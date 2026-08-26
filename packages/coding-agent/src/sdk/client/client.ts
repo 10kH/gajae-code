@@ -116,13 +116,13 @@ export interface SdkDispatchContext {
 	readonly generation: number;
 }
 
-/** Request identity retained after an uncertain send for lifecycle reconciliation. */
-
+/** Request identity retained after an uncertain send. */
 export interface SdkSentRecord {
 	readonly id: string;
 	readonly operation?: string;
 	readonly idempotencyKey?: string;
-	readonly fingerprint: string;
+	/** Present for lifecycle lookups; `session.spawn` replays through its idempotency key. */
+	readonly fingerprint?: string;
 }
 
 export type SdkFrameHandler = (frame: SdkFrame) => void;
@@ -573,16 +573,16 @@ export class SdkClient {
 		// nothing reached the transport, so the request stays retryable and
 		// non-uncertain with no record retained.
 		pending.sent = true;
-		// Spawn reconciliation is exclusively broker-owned and keyed by its opaque
-		// claim identity. Never compute or retain a raw sent-record fingerprint.
-		if (!isSpawn) {
-			this.#rememberSentRecord({
-				id,
-				operation: sentOperation,
-				idempotencyKey: sentIdempotencyKey,
-				fingerprint: sentFingerprint!,
-			});
-		}
+		// A spawn claim replays only through its caller-provided idempotency key;
+		// it deliberately has no lifecycle fingerprint. Retain the common sent
+		// record anyway so an uncertain transport result tells the caller which
+		// key can join that durable claim.
+		this.#rememberSentRecord({
+			id,
+			...(sentOperation === undefined ? {} : { operation: sentOperation }),
+			...(sentIdempotencyKey === undefined ? {} : { idempotencyKey: sentIdempotencyKey }),
+			...(sentFingerprint === undefined ? {} : { fingerprint: sentFingerprint }),
+		});
 		try {
 			incarnation.socket.send(serializedRequest);
 		} catch (error) {

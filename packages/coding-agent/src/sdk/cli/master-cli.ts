@@ -11,6 +11,7 @@ import { randomUUID } from "node:crypto";
 import * as path from "node:path";
 import { getAgentDir } from "@gajae-code/utils";
 import { type IndexedSession, isSessionAuthorityEligible, SessionIndex } from "../broker/session-index";
+import { SdkClientError } from "../client";
 import { dispatchSpawnGlobal } from "../lifecycle/broker-client";
 
 const MASTER_CAPABILITY_ENV = "GJC_MASTER_CAPABILITY";
@@ -34,6 +35,7 @@ export interface SdkSpawnArgs {
 	model?: string;
 	profile?: string;
 	agentDir?: string;
+	idempotencyKey?: string;
 	json?: boolean;
 }
 
@@ -44,6 +46,7 @@ export interface SdkSpawnRendered {
 	sessionId?: string;
 	substrateKind?: string;
 	seed?: { phase?: string; clientRef?: string; commandId?: string; turnId?: string; status?: string };
+	idempotencyKey?: string;
 	error?: { code: string; message: string };
 }
 
@@ -170,11 +173,19 @@ export function safeSpawnRender(response: unknown): { rendered: SdkSpawnRendered
 	}
 	const error = record(outer?.error);
 	const code = opaque(error?.code) ?? "spawn_failed";
-	// Error messages are Broker-typed and never quote request input; render the
-	// code plus the typed message only.
+	const retryIdempotencyKey = code === "uncertain_after_send" ? opaque(error?.idempotencyKey) : undefined;
+	// Error messages are Broker-typed and never quote request input; an uncertain
+	// post-send result may additionally expose its non-secret replay key.
 	const message =
 		typeof error?.message === "string" && error.message.length <= 512 ? error.message : "session.spawn failed";
-	return { rendered: { code, error: { code, message } }, exitCode: 1 };
+	return {
+		rendered: {
+			code,
+			...(retryIdempotencyKey === undefined ? {} : { idempotencyKey: retryIdempotencyKey }),
+			error: { code, message },
+		},
+		exitCode: 1,
+	};
 }
 
 export function renderSpawnTable(rendered: SdkSpawnRendered): string {
@@ -185,12 +196,14 @@ export function renderSpawnTable(rendered: SdkSpawnRendered): string {
 	if (rendered.seed?.phase) lines.push(`Seed phase: ${rendered.seed.phase}`);
 	if (rendered.seed?.status) lines.push(`Seed status: ${rendered.seed.status}`);
 	if (rendered.error) lines.push(`Error: ${rendered.error.code}: ${rendered.error.message}`);
+	if (rendered.idempotencyKey) lines.push(`Retry idempotency key: ${rendered.idempotencyKey}`);
+
 	return lines.join("\n");
 }
 
 /**
- * Runs one local master spawn. Every invocation uses a fresh idempotency key:
- * a semantically new task must never replay an older claim.
+ * Runs one local master spawn. A caller-provided idempotency key replays the
+ * matching durable claim; otherwise each invocation receives a fresh key.
  */
 export async function runSdkSpawn(
 	args: SdkSpawnArgs,
@@ -219,18 +232,29 @@ export async function runSdkSpawn(
 			"No master role attestation exists for this session; relaunch with gjc --master.",
 			1,
 		);
-	const response = await deps.dispatch(
-		agentDir,
-		{
-			task: args.prompt,
-			masterCapability: capability,
-			ownerSessionId,
-			attestationEpoch,
-			cwd: args.cwd === undefined ? undefined : path.resolve(args.cwd),
-			...(args.model === undefined ? {} : { modelId: args.model }),
-			...(args.profile === undefined ? {} : { modelPreset: args.profile }),
-		},
-		randomUUID(),
-	);
-	return safeSpawnRender(response);
+	const idempotencyKey = args.idempotencyKey ?? randomUUID();
+	try {
+		const response = await deps.dispatch(
+			agentDir,
+			{
+				task: args.prompt,
+				masterCapability: capability,
+				ownerSessionId,
+				attestationEpoch,
+				cwd: args.cwd === undefined ? undefined : path.resolve(args.cwd),
+				...(args.model === undefined ? {} : { modelId: args.model }),
+				...(args.profile === undefined ? {} : { modelPreset: args.profile }),
+			},
+			idempotencyKey,
+		);
+		return safeSpawnRender(response);
+	} catch (error) {
+		if (error instanceof SdkClientError && error.code === "uncertain_after_send") {
+			return safeSpawnRender({
+				ok: false,
+				error: { code: error.code, message: error.message, idempotencyKey },
+			});
+		}
+		throw error;
+	}
 }

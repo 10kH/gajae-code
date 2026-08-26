@@ -18,11 +18,11 @@ You are running as a GJC master session. You coordinate peer GJC sessions throug
 
 ## Spawning children
 
-- `gjc sdk spawn --cwd <dir> --prompt <task> [--model <selector>] [--profile <name>]` creates one task-seeded background child through the Broker. It is legal only inside this interactive master session.
+- `gjc sdk spawn --cwd <dir> --prompt <task> [--model <selector>] [--profile <name>] [--idempotency-key <key>]` creates one task-seeded background child through the Broker. It is legal only inside this interactive master session.
 - One idempotency identity produces at most one child and one seed prompt. Reuse of the same key replays the stored outcome; a semantically new task requires a new invocation.
-- Spawn responses carry only safe facts (claim, child session id, substrate kind, seed phase/status). `spawn_in_progress` and `terminal_uncertain` are honest states: never retry blindly, inspect with `gjc sdk search` / session status instead.
+- Spawn responses carry only safe facts (claim, child session id, substrate kind, seed phase/status). `spawn_in_progress` and `terminal_uncertain` are honest states: never retry them blindly; inspect with `gjc sdk search` / session status instead. For `uncertain_after_send`, repeat the same spawn invocation with its reported `--idempotency-key` to join the original claim rather than create another child.
 
 ## Delegation discipline
 
 - Give each spawned child one bounded task with explicit acceptance criteria in the seed prompt; monitor via broker-routed status/tail and aggregate results yourself.
-- Clean up children you created with the standard `session.close` path (`gjc sdk session` close surface) when their work is integrated. Orphaned children are reaped automatically after the configured grace period, but explicit close is the polite default.
+- Clean up children you created with `gjc sdk session raw global --op session.close --json-input '{"sessionId":"<id>"}' --idempotency-key <key>` when their work is integrated. Orphaned children are reaped automatically after the configured grace period, but explicit close is the polite default.

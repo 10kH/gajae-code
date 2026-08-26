@@ -322,6 +322,32 @@ test("SdkClient rejects malformed frames and marks a lost sent response uncertai
 	});
 });
 
+test("SdkClient exposes the spawn retry key when a sent response is lost", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0 });
+		const socket = await connect(client);
+		const idempotencyKey = "spawn-retry-key";
+		const secret = "secret-spawn-input";
+		const spawn = client.global("session.spawn", { task: secret, masterCapability: secret }, { idempotencyKey });
+		await flush();
+		const frame = sent(socket);
+		if (typeof frame.id !== "string") throw new Error("spawn request id missing");
+		socket.readyState = FakeWebSocket.CLOSED;
+		socket.emit("close");
+		let uncertain: unknown;
+		try {
+			await spawn;
+		} catch (error) {
+			uncertain = error;
+		}
+		if (!(uncertain instanceof SdkClientError)) throw new Error("sent spawn request was not uncertain");
+		expect(uncertain).toMatchObject({ code: "uncertain_after_send" });
+		expect(uncertain.details).toEqual({ id: frame.id, operation: "session.spawn", idempotencyKey });
+		expect(JSON.stringify(uncertain.details)).not.toContain(secret);
+		await client.close();
+	});
+});
+
 test("SdkClient distinguishes pre-send closure from a sent lifecycle request and reconciles the durable lookup", async () => {
 	await withFakeTransport(async () => {
 		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0 });

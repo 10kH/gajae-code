@@ -7,6 +7,7 @@ import {
 	selectNewestMasterAttestationEpoch,
 } from "@gajae-code/coding-agent/sdk/cli/master-cli";
 import type { IndexedSession } from "../src/sdk/broker/session-index";
+import { SdkClientError } from "../src/sdk/client/client";
 
 const task = "secret-task-fixture";
 const capability = "secret-capability-fixture";
@@ -128,6 +129,59 @@ describe("gjc sdk spawn CLI", () => {
 		});
 		expect(first.exitCode).toBe(0);
 		expect(second.rendered.code).toBe("spawn_accepted");
+	});
+
+	it("joins an existing claim when re-run with an explicit idempotency key", async () => {
+		const idempotencyKey = "spawn-join-key";
+		const keys: string[] = [];
+		const inputs: Record<string, unknown>[] = [];
+		const claims = new Map<string, string>();
+		let launches = 0;
+		const dispatch = async (_agentDir: string, input: Record<string, unknown>, key: string) => {
+			keys.push(key);
+			inputs.push(input);
+			const existing = claims.get(key);
+			if (existing) return { ok: true, result: { code: "spawn_replayed", sessionId: existing } };
+			launches += 1;
+			const sessionId = `child-${launches}`;
+			claims.set(key, sessionId);
+			return { ok: true, result: { code: "spawn_accepted", sessionId } };
+		};
+		const dependencies = { env: masterEnv, resolveAttestationEpoch: epoch, dispatch };
+		const args = { cwd: "/tmp", prompt: task, idempotencyKey };
+		const accepted = await runSdkSpawn(args, dependencies);
+		const replay = await runSdkSpawn(args, dependencies);
+		expect(keys).toEqual([idempotencyKey, idempotencyKey]);
+		expect(inputs[1]).toEqual(inputs[0]);
+		expect(accepted.rendered).toMatchObject({ code: "spawn_accepted", sessionId: "child-1" });
+		expect(replay.rendered).toMatchObject({ code: "spawn_replayed", sessionId: "child-1" });
+		expect(launches).toBe(1);
+	});
+
+	it("renders the replay key when session.spawn is uncertain after send", async () => {
+		const idempotencyKey = "spawn-retry-key";
+		let dispatchedKey: string | undefined;
+		const result = await runSdkSpawn(
+			{ cwd: "/tmp", prompt: task, idempotencyKey },
+			{
+				env: masterEnv,
+				resolveAttestationEpoch: epoch,
+				dispatch: async (_agentDir, _input, key) => {
+					dispatchedKey = key;
+					throw new SdkClientError("uncertain_after_send", "spawn response was lost after send");
+				},
+			},
+		);
+		expect(dispatchedKey).toBe(idempotencyKey);
+		expect(result).toEqual({
+			rendered: {
+				code: "uncertain_after_send",
+				idempotencyKey,
+				error: { code: "uncertain_after_send", message: "spawn response was lost after send" },
+			},
+			exitCode: 1,
+		});
+		expect(renderSpawnTable(result.rendered)).toContain(`Retry idempotency key: ${idempotencyKey}`);
 	});
 
 	it("renders only safe fields for every outcome and never echoes input", async () => {
