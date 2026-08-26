@@ -1178,6 +1178,9 @@ interface SessionRuntime {
 	/** Delivers one ring-positioned event envelope to every attached subscriber
 	 *  connection, applying the same capability gate as event replay. */
 	broadcastEventFrame: (event: SdkFrame) => string[];
+	/** Delivers one positioned event and returns opaque receipts only for the
+	 *  notification-effect generations that accepted it. */
+	broadcastEventFrameWithReceipts: (event: SdkFrame) => string[];
 	/** Owns stateRoot-backed revisions and removes their spills on terminal shutdown. */
 	revisions: RevisionStore;
 	/** Releases all snapshot pins before the revision store is closed. */
@@ -1406,6 +1409,13 @@ function emitSessionEvent(
 	payload: Record<string, unknown> = frame,
 ): string[] {
 	return runtime.broadcastEventFrame(runtime.host.emitEvent({ kind: frame.type, payload }));
+}
+
+function emitSessionEventWithReceipts(
+	runtime: Pick<SessionRuntime, "host" | "broadcastEventFrameWithReceipts">,
+	frame: { type: string; [key: string]: unknown },
+): string[] {
+	return runtime.broadcastEventFrameWithReceipts(runtime.host.emitEvent({ kind: frame.type, payload: frame }));
 }
 
 function pushSessionFrame(
@@ -4780,6 +4790,22 @@ export function createNotificationsExtension(
 			}
 			return recipients;
 		};
+		const broadcastEventFrameWithReceipts = (event: SdkFrame): string[] => {
+			const gated = CAP_GATED_FRAME_KINDS.has(String(event.kind));
+			const json = JSON.stringify(event);
+			const receipts: string[] = [];
+			for (const [connectionId, capabilities] of hostCapCache) {
+				if (fencedConnections.has(connectionId)) continue;
+				if (gated && !capabilities.has(TOOL_ACTIVITY_CAPABILITY)) continue;
+				try {
+					const receipt = server.sendToWithReceipt(connectionId, json);
+					if (capabilities.has(POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY)) receipts.push(receipt);
+				} catch {
+					// Rejected positioned sends remain eligible for the atomic raw fallback.
+				}
+			}
+			return receipts;
+		};
 		let cancelPreflightsForConnection: ((connectionId: string) => Promise<void>) | undefined;
 		const promptTerminalTombstones = new Map<string, { connectionId: string; expiresAt: number }>();
 		// Authoritative bounded reconciliation state for canonical Q26 turn.result
@@ -6858,6 +6884,7 @@ export function createNotificationsExtension(
 			server,
 			host,
 			broadcastEventFrame,
+			broadcastEventFrameWithReceipts,
 			revisions,
 			cursors,
 			id,
@@ -7137,6 +7164,11 @@ export function createNotificationsExtension(
 			) {
 				throw new Error(
 					"@gajae-code/natives is out of date: missing positioned raw-fan-out exclusion. Rebuild the native addon (bun --cwd=packages/natives run build).",
+				);
+			}
+			if (typeof server.sendToWithReceipt !== "function" || typeof server.queueIdleAfterDirected !== "function") {
+				throw new Error(
+					"@gajae-code/natives is out of date: missing recipient-bound dependent delivery. Rebuild the native addon (bun --cwd=packages/natives run build).",
 				);
 			}
 			server.onNegotiatedCapabilities((_err, connectionId, capabilities) => {
@@ -8747,16 +8779,20 @@ export function createNotificationsExtension(
 		const seq = rt.idleSeq++;
 		// Re-assert the identity header so the daemon renames the topic once the
 		// session title has been auto-generated ("{repo}/{branch} - {title}"). The
-		// daemon only renames when the title actually changed.
+		// daemon only renames when the title actually changed. Bind the dependent
+		// idle to the exact connection generations that accepted this positioned
+		// identity; native raw fallbacks enqueue identity and idle as one bounded
+		// writer command for the remaining snapshot cohort.
 		try {
-			pushSessionFrame(rt, {
+			const identity = {
 				type: "identity_header",
 				sessionId: id,
 				...buildIdentity(ctx.cwd, ctx.sessionManager.getSessionName(), telegramTopicsEnabled()),
-			});
-		} catch {}
-		try {
-			rt.server.noteIdle(
+			} as const;
+			const receipts = emitSessionEventWithReceipts(rt, identity);
+			const outcome = rt.server.queueIdleAfterDirected(
+				JSON.stringify(identity),
+				receipts,
 				JSON.stringify(
 					notificationActionPayload(
 						{
@@ -8769,8 +8805,13 @@ export function createNotificationsExtension(
 					),
 				),
 			);
-		} catch (e) {
-			logger.warn(`notifications: noteIdle failed: ${String(e)}`);
+			if (outcome.status === "rejected" || outcome.status === "partial") {
+				logger.warn(
+					`notifications: dependent idle ${outcome.status} (${outcome.queuedCount}/${outcome.recipientCount} recipients queued)`,
+				);
+			}
+		} catch (error) {
+			logger.warn(`notifications: recipient-bound identity/idle delivery failed: ${String(error)}`);
 		}
 
 		// Lean: emit the latest deferred assistant answer exactly once at idle.
