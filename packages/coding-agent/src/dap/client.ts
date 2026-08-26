@@ -334,6 +334,7 @@ export class DapClient {
 			throw signal.reason instanceof Error ? signal.reason : new ToolAbortError();
 		}
 		const { promise, resolve, reject } = Promise.withResolvers<TBody>();
+		void promise.catch(() => {});
 		let timeout: NodeJS.Timeout | undefined;
 		const cleanup = () => {
 			unsubscribe();
@@ -417,13 +418,11 @@ export class DapClient {
 			},
 		});
 		this.#lastActivity = Date.now();
-		try {
-			await this.#queueWrite(request);
-		} catch (error) {
+		void this.#queueWrite(request).catch(error => {
 			this.#pendingRequests.delete(requestSeq);
 			cleanup();
-			throw error;
-		}
+			reject(error);
+		});
 		return promise;
 	}
 

@@ -180,6 +180,31 @@ describe("DAP lifecycle behavior", () => {
 		await second;
 	});
 
+	it("delivers request timeouts while a write remains backpressured", async () => {
+		const sink = {
+			write(): Promise<number> {
+				return new Promise(() => {});
+			},
+			flush(): number {
+				return 0;
+			},
+		};
+		const owner = {
+			child: { stdin: sink, stdout: new ReadableStream<Uint8Array>() },
+			dispose: async () => {},
+			awaitExit: async () => {},
+			disposed: false,
+		};
+		const client = new DapClient(STDIO_ADAPTER, ".", owner as never, {
+			readable: new ReadableStream<Uint8Array>(),
+			writeSink: sink,
+		});
+
+		await expect(client.sendRequest("blocked", undefined, undefined, 10)).rejects.toThrow(
+			"DAP request blocked timed out after 10ms",
+		);
+	});
+
 	it("socket-mode startup timeout disposes the adapter process", async () => {
 		const cwd = await tempDir("gjc-dap-socket-timeout-");
 		try {

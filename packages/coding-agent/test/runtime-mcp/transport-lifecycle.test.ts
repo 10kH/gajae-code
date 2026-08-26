@@ -133,6 +133,22 @@ describe("MCP stdio transport lifecycle", () => {
 		}
 	}, 10_000);
 
+	test("delivers request timeouts while a write remains backpressured", async () => {
+		const transport = new StdioTransport({
+			command: process.execPath,
+			args: ["-e", "setInterval(() => {}, 1000)"],
+			timeout: 25,
+		});
+		try {
+			await transport.connect();
+			await expect(transport.request("tools/list", { text: "x".repeat(64 * 1024 * 1024) })).rejects.toThrow(
+				"Request timeout after 25ms",
+			);
+		} finally {
+			await transport.close().catch(() => {});
+		}
+	}, 10_000);
+
 	test("close and reconnect dispose the old owned child tree", async () => {
 		vi.restoreAllMocks();
 		if (process.env[STDIO_LIFECYCLE_ISOLATION] !== "1") {

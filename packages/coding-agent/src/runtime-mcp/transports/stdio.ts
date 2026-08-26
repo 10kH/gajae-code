@@ -283,6 +283,7 @@ export class StdioTransport implements MCPTransport {
 		}
 
 		const { promise, resolve, reject } = Promise.withResolvers<T>();
+		void promise.catch(() => {});
 		let timer: NodeJS.Timeout | undefined;
 		let settled = false;
 
@@ -326,16 +327,18 @@ export class StdioTransport implements MCPTransport {
 		}, timeout);
 
 		const message = `${JSON.stringify(request)}\n`;
-		try {
-			// Bun's FileSink has write() method directly. Await both write and
-			// flush: under backpressure write() returns a promise, and either
-			// call can fail with EPIPE when the server dies mid-write.
-			await stdin.write(message);
-			await stdin.flush();
-		} catch (error: unknown) {
-			cleanup();
-			reject(new MCPExpectedFailure(error));
-		}
+		void (async () => {
+			try {
+				// Bun's FileSink has write() method directly. Await both write and
+				// flush: under backpressure write() returns a promise, and either
+				// call can fail with EPIPE when the server dies mid-write.
+				await stdin.write(message);
+				await stdin.flush();
+			} catch (error: unknown) {
+				cleanup();
+				reject(new MCPExpectedFailure(error));
+			}
+		})();
 
 		return promise;
 	}
