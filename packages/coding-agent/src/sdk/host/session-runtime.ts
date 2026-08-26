@@ -752,7 +752,13 @@ export function createInvocationReconciliation(
 				// failure reason may arrive on a different delivery path than the one that
 				// claimed the terminal. Enrich the settled record instead of dropping it;
 				// never resurrect (status/terminalAt untouched), and first reason wins.
-				if (frame.type === "agent_failed" && record.error === undefined) {
+				if (frame.type === "agent_failed") {
+					const failure = sanitizePromptFailure(frame.error);
+					if (
+						record.error !== undefined &&
+						!(record.error.code === "agent_failed" && failure.code !== "agent_failed")
+					)
+						return;
 					const next = { ...record, revision: ++mutationRevision };
 					logger.error("SDK invocation failed (late)", {
 						kind,
@@ -760,7 +766,7 @@ export function createInvocationReconciliation(
 						turnId: correlation.turnId,
 						error: formatPromptFailureForLocalLog(frame.error),
 					});
-					next.error = sanitizePromptFailure(frame.error);
+					next.error = failure;
 					records.set(recordKey, next);
 					try {
 						await persist();
