@@ -162,14 +162,14 @@ export class FallbackChainController {
 	 * being retried forever while still allowing every eligible fallback model
 	 * its own literal-UTF-8 recovery budget.
 	 */
-	recordEscapedArgumentsFailure(reason: string): boolean {
+	recordEscapedArgumentsFailure(reason: string, advance = true): boolean {
 		const selector = this.currentSelector();
 		if (!selector || this.exhaustedForTurn) return false;
 		this.#attemptStarted = false;
 		this.attemptsUsed = this.maxAttempts;
 		this.#totalAttemptsUsed += 1;
 		this.tried.push({ selector, triggerClass: "unknown", reason });
-		return this.advance();
+		return advance ? this.advance() : this.activeIndex + 1 < this.chain.entries.length;
 	}
 
 	advance(): boolean {

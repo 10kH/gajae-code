@@ -484,4 +484,63 @@ describe("AgentSession escaped non-ASCII fallback terminal (#4880)", () => {
 		expect(session.model?.provider).toBe(fallback.provider);
 		expect(session.model?.id).toBe(fallback.id);
 	});
+
+	it("rolls back a fallback switch when cancellation arrives before continuation invocation", async () => {
+		tempDir = TempDir.createSync("@gjc-escaped-fallback-post-switch-abort-4880-");
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+
+		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallback = getBundledModel("anthropic", "claude-opus-4-6");
+		if (!primary || !fallback) throw new Error("Expected bundled post-switch abort models");
+
+		const modelRegistry = new ModelRegistry(authStorage);
+		const manager = SessionManager.create(tempDir.path(), tempDir.path());
+		const streamCalls: string[] = [];
+		const mock = createMockModel({
+			handler: () =>
+				escapedTurn(`tc-post-switch-${mock.model.calls.length}`, {
+					type: "openaiResponsesHistory",
+					items: [{ type: "function_call", arguments: `{"question":"\\uCD5C"}` }],
+				}),
+		});
+		const agent = new Agent({
+			initialState: { model: primary, systemPrompt: ["test"], tools: [], messages: [] },
+			convertToLlm: identityConverter,
+			streamFn: (model, context, options) => {
+				streamCalls.push(selector(model));
+				return mock.stream(model, context, options);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"fallback.maxAttempts": 1,
+			"retry.baseDelayMs": 10,
+		});
+		settings.setModelRole("default", selector(primary));
+		session = new AgentSession({ agent, sessionManager: manager, settings, modelRegistry });
+		session.setConfiguredModelChain("default", [selector(primary), selector(fallback)], "test");
+		const fallbackEvents: string[] = [];
+		session.subscribe(event => {
+			if (event.type === "model_fallback_switched") fallbackEvents.push(event.to);
+		});
+
+		let continuationCalls = 0;
+		const originalContinue = agent.continue.bind(agent);
+		vi.spyOn(agent, "continue").mockImplementation(async options => {
+			continuationCalls += 1;
+			if (continuationCalls === 1) void session?.abort();
+			return await originalContinue(options);
+		});
+
+		const prompt = session.prompt("post-switch abort");
+		await prompt.catch(() => {});
+		await session.waitForIdle();
+
+		expect(continuationCalls).toBe(1);
+		expect(streamCalls).toEqual([selector(primary)]);
+		expect(session.model?.provider).toBe(primary.provider);
+		expect(session.model?.id).toBe(primary.id);
+		expect(fallbackEvents).toEqual([]);
+	});
 });

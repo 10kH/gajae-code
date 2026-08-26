@@ -2484,6 +2484,7 @@ export class AgentSession {
 	#retryPromise: Promise<void> | undefined = undefined;
 	#retryResolve: (() => void) | undefined = undefined;
 	#defaultFallbackController: FallbackChainController | undefined;
+	#fallbackTransitionGeneration = 0;
 	/** Managed escaped-non-ASCII retries issued for the current logical run. Bounded so a deterministic escaper cannot loop forever through un-charged fallback retries. */
 	#escapedNonAsciiManagedRetries = 0;
 	/** Concrete models that already exhausted escaped-argument recovery this turn. */
@@ -13872,6 +13873,7 @@ export class AgentSession {
 		// Only an explicit user selection starts a new fallback epoch. Internal
 		// fallback switches must preserve the exhausted-model set while advancing.
 		if (role === "default" && (options?.cause ?? "user-selection") === "user-selection") {
+			this.#fallbackTransitionGeneration++;
 			this.#defaultFallbackController = undefined;
 			this.#defaultFallbackExhaustedLastTurn = false;
 			this.#escapedNonAsciiExhaustedModelKeys.clear();
@@ -18749,6 +18751,7 @@ export class AgentSession {
 					`Managed fallback retried the escaped non-ASCII tool-call turn ${MAX_ESCAPED_NONASCII_MANAGED_RETRIES} times without a literal-UTF-8 re-issue; ` +
 					`giving up on this model so the next eligible fallback can re-issue with literal UTF-8.`;
 				const controller = this.#defaultFallbackChain();
+				const fallbackFrom = controller.currentSelector();
 				const previousModel = this.model;
 				const previousThinkingLevel = this.thinkingLevel;
 				if (this.model) {
@@ -18756,60 +18759,98 @@ export class AgentSession {
 				}
 				controller.discardStartedAttempt();
 				const controllerStateBeforeFailure = controller.snapshotRuntimeState();
-				const advanced = controller.recordEscapedArgumentsFailure(errorMessage);
+				const advanced = controller.recordEscapedArgumentsFailure(errorMessage, false);
 				this.#escapedNonAsciiManagedRetries = 0;
 				const abortEpoch = this.#abortAdmissionEpoch;
-				if (
-					advanced &&
-					(await this.#advanceDefaultFallback(
-						controller,
-						"escaped_non_ascii",
-						1,
-						cancellationSignal,
-						abortEpoch,
-						controllerStateBeforeFailure,
-						previousModel,
-						previousThinkingLevel,
-					))
-				) {
-					if (this.#abortAdmissionEpoch !== abortEpoch) controller.resetForNewTurn();
-					if (this.#abortAdmissionEpoch !== abortEpoch)
-						return { type: "terminal", terminal: { stopReason: "cancelled" } };
+				if (advanced) {
+					const transitionGeneration = ++this.#fallbackTransitionGeneration;
 					return {
 						type: "retry",
 						continuation: async ownership => {
+							const restoreOwnedTransition = async () => {
+								if (this.#fallbackTransitionGeneration !== transitionGeneration) return;
+								this.#fallbackTransitionGeneration++;
+								if (!this.agent.state.isStreaming)
+									await this.#restoreDefaultFallbackTransition(
+										controller,
+										controllerStateBeforeFailure,
+										previousModel,
+										previousThinkingLevel,
+									);
+							};
 							const continuationCancelled =
 								!ownership.isCurrent() ||
 								ownership.lease.signal.aborted ||
 								cancellationSignal?.aborted ||
 								this.#abortAdmissionEpoch !== abortEpoch;
 							if (continuationCancelled) {
-								if (this.#abortAdmissionEpoch === abortEpoch)
-									await this.#restoreDefaultFallbackTransition(
-										controller,
-										controllerStateBeforeFailure,
-										previousModel,
-										previousThinkingLevel,
-									);
+								await restoreOwnedTransition();
 								return;
 							}
-							if (cancellationSignal?.aborted || this.#abortAdmissionEpoch !== abortEpoch) {
-								if (this.#abortAdmissionEpoch === abortEpoch)
-									await this.#restoreDefaultFallbackTransition(
-										controller,
-										controllerStateBeforeFailure,
-										previousModel,
-										previousThinkingLevel,
-									);
+							if (!controller.advance()) {
+								this.#fallbackTransitionGeneration++;
+								this.#defaultFallbackExhaustedLastTurn = true;
+								this.agent.requestRunTerminal(ownership.handle.logicalRunId, {
+									stopReason: "exhausted",
+									messages: [
+										this.#managedFallbackExhaustionMessage(
+											outcome.message,
+											`Managed fallback exhausted every eligible model after escaped non-ASCII tool-call retries; the run fails closed. ${errorMessage}`,
+										),
+									],
+								});
 								return;
 							}
-							await this.agent.continue({
+							const switched = await this.#advanceDefaultFallback(
+								controller,
+								"escaped_non_ascii",
+								1,
+								cancellationSignal,
+								abortEpoch,
+								controllerStateBeforeFailure,
+								previousModel,
+								previousThinkingLevel,
+								{ emitSwitchEvent: false },
+							);
+							if (!switched) {
+								if (this.#abortAdmissionEpoch !== abortEpoch || cancellationSignal?.aborted) {
+									await restoreOwnedTransition();
+									return;
+								}
+								this.#fallbackTransitionGeneration++;
+								this.#defaultFallbackExhaustedLastTurn = true;
+								this.agent.requestRunTerminal(ownership.handle.logicalRunId, {
+									stopReason: "exhausted",
+									messages: [
+										this.#managedFallbackExhaustionMessage(
+											outcome.message,
+											`Managed fallback exhausted every eligible model after escaped non-ASCII tool-call retries; the run fails closed. ${errorMessage}`,
+										),
+									],
+								});
+								return;
+							}
+							const continuation = this.agent.continue({
 								...this.#managedFallbackPromptOptions(),
 								transientRecoveryMessage: this.#escapedNonAsciiRecoveryMessage(),
 							});
+							if (cancellationSignal?.aborted || this.#abortAdmissionEpoch !== abortEpoch) {
+								await restoreOwnedTransition();
+								return;
+							}
+							this.#emitFallbackSwitchEvent(
+								controller,
+								fallbackFrom,
+								controller.currentSelector(),
+								"escaped_non_ascii",
+								1,
+							);
+							await continuation;
+							this.#fallbackTransitionGeneration++;
 						},
 					};
 				}
+				controller.advance();
 				if (this.#abortAdmissionEpoch !== abortEpoch || cancellationSignal?.aborted)
 					return { type: "terminal", terminal: { stopReason: "cancelled" } };
 				this.#defaultFallbackExhaustedLastTurn = true;
@@ -18971,6 +19012,7 @@ export class AgentSession {
 		rollbackState?: FallbackChainRuntimeState,
 		previousModel?: Model,
 		previousThinkingLevel?: ThinkingLevel,
+		options?: { emitSwitchEvent?: boolean },
 	): Promise<boolean> {
 		const promptAbortSignal = this.#promptPreflightAbortController.signal;
 		const cancellationSignal = signal ? AbortSignal.any([signal, promptAbortSignal]) : promptAbortSignal;
@@ -19098,28 +19140,43 @@ export class AgentSession {
 			if (cancellationSignal.aborted || (abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch)) {
 				return await rollbackCancelled();
 			}
-			if (from !== to) {
-				this.#emit({
-					type: "model_fallback_switched",
-					eventId: crypto.randomUUID(),
-					from,
-					to,
-					reason,
-					role:
-						controller.chain.origin === "subagent"
-							? (controller.chain.identity ?? controller.chain.role)
-							: controller.chain.role,
-					scope: controller.chain.origin === "subagent" ? "subagent-call" : "session",
-					activeIndex: controller.activeIndex,
-					chainLength: controller.chain.entries.length,
-					attemptsUsed,
-				});
-			}
+			if (options?.emitSwitchEvent ?? true)
+				this.#emitFallbackSwitchEvent(controller, from, to, reason, attemptsUsed);
 			if (cancellationSignal.aborted || (abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch))
 				return await rollbackCancelled();
 			return true;
 		}
 		return false;
+	}
+
+	#emitFallbackSwitchEvent(
+		controller: FallbackChainController,
+		from: string | undefined,
+		to: string | undefined,
+		reason: string,
+		attemptsUsed: number,
+	): void {
+		if (!from || !to || from === to) return;
+		const event: Extract<AgentSessionEvent, { type: "model_fallback_switched" }> = {
+			type: "model_fallback_switched",
+			eventId: crypto.randomUUID(),
+			from,
+			to,
+			reason,
+			role:
+				controller.chain.origin === "subagent"
+					? (controller.chain.identity ?? controller.chain.role)
+					: controller.chain.role,
+			scope: controller.chain.origin === "subagent" ? "subagent-call" : "session",
+			activeIndex: controller.activeIndex,
+			chainLength: controller.chain.entries.length,
+			attemptsUsed,
+		};
+		if (this.#eventListeners.length === 0) {
+			this.#pendingFallbackSwitches.push(event);
+		} else {
+			this.#emit(event);
+		}
 	}
 
 	#emitResolutionFallbackSwitch(controller: FallbackChainController): void {
