@@ -10386,6 +10386,7 @@ export class AgentSession {
 										? { onPreflightAcceptCommit: options.onPreflightAcceptCommit }
 										: {}),
 									...(options.preflightSignal ? { preflightSignal: options.preflightSignal } : {}),
+									...(options.sdkRunToken ? { sdkRunToken: options.sdkRunToken } : {}),
 								}
 							: undefined,
 					);
