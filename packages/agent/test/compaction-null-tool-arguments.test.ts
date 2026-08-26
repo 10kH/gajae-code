@@ -16,10 +16,10 @@
  * "prompt is too long".
  */
 import { describe, expect, it } from "bun:test";
+import type { Message } from "@gajae-code/ai";
 import { serializeConversation } from "../src/compaction/utils";
-import type { AgentMessage } from "../src/types";
 
-function assistantWithToolCall(args: unknown): AgentMessage {
+function assistantWithToolCall(args: unknown): Message {
 	return {
 		role: "assistant",
 		content: [{ type: "toolCall", id: "call_1", name: "bash", arguments: args as Record<string, unknown> }],
@@ -36,7 +36,7 @@ function assistantWithToolCall(args: unknown): AgentMessage {
 		},
 		stopReason: "toolUse",
 		timestamp: Date.now(),
-	} as AgentMessage;
+	} as Message;
 }
 
 describe("serializeConversation - malformed tool-call arguments", () => {
