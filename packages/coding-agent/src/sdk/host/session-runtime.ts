@@ -3252,6 +3252,11 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		else retiredLifecycleOwners.set(owner.sessionId, remaining);
 		const remainingSameIdentity = remaining.filter(candidate => candidate.sessionIdentity === owner.sessionIdentity);
 		if (remainingSameIdentity.length < 2) ambiguousLifecycleIdentities.delete(owner.sessionIdentity);
+		// Expiry is the final lifecycle-reference boundary. Do not retain
+		// diagnostic suppression or failed-write recovery state after the owner is
+		// no longer eligible to receive a delayed event.
+		owner.failureDiagnosticKeys.clear();
+		owner.unrecordedFailureReasons?.clear();
 		for (const [token, binding] of lifecycleRunOwners) if (binding.state === owner) lifecycleRunOwners.delete(token);
 	};
 	const maybeRetireLifecycleOwner = (owner: RuntimeState): void => {
