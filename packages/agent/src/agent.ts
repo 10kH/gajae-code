@@ -123,7 +123,8 @@ function safeErrorStatus(error: unknown): number | undefined {
 	try {
 		return (
 			extractHttpStatusFromError({ status: (error as { errorStatus?: unknown } | undefined)?.errorStatus }) ??
-			extractHttpStatusFromError(error)
+			extractHttpStatusFromError(error) ??
+			extractHttpStatusFromError((error as { transportFailure?: unknown } | undefined)?.transportFailure)
 		);
 	} catch {
 		return undefined;
