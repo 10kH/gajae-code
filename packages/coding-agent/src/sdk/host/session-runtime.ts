@@ -3195,6 +3195,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	const retiredLifecycleOwners = new Map<string, RuntimeState[]>();
 	const retiredLifecycleOwnerTimers = new Map<RuntimeState, ReturnType<typeof setTimeout>>();
 	const skillRecoveryControllers = new Map<string, AbortController>();
+	const skillTerminalRecoveryControllers = new Map<string, AbortController>();
 	const ambiguousLifecycleIdentities = new Set<string>();
 	const lifecycleRunOwners = new Map<
 		string,
@@ -3515,6 +3516,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			const recoveryKey = `${invocation.correlation.commandId}:${invocation.correlation.turnId}`;
 			if (skillTerminalRecoveryKeys.has(recoveryKey)) return;
 			skillTerminalRecoveryKeys.add(recoveryKey);
+			const controller = new AbortController();
+			skillTerminalRecoveryControllers.set(recoveryKey, controller);
 			const attempt = async (): Promise<void> => {
 				try {
 					const unrecorded = current.unrecordedFailureReasons?.get(recoveryKey);
@@ -3550,16 +3553,29 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						adoptLifecycleBatch(current.openLifecycleBatches[0]?.invocations);
 					if (current.openLifecycleBatches.length === 0) current.lifecycleActive = false;
 				} catch (error) {
+					if (controller.signal.aborted) {
+						skillTerminalRecoveryKeys.delete(recoveryKey);
+						return;
+					}
 					logger.error("SDK skill lifecycle terminal recovery retrying", {
 						commandId: invocation.correlation.commandId,
 						turnId: invocation.correlation.turnId,
 						error: sanitizePromptFailure(error),
 					});
-					await Bun.sleep(1_000);
+					const wait = Promise.withResolvers<void>();
+					const timer = setTimeout(wait.resolve, 1_000);
+					timer.unref();
+					const onAbort = () => {
+						clearTimeout(timer);
+						wait.resolve();
+					};
+					controller.signal.addEventListener("abort", onAbort, { once: true });
+					await wait.promise;
+					controller.signal.removeEventListener("abort", onAbort);
 					return attempt();
 				}
 			};
-			void attempt();
+			void attempt().finally(() => skillTerminalRecoveryControllers.delete(recoveryKey));
 		};
 		if (type === "agent_end" && maintenanceOutcome !== undefined && maintenanceOutcome !== "aborted") {
 			try {
@@ -4586,6 +4602,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const current = active;
 		if (!current) return;
 		for (const controller of skillRecoveryControllers.values()) controller.abort();
+		for (const controller of skillTerminalRecoveryControllers.values()) controller.abort();
 		activePromptOwnerHolder.connectionIds = undefined;
 		activePromptOwnerHolder.lifecycleEpoch = undefined;
 		current.quiesceInput();
