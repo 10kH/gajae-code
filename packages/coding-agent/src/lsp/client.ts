@@ -280,7 +280,13 @@ async function writeMessage(
 	if (terminalError) throw terminalError;
 
 	try {
-		client.proc.stdin.write(`Content-Length: ${Buffer.byteLength(content, "utf-8")}\r\n\r\n${content}`);
+		// FileSink.write() returns `number | Promise<number>`: under backpressure
+		// (e.g. a large didOpen/didChange payload) it returns a promise whose
+		// rejection — typically EPIPE when the server dies mid-write — would
+		// otherwise be discarded here and surface as an unhandled rejection that
+		// takes down the whole process. Await it so every failure mode reaches
+		// the transport-closed mapping below.
+		await client.proc.stdin.write(`Content-Length: ${Buffer.byteLength(content, "utf-8")}\r\n\r\n${content}`);
 		await client.proc.stdin.flush();
 	} catch (error) {
 		if (isKnownSinkPeerClosedError(error)) {

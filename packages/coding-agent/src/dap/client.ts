@@ -62,8 +62,13 @@ function parseMessage(
 
 async function writeMessage(sink: DapWriteSink, message: DapRequestMessage | DapResponseMessage): Promise<void> {
 	const content = JSON.stringify(message);
-	sink.write(`Content-Length: ${Buffer.byteLength(content, "utf-8")}\r\n\r\n`);
-	sink.write(content);
+	// DapWriteSink.write() returns `number | Promise<number>`: under
+	// backpressure it returns a promise whose rejection (e.g. EPIPE when the
+	// adapter dies mid-write) would otherwise be discarded here and surface as
+	// an unhandled rejection. Await both writes so failures reach the callers
+	// that already handle flush() errors.
+	await sink.write(`Content-Length: ${Buffer.byteLength(content, "utf-8")}\r\n\r\n`);
+	await sink.write(content);
 	await sink.flush();
 }
 
