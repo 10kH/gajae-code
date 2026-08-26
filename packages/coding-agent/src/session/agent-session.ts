@@ -21407,16 +21407,6 @@ export class AgentSession {
 				return { cancelled: false };
 			}
 
-			// Tree navigation rewrites live history in place. Drop queued SDK work
-			// before any awaited hook or summarizer can let it promote under the
-			// rewritten successor history without its predecessor owner.
-			const queuedSdkWork = this.#queuedMessagesForSessionTransition();
-			this.#terminalizeQueuedSdkWorkForSessionTransition(queuedSdkWork);
-			this.#deferredSdkFollowUps = [];
-			this.agent.clearAllQueues();
-			this.#steeringMessages = [];
-			this.#followUpMessages = [];
-
 			// Model required for summarization
 			if (options.summarize && !this.model) {
 				throw new Error("No model available for summarization");
@@ -21547,6 +21537,15 @@ export class AgentSession {
 				// No summary, navigating to non-root
 				this.sessionManager.branch(newLeafId);
 			}
+
+			// The history rewrite is now committed. Drop predecessor-owned queued SDK
+			// work at this boundary; cancelled or failed preparation above preserves it.
+			const queuedSdkWork = this.#queuedMessagesForSessionTransition();
+			this.#terminalizeQueuedSdkWorkForSessionTransition(queuedSdkWork);
+			this.#deferredSdkFollowUps = [];
+			this.agent.clearAllQueues();
+			this.#steeringMessages = [];
+			this.#followUpMessages = [];
 
 			// Update agent state through the canonical filtered display context so legacy
 			// request-scoped entries cannot re-enter live history after tree navigation.
