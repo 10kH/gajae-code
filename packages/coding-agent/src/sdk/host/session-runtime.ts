@@ -3194,6 +3194,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	type LifecycleOwner = { state: RuntimeState; sessionId: string; batch?: LifecycleBatch };
 	const retiredLifecycleOwners = new Map<string, RuntimeState[]>();
 	const retiredLifecycleOwnerTimers = new Map<RuntimeState, ReturnType<typeof setTimeout>>();
+	const skillRecoveryControllers = new Map<string, AbortController>();
 	const ambiguousLifecycleIdentities = new Set<string>();
 	const lifecycleRunOwners = new Map<
 		string,
@@ -3966,10 +3967,13 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		): void => {
 			const key = lifecycleCorrelationKey(correlation);
 			if (skillRecoveryTasks.has(key)) return;
+			const controller = new AbortController();
+			skillRecoveryControllers.set(key, controller);
 			const intent = failureIntent;
 			const task = (async (): Promise<void> => {
 				let failureRecorded = intent === undefined;
 				for (;;) {
+					if (controller.signal.aborted) return;
 					try {
 						if (!failureRecorded) {
 							await reconciliation.noteTransition("skill", correlation, {
@@ -3983,17 +3987,30 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						await reconciliation.noteTransition("skill", correlation, { type: "agent_end" });
 						return;
 					} catch (error) {
+						if (controller.signal.aborted) return;
 						logger.error("SDK skill lifecycle recovery retrying", {
 							commandId: correlation.commandId,
 							turnId: correlation.turnId,
 							error: sanitizePromptFailure(error),
 						});
-						await Bun.sleep(1_000);
+						const wait = Promise.withResolvers<void>();
+						const timer = setTimeout(wait.resolve, 1_000);
+						timer.unref();
+						const onAbort = () => {
+							clearTimeout(timer);
+							wait.resolve();
+						};
+						controller.signal.addEventListener("abort", onAbort, { once: true });
+						await wait.promise;
+						controller.signal.removeEventListener("abort", onAbort);
 					}
 				}
 			})();
 			skillRecoveryTasks.set(key, task);
-			void task.finally(() => skillRecoveryTasks.delete(key));
+			void task.finally(() => {
+				skillRecoveryTasks.delete(key);
+				skillRecoveryControllers.delete(key);
+			});
 		};
 		let runtime: SessionSdkSessionRuntime;
 		// Durable-first bounded terminalization for accepted submissions that leave
@@ -4568,6 +4585,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	const stopActive = async (): Promise<void> => {
 		const current = active;
 		if (!current) return;
+		for (const controller of skillRecoveryControllers.values()) controller.abort();
 		activePromptOwnerHolder.connectionIds = undefined;
 		activePromptOwnerHolder.lifecycleEpoch = undefined;
 		current.quiesceInput();
@@ -4576,13 +4594,11 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			await current.waitForGateResolutionQuiescence();
 			if (current.lifecycleTasks.size > 0) {
 				const lifecycleDrain = Promise.all([...current.lifecycleTasks]);
-				let timer: ReturnType<typeof setTimeout> | undefined;
-				const timeout = new Promise<void>(resolve => {
-					timer = setTimeout(resolve, LIFECYCLE_QUIESCENCE_MS);
-				});
-				const drained = Promise.race([lifecycleDrain, timeout]);
+				const timeout = Promise.withResolvers<void>();
+				const timer = setTimeout(timeout.resolve, LIFECYCLE_QUIESCENCE_MS);
+				const drained = Promise.race([lifecycleDrain, timeout.promise]);
 				await drained;
-				if (timer !== undefined) clearTimeout(timer);
+				clearTimeout(timer);
 				if (current.lifecycleTasks.size > 0) {
 					logger.warn("SDK runtime lifecycle drain timed out; durable lifecycle recovery remains authoritative.");
 					options.onLifecycleDrainTimeoutForTests?.();
