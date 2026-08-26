@@ -18609,6 +18609,7 @@ export class AgentSession {
 			},
 			onManagedAttemptAccepted: () => {
 				controller.resetAttemptBudget();
+				this.#escapedNonAsciiManagedRetries = 0;
 				this.#overflowMaintenanceAttempts = 0;
 			},
 			onManagedAttemptOutcome: outcome => this.#handleManagedAttemptOutcome(outcome),
@@ -18744,13 +18745,13 @@ export class AgentSession {
 					`Managed fallback retried the escaped non-ASCII tool-call turn ${MAX_ESCAPED_NONASCII_MANAGED_RETRIES} times without a literal-UTF-8 re-issue; ` +
 					`giving up on this model so the next eligible fallback can re-issue with literal UTF-8.`;
 				const controller = this.#defaultFallbackChain();
-				const controllerStateBeforeFailure = controller.snapshotRuntimeState();
 				const previousModel = this.model;
 				const previousThinkingLevel = this.thinkingLevel;
 				if (this.model) {
 					this.#escapedNonAsciiExhaustedModelKeys.add(`${this.model.provider}\u0000${this.model.id}`);
 				}
 				controller.discardStartedAttempt();
+				const controllerStateBeforeFailure = controller.snapshotRuntimeState();
 				const advanced = controller.recordEscapedArgumentsFailure(errorMessage);
 				this.#escapedNonAsciiManagedRetries = 0;
 				const abortEpoch = this.#abortAdmissionEpoch;
@@ -18955,7 +18956,6 @@ export class AgentSession {
 							...profileAliasIntent,
 							canonicalSessionId: this.agent.providerSessionId ?? this.sessionId,
 							credentialSessionId: this.credentialSessionId,
-							signal,
 						},
 					)
 				: resolveModelRoleValue(selector, this.#modelRegistry.getAvailable(), {
@@ -18980,7 +18980,7 @@ export class AgentSession {
 				controller.onResolutionSkip(managedCursorUnavailable);
 				continue;
 			}
-			const key = await this.#modelRegistry.getApiKey(resolved.model, this.credentialSessionId, { signal });
+			const key = await this.#modelRegistry.getApiKey(resolved.model, this.credentialSessionId);
 			if (signal?.aborted || (abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch))
 				return await rollbackCancelled();
 			if (!isAuthenticated(key) && key !== kNoAuth) {
@@ -19418,9 +19418,9 @@ export class AgentSession {
 			let resolutionError: unknown;
 			if (outcome === "advance") {
 				const controllerStateBeforeAdvance = controller.snapshotRuntimeState();
-				const failedSelectorIndex = controller.chain.entries.indexOf(controller.tried.at(-1)?.selector ?? "");
-				if (failedSelectorIndex >= 0) {
-					controllerStateBeforeAdvance.activeIndex = failedSelectorIndex;
+				const failedEntryIndex = controller.activeIndex - 1;
+				if (failedEntryIndex >= 0 && failedEntryIndex < controller.chain.entries.length) {
+					controllerStateBeforeAdvance.activeIndex = failedEntryIndex;
 					controllerStateBeforeAdvance.attemptsUsed = 0;
 					controllerStateBeforeAdvance.attemptStarted = false;
 					controllerStateBeforeAdvance.exhaustedForTurn = false;

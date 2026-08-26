@@ -426,6 +426,7 @@ describe("AgentSession escaped non-ASCII fallback terminal (#4880)", () => {
 		const manager = SessionManager.create(tempDir.path(), tempDir.path());
 		const streamCalls: string[] = [];
 		const fallbackKeyGate = Promise.withResolvers<string | undefined>();
+		const fallbackAbortGate = Promise.withResolvers<undefined>();
 		let keyCalls = 0;
 		let holdFallbackResolution = true;
 		const originalGetApiKey = modelRegistry.getApiKey.bind(modelRegistry);
@@ -433,12 +434,8 @@ describe("AgentSession escaped non-ASCII fallback terminal (#4880)", () => {
 			keyCalls += 1;
 			if (keyCalls >= 3 && holdFallbackResolution) {
 				if (options?.signal?.aborted) return undefined;
-				return await Promise.race([
-					fallbackKeyGate.promise,
-					new Promise<undefined>(resolve =>
-						options?.signal?.addEventListener("abort", () => resolve(undefined), { once: true }),
-					),
-				]);
+				options?.signal?.addEventListener("abort", () => fallbackAbortGate.resolve(undefined), { once: true });
+				return await Promise.race([fallbackKeyGate.promise, fallbackAbortGate.promise]);
 			}
 			return await originalGetApiKey(model, sessionId, options);
 		});
