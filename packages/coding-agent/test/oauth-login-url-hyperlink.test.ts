@@ -4,6 +4,7 @@ import {
 	buildOAuthLoginAnchor,
 	SelectorController,
 } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
+import { createOAuthUrlCopyLease } from "@gajae-code/coding-agent/modes/shared/oauth-url-copy";
 import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 import { type Component, Text } from "@gajae-code/tui";
@@ -179,5 +180,29 @@ describe("OAuth login row emission", () => {
 		const rows = (labelRow as Text).render(100).filter(row => plainText(row).trim() !== "");
 		expect(rows).toHaveLength(1);
 		expect(urisIn(rows[0]!)).toEqual([URL]);
+	});
+});
+
+describe("OAuth URL copy lease wiring", () => {
+	it("replaces and releases the pending URL lease for controller auth callbacks", () => {
+		const pendingUrls: Array<string | undefined> = [];
+		const lease = createOAuthUrlCopyLease({
+			beginOAuthUrlForCopy: (url: string) => {
+				pendingUrls.push(url);
+				return () => pendingUrls.push(undefined);
+			},
+		});
+
+		lease.replace("https://example.test/oauth/one");
+		lease.replace("https://example.test/oauth/two");
+		lease.release();
+		lease.release();
+
+		expect(pendingUrls).toEqual([
+			"https://example.test/oauth/one",
+			undefined,
+			"https://example.test/oauth/two",
+			undefined,
+		]);
 	});
 });

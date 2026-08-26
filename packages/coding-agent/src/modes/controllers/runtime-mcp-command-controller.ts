@@ -40,6 +40,7 @@ import { shortenPath } from "../../tools/render-utils";
 import { openPath } from "../../utils/open";
 import { MCPAddWizard } from "../components/runtime-mcp-add-wizard";
 import { parseCommandArgs } from "../shared";
+import { createOAuthUrlCopyLease } from "../shared/oauth-url-copy";
 import { theme } from "../theme/theme";
 import type { InteractiveModeContext } from "../types";
 import { groupBySource, parseRemoveArgs, readScopeFlag, showCommandMessage } from "./command-controller-shared";
@@ -550,7 +551,7 @@ export class MCPCommandController {
 		const copyOAuthUrlHint = copyOAuthUrlKey
 			? `Use ${copyOAuthUrlKey} or command palette → Copy OAuth URL to copy this exact URL:`
 			: "Use command palette → Copy OAuth URL to copy this exact URL:";
-		let releaseOAuthUrlForCopy: (() => void) | undefined;
+		const oauthUrlCopyLease = createOAuthUrlCopyLease(this.ctx);
 
 		try {
 			// Create OAuth flow
@@ -574,8 +575,7 @@ export class MCPCommandController {
 				},
 				{
 					onAuth: (info: { url: string; instructions?: string }) => {
-						releaseOAuthUrlForCopy?.();
-						releaseOAuthUrlForCopy = this.ctx.beginOAuthUrlForCopy(info.url);
+						oauthUrlCopyLease.replace(info.url);
 						// Show auth URL prominently in chat
 						this.ctx.chatContainer.addChild(new Spacer(1));
 						this.ctx.chatContainer.addChild(
@@ -678,7 +678,7 @@ export class MCPCommandController {
 				throw new Error(`OAuth authentication failed: ${errorMsg}`);
 			}
 		} finally {
-			releaseOAuthUrlForCopy?.();
+			oauthUrlCopyLease.release();
 		}
 	}
 

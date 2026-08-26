@@ -214,6 +214,7 @@ import { TreeSelectorComponent } from "../components/tree-selector";
 import { UserMessageSelectorComponent } from "../components/user-message-selector";
 import type { JobsObserver } from "../jobs-observer";
 import type { SessionObserverRegistry } from "../session-observer-registry";
+import { createOAuthUrlCopyLease } from "../shared/oauth-url-copy";
 import type { TasksAggregator } from "../tasks-aggregator";
 import type { TranscriptItemRegistry } from "../transcript-item-registry";
 import { acquireResumeProgressLease, type ResumeProgressLease } from "../utils/ui-helpers";
@@ -3493,7 +3494,7 @@ export class SelectorController {
 		const copyOAuthUrlHint = copyOAuthUrlKey
 			? `${copyOAuthUrlKey} or command palette → Copy OAuth URL copies the URL exactly.`
 			: "Command palette → Copy OAuth URL copies the URL exactly.";
-		let releaseOAuthUrlForCopy: (() => void) | undefined;
+		const oauthUrlCopyLease = createOAuthUrlCopyLease(this.ctx);
 		if (providerId === "opencodex") {
 			this.ctx.showStatus("Checking the local OpenCodex proxy…");
 		}
@@ -3502,8 +3503,7 @@ export class SelectorController {
 				providerId as OAuthProvider,
 				{
 					onAuth: (info: { url: string; instructions?: string }) => {
-						releaseOAuthUrlForCopy?.();
-						releaseOAuthUrlForCopy = this.ctx.beginOAuthUrlForCopy(info.url);
+						oauthUrlCopyLease.replace(info.url);
 						this.ctx.chatContainer.addChild(new Spacer(1));
 						this.ctx.chatContainer.addChild(new Text(theme.fg("dim", buildOAuthLoginAnchor(info.url)), 1, 0));
 						const hyperlink = buildOAuthLoginAnchor(info.url, "Click here to login");
@@ -3573,7 +3573,7 @@ export class SelectorController {
 		} catch (error: unknown) {
 			this.ctx.showError(`Login failed: ${error instanceof Error ? error.message : String(error)}`);
 		} finally {
-			releaseOAuthUrlForCopy?.();
+			oauthUrlCopyLease.release();
 			if (useManualInput) {
 				manualInput.clear(`Manual OAuth input cleared for ${providerId}`);
 			}
