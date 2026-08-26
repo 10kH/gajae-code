@@ -4416,12 +4416,14 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						current.lifecycleTasks.size > 0
 					) {
 						const retry = setTimeout(retryCleanup, LIFECYCLE_QUIESCENCE_MS);
+						retry.unref();
 						retiredLifecycleOwnerTimers.set(current, retry);
 						return;
 					}
 					removeRetiredLifecycleOwner(current);
 				};
 				const timer = setTimeout(retryCleanup, LIFECYCLE_QUIESCENCE_MS);
+				timer.unref();
 				retiredLifecycleOwnerTimers.set(current, timer);
 			} else current.deadlineManager.clearAll();
 			current.disposeGate?.();
