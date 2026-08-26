@@ -18782,7 +18782,8 @@ export class AgentSession {
 								!ownership.isCurrent() ||
 								ownership.lease.signal.aborted ||
 								cancellationSignal?.aborted ||
-								this.#abortAdmissionEpoch !== abortEpoch;
+								this.#abortAdmissionEpoch !== abortEpoch ||
+								this.#fallbackTransitionGeneration !== transitionGeneration;
 							if (continuationCancelled) {
 								await restoreOwnedTransition();
 								return;
@@ -18811,6 +18812,7 @@ export class AgentSession {
 								previousModel,
 								previousThinkingLevel,
 								{ emitSwitchEvent: false },
+								transitionGeneration,
 							);
 							if (!switched) {
 								if (this.#abortAdmissionEpoch !== abortEpoch || cancellationSignal?.aborted) {
@@ -18834,7 +18836,11 @@ export class AgentSession {
 								...this.#managedFallbackPromptOptions(),
 								transientRecoveryMessage: this.#escapedNonAsciiRecoveryMessage(),
 							});
-							if (cancellationSignal?.aborted || this.#abortAdmissionEpoch !== abortEpoch) {
+							if (
+								cancellationSignal?.aborted ||
+								this.#abortAdmissionEpoch !== abortEpoch ||
+								this.#fallbackTransitionGeneration !== transitionGeneration
+							) {
 								await restoreOwnedTransition();
 								return;
 							}
@@ -19013,11 +19019,16 @@ export class AgentSession {
 		previousModel?: Model,
 		previousThinkingLevel?: ThinkingLevel,
 		options?: { emitSwitchEvent?: boolean },
+		transitionGeneration?: number,
 	): Promise<boolean> {
 		const promptAbortSignal = this.#promptPreflightAbortController.signal;
 		const cancellationSignal = signal ? AbortSignal.any([signal, promptAbortSignal]) : promptAbortSignal;
+		const transitionStillOwned = () =>
+			transitionGeneration === undefined || this.#fallbackTransitionGeneration === transitionGeneration;
 		const restoreFallbackTransition = () =>
-			this.#restoreDefaultFallbackTransition(controller, rollbackState, previousModel, previousThinkingLevel);
+			transitionStillOwned()
+				? this.#restoreDefaultFallbackTransition(controller, rollbackState, previousModel, previousThinkingLevel)
+				: Promise.resolve();
 		const awaitWithCancellation = async <T>(pending: Promise<T>) => {
 			const cancellation = Promise.withResolvers<"aborted">();
 			const onAbort = () => cancellation.resolve("aborted");
@@ -19035,7 +19046,11 @@ export class AgentSession {
 			await restoreFallbackTransition();
 			return false;
 		};
-		if (cancellationSignal.aborted || (abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch))
+		if (
+			cancellationSignal.aborted ||
+			(abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch) ||
+			!transitionStillOwned()
+		)
 			return await rollbackCancelled();
 		while (!controller.isExhausted()) {
 			const selector = controller.currentSelector();
@@ -19091,7 +19106,11 @@ export class AgentSession {
 							sessionId: this.agent.providerSessionId ?? this.sessionId,
 							credentialSessionId: this.credentialSessionId,
 						});
-			if (cancellationSignal.aborted || (abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch))
+			if (
+				cancellationSignal.aborted ||
+				(abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch) ||
+				!transitionStillOwned()
+			)
 				return await rollbackCancelled();
 			if (!resolved.model) {
 				controller.onResolutionSkip("unknown_model");
@@ -19119,7 +19138,11 @@ export class AgentSession {
 			})();
 			if (keyResult.kind === "aborted") return await rollbackCancelled();
 			const key = keyResult.value;
-			if (cancellationSignal.aborted || (abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch))
+			if (
+				cancellationSignal.aborted ||
+				(abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch) ||
+				!transitionStillOwned()
+			)
 				return await rollbackCancelled();
 			if (!isAuthenticated(key) && key !== kNoAuth) {
 				controller.onResolutionSkip("unauthenticated");
@@ -19137,12 +19160,20 @@ export class AgentSession {
 			);
 			this.agent.setThinkingLevel(toReasoningEffort(this.#thinkingLevel));
 			await this.#syncEditToolModeAfterModelChange(previousEditMode);
-			if (cancellationSignal.aborted || (abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch)) {
+			if (
+				cancellationSignal.aborted ||
+				(abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch) ||
+				!transitionStillOwned()
+			) {
 				return await rollbackCancelled();
 			}
 			if (options?.emitSwitchEvent ?? true)
 				this.#emitFallbackSwitchEvent(controller, from, to, reason, attemptsUsed);
-			if (cancellationSignal.aborted || (abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch))
+			if (
+				cancellationSignal.aborted ||
+				(abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch) ||
+				!transitionStillOwned()
+			)
 				return await rollbackCancelled();
 			return true;
 		}
