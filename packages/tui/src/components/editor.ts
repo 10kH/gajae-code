@@ -1359,32 +1359,34 @@ export class Editor implements Component, Focusable {
 		}
 
 		// Continue with rest of input handling
-		// Ctrl+K - Delete to end of line
-		if (matchesKey(data, "ctrl+k")) {
+		// Kill/yank/word-delete actions resolve through the keybinding registry so a
+		// user remap actually moves them, matching `Input` and `SecretInput`. The
+		// five parity ids below declare exactly the chords the previous literals
+		// implemented, so default behavior is unchanged.
+		if (kb.matches(data, "tui.editor.deleteToLineEnd")) {
 			this.#deleteToEndOfLine();
 		}
 		// Ctrl+U - Delete to start of line
-		else if (matchesKey(data, "ctrl+u")) {
+		else if (kb.matches(data, "tui.editor.deleteToLineStart")) {
 			this.#deleteToStartOfLine();
 		}
-		// Ctrl+W - Delete word backwards
-		else if (matchesKey(data, "ctrl+w")) {
-			this.#deleteWordBackwards();
-		}
-		// Option/Alt+Backspace - Delete word backwards
-		else if (matchesKey(data, "alt+backspace")) {
+		// Deliberate repair, not parity: `tui.editor.deleteWordBackward` declares
+		// ctrl+w, alt+backspace AND ctrl+backspace, but the previous literal chain
+		// implemented only the first two, so the declared ctrl+backspace never
+		// worked in the composer.
+		else if (kb.matches(data, "tui.editor.deleteWordBackward")) {
 			this.#deleteWordBackwards();
 		}
 		// Option/Alt+D - Delete word forwards
-		else if (matchesKey(data, "alt+d") || matchesKey(data, "alt+delete")) {
+		else if (kb.matches(data, "tui.editor.deleteWordForward")) {
 			this.#deleteWordForwards();
 		}
 		// Ctrl+Y - Yank from kill ring
-		else if (matchesKey(data, "ctrl+y")) {
+		else if (kb.matches(data, "tui.editor.yank")) {
 			this.#yankFromKillRing();
 		}
 		// Alt+Y - Yank-pop (cycle kill ring)
-		else if (matchesKey(data, "alt+y")) {
+		else if (kb.matches(data, "tui.editor.yankPop")) {
 			this.#yankPop();
 		}
 		// Ctrl+A - Move to start of line
