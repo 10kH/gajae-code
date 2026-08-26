@@ -66,6 +66,7 @@ async function createContext(options?: {
 	busyPromptMode?: "steer" | "queue";
 	followUpKeys?: string[];
 	ircSidebarToggleKeys?: string[];
+	oauthCopyKeys?: string[];
 }) {
 	let editorText = "";
 	const keyMap: Record<string, string[]> = {
@@ -79,7 +80,7 @@ async function createContext(options?: {
 		"tui.select.cancel": ["escape"],
 		"tui.editor.deleteCharBackward": ["backspace"],
 		"app.todo.toggle": ["alt+shift+t"],
-		"app.clipboard.copyOAuthUrl": ["alt+shift+u"],
+		"app.clipboard.copyOAuthUrl": options?.oauthCopyKeys ?? ["alt+shift+u"],
 		"app.session.tree": ["alt+shift+s"],
 		"app.session.fork": ["alt+shift+f"],
 		"app.session.resume": ["alt+shift+r"],
@@ -417,13 +418,13 @@ describe("InputController keybinding setup", () => {
 	});
 
 	it("copies a pending OAuth URL from the global shortcut without changing focus", async () => {
-		const { InputController, ctx, spies } = await createContext();
+		const { InputController, ctx, spies } = await createContext({ oauthCopyKeys: ["alt+shift+k"] });
 		new InputController(ctx);
 		spies.hasOAuthUrlForCopy.mockReturnValue(true);
 		const addInputListener = ctx.ui.addInputListener as ReturnType<typeof vi.fn>;
 		const listener = addInputListener.mock.calls[0]?.[0] as (data: string) => { consume: boolean } | undefined;
 
-		expect(listener("\x1bU")).toEqual({ consume: true });
+		expect(listener("\x1bK")).toEqual({ consume: true });
 		await Promise.resolve();
 		expect(spies.copyOAuthUrl).toHaveBeenCalledTimes(1);
 		expect(ctx.ui.setFocus as ReturnType<typeof vi.fn>).not.toHaveBeenCalled();

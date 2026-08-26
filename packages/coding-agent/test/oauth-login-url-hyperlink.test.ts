@@ -116,6 +116,7 @@ async function renderLoginRows(
 		chatContainer: { addChild: (child: Component) => rendered.push(child) },
 		editorContainer: { clear: () => {}, detachChild: () => {}, addChild: () => {} },
 		editor: {},
+		keybindings: { getDisplayString: () => "Alt+Shift+K" },
 		showStatus: () => {},
 		showError: () => {},
 		beginOAuthUrlForCopy: (next: string) => {
@@ -158,6 +159,10 @@ describe("OAuth login row emission", () => {
 		for (const row of rows) expect(urisIn(row)).toEqual([URL]);
 		expect(rows.map(fragment).join("")).toBe(URL);
 		expect(pendingUrls).toEqual([URL, undefined]);
+		const guidance = rendered.find(
+			child => child instanceof Text && plainText(child.getText()).includes("Copy OAuth URL"),
+		);
+		expect(guidance && plainText((guidance as Text).getText())).toContain("Alt+Shift+K");
 	});
 
 	it("leaves the adjacent short-label link row pointing at the same target", async () => {
