@@ -521,7 +521,6 @@ function strictDirectSdkSpawnTokens(command: string): string[] | undefined {
 	let tokenStarted = false;
 	let quote: "'" | '"' | undefined;
 	for (const character of command) {
-		if (";&|<>()$`\\*?[]{}#!\n\r".includes(character)) return undefined;
 		if (quote !== undefined) {
 			if (character === quote) {
 				quote = undefined;
@@ -532,6 +531,7 @@ function strictDirectSdkSpawnTokens(command: string): string[] | undefined {
 			}
 			continue;
 		}
+		if (";&|<>()$`\\*?[]{}#!\n\r".includes(character)) return undefined;
 		if (character === "'" || character === '"') {
 			quote = character;
 			tokenStarted = true;

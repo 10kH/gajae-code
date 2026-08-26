@@ -49,6 +49,9 @@ describe("Bash master capability command boundary", () => {
 	it("allows only a direct shell-syntax-free sdk spawn", () => {
 		expect(isStrictDirectSdkSpawnCommand("gjc sdk spawn --cwd /tmp --prompt task")).toBe(true);
 		expect(isStrictDirectSdkSpawnCommand("gjc sdk spawn --prompt 'task with spaces'")).toBe(true);
+		expect(isStrictDirectSdkSpawnCommand("gjc sdk spawn --prompt 'Investigate issue #4420 $HOME [urgent]'")).toBe(
+			true,
+		);
 		expect(isStrictDirectSdkSpawnCommand("gjc sdk spawn --prompt task; env")).toBe(false);
 		expect(isStrictDirectSdkSpawnCommand("gjc sdk spawn --prompt $(cat secret)")).toBe(false);
 		expect(isStrictDirectSdkSpawnCommand("printf x | gjc sdk spawn --cwd /tmp --prompt task")).toBe(false);
