@@ -1,8 +1,8 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getBundledModel } from "@gajae-code/ai";
+import { closeModelCache, getBundledModel } from "@gajae-code/ai";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { assertMasterLaunchDisposition, createMasterModeContext } from "@gajae-code/coding-agent/master-mode/context";
 import {
@@ -14,6 +14,15 @@ import type { SessionListOutcome } from "@gajae-code/coding-agent/sdk/lifecycle/
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { Snowflake } from "@gajae-code/utils";
+import { createMasterCapabilityVerifier, readEndpoint } from "../src/sdk/broker/master-capability";
+import { type IndexedSession, SessionIndex } from "../src/sdk/broker/session-index";
+import { createNotificationsExtension } from "../src/sdk/bus";
+import { SessionSdkSessionRuntime } from "../src/sdk/host/session-runtime";
+import {
+	cleanupFixtureRoot,
+	createNotificationFixtureRoot,
+	isolatedNotificationSettings,
+} from "./helpers/notification-settings";
 
 const authStorages: AuthStorage[] = [];
 const tempDirs: string[] = [];
@@ -56,6 +65,65 @@ function countOccurrences(haystack: string, needle: string): number {
 	return haystack.split(needle).length - 1;
 }
 
+async function waitFor(predicate: () => boolean | Promise<boolean>, label: string): Promise<void> {
+	const deadline = Date.now() + 10_000;
+	while (!(await predicate())) {
+		if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
+		await Bun.sleep(20);
+	}
+}
+
+function hasMasterAttestation(rows: readonly IndexedSession[], sessionId: string, epoch: string): boolean {
+	const matches = (row: IndexedSession | undefined): boolean =>
+		row?.masterRole?.version === 2 &&
+		row.masterRole.ownerSessionId === sessionId &&
+		row.masterRole.launchPid === process.pid &&
+		row.masterRole.role === "master" &&
+		row.masterRole.attestationEpoch === epoch;
+	return (
+		matches(rows.find(row => row.sessionId === sessionId && row.endpointGeneration === 0)) &&
+		matches(rows.find(row => row.sessionId === sessionId && row.endpointGeneration > 0))
+	);
+}
+
+async function waitForMasterAttestation(agentDir: string, sessionId: string, epoch: string): Promise<void> {
+	await waitFor(async () => {
+		const index = await new SessionIndex(agentDir).open();
+		return hasMasterAttestation(index.listSessionIdentities(), sessionId, epoch);
+	}, `master attestation for ${sessionId}`);
+}
+
+async function assertVerifiableMasterAttachment(
+	agentDir: string,
+	sessionId: string,
+	epoch: string,
+): Promise<SessionIndex> {
+	const index = await new SessionIndex(agentDir).open();
+	await index.refresh();
+	const rows = index.listSessionIdentities();
+	const direct = rows.find(row => row.sessionId === sessionId && row.endpointGeneration === 0);
+	const effective = rows.find(row => row.sessionId === sessionId && row.endpointGeneration > 0);
+	expect(hasMasterAttestation(rows, sessionId, epoch)).toBe(true);
+	expect(direct?.hostIncarnation ?? direct?.processIncarnation).toBe(direct?.masterRole?.launchProcessIncarnation);
+	expect(effective).toMatchObject({ live: true, terminal: false, ambiguous: false });
+	expect(effective?.hostIncarnation ?? effective?.processIncarnation).toBe(
+		effective?.masterRole?.launchProcessIncarnation,
+	);
+	if (!effective) throw new Error("Expected effective master host");
+	expect(await readEndpoint(effective)).toBeDefined();
+	return index;
+}
+
+function configuredNotificationSettings(agentDir: string): Settings {
+	return isolatedNotificationSettings(agentDir, {
+		"notifications.enabled": true,
+		"notifications.discord.botToken": "discord-token",
+		"notifications.discord.applicationId": "discord-app",
+		"notifications.discord.guildId": "discord-guild",
+		"notifications.discord.parentChannelId": "discord-parent",
+	});
+}
+
 describe("master launch admission", () => {
 	// Every noninteractive master route must fail admission. The prepared-input
 	// non-TTY case is the dangerous one: it resolves to autoPrint with NO
@@ -95,6 +163,9 @@ describe("master mode prompt integration", () => {
 			const prompt = session.systemPrompt.join("\n\n");
 			expect(countOccurrences(prompt, "# Master Mode")).toBe(1);
 			expect(prompt).toContain("gjc sdk spawn --cwd");
+			expect(prompt).toContain("--idempotency-key <key>");
+			expect(prompt).toContain("gjc sdk session raw global --op session.close");
+			expect(prompt).not.toContain("gjc sdk session close");
 			// The guidance block is the LAST segment: appended after every other
 			// prompt transformation.
 			expect(session.systemPrompt.at(-1)).toContain("# Master Mode");
@@ -202,5 +273,148 @@ describe("master peer snapshot contributor", () => {
 		const message = await contributor();
 		expect(message === undefined || message.content.includes("unavailable")).toBe(true);
 		expect(errors).toHaveLength(0);
+	});
+});
+
+describe("master SDK host composition", () => {
+	it("keeps configured notification adapters on one attested master runtime", async () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-master-notifications-"));
+		const agentDir = path.join(cwd, ".gjc", "agent");
+		const cleanup = await createNotificationFixtureRoot(cwd, agentDir);
+		const authStorage = await AuthStorage.create(path.join(cwd, "auth.db"));
+		const sessionManager = SessionManager.inMemory(cwd);
+		const epoch = "master-notifications-epoch";
+		const masterModeContext = createMasterModeContext("repo", sessionManager.getSessionId(), epoch);
+		const model = getBundledModel("openai", "gpt-4o-mini");
+		if (!model) throw new Error("Expected bundled model");
+		let providerDaemonEnsures = 0;
+		let shutdown: (() => Promise<void>) | undefined;
+		let dispose: (() => Promise<void>) | undefined;
+		const startHost = spyOn(SessionSdkSessionRuntime.prototype, "startHost");
+		try {
+			const created = await createAgentSession({
+				cwd,
+				agentDir,
+				sessionManager,
+				authStorage,
+				settings: configuredNotificationSettings(agentDir),
+				model,
+				disableExtensionDiscovery: true,
+				ensureNotificationProviderDaemon: async () => {
+					providerDaemonEnsures++;
+					return "attached";
+				},
+				extensions: [],
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+				masterModeContext,
+			});
+			shutdown = async () => {
+				await created.session.extensionRunner?.emit({ type: "session_shutdown" });
+			};
+			dispose = async () => await created.session.dispose();
+			const sessionId = sessionManager.getSessionId();
+			await created.session.extensionRunner?.emit({ type: "session_start" });
+			const endpointDir = path.join(cwd, ".gjc", "state", "sdk");
+			const endpoint = path.join(endpointDir, `${sessionId}.json`);
+			await waitFor(async () => await Bun.file(endpoint).exists(), "master SDK endpoint");
+			await waitFor(() => providerDaemonEnsures > 0, "configured notification provider startup");
+			await waitForMasterAttestation(agentDir, sessionId, epoch);
+
+			expect(startHost).toHaveBeenCalledTimes(1);
+			expect(await Array.fromAsync(new Bun.Glob("*.json").scan({ cwd: endpointDir, onlyFiles: true }))).toEqual([
+				`${sessionId}.json`,
+			]);
+			const verifier = createMasterCapabilityVerifier(
+				await assertVerifiableMasterAttachment(agentDir, sessionId, epoch),
+			);
+			expect(await verifier.verifyMasterCapability(sessionId, masterModeContext.getCapability(), epoch)).toEqual({
+				allowed: true,
+			});
+		} finally {
+			try {
+				await shutdown?.();
+			} finally {
+				try {
+					await dispose?.();
+				} finally {
+					authStorage.close();
+					closeModelCache(path.join(cwd, "models.db"));
+					startHost.mockRestore();
+					await cleanupFixtureRoot(cleanup);
+				}
+			}
+		}
+	});
+
+	it("re-attests a successor identity after a notification session switch", async () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-master-notification-switch-"));
+		const agentDir = path.join(cwd, ".gjc", "agent");
+		const cleanup = await createNotificationFixtureRoot(cwd, agentDir);
+		const capability = "master-capability-switch";
+		const epoch = "master-switch-epoch";
+		const initialSessionId = `master-switch-initial-${Snowflake.next()}`;
+		const successorSessionId = `master-switch-successor-${Snowflake.next()}`;
+		let activeSessionId = initialSessionId;
+		const handlers = new Map<string, (event: unknown, context: unknown) => unknown>();
+		const api = {
+			on: (event: string, handler: (event: unknown, context: unknown) => unknown) => handlers.set(event, handler),
+			registerCommand: () => {},
+			sendUserMessage: async () => {},
+		} as never;
+		const ctx = {
+			cwd,
+			sessionManager: {
+				getSessionId: () => activeSessionId,
+				getSessionName: () => "Master notification session",
+				getArtifactsDir: () => cwd,
+				getCwd: () => cwd,
+				getSessionFile: () => path.join(cwd, "sessions", `${activeSessionId}.jsonl`),
+			},
+		} as never;
+		const startHost = spyOn(SessionSdkSessionRuntime.prototype, "startHost");
+		createNotificationsExtension(api, {
+			settings: configuredNotificationSettings(agentDir),
+			masterCapability: capability,
+			masterAttestationEpoch: epoch,
+			ensureProviderDaemon: async () => "attached",
+		});
+		try {
+			const start = handlers.get("session_start");
+			if (!start) throw new Error("Expected session_start handler");
+			await start({ type: "session_start" }, ctx);
+			await waitForMasterAttestation(agentDir, initialSessionId, epoch);
+			expect(startHost).toHaveBeenCalledTimes(1);
+
+			activeSessionId = successorSessionId;
+			const sessionSwitch = handlers.get("session_switch");
+			if (!sessionSwitch) throw new Error("Expected session_switch handler");
+			await sessionSwitch(
+				{
+					type: "session_switch",
+					previousSessionFile: path.join(cwd, "sessions", `${initialSessionId}.jsonl`),
+				},
+				ctx,
+			);
+			await waitForMasterAttestation(agentDir, successorSessionId, epoch);
+			expect(startHost).toHaveBeenCalledTimes(2);
+			const verifier = createMasterCapabilityVerifier(
+				await assertVerifiableMasterAttachment(agentDir, successorSessionId, epoch),
+			);
+			expect(await verifier.verifyMasterCapability(successorSessionId, capability, epoch)).toEqual({
+				allowed: true,
+			});
+		} finally {
+			try {
+				await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, ctx);
+			} finally {
+				startHost.mockRestore();
+				await cleanupFixtureRoot(cleanup);
+			}
+		}
 	});
 });

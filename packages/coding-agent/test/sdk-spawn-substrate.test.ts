@@ -77,10 +77,8 @@ describe("Broker spawn substrate provider", () => {
 		});
 	});
 
-	it("accepts inherited empty environment values and still rejects invalid names or NUL", async () => {
+	it("validates child-specific environment entries while permitting empty values", async () => {
 		const provider = createSpawnSubstrateProvider(managedDependencies());
-		// An empty value is legitimate (AWS_PAGER="" disables a pager) and appears
-		// in ordinary inherited environments; rejecting it failed every spawn.
 		const accepted = await provider.launch({
 			...launchSpec(),
 			env: { CHILD_SETTING: "enabled", AWS_PAGER: "", EMPTY_TOO: "" },
@@ -90,11 +88,38 @@ describe("Broker spawn substrate provider", () => {
 		expect(badName).toMatchObject({ ok: false, code: "substrate_proof_failed" });
 		const nulValue = await provider.launch({ ...launchSpec(), env: { OK_NAME: "a\u0000b" } });
 		expect(nulValue).toMatchObject({ ok: false, code: "substrate_proof_failed" });
-		// Allowing an empty value must not drop the length bound.
 		const atBound = await provider.launch({ ...launchSpec(), env: { OK_NAME: "x".repeat(4096) } });
 		expect(atBound).toMatchObject({ ok: true });
 		const oversized = await provider.launch({ ...launchSpec(), env: { OK_NAME: "x".repeat(4097) } });
 		expect(oversized).toMatchObject({ ok: false, code: "substrate_proof_failed" });
+	});
+
+	it("drops unsupported inherited environment entries without weakening child-specific validation", async () => {
+		let receivedEnvironment: NodeJS.ProcessEnv | undefined;
+		const drops: string[][] = [];
+		const provider = createSpawnSubstrateProvider(
+			managedDependencies({
+				launchManaged: (_spec, environment) => {
+					receivedEnvironment = environment;
+					return managedProof();
+				},
+				onInheritedEnvironmentDrop: names => drops.push([...names]),
+			}),
+		);
+		const result = await provider.launch({
+			...launchSpec(),
+			inheritedEnv: {
+				FOO_BAR: "retained",
+				"FOO-BAR": "dropped",
+				TOO_LARGE: "x".repeat(4097),
+			},
+			env: { CHILD_SETTING: "enabled" },
+		});
+		expect(result).toEqual({ ok: true, proof: substrateProof() });
+		expect(receivedEnvironment).toMatchObject({ FOO_BAR: "retained", CHILD_SETTING: "enabled" });
+		expect(receivedEnvironment?.["FOO-BAR"]).toBeUndefined();
+		expect(receivedEnvironment?.TOO_LARGE).toBeUndefined();
+		expect(drops).toEqual([["FOO-BAR", "TOO_LARGE"]]);
 	});
 
 	it("uses the psmux substrate kind only for the Windows multiplexer selection", async () => {
@@ -214,6 +239,38 @@ describe("Broker spawn substrate provider", () => {
 		live = false;
 		expect(await provider.verify(launched.proof)).toBe("gone");
 		expect(await provider.close(launched.proof)).toEqual({ ok: false, code: "substrate_gone" });
+	});
+
+	it("leaves a SIGTERM-trapping headless incarnation pending until its exit is observed", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-spawn-substrate-"));
+		temporaryDirectories.push(cwd);
+		let live = true;
+		let killTerminates = false;
+		const signals: Array<"SIGTERM" | "SIGKILL"> = [];
+		const provider = createSpawnSubstrateProvider({
+			platform: "darwin",
+			selectMultiplexer: () => "none",
+			startHeadless: () => ({ pid: 993, terminate() {} }),
+			processIncarnation: () => (live ? "darwin:993" : undefined),
+			isProcessGone: () => !live,
+			signalHeadless: (_pid, _incarnation, _platform, signal) => {
+				signals.push(signal);
+				if (signal === "SIGKILL" && killTerminates) live = false;
+				return true;
+			},
+			sleep: async () => {},
+		});
+		const launched = await provider.launch(launchSpec(cwd));
+		expect(launched.ok).toBeTrue();
+		if (!launched.ok) throw new Error("headless substrate did not launch");
+		expect(await provider.close(launched.proof)).toEqual({ ok: false, code: "substrate_close_pending" });
+		expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+		expect(await provider.verify(launched.proof)).toBe("verified");
+
+		killTerminates = true;
+		expect(await provider.close(launched.proof)).toEqual({ ok: true });
+		expect(signals).toEqual(["SIGTERM", "SIGKILL", "SIGTERM", "SIGKILL"]);
+		expect(await provider.verify(launched.proof)).toBe("gone");
 	});
 
 	it("closes only the requested exact sibling proof", async () => {

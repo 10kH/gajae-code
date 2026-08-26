@@ -10,7 +10,12 @@ import {
 	sessionIndexChecksum,
 	sessionWorktreeRoot,
 } from "../src/sdk/broker/session-index";
-import { SDK_STATE_VERSION } from "../src/sdk/broker/state-version";
+import {
+	assertSupportedStateVersion,
+	SDK_STATE_VERSION,
+	SESSION_INDEX_EVENT_VERSION,
+	UnsupportedStateVersionError,
+} from "../src/sdk/broker/state-version";
 
 const event = (sessionId: string) => ({
 	type: "host_registered" as const,
@@ -741,7 +746,7 @@ describe("SDK session index", () => {
 		expect(await unsupported.repair()).toMatchObject({ status: "unsupported", repaired: false });
 		await expect(new SessionIndex(dir).open()).rejects.toThrow(/Unsupported SDK state version/);
 		const futureOne = { ...event("supported-prefix"), version: SDK_STATE_VERSION, indexSeq: 1, ts: 1 };
-		const futureTwo = { ...event("future-event"), version: 2, indexSeq: 2, ts: 2 };
+		const futureTwo = { ...event("future-event"), version: SESSION_INDEX_EVENT_VERSION + 1, indexSeq: 2, ts: 2 };
 		await fs.writeFile(
 			snapshotFile,
 			JSON.stringify({
@@ -766,7 +771,7 @@ describe("SDK session index", () => {
 			snapshotSeq: 2,
 		});
 		expect(await futureSnapshot.repair()).toMatchObject({ status: "unsupported", repaired: false });
-		await expect(futureSnapshot.open()).rejects.toThrow(/maximum supported version is 1/);
+		await expect(futureSnapshot.open()).rejects.toThrow(/maximum supported version is 4/);
 		const invalidFutureSnapshot = JSON.stringify({
 			version: 2,
 			indexSeq: 99,
@@ -793,6 +798,55 @@ describe("SDK session index", () => {
 		const replay = await new SessionIndex(dir).open();
 		expect(replay.listSessions().warnings).toEqual([]);
 		expect(replay.listSessions().sessions.map(s => s.sessionId)).toEqual(["legacy"]);
+	});
+	it("fences locator-v2 log events from older readers before snapshot rotation", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-event-fence-"));
+		const sessionsDir = path.join(dir, "sdk", "sessions");
+		const log = path.join(sessionsDir, "index.jsonl");
+		await fs.mkdir(sessionsDir, { recursive: true });
+		const legacy = {
+			version: SDK_STATE_VERSION,
+			indexSeq: 1,
+			type: "host_registered" as const,
+			sessionId: "legacy-prefix",
+			locator: { repo: dir, stateRoot: path.join(dir, ".gjc", "state") },
+			endpointGeneration: 1,
+			pid: process.pid,
+			ts: 1,
+		};
+		await fs.writeFile(
+			log,
+			`${JSON.stringify({
+				...legacy,
+				checksum: sessionIndexChecksum(legacy as unknown as Omit<SessionIndexEvent, "checksum">),
+			})}\n`,
+		);
+
+		const index = await new SessionIndex(dir).open();
+		const locatorV2 = await index.append(event("locator-v2"));
+		expect(locatorV2.version).toBe(SESSION_INDEX_EVENT_VERSION);
+		expect(await fs.exists(path.join(sessionsDir, "index.snapshot.json"))).toBe(false);
+
+		const entries = (await fs.readFile(log, "utf8"))
+			.trim()
+			.split("\n")
+			.map(line => JSON.parse(line));
+		expect(entries).toMatchObject([
+			{ version: SDK_STATE_VERSION },
+			{ version: SESSION_INDEX_EVENT_VERSION, locator: { cwd: "r", worktreeRoot: null, stateRoot: "q" } },
+		]);
+		let thrown: unknown;
+		try {
+			for (const entry of entries) assertSupportedStateVersion(log, entry);
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).toBeInstanceOf(UnsupportedStateVersionError);
+		expect(thrown).toMatchObject({
+			code: "unsupported_state_version",
+			version: SESSION_INDEX_EVENT_VERSION,
+			maximumSupportedVersion: SDK_STATE_VERSION,
+		});
 	});
 	it("compacts idempotently: a second snapshot of the same history is byte-identical", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));

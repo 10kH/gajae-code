@@ -6,7 +6,7 @@ import * as path from "node:path";
 import { Broker } from "../src/sdk/broker/broker";
 import { processIncarnation } from "../src/sdk/broker/process-incarnation";
 import { type SessionIndexEvent, sessionIndexChecksum } from "../src/sdk/broker/session-index";
-import { SDK_STATE_VERSION } from "../src/sdk/broker/state-version";
+import { SESSION_INDEX_EVENT_VERSION } from "../src/sdk/broker/state-version";
 import { verifyMasterCapabilityFrame } from "../src/sdk/host/session-runtime";
 
 const capability = "master-capability-fixed-e2e";
@@ -21,7 +21,7 @@ function event(
 ): SessionIndexEvent {
 	const unsigned: Omit<SessionIndexEvent, "checksum"> = {
 		...input,
-		version: SDK_STATE_VERSION as 1,
+		version: SESSION_INDEX_EVENT_VERSION,
 		indexSeq,
 		ts: Date.now(),
 	};

@@ -7,6 +7,7 @@ import {
 	selectNewestMasterAttestationEpoch,
 } from "@gajae-code/coding-agent/sdk/cli/master-cli";
 import type { IndexedSession } from "../src/sdk/broker/session-index";
+import { SdkClientError } from "../src/sdk/client/client";
 
 const task = "secret-task-fixture";
 const capability = "secret-capability-fixture";
@@ -15,37 +16,56 @@ const masterEnv = { GJC_MASTER_CAPABILITY: capability, GJC_SESSION_ID: "master-c
 const epoch = async () => "epoch-cli";
 
 describe("gjc sdk spawn CLI", () => {
-	it("selects the newest retained master epoch instead of the first row", () => {
-		const attestation = (attestationEpoch: string) => ({
-			version: 2 as const,
-			ownerSessionId: "master-cli-owner",
-			launchPid: 42,
-			launchProcessIncarnation: "process-42",
-			role: "master" as const,
-			attestationEpoch,
-		});
-		const row = (indexSeq: number, epoch: string, endpointGeneration: number, live = true): IndexedSession => ({
-			sessionId: "master-cli-owner",
-			locator: { cwd: "/repo", worktreeRoot: "/repo", stateRoot: "/state" },
-			endpointGeneration,
-			pid: 42,
-			processIncarnation: "process-42",
-			live,
-			indexSeq,
-			identityProvenance: "composite",
-			ambiguous: false,
-			terminal: false,
-			masterRole: attestation(epoch),
-		});
+	const attestation = (attestationEpoch: string, launchProcessIncarnation: string) => ({
+		version: 2 as const,
+		ownerSessionId: "master-cli-owner",
+		launchPid: 42,
+		launchProcessIncarnation,
+		role: "master" as const,
+		attestationEpoch,
+	});
+	const row = (
+		indexSeq: number,
+		epoch: string,
+		endpointGeneration: number,
+		live = true,
+		processIncarnation = "process-42",
+	): IndexedSession => ({
+		sessionId: "master-cli-owner",
+		locator: { cwd: "/repo", worktreeRoot: "/repo", stateRoot: "/state" },
+		endpointGeneration,
+		pid: 42,
+		processIncarnation,
+		live,
+		indexSeq,
+		identityProvenance: "composite",
+		ambiguous: false,
+		terminal: false,
+		masterRole: attestation(epoch, processIncarnation),
+	});
+
+	it("selects the older live epoch when a newer crashed master registration remains", () => {
 		const rows: IndexedSession[] = [
-			row(1, "old-epoch", 0),
-			row(20, "old-epoch", 1),
-			row(19, "new-epoch", 0),
-			row(21, "new-epoch", 1),
-			row(22, "stale-epoch", 1, false),
+			row(1, "older-live-epoch", 0),
+			row(20, "older-live-epoch", 1),
+			row(21, "crashed-newer-epoch", 0, false),
+			row(22, "crashed-newer-epoch", 1, false),
 		];
 
-		expect(selectNewestMasterAttestationEpoch(rows, "master-cli-owner")).toBe("new-epoch");
+		expect(selectNewestMasterAttestationEpoch(rows, "master-cli-owner")).toBe("older-live-epoch");
+	});
+
+	it("selects the live resumed master incarnation when a stale identity is returned first", () => {
+		const priorProcess = "process-prior";
+		const resumedProcess = "process-resumed";
+		const rows: IndexedSession[] = [
+			row(30, "prior-epoch", 1, false, priorProcess),
+			row(29, "prior-epoch", 0, false, priorProcess),
+			row(31, "resumed-epoch", 0, true, resumedProcess),
+			row(32, "resumed-epoch", 1, true, resumedProcess),
+		];
+
+		expect(selectNewestMasterAttestationEpoch(rows, "master-cli-owner")).toBe("resumed-epoch");
 	});
 
 	it("requires --cwd and --prompt", async () => {
@@ -109,6 +129,59 @@ describe("gjc sdk spawn CLI", () => {
 		});
 		expect(first.exitCode).toBe(0);
 		expect(second.rendered.code).toBe("spawn_accepted");
+	});
+
+	it("joins an existing claim when re-run with an explicit idempotency key", async () => {
+		const idempotencyKey = "spawn-join-key";
+		const keys: string[] = [];
+		const inputs: Record<string, unknown>[] = [];
+		const claims = new Map<string, string>();
+		let launches = 0;
+		const dispatch = async (_agentDir: string, input: Record<string, unknown>, key: string) => {
+			keys.push(key);
+			inputs.push(input);
+			const existing = claims.get(key);
+			if (existing) return { ok: true, result: { code: "spawn_replayed", sessionId: existing } };
+			launches += 1;
+			const sessionId = `child-${launches}`;
+			claims.set(key, sessionId);
+			return { ok: true, result: { code: "spawn_accepted", sessionId } };
+		};
+		const dependencies = { env: masterEnv, resolveAttestationEpoch: epoch, dispatch };
+		const args = { cwd: "/tmp", prompt: task, idempotencyKey };
+		const accepted = await runSdkSpawn(args, dependencies);
+		const replay = await runSdkSpawn(args, dependencies);
+		expect(keys).toEqual([idempotencyKey, idempotencyKey]);
+		expect(inputs[1]).toEqual(inputs[0]);
+		expect(accepted.rendered).toMatchObject({ code: "spawn_accepted", sessionId: "child-1" });
+		expect(replay.rendered).toMatchObject({ code: "spawn_replayed", sessionId: "child-1" });
+		expect(launches).toBe(1);
+	});
+
+	it("renders the replay key when session.spawn is uncertain after send", async () => {
+		const idempotencyKey = "spawn-retry-key";
+		let dispatchedKey: string | undefined;
+		const result = await runSdkSpawn(
+			{ cwd: "/tmp", prompt: task, idempotencyKey },
+			{
+				env: masterEnv,
+				resolveAttestationEpoch: epoch,
+				dispatch: async (_agentDir, _input, key) => {
+					dispatchedKey = key;
+					throw new SdkClientError("uncertain_after_send", "spawn response was lost after send");
+				},
+			},
+		);
+		expect(dispatchedKey).toBe(idempotencyKey);
+		expect(result).toEqual({
+			rendered: {
+				code: "uncertain_after_send",
+				idempotencyKey,
+				error: { code: "uncertain_after_send", message: "spawn response was lost after send" },
+			},
+			exitCode: 1,
+		});
+		expect(renderSpawnTable(result.rendered)).toContain(`Retry idempotency key: ${idempotencyKey}`);
 	});
 
 	it("renders only safe fields for every outcome and never echoes input", async () => {

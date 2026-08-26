@@ -5,12 +5,14 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Broker } from "../src/sdk/broker/broker";
 import { getBrokerIdentityKey } from "../src/sdk/broker/identity";
+import { setLifecycleCommandResolverForTest } from "../src/sdk/broker/lifecycle";
 import {
 	isSpawnClaimV2,
 	type SeedDeliveryV2,
 	SpawnAuthorityStore,
 	type SpawnClaimV2,
 } from "../src/sdk/broker/spawn-authority";
+import { createSpawnSubstrateProvider } from "../src/sdk/broker/spawn-substrate";
 
 const identityKey = "a".repeat(64);
 const bindingMac = "b".repeat(64);
@@ -1100,7 +1102,7 @@ describe("Broker spawn close and orphan reaper", () => {
 		attestationEpoch: "epoch-close",
 		cwd: process.cwd(),
 	});
-	type ProviderProbe = { verdict: "verified" | "mismatch" | "gone"; closes: number };
+	type ProviderProbe = { verdict: "verified" | "mismatch" | "gone"; closes: number; closePending?: boolean };
 	function provider(probe: ProviderProbe) {
 		return {
 			launch: async () => ({
@@ -1115,6 +1117,8 @@ describe("Broker spawn close and orphan reaper", () => {
 			verify: async () => probe.verdict,
 			close: async () => {
 				probe.closes += 1;
+				if (probe.closePending) return { ok: false, code: "substrate_close_pending" };
+				probe.verdict = "gone";
 				return { ok: true };
 			},
 		};
@@ -1151,6 +1155,51 @@ describe("Broker spawn close and orphan reaper", () => {
 		return childId;
 	}
 
+	it("launches after dropping unsupported broker-inherited environment entries", async () => {
+		const agentDir = await temp();
+		let launchEnvironment: NodeJS.ProcessEnv | undefined;
+		const drops: string[][] = [];
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: createSpawnSubstrateProvider({
+				platform: "darwin",
+				selectMultiplexer: () => "none",
+				startHeadless: (_spec, environment) => {
+					launchEnvironment = environment;
+					return { pid: 996, terminate() {} };
+				},
+				processIncarnation: pid => (pid === 996 ? "inc-996" : undefined),
+				isProcessGone: () => false,
+				onInheritedEnvironmentDrop: names => drops.push([...names]),
+			}),
+			spawnPromptLayer: promptLayer,
+		});
+		setLifecycleCommandResolverForTest(broker, () => ({
+			kind: "compiled",
+			file: "child-command",
+			args: [],
+			env: { "FOO-BAR": "retained-by-os", TOO_LARGE: "x".repeat(4097), SAFE_PARENT: "kept" },
+		}));
+		await broker.start();
+		try {
+			const response = await broker.handleRequest(
+				"session.spawn",
+				{ ...spawnInput(), cwd: agentDir },
+				"inherited-environment-key",
+			);
+			expect(response).toMatchObject({ ok: true, result: { code: "spawn_accepted" } });
+			expect(launchEnvironment).toMatchObject({ SAFE_PARENT: "kept" });
+			expect(launchEnvironment?.["FOO-BAR"]).toBeUndefined();
+			expect(launchEnvironment?.TOO_LARGE).toBeUndefined();
+			expect(drops).toEqual([["FOO-BAR", "TOO_LARGE"]]);
+		} finally {
+			setLifecycleCommandResolverForTest(broker, undefined);
+			await broker.stop();
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
 	it("closes only a re-proven substrate and replays repeated close safely", async () => {
 		const agentDir = await temp();
 		const probe: ProviderProbe = { verdict: "verified", closes: 0 };
@@ -1174,6 +1223,42 @@ describe("Broker spawn close and orphan reaper", () => {
 			const claim = store.claims().find(candidate => candidate.childId === childId);
 			expect(claim?.state).toBe("closed");
 			expect(store.authority(claim?.lifecycleIdentity ?? "")?.closeState).toBe("closed");
+		} finally {
+			await broker.stop();
+		}
+	});
+
+	it("retains close_requested until the exact headless incarnation is observed gone", async () => {
+		const agentDir = await temp();
+		const probe: ProviderProbe = { verdict: "verified", closes: 0, closePending: true };
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: provider(probe),
+			spawnPromptLayer: promptLayer,
+		});
+		await broker.start();
+		try {
+			const childId = await acceptedChild(broker, "close-pending-key");
+			const retained = await broker.handleRequest("session.close", { sessionId: childId }, undefined);
+			expect(retained).toMatchObject({ ok: false, error: { code: "close_refused" } });
+			expect(probe.closes).toBe(1);
+			const store = new SpawnAuthorityStore(agentDir, await getBrokerIdentityKey(agentDir));
+			await store.open();
+			const claim = store.claims().find(candidate => candidate.childId === childId);
+			const identity = claim?.lifecycleIdentity ?? "";
+			expect(claim?.state).toBe("accepted");
+			expect(store.authority(identity)).toMatchObject({ closeState: "close_requested" });
+
+			// A later maintenance pass retries the close request. The provider reports
+			// success only after it observes the exact incarnation gone.
+			probe.closePending = false;
+			await broker.reapSpawnOrphansOnce();
+			expect(probe.closes).toBe(2);
+			const reopened = new SpawnAuthorityStore(agentDir, await getBrokerIdentityKey(agentDir));
+			await reopened.open();
+			expect(reopened.claim(identity)?.state).toBe("closed");
+			expect(reopened.authority(identity)?.closeState).toBe("closed");
 		} finally {
 			await broker.stop();
 		}

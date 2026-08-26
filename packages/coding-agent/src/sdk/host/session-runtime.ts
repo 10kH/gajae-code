@@ -25,7 +25,12 @@ import {
 import { parseThinkingLevel } from "../../thinking";
 import { ensureBroker } from "../broker/ensure";
 import { processIncarnation } from "../broker/process-incarnation";
-import { type MasterRoleAttestationV2, resolveSessionLocator, SessionIndex } from "../broker/session-index";
+import {
+	type MasterRoleAttestationV2,
+	resolveSessionLocator,
+	SessionIndex,
+	type SessionLocatorV2,
+} from "../broker/session-index";
 import {
 	collectAuthenticatedProfileProviders,
 	parseSyntheticModelId,
@@ -3096,7 +3101,7 @@ export function registerSdkOnlyNotificationCommand(api: ExtensionAPI): void {
 	});
 }
 
-function masterAttestationForEffectiveHost(input: {
+export function masterAttestationForEffectiveHost(input: {
 	masterCapability: string | undefined;
 	attestationEpoch: string | undefined;
 	sessionId: string;
@@ -3116,6 +3121,82 @@ function masterAttestationForEffectiveHost(input: {
 	)
 		return undefined;
 	return direct;
+}
+
+function masterDirectAttestation(input: {
+	masterCapability: string | undefined;
+	attestationEpoch: string | undefined;
+	sessionId: string;
+	pid: number;
+	processIncarnation: string | undefined;
+}): MasterRoleAttestationV2 | undefined {
+	if (
+		input.masterCapability === undefined ||
+		input.attestationEpoch === undefined ||
+		input.processIncarnation === undefined
+	)
+		return undefined;
+	return {
+		version: 2,
+		ownerSessionId: input.sessionId,
+		launchPid: input.pid,
+		launchProcessIncarnation: input.processIncarnation,
+		role: "master",
+		attestationEpoch: input.attestationEpoch,
+	};
+}
+
+function sameMasterAttestation(left: MasterRoleAttestationV2, right: MasterRoleAttestationV2): boolean {
+	return (
+		left.version === right.version &&
+		left.ownerSessionId === right.ownerSessionId &&
+		left.launchPid === right.launchPid &&
+		left.launchProcessIncarnation === right.launchProcessIncarnation &&
+		left.role === right.role &&
+		left.attestationEpoch === right.attestationEpoch
+	);
+}
+
+/**
+ * Establish direct master authority for the session currently hosted by this
+ * process. Session identity transitions retain the master capability and epoch
+ * but require a new direct attestation before their effective endpoint can
+ * adopt that authority.
+ */
+export async function reattestMasterSessionIdentity(input: {
+	index: SessionIndex;
+	locator: SessionLocatorV2;
+	masterCapability: string | undefined;
+	attestationEpoch: string | undefined;
+	sessionId: string;
+	pid: number;
+	processIncarnation: string | undefined;
+}): Promise<MasterRoleAttestationV2 | undefined> {
+	const masterRole = masterDirectAttestation(input);
+	if (!masterRole) return undefined;
+	const directExists = input.index.listSessionIdentities().some(row => {
+		const processIdentity = row.hostIncarnation ?? row.processIncarnation;
+		return (
+			row.sessionId === input.sessionId &&
+			row.endpointGeneration === 0 &&
+			row.pid === input.pid &&
+			processIdentity === input.processIncarnation &&
+			row.masterRole !== undefined &&
+			sameMasterAttestation(row.masterRole, masterRole)
+		);
+	});
+	if (!directExists) {
+		await input.index.append({
+			type: "host_registered",
+			sessionId: input.sessionId,
+			locator: input.locator,
+			endpointGeneration: 0,
+			pid: input.pid,
+			processIncarnation: input.processIncarnation,
+			masterRole,
+		});
+	}
+	return masterRole;
 }
 
 /** Install a complete SDK host for a session when notifications are inactive. */
@@ -4105,17 +4186,20 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				await ensureBroker({ agentDir: options.agentDir });
 				const index = await new SessionIndex(options.agentDir).open();
 				const locator = await resolveSessionLocator(ctx.cwd, stateRoot);
+				const effectiveIncarnation = processIncarnation(process.pid);
+				const direct = await reattestMasterSessionIdentity({
+					index,
+					locator,
+					masterCapability: options.masterCapability,
+					attestationEpoch: options.masterAttestationEpoch,
+					sessionId,
+					pid: process.pid,
+					processIncarnation: effectiveIncarnation,
+				});
 				await runtime.registerWithBroker({
 					register: async input => {
 						const endpointMtimeMs = (await fs.stat(path.join(input.stateRoot, "sdk", `${input.sessionId}.json`)))
 							.mtimeMs;
-						const direct = index
-							.listSessionIdentities()
-							.find(
-								row =>
-									row.sessionId === input.sessionId && row.endpointGeneration === 0 && row.pid === process.pid,
-							)?.masterRole;
-						const effectiveIncarnation = processIncarnation(process.pid);
 						const masterRole = masterAttestationForEffectiveHost({
 							masterCapability: options.masterCapability,
 							attestationEpoch: options.masterAttestationEpoch,

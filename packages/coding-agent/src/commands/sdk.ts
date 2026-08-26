@@ -872,6 +872,9 @@ class SdkSpawnCommand extends Command {
 		model: Flags.string({ description: "Model selector for the child" }),
 		profile: Flags.string({ description: "Model profile name for the child" }),
 		"agent-dir": Flags.string({ description: "SDK broker state directory" }),
+		"idempotency-key": Flags.string({
+			description: "Idempotency key for replaying an uncertain session.spawn result",
+		}),
 		json: Flags.boolean({ description: "Render the safe spawn result as JSON" }),
 	};
 	async run(): Promise<void> {
@@ -883,6 +886,7 @@ class SdkSpawnCommand extends Command {
 				model: flags.model,
 				profile: flags.profile,
 				agentDir: flags["agent-dir"],
+				idempotencyKey: flags["idempotency-key"],
 			});
 			process.stdout.write(`${flags.json ? JSON.stringify(spawn.rendered) : renderSpawnTable(spawn.rendered)}\n`);
 			if (spawn.exitCode !== 0) process.exitCode = spawn.exitCode;

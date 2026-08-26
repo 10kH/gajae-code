@@ -2,9 +2,15 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { reserveLaunchWorktreeForTest } from "../src/commands/launch";
+import {
+	type LaunchWorktreeReservation,
+	launchWorktreeReservationDirectoryForTest,
+	releaseLaunchWorktreeReservationAfterRegistration,
+} from "../src/gjc-runtime/launch-worktree-reservation";
 import { lifecycleTargetForTest } from "../src/sdk/broker/broker";
 import { worktreeOccupantForTest } from "../src/sdk/broker/lifecycle";
-import type { IndexedSession } from "../src/sdk/broker/session-index";
+import { type IndexedSession, SessionIndex } from "../src/sdk/broker/session-index";
 
 const WORKTREE = "/repos/app.gajae-code-worktrees/main-0d6e4079";
 const OTHER_WORKTREE = "/repos/app.gajae-code-worktrees/task-b-1a2b3c4d";
@@ -162,5 +168,96 @@ describe("worktree occupancy", () => {
 		];
 
 		expect(worktreeOccupantForTest(sessions, WORKTREE, pid => (pid === 4242 ? "exited" : "alive"))).toBe("holder");
+	});
+});
+
+describe("launch worktree reservation", () => {
+	it("allows exactly one overlapping preflight for a deterministic worktree path", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-launch-worktree-reservation-"));
+		const worktreePath = path.join(agentDir, "worktree");
+		let winner: LaunchWorktreeReservation | undefined;
+		try {
+			const results = await Promise.allSettled([
+				reserveLaunchWorktreeForTest(agentDir, worktreePath),
+				reserveLaunchWorktreeForTest(agentDir, worktreePath),
+			]);
+			const fulfilled = results.filter(
+				(result): result is PromiseFulfilledResult<LaunchWorktreeReservation> => result.status === "fulfilled",
+			);
+			const rejected = results.filter(result => result.status === "rejected");
+
+			expect(fulfilled).toHaveLength(1);
+			expect(rejected).toHaveLength(1);
+			winner = fulfilled[0]?.value;
+			if (!winner) throw new Error("Expected one worktree reservation winner.");
+			const loser = rejected[0];
+			if (!loser || loser.status !== "rejected") throw new Error("Expected one worktree reservation loser.");
+			const message = loser.reason instanceof Error ? loser.reason.message : String(loser.reason);
+			expect(message).toStartWith(`worktree_in_use:${worktreePath}`);
+		} finally {
+			await winner?.release();
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("releases the reservation once the launched host is registered", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-launch-worktree-registered-reservation-"));
+		const targetRoot = path.join(agentDir, "target");
+		const aliasRoot = path.join(agentDir, "alias");
+		const worktreePath = path.join(aliasRoot, "worktree");
+		const registeredWorktreePath = path.join(targetRoot, "worktree");
+		const lockInfo = path.join(launchWorktreeReservationDirectoryForTest(agentDir, worktreePath), "info");
+		let reservation: LaunchWorktreeReservation | undefined;
+		try {
+			await fs.mkdir(targetRoot);
+			await fs.symlink(targetRoot, aliasRoot, process.platform === "win32" ? "junction" : "dir");
+			reservation = await reserveLaunchWorktreeForTest(agentDir, worktreePath);
+			await fs.mkdir(registeredWorktreePath);
+			await new SessionIndex(agentDir).append({
+				type: "host_registered",
+				sessionId: "launch-holder",
+				locator: {
+					cwd: registeredWorktreePath,
+					worktreeRoot: registeredWorktreePath,
+					stateRoot: path.join(agentDir, "state"),
+				},
+				endpointGeneration: 1,
+				pid: process.pid,
+			});
+			await releaseLaunchWorktreeReservationAfterRegistration(agentDir, registeredWorktreePath);
+
+			expect(await Bun.file(lockInfo).exists()).toBe(false);
+		} finally {
+			await reservation?.release();
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("reclaims a reservation whose owner pid has exited", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-launch-worktree-stale-reservation-"));
+		const worktreePath = path.join(agentDir, "worktree");
+		const lockDir = launchWorktreeReservationDirectoryForTest(agentDir, worktreePath);
+		try {
+			await fs.mkdir(lockDir, { recursive: true, mode: 0o700 });
+			await Bun.write(
+				path.join(lockDir, "info"),
+				JSON.stringify({
+					version: 1,
+					worktreePath,
+					pid: 525_252,
+					start_time: "dead-owner",
+					processIncarnation: "dead-owner",
+					timestamp: Date.now(),
+					reservationId: "stale-reservation",
+				}),
+			);
+
+			const reservation = await reserveLaunchWorktreeForTest(agentDir, worktreePath);
+			expect(await Bun.file(path.join(lockDir, "info")).exists()).toBe(true);
+			await reservation.release();
+			expect(await Bun.file(path.join(lockDir, "info")).exists()).toBe(false);
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
 	});
 });

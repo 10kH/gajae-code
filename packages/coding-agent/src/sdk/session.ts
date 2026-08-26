@@ -3114,16 +3114,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				try {
 					if (autoroutingInactive) markAutoroutingInactive(api);
 					if (lifecycleStartupCapability) attachLifecycleStartupCapability(api, lifecycleStartupCapability);
-					if (masterModeContext) {
-						createSdkSessionRuntimeExtension(api, {
-							agentDir,
-							createTransport: input => createSdkWebSocketTransport(input),
-							settings,
-							masterCapability: masterModeContext.getCapability(),
-							masterAttestationEpoch: masterModeContext.attestationEpoch,
-						});
-						return;
-					}
 					if (lifecycleStartupCapability && process.env.GJC_SDK_TEST_FACTORY_FAILURE === cwd)
 						throw new Error(process.env.GJC_SDK_TEST_FACTORY_SECRET ?? "Lifecycle factory test failure.");
 					if (notificationsExtensionEligible) {
@@ -3134,6 +3124,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							controller: notificationSessionController,
 							spawnedByGjc,
 							sdkHostModeSupported: options.sdkHostModeSupported,
+							...(masterModeContext
+								? {
+										masterCapability: masterModeContext.getCapability(),
+										masterAttestationEpoch: masterModeContext.attestationEpoch,
+									}
+								: {}),
 							// INTERNAL terminal-abort seams, threaded directly from the
 							// owning session (NOT on the public extension context).
 							terminalAbortSeams: {
@@ -3184,6 +3180,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							createTransport: input => createSdkWebSocketTransport(input),
 							settings,
 							configOverrides: new Map(),
+							...(masterModeContext
+								? {
+										masterCapability: masterModeContext.getCapability(),
+										masterAttestationEpoch: masterModeContext.attestationEpoch,
+									}
+								: {}),
 							// INTERNAL terminal-abort seams, threaded directly from the
 							// owning session (NOT on the public extension context).
 							terminalAbortSeams: {

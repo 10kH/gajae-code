@@ -13,6 +13,7 @@ import {
 	type BashToolInput,
 	isStrictDirectSdkSpawnCommand,
 	masterCommandEnvOverrides,
+	parseDirectSdkSpawnArgs,
 } from "../../src/tools/bash";
 import * as shellSnapshot from "../../src/utils/shell-snapshot";
 import { stubBashExecutorSettings } from "../helpers/tool-session-settings";
@@ -64,6 +65,19 @@ describe("Bash master capability command boundary", () => {
 				true,
 			),
 		).toEqual({});
+	});
+});
+
+describe("Direct master spawn argument parsing", () => {
+	it("accepts --idempotency-key so uncertain spawns can be replayed", () => {
+		const args = parseDirectSdkSpawnArgs("gjc sdk spawn --cwd /repo --prompt task --idempotency-key retry-key-1");
+		expect(args).toEqual({ cwd: "/repo", prompt: "task", idempotencyKey: "retry-key-1" });
+	});
+
+	it("still rejects agent directory overrides", () => {
+		expect(() => parseDirectSdkSpawnArgs("gjc sdk spawn --cwd /repo --prompt task --agent-dir /tmp/x")).toThrow(
+			"Master spawn cannot override the session agent directory.",
+		);
 	});
 });
 

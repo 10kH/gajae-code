@@ -1910,6 +1910,7 @@ fn is_v3_frame(text: &str) -> bool {
 				| "lease_release"
 				| "reverse_response"
 				| "session_activate"
+				| "master_capability_verify"
 		)
 	)
 }
@@ -2166,7 +2167,8 @@ mod tests {
 	}
 
 	#[test]
-	fn event_replay_is_a_v3_frame() {
+	fn master_capability_verify_is_a_v3_frame() {
+		assert!(is_v3_frame(r#"{"type":"master_capability_verify","id":"verify-1"}"#));
 		assert!(is_v3_frame(r#"{"type":"event_replay","id":"replay-1"}"#));
 		// Prepared-session activation is a v3 session frame: the transport must
 		// forward it to the host instead of dropping it as an unknown message.

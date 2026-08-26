@@ -1,11 +1,12 @@
 export const SDK_STATE_VERSION = 1;
 
-// The session-index snapshot carries its own format version, independent of the shared
-// SDK_STATE_VERSION used by discovery, the lifecycle ledger, and per-event records.
-// Version 4 requires SessionLocatorV2 (`cwd`, `worktreeRoot`, `stateRoot`) on every
-// retained row. Older snapshots are intentionally unreadable: legacy `repo` rows are
-// ambiguous and must re-register rather than being translated at read time.
+// The session-index snapshot and event log share one format version. Version 4
+// requires SessionLocatorV2 (`cwd`, `worktreeRoot`, `stateRoot`) on every
+// retained row. New v4 events force older brokers to fail closed before they
+// misread `cwd` as the former `repo`; pre-v4 snapshots remain readable only to
+// quarantine legacy rows.
 export const SESSION_INDEX_SNAPSHOT_VERSION = 4;
+export const SESSION_INDEX_EVENT_VERSION = SESSION_INDEX_SNAPSHOT_VERSION;
 
 export class UnsupportedStateVersionError extends Error {
 	readonly code = "unsupported_state_version";
@@ -28,6 +29,22 @@ export function assertSupportedStateVersion(file: string, value: unknown): void 
 	for (const version of [record.version, record.stateVersion]) {
 		if (typeof version === "number" && Number.isFinite(version) && version > SDK_STATE_VERSION) {
 			throw new UnsupportedStateVersionError(file, version);
+		}
+	}
+}
+
+/** Rejects session-index events outside the known legacy and current formats. */
+export function assertSupportedSessionIndexEventVersion(file: string, value: unknown): void {
+	if (!value || typeof value !== "object") return;
+	const record = value as { version?: unknown; stateVersion?: unknown };
+	for (const version of [record.version, record.stateVersion]) {
+		if (
+			typeof version === "number" &&
+			Number.isFinite(version) &&
+			version !== SDK_STATE_VERSION &&
+			version !== SESSION_INDEX_EVENT_VERSION
+		) {
+			throw new UnsupportedStateVersionError(file, version, SESSION_INDEX_EVENT_VERSION);
 		}
 	}
 }

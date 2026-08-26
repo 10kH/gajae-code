@@ -149,9 +149,11 @@
 					"maximum": 86400000
 				},
 				"masterOrphanGraceMs": {
-					"type": "number",
+					"type": "integer",
 					"description": "Grace period before a master-spawned child orphaned by confirmed master loss is closed.",
-					"default": 120000
+					"default": 120000,
+					"minimum": 60000,
+					"maximum": 3600000
 				}
 			},
 			"additionalProperties": false

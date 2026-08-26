@@ -7,9 +7,10 @@ import { withFileLock } from "../../config/file-lock";
 import { repo } from "../../utils/git";
 import { processIncarnation } from "./process-incarnation";
 import {
+	assertSupportedSessionIndexEventVersion,
 	assertSupportedSnapshotVersion,
-	assertSupportedStateVersion,
 	SDK_STATE_VERSION,
+	SESSION_INDEX_EVENT_VERSION,
 	SESSION_INDEX_SNAPSHOT_VERSION,
 	UnsupportedStateVersionError,
 } from "./state-version";
@@ -122,7 +123,7 @@ function sessionLocatorV2(locator: unknown): locator is SessionLocatorV2 {
 	);
 }
 export interface SessionIndexEvent {
-	version: typeof SDK_STATE_VERSION;
+	version: typeof SDK_STATE_VERSION | typeof SESSION_INDEX_EVENT_VERSION;
 	indexSeq: number;
 	type: SessionIndexEventType;
 	sessionId: string;
@@ -1205,7 +1206,7 @@ export class SessionIndex {
 			if (Array.isArray(snapshot.events)) {
 				try {
 					for (const event of snapshot.events) {
-						assertSupportedStateVersion(snapshotFor(this.#agentDir), event);
+						assertSupportedSessionIndexEventVersion(snapshotFor(this.#agentDir), event);
 						supportedEvents.push(event as SessionIndexEvent);
 					}
 				} catch (error) {
@@ -1244,7 +1245,7 @@ export class SessionIndex {
 				if (!line) continue;
 				try {
 					const event = JSON.parse(line) as SessionIndexEvent;
-					assertSupportedStateVersion(logFor(this.#agentDir), event);
+					assertSupportedSessionIndexEventVersion(logFor(this.#agentDir), event);
 					const { checksum, ...unsigned } = event;
 					if (checksum !== sessionIndexChecksum(unsigned)) {
 						corrupt = true;
@@ -1411,7 +1412,7 @@ export class SessionIndex {
 			let event: SessionIndexEvent;
 			try {
 				event = JSON.parse(line) as SessionIndexEvent;
-				assertSupportedStateVersion(logFor(this.#agentDir), event);
+				assertSupportedSessionIndexEventVersion(logFor(this.#agentDir), event);
 			} catch (error) {
 				if (error instanceof UnsupportedStateVersionError) throw error;
 				corrupt = true;
@@ -1495,7 +1496,7 @@ export class SessionIndex {
 				}
 				const unsigned: Omit<SessionIndexEvent, "checksum"> = {
 					...input,
-					version: SDK_STATE_VERSION,
+					version: SESSION_INDEX_EVENT_VERSION,
 					indexSeq: this.indexSeq + 1,
 					ts: input.ts ?? Date.now(),
 				};
@@ -1574,7 +1575,7 @@ export class SessionIndex {
 				)
 					return false;
 				const unsigned: Omit<SessionIndexEvent, "checksum"> = {
-					version: SDK_STATE_VERSION,
+					version: SESSION_INDEX_EVENT_VERSION,
 					indexSeq: this.indexSeq + 1,
 					ts: Date.now(),
 					type: "host_unregistered",
@@ -1949,7 +1950,7 @@ export class SessionIndex {
 					const current = probed.get(`${row.sessionId}\u0000${row.endpointGeneration}\u0000${row.pid}`);
 					if (current === undefined || current !== recordedIncarnation) continue;
 					const unsigned: Omit<SessionIndexEvent, "checksum"> = {
-						version: SDK_STATE_VERSION,
+						version: SESSION_INDEX_EVENT_VERSION,
 						indexSeq: this.indexSeq + events.length + 1,
 						type: "host_heartbeat",
 						sessionId: row.sessionId,

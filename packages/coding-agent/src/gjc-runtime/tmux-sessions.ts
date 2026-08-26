@@ -864,6 +864,32 @@ export function createGjcTmuxSession(
 		: statusGjcTmuxSessionByNativeId(nativeSessionId, executionEnv);
 }
 
+function cleanupCreatedManagedGjcTmuxSession(
+	session: GjcTmuxSessionStatus,
+	sessionEnv: NodeJS.ProcessEnv,
+	proof: ProvenTmuxSessionIdentity | undefined,
+): void {
+	const nativeSessionId = proof?.nativeSessionId ?? session.nativeSessionId;
+	if (!nativeSessionId || !session.ownerGeneration)
+		throw new Error(`gjc_tmux_managed_launch_cleanup_identity_unavailable:${session.name}`);
+	const tmuxCommand = session.providerAuthority?.command ?? resolveGjcTmuxCommand(sessionEnv);
+	const server = requireSafeTmuxServerForMutation(tmuxCommand, sessionEnv);
+	if (proof && (server.pid !== proof.serverPid || server.startTime !== proof.serverStartTime))
+		throw new Error("gjc_tmux_cleanup_target_changed");
+	cleanupExactCreatedTmuxSession(
+		nativeSessionId,
+		session.name,
+		tmuxCommand,
+		sessionEnv,
+		proof?.serverPid ?? server.pid,
+		proof?.serverStartTime ?? server.startTime,
+		server.pidProven,
+		session.providerAuthority,
+		session.ownerGeneration,
+		proof?.psmuxIncarnation ?? session.psmuxIncarnation,
+	);
+}
+
 /** Launches one Broker-owned child through the managed owner path and returns only re-proof inputs. */
 export function createManagedGjcTmuxSession(
 	spec: ManagedTmuxLaunchSpec,
@@ -872,30 +898,40 @@ export function createManagedGjcTmuxSession(
 ): ManagedTmuxLaunchProof {
 	const session = createGjcTmuxSession(env, { ...options, launch: spec });
 	const sessionEnv = session.providerAuthority ? environmentForProviderAuthority(env, session.providerAuthority) : env;
-	const proof = proveGjcTmuxSessionMutationTarget(session.name, sessionEnv);
-	const status = statusGjcTmuxSession(session.name, sessionEnv);
-	if (
-		!status.sessionId ||
-		!status.sessionStateFile ||
-		!status.ownerGeneration ||
-		status.panePids.length !== 1 ||
-		proof.nativeSessionId !== status.nativeSessionId
-	)
-		throw new Error("gjc_tmux_managed_launch_proof_unavailable");
-	return {
-		name: status.name,
-		nativeSessionId: proof.nativeSessionId,
-		serverPid: proof.serverPid,
-		serverStartTime: proof.serverStartTime,
-		ownerGeneration: status.ownerGeneration,
-		sessionId: status.sessionId,
-		sessionStateFile: status.sessionStateFile,
-		pid: status.panePids[0]!,
-		providerIdentity: providerIdentity(
-			session.providerAuthority ?? resolveGjcTmuxProviderContext({ env, platform: options.platform }),
-		),
-		psmuxIncarnation: proof.psmuxIncarnation,
-	};
+	let proof: ProvenTmuxSessionIdentity | undefined;
+	try {
+		proof = proveGjcTmuxSessionMutationTarget(session.name, sessionEnv);
+		const status = statusGjcTmuxSession(session.name, sessionEnv);
+		if (
+			!status.sessionId ||
+			!status.sessionStateFile ||
+			!status.ownerGeneration ||
+			status.panePids.length !== 1 ||
+			proof.nativeSessionId !== status.nativeSessionId
+		)
+			throw new Error("gjc_tmux_managed_launch_proof_unavailable");
+		return {
+			name: status.name,
+			nativeSessionId: proof.nativeSessionId,
+			serverPid: proof.serverPid,
+			serverStartTime: proof.serverStartTime,
+			ownerGeneration: status.ownerGeneration,
+			sessionId: status.sessionId,
+			sessionStateFile: status.sessionStateFile,
+			pid: status.panePids[0]!,
+			providerIdentity: providerIdentity(
+				session.providerAuthority ?? resolveGjcTmuxProviderContext({ env, platform: options.platform }),
+			),
+			psmuxIncarnation: proof.psmuxIncarnation,
+		};
+	} catch (proofError) {
+		try {
+			cleanupCreatedManagedGjcTmuxSession(session, sessionEnv, proof);
+		} catch (cleanupError) {
+			throw new AggregateError([proofError, cleanupError], "gjc_tmux_managed_launch_proof_failed_cleanup_failed");
+		}
+		throw proofError;
+	}
 }
 
 function isManagedSessionGone(error: unknown): boolean {
@@ -1087,6 +1123,8 @@ function cleanupExactCreatedTmuxSession(
 	expectedStartTime: string,
 	expectedPidProven?: boolean,
 	provisionalAuthority?: ProviderAuthority,
+	expectedOwnerGeneration?: string,
+	expectedPsmuxIncarnation?: string,
 ): void {
 	const server = requireSafeTmuxServerForMutation(tmuxCommand, env);
 	if (server.pid !== expectedPid || server.startTime !== expectedStartTime)
@@ -1097,8 +1135,9 @@ function cleanupExactCreatedTmuxSession(
 		{ pid: expectedPid, pidProven: expectedPidProven ?? server.pidProven },
 		env,
 		`kill-session -t ${tmuxCommandArgument(normalizeExactTmuxTarget(nativeSessionId, env, "session"))}`,
-		undefined,
+		expectedOwnerGeneration,
 		provisionalAuthority,
+		expectedPsmuxIncarnation,
 	);
 }
 

@@ -498,6 +498,7 @@ export function renderSdkSearchTable(result: SdkSearchResultV1): string {
 		`Scope resolved: ${safeSearchText(searchScopeLabel(result))}`,
 		`Status: ${result.status}`,
 		`Observed at: ${result.observedAt}`,
+		...(result.cursor === undefined ? [] : [`Continuation cursor: ${safeSearchText(result.cursor)}`]),
 	];
 	if (result.rows.length === 0) return lines.join("\n");
 	lines.push("ID  PROBE        LIVE  CWD");
