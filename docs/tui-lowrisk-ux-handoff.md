@@ -5,7 +5,7 @@
 
 Shipped in PR [#4965](https://github.com/Yeachan-Heo/gajae-code/pull/4965) (merged into `dev`).
 
-Six defects where the TUI rendered an affordance nothing could reach, or discarded information without saying so. Planned via `ralplan` (Architect `CLEAR`/`APPROVE`, Critic `OKAY`), executed via `ultragoal`.
+Six defects where the TUI rendered an affordance nothing could reach, or discarded information without saying so. The implementation landed in merged PR [#4965](https://github.com/Yeachan-Heo/gajae-code/pull/4965); this document records the shipped behavior, deliberate follow-ups, and review evidence without depending on private execution history.
 
 ## What shipped
 
@@ -20,9 +20,9 @@ Six defects where the TUI rendered an affordance nothing could reach, or discard
 
 ## Deferred, with rationale
 
-These are numbered non-goals in the approved plan, not oversights.
+These are seven numbered non-goals from the #4965 review, not oversights. The theme-preset question below is an additional follow-up.
 
-1. **`NO_COLOR` contract** — `Theme.fg`/`Theme.bg` always emit SGR; only `isHyperlinkEnabled` consults `NO_COLOR`. This violates the contract in `packages/coding-agent/src/modes/DESIGN.md`. Reaches **103 files** under `packages/coding-agent/src` and needs a conflicting raw reverse-video fallback in `src/tools/vim.ts` reversed. Highest-value follow-up; needs its own reviewed change.
+1. **`NO_COLOR` contract** — `Theme.fg`/`Theme.bg` always emit SGR; only `isHyperlinkEnabled` consults `NO_COLOR`. This violates the contract in `packages/coding-agent/src/modes/DESIGN.md`. The #4965 review estimated **103 affected files** under `packages/coding-agent/src` and identified a conflicting raw reverse-video fallback in `src/tools/vim.ts` that must be reversed. Highest-value follow-up; needs its own reviewed change.
 2. **Default bindings for the six palette-only nav ids** — `sendNow` and `mode.cycle` sit in `ACTION_HINT_PRIORITY`, so binding them mutates default composer hints. Needs a product decision on hint priority first.
 3. **Full curated-palette availability/dispatch migration** — filtering every curated entry (not just the opt-in six) changes visible palette contents for pre-existing thinking, model-cycle, editor, copy, queue and session actions. Two execution models coexist today: pre-existing entries are direct closures, the gated six route through `#executeAction`.
 4. **Status-line eviction priority** — `right` is a bare `string[]` with no identity parallel to `leftSegIds`, so a cross-segment priority policy needs new typed provenance and would override the retention users express through configured segment order.
@@ -34,7 +34,7 @@ Also deferred: whether the theme `ascii` symbol preset should govern the truncat
 
 ## Known pre-existing failure
 
-`bun run check:ts` fails at `check:sdk-closure` (`sdk-acp-adapter.test.ts`, "SDK internal launch refused: runtime dependency escapes its trusted root"). Reproduces at the merge base with this branch's commits stashed, emits no TypeScript diagnostics, and touches no path this work modifies. Not from this branch.
+The #4965 review recorded `bun run check:ts` failing at `check:sdk-closure` (`sdk-acp-adapter.test.ts`, "SDK internal launch refused: runtime dependency escapes its trusted root"). Treat that as merge-epoch baseline evidence and rerun it against current `dev` before attributing a later CI failure; it does not touch any path modified by this documentation-only handoff.
 
 ## Landmines for whoever touches this next
 
@@ -42,7 +42,7 @@ Hard-won during review; worth reading before editing these files.
 
 - **`render()` applies `truncateToWidth` after status rows are built.** An assertion that reads only `render(width)` output cannot distinguish the reserved overflow marker from an ellipsis that truncation manufactured. Two real defects hid behind exactly that. Assert `getPreviewContent(width)` raw rows *before* the rendered ones.
 - **`ActionRegistry` memoizes availability per microtask** and clears it on a queued microtask. Tests that flip a predicate and re-probe must yield first.
-- **Editing `settings-schema.ts` triggers the mandatory computer-use red-team gate.** It is a shared behavior registry, so `ultragoal` requires all seven cases (`kill-switch-bypass`, `suspended-enforcement`, `permission-revoked`, `display-stale`, `out-of-bounds-drift`, `runaway-loop-halt`, `blast-radius`) even for a change with no computer-use behavior. A real suite exists at `packages/coding-agent/src/tools/computer.{redteam,enforcement}.test.ts` — run it, do not fabricate cases.
+- **Editing `settings-schema.ts` triggers the mandatory computer-use red-team gate.** It is a shared behavior registry, so the completion gate requires all seven cases (`kill-switch-bypass`, `suspended-enforcement`, `permission-revoked`, `display-stale`, `out-of-bounds-drift`, `runaway-loop-halt`, `blast-radius`) even for a change with no computer-use behavior. A real suite exists at `packages/coding-agent/src/tools/computer.{redteam,enforcement}.test.ts` — run it, do not fabricate cases.
 - **`sticky-viewport-showcase` fails fast on the first witness mismatch.** One reported key does not mean one drifted key; enumerate all 20 against a fresh capture. This batch found three.
 - **The witness table is an anti-restatement oracle.** `STICKY_VIEWPORT_FRAME_TEXT_WITNESS` and the verifier derivation are both in `ORACLE_SOURCES`. Updating it requires a fresh capture plus an `independent-review.json` whose `reviewer_identity` the verifier machine-checks as distinct from the bundle's `capture-sticky-viewport-showcase` author/executor.
 - **Terminal visual evidence has a real contract** (`docs/ui-design-visual-qa.md:62-66`): `terminal.html` must *render* ANSI as styled markup, not print escape notation, and `metadata.json` must carry font/rendering assumptions, capture timestamp, tool version, and live-PTY/replay/fixture mode. A bundle can prove the behavior and still fail this.
