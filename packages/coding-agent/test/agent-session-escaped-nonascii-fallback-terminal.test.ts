@@ -427,10 +427,11 @@ describe("AgentSession escaped non-ASCII fallback terminal (#4880)", () => {
 		const streamCalls: string[] = [];
 		const fallbackKeyGate = Promise.withResolvers<string | undefined>();
 		let keyCalls = 0;
+		let holdFallbackResolution = true;
 		const originalGetApiKey = modelRegistry.getApiKey.bind(modelRegistry);
 		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (model, sessionId, options) => {
 			keyCalls += 1;
-			if (keyCalls >= 3) {
+			if (keyCalls >= 3 && holdFallbackResolution) {
 				if (options?.signal?.aborted) return undefined;
 				return await Promise.race([
 					fallbackKeyGate.promise,
@@ -442,7 +443,9 @@ describe("AgentSession escaped non-ASCII fallback terminal (#4880)", () => {
 			return await originalGetApiKey(model, sessionId, options);
 		});
 		const events: string[] = [];
-		const mock = createMockModel({ responses: [{ throw: "503 service unavailable: overloaded_error" }] });
+		const mock = createMockModel({
+			responses: [{ throw: "503 service unavailable: overloaded_error" }, { content: ["done"] }],
+		});
 		const agent = new Agent({
 			initialState: { model: primary, systemPrompt: ["test"], tools: [], messages: [] },
 			convertToLlm: identityConverter,
@@ -467,6 +470,7 @@ describe("AgentSession escaped non-ASCII fallback terminal (#4880)", () => {
 		for (let attempt = 0; attempt < 100 && keyCalls < 3; attempt++) await Bun.sleep(5);
 		expect(keyCalls).toBeGreaterThanOrEqual(3);
 		const abort = session.abort();
+		holdFallbackResolution = false;
 		fallbackKeyGate.resolve("test-key");
 		await abort;
 		await prompt.catch(() => {});
@@ -474,6 +478,8 @@ describe("AgentSession escaped non-ASCII fallback terminal (#4880)", () => {
 
 		expect(streamCalls).toEqual([selector(primary)]);
 		expect(events).toEqual([]);
+		await session.prompt("after abort");
+		expect(streamCalls).toEqual([selector(primary), selector(primary)]);
 		expect(session.model?.provider).toBe(primary.provider);
 		expect(session.model?.id).toBe(primary.id);
 	});

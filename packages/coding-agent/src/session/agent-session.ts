@@ -18767,6 +18767,7 @@ export class AgentSession {
 						previousThinkingLevel,
 					))
 				) {
+					if (this.#abortAdmissionEpoch !== abortEpoch) controller.resetForNewTurn();
 					if (this.#abortAdmissionEpoch !== abortEpoch)
 						return { type: "terminal", terminal: { stopReason: "cancelled" } };
 					return {
@@ -19411,6 +19412,14 @@ export class AgentSession {
 			let resolutionError: unknown;
 			if (outcome === "advance") {
 				const controllerStateBeforeAdvance = controller.snapshotRuntimeState();
+				const failedSelectorIndex = controller.chain.entries.indexOf(controller.tried.at(-1)?.selector ?? "");
+				if (failedSelectorIndex >= 0) {
+					controllerStateBeforeAdvance.activeIndex = failedSelectorIndex;
+					controllerStateBeforeAdvance.attemptsUsed = 0;
+					controllerStateBeforeAdvance.attemptStarted = false;
+					controllerStateBeforeAdvance.exhaustedForTurn = false;
+					controllerStateBeforeAdvance.tried = controllerStateBeforeAdvance.tried.slice(0, -1);
+				}
 				const previousModel = this.model;
 				const previousThinkingLevel = this.thinkingLevel;
 				try {
@@ -19429,7 +19438,10 @@ export class AgentSession {
 				}
 			}
 			if (ownership && (!ownership.isCurrent() || cancellationSignal?.aborted)) return;
-			if (this.#abortAdmissionEpoch !== abortEpoch) return;
+			if (this.#abortAdmissionEpoch !== abortEpoch) {
+				controller.resetForNewTurn();
+				return;
+			}
 			if (!advanced) {
 				let errorMessage = resolutionError
 					? `${this.#fallbackExhaustionError(controller)}; resolution failed: ${resolutionError instanceof Error ? resolutionError.message : String(resolutionError)}`
