@@ -119,7 +119,7 @@ describe("AgentSession escaped non-ASCII managed steering", () => {
 		await session.prompt("ask me");
 		await manager.flush();
 
-		// Four provider calls: initial, steered retry, blind retry, post-tool wrap-up.
+		// Four provider calls: initial, two steered retries, post-tool wrap-up.
 		expect(mock.model.calls).toHaveLength(4);
 
 		// Every bounded retry must carry the steering instruction, and tools stay

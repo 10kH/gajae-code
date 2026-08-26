@@ -285,4 +285,69 @@ describe("AgentSession escaped non-ASCII fallback terminal (#4880)", () => {
 		expect(persistedToolCallIds).toEqual(["tc-fallback-1"]);
 		expect(hasUserText(durable, ESCAPED_NONASCII_RECOVERY_PROMPT)).toBe(false);
 	});
+
+	it("starts a fresh escaped retry budget after an ordinary fallback advance", async () => {
+		tempDir = TempDir.createSync("@gjc-escaped-fallback-mixed-4880-");
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		authStorage.setRuntimeApiKey("openai", "test-key");
+
+		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		if (!primary || !fallback) throw new Error("Expected bundled mixed-fallback models");
+
+		const modelRegistry = new ModelRegistry(authStorage);
+		const manager = SessionManager.create(tempDir.path(), tempDir.path());
+		const executed: Array<Record<string, unknown>> = [];
+		const callModels: string[] = [];
+		const mock = createMockModel({
+			responses: [
+				escapedTurn("tc-primary-escaped"),
+				{ throw: "503 service unavailable: overloaded_error" },
+				escapedTurn("tc-fallback-escaped-1"),
+				escapedTurn("tc-fallback-escaped-2"),
+				literalTurn("tc-fallback-literal"),
+				{ content: ["done"] },
+			],
+		});
+		const agent = new Agent({
+			initialState: { model: primary, systemPrompt: ["test"], tools: [askTool(executed)], messages: [] },
+			convertToLlm: identityConverter,
+			streamFn: (model, context, options) => {
+				callModels.push(selector(model));
+				return mock.stream(model, context, options);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"fallback.maxAttempts": 1,
+			"retry.baseDelayMs": 10,
+		});
+		settings.setModelRole("default", selector(primary));
+		session = new AgentSession({ agent, sessionManager: manager, settings, modelRegistry });
+		session.setConfiguredModelChain("default", [selector(primary), selector(fallback)], "test");
+
+		await session.prompt("ask me");
+		await manager.flush();
+
+		expect(callModels).toEqual([
+			selector(primary),
+			selector(primary),
+			selector(fallback),
+			selector(fallback),
+			selector(fallback),
+			selector(fallback),
+		]);
+		expect(executed).toEqual([{ question: QUESTION }]);
+		expect(session.isStreaming).toBe(false);
+		const durable = manager.buildSessionContext().messages;
+		expect(hasUserText(durable, ESCAPED_NONASCII_RECOVERY_PROMPT)).toBe(false);
+		expect(
+			durable.some(
+				message =>
+					message.role === "assistant" &&
+					message.content.some(block => block.type === "toolCall" && block.id === "tc-fallback-literal"),
+			),
+		).toBe(true);
+	});
 });

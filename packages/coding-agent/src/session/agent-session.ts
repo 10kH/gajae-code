@@ -18718,10 +18718,9 @@ export class AgentSession {
 			// evidence: never charge the attempt, advance the chain, or suppress the
 			// selector. The loop already removed the defective turn from history and
 			// bounded its own resample budget, so this decision just re-issues the
-			// same request on the same model. The re-issue carries the transient
-			// steering instruction exactly once (when the discarded attempt did not
-			// already have one), so a deterministic escaper has a reason to change
-			// its spelling; the instruction never lands in durable history.
+			// same request on the same model. Every bounded re-issue carries the
+			// transient steering instruction, so a deterministic escaper has a reason
+			// to change its spelling; the instruction never lands in durable history.
 			//
 			// The retries are un-charged by design, so a deterministic escaper
 			// would otherwise loop forever: each continuation is a fresh loop with
@@ -18926,6 +18925,7 @@ export class AgentSession {
 				controller.tried.at(-1)?.selector ?? controller.chain.entries[controller.activeIndex - 1] ?? selector;
 			const to = selector;
 			const previousEditMode = this.#resolveActiveEditMode();
+			this.#escapedNonAsciiManagedRetries = 0;
 			this.#setModelAuthoritatively(resolved.model, "fallback-switch");
 			this.setThinkingLevel(
 				this.#thinkingLevelForResolvedFallback(resolved.explicitThinkingLevel, resolved.thinkingLevel),
