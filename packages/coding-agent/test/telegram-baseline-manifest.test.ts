@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { ADAPTERS } from "../src/sdk/protocol/operation-registry";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..");
 const packageRoot = path.join(repoRoot, "packages", "coding-agent");
@@ -25,7 +26,7 @@ interface BaselineManifest {
 }
 
 interface SdkAdapterParityManifest extends BaselineManifest {
-	rows: { argv: string[] }[];
+	rows: { adapter: string; argv: string[] }[];
 }
 
 async function tempDir(): Promise<string> {
