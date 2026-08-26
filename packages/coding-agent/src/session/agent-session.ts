@@ -6380,6 +6380,8 @@ export class AgentSession {
 												releasePredecessor();
 												if (startsQueuedSuccessor) {
 													this.#defaultFallbackChain().resetAttemptBudget();
+													this.#escapedNonAsciiManagedRetries = 0;
+													this.#escapedNonAsciiExhaustedModelKeys.clear();
 													this.#overflowMaintenanceAttempts = 0;
 												}
 											},
