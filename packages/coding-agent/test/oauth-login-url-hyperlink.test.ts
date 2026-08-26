@@ -387,6 +387,60 @@ describe("OAuth URL copy lease wiring", () => {
 		expect(pendingUrls).toEqual([authUrl, undefined]);
 	});
 
+	it("installs an interrupt listener for non-wizard OAuth flows", async () => {
+		let listener: ((data: string) => { consume: boolean } | undefined) | undefined;
+		const pendingUrls: Array<string | undefined> = [];
+		const ctx = {
+			keybindings: { getDisplayString: () => "Alt+Shift+U" },
+			beginOAuthUrlForCopy: (url: string) => {
+				pendingUrls.push(url);
+				return () => pendingUrls.push(undefined);
+			},
+			chatContainer: { addChild: () => {} },
+			ui: {
+				requestRender: () => {},
+				addInputListener: (callback: typeof listener) => {
+					listener = callback;
+					return () => {};
+				},
+			},
+			showError: () => {},
+			session: { modelRegistry: { authStorage: { set: async () => {} } } },
+		} as unknown as InteractiveModeContext;
+		const controller = new MCPCommandController(ctx);
+		const authUrl = "https://auth.example.test/authorize?client_id=interrupt-test";
+		const operation = controller.handleOAuthFlow(
+			"https://mcp.example.test",
+			authUrl,
+			"https://auth.example.test/token",
+			"test-client",
+			"",
+			"",
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			(config, callbacks) => ({
+				resolvedClientId: config.clientId,
+				registeredClientSecret: undefined,
+				login: async () => {
+					callbacks.onAuth({ url: authUrl });
+					const signal = callbacks.signal;
+					if (!signal) throw new Error("missing cancellation signal");
+					return await new Promise<never>((_resolve, reject) => {
+						signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+					});
+				},
+			}),
+			() => {},
+		);
+
+		await Bun.sleep(0);
+		expect(listener?.("\x03")).toEqual({ consume: true });
+		await expect(operation).rejects.toThrow("OAuth authentication failed: OAuth flow cancelled");
+		expect(pendingUrls).toEqual([authUrl, undefined]);
+	});
+
 	it("routes the command-palette chord through a focused MCP wizard", () => {
 		let receivedKey = "";
 		const wizard = new MCPAddWizard(

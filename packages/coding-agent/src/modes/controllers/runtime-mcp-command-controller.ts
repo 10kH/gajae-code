@@ -44,6 +44,7 @@ import { parseCommandArgs } from "../shared";
 import { buildOAuthLoginAnchor, createOAuthUrlCopyLease } from "../shared/oauth-url-copy";
 import { theme } from "../theme/theme";
 import type { InteractiveModeContext } from "../types";
+import { matchesAppInterrupt } from "../utils/keybinding-matchers";
 import { groupBySource, parseRemoveArgs, readScopeFlag, showCommandMessage } from "./command-controller-shared";
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
@@ -628,8 +629,21 @@ export class MCPCommandController {
 			: "Use command palette → Copy OAuth URL to copy this exact URL:";
 		const oauthUrlCopyLease = createOAuthUrlCopyLease(this.ctx);
 		const timeoutController = new AbortController();
-		const flowSignal = signal ? AbortSignal.any([signal, timeoutController.signal]) : timeoutController.signal;
+		const userController = new AbortController();
+		const flowSignal = AbortSignal.any([
+			userController.signal,
+			timeoutController.signal,
+			...(signal ? [signal] : []),
+		]);
 		let flowFinished = false;
+		const cancellationUnsubscribe =
+			signal === undefined && typeof this.ctx.ui.addInputListener === "function"
+				? this.ctx.ui.addInputListener(data => {
+						if (data !== "\x03" && !matchesAppInterrupt(data)) return;
+						userController.abort(new Error("OAuth flow cancelled"));
+						return { consume: true };
+					})
+				: undefined;
 
 		try {
 			// Create OAuth flow
@@ -784,6 +798,7 @@ export class MCPCommandController {
 			}
 		} finally {
 			oauthUrlCopyLease.release();
+			cancellationUnsubscribe?.();
 		}
 	}
 
