@@ -567,7 +567,6 @@ export async function getOrCreateClient(config: ServerConfig, cwd: string, initT
 			killedClients.add(client);
 			return originalKill(...args);
 		};
-		clients.set(key, client);
 
 		// Register crash recovery - remove client on process exit
 		proc.exited.then(async () => {
@@ -643,10 +642,17 @@ export async function getOrCreateClient(config: ServerConfig, cwd: string, initT
 			const terminalError = transportClosedErrors.get(client);
 			if (terminalError) throw terminalError;
 
+			// Publish to the cache only after the handshake completes: callers that
+			// hit the `clients` map must never observe a client whose initialize is
+			// still in flight. Concurrent callers instead share `clientLocks` and
+			// wait for initialization, so a server that dies mid-handshake rejects
+			// every waiter instead of handing them a transport that is about to
+			// break underneath them.
+			clients.set(key, client);
+
 			return client;
 		} catch (err) {
 			// Clean up on initialization failure
-			deleteCachedClient(key, client);
 			deleteClientLock(key, clientPromise);
 			await shutdownClientInstance(client);
 			throw err;
