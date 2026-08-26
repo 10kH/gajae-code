@@ -742,7 +742,7 @@ describe("SessionSdkSessionRuntime", () => {
 			},
 			sendUserMessage: async (_content: string, options: { onPreflightAcceptCommit?: () => Promise<void> }) => {
 				await options?.onPreflightAcceptCommit?.();
-				await new Promise<void>(() => {});
+				await neverSettlingPromise();
 			},
 		} as unknown as ExtensionAPI;
 		const transport = memoryTransport();
@@ -994,7 +994,7 @@ describe("SessionSdkSessionRuntime", () => {
 			},
 			sendUserMessage: async (_content: string, options: { onPreflightAcceptCommit?: () => Promise<void> }) => {
 				await options?.onPreflightAcceptCommit?.();
-				await new Promise<void>(() => {});
+				await neverSettlingPromise();
 			},
 		} as unknown as ExtensionAPI;
 		const transport = memoryTransport();
@@ -1356,7 +1356,7 @@ describe("SessionSdkSessionRuntime", () => {
 			},
 			sendUserMessage: async (_content: string, options: { onPreflightAcceptCommit?: () => Promise<void> }) => {
 				await options?.onPreflightAcceptCommit?.();
-				await new Promise<void>(() => {});
+				await neverSettlingPromise();
 			},
 		} as unknown as ExtensionAPI;
 		const transport = memoryTransport();
@@ -1710,7 +1710,7 @@ describe("SessionSdkSessionRuntime", () => {
 				// Production-faithful: an accepted run stays in-flight for the whole
 				// test; sendUserMessage resolution (turn completion) never precedes
 				// agent_start (#4668 success-retirement).
-				await new Promise<void>(() => {});
+				await neverSettlingPromise();
 			},
 		} as unknown as ExtensionAPI;
 		const transport = memoryTransport();
@@ -3211,6 +3211,10 @@ async function settledStatus(
 	throw new Error(`${name} never reported a terminal reconciliation status`);
 }
 
+function neverSettlingPromise(): Promise<void> {
+	return Promise.withResolvers<void>().promise;
+}
+
 describe("post-acceptance invocation terminalization", () => {
 	test.each([
 		{ status: 402, code: "provider_http_402" },
@@ -3227,7 +3231,7 @@ describe("post-acceptance invocation terminalization", () => {
 				sendUserMessage: async (_content, options) => {
 					prompts += 1;
 					await options?.onPreflightAcceptCommit?.();
-					if (prompts === 1) await new Promise<void>(() => {});
+					if (prompts === 1) await neverSettlingPromise();
 				},
 			});
 			const failed = await harness.control("turn.prompt", { text: "provider rejects", clientRef: `http-${status}` });
@@ -3284,7 +3288,7 @@ describe("post-acceptance invocation terminalization", () => {
 			const harness = await invocationHarness("provider-statusless", cwd, {
 				sendUserMessage: async (_content, options) => {
 					await options?.onPreflightAcceptCommit?.();
-					await new Promise<void>(() => {});
+					await neverSettlingPromise();
 				},
 			});
 			const accepted = await harness.control("turn.prompt", { text: "provider rejects" });
@@ -3309,7 +3313,7 @@ describe("post-acceptance invocation terminalization", () => {
 			const harness = await invocationHarness("local-malformed-tool", cwd, {
 				sendUserMessage: async (_content, options) => {
 					await options?.onPreflightAcceptCommit?.();
-					await new Promise<void>(() => {});
+					await neverSettlingPromise();
 				},
 			});
 			const accepted = await harness.control("turn.prompt", { text: "local malformed tool" });
@@ -3340,7 +3344,7 @@ describe("post-acceptance invocation terminalization", () => {
 			const harness = await invocationHarness("local-composer-policy", cwd, {
 				sendUserMessage: async (_content, options) => {
 					await options?.onPreflightAcceptCommit?.();
-					await new Promise<void>(() => {});
+					await neverSettlingPromise();
 				},
 			});
 			const accepted = await harness.control("turn.prompt", { text: "local composer policy" });
@@ -3371,7 +3375,7 @@ describe("post-acceptance invocation terminalization", () => {
 			const harness = await invocationHarness("provider-throwing-metadata", cwd, {
 				sendUserMessage: async (_content, options) => {
 					await options?.onPreflightAcceptCommit?.();
-					await new Promise<void>(() => {});
+					await neverSettlingPromise();
 				},
 			});
 			const accepted = await harness.control("turn.prompt", { text: "provider metadata" });
@@ -3746,7 +3750,7 @@ describe("post-acceptance invocation terminalization", () => {
 			const harness = await invocationHarness("terminalize-prompt", cwd, {
 				sendUserMessage: async (_content, options) => {
 					await options?.onPreflightAcceptCommit?.();
-					await new Promise<void>(() => {});
+					await neverSettlingPromise();
 				},
 			});
 			const accepted = await harness.control("turn.prompt", { text: "hello" });
@@ -3777,7 +3781,7 @@ describe("post-acceptance invocation terminalization", () => {
 			const harness = await invocationHarness("terminalize-abort", cwd, {
 				sendUserMessage: async (_content, options) => {
 					await options?.onPreflightAcceptCommit?.();
-					await new Promise<void>(() => {});
+					await neverSettlingPromise();
 				},
 				abort: () => {},
 			});
@@ -3944,7 +3948,7 @@ describe("post-acceptance invocation terminalization", () => {
 			const harness = await invocationHarness("terminalize-skill", cwd, {
 				invokeSkill: async (_name, _args, options) => {
 					await options?.onPreflightAcceptCommit?.();
-					await new Promise<void>(() => {});
+					await neverSettlingPromise();
 				},
 			});
 			const accepted = await harness.control("skill.invoke", { name: "ralplan" });
@@ -4168,7 +4172,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				sendUserMessage: async (_content, options) => {
 					await options?.onPreflightAcceptCommit?.();
 					// Accepted, then permanently no execution progress and no agent_start.
-					await new Promise<void>(() => {});
+					await neverSettlingPromise();
 				},
 			});
 			const accepted = await harness.control("turn.prompt", { text: "hello" });
@@ -4202,7 +4206,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				settings: zeroProgressSettings,
 				sendUserMessage: async (_content, options) => {
 					await options?.onPreflightAcceptCommit?.();
-					await new Promise<void>(() => {});
+					await neverSettlingPromise();
 				},
 			});
 			const original = await harness.control("turn.prompt", { text: "original" });
@@ -4336,7 +4340,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 						return;
 					}
 					// The first turn accepts and then never makes progress.
-					await new Promise<void>(() => {});
+					await neverSettlingPromise();
 				},
 			});
 			const first = await harness.control("turn.prompt", { text: "first" });
@@ -4422,7 +4426,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 						)?.onQueuedPromoted;
 						return;
 					}
-					await new Promise<void>(() => {});
+					await neverSettlingPromise();
 				},
 			});
 			const first = await harness.control("turn.prompt", { text: "first" });
@@ -4478,7 +4482,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 					promoted = options?.onQueuedPromoted;
 					return;
 				}
-				await new Promise<void>(() => {});
+				await neverSettlingPromise();
 			},
 		} as unknown as ExtensionAPI;
 		const transport = memoryTransport();
@@ -4599,7 +4603,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 						return;
 					}
 					// The first turn accepts and then keeps streaming.
-					await new Promise<void>(() => {});
+					await neverSettlingPromise();
 				},
 			});
 			const first = await harness.control("turn.prompt", { text: "first" });
@@ -4657,7 +4661,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 						return;
 					}
 					// The first turn accepts and then keeps streaming.
-					await new Promise<void>(() => {});
+					await neverSettlingPromise();
 				},
 			});
 			const first = await harness.control("turn.prompt", { text: "first" });
@@ -4733,7 +4737,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				} as unknown as Settings,
 				sendUserMessage: async (_content, options) => {
 					await options?.onPreflightAcceptCommit?.();
-					await new Promise<void>(() => {});
+					await neverSettlingPromise();
 				},
 				persistInterceptor: transition => {
 					if (transition.type === "agent_failed") {
@@ -4817,7 +4821,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			const harness = await invocationHarness("skill-terminal-retry", cwd, {
 				invokeSkill: async (_name, _args, options) => {
 					await options?.onPreflightAcceptCommit?.();
-					await new Promise<void>(() => {});
+					await neverSettlingPromise();
 				},
 				persistInterceptor: transition => {
 					if (transition.type === "agent_end" && failedWrites < 2) {
@@ -4940,7 +4944,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 						)?.onQueuedPromoted;
 						return;
 					}
-					await new Promise<void>(() => {});
+					await neverSettlingPromise();
 				},
 			});
 			const first = await harness.control("turn.prompt", { text: "first" });
@@ -4974,7 +4978,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				sendUserMessage: async (_content, options) => {
 					await options?.onPreflightAcceptCommit?.();
 					// The failing turn accepts and then never makes progress on its own.
-					await new Promise<void>(() => {});
+					await neverSettlingPromise();
 				},
 			});
 			const failing = await harness.control("turn.prompt", { text: "failing" });
@@ -5025,7 +5029,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				options: { onPreflightAcceptCommit?: () => Promise<void> } | undefined,
 			) => {
 				await options?.onPreflightAcceptCommit?.();
-				if (content === "hangs") await new Promise<void>(() => {});
+				if (content === "hangs") await neverSettlingPromise();
 			},
 		} as unknown as ExtensionAPI;
 		const transport = memoryTransport();
@@ -5423,7 +5427,7 @@ test("SDK-only host keeps the idle-submitted prompt's owner when isIdle flips du
 			// Production-faithful: the accepted run stays in-flight; sendUserMessage
 			// resolution (turn completion) never precedes agent_start (#4668
 			// success-retirement).
-			await new Promise<void>(() => {});
+			await neverSettlingPromise();
 		},
 	} as unknown as ExtensionAPI;
 	const transport = memoryTransport();

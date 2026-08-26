@@ -4634,7 +4634,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				current.lifecycleTasks.size > 0;
 			if (retainsLifecycleWork) {
 				const owners = retiredLifecycleOwners.get(current.sessionId) ?? [];
-				owners.push(current);
+				if (!owners.includes(current)) owners.push(current);
 				retiredLifecycleOwners.set(current.sessionId, owners);
 				const retryCleanup = (): void => {
 					retiredLifecycleOwnerTimers.delete(current);
