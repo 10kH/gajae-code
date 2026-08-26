@@ -164,4 +164,9 @@ export class ActionRegistry<Context> {
 			if (group) this.#busyGroups.delete(group);
 		}
 	}
+
+	async executeFresh(id: AppKeybinding): Promise<boolean> {
+		this.#availability.delete(id);
+		return this.execute(id);
+	}
 }

@@ -271,8 +271,8 @@ async function createHost(): Promise<InteractivePaletteHost> {
 	}
 }
 
-async function openPalette(host: InteractivePaletteHost): Promise<CommandPaletteComponent> {
-	host.mode.editor.handleInput("\u0010");
+async function openPalette(host: InteractivePaletteHost, key = "\u0010"): Promise<CommandPaletteComponent> {
+	host.mode.editor.handleInput(key);
 	let palette: CommandPaletteComponent | undefined;
 	await waitFor(() => {
 		const component = host.mode.editorContainer.children[0];
@@ -408,14 +408,21 @@ describe("command palette InteractiveMode host", () => {
 		expect(host.dispatches.extensionError).not.toHaveBeenCalled();
 	});
 
-	it("keeps a draft when the palette action is unavailable and does not leak palette components", async () => {
+	it("opens over a draft, preserves its cursor, and does not leak palette components", async () => {
 		const host = await createHost();
 		host.mode.editor.setText("keep this draft");
+		host.mode.editor.handleInput("\u001b[D");
+		host.mode.editor.handleInput("\u001b[D");
+		const draftCursor = host.mode.editor.getCursor();
 
-		host.mode.editor.handleInput("\u0010");
+		const palette = await openPalette(host);
 
+		expect(host.mode.editor.getText()).toBe("keep this draft");
+		expect(host.mode.editor.getCursor()).toEqual(draftCursor);
+		palette.handleInput("\u001b");
 		expect(host.mode.editorContainer.children).toEqual([host.mode.editor]);
 		expect(host.mode.editor.getText()).toBe("keep this draft");
+		expect(host.mode.editor.getCursor()).toEqual(draftCursor);
 
 		host.mode.editor.setText("");
 		await Promise.resolve();
@@ -426,16 +433,62 @@ describe("command palette InteractiveMode host", () => {
 		}
 	});
 
-	it("blocks the palette while a draft or palette command is active without leaking a modal", async () => {
+	it("preserves whitespace and Unicode multiline drafts across repeated palette cycles", async () => {
+		const host = await createHost();
+		const editor = host.mode.editor;
+
+		for (const draft of ["   ", "한글\nsecond line\n終わり"]) {
+			editor.setText(draft);
+			const cursor = editor.getCursor();
+			for (let cycle = 0; cycle < 3; cycle += 1) {
+				const palette = await openPalette(host);
+				expect(host.mode.editor).toBe(editor);
+				expect(editor.getText()).toBe(draft);
+				expect(editor.getCursor()).toEqual(cursor);
+				palette.handleInput("\u001b");
+				expect(host.mode.editorContainer.children).toEqual([editor]);
+				expect(host.mode.editor.getText()).toBe(draft);
+				expect(host.mode.editor.getCursor()).toEqual(cursor);
+			}
+		}
+	});
+
+	it("restores a nonempty draft before a selected action reports an error", async () => {
+		const host = await createHost();
+		const editor = host.mode.editor;
+		editor.setText("preserve this action draft");
+		editor.handleInput("\u001b[D");
+		const cursor = editor.getCursor();
+		const failure = new Error("dashboard action failed");
+		vi.spyOn(host.mode, "showSessionsDashboard").mockImplementation(() => {
+			throw failure;
+		});
+		const showError = vi.spyOn(host.mode, "showError");
+
+		const palette = await openPalette(host);
+		expect(palette.getEntries().some(entry => entry.id === "action:app.session.dashboard")).toBe(true);
+		select(palette, "sessions dashboard");
+		await waitFor(() => showError.mock.calls.length === 1, "the dashboard action error");
+
+		expect(host.mode.editor).toBe(editor);
+		expect(editor.getText()).toBe("preserve this action draft");
+		expect(editor.getCursor()).toEqual(cursor);
+		expect(host.mode.editorContainer.children).toEqual([editor]);
+		expect(host.focus).toHaveBeenLastCalledWith(editor);
+		expect(showError).toHaveBeenCalledWith(expect.stringContaining("dashboard action failed"));
+	});
+
+	it("allows a draft palette and blocks overlapping palette commands without leaking a modal", async () => {
 		const host = await createHost();
 		const status = vi.spyOn(host.mode, "showStatus");
 		host.mode.editor.setText("unsent draft");
 
-		host.mode.editor.handleInput("\u0010");
-
+		const draftPalette = await openPalette(host);
+		draftPalette.handleInput("\u001b");
 		expect(host.dispatches.builtin).toHaveBeenCalledTimes(0);
 		expect(host.mode.editor.getText()).toBe("unsent draft");
 		expect(host.mode.editorContainer.children).toEqual([host.mode.editor]);
+		expect(status).not.toHaveBeenCalled();
 		host.mode.editor.setText("");
 		await Promise.resolve();
 		const pending = Promise.withResolvers<void>();

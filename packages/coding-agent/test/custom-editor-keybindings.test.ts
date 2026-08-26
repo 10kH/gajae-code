@@ -16,6 +16,8 @@ function inputForKey(key: string): string {
 	switch (key) {
 		case "alt+q":
 			return "\x1bq";
+		case "alt+p":
+			return "\x1bp";
 		case "alt+enter":
 			return "\x1b\r";
 		default:
@@ -44,6 +46,17 @@ describe("CustomEditor command palette keybinding", () => {
 
 		expect(onOpenCommandPalette).toHaveBeenCalledTimes(1);
 		expect(onCycleModelForward).not.toHaveBeenCalled();
+	});
+
+	it("routes a remapped palette binding through the same editor action", () => {
+		const editor = createEditor();
+		const onOpenCommandPalette = vi.fn();
+		editor.onOpenCommandPalette = onOpenCommandPalette;
+		editor.setActionKeys("app.commandPalette.open", ["alt+p"]);
+
+		editor.handleInput(inputForKey("alt+p"));
+
+		expect(onOpenCommandPalette).toHaveBeenCalledTimes(1);
 	});
 
 	it("moves model cycling to Alt+N by default", () => {
