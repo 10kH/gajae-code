@@ -3805,7 +3805,6 @@ async function runLoopBody(
 					await config.onManagedAttemptOutcome?.({
 						type: "escaped_arguments_discarded",
 						message,
-						steeringPending: recoveryAttempt?.kind !== "escaped-nonascii",
 						scope: transaction?.scope,
 					});
 					stream.end(newMessages);

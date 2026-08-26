@@ -20,7 +20,7 @@ function identityConverter(messages: AgentMessage[]): Message[] {
 	) as Message[];
 }
 
-function escapedTurn(id: string) {
+function escapedTurn(id: string, providerPayload?: unknown) {
 	return {
 		content: [
 			{
@@ -31,6 +31,7 @@ function escapedTurn(id: string) {
 				escapedNonAsciiArguments: true,
 			},
 		],
+		...(providerPayload === undefined ? {} : { providerPayload }),
 	};
 }
 
@@ -95,7 +96,11 @@ describe("AgentSession escaped non-ASCII fallback terminal (#4880)", () => {
 		// Deterministic escaper: every wire attempt escapes, forever.
 		// This reproduces the v0.15.0 fallback-exhaustion defect without Windows.
 		const mock = createMockModel({
-			handler: () => escapedTurn(`tc-esc-${mock.model.calls.length}`),
+			handler: () =>
+				escapedTurn(`tc-esc-${mock.model.calls.length}`, {
+					type: "openaiResponsesHistory",
+					items: [{ type: "function_call", arguments: `{"question":"\\uCD5C"}` }],
+				}),
 		});
 
 		const agent = new Agent({
@@ -109,7 +114,7 @@ describe("AgentSession escaped non-ASCII fallback terminal (#4880)", () => {
 
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
-			"fallback.maxAttempts": 3,
+			"fallback.maxAttempts": 1,
 			"retry.baseDelayMs": 10,
 		});
 		settings.setModelRole("default", selector(primary));
