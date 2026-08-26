@@ -3209,7 +3209,14 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		for (const [token, binding] of lifecycleRunOwners) if (binding.state === owner) lifecycleRunOwners.delete(token);
 	};
 	const maybeRetireLifecycleOwner = (owner: RuntimeState): void => {
-		if (owner.openLifecycleBatches.length > 0 || owner.lifecycleTasks.size > 0) return;
+		if (
+			owner.pending.length > 0 ||
+			owner.openLifecycleBatches.length > 0 ||
+			(owner.attachedInvocations?.length ?? 0) > 0 ||
+			(owner.drainedInvocations?.length ?? 0) > 0 ||
+			owner.lifecycleTasks.size > 0
+		)
+			return;
 		removeRetiredLifecycleOwner(owner);
 	};
 	// Shared with the control surface's terminal abort: the correlated
@@ -3897,7 +3904,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			api,
 			reconciliation,
 			(kind, correlation, connectionId, startsOwnTurn, sdkRunToken) => {
-				if (sdkRunToken && lifecycleRuntimeState) lifecycleRunOwners.set(sdkRunToken, { state: lifecycleRuntimeState });
+				if (sdkRunToken && lifecycleRuntimeState)
+					lifecycleRunOwners.set(sdkRunToken, { state: lifecycleRuntimeState });
 				// Only submissions that start their OWN turn get a pending entry: a
 				// steering-queued submission consumed inside the current run never
 				// emits the agent_start that would consume the entry, so leaving it
@@ -4050,7 +4058,11 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				// inherits the failed submission's connection as owner (review
 				// thread P1).
 				const index = pending.findIndex(entry => entry.correlation === correlation);
-				if (index >= 0) pending.splice(index, 1);
+				if (index >= 0) {
+					const [removed] = pending.splice(index, 1);
+					if (removed && lifecycleRunOwners.get(removed.sdkRunToken)?.state === lifecycleRuntimeState)
+						lifecycleRunOwners.delete(removed.sdkRunToken);
+				}
 				// Release the acceptance-anchored lease ONLY when the durable row is
 				// already terminal (exact-head review #4): clearing it before the
 				// settlement writes land strands the row accepted with no recovery
@@ -4391,6 +4403,20 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				retiredLifecycleOwners.set(current.sessionId, owners);
 				const timer = setTimeout(() => {
 					retiredLifecycleOwnerTimers.delete(current);
+					if (
+						current.pending.length > 0 ||
+						current.openLifecycleBatches.length > 0 ||
+						(current.attachedInvocations?.length ?? 0) > 0 ||
+						(current.drainedInvocations?.length ?? 0) > 0 ||
+						current.lifecycleTasks.size > 0
+					) {
+						const retry = setTimeout(() => {
+							retiredLifecycleOwnerTimers.delete(current);
+							maybeRetireLifecycleOwner(current);
+						}, LIFECYCLE_QUIESCENCE_MS);
+						retiredLifecycleOwnerTimers.set(current, retry);
+						return;
+					}
 					removeRetiredLifecycleOwner(current);
 				}, LIFECYCLE_QUIESCENCE_MS);
 				retiredLifecycleOwnerTimers.set(current, timer);

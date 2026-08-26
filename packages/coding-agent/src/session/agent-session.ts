@@ -7437,7 +7437,7 @@ export class AgentSession {
 			typeof eventToken === "string"
 				? eventToken
 				: deliveryScope
-					? this.#sdkRunTokensByAttemptScope.get(deliveryScope as AttemptScope)
+					? (this.#sdkRunTokensByAttemptScope.get(deliveryScope as AttemptScope) ?? this.#activeSdkRunToken)
 					: this.#activeSdkRunToken;
 		const isTerminalAgentEnd =
 			event.type === "agent_end" && !(event.stopReason === "maintenance" && event.maintenanceOutcome !== "aborted");
