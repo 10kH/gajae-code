@@ -517,8 +517,6 @@ export class MCPAddWizard extends Container {
 	}
 
 	handleInput(keyData: string): void {
-		if (this.#onCommandPaletteCallback?.(keyData) === true) return;
-
 		// Handle Ctrl+C to cancel wizard immediately
 		if (keyData === "\x03") {
 			// Ctrl+C pressed - cancel wizard
@@ -528,6 +526,10 @@ export class MCPAddWizard extends Container {
 
 		// Handle Escape (always handled by wizard)
 		if (matchesAppInterrupt(keyData)) {
+			if (this.#oauthAbortController) {
+				this.#onCancelCallback();
+				return;
+			}
 			if (this.#currentStep === "name") {
 				// Cancel wizard
 				this.#onCancelCallback();
@@ -537,6 +539,8 @@ export class MCPAddWizard extends Container {
 			this.#goBack();
 			return;
 		}
+
+		if (this.#onCommandPaletteCallback?.(keyData) === true) return;
 
 		// If we have an input field, let it handle the input
 		if (this.#inputField) {
