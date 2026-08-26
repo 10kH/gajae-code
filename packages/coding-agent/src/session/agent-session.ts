@@ -18985,23 +18985,39 @@ export class AgentSession {
 			const profileAliasIntent = this.#persistedModelProfileAliasIntent("default");
 			const profileResolution = profileAliasIntent
 				? await (async () => {
+						const canonicalSessionId = this.agent.providerSessionId ?? this.sessionId;
+						const previousCanonicalVariant = this.#modelRegistry.getSessionCanonicalVariant(canonicalSessionId);
+						const restoreCanonicalVariant = () => {
+							if (previousCanonicalVariant !== undefined) {
+								this.#modelRegistry.restoreSessionCanonicalVariant(
+									canonicalSessionId,
+									previousCanonicalVariant,
+								);
+							} else {
+								this.#modelRegistry.clearCanonicalVariant(canonicalSessionId);
+							}
+						};
 						try {
+							const pendingResolution = resolveModelChainWithAuth(
+								[selector],
+								this.#modelRegistry,
+								this.settings,
+								this.credentialSessionId,
+								{
+									managedFallback: true,
+									...profileAliasIntent,
+									canonicalSessionId,
+									credentialSessionId: this.credentialSessionId,
+								},
+							);
 							return await awaitWithCancellation(
-								resolveModelChainWithAuth(
-									[selector],
-									this.#modelRegistry,
-									this.settings,
-									this.credentialSessionId,
-									{
-										managedFallback: true,
-										...profileAliasIntent,
-										canonicalSessionId: this.agent.providerSessionId ?? this.sessionId,
-										credentialSessionId: this.credentialSessionId,
-									},
-								),
+								pendingResolution.finally(() => {
+									if (cancellationSignal.aborted) restoreCanonicalVariant();
+								}),
 							);
 						} catch (error) {
-							await rollbackCancelled();
+							if (cancellationSignal.aborted) restoreCanonicalVariant();
+							await restoreFallbackTransition();
 							throw error;
 						}
 					})()
