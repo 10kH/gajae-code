@@ -17,7 +17,7 @@
 
 ### Fixed
 
-- Idle notifications now wait for positioned activity and identity frames to cross the SDK connection-writer barrier before using the independent broadcast lane, preventing Telegram from routing an idle result with stale topic identity.
+- Idle notifications are now bound to the exact SDK connection generations that accepted their positioned identity prerequisite; raw-only recipients receive identity and idle through the same bounded writer command. Late joins, replaced generations, and saturated writers therefore cannot receive a dependent Telegram idle through an unrelated global broadcast.
 - When OSC 8 hyperlinks are enabled, the `/login` URL row is now an anchor pointing at itself, so a login URL wider than the pane stays clickable on every wrapped fragment. A login URL is one unbreakable token, so a pane narrower than the URL splits it across rows; the row printed the bare URL, so the wrap layer had no link to carry (#4711) and every fragment rendered as dead text. Bare URLs in Markdown prose already got this treatment; the login row did not. The existing hyperlink policy still disables OSC 8 where the terminal or user settings do not support it.
 - Foreground activity animation now uses layout-only TUI repaints, avoiding repeated reconstruction of unchanged transcript content during long sessions.
 - Notification adapters can now opt into one live representation per native effect: adapters that accept a positioned event are excluded from its matching raw fan-out, while ordinary direct SDK and raw-only legacy subscribers retain their existing delivery. Telegram opts in, preventing turn output, tool activity, and reasoning summaries from rendering twice after #4570; acknowledged terminal shutdown delivery is unchanged.

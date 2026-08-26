@@ -41,9 +41,9 @@ test("napi turn streams report whether a connection accepted the raw frame", asy
 	}
 });
 
-test("napi directed delivery barrier settles before a dependent idle broadcast", async () => {
-	const sessionId = `directed-barrier-${process.pid}-${Date.now()}`;
-	const token = "directed-barrier-token";
+test("napi directed receipt binds dependent idle to the accepting generation", async () => {
+	const sessionId = `directed-receipt-${process.pid}-${Date.now()}`;
+	const token = "directed-receipt-token";
 	const server = new NotificationServer(sessionId, token, `/tmp/${sessionId}`, true);
 	const endpoint = await server.start();
 	const frames: Array<{ type?: string; connectionId?: string; kind?: string }> = [];
@@ -61,18 +61,20 @@ test("napi directed delivery barrier settles before a dependent idle broadcast",
 		expect(connectionId).toBeString();
 		frames.splice(0);
 
-		server.sendTo(
-			connectionId!,
-			JSON.stringify({
-				type: "identity_header",
-				sessionId,
-				repo: "gajae-code",
-				branch: "dev",
-				machine: "test",
-			}),
+		const identity = {
+			type: "identity_header",
+			sessionId,
+			repo: "gajae-code",
+			branch: "dev",
+			machine: "test",
+		} as const;
+		const receipt = server.sendToWithReceipt(connectionId!, JSON.stringify(identity));
+		const outcome = server.queueIdleAfterDirected(
+			JSON.stringify(identity),
+			[receipt],
+			JSON.stringify({ id: `idle:${sessionId}`, kind: "idle", sessionId }),
 		);
-		expect(await server.waitForDirectedDelivery(1_000)).toBe(true);
-		server.noteIdle(JSON.stringify({ id: `idle:${sessionId}`, kind: "idle", sessionId }));
+		expect(outcome).toEqual({ status: "queued", recipientCount: 1, queuedCount: 1 });
 
 		await waitFor(
 			() =>

@@ -242,13 +242,17 @@ export declare class NotificationServer {
    */
   supportsPositionedRawExclusion(): boolean
   /** Send a validated, bounded JSON envelope to one connected v3 SDK client. */
-  sendTo(connectionId: string, json: string): boolean
+  sendTo(connectionId: string, json: string): void
   /**
-   * Wait until every connected writer has processed the directed frames that
-   * were accepted before this call. This preserves ordering when a dependent
-   * frame uses the independent broadcast lane.
+   * Send a directed frame and return an opaque receipt bound to the exact
+   * connection generation that accepted it.
    */
-  waitForDirectedDelivery(timeoutMs: number, connectionIds?: Array<string> | undefined | null): Promise<boolean>
+  sendToWithReceipt(connectionId: string, json: string): string
+  /**
+   * Queue an idle action only on writer generations that also accepted its
+   * positioned or raw identity prerequisite.
+   */
+  queueIdleAfterDirected(prerequisiteJson: string, positionedReceipts: Array<string>, neededJson: string): DependentIdleDeliveryResult
   /**
    * Publish a replayable `session_ready` readiness signal. `ready_json` is a
    * JSON `SessionReady`. Unlike [`Self::push_frame`], this frame is buffered
@@ -843,6 +847,13 @@ export declare function copyToClipboard(text: string): void
  * Unlike argv, this is not supplied by the process caller.
  */
 export declare function currentExecutablePath(): string | null
+
+/** Explicit result of binding an idle action to an exact prerequisite cohort. */
+export interface DependentIdleDeliveryResult {
+  status: 'queued' | 'no_recipients' | 'rejected' | 'partial'
+  recipientCount: number
+  queuedCount: number
+}
 
 /**
  * Detect macOS system appearance via CoreFoundation.

@@ -255,7 +255,7 @@ test("a replay-attached subscriber receives one live representation of a turn fr
 	}
 }, 30000);
 
-test("idle broadcast follows positioned activity and identity delivery", async () => {
+test("recipient-bound idle follows positioned activity and identity delivery", async () => {
 	const prevEnv = process.env.GJC_NOTIFICATIONS;
 	process.env.GJC_NOTIFICATIONS = "1";
 	try {
@@ -273,7 +273,7 @@ test("idle broadcast follows positioned activity and identity delivery", async (
 				id: "idle-ordering-regression",
 				sinceGeneration: 0,
 				sinceSeq: 0,
-				capabilities: [],
+				capabilities: [POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY, TOOL_ACTIVITY_CAPABILITY],
 			}),
 		);
 		await waitFor(() => frames.some(frame => frame.type === "event_replay_result"), 3000, "event replay result");

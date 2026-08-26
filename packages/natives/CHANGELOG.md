@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Notification hosts can now await a directed-delivery writer barrier before publishing a dependent frame through the independent broadcast lane.
+- Notification hosts can now obtain opaque exact-generation receipts for accepted directed frames and queue a dependent idle on that bounded recipient cohort; raw fallbacks carry their prerequisite and idle in one writer command without global barriers or accumulating timeout waiters.
 - Notification frame fan-out can now exclude explicitly opted-in adapter connections that already accepted the matching positioned SDK event, preserving existing delivery for ordinary direct SDK and raw-only legacy subscribers.
 
 ## [0.15.2] - 2026-08-25

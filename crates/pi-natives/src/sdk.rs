@@ -18,8 +18,8 @@ use std::{
 };
 
 use gjc_sdk::{
-	ActionIdentity, ActionNeeded, ClientMessage, ReplyAnswer, ServerConfig, ServerHandle,
-	ServerMessage, Verbosity,
+	ActionIdentity, ActionNeeded, ClientMessage, DependentIdleDeliveryStatus, ReplyAnswer,
+	ServerConfig, ServerHandle, ServerMessage, Verbosity,
 	actions::RetireIfUnclaimed,
 	protocol::{
 		FileAttachment, SessionReady, TurnPhase, TurnStream, decode_workflow_gate_action_needed,
@@ -215,6 +215,15 @@ pub struct KnownGoodFrameStats {
 	/// Base64 characters encoded in Rust for `file_attachment` frames (the JS
 	/// side crosses raw `Buffer` bytes and never allocates the base64 string).
 	pub file_attachment_rust_base64_chars:   f64,
+}
+
+/// Explicit result of binding an idle action to an exact prerequisite cohort.
+#[napi(object)]
+pub struct DependentIdleDeliveryResult {
+	#[napi(ts_type = "'queued' | 'no_recipients' | 'rejected' | 'partial'")]
+	pub status:          String,
+	pub recipient_count: u32,
+	pub queued_count:    u32,
 }
 
 #[napi]
@@ -722,28 +731,60 @@ impl NotificationServer {
 
 	/// Send a validated, bounded JSON envelope to one connected v3 SDK client.
 	#[napi]
-	#[must_use]
-	pub fn send_to(&self, connection_id: String, json: String) -> Result<bool> {
+	pub fn send_to(&self, connection_id: String, json: String) -> Result<()> {
 		let handle = self.handle()?;
-		Ok(handle.send_to(&connection_id, json))
+		if handle.send_to(&connection_id, json) {
+			Ok(())
+		} else {
+			Err(Error::from_reason(
+				"SDK connection is unavailable or directed frame is invalid, oversized, or \
+				 unauthorized, or its writer backlog is full",
+			))
+		}
 	}
 
-	/// Wait until every connected writer has processed the directed frames that
-	/// were accepted before this call. This preserves ordering when a dependent
-	/// frame uses the independent broadcast lane.
+	/// Send a directed frame and return an opaque receipt bound to the exact
+	/// connection generation that accepted it.
 	#[napi]
-	pub async fn wait_for_directed_delivery(
+	pub fn send_to_with_receipt(&self, connection_id: String, json: String) -> Result<String> {
+		self
+			.handle()?
+			.send_to_with_receipt(&connection_id, json)
+			.ok_or_else(|| {
+				Error::from_reason(
+					"SDK connection is unavailable or directed frame is invalid, oversized, or \
+					 unauthorized, or its writer backlog is full",
+				)
+			})
+	}
+
+	/// Queue an idle action only on writer generations that also accepted its
+	/// positioned or raw identity prerequisite.
+	#[napi]
+	pub fn queue_idle_after_directed(
 		&self,
-		timeout_ms: u32,
-		connection_ids: Option<Vec<String>>,
-	) -> Result<bool> {
-		let handle = self.with_handle(Clone::clone)?;
-		Ok(handle
-			.wait_for_directed_delivery(
-				connection_ids.as_deref(),
-				Duration::from_millis(u64::from(timeout_ms)),
-			)
-			.await)
+		prerequisite_json: String,
+		positioned_receipts: Vec<String>,
+		needed_json: String,
+	) -> Result<DependentIdleDeliveryResult> {
+		let prerequisite: ServerMessage = serde_json::from_str(&prerequisite_json)
+			.map_err(|error| Error::from_reason(format!("invalid prerequisite json: {error}")))?;
+		let needed = parse_needed(&needed_json)?;
+		let outcome = self
+			.handle()?
+			.queue_idle_after_directed(prerequisite, &positioned_receipts, needed)
+			.map_err(|error| Error::from_reason(error.to_string()))?;
+		let status = match outcome.status {
+			DependentIdleDeliveryStatus::Queued => "queued",
+			DependentIdleDeliveryStatus::NoRecipients => "no_recipients",
+			DependentIdleDeliveryStatus::Rejected => "rejected",
+			DependentIdleDeliveryStatus::Partial => "partial",
+		};
+		Ok(DependentIdleDeliveryResult {
+			status:          status.into(),
+			recipient_count: u32::try_from(outcome.recipient_count).unwrap_or(u32::MAX),
+			queued_count:    u32::try_from(outcome.queued_count).unwrap_or(u32::MAX),
+		})
 	}
 
 	/// Publish a replayable `session_ready` readiness signal. `ready_json` is a

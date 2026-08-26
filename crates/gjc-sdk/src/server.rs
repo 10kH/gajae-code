@@ -23,7 +23,10 @@ use std::{
 };
 
 use futures_util::{SinkExt, StreamExt};
+use hmac::{Hmac, Mac};
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use tokio::{
 	net::{TcpListener, TcpStream},
 	sync::{Mutex as AsyncMutex, broadcast, mpsc, oneshot},
@@ -118,26 +121,65 @@ enum DirectCommand {
 		connection_generation:  String,
 		requires_tool_activity: bool,
 	},
-	/// Acknowledged only after every directed frame queued before it has
-	/// finished on this connection's writer path.
-	DirectedDeliveryBarrier {
-		settled: oneshot::Sender<()>,
-		pending: Arc<AtomicBool>,
+	/// A prerequisite and its dependent frames reserved and enqueued as one
+	/// connection-generation-bound writer command.
+	DirectedFrameBatch {
+		frames:                Vec<(String, bool)>,
+		connection_generation: String,
 	},
 	ReevaluateAsk,
 }
 
 fn reserve_directed_frame(counter: &AtomicUsize) -> bool {
+	reserve_directed_frames(counter, 1)
+}
+
+fn reserve_directed_frames(counter: &AtomicUsize, count: usize) -> bool {
 	counter
 		.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |queued| {
-			(queued < MAX_QUEUED_DIRECTED_FRAMES).then_some(queued + 1)
+			queued
+				.checked_add(count)
+				.filter(|next| *next <= MAX_QUEUED_DIRECTED_FRAMES)
 		})
 		.is_ok()
 }
 
 fn release_directed_frame(counter: &AtomicUsize) {
-	let queued = counter.fetch_sub(1, Ordering::Relaxed);
-	debug_assert!(queued > 0, "directed-frame reservation underflow");
+	release_directed_frames(counter, 1);
+}
+
+fn release_directed_frames(counter: &AtomicUsize, count: usize) {
+	let queued = counter.fetch_sub(count, Ordering::Relaxed);
+	debug_assert!(queued >= count, "directed-frame reservation underflow");
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DirectedDeliveryReceipt {
+	connection_id: String,
+	generation:    String,
+	mac:           Vec<u8>,
+}
+
+/// Result of scheduling a prerequisite and its dependent idle on exact writer
+/// generations.
+///
+/// These states deliberately distinguish an empty audience from
+/// transport rejection rather than collapsing both into a boolean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DependentIdleDeliveryStatus {
+	Queued,
+	NoRecipients,
+	Rejected,
+	Partial,
+}
+
+/// Observable scheduling counts for dependent idle delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DependentIdleDeliveryOutcome {
+	pub status:          DependentIdleDeliveryStatus,
+	pub recipient_count: usize,
+	pub queued_count:    usize,
 }
 
 fn prepare_direct_ack(state: &ServerState, message: &ServerMessage) -> bool {
@@ -231,6 +273,46 @@ fn may_deliver_directed_frame(
 		})
 }
 
+fn directed_delivery_receipt_mac(
+	connection_id: &str,
+	generation: &str,
+	server_token: &[u8],
+) -> Vec<u8> {
+	let mut mac = Hmac::<Sha256>::new_from_slice(server_token)
+		.expect("HMAC-SHA256 accepts server tokens of every length");
+	mac.update(b"gjc-directed-delivery-receipt-v1\0");
+	mac.update(connection_id.as_bytes());
+	mac.update(b"\0");
+	mac.update(generation.as_bytes());
+	mac.finalize().into_bytes().to_vec()
+}
+
+fn sign_directed_delivery_receipt(
+	connection_id: String,
+	generation: String,
+	server_token: &[u8],
+) -> String {
+	let mac = directed_delivery_receipt_mac(&connection_id, &generation, server_token);
+	serde_json::to_string(&DirectedDeliveryReceipt { connection_id, generation, mac })
+		.expect("directed delivery receipts contain only serializable strings and bytes")
+}
+
+fn verify_directed_delivery_receipt(
+	receipt: &str,
+	server_token: &[u8],
+) -> Option<(String, String)> {
+	let receipt: DirectedDeliveryReceipt = serde_json::from_str(receipt).ok()?;
+	let mut mac = Hmac::<Sha256>::new_from_slice(server_token)
+		.expect("HMAC-SHA256 accepts server tokens of every length");
+	mac.update(b"gjc-directed-delivery-receipt-v1\0");
+	mac.update(receipt.connection_id.as_bytes());
+	mac.update(b"\0");
+	mac.update(receipt.generation.as_bytes());
+	mac.verify_slice(&receipt.mac)
+		.ok()
+		.map(|()| (receipt.connection_id, receipt.generation))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Negotiation {
 	AwaitingHello,
@@ -257,7 +339,6 @@ struct Connection {
 	negotiation:            Negotiation,
 	delivered:              Option<Delivered>,
 	queued_directed_frames: Arc<AtomicUsize>,
-	barrier_pending:        Arc<AtomicBool>,
 	tx:                     mpsc::UnboundedSender<DirectCommand>,
 }
 
@@ -294,6 +375,10 @@ impl std::error::Error for WorkflowGateRegistrationError {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PushFrameError {
 	ActionNeededProhibited,
+	DependentIdleInvalid,
+	DependentPrerequisiteInvalid,
+	DependentSessionMismatch,
+	DeliveryReceiptInvalid,
 }
 
 impl std::fmt::Display for PushFrameError {
@@ -301,6 +386,16 @@ impl std::fmt::Display for PushFrameError {
 		match self {
 			Self::ActionNeededProhibited => {
 				formatter.write_str("ActionNeeded must be sent with register_ask or note_idle")
+			},
+			Self::DependentIdleInvalid => formatter
+				.write_str("dependent delivery requires an idle ActionNeeded without reply controls"),
+			Self::DependentPrerequisiteInvalid => {
+				formatter.write_str("dependent idle delivery requires an identity_header prerequisite")
+			},
+			Self::DependentSessionMismatch => formatter
+				.write_str("dependent idle and identity prerequisite must name the same session"),
+			Self::DeliveryReceiptInvalid => {
+				formatter.write_str("directed delivery receipt is invalid or belongs to another server")
 			},
 		}
 	}
@@ -802,9 +897,24 @@ impl ServerHandle {
 	/// it exceeds the transport frame bound, or the connection's bounded writer
 	/// backlog is full.
 	pub fn send_to(&self, connection_id: &str, json: String) -> bool {
-		let Some((json, requires_tool_activity)) = validate_directed_frame(json) else {
-			return false;
-		};
+		self.enqueue_directed_frame(connection_id, json).is_some()
+	}
+
+	/// Send one directed frame and return an opaque, server-authenticated
+	/// receipt for the exact connection generation that accepted it. The
+	/// receipt carries no authority outside this server and must be passed to
+	/// [`Self::queue_idle_after_directed`].
+	pub fn send_to_with_receipt(&self, connection_id: &str, json: String) -> Option<String> {
+		let generation = self.enqueue_directed_frame(connection_id, json)?;
+		Some(sign_directed_delivery_receipt(
+			connection_id.to_owned(),
+			generation,
+			self.state.token.as_bytes(),
+		))
+	}
+
+	fn enqueue_directed_frame(&self, connection_id: &str, json: String) -> Option<String> {
+		let (json, requires_tool_activity) = validate_directed_frame(json)?;
 		let sender = self
 			.state
 			.connections
@@ -817,88 +927,149 @@ impl ServerHandle {
 					Arc::clone(&connection.queued_directed_frames),
 				)
 			});
-		sender.is_some_and(|(sender, connection_generation, queued_directed_frames)| {
+		sender.and_then(|(sender, connection_generation, queued_directed_frames)| {
 			if !reserve_directed_frame(&queued_directed_frames) {
-				return false;
+				return None;
 			}
 			let sent = sender
 				.send(DirectCommand::DirectedFrame {
 					json,
-					connection_generation,
+					connection_generation: connection_generation.clone(),
 					requires_tool_activity,
 				})
 				.is_ok();
 			if !sent {
 				release_directed_frame(&queued_directed_frames);
 			}
-			sent
+			sent.then_some(connection_generation)
 		})
 	}
 
-	/// Wait until the selected authenticated connections have processed all
-	/// directed frames accepted before this call. The barrier is serialized on
-	/// each connection's writer queue, so a later broadcast cannot overtake an
-	/// earlier positioned or excluded-recipient delivery. A selected connection
-	/// is captured by id, so connections that join after the prerequisite frame
-	/// snapshot cannot acknowledge a barrier for an identity they never
-	/// received.
+	/// Queue an idle action behind an identity prerequisite for one exact
+	/// cohort. Connections named by valid receipts receive only the idle
+	/// because their exact generation already accepted the positioned identity.
+	/// Other current connections receive the raw identity and idle in one
+	/// writer command. A replacement generation never inherits an older
+	/// generation's receipt, and connections that join after the registry
+	/// snapshot receive neither frame.
 	///
-	/// Returns `false` when a connection closes before acknowledging its barrier
-	/// or the bounded wait expires. With no connected clients there is nothing
-	/// to order and the barrier succeeds immediately.
-	pub async fn wait_for_directed_delivery(
+	/// Capacity is reserved for the whole cohort before any dependent idle is
+	/// enqueued. Saturation therefore rejects the operation without creating an
+	/// unbounded waiter or partially publishing the dependency.
+	pub fn queue_idle_after_directed(
 		&self,
-		connection_ids: Option<&[String]>,
-		wait: Duration,
-	) -> bool {
-		let senders = self
-			.state
-			.connections
-			.lock()
-			.iter()
-			.filter(|(connection_id, _)| {
-				connection_ids.is_none_or(|ids| ids.iter().any(|id| id == *connection_id))
-			})
-			.map(|(_, connection)| (connection.tx.clone(), Arc::clone(&connection.barrier_pending)))
-			.collect::<Vec<_>>();
-		if connection_ids.is_some_and(|ids| ids.len() != senders.len()) {
-			return false;
+		prerequisite: ServerMessage,
+		positioned_receipts: &[String],
+		needed: ActionNeeded,
+	) -> Result<DependentIdleDeliveryOutcome, PushFrameError> {
+		let ServerMessage::IdentityHeader(identity) = &prerequisite else {
+			return Err(PushFrameError::DependentPrerequisiteInvalid);
+		};
+		if needed.kind != ActionKind::Idle || !needed.controls.is_empty() {
+			return Err(PushFrameError::DependentIdleInvalid);
 		}
-		let mut receipts = Vec::with_capacity(senders.len());
-		for (sender, pending) in senders {
-			if pending
-				.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-				.is_err()
-			{
-				return false;
-			}
-			let (settled_tx, settled_rx) = oneshot::channel();
-			let pending_for_command = Arc::clone(&pending);
-			if sender
-				.send(DirectCommand::DirectedDeliveryBarrier {
-					settled: settled_tx,
-					pending: pending_for_command,
-				})
-				.is_err()
-			{
-				// This command never entered the writer queue, so its reservation is
-				// safe to release. Earlier reservations remain held until their
-				// already-enqueued barriers are processed.
-				pending.store(false, Ordering::Release);
-				return false;
-			}
-			receipts.push(settled_rx);
+		if needed.session_id != identity.session_id {
+			return Err(PushFrameError::DependentSessionMismatch);
 		}
-		timeout(wait, async move {
-			for receipt in receipts {
-				if receipt.await.is_err() {
-					return false;
+
+		let mut positioned = HashMap::<String, String>::new();
+		for receipt in positioned_receipts {
+			let Some((connection_id, generation)) =
+				verify_directed_delivery_receipt(receipt, self.state.token.as_bytes())
+			else {
+				return Err(PushFrameError::DeliveryReceiptInvalid);
+			};
+			if positioned
+				.insert(connection_id, generation.clone())
+				.is_some_and(|prior| prior != generation)
+			{
+				return Err(PushFrameError::DeliveryReceiptInvalid);
+			}
+		}
+
+		let prerequisite_json =
+			serde_json::to_string(&prerequisite).expect("ServerMessage serialization cannot fail");
+		let Some((prerequisite_json, prerequisite_requires_tool_activity)) =
+			validate_directed_frame(prerequisite_json)
+		else {
+			return Err(PushFrameError::DependentPrerequisiteInvalid);
+		};
+		let needed = self.state.registry.lock().note_idle(needed);
+		let idle_json = serde_json::to_string(&ServerMessage::ActionNeeded(needed))
+			.expect("ServerMessage serialization cannot fail");
+		let Some((idle_json, idle_requires_tool_activity)) = validate_directed_frame(idle_json)
+		else {
+			return Err(PushFrameError::DependentIdleInvalid);
+		};
+
+		let connections = self.state.connections.lock();
+		let mut targets = Vec::with_capacity(connections.len());
+		for (connection_id, connection) in connections.iter() {
+			let frames = match positioned.get(connection_id) {
+				Some(generation) if generation == &connection.generation => {
+					vec![(idle_json.clone(), idle_requires_tool_activity)]
+				},
+				// A same-id replacement generation is intentionally excluded: an
+				// older receipt cannot grant it the dependent raw fallback.
+				Some(_) => continue,
+				None => vec![
+					(prerequisite_json.clone(), prerequisite_requires_tool_activity),
+					(idle_json.clone(), idle_requires_tool_activity),
+				],
+			};
+			targets.push((
+				connection.tx.clone(),
+				connection.generation.clone(),
+				Arc::clone(&connection.queued_directed_frames),
+				frames,
+			));
+		}
+		drop(connections);
+
+		let recipient_count = targets.len();
+		if recipient_count == 0 {
+			return Ok(DependentIdleDeliveryOutcome {
+				status: DependentIdleDeliveryStatus::NoRecipients,
+				recipient_count,
+				queued_count: 0,
+			});
+		}
+
+		let mut reserved: Vec<(Arc<AtomicUsize>, usize)> = Vec::with_capacity(targets.len());
+		for (_, _, counter, frames) in &targets {
+			let count = frames.len();
+			if !reserve_directed_frames(counter, count) {
+				for (counter, count) in reserved {
+					release_directed_frames(&counter, count);
 				}
+				return Ok(DependentIdleDeliveryOutcome {
+					status: DependentIdleDeliveryStatus::Rejected,
+					recipient_count,
+					queued_count: 0,
+				});
 			}
-			true
-		})
-		.await
-		.unwrap_or(false)
+			reserved.push((Arc::clone(counter), count));
+		}
+
+		let mut queued_count = 0;
+		for (sender, connection_generation, counter, frames) in targets {
+			let count = frames.len();
+			if sender
+				.send(DirectCommand::DirectedFrameBatch { frames, connection_generation })
+				.is_ok()
+			{
+				queued_count += 1;
+			} else {
+				release_directed_frames(&counter, count);
+			}
+		}
+
+		let status = match queued_count {
+			0 => DependentIdleDeliveryStatus::Rejected,
+			count if count == recipient_count => DependentIdleDeliveryStatus::Queued,
+			_ => DependentIdleDeliveryStatus::Partial,
+		};
+		Ok(DependentIdleDeliveryOutcome { status, recipient_count, queued_count })
 	}
 
 	/// Resolve an unclaimed legacy action. Claimed forward-mode replies require
@@ -1433,7 +1604,6 @@ async fn handle_conn(stream: TcpStream, state: Arc<ServerState>, cancel: Cancell
 	let generation = "0".to_owned();
 	let (direct_tx, mut direct_rx) = mpsc::unbounded_channel::<DirectCommand>();
 	let queued_directed_frames = Arc::new(AtomicUsize::new(0));
-	let barrier_pending = Arc::new(AtomicBool::new(false));
 	let mut rx = state.tx.subscribe();
 	let (mut write, mut read) = ws.split();
 	let hello = ServerMessage::Hello(ServerHello {
@@ -1466,7 +1636,6 @@ async fn handle_conn(stream: TcpStream, state: Arc<ServerState>, cancel: Cancell
 			negotiation:            Negotiation::AwaitingHello,
 			delivered:              None,
 			queued_directed_frames: Arc::clone(&queued_directed_frames),
-			barrier_pending:        Arc::clone(&barrier_pending),
 			tx:                     direct_tx.clone(),
 		});
 
@@ -1518,10 +1687,25 @@ async fn handle_conn(stream: TcpStream, state: Arc<ServerState>, cancel: Cancell
 								requires_tool_activity,
 							) && write.send(Message::Text(json)).await.is_ok()
 						},
-						DirectCommand::DirectedDeliveryBarrier { settled, pending } => {
-							pending.store(false, Ordering::Release);
-							let _ = settled.send(());
-							true
+						DirectCommand::DirectedFrameBatch {
+							frames,
+							connection_generation,
+						} => {
+							let mut sent = true;
+							for (json, requires_tool_activity) in frames {
+								release_directed_frame(&queued_directed_frames);
+								if sent
+									&& may_deliver_directed_frame(
+										&state,
+										&connection_id,
+										&connection_generation,
+										requires_tool_activity,
+									)
+								{
+									sent = write.send(Message::Text(json)).await.is_ok();
+								}
+							}
+							sent
 						},
 						DirectCommand::ReevaluateAsk => true,
 					};
@@ -1609,9 +1793,28 @@ async fn handle_conn(stream: TcpStream, state: Arc<ServerState>, cancel: Cancell
 							break;
 						}
 					},
-					DirectCommand::DirectedDeliveryBarrier { settled, pending } => {
-						pending.store(false, Ordering::Release);
-						let _ = settled.send(());
+					DirectCommand::DirectedFrameBatch {
+						frames,
+						connection_generation,
+					} => {
+						let mut failed = false;
+						for (json, requires_tool_activity) in frames {
+							release_directed_frame(&queued_directed_frames);
+							if !failed
+								&& may_deliver_directed_frame(
+									&state,
+									&connection_id,
+									&connection_generation,
+									requires_tool_activity,
+								)
+								&& write.send(Message::Text(json)).await.is_err()
+							{
+								failed = true;
+							}
+						}
+						if failed {
+							break;
+						}
 					},
 					DirectCommand::ReevaluateAsk => {
 						if !reevaluate_ask(&state, &mut write, &connection_id).await {
@@ -2064,7 +2267,6 @@ mod tests {
 				negotiation: Negotiation::Negotiated,
 				delivered: None,
 				queued_directed_frames: Arc::clone(&queued),
-				barrier_pending: Arc::new(AtomicBool::new(false)),
 				tx,
 			});
 
@@ -2091,129 +2293,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn directed_delivery_barrier_waits_behind_preceding_frames() {
-		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
-		let (tx, mut rx) = mpsc::unbounded_channel::<DirectCommand>();
-		let queued = Arc::new(AtomicUsize::new(0));
-		handle
-			.state
-			.connections
-			.lock()
-			.insert("slow".into(), Connection {
-				generation: "generation".into(),
-				capabilities: Vec::new(),
-				negotiation: Negotiation::Negotiated,
-				delivered: None,
-				queued_directed_frames: Arc::clone(&queued),
-				barrier_pending: Arc::new(AtomicBool::new(false)),
-				tx,
-			});
-
-		assert!(handle.send_to(
-			"slow",
-			r#"{"type":"identity_header","sessionId":"s","repo":"repo","branch":"dev","machine":"host"}"#
-				.into(),
-		));
-		let barrier = {
-			let handle = handle.clone();
-			tokio::spawn(async move {
-				handle
-					.wait_for_directed_delivery(Some(&["slow".into()]), Duration::from_secs(1))
-					.await
-			})
-		};
-
-		let DirectCommand::DirectedFrame { .. } = rx.recv().await.expect("preceding frame") else {
-			panic!("expected directed frame before its barrier");
-		};
-		release_directed_frame(&queued);
-		let DirectCommand::DirectedDeliveryBarrier { settled, .. } =
-			rx.recv().await.expect("directed delivery barrier")
-		else {
-			panic!("expected directed delivery barrier after the frame");
-		};
-		assert!(
-			!handle
-				.wait_for_directed_delivery(Some(&["slow".into()]), Duration::from_millis(10))
-				.await,
-			"a timed-out barrier must not enqueue a second barrier while the first is pending"
-		);
-		assert!(!barrier.is_finished());
-		settled.send(()).expect("barrier waiter remains live");
-		assert!(barrier.await.expect("barrier task"));
-		handle.stop();
-	}
-
-	#[tokio::test]
-	async fn directed_delivery_barrier_only_targets_snapshot_recipients() {
-		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
-		let (first_tx, mut first_rx) = mpsc::unbounded_channel::<DirectCommand>();
-		let (late_tx, mut late_rx) = mpsc::unbounded_channel::<DirectCommand>();
-		for (id, tx) in [("first", first_tx), ("late", late_tx)] {
-			handle
-				.state
-				.connections
-				.lock()
-				.insert(id.into(), Connection {
-					generation: "generation".into(),
-					capabilities: Vec::new(),
-					negotiation: Negotiation::Negotiated,
-					delivered: None,
-					queued_directed_frames: Arc::new(AtomicUsize::new(0)),
-					barrier_pending: Arc::new(AtomicBool::new(false)),
-					tx,
-				});
-		}
-		let ids = vec!["first".to_owned()];
-		let barrier = {
-			let handle = handle.clone();
-			let ids = ids.clone();
-			tokio::spawn(async move {
-				handle
-					.wait_for_directed_delivery(Some(&ids), Duration::from_secs(1))
-					.await
-			})
-		};
-		let DirectCommand::DirectedDeliveryBarrier { settled, .. } =
-			first_rx.recv().await.expect("selected recipient barrier")
-		else {
-			panic!("expected selected recipient barrier");
-		};
-		assert!(late_rx.try_recv().is_err(), "late recipients must not receive the barrier");
-		settled.send(()).expect("barrier waiter remains live");
-		assert!(barrier.await.expect("barrier task"));
-		handle.stop();
-	}
-
-	#[tokio::test]
-	async fn directed_delivery_barrier_fails_when_a_writer_disappears() {
-		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
-		let (tx, rx) = mpsc::unbounded_channel::<DirectCommand>();
-		handle
-			.state
-			.connections
-			.lock()
-			.insert("closed".into(), Connection {
-				generation: "generation".into(),
-				capabilities: Vec::new(),
-				negotiation: Negotiation::Negotiated,
-				delivered: None,
-				queued_directed_frames: Arc::new(AtomicUsize::new(0)),
-				barrier_pending: Arc::new(AtomicBool::new(false)),
-				tx,
-			});
-		drop(rx);
-
-		assert!(
-			!handle
-				.wait_for_directed_delivery(Some(&["closed".into()]), Duration::from_millis(100))
-				.await
-		);
-		handle.stop();
-	}
-
-	#[tokio::test]
-	async fn directed_delivery_barrier_orders_a_later_idle_broadcast() {
+	async fn directed_receipt_queues_idle_behind_the_exact_positioned_generation() {
 		use crate::protocol::IdentityHeader;
 		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
 		let mut ws = connect(&handle, "secret").await;
@@ -2229,19 +2309,18 @@ mod tests {
 			machine:    "test".into(),
 			title:      None,
 		});
-		assert!(handle.send_to(
-			&connection_id,
-			serde_json::to_string(&identity).expect("identity serialization"),
-		));
-		assert!(
-			handle
-				.wait_for_directed_delivery(
-					Some(std::slice::from_ref(&connection_id)),
-					Duration::from_secs(1)
-				)
-				.await
-		);
-		handle.note_idle(idle("ordered-idle"));
+		let receipt = handle
+			.send_to_with_receipt(
+				&connection_id,
+				serde_json::to_string(&identity).expect("identity serialization"),
+			)
+			.expect("positioned identity receipt");
+		let outcome = handle
+			.queue_idle_after_directed(identity, &[receipt], idle("ordered-idle"))
+			.expect("dependent idle scheduling");
+		assert_eq!(outcome.status, DependentIdleDeliveryStatus::Queued);
+		assert_eq!(outcome.recipient_count, 1);
+		assert_eq!(outcome.queued_count, 1);
 
 		assert!(matches!(
 			next_server_msg(&mut ws).await,
@@ -2252,6 +2331,185 @@ mod tests {
 			ServerMessage::ActionNeeded(needed)
 				if needed.kind == ActionKind::Idle && needed.id == "ordered-idle"
 		));
+		handle.stop();
+	}
+
+	#[tokio::test]
+	async fn directed_receipt_gives_a_late_joiner_its_raw_prerequisite_before_idle() {
+		use crate::protocol::IdentityHeader;
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		let mut positioned = connect(&handle, "secret").await;
+		let positioned_id = next_server_hello(&mut positioned)
+			.await
+			.connection_id
+			.expect("positioned connection id");
+		wait_for_clients(&handle, 1).await;
+
+		let identity = ServerMessage::IdentityHeader(IdentityHeader {
+			session_id: "s".into(),
+			repo:       "gajae-code".into(),
+			branch:     "dev".into(),
+			machine:    "test".into(),
+			title:      None,
+		});
+		let receipt = handle
+			.send_to_with_receipt(
+				&positioned_id,
+				serde_json::to_string(&identity).expect("identity serialization"),
+			)
+			.expect("positioned identity receipt");
+
+		let mut late = connect(&handle, "secret").await;
+		next_server_hello(&mut late).await;
+		wait_for_clients(&handle, 2).await;
+		let outcome = handle
+			.queue_idle_after_directed(identity, &[receipt], idle("late-idle"))
+			.expect("mixed cohort scheduling");
+		assert_eq!(outcome.status, DependentIdleDeliveryStatus::Queued);
+		assert_eq!(outcome.recipient_count, 2);
+
+		for ws in [&mut positioned, &mut late] {
+			assert!(matches!(
+				next_server_msg(ws).await,
+				ServerMessage::IdentityHeader(IdentityHeader { session_id, .. }) if session_id == "s"
+			));
+			assert!(matches!(
+				next_server_msg(ws).await,
+				ServerMessage::ActionNeeded(needed)
+					if needed.kind == ActionKind::Idle && needed.id == "late-idle"
+			));
+		}
+		handle.stop();
+	}
+
+	#[tokio::test]
+	async fn replaced_generation_cannot_consume_an_older_directed_receipt() {
+		use crate::protocol::IdentityHeader;
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		let (tx, mut rx) = mpsc::unbounded_channel::<DirectCommand>();
+		let queued = Arc::new(AtomicUsize::new(0));
+		handle
+			.state
+			.connections
+			.lock()
+			.insert("same-id".into(), Connection {
+				generation: "old".into(),
+				capabilities: Vec::new(),
+				negotiation: Negotiation::Negotiated,
+				delivered: None,
+				queued_directed_frames: Arc::clone(&queued),
+				tx,
+			});
+		let identity = ServerMessage::IdentityHeader(IdentityHeader {
+			session_id: "s".into(),
+			repo:       "gajae-code".into(),
+			branch:     "dev".into(),
+			machine:    "test".into(),
+			title:      None,
+		});
+		let receipt = handle
+			.send_to_with_receipt(
+				"same-id",
+				serde_json::to_string(&identity).expect("identity serialization"),
+			)
+			.expect("old generation receipt");
+		let mut forged: DirectedDeliveryReceipt =
+			serde_json::from_str(&receipt).expect("receipt payload");
+		forged.generation = "forged".into();
+		assert_eq!(
+			handle.queue_idle_after_directed(
+				identity.clone(),
+				&[serde_json::to_string(&forged).expect("forged receipt serialization")],
+				idle("forged-idle"),
+			),
+			Err(PushFrameError::DeliveryReceiptInvalid),
+		);
+		handle
+			.state
+			.connections
+			.lock()
+			.get_mut("same-id")
+			.expect("connection")
+			.generation = "replacement".into();
+
+		let outcome = handle
+			.queue_idle_after_directed(identity, &[receipt], idle("stale-idle"))
+			.expect("stale receipt is a safe no-op");
+		assert_eq!(outcome.status, DependentIdleDeliveryStatus::NoRecipients);
+		assert!(matches!(rx.recv().await, Some(DirectCommand::DirectedFrame { .. })));
+		release_directed_frame(&queued);
+		assert!(rx.try_recv().is_err());
+		handle.stop();
+	}
+
+	#[tokio::test]
+	async fn saturated_cohort_rejects_repeated_dependent_idle_without_queue_growth() {
+		use crate::protocol::IdentityHeader;
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		let (tx, mut rx) = mpsc::unbounded_channel::<DirectCommand>();
+		let queued = Arc::new(AtomicUsize::new(0));
+		handle
+			.state
+			.connections
+			.lock()
+			.insert("slow".into(), Connection {
+				generation: "generation".into(),
+				capabilities: Vec::new(),
+				negotiation: Negotiation::Negotiated,
+				delivered: None,
+				queued_directed_frames: Arc::clone(&queued),
+				tx,
+			});
+		for id in 0..(MAX_QUEUED_DIRECTED_FRAMES - 1) {
+			assert!(
+				handle
+					.send_to("slow", format!(r#"{{"type":"query_response","id":"q{id}","ok":true}}"#),)
+			);
+		}
+		let identity = ServerMessage::IdentityHeader(IdentityHeader {
+			session_id: "s".into(),
+			repo:       "gajae-code".into(),
+			branch:     "dev".into(),
+			machine:    "test".into(),
+			title:      None,
+		});
+		let raw_outcome = handle
+			.queue_idle_after_directed(identity.clone(), &[], idle("raw-saturated"))
+			.expect("255-frame raw rejection");
+		assert_eq!(raw_outcome.status, DependentIdleDeliveryStatus::Rejected);
+		assert_eq!(queued.load(Ordering::Relaxed), MAX_QUEUED_DIRECTED_FRAMES - 1);
+		let receipt = handle
+			.send_to_with_receipt(
+				"slow",
+				serde_json::to_string(&identity).expect("identity serialization"),
+			)
+			.expect("256th reservation");
+		assert!(
+			handle
+				.send_to_with_receipt(
+					"slow",
+					serde_json::to_string(&identity).expect("identity serialization"),
+				)
+				.is_none()
+		);
+
+		for sequence in 0..8 {
+			let outcome = handle
+				.queue_idle_after_directed(
+					identity.clone(),
+					std::slice::from_ref(&receipt),
+					idle(&format!("saturated-{sequence}")),
+				)
+				.expect("bounded rejection");
+			assert_eq!(outcome.status, DependentIdleDeliveryStatus::Rejected);
+			assert_eq!(outcome.queued_count, 0);
+			assert_eq!(queued.load(Ordering::Relaxed), MAX_QUEUED_DIRECTED_FRAMES);
+		}
+		for _ in 0..MAX_QUEUED_DIRECTED_FRAMES {
+			assert!(matches!(rx.recv().await, Some(DirectCommand::DirectedFrame { .. })));
+			release_directed_frame(&queued);
+		}
+		assert!(rx.try_recv().is_err());
 		handle.stop();
 	}
 
@@ -4051,7 +4309,6 @@ mod tests {
 				negotiation: Negotiation::Negotiated,
 				delivered: None,
 				queued_directed_frames: Arc::new(AtomicUsize::new(0)),
-				barrier_pending: Arc::new(AtomicBool::new(false)),
 				tx,
 			});
 		let task = {

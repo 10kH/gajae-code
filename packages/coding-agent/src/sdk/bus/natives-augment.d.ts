@@ -21,6 +21,11 @@ declare module "@gajae-code/natives" {
 	interface RetireIfUnclaimedResult {
 		status: "retired" | "already_terminal" | "claimed" | "stale";
 	}
+	interface DependentIdleDeliveryResult {
+		status: "queued" | "no_recipients" | "rejected" | "partial";
+		recipientCount: number;
+		queuedCount: number;
+	}
 	interface NotificationServer {
 		/** Broadcast a validated frame, omitting subscribers that received its positioned event envelope. */
 		pushFrame(json: string, excludedConnectionIds?: string[]): void;
@@ -33,9 +38,15 @@ declare module "@gajae-code/natives" {
 			callback: (err: null | Error, connectionId: string, capabilities: string[]) => void,
 		): void;
 		/** Directed delivery of a validated, bounded JSON v3 envelope to one connection. */
-		sendTo(connectionId: string, json: string): boolean;
-		/** Wait for every directed writer queue to cross the current delivery barrier. */
-		waitForDirectedDelivery(timeoutMs: number, connectionIds?: string[] | null): Promise<boolean>;
+		sendTo(connectionId: string, json: string): void;
+		/** Directed delivery with an opaque exact-generation receipt. */
+		sendToWithReceipt(connectionId: string, json: string): string;
+		/** Queue raw identity fallback and dependent idle on one exact bounded cohort. */
+		queueIdleAfterDirected(
+			prerequisiteJson: string,
+			positionedReceipts: string[],
+			neededJson: string,
+		): DependentIdleDeliveryResult;
 		/** Register a correlated workflow-gate action_needed frame. */
 		registerWorkflowGateAsk(workflowJson: string, repliable: boolean): void;
 		/** Atomically register the single active arbitrated action and return its private lease. */

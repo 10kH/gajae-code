@@ -1177,7 +1177,10 @@ interface SessionRuntime {
 	host: SessionSdkHost;
 	/** Delivers one ring-positioned event envelope to every attached subscriber
 	 *  connection, applying the same capability gate as event replay. */
-	broadcastEventFrame: (event: SdkFrame) => PositionedDelivery;
+	broadcastEventFrame: (event: SdkFrame) => string[];
+	/** Delivers one positioned event and returns opaque receipts only for the
+	 *  notification-effect generations that accepted it. */
+	broadcastEventFrameWithReceipts: (event: SdkFrame) => string[];
 	/** Owns stateRoot-backed revisions and removes their spills on terminal shutdown. */
 	revisions: RevisionStore;
 	/** Releases all snapshot pins before the revision store is closed. */
@@ -1348,12 +1351,6 @@ interface SessionRuntime {
 	abortEphemeralTurns: () => void;
 }
 
-type PositionedDelivery = {
-	recipients: string[];
-	attempted: number;
-	rejected: number;
-};
-
 const SENSITIVE_MODEL_LABEL =
 	/(?:\b(?:https?|wss?):\/\/|\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b|\b(?:api[-_ ]?key|access[-_ ]?token|bearer|secret|password|account(?:\s*id)?|email|exception|stack trace)\b|\b(?:sk|pk|rk)-[A-Za-z0-9_-]{12,}\b)/i;
 const TOOL_SUMMARY_MAX = 280;
@@ -1410,17 +1407,15 @@ function emitSessionEvent(
 	runtime: Pick<SessionRuntime, "host" | "broadcastEventFrame">,
 	frame: { type: string; [key: string]: unknown },
 	payload: Record<string, unknown> = frame,
-): PositionedDelivery {
+): string[] {
 	return runtime.broadcastEventFrame(runtime.host.emitEvent({ kind: frame.type, payload }));
 }
 
-function pushPositionedFrame(
-	runtime: Pick<SessionRuntime, "server" | "host" | "broadcastEventFrame">,
+function emitSessionEventWithReceipts(
+	runtime: Pick<SessionRuntime, "host" | "broadcastEventFrameWithReceipts">,
 	frame: { type: string; [key: string]: unknown },
-): PositionedDelivery {
-	const positioned = emitSessionEvent(runtime, frame);
-	runtime.server.pushFrame(JSON.stringify(frame), positioned.recipients);
-	return positioned;
+): string[] {
+	return runtime.broadcastEventFrameWithReceipts(runtime.host.emitEvent({ kind: frame.type, payload: frame }));
 }
 
 function pushSessionFrame(
@@ -1435,16 +1430,16 @@ function pushSessionFrame(
 			String(frame.text),
 			typeof frame.finalAnswer === "boolean" ? frame.finalAnswer : undefined,
 			typeof frame.messageRef === "string" ? frame.messageRef : undefined,
-			positionedRecipients.recipients,
+			positionedRecipients,
 		);
 		// A retained lean settlement may be consumed only after either the
 		// positioned or legacy raw transport accepts the lead-in. Older native addons
 		// return undefined here, which deliberately fails closed unless the
 		// positioned leg has already proved acceptance.
-		return positionedRecipients.recipients.length > 0 || rawAccepted === true;
+		return positionedRecipients.length > 0 || rawAccepted === true;
 	}
-	runtime.server.pushFrame(JSON.stringify(frame), positionedRecipients.recipients);
-	return positionedRecipients.recipients.length > 0 && positionedRecipients.rejected === 0;
+	runtime.server.pushFrame(JSON.stringify(frame), positionedRecipients);
+	return positionedRecipients.length > 0;
 }
 
 async function pushTerminalSessionFrame(
@@ -1470,7 +1465,7 @@ function pushFileAttachment(
 		frame.mime,
 		data,
 		frame.caption,
-		positionedRecipients.recipients,
+		positionedRecipients,
 	);
 }
 
@@ -1482,7 +1477,7 @@ function emitAgentLifecycle(
 	try {
 		const json = JSON.stringify(frame);
 		const positionedRecipients = emitSessionEvent(runtime, frame);
-		runtime.server.pushFrame(json, positionedRecipients.recipients);
+		runtime.server.pushFrame(json, positionedRecipients);
 	} catch (error) {
 		logger.warn(`sdk: lifecycle delivery failed: ${String(error)}`);
 	}
@@ -4779,28 +4774,37 @@ export function createNotificationsExtension(
 		 * negotiate positioned-only effects are returned for matching raw exclusion;
 		 * ordinary direct SDK subscribers retain both public surfaces from #4570.
 		 */
-		const broadcastEventFrame = (event: SdkFrame): PositionedDelivery => {
+		const broadcastEventFrame = (event: SdkFrame): string[] => {
 			const gated = CAP_GATED_FRAME_KINDS.has(String(event.kind));
 			const json = JSON.stringify(event);
 			const recipients: string[] = [];
-			let attempted = 0;
-			let rejected = 0;
 			for (const [connectionId, capabilities] of hostCapCache) {
 				if (fencedConnections.has(connectionId)) continue;
 				if (gated && !capabilities.has(TOOL_ACTIVITY_CAPABILITY)) continue;
-				const positioned = capabilities.has(POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY);
-				if (positioned) attempted += 1;
 				try {
-					const accepted = server.sendTo(connectionId, json);
-					if (positioned) {
-						if (accepted) recipients.push(connectionId);
-						else rejected += 1;
-					}
+					server.sendTo(connectionId, json);
+					if (capabilities.has(POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY)) recipients.push(connectionId);
 				} catch {
-					if (positioned) rejected += 1;
+					// Broadcasts are best effort; directed responses surface send failures.
 				}
 			}
-			return { recipients, attempted, rejected };
+			return recipients;
+		};
+		const broadcastEventFrameWithReceipts = (event: SdkFrame): string[] => {
+			const gated = CAP_GATED_FRAME_KINDS.has(String(event.kind));
+			const json = JSON.stringify(event);
+			const receipts: string[] = [];
+			for (const [connectionId, capabilities] of hostCapCache) {
+				if (fencedConnections.has(connectionId)) continue;
+				if (gated && !capabilities.has(TOOL_ACTIVITY_CAPABILITY)) continue;
+				try {
+					const receipt = server.sendToWithReceipt(connectionId, json);
+					if (capabilities.has(POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY)) receipts.push(receipt);
+				} catch {
+					// Rejected positioned sends remain eligible for the atomic raw fallback.
+				}
+			}
+			return receipts;
 		};
 		let cancelPreflightsForConnection: ((connectionId: string) => Promise<void>) | undefined;
 		const promptTerminalTombstones = new Map<string, { connectionId: string; expiresAt: number }>();
@@ -6880,6 +6884,7 @@ export function createNotificationsExtension(
 			server,
 			host,
 			broadcastEventFrame,
+			broadcastEventFrameWithReceipts,
 			revisions,
 			cursors,
 			id,
@@ -7161,9 +7166,9 @@ export function createNotificationsExtension(
 					"@gajae-code/natives is out of date: missing positioned raw-fan-out exclusion. Rebuild the native addon (bun --cwd=packages/natives run build).",
 				);
 			}
-			if (typeof server.waitForDirectedDelivery !== "function") {
+			if (typeof server.sendToWithReceipt !== "function" || typeof server.queueIdleAfterDirected !== "function") {
 				throw new Error(
-					"@gajae-code/natives is out of date: missing directed-delivery barrier. Rebuild the native addon (bun --cwd=packages/natives run build).",
+					"@gajae-code/natives is out of date: missing recipient-bound dependent delivery. Rebuild the native addon (bun --cwd=packages/natives run build).",
 				);
 			}
 			server.onNegotiatedCapabilities((_err, connectionId, capabilities) => {
@@ -7728,7 +7733,7 @@ export function createNotificationsExtension(
 					...buildIdentity(ctx.cwd, sessionName, telegramTopicsEnabled()),
 				};
 				const positionedRecipients = emitSessionEvent(initializedRuntime, identity);
-				server.pushFrame(JSON.stringify(identity), positionedRecipients.recipients);
+				server.pushFrame(JSON.stringify(identity), positionedRecipients);
 			}, 250);
 			sessionNameObserver.unref?.();
 			runtime.stopSessionNameObserver = () => clearInterval(sessionNameObserver);
@@ -7742,7 +7747,7 @@ export function createNotificationsExtension(
 					...buildIdentity(ctx.cwd, sessionNameAfterStartup, telegramTopicsEnabled()),
 				};
 				const positionedRecipients = emitSessionEvent(initializedRuntime, identity);
-				server.pushFrame(JSON.stringify(identity), positionedRecipients.recipients);
+				server.pushFrame(JSON.stringify(identity), positionedRecipients);
 			}
 			const agentDir = lifecycleAgentDir ?? settings?.getAgentDir?.();
 			if (lifecycleRequired && !agentDir) throw new Error("Lifecycle SDK host requires an agent directory.");
@@ -8774,47 +8779,39 @@ export function createNotificationsExtension(
 		const seq = rt.idleSeq++;
 		// Re-assert the identity header so the daemon renames the topic once the
 		// session title has been auto-generated ("{repo}/{branch} - {title}"). The
-		// daemon only renames when the title actually changed. A positioned event
-		// uses the per-connection directed queue while noteIdle uses the independent
-		// broadcast queue, so wait for the directed writer barrier before publishing
-		// the dependent idle action. Without it Tokio may select the idle first and
-		// route the notification with stale topic identity.
-		let idleOrderingReady = true;
+		// daemon only renames when the title actually changed. Bind the dependent
+		// idle to the exact connection generations that accepted this positioned
+		// identity; native raw fallbacks enqueue identity and idle as one bounded
+		// writer command for the remaining snapshot cohort.
 		try {
-			const positioned = pushPositionedFrame(rt, {
+			const identity = {
 				type: "identity_header",
 				sessionId: id,
 				...buildIdentity(ctx.cwd, ctx.sessionManager.getSessionName(), telegramTopicsEnabled()),
-			});
-			if (positioned.attempted > 0) {
-				idleOrderingReady =
-					positioned.rejected === 0 &&
-					(await rt.server.waitForDirectedDelivery(1_000, positioned.recipients));
+			} as const;
+			const receipts = emitSessionEventWithReceipts(rt, identity);
+			const outcome = rt.server.queueIdleAfterDirected(
+				JSON.stringify(identity),
+				receipts,
+				JSON.stringify(
+					notificationActionPayload(
+						{
+							id: `idle:${id}#${seq}`,
+							kind: "idle",
+							sessionId: id,
+							summary: undefined,
+						},
+						{ redact: rt.redact },
+					),
+				),
+			);
+			if (outcome.status === "rejected" || outcome.status === "partial") {
+				logger.warn(
+					`notifications: dependent idle ${outcome.status} (${outcome.queuedCount}/${outcome.recipientCount} recipients queued)`,
+				);
 			}
 		} catch (error) {
-			idleOrderingReady = false;
-			logger.warn(`notifications: identity delivery barrier failed: ${String(error)}`);
-		}
-		if (idleOrderingReady) {
-			try {
-				rt.server.noteIdle(
-					JSON.stringify(
-						notificationActionPayload(
-							{
-								id: `idle:${id}#${seq}`,
-								kind: "idle",
-								sessionId: id,
-								summary: undefined,
-							},
-							{ redact: rt.redact },
-						),
-					),
-				);
-			} catch (e) {
-				logger.warn(`notifications: noteIdle failed: ${String(e)}`);
-			}
-		} else {
-			logger.warn("notifications: idle suppressed because positioned identity delivery did not settle");
+			logger.warn(`notifications: recipient-bound identity/idle delivery failed: ${String(error)}`);
 		}
 
 		// Lean: emit the latest deferred assistant answer exactly once at idle.
