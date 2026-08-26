@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createNotificationsExtension } from "../src/sdk/bus/index";
-import { POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY } from "../src/sdk/bus/telegram-daemon";
+import { POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY, TOOL_ACTIVITY_CAPABILITY } from "../src/sdk/bus/telegram-daemon";
 import {
 	cleanupFixtureRoots,
 	createNotificationFixtureRoot,
@@ -249,6 +249,55 @@ test("a replay-attached subscriber receives one live representation of a turn fr
 		expect(legacyFrames.filter(frame => frame.type === "turn_stream")).toEqual([
 			expect.objectContaining({ type: "turn_stream", text: "One visible result." }),
 		]);
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}, 30000);
+
+test("recipient-bound idle follows positioned activity and identity delivery", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, frames, ws } = await setup();
+		ws.send(
+			JSON.stringify({
+				type: "hello",
+				protocolVersion: 3,
+				capabilities: [POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY, TOOL_ACTIVITY_CAPABILITY],
+			}),
+		);
+		ws.send(
+			JSON.stringify({
+				type: "event_replay",
+				id: "idle-ordering-regression",
+				sinceGeneration: 0,
+				sinceSeq: 0,
+				capabilities: [POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY, TOOL_ACTIVITY_CAPABILITY],
+			}),
+		);
+		await waitFor(() => frames.some(frame => frame.type === "event_replay_result"), 3000, "event replay result");
+		frames.splice(0);
+
+		// Keep enough directed work ahead of the terminal identity to exercise the
+		// independent directed/broadcast queues instead of relying on an idle socket.
+		for (let index = 0; index < 32; index++) {
+			await handlers.get("tool_execution_start")!(
+				{
+					type: "tool_execution_start",
+					toolName: "read",
+					toolCallId: `ordering-${index}`,
+					args: {},
+				},
+				ctx,
+			);
+		}
+		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
+
+		const identityIndex = () => frames.findIndex(frame => frame.type === "event" && frame.kind === "identity_header");
+		const idleIndex = () => frames.findIndex(frame => frame.type === "action_needed" && frame.kind === "idle");
+		await waitFor(() => identityIndex() >= 0 && idleIndex() >= 0, 3000, "ordered identity and idle frames");
+		expect(identityIndex()).toBeLessThan(idleIndex());
 	} finally {
 		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
 		else process.env.GJC_NOTIFICATIONS = prevEnv;
