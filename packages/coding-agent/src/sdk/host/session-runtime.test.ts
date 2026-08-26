@@ -3337,6 +3337,35 @@ describe("post-acceptance invocation terminalization", () => {
 		}
 	});
 
+	test("preserves a specific agent_failed diagnostic when agent_end is statusless", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-provider-statusless-specific-"));
+		try {
+			const harness = await invocationHarness("provider-statusless-specific", cwd, {
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await neverSettlingPromise();
+				},
+			});
+			const accepted = await harness.control("turn.prompt", { text: "provider unavailable" });
+			expect(accepted.ok).toBe(true);
+			const ids = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
+			await harness.emit("agent_start");
+			await harness.emit("agent_failed", {
+				error: Object.assign(new Error("provider unavailable"), { code: "provider_unavailable" }),
+			});
+			await harness.emit("agent_end", { messages: [{ role: "assistant", stopReason: "error" }] });
+			expect(await settledStatus(harness, "turn.prompt_status", ids)).toMatchObject({
+				status: "failed",
+				error: { code: "provider_unavailable" },
+			});
+			expect(harness.broadcasts.filter(frame => frame.kind === "agent_failed")).toHaveLength(1);
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("does not misclassify a local malformed-tool circuit breaker as provider rejection", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-local-malformed-tool-"));
 		try {

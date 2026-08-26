@@ -3805,10 +3805,12 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const currentFailureKey = currentInvocation
 			? `${currentInvocation.correlation.commandId}:${currentInvocation.correlation.turnId}`
 			: undefined;
+		const existingFailureCode =
+			currentFailureKey !== undefined ? owner?.failureDiagnosticCodes.get(currentFailureKey) : undefined;
 		const failureAlreadyPublished =
-			currentFailureKey !== undefined && owner?.failureDiagnosticKeys.has(currentFailureKey)
-				? failure === undefined || owner.failureDiagnosticCodes.get(currentFailureKey) === failure.code
-				: false;
+			currentFailureKey !== undefined &&
+			owner?.failureDiagnosticKeys.has(currentFailureKey) === true &&
+			(failure === undefined || existingFailureCode === undefined || existingFailureCode !== "agent_failed");
 		return trackLifecycle(async () => {
 			if (failure && !failureAlreadyPublished) {
 				if (currentFailureKey !== undefined) owner?.failureDiagnosticKeys.delete(currentFailureKey);
