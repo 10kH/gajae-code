@@ -3303,6 +3303,68 @@ describe("post-acceptance invocation terminalization", () => {
 		}
 	});
 
+	test("does not misclassify a local malformed-tool circuit breaker as provider rejection", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-local-malformed-tool-"));
+		try {
+			const harness = await invocationHarness("local-malformed-tool", cwd, {
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await new Promise<void>(() => {});
+				},
+			});
+			const accepted = await harness.control("turn.prompt", { text: "local malformed tool" });
+			expect(accepted.ok).toBe(true);
+			const ids = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
+			await harness.emit("agent_start");
+			await harness.emit("agent_end", {
+				messages: [
+					{
+						role: "assistant",
+						stopReason: "error",
+						errorMessage:
+							"Stopping after 3 consecutive turns of malformed tool calls; the model did not produce a usable tool call or answer.",
+					},
+				],
+			});
+			expect(await settledStatus(harness, "turn.prompt_status", ids)).toMatchObject({ status: "terminal_ok" });
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("does not misclassify a local composer policy breaker as provider rejection", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-local-composer-policy-"));
+		try {
+			const harness = await invocationHarness("local-composer-policy", cwd, {
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await new Promise<void>(() => {});
+				},
+			});
+			const accepted = await harness.control("turn.prompt", { text: "local composer policy" });
+			expect(accepted.ok).toBe(true);
+			const ids = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
+			await harness.emit("agent_start");
+			await harness.emit("agent_end", {
+				messages: [
+					{
+						role: "assistant",
+						stopReason: "error",
+						errorMessage:
+							"Composer bash policy blocked repository file I/O again after its one automatic recovery turn.",
+					},
+				],
+			});
+			expect(await settledStatus(harness, "turn.prompt_status", ids)).toMatchObject({ status: "terminal_ok" });
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("terminalizes when provider end metadata exposes a throwing accessor", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-provider-throwing-metadata-"));
 		try {

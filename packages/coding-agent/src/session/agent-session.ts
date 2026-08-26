@@ -21407,6 +21407,16 @@ export class AgentSession {
 				return { cancelled: false };
 			}
 
+			// Tree navigation rewrites live history in place. Drop queued SDK work
+			// before any awaited hook or summarizer can let it promote under the
+			// rewritten successor history without its predecessor owner.
+			const queuedSdkWork = this.#queuedMessagesForSessionTransition();
+			this.#terminalizeQueuedSdkWorkForSessionTransition(queuedSdkWork);
+			this.#deferredSdkFollowUps = [];
+			this.agent.clearAllQueues();
+			this.#steeringMessages = [];
+			this.#followUpMessages = [];
+
 			// Model required for summarization
 			if (options.summarize && !this.model) {
 				throw new Error("No model available for summarization");

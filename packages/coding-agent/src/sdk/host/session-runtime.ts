@@ -1532,6 +1532,7 @@ function providerFailureFromAgentEnd(event: unknown): { code: string; message: s
 		if (!lastAssistant || typeof lastAssistant !== "object") return undefined;
 		const assistant = lastAssistant as {
 			stopReason?: unknown;
+			errorMessage?: unknown;
 			errorStatus?: unknown;
 			transportFailure?: { status?: unknown };
 		};
@@ -1542,6 +1543,21 @@ function providerFailureFromAgentEnd(event: unknown): { code: string; message: s
 			return undefined;
 		}
 		if (stopReason !== "error") return undefined;
+		let errorMessage: unknown;
+		try {
+			errorMessage = assistant.errorMessage;
+		} catch {
+			return undefined;
+		}
+		// Agent-local malformed-tool and composer policy circuit breakers also use
+		// stopReason=error, but they are not provider failures and must not be
+		// reported as provider_rejected to SDK callers.
+		if (
+			typeof errorMessage === "string" &&
+			(errorMessage.includes("Composer bash policy blocked repository file I/O again") ||
+				errorMessage.includes("consecutive turns of malformed tool calls"))
+		)
+			return undefined;
 		let status: number | undefined;
 		try {
 			const errorStatus = assistant.errorStatus;
@@ -3234,7 +3250,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const remaining = owners.filter(candidate => candidate !== owner);
 		if (remaining.length === 0) retiredLifecycleOwners.delete(owner.sessionId);
 		else retiredLifecycleOwners.set(owner.sessionId, remaining);
-		if (remaining.length < 2) ambiguousLifecycleIdentities.delete(owner.sessionIdentity);
+		const remainingSameIdentity = remaining.filter(candidate => candidate.sessionIdentity === owner.sessionIdentity);
+		if (remainingSameIdentity.length < 2) ambiguousLifecycleIdentities.delete(owner.sessionIdentity);
 		for (const [token, binding] of lifecycleRunOwners) if (binding.state === owner) lifecycleRunOwners.delete(token);
 	};
 	const maybeRetireLifecycleOwner = (owner: RuntimeState): void => {
