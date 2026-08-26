@@ -291,6 +291,57 @@ describe("OAuth URL copy lease wiring", () => {
 		expect(pendingUrls).toEqual([authUrl, undefined, authUrl, undefined]);
 	});
 
+	it("aborts the pending flow and releases its URL lease exactly once", async () => {
+		const pendingUrls: Array<string | undefined> = [];
+		const ctx = {
+			keybindings: { getDisplayString: () => "Ctrl+C" },
+			beginOAuthUrlForCopy: (url: string) => {
+				pendingUrls.push(url);
+				return () => pendingUrls.push(undefined);
+			},
+			chatContainer: { addChild: () => {} },
+			ui: { requestRender: () => {} },
+			showError: () => {},
+			session: { modelRegistry: { authStorage: { set: async () => {} } } },
+		} as unknown as InteractiveModeContext;
+		const controller = new MCPCommandController(ctx);
+		const abortController = new AbortController();
+		const authUrl = "https://auth.example.test/authorize?client_id=abort-test";
+		const entered = Promise.withResolvers<void>();
+
+		const operation = controller.handleOAuthFlow(
+			"https://mcp.example.test",
+			authUrl,
+			"https://auth.example.test/token",
+			"test-client",
+			"",
+			"",
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			(config, callbacks) => ({
+				resolvedClientId: config.clientId,
+				registeredClientSecret: undefined,
+				login: async () => {
+					callbacks.onAuth({ url: authUrl });
+					entered.resolve();
+					await new Promise<never>((_resolve, reject) => {
+						callbacks.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+					});
+					throw new Error("unreachable");
+				},
+			}),
+			() => {},
+			abortController.signal,
+		);
+
+		await entered.promise;
+		abortController.abort(new Error("wizard cancelled"));
+		await expect(operation).rejects.toThrow("aborted");
+		expect(pendingUrls).toEqual([authUrl, undefined]);
+	});
+
 	it("routes the command-palette chord through a focused MCP wizard", () => {
 		let receivedKey = "";
 		const wizard = new MCPAddWizard(

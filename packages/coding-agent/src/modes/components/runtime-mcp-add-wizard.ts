@@ -129,11 +129,13 @@ export class MCPAddWizard extends Container {
 				clientId: string,
 				clientSecret: string,
 				scopes: string,
+				signal: AbortSignal,
 		  ) => Promise<MCPAddWizardOAuthResult>)
 		| null = null;
 	#onTestConnectionCallback: ((config: MCPServerConfig) => Promise<void>) | null = null;
 	#onRenderCallback: (() => void) | null = null;
 	#onCommandPaletteCallback: ((keyData: string) => boolean) | null = null;
+	#oauthAbortController: AbortController | undefined;
 	#disposed = false;
 	#transitionTimers = new Set<NodeJS.Timeout>();
 	#healthCheckSpinner?: NodeJS.Timeout;
@@ -150,6 +152,7 @@ export class MCPAddWizard extends Container {
 			clientId: string,
 			clientSecret: string,
 			scopes: string,
+			signal: AbortSignal,
 		) => Promise<MCPAddWizardOAuthResult>,
 		onTestConnection?: (config: MCPServerConfig) => Promise<void>,
 		onRender?: () => void,
@@ -193,6 +196,8 @@ export class MCPAddWizard extends Container {
 		if (this.#disposed) return;
 		this.#disposed = true;
 		this.#asyncGeneration += 1;
+		this.#oauthAbortController?.abort(new Error("OAuth flow cancelled"));
+		this.#oauthAbortController = undefined;
 		for (const timer of this.#transitionTimers) {
 			clearTimeout(timer);
 		}
@@ -1194,6 +1199,8 @@ export class MCPAddWizard extends Container {
 		this.#contentContainer.addChild(new Text(theme.fg("muted", "(Press Esc to cancel)"), 0, 0));
 		this.#requestRender();
 
+		const oauthAbortController = new AbortController();
+		this.#oauthAbortController = oauthAbortController;
 		try {
 			// Call OAuth handler
 			const oauthResult = await this.#onOAuthCallback(
@@ -1203,6 +1210,7 @@ export class MCPAddWizard extends Container {
 				this.#state.oauthClientId,
 				this.#state.oauthClientSecret,
 				this.#state.oauthScopes,
+				oauthAbortController.signal,
 			);
 			if (this.#disposed || generation !== this.#asyncGeneration) return;
 
@@ -1281,6 +1289,7 @@ export class MCPAddWizard extends Container {
 				healthPassed ? 1000 : 2000,
 			);
 		} catch (error) {
+			if (this.#disposed || generation !== this.#asyncGeneration) return;
 			// Show error with options to retry or go back
 			const errorMsg = sanitize(error instanceof Error ? error.message : String(error));
 			this.#contentContainer.clear();
@@ -1316,6 +1325,8 @@ export class MCPAddWizard extends Container {
 			// Set up as a selector step
 			this.#selectedIndex = 0;
 			this.#currentStep = "oauth-error";
+		} finally {
+			if (this.#oauthAbortController === oauthAbortController) this.#oauthAbortController = undefined;
 		}
 	}
 

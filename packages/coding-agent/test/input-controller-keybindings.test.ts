@@ -430,6 +430,23 @@ describe("InputController keybinding setup", () => {
 		expect(ctx.ui.setFocus as ReturnType<typeof vi.fn>).not.toHaveBeenCalled();
 	});
 
+	it("does not let a remapped OAuth copy chord steal Ctrl+C cancellation", async () => {
+		for (const [copyKey, input] of [
+			["ctrl+c", "\x03"],
+			["escape", "\x1b"],
+		] as const) {
+			const { InputController, ctx, spies } = await createContext({ oauthCopyKeys: [copyKey] });
+			new InputController(ctx);
+			spies.hasOAuthUrlForCopy.mockReturnValue(true);
+			const addInputListener = ctx.ui.addInputListener as ReturnType<typeof vi.fn>;
+			const listener = addInputListener.mock.calls[0]?.[0] as (data: string) => { consume: boolean } | undefined;
+
+			expect(listener(input)).toBeUndefined();
+			await Promise.resolve();
+			expect(spies.copyOAuthUrl).not.toHaveBeenCalled();
+		}
+	});
+
 	it("enables model cycling from configured role candidates without a model scope", async () => {
 		const { InputController, ctx } = await createContext();
 		const session = ctx.session as unknown as {

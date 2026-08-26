@@ -79,6 +79,7 @@ type MCPAuthFlow = Pick<MCPOAuthFlow, "resolvedClientId" | "registeredClientSecr
 type MCPAuthCallbacks = {
 	onAuth(info: { url: string; instructions?: string }): void;
 	onProgress(message: string): void;
+	signal?: AbortSignal;
 };
 
 type MCPAuthFlowFactory = (config: MCPOAuthConfig, callbacks: MCPAuthCallbacks) => MCPAuthFlow;
@@ -545,8 +546,23 @@ export class MCPCommandController {
 				clientId: string,
 				clientSecret: string,
 				scopes: string,
+				signal: AbortSignal,
 			) => {
-				return await this.handleOAuthFlow(endpointUrl, authUrl, tokenUrl, clientId, clientSecret, scopes);
+				return await this.handleOAuthFlow(
+					endpointUrl,
+					authUrl,
+					tokenUrl,
+					clientId,
+					clientSecret,
+					scopes,
+					undefined,
+					undefined,
+					undefined,
+					undefined,
+					undefined,
+					undefined,
+					signal,
+				);
 			},
 			async (config: MCPServerConfig) => {
 				return await this.#handleTestConnection(config);
@@ -586,6 +602,7 @@ export class MCPCommandController {
 		oauthMeta?: { issuer?: string; issuerResponseIssSupported?: boolean },
 		createFlow: MCPAuthFlowFactory = (config, callbacks) => new MCPOAuthFlow(config, callbacks),
 		openBrowser: (url: string) => void = openPath,
+		signal?: AbortSignal,
 	): Promise<OAuthFlowResult> {
 		const authStorage = this.ctx.session.modelRegistry.authStorage;
 		let parsedAuthUrl: URL;
@@ -609,6 +626,8 @@ export class MCPCommandController {
 			? `Use ${copyOAuthUrlKey} or command palette → Copy OAuth URL to copy this exact URL:`
 			: "Use command palette → Copy OAuth URL to copy this exact URL:";
 		const oauthUrlCopyLease = createOAuthUrlCopyLease(this.ctx);
+		const timeoutController = new AbortController();
+		const flowSignal = signal ? AbortSignal.any([signal, timeoutController.signal]) : timeoutController.signal;
 
 		try {
 			// Create OAuth flow
@@ -691,11 +710,25 @@ export class MCPCommandController {
 						this.ctx.chatContainer.addChild(new Text(theme.fg("muted", message), 1, 0));
 						this.ctx.ui.requestRender();
 					},
+					signal: flowSignal,
 				},
 			);
 
 			// Execute OAuth flow with 5 minute timeout
-			const credentials = await withTimeout(flow.login(), 5 * 60 * 1000, "OAuth flow timed out after 5 minutes");
+			const { promise: timeoutPromise, reject: rejectTimeout } = Promise.withResolvers<never>();
+			const timeoutId = setTimeout(
+				() => {
+					timeoutController.abort(new Error("OAuth flow timed out after 5 minutes"));
+					rejectTimeout(new Error("OAuth flow timed out after 5 minutes"));
+				},
+				5 * 60 * 1000,
+			);
+			let credentials: { access: string; refresh: string; expires: number };
+			try {
+				credentials = await Promise.race([flow.login(), timeoutPromise]);
+			} finally {
+				clearTimeout(timeoutId);
+			}
 
 			this.ctx.chatContainer.addChild(new Spacer(1));
 			this.ctx.chatContainer.addChild(new Text(theme.fg("success", "✓ Authorization completed in browser."), 1, 0));

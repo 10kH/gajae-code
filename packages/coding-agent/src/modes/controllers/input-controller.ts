@@ -39,6 +39,7 @@ import { CommandPalette, type CommandPaletteAction, type CommandPaletteEntry } f
 import type { PasteTextContext } from "../components/custom-editor";
 import { QueuePaneComponent } from "../components/queue-pane";
 import { type QueuedMessageMoveDirection, QueuedMessageSelectorComponent } from "../components/queued-message-selector";
+import { matchesAppInterrupt } from "../utils/keybinding-matchers";
 
 const QUEUE_SELECTOR_NAVIGATION_ACTIONS = [
 	"tui.select.up",
@@ -348,6 +349,9 @@ export class InputController {
 		this.#oauthCopyUnsubscribe?.();
 		this.#oauthCopyUnsubscribe = this.ctx.ui.addInputListener(data => {
 			if (this.ctx.hasOAuthUrlForCopy?.() !== true) return;
+			// Focused overlays own cancellation. In particular, a user remap of
+			// copyOAuthUrl to Ctrl+C/Escape must not steal the wizard's interrupt.
+			if (data === "\x03" || matchesAppInterrupt(data)) return;
 			if (this.ctx.keybindings.getKeys("app.clipboard.copyOAuthUrl").some(key => matchesKey(data, key))) {
 				this.#executeAction("app.clipboard.copyOAuthUrl");
 				return { consume: true };
