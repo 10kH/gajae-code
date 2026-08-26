@@ -267,13 +267,16 @@ describe("AgentSession auto-compaction queue resume", () => {
 		expect(sessionManager.getBranch().some(entry => entry.type === "compaction")).toBe(false);
 	});
 
-	it("uses adaptive call rate to compact below the static threshold when enabled", async () => {
-		session.settings.set("compaction.thresholdPercent", 85);
+	it("uses adaptive threshold to compact below the static threshold when enabled", async () => {
+		vi.useRealTimers();
+		session.settings.set("compaction.thresholdPercent", 99);
 		session.settings.set("compaction.adaptive.enabled", true);
 		session.settings.set("compaction.adaptive.baseThresholdPercent", 85);
 		session.settings.set("compaction.adaptive.aggression", 0.5);
 		session.settings.set("compaction.adaptive.turnWindow", 15);
 		session.settings.set("compaction.adaptive.minThresholdPercent", 50);
+		const totalTokens = Math.floor((session.model?.contextWindow ?? 200_000) * 0.9);
+		const inputTokens = totalTokens - 1_000;
 
 		const assistantMsg: AssistantMessage = {
 			role: "assistant",
@@ -283,41 +286,39 @@ describe("AgentSession auto-compaction queue resume", () => {
 			model: "claude-sonnet-4-5",
 			stopReason: "stop",
 			usage: {
-				input: 152_000,
+				input: inputTokens,
 				output: 1_000,
 				cacheRead: 0,
 				cacheWrite: 0,
-				totalTokens: 153_000,
+				totalTokens,
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 			},
 			timestamp: Date.now(),
 		};
-		let compactionSucceeded = false;
-		const { promise: compactionDone, resolve: onCompactionDone } = Promise.withResolvers<void>();
+		let compactionTriggered = false;
+		const { promise: compactionStarted, resolve: onCompactionStarted } = Promise.withResolvers<void>();
 		session.subscribe(event => {
-			if (event.type === "auto_compaction_end" && event.result !== undefined) {
-				compactionSucceeded = true;
-				onCompactionDone();
+			if (event.type === "auto_compaction_start" && event.reason === "threshold") {
+				compactionTriggered = true;
+				onCompactionStarted();
 			}
 		});
-		for (let i = 0; i < 60; i++) {
-			session.agent.emitExternalEvent({
-				type: "message_end",
-				message: { ...assistantMsg, timestamp: Date.now() },
-			});
-			session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
-			await Promise.resolve();
-			await Promise.resolve();
-		}
+		session.agent.emitExternalEvent({
+			type: "message_end",
+			message: { ...assistantMsg, timestamp: Date.now() },
+		});
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
+		await withTimeout(session.waitForIdle(), 1000, "Adaptive compaction turn did not become idle");
 
-		await compactionDone;
-
-		expect(compactionSucceeded).toBe(true);
+		await withTimeout(compactionStarted, 1000, "Adaptive compaction did not start");
+		expect(compactionTriggered).toBe(true);
 	});
 
 	it("keeps the same below-threshold session un-compacted when adaptive is disabled", async () => {
-		session.settings.set("compaction.thresholdPercent", 85);
+		session.settings.set("compaction.thresholdPercent", 99);
 		session.settings.set("compaction.adaptive.enabled", false);
+		const totalTokens = Math.floor((session.model?.contextWindow ?? 200_000) * 0.9);
+		const inputTokens = totalTokens - 1_000;
 
 		const assistantMsg: AssistantMessage = {
 			role: "assistant",
@@ -327,11 +328,11 @@ describe("AgentSession auto-compaction queue resume", () => {
 			model: "claude-sonnet-4-5",
 			stopReason: "stop",
 			usage: {
-				input: 152_000,
+				input: inputTokens,
 				output: 1_000,
 				cacheRead: 0,
 				cacheWrite: 0,
-				totalTokens: 153_000,
+				totalTokens,
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 			},
 			timestamp: Date.now(),
