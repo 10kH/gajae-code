@@ -767,12 +767,12 @@ impl NotificationServer {
 		positioned_receipts: Vec<String>,
 		needed_json: String,
 	) -> Result<DependentIdleDeliveryResult> {
-		let prerequisite: ServerMessage = serde_json::from_str(&prerequisite_json)
+		let _: ServerMessage = serde_json::from_str(&prerequisite_json)
 			.map_err(|error| Error::from_reason(format!("invalid prerequisite json: {error}")))?;
 		let needed = parse_needed(&needed_json)?;
 		let outcome = self
 			.handle()?
-			.queue_idle_after_directed(prerequisite, &positioned_receipts, needed)
+			.queue_idle_after_directed_json(prerequisite_json, &positioned_receipts, needed)
 			.map_err(|error| Error::from_reason(error.to_string()))?;
 		let status = match outcome.status {
 			DependentIdleDeliveryStatus::Queued => "queued",

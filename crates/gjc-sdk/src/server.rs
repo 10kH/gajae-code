@@ -26,7 +26,7 @@ use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use tokio::{
 	net::{TcpListener, TcpStream},
 	sync::{Mutex as AsyncMutex, broadcast, mpsc, oneshot},
@@ -156,9 +156,10 @@ fn release_directed_frames(counter: &AtomicUsize, count: usize) {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DirectedDeliveryReceipt {
-	connection_id: String,
-	generation:    String,
-	mac:           Vec<u8>,
+	connection_id:       String,
+	generation:          String,
+	prerequisite_digest: Vec<u8>,
+	mac:                 Vec<u8>,
 }
 
 /// Result of scheduling a prerequisite and its dependent idle on exact writer
@@ -276,6 +277,7 @@ fn may_deliver_directed_frame(
 fn directed_delivery_receipt_mac(
 	connection_id: &str,
 	generation: &str,
+	prerequisite_digest: &[u8],
 	server_token: &[u8],
 ) -> Vec<u8> {
 	let mut mac = Hmac::<Sha256>::new_from_slice(server_token)
@@ -284,23 +286,107 @@ fn directed_delivery_receipt_mac(
 	mac.update(connection_id.as_bytes());
 	mac.update(b"\0");
 	mac.update(generation.as_bytes());
+	mac.update(b"\0");
+	mac.update(prerequisite_digest);
 	mac.finalize().into_bytes().to_vec()
+}
+
+fn write_canonical_json(value: &serde_json::Value, output: &mut Vec<u8>) {
+	match value {
+		serde_json::Value::Null => output.extend_from_slice(b"null"),
+		serde_json::Value::Bool(value) => {
+			output.extend_from_slice(if *value { b"true" } else { b"false" });
+		},
+		serde_json::Value::Number(value) => output.extend_from_slice(value.to_string().as_bytes()),
+		serde_json::Value::String(value) => output.extend_from_slice(
+			serde_json::to_string(value)
+				.expect("JSON strings are serializable")
+				.as_bytes(),
+		),
+		serde_json::Value::Array(values) => {
+			output.push(b'[');
+			for (index, value) in values.iter().enumerate() {
+				if index != 0 {
+					output.push(b',');
+				}
+				write_canonical_json(value, output);
+			}
+			output.push(b']');
+		},
+		serde_json::Value::Object(values) => {
+			output.push(b'{');
+			let mut keys = values.keys().collect::<Vec<_>>();
+			keys.sort_unstable();
+			for (index, key) in keys.into_iter().enumerate() {
+				if index != 0 {
+					output.push(b',');
+				}
+				output.extend_from_slice(
+					serde_json::to_string(key)
+						.expect("JSON object keys are serializable")
+						.as_bytes(),
+				);
+				output.push(b':');
+				write_canonical_json(&values[key], output);
+			}
+			output.push(b'}');
+		},
+	}
+}
+
+/// Hash the semantic prerequisite carried by a directed frame. Positioned
+/// identity events bind to their raw identity payload so the receipt can be
+/// checked against the raw fallback passed to `queue_idle_after_directed`.
+/// Every other frame binds to its complete canonical JSON value and therefore
+/// cannot stand in for an identity prerequisite.
+fn directed_prerequisite_digest(json: &str) -> Option<Vec<u8>> {
+	let frame: serde_json::Value = serde_json::from_str(json).ok()?;
+	let binding = frame.as_object().and_then(|object| {
+		let positioned_identity = object.get("type").and_then(serde_json::Value::as_str)
+			== Some("event")
+			&& object.get("kind").and_then(serde_json::Value::as_str) == Some("identity_header")
+			&& object
+				.get("payload")
+				.and_then(serde_json::Value::as_object)
+				.and_then(|payload| payload.get("type"))
+				.and_then(serde_json::Value::as_str)
+				== Some("identity_header");
+		if positioned_identity {
+			object.get("payload")
+		} else {
+			None
+		}
+	});
+	let mut canonical = Vec::new();
+	write_canonical_json(binding.unwrap_or(&frame), &mut canonical);
+	Some(Sha256::digest(&canonical).to_vec())
 }
 
 fn sign_directed_delivery_receipt(
 	connection_id: String,
 	generation: String,
+	prerequisite_digest: Vec<u8>,
 	server_token: &[u8],
 ) -> String {
-	let mac = directed_delivery_receipt_mac(&connection_id, &generation, server_token);
-	serde_json::to_string(&DirectedDeliveryReceipt { connection_id, generation, mac })
-		.expect("directed delivery receipts contain only serializable strings and bytes")
+	let mac = directed_delivery_receipt_mac(
+		&connection_id,
+		&generation,
+		&prerequisite_digest,
+		server_token,
+	);
+	serde_json::to_string(&DirectedDeliveryReceipt {
+		connection_id,
+		generation,
+		prerequisite_digest,
+		mac,
+	})
+	.expect("directed delivery receipts contain only serializable strings and bytes")
 }
 
 fn verify_directed_delivery_receipt(
 	receipt: &str,
 	server_token: &[u8],
-) -> Option<(String, String)> {
+) -> Option<(String, String, Vec<u8>)> {
 	let receipt: DirectedDeliveryReceipt = serde_json::from_str(receipt).ok()?;
 	let mut mac = Hmac::<Sha256>::new_from_slice(server_token)
 		.expect("HMAC-SHA256 accepts server tokens of every length");
@@ -308,9 +394,11 @@ fn verify_directed_delivery_receipt(
 	mac.update(receipt.connection_id.as_bytes());
 	mac.update(b"\0");
 	mac.update(receipt.generation.as_bytes());
+	mac.update(b"\0");
+	mac.update(&receipt.prerequisite_digest);
 	mac.verify_slice(&receipt.mac)
 		.ok()
-		.map(|()| (receipt.connection_id, receipt.generation))
+		.map(|()| (receipt.connection_id, receipt.generation, receipt.prerequisite_digest))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -905,10 +993,12 @@ impl ServerHandle {
 	/// receipt carries no authority outside this server and must be passed to
 	/// [`Self::queue_idle_after_directed`].
 	pub fn send_to_with_receipt(&self, connection_id: &str, json: String) -> Option<String> {
+		let prerequisite_digest = directed_prerequisite_digest(&json)?;
 		let generation = self.enqueue_directed_frame(connection_id, json)?;
 		Some(sign_directed_delivery_receipt(
 			connection_id.to_owned(),
 			generation,
+			prerequisite_digest,
 			self.state.token.as_bytes(),
 		))
 	}
@@ -962,6 +1052,23 @@ impl ServerHandle {
 		positioned_receipts: &[String],
 		needed: ActionNeeded,
 	) -> Result<DependentIdleDeliveryOutcome, PushFrameError> {
+		let prerequisite_json =
+			serde_json::to_string(&prerequisite).expect("ServerMessage serialization cannot fail");
+		self.queue_idle_after_directed_json(prerequisite_json, positioned_receipts, needed)
+	}
+
+	/// JSON-preserving variant used by native hosts whose identity payload has
+	/// forward-compatible fields not yet modeled by [`ServerMessage`]. The
+	/// typed parse below validates the dependency while the original JSON is
+	/// retained for both raw delivery and receipt comparison.
+	pub fn queue_idle_after_directed_json(
+		&self,
+		prerequisite_json: String,
+		positioned_receipts: &[String],
+		needed: ActionNeeded,
+	) -> Result<DependentIdleDeliveryOutcome, PushFrameError> {
+		let prerequisite: ServerMessage = serde_json::from_str(&prerequisite_json)
+			.map_err(|_| PushFrameError::DependentPrerequisiteInvalid)?;
 		let ServerMessage::IdentityHeader(identity) = &prerequisite else {
 			return Err(PushFrameError::DependentPrerequisiteInvalid);
 		};
@@ -972,28 +1079,28 @@ impl ServerHandle {
 			return Err(PushFrameError::DependentSessionMismatch);
 		}
 
-		let mut positioned = HashMap::<String, String>::new();
-		for receipt in positioned_receipts {
-			let Some((connection_id, generation)) =
-				verify_directed_delivery_receipt(receipt, self.state.token.as_bytes())
-			else {
-				return Err(PushFrameError::DeliveryReceiptInvalid);
-			};
-			if positioned
-				.insert(connection_id, generation.clone())
-				.is_some_and(|prior| prior != generation)
-			{
-				return Err(PushFrameError::DeliveryReceiptInvalid);
-			}
-		}
-
-		let prerequisite_json =
-			serde_json::to_string(&prerequisite).expect("ServerMessage serialization cannot fail");
 		let Some((prerequisite_json, prerequisite_requires_tool_activity)) =
 			validate_directed_frame(prerequisite_json)
 		else {
 			return Err(PushFrameError::DependentPrerequisiteInvalid);
 		};
+		let prerequisite_digest = directed_prerequisite_digest(&prerequisite_json)
+			.expect("validated identity prerequisites have a canonical digest");
+		let mut positioned = HashMap::<String, String>::new();
+		for receipt in positioned_receipts {
+			let Some((connection_id, generation, receipt_digest)) =
+				verify_directed_delivery_receipt(receipt, self.state.token.as_bytes())
+			else {
+				return Err(PushFrameError::DeliveryReceiptInvalid);
+			};
+			if receipt_digest != prerequisite_digest
+				|| positioned
+					.insert(connection_id, generation.clone())
+					.is_some_and(|prior| prior != generation)
+			{
+				return Err(PushFrameError::DeliveryReceiptInvalid);
+			}
+		}
 		let needed = self.state.registry.lock().note_idle(needed);
 		let idle_json = serde_json::to_string(&ServerMessage::ActionNeeded(needed))
 			.expect("ServerMessage serialization cannot fail");
@@ -2292,6 +2399,25 @@ mod tests {
 		handle.stop();
 	}
 
+	#[test]
+	fn receipt_digest_matches_only_the_positioned_identity_prerequisite() {
+		let raw = r#"{"type":"identity_header","sessionId":"s","repo":"gajae-code","branch":"dev","machine":"test"}"#;
+		let positioned = r#"{"type":"event","generation":7,"seq":9,"kind":"identity_header","payload":{"machine":"test","branch":"dev","repo":"gajae-code","sessionId":"s","type":"identity_header"}}"#;
+		let stale = r#"{"type":"event","generation":7,"seq":8,"kind":"identity_header","payload":{"type":"identity_header","sessionId":"s","repo":"gajae-code","branch":"stale","machine":"test"}}"#;
+		let mislabeled = r#"{"type":"event","generation":7,"seq":9,"kind":"activity","payload":{"type":"identity_header","sessionId":"s","repo":"gajae-code","branch":"dev","machine":"test"}}"#;
+
+		let raw_digest = directed_prerequisite_digest(raw).expect("raw identity digest");
+		assert_eq!(
+			raw_digest,
+			directed_prerequisite_digest(positioned).expect("positioned identity digest")
+		);
+		assert_ne!(raw_digest, directed_prerequisite_digest(stale).expect("stale identity digest"));
+		assert_ne!(
+			raw_digest,
+			directed_prerequisite_digest(mislabeled).expect("mislabeled event digest")
+		);
+	}
+
 	#[tokio::test]
 	async fn directed_receipt_queues_idle_behind_the_exact_positioned_generation() {
 		use crate::protocol::IdentityHeader;
@@ -2383,7 +2509,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn replaced_generation_cannot_consume_an_older_directed_receipt() {
+	async fn mismatched_prerequisite_and_replaced_generation_cannot_consume_a_receipt() {
 		use crate::protocol::IdentityHeader;
 		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
 		let (tx, mut rx) = mpsc::unbounded_channel::<DirectCommand>();
@@ -2413,6 +2539,27 @@ mod tests {
 				serde_json::to_string(&identity).expect("identity serialization"),
 			)
 			.expect("old generation receipt");
+		let mismatched_receipt = handle
+			.send_to_with_receipt(
+				"same-id",
+				serde_json::to_string(&ServerMessage::IdentityHeader(IdentityHeader {
+					session_id: "s".into(),
+					repo:       "gajae-code".into(),
+					branch:     "stale".into(),
+					machine:    "test".into(),
+					title:      None,
+				}))
+				.expect("mismatched identity serialization"),
+			)
+			.expect("mismatched prerequisite receipt");
+		assert_eq!(
+			handle.queue_idle_after_directed(
+				identity.clone(),
+				&[mismatched_receipt],
+				idle("mismatched-idle"),
+			),
+			Err(PushFrameError::DeliveryReceiptInvalid),
+		);
 		let mut forged: DirectedDeliveryReceipt =
 			serde_json::from_str(&receipt).expect("receipt payload");
 		forged.generation = "forged".into();
@@ -2436,8 +2583,10 @@ mod tests {
 			.queue_idle_after_directed(identity, &[receipt], idle("stale-idle"))
 			.expect("stale receipt is a safe no-op");
 		assert_eq!(outcome.status, DependentIdleDeliveryStatus::NoRecipients);
-		assert!(matches!(rx.recv().await, Some(DirectCommand::DirectedFrame { .. })));
-		release_directed_frame(&queued);
+		for _ in 0..2 {
+			assert!(matches!(rx.recv().await, Some(DirectCommand::DirectedFrame { .. })));
+			release_directed_frame(&queued);
+		}
 		assert!(rx.try_recv().is_err());
 		handle.stop();
 	}

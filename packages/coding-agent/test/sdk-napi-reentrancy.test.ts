@@ -69,6 +69,17 @@ test("napi directed receipt binds dependent idle to the accepting generation", a
 			machine: "test",
 		} as const;
 		const receipt = server.sendToWithReceipt(connectionId!, JSON.stringify(identity));
+		const mismatchedReceipt = server.sendToWithReceipt(
+			connectionId!,
+			JSON.stringify({ ...identity, branch: "stale" }),
+		);
+		expect(() =>
+			server.queueIdleAfterDirected(
+				JSON.stringify(identity),
+				[mismatchedReceipt],
+				JSON.stringify({ id: `idle:${sessionId}:mismatched`, kind: "idle", sessionId }),
+			),
+		).toThrow("delivery receipt is invalid");
 		const outcome = server.queueIdleAfterDirected(
 			JSON.stringify(identity),
 			[receipt],
