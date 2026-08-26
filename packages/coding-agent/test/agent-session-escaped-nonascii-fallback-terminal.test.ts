@@ -394,7 +394,13 @@ describe("AgentSession escaped non-ASCII fallback terminal (#4880)", () => {
 		await session.prompt("ask me");
 		await manager.flush();
 
-		expect(callModels).toEqual([selector(primary), selector(primary), selector(primary), selector(fallback), selector(fallback)]);
+		expect(callModels).toEqual([
+			selector(primary),
+			selector(primary),
+			selector(primary),
+			selector(fallback),
+			selector(fallback),
+		]);
 		expect(executed).toEqual([{ question: QUESTION }]);
 		expect(session.isStreaming).toBe(false);
 	});
