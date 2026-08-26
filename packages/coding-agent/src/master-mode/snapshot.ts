@@ -89,8 +89,7 @@ function boundSnapshotRows(
 			retained.pop();
 			return { rows: retained, truncated: true };
 		}
-		if (willTruncate && retained.length === MASTER_PEER_SNAPSHOT_MAX_ROWS)
-			return { rows: retained, truncated: true };
+		if (willTruncate && retained.length === MASTER_PEER_SNAPSHOT_MAX_ROWS) return { rows: retained, truncated: true };
 	}
 	return { rows: retained, truncated: false };
 }

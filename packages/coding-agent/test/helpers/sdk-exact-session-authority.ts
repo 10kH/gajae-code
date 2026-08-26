@@ -2,7 +2,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { processIncarnation } from "../../src/sdk/broker/process-incarnation";
 import { type SessionIndexEvent, sessionIndexChecksum } from "../../src/sdk/broker/session-index";
-import { SDK_STATE_VERSION } from "../../src/sdk/broker/state-version";
+import { SESSION_INDEX_EVENT_VERSION } from "../../src/sdk/broker/state-version";
 
 export interface ExactSessionAuthorityFixture {
 	readonly sessionId: string;
@@ -74,7 +74,7 @@ export async function publishExactSessionAuthority(
 		processIncarnation: processIncarnation(process.pid),
 		endpointMtimeMs: authority.endpointMtimeMs,
 		...(hostIncarnation === undefined ? {} : { hostIncarnation }),
-		version: SDK_STATE_VERSION,
+		version: SESSION_INDEX_EVENT_VERSION,
 		indexSeq: 1,
 		ts: Date.now(),
 	} satisfies Omit<SessionIndexEvent, "checksum">;
