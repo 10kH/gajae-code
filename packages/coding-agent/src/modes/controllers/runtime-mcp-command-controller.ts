@@ -628,6 +628,7 @@ export class MCPCommandController {
 		const oauthUrlCopyLease = createOAuthUrlCopyLease(this.ctx);
 		const timeoutController = new AbortController();
 		const flowSignal = signal ? AbortSignal.any([signal, timeoutController.signal]) : timeoutController.signal;
+		let flowFinished = false;
 
 		try {
 			// Create OAuth flow
@@ -651,7 +652,10 @@ export class MCPCommandController {
 				},
 				{
 					onAuth: (info: { url: string; instructions?: string }) => {
-						oauthUrlCopyLease.replace(info.url);
+						if (flowFinished || flowSignal.aborted) return;
+						queueMicrotask(() => {
+							if (!flowFinished && !flowSignal.aborted) oauthUrlCopyLease.replace(info.url);
+						});
 						// Show auth URL prominently in chat
 						this.ctx.chatContainer.addChild(new Spacer(1));
 						this.ctx.chatContainer.addChild(
@@ -727,6 +731,7 @@ export class MCPCommandController {
 			try {
 				credentials = await Promise.race([flow.login(), timeoutPromise]);
 			} finally {
+				flowFinished = true;
 				clearTimeout(timeoutId);
 			}
 
@@ -738,6 +743,7 @@ export class MCPCommandController {
 			const credentialId = `mcp_oauth_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
 
 			// Store credentials in auth storage
+			flowSignal.throwIfAborted();
 			const oauthCredential: OAuthCredential = {
 				type: "oauth",
 				...credentials,
@@ -749,6 +755,10 @@ export class MCPCommandController {
 
 			// Store under a synthetic provider name
 			await authStorage.set(credentialId, oauthCredential);
+			if (flowSignal.aborted) {
+				await authStorage.remove(credentialId);
+				flowSignal.throwIfAborted();
+			}
 
 			return {
 				credentialId,

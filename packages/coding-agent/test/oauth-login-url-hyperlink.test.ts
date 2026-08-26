@@ -342,6 +342,51 @@ describe("OAuth URL copy lease wiring", () => {
 		expect(pendingUrls).toEqual([authUrl, undefined]);
 	});
 
+	it("ignores a late auth callback after the flow has settled", async () => {
+		const pendingUrls: Array<string | undefined> = [];
+		const ctx = {
+			keybindings: { getDisplayString: () => "Alt+Shift+U" },
+			beginOAuthUrlForCopy: (url: string) => {
+				pendingUrls.push(url);
+				return () => pendingUrls.push(undefined);
+			},
+			chatContainer: { addChild: () => {} },
+			ui: { requestRender: () => {} },
+			showError: () => {},
+			session: { modelRegistry: { authStorage: { set: async () => {} } } },
+		} as unknown as InteractiveModeContext;
+		const controller = new MCPCommandController(ctx);
+		const authUrl = "https://auth.example.test/authorize?client_id=late-test";
+
+		await expect(
+			controller.handleOAuthFlow(
+				"https://mcp.example.test",
+				authUrl,
+				"https://auth.example.test/token",
+				"test-client",
+				"",
+				"",
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				(config, callbacks) => ({
+					resolvedClientId: config.clientId,
+					registeredClientSecret: undefined,
+					login: async () => {
+						callbacks.onAuth({ url: authUrl });
+						setTimeout(() => callbacks.onAuth({ url: "https://auth.example.test/late" }), 0);
+						throw new Error("settled");
+					},
+				}),
+				() => {},
+			),
+		).rejects.toThrow("settled");
+
+		await Bun.sleep(0);
+		expect(pendingUrls).toEqual([authUrl, undefined]);
+	});
+
 	it("routes the command-palette chord through a focused MCP wizard", () => {
 		let receivedKey = "";
 		const wizard = new MCPAddWizard(

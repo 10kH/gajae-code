@@ -649,6 +649,7 @@ export class MCPAddWizard extends Container {
 				break;
 			case "oauth-scopes":
 				this.#state.oauthScopes = value; // Optional
+				this.#inputField = null;
 				// Launch OAuth flow
 				void this.#launchOAuthFlow();
 				return;
@@ -1167,7 +1168,7 @@ export class MCPAddWizard extends Container {
 	}
 
 	async #launchOAuthFlow(): Promise<void> {
-		if (this.#disposed) return;
+		if (this.#disposed || this.#oauthAbortController) return;
 		const generation = ++this.#asyncGeneration;
 		if (!this.#onOAuthCallback) {
 			this.#contentContainer.clear();

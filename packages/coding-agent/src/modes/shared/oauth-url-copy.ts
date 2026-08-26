@@ -15,13 +15,17 @@ export function buildOAuthLoginAnchor(url: string, label: string = url, hyperlin
 
 export function createOAuthUrlCopyLease(host: OAuthUrlCopyLeaseHost): OAuthUrlCopyLease {
 	let releaseCurrent: (() => void) | undefined;
+	let released = false;
 
 	return {
 		replace(url: string): void {
+			if (released) return;
 			releaseCurrent?.();
 			releaseCurrent = host.beginOAuthUrlForCopy(url);
 		},
 		release(): void {
+			if (released) return;
+			released = true;
 			releaseCurrent?.();
 			releaseCurrent = undefined;
 		},
