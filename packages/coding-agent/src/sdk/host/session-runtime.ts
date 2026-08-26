@@ -3173,7 +3173,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			}
 			const delayedOwner = retired.find(owner => owner.openLifecycleBatches.length > 0);
 			if (delayedOwner) {
-				if (active?.sessionIdentity === sessionIdentity && active.openLifecycleBatches.length > 0) {
+				if (active?.sessionIdentity === sessionIdentity && active.lifecycleActive) {
 					ambiguousLifecycleIdentities.add(sessionIdentity);
 					return undefined;
 				}
@@ -3792,7 +3792,12 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						entry.correlation.commandId === correlation.commandId &&
 						entry.correlation.turnId === correlation.turnId,
 				);
-				if (idx >= 0) pending.splice(idx, 1);
+				if (idx >= 0) {
+					const [removed] = pending.splice(idx, 1);
+					if (removed && lifecycleRunOwners.get(removed.sdkRunToken)?.state === lifecycleRuntimeState)
+						lifecycleRunOwners.delete(removed.sdkRunToken);
+				}
+				if (lifecycleRuntimeState) maybeRetireLifecycleOwner(lifecycleRuntimeState);
 			},
 		});
 		const pending: Array<{
@@ -4401,7 +4406,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				const owners = retiredLifecycleOwners.get(current.sessionId) ?? [];
 				owners.push(current);
 				retiredLifecycleOwners.set(current.sessionId, owners);
-				const timer = setTimeout(() => {
+				const retryCleanup = (): void => {
 					retiredLifecycleOwnerTimers.delete(current);
 					if (
 						current.pending.length > 0 ||
@@ -4410,22 +4415,19 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						(current.drainedInvocations?.length ?? 0) > 0 ||
 						current.lifecycleTasks.size > 0
 					) {
-						const retry = setTimeout(() => {
-							retiredLifecycleOwnerTimers.delete(current);
-							maybeRetireLifecycleOwner(current);
-						}, LIFECYCLE_QUIESCENCE_MS);
+						const retry = setTimeout(retryCleanup, LIFECYCLE_QUIESCENCE_MS);
 						retiredLifecycleOwnerTimers.set(current, retry);
 						return;
 					}
 					removeRetiredLifecycleOwner(current);
-				}, LIFECYCLE_QUIESCENCE_MS);
+				};
+				const timer = setTimeout(retryCleanup, LIFECYCLE_QUIESCENCE_MS);
 				retiredLifecycleOwnerTimers.set(current, timer);
 			} else current.deadlineManager.clearAll();
 			current.disposeGate?.();
 			await current.runtime.stop();
 		} catch (error) {
 			logger.error("sdk runtime stop failed", { code: errorCode(error), error: String(error) });
-			active = current;
 			throw error;
 		}
 		current.cursors.close();

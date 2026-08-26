@@ -3608,7 +3608,7 @@ describe("post-acceptance invocation terminalization", () => {
 		}
 	});
 
-	test("routes delayed predecessor events to the retired owner when a session id is reused", async () => {
+	test("fails closed for tokenless delayed events when a session id is reused", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-reused-session-retired-owner-"));
 		try {
 			const firstInflight = Promise.withResolvers<void>();
@@ -3639,7 +3639,7 @@ describe("post-acceptance invocation terminalization", () => {
 					(payload as { turnId?: unknown }).turnId === firstIds.turnId
 				);
 			});
-			expect(failure).toMatchObject({ kind: "agent_failed", payload: { error: { code: "provider_http_402" } } });
+			expect(failure).toBeUndefined();
 			firstInflight.resolve();
 			await harness.stop();
 		} finally {
