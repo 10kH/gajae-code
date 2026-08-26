@@ -1575,6 +1575,7 @@ function createControlSurface(
 		waiters?: Array<{ epoch: number; resolve: (observed: boolean) => void }>;
 	},
 	activePromptOwnerHolder?: { connectionIds?: ReadonlySet<string>; lifecycleEpoch?: number },
+	lifecycleRuntimeState?: RuntimeState,
 	retirePendingOwner?: (
 		kind: InvocationKind,
 		correlation: InvocationCorrelation,
@@ -3832,6 +3833,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		});
 		const queryHandlers = new QueryHandlers(surfaceFactory.query, sessionId, revisions, cursors);
 		const inputGate = { quiescing: false };
+		let lifecycleRuntimeState: RuntimeState | undefined;
 		let runtime: SessionSdkSessionRuntime;
 		// Durable-first bounded terminalization for accepted submissions that leave
 		// their queue or race a run WITHOUT consumption (exact-head review: clearing
@@ -3917,7 +3919,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			steerReconciliation,
 			(kind, correlation, connectionId, sdkRunToken, promotion) => {
 				const bindPromotedToken = (batch?: LifecycleBatch): void => {
-					if (sdkRunToken) lifecycleRunOwners.set(sdkRunToken, { state: active!, batch });
+					if (sdkRunToken && lifecycleRuntimeState)
+						lifecycleRunOwners.set(sdkRunToken, { state: lifecycleRuntimeState, batch });
 				};
 				// Lease at the ACTUAL promotion boundary (#4668 review): a promoted
 				// submission that wedges before its run's agent_start must still
@@ -4036,6 +4039,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			options.terminalAbortSeams,
 			terminalPublicationCapture,
 			activePromptOwnerHolder,
+			lifecycleRuntimeState,
 			(
 				kind: InvocationKind,
 				correlation: InvocationCorrelation,
