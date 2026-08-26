@@ -18714,6 +18714,11 @@ export class AgentSession {
 	}
 
 	async #handleManagedAttemptOutcome(outcome: ManagedAttemptOutcome): Promise<ManagedAttemptDecision> {
+		const activePromptHandle = this.activePromptHandle;
+		const cancellationSignal = activePromptHandle
+			? this.#runCancellationDomains.lookup(activePromptHandle)?.signal
+			: undefined;
+		if (cancellationSignal?.aborted) return { type: "terminal", terminal: { stopReason: "cancelled" } };
 		if (outcome.type === "run_terminal") {
 			this.#defaultFallbackChain().resetAttemptBudget();
 			return { type: "terminal", terminal: { stopReason: outcome.reason } };
@@ -18745,7 +18750,13 @@ export class AgentSession {
 				controller.discardStartedAttempt();
 				const advanced = controller.recordEscapedArgumentsFailure(errorMessage);
 				this.#escapedNonAsciiManagedRetries = 0;
-				if (advanced && (await this.#advanceDefaultFallback(controller, "escaped_non_ascii", 1))) {
+				const abortEpoch = this.#abortAdmissionEpoch;
+				if (
+					advanced &&
+					(await this.#advanceDefaultFallback(controller, "escaped_non_ascii", 1, cancellationSignal, abortEpoch))
+				) {
+					if (this.#abortAdmissionEpoch !== abortEpoch)
+						return { type: "terminal", terminal: { stopReason: "cancelled" } };
 					return {
 						type: "retry",
 						continuation: async ownership => {
@@ -18891,7 +18902,10 @@ export class AgentSession {
 		controller: FallbackChainController,
 		reason: string,
 		attemptsUsed: number,
+		signal?: AbortSignal,
+		abortEpoch?: number,
 	): Promise<boolean> {
+		if (signal?.aborted || (abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch)) return false;
 		while (!controller.isExhausted()) {
 			const selector = controller.currentSelector();
 			if (!selector) return false;
@@ -18907,6 +18921,7 @@ export class AgentSession {
 							...profileAliasIntent,
 							canonicalSessionId: this.agent.providerSessionId ?? this.sessionId,
 							credentialSessionId: this.credentialSessionId,
+							signal,
 						},
 					)
 				: resolveModelRoleValue(selector, this.#modelRegistry.getAvailable(), {
@@ -18916,6 +18931,7 @@ export class AgentSession {
 						sessionId: this.agent.providerSessionId ?? this.sessionId,
 						credentialSessionId: this.credentialSessionId,
 					});
+			if (signal?.aborted || (abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch)) return false;
 			if (!resolved.model) {
 				controller.onResolutionSkip("unknown_model");
 				continue;
@@ -18929,7 +18945,8 @@ export class AgentSession {
 				controller.onResolutionSkip(managedCursorUnavailable);
 				continue;
 			}
-			const key = await this.#modelRegistry.getApiKey(resolved.model, this.credentialSessionId);
+			const key = await this.#modelRegistry.getApiKey(resolved.model, this.credentialSessionId, { signal });
+			if (signal?.aborted || (abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch)) return false;
 			if (!isAuthenticated(key) && key !== kNoAuth) {
 				controller.onResolutionSkip("unauthenticated");
 				continue;
@@ -18944,6 +18961,7 @@ export class AgentSession {
 				this.#thinkingLevelForResolvedFallback(resolved.explicitThinkingLevel, resolved.thinkingLevel),
 			);
 			await this.#syncEditToolModeAfterModelChange(previousEditMode);
+			if (signal?.aborted || (abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch)) return false;
 			if (from !== to) {
 				this.#emit({
 					type: "model_fallback_switched",
@@ -19342,6 +19360,12 @@ export class AgentSession {
 		}
 
 		const retry = async (ownership?: ManagedAttemptContinuationOwnership): Promise<void> => {
+			const activePromptHandle = this.activePromptHandle;
+			const cancellationSignal =
+				ownership?.lease.signal ??
+				(activePromptHandle ? this.#runCancellationDomains.lookup(activePromptHandle)?.signal : undefined);
+			if (ownership && (!ownership.isCurrent() || cancellationSignal?.aborted)) return;
+			const abortEpoch = this.#abortAdmissionEpoch;
 			let quotaPoolExhausted = false;
 			if (managedFallback && !credentialRotated && !providerRetryCeilingReached) {
 				const mark = await this.#markFailedCredential(trigger);
@@ -19352,11 +19376,19 @@ export class AgentSession {
 			let resolutionError: unknown;
 			if (outcome === "advance") {
 				try {
-					advanced = await this.#advanceDefaultFallback(controller, trigger.class, attemptsUsed);
+					advanced = await this.#advanceDefaultFallback(
+						controller,
+						trigger.class,
+						attemptsUsed,
+						cancellationSignal,
+						abortEpoch,
+					);
 				} catch (error) {
 					resolutionError = error;
 				}
 			}
+			if (ownership && (!ownership.isCurrent() || cancellationSignal?.aborted)) return;
+			if (this.#abortAdmissionEpoch !== abortEpoch) return;
 			if (!advanced) {
 				let errorMessage = resolutionError
 					? `${this.#fallbackExhaustionError(controller)}; resolution failed: ${resolutionError instanceof Error ? resolutionError.message : String(resolutionError)}`

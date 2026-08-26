@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent, type AgentMessage, type AgentTool } from "@gajae-code/agent-core";
 import { ESCAPED_NONASCII_RECOVERY_PROMPT } from "@gajae-code/agent-core/agent-loop";
@@ -410,5 +410,71 @@ describe("AgentSession escaped non-ASCII fallback terminal (#4880)", () => {
 		]);
 		expect(executed).toEqual([{ question: QUESTION }]);
 		expect(session.isStreaming).toBe(false);
+	});
+
+	it("does not switch models after abort interrupts fallback credential resolution", async () => {
+		tempDir = TempDir.createSync("@gjc-escaped-fallback-abort-4880-");
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		authStorage.setRuntimeApiKey("openai", "test-key");
+
+		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		if (!primary || !fallback) throw new Error("Expected bundled abort-fallback models");
+
+		const modelRegistry = new ModelRegistry(authStorage);
+		const manager = SessionManager.create(tempDir.path(), tempDir.path());
+		const streamCalls: string[] = [];
+		const fallbackKeyGate = Promise.withResolvers<string | undefined>();
+		let keyCalls = 0;
+		const originalGetApiKey = modelRegistry.getApiKey.bind(modelRegistry);
+		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (model, sessionId, options) => {
+			keyCalls += 1;
+			if (keyCalls >= 3) {
+				if (options?.signal?.aborted) return undefined;
+				return await Promise.race([
+					fallbackKeyGate.promise,
+					new Promise<undefined>(resolve =>
+						options?.signal?.addEventListener("abort", () => resolve(undefined), { once: true }),
+					),
+				]);
+			}
+			return await originalGetApiKey(model, sessionId, options);
+		});
+		const events: string[] = [];
+		const mock = createMockModel({ responses: [{ throw: "503 service unavailable: overloaded_error" }] });
+		const agent = new Agent({
+			initialState: { model: primary, systemPrompt: ["test"], tools: [], messages: [] },
+			convertToLlm: identityConverter,
+			streamFn: (model, context, options) => {
+				streamCalls.push(selector(model));
+				return mock.stream(model, context, options);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"fallback.maxAttempts": 1,
+			"retry.baseDelayMs": 10,
+		});
+		settings.setModelRole("default", selector(primary));
+		session = new AgentSession({ agent, sessionManager: manager, settings, modelRegistry });
+		session.setConfiguredModelChain("default", [selector(primary), selector(fallback)], "test");
+		session.subscribe(event => {
+			if (event.type === "model_fallback_switched") events.push(event.to);
+		});
+
+		const prompt = session.prompt("abort fallback");
+		for (let attempt = 0; attempt < 100 && keyCalls < 3; attempt++) await Bun.sleep(5);
+		expect(keyCalls).toBeGreaterThanOrEqual(3);
+		const abort = session.abort();
+		fallbackKeyGate.resolve("test-key");
+		await abort;
+		await prompt.catch(() => {});
+		await session.waitForIdle();
+
+		expect(streamCalls).toEqual([selector(primary)]);
+		expect(events).toEqual([]);
+		expect(session.model?.provider).toBe(primary.provider);
+		expect(session.model?.id).toBe(primary.id);
 	});
 });
