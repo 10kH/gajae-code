@@ -23,6 +23,8 @@ const clients = new Map<string, LspClient>();
 const killedClients = new WeakSet<LspClient>();
 const clientLocks = new Map<string, Promise<LspClient>>();
 const fileOperationLocks = new Map<string, Promise<void>>();
+const initializingClients = new Set<LspClient>();
+let shutdownGeneration = 0;
 const transportClosedErrors = new WeakMap<LspClient, Error>();
 const LSP_TRANSPORT_CLOSED_MESSAGE = "LSP transport closed";
 let lspCleanupOwner: (() => void) | undefined;
@@ -515,6 +517,7 @@ export async function getOrCreateClient(config: ServerConfig, cwd: string, initT
 	// Create new client with lock
 	let clientPromise!: Promise<LspClient>;
 	clientPromise = (async () => {
+		const creationGeneration = shutdownGeneration;
 		const baseCommand = config.resolvedCommand ?? config.command;
 		const baseArgs = config.args ?? [];
 
@@ -522,6 +525,9 @@ export async function getOrCreateClient(config: ServerConfig, cwd: string, initT
 		const { command, args, env } = isLspmuxSupported(baseCommand)
 			? await getLspmuxCommand(baseCommand, baseArgs, cwd)
 			: { command: baseCommand, args: baseArgs };
+		if (creationGeneration !== shutdownGeneration) {
+			throw new Error("LSP client shutdown");
+		}
 
 		const owner = spawnOwnedProcess([command, ...args], {
 			cwd,
@@ -567,6 +573,12 @@ export async function getOrCreateClient(config: ServerConfig, cwd: string, initT
 			killedClients.add(client);
 			return originalKill(...args);
 		};
+		initializingClients.add(client);
+		if (creationGeneration !== shutdownGeneration) {
+			initializingClients.delete(client);
+			await shutdownClientInstance(client);
+			throw new Error("LSP client shutdown");
+		}
 
 		// Register crash recovery - remove client on process exit
 		proc.exited.then(async () => {
@@ -641,6 +653,9 @@ export async function getOrCreateClient(config: ServerConfig, cwd: string, initT
 			ensureLspCleanup();
 			const terminalError = transportClosedErrors.get(client);
 			if (terminalError) throw terminalError;
+			if (creationGeneration !== shutdownGeneration) {
+				throw new Error("LSP client shutdown");
+			}
 
 			// Publish to the cache only after the handshake completes: callers that
 			// hit the `clients` map must never observe a client whose initialize is
@@ -657,6 +672,7 @@ export async function getOrCreateClient(config: ServerConfig, cwd: string, initT
 			await shutdownClientInstance(client);
 			throw err;
 		} finally {
+			initializingClients.delete(client);
 			deleteClientLock(key, clientPromise);
 		}
 	})();
@@ -1011,11 +1027,18 @@ export async function sendNotification(client: LspClient, method: string, params
  */
 export async function shutdownAll(): Promise<void> {
 	stopIdleChecker();
+	shutdownGeneration += 1;
+	const inFlightPromises = Array.from(clientLocks.values());
+	const initializingToShutdown = Array.from(initializingClients);
 	clientLocks.clear();
 	fileOperationLocks.clear();
 	const clientsToShutdown = Array.from(clients.values());
 	clients.clear();
-	await Promise.allSettled(clientsToShutdown.map(client => shutdownClientInstance(client)));
+	await Promise.allSettled([
+		...clientsToShutdown.map(client => shutdownClientInstance(client)),
+		...initializingToShutdown.map(client => shutdownClientInstance(client)),
+		...inFlightPromises,
+	]);
 }
 
 /** Status of an LSP server */

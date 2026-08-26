@@ -10,7 +10,7 @@ import {
 	waitForProjectLoaded,
 } from "../../src/lsp/client";
 import type { ServerConfig } from "../../src/lsp/types";
-import { disposeAllOwnedProcesses } from "../../src/runtime/process-lifecycle";
+import { disposeAllOwnedProcesses, liveOwnedProcessCount } from "../../src/runtime/process-lifecycle";
 
 const BUN = process.execPath;
 const ORIGINAL_PATH = Bun.env.PATH;
@@ -322,4 +322,24 @@ describe("LSP transport write failures", () => {
 			await fs.rm(cwd, { recursive: true, force: true });
 		}
 	}, 10_000);
+
+	it("shutdownAll disposes an in-flight initializer and prevents cache resurrection", async () => {
+		const cwd = await tempDir("gjc-lsp-shutdown-init-");
+		try {
+			const script = await writeFakeLspServer(cwd, { initDelayMs: 500 });
+			const config = serverConfig(BUN, [script]);
+			const before = liveOwnedProcessCount();
+			const initializing = getOrCreateClient(config, cwd, 5_000);
+			await Bun.sleep(50);
+			await shutdownAll();
+			await expect(initializing).rejects.toThrow("LSP client shutdown");
+			await Bun.sleep(100);
+			expect(liveOwnedProcessCount()).toBe(before);
+
+			const retry = await getOrCreateClient(config, cwd, 5_000);
+			expect(retry.proc.exitCode).toBeNull();
+		} finally {
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	});
 });
