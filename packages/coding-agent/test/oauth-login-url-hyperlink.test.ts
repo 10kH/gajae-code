@@ -1,10 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { resetSettingsForTest, Settings, settings } from "@gajae-code/coding-agent/config/settings";
-import {
-	buildOAuthLoginAnchor,
-	SelectorController,
-} from "@gajae-code/coding-agent/modes/controllers/selector-controller";
-import { createOAuthUrlCopyLease } from "@gajae-code/coding-agent/modes/shared/oauth-url-copy";
+import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
+import { buildOAuthLoginAnchor, createOAuthUrlCopyLease } from "@gajae-code/coding-agent/modes/shared/oauth-url-copy";
 import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 import { type Component, Text } from "@gajae-code/tui";
@@ -185,6 +182,15 @@ describe("OAuth login row emission", () => {
 });
 
 describe("OAuth URL copy lease wiring", () => {
+	beforeAll(async () => {
+		await Settings.init({ inMemory: true });
+		settings.override("tui.hyperlinks", "always");
+	});
+
+	afterAll(() => {
+		resetSettingsForTest();
+	});
+
 	it("replaces and releases the pending URL lease for controller auth callbacks", () => {
 		const pendingUrls: Array<string | undefined> = [];
 		const lease = createOAuthUrlCopyLease({
@@ -210,13 +216,14 @@ describe("OAuth URL copy lease wiring", () => {
 	it("registers and releases the lease through the runtime MCP OAuth controller", async () => {
 		const pendingUrls: Array<string | undefined> = [];
 		const storedCredentials: unknown[] = [];
+		const chatChildren: Component[] = [];
 		const ctx = {
 			keybindings: { getDisplayString: () => "Alt+Shift+U" },
 			beginOAuthUrlForCopy: (url: string) => {
 				pendingUrls.push(url);
 				return () => pendingUrls.push(undefined);
 			},
-			chatContainer: { addChild: () => {} },
+			chatContainer: { addChild: (child: Component) => chatChildren.push(child) },
 			ui: { requestRender: () => {} },
 			showError: () => {},
 			session: { modelRegistry: { authStorage: { set: async (value: unknown) => storedCredentials.push(value) } } },
@@ -243,10 +250,18 @@ describe("OAuth URL copy lease wiring", () => {
 					return { access: "access", refresh: "refresh", expires: 1 };
 				},
 			}),
+			() => {},
 		);
 
 		expect(pendingUrls).toEqual([authUrl, undefined]);
 		expect(storedCredentials).toHaveLength(1);
+		const runtimeUrlRow = chatChildren.find(
+			(child): child is Text => child instanceof Text && plainText(child.getText()).includes(authUrl),
+		);
+		expect(runtimeUrlRow).toBeDefined();
+		const runtimeRows = rowsAt(runtimeUrlRow!.getText(), 40);
+		expect(runtimeRows.length).toBeGreaterThan(1);
+		for (const row of runtimeRows) expect(urisIn(row)).toEqual([authUrl]);
 
 		await expect(
 			controller.handleOAuthFlow(
@@ -268,6 +283,7 @@ describe("OAuth URL copy lease wiring", () => {
 						throw new Error("cancelled");
 					},
 				}),
+				() => {},
 			),
 		).rejects.toThrow("OAuth authentication failed: cancelled");
 

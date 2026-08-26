@@ -152,7 +152,6 @@ import {
 	setSearchFallbackProviders,
 	setSearchHardTimeoutMs,
 } from "../../tools/implementations";
-import { isHyperlinkEnabled } from "../../tui/hyperlink";
 import { copyToClipboard } from "../../utils/clipboard";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
 import { AgentDashboard } from "../components/agent-dashboard";
@@ -214,7 +213,7 @@ import { TreeSelectorComponent } from "../components/tree-selector";
 import { UserMessageSelectorComponent } from "../components/user-message-selector";
 import type { JobsObserver } from "../jobs-observer";
 import type { SessionObserverRegistry } from "../session-observer-registry";
-import { createOAuthUrlCopyLease } from "../shared/oauth-url-copy";
+import { buildOAuthLoginAnchor, createOAuthUrlCopyLease } from "../shared/oauth-url-copy";
 import type { TasksAggregator } from "../tasks-aggregator";
 import type { TranscriptItemRegistry } from "../transcript-item-registry";
 import { acquireResumeProgressLease, type ResumeProgressLease } from "../utils/ui-helpers";
@@ -256,19 +255,6 @@ export function buildStatusLineSettings(settingsInstance: Settings): StatusLineS
 		maxRows: settingsInstance.get("statusLine.maxRows"),
 		segmentOptions: settingsInstance.get("statusLine.segmentOptions"),
 	};
-}
-
-/**
- * Build the OSC 8 anchor emitted for an OAuth login URL row.
- *
- * The URL row is itself an anchor, not bare text: a login URL is a single
- * unbreakable token, so any pane narrower than the URL splits it across rows.
- * The wrap layer re-opens the identical link on every fragment (#4711), but
- * only for text that carries an anchor to begin with — a bare URL wrapped into
- * fragments leaves every fragment as dead, unclickable text.
- */
-export function buildOAuthLoginAnchor(url: string, label: string = url, hyperlinks = isHyperlinkEnabled()): string {
-	return hyperlinks ? `\x1b]8;;${url}\x07${label}\x1b]8;;\x07` : label;
 }
 
 function formatProviderOnboardingCommandGuide(): string {

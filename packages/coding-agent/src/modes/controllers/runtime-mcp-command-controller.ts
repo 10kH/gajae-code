@@ -40,7 +40,7 @@ import { shortenPath } from "../../tools/render-utils";
 import { openPath } from "../../utils/open";
 import { MCPAddWizard } from "../components/runtime-mcp-add-wizard";
 import { parseCommandArgs } from "../shared";
-import { createOAuthUrlCopyLease } from "../shared/oauth-url-copy";
+import { buildOAuthLoginAnchor, createOAuthUrlCopyLease } from "../shared/oauth-url-copy";
 import { theme } from "../theme/theme";
 import type { InteractiveModeContext } from "../types";
 import { groupBySource, parseRemoveArgs, readScopeFlag, showCommandMessage } from "./command-controller-shared";
@@ -542,6 +542,7 @@ export class MCPCommandController {
 		redirectUri?: string,
 		oauthMeta?: { issuer?: string; issuerResponseIssSupported?: boolean },
 		createFlow: MCPAuthFlowFactory = (config, callbacks) => new MCPOAuthFlow(config, callbacks),
+		openBrowser: (url: string) => void = openPath,
 	): Promise<OAuthFlowResult> {
 		const authStorage = this.ctx.session.modelRegistry.authStorage;
 		let parsedAuthUrl: URL;
@@ -613,7 +614,7 @@ export class MCPCommandController {
 						this.ctx.ui.requestRender();
 						// Try to open browser automatically
 						try {
-							openPath(info.url);
+							openBrowser(info.url);
 
 							// Show confirmation that browser should open
 							this.ctx.chatContainer.addChild(new Spacer(1));
@@ -625,7 +626,9 @@ export class MCPCommandController {
 								new Text(theme.fg("muted", "Alternative if browser did not open:"), 1, 0),
 							);
 							this.ctx.chatContainer.addChild(new Text(theme.fg("success", copyOAuthUrlHint), 1, 0));
-							this.ctx.chatContainer.addChild(new Text(theme.fg("accent", info.url), 1, 0));
+							this.ctx.chatContainer.addChild(
+								new Text(theme.fg("accent", buildOAuthLoginAnchor(info.url)), 1, 0),
+							);
 							this.ctx.ui.requestRender();
 						} catch (_error) {
 							// Show error if browser doesn't open
@@ -634,7 +637,9 @@ export class MCPCommandController {
 								new Text(theme.fg("warning", "→ Could not open browser automatically"), 1, 0),
 							);
 							this.ctx.chatContainer.addChild(new Text(theme.fg("success", copyOAuthUrlHint), 1, 0));
-							this.ctx.chatContainer.addChild(new Text(theme.fg("accent", info.url), 1, 0));
+							this.ctx.chatContainer.addChild(
+								new Text(theme.fg("accent", buildOAuthLoginAnchor(info.url)), 1, 0),
+							);
 							this.ctx.ui.requestRender();
 						}
 					},
