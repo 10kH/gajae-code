@@ -254,7 +254,7 @@ export class InputController {
 	}
 
 	#executeAction(id: (typeof APP_ACTION_METADATA)[number]["id"]): void {
-		void this.actionRegistry.execute(id);
+		void this.actionRegistry.executeFresh(id);
 	}
 
 	#transcriptTurnAnchorIds: readonly string[] = [];
@@ -2189,7 +2189,7 @@ export class InputController {
 						keybinding: action.bindingId
 							? this.ctx.keybindings.getKeys(action.bindingId).join(", ") || undefined
 							: undefined,
-						handler: () => this.actionRegistry.execute(action.id),
+						handler: () => this.actionRegistry.executeFresh(action.id),
 					})),
 				...slashCommands.map(command => ({
 					id: `slash:/${command.name}`,

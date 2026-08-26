@@ -225,9 +225,13 @@ describe("G003 WS2 red-team: command palette", () => {
 					setText: (value: string) => {
 						text = value;
 					},
+					addToHistory: () => {},
 					onSubmit: async () => {},
 				} as never,
 				session: session as never,
+				hasActiveBtw: () => false,
+				withLocalSubmission: async <T>(_value: string, action: () => Promise<T>) => action(),
+				updatePendingMessagesDisplay: () => {},
 				ui: {
 					showOverlay(component: CommandPalette) {
 						palette = component;
@@ -239,10 +243,10 @@ describe("G003 WS2 red-team: command palette", () => {
 			}) as never,
 		);
 		controller.openCommandPalette();
-		for (const key of "queue message") palette?.handleInput(key);
+		const queueEntry = palette?.getEntries().find(entry => entry.id === "action:app.message.queue");
+		expect(queueEntry?.handler).toBeDefined();
 		session.isStreaming = false;
-		palette?.handleInput("\n");
-		await Promise.resolve();
+		await queueEntry?.handler?.();
 		await Promise.resolve();
 		expect(submitted).toBe(0);
 		expect(text).toBe("draft");
