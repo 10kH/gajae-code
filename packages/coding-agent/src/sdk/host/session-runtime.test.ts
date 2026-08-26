@@ -3366,6 +3366,46 @@ describe("post-acceptance invocation terminalization", () => {
 		}
 	});
 
+	test("upgrades every shared generic diagnostic on a statusless provider end", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-provider-statusless-shared-"));
+		try {
+			let promoted: ((promotion: { startsOwnRun?: boolean }) => void) | undefined;
+			const harness = await invocationHarness("provider-statusless-shared", cwd, {
+				sendUserMessage: async (content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					if (content === "attached") {
+						promoted = (options as { onQueuedPromoted?: (promotion: { startsOwnRun?: boolean }) => void })
+							?.onQueuedPromoted;
+						return;
+					}
+					await neverSettlingPromise();
+				},
+			});
+			const first = await harness.control("turn.prompt", { text: "first" });
+			expect(first.ok).toBe(true);
+			await harness.emit("agent_start");
+			const attached = await harness.control("turn.follow_up", { text: "attached" });
+			expect(attached.ok).toBe(true);
+			promoted?.({ startsOwnRun: false });
+			const firstIds = { commandId: first.result?.commandId, turnId: first.result?.turnId };
+			const attachedIds = { commandId: attached.result?.commandId, turnId: attached.result?.turnId };
+			await harness.emit("agent_failed", { error: Object.assign(new Error("generic"), { code: "agent_failed" }) });
+			await harness.emit("agent_end", { messages: [{ role: "assistant", stopReason: "error" }] });
+			expect(await settledStatus(harness, "turn.prompt_status", firstIds)).toMatchObject({
+				status: "failed",
+				error: { code: "provider_rejected" },
+			});
+			expect(await settledStatus(harness, "turn.prompt_status", attachedIds)).toMatchObject({
+				status: "failed",
+				error: { code: "provider_rejected" },
+			});
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("does not misclassify a local malformed-tool circuit breaker as provider rejection", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-local-malformed-tool-"));
 		try {

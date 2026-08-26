@@ -3802,18 +3802,21 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			: undefined;
 		const currentInvocation = endedBatch?.invocations[0] ?? owner?.activeInvocation;
 		const failure = providerFailureFromAgentEnd(event);
-		const currentFailureKey = currentInvocation
-			? `${currentInvocation.correlation.commandId}:${currentInvocation.correlation.turnId}`
-			: undefined;
-		const existingFailureCode =
-			currentFailureKey !== undefined ? owner?.failureDiagnosticCodes.get(currentFailureKey) : undefined;
-		const failureAlreadyPublished =
-			currentFailureKey !== undefined &&
-			owner?.failureDiagnosticKeys.has(currentFailureKey) === true &&
-			(failure === undefined || existingFailureCode === undefined || existingFailureCode !== "agent_failed");
+		const failureCandidates = endedBatch
+			? [...endedBatch.invocations, ...endedBatch.attachedInvocations]
+			: currentInvocation
+				? [currentInvocation]
+				: [];
+		const genericFailureKeys = failureCandidates
+			.map(({ correlation }) => lifecycleCorrelationKey(correlation))
+			.filter(key => owner?.failureDiagnosticCodes.get(key) === "agent_failed");
+		const hasExistingFailure = failureCandidates.some(({ correlation }) =>
+			owner?.failureDiagnosticKeys.has(lifecycleCorrelationKey(correlation)),
+		);
+		const failureAlreadyPublished = failure === undefined || (hasExistingFailure && genericFailureKeys.length === 0);
 		return trackLifecycle(async () => {
 			if (failure && !failureAlreadyPublished) {
-				if (currentFailureKey !== undefined) owner?.failureDiagnosticKeys.delete(currentFailureKey);
+				for (const key of genericFailureKeys) owner?.failureDiagnosticKeys.delete(key);
 				await emitLifecycle("agent_failed", ctx, failure, undefined, lifecycleOwner);
 			}
 			await emitLifecycle(
