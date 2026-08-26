@@ -6410,10 +6410,12 @@ export class AgentSession {
 												if (consumedSdkRunToken !== undefined)
 													this.#sdkRunTokensByAttemptScope.set(handle.scope, consumedSdkRunToken);
 												if (startsOwn) this.#activeSdkRunToken = consumedSdkRunToken;
-												for (const message of acceptance.consumedQueuedMessages)
-													this.#sdkRunTokensByQueuedMessage.delete(message);
 												this.#acceptRunHandle(handle);
 												options?.onRunAccepted?.(handle);
+												// Keep the queued token available through the acceptance callback;
+												// SDK follow-up owners bind it to the new attempt scope there.
+												for (const message of acceptance.consumedQueuedMessages)
+													this.#sdkRunTokensByQueuedMessage.delete(message);
 												settleLease();
 												releasePredecessor();
 												if (startsQueuedSuccessor) {
