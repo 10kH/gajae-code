@@ -39,6 +39,7 @@ import { BUNDLED_GROK_BUILD_EXTENSION_ID, getBundledGrokBuildExtensionFactory } 
 import { initializeWithSettings } from "./discovery";
 import { exportFromFile } from "./export/html";
 import type { ExtensionUIContext } from "./extensibility/extensions/types";
+import { releaseLaunchWorktreeReservationAfterRegistration } from "./gjc-runtime/launch-worktree-reservation";
 import { persistCoordinatorRuntimeInputReady } from "./gjc-runtime/session-state-sidecar";
 import { assertMasterLaunchArgs, assertMasterLaunchDisposition, createMasterModeContext } from "./master-mode/context";
 import type { AcpStartupOptions } from "./modes/acp/startup-options";
@@ -1846,6 +1847,18 @@ export async function runRootCommand(
 					}
 				: {}),
 		});
+		if (locator.worktreeRoot !== null) {
+			try {
+				await releaseLaunchWorktreeReservationAfterRegistration(
+					settingsInstance.getAgentDir(),
+					locator.worktreeRoot,
+				);
+			} catch (error) {
+				logger.warn("Failed to release launch worktree reservation after host registration", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
 		postmortem.register("direct-session-index", async () => {
 			await sessionIndex.append({
 				type: "host_unregistered",

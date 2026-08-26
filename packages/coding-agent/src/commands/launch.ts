@@ -15,6 +15,7 @@ import {
 	planLaunchWorktree,
 	prepareLaunchWorktree,
 } from "../gjc-runtime/launch-worktree";
+import { type LaunchWorktreeReservation, reserveLaunchWorktree } from "../gjc-runtime/launch-worktree-reservation";
 import {
 	GJC_COORDINATOR_SESSION_ID_ENV,
 	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
@@ -65,6 +66,28 @@ export async function persistCoordinatorLaunchFailure(
 	await writeCoordinatorAtomic(stateFile, `${JSON.stringify(payload, null, 2)}\n`);
 }
 
+function worktreeInUseError(worktreePath: string, occupant?: string): Error {
+	const holder = occupant ? `session ${occupant}` : "another launch";
+	return new Error(
+		`worktree_in_use:${worktreePath} is already held by ${holder}. ` +
+			"Use gjc --worktree <name> for a separate checkout, or stop that session.",
+	);
+}
+
+async function reserveLaunchWorktreeOrFail(agentDir: string, worktreePath: string): Promise<LaunchWorktreeReservation> {
+	const reservation = await reserveLaunchWorktree(agentDir, worktreePath);
+	if (!reservation) throw worktreeInUseError(worktreePath);
+	return reservation;
+}
+
+/** Test seam for the path-keyed atomic reservation. */
+export async function reserveLaunchWorktreeForTest(
+	agentDir: string,
+	worktreePath: string,
+): Promise<LaunchWorktreeReservation> {
+	return await reserveLaunchWorktreeOrFail(agentDir, worktreePath);
+}
+
 async function assertLaunchWorktreeUnoccupied(worktree: GjcLaunchWorktreePlan | { enabled: false }): Promise<void> {
 	if (!worktree.enabled) return;
 	let sessions: readonly IndexedSession[];
@@ -74,11 +97,21 @@ async function assertLaunchWorktreeUnoccupied(worktree: GjcLaunchWorktreePlan | 
 		throw new Error(`worktree_occupancy_unavailable:${worktree.worktreePath}`);
 	}
 	const occupant = worktreeOccupant(sessions, worktree.worktreePath);
-	if (occupant)
-		throw new Error(
-			`worktree_in_use:${worktree.worktreePath} is already held by session ${occupant}. ` +
-				"Use gjc --worktree <name> for a separate checkout, or stop that session.",
-		);
+	if (occupant) throw worktreeInUseError(worktree.worktreePath, occupant);
+}
+
+async function reserveLaunchWorktreePreflight(
+	worktree: GjcLaunchWorktreePlan | { enabled: false },
+): Promise<LaunchWorktreeReservation | undefined> {
+	if (!worktree.enabled) return undefined;
+	const reservation = await reserveLaunchWorktreeOrFail(getAgentDir(), worktree.worktreePath);
+	try {
+		await assertLaunchWorktreeUnoccupied(worktree);
+		return reservation;
+	} catch (error) {
+		await reservation.release();
+		throw error;
+	}
 }
 
 export default class Index extends Command {
@@ -125,31 +158,37 @@ export default class Index extends Command {
 		}
 
 		let launch: PreparedLaunchWorktree;
+		let reservation: LaunchWorktreeReservation | undefined;
 		try {
 			const plannedWorktree = planLaunchWorktree(process.cwd(), parseLaunchWorktreeMode(args).mode);
-			await assertLaunchWorktreeUnoccupied(plannedWorktree);
+			reservation = await reserveLaunchWorktreePreflight(plannedWorktree);
 			launch = prepareLaunchWorktree(process.cwd(), args);
 		} catch (error) {
+			await reservation?.release();
 			await persistCoordinatorLaunchFailure(error, process.cwd());
 			throw error;
 		}
-		if (launch.worktree.enabled) {
-			process.chdir(launch.cwd);
-			setProjectDir(launch.cwd);
+		try {
+			if (launch.worktree.enabled) {
+				process.chdir(launch.cwd);
+				setProjectDir(launch.cwd);
+			}
+			const launchParsed = parseArgs(launch.args, "deferred");
+			if (launchParsed.mode !== "acp") assertLocalLaunchArgs(launchParsed);
+			assertMasterLaunchArgs(launchParsed);
+			if (
+				launchDefaultTmuxIfNeeded({
+					parsed: launchParsed,
+					rawArgs: launch.args,
+					cwd: launch.cwd,
+					worktreeBranch: launch.worktree.enabled && !launch.worktree.detached ? launch.worktree.branchName : null,
+					project: launch.cwd,
+				})
+			)
+				return;
+			await runRootCommand(launchParsed, launch.args);
+		} finally {
+			await reservation?.release();
 		}
-		const launchParsed = parseArgs(launch.args, "deferred");
-		if (launchParsed.mode !== "acp") assertLocalLaunchArgs(launchParsed);
-		assertMasterLaunchArgs(launchParsed);
-		if (
-			launchDefaultTmuxIfNeeded({
-				parsed: launchParsed,
-				rawArgs: launch.args,
-				cwd: launch.cwd,
-				worktreeBranch: launch.worktree.enabled && !launch.worktree.detached ? launch.worktree.branchName : null,
-				project: launch.cwd,
-			})
-		)
-			return;
-		await runRootCommand(launchParsed, launch.args);
 	}
 }
