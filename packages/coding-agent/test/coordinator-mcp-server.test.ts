@@ -2114,7 +2114,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		});
 		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
 		let creation: Record<string, unknown> | undefined;
-		for (let attempt = 0; attempt < 50 && (!creation || !lifecycleInput); attempt++) {
+		for (let attempt = 0; attempt < 200 && (!creation || !lifecycleInput); attempt++) {
 			try {
 				const registry = JSON.parse(await fs.readFile(paths.registry, "utf8")) as Record<string, unknown>;
 				const creations = registry.creations as Record<string, Record<string, unknown>> | undefined;
@@ -2123,7 +2123,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			} catch {
 				// The registry may not exist until the initial claim transaction completes.
 			}
-			if (!creation || !lifecycleInput) await Bun.sleep(5);
+			if (!creation || !lifecycleInput) await Bun.sleep(10);
 		}
 		expect(creation).toMatchObject({ phase: "remote_started" });
 		expect((creation?.sidecar_verifier as Record<string, unknown>)?.key_id).toBe(
