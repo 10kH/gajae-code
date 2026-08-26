@@ -131,6 +131,80 @@ afterEach(async () => {
 });
 
 describe("DAP lifecycle behavior", () => {
+	it("serializes concurrent backpressured protocol frames", async () => {
+		const calls: string[] = [];
+		const resolvers: Array<() => void> = [];
+		const sink = {
+			write(data: string | Uint8Array): Promise<number> {
+				calls.push(typeof data === "string" ? data : new TextDecoder().decode(data));
+				return new Promise(resolve =>
+					resolvers.push(() => resolve(typeof data === "string" ? data.length : data.byteLength)),
+				);
+			},
+			flush(): number {
+				calls.push("flush");
+				return 0;
+			},
+		};
+		const owner = {
+			child: { stdin: sink, stdout: new ReadableStream<Uint8Array>() },
+			dispose: async () => {},
+			awaitExit: async () => {},
+			disposed: false,
+		};
+		const client = new DapClient(STDIO_ADAPTER, ".", owner as never, {
+			readable: new ReadableStream<Uint8Array>(),
+			writeSink: sink,
+		});
+
+		const first = client.sendResponse({ seq: 1, type: "request", command: "first" }, true);
+		await Bun.sleep(0);
+		const second = client.sendResponse({ seq: 2, type: "request", command: "second" }, true);
+		await Bun.sleep(0);
+		expect(calls).toHaveLength(1);
+		expect(calls[0]).toBe("Content-Length: 76\r\n\r\n");
+
+		resolvers.shift()?.();
+		await Bun.sleep(0);
+		expect(calls[1]).toContain('"first"');
+		resolvers.shift()?.();
+		await first;
+		await Bun.sleep(0);
+		expect(calls[2]).toBe("flush");
+		expect(calls[3]).toBe("Content-Length: 77\r\n\r\n");
+
+		resolvers.shift()?.();
+		await Bun.sleep(0);
+		expect(calls[4]).toContain('"second"');
+		resolvers.shift()?.();
+		await second;
+	});
+
+	it("delivers request timeouts while a write remains backpressured", async () => {
+		const sink = {
+			write(): Promise<number> {
+				return new Promise(() => {});
+			},
+			flush(): number {
+				return 0;
+			},
+		};
+		const owner = {
+			child: { stdin: sink, stdout: new ReadableStream<Uint8Array>() },
+			dispose: async () => {},
+			awaitExit: async () => {},
+			disposed: false,
+		};
+		const client = new DapClient(STDIO_ADAPTER, ".", owner as never, {
+			readable: new ReadableStream<Uint8Array>(),
+			writeSink: sink,
+		});
+
+		await expect(client.sendRequest("blocked", undefined, undefined, 10)).rejects.toThrow(
+			"DAP request blocked timed out after 10ms",
+		);
+	});
+
 	it("socket-mode startup timeout disposes the adapter process", async () => {
 		const cwd = await tempDir("gjc-dap-socket-timeout-");
 		try {

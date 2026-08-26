@@ -23,6 +23,8 @@ const clients = new Map<string, LspClient>();
 const killedClients = new WeakSet<LspClient>();
 const clientLocks = new Map<string, Promise<LspClient>>();
 const fileOperationLocks = new Map<string, Promise<void>>();
+const initializingClients = new Set<LspClient>();
+let shutdownGeneration = 0;
 const transportClosedErrors = new WeakMap<LspClient, Error>();
 const LSP_TRANSPORT_CLOSED_MESSAGE = "LSP transport closed";
 let lspCleanupOwner: (() => void) | undefined;
@@ -280,7 +282,13 @@ async function writeMessage(
 	if (terminalError) throw terminalError;
 
 	try {
-		client.proc.stdin.write(`Content-Length: ${Buffer.byteLength(content, "utf-8")}\r\n\r\n${content}`);
+		// FileSink.write() returns `number | Promise<number>`: under backpressure
+		// (e.g. a large didOpen/didChange payload) it returns a promise whose
+		// rejection — typically EPIPE when the server dies mid-write — would
+		// otherwise be discarded here and surface as an unhandled rejection that
+		// takes down the whole process. Await it so every failure mode reaches
+		// the transport-closed mapping below.
+		await client.proc.stdin.write(`Content-Length: ${Buffer.byteLength(content, "utf-8")}\r\n\r\n${content}`);
 		await client.proc.stdin.flush();
 	} catch (error) {
 		if (isKnownSinkPeerClosedError(error)) {
@@ -509,6 +517,7 @@ export async function getOrCreateClient(config: ServerConfig, cwd: string, initT
 	// Create new client with lock
 	let clientPromise!: Promise<LspClient>;
 	clientPromise = (async () => {
+		const creationGeneration = shutdownGeneration;
 		const baseCommand = config.resolvedCommand ?? config.command;
 		const baseArgs = config.args ?? [];
 
@@ -516,6 +525,9 @@ export async function getOrCreateClient(config: ServerConfig, cwd: string, initT
 		const { command, args, env } = isLspmuxSupported(baseCommand)
 			? await getLspmuxCommand(baseCommand, baseArgs, cwd)
 			: { command: baseCommand, args: baseArgs };
+		if (creationGeneration !== shutdownGeneration) {
+			throw new Error("LSP client shutdown");
+		}
 
 		const owner = spawnOwnedProcess([command, ...args], {
 			cwd,
@@ -561,7 +573,12 @@ export async function getOrCreateClient(config: ServerConfig, cwd: string, initT
 			killedClients.add(client);
 			return originalKill(...args);
 		};
-		clients.set(key, client);
+		initializingClients.add(client);
+		if (creationGeneration !== shutdownGeneration) {
+			initializingClients.delete(client);
+			await shutdownClientInstance(client);
+			throw new Error("LSP client shutdown");
+		}
 
 		// Register crash recovery - remove client on process exit
 		proc.exited.then(async () => {
@@ -636,15 +653,26 @@ export async function getOrCreateClient(config: ServerConfig, cwd: string, initT
 			ensureLspCleanup();
 			const terminalError = transportClosedErrors.get(client);
 			if (terminalError) throw terminalError;
+			if (creationGeneration !== shutdownGeneration) {
+				throw new Error("LSP client shutdown");
+			}
+
+			// Publish to the cache only after the handshake completes: callers that
+			// hit the `clients` map must never observe a client whose initialize is
+			// still in flight. Concurrent callers instead share `clientLocks` and
+			// wait for initialization, so a server that dies mid-handshake rejects
+			// every waiter instead of handing them a transport that is about to
+			// break underneath them.
+			clients.set(key, client);
 
 			return client;
 		} catch (err) {
 			// Clean up on initialization failure
-			deleteCachedClient(key, client);
 			deleteClientLock(key, clientPromise);
 			await shutdownClientInstance(client);
 			throw err;
 		} finally {
+			initializingClients.delete(client);
 			deleteClientLock(key, clientPromise);
 		}
 	})();
@@ -999,11 +1027,18 @@ export async function sendNotification(client: LspClient, method: string, params
  */
 export async function shutdownAll(): Promise<void> {
 	stopIdleChecker();
+	shutdownGeneration += 1;
+	const inFlightPromises = Array.from(clientLocks.values());
+	const initializingToShutdown = Array.from(initializingClients);
 	clientLocks.clear();
 	fileOperationLocks.clear();
 	const clientsToShutdown = Array.from(clients.values());
 	clients.clear();
-	await Promise.allSettled(clientsToShutdown.map(client => shutdownClientInstance(client)));
+	await Promise.allSettled([
+		...clientsToShutdown.map(client => shutdownClientInstance(client)),
+		...initializingToShutdown.map(client => shutdownClientInstance(client)),
+		...inFlightPromises,
+	]);
 }
 
 /** Status of an LSP server */

@@ -239,8 +239,15 @@ export class StdioTransport implements MCPTransport {
 		const response = error
 			? { jsonrpc: "2.0" as const, id, error }
 			: { jsonrpc: "2.0" as const, id, result: result ?? {} };
-		stdin.write(`${JSON.stringify(response)}\n`);
-		stdin.flush();
+		// FileSink.write()/flush() return `number | Promise<number>` (flush may
+		// also return undefined): under backpressure a write returns a promise
+		// whose rejection — e.g. EPIPE when the server dies mid-write — must
+		// not escape as an unhandled rejection. Best-effort, like the caller.
+		Promise.resolve(stdin.write(`${JSON.stringify(response)}\n`))
+			.then(() => stdin.flush())
+			.catch(() => {
+				// Best-effort — process may have exited
+			});
 	}
 
 	#handleClose(failure?: MCPExpectedFailure): void {
@@ -276,6 +283,7 @@ export class StdioTransport implements MCPTransport {
 		}
 
 		const { promise, resolve, reject } = Promise.withResolvers<T>();
+		void promise.catch(() => {});
 		let timer: NodeJS.Timeout | undefined;
 		let settled = false;
 
@@ -319,14 +327,18 @@ export class StdioTransport implements MCPTransport {
 		}, timeout);
 
 		const message = `${JSON.stringify(request)}\n`;
-		try {
-			// Bun's FileSink has write() method directly
-			stdin.write(message);
-			stdin.flush();
-		} catch (error: unknown) {
-			cleanup();
-			reject(new MCPExpectedFailure(error));
-		}
+		void (async () => {
+			try {
+				// Bun's FileSink has write() method directly. Await both write and
+				// flush: under backpressure write() returns a promise, and either
+				// call can fail with EPIPE when the server dies mid-write.
+				await stdin.write(message);
+				await stdin.flush();
+			} catch (error: unknown) {
+				cleanup();
+				reject(new MCPExpectedFailure(error));
+			}
+		})();
 
 		return promise;
 	}
@@ -345,9 +357,11 @@ export class StdioTransport implements MCPTransport {
 
 		const message = `${JSON.stringify(notification)}\n`;
 		try {
-			// Bun's FileSink has write() method directly
-			stdin.write(message);
-			stdin.flush();
+			// Bun's FileSink has write() method directly. Await both write and
+			// flush: under backpressure write() returns a promise, and either
+			// call can fail with EPIPE when the server dies mid-write.
+			await stdin.write(message);
+			await stdin.flush();
 		} catch (error) {
 			throw new MCPExpectedFailure(error);
 		}
