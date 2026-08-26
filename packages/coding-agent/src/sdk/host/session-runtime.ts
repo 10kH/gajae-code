@@ -3897,7 +3897,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			api,
 			reconciliation,
 			(kind, correlation, connectionId, startsOwnTurn, sdkRunToken) => {
-				if (sdkRunToken) lifecycleRunOwners.set(sdkRunToken, { state: active! });
+				if (sdkRunToken && lifecycleRuntimeState) lifecycleRunOwners.set(sdkRunToken, { state: lifecycleRuntimeState });
 				// Only submissions that start their OWN turn get a pending entry: a
 				// steering-queued submission consumed inside the current run never
 				// emits the agent_start that would consume the entry, so leaving it
@@ -4361,7 +4361,6 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		activePromptOwnerHolder.connectionIds = undefined;
 		activePromptOwnerHolder.lifecycleEpoch = undefined;
 		current.quiesceInput();
-		current.deadlineManager.clearAll();
 		current.fenceGateResolutions();
 		try {
 			await current.waitForGateResolutionQuiescence();
@@ -4380,13 +4379,13 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				}
 			}
 			active = undefined;
-			if (
+			const retainsLifecycleWork =
 				current.pending.length > 0 ||
 				current.openLifecycleBatches.length > 0 ||
 				(current.attachedInvocations?.length ?? 0) > 0 ||
 				(current.drainedInvocations?.length ?? 0) > 0 ||
-				current.lifecycleTasks.size > 0
-			) {
+				current.lifecycleTasks.size > 0;
+			if (retainsLifecycleWork) {
 				const owners = retiredLifecycleOwners.get(current.sessionId) ?? [];
 				owners.push(current);
 				retiredLifecycleOwners.set(current.sessionId, owners);
@@ -4395,7 +4394,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					removeRetiredLifecycleOwner(current);
 				}, LIFECYCLE_QUIESCENCE_MS);
 				retiredLifecycleOwnerTimers.set(current, timer);
-			}
+			} else current.deadlineManager.clearAll();
 			current.disposeGate?.();
 			await current.runtime.stop();
 		} catch (error) {
