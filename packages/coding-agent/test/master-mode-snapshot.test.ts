@@ -168,6 +168,35 @@ test("bounds large master snapshots and reports truncation", async () => {
 	expect(snapshot.rows.length).toBe(256);
 	expect(renderMasterPeerSnapshot(snapshot)).toContain('"truncated":true');
 });
+test("bounds entity-expanded master snapshots against final rendered bytes", async () => {
+	const { anchor } = await gitAnchor();
+	const entityExpansionText = "&".repeat(4_000);
+	const peers = Array.from({ length: 5 }, (_, index) => ({
+		id: `peer-${index}-${entityExpansionText}`,
+		locator: {
+			cwd: `/repo/${entityExpansionText}`,
+			worktreeRoot: null,
+			stateRoot: `/state/${entityExpansionText}`,
+		},
+		live: true,
+	}));
+	const unescapedRowBytes = peers.reduce((bytes, row) => bytes + Buffer.byteLength(JSON.stringify(row), "utf8"), 0);
+	expect(unescapedRowBytes).toBeLessThanOrEqual(64 * 1024);
+
+	const snapshot = await collectMasterPeerSnapshot({
+		lifecycle: new FakeLifecycle({ ok: true, operation: "session.list", result: result(anchor, peers) }),
+		actor,
+		ownerSessionId: "master",
+		scope: "repo",
+		requestAnchor: anchor,
+	});
+	const rendered = renderMasterPeerSnapshot(snapshot);
+
+	expect(snapshot.rows).toHaveLength(1);
+	expect(snapshot.truncated).toBe(true);
+	expect(rendered).toContain('"truncated":true');
+	expect(Buffer.byteLength(rendered, "utf8")).toBeLessThanOrEqual(64 * 1024);
+});
 
 test("collectMasterPeerSnapshot renders unavailable when Broker does not return a scoped envelope", async () => {
 	const { anchor } = await gitAnchor();

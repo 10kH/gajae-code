@@ -70,6 +70,23 @@ describe("generated JSON Schemas", () => {
 		});
 	});
 
+	it("emits the master orphan grace safe-integer bounds", () => {
+		const schema = configSchema() as {
+			properties: {
+				sdk: {
+					properties: { masterOrphanGraceMs: { type: string; default: number; minimum: number; maximum: number } };
+				};
+			};
+		};
+
+		expect(schema.properties.sdk.properties.masterOrphanGraceMs).toMatchObject({
+			type: "integer",
+			default: 120_000,
+			minimum: 60_000,
+			maximum: 3_600_000,
+		});
+	});
+
 	it("accepts documented Discord and Slack config while rejecting unknown chat properties", () => {
 		const schema = configSchema();
 		const completeConfig = {

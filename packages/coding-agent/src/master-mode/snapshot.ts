@@ -66,18 +66,31 @@ function matchesResolvedScope(left: ResolvedScopeV1, right: ResolvedScopeV1): bo
 	return JSON.stringify(left) === JSON.stringify(right);
 }
 
-function boundSnapshotRows(rows: readonly SdkSearchRowV1[]): {
+/** Retains a row prefix only when its final escaped prompt block fits the budget. */
+function boundSnapshotRows(
+	snapshot: Omit<MasterPeerSnapshot, "rows" | "truncated">,
+	rows: readonly SdkSearchRowV1[],
+): {
 	rows: readonly SdkSearchRowV1[];
 	truncated: boolean;
 } {
 	const retained: SdkSearchRowV1[] = [];
-	let bytes = 0;
-	for (const row of rows) {
-		const rowBytes = Buffer.byteLength(JSON.stringify(row), "utf8");
-		if (retained.length >= MASTER_PEER_SNAPSHOT_MAX_ROWS || bytes + rowBytes > MASTER_PEER_SNAPSHOT_MAX_BYTES)
-			return { rows: retained, truncated: true };
+	for (const [index, row] of rows.entries()) {
+		if (retained.length >= MASTER_PEER_SNAPSHOT_MAX_ROWS) return { rows: retained, truncated: true };
+
 		retained.push(row);
-		bytes += rowBytes;
+		const willTruncate = index < rows.length - 1;
+		const candidate: MasterPeerSnapshot = {
+			...snapshot,
+			rows: retained,
+			...(willTruncate ? { truncated: true } : {}),
+		};
+		if (Buffer.byteLength(renderMasterPeerSnapshot(candidate), "utf8") > MASTER_PEER_SNAPSHOT_MAX_BYTES) {
+			retained.pop();
+			return { rows: retained, truncated: true };
+		}
+		if (willTruncate && retained.length === MASTER_PEER_SNAPSHOT_MAX_ROWS)
+			return { rows: retained, truncated: true };
 	}
 	return { rows: retained, truncated: false };
 }
@@ -101,12 +114,16 @@ export async function collectMasterPeerSnapshot(input: CollectMasterPeerSnapshot
 	});
 	const result = sdkSearchResultV1(outcome.result);
 	if (!result || !matchesResolvedScope(result.scope, resolvedScope)) return unavailableSnapshot(resolvedScope);
-	const bounded = boundSnapshotRows(result.rows.filter(row => row.id !== input.ownerSessionId).sort(compareRows));
-	return {
+	const snapshot: Omit<MasterPeerSnapshot, "rows" | "truncated"> = {
 		status: result.status,
 		scope: result.scope,
 		observedAt: result.observedAt,
 		...(result.indexSeq === undefined ? {} : { indexSeq: result.indexSeq }),
+	};
+	const rows = result.rows.filter(row => row.id !== input.ownerSessionId).sort(compareRows);
+	const bounded = boundSnapshotRows(snapshot, rows);
+	return {
+		...snapshot,
 		rows: bounded.rows,
 		...(bounded.truncated ? { truncated: true } : {}),
 	};
