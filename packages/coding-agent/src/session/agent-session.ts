@@ -2144,7 +2144,8 @@ const AGENT_CONTINUE_BUSY_MAX_RESCHEDULES = 50;
  * in-loop resample budget, so without this cap a deterministic escaper loops
  * forever: the fallback chain never sees a charge to exhaust on. Matching the
  * agent loop's own per-loop budget (MAX_ESCAPED_NONASCII_RESAMPLES + 1 wire
- * attempts) keeps one steering retry plus one blind retry before the run ends.
+ * attempts) gives every eligible model two steered retries before one policy
+ * charge advances the chain.
  */
 const MAX_ESCAPED_NONASCII_MANAGED_RETRIES = 2;
 
