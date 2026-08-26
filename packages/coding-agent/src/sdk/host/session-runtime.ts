@@ -3959,6 +3959,42 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const queryHandlers = new QueryHandlers(surfaceFactory.query, sessionId, revisions, cursors);
 		const inputGate = { quiescing: false };
 		const lifecycleOwnerHolder: { state?: RuntimeState; quiescing: boolean } = { quiescing: false };
+		const skillRecoveryTasks = new Map<string, Promise<void>>();
+		const scheduleSkillRecovery = (
+			correlation: InvocationCorrelation,
+			failureIntent?: { code: string; message: string },
+		): void => {
+			const key = lifecycleCorrelationKey(correlation);
+			if (skillRecoveryTasks.has(key)) return;
+			const intent = failureIntent;
+			const task = (async (): Promise<void> => {
+				let failureRecorded = intent === undefined;
+				for (;;) {
+					try {
+						if (!failureRecorded) {
+							await reconciliation.noteTransition("skill", correlation, {
+								type: "agent_failed",
+								error: Object.assign(new Error(intent?.message ?? "skill invocation failed"), {
+									code: intent?.code ?? "skill_failed",
+								}),
+							} as never);
+							failureRecorded = true;
+						}
+						await reconciliation.noteTransition("skill", correlation, { type: "agent_end" });
+						return;
+					} catch (error) {
+						logger.error("SDK skill lifecycle recovery retrying", {
+							commandId: correlation.commandId,
+							turnId: correlation.turnId,
+							error: sanitizePromptFailure(error),
+						});
+						await Bun.sleep(1_000);
+					}
+				}
+			})();
+			skillRecoveryTasks.set(key, task);
+			void task.finally(() => skillRecoveryTasks.delete(key));
+		};
 		let runtime: SessionSdkSessionRuntime;
 		// Durable-first bounded terminalization for accepted submissions that leave
 		// their queue or race a run WITHOUT consumption (exact-head review: clearing
@@ -4220,6 +4256,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					return;
 				}
 				if (leaseRelease === "recover-failure" && failureIntent !== undefined) {
+					if (kind === "skill") {
+						scheduleSkillRecovery(correlation, failureIntent);
+						return;
+					}
 					// Compound failure-plus-terminal recovery: the settlement's durable
 					// writes failed, so the lease stays armed as the recovery owner and its
 					// replay re-records the failure reason before agent_end (exact-head
@@ -4228,6 +4268,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					return;
 				}
 				if (leaseRelease === "recover-terminal") {
+					if (kind === "skill") {
+						scheduleSkillRecovery(correlation);
+						return;
+					}
 					deadlineManager.noteTerminalTransition(correlation);
 					return;
 				}
