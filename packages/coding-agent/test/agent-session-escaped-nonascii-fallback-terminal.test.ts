@@ -4,6 +4,7 @@ import { Agent, type AgentMessage, type AgentTool } from "@gajae-code/agent-core
 import { ESCAPED_NONASCII_RECOVERY_PROMPT } from "@gajae-code/agent-core/agent-loop";
 import { getBundledModel, type Message, type Model } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
+import type { OpenAIResponsesHistoryPayload } from "@gajae-code/ai/types";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
@@ -20,7 +21,7 @@ function identityConverter(messages: AgentMessage[]): Message[] {
 	) as Message[];
 }
 
-function escapedTurn(id: string, providerPayload?: unknown) {
+function escapedTurn(id: string, providerPayload?: OpenAIResponsesHistoryPayload) {
 	return {
 		content: [
 			{
