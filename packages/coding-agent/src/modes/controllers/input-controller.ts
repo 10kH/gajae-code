@@ -184,7 +184,7 @@ export class InputController {
 			case "app.thinking.toggle":
 				return Boolean(this.ctx.session.model?.reasoning);
 			case "app.commandPalette.open":
-				return this.ctx.editor.getText().trim().length === 0;
+				return true;
 			case "app.model.cycleForward":
 			case "app.model.cycleBackward":
 				return this.ctx.session.getRoleModelCycleCandidateCount() > 1;

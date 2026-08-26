@@ -35,6 +35,7 @@ function createControllerContext(overrides: Partial<InteractiveModeContext> = {}
 		chatContainer: { children: [] },
 		goalModeController: { enabled: false, paused: false, handleCommand: () => {} },
 		planModeController: { enabled: true, paused: false, handleCommand: () => {} },
+		todoPhases: [],
 		showError: () => {},
 		showStatus: () => {},
 		historyStorage: { getRecent: () => [] },
@@ -140,7 +141,9 @@ describe("G003 WS2 red-team: command palette", () => {
 			editor: { getText: () => "draft", setText: () => {}, onSubmit: async () => {} } as never,
 			showStatus: status => statuses.push(status),
 		});
-		new InputController(nonempty).openCommandPalette();
+		const nonemptyController = new InputController(nonempty);
+		expect(nonemptyController.actionRegistry.isAvailable("app.commandPalette.open")).toBe(true);
+		nonemptyController.openCommandPalette();
 		expect(statuses).toEqual([]);
 
 		const order: string[] = [];
