@@ -96,8 +96,11 @@ describe("OAuth login URL hyperlink anchor", () => {
 });
 
 /** Drive the login flow far enough to capture what `onAuth` renders. */
-async function renderLoginRows(url: string): Promise<Component[]> {
+async function renderLoginRows(
+	url: string,
+): Promise<{ rendered: Component[]; pendingUrls: Array<string | undefined> }> {
 	const rendered: Component[] = [];
+	const pendingUrls: Array<string | undefined> = [];
 	const authStorage = {
 		listCredentialInventory: () => [],
 		listCredentialRemovalTargets: () => [],
@@ -115,13 +118,18 @@ async function renderLoginRows(url: string): Promise<Component[]> {
 		editor: {},
 		showStatus: () => {},
 		showError: () => {},
+		setOAuthUrlForCopy: (next: string | undefined) => {
+			pendingUrls.push(next);
+		},
+		hasOAuthUrlForCopy: () => false,
+		copyOAuthUrl: async () => {},
 		openInBrowser: () => {},
 		oauthManualInput: { waitForInput: async () => "", clear: () => {} },
 		session: { modelRegistry: { authStorage, getModelProfiles: () => new Map() } },
 	} as unknown as InteractiveModeContext;
 
 	await new SelectorController(ctx).showOAuthSelector("login", "anthropic");
-	return rendered;
+	return { rendered, pendingUrls };
 }
 
 describe("OAuth login row emission", () => {
@@ -139,7 +147,7 @@ describe("OAuth login row emission", () => {
 	});
 
 	it("renders the login URL as an anchored row whose every narrow-pane fragment is clickable", async () => {
-		const rendered = await renderLoginRows(URL);
+		const { rendered, pendingUrls } = await renderLoginRows(URL);
 
 		const urlRow = rendered.find(child => child instanceof Text && plainText(child.getText()) === URL);
 		expect(urlRow).toBeDefined();
@@ -148,10 +156,11 @@ describe("OAuth login row emission", () => {
 		expect(rows.length).toBeGreaterThan(1);
 		for (const row of rows) expect(urisIn(row)).toEqual([URL]);
 		expect(rows.map(fragment).join("")).toBe(URL);
+		expect(pendingUrls).toEqual([URL, undefined]);
 	});
 
 	it("leaves the adjacent short-label link row pointing at the same target", async () => {
-		const rendered = await renderLoginRows(URL);
+		const { rendered } = await renderLoginRows(URL);
 
 		const labelRow = rendered.find(
 			child => child instanceof Text && plainText(child.getText()) === "Click here to login",

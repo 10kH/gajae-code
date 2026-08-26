@@ -91,6 +91,8 @@ async function createContext(options?: {
 	const updatePendingMessagesDisplay = vi.fn();
 	const handleBashCommand = vi.fn(async () => {});
 	const showStatus = vi.fn();
+	const hasOAuthUrlForCopy = vi.fn(() => false);
+	const copyOAuthUrl = vi.fn(async () => {});
 	const onInputCallback = vi.fn();
 	const showHookSelector = vi.fn(async () => "Attach images" as string | undefined);
 	const toggleIrcSidebar = vi.fn();
@@ -325,6 +327,9 @@ async function createContext(options?: {
 		showWarning: vi.fn(),
 		showStatus,
 		showError: vi.fn(),
+		setOAuthUrlForCopy: vi.fn(),
+		hasOAuthUrlForCopy,
+		copyOAuthUrl,
 		showHookSelector,
 
 		hasActiveBtw: vi.fn(() => false),
@@ -345,6 +350,8 @@ async function createContext(options?: {
 			handleBashCommand,
 			showStatus,
 			showHookSelector,
+			hasOAuthUrlForCopy,
+			copyOAuthUrl,
 			queueCompactionMessage,
 			popLastQueuedMessage,
 			clearQueue,
@@ -392,6 +399,19 @@ describe("InputController keybinding setup", () => {
 		ctx.editor.setText("queue this");
 		await Promise.resolve();
 		expect(controller.actionRegistry.isAvailable("app.message.queue")).toBe(true);
+	});
+
+	it("exposes OAuth copy only while a pending URL is available", async () => {
+		const { InputController, ctx, spies } = await createContext();
+		const controller = new InputController(ctx);
+
+		expect(controller.actionRegistry.isAvailable("app.clipboard.copyOAuthUrl")).toBe(false);
+		spies.hasOAuthUrlForCopy.mockReturnValue(true);
+		await Promise.resolve();
+		expect(controller.actionRegistry.isAvailable("app.clipboard.copyOAuthUrl")).toBe(true);
+
+		expect(await controller.actionRegistry.execute("app.clipboard.copyOAuthUrl")).toBe(true);
+		expect(spies.copyOAuthUrl).toHaveBeenCalledTimes(1);
 	});
 
 	it("enables model cycling from configured role candidates without a model scope", async () => {

@@ -3497,10 +3497,14 @@ export class SelectorController {
 				providerId as OAuthProvider,
 				{
 					onAuth: (info: { url: string; instructions?: string }) => {
+						this.ctx.setOAuthUrlForCopy(info.url);
 						this.ctx.chatContainer.addChild(new Spacer(1));
 						this.ctx.chatContainer.addChild(new Text(theme.fg("dim", buildOAuthLoginAnchor(info.url)), 1, 0));
 						const hyperlink = buildOAuthLoginAnchor(info.url, "Click here to login");
 						this.ctx.chatContainer.addChild(new Text(theme.fg("accent", hyperlink), 1, 0));
+						this.ctx.chatContainer.addChild(
+							new Text(theme.fg("muted", "Command palette → Copy OAuth URL copies the URL exactly."), 1, 0),
+						);
 						if (info.instructions) {
 							this.ctx.chatContainer.addChild(new Spacer(1));
 							this.ctx.chatContainer.addChild(new Text(theme.fg("warning", info.instructions), 1, 0));
@@ -3565,6 +3569,7 @@ export class SelectorController {
 		} catch (error: unknown) {
 			this.ctx.showError(`Login failed: ${error instanceof Error ? error.message : String(error)}`);
 		} finally {
+			this.ctx.setOAuthUrlForCopy(undefined);
 			if (useManualInput) {
 				manualInput.clear(`Manual OAuth input cleared for ${providerId}`);
 			}

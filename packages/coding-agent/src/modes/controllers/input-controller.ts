@@ -145,6 +145,7 @@ export class InputController {
 			},
 			"app.clipboard.copyLine": () => this.handleCopyCurrentLine(),
 			"app.clipboard.copyPrompt": () => this.handleCopyPrompt(),
+			"app.clipboard.copyOAuthUrl": () => this.ctx.copyOAuthUrl(),
 			"app.session.new": async () => {
 				await this.ctx.handleClearCommand();
 			},
@@ -221,6 +222,8 @@ export class InputController {
 				);
 			case "app.clipboard.copyPrompt":
 				return this.ctx.editor.getText().length > 0;
+			case "app.clipboard.copyOAuthUrl":
+				return this.ctx.hasOAuthUrlForCopy();
 			case "app.session.tree":
 			case "app.session.fork":
 				return this.ctx.session.messages.length > 0;
@@ -733,6 +736,7 @@ export class InputController {
 		);
 		this.ctx.editor.onCopyPrompt = () => this.#executeAction("app.clipboard.copyPrompt");
 		this.#registerCommandPaletteAction("app.clipboard.copyPrompt", copyPrompt);
+		this.#registerCommandPaletteAction("app.clipboard.copyOAuthUrl", () => this.ctx.copyOAuthUrl(), true);
 		this.ctx.editor.onPasteText = (text, context) => this.handleTextPaste(text, context);
 		this.ctx.editor.onPastePendingInputCleared = (reason, restoredInputCount) => {
 			const reasonText = reason === "timeout" ? "timed out" : "exceeded the input queue limit";

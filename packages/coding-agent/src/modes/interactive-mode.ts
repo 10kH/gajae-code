@@ -431,6 +431,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	hookEditor: HookEditorComponent | undefined = undefined;
 	lastStatusSpacer: Spacer | undefined = undefined;
 	lastStatusText: Text | undefined = undefined;
+	#oauthUrlForCopy: string | undefined;
 	fileSlashCommands: Set<string> = new Set();
 	skillCommands: Map<string, Skill> = new Map();
 	oauthManualInput: OAuthManualInputManager = new OAuthManualInputManager();
@@ -1836,6 +1837,28 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	showWarning(message: string): void {
 		this.#uiHelpers.showWarning(message);
+	}
+
+	setOAuthUrlForCopy(url: string | undefined): void {
+		this.#oauthUrlForCopy = url;
+	}
+
+	hasOAuthUrlForCopy(): boolean {
+		return this.#oauthUrlForCopy !== undefined;
+	}
+
+	async copyOAuthUrl(): Promise<void> {
+		const url = this.#oauthUrlForCopy;
+		if (url === undefined) {
+			this.showStatus("No OAuth URL is available to copy.");
+			return;
+		}
+		try {
+			await copyToClipboard(url);
+			this.showStatus("OAuth URL copied to clipboard.");
+		} catch {
+			this.showWarning("Failed to copy OAuth URL to clipboard.");
+		}
 	}
 
 	#handleLspStartupEvent(event: LspStartupEvent): void {

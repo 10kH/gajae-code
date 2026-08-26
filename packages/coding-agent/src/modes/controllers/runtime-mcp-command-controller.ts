@@ -569,6 +569,7 @@ export class MCPCommandController {
 				},
 				{
 					onAuth: (info: { url: string; instructions?: string }) => {
+						this.ctx.setOAuthUrlForCopy(info.url);
 						// Show auth URL prominently in chat
 						this.ctx.chatContainer.addChild(new Spacer(1));
 						this.ctx.chatContainer.addChild(
@@ -605,7 +606,11 @@ export class MCPCommandController {
 								new Text(theme.fg("muted", "Alternative if browser did not open:"), 1, 0),
 							);
 							this.ctx.chatContainer.addChild(
-								new Text(theme.fg("success", "Copy this exact URL in your browser:"), 1, 0),
+								new Text(
+									theme.fg("success", "Use command palette → Copy OAuth URL to copy this exact URL:"),
+									1,
+									0,
+								),
 							);
 							this.ctx.chatContainer.addChild(new Text(theme.fg("accent", info.url), 1, 0));
 							this.ctx.ui.requestRender();
@@ -616,7 +621,11 @@ export class MCPCommandController {
 								new Text(theme.fg("warning", "→ Could not open browser automatically"), 1, 0),
 							);
 							this.ctx.chatContainer.addChild(
-								new Text(theme.fg("success", "Copy this exact URL in your browser:"), 1, 0),
+								new Text(
+									theme.fg("success", "Use command palette → Copy OAuth URL to copy this exact URL:"),
+									1,
+									0,
+								),
 							);
 							this.ctx.chatContainer.addChild(new Text(theme.fg("accent", info.url), 1, 0));
 							this.ctx.ui.requestRender();
@@ -674,6 +683,8 @@ export class MCPCommandController {
 			} else {
 				throw new Error(`OAuth authentication failed: ${errorMsg}`);
 			}
+		} finally {
+			this.ctx.setOAuthUrlForCopy(undefined);
 		}
 	}
 
