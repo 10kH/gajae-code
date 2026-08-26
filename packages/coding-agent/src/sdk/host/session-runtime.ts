@@ -3841,9 +3841,12 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	// Tool activity renews the deadline of EVERY prompt correlation attached to
 	// the active run — the root invocation plus any in-run consumed follow-ups
 	// sharing it — not only the head, or an attached correlation would
-	// false-fire prompt_deadline_exceeded during a long shared run (#4668).
+	// false-fire prompt_deadline_exceeded during a long shared run.
 	const renewAttributableProgress = (eventType: string, ctx: ExtensionContext): void => {
-		const current = lifecycleStateForContext(ctx, "agent_end");
+		// Tool events do not carry an SDK run token. Prefer the lifecycle-active
+		// runtime for the current session so a retained predecessor cannot make a
+		// live replacement look ambiguous and suppress its lease renewal.
+		const current = lifecycleStateForContext(ctx, "agent_start");
 		if (!current) return;
 		// Renew only invocations adopted by the CURRENT run: the live lifecycle
 		// batch plus in-run attachments. drainedInvocations may still hold
