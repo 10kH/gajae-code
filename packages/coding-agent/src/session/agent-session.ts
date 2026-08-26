@@ -18744,6 +18744,9 @@ export class AgentSession {
 					`Managed fallback retried the escaped non-ASCII tool-call turn ${MAX_ESCAPED_NONASCII_MANAGED_RETRIES} times without a literal-UTF-8 re-issue; ` +
 					`giving up on this model so the next eligible fallback can re-issue with literal UTF-8.`;
 				const controller = this.#defaultFallbackChain();
+				const controllerStateBeforeFailure = controller.snapshotRuntimeState();
+				const previousModel = this.model;
+				const previousThinkingLevel = this.thinkingLevel;
 				if (this.model) {
 					this.#escapedNonAsciiExhaustedModelKeys.add(`${this.model.provider}\u0000${this.model.id}`);
 				}
@@ -18753,7 +18756,16 @@ export class AgentSession {
 				const abortEpoch = this.#abortAdmissionEpoch;
 				if (
 					advanced &&
-					(await this.#advanceDefaultFallback(controller, "escaped_non_ascii", 1, cancellationSignal, abortEpoch))
+					(await this.#advanceDefaultFallback(
+						controller,
+						"escaped_non_ascii",
+						1,
+						cancellationSignal,
+						abortEpoch,
+						controllerStateBeforeFailure,
+						previousModel,
+						previousThinkingLevel,
+					))
 				) {
 					if (this.#abortAdmissionEpoch !== abortEpoch)
 						return { type: "terminal", terminal: { stopReason: "cancelled" } };
@@ -18906,8 +18918,27 @@ export class AgentSession {
 		attemptsUsed: number,
 		signal?: AbortSignal,
 		abortEpoch?: number,
+		rollbackState?: FallbackChainRuntimeState,
+		previousModel?: Model,
+		previousThinkingLevel?: ThinkingLevel,
 	): Promise<boolean> {
-		if (signal?.aborted || (abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch)) return false;
+		const rollbackCancelled = async (): Promise<boolean> => {
+			if (rollbackState) controller.restoreRuntimeState(rollbackState);
+			if (previousModel && this.model !== previousModel) {
+				const previousEditMode = this.#resolveActiveEditMode();
+				this.#setModelAuthoritatively(previousModel, "fallback-switch");
+				this.#thinkingLevel = previousThinkingLevel;
+				this.agent.setThinkingLevel(toReasoningEffort(previousThinkingLevel));
+				await this.#syncEditToolModeAfterModelChange(previousEditMode);
+			}
+			if (previousModel && this.model === previousModel && this.thinkingLevel !== previousThinkingLevel) {
+				this.#thinkingLevel = previousThinkingLevel;
+				this.agent.setThinkingLevel(toReasoningEffort(previousThinkingLevel));
+			}
+			return false;
+		};
+		if (signal?.aborted || (abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch))
+			return await rollbackCancelled();
 		while (!controller.isExhausted()) {
 			const selector = controller.currentSelector();
 			if (!selector) return false;
@@ -18957,7 +18988,6 @@ export class AgentSession {
 				controller.tried.at(-1)?.selector ?? controller.chain.entries[controller.activeIndex - 1] ?? selector;
 			const to = selector;
 			const previousEditMode = this.#resolveActiveEditMode();
-			const previousModel = this.model;
 			this.#escapedNonAsciiManagedRetries = 0;
 			this.#setModelAuthoritatively(resolved.model, "fallback-switch");
 			this.setThinkingLevel(
@@ -18965,9 +18995,7 @@ export class AgentSession {
 			);
 			await this.#syncEditToolModeAfterModelChange(previousEditMode);
 			if (signal?.aborted || (abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch)) {
-				if (previousModel && this.model !== previousModel)
-					this.#setModelAuthoritatively(previousModel, "fallback-switch");
-				return false;
+				return await rollbackCancelled();
 			}
 			if (from !== to) {
 				this.#emit({
@@ -19382,6 +19410,9 @@ export class AgentSession {
 			let advanced = outcome !== "advance";
 			let resolutionError: unknown;
 			if (outcome === "advance") {
+				const controllerStateBeforeAdvance = controller.snapshotRuntimeState();
+				const previousModel = this.model;
+				const previousThinkingLevel = this.thinkingLevel;
 				try {
 					advanced = await this.#advanceDefaultFallback(
 						controller,
@@ -19389,6 +19420,9 @@ export class AgentSession {
 						attemptsUsed,
 						cancellationSignal,
 						abortEpoch,
+						controllerStateBeforeAdvance,
+						previousModel,
+						previousThinkingLevel,
 					);
 				} catch (error) {
 					resolutionError = error;
