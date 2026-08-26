@@ -3303,6 +3303,36 @@ describe("post-acceptance invocation terminalization", () => {
 		}
 	});
 
+	test("terminalizes when provider end metadata exposes a throwing accessor", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-provider-throwing-metadata-"));
+		try {
+			const harness = await invocationHarness("provider-throwing-metadata", cwd, {
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await new Promise<void>(() => {});
+				},
+			});
+			const accepted = await harness.control("turn.prompt", { text: "provider metadata" });
+			expect(accepted.ok).toBe(true);
+			const ids = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
+			await harness.emit("agent_start");
+			const event = {} as Record<string, unknown>;
+			Object.defineProperty(event, "messages", {
+				get() {
+					throw new Error("provider metadata accessor failed");
+				},
+			});
+			await harness.emit("agent_end", event);
+			expect(await settledStatus(harness, "turn.prompt_status", ids)).toMatchObject({
+				status: "terminal_ok",
+			});
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("binds a delayed predecessor provider failure to its own batch after a replacement starts", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-delayed-provider-batch-"));
 		try {

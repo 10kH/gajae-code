@@ -1520,30 +1520,52 @@ function rejectionRecoveryIntent(error: unknown): { code: string; message: strin
  * to publish the additive failure diagnostic before terminal reconciliation.
  */
 function providerFailureFromAgentEnd(event: unknown): { code: string; message: string } | undefined {
-	if (!event || typeof event !== "object") return undefined;
-	const messages = (event as { messages?: unknown }).messages;
-	if (!Array.isArray(messages)) return undefined;
-	const lastAssistant = [...messages]
-		.reverse()
-		.find(message => message && typeof message === "object" && (message as { role?: unknown }).role === "assistant");
-	if (!lastAssistant || typeof lastAssistant !== "object") return undefined;
-	const assistant = lastAssistant as {
-		stopReason?: unknown;
-		errorStatus?: unknown;
-		transportFailure?: { status?: unknown };
-	};
-	if (assistant.stopReason !== "error") return undefined;
-	const status =
-		typeof assistant.errorStatus === "number" && Number.isSafeInteger(assistant.errorStatus)
-			? assistant.errorStatus
-			: typeof assistant.transportFailure?.status === "number" &&
-					Number.isSafeInteger(assistant.transportFailure.status)
-				? assistant.transportFailure.status
-				: undefined;
-	if (status === 402 || status === 429)
-		return { code: `provider_http_${status}`, message: "Prompt submission failed." };
-	if (status !== undefined) return { code: "provider_rejected", message: "Prompt submission failed." };
-	return { code: "provider_rejected", message: "Prompt submission failed." };
+	try {
+		if (!event || typeof event !== "object") return undefined;
+		const messages = (event as { messages?: unknown }).messages;
+		if (!Array.isArray(messages)) return undefined;
+		const lastAssistant = [...messages]
+			.reverse()
+			.find(
+				message => message && typeof message === "object" && (message as { role?: unknown }).role === "assistant",
+			);
+		if (!lastAssistant || typeof lastAssistant !== "object") return undefined;
+		const assistant = lastAssistant as {
+			stopReason?: unknown;
+			errorStatus?: unknown;
+			transportFailure?: { status?: unknown };
+		};
+		let stopReason: unknown;
+		try {
+			stopReason = assistant.stopReason;
+		} catch {
+			return undefined;
+		}
+		if (stopReason !== "error") return undefined;
+		let status: number | undefined;
+		try {
+			const errorStatus = assistant.errorStatus;
+			if (typeof errorStatus === "number" && Number.isSafeInteger(errorStatus)) status = errorStatus;
+		} catch {
+			// A malformed errorStatus is equivalent to a statusless provider error.
+		}
+		if (status === undefined) {
+			try {
+				const transportStatus = assistant.transportFailure?.status;
+				if (typeof transportStatus === "number" && Number.isSafeInteger(transportStatus)) status = transportStatus;
+			} catch {
+				// A throwing transport metadata accessor is also statusless.
+			}
+		}
+		if (status === 402 || status === 429)
+			return { code: `provider_http_${status}`, message: "Prompt submission failed." };
+		if (status !== undefined) return { code: "provider_rejected", message: "Prompt submission failed." };
+		return { code: "provider_rejected", message: "Prompt submission failed." };
+	} catch {
+		// Provider metadata is untrusted: an SDK/provider adapter may expose a
+		// throwing getter while the lifecycle boundary still needs to terminalize.
+		return undefined;
+	}
 }
 
 function createControlSurface(
@@ -3113,6 +3135,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					kind: InvocationKind;
 					correlation: InvocationCorrelation;
 					connectionId: string | undefined;
+					sdkRunToken: string;
 				}>;
 				registerBroker: () => Promise<void>;
 				quiesceInput: () => void;
@@ -3127,6 +3150,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						kind: InvocationKind;
 						correlation: InvocationCorrelation;
 						connectionId: string | undefined;
+						sdkRunToken: string;
 					}>;
 					attachedInvocations: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }>;
 				}>;
@@ -3147,7 +3171,12 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	const retiredLifecycleOwners = new Map<string, RuntimeState[]>();
 	const retiredLifecycleOwnerTimers = new Map<RuntimeState, ReturnType<typeof setTimeout>>();
 	const ambiguousLifecycleIdentities = new Set<string>();
-	const lifecycleRunOwners = new Map<string, { state: RuntimeState; batch?: LifecycleBatch }>();
+	const lifecycleRunOwners = new Map<
+		string,
+		{ state: RuntimeState; batch?: LifecycleBatch; correlationKey?: string }
+	>();
+	const lifecycleCorrelationKey = (correlation: InvocationCorrelation): string =>
+		`${correlation.commandId}:${correlation.turnId}`;
 	const sessionIdentityForContext = (ctx: ExtensionContext): string | undefined => {
 		const sessionId = ctx.sessionManager.getSessionId();
 		const sessionFile = ctx.sessionManager.getSessionFile?.();
@@ -3218,6 +3247,54 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		)
 			return;
 		removeRetiredLifecycleOwner(owner);
+	};
+	const removeLifecycleTokenAliases = (owner: RuntimeState, correlation: InvocationCorrelation): void => {
+		const target = lifecycleCorrelationKey(correlation);
+		for (const [token, binding] of lifecycleRunOwners) {
+			if (binding.state === owner && binding.correlationKey === target) lifecycleRunOwners.delete(token);
+		}
+	};
+	const removeLifecycleReferences = (owner: RuntimeState, correlation: InvocationCorrelation): void => {
+		const target = lifecycleCorrelationKey(correlation);
+		owner.pending = owner.pending.filter(entry => lifecycleCorrelationKey(entry.correlation) !== target);
+		for (const batch of owner.openLifecycleBatches) {
+			batch.invocations = batch.invocations.filter(entry => lifecycleCorrelationKey(entry.correlation) !== target);
+			batch.attachedInvocations = batch.attachedInvocations.filter(
+				entry => lifecycleCorrelationKey(entry.correlation) !== target,
+			);
+		}
+		owner.openLifecycleBatches = owner.openLifecycleBatches.filter(
+			batch => batch.invocations.length > 0 || batch.attachedInvocations.length > 0,
+		);
+		owner.drainedInvocations = owner.drainedInvocations?.filter(
+			entry => lifecycleCorrelationKey(entry.correlation) !== target,
+		);
+		owner.attachedInvocations = owner.attachedInvocations?.filter(
+			entry => lifecycleCorrelationKey(entry.correlation) !== target,
+		);
+		if (owner.activeInvocation && lifecycleCorrelationKey(owner.activeInvocation.correlation) === target) {
+			const replacement =
+				owner.openLifecycleBatches.flatMap(batch => batch.invocations)[0] ?? owner.attachedInvocations?.[0];
+			owner.activeInvocation = replacement
+				? { kind: replacement.kind, correlation: replacement.correlation }
+				: undefined;
+		}
+		removeLifecycleTokenAliases(owner, correlation);
+		if (owner === active) {
+			const owners = new Set<string>();
+			const activeBatch = owner.activeInvocation
+				? owner.openLifecycleBatches.find(batch =>
+						batch.invocations.some(
+							entry =>
+								lifecycleCorrelationKey(entry.correlation) ===
+								lifecycleCorrelationKey(owner.activeInvocation!.correlation),
+						),
+					)
+				: undefined;
+			for (const entry of activeBatch?.invocations ?? [])
+				if (entry.connectionId !== undefined) owners.add(entry.connectionId);
+			activePromptOwnerHolder.connectionIds = owners.size > 0 ? owners : undefined;
+		}
 	};
 	// Shared with the control surface's terminal abort: the correlated
 	// agent_end publication capture (AC 19). terminalAbort installs a fresh
@@ -3571,6 +3648,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				const failedKeys = new Set(failedTransitions.map(({ correlation }) => correlationKey(correlation)));
 				for (const invocation of transitions) {
 					if (!failedKeys.has(correlationKey(invocation.correlation)))
+						removeLifecycleReferences(current, invocation.correlation);
+					if (!failedKeys.has(correlationKey(invocation.correlation)))
 						current.failureDiagnosticKeys.delete(correlationKey(invocation.correlation));
 				}
 				options.onFailureDiagnosticKeyCountForTests?.(current.failureDiagnosticKeys.size);
@@ -3594,6 +3673,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				const index = current.openLifecycleBatches.indexOf(ended);
 				if (index >= 0) current.openLifecycleBatches.splice(index, 1);
 			}
+			for (const invocation of transitions) removeLifecycleReferences(current, invocation.correlation);
 			for (const invocation of transitions)
 				current.failureDiagnosticKeys.delete(correlationKey(invocation.correlation));
 			options.onFailureDiagnosticKeyCountForTests?.(current.failureDiagnosticKeys.size);
@@ -3618,11 +3698,20 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				undefined,
 				owner ? { state: owner, sessionId: owner.sessionId } : undefined,
 			);
-			if (owner && typeof event.sdkRunToken === "string" && event.sdkRunToken.length > 0)
+			if (owner && typeof event.sdkRunToken === "string" && event.sdkRunToken.length > 0) {
+				const batch = owner.openLifecycleBatches.at(-1);
+				const entry = batch?.invocations.find(item => item.sdkRunToken === event.sdkRunToken);
+				const previous = lifecycleRunOwners.get(event.sdkRunToken);
 				lifecycleRunOwners.set(event.sdkRunToken, {
 					state: owner,
-					batch: owner.openLifecycleBatches.at(-1),
+					batch,
+					...(previous?.correlationKey !== undefined
+						? { correlationKey: previous.correlationKey }
+						: entry
+							? { correlationKey: lifecycleCorrelationKey(entry.correlation) }
+							: {}),
 				});
+			}
 		}, owner);
 	});
 	api.on("agent_end", (event, ctx) => {
@@ -3787,17 +3876,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				return typeof v === "number" && Number.isFinite(v) ? v : 21_600_000;
 			},
 			onExpired: correlation => {
-				const idx = pending.findIndex(
-					entry =>
-						entry.correlation.commandId === correlation.commandId &&
-						entry.correlation.turnId === correlation.turnId,
-				);
-				if (idx >= 0) {
-					const [removed] = pending.splice(idx, 1);
-					if (removed && lifecycleRunOwners.get(removed.sdkRunToken)?.state === lifecycleRuntimeState)
-						lifecycleRunOwners.delete(removed.sdkRunToken);
-				}
-				if (lifecycleRuntimeState) maybeRetireLifecycleOwner(lifecycleRuntimeState);
+				const owner = lifecycleOwnerHolder.state;
+				if (!owner) return;
+				removeLifecycleReferences(owner, correlation);
+				maybeRetireLifecycleOwner(owner);
 			},
 		});
 		const pending: Array<{
@@ -3814,6 +3896,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				kind: InvocationKind;
 				correlation: InvocationCorrelation;
 				connectionId: string | undefined;
+				sdkRunToken: string;
 			}>;
 			attachedInvocations: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }>;
 		}> = [];
@@ -3844,7 +3927,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		});
 		const queryHandlers = new QueryHandlers(surfaceFactory.query, sessionId, revisions, cursors);
 		const inputGate = { quiescing: false };
-		let lifecycleRuntimeState: RuntimeState | undefined;
+		const lifecycleOwnerHolder: { state?: RuntimeState; quiescing: boolean } = { quiescing: false };
 		let runtime: SessionSdkSessionRuntime;
 		// Durable-first bounded terminalization for accepted submissions that leave
 		// their queue or race a run WITHOUT consumption (exact-head review: clearing
@@ -3858,6 +3941,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			correlation: InvocationCorrelation,
 			error: { code: string; message: string },
 		): void => {
+			if (lifecycleOwnerHolder.state) removeLifecycleTokenAliases(lifecycleOwnerHolder.state, correlation);
 			const attempt = async (remaining: number): Promise<void> => {
 				try {
 					// 1. Record the failure reason durably FIRST. If this write fails,
@@ -3909,8 +3993,19 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			api,
 			reconciliation,
 			(kind, correlation, connectionId, startsOwnTurn, sdkRunToken) => {
-				if (sdkRunToken && lifecycleRuntimeState)
-					lifecycleRunOwners.set(sdkRunToken, { state: lifecycleRuntimeState });
+				const owner = lifecycleOwnerHolder.state;
+				if (lifecycleOwnerHolder.quiescing) {
+					terminalizeAbandonedSubmission(kind, correlation, {
+						code: "session_quiescing",
+						message: "Session endpoint was replaced before the invocation started.",
+					});
+					return;
+				}
+				if (sdkRunToken && owner)
+					lifecycleRunOwners.set(sdkRunToken, {
+						state: owner,
+						correlationKey: lifecycleCorrelationKey(correlation),
+					});
 				// Only submissions that start their OWN turn get a pending entry: a
 				// steering-queued submission consumed inside the current run never
 				// emits the agent_start that would consume the entry, so leaving it
@@ -3931,9 +4026,21 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			steerReconciliation,
 			(kind, correlation, connectionId, sdkRunToken, promotion) => {
 				const bindPromotedToken = (batch?: LifecycleBatch): void => {
-					if (sdkRunToken && lifecycleRuntimeState)
-						lifecycleRunOwners.set(sdkRunToken, { state: lifecycleRuntimeState, batch });
+					const owner = lifecycleOwnerHolder.state;
+					if (sdkRunToken && owner)
+						lifecycleRunOwners.set(sdkRunToken, {
+							state: owner,
+							batch,
+							correlationKey: lifecycleCorrelationKey(correlation),
+						});
 				};
+				if (lifecycleOwnerHolder.quiescing) {
+					terminalizeAbandonedSubmission(kind, correlation, {
+						code: "session_quiescing",
+						message: "Session endpoint was replaced before the invocation started.",
+					});
+					return;
+				}
 				// Lease at the ACTUAL promotion boundary (#4668 review): a promoted
 				// submission that wedges before its run's agent_start must still
 				// terminalize boundedly instead of remaining accepted forever.
@@ -4062,11 +4169,13 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				// the matching correlation so a later agent-initiated turn never
 				// inherits the failed submission's connection as owner (review
 				// thread P1).
-				const index = pending.findIndex(entry => entry.correlation === correlation);
-				if (index >= 0) {
-					const [removed] = pending.splice(index, 1);
-					if (removed && lifecycleRunOwners.get(removed.sdkRunToken)?.state === lifecycleRuntimeState)
-						lifecycleRunOwners.delete(removed.sdkRunToken);
+				if (!lifecycleOwnerHolder.quiescing) {
+					const index = pending.findIndex(entry => entry.correlation === correlation);
+					if (index >= 0) {
+						const [removed] = pending.splice(index, 1);
+						if (removed && lifecycleRunOwners.get(removed.sdkRunToken)?.state === lifecycleOwnerHolder.state)
+							lifecycleRunOwners.delete(removed.sdkRunToken);
+					}
 				}
 				// Release the acceptance-anchored lease ONLY when the durable row is
 				// already terminal (exact-head review #4): clearing it before the
@@ -4302,7 +4411,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				logger.warn(`sdk broker registration unavailable: ${String(error)}`);
 			}
 		};
-		lifecycleRuntimeState = active = {
+		const runtimeOwner: RuntimeState = {
 			sessionId,
 			sessionIdentity,
 			runtime,
@@ -4316,6 +4425,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			registerBroker,
 			quiesceInput: () => {
 				inputGate.quiescing = true;
+				lifecycleOwnerHolder.quiescing = true;
 			},
 			fenceGateResolutions: () => {
 				acceptingGateResolutions = false;
@@ -4327,6 +4437,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			failureDiagnosticKeys: new Set(),
 			lifecycleTasks: new Set(),
 		};
+		lifecycleOwnerHolder.state = runtimeOwner;
+		active = runtimeOwner;
 		try {
 			await runtime.start();
 			await registerBroker();
@@ -4340,7 +4452,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					code: errorCode(cleanupError),
 					error: String(cleanupError),
 				});
-				active = {
+				const failedRuntimeOwner: RuntimeState = {
 					sessionId,
 					sessionIdentity,
 					runtime,
@@ -4354,6 +4466,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					registerBroker,
 					quiesceInput: () => {
 						inputGate.quiescing = true;
+						lifecycleOwnerHolder.quiescing = true;
 					},
 					fenceGateResolutions: () => {
 						acceptingGateResolutions = false;
@@ -4365,6 +4478,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					failureDiagnosticKeys: new Set(),
 					lifecycleTasks: new Set(),
 				};
+				lifecycleOwnerHolder.state = failedRuntimeOwner;
+				active = failedRuntimeOwner;
 				throw new AggregateError([error, cleanupError], "SDK runtime startup failed and cleanup failed.");
 			}
 			cursors.close();
@@ -4429,6 +4544,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			current.disposeGate?.();
 			await current.runtime.stop();
 		} catch (error) {
+			// Keep the immutable owner available for a retry when transport teardown
+			// fails after quiescing. Clearing `active` before stop prevents a second
+			// shutdown from retrying the failed endpoint removal.
+			if (active === undefined) active = current;
 			logger.error("sdk runtime stop failed", { code: errorCode(error), error: String(error) });
 			throw error;
 		}
