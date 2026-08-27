@@ -308,7 +308,10 @@ function parseSessionLine(line: string): GjcTmuxSessionStatus | null {
 
 /** tmux failure shapes that mean "this socket has no server", not "tmux is broken". */
 function isMissingServerFailure(message: string): boolean {
-	return message.includes("no server running") || message.includes("failed to connect to server");
+	return (
+		message.includes("no server running") ||
+		(message.includes("failed to connect to server") && /(?:no such file or directory|not found)/iu.test(message))
+	);
 }
 
 function isMissingSocketFailure(message: string): boolean {

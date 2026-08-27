@@ -191,6 +191,21 @@ describe("GJC tmux session management", () => {
 		expect(listGjcTmuxSessions({ GJC_TMUX_COMMAND: "tmux-test" })).toEqual([]);
 	});
 
+	it("propagates permission and transport failures that use failed-connect diagnostics", () => {
+		let stderr = "failed to connect to server: Permission denied";
+		spyOn(Bun, "spawnSync").mockImplementation(((command: unknown) => {
+			if (!spawnArgv(command).includes("list-sessions")) return spawnResult(0, "");
+			return spawnResult(1, "", stderr);
+		}) as never);
+		clearPsmuxDetectionCache();
+
+		expect(() => listGjcTmuxSessions({ GJC_TMUX_COMMAND: "tmux-test" })).toThrow(stderr);
+
+		stderr = "failed to connect to server: Connection refused";
+		clearPsmuxDetectionCache();
+		expect(() => listGjcTmuxSessions({ GJC_TMUX_COMMAND: "tmux-test" })).toThrow(stderr);
+	});
+
 	// A terminal host that emulates tmux for its own agents can export a `$TMUX`
 	// naming a socket it never created. tmux then fails with `error connecting
 	// to <socket>`, which shares its shape with a legitimate "no server" miss —
