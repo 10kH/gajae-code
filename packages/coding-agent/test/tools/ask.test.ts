@@ -737,12 +737,11 @@ describe("AskTool remote semantic settlements", () => {
 				undefined,
 				abortableUi(abort),
 			),
-		).rejects.toThrow("Ask cancelled after 4 attempts");
+		).rejects.toThrow("Ask tool was cancelled by the user");
 
-		expect(remoteCalls).toBe(4);
-		expect(settlements).toHaveLength(4);
+		expect(remoteCalls).toBe(3);
+		expect(settlements).toHaveLength(3);
 		expect(settlements).toEqual([
-			{ kind: "invalid", reason: "empty_custom" },
 			{ kind: "invalid", reason: "empty_custom" },
 			{ kind: "invalid", reason: "empty_custom" },
 			{ kind: "invalid", reason: "empty_custom" },
@@ -776,10 +775,10 @@ describe("AskTool remote semantic settlements", () => {
 				undefined,
 				abortableUi(),
 			),
-		).rejects.toThrow("Ask cancelled after 4 attempts");
+		).rejects.toThrow("Ask tool was cancelled by the user");
 		clearTimeout(timer);
 		expect(timerRan).toBe(true);
-		expect(remoteCalls).toBe(4);
+		expect(remoteCalls).toBe(3);
 	});
 
 	it("awaits a committed visible acknowledgement before returning the answer", async () => {

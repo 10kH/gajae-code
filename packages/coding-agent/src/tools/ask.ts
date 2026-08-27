@@ -114,7 +114,7 @@ const HEADLESS_CHECKBOX_CHECKED = "[x]";
 const HEADLESS_CHECKBOX_UNCHECKED = "[ ]";
 const DEEP_INTERVIEW_SELECTOR_SCROLL_TITLE_ROWS = Number.MAX_SAFE_INTEGER;
 const DEEP_INTERVIEW_RECORDER_AWAIT_TIMEOUT_MS = 250;
-export const MAX_EMPTY_CUSTOM_RETRIES = 3;
+export const MAX_EMPTY_CUSTOM_ATTEMPTS = 3;
 const EMPTY_CUSTOM_RETRY_MESSAGE = "Custom input cannot be empty. Enter text or cancel the ask.";
 
 function errorMessage(error: unknown): string {
@@ -330,7 +330,7 @@ interface UIContext {
 			onLeft?: () => void;
 			onRight?: () => void;
 			helpText?: string;
-			customInput?: { optionLabel: string; onSubmit: (text: string) => void };
+			customInput?: { optionLabel: string; onSubmit: (text: string) => void; allowEmpty?: boolean };
 			clarificationInput?: { optionLabel: string; onSubmit: (text: string) => void; allowEmpty?: boolean };
 		},
 	): Promise<string | undefined>;
@@ -406,6 +406,7 @@ async function askSingleQuestion(
 			helpText,
 			customInput: {
 				optionLabel: otherOptionLabel,
+				allowEmpty: false,
 				onSubmit: (text: string) => {
 					inlineInput = text;
 				},
@@ -1113,12 +1114,12 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			options?: {
 				previous?: QuestionResult;
 				navigation?: NavigationControls;
-				emptyCustomRetryCount?: number;
+				emptyCustomAttempt?: number;
 			},
 		) => {
 			const rawOptionLabels = q.options.map(o => o.label);
 			const questionIndex = params.questions.indexOf(q);
-			const emptyCustomRetryCount = options?.emptyCustomRetryCount ?? 0;
+			const emptyCustomAttempt = options?.emptyCustomAttempt ?? 0;
 			// Route headless asks through the SDK workflow-gate emitter; a connected
 			// SDK responder supplies the durable answer instead of an interactive UI.
 			if (gateEmitter && canUseWorkflowGate) {
@@ -1150,8 +1151,8 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				const isDeepInterviewQuestion = deepInterviewPrompt !== null || q.deepInterview !== undefined;
 				const baseDisplayQuestion = deepInterviewPrompt ?? q.question;
 				const displayQuestion =
-					emptyCustomRetryCount > 0
-						? `${baseDisplayQuestion}\n\n${EMPTY_CUSTOM_RETRY_MESSAGE} (attempt ${emptyCustomRetryCount + 1} of ${MAX_EMPTY_CUSTOM_RETRIES + 1})`
+					emptyCustomAttempt > 0
+						? `${baseDisplayQuestion}\n\n${EMPTY_CUSTOM_RETRY_MESSAGE} (attempt ${emptyCustomAttempt + 1} of ${MAX_EMPTY_CUSTOM_ATTEMPTS})`
 						: baseDisplayQuestion;
 				const shouldNumberOptions = isDeepInterviewQuestion || isDeepInterviewAskQuestion(q.question);
 				const optionLabels = shouldNumberOptions ? numberOptionLabels(rawOptionLabels) : rawOptionLabels;
@@ -1276,19 +1277,24 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 					await settleActiveRemote(settlement);
 					activeRemoteRequest = undefined;
 					if (settlement.kind === "invalid") {
-						if (emptyCustomRetryCount >= MAX_EMPTY_CUSTOM_RETRIES) {
-							context?.abort();
-							throw new ToolAbortError(
-								`${EMPTY_CUSTOM_RETRY_MESSAGE} Ask cancelled after ${MAX_EMPTY_CUSTOM_RETRIES + 1} attempts.`,
-							);
+						if (emptyCustomAttempt + 1 >= MAX_EMPTY_CUSTOM_ATTEMPTS) {
+							return {
+								optionLabels: rawOptionLabels,
+								selectedOptions: [] as string[],
+								customInput: undefined,
+								clarificationQuestion: undefined,
+								navigation: undefined,
+								cancelled: true,
+								timedOut: false,
+							};
 						}
 						// A remote source may resolve synchronously. Yield to a timer queue
 						// between retries so repeated invalid answers cannot starve the
 						// event loop indefinitely.
-						await Bun.sleep(0);
+						await Bun.sleep(1);
 						return askQuestion(q, {
 							...options,
-							emptyCustomRetryCount: emptyCustomRetryCount + 1,
+							emptyCustomAttempt: emptyCustomAttempt + 1,
 						});
 					}
 				}
