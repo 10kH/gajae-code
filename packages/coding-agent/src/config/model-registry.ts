@@ -750,7 +750,7 @@ export function mergeDiscoveredModel<TApi extends Api>(
 		return {
 			...model,
 			baseUrl: providerOverride?.baseUrl ?? model.baseUrl ?? existing.baseUrl,
-			headers: existing.headers ? { ...existing.headers, ...model.headers } : model.headers,
+			headers: mergeCaseInsensitiveHeaders(existing.headers, model.headers),
 			requestTransform: mergeRequestTransform(
 				mergeRequestTransform(existing.requestTransform, model.requestTransform),
 				providerOverride?.requestTransform,
@@ -762,7 +762,7 @@ export function mergeDiscoveredModel<TApi extends Api>(
 		return {
 			...model,
 			baseUrl: providerOverride.baseUrl ?? model.baseUrl,
-			headers: providerOverride.headers ? { ...model.headers, ...providerOverride.headers } : model.headers,
+			headers: mergeCaseInsensitiveHeaders(model.headers, providerOverride.headers),
 			...(providerOverride.transport !== undefined ? { transport: providerOverride.transport } : {}),
 			requestTransform: mergeRequestTransform(model.requestTransform, providerOverride.requestTransform),
 		};
@@ -1206,7 +1206,11 @@ function mergeCaseInsensitiveHeaders(
 	baseHeaders: Record<string, string> | undefined,
 	overrideHeaders: Record<string, string> | undefined,
 ): Record<string, string> | undefined {
-	const merged = { ...(baseHeaders ?? {}) };
+	const merged: Record<string, string> = {};
+	for (const [key, value] of Object.entries(baseHeaders ?? {})) {
+		if (key.toLowerCase() === "authorization") deleteHeaderCaseInsensitive(merged, "Authorization");
+		merged[key] = value;
+	}
 	for (const [key, value] of Object.entries(overrideHeaders ?? {})) {
 		if (key.toLowerCase() === "authorization") deleteHeaderCaseInsensitive(merged, "Authorization");
 		merged[key] = value;
