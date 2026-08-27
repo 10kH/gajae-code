@@ -28,6 +28,7 @@ import {
 	runPackageManagerUpdateForTest,
 	runPostUpdateRecoveryForTest,
 	runUpdateCommand,
+	verifyMigrationTargetAdapterForTest,
 	verifyMigrationTargetForTest,
 } from "../src/cli/update-cli";
 import { Settings } from "../src/config/settings";
@@ -573,6 +574,24 @@ describe("update-cli managed notification recovery", () => {
 			});
 			expect(calls).toEqual(["checksum"]);
 			expect(result).toEqual({ ok: false, path: target.path });
+		});
+
+		it("passes the release tag, binary asset, and target path to checksum verification", async () => {
+			const checksumCalls: Array<{ tag: string; assetName: string; filePath: string }> = [];
+			const result = await verifyMigrationTargetAdapterForTest({
+				release,
+				runtimePath: target.path,
+				verifyChecksum: async options => {
+					checksumCalls.push(options);
+				},
+				verifyRuntime: async (expectedVersion, runtimePath) => ({
+					ok: true,
+					actual: expectedVersion,
+					path: runtimePath,
+				}),
+			});
+			expect(checksumCalls).toEqual([{ tag: release.tag, assetName: "gjc-linux-x64", filePath: target.path }]);
+			expect(result).toEqual({ ok: true, actual: release.version, path: target.path });
 		});
 
 		it("keeps a checksum-valid but stale or smoke-failing target on the migration path", async () => {

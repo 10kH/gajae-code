@@ -513,6 +513,14 @@ interface MigrationTargetVerificationOptions {
 	verifyRuntime: () => Promise<InstalledVersionVerification>;
 }
 
+interface MigrationChecksumOptions {
+	tag: string;
+	assetName: string;
+	filePath: string;
+}
+
+type MigrationChecksumVerifier = (options: MigrationChecksumOptions) => Promise<unknown>;
+
 async function verifyMigrationTargetWith(
 	options: MigrationTargetVerificationOptions,
 ): Promise<InstalledVersionVerification> {
@@ -524,17 +532,25 @@ async function verifyMigrationTargetWith(
 	return await options.verifyRuntime();
 }
 
-async function verifyMigrationTarget(release: ReleaseInfo, runtimePath: string): Promise<InstalledVersionVerification> {
+async function verifyMigrationTarget(
+	release: Pick<ReleaseInfo, "tag" | "version">,
+	runtimePath: string,
+	verifyChecksum: MigrationChecksumVerifier = verifyDownloadedBinaryChecksum,
+	verifyRuntime: (
+		expectedVersion: string,
+		runtimePath: string,
+	) => Promise<InstalledVersionVerification> = verifyInstalledRuntime,
+): Promise<InstalledVersionVerification> {
 	return await verifyMigrationTargetWith({
 		runtimePath,
 		verifyChecksum: async () => {
-			await verifyDownloadedBinaryChecksum({
+			await verifyChecksum({
 				tag: release.tag,
 				assetName: getBinaryName(),
 				filePath: runtimePath,
 			});
 		},
-		verifyRuntime: async () => await verifyInstalledRuntime(release.version, runtimePath),
+		verifyRuntime: async () => await verifyRuntime(release.version, runtimePath),
 	});
 }
 
@@ -542,6 +558,20 @@ export async function verifyMigrationTargetForTest(
 	options: MigrationTargetVerificationOptions,
 ): Promise<InstalledVersionVerification> {
 	return await verifyMigrationTargetWith(options);
+}
+
+export async function verifyMigrationTargetAdapterForTest(options: {
+	release: Pick<ReleaseInfo, "tag" | "version">;
+	runtimePath: string;
+	verifyChecksum: MigrationChecksumVerifier;
+	verifyRuntime: (expectedVersion: string, runtimePath: string) => Promise<InstalledVersionVerification>;
+}): Promise<InstalledVersionVerification> {
+	return await verifyMigrationTarget(
+		options.release,
+		options.runtimePath,
+		options.verifyChecksum,
+		options.verifyRuntime,
+	);
 }
 
 function printRestartGuidance(): void {
