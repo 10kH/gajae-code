@@ -1178,7 +1178,12 @@ function acceptedRegistryFromState(
 	state: RegistryState,
 ): AcceptedModelPresetRegistry {
 	state = recoverStateForRead(state, effectiveTrustedKeys(dependencies, agentDir));
-	const revision = control.pinnedRevision ?? state.activeRevision;
+	const pinnedGeneration =
+		control.pinnedRevision === undefined
+			? undefined
+			: state.history.find(item => item.manifest.signed.registryRevision === control.pinnedRevision);
+	const staleRevokedPin = pinnedGeneration?.revoked === true;
+	const revision = staleRevokedPin ? state.activeRevision : (control.pinnedRevision ?? state.activeRevision);
 	const generation = state.history.find(item => item.manifest.signed.registryRevision === revision);
 	if (revision !== undefined && !generation)
 		throw new Error(`Registry selected revision ${revision} is missing from accepted history.`);
@@ -1205,7 +1210,7 @@ function acceptedRegistryFromState(
 		retainedProfiles: valid.retainedProfiles.map(profile => profile.id),
 		retainedPresets: valid.retainedPresets.map(preset => `${preset.provider}/${preset.id}`),
 		disabled: false,
-		pinnedRevision: control.pinnedRevision,
+		pinnedRevision: staleRevokedPin ? undefined : control.pinnedRevision,
 	};
 }
 
@@ -2198,7 +2203,12 @@ export function getModelPresetRegistryStatus(
 		loadError = safeError(error);
 	}
 	const disabled = control.disabled || environmentDisabled();
-	const revision = control.pinnedRevision ?? state.activeRevision;
+	const pinnedGeneration =
+		control.pinnedRevision === undefined
+			? undefined
+			: state.history.find(item => item.manifest.signed.registryRevision === control.pinnedRevision);
+	const staleRevokedPin = pinnedGeneration?.revoked === true;
+	const revision = staleRevokedPin ? state.activeRevision : (control.pinnedRevision ?? state.activeRevision);
 	const generation = state.history.find(item => item.manifest.signed.registryRevision === revision);
 	let valid: AcceptedGeneration | undefined;
 	if (revision !== undefined && !generation) {
@@ -2231,7 +2241,7 @@ export function getModelPresetRegistryStatus(
 		lastCheckedAt: state.lastCheckedAt,
 		lastError: loadError ?? state.lastError,
 		disabled,
-		pinnedRevision: control.pinnedRevision,
+		pinnedRevision: staleRevokedPin ? undefined : control.pinnedRevision,
 		retainedProfiles: valid?.retainedProfiles.map(profile => profile.id) ?? [],
 		retainedPresets: valid?.retainedPresets.map(preset => `${preset.provider}/${preset.id}`) ?? [],
 		historyRevisions: state.history

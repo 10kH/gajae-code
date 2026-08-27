@@ -4935,8 +4935,10 @@ export class ModelRegistry {
 	}
 
 	#refreshRotatingConfigApiKey(provider: string): void {
-		const envName =
-			this.#runtimeProviderApiKeyEnvNames.get(provider) ?? this.#customProviderApiKeyEnvNames.get(provider);
+		const runtimeOwned = this.#runtimeProviderApiKeys.has(provider);
+		const envName = runtimeOwned
+			? this.#runtimeProviderApiKeyEnvNames.get(provider)
+			: this.#customProviderApiKeyEnvNames.get(provider);
 		if (!envName) return;
 		const resolved = $rotatingCredentialEnv(envName);
 		if (resolved === this.#customProviderApiKeys.get(provider)) return;
@@ -4945,7 +4947,8 @@ export class ModelRegistry {
 			this.authStorage.removeConfigApiKey(provider);
 		} else {
 			this.#customProviderApiKeys.set(provider, resolved);
-			this.authStorage.setConfigApiKey(provider, resolved, { envSourced: true });
+			if (runtimeOwned) this.authStorage.setConfigApiKey(provider, resolved);
+			else this.authStorage.setConfigApiKey(provider, resolved, { envSourced: true });
 		}
 		const authHeader =
 			this.#runtimeProviderAuthHeaders.get(provider) ?? this.#customProviderAuthHeaders.get(provider);
