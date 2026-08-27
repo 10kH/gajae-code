@@ -2949,6 +2949,7 @@ export class ModelRegistry {
 		const combined = this.#mergeCustomModels(withConfigModels, this.#runtimeModelOverlays);
 		const withModelOverrides = this.#applyModelOverrides(combined, this.#modelOverrides);
 		this.#models = this.#finalizeModels(this.#applyRuntimeProviderOverrides(withModelOverrides));
+		this.#recordGeneratedAuthHeaders();
 		this.#rebuildCanonicalIndex();
 	}
 
@@ -4050,11 +4051,14 @@ export class ModelRegistry {
 				? withTransportOverride
 				: { ...withTransportOverride, ...(sanitizedBaseUrl === undefined ? {} : { baseUrl: sanitizedBaseUrl }) };
 		const modelCompat = this.#modelOverrides.get(model.provider.toLowerCase())?.get(model.id.toLowerCase())?.compat;
-		return enrichModelThinking(
+		const result = enrichModelThinking(
 			modelCompat
 				? { ...sanitizedTransport, compat: mergeCompat(sanitizedTransport.compat, modelCompat) }
 				: sanitizedTransport,
 		);
+		const generated = this.#generatedAuthHeaders.get(model);
+		if (generated) this.#generatedAuthHeaders.set(result, generated);
+		return result;
 	}
 	#applyRuntimeProviderOverrides(models: Model<Api>[]): Model<Api>[] {
 		if (this.#runtimeProviderOverrides.size === 0) return models;
@@ -5219,6 +5223,29 @@ export class ModelRegistry {
 			const nextModels = this.#models.filter(m => m.provider !== providerName);
 			for (const overlay of newOverlays) {
 				nextModels.push(finalizeCustomModel(overlay, { useDefaults: true }));
+			}
+			if (
+				config.baseUrl ||
+				config.headers ||
+				config.apiKey ||
+				config.authHeader !== undefined ||
+				config.compat !== undefined ||
+				config.requestTransform !== undefined ||
+				config.transport !== undefined
+			) {
+				this.#runtimeProviderOverrides.set(
+					providerName,
+					this.#mergeProviderOverride(this.#runtimeProviderOverrides.get(providerName), {
+						api: config.api,
+						baseUrl: config.baseUrl,
+						headers: config.headers,
+						apiKey: config.apiKey ? resolveApiKeyConfig(config.apiKey) : undefined,
+						authHeader: config.authHeader,
+						compat: config.compat,
+						requestTransform: config.requestTransform,
+						transport: config.transport,
+					}),
+				);
 			}
 			const runtimeTransportOverride = this.#runtimeProviderOverrides.get(providerName);
 			const withRuntimeTransportOverride = runtimeTransportOverride
