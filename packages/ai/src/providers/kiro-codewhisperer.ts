@@ -11,6 +11,7 @@
  * not from any AGPL reference implementation.
  */
 import { $credentialEnv, $env, extractHttpStatusFromError } from "@gajae-code/utils";
+import type { Effort } from "../model-thinking";
 import type {
 	Api,
 	AssistantMessage,
@@ -35,6 +36,8 @@ import { isKiroApiKey, streamKiroApiKey } from "./kiro-api-key";
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface KiroCodeWhispererOptions extends StreamOptions {
+	/** Effort level for Kiro API-key reasoning. */
+	reasoning?: Effort | boolean;
 	/** AWS region for the CodeWhisperer streaming endpoint. */
 	region?: string;
 	/** Profile ARN for enterprise IAM Identity Center accounts. */

@@ -48,7 +48,7 @@ const EFFORT_BUDGET: Record<string, number> = {
 };
 
 export function isKiroApiKey(value: string | undefined): value is string {
-	return typeof value === "string" && value.trim().startsWith("ksk_");
+	return typeof value === "string" && value.trim().startsWith("ksk_") && !/[\x00-\x1f\x7f]/.test(value);
 }
 
 export function kiroApiRegion(options?: { region?: string }): string {
@@ -94,6 +94,15 @@ function kiroApiHeaders(apiKey: string, target: string): Record<string, string> 
 		"user-agent": ua,
 		"x-amzn-kiro-agent-mode": "vibe",
 	};
+}
+
+function sanitizeKiroError(value: unknown, secret?: string): string {
+	let message = value instanceof Error ? value.message : String(value);
+	if (secret) message = message.split(secret).join("[redacted]");
+	message = message.replace(/bearer\s+[^\s,;]+/gi, "Bearer [redacted]");
+	message = message.replace(/(api[_-]?key|token|secret|authorization)[=:]\s*[^\s,;]+/gi, "$1=[redacted]");
+	message = message.replace(/[\r\n\t ]+/g, " ").trim();
+	return message.length > 1000 ? `${message.slice(0, 997)}...` : message || "Kiro request failed";
 }
 
 interface ApiModel {
@@ -170,7 +179,10 @@ export function kiroApiStaticModels(): Model<"kiro-codewhisperer-stream">[] {
 }
 
 /** Discover models this API key can use. Returns null when the key is missing. */
-export async function fetchKiroApiModels(apiKey: string, region?: string): Promise<Model<"kiro-codewhisperer-stream">[]> {
+export async function fetchKiroApiModels(
+	apiKey: string,
+	region?: string,
+): Promise<Model<"kiro-codewhisperer-stream">[]> {
 	const resolvedRegion = region || kiroApiRegion();
 	const baseUrl = kiroApiBaseUrl(resolvedRegion);
 	const response = await fetch(baseUrl, {
@@ -181,7 +193,9 @@ export async function fetchKiroApiModels(apiKey: string, region?: string): Promi
 	});
 	if (!response.ok) {
 		const body = await response.text().catch(() => "");
-		throw new Error(`Kiro ListAvailableModels HTTP ${response.status}: ${body.slice(0, 500)}`);
+		throw new Error(
+			sanitizeKiroError(`Kiro ListAvailableModels HTTP ${response.status}: ${body.slice(0, 500)}`, apiKey),
+		);
 	}
 	const payload = (await response.json()) as { models?: ApiModel[] };
 	const models: Model<"kiro-codewhisperer-stream">[] = [];
@@ -222,15 +236,15 @@ const EVENT_PATTERNS = [
 function findJsonEnd(text: string, start: number): number {
 	let brace = 0;
 	let inString = false;
-	let escape = false;
+	let escaped = false;
 	for (let i = start; i < text.length; i++) {
 		const ch = text[i];
-		if (escape) {
-			escape = false;
+		if (escaped) {
+			escaped = false;
 			continue;
 		}
 		if (ch === "\\") {
-			escape = true;
+			escaped = true;
 			continue;
 		}
 		if (ch === '"') {
@@ -265,8 +279,7 @@ export function parseKiroApiEvents(buffer: string): { events: KiroStreamEvent[];
 				events.push({ type: "content", data: parsed.content });
 			} else if (parsed.name && parsed.toolUseId) {
 				const raw = parsed.input;
-				const input =
-					typeof raw === "string" ? raw : raw && typeof raw === "object" ? JSON.stringify(raw) : "";
+				const input = typeof raw === "string" ? raw : raw && typeof raw === "object" ? JSON.stringify(raw) : "";
 				events.push({
 					type: "toolUse",
 					data: {
@@ -382,7 +395,9 @@ function buildApiKeyRequest(
 				status: tr.isError ? "error" : "success",
 				toolUseId: tr.toolCallId,
 			};
-			const last = history[history.length - 1] as { userInputMessage?: { userInputMessageContext?: { toolResults?: unknown[] } } };
+			const last = history[history.length - 1] as {
+				userInputMessage?: { userInputMessageContext?: { toolResults?: unknown[] } };
+			};
 			if (last?.userInputMessage) {
 				last.userInputMessage.userInputMessageContext ??= {};
 				last.userInputMessage.userInputMessageContext.toolResults ??= [];
@@ -470,7 +485,9 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 		const blocks = output.content as Block[];
 		try {
 			if (!isKiroApiKey(apiKey)) {
-				throw new Error("Kiro API key missing. Set KIRO_API_KEY to a ksk_ key from https://app.kiro.dev/settings/api-keys.");
+				throw new Error(
+					"Kiro API key missing. Set KIRO_API_KEY to a ksk_ key from https://app.kiro.dev/settings/api-keys.",
+				);
 			}
 			const region = kiroApiRegion(options);
 			const endpoint = model.baseUrl || kiroApiBaseUrl(region);
@@ -479,14 +496,14 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 
 			const response = await fetch(endpoint, {
 				method: "POST",
-				headers: kiroApiHeaders(apiKey, CHAT_TARGET),
+				headers: { ...kiroApiHeaders(apiKey, CHAT_TARGET), ...(options.headers ?? {}) },
 				body: JSON.stringify(request),
 				signal: options.signal,
 			});
 			if (!response.ok) {
 				const errBody = await response.text().catch(() => "");
 				throw withHttpStatus(
-					new Error(`Kiro API key HTTP ${response.status}: ${errBody.slice(0, 1000)}`),
+					new Error(sanitizeKiroError(`Kiro API key HTTP ${response.status}: ${errBody.slice(0, 1000)}`, apiKey)),
 					response.status,
 				);
 			}
@@ -627,7 +644,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 						if (event.data.outputTokens !== undefined) output.usage.output = event.data.outputTokens;
 						output.usage.totalTokens = output.usage.input + output.usage.output;
 					} else if (event.type === "error") {
-						throw new Error(`${event.data.error}: ${event.data.message ?? ""}`.trim());
+						throw new Error(sanitizeKiroError(`${event.data.error}: ${event.data.message ?? ""}`, apiKey));
 					}
 				}
 			}
@@ -658,7 +675,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			stream.end();
 		} catch (error) {
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = error instanceof Error ? error.message : String(error);
+			output.errorMessage = sanitizeKiroError(error, apiKey);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
