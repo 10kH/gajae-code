@@ -5079,16 +5079,18 @@ export class ModelRegistry {
 			(typeof headers[GENERATED_AUTH_HEADER] === "string"
 				? { authorization: headers[GENERATED_AUTH_HEADER] }
 				: undefined);
+		const hadAuthorization = headers.Authorization !== undefined;
+		const ownsAuthorization = generated?.authorization === headers.Authorization;
 		if (authHeader !== true && generated === undefined && !this.#generatedAuthHeaderProviders.has(model.provider))
 			return;
-		if (generated?.authorization === headers.Authorization) delete headers.Authorization;
+		if (ownsAuthorization) delete headers.Authorization;
 		if (generated?.apiKey === headers["X-Api-Key"]) delete headers["X-Api-Key"];
 		delete headers[GENERATED_AUTH_HEADER];
 		model.headers =
-			authHeader === true && apiKey && apiKey !== kNoAuth
+			authHeader === true && apiKey && apiKey !== kNoAuth && (ownsAuthorization || !hadAuthorization)
 				? { ...headers, Authorization: `Bearer ${apiKey}`, [GENERATED_AUTH_HEADER]: `Bearer ${apiKey}` }
 				: headers;
-		if (authHeader === true && apiKey && apiKey !== kNoAuth) {
+		if (authHeader === true && apiKey && apiKey !== kNoAuth && (ownsAuthorization || !hadAuthorization)) {
 			this.#generatedAuthHeaders.set(model, { authorization: model.headers.Authorization });
 		}
 	}
@@ -5282,17 +5284,18 @@ export class ModelRegistry {
 			if (config.authHeader !== undefined) this.#runtimeProviderAuthHeaders.set(providerName, config.authHeader);
 			this.authStorage.setConfigApiKey(providerName, resolved);
 		}
+		if (config.oauth && !config.apiKey && this.#runtimeProviderApiKeys.has(providerName)) {
+			this.#runtimeProviderApiKeys.delete(providerName);
+			this.#runtimeProviderApiKeyEnvNames.delete(providerName);
+			this.#customProviderApiKeys.delete(providerName);
+			this.authStorage.removeConfigApiKey(providerName);
+			const previousOverride = this.#runtimeProviderOverrides.get(providerName);
+			if (previousOverride)
+				this.#runtimeProviderOverrides.set(providerName, { ...previousOverride, apiKey: "", isOAuth: true });
+			this.#reloadStaticModels();
+		}
 
 		if (config.models && config.models.length > 0) {
-			if (config.oauth && !config.apiKey) {
-				this.#runtimeProviderApiKeys.delete(providerName);
-				this.#runtimeProviderApiKeyEnvNames.delete(providerName);
-				this.#customProviderApiKeys.delete(providerName);
-				this.authStorage.removeConfigApiKey(providerName);
-				const previousOverride = this.#runtimeProviderOverrides.get(providerName);
-				if (previousOverride)
-					this.#runtimeProviderOverrides.set(providerName, { ...previousOverride, apiKey: "", isOAuth: true });
-			}
 			// Build model overlays that persist across refresh() cycles
 			const newOverlays: CustomModelOverlay[] = [];
 			for (const modelDef of config.models) {
