@@ -6,6 +6,7 @@ import { buildZCodeSourceHeaders, resolveGlmZcodeAnthropicBaseUrl } from "../pro
 import { fetchOpenCodexModels, OPENCODEX_MODEL_CACHE_TTL_MS } from "../providers/openai-opencodex-responses";
 import { fetchCodexModels } from "../utils/discovery/codex";
 import { fetchOpenAICompatibleModels } from "../utils/discovery/openai-compatible";
+import { fetchKiroApiModels, isKiroApiKey } from "../providers/kiro-api-key";
 import { createBundledReferenceMap } from "./bundled-references";
 export function openCodexModelManagerOptions(): ModelManagerOptions<"openai-responses"> {
 	return {
@@ -164,10 +165,20 @@ export function jetbrainsJunieModelManagerOptions(
 // Kiro (Amazon Q Developer / CodeWhisperer)
 // ---------------------------------------------------------------------------
 
-export interface KiroModelManagerConfig {}
+export interface KiroModelManagerConfig {
+	apiKey?: string;
+}
 
 export function kiroModelManagerOptions(
-	_config: KiroModelManagerConfig = {},
+	config: KiroModelManagerConfig = {},
 ): ModelManagerOptions<"kiro-codewhisperer-stream"> {
-	return { providerId: "kiro" };
+	const apiKey = config.apiKey;
+	return {
+		providerId: "kiro",
+		...(isKiroApiKey(apiKey)
+			? {
+					fetchDynamicModels: () => fetchKiroApiModels(apiKey),
+				}
+			: undefined),
+	};
 }

@@ -131,11 +131,8 @@ const serviceProviderMap: Record<string, KeyResolver> = {
 	tavily: "TAVILY_API_KEY",
 	parallel: "PARALLEL_API_KEY",
 	kagi: "KAGI_API_KEY",
-	// Kiro uses AWS SSO OIDC OAuth flow; bearer token is stored as the OAuth access token.
-	kiro: () => {
-		const bearerToken = $credentialEnv("AWS_BEARER_TOKEN_KIRO");
-		if (bearerToken) return bearerToken;
-	},
+	// Kiro: prefer long-lived app.kiro.dev API keys (ksk_), then AWS SSO bearer tokens.
+	kiro: () => $pickCredentialEnv("KIRO_API_KEY", "AWS_BEARER_TOKEN_KIRO"),
 	// GitHub Copilot uses GitHub personal access token
 	"github-copilot": () => $pickCredentialEnv("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"),
 	// Foundry mode optionally switches Anthropic auth to enterprise gateway credentials.
