@@ -124,6 +124,7 @@ import {
 	EMPTY_RESPONSE_PROVIDER_CODE,
 	type FallbackAttemptToken,
 	type FallbackTriggerClass,
+	SERVER_OVERLOADED_PROVIDER_CODE,
 	STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE,
 } from "@gajae-code/ai/utils/fallback-transport";
 import { AttemptRecordStore } from "./attempt-record-store";
@@ -1299,11 +1300,58 @@ function isBareDefaultMessageOnlyFirstEventTimeout(message: AssistantMessage): b
 			BARE_DEFAULT_WATCHDOG_ERROR.test(message.errorMessage ?? ""))
 	);
 }
+/**
+ * True when the attempt's structured evidence is exactly the provider's typed
+ * capacity-overload code and nothing else: no status, no retained retry header,
+ * no second typed code, no error kind, and none of the transport's other
+ * observations (request size, first-event timing, endpoint class, provider retry
+ * ceiling). The code arrives statuslessly (a Codex error event, an HTTP 200
+ * terminal Responses envelope), so these facts ARE the overload rather than
+ * evidence that the attempt did observable work; any additional fact means the
+ * attempt is no longer provably that bare capacity rejection. The code is
+ * compared case-sensitively, matching the parser and the transport gate.
+ */
+function isExactTypedOverloadFacts(message: AssistantMessage): boolean {
+	if (message.errorKind !== undefined || message.errorStatus !== undefined) return false;
+	const facts = message.transportFailure;
+	if (!facts) return false;
+	return (
+		facts.providerCode === SERVER_OVERLOADED_PROVIDER_CODE &&
+		facts.status === undefined &&
+		facts.anthropicErrorType === undefined &&
+		(facts.openaiErrorCode === undefined || facts.openaiErrorCode === SERVER_OVERLOADED_PROVIDER_CODE) &&
+		(facts.headers === undefined || Object.keys(facts.headers).length === 0) &&
+		facts.requestBytes === undefined &&
+		facts.firstEventElapsedMs === undefined &&
+		facts.firstEventTimeoutMs === undefined &&
+		facts.endpointClass === undefined &&
+		facts.retryMaxAttempts === undefined
+	);
+}
+
 function isBareDefaultCodexOverload(message: AssistantMessage): boolean {
 	return (
 		message.api === "openai-codex-responses" &&
 		BARE_DEFAULT_CODEX_OVERLOAD_ERROR.test(message.errorMessage ?? "") &&
-		!hasBareDefaultRetryDisqualifyingFacts(message) &&
+		(isExactTypedOverloadFacts(message) || !hasBareDefaultRetryDisqualifyingFacts(message)) &&
+		!assistantMessageHasVisibleOrToolContent(message)
+	);
+}
+
+/**
+ * True when a generic OpenAI Responses turn failed with exactly OpenAI's typed
+ * capacity-overload code. Unlike the Codex and Anthropic admissions this reads
+ * no prose at all: the terminal Responses envelope carries the code in typed
+ * transport facts, so the code plus a content-free attempt is the whole
+ * admission. Both `openaiErrorCode` and the derived `providerCode` must be the
+ * exact code, so a different transport's overload facts cannot enter through
+ * this path.
+ */
+function isBareDefaultOpenAIResponsesOverload(message: AssistantMessage): boolean {
+	return (
+		message.api === "openai-responses" &&
+		message.transportFailure?.openaiErrorCode === SERVER_OVERLOADED_PROVIDER_CODE &&
+		isExactTypedOverloadFacts(message) &&
 		!assistantMessageHasVisibleOrToolContent(message)
 	);
 }
@@ -19542,7 +19590,10 @@ export class AgentSession {
 		}
 		const firstEventTimeout = classification === "first_event_timeout";
 		const emptyResponse = classification === "empty_response";
-		const canReplayProviderOverload = isBareDefaultCodexOverload(message) || isBareDefaultAnthropicOverload(message);
+		const canReplayProviderOverload =
+			isBareDefaultCodexOverload(message) ||
+			isBareDefaultAnthropicOverload(message) ||
+			isBareDefaultOpenAIResponsesOverload(message);
 		const reportedRetryMaxAttempts = transportFailure?.retryMaxAttempts;
 		if (reportedRetryMaxAttempts !== undefined) {
 			this.#providerRetryMaxAttempts = Math.min(

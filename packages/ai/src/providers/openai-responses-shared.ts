@@ -31,6 +31,7 @@ import {
 } from "../types";
 import { normalizeResponsesToolCallId, sanitizeJsonStrings } from "../utils";
 import type { AssistantMessageEventStream } from "../utils/event-stream";
+import { SERVER_OVERLOADED_PROVIDER_CODE } from "../utils/fallback-transport";
 import { captureUnicodeEscapeEvidence, isCompleteJson, parseStreamingJson } from "../utils/json-parse";
 import { areJsonValuesEqual } from "../utils/schema";
 import { joinTextWithImagePlaceholder, NON_VISION_IMAGE_PLACEHOLDER, partitionVisionContent } from "./vision-guard";
@@ -981,7 +982,10 @@ export async function processResponsesStream<TApi extends Api>(
 						: typeof statusDetailsReason === "string" && statusDetailsReason.length > 0
 							? `status_details: ${statusDetailsReason}`
 							: "Unknown error (no error details in response)";
-				throw new Error(message);
+				// A `cancelled` response is not a capacity rejection and may already
+				// have produced observable work, so only the `failed` status carries
+				// the typed code onward.
+				throw createResponsesFailedError(message, response.status === "failed" ? error?.code : undefined);
 			}
 			// A response cut short for length (`incomplete`) may have stopped
 			// mid-tool-call. Any tool-call item still tracked in `items` never
@@ -1003,9 +1007,26 @@ export async function processResponsesStream<TApi extends Api>(
 				: details?.reason
 					? `incomplete: ${details.reason}`
 					: "Unknown error (no error details in response)";
-			throw new Error(message);
+			throw createResponsesFailedError(message, error?.code);
 		}
 	}
+}
+
+/**
+ * A terminal failure envelope arrives inside an HTTP 200 stream — as
+ * `response.failed`, or as `response.completed` with a `failed` response status
+ * — so the typed `error.code` is the only structured evidence the transport can
+ * keep. Both shapes carry the same structured failure and are typed identically.
+ * Exactly OpenAI's capacity-overload code is carried through as transport facts,
+ * matched case-sensitively; every other failure stays a plain error, so an
+ * untyped, cased, or malformed code can never reach a typed retry admission. The
+ * display message is unchanged either way.
+ */
+function createResponsesFailedError(message: string, code: string | undefined): Error {
+	if (code !== SERVER_OVERLOADED_PROVIDER_CODE) return new Error(message);
+	const error = new Error(message) as Error & { openaiErrorCode?: string };
+	error.openaiErrorCode = SERVER_OVERLOADED_PROVIDER_CODE;
+	return error;
 }
 
 /**
