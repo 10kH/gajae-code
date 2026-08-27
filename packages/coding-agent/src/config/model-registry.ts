@@ -1194,7 +1194,12 @@ function mergeCustomModelHeaders(
 	authHeader: boolean | undefined,
 	apiKeyConfig: string | undefined,
 ): Record<string, string> | undefined {
-	return mergeAuthHeader({ ...providerHeaders, ...modelHeaders }, authHeader, apiKeyConfig);
+	const merged = { ...(providerHeaders ?? {}) };
+	for (const [key, value] of Object.entries(modelHeaders ?? {})) {
+		if (key.toLowerCase() === "authorization") deleteHeaderCaseInsensitive(merged, "Authorization");
+		merged[key] = value;
+	}
+	return mergeAuthHeader(merged, authHeader, apiKeyConfig);
 }
 
 function mergeAuthHeader(
@@ -4127,7 +4132,7 @@ export class ModelRegistry {
 		)?.[GENERATED_AUTH_HEADER];
 		if (generatedHeader !== undefined && result.headers?.Authorization === generatedHeader) {
 			this.#generatedAuthHeaders.set(result, { authorization: result.headers.Authorization });
-		} else {
+		} else if (explicitAuthKey === undefined) {
 			const generated = this.#generatedAuthHeaders.get(entry);
 			if (generated) this.#generatedAuthHeaders.set(result, generated);
 		}
@@ -5416,6 +5421,7 @@ export class ModelRegistry {
 			}
 			this.#staticModelsLoaded = false;
 			this.#reloadStaticModels();
+			if (config.authHeader !== undefined) this.#runtimeProviderAuthHeaders.set(providerName, config.authHeader);
 		}
 
 		if (config.models && config.models.length > 0) {
