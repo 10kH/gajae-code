@@ -77,7 +77,7 @@ describe("adaptive compaction threshold", () => {
 		};
 		const justCompactedSettings: CompactionSettings = {
 			...adaptiveSettings,
-			adaptiveState: { turnsSinceCompact: 2, callsInWindow: 60 },
+			adaptiveState: { turnsSinceCompact: 3, callsInWindow: 60 },
 		};
 
 		expect(shouldCompact(76_000, 100_000, hotSessionSettings)).toBe(true);

@@ -180,8 +180,6 @@ export function computeAdaptiveThresholdPercent(
 	if (!state || !Number.isFinite(contextWindow) || contextWindow <= 0) return clampedBasePercent;
 	if (!Number.isFinite(options.turnWindow) || options.turnWindow <= 0) return clampedBasePercent;
 
-	if (state.turnsSinceCompact < 3) return clampedBasePercent;
-
 	const safeContextTokens = Number.isFinite(contextTokens) ? Math.max(0, contextTokens) : 0;
 	const fillRatio = safeContextTokens / contextWindow;
 	const baseRatio = clampedBasePercent / 100;
@@ -189,7 +187,7 @@ export function computeAdaptiveThresholdPercent(
 
 	const turnsSinceCompact = Number.isFinite(state.turnsSinceCompact) ? Math.max(0, state.turnsSinceCompact) : 0;
 	const callsInWindow = Number.isFinite(state.callsInWindow) ? Math.max(0, state.callsInWindow) : 0;
-	if (turnsSinceCompact < 3) return clampedBasePercent;
+	if (turnsSinceCompact <= 3) return clampedBasePercent;
 	const windowTurns = Math.max(1, options.turnWindow * 4);
 	const intensity = Math.min(1, callsInWindow / windowTurns);
 	const aggression = Number.isFinite(options.aggression) ? Math.min(1, Math.max(0, options.aggression)) : 0;
