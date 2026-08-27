@@ -4138,7 +4138,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					const effectiveApiKey = await modelRegistry.getApiKey(streamModel, credentialSessionId);
 					stream = await streamSimple(streamModel, context, {
 						...streamOptions,
-						apiKey: effectiveApiKey ?? streamOptions?.apiKey,
+						apiKey: effectiveApiKey,
 						authCredentialType: modelRegistry.getSessionCredentialType(streamModel.provider, credentialSessionId),
 						onAuthError: async (provider, oldKey, error) => {
 							await modelRegistry.authStorage.invalidateCredentialMatching(provider, oldKey, {
