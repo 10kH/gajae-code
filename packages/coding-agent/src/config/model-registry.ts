@@ -1533,6 +1533,7 @@ export class ModelRegistry {
 	#runtimeProviderOverrides: Map<string, ProviderOverride> = new Map();
 	#runtimeProviderAuthHeaders: Map<string, boolean> = new Map();
 	#generatedAuthHeaderProviders: Set<string> = new Set();
+	#generatedAuthHeaders: WeakMap<Model<Api>, { authorization?: string; apiKey?: string }> = new WeakMap();
 	#runtimeProvidersBySource: Map<string, Set<string>> = new Map();
 	#runtimeProviderSourceByName: Map<string, string> = new Map();
 	#registryModelKeys: Set<string> = new Set();
@@ -1942,6 +1943,7 @@ export class ModelRegistry {
 		const combined = this.#mergeCustomModels(withConfigModels, this.#runtimeModelOverlays);
 		const withModelOverrides = this.#applyModelOverrides(combined, this.#modelOverrides);
 		this.#models = this.#finalizeModels(this.#applyRuntimeProviderOverrides(withModelOverrides));
+		this.#recordGeneratedAuthHeaders();
 		this.#modelProfiles = mergeModelProfiles(
 			profiles,
 			filterMaterializedRegistryProfiles(
@@ -4021,10 +4023,6 @@ export class ModelRegistry {
 		>,
 	): T {
 		const overrideHeaders = override.headers ? { ...entry.headers, ...override.headers } : entry.headers;
-		if (override.authHeader === false && overrideHeaders) {
-			delete overrideHeaders.Authorization;
-			delete overrideHeaders["X-Api-Key"];
-		}
 		const headers = mergeAuthHeader(overrideHeaders, override.authHeader, override.apiKey);
 		return {
 			...entry,
@@ -4975,9 +4973,12 @@ export class ModelRegistry {
 		for (const model of this.#models) {
 			if (model.provider !== provider) continue;
 			const headers = { ...(model.headers ?? {}) };
-			delete headers.Authorization;
+			const generated = this.#generatedAuthHeaders.get(model);
+			if (generated?.authorization === headers.Authorization) delete headers.Authorization;
+			if (generated?.apiKey === headers["X-Api-Key"]) delete headers["X-Api-Key"];
 			model.headers =
 				authHeader === true && resolved ? { ...headers, Authorization: `Bearer ${resolved}` } : headers;
+			if (authHeader === true) this.#generatedAuthHeaders.set(model, { authorization: model.headers.Authorization });
 		}
 		this.#rebuildCanonicalIndex();
 	}
@@ -4986,13 +4987,30 @@ export class ModelRegistry {
 		const authHeader =
 			this.#runtimeProviderAuthHeaders.get(model.provider) ?? this.#customProviderAuthHeaders.get(model.provider);
 		if (authHeader === true) this.#generatedAuthHeaderProviders.add(model.provider);
-		if (authHeader !== true && !this.#generatedAuthHeaderProviders.has(model.provider)) return;
 		const headers = { ...(model.headers ?? {}) };
-		delete headers.Authorization;
+		const generated = this.#generatedAuthHeaders.get(model);
+		if (authHeader !== true && generated === undefined && !this.#generatedAuthHeaderProviders.has(model.provider))
+			return;
+		if (generated?.authorization === headers.Authorization) delete headers.Authorization;
+		if (generated?.apiKey === headers["X-Api-Key"]) delete headers["X-Api-Key"];
 		model.headers =
 			authHeader === true && apiKey && apiKey !== kNoAuth
 				? { ...headers, Authorization: `Bearer ${apiKey}` }
 				: headers;
+		if (authHeader === true) this.#generatedAuthHeaders.set(model, { authorization: model.headers.Authorization });
+	}
+
+	#recordGeneratedAuthHeaders(): void {
+		for (const model of this.#models) {
+			const authHeader =
+				this.#runtimeProviderAuthHeaders.get(model.provider) ?? this.#customProviderAuthHeaders.get(model.provider);
+			if (authHeader !== true) continue;
+			if (model.headers?.Authorization !== undefined || model.headers?.["X-Api-Key"] !== undefined)
+				this.#generatedAuthHeaders.set(model, {
+					authorization: model.headers?.Authorization,
+					apiKey: model.headers?.["X-Api-Key"],
+				});
+		}
 	}
 
 	async #peekApiKeyForProvider(
@@ -5133,11 +5151,6 @@ export class ModelRegistry {
 				sourceId,
 			});
 		}
-		if (config.authHeader !== undefined) {
-			this.#runtimeProviderAuthHeaders.set(providerName, config.authHeader);
-			if (config.authHeader === true) this.#generatedAuthHeaderProviders.add(providerName);
-		}
-
 		let sourceHandoff = false;
 		if (sourceId) {
 			this.#registeredProviderSources.add(sourceId);
@@ -5160,6 +5173,10 @@ export class ModelRegistry {
 			this.#lastStaticLoadMtime = null;
 			this.#staticModelsLoaded = false;
 			this.#reloadStaticModels();
+		}
+		if (config.authHeader !== undefined) {
+			this.#runtimeProviderAuthHeaders.set(providerName, config.authHeader);
+			if (config.authHeader === true) this.#generatedAuthHeaderProviders.add(providerName);
 		}
 
 		if (config.apiKey) {
