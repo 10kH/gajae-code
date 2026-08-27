@@ -4047,8 +4047,20 @@ export class ModelRegistry {
 			| "cacheRetention"
 		>,
 	): T {
-		const overrideHeaders = override.headers ? { ...entry.headers, ...override.headers } : entry.headers;
-		const headers = mergeAuthHeader(overrideHeaders, override.authHeader, override.apiKey);
+		const overrideHeaders = override.headers ? { ...entry.headers, ...override.headers } : { ...entry.headers };
+		if (override.headers?.Authorization !== undefined) {
+			delete (overrideHeaders as Record<string, string> & { [GENERATED_AUTH_HEADER]?: string })[
+				GENERATED_AUTH_HEADER
+			];
+		}
+		const existingMarker = (overrideHeaders as Record<string, string> & { [GENERATED_AUTH_HEADER]?: string })[
+			GENERATED_AUTH_HEADER
+		];
+		const canInject =
+			override.authHeader === true &&
+			Boolean(override.apiKey) &&
+			(overrideHeaders.Authorization === undefined || existingMarker === overrideHeaders.Authorization);
+		const headers = mergeAuthHeader(overrideHeaders, canInject, canInject ? override.apiKey : undefined);
 		const result = {
 			...entry,
 			compat: mergeProviderCompat(entry.compat, override.compat),
@@ -4063,7 +4075,7 @@ export class ModelRegistry {
 			),
 			cacheRetention: entry.cacheRetention ?? override.cacheRetention,
 		};
-		if (override.authHeader !== true && override.headers?.Authorization !== undefined) {
+		if (!canInject && override.headers?.Authorization !== undefined) {
 			delete (result.headers as Record<string, string> & { [GENERATED_AUTH_HEADER]?: string })[
 				GENERATED_AUTH_HEADER
 			];
@@ -5050,9 +5062,11 @@ export class ModelRegistry {
 				[GENERATED_AUTH_HEADER]?: string;
 			};
 			const generated = headers[GENERATED_AUTH_HEADER];
-			if (typeof generated === "string" && headers.Authorization === generated) delete headers.Authorization;
+			const hadAuthorization = headers.Authorization !== undefined;
+			const ownsAuthorization = typeof generated === "string" && headers.Authorization === generated;
+			if (ownsAuthorization) delete headers.Authorization;
 			delete headers[GENERATED_AUTH_HEADER];
-			if (authHeader === true && resolved) {
+			if (authHeader === true && resolved && (ownsAuthorization || !hadAuthorization)) {
 				headers.Authorization = `Bearer ${resolved}`;
 				headers[GENERATED_AUTH_HEADER] = `Bearer ${resolved}`;
 			}
@@ -5321,11 +5335,15 @@ export class ModelRegistry {
 					[GENERATED_AUTH_HEADER]?: string;
 				};
 				const generated = headers[GENERATED_AUTH_HEADER];
-				if (
-					(typeof generated === "string" && headers.Authorization === generated) ||
-					(previousApiKey !== undefined && headers.Authorization === `Bearer ${previousApiKey}`)
-				) {
-					delete headers.Authorization;
+				for (const key of Object.keys(headers)) {
+					if (key.toLowerCase() !== "authorization") continue;
+					const value = headers[key];
+					if (
+						(typeof generated === "string" && value === generated) ||
+						(previousApiKey !== undefined && value === `Bearer ${previousApiKey}`) ||
+						(previousApiKey === undefined && value.startsWith("Bearer "))
+					)
+						delete headers[key];
 				}
 				delete headers[GENERATED_AUTH_HEADER];
 				return { ...overlay, headers };
@@ -5333,8 +5351,15 @@ export class ModelRegistry {
 			const previousOverride = this.#runtimeProviderOverrides.get(providerName);
 			if (previousOverride) {
 				const headers = { ...(previousOverride.headers ?? {}) };
-				if (previousApiKey !== undefined && headers.Authorization === `Bearer ${previousApiKey}`)
-					delete headers.Authorization;
+				for (const key of Object.keys(headers)) {
+					if (key.toLowerCase() !== "authorization") continue;
+					const value = headers[key];
+					if (
+						(previousApiKey !== undefined && value === `Bearer ${previousApiKey}`) ||
+						(previousApiKey === undefined && value.startsWith("Bearer "))
+					)
+						delete headers[key];
+				}
 				this.#runtimeProviderOverrides.set(providerName, {
 					...previousOverride,
 					apiKey: "",
