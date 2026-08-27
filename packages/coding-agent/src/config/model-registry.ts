@@ -1202,6 +1202,18 @@ function mergeCustomModelHeaders(
 	return mergeAuthHeader(merged, authHeader, apiKeyConfig);
 }
 
+function mergeCaseInsensitiveHeaders(
+	baseHeaders: Record<string, string> | undefined,
+	overrideHeaders: Record<string, string> | undefined,
+): Record<string, string> | undefined {
+	const merged = { ...(baseHeaders ?? {}) };
+	for (const [key, value] of Object.entries(overrideHeaders ?? {})) {
+		if (key.toLowerCase() === "authorization") deleteHeaderCaseInsensitive(merged, "Authorization");
+		merged[key] = value;
+	}
+	return Object.keys(merged).length > 0 ? merged : undefined;
+}
+
 function mergeAuthHeader(
 	headers: Record<string, string> | undefined,
 	authHeader: boolean | undefined,
@@ -3244,7 +3256,7 @@ export class ModelRegistry {
 		return {
 			...providerConfig,
 			baseUrl: effectiveBaseUrl,
-			headers: override?.headers ? { ...providerConfig.headers, ...override.headers } : providerConfig.headers,
+			headers: mergeCaseInsensitiveHeaders(providerConfig.headers, override?.headers),
 			compat: override?.compat ? mergeCompat(providerConfig.compat, override.compat) : providerConfig.compat,
 			requestTransform: mergeRequestTransform(providerConfig.requestTransform, override?.requestTransform),
 			cacheRetention: override?.cacheRetention ?? providerConfig.cacheRetention,
@@ -4076,7 +4088,7 @@ export class ModelRegistry {
 			baseUrl: override.baseUrl ?? baseOverride?.baseUrl,
 			apiKey: override.apiKey ?? baseOverride?.apiKey,
 			authHeader: override.authHeader ?? baseOverride?.authHeader,
-			headers: override.headers ? { ...(baseOverride?.headers ?? {}), ...override.headers } : baseOverride?.headers,
+			headers: mergeCaseInsensitiveHeaders(baseOverride?.headers, override.headers),
 			compat: override.compat ? mergeCompat(baseOverride?.compat, override.compat) : baseOverride?.compat,
 			transport: override.transport ?? baseOverride?.transport,
 			requestTransform: mergeRequestTransform(baseOverride?.requestTransform, override.requestTransform),
@@ -4098,7 +4110,9 @@ export class ModelRegistry {
 			| "cacheRetention"
 		>,
 	): T {
-		const overrideHeaders = override.headers ? { ...entry.headers, ...override.headers } : { ...entry.headers };
+		const overrideHeaders = (
+			override.headers ? { ...entry.headers, ...override.headers } : { ...entry.headers }
+		) as Record<string, string> & { [GENERATED_AUTH_HEADER]?: string };
 		const explicitAuthKey = override.headers
 			? Object.keys(override.headers).find(key => key.toLowerCase() === "authorization")
 			: undefined;
@@ -4117,7 +4131,14 @@ export class ModelRegistry {
 			override.authHeader === true &&
 			Boolean(override.apiKey) &&
 			(headerValue(overrideHeaders, "Authorization") === undefined ||
-				existingMarker === headerValue(overrideHeaders, "Authorization"));
+				ownsOnlyGeneratedAuthorization(overrideHeaders, existingMarker));
+		if (canInject) {
+			deleteHeaderCaseInsensitive(overrideHeaders, "Authorization");
+			delete overrideHeaders[GENERATED_AUTH_HEADER];
+		} else if (existingMarker !== undefined) {
+			deleteAuthorizationValue(overrideHeaders, existingMarker);
+			delete overrideHeaders[GENERATED_AUTH_HEADER];
+		}
 		const headers = mergeAuthHeader(overrideHeaders, canInject, canInject ? override.apiKey : undefined);
 		const result = {
 			...entry,
