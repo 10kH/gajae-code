@@ -349,22 +349,31 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 
 	#getSlashCommandNameSuggestions(prefix: string): AutocompleteItem[] {
 		const lowerPrefix = prefix.toLowerCase();
+		const normalizedPrefix = normalizeFuzzyText(prefix);
 
 		return this.#commands
 			.filter(cmd => {
 				const name = this.#getCommandName(cmd);
 				if (!name) return false;
-				if (fuzzyMatch(lowerPrefix, name.toLowerCase())) return true;
-				if (getSlashCommandMatchRank(lowerPrefix, name.toLowerCase()) < 4) return true;
-				const desc = cmd.description?.toLowerCase();
-				return desc ? fuzzyMatch(lowerPrefix, desc) : false;
+				const lowerName = name.toLowerCase();
+				if (fuzzyMatch(normalizedPrefix, normalizeFuzzyText(name))) return true;
+				const isAscii = /^[\x00-\x7F]*$/.test(`${prefix}${name}`);
+				if (isAscii && getSlashCommandMatchRank(lowerPrefix, lowerName) < 4) return true;
+				const desc = cmd.description;
+				return desc ? fuzzyMatch(normalizedPrefix, normalizeFuzzyText(desc)) : false;
 			})
 			.map((cmd, index) => {
 				const name = this.#getCommandName(cmd);
 				const lowerName = name?.toLowerCase() ?? "";
-				const lowerDesc = cmd.description?.toLowerCase() ?? "";
-				const nameScore = fuzzyMatch(lowerPrefix, lowerName) ? fuzzyScore(lowerPrefix, lowerName) : 0;
-				const descScore = fuzzyMatch(lowerPrefix, lowerDesc) ? fuzzyScore(lowerPrefix, lowerDesc) * 0.5 : 0;
+				const lowerDesc = cmd.description ?? "";
+				const normalizedName = normalizeFuzzyText(name);
+				const normalizedDesc = normalizeFuzzyText(lowerDesc);
+				const nameScore = fuzzyMatch(normalizedPrefix, normalizedName)
+					? fuzzyScore(normalizedPrefix, normalizedName)
+					: 0;
+				const descScore = fuzzyMatch(normalizedPrefix, normalizedDesc)
+					? fuzzyScore(normalizedPrefix, normalizedDesc) * 0.5
+					: 0;
 				const hint = "argumentHint" in cmd && cmd.argumentHint ? cmd.argumentHint : undefined;
 				const desc = cmd.description ?? "";
 				const fullDesc = hint ? (desc ? `${hint} — ${desc}` : hint) : desc;
@@ -374,7 +383,9 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 					label: "name" in cmd ? cmd.name : cmd.label,
 					score: Math.max(nameScore, descScore),
 					priority,
-					matchRank: getSlashCommandMatchRank(lowerPrefix, lowerName),
+					matchRank: /^[\x00-\x7F]*$/.test(`${prefix}${name}`)
+						? getSlashCommandMatchRank(lowerPrefix, lowerName)
+						: 4,
 					index,
 					...(fullDesc && { description: fullDesc }),
 				} as AutocompleteItem & { score: number; priority: number; matchRank: number; index: number };

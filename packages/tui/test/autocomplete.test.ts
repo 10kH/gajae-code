@@ -538,6 +538,19 @@ describe("trySyncSlashCompletion", () => {
 		expect(result?.items.map(item => item.value)).toEqual(["한글명령"]);
 	});
 
+	it("normalizes separators and rejects unrelated commands for mixed Hangul queries", () => {
+		const provider = new CombinedAutocompleteProvider(
+			[
+				{ name: "한글명령", description: "Korean command", value: "한글명령" },
+				{ name: "model", description: "Switch model", value: "model" },
+			],
+			"/tmp",
+		);
+
+		expect(provider.trySyncSlashCompletion("/ㅎ-ㄱ")?.items.map(item => item.value)).toEqual(["한글명령"]);
+		expect(provider.trySyncSlashCompletion("/ㅎㄱ-model")).toBeNull();
+	});
+
 	it("matches case-insensitively", () => {
 		const provider = new CombinedAutocompleteProvider(
 			[{ name: "Model", description: "Switch AI model", value: "Model" }],
