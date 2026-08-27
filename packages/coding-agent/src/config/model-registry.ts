@@ -1194,11 +1194,7 @@ function mergeCustomModelHeaders(
 	authHeader: boolean | undefined,
 	apiKeyConfig: string | undefined,
 ): Record<string, string> | undefined {
-	const merged = { ...(providerHeaders ?? {}) };
-	for (const [key, value] of Object.entries(modelHeaders ?? {})) {
-		if (key.toLowerCase() === "authorization") deleteHeaderCaseInsensitive(merged, "Authorization");
-		merged[key] = value;
-	}
+	const merged = mergeCaseInsensitiveHeaders(providerHeaders, modelHeaders);
 	return mergeAuthHeader(merged, authHeader, apiKeyConfig);
 }
 
