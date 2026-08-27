@@ -247,9 +247,9 @@ describe("GJC tmux session management", () => {
 		}) as never);
 		clearPsmuxDetectionCache();
 
-		expect(listGjcTmuxSessions({ GJC_TMUX_COMMAND: "tmux-test", TMUX: "/tmp/host-emulated/agent-team,0,1" })).toEqual(
-			[],
-		);
+		expect(() =>
+			listGjcTmuxSessions({ GJC_TMUX_COMMAND: "tmux-test", TMUX: "/tmp/host-emulated/agent-team,0,1" }),
+		).toThrow("error connecting to /tmp/host-emulated/agent-team-stale");
 		expect(listCalls).toBe(1);
 	});
 

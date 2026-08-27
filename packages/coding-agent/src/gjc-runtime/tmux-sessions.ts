@@ -308,11 +308,7 @@ function parseSessionLine(line: string): GjcTmuxSessionStatus | null {
 
 /** tmux failure shapes that mean "this socket has no server", not "tmux is broken". */
 function isMissingServerFailure(message: string): boolean {
-	return (
-		message.includes("no server running") ||
-		message.includes("failed to connect to server") ||
-		message.includes("error connecting to")
-	);
+	return message.includes("no server running") || message.includes("failed to connect to server");
 }
 
 /**
@@ -330,7 +326,9 @@ function inheritedTmuxSocketPath(env: NodeJS.ProcessEnv): string | null {
 }
 
 function namesInheritedTmuxSocket(message: string, socket: string): boolean {
-	return message.includes(`error connecting to ${socket} `);
+	return (
+		message.includes(`error connecting to ${socket} `) && /(?:No such file or directory|not found)/iu.test(message)
+	);
 }
 
 function envWithoutInheritedTmux(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -351,20 +349,21 @@ function runListSessions(format: string, env: NodeJS.ProcessEnv = process.env): 
 		output = runTmux(["list-sessions", "-F", format], env);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
-		if (!isMissingServerFailure(message)) throw error;
 		const inheritedSocket = inheritedTmuxSocketPath(env);
 		// A miss on the default socket is a real empty list; only the inherited
 		// socket is suspect, so retry without it before concluding there is
 		// nothing to list.
-		if (!inheritedSocket || !namesInheritedTmuxSocket(message, inheritedSocket)) return { lines: [], env };
-		try {
-			effectiveEnv = envWithoutInheritedTmux(env);
-			output = runTmux(["list-sessions", "-F", format], effectiveEnv);
-		} catch (retryError) {
-			const retryMessage = retryError instanceof Error ? retryError.message : String(retryError);
-			if (isMissingServerFailure(retryMessage)) return { lines: [], env: effectiveEnv };
-			throw retryError;
-		}
+		if (inheritedSocket && namesInheritedTmuxSocket(message, inheritedSocket)) {
+			try {
+				effectiveEnv = envWithoutInheritedTmux(env);
+				output = runTmux(["list-sessions", "-F", format], effectiveEnv);
+			} catch (retryError) {
+				const retryMessage = retryError instanceof Error ? retryError.message : String(retryError);
+				if (isMissingServerFailure(retryMessage)) return { lines: [], env: effectiveEnv };
+				throw retryError;
+			}
+		} else if (isMissingServerFailure(message)) return { lines: [], env };
+		else throw error;
 	}
 	const lines = output
 		.split("\n")
@@ -486,7 +485,11 @@ export function listGjcTmuxSessions(env: NodeJS.ProcessEnv = process.env): GjcTm
 				return hydrated;
 			})
 			.filter((session): session is GjcTmuxSessionStatus => session?.profile === GJC_TMUX_PROFILE_VALUE)
-			.map(session => (authority ? { ...session, providerAuthority: authority } : session));
+			.map(session => {
+				const result = authority ? { ...session, providerAuthority: authority } : session;
+				effectiveSessionEnvironments.set(result, listed.env);
+				return result;
+			});
 	});
 	const names = new Set<string>();
 	for (const session of discovered) {
