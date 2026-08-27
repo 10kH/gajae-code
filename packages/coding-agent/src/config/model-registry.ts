@@ -1105,7 +1105,11 @@ function applyModelOverride(model: Model<Api>, override: ModelOverride): Model<A
 	}
 	if (override.headers) {
 		result.headers = { ...model.headers, ...override.headers };
-		if (override.headers.Authorization !== undefined) {
+		const explicitAuthKey = Object.keys(override.headers).find(key => key.toLowerCase() === "authorization");
+		if (explicitAuthKey !== undefined) {
+			const explicitAuthValue = override.headers[explicitAuthKey];
+			deleteHeaderCaseInsensitive(result.headers, "Authorization");
+			result.headers[explicitAuthKey] = explicitAuthValue;
 			delete (result.headers as Record<string, string> & { [GENERATED_AUTH_HEADER]?: boolean })[
 				GENERATED_AUTH_HEADER
 			];
@@ -1199,7 +1203,7 @@ function mergeAuthHeader(
 	apiKeyConfig: string | undefined,
 ): Record<string, string> | undefined {
 	const nextHeaders = headers && Object.keys(headers).length > 0 ? { ...headers } : undefined;
-	if (!authHeader || !apiKeyConfig) {
+	if (!authHeader || !apiKeyConfig || headerValue(nextHeaders, "Authorization") !== undefined) {
 		return nextHeaders;
 	}
 	return apiKeyConfig
@@ -1866,6 +1870,7 @@ export class ModelRegistry {
 				? $rotatingCredentialEnv(this.#runtimeProviderApiKeyEnvNames.get(provider)!)
 				: resolveApiKeyConfig(apiKeyConfig);
 			if (!resolved) {
+				this.#runtimeProviderCredentialInstalled.delete(provider);
 				const authHeader = this.#runtimeProviderAuthHeaders.get(provider);
 				if (authHeader === true) {
 					this.#runtimeModelOverlays = this.#runtimeModelOverlays.map(overlay => {
@@ -1898,7 +1903,8 @@ export class ModelRegistry {
 						[GENERATED_AUTH_HEADER]?: string;
 					};
 					const generated = headers[GENERATED_AUTH_HEADER];
-					if (typeof generated === "string" && headers.Authorization === generated) delete headers.Authorization;
+					if (typeof generated === "string" && headerValue(headers, "Authorization") === generated)
+						deleteHeaderCaseInsensitive(headers, "Authorization");
 					return {
 						...overlay,
 						headers: {
