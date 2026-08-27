@@ -5127,6 +5127,7 @@ export class ModelRegistry {
 		if (resolved === previous && (!runtimeOwned || this.#runtimeProviderCredentialInstalled.has(provider))) return;
 		if (resolved === undefined) {
 			if (runtimeOwned) {
+				if (!this.#runtimeProviderCredentialInstalled.has(provider)) return;
 				this.#runtimeProviderCredentialInstalled.delete(provider);
 				this.#staticModelsLoaded = false;
 				this.#reloadStaticModels();
