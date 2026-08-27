@@ -18,6 +18,10 @@ async function fuzzyFindNative(): Promise<NativeFuzzyFind> {
 
 const PATH_DELIMITERS = new Set([" ", "\t", '"', "'", "="]);
 
+function isAbsolutePathLike(value: string): boolean {
+	return path.isAbsolute(value) || path.win32.isAbsolute(value);
+}
+
 function buildAutocompleteFuzzyDiscoveryProfile(
 	query: string,
 	basePath: string,
@@ -589,7 +593,7 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 	async #resolveScopedFuzzyQuery(
 		rawQuery: string,
 	): Promise<{ baseDir: string; query: string; displayBase: string } | null> {
-		const slashIndex = rawQuery.lastIndexOf("/");
+		const slashIndex = Math.max(rawQuery.lastIndexOf("/"), rawQuery.lastIndexOf("\\"));
 		if (slashIndex === -1) {
 			return null;
 		}
@@ -669,7 +673,7 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 			const homeRelative = path.relative(path.resolve(os.homedir()), resolvedDir).replaceAll(path.sep, "/");
 			return homeRelative ? `~/${homeRelative}/` : "~/";
 		}
-		if (path.isAbsolute(rawPrefix)) {
+		if (isAbsolutePathLike(rawPrefix)) {
 			return normalizedResolvedDir === "/" ? "/" : `${normalizedResolvedDir}/`;
 		}
 
@@ -740,7 +744,7 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 
 			if (isRootPrefix) {
 				// Complete from specified position
-				if (rawPrefix.startsWith("~") || expandedPrefix.startsWith("/")) {
+				if (rawPrefix.startsWith("~") || isAbsolutePathLike(expandedPrefix)) {
 					searchDir = expandedPrefix;
 				} else {
 					searchDir = path.join(this.#basePath, expandedPrefix);
@@ -748,7 +752,7 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 				searchPrefix = "";
 			} else if (rawPrefix.endsWith("/")) {
 				// If prefix ends with /, show contents of that directory
-				if (rawPrefix.startsWith("~") || expandedPrefix.startsWith("/")) {
+				if (rawPrefix.startsWith("~") || isAbsolutePathLike(expandedPrefix)) {
 					searchDir = expandedPrefix;
 				} else {
 					searchDir = path.join(this.#basePath, expandedPrefix);
@@ -758,7 +762,7 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 				// Split into directory and file prefix
 				const dir = path.dirname(expandedPrefix);
 				const file = path.basename(expandedPrefix);
-				if (rawPrefix.startsWith("~") || expandedPrefix.startsWith("/")) {
+				if (rawPrefix.startsWith("~") || isAbsolutePathLike(expandedPrefix)) {
 					searchDir = dir;
 				} else {
 					searchDir = path.join(this.#basePath, dir);
