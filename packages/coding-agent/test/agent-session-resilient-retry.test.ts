@@ -2884,4 +2884,36 @@ describe("AgentSession resilient retry", () => {
 		expect(requestedModels).toHaveLength(1);
 		expect(lastAssistant(session).stopReason).toBe("error");
 	});
+	it("keeps managed fallback policy unchanged for the typed Responses overload (#5018)", async () => {
+		// The typed overload facts are new transport evidence (issue #5018) and
+		// must not grant the managed chain retry/advance authority it did not
+		// have before. Before the code survived transport, the failure reached
+		// the session as an ordinary committed error and surfaced immediately;
+		// the managed run must still stop on the primary model without a retry
+		// and without switching models.
+		const primary = getBundledModel("openai", "gpt-5.4-mini");
+		const fallback = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!primary || !fallback) throw new Error("Expected bundled test models to exist");
+		const requestedModels: string[] = [];
+		session = buildStatusErrorSession({
+			model: primary,
+			errorMessage: RESPONSES_OVERLOAD_ERROR,
+			transportFailure: RESPONSES_OVERLOAD_FACTS,
+			recoveredContent: "should not be reached",
+			requestedModels,
+		});
+		session.setConfiguredModelChain(
+			"default",
+			[`${primary.provider}/${primary.id}`, `${fallback.provider}/${fallback.id}`],
+			"test",
+		);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("managed typed Responses overload");
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(0);
+		expect(requestedModels).toEqual([`${primary.provider}/${primary.id}`]);
+		expect(lastAssistant(session)).toMatchObject({ stopReason: "error", errorMessage: RESPONSES_OVERLOAD_ERROR });
+	});
 });

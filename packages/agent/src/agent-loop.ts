@@ -14,6 +14,7 @@ import {
 	EventStream,
 	isProviderSafetyStopAuthenticated,
 	isZodSchema,
+	SERVER_OVERLOADED_PROVIDER_CODE,
 	streamSimple,
 	type ToolChoice,
 	type ToolResultMessage,
@@ -783,6 +784,19 @@ function isManagedProviderSafetyStopAuthenticated(value: unknown): boolean {
 function managedRetryableFailure(failure: unknown): boolean {
 	const facts = managedTransportFailure(failure);
 	if (!facts) return false;
+	// OpenAI's typed statusless capacity-overload code (issue #5018) never
+	// becomes managed transaction authority. Before the code survived as
+	// transport facts this failure produced none, so the staged attempt was
+	// always committed; the shared Responses parser and Codex events now carry
+	// it, and this check preserves that committed-failure behavior instead of
+	// discarding the transaction. It reads only typed facts, never error text.
+	if (
+		facts.status === undefined &&
+		facts.providerCode === SERVER_OVERLOADED_PROVIDER_CODE &&
+		(facts.openaiErrorCode === undefined || facts.openaiErrorCode === SERVER_OVERLOADED_PROVIDER_CODE)
+	) {
+		return false;
+	}
 	// A typed provider safety stop is terminal evidence ahead of any transport
 	// class, but only with adapter-minted provenance: unauthenticated labels
 	// are stripped at the stream exit (`sanitizeProviderSafetyStopProvenance`)
