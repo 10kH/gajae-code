@@ -5002,6 +5002,48 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		}
 	});
 
+	test("retains skill terminal recovery across session replacement", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-skill-terminal-replacement-"));
+		let failFirstTerminalWrite = true;
+		try {
+			const harness = await invocationHarness("skill-terminal-replacement", cwd, {
+				invokeSkill: async (_name, _args, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await neverSettlingPromise();
+				},
+				persistInterceptor: transition => {
+					if (transition.type === "agent_end" && failFirstTerminalWrite) {
+						failFirstTerminalWrite = false;
+						throw Object.assign(new Error("injected terminal persistence failure"), { code: "io_error" });
+					}
+				},
+			});
+			const submitted = await harness.control("skill.invoke", {
+				name: "replacement-hang",
+				args: "",
+				clientRef: "skill-terminal-replacement-ref",
+			});
+			expect(submitted.ok).toBe(true);
+			await harness.emit("agent_start");
+			await harness.emit("agent_end");
+			await Bun.sleep(50);
+			await harness.switchSession("skill-terminal-replacement-next");
+			await Bun.sleep(1_100);
+			let settled: { status?: string; error?: { code?: string } } | undefined;
+			for (let attempt = 0; attempt < 500 && settled === undefined; attempt += 1) {
+				const frame = await harness.query("skill.invoke_status", { clientRef: "skill-terminal-replacement-ref" });
+				const result = frame.result as { status?: string; error?: { code?: string } } | undefined;
+				if (result?.status === "terminal_ok" || result?.status === "failed") settled = result;
+				else await Bun.sleep(10);
+			}
+			expect(settled?.status).toBe("terminal_ok");
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("a rejected prompt replays its failure reason, never a bare terminal_ok", async () => {
 		// Exact-head review HIGH: after failed agent_failed persistence, recovery
 		// replayed only agent_end, so an abandoned/rejected prompt became durable

@@ -4635,11 +4635,13 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			throw error;
 		}
 	};
-	const stopActive = async (): Promise<void> => {
+	const stopActive = async (cancelSkillRecovery = false): Promise<void> => {
 		const current = active;
 		if (!current) return;
-		for (const controller of skillRecoveryControllers.values()) controller.abort();
-		for (const controller of skillTerminalRecoveryControllers.values()) controller.abort();
+		if (cancelSkillRecovery) {
+			for (const controller of skillRecoveryControllers.values()) controller.abort();
+			for (const controller of skillTerminalRecoveryControllers.values()) controller.abort();
+		}
 		activePromptOwnerHolder.connectionIds = undefined;
 		activePromptOwnerHolder.lifecycleEpoch = undefined;
 		current.quiesceInput();
@@ -4714,6 +4716,6 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		await startRuntime(ctx);
 	});
 	api.on("session_shutdown", async () => {
-		await stopActive();
+		await stopActive(true);
 	});
 }
