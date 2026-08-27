@@ -182,6 +182,58 @@ describe("GJC tmux session management", () => {
 		expect(listGjcTmuxSessions()).toEqual([]);
 	});
 
+	// A terminal host that emulates tmux for its own agents can export a `$TMUX`
+	// naming a socket it never created. tmux then fails with `error connecting
+	// to <socket>`, which shares its shape with a legitimate "no server" miss —
+	// so gjc used to report zero sessions while sessions were live on the
+	// default socket.
+	it("retries on the default socket when the inherited $TMUX socket is unreachable", () => {
+		const inheritedSocket = "/tmp/host-emulated/agent-team";
+		const sessionRow =
+			"gajae_code_abc\t1\t0\t1770000000\t1\troot\t2\t12345\tfeature/demo\tfeature-demo\t/repo-a\t\t\t\t\t\t$1";
+		const observedTmux: (string | undefined)[] = [];
+		spyOn(Bun, "spawnSync").mockImplementation(((command: unknown, options: unknown) => {
+			if (!spawnArgv(command).includes("list-sessions")) return spawnResult(0, "");
+			const inherited = (options as { env?: NodeJS.ProcessEnv } | undefined)?.env?.TMUX;
+			observedTmux.push(inherited);
+			if (inherited) return spawnResult(1, "", `error connecting to ${inheritedSocket} (No such file or directory)`);
+			return spawnResult(0, sessionRow);
+		}) as never);
+		clearPsmuxDetectionCache();
+
+		const sessions = listGjcTmuxSessions({ GJC_TMUX_COMMAND: "tmux-test", TMUX: `${inheritedSocket},0,1` });
+
+		expect(sessions.map(session => session.name)).toEqual(["gajae_code_abc"]);
+		expect(observedTmux[0]).toBe(`${inheritedSocket},0,1`);
+		expect(observedTmux).toContain(undefined);
+	});
+
+	it("still reports an empty list when the default socket has no server either", () => {
+		const inheritedSocket = "/tmp/host-emulated/agent-team";
+		spyOn(Bun, "spawnSync").mockImplementation(((command: unknown, options: unknown) => {
+			if (!spawnArgv(command).includes("list-sessions")) return spawnResult(0, "");
+			return (options as { env?: NodeJS.ProcessEnv } | undefined)?.env?.TMUX
+				? spawnResult(1, "", `error connecting to ${inheritedSocket} (No such file or directory)`)
+				: spawnResult(1, "", "no server running on /tmp/tmux-501/default");
+		}) as never);
+		clearPsmuxDetectionCache();
+
+		expect(listGjcTmuxSessions({ GJC_TMUX_COMMAND: "tmux-test", TMUX: `${inheritedSocket},0,1` })).toEqual([]);
+	});
+
+	it("does not retry when the failure does not name the inherited socket", () => {
+		let listCalls = 0;
+		spyOn(Bun, "spawnSync").mockImplementation(((command: unknown) => {
+			if (!spawnArgv(command).includes("list-sessions")) return spawnResult(0, "");
+			listCalls += 1;
+			return spawnResult(1, "", "no server running on /tmp/tmux-501/default");
+		}) as never);
+		clearPsmuxDetectionCache();
+
+		expect(listGjcTmuxSessions({ GJC_TMUX_COMMAND: "tmux-test" })).toEqual([]);
+		expect(listCalls).toBe(1);
+	});
+
 	it("reports provider-aware diagnostics before spawning when Windows has no multiplexer", async () => {
 		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-tmux-sessions-test-"));
 		fixtureDirectories.push(stateDir);

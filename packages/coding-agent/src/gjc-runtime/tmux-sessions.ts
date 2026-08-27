@@ -305,20 +305,54 @@ function parseSessionLine(line: string): GjcTmuxSessionStatus | null {
 	};
 }
 
+/** tmux failure shapes that mean "this socket has no server", not "tmux is broken". */
+function isMissingServerFailure(message: string): boolean {
+	return (
+		message.includes("no server running") ||
+		message.includes("failed to connect to server") ||
+		message.includes("error connecting to")
+	);
+}
+
+/**
+ * `$TMUX` is inherited from whatever launched gjc and names the socket tmux
+ * talks to. Terminal hosts that emulate tmux for their own agents can export a
+ * `$TMUX` pointing at a socket they never created, and tmux then fails with
+ * `error connecting to <socket>` — the same message shape as a legitimate
+ * "no server" miss. Returning the socket path lets callers tell the two apart
+ * instead of reporting zero sessions while sessions are live on the default
+ * socket.
+ */
+function inheritedTmuxSocketPath(env: NodeJS.ProcessEnv): string | null {
+	const socket = env.TMUX?.split(",")[0]?.trim();
+	return socket ? socket : null;
+}
+
+function envWithoutInheritedTmux(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+	const withoutTmux: NodeJS.ProcessEnv = { ...env };
+	delete withoutTmux.TMUX;
+	return withoutTmux;
+}
+
 function runListSessions(format: string, env: NodeJS.ProcessEnv = process.env): string[] {
 	let output = "";
 	try {
 		output = runTmux(["list-sessions", "-F", format], env);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
-		if (
-			message.includes("no server running") ||
-			message.includes("failed to connect to server") ||
-			message.includes("error connecting to")
-		) {
-			return [];
+		if (!isMissingServerFailure(message)) throw error;
+		const inheritedSocket = inheritedTmuxSocketPath(env);
+		// A miss on the default socket is a real empty list; only the inherited
+		// socket is suspect, so retry without it before concluding there is
+		// nothing to list.
+		if (!inheritedSocket || !message.includes(inheritedSocket)) return [];
+		try {
+			output = runTmux(["list-sessions", "-F", format], envWithoutInheritedTmux(env));
+		} catch (retryError) {
+			const retryMessage = retryError instanceof Error ? retryError.message : String(retryError);
+			if (isMissingServerFailure(retryMessage)) return [];
+			throw retryError;
 		}
-		throw error;
 	}
 	const lines = output
 		.split("\n")
