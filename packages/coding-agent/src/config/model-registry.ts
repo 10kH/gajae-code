@@ -5005,11 +5005,9 @@ export class ModelRegistry {
 			const authHeader =
 				this.#runtimeProviderAuthHeaders.get(model.provider) ?? this.#customProviderAuthHeaders.get(model.provider);
 			if (authHeader !== true) continue;
-			if (model.headers?.Authorization !== undefined || model.headers?.["X-Api-Key"] !== undefined)
-				this.#generatedAuthHeaders.set(model, {
-					authorization: model.headers?.Authorization,
-					apiKey: model.headers?.["X-Api-Key"],
-				});
+			const resolved = this.#customProviderApiKeys.get(model.provider);
+			if (resolved !== undefined && model.headers?.Authorization === `Bearer ${resolved}`)
+				this.#generatedAuthHeaders.set(model, { authorization: model.headers.Authorization });
 		}
 	}
 
@@ -5235,6 +5233,7 @@ export class ModelRegistry {
 				const credential = this.authStorage.getOAuthCredential(providerName);
 				if (credential) {
 					this.#models = this.#finalizeModels(config.oauth.modifyModels(withModelOverrides, credential));
+					this.#recordGeneratedAuthHeaders();
 					this.#rebuildCanonicalIndex();
 					this.#rebuildProviderActivity();
 					return;
@@ -5242,6 +5241,7 @@ export class ModelRegistry {
 			}
 
 			this.#models = this.#finalizeModels(withModelOverrides);
+			this.#recordGeneratedAuthHeaders();
 			this.#rebuildCanonicalIndex();
 			this.#rebuildProviderActivity();
 			return;

@@ -1816,7 +1816,7 @@ async function refreshModelPresetRegistryInner(
 			async () => {
 				if (environmentDisabled()) return { status: "disabled", revision: undefined } as const;
 				const allowTestUrls = modelPresetRegistryTestUrlsAllowed(agentDir);
-				const control = loadControlSync(agentDir);
+				let control = loadControlSync(agentDir);
 				if (control.disabled || environmentDisabled())
 					return { status: "disabled", revision: control.pinnedRevision };
 				const state = loadStateSync(agentDir);
@@ -1847,10 +1847,14 @@ async function refreshModelPresetRegistryInner(
 					control.pinnedRevision === undefined
 						? undefined
 						: usableState.history.find(item => item.manifest.signed.registryRevision === control.pinnedRevision);
-				const effectivePinnedRevision =
-					stateIsVerified && !controlPinnedGeneration?.revoked
-						? control.pinnedRevision
-						: usableState.activeRevision;
+				const staleControlPin =
+					control.pinnedRevision !== undefined &&
+					(controlPinnedGeneration === undefined || controlPinnedGeneration.revoked === true);
+				if (staleControlPin) {
+					control = { ...control, pinnedRevision: undefined };
+					await writeAtomicJson(paths.control, control);
+				}
+				const effectivePinnedRevision = stateIsVerified ? control.pinnedRevision : usableState.activeRevision;
 				const trustedHighestSeenRevision = stateIsVerified
 					? state.highestSeenRevision
 					: (recoveredState?.highestSeenRevision ?? recoveryGeneration?.manifest.signed.registryRevision);
