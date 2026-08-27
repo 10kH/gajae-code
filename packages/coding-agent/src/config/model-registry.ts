@@ -1470,7 +1470,6 @@ export class ModelRegistry {
 	#customProviderApiKeys: Map<string, string> = new Map();
 	#customProviderApiKeyEnvNames: Map<string, string> = new Map();
 	#customProviderAuthHeaders: Map<string, boolean> = new Map();
-	#authHeaderManagedProviders: Set<string> = new Set();
 	#providerWebSearchModes: Map<string, WebSearchMode> = new Map();
 	#keylessProviders: Set<string> = new Set();
 	#optionalAuthProviders: Set<string> = new Set();
@@ -1533,6 +1532,7 @@ export class ModelRegistry {
 	#runtimeProviderApiKeyEnvNames: Map<string, string> = new Map();
 	#runtimeProviderOverrides: Map<string, ProviderOverride> = new Map();
 	#runtimeProviderAuthHeaders: Map<string, boolean> = new Map();
+	#generatedAuthHeaderProviders: Set<string> = new Set();
 	#runtimeProvidersBySource: Map<string, Set<string>> = new Map();
 	#runtimeProviderSourceByName: Map<string, string> = new Map();
 	#registryModelKeys: Set<string> = new Set();
@@ -2463,7 +2463,6 @@ export class ModelRegistry {
 			if (providerConfig.openaiCompat?.apiKey)
 				this.#configuredApiKeyEnvNames.add(providerConfig.openaiCompat.apiKey);
 			if (providerConfig.webSearch) this.#providerWebSearchModes.set(providerName, providerConfig.webSearch);
-			if (providerConfig.authHeader === true) this.#authHeaderManagedProviders.add(providerName);
 			const providerApiKeyConfig = providerConfig.apiKey
 				? resolveApiKeyConfig(providerConfig.apiKey)
 				: resolveApiKeyEnvConfig(providerConfig.apiKeyEnv);
@@ -4971,7 +4970,8 @@ export class ModelRegistry {
 		}
 		const authHeader =
 			this.#runtimeProviderAuthHeaders.get(provider) ?? this.#customProviderAuthHeaders.get(provider);
-		if (authHeader !== true && !this.#authHeaderManagedProviders.has(provider)) return;
+		if (authHeader === true) this.#generatedAuthHeaderProviders.add(provider);
+		if (authHeader !== true && !this.#generatedAuthHeaderProviders.has(provider)) return;
 		for (const model of this.#models) {
 			if (model.provider !== provider) continue;
 			const headers = { ...(model.headers ?? {}) };
@@ -4985,8 +4985,8 @@ export class ModelRegistry {
 	#applyEffectiveAuthHeader(model: Model<Api>, apiKey: string | undefined): void {
 		const authHeader =
 			this.#runtimeProviderAuthHeaders.get(model.provider) ?? this.#customProviderAuthHeaders.get(model.provider);
-		if (authHeader === true) this.#authHeaderManagedProviders.add(model.provider);
-		if (authHeader !== true && !this.#authHeaderManagedProviders.has(model.provider)) return;
+		if (authHeader === true) this.#generatedAuthHeaderProviders.add(model.provider);
+		if (authHeader !== true && !this.#generatedAuthHeaderProviders.has(model.provider)) return;
 		const headers = { ...(model.headers ?? {}) };
 		delete headers.Authorization;
 		model.headers =
@@ -5133,6 +5133,10 @@ export class ModelRegistry {
 				sourceId,
 			});
 		}
+		if (config.authHeader !== undefined) {
+			this.#runtimeProviderAuthHeaders.set(providerName, config.authHeader);
+			if (config.authHeader === true) this.#generatedAuthHeaderProviders.add(providerName);
+		}
 
 		let sourceHandoff = false;
 		if (sourceId) {
@@ -5163,7 +5167,6 @@ export class ModelRegistry {
 			if (!resolved) return;
 			if (Bun.env[config.apiKey] !== undefined) this.#runtimeProviderApiKeyEnvNames.set(providerName, config.apiKey);
 			else this.#runtimeProviderApiKeyEnvNames.delete(providerName);
-			if (config.authHeader === true) this.#authHeaderManagedProviders.add(providerName);
 			this.#customProviderApiKeys.set(providerName, resolved);
 			// Persist runtime API keys so they survive #reloadStaticModels() cycles
 			this.#runtimeProviderApiKeys.set(providerName, config.apiKey);
@@ -5255,6 +5258,11 @@ export class ModelRegistry {
 				if (m.provider !== providerName) return m;
 				return this.#applyRuntimeProviderOverride(m, transportOverride);
 			});
+			if (config.authHeader === false) {
+				for (const model of this.#models) {
+					if (model.provider === providerName) this.#applyEffectiveAuthHeader(model, undefined);
+				}
+			}
 			this.#rebuildCanonicalIndex();
 			this.#rebuildProviderActivity();
 		}

@@ -1843,7 +1843,14 @@ async function refreshModelPresetRegistryInner(
 				const usableState: RegistryState = stateIsVerified
 					? state
 					: (recoveredState ?? { ...state, activeRevision: undefined, history: [] });
-				const effectivePinnedRevision = stateIsVerified ? control.pinnedRevision : undefined;
+				const controlPinnedGeneration =
+					control.pinnedRevision === undefined
+						? undefined
+						: usableState.history.find(item => item.manifest.signed.registryRevision === control.pinnedRevision);
+				const effectivePinnedRevision =
+					stateIsVerified && !controlPinnedGeneration?.revoked
+						? control.pinnedRevision
+						: usableState.activeRevision;
 				const trustedHighestSeenRevision = stateIsVerified
 					? state.highestSeenRevision
 					: (recoveredState?.highestSeenRevision ?? recoveryGeneration?.manifest.signed.registryRevision);
