@@ -52,9 +52,10 @@ A session with no explicit `retry.*` settings and a single-model default role (n
 
 - canonical first-event and idle-stream watchdog aborts, recognized from the typed timeout fact or an exact canonical sentinel message
 - the OpenAI Codex `server_is_overloaded` event, recognized from that provider's typed overload code
+- the generic OpenAI Responses `server_is_overloaded` terminal envelope, recognized from the exact statusless `openaiErrorCode` and matching `providerCode`
 - Anthropic's typed `overloaded_error` envelope, recognized by parsing the error envelope and requiring both the outer `type` and the nested `error.type` to match
 
-Overload admissions therefore require a provider-specific typed signature, while watchdog admissions accept only their canonical sentinel messages. Every admission additionally requires that the attempt carry no assistant text, thinking, or tool call and no conflicting transport facts; a status-bearing or otherwise typed failure surfaces instead. Generic or noncanonical overload and timeout wording never authorizes a replay.
+Overload admissions therefore require a provider-specific typed signature, while watchdog admissions accept only their canonical sentinel messages. Every admission additionally requires that the attempt carry no assistant text, thinking, or tool call and no conflicting transport facts; a status-bearing or otherwise typed failure surfaces instead. Untyped or noncanonical overload and timeout wording never authorizes a replay.
 
 ### Local snapshot failures (surface immediately, no retry)
 
@@ -85,7 +86,7 @@ Flow (`#handleRetryableError`):
 2. If `retry.enabled === false`, stop immediately (`false`, no retry started). Managed provider-fallback failures keep their own chain policy; local snapshot and buffer-overflow failures surface immediately regardless of this setting.
 3. Increment `#retryAttempt`.
 4. Create `#retryPromise` once (first attempt in a chain).
-5. In the legacy single-model path, ordinary transient errors retry without an attempt limit, while canonical idle-stream watchdog stalls and unknown/no-code errors stop after `retry.maxRetries`. Managed fallback instead uses its controller's per-entry `fallback.maxAttempts` budget.
+5. In the legacy single-model path, ordinary transient errors retry without an attempt limit. Typed provider-overload replays, canonical idle-stream watchdog stalls, and unknown/no-code errors stop after `retry.maxRetries`. Managed fallback instead uses its controller's per-entry `fallback.maxAttempts` budget.
 6. Compute exponential full-jitter delay capped at `retry.maxDelayMs`; legacy parsed provider retry-after values override computed backoff and are capped at `retry.maxDelayMs`, while managed typed Retry-After values are intentionally uncapped.
 7. For usage-limit errors, call auth storage (`markUsageLimitReached(...)`); if credential switching succeeds, force delay to `0`, otherwise use the applicable backoff.
 8. Eligible ordered role-array fallback chains advance on entry-budget exhaustion. A selected fallback entry remains sticky until the head selector's rate-limit cooldown expires, when `retry.fallbackRevertPolicy: cooldown-expiry` probes it again on a new turn.

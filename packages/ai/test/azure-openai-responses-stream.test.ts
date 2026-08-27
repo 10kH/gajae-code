@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import { type AzureOpenAIResponsesOptions, streamAzureOpenAIResponses } from "../src/providers/azure-openai-responses";
 import { getEnvApiKey } from "../src/stream";
 import type { Context, Model, Tool } from "../src/types";
+import { classifyFallbackTrigger } from "../src/utils/fallback-transport";
 
 const originalFetch = global.fetch;
 
@@ -278,6 +279,61 @@ describe("azure openai responses streaming", () => {
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toContain("server_error: backend exploded late");
 	});
+	it("preserves the typed capacity-overload code from both terminal envelope shapes", async () => {
+		// Azure shares the Responses parser, so the typed code survives provider
+		// finalization here too and classifies as a server fallback trigger. The
+		// session's bare-default replay admission is scoped to the generic
+		// `openai-responses` API and is unaffected by this.
+		for (const response of [
+			{ error: { code: "server_is_overloaded", message: "Our servers are currently overloaded." } },
+			{
+				status: "failed",
+				error: { code: "server_is_overloaded", message: "Our servers are currently overloaded." },
+			},
+		]) {
+			const type = "status" in response ? "response.completed" : "response.failed";
+			global.fetch = vi.fn(async () => createSseResponse([{ type, response }])) as unknown as typeof fetch;
+
+			const result = await streamAzureOpenAIResponses(
+				azureModel,
+				{ messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }] },
+				{ apiKey: "test-key", azureBaseUrl: azureModel.baseUrl, azureApiVersion: "v1" },
+			).result();
+
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toContain("server_is_overloaded: Our servers are currently overloaded.");
+			expect(result.transportFailure).toMatchObject({
+				kind: "transport",
+				providerCode: "server_is_overloaded",
+				openaiErrorCode: "server_is_overloaded",
+			});
+			expect(result.transportFailure?.status).toBeUndefined();
+			expect(classifyFallbackTrigger(result.transportFailure)).toEqual({ class: "server" });
+		}
+	});
+
+	it("leaves near-miss and case-variant Azure overload codes untyped", async () => {
+		for (const code of ["server_is_overloaded_now", "SERVER_IS_OVERLOADED"]) {
+			global.fetch = vi.fn(async () =>
+				createSseResponse([
+					{
+						type: "response.failed",
+						response: { error: { code, message: "Our servers are currently overloaded." } },
+					},
+				]),
+			) as unknown as typeof fetch;
+
+			const result = await streamAzureOpenAIResponses(
+				azureModel,
+				{ messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }] },
+				{ apiKey: "test-key", azureBaseUrl: azureModel.baseUrl, azureApiVersion: "v1" },
+			).result();
+
+			expect(result.stopReason).toBe("error");
+			expect(result.transportFailure).toBeUndefined();
+		}
+	});
+
 	it("preserves assistant message phase when rebuilding fallback replay history", async () => {
 		const payload = await captureAzurePayload({
 			messages: [
