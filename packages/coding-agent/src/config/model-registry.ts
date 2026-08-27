@@ -1943,7 +1943,6 @@ export class ModelRegistry {
 		const combined = this.#mergeCustomModels(withConfigModels, this.#runtimeModelOverlays);
 		const withModelOverrides = this.#applyModelOverrides(combined, this.#modelOverrides);
 		this.#models = this.#finalizeModels(this.#applyRuntimeProviderOverrides(withModelOverrides));
-		this.#recordGeneratedAuthHeaders();
 		this.#modelProfiles = mergeModelProfiles(
 			profiles,
 			filterMaterializedRegistryProfiles(
@@ -2949,7 +2948,6 @@ export class ModelRegistry {
 		const combined = this.#mergeCustomModels(withConfigModels, this.#runtimeModelOverlays);
 		const withModelOverrides = this.#applyModelOverrides(combined, this.#modelOverrides);
 		this.#models = this.#finalizeModels(this.#applyRuntimeProviderOverrides(withModelOverrides));
-		this.#recordGeneratedAuthHeaders();
 		this.#rebuildCanonicalIndex();
 	}
 
@@ -4002,14 +4000,7 @@ export class ModelRegistry {
 			isOAuth: override.isOAuth ?? baseOverride?.isOAuth,
 		};
 	}
-	#applyProviderTransportOverride<
-		T extends {
-			baseUrl?: string;
-			headers?: Record<string, string>;
-			compat?: Model<Api>["compat"];
-			cacheRetention?: CacheRetention;
-		},
-	>(
+	#applyProviderTransportOverride<T extends Model<Api>>(
 		entry: T,
 		override: Pick<
 			ProviderOverride,
@@ -4025,7 +4016,7 @@ export class ModelRegistry {
 	): T {
 		const overrideHeaders = override.headers ? { ...entry.headers, ...override.headers } : entry.headers;
 		const headers = mergeAuthHeader(overrideHeaders, override.authHeader, override.apiKey);
-		return {
+		const result = {
 			...entry,
 			compat: mergeProviderCompat(entry.compat, override.compat),
 			baseUrl: override.baseUrl ?? entry.baseUrl,
@@ -4039,6 +4030,17 @@ export class ModelRegistry {
 			),
 			cacheRetention: entry.cacheRetention ?? override.cacheRetention,
 		};
+		if (
+			override.authHeader === true &&
+			override.apiKey !== undefined &&
+			result.headers?.Authorization !== undefined
+		) {
+			this.#generatedAuthHeaders.set(result, { authorization: result.headers.Authorization });
+		} else {
+			const generated = this.#generatedAuthHeaders.get(entry);
+			if (generated) this.#generatedAuthHeaders.set(result, generated);
+		}
+		return result;
 	}
 	#applyRuntimeProviderOverride(model: Model<Api>, override: ProviderOverride): Model<Api> {
 		const withTransportOverride = this.#applyProviderTransportOverride(
@@ -4056,7 +4058,7 @@ export class ModelRegistry {
 				? { ...sanitizedTransport, compat: mergeCompat(sanitizedTransport.compat, modelCompat) }
 				: sanitizedTransport,
 		);
-		const generated = this.#generatedAuthHeaders.get(model);
+		const generated = this.#generatedAuthHeaders.get(sanitizedTransport);
 		if (generated) this.#generatedAuthHeaders.set(result, generated);
 		return result;
 	}
@@ -4069,11 +4071,13 @@ export class ModelRegistry {
 		});
 	}
 	#finalizeModels(models: Model<Api>[]): Model<Api>[] {
-		return applyFinalCodexGpt56ContextCap(
-			models.map(model => enrichModelThinking({ ...this.#restoreDeclaredThinking(model) })),
-			undefined,
-			this.#codexContextWindowOverrides,
-		);
+		const finalized = models.map(model => enrichModelThinking({ ...this.#restoreDeclaredThinking(model) }));
+		const result = applyFinalCodexGpt56ContextCap(finalized, undefined, this.#codexContextWindowOverrides);
+		for (let index = 0; index < result.length; index++) {
+			const generated = this.#generatedAuthHeaders.get(models[index]!);
+			if (generated) this.#generatedAuthHeaders.set(result[index]!, generated);
+		}
+		return result;
 	}
 	#restoreDeclaredThinking(model: Model<Api>): Model<Api> {
 		const overrideThinking = this.#modelOverrides
@@ -5004,17 +5008,6 @@ export class ModelRegistry {
 		if (authHeader === true) this.#generatedAuthHeaders.set(model, { authorization: model.headers.Authorization });
 	}
 
-	#recordGeneratedAuthHeaders(): void {
-		for (const model of this.#models) {
-			const authHeader =
-				this.#runtimeProviderAuthHeaders.get(model.provider) ?? this.#customProviderAuthHeaders.get(model.provider);
-			if (authHeader !== true) continue;
-			const resolved = this.#customProviderApiKeys.get(model.provider);
-			if (resolved !== undefined && model.headers?.Authorization === `Bearer ${resolved}`)
-				this.#generatedAuthHeaders.set(model, { authorization: model.headers.Authorization });
-		}
-	}
-
 	async #peekApiKeyForProvider(
 		provider: string,
 		options: {
@@ -5260,7 +5253,6 @@ export class ModelRegistry {
 				const credential = this.authStorage.getOAuthCredential(providerName);
 				if (credential) {
 					this.#models = this.#finalizeModels(config.oauth.modifyModels(withModelOverrides, credential));
-					this.#recordGeneratedAuthHeaders();
 					this.#rebuildCanonicalIndex();
 					this.#rebuildProviderActivity();
 					return;
@@ -5268,7 +5260,6 @@ export class ModelRegistry {
 			}
 
 			this.#models = this.#finalizeModels(withModelOverrides);
-			this.#recordGeneratedAuthHeaders();
 			this.#rebuildCanonicalIndex();
 			this.#rebuildProviderActivity();
 			return;

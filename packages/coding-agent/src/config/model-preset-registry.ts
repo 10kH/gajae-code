@@ -1182,8 +1182,9 @@ function acceptedRegistryFromState(
 		control.pinnedRevision === undefined
 			? undefined
 			: state.history.find(item => item.manifest.signed.registryRevision === control.pinnedRevision);
-	const staleRevokedPin = pinnedGeneration?.revoked === true;
-	const revision = staleRevokedPin ? state.activeRevision : (control.pinnedRevision ?? state.activeRevision);
+	const staleControlPin =
+		control.pinnedRevision !== undefined && (pinnedGeneration === undefined || pinnedGeneration.revoked === true);
+	const revision = staleControlPin ? state.activeRevision : (control.pinnedRevision ?? state.activeRevision);
 	const generation = state.history.find(item => item.manifest.signed.registryRevision === revision);
 	if (revision !== undefined && !generation)
 		throw new Error(`Registry selected revision ${revision} is missing from accepted history.`);
@@ -1195,7 +1196,7 @@ function acceptedRegistryFromState(
 			retainedProfiles: [],
 			retainedPresets: [],
 			disabled: false,
-			pinnedRevision: control.pinnedRevision,
+			pinnedRevision: staleControlPin ? undefined : control.pinnedRevision,
 		};
 	const valid = validateGeneration(generation, effectiveTrustedKeys(dependencies, agentDir));
 	return {
@@ -1210,7 +1211,7 @@ function acceptedRegistryFromState(
 		retainedProfiles: valid.retainedProfiles.map(profile => profile.id),
 		retainedPresets: valid.retainedPresets.map(preset => `${preset.provider}/${preset.id}`),
 		disabled: false,
-		pinnedRevision: staleRevokedPin ? undefined : control.pinnedRevision,
+		pinnedRevision: staleControlPin ? undefined : control.pinnedRevision,
 	};
 }
 
@@ -2224,8 +2225,9 @@ export function getModelPresetRegistryStatus(
 		control.pinnedRevision === undefined
 			? undefined
 			: state.history.find(item => item.manifest.signed.registryRevision === control.pinnedRevision);
-	const staleRevokedPin = pinnedGeneration?.revoked === true;
-	const revision = staleRevokedPin ? state.activeRevision : (control.pinnedRevision ?? state.activeRevision);
+	const staleControlPin =
+		control.pinnedRevision !== undefined && (pinnedGeneration === undefined || pinnedGeneration.revoked === true);
+	const revision = staleControlPin ? state.activeRevision : (control.pinnedRevision ?? state.activeRevision);
 	const generation = state.history.find(item => item.manifest.signed.registryRevision === revision);
 	let valid: AcceptedGeneration | undefined;
 	if (revision !== undefined && !generation) {
@@ -2258,7 +2260,7 @@ export function getModelPresetRegistryStatus(
 		lastCheckedAt: state.lastCheckedAt,
 		lastError: loadError ?? state.lastError,
 		disabled,
-		pinnedRevision: staleRevokedPin ? undefined : control.pinnedRevision,
+		pinnedRevision: staleControlPin ? undefined : control.pinnedRevision,
 		retainedProfiles: valid?.retainedProfiles.map(profile => profile.id) ?? [],
 		retainedPresets: valid?.retainedPresets.map(preset => `${preset.provider}/${preset.id}`) ?? [],
 		historyRevisions: state.history
