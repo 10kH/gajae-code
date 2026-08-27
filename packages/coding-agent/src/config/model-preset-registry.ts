@@ -2154,7 +2154,13 @@ export async function rollbackModelPresetRegistry(
 	await withFileLock(paths.transaction, async () => {
 		const state = recoverStateForRead(loadStateSync(agentDir), effectiveTrustedKeys(options));
 		const control = loadControlSync(agentDir);
-		const activeRevision = control.pinnedRevision ?? state.activeRevision;
+		const pinnedGeneration =
+			control.pinnedRevision === undefined
+				? undefined
+				: state.history.find(item => item.manifest.signed.registryRevision === control.pinnedRevision);
+		const activeRevision = pinnedGeneration?.revoked
+			? state.activeRevision
+			: (control.pinnedRevision ?? state.activeRevision);
 		const revision =
 			options.revision ??
 			state.history
