@@ -310,7 +310,7 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 	// Intentionally separate from pi-natives cache: this cache is a local,
 	// per-directory readdir fast-path for prefix completions. Global fuzzy
 	// discovery continues to use native fuzzyFind + shared scan cache.
-	#dirCache: Map<string, { entries: fs.Dirent[]; timestamp: number }> = new Map();
+	#dirCache: Map<string, { entries: fs.Dirent[]; resolvedDir: string; timestamp: number }> = new Map();
 	readonly #DIR_CACHE_TTL = 2000; // 2 seconds
 
 	constructor(commands: (SlashCommand | AutocompleteItem)[] = [], basePath: string = getProjectDir()) {
@@ -624,16 +624,32 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 		return `${displayBase}${relativePath}`;
 	}
 
-	async #getCachedDirEntries(searchDir: string): Promise<fs.Dirent[]> {
+	async #getCachedDirEntries(searchDir: string): Promise<{ entries: fs.Dirent[]; resolvedDir: string }> {
 		const now = Date.now();
 		const cached = this.#dirCache.get(searchDir);
 
 		if (cached && now - cached.timestamp < this.#DIR_CACHE_TTL) {
-			return cached.entries;
+			return { entries: cached.entries, resolvedDir: cached.resolvedDir };
 		}
 
-		const entries = await fs.promises.readdir(searchDir, { withFileTypes: true });
-		this.#dirCache.set(searchDir, { entries, timestamp: now });
+		const searchDirs = [...new Set([searchDir, searchDir.normalize("NFD"), searchDir.normalize("NFC")])];
+		let entries: fs.Dirent[] | undefined;
+		let resolvedDir: string | undefined;
+		for (const candidate of searchDirs) {
+			try {
+				entries = await fs.promises.readdir(candidate, { withFileTypes: true });
+				resolvedDir = candidate;
+				break;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+					throw error;
+				}
+			}
+		}
+		if (!entries || !resolvedDir) {
+			throw new Error(`Directory not found: ${searchDir}`);
+		}
+		this.#dirCache.set(searchDir, { entries, resolvedDir, timestamp: now });
 
 		if (this.#dirCache.size > 100) {
 			const sortedKeys = [...this.#dirCache.entries()]
@@ -645,7 +661,7 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 			}
 		}
 
-		return entries;
+		return { entries, resolvedDir };
 	}
 
 	invalidateDirCache(dir?: string): void {
@@ -706,9 +722,27 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 				searchPrefix = file;
 			}
 
-			const entries = await this.#getCachedDirEntries(searchDir);
+			const { entries, resolvedDir } = await this.#getCachedDirEntries(searchDir);
 			const suggestions: AutocompleteItem[] = [];
 			const lowerSearchPrefix = searchPrefix.normalize("NFC").toLowerCase();
+			const resolvedDirectoryPrefix = (() => {
+				if (resolvedDir === searchDir) return rawPrefix.endsWith("/") ? rawPrefix : path.dirname(rawPrefix);
+
+				const normalizedResolvedDir = resolvedDir.replaceAll(path.sep, "/");
+				let prefix: string;
+				if (rawPrefix.startsWith("~")) {
+					const homeRelative = path.relative(this.#expandHomePath("~"), resolvedDir).replaceAll(path.sep, "/");
+					prefix = homeRelative ? `~/${homeRelative}` : "~";
+				} else if (path.isAbsolute(expandedPrefix)) {
+					prefix = normalizedResolvedDir;
+				} else {
+					const relative = path.relative(this.#basePath, resolvedDir).replaceAll(path.sep, "/");
+					prefix = rawPrefix.startsWith("./") && relative ? `./${relative}` : relative;
+				}
+				return prefix ? `${prefix}/` : prefix;
+			})();
+			const resolvedDisplayPrefix =
+				resolvedDir === searchDir ? rawPrefix : `${resolvedDirectoryPrefix}${searchPrefix}`;
 
 			for (const entry of entries) {
 				if (!entry.name.normalize("NFC").toLowerCase().startsWith(lowerSearchPrefix)) {
@@ -733,7 +767,7 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 
 				let relativePath: string;
 				const name = entry.name;
-				const displayPrefix = rawPrefix;
+				const displayPrefix = resolvedDisplayPrefix;
 
 				if (displayPrefix.endsWith("/")) {
 					// If prefix ends with /, append entry to the prefix
