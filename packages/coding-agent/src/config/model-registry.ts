@@ -5289,9 +5289,11 @@ export class ModelRegistry {
 			this.#runtimeProviderApiKeyEnvNames.delete(providerName);
 			this.#customProviderApiKeys.delete(providerName);
 			this.authStorage.removeConfigApiKey(providerName);
+			this.#runtimeModelOverlays = this.#runtimeModelOverlays.filter(overlay => overlay.provider !== providerName);
 			const previousOverride = this.#runtimeProviderOverrides.get(providerName);
 			if (previousOverride)
 				this.#runtimeProviderOverrides.set(providerName, { ...previousOverride, apiKey: "", isOAuth: true });
+			this.#staticModelsLoaded = false;
 			this.#reloadStaticModels();
 		}
 
