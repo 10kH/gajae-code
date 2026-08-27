@@ -3,10 +3,10 @@ import { once, sanitizeText } from "@gajae-code/utils";
 
 import type { ModelManagerOptions } from "../model-manager";
 import { buildZCodeSourceHeaders, resolveGlmZcodeAnthropicBaseUrl } from "../providers/anthropic";
+import { fetchKiroApiModels, isKiroApiKey, kiroApiStaticModels } from "../providers/kiro-api-key";
 import { fetchOpenCodexModels, OPENCODEX_MODEL_CACHE_TTL_MS } from "../providers/openai-opencodex-responses";
 import { fetchCodexModels } from "../utils/discovery/codex";
 import { fetchOpenAICompatibleModels } from "../utils/discovery/openai-compatible";
-import { fetchKiroApiModels, isKiroApiKey, kiroApiStaticModels } from "../providers/kiro-api-key";
 import { createBundledReferenceMap } from "./bundled-references";
 export function openCodexModelManagerOptions(): ModelManagerOptions<"openai-responses"> {
 	return {
