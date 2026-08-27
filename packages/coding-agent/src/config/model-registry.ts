@@ -5059,7 +5059,8 @@ export class ModelRegistry {
 				authHeader === true && resolved
 					? { ...headers, Authorization: `Bearer ${resolved}`, [GENERATED_AUTH_HEADER]: `Bearer ${resolved}` }
 					: headers;
-			if (authHeader === true) this.#generatedAuthHeaders.set(model, { authorization: model.headers.Authorization });
+			if (authHeader === true && resolved)
+				this.#generatedAuthHeaders.set(model, { authorization: model.headers.Authorization });
 		}
 		this.#rebuildCanonicalIndex();
 	}
