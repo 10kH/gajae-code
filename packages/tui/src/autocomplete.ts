@@ -133,7 +133,7 @@ function fuzzyCharMatches(queryChar: string, targetChar: string): boolean {
 	return queryChar === targetChar || hangulInitialJamo(targetChar) === queryChar;
 }
 
-function normalizeFuzzyText(value: string): string {
+export function normalizeFuzzyText(value: string): string {
 	return value
 		.normalize("NFC")
 		.toLowerCase()
@@ -184,6 +184,8 @@ function fuzzyScore(query: string, target: string): number {
 	// Base score 40 for subsequence, minus penalty for gaps
 	return Math.max(1, 40 - gaps * 5);
 }
+
+export { fuzzyMatch as autocompleteFuzzyMatch, fuzzyScore as autocompleteFuzzyScore };
 export function getSlashCommandMatchRank(query: string, commandName: string): number {
 	const normalizedQuery = normalizeSlashCommandText(query);
 	if (normalizedQuery.length === 0) return 4;
