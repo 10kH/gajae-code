@@ -163,11 +163,12 @@ function isPathInDirectory(filePath: string, directoryPath: string): boolean {
 }
 
 export type PackageManagerTarget = { manager: "npm"; packageName: string };
+type MigrationUpdateTarget = { method: "migrate"; path: string; previousPath?: string };
 export type UpdateTarget =
 	| { method: "bun" }
 	| { method: "npm"; packageName: string }
 	| { method: "binary"; path: string }
-	| { method: "migrate"; path: string; previousPath?: string };
+	| MigrationUpdateTarget;
 
 type PathPlatform = NodeJS.Platform;
 type PackageExists = (packageName: string, packageRoot: string) => boolean;
@@ -504,6 +505,43 @@ async function verifyInstalledRuntime(
 			smokeTestOutput: error instanceof Error ? error.message : String(error),
 		};
 	}
+}
+
+interface MigrationTargetVerificationOptions {
+	runtimePath: string;
+	verifyChecksum: () => Promise<void>;
+	verifyRuntime: () => Promise<InstalledVersionVerification>;
+}
+
+async function verifyMigrationTargetWith(
+	options: MigrationTargetVerificationOptions,
+): Promise<InstalledVersionVerification> {
+	try {
+		await options.verifyChecksum();
+	} catch {
+		return { ok: false, path: options.runtimePath };
+	}
+	return await options.verifyRuntime();
+}
+
+async function verifyMigrationTarget(release: ReleaseInfo, runtimePath: string): Promise<InstalledVersionVerification> {
+	return await verifyMigrationTargetWith({
+		runtimePath,
+		verifyChecksum: async () => {
+			await verifyDownloadedBinaryChecksum({
+				tag: release.tag,
+				assetName: getBinaryName(),
+				filePath: runtimePath,
+			});
+		},
+		verifyRuntime: async () => await verifyInstalledRuntime(release.version, runtimePath),
+	});
+}
+
+export async function verifyMigrationTargetForTest(
+	options: MigrationTargetVerificationOptions,
+): Promise<InstalledVersionVerification> {
+	return await verifyMigrationTargetWith(options);
 }
 
 function printRestartGuidance(): void {
@@ -1062,6 +1100,7 @@ async function updateViaBinaryAt(
 export interface UpdateCommandDependencies {
 	getLatestRelease?: (options?: LatestReleaseLookupOptions) => Promise<ReleaseInfo>;
 	resolveUpdateTarget?: () => Promise<UpdateTarget>;
+	verifyMigrationTarget?: (release: ReleaseInfo, runtimePath: string) => Promise<InstalledVersionVerification>;
 	performUpdate?: (
 		target: UpdateTarget,
 		expectedVersion: string,
@@ -1265,6 +1304,24 @@ export function resolveUpdateDecision(options: {
 	return { install: true, kind: options.comparison > 0 ? "new-version" : "force" };
 }
 
+function printVerifiedMigrationTarget(target: MigrationUpdateTarget, version: string): void {
+	console.log(
+		chalk.green(
+			`${theme.status.success} Standalone ${APP_NAME} ${version} is already installed and verified at ${target.path}`,
+		),
+	);
+	if (target.previousPath) {
+		console.log(chalk.yellow(`${target.previousPath} shadows it on PATH.`));
+		console.log(
+			chalk.cyan(
+				`The standalone directory ${path.dirname(target.path)} must precede the shim directory ${path.dirname(target.previousPath)} on PATH.`,
+			),
+		);
+		return;
+	}
+	console.log(chalk.cyan(`Ensure the standalone directory ${path.dirname(target.path)} is on PATH.`));
+}
+
 export async function runUpdateCommand(
 	opts: UpdateCommandOptions,
 	deps: UpdateCommandDependencies = {},
@@ -1272,6 +1329,7 @@ export async function runUpdateCommand(
 	const channel = opts.channel ?? "stable";
 	const lookupRelease = deps.getLatestRelease ?? getLatestRelease;
 	const resolveTarget = deps.resolveUpdateTarget ?? resolveUpdateTarget;
+	const verifyTarget = deps.verifyMigrationTarget ?? verifyMigrationTarget;
 	const update = deps.performUpdate ?? performUpdate;
 	const refreshDefaults = deps.refreshInstalledDefaultSkills ?? refreshInstalledDefaultSkills;
 	const exit = deps.exit ?? process.exit;
@@ -1322,6 +1380,14 @@ export async function runUpdateCommand(
 		currentVersion: VERSION,
 		migrate: target?.method === "migrate",
 	});
+
+	if (target.method === "migrate" && decision.install && !opts.force) {
+		const verification = await verifyTarget(release, target.path);
+		if (verification.ok) {
+			printVerifiedMigrationTarget(target, release.version);
+			return;
+		}
+	}
 
 	if (!decision.install) {
 		console.log(chalk.green(`${theme.status.success} Already up to date`));
