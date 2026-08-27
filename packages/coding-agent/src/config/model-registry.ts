@@ -3630,7 +3630,12 @@ export class ModelRegistry {
 			(this.#isCredentiallessProvider(providerConfig.provider)
 				? kNoAuth
 				: await this.authStorage.getApiKey(providerConfig.provider));
-		if (apiKey && apiKey !== DEFAULT_LOCAL_TOKEN && apiKey !== kNoAuth) {
+		if (
+			apiKey &&
+			apiKey !== DEFAULT_LOCAL_TOKEN &&
+			apiKey !== kNoAuth &&
+			headerValue(headers, "Authorization") === undefined
+		) {
 			headers.Authorization = `Bearer ${apiKey}`;
 		}
 		const response = await fetch(tagsUrl, {
@@ -3710,7 +3715,12 @@ export class ModelRegistry {
 			(this.#isCredentiallessProvider(providerConfig.provider)
 				? kNoAuth
 				: await this.authStorage.getApiKey(providerConfig.provider));
-		if (apiKey && apiKey !== DEFAULT_LOCAL_TOKEN && apiKey !== kNoAuth) {
+		if (
+			apiKey &&
+			apiKey !== DEFAULT_LOCAL_TOKEN &&
+			apiKey !== kNoAuth &&
+			headerValue(requestHeaders, "Authorization") === undefined
+		) {
 			requestHeaders.Authorization = `Bearer ${apiKey}`;
 		}
 
@@ -3836,7 +3846,8 @@ export class ModelRegistry {
 			apiKey &&
 			apiKey !== DEFAULT_LOCAL_TOKEN &&
 			!isVllmNoAuthToken(providerConfig.provider, apiKey) &&
-			apiKey !== kNoAuth
+			apiKey !== kNoAuth &&
+			headerValue(requestHeaders, "Authorization") === undefined
 		) {
 			requestHeaders.Authorization = `Bearer ${apiKey}`;
 		}
