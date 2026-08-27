@@ -1228,6 +1228,18 @@ function deleteHeaderCaseInsensitive(headers: Record<string, string>, name: stri
 	}
 }
 
+function ownsOnlyGeneratedAuthorization(headers: Record<string, string>, generated: string | undefined): boolean {
+	if (generated === undefined) return false;
+	const entries = Object.entries(headers).filter(([key]) => key.toLowerCase() === "authorization");
+	return entries.length === 1 && entries[0]![1] === generated;
+}
+
+function deleteAuthorizationValue(headers: Record<string, string>, value: string): void {
+	for (const key of Object.keys(headers)) {
+		if (key.toLowerCase() === "authorization" && headers[key] === value) delete headers[key];
+	}
+}
+
 /**
  * Decide whether a custom-yaml model should force OAuth-style request shaping.
  * - Explicit `auth: oauth` → force on.
@@ -4067,7 +4079,13 @@ export class ModelRegistry {
 		>,
 	): T {
 		const overrideHeaders = override.headers ? { ...entry.headers, ...override.headers } : { ...entry.headers };
-		if (headerValue(override.headers, "Authorization") !== undefined) {
+		const explicitAuthKey = override.headers
+			? Object.keys(override.headers).find(key => key.toLowerCase() === "authorization")
+			: undefined;
+		if (explicitAuthKey !== undefined) {
+			const explicitAuthValue = override.headers![explicitAuthKey]!;
+			deleteHeaderCaseInsensitive(overrideHeaders, "Authorization");
+			overrideHeaders[explicitAuthKey] = explicitAuthValue;
 			delete (overrideHeaders as Record<string, string> & { [GENERATED_AUTH_HEADER]?: string })[
 				GENERATED_AUTH_HEADER
 			];
@@ -4095,7 +4113,7 @@ export class ModelRegistry {
 			),
 			cacheRetention: entry.cacheRetention ?? override.cacheRetention,
 		};
-		if (!canInject && override.headers?.Authorization !== undefined) {
+		if (!canInject && explicitAuthKey !== undefined) {
 			delete (result.headers as Record<string, string> & { [GENERATED_AUTH_HEADER]?: string })[
 				GENERATED_AUTH_HEADER
 			];
@@ -5083,8 +5101,9 @@ export class ModelRegistry {
 			};
 			const generated = headers[GENERATED_AUTH_HEADER];
 			const hadAuthorization = headerValue(headers, "Authorization") !== undefined;
-			const ownsAuthorization = typeof generated === "string" && headerValue(headers, "Authorization") === generated;
+			const ownsAuthorization = ownsOnlyGeneratedAuthorization(headers, generated);
 			if (ownsAuthorization) deleteHeaderCaseInsensitive(headers, "Authorization");
+			else if (typeof generated === "string") deleteAuthorizationValue(headers, generated);
 			delete headers[GENERATED_AUTH_HEADER];
 			if (authHeader === true && resolved && (ownsAuthorization || !hadAuthorization)) {
 				headers.Authorization = `Bearer ${resolved}`;
@@ -5105,8 +5124,9 @@ export class ModelRegistry {
 					? { authorization: headers[GENERATED_AUTH_HEADER] }
 					: undefined);
 			const hadAuthorization = headerValue(headers, "Authorization") !== undefined;
-			const ownsAuthorization = generated?.authorization === headerValue(headers, "Authorization");
+			const ownsAuthorization = ownsOnlyGeneratedAuthorization(headers, generated?.authorization);
 			if (ownsAuthorization) deleteHeaderCaseInsensitive(headers, "Authorization");
+			else if (generated?.authorization) deleteAuthorizationValue(headers, generated.authorization);
 			if (generated?.apiKey === headers["X-Api-Key"]) delete headers["X-Api-Key"];
 			delete headers[GENERATED_AUTH_HEADER];
 			model.headers =
@@ -5132,10 +5152,11 @@ export class ModelRegistry {
 				? { authorization: headers[GENERATED_AUTH_HEADER] }
 				: undefined);
 		const hadAuthorization = headerValue(headers, "Authorization") !== undefined;
-		const ownsAuthorization = generated?.authorization === headerValue(headers, "Authorization");
+		const ownsAuthorization = ownsOnlyGeneratedAuthorization(headers, generated?.authorization);
 		if (authHeader !== true && generated === undefined && !this.#generatedAuthHeaderProviders.has(model.provider))
 			return;
 		if (ownsAuthorization) deleteHeaderCaseInsensitive(headers, "Authorization");
+		else if (generated?.authorization) deleteAuthorizationValue(headers, generated.authorization);
 		if (generated?.apiKey === headers["X-Api-Key"]) delete headers["X-Api-Key"];
 		delete headers[GENERATED_AUTH_HEADER];
 		model.headers =
