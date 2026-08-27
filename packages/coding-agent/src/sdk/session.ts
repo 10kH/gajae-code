@@ -4135,6 +4135,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				const requestStartedAt = performance.now();
 				let stream: Awaited<ReturnType<typeof streamSimple>>;
 				try {
+					await modelRegistry.getApiKey(streamModel, credentialSessionId);
 					stream = await streamSimple(streamModel, context, {
 						...streamOptions,
 						onAuthError: async (provider, oldKey, error) => {

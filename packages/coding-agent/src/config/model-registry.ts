@@ -1836,7 +1836,20 @@ export class ModelRegistry {
 			const resolved = this.#runtimeProviderApiKeyEnvNames.has(provider)
 				? $rotatingCredentialEnv(this.#runtimeProviderApiKeyEnvNames.get(provider)!)
 				: resolveApiKeyConfig(apiKeyConfig);
-			if (!resolved) continue;
+			if (!resolved) {
+				const authHeader = this.#runtimeProviderAuthHeaders.get(provider);
+				if (authHeader === true) {
+					this.#runtimeModelOverlays = this.#runtimeModelOverlays.map(overlay => {
+						if (overlay.provider !== provider) return overlay;
+						const headers = { ...(overlay.headers ?? {}) };
+						delete headers.Authorization;
+						return { ...overlay, headers };
+					});
+				}
+				const override = this.#runtimeProviderOverrides.get(provider);
+				if (override) this.#runtimeProviderOverrides.set(provider, { ...override, apiKey: "" });
+				continue;
+			}
 			this.#customProviderApiKeys.set(provider, resolved);
 			this.authStorage.setConfigApiKey(provider, resolved);
 			const override = this.#runtimeProviderOverrides.get(provider);
@@ -4926,7 +4939,10 @@ export class ModelRegistry {
 				signal: options.signal,
 			}),
 		);
-		if (this.#customProviderAuthHeaders.get(provider) === true) {
+		if (
+			this.#runtimeProviderAuthHeaders.get(provider) === true ||
+			this.#customProviderAuthHeaders.get(provider) === true
+		) {
 			for (const model of this.#models) {
 				if (model.provider === provider) this.#applyEffectiveAuthHeader(model, apiKey);
 			}
@@ -5138,6 +5154,7 @@ export class ModelRegistry {
 			const resolved = resolveApiKeyConfig(config.apiKey);
 			if (!resolved) return;
 			if (Bun.env[config.apiKey] !== undefined) this.#runtimeProviderApiKeyEnvNames.set(providerName, config.apiKey);
+			else this.#runtimeProviderApiKeyEnvNames.delete(providerName);
 			this.#customProviderApiKeys.set(providerName, resolved);
 			// Persist runtime API keys so they survive #reloadStaticModels() cycles
 			this.#runtimeProviderApiKeys.set(providerName, config.apiKey);
