@@ -708,9 +708,10 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 
 			const entries = await this.#getCachedDirEntries(searchDir);
 			const suggestions: AutocompleteItem[] = [];
+			const lowerSearchPrefix = searchPrefix.normalize("NFC").toLowerCase();
 
 			for (const entry of entries) {
-				if (!entry.name.toLowerCase().startsWith(searchPrefix.toLowerCase())) {
+				if (!entry.name.normalize("NFC").toLowerCase().startsWith(lowerSearchPrefix)) {
 					continue;
 				}
 				// Skip .git directory
@@ -801,14 +802,14 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 			const searchPath = scopedQuery?.baseDir ?? this.#basePath;
 			const fuzzyQuery = scopedQuery?.query ?? query;
 			const result = await (await fuzzyFindNative())(buildAutocompleteFuzzyDiscoveryProfile(fuzzyQuery, searchPath));
-			const lowerQuery = fuzzyQuery.toLowerCase();
+			const lowerQuery = fuzzyQuery.normalize("NFC").toLowerCase();
 			const filteredMatches = result.matches.filter(entry => {
 				const p = entry.path.endsWith("/") ? entry.path.slice(0, -1) : entry.path;
 				const normalized = p.replaceAll("\\", "/");
 				if (/(^|\/)\.git(\/|$)/.test(normalized)) {
 					return false;
 				}
-				return lowerQuery.length === 0 || fuzzyMatch(lowerQuery, normalized.toLowerCase());
+				return lowerQuery.length === 0 || fuzzyMatch(lowerQuery, normalized.normalize("NFC").toLowerCase());
 			});
 			const topEntries = filteredMatches.slice(0, 20);
 			const suggestions: AutocompleteItem[] = [];
