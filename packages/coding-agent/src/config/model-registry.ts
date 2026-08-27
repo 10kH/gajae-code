@@ -1203,10 +1203,11 @@ function mergeAuthHeader(
 		return nextHeaders;
 	}
 	return apiKeyConfig
-		? ({ ...nextHeaders, Authorization: `Bearer ${apiKeyConfig}`, [GENERATED_AUTH_HEADER]: true } as Record<
-				string,
-				string
-			>)
+		? ({
+				...nextHeaders,
+				Authorization: `Bearer ${apiKeyConfig}`,
+				[GENERATED_AUTH_HEADER]: `Bearer ${apiKeyConfig}`,
+			} as Record<string, string>)
 		: nextHeaders;
 }
 
@@ -4042,13 +4043,9 @@ export class ModelRegistry {
 			cacheRetention: entry.cacheRetention ?? override.cacheRetention,
 		};
 		const generatedHeader = (
-			result.headers as (Record<string, string> & { [GENERATED_AUTH_HEADER]?: boolean }) | undefined
+			result.headers as (Record<string, string> & { [GENERATED_AUTH_HEADER]?: string }) | undefined
 		)?.[GENERATED_AUTH_HEADER];
-		if (
-			(generatedHeader === true || override.authHeader === true) &&
-			override.apiKey &&
-			result.headers?.Authorization !== undefined
-		) {
+		if (generatedHeader !== undefined && result.headers?.Authorization === generatedHeader) {
 			this.#generatedAuthHeaders.set(result, { authorization: result.headers.Authorization });
 		} else {
 			const generated = this.#generatedAuthHeaders.get(entry);
@@ -4089,7 +4086,7 @@ export class ModelRegistry {
 		const result = applyFinalCodexGpt56ContextCap(finalized, undefined, this.#codexContextWindowOverrides);
 		for (let index = 0; index < result.length; index++) {
 			if (
-				(result[index]?.headers as (Record<string, string> & { [GENERATED_AUTH_HEADER]?: boolean }) | undefined)?.[
+				(result[index]?.headers as (Record<string, string> & { [GENERATED_AUTH_HEADER]?: string }) | undefined)?.[
 					GENERATED_AUTH_HEADER
 				]
 			) {
@@ -5003,21 +5000,37 @@ export class ModelRegistry {
 		if (runtimeOverride) this.#runtimeProviderOverrides.set(provider, { ...runtimeOverride, apiKey: resolved ?? "" });
 		this.#runtimeModelOverlays = this.#runtimeModelOverlays.map(overlay => {
 			if (overlay.provider !== provider) return overlay;
-			const headers = { ...(overlay.headers ?? {}) };
-			if (previous !== undefined && headers.Authorization === `Bearer ${previous}`) delete headers.Authorization;
-			if (authHeader === true && resolved) headers.Authorization = `Bearer ${resolved}`;
+			const headers = { ...(overlay.headers ?? {}) } as Record<string, string> & {
+				[GENERATED_AUTH_HEADER]?: string;
+			};
+			const generated = headers[GENERATED_AUTH_HEADER];
+			if (typeof generated === "string" && headers.Authorization === generated) delete headers.Authorization;
+			delete headers[GENERATED_AUTH_HEADER];
+			if (authHeader === true && resolved) {
+				headers.Authorization = `Bearer ${resolved}`;
+				headers[GENERATED_AUTH_HEADER] = `Bearer ${resolved}`;
+			}
 			return { ...overlay, headers };
 		});
 		if (authHeader === true) this.#generatedAuthHeaderProviders.add(provider);
 		if (authHeader !== true && !this.#generatedAuthHeaderProviders.has(provider)) return;
 		for (const model of this.#models) {
 			if (model.provider !== provider) continue;
-			const headers = { ...(model.headers ?? {}) };
-			const generated = this.#generatedAuthHeaders.get(model);
+			const headers = { ...(model.headers ?? {}) } as Record<string, string> & {
+				[GENERATED_AUTH_HEADER]?: string;
+			};
+			const generated =
+				this.#generatedAuthHeaders.get(model) ??
+				(typeof headers[GENERATED_AUTH_HEADER] === "string"
+					? { authorization: headers[GENERATED_AUTH_HEADER] }
+					: undefined);
 			if (generated?.authorization === headers.Authorization) delete headers.Authorization;
 			if (generated?.apiKey === headers["X-Api-Key"]) delete headers["X-Api-Key"];
+			delete headers[GENERATED_AUTH_HEADER];
 			model.headers =
-				authHeader === true && resolved ? { ...headers, Authorization: `Bearer ${resolved}` } : headers;
+				authHeader === true && resolved
+					? { ...headers, Authorization: `Bearer ${resolved}`, [GENERATED_AUTH_HEADER]: `Bearer ${resolved}` }
+					: headers;
 			if (authHeader === true) this.#generatedAuthHeaders.set(model, { authorization: model.headers.Authorization });
 		}
 		this.#rebuildCanonicalIndex();
@@ -5027,15 +5040,22 @@ export class ModelRegistry {
 		const authHeader =
 			this.#runtimeProviderAuthHeaders.get(model.provider) ?? this.#customProviderAuthHeaders.get(model.provider);
 		if (authHeader === true) this.#generatedAuthHeaderProviders.add(model.provider);
-		const headers = { ...(model.headers ?? {}) };
-		const generated = this.#generatedAuthHeaders.get(model);
+		const headers = { ...(model.headers ?? {}) } as Record<string, string> & {
+			[GENERATED_AUTH_HEADER]?: string;
+		};
+		const generated =
+			this.#generatedAuthHeaders.get(model) ??
+			(typeof headers[GENERATED_AUTH_HEADER] === "string"
+				? { authorization: headers[GENERATED_AUTH_HEADER] }
+				: undefined);
 		if (authHeader !== true && generated === undefined && !this.#generatedAuthHeaderProviders.has(model.provider))
 			return;
 		if (generated?.authorization === headers.Authorization) delete headers.Authorization;
 		if (generated?.apiKey === headers["X-Api-Key"]) delete headers["X-Api-Key"];
+		delete headers[GENERATED_AUTH_HEADER];
 		model.headers =
 			authHeader === true && apiKey && apiKey !== kNoAuth
-				? { ...headers, Authorization: `Bearer ${apiKey}` }
+				? { ...headers, Authorization: `Bearer ${apiKey}`, [GENERATED_AUTH_HEADER]: `Bearer ${apiKey}` }
 				: headers;
 		if (authHeader === true) this.#generatedAuthHeaders.set(model, { authorization: model.headers.Authorization });
 	}
@@ -5203,12 +5223,14 @@ export class ModelRegistry {
 		}
 		if (config.authHeader !== undefined) {
 			if (config.authHeader === false) {
-				const previous = this.#customProviderApiKeys.get(providerName);
 				this.#runtimeModelOverlays = this.#runtimeModelOverlays.map(overlay => {
 					if (overlay.provider !== providerName) return overlay;
-					const headers = { ...(overlay.headers ?? {}) };
-					if (previous !== undefined && headers.Authorization === `Bearer ${previous}`)
-						delete headers.Authorization;
+					const headers = { ...(overlay.headers ?? {}) } as Record<string, string> & {
+						[GENERATED_AUTH_HEADER]?: string;
+					};
+					const generated = headers[GENERATED_AUTH_HEADER];
+					if (typeof generated === "string" && headers.Authorization === generated) delete headers.Authorization;
+					delete headers[GENERATED_AUTH_HEADER];
 					return { ...overlay, headers };
 				});
 			}
