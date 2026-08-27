@@ -239,7 +239,11 @@ describe("GJC tmux session management", () => {
 		spyOn(Bun, "spawnSync").mockImplementation(((command: unknown) => {
 			if (!spawnArgv(command).includes("list-sessions")) return spawnResult(0, "");
 			listCalls += 1;
-			return spawnResult(1, "", "error connecting to /tmp/host-emulated/agent-team-stale (No such file or directory)");
+			return spawnResult(
+				1,
+				"",
+				"error connecting to /tmp/host-emulated/agent-team-stale (No such file or directory)",
+			);
 		}) as never);
 		clearPsmuxDetectionCache();
 
