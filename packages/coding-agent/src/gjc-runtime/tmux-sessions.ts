@@ -154,6 +154,7 @@ export interface ForceCloseOwnerDependencies {
 }
 const GJC_TMUX_PSMUX_INCARNATION_OPTION = "@gjc-psmux-incarnation";
 const effectiveSessionEnvironments = new WeakMap<GjcTmuxSessionStatus, NodeJS.ProcessEnv>();
+const fallbackSessionEnvironments = new WeakSet<GjcTmuxSessionStatus>();
 
 const FORCE_CLOSE_VERDICT_TIMEOUT_MS = 15_000;
 const FORCE_CLOSE_VERDICT_POLL_MS = 50;
@@ -422,6 +423,11 @@ function listSessionLines(env: NodeJS.ProcessEnv = process.env): ListedTmuxSessi
 function listRawTmuxSessionNames(env: NodeJS.ProcessEnv = process.env): string[] {
 	return runListSessions("#{session_name}", env).lines.map(line => line.split("\t")[0] ?? line);
 }
+
+function assertMutationAuthority(session: GjcTmuxSessionStatus): void {
+	if (fallbackSessionEnvironments.has(session)) throw new Error("gjc_tmux_fallback_authority_unconfirmed");
+}
+
 function canonicalProviderStateDirs(cwd: string): string[] {
 	const gjcDir = path.join(cwd, GJC_DIR);
 	let entries: fsSync.Dirent[];
@@ -497,12 +503,14 @@ export function listGjcTmuxSessions(env: NodeJS.ProcessEnv = process.env): GjcTm
 			.map(session => {
 				const hydrated = hydrateSessionFromExactOptions(session, listed.env);
 				effectiveSessionEnvironments.set(hydrated, listed.env);
+				if (listed.env !== authorityEnv) fallbackSessionEnvironments.add(hydrated);
 				return hydrated;
 			})
 			.filter((session): session is GjcTmuxSessionStatus => session?.profile === GJC_TMUX_PROFILE_VALUE)
 			.map(session => {
 				const result = authority ? { ...session, providerAuthority: authority } : session;
 				effectiveSessionEnvironments.set(result, listed.env);
+				if (listed.env !== authorityEnv) fallbackSessionEnvironments.add(result);
 				return result;
 			});
 	});
@@ -525,6 +533,7 @@ export function listTmuxSessionsForGc(env: NodeJS.ProcessEnv = process.env): Gjc
 			.map(session => {
 				const hydrated = hydrateSessionFromExactOptions(session, listed.env);
 				effectiveSessionEnvironments.set(hydrated, listed.env);
+				if (listed.env !== authorityEnv) fallbackSessionEnvironments.add(hydrated);
 				return hydrated;
 			});
 	});
@@ -1251,6 +1260,7 @@ export function removeGjcTmuxSession(
 	expectedIdentity?: ExpectedGjcTmuxSessionIdentity,
 ): GjcTmuxSessionStatus {
 	const session = statusGjcTmuxSession(sessionName, env);
+	assertMutationAuthority(session);
 	const sessionEnv =
 		effectiveSessionEnvironments.get(session) ?? environmentForProviderAuthority(env, session.providerAuthority);
 	if (session.attached || session.panePids.length > 0) {
@@ -1509,6 +1519,7 @@ export async function forceCloseGjcTmuxSession(
 	deps: Partial<ForceCloseOwnerDependencies> = {},
 ): Promise<GjcTmuxSessionStatus> {
 	const session = statusGjcTmuxSession(sessionName, env);
+	assertMutationAuthority(session);
 	const sessionEnv =
 		effectiveSessionEnvironments.get(session) ?? environmentForProviderAuthority(env, session.providerAuthority);
 	if (readProfileForExactTarget(session.name, sessionEnv) !== GJC_TMUX_PROFILE_VALUE)
@@ -1644,6 +1655,7 @@ export async function forceCloseGjcTmuxSession(
 
 export function attachGjcTmuxSession(sessionName: string, env: NodeJS.ProcessEnv = process.env): never {
 	const session = statusGjcTmuxSession(sessionName, env);
+	assertMutationAuthority(session);
 	const sessionEnv =
 		effectiveSessionEnvironments.get(session) ?? environmentForProviderAuthority(env, session.providerAuthority);
 	const authority = session.providerAuthority ?? psmuxAuthorityFromEnv(sessionEnv);

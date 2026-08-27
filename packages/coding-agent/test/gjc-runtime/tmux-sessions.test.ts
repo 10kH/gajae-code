@@ -310,6 +310,24 @@ describe("GJC tmux session management", () => {
 		expect(listCalls).toBe(1);
 	});
 
+	it("denies mutations for sessions discovered through an automatic socket fallback", () => {
+		const inheritedSocket = "/tmp/host-emulated/agent-team";
+		spyOn(Bun, "spawnSync").mockImplementation(((command: unknown, options: unknown) => {
+			if (!spawnArgv(command).includes("list-sessions")) return spawnResult(0, "");
+			const inherited = (options as { env?: NodeJS.ProcessEnv } | undefined)?.env?.TMUX;
+			if (inherited) return spawnResult(1, "", `error connecting to ${inheritedSocket} (No such file or directory)`);
+			return spawnResult(0, "gajae_code_fallback\t1\t0\t1770000000\t1\troot\t0\t\t\t\t\t\t\t\t$3");
+		}) as never);
+		clearPsmuxDetectionCache();
+
+		expect(() =>
+			removeGjcTmuxSession("gajae_code_fallback", {
+				GJC_TMUX_COMMAND: "tmux-test",
+				TMUX: `${inheritedSocket},0,1`,
+			}),
+		).toThrow("gjc_tmux_fallback_authority_unconfirmed");
+	});
+
 	it("reports provider-aware diagnostics before spawning when Windows has no multiplexer", async () => {
 		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-tmux-sessions-test-"));
 		fixtureDirectories.push(stateDir);
