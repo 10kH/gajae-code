@@ -7705,8 +7705,7 @@ export class AgentSession {
 	 * such event.
 	 */
 	#syncAgentSessionId(sessionId?: string): void {
-		this.#adaptiveCompactionTracker.reset();
-		this.#adaptiveCompactionRecordedMessages = new WeakSet<AssistantMessage>();
+		this.#resetAdaptiveCompactionState();
 		this.#reasoningControlContextGeneration++;
 		const sid = this.#providerSessionId ?? sessionId ?? this.sessionManager.getSessionId();
 		this.agent.sessionId = sid;
@@ -15862,9 +15861,7 @@ export class AgentSession {
 					fromExtension,
 					preserveData,
 				);
-				if (compactionSettings.adaptive?.enabled) {
-					this.#adaptiveCompactionTracker.recordCompact(tokensBefore);
-				}
+				this.#resetAdaptiveCompactionState();
 				await this.#applyCompactionPostAppend(compactionEntryId, firstKeptEntryId, fromExtension);
 
 				const compactionResult: CompactionResult = {
@@ -16471,8 +16468,7 @@ export class AgentSession {
 			// keeps its existing agent_end / pre-prompt boundaries (a mid-tool-loop
 			// session swap would be far more disruptive than the overflow it avoids).
 			const compactionSettings = this.settings.getGroup("compaction");
-			const adaptiveCompactionSettings = this.#compactionSettingsWithAdaptiveState(compactionSettings);
-			if (!compactionSettings.enabled || compactionSettings.strategy === "context-full") return result("not-needed");
+			if (!compactionSettings.enabled || compactionSettings.strategy !== "context-full") return result("not-needed");
 			const contextWindow = this.model?.contextWindow ?? 0;
 			if (contextWindow <= 0) return result("not-needed");
 			// A compaction already in flight (overflow recovery, manual, idle) owns the
@@ -16484,6 +16480,9 @@ export class AgentSession {
 			const autoCompactionOutputReserveTokens = 0;
 			const anchor = this.#findMidRunUsageAnchor(context.messages);
 			let contextTokens = this.#estimateMidRunContextTokens(context.messages);
+			const adaptiveCompactionSettings = anchor
+				? this.#recordAdaptiveCompactionCall(contextTokens, compactionSettings, anchor.message)
+				: this.#compactionSettingsWithAdaptiveState(compactionSettings);
 			if (
 				!shouldCompact(contextTokens, contextWindow, adaptiveCompactionSettings, autoCompactionOutputReserveTokens)
 			) {
@@ -16748,6 +16747,11 @@ export class AgentSession {
 			...settings,
 			adaptiveState: this.#adaptiveCompactionTracker.decisionState(),
 		};
+	}
+
+	#resetAdaptiveCompactionState(): void {
+		this.#adaptiveCompactionTracker.reset();
+		this.#adaptiveCompactionRecordedMessages = new WeakSet<AssistantMessage>();
 	}
 
 	#assistantEndedWithSuccessfulYield(assistantMessage: AssistantMessage): boolean {
@@ -18200,9 +18204,7 @@ export class AgentSession {
 				fromExtension,
 				preserveData,
 			);
-			if (compactionSettings.adaptive?.enabled) {
-				this.#adaptiveCompactionTracker.recordCompact(tokensBefore);
-			}
+			this.#resetAdaptiveCompactionState();
 			await this.#applyCompactionPostAppend(compactionEntryId, firstKeptEntryId, fromExtension);
 			if (autoCompactionSignal.aborted) return await emitAborted();
 
