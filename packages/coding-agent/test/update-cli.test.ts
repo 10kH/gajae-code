@@ -540,6 +540,24 @@ describe("update-cli managed notification recovery", () => {
 			expect(result).toEqual({ ok: true, actual: release.version, path: target.path });
 		});
 
+		it("holds the binary update lock across migration preflight", async () => {
+			const root = await makeTempDir();
+			const runtimePath = path.join(root, "gjc");
+			const lockPath = path.join(root, ".gjc-install.lock");
+			await runUpdateCommand(
+				{ force: false, check: false },
+				{
+					getLatestRelease: async () => release,
+					resolveUpdateTarget: async () => ({ method: "migrate", path: runtimePath }),
+					verifyMigrationTarget: async () => {
+						expect(fsNode.existsSync(lockPath)).toBe(true);
+						return { ok: true, actual: release.version, path: runtimePath };
+					},
+				},
+			);
+			expect(fsNode.existsSync(lockPath)).toBe(false);
+		});
+
 		it("does not execute a missing or tampered migration target when checksum verification fails", async () => {
 			const calls: string[] = [];
 			const result = await verifyMigrationTargetForTest({

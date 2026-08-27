@@ -1382,10 +1382,15 @@ export async function runUpdateCommand(
 	});
 
 	if (target.method === "migrate" && decision.install && !opts.force) {
-		const verification = await verifyTarget(release, target.path);
-		if (verification.ok) {
-			printVerifiedMigrationTarget(target, release.version);
-			return;
+		const releaseLock = await acquireBinaryUpdateLock(target.path);
+		try {
+			const verification = await verifyTarget(release, target.path);
+			if (verification.ok) {
+				printVerifiedMigrationTarget(target, release.version);
+				return;
+			}
+		} finally {
+			await releaseLock();
 		}
 	}
 
