@@ -1205,7 +1205,7 @@ function mergeCustomModelHeaders(
 function mergeCaseInsensitiveHeaders(
 	baseHeaders: Record<string, string> | undefined,
 	overrideHeaders: Record<string, string> | undefined,
-): Record<string, string> | undefined {
+): (Record<string, string> & { [GENERATED_AUTH_HEADER]?: string }) | undefined {
 	const merged: Record<string, string> = {};
 	for (const [key, value] of Object.entries(baseHeaders ?? {})) {
 		if (key.toLowerCase() === "authorization") deleteHeaderCaseInsensitive(merged, "Authorization");
@@ -1214,6 +1214,18 @@ function mergeCaseInsensitiveHeaders(
 	for (const [key, value] of Object.entries(overrideHeaders ?? {})) {
 		if (key.toLowerCase() === "authorization") deleteHeaderCaseInsensitive(merged, "Authorization");
 		merged[key] = value;
+	}
+	const baseGenerated = (baseHeaders as (Record<string, string> & { [GENERATED_AUTH_HEADER]?: string }) | undefined)?.[
+		GENERATED_AUTH_HEADER
+	];
+	const overrideGenerated = (
+		overrideHeaders as (Record<string, string> & { [GENERATED_AUTH_HEADER]?: string }) | undefined
+	)?.[GENERATED_AUTH_HEADER];
+	const survivingGenerated =
+		headerValue(overrideHeaders, "Authorization") !== undefined ? overrideGenerated : baseGenerated;
+	if (survivingGenerated !== undefined && headerValue(merged, "Authorization") === survivingGenerated) {
+		(merged as Record<string, string> & { [GENERATED_AUTH_HEADER]?: string })[GENERATED_AUTH_HEADER] =
+			survivingGenerated;
 	}
 	return Object.keys(merged).length > 0 ? merged : undefined;
 }
