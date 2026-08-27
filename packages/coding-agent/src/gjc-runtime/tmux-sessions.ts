@@ -336,8 +336,8 @@ function inheritedTmuxSocketPath(env: NodeJS.ProcessEnv): string | null {
 }
 
 function namesInheritedTmuxSocket(message: string, socket: string): boolean {
-	const normalizedMessage = message.toLowerCase();
-	const normalizedSocket = socket.toLowerCase();
+	const normalizedMessage = process.platform === "win32" ? message.toLowerCase() : message;
+	const normalizedSocket = process.platform === "win32" ? socket.toLowerCase() : socket;
 	return (
 		(normalizedMessage.includes(`error connecting to ${normalizedSocket} `) ||
 			normalizedMessage.includes(`failed to connect to server: ${normalizedSocket} `)) &&

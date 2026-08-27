@@ -249,6 +249,22 @@ describe("GJC tmux session management", () => {
 		expect(observedTmux).toEqual([`${inheritedSocket},0,1`, undefined]);
 	});
 
+	it("does not retry a case-mismatched socket path on case-sensitive hosts", () => {
+		let listCalls = 0;
+		spyOn(Bun, "spawnSync").mockImplementation(((command: unknown) => {
+			if (!spawnArgv(command).includes("list-sessions")) return spawnResult(0, "");
+			listCalls += 1;
+			return spawnResult(1, "", "error connecting to /TMP/host-emulated/agent-team (No such file or directory)");
+		}) as never);
+		clearPsmuxDetectionCache();
+
+		if (process.platform === "win32") return;
+		expect(listGjcTmuxSessions({ GJC_TMUX_COMMAND: "tmux-test", TMUX: "/tmp/host-emulated/agent-team,0,1" })).toEqual(
+			[],
+		);
+		expect(listCalls).toBe(1);
+	});
+
 	it("still reports an empty list when the default socket has no server either", () => {
 		const inheritedSocket = "/tmp/host-emulated/agent-team";
 		spyOn(Bun, "spawnSync").mockImplementation(((command: unknown, options: unknown) => {
