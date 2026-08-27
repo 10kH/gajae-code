@@ -118,6 +118,7 @@ export type { CanonicalModelIndex, CanonicalModelRecord, CanonicalModelVariant, 
 export { isAuthenticated, kNoAuth };
 
 const MAX_SESSION_CANONICAL_VARIANTS = 64;
+const GENERATED_AUTH_HEADER = Symbol("generated-auth-header");
 function firstPositiveDiscoveryNumber(...values: readonly unknown[]): number | undefined {
 	for (const value of values) {
 		const number =
@@ -4036,6 +4037,7 @@ export class ModelRegistry {
 			result.headers?.Authorization !== undefined
 		) {
 			this.#generatedAuthHeaders.set(result, { authorization: result.headers.Authorization });
+			(result as Model<Api> & { [GENERATED_AUTH_HEADER]?: boolean })[GENERATED_AUTH_HEADER] = true;
 		} else {
 			const generated = this.#generatedAuthHeaders.get(entry);
 			if (generated) this.#generatedAuthHeaders.set(result, generated);
@@ -4074,6 +4076,10 @@ export class ModelRegistry {
 		const finalized = models.map(model => enrichModelThinking({ ...this.#restoreDeclaredThinking(model) }));
 		const result = applyFinalCodexGpt56ContextCap(finalized, undefined, this.#codexContextWindowOverrides);
 		for (let index = 0; index < result.length; index++) {
+			if ((result[index] as Model<Api> & { [GENERATED_AUTH_HEADER]?: boolean })[GENERATED_AUTH_HEADER]) {
+				const authorization = result[index]?.headers?.Authorization;
+				if (authorization) this.#generatedAuthHeaders.set(result[index]!, { authorization });
+			}
 			const generated = this.#generatedAuthHeaders.get(models[index]!);
 			if (generated) this.#generatedAuthHeaders.set(result[index]!, generated);
 		}
@@ -4965,7 +4971,8 @@ export class ModelRegistry {
 			: this.#customProviderApiKeyEnvNames.get(provider);
 		if (!envName) return;
 		const resolved = $rotatingCredentialEnv(envName);
-		if (resolved === this.#customProviderApiKeys.get(provider)) return;
+		const previous = this.#customProviderApiKeys.get(provider);
+		if (resolved === previous) return;
 		if (resolved === undefined) {
 			this.#customProviderApiKeys.delete(provider);
 			this.authStorage.removeConfigApiKey(provider);
@@ -4976,6 +4983,15 @@ export class ModelRegistry {
 		}
 		const authHeader =
 			this.#runtimeProviderAuthHeaders.get(provider) ?? this.#customProviderAuthHeaders.get(provider);
+		const runtimeOverride = this.#runtimeProviderOverrides.get(provider);
+		if (runtimeOverride) this.#runtimeProviderOverrides.set(provider, { ...runtimeOverride, apiKey: resolved ?? "" });
+		this.#runtimeModelOverlays = this.#runtimeModelOverlays.map(overlay => {
+			if (overlay.provider !== provider) return overlay;
+			const headers = { ...(overlay.headers ?? {}) };
+			if (previous !== undefined && headers.Authorization === `Bearer ${previous}`) delete headers.Authorization;
+			if (authHeader === true && resolved) headers.Authorization = `Bearer ${resolved}`;
+			return { ...overlay, headers };
+		});
 		if (authHeader === true) this.#generatedAuthHeaderProviders.add(provider);
 		if (authHeader !== true && !this.#generatedAuthHeaderProviders.has(provider)) return;
 		for (const model of this.#models) {
