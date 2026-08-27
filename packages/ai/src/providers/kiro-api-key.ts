@@ -121,6 +121,54 @@ function toModel(api: ApiModel, baseUrl: string): Model<"kiro-codewhisperer-stre
 	};
 }
 
+const STATIC_KIRO_API_CATALOG: Array<{
+	modelId: string;
+	modelName: string;
+	maxInputTokens: number;
+	maxOutputTokens: number;
+	image: boolean;
+}> = [
+	{ modelId: "auto", modelName: "Auto", maxInputTokens: 1_000_000, maxOutputTokens: 64_000, image: true },
+	{ modelId: "claude-haiku-4.5", modelName: "Claude Haiku 4.5", maxInputTokens: 200_000, maxOutputTokens: 64_000, image: true },
+	{ modelId: "claude-sonnet-4", modelName: "Claude Sonnet 4", maxInputTokens: 200_000, maxOutputTokens: 64_000, image: true },
+	{ modelId: "claude-sonnet-4.5", modelName: "Claude Sonnet 4.5", maxInputTokens: 200_000, maxOutputTokens: 64_000, image: true },
+	{ modelId: "claude-sonnet-4.6", modelName: "Claude Sonnet 4.6", maxInputTokens: 1_000_000, maxOutputTokens: 64_000, image: true },
+	{ modelId: "claude-sonnet-5", modelName: "Claude Sonnet 5", maxInputTokens: 1_000_000, maxOutputTokens: 64_000, image: true },
+	{ modelId: "claude-opus-4.5", modelName: "Claude Opus 4.5", maxInputTokens: 200_000, maxOutputTokens: 64_000, image: true },
+	{ modelId: "claude-opus-4.6", modelName: "Claude Opus 4.6", maxInputTokens: 1_000_000, maxOutputTokens: 64_000, image: true },
+	{ modelId: "claude-opus-4.7", modelName: "Claude Opus 4.7", maxInputTokens: 1_000_000, maxOutputTokens: 128_000, image: true },
+	{ modelId: "claude-opus-4.8", modelName: "Claude Opus 4.8", maxInputTokens: 1_000_000, maxOutputTokens: 128_000, image: true },
+	{ modelId: "claude-opus-5", modelName: "Claude Opus 5", maxInputTokens: 1_000_000, maxOutputTokens: 128_000, image: true },
+	{ modelId: "gpt-5.6-luna", modelName: "GPT 5.6 Luna", maxInputTokens: 272_000, maxOutputTokens: 128_000, image: true },
+	{ modelId: "gpt-5.6-terra", modelName: "GPT 5.6 Terra", maxInputTokens: 272_000, maxOutputTokens: 128_000, image: true },
+	{ modelId: "gpt-5.6-sol", modelName: "GPT 5.6 Sol", maxInputTokens: 272_000, maxOutputTokens: 128_000, image: true },
+	{ modelId: "deepseek-3.2", modelName: "DeepSeek 3.2", maxInputTokens: 164_000, maxOutputTokens: 64_000, image: true },
+	{ modelId: "minimax-m2.1", modelName: "MiniMax M2.1", maxInputTokens: 196_000, maxOutputTokens: 64_000, image: true },
+	{ modelId: "minimax-m2.5", modelName: "MiniMax M2.5", maxInputTokens: 196_000, maxOutputTokens: 64_000, image: false },
+	{ modelId: "glm-5", modelName: "GLM 5", maxInputTokens: 200_000, maxOutputTokens: 64_000, image: false },
+	{ modelId: "qwen3-coder-next", modelName: "Qwen3 Coder Next", maxInputTokens: 256_000, maxOutputTokens: 64_000, image: true },
+];
+
+export function kiroApiStaticModels(): Model<"kiro-codewhisperer-stream">[] {
+	const baseUrl = kiroApiBaseUrl(kiroApiRegion());
+	const models: Model<"kiro-codewhisperer-stream">[] = [];
+	for (const item of STATIC_KIRO_API_CATALOG) {
+		const model = toModel(
+			{
+				modelId: item.modelId,
+				modelName: item.modelName,
+				supportedInputTypes: item.image ? ["TEXT", "IMAGE"] : ["TEXT"],
+				tokenLimits: { maxInputTokens: item.maxInputTokens, maxOutputTokens: item.maxOutputTokens },
+			},
+			baseUrl,
+		);
+		models.push(model);
+		const dashed = toGjcModelId(item.modelId);
+		if (dashed !== item.modelId) models.push({ ...model, id: dashed });
+	}
+	return models;
+}
+
 /** Discover models this API key can use. Returns null when the key is missing. */
 export async function fetchKiroApiModels(apiKey: string, region?: string): Promise<Model<"kiro-codewhisperer-stream">[]> {
 	const resolvedRegion = region || kiroApiRegion();

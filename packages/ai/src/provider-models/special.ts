@@ -6,7 +6,7 @@ import { buildZCodeSourceHeaders, resolveGlmZcodeAnthropicBaseUrl } from "../pro
 import { fetchOpenCodexModels, OPENCODEX_MODEL_CACHE_TTL_MS } from "../providers/openai-opencodex-responses";
 import { fetchCodexModels } from "../utils/discovery/codex";
 import { fetchOpenAICompatibleModels } from "../utils/discovery/openai-compatible";
-import { fetchKiroApiModels, isKiroApiKey } from "../providers/kiro-api-key";
+import { fetchKiroApiModels, isKiroApiKey, kiroApiStaticModels } from "../providers/kiro-api-key";
 import { createBundledReferenceMap } from "./bundled-references";
 export function openCodexModelManagerOptions(): ModelManagerOptions<"openai-responses"> {
 	return {
@@ -177,6 +177,7 @@ export function kiroModelManagerOptions(
 		providerId: "kiro",
 		...(isKiroApiKey(apiKey)
 			? {
+					staticModels: kiroApiStaticModels(),
 					fetchDynamicModels: () => fetchKiroApiModels(apiKey),
 				}
 			: undefined),
