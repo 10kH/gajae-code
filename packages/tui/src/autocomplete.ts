@@ -129,6 +129,17 @@ function hangulInitialJamo(char: string): string | undefined {
 	return HANGUL_INITIAL_COMPAT_JAMO[Math.floor(offset / 588)];
 }
 
+function fuzzyCharMatches(queryChar: string, targetChar: string): boolean {
+	return queryChar === targetChar || hangulInitialJamo(targetChar) === queryChar;
+}
+
+function normalizeFuzzyText(value: string): string {
+	return value
+		.normalize("NFC")
+		.toLowerCase()
+		.replace(/[\s/\\._-]+/g, "");
+}
+
 /**
  * Check if query is a subsequence of target (fuzzy match).
  * "wig" matches "skill:wig" because w-i-g appear in order.
@@ -141,9 +152,7 @@ function fuzzyMatch(query: string, target: string): boolean {
 
 	let qi = 0;
 	for (let ti = 0; ti < target.length && qi < query.length; ti++) {
-		const queryChar = query[qi] as string;
-		const targetChar = target[ti] as string;
-		if (queryChar === targetChar || hangulInitialJamo(targetChar) === queryChar) qi++;
+		if (fuzzyCharMatches(query[qi] as string, target[ti] as string)) qi++;
 	}
 	return qi === query.length;
 }
@@ -164,7 +173,7 @@ function fuzzyScore(query: string, target: string): number {
 	let gaps = 0;
 	let lastMatchIdx = -1;
 	for (let ti = 0; ti < target.length && qi < query.length; ti++) {
-		if (query[qi] === target[ti]) {
+		if (fuzzyCharMatches(query[qi] as string, target[ti] as string)) {
 			if (lastMatchIdx >= 0 && ti - lastMatchIdx > 1) gaps++;
 			lastMatchIdx = ti;
 			qi++;
@@ -849,14 +858,14 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 			const searchPath = scopedQuery?.baseDir ?? this.#basePath;
 			const fuzzyQuery = scopedQuery?.query ?? query;
 			const result = await (await fuzzyFindNative())(buildAutocompleteFuzzyDiscoveryProfile(fuzzyQuery, searchPath));
-			const lowerQuery = fuzzyQuery.normalize("NFC").toLowerCase();
+			const normalizedQuery = normalizeFuzzyText(fuzzyQuery);
 			const filteredMatches = result.matches.filter(entry => {
 				const p = entry.path.endsWith("/") ? entry.path.slice(0, -1) : entry.path;
 				const normalized = p.replaceAll("\\", "/");
 				if (/(^|\/)\.git(\/|$)/.test(normalized)) {
 					return false;
 				}
-				return lowerQuery.length === 0 || fuzzyMatch(lowerQuery, normalized.normalize("NFC").toLowerCase());
+				return normalizedQuery.length === 0 || fuzzyMatch(normalizedQuery, normalizeFuzzyText(normalized));
 			});
 			const topEntries = filteredMatches.slice(0, 20);
 			const suggestions: AutocompleteItem[] = [];

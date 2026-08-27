@@ -357,6 +357,15 @@ describe("CombinedAutocompleteProvider", () => {
 			expect(values).toContain("@history-search.ts");
 			expect(values).not.toContain(`@${hangulName}`);
 		});
+
+		it("keeps separator-bearing chosung queries accepted by native fuzzy search", async () => {
+			fs.writeFileSync(path.join(baseDir, hangulName), "content\n");
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "@ㅎ-ㄱ";
+			const result = await provider.getSuggestions([line], 0, line.length);
+			const values = result?.items.map(item => item.value) ?? [];
+			expect(values).toContain(`@${hangulName}`);
+		});
 	});
 });
 
@@ -518,6 +527,15 @@ describe("trySyncSlashCompletion", () => {
 		// Both should be present; order depends on fuzzyScore internals
 		expect(modelIdx).not.toBe(-1);
 		expect(modeIdx).not.toBe(-1);
+	});
+
+	it("scores Hangul chosung slash-command matches", () => {
+		const provider = new CombinedAutocompleteProvider(
+			[{ name: "한글명령", description: "Korean command", value: "한글명령" }],
+			"/tmp",
+		);
+		const result = provider.trySyncSlashCompletion("/ㅎㄱ");
+		expect(result?.items.map(item => item.value)).toEqual(["한글명령"]);
 	});
 
 	it("matches case-insensitively", () => {
