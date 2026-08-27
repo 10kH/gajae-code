@@ -328,6 +328,10 @@ function inheritedTmuxSocketPath(env: NodeJS.ProcessEnv): string | null {
 	return socket ? socket : null;
 }
 
+function namesInheritedTmuxSocket(message: string, socket: string): boolean {
+	return message.includes(`error connecting to ${socket} `);
+}
+
 function envWithoutInheritedTmux(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 	const withoutTmux: NodeJS.ProcessEnv = { ...env };
 	delete withoutTmux.TMUX;
@@ -345,7 +349,7 @@ function runListSessions(format: string, env: NodeJS.ProcessEnv = process.env): 
 		// A miss on the default socket is a real empty list; only the inherited
 		// socket is suspect, so retry without it before concluding there is
 		// nothing to list.
-		if (!inheritedSocket || !message.includes(inheritedSocket)) return [];
+		if (!inheritedSocket || !namesInheritedTmuxSocket(message, inheritedSocket)) return [];
 		try {
 			output = runTmux(["list-sessions", "-F", format], envWithoutInheritedTmux(env));
 		} catch (retryError) {

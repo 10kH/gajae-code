@@ -234,6 +234,21 @@ describe("GJC tmux session management", () => {
 		expect(listCalls).toBe(1);
 	});
 
+	it("does not retry when the error names a longer socket path with the inherited path as a prefix", () => {
+		let listCalls = 0;
+		spyOn(Bun, "spawnSync").mockImplementation(((command: unknown) => {
+			if (!spawnArgv(command).includes("list-sessions")) return spawnResult(0, "");
+			listCalls += 1;
+			return spawnResult(1, "", "error connecting to /tmp/host-emulated/agent-team-stale (No such file or directory)");
+		}) as never);
+		clearPsmuxDetectionCache();
+
+		expect(listGjcTmuxSessions({ GJC_TMUX_COMMAND: "tmux-test", TMUX: "/tmp/host-emulated/agent-team,0,1" })).toEqual(
+			[],
+		);
+		expect(listCalls).toBe(1);
+	});
+
 	it("reports provider-aware diagnostics before spawning when Windows has no multiplexer", async () => {
 		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-tmux-sessions-test-"));
 		fixtureDirectories.push(stateDir);
