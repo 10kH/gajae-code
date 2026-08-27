@@ -590,7 +590,13 @@ describe("update-cli managed notification recovery", () => {
 					path: runtimePath,
 				}),
 			});
-			expect(checksumCalls).toEqual([{ tag: release.tag, assetName: "gjc-linux-x64", filePath: target.path }]);
+			// Derive the expected asset from the production platform mapping so the
+			// assertion stays host-faithful (including the Windows `.exe` name) and
+			// fails loudly through the same unsupported-platform errors.
+			const assetName = path.posix.basename(
+				buildReleaseBinaryUrlForTest(release.version, process.platform, process.arch),
+			);
+			expect(checksumCalls).toEqual([{ tag: release.tag, assetName, filePath: target.path }]);
 			expect(result).toEqual({ ok: true, actual: release.version, path: target.path });
 		});
 
