@@ -336,8 +336,12 @@ function inheritedTmuxSocketPath(env: NodeJS.ProcessEnv): string | null {
 }
 
 function namesInheritedTmuxSocket(message: string, socket: string): boolean {
+	const normalizedMessage = message.toLowerCase();
+	const normalizedSocket = socket.toLowerCase();
 	return (
-		message.includes(`error connecting to ${socket} `) && /(?:No such file or directory|not found)/iu.test(message)
+		(normalizedMessage.includes(`error connecting to ${normalizedSocket} `) ||
+			normalizedMessage.includes(`failed to connect to server: ${normalizedSocket} `)) &&
+		/(?:no such file or directory|not found)/iu.test(message)
 	);
 }
 

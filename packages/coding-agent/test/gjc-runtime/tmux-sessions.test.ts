@@ -232,6 +232,23 @@ describe("GJC tmux session management", () => {
 		expect(observedTmux).toContain(undefined);
 	});
 
+	it("retries when an inherited socket uses the alternate failed-connect ENOENT diagnostic", () => {
+		const inheritedSocket = "/tmp/host-emulated/agent-team";
+		const observedTmux: (string | undefined)[] = [];
+		spyOn(Bun, "spawnSync").mockImplementation(((command: unknown, options: unknown) => {
+			if (!spawnArgv(command).includes("list-sessions")) return spawnResult(0, "");
+			const inherited = (options as { env?: NodeJS.ProcessEnv } | undefined)?.env?.TMUX;
+			observedTmux.push(inherited);
+			if (inherited)
+				return spawnResult(1, "", `failed to connect to server: ${inheritedSocket} (No such file or directory)`);
+			return spawnResult(0, "gajae_code_alt\t1\t0\t1770000000\t1\troot\t1\t12345\t\t\t\t\t\t\t\t$2");
+		}) as never);
+		clearPsmuxDetectionCache();
+
+		expect(listGjcTmuxSessions({ GJC_TMUX_COMMAND: "tmux-test", TMUX: `${inheritedSocket},0,1` })).toHaveLength(1);
+		expect(observedTmux).toEqual([`${inheritedSocket},0,1`, undefined]);
+	});
+
 	it("still reports an empty list when the default socket has no server either", () => {
 		const inheritedSocket = "/tmp/host-emulated/agent-team";
 		spyOn(Bun, "spawnSync").mockImplementation(((command: unknown, options: unknown) => {
