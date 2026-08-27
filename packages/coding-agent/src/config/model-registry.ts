@@ -1105,6 +1105,11 @@ function applyModelOverride(model: Model<Api>, override: ModelOverride): Model<A
 	}
 	if (override.headers) {
 		result.headers = { ...model.headers, ...override.headers };
+		if (override.headers.Authorization !== undefined || override.headers["X-Api-Key"] !== undefined) {
+			delete (result.headers as Record<string, string> & { [GENERATED_AUTH_HEADER]?: boolean })[
+				GENERATED_AUTH_HEADER
+			];
+		}
 	}
 	result.compat = mergeCompat(model.compat, override.compat);
 	return enrichModelThinking(result);
@@ -1197,7 +1202,12 @@ function mergeAuthHeader(
 	if (!authHeader || !apiKeyConfig) {
 		return nextHeaders;
 	}
-	return apiKeyConfig ? { ...nextHeaders, Authorization: `Bearer ${apiKeyConfig}` } : nextHeaders;
+	return apiKeyConfig
+		? ({ ...nextHeaders, Authorization: `Bearer ${apiKeyConfig}`, [GENERATED_AUTH_HEADER]: true } as Record<
+				string,
+				string
+			>)
+		: nextHeaders;
 }
 
 /**
@@ -4031,13 +4041,15 @@ export class ModelRegistry {
 			),
 			cacheRetention: entry.cacheRetention ?? override.cacheRetention,
 		};
+		const generatedHeader = (
+			result.headers as (Record<string, string> & { [GENERATED_AUTH_HEADER]?: boolean }) | undefined
+		)?.[GENERATED_AUTH_HEADER];
 		if (
-			override.authHeader === true &&
-			override.apiKey !== undefined &&
+			(generatedHeader === true || override.authHeader === true) &&
+			override.apiKey &&
 			result.headers?.Authorization !== undefined
 		) {
 			this.#generatedAuthHeaders.set(result, { authorization: result.headers.Authorization });
-			(result as Model<Api> & { [GENERATED_AUTH_HEADER]?: boolean })[GENERATED_AUTH_HEADER] = true;
 		} else {
 			const generated = this.#generatedAuthHeaders.get(entry);
 			if (generated) this.#generatedAuthHeaders.set(result, generated);
@@ -4076,7 +4088,11 @@ export class ModelRegistry {
 		const finalized = models.map(model => enrichModelThinking({ ...this.#restoreDeclaredThinking(model) }));
 		const result = applyFinalCodexGpt56ContextCap(finalized, undefined, this.#codexContextWindowOverrides);
 		for (let index = 0; index < result.length; index++) {
-			if ((result[index] as Model<Api> & { [GENERATED_AUTH_HEADER]?: boolean })[GENERATED_AUTH_HEADER]) {
+			if (
+				(result[index]?.headers as (Record<string, string> & { [GENERATED_AUTH_HEADER]?: boolean }) | undefined)?.[
+					GENERATED_AUTH_HEADER
+				]
+			) {
 				const authorization = result[index]?.headers?.Authorization;
 				if (authorization) this.#generatedAuthHeaders.set(result[index]!, { authorization });
 			}
@@ -5186,6 +5202,16 @@ export class ModelRegistry {
 			this.#reloadStaticModels();
 		}
 		if (config.authHeader !== undefined) {
+			if (config.authHeader === false) {
+				const previous = this.#customProviderApiKeys.get(providerName);
+				this.#runtimeModelOverlays = this.#runtimeModelOverlays.map(overlay => {
+					if (overlay.provider !== providerName) return overlay;
+					const headers = { ...(overlay.headers ?? {}) };
+					if (previous !== undefined && headers.Authorization === `Bearer ${previous}`)
+						delete headers.Authorization;
+					return { ...overlay, headers };
+				});
+			}
 			this.#runtimeProviderAuthHeaders.set(providerName, config.authHeader);
 			if (config.authHeader === true) this.#generatedAuthHeaderProviders.add(providerName);
 		}
