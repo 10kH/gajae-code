@@ -1915,16 +1915,20 @@ export class ModelRegistry {
 						[GENERATED_AUTH_HEADER]?: string;
 					};
 					const generated = headers[GENERATED_AUTH_HEADER];
-					if (typeof generated === "string" && headerValue(headers, "Authorization") === generated)
-						deleteHeaderCaseInsensitive(headers, "Authorization");
-					return {
-						...overlay,
-						headers: {
-							...headers,
-							Authorization: `Bearer ${resolved}`,
-							[GENERATED_AUTH_HEADER]: `Bearer ${resolved}`,
-						},
-					};
+					const hadAuthorization = headerValue(headers, "Authorization") !== undefined;
+					const ownsAuthorization = ownsOnlyGeneratedAuthorization(headers, generated);
+					if (ownsAuthorization) deleteHeaderCaseInsensitive(headers, "Authorization");
+					if (resolved && (ownsAuthorization || !hadAuthorization))
+						return {
+							...overlay,
+							headers: {
+								...headers,
+								Authorization: `Bearer ${resolved}`,
+								[GENERATED_AUTH_HEADER]: `Bearer ${resolved}`,
+							},
+						};
+					delete headers[GENERATED_AUTH_HEADER];
+					return { ...overlay, headers };
 				});
 			}
 		}
@@ -5330,6 +5334,7 @@ export class ModelRegistry {
 			this.#lastStaticLoadMtime = null;
 			this.#staticModelsLoaded = false;
 			this.#reloadStaticModels();
+			if (config.authHeader !== undefined) this.#runtimeProviderAuthHeaders.set(providerName, config.authHeader);
 		}
 		if (config.authHeader !== undefined) {
 			if (config.authHeader === false) {
