@@ -352,6 +352,7 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 	#getSlashCommandNameSuggestions(prefix: string): AutocompleteItem[] {
 		const lowerPrefix = prefix.toLowerCase();
 		const normalizedPrefix = normalizeFuzzyText(prefix);
+		if (prefix.length > 0 && normalizedPrefix.length === 0) return [];
 
 		return this.#commands
 			.filter(cmd => {

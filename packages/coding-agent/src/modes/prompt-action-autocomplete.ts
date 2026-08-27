@@ -324,7 +324,10 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 		if (!prefix) return null;
 		const query = prefix.slice(1).toLowerCase();
 		if (query.length === 0 && !options.includeEmpty) return null;
-		const normalizedQuery = query.startsWith("skill-") ? `skill:${query.slice("skill-".length)}` : query;
+		const normalizedQuery = normalizeFuzzyText(
+			query.startsWith("skill-") ? `skill:${query.slice("skill-".length)}` : query,
+		);
+		if (query.length > 0 && normalizedQuery.length === 0) return null;
 		const exactNonSkillCommand = this.#commands.some(
 			command => command.name === query && !command.name.startsWith("skill:"),
 		);
@@ -338,7 +341,7 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 					`skill-${skillName}`,
 					...(exactNonSkillCommand ? [] : [skillName]),
 					command.description ?? "",
-				].map(target => target.toLowerCase());
+				].map(target => normalizeFuzzyText(target));
 				if (
 					!searchTargets.some(
 						target => autocompleteFuzzyMatch(normalizedQuery, target) || target.includes(normalizedQuery),
