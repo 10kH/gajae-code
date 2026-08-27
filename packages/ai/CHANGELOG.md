@@ -9,6 +9,7 @@
 ### Fixed
 
 - Kiro credential selection now rejects control-character injection and keeps non-`ksk_` values on the Builder ID bearer path. API-key failures redact the credential before reaching assistant error output, and the transport accepts provider header overrides without changing the documented endpoint contract.
+- API-key model discovery also retains the contributor-supplied static catalog for offline print-mode resolution, while live `ListAvailableModels` results remain authoritative when available.
 
 ## [0.15.3] - 2026-08-27
 
