@@ -311,6 +311,13 @@ function isMissingServerFailure(message: string): boolean {
 	return message.includes("no server running") || message.includes("failed to connect to server");
 }
 
+function isMissingSocketFailure(message: string): boolean {
+	return (
+		message.toLowerCase().includes("error connecting to ") &&
+		/(?:no such file or directory|not found)/iu.test(message)
+	);
+}
+
 /**
  * `$TMUX` is inherited from whatever launched gjc and names the socket tmux
  * talks to. Terminal hosts that emulate tmux for their own agents can export a
@@ -359,10 +366,11 @@ function runListSessions(format: string, env: NodeJS.ProcessEnv = process.env): 
 				output = runTmux(["list-sessions", "-F", format], effectiveEnv);
 			} catch (retryError) {
 				const retryMessage = retryError instanceof Error ? retryError.message : String(retryError);
-				if (isMissingServerFailure(retryMessage)) return { lines: [], env: effectiveEnv };
+				if (isMissingServerFailure(retryMessage) || isMissingSocketFailure(retryMessage))
+					return { lines: [], env: effectiveEnv };
 				throw retryError;
 			}
-		} else if (isMissingServerFailure(message)) return { lines: [], env };
+		} else if (isMissingServerFailure(message) || isMissingSocketFailure(message)) return { lines: [], env };
 		else throw error;
 	}
 	const lines = output

@@ -182,6 +182,15 @@ describe("GJC tmux session management", () => {
 		expect(listGjcTmuxSessions()).toEqual([]);
 	});
 
+	it("returns an empty list when the default socket reports an ENOENT connection error", () => {
+		spyOn(Bun, "spawnSync").mockReturnValue(
+			spawnResult(1, "", "error connecting to /tmp/tmux-501/default (No such file or directory)"),
+		);
+		clearPsmuxDetectionCache();
+
+		expect(listGjcTmuxSessions({ GJC_TMUX_COMMAND: "tmux-test" })).toEqual([]);
+	});
+
 	// A terminal host that emulates tmux for its own agents can export a `$TMUX`
 	// naming a socket it never created. tmux then fails with `error connecting
 	// to <socket>`, which shares its shape with a legitimate "no server" miss —
@@ -247,9 +256,9 @@ describe("GJC tmux session management", () => {
 		}) as never);
 		clearPsmuxDetectionCache();
 
-		expect(() =>
-			listGjcTmuxSessions({ GJC_TMUX_COMMAND: "tmux-test", TMUX: "/tmp/host-emulated/agent-team,0,1" }),
-		).toThrow("error connecting to /tmp/host-emulated/agent-team-stale");
+		expect(listGjcTmuxSessions({ GJC_TMUX_COMMAND: "tmux-test", TMUX: "/tmp/host-emulated/agent-team,0,1" })).toEqual(
+			[],
+		);
 		expect(listCalls).toBe(1);
 	});
 
