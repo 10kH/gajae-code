@@ -514,7 +514,10 @@ async function removeStaleLockForAcquire(lockPath: string, snapshot: LockStaleSn
 		if (!sameStatToken(statToken(currentStats), snapshot.stat)) return false;
 		const captured = nativeFileLockBindings().snapshotDirectoryTree(lockPath);
 		if (!captured.ok || !captured.snapshot) return false;
-		if (captured.snapshot.rootDev !== String(currentStats.dev) || captured.snapshot.rootIno !== String(currentStats.ino))
+		if (
+			captured.snapshot.rootDev !== String(currentStats.dev) ||
+			captured.snapshot.rootIno !== String(currentStats.ino)
+		)
 			return false;
 		const removed = nativeFileLockBindings().exactRemoveDirectoryTree(lockPath, captured.snapshot);
 		return removed.ok || removed.code === "not_found";

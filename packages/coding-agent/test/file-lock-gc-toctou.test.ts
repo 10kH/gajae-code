@@ -99,17 +99,17 @@ describe("withFileLock stale owner liveness (#652)", () => {
 		const file = path.join(root, "nested", "deeper", "state.json");
 		const previousUmask = process.umask(0o277);
 		try {
-			await withFileLock(
-				file,
-				async () => undefined,
-				{
-					onAcquired: async () => {
-						for (const directory of [path.join(root, "nested"), path.join(root, "nested", "deeper"), `${file}.lock`]) {
-							expect((await fs.stat(directory)).mode & 0o777).toBe(0o700);
-						}
-					},
+			await withFileLock(file, async () => undefined, {
+				onAcquired: async () => {
+					for (const directory of [
+						path.join(root, "nested"),
+						path.join(root, "nested", "deeper"),
+						`${file}.lock`,
+					]) {
+						expect((await fs.stat(directory)).mode & 0o777).toBe(0o700);
+					}
 				},
-			);
+			});
 			const qualifiedFile = path.join(root, "qualified", "state.json");
 			await withFileLock(qualifiedFile, async () => undefined, {
 				ownerHostId: "test-host",
