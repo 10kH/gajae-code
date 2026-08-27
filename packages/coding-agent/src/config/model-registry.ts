@@ -1541,6 +1541,7 @@ export class ModelRegistry {
 	// models registered by extensions survive the model selector's offline reload.
 	#runtimeModelOverlays: CustomModelOverlay[] = [];
 	#runtimeProviderApiKeys: Map<string, string> = new Map();
+	#runtimeProviderResolvedApiKeys: Map<string, string> = new Map();
 	#runtimeProviderApiKeyEnvNames: Map<string, string> = new Map();
 	#runtimeProviderOverrides: Map<string, ProviderOverride> = new Map();
 	#runtimeProviderAuthHeaders: Map<string, boolean> = new Map();
@@ -1870,6 +1871,7 @@ export class ModelRegistry {
 				continue;
 			}
 			this.#customProviderApiKeys.set(provider, resolved);
+			this.#runtimeProviderResolvedApiKeys.set(provider, resolved);
 			this.authStorage.setConfigApiKey(provider, resolved);
 			const override = this.#runtimeProviderOverrides.get(provider);
 			if (override) this.#runtimeProviderOverrides.set(provider, { ...override, apiKey: resolved });
@@ -1900,6 +1902,7 @@ export class ModelRegistry {
 				: resolveApiKeyConfig(apiKeyConfig);
 			if (!resolved) continue;
 			this.#customProviderApiKeys.set(provider, resolved);
+			this.#runtimeProviderResolvedApiKeys.set(provider, resolved);
 			this.authStorage.setConfigApiKey(provider, resolved);
 		}
 		this.#lastDisabledProviderKey = disabledProviderKey;
@@ -5012,13 +5015,16 @@ export class ModelRegistry {
 			: this.#customProviderApiKeyEnvNames.get(provider);
 		if (!envName) return;
 		const resolved = $rotatingCredentialEnv(envName);
-		const previous = this.#customProviderApiKeys.get(provider);
+		const previous = runtimeOwned
+			? this.#runtimeProviderResolvedApiKeys.get(provider)
+			: this.#customProviderApiKeys.get(provider);
 		if (resolved === previous) return;
 		if (resolved === undefined) {
 			this.#customProviderApiKeys.delete(provider);
 			this.authStorage.removeConfigApiKey(provider);
 		} else {
 			this.#customProviderApiKeys.set(provider, resolved);
+			if (runtimeOwned) this.#runtimeProviderResolvedApiKeys.set(provider, resolved);
 			if (runtimeOwned) this.authStorage.setConfigApiKey(provider, resolved);
 			else this.authStorage.setConfigApiKey(provider, resolved, { envSourced: true });
 		}
@@ -5143,6 +5149,7 @@ export class ModelRegistry {
 
 	#clearRuntimeProviderState(providerName: string): void {
 		this.#runtimeProviderApiKeys.delete(providerName);
+		this.#runtimeProviderResolvedApiKeys.delete(providerName);
 		this.#runtimeProviderApiKeyEnvNames.delete(providerName);
 		this.#runtimeProviderOverrides.delete(providerName);
 		this.#runtimeProviderAuthHeaders.delete(providerName);
@@ -5281,12 +5288,14 @@ export class ModelRegistry {
 			this.#customProviderApiKeys.set(providerName, resolved);
 			// Persist runtime API keys so they survive #reloadStaticModels() cycles
 			this.#runtimeProviderApiKeys.set(providerName, config.apiKey);
+			this.#runtimeProviderResolvedApiKeys.set(providerName, resolved);
 			if (config.authHeader !== undefined) this.#runtimeProviderAuthHeaders.set(providerName, config.authHeader);
 			this.authStorage.setConfigApiKey(providerName, resolved);
 		}
 		if (config.oauth && !config.apiKey && this.#runtimeProviderApiKeys.has(providerName)) {
-			const previousApiKey = this.#customProviderApiKeys.get(providerName);
+			const previousApiKey = this.#runtimeProviderResolvedApiKeys.get(providerName);
 			this.#runtimeProviderApiKeys.delete(providerName);
+			this.#runtimeProviderResolvedApiKeys.delete(providerName);
 			this.#runtimeProviderApiKeyEnvNames.delete(providerName);
 			this.#runtimeProviderAuthHeaders.delete(providerName);
 			this.#customProviderApiKeys.delete(providerName);
