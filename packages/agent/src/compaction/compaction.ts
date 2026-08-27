@@ -178,6 +178,7 @@ export function computeAdaptiveThresholdPercent(
 	const clampedBasePercent = Number.isFinite(basePercent) ? Math.min(99, Math.max(1, basePercent)) : 85;
 	if (!options?.enabled) return basePercent;
 	if (!state || !Number.isFinite(contextWindow) || contextWindow <= 0) return clampedBasePercent;
+	if (!Number.isFinite(options.turnWindow) || options.turnWindow <= 0) return clampedBasePercent;
 
 	if (state.turnsSinceCompact < 3) return clampedBasePercent;
 
@@ -186,8 +187,11 @@ export function computeAdaptiveThresholdPercent(
 	const baseRatio = clampedBasePercent / 100;
 	if (fillRatio < baseRatio * 0.7) return clampedBasePercent;
 
-	const windowTurns = Number.isFinite(options.turnWindow) ? Math.max(1, options.turnWindow * 4) : 1;
-	const intensity = Math.min(1, Math.max(0, state.callsInWindow) / windowTurns);
+	const turnsSinceCompact = Number.isFinite(state.turnsSinceCompact) ? Math.max(0, state.turnsSinceCompact) : 0;
+	const callsInWindow = Number.isFinite(state.callsInWindow) ? Math.max(0, state.callsInWindow) : 0;
+	if (turnsSinceCompact < 3) return clampedBasePercent;
+	const windowTurns = Math.max(1, options.turnWindow * 4);
+	const intensity = Math.min(1, callsInWindow / windowTurns);
 	const aggression = Number.isFinite(options.aggression) ? Math.min(1, Math.max(0, options.aggression)) : 0;
 	const configuredMinThresholdPercent = options.minThresholdPercent;
 	const minThresholdPercent = Math.min(

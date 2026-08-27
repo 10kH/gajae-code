@@ -2432,7 +2432,7 @@ export class AgentSession {
 	// it survives the message-array rebuild that compaction/prune perform.
 	#lastMidRunMaintenanceAnchorSignature: string | undefined = undefined;
 	#adaptiveCompactionTracker = new AdaptiveCompactionTracker();
-	#adaptiveCompactionRecordedMessages = new WeakSet<AssistantMessage>();
+	#adaptiveCompactionRecordedMessageKey: string | undefined;
 	#resourceSampler: () => EmergencyCompactionSample = () => this.#defaultResourceSample();
 	#retainedMemorySampler: (() => RetainedMemorySample) | undefined;
 
@@ -15861,7 +15861,7 @@ export class AgentSession {
 					fromExtension,
 					preserveData,
 				);
-				this.#resetAdaptiveCompactionState();
+				this.#recordAdaptiveCompactionReset(tokensBefore);
 				await this.#applyCompactionPostAppend(compactionEntryId, firstKeptEntryId, fromExtension);
 
 				const compactionResult: CompactionResult = {
@@ -16733,12 +16733,17 @@ export class AgentSession {
 	): T {
 		if (!settings.adaptive?.enabled) return settings;
 		this.#adaptiveCompactionTracker.setWindowMs(settings.adaptive.turnWindow * 60_000);
-		if (this.#adaptiveCompactionRecordedMessages.has(assistantMessage)) {
+		const messageKey = this.#adaptiveCompactionMessageKey(assistantMessage);
+		if (this.#adaptiveCompactionRecordedMessageKey === messageKey) {
 			return this.#compactionSettingsWithAdaptiveState(settings);
 		}
-		this.#adaptiveCompactionRecordedMessages.add(assistantMessage);
+		this.#adaptiveCompactionRecordedMessageKey = messageKey;
 		this.#adaptiveCompactionTracker.recordCall(contextTokens);
 		return this.#compactionSettingsWithAdaptiveState(settings);
+	}
+
+	#adaptiveCompactionMessageKey(message: AssistantMessage): string {
+		return `${message.provider}\u0000${message.model}\u0000${message.timestamp}\u0000${message.usage?.totalTokens ?? ""}`;
 	}
 
 	#compactionSettingsWithAdaptiveState<T extends { adaptive?: { enabled: boolean } }>(settings: T): T {
@@ -16751,7 +16756,13 @@ export class AgentSession {
 
 	#resetAdaptiveCompactionState(): void {
 		this.#adaptiveCompactionTracker.reset();
-		this.#adaptiveCompactionRecordedMessages = new WeakSet<AssistantMessage>();
+		this.#adaptiveCompactionRecordedMessageKey = undefined;
+	}
+
+	#recordAdaptiveCompactionReset(contextTokens: number): void {
+		this.#adaptiveCompactionTracker.reset();
+		this.#adaptiveCompactionTracker.recordCompact(contextTokens);
+		this.#adaptiveCompactionRecordedMessageKey = undefined;
 	}
 
 	#assistantEndedWithSuccessfulYield(assistantMessage: AssistantMessage): boolean {
@@ -18204,7 +18215,7 @@ export class AgentSession {
 				fromExtension,
 				preserveData,
 			);
-			this.#resetAdaptiveCompactionState();
+			this.#recordAdaptiveCompactionReset(tokensBefore);
 			await this.#applyCompactionPostAppend(compactionEntryId, firstKeptEntryId, fromExtension);
 			if (autoCompactionSignal.aborted) return await emitAborted();
 

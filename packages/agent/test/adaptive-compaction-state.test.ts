@@ -70,6 +70,21 @@ describe("AdaptiveCompactionTracker", () => {
 		expect(tracker.snapshot().callsInWindow).toBe(1);
 	});
 
+	it("retains compaction metadata when counters are reset", () => {
+		const tracker = new AdaptiveCompactionTracker(60_000, 0);
+		tracker.recordCall(80_000, 1_000);
+		tracker.reset(2_000);
+		tracker.recordCompact(123_000, 3_000);
+
+		expect(tracker.snapshot()).toMatchObject({
+			turnsSinceCompact: 0,
+			callsInWindow: 0,
+			lastContextTokens: 123_000,
+			lastCompactContextTokens: 123_000,
+			lastCompactTs: 3_000,
+		});
+	});
+
 	it("exposes the latest context size for adaptive decisions", () => {
 		const tracker = new AdaptiveCompactionTracker(60_000, 0);
 

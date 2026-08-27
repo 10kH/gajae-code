@@ -38,7 +38,11 @@ export class AdaptiveCompactionTracker {
 	}
 
 	setWindowMs(windowMs: number, now = Date.now()): void {
-		if (!Number.isFinite(windowMs)) return;
+		if (!Number.isFinite(windowMs)) {
+			this.windowMs = 1;
+			this.#state.windowStart = now;
+			return;
+		}
 		const nextWindowMs = Math.max(1, windowMs);
 		if (nextWindowMs === this.windowMs) return;
 		this.windowMs = nextWindowMs;

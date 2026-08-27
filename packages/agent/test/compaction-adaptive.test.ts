@@ -122,4 +122,34 @@ describe("adaptive compaction threshold", () => {
 			}),
 		).toBe(99);
 	});
+
+	it("uses the adaptive base for the disabled percentage sentinel", () => {
+		expect(
+			resolveThresholdTokens(
+				100_000,
+				{
+					...adaptiveSettings,
+					thresholdPercent: -1,
+					adaptive: { ...adaptiveOptions, baseThresholdPercent: 72 },
+				},
+				0,
+				0,
+			),
+		).toBe(72_000);
+	});
+
+	it("fails safe for malformed decision state and window settings", () => {
+		expect(
+			computeAdaptiveThresholdPercent(
+				85,
+				80_000,
+				100_000,
+				{
+					turnsSinceCompact: Number.NaN,
+					callsInWindow: Number.NaN,
+				},
+				{ ...adaptiveOptions, turnWindow: Number.NaN },
+			),
+		).toBe(85);
+	});
 });
