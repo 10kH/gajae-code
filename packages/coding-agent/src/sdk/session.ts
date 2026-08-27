@@ -4147,7 +4147,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								provider,
 								error: error instanceof Error ? error.message : String(error),
 							});
-							return modelRegistry.getApiKeyForProvider(provider, credentialSessionId);
+							return modelRegistry.getApiKey(streamModel, credentialSessionId, {
+								signal: streamOptions?.signal,
+							});
 						},
 					});
 				} catch (error) {
