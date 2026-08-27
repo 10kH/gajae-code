@@ -959,7 +959,7 @@ export function validateToolCall(tools: Tool[], toolCall: ToolCall): ToolCall["a
 }
 
 const RAW_ARGUMENT_REJECTION_MESSAGES: Record<RawArgumentRejectionCode, string> = {
-	"deep-interview-question-body-placeholder":
+	"ask-deep-interview-question-body-required":
 		"deep-interview question bodies must contain a specific question, not a placeholder",
 	"ask-intent-review-requires-positive-round":
 		"deepInterview.intent_review is post-Round-0 only and requires a positive round",

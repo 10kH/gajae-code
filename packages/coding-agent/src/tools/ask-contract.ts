@@ -477,7 +477,7 @@ function deepInterviewPlaceholderRejection(
 		if (isWorkflowPlaceholderText(rawQuestion.question)) {
 			return {
 				outcome: "reject",
-				code: "deep-interview-question-body-placeholder",
+				code: "ask-deep-interview-question-body-required",
 				detail: {
 					rejectedKeys: [`questions[${index}].question`],
 					hint: WORKFLOW_PLACEHOLDER_CORRECTION,

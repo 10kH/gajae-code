@@ -9,7 +9,20 @@ import {
 } from "@gajae-code/coding-agent/gjc-runtime/workflow-placeholder";
 import { askSchema, recoverRoundZeroIntentContract } from "@gajae-code/coding-agent/tools/ask-contract";
 
-const PLACEHOLDERS = ["", "   \n\t", "unused", "TODO", "tbd", "n-a", "none", "placeholder", "empty", "stub"];
+const PLACEHOLDERS = [
+	"",
+	"   \n\t",
+	"unused",
+	"TODO",
+	"tbd",
+	"n-a",
+	"n/a",
+	"N/A",
+	"none",
+	"placeholder",
+	"empty",
+	"stub",
+];
 
 function roundQuestion(question: string): Record<string, unknown> {
 	return {
@@ -41,7 +54,7 @@ describe("shared workflow placeholder semantics", () => {
 			const result = recoverRoundZeroIntentContract(roundQuestion(question));
 			expect(result).toMatchObject({
 				outcome: "reject",
-				code: "deep-interview-question-body-placeholder",
+				code: "ask-deep-interview-question-body-required",
 				detail: {
 					rejectedKeys: ["questions[0].question"],
 					hint: WORKFLOW_PLACEHOLDER_CORRECTION,
