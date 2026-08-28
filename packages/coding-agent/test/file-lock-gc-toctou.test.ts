@@ -97,11 +97,11 @@ describe("withFileLock stale owner liveness (#652)", () => {
 		expect((await fs.readdir(`${file}.lock`)).join(",")).toBe("info");
 	});
 
-	test("publishes a directory lock through the no-replace claim fallback when rename flags are unsupported", async () => {
+	test("fails closed when native no-replace publication is unsupported", async () => {
 		const root = await makeTemp();
 		const file = path.join(root, "unsupported", "publication.json");
-		const realRename = native.renameNoReplacePath;
-		vi.spyOn(native, "renameNoReplacePath").mockImplementation(() => ({
+		const realRename = native.renameNoReplacePathAsync;
+		vi.spyOn(native, "renameNoReplacePathAsync").mockImplementation(async () => ({
 			ok: false,
 			code: "atomic_unavailable",
 			mutationState: "not_committed",
@@ -111,17 +111,19 @@ describe("withFileLock stale owner liveness (#652)", () => {
 			phase: "preflight",
 			diagnostic: { schemaVersion: 1, collectionState: "unavailable" },
 		}));
-		await expect(withFileLock(file, async () => undefined)).resolves.toBeUndefined();
+		await expect(withFileLock(file, async () => undefined)).rejects.toThrow(
+			"Failed to publish file lock: atomic_unavailable",
+		);
 		expect(await fs.exists(`${file}.lock`)).toBe(false);
-		vi.spyOn(native, "renameNoReplacePath").mockImplementation(realRename);
+		vi.spyOn(native, "renameNoReplacePathAsync").mockImplementation(realRename);
 	});
 
-	test("does not replace a legacy empty lock directory during unsupported publication fallback", async () => {
+	test("does not replace a legacy empty lock directory when publication is unsupported", async () => {
 		const root = await makeTemp();
 		const file = path.join(root, "legacy-empty", "publication.json");
 		await fs.mkdir(`${file}.lock`, { recursive: true });
-		const realRename = native.renameNoReplacePath;
-		vi.spyOn(native, "renameNoReplacePath").mockImplementation(() => ({
+		const realRename = native.renameNoReplacePathAsync;
+		vi.spyOn(native, "renameNoReplacePathAsync").mockImplementation(async () => ({
 			ok: false,
 			code: "invalid_request",
 			mutationState: "not_committed",
@@ -133,7 +135,7 @@ describe("withFileLock stale owner liveness (#652)", () => {
 		}));
 		await expect(withFileLock(file, async () => undefined, { retries: 2, retryDelayMs: 1 })).rejects.toThrow();
 		expect((await fs.stat(`${file}.lock`)).isDirectory()).toBe(true);
-		vi.spyOn(native, "renameNoReplacePath").mockImplementation(realRename);
+		vi.spyOn(native, "renameNoReplacePathAsync").mockImplementation(realRename);
 	});
 
 	test("publishes nested lock directories with private modes under restrictive umask", async () => {
@@ -1027,5 +1029,44 @@ describe("fileLocksGcAdapter.prune TOCTOU (#606)", () => {
 		const onDisk = JSON.parse(await fs.readFile(path.join(lockDir, "info"), "utf8"));
 		expect(onDisk.pid).toBe(LIVE_PID);
 		expect(onDisk.timestamp).toBe(2000);
+	});
+
+	test("does not let a cloned directory inherit a stale verdict before the removal snapshot", async () => {
+		const base = await makeTemp();
+		const spoolDir = path.join(base, "spool");
+		const lockDir = path.join(spoolDir, "clone-before-snapshot.lock");
+		await writeInfo(lockDir, { pid: DEAD_PID, timestamp: 1000 });
+
+		let cloned = false;
+		let exactRemoveCalled = false;
+		FileLockTestHooks.nativeQuarantineBindings = () => ({
+			snapshotDirectoryTree(target) {
+				if (target === lockDir && !cloned) {
+					cloned = true;
+					rmSync(lockDir, { recursive: true, force: true });
+					mkdirSync(lockDir);
+					writeFileSync(
+						path.join(lockDir, "info"),
+						JSON.stringify({ pid: DEAD_PID, start_time: "test-start", timestamp: 1000 }),
+					);
+				}
+				return snapshotDirectoryTree(target);
+			},
+			exactRemoveDirectoryTree() {
+				exactRemoveCalled = true;
+				return { ok: false, code: "identity_mismatch" };
+			},
+		});
+
+		const outcome = await fileLocksGcAdapter.prune(
+			deadLockRecord(lockDir),
+			ctxWith(spoolDir, () => ({ status: "dead" })),
+		);
+
+		expect(cloned).toBe(true);
+		expect(exactRemoveCalled).toBe(false);
+		expect(outcome).toEqual({ removed: false, skipped: "file_lock_owner_changed_before_delete" });
+		expect(await fs.exists(lockDir)).toBe(true);
+		expect(JSON.parse(await fs.readFile(path.join(lockDir, "info"), "utf8")).timestamp).toBe(1000);
 	});
 });

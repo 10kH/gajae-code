@@ -71,9 +71,22 @@ interface TransitionDirectoryGeneration {
 	ctimeNs: bigint;
 }
 
+function transitionGenerationFromStat(stat: fsSync.BigIntStats): TransitionDirectoryGeneration {
+	return {
+		dev: stat.dev,
+		ino: stat.ino,
+		mode: stat.mode,
+		nlink: stat.nlink,
+		mtimeNs: stat.mtimeNs,
+		ctimeNs: stat.ctimeNs,
+	};
+}
+
 interface PendingTransitionRelease {
 	token: string;
 	generation: TransitionDirectoryGeneration;
+	held: LockOwnerSnapshot;
+	releasedOwner: SessionStateLockOwner;
 	recovery?: Promise<boolean>;
 }
 
@@ -220,6 +233,10 @@ export const SessionStateLockTestHooks: {
 	unqualifiedOwnerIsLocal?: boolean;
 	/** @internal Runs after final live-owner validation and before descriptor rewrite. */
 	afterCurrentOwnerValidation?: (file: string) => void | Promise<void>;
+	/** @internal Fault seam immediately before a held owner record rewrite mutates bytes. */
+	beforeOwnerRecordRewrite?: (file: string) => void | Promise<void>;
+	/** @internal Fault seam immediately before final transition-generation validation. */
+	beforeTransitionReleaseLstat?: (transitionDir: string) => void | Promise<void>;
 	/**
 	 * @internal Runs after a live owner has been proven and immediately before its
 	 * final pathname capture for release. Tests use it to replace the pathname and
@@ -715,17 +732,21 @@ async function newLockOwner(): Promise<SessionStateLockOwner> {
 	};
 }
 
-async function releasedLockOwner(): Promise<SessionStateLockOwner> {
+function releasedOwnerForHost(ownerHostId: string, token = randomUUID()): SessionStateLockOwner {
 	return {
 		// PID 1 exists in every supported process namespace. Legacy readers that do
 		// not understand `released` therefore keep this compatibility fence instead
 		// of deleting it and racing a current writer.
 		pid: 1,
 		start_time: "unknown",
-		token: randomUUID(),
-		owner_host_id: await currentOwnerHostId(),
+		token,
+		owner_host_id: ownerHostId,
 		released: true,
 	};
+}
+
+async function releasedLockOwner(): Promise<SessionStateLockOwner> {
+	return releasedOwnerForHost(await currentOwnerHostId());
 }
 
 /**
@@ -896,6 +917,7 @@ async function rewriteHeldOwnerRecord(
 			throw new SessionStateLockUnavailableError(new Error("Owner record identity changed before rewrite."));
 
 		const replacementBytes = Buffer.from(JSON.stringify(replacement), "utf8");
+		await SessionStateLockTestHooks.beforeOwnerRecordRewrite?.(file);
 		await handle.truncate(0);
 		let offset = 0;
 		while (offset < replacementBytes.byteLength) {
@@ -1045,51 +1067,35 @@ async function releaseTransitionClaim(
 	ownerFile: string,
 	held: LockOwnerSnapshot,
 	recoveryKey: string,
+	transitionGeneration: TransitionDirectoryGeneration,
 ): Promise<void> {
-	const transitionStat = await fs.lstat(transitionDir, { bigint: true });
-	if (!transitionStat.isDirectory())
-		throw new SessionStateLockUnavailableError(new Error("Transition claim is no longer a directory."));
+	let heldOwner: SessionStateLockOwner;
+	try {
+		heldOwner = JSON.parse(held.bytes) as SessionStateLockOwner;
+	} catch (error) {
+		throw new SessionStateLockUnavailableError(error);
+	}
+	const releasedOwner = releasedOwnerForHost(heldOwner.owner_host_id ?? "", randomUUID());
+	// Arm recovery before every fallible release phase. In particular, an initial
+	// lstat/capture or a rewrite that commits bytes and then reports an I/O fault must not
+	// strand the claim without a generation-bound replay record.
+	pendingTransitionReleases.set(recoveryKey, {
+		token: releasedOwner.token,
+		generation: transitionGeneration,
+		held,
+		releasedOwner,
+	});
 	await SessionStateLockTestHooks.beforeCurrentOwnerRelease?.(ownerFile);
 	const current = await captureRegularLockOwner(ownerFile);
 	if (!current || !sameLockOwnerSnapshot(current, held))
 		throw new SessionStateLockUnavailableError(new Error("Transition owner changed before release."));
 	await SessionStateLockTestHooks.afterCurrentOwnerValidation?.(ownerFile);
-	const releasedOwner = await releasedLockOwner();
-	// Arm recovery BEFORE the rewrite itself. Its namespace mutation can commit before
-	// final verification reports an I/O fault, leaving a released tombstone inside a
-	// claim that this process must still be able to retract.
-	pendingTransitionReleases.set(recoveryKey, {
-		token: releasedOwner.token,
-		generation: {
-			dev: transitionStat.dev,
-			ino: transitionStat.ino,
-			mode: transitionStat.mode,
-			nlink: transitionStat.nlink,
-			mtimeNs: transitionStat.mtimeNs,
-			ctimeNs: transitionStat.ctimeNs,
-		},
-	});
-	try {
-		await rewriteHeldOwnerRecord(ownerFile, held, releasedOwner);
-	} catch (error) {
-		// A rewrite can fail before touching the inode. Do not retain a pending
-		// generation for that ordinary refusal; retain it only when the released
-		// tombstone is actually present and therefore needs replay.
-		try {
-			const currentOwner = await captureRegularLockOwner(ownerFile);
-			const parsed = currentOwner ? (JSON.parse(currentOwner.bytes) as Partial<SessionStateLockOwner>) : undefined;
-			if (!parsed || parsed.token !== releasedOwner.token || parsed.released !== true)
-				pendingTransitionReleases.delete(recoveryKey);
-		} catch {
-			// Preserve the pending entry when the post-failure state cannot be proved.
-		}
-		throw error;
-	}
+	await rewriteHeldOwnerRecord(ownerFile, held, releasedOwner);
+	await SessionStateLockTestHooks.beforeTransitionReleaseLstat?.(transitionDir);
 	const currentTransition = await fs.lstat(transitionDir, { bigint: true });
 	if (
 		!currentTransition.isDirectory() ||
-		currentTransition.dev !== transitionStat.dev ||
-		currentTransition.ino !== transitionStat.ino
+		!sameTransitionGeneration(transitionGenerationFromStat(currentTransition), transitionGeneration)
 	)
 		throw new SessionStateLockUnavailableError(new Error("Transition claim changed before release."));
 	try {
@@ -1191,11 +1197,39 @@ async function recoverPendingTransitionRelease(transitionDir: string, recoveryKe
 			return false;
 		}
 		try {
-			const pendingOwner = JSON.parse(await fs.readFile(ownerFile, "utf8")) as Partial<SessionStateLockOwner>;
-			if (pendingOwner.token !== pending.token || pendingOwner.released !== true) {
+			let pendingOwner = await captureRegularLockOwner(ownerFile);
+			if (!pendingOwner) return false;
+			let parsed: Partial<SessionStateLockOwner>;
+			try {
+				parsed = JSON.parse(pendingOwner.bytes) as Partial<SessionStateLockOwner>;
+			} catch {
 				pendingTransitionReleases.delete(pendingKey);
 				return false;
 			}
+			if (parsed.token !== pending.token || parsed.released !== true) {
+				// A rewrite may have failed before touching the inode. Retry it only when
+				// the owner path is still the exact record this transition held; any other
+				// bytes belong to a successor and invalidate this pending authority.
+				if (!sameLockOwnerSnapshot(pendingOwner, pending.held)) {
+					pendingTransitionReleases.delete(pendingKey);
+					return false;
+				}
+				try {
+					await rewriteHeldOwnerRecord(ownerFile, pending.held, pending.releasedOwner);
+				} catch {
+					// Keep the generation record. A later contender can retry this
+					// release without replaying the already-completed transition.
+					return false;
+				}
+				pendingOwner = await captureRegularLockOwner(ownerFile);
+				if (!pendingOwner) return false;
+				try {
+					parsed = JSON.parse(pendingOwner.bytes) as Partial<SessionStateLockOwner>;
+				} catch {
+					return false;
+				}
+			}
+			if (parsed.token !== pending.token || parsed.released !== true) return false;
 			const captured = nativeSessionStateLock().snapshotDirectoryTree(transitionDir);
 			if (
 				!captured.ok ||
@@ -1279,19 +1313,35 @@ async function withLockPathTransition<T>(lockFile: string, transition: () => Pro
 			await removeTransitionDir(transitionDir).catch(() => undefined);
 			throw error;
 		}
+		let transitionGeneration: TransitionDirectoryGeneration;
+		try {
+			const transitionStat = await fs.lstat(transitionDir, { bigint: true });
+			if (!transitionStat.isDirectory()) throw new Error("Transition claim is no longer a directory.");
+			transitionGeneration = transitionGenerationFromStat(transitionStat);
+		} catch (error) {
+			// The owner descriptor is the only authority to retract this sidecar after
+			// creation. If generation capture itself faults, keep the claim fail-closed
+			// when that proof cannot complete rather than removing an unrelated file.
+			if (exactUnlinkOwnerRecord(ownerFile, held) !== "removed") throw new SessionStateLockUnavailableError(error);
+			await removeTransitionDir(transitionDir).catch(() => undefined);
+			throw new SessionStateLockUnavailableError(error);
+		}
 		const outcome = await transition().then(
 			value => ({ ok: true as const, value }),
 			error => ({ ok: false as const, error }),
 		);
 		try {
-			await releaseTransitionClaim(transitionDir, ownerFile, held, recoveryKey);
+			await releaseTransitionClaim(transitionDir, ownerFile, held, recoveryKey, transitionGeneration);
 		} catch (releaseError) {
 			// The release rewrite may itself have succeeded before the claim-dir
 			// removal was denied (transient sharing denial). Recover the stranded
 			// claim in-process without replaying a transition that already succeeded.
-			if (outcome.ok && pendingTransitionReleases.has(recoveryKey)) {
+			if (pendingTransitionReleases.has(recoveryKey)) {
 				for (let recoveryAttempt = 0; recoveryAttempt < LOCK_ACQUIRE_ATTEMPTS; recoveryAttempt++) {
-					if (await recoverPendingTransitionRelease(transitionDir, recoveryKey)) return outcome.value;
+					if (await recoverPendingTransitionRelease(transitionDir, recoveryKey)) {
+						if (outcome.ok) return outcome.value;
+						throw outcome.error;
+					}
 					if (!pendingTransitionReleases.has(recoveryKey)) break;
 					await Bun.sleep(LOCK_ACQUIRE_RETRY_MS);
 				}
@@ -1445,7 +1495,11 @@ async function reclaimStaleDirectoryLock(lockFile: string): Promise<void> {
 		await SessionStateLockTestHooks.afterLegacyDirectoryStaleVerdict?.(lockFile);
 		const authorized = captureLegacyDirectoryTree(native, lockFile);
 		// The verdict spoke for `before`; only an unchanged tree carries that authority.
-		if (!authorized || !legacyDirectoryMatchesVerdict(authorized, verdict.identity) || !sameDirectoryTreeSnapshot(before, authorized))
+		if (
+			!authorized ||
+			!legacyDirectoryMatchesVerdict(authorized, verdict.identity) ||
+			!sameDirectoryTreeSnapshot(before, authorized)
+		)
 			return;
 		await SessionStateLockTestHooks.beforeLegacyDirectoryRemoval?.(lockFile);
 		let removed: NativeExactUnlinkResult;

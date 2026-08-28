@@ -2,8 +2,8 @@ import * as crypto from "node:crypto";
 import type { BigIntStats, Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { NativeDirectoryTreeResult, NativeExactUnlinkResult, NativeNoReplaceResult } from "@gajae-code/natives";
-import { renameNoReplacePath } from "@gajae-code/natives";
+import type { NativeDirectoryTreeResult, NativeExactUnlinkResult } from "@gajae-code/natives";
+import { renameNoReplacePathAsync } from "@gajae-code/natives";
 import { isEnoent } from "@gajae-code/utils/fs-error";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 
@@ -212,6 +212,42 @@ function sameLockInfoPathState(left: LockInfoPathState, right: LockInfoPathState
 	);
 }
 
+function fileLockDirIdentityFromPathState(state: LockInfoPathState, bytes: string): GenericFileLockDirIdentity {
+	return {
+		rootDev: String(state.root.dev),
+		rootIno: String(state.root.ino),
+		infoDev: String(state.file.dev),
+		infoIno: String(state.file.ino),
+		infoNlink: String(state.file.nlink),
+		infoSize: String(state.file.size),
+		infoMtimeNs: String(state.file.mtimeNs),
+		infoCtimeNs: String(state.file.ctimeNs),
+		infoSha256: crypto.createHash("sha256").update(bytes).digest("hex"),
+	};
+}
+
+/** Capture the exact root/info identity that a later stale verdict may authorize. */
+async function captureFileLockDirIdentity(lockDir: string): Promise<GenericFileLockDirIdentity | null> {
+	const before = await lockInfoPathState(lockDir);
+	if (!before) return null;
+	const bytes = await readLockInfoBytes(lockDir);
+	if (bytes === null) return null;
+	const after = await lockInfoPathState(lockDir);
+	if (!after || !sameLockInfoPathState(before, after)) return null;
+	return fileLockDirIdentityFromPathState(after, bytes);
+}
+
+/** Resolve parent aliases without following the mutable lock-dir final component. */
+async function canonicalLockPathPreservingFinal(lockPath: string): Promise<string> {
+	const parent = path.dirname(lockPath);
+	try {
+		return path.join(await fs.realpath(parent), path.basename(lockPath));
+	} catch (error) {
+		if (!isEnoent(error) && !isTransientReleaseError(error)) throw error;
+		return lockPath;
+	}
+}
+
 function normalizeLockKey(lockPath: string): string {
 	return path.normalize(lockPath);
 }
@@ -314,7 +350,12 @@ function parseLockInfoBytes(bytes: string): LockInfo | null {
 
 /** @internal */
 export async function readFileLockInfoForGc(lockDir: string): Promise<FileLockOwnerToken | null> {
-	return await readLockInfo(lockDir);
+	const info = await readLockInfo(lockDir);
+	if (info) {
+		const identity = await captureFileLockDirIdentity(lockDir);
+		if (identity) fileLockDirIdentities.set(info, identity);
+	}
+	return info;
 }
 
 /** Owner identity stamped into a `<file>.lock/info` record. */
@@ -328,6 +369,13 @@ export interface FileLockOwnerToken {
 	owner_token?: string;
 	timestamp: number;
 }
+
+/**
+ * Identity captured before a stale/liveness verdict. Kept out of the owner JSON: it is
+ * authorization evidence for the in-memory call that produced the verdict, not metadata
+ * another process may copy into a new lock generation.
+ */
+const fileLockDirIdentities = new WeakMap<object, GenericFileLockDirIdentity>();
 
 function getLockPath(filePath: string): string {
 	return `${filePath}.lock`;
@@ -396,7 +444,7 @@ interface LockDirStatToken {
 
 type LockStaleSnapshot =
 	| { stale: false }
-	| { stale: true; owner: FileLockOwnerToken }
+	| { stale: true; owner: FileLockOwnerToken; identity: GenericFileLockDirIdentity }
 	| { stale: true; owner: null; stat: LockDirStatToken };
 
 /** Identity evidence carried by the generic stale verdict into a later removal. */
@@ -412,9 +460,21 @@ export interface GenericFileLockDirIdentity {
 	infoSha256: string;
 }
 
-export type GenericFileLockDirStaleVerdict =
-	| { stale: false }
-	| { stale: true; identity: GenericFileLockDirIdentity };
+function sameGenericFileLockDirIdentity(left: GenericFileLockDirIdentity, right: GenericFileLockDirIdentity): boolean {
+	return (
+		left.rootDev === right.rootDev &&
+		left.rootIno === right.rootIno &&
+		left.infoDev === right.infoDev &&
+		left.infoIno === right.infoIno &&
+		left.infoNlink === right.infoNlink &&
+		left.infoSize === right.infoSize &&
+		left.infoMtimeNs === right.infoMtimeNs &&
+		left.infoCtimeNs === right.infoCtimeNs &&
+		left.infoSha256 === right.infoSha256
+	);
+}
+
+export type GenericFileLockDirStaleVerdict = { stale: false } | { stale: true; identity: GenericFileLockDirIdentity };
 
 /**
  * @internal
@@ -436,7 +496,9 @@ export type GenericFileLockDirStaleVerdict =
 export async function removeFileLockDirForGc(
 	lockDir: string,
 	expected: FileLockOwnerToken,
+	preVerdictIdentity?: GenericFileLockDirIdentity,
 ): Promise<FileLockGcRemoval> {
+	const expectedIdentity = preVerdictIdentity ?? fileLockDirIdentities.get(expected);
 	const onDiskBytes = await readLockInfoBytes(lockDir);
 	const current = onDiskBytes === null ? null : parseLockInfoBytes(onDiskBytes);
 	if (!current || onDiskBytes === null) return "missing";
@@ -450,19 +512,18 @@ export async function removeFileLockDirForGc(
 		return "owner_changed";
 	}
 	// The token comparison above authorizes the content that was judged, not the
-	// pathname. Bind the deletion to that exact tree: capture the directory after
-	// the verdict and remove only while the native identity check still matches,
-	// so a live successor installed in the final window is never removed by a
-	// comparison that predates it (#652 — a live owner is never displaced). The
-	// digest is taken over the exact bytes that were judged, so any rewrite —
-	// including a key-order-different re-serialization of the same fields —
-	// counts as a changed owner.
+	// pathname. When the caller carried pre-verdict root/info identity, require
+	// the post-verdict native snapshot to match that same object before removal;
+	// a clone or successor can therefore never inherit the stale authorization.
+	// Direct callers without prior verdict evidence retain the original digest
+	// guard, so any rewrite — including key-order-different re-serialization of
+	// the same fields — still counts as a changed owner.
 	// The canonical native path may refuse a symlinked parent ("reparse_point");
 	// canonicalize first so the identity-bound capture sees the real directory,
 	// mirroring how localLockKey canonicalizes the lock pathname.
 	let nativeCapturePath = lockDir;
 	try {
-		nativeCapturePath = await fs.realpath(lockDir);
+		nativeCapturePath = await canonicalLockPathPreservingFinal(lockDir);
 	} catch (error) {
 		if (!isEnoent(error) && !isTransientReleaseError(error)) return "cleanup_failed";
 	}
@@ -472,6 +533,20 @@ export async function removeFileLockDirForGc(
 	if (!infoEntry?.sha256) return "owner_changed";
 	const judgedDigest = crypto.createHash("sha256").update(onDiskBytes).digest("hex");
 	if (infoEntry.sha256 !== judgedDigest) return "owner_changed";
+	if (
+		expectedIdentity &&
+		(!captured.snapshot.rootDev ||
+			captured.snapshot.rootDev !== expectedIdentity.rootDev ||
+			captured.snapshot.rootIno !== expectedIdentity.rootIno ||
+			infoEntry.dev !== expectedIdentity.infoDev ||
+			infoEntry.ino !== expectedIdentity.infoIno ||
+			infoEntry.nlink !== expectedIdentity.infoNlink ||
+			infoEntry.size !== expectedIdentity.infoSize ||
+			infoEntry.mtimeNs !== expectedIdentity.infoMtimeNs ||
+			infoEntry.ctimeNs !== expectedIdentity.infoCtimeNs ||
+			infoEntry.sha256 !== expectedIdentity.infoSha256)
+	)
+		return "owner_changed";
 	let removed: NativeExactUnlinkResult;
 	try {
 		removed = nativeFileLockBindings().exactRemoveDirectoryTree(nativeCapturePath, captured.snapshot);
@@ -555,6 +630,15 @@ async function staleLockSnapshot(
 	previousOwnerHostIds: readonly string[] = [],
 	startTimeCache?: Map<string, string | null>,
 ): Promise<LockStaleSnapshot> {
+	// Capture the root and info inode BEFORE asking whether the owner is stale. A later
+	// snapshot alone would let a copied successor inherit the stale verdict's authority.
+	let judgedIdentity: GenericFileLockDirIdentity | null = null;
+	try {
+		judgedIdentity = await captureFileLockDirIdentity(lockPath);
+	} catch (error) {
+		if (isTransientReleaseError(error)) return { stale: false };
+		throw error;
+	}
 	let info: LockInfo | null;
 	try {
 		info = await readLockInfo(lockPath);
@@ -597,14 +681,36 @@ async function staleLockSnapshot(
 	)
 		return { stale: false };
 	if (ownerHostId === undefined && info.owner_host_id !== undefined) return { stale: false };
-	if (ownerIncarnationChanged(info, startTimeCache)) return { stale: true, owner: info };
+	if (ownerIncarnationChanged(info, startTimeCache)) {
+		if (!judgedIdentity) return { stale: false };
+		let currentIdentity: GenericFileLockDirIdentity | null;
+		try {
+			currentIdentity = await captureFileLockDirIdentity(lockPath);
+		} catch (error) {
+			if (isTransientReleaseError(error)) return { stale: false };
+			throw error;
+		}
+		if (!currentIdentity || !sameGenericFileLockDirIdentity(judgedIdentity, currentIdentity)) return { stale: false };
+		fileLockDirIdentities.set(info, judgedIdentity);
+		return { stale: true, owner: info, identity: judgedIdentity };
+	}
 	// Never reap a live owner by elapsed time: a long legitimate critical section must
 	// not have its lock stolen (#652). Reclaim only when the OS proves the owner is dead;
 	// indeterminate liveness remains protected regardless of elapsed time.
 	if (ownerIsAlive(info, startTimeCache)) return { stale: false };
 	const liveness = ownerLiveness(info.pid);
 	if (liveness === "dead") {
-		return { stale: true, owner: info };
+		if (!judgedIdentity) return { stale: false };
+		let currentIdentity: GenericFileLockDirIdentity | null;
+		try {
+			currentIdentity = await captureFileLockDirIdentity(lockPath);
+		} catch (error) {
+			if (isTransientReleaseError(error)) return { stale: false };
+			throw error;
+		}
+		if (!currentIdentity || !sameGenericFileLockDirIdentity(judgedIdentity, currentIdentity)) return { stale: false };
+		fileLockDirIdentities.set(info, judgedIdentity);
+		return { stale: true, owner: info, identity: judgedIdentity };
 	}
 	return { stale: false };
 }
@@ -612,7 +718,7 @@ async function staleLockSnapshot(
 async function removeStaleLockForAcquire(lockPath: string, snapshot: LockStaleSnapshot): Promise<boolean> {
 	if (!snapshot.stale) return false;
 	if (snapshot.owner) {
-		return (await removeFileLockDirForGc(lockPath, snapshot.owner)) === "removed";
+		return (await removeFileLockDirForGc(lockPath, snapshot.owner, snapshot.identity)) === "removed";
 	}
 
 	let currentInfo: LockInfo | null;
@@ -624,16 +730,18 @@ async function removeStaleLockForAcquire(lockPath: string, snapshot: LockStaleSn
 	}
 	if (currentInfo) return false;
 	try {
-		const currentStats = await fs.stat(lockPath);
+		const currentStats = await fs.lstat(lockPath);
+		if (currentStats.isSymbolicLink() || !currentStats.isDirectory()) return false;
 		if (!sameStatToken(statToken(currentStats), snapshot.stat)) return false;
-		const captured = nativeFileLockBindings().snapshotDirectoryTree(lockPath);
+		const nativeCapturePath = await canonicalLockPathPreservingFinal(lockPath);
+		const captured = nativeFileLockBindings().snapshotDirectoryTree(nativeCapturePath);
 		if (!captured.ok || !captured.snapshot) return false;
 		if (
 			captured.snapshot.rootDev !== String(currentStats.dev) ||
 			captured.snapshot.rootIno !== String(currentStats.ino)
 		)
 			return false;
-		const removed = nativeFileLockBindings().exactRemoveDirectoryTree(lockPath, captured.snapshot);
+		const removed = nativeFileLockBindings().exactRemoveDirectoryTree(nativeCapturePath, captured.snapshot);
 		return removed.ok || removed.code === "not_found";
 	} catch (err) {
 		if (isEnoent(err)) return false;
@@ -678,49 +786,11 @@ export async function genericFileLockDirStaleVerdict(
 	staleMs: number,
 	ownerHostId?: string,
 ): Promise<GenericFileLockDirStaleVerdict> {
-	let before: LockInfoPathState | null;
-	try {
-		before = await lockInfoPathState(lockDir);
-	} catch (error) {
-		if (isTransientReleaseError(error)) return { stale: false };
-		throw error;
-	}
 	const verdict = await staleLockSnapshot(lockDir, staleMs, ownerHostId);
-	if (!verdict.stale || verdict.owner === null || before === null) return { stale: false };
-	let bytes: string | null;
-	let after: LockInfoPathState | null;
-	try {
-		bytes = await readLockInfoBytes(lockDir);
-		after = await lockInfoPathState(lockDir);
-	} catch (error) {
-		if (isTransientReleaseError(error)) return { stale: false };
-		throw error;
-	}
-	if (!bytes || !after || !sameLockInfoPathState(before, after)) return { stale: false };
-	const current = parseLockInfoBytes(bytes);
-	if (
-		!current ||
-		current.pid !== verdict.owner.pid ||
-		current.start_time !== verdict.owner.start_time ||
-		current.start_time_format !== verdict.owner.start_time_format ||
-		current.owner_host_id !== verdict.owner.owner_host_id ||
-		current.owner_token !== verdict.owner.owner_token ||
-		current.timestamp !== verdict.owner.timestamp
-	)
-		return { stale: false };
+	if (!verdict.stale || verdict.owner === null) return { stale: false };
 	return {
 		stale: true,
-		identity: {
-			rootDev: String(after.root.dev),
-			rootIno: String(after.root.ino),
-			infoDev: String(after.file.dev),
-			infoIno: String(after.file.ino),
-			infoNlink: String(after.file.nlink),
-			infoSize: String(after.file.size),
-			infoMtimeNs: String(after.file.mtimeNs),
-			infoCtimeNs: String(after.file.ctimeNs),
-			infoSha256: crypto.createHash("sha256").update(bytes).digest("hex"),
-		},
+		identity: verdict.identity,
 	};
 }
 
@@ -746,18 +816,10 @@ async function tryAcquireLock(
 		// already-created staging entry and its parent before publication so aliases
 		// retain the same lock identity as the ordinary path.
 		const canonicalParent = await fs.realpath(path.dirname(lockPath));
-		let published = renameNoReplacePath(
+		const published = await renameNoReplacePathAsync(
 			await fs.realpath(pendingPath),
 			path.join(canonicalParent, path.basename(lockPath)),
 		);
-		if (isRenameNoReplaceUnsupported(published)) {
-			const fallbackPublished = await publishDirectoryNoReplaceFallback(
-				await fs.realpath(pendingPath),
-				path.join(canonicalParent, path.basename(lockPath)),
-			);
-			if (!fallbackPublished) return null;
-			published = { ...published, ok: true };
-		}
 		if (!published.ok) {
 			if (published.reason === "destination_exists") return null;
 			const failure = new Error(
@@ -778,48 +840,6 @@ async function tryAcquireLock(
 function isTransientReleaseError(error: unknown): boolean {
 	const code = (error as NodeJS.ErrnoException).code;
 	return code === "EBUSY" || code === "EPERM" || code === "EACCES" || code === "ENOTEMPTY";
-}
-
-function isRenameNoReplaceUnsupported(result: NativeNoReplaceResult): boolean {
-	return (
-		!result.ok &&
-		result.mutationState === "not_committed" &&
-		result.durabilityState === "not_attempted" &&
-		(result.reason === "invalid_request" || result.reason === "atomic_unavailable")
-	);
-}
-
-/**
- * Directory equivalent of the native no-replace fallback: claim the destination name
- * with mkdir, then rename the staged tree over that empty directory. An existing empty
- * directory is still a collision, never a destination to replace; the placeholder is
- * removed only when the following rename demonstrably did not consume the source.
- */
-async function publishDirectoryNoReplaceFallback(sourcePath: string, destinationPath: string): Promise<boolean> {
-	try {
-		await fs.mkdir(destinationPath, { mode: 0o700 });
-		await fs.chmod(destinationPath, 0o700);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
-		throw error;
-	}
-	try {
-		await fs.rename(sourcePath, destinationPath);
-		return true;
-	} catch (error) {
-		// A failed plain rename normally leaves both names untouched. Do not remove a
-		// destination when the source disappeared: that outcome is ambiguous and the
-		// namespace must remain fail-closed for the next contender.
-		let sourceStillPresent = false;
-		try {
-			await fs.lstat(sourcePath);
-			sourceStillPresent = true;
-		} catch {
-			// Preserve the claimed destination on an ambiguous failure.
-		}
-		if (sourceStillPresent) await fs.rmdir(destinationPath).catch(() => undefined);
-		throw error;
-	}
 }
 
 type NativeFileLockBindings = {
@@ -843,10 +863,21 @@ function nativeFileLockBindings(): NativeFileLockBindings {
 	}
 }
 
-async function quarantineReleasedLock(lockPath: string, owner: FileLockOwnerToken): Promise<boolean> {
+async function quarantineReleasedLock(
+	lockPath: string,
+	owner: FileLockOwnerToken,
+	preVerdictIdentity?: GenericFileLockDirIdentity,
+): Promise<boolean> {
+	const expectedIdentity = preVerdictIdentity ?? fileLockDirIdentities.get(owner);
+	// Quarantine is only a release fallback after earlier transient failures. It must not
+	// make a fresh post-failure snapshot authoritative for an object this release never
+	// judged; without pre-verdict evidence, refuse and let the caller surface the retry
+	// failure instead of risking a successor lock.
+	if (!expectedIdentity) return false;
 	let captured: NativeDirectoryTreeResult;
+	const nativeCapturePath = await canonicalLockPathPreservingFinal(lockPath);
 	try {
-		captured = nativeFileLockBindings().snapshotDirectoryTree(lockPath);
+		captured = nativeFileLockBindings().snapshotDirectoryTree(nativeCapturePath);
 	} catch (error) {
 		if (isTransientReleaseError(error)) return false;
 		throw error;
@@ -854,6 +885,18 @@ async function quarantineReleasedLock(lockPath: string, owner: FileLockOwnerToke
 	if (!captured.ok || !captured.snapshot) return false;
 	const infoEntry = captured.snapshot.entries.find(entry => entry.relativePath === "info");
 	if (!infoEntry?.sha256) return false;
+	if (
+		captured.snapshot.rootDev !== expectedIdentity.rootDev ||
+		captured.snapshot.rootIno !== expectedIdentity.rootIno ||
+		infoEntry.dev !== expectedIdentity.infoDev ||
+		infoEntry.ino !== expectedIdentity.infoIno ||
+		infoEntry.nlink !== expectedIdentity.infoNlink ||
+		infoEntry.size !== expectedIdentity.infoSize ||
+		infoEntry.mtimeNs !== expectedIdentity.infoMtimeNs ||
+		infoEntry.ctimeNs !== expectedIdentity.infoCtimeNs ||
+		infoEntry.sha256 !== expectedIdentity.infoSha256
+	)
+		return false;
 	// Bind the owner generation to the snapshot before exact removal. A successor
 	// installed after this snapshot is rejected by the native identity check instead of
 	// being moved into quarantine by a pathname-only rename.
@@ -861,7 +904,7 @@ async function quarantineReleasedLock(lockPath: string, owner: FileLockOwnerToke
 	if (infoEntry.sha256 !== expectedDigest) return false;
 	let removed: NativeExactUnlinkResult;
 	try {
-		removed = nativeFileLockBindings().exactRemoveDirectoryTree(lockPath, captured.snapshot);
+		removed = nativeFileLockBindings().exactRemoveDirectoryTree(nativeCapturePath, captured.snapshot);
 	} catch (error) {
 		if (isTransientReleaseError(error)) return false;
 		throw error;
@@ -875,7 +918,7 @@ async function quarantineReleasedLock(lockPath: string, owner: FileLockOwnerToke
 		removed.retainedUnknownPath === undefined
 	) {
 		try {
-			await fs.lstat(lockPath);
+			await fs.lstat(nativeCapturePath);
 			return false;
 		} catch (error) {
 			if (isEnoent(error)) {
@@ -889,10 +932,17 @@ async function quarantineReleasedLock(lockPath: string, owner: FileLockOwnerToke
 }
 
 async function releaseOwnedLock(lockPath: string, owner: FileLockOwnerToken): Promise<void> {
+	let preVerdictIdentity: GenericFileLockDirIdentity | undefined;
+	try {
+		preVerdictIdentity = (await captureFileLockDirIdentity(lockPath)) ?? undefined;
+		if (preVerdictIdentity) fileLockDirIdentities.set(owner, preVerdictIdentity);
+	} catch (error) {
+		if (!isTransientReleaseError(error)) throw error;
+	}
 	let lastTransientError: unknown;
 	for (let attempt = 0; attempt < FILE_LOCK_RELEASE_RETRY_ATTEMPTS; attempt++) {
 		try {
-			const outcome = await removeFileLockDirForGc(lockPath, owner);
+			const outcome = await removeFileLockDirForGc(lockPath, owner, preVerdictIdentity);
 			if (outcome === "removed" || outcome === "missing") {
 				if (outcome === "missing") throw new Error("Failed to release file lock: missing.");
 				return;
@@ -904,7 +954,7 @@ async function releaseOwnedLock(lockPath: string, owner: FileLockOwnerToken): Pr
 			if (attempt + 1 < FILE_LOCK_RELEASE_RETRY_ATTEMPTS) await Bun.sleep(FILE_LOCK_RELEASE_RETRY_DELAY_MS);
 		}
 	}
-	if (await quarantineReleasedLock(lockPath, owner)) return;
+	if (await quarantineReleasedLock(lockPath, owner, preVerdictIdentity)) return;
 	throw lastTransientError ?? new Error("Failed to release file lock: transient removal failure.");
 }
 

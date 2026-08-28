@@ -55,6 +55,8 @@ afterEach(async () => {
 	SessionStateLockTestHooks.unqualifiedOwnerIsLocal = undefined;
 	SessionStateLockTestHooks.beforeCurrentOwnerRelease = undefined;
 	SessionStateLockTestHooks.afterCurrentOwnerValidation = undefined;
+	SessionStateLockTestHooks.beforeOwnerRecordRewrite = undefined;
+	SessionStateLockTestHooks.beforeTransitionReleaseLstat = undefined;
 	installExactIdentityNatives();
 	setSystemTime();
 	if (ORIGINAL_STATE_FILE === undefined) delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
@@ -1514,6 +1516,76 @@ describe("coordinator session state lock", () => {
 			}),
 		).resolves.toBe("saved-result");
 
+		expect(callbackCount).toBe(1);
+		expect(fsSync.existsSync(transitionDir)).toBe(false);
+	});
+
+	it("recovers a release when the final claim lstat faults after the tombstone rewrite", async () => {
+		const { stateFile } = await seededRunningSession("lock-transition-release-lstat-fault");
+		const transitionDir = `${stateFile}.lock.transition`;
+		SessionStateLockTestHooks.beforeTransitionReleaseLstat = async target => {
+			if (target === transitionDir) {
+				SessionStateLockTestHooks.beforeTransitionReleaseLstat = undefined;
+				throw Object.assign(new Error("claim lstat fault"), { code: "EIO" });
+			}
+		};
+
+		let callbackCount = 0;
+		await expect(
+			withSessionStateFileLock(stateFile, async () => {
+				callbackCount++;
+				return "saved-result";
+			}),
+		).resolves.toBe("saved-result");
+
+		expect(callbackCount).toBe(1);
+		expect(fsSync.existsSync(transitionDir)).toBe(false);
+	});
+
+	it("retains the generation record when release-owner capture faults before rewrite", async () => {
+		const { stateFile } = await seededRunningSession("lock-transition-release-capture-fault");
+		const transitionDir = `${stateFile}.lock.transition`;
+		let faulted = false;
+		SessionStateLockTestHooks.afterCurrentOwnerValidation = async file => {
+			if (!faulted && file === `${transitionDir}.owner`) {
+				faulted = true;
+				throw new Error("owner capture fault");
+			}
+		};
+
+		let callbackCount = 0;
+		await expect(
+			withSessionStateFileLock(stateFile, async () => {
+				callbackCount++;
+				return "saved-result";
+			}),
+		).resolves.toBe("saved-result");
+
+		expect(faulted).toBe(true);
+		expect(callbackCount).toBe(1);
+		expect(fsSync.existsSync(transitionDir)).toBe(false);
+	});
+
+	it("retries a pre-commit release rewrite without dropping its claim", async () => {
+		const { stateFile } = await seededRunningSession("lock-transition-release-rewrite-fault");
+		const transitionDir = `${stateFile}.lock.transition`;
+		let faulted = false;
+		SessionStateLockTestHooks.beforeOwnerRecordRewrite = async file => {
+			if (!faulted && file === `${transitionDir}.owner`) {
+				faulted = true;
+				throw new Error("pre-commit rewrite fault");
+			}
+		};
+
+		let callbackCount = 0;
+		await expect(
+			withSessionStateFileLock(stateFile, async () => {
+				callbackCount++;
+				return "saved-result";
+			}),
+		).resolves.toBe("saved-result");
+
+		expect(faulted).toBe(true);
 		expect(callbackCount).toBe(1);
 		expect(fsSync.existsSync(transitionDir)).toBe(false);
 	});
