@@ -2734,7 +2734,11 @@ export class AsyncJobManager {
 		const remainingDeliveryMs = Math.max(0, disposalDeadline - Date.now());
 		const drained = await this.drainDeliveries({ timeoutMs: remainingDeliveryMs });
 		if (!drained) this.#projectUndeliveredDisposalFailures();
-		this.#lastDisposeDiagnostics = { stuckJobIds: waitResult.stuckJobIds, deliveriesDrained: drained };
+		const disposalCompleted = waitResult.completed && drained;
+		this.#lastDisposeDiagnostics = {
+			stuckJobIds: waitResult.stuckJobIds,
+			deliveriesDrained: disposalCompleted,
+		};
 		if (waitResult.stuckJobIds.length > 0) {
 			logger.warn("Async job manager dispose timed out waiting for jobs", { stuckJobIds: waitResult.stuckJobIds });
 		}
@@ -2768,7 +2772,7 @@ export class AsyncJobManager {
 		this.#ownerSubagentShutdownLeases.clear();
 		this.#notifyChange();
 		this.#changeListeners.clear();
-		return drained && waitResult.completed;
+		return disposalCompleted;
 	}
 
 	#projectUndeliveredDisposalFailures(): void {
