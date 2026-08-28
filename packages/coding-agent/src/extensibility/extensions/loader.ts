@@ -345,7 +345,6 @@ class ConcreteExtensionAPI implements ExtensionAPI {
 			onQueuedPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
 			onDispatchDisposition?: (promotion: { startsOwnRun: boolean }) => void;
 			preflightSignal?: AbortSignal;
-			sdkRunToken?: string;
 		},
 	): Promise<void> {
 		return Promise.resolve(this.runtime.sendUserMessage(content, options));

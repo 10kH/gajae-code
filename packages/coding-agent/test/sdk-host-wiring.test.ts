@@ -1775,7 +1775,7 @@ test("SDK host correlates follow-up acknowledgements with the later agent start"
 	if (typeof commandId !== "string" || typeof turnId !== "string") throw new Error("missing follow-up correlation");
 	const sentOptions = sent[0]?.[1];
 	const sdkRunToken = sentOptions && "sdkRunToken" in sentOptions ? sentOptions.sdkRunToken : undefined;
-	expect(sent).toEqual([
+	expect(sent as unknown).toEqual([
 		[
 			"queued follow-up",
 			{ deliverAs: "followUp", preflightSignal: expect.any(AbortSignal), sdkRunToken: expect.any(String) },

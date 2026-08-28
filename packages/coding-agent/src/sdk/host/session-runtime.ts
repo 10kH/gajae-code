@@ -1528,6 +1528,10 @@ function createQuerySurface(
 export function createSdkSurfaceFactory(
 	options: SdkSurfaceFactoryOptions & { reconciliation?: InvocationReconciliation },
 ): SdkSurfaceFactory {
+	const sendSdkUserMessage = options.api.sendUserMessage as (
+		content: Parameters<ExtensionAPI["sendUserMessage"]>[0],
+		options?: Record<string, unknown>,
+	) => Promise<void>;
 	const policy =
 		options.policy ??
 		createSdkSurfacePolicyForContext(options.ctx, hasSdkWorkflowGateCapability(options.ctx.workflowGate));
@@ -1853,6 +1857,10 @@ function createControlSurface(
 	canResolveGate: () => boolean = () => true,
 	trackGateResolution: <T>(resolution: Promise<T>) => Promise<T> = async resolution => await resolution,
 ): ControlSurface {
+	const sendSdkUserMessage = api.sendUserMessage as (
+		content: Parameters<ExtensionAPI["sendUserMessage"]>[0],
+		options?: Record<string, unknown>,
+	) => Promise<void>;
 	const surfacePolicy =
 		policy ?? createSdkSurfacePolicyForContext(ctx, hasSdkWorkflowGateCapability(ctx.workflowGate));
 	const typed = (operation: string, input: Record<string, unknown> = {}) =>
@@ -3098,7 +3106,7 @@ function createControlSurface(
 	return {
 		prompt: async (text, images, clientRef) =>
 			submit("prompt", clientRef, ({ queuedAtDispatch, sdkRunToken, ...options }) =>
-				api.sendUserMessage(
+				sendSdkUserMessage(
 					typeof images === "undefined" ? text : ([{ type: "text", text }, ...(images as never[])] as never),
 					{
 						...options,
@@ -3114,14 +3122,14 @@ function createControlSurface(
 			const retainedClientRef = normalizeClientRef(clientRef);
 			if (retainedClientRef === undefined) {
 				const correlation = newCorrelation();
-				await api.sendUserMessage(text, { deliverAs: "steer" });
+				await sendSdkUserMessage(text, { deliverAs: "steer" });
 				return { accepted: true, ...correlation };
 			}
 			const durable = steerReconciliation;
 			const reservation = await durable.reserveSteer(retainedClientRef, text);
 			if (reservation.replay) return { accepted: reservation.result.status === "accepted", ...reservation.result };
 			try {
-				await api.sendUserMessage(text, { deliverAs: "steer" });
+				await sendSdkUserMessage(text, { deliverAs: "steer" });
 				return { accepted: true, ...(await durable.settleSteer(retainedClientRef, "accepted")) };
 			} catch (error) {
 				return { accepted: false, ...(await durable.settleSteer(retainedClientRef, "rejected", error)) };
@@ -3131,7 +3139,7 @@ function createControlSurface(
 			submit(
 				"prompt",
 				undefined,
-				options => api.sendUserMessage(text, { ...options, deliverAs: "followUp" }),
+				options => sendSdkUserMessage(text, { ...options, deliverAs: "followUp" }),
 				undefined,
 				false,
 				// Follow-ups never start inline; ownership correlates at promotion.
@@ -3144,7 +3152,7 @@ function createControlSurface(
 		abortTerminal: terminalAbort,
 		abortAndPrompt: async text => {
 			await ctx.abort();
-			return await submit("prompt", undefined, options => api.sendUserMessage(text, { ...options }));
+			return await submit("prompt", undefined, options => sendSdkUserMessage(text, { ...options }));
 		},
 		answerAsk: unavailable("ask.answer"),
 		answerGate: async (id, response, expectedSessionId, idempotencyKey) =>
