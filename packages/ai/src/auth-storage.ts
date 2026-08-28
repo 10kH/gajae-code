@@ -1627,7 +1627,11 @@ export class AuthStorage {
 		}
 	}
 
-	/** Set the selector derived from a durable session pin or a session seed. */
+	/**
+	 * Set the selector derived from a durable session pin or a session seed.
+	 * `owner` scopes config-override validation to one ModelRegistry; omitted
+	 * owners retain process-wide caller semantics.
+	 */
 	setSessionCredentialSelector(
 		scopeId: string,
 		provider: string,
@@ -1712,7 +1716,11 @@ export class AuthStorage {
 		return this.getProviderEvidenceGeneration(storageProvider, key, owner);
 	}
 
-	/** Validate and canonicalize an OAuth-only selector for account pinning. */
+	/**
+	 * Validate and canonicalize an OAuth-only selector for account pinning.
+	 * `owner` scopes config-override checks to one ModelRegistry; omitted owners
+	 * retain process-wide caller semantics.
+	 */
 	resolveOAuthPinTarget(provider: string, selector: AuthCredentialSelector, owner?: object): OAuthPinTarget {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		if (
@@ -1976,7 +1984,8 @@ export class AuthStorage {
 	 * runtime API-key override (`--api-key`), or a config-sourced API key
 	 * (`models.yml` `apiKey`) would each re-decide the credential on the very
 	 * next {@link AuthStorage.getApiKey} call and make this switch appear to
-	 * silently do nothing.
+	 * silently do nothing. `owner` scopes the config-override check to one
+	 * ModelRegistry; omitted owners retain process-wide caller semantics.
 	 *
 	 * Deliberately does not touch credential-blocked state: if the target row
 	 * is still backoff-blocked from a prior quota failure, the existing

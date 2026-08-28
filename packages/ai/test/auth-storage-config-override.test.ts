@@ -243,6 +243,12 @@ describe("AuthStorage config-override apiKey", () => {
 			expect(() => authStorage.setSessionCredentialSelector("global", "anthropic", selector)).toThrow(
 				"config API key override",
 			);
+
+			// A registry's own override still takes precedence over its selector.
+			authStorage.setConfigApiKey("anthropic", "first-owner-key", { owner: firstOwner });
+			expect(() => authStorage.setSessionCredentialSelector("owner-a", "anthropic", selector, firstOwner)).toThrow(
+				"config API key override",
+			);
 		});
 	});
 });
