@@ -225,9 +225,14 @@ export function splitInternalUrlSel(
 	}
 
 	if (!INTERNAL_SCHEMES_WITH_UNAMBIGUOUS_AUTHORITIES[scheme]) {
+		// A path/query/fragment after a path-like authority makes a colon-bearing
+		// resource identity indistinguishable from an authority selector. Preserve
+		// the complete URL; path-like selectors are accepted only on authority-only
+		// URLs, where the existing strict grammar is the sole interpretation.
+		if (authoritySuffix !== "") return { path: rawPath };
 		const strict = splitPathAndSel(authority);
 		if (strict.sel !== undefined) {
-			return { path: `${rawPath.slice(0, schemeEnd)}${strict.path}${authoritySuffix}`, sel: strict.sel };
+			return { path: `${rawPath.slice(0, schemeEnd)}${strict.path}`, sel: strict.sel };
 		}
 		return { path: rawPath };
 	}
