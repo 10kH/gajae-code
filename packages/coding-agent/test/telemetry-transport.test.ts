@@ -18,9 +18,9 @@ const event = {
 const disabledSettings = { get: (_path: "telemetry.enabled") => false };
 const enabledSettings = { get: (_path: "telemetry.enabled") => true };
 
-afterEach(() => {
+afterEach(async () => {
 	delete process.env[TELEMETRY_KILL_SWITCH_ENV];
-	resetTelemetryTransportForTest();
+	await resetTelemetryTransportForTest();
 });
 
 describe("telemetry controls", () => {
@@ -62,5 +62,27 @@ describe("bounded nonblocking telemetry transport", () => {
 		expect(calls).toBe(TELEMETRY_MAX_IN_FLIGHT);
 		for (const reject of pending) reject();
 		await new Promise(resolve => setTimeout(resolve, 0));
+	});
+
+	it("does not reset the concurrency cap while requests are still settling", async () => {
+		const release: Array<() => void> = [];
+		let calls = 0;
+		const fetchImpl = () => {
+			calls++;
+			return new Promise<Response>(resolve => release.push(() => resolve(new Response(null, { status: 204 }))));
+		};
+		for (let index = 0; index < TELEMETRY_MAX_IN_FLIGHT; index++)
+			sendTelemetryEvent(enabledSettings, event, { fetchImpl });
+
+		let resetFinished = false;
+		const reset = resetTelemetryTransportForTest().then(() => {
+			resetFinished = true;
+		});
+		await Bun.sleep(0);
+		expect(resetFinished).toBe(false);
+		sendTelemetryEvent(enabledSettings, event, { fetchImpl });
+		expect(calls).toBe(TELEMETRY_MAX_IN_FLIGHT);
+		for (const resolve of release) resolve();
+		await reset;
 	});
 });

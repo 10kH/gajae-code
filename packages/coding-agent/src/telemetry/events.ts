@@ -136,6 +136,7 @@ export async function getTelemetryInstallId(
 		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 		const existing = (await Bun.file(filePath).text()).trim();
 		if (!UUID_V4.test(existing)) throw new Error("telemetry install ID is malformed");
+		await fs.chmod(filePath, 0o600);
 		return existing;
 	}
 }

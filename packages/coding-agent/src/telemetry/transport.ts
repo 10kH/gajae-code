@@ -56,9 +56,8 @@ export function sendTelemetryEvent(
 	return delivery;
 }
 
-export function resetTelemetryTransportForTest(): void {
-	inFlight = 0;
-	pendingTelemetry.clear();
+export async function resetTelemetryTransportForTest(): Promise<void> {
+	await Promise.allSettled([...pendingTelemetry]);
 }
 
 /** Schedule an event without making telemetry part of the caller's lifecycle. */
