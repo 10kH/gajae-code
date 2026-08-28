@@ -8,7 +8,9 @@ import {
 	__agentSessionPerfCounters,
 	AgentSession,
 	type AgentSessionEvent,
+	WorkerIntegrationRequestScheduler,
 } from "@gajae-code/coding-agent/session/agent-session";
+import { createSdkRunCapability } from "@gajae-code/coding-agent/session/sdk-run-capability";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
@@ -38,6 +40,13 @@ describe("AgentSession message pipeline", () => {
 		for (const session of sessions.splice(0)) {
 			await session.dispose();
 		}
+	});
+	it("reports a bounded worker integration failure outcome", async () => {
+		const scheduler = new WorkerIntegrationRequestScheduler(async () => {
+			throw new Error("worker integration failed");
+		}, 50);
+		scheduler.enqueue();
+		expect(await scheduler.flush()).toEqual({ status: "failed", error: "Error: worker integration failed" });
 	});
 
 	it("applies transformContext before convertToLlm", async () => {
@@ -1041,7 +1050,7 @@ describe("AgentSession message pipeline", () => {
 		neverSettle = true;
 		integrationAborted = false;
 		const sdkSubmission = session.sendUserMessage("sdk terminal fast path", {
-			sdkRunToken: "sdk-terminal-fast-path",
+			sdkRunCapability: createSdkRunCapability("sdk-terminal-fast-path"),
 		} as never);
 		const secondAgentEnd = Promise.withResolvers<void>();
 		const unsubscribe = session.subscribe(event => {

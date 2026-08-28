@@ -10,6 +10,7 @@ import { modeStatePath } from "@gajae-code/coding-agent/gjc-runtime/session-layo
 import { readVisibleSkillActiveState } from "@gajae-code/coding-agent/hooks/skill-state";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
+import { createSdkRunCapability } from "@gajae-code/coding-agent/session/sdk-run-capability";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 
 let session: AgentSession | undefined;
@@ -127,7 +128,9 @@ test.serial("keeps SDK ownership when an internal skill invocation becomes a cus
 		],
 	});
 	const promptCustomMessage = vi.spyOn(session, "promptCustomMessage").mockResolvedValue(undefined);
-	await session.invokeSkill("fixture-skill", "owned", { sdkRunToken: "skill-owner-token" } as never);
+	await session.invokeSkill("fixture-skill", "owned", {
+		sdkRunCapability: createSdkRunCapability("skill-owner-token"),
+	});
 	expect(promptCustomMessage).toHaveBeenCalledWith(
 		expect.objectContaining({ customType: expect.any(String) }),
 		expect.objectContaining({ sdkRunToken: "skill-owner-token" }),
@@ -315,7 +318,7 @@ test.serial("cancels only its accepted idle follow-up before it can execute", as
 	await session.sendUserMessage("owned follow-up", {
 		deliverAs: "followUp",
 		preflightSignal: controller.signal,
-		sdkRunToken: "sdk-owned-follow-up",
+		sdkRunCapability: createSdkRunCapability("sdk-owned-follow-up"),
 		onPreflightAcceptCommit: () => {},
 	} as never);
 	controller.abort();
@@ -352,7 +355,7 @@ test.serial("defers an SDK follow-up behind pre-existing queued work so its run 
 	await session.sendUserMessage("owned follow-up", {
 		deliverAs: "followUp",
 		preflightSignal: controller.signal,
-		sdkRunToken: "sdk-owned-follow-up-deferred",
+		sdkRunCapability: createSdkRunCapability("sdk-owned-follow-up-deferred"),
 		onPreflightAcceptCommit: () => {},
 	} as never);
 
@@ -391,7 +394,7 @@ test.serial("releases a deferred SDK follow-up only after queued work drains", a
 	await session.sendUserMessage("owned follow-up", {
 		deliverAs: "followUp",
 		preflightSignal: new AbortController().signal,
-		sdkRunToken: "sdk-owned-follow-up-release",
+		sdkRunCapability: createSdkRunCapability("sdk-owned-follow-up-release"),
 		onPreflightAcceptCommit: () => {},
 	} as never);
 	expect(agent.snapshotFollowUp()).toHaveLength(1);
@@ -437,13 +440,13 @@ test.serial("releases the next deferred SDK follow-up when a released one is can
 	await session.sendUserMessage("owned m1", {
 		deliverAs: "followUp",
 		preflightSignal: firstController.signal,
-		sdkRunToken: "token-m1",
+		sdkRunCapability: createSdkRunCapability("token-m1"),
 		onPreflightAcceptCommit: () => {},
 	} as never);
 	await session.sendUserMessage("owned m2", {
 		deliverAs: "followUp",
 		preflightSignal: secondController.signal,
-		sdkRunToken: "token-m2",
+		sdkRunCapability: createSdkRunCapability("token-m2"),
 		onPreflightAcceptCommit: () => {},
 	} as never);
 	// Both SDK follow-ups are deferred behind the pre-existing queued work.

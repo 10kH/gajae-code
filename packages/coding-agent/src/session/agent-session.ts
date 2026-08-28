@@ -317,6 +317,7 @@ import {
 	type CoordinatorToolObservation,
 	ownerTerminalContextFromEnvironment,
 	persistCoordinatorRuntimeStateFromEvent,
+	persistCoordinatorWorkerIntegrationOutcome,
 	registerCoordinatorRuntimeStateFinalizer,
 	UNPROVEN_TOOL_LABEL,
 } from "../gjc-runtime/session-state-sidecar";
@@ -461,6 +462,7 @@ import {
 	SKILL_PROMPT_MESSAGE_TYPE,
 } from "./messages";
 import { isLegacyProviderSafetyStopMessage } from "./provider-safety-stop";
+import { readSdkRunCapability } from "./sdk-run-capability";
 import { formatSessionDumpText } from "./session-dump-format";
 import type {
 	BranchSummaryEntry,
@@ -1077,6 +1079,8 @@ export interface PromptOptions {
 	onSkillPrepared?: (meta: { name: string; path: string; lineCount?: number; cleanedArgs?: string }) => void;
 	/** Optional invocation-scoped cancellation fence used before an accepted skill starts execution. */
 	preflightSignal?: AbortSignal;
+	/** Internal host capability; ordinary package callers cannot construct the branded value. */
+	sdkRunCapability?: unknown;
 }
 
 type InternalPromptOptions = PromptOptions & { sdkRunToken?: string };
@@ -1982,8 +1986,13 @@ export type BeforeAgentStartContributor = (event: {
 
 const AGENT_END_WORKER_INTEGRATION_TIMEOUT_MS = 5_000;
 
+export type WorkerIntegrationOutcome =
+	| { status: "completed" }
+	| { status: "failed"; error: string }
+	| { status: "timed_out" };
+
 export class WorkerIntegrationRequestScheduler {
-	#inFlight: Promise<void> | undefined = undefined;
+	#inFlight: Promise<WorkerIntegrationOutcome> | undefined = undefined;
 	#pending = false;
 
 	constructor(
@@ -1999,10 +2008,12 @@ export class WorkerIntegrationRequestScheduler {
 		this.#start();
 	}
 
-	async flush(): Promise<void> {
+	async flush(): Promise<WorkerIntegrationOutcome> {
+		let outcome: WorkerIntegrationOutcome = { status: "completed" };
 		while (this.#inFlight) {
-			await this.#inFlight;
+			outcome = await this.#inFlight;
 		}
+		return outcome;
 	}
 
 	#start(): void {
@@ -2012,16 +2023,22 @@ export class WorkerIntegrationRequestScheduler {
 		try {
 			request = this.request(controller.signal);
 		} catch {
-			request = Promise.resolve();
+			request = Promise.reject(new Error("Worker integration request failed before dispatch."));
 		}
 		let timeout: ReturnType<typeof setTimeout> | undefined;
-		const deadline = new Promise<void>(resolve => {
+		const deadline = new Promise<WorkerIntegrationOutcome>(resolve => {
 			timeout = setTimeout(() => {
 				controller.abort(new Error("Worker integration request timed out"));
-				resolve();
+				resolve({ status: "timed_out" });
 			}, this.timeoutMs);
 		});
-		this.#inFlight = Promise.race([request.catch(() => {}), deadline]).finally(() => {
+		this.#inFlight = Promise.race([
+			request.then(
+				() => ({ status: "completed" as const }),
+				error => ({ status: "failed" as const, error: String(error) }),
+			),
+			deadline,
+		]).finally(() => {
 			if (timeout) clearTimeout(timeout);
 			controller.abort();
 			this.#inFlight = undefined;
@@ -3848,12 +3865,9 @@ export class AgentSession {
 			lease.closeDiscovery();
 		};
 		const publish = async () => {
-			let workerIntegration: Promise<void> | undefined;
+			let workerIntegration: Promise<WorkerIntegrationOutcome> | undefined;
 			if (!workerIntegrationSettled) {
 				workerIntegration = this.#flushWorkerIntegrationForAgentEnd();
-				void workerIntegration.catch(error => {
-					logger.warn("Worker integration settled after terminal publication", { error });
-				});
 			}
 			// Reserve persistence before notifying synchronous subscribers: a subscriber
 			// may start a successor prompt from agent_end, whose running state must
@@ -3866,11 +3880,18 @@ export class AgentSession {
 			// and busy input state visible after the model has already finished. The queue
 			// preserves transaction order; terminal publication is the user-visible
 			// authority and must not be suppressed by a secondary persistence failure.
-			const terminalPersistence = this.#queueCoordinatorRuntimeStatePersist(pending);
+			const terminalPersistence = this.#queueCoordinatorRuntimeStatePersist(pending, true);
 			this.#emit(pending);
-			void terminalPersistence.catch(error => {
-				logger.warn("Failed to persist terminal coordinator runtime state", { error: String(error) });
-			});
+			void terminalPersistence.then(
+				() => this.#recordPostPublicationOutcome(pending, "terminal_persistence", { status: "completed" }),
+				error => {
+					this.#recordPostPublicationOutcome(pending, "terminal_persistence", {
+						status: "failed",
+						error: String(error),
+					});
+					logger.warn("Failed to persist terminal coordinator runtime state", { error: String(error) });
+				},
+			);
 			extensionDelivery = this.#queueExtensionEvent(
 				pending,
 				undefined,
@@ -3880,14 +3901,15 @@ export class AgentSession {
 			if (workerIntegrationSettled) {
 				await extensionDelivery;
 				workerIntegration = this.#flushWorkerIntegrationForAgentEnd();
-				void workerIntegration.catch(error => {
-					logger.warn("Worker integration started after SDK terminal publication", { error });
-				});
+				void workerIntegration.then(outcome =>
+					this.#recordPostPublicationOutcome(pending, "worker_integration", outcome),
+				);
 				void terminalPersistence.catch(error =>
 					logger.warn("Terminal persistence continued after SDK publication", { error }),
 				);
 			} else {
-				await workerIntegration;
+				const outcome = await workerIntegration!;
+				this.#recordPostPublicationOutcome(pending, "worker_integration", outcome);
 			}
 		};
 		try {
@@ -5428,6 +5450,37 @@ export class AgentSession {
 	/** Serializes sidecar writes in publication order, independent of write latency. */
 	#coordinatorPersistQueue: Promise<void> = Promise.resolve();
 
+	#recordPostPublicationOutcome(
+		event: AgentSessionEvent,
+		kind: "worker_integration" | "terminal_persistence",
+		outcome: { status: "completed" | "failed" | "timed_out"; error?: string },
+	): void {
+		const sdkRunToken =
+			(event as AgentSessionEvent & { sdkRunToken?: unknown }).sdkRunToken ??
+			((event as AgentSessionEvent & { scope?: AttemptScopeRef }).scope
+				? this.#sdkRunTokensByAttemptScope.get(
+						(event as AgentSessionEvent & { scope?: AttemptScopeRef }).scope as AttemptScope,
+					)
+				: undefined);
+		if (outcome.status !== "completed") {
+			const correlation = typeof sdkRunToken === "string" ? sdkRunToken : this.sessionId;
+			this.#emit({
+				type: "notice",
+				level: "error",
+				source: kind,
+				message: `${kind} ${outcome.status} for ${correlation}${outcome.error ? `: ${outcome.error}` : ""}`,
+			});
+		}
+		void persistCoordinatorWorkerIntegrationOutcome(
+			{
+				sessionId: this.sessionId,
+				cwd: this.sessionManager.getCwd(),
+				sessionFile: this.sessionManager.getSessionFile(),
+			},
+			{ ...outcome, kind, correlationId: typeof sdkRunToken === "string" ? sdkRunToken : undefined },
+		).catch(error => logger.warn("Failed to persist terminal reconciliation outcome", { error: String(error) }));
+	}
+
 	/**
 	 * Reserve this event's place in the sidecar write order.
 	 *
@@ -5440,7 +5493,7 @@ export class AgentSession {
 	 * its end. It describes a call that was never dispatched, and this file is read as the
 	 * answer to "what is this session doing right now".
 	 */
-	#queueCoordinatorRuntimeStatePersist(event: AgentSessionEvent): Promise<void> {
+	#queueCoordinatorRuntimeStatePersist(event: AgentSessionEvent, propagateFailure = false): Promise<void> {
 		if (isNonDispatchedToolEvent(event)) return Promise.resolve();
 		const observation = this.#coordinatorToolObservations.get(event);
 		const context = {
@@ -5451,7 +5504,7 @@ export class AgentSession {
 		const generation = this.#agentEventAdmission.get(event)?.persistGeneration ?? this.#coordinatorPersistGeneration;
 		const run = () =>
 			generation === this.#coordinatorPersistGeneration
-				? this.#persistRuntimeStateInBackground(event, context, observation)
+				? this.#persistRuntimeStateInBackground(event, context, observation, propagateFailure)
 				: Promise.resolve();
 		const queued = this.#coordinatorPersistQueue.then(run, run);
 		this.#coordinatorPersistQueue = queued.catch(() => {});
@@ -5462,11 +5515,13 @@ export class AgentSession {
 		event: AgentSessionEvent,
 		context: { sessionId: string; cwd: string; sessionFile: string | undefined },
 		observation: CoordinatorToolObservation | undefined,
+		propagateFailure: boolean,
 	): Promise<void> {
 		try {
 			await persistCoordinatorRuntimeStateFromEvent(event, context, observation);
-		} catch {
+		} catch (error) {
 			logger.warn("Failed to persist coordinator runtime state", { event: event.type });
+			if (propagateFailure) throw error;
 		}
 	}
 
@@ -7823,16 +7878,16 @@ export class AgentSession {
 		this.#workerIntegrationScheduler?.enqueue();
 	}
 
-	async #flushWorkerIntegrationAttempt(): Promise<void> {
-		await this.#workerIntegrationScheduler?.flush();
+	async #flushWorkerIntegrationAttempt(): Promise<WorkerIntegrationOutcome> {
+		return (await this.#workerIntegrationScheduler?.flush()) ?? { status: "completed" };
 	}
 
-	async #flushWorkerIntegrationForAgentEnd(): Promise<void> {
+	async #flushWorkerIntegrationForAgentEnd(): Promise<WorkerIntegrationOutcome> {
 		if (!this.#workerIntegrationRequestedForTurn) {
 			this.#requestWorkerIntegrationAttempt();
 		}
 		try {
-			await this.#flushWorkerIntegrationAttempt();
+			return await this.#flushWorkerIntegrationAttempt();
 		} finally {
 			this.#workerIntegrationRequestedForTurn = false;
 		}
@@ -10062,9 +10117,13 @@ export class AgentSession {
 		args = "",
 		options?: Pick<
 			PromptOptions,
-			"onPreflightAccepted" | "onPreflightAcceptCommit" | "onSkillPrepared" | "preflightSignal"
+			"onPreflightAccepted" | "onPreflightAcceptCommit" | "onSkillPrepared" | "preflightSignal" | "sdkRunCapability"
 		>,
 	): Promise<{ name: string; path: string; args?: string; lineCount?: number }> {
+		const internalOptions = {
+			...options,
+			sdkRunToken: readSdkRunCapability(options?.sdkRunCapability),
+		};
 		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		const skillName = name.trim();
 		if (!skillName) throw Object.assign(new Error("skill.invoke requires a skill name."), { code: "invalid_input" });
@@ -10110,7 +10169,7 @@ export class AgentSession {
 			lineCount: built.details.lineCount,
 			cleanedArgs: activation.cleanedArgs || undefined,
 		});
-		await this.promptCustomMessage(skillPromptMessage, options as InternalCustomMessageOptions);
+		await this.promptCustomMessage(skillPromptMessage, internalOptions as InternalCustomMessageOptions);
 		return {
 			name: skill.name,
 			path: skill.filePath,
@@ -10800,7 +10859,10 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
-		const internalOptions = options as InternalPromptOptions | undefined;
+		const sdkRunToken = readSdkRunCapability(options?.sdkRunCapability);
+		const internalOptions: InternalPromptOptions | undefined = options
+			? { ...options, ...(sdkRunToken ? { sdkRunToken } : {}) }
+			: undefined;
 		this.#assertRecoveryHydrationPromoted();
 		const owner = this.#sessionAdmissionContext.getStore();
 		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
@@ -11081,9 +11143,13 @@ export class AgentSession {
 			| "onPreflightAccepted"
 			| "onPreflightAcceptCommit"
 			| "preflightSignal"
+			| "sdkRunCapability"
 		>,
 	): Promise<void> {
-		const internalOptions = options as InternalCustomMessageOptions | undefined;
+		const sdkRunToken = readSdkRunCapability(options?.sdkRunCapability);
+		const internalOptions: InternalCustomMessageOptions | undefined = options
+			? { ...options, ...(sdkRunToken ? { sdkRunToken } : {}) }
+			: undefined;
 		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		const textContent =
 			typeof message.content === "string"
@@ -12451,9 +12517,11 @@ export class AgentSession {
 			/** Internal dispatch disposition used before actual queue consumption. */
 			onDispatchDisposition?: (promotion: { startsOwnRun: boolean }) => void;
 			preflightSignal?: AbortSignal;
+			sdkRunCapability?: unknown;
 		},
 	): Promise<void> {
-		const internalOptions = options as (typeof options & { sdkRunToken?: string }) | undefined;
+		const sdkRunToken = readSdkRunCapability(options?.sdkRunCapability);
+		const internalOptions = options ? { ...options, ...(sdkRunToken ? { sdkRunToken } : {}) } : undefined;
 		this.#assertRecoveryHydrationPromoted();
 		const owner = this.#sessionAdmissionContext.getStore();
 		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();

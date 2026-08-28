@@ -28,6 +28,7 @@ import { type ModelSelectorValue, normalizeModelSelectorValue } from "../../conf
 import { type Settings, validateSettingPatch } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import { normalizeGoal } from "../../goals/state";
+import { createSdkRunCapability } from "../../session/sdk-run-capability";
 import {
 	boundTerminalRetentionState,
 	findOwnedRegistrationsForTurn,
@@ -1856,7 +1857,11 @@ function createControlSurface(
 	const sendSdkUserMessage = (
 		content: Parameters<ExtensionAPI["sendUserMessage"]>[0],
 		options?: Record<string, unknown>,
-	): Promise<void> => api.sendUserMessage(content, options as never);
+	): Promise<void> => {
+		if (!options || typeof options.sdkRunToken !== "string") return api.sendUserMessage(content, options as never);
+		const { sdkRunToken, ...rest } = options;
+		return api.sendUserMessage(content, { ...rest, sdkRunCapability: createSdkRunCapability(sdkRunToken) } as never);
+	};
 	const surfacePolicy =
 		policy ?? createSdkSurfacePolicyForContext(ctx, hasSdkWorkflowGateCapability(ctx.workflowGate));
 	const typed = (operation: string, input: Record<string, unknown> = {}) =>
@@ -3106,7 +3111,7 @@ function createControlSurface(
 					typeof images === "undefined" ? text : ([{ type: "text", text }, ...(images as never[])] as never),
 					{
 						...options,
-						sdkRunToken,
+						sdkRunCapability: createSdkRunCapability(sdkRunToken),
 						// ACP terminal settlement is owned by the correlated agent_end
 						// publication. Post-prompt recovery may include independent
 						// subagent work and must not hold that client-facing boundary.
@@ -3135,7 +3140,12 @@ function createControlSurface(
 			submit(
 				"prompt",
 				undefined,
-				options => sendSdkUserMessage(text, { ...options, deliverAs: "followUp" }),
+				({ sdkRunToken, ...options }) =>
+					sendSdkUserMessage(text, {
+						...options,
+						sdkRunCapability: createSdkRunCapability(sdkRunToken),
+						deliverAs: "followUp",
+					}),
 				undefined,
 				false,
 				// Follow-ups never start inline; ownership correlates at promotion.
@@ -3148,7 +3158,9 @@ function createControlSurface(
 		abortTerminal: terminalAbort,
 		abortAndPrompt: async text => {
 			await ctx.abort();
-			return await submit("prompt", undefined, options => sendSdkUserMessage(text, { ...options }));
+			return await submit("prompt", undefined, ({ sdkRunToken, ...options }) =>
+				sendSdkUserMessage(text, { ...options, sdkRunCapability: createSdkRunCapability(sdkRunToken) }),
+			);
 		},
 		answerAsk: unavailable("ask.answer"),
 		answerGate: async (id, response, expectedSessionId, idempotencyKey) =>

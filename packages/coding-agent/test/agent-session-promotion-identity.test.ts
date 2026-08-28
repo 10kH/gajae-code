@@ -8,6 +8,7 @@ import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
+import { createSdkRunCapability } from "@gajae-code/coding-agent/session/sdk-run-capability";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
 import { z } from "zod";
@@ -229,7 +230,7 @@ describe("queued promotion run identity (#4668)", () => {
 		});
 		const queuedDone = session.sendUserMessage("deferred target", {
 			deliverAs: "followUp",
-			sdkRunToken: "deferred-target-token",
+			sdkRunCapability: createSdkRunCapability("deferred-target-token"),
 			onQueuedPromoted: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => {
 				if (promotion.removed) removals.push("deferred target");
 			},
@@ -283,7 +284,7 @@ describe("queued promotion run identity (#4668)", () => {
 		});
 		const queuedDone = session.sendUserMessage("deferred follow-up", {
 			deliverAs: "followUp",
-			sdkRunToken: "deferred-clear-token",
+			sdkRunCapability: createSdkRunCapability("deferred-clear-token"),
 			onQueuedPromoted: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => {
 				if (promotion.removed) removals.push("deferred follow-up");
 			},

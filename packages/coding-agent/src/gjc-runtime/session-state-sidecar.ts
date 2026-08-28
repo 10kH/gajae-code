@@ -1608,6 +1608,60 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 	);
 }
 
+export async function persistCoordinatorWorkerIntegrationOutcome(
+	context: RuntimeStateContext,
+	outcome: {
+		kind: "worker_integration" | "terminal_persistence";
+		status: "completed" | "failed" | "timed_out";
+		correlationId?: string;
+		error?: string;
+	},
+): Promise<void> {
+	const stateFile = runtimeStateFileForContext(context);
+	if (!stateFile) return;
+	const identity = normalizedIdentity(context);
+	await serializeStateFileWrite(
+		stateFile,
+		async () =>
+			await withCoordinatorTransactionLock(
+				stateFile,
+				async () =>
+					await withStateFileLock(stateFile, async () => {
+						const previous = await readPreviousPayloadForEvent(stateFile);
+						if (Object.keys(previous).length === 0) return;
+						assertPreviousRuntimeStateIdentity(previous, identity);
+						const now = new Date().toISOString();
+						const reconciliation = {
+							status: outcome.status,
+							...(outcome.correlationId ? { correlation_id: outcome.correlationId } : {}),
+							...(outcome.error ? { error: outcome.error.slice(0, MAX_PUBLIC_ERROR_MESSAGE_LENGTH) } : {}),
+							observed_at: now,
+						};
+						const failureMessage =
+							outcome.error ??
+							(outcome.status === "timed_out"
+								? "Worker integration timed out after terminal publication."
+								: "Worker integration failed after terminal publication.");
+						const payload = {
+							...previous,
+							updated_at: now,
+							[outcome.kind]: reconciliation,
+							...(outcome.status !== "completed"
+								? {
+										error: {
+											code: `${outcome.kind}_failed`,
+											message: failureMessage,
+											recoverable: true,
+										},
+									}
+								: {}),
+						};
+						await writeStateFileSync(stateFile, payload, identity.sidecarKeyId);
+					}),
+			),
+	);
+}
+
 function ownerTerminalSignal(reason: postmortem.Reason): TerminalSignal {
 	if (reason === postmortem.Reason.SIGTERM) return "SIGTERM";
 	if (reason === postmortem.Reason.SIGINT) return "SIGINT";
