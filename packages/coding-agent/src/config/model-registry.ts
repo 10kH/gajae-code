@@ -4846,12 +4846,12 @@ export class ModelRegistry {
 
 	#synchronizeEnvironmentCredentials(): void {
 		for (const [provider, envName] of this.#customProviderApiKeyEnvNames) {
-			const resolved = Bun.env[envName];
+			const resolved = $rotatingCredentialEnv(envName);
 			const installed = this.#customProviderApiKeys.get(provider);
 			if (resolved) {
 				if (installed !== resolved) {
 					this.#customProviderApiKeys.set(provider, resolved);
-					this.authStorage.setConfigApiKey(provider, resolved);
+					this.authStorage.setConfigApiKey(provider, resolved, { envSourced: true });
 				}
 			} else if (installed !== undefined) {
 				this.#customProviderApiKeys.delete(provider);
@@ -4859,7 +4859,7 @@ export class ModelRegistry {
 			}
 		}
 		for (const [provider, envName] of this.#runtimeProviderApiKeyEnvNames) {
-			const resolved = Bun.env[envName];
+			const resolved = $rotatingCredentialEnv(envName);
 			const installed = this.#customProviderApiKeys.get(provider);
 			if (resolved) {
 				if (installed !== resolved) {
