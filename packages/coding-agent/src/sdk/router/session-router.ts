@@ -1054,8 +1054,16 @@ export class SessionRouter {
 				"session_not_live",
 				"Session activation requires an exact live session endpoint.",
 			);
-		const endpoint = await this.#readEndpoint(indexed).catch(() => null);
-		if (!endpoint || endpoint.stale === true || !endpoint.url || !endpoint.token || endpoint.pid !== indexed.pid)
+		const provenEndpoint = await this.#readProvenEndpoint(indexed).catch(() => null);
+		const endpoint = provenEndpoint?.endpoint;
+		if (
+			!provenEndpoint ||
+			!endpoint ||
+			endpoint.stale === true ||
+			!endpoint.url ||
+			!endpoint.token ||
+			endpoint.pid !== indexed.pid
+		)
 			throw new SessionActivationError(
 				"session_not_live",
 				"Session activation requires a readable session discovery endpoint.",
@@ -1075,12 +1083,15 @@ export class SessionRouter {
 			throw new SessionActivationError("activation_unavailable", "The session endpoint could not be reached.");
 		}
 		try {
-			const currentEndpoint = await this.#readEndpoint(indexed).catch(() => null);
+			const currentProvenEndpoint = await this.#readProvenEndpoint(indexed).catch(() => null);
+			const currentEndpoint = currentProvenEndpoint?.endpoint;
 			if (
+				!currentProvenEndpoint ||
 				!currentEndpoint ||
 				currentEndpoint.url !== endpoint.url ||
 				currentEndpoint.token !== endpoint.token ||
-				currentEndpoint.pid !== endpoint.pid
+				currentEndpoint.pid !== endpoint.pid ||
+				!sameEndpointIdentity(provenEndpoint.identity, currentProvenEndpoint.identity)
 			)
 				throw new SessionActivationError(
 					"session_not_live",

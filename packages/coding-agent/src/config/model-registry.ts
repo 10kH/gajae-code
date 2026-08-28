@@ -1670,6 +1670,7 @@ export class ModelRegistry {
 		this.#cancelModelPresetRegistryRefresh = undefined;
 		this.#unsubscribeAuthGeneration?.();
 		this.#unsubscribeAuthGeneration = undefined;
+		this.authStorage.setFallbackResolver(() => undefined);
 		this.#catalogChangeListeners.clear();
 	}
 
