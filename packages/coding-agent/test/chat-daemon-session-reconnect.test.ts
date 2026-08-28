@@ -491,6 +491,7 @@ async function withAttachedSessionRuntime(run: (harness: AttachedRuntimeHarness)
 					clearInterval: (() => undefined) as unknown as typeof clearInterval,
 					setTimeout: inertAttachmentTimeout,
 					clearTimeout: clearInertAttachmentTimeout,
+					startupAttachBudgetMs: 50,
 				},
 			},
 		);
@@ -692,7 +693,8 @@ async function awaitReplayRequests(host: FakeSessionHost, count: number, clock?:
 		await flush();
 		if (clock) {
 			const pending = clock.pendingDelays();
-			if (pending.length > 0) clock.advanceBy(Math.min(...pending));
+			const backoffs = pending.filter(delay => delay <= 2_000);
+			if (backoffs.length > 0) clock.advanceBy(Math.min(...backoffs));
 		}
 		await Bun.sleep(1);
 	}
@@ -785,8 +787,14 @@ test("an unreachable attached chat session exhausts its long-lived reconnect bud
 		await withSerializedFakeTransport(async clock => {
 			const starting = runtime.start();
 			await awaitSocket(1);
-			const observed = await drainReconnects(clock);
+			// Startup owns a short independent cutoff. Advancing only that cutoff proves
+			// the caller is released while the first long-lived transport backoff remains
+			// pending; draining the reconnect budget below is a separate assertion.
+			clock.advanceBy(50);
+			await flush();
 			await expect(starting).resolves.toBeUndefined();
+			expect(FakeWebSocket.instances).toHaveLength(1);
+			const observed = await drainReconnects(clock);
 
 			// The attached-session client must follow the shared long-lived schedule,
 			// not the transport's one-shot defaults (3 attempts, 25/50/100ms = 175ms).
@@ -968,6 +976,7 @@ test("stopping the runtime while a replay is pending neither hangs nor publishes
 			await runtime.stop();
 			await Bun.sleep(20);
 			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\none"]);
+			expect(FakeWebSocket.instances.every(socket => socket.readyState === FakeWebSocket.CLOSED)).toBe(true);
 		});
 	});
 }, 20_000);
