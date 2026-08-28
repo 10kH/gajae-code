@@ -113,8 +113,7 @@ async function readProjectionFileSafe(file: string, encoding: "utf8", expected?:
 	const nonBlock = fs.constants.O_NONBLOCK;
 	if (platform !== "win32" && (typeof noFollow !== "number" || typeof nonBlock !== "number"))
 		throw new ProjectionScanUnsupportedError();
-	const flags =
-		fs.constants.O_RDONLY | (platform === "win32" ? 0 : (nonBlock as number) | (noFollow as number));
+	const flags = fs.constants.O_RDONLY | (platform === "win32" ? 0 : (nonBlock as number) | (noFollow as number));
 	let before: import("node:fs").BigIntStats | undefined;
 	if (platform === "win32") {
 		before = await fs.lstat(file, { bigint: true });
@@ -183,10 +182,7 @@ function trimProjectionRootPath(dir: string): string {
 	let trimmed = dir;
 	while (trimmed.length > parsedRoot.length && (trimmed.endsWith("/") || trimmed.endsWith("\\")))
 		trimmed = trimmed.slice(0, -1);
-	while (
-		trimmed.length > parsedRoot.length &&
-		(trimmed.endsWith("/.") || trimmed.endsWith("\\."))
-	) {
+	while (trimmed.length > parsedRoot.length && (trimmed.endsWith("/.") || trimmed.endsWith("\\."))) {
 		trimmed = trimmed.slice(0, -2);
 		while (trimmed.length > parsedRoot.length && (trimmed.endsWith("/") || trimmed.endsWith("\\")))
 			trimmed = trimmed.slice(0, -1);

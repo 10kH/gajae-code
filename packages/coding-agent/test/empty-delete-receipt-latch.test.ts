@@ -9,8 +9,8 @@ import { writeCoordinatorAtomic } from "../src/coordinator-mcp/durability";
 import {
 	COORDINATOR_JSON_SCAN_CAP,
 	listCoordinatorJsonFiles,
-	ProjectionScanTestHooks,
 	type ProjectionScanDirectory,
+	ProjectionScanTestHooks,
 } from "../src/coordinator-mcp/projection-scan";
 import { collectEmptyDeleteReceipts, runEmptyDeleteGc } from "../src/gjc-runtime/empty-delete-gc";
 import { runGjcGcCommand } from "../src/gjc-runtime/gc-runtime";
