@@ -2008,7 +2008,11 @@ export class WorkerIntegrationRequestScheduler {
 		this.#start();
 	}
 
-	async flush(): Promise<WorkerIntegrationOutcome> {
+	async flush(): Promise<void> {
+		await this.flushWithOutcome();
+	}
+
+	async flushWithOutcome(): Promise<WorkerIntegrationOutcome> {
 		let outcome: WorkerIntegrationOutcome = { status: "completed" };
 		while (this.#inFlight) {
 			outcome = await this.#inFlight;
@@ -3879,6 +3883,13 @@ export class AgentSession {
 			let workerIntegration: Promise<WorkerIntegrationOutcome> | undefined;
 			if (!workerIntegrationSettled) {
 				workerIntegration = this.#flushWorkerIntegrationForAgentEnd();
+				const outcome = await workerIntegration;
+				this.#recordPostPublicationOutcome(
+					publicationContext,
+					publicationCorrelationId,
+					"worker_integration",
+					outcome,
+				);
 			}
 			// Reserve persistence before notifying synchronous subscribers: a subscriber
 			// may start a successor prompt from agent_end, whose running state must
@@ -3935,13 +3946,7 @@ export class AgentSession {
 					logger.warn("Terminal persistence continued after SDK publication", { error }),
 				);
 			} else {
-				const outcome = await workerIntegration!;
-				this.#recordPostPublicationOutcome(
-					publicationContext,
-					publicationCorrelationId,
-					"worker_integration",
-					outcome,
-				);
+				// Non-SDK/public publication has already awaited worker integration above.
 			}
 		};
 		try {
@@ -7900,7 +7905,7 @@ export class AgentSession {
 	}
 
 	async #flushWorkerIntegrationAttempt(): Promise<WorkerIntegrationOutcome> {
-		return (await this.#workerIntegrationScheduler?.flush()) ?? { status: "completed" };
+		return (await this.#workerIntegrationScheduler?.flushWithOutcome()) ?? { status: "completed" };
 	}
 
 	async #flushWorkerIntegrationForAgentEnd(): Promise<WorkerIntegrationOutcome> {

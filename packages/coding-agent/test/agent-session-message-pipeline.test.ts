@@ -46,7 +46,10 @@ describe("AgentSession message pipeline", () => {
 			throw new Error("worker integration failed");
 		}, 50);
 		scheduler.enqueue();
-		expect(await scheduler.flush()).toEqual({ status: "failed", error: "Error: worker integration failed" });
+		expect(await scheduler.flushWithOutcome()).toEqual({
+			status: "failed",
+			error: "Error: worker integration failed",
+		});
 	});
 
 	it("applies transformContext before convertToLlm", async () => {
