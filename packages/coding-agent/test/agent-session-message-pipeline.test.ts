@@ -1032,28 +1032,48 @@ describe("AgentSession message pipeline", () => {
 		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
 		expect(integrationRequests).toBe(1);
 
+		// SDK/ACP settlement must not wait for post-prompt recovery. A recovery
+		// request that ignores its abort signal represents the subagent/tool work
+		// seen in the field: the correlated agent_end is still the terminal
+		// boundary and must reach the client before that work drains.
+		neverSettle = true;
+		integrationAborted = false;
+		const sdkSubmission = session.sendUserMessage("sdk terminal fast path", {
+			skipPostPromptRecoveryWait: true,
+		});
+		await new Promise<void>(resolve => {
+			const check = () => {
+				if (events.filter(event => event.type === "agent_end").length >= 2) resolve();
+				else setTimeout(check, 1);
+			};
+			check();
+		});
+		expect(integrationAborted).toBe(false);
+		await sdkSubmission;
+		expect(integrationAborted).toBe(true);
+
 		failIntegration = true;
 		await session.prompt("again");
 		await session.waitForIdle();
-		expect(events.filter(event => event.type === "agent_end")).toHaveLength(2);
-		expect(integrationRequests).toBe(2);
+		expect(events.filter(event => event.type === "agent_end")).toHaveLength(3);
+		expect(integrationRequests).toBe(3);
 
 		failIntegration = false;
 		await session.prompt("third time");
 		await session.waitForIdle();
-		expect(events.filter(event => event.type === "agent_end")).toHaveLength(3);
-		expect(integrationRequests).toBe(3);
+		expect(events.filter(event => event.type === "agent_end")).toHaveLength(4);
+		expect(integrationRequests).toBe(4);
 
 		neverSettle = true;
 		await session.prompt("hung integration");
 		await session.waitForIdle();
 		expect(integrationAborted).toBe(true);
-		expect(events.filter(event => event.type === "agent_end")).toHaveLength(4);
+		expect(events.filter(event => event.type === "agent_end")).toHaveLength(5);
 
 		neverSettle = false;
 		await session.prompt("available after integration timeout");
 		await session.waitForIdle();
-		expect(events.filter(event => event.type === "agent_end")).toHaveLength(5);
+		expect(events.filter(event => event.type === "agent_end")).toHaveLength(6);
 	});
 	it("drains deferred agent_end extension delivery before session shutdown", async () => {
 		const extensionStarted = Promise.withResolvers<void>();

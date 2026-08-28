@@ -1079,6 +1079,8 @@ export interface PromptOptions {
 	preflightSignal?: AbortSignal;
 	/** Internal SDK lifecycle owner token. */
 	sdkRunToken?: string;
+	/** Internal SDK path: let the correlated agent_end settle before recovery drains. */
+	skipPostPromptRecoveryWait?: boolean;
 }
 
 function promptPreflightCancelledError(): Error {
@@ -3811,10 +3813,12 @@ export class AgentSession {
 			lease.closeDiscovery();
 		};
 		const publish = async () => {
-			// Worker integration is first-party lifecycle persistence, not an extension
-			// hook. Settle it before publishing the terminal boundary while user extension
-			// delivery and coordinator sidecar persistence remain asynchronous.
-			await this.#flushWorkerIntegrationForAgentEnd();
+			// Start first-party worker integration, but do not put it in front of the
+			// terminal boundary. Integration can include independent subagent work and
+			// must not turn a completed provider run into an ACP prompt that waits on
+			// recovery indefinitely. The bounded integration promise is still awaited
+			// below so ordinary session shutdown retains its drain guarantee.
+			const workerIntegration = this.#flushWorkerIntegrationForAgentEnd();
 			// Reserve persistence before notifying synchronous subscribers: a subscriber
 			// may start a successor prompt from agent_end, whose running state must
 			// serialize after this terminal boundary rather than be overwritten by it.
@@ -3837,6 +3841,7 @@ export class AgentSession {
 				true,
 				(pending as AgentSessionEvent & { scope?: AttemptScopeRef }).scope,
 			);
+			await workerIntegration;
 		};
 		try {
 			if (lease) await this.#runResourceLeaseContext.run(lease, publish);
@@ -12281,6 +12286,8 @@ export class AgentSession {
 			onDispatchDisposition?: (promotion: { startsOwnRun: boolean }) => void;
 			preflightSignal?: AbortSignal;
 			sdkRunToken?: string;
+			/** Do not let post-prompt recovery delay the SDK terminal boundary. */
+			skipPostPromptRecoveryWait?: boolean;
 		},
 	): Promise<void> {
 		this.#assertRecoveryHydrationPromoted();
@@ -12479,6 +12486,7 @@ export class AgentSession {
 							}
 						: undefined,
 				preflightSignal: options?.preflightSignal,
+				skipPostPromptRecoveryWait: options?.skipPostPromptRecoveryWait,
 			});
 		} finally {
 			releaseFollowUpReservation();

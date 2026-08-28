@@ -1317,6 +1317,8 @@ export interface ExtensionAPI {
 			preflightSignal?: AbortSignal;
 			/** Internal SDK correlation owner for an exact queued follow-up. */
 			sdkRunToken?: string;
+			/** Internal SDK path: let the correlated agent_end settle before recovery drains. */
+			skipPostPromptRecoveryWait?: boolean;
 		},
 	): Promise<void>;
 
@@ -1547,6 +1549,8 @@ export type SendUserMessageHandler = (
 		preflightSignal?: AbortSignal;
 		/** Internal SDK correlation owner for an exact queued follow-up. */
 		sdkRunToken?: string;
+		/** Internal SDK path: let the correlated agent_end settle before recovery drains. */
+		skipPostPromptRecoveryWait?: boolean;
 	},
 ) => void | Promise<void>;
 

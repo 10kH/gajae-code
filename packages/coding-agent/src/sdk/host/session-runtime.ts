@@ -3103,6 +3103,10 @@ function createControlSurface(
 					{
 						...options,
 						sdkRunToken,
+						// ACP terminal settlement is owned by the correlated agent_end
+						// publication. Post-prompt recovery may include independent
+						// subagent work and must not hold that client-facing boundary.
+						skipPostPromptRecoveryWait: true,
 						...(queuedAtDispatch ? { queuedAtDispatch: true } : {}),
 					},
 				),
