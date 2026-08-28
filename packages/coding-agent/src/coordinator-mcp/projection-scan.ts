@@ -25,6 +25,15 @@ class ProjectionScanUnsupportedError extends Error {
 	}
 }
 
+/** Test-only platform seam; production always follows the host platform. */
+export const ProjectionScanTestHooks: {
+	platform?: NodeJS.Platform;
+} = {};
+
+function projectionPlatform(): NodeJS.Platform {
+	return ProjectionScanTestHooks.platform ?? process.platform;
+}
+
 /** Post-filter parse-candidate cap. Exhaustion returns an explicit incomplete result. */
 export const COORDINATOR_JSON_SCAN_CAP = 10_000;
 
@@ -99,14 +108,15 @@ function sameProjectionFile(left: ProjectionScanStat, right: ProjectionScanStat)
 
 async function readProjectionFileSafe(file: string, encoding: "utf8", expected?: ProjectionScanStat): Promise<string> {
 	if (encoding !== "utf8") throw new TypeError("Coordinator projection reads require utf8.");
+	const platform = projectionPlatform();
 	const noFollow = fs.constants.O_NOFOLLOW;
 	const nonBlock = fs.constants.O_NONBLOCK;
-	if (process.platform !== "win32" && (typeof noFollow !== "number" || typeof nonBlock !== "number"))
+	if (platform !== "win32" && (typeof noFollow !== "number" || typeof nonBlock !== "number"))
 		throw new ProjectionScanUnsupportedError();
 	const flags =
-		fs.constants.O_RDONLY | (process.platform === "win32" ? 0 : (nonBlock as number) | (noFollow as number));
+		fs.constants.O_RDONLY | (platform === "win32" ? 0 : (nonBlock as number) | (noFollow as number));
 	let before: import("node:fs").BigIntStats | undefined;
-	if (process.platform === "win32") {
+	if (platform === "win32") {
 		before = await fs.lstat(file, { bigint: true });
 		if (before.isSymbolicLink() || !before.isFile())
 			throw new ProjectionScanRaceError("candidate is not a regular file");
@@ -168,13 +178,120 @@ function hasProjectionRootIdentity(stat: ProjectionScanStat): boolean {
 	return stat.dev !== undefined && stat.ino !== undefined;
 }
 
+function trimProjectionRootPath(dir: string): string {
+	const parsedRoot = path.parse(dir).root;
+	let trimmed = dir;
+	while (trimmed.length > parsedRoot.length && (trimmed.endsWith("/") || trimmed.endsWith("\\")))
+		trimmed = trimmed.slice(0, -1);
+	while (
+		trimmed.length > parsedRoot.length &&
+		(trimmed.endsWith("/.") || trimmed.endsWith("\\."))
+	) {
+		trimmed = trimmed.slice(0, -2);
+		while (trimmed.length > parsedRoot.length && (trimmed.endsWith("/") || trimmed.endsWith("\\")))
+			trimmed = trimmed.slice(0, -1);
+	}
+	return trimmed || parsedRoot;
+}
+
+/**
+ * Windows has no descriptor-relative `openat` binding in Node. Keep the root pathname
+ * authoritative by checking its identity before and after every mutable-path operation.
+ */
+async function openProjectionDirectoryWindowsSafe(dir: string): Promise<ProjectionScanDirectory> {
+	const rootPath = trimProjectionRootPath(dir);
+	let opened: import("node:fs").BigIntStats;
+	try {
+		opened = await fs.lstat(rootPath, { bigint: true });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ELOOP")
+			throw new ProjectionScanRaceError("scan root became a reparse point");
+		throw error;
+	}
+	if (opened.isSymbolicLink() || !opened.isDirectory())
+		throw new ProjectionScanRaceError("scan root is not a regular directory");
+
+	const assertRoot = async (): Promise<void> => {
+		let settled: import("node:fs").BigIntStats;
+		try {
+			settled = await fs.lstat(rootPath, { bigint: true });
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code === "ENOENT" || code === "ELOOP")
+				throw new ProjectionScanRaceError("scan root changed during enumeration");
+			throw error;
+		}
+		if (settled.isSymbolicLink() || !settled.isDirectory() || !sameProjectionRoot(opened, settled))
+			throw new ProjectionScanRaceError("scan root changed during enumeration");
+	};
+
+	const entryPath = (entry: string): string => {
+		// Directory entries come from readdir and are therefore single components on
+		// Windows. Keep the invariant explicit so an injected or corrupted entry can
+		// never turn a child operation into mutable pathname traversal.
+		if (
+			entry.length === 0 ||
+			entry === "." ||
+			entry === ".." ||
+			entry.includes("/") ||
+			entry.includes("\\") ||
+			entry.includes(":")
+		)
+			throw new ProjectionScanRaceError("scan entry is not a single directory component");
+		return path.join(rootPath, entry);
+	};
+
+	const bracketRoot = async <T>(operation: () => Promise<T>): Promise<T> => {
+		let value!: T;
+		let operationError: unknown;
+		let started = false;
+		try {
+			await assertRoot();
+			started = true;
+			value = await operation();
+		} catch (error) {
+			operationError = error;
+		}
+		if (started) {
+			try {
+				await assertRoot();
+			} catch (error) {
+				operationError = error;
+			}
+		}
+		if (operationError !== undefined) {
+			const code = (operationError as NodeJS.ErrnoException).code;
+			if (code === "ENOENT" || code === "ELOOP")
+				throw new ProjectionScanRaceError("scan operation raced with a replacement or reparse point");
+			throw operationError;
+		}
+		return value;
+	};
+
+	return {
+		stat: opened,
+		readdir: () => bracketRoot(() => fs.readdir(rootPath)),
+		lstat: entry =>
+			bracketRoot(async () => {
+				const stat = await fs.lstat(entryPath(entry), { bigint: true });
+				if (stat.isSymbolicLink()) throw new ProjectionScanRaceError("candidate became a reparse point");
+				return stat;
+			}),
+		readFile: (entry, encoding, expected) =>
+			bracketRoot(() => readProjectionFileSafe(entryPath(entry), encoding, expected)),
+		close: async () => {},
+	};
+}
+
 /**
  * Open a no-follow directory authority and keep it alive through enumeration, child
  * lstat, and child reads. Node has no `openat` binding, so POSIX uses the proc fd path
  * as the descriptor-relative namespace; a replacement root or parent cannot redirect it.
  */
 async function openProjectionDirectorySafe(dir: string): Promise<ProjectionScanDirectory> {
-	if (process.platform !== "linux") throw new ProjectionScanUnsupportedError();
+	const platform = projectionPlatform();
+	if (platform === "win32") return openProjectionDirectoryWindowsSafe(dir);
+	if (platform !== "linux") throw new ProjectionScanUnsupportedError();
 	const noFollow = fs.constants.O_NOFOLLOW;
 	const nonBlock = fs.constants.O_NONBLOCK;
 	if (typeof noFollow !== "number" || typeof nonBlock !== "number") throw new ProjectionScanUnsupportedError();

@@ -9,6 +9,7 @@ import { writeCoordinatorAtomic } from "../src/coordinator-mcp/durability";
 import {
 	COORDINATOR_JSON_SCAN_CAP,
 	listCoordinatorJsonFiles,
+	ProjectionScanTestHooks,
 	type ProjectionScanDirectory,
 } from "../src/coordinator-mcp/projection-scan";
 import { collectEmptyDeleteReceipts, runEmptyDeleteGc } from "../src/gjc-runtime/empty-delete-gc";
@@ -30,6 +31,7 @@ const tempDirs: string[] = [];
 installExactIdentityNatives();
 
 afterEach(async () => {
+	ProjectionScanTestHooks.platform = undefined;
 	SessionStateLockTestHooks.quarantineMints = undefined;
 	SessionStateLockTestHooks.lastQuarantineName = undefined;
 	SessionStateLockTestHooks.forcedQuarantineName = undefined;
@@ -214,6 +216,125 @@ describe("empty .gjc-delete-* latch", () => {
 		expect(scan.values).toEqual([]);
 		expect(scan.incomplete).toBe(true);
 		expect(scan.raced).toBe(1);
+		expect(scan.capped).toBe(true);
+	});
+
+	it("Test 1 Windows authority: stable regular JSON remains readable", async () => {
+		const dir = await tempRoot("gjc-scan-win-stable-");
+		ProjectionScanTestHooks.platform = "win32";
+		await fs.writeFile(path.join(dir, "stable.json"), JSON.stringify({ session_id: "stable" }));
+
+		const scan = await listCoordinatorJsonFiles(dir);
+
+		expect(scan.values).toEqual([{ session_id: "stable" }]);
+		expect(scan.parsed).toBe(1);
+		expect(scan.raced).toBe(0);
+		expect(scan.incomplete).toBe(false);
+	});
+
+	it("Test 1 Windows authority: root replacement fails closed", async () => {
+		const dir = await tempRoot("gjc-scan-win-root-race-");
+		const replacement = `${dir}-replacement`;
+		tempDirs.push(replacement);
+		ProjectionScanTestHooks.platform = "win32";
+		await fs.writeFile(path.join(dir, "original.json"), JSON.stringify({ session_id: "original" }));
+
+		const realReaddir = fs.readdir;
+		const readdirSpy = spyOn(fs, "readdir");
+		readdirSpy.mockImplementation((async (target: PathLike) => {
+			const entries = await realReaddir(target);
+			if (String(target) === dir) {
+				await fs.rename(dir, replacement);
+				await fs.mkdir(dir);
+				await fs.writeFile(path.join(dir, "foreign.json"), JSON.stringify({ session_id: "foreign" }));
+			}
+			return entries;
+		}) as unknown as typeof fs.readdir);
+		try {
+			const scan = await listCoordinatorJsonFiles(dir);
+			expect(scan.values).toEqual([]);
+			expect(scan.raced).toBe(1);
+			expect(scan.incomplete).toBe(true);
+			expect(scan.capped).toBe(true);
+		} finally {
+			readdirSpy.mockRestore();
+		}
+	});
+
+	it("Test 1 Windows authority: candidate replacement fails closed before parsing", async () => {
+		const dir = await tempRoot("gjc-scan-win-candidate-race-");
+		const candidate = path.join(dir, "candidate.json");
+		const replacement = path.join(dir, "candidate-replacement.tmp");
+		ProjectionScanTestHooks.platform = "win32";
+		await fs.writeFile(candidate, JSON.stringify({ session_id: "source" }));
+		await fs.writeFile(replacement, JSON.stringify({ session_id: "target" }));
+
+		const realLstat = fs.lstat as unknown as (file: PathLike, options?: unknown) => Promise<BigIntStats>;
+		const lstatSpy = spyOn(fs, "lstat");
+		let enumerated = false;
+		lstatSpy.mockImplementation((async (file: PathLike, options: unknown) => {
+			const stat = await realLstat(file, options);
+			if (!enumerated && String(file) === candidate) {
+				enumerated = true;
+				await fs.rename(replacement, candidate);
+				await fs.writeFile(replacement, JSON.stringify({ session_id: "replacement" }));
+			}
+			return stat;
+		}) as unknown as typeof fs.lstat);
+		try {
+			const scan = await listCoordinatorJsonFiles(dir);
+			expect(enumerated).toBe(true);
+			expect(scan.values).toEqual([]);
+			expect(scan.raced).toBe(1);
+			expect(scan.incomplete).toBe(true);
+			expect(scan.capped).toBe(true);
+		} finally {
+			lstatSpy.mockRestore();
+		}
+	});
+
+	it("Test 1 Windows authority: candidate reparse replacement fails closed", async () => {
+		const dir = await tempRoot("gjc-scan-win-reparse-race-");
+		const candidate = path.join(dir, "candidate.json");
+		const source = path.join(dir, "candidate-source.txt");
+		ProjectionScanTestHooks.platform = "win32";
+		await fs.writeFile(candidate, JSON.stringify({ session_id: "source" }));
+		await fs.writeFile(source, JSON.stringify({ session_id: "reparse-target" }));
+
+		const realLstat = fs.lstat as unknown as (file: PathLike, options?: unknown) => Promise<BigIntStats>;
+		const lstatSpy = spyOn(fs, "lstat");
+		let enumerated = false;
+		lstatSpy.mockImplementation((async (file: PathLike, options: unknown) => {
+			const stat = await realLstat(file, options);
+			if (!enumerated && String(file) === candidate) {
+				enumerated = true;
+				await fs.unlink(candidate);
+				await fs.symlink(source, candidate);
+			}
+			return stat;
+		}) as unknown as typeof fs.lstat);
+		try {
+			const scan = await listCoordinatorJsonFiles(dir);
+			expect(enumerated).toBe(true);
+			expect(scan.values).toEqual([]);
+			expect(scan.raced).toBe(1);
+			expect(scan.incomplete).toBe(true);
+			expect(scan.capped).toBe(true);
+		} finally {
+			lstatSpy.mockRestore();
+		}
+	});
+
+	it("Test 1 Windows authority: unsupported platform remains fail-closed", async () => {
+		const dir = await tempRoot("gjc-scan-unsupported-platform-");
+		ProjectionScanTestHooks.platform = "darwin";
+		await fs.writeFile(path.join(dir, "foreign.json"), JSON.stringify({ session_id: "foreign" }));
+
+		const scan = await listCoordinatorJsonFiles(dir);
+
+		expect(scan.values).toEqual([]);
+		expect(scan.raced).toBe(1);
+		expect(scan.incomplete).toBe(true);
 		expect(scan.capped).toBe(true);
 	});
 
