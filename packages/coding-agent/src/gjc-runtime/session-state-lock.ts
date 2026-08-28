@@ -197,6 +197,37 @@ async function removeTransitionDir(transitionDir: string): Promise<void> {
 	}
 }
 
+function removeOwnedTransitionClaim(
+	nativePath: string,
+	generation: TransitionDirectoryGeneration,
+): boolean {
+	const native = nativeSessionStateLock();
+	const captured = native.snapshotDirectoryTree(nativePath);
+	if (!captured.ok || !captured.snapshot) return captured.code === "not_found";
+	const root = captured.snapshot.entries.find(entry => entry.relativePath === "");
+	if (
+		!root ||
+		root.kind !== "directory" ||
+		root.dev !== String(generation.dev) ||
+		root.ino !== String(generation.ino) ||
+		root.nlink !== String(generation.nlink) ||
+		root.mtimeNs !== String(generation.mtimeNs) ||
+		root.ctimeNs !== String(generation.ctimeNs)
+	)
+		return false;
+	const removed = native.exactRemoveDirectoryTree(nativePath, captured.snapshot);
+	return (
+		removed.ok ||
+		removed.code === "not_found" ||
+		(removed.code === "cleanup_pending" &&
+			removed.payloadDurable === true &&
+			removed.detachedPath === `${nativePath}.removing` &&
+			removed.retainedSuccessorPath === undefined &&
+			removed.retainedUnknownPath === undefined &&
+			removed.retainedPlaceholderPath === undefined)
+	);
+}
+
 async function transitionRecoveryKey(transitionDir: string): Promise<string> {
 	try {
 		return path.normalize(await fs.realpath(transitionDir));
@@ -1618,16 +1649,20 @@ async function withLockPathTransition<T>(lockFile: string, transition: () => Pro
 			}
 			try {
 				// If no owner pathname exists, setup never established an owner and
-				// this claim can be removed safely. Use lstat only: an unsupported
-				// owner-access strategy must not prevent this ownerless cleanup, and
-				// any existing regular/malformed/symlink record remains fenced.
+				// this claim can be removed only when its captured directory identity
+				// still matches. A raw rmdir could delete an empty successor claim.
 				const ownerStat = await fs.lstat(ownerFile).catch(error => {
 					if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
 					throw error;
 				});
 				if (!ownerStat) {
-					await removeTransitionDir(transitionDir);
-					clearPendingTransitionRelease(recoveryKey, pending);
+					if (
+						pending?.nativePath &&
+						pending.generation &&
+						removeOwnedTransitionClaim(pending.nativePath, pending.generation)
+					) {
+						clearPendingTransitionRelease(recoveryKey, pending);
+					}
 				}
 			} catch {
 				if (pending) pending.recoverable = true;

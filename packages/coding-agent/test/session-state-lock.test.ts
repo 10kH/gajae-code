@@ -1698,6 +1698,29 @@ describe("coordinator session state lock", () => {
 		await fs.rm(transitionDir, { recursive: true, force: true });
 	});
 
+	it("does not delete an empty successor after owner setup fails", async () => {
+		const { stateFile } = await seededRunningSession("lock-transition-owner-successor");
+		const transitionDir = `${stateFile}.lock.transition`;
+		let faulted = false;
+		SessionStateLockTestHooks.ownerRecordWriteFault = async ownerFile => {
+			if (ownerFile !== `${transitionDir}.owner` || faulted) return;
+			faulted = true;
+			await fs.rm(transitionDir, { recursive: true, force: true });
+			await fs.mkdir(transitionDir);
+			const successorTime = new Date("2026-02-01T00:00:00.000Z");
+			await fs.utimes(transitionDir, successorTime, successorTime);
+			throw new Error("owner setup fault");
+		};
+
+		await expect(withSessionStateFileLock(stateFile, async () => "entered")).rejects.toBeInstanceOf(
+			SessionStateLockUnavailableError,
+		);
+		expect(faulted).toBe(true);
+		expect(fsSync.existsSync(transitionDir)).toBe(true);
+		expect((await fs.stat(transitionDir)).isDirectory()).toBe(true);
+		await fs.rm(transitionDir, { recursive: true, force: true });
+	});
+
 	it("retains the generation record when release-owner capture faults before rewrite", async () => {
 		const { stateFile } = await seededRunningSession("lock-transition-release-capture-fault");
 		const transitionDir = `${stateFile}.lock.transition`;
@@ -1891,9 +1914,8 @@ describe("coordinator session state lock", () => {
 
 		expect(fsSync.lstatSync(lockFile).isFile()).toBe(true);
 		expect(await fs.readFile(lockFile, "utf8")).toBe(record);
-		// And nothing was left claimed on the way out: no unreleasable record strands the
-		// pathname for the next contender once the primitive is back.
-		expect(fsSync.existsSync(`${lockFile}.transition`)).toBe(false);
+		// The transition claim stays fail-closed while identity-bound deletion is unavailable.
+		expect(fsSync.existsSync(`${lockFile}.transition`)).toBe(true);
 	});
 
 	it("keeps the namespace mutation lock directory-style", async () => {
@@ -2100,7 +2122,8 @@ describe("coordinator session state lock", () => {
 			);
 
 			expect(await fs.readFile(lockFile, "utf8")).toBe(record);
-			expect(fsSync.existsSync(`${lockFile}.transition`)).toBe(false);
+		// The transition claim remains fail-closed when no safe owner strategy exists.
+			expect(fsSync.existsSync(`${lockFile}.transition`)).toBe(true);
 		});
 	});
 });
