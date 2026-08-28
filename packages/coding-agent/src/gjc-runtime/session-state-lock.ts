@@ -1085,24 +1085,27 @@ async function releaseTransitionClaim(
 		generation: transitionGeneration,
 		held,
 		releasedOwner,
+		recoverable: false,
 	});
-	await SessionStateLockTestHooks.beforeCurrentOwnerRelease?.(ownerFile);
-	const current = await captureRegularLockOwner(ownerFile);
-	if (!current || !sameLockOwnerSnapshot(current, held))
-		throw new SessionStateLockUnavailableError(new Error("Transition owner changed before release."));
-	await SessionStateLockTestHooks.afterCurrentOwnerValidation?.(ownerFile);
-	await rewriteHeldOwnerRecord(ownerFile, held, releasedOwner);
-	await SessionStateLockTestHooks.beforeTransitionReleaseLstat?.(transitionDir);
-	const currentTransition = await fs.lstat(transitionDir, { bigint: true });
-	if (
-		!currentTransition.isDirectory() ||
-		!sameTransitionGeneration(transitionGenerationFromStat(currentTransition), transitionGeneration)
-	)
-		throw new SessionStateLockUnavailableError(new Error("Transition claim changed before release."));
 	try {
+		await SessionStateLockTestHooks.beforeCurrentOwnerRelease?.(ownerFile);
+		const current = await captureRegularLockOwner(ownerFile);
+		if (!current || !sameLockOwnerSnapshot(current, held))
+			throw new SessionStateLockUnavailableError(new Error("Transition owner changed before release."));
+		await SessionStateLockTestHooks.afterCurrentOwnerValidation?.(ownerFile);
+		await rewriteHeldOwnerRecord(ownerFile, held, releasedOwner);
+		await SessionStateLockTestHooks.beforeTransitionReleaseLstat?.(transitionDir);
+		const currentTransition = await fs.lstat(transitionDir, { bigint: true });
+		if (
+			!currentTransition.isDirectory() ||
+			!sameTransitionGeneration(transitionGenerationFromStat(currentTransition), transitionGeneration)
+		)
+			throw new SessionStateLockUnavailableError(new Error("Transition claim changed before release."));
 		await removeTransitionDir(transitionDir);
 		pendingTransitionReleases.delete(recoveryKey);
 	} catch (error) {
+		const currentPending = pendingTransitionReleases.get(recoveryKey);
+		if (currentPending && currentPending.held === held) currentPending.recoverable = true;
 		throw error;
 	}
 }
