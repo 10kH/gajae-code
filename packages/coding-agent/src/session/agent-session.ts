@@ -5236,7 +5236,10 @@ export class AgentSession {
 	 * seen.
 	 */
 	#coordinatorToolObservations = new WeakMap<object, CoordinatorToolObservation>();
-	#agentEventAdmission = new WeakMap<object, { scope?: AttemptScope; sdkRunToken?: string }>();
+	#agentEventAdmission = new WeakMap<
+		object,
+		{ scope?: AttemptScope; sdkRunToken?: string; persistGeneration: number }
+	>();
 
 	/**
 	 * Capture what is true at the SYNCHRONOUS agent-event boundary, before any async work.
@@ -5295,6 +5298,7 @@ export class AgentSession {
 		this.#agentEventAdmission.set(event, {
 			scope: this.#activeAttemptScope,
 			sdkRunToken: this.#activeSdkRunToken,
+			persistGeneration: this.#coordinatorPersistGeneration,
 		});
 		// First statement of the listener: the observation must precede every claim,
 		// reservation, and async hop this handler performs.
@@ -5423,7 +5427,7 @@ export class AgentSession {
 			cwd: this.sessionManager.getCwd(),
 			sessionFile: this.sessionManager.getSessionFile(),
 		};
-		const generation = this.#coordinatorPersistGeneration;
+		const generation = this.#agentEventAdmission.get(event)?.persistGeneration ?? this.#coordinatorPersistGeneration;
 		const run = () =>
 			generation === this.#coordinatorPersistGeneration
 				? this.#persistRuntimeStateInBackground(event, context, observation)
