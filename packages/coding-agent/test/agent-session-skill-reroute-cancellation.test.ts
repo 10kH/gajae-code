@@ -10,8 +10,8 @@ import { modeStatePath } from "@gajae-code/coding-agent/gjc-runtime/session-layo
 import { readVisibleSkillActiveState } from "@gajae-code/coding-agent/hooks/skill-state";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
-import { createSdkRunCapability } from "@gajae-code/coding-agent/session/sdk-run-capability";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { createSdkRunCapability } from "../src/session/sdk-run-capability";
 
 let session: AgentSession | undefined;
 let authStorage: AuthStorage | undefined;

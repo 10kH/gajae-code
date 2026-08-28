@@ -127,6 +127,8 @@
 		"./slash-commands/helpers/mcp": null,
 		"./session/session-manager-internal": null,
 		"./session/session-manager-internal.js": null,
+		"./session/sdk-run-capability": null,
+		"./session/sdk-run-capability.js": null,
 		"./sdk": {
 			"types": "./src/sdk/index.ts",
 			"import": "./src/sdk/index.ts"

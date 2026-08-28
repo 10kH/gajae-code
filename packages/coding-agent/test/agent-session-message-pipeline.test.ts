@@ -10,8 +10,8 @@ import {
 	type AgentSessionEvent,
 	WorkerIntegrationRequestScheduler,
 } from "@gajae-code/coding-agent/session/agent-session";
-import { createSdkRunCapability } from "@gajae-code/coding-agent/session/sdk-run-capability";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { createSdkRunCapability } from "../src/session/sdk-run-capability";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
 function eventDelta(event: AgentSessionEvent): string {

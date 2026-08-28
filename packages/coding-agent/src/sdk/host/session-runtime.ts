@@ -4400,6 +4400,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			api,
 			reconciliation,
 			(kind, correlation, connectionId, startsOwnTurn, sdkRunToken) => {
+				// Arm the acceptance lease before secondary lifecycle bookkeeping.
+				// A projection failure must never suppress the pre-agent_start bound.
+				if (startsOwnTurn && kind === "prompt") deadlineManager.onAccepted(correlation);
 				const owner = lifecycleOwnerHolder.state;
 				if (lifecycleOwnerHolder.quiescing) {
 					terminalizeAbandonedSubmission(kind, correlation, {
@@ -4428,7 +4431,6 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				// promotion/agent_start instead, so a prompt waiting behind a
 				// legitimately long turn never false-fires. The agent_start
 				// re-entry in emitLifecycle is a no-op for an existing lease.
-				if (startsOwnTurn && kind === "prompt") deadlineManager.onAccepted(correlation);
 			},
 			steerReconciliation,
 			(kind, correlation, connectionId, sdkRunToken, promotion) => {

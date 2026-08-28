@@ -8,10 +8,10 @@ import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
-import { createSdkRunCapability } from "@gajae-code/coding-agent/session/sdk-run-capability";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
 import { z } from "zod";
+import { createSdkRunCapability } from "../src/session/sdk-run-capability";
 
 /**
  * Issue #4668 — production-path coverage for queued-promotion run identity.

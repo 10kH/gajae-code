@@ -3855,6 +3855,17 @@ export class AgentSession {
 		lease: RunResourceProducerLease | undefined,
 		workerIntegrationSettled: boolean,
 	): Promise<void> {
+		const publicationContext = {
+			sessionId: this.sessionId,
+			cwd: this.sessionManager.getCwd(),
+			sessionFile: this.sessionManager.getSessionFile(),
+		};
+		const publicationScope = (pending as AgentSessionEvent & { scope?: AttemptScopeRef }).scope as
+			| AttemptScope
+			| undefined;
+		const publicationCorrelationId = publicationScope
+			? this.#sdkRunTokensByAttemptScope.get(publicationScope)
+			: undefined;
 		let extensionDelivery: Promise<void> | undefined;
 		const releaseLease = () => {
 			if (!lease) return;
@@ -3883,12 +3894,23 @@ export class AgentSession {
 			const terminalPersistence = this.#queueCoordinatorRuntimeStatePersist(pending, true);
 			this.#emit(pending);
 			void terminalPersistence.then(
-				() => this.#recordPostPublicationOutcome(pending, "terminal_persistence", { status: "completed" }),
+				() =>
+					this.#recordPostPublicationOutcome(
+						publicationContext,
+						publicationCorrelationId,
+						"terminal_persistence",
+						{ status: "completed" },
+					),
 				error => {
-					this.#recordPostPublicationOutcome(pending, "terminal_persistence", {
-						status: "failed",
-						error: String(error),
-					});
+					this.#recordPostPublicationOutcome(
+						publicationContext,
+						publicationCorrelationId,
+						"terminal_persistence",
+						{
+							status: "failed",
+							error: String(error),
+						},
+					);
 					logger.warn("Failed to persist terminal coordinator runtime state", { error: String(error) });
 				},
 			);
@@ -3902,14 +3924,24 @@ export class AgentSession {
 				await extensionDelivery;
 				workerIntegration = this.#flushWorkerIntegrationForAgentEnd();
 				void workerIntegration.then(outcome =>
-					this.#recordPostPublicationOutcome(pending, "worker_integration", outcome),
+					this.#recordPostPublicationOutcome(
+						publicationContext,
+						publicationCorrelationId,
+						"worker_integration",
+						outcome,
+					),
 				);
 				void terminalPersistence.catch(error =>
 					logger.warn("Terminal persistence continued after SDK publication", { error }),
 				);
 			} else {
 				const outcome = await workerIntegration!;
-				this.#recordPostPublicationOutcome(pending, "worker_integration", outcome);
+				this.#recordPostPublicationOutcome(
+					publicationContext,
+					publicationCorrelationId,
+					"worker_integration",
+					outcome,
+				);
 			}
 		};
 		try {
@@ -5451,19 +5483,13 @@ export class AgentSession {
 	#coordinatorPersistQueue: Promise<void> = Promise.resolve();
 
 	#recordPostPublicationOutcome(
-		event: AgentSessionEvent,
+		context: { sessionId: string; cwd: string; sessionFile: string | undefined },
+		correlationId: string | undefined,
 		kind: "worker_integration" | "terminal_persistence",
 		outcome: { status: "completed" | "failed" | "timed_out"; error?: string },
 	): void {
-		const sdkRunToken =
-			(event as AgentSessionEvent & { sdkRunToken?: unknown }).sdkRunToken ??
-			((event as AgentSessionEvent & { scope?: AttemptScopeRef }).scope
-				? this.#sdkRunTokensByAttemptScope.get(
-						(event as AgentSessionEvent & { scope?: AttemptScopeRef }).scope as AttemptScope,
-					)
-				: undefined);
 		if (outcome.status !== "completed") {
-			const correlation = typeof sdkRunToken === "string" ? sdkRunToken : this.sessionId;
+			const correlation = correlationId ?? context.sessionId;
 			this.#emit({
 				type: "notice",
 				level: "error",
@@ -5471,14 +5497,9 @@ export class AgentSession {
 				message: `${kind} ${outcome.status} for ${correlation}${outcome.error ? `: ${outcome.error}` : ""}`,
 			});
 		}
-		void persistCoordinatorWorkerIntegrationOutcome(
-			{
-				sessionId: this.sessionId,
-				cwd: this.sessionManager.getCwd(),
-				sessionFile: this.sessionManager.getSessionFile(),
-			},
-			{ ...outcome, kind, correlationId: typeof sdkRunToken === "string" ? sdkRunToken : undefined },
-		).catch(error => logger.warn("Failed to persist terminal reconciliation outcome", { error: String(error) }));
+		void persistCoordinatorWorkerIntegrationOutcome(context, { ...outcome, kind, correlationId }).catch(error =>
+			logger.warn("Failed to persist terminal reconciliation outcome", { error: String(error) }),
+		);
 	}
 
 	/**
@@ -10889,7 +10910,7 @@ export class AgentSession {
 										? { onPreflightAcceptCommit: options.onPreflightAcceptCommit }
 										: {}),
 									...(options?.preflightSignal ? { preflightSignal: options.preflightSignal } : {}),
-									...(internalOptions?.sdkRunToken ? { sdkRunToken: internalOptions.sdkRunToken } : {}),
+									...(options?.sdkRunCapability ? { sdkRunCapability: options.sdkRunCapability } : {}),
 								}
 							: undefined,
 					);
