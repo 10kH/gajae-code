@@ -3072,8 +3072,6 @@ export class AsyncJobManager {
 		while (this.#deadLetteredDeliveries.size > MAX_DEAD_LETTERED_DELIVERIES) {
 			const oldestJobId = this.#deadLetteredDeliveries.keys().next().value;
 			if (oldestJobId === undefined) return;
-			const oldestOwner = this.#deadLetteredDeliveryOwners.get(oldestJobId);
-			this.#recordDeadLetterOverflow(oldestOwner);
 			this.#deadLetteredDeliveries.delete(oldestJobId);
 			this.#deadLetteredDeliveryOwners.delete(oldestJobId);
 		}
