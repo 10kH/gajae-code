@@ -1728,14 +1728,9 @@ async function withLockPathTransition<T>(
 			throw new SessionStateLockUnavailableError(new Error("Transition claim generation unavailable."));
 		let held: LockOwnerSnapshot;
 		try {
-			held = await acquireOwnerLock(
-				ownerFile,
-				owner,
-				quarantineName,
-				failedHeld => {
-					pendingSetup.held = failedHeld;
-				},
-			);
+			held = await acquireOwnerLock(ownerFile, owner, quarantineName, failedHeld => {
+				pendingSetup.held = failedHeld;
+			});
 		} catch (error) {
 			const pending = pendingTransitionReleases.get(recoveryKey);
 			// `acquireOwnerLock` owns the only descriptor that can authorize
