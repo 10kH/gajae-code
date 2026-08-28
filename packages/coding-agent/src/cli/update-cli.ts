@@ -17,6 +17,8 @@ import { isUpdateChannel, UPDATE_CHANNELS, type UpdateChannel } from "../config/
 import { installDefaultGjcDefinitions } from "../defaults/gjc-defaults";
 import { theme } from "../modes/theme/theme";
 import { getNotificationConfig, type NotificationProvider, resolveNotificationProvider } from "../sdk/bus/config";
+import type { TelemetryDetails, TelemetryEventName } from "../telemetry";
+import { recordTelemetryEvent } from "../telemetry";
 import { runDaemonCommand } from "./daemon-cli";
 import {
 	fetchGithubChannelRelease,
@@ -1142,6 +1144,7 @@ export interface UpdateCommandDependencies {
 	restartDaemon?: (settings: Settings) => Promise<void>;
 	recoverNotifications?: (settings: Settings) => Promise<void>;
 	runPostUpdateRecovery?: (runtimePath: string) => Promise<void>;
+	recordTelemetryEvent?: (event: TelemetryEventName, details: TelemetryDetails) => unknown;
 	exit?: (code: number) => never;
 }
 
@@ -1363,6 +1366,24 @@ export async function runUpdateCommand(
 	const update = deps.performUpdate ?? performUpdate;
 	const refreshDefaults = deps.refreshInstalledDefaultSkills ?? refreshInstalledDefaultSkills;
 	const exit = deps.exit ?? process.exit;
+	const recordEvent = deps.recordTelemetryEvent ?? ((event, details) => recordTelemetryEvent(event, details));
+	const pendingTelemetry = new Set<Promise<void>>();
+	const record = (event: TelemetryEventName, details: TelemetryDetails): void => {
+		const result = recordEvent(event, details);
+		if (result !== null && (typeof result === "object" || typeof result === "function") && "then" in result) {
+			const pending = Promise.resolve(result as PromiseLike<unknown>).then(
+				() => undefined,
+				() => undefined,
+			);
+			pendingTelemetry.add(pending);
+			void pending.finally(() => pendingTelemetry.delete(pending));
+		}
+	};
+	const flushTelemetryBeforeExit = async (): Promise<never> => {
+		await Promise.race([Promise.allSettled([...pendingTelemetry]), Bun.sleep(2000)]);
+		return exit(1);
+	};
+	record("update_check_started", { channel });
 
 	console.log(chalk.dim(`Current version: ${VERSION}`));
 	if (channel !== "stable") {
@@ -1373,16 +1394,18 @@ export async function runUpdateCommand(
 	try {
 		target = await resolveTarget();
 	} catch (err) {
+		record("update_check_completed", { channel, result: "failed" });
 		console.error(chalk.red(err instanceof Error ? err.message : String(err)));
-		return exit(1);
+		return flushTelemetryBeforeExit();
 	}
 
 	let release: ReleaseInfo;
 	try {
 		release = await lookupRelease({ channel });
 	} catch (err) {
+		record("update_check_completed", { channel, result: "failed" });
 		console.error(chalk.red(`Failed to check for updates: ${err}`));
-		return exit(1);
+		return flushTelemetryBeforeExit();
 	}
 
 	// A config file that exists but could not be read changes which registry
@@ -1395,12 +1418,13 @@ export async function runUpdateCommand(
 	try {
 		comparison = compareVersions(release.version, VERSION);
 	} catch (err) {
+		record("update_check_completed", { channel, result: "failed" });
 		console.error(
 			chalk.red(
 				`Failed to check for updates: the ${channel} channel reported an unparseable version "${release.version}": ${err instanceof Error ? err.message : String(err)}`,
 			),
 		);
-		return exit(1);
+		return flushTelemetryBeforeExit();
 	}
 
 	const decision = resolveUpdateDecision({
@@ -1416,7 +1440,10 @@ export async function runUpdateCommand(
 		try {
 			const verification = await verifyTarget(release, target.path);
 			if (verification.ok) {
+				record("update_check_completed", { channel, result: "available" });
+				record("update_install_started", { channel, installMethod: target.method });
 				printVerifiedMigrationTarget(target, release.version);
+				record("update_install_completed", { channel, result: "installed", installMethod: target.method });
 				return;
 			}
 		} finally {
@@ -1425,6 +1452,7 @@ export async function runUpdateCommand(
 	}
 
 	if (!decision.install) {
+		record("update_check_completed", { channel, result: "up_to_date" });
 		console.log(chalk.green(`${theme.status.success} Already up to date`));
 		return;
 	}
@@ -1439,9 +1467,14 @@ export async function runUpdateCommand(
 		console.log(chalk.yellow(`Forcing reinstall of ${release.version}`));
 	}
 
-	if (opts.check) return;
+	record("update_check_completed", { channel, result: "available" });
+	if (opts.check) {
+		record("update_install_completed", { channel, result: "skipped" });
+		return;
+	}
 
 	let installedVersion: string | undefined;
+	record("update_install_started", { channel, installMethod: target.method });
 	try {
 		const resolved = target ?? (await resolveTarget());
 		const verification = await update(resolved, release.version, release.registry);
@@ -1450,16 +1483,18 @@ export async function runUpdateCommand(
 			await (deps.runPostUpdateRecovery ?? runPostUpdateRecovery)(verification.path);
 		} else if (!deps.performUpdate) throw new Error("verified installed runtime path is unavailable");
 	} catch (err) {
+		record("update_install_failed", { channel, result: "failed", installMethod: target.method });
 		const prefix = installedVersion
 			? `Updated to ${installedVersion}, but post-update recovery failed`
 			: "Update failed";
 		console.error(chalk.red(`${prefix}: ${err}`));
-		return exit(1);
+		return flushTelemetryBeforeExit();
 	}
 
 	// The installed runtime completes recovery before this old updater process
 	// refreshes opt-in local definitions, avoiding stale-module daemon control.
 	await refreshDefaults();
+	record("update_install_completed", { channel, result: "installed", installMethod: target.method });
 }
 
 /**

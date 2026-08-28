@@ -1413,6 +1413,17 @@
 			"description": "Predict your likely next prompt after each turn (smol-model call) and show it as ghost text; Tab accepts",
 			"default": false
 		},
+		"telemetry": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Send minimal allowlisted update and adoption events. Disabled by default; no prompts, paths, environment, identity, or arbitrary errors are collected.",
+					"default": false
+				}
+			},
+			"additionalProperties": false
+		},
 		"starReminder": {
 			"type": "object",
 			"properties": {
