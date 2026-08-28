@@ -146,6 +146,7 @@ export const TIER_MAP_SKIP_LIST = {
 	},
 	"vercel-ai-gateway/google/gemini-3.7-flash": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"zai/glm-5.3": { rationale: "post-rebase catalog addition from dev; not yet curated" },
+	"zai/glm-5.3-flash": { rationale: "post-feature catalog addition; not yet curated" },
 	"cursor/gemini-3.7-flash-high": {
 		rationale: "post-rebase catalog addition from dev; not yet curated",
 	},
