@@ -225,6 +225,28 @@ describe("coordinator session state lock", () => {
 		expect((await readJson(stateFile)).activity).toMatchObject({ seq: 1, tool: "bash" });
 	});
 
+	it("keeps session-state parents, transition claims, and owner records restrictive under umask", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "nested", "session", "state.json");
+		const previousUmask = process.umask(0o777);
+		try {
+			SessionStateLockTestHooks.afterCurrentOwnerValidation = async file => {
+				if (file !== `${stateFile}.lock`) return;
+				expect((await fs.stat(`${stateFile}.lock.transition`)).mode & 0o777).toBe(0o700);
+				expect((await fs.stat(`${stateFile}.lock.transition.owner`)).mode & 0o777).toBe(0o600);
+				SessionStateLockTestHooks.afterCurrentOwnerValidation = undefined;
+			};
+			await withSessionStateFileLock(stateFile, async () => {
+				for (const directory of [path.dirname(stateFile), path.dirname(path.dirname(stateFile))]) {
+					expect((await fs.stat(directory)).mode & 0o777).toBe(0o700);
+				}
+				expect((await fs.stat(`${stateFile}.lock`)).mode & 0o777).toBe(0o600);
+			});
+		} finally {
+			process.umask(previousUmask);
+		}
+	});
+
 	it("never creates a lock directory that would strand a base regular-file writer", async () => {
 		const { root, stateFile } = await seededRunningSession("lock-no-enotdir");
 		const observed: Array<string | undefined> = [];
@@ -1496,6 +1518,26 @@ describe("coordinator session state lock", () => {
 		expect(await withSessionStateFileLock(stateFile, async () => "reacquired")).toBe("reacquired");
 	});
 
+	it("repairs a partial primary-owner rewrite before releasing its transition claim", async () => {
+		const { stateFile } = await seededRunningSession("lock-primary-rewrite-partial");
+		const lockFile = `${stateFile}.lock`;
+		await withSessionStateFileLock(stateFile, async () => undefined);
+		let faulted = false;
+		SessionStateLockTestHooks.beforeOwnerRecordRewrite = async file => {
+			if (file !== lockFile || faulted) return;
+			faulted = true;
+			await fs.writeFile(file, '{"pid":');
+			throw Object.assign(new Error("partial primary rewrite"), { code: "EIO" });
+		};
+
+		await expect(withSessionStateFileLock(stateFile, async () => "unreachable")).rejects.toBeInstanceOf(
+			SessionStateLockUnavailableError,
+		);
+		expect(faulted).toBe(true);
+		expect(fsSync.existsSync(`${lockFile}.transition`)).toBe(false);
+		await expect(withSessionStateFileLock(stateFile, async () => "reacquired")).resolves.toBe("reacquired");
+	});
+
 	it("returns a successful transition result without replaying after transient claim cleanup", async () => {
 		const { stateFile } = await seededRunningSession("lock-transition-release-retry");
 		const transitionDir = `${stateFile}.lock.transition`;
@@ -1543,6 +1585,47 @@ describe("coordinator session state lock", () => {
 		expect(fsSync.existsSync(transitionDir)).toBe(false);
 	});
 
+	it("uses the canonical physical transition path during pending recovery", async () => {
+		const root = await tempRoot();
+		const realParent = path.join(root, "real");
+		const aliasParent = path.join(root, "alias");
+		await fs.mkdir(realParent);
+		await fs.symlink(realParent, aliasParent, "dir");
+		const realStateFile = path.join(realParent, "state.json");
+		const aliasStateFile = path.join(aliasParent, "state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = aliasStateFile;
+		setSystemTime(new Date("2026-03-01T00:00:00.000Z"));
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "turn_start" },
+			{ sessionId: SESSION_ID, cwd: root, sessionFile: null },
+		);
+
+		let faulted = false;
+		SessionStateLockTestHooks.beforeTransitionReleaseLstat = async target => {
+			if (target === `${aliasStateFile}.lock.transition` && !faulted) {
+				faulted = true;
+				throw Object.assign(new Error("pending release"), { code: "EIO" });
+			}
+		};
+		const nativeTargets: string[] = [];
+		setSessionStateLockNativeBindings(() => ({
+			...exactIdentityNativeBindings,
+			snapshotDirectoryTree(target) {
+				nativeTargets.push(target);
+				return exactIdentityNativeBindings.snapshotDirectoryTree(target);
+			},
+			exactRemoveDirectoryTree(target, snapshot) {
+				nativeTargets.push(target);
+				return exactIdentityNativeBindings.exactRemoveDirectoryTree(target, snapshot);
+			},
+		}));
+
+		await expect(withSessionStateFileLock(aliasStateFile, async () => "recovered")).resolves.toBe("recovered");
+		expect(faulted).toBe(true);
+		expect(nativeTargets.length).toBeGreaterThan(0);
+		expect(nativeTargets.every(target => target === `${realStateFile}.lock.transition`)).toBe(true);
+	});
+
 	it("cleans a transition claim when setup generation lstat faults", async () => {
 		const { stateFile } = await seededRunningSession("lock-transition-setup-lstat-fault");
 		const transitionDir = `${stateFile}.lock.transition`;
@@ -1560,6 +1643,31 @@ describe("coordinator session state lock", () => {
 		expect(faulted).toBe(true);
 		expect(fsSync.existsSync(transitionDir)).toBe(false);
 		await expect(withSessionStateFileLock(stateFile, async () => "reacquired")).resolves.toBe("reacquired");
+	});
+
+	it("does not delete a successor after setup generation capture faults", async () => {
+		const { stateFile } = await seededRunningSession("lock-transition-setup-successor");
+		const transitionDir = `${stateFile}.lock.transition`;
+		let faulted = false;
+		SessionStateLockTestHooks.beforeTransitionSetupLstat = async target => {
+			if (target !== transitionDir || faulted) return;
+			faulted = true;
+			await fs.rm(transitionDir, { recursive: true, force: true });
+			await fs.mkdir(transitionDir);
+			await fs.writeFile(
+				`${transitionDir}.owner`,
+				JSON.stringify({ pid: DEAD_PID, start_time: "unknown", token: "successor" }),
+			);
+			throw Object.assign(new Error("setup generation capture fault"), { code: "EIO" });
+		};
+
+		await expect(withSessionStateFileLock(stateFile, async () => "entered")).rejects.toBeInstanceOf(
+			SessionStateLockUnavailableError,
+		);
+		expect(faulted).toBe(true);
+		expect(fsSync.existsSync(transitionDir)).toBe(true);
+		expect(await fs.readFile(`${transitionDir}.owner`, "utf8")).toContain("successor");
+		await fs.rm(transitionDir, { recursive: true, force: true });
 	});
 
 	it("retains the generation record when release-owner capture faults before rewrite", async () => {

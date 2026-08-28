@@ -5892,7 +5892,8 @@ mod platform {
 	use windows_sys::Win32::{
 		Foundation::{
 			CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_FILE_NOT_FOUND,
-			ERROR_PATH_NOT_FOUND, GENERIC_ALL, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+			ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION, GENERIC_ALL, GetLastError, HANDLE,
+			INVALID_HANDLE_VALUE, LocalFree,
 		},
 		Security::{
 			ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION, ACL_SIZE_INFORMATION,
@@ -5999,6 +6000,7 @@ mod platform {
 	fn last_error_code() -> &'static str {
 		match unsafe { GetLastError() } {
 			ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => "not_found",
+			ERROR_SHARING_VIOLATION => "sharing_violation",
 			_ => "io_error",
 		}
 	}
@@ -6259,6 +6261,7 @@ mod platform {
 		match status as u32 {
 			0xc000_0034 | 0xc000_003a => "not_found",
 			0xc000_0035 => "quarantine_collision",
+			0xc000_0043 => "sharing_violation",
 			0xc000_0022 => "owner_mismatch",
 			0xc000_050b => "reparse_point",
 			0xc000_00d4 => "atomic_unavailable",

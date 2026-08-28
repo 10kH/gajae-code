@@ -8,9 +8,9 @@ import type {
 	NativeExactUnlinkResult,
 } from "@gajae-code/natives";
 import {
+	type GenericFileLockDirIdentity,
 	genericFileLockDirStaleVerdict,
 	processStartTime as portableProcessStartTime,
-	type GenericFileLockDirIdentity,
 } from "../config/file-lock";
 import { loadInstallationHostId, loadLegacyInstallationHostId } from "../config/machine-identity";
 import { readLinuxProcStartTimeSync } from "./linux-proc";
@@ -60,7 +60,7 @@ const LOCK_STALE_MS = 30_000;
 const LOCK_TRANSITION_RESOURCE_SUFFIX = ".transition";
 const LINUX_PROC_START_TIME_FORMAT = "linux-proc-v1";
 const PORTABLE_START_TIME_FORMAT = "ps-utc-v1";
-const TRANSIENT_LOCK_ERROR_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
+const TRANSIENT_LOCK_ERROR_CODES = new Set(["EPERM", "EACCES", "EBUSY", "ENOTEMPTY", "sharing_violation"]);
 
 interface TransitionDirectoryGeneration {
 	dev: bigint;
@@ -72,20 +72,14 @@ interface TransitionDirectoryGeneration {
 }
 
 const TRANSITION_DIRECTORY_OPEN_FLAGS =
-	fsSync.constants.O_RDONLY |
-	(fsSync.constants.O_DIRECTORY ?? 0) |
-	(fsSync.constants.O_NOFOLLOW ?? 0);
+	fsSync.constants.O_RDONLY | (fsSync.constants.O_DIRECTORY ?? 0) | (fsSync.constants.O_NOFOLLOW ?? 0);
 
-async function captureTransitionDirectoryGeneration(transitionDir: string): Promise<TransitionDirectoryGeneration> {
-	let handle: fs.FileHandle | undefined;
-	try {
-		handle = await fs.open(transitionDir, TRANSITION_DIRECTORY_OPEN_FLAGS);
-		const stat = await handle.stat({ bigint: true });
-		if (!stat.isDirectory()) throw new Error("Transition claim is no longer a directory.");
-		return transitionGenerationFromStat(stat as fsSync.BigIntStats);
-	} finally {
-		await handle?.close().catch(() => undefined);
-	}
+async function captureTransitionDirectoryGenerationFromHandle(
+	handle: fs.FileHandle,
+): Promise<TransitionDirectoryGeneration> {
+	const stat = await handle.stat({ bigint: true });
+	if (!stat.isDirectory()) throw new Error("Transition claim is no longer a directory.");
+	return transitionGenerationFromStat(stat as fsSync.BigIntStats);
 }
 
 function transitionGenerationFromStat(stat: fsSync.BigIntStats): TransitionDirectoryGeneration {
@@ -103,6 +97,14 @@ interface PendingTransitionRelease {
 	phase: "setup" | "release";
 	token: string;
 	generation?: TransitionDirectoryGeneration;
+	/** A no-follow descriptor captured immediately after mkdir. This remains the
+	 * authority when setup generation capture itself faults or the pathname is
+	 * replaced before recovery gets to run. */
+	generationHandle?: fs.FileHandle;
+	/** Descriptor retained when a rewrite fault defeats immediate repair. */
+	repairHandle?: fs.FileHandle;
+	repairBytes?: string;
+	repairSnapshot?: LockOwnerSnapshot;
 	held?: LockOwnerSnapshot;
 	releasedOwner?: SessionStateLockOwner;
 	recoverable: boolean;
@@ -110,6 +112,62 @@ interface PendingTransitionRelease {
 }
 
 const pendingTransitionReleases = new Map<string, PendingTransitionRelease>();
+
+function clearPendingTransitionRelease(key: string, pending?: PendingTransitionRelease): void {
+	const current = pendingTransitionReleases.get(key);
+	if (pending !== undefined && current !== pending) return;
+	pendingTransitionReleases.delete(key);
+	const handle = (pending ?? current)?.generationHandle;
+	if (handle) {
+		(pending ?? current)!.generationHandle = undefined;
+		void handle.close().catch(() => undefined);
+	}
+	const repairHandle = (pending ?? current)?.repairHandle;
+	if (repairHandle) {
+		(pending ?? current)!.repairHandle = undefined;
+		void repairHandle.close().catch(() => undefined);
+	}
+}
+
+async function repairPendingOwnerRecord(pending: PendingTransitionRelease): Promise<boolean> {
+	const handle = pending.repairHandle;
+	if (!handle || pending.repairBytes === undefined) return true;
+	try {
+		await writeOwnerBytes(handle, Buffer.from(pending.repairBytes, "utf8"));
+		const stat = await handle.stat({ bigint: true });
+		pending.repairSnapshot = ownerSnapshotFrom(stat, Buffer.from(pending.repairBytes, "utf8"));
+		await handle.close();
+		pending.repairHandle = undefined;
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function ensureSessionStateParent(directory: string): Promise<void> {
+	const missing: string[] = [];
+	let current = path.resolve(directory);
+	for (;;) {
+		try {
+			await fs.lstat(current);
+			break;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			missing.push(current);
+			const parent = path.dirname(current);
+			if (parent === current) throw error;
+			current = parent;
+		}
+	}
+	for (const created of missing.reverse()) {
+		try {
+			await fs.mkdir(created, { mode: 0o700 });
+			await fs.chmod(created, 0o700);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+		}
+	}
+}
 
 function isTransientLockError(error: unknown): boolean {
 	if (
@@ -119,6 +177,10 @@ function isTransientLockError(error: unknown): boolean {
 	)
 		return true;
 	return error instanceof Error && isTransientLockError(error.cause);
+}
+
+function transientNativeResultError(code: string): NodeJS.ErrnoException {
+	return Object.assign(new Error(`Native lock operation is transiently unavailable: ${code}.`), { code });
 }
 
 async function removeTransitionDir(transitionDir: string): Promise<void> {
@@ -152,6 +214,12 @@ async function transitionRecoveryKey(transitionDir: string): Promise<string> {
 	return path.normalize(path.join(canonicalParent, path.basename(transitionDir)));
 }
 
+/** Resolve aliases in the parent while preserving the mutable claim's final name. */
+async function canonicalTransitionPathPreservingFinal(transitionDir: string): Promise<string> {
+	const parent = path.dirname(transitionDir);
+	return path.join(await fs.realpath(parent), path.basename(transitionDir));
+}
+
 function sameTransitionGeneration(left: TransitionDirectoryGeneration, right: TransitionDirectoryGeneration): boolean {
 	return (
 		left.dev === right.dev &&
@@ -171,6 +239,12 @@ interface SessionStateLockOwner {
 	owner_host_id?: string;
 	released?: true;
 }
+
+type OwnerRewriteFailure = Error & {
+	repairSnapshot?: LockOwnerSnapshot;
+	repairHandle?: fs.FileHandle;
+	repairBytes?: string;
+};
 
 /**
  * How a `<file>.lock` owner record can be opened safely on this platform.
@@ -865,13 +939,14 @@ async function createOwnerLock(file: string, owner: SessionStateLockOwner): Prom
 			new Error("Safe owner record creation is unsupported on this platform."),
 		);
 	nativeSessionStateLock();
-	const handle = await fs.open(file, flags);
+	const handle = await fs.open(file, flags, 0o600);
 	const bytes = Buffer.from(JSON.stringify(owner), "utf8");
 	// Taken from the SAME descriptor the exclusive create produced, before anything is
 	// written through it. `O_EXCL` proves the object did not exist a moment ago, so this
 	// pair names the record this call brought into existence and nothing else.
 	let created: OpenOwnerIdentity | null = null;
 	try {
+		await handle.chmod(0o600);
 		created = await openOwnerIdentity(handle);
 		await SessionStateLockTestHooks.ownerRecordWriteFault?.(file);
 		await handle.writeFile(bytes);
@@ -900,6 +975,18 @@ const POSIX_OWNER_REWRITE_FLAGS = POSIX_NOFOLLOW_AVAILABLE
 	? fsSync.constants.O_RDWR | fsSync.constants.O_NONBLOCK | fsSync.constants.O_NOFOLLOW
 	: undefined;
 
+async function writeOwnerBytes(handle: fs.FileHandle, bytes: Buffer): Promise<void> {
+	await handle.truncate(0);
+	let offset = 0;
+	while (offset < bytes.byteLength) {
+		const { bytesWritten } = await handle.write(bytes, offset, bytes.byteLength - offset, offset);
+		if (bytesWritten <= 0) throw new Error("Owner record rewrite made no progress.");
+		offset += bytesWritten;
+	}
+	await handle.truncate(bytes.byteLength);
+	await handle.sync();
+}
+
 async function rewriteHeldOwnerRecord(
 	file: string,
 	held: LockOwnerSnapshot,
@@ -924,6 +1011,9 @@ async function rewriteHeldOwnerRecord(
 	} catch (error) {
 		throw new SessionStateLockUnavailableError(error);
 	}
+	let mutationStarted = false;
+	let rewriteHookPassed = false;
+	let retainRepairHandle = false;
 	try {
 		const opened = await handle.stat({ bigint: true });
 		if (!opened.isFile()) throw new SessionStateLockUnavailableError(new Error("Owner record is not regular."));
@@ -940,23 +1030,13 @@ async function rewriteHeldOwnerRecord(
 			throw new SessionStateLockUnavailableError(new Error("Owner record changed before rewrite."));
 		if (!sameLockOwnerSnapshot(ownerSnapshotFrom(settled, currentBytes), held))
 			throw new SessionStateLockUnavailableError(new Error("Owner record identity changed before rewrite."));
+		await handle.chmod(0o600);
 
 		const replacementBytes = Buffer.from(JSON.stringify(replacement), "utf8");
+		mutationStarted = true;
 		await SessionStateLockTestHooks.beforeOwnerRecordRewrite?.(file);
-		await handle.truncate(0);
-		let offset = 0;
-		while (offset < replacementBytes.byteLength) {
-			const { bytesWritten } = await handle.write(
-				replacementBytes,
-				offset,
-				replacementBytes.byteLength - offset,
-				offset,
-			);
-			if (bytesWritten <= 0) throw new Error("Owner record rewrite made no progress.");
-			offset += bytesWritten;
-		}
-		await handle.truncate(replacementBytes.byteLength);
-		await handle.sync();
+		rewriteHookPassed = true;
+		await writeOwnerBytes(handle, replacementBytes);
 		const rewritten = await handle.stat({ bigint: true });
 		const canonical = await captureRegularLockOwner(file);
 		if (!canonical || canonical.dev !== rewritten.dev || canonical.ino !== rewritten.ino)
@@ -973,13 +1053,54 @@ async function rewriteHeldOwnerRecord(
 		}
 		return canonical;
 	} catch (error) {
+		// Keep the descriptor as the repair authority until the held bytes have
+		// been restored. A truncate/write/fsync fault may leave a malformed or
+		// partially committed record; closing first would force recovery to trust
+		// an unproven pathname and can wedge a successor behind the transition.
+		let repairNeeded = mutationStarted;
+		if (mutationStarted && !rewriteHookPassed) {
+			try {
+				repairNeeded = (await handle.readFile()).toString("utf8") !== held.bytes;
+			} catch {
+				repairNeeded = true;
+			}
+		}
+		if (repairNeeded) {
+			let repaired: LockOwnerSnapshot;
+			try {
+				await writeOwnerBytes(handle, Buffer.from(held.bytes, "utf8"));
+				const repairedStat = await handle.stat({ bigint: true });
+				repaired = ownerSnapshotFrom(repairedStat, Buffer.from(held.bytes, "utf8"));
+			} catch (repairError) {
+				const aggregate = new AggregateError(
+					[error, repairError],
+					"Owner record rewrite failed and its descriptor-bound repair also failed.",
+				);
+				const failure = aggregate as OwnerRewriteFailure;
+				failure.repairHandle = handle;
+				failure.repairBytes = held.bytes;
+				// The finally block must not close this handle: it is now the only
+				// authority capable of repairing the exact inode without trusting its
+				// mutable pathname.
+				retainRepairHandle = true;
+				throw failure;
+			}
+			const wrapped =
+				error instanceof SessionStateLockUnavailableError ? error : new SessionStateLockUnavailableError(error);
+			(wrapped as OwnerRewriteFailure).repairSnapshot = repaired;
+			throw wrapped;
+		}
 		throw error instanceof SessionStateLockUnavailableError ? error : new SessionStateLockUnavailableError(error);
 	} finally {
-		await handle.close().catch(() => undefined);
+		if (!retainRepairHandle) await handle.close().catch(() => undefined);
 	}
 }
 
-async function acquireOwnerLock(file: string, owner: SessionStateLockOwner): Promise<LockOwnerSnapshot> {
+async function acquireOwnerLock(
+	file: string,
+	owner: SessionStateLockOwner,
+	onRewriteFailure?: (held: LockOwnerSnapshot) => void,
+): Promise<LockOwnerSnapshot> {
 	nativeSessionStateLock();
 	try {
 		return await createOwnerLock(file, owner);
@@ -996,7 +1117,12 @@ async function acquireOwnerLock(file: string, owner: SessionStateLockOwner): Pro
 			throw error;
 		}
 		if (!validLockOwner(observed) || observed.released !== true) throw error;
-		return await rewriteHeldOwnerRecord(file, current, owner);
+		try {
+			return await rewriteHeldOwnerRecord(file, current, owner);
+		} catch (error) {
+			onRewriteFailure?.(current);
+			throw error;
+		}
 	}
 }
 
@@ -1127,10 +1253,19 @@ async function releaseTransitionClaim(
 		)
 			throw new SessionStateLockUnavailableError(new Error("Transition claim changed before release."));
 		await removeTransitionDir(transitionDir);
-		pendingTransitionReleases.delete(recoveryKey);
+		clearPendingTransitionRelease(recoveryKey);
 	} catch (error) {
 		const currentPending = pendingTransitionReleases.get(recoveryKey);
-		if (currentPending && currentPending.held === held) currentPending.recoverable = true;
+		if (currentPending && currentPending.held === held) {
+			const rewriteFailure = error as OwnerRewriteFailure;
+			const repaired = rewriteFailure.repairSnapshot;
+			if (repaired && sameLockOwnerObject(repaired, held)) currentPending.held = repaired;
+			if (rewriteFailure.repairHandle) {
+				currentPending.repairHandle = rewriteFailure.repairHandle;
+				currentPending.repairBytes = rewriteFailure.repairBytes ?? held.bytes;
+			}
+			currentPending.recoverable = true;
+		}
 		throw error;
 	}
 }
@@ -1204,13 +1339,13 @@ async function recoverPendingTransitionRelease(transitionDir: string, recoveryKe
 	const recovery = (async (): Promise<boolean> => {
 		const ownerFile = `${transitionDir}.owner`;
 		if (!pending.generation) {
+			// A generation-less pending setup has no pathname authority. The only
+			// safe recovery source is the descriptor retained immediately after mkdir;
+			// never snapshot an arbitrary successor now occupying the alias.
+			if (!pending.generationHandle) return false;
 			try {
-				pending.generation = await captureTransitionDirectoryGeneration(transitionDir);
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-					pendingTransitionReleases.delete(pendingKey);
-					return true;
-				}
+				pending.generation = await captureTransitionDirectoryGenerationFromHandle(pending.generationHandle);
+			} catch {
 				return false;
 			}
 		}
@@ -1221,7 +1356,7 @@ async function recoverPendingTransitionRelease(transitionDir: string, recoveryKe
 			current = await fs.lstat(transitionDir, { bigint: true });
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-				pendingTransitionReleases.delete(pendingKey);
+				clearPendingTransitionRelease(pendingKey, pending);
 				return true;
 			}
 			return false;
@@ -1240,29 +1375,32 @@ async function recoverPendingTransitionRelease(transitionDir: string, recoveryKe
 				ctimeNs: current.ctimeNs,
 			})
 		) {
-			pendingTransitionReleases.delete(pendingKey);
+			clearPendingTransitionRelease(pendingKey, pending);
 			return false;
 		}
+		if (!(await repairPendingOwnerRecord(pending))) return false;
+		if (pending.repairSnapshot && pending.held && sameLockOwnerObject(pending.repairSnapshot, pending.held))
+			pending.held = pending.repairSnapshot;
 		if (pending.phase === "setup") {
 			try {
 				if (pending.held) {
 					const outcome = exactUnlinkOwnerRecord(ownerFile, pending.held);
 					if (outcome !== "removed" && outcome !== "absent") {
-						pendingTransitionReleases.delete(pendingKey);
+						clearPendingTransitionRelease(pendingKey, pending);
 						return false;
 					}
 				} else if (await captureRegularLockOwner(ownerFile)) {
 					return false;
 				}
 				await removeTransitionDir(transitionDir);
-				pendingTransitionReleases.delete(pendingKey);
+				clearPendingTransitionRelease(pendingKey, pending);
 				return true;
 			} catch {
 				return false;
 			}
 		}
 		if (!pending.held || !pending.releasedOwner) {
-			pendingTransitionReleases.delete(pendingKey);
+			clearPendingTransitionRelease(pendingKey, pending);
 			return false;
 		}
 		try {
@@ -1277,13 +1415,13 @@ async function recoverPendingTransitionRelease(transitionDir: string, recoveryKe
 				// identity is the held inode; exact unlink then re-proves the current
 				// bytes before removing it. A different inode is a successor and stays.
 				if (!sameLockOwnerObject(pendingOwner, pending.held)) {
-					pendingTransitionReleases.delete(pendingKey);
+					clearPendingTransitionRelease(pendingKey, pending);
 					return false;
 				}
 				const outcome = exactUnlinkOwnerRecord(ownerFile, pendingOwner);
 				if (outcome !== "removed" && outcome !== "absent") return false;
 				await removeTransitionDir(transitionDir);
-				pendingTransitionReleases.delete(pendingKey);
+				clearPendingTransitionRelease(pendingKey, pending);
 				return true;
 			}
 			if (parsed.token !== pending.token || parsed.released !== true) {
@@ -1291,11 +1429,11 @@ async function recoverPendingTransitionRelease(transitionDir: string, recoveryKe
 				// the owner path is still the exact record this transition held; any other
 				// bytes belong to a successor and invalidate this pending authority.
 				if (!sameLockOwnerSnapshot(pendingOwner, pending.held)) {
-					pendingTransitionReleases.delete(pendingKey);
+					clearPendingTransitionRelease(pendingKey, pending);
 					return false;
 				}
 				try {
-					await rewriteHeldOwnerRecord(ownerFile, pending.held, pending.releasedOwner);
+					await rewriteHeldOwnerRecord(ownerFile, pendingOwner, pending.releasedOwner);
 				} catch {
 					// Keep the generation record. A later contender can retry this
 					// release without replaying the already-completed transition.
@@ -1310,14 +1448,21 @@ async function recoverPendingTransitionRelease(transitionDir: string, recoveryKe
 				}
 			}
 			if (parsed.token !== pending.token || parsed.released !== true) return false;
-			const captured = nativeSessionStateLock().snapshotDirectoryTree(transitionDir);
+			let nativeTransitionPath: string;
+			try {
+				nativeTransitionPath = await canonicalTransitionPathPreservingFinal(transitionDir);
+			} catch {
+				return false;
+			}
+			const captured = nativeSessionStateLock().snapshotDirectoryTree(nativeTransitionPath);
+			if (captured.code === "sharing_violation") return false;
 			if (
 				!captured.ok ||
 				!captured.snapshot ||
 				captured.snapshot.rootDev !== String(current.dev) ||
 				captured.snapshot.rootIno !== String(current.ino)
 			) {
-				pendingTransitionReleases.delete(pendingKey);
+				clearPendingTransitionRelease(pendingKey, pending);
 				return false;
 			}
 			const capturedRoot = captured.snapshot.entries.find(entry => entry.relativePath === "");
@@ -1329,27 +1474,28 @@ async function recoverPendingTransitionRelease(transitionDir: string, recoveryKe
 				capturedRoot.mtimeNs !== String(pendingGeneration.mtimeNs) ||
 				capturedRoot.ctimeNs !== String(pendingGeneration.ctimeNs)
 			) {
-				pendingTransitionReleases.delete(pendingKey);
+				clearPendingTransitionRelease(pendingKey, pending);
 				return false;
 			}
-			const removed = nativeSessionStateLock().exactRemoveDirectoryTree(transitionDir, captured.snapshot);
+			const removed = nativeSessionStateLock().exactRemoveDirectoryTree(nativeTransitionPath, captured.snapshot);
+			if (removed.code === "sharing_violation") return false;
 			if (removed.ok || removed.code === "not_found") {
-				pendingTransitionReleases.delete(pendingKey);
+				clearPendingTransitionRelease(pendingKey, pending);
 				return true;
 			}
 			if (removed.code === "identity_mismatch") {
-				pendingTransitionReleases.delete(pendingKey);
+				clearPendingTransitionRelease(pendingKey, pending);
 				return false;
 			}
 			if (
 				removed.code === "cleanup_pending" &&
 				removed.payloadDurable === true &&
-				removed.detachedPath === `${transitionDir}.removing` &&
+				removed.detachedPath === `${nativeTransitionPath}.removing` &&
 				removed.retainedSuccessorPath === undefined &&
 				removed.retainedUnknownPath === undefined &&
 				removed.retainedPlaceholderPath === undefined
 			) {
-				pendingTransitionReleases.delete(pendingKey);
+				clearPendingTransitionRelease(pendingKey, pending);
 				return true;
 			}
 			return false;
@@ -1378,7 +1524,8 @@ async function withLockPathTransition<T>(lockFile: string, transition: () => Pro
 			// fall through and retry the mkdir immediately.
 		}
 		try {
-			await fs.mkdir(transitionDir);
+			await fs.mkdir(transitionDir, { mode: 0o700 });
+			await fs.chmod(transitionDir, 0o700);
 		} catch (error) {
 			const code = (error as NodeJS.ErrnoException).code;
 			if (code !== "EEXIST" && !isTransientLockError(error)) throw new SessionStateLockUnavailableError(error);
@@ -1394,13 +1541,32 @@ async function withLockPathTransition<T>(lockFile: string, transition: () => Pro
 		pendingTransitionReleases.set(recoveryKey, pendingSetup);
 		let transitionGeneration: TransitionDirectoryGeneration;
 		try {
-			await SessionStateLockTestHooks.beforeTransitionSetupLstat?.(transitionDir);
-			const transitionStat = await fs.lstat(transitionDir, { bigint: true });
-			if (!transitionStat.isDirectory()) throw new Error("Transition claim is no longer a directory.");
-			transitionGeneration = transitionGenerationFromStat(transitionStat);
+			if (process.platform === "win32") {
+				// Windows has no no-follow directory descriptor through Node's fs
+				// flags. A setup fault therefore retains the claim fail-closed below;
+				// only a completed lstat may enter the normal transition path.
+				await SessionStateLockTestHooks.beforeTransitionSetupLstat?.(transitionDir);
+				const transitionStat = await fs.lstat(transitionDir, { bigint: true });
+				if (!transitionStat.isDirectory()) throw new Error("Transition claim is no longer a directory.");
+				transitionGeneration = transitionGenerationFromStat(transitionStat);
+			} else {
+				// Retain no-follow authority before the fault seam and before any
+				// recovery pathname lookup. A later lstat cannot distinguish this
+				// claim from a successor that replaced the name after setup failed.
+				pendingSetup.generationHandle = await fs.open(transitionDir, TRANSITION_DIRECTORY_OPEN_FLAGS);
+				await SessionStateLockTestHooks.beforeTransitionSetupLstat?.(transitionDir);
+				transitionGeneration = await captureTransitionDirectoryGenerationFromHandle(pendingSetup.generationHandle);
+				await pendingSetup.generationHandle.close();
+				pendingSetup.generationHandle = undefined;
+			}
 			pendingSetup.generation = transitionGeneration;
 		} catch (error) {
 			pendingSetup.recoverable = true;
+			// If opening the just-created claim itself failed, no descriptor or
+			// generation proves which object the pathname names. Retain the claim
+			// fail-closed rather than spinning recovery against an unproven path.
+			if (!pendingSetup.generationHandle && !pendingSetup.generation)
+				throw new SessionStateLockUnavailableError(error);
 			for (let recoveryAttempt = 0; recoveryAttempt < LOCK_ACQUIRE_ATTEMPTS; recoveryAttempt++) {
 				if (await recoverPendingTransitionRelease(transitionDir, recoveryKey)) break;
 				if (!pendingTransitionReleases.has(recoveryKey)) break;
@@ -1408,17 +1574,33 @@ async function withLockPathTransition<T>(lockFile: string, transition: () => Pro
 			}
 			throw new SessionStateLockUnavailableError(error);
 		}
-		if (!transitionGeneration) throw new SessionStateLockUnavailableError(new Error("Transition claim generation unavailable."));
+		if (!transitionGeneration)
+			throw new SessionStateLockUnavailableError(new Error("Transition claim generation unavailable."));
 		let held: LockOwnerSnapshot;
 		try {
-			held = await acquireOwnerLock(ownerFile, owner);
+			held = await acquireOwnerLock(ownerFile, owner, failedHeld => {
+				pendingSetup.held = failedHeld;
+			});
 		} catch (error) {
 			const pending = pendingTransitionReleases.get(recoveryKey);
 			// `acquireOwnerLock` owns the only descriptor that can authorize
 			// cleanup of a failed create. Once it returns an error that descriptor
 			// is gone; a pathname capture here could be a successor's owner and
 			// must never be handed to exact-unlink as our authority.
-			if (pending) pending.recoverable = true;
+			if (pending) {
+				const rewriteFailure = error as OwnerRewriteFailure;
+				if (
+					rewriteFailure.repairSnapshot &&
+					pending.held &&
+					sameLockOwnerObject(rewriteFailure.repairSnapshot, pending.held)
+				)
+					pending.held = rewriteFailure.repairSnapshot;
+				if (rewriteFailure.repairHandle) {
+					pending.repairHandle = rewriteFailure.repairHandle;
+					pending.repairBytes = rewriteFailure.repairBytes;
+				}
+				pending.recoverable = true;
+			}
 			try {
 				// If no owner pathname exists, setup never established an owner and
 				// this claim can be removed safely. Use lstat only: an unsupported
@@ -1430,7 +1612,7 @@ async function withLockPathTransition<T>(lockFile: string, transition: () => Pro
 				});
 				if (!ownerStat) {
 					await removeTransitionDir(transitionDir);
-					pendingTransitionReleases.delete(recoveryKey);
+					clearPendingTransitionRelease(recoveryKey, pending);
 				}
 			} catch {
 				if (pending) pending.recoverable = true;
@@ -1561,6 +1743,8 @@ function captureLegacyDirectoryTree(
 	}
 	if (captured.ok && captured.snapshot) return captured.snapshot;
 	if (captured.code === "not_found") return null;
+	if (captured.code === "sharing_violation")
+		throw new SessionStateLockUnavailableError(transientNativeResultError(captured.code));
 	throw new SessionStateLockUnavailableError(
 		new Error(`Legacy lock directory could not be captured: ${captured.code ?? "unknown"}.`),
 	);
@@ -1639,6 +1823,8 @@ async function reclaimStaleDirectoryLock(lockFile: string): Promise<void> {
 				throw new SessionStateLockUnavailableError(error);
 			}
 		}
+		if (removed.code === "sharing_violation")
+			throw new SessionStateLockUnavailableError(transientNativeResultError(removed.code));
 		// The tree changed after it was captured, so it belongs to a successor now.
 		if (removed.code === "identity_mismatch") return;
 		throw new SessionStateLockUnavailableError(
@@ -1684,7 +1870,7 @@ export async function reclaimStaleSessionStateLock(lockFile: string): Promise<vo
 export async function withSessionStateFileLock<T>(stateFile: string, operation: () => Promise<T>): Promise<T> {
 	const lockFile = `${stateFile}.lock`;
 	const owner = await newLockOwner();
-	await fs.mkdir(path.dirname(stateFile), { recursive: true });
+	await ensureSessionStateParent(path.dirname(stateFile));
 	for (let attempt = 0; attempt < LOCK_ACQUIRE_ATTEMPTS; attempt++) {
 		let held: LockOwnerSnapshot | undefined;
 		try {

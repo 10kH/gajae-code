@@ -6,6 +6,7 @@ import * as path from "node:path";
 import {
 	FileLockTestHooks,
 	processStartTime,
+	readFileLockObservationForGc,
 	removeFileLockDirForGc,
 	withFileLock,
 } from "@gajae-code/coding-agent/config/file-lock";
@@ -557,6 +558,50 @@ describe("host-qualified file lock publication", () => {
 	});
 });
 describe("file lock cleanup failure handling (#2478)", () => {
+	test("refuses generic release without pre-verdict identity instead of capturing a successor", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "state.json");
+		const lockDir = `${lockedFile}.lock`;
+		const expected = { pid: DEAD_PID, timestamp: Date.now(), start_time: "test-start", owner_token: "owner" };
+		await writeInfo(lockDir, expected);
+		let snapshotCalls = 0;
+		FileLockTestHooks.nativeQuarantineBindings = () => ({
+			snapshotDirectoryTree: () => {
+				snapshotCalls++;
+				return snapshotDirectoryTree(lockDir);
+			},
+			exactRemoveDirectoryTree: () => {
+				throw new Error("successor must not be removed");
+			},
+		});
+
+		expect(await removeFileLockDirForGc(lockDir, expected)).toBe("owner_changed");
+		expect(snapshotCalls).toBe(0);
+		expect(await fs.exists(lockDir)).toBe(true);
+	});
+
+	test("treats a native snapshot sharing violation as transient release contention", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "state.json");
+		const lockDir = `${lockedFile}.lock`;
+		let snapshotCalls = 0;
+		FileLockTestHooks.nativeQuarantineBindings = () => ({
+			snapshotDirectoryTree: () => {
+				snapshotCalls++;
+				return { ok: false, code: "sharing_violation" };
+			},
+			exactRemoveDirectoryTree: () => {
+				throw new Error("snapshot sharing violation must stop before removal");
+			},
+		});
+
+		await expect(withFileLock(lockedFile, async () => undefined)).rejects.toMatchObject({
+			code: "sharing_violation",
+		});
+		expect(snapshotCalls).toBeGreaterThan(0);
+		expect(await fs.exists(lockDir)).toBe(true);
+	});
+
 	test("retries transient Windows release denial before reporting success", async () => {
 		const base = await makeTemp();
 		const lockedFile = path.join(base, "state.json");
@@ -920,8 +965,10 @@ describe("file lock owner-token removal guard (#606)", () => {
 		const lockDir = path.join(base, "match.lock");
 		const token = { pid: DEAD_PID, timestamp: 1000 };
 		await writeInfo(lockDir, token);
+		const observed = await readFileLockObservationForGc(lockDir);
+		expect(observed).not.toBeNull();
 
-		const outcome = await removeFileLockDirForGc(lockDir, token);
+		const outcome = await removeFileLockDirForGc(lockDir, token, observed?.identity);
 
 		expect(outcome).toBe("removed");
 		expect(await fs.exists(lockDir)).toBe(false);

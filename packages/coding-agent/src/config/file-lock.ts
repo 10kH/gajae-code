@@ -515,14 +515,10 @@ export async function removeFileLockDirForGc(
 	expected: FileLockOwnerToken,
 	preVerdictIdentity?: GenericFileLockDirIdentity,
 ): Promise<FileLockGcRemoval> {
-	let expectedIdentity = preVerdictIdentity ?? fileLockDirIdentities.get(expected);
-	if (!expectedIdentity) {
-		try {
-			expectedIdentity = (await captureFileLockDirIdentity(lockDir)) ?? undefined;
-		} catch (error) {
-			if (!isTransientReleaseError(error)) return "cleanup_failed";
-		}
-	}
+	// A generic release/quarantine call is only authorized by evidence captured
+	// before its stale verdict. Capturing the current pathname here would let a
+	// fresh successor inherit an old owner's release authority.
+	const expectedIdentity = preVerdictIdentity ?? fileLockDirIdentities.get(expected);
 	let onDiskBytes: string | null;
 	try {
 		onDiskBytes = await readLockInfoBytes(lockDir);
@@ -532,6 +528,7 @@ export async function removeFileLockDirForGc(
 	}
 	const current = onDiskBytes === null ? null : parseLockInfoBytes(onDiskBytes);
 	if (!current || onDiskBytes === null) return "missing";
+	if (!expectedIdentity) return "owner_changed";
 	if (
 		current.pid !== expected.pid ||
 		(expected.start_time !== undefined && current.start_time !== expected.start_time) ||
@@ -545,9 +542,6 @@ export async function removeFileLockDirForGc(
 	// pathname. When the caller carried pre-verdict root/info identity, require
 	// the post-verdict native snapshot to match that same object before removal;
 	// a clone or successor can therefore never inherit the stale authorization.
-	// Direct callers without prior verdict evidence retain the original digest
-	// guard, so any rewrite — including key-order-different re-serialization of
-	// the same fields — still counts as a changed owner.
 	// The canonical native path may refuse a symlinked parent ("reparse_point");
 	// canonicalize first so the identity-bound capture sees the real directory,
 	// mirroring how localLockKey canonicalizes the lock pathname.
@@ -558,23 +552,23 @@ export async function removeFileLockDirForGc(
 		if (!isEnoent(error) && !isTransientReleaseError(error)) return "cleanup_failed";
 	}
 	const captured = nativeFileLockBindings().snapshotDirectoryTree(nativeCapturePath);
+	if (captured.code === "sharing_violation") throwTransientNativeResult(captured.code);
 	if (!captured.ok || !captured.snapshot) return "owner_changed";
 	const infoEntry = captured.snapshot.entries.find(entry => entry.relativePath === "info");
 	if (!infoEntry?.sha256) return "owner_changed";
 	const judgedDigest = crypto.createHash("sha256").update(onDiskBytes).digest("hex");
 	if (infoEntry.sha256 !== judgedDigest) return "owner_changed";
 	if (
-		expectedIdentity &&
-		(!captured.snapshot.rootDev ||
-			captured.snapshot.rootDev !== expectedIdentity.rootDev ||
-			captured.snapshot.rootIno !== expectedIdentity.rootIno ||
-			infoEntry.dev !== expectedIdentity.infoDev ||
-			infoEntry.ino !== expectedIdentity.infoIno ||
-			infoEntry.nlink !== expectedIdentity.infoNlink ||
-			infoEntry.size !== expectedIdentity.infoSize ||
-			infoEntry.mtimeNs !== expectedIdentity.infoMtimeNs ||
-			infoEntry.ctimeNs !== expectedIdentity.infoCtimeNs ||
-			infoEntry.sha256 !== expectedIdentity.infoSha256)
+		!captured.snapshot.rootDev ||
+		captured.snapshot.rootDev !== expectedIdentity.rootDev ||
+		captured.snapshot.rootIno !== expectedIdentity.rootIno ||
+		infoEntry.dev !== expectedIdentity.infoDev ||
+		infoEntry.ino !== expectedIdentity.infoIno ||
+		infoEntry.nlink !== expectedIdentity.infoNlink ||
+		infoEntry.size !== expectedIdentity.infoSize ||
+		infoEntry.mtimeNs !== expectedIdentity.infoMtimeNs ||
+		infoEntry.ctimeNs !== expectedIdentity.infoCtimeNs ||
+		infoEntry.sha256 !== expectedIdentity.infoSha256
 	)
 		return "owner_changed";
 	let removed: NativeExactUnlinkResult;
@@ -765,6 +759,7 @@ async function removeStaleLockForAcquire(lockPath: string, snapshot: LockStaleSn
 		if (!sameStatToken(statToken(currentStats), snapshot.stat)) return false;
 		const nativeCapturePath = await canonicalLockPathPreservingFinal(lockPath);
 		const captured = nativeFileLockBindings().snapshotDirectoryTree(nativeCapturePath);
+		if (captured.code === "sharing_violation") throwTransientNativeResult(captured.code);
 		if (!captured.ok || !captured.snapshot) return false;
 		if (
 			captured.snapshot.rootDev !== String(currentStats.dev) ||
@@ -869,7 +864,13 @@ async function tryAcquireLock(
 
 function isTransientReleaseError(error: unknown): boolean {
 	const code = (error as NodeJS.ErrnoException).code;
-	return code === "EBUSY" || code === "EPERM" || code === "EACCES" || code === "ENOTEMPTY";
+	return (
+		code === "EBUSY" || code === "EPERM" || code === "EACCES" || code === "ENOTEMPTY" || code === "sharing_violation"
+	);
+}
+
+function throwTransientNativeResult(code: string): never {
+	throw Object.assign(new Error(`Native lock operation is transiently unavailable: ${code}.`), { code });
 }
 
 type NativeFileLockBindings = {
@@ -908,6 +909,7 @@ async function quarantineReleasedLock(
 	const nativeCapturePath = await canonicalLockPathPreservingFinal(lockPath);
 	try {
 		captured = nativeFileLockBindings().snapshotDirectoryTree(nativeCapturePath);
+		if (captured.code === "sharing_violation") throwTransientNativeResult(captured.code);
 	} catch (error) {
 		if (isTransientReleaseError(error)) return false;
 		throw error;
