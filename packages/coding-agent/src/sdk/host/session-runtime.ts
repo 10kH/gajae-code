@@ -3132,7 +3132,8 @@ function createControlSurface(
 			submit(
 				"prompt",
 				undefined,
-				options => api.sendUserMessage(text, { ...options, deliverAs: "followUp" }),
+				options =>
+					api.sendUserMessage(text, { ...options, deliverAs: "followUp", skipPostPromptRecoveryWait: true }),
 				undefined,
 				false,
 				// Follow-ups never start inline; ownership correlates at promotion.
@@ -3177,6 +3178,7 @@ function createControlSurface(
 				options =>
 					ctx.invokeSkill!(name, args, {
 						...options,
+						skipPostPromptRecoveryWait: true,
 						onSkillPrepared: meta => {
 							prepared = meta;
 						},

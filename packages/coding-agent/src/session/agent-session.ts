@@ -2797,8 +2797,6 @@ export class AgentSession {
 	#extensionRunner: ExtensionRunner | undefined = undefined;
 	/** SDK follow-up ownership by queued message and the attempt that dequeues it. */
 	#sdkRunTokensByQueuedMessage = new WeakMap<AgentMessage, string>();
-	#skipPostPromptRecoveryWaitByQueuedMessage = new WeakSet<AgentMessage>();
-	#skipPostPromptRecoveryWaitForCurrentTurn = false;
 	#sdkRunTokensByAttemptScope = new WeakMap<AttemptScope, string>();
 	#activeSdkRunToken: string | undefined;
 	#activeAttemptScope: AttemptScope | undefined;
@@ -3821,6 +3819,9 @@ export class AgentSession {
 			// recovery indefinitely. The bounded integration promise is still awaited
 			// below so ordinary session shutdown retains its drain guarantee.
 			const workerIntegration = this.#flushWorkerIntegrationForAgentEnd();
+			void workerIntegration.catch(error => {
+				logger.warn("Worker integration settled after terminal publication", { error });
+			});
 			const pendingScope = (pending as AgentSessionEvent & { scope?: AttemptScopeRef }).scope as
 				| AttemptScope
 				| undefined;
@@ -4217,10 +4218,6 @@ export class AgentSession {
 		// next turn, the previously streaming turn has ended, so mutating the
 		// session-wide epoch/lineage is safe and its tools bind the fresh lineage.
 		this.agent.onFollowUpConsumed = (messages, promotion = { startsOwnRun: false }) => {
-			if (messages.some(message => this.#skipPostPromptRecoveryWaitByQueuedMessage.has(message))) {
-				this.#skipPostPromptRecoveryWaitForCurrentTurn = true;
-			}
-			for (const message of messages) this.#skipPostPromptRecoveryWaitByQueuedMessage.delete(message);
 			// A follow-up whose owned-completion origin is DENIED — an owned
 			// scope landed after the result was queued, or the tuple is
 			// forged/vanished-disabled — must NOT resume the agent: remove it
@@ -4238,6 +4235,16 @@ export class AgentSession {
 			// actual admission (see the comment above).
 			if (messages.some(message => ownedCompletionResumeAction(message) === "fresh")) {
 				this.#resumeFromOwnedCompletion();
+			}
+			const consumedSdkRunTokenForCurrentRun = messages
+				.map(message => this.#sdkRunTokensByQueuedMessage.get(message))
+				.find((token): token is string => token !== undefined);
+			if (
+				consumedSdkRunTokenForCurrentRun !== undefined &&
+				this.#activeAttemptScope !== undefined &&
+				promotion.startsOwnRun !== true
+			) {
+				this.#sdkRunTokensByAttemptScope.set(this.#activeAttemptScope, consumedSdkRunTokenForCurrentRun);
 			}
 			// Monitor task-notifications now carry the owned-completion envelope
 			// (see tools/monitor.ts), so the general drop + fresh-admission paths
@@ -4274,10 +4281,16 @@ export class AgentSession {
 		// submitter to the in-flight run instead of parking the correlation for
 		// an unrelated later agent_start (#4668).
 		this.agent.onSteeringConsumed = (messages, promotion = { startsOwnRun: false }) => {
-			if (messages.some(message => this.#skipPostPromptRecoveryWaitByQueuedMessage.has(message))) {
-				this.#skipPostPromptRecoveryWaitForCurrentTurn = true;
+			const consumedSdkRunToken = messages
+				.map(message => this.#sdkRunTokensByQueuedMessage.get(message))
+				.find((token): token is string => token !== undefined);
+			if (
+				consumedSdkRunToken !== undefined &&
+				this.#activeAttemptScope !== undefined &&
+				promotion.startsOwnRun !== true
+			) {
+				this.#sdkRunTokensByAttemptScope.set(this.#activeAttemptScope, consumedSdkRunToken);
 			}
-			for (const message of messages) this.#skipPostPromptRecoveryWaitByQueuedMessage.delete(message);
 			this.#fireQueuedPromotionHooks(messages, promotion);
 		};
 		this.agent.providerSessionState = this.#providerSessionState;
@@ -6674,13 +6687,6 @@ export class AgentSession {
 															.map(message => this.#sdkRunTokensByQueuedMessage.get(message))
 															.find((token): token is string => token !== undefined)
 													: undefined;
-												const consumedFastTerminal = acceptance.consumedQueuedMessages.some(message =>
-													this.#skipPostPromptRecoveryWaitByQueuedMessage.has(message),
-												);
-												if (consumedFastTerminal) this.#skipPostPromptRecoveryWaitForCurrentTurn = true;
-												for (const message of acceptance.consumedQueuedMessages) {
-													this.#skipPostPromptRecoveryWaitByQueuedMessage.delete(message);
-												}
 												this.#fireQueuedPromotionHooks(acceptance.consumedQueuedMessages, {
 													startsOwnRun: startsOwn,
 												});
@@ -9951,7 +9957,12 @@ export class AgentSession {
 		args = "",
 		options?: Pick<
 			PromptOptions,
-			"onPreflightAccepted" | "onPreflightAcceptCommit" | "onSkillPrepared" | "preflightSignal" | "sdkRunToken"
+			| "onPreflightAccepted"
+			| "onPreflightAcceptCommit"
+			| "onSkillPrepared"
+			| "preflightSignal"
+			| "sdkRunToken"
+			| "skipPostPromptRecoveryWait"
 		>,
 	): Promise<{ name: string; path: string; args?: string; lineCount?: number }> {
 		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
@@ -10703,7 +10714,10 @@ export class AgentSession {
 					await this.invokeSkill(
 						invocation.skill.name,
 						invocation.args,
-						options?.onPreflightAccepted || options?.onPreflightAcceptCommit || options?.preflightSignal
+						options?.onPreflightAccepted ||
+							options?.onPreflightAcceptCommit ||
+							options?.preflightSignal ||
+							options?.skipPostPromptRecoveryWait
 							? {
 									...(options.onPreflightAccepted ? { onPreflightAccepted: options.onPreflightAccepted } : {}),
 									...(options.onPreflightAcceptCommit
@@ -10711,6 +10725,9 @@ export class AgentSession {
 										: {}),
 									...(options.preflightSignal ? { preflightSignal: options.preflightSignal } : {}),
 									...(options.sdkRunToken ? { sdkRunToken: options.sdkRunToken } : {}),
+									...(options.skipPostPromptRecoveryWait
+										? { skipPostPromptRecoveryWait: options.skipPostPromptRecoveryWait }
+										: {}),
 								}
 							: undefined,
 					);
@@ -10965,6 +10982,7 @@ export class AgentSession {
 			| "onPreflightAcceptCommit"
 			| "preflightSignal"
 			| "sdkRunToken"
+			| "skipPostPromptRecoveryWait"
 		>,
 	): Promise<void> {
 		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
@@ -11449,11 +11467,6 @@ export class AgentSession {
 			) {
 				this.#commitIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
 			}
-			// A queued SDK submission can attach to this already-running turn. Consume
-			// its fast-terminal intent exactly once at the same boundary as the direct
-			// prompt option, without changing ordinary interactive drain semantics.
-			skipPostPromptRecoveryWait ||= this.#skipPostPromptRecoveryWaitForCurrentTurn;
-			this.#skipPostPromptRecoveryWaitForCurrentTurn = false;
 			if (!skipPostPromptRecoveryWait) {
 				await this.#waitForPostPromptRecovery();
 			}
@@ -11479,7 +11492,6 @@ export class AgentSession {
 				this.#releaseIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
 			}
 			this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
-			this.#skipPostPromptRecoveryWaitForCurrentTurn = false;
 			await this.#settleEndedInFlight(inFlightPrompt, skipPostPromptRecoveryWait ? "publication" : "full");
 		}
 	}
@@ -11725,7 +11737,7 @@ export class AgentSession {
 			claimsGenuineUserIntent?: boolean;
 			onPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
 			external?: boolean;
-			skipPostPromptRecoveryWait?: boolean;
+			sdkRunToken?: string;
 		},
 	): Promise<void> {
 		this.#assertNoHandoffTransition();
@@ -11740,7 +11752,7 @@ export class AgentSession {
 			this.#externalSteerAdmissionSeq.set(message, ++this.#steeringAdmissionSeq);
 			if (options.onPromoted) this.#steerPromotionHooks.set(message, options.onPromoted);
 		}
-		if (options?.skipPostPromptRecoveryWait) this.#skipPostPromptRecoveryWaitByQueuedMessage.add(message);
+		if (options?.sdkRunToken) this.#sdkRunTokensByQueuedMessage.set(message, options.sdkRunToken);
 		if (options?.claimsGenuineUserIntent) {
 			const epoch = this.#claimDeepInterviewUserIntent();
 			this.#deepInterviewGenuineUserMessageEpochs.set(message, epoch);
@@ -11774,7 +11786,6 @@ export class AgentSession {
 			claimsGenuineUserIntent?: boolean;
 			onPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
 			sdkRunToken?: string;
-			skipPostPromptRecoveryWait?: boolean;
 		},
 	): Promise<QueuedFollowUpOwner> {
 		this.#assertNoHandoffTransition();
@@ -11795,7 +11806,6 @@ export class AgentSession {
 			this.#deepInterviewGenuineUserMessageEpochs.set(message, epoch);
 		}
 		if (options?.sdkRunToken) this.#sdkRunTokensByQueuedMessage.set(message, options.sdkRunToken);
-		if (options?.skipPostPromptRecoveryWait) this.#skipPostPromptRecoveryWaitByQueuedMessage.add(message);
 		if (options?.sdkRunToken && (this.agent.state.isStreaming || this.agent.hasQueuedMessages())) {
 			this.#deferredSdkFollowUps.push(message);
 		} else {
@@ -12453,7 +12463,6 @@ export class AgentSession {
 					forceOneAtATime: Boolean(options?.preflightSignal || options?.queuedAtDispatch),
 					onPromoted: options?.onQueuedPromoted,
 					sdkRunToken: options?.sdkRunToken,
-					skipPostPromptRecoveryWait: options?.skipPostPromptRecoveryWait,
 				});
 				const cancelQueuedFollowUp = () => queuedFollowUp.cancel();
 				options?.preflightSignal?.addEventListener("abort", cancelQueuedFollowUp, { once: true });
@@ -12468,7 +12477,7 @@ export class AgentSession {
 					claimsGenuineUserIntent: true,
 					onPromoted: options?.onQueuedPromoted,
 					external: true,
-					skipPostPromptRecoveryWait: options?.skipPostPromptRecoveryWait,
+					sdkRunToken: options?.sdkRunToken,
 				});
 				options?.onPreflightAccepted?.();
 				return;
@@ -12488,7 +12497,7 @@ export class AgentSession {
 					claimsGenuineUserIntent: true,
 					onPromoted: options?.onQueuedPromoted,
 					external: true,
-					skipPostPromptRecoveryWait: options?.skipPostPromptRecoveryWait,
+					sdkRunToken: options?.sdkRunToken,
 				});
 				// Dispatch-race disposition (#4668 review P1): the SDK snapshot-decided
 				// this submission starts its own turn (idle at dispatch), but the
