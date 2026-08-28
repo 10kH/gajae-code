@@ -176,6 +176,7 @@ export class JobsObserver {
 		for (const entry of asyncSnapshot.jobs) snapshotEntries.set(jobKey(entry.id, entry.generation), entry);
 
 		const monitorJobs = this.#listMonitorJobs();
+		const monitorKeys = new Set(monitorJobs.map(job => jobKey(job.id, job.generation)));
 		const presentKeys = new Set<string>([
 			...asyncSnapshot.jobs.map(entry => jobKey(entry.id, entry.generation)),
 			...asyncSnapshot.deadLettered.map(entry => jobKey(entry.jobId, entry.generation)),
@@ -190,7 +191,9 @@ export class JobsObserver {
 		const hasUnacknowledgedFailure =
 			asyncSnapshot.jobs.some(
 				entry =>
-					(entry.status === "failed" || entry.deliveryState === "failed-visible") &&
+					(entry.deliveryState === "failed-visible" ||
+						(entry.status === "failed" &&
+							(entry.backgrounded || monitorKeys.has(jobKey(entry.id, entry.generation))))) &&
 					!this.#acknowledgedFailedIds.has(jobKey(entry.id, entry.generation)),
 			) ||
 			asyncSnapshot.deadLettered.some(
@@ -226,7 +229,10 @@ export class JobsObserver {
 			.filter(
 				entry =>
 					entry.backgrounded ||
-					(entry.status !== "running" && (entry.status === "failed" || entry.deliveryState !== "delivered")),
+					(entry.status !== "running" &&
+						(entry.deliveryState === "failed-visible" ||
+							(entry.status === "failed" && entry.backgrounded) ||
+							entry.deliveryState !== "delivered")),
 			)
 			.map(entry => {
 				const lastError = deadLettersByKey.get(jobKey(entry.id, entry.generation))?.lastError;

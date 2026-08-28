@@ -147,6 +147,31 @@ describe("JobsObserver", () => {
 		await manager.dispose();
 	});
 
+	test("handled foreground failures do not latch or surface as folded jobs", async () => {
+		const manager = makeManager();
+		const observer = new JobsObserver(manager, OWNER);
+
+		const jobId = manager.register(
+			"bash",
+			"handled foreground failure",
+			async () => {
+				throw new Error("foreground failure");
+			},
+			{ ownerId: OWNER },
+		);
+		await flush();
+
+		const snapshot = observer.getSnapshot();
+		expect(manager.getJob(jobId)?.status).toBe("failed");
+		expect(manager.getJob(jobId)?.metadata?.backgrounded).not.toBe(true);
+		expect(snapshot.failedUnacknowledged).toBe(false);
+		expect(snapshot.worstState).toBe("none");
+		expect(snapshot.foldedJobs).not.toEqual(expect.arrayContaining([expect.objectContaining({ id: jobId })]));
+
+		observer.dispose();
+		await manager.dispose();
+	});
+
 	test("AC5/AC13 onChange fires (debounced) when a monitor registers", async () => {
 		const manager = makeManager();
 		const observer = new JobsObserver(manager, OWNER);
