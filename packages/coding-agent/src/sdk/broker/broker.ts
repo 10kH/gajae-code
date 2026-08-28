@@ -866,6 +866,7 @@ export class Broker {
 	#resolveCompletion!: () => void;
 	#rejectCompletion!: (error: unknown) => void;
 	#resolveModelPin: SdkHostModelResolver;
+	#ownsResolveModelPin: boolean;
 	constructor(settings: BrokerSettings) {
 		this.settings = {
 			agentDir: settings.agentDir,
@@ -876,6 +877,7 @@ export class Broker {
 		};
 		this.index = new SessionIndex(settings.agentDir);
 		this.ledger = new LifecycleLedger(settings.agentDir);
+		this.#ownsResolveModelPin = settings.resolveModelPin === undefined;
 		this.#resolveModelPin = settings.resolveModelPin ?? createDefaultSdkHostModelResolver(this.settings.agentDir);
 		this.#lock = path.join(settings.agentDir, "sdk", "broker.lock");
 		const completion = Promise.withResolvers<void>();
@@ -1025,7 +1027,8 @@ export class Broker {
 			this.#resolveCompletion = completion.resolve;
 			this.#rejectCompletion = completion.reject;
 			this.#completionTask = null;
-			this.#resolveModelPin = createDefaultSdkHostModelResolver(this.settings.agentDir);
+			if (this.#ownsResolveModelPin)
+				this.#resolveModelPin = createDefaultSdkHostModelResolver(this.settings.agentDir);
 			// A drained queue refuses every later startup by design, so a restarted broker
 			// needs a new one or it would admit nothing for the rest of the process.
 			this.#startupAdmissions = new StartupAdmissionQueue(sdkHostStartupConcurrency());
@@ -1308,7 +1311,7 @@ export class Broker {
 					await this.#releaseOwnedLock();
 				}
 			} finally {
-				const disposeModelPin = this.#resolveModelPin.dispose?.();
+				const disposeModelPin = this.#ownsResolveModelPin ? this.#resolveModelPin.dispose?.() : undefined;
 				if (mode === "lost-root" && disposeModelPin !== undefined) {
 					void disposeModelPin.catch(() => undefined);
 					await Promise.race([disposeModelPin, Bun.sleep(BROKER_SETTLEMENT_MS)]);
