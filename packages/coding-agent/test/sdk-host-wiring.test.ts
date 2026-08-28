@@ -14,15 +14,15 @@ import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { ExtensionRunner } from "../src/extensibility/extensions/runner";
 import type {
-	ExtensionAPI,
 	ExtensionActions,
+	ExtensionAPI,
 	ExtensionContextActions,
 	ExtensionUIContext,
 } from "../src/extensibility/extensions/types";
 
 test("extension API cannot set the private recovery bypass", () => {
-	const api = {} as ExtensionAPI;
-	if (false) {
+	const api = undefined as ExtensionAPI | undefined;
+	if (api) {
 		// @ts-expect-error The recovery bypass is private to SDK-correlated session runs.
 		void api.sendUserMessage("unauthorized", { skipPostPromptRecoveryWait: true });
 	}
