@@ -2112,18 +2112,18 @@ describe("coordinator session state lock", () => {
 		it("fails closed when neither owner-access strategy is available", async () => {
 			const { stateFile } = await seededRunningSession("lock-no-owner-strategy");
 			const lockFile = `${stateFile}.lock`;
-			const record = JSON.stringify({ pid: DEAD_PID, start_time: "unknown", token: "dead-owner-token" });
-			await fs.writeFile(lockFile, record);
 			SessionStateLockTestHooks.ownerAccessStrategy = "unsupported";
 
-			await expect(reclaimStaleSessionStateLock(lockFile)).rejects.toBeInstanceOf(SessionStateLockUnavailableError);
 			await expect(withSessionStateFileLock(stateFile, async () => "entered")).rejects.toBeInstanceOf(
 				SessionStateLockUnavailableError,
 			);
 
-			expect(await fs.readFile(lockFile, "utf8")).toBe(record);
-		// The transition claim remains fail-closed when no safe owner strategy exists.
-			expect(fsSync.existsSync(`${lockFile}.transition`)).toBe(true);
+			expect(fsSync.existsSync(lockFile)).toBe(false);
+			expect(fsSync.existsSync(`${lockFile}.transition`)).toBe(false);
+			expect(fsSync.existsSync(`${lockFile}.transition.owner`)).toBe(false);
+
+			SessionStateLockTestHooks.ownerAccessStrategy = process.platform === "win32" ? "windows-validated" : "posix-nofollow";
+			await expect(withSessionStateFileLock(stateFile, async () => "reacquired")).resolves.toBe("reacquired");
 		});
 	});
 });

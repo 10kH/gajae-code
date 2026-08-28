@@ -1551,6 +1551,8 @@ async function recoverPendingTransitionRelease(transitionDir: string, recoveryKe
 
 /** Run one pathname transition under an atomic `mkdir`/`rmdir` claim. */
 async function withLockPathTransition<T>(lockFile: string, transition: () => Promise<T>): Promise<T> {
+	if (ownerAccessStrategy() === "unsupported")
+		throw new SessionStateLockUnavailableError(new Error("Safe transition ownership is unsupported."));
 	const transitionDir = `${lockFile}${LOCK_TRANSITION_RESOURCE_SUFFIX}`;
 	const ownerFile = `${transitionDir}.owner`;
 	const recoveryKey = await transitionRecoveryKey(transitionDir);
