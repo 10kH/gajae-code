@@ -3821,6 +3821,10 @@ export class AgentSession {
 			// recovery indefinitely. The bounded integration promise is still awaited
 			// below so ordinary session shutdown retains its drain guarantee.
 			const workerIntegration = this.#flushWorkerIntegrationForAgentEnd();
+			const pendingScope = (pending as AgentSessionEvent & { scope?: AttemptScopeRef }).scope as
+				| AttemptScope
+				| undefined;
+			const sdkTerminal = pendingScope !== undefined && this.#sdkRunTokensByAttemptScope.has(pendingScope);
 			// Reserve persistence before notifying synchronous subscribers: a subscriber
 			// may start a successor prompt from agent_end, whose running state must
 			// serialize after this terminal boundary rather than be overwritten by it.
@@ -3843,7 +3847,15 @@ export class AgentSession {
 				true,
 				(pending as AgentSessionEvent & { scope?: AttemptScopeRef }).scope,
 			);
-			await workerIntegration;
+			if (sdkTerminal) {
+				await extensionDelivery;
+				void terminalPersistence.catch(error =>
+					logger.warn("Terminal persistence continued after SDK publication", { error }),
+				);
+			} else {
+				await terminalPersistence;
+				await workerIntegration;
+			}
 		};
 		try {
 			if (lease) await this.#runResourceLeaseContext.run(lease, publish);
@@ -4205,6 +4217,10 @@ export class AgentSession {
 		// next turn, the previously streaming turn has ended, so mutating the
 		// session-wide epoch/lineage is safe and its tools bind the fresh lineage.
 		this.agent.onFollowUpConsumed = (messages, promotion = { startsOwnRun: false }) => {
+			if (messages.some(message => this.#skipPostPromptRecoveryWaitByQueuedMessage.has(message))) {
+				this.#skipPostPromptRecoveryWaitForCurrentTurn = true;
+			}
+			for (const message of messages) this.#skipPostPromptRecoveryWaitByQueuedMessage.delete(message);
 			// A follow-up whose owned-completion origin is DENIED — an owned
 			// scope landed after the result was queued, or the tuple is
 			// forged/vanished-disabled — must NOT resume the agent: remove it
@@ -6658,6 +6674,13 @@ export class AgentSession {
 															.map(message => this.#sdkRunTokensByQueuedMessage.get(message))
 															.find((token): token is string => token !== undefined)
 													: undefined;
+												const consumedFastTerminal = acceptance.consumedQueuedMessages.some(message =>
+													this.#skipPostPromptRecoveryWaitByQueuedMessage.has(message),
+												);
+												if (consumedFastTerminal) this.#skipPostPromptRecoveryWaitForCurrentTurn = true;
+												for (const message of acceptance.consumedQueuedMessages) {
+													this.#skipPostPromptRecoveryWaitByQueuedMessage.delete(message);
+												}
 												this.#fireQueuedPromotionHooks(acceptance.consumedQueuedMessages, {
 													startsOwnRun: startsOwn,
 												});
@@ -11751,6 +11774,7 @@ export class AgentSession {
 			claimsGenuineUserIntent?: boolean;
 			onPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
 			sdkRunToken?: string;
+			skipPostPromptRecoveryWait?: boolean;
 		},
 	): Promise<QueuedFollowUpOwner> {
 		this.#assertNoHandoffTransition();
@@ -11771,6 +11795,7 @@ export class AgentSession {
 			this.#deepInterviewGenuineUserMessageEpochs.set(message, epoch);
 		}
 		if (options?.sdkRunToken) this.#sdkRunTokensByQueuedMessage.set(message, options.sdkRunToken);
+		if (options?.skipPostPromptRecoveryWait) this.#skipPostPromptRecoveryWaitByQueuedMessage.add(message);
 		if (options?.sdkRunToken && (this.agent.state.isStreaming || this.agent.hasQueuedMessages())) {
 			this.#deferredSdkFollowUps.push(message);
 		} else {
@@ -12428,6 +12453,7 @@ export class AgentSession {
 					forceOneAtATime: Boolean(options?.preflightSignal || options?.queuedAtDispatch),
 					onPromoted: options?.onQueuedPromoted,
 					sdkRunToken: options?.sdkRunToken,
+					skipPostPromptRecoveryWait: options?.skipPostPromptRecoveryWait,
 				});
 				const cancelQueuedFollowUp = () => queuedFollowUp.cancel();
 				options?.preflightSignal?.addEventListener("abort", cancelQueuedFollowUp, { once: true });
