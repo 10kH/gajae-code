@@ -345,6 +345,7 @@ describe("empty .gjc-delete-* latch", () => {
 		const missing = path.join(root, "no-such-root");
 		const dry = await runEmptyDeleteGc({ roots: [root, missing], prune: false });
 		expect(dry.would_remove).toBe(1);
+		expect(dry.records.find(r => r.action === "would_remove")?.observationOnly).toBe(true);
 		expect(dry.records.some(r => r.reason === "missing_root")).toBe(true);
 		expect(dry.errors).toEqual([`${missing}: missing_root`]);
 		expect(dry.records.some(r => r.reason === "non_empty")).toBe(true);

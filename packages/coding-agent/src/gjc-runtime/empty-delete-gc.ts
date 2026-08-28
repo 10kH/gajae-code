@@ -31,6 +31,8 @@ export interface EmptyDeleteGcRecord {
 	action: "would_remove" | "removed" | "kept" | "skipped";
 	reason: string;
 	identity?: EmptyDeleteIdentity;
+	/** A dry-run candidate is an observation, never deletion authority. */
+	observationOnly?: boolean;
 	/** Retained-object paths a native direct unlink left behind; operator-recoverable only there. */
 	retainedPaths?: { detached?: string; successor?: string; placeholder?: string; unknown?: string };
 }
@@ -230,6 +232,7 @@ export async function runEmptyDeleteGc(
 			continue;
 		}
 		for (const record of records) {
+			if (record.action === "would_remove" && !options.prune) record.observationOnly = true;
 			if (
 				record.action === "skipped" &&
 				(record.reason === "raced" ||
