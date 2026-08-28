@@ -1080,10 +1080,15 @@ export interface PromptOptions {
 }
 
 type InternalPromptOptions = PromptOptions & { sdkRunToken?: string };
-type InternalSkillOptions = Pick<PromptOptions, "onPreflightAccepted" | "onPreflightAcceptCommit" | "onSkillPrepared" | "preflightSignal"> & {
-	sdkRunToken?: string;
-};
-type InternalCustomMessageOptions = Pick<PromptOptions, "streamingBehavior" | "toolChoice" | "followUpQueuePolicy" | "onPreflightAccepted" | "onPreflightAcceptCommit" | "preflightSignal"> & {
+type InternalCustomMessageOptions = Pick<
+	PromptOptions,
+	| "streamingBehavior"
+	| "toolChoice"
+	| "followUpQueuePolicy"
+	| "onPreflightAccepted"
+	| "onPreflightAcceptCommit"
+	| "preflightSignal"
+> & {
 	sdkRunToken?: string;
 };
 
@@ -10812,7 +10817,9 @@ export class AgentSession {
 							options?.preflightSignal ||
 							internalOptions?.sdkRunToken
 							? {
-									...(options?.onPreflightAccepted ? { onPreflightAccepted: options.onPreflightAccepted } : {}),
+									...(options?.onPreflightAccepted
+										? { onPreflightAccepted: options.onPreflightAccepted }
+										: {}),
 									...(options?.onPreflightAcceptCommit
 										? { onPreflightAcceptCommit: options.onPreflightAcceptCommit }
 										: {}),
@@ -11174,7 +11181,7 @@ export class AgentSession {
 			| "onPreflightAcceptCommit"
 			| "preflightSignal"
 		> & {
-		sdkRunToken?: string;
+			sdkRunToken?: string;
 			prependMessages?: AgentMessage[];
 			skipPostPromptRecoveryWait?: boolean;
 			predecessorAgentEndHold?: symbol;

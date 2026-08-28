@@ -99,6 +99,41 @@ test.serial("forwards preflight cancellation when a prompt reroutes to a skill",
 	});
 });
 
+test.serial("keeps SDK ownership when an internal skill invocation becomes a custom prompt", async () => {
+	tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-skill-sdk-owner-"));
+	const skillPath = path.join(tempDir, "SKILL.md");
+	fs.writeFileSync(skillPath, "# Fixture skill\n\n{{args}}\n");
+	const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+	authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
+	authStorage.setRuntimeApiKey("anthropic", "test-key");
+	const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+	const agent = new Agent({
+		getApiKey: () => "test-key",
+		initialState: { model, systemPrompt: ["Test"], tools: [] },
+	});
+	session = new AgentSession({
+		agent,
+		sessionManager: createLifecycleIndependentSessionManager(),
+		settings: Settings.isolated(),
+		modelRegistry,
+		skills: [
+			{
+				name: "fixture-skill",
+				description: "Fixture skill",
+				filePath: skillPath,
+				baseDir: tempDir,
+				source: "test",
+			},
+		],
+	});
+	const promptCustomMessage = vi.spyOn(session, "promptCustomMessage").mockResolvedValue(undefined);
+	await session.invokeSkill("fixture-skill", "owned", { sdkRunToken: "skill-owner-token" } as never);
+	expect(promptCustomMessage).toHaveBeenCalledWith(
+		expect.objectContaining({ customType: expect.any(String) }),
+		expect.objectContaining({ sdkRunToken: "skill-owner-token" }),
+	);
+});
+
 test.serial("cancels an ordinary prompt while it waits on the startup barrier", async () => {
 	tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-prompt-admission-cancel-"));
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
