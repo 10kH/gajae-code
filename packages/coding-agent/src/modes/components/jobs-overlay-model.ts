@@ -18,6 +18,18 @@ export interface JobRef {
 	generation?: string;
 }
 
+function encodeJobRefPart(value: string): string {
+	return encodeURIComponent(value);
+}
+
+function decodeJobRefPart(value: string): string | undefined {
+	try {
+		return decodeURIComponent(value);
+	} catch {
+		return undefined;
+	}
+}
+
 function displayText(text: string, max: number = TRUNCATE_LENGTHS.CONTENT): string {
 	const sanitized = shortenPath(replaceTabs(sanitizeStatusText(text)));
 	return truncateToWidth(sanitized, max);
@@ -54,7 +66,9 @@ export function parseJobRef(value: string): JobRef | null {
 	if (kind === "folded") {
 		const generationSep = id.indexOf(":");
 		if (generationSep > 0 && generationSep < id.length - 1) {
-			return { kind, id: id.slice(0, generationSep), generation: id.slice(generationSep + 1) };
+			const decodedId = decodeJobRefPart(id.slice(0, generationSep));
+			const generation = decodeJobRefPart(id.slice(generationSep + 1));
+			if (decodedId && generation) return { kind, id: decodedId, generation };
 		}
 	}
 	return null;
@@ -108,7 +122,7 @@ export function buildJobsListItems(snapshot: JobsSnapshot): SelectItem[] {
 					)
 				: state;
 		items.push({
-			value: `folded:${job.id}:${job.generation}`,
+			value: `folded:${encodeJobRefPart(job.id)}:${encodeJobRefPart(job.generation)}`,
 			label: `${kind} · ${preview(job.label, TRUNCATE_LENGTHS.SHORT)}`,
 			description,
 			hint: job.status === "failed" || job.deliveryState === "failed-visible" ? "failed" : "read-only",
