@@ -216,6 +216,7 @@ export const credentialRefreshResponseSchema = z
 export const credentialDisableRequestSchema = z
 	.object({
 		cause: z.string().optional(),
+		expectedRevision: z.number().int().positive().optional(),
 	})
 	.strict();
 

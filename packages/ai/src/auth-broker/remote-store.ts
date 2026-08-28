@@ -836,6 +836,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 				provider: entry.provider,
 				credential: entry.credential as AuthCredential,
 				disabledCause: null,
+				...(entry.revision === undefined ? {} : { revision: entry.revision }),
 			});
 		}
 		return out;
@@ -869,21 +870,20 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		credentialId: number,
 		disabledCause: string,
 		signal?: AbortSignal,
+		expectedRevision?: number,
 	): Promise<boolean> {
 		try {
-			await this.#client.disableCredential(credentialId, disabledCause, signal);
+			await this.#client.disableCredential(credentialId, disabledCause, signal, expectedRevision);
 		} catch (error) {
 			if (!isErrorStatus(error, 404)) throw error;
 			// A peer may have disabled the row first. Reconcile the local mirror so
 			// AuthStorage can select a fallback without ever mutating remote state
 			// through the read-only synchronous methods.
-			if (!this.#streamingActive) {
-				await this.refreshSnapshot().catch(refreshError => {
-					logger.debug("auth-broker snapshot refresh after remote disable miss failed", {
-						error: String(refreshError),
-					});
+			await this.refreshSnapshot().catch(refreshError => {
+				logger.debug("auth-broker snapshot refresh after remote disable miss failed", {
+					error: String(refreshError),
 				});
-			}
+			});
 			return false;
 		}
 		this.#removeCredentialEntry(credentialId);

@@ -75,6 +75,7 @@ export type CredentialRefreshRequest = MCPOAuthRefreshClient;
 /** POST /v1/credential/:id/disable request body. */
 export interface CredentialDisableRequest {
 	cause: string;
+	expectedRevision?: number;
 }
 
 /** POST /v1/credential/:id/disable response body. */

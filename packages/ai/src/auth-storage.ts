@@ -383,6 +383,7 @@ export interface AuthCredentialSnapshotEntry {
 	provider: string;
 	credential: SnapshotCredential;
 	identityKey: string | null;
+	revision?: number;
 }
 
 export type AuthCredentialIfAbsentReason =
@@ -472,6 +473,7 @@ export interface AuthCredentialStore {
 	updateAuthCredential(id: number, credential: AuthCredential): void;
 	deleteAuthCredential(id: number, disabledCause: string): void;
 	tryDisableAuthCredentialIfMatches(id: number, expectedData: string, disabledCause: string): boolean;
+	tryDisableAuthCredentialIfRevision?(id: number, expectedRevision: number, disabledCause: string): boolean;
 	replaceAuthCredentialsForProvider(provider: string, credentials: AuthCredential[]): StoredAuthCredential[];
 	upsertAuthCredentialForProvider(provider: string, credential: AuthCredential): StoredAuthCredential[];
 	upsertAuthCredentialForProviderIfAbsent(provider: string, credential: AuthCredential): AuthCredentialIfAbsentResult;
@@ -591,7 +593,12 @@ export interface AuthCredentialStore {
 	 * disabled it first). Implementations MUST NOT treat a failed remote write as
 	 * a successful local deletion.
 	 */
-	disableAuthCredentialRemote?(credentialId: number, disabledCause: string, signal?: AbortSignal): Promise<boolean>;
+	disableAuthCredentialRemote?(
+		credentialId: number,
+		disabledCause: string,
+		signal?: AbortSignal,
+		expectedRevision?: number,
+	): Promise<boolean>;
 	/**
 	 * Optional async write hook for upserting a single credential. When present,
 	 * `AuthStorage.#upsertOAuthCredential` routes through this instead of the
@@ -1273,11 +1280,12 @@ class AuthStorageUsageCache implements UsageCache {
 // In-memory representation
 // ─────────────────────────────────────────────────────────────────────────────
 
-type StoredCredential = { id: number; credential: AuthCredential };
+type StoredCredential = { id: number; credential: AuthCredential; revision?: number };
 type IndexedStoredCredential<T extends AuthCredential = AuthCredential> = {
 	id: number;
 	credential: T;
 	index: number;
+	revision?: number;
 };
 type OAuthCredentialSelection = IndexedStoredCredential<OAuthCredential>;
 type ConfigApiKeyRegistration = { apiKey: string; envSourced: boolean; order: number };
@@ -2204,7 +2212,7 @@ export class AuthStorage {
 		const grouped = new Map<string, StoredCredential[]>();
 		for (const record of records) {
 			const list = grouped.get(record.provider) ?? [];
-			list.push({ id: record.id, credential: record.credential });
+			list.push({ id: record.id, credential: record.credential, revision: record.revision });
 			grouped.set(record.provider, list);
 		}
 
@@ -2739,10 +2747,11 @@ export class AuthStorage {
 		credentialId: number,
 		disabledCause: string,
 		signal?: AbortSignal,
+		expectedRevision?: number,
 	): Promise<boolean> {
 		const disable = this.#store.disableAuthCredentialRemote?.bind(this.#store);
 		if (!disable) return false;
-		const disabled = await disable(credentialId, disabledCause, signal);
+		const disabled = await disable(credentialId, disabledCause, signal, expectedRevision);
 		if (!disabled) return false;
 		const entries = this.#getStoredCredentials(provider);
 		if (!entries.some(entry => entry.id === credentialId)) return true;
@@ -2845,6 +2854,7 @@ export class AuthStorage {
 				provider: entry.provider,
 				credential: redacted,
 				identityKey: resolveCredentialIdentityKey(provider, persisted),
+				...(entry.revision === undefined ? {} : { revision: entry.revision }),
 			};
 		});
 	}
@@ -2869,7 +2879,7 @@ export class AuthStorage {
 		if (this.#hasConfigOverride(storageProvider, owner))
 			return this.#snapshotSkipResult(storageProvider, "skipped-existing-config");
 		if (getEnvApiKey(storageProvider)) return this.#snapshotSkipResult(storageProvider, "skipped-existing-env");
-		if (this.#resolveFallback(storageProvider))
+		if (this.#resolveFallback(storageProvider, owner))
 			return this.#snapshotSkipResult(storageProvider, "skipped-existing-fallback");
 
 		const result = this.#store.upsertAuthCredentialRemoteIfAbsent
@@ -2951,6 +2961,23 @@ export class AuthStorage {
 		if (this.#getCredentialsForProvider(storageProvider).length > 0) return true;
 		if (getEnvApiKey(storageProvider)) return true;
 		if (this.#resolveFallback(storageProvider, owner)) return true;
+		return false;
+	}
+
+	disableCredentialByIdIfRevision(id: number, expectedRevision: number, disabledCause: string): boolean {
+		const cause = normalizeDisabledCause(disabledCause);
+		if (this.#store.tryDisableAuthCredentialIfRevision?.(id, expectedRevision, cause) !== true) return false;
+		for (const [provider, entries] of this.#data) {
+			if (!entries.some(entry => entry.id === id)) continue;
+			this.#setStoredCredentials(
+				provider,
+				entries.filter(entry => entry.id !== id),
+			);
+			this.#clearSelectorsForRemovedCredential(provider, new Set([id]), entries);
+			this.#resetProviderAssignments(provider);
+			this.#emitCredentialDisabled({ provider, disabledCause: cause });
+			return true;
+		}
 		return false;
 	}
 
@@ -4766,14 +4793,23 @@ export class AuthStorage {
 						id: selectedCredential.id,
 						credential: selectedCredential.credential,
 						index: selectedCredential.index,
+						revision: selectedCredential.revision,
 					}
 				: undefined;
 		if (selectedCredential && !selectedOAuthCredential) return undefined;
 		const credentials = selectedOAuthCredential
 			? [selectedOAuthCredential]
 			: this.#getStoredCredentials(provider)
-					.map((entry, index) => ({ id: entry.id, credential: entry.credential, index }))
-					.filter((entry): entry is OAuthCredentialSelection => entry.credential.type === "oauth");
+					.filter(
+						(entry): entry is StoredCredential & { credential: OAuthCredential } =>
+							entry.credential.type === "oauth",
+					)
+					.map((entry, index) => ({
+						id: entry.id,
+						credential: entry.credential,
+						index,
+						revision: entry.revision,
+					}));
 
 		if (credentials.length === 0) return undefined;
 
@@ -5154,6 +5190,7 @@ export class AuthStorage {
 		if (current?.credential.type !== "oauth") return false;
 		selection.index = index;
 		selection.credential = current.credential;
+		selection.revision = current.revision;
 		return true;
 	}
 
@@ -5182,6 +5219,7 @@ export class AuthStorage {
 		if (latest?.credential.type !== "oauth") return false;
 		selection.index = latestIndex;
 		selection.credential = latest.credential;
+		selection.revision = latest.revision;
 		return true;
 	}
 
@@ -5442,6 +5480,7 @@ export class AuthStorage {
 									attemptedCredentialId,
 									disabledCause,
 									options?.signal,
+									selection.revision,
 								);
 								if (!disabled) {
 									await this.reload();
@@ -5886,6 +5925,7 @@ export class AuthStorage {
 					provider,
 					credential: redacted,
 					identityKey: resolveCredentialIdentityKey(provider, credential),
+					...(entry.revision === undefined ? {} : { revision: entry.revision }),
 				});
 			}
 		}
@@ -6343,6 +6383,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 	#updateStmt: Statement;
 	#deleteStmt: Statement;
 	#deleteIfMatchesStmt: Statement;
+	#deleteIfRevisionStmt: Statement;
 	#deleteByProviderStmt: Statement;
 	#hardDeleteStmt: Statement;
 	#getCacheStmt: Statement;
@@ -6382,6 +6423,9 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		);
 		this.#deleteIfMatchesStmt = this.#db.prepare(
 			`UPDATE auth_credentials SET disabled_cause = ?, revision = revision + 1, updated_at = ${SQLITE_NOW_EPOCH} WHERE id = ? AND data = ? AND disabled_cause IS NULL`,
+		);
+		this.#deleteIfRevisionStmt = this.#db.prepare(
+			`UPDATE auth_credentials SET disabled_cause = ?, revision = revision + 1, updated_at = ${SQLITE_NOW_EPOCH} WHERE id = ? AND revision = ? AND disabled_cause IS NULL`,
 		);
 		this.#deleteByProviderStmt = this.#db.prepare(
 			`UPDATE auth_credentials SET disabled_cause = ?, revision = revision + 1, updated_at = ${SQLITE_NOW_EPOCH} WHERE provider = ? AND disabled_cause IS NULL`,
@@ -7064,6 +7108,17 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		}
 	}
 
+	tryDisableAuthCredentialIfRevision(id: number, expectedRevision: number, disabledCause: string): boolean {
+		try {
+			const result = this.#deleteIfRevisionStmt.run(normalizeDisabledCause(disabledCause), id, expectedRevision) as {
+				changes: number;
+			};
+			return result.changes === 1;
+		} catch {
+			return false;
+		}
+	}
+
 	deleteAuthCredentialsForProvider(provider: string, disabledCause: string): void {
 		try {
 			this.#deleteByProviderStmt.run(normalizeDisabledCause(disabledCause), provider);
@@ -7195,6 +7250,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		this.#updateStmt.finalize();
 		this.#deleteStmt.finalize();
 		this.#deleteIfMatchesStmt.finalize();
+		this.#deleteIfRevisionStmt.finalize();
 		this.#deleteByProviderStmt.finalize();
 		this.#hardDeleteStmt.finalize();
 		this.#getCacheStmt.finalize();

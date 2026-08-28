@@ -674,7 +674,10 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 					const parsed = await parseBody(req, credentialDisableRequestSchema, { allowEmpty: true });
 					if (!parsed.ok) return parsed.response;
 					const cause = "disabled via auth-broker";
-					const ok = opts.storage.disableCredentialById(id, cause);
+					const ok =
+						parsed.data.expectedRevision === undefined
+							? opts.storage.disableCredentialById(id, cause)
+							: opts.storage.disableCredentialByIdIfRevision(id, parsed.data.expectedRevision, cause);
 					if (!ok) {
 						logger.info("auth-broker disable miss", { id, peer });
 						return json(404, { error: `No credential with id=${id}` });
