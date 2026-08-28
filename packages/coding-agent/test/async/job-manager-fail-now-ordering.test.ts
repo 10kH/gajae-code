@@ -106,6 +106,37 @@ describe("AsyncJobManager.failNow", () => {
 		expect(delivered).toEqual(["owner teardown killed the terminal"]);
 	});
 
+	test("drains cleanup-triggered failure before clearing delivery state", async () => {
+		const deliveryStarted = Promise.withResolvers<void>();
+		const releaseDelivery = Promise.withResolvers<void>();
+		const delivered: string[] = [];
+		const manager = new AsyncJobManager({
+			retentionMs: 60_000,
+			onJobComplete: async (_jobId, text) => {
+				deliveryStarted.resolve();
+				await releaseDelivery.promise;
+				delivered.push(text);
+			},
+		});
+		const gate = Promise.withResolvers<string>();
+		const jobId = manager.register("bash", "remote", async () => gate.promise, {
+			id: "bridge-4",
+			ownerId: "0-Main",
+		});
+		const generation = manager.getJob(jobId)?.generation ?? "";
+		manager.registerOwnerCleanup("0-Main", () => {
+			manager.failNow(jobId, generation, "cleanup failure");
+		});
+
+		const disposal = manager.dispose({ timeoutMs: 2_000 });
+		await deliveryStarted.promise;
+		releaseDelivery.resolve();
+		gate.resolve("late runner result");
+
+		expect(await disposal).toBe(true);
+		expect(delivered).toEqual(["cleanup failure"]);
+	});
+
 	test("closes registration while owner cleanups run during dispose", async () => {
 		const manager = new AsyncJobManager({ retentionMs: 60_000, onJobComplete: async () => {} });
 		let registerDuringCleanup: string | undefined;

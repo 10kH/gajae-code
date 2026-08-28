@@ -405,6 +405,33 @@ describe("AsyncJobManager delivery reliability", () => {
 		await manager.dispose({ timeoutMs: 250 });
 	});
 
+	test("retains a parked fold delivery after its job record is evicted", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: () => {}, retentionMs: 0 });
+		try {
+			const jobId = manager.register("bash", "evicted parked fold", async () => "done", {
+				id: "evicted-parked-fold",
+				metadata: { backgrounded: true },
+			});
+			const job = manager.getJob(jobId);
+			if (!job) throw new Error("expected evicted parked job");
+			manager.retainParkedDelivery(job, "parked output");
+
+			await manager.waitForAll();
+
+			expect(manager.getJob(jobId)).toBeUndefined();
+			expect(manager.getJobsSnapshot().jobs).toContainEqual(
+				expect.objectContaining({
+					id: jobId,
+					generation: job.generation,
+					status: "running",
+					deliveryState: "pending",
+				}),
+			);
+		} finally {
+			await manager.dispose({ timeoutMs: 250 });
+		}
+	});
+
 	test("receipt claims prevent job-id reuse until wake consumption", async () => {
 		const manager = new AsyncJobManager({ onJobComplete: () => {}, retentionMs: 0 });
 		const originalId = manager.register("bash", "claimed", async () => "done", { id: "claimed-job" });

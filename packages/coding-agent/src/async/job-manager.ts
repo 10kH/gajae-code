@@ -649,6 +649,7 @@ export class AsyncJobManager {
 	readonly #retentionMs: number;
 	#deliveryLoop: Promise<void> | undefined;
 	#disposed = false;
+	#disposing = false;
 	readonly #subagentRecords = new Map<string, SubagentRecord>();
 	readonly #terminalEvents = new Map<string, TerminalEvent>();
 	readonly #waitGenerationAliases = new Map<string, string>();
@@ -2698,7 +2699,7 @@ export class AsyncJobManager {
 		this.#registrationClosed = true;
 		this.#clearEvictionTimers();
 		this.runOwnerCleanups();
-		this.#disposed = true;
+		this.#disposing = true;
 		this.cancelAll();
 		for (const tombstone of this.#monitorTombstones.values()) {
 			try {
@@ -2719,6 +2720,7 @@ export class AsyncJobManager {
 			logger.warn("Async job manager dispose timed out waiting for jobs", { stuckJobIds: waitResult.stuckJobIds });
 		}
 		this.#clearEvictionTimers();
+		this.#disposed = true;
 		this.#jobs.clear();
 		this.#deliveries.length = 0;
 		this.#inFlightDeliveries.length = 0;
@@ -2841,7 +2843,6 @@ export class AsyncJobManager {
 			}
 		}
 		this.#jobs.delete(jobId);
-		if (job) this.#parkedDeliveries.delete(job.generation);
 		this.#settledJobIds.delete(jobId);
 		this.#lifecycles.delete(jobId);
 		this.#lifecyclePhases.delete(jobId);
@@ -3177,7 +3178,7 @@ export class AsyncJobManager {
 			} catch (error) {
 				delivery.attempt += 1;
 				delivery.lastError = this.#boundedDeliveryErrorText(error instanceof Error ? error.message : String(error));
-				if (this.#disposed) {
+				if (this.#disposed || this.#disposing) {
 					logger.warn("Async job completion delivery dropped after manager disposal", {
 						jobId: delivery.jobId,
 						attempt: delivery.attempt,
