@@ -17,7 +17,7 @@ import type {
 } from "../gjc-runtime/gc-runtime";
 import { gcPidStatusLabel } from "../gjc-runtime/gc-runtime";
 import { resolveReceiptSpoolDir } from "../harness-control-plane/receipt-spool";
-import { readFileLockInfoForGc, removeFileLockDirForGc } from "./file-lock";
+import { readFileLockObservationForGc, removeFileLockDirForGc } from "./file-lock";
 
 const MAX_WALK_DEPTH = 6;
 /** Default per-root walk budget. Truncation is a warning, not a hard error. */
@@ -68,7 +68,8 @@ function keptMalformedRecord(lockDir: string): GcRecord {
 }
 
 async function collectLockRecord(lockDir: string, ctx: GcContext): Promise<GcRecord> {
-	const info = await readFileLockInfoForGc(lockDir);
+	const observation = await readFileLockObservationForGc(lockDir);
+	const info = observation?.info;
 	if (!info) return keptMalformedRecord(lockDir);
 	if (info.owner_host_id !== undefined) {
 		return {
@@ -203,7 +204,8 @@ export const fileLocksGcAdapter: GcStoreAdapter = {
 	},
 	async prune(record: GcRecord, ctx: GcContext): Promise<GcPruneOutcome> {
 		const lockDir = record.path ?? record.id;
-		const info = await readFileLockInfoForGc(lockDir);
+		const observation = await readFileLockObservationForGc(lockDir);
+		const info = observation?.info;
 		if (!info) return { removed: false, skipped: "lock_no_longer_dead_or_missing" };
 		if (info.owner_host_id !== undefined) {
 			return { removed: false, skipped: "host_qualified_lock_requires_owner_reclamation" };
@@ -220,12 +222,15 @@ export const fileLocksGcAdapter: GcStoreAdapter = {
 		// so removal re-verifies the on-disk identity under the unlink and refuses
 		// to delete a recreated LIVE lock (TOCTOU).
 		try {
-			const removal = await removeFileLockDirForGc(lockDir, info);
+			const removal = await removeFileLockDirForGc(lockDir, info, observation?.identity);
 			if (removal === "owner_changed") {
 				return { removed: false, skipped: "file_lock_owner_changed_before_delete" };
 			}
 			if (removal === "missing") {
 				return { removed: false, skipped: "lock_no_longer_dead_or_missing" };
+			}
+			if (removal === "cleanup_failed") {
+				return { removed: false, skipped: "lock_removal_denied_by_native_identity_guard" };
 			}
 			return { removed: true };
 		} catch (error) {
