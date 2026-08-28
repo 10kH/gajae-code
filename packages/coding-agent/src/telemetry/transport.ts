@@ -35,6 +35,7 @@ export function sendTelemetryEvent(
 	const fetchImpl = deps.fetchImpl ?? fetch;
 	const controller = new AbortController();
 	const timeout = setTimeout(() => controller.abort(), TELEMETRY_TIMEOUT_MS);
+	timeout.unref?.();
 	void fetchImpl(deps.endpoint ?? TELEMETRY_ENDPOINT, {
 		method: "POST",
 		headers: { "content-type": "application/json" },
