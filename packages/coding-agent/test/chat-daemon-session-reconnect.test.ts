@@ -11,7 +11,13 @@ import type { DiscordMessageComponent, DiscordProvider, DiscordThread } from "..
 import { SlackProviderError } from "../src/sdk/bus/slack-live-provider";
 import type { SlackProviderClient } from "../src/sdk/bus/slack-provider";
 import { ACP_SESSION_RECONNECT } from "../src/sdk/session-reconnect";
-import { drainReconnects, expectedBackoffs, FakeWebSocket, withFakeTransport } from "./helpers/fake-sdk-transport";
+import {
+	drainReconnects,
+	expectedBackoffs,
+	type FakeClock,
+	FakeWebSocket,
+	withFakeTransport,
+} from "./helpers/fake-sdk-transport";
 
 const SESSION_ID = "chat-reconnect-session";
 const GENERATION = 4;
@@ -631,8 +637,14 @@ async function awaitSocket(count: number): Promise<FakeWebSocket> {
  * a test that drops the socket the instant a post appears would otherwise be racing a
  * cursor the runtime has not moved yet.
  */
-async function awaitPosts(provider: FakeSlackProvider, count: number): Promise<void> {
-	for (let attempt = 0; attempt < 5_000 && provider.posts.length < count; attempt++) await Bun.sleep(1);
+async function awaitPosts(provider: FakeSlackProvider, count: number, clock?: FakeClock): Promise<void> {
+	for (let attempt = 0; attempt < 5_000 && provider.posts.length < count; attempt++) {
+		if (clock) {
+			const pending = clock.pendingDelays();
+			if (pending.length > 0) clock.advanceBy(Math.min(...pending));
+		}
+		await Bun.sleep(1);
+	}
 	expect(provider.posts).toHaveLength(count);
 	await Bun.sleep(25);
 }
@@ -672,8 +684,14 @@ async function awaitRefusals(provider: FakeSlackProvider, count: number): Promis
 }
 
 /** The replay rides the socket, so settle on the request the host itself observed. */
-async function awaitReplayRequests(host: FakeSessionHost, count: number): Promise<void> {
-	for (let attempt = 0; attempt < 5_000 && host.replayRequests.length < count; attempt++) await Bun.sleep(1);
+async function awaitReplayRequests(host: FakeSessionHost, count: number, clock?: FakeClock): Promise<void> {
+	for (let attempt = 0; attempt < 5_000 && host.replayRequests.length < count; attempt++) {
+		if (clock) {
+			const pending = clock.pendingDelays();
+			if (pending.length > 0) clock.advanceBy(Math.min(...pending));
+		}
+		await Bun.sleep(1);
+	}
 	expect(host.replayRequests).toHaveLength(count);
 }
 
@@ -994,7 +1012,7 @@ test("a supersession while a replay is pending discards it instead of replaying 
 
 test("a replay refused on a live socket loses no event and leaves the cursor below the gap", async () => {
 	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile }) => {
-		await withSerializedFakeTransport(async () => {
+		await withSerializedFakeTransport(async clock => {
 			const host = new FakeSessionHost();
 			const starting = runtime.start();
 			host.accept(await awaitSocket(1));
@@ -1012,11 +1030,11 @@ test("a replay refused on a live socket loses no event and leaves the cursor bel
 
 			reconcile();
 			host.accept(await awaitSocket(2));
-			await awaitReplayRequests(host, 2);
+			await awaitReplayRequests(host, 2, clock);
 			// Delivered on the live socket after the refusal, while the gap is still open.
 			host.emit("three");
 
-			await awaitPosts(provider, 3);
+			await awaitPosts(provider, 3, clock);
 			await Bun.sleep(20);
 			// The refusal costs the stream nothing: every sequence, exactly once, in order.
 			expect(provider.posts.map(post => post.text)).toEqual([
@@ -1039,7 +1057,7 @@ test("a replay refused on a live socket loses no event and leaves the cursor bel
 
 test("a replay refused past its retry budget rebuilds the attachment from its cursor", async () => {
 	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile, awaitFrameSettlement }) => {
-		await withSerializedFakeTransport(async () => {
+		await withSerializedFakeTransport(async clock => {
 			const host = new FakeSessionHost();
 			const starting = runtime.start();
 			host.accept(await awaitSocket(1));
@@ -1057,14 +1075,14 @@ test("a replay refused past its retry budget rebuilds the attachment from its cu
 
 			reconcile();
 			host.accept(await awaitSocket(2));
-			await awaitReplayRequests(host, 5);
+			await awaitReplayRequests(host, 5, clock);
 			// The barrier has failed by now, so this frame is not published on the fenced
 			// attachment — but it is in the host log, so the rebuild owes it too.
 			host.emit("three");
 
 			reconcile();
 			host.accept(await awaitSocket(3));
-			await awaitPosts(provider, 3);
+			await awaitPosts(provider, 3, clock);
 			await Bun.sleep(20);
 			// The rebuild resumes the same stream instead of restarting it: nothing above the
 			// cursor is skipped, and nothing at or below it is published twice.

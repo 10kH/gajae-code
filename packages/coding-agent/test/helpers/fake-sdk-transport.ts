@@ -165,10 +165,17 @@ export async function drainReconnects(clock: FakeClock, attempt = 0): Promise<nu
 		for (let tick = 0; tick < 4; tick++) await flush();
 		const pending = clock.pendingDelays();
 		if (pending.length === 0) break;
-		// The failed incarnation clears its open timer, so only the backoff sleep is pending.
-		expect(pending).toHaveLength(1);
-		observed.push(pending[0]);
-		clock.advanceBy(pending[0]);
+		// The startup budget may still be pending while the long-lived reconnect
+		// cycle drains. Select the transport backoff; the open timer is cleared by
+		// the failed incarnation and the startup cutoff is independent of it.
+		const backoffs = pending.filter(delay => delay <= 2_000);
+		expect(backoffs.length).toBeGreaterThan(0);
+		// A startup cutoff can be shorter than the current backoff near the end of
+		// the budget. The transport backoff is the largest short timer; the cutoff
+		// is allowed to remain pending until startup observes it.
+		const backoff = Math.max(...backoffs);
+		observed.push(backoff);
+		clock.advanceBy(backoff);
 		for (let tick = 0; tick < 4; tick++) await flush();
 	}
 	return observed;
