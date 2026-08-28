@@ -6062,11 +6062,13 @@ export class AuthStorage {
 				mcpBinding: refreshed.mcpBinding,
 			};
 			this.#replaceCredentialAt(provider, index, updated, !refreshed.persistedByLease, id);
+			const persisted = this.#store.listAuthCredentials(provider).find(entry => entry.id === id);
 			return {
 				id,
 				provider,
 				credential: { ...updated, refresh: REMOTE_REFRESH_SENTINEL },
 				identityKey: resolveCredentialIdentityKey(provider, updated),
+				...(persisted?.revision === undefined ? {} : { revision: persisted.revision }),
 			};
 		}
 		throw new Error(`No credential with id=${id}`);
@@ -6863,6 +6865,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				id: row.id,
 				credential: deserializeCredential(row),
 				identityKey: resolveRowCredentialIdentityKey(providerName, row),
+				revision: row.revision,
 			}));
 
 			const result: StoredAuthCredential[] = [];
@@ -6879,7 +6882,13 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				if (match) {
 					matchedExistingIds.add(match.id);
 					this.#updateStmt.run(serialized.credentialType, serialized.data, serialized.identityKey, match.id);
-					result.push({ id: match.id, provider: providerName, credential, disabledCause: null });
+					result.push({
+						id: match.id,
+						provider: providerName,
+						credential,
+						disabledCause: null,
+						revision: match.revision + 1,
+					});
 				} else {
 					const row = this.#insertStmt.get(
 						providerName,
@@ -6888,7 +6897,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 						serialized.identityKey,
 					) as { id?: number } | undefined;
 					if (row?.id) {
-						result.push({ id: row.id, provider: providerName, credential, disabledCause: null });
+						result.push({ id: row.id, provider: providerName, credential, disabledCause: null, revision: 1 });
 					}
 				}
 			}
@@ -6981,6 +6990,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 					id: number;
 					credential: AuthCredential;
 					identityKey: string | null;
+					revision: number;
 				}> = [];
 				for (const row of existingRows) {
 					const activeCredential = deserializeCredential(row);
@@ -6989,6 +6999,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 						id: row.id,
 						credential: activeCredential,
 						identityKey: resolveRowCredentialIdentityKey(providerName, row),
+						revision: row.revision,
 					});
 				}
 				if (existing.length > 0) {
@@ -7021,6 +7032,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 							provider: providerName,
 							credential: row.credential,
 							disabledCause: null,
+							revision: row.revision,
 						})),
 					};
 				}
