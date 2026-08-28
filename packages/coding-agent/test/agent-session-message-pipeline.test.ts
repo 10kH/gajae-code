@@ -1040,7 +1040,7 @@ describe("AgentSession message pipeline", () => {
 		integrationAborted = false;
 		const sdkSubmission = session.sendUserMessage("sdk terminal fast path", {
 			sdkRunToken: "sdk-terminal-fast-path",
-		});
+		} as never);
 		const secondAgentEnd = Promise.withResolvers<void>();
 		const unsubscribe = session.subscribe(event => {
 			if (event.type === "agent_end" && events.filter(candidate => candidate.type === "agent_end").length >= 2)

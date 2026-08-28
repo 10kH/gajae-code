@@ -282,7 +282,7 @@ test.serial("cancels only its accepted idle follow-up before it can execute", as
 		preflightSignal: controller.signal,
 		sdkRunToken: "sdk-owned-follow-up",
 		onPreflightAcceptCommit: () => {},
-	});
+	} as never);
 	controller.abort();
 
 	expect(agent.snapshotFollowUp()).toMatchObject([{ content: [{ type: "text", text: "unrelated follow-up" }] }]);
@@ -319,7 +319,7 @@ test.serial("defers an SDK follow-up behind pre-existing queued work so its run 
 		preflightSignal: controller.signal,
 		sdkRunToken: "sdk-owned-follow-up-deferred",
 		onPreflightAcceptCommit: () => {},
-	});
+	} as never);
 
 	// The SDK-owned follow-up must not sit behind the unrelated message: at the
 	// next acceptance the unrelated message would run first and the SDK message
@@ -358,7 +358,7 @@ test.serial("releases a deferred SDK follow-up only after queued work drains", a
 		preflightSignal: new AbortController().signal,
 		sdkRunToken: "sdk-owned-follow-up-release",
 		onPreflightAcceptCommit: () => {},
-	});
+	} as never);
 	expect(agent.snapshotFollowUp()).toHaveLength(1);
 
 	// agent_end while queued work is still pending must hold the SDK follow-up.
@@ -404,13 +404,13 @@ test.serial("releases the next deferred SDK follow-up when a released one is can
 		preflightSignal: firstController.signal,
 		sdkRunToken: "token-m1",
 		onPreflightAcceptCommit: () => {},
-	});
+	} as never);
 	await session.sendUserMessage("owned m2", {
 		deliverAs: "followUp",
 		preflightSignal: secondController.signal,
 		sdkRunToken: "token-m2",
 		onPreflightAcceptCommit: () => {},
-	});
+	} as never);
 	// Both SDK follow-ups are deferred behind the pre-existing queued work.
 	expect(agent.snapshotFollowUp()).toHaveLength(1);
 

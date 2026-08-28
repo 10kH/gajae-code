@@ -1080,6 +1080,12 @@ export interface PromptOptions {
 }
 
 type InternalPromptOptions = PromptOptions & { sdkRunToken?: string };
+type InternalSkillOptions = Pick<PromptOptions, "onPreflightAccepted" | "onPreflightAcceptCommit" | "onSkillPrepared" | "preflightSignal"> & {
+	sdkRunToken?: string;
+};
+type InternalCustomMessageOptions = Pick<PromptOptions, "streamingBehavior" | "toolChoice" | "followUpQueuePolicy" | "onPreflightAccepted" | "onPreflightAcceptCommit" | "preflightSignal"> & {
+	sdkRunToken?: string;
+};
 
 function promptPreflightCancelledError(): Error {
 	const error = Object.assign(new Error("Prompt preflight was cancelled before execution."), { code: "busy" });
@@ -10049,7 +10055,7 @@ export class AgentSession {
 		options?: Pick<
 			PromptOptions,
 			"onPreflightAccepted" | "onPreflightAcceptCommit" | "onSkillPrepared" | "preflightSignal"
-		> & { sdkRunToken?: string },
+		>,
 	): Promise<{ name: string; path: string; args?: string; lineCount?: number }> {
 		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		const skillName = name.trim();
@@ -10096,7 +10102,7 @@ export class AgentSession {
 			lineCount: built.details.lineCount,
 			cleanedArgs: activation.cleanedArgs || undefined,
 		});
-		await this.promptCustomMessage(skillPromptMessage, options);
+		await this.promptCustomMessage(skillPromptMessage, options as InternalCustomMessageOptions);
 		return {
 			name: skill.name,
 			path: skill.filePath,
@@ -11065,8 +11071,9 @@ export class AgentSession {
 			| "onPreflightAccepted"
 			| "onPreflightAcceptCommit"
 			| "preflightSignal"
-		> & { sdkRunToken?: string },
+		>,
 	): Promise<void> {
+		const internalOptions = options as InternalCustomMessageOptions | undefined;
 		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		const textContent =
 			typeof message.content === "string"
@@ -11135,7 +11142,7 @@ export class AgentSession {
 				};
 				try {
 					await this.#promptWithMessage(customMessage, textContent, {
-						...options,
+						...internalOptions,
 						onPreflightAccepted: undefined,
 						onPreflightAcceptCommit: commitAcceptance,
 						admissionLease: admission,
@@ -12434,9 +12441,9 @@ export class AgentSession {
 			/** Internal dispatch disposition used before actual queue consumption. */
 			onDispatchDisposition?: (promotion: { startsOwnRun: boolean }) => void;
 			preflightSignal?: AbortSignal;
-			sdkRunToken?: string;
 		},
 	): Promise<void> {
+		const internalOptions = options as (typeof options & { sdkRunToken?: string }) | undefined;
 		this.#assertRecoveryHydrationPromoted();
 		const owner = this.#sessionAdmissionContext.getStore();
 		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
@@ -12559,7 +12566,7 @@ export class AgentSession {
 					claimsGenuineUserIntent: true,
 					forceOneAtATime: Boolean(options?.preflightSignal || options?.queuedAtDispatch),
 					onPromoted: options?.onQueuedPromoted,
-					sdkRunToken: options?.sdkRunToken,
+					sdkRunToken: internalOptions?.sdkRunToken,
 				});
 				const cancelQueuedFollowUp = () => queuedFollowUp.cancel();
 				options?.preflightSignal?.addEventListener("abort", cancelQueuedFollowUp, { once: true });
@@ -12574,7 +12581,7 @@ export class AgentSession {
 					claimsGenuineUserIntent: true,
 					onPromoted: options?.onQueuedPromoted,
 					external: true,
-					sdkRunToken: options?.sdkRunToken,
+					sdkRunToken: internalOptions?.sdkRunToken,
 				});
 				options?.onPreflightAccepted?.();
 				return;
@@ -12594,7 +12601,7 @@ export class AgentSession {
 					claimsGenuineUserIntent: true,
 					onPromoted: options?.onQueuedPromoted,
 					external: true,
-					sdkRunToken: options?.sdkRunToken,
+					sdkRunToken: internalOptions?.sdkRunToken,
 				});
 				// Dispatch-race disposition (#4668 review P1): the SDK snapshot-decided
 				// this submission starts its own turn (idle at dispatch), but the
@@ -12620,7 +12627,7 @@ export class AgentSession {
 			await this.prompt(text, {
 				expandPromptTemplates: false,
 				images,
-				sdkRunToken: options?.sdkRunToken,
+				sdkRunToken: internalOptions?.sdkRunToken,
 				onPreflightAccepted: () => {
 					options?.onPreflightAccepted?.();
 					fireQueuedPromotion();

@@ -230,10 +230,10 @@ describe("queued promotion run identity (#4668)", () => {
 		const queuedDone = session.sendUserMessage("deferred target", {
 			deliverAs: "followUp",
 			sdkRunToken: "deferred-target-token",
-			onQueuedPromoted: promotion => {
+			onQueuedPromoted: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => {
 				if (promotion.removed) removals.push("deferred target");
 			},
-		});
+		} as never);
 		await queuedDone;
 		// The deferred target is displayed but NOT in the Agent live queue.
 		const entries = session.getQueuedMessageEntries();
@@ -284,10 +284,10 @@ describe("queued promotion run identity (#4668)", () => {
 		const queuedDone = session.sendUserMessage("deferred follow-up", {
 			deliverAs: "followUp",
 			sdkRunToken: "deferred-clear-token",
-			onQueuedPromoted: promotion => {
+			onQueuedPromoted: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => {
 				if (promotion.removed) removals.push("deferred follow-up");
 			},
-		});
+		} as never);
 		await queuedDone;
 		expect(session.agent.snapshotFollowUp()).toHaveLength(1);
 		const cleared = session.clearQueue();
