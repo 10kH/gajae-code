@@ -57,6 +57,7 @@ afterEach(async () => {
 	SessionStateLockTestHooks.afterCurrentOwnerValidation = undefined;
 	SessionStateLockTestHooks.beforeOwnerRecordRewrite = undefined;
 	SessionStateLockTestHooks.beforeTransitionReleaseLstat = undefined;
+	SessionStateLockTestHooks.beforeTransitionSetupLstat = undefined;
 	installExactIdentityNatives();
 	setSystemTime();
 	if (ORIGINAL_STATE_FILE === undefined) delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
@@ -1540,6 +1541,25 @@ describe("coordinator session state lock", () => {
 
 		expect(callbackCount).toBe(1);
 		expect(fsSync.existsSync(transitionDir)).toBe(false);
+	});
+
+	it("cleans a transition claim when setup generation lstat faults", async () => {
+		const { stateFile } = await seededRunningSession("lock-transition-setup-lstat-fault");
+		const transitionDir = `${stateFile}.lock.transition`;
+		let faulted = false;
+		SessionStateLockTestHooks.beforeTransitionSetupLstat = async target => {
+			if (target === transitionDir && !faulted) {
+				faulted = true;
+				throw Object.assign(new Error("setup generation lstat fault"), { code: "EIO" });
+			}
+		};
+
+		await expect(withSessionStateFileLock(stateFile, async () => "entered")).rejects.toBeInstanceOf(
+			SessionStateLockUnavailableError,
+		);
+		expect(faulted).toBe(true);
+		expect(fsSync.existsSync(transitionDir)).toBe(false);
+		await expect(withSessionStateFileLock(stateFile, async () => "reacquired")).resolves.toBe("reacquired");
 	});
 
 	it("retains the generation record when release-owner capture faults before rewrite", async () => {

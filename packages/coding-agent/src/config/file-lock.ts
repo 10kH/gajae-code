@@ -288,6 +288,9 @@ async function readLockInfoObservation(lockPath: string): Promise<LockInfoObserv
 		)
 			return null;
 		return { bytes: bytes.toString("utf8"), state: afterPath };
+	} catch (error) {
+		if (isEnoent(error)) return null;
+		throw error;
 	} finally {
 		await handle?.close().catch(() => undefined);
 	}

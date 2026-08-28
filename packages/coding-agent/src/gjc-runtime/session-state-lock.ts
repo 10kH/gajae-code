@@ -71,6 +71,23 @@ interface TransitionDirectoryGeneration {
 	ctimeNs: bigint;
 }
 
+const TRANSITION_DIRECTORY_OPEN_FLAGS =
+	fsSync.constants.O_RDONLY |
+	(fsSync.constants.O_DIRECTORY ?? 0) |
+	(fsSync.constants.O_NOFOLLOW ?? 0);
+
+async function captureTransitionDirectoryGeneration(transitionDir: string): Promise<TransitionDirectoryGeneration> {
+	let handle: fs.FileHandle | undefined;
+	try {
+		handle = await fs.open(transitionDir, TRANSITION_DIRECTORY_OPEN_FLAGS);
+		const stat = await handle.stat({ bigint: true });
+		if (!stat.isDirectory()) throw new Error("Transition claim is no longer a directory.");
+		return transitionGenerationFromStat(stat as fsSync.BigIntStats);
+	} finally {
+		await handle?.close().catch(() => undefined);
+	}
+}
+
 function transitionGenerationFromStat(stat: fsSync.BigIntStats): TransitionDirectoryGeneration {
 	return {
 		dev: stat.dev,
@@ -85,7 +102,7 @@ function transitionGenerationFromStat(stat: fsSync.BigIntStats): TransitionDirec
 interface PendingTransitionRelease {
 	phase: "setup" | "release";
 	token: string;
-	generation: TransitionDirectoryGeneration;
+	generation?: TransitionDirectoryGeneration;
 	held?: LockOwnerSnapshot;
 	releasedOwner?: SessionStateLockOwner;
 	recoverable: boolean;
@@ -239,6 +256,8 @@ export const SessionStateLockTestHooks: {
 	beforeOwnerRecordRewrite?: (file: string) => void | Promise<void>;
 	/** @internal Fault seam immediately before final transition-generation validation. */
 	beforeTransitionReleaseLstat?: (transitionDir: string) => void | Promise<void>;
+	/** @internal Fault seam immediately before setup generation capture. */
+	beforeTransitionSetupLstat?: (transitionDir: string) => void | Promise<void>;
 	/**
 	 * @internal Runs after a live owner has been proven and immediately before its
 	 * final pathname capture for release. Tests use it to replace the pathname and
@@ -1160,6 +1179,7 @@ async function recoverPendingTransitionRelease(transitionDir: string, recoveryKe
 		if (!current?.isDirectory()) return false;
 		for (const [key, candidate] of pendingTransitionReleases) {
 			if (
+				candidate.generation &&
 				sameTransitionGeneration(candidate.generation, {
 					dev: current.dev,
 					ino: current.ino,
@@ -1183,6 +1203,19 @@ async function recoverPendingTransitionRelease(transitionDir: string, recoveryKe
 	if (pending.recovery) return await pending.recovery;
 	const recovery = (async (): Promise<boolean> => {
 		const ownerFile = `${transitionDir}.owner`;
+		if (!pending.generation) {
+			try {
+				pending.generation = await captureTransitionDirectoryGeneration(transitionDir);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+					pendingTransitionReleases.delete(pendingKey);
+					return true;
+				}
+				return false;
+			}
+		}
+		const pendingGeneration = pending.generation;
+		if (!pendingGeneration) return false;
 		let current: fsSync.BigIntStats | null;
 		try {
 			current = await fs.lstat(transitionDir, { bigint: true });
@@ -1198,7 +1231,7 @@ async function recoverPendingTransitionRelease(transitionDir: string, recoveryKe
 		// happens to carry the same released token.
 		if (
 			!current.isDirectory() ||
-			!sameTransitionGeneration(pending.generation, {
+			!sameTransitionGeneration(pendingGeneration, {
 				dev: current.dev,
 				ino: current.ino,
 				mode: current.mode,
@@ -1290,11 +1323,11 @@ async function recoverPendingTransitionRelease(transitionDir: string, recoveryKe
 			const capturedRoot = captured.snapshot.entries.find(entry => entry.relativePath === "");
 			if (
 				!capturedRoot ||
-				capturedRoot.dev !== String(pending.generation.dev) ||
-				capturedRoot.ino !== String(pending.generation.ino) ||
-				capturedRoot.nlink !== String(pending.generation.nlink) ||
-				capturedRoot.mtimeNs !== String(pending.generation.mtimeNs) ||
-				capturedRoot.ctimeNs !== String(pending.generation.ctimeNs)
+				capturedRoot.dev !== String(pendingGeneration.dev) ||
+				capturedRoot.ino !== String(pendingGeneration.ino) ||
+				capturedRoot.nlink !== String(pendingGeneration.nlink) ||
+				capturedRoot.mtimeNs !== String(pendingGeneration.mtimeNs) ||
+				capturedRoot.ctimeNs !== String(pendingGeneration.ctimeNs)
 			) {
 				pendingTransitionReleases.delete(pendingKey);
 				return false;
@@ -1353,20 +1386,29 @@ async function withLockPathTransition<T>(lockFile: string, transition: () => Pro
 			await Bun.sleep(LOCK_ACQUIRE_RETRY_MS);
 			continue;
 		}
+		const pendingSetup: PendingTransitionRelease = {
+			phase: "setup",
+			token: owner.token,
+			recoverable: false,
+		};
+		pendingTransitionReleases.set(recoveryKey, pendingSetup);
 		let transitionGeneration: TransitionDirectoryGeneration;
 		try {
+			await SessionStateLockTestHooks.beforeTransitionSetupLstat?.(transitionDir);
 			const transitionStat = await fs.lstat(transitionDir, { bigint: true });
 			if (!transitionStat.isDirectory()) throw new Error("Transition claim is no longer a directory.");
 			transitionGeneration = transitionGenerationFromStat(transitionStat);
+			pendingSetup.generation = transitionGeneration;
 		} catch (error) {
+			pendingSetup.recoverable = true;
+			for (let recoveryAttempt = 0; recoveryAttempt < LOCK_ACQUIRE_ATTEMPTS; recoveryAttempt++) {
+				if (await recoverPendingTransitionRelease(transitionDir, recoveryKey)) break;
+				if (!pendingTransitionReleases.has(recoveryKey)) break;
+				await Bun.sleep(LOCK_ACQUIRE_RETRY_MS);
+			}
 			throw new SessionStateLockUnavailableError(error);
 		}
-		pendingTransitionReleases.set(recoveryKey, {
-			phase: "setup",
-			token: owner.token,
-			generation: transitionGeneration,
-			recoverable: false,
-		});
+		if (!transitionGeneration) throw new SessionStateLockUnavailableError(new Error("Transition claim generation unavailable."));
 		let held: LockOwnerSnapshot;
 		try {
 			held = await acquireOwnerLock(ownerFile, owner);
@@ -1400,7 +1442,7 @@ async function withLockPathTransition<T>(lockFile: string, transition: () => Pro
 			error => ({ ok: false as const, error }),
 		);
 		try {
-			await releaseTransitionClaim(transitionDir, ownerFile, held, recoveryKey, transitionGeneration);
+			await releaseTransitionClaim(transitionDir, ownerFile, held, recoveryKey, transitionGeneration!);
 		} catch (releaseError) {
 			// The release rewrite may itself have succeeded before the claim-dir
 			// removal was denied (transient sharing denial). Recover the stranded
