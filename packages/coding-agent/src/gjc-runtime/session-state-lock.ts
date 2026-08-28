@@ -1547,20 +1547,22 @@ async function withLockPathTransition<T>(lockFile: string, transition: () => Pro
 		pendingTransitionReleases.set(recoveryKey, pendingSetup);
 		let transitionGeneration: TransitionDirectoryGeneration;
 		try {
-			// The claim's final component is mutable, but its parent alias is not part of
-			// native identity. Pin the physical parent while this claim is known to be ours;
-			// recovery must not rediscover a different spelling after a fault.
-			pendingSetup.nativePath = await canonicalOwnedTransitionPath(transitionDir);
 			if (process.platform === "win32") {
 				// Windows has no no-follow directory descriptor through Node's fs
-				// flags. Capture the generation immediately after the exclusive mkdir,
-				// before the fault seam, so cleanup remains bound to this claim even when
-				// setup reports a fault after the capture.
+				// flags. Capture the generation immediately after the exclusive mkdir and
+				// before canonicalization, so a replacement cannot become our authority.
 				const transitionStat = await fs.lstat(transitionDir, { bigint: true });
 				if (!transitionStat.isDirectory()) throw new Error("Transition claim is no longer a directory.");
 				transitionGeneration = transitionGenerationFromStat(transitionStat);
 				pendingSetup.generation = transitionGeneration;
 				await SessionStateLockTestHooks.beforeTransitionSetupLstat?.(transitionDir);
+				pendingSetup.nativePath = await canonicalOwnedTransitionPath(transitionDir);
+				const rebound = await fs.lstat(transitionDir, { bigint: true });
+				if (
+					!rebound.isDirectory() ||
+					!sameTransitionGeneration(transitionGenerationFromStat(rebound), transitionGeneration)
+				)
+					throw new Error("Transition claim changed during physical path capture.");
 			} else {
 				// Retain no-follow authority before the fault seam and before any
 				// recovery pathname lookup. A later lstat cannot distinguish this
@@ -1568,6 +1570,7 @@ async function withLockPathTransition<T>(lockFile: string, transition: () => Pro
 				pendingSetup.generationHandle = await fs.open(transitionDir, TRANSITION_DIRECTORY_OPEN_FLAGS);
 				transitionGeneration = await captureTransitionDirectoryGenerationFromHandle(pendingSetup.generationHandle);
 				await SessionStateLockTestHooks.beforeTransitionSetupLstat?.(transitionDir);
+				pendingSetup.nativePath = await canonicalOwnedTransitionPath(transitionDir);
 				await pendingSetup.generationHandle.close();
 				pendingSetup.generationHandle = undefined;
 			}
