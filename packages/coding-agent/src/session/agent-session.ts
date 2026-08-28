@@ -3160,6 +3160,7 @@ export class AgentSession {
 	 * orchestrator does not hold it), so there is no self-deadlock.
 	 */
 	#sessionTransitionKind: string | undefined;
+	#coordinatorPersistGeneration = 0;
 
 	#beginSessionTransition(kind: string): void {
 		if (this.#sessionTransitionKind !== undefined) {
@@ -3169,6 +3170,7 @@ export class AgentSession {
 			);
 		}
 		this.#sessionTransitionKind = kind;
+		this.#coordinatorPersistGeneration += 1;
 	}
 
 	#endSessionTransition(): void {
@@ -5421,7 +5423,11 @@ export class AgentSession {
 			cwd: this.sessionManager.getCwd(),
 			sessionFile: this.sessionManager.getSessionFile(),
 		};
-		const run = () => this.#persistRuntimeStateInBackground(event, context, observation);
+		const generation = this.#coordinatorPersistGeneration;
+		const run = () =>
+			generation === this.#coordinatorPersistGeneration
+				? this.#persistRuntimeStateInBackground(event, context, observation)
+				: Promise.resolve();
 		const queued = this.#coordinatorPersistQueue.then(run, run);
 		this.#coordinatorPersistQueue = queued.catch(() => {});
 		return queued;
@@ -7839,7 +7845,9 @@ export class AgentSession {
 				deliveryScope === undefined
 					? this.#activeAttemptScope === activeAttemptScopeAtEvent &&
 						this.#activeSdkRunToken === activeSdkRunTokenAtEvent
-					: deliveryScope === activeAttemptScopeAtEvent && deliveryScope === this.#activeAttemptScope;
+					: deliveryScope === activeAttemptScopeAtEvent &&
+						deliveryScope === this.#activeAttemptScope &&
+						this.#activeSdkRunToken === activeSdkRunTokenAtEvent;
 			if (this.#foldStopRequested) {
 				this.#foldStopRequested = false;
 				this.agent.setSteeringAdmissionFence(undefined);
