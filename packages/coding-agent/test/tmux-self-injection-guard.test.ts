@@ -44,10 +44,28 @@ describe("tmux self-injection guard", () => {
 		});
 	});
 
+	it("fails closed when a current-server target cannot be resolved", async () => {
+		const unresolvedOptions = {
+			...options,
+			resolvePaneId: async () => undefined,
+		};
+		await expect(checkTmuxSelfInjection("tmux send-keys -t unknown x", unresolvedOptions)).resolves.toMatchObject({
+			block: true,
+		});
+	});
+
 	it("allows a different explicit socket", async () => {
 		await expect(checkTmuxSelfInjection("tmux -S /tmp/other-tmux.sock send-keys -t %47 x", options)).resolves.toEqual(
 			{ block: false },
 		);
+	});
+
+	it("allows a different socket selected by an inline TMUX assignment", async () => {
+		await expect(
+			checkTmuxSelfInjection("TMUX=/tmp/other-tmux.sock tmux send-keys -t demo x", options),
+		).resolves.toEqual({
+			block: false,
+		});
 	});
 
 	it("blocks the current server selected with -L", async () => {

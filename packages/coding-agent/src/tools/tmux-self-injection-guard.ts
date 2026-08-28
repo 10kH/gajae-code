@@ -256,6 +256,15 @@ function sameSocket(left: string, right: string): boolean {
 	}
 }
 
+function assignedTmuxSocket(tokens: Token[], commandIndex: number): string | undefined {
+	for (let index = commandIndex - 1; index >= 0 && commandIndex - index <= 4; index--) {
+		const assignment = tokens[index].text.match(/^TMUX=([^,\s]+)/);
+		if (assignment) return assignment[1];
+		if (!tokens[index].commandStart) break;
+	}
+	return undefined;
+}
+
 const defaultResolvePaneId: TmuxPaneResolver = async ({ socketArgs, target, env }) => {
 	const processHandle = Bun.spawn(["tmux", ...socketArgs, "display-message", "-p", "-t", target, "#{pane_id}"], {
 		env,
@@ -292,8 +301,9 @@ export async function checkTmuxSelfInjection(
 			continue;
 		const invocation = parseInvocation(tokens.slice(index + 1));
 		if (!invocation || !INPUT_VERBS.has(invocation.verb)) continue;
-		if (invocation.socket && !sameSocket(socketPathFor(invocation.socket, env, cwd, uid), identity.socketPath))
-			continue;
+		const assignedSocket = assignedTmuxSocket(tokens, index);
+		const commandSocket = invocation.socket ? socketPathFor(invocation.socket, env, cwd, uid) : assignedSocket;
+		if (commandSocket && !sameSocket(commandSocket, identity.socketPath)) continue;
 
 		const target = targetFromArgs(invocation.args);
 		if (target === undefined) {
@@ -314,10 +324,14 @@ export async function checkTmuxSelfInjection(
 				target,
 				env: { ...env, TMUX: `${identity.socketPath},0,0` } as Record<string, string>,
 			});
-			if (resolved === identity.paneId) {
+			if (resolved !== undefined && resolved !== identity.paneId) continue;
+			if (resolved === identity.paneId || resolved === undefined) {
 				return {
 					block: true,
-					reason: `Blocked: ${invocation.verb} target ${target} resolves to this agent pane (${identity.paneId}); injected bytes would become a forged user turn.`,
+					reason:
+						resolved === identity.paneId
+							? `Blocked: ${invocation.verb} target ${target} resolves to this agent pane (${identity.paneId}); injected bytes would become a forged user turn.`
+							: `Blocked: could not verify that ${invocation.verb} target ${target} is a different pane on the current tmux server; refusing fail-closed.`,
 				};
 			}
 		}
