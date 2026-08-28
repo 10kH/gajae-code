@@ -1720,6 +1720,17 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"telemetry.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "interaction",
+			label: "Anonymous Usage Telemetry",
+			description:
+				"Send minimal allowlisted update and adoption events. Disabled by default; no prompts, paths, environment, identity, or arbitrary errors are collected.",
+		},
+	},
+
 	"starReminder.enabled": {
 		type: "boolean",
 		default: true,
