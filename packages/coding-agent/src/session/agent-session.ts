@@ -7814,8 +7814,8 @@ export class AgentSession {
 		scope?: AttemptScopeRef,
 	): Promise<void> {
 		const admission = this.#agentEventAdmission.get(event);
-		const activeAttemptScopeAtEvent = admission?.scope ?? this.#activeAttemptScope;
-		const activeSdkRunTokenAtEvent = admission?.sdkRunToken ?? this.#activeSdkRunToken;
+		const activeAttemptScopeAtEvent = admission === undefined ? this.#activeAttemptScope : admission.scope;
+		const activeSdkRunTokenAtEvent = admission === undefined ? this.#activeSdkRunToken : admission.sdkRunToken;
 		if (event.type === "agent_end" && !workerIntegrationSettled) {
 			await this.#flushWorkerIntegrationForAgentEnd();
 		}
@@ -7841,7 +7841,7 @@ export class AgentSession {
 				deliveryScope === undefined
 					? this.#activeAttemptScope === activeAttemptScopeAtEvent &&
 						this.#activeSdkRunToken === activeSdkRunTokenAtEvent
-					: deliveryScope === activeAttemptScopeAtEvent;
+					: deliveryScope === activeAttemptScopeAtEvent && deliveryScope === this.#activeAttemptScope;
 			if (this.#foldStopRequested) {
 				this.#foldStopRequested = false;
 				this.agent.setSteeringAdmissionFence(undefined);
