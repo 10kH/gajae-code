@@ -6,7 +6,14 @@
  */
 import type { AuthStorage } from "@gajae-code/ai/core";
 import { $credentialEnv, $env } from "@gajae-code/utils";
-import type { SearchCitation, SearchResponse, SearchSource, SearchUsage } from "../../../web/search/types";
+import type {
+	ActiveSearchModelContext,
+	ActiveSearchModelCredentials,
+	SearchCitation,
+	SearchResponse,
+	SearchSource,
+	SearchUsage,
+} from "../../../web/search/types";
 import { SearchProviderError } from "../../../web/search/types";
 import type { SearchParams } from "./base";
 import { SearchProvider } from "./base";
@@ -49,11 +56,13 @@ export interface XaiSearchParams {
 	signal?: AbortSignal;
 	authStorage: AuthStorage;
 	sessionId?: string;
+	activeModelContext?: ActiveSearchModelContext;
 }
 
 interface XaiAuth {
 	bearer: string;
 	mode: "api_key" | "oauth";
+	headers?: Record<string, string>;
 }
 
 interface PreparedXaiTools {
@@ -67,7 +76,40 @@ function asTrimmed(value: string | undefined): string | undefined {
 	return trimmed.length > 0 ? trimmed : undefined;
 }
 
-function getModel(): string {
+function isOpenAICompatWire(api: string): boolean {
+	return api === "openai-responses" || api === "openai-completions";
+}
+
+function looksXaiModelId(modelId: string | undefined): boolean {
+	if (!modelId) return false;
+	const id = modelId.toLowerCase();
+	return id.startsWith("grok-") || id.startsWith("x-ai/grok-") || id.startsWith("xai/grok-");
+}
+
+function isCustomXaiContext(ctx: ActiveSearchModelContext | undefined): ctx is ActiveSearchModelContext {
+	if (!ctx || !isOpenAICompatWire(ctx.api)) return false;
+	if (!looksXaiModelId(ctx.wireModelId) && !looksXaiModelId(ctx.modelId)) return false;
+	return ctx.provider.toLowerCase() !== "xai";
+}
+
+function hasHeader(headers: Record<string, string>, name: string): boolean {
+	const normalized = name.toLowerCase();
+	return Object.keys(headers).some(key => key.toLowerCase() === normalized);
+}
+
+function explicitCredentialHeader(headers: Record<string, string> | undefined): string | undefined {
+	for (const [key, value] of Object.entries(headers ?? {})) {
+		const normalized = key.toLowerCase();
+		if (normalized === "authorization" || normalized === "x-api-key") return value;
+	}
+	return undefined;
+}
+
+function getModel(activeModelContext?: ActiveSearchModelContext): string {
+	const ctx = activeModelContext;
+	if (isCustomXaiContext(ctx)) {
+		return ctx.wireModelId ?? ctx.modelId;
+	}
 	return asTrimmed($env.PI_XAI_WEB_SEARCH_MODEL) ?? asTrimmed($env.XAI_WEB_SEARCH_MODEL) ?? DEFAULT_MODEL;
 }
 
@@ -76,12 +118,14 @@ export function resolveXaiSearchBaseUrlForTest(): string {
 	return getBaseUrl();
 }
 
-function getBaseUrl(): string {
+function getBaseUrl(activeModelContext?: ActiveSearchModelContext): string {
+	const ctx = activeModelContext;
+	if (isCustomXaiContext(ctx) && ctx.baseUrl) return ctx.baseUrl;
 	return asTrimmed($credentialEnv("XAI_SEARCH_BASE_URL")) ?? DEFAULT_BASE_URL;
 }
 
-function responsesEndpoint(): string {
-	return `${getBaseUrl().replace(/\/+$/, "")}/responses`;
+function responsesEndpoint(activeModelContext?: ActiveSearchModelContext): string {
+	return `${getBaseUrl(activeModelContext).replace(/\/+$/, "")}/responses`;
 }
 
 async function resolveXaiAuth(
@@ -89,7 +133,26 @@ async function resolveXaiAuth(
 	sessionId: string | undefined,
 	model: string,
 	signal: AbortSignal | undefined,
+	activeModelContext?: ActiveSearchModelContext,
 ): Promise<XaiAuth | null> {
+	const ctx = activeModelContext;
+	if (isCustomXaiContext(ctx)) {
+		const activeCredentials: ActiveSearchModelCredentials = ctx.resolveCredentials
+			? await ctx.resolveCredentials({ sessionId, signal })
+			: {
+					apiKey: await authStorage.getApiKey(ctx.provider, sessionId, {
+						baseUrl: ctx.baseUrl,
+						modelId: ctx.modelId,
+						signal,
+					}),
+					headers: ctx.headers,
+				};
+		const headers = { ...(activeCredentials.headers ?? ctx.headers ?? {}) };
+		const bearer = activeCredentials.apiKey ?? explicitCredentialHeader(headers);
+		if (!bearer) return null;
+		return { bearer, mode: "api_key", headers };
+	}
+
 	const credentialSessionId = sessionId ?? `xai-search:${crypto.randomUUID()}`;
 	const bearer = await authStorage.getApiKey("xai", credentialSessionId, {
 		baseUrl: getBaseUrl(),
@@ -409,8 +472,14 @@ function parseUsage(json: any): SearchUsage | undefined {
 
 /** Execute xAI web/X search through the Responses API search tools. */
 export async function searchXai(params: XaiSearchParams): Promise<SearchResponse> {
-	const model = getModel();
-	const auth = await resolveXaiAuth(params.authStorage, params.sessionId, model, params.signal);
+	const model = getModel(params.activeModelContext);
+	const auth = await resolveXaiAuth(
+		params.authStorage,
+		params.sessionId,
+		model,
+		params.signal,
+		params.activeModelContext,
+	);
 	if (!auth) {
 		throw new SearchProviderError(
 			"xai",
@@ -419,12 +488,15 @@ export async function searchXai(params: XaiSearchParams): Promise<SearchResponse
 		);
 	}
 
-	const response = await fetch(responsesEndpoint(), {
+	const headers = { ...(auth.headers ?? {}) };
+	if (!hasHeader(headers, "authorization") && !hasHeader(headers, "x-api-key")) {
+		headers.Authorization = `Bearer ${auth.bearer}`;
+	}
+	if (!hasHeader(headers, "content-type")) headers["Content-Type"] = "application/json";
+
+	const response = await fetch(responsesEndpoint(params.activeModelContext), {
 		method: "POST",
-		headers: {
-			Authorization: `Bearer ${auth.bearer}`,
-			"Content-Type": "application/json",
-		},
+		headers,
 		body: JSON.stringify(
 			buildXaiRequestBody({
 				query: params.query,
@@ -511,6 +583,7 @@ export class XaiProvider extends SearchProvider {
 			signal: params.signal,
 			authStorage: params.authStorage,
 			sessionId: params.sessionId,
+			activeModelContext: params.activeModelContext,
 		});
 	}
 }

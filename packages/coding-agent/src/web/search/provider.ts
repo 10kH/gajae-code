@@ -278,7 +278,17 @@ function isAnthropicWire(api: string): boolean {
 }
 
 function isGoogleWire(api: string): boolean {
-	return api === "google-generative-ai" || api === "google-vertex" || api === "google-gemini-cli";
+	return (
+		api === "google-generative-ai" ||
+		api === "google-generative-language" ||
+		api === "gemini-wire" ||
+		api === "google-vertex" ||
+		api === "google-gemini-cli"
+	);
+}
+
+function isGenerativeLanguageWire(api: string): boolean {
+	return api === "google-generative-ai" || api === "google-generative-language" || api === "gemini-wire";
 }
 
 function isOpenAICompatWire(api: string): boolean {
@@ -370,7 +380,13 @@ export function inferNativeProviderFromModel(ctx: ActiveSearchModelContext | und
 	const modelId = (ctx.wireModelId ?? ctx.modelId).toLowerCase();
 	if (modelId.startsWith("claude-") && isAnthropicWire(ctx.api)) return "anthropic";
 	if (modelId.startsWith("gemini-") && isGoogleWire(ctx.api)) return "gemini";
-	if (looksXaiFamilyModelId(ctx) && isOpenAICompatWire(ctx.api)) return "xai";
+	// A custom proxy may expose a Grok model through an OpenAI wire while the
+	// process also has canonical xAI credentials. Do not infer the canonical
+	// xAI provider from the model family: that would silently send the search to
+	// api.x.ai with another registry's credentials. Custom active contexts are
+	// dispatched below by activeContextNativeId, where the provider can consume
+	// the active owner-bound resolver instead.
+	if (looksXaiFamilyModelId(ctx) && isOpenAICompatWire(ctx.api) && ctx.provider.toLowerCase() === "xai") return "xai";
 	// `codex` hits the ChatGPT backend with local Codex OAuth, so only infer it
 	// for genuine OpenAI endpoints. Custom/proxy OpenAI-compatible models fall
 	// through to `activeContextNativeId` → `openai-compatible` (their own creds).
@@ -440,8 +456,9 @@ export function activeContextNativeId(ctx: ActiveSearchModelContext | undefined)
 	// Generative Language wire (not vertex/cloud-code). Returning an id the
 	// provider would reject just wastes a guaranteed-fail attempt before DuckDuckGo.
 	if (isAnthropicWire(ctx.api) && modelId.startsWith("claude-")) return "anthropic";
+	if (isGenerativeLanguageWire(ctx.api) && modelId.startsWith("gemini-")) return "gemini";
+	if (looksXaiFamilyModelId(ctx) && isOpenAICompatWire(ctx.api) && ctx.provider.toLowerCase() !== "xai") return "xai";
 	if (ctx.api === "openai-responses" || ctx.api === "openai-completions") return "openai-compatible";
-	if (ctx.api === "google-generative-ai" && modelId.startsWith("gemini-")) return "gemini";
 	return undefined;
 }
 

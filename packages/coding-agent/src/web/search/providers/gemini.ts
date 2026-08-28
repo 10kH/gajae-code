@@ -43,6 +43,20 @@ const RATE_LIMIT_BUDGET_MS = 30 * 1000;
 const GEMINI_PROVIDERS = ["google-gemini-cli", "google-antigravity"] as const;
 type GeminiProviderId = (typeof GEMINI_PROVIDERS)[number];
 
+function isGenerativeLanguageWire(api: string): boolean {
+	return api === "google-generative-ai" || api === "google-generative-language" || api === "gemini-wire";
+}
+
+function isCustomGenerativeLanguageContext(ctx: SearchParams["activeModelContext"]): ctx is NonNullable<
+	SearchParams["activeModelContext"]
+> & {
+	resolveCredentials: NonNullable<NonNullable<SearchParams["activeModelContext"]>["resolveCredentials"]>;
+} {
+	if (!ctx || !isGenerativeLanguageWire(ctx.api) || !ctx.resolveCredentials) return false;
+	const provider = ctx.provider.toLowerCase();
+	return provider !== "google" && provider !== "gemini" && !GEMINI_PROVIDERS.includes(provider as GeminiProviderId);
+}
+
 function hasHeader(headers: Record<string, string>, name: string): boolean {
 	const normalized = name.toLowerCase();
 	return Object.keys(headers).some(key => key.toLowerCase() === normalized);
@@ -443,9 +457,8 @@ export async function searchGemini(params: GeminiSearchParams): Promise<SearchRe
  * Native Gemini web search over the public Generative Language REST API
  * (`{baseUrl}/v1beta/models/{model}:generateContent`), reusing the ACTIVE
  * model's own API key + baseUrl. This is the "native search over a proxy" path
- * for `google-generative-ai` wire models whose canonical gemini-cli/antigravity
- * OAuth is absent. Distinct from {@link searchGemini}, which speaks the Cloud
- * Code Assist API with OAuth.
+ * for Generative Language wire models. Distinct from {@link searchGemini},
+ * which speaks the Cloud Code Assist API with OAuth.
  */
 async function searchGeminiViaGenerativeLanguage(params: SearchParams): Promise<SearchResponse> {
 	const ctx = params.activeModelContext;
@@ -557,11 +570,15 @@ export class GeminiProvider extends SearchProvider {
 	}
 
 	search(params: SearchParams): Promise<SearchResponse> {
-		// Native-over-proxy: when canonical gemini-cli/antigravity OAuth is
-		// absent but the active model speaks the Generative Language wire, reuse
-		// its own API key + baseUrl instead of failing closed.
 		const ctx = params.activeModelContext;
-		if (!hasGeminiOAuth(params.authStorage) && ctx?.api === "google-generative-ai") {
+		// Native-over-proxy: a custom model's owner-bound resolver must win over
+		// canonical Gemini OAuth. Otherwise the request would silently leave the
+		// proxy and hit Cloud Code with another registry's identity.
+		if (isCustomGenerativeLanguageContext(ctx)) {
+			return searchGeminiViaGenerativeLanguage(params);
+		}
+		// Preserve the existing active-key fallback when canonical OAuth is absent.
+		if (!hasGeminiOAuth(params.authStorage) && ctx && isGenerativeLanguageWire(ctx.api)) {
 			return searchGeminiViaGenerativeLanguage(params);
 		}
 		return searchGemini({
