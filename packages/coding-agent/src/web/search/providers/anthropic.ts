@@ -307,11 +307,27 @@ export async function searchAnthropic(
 	// proxy), prefer its wire model id and carry its request headers through.
 	let modelOverride: string | undefined;
 	let extraHeaders: Record<string, string> | undefined;
+	const activeContext = "authStorage" in params ? params.activeModelContext : undefined;
+	const activeSessionId = "authStorage" in params ? params.sessionId : undefined;
+	const activeCustomContext =
+		activeContext?.api === "anthropic-messages" && activeContext.provider.toLowerCase() !== "anthropic";
 
-	if (searchApiKey) {
+	if (activeCustomContext && activeContext?.resolveCredentials) {
+		const activeCredentials = await activeContext.resolveCredentials({
+			sessionId: activeSessionId,
+			signal: params.signal,
+		});
+		const ctxKey =
+			activeCredentials.apiKey ?? explicitCredentialHeader(activeCredentials.headers ?? activeContext.headers);
+		if (ctxKey) {
+			auth = buildAnthropicAuthConfig(ctxKey, activeContext.baseUrl);
+			modelOverride = activeContext.wireModelId ?? activeContext.modelId;
+			extraHeaders = activeCredentials.headers ?? activeContext.headers;
+		}
+	} else if (searchApiKey) {
 		auth = buildAnthropicAuthConfig(searchApiKey, searchBaseUrl);
 	} else if ("authStorage" in params) {
-		const ctx = params.activeModelContext;
+		const ctx = activeContext;
 		const resolveActiveCredentials = ctx?.resolveCredentials;
 		const activeAnthropicWire = ctx?.api === "anthropic-messages";
 		const activeModelOwnsProvider =

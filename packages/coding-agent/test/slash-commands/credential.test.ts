@@ -89,6 +89,28 @@ describe("/credential slash command", () => {
 		expect(await authStorage.getApiKey("anthropic", "session-1")).toBe("token-account-b");
 	});
 
+	test("owner-scoped switch ignores a sibling same-provider config override", async () => {
+		const { output, runtime, authStorage } = await createRuntime({
+			model: { provider: "anthropic", id: "claude-3-5-sonnet" },
+		});
+		const rows = (await authStorage.exportSnapshot()).credentials;
+		const rowB = rows.find(entry => entry.credential.type === "oauth" && entry.credential.email === "b@example.test");
+		if (!rowB) throw new Error("test setup failed");
+		const owner = {};
+		const siblingOwner = {};
+		authStorage.setConfigApiKey("anthropic", "sibling-config-key", { owner: siblingOwner });
+		const mutableSession = runtime.session as unknown as {
+			modelRegistry: { authStorage: typeof authStorage; getAuthStorageOwner: () => object };
+		};
+		mutableSession.modelRegistry = { authStorage, getAuthStorageOwner: () => owner };
+
+		await expect(executeAcpBuiltinSlashCommand(`/credential id:${rowB.id}`, runtime)).resolves.toEqual({
+			consumed: true,
+		});
+		expect(output[0]).toContain("Switched this session");
+		expect(await authStorage.getApiKey("anthropic", "session-1", { owner })).toBe("token-account-b");
+	});
+
 	test("switches by explicit provider-qualified selector", async () => {
 		const { output, runtime, authStorage } = await createRuntime({
 			provider: "openai-codex",
