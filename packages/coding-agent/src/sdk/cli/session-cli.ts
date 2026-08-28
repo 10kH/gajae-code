@@ -416,6 +416,15 @@ async function workspaceIdentity(target: string): Promise<WorkspaceIdentity> {
 	const canonicalPath = await canonicalWorkspacePath(target);
 	const cached = workspaceIdentityCache.get(canonicalPath);
 	if (cached) return cached;
+	try {
+		if (!(await fs.stat(target)).isDirectory()) throw new Error("workspace is not a directory");
+	} catch {
+		// A removed or unreadable locator cannot prove Git membership. Keeping it
+		// outside every identity is the narrowest safe result for row filtering.
+		const unavailable = { canonicalPath, repoRoot: null, commonDir: null };
+		workspaceIdentityCache.set(canonicalPath, unavailable);
+		return unavailable;
+	}
 	const repository = await resolveGitRepository.resolve(canonicalPath);
 	const identity: WorkspaceIdentity = repository
 		? {
