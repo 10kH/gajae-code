@@ -1982,11 +1982,7 @@ function preserveRawStateFloor(state: RegistryState, copies: readonly ParsedRegi
 	return state;
 }
 
-async function writeFailureDiagnostic(
-	paths: ReturnType<typeof registryPaths>,
-	error: unknown,
-	now: Date,
-): Promise<void> {
+async function writeFailureDiagnostic(paths: { failure: string }, error: unknown, now: Date): Promise<void> {
 	await writeAtomicJson(paths.failure, {
 		version: 1,
 		lastCheckedAt: now.toISOString(),
