@@ -25,8 +25,20 @@ test("extension API cannot set the private recovery bypass", () => {
 	if (api) {
 		// @ts-expect-error The recovery bypass is private to SDK-correlated session runs.
 		void api.sendUserMessage("unauthorized", { skipPostPromptRecoveryWait: true });
+		// @ts-expect-error Raw SDK ownership tokens are not part of the public extension surface.
+		void api.sendUserMessage("unauthorized", { sdkRunToken: "raw-token" });
+		// @ts-expect-error The branded SDK capability is private to the trusted host adapter.
+		void api.sendUserMessage("unauthorized", { sdkRunCapability: {} });
 	}
 	expect("skipPostPromptRecoveryWait" in ({} as Record<string, unknown>)).toBe(false);
+});
+
+test("the SDK capability module is not package-importable", () => {
+	const packageJson = JSON.parse(fs.readFileSync(path.resolve(import.meta.dir, "../package.json"), "utf8")) as {
+		exports?: Record<string, unknown>;
+	};
+	expect(packageJson.exports?.["./session/sdk-run-capability"]).toBeNull();
+	expect(packageJson.exports?.["./session/sdk-run-capability.js"]).toBeNull();
 });
 
 async function firePreflightAccept(options?: {
@@ -78,6 +90,25 @@ import type {
 	ClientBridgePermissionToolCall,
 } from "../src/session/client-bridge";
 import { SessionManager } from "../src/session/session-manager";
+import { createSdkRunCapability, readSdkRunCapability } from "../src/session/sdk-run-capability";
+
+type CapturedSendUserMessage = (
+	content: Parameters<ExtensionActions["sendUserMessage"]>[0],
+	options?: NonNullable<Parameters<ExtensionActions["sendUserMessage"]>[1]> & { sdkRunCapability?: unknown },
+) => void | Promise<unknown>;
+type CapturedSendCall = [
+	Parameters<ExtensionActions["sendUserMessage"]>[0],
+	(NonNullable<Parameters<ExtensionActions["sendUserMessage"]>[1]> & { sdkRunCapability?: unknown })?,
+];
+
+function captureInternalSend(sent: CapturedSendCall[], content: CapturedSendCall[0], options?: CapturedSendCall[1]): void {
+	if (options && "sdkRunToken" in options && typeof options.sdkRunToken === "string") {
+		const { sdkRunToken, ...publicOptions } = options as typeof options & { sdkRunToken: string };
+		sent.push([content, { ...publicOptions, sdkRunCapability: createSdkRunCapability(sdkRunToken) }]);
+		return;
+	}
+	sent.push([content, options]);
+}
 import { getAskAnswerSource, registerAskAnswerSource } from "../src/tools/ask-answer-registry";
 import { startProductionSdkHost } from "./helpers/sdk-production-host";
 import { createOrchestrationNotificationsExtension } from "./helpers/telegram-topic-test";
@@ -216,7 +247,7 @@ async function removeTempDir(dir: string): Promise<void> {
 function start(
 	ctx: Record<string, unknown>,
 	settings?: Settings,
-	sendUserMessage: ExtensionActions["sendUserMessage"] = () => {},
+	sendUserMessage: CapturedSendUserMessage = async () => {},
 	forwardPreflightCallbacks = false,
 	commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>(),
 	lifecycle?: { startupCapability: SdkStartupCapability; lifecycleRequired: true },
@@ -1668,10 +1699,10 @@ test("SDK host preserves ordered prompt image blocks in the host payload", async
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-images-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-prompt-images-${Date.now()}`;
-	const sent: Parameters<ExtensionActions["sendUserMessage"]>[] = [];
+	const sent: CapturedSendCall[] = [];
 	const sessionContext = context(cwd, sessionId);
 	const handlers = start(sessionContext, undefined, (...args) => {
-		sent.push(args);
+		captureInternalSend(sent, args[0], args[1]);
 	});
 	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
@@ -1732,10 +1763,10 @@ test("SDK host correlates follow-up acknowledgements with the later agent start"
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-follow-up-correlation-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-follow-up-correlation-${Date.now()}`;
-	const sent: Parameters<ExtensionActions["sendUserMessage"]>[] = [];
+	const sent: CapturedSendCall[] = [];
 	const sessionContext = context(cwd, sessionId);
 	const handlers = start(sessionContext, undefined, (...args) => {
-		sent.push(args);
+		captureInternalSend(sent, args[0], args[1]);
 	});
 	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
@@ -1774,13 +1805,18 @@ test("SDK host correlates follow-up acknowledgements with the later agent start"
 	});
 	if (typeof commandId !== "string" || typeof turnId !== "string") throw new Error("missing follow-up correlation");
 	const sentOptions = sent[0]?.[1];
-	const sdkRunToken = sentOptions && "sdkRunToken" in sentOptions ? sentOptions.sdkRunToken : undefined;
-	expect(sent as unknown).toEqual([
+	const sdkRunToken = readSdkRunCapability(sentOptions?.sdkRunCapability);
+	expect(sent).toEqual([
 		[
 			"queued follow-up",
-			{ deliverAs: "followUp", preflightSignal: expect.any(AbortSignal), sdkRunToken: expect.any(String) },
+			{
+				deliverAs: "followUp",
+				preflightSignal: expect.any(AbortSignal),
+				sdkRunCapability: expect.any(Object),
+			},
 		],
 	]);
+	expect("sdkRunToken" in (sentOptions ?? {})).toBe(false);
 	if (typeof sdkRunToken !== "string") throw new Error("missing SDK follow-up run token");
 	void handlers.get("agent_end")?.({ type: "agent_end", messages: [], stopReason: "completed" }, sessionContext);
 	await Bun.sleep(10);

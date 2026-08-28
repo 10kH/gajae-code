@@ -28,7 +28,7 @@ import { type ModelSelectorValue, normalizeModelSelectorValue } from "../../conf
 import { type Settings, validateSettingPatch } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import { normalizeGoal } from "../../goals/state";
-import { createSdkRunCapability } from "../../session/sdk-run-capability";
+import { createSdkRunCapability, type SdkRunCapability } from "../../session/sdk-run-capability";
 import {
 	boundTerminalRetentionState,
 	findOwnedRegistrationsForTurn,
@@ -1827,6 +1827,7 @@ function createControlSurface(
 		startsOwnTurn: boolean,
 		sdkRunToken: string,
 	) => void,
+	armPromptDeadline: (correlation: InvocationCorrelation) => void,
 	steerReconciliation: KindAwareReconciliation,
 	onPromotedTurn?: (
 		kind: InvocationKind,
@@ -1854,14 +1855,20 @@ function createControlSurface(
 	canResolveGate: () => boolean = () => true,
 	trackGateResolution: <T>(resolution: Promise<T>) => Promise<T> = async resolution => await resolution,
 ): ControlSurface {
+	type InternalSendOptions = NonNullable<Parameters<ExtensionAPI["sendUserMessage"]>[1]> & {
+		sdkRunCapability?: SdkRunCapability;
+	};
+	type InternalSdkApi = Omit<ExtensionAPI, "sendUserMessage"> & {
+		sendUserMessage: (
+			content: Parameters<ExtensionAPI["sendUserMessage"]>[0],
+			options?: InternalSendOptions,
+		) => Promise<void>;
+	};
+	const internalApi = api as InternalSdkApi;
 	const sendSdkUserMessage = (
 		content: Parameters<ExtensionAPI["sendUserMessage"]>[0],
 		options?: Record<string, unknown>,
-	): Promise<void> => {
-		if (!options || typeof options.sdkRunToken !== "string") return api.sendUserMessage(content, options as never);
-		const { sdkRunToken, ...rest } = options;
-		return api.sendUserMessage(content, { ...rest, sdkRunCapability: createSdkRunCapability(sdkRunToken) } as never);
-	};
+	): Promise<void> => internalApi.sendUserMessage(content, options);
 	const surfacePolicy =
 		policy ?? createSdkSurfacePolicyForContext(ctx, hasSdkWorkflowGateCapability(ctx.workflowGate));
 	const typed = (operation: string, input: Record<string, unknown> = {}) =>
@@ -1946,7 +1953,7 @@ function createControlSurface(
 		kind: InvocationKind,
 		clientRef: string | undefined,
 		run: (options: {
-			sdkRunToken: string;
+			sdkRunCapability: SdkRunCapability;
 			onPreflightAccepted: () => void;
 			onPreflightAcceptCommit: () => Promise<void>;
 			/** Internal disposition before a queued submission is actually consumed. */
@@ -1967,6 +1974,7 @@ function createControlSurface(
 		reconciliation.admit(kind, retainedClientRef);
 		const correlation = newCorrelation();
 		const sdkRunToken = `${correlation.commandId}:${correlation.turnId}`;
+		const sdkRunCapability = createSdkRunCapability(sdkRunToken);
 		const preflight = Promise.withResolvers<void>();
 		let accepted = false;
 		let settled = false;
@@ -1990,6 +1998,7 @@ function createControlSurface(
 				await reconciliation.noteAccepted(kind, correlation, retainedClientRef);
 				accepted = true;
 				settled = true;
+				if (kind === "prompt" && startsOwnTurn) armPromptDeadline(correlation);
 				// The accepted submission does NOT own the active turn until its run
 				// actually STARTS: the connection is carried on the pending entry and
 				// associated at agent_start instead (review thread P1).
@@ -2025,7 +2034,7 @@ function createControlSurface(
 			const submission = Promise.resolve(
 				run({
 					onPreflightAccepted: () => void accept().catch(() => undefined),
-					sdkRunToken,
+					sdkRunCapability,
 					onPreflightAcceptCommit: accept,
 					onDispatchDisposition: promotion => {
 						promotionStartsOwnRun = promotion.startsOwnRun;
@@ -3106,12 +3115,12 @@ function createControlSurface(
 	};
 	return {
 		prompt: async (text, images, clientRef) =>
-			submit("prompt", clientRef, ({ queuedAtDispatch, sdkRunToken, ...options }) =>
+			submit("prompt", clientRef, ({ queuedAtDispatch, sdkRunCapability, ...options }) =>
 				sendSdkUserMessage(
 					typeof images === "undefined" ? text : ([{ type: "text", text }, ...(images as never[])] as never),
 					{
 						...options,
-						sdkRunCapability: createSdkRunCapability(sdkRunToken),
+						sdkRunCapability,
 						// ACP terminal settlement is owned by the correlated agent_end
 						// publication. Post-prompt recovery may include independent
 						// subagent work and must not hold that client-facing boundary.
@@ -3140,10 +3149,10 @@ function createControlSurface(
 			submit(
 				"prompt",
 				undefined,
-				({ sdkRunToken, ...options }) =>
+				({ sdkRunCapability, ...options }) =>
 					sendSdkUserMessage(text, {
 						...options,
-						sdkRunCapability: createSdkRunCapability(sdkRunToken),
+						sdkRunCapability,
 						deliverAs: "followUp",
 					}),
 				undefined,
@@ -3158,8 +3167,8 @@ function createControlSurface(
 		abortTerminal: terminalAbort,
 		abortAndPrompt: async text => {
 			await ctx.abort();
-			return await submit("prompt", undefined, ({ sdkRunToken, ...options }) =>
-				sendSdkUserMessage(text, { ...options, sdkRunCapability: createSdkRunCapability(sdkRunToken) }),
+			return await submit("prompt", undefined, ({ sdkRunCapability, ...options }) =>
+				sendSdkUserMessage(text, { ...options, sdkRunCapability }),
 			);
 		},
 		answerAsk: unavailable("ask.answer"),
@@ -3187,10 +3196,10 @@ function createControlSurface(
 			return await submit(
 				"skill",
 				clientRef,
-				({ sdkRunToken, ...options }) =>
+				({ sdkRunCapability, ...options }) =>
 					ctx.invokeSkill!(name, args, {
 						...options,
-						sdkRunCapability: createSdkRunCapability(sdkRunToken),
+						sdkRunCapability,
 						onSkillPrepared: meta => {
 							prepared = meta;
 						},
@@ -4401,9 +4410,6 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			api,
 			reconciliation,
 			(kind, correlation, connectionId, startsOwnTurn, sdkRunToken) => {
-				// Arm the acceptance lease before secondary lifecycle bookkeeping.
-				// A projection failure must never suppress the pre-agent_start bound.
-				if (startsOwnTurn && kind === "prompt") deadlineManager.onAccepted(correlation);
 				const owner = lifecycleOwnerHolder.state;
 				if (lifecycleOwnerHolder.quiescing) {
 					terminalizeAbandonedSubmission(kind, correlation, {
@@ -4433,6 +4439,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				// legitimately long turn never false-fires. The agent_start
 				// re-entry in emitLifecycle is a no-op for an existing lease.
 			},
+			correlation => deadlineManager.onAccepted(correlation),
 			steerReconciliation,
 			(kind, correlation, connectionId, sdkRunToken, promotion) => {
 				const bindPromotedToken = (batch?: LifecycleBatch): void => {
