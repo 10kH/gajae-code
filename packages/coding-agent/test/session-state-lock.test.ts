@@ -232,15 +232,19 @@ describe("coordinator session state lock", () => {
 		try {
 			SessionStateLockTestHooks.afterCurrentOwnerValidation = async file => {
 				if (file !== `${stateFile}.lock`) return;
-				expect((await fs.stat(`${stateFile}.lock.transition`)).mode & 0o777).toBe(0o700);
-				expect((await fs.stat(`${stateFile}.lock.transition.owner`)).mode & 0o777).toBe(0o600);
+				if (process.platform !== "win32") {
+					expect((await fs.stat(`${stateFile}.lock.transition`)).mode & 0o777).toBe(0o700);
+					expect((await fs.stat(`${stateFile}.lock.transition.owner`)).mode & 0o777).toBe(0o600);
+				}
 				SessionStateLockTestHooks.afterCurrentOwnerValidation = undefined;
 			};
 			await withSessionStateFileLock(stateFile, async () => {
+				if (process.platform !== "win32") {
 				for (const directory of [path.dirname(stateFile), path.dirname(path.dirname(stateFile))]) {
 					expect((await fs.stat(directory)).mode & 0o777).toBe(0o700);
 				}
-				expect((await fs.stat(`${stateFile}.lock`)).mode & 0o777).toBe(0o600);
+					expect((await fs.stat(`${stateFile}.lock`)).mode & 0o777).toBe(0o600);
+				}
 			});
 		} finally {
 			process.umask(previousUmask);
@@ -1623,7 +1627,31 @@ describe("coordinator session state lock", () => {
 		await expect(withSessionStateFileLock(aliasStateFile, async () => "recovered")).resolves.toBe("recovered");
 		expect(faulted).toBe(true);
 		expect(nativeTargets.length).toBeGreaterThan(0);
-		expect(nativeTargets.every(target => target === `${realStateFile}.lock.transition`)).toBe(true);
+		const comparablePath = (target: string): string => {
+			const normalized = path.normalize(target);
+			return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+		};
+		const equivalentWindowsPath = (target: string): string => {
+			if (process.platform !== "win32") return target;
+			if (target.startsWith("\\\\?\\UNC\\")) return `\\\\${target.slice("\\\\?\\UNC\\".length)}`;
+			return target.startsWith("\\\\?\\") ? target.slice("\\\\?\\".length) : target;
+		};
+		const comparableWindowsPath = (target: string): string => {
+			const equivalent = equivalentWindowsPath(comparablePath(target));
+			return process.platform === "win32" ? equivalent.toLowerCase() : equivalent;
+		};
+		const canonicalTarget = async (target: string): Promise<string> =>
+			comparableWindowsPath(path.join(await fs.realpath(path.dirname(target)), path.basename(target)));
+		const canonicalTargets = await Promise.all(nativeTargets.map(canonicalTarget));
+		const expectedComparableTransition = await canonicalTarget(`${realStateFile}.lock.transition`);
+		const comparablePhysicalRoot = comparableWindowsPath(await fs.realpath(realParent)) + path.sep;
+		const comparableAliasRoot = comparableWindowsPath(aliasParent) + path.sep;
+		expect(
+			canonicalTargets.every(target => target === expectedComparableTransition),
+			`expected=${expectedComparableTransition}\nactual=${canonicalTargets.join("\n")}`,
+		).toBe(true);
+		expect(canonicalTargets.every(target => target.startsWith(comparablePhysicalRoot))).toBe(true);
+		expect(canonicalTargets.every(target => !target.startsWith(comparableAliasRoot))).toBe(true);
 	});
 
 	it("cleans a transition claim when setup generation lstat faults", async () => {
@@ -1667,6 +1695,29 @@ describe("coordinator session state lock", () => {
 		expect(faulted).toBe(true);
 		expect(fsSync.existsSync(transitionDir)).toBe(true);
 		expect(await fs.readFile(`${transitionDir}.owner`, "utf8")).toContain("successor");
+		await fs.rm(transitionDir, { recursive: true, force: true });
+	});
+
+	it("does not delete an empty successor after owner setup fails", async () => {
+		const { stateFile } = await seededRunningSession("lock-transition-owner-successor");
+		const transitionDir = `${stateFile}.lock.transition`;
+		let faulted = false;
+		SessionStateLockTestHooks.ownerRecordWriteFault = async ownerFile => {
+			if (ownerFile !== `${transitionDir}.owner` || faulted) return;
+			faulted = true;
+			await fs.rm(transitionDir, { recursive: true, force: true });
+			await fs.mkdir(transitionDir);
+			const successorTime = new Date("2026-02-01T00:00:00.000Z");
+			await fs.utimes(transitionDir, successorTime, successorTime);
+			throw new Error("owner setup fault");
+		};
+
+		await expect(withSessionStateFileLock(stateFile, async () => "entered")).rejects.toBeInstanceOf(
+			SessionStateLockUnavailableError,
+		);
+		expect(faulted).toBe(true);
+		expect(fsSync.existsSync(transitionDir)).toBe(true);
+		expect((await fs.stat(transitionDir)).isDirectory()).toBe(true);
 		await fs.rm(transitionDir, { recursive: true, force: true });
 	});
 
@@ -1863,9 +1914,8 @@ describe("coordinator session state lock", () => {
 
 		expect(fsSync.lstatSync(lockFile).isFile()).toBe(true);
 		expect(await fs.readFile(lockFile, "utf8")).toBe(record);
-		// And nothing was left claimed on the way out: no unreleasable record strands the
-		// pathname for the next contender once the primitive is back.
-		expect(fsSync.existsSync(`${lockFile}.transition`)).toBe(false);
+		// The transition claim stays fail-closed while identity-bound deletion is unavailable.
+		expect(fsSync.existsSync(`${lockFile}.transition`)).toBe(true);
 	});
 
 	it("keeps the namespace mutation lock directory-style", async () => {
@@ -2062,17 +2112,18 @@ describe("coordinator session state lock", () => {
 		it("fails closed when neither owner-access strategy is available", async () => {
 			const { stateFile } = await seededRunningSession("lock-no-owner-strategy");
 			const lockFile = `${stateFile}.lock`;
-			const record = JSON.stringify({ pid: DEAD_PID, start_time: "unknown", token: "dead-owner-token" });
-			await fs.writeFile(lockFile, record);
 			SessionStateLockTestHooks.ownerAccessStrategy = "unsupported";
 
-			await expect(reclaimStaleSessionStateLock(lockFile)).rejects.toBeInstanceOf(SessionStateLockUnavailableError);
 			await expect(withSessionStateFileLock(stateFile, async () => "entered")).rejects.toBeInstanceOf(
 				SessionStateLockUnavailableError,
 			);
 
-			expect(await fs.readFile(lockFile, "utf8")).toBe(record);
+			expect(fsSync.existsSync(lockFile)).toBe(false);
 			expect(fsSync.existsSync(`${lockFile}.transition`)).toBe(false);
+			expect(fsSync.existsSync(`${lockFile}.transition.owner`)).toBe(false);
+
+			SessionStateLockTestHooks.ownerAccessStrategy = process.platform === "win32" ? "windows-validated" : "posix-nofollow";
+			await expect(withSessionStateFileLock(stateFile, async () => "reacquired")).resolves.toBe("reacquired");
 		});
 	});
 });

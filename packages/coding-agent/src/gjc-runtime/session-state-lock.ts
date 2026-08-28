@@ -97,6 +97,8 @@ interface PendingTransitionRelease {
 	phase: "setup" | "release";
 	token: string;
 	generation?: TransitionDirectoryGeneration;
+	/** Physical claim pathname used for every native identity operation. */
+	nativePath?: string;
 	/** A no-follow descriptor captured immediately after mkdir. This remains the
 	 * authority when setup generation capture itself faults or the pathname is
 	 * replaced before recovery gets to run. */
@@ -195,6 +197,37 @@ async function removeTransitionDir(transitionDir: string): Promise<void> {
 	}
 }
 
+function removeOwnedTransitionClaim(
+	nativePath: string,
+	generation: TransitionDirectoryGeneration,
+): boolean {
+	const native = nativeSessionStateLock();
+	const captured = native.snapshotDirectoryTree(nativePath);
+	if (!captured.ok || !captured.snapshot) return captured.code === "not_found";
+	const root = captured.snapshot.entries.find(entry => entry.relativePath === "");
+	if (
+		!root ||
+		root.kind !== "directory" ||
+		root.dev !== String(generation.dev) ||
+		root.ino !== String(generation.ino) ||
+		root.nlink !== String(generation.nlink) ||
+		root.mtimeNs !== String(generation.mtimeNs) ||
+		root.ctimeNs !== String(generation.ctimeNs)
+	)
+		return false;
+	const removed = native.exactRemoveDirectoryTree(nativePath, captured.snapshot);
+	return (
+		removed.ok ||
+		removed.code === "not_found" ||
+		(removed.code === "cleanup_pending" &&
+			removed.payloadDurable === true &&
+			removed.detachedPath === `${nativePath}.removing` &&
+			removed.retainedSuccessorPath === undefined &&
+			removed.retainedUnknownPath === undefined &&
+			removed.retainedPlaceholderPath === undefined)
+	);
+}
+
 async function transitionRecoveryKey(transitionDir: string): Promise<string> {
 	try {
 		return path.normalize(await fs.realpath(transitionDir));
@@ -214,10 +247,9 @@ async function transitionRecoveryKey(transitionDir: string): Promise<string> {
 	return path.normalize(path.join(canonicalParent, path.basename(transitionDir)));
 }
 
-/** Resolve aliases in the parent while preserving the mutable claim's final name. */
-async function canonicalTransitionPathPreservingFinal(transitionDir: string): Promise<string> {
-	const parent = path.dirname(transitionDir);
-	return path.join(await fs.realpath(parent), path.basename(transitionDir));
+/** Resolve the owned claim to its physical path while it is still present. */
+async function canonicalOwnedTransitionPath(transitionDir: string): Promise<string> {
+	return path.normalize(await fs.realpath(transitionDir));
 }
 
 function sameTransitionGeneration(left: TransitionDirectoryGeneration, right: TransitionDirectoryGeneration): boolean {
@@ -1219,6 +1251,7 @@ async function releaseTransitionClaim(
 	held: LockOwnerSnapshot,
 	recoveryKey: string,
 	transitionGeneration: TransitionDirectoryGeneration,
+	nativePath: string,
 ): Promise<void> {
 	let heldOwner: SessionStateLockOwner;
 	try {
@@ -1234,6 +1267,7 @@ async function releaseTransitionClaim(
 		phase: "release",
 		token: releasedOwner.token,
 		generation: transitionGeneration,
+		nativePath,
 		held,
 		releasedOwner,
 		recoverable: false,
@@ -1448,11 +1482,14 @@ async function recoverPendingTransitionRelease(transitionDir: string, recoveryKe
 				}
 			}
 			if (parsed.token !== pending.token || parsed.released !== true) return false;
-			let nativeTransitionPath: string;
-			try {
-				nativeTransitionPath = await canonicalTransitionPathPreservingFinal(transitionDir);
-			} catch {
-				return false;
+			let nativeTransitionPath = pending.nativePath;
+			if (nativeTransitionPath === undefined) {
+				try {
+					nativeTransitionPath = await canonicalOwnedTransitionPath(transitionDir);
+					pending.nativePath = nativeTransitionPath;
+				} catch {
+					return false;
+				}
 			}
 			const captured = nativeSessionStateLock().snapshotDirectoryTree(nativeTransitionPath);
 			if (captured.code === "sharing_violation") return false;
@@ -1514,11 +1551,15 @@ async function recoverPendingTransitionRelease(transitionDir: string, recoveryKe
 
 /** Run one pathname transition under an atomic `mkdir`/`rmdir` claim. */
 async function withLockPathTransition<T>(lockFile: string, transition: () => Promise<T>): Promise<T> {
+	if (ownerAccessStrategy() === "unsupported")
+		throw new SessionStateLockUnavailableError(new Error("Safe transition ownership is unsupported."));
 	const transitionDir = `${lockFile}${LOCK_TRANSITION_RESOURCE_SUFFIX}`;
 	const ownerFile = `${transitionDir}.owner`;
 	const recoveryKey = await transitionRecoveryKey(transitionDir);
 	const owner = await newLockOwner();
 	for (let attempt = 0; attempt < LOCK_ACQUIRE_ATTEMPTS; attempt++) {
+		if (ownerAccessStrategy() === "unsupported" && fsSync.existsSync(transitionDir))
+			throw new SessionStateLockUnavailableError(new Error("Safe transition ownership is unsupported."));
 		if (await recoverPendingTransitionRelease(transitionDir, recoveryKey)) {
 			// The claim this process stranded in an earlier failed release is gone;
 			// fall through and retry the mkdir immediately.
@@ -1543,23 +1584,32 @@ async function withLockPathTransition<T>(lockFile: string, transition: () => Pro
 		try {
 			if (process.platform === "win32") {
 				// Windows has no no-follow directory descriptor through Node's fs
-				// flags. A setup fault therefore retains the claim fail-closed below;
-				// only a completed lstat may enter the normal transition path.
-				await SessionStateLockTestHooks.beforeTransitionSetupLstat?.(transitionDir);
+				// flags. Capture the generation immediately after the exclusive mkdir and
+				// before canonicalization, so a replacement cannot become our authority.
 				const transitionStat = await fs.lstat(transitionDir, { bigint: true });
 				if (!transitionStat.isDirectory()) throw new Error("Transition claim is no longer a directory.");
 				transitionGeneration = transitionGenerationFromStat(transitionStat);
+				pendingSetup.generation = transitionGeneration;
+				await SessionStateLockTestHooks.beforeTransitionSetupLstat?.(transitionDir);
+				pendingSetup.nativePath = await canonicalOwnedTransitionPath(transitionDir);
+				const rebound = await fs.lstat(transitionDir, { bigint: true });
+				if (
+					!rebound.isDirectory() ||
+					!sameTransitionGeneration(transitionGenerationFromStat(rebound), transitionGeneration)
+				)
+					throw new Error("Transition claim changed during physical path capture.");
 			} else {
 				// Retain no-follow authority before the fault seam and before any
 				// recovery pathname lookup. A later lstat cannot distinguish this
 				// claim from a successor that replaced the name after setup failed.
 				pendingSetup.generationHandle = await fs.open(transitionDir, TRANSITION_DIRECTORY_OPEN_FLAGS);
-				await SessionStateLockTestHooks.beforeTransitionSetupLstat?.(transitionDir);
 				transitionGeneration = await captureTransitionDirectoryGenerationFromHandle(pendingSetup.generationHandle);
+				await SessionStateLockTestHooks.beforeTransitionSetupLstat?.(transitionDir);
+				pendingSetup.nativePath = await canonicalOwnedTransitionPath(transitionDir);
 				await pendingSetup.generationHandle.close();
 				pendingSetup.generationHandle = undefined;
 			}
-			pendingSetup.generation = transitionGeneration;
+			pendingSetup.generation ??= transitionGeneration;
 		} catch (error) {
 			pendingSetup.recoverable = true;
 			// If opening the just-created claim itself failed, no descriptor or
@@ -1603,16 +1653,21 @@ async function withLockPathTransition<T>(lockFile: string, transition: () => Pro
 			}
 			try {
 				// If no owner pathname exists, setup never established an owner and
-				// this claim can be removed safely. Use lstat only: an unsupported
-				// owner-access strategy must not prevent this ownerless cleanup, and
-				// any existing regular/malformed/symlink record remains fenced.
+				// this claim can be removed only when its captured directory identity
+				// still matches. A raw rmdir could delete an empty successor claim.
 				const ownerStat = await fs.lstat(ownerFile).catch(error => {
 					if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
 					throw error;
 				});
 				if (!ownerStat) {
-					await removeTransitionDir(transitionDir);
-					clearPendingTransitionRelease(recoveryKey, pending);
+					if (
+						ownerAccessStrategy() !== "unsupported" &&
+						pending?.nativePath &&
+						pending.generation &&
+						removeOwnedTransitionClaim(pending.nativePath, pending.generation)
+					) {
+						clearPendingTransitionRelease(recoveryKey, pending);
+					}
 				}
 			} catch {
 				if (pending) pending.recoverable = true;
@@ -1624,8 +1679,24 @@ async function withLockPathTransition<T>(lockFile: string, transition: () => Pro
 			error => ({ ok: false as const, error }),
 		);
 		try {
-			await releaseTransitionClaim(transitionDir, ownerFile, held, recoveryKey, transitionGeneration!);
+			await releaseTransitionClaim(
+				transitionDir,
+				ownerFile,
+				held,
+				recoveryKey,
+				transitionGeneration!,
+				pendingSetup.nativePath!,
+			);
 		} catch (releaseError) {
+			if (ownerAccessStrategy() === "unsupported") {
+				if (outcome.ok)
+					throw new SessionStateLockUnavailableError(
+						new AggregateError([releaseError], "Transition claim cannot be released safely."),
+					);
+				throw new SessionStateLockUnavailableError(
+					new AggregateError([outcome.error, releaseError], "Lock path transition and release both failed."),
+				);
+			}
 			// The release rewrite may itself have succeeded before the claim-dir
 			// removal was denied (transient sharing denial). Recover the stranded
 			// claim in-process without replaying a transition that already succeeded.
@@ -1889,7 +1960,9 @@ export async function withSessionStateFileLock<T>(stateFile: string, operation: 
 			// is no longer ours is left for its owner rather than unlinked by name.
 			let releaseFailure: { error: unknown } | undefined;
 			try {
-				await withLockPathTransition(lockFile, async () => releaseOwnerLock(lockFile, record));
+				await withLockPathTransition(lockFile, async () =>
+				releaseOwnerLock(lockFile, record),
+				);
 			} catch (error) {
 				releaseFailure = { error };
 			}
@@ -1906,6 +1979,10 @@ export async function withSessionStateFileLock<T>(stateFile: string, operation: 
 		} catch (error) {
 			// A fault after the lock was taken belongs to the operation, not to acquisition.
 			if (held) throw error;
+			// Without a safe owner-record access strategy, retrying cannot make the
+			// transition claim removable. Preserve it as a fail-closed fence instead
+			// of spinning until the acquisition budget expires.
+			if (ownerAccessStrategy() === "unsupported") throw error;
 			// A legacy `<file>.lock/` directory reports EISDIR (EPERM on some platforms);
 			// both are contention to be evaluated, not a hard failure.
 			const code = (error as NodeJS.ErrnoException).code;
