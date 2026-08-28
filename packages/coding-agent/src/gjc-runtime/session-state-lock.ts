@@ -2076,11 +2076,7 @@ export async function withSessionStateFileLock<T>(stateFile: string, operation: 
 			// is no longer ours is left for its owner rather than unlinked by name.
 			let releaseFailure: { error: unknown } | undefined;
 			try {
-				await withLockPathTransition(
-					lockFile,
-					async () => releaseOwnerLock(lockFile, record),
-					cycleQuarantine,
-				);
+				await withLockPathTransition(lockFile, async () => releaseOwnerLock(lockFile, record), cycleQuarantine);
 			} catch (error) {
 				releaseFailure = { error };
 			}
