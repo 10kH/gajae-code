@@ -1528,10 +1528,6 @@ function createQuerySurface(
 export function createSdkSurfaceFactory(
 	options: SdkSurfaceFactoryOptions & { reconciliation?: InvocationReconciliation },
 ): SdkSurfaceFactory {
-	const sendSdkUserMessage = options.api.sendUserMessage as (
-		content: Parameters<ExtensionAPI["sendUserMessage"]>[0],
-		options?: Record<string, unknown>,
-	) => Promise<void>;
 	const policy =
 		options.policy ??
 		createSdkSurfacePolicyForContext(options.ctx, hasSdkWorkflowGateCapability(options.ctx.workflowGate));
