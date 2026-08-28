@@ -78,7 +78,7 @@ const WORKTREE_BUCKET_ENV = "GJC_WORKTREE_DIR";
  * what keeps two repositories that share a branch name from resolving to one worktree.
  */
 const REPO_NAME_PLACEHOLDER = "{repo}";
-const DEFAULT_WORKTREE_BUCKET = `${REPO_NAME_PLACEHOLDER}.gajae-code-worktrees`;
+const DEFAULT_WORKTREE_BUCKET = `${REPO_NAME_PLACEHOLDER}/.worktrees`;
 
 function expandHomePrefix(value: string, home: string, pathApi: typeof path.posix): string {
 	if (value === "~") return home;
@@ -108,12 +108,34 @@ export function resolveWorktreeBucketForPath(
 /**
  * Directory that holds this repository's launch worktrees.
  *
- * A relative override resolves against the repository's PARENT directory, matching the
- * default's own shape, so `{repo}.worktrees` adopts an existing sibling bucket and
- * `.worktrees` parks a hidden bucket beside the repository. An absolute override is used verbatim.
+ * A relative override resolves against the repository's parent directory. The default
+ * `{repo}/.worktrees` template places managed worktrees inside the repository, while
+ * `{repo}.worktrees` adopts an existing sibling bucket. An absolute override is used verbatim.
  */
 function resolveWorktreeBucket(repoRoot: string): string {
 	return resolveWorktreeBucketForPath(repoRoot, process.env[WORKTREE_BUCKET_ENV], os.homedir(), path);
+}
+
+function ensureRepositoryBucketIgnored(repoRoot: string, bucketPath: string): void {
+	const relativeBucket = path.relative(repoRoot, bucketPath);
+	if (relativeBucket.startsWith(`..${path.sep}`) || relativeBucket === ".." || path.isAbsolute(relativeBucket)) return;
+	const ignoreProbe = path.join(relativeBucket, ".gjc-worktree-probe");
+	for (const candidate of [relativeBucket, ignoreProbe]) {
+		const result = Bun.spawnSync(["git", "check-ignore", "--quiet", "--", candidate], {
+			cwd: repoRoot,
+			stdout: "ignore",
+			stderr: "pipe",
+		});
+		if (result.exitCode === 0) return;
+	}
+	throw new Error(
+		[
+			"worktree_bucket_not_ignored",
+			"The GJC launch worktree bucket is inside the repository but is not ignored by Git.",
+			`Path: ${formatBucketPath(bucketPath)}`,
+			`Safe remediation: add /${relativeBucket.replaceAll(path.sep, "/")} to ${path.join(repoRoot, ".gitignore")}, then relaunch.`,
+		].join("\n"),
+	);
 }
 
 function resolveSourceBranchSlug(repoRoot: string, baseRef: string): string {
@@ -301,6 +323,7 @@ function pruneStaleWorktreePath(repoRoot: string): void {
 
 function readWorktreeEntryFromPath(repoRoot: string, worktreePath: string): GitWorktreeEntry | null {
 	if (!fs.existsSync(worktreePath)) return null;
+	if (!fs.existsSync(path.join(worktreePath, ".git"))) return null;
 	const repoCommonDir = tryRunGit(repoRoot, ["rev-parse", "--git-common-dir"]);
 	const worktreeCommonDir = tryRunGit(worktreePath, ["rev-parse", "--git-common-dir"]);
 	if (!repoCommonDir || !worktreeCommonDir) return null;
@@ -379,6 +402,7 @@ export function planLaunchWorktree(
 	if (branchName) validateBranchName(repoRoot, branchName);
 	const worktreeSlug = mode.detached ? resolveSourceBranchSlug(repoRoot, baseRef) : sanitizePathToken(mode.name);
 	const worktreePath = path.join(resolveWorktreeBucket(repoRoot), worktreeSlug);
+	if (path.resolve(worktreePath) === path.resolve(repoRoot)) throw new Error(`worktree_path_conflict:${worktreePath}`);
 	return { enabled: true, repoRoot, worktreePath, detached: mode.detached, baseRef, branchName };
 }
 
@@ -386,6 +410,9 @@ export function ensureLaunchWorktree(
 	plan: GjcLaunchWorktreePlan | { enabled: false },
 ): GjcLaunchWorktreeResult | { enabled: false } {
 	if (!plan.enabled) return { enabled: false };
+	const bucketPath = path.dirname(plan.worktreePath);
+	inspectBucketDir(bucketPath);
+	ensureRepositoryBucketIgnored(plan.repoRoot, bucketPath);
 	let allWorktrees = listWorktrees(plan.repoRoot);
 	const staleAtPath = findWorktreeByPath(allWorktrees, plan.worktreePath);
 	if (staleAtPath && !fs.existsSync(staleAtPath.path)) {
@@ -393,9 +420,19 @@ export function ensureLaunchWorktree(
 		allWorktrees = listWorktrees(plan.repoRoot);
 	}
 
-	const existingAtPath =
-		findWorktreeByPath(allWorktrees, plan.worktreePath) ??
-		readWorktreeEntryFromPath(plan.repoRoot, plan.worktreePath);
+	const listedAtPath = findWorktreeByPath(allWorktrees, plan.worktreePath);
+	const existingAtPath = readWorktreeEntryFromPath(plan.repoRoot, plan.worktreePath);
+	if (listedAtPath && !existingAtPath) {
+		if (fs.existsSync(plan.worktreePath)) throw new Error(`worktree_path_conflict:${plan.worktreePath}`);
+		throw new Error(
+			[
+				"worktree_path_unavailable",
+				"The requested launch worktree is still registered by Git but its directory is unavailable or locked.",
+				`Path: ${formatBucketPath(plan.worktreePath)}`,
+				"Safe remediation: inspect the worktree lock and remove or repair it with git worktree remove/prune when it is no longer needed, then relaunch. GJC did not delete or replace the entry.",
+			].join("\n"),
+		);
+	}
 	const expectedBranchRef = plan.branchName ? `refs/heads/${plan.branchName}` : null;
 
 	if (existingAtPath) {
