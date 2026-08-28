@@ -1079,8 +1079,6 @@ export interface PromptOptions {
 	preflightSignal?: AbortSignal;
 	/** Internal SDK lifecycle owner token. */
 	sdkRunToken?: string;
-	/** Internal SDK path: let the correlated agent_end settle before recovery drains. */
-	skipPostPromptRecoveryWait?: boolean;
 }
 
 function promptPreflightCancelledError(): Error {
@@ -10034,12 +10032,7 @@ export class AgentSession {
 		args = "",
 		options?: Pick<
 			PromptOptions,
-			| "onPreflightAccepted"
-			| "onPreflightAcceptCommit"
-			| "onSkillPrepared"
-			| "preflightSignal"
-			| "sdkRunToken"
-			| "skipPostPromptRecoveryWait"
+			"onPreflightAccepted" | "onPreflightAcceptCommit" | "onSkillPrepared" | "preflightSignal" | "sdkRunToken"
 		>,
 	): Promise<{ name: string; path: string; args?: string; lineCount?: number }> {
 		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
@@ -10794,7 +10787,7 @@ export class AgentSession {
 						options?.onPreflightAccepted ||
 							options?.onPreflightAcceptCommit ||
 							options?.preflightSignal ||
-							options?.skipPostPromptRecoveryWait
+							options?.sdkRunToken
 							? {
 									...(options.onPreflightAccepted ? { onPreflightAccepted: options.onPreflightAccepted } : {}),
 									...(options.onPreflightAcceptCommit
@@ -10802,9 +10795,6 @@ export class AgentSession {
 										: {}),
 									...(options.preflightSignal ? { preflightSignal: options.preflightSignal } : {}),
 									...(options.sdkRunToken ? { sdkRunToken: options.sdkRunToken } : {}),
-									...(options.skipPostPromptRecoveryWait
-										? { skipPostPromptRecoveryWait: options.skipPostPromptRecoveryWait }
-										: {}),
 								}
 							: undefined,
 					);
@@ -11059,7 +11049,6 @@ export class AgentSession {
 			| "onPreflightAcceptCommit"
 			| "preflightSignal"
 			| "sdkRunToken"
-			| "skipPostPromptRecoveryWait"
 		>,
 	): Promise<void> {
 		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
@@ -12632,7 +12621,6 @@ export class AgentSession {
 							}
 						: undefined,
 				preflightSignal: options?.preflightSignal,
-				skipPostPromptRecoveryWait: options?.skipPostPromptRecoveryWait,
 			});
 		} finally {
 			releaseFollowUpReservation();
