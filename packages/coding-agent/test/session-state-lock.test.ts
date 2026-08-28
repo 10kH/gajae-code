@@ -232,8 +232,10 @@ describe("coordinator session state lock", () => {
 		try {
 			SessionStateLockTestHooks.afterCurrentOwnerValidation = async file => {
 				if (file !== `${stateFile}.lock`) return;
-				expect((await fs.stat(`${stateFile}.lock.transition`)).mode & 0o777).toBe(0o700);
-				expect((await fs.stat(`${stateFile}.lock.transition.owner`)).mode & 0o777).toBe(0o600);
+				if (process.platform !== "win32") {
+					expect((await fs.stat(`${stateFile}.lock.transition`)).mode & 0o777).toBe(0o700);
+					expect((await fs.stat(`${stateFile}.lock.transition.owner`)).mode & 0o777).toBe(0o600);
+				}
 				SessionStateLockTestHooks.afterCurrentOwnerValidation = undefined;
 			};
 			await withSessionStateFileLock(stateFile, async () => {

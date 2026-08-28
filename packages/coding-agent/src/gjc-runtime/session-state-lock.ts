@@ -216,10 +216,9 @@ async function transitionRecoveryKey(transitionDir: string): Promise<string> {
 	return path.normalize(path.join(canonicalParent, path.basename(transitionDir)));
 }
 
-/** Resolve aliases in the parent while preserving the mutable claim's final name. */
-async function canonicalTransitionPathPreservingFinal(transitionDir: string): Promise<string> {
-	const parent = path.dirname(transitionDir);
-	return path.join(await fs.realpath(parent), path.basename(transitionDir));
+/** Resolve the owned claim to its physical path while it is still present. */
+async function canonicalOwnedTransitionPath(transitionDir: string): Promise<string> {
+	return path.normalize(await fs.realpath(transitionDir));
 }
 
 function sameTransitionGeneration(left: TransitionDirectoryGeneration, right: TransitionDirectoryGeneration): boolean {
@@ -1453,7 +1452,7 @@ async function recoverPendingTransitionRelease(transitionDir: string, recoveryKe
 			let nativeTransitionPath = pending.nativePath;
 			if (nativeTransitionPath === undefined) {
 				try {
-					nativeTransitionPath = await canonicalTransitionPathPreservingFinal(transitionDir);
+					nativeTransitionPath = await canonicalOwnedTransitionPath(transitionDir);
 					pending.nativePath = nativeTransitionPath;
 				} catch {
 					return false;
@@ -1549,7 +1548,7 @@ async function withLockPathTransition<T>(lockFile: string, transition: () => Pro
 			// The claim's final component is mutable, but its parent alias is not part of
 			// native identity. Pin the physical parent while this claim is known to be ours;
 			// recovery must not rediscover a different spelling after a fault.
-			pendingSetup.nativePath = await canonicalTransitionPathPreservingFinal(transitionDir);
+			pendingSetup.nativePath = await canonicalOwnedTransitionPath(transitionDir);
 			if (process.platform === "win32") {
 				// Windows has no no-follow directory descriptor through Node's fs
 				// flags. Capture the generation immediately after the exclusive mkdir,
@@ -1558,6 +1557,7 @@ async function withLockPathTransition<T>(lockFile: string, transition: () => Pro
 				const transitionStat = await fs.lstat(transitionDir, { bigint: true });
 				if (!transitionStat.isDirectory()) throw new Error("Transition claim is no longer a directory.");
 				transitionGeneration = transitionGenerationFromStat(transitionStat);
+				pendingSetup.generation = transitionGeneration;
 				await SessionStateLockTestHooks.beforeTransitionSetupLstat?.(transitionDir);
 			} else {
 				// Retain no-follow authority before the fault seam and before any
@@ -1569,7 +1569,7 @@ async function withLockPathTransition<T>(lockFile: string, transition: () => Pro
 				await pendingSetup.generationHandle.close();
 				pendingSetup.generationHandle = undefined;
 			}
-			pendingSetup.generation = transitionGeneration;
+			pendingSetup.generation ??= transitionGeneration;
 		} catch (error) {
 			pendingSetup.recoverable = true;
 			// If opening the just-created claim itself failed, no descriptor or
