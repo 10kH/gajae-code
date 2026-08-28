@@ -34,7 +34,7 @@ import {
 	syntheticNamespaceCollision,
 } from "../model-profile-model";
 import { projectQ10Models } from "../models.js";
-import { PromptDeadlineManager } from "../prompt-deadline-manager";
+import { PromptDeadlineManager, type PromptTerminalTransitionEvidence } from "../prompt-deadline-manager";
 import { formatPromptFailureForLocalLog, sanitizePromptFailure } from "../prompt-failure";
 import { OPERATIONS } from "../protocol/operation-registry";
 import {
@@ -43,6 +43,7 @@ import {
 	type KindAwareReconciliation,
 	resolveReconciliationSessionFile,
 } from "../reconciliation-extensions";
+import { sanitizeTurnResultContent, type TurnResultContent } from "../turn-result";
 import { type ControlSurface, controlRequestFromFrame, dispatchControl } from "./control";
 import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "./control/runtime-gate";
 import { SessionSdkHost, type SessionSdkHostOptions } from "./host";
@@ -420,6 +421,7 @@ export interface InvocationCorrelation {
 
 export type InvocationKind = "prompt" | "skill" | "steer";
 type InvocationStatus = "accepted" | "in_flight" | "terminal_ok" | "failed" | "uncertain";
+const EMPTY_PROMPT_FAILURE = { code: "prompt_failed", message: "Prompt submission failed." } as const;
 interface InvocationRecord extends InvocationCorrelation {
 	kind: InvocationKind;
 	revision: number;
@@ -440,7 +442,14 @@ export interface InvocationReconciliation {
 	noteTransition(
 		kind: InvocationKind,
 		correlation: InvocationCorrelation | undefined,
-		frame: { type: "agent_start" | "agent_end" } | { type: "agent_failed"; error: unknown },
+		frame:
+			| {
+					type: "agent_start" | "agent_end";
+					content?: TurnResultContent;
+					hasActivity?: boolean;
+					outcome?: { kind: "stopped"; reason: "cancelled"; provenance: "client_cancel" };
+			  }
+			| { type: "agent_failed"; error: unknown; content?: TurnResultContent; hasActivity?: boolean },
 	): Promise<void>;
 	lookup(kind: InvocationKind, selector: { commandId?: string; turnId?: string; clientRef?: string }): unknown;
 	lookupResult(kind: InvocationKind, selector: { commandId?: string; turnId?: string; clientRef?: string }): unknown;
@@ -464,7 +473,13 @@ export interface InvocationReconciliation {
 		correlation: InvocationCorrelation,
 		outcome?: { kind: string; code: string; message: string; provenance?: string },
 		arg4?: (() => boolean) | { code: string; message: string },
+		// Terminal evidence accepted by finalizeOutcome (exact-head review P1/P2):
+		// when an explicit outcome is absent, a content-bearing, activity-bearing,
+		// or explicitly stopped finalization is still a successful terminal; only a
+		// genuinely empty, no-activity completion fails closed with the sanitized
+		// empty-prompt failure. Mirrors the noteTransition evidence predicate.
 		arg5?: unknown,
+		arg6?: { content?: TurnResultContent; hasActivity?: boolean; outcomeKind?: string },
 	): Promise<void>;
 	markUncertain(
 		kind: InvocationKind,
@@ -699,7 +714,14 @@ export function createInvocationReconciliation(
 						// so a real lifecycle event is never swallowed.
 					}
 					const current = records.get(recordKey);
-					if (frame.type === "agent_end" && current === pending.finalizedRecord) {
+					if (
+						frame.type === "agent_end" &&
+						current === pending.finalizedRecord &&
+						(kind !== "prompt" ||
+							frame.outcome?.kind === "stopped" ||
+							frame.hasActivity === true ||
+							frame.content?.text.trim())
+					) {
 						// A real lifecycle end that arrived during deadline finalization is
 						// stronger evidence than the synthetic deadline outcome. Upgrade the
 						// durable terminal instead of treating the event as a duplicate.
@@ -734,7 +756,14 @@ export function createInvocationReconciliation(
 				}
 			}
 			if (record.terminalAt !== undefined) {
-				if (frame.type === "agent_end" && record.error?.code === "prompt_deadline_exceeded") {
+				if (
+					frame.type === "agent_end" &&
+					record.error?.code === "prompt_deadline_exceeded" &&
+					(kind !== "prompt" ||
+						frame.outcome?.kind === "stopped" ||
+						frame.hasActivity === true ||
+						frame.content?.text.trim())
+				) {
 					const upgraded = { ...record, revision: ++mutationRevision, status: "terminal_ok" as const };
 					// The synthetic deadline error is superseded evidence; terminal_ok must not
 					// surface a deadline failure for a prompt that actually completed.
@@ -795,7 +824,17 @@ export function createInvocationReconciliation(
 				if (next.error === undefined || (next.error.code === "agent_failed" && failure.code !== "agent_failed"))
 					next.error = failure;
 			} else {
-				next.status = next.error === undefined ? "terminal_ok" : "failed";
+				if (
+					kind === "prompt" &&
+					next.error === undefined &&
+					frame.type === "agent_end" &&
+					frame.outcome?.kind !== "stopped" &&
+					!frame.content?.text.trim() &&
+					!frame.hasActivity
+				) {
+					next.status = "failed";
+					next.error = EMPTY_PROMPT_FAILURE;
+				} else next.status = next.error === undefined ? "terminal_ok" : "failed";
 				next.terminalAt = Date.now();
 			}
 			records.set(recordKey, next);
@@ -868,6 +907,7 @@ export function createInvocationReconciliation(
 			outcome,
 			arg4?: (() => boolean) | { code: string; message: string },
 			arg5?: unknown,
+			arg6?: { content?: TurnResultContent; hasActivity?: boolean; outcomeKind?: string },
 		) {
 			// Normalize every supported positional form (exact-head review P1):
 			//   (…, isCurrent) | (…, recordError) | (…, undefined, recordError) |
@@ -880,6 +920,14 @@ export function createInvocationReconciliation(
 						? (arg5 as { code: string; message: string })
 						: undefined;
 			const recordError = recordErrorCandidate;
+			// Terminal evidence may also arrive positionally through arg5 (legacy
+			// callers) when it does not carry a recordError shape; normalize it so
+			// the empty predicate below sees every evidence channel consistently.
+			const legacyEvidenceCandidate =
+				typeof arg5 === "object" && arg5 !== null && !("code" in arg5)
+					? (arg5 as { content?: TurnResultContent; hasActivity?: boolean; outcomeKind?: string })
+					: undefined;
+			const evidence = arg6 ?? legacyEvidenceCandidate;
 			const recordKey = key(kind, correlation);
 			const record = records.get(recordKey);
 			if (!record || record.terminalAt !== undefined || record.kind !== kind) return;
@@ -896,6 +944,19 @@ export function createInvocationReconciliation(
 					recordError !== undefined
 						? { code: recordError.code, message: recordError.message }
 						: { code: finalOutcome.code, message: finalOutcome.message };
+			} else if (kind === "prompt" && finalOutcome === undefined) {
+				// Evidence-based empty predicate (exact-head review P1/P2): the same
+				// semantics as the noteTransition agent_end classifier. A
+				// content-bearing, activity-bearing, or explicitly stopped
+				// finalization without an explicit outcome is a successful terminal;
+				// only a genuinely empty, no-activity completion fails closed.
+				const terminalText = evidence?.content?.text.trim() ?? "";
+				if (terminalText === "" && !evidence?.hasActivity && evidence?.outcomeKind !== "stopped") {
+					finalizedRecord.status = "failed";
+					finalizedRecord.error = EMPTY_PROMPT_FAILURE;
+				} else {
+					finalizedRecord.status = "terminal_ok";
+				}
 			} else {
 				finalizedRecord.status = "terminal_ok";
 			}
@@ -1597,6 +1658,55 @@ function providerFailureFromAgentEnd(event: unknown): { code: string; message: s
 		// Provider metadata is untrusted: an SDK/provider adapter may expose a
 		// throwing getter while the lifecycle boundary still needs to terminalize.
 		return undefined;
+	}
+}
+
+interface PromptTerminalEvidence {
+	content?: TurnResultContent;
+	hasActivity: boolean;
+}
+
+function promptTerminalEvidenceFromAgentEnd(event: unknown): PromptTerminalEvidence {
+	try {
+		if (!event || typeof event !== "object") return { hasActivity: false };
+		const messages = (event as { messages?: unknown }).messages;
+		if (!Array.isArray(messages)) return { hasActivity: false };
+		const assistant = [...messages]
+			.reverse()
+			.find(
+				message => message && typeof message === "object" && (message as { role?: unknown }).role === "assistant",
+			);
+		if (!assistant || typeof assistant !== "object") return { hasActivity: false };
+		const content = (assistant as { content?: unknown }).content;
+		if (typeof content === "string") {
+			const bounded = sanitizeTurnResultContent(content);
+			return { content: bounded, hasActivity: content.trim().length > 0 };
+		}
+		if (Array.isArray(content)) {
+			const hasActivity = content.some(block => {
+				if (block === null || typeof block !== "object") return false;
+				const type = (block as { type?: unknown }).type;
+				if (type === "text") {
+					const text = (block as { text?: unknown }).text;
+					return typeof text === "string" && text.trim().length > 0;
+				}
+				return typeof type === "string" && type.length > 0;
+			});
+			const text = content
+				.filter(
+					(block): block is { type: "text"; text: string } =>
+						block !== null &&
+						typeof block === "object" &&
+						(block as { type?: unknown }).type === "text" &&
+						typeof (block as { text?: unknown }).text === "string",
+				)
+				.map(block => block.text)
+				.join("");
+			return { content: sanitizeTurnResultContent(text), hasActivity };
+		}
+		return { content: sanitizeTurnResultContent(""), hasActivity: false };
+	} catch {
+		return { hasActivity: false };
 	}
 }
 
@@ -3374,6 +3484,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		failureCause?: unknown,
 		maintenanceOutcome?: string,
 		lifecycleOwner?: LifecycleOwner,
+		terminalContent?: TurnResultContent,
+		terminalHasActivity = false,
+		terminalOutcome?: { kind: "stopped"; reason: "cancelled"; provenance: "client_cancel" },
 	): Promise<void> => {
 		const current = lifecycleOwner?.state ?? active;
 		if (!current) return;
@@ -3461,6 +3574,11 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				if (current.activeInvocation?.kind === "prompt") {
 					current.deadlineManager.onAccepted(current.activeInvocation.correlation);
 				}
+			} else {
+				// An empty drain is an agent-initiated successor run. Clear the
+				// predecessor's SDK owner and active invocation so abort ownership and
+				// tool-progress renewal cannot leak into the successor.
+				adoptLifecycleBatch(undefined);
 			}
 			transitions = drained.map(({ kind, correlation }) => ({ kind, correlation }));
 		} else {
@@ -3626,7 +3744,17 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					const reasonKey = `${invocation.correlation.commandId}:${invocation.correlation.turnId}`;
 					const unrecorded = type === "agent_end" ? current.unrecordedFailureReasons?.get(reasonKey) : undefined;
 					if (type === "agent_end" && invocation.kind === "prompt")
-						current.deadlineManager.noteTerminalTransition(invocation.correlation, unrecorded);
+						current.deadlineManager.noteTerminalTransition(
+							invocation.correlation,
+							unrecorded,
+							terminalContent !== undefined || terminalHasActivity || terminalOutcome !== undefined
+								? ({
+										content: terminalContent,
+										hasActivity: terminalHasActivity,
+										outcome: terminalOutcome,
+									} satisfies PromptTerminalTransitionEvidence)
+								: undefined,
+						);
 					if (type === "agent_end") {
 						// Compound recovery (exact-head review P1): if this run's
 						// agent_failed write failed, re-record the sanitized reason
@@ -3650,7 +3778,16 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 									error:
 										failureCause ?? Object.assign(new Error("agent run failed"), { code: "agent_failed" }),
 								}
-							: { type };
+							: {
+									type,
+									...(type === "agent_end" && terminalContent !== undefined
+										? { content: terminalContent }
+										: {}),
+									...(type === "agent_end" && terminalHasActivity ? { hasActivity: true } : {}),
+									...(type === "agent_end" && terminalOutcome !== undefined
+										? { outcome: terminalOutcome }
+										: {}),
+								};
 					await current.reconciliation.noteTransition(invocation.kind, invocation.correlation, frame as never);
 					if ((type as string) === "agent_end") {
 						if (invocation.kind === "prompt") current.deadlineManager.clear(invocation.correlation);
@@ -3814,6 +3951,11 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			owner?.failureDiagnosticKeys.has(lifecycleCorrelationKey(correlation)),
 		);
 		const failureAlreadyPublished = failure === undefined || (hasExistingFailure && genericFailureKeys.length === 0);
+		const terminalEvidence = promptTerminalEvidenceFromAgentEnd(event);
+		const terminalOutcome =
+			event.stopReason === "cancelled"
+				? ({ kind: "stopped", reason: "cancelled", provenance: "client_cancel" } as const)
+				: undefined;
 		return trackLifecycle(async () => {
 			if (failure && !failureAlreadyPublished) {
 				for (const key of genericFailureKeys) owner?.failureDiagnosticKeys.delete(key);
@@ -3825,6 +3967,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				undefined,
 				event.stopReason === "maintenance" ? event.maintenanceOutcome : undefined,
 				lifecycleOwner,
+				terminalEvidence.content,
+				terminalEvidence.hasActivity,
+				terminalOutcome,
 			);
 		}, owner).finally(() => {
 			if (typeof event.sdkRunToken === "string" && lifecycleRunOwners.get(event.sdkRunToken)?.state === owner)
