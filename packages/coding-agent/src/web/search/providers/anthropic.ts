@@ -313,12 +313,18 @@ export async function searchAnthropic(
 	} else if ("authStorage" in params) {
 		const ctx = params.activeModelContext;
 		const resolveActiveCredentials = ctx?.resolveCredentials;
+		const activeAnthropicWire = ctx?.api === "anthropic-messages";
 		const activeModelOwnsProvider =
 			ctx !== undefined &&
 			resolveActiveCredentials !== undefined &&
-			ctx.api === "anthropic-messages" &&
+			activeAnthropicWire &&
 			ctx.provider.toLowerCase() === "anthropic";
-		if (activeModelOwnsProvider) {
+		const activeCustomModel =
+			ctx !== undefined &&
+			resolveActiveCredentials !== undefined &&
+			activeAnthropicWire &&
+			ctx.provider.toLowerCase() !== "anthropic";
+		if (activeModelOwnsProvider || activeCustomModel) {
 			const activeCredentials: ActiveSearchModelCredentials = await resolveActiveCredentials({
 				sessionId: params.sessionId,
 				signal: params.signal,

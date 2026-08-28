@@ -5106,6 +5106,11 @@ export class ModelRegistry {
 		);
 	}
 
+	/** Opaque owner token for registry-scoped AuthStorage reads. */
+	getAuthStorageOwner(): object {
+		return this.#authStorageConfigOwner;
+	}
+
 	getProviderWebSearchMode(provider: string): WebSearchMode | undefined {
 		return this.#providerWebSearchModes.get(provider);
 	}
