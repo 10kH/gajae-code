@@ -11111,6 +11111,7 @@ export class AgentSession {
 		const rosterClaim = this.#claimIrcRosterCandidate();
 		let hasPendingNextTurnMessages = false;
 		let pendingNextTurnMessageCount = 0;
+		let skipPostPromptRecoveryWait = options?.skipPostPromptRecoveryWait === true;
 		let hindsightRecall: string | undefined;
 		try {
 			this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
@@ -11425,7 +11426,12 @@ export class AgentSession {
 			) {
 				this.#commitIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
 			}
-			if (!options?.skipPostPromptRecoveryWait) {
+			// A queued SDK submission can attach to this already-running turn. Consume
+			// its fast-terminal intent exactly once at the same boundary as the direct
+			// prompt option, without changing ordinary interactive drain semantics.
+			skipPostPromptRecoveryWait ||= this.#skipPostPromptRecoveryWaitForCurrentTurn;
+			this.#skipPostPromptRecoveryWaitForCurrentTurn = false;
+			if (!skipPostPromptRecoveryWait) {
 				await this.#waitForPostPromptRecovery();
 			}
 		} catch (error) {
@@ -11450,7 +11456,8 @@ export class AgentSession {
 				this.#releaseIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
 			}
 			this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
-			await this.#settleEndedInFlight(inFlightPrompt, options?.skipPostPromptRecoveryWait ? "publication" : "full");
+			this.#skipPostPromptRecoveryWaitForCurrentTurn = false;
+			await this.#settleEndedInFlight(inFlightPrompt, skipPostPromptRecoveryWait ? "publication" : "full");
 		}
 	}
 
