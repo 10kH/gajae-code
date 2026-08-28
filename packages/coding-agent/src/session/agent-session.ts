@@ -11442,9 +11442,10 @@ export class AgentSession {
 				...this.#managedFallbackPromptOptions(),
 				...(options?.sdkRunToken ? { sdkRunToken: options.sdkRunToken } : {}),
 				onRunAccepted: (handle: AttemptRunHandle) => {
-					promptAttemptScope = handle.scope;
-					this.#acceptSdkAttemptRun(handle, options?.sdkRunToken);
-					if (options?.sdkRunToken) {
+					promptAttemptScope = handle?.scope;
+					if (handle) this.#acceptSdkAttemptRun(handle, options?.sdkRunToken);
+					else this.#acceptRunHandle(handle);
+					if (handle && options?.sdkRunToken) {
 						this.#activeSdkRunToken = options.sdkRunToken;
 					}
 					options?.onRunAccepted?.(handle);
