@@ -1424,7 +1424,10 @@ export async function runUpdateCommand(
 		try {
 			const verification = await verifyTarget(release, target.path);
 			if (verification.ok) {
+				recordEvent("update_check_completed", { channel, result: "available" });
+				recordEvent("update_install_started", { channel, installMethod: target.method });
 				printVerifiedMigrationTarget(target, release.version);
+				recordEvent("update_install_completed", { channel, result: "installed", installMethod: target.method });
 				return;
 			}
 		} finally {

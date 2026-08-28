@@ -75,7 +75,9 @@ export function serializeTelemetryEvent(input: unknown): string {
 	const installId = requireString(value.installId, "installId");
 	if (!UUID_V4.test(installId)) throw new Error("invalid telemetry installId");
 	const occurredAt = requireString(value.occurredAt, "occurredAt");
-	if (Number.isNaN(Date.parse(occurredAt))) throw new Error("invalid telemetry occurredAt");
+	if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(occurredAt) || Number.isNaN(Date.parse(occurredAt))) {
+		throw new Error("invalid telemetry occurredAt");
+	}
 
 	const output: TelemetryEvent = {
 		schemaVersion: TELEMETRY_SCHEMA_VERSION,
@@ -116,7 +118,10 @@ export async function getTelemetryInstallId(
 ): Promise<string> {
 	try {
 		const existing = (await Bun.file(filePath).text()).trim();
-		if (UUID_V4.test(existing)) return existing;
+		if (UUID_V4.test(existing)) {
+			await fs.chmod(filePath, 0o600);
+			return existing;
+		}
 		throw new Error("telemetry install ID is malformed");
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;

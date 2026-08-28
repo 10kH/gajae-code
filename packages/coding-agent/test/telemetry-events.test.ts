@@ -88,4 +88,14 @@ describe("telemetry install ID", () => {
 
 		await expect(getTelemetryInstallId(filePath)).rejects.toThrow("malformed");
 	});
+
+	it("tightens permissions when reusing an existing valid ID", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-telemetry-test-"));
+		tempDirs.push(directory);
+		const filePath = path.join(directory, "telemetry-install-id");
+		await fs.writeFile(filePath, "123e4567-e89b-42d3-a456-426614174000\n", { mode: 0o644 });
+
+		expect(await getTelemetryInstallId(filePath)).toBe("123e4567-e89b-42d3-a456-426614174000");
+		expect((await fs.stat(filePath)).mode & 0o777).toBe(0o600);
+	});
 });
