@@ -59,7 +59,89 @@ function exactUnlink(target: string, identity: NativeExactFileIdentity): NativeE
 	return { ok: true };
 }
 
-function treeEntries(root: string, relativePath: string, into: NativeDirectoryTreeEntry[]): string | undefined {
+/**
+ * Faithful stand-in for the debris variant: detach to the caller's private quarantine
+ * name, revalidate identity there, then remove. A replacement at the original pathname
+ * is never consumed; a mismatch at the quarantine name restores the detached object
+ * whenever the original pathname is still vacant, mirroring the native no-replace
+ * exchange semantics.
+ *
+ * Node has no rename-no-replace, so both namespace moves are hard-link exchanges:
+ * `linkSync` fails with EEXIST when the destination holds ANY object — including a
+ * dangling symlink that `existsSync` would miss — which is exactly the native
+ * no-replace verdict. Both names are always in the same directory and the targets
+ * are validated regular files, so the exchange never crosses devices or types.
+ */
+function linkNoReplace(from: string, to: string): "ok" | "collision" | "not_found" | "io_error" {
+	try {
+		fs.linkSync(from, to);
+		return "ok";
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		// Only EEXIST is a collision verdict; EPERM and every other failure keep
+		// their diagnostic identity instead of being relabeled.
+		if (code === "EEXIST") return "collision";
+		return isEnoent(error) ? "not_found" : "io_error";
+	}
+}
+
+function exactUnlinkDirect(target: string, identity: NativeExactFileIdentity): NativeExactUnlinkResult {
+	const quarantine = identity.quarantineName;
+	if (
+		typeof quarantine !== "string" ||
+		quarantine === "" ||
+		quarantine === "." ||
+		quarantine === ".." ||
+		quarantine.includes("/") ||
+		quarantine.includes("\\")
+	)
+		return { ok: false, code: "invalid_request" };
+	const detached = path.join(path.dirname(target), quarantine);
+	// The native detaches with rename-no-replace: a pre-existing quarantine name —
+	// even a dangling symlink — is a collision verdict, never an overwrite.
+	const detach = linkNoReplace(target, detached);
+	if (detach === "collision") return { ok: false, code: "quarantine_collision" };
+	if (detach !== "ok") return { ok: false, code: detach };
+	try {
+		fs.unlinkSync(target);
+	} catch (error) {
+		// The link committed, so the object now lives at BOTH names. Any failure to
+		// drop the source — including a concurrent-cleaner ENOENT — leaves the
+		// detached name as retained evidence that must be reported, never swallowed.
+		return {
+			ok: false,
+			code: isEnoent(error) ? "not_found" : "io_error",
+			detachedPath: detached,
+		};
+	}
+	const result = exactUnlink(detached, identity);
+	if (result.ok) return { ok: true };
+	if (result.code === "identity_mismatch") {
+		// Mirror the native no-replace exchange: a successor at the original pathname
+		// (again including a dangling symlink) is never replaced; only a genuinely
+		// vacant name takes the detached object back, and the verdict carries NO
+		// retained path exactly when that restore committed.
+		const restore = linkNoReplace(detached, target);
+		if (restore === "ok") {
+			try {
+				fs.unlinkSync(detached);
+				return { ok: false, code: "identity_mismatch" };
+			} catch {
+				// The restore link committed but the detached name could not be dropped:
+				// two links remain, and the detached name is retained evidence.
+				return { ok: false, code: "identity_mismatch", detachedPath: detached };
+			}
+		}
+		return { ok: false, code: "identity_mismatch", detachedPath: detached };
+	}
+	return { ...result, detachedPath: detached };
+}
+
+function treeEntries(
+	root: string,
+	relativePath: string,
+	into: NativeDirectoryTreeEntry[],
+): "reparse_point" | "unsupported_entry" | "not_a_directory" | undefined {
 	const absolute = relativePath === "" ? root : path.join(root, relativePath);
 	const stat = fs.lstatSync(absolute, { bigint: true });
 	if (stat.isSymbolicLink()) return "reparse_point";
@@ -109,6 +191,7 @@ function exactRemoveDirectoryTree(root: string, snapshot: NativeDirectoryTreeSna
 
 export const exactIdentityNativeBindings: SessionStateLockNativeBindings = {
 	exactUnlink,
+	exactUnlinkDirect,
 	snapshotDirectoryTree,
 	exactRemoveDirectoryTree,
 };

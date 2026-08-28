@@ -15,6 +15,9 @@ import {
 import { loadInstallationHostId, loadLegacyInstallationHostId } from "../config/machine-identity";
 import { readLinuxProcStartTimeSync } from "./linux-proc";
 
+/** SHA-256 of the empty payload; the constant identity of every verified-empty receipt. */
+const EMPTY_FILE_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
 /**
  * The one lock implementation for a coordinator-shared session state file.
  *
@@ -368,6 +371,12 @@ export const SessionStateLockTestHooks: {
 	 */
 	beforeCurrentOwnerRelease?: (file: string) => void | Promise<void>;
 	beforeLegacyDirectoryRemoval?: (lockDir: string) => void | Promise<void>;
+	/** @internal Last quarantine name minted in the current lock cycle (tests). */
+	lastQuarantineName?: string;
+	/** @internal Count of quarantine names minted in the current lock cycle (tests). */
+	quarantineMints?: number;
+	/** @internal Force the next mint to this name so leftover-collision tests can plant it. */
+	forcedQuarantineName?: string;
 } = {};
 
 /** Raised when the lock could not be acquired; callers map it to their own refusal. */
@@ -392,7 +401,7 @@ export class SessionStateLockUnavailableError extends Error {
  */
 export type SessionStateLockNativeBindings = Pick<
 	typeof import("@gajae-code/natives"),
-	"exactRemoveDirectoryTree" | "exactUnlink" | "snapshotDirectoryTree"
+	"exactRemoveDirectoryTree" | "exactUnlink" | "exactUnlinkDirect" | "snapshotDirectoryTree"
 >;
 
 /** How the deletion primitives are obtained. Throwing means they are unavailable. */
@@ -781,8 +790,16 @@ type ExactRemovalOutcome = "removed" | "absent" | "identity_mismatch" | "refused
  * A single-component quarantine destination, required by the native primitive so that
  * authority over a detached record survives a crash between detach and unlink.
  */
-function lockQuarantineName(): string {
-	return `.gjc-delete-session-state-lock-${randomUUID()}.json`;
+function lockQuarantineName(existing?: string): string {
+	const name =
+		existing ??
+		SessionStateLockTestHooks.forcedQuarantineName ??
+		`.gjc-delete-session-state-lock-${randomUUID()}.json`;
+	if (!existing) {
+		SessionStateLockTestHooks.lastQuarantineName = name;
+		SessionStateLockTestHooks.quarantineMints = (SessionStateLockTestHooks.quarantineMints ?? 0) + 1;
+	}
+	return name;
 }
 
 /**
@@ -792,7 +809,11 @@ function lockQuarantineName(): string {
  * never downgraded to `fs.rm`: not knowing what is at the pathname is precisely the state
  * in which deleting it destroys a successor's lock.
  */
-function exactUnlinkOwnerRecord(file: string, identity: LockOwnerSnapshot): ExactRemovalOutcome {
+function exactUnlinkOwnerRecord(
+	file: string,
+	identity: LockOwnerSnapshot,
+	quarantineName: string,
+): ExactRemovalOutcome {
 	let result: NativeExactUnlinkResult;
 	try {
 		result = nativeSessionStateLock().exactUnlink(file, {
@@ -802,7 +823,7 @@ function exactUnlinkOwnerRecord(file: string, identity: LockOwnerSnapshot): Exac
 			size: identity.size,
 			mtimeNs: identity.mtimeNs,
 			sha256: identity.sha256,
-			quarantineName: lockQuarantineName(),
+			quarantineName,
 		});
 	} catch (error) {
 		throw new SessionStateLockUnavailableError(error);
@@ -933,6 +954,7 @@ async function retractFailedOwnerRecord(
 	file: string,
 	handle: fs.FileHandle,
 	created: OpenOwnerIdentity | null,
+	quarantineName: string,
 ): Promise<void> {
 	if (!created) return;
 	const stillOpen = await openOwnerIdentity(handle);
@@ -940,7 +962,7 @@ async function retractFailedOwnerRecord(
 	if (ownerAccessStrategy() === "windows-validated") await handle.close().catch(() => undefined);
 	const current = await captureRegularLockOwner(file).catch(() => null);
 	if (!current || current.dev !== created.dev || current.ino !== created.ino) return;
-	exactUnlinkOwnerRecord(file, current);
+	exactUnlinkOwnerRecord(file, current, quarantineName);
 }
 
 /**
@@ -961,7 +983,11 @@ async function retractFailedOwnerRecord(
  * @throws `EEXIST` (or `EISDIR`/`EPERM`) unchanged, so callers can tell contention apart
  * from failure.
  */
-async function createOwnerLock(file: string, owner: SessionStateLockOwner): Promise<LockOwnerSnapshot> {
+async function createOwnerLock(
+	file: string,
+	owner: SessionStateLockOwner,
+	quarantineName: string,
+): Promise<LockOwnerSnapshot> {
 	const flags = ownerCreateFlags();
 	if (flags === undefined)
 		throw new SessionStateLockUnavailableError(
@@ -987,7 +1013,7 @@ async function createOwnerLock(file: string, owner: SessionStateLockOwner): Prom
 		// Deliberately BEFORE any close: releasing the descriptor first would free the
 		// created inode for reuse and turn a successor into a match.
 		try {
-			await retractFailedOwnerRecord(file, handle, created);
+			await retractFailedOwnerRecord(file, handle, created, quarantineName);
 		} catch (cleanupError) {
 			throw new AggregateError(
 				[error, cleanupError],
@@ -1128,11 +1154,12 @@ async function rewriteHeldOwnerRecord(
 async function acquireOwnerLock(
 	file: string,
 	owner: SessionStateLockOwner,
+	quarantineName: string,
 	onRewriteFailure?: (held: LockOwnerSnapshot) => void,
 ): Promise<LockOwnerSnapshot> {
 	nativeSessionStateLock();
 	try {
-		return await createOwnerLock(file, owner);
+		return await createOwnerLock(file, owner, quarantineName);
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 		const stat = await fs.lstat(file).catch(() => null);
@@ -1218,6 +1245,7 @@ async function reclaimStaleOwnerRecord(
 		afterInspection?: (file: string) => void | Promise<void>;
 		beforeRemoval?: (file: string) => void | Promise<void>;
 	},
+	quarantineName?: string,
 ): Promise<void> {
 	const snapshot = await captureRegularLockOwner(file);
 	if (!snapshot) return;
@@ -1236,10 +1264,82 @@ async function reclaimStaleOwnerRecord(
 	const current = await captureRegularLockOwner(file);
 	if (!current || !sameLockOwnerSnapshot(current, snapshot)) return;
 	await hooks.beforeRemoval?.(file);
-	const outcome = exactUnlinkOwnerRecord(file, current);
+	const reserved = quarantineName ?? lockQuarantineName();
+	await removeVerifiedEmptyQuarantine(path.dirname(file), reserved);
+	const outcome = exactUnlinkOwnerRecord(file, current, reserved);
 	// A successor that took the path in the final window keeps it; this call just loses.
 	if (outcome === "refused")
 		throw new SessionStateLockUnavailableError(new Error("Stale owner record could not be reclaimed."));
+}
+
+/**
+ * Verified empty leftover at a reserved quarantine name is incomplete debris, not
+ * in-progress cleanup.
+ *
+ * Deletion authority is the native identity-bound direct unlink — never a plain
+ * pathname unlink. A replacement planted at the reserved name between observation
+ * and deletion has a different inode identity and is refused by construction.
+ */
+export async function removeVerifiedEmptyQuarantine(directory: string, name: string): Promise<void> {
+	// The name must be a single path component on every supported platform: both
+	// separator forms and drive/colon syntax are rejected before path.join, so a
+	// caller-controlled name can never escape the lock directory (Windows included).
+	if (
+		!name.startsWith(".gjc-delete-") ||
+		name.includes("/") ||
+		name.includes("\\") ||
+		name.includes(":") ||
+		name.includes("\0")
+	)
+		return;
+	const target = path.join(directory, name);
+	let parent: fsSync.BigIntStats;
+	try {
+		parent = await fs.stat(path.dirname(target), { bigint: true });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+		throw error;
+	}
+	let stat: fsSync.BigIntStats;
+	try {
+		stat = await fs.lstat(target, { bigint: true });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+		throw error;
+	}
+	if (stat.isSymbolicLink() || !stat.isFile() || stat.size !== 0n || stat.nlink !== 1n) return;
+	const result = nativeSessionStateLock().exactUnlinkDirect(target, {
+		dev: stat.dev,
+		ino: stat.ino,
+		nlink: stat.nlink,
+		parentDev: parent.dev,
+		parentIno: parent.ino,
+		size: stat.size,
+		mtimeNs: stat.mtimeNs,
+		sha256: EMPTY_FILE_SHA256,
+		quarantineName: `.gjc-delete-cleanup-${randomUUID()}.json`,
+	});
+	if (result.ok) return;
+	const retained = [
+		result.detachedPath,
+		result.retainedSuccessorPath,
+		result.retainedPlaceholderPath,
+		result.retainedUnknownPath,
+	].filter((value): value is string => typeof value === "string");
+	// not_found is an ordinary concurrent-cleanup race; identity_mismatch without a
+	// retained path means the native restored the verified object to its original
+	// name and a replacement owns the pathname now — both leave nothing hidden.
+	if (retained.length === 0 && (result.code === "not_found" || result.code === "identity_mismatch")) return;
+	// Anything else is fail-closed and observable: the stale reclaim must not proceed
+	// while recovery evidence (a stranded detached object, a retained successor, or an
+	// unrecovered placeholder) would otherwise vanish silently.
+	throw new SessionStateLockUnavailableError(
+		new Error(
+			`Verified empty quarantine cleanup did not complete (${result.code ?? "unknown"})` +
+				(retained.length > 0 ? `; retained: ${retained.join(", ")}` : "") +
+				".",
+		),
+	);
 }
 
 async function releaseTransitionClaim(
@@ -1301,17 +1401,21 @@ async function releaseTransitionClaim(
 	}
 }
 
-async function reclaimStaleTransitionClaim(transitionDir: string): Promise<void> {
+async function reclaimStaleTransitionClaim(transitionDir: string, quarantineName: string): Promise<void> {
 	const stat = await fs.lstat(transitionDir).catch(() => null);
 	if (!stat) return;
 	// Regular-file claims belong to the superseded protocol. They retain the old
 	// exact-identity stale path; released PID-1 tombstones deliberately require
 	// explicit cleanup before this atomic-directory protocol can take over.
 	if (stat.isFile()) {
-		await reclaimStaleOwnerRecord(transitionDir, {
-			afterInspection: SessionStateLockTestHooks.afterTransitionStaleInspection,
-			beforeRemoval: SessionStateLockTestHooks.beforeTransitionStaleRemoval,
-		});
+		await reclaimStaleOwnerRecord(
+			transitionDir,
+			{
+				afterInspection: SessionStateLockTestHooks.afterTransitionStaleInspection,
+				beforeRemoval: SessionStateLockTestHooks.beforeTransitionStaleRemoval,
+			},
+			quarantineName,
+		);
 		return;
 	}
 	if (!stat.isDirectory()) throw new SessionStateLockUnavailableError();
@@ -1334,7 +1438,11 @@ async function reclaimStaleTransitionClaim(transitionDir: string): Promise<void>
  * same token with `released: true` — any other content is a successor's claim
  * and stays untouched.
  */
-async function recoverPendingTransitionRelease(transitionDir: string, recoveryKey: string): Promise<boolean> {
+async function recoverPendingTransitionRelease(
+	transitionDir: string,
+	recoveryKey: string,
+	quarantineName: string,
+): Promise<boolean> {
 	let pendingKey = recoveryKey;
 	let pending = pendingTransitionReleases.get(pendingKey);
 	if (pending === undefined) {
@@ -1415,7 +1523,7 @@ async function recoverPendingTransitionRelease(transitionDir: string, recoveryKe
 		if (pending.phase === "setup") {
 			try {
 				if (pending.held) {
-					const outcome = exactUnlinkOwnerRecord(ownerFile, pending.held);
+					const outcome = exactUnlinkOwnerRecord(ownerFile, pending.held, quarantineName);
 					if (outcome !== "removed" && outcome !== "absent") {
 						clearPendingTransitionRelease(pendingKey, pending);
 						return false;
@@ -1449,7 +1557,7 @@ async function recoverPendingTransitionRelease(transitionDir: string, recoveryKe
 					clearPendingTransitionRelease(pendingKey, pending);
 					return false;
 				}
-				const outcome = exactUnlinkOwnerRecord(ownerFile, pendingOwner);
+				const outcome = exactUnlinkOwnerRecord(ownerFile, pendingOwner, quarantineName);
 				if (outcome !== "removed" && outcome !== "absent") return false;
 				await removeTransitionDir(transitionDir);
 				clearPendingTransitionRelease(pendingKey, pending);
@@ -1547,7 +1655,11 @@ async function recoverPendingTransitionRelease(transitionDir: string, recoveryKe
 }
 
 /** Run one pathname transition under an atomic `mkdir`/`rmdir` claim. */
-async function withLockPathTransition<T>(lockFile: string, transition: () => Promise<T>): Promise<T> {
+async function withLockPathTransition<T>(
+	lockFile: string,
+	transition: () => Promise<T>,
+	quarantineName = lockQuarantineName(),
+): Promise<T> {
 	if (ownerAccessStrategy() === "unsupported")
 		throw new SessionStateLockUnavailableError(new Error("Safe transition ownership is unsupported."));
 	const transitionDir = `${lockFile}${LOCK_TRANSITION_RESOURCE_SUFFIX}`;
@@ -1557,7 +1669,7 @@ async function withLockPathTransition<T>(lockFile: string, transition: () => Pro
 	for (let attempt = 0; attempt < LOCK_ACQUIRE_ATTEMPTS; attempt++) {
 		if (ownerAccessStrategy() === "unsupported" && fsSync.existsSync(transitionDir))
 			throw new SessionStateLockUnavailableError(new Error("Safe transition ownership is unsupported."));
-		if (await recoverPendingTransitionRelease(transitionDir, recoveryKey)) {
+		if (await recoverPendingTransitionRelease(transitionDir, recoveryKey, quarantineName)) {
 			// The claim this process stranded in an earlier failed release is gone;
 			// fall through and retry the mkdir immediately.
 		}
@@ -1567,7 +1679,7 @@ async function withLockPathTransition<T>(lockFile: string, transition: () => Pro
 		} catch (error) {
 			const code = (error as NodeJS.ErrnoException).code;
 			if (code !== "EEXIST" && !isTransientLockError(error)) throw new SessionStateLockUnavailableError(error);
-			await reclaimStaleTransitionClaim(transitionDir);
+			await reclaimStaleTransitionClaim(transitionDir, quarantineName);
 			await Bun.sleep(LOCK_ACQUIRE_RETRY_MS);
 			continue;
 		}
@@ -1615,7 +1727,7 @@ async function withLockPathTransition<T>(lockFile: string, transition: () => Pro
 			if (!pendingSetup.generationHandle && !pendingSetup.generation)
 				throw new SessionStateLockUnavailableError(error);
 			for (let recoveryAttempt = 0; recoveryAttempt < LOCK_ACQUIRE_ATTEMPTS; recoveryAttempt++) {
-				if (await recoverPendingTransitionRelease(transitionDir, recoveryKey)) break;
+				if (await recoverPendingTransitionRelease(transitionDir, recoveryKey, quarantineName)) break;
 				if (!pendingTransitionReleases.has(recoveryKey)) break;
 				await Bun.sleep(LOCK_ACQUIRE_RETRY_MS);
 			}
@@ -1625,7 +1737,7 @@ async function withLockPathTransition<T>(lockFile: string, transition: () => Pro
 			throw new SessionStateLockUnavailableError(new Error("Transition claim generation unavailable."));
 		let held: LockOwnerSnapshot;
 		try {
-			held = await acquireOwnerLock(ownerFile, owner, failedHeld => {
+			held = await acquireOwnerLock(ownerFile, owner, quarantineName, failedHeld => {
 				pendingSetup.held = failedHeld;
 			});
 		} catch (error) {
@@ -1699,7 +1811,7 @@ async function withLockPathTransition<T>(lockFile: string, transition: () => Pro
 			// claim in-process without replaying a transition that already succeeded.
 			if (pendingTransitionReleases.has(recoveryKey)) {
 				for (let recoveryAttempt = 0; recoveryAttempt < LOCK_ACQUIRE_ATTEMPTS; recoveryAttempt++) {
-					if (await recoverPendingTransitionRelease(transitionDir, recoveryKey)) {
+					if (await recoverPendingTransitionRelease(transitionDir, recoveryKey, quarantineName)) {
 						if (outcome.ok) return outcome.value;
 						throw outcome.error;
 					}
@@ -1732,14 +1844,20 @@ async function withLockPathTransition<T>(lockFile: string, transition: () => Pro
  * window, and the identity-bound delete keeps a BASE writer — which takes no claim and
  * just creates the pathname — from having its brand-new lock unlinked.
  */
-async function reclaimStaleRegularLock(lockFile: string): Promise<void> {
+async function reclaimStaleRegularLock(lockFile: string, quarantineName?: string): Promise<void> {
+	const reserved = quarantineName ?? lockQuarantineName();
 	await withLockPathTransition(
 		lockFile,
 		async () =>
-			await reclaimStaleOwnerRecord(lockFile, {
-				afterInspection: SessionStateLockTestHooks.afterStaleInspection,
-				beforeRemoval: SessionStateLockTestHooks.beforeStaleRemoval,
-			}),
+			await reclaimStaleOwnerRecord(
+				lockFile,
+				{
+					afterInspection: SessionStateLockTestHooks.afterStaleInspection,
+					beforeRemoval: SessionStateLockTestHooks.beforeStaleRemoval,
+				},
+				reserved,
+			),
+		reserved,
 	);
 }
 
@@ -1844,61 +1962,66 @@ function captureLegacyDirectoryTree(
  *
  * Nothing creates such a directory at this path anymore.
  */
-async function reclaimStaleDirectoryLock(lockFile: string): Promise<void> {
-	await withLockPathTransition(lockFile, async () => {
-		const native = nativeSessionStateLock();
-		const ownerHostId =
-			SessionStateLockTestHooks.unqualifiedOwnerIsLocal === true ? undefined : await currentOwnerHostId();
-		let verdict = await genericFileLockDirStaleVerdict(lockFile, LOCK_STALE_MS, ownerHostId);
-		if (!verdict.stale && ownerHostId !== undefined)
-			verdict = await genericFileLockDirStaleVerdict(lockFile, LOCK_STALE_MS, await currentLegacyOwnerHostId());
-		if (!verdict.stale) return;
-		const before = captureLegacyDirectoryTree(native, lockFile);
-		if (!before || !legacyDirectoryMatchesVerdict(before, verdict.identity)) return;
-		await SessionStateLockTestHooks.afterLegacyDirectoryStaleVerdict?.(lockFile);
-		const authorized = captureLegacyDirectoryTree(native, lockFile);
-		// The verdict spoke for `before`; only an unchanged tree carries that authority.
-		if (
-			!authorized ||
-			!legacyDirectoryMatchesVerdict(authorized, verdict.identity) ||
-			!sameDirectoryTreeSnapshot(before, authorized)
-		)
-			return;
-		await SessionStateLockTestHooks.beforeLegacyDirectoryRemoval?.(lockFile);
-		let removed: NativeExactUnlinkResult;
-		try {
-			// The SAME verified capture the verdict was bound to, so a replacement that
-			// lands after this point is still refused by the primitive itself.
-			removed = native.exactRemoveDirectoryTree(lockFile, authorized);
-		} catch (error) {
-			throw new SessionStateLockUnavailableError(error);
-		}
-		if (removed.ok || removed.code === "not_found") return;
-		// Current natives may finish the security-critical phase by durably scrubbing the
-		// authorized tree and detaching it to the one replayable `.removing` name. That
-		// retained cleanup authority is not a live lock: acquisition may continue only when
-		// the typed receipt names exactly that sibling and the original namespace is still
-		// absent. A successor already at the lock path remains authoritative and fails closed.
-		if (
-			removed.code === "cleanup_pending" &&
-			removed.payloadDurable === true &&
-			removed.detachedPath === `${lockFile}.removing`
-		) {
+async function reclaimStaleDirectoryLock(lockFile: string, quarantineName?: string): Promise<void> {
+	const reserved = quarantineName ?? lockQuarantineName();
+	await withLockPathTransition(
+		lockFile,
+		async () => {
+			const native = nativeSessionStateLock();
+			const ownerHostId =
+				SessionStateLockTestHooks.unqualifiedOwnerIsLocal === true ? undefined : await currentOwnerHostId();
+			let verdict = await genericFileLockDirStaleVerdict(lockFile, LOCK_STALE_MS, ownerHostId);
+			if (!verdict.stale && ownerHostId !== undefined)
+				verdict = await genericFileLockDirStaleVerdict(lockFile, LOCK_STALE_MS, await currentLegacyOwnerHostId());
+			if (!verdict.stale) return;
+			const before = captureLegacyDirectoryTree(native, lockFile);
+			if (!before || !legacyDirectoryMatchesVerdict(before, verdict.identity)) return;
+			await SessionStateLockTestHooks.afterLegacyDirectoryStaleVerdict?.(lockFile);
+			const authorized = captureLegacyDirectoryTree(native, lockFile);
+			// The verdict spoke for `before`; only an unchanged tree carries that authority.
+			if (
+				!authorized ||
+				!legacyDirectoryMatchesVerdict(authorized, verdict.identity) ||
+				!sameDirectoryTreeSnapshot(before, authorized)
+			)
+				return;
+			await SessionStateLockTestHooks.beforeLegacyDirectoryRemoval?.(lockFile);
+			let removed: NativeExactUnlinkResult;
 			try {
-				await fs.lstat(lockFile);
+				// The SAME verified capture the verdict was bound to, so a replacement that
+				// lands after this point is still refused by the primitive itself.
+				removed = native.exactRemoveDirectoryTree(lockFile, authorized);
 			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
 				throw new SessionStateLockUnavailableError(error);
 			}
-		}
-		if (removed.code === "sharing_violation")
-			throw new SessionStateLockUnavailableError(transientNativeResultError(removed.code));
-		// The tree changed after it was captured, so it belongs to a successor now.
-		if (removed.code === "identity_mismatch") return;
-		throw new SessionStateLockUnavailableError(
-			new Error(`Legacy lock directory could not be removed: ${removed.code ?? "unknown"}.`),
-		);
-	});
+			if (removed.ok || removed.code === "not_found") return;
+			// Current natives may finish the security-critical phase by durably scrubbing the
+			// authorized tree and detaching it to the one replayable `.removing` name. That
+			// retained cleanup authority is not a live lock: acquisition may continue only when
+			// the typed receipt names exactly that sibling and the original namespace is still
+			// absent. A successor already at the lock path remains authoritative and fails closed.
+			if (
+				removed.code === "cleanup_pending" &&
+				removed.payloadDurable === true &&
+				removed.detachedPath === `${lockFile}.removing`
+			) {
+				try {
+					await fs.lstat(lockFile);
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+					throw new SessionStateLockUnavailableError(error);
+				}
+			}
+			if (removed.code === "sharing_violation")
+				throw new SessionStateLockUnavailableError(transientNativeResultError(removed.code));
+			// The tree changed after it was captured, so it belongs to a successor now.
+			if (removed.code === "identity_mismatch") return;
+			throw new SessionStateLockUnavailableError(
+				new Error(`Legacy lock directory could not be removed: ${removed.code ?? "unknown"}.`),
+			);
+		},
+		reserved,
+	);
 }
 
 /**
@@ -1907,7 +2030,7 @@ async function reclaimStaleDirectoryLock(lockFile: string): Promise<void> {
  * @internal exported as the seam these decisions are tested through: a live legacy
  * directory owner must be provably left alone without waiting out a real stale window.
  */
-export async function reclaimStaleSessionStateLock(lockFile: string): Promise<void> {
+export async function reclaimStaleSessionStateLock(lockFile: string, quarantineName?: string): Promise<void> {
 	let stat: fsSync.Stats;
 	try {
 		stat = await fs.lstat(lockFile);
@@ -1916,7 +2039,7 @@ export async function reclaimStaleSessionStateLock(lockFile: string): Promise<vo
 		throw error;
 	}
 	if (stat.isDirectory()) {
-		await reclaimStaleDirectoryLock(lockFile);
+		await reclaimStaleDirectoryLock(lockFile, quarantineName);
 		return;
 	}
 	// A symlink, FIFO, socket, or device is not a shape either lock protocol writes.
@@ -1924,7 +2047,7 @@ export async function reclaimStaleSessionStateLock(lockFile: string): Promise<vo
 	// path is refused outright rather than inspected or removed.
 	if (!stat.isFile()) throw new SessionStateLockUnavailableError();
 	await SessionStateLockTestHooks.afterLockTypeDecision?.(lockFile);
-	await reclaimStaleRegularLock(lockFile);
+	await reclaimStaleRegularLock(lockFile, quarantineName);
 }
 
 /**
@@ -1939,13 +2062,18 @@ export async function withSessionStateFileLock<T>(stateFile: string, operation: 
 	const lockFile = `${stateFile}.lock`;
 	const owner = await newLockOwner();
 	await ensureSessionStateParent(path.dirname(stateFile));
+	const cycleQuarantine = lockQuarantineName();
 	for (let attempt = 0; attempt < LOCK_ACQUIRE_ATTEMPTS; attempt++) {
 		let held: LockOwnerSnapshot | undefined;
 		try {
 			// Contention (`EEXIST`, or `EISDIR`/`EPERM` for a legacy directory owner)
 			// propagates out of the claim to the evaluation below; the claim is released
 			// first, so the reclaim that follows can take it.
-			held = await withLockPathTransition(lockFile, () => acquireOwnerLock(lockFile, owner));
+			held = await withLockPathTransition(
+				lockFile,
+				() => acquireOwnerLock(lockFile, owner, cycleQuarantine),
+				cycleQuarantine,
+			);
 			let outcome: { ok: true; value: T } | { ok: false; error: unknown };
 			try {
 				outcome = { ok: true, value: await operation() };
@@ -1957,7 +2085,7 @@ export async function withSessionStateFileLock<T>(stateFile: string, operation: 
 			// is no longer ours is left for its owner rather than unlinked by name.
 			let releaseFailure: { error: unknown } | undefined;
 			try {
-				await withLockPathTransition(lockFile, async () => releaseOwnerLock(lockFile, record));
+				await withLockPathTransition(lockFile, async () => releaseOwnerLock(lockFile, record), cycleQuarantine);
 			} catch (error) {
 				releaseFailure = { error };
 			}
@@ -1985,7 +2113,7 @@ export async function withSessionStateFileLock<T>(stateFile: string, operation: 
 				throw error instanceof SessionStateLockUnavailableError
 					? error
 					: new SessionStateLockUnavailableError(error);
-			await reclaimStaleSessionStateLock(lockFile);
+			await reclaimStaleSessionStateLock(lockFile, cycleQuarantine);
 			await Bun.sleep(LOCK_ACQUIRE_RETRY_MS);
 		}
 	}
