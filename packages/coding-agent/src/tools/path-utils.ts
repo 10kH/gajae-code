@@ -227,7 +227,7 @@ export function splitInternalUrlSel(
 	if (!INTERNAL_SCHEMES_WITH_UNAMBIGUOUS_AUTHORITIES[scheme]) {
 		const strict = splitPathAndSel(authority);
 		if (strict.sel !== undefined) {
-			return { path: `${rawPath.slice(0, schemeEnd)}${strict.path}`, sel: strict.sel };
+			return { path: `${rawPath.slice(0, schemeEnd)}${strict.path}${authoritySuffix}`, sel: strict.sel };
 		}
 		return { path: rawPath };
 	}

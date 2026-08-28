@@ -39,6 +39,15 @@ describe("splitInternalUrlSel", () => {
 		}
 	});
 
+	it("preserves path-like URL suffixes after strict selectors", () => {
+		for (const suffix of ["/nested.txt", "?query=value", "#fragment"]) {
+			expect(splitInternalUrlSel(`local://report:raw${suffix}`)).toEqual({
+				path: `local://report${suffix}`,
+				sel: "raw",
+			});
+		}
+	});
+
 	it("does not turn empty authorities into selector-bearing root reads", () => {
 		for (const scheme of ["agent", "artifact", "memory", "issue", "pr"]) {
 			expect(splitInternalUrlSel(`${scheme}://:raw`)).toEqual({ path: `${scheme}://:raw` });
