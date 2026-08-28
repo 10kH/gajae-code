@@ -4860,19 +4860,9 @@ export class ModelRegistry {
 		for (const provider of this.#runtimeProviderApiKeyEnvNames.keys()) {
 			this.#refreshRotatingConfigApiKey(provider);
 		}
-		for (const [provider, envName] of this.#customProviderApiKeyEnvNames) {
+		for (const provider of this.#customProviderApiKeyEnvNames.keys()) {
 			if (this.#runtimeProviderCredentialInstalled.has(provider)) continue;
-			const resolved = $rotatingCredentialEnv(envName);
-			const installed = this.#customProviderApiKeys.get(provider);
-			if (resolved) {
-				if (installed !== resolved) {
-					this.#customProviderApiKeys.set(provider, resolved);
-					this.authStorage.setConfigApiKey(provider, resolved, { envSourced: true });
-				}
-			} else if (installed !== undefined) {
-				this.#customProviderApiKeys.delete(provider);
-				this.authStorage.removeConfigApiKey(provider);
-			}
+			this.#refreshRotatingConfigApiKey(provider);
 		}
 	}
 
