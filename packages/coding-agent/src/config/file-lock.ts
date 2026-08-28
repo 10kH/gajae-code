@@ -512,7 +512,13 @@ export async function removeFileLockDirForGc(
 			if (!isTransientReleaseError(error)) return "cleanup_failed";
 		}
 	}
-	const onDiskBytes = await readLockInfoBytes(lockDir);
+	let onDiskBytes: string | null;
+	try {
+		onDiskBytes = await readLockInfoBytes(lockDir);
+	} catch (error) {
+		if (isEnoent(error)) return "missing";
+		throw error;
+	}
 	const current = onDiskBytes === null ? null : parseLockInfoBytes(onDiskBytes);
 	if (!current || onDiskBytes === null) return "missing";
 	if (
