@@ -35,10 +35,10 @@ import { assertImagePlaceholdersHavePayload } from "./image-placeholder-guard";
 import { createRunResourceLedger } from "./run-resource-ledger";
 import type {
 	AgentContext,
-	AgentMetadataResolverContext,
 	AgentEvent,
 	AgentLoopConfig,
 	AgentMessage,
+	AgentMetadataResolverContext,
 	AgentState,
 	AgentTool,
 	AgentToolContext,

@@ -1007,94 +1007,98 @@ describe("createAgentSession deferred model pattern resolution", () => {
 	test(
 		"same-provider sibling registry overrides do not block startup or session pin validation",
 		async () => {
-		const provider = "anthropic";
-		const model = getBundledModel(provider, "claude-sonnet-4-5");
-		if (!model) throw new Error("Expected bundled Anthropic model");
-		const modelId = model.id;
-		const sharedAuth = await AuthStorage.create(path.join(tempDir, `shared-selector-${Snowflake.next()}.db`));
-		const firstRegistry = new ModelRegistry(
-			sharedAuth,
-			path.join(tempDir, `shared-selector-a-${Snowflake.next()}.yml`),
-			undefined,
-			{
-				automaticRefresh: false,
-			},
-		);
-		const secondRegistry = new ModelRegistry(
-			sharedAuth,
-			path.join(tempDir, `shared-selector-b-${Snowflake.next()}.yml`),
-			undefined,
-			{
-				automaticRefresh: false,
-			},
-		);
-		let session:
-			| {
-					model: Model | undefined;
-					setCredentialPin(provider: string, selector: { kind: "id"; value: string }): Promise<void>;
-					dispose(): Promise<void>;
-			  }
-			| undefined;
-		try {
-			await sharedAuth.set(provider, [
+			const provider = "anthropic";
+			const model = getBundledModel(provider, "claude-sonnet-4-5");
+			if (!model) throw new Error("Expected bundled Anthropic model");
+			const modelId = model.id;
+			const sharedAuth = await AuthStorage.create(path.join(tempDir, `shared-selector-${Snowflake.next()}.db`));
+			const firstRegistry = new ModelRegistry(
+				sharedAuth,
+				path.join(tempDir, `shared-selector-a-${Snowflake.next()}.yml`),
+				undefined,
 				{
-					type: "oauth",
-					access: "shared-selector-access",
-					refresh: "shared-selector-refresh",
-					expires: Date.now() + 60 * 60_000,
-					email: "shared-selector@example.test",
+					automaticRefresh: false,
 				},
-			]);
-			const row = sharedAuth.listCredentialInventory(provider)[0];
-			if (!row) throw new Error("Expected shared selector OAuth row");
-			const selector = { kind: "id" as const, value: String(row.id) };
-			secondRegistry.registerProvider(provider, {
-				baseUrl: "https://shared-selector-b.example.test",
-				api: "anthropic-messages",
-				apiKey: "shared-selector-second-key",
-			});
-			expect(await secondRegistry.getApiKeyForProvider(provider)).toBe("shared-selector-second-key");
+			);
+			const secondRegistry = new ModelRegistry(
+				sharedAuth,
+				path.join(tempDir, `shared-selector-b-${Snowflake.next()}.yml`),
+				undefined,
+				{
+					automaticRefresh: false,
+				},
+			);
+			let session:
+				| {
+						model: Model | undefined;
+						setCredentialPin(provider: string, selector: { kind: "id"; value: string }): Promise<void>;
+						dispose(): Promise<void>;
+				  }
+				| undefined;
+			try {
+				await sharedAuth.set(provider, [
+					{
+						type: "oauth",
+						access: "shared-selector-access",
+						refresh: "shared-selector-refresh",
+						expires: Date.now() + 60 * 60_000,
+						email: "shared-selector@example.test",
+					},
+				]);
+				const row = sharedAuth.listCredentialInventory(provider)[0];
+				if (!row) throw new Error("Expected shared selector OAuth row");
+				const selector = { kind: "id" as const, value: String(row.id) };
+				secondRegistry.registerProvider(provider, {
+					baseUrl: "https://shared-selector-b.example.test",
+					api: "anthropic-messages",
+					apiKey: "shared-selector-second-key",
+				});
+				expect(await secondRegistry.getApiKeyForProvider(provider)).toBe("shared-selector-second-key");
 
-			// Registry B's same-provider key must not make registry A's OAuth selector
-			// appear unusable. This is the direct owner-scoped startup authority check.
-			expect(
-				await firstRegistry.getApiKeyForProvider(provider, undefined, undefined, { credentialSelector: selector }),
-			).toBe("shared-selector-access");
+				// Registry B's same-provider key must not make registry A's OAuth selector
+				// appear unusable. This is the direct owner-scoped startup authority check.
+				expect(
+					await firstRegistry.getApiKeyForProvider(provider, undefined, undefined, {
+						credentialSelector: selector,
+					}),
+				).toBe("shared-selector-access");
 
-			const result = await createAgentSession({
-				cwd: tempDir,
-				agentDir: tempDir,
-				sessionManager: SessionManager.inMemory(tempDir),
-				modelRegistry: firstRegistry,
-				modelPattern: `${provider}/${modelId}`,
-				credentialSelector: { provider, selector, raw: `${provider}/id:${row.id}` },
-				settings: Settings.isolated({ "compaction.enabled": false, "todo.enabled": false }),
-				disableExtensionDiscovery: true,
-				extensions: [],
-				skills: [],
-				contextFiles: [],
-				promptTemplates: [],
-				slashCommands: [],
-				enableMCP: false,
-				enableLsp: false,
-				workspaceTree: { rootPath: tempDir, rendered: "", truncated: false, totalLines: 0, agentsMdFiles: [] },
-				toolNames: [],
-				rules: [],
-			});
-			session = result.session;
-			expect(session.model).toMatchObject({ provider, id: modelId });
-			await session.setCredentialPin(provider, selector);
+				const result = await createAgentSession({
+					cwd: tempDir,
+					agentDir: tempDir,
+					sessionManager: SessionManager.inMemory(tempDir),
+					modelRegistry: firstRegistry,
+					modelPattern: `${provider}/${modelId}`,
+					credentialSelector: { provider, selector, raw: `${provider}/id:${row.id}` },
+					settings: Settings.isolated({ "compaction.enabled": false, "todo.enabled": false }),
+					disableExtensionDiscovery: true,
+					extensions: [],
+					skills: [],
+					contextFiles: [],
+					promptTemplates: [],
+					slashCommands: [],
+					enableMCP: false,
+					enableLsp: false,
+					workspaceTree: { rootPath: tempDir, rendered: "", truncated: false, totalLines: 0, agentsMdFiles: [] },
+					toolNames: [],
+					rules: [],
+				});
+				session = result.session;
+				expect(session.model).toMatchObject({ provider, id: modelId });
+				await session.setCredentialPin(provider, selector);
 
-			secondRegistry.dispose();
-			expect(
-				await firstRegistry.getApiKeyForProvider(provider, undefined, undefined, { credentialSelector: selector }),
-			).toBe("shared-selector-access");
-		} finally {
-			await session?.dispose();
-			firstRegistry.dispose();
-			secondRegistry.dispose();
-			sharedAuth.close();
-		}
+				secondRegistry.dispose();
+				expect(
+					await firstRegistry.getApiKeyForProvider(provider, undefined, undefined, {
+						credentialSelector: selector,
+					}),
+				).toBe("shared-selector-access");
+			} finally {
+				await session?.dispose();
+				firstRegistry.dispose();
+				secondRegistry.dispose();
+				sharedAuth.close();
+			}
 		},
 		{ timeout: 60_000 },
 	);

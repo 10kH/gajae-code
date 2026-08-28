@@ -24,6 +24,7 @@ const active: SlackConversation = {
 describe("Slack thread state", () => {
 	it("requires the exact active root and endpoint generation", () => {
 		expect(acceptsSlackInbound(active, "171.1", 7)).toBe(true);
+		expect(acceptsSlackInbound({ ...active, state: "resumed_root" }, "171.1", 7)).toBe(true);
 		expect(acceptsSlackInbound(active, "171.2", 7)).toBe(false);
 		expect(acceptsSlackInbound(active, "171.1", 8)).toBe(false);
 		expect(acceptsSlackInbound({ ...active, state: "closed_marker" }, "171.1", 7)).toBe(false);

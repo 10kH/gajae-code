@@ -26,7 +26,6 @@ import {
 	type Agent,
 	AgentBusyError,
 	type AgentContext,
-	type AgentMetadataResolverContext,
 	type AgentEvent,
 	type AgentLoopConfig,
 	type AgentMessage,
@@ -183,8 +182,10 @@ export interface ForkContextSeedOptions {
 }
 
 import type { AuthCredentialSelector } from "@gajae-code/ai/core";
+import { isFoundryEnabled } from "@gajae-code/ai/utils/foundry";
 import type { MacOSPowerAssertion } from "@gajae-code/natives";
 import {
+	$pickCredentialEnv,
 	extractRetryHint,
 	hasFsCode,
 	isEacces,
@@ -192,10 +193,8 @@ import {
 	isUnexpectedSocketCloseMessage,
 	logger,
 	prompt,
-	$pickCredentialEnv,
 	Snowflake,
 } from "@gajae-code/utils";
-import { isFoundryEnabled } from "@gajae-code/ai/utils/foundry";
 import { createAppendOnlyContextManager, resolveAppendOnlyMode } from "../append-only-mode";
 import {
 	type AsyncJob,
