@@ -3,6 +3,7 @@ import type { BigIntStats, Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { NativeDirectoryTreeResult, NativeExactUnlinkResult } from "@gajae-code/natives";
+import { renameNoReplacePath } from "@gajae-code/natives";
 import { isEnoent } from "@gajae-code/utils/fs-error";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 
@@ -658,62 +659,30 @@ async function tryAcquireLock(
 	await ensureLockParent(path.dirname(lockPath));
 	const afterParentMkdir = FileLockTestHooks.afterParentMkdir;
 	if (afterParentMkdir) await afterParentMkdir(lockPath);
-	if (ownerHostId === undefined) {
-		// The final directory is never visible empty: publication stages the fully
-		// populated directory under a private pending name and renames it into place.
-		// A direct mkdir+write here would expose a stale-reclaimable ownerless `.lock`
-		// whose info a delayed publisher later overwrites a successor's record with.
-		const pendingPath = `${lockPath}.pending.${process.pid}.${crypto.randomUUID()}`;
-		const owner = lockInfo(undefined, ownerToken);
-		try {
-			await fs.mkdir(pendingPath, { mode: 0o700 });
-			await fs.chmod(pendingPath, 0o700);
-			await writeLockInfo(pendingPath, owner);
-			try {
-				await fs.rename(pendingPath, lockPath);
-			} catch (error) {
-				const code = (error as NodeJS.ErrnoException).code;
-				if (code === "EEXIST" || code === "ENOTEMPTY") return null;
-				if (isTransientReleaseError(error)) {
-					try {
-						await fs.stat(lockPath);
-						return null;
-					} catch (statError) {
-						if (!isEnoent(statError)) throw statError;
-					}
-				}
-				throw error;
-			}
-			// The rename published this process as the owner, so an onAcquired
-			// failure must still propagate without retrying: the lock exists with
-			// our identity and a retry would race our own release cleanup.
-			onAcquired?.();
-			return owner;
-		} finally {
-			await fs.rm(pendingPath, { recursive: true, force: true }).catch(() => undefined);
-		}
-	}
-
 	const pendingPath = `${lockPath}.pending.${process.pid}.${crypto.randomUUID()}`;
 	const owner = lockInfo(ownerHostId, ownerToken);
 	try {
 		await fs.mkdir(pendingPath, { mode: 0o700 });
 		await fs.chmod(pendingPath, 0o700);
 		await writeLockInfo(pendingPath, owner);
-		try {
-			await fs.rename(pendingPath, lockPath);
-		} catch (error) {
-			const code = (error as NodeJS.ErrnoException).code;
-			if (code === "EEXIST" || code === "ENOTEMPTY") return null;
-			if (isTransientReleaseError(error)) {
-				try {
-					await fs.stat(lockPath);
-					return null;
-				} catch (statError) {
-					if (!isEnoent(statError)) throw statError;
-				}
-			}
-			throw error;
+		// A plain POSIX rename replaces an existing empty directory. The legacy
+		// directory lock is a real holder, so publication must use the native
+		// no-replace primitive rather than treating an empty destination as free.
+		// The native primitive also rejects symlinked/reparse parents. Resolve the
+		// already-created staging entry and its parent before publication so aliases
+		// retain the same lock identity as the ordinary path.
+		const canonicalParent = await fs.realpath(path.dirname(lockPath));
+		const published = renameNoReplacePath(
+			await fs.realpath(pendingPath),
+			path.join(canonicalParent, path.basename(lockPath)),
+		);
+		if (!published.ok) {
+			if (published.reason === "destination_exists") return null;
+			const failure = new Error(
+				`Failed to publish file lock: ${published.code ?? published.reason ?? "unknown"}.`,
+			) as NodeJS.ErrnoException;
+			if (published.code) failure.code = published.code;
+			throw failure;
 		}
 		// Published above, so an onAcquired failure must propagate instead of
 		// retrying an acquisition that already owns the lock.

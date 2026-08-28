@@ -57,7 +57,19 @@ const LOCK_TRANSITION_RESOURCE_SUFFIX = ".transition";
 const LINUX_PROC_START_TIME_FORMAT = "linux-proc-v1";
 const PORTABLE_START_TIME_FORMAT = "ps-utc-v1";
 const TRANSIENT_LOCK_ERROR_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
-const pendingTransitionReleases = new Map<string, string>();
+
+interface TransitionDirectoryGeneration {
+	dev: bigint;
+	ino: bigint;
+}
+
+interface PendingTransitionRelease {
+	token: string;
+	generation: TransitionDirectoryGeneration;
+	recovery?: Promise<boolean>;
+}
+
+const pendingTransitionReleases = new Map<string, PendingTransitionRelease>();
 
 function isTransientLockError(error: unknown): boolean {
 	if (
@@ -995,17 +1007,31 @@ async function releaseTransitionClaim(
 	ownerFile: string,
 	held: LockOwnerSnapshot,
 ): Promise<void> {
+	const transitionStat = await fs.lstat(transitionDir, { bigint: true });
+	if (!transitionStat.isDirectory())
+		throw new SessionStateLockUnavailableError(new Error("Transition claim is no longer a directory."));
 	await SessionStateLockTestHooks.beforeCurrentOwnerRelease?.(ownerFile);
 	const current = await captureRegularLockOwner(ownerFile);
 	if (!current || !sameLockOwnerSnapshot(current, held))
 		throw new SessionStateLockUnavailableError(new Error("Transition owner changed before release."));
 	await SessionStateLockTestHooks.afterCurrentOwnerValidation?.(ownerFile);
 	const released = await rewriteHeldOwnerRecord(ownerFile, held, await releasedLockOwner());
+	const currentTransition = await fs.lstat(transitionDir, { bigint: true });
+	if (
+		!currentTransition.isDirectory() ||
+		currentTransition.dev !== transitionStat.dev ||
+		currentTransition.ino !== transitionStat.ino
+	)
+		throw new SessionStateLockUnavailableError(new Error("Transition claim changed before release."));
 	try {
 		await removeTransitionDir(transitionDir);
 	} catch (error) {
 		const owner = JSON.parse(released.bytes) as Partial<SessionStateLockOwner>;
-		if (owner.token) pendingTransitionReleases.set(transitionDir, owner.token);
+		if (owner.token)
+			pendingTransitionReleases.set(transitionDir, {
+				token: owner.token,
+				generation: { dev: transitionStat.dev, ino: transitionStat.ino },
+			});
 		throw error;
 	}
 }
@@ -1044,19 +1070,75 @@ async function reclaimStaleTransitionClaim(transitionDir: string): Promise<void>
  * and stays untouched.
  */
 async function recoverPendingTransitionRelease(transitionDir: string): Promise<boolean> {
-	const pendingToken = pendingTransitionReleases.get(transitionDir);
-	if (pendingToken === undefined) return false;
-	const ownerFile = `${transitionDir}.owner`;
+	const pending = pendingTransitionReleases.get(transitionDir);
+	if (pending === undefined) return false;
+	if (pending.recovery) return await pending.recovery;
+	const recovery = (async (): Promise<boolean> => {
+		const ownerFile = `${transitionDir}.owner`;
+		let current: fsSync.BigIntStats | null;
+		try {
+			current = await fs.lstat(transitionDir, { bigint: true });
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+				pendingTransitionReleases.delete(transitionDir);
+				return true;
+			}
+			return false;
+		}
+		// A successor may have replaced the claim after the original release failed.
+		// Never let this cleanup remove that new generation, even if its owner sidecar
+		// happens to carry the same released token.
+		if (!current.isDirectory() || current.dev !== pending.generation.dev || current.ino !== pending.generation.ino) {
+			pendingTransitionReleases.delete(transitionDir);
+			return false;
+		}
+		try {
+			const pendingOwner = JSON.parse(await fs.readFile(ownerFile, "utf8")) as Partial<SessionStateLockOwner>;
+			if (pendingOwner.token !== pending.token || pendingOwner.released !== true) {
+				pendingTransitionReleases.delete(transitionDir);
+				return false;
+			}
+			const captured = nativeSessionStateLock().snapshotDirectoryTree(transitionDir);
+			if (
+				!captured.ok ||
+				!captured.snapshot ||
+				captured.snapshot.rootDev !== String(current.dev) ||
+				captured.snapshot.rootIno !== String(current.ino)
+			) {
+				pendingTransitionReleases.delete(transitionDir);
+				return false;
+			}
+			const removed = nativeSessionStateLock().exactRemoveDirectoryTree(transitionDir, captured.snapshot);
+			if (removed.ok || removed.code === "not_found") {
+				pendingTransitionReleases.delete(transitionDir);
+				return true;
+			}
+			if (removed.code === "identity_mismatch") {
+				pendingTransitionReleases.delete(transitionDir);
+				return false;
+			}
+			if (
+				removed.code === "cleanup_pending" &&
+				removed.payloadDurable === true &&
+				removed.detachedPath === `${transitionDir}.removing` &&
+				removed.retainedSuccessorPath === undefined &&
+				removed.retainedUnknownPath === undefined &&
+				removed.retainedPlaceholderPath === undefined
+			) {
+				pendingTransitionReleases.delete(transitionDir);
+				return true;
+			}
+			return false;
+		} catch (error) {
+			if (isTransientLockError(error)) return false;
+			return false;
+		}
+	})();
+	pending.recovery = recovery;
 	try {
-		const pendingOwner = JSON.parse(await fs.readFile(ownerFile, "utf8")) as Partial<SessionStateLockOwner>;
-		if (pendingOwner.token !== pendingToken || pendingOwner.released !== true) return false;
-		await removeTransitionDir(transitionDir);
-		pendingTransitionReleases.delete(transitionDir);
-		return true;
-	} catch {
-		// A still-active denial, a vanished owner record, or unverifiable bytes all
-		// leave the claim in place: stale reclamation owns what this cannot prove.
-		return false;
+		return await recovery;
+	} finally {
+		if (pending.recovery === recovery) pending.recovery = undefined;
 	}
 }
 
@@ -1095,13 +1177,18 @@ async function withLockPathTransition<T>(lockFile: string, transition: () => Pro
 		} catch (releaseError) {
 			// The release rewrite may itself have succeeded before the claim-dir
 			// removal was denied (transient sharing denial). Recover the stranded
-			// claim in-process on the following attempts instead of surfacing a
-			// failure whose owner record is already released — and whose unrecovered
-			// claim would wedge every later operation on this state file.
+			// claim in-process without replaying a transition that already succeeded.
 			if (outcome.ok && pendingTransitionReleases.has(transitionDir)) {
-				await Bun.sleep(LOCK_ACQUIRE_RETRY_MS);
-				continue;
+				for (let recoveryAttempt = 0; recoveryAttempt < LOCK_ACQUIRE_ATTEMPTS; recoveryAttempt++) {
+					if (await recoverPendingTransitionRelease(transitionDir)) return outcome.value;
+					if (!pendingTransitionReleases.has(transitionDir)) break;
+					await Bun.sleep(LOCK_ACQUIRE_RETRY_MS);
+				}
 			}
+			if (outcome.ok)
+				throw new SessionStateLockUnavailableError(
+					new Error("Successful pathname transition could not release its claim."),
+				);
 			if (!outcome.ok)
 				throw new SessionStateLockUnavailableError(
 					new AggregateError([outcome.error, releaseError], "Lock path transition and release both failed."),

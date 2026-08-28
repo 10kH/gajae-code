@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, setSystemTime } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, setSystemTime, vi } from "bun:test";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -1491,6 +1491,31 @@ describe("coordinator session state lock", () => {
 		await expectReleasedOwner(lockFile);
 		expectReleasedTransition(lockFile);
 		expect(await withSessionStateFileLock(stateFile, async () => "reacquired")).toBe("reacquired");
+	});
+
+	it("returns a successful transition result without replaying after transient claim cleanup", async () => {
+		const { stateFile } = await seededRunningSession("lock-transition-release-retry");
+		const transitionDir = `${stateFile}.lock.transition`;
+		let denied = 5;
+		let callbackCount = 0;
+		const realRmdir = fs.rmdir;
+		vi.spyOn(fs, "rmdir").mockImplementation((async target => {
+			if (denied > 0 && String(target) === transitionDir) {
+				denied--;
+				throw Object.assign(new Error("sharing violation"), { code: "EPERM" });
+			}
+			return await realRmdir(target);
+		}) as typeof fs.rmdir);
+
+		await expect(
+			withSessionStateFileLock(stateFile, async () => {
+				callbackCount++;
+				return "saved-result";
+			}),
+		).resolves.toBe("saved-result");
+
+		expect(callbackCount).toBe(1);
+		expect(fsSync.existsSync(transitionDir)).toBe(false);
 	});
 
 	it("leaves a legacy directory whose tree changed before the exact removal", async () => {

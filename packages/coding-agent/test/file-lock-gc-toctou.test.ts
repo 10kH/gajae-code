@@ -328,6 +328,20 @@ describe("withFileLock stale owner liveness (#652)", () => {
 		expect(await fs.exists(lockDir)).toBe(true);
 	});
 
+	test("does not replace an empty legacy lock directory during publication", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "state.json");
+		const lockDir = `${lockedFile}.lock`;
+		await fs.mkdir(lockDir);
+
+		await expect(withFileLock(lockedFile, async () => undefined, { retries: 1, retryDelayMs: 1 })).rejects.toThrow(
+			"Failed to acquire lock",
+		);
+
+		expect((await fs.lstat(lockDir)).isDirectory()).toBe(true);
+		expect(await fs.readdir(lockDir)).toEqual([]);
+	});
+
 	test("preserves a live holder whose start time is explicitly unknown", async () => {
 		const base = await makeTemp();
 		const lockedFile = path.join(base, "state.json");
