@@ -58,6 +58,14 @@ describe("splitInternalUrlSel", () => {
 		expect(splitInternalUrlSel("pr://owner/repo?author=team:runtime")).toEqual({
 			path: "pr://owner/repo?author=team:runtime",
 		});
+		expect(splitInternalUrlSel("agent://reviewer_0:bogus/result")).toEqual({
+			path: "agent://reviewer_0/result",
+			sel: "bogus",
+		});
+		expect(splitInternalUrlSel("artifact://3:bogus?range=1-2")).toEqual({
+			path: "artifact://3?range=1-2",
+			sel: "bogus",
+		});
 	});
 
 	it("uses active skill names before interpreting selectors", () => {

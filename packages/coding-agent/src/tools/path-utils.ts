@@ -181,8 +181,9 @@ export function splitInternalUrlSel(
 
 	const schemeEnd = schemeMatch[0].length;
 	const authorityTerminator = rawPath.slice(schemeEnd).search(/[/?#]/);
-	if (authorityTerminator !== -1) return { path: rawPath };
-	const authority = rawPath.slice(schemeEnd);
+	const authorityEnd = authorityTerminator === -1 ? rawPath.length : schemeEnd + authorityTerminator;
+	const authority = rawPath.slice(schemeEnd, authorityEnd);
+	const authoritySuffix = rawPath.slice(authorityEnd);
 	const firstColon = authority.indexOf(":");
 	if (firstColon === -1) return { path: rawPath };
 	if (firstColon === 0) return { path: rawPath };
@@ -204,22 +205,22 @@ export function splitInternalUrlSel(
 			const rawSkillPrefix = rawSkillPrefixForName(authority, skillName);
 			if (!rawSkillPrefix) return { path: rawPath };
 			return {
-				path: `${rawPath.slice(0, schemeEnd)}${rawSkillPrefix}`,
+				path: `${rawPath.slice(0, schemeEnd)}${rawSkillPrefix}${authoritySuffix}`,
 				sel: authority.slice(rawSkillPrefix.length + 1),
 			};
 		}
 		const strict = splitPathAndSel(authority);
 		if (strict.sel !== undefined) {
-			return { path: `${rawPath.slice(0, schemeEnd)}${strict.path}`, sel: strict.sel };
+			return { path: `${rawPath.slice(0, schemeEnd)}${strict.path}${authoritySuffix}`, sel: strict.sel };
 		}
 		const firstTail = authority.slice(firstColon + 1);
 		if (FILE_LINE_RANGE_RE.test(firstTail)) {
-			return { path: rawPath.slice(0, schemeEnd + firstColon), sel: firstTail };
+			return { path: `${rawPath.slice(0, schemeEnd + firstColon)}${authoritySuffix}`, sel: firstTail };
 		}
 		const selectorColon = authority.indexOf(":", firstColon + 1);
 		if (selectorColon === -1) return { path: rawPath };
 		return {
-			path: rawPath.slice(0, schemeEnd + selectorColon),
+			path: `${rawPath.slice(0, schemeEnd + selectorColon)}${authoritySuffix}`,
 			sel: authority.slice(selectorColon + 1),
 		};
 	}
@@ -232,7 +233,10 @@ export function splitInternalUrlSel(
 		return { path: rawPath };
 	}
 
-	return { path: rawPath.slice(0, schemeEnd + firstColon), sel: authority.slice(firstColon + 1) };
+	return {
+		path: `${rawPath.slice(0, schemeEnd + firstColon)}${authoritySuffix}`,
+		sel: authority.slice(firstColon + 1),
+	};
 }
 
 function assertNotInternalUrl(expanded: string, original: string): void {
