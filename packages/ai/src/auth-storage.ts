@@ -2572,11 +2572,21 @@ export class AuthStorage {
 		isUsable?: (credential: Extract<AuthCredential, { type: T }>, index: number) => boolean | undefined,
 	): IndexedStoredCredential<Extract<AuthCredential, { type: T }>> | undefined {
 		const credentials = this.#getStoredCredentials(provider)
-			.map((entry, index) => ({ id: entry.id, credential: entry.credential, index }))
+			.map((entry, index) => ({ entry, index }))
 			.filter(
-				(entry): entry is IndexedStoredCredential<Extract<AuthCredential, { type: T }>> =>
-					entry.credential.type === type,
-			);
+				(
+					item,
+				): item is {
+					entry: StoredCredential & { credential: Extract<AuthCredential, { type: T }> };
+					index: number;
+				} => item.entry.credential.type === type,
+			)
+			.map(({ entry, index }) => ({
+				id: entry.id,
+				credential: entry.credential,
+				index,
+				revision: entry.revision,
+			}));
 
 		if (credentials.length === 0) return undefined;
 
@@ -2604,8 +2614,12 @@ export class AuthStorage {
 		includeKnownUnusable = false,
 	): IndexedStoredCredential<ApiKeyCredential> | undefined {
 		const credentials = this.#getStoredCredentials(provider)
-			.map((entry, index) => ({ id: entry.id, credential: entry.credential, index }))
-			.filter((entry): entry is IndexedStoredCredential<ApiKeyCredential> => entry.credential.type === "api_key");
+			.map((entry, index) => ({ entry, index }))
+			.filter(
+				(item): item is { entry: StoredCredential & { credential: ApiKeyCredential }; index: number } =>
+					item.entry.credential.type === "api_key",
+			)
+			.map(({ entry, index }) => ({ id: entry.id, credential: entry.credential, index, revision: entry.revision }));
 		if (credentials.length === 0) return undefined;
 
 		const providerKey = this.#getProviderTypeKey(provider, "api_key");
@@ -2839,7 +2853,7 @@ export class AuthStorage {
 			: this.#store.replaceAuthCredentialsForProvider(storageProvider, deduped);
 		this.#setStoredCredentials(
 			storageProvider,
-			stored.map(record => ({ id: record.id, credential: record.credential })),
+			stored.map(record => ({ id: record.id, credential: record.credential, revision: record.revision })),
 		);
 		this.#resetProviderAssignments(storageProvider);
 	}
@@ -2887,7 +2901,7 @@ export class AuthStorage {
 			: this.#store.upsertAuthCredentialForProviderIfAbsent(storageProvider, credential);
 		this.#setStoredCredentials(
 			storageProvider,
-			result.entries.map(entry => ({ id: entry.id, credential: entry.credential })),
+			result.entries.map(entry => ({ id: entry.id, credential: entry.credential, revision: entry.revision })),
 		);
 		this.#resetProviderAssignments(storageProvider);
 		if (result.inserted) this.#invalidateUsageCacheForProvider(storageProvider);
@@ -2905,7 +2919,7 @@ export class AuthStorage {
 			: this.#store.upsertAuthCredentialForProvider(provider, credential);
 		this.#setStoredCredentials(
 			provider,
-			stored.map(record => ({ id: record.id, credential: record.credential })),
+			stored.map(record => ({ id: record.id, credential: record.credential, revision: record.revision })),
 		);
 		this.#resetProviderAssignments(provider);
 		this.#invalidateUsageCacheForProvider(provider);
@@ -5211,7 +5225,7 @@ export class AuthStorage {
 		const latestRows = this.#store.listAuthCredentials(provider);
 		this.#setStoredCredentials(
 			provider,
-			latestRows.map(row => ({ id: row.id, credential: row.credential })),
+			latestRows.map(row => ({ id: row.id, credential: row.credential, revision: row.revision })),
 		);
 		const latestIndex = latestRows.findIndex(row => row.id === selection.id);
 		if (latestIndex === -1) return false;
@@ -5898,7 +5912,7 @@ export class AuthStorage {
 		const latestRows = this.#store.listAuthCredentials(storageProvider);
 		this.#setStoredCredentials(
 			storageProvider,
-			latestRows.map(row => ({ id: row.id, credential: row.credential })),
+			latestRows.map(row => ({ id: row.id, credential: row.credential, revision: row.revision })),
 		);
 		return true;
 	}
@@ -6108,7 +6122,7 @@ export class AuthStorage {
 		const stored = this.#store.upsertAuthCredentialForProvider(provider, credential);
 		this.#setStoredCredentials(
 			provider,
-			stored.map(entry => ({ id: entry.id, credential: entry.credential })),
+			stored.map(entry => ({ id: entry.id, credential: entry.credential, revision: entry.revision })),
 		);
 		this.#resetProviderAssignments(provider);
 		return this.#toSnapshotEntries(provider, stored);
