@@ -2729,8 +2729,11 @@ export class AsyncJobManager {
 		}
 		this.#monitorTombstones.clear();
 		const timeoutMs = options?.timeoutMs ?? 3_000;
+		const disposalDeadline = Date.now() + Math.max(timeoutMs, 0);
 		const waitResult = await this.#waitForAllWithDeadline(timeoutMs);
-		const drained = waitResult.completed ? await this.drainDeliveries({ timeoutMs }) : false;
+		const remainingDeliveryMs = Math.max(0, disposalDeadline - Date.now());
+		const drained = await this.drainDeliveries({ timeoutMs: remainingDeliveryMs });
+		if (!drained) this.#projectUndeliveredDisposalFailures();
 		this.#lastDisposeDiagnostics = { stuckJobIds: waitResult.stuckJobIds, deliveriesDrained: drained };
 		if (waitResult.stuckJobIds.length > 0) {
 			logger.warn("Async job manager dispose timed out waiting for jobs", { stuckJobIds: waitResult.stuckJobIds });
@@ -2766,6 +2769,15 @@ export class AsyncJobManager {
 		this.#notifyChange();
 		this.#changeListeners.clear();
 		return drained && waitResult.completed;
+	}
+
+	#projectUndeliveredDisposalFailures(): void {
+		const retained = [...this.#deliveries, ...this.#inFlightDeliveries];
+		for (const delivery of retained) {
+			delivery.attempt = Math.max(1, delivery.attempt);
+			delivery.lastError ??= "delivery did not settle before manager disposal deadline";
+			this.#recordDeadLetterOrEvicted(delivery);
+		}
 	}
 
 	#resolveJobId(preferredId?: string): string {

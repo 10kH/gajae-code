@@ -193,6 +193,46 @@ describe("AsyncJobManager.failNow", () => {
 		expect(manager.getLastDisposeDiagnostics().deliveriesDrained).toBe(true);
 	});
 
+	test("drains a cleanup failure while a final retry overlaps disposal", async () => {
+		const firstAttemptStarted = Promise.withResolvers<void>();
+		const releaseFirstAttempt = Promise.withResolvers<void>();
+		const secondAttemptStarted = Promise.withResolvers<void>();
+		let attempts = 0;
+		const delivered: string[] = [];
+		const manager = new AsyncJobManager({
+			retentionMs: 60_000,
+			onJobComplete: async (_jobId, text) => {
+				attempts += 1;
+				if (attempts === 1) {
+					firstAttemptStarted.resolve();
+					await releaseFirstAttempt.promise;
+					throw new Error("first cleanup receipt attempt failed");
+				}
+				secondAttemptStarted.resolve();
+				delivered.push(text);
+			},
+		});
+		const gate = Promise.withResolvers<string>();
+		const jobId = manager.register("bash", "remote", () => gate.promise, {
+			id: "bridge-final-retry",
+			ownerId: "0-Main",
+		});
+		const generation = manager.getJob(jobId)?.generation ?? "";
+		manager.registerOwnerCleanup("0-Main", () => {
+			manager.failNow(jobId, generation, "cleanup failure");
+		});
+
+		const disposal = manager.dispose({ timeoutMs: 3_000 });
+		await firstAttemptStarted.promise;
+		releaseFirstAttempt.resolve();
+		await secondAttemptStarted.promise;
+		gate.resolve("late runner result");
+
+		expect(await disposal).toBe(true);
+		expect(attempts).toBe(2);
+		expect(delivered).toEqual(["cleanup failure"]);
+	});
+
 	test("closes registration while owner cleanups run during dispose", async () => {
 		const manager = new AsyncJobManager({ retentionMs: 60_000, onJobComplete: async () => {} });
 		let registerDuringCleanup: string | undefined;
