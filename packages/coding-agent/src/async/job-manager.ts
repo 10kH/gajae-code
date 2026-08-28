@@ -2923,10 +2923,11 @@ export class AsyncJobManager {
 	}
 
 	#isDeliveryAcknowledged(jobId: string, generation?: string): boolean {
-		return (
-			(generation !== undefined && this.#suppressedDeliveries.has(generation)) ||
-			this.#suppressedDeliveries.has(jobId)
-		);
+		if (generation !== undefined && this.#suppressedDeliveries.has(generation)) return true;
+		for (const suppressedJobId of this.#suppressedDeliveryJobIds.values()) {
+			if (suppressedJobId === jobId) return true;
+		}
+		return false;
 	}
 
 	#suppressDelivery(jobId: string | null, generation: string): void {

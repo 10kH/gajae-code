@@ -109,6 +109,7 @@ describe("AsyncJobManager delivery reliability", () => {
 			// This prunes the terminal event. The suppressed generation must still
 			// reserve its original id through the independent generation projection.
 			manager.getJobsSnapshot();
+			expect(manager.isDeliverySuppressed(originalId)).toBe(true);
 			const replacementId = manager.register("task", "replacement", async () => "replacement", {
 				id: originalId,
 			});
