@@ -995,8 +995,21 @@ function parseState(value: unknown): RegistryState {
 }
 
 function loadStateSync(agentDir: string): RegistryState {
-	const value = readJsonSync(registryPaths(agentDir).state);
-	return value === undefined ? { version: 1, history: [] } : parseState(value);
+	const paths = registryPaths(agentDir);
+	const value = readJsonSync(paths.state);
+	if (value === undefined) {
+		const backup = readJsonSync(paths.backup);
+		return backup === undefined ? { version: 1, history: [] } : parseState(backup);
+	}
+	const state = parseState(value);
+	if (state.history.length === 0 && state.highestSeenRevision === undefined) {
+		const backup = readJsonSync(paths.backup);
+		if (backup !== undefined) {
+			const recovered = parseState(backup);
+			if (recovered.history.length > 0 || recovered.highestSeenRevision !== undefined) return recovered;
+		}
+	}
+	return state;
 }
 
 function loadControlSync(agentDir: string): RegistryControl {
@@ -1016,8 +1029,21 @@ function loadControlSync(agentDir: string): RegistryControl {
 }
 
 async function loadStateBun(agentDir: string): Promise<RegistryState> {
-	const value = await readJsonBun(registryPaths(agentDir).state);
-	return value === undefined ? { version: 1, history: [] } : parseState(value);
+	const paths = registryPaths(agentDir);
+	const value = await readJsonBun(paths.state);
+	if (value === undefined) {
+		const backup = await readJsonBun(paths.backup);
+		return backup === undefined ? { version: 1, history: [] } : parseState(backup);
+	}
+	const state = parseState(value);
+	if (state.history.length === 0 && state.highestSeenRevision === undefined) {
+		const backup = await readJsonBun(paths.backup);
+		if (backup !== undefined) {
+			const recovered = parseState(backup);
+			if (recovered.history.length > 0 || recovered.highestSeenRevision !== undefined) return recovered;
+		}
+	}
+	return state;
 }
 
 async function loadControlBun(agentDir: string): Promise<RegistryControl> {
