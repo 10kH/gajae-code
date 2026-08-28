@@ -67,6 +67,24 @@ describe("preset catalog model entries", () => {
 		});
 	});
 
+	test("bundles zai/glm-5.3-flash with the canonical multimodal contract", () => {
+		const model = getBundledModel("zai", "glm-5.3-flash");
+
+		expect(model.api).toBe("anthropic-messages");
+		expect(model.baseUrl).toBe("https://api.z.ai/api/anthropic");
+		expect(model.reasoning).toBe(true);
+		expect(model.input).toEqual(["text", "image"]);
+		expect(model.contextWindow).toBe(1_000_000);
+		expect(model.maxTokens).toBe(131_072);
+		expect(model.thinking).toEqual({
+			mode: "effort",
+			minLevel: Effort.Low,
+			maxLevel: Effort.Max,
+			defaultLevel: Effort.Max,
+			levels: [Effort.Low, Effort.High, Effort.Max],
+		});
+	});
+
 	test("bundles google-gemini-cli/gemini-3.5-flash", () => {
 		const model = getBundledModel("google-gemini-cli", "gemini-3.5-flash");
 
