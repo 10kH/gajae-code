@@ -994,7 +994,11 @@ function resolveOAuthAccountIdForAccessToken(
 	authStorage: AuthStorage,
 	provider: string,
 	accessToken: string,
+	owner?: object,
 ): string | undefined {
+	if (authStorage.getEffectiveCredentialType(provider, undefined, owner ? { owner } : undefined) !== "oauth") {
+		return undefined;
+	}
 	const oauthCredentials = getOAuthCredentialsForProvider(authStorage, provider);
 	const matchingCredential = oauthCredentials.find(credential => credential.access === accessToken);
 	if (matchingCredential) {
@@ -1580,7 +1584,6 @@ export class ModelRegistry {
 	#modelsConfigFile: ConfigFile<ModelsConfig>;
 	#settings: Pick<Settings, "get" | "getGlobal">;
 	readonly #authStorageConfigOwner: object = {};
-	readonly #authStorageFallbackOwner: object = {};
 	#disposeAuthStorageFallbackResolver: (() => void) | undefined;
 	#lastStaticLoadMtime: number | null = null;
 	#lastStaticLoadEnvironmentFingerprint: string | undefined;
@@ -1645,7 +1648,7 @@ export class ModelRegistry {
 		this.#disposeAuthStorageFallbackResolver = this.authStorage.setFallbackResolver(provider => {
 			const keyConfig = this.#customProviderApiKeys.get(provider);
 			return keyConfig;
-		}, this.#authStorageFallbackOwner);
+		}, this.#authStorageConfigOwner);
 		this.#unsubscribeAuthGeneration = this.authStorage.onGenerationChanged(() => this.#invalidateAvailableModels());
 		// Load models synchronously in constructor
 		this.#loadModels();
@@ -1827,7 +1830,11 @@ export class ModelRegistry {
 			this.#discoveryManager.providerIds().has(providerId) ||
 			PROVIDER_DESCRIPTORS.some(descriptor => descriptor.providerId === providerId);
 		if (!supportsDiscovery) return undefined;
-		const authEvidence = this.authStorage.getStoredLiteralApiKeyEvidenceGeneration(providerId, selector);
+		const authEvidence = this.authStorage.getStoredLiteralApiKeyEvidenceGeneration(
+			providerId,
+			selector,
+			this.#authStorageConfigOwner,
+		);
 		if (!authEvidence) return undefined;
 		return [
 			...this.#loadCachedStandardProviderModels(providerId, authEvidence),
@@ -3079,7 +3086,8 @@ export class ModelRegistry {
 		let preflightCompleted = false;
 		const optionalAuth = this.#optionalAuthProviders.has(provider);
 		const shouldPreflightAuth = optionalAuth
-			? this.authStorage.has(provider) || this.authStorage.hasAuth(provider)
+			? this.authStorage.has(provider) ||
+				this.authStorage.hasAuth(provider, undefined, { owner: this.#authStorageConfigOwner })
 			: !this.#isCredentiallessProvider(provider);
 		let preflightAuthConfigurationGeneration = this.authStorage.getProviderConfigurationGeneration(provider);
 		let preflightOAuthRefreshGeneration = this.authStorage.getProviderOAuthRefreshGeneration(provider);
@@ -3120,7 +3128,11 @@ export class ModelRegistry {
 			preflightCompleted = true;
 			if (!preflightFailed && optionalAuth && isCurrentPreflight()) {
 				this.#providerEvidenceApiKeys.set(provider, apiKey);
-				const authGeneration = this.authStorage.getProviderEvidenceGeneration(provider, apiKey);
+				const authGeneration = this.authStorage.getProviderEvidenceGeneration(
+					provider,
+					apiKey,
+					this.#authStorageConfigOwner,
+				);
 				if (apiKey === undefined) this.#credentiallessAuthFallbackProviders.set(provider, authGeneration);
 				else this.#credentiallessAuthFallbackProviders.delete(provider);
 			}
@@ -3364,7 +3376,12 @@ export class ModelRegistry {
 				providerId: "openai-codex",
 				resolveKey: value => value,
 				createOptions: accessToken => {
-					const accountId = resolveOAuthAccountIdForAccessToken(this.authStorage, "openai-codex", accessToken);
+					const accountId = resolveOAuthAccountIdForAccessToken(
+						this.authStorage,
+						"openai-codex",
+						accessToken,
+						this.#authStorageConfigOwner,
+					);
 					return openaiCodexModelManagerOptions({
 						accessToken,
 						accountId,
@@ -3666,7 +3683,9 @@ export class ModelRegistry {
 			discoveryApiKey ??
 			(this.#isCredentiallessProvider(providerConfig.provider)
 				? kNoAuth
-				: await this.authStorage.getApiKey(providerConfig.provider));
+				: await this.authStorage.getApiKey(providerConfig.provider, undefined, {
+						owner: this.#authStorageConfigOwner,
+					}));
 		if (
 			apiKey &&
 			apiKey !== DEFAULT_LOCAL_TOKEN &&
@@ -3751,7 +3770,9 @@ export class ModelRegistry {
 			discoveryApiKey ??
 			(this.#isCredentiallessProvider(providerConfig.provider)
 				? kNoAuth
-				: await this.authStorage.getApiKey(providerConfig.provider));
+				: await this.authStorage.getApiKey(providerConfig.provider, undefined, {
+						owner: this.#authStorageConfigOwner,
+					}));
 		if (
 			apiKey &&
 			apiKey !== DEFAULT_LOCAL_TOKEN &&
@@ -3878,7 +3899,10 @@ export class ModelRegistry {
 			discoveryApiKey ??
 			(this.#isCredentiallessProvider(providerConfig.provider)
 				? kNoAuth
-				: await this.authStorage.getApiKey(providerConfig.provider, undefined, { baseUrl }));
+				: await this.authStorage.getApiKey(providerConfig.provider, undefined, {
+						baseUrl,
+						owner: this.#authStorageConfigOwner,
+					}));
 		if (
 			apiKey &&
 			apiKey !== DEFAULT_LOCAL_TOKEN &&
@@ -4026,7 +4050,11 @@ export class ModelRegistry {
 			try {
 				fallbackMatchesCurrentEvidence =
 					fallbackEvidenceGeneration ===
-					this.authStorage.getProviderEvidenceGeneration(provider, this.#providerEvidenceApiKeys.get(provider));
+					this.authStorage.getProviderEvidenceGeneration(
+						provider,
+						this.#providerEvidenceApiKeys.get(provider),
+						this.#authStorageConfigOwner,
+					);
 			} catch {
 				// AuthStorage may be unavailable while a registry is being torn down.
 			}
@@ -4034,7 +4062,8 @@ export class ModelRegistry {
 		return (
 			this.#keylessProviders.has(provider) &&
 			(!this.#optionalAuthProviders.has(provider) ||
-				(!this.authStorage.hasAuth(provider) && !this.authStorage.has(provider)) ||
+				(!this.authStorage.hasAuth(provider, undefined, { owner: this.#authStorageConfigOwner }) &&
+					!this.authStorage.has(provider)) ||
 				fallbackMatchesCurrentEvidence)
 		);
 	}
@@ -4045,6 +4074,7 @@ export class ModelRegistry {
 		return this.authStorage.getProviderEvidenceGeneration(
 			provider,
 			resolvedApiKey ?? this.#providerEvidenceApiKeys.get(provider),
+			this.#authStorageConfigOwner,
 		);
 	}
 	#normalizeOpenAIModelsListBaseUrl(baseUrl?: string): string {
@@ -4444,7 +4474,8 @@ export class ModelRegistry {
 		const disabled = disabledProviders ?? getDisabledProviderIdsFromSettings(this.#settings);
 		return (
 			!disabled.has(model.provider) &&
-			(this.#keylessProviders.has(model.provider) || this.authStorage.hasAuth(model.provider))
+			(this.#keylessProviders.has(model.provider) ||
+				this.authStorage.hasAuth(model.provider, undefined, { owner: this.#authStorageConfigOwner }))
 		);
 	}
 	/** Per-query precomputed variant filter inputs; plan fields are authoritative when provided. */
@@ -4498,7 +4529,9 @@ export class ModelRegistry {
 	 * 6. Unknown (no credential surface)
 	 */
 	#effectiveProviderAuth(provider: string, sessionId?: string): EffectiveProviderAuth {
-		const credentialType = this.authStorage.getEffectiveCredentialType(provider, sessionId);
+		const credentialType = this.authStorage.getEffectiveCredentialType(provider, sessionId, {
+			owner: this.#authStorageConfigOwner,
+		});
 		if (credentialType === "api_key") return "key";
 		if (credentialType === "oauth") return "oauth";
 		if (this.#keylessProviders.has(provider)) return "keyless";
@@ -4947,7 +4980,10 @@ export class ModelRegistry {
 
 	#activeConnectionKind(model: Model<Api>): ActiveProviderDescriptor["connectionKind"] | undefined {
 		const evidence = this.#providerActivity.get(model.provider);
-		if (!this.#isCredentiallessProvider(model.provider) && this.authStorage.hasUsableAuth(model.provider)) {
+		if (
+			!this.#isCredentiallessProvider(model.provider) &&
+			this.authStorage.hasUsableAuth(model.provider, { owner: this.#authStorageConfigOwner })
+		) {
 			if (!evidence) return undefined;
 			const discoveryOnly =
 				!evidence.staticConfigured &&
@@ -5022,14 +5058,20 @@ export class ModelRegistry {
 	 * as providers with stored credentials. See issue #993.
 	 */
 	hasConfiguredAuth(model: Model<Api>): boolean {
-		return this.#keylessProviders.has(model.provider) || this.authStorage.hasAuth(model.provider);
+		return (
+			this.#keylessProviders.has(model.provider) ||
+			this.authStorage.hasAuth(model.provider, undefined, { owner: this.#authStorageConfigOwner })
+		);
 	}
 
 	/**
 	 * Check whether auth is configured for a provider.
 	 */
 	hasConfiguredProviderAuth(provider: string): boolean {
-		return this.#keylessProviders.has(provider) || this.authStorage.hasAuth(provider);
+		return (
+			this.#keylessProviders.has(provider) ||
+			this.authStorage.hasAuth(provider, undefined, { owner: this.#authStorageConfigOwner })
+		);
 	}
 
 	isCredentiallessProvider(provider: string): boolean {
@@ -5120,6 +5162,7 @@ export class ModelRegistry {
 				modelId: model.id,
 				credentialSelector: options.credentialSelector,
 				preferredCredentialSelector: options.preferredCredentialSelector,
+				owner: this.#authStorageConfigOwner,
 				signal: options.signal,
 			}),
 		);
@@ -5146,6 +5189,7 @@ export class ModelRegistry {
 				baseUrl,
 				credentialSelector: options.credentialSelector,
 				preferredCredentialSelector: options.preferredCredentialSelector,
+				owner: this.#authStorageConfigOwner,
 				signal: options.signal,
 			}),
 		);
@@ -5292,16 +5336,21 @@ export class ModelRegistry {
 			return kNoAuth;
 		}
 		try {
-			this.authStorage.getProviderEvidenceGeneration(provider);
+			this.authStorage.getProviderEvidenceGeneration(provider, undefined, this.#authStorageConfigOwner);
 		} catch {
 			return undefined;
 		}
 		if (options.refreshOAuth && this.authStorage.hasOAuth(provider)) {
-			return this.authStorage.getApiKey(provider, undefined, { baseUrl: options.baseUrl });
+			return this.authStorage.getApiKey(provider, undefined, {
+				baseUrl: options.baseUrl,
+				owner: this.#authStorageConfigOwner,
+			});
 		}
 		return options.ignoreCredentiallessFallback
-			? this.authStorage.peekApiKey(provider)
-			: this.#getApiKeyOrNoAuth(provider, () => this.authStorage.peekApiKey(provider));
+			? this.authStorage.peekApiKey(provider, { owner: this.#authStorageConfigOwner })
+			: this.#getApiKeyOrNoAuth(provider, () =>
+					this.authStorage.peekApiKey(provider, { owner: this.#authStorageConfigOwner }),
+				);
 	}
 
 	/**
@@ -5590,7 +5639,9 @@ export class ModelRegistry {
 			const withModelOverrides = this.#applyProviderModelOverrides(providerName, withRuntimeTransportOverride);
 
 			if (config.oauth?.modifyModels) {
-				const credential = this.authStorage.getOAuthCredential(providerName);
+				const credential = this.authStorage.getOAuthCredential(providerName, undefined, {
+					owner: this.#authStorageConfigOwner,
+				});
 				if (credential) {
 					this.#models = this.#finalizeModels(config.oauth.modifyModels(withModelOverrides, credential));
 					this.#rebuildCanonicalIndex();

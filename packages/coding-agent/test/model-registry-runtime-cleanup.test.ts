@@ -119,4 +119,71 @@ describe("ModelRegistry runtime source cleanup", () => {
 			secondRegistry.dispose();
 		}
 	});
+
+	test("shared AuthStorage keeps same-provider credentials owner-bound", async () => {
+		const secondModelsJsonPath = path.join(tempDir, "models-second.json");
+		const provider = "shared-provider";
+		const modelId = "shared-model";
+		await Bun.write(
+			modelsJsonPath,
+			JSON.stringify({
+				providers: {
+					[provider]: {
+						baseUrl: "https://first.example.com/v1",
+						api: "openai-responses",
+						apiKey: "first-key",
+						models: [{ id: modelId }],
+					},
+				},
+			}),
+		);
+		await Bun.write(
+			secondModelsJsonPath,
+			JSON.stringify({
+				providers: {
+					[provider]: {
+						baseUrl: "https://second.example.com/v1",
+						api: "openai-responses",
+						apiKey: "second-key",
+						models: [{ id: modelId }],
+					},
+				},
+			}),
+		);
+
+		const firstRegistry = new ModelRegistry(authStorage, modelsJsonPath, undefined, { automaticRefresh: false });
+		const secondRegistry = new ModelRegistry(authStorage, secondModelsJsonPath, undefined, {
+			automaticRefresh: false,
+		});
+		try {
+			const firstModel = firstRegistry.find(provider, modelId);
+			const secondModel = secondRegistry.find(provider, modelId);
+			expect(firstModel?.baseUrl).toBe("https://first.example.com/v1");
+			expect(secondModel?.baseUrl).toBe("https://second.example.com/v1");
+			expect(await firstRegistry.getApiKeyForProvider(provider)).toBe("first-key");
+			expect(await secondRegistry.getApiKeyForProvider(provider)).toBe("second-key");
+
+			const firstSearch = firstRegistry.getActiveSearchModelContext(firstModel!);
+			const secondSearch = secondRegistry.getActiveSearchModelContext(secondModel!);
+			expect((await firstSearch.resolveCredentials!({})).apiKey).toBe("first-key");
+			expect((await secondSearch.resolveCredentials!({})).apiKey).toBe("second-key");
+
+			await firstRegistry.refresh("offline");
+			expect(await firstRegistry.getApiKeyForProvider(provider)).toBe("first-key");
+			expect(await secondRegistry.getApiKeyForProvider(provider)).toBe("second-key");
+			await secondRegistry.refresh("offline");
+			expect(await firstRegistry.getApiKeyForProvider(provider)).toBe("first-key");
+			expect(await secondRegistry.getApiKeyForProvider(provider)).toBe("second-key");
+			authStorage.clearConfigApiKeys();
+			expect(await firstRegistry.getApiKeyForProvider(provider)).toBe("first-key");
+			expect(await secondRegistry.getApiKeyForProvider(provider)).toBe("second-key");
+
+			firstRegistry.dispose();
+			expect(await secondRegistry.getApiKeyForProvider(provider)).toBe("second-key");
+			expect((await secondSearch.resolveCredentials!({})).apiKey).toBe("second-key");
+		} finally {
+			firstRegistry.dispose();
+			secondRegistry.dispose();
+		}
+	});
 });

@@ -196,17 +196,27 @@ describe("ModelRegistry", () => {
 				signal: controller.signal,
 			});
 
-			expect(getApiKey).toHaveBeenNthCalledWith(1, "anthropic", "model-session", {
-				baseUrl: model.baseUrl,
-				modelId: model.id,
-				credentialSelector,
-				signal: controller.signal,
-			});
-			expect(getApiKey).toHaveBeenNthCalledWith(2, "anthropic", "provider-session", {
-				baseUrl: "https://proxy.example.com",
-				credentialSelector,
-				signal: controller.signal,
-			});
+			expect(getApiKey).toHaveBeenNthCalledWith(
+				1,
+				"anthropic",
+				"model-session",
+				expect.objectContaining({
+					baseUrl: model.baseUrl,
+					modelId: model.id,
+					credentialSelector,
+					signal: controller.signal,
+				}),
+			);
+			expect(getApiKey).toHaveBeenNthCalledWith(
+				2,
+				"anthropic",
+				"provider-session",
+				expect.objectContaining({
+					baseUrl: "https://proxy.example.com",
+					credentialSelector,
+					signal: controller.signal,
+				}),
+			);
 		} finally {
 			getApiKey.mockRestore();
 		}
@@ -5119,9 +5129,13 @@ describe("ModelRegistry", () => {
 					const registry = new ModelRegistry(authStorage, modelsJsonPath);
 					await registry.refreshProvider("llama.cpp", "online");
 
-					expect(getApiKeySpy).toHaveBeenCalledWith("llama.cpp", undefined, {
-						baseUrl: "http://127.0.0.1:8080",
-					});
+					expect(getApiKeySpy).toHaveBeenCalledWith(
+						"llama.cpp",
+						undefined,
+						expect.objectContaining({
+							baseUrl: "http://127.0.0.1:8080",
+						}),
+					);
 					expect(requestApiKeys).toEqual(["Bearer refreshed-llama-access", "Bearer refreshed-llama-access"]);
 				} finally {
 					getApiKeySpy.mockRestore();
@@ -8808,9 +8822,13 @@ describe("ModelRegistry", () => {
 				const registry = new ModelRegistry(authStorage, modelsJsonPath);
 				await registry.refreshProvider("oauth-discovery", "online");
 
-				expect(getApiKeySpy).toHaveBeenCalledWith("oauth-discovery", undefined, {
-					baseUrl: "https://oauth-discovery.example.com/v1",
-				});
+				expect(getApiKeySpy).toHaveBeenCalledWith(
+					"oauth-discovery",
+					undefined,
+					expect.objectContaining({
+						baseUrl: "https://oauth-discovery.example.com/v1",
+					}),
+				);
 				expect(getApiKeySpy).toHaveBeenCalledTimes(1);
 				expect(fetchCalls).toBe(1);
 			} finally {

@@ -1026,9 +1026,11 @@ type UsageRequestDescriptor = {
 	baseUrl?: string;
 };
 
-type AuthApiKeyOptions = {
+export type AuthApiKeyOptions = {
 	baseUrl?: string;
 	modelId?: string;
+	/** Select config registrations owned by one caller (for example a ModelRegistry). */
+	owner?: object;
 	/**
 	 * Caller's cancel signal. Threaded into any broker-bound OAuth refresh so
 	 * `ESC` / request abort actually kills a hung broker fetch instead of
@@ -1251,6 +1253,7 @@ type IndexedStoredCredential<T extends AuthCredential = AuthCredential> = {
 	index: number;
 };
 type OAuthCredentialSelection = IndexedStoredCredential<OAuthCredential>;
+type ConfigApiKeyRegistration = { apiKey: string; envSourced: boolean; order: number };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // AuthStorage Class
@@ -1269,9 +1272,8 @@ export class AuthStorage {
 	#runtimeOverrides: Map<string, string> = new Map();
 	#configOverrides: Map<string, string> = new Map();
 	/** Effective config override registrations, including owner-scoped model registries. */
-	#configOverrideRegistrations: Map<string, Map<object, { apiKey: string; envSourced: boolean; order: number }>> =
-		new Map();
-	#unownedConfigOverrides: Map<string, { apiKey: string; envSourced: boolean; order: number }> = new Map();
+	#configOverrideRegistrations: Map<string, Map<object, ConfigApiKeyRegistration>> = new Map();
+	#unownedConfigOverrides: Map<string, ConfigApiKeyRegistration> = new Map();
 	#configOverrideOrder = 0;
 	/**
 	 * Providers whose config override was resolved from a models.yml `apiKeyEnv`
@@ -1422,13 +1424,29 @@ export class AuthStorage {
 	#getProviderConfigurationGeneration(provider: string): number {
 		return this.#providerConfigurationGenerations.get(resolveOAuthStorageProvider(provider)) ?? 1;
 	}
-	getProviderEvidenceGeneration(provider: string, resolvedApiKey?: string): string {
+	#configOverrideRegistration(provider: string, owner?: object): ConfigApiKeyRegistration | undefined {
 		const storageProvider = resolveOAuthStorageProvider(provider);
+		if (owner) {
+			return (
+				this.#configOverrideRegistrations.get(storageProvider)?.get(owner) ??
+				this.#unownedConfigOverrides.get(storageProvider)
+			);
+		}
+		const apiKey = this.#configOverrides.get(storageProvider);
+		return apiKey === undefined
+			? undefined
+			: { apiKey, envSourced: this.#configOverrideEnvSourced.has(storageProvider), order: 0 };
+	}
+	#hasConfigOverride(provider: string, owner?: object): boolean {
+		return this.#configOverrideRegistration(provider, owner) !== undefined;
+	}
+	getProviderEvidenceGeneration(provider: string, resolvedApiKey?: string, owner?: object): string {
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		provider = storageProvider;
 		const evidenceApiKey = resolvedApiKey;
+		const configOverride = this.#configOverrideRegistration(storageProvider, owner);
 		const storedLiteral =
-			evidenceApiKey === undefined ||
-			this.#runtimeOverrides.has(storageProvider) ||
-			this.#configOverrides.has(storageProvider)
+			evidenceApiKey === undefined || this.#runtimeOverrides.has(storageProvider) || configOverride !== undefined
 				? undefined
 				: this.#getCredentialsForProvider(storageProvider).find(
 						(credential): credential is Extract<AuthCredential, { type: "api_key" }> =>
@@ -1445,7 +1463,7 @@ export class AuthStorage {
 		}
 		let selectedCredential: ({ index: number } & StoredCredential) | undefined;
 		try {
-			selectedCredential = this.#resolveSelectedStoredCredential(provider, undefined, undefined);
+			selectedCredential = this.#resolveSelectedStoredCredential(provider, owner ? { owner } : undefined, undefined);
 		} catch {
 			return crypto
 				.createHash("sha256")
@@ -1461,7 +1479,7 @@ export class AuthStorage {
 				credential.type === "oauth" && Number.isFinite(credential.expires) && credential.expires > Date.now(),
 		);
 		const effectiveEnvKey =
-			this.#runtimeOverrides.get(provider) || this.#configOverrides.get(provider) || hasApiKey || hasUsableOAuth
+			this.#runtimeOverrides.get(provider) || configOverride?.apiKey || hasApiKey || hasUsableOAuth
 				? undefined
 				: getEnvApiKey(provider);
 		const storedApiKeyFingerprint = credentials
@@ -1673,15 +1691,20 @@ export class AuthStorage {
 	}
 
 	/** @internal Return cache provenance for an exact stored literal API-key row without resolving its value. */
-	getStoredLiteralApiKeyEvidenceGeneration(provider: string, selector: AuthCredentialSelector): string | undefined {
+	getStoredLiteralApiKeyEvidenceGeneration(
+		provider: string,
+		selector: AuthCredentialSelector,
+		owner?: object,
+	): string | undefined {
 		if (selector.kind !== "id") return undefined;
 		const storageProvider = resolveOAuthStorageProvider(provider);
-		if (this.#runtimeOverrides.has(storageProvider) || this.#configOverrides.has(storageProvider)) return undefined;
+		if (this.#runtimeOverrides.has(storageProvider) || this.#hasConfigOverride(storageProvider, owner))
+			return undefined;
 		const selected = this.#findCredentialBySelector(storageProvider, selector);
 		if (selected?.credential.type !== "api_key") return undefined;
 		const key = selected.credential.key;
 		if (!key || key.startsWith("!") || process.env[key] !== undefined) return undefined;
-		return this.getProviderEvidenceGeneration(storageProvider, key);
+		return this.getProviderEvidenceGeneration(storageProvider, key, owner);
 	}
 
 	/** Validate and canonicalize an OAuth-only selector for account pinning. */
@@ -1886,8 +1909,8 @@ export class AuthStorage {
 	}
 
 	/** Whether a provider is currently authenticated by a config API-key override. */
-	hasConfigApiKey(provider: string): boolean {
-		return Boolean(this.#configOverrides.get(resolveOAuthStorageProvider(provider)));
+	hasConfigApiKey(provider: string, owner?: object): boolean {
+		return Boolean(this.#configOverrideRegistration(provider, owner)?.apiKey);
 	}
 
 	/**
@@ -2099,7 +2122,10 @@ export class AuthStorage {
 		};
 	}
 
-	#resolveFallback(provider: string): string | undefined {
+	#resolveFallback(provider: string, owner?: object): string | undefined {
+		if (owner) {
+			return this.#ownedFallbackResolvers.get(owner)?.(provider) ?? this.#fallbackResolver?.(provider);
+		}
 		for (const resolver of [...this.#ownedFallbackResolvers.values()].reverse()) {
 			const value = resolver(provider);
 			if (value !== undefined) return value;
@@ -2430,13 +2456,13 @@ export class AuthStorage {
 		);
 	}
 
-	#assertCredentialSelectorUsable(provider: string, selector: AuthCredentialSelector): void {
+	#assertCredentialSelectorUsable(provider: string, selector: AuthCredentialSelector, owner?: object): void {
 		if (this.#runtimeOverrides.has(provider)) {
 			throw new Error(
 				`Credential selector ${this.#formatCredentialSelector(selector)} cannot be used for ${provider} while a runtime API key override is active`,
 			);
 		}
-		if (this.#configOverrides.has(provider)) {
+		if (this.#hasConfigOverride(provider, owner)) {
 			throw new Error(
 				`Credential selector ${this.#formatCredentialSelector(selector)} cannot be used for ${provider} while a config API key override is active`,
 			);
@@ -2452,8 +2478,8 @@ export class AuthStorage {
 	 * to an OAuth row specifically — the soft-preference/quota-fallback path is
 	 * meaningless for a single static API key.
 	 */
-	#assertPreferredCredentialSelectorUsable(provider: string, selector: AuthCredentialSelector): void {
-		if (this.#runtimeOverrides.has(provider) || this.#configOverrides.has(provider)) {
+	#assertPreferredCredentialSelectorUsable(provider: string, selector: AuthCredentialSelector, owner?: object): void {
+		if (this.#runtimeOverrides.has(provider) || this.#hasConfigOverride(provider, owner)) {
 			throw new Error(
 				`Preferred credential selector ${this.#formatCredentialSelector(selector)} cannot be used for ${provider} while an API key override is active`,
 			);
@@ -2473,7 +2499,7 @@ export class AuthStorage {
 	): IndexedStoredCredential | undefined {
 		const selector = this.#getCredentialSelector(provider, options, sessionId);
 		if (!selector) return undefined;
-		this.#assertCredentialSelectorUsable(resolveOAuthStorageProvider(provider), selector);
+		this.#assertCredentialSelectorUsable(resolveOAuthStorageProvider(provider), selector, options?.owner);
 		const selected = this.#findCredentialBySelector(provider, selector);
 		if (!selected) {
 			throw new Error(`No credential found for ${provider} matching ${this.#formatCredentialSelector(selector)}`);
@@ -2844,23 +2870,27 @@ export class AuthStorage {
 	 * Check if any form of auth is configured for a provider.
 	 * Unlike getApiKey(), this doesn't refresh OAuth tokens.
 	 */
-	#hasConfiguredAuth(storageProvider: string): boolean {
+	#hasConfiguredAuth(storageProvider: string, owner?: object): boolean {
 		if (this.hasRuntimeApiKey(storageProvider)) return true;
-		if (this.#configOverrides.has(storageProvider)) return true;
+		if (this.#hasConfigOverride(storageProvider, owner)) return true;
 		if (this.#getCredentialsForProvider(storageProvider).length > 0) return true;
 		if (getEnvApiKey(storageProvider)) return true;
-		if (this.#resolveFallback(storageProvider)) return true;
+		if (this.#resolveFallback(storageProvider, owner)) return true;
 		return false;
 	}
 
-	hasAuth(provider: string, sessionId?: string): boolean {
+	hasAuth(provider: string, sessionId?: string, options?: Pick<AuthApiKeyOptions, "owner">): boolean {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		try {
-			this.#resolveSelectedStoredCredential(storageProvider, undefined, sessionId);
+			this.#resolveSelectedStoredCredential(
+				storageProvider,
+				options?.owner ? { owner: options.owner } : undefined,
+				sessionId,
+			);
 		} catch {
 			return false;
 		}
-		return this.#hasConfiguredAuth(storageProvider);
+		return this.#hasConfiguredAuth(storageProvider, options?.owner);
 	}
 
 	/**
@@ -2868,15 +2898,24 @@ export class AuthStorage {
 	 * Mirrors getApiKey selector validation, overrides, session OAuth stickiness,
 	 * cached command-key usability, OAuth retry, and environment fallback order.
 	 */
-	getEffectiveCredentialType(provider: string, sessionId?: string): AuthCredential["type"] | undefined {
+	getEffectiveCredentialType(
+		provider: string,
+		sessionId?: string,
+		options?: Pick<AuthApiKeyOptions, "owner">,
+	): AuthCredential["type"] | undefined {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		let selected: ({ index: number } & StoredCredential) | undefined;
 		try {
-			selected = this.#resolveSelectedStoredCredential(storageProvider, undefined, sessionId);
+			selected = this.#resolveSelectedStoredCredential(
+				storageProvider,
+				options?.owner ? { owner: options.owner } : undefined,
+				sessionId,
+			);
 		} catch {
 			return undefined;
 		}
-		if (this.hasRuntimeApiKey(storageProvider) || this.#configOverrides.has(storageProvider)) return "api_key";
+		if (this.hasRuntimeApiKey(storageProvider) || this.#hasConfigOverride(storageProvider, options?.owner))
+			return "api_key";
 		if (selected) return selected.credential.type;
 
 		const credentials = this.#getCredentialsForProvider(storageProvider);
@@ -2889,19 +2928,23 @@ export class AuthStorage {
 		}
 		if (credentials.some(credential => credential.type === "oauth")) return "oauth";
 		if (apiKeys.length > 0) return "api_key";
-		if (getEnvApiKey(storageProvider) || this.#resolveFallback(storageProvider)) return "api_key";
+		if (getEnvApiKey(storageProvider) || this.#resolveFallback(storageProvider, options?.owner)) return "api_key";
 		return undefined;
 	}
 
 	/**
 	 * Check whether configured auth is currently usable without resolving credentials.
 	 */
-	hasUsableAuth(provider: string): boolean {
+	hasUsableAuth(provider: string, options?: Pick<AuthApiKeyOptions, "owner">): boolean {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		try {
-			const selectedCredential = this.#resolveSelectedStoredCredential(storageProvider, undefined, undefined);
+			const selectedCredential = this.#resolveSelectedStoredCredential(
+				storageProvider,
+				options?.owner ? { owner: options.owner } : undefined,
+				undefined,
+			);
 			if (this.hasRuntimeApiKey(storageProvider)) return true;
-			if (this.#configOverrides.has(storageProvider)) return true;
+			if (this.#hasConfigOverride(storageProvider, options?.owner)) return true;
 			if (selectedCredential) {
 				if (selectedCredential.credential.type === "api_key") {
 					return (
@@ -2942,7 +2985,7 @@ export class AuthStorage {
 		} catch {
 			return false;
 		}
-		return Boolean(getEnvApiKey(storageProvider) || this.#resolveFallback(storageProvider));
+		return Boolean(getEnvApiKey(storageProvider) || this.#resolveFallback(storageProvider, options?.owner));
 	}
 
 	/**
@@ -2955,10 +2998,14 @@ export class AuthStorage {
 	/**
 	 * Get OAuth credentials for a provider.
 	 */
-	getOAuthCredential(provider: string, sessionId?: string): OAuthCredential | undefined {
+	getOAuthCredential(
+		provider: string,
+		sessionId?: string,
+		options?: Pick<AuthApiKeyOptions, "owner">,
+	): OAuthCredential | undefined {
 		const selected = this.#resolveSelectedStoredCredential(
 			resolveOAuthStorageProvider(provider),
-			undefined,
+			options?.owner ? { owner: options.owner } : undefined,
 			sessionId,
 		);
 		if (selected?.credential.type === "oauth") return selected.credential;
@@ -2975,7 +3022,11 @@ export class AuthStorage {
 	 * first call before any `getApiKey` has been issued, or single-credential setups).
 	 * Returns `undefined` when no OAuth credential carries an `accountId`.
 	 */
-	getOAuthAccountId(provider: string, sessionId?: string): string | undefined {
+	getOAuthAccountId(
+		provider: string,
+		sessionId?: string,
+		options?: Pick<AuthApiKeyOptions, "owner">,
+	): string | undefined {
 		provider = resolveOAuthStorageProvider(provider);
 		const allCredentials = this.#getCredentialsForProvider(provider);
 		const oauthCredentials = allCredentials.filter((c): c is OAuthCredential => c.type === "oauth");
@@ -2983,11 +3034,15 @@ export class AuthStorage {
 
 		// Runtime / config overrides bypass OAuth account_uuid attribution — the
 		// caller is authenticating with an explicit key, not the broker's OAuth.
-		if (this.#runtimeOverrides.has(provider) || this.#configOverrides.has(provider)) return undefined;
+		if (this.#runtimeOverrides.has(provider) || this.#hasConfigOverride(provider, options?.owner)) return undefined;
 
 		// Prefer the session-sticky credential when available.
 
-		const scopedSelection = this.#resolveSelectedStoredCredential(provider, undefined, sessionId);
+		const scopedSelection = this.#resolveSelectedStoredCredential(
+			provider,
+			options?.owner ? { owner: options.owner } : undefined,
+			sessionId,
+		);
 		if (scopedSelection?.credential.type === "api_key") return undefined;
 		if (scopedSelection?.credential.type === "oauth") {
 			const accountId = scopedSelection.credential.accountId;
@@ -3003,7 +3058,7 @@ export class AuthStorage {
 		// account_uuid injection would misattribute traffic. Only apply this guard when
 		// sessionPref is absent; a recorded OAuth sticky (sessionPref.type === "oauth") must
 		// NOT be blocked even if an env key also happens to exist.
-		if (!sessionPref && (getEnvApiKey(provider) || this.#resolveFallback(provider))) return undefined;
+		if (!sessionPref && (getEnvApiKey(provider) || this.#resolveFallback(provider, options?.owner))) return undefined;
 		// Resolve the sticky index against the full credential list — the index is
 		// recorded against the unfiltered provider array (by #recordSessionCredential /
 		// #tryOAuthCredential), not the OAuth-only subset, so dereferencing it into the
@@ -4674,7 +4729,11 @@ export class AuthStorage {
 		if (!selectedCredential) {
 			const preferredSelector = this.#getPreferredCredentialSelector(provider, options);
 			if (preferredSelector) {
-				this.#assertPreferredCredentialSelectorUsable(resolveOAuthStorageProvider(provider), preferredSelector);
+				this.#assertPreferredCredentialSelectorUsable(
+					resolveOAuthStorageProvider(provider),
+					preferredSelector,
+					options?.owner,
+				);
 			}
 			const preferredSelection = preferredSelector
 				? this.#findCredentialBySelector(provider, preferredSelector)
@@ -5392,15 +5451,20 @@ export class AuthStorage {
 	 * and get a best-effort token. For GitHub Copilot we preserve enterprise
 	 * routing metadata so discovery can hit the correct host.
 	 */
-	async peekApiKey(provider: string): Promise<string | undefined> {
+	async peekApiKey(provider: string, options?: Pick<AuthApiKeyOptions, "owner">): Promise<string | undefined> {
 		provider = resolveOAuthStorageProvider(provider);
 		const runtimeKey = this.#runtimeOverrides.get(provider);
 		if (runtimeKey) return runtimeKey;
 
-		const configKey = this.#configOverrides.get(provider);
-		if (configKey && !this.#configOverrideEnvSourced.has(provider)) return configKey;
+		const configOverride = this.#configOverrideRegistration(provider, options?.owner);
+		const configKey = configOverride?.apiKey;
+		if (configKey && !configOverride?.envSourced) return configKey;
 
-		const selectedCredential = this.#resolveSelectedStoredCredential(provider, undefined, undefined);
+		const selectedCredential = this.#resolveSelectedStoredCredential(
+			provider,
+			options?.owner ? { owner: options.owner } : undefined,
+			undefined,
+		);
 		if (configKey) {
 			// Env-sourced (`apiKeyEnv`) override: same precedence as getApiKey —
 			// a stored api_key credential from `auth login` wins, stored OAuth
@@ -5450,7 +5514,7 @@ export class AuthStorage {
 			}
 		}
 
-		return getEnvApiKey(provider) || this.#resolveFallback(provider);
+		return getEnvApiKey(provider) || this.#resolveFallback(provider, options?.owner);
 	}
 
 	/**
@@ -5481,9 +5545,10 @@ export class AuthStorage {
 		// (e.g. an auth-gateway) and supplied the bearer for that endpoint —
 		// honor it instead of forwarding an upstream OAuth token that the proxy
 		// won't accept.
-		const configKey = this.#configOverrides.get(provider);
+		const configOverride = this.#configOverrideRegistration(provider, options?.owner);
+		const configKey = configOverride?.apiKey;
 		if (configKey) {
-			if (!this.#configOverrideEnvSourced.has(provider)) return configKey;
+			if (!configOverride?.envSourced) return configKey;
 			// The override is an `apiKeyEnv` indirection, not a pinned value. A
 			// stored api_key credential from `auth login` is actively managed
 			// (validated at login, rotated on 401), while the pointed-to env
@@ -5545,7 +5610,7 @@ export class AuthStorage {
 		if (sessionId) this.#sessionLastCredential.get(provider)?.delete(sessionId);
 		const envKey = getEnvApiKey(provider);
 		if (envKey) return envKey;
-		return this.#resolveFallback(provider) ?? undefined;
+		return this.#resolveFallback(provider, options?.owner) ?? undefined;
 	}
 
 	/**
@@ -5604,7 +5669,7 @@ export class AuthStorage {
 		// Runtime / config overrides intentionally short-circuit OAuth: when the
 		// user has pinned an API key, they expect the OAuth identity to be
 		// suppressed (same contract as `getOAuthAccountId`).
-		if (this.#runtimeOverrides.has(provider) || this.#configOverrides.has(provider)) {
+		if (this.#runtimeOverrides.has(provider) || this.#hasConfigOverride(provider, options?.owner)) {
 			return undefined;
 		}
 		const resolved = await this.#resolveOAuthSelection(provider, sessionId, options);
@@ -5909,15 +5974,21 @@ export class AuthStorage {
 	 *
 	 * The string is purely informational; consumers must not parse it.
 	 */
-	describeCredentialSource(provider: string, sessionId?: string): string | undefined {
+	describeCredentialSource(
+		provider: string,
+		sessionId?: string,
+		options?: Pick<AuthApiKeyOptions, "owner">,
+	): string | undefined {
+		provider = resolveOAuthStorageProvider(provider);
 		if (this.#runtimeOverrides.has(provider)) {
 			return "runtime override (--api-key)";
 		}
-		if (this.#configOverrides.has(provider)) {
+		const configOverride = this.#configOverrideRegistration(provider, options?.owner);
+		if (configOverride) {
 			// An `apiKeyEnv` indirection loses to a stored api_key credential
 			// (see getApiKey); describe the credential that actually wins.
 			const shadowed = this.#getStoredCredentials(provider).some(entry => entry.credential.type === "api_key");
-			if (!this.#configOverrideEnvSourced.has(provider) || !shadowed) {
+			if (!configOverride.envSourced || !shadowed) {
 				return "config override (models.yml)";
 			}
 		}
@@ -5926,7 +5997,7 @@ export class AuthStorage {
 		const stored = this.#getStoredCredentials(provider);
 		if (stored.length === 0) {
 			if (getEnvApiKey(provider)) return `env ${baseLabel ? `(fallback over ${baseLabel})` : ""}`.trim();
-			if (this.#resolveFallback(provider) !== undefined) return `fallback resolver`;
+			if (this.#resolveFallback(provider, options?.owner) !== undefined) return `fallback resolver`;
 			return undefined;
 		}
 

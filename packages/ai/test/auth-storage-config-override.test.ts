@@ -186,4 +186,28 @@ describe("AuthStorage config-override apiKey", () => {
 			expect(authStorage.describeCredentialSource("anthropic")).toContain("api_key");
 		});
 	});
+
+	test("owner-scoped config reads do not cross-use same-provider registrations", async () => {
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			if (!authStorage) throw new Error("test setup failed");
+			const firstOwner = {};
+			const secondOwner = {};
+			authStorage.setConfigApiKey("anthropic", "first-key", { owner: firstOwner });
+			authStorage.setConfigApiKey("anthropic", "second-key", { owner: secondOwner });
+
+			expect(await authStorage.getApiKey("anthropic", undefined, { owner: firstOwner })).toBe("first-key");
+			expect(await authStorage.peekApiKey("anthropic", { owner: firstOwner })).toBe("first-key");
+			expect(authStorage.hasAuth("anthropic", undefined, { owner: firstOwner })).toBe(true);
+			expect(authStorage.getEffectiveCredentialType("anthropic", undefined, { owner: firstOwner })).toBe("api_key");
+			expect(authStorage.describeCredentialSource("anthropic", undefined, { owner: firstOwner })).toBe(
+				"config override (models.yml)",
+			);
+			expect(await authStorage.getApiKey("anthropic", undefined, { owner: secondOwner })).toBe("second-key");
+			authStorage.setConfigApiKey("openai-codex-device", "alias-key", { owner: firstOwner });
+			expect(await authStorage.getApiKey("openai-codex", undefined, { owner: firstOwner })).toBe("alias-key");
+
+			// Unowned callers continue to observe the latest process-wide registration.
+			expect(await authStorage.getApiKey("anthropic")).toBe("second-key");
+		});
+	});
 });
