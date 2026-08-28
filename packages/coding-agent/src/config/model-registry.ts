@@ -4827,6 +4827,7 @@ export class ModelRegistry {
 	 * This is a fast check that doesn't refresh OAuth tokens.
 	 */
 	getAvailable(): Model<Api>[] {
+		this.#synchronizeEnvironmentCredentials();
 		const disabledProviders = getDisabledProviderIdsFromSettings(this.#settings);
 		const disabledProviderKey = [...disabledProviders].sort().join("\u0000");
 		const envFingerprint = envAvailabilityFingerprint(this.#configuredApiKeyEnvNames);
@@ -4841,6 +4842,37 @@ export class ModelRegistry {
 		this.#availableModelsDisabledProviders = disabledProviderKey;
 		this.#availableModelsEnvFingerprint = envFingerprint;
 		return this.#availableModelsCache;
+	}
+
+	#synchronizeEnvironmentCredentials(): void {
+		for (const [provider, envName] of this.#customProviderApiKeyEnvNames) {
+			const resolved = Bun.env[envName];
+			const installed = this.#customProviderApiKeys.get(provider);
+			if (resolved) {
+				if (installed !== resolved) {
+					this.#customProviderApiKeys.set(provider, resolved);
+					this.authStorage.setConfigApiKey(provider, resolved);
+				}
+			} else if (installed !== undefined) {
+				this.#customProviderApiKeys.delete(provider);
+				this.authStorage.removeConfigApiKey(provider);
+			}
+		}
+		for (const [provider, envName] of this.#runtimeProviderApiKeyEnvNames) {
+			const resolved = Bun.env[envName];
+			const installed = this.#customProviderApiKeys.get(provider);
+			if (resolved) {
+				if (installed !== resolved) {
+					this.#customProviderApiKeys.set(provider, resolved);
+					this.authStorage.setConfigApiKey(provider, resolved);
+				}
+				this.#runtimeProviderCredentialInstalled.add(provider);
+			} else if (installed !== undefined) {
+				this.#customProviderApiKeys.delete(provider);
+				this.authStorage.removeConfigApiKey(provider);
+				this.#runtimeProviderCredentialInstalled.delete(provider);
+			}
+		}
 	}
 
 	/**
