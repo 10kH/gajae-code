@@ -347,13 +347,13 @@ describe("AsyncJobManager delivery reliability", () => {
 		const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
 		Date.now = () => {
-			now += 1_000_000;
+			now += 1_000;
 			return now;
 		};
 		const ownerCount = 3;
 		const manager = new AsyncJobManager({
-			maxRunningJobs: 60,
-			retentionMs: 60_000,
+			maxRunningJobs: 70,
+			retentionMs: 0,
 			maxDeadLetterOverflowOwners: 2,
 			onJobComplete: async () => {
 				throw new Error("overflow owner delivery failed");
@@ -363,20 +363,62 @@ describe("AsyncJobManager delivery reliability", () => {
 		try {
 			for (let ownerIndex = 0; ownerIndex < ownerCount; ownerIndex += 1) {
 				const ownerId = `overflow-owner-${ownerIndex}`;
-				for (let jobIndex = 0; jobIndex < 51; jobIndex += 1) {
+				for (let jobIndex = 0; jobIndex < 65; jobIndex += 1) {
 					manager.register("bash", `${ownerId}-${jobIndex}`, async () => "payload", {
 						ownerId,
 						metadata: { backgrounded: true },
 					});
 				}
-				await Bun.sleep(500);
+				await Bun.sleep(1_000);
 			}
 			const latest = manager.getJobsSnapshot({ ownerId: "overflow-owner-2" }).deadLettered;
-			expect(latest.some(entry => entry.ownerId === "overflow-owner-2")).toBe(true);
+			expect(latest.some(entry => entry.jobId === "dead-letter-overflow:overflow-owner-2")).toBe(true);
 			const observer = new JobsObserver(manager, "overflow-owner-2");
 			try {
 				expect(observer.getSnapshot().worstState).toBe("failed");
 				expect(observer.getSnapshot().failedUnacknowledged).toBe(true);
+			} finally {
+				observer.dispose();
+			}
+		} finally {
+			await manager.dispose({ timeoutMs: 5_000 });
+			Date.now = realNow;
+			warnSpy.mockRestore();
+			errorSpy.mockRestore();
+		}
+	});
+
+	test("does not overflow-account retained failures still projected on live jobs", async () => {
+		let now = 1_000_000;
+		const realNow = Date.now;
+		const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
+		Date.now = () => {
+			now += 1_000;
+			return now;
+		};
+		const manager = new AsyncJobManager({
+			maxRunningJobs: 60,
+			retentionMs: 60_000,
+			onJobComplete: async () => {
+				throw new Error("retained delivery failed");
+			},
+		});
+
+		try {
+			for (let index = 0; index < 51; index += 1) {
+				manager.register("bash", `retained-failure-${index}`, async () => "payload", {
+					ownerId: "retained-failure-owner",
+					metadata: { backgrounded: true },
+				});
+			}
+			await Bun.sleep(1_000);
+			const snapshot = manager.getJobsSnapshot({ ownerId: "retained-failure-owner" });
+			expect(snapshot.deadLettered.some(entry => entry.jobId.startsWith("dead-letter-overflow:"))).toBe(false);
+			expect(snapshot.jobs.filter(job => job.deliveryState === "failed-visible")).toHaveLength(51);
+			const observer = new JobsObserver(manager, "retained-failure-owner");
+			try {
+				expect(observer.getSnapshot().foldedJobs).toHaveLength(51);
 			} finally {
 				observer.dispose();
 			}
