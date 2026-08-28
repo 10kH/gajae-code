@@ -1721,18 +1721,20 @@ export class ManagedSessionDescendantStore {
 	): ManagedAppendReceipt {
 		this.#beforeMutation();
 		this.#assertBound();
+		let appendExpectation = expected;
 		if (!this.#authority) {
 			const current = captureManagedFileIdentityStreamingNoFollow(this.#resolve(relativePath));
-			if (
-				current.dev.toString() !== expected.dev ||
-				current.ino.toString() !== expected.ino ||
-				current.nlink.toString() !== expected.nlink ||
-				current.size.toString() !== expected.size ||
-				current.mtimeNs.toString() !== expected.mtimeNs ||
-				current.ctimeNs.toString() !== expected.ctimeNs ||
-				current.sha256 !== expected.sha256
-			)
+			const identityMatches =
+				current.dev.toString() === expected.dev &&
+				current.ino.toString() === expected.ino &&
+				current.nlink.toString() === expected.nlink &&
+				current.size.toString() === expected.size &&
+				current.sha256 === expected.sha256;
+			if (!identityMatches) {
 				throw new Error("managed_append_identity_mismatch");
+			}
+			// mtime/ctime drift on the same file object is harmless. The append
+			// helper performs its own descriptor-bound mutation check.
 			const appended = appendManagedFileStreamingSync(
 				this.#resolve(relativePath),
 				bytes,
@@ -1742,16 +1744,35 @@ export class ManagedSessionDescendantStore {
 			this.#assertBound();
 			return managedAppendReceiptFromIdentity(appended);
 		}
+		const current = this.captureBoundedAppendExpectation(relativePath);
+		if (!current) throw new Error("managed_append_identity_mismatch");
+		if (
+			current.dev !== expected.dev ||
+			current.ino !== expected.ino ||
+			current.nlink !== expected.nlink ||
+			current.size !== expected.size ||
+			current.sha256 !== expected.sha256
+		)
+			throw new Error("managed_append_identity_mismatch");
+		const descriptorMatches =
+			current.dev === expected.dev &&
+			current.ino === expected.ino &&
+			current.nlink === expected.nlink &&
+			current.size === expected.size &&
+			current.mtimeNs === expected.mtimeNs &&
+			current.ctimeNs === expected.ctimeNs &&
+			current.sha256 === expected.sha256;
+		if (!descriptorMatches) appendExpectation = current;
 		const relative = this.#relative(this.#resolve(relativePath));
 		const appended = this.#authority.appendManaged(
 			relative,
 			bytes,
-			expected.dev,
-			expected.ino,
-			expected.size,
-			expected.mtimeNs,
-			expected.ctimeNs,
-			expected.sha256,
+			appendExpectation.dev,
+			appendExpectation.ino,
+			appendExpectation.size,
+			appendExpectation.mtimeNs,
+			appendExpectation.ctimeNs,
+			appendExpectation.sha256,
 		);
 		if (!appended.ok) throw managedAppendFailure(appended.code);
 		if (!appended.identity)
