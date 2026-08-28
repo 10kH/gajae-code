@@ -1455,7 +1455,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 					],
 				},
 			},
-			{ triggerTurn: true, deliverAs: "followUp" },
+			{ triggerTurn: true, deliverAs: "nextTurn" },
 		);
 		await waitFor(
 			() => lookupOwnedRegistration(jobId, generation, bindEndpoint) === undefined,
