@@ -198,6 +198,9 @@ describe("read tool ACP fs routing", () => {
 		]);
 
 		try {
+			await expect(tool.execute("agent-unknown", { path: "agent://0:bogus" })).rejects.toThrow(
+				'Invalid internal URL selector "bogus".',
+			);
 			await expect(tool.execute("empty", { path: "artifact://3:" })).rejects.toThrow(
 				'Invalid internal URL selector "".',
 			);

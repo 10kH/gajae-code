@@ -149,12 +149,11 @@ export function splitPathAndSel(rawPath: string): { path: string; sel?: string }
 /**
  * Variant of {@link splitPathAndSel} for internal URLs (`scheme://...`).
  *
- * Artifact authorities are generated identifiers, so their complete tail is
- * unambiguously a selector and malformed selectors can be rejected before
- * resolving the artifact. Other resources may legitimately use colons in
- * their identities, so they only lose strict, recognized selector suffixes.
- * Skill authorities additionally use the active registry to distinguish a
- * skill name from its selector without making path-utils depend on skills.
+ * Selector-capable internal authorities use identifier-shaped resource names,
+ * so an authority-only `:<tail>` is an explicit read selector even when the
+ * selector is malformed. Skill authorities are the exception: namespaced
+ * skill names already contain a colon, so the active registry gets first
+ * refusal and the fallback recognizes a later colon as the selector boundary.
  */
 export function splitInternalUrlSel(
 	rawPath: string,
@@ -172,10 +171,6 @@ export function splitInternalUrlSel(
 	const firstColon = authority.indexOf(":");
 	if (firstColon === -1) return { path: rawPath };
 
-	if (scheme === "artifact") {
-		return { path: rawPath.slice(0, schemeEnd + firstColon), sel: authority.slice(firstColon + 1) };
-	}
-
 	if (scheme === "skill") {
 		const activeSkillNames = options.activeSkillNames ?? [];
 		if (activeSkillNames.includes(authority)) return { path: rawPath };
@@ -188,11 +183,23 @@ export function splitInternalUrlSel(
 				sel: authority.slice(skillName.length + 1),
 			};
 		}
+		const strict = splitPathAndSel(authority);
+		if (strict.sel !== undefined) {
+			return { path: `${rawPath.slice(0, schemeEnd)}${strict.path}`, sel: strict.sel };
+		}
+		const firstTail = authority.slice(firstColon + 1);
+		if (FILE_LINE_RANGE_RE.test(firstTail)) {
+			return { path: rawPath.slice(0, schemeEnd + firstColon), sel: firstTail };
+		}
+		const selectorColon = authority.indexOf(":", firstColon + 1);
+		if (selectorColon === -1) return { path: rawPath };
+		return {
+			path: rawPath.slice(0, schemeEnd + selectorColon),
+			sel: authority.slice(selectorColon + 1),
+		};
 	}
 
-	const strict = splitPathAndSel(authority);
-	if (strict.sel === undefined) return { path: rawPath };
-	return { path: `${rawPath.slice(0, schemeEnd)}${strict.path}`, sel: strict.sel };
+	return { path: rawPath.slice(0, schemeEnd + firstColon), sel: authority.slice(firstColon + 1) };
 }
 
 function assertNotInternalUrl(expanded: string, original: string): void {

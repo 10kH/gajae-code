@@ -14,10 +14,11 @@ describe("splitInternalUrlSel", () => {
 		}
 	});
 
-	it("only peels strict selectors from ambiguous resource identities", () => {
+	it("peels explicit authority selectors before resolving every internal resource", () => {
 		for (const scheme of ["agent", "local", "memory", "rule", "gjc", "issue", "pr"]) {
 			expect(splitInternalUrlSel(`${scheme}://namespace:raw:bogus`)).toEqual({
-				path: `${scheme}://namespace:raw:bogus`,
+				path: `${scheme}://namespace`,
+				sel: "raw:bogus",
 			});
 			expect(splitInternalUrlSel(`${scheme}://namespace:raw`)).toEqual({
 				path: `${scheme}://namespace`,
