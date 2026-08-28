@@ -46,6 +46,7 @@ describe("AuthStorage config-override apiKey", () => {
 	test("setConfigApiKey beats OAuth access token for getApiKey", async () => {
 		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
 			if (!authStorage) throw new Error("test setup failed");
+			const storage = authStorage;
 			await seedOAuth("anthropic", "oauth-from-broker");
 			authStorage.setConfigApiKey("anthropic", "gateway-bearer");
 
@@ -214,39 +215,40 @@ describe("AuthStorage config-override apiKey", () => {
 	test("owner-scoped selector guards ignore a sibling same-provider override", async () => {
 		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
 			if (!authStorage) throw new Error("test setup failed");
+			const storage = authStorage;
 			await seedOAuth("anthropic", "oauth-from-broker");
 			const firstOwner = {};
 			const secondOwner = {};
-			const row = authStorage.listCredentialInventory("anthropic")[0];
+			const row = storage.listCredentialInventory("anthropic")[0];
 			if (!row) throw new Error("Expected seeded OAuth row");
 			const selector = { kind: "id" as const, value: String(row.id) };
-			authStorage.setConfigApiKey("anthropic", "second-owner-key", { owner: secondOwner });
+			storage.setConfigApiKey("anthropic", "second-owner-key", { owner: secondOwner });
 
-			authStorage.setSessionCredentialSelector("owner-a", "anthropic", selector, firstOwner);
-			expect(authStorage.resolveOAuthPinTarget("anthropic", selector, firstOwner).canonicalSelector).toEqual({
+			storage.setSessionCredentialSelector("owner-a", "anthropic", selector, firstOwner);
+			expect(storage.resolveOAuthPinTarget("anthropic", selector, firstOwner).canonicalSelector).toEqual({
 				kind: "id",
 				value: String(row.id),
 			});
-			authStorage.switchSessionCredential("anthropic", "owner-a", selector, firstOwner);
+			storage.switchSessionCredential("anthropic", "owner-a", selector, firstOwner);
 
-			expect(() => authStorage.setSessionCredentialSelector("owner-b", "anthropic", selector, secondOwner)).toThrow(
+			expect(() => authStorage!.setSessionCredentialSelector("owner-b", "anthropic", selector, secondOwner)).toThrow(
 				"config API key override",
 			);
-			expect(() => authStorage.resolveOAuthPinTarget("anthropic", selector, secondOwner)).toThrow(
+			expect(() => authStorage!.resolveOAuthPinTarget("anthropic", selector, secondOwner)).toThrow(
 				"override is active",
 			);
-			expect(() => authStorage.switchSessionCredential("anthropic", "owner-b", selector, secondOwner)).toThrow(
+			expect(() => authStorage!.switchSessionCredential("anthropic", "owner-b", selector, secondOwner)).toThrow(
 				"config API key override",
 			);
 
 			// Unowned callers retain process-wide override semantics.
-			expect(() => authStorage.setSessionCredentialSelector("global", "anthropic", selector)).toThrow(
+			expect(() => authStorage!.setSessionCredentialSelector("global", "anthropic", selector)).toThrow(
 				"config API key override",
 			);
 
 			// A registry's own override still takes precedence over its selector.
 			authStorage.setConfigApiKey("anthropic", "first-owner-key", { owner: firstOwner });
-			expect(() => authStorage.setSessionCredentialSelector("owner-a", "anthropic", selector, firstOwner)).toThrow(
+			expect(() => authStorage!.setSessionCredentialSelector("owner-a", "anthropic", selector, firstOwner)).toThrow(
 				"config API key override",
 			);
 		});
