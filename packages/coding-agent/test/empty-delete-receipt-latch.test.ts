@@ -28,10 +28,17 @@ import {
 import { exactIdentityNativeBindings, installExactIdentityNatives } from "./helpers/exact-identity-natives";
 
 const tempDirs: string[] = [];
+const ORIGINAL_STATE_FILE = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
+const ORIGINAL_OWNER_HOST_ID = SessionStateLockTestHooks.ownerHostId;
+const ORIGINAL_UNQUALIFIED_OWNER_IS_LOCAL = SessionStateLockTestHooks.unqualifiedOwnerIsLocal;
 installExactIdentityNatives();
 
 afterEach(async () => {
+	if (ORIGINAL_STATE_FILE === undefined) delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
+	else process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = ORIGINAL_STATE_FILE;
 	ProjectionScanTestHooks.platform = undefined;
+	SessionStateLockTestHooks.ownerHostId = ORIGINAL_OWNER_HOST_ID;
+	SessionStateLockTestHooks.unqualifiedOwnerIsLocal = ORIGINAL_UNQUALIFIED_OWNER_IS_LOCAL;
 	SessionStateLockTestHooks.quarantineMints = undefined;
 	SessionStateLockTestHooks.lastQuarantineName = undefined;
 	SessionStateLockTestHooks.forcedQuarantineName = undefined;
@@ -89,6 +96,41 @@ describe("empty .gjc-delete-* latch", () => {
 		expect(scan.incomplete).toBe(true);
 		expect(scan.capped).toBe(true);
 	});
+
+	it.skipIf(process.platform !== "linux")(
+		"Test 1 race: a post-enumeration symlink candidate is raced, not skipped",
+		async () => {
+			const dir = await tempRoot("gjc-scan-candidate-reparse-race-");
+			const candidate = path.join(dir, "candidate.json");
+			const target = path.join(dir, "candidate-target.txt");
+			await fs.writeFile(candidate, JSON.stringify({ session_id: "source" }));
+			await fs.writeFile(target, JSON.stringify({ session_id: "target" }));
+			const realReaddir = fs.readdir;
+			const readdirSpy = spyOn(fs, "readdir");
+			let replaced = false;
+			readdirSpy.mockImplementation((async (directory: PathLike) => {
+				const entries = await realReaddir(directory);
+				if (!replaced && String(directory).startsWith("/proc/self/fd/")) {
+					replaced = true;
+					await fs.unlink(candidate);
+					await fs.symlink(target, candidate);
+				}
+				return entries;
+			}) as unknown as typeof fs.readdir);
+			try {
+				const scan = await listCoordinatorJsonFiles(dir);
+				expect(replaced).toBe(true);
+				expect(scan.values).toEqual([]);
+				expect(scan.parsed).toBe(0);
+				expect(scan.raced).toBe(1);
+				expect(scan.skippedEmpty).toBe(0);
+				expect(scan.incomplete).toBe(true);
+				expect(scan.capped).toBe(true);
+			} finally {
+				readdirSpy.mockRestore();
+			}
+		},
+	);
 
 	it.skipIf(process.platform !== "linux")(
 		"Test 1 race: a valid replacement after enumeration is not parsed as the candidate",
@@ -851,6 +893,31 @@ describe("empty .gjc-delete-* latch", () => {
 		}));
 		await removeVerifiedEmptyQuarantine(dir, reserved);
 		expect(await fs.readFile(target, "utf8")).toBe("operator payload");
+	});
+
+	it("Test 2c parent race: replacement directory is refused by parent identity", async () => {
+		const dir = await tempRoot("gjc-quarantine-parent-race-");
+		const replacement = `${dir}-replacement`;
+		tempDirs.push(replacement);
+		const reserved = ".gjc-delete-session-state-lock-66666666-6666-6666-6666-666666666666.json";
+		const target = path.join(dir, reserved);
+		await fs.writeFile(target, "");
+		setSessionStateLockNativeBindings(() => ({
+			...exactIdentityNativeBindings,
+			exactUnlinkDirect: (targetPath, identity) => {
+				const originalParent = fsSync.statSync(path.dirname(targetPath), { bigint: true });
+				expect(identity.parentDev).toBe(originalParent.dev);
+				expect(identity.parentIno).toBe(originalParent.ino);
+				fsSync.renameSync(path.dirname(targetPath), replacement);
+				fsSync.mkdirSync(path.dirname(targetPath));
+				return { ok: false, code: "parent_mismatch" };
+			},
+		}));
+		await expect(removeVerifiedEmptyQuarantine(dir, reserved)).rejects.toBeInstanceOf(
+			SessionStateLockUnavailableError,
+		);
+		expect(await fs.readFile(path.join(replacement, reserved), "utf8")).toBe("");
+		expect(await fs.readdir(dir)).toEqual([]);
 	});
 
 	it("Test 2d: a backslash traversal quarantine name is refused before any join", async () => {

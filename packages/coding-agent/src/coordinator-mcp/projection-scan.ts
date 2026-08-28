@@ -443,7 +443,11 @@ async function scanCoordinatorJsonFiles(
 			throw error;
 		}
 		if (stat.isSymbolicLink() || !stat.isFile()) {
-			skippedEmpty += 1;
+			// The candidate was a parseable-looking directory entry when enumeration
+			// completed, but its type changed before inspection. Treat that as a
+			// raced candidate rather than ordinary empty/non-regular debris: callers
+			// must not consume a partial projection set.
+			raced += 1;
 			continue;
 		}
 		parseCandidates.push({ entry, stat });

@@ -1293,6 +1293,13 @@ export async function removeVerifiedEmptyQuarantine(directory: string, name: str
 	)
 		return;
 	const target = path.join(directory, name);
+	let parent: fsSync.BigIntStats;
+	try {
+		parent = await fs.stat(path.dirname(target), { bigint: true });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+		throw error;
+	}
 	let stat: fsSync.BigIntStats;
 	try {
 		stat = await fs.lstat(target, { bigint: true });
@@ -1305,6 +1312,8 @@ export async function removeVerifiedEmptyQuarantine(directory: string, name: str
 		dev: stat.dev,
 		ino: stat.ino,
 		nlink: stat.nlink,
+		parentDev: parent.dev,
+		parentIno: parent.ino,
 		size: stat.size,
 		mtimeNs: stat.mtimeNs,
 		sha256: EMPTY_FILE_SHA256,
