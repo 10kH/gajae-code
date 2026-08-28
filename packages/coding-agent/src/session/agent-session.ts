@@ -2797,6 +2797,7 @@ export class AgentSession {
 	#extensionRunner: ExtensionRunner | undefined = undefined;
 	/** SDK follow-up ownership by queued message and the attempt that dequeues it. */
 	#sdkRunTokensByQueuedMessage = new WeakMap<AgentMessage, string>();
+	#skipPostPromptRecoveryWaitByAttemptScope = new WeakSet<AttemptScope>();
 	#sdkRunTokensByAttemptScope = new WeakMap<AttemptScope, string>();
 	#activeSdkRunToken: string | undefined;
 	#activeAttemptScope: AttemptScope | undefined;
@@ -4245,6 +4246,7 @@ export class AgentSession {
 				promotion.startsOwnRun !== true
 			) {
 				this.#sdkRunTokensByAttemptScope.set(this.#activeAttemptScope, consumedSdkRunTokenForCurrentRun);
+				this.#skipPostPromptRecoveryWaitByAttemptScope.add(this.#activeAttemptScope);
 			}
 			// Monitor task-notifications now carry the owned-completion envelope
 			// (see tools/monitor.ts), so the general drop + fresh-admission paths
@@ -4290,6 +4292,7 @@ export class AgentSession {
 				promotion.startsOwnRun !== true
 			) {
 				this.#sdkRunTokensByAttemptScope.set(this.#activeAttemptScope, consumedSdkRunToken);
+				this.#skipPostPromptRecoveryWaitByAttemptScope.add(this.#activeAttemptScope);
 			}
 			this.#fireQueuedPromotionHooks(messages, promotion);
 		};
@@ -6682,17 +6685,19 @@ export class AgentSession {
 												// agent_start (review P1); their queued messages are in-run
 												// consumptions, not own-run promotions.
 												const startsOwn = options?.maintenanceContinuation !== true;
+												const inheritedSdkRunToken = this.#activeSdkRunToken;
 												const consumedSdkRunToken = startsOwn
 													? acceptance.consumedQueuedMessages
 															.map(message => this.#sdkRunTokensByQueuedMessage.get(message))
 															.find((token): token is string => token !== undefined)
 													: undefined;
+												const sdkRunToken = consumedSdkRunToken ?? inheritedSdkRunToken;
 												this.#fireQueuedPromotionHooks(acceptance.consumedQueuedMessages, {
 													startsOwnRun: startsOwn,
 												});
-												if (consumedSdkRunToken !== undefined)
-													this.#sdkRunTokensByAttemptScope.set(handle.scope, consumedSdkRunToken);
-												if (startsOwn) this.#activeSdkRunToken = consumedSdkRunToken;
+												if (sdkRunToken !== undefined)
+													this.#sdkRunTokensByAttemptScope.set(handle.scope, sdkRunToken);
+												if (startsOwn) this.#activeSdkRunToken = sdkRunToken;
 												this.#acceptRunHandle(handle);
 												options?.onRunAccepted?.(handle);
 												// Keep the queued token available through the acceptance callback;
@@ -9705,6 +9710,7 @@ export class AgentSession {
 		if (this.#sessionAdmissionClosed || this.#isDisposed) throw this.#sessionAdmissionBusyError();
 		const inFlightPrompt = this.#beginInFlight();
 		let hindsightRecall: string | undefined;
+		let continuationSdkRunToken: string | undefined;
 		try {
 			const volatileProjectContextMessage = await this.#buildVolatileProjectContextMessage();
 			this.agent.appendMessage(volatileProjectContextMessage);
@@ -9741,13 +9747,19 @@ export class AgentSession {
 				...this.#managedFallbackPromptOptions(),
 				onRunAccepted: (handle: AttemptRunHandle) => {
 					this.#acceptRunHandle(handle);
+					continuationSdkRunToken = this.#activeSdkRunToken;
+					if (continuationSdkRunToken !== undefined)
+						this.#sdkRunTokensByAttemptScope.set(handle.scope, continuationSdkRunToken);
 					if (hindsightRecall) hindsightState?.markRecallSnippetInjected(hindsightRecall);
 				},
 			});
-			await this.#waitForPostPromptRecovery();
+			if (continuationSdkRunToken === undefined) await this.#waitForPostPromptRecovery();
 		} finally {
 			this.#removeEphemeralCustomMessages();
-			await this.#settleEndedInFlight(inFlightPrompt);
+			await this.#settleEndedInFlight(
+				inFlightPrompt,
+				continuationSdkRunToken === undefined ? "full" : "publication",
+			);
 		}
 	}
 
@@ -11152,7 +11164,8 @@ export class AgentSession {
 		const rosterClaim = this.#claimIrcRosterCandidate();
 		let hasPendingNextTurnMessages = false;
 		let pendingNextTurnMessageCount = 0;
-		const skipPostPromptRecoveryWait = options?.skipPostPromptRecoveryWait === true;
+		let skipPostPromptRecoveryWait = options?.skipPostPromptRecoveryWait === true;
+		let promptAttemptScope: AttemptScope | undefined;
 		let hindsightRecall: string | undefined;
 		try {
 			this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
@@ -11421,6 +11434,7 @@ export class AgentSession {
 				...this.#managedFallbackPromptOptions(),
 				...(options?.sdkRunToken ? { sdkRunToken: options.sdkRunToken } : {}),
 				onRunAccepted: (handle: AttemptRunHandle) => {
+					promptAttemptScope = handle.scope;
 					this.#acceptRunHandle(handle);
 					if (options?.sdkRunToken) {
 						this.#sdkRunTokensByAttemptScope.set(handle.scope, options.sdkRunToken);
@@ -11458,6 +11472,12 @@ export class AgentSession {
 					options?.onPreflightAccepted?.();
 				},
 			});
+			if (
+				promptAttemptScope !== undefined &&
+				this.#skipPostPromptRecoveryWaitByAttemptScope.delete(promptAttemptScope)
+			) {
+				skipPostPromptRecoveryWait = true;
+			}
 			const terminalAssistant = this.#findLastAssistantMessage();
 			if (
 				rosterClaim &&
@@ -19328,6 +19348,11 @@ export class AgentSession {
 							const continuation = this.agent.continue({
 								...this.#managedFallbackPromptOptions(),
 								transientRecoveryMessage: this.#escapedNonAsciiRecoveryMessage(),
+								onRunAccepted: (handle: AttemptRunHandle) => {
+									this.#acceptRunHandle(handle);
+									if (this.#activeSdkRunToken !== undefined)
+										this.#sdkRunTokensByAttemptScope.set(handle.scope, this.#activeSdkRunToken);
+								},
 							});
 							if (
 								cancellationSignal?.aborted ||
@@ -19366,6 +19391,11 @@ export class AgentSession {
 					await this.agent.continue({
 						...this.#managedFallbackPromptOptions(),
 						transientRecoveryMessage: this.#escapedNonAsciiRecoveryMessage(),
+						onRunAccepted: (handle: AttemptRunHandle) => {
+							this.#acceptRunHandle(handle);
+							if (this.#activeSdkRunToken !== undefined)
+								this.#sdkRunTokensByAttemptScope.set(handle.scope, this.#activeSdkRunToken);
+						},
 					});
 				},
 			};
