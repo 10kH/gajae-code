@@ -1358,6 +1358,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			{ agentDir },
 		);
 	const authStorage = modelRegistry.authStorage;
+	const authStorageOwner = modelRegistry.getAuthStorageOwner();
 	if (options.authStorage && options.authStorage !== authStorage) {
 		throw new Error(
 			"options.authStorage and options.modelRegistry.authStorage must be the same instance when both are provided",
@@ -1428,7 +1429,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 		});
 		const applyCredentialSelector = (scopeId: string, provider: string, selector: AuthCredentialSelector): void => {
-			authStorage.setSessionCredentialSelector(scopeId, provider, selector);
+			authStorage.setSessionCredentialSelector(scopeId, provider, selector, authStorageOwner);
 		};
 		const ownsScopedSettings = options.settings === undefined;
 		const settings = options.settings ?? (await logger.time("settings", Settings.loadForScope, { cwd, agentDir }));
@@ -1702,10 +1703,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					) {
 						throw new Error("Durable numeric credential pin authority changed");
 					}
-					authStorage.setSessionCredentialSelector(credentialSessionId, record.provider, {
-						kind: pin.kind,
-						value: pin.value,
-					});
+					authStorage.setSessionCredentialSelector(
+						credentialSessionId,
+						record.provider,
+						{
+							kind: pin.kind,
+							value: pin.value,
+						},
+						authStorageOwner,
+					);
 					staleDurableCredentialPins.delete(resolveOAuthStorageProvider(record.provider));
 				}
 			} catch {

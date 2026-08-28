@@ -9798,8 +9798,9 @@ export class AgentSession {
 	async setCredentialPin(provider: string, selector: AuthCredentialSelector): Promise<void> {
 		const scopeId = this.credentialSessionId;
 		const authStorage = this.#modelRegistry.authStorage;
-		const target = authStorage.resolveOAuthPinTarget(provider, selector);
-		authStorage.setSessionCredentialSelector(scopeId, provider, target.canonicalSelector);
+		const authStorageOwner = this.#modelRegistry.getAuthStorageOwner();
+		const target = authStorage.resolveOAuthPinTarget(provider, selector, authStorageOwner);
+		authStorage.setSessionCredentialSelector(scopeId, provider, target.canonicalSelector, authStorageOwner);
 		if (target.canonicalSelector.kind === "id" && !this.#credentialStoreIdentity) return;
 		this.sessionManager.appendCustomEntry("auth-credential-pin", {
 			v: 1,

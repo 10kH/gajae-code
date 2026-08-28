@@ -131,7 +131,12 @@ export async function switchSessionCredentialCommand(runtime: SlashCommandRuntim
 	}
 
 	try {
-		authStorage.switchSessionCredential(provider, runtime.session.credentialSessionId, parsed.selector);
+		authStorage.switchSessionCredential(
+			provider,
+			runtime.session.credentialSessionId,
+			parsed.selector,
+			runtime.session.modelRegistry.getAuthStorageOwner?.(),
+		);
 	} catch (error) {
 		return error instanceof Error ? error.message : String(error);
 	}

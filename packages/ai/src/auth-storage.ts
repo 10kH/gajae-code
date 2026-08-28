@@ -1628,11 +1628,16 @@ export class AuthStorage {
 	}
 
 	/** Set the selector derived from a durable session pin or a session seed. */
-	setSessionCredentialSelector(scopeId: string, provider: string, selector: AuthCredentialSelector): void {
+	setSessionCredentialSelector(
+		scopeId: string,
+		provider: string,
+		selector: AuthCredentialSelector,
+		owner?: object,
+	): void {
 		const scope = scopeId.trim();
 		if (!scope) throw new Error("Credential scope id must not be empty");
 		const storageProvider = resolveOAuthStorageProvider(provider);
-		this.#assertCredentialSelectorUsable(storageProvider, selector);
+		this.#assertCredentialSelectorUsable(storageProvider, selector, owner);
 		const selectors = this.#sessionCredentialSelectors.get(scope) ?? new Map<string, AuthCredentialSelector>();
 		selectors.set(storageProvider, selector);
 		this.#sessionCredentialSelectors.set(scope, selectors);
@@ -1708,11 +1713,11 @@ export class AuthStorage {
 	}
 
 	/** Validate and canonicalize an OAuth-only selector for account pinning. */
-	resolveOAuthPinTarget(provider: string, selector: AuthCredentialSelector): OAuthPinTarget {
+	resolveOAuthPinTarget(provider: string, selector: AuthCredentialSelector, owner?: object): OAuthPinTarget {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		if (
 			this.#runtimeOverrides.has(storageProvider) ||
-			this.#configOverrides.has(storageProvider) ||
+			this.#hasConfigOverride(storageProvider, owner) ||
 			getEnvApiKey(storageProvider)
 		) {
 			throw new OAuthCredentialSelectorError(
@@ -1979,14 +1984,19 @@ export class AuthStorage {
 	 * falls back to a usable account instead of re-issuing a request that would
 	 * just draw another 429/quota error.
 	 */
-	switchSessionCredential(provider: string, sessionId: string, selector: AuthCredentialSelector): void {
+	switchSessionCredential(
+		provider: string,
+		sessionId: string,
+		selector: AuthCredentialSelector,
+		owner?: object,
+	): void {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		if (this.#runtimeOverrides.has(storageProvider)) {
 			throw new Error(
 				`Cannot switch credential for ${provider}: a runtime API key override (--api-key) is active and always wins`,
 			);
 		}
-		if (this.#configOverrides.has(storageProvider)) {
+		if (this.#hasConfigOverride(storageProvider, owner)) {
 			throw new Error(
 				`Cannot switch credential for ${provider}: a config API key override (models.yml) is active and always wins`,
 			);
