@@ -1634,11 +1634,24 @@ describe("coordinator session state lock", () => {
 		const expectedPhysicalTransition = comparablePath(`${realStateFile}.lock.transition`);
 		const physicalRoot = comparablePath(realParent) + path.sep;
 		const aliasRoot = comparablePath(aliasParent) + path.sep;
-		expect(nativeTargets.every(target => comparablePath(target) === expectedPhysicalTransition), nativeTargets.join("\n")).toBe(
-			true,
-		);
-		expect(nativeTargets.every(target => comparablePath(target).startsWith(physicalRoot))).toBe(true);
-		expect(nativeTargets.every(target => !comparablePath(target).startsWith(aliasRoot))).toBe(true);
+		const equivalentWindowsPath = (target: string): string => {
+			if (process.platform !== "win32") return target;
+			if (target.startsWith("\\\\?\\UNC\\")) return `\\\\${target.slice("\\\\?\\UNC\\".length)}`;
+			return target.startsWith("\\\\?\\") ? target.slice("\\\\?\\".length) : target;
+		};
+		const comparableWindowsPath = (target: string): string => {
+			const equivalent = equivalentWindowsPath(comparablePath(target));
+			return process.platform === "win32" ? equivalent.toLowerCase() : equivalent;
+		};
+		const expectedComparableTransition = comparableWindowsPath(expectedPhysicalTransition);
+		const comparablePhysicalRoot = comparableWindowsPath(physicalRoot);
+		const comparableAliasRoot = comparableWindowsPath(aliasRoot);
+		expect(
+			nativeTargets.every(target => comparableWindowsPath(target) === expectedComparableTransition),
+			`expected=${expectedComparableTransition}\nactual=${nativeTargets.map(comparableWindowsPath).join("\n")}`,
+		).toBe(true);
+		expect(nativeTargets.every(target => comparableWindowsPath(target).startsWith(comparablePhysicalRoot))).toBe(true);
+		expect(nativeTargets.every(target => !comparableWindowsPath(target).startsWith(comparableAliasRoot))).toBe(true);
 	});
 
 	it("cleans a transition claim when setup generation lstat faults", async () => {
