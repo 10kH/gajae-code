@@ -1040,7 +1040,6 @@ describe("AgentSession message pipeline", () => {
 		integrationAborted = false;
 		const sdkSubmission = session.sendUserMessage("sdk terminal fast path", {
 			sdkRunToken: "sdk-terminal-fast-path",
-			skipPostPromptRecoveryWait: true,
 		});
 		await new Promise<void>(resolve => {
 			const check = () => {

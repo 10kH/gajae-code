@@ -12430,8 +12430,6 @@ export class AgentSession {
 			onDispatchDisposition?: (promotion: { startsOwnRun: boolean }) => void;
 			preflightSignal?: AbortSignal;
 			sdkRunToken?: string;
-			/** Do not let post-prompt recovery delay the SDK terminal boundary. */
-			skipPostPromptRecoveryWait?: boolean;
 		},
 	): Promise<void> {
 		this.#assertRecoveryHydrationPromoted();
