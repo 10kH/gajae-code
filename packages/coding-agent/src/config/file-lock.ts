@@ -230,7 +230,13 @@ function fileLockDirIdentityFromPathState(state: LockInfoPathState, bytes: strin
 async function captureFileLockDirIdentity(lockDir: string): Promise<GenericFileLockDirIdentity | null> {
 	const before = await lockInfoPathState(lockDir);
 	if (!before) return null;
-	const bytes = await readLockInfoBytes(lockDir);
+	let bytes: string | null;
+	try {
+		bytes = await readLockInfoBytes(lockDir);
+	} catch (error) {
+		if (isEnoent(error)) return null;
+		throw error;
+	}
 	if (bytes === null) return null;
 	const after = await lockInfoPathState(lockDir);
 	if (!after || !sameLockInfoPathState(before, after)) return null;
@@ -498,7 +504,14 @@ export async function removeFileLockDirForGc(
 	expected: FileLockOwnerToken,
 	preVerdictIdentity?: GenericFileLockDirIdentity,
 ): Promise<FileLockGcRemoval> {
-	const expectedIdentity = preVerdictIdentity ?? fileLockDirIdentities.get(expected);
+	let expectedIdentity = preVerdictIdentity ?? fileLockDirIdentities.get(expected);
+	if (!expectedIdentity) {
+		try {
+			expectedIdentity = (await captureFileLockDirIdentity(lockDir)) ?? undefined;
+		} catch (error) {
+			if (!isTransientReleaseError(error)) return "cleanup_failed";
+		}
+	}
 	const onDiskBytes = await readLockInfoBytes(lockDir);
 	const current = onDiskBytes === null ? null : parseLockInfoBytes(onDiskBytes);
 	if (!current || onDiskBytes === null) return "missing";
