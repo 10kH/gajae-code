@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from "bun:test";
 import type { AuthStorage } from "../../../src/session/auth-storage";
 import {
+	activeContextNativeId,
 	inferNativeProviderFromModel,
 	resolveProviderChain,
 	setPreferredSearchProvider,
@@ -102,6 +103,44 @@ describe("native web-search provider resolution", () => {
 		).resolves.toEqual(["xai", "duckduckgo"]);
 	});
 
+	it("uses the owner-bound xAI context for a canonical provider on a custom endpoint", async () => {
+		let resolverCalls = 0;
+		const ctx: ActiveSearchModelContext = {
+			provider: "xai",
+			modelId: "grok-proxy",
+			api: "openai-responses",
+			baseUrl: "https://proxy.example/v1",
+			resolveCredentials: async () => {
+				resolverCalls++;
+				return { apiKey: "active-owner-key" };
+			},
+		};
+
+		expect(inferNativeProviderFromModel(ctx)).toBeUndefined();
+		expect(activeContextNativeId(ctx)).toBe("xai");
+		await expect(ids(ctx, { auth: ["xai"] })).resolves.toEqual(["xai", "duckduckgo"]);
+		expect(resolverCalls).toBeGreaterThan(0);
+	});
+
+	it("uses the owner-bound Gemini context for a canonical provider on a custom endpoint", async () => {
+		let resolverCalls = 0;
+		const ctx: ActiveSearchModelContext = {
+			provider: "google-gemini-cli",
+			modelId: "gemini-proxy",
+			api: "google-generative-ai",
+			baseUrl: "https://proxy.example",
+			resolveCredentials: async () => {
+				resolverCalls++;
+				return { apiKey: "active-owner-key" };
+			},
+		};
+
+		expect(inferNativeProviderFromModel(ctx)).toBeUndefined();
+		expect(activeContextNativeId(ctx)).toBe("gemini");
+		await expect(ids(ctx, { auth: ["google-gemini-cli"] })).resolves.toEqual(["gemini", "duckduckgo"]);
+		expect(resolverCalls).toBeGreaterThan(0);
+	});
+
 	it("does not infer canonical xAI search for Grok contexts behind proxies", async () => {
 		const ctx: ActiveSearchModelContext = {
 			provider: "proxy",
@@ -201,7 +240,7 @@ describe("native web-search provider resolution", () => {
 				},
 				{ auth: ["google-gemini-cli"] },
 			),
-		).resolves.toEqual(["gemini", "duckduckgo"]);
+		).resolves.toEqual(["duckduckgo"]);
 		await expect(
 			ids(
 				{ provider: "proxy", modelId: "gpt-5", api: "openai-responses", baseUrl: "https://models.example" },

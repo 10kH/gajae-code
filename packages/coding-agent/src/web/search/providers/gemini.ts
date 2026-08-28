@@ -17,6 +17,7 @@ import {
 import { fetchWithRetry } from "@gajae-code/utils";
 
 import type {
+	ActiveSearchModelContext,
 	ActiveSearchModelCredentials,
 	SearchCitation,
 	SearchResponse,
@@ -47,14 +48,37 @@ function isGenerativeLanguageWire(api: string): boolean {
 	return api === "google-generative-ai" || api === "google-generative-language" || api === "gemini-wire";
 }
 
-function isCustomGenerativeLanguageContext(ctx: SearchParams["activeModelContext"]): ctx is NonNullable<
-	SearchParams["activeModelContext"]
-> & {
-	resolveCredentials: NonNullable<NonNullable<SearchParams["activeModelContext"]>["resolveCredentials"]>;
-} {
-	if (!ctx || !isGenerativeLanguageWire(ctx.api) || !ctx.resolveCredentials) return false;
+function isGoogleWire(api: string): boolean {
+	return isGenerativeLanguageWire(api) || api === "google-gemini-cli" || api === "google-vertex";
+}
+
+const OFFICIAL_GEMINI_HOSTS = new Set([
+	"cloudcode-pa.googleapis.com",
+	"daily-cloudcode-pa.googleapis.com",
+	"daily-cloudcode-pa.sandbox.googleapis.com",
+	"generativelanguage.googleapis.com",
+]);
+const CANONICAL_GEMINI_PROVIDERS = new Set(["google", "gemini", "google-gemini-cli", "google-antigravity"]);
+
+function isOfficialGeminiBaseUrl(baseUrl: string | undefined): boolean {
+	if (!baseUrl?.trim()) return true;
+	try {
+		const host = new URL(baseUrl).hostname.toLowerCase().replace(/^\[/, "").replace(/\]$/, "").replace(/\.$/, "");
+		return OFFICIAL_GEMINI_HOSTS.has(host);
+	} catch {
+		return false;
+	}
+}
+
+function isCustomGeminiContext(ctx: ActiveSearchModelContext | undefined): boolean {
+	if (!ctx || !isGoogleWire(ctx.api)) return false;
+	if (!isOfficialGeminiBaseUrl(ctx.baseUrl)) return true;
 	const provider = ctx.provider.toLowerCase();
-	return provider !== "google" && provider !== "gemini" && !GEMINI_PROVIDERS.includes(provider as GeminiProviderId);
+	return Boolean(ctx.resolveCredentials && !CANONICAL_GEMINI_PROVIDERS.has(provider));
+}
+
+function isCustomGenerativeLanguageContext(ctx: ActiveSearchModelContext | undefined): boolean {
+	return isGenerativeLanguageWire(ctx?.api ?? "") && isCustomGeminiContext(ctx);
 }
 
 function hasHeader(headers: Record<string, string>, name: string): boolean {
@@ -574,8 +598,15 @@ export class GeminiProvider extends SearchProvider {
 		// Native-over-proxy: a custom model's owner-bound resolver must win over
 		// canonical Gemini OAuth. Otherwise the request would silently leave the
 		// proxy and hit Cloud Code with another registry's identity.
-		if (isCustomGenerativeLanguageContext(ctx)) {
-			return searchGeminiViaGenerativeLanguage(params);
+		if (isCustomGeminiContext(ctx)) {
+			if (isCustomGenerativeLanguageContext(ctx)) return searchGeminiViaGenerativeLanguage(params);
+			return Promise.reject(
+				new SearchProviderError(
+					"gemini",
+					`Gemini native search does not support custom ${ctx?.api ?? ""} transports`,
+					400,
+				),
+			);
 		}
 		// Preserve the existing active-key fallback when canonical OAuth is absent.
 		if (!hasGeminiOAuth(params.authStorage) && ctx && isGenerativeLanguageWire(ctx.api)) {

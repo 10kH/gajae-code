@@ -1591,7 +1591,8 @@ export class ModelRegistry {
 	#loadedModelPresetRegistryManifestSha256: string | undefined;
 	#modelPresetRegistryAgentDir: string;
 	#modelPresetRegistryDependencies: Omit<ModelPresetRegistryDependencies, "agentDir">;
-	#cancelModelPresetRegistryRefresh: (() => void) | undefined;
+	#cancelModelPresetRegistryRefresh: (() => Promise<void>) | undefined;
+	#disposePromise: Promise<void> | undefined;
 	#unsubscribeAuthGeneration: (() => void) | undefined;
 	#staticModelsLoaded = false;
 	#lastDisabledProviderKey: string | undefined;
@@ -1669,10 +1670,11 @@ export class ModelRegistry {
 		);
 	}
 
-	dispose(): void {
+	dispose(): Promise<void> {
+		if (this.#disposePromise) return this.#disposePromise;
 		this.#disposed = true;
 		this.#catalogRefreshGeneration++;
-		this.#cancelModelPresetRegistryRefresh?.();
+		const awaitRefreshDisposal = this.#cancelModelPresetRegistryRefresh?.() ?? Promise.resolve();
 		this.#cancelModelPresetRegistryRefresh = undefined;
 		this.#unsubscribeAuthGeneration?.();
 		this.#unsubscribeAuthGeneration = undefined;
@@ -1680,6 +1682,8 @@ export class ModelRegistry {
 		this.#disposeAuthStorageFallbackResolver?.();
 		this.#disposeAuthStorageFallbackResolver = undefined;
 		this.#catalogChangeListeners.clear();
+		this.#disposePromise = awaitRefreshDisposal;
+		return this.#disposePromise;
 	}
 
 	#enqueueCatalogMutation(operation: () => void | Promise<void>): Promise<void> {

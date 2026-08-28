@@ -1395,8 +1395,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	let credentialScopeId: string | undefined;
 	let credentialScopeLeased = false;
 	let closeOwnedSettings: () => Promise<void> = async () => {};
-	const closeOwnedAuthStorage = (): void => {
-		if (ownsModelRegistry) modelRegistry.dispose();
+	const closeOwnedAuthStorage = async (): Promise<void> => {
+		if (ownsModelRegistry) await modelRegistry.dispose();
 		if (!hasSession && credentialScopeLeased && credentialScopeId) {
 			authStorage.releaseCredentialScope(credentialScopeId);
 			credentialScopeLeased = false;
@@ -4393,7 +4393,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							);
 							AsyncJobManager.unregisterManager(asyncJobManager);
 						}
-						closeOwnedAuthStorage();
+						await closeOwnedAuthStorage();
 						await closeOwnedSettings();
 					}
 				}
@@ -4663,7 +4663,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 			releaseLocalProtocolOverride();
 			try {
-				closeOwnedAuthStorage();
+				await closeOwnedAuthStorage();
 			} catch (authCleanupError) {
 				logger.warn("Failed to close owned auth storage after startup error", { error: authCleanupError });
 			}

@@ -315,6 +315,50 @@ function looksXaiFamilyModelId(ctx: ActiveSearchModelContext): boolean {
 	return looksXaiModelId(ctx.wireModelId) || looksXaiModelId(ctx.modelId);
 }
 
+const OFFICIAL_GEMINI_HOSTS = new Set([
+	"cloudcode-pa.googleapis.com",
+	"daily-cloudcode-pa.googleapis.com",
+	"daily-cloudcode-pa.sandbox.googleapis.com",
+	"generativelanguage.googleapis.com",
+]);
+
+function normalizedHost(baseUrl: string): string | undefined {
+	try {
+		return new URL(baseUrl).hostname.toLowerCase().replace(/^\[/, "").replace(/\]$/, "").replace(/\.$/, "");
+	} catch {
+		return undefined;
+	}
+}
+
+function isOfficialGeminiBaseUrl(baseUrl: string | undefined): boolean {
+	if (!baseUrl?.trim()) return true;
+	const host = normalizedHost(baseUrl);
+	return host !== undefined && OFFICIAL_GEMINI_HOSTS.has(host);
+}
+
+function isOfficialXaiBaseUrl(baseUrl: string | undefined): boolean {
+	if (!baseUrl?.trim()) return true;
+	return normalizedHost(baseUrl) === "api.x.ai";
+}
+
+const CANONICAL_GEMINI_PROVIDERS = new Set(["google", "gemini", "google-gemini-cli", "google-antigravity"]);
+
+function hasCustomGeminiSearchContext(ctx: ActiveSearchModelContext): boolean {
+	if (!isGoogleWire(ctx.api)) return false;
+	if (!isOfficialGeminiBaseUrl(ctx.baseUrl)) return true;
+	const provider = ctx.provider.toLowerCase();
+	return Boolean(ctx.resolveCredentials && !CANONICAL_GEMINI_PROVIDERS.has(provider));
+}
+
+function hasCustomXaiSearchContext(ctx: ActiveSearchModelContext): boolean {
+	if (!isOpenAICompatWire(ctx.api)) return false;
+	const provider = ctx.provider.toLowerCase();
+	if (provider === "xai" && !isOfficialXaiBaseUrl(ctx.baseUrl)) return true;
+	if (!looksXaiFamilyModelId(ctx)) return false;
+	if (!isOfficialXaiBaseUrl(ctx.baseUrl)) return true;
+	return provider !== "xai";
+}
+
 export function isLocalBaseUrl(baseUrl: string | undefined): boolean {
 	if (!baseUrl) return false;
 	let url: URL;
@@ -379,14 +423,20 @@ export function inferNativeProviderFromModel(ctx: ActiveSearchModelContext | und
 	if (!ctx || ctx.webSearch === "off") return undefined;
 	const modelId = (ctx.wireModelId ?? ctx.modelId).toLowerCase();
 	if (modelId.startsWith("claude-") && isAnthropicWire(ctx.api)) return "anthropic";
-	if (modelId.startsWith("gemini-") && isGoogleWire(ctx.api)) return "gemini";
+	if (modelId.startsWith("gemini-") && isGoogleWire(ctx.api) && !hasCustomGeminiSearchContext(ctx)) return "gemini";
 	// A custom proxy may expose a Grok model through an OpenAI wire while the
 	// process also has canonical xAI credentials. Do not infer the canonical
 	// xAI provider from the model family: that would silently send the search to
 	// api.x.ai with another registry's credentials. Custom active contexts are
 	// dispatched below by activeContextNativeId, where the provider can consume
 	// the active owner-bound resolver instead.
-	if (looksXaiFamilyModelId(ctx) && isOpenAICompatWire(ctx.api) && ctx.provider.toLowerCase() === "xai") return "xai";
+	if (
+		looksXaiFamilyModelId(ctx) &&
+		isOpenAICompatWire(ctx.api) &&
+		ctx.provider.toLowerCase() === "xai" &&
+		!hasCustomXaiSearchContext(ctx)
+	)
+		return "xai";
 	// `codex` hits the ChatGPT backend with local Codex OAuth, so only infer it
 	// for genuine OpenAI endpoints. Custom/proxy OpenAI-compatible models fall
 	// through to `activeContextNativeId` and reuse their own credentials.
@@ -398,6 +448,8 @@ export function inferNativeProviderFromModel(ctx: ActiveSearchModelContext | und
 
 function canUseDirectProviderMapping(ctx: ActiveSearchModelContext, id: SearchProviderId): boolean {
 	if (ctx.webSearch === "off") return false;
+	if (id === "gemini" && hasCustomGeminiSearchContext(ctx)) return false;
+	if (id === "xai" && hasCustomXaiSearchContext(ctx)) return false;
 	if (id !== "codex") return true;
 	// Same constraint as inference: the ChatGPT-backed codex provider is valid
 	// only for official OpenAI endpoints, not custom/proxy base URLs.
@@ -458,7 +510,12 @@ export function activeContextNativeId(ctx: ActiveSearchModelContext | undefined)
 	// reject just wastes a guaranteed-fail attempt before DuckDuckGo.
 	if (isAnthropicWire(ctx.api) && modelId.startsWith("claude-")) return "anthropic";
 	if (isGenerativeLanguageWire(ctx.api) && modelId.startsWith("gemini-")) return "gemini";
-	if (looksXaiFamilyModelId(ctx) && isOpenAICompatWire(ctx.api) && ctx.provider.toLowerCase() !== "xai") return "xai";
+	if (
+		isOpenAICompatWire(ctx.api) &&
+		hasCustomXaiSearchContext(ctx) &&
+		(looksXaiFamilyModelId(ctx) || ctx.provider.toLowerCase() === "xai")
+	)
+		return "xai";
 	if (ctx.api === "openai-responses" || ctx.api === "openai-completions") return "openai-compatible";
 	return undefined;
 }

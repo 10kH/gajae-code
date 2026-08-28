@@ -86,10 +86,22 @@ function looksXaiModelId(modelId: string | undefined): boolean {
 	return id.startsWith("grok-") || id.startsWith("x-ai/grok-") || id.startsWith("xai/grok-");
 }
 
+function isOfficialXaiBaseUrl(baseUrl: string | undefined): boolean {
+	if (!baseUrl?.trim()) return true;
+	try {
+		return new URL(baseUrl).hostname.toLowerCase().replace(/\.$/, "") === "api.x.ai";
+	} catch {
+		return false;
+	}
+}
+
 function isCustomXaiContext(ctx: ActiveSearchModelContext | undefined): ctx is ActiveSearchModelContext {
 	if (!ctx || !isOpenAICompatWire(ctx.api)) return false;
+	const provider = ctx.provider.toLowerCase();
+	if (provider === "xai" && !isOfficialXaiBaseUrl(ctx.baseUrl)) return true;
 	if (!looksXaiModelId(ctx.wireModelId) && !looksXaiModelId(ctx.modelId)) return false;
-	return ctx.provider.toLowerCase() !== "xai";
+	if (!isOfficialXaiBaseUrl(ctx.baseUrl)) return true;
+	return provider !== "xai";
 }
 
 function hasHeader(headers: Record<string, string>, name: string): boolean {

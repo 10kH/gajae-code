@@ -543,11 +543,17 @@ function registryPaths(agentDir: string) {
 
 type RegistryStatePaths = { state: string; backup: string };
 
-async function writeRegistryState(paths: RegistryStatePaths, state: RegistryState): Promise<void> {
+async function writeRegistryState(
+	paths: RegistryStatePaths,
+	state: RegistryState,
+	canWrite: () => boolean = () => true,
+): Promise<void> {
 	// Publish the backup before replacing the primary. If the process stops in
 	// the replacement window, recovery can still combine the old primary's
 	// active intent with the newer backup's anti-rollback floor.
+	if (!canWrite()) return;
 	await writeAtomicJson(paths.backup, state);
+	if (!canWrite()) return;
 	await writeAtomicJson(paths.state, state);
 }
 
@@ -1982,7 +1988,13 @@ function preserveRawStateFloor(state: RegistryState, copies: readonly ParsedRegi
 	return state;
 }
 
-async function writeFailureDiagnostic(paths: { failure: string }, error: unknown, now: Date): Promise<void> {
+async function writeFailureDiagnostic(
+	paths: { failure: string },
+	error: unknown,
+	now: Date,
+	canWrite: () => boolean = () => true,
+): Promise<void> {
+	if (!canWrite()) return;
 	await writeAtomicJson(paths.failure, {
 		version: 1,
 		lastCheckedAt: now.toISOString(),
@@ -2007,11 +2019,17 @@ async function recordFailure(
 	error: unknown,
 	now: Date,
 	trustedKeys: ReadonlyMap<string, ModelPresetRegistryTrustedKey>,
+	canWrite: () => boolean = () => true,
 ): Promise<void> {
+	if (!canWrite()) return;
 	const paths = registryPaths(agentDir);
+	const writeFailure = async (): Promise<void> => {
+		await writeFailureDiagnostic(paths, error, now, canWrite);
+	};
 	await withFileLock(
 		paths.transaction,
 		async () => {
+			if (!canWrite()) return;
 			let control: RegistryControl = { version: 1, disabled: false };
 			let controlIsValid = true;
 			try {
@@ -2021,7 +2039,7 @@ async function recordFailure(
 			}
 			const copies = [readParsedStateSync(paths.state), readParsedStateSync(paths.backup)];
 			if (!copies.some(copy => copy.present)) {
-				await writeFailureDiagnostic(paths, error, now);
+				await writeFailure();
 				return;
 			}
 			let recovery: RegistryStateRecovery | undefined;
@@ -2034,7 +2052,7 @@ async function recordFailure(
 				// Never replace a copy that could not be independently read. Keep the
 				// failure diagnostic separate so a later refresh remains fail-closed.
 				if (copies.some(copy => copy.error !== undefined)) {
-					await writeFailureDiagnostic(paths, error, now);
+					await writeFailure();
 					return;
 				}
 				const backupEvidence = inspectStateEvidence(copies[1], trustedKeys);
@@ -2052,7 +2070,7 @@ async function recordFailure(
 			if (!recovery) {
 				const primaryEvidence = inspectStateEvidence(copies[0], trustedKeys);
 				if (primaryEvidence && (!primaryEvidence.allGenerationsVerified || primaryEvidence.duplicateRevision)) {
-					await writeFailureDiagnostic(paths, error, now);
+					await writeFailure();
 					return;
 				}
 			}
@@ -2067,33 +2085,54 @@ async function recordFailure(
 			}
 			let state = recovery?.state ?? copies.find(copy => copy.state)?.state;
 			if (!state) {
-				await writeFailureDiagnostic(paths, error, now);
+				await writeFailure();
 				return;
 			}
 			if (recovery?.firstRun) {
-				await writeFailureDiagnostic(paths, error, now);
+				await writeFailure();
 				return;
 			}
 			state = preserveRawStateFloor(state, copies);
 			if (recovery?.hadInvalidCopy || !controlIsValid || !recovery) {
 				// An unreadable control file cannot safely preserve a stale pin or disablement.
-				await writeAtomicJson(
-					paths.control,
-					controlIsValid ? { ...control, pinnedRevision: undefined } : { version: 1, disabled: false },
-				);
+				if (canWrite())
+					await writeAtomicJson(
+						paths.control,
+						controlIsValid ? { ...control, pinnedRevision: undefined } : { version: 1, disabled: false },
+					);
 			}
 			const failedState = {
 				...state,
 				lastCheckedAt: now.toISOString(),
 				lastError: safeError(error),
 			};
-			await writeRegistryState(paths, failedState);
+			await writeRegistryState(paths, failedState, canWrite);
 		},
 		{ retries: 20, retryDelayMs: 50, staleMs: 30_000 },
 	);
 }
 
-const refreshSingleFlight = new Map<string, Promise<ModelPresetRegistryRefreshResult>>();
+class RefreshCancelledError extends Error {
+	constructor() {
+		super("Model preset registry refresh was cancelled.");
+		this.name = "RefreshCancelledError";
+	}
+}
+
+function isRefreshCancelled(error: unknown): boolean {
+	return error instanceof RefreshCancelledError;
+}
+
+interface RefreshFlightConsumer {
+	cancelled: boolean;
+}
+
+interface RefreshFlight {
+	promise: Promise<ModelPresetRegistryRefreshResult>;
+	consumers: Set<RefreshFlightConsumer>;
+}
+
+const refreshSingleFlight = new Map<string, RefreshFlight>();
 const registryChangeListeners = new Map<string, Set<() => void>>();
 const refreshDependencyIds = new WeakMap<object, number>();
 let nextRefreshDependencyId = 1;
@@ -2145,23 +2184,62 @@ function refreshSingleFlightKey(dependencies: ModelPresetRegistryDependencies, a
 export async function refreshModelPresetRegistry(
 	dependencies: ModelPresetRegistryDependencies = {},
 ): Promise<ModelPresetRegistryRefreshResult> {
+	return getRefreshFlight(dependencies).promise;
+}
+
+function refreshCanWrite(flight: RefreshFlight): boolean {
+	for (const consumer of flight.consumers) {
+		if (!consumer.cancelled) return true;
+	}
+	return false;
+}
+
+function attachRefreshFlightConsumer(flight: RefreshFlight, consumer: RefreshFlightConsumer): void {
+	flight.consumers.add(consumer);
+	void flight.promise.then(
+		() => flight.consumers.delete(consumer),
+		() => flight.consumers.delete(consumer),
+	);
+}
+
+function getRefreshFlight(
+	dependencies: ModelPresetRegistryDependencies,
+	consumer?: RefreshFlightConsumer,
+): RefreshFlight {
 	const agentDir = effectiveAgentDir(dependencies);
 	const flightKey = refreshSingleFlightKey(dependencies, agentDir);
 	const existing = refreshSingleFlight.get(flightKey);
-	if (existing) return existing;
-	const promise = refreshModelPresetRegistryInner({ ...dependencies, agentDir }).finally(() => {
-		if (refreshSingleFlight.get(flightKey) === promise) refreshSingleFlight.delete(flightKey);
+	if (existing) {
+		if (consumer) attachRefreshFlightConsumer(existing, consumer);
+		return existing;
+	}
+	const flight: RefreshFlight = {
+		promise: undefined as unknown as Promise<ModelPresetRegistryRefreshResult>,
+		consumers: new Set<RefreshFlightConsumer>(),
+	};
+	if (consumer) flight.consumers.add(consumer);
+	else flight.consumers.add({ cancelled: false });
+	const promise = refreshModelPresetRegistryInner({ ...dependencies, agentDir }, () =>
+		refreshCanWrite(flight),
+	).finally(() => {
+		if (refreshSingleFlight.get(flightKey) === flight) refreshSingleFlight.delete(flightKey);
+		flight.consumers.clear();
 	});
-	refreshSingleFlight.set(flightKey, promise);
-	return promise;
+	flight.promise = promise;
+	refreshSingleFlight.set(flightKey, flight);
+	return flight;
 }
 
 async function refreshModelPresetRegistryInner(
 	dependencies: ModelPresetRegistryDependencies & { agentDir: string },
+	canWrite: () => boolean = () => true,
 ): Promise<ModelPresetRegistryRefreshResult> {
 	const { agentDir } = dependencies;
 	const paths = registryPaths(agentDir);
 	const now = (dependencies.now ?? (() => new Date()))();
+	const ensureWritable = (): void => {
+		if (!canWrite()) throw new RefreshCancelledError();
+	};
 	try {
 		return await withFileLock(
 			paths.transaction,
@@ -2188,6 +2266,7 @@ async function refreshModelPresetRegistryInner(
 					(controlPinnedGeneration === undefined || controlPinnedGeneration.revoked === true);
 				if (staleControlPin) {
 					control = { ...control, pinnedRevision: undefined };
+					ensureWritable();
 					await writeAtomicJson(paths.control, control);
 				}
 				const effectivePinnedRevision =
@@ -2224,6 +2303,7 @@ async function refreshModelPresetRegistryInner(
 						undefined,
 					);
 					if (!currentLatest) throw new Error("Registry returned 304 without a verified cached generation.");
+					ensureWritable();
 					await writeRegistryState(paths, {
 						...currentState,
 						lastCheckedAt: now.toISOString(),
@@ -2427,9 +2507,12 @@ async function refreshModelPresetRegistryInner(
 				if (serializedJsonByteLength(candidate.nextState) > maxStateBytes)
 					throw new Error("Registry cache state exceeds its durable size limit.");
 				const { nextState, retained } = candidate;
-				if (stateRecovery.hadInvalidCopy && control.pinnedRevision !== undefined)
+				if (stateRecovery.hadInvalidCopy && control.pinnedRevision !== undefined) {
+					ensureWritable();
 					await writeAtomicJson(paths.control, { ...control, pinnedRevision: undefined });
-				await writeRegistryState(paths, nextState);
+				}
+				ensureWritable();
+				await writeRegistryState(paths, nextState, canWrite);
 				return {
 					status: "updated",
 					revision: manifest.signed.registryRevision,
@@ -2442,8 +2525,12 @@ async function refreshModelPresetRegistryInner(
 			{ retries: 20, retryDelayMs: 50, staleMs: 30_000 },
 		);
 	} catch (error) {
+		if (isRefreshCancelled(error)) throw error;
 		const redacted = new Error(safeError(error));
-		await recordFailure(agentDir, redacted, now, effectiveTrustedKeys(dependencies)).catch(() => undefined);
+		if (canWrite())
+			await recordFailure(agentDir, redacted, now, effectiveTrustedKeys(dependencies), canWrite).catch(
+				() => undefined,
+			);
 		throw redacted;
 	}
 }
@@ -2606,8 +2693,8 @@ export function getModelPresetRegistryStatus(
 export function refreshModelPresetRegistryInBackground(
 	dependencies: ModelPresetRegistryDependencies = {},
 	onAccepted?: () => void,
-): () => void {
-	if (dependencies.automaticRefresh === false) return () => {};
+): () => Promise<void> {
+	if (dependencies.automaticRefresh === false) return async () => {};
 	const agentDir = effectiveAgentDir(dependencies);
 	let status: ModelPresetRegistryStatus;
 	try {
@@ -2635,6 +2722,9 @@ export function refreshModelPresetRegistryInBackground(
 			? refreshIntervalMs - recentAge
 			: (dependencies.startupDelayMs ?? MODEL_PRESET_REGISTRY_STARTUP_DELAY_MS);
 	let cancelled = false;
+	let disposal: Promise<void> | undefined;
+	const consumer: RefreshFlightConsumer = { cancelled: false };
+	const pendingFlights = new Set<Promise<ModelPresetRegistryRefreshResult>>();
 	let knownManifestSha256 = dependencies.knownManifestSha256 ?? status.manifestSha256;
 	const publicationFingerprint = (current: ModelPresetRegistryStatus): string =>
 		JSON.stringify({
@@ -2667,8 +2757,11 @@ export function refreshModelPresetRegistryInBackground(
 	const schedule = (delayMs: number): void => {
 		if (cancelled) return;
 		timer = setTimeout(() => {
+			if (cancelled) return;
 			publishCurrentStatus();
-			void refreshModelPresetRegistry({ ...dependencies, agentDir, knownManifestSha256 })
+			const flight = getRefreshFlight({ ...dependencies, agentDir, knownManifestSha256 }, consumer);
+			pendingFlights.add(flight.promise);
+			void flight.promise
 				.then(result => {
 					if (result.status === "updated") knownManifestSha256 = result.manifestSha256;
 					if (!cancelled) {
@@ -2686,14 +2779,21 @@ export function refreshModelPresetRegistryInBackground(
 					}
 				})
 				.catch(() => undefined)
-				.finally(() => schedule(refreshIntervalMs));
+				.finally(() => {
+					pendingFlights.delete(flight.promise);
+					schedule(refreshIntervalMs);
+				});
 		}, delayMs);
 		timer.unref?.();
 	};
 	schedule(initialDelay);
 	return () => {
+		if (disposal) return disposal;
 		cancelled = true;
+		consumer.cancelled = true;
 		unsubscribe();
 		if (timer) clearTimeout(timer);
+		disposal = Promise.allSettled([...pendingFlights]).then(() => undefined);
+		return disposal;
 	};
 }

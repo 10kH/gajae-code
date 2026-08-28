@@ -1758,9 +1758,9 @@ describe("signed model preset registry", () => {
 		modelRegistry.onCatalogChanged(catalogChanged);
 		try {
 			await entered.promise;
-			modelRegistry.dispose();
+			const disposal = modelRegistry.dispose();
 			release.resolve();
-			for (let attempt = 0; attempt < 50 && calls < 4; attempt++) await Bun.sleep(10);
+			await disposal;
 			expect(calls).toBe(4);
 			expect(modelRegistry.getModelProfile("late-profile")).toBeUndefined();
 			await modelRegistry.refresh("offline");
@@ -1769,6 +1769,41 @@ describe("signed model preset registry", () => {
 			modelRegistry.dispose();
 			authStorage.close();
 		}
+	});
+
+	test("awaits a deferred refresh before allowing its fixture root to be removed", async () => {
+		const data = await fixture();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const fetchImpl = (async () => {
+			entered.resolve();
+			await release.promise;
+			throw new Error("offline");
+		}) as unknown as typeof fetch;
+		const dispose = refreshModelPresetRegistryInBackground({
+			agentDir: data.agentDir,
+			manifestUrl,
+			startupDelayMs: 0,
+			refreshIntervalMs: 60_000,
+			fetch: fetchImpl,
+		});
+		await entered.promise;
+		const disposal = dispose();
+		let settled = false;
+		void disposal.then(() => {
+			settled = true;
+		});
+		await Bun.sleep(10);
+		expect(settled).toBe(false);
+		await fs.rm(data.agentDir, { recursive: true, force: true });
+		release.resolve();
+		await disposal;
+		expect(
+			await fs
+				.stat(data.agentDir)
+				.then(() => true)
+				.catch(() => false),
+		).toBe(false);
 	});
 
 	test("releases the auth-generation listener when a registry is disposed", async () => {
