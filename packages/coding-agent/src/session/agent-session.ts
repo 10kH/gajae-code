@@ -5416,7 +5416,12 @@ export class AgentSession {
 	#queueCoordinatorRuntimeStatePersist(event: AgentSessionEvent): Promise<void> {
 		if (isNonDispatchedToolEvent(event)) return Promise.resolve();
 		const observation = this.#coordinatorToolObservations.get(event);
-		const run = () => this.#persistRuntimeStateInBackground(event, observation);
+		const context = {
+			sessionId: this.sessionId,
+			cwd: this.sessionManager.getCwd(),
+			sessionFile: this.sessionManager.getSessionFile(),
+		};
+		const run = () => this.#persistRuntimeStateInBackground(event, context, observation);
 		const queued = this.#coordinatorPersistQueue.then(run, run);
 		this.#coordinatorPersistQueue = queued.catch(() => {});
 		return queued;
@@ -5424,18 +5429,11 @@ export class AgentSession {
 
 	async #persistRuntimeStateInBackground(
 		event: AgentSessionEvent,
+		context: { sessionId: string; cwd: string; sessionFile: string | undefined },
 		observation: CoordinatorToolObservation | undefined,
 	): Promise<void> {
 		try {
-			await persistCoordinatorRuntimeStateFromEvent(
-				event,
-				{
-					sessionId: this.sessionId,
-					cwd: this.sessionManager.getCwd(),
-					sessionFile: this.sessionManager.getSessionFile(),
-				},
-				observation,
-			);
+			await persistCoordinatorRuntimeStateFromEvent(event, context, observation);
 		} catch {
 			logger.warn("Failed to persist coordinator runtime state", { event: event.type });
 		}
