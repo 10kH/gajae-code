@@ -118,7 +118,7 @@ import {
 	modelsAreEqual,
 	streamSimple,
 } from "@gajae-code/ai/core";
-import { resolveAnthropicBaseUrlFromEnv } from "@gajae-code/ai/utils/anthropic-auth";
+import { normalizeAnthropicBaseUrl } from "@gajae-code/ai/providers/anthropic";
 import {
 	type AuthDisposition,
 	beginAttempt,
@@ -1665,14 +1665,21 @@ function buildSessionMetadata(
 	// Anthropic-format-compatible proxies like cloudflare-ai-gateway or gitlab-duo)
 	// would leak the user's Anthropic identity to unrelated third-party APIs.
 	const effectiveBaseUrl =
-		model?.provider === "anthropic" ? (resolveAnthropicBaseUrlFromEnv() ?? model.baseUrl) : undefined;
+		model?.provider === "anthropic"
+			? (normalizeAnthropicBaseUrl(
+					(isFoundryEnabled() ? $pickCredentialEnv("FOUNDRY_BASE_URL") : undefined) ?? model.baseUrl,
+				) ?? "https://api.anthropic.com")
+			: undefined;
 	let officialAnthropicEndpoint = false;
 	if (provider === "anthropic" && model?.api === "anthropic-messages") {
 		try {
-			const url = new URL(effectiveBaseUrl ?? "https://api.anthropic.com");
+			const candidate = effectiveBaseUrl ?? "https://api.anthropic.com";
+			const url = new URL(candidate);
+			const authority = candidate.match(/^[a-z][a-z\d+.-]*:\/\/([^/?#]*)/iu)?.[1];
 			officialAnthropicEndpoint =
 				url.protocol === "https:" &&
 				url.hostname === "api.anthropic.com" &&
+				authority?.toLowerCase() === "api.anthropic.com" &&
 				!url.username &&
 				!url.password &&
 				!url.search &&

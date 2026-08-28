@@ -583,6 +583,16 @@ export interface AuthCredentialStore {
 	 */
 	markCredentialSuspect?(credentialId: number, opts?: { signal?: AbortSignal }): Promise<void>;
 	/**
+	 * Optional async write hook to disable one credential through an authoritative
+	 * remote store. Remote clients MUST use this hook instead of the synchronous
+	 * local delete methods when an OAuth refresh fails definitively.
+	 *
+	 * Returns `false` when the row is already absent (for example, a peer
+	 * disabled it first). Implementations MUST NOT treat a failed remote write as
+	 * a successful local deletion.
+	 */
+	disableAuthCredentialRemote?(credentialId: number, disabledCause: string, signal?: AbortSignal): Promise<boolean>;
+	/**
 	 * Optional async write hook for upserting a single credential. When present,
 	 * `AuthStorage.#upsertOAuthCredential` routes through this instead of the
 	 * sync `upsertAuthCredentialForProvider`. `RemoteAuthCredentialStore` uses
@@ -2700,6 +2710,34 @@ export class AuthStorage {
 		this.#clearSelectorsForRemovedCredential(provider, new Set([credentialId]), entries);
 		this.#resetProviderAssignments(provider);
 		this.#emitCredentialDisabled({ provider, disabledCause });
+	}
+
+	/**
+	 * Disable one credential through an authoritative remote store and reconcile
+	 * this AuthStorage instance only after that write succeeds. Remote stores
+	 * must never be mutated through the synchronous local delete path because
+	 * their snapshots do not own persistence authority.
+	 */
+	async #disableCredentialRemotely(
+		provider: string,
+		credentialId: number,
+		disabledCause: string,
+		signal?: AbortSignal,
+	): Promise<boolean> {
+		const disable = this.#store.disableAuthCredentialRemote?.bind(this.#store);
+		if (!disable) return false;
+		const disabled = await disable(credentialId, disabledCause, signal);
+		if (!disabled) return false;
+		const entries = this.#getStoredCredentials(provider);
+		if (!entries.some(entry => entry.id === credentialId)) return true;
+		this.#setStoredCredentials(
+			provider,
+			entries.filter(entry => entry.id !== credentialId),
+		);
+		this.#clearSelectorsForRemovedCredential(provider, new Set([credentialId]), entries);
+		this.#resetProviderAssignments(provider);
+		this.#emitCredentialDisabled({ provider, disabledCause });
+		return true;
 	}
 
 	/** Clear every selector whose durable/in-memory target was just removed. */
@@ -5278,7 +5316,15 @@ export class AuthStorage {
 			this.#recordSessionCredential(provider, sessionId, "oauth", selection.index);
 			return { apiKey: result.apiKey, credential: updated };
 		} catch (error) {
-			const errorMsg = String(error);
+			// Auth-broker errors retain the sanitized upstream body separately from
+			// their transport message. Include that body for failure classification
+			// (the broker's 500 envelope otherwise hides `invalid_grant`) while
+			// preserving the original error object for callers and diagnostics.
+			const brokerBody =
+				error !== null && typeof error === "object" && "body" in error && typeof error.body === "string"
+					? error.body
+					: undefined;
+			const errorMsg = [String(error), brokerBody].filter((part): part is string => Boolean(part)).join(" ");
 			// Peer-rotation recovery runs before ANY failure classification: a
 			// concurrent process may have rotated the refresh token, which
 			// invalidates the snapshot token we just attempted. Re-read the row —
@@ -5374,7 +5420,34 @@ export class AuthStorage {
 							index: selection.index,
 							credentialId: attemptedCredentialId,
 						});
-						this.#disableCredentialById(provider, attemptedCredentialId, `oauth refresh failed: ${errorMsg}`);
+						const disabledCause = `oauth refresh failed: ${errorMsg}`;
+						if (this.#store.disableAuthCredentialRemote) {
+							try {
+								const disabled = await this.#disableCredentialRemotely(
+									provider,
+									attemptedCredentialId,
+									disabledCause,
+									options?.signal,
+								);
+								if (!disabled) {
+									await this.reload();
+									return this.#resolveOAuthSelection(provider, sessionId, options, reloadsUsed + 1);
+								}
+							} catch (disableError) {
+								// A failed broker mutation must not replace the provider's
+								// original authentication failure. We also deliberately do
+								// not remove the row locally: remote authority may still be
+								// active and can only be changed by its broker.
+								logger.warn("OAuth refresh remote disable failed", {
+									provider,
+									credentialId: attemptedCredentialId,
+									error: String(disableError),
+								});
+								throw error;
+							}
+						} else {
+							this.#disableCredentialById(provider, attemptedCredentialId, disabledCause);
+						}
 					} else {
 						logger.debug("OAuth refresh disable lost CAS; reloading after peer rotation", {
 							provider,

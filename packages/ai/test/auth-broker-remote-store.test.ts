@@ -12,6 +12,7 @@ import {
 	SqliteAuthCredentialStore,
 	startAuthBroker,
 } from "../src";
+import * as oauthUtils from "../src/utils/oauth";
 
 const ANTHROPIC_ENV = ["ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN"] as const;
 const savedEnv: Partial<Record<(typeof ANTHROPIC_ENV)[number], string | undefined>> = {};
@@ -194,6 +195,58 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 		expect(directFetchesAfterFailure).toBeGreaterThan(directFetchesBeforeFailure);
 		expect(remote.snapshot.credentials).toHaveLength(1);
 		expect(remote.snapshot.credentials[0]!.id).not.toBe(staleEntry.id);
+	});
+
+	test("disables a remotely-invalid OAuth row through the broker and falls back", async () => {
+		// Keep the revoked row first so the initial round-robin selection attempts
+		// it before the healthy sibling. The client only has a redacted refresh
+		// sentinel; the broker remains the sole mutation authority.
+		store!.saveOAuth("anthropic", mintOAuthCredential("fallback", Date.now() + 120_000));
+		await storage!.reload();
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		const initial = await client.fetchSnapshot();
+		if (initial.status !== 200) throw new Error("expected snapshot");
+		remote = new RemoteAuthCredentialStore({ client, initialSnapshot: initial.snapshot, streamSnapshots: false });
+		const clientStorage = new AuthStorage(remote, { rankingStrategyResolver: () => undefined });
+		await clientStorage.reload();
+		const disableSpy = vi.spyOn(client, "disableCredential");
+		const refreshSpy = vi.spyOn(oauthUtils, "refreshOAuthToken").mockImplementation(async (_provider, credential) => {
+			if (credential.refresh === "refresh-a") {
+				throw new Error('HTTP 400 invalid_grant {"error":"invalid_grant"}');
+			}
+			return {
+				...credential,
+				access: "access-fallback-rotated",
+				refresh: "refresh-fallback-rotated",
+				expires: Date.now() + 120_000,
+			};
+		});
+
+		try {
+			const apiKey = await clientStorage.getApiKey("anthropic");
+			expect(apiKey).toBe("access-fallback");
+			expect(disableSpy).toHaveBeenCalledTimes(1);
+			expect(disableSpy.mock.calls[0]?.[0]).toBe(initial.snapshot.credentials[0]?.id);
+			expect(disableSpy.mock.calls[0]?.[1]).toContain("invalid_grant");
+			expect(refreshSpy).toHaveBeenCalledTimes(2);
+
+			const active = store!.listAuthCredentials("anthropic");
+			expect(active).toHaveLength(1);
+			expect(active[0]?.credential).toMatchObject({ access: "access-fallback" });
+			const inventory = store!.listCredentialInventory("anthropic");
+			expect(inventory).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						id: initial.snapshot.credentials[0]?.id,
+						disabled: true,
+						disabledCause: expect.stringContaining("invalid_grant"),
+					}),
+				]),
+			);
+			expect(remote.snapshot.credentials).toHaveLength(1);
+		} finally {
+			clientStorage.close();
+		}
 	});
 
 	test("records aggregate usage only for the current snapshot generation", async () => {
