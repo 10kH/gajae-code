@@ -395,6 +395,43 @@ describe("runGjcGcCommand", () => {
 		expect(pruned).toBe(0);
 	});
 
+	test("preflights invalid explicit empty-delete roots before any adapter prune", async () => {
+		const missingRoot = path.join(perTestAgentDir, "missing-empty-delete-root");
+		let pruned = 0;
+		const adapter = fakeAdapter("harness_leases", [record("harness_leases")], async () => {
+			pruned += 1;
+			return { removed: true };
+		});
+		const result = await runGjcGcCommand(
+			["--prune", "--empty-delete-receipts", "--root", missingRoot, "--json"],
+			perTestAgentDir,
+			{},
+			[adapter],
+		);
+		expect(result.status).toBe(2);
+		expect(result.stderr).toContain(`${missingRoot}: missing_root`);
+		expect(result.stdout).toBe("");
+		expect(pruned).toBe(0);
+	});
+
+	test("valid explicit empty-delete roots preserve ordinary prune behavior", async () => {
+		const root = await fs.mkdtemp(path.join(perTestAgentDir, "valid-empty-delete-root-"));
+		let pruned = 0;
+		const adapter = fakeAdapter("harness_leases", [record("harness_leases")], async () => {
+			pruned += 1;
+			return { removed: true };
+		});
+		const result = await runGjcGcCommand(
+			["--prune", "--empty-delete-receipts", "--root", root, "--json"],
+			perTestAgentDir,
+			{},
+			[adapter],
+		);
+		expect(result.status).toBe(0);
+		expect(pruned).toBe(1);
+		expect(JSON.parse(result.stdout).empty_delete_receipts.roots).toEqual([root]);
+	});
+
 	test("includes healthy session-index diagnosis in ordinary JSON output", async () => {
 		const agentDir = await sessionIndexAgentDir();
 		await appendSessionIndexEvent(agentDir);

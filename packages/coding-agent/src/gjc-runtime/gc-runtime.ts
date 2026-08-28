@@ -441,6 +441,33 @@ function resolveGcAgentDir(env: NodeJS.ProcessEnv): string {
 }
 
 /**
+ * Validate operator-supplied empty-delete roots before any ordinary GC mutation.
+ *
+ * These roots are explicit operands, so a missing, symlink, non-directory, or
+ * unreadable root is a usage failure rather than a partial GC report. The
+ * collector repeats its own race-safe checks after this preflight.
+ */
+async function preflightEmptyDeleteRoot(root: string): Promise<void> {
+	const resolvedRoot = path.resolve(root);
+	let stat: Stats;
+	try {
+		stat = await fsp.lstat(resolvedRoot);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+			throw new GcUsageError(`${root}: missing_root`);
+		}
+		throw new GcUsageError(`${root}: ${error instanceof Error ? error.message : String(error)}`);
+	}
+	if (stat.isSymbolicLink()) throw new GcUsageError(`${root}: symlink_root`);
+	if (!stat.isDirectory()) throw new GcUsageError(`${root}: not_directory`);
+	try {
+		await fsp.readdir(resolvedRoot);
+	} catch (error) {
+		throw new GcUsageError(`${root}: ${error instanceof Error ? error.message : String(error)}`);
+	}
+}
+
+/**
  * Locate and measure the managed scope for `cwd`.
  *
  * Resolution is read-only (it never prepares or writes a scope), and any
@@ -543,6 +570,12 @@ export async function runGjcGcCommand(
 		}
 		if (emptyDeleteRoots.length === 0) {
 			return { stdout: "", stderr: "gjc gc: empty_delete_receipts_requires_root_or_manifest\n", status: 2 };
+		}
+		try {
+			for (const root of emptyDeleteRoots) await preflightEmptyDeleteRoot(root);
+		} catch (error) {
+			const message = error instanceof GcUsageError ? error.message : String(error);
+			return { stdout: "", stderr: `gjc gc: ${message}\n`, status: 2 };
 		}
 	}
 	const resolvedAdapters = adapters ?? (await defaultGcAdapters());

@@ -32,6 +32,9 @@ export interface ProjectionScanStat {
 	size: number | bigint;
 	dev?: number | bigint;
 	ino?: number | bigint;
+	nlink?: number | bigint;
+	mtimeNs?: number | bigint;
+	ctimeNs?: number | bigint;
 	isDirectory?(): boolean;
 	isFile(): boolean;
 	isSymbolicLink(): boolean;
@@ -40,9 +43,9 @@ export interface ProjectionScanStat {
 export interface ProjectionScanFs {
 	readdir(dir: string): Promise<string[]>;
 	lstat(file: string): Promise<ProjectionScanStat>;
-	readFile(file: string, encoding: "utf8"): Promise<string>;
+	readFile(file: string, encoding: "utf8", expected?: ProjectionScanStat): Promise<string>;
 	/** Optional descriptor-bound reader used by the production filesystem. */
-	readFileSafe?: (file: string, encoding: "utf8") => Promise<string>;
+	readFileSafe?: (file: string, encoding: "utf8", expected?: ProjectionScanStat) => Promise<string>;
 	/** Optional pinned directory authority used for enumeration and every child operation. */
 	openDirectory?: (dir: string) => Promise<ProjectionScanDirectory>;
 }
@@ -51,7 +54,7 @@ export interface ProjectionScanDirectory {
 	readonly stat: ProjectionScanStat;
 	readdir(): Promise<string[]>;
 	lstat(entry: string): Promise<ProjectionScanStat>;
-	readFile(entry: string, encoding: "utf8"): Promise<string>;
+	readFile(entry: string, encoding: "utf8", expected?: ProjectionScanStat): Promise<string>;
 	close(): Promise<void>;
 }
 
@@ -73,7 +76,28 @@ export interface ProjectionScanResult {
  * has neither flag, so the path is bracketed by lstat/fstat/lstat identity checks and the
  * bytes still come from the opened handle rather than the mutable pathname.
  */
-async function readProjectionFileSafe(file: string, encoding: "utf8"): Promise<string> {
+function sameProjectionFile(left: ProjectionScanStat, right: ProjectionScanStat): boolean {
+	if (!left.isFile() || !right.isFile()) return false;
+	if (
+		left.dev === undefined ||
+		right.dev === undefined ||
+		left.ino === undefined ||
+		right.ino === undefined ||
+		String(left.dev) !== String(right.dev) ||
+		String(left.ino) !== String(right.ino) ||
+		String(left.size) !== String(right.size)
+	)
+		return false;
+	if (left.nlink !== undefined && right.nlink !== undefined && String(left.nlink) !== String(right.nlink))
+		return false;
+	if (left.mtimeNs !== undefined && right.mtimeNs !== undefined && String(left.mtimeNs) !== String(right.mtimeNs))
+		return false;
+	if (left.ctimeNs !== undefined && right.ctimeNs !== undefined && String(left.ctimeNs) !== String(right.ctimeNs))
+		return false;
+	return true;
+}
+
+async function readProjectionFileSafe(file: string, encoding: "utf8", expected?: ProjectionScanStat): Promise<string> {
 	if (encoding !== "utf8") throw new TypeError("Coordinator projection reads require utf8.");
 	const noFollow = fs.constants.O_NOFOLLOW;
 	const nonBlock = fs.constants.O_NONBLOCK;
@@ -92,6 +116,8 @@ async function readProjectionFileSafe(file: string, encoding: "utf8"): Promise<s
 		handle = await fs.open(file, flags);
 		const opened = await handle.stat({ bigint: true });
 		if (!opened.isFile()) throw new ProjectionScanRaceError("candidate changed to a non-regular file");
+		if (expected && !sameProjectionFile(expected, opened))
+			throw new ProjectionScanRaceError("candidate changed while opening");
 		if (before) {
 			if (
 				before.dev !== opened.dev ||
@@ -178,8 +204,8 @@ async function openProjectionDirectorySafe(dir: string): Promise<ProjectionScanD
 				await assertRoot();
 				return stat;
 			},
-			readFile: async (entry, encoding) => {
-				const source = await readProjectionFileSafe(path.join(pinnedPath, entry), encoding);
+			readFile: async (entry, encoding, expected) => {
+				const source = await readProjectionFileSafe(path.join(pinnedPath, entry), encoding, expected);
 				await assertRoot();
 				return source;
 			},
@@ -280,7 +306,7 @@ async function scanCoordinatorJsonFiles(
 	let skippedDebris = 0;
 	let skippedEmpty = 0;
 	let raced = 0;
-	const parseCandidates: string[] = [];
+	const parseCandidates: Array<{ entry: string; stat: ProjectionScanStat }> = [];
 	for (const entry of entries) {
 		if (!entry.endsWith(".json") || isCoordinatorScanDebrisName(entry)) {
 			if (entry.endsWith(".json") && isCoordinatorScanDebrisName(entry)) skippedDebris += 1;
@@ -301,19 +327,20 @@ async function scanCoordinatorJsonFiles(
 			skippedEmpty += 1;
 			continue;
 		}
-		parseCandidates.push(entry);
+		parseCandidates.push({ entry, stat });
 	}
 
 	const capped = parseCandidates.length > cap;
 	const toParse = capped ? parseCandidates.slice(0, cap) : parseCandidates;
 	const values: unknown[] = [];
-	for (const entry of toParse) {
+	for (const candidate of toParse) {
+		const { entry, stat } = candidate;
 		const file = path.join(dir, entry);
 		let source: string;
 		try {
 			source = authority
-				? await authority.readFile(entry, "utf8")
-				: await (io.readFileSafe ?? io.readFile)(file, "utf8");
+				? await authority.readFile(entry, "utf8", stat)
+				: await (io.readFileSafe ?? io.readFile)(file, "utf8", stat);
 		} catch (error) {
 			if (
 				(error as NodeJS.ErrnoException).code === "ENOENT" ||

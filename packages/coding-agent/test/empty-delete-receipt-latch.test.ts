@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import type { BigIntStats, PathLike } from "node:fs";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -86,6 +87,43 @@ describe("empty .gjc-delete-* latch", () => {
 		expect(scan.incomplete).toBe(true);
 		expect(scan.capped).toBe(true);
 	});
+
+	it.skipIf(process.platform !== "linux")(
+		"Test 1 race: a valid replacement after enumeration is not parsed as the candidate",
+		async () => {
+			const dir = await tempRoot("gjc-scan-candidate-race-");
+			const candidate = path.join(dir, "candidate.json");
+			const replacement = path.join(dir, "candidate-replacement.tmp");
+			await fs.writeFile(candidate, JSON.stringify({ session_id: "source" }));
+			await fs.writeFile(replacement, JSON.stringify({ session_id: "target" }));
+			const realLstat = fs.lstat as unknown as (file: PathLike, options?: unknown) => Promise<BigIntStats>;
+			let replaced = false;
+			const lstatSpy = spyOn(fs, "lstat");
+			lstatSpy.mockImplementation((async (file: PathLike, options: unknown) => {
+				const stat = await realLstat(file, options);
+				if (
+					!replaced &&
+					String(file).startsWith("/proc/self/fd/") &&
+					path.basename(String(file)) === "candidate.json"
+				) {
+					replaced = true;
+					await fs.rename(replacement, candidate);
+				}
+				return stat;
+			}) as unknown as typeof fs.lstat);
+			try {
+				const scan = await listCoordinatorJsonFiles(dir);
+				expect(replaced).toBe(true);
+				expect(scan.values).toEqual([]);
+				expect(scan.parsed).toBe(0);
+				expect(scan.raced).toBe(1);
+				expect(scan.incomplete).toBe(true);
+				expect(scan.capped).toBe(true);
+			} finally {
+				lstatSpy.mockRestore();
+			}
+		},
+	);
 
 	it("Test 1 root race: replacement enumeration is incomplete without a foreign record", async () => {
 		const dir = await tempRoot("gjc-scan-root-race-");
