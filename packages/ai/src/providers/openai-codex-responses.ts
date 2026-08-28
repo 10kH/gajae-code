@@ -2643,6 +2643,7 @@ class CodexWebSocketConnection {
 		signal?: AbortSignal,
 		firstEventTimeoutMs?: number,
 		idleTimeoutMs = this.#idleTimeoutMs,
+		onStreamCreated?: () => void,
 	): AsyncGenerator<Record<string, unknown>> {
 		if (!this.#socket || this.#socket.readyState !== WebSocket.OPEN) {
 			throw createCodexWebSocketTransportError("websocket connection is unavailable");
@@ -2664,6 +2665,7 @@ class CodexWebSocketConnection {
 		}
 
 		try {
+			onStreamCreated?.();
 			this.#socket.send(JSON.stringify(request));
 			let sawFirstProgress = false;
 			const startedAt = Date.now();
@@ -2860,12 +2862,12 @@ async function openCodexWebSocketEventStream(
 	firstEventTimeoutMs?: number,
 ): Promise<AsyncGenerator<Record<string, unknown>>> {
 	const connection = await getOrCreateCodexWebSocketConnection(state, url, headers, signal, options);
-	options?.onStreamCreated?.();
 	return connection.streamRequest(
 		request,
 		signal,
 		firstEventTimeoutMs,
 		getCodexWebSocketIdleTimeoutMs(options?.streamIdleTimeoutMs),
+		options?.onStreamCreated,
 	);
 }
 
