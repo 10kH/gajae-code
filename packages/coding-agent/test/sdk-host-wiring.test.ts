@@ -89,26 +89,32 @@ import type {
 	ClientBridgePermissionOutcome,
 	ClientBridgePermissionToolCall,
 } from "../src/session/client-bridge";
-import { SessionManager } from "../src/session/session-manager";
 import { createSdkRunCapability, readSdkRunCapability } from "../src/session/sdk-run-capability";
+import { SessionManager } from "../src/session/session-manager";
 
 type CapturedSendUserMessage = (
 	content: Parameters<ExtensionActions["sendUserMessage"]>[0],
 	options?: NonNullable<Parameters<ExtensionActions["sendUserMessage"]>[1]> & { sdkRunCapability?: unknown },
-) => void | Promise<unknown>;
-type CapturedSendCall = [
-	Parameters<ExtensionActions["sendUserMessage"]>[0],
-	(NonNullable<Parameters<ExtensionActions["sendUserMessage"]>[1]> & { sdkRunCapability?: unknown })?,
-];
+) => void | Promise<void>;
+type InternalCapturedOptions = NonNullable<Parameters<ExtensionActions["sendUserMessage"]>[1]> & {
+	sdkRunCapability?: unknown;
+	sdkRunToken?: unknown;
+};
+type CapturedSendCall = [Parameters<ExtensionActions["sendUserMessage"]>[0], InternalCapturedOptions?];
 
-function captureInternalSend(sent: CapturedSendCall[], content: CapturedSendCall[0], options?: CapturedSendCall[1]): void {
-	if (options && "sdkRunToken" in options && typeof options.sdkRunToken === "string") {
-		const { sdkRunToken, ...publicOptions } = options as typeof options & { sdkRunToken: string };
+function captureInternalSend(
+	sent: CapturedSendCall[],
+	content: CapturedSendCall[0],
+	options?: InternalCapturedOptions,
+): void {
+	if (options && typeof options.sdkRunToken === "string") {
+		const { sdkRunToken, ...publicOptions } = options;
 		sent.push([content, { ...publicOptions, sdkRunCapability: createSdkRunCapability(sdkRunToken) }]);
 		return;
 	}
 	sent.push([content, options]);
 }
+
 import { getAskAnswerSource, registerAskAnswerSource } from "../src/tools/ask-answer-registry";
 import { startProductionSdkHost } from "./helpers/sdk-production-host";
 import { createOrchestrationNotificationsExtension } from "./helpers/telegram-topic-test";
