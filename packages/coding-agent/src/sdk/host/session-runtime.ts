@@ -1853,10 +1853,10 @@ function createControlSurface(
 	canResolveGate: () => boolean = () => true,
 	trackGateResolution: <T>(resolution: Promise<T>) => Promise<T> = async resolution => await resolution,
 ): ControlSurface {
-	const sendSdkUserMessage = api.sendUserMessage as (
+	const sendSdkUserMessage = (
 		content: Parameters<ExtensionAPI["sendUserMessage"]>[0],
 		options?: Record<string, unknown>,
-	) => Promise<void>;
+	): Promise<void> => api.sendUserMessage(content, options as never);
 	const surfacePolicy =
 		policy ?? createSdkSurfacePolicyForContext(ctx, hasSdkWorkflowGateCapability(ctx.workflowGate));
 	const typed = (operation: string, input: Record<string, unknown> = {}) =>

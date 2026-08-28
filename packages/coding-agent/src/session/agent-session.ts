@@ -6301,6 +6301,7 @@ export class AgentSession {
 						skipCompactionCheck: true,
 						resourceRunId: activePromptHandle,
 						maintenanceContinuation: true,
+						sdkRunToken: attemptScope ? this.#sdkRunTokensByAttemptScope.get(attemptScope) : undefined,
 					});
 				}
 				return;
@@ -13845,6 +13846,9 @@ export class AgentSession {
 						attribution: "user" as const,
 						timestamp: Date.now(),
 					};
+					const selectedSdkRunToken = selectedMessage
+						? this.#sdkRunTokensByQueuedMessage.get(selectedMessage)
+						: undefined;
 					const messageText =
 						message.role === "custom"
 							? this.#getCustomMessageTextContent(message)
@@ -13863,6 +13867,7 @@ export class AgentSession {
 						await this.#promptWithMessage(message, messageText, {
 							admissionLease: admission,
 							resetRetryReplaySafety: true,
+							sdkRunToken: selectedSdkRunToken,
 							onRunAccepted: () => {
 								runAccepted = true;
 								if (selected) this.#fireQueuedPromotionHooks([message], { startsOwnRun: true });

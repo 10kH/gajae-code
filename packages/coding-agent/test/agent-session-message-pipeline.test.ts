@@ -1041,13 +1041,16 @@ describe("AgentSession message pipeline", () => {
 		const sdkSubmission = session.sendUserMessage("sdk terminal fast path", {
 			sdkRunToken: "sdk-terminal-fast-path",
 		});
-		await new Promise<void>(resolve => {
-			const check = () => {
-				if (events.filter(event => event.type === "agent_end").length >= 2) resolve();
-				else setTimeout(check, 1);
-			};
-			check();
+		const secondAgentEnd = Promise.withResolvers<void>();
+		const unsubscribe = session.subscribe(event => {
+			if (event.type === "agent_end" && events.filter(candidate => candidate.type === "agent_end").length >= 2)
+				secondAgentEnd.resolve();
 		});
+		try {
+			await secondAgentEnd.promise;
+		} finally {
+			unsubscribe();
+		}
 		expect(integrationAborted).toBe(false);
 		await sdkSubmission;
 		await Bun.sleep(25);
