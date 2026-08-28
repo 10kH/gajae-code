@@ -239,10 +239,12 @@ describe("coordinator session state lock", () => {
 				SessionStateLockTestHooks.afterCurrentOwnerValidation = undefined;
 			};
 			await withSessionStateFileLock(stateFile, async () => {
+				if (process.platform !== "win32") {
 				for (const directory of [path.dirname(stateFile), path.dirname(path.dirname(stateFile))]) {
 					expect((await fs.stat(directory)).mode & 0o777).toBe(0o700);
 				}
-				expect((await fs.stat(`${stateFile}.lock`)).mode & 0o777).toBe(0o600);
+					expect((await fs.stat(`${stateFile}.lock`)).mode & 0o777).toBe(0o600);
+				}
 			});
 		} finally {
 			process.umask(previousUmask);
@@ -1625,7 +1627,7 @@ describe("coordinator session state lock", () => {
 		await expect(withSessionStateFileLock(aliasStateFile, async () => "recovered")).resolves.toBe("recovered");
 		expect(faulted).toBe(true);
 		expect(nativeTargets.length).toBeGreaterThan(0);
-		expect(nativeTargets.every(target => target === `${realStateFile}.lock.transition`)).toBe(true);
+		expect(nativeTargets.every(target => target === `${realStateFile}.lock.transition`), nativeTargets.join("\n")).toBe(true);
 	});
 
 	it("cleans a transition claim when setup generation lstat faults", async () => {
