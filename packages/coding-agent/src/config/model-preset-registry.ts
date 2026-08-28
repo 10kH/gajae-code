@@ -534,9 +534,18 @@ function registryPaths(agentDir: string) {
 	return {
 		root,
 		state: path.join(root, "state.json"),
+		backup: path.join(root, "state.backup.json"),
+		failure: path.join(root, "failure.json"),
 		control: path.join(root, "control.json"),
 		transaction: path.join(root, "transaction"),
 	};
+}
+
+type RegistryStatePaths = { state: string; backup: string };
+
+async function writeRegistryState(paths: RegistryStatePaths, state: RegistryState): Promise<void> {
+	await writeAtomicJson(paths.state, state);
+	await writeAtomicJson(paths.backup, state);
 }
 
 function safeError(error: unknown): string {
@@ -1699,6 +1708,8 @@ async function recordFailure(
 		paths.transaction,
 		async () => {
 			let state: RegistryState;
+			let stateReadable = true;
+			let stateRecoveredFromBackup = false;
 			let stateIsVerified = true;
 			let control: RegistryControl = { version: 1, disabled: false };
 			let controlIsValid = true;
@@ -1710,8 +1721,22 @@ async function recordFailure(
 			try {
 				state = loadStateSync(agentDir);
 			} catch {
-				state = { version: 1, history: [] };
+				try {
+					state = parseState(readJsonSync(paths.backup));
+					stateRecoveredFromBackup = true;
+				} catch {
+					state = { version: 1, history: [] };
+				}
+				stateReadable = false;
 				stateIsVerified = false;
+			}
+			if (!stateReadable && !stateRecoveredFromBackup) {
+				await writeAtomicJson(paths.failure, {
+					version: 1,
+					lastCheckedAt: now.toISOString(),
+					lastError: safeError(error),
+				});
+				return;
 			}
 			if (stateIsVerified) {
 				try {
@@ -1732,11 +1757,12 @@ async function recordFailure(
 					controlIsValid ? { ...control, pinnedRevision: undefined } : { version: 1, disabled: false },
 				);
 			}
-			await writeAtomicJson(paths.state, {
+			const failedState = {
 				...state,
 				lastCheckedAt: now.toISOString(),
 				lastError: safeError(error),
-			});
+			};
+			await writeRegistryState(paths, failedState);
 		},
 		{ retries: 20, retryDelayMs: 50, staleMs: 30_000 },
 	);
@@ -1894,7 +1920,7 @@ async function refreshModelPresetRegistryInner(
 						undefined,
 					);
 					if (!currentLatest) throw new Error("Registry returned 304 without a verified cached generation.");
-					await writeAtomicJson(paths.state, {
+					await writeRegistryState(paths, {
 						...currentState,
 						lastCheckedAt: now.toISOString(),
 						lastError: undefined,
@@ -2099,7 +2125,7 @@ async function refreshModelPresetRegistryInner(
 				const { nextState, retained } = candidate;
 				if (!stateIsVerified && control.pinnedRevision !== undefined)
 					await writeAtomicJson(paths.control, { ...control, pinnedRevision: undefined });
-				await writeAtomicJson(paths.state, nextState);
+				await writeRegistryState(paths, nextState);
 				return {
 					status: "updated",
 					revision: manifest.signed.registryRevision,
@@ -2152,7 +2178,7 @@ export async function setModelPresetRegistryPin(
 			if (generation.revoked) throw new Error(`Cannot pin revoked registry revision ${revision}.`);
 		}
 		const current = loadControlSync(agentDir);
-		await writeAtomicJson(paths.state, state);
+		await writeRegistryState(paths, state);
 		await writeAtomicJson(paths.control, { ...current, pinnedRevision: revision });
 	});
 	notifyRegistryChanges(agentDir);
@@ -2184,7 +2210,7 @@ export async function rollbackModelPresetRegistry(
 		const generation = state.history.find(item => item.manifest.signed.registryRevision === revision);
 		if (!generation) throw new Error(`Registry revision ${revision} is not in accepted history.`);
 		validateGeneration(generation, effectiveTrustedKeys(options));
-		await writeAtomicJson(paths.state, { ...state, activeRevision: revision, lastError: undefined });
+		await writeRegistryState(paths, { ...state, activeRevision: revision, lastError: undefined });
 		await writeAtomicJson(paths.control, { ...control, pinnedRevision: undefined });
 	});
 	notifyRegistryChanges(agentDir);
