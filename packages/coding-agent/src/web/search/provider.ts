@@ -395,12 +395,23 @@ export async function canUseGenericCredentials(
 	signal?: AbortSignal,
 ): Promise<boolean> {
 	if (!ctx) return false;
+	if (ctx.resolveCredentials) {
+		const resolved = await ctx.resolveCredentials({ sessionId, signal });
+		return Boolean(resolved.apiKey) || hasActiveCredentialHeader(resolved.headers);
+	}
 	const key = await authStorage.getApiKey(ctx.provider, sessionId, {
 		baseUrl: ctx.baseUrl,
 		modelId: ctx.modelId,
 		signal,
 	});
 	return Boolean(key);
+}
+
+function hasActiveCredentialHeader(headers: Record<string, string> | undefined): boolean {
+	return Object.keys(headers ?? {}).some(key => {
+		const normalized = key.toLowerCase();
+		return normalized === "authorization" || normalized === "x-api-key" || normalized === "x-goog-api-key";
+	});
 }
 
 /**
@@ -445,6 +456,13 @@ export async function resolveProviderChain(options: ResolveProviderChainOptions)
 		settings,
 	} = options;
 
+	// Resolve the active model before consulting the chain cache. The registry
+	// resolver refreshes rotating apiKeyEnv credentials and updates generated
+	// headers, which also advances AuthStorage's generation when credentials
+	// rotate or disappear.
+	if (preferredProvider === "auto" && activeModelContext?.resolveCredentials) {
+		await activeModelContext.resolveCredentials({ sessionId, signal });
+	}
 	const cacheKey = chainCacheKey(preferredProvider, fallbackProviders, activeModelContext, authStorage, settings);
 	const perStorage = chainCache.get(authStorage);
 	const now = Date.now();

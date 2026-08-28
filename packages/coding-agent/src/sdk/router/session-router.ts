@@ -24,6 +24,14 @@ import {
 } from "../session-activation";
 import { ACP_SESSION_RECONNECT, SESSION_REQUEST_TIMEOUT_MS } from "../session-reconnect";
 
+export interface SessionEndpointIdentity {
+	readonly mtimeMs: number;
+	readonly mtimeNs: bigint;
+	readonly ctimeNs: bigint;
+	readonly size: bigint;
+	readonly ino: bigint;
+}
+
 /**
  * Exact identity of one attached SDK session endpoint. Providers persist it next to
  * their conversation state and re-prove it before every resume, so it must be derived
@@ -37,11 +45,22 @@ export function sessionAttachmentAuthorityId(input: {
 	endpointMtimeMs: number | undefined;
 	url: string;
 	token: string;
+	/** Proven no-follow endpoint identity, when the caller has one. */
+	endpointIdentity?: SessionEndpointIdentity;
 }): string {
 	const endpointAuthorityDigest = crypto
 		.createHash("sha256")
 		.update(JSON.stringify({ url: input.url, token: input.token }))
 		.digest("hex");
+	const endpointIdentity = input.endpointIdentity
+		? {
+				mtimeMs: input.endpointIdentity.mtimeMs,
+				mtimeNs: input.endpointIdentity.mtimeNs.toString(),
+				ctimeNs: input.endpointIdentity.ctimeNs.toString(),
+				size: input.endpointIdentity.size.toString(),
+				ino: input.endpointIdentity.ino.toString(),
+			}
+		: undefined;
 	return crypto
 		.createHash("sha256")
 		.update(
@@ -51,6 +70,7 @@ export function sessionAttachmentAuthorityId(input: {
 				pid: input.pid,
 				endpointMtimeMs: input.endpointMtimeMs,
 				endpointAuthorityDigest,
+				endpointIdentity,
 			}),
 		)
 		.digest("hex");
@@ -292,6 +312,8 @@ type AttachedSession = {
 	readonly generation: number;
 	readonly pid: number;
 	readonly endpointMtimeMs: number;
+	/** No-follow endpoint identity proven before this attachment became current. */
+	readonly endpointIdentity: SessionEndpointIdentity;
 	readonly runEpoch: number;
 	readonly client: SessionRouterClient;
 	readonly indexed: IndexedSession;
@@ -403,9 +425,7 @@ function readSequence(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isSafeInteger(value) && value >= 1 ? value : undefined;
 }
 
-async function lstatEndpoint(
-	file: string,
-): Promise<{ mtimeMs: number; mtimeNs: bigint; ctimeNs: bigint; size: bigint; ino: bigint } | undefined> {
+async function lstatEndpoint(file: string): Promise<SessionEndpointIdentity | undefined> {
 	const stat = await fs.lstat(file).catch(() => undefined);
 	if (!stat || !stat.isFile()) return undefined;
 	const identity = await fs.lstat(file, { bigint: true }).catch(() => undefined);
@@ -424,6 +444,16 @@ async function lstatEndpoint(
 		size: identity.size,
 		ino: identity.ino,
 	};
+}
+
+function sameEndpointIdentity(expected: SessionEndpointIdentity, current: SessionEndpointIdentity): boolean {
+	return (
+		expected.mtimeMs === current.mtimeMs &&
+		expected.mtimeNs === current.mtimeNs &&
+		expected.ctimeNs === current.ctimeNs &&
+		expected.size === current.size &&
+		expected.ino === current.ino
+	);
 }
 
 function readFrameSequenceClaim(frame: Record<string, unknown>): {
@@ -550,12 +580,6 @@ export class SessionRouter {
 		{ generation: number; frames: Array<{ seq: number; frame: Record<string, unknown> }> }
 	>();
 	readonly #reviving = new Set<string>();
-	/**
-	 * Endpoint-file inode captured when each attachment was published (#4730
-	 * review). Maintenance renewal compares against this so a rename-replace that
-	 * preserves size, mtime and body cannot keep a superseded endpoint authorized.
-	 */
-	readonly #endpointInodes = new Map<string, bigint>();
 	readonly #notificationReceipts = new Map<string, NotificationCleanupReceipt>();
 	#stopTimer: (() => void) | undefined;
 	#reconcileTail: Promise<void> = Promise.resolve();
@@ -867,14 +891,15 @@ export class SessionRouter {
 		if (expectedAttachment !== undefined && attached.capability !== expectedAttachment)
 			throw new SessionRouterError("pre_send", "SDK session attachment changed before command dispatch.");
 		if (attached.initializingPublication) {
-			const endpoint = await this.#readEndpoint(attached.indexed);
+			const proven = await this.#readProvenEndpoint(attached.indexed);
 			if (
-				!endpoint ||
-				endpoint.url !== attached.endpoint.url ||
-				endpoint.token !== attached.endpoint.token ||
-				endpoint.pid !== attached.pid
+				!proven ||
+				proven.endpoint.url !== attached.endpoint.url ||
+				proven.endpoint.token !== attached.endpoint.token ||
+				proven.endpoint.pid !== attached.pid ||
+				!sameEndpointIdentity(attached.endpointIdentity, proven.identity)
 			) {
-				await this.#retireAttachment(attached, endpoint ? "replaced_same_generation" : undefined);
+				await this.#retireAttachment(attached, proven ? "replaced_same_generation" : undefined);
 				throw new SessionRouterError("pre_send", "SDK session attachment changed during publication.");
 			}
 		}
@@ -942,8 +967,15 @@ export class SessionRouter {
 		)
 			return undefined;
 		if (!Number.isSafeInteger(indexed.pid) || indexed.pid <= 0) return undefined;
-		const endpoint = await this.#readEndpoint(indexed).catch(() => null);
-		if (!endpoint || endpoint.stale === true || endpoint.pid !== indexed.pid || !endpoint.token) return undefined;
+		const proven = await this.#readProvenEndpoint(indexed).catch(() => null);
+		if (
+			!proven ||
+			proven.endpoint.stale === true ||
+			proven.endpoint.pid !== indexed.pid ||
+			!proven.endpoint.token ||
+			!sameEndpointIdentity(attached.endpointIdentity, proven.identity)
+		)
+			return undefined;
 		if (this.#sessions.get(sessionId) !== attached || !this.#attachmentPublished(attached)) return undefined;
 		return { sessionId, endpointGeneration: attached.generation };
 	}
@@ -1277,15 +1309,9 @@ export class SessionRouter {
 		// attachment was PUBLISHED against is therefore the identity, and the
 		// generation is compared so a re-registration reusing the same url/token/pid
 		// cannot keep the old attachment authorized.
-		const publishedIno = this.#endpointInodes.get(attached.id);
-		if (publishedIno === undefined) return false;
-		const statBefore = await fs.stat(attached.endpoint.path).catch(() => undefined);
-		const inoBefore = await fs
-			.stat(attached.endpoint.path, { bigint: true })
-			.then(value => value.ino)
-			.catch(() => undefined);
-		if (!statBefore || inoBefore === undefined || inoBefore !== publishedIno) return false;
-		if (statBefore.mtimeMs !== indexed.endpointMtimeMs) return false;
+		const identityBefore = await lstatEndpoint(attached.endpoint.path);
+		if (!identityBefore || !sameEndpointIdentity(attached.endpointIdentity, identityBefore)) return false;
+		if (identityBefore.mtimeMs !== indexed.endpointMtimeMs) return false;
 		let raw: Record<string, unknown>;
 		try {
 			const parsed = JSON.parse(await Bun.file(attached.endpoint.path).text());
@@ -1306,26 +1332,23 @@ export class SessionRouter {
 		// comes from the indexed row this attachment was published against.
 		if (indexed.endpointGeneration !== attached.generation) return false;
 		if (raw.endpointGeneration !== undefined && raw.endpointGeneration !== attached.generation) return false;
-		const statAfter = await fs.stat(attached.endpoint.path).catch(() => undefined);
-		const inoAfter = await fs
-			.stat(attached.endpoint.path, { bigint: true })
-			.then(value => value.ino)
-			.catch(() => undefined);
+		const identityAfter = await lstatEndpoint(attached.endpoint.path);
 		return (
-			statAfter !== undefined &&
-			inoAfter !== undefined &&
-			statAfter.mtimeMs === indexed.endpointMtimeMs &&
-			inoAfter === publishedIno
+			identityAfter !== undefined &&
+			identityAfter.mtimeMs === indexed.endpointMtimeMs &&
+			sameEndpointIdentity(attached.endpointIdentity, identityAfter)
 		);
 	}
 
 	/**
-	 * Returns the endpoint together with the inode this read PROVED (#4730
+	 * Returns the endpoint together with the full identity this read PROVED (#4730
 	 * review). The identity travels with the value instead of living in a side
 	 * map, so every consumer decision compares the same proof and the two cannot
 	 * drift apart.
 	 */
-	async #readProvenEndpoint(indexed: IndexedSession): Promise<{ endpoint: SdkSessionEndpoint; ino: bigint } | null> {
+	async #readProvenEndpoint(
+		indexed: IndexedSession,
+	): Promise<{ endpoint: SdkSessionEndpoint; identity: SessionEndpointIdentity } | null> {
 		if (!isSessionAuthorityEligible(indexed)) return null;
 		const repo = path.resolve(indexed.locator.repo);
 		const defaultStateRoot = path.join(repo, ".gjc", "state");
@@ -1352,7 +1375,7 @@ export class SessionRouter {
 		// Identity is proven INSIDE this authority read (#4730 review): sampling it
 		// afterwards would let an identical rename between the read and the sample
 		// install the replacement's inode as the trusted baseline.
-		const provenIno = endpointIdentity.ino;
+		const provenIdentity = endpointIdentity;
 		let raw: Record<string, unknown>;
 		try {
 			const parsed = JSON.parse(await Bun.file(endpoint.path).text());
@@ -1374,10 +1397,7 @@ export class SessionRouter {
 		if (
 			!endpointIdentityAfterRead ||
 			endpointIdentityAfterRead.mtimeMs !== indexed.endpointMtimeMs ||
-			endpointIdentityAfterRead.mtimeNs !== endpointIdentity.mtimeNs ||
-			endpointIdentityAfterRead.ctimeNs !== endpointIdentity.ctimeNs ||
-			endpointIdentityAfterRead.size !== endpointIdentity.size ||
-			endpointIdentityAfterRead.ino !== provenIno
+			!sameEndpointIdentity(endpointIdentity, endpointIdentityAfterRead)
 		)
 			return null;
 		await this.#index.refresh();
@@ -1385,7 +1405,7 @@ export class SessionRouter {
 		if (listing.warnings.length > 0) return null;
 		const current = listing.sessions.find(session => session.sessionId === indexed.sessionId);
 		if (!current || !sameIndexedAuthority(indexed, current)) return null;
-		return { endpoint, ino: provenIno };
+		return { endpoint, identity: provenIdentity };
 	}
 
 	/** Endpoint-only view for callers that do not make an authority decision. */
@@ -1480,14 +1500,14 @@ export class SessionRouter {
 		// authority read of its own, so it samples once here.
 		const proven = resolvedEndpoint === undefined ? await this.#readProvenEndpoint(indexed) : null;
 		const endpoint = resolvedEndpoint ?? proven?.endpoint ?? null;
-		let provenIno = proven?.ino;
-		if (resolvedEndpoint !== undefined) provenIno = (await lstatEndpoint(resolvedEndpoint.path))?.ino;
+		const endpointIdentity =
+			resolvedEndpoint === undefined ? proven?.identity : await lstatEndpoint(resolvedEndpoint.path);
 		const retirementAfterValidation = this.#retirements.get(indexed.sessionId);
 		if (retirementAfterValidation) await retirementAfterValidation;
 		if ((this.#retirementVersions.get(indexed.sessionId) ?? 0) !== retirementVersion)
 			return await this.#attachUnserialized(indexed, runEpoch, undefined, skipReplay, deferPublication, deferReplay);
 		if (!this.#running(runEpoch)) return false;
-		if (!endpoint) return false;
+		if (!endpoint || !endpointIdentity) return false;
 		const existing = this.#sessions.get(indexed.sessionId);
 		const resumable =
 			existing !== undefined &&
@@ -1495,7 +1515,9 @@ export class SessionRouter {
 			existing.endpoint.token === endpoint.token &&
 			existing.generation === indexed.endpointGeneration &&
 			existing.pid === indexed.pid &&
-			existing.endpointMtimeMs === indexed.endpointMtimeMs;
+			existing.endpointMtimeMs === indexed.endpointMtimeMs &&
+			endpointIdentity !== undefined &&
+			sameEndpointIdentity(existing.endpointIdentity, endpointIdentity);
 		if (existing && resumable && !existing.barrier.failed) {
 			this.#reviveTransport(existing);
 			return true;
@@ -1524,7 +1546,9 @@ export class SessionRouter {
 						(existing.endpoint.url !== endpoint.url ||
 							existing.endpoint.token !== endpoint.token ||
 							existing.pid !== indexed.pid ||
-							existing.endpointMtimeMs !== indexed.endpointMtimeMs)
+							existing.endpointMtimeMs !== indexed.endpointMtimeMs ||
+							endpointIdentity === undefined ||
+							!sameEndpointIdentity(existing.endpointIdentity, endpointIdentity))
 						? "replaced_same_generation"
 						: "replaced",
 				),
@@ -1559,6 +1583,7 @@ export class SessionRouter {
 				endpointMtimeMs: indexed.endpointMtimeMs,
 				url: endpoint.url,
 				token: endpoint.token,
+				endpointIdentity,
 			}),
 			sessionId: indexed.sessionId,
 			generation: indexed.endpointGeneration,
@@ -1570,14 +1595,15 @@ export class SessionRouter {
 				if (!attached || !this.#attachmentPublished(attached))
 					throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
 				if (attached.initializingPublication) {
-					const endpoint = await this.#readEndpoint(attached.indexed);
+					const proven = await this.#readProvenEndpoint(attached.indexed);
 					if (
-						!endpoint ||
-						endpoint.url !== attached.endpoint.url ||
-						endpoint.token !== attached.endpoint.token ||
-						endpoint.pid !== attached.pid
+						!proven ||
+						proven.endpoint.url !== attached.endpoint.url ||
+						proven.endpoint.token !== attached.endpoint.token ||
+						proven.endpoint.pid !== attached.pid ||
+						!sameEndpointIdentity(attached.endpointIdentity, proven.identity)
 					) {
-						await this.#retireAttachment(attached, endpoint ? "replaced_same_generation" : undefined);
+						await this.#retireAttachment(attached, proven ? "replaced_same_generation" : undefined);
 						throw new SessionRouterError("pre_send", "SDK session attachment changed during publication.");
 					}
 				} else await this.#serialReconcile(runEpoch, true, true);
@@ -1659,6 +1685,7 @@ export class SessionRouter {
 			endpoint,
 			pid: indexed.pid,
 			endpointMtimeMs: indexed.endpointMtimeMs,
+			endpointIdentity,
 			generation: indexed.endpointGeneration,
 			runEpoch,
 			client,
@@ -1682,10 +1709,6 @@ export class SessionRouter {
 						new SessionRouterError("pre_send", "SDK session publication was detached before completion."),
 					);
 				barrier.held = undefined;
-				// Every teardown path (retirement, replacement, stop, failed
-				// publication) routes through dispose(), so the published-inode entry
-				// is dropped here rather than at one call site (#4730 review).
-				if (attached) this.#endpointInodes.delete(attached.id);
 			},
 		};
 		// Re-check at publication (#4730 review): the endpoint must STILL be the
@@ -1699,11 +1722,9 @@ export class SessionRouter {
 			await client.close().catch(() => undefined);
 			return false;
 		};
-		if (provenIno === undefined) return await rollback();
-		const publishIno = (await lstatEndpoint(endpoint.path))?.ino;
-		if (publishIno === undefined || publishIno !== provenIno) return await rollback();
+		const publishIdentity = await lstatEndpoint(endpoint.path);
+		if (!publishIdentity || !sameEndpointIdentity(endpointIdentity, publishIdentity)) return await rollback();
 		this.#sessions.set(indexed.sessionId, attached);
-		this.#endpointInodes.set(attached.id, provenIno);
 		if (deferPublication)
 			this.#adopted.set(indexed.sessionId, {
 				generation: indexed.endpointGeneration,
@@ -1743,19 +1764,17 @@ export class SessionRouter {
 		if (!this.#attachmentLive(attached)) return false;
 		const proven = await this.#readProvenEndpoint(attached.indexed).catch(() => null);
 		if (!this.#attachmentLive(attached)) return false;
-		// The commit point compares the PROVEN inode alongside url/token/pid
+		// The commit point compares the PROVEN endpoint identity alongside url/token/pid
 		// (#4730 review): an identical-byte rename during the pre-publication
 		// hooks matches every other field, so identity is what rejects it. The
 		// value compared here is the one the authority read proved, not a later
 		// observation, so the proof and its consumer cannot drift apart.
-		const publishedIno = this.#endpointInodes.get(attached.id);
 		if (
 			!proven ||
 			proven.endpoint.url !== attached.endpoint.url ||
 			proven.endpoint.token !== attached.endpoint.token ||
 			proven.endpoint.pid !== attached.pid ||
-			publishedIno === undefined ||
-			proven.ino !== publishedIno
+			!sameEndpointIdentity(attached.endpointIdentity, proven.identity)
 		) {
 			await this.#retireAttachment(attached, proven ? "replaced_same_generation" : undefined);
 			return false;
@@ -1818,14 +1837,15 @@ export class SessionRouter {
 			.catch(() => undefined)
 			.then(async () => {
 				if (!this.#attachmentLive(attached)) return;
-				const endpoint = await this.#readEndpoint(attached.indexed);
+				const proven = await this.#readProvenEndpoint(attached.indexed);
 				if (
-					!endpoint ||
-					endpoint.url !== attached.endpoint.url ||
-					endpoint.token !== attached.endpoint.token ||
-					endpoint.pid !== attached.pid
+					!proven ||
+					proven.endpoint.url !== attached.endpoint.url ||
+					proven.endpoint.token !== attached.endpoint.token ||
+					proven.endpoint.pid !== attached.pid ||
+					!sameEndpointIdentity(attached.endpointIdentity, proven.identity)
 				) {
-					await this.#retireAttachment(attached, endpoint ? "replaced_same_generation" : undefined);
+					await this.#retireAttachment(attached, proven ? "replaced_same_generation" : undefined);
 					return;
 				}
 				attached.initializingPublication = true;

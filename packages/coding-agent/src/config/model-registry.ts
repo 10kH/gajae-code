@@ -4142,7 +4142,9 @@ export class ModelRegistry {
 		const existingMarker = (overrideHeaders as Record<string, string> & { [GENERATED_AUTH_HEADER]?: string })[
 			GENERATED_AUTH_HEADER
 		];
+		const managesAuth = override.authHeader !== undefined || override.apiKey !== undefined;
 		const canInject =
+			managesAuth &&
 			override.authHeader === true &&
 			Boolean(override.apiKey) &&
 			(headerValue(overrideHeaders, "Authorization") === undefined ||
@@ -4150,7 +4152,7 @@ export class ModelRegistry {
 		if (canInject) {
 			deleteHeaderCaseInsensitive(overrideHeaders, "Authorization");
 			delete overrideHeaders[GENERATED_AUTH_HEADER];
-		} else if (existingMarker !== undefined) {
+		} else if (managesAuth && existingMarker !== undefined) {
 			deleteAuthorizationValue(overrideHeaders, existingMarker);
 			delete overrideHeaders[GENERATED_AUTH_HEADER];
 		}
@@ -4210,7 +4212,13 @@ export class ModelRegistry {
 		return models.map(model => {
 			const override = this.#runtimeProviderOverrides.get(model.provider);
 			if (!override) return model;
-			return this.#applyRuntimeProviderOverride(model, override);
+			const runtimeCredentialRevoked =
+				this.#runtimeProviderApiKeys.has(model.provider) &&
+				!this.#runtimeProviderCredentialInstalled.has(model.provider);
+			return this.#applyRuntimeProviderOverride(
+				model,
+				runtimeCredentialRevoked ? { ...override, apiKey: undefined, authHeader: undefined } : override,
+			);
 		});
 	}
 	#finalizeModels(models: Model<Api>[]): Model<Api>[] {
@@ -4845,7 +4853,14 @@ export class ModelRegistry {
 	}
 
 	#synchronizeEnvironmentCredentials(): void {
+		// Runtime registrations own a provider while their credential is present.
+		// Refresh them first so a missing runtime env key can hand ownership back to
+		// the static config before the static apiKeyEnv pass runs.
+		for (const provider of this.#runtimeProviderApiKeyEnvNames.keys()) {
+			this.#refreshRotatingConfigApiKey(provider);
+		}
 		for (const [provider, envName] of this.#customProviderApiKeyEnvNames) {
+			if (this.#runtimeProviderCredentialInstalled.has(provider)) continue;
 			const resolved = $rotatingCredentialEnv(envName);
 			const installed = this.#customProviderApiKeys.get(provider);
 			if (resolved) {
@@ -4856,21 +4871,6 @@ export class ModelRegistry {
 			} else if (installed !== undefined) {
 				this.#customProviderApiKeys.delete(provider);
 				this.authStorage.removeConfigApiKey(provider);
-			}
-		}
-		for (const [provider, envName] of this.#runtimeProviderApiKeyEnvNames) {
-			const resolved = $rotatingCredentialEnv(envName);
-			const installed = this.#customProviderApiKeys.get(provider);
-			if (resolved) {
-				if (installed !== resolved) {
-					this.#customProviderApiKeys.set(provider, resolved);
-					this.authStorage.setConfigApiKey(provider, resolved);
-				}
-				this.#runtimeProviderCredentialInstalled.add(provider);
-			} else if (installed !== undefined) {
-				this.#customProviderApiKeys.delete(provider);
-				this.authStorage.removeConfigApiKey(provider);
-				this.#runtimeProviderCredentialInstalled.delete(provider);
 			}
 		}
 	}
@@ -5073,6 +5073,14 @@ export class ModelRegistry {
 			api: model.api,
 			baseUrl: model.baseUrl,
 			headers: model.headers,
+			resolveCredentials: async ({ sessionId, signal }) => {
+				// Resolve against the current registry model so rotating apiKeyEnv
+				// credentials and generated Authorization headers are synchronized
+				// immediately before native search sends its request.
+				const currentModel = this.find(model.provider, model.id) ?? model;
+				const apiKey = await this.getApiKey(currentModel, sessionId, { signal });
+				return { apiKey, headers: currentModel.headers };
+			},
 			webSearch: this.getProviderWebSearchMode(model.provider),
 		};
 	}
@@ -5229,8 +5237,13 @@ export class ModelRegistry {
 	}
 
 	#applyEffectiveAuthHeader(model: Model<Api>, apiKey: string | undefined): void {
-		const authHeader =
-			this.#runtimeProviderAuthHeaders.get(model.provider) ?? this.#customProviderAuthHeaders.get(model.provider);
+		const runtimeCredentialRevoked =
+			this.#runtimeProviderApiKeys.has(model.provider) &&
+			!this.#runtimeProviderCredentialInstalled.has(model.provider);
+		const authHeader = runtimeCredentialRevoked
+			? this.#customProviderAuthHeaders.get(model.provider)
+			: (this.#runtimeProviderAuthHeaders.get(model.provider) ??
+				this.#customProviderAuthHeaders.get(model.provider));
 		if (authHeader === true) this.#generatedAuthHeaderProviders.add(model.provider);
 		const headers = { ...(model.headers ?? {}) } as Record<string, string> & {
 			[GENERATED_AUTH_HEADER]?: string;

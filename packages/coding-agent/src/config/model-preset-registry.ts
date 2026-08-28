@@ -544,8 +544,11 @@ function registryPaths(agentDir: string) {
 type RegistryStatePaths = { state: string; backup: string };
 
 async function writeRegistryState(paths: RegistryStatePaths, state: RegistryState): Promise<void> {
-	await writeAtomicJson(paths.state, state);
+	// Publish the backup before replacing the primary. If the process stops in
+	// the replacement window, recovery can still combine the old primary's
+	// active intent with the newer backup's anti-rollback floor.
 	await writeAtomicJson(paths.backup, state);
+	await writeAtomicJson(paths.state, state);
 }
 
 function safeError(error: unknown): string {
@@ -994,22 +997,273 @@ function parseState(value: unknown): RegistryState {
 	return { ...state, version: 1, history, lastError };
 }
 
-function loadStateSync(agentDir: string): RegistryState {
-	const paths = registryPaths(agentDir);
-	const value = readJsonSync(paths.state);
-	if (value === undefined) {
-		const backup = readJsonSync(paths.backup);
-		return backup === undefined ? { version: 1, history: [] } : parseState(backup);
+type ParsedRegistryState = {
+	present: boolean;
+	state?: RegistryState;
+	error?: unknown;
+};
+
+type RegistryStateEvidence = {
+	state: RegistryState;
+	fullyVerified: boolean;
+	verifiedGenerations: AcceptedGeneration[];
+	allGenerationsVerified: boolean;
+	duplicateRevision: boolean;
+	maxUnverifiedRevision?: number;
+	activeRevision?: number;
+	floor?: { revision: number; manifestSha256: string };
+	unverifiedCheckpointRevision?: number;
+	resetShaped: boolean;
+};
+
+type RegistryStateRecovery = {
+	state: RegistryState;
+	stateIsVerified: boolean;
+	highestSeenRevision?: number;
+	highestSeenManifestSha256?: string;
+	hadInvalidCopy: boolean;
+	firstRun: boolean;
+};
+
+function readParsedStateSync(file: string): ParsedRegistryState {
+	try {
+		const value = readJsonSync(file);
+		if (value === undefined) return { present: false };
+		return { present: true, state: parseState(value) };
+	} catch (error) {
+		return { present: true, error };
 	}
-	const state = parseState(value);
-	if (state.history.length === 0 && state.highestSeenRevision === undefined) {
-		const backup = readJsonSync(paths.backup);
-		if (backup !== undefined) {
-			const recovered = parseState(backup);
-			if (recovered.history.length > 0 || recovered.highestSeenRevision !== undefined) return recovered;
+}
+
+function isResetShapedState(state: RegistryState): boolean {
+	return state.history.length === 0 && state.activeRevision === undefined && state.highestSeenRevision === undefined;
+}
+
+function verifyGenerationForRecovery(
+	generation: AcceptedGeneration,
+	trustedKeys: ReadonlyMap<string, ModelPresetRegistryTrustedKey>,
+): AcceptedGeneration | undefined {
+	try {
+		return validateGeneration(generation, trustedKeys);
+	} catch {
+		try {
+			const verified = validateGeneration(generation, trustedKeys, true);
+			return { ...verified, revoked: true };
+		} catch {
+			return undefined;
 		}
 	}
-	return state;
+}
+
+function verifyManifestCheckpointForRecovery(
+	generation: AcceptedGeneration,
+	trustedKeys: ReadonlyMap<string, ModelPresetRegistryTrustedKey>,
+): boolean {
+	try {
+		const manifest = ModelPresetRegistryManifestSchema.parse(generation.manifest);
+		assertSafeRegistryDocument(manifest);
+		verifyManifest(manifest, trustedKeys, true);
+		assertManifestBindings(manifest);
+		return sha256(canonicalModelPresetRegistryJson(manifest)) === generation.manifestSha256;
+	} catch {
+		return false;
+	}
+}
+
+function inspectStateEvidence(
+	parsed: ParsedRegistryState,
+	trustedKeys: ReadonlyMap<string, ModelPresetRegistryTrustedKey>,
+): RegistryStateEvidence | undefined {
+	if (!parsed.state) return undefined;
+	const state = parsed.state;
+	let fullyVerified = true;
+	try {
+		validateStateGenerations(state, trustedKeys);
+	} catch {
+		fullyVerified = false;
+	}
+	const verifiedGenerations = state.history
+		.map(generation => verifyGenerationForRecovery(generation, trustedKeys))
+		.filter((generation): generation is AcceptedGeneration => generation !== undefined);
+	const verifiedRevisionSet = new Set<number>();
+	let duplicateRevision = false;
+	for (const generation of state.history) {
+		const revision = generation.manifest.signed.registryRevision;
+		if (verifiedRevisionSet.has(revision)) duplicateRevision = true;
+		verifiedRevisionSet.add(revision);
+	}
+	const verifiedGenerationRevisions = new Set(
+		verifiedGenerations.map(generation => generation.manifest.signed.registryRevision),
+	);
+	const maxUnverifiedRevision = state.history
+		.map(generation => generation.manifest.signed.registryRevision)
+		.filter(revision => !verifiedGenerationRevisions.has(revision))
+		.sort((left, right) => right - left)[0];
+	const verifiedByRevision = new Map(
+		verifiedGenerations.map(generation => [generation.manifest.signed.registryRevision, generation]),
+	);
+	const activeGeneration =
+		state.activeRevision === undefined ? undefined : verifiedByRevision.get(state.activeRevision);
+	const activeRevision = activeGeneration && !activeGeneration.revoked ? state.activeRevision : undefined;
+	let floor: RegistryStateEvidence["floor"];
+	let unverifiedCheckpointRevision: number | undefined;
+	if (state.highestSeenRevision !== undefined && state.highestSeenManifestSha256 !== undefined) {
+		const checkpoint = verifiedByRevision.get(state.highestSeenRevision);
+		if (checkpoint?.manifestSha256 === state.highestSeenManifestSha256)
+			floor = { revision: state.highestSeenRevision, manifestSha256: state.highestSeenManifestSha256 };
+		else {
+			const checkpointCandidate = state.history.find(
+				generation => generation.manifest.signed.registryRevision === state.highestSeenRevision,
+			);
+			if (
+				checkpointCandidate?.manifestSha256 === state.highestSeenManifestSha256 &&
+				verifyManifestCheckpointForRecovery(checkpointCandidate, trustedKeys)
+			)
+				floor = { revision: state.highestSeenRevision, manifestSha256: state.highestSeenManifestSha256 };
+			else if (checkpointCandidate) unverifiedCheckpointRevision = state.highestSeenRevision;
+		}
+	}
+	for (const generation of verifiedGenerations) {
+		const revision = generation.manifest.signed.registryRevision;
+		if (!floor || revision > floor.revision) floor = { revision, manifestSha256: generation.manifestSha256 };
+	}
+	return {
+		state,
+		fullyVerified,
+		verifiedGenerations,
+		allGenerationsVerified: verifiedGenerations.length === state.history.length,
+		duplicateRevision,
+		maxUnverifiedRevision,
+		activeRevision,
+		floor,
+		unverifiedCheckpointRevision,
+		resetShaped: isResetShapedState(state),
+	};
+}
+
+function recoverStateCopiesSync(
+	agentDir: string,
+	trustedKeys: ReadonlyMap<string, ModelPresetRegistryTrustedKey>,
+	options: { allowInvalidPrimaryFallback?: boolean; allowUnreadablePrimaryFallback?: boolean } = {},
+): RegistryStateRecovery {
+	const paths = registryPaths(agentDir);
+	const primary = readParsedStateSync(paths.state);
+	const backup = readParsedStateSync(paths.backup);
+	if (!primary.present && !backup.present)
+		return { state: { version: 1, history: [] }, stateIsVerified: true, hadInvalidCopy: false, firstRun: true };
+	const primaryEvidence = inspectStateEvidence(primary, trustedKeys);
+	const backupEvidence = inspectStateEvidence(backup, trustedKeys);
+	if (primary.error !== undefined && !options.allowUnreadablePrimaryFallback)
+		throw new Error("Registry primary cache state is unreadable.");
+	if (
+		primaryEvidence &&
+		!primaryEvidence.resetShaped &&
+		(!primaryEvidence.allGenerationsVerified || primaryEvidence.duplicateRevision)
+	)
+		if (!options.allowInvalidPrimaryFallback || !backupEvidence?.fullyVerified) {
+			try {
+				validateStateGenerations(primaryEvidence.state, trustedKeys);
+			} catch (error) {
+				throw error;
+			}
+		}
+	if (
+		backupEvidence &&
+		(!backupEvidence.allGenerationsVerified || backupEvidence.duplicateRevision) &&
+		(!primaryEvidence?.fullyVerified || primaryEvidence.resetShaped)
+	)
+		throw new Error("Registry backup cache contains an unverifiable accepted generation.");
+	const evidences = [primaryEvidence, backupEvidence].filter(
+		(evidence): evidence is RegistryStateEvidence => evidence !== undefined,
+	);
+	const byRevision = new Map<number, AcceptedGeneration>();
+	for (const evidence of evidences) {
+		for (const generation of evidence.verifiedGenerations) {
+			const revision = generation.manifest.signed.registryRevision;
+			const existing = byRevision.get(revision);
+			if (existing && existing.manifestSha256 !== generation.manifestSha256)
+				throw new Error(`Registry cache contains conflicting verified revision ${revision}.`);
+			if (!existing || (generation.revoked && !existing.revoked)) byRevision.set(revision, generation);
+		}
+	}
+	const floors = evidences.flatMap(evidence => (evidence.floor ? [evidence.floor] : []));
+	const floor = floors.sort((left, right) => right.revision - left.revision)[0];
+	if (
+		primaryEvidence?.unverifiedCheckpointRevision !== undefined &&
+		(primaryEvidence.unverifiedCheckpointRevision > (floor?.revision ?? 0) || floor === undefined)
+	)
+		throw new Error("Registry primary cache anti-rollback checkpoint is unverifiable.");
+	if (
+		primaryEvidence?.maxUnverifiedRevision !== undefined &&
+		(primaryEvidence.maxUnverifiedRevision > (floor?.revision ?? 0) || floor === undefined)
+	)
+		throw new Error("Registry primary cache contains a revision without a verified checkpoint.");
+	const primaryUsable =
+		primaryEvidence !== undefined &&
+		(!primaryEvidence.resetShaped
+			? backupEvidence === undefined || primaryEvidence.fullyVerified
+			: backupEvidence === undefined);
+	const preferred = primaryUsable
+		? primaryEvidence
+		: options.allowInvalidPrimaryFallback && backupEvidence?.fullyVerified
+			? backupEvidence
+			: primaryEvidence && primary.error === undefined
+				? primaryEvidence
+				: (backupEvidence ?? primaryEvidence);
+	const activeRevision =
+		preferred?.activeRevision !== undefined && byRevision.has(preferred.activeRevision)
+			? preferred.activeRevision
+			: undefined;
+	const history = [...byRevision.values()].sort(
+		(left, right) => right.manifest.signed.registryRevision - left.manifest.signed.registryRevision,
+	);
+	const hadInvalidCopy =
+		(primary.present && (primary.error !== undefined || primaryEvidence?.fullyVerified !== true)) ||
+		(backup.present && (backup.error !== undefined || backupEvidence?.fullyVerified !== true));
+	const firstRun =
+		!hadInvalidCopy &&
+		evidences.length > 0 &&
+		evidences.every(evidence => evidence.resetShaped) &&
+		floor === undefined;
+	if (floor === undefined && !firstRun)
+		throw new Error("Registry cache anti-rollback checkpoint cannot be reconstructed.");
+	const recovered: RegistryState = {
+		...(preferred?.state ?? {}),
+		version: 1,
+		activeRevision,
+		highestSeenRevision: floor?.revision,
+		highestSeenManifestSha256: floor?.manifestSha256,
+		history,
+		lastCheckedAt: preferred?.state.lastCheckedAt,
+		lastError: preferred?.state.lastError,
+	};
+	try {
+		validateStateGenerations(recovered, trustedKeys);
+	} catch (error) {
+		if (!preferred?.fullyVerified) throw error;
+		if (
+			preferred.state.highestSeenRevision !== undefined &&
+			floor !== undefined &&
+			preferred.state.highestSeenRevision >= floor.revision
+		)
+			return {
+				state: preferred.state,
+				stateIsVerified: true,
+				highestSeenRevision: preferred.state.highestSeenRevision,
+				highestSeenManifestSha256: preferred.state.highestSeenManifestSha256,
+				hadInvalidCopy,
+				firstRun: false,
+			};
+		throw error;
+	}
+	return {
+		state: recovered,
+		stateIsVerified: true,
+		highestSeenRevision: floor?.revision,
+		highestSeenManifestSha256: floor?.manifestSha256,
+		hadInvalidCopy,
+		firstRun,
+	};
 }
 
 function loadControlSync(agentDir: string): RegistryControl {
@@ -1026,24 +1280,6 @@ function loadControlSync(agentDir: string): RegistryControl {
 	)
 		throw new Error("Registry pin is invalid.");
 	return { version: 1, disabled: control.disabled, pinnedRevision: control.pinnedRevision };
-}
-
-async function loadStateBun(agentDir: string): Promise<RegistryState> {
-	const paths = registryPaths(agentDir);
-	const value = await readJsonBun(paths.state);
-	if (value === undefined) {
-		const backup = await readJsonBun(paths.backup);
-		return backup === undefined ? { version: 1, history: [] } : parseState(backup);
-	}
-	const state = parseState(value);
-	if (state.history.length === 0 && state.highestSeenRevision === undefined) {
-		const backup = await readJsonBun(paths.backup);
-		if (backup !== undefined) {
-			const recovered = parseState(backup);
-			if (recovered.history.length > 0 || recovered.highestSeenRevision !== undefined) return recovered;
-		}
-	}
-	return state;
 }
 
 async function loadControlBun(agentDir: string): Promise<RegistryControl> {
@@ -1289,7 +1525,8 @@ export function loadAcceptedModelPresetRegistry(
 			pinnedRevision: control.pinnedRevision,
 		};
 	try {
-		return acceptedRegistryFromState(agentDir, dependencies, control, loadStateSync(agentDir));
+		const recovery = recoverStateCopiesSync(agentDir, effectiveTrustedKeys(dependencies, agentDir));
+		return acceptedRegistryFromState(agentDir, dependencies, control, recovery.state);
 	} catch (error) {
 		return {
 			profiles: new Map(),
@@ -1348,7 +1585,8 @@ export async function loadAcceptedModelPresetRegistryAsync(
 			pinnedRevision: control.pinnedRevision,
 		};
 	try {
-		return acceptedRegistryFromState(agentDir, dependencies, control, await loadStateBun(agentDir));
+		const recovery = recoverStateCopiesSync(agentDir, effectiveTrustedKeys(dependencies, agentDir));
+		return acceptedRegistryFromState(agentDir, dependencies, control, recovery.state);
 	} catch (error) {
 		return {
 			profiles: new Map(),
@@ -1723,6 +1961,51 @@ function recoverStateForRead(
 	}
 }
 
+function preserveRawStateFloor(state: RegistryState, copies: readonly ParsedRegistryState[]): RegistryState {
+	const rawFloors = copies
+		.map(copy => copy.state)
+		.filter(
+			(candidate): candidate is RegistryState =>
+				candidate !== undefined && candidate.highestSeenRevision !== undefined,
+		)
+		.sort((left, right) => (right.highestSeenRevision ?? 0) - (left.highestSeenRevision ?? 0));
+	const rawFloor = rawFloors[0];
+	if (
+		rawFloor?.highestSeenRevision !== undefined &&
+		(rawFloor.highestSeenRevision > (state.highestSeenRevision ?? 0) || state.highestSeenRevision === undefined)
+	)
+		return {
+			...state,
+			highestSeenRevision: rawFloor.highestSeenRevision,
+			highestSeenManifestSha256: rawFloor.highestSeenManifestSha256,
+		};
+	return state;
+}
+
+async function writeFailureDiagnostic(
+	paths: ReturnType<typeof registryPaths>,
+	error: unknown,
+	now: Date,
+): Promise<void> {
+	await writeAtomicJson(paths.failure, {
+		version: 1,
+		lastCheckedAt: now.toISOString(),
+		lastError: safeError(error),
+	});
+}
+
+function readFailureDiagnostic(agentDir: string): string | undefined {
+	try {
+		const value = readJsonSync(registryPaths(agentDir).failure);
+		if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+		const diagnostic = value as { version?: unknown; lastError?: unknown };
+		if (diagnostic.version !== 1 || typeof diagnostic.lastError !== "string") return undefined;
+		return safeError(diagnostic.lastError);
+	} catch {
+		return undefined;
+	}
+}
+
 async function recordFailure(
 	agentDir: string,
 	error: unknown,
@@ -1733,10 +2016,6 @@ async function recordFailure(
 	await withFileLock(
 		paths.transaction,
 		async () => {
-			let state: RegistryState;
-			let stateReadable = true;
-			let stateRecoveredFromBackup = false;
-			let stateIsVerified = true;
 			let control: RegistryControl = { version: 1, disabled: false };
 			let controlIsValid = true;
 			try {
@@ -1744,39 +2023,63 @@ async function recordFailure(
 			} catch {
 				controlIsValid = false;
 			}
-			try {
-				state = loadStateSync(agentDir);
-			} catch {
-				try {
-					state = parseState(readJsonSync(paths.backup));
-					stateRecoveredFromBackup = true;
-				} catch {
-					state = { version: 1, history: [] };
-				}
-				stateReadable = false;
-				stateIsVerified = false;
-			}
-			if (!stateReadable && !stateRecoveredFromBackup) {
-				await writeAtomicJson(paths.failure, {
-					version: 1,
-					lastCheckedAt: now.toISOString(),
-					lastError: safeError(error),
-				});
+			const copies = [readParsedStateSync(paths.state), readParsedStateSync(paths.backup)];
+			if (!copies.some(copy => copy.present)) {
+				await writeFailureDiagnostic(paths, error, now);
 				return;
 			}
-			if (stateIsVerified) {
-				try {
-					validateStateGenerations(state, trustedKeys);
-				} catch {
-					state = recoveryStateFromGeneration(
-						recoverLatestVerifiedGeneration(state, trustedKeys),
-						recoverRevokedGenerations(state, trustedKeys),
-						state,
-					);
-					stateIsVerified = false;
+			let recovery: RegistryStateRecovery | undefined;
+			try {
+				recovery = recoverStateCopiesSync(agentDir, trustedKeys, {
+					allowInvalidPrimaryFallback: true,
+					allowUnreadablePrimaryFallback: true,
+				});
+			} catch {
+				// Never replace a copy that could not be independently read. Keep the
+				// failure diagnostic separate so a later refresh remains fail-closed.
+				if (copies.some(copy => copy.error !== undefined)) {
+					await writeFailureDiagnostic(paths, error, now);
+					return;
+				}
+				const backupEvidence = inspectStateEvidence(copies[1], trustedKeys);
+				if (backupEvidence?.fullyVerified) {
+					recovery = {
+						state: backupEvidence.state,
+						stateIsVerified: true,
+						highestSeenRevision: backupEvidence.floor?.revision,
+						highestSeenManifestSha256: backupEvidence.floor?.manifestSha256,
+						hadInvalidCopy: true,
+						firstRun: false,
+					};
 				}
 			}
-			if (!stateIsVerified || !controlIsValid) {
+			if (!recovery) {
+				const primaryEvidence = inspectStateEvidence(copies[0], trustedKeys);
+				if (primaryEvidence && (!primaryEvidence.allGenerationsVerified || primaryEvidence.duplicateRevision)) {
+					await writeFailureDiagnostic(paths, error, now);
+					return;
+				}
+			}
+			const backupEvidence = inspectStateEvidence(copies[1], trustedKeys);
+			if (recovery?.hadInvalidCopy && backupEvidence?.fullyVerified) {
+				recovery = {
+					...recovery,
+					state: backupEvidence.state,
+					highestSeenRevision: backupEvidence.floor?.revision,
+					highestSeenManifestSha256: backupEvidence.floor?.manifestSha256,
+				};
+			}
+			let state = recovery?.state ?? copies.find(copy => copy.state)?.state;
+			if (!state) {
+				await writeFailureDiagnostic(paths, error, now);
+				return;
+			}
+			if (recovery?.firstRun) {
+				await writeFailureDiagnostic(paths, error, now);
+				return;
+			}
+			state = preserveRawStateFloor(state, copies);
+			if (recovery?.hadInvalidCopy || !controlIsValid || !recovery) {
 				// An unreadable control file cannot safely preserve a stale pin or disablement.
 				await writeAtomicJson(
 					paths.control,
@@ -1872,30 +2175,14 @@ async function refreshModelPresetRegistryInner(
 				let control = loadControlSync(agentDir);
 				if (control.disabled || environmentDisabled())
 					return { status: "disabled", revision: control.pinnedRevision };
-				const state = loadStateSync(agentDir);
 				const trustedKeys = effectiveTrustedKeys(dependencies);
-				let stateIsVerified = true;
-				let recoveryGeneration: AcceptedGeneration | undefined;
-				let recoveredState: RegistryState | undefined;
-				try {
-					validateStateGenerations(state, trustedKeys);
-				} catch {
-					stateIsVerified = false;
-					recoveryGeneration = recoverLatestVerifiedGeneration(state, trustedKeys);
-					if (
-						state.history.some(
-							generation => trustedKeys.get(generation.manifest.signature.keyId)?.revokedAt !== undefined,
-						)
-					)
-						recoveredState = recoveryStateFromGeneration(
-							recoveryGeneration,
-							recoverRevokedGenerations(state, trustedKeys),
-							state,
-						);
-				}
-				const usableState: RegistryState = stateIsVerified
-					? state
-					: (recoveredState ?? { ...state, activeRevision: undefined, history: [] });
+				const stateRecovery = recoverStateCopiesSync(agentDir, trustedKeys, {
+					allowInvalidPrimaryFallback: true,
+					allowUnreadablePrimaryFallback: true,
+				});
+				const state = stateRecovery.state;
+				const stateIsVerified = stateRecovery.stateIsVerified;
+				const usableState: RegistryState = state;
 				const controlPinnedGeneration =
 					control.pinnedRevision === undefined
 						? undefined
@@ -1907,15 +2194,10 @@ async function refreshModelPresetRegistryInner(
 					control = { ...control, pinnedRevision: undefined };
 					await writeAtomicJson(paths.control, control);
 				}
-				const effectivePinnedRevision = stateIsVerified ? control.pinnedRevision : usableState.activeRevision;
-				const trustedHighestSeenRevision = stateIsVerified
-					? state.highestSeenRevision
-					: (recoveredState?.highestSeenRevision ?? recoveryGeneration?.manifest.signed.registryRevision);
-				const trustedHighestSeenManifestSha256 = stateIsVerified
-					? state.highestSeenManifestSha256
-					: (recoveredState?.highestSeenManifestSha256 ?? recoveryGeneration?.manifestSha256);
-				if (!stateIsVerified && trustedHighestSeenRevision === undefined)
-					throw new Error("Registry cache anti-rollback checkpoint cannot be reconstructed.");
+				const effectivePinnedRevision =
+					stateIsVerified && !stateRecovery.hadInvalidCopy ? control.pinnedRevision : undefined;
+				const trustedHighestSeenRevision = stateRecovery.highestSeenRevision;
+				const trustedHighestSeenManifestSha256 = stateRecovery.highestSeenManifestSha256;
 				const latest = usableState.history.reduce<AcceptedGeneration | undefined>(
 					(current, item) =>
 						item.revoked ||
@@ -1933,10 +2215,10 @@ async function refreshModelPresetRegistryInner(
 					latest?.etag && latest.manifestUrl === manifestUrl.href ? { "If-None-Match": latest.etag } : {},
 				);
 				if (manifestResponse.response.status === 304) {
-					const currentState = recoverStateForRead(
-						loadStateSync(agentDir),
-						effectiveTrustedKeys(dependencies, agentDir),
-					);
+					const currentState = recoverStateCopiesSync(agentDir, effectiveTrustedKeys(dependencies, agentDir), {
+						allowInvalidPrimaryFallback: true,
+						allowUnreadablePrimaryFallback: true,
+					}).state;
 					const currentLatest = currentState.history.reduce<AcceptedGeneration | undefined>(
 						(current, item) =>
 							item.revoked ||
@@ -2149,7 +2431,7 @@ async function refreshModelPresetRegistryInner(
 				if (serializedJsonByteLength(candidate.nextState) > maxStateBytes)
 					throw new Error("Registry cache state exceeds its durable size limit.");
 				const { nextState, retained } = candidate;
-				if (!stateIsVerified && control.pinnedRevision !== undefined)
+				if (stateRecovery.hadInvalidCopy && control.pinnedRevision !== undefined)
 					await writeAtomicJson(paths.control, { ...control, pinnedRevision: undefined });
 				await writeRegistryState(paths, nextState);
 				return {
@@ -2190,7 +2472,7 @@ export async function setModelPresetRegistryPin(
 	const agentDir = effectiveAgentDir(options);
 	const paths = registryPaths(agentDir);
 	await withFileLock(paths.transaction, async () => {
-		let state = recoverStateForRead(loadStateSync(agentDir), effectiveTrustedKeys(options));
+		let state = recoverStateCopiesSync(agentDir, effectiveTrustedKeys(options)).state;
 		if (revision === undefined) {
 			const highest = state.history.reduce(
 				(value, item) => (item.revoked ? value : Math.max(value, item.manifest.signed.registryRevision)),
@@ -2216,7 +2498,7 @@ export async function rollbackModelPresetRegistry(
 	const agentDir = effectiveAgentDir(options);
 	const paths = registryPaths(agentDir);
 	await withFileLock(paths.transaction, async () => {
-		const state = recoverStateForRead(loadStateSync(agentDir), effectiveTrustedKeys(options));
+		const state = recoverStateCopiesSync(agentDir, effectiveTrustedKeys(options)).state;
 		const control = loadControlSync(agentDir);
 		const pinnedGeneration =
 			control.pinnedRevision === undefined
@@ -2262,11 +2544,13 @@ export function getModelPresetRegistryStatus(
 	let state: RegistryState = { version: 1, history: [] };
 	let cacheHealth: ModelPresetRegistryStatus["cacheHealth"] = "empty";
 	let loadError: string | undefined;
+	let failureDiagnostic: string | undefined;
 	try {
 		control = loadControlSync(agentDir);
-		state = loadStateSync(agentDir);
-		state = recoverStateForRead(state, effectiveTrustedKeys(dependencies, agentDir));
+		state = recoverStateCopiesSync(agentDir, effectiveTrustedKeys(dependencies, agentDir)).state;
 		cacheHealth = state.history.length > 0 ? "valid" : "empty";
+		if (state.history.length === 0 && state.lastError === undefined)
+			failureDiagnostic = readFailureDiagnostic(agentDir);
 	} catch (error) {
 		cacheHealth = "corrupt";
 		state = { version: 1, history: [] };
@@ -2310,7 +2594,7 @@ export function getModelPresetRegistryStatus(
 		acceptedAt: valid?.acceptedAt,
 		publishedAt: valid?.manifest.signed.publishedAt,
 		lastCheckedAt: state.lastCheckedAt,
-		lastError: loadError ?? state.lastError,
+		lastError: loadError ?? state.lastError ?? failureDiagnostic,
 		disabled,
 		pinnedRevision: staleControlPin ? undefined : control.pinnedRevision,
 		retainedProfiles: valid?.retainedProfiles.map(profile => profile.id) ?? [],

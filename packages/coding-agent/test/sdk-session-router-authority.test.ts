@@ -1562,8 +1562,7 @@ describe("SessionRouter dispatch authority", () => {
 			await fixture.router.start();
 			expect(fixture.clients).toHaveLength(1);
 			expect(readyCount).toBe(0);
-			expect(fixture.attachments).toHaveLength(1);
-			expect(fixture.attachments[0]?.isCurrent()).toBe(false);
+			expect(fixture.attachments).toHaveLength(0);
 			expect(fixture.clients[0]?.requests).toEqual([]);
 			expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
 		} finally {
@@ -2571,6 +2570,60 @@ describe("SessionRouter dispatch authority", () => {
 			expect(sent).toHaveLength(1);
 		} finally {
 			await router.stop();
+		}
+	});
+	test("sendMaintenance fails closed when the endpoint is substituted with a symlink", async () => {
+		const fixture = await routerFixture();
+		const attachment = fixture.router.attachment(fixture.sessionId);
+		const sent = fixture.clients[0]?.sent;
+		expect(attachment?.isCurrent()).toBe(true);
+		const originalPath = `${fixture.endpointFile}.original`;
+		fs.renameSync(fixture.endpointFile, originalPath);
+		fs.symlinkSync(originalPath, fixture.endpointFile);
+		try {
+			await expect(attachment!.sendMaintenance?.("lease-after-symlink")).rejects.toThrow(
+				/endpoint authority changed/i,
+			);
+			expect(sent).toHaveLength(0);
+			expect(attachment!.isCurrent()).toBe(true);
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+	test("retires and recreates a same-generation attachment after an identical-byte inode replacement", async () => {
+		const reasons: Array<"removed" | "replaced" | "replaced_same_generation" | undefined> = [];
+		const fixture = await routerFixture({
+			start: false,
+			onSessionRemoved: (_attachment, reason) => {
+				reasons.push(reason);
+			},
+		});
+		const preservedTimestamp = new Date(1_700_000_000_000);
+		fs.utimesSync(fixture.endpointFile, preservedTimestamp, preservedTimestamp);
+		fixture.authority.endpointMtimeMs = fs.statSync(fixture.endpointFile).mtimeMs;
+		try {
+			await fixture.router.start();
+			const predecessor = fixture.router.attachment(fixture.sessionId)!;
+			const originalIno = fs.lstatSync(fixture.endpointFile).ino;
+			const staging = `${fixture.endpointFile}.same-byte.tmp`;
+			fs.writeFileSync(staging, fs.readFileSync(fixture.endpointFile));
+			fs.renameSync(staging, fixture.endpointFile);
+			fs.utimesSync(fixture.endpointFile, preservedTimestamp, preservedTimestamp);
+			const replacement = fs.lstatSync(fixture.endpointFile);
+			expect(replacement.ino).not.toBe(originalIno);
+			expect(replacement.mtimeMs).toBe(fixture.authority.endpointMtimeMs);
+
+			await fixture.router.reconcile();
+			const successor = fixture.router.attachment(fixture.sessionId);
+			expect(predecessor.isCurrent()).toBe(false);
+			expect(successor).not.toBeNull();
+			expect(successor).not.toBe(predecessor);
+			expect(successor?.isCurrent()).toBe(true);
+			expect(successor?.authorityId).not.toBe(predecessor.authorityId);
+			await waitFor(() => reasons.length > 0, "same-generation predecessor was not retired");
+			expect(reasons).toContain("replaced_same_generation");
+		} finally {
+			await fixture.router.stop();
 		}
 	});
 	test("idle sweep retires an attachment whose row goes dead or stale (#4689 review)", async () => {

@@ -1305,6 +1305,85 @@ describe("signed model preset registry", () => {
 		expect(recoveredState.history).toEqual([]);
 	});
 
+	test("recovers the backup floor when the primary state is missing", async () => {
+		const data = await fixture();
+		await accept(data, signedRegistry(data.privateKey, 1));
+		await accept(data, signedRegistry(data.privateKey, 2));
+		await fs.rm(path.join(data.agentDir, "model-presets", "state.json"));
+		await expect(accept(data, signedRegistry(data.privateKey, 1))).rejects.toThrow(/downgrade/i);
+		expect(getModelPresetRegistryStatus({ agentDir: data.agentDir })).toMatchObject({
+			activeRevision: 2,
+			highestSeenRevision: 2,
+		});
+	});
+
+	test("recovers the backup floor when the primary state is reset-shaped", async () => {
+		const data = await fixture();
+		await accept(data, signedRegistry(data.privateKey, 1));
+		await accept(data, signedRegistry(data.privateKey, 2));
+		await Bun.write(path.join(data.agentDir, "model-presets", "state.json"), '{"version":1,"history":[]}');
+		await expect(accept(data, signedRegistry(data.privateKey, 1))).rejects.toThrow(/downgrade/i);
+		expect(getModelPresetRegistryStatus({ agentDir: data.agentDir })).toMatchObject({
+			activeRevision: 2,
+			highestSeenRevision: 2,
+		});
+	});
+
+	test("keeps a rollback active intent while taking the maximum floor from a stale backup", async () => {
+		const data = await fixture();
+		await accept(data, signedRegistry(data.privateKey, 1));
+		await accept(data, signedRegistry(data.privateKey, 2));
+		const statePath = path.join(data.agentDir, "model-presets", "state.json");
+		const staleBackup = await Bun.file(statePath).json();
+		await rollbackModelPresetRegistry({ agentDir: data.agentDir, revision: 1 });
+		await Bun.write(path.join(data.agentDir, "model-presets", "state.backup.json"), JSON.stringify(staleBackup));
+		expect(getModelPresetRegistryStatus({ agentDir: data.agentDir })).toMatchObject({
+			activeRevision: 1,
+			highestSeenRevision: 2,
+		});
+		await expect(accept(data, signedRegistry(data.privateKey, 1))).rejects.toThrow(/downgrade/i);
+		expect(getModelPresetRegistryStatus({ agentDir: data.agentDir }).activeRevision).toBe(1);
+	});
+
+	test("uses a clean backup floor when the primary highest generation is corrupt", async () => {
+		const data = await fixture();
+		await accept(data, signedRegistry(data.privateKey, 1));
+		await accept(data, signedRegistry(data.privateKey, 2));
+		const statePath = path.join(data.agentDir, "model-presets", "state.json");
+		const state = await Bun.file(statePath).json();
+		state.history[0].retainedProfiles = [registryProfile("corrupt", "https://evil.example/model")];
+		await Bun.write(statePath, JSON.stringify(state));
+		await expect(accept(data, signedRegistry(data.privateKey, 1))).rejects.toThrow(/downgrade/i);
+		expect(getModelPresetRegistryStatus({ agentDir: data.agentDir })).toMatchObject({
+			cacheHealth: "valid",
+			activeRevision: 2,
+			highestSeenRevision: 2,
+		});
+	});
+
+	test("records a first refresh failure without creating an empty anti-rollback checkpoint", async () => {
+		const data = await fixture();
+		await expect(
+			refreshModelPresetRegistry({
+				agentDir: data.agentDir,
+				manifestUrl,
+				fetch: (async () => {
+					throw new Error("offline");
+				}) as unknown as typeof fetch,
+			}),
+		).rejects.toThrow("Registry refresh failed.");
+		expect(await Bun.file(path.join(data.agentDir, "model-presets", "state.json")).exists()).toBe(false);
+		expect(await Bun.file(path.join(data.agentDir, "model-presets", "state.backup.json")).exists()).toBe(false);
+		expect(await Bun.file(path.join(data.agentDir, "model-presets", "failure.json")).json()).toMatchObject({
+			version: 1,
+			lastError: "Registry refresh failed.",
+		});
+		expect(getModelPresetRegistryStatus({ agentDir: data.agentDir })).toMatchObject({
+			cacheHealth: "empty",
+			lastError: "Registry refresh failed.",
+		});
+	});
+
 	test("rejects same-revision equivocation after recovering a verified checkpoint", async () => {
 		const data = await fixture();
 		await accept(data, signedRegistry(data.privateKey, 1));
