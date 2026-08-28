@@ -536,6 +536,7 @@ export interface ExtensionContext {
 			onPreflightAcceptCommit?: () => void | Promise<void>;
 			onSkillPrepared?: (meta: { name: string; path: string; lineCount?: number; cleanedArgs?: string }) => void;
 			preflightSignal?: AbortSignal;
+			sdkRunCapability?: unknown;
 		},
 	): Promise<unknown>;
 	setPlanMode?(on: boolean): unknown;
@@ -1705,6 +1706,7 @@ export interface ExtensionContextActions {
 			onPreflightAcceptCommit?: () => void | Promise<void>;
 			onSkillPrepared?: (meta: { name: string; path: string; lineCount?: number; cleanedArgs?: string }) => void;
 			preflightSignal?: AbortSignal;
+			sdkRunCapability?: unknown;
 		},
 	) => Promise<unknown>;
 	setPlanMode?: (on: boolean) => unknown;

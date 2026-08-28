@@ -3187,9 +3187,10 @@ function createControlSurface(
 			return await submit(
 				"skill",
 				clientRef,
-				options =>
+				({ sdkRunToken, ...options }) =>
 					ctx.invokeSkill!(name, args, {
 						...options,
+						sdkRunCapability: createSdkRunCapability(sdkRunToken),
 						onSkillPrepared: meta => {
 							prepared = meta;
 						},
