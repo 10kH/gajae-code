@@ -7945,7 +7945,6 @@ export class AgentSession {
 			// unrelated enqueue.
 			this.yieldQueue.rearmIdle();
 			const isActiveAttempt =
-			const isActiveAttempt =
 				deliveryScope === undefined
 					? this.#activeAttemptScope === activeAttemptScopeAtEvent &&
 						this.#activeSdkRunToken === activeSdkRunTokenAtEvent
