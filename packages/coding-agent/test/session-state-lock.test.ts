@@ -1627,7 +1627,18 @@ describe("coordinator session state lock", () => {
 		await expect(withSessionStateFileLock(aliasStateFile, async () => "recovered")).resolves.toBe("recovered");
 		expect(faulted).toBe(true);
 		expect(nativeTargets.length).toBeGreaterThan(0);
-		expect(nativeTargets.every(target => target === `${realStateFile}.lock.transition`), nativeTargets.join("\n")).toBe(true);
+		const comparablePath = (target: string): string => {
+			const normalized = path.normalize(target);
+			return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+		};
+		const expectedPhysicalTransition = comparablePath(`${realStateFile}.lock.transition`);
+		const physicalRoot = comparablePath(realParent) + path.sep;
+		const aliasRoot = comparablePath(aliasParent) + path.sep;
+		expect(nativeTargets.every(target => comparablePath(target) === expectedPhysicalTransition), nativeTargets.join("\n")).toBe(
+			true,
+		);
+		expect(nativeTargets.every(target => comparablePath(target).startsWith(physicalRoot))).toBe(true);
+		expect(nativeTargets.every(target => !comparablePath(target).startsWith(aliasRoot))).toBe(true);
 	});
 
 	it("cleans a transition claim when setup generation lstat faults", async () => {
