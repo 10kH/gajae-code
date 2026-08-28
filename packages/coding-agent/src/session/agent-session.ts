@@ -2533,6 +2533,16 @@ export class AgentSession {
 		this.#activeAttemptScope = undefined;
 		this.#activeLogicalRunId = undefined;
 	}
+	#acceptSdkAttemptRun(handle: AttemptRunHandle, sdkRunToken?: string): void {
+		const predecessorScope = this.#activeAttemptScope;
+		const carryRecoverySkip =
+			sdkRunToken !== undefined &&
+			predecessorScope !== undefined &&
+			this.#skipPostPromptRecoveryWaitByAttemptScope.delete(predecessorScope);
+		this.#acceptRunHandle(handle);
+		if (sdkRunToken !== undefined) this.#sdkRunTokensByAttemptScope.set(handle.scope, sdkRunToken);
+		if (carryRecoverySkip) this.#skipPostPromptRecoveryWaitByAttemptScope.add(handle.scope);
+	}
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	#pendingNextTurnMessages: Array<{ message: CustomMessage; origin: "turn" | "external" }> = [];
 	#scheduledHiddenNextTurnGeneration: number | undefined = undefined;
@@ -4247,6 +4257,7 @@ export class AgentSession {
 			) {
 				this.#sdkRunTokensByAttemptScope.set(this.#activeAttemptScope, consumedSdkRunTokenForCurrentRun);
 				this.#skipPostPromptRecoveryWaitByAttemptScope.add(this.#activeAttemptScope);
+				this.#activeSdkRunToken = consumedSdkRunTokenForCurrentRun;
 			}
 			// Monitor task-notifications now carry the owned-completion envelope
 			// (see tools/monitor.ts), so the general drop + fresh-admission paths
@@ -4293,6 +4304,7 @@ export class AgentSession {
 			) {
 				this.#sdkRunTokensByAttemptScope.set(this.#activeAttemptScope, consumedSdkRunToken);
 				this.#skipPostPromptRecoveryWaitByAttemptScope.add(this.#activeAttemptScope);
+				this.#activeSdkRunToken = consumedSdkRunToken;
 			}
 			this.#fireQueuedPromotionHooks(messages, promotion);
 		};
@@ -6695,10 +6707,8 @@ export class AgentSession {
 												this.#fireQueuedPromotionHooks(acceptance.consumedQueuedMessages, {
 													startsOwnRun: startsOwn,
 												});
-												if (sdkRunToken !== undefined)
-													this.#sdkRunTokensByAttemptScope.set(handle.scope, sdkRunToken);
 												if (startsOwn) this.#activeSdkRunToken = sdkRunToken;
-												this.#acceptRunHandle(handle);
+												this.#acceptSdkAttemptRun(handle, sdkRunToken);
 												options?.onRunAccepted?.(handle);
 												// Keep the queued token available through the acceptance callback;
 												// SDK follow-up owners bind it to the new attempt scope there.
@@ -9746,10 +9756,8 @@ export class AgentSession {
 			await this.agent.continue({
 				...this.#managedFallbackPromptOptions(),
 				onRunAccepted: (handle: AttemptRunHandle) => {
-					this.#acceptRunHandle(handle);
 					continuationSdkRunToken = this.#activeSdkRunToken;
-					if (continuationSdkRunToken !== undefined)
-						this.#sdkRunTokensByAttemptScope.set(handle.scope, continuationSdkRunToken);
+					this.#acceptSdkAttemptRun(handle, continuationSdkRunToken);
 					if (hindsightRecall) hindsightState?.markRecallSnippetInjected(hindsightRecall);
 				},
 			});
@@ -11435,9 +11443,8 @@ export class AgentSession {
 				...(options?.sdkRunToken ? { sdkRunToken: options.sdkRunToken } : {}),
 				onRunAccepted: (handle: AttemptRunHandle) => {
 					promptAttemptScope = handle.scope;
-					this.#acceptRunHandle(handle);
+					this.#acceptSdkAttemptRun(handle, options?.sdkRunToken);
 					if (options?.sdkRunToken) {
-						this.#sdkRunTokensByAttemptScope.set(handle.scope, options.sdkRunToken);
 						this.#activeSdkRunToken = options.sdkRunToken;
 					}
 					options?.onRunAccepted?.(handle);
@@ -19350,9 +19357,7 @@ export class AgentSession {
 								...this.#managedFallbackPromptOptions(),
 								transientRecoveryMessage: this.#escapedNonAsciiRecoveryMessage(),
 								onRunAccepted: (handle: AttemptRunHandle) => {
-									this.#acceptRunHandle(handle);
-									if (this.#activeSdkRunToken !== undefined)
-										this.#sdkRunTokensByAttemptScope.set(handle.scope, this.#activeSdkRunToken);
+									this.#acceptSdkAttemptRun(handle, this.#activeSdkRunToken);
 								},
 							});
 							if (
@@ -19393,9 +19398,7 @@ export class AgentSession {
 						...this.#managedFallbackPromptOptions(),
 						transientRecoveryMessage: this.#escapedNonAsciiRecoveryMessage(),
 						onRunAccepted: (handle: AttemptRunHandle) => {
-							this.#acceptRunHandle(handle);
-							if (this.#activeSdkRunToken !== undefined)
-								this.#sdkRunTokensByAttemptScope.set(handle.scope, this.#activeSdkRunToken);
+							this.#acceptSdkAttemptRun(handle, this.#activeSdkRunToken);
 						},
 					});
 				},
@@ -20343,9 +20346,7 @@ export class AgentSession {
 					await this.agent.continue({
 						...this.#managedFallbackPromptOptions(),
 						onRunAccepted: (handle: AttemptRunHandle) => {
-							this.#acceptRunHandle(handle);
-							if (this.#activeSdkRunToken !== undefined)
-								this.#sdkRunTokensByAttemptScope.set(handle.scope, this.#activeSdkRunToken);
+							this.#acceptSdkAttemptRun(handle, this.#activeSdkRunToken);
 						},
 					});
 					return;
