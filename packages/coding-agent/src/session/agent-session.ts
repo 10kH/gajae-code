@@ -7867,7 +7867,11 @@ export class AgentSession {
 			}
 			if (deliveryScope) {
 				this.#attemptRecordStore.retire(deliveryScope as AttemptScope);
-				this.#sdkRunTokensByAttemptScope.delete(deliveryScope as AttemptScope);
+				if (
+					activeSdkRunTokenAtEvent !== undefined &&
+					this.#sdkRunTokensByAttemptScope.get(deliveryScope as AttemptScope) === activeSdkRunTokenAtEvent
+				)
+					this.#sdkRunTokensByAttemptScope.delete(deliveryScope as AttemptScope);
 			}
 			if (isActiveAttempt) this.#activeSdkRunToken = undefined;
 			if (isActiveAttempt) {
