@@ -402,7 +402,9 @@ describe("auth-broker wire surface", () => {
 				iter,
 				event =>
 					event.kind === "snapshot" &&
-					event.credentials.some(entry => entry.credential.type === "oauth" && entry.credential.access === "access-b"),
+					event.credentials.some(
+						entry => entry.credential.type === "oauth" && entry.credential.access === "access-b",
+					),
 			);
 			if (next.kind !== "snapshot") throw new Error("expected snapshot frame");
 			const updated = next.credentials.find(
@@ -448,12 +450,16 @@ describe("auth-broker wire surface", () => {
 				event =>
 					event.kind === "snapshot" &&
 					event.credentials.some(
-					entry => entry.id === id && entry.credential.type === "oauth" && entry.credential.access === "access-rotated",
-				),
+						entry =>
+							entry.id === id &&
+							entry.credential.type === "oauth" &&
+							entry.credential.access === "access-rotated",
+					),
 			);
 			if (next.kind !== "snapshot") throw new Error("expected snapshot frame");
 			const updated = next.credentials.find(entry => entry.id === id);
-			if (!updated || updated.credential.type !== "oauth") throw new Error("expected oauth credential");
+			if (!updated) throw new Error("expected credential");
+			if (updated.credential.type !== "oauth") throw new Error("expected oauth credential");
 			expect(updated.credential.access).toBe("access-rotated");
 			expect(updated.credential.refresh).toBe(REMOTE_REFRESH_SENTINEL);
 		} finally {
