@@ -1556,6 +1556,8 @@ async function withLockPathTransition<T>(lockFile: string, transition: () => Pro
 	const recoveryKey = await transitionRecoveryKey(transitionDir);
 	const owner = await newLockOwner();
 	for (let attempt = 0; attempt < LOCK_ACQUIRE_ATTEMPTS; attempt++) {
+		if (ownerAccessStrategy() === "unsupported" && fsSync.existsSync(transitionDir))
+			throw new SessionStateLockUnavailableError(new Error("Safe transition ownership is unsupported."));
 		if (await recoverPendingTransitionRelease(transitionDir, recoveryKey)) {
 			// The claim this process stranded in an earlier failed release is gone;
 			// fall through and retry the mkdir immediately.
@@ -1657,6 +1659,7 @@ async function withLockPathTransition<T>(lockFile: string, transition: () => Pro
 				});
 				if (!ownerStat) {
 					if (
+						ownerAccessStrategy() !== "unsupported" &&
 						pending?.nativePath &&
 						pending.generation &&
 						removeOwnedTransitionClaim(pending.nativePath, pending.generation)
@@ -1683,6 +1686,15 @@ async function withLockPathTransition<T>(lockFile: string, transition: () => Pro
 				pendingSetup.nativePath!,
 			);
 		} catch (releaseError) {
+			if (ownerAccessStrategy() === "unsupported") {
+				if (outcome.ok)
+					throw new SessionStateLockUnavailableError(
+						new AggregateError([releaseError], "Transition claim cannot be released safely."),
+					);
+				throw new SessionStateLockUnavailableError(
+					new AggregateError([outcome.error, releaseError], "Lock path transition and release both failed."),
+				);
+			}
 			// The release rewrite may itself have succeeded before the claim-dir
 			// removal was denied (transient sharing denial). Recover the stranded
 			// claim in-process without replaying a transition that already succeeded.
@@ -1965,6 +1977,10 @@ export async function withSessionStateFileLock<T>(stateFile: string, operation: 
 		} catch (error) {
 			// A fault after the lock was taken belongs to the operation, not to acquisition.
 			if (held) throw error;
+			// Without a safe owner-record access strategy, retrying cannot make the
+			// transition claim removable. Preserve it as a fail-closed fence instead
+			// of spinning until the acquisition budget expires.
+			if (ownerAccessStrategy() === "unsupported") throw error;
 			// A legacy `<file>.lock/` directory reports EISDIR (EPERM on some platforms);
 			// both are contention to be evaluated, not a hard failure.
 			const code = (error as NodeJS.ErrnoException).code;
