@@ -142,15 +142,18 @@ function stripUrlQuery(value: string): string {
 	return value.slice(0, queryStart) + (fragmentStart < 0 ? "" : value.slice(fragmentStart));
 }
 
-function envAvailabilityFingerprint(): string {
-	return Object.entries(process.env)
-		.filter(
-			([name]) =>
+function envAvailabilityFingerprint(configuredNames?: ReadonlySet<string>): string {
+	const names = new Set(
+		Object.keys(process.env).filter(
+			name =>
 				/(?:_API_KEY|_OAUTH_TOKEN|_ACCESS_TOKEN)$/.test(name) ||
 				/^(?:GH_TOKEN|GITHUB_TOKEN|HF_TOKEN|COPILOT_GITHUB_TOKEN)$/.test(name),
-		)
-		.sort(([left], [right]) => left.localeCompare(right))
-		.map(([name, value]) => `${name}=${value ?? ""}`)
+		),
+	);
+	for (const name of configuredNames ?? []) names.add(name);
+	return [...names]
+		.sort((left, right) => left.localeCompare(right))
+		.map(name => `${name}=${process.env[name] ?? ""}`)
 		.join("\u0000");
 }
 
@@ -4826,7 +4829,7 @@ export class ModelRegistry {
 	getAvailable(): Model<Api>[] {
 		const disabledProviders = getDisabledProviderIdsFromSettings(this.#settings);
 		const disabledProviderKey = [...disabledProviders].sort().join("\u0000");
-		const envFingerprint = envAvailabilityFingerprint();
+		const envFingerprint = envAvailabilityFingerprint(this.#configuredApiKeyEnvNames);
 		if (
 			this.#availableModelsCache &&
 			this.#availableModelsDisabledProviders === disabledProviderKey &&

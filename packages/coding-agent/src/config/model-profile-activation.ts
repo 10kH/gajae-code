@@ -1045,6 +1045,7 @@ export async function prepareModelProfileActivation(
 			options.modelRegistry.getAvailableForProfileActivation?.() ??
 			options.modelRegistry.getAvailable?.() ??
 			options.modelRegistry.getAll();
+		const roleCatalogModels = options.modelRegistry.getAll();
 		let bindings = resolveProfileBindings(profile);
 		if (alternativeGroups.length > 0) {
 			bindings = rewriteBindingsProviders(bindings, new Set(authenticatedProviders), alternativeGroups);
@@ -1124,7 +1125,7 @@ export async function prepareModelProfileActivation(
 		][]) {
 			modelRoles[role] = await resolveAndClampSelectorValue(
 				selectorValue,
-				availableModels,
+				roleCatalogModels,
 				{
 					settings: options.settings as Settings,
 					modelRegistry: options.modelRegistry as ModelRegistry,
@@ -1145,7 +1146,7 @@ export async function prepareModelProfileActivation(
 		][]) {
 			agentModelOverrides[role] = await resolveAndClampSelectorValue(
 				selectorValue,
-				availableModels,
+				roleCatalogModels,
 				{
 					settings: options.settings as Settings,
 					modelRegistry: options.modelRegistry as ModelRegistry,
