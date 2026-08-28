@@ -32,6 +32,34 @@ describe("foreground bash background fold", () => {
 		}
 	});
 
+	test("claims the fold before a queued microtask can submit steering", async () => {
+		const order: string[] = [];
+		const controller = new InputController({
+			session: {
+				hasForegroundBashBackgroundRequestHandler: () => true,
+				requestForegroundBashBackground: async () => {
+					order.push("request");
+					await Bun.sleep(0);
+					return true;
+				},
+			},
+			showStatus: () => {},
+			showWarning: () => {},
+		} as never);
+		const realNow = Date.now;
+		try {
+			Date.now = () => 1_000;
+			controller.handleForegroundToolBackgroundFold();
+			Date.now = () => 1_000 + BACKGROUND_FOLD_DOUBLE_PRESS_MS;
+			queueMicrotask(() => order.push("steer"));
+			controller.handleForegroundToolBackgroundFold();
+			await Bun.sleep(0);
+			expect(order).toEqual(["request", "steer"]);
+		} finally {
+			Date.now = realNow;
+		}
+	});
+
 	for (const testCase of [
 		{
 			label: "synchronous rejection",

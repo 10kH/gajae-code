@@ -303,6 +303,42 @@ describe("AsyncJobManager delivery reliability", () => {
 		}
 	});
 
+	test("dead-letter overflow snapshots keep a stable bucket timestamp", async () => {
+		const manager = new AsyncJobManager({
+			maxRunningJobs: 150,
+			retentionMs: 0,
+			onJobComplete: async () => {
+				throw new Error("delivery always fails");
+			},
+		});
+
+		try {
+			for (let index = 0; index < 110; index += 1) {
+				manager.register("bash", `overflow timestamp ${index}`, async () => `payload-${index}`, {
+					ownerId: "owner-overflow-timestamp",
+					metadata: { backgrounded: true },
+				});
+			}
+			await waitFor(
+				() =>
+					manager
+						.getJobsSnapshot({ ownerId: "owner-overflow-timestamp" })
+						.deadLettered.some(entry => entry.jobId.startsWith("dead-letter-overflow:")),
+				8_000,
+			);
+			const first = manager
+				.getJobsSnapshot({ ownerId: "owner-overflow-timestamp" })
+				.deadLettered.find(entry => entry.jobId.startsWith("dead-letter-overflow:"));
+			const second = manager
+				.getJobsSnapshot({ ownerId: "owner-overflow-timestamp" })
+				.deadLettered.find(entry => entry.jobId.startsWith("dead-letter-overflow:"));
+			expect(first?.recordedAt).toBeDefined();
+			expect(second?.recordedAt).toBe(first?.recordedAt);
+		} finally {
+			await manager.dispose({ timeoutMs: 5_000 });
+		}
+	});
+
 	test("zero-retention snapshot keeps an in-flight evicted delivery visible", async () => {
 		const deliveryStarted = Promise.withResolvers<void>();
 		const releaseDelivery = Promise.withResolvers<void>();

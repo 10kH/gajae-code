@@ -678,6 +678,7 @@ export class AsyncJobManager {
 	readonly #deadLetteredDeliveries = new Map<string, DeadLetteredDelivery>();
 	readonly #deadLetteredDeliveryOwners = new Map<string, string | undefined>();
 	readonly #deadLetterOverflowByOwner = new Map<string | undefined, number>();
+	readonly #deadLetterOverflowRecordedAt = new Map<string | undefined, number>();
 	/** Retry-cap failures whose job record was already evicted, keyed by the unique generation. */
 	readonly #evictedDeadLetters = new Map<string, EvictedDeadLetteredDelivery>();
 	readonly #parkedDeliveries = new Map<string, AsyncJobDelivery>();
@@ -2384,7 +2385,7 @@ export class AsyncJobManager {
 				backgrounded: true,
 				attempt: 0,
 				lastError: `${count} additional undelivered completion(s) exceeded retained dead-letter capacity`,
-				recordedAt: Date.now(),
+				recordedAt: this.#deadLetterOverflowRecordedAt.get(entryOwner) ?? Date.now(),
 			});
 		}
 
@@ -2740,6 +2741,7 @@ export class AsyncJobManager {
 		this.#externallySettled.clear();
 		this.#deadLetteredDeliveryOwners.clear();
 		this.#deadLetterOverflowByOwner.clear();
+		this.#deadLetterOverflowRecordedAt.clear();
 		this.#suppressedDeliveries.clear();
 		this.#suppressedDeliveryJobIds.clear();
 		this.#deliveryAckOwners.clear();
@@ -3079,6 +3081,7 @@ export class AsyncJobManager {
 				? ownerId
 				: undefined;
 		this.#deadLetterOverflowByOwner.set(key, (this.#deadLetterOverflowByOwner.get(key) ?? 0) + 1);
+		if (!this.#deadLetterOverflowRecordedAt.has(key)) this.#deadLetterOverflowRecordedAt.set(key, Date.now());
 	}
 
 	#recordDeadLetterOrEvicted(delivery: AsyncJobDelivery): void {
