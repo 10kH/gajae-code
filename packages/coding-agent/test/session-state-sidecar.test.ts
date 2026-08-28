@@ -149,13 +149,18 @@ describe("coordinator runtime state sidecar", () => {
 		);
 		await persistCoordinatorWorkerIntegrationOutcome(
 			{ sessionId: "reconcile", cwd: root, sessionFile: null },
-			{ kind: "worker_integration", status: "failed", correlationId: "cmd:turn", error: "worker unavailable" },
+			{
+				kind: "worker_integration",
+				status: "failed",
+				correlationId: "cmd:turn",
+				error: "worker\u0000 unavailable\n",
+			},
 		);
 		const payload = await readJson(stateFile);
 		expect(payload.worker_integration).toMatchObject({
 			status: "failed",
 			correlation_id: "cmd:turn",
-			error: "worker unavailable",
+			error: "worker  unavailable",
 		});
 		expect(payload.error).toMatchObject({ code: "worker_integration_failed", recoverable: true });
 	});

@@ -1985,11 +1985,21 @@ export type BeforeAgentStartContributor = (event: {
 }) => Promise<BeforeAgentStartInternalMessage | undefined>;
 
 const AGENT_END_WORKER_INTEGRATION_TIMEOUT_MS = 5_000;
+const POST_PUBLICATION_ERROR_MAX_BYTES = 512;
 
 export type WorkerIntegrationOutcome =
 	| { status: "completed" }
 	| { status: "failed"; error: string }
 	| { status: "timed_out" };
+
+function sanitizePostPublicationError(error: string | undefined): string | undefined {
+	if (error === undefined) return undefined;
+	const normalized = error
+		.replace(/[\u0000-\u001f\u007f]/gu, " ")
+		.replace(/\s+/gu, " ")
+		.trim();
+	return truncateHeadBytes(normalized || "unknown worker integration error", POST_PUBLICATION_ERROR_MAX_BYTES).text;
+}
 
 export class WorkerIntegrationRequestScheduler {
 	#inFlight: Promise<WorkerIntegrationOutcome> | undefined = undefined;
@@ -5495,16 +5505,20 @@ export class AgentSession {
 	): void {
 		if (outcome.status !== "completed") {
 			const correlation = correlationId ?? context.sessionId;
+			const safeError = sanitizePostPublicationError(outcome.error);
 			this.#emit({
 				type: "notice",
 				level: "error",
 				source: kind,
-				message: `${kind} ${outcome.status} for ${correlation}${outcome.error ? `: ${outcome.error}` : ""}`,
+				message: `${kind} ${outcome.status} for ${correlation}${safeError ? `: ${safeError}` : ""}`,
 			});
 		}
-		void persistCoordinatorWorkerIntegrationOutcome(context, { ...outcome, kind, correlationId }).catch(error =>
-			logger.warn("Failed to persist terminal reconciliation outcome", { error: String(error) }),
-		);
+		void persistCoordinatorWorkerIntegrationOutcome(context, {
+			...outcome,
+			kind,
+			correlationId,
+			error: sanitizePostPublicationError(outcome.error),
+		}).catch(error => logger.warn("Failed to persist terminal reconciliation outcome", { error: String(error) }));
 	}
 
 	/**

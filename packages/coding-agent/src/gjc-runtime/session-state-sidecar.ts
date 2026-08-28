@@ -1634,14 +1634,15 @@ export async function persistCoordinatorWorkerIntegrationOutcome(
 						const reconciliation = {
 							status: outcome.status,
 							...(outcome.correlationId ? { correlation_id: outcome.correlationId } : {}),
-							...(outcome.error ? { error: outcome.error.slice(0, MAX_PUBLIC_ERROR_MESSAGE_LENGTH) } : {}),
+							...(outcome.error ? { error: publicSafeErrorMessage(outcome.error) } : {}),
 							observed_at: now,
 						};
-						const failureMessage =
+						const failureMessage = publicSafeErrorMessage(
 							outcome.error ??
-							(outcome.status === "timed_out"
-								? "Worker integration timed out after terminal publication."
-								: "Worker integration failed after terminal publication.");
+								(outcome.status === "timed_out"
+									? "Worker integration timed out after terminal publication."
+									: "Worker integration failed after terminal publication."),
+						);
 						const payload = {
 							...previous,
 							updated_at: now,
