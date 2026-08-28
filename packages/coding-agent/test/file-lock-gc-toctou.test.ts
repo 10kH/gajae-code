@@ -11,6 +11,7 @@ import {
 } from "@gajae-code/coding-agent/config/file-lock";
 import { fileLocksGcAdapter } from "@gajae-code/coding-agent/config/file-lock-gc";
 import type { GcContext, GcPidProbe, GcRecord } from "@gajae-code/coding-agent/gjc-runtime/gc-runtime";
+import * as native from "@gajae-code/natives";
 import { snapshotDirectoryTree } from "@gajae-code/natives";
 
 const DEAD_PID = 525_252;
@@ -94,6 +95,45 @@ describe("withFileLock stale owner liveness (#652)", () => {
 		// Publication is staged before onAcquired runs, so the aborted callback
 		// leaves the fully populated lock behind instead of an empty directory.
 		expect((await fs.readdir(`${file}.lock`)).join(",")).toBe("info");
+	});
+
+	test("publishes a directory lock through the no-replace claim fallback when rename flags are unsupported", async () => {
+		const root = await makeTemp();
+		const file = path.join(root, "unsupported", "publication.json");
+		const realRename = native.renameNoReplacePath;
+		vi.spyOn(native, "renameNoReplacePath").mockImplementation(() => ({
+			ok: false,
+			code: "atomic_unavailable",
+			mutationState: "not_committed",
+			durabilityState: "not_attempted",
+			reason: "atomic_unavailable",
+			primitive: "renameat2_noreplace",
+			phase: "preflight",
+			diagnostic: { schemaVersion: 1, collectionState: "unavailable" },
+		}));
+		await expect(withFileLock(file, async () => undefined)).resolves.toBeUndefined();
+		expect(await fs.exists(`${file}.lock`)).toBe(false);
+		vi.spyOn(native, "renameNoReplacePath").mockImplementation(realRename);
+	});
+
+	test("does not replace a legacy empty lock directory during unsupported publication fallback", async () => {
+		const root = await makeTemp();
+		const file = path.join(root, "legacy-empty", "publication.json");
+		await fs.mkdir(`${file}.lock`, { recursive: true });
+		const realRename = native.renameNoReplacePath;
+		vi.spyOn(native, "renameNoReplacePath").mockImplementation(() => ({
+			ok: false,
+			code: "invalid_request",
+			mutationState: "not_committed",
+			durabilityState: "not_attempted",
+			reason: "invalid_request",
+			primitive: "renameat2_noreplace",
+			phase: "preflight",
+			diagnostic: { schemaVersion: 1, collectionState: "unavailable" },
+		}));
+		await expect(withFileLock(file, async () => undefined, { retries: 2, retryDelayMs: 1 })).rejects.toThrow();
+		expect((await fs.stat(`${file}.lock`)).isDirectory()).toBe(true);
+		vi.spyOn(native, "renameNoReplacePath").mockImplementation(realRename);
 	});
 
 	test("publishes nested lock directories with private modes under restrictive umask", async () => {

@@ -2,7 +2,7 @@ import * as crypto from "node:crypto";
 import type { BigIntStats, Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { NativeDirectoryTreeResult, NativeExactUnlinkResult } from "@gajae-code/natives";
+import type { NativeDirectoryTreeResult, NativeExactUnlinkResult, NativeNoReplaceResult } from "@gajae-code/natives";
 import { renameNoReplacePath } from "@gajae-code/natives";
 import { isEnoent } from "@gajae-code/utils/fs-error";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
@@ -399,6 +399,23 @@ type LockStaleSnapshot =
 	| { stale: true; owner: FileLockOwnerToken }
 	| { stale: true; owner: null; stat: LockDirStatToken };
 
+/** Identity evidence carried by the generic stale verdict into a later removal. */
+export interface GenericFileLockDirIdentity {
+	rootDev: string;
+	rootIno: string;
+	infoDev: string;
+	infoIno: string;
+	infoNlink: string;
+	infoSize: string;
+	infoMtimeNs: string;
+	infoCtimeNs: string;
+	infoSha256: string;
+}
+
+export type GenericFileLockDirStaleVerdict =
+	| { stale: false }
+	| { stale: true; identity: GenericFileLockDirIdentity };
+
 /**
  * @internal
  * Fail-closed removal of a lock dir whose owner is expected to be dead or
@@ -647,7 +664,64 @@ export async function genericFileLockDirIsStale(
 	staleMs: number,
 	ownerHostId?: string,
 ): Promise<boolean> {
-	return (await staleLockSnapshot(lockDir, staleMs, ownerHostId)).stale;
+	return (await genericFileLockDirStaleVerdict(lockDir, staleMs, ownerHostId)).stale;
+}
+
+/**
+ * Render a generic stale verdict together with the root and owner-file identity that
+ * verdict actually observed. A caller that removes the directory must require a later
+ * native snapshot to carry this same identity; a snapshot taken only after a clone was
+ * installed is not authority for the stale verdict.
+ */
+export async function genericFileLockDirStaleVerdict(
+	lockDir: string,
+	staleMs: number,
+	ownerHostId?: string,
+): Promise<GenericFileLockDirStaleVerdict> {
+	let before: LockInfoPathState | null;
+	try {
+		before = await lockInfoPathState(lockDir);
+	} catch (error) {
+		if (isTransientReleaseError(error)) return { stale: false };
+		throw error;
+	}
+	const verdict = await staleLockSnapshot(lockDir, staleMs, ownerHostId);
+	if (!verdict.stale || verdict.owner === null || before === null) return { stale: false };
+	let bytes: string | null;
+	let after: LockInfoPathState | null;
+	try {
+		bytes = await readLockInfoBytes(lockDir);
+		after = await lockInfoPathState(lockDir);
+	} catch (error) {
+		if (isTransientReleaseError(error)) return { stale: false };
+		throw error;
+	}
+	if (!bytes || !after || !sameLockInfoPathState(before, after)) return { stale: false };
+	const current = parseLockInfoBytes(bytes);
+	if (
+		!current ||
+		current.pid !== verdict.owner.pid ||
+		current.start_time !== verdict.owner.start_time ||
+		current.start_time_format !== verdict.owner.start_time_format ||
+		current.owner_host_id !== verdict.owner.owner_host_id ||
+		current.owner_token !== verdict.owner.owner_token ||
+		current.timestamp !== verdict.owner.timestamp
+	)
+		return { stale: false };
+	return {
+		stale: true,
+		identity: {
+			rootDev: String(after.root.dev),
+			rootIno: String(after.root.ino),
+			infoDev: String(after.file.dev),
+			infoIno: String(after.file.ino),
+			infoNlink: String(after.file.nlink),
+			infoSize: String(after.file.size),
+			infoMtimeNs: String(after.file.mtimeNs),
+			infoCtimeNs: String(after.file.ctimeNs),
+			infoSha256: crypto.createHash("sha256").update(bytes).digest("hex"),
+		},
+	};
 }
 
 async function tryAcquireLock(
@@ -672,10 +746,18 @@ async function tryAcquireLock(
 		// already-created staging entry and its parent before publication so aliases
 		// retain the same lock identity as the ordinary path.
 		const canonicalParent = await fs.realpath(path.dirname(lockPath));
-		const published = renameNoReplacePath(
+		let published = renameNoReplacePath(
 			await fs.realpath(pendingPath),
 			path.join(canonicalParent, path.basename(lockPath)),
 		);
+		if (isRenameNoReplaceUnsupported(published)) {
+			const fallbackPublished = await publishDirectoryNoReplaceFallback(
+				await fs.realpath(pendingPath),
+				path.join(canonicalParent, path.basename(lockPath)),
+			);
+			if (!fallbackPublished) return null;
+			published = { ...published, ok: true };
+		}
 		if (!published.ok) {
 			if (published.reason === "destination_exists") return null;
 			const failure = new Error(
@@ -696,6 +778,48 @@ async function tryAcquireLock(
 function isTransientReleaseError(error: unknown): boolean {
 	const code = (error as NodeJS.ErrnoException).code;
 	return code === "EBUSY" || code === "EPERM" || code === "EACCES" || code === "ENOTEMPTY";
+}
+
+function isRenameNoReplaceUnsupported(result: NativeNoReplaceResult): boolean {
+	return (
+		!result.ok &&
+		result.mutationState === "not_committed" &&
+		result.durabilityState === "not_attempted" &&
+		(result.reason === "invalid_request" || result.reason === "atomic_unavailable")
+	);
+}
+
+/**
+ * Directory equivalent of the native no-replace fallback: claim the destination name
+ * with mkdir, then rename the staged tree over that empty directory. An existing empty
+ * directory is still a collision, never a destination to replace; the placeholder is
+ * removed only when the following rename demonstrably did not consume the source.
+ */
+async function publishDirectoryNoReplaceFallback(sourcePath: string, destinationPath: string): Promise<boolean> {
+	try {
+		await fs.mkdir(destinationPath, { mode: 0o700 });
+		await fs.chmod(destinationPath, 0o700);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+		throw error;
+	}
+	try {
+		await fs.rename(sourcePath, destinationPath);
+		return true;
+	} catch (error) {
+		// A failed plain rename normally leaves both names untouched. Do not remove a
+		// destination when the source disappeared: that outcome is ambiguous and the
+		// namespace must remain fail-closed for the next contender.
+		let sourceStillPresent = false;
+		try {
+			await fs.lstat(sourcePath);
+			sourceStillPresent = true;
+		} catch {
+			// Preserve the claimed destination on an ambiguous failure.
+		}
+		if (sourceStillPresent) await fs.rmdir(destinationPath).catch(() => undefined);
+		throw error;
+	}
 }
 
 type NativeFileLockBindings = {

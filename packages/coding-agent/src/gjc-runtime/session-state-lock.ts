@@ -7,7 +7,11 @@ import type {
 	NativeDirectoryTreeSnapshot,
 	NativeExactUnlinkResult,
 } from "@gajae-code/natives";
-import { genericFileLockDirIsStale, processStartTime as portableProcessStartTime } from "../config/file-lock";
+import {
+	genericFileLockDirStaleVerdict,
+	processStartTime as portableProcessStartTime,
+	type GenericFileLockDirIdentity,
+} from "../config/file-lock";
 import { loadInstallationHostId, loadLegacyInstallationHostId } from "../config/machine-identity";
 import { readLinuxProcStartTimeSync } from "./linux-proc";
 
@@ -95,6 +99,36 @@ async function removeTransitionDir(transitionDir: string): Promise<void> {
 			await Bun.sleep(LOCK_ACQUIRE_RETRY_MS);
 		}
 	}
+}
+
+async function transitionRecoveryKey(transitionDir: string): Promise<string> {
+	try {
+		return path.normalize(await fs.realpath(transitionDir));
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code !== "ENOENT" && !isTransientLockError(error)) throw error;
+	}
+	const parent = path.dirname(transitionDir);
+	let canonicalParent: string;
+	try {
+		canonicalParent = await fs.realpath(parent);
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code !== "ENOENT" && !isTransientLockError(error)) throw error;
+		canonicalParent = path.resolve(parent);
+	}
+	return path.normalize(path.join(canonicalParent, path.basename(transitionDir)));
+}
+
+function sameTransitionGeneration(left: TransitionDirectoryGeneration, right: TransitionDirectoryGeneration): boolean {
+	return (
+		left.dev === right.dev &&
+		left.ino === right.ino &&
+		left.mode === right.mode &&
+		left.nlink === right.nlink &&
+		left.mtimeNs === right.mtimeNs &&
+		left.ctimeNs === right.ctimeNs
+	);
 }
 
 interface SessionStateLockOwner {
@@ -1010,6 +1044,7 @@ async function releaseTransitionClaim(
 	transitionDir: string,
 	ownerFile: string,
 	held: LockOwnerSnapshot,
+	recoveryKey: string,
 ): Promise<void> {
 	const transitionStat = await fs.lstat(transitionDir, { bigint: true });
 	if (!transitionStat.isDirectory())
@@ -1019,7 +1054,37 @@ async function releaseTransitionClaim(
 	if (!current || !sameLockOwnerSnapshot(current, held))
 		throw new SessionStateLockUnavailableError(new Error("Transition owner changed before release."));
 	await SessionStateLockTestHooks.afterCurrentOwnerValidation?.(ownerFile);
-	const released = await rewriteHeldOwnerRecord(ownerFile, held, await releasedLockOwner());
+	const releasedOwner = await releasedLockOwner();
+	// Arm recovery BEFORE the rewrite itself. Its namespace mutation can commit before
+	// final verification reports an I/O fault, leaving a released tombstone inside a
+	// claim that this process must still be able to retract.
+	pendingTransitionReleases.set(recoveryKey, {
+		token: releasedOwner.token,
+		generation: {
+			dev: transitionStat.dev,
+			ino: transitionStat.ino,
+			mode: transitionStat.mode,
+			nlink: transitionStat.nlink,
+			mtimeNs: transitionStat.mtimeNs,
+			ctimeNs: transitionStat.ctimeNs,
+		},
+	});
+	try {
+		await rewriteHeldOwnerRecord(ownerFile, held, releasedOwner);
+	} catch (error) {
+		// A rewrite can fail before touching the inode. Do not retain a pending
+		// generation for that ordinary refusal; retain it only when the released
+		// tombstone is actually present and therefore needs replay.
+		try {
+			const currentOwner = await captureRegularLockOwner(ownerFile);
+			const parsed = currentOwner ? (JSON.parse(currentOwner.bytes) as Partial<SessionStateLockOwner>) : undefined;
+			if (!parsed || parsed.token !== releasedOwner.token || parsed.released !== true)
+				pendingTransitionReleases.delete(recoveryKey);
+		} catch {
+			// Preserve the pending entry when the post-failure state cannot be proved.
+		}
+		throw error;
+	}
 	const currentTransition = await fs.lstat(transitionDir, { bigint: true });
 	if (
 		!currentTransition.isDirectory() ||
@@ -1029,20 +1094,8 @@ async function releaseTransitionClaim(
 		throw new SessionStateLockUnavailableError(new Error("Transition claim changed before release."));
 	try {
 		await removeTransitionDir(transitionDir);
+		pendingTransitionReleases.delete(recoveryKey);
 	} catch (error) {
-		const owner = JSON.parse(released.bytes) as Partial<SessionStateLockOwner>;
-		if (owner.token)
-			pendingTransitionReleases.set(transitionDir, {
-				token: owner.token,
-				generation: {
-					dev: transitionStat.dev,
-					ino: transitionStat.ino,
-					mode: transitionStat.mode,
-					nlink: transitionStat.nlink,
-					mtimeNs: transitionStat.mtimeNs,
-					ctimeNs: transitionStat.ctimeNs,
-				},
-			});
 		throw error;
 	}
 }
@@ -1080,8 +1133,32 @@ async function reclaimStaleTransitionClaim(transitionDir: string): Promise<void>
  * same token with `released: true` — any other content is a successor's claim
  * and stays untouched.
  */
-async function recoverPendingTransitionRelease(transitionDir: string): Promise<boolean> {
-	const pending = pendingTransitionReleases.get(transitionDir);
+async function recoverPendingTransitionRelease(transitionDir: string, recoveryKey: string): Promise<boolean> {
+	let pendingKey = recoveryKey;
+	let pending = pendingTransitionReleases.get(pendingKey);
+	if (pending === undefined) {
+		// Parent realpath can be transiently unavailable during release. A later alias
+		// may therefore compute a different lexical key; generation identity is the
+		// authority for finding that stranded entry, never the pathname spelling.
+		const current = await fs.lstat(transitionDir, { bigint: true }).catch(() => null);
+		if (!current?.isDirectory()) return false;
+		for (const [key, candidate] of pendingTransitionReleases) {
+			if (
+				sameTransitionGeneration(candidate.generation, {
+					dev: current.dev,
+					ino: current.ino,
+					mode: current.mode,
+					nlink: current.nlink,
+					mtimeNs: current.mtimeNs,
+					ctimeNs: current.ctimeNs,
+				})
+			) {
+				pendingKey = key;
+				pending = candidate;
+				break;
+			}
+		}
+	}
 	if (pending === undefined) return false;
 	if (pending.recovery) return await pending.recovery;
 	const recovery = (async (): Promise<boolean> => {
@@ -1091,7 +1168,7 @@ async function recoverPendingTransitionRelease(transitionDir: string): Promise<b
 			current = await fs.lstat(transitionDir, { bigint: true });
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-				pendingTransitionReleases.delete(transitionDir);
+				pendingTransitionReleases.delete(pendingKey);
 				return true;
 			}
 			return false;
@@ -1101,20 +1178,22 @@ async function recoverPendingTransitionRelease(transitionDir: string): Promise<b
 		// happens to carry the same released token.
 		if (
 			!current.isDirectory() ||
-			current.dev !== pending.generation.dev ||
-			current.ino !== pending.generation.ino ||
-			current.mode !== pending.generation.mode ||
-			current.nlink !== pending.generation.nlink ||
-			current.mtimeNs !== pending.generation.mtimeNs ||
-			current.ctimeNs !== pending.generation.ctimeNs
+			!sameTransitionGeneration(pending.generation, {
+				dev: current.dev,
+				ino: current.ino,
+				mode: current.mode,
+				nlink: current.nlink,
+				mtimeNs: current.mtimeNs,
+				ctimeNs: current.ctimeNs,
+			})
 		) {
-			pendingTransitionReleases.delete(transitionDir);
+			pendingTransitionReleases.delete(pendingKey);
 			return false;
 		}
 		try {
 			const pendingOwner = JSON.parse(await fs.readFile(ownerFile, "utf8")) as Partial<SessionStateLockOwner>;
 			if (pendingOwner.token !== pending.token || pendingOwner.released !== true) {
-				pendingTransitionReleases.delete(transitionDir);
+				pendingTransitionReleases.delete(pendingKey);
 				return false;
 			}
 			const captured = nativeSessionStateLock().snapshotDirectoryTree(transitionDir);
@@ -1124,7 +1203,7 @@ async function recoverPendingTransitionRelease(transitionDir: string): Promise<b
 				captured.snapshot.rootDev !== String(current.dev) ||
 				captured.snapshot.rootIno !== String(current.ino)
 			) {
-				pendingTransitionReleases.delete(transitionDir);
+				pendingTransitionReleases.delete(pendingKey);
 				return false;
 			}
 			const capturedRoot = captured.snapshot.entries.find(entry => entry.relativePath === "");
@@ -1136,16 +1215,16 @@ async function recoverPendingTransitionRelease(transitionDir: string): Promise<b
 				capturedRoot.mtimeNs !== String(pending.generation.mtimeNs) ||
 				capturedRoot.ctimeNs !== String(pending.generation.ctimeNs)
 			) {
-				pendingTransitionReleases.delete(transitionDir);
+				pendingTransitionReleases.delete(pendingKey);
 				return false;
 			}
 			const removed = nativeSessionStateLock().exactRemoveDirectoryTree(transitionDir, captured.snapshot);
 			if (removed.ok || removed.code === "not_found") {
-				pendingTransitionReleases.delete(transitionDir);
+				pendingTransitionReleases.delete(pendingKey);
 				return true;
 			}
 			if (removed.code === "identity_mismatch") {
-				pendingTransitionReleases.delete(transitionDir);
+				pendingTransitionReleases.delete(pendingKey);
 				return false;
 			}
 			if (
@@ -1156,7 +1235,7 @@ async function recoverPendingTransitionRelease(transitionDir: string): Promise<b
 				removed.retainedUnknownPath === undefined &&
 				removed.retainedPlaceholderPath === undefined
 			) {
-				pendingTransitionReleases.delete(transitionDir);
+				pendingTransitionReleases.delete(pendingKey);
 				return true;
 			}
 			return false;
@@ -1177,9 +1256,10 @@ async function recoverPendingTransitionRelease(transitionDir: string): Promise<b
 async function withLockPathTransition<T>(lockFile: string, transition: () => Promise<T>): Promise<T> {
 	const transitionDir = `${lockFile}${LOCK_TRANSITION_RESOURCE_SUFFIX}`;
 	const ownerFile = `${transitionDir}.owner`;
+	const recoveryKey = await transitionRecoveryKey(transitionDir);
 	const owner = await newLockOwner();
 	for (let attempt = 0; attempt < LOCK_ACQUIRE_ATTEMPTS; attempt++) {
-		if (await recoverPendingTransitionRelease(transitionDir)) {
+		if (await recoverPendingTransitionRelease(transitionDir, recoveryKey)) {
 			// The claim this process stranded in an earlier failed release is gone;
 			// fall through and retry the mkdir immediately.
 		}
@@ -1204,15 +1284,15 @@ async function withLockPathTransition<T>(lockFile: string, transition: () => Pro
 			error => ({ ok: false as const, error }),
 		);
 		try {
-			await releaseTransitionClaim(transitionDir, ownerFile, held);
+			await releaseTransitionClaim(transitionDir, ownerFile, held, recoveryKey);
 		} catch (releaseError) {
 			// The release rewrite may itself have succeeded before the claim-dir
 			// removal was denied (transient sharing denial). Recover the stranded
 			// claim in-process without replaying a transition that already succeeded.
-			if (outcome.ok && pendingTransitionReleases.has(transitionDir)) {
+			if (outcome.ok && pendingTransitionReleases.has(recoveryKey)) {
 				for (let recoveryAttempt = 0; recoveryAttempt < LOCK_ACQUIRE_ATTEMPTS; recoveryAttempt++) {
-					if (await recoverPendingTransitionRelease(transitionDir)) return outcome.value;
-					if (!pendingTransitionReleases.has(transitionDir)) break;
+					if (await recoverPendingTransitionRelease(transitionDir, recoveryKey)) return outcome.value;
+					if (!pendingTransitionReleases.has(recoveryKey)) break;
 					await Bun.sleep(LOCK_ACQUIRE_RETRY_MS);
 				}
 			}
@@ -1280,6 +1360,25 @@ function sameDirectoryTreeSnapshot(left: NativeDirectoryTreeSnapshot, right: Nat
 	});
 }
 
+function legacyDirectoryMatchesVerdict(
+	snapshot: NativeDirectoryTreeSnapshot,
+	identity: GenericFileLockDirIdentity,
+): boolean {
+	const info = snapshot.entries.find(entry => entry.relativePath === "info");
+	return (
+		snapshot.rootDev === identity.rootDev &&
+		snapshot.rootIno === identity.rootIno &&
+		info?.kind === "file" &&
+		info.dev === identity.infoDev &&
+		info.ino === identity.infoIno &&
+		info.nlink === identity.infoNlink &&
+		info.size === identity.infoSize &&
+		info.mtimeNs === identity.infoMtimeNs &&
+		info.ctimeNs === identity.infoCtimeNs &&
+		info.sha256 === identity.infoSha256
+	);
+}
+
 /**
  * Capture the exact tree at `lockDir`, or prove there is nothing there to capture.
  *
@@ -1335,18 +1434,19 @@ function captureLegacyDirectoryTree(
 async function reclaimStaleDirectoryLock(lockFile: string): Promise<void> {
 	await withLockPathTransition(lockFile, async () => {
 		const native = nativeSessionStateLock();
-		const before = captureLegacyDirectoryTree(native, lockFile);
-		if (!before) return;
 		const ownerHostId =
 			SessionStateLockTestHooks.unqualifiedOwnerIsLocal === true ? undefined : await currentOwnerHostId();
-		let stale = await genericFileLockDirIsStale(lockFile, LOCK_STALE_MS, ownerHostId);
-		if (!stale && ownerHostId !== undefined)
-			stale = await genericFileLockDirIsStale(lockFile, LOCK_STALE_MS, await currentLegacyOwnerHostId());
-		if (!stale) return;
+		let verdict = await genericFileLockDirStaleVerdict(lockFile, LOCK_STALE_MS, ownerHostId);
+		if (!verdict.stale && ownerHostId !== undefined)
+			verdict = await genericFileLockDirStaleVerdict(lockFile, LOCK_STALE_MS, await currentLegacyOwnerHostId());
+		if (!verdict.stale) return;
+		const before = captureLegacyDirectoryTree(native, lockFile);
+		if (!before || !legacyDirectoryMatchesVerdict(before, verdict.identity)) return;
 		await SessionStateLockTestHooks.afterLegacyDirectoryStaleVerdict?.(lockFile);
 		const authorized = captureLegacyDirectoryTree(native, lockFile);
 		// The verdict spoke for `before`; only an unchanged tree carries that authority.
-		if (!authorized || !sameDirectoryTreeSnapshot(before, authorized)) return;
+		if (!authorized || !legacyDirectoryMatchesVerdict(authorized, verdict.identity) || !sameDirectoryTreeSnapshot(before, authorized))
+			return;
 		await SessionStateLockTestHooks.beforeLegacyDirectoryRemoval?.(lockFile);
 		let removed: NativeExactUnlinkResult;
 		try {
