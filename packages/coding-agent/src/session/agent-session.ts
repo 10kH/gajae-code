@@ -11702,7 +11702,7 @@ export class AgentSession {
 			claimsGenuineUserIntent?: boolean;
 			onPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
 			external?: boolean;
-				skipPostPromptRecoveryWait?: boolean;
+			skipPostPromptRecoveryWait?: boolean;
 		},
 	): Promise<void> {
 		this.#assertNoHandoffTransition();
