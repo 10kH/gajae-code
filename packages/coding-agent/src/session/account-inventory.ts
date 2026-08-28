@@ -324,8 +324,8 @@ function freshUsageCache(report: CachedUsageReport["report"]): AccountUsageCache
 	};
 }
 
-function canPinStoredOAuth(authStorage: AuthStorage, provider: string): boolean {
-	if (authStorage.hasRuntimeApiKey(provider) || authStorage.hasConfigApiKey(provider)) return false;
+function canPinStoredOAuth(authStorage: AuthStorage, provider: string, owner?: object): boolean {
+	if (authStorage.hasRuntimeApiKey(provider) || authStorage.hasConfigApiKey(provider, owner)) return false;
 	return !getEnvApiKey(provider);
 }
 
@@ -369,6 +369,7 @@ function addStoredRows(
 	inventory: CredentialInventoryRecord[],
 	sessionId: string | undefined,
 	baseUrlResolver?: (provider: string) => string | undefined,
+	authStorageOwner?: object,
 ): void {
 	const removalTargetIds = new Set(
 		(typeof authStorage.listCredentialRemovalTargets === "function"
@@ -383,7 +384,9 @@ function addStoredRows(
 			typeof record.provider === "string" &&
 			authStorage.getSessionCredentialRowId(record.provider, sessionId) === record.id;
 		const canPin =
-			record.credentialKind === "oauth" && !record.disabled && canPinStoredOAuth(authStorage, record.provider);
+			record.credentialKind === "oauth" &&
+			!record.disabled &&
+			canPinStoredOAuth(authStorage, record.provider, authStorageOwner);
 		const canRemove = removalTargetIds.has(record.id);
 		rows.push({
 			id: sourceId(record.provider, "stored", record.id),
@@ -476,8 +479,13 @@ export function buildAccountInventorySnapshot(input: AccountInventoryInput): Acc
 	const inventory = input.authStorage.listCredentialInventory();
 	const rows: AccountInventoryRow[] = [];
 	const authStorageOwner = input.modelRegistry?.getAuthStorageOwner?.();
-	addStoredRows(rows, input.authStorage, inventory, input.sessionId, provider =>
-		input.modelRegistry?.getProviderBaseUrl?.(provider),
+	addStoredRows(
+		rows,
+		input.authStorage,
+		inventory,
+		input.sessionId,
+		provider => input.modelRegistry?.getProviderBaseUrl?.(provider),
+		authStorageOwner,
 	);
 	addSyntheticRows(rows, input.authStorage, providerSet(input, inventory), input.sessionId, authStorageOwner);
 	rows.sort((left, right) => left.id.localeCompare(right.id));
