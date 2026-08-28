@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { ManagedSessionDescendantStore } from "../../src/session/internal/managed-session-storage";
 import { makeAssistantMessage } from "./helpers";
 
 function tempDir(prefix: string): string {
@@ -86,6 +87,35 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		await manager.flush();
 		expect(fs.readFileSync(sessionFile, "utf8")).toContain("after-metadata-drift");
 		expect(fs.readFileSync(sessionFile, "utf8")).toContain("after-second-metadata-drift");
+		await manager.close();
+	});
+
+	it("accepts metadata drift on the same managed append predecessor", async () => {
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		if (destination.kind !== "managed") throw new Error("Expected managed destination");
+		const manager = SessionManager.create(cwd, destination);
+		manager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
+		manager.appendMessage(makeAssistantMessage() as never);
+		await manager.flush();
+		const sessionFile = manager.getSessionFile()!;
+		const store = new ManagedSessionDescendantStore(
+			destination.securityContext.rootAuthority,
+			destination.directory,
+			destination.securityContext.retainedAuthority
+				? {
+						authority: destination.securityContext.retainedAuthority,
+						authorityBaseDir: destination.directory,
+					}
+				: undefined,
+		);
+		const expected = store.captureBoundedAppendExpectation(path.basename(sessionFile));
+		if (!expected) throw new Error("Expected managed append identity");
+		const before = fs.statSync(sessionFile);
+		fs.utimesSync(sessionFile, new Date(before.atimeMs + 1_000), new Date(before.mtimeMs + 1_000));
+
+		store.appendExpectedSync(path.basename(sessionFile), Buffer.from("metadata-drift\n", "utf8"), expected);
+
+		expect(fs.readFileSync(sessionFile, "utf8")).toContain("metadata-drift");
 		await manager.close();
 	});
 
