@@ -3379,6 +3379,20 @@ pub(crate) mod platform {
 				_ => Err("io_error"),
 			};
 		}
+		// Pin the placeholder inode so failure cleanup can never remove an empty
+		// successor that replaced our claimed name while the plain rename ran.
+		let mut placeholder: libc::stat = unsafe { std::mem::zeroed() };
+		if unsafe {
+			libc::fstatat(
+				destination_parent_fd,
+				destination.as_ptr(),
+				&mut placeholder,
+				libc::AT_SYMLINK_NOFOLLOW,
+			)
+		} != 0 || placeholder.st_mode & libc::S_IFMT != libc::S_IFDIR
+		{
+			return Err("io_error");
+		}
 		// SAFETY: both parent descriptors and names remain live through the syscall.
 		if unsafe {
 			libc::renameat(
@@ -3394,8 +3408,25 @@ pub(crate) mod platform {
 		let error = std::io::Error::last_os_error();
 		// SAFETY: the placeholder is empty and owned by this call; a failed rename
 		// leaves it untouched, so AT_REMOVEDIR cannot remove a successor tree.
-		unsafe {
-			libc::unlinkat(destination_parent_fd, destination.as_ptr(), libc::AT_REMOVEDIR);
+		let mut current_placeholder: libc::stat = unsafe { std::mem::zeroed() };
+		let placeholder_matches = unsafe {
+			libc::fstatat(
+				destination_parent_fd,
+				destination.as_ptr(),
+				&mut current_placeholder,
+				libc::AT_SYMLINK_NOFOLLOW,
+			)
+		} == 0 && current_placeholder.st_mode & libc::S_IFMT
+			== libc::S_IFDIR
+			&& current_placeholder.st_dev == placeholder.st_dev
+			&& current_placeholder.st_ino == placeholder.st_ino;
+		if placeholder_matches {
+			// SAFETY: the placeholder is still the empty directory created above;
+			// a failed rename leaves it untouched, so AT_REMOVEDIR cannot remove a
+			// successor tree.
+			unsafe {
+				libc::unlinkat(destination_parent_fd, destination.as_ptr(), libc::AT_REMOVEDIR);
+			}
 		}
 		match error.raw_os_error() {
 			Some(libc::EXDEV) => Err("cross_device"),
