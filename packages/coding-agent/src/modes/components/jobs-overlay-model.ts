@@ -6,20 +6,41 @@
  * SelectItem lists into nested SelectLists (list -> detail -> confirm).
  */
 import type { SelectItem } from "@gajae-code/tui";
+import { replaceTabs, shortenPath, TRUNCATE_LENGTHS, truncateToWidth } from "../../tools/render-utils";
 import type { JobsSnapshot } from "../jobs-observer";
+import { sanitizeStatusText } from "../shared";
 
-export type JobRefKind = "monitor" | "cron";
+export type JobRefKind = "monitor" | "cron" | "folded";
 
 export interface JobRef {
 	kind: JobRefKind;
 	id: string;
+	generation?: string;
 }
 
-const PROMPT_PREVIEW_MAX = 60;
+function encodeJobRefPart(value: string): string {
+	return encodeURIComponent(value);
+}
 
-function preview(text: string, max = PROMPT_PREVIEW_MAX): string {
-	const oneLine = text.replace(/\s+/g, " ").trim();
-	return oneLine.length > max ? `${oneLine.slice(0, max - 1)}…` : oneLine;
+function decodeJobRefPart(value: string): string | undefined {
+	try {
+		return decodeURIComponent(value);
+	} catch {
+		return undefined;
+	}
+}
+
+function displayText(text: string, max: number = TRUNCATE_LENGTHS.CONTENT): string {
+	const sanitized = shortenPath(replaceTabs(sanitizeStatusText(text)));
+	return truncateToWidth(sanitized, max);
+}
+
+function preview(text: string, max: number = TRUNCATE_LENGTHS.TITLE): string {
+	return displayText(text, max);
+}
+
+function snapshotJobKey(id: string, generation: string | undefined): string {
+	return `${id}\u0000${generation ?? ""}`;
 }
 
 /** Compact relative time, e.g. "in 5m", "2m ago", "now". */
@@ -42,28 +63,69 @@ export function parseJobRef(value: string): JobRef | null {
 	if ((kind === "monitor" || kind === "cron") && id.length > 0) {
 		return { kind, id };
 	}
+	if (kind === "folded") {
+		const generationSep = id.indexOf(":");
+		if (generationSep > 0 && generationSep < id.length - 1) {
+			const decodedId = decodeJobRefPart(id.slice(0, generationSep));
+			const generation = decodeJobRefPart(id.slice(generationSep + 1));
+			if (decodedId && generation) return { kind, id: decodedId, generation };
+		}
+	}
 	return null;
 }
 
 /**
  * Build the grouped jobs list: monitors first (newest-first), then crons
- * (newest-first). The snapshot arrays are already sorted newest-first.
+ * (newest-first), then read-only folded jobs. The snapshot arrays are already
+ * sorted newest-first where a source has a timestamp.
  */
 export function buildJobsListItems(snapshot: JobsSnapshot): SelectItem[] {
 	const items: SelectItem[] = [];
+	const foldedJobs = snapshot.foldedJobs ?? [];
+	const foldedKeys = new Set(foldedJobs.map(job => snapshotJobKey(job.id, job.generation)));
 	for (const monitor of snapshot.monitors) {
+		// A monitor can also be backgrounded; render it only in the folded section
+		// so a public job state has exactly one row.
+		if (monitor.backgrounded || foldedKeys.has(snapshotJobKey(monitor.id, monitor.generation))) continue;
 		items.push({
 			value: `monitor:${monitor.id}`,
-			label: `monitor · ${preview(monitor.label, 40)}`,
-			description: monitor.status,
-			hint: monitor.status === "failed" ? "failed" : undefined,
+			label: `monitor · ${preview(monitor.label, TRUNCATE_LENGTHS.SHORT)}`,
+			description: displayText(monitor.status, TRUNCATE_LENGTHS.SHORT),
+			hint: monitor.status === "failed" || monitor.deliveryState === "failed-visible" ? "failed" : undefined,
 		});
 	}
 	for (const cron of snapshot.crons) {
 		items.push({
 			value: `cron:${cron.id}`,
-			label: `cron · ${cron.humanSchedule}`,
+			label: `cron · ${preview(cron.humanSchedule, TRUNCATE_LENGTHS.SHORT)}`,
 			description: preview(cron.prompt),
+		});
+	}
+	for (const job of foldedJobs) {
+		const state = displayText(job.deliveryState, TRUNCATE_LENGTHS.SHORT);
+		const kind = preview(job.kind, TRUNCATE_LENGTHS.SHORT);
+		const deadLetter = (snapshot.deadLettered ?? []).find(
+			entry => snapshotJobKey(entry.jobId, entry.generation) === snapshotJobKey(job.id, job.generation),
+		);
+		const errorText = job.errorText ?? deadLetter?.lastError;
+		const description =
+			deadLetter || errorText
+				? displayText(
+						[
+							state,
+							deadLetter ? `attempt ${deadLetter.attempt}` : undefined,
+							errorText ? `error: ${errorText}` : undefined,
+						]
+							.filter((part): part is string => part !== undefined)
+							.join(" · "),
+						TRUNCATE_LENGTHS.CONTENT,
+					)
+				: state;
+		items.push({
+			value: `folded:${encodeJobRefPart(job.id)}:${encodeJobRefPart(job.generation)}`,
+			label: `${kind} · ${preview(job.label, TRUNCATE_LENGTHS.SHORT)}`,
+			description,
+			hint: job.status === "failed" || job.deliveryState === "failed-visible" ? "failed" : "read-only",
 		});
 	}
 	return items;
@@ -80,21 +142,41 @@ export function buildJobDetailItems(snapshot: JobsSnapshot, ref: JobRef, output 
 		if (!monitor) return [{ value: "back", label: "Back (job no longer present)" }];
 		const lastOutput = output.trim().split("\n").filter(Boolean).slice(-1)[0] ?? "(no output captured)";
 		return [
-			{ value: "noop", label: "Status", description: monitor.status },
+			{ value: "noop", label: "Status", description: displayText(monitor.status, TRUNCATE_LENGTHS.SHORT) },
 			{ value: "noop", label: "Label", description: preview(monitor.label) },
 			{ value: "noop", label: "Started", description: formatRelative(monitor.startTime) },
-			{ value: "noop", label: "Output", description: preview(lastOutput, 80) },
+			{ value: "noop", label: "Output", description: preview(lastOutput, TRUNCATE_LENGTHS.CONTENT) },
 			{ value: "action:cancel", label: "Cancel this monitor", hint: "stops the running job" },
+			{ value: "back", label: "Back" },
+		];
+	}
+	if (ref.kind === "folded") {
+		const job = snapshot.foldedJobs?.find(
+			entry => entry.id === ref.id && (ref.generation === undefined || entry.generation === ref.generation),
+		);
+		if (!job) return [{ value: "back", label: "Back (job no longer present)" }];
+		return [
+			{ value: "noop", label: "Status", description: displayText(job.status, TRUNCATE_LENGTHS.SHORT) },
+			{ value: "noop", label: "Kind", description: preview(job.kind, TRUNCATE_LENGTHS.SHORT) },
+			{ value: "noop", label: "Label", description: preview(job.label) },
+			{ value: "noop", label: "Generation", description: preview(job.generation, TRUNCATE_LENGTHS.CONTENT) },
+			...(job.errorText
+				? [{ value: "noop", label: "Error", description: preview(job.errorText, TRUNCATE_LENGTHS.CONTENT) }]
+				: []),
 			{ value: "back", label: "Back" },
 		];
 	}
 	const cron = snapshot.crons.find(c => c.id === ref.id);
 	if (!cron) return [{ value: "back", label: "Back (job no longer present)" }];
 	return [
-		{ value: "noop", label: "Schedule", description: `${cron.humanSchedule} (${cron.cronExpression})` },
+		{
+			value: "noop",
+			label: "Schedule",
+			description: `${preview(cron.humanSchedule, TRUNCATE_LENGTHS.SHORT)} (${preview(cron.cronExpression, TRUNCATE_LENGTHS.SHORT)})`,
+		},
 		{ value: "noop", label: "Recurring", description: cron.recurring ? "yes" : "no" },
 		{ value: "noop", label: "Next fire", description: formatRelative(cron.nextFireAt) },
-		{ value: "noop", label: "Prompt", description: preview(cron.prompt, 80) },
+		{ value: "noop", label: "Prompt", description: preview(cron.prompt, TRUNCATE_LENGTHS.CONTENT) },
 		{ value: "action:delete", label: "Delete this cron", hint: "removes the schedule" },
 		{ value: "back", label: "Back" },
 	];
@@ -102,8 +184,9 @@ export function buildJobDetailItems(snapshot: JobsSnapshot, ref: JobRef, output 
 
 /** Yes/No confirm items for a destructive action. */
 export function buildConfirmItems(actionLabel: string): SelectItem[] {
+	const safeActionLabel = displayText(actionLabel, TRUNCATE_LENGTHS.TITLE);
 	return [
-		{ value: "no", label: `No, keep it` },
-		{ value: "yes", label: `Yes, ${actionLabel}` },
+		{ value: "no", label: "No, keep it" },
+		{ value: "yes", label: `Yes, ${safeActionLabel}` },
 	];
 }

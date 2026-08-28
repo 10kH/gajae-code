@@ -443,6 +443,7 @@ import {
 } from "./contribution-prep";
 import { canonicalCoordinatorToolLabel } from "./coordinator-tool-label";
 import { pruneStaleFileMentions } from "./file-mention-pruning";
+import { describeFoldReceipt, FOLD_WAKE_MERGE_WINDOW_MS, type FoldAdapter, FoldCoordinator } from "./fold-coordinator";
 import type { MemoryGuardRestoreResult } from "./memory-guard-checkpoint-participant";
 import {
 	type BashExecutionMessage,
@@ -471,7 +472,6 @@ import type {
 	SessionManagerCloseOutcome,
 	SessionMemoryStats,
 } from "./session-manager";
-
 import {
 	createReadonlySessionManager,
 	getLatestCompactionEntry,
@@ -488,6 +488,8 @@ import {
 	bindToolLineage,
 	classifyOwnedEnvelope,
 	isOwnedCompletionEnvelope,
+	isOwnedCompletionEnvelopeAllowed,
+	lookupOwnedRegistration,
 	lookupTerminalScope,
 	mintTurnLineageIdHash,
 	type OwnedCompletionEnvelope,
@@ -496,10 +498,34 @@ import {
 	settleToolLineageRegistrationWindow,
 	unregisterOwnedRegistration,
 } from "./terminal-abort";
-
 import { ToolChoiceQueue } from "./tool-choice-queue";
 import { pruneSupersededMaintenanceReminders, pruneSupersededVolatileProjectContext } from "./volatile-context-pruning";
 import { YieldQueue } from "./yield-queue";
+
+const ASYNC_INLINE_RESULT_MAX_CHARS = 12_000;
+const ASYNC_PREVIEW_MAX_CHARS = 4_000;
+
+async function formatParkedAsyncResult(
+	sessionManager: SessionManager,
+	result: string,
+	allowArtifact = true,
+): Promise<string> {
+	if (result.length <= ASYNC_INLINE_RESULT_MAX_CHARS) return result;
+	const preview = `${result.slice(0, ASYNC_PREVIEW_MAX_CHARS)}\n\n[Output truncated. Showing first ${ASYNC_PREVIEW_MAX_CHARS.toLocaleString()} characters.]`;
+	try {
+		if (!allowArtifact) return preview;
+		const { path: artifactPath, id: artifactId } = await sessionManager.allocateArtifactPath("async");
+		if (artifactPath && artifactId) {
+			await Bun.write(artifactPath, result);
+			return `${preview}\nFull output: artifact://${artifactId}`;
+		}
+	} catch (error) {
+		logger.warn("Failed to persist parked async follow-up artifact", {
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
+	return preview;
+}
 
 /**
  * #4560: structured workflow recovery projection from canonical durable
@@ -2608,7 +2634,88 @@ export class AgentSession {
 		onPersisted?: () => void;
 		appendedToAgent: boolean;
 	}> = [];
-	#foregroundBashBackgroundRequestHandler: (() => void) | undefined;
+	/**
+	 * Set by a fold and consumed once by the pause checkpoint, so a fold ends its
+	 * own turn without pausing any later turn.
+	 */
+	#foldStopRequested = false;
+	/**
+	 * The single linearization point for folding a foreground wait. Arrow deps
+	 * capture `this` but are only invoked after construction.
+	 */
+	readonly #foldCoordinator = new FoldCoordinator({
+		hasActiveTurn: () => this.activePromptHandle !== undefined,
+		armSteeringFence: () => {
+			this.agent.setSteeringAdmissionFence(() => true);
+			return () => this.agent.setSteeringAdmissionFence(undefined);
+		},
+		requestStop: () => {
+			this.#foldStopRequested = true;
+		},
+		captureRemainingIntent: () => this.#captureRemainingIntentForFold(),
+		// A parked completion replayed after the fold must schedule its own wake.
+		// This mirrors exactly what the sdk delivery seam does for a live receipt
+		// delivery, so the parked path cannot rely on an unrelated idle rearm.
+		deliverParked: (job, disposition) => {
+			const endpointId = this.#ownedAsyncJobManager
+				? AsyncJobManager.endpointIdOf(this.#ownedAsyncJobManager)
+				: undefined;
+			const registration = lookupOwnedRegistration(job.id, job.generation, endpointId);
+			if (this.#ownedAsyncJobManager?.isDeliverySuppressed(job.id, job.generation)) {
+				this.#ownedAsyncJobManager.clearParkedDelivery(job.generation);
+				return;
+			}
+			if (this.#foldCoordinator.claimCompletionNotice(job)) {
+				this.emitNotice(
+					"info",
+					`Folded job ${disposition.receipt.jobId} (${disposition.receipt.label}) finished.`,
+					"fold",
+				);
+			}
+			const ownedCompletion = registration
+				? {
+						lineageIdHash: registration.lineageIdHash,
+						promptAttemptEpoch: registration.promptAttemptEpoch,
+						registration,
+					}
+				: undefined;
+			const allowArtifact = ownedCompletion === undefined || isOwnedCompletionEnvelopeAllowed(ownedCompletion);
+			void formatParkedAsyncResult(this.sessionManager, disposition.text, allowArtifact)
+				.then(formattedResult => {
+					const manager = this.#ownedAsyncJobManager;
+					if (manager?.isDeliverySuppressed(job.id, job.generation)) {
+						manager.clearParkedDelivery(job.generation);
+						return;
+					}
+					if (!this.#foldCoordinator.claimCompletionDelivery(job)) {
+						manager?.clearParkedDelivery(job.generation);
+						return;
+					}
+					try {
+						manager?.retainDeliveryClaim(job);
+						if (manager?.isDeliverySuppressed(job.id, job.generation)) {
+							manager.releaseDeliveryClaim(job.generation);
+							manager.clearParkedDelivery(job.generation);
+							return;
+						}
+						this.yieldQueue.enqueue("async-result", {
+							jobId: disposition.receipt.jobId,
+							generation: disposition.receipt.jobGeneration,
+							result: `${formattedResult}\n\n${describeFoldReceipt(disposition.receipt)}`,
+							job,
+							durationMs: undefined,
+							ownedCompletion,
+						});
+					} finally {
+						manager?.clearParkedDelivery(job.generation);
+					}
+				})
+				.catch(error => {
+					this.#ownedAsyncJobManager?.clearParkedDelivery(job.generation);
+					logger.warn("Parked folded delivery formatting failed", { error: String(error) });
+				});
+		},
+	});
 
 	// Python execution state
 	#evalAbortControllers = new Set<AbortController>();
@@ -3915,11 +4022,32 @@ export class AgentSession {
 					async () => {
 						await run();
 					},
-					{ delayMs: 1 },
+					// One merge window, so staggered completions share a single wake
+					// turn instead of each buying its own.
+					{ delayMs: FOLD_WAKE_MERGE_WINDOW_MS },
 				);
 			},
 		});
 		this.agent.setOnBeforeYield(() => this.yieldQueue.flush("streaming"));
+		// Stop-after-result, never abort: a fold arms this once and the loop ends the
+		// turn at its next checkpoint. Consuming the flag here keeps the pause scoped
+		// to the folded turn instead of pausing everything that follows. The
+		// config-provided checkpoint (subagent requestPause, RLM research) is OR-ed
+		// in, never replaced.
+		// sdk/session.ts threads the config's shouldPause into new Agent, so the
+		// Agent's current checkpoint IS the config-provided one (subagent
+		// requestPause, RLM research). Capture and OR it rather than replace it.
+		const configuredShouldPause = this.agent.shouldPause;
+		this.agent.setShouldPause(() => {
+			if (configuredShouldPause?.() === true) return true;
+			if (!this.#foldStopRequested) return false;
+			this.#foldStopRequested = false;
+			// The folded turn has now actually stopped: steering admission must be
+			// restored so later turns drain their queues normally (the fence stays
+			// armed from the fold until exactly this point).
+			this.agent.setSteeringAdmissionFence(undefined);
+			return true;
+		});
 		this.agent.setMaintainContext((context, lifecycle) =>
 			this.#trackMidRunMaintenance(
 				this.awaitPendingContextTransformations().then(() => this.#runMidRunMaintenance(context, lifecycle)),
@@ -7573,10 +7701,19 @@ export class AgentSession {
 			event.type === "agent_end" && !(event.stopReason === "maintenance" && event.maintenanceOutcome !== "aborted");
 		const finishAttempt = () => {
 			if (!isTerminalAgentEnd) return;
+			// A merged wake batch whose flush fired while still streaming cleared its
+			// pending flag without rescheduling. Returning to idle is exactly when it
+			// becomes deliverable again, so rearm here rather than waiting for an
+			// unrelated enqueue.
+			this.yieldQueue.rearmIdle();
 			const isActiveAttempt =
 				deliveryScope === undefined ||
 				this.#activeAttemptScope === undefined ||
 				deliveryScope === this.#activeAttemptScope;
+			if (this.#foldStopRequested) {
+				this.#foldStopRequested = false;
+				this.agent.setSteeringAdmissionFence(undefined);
+			}
 			if (deliveryScope) {
 				this.#attemptRecordStore.retire(deliveryScope as AttemptScope);
 				this.#sdkRunTokensByAttemptScope.delete(deliveryScope as AttemptScope);
@@ -8463,13 +8600,39 @@ export class AgentSession {
 	 * handler, so Ctrl+B-style folding fails closed instead of aborting or
 	 * shell-suspending arbitrary work.
 	 */
-	registerForegroundBashBackgroundRequestHandler(handler: () => void): () => void {
-		this.#foregroundBashBackgroundRequestHandler = handler;
-		return () => {
-			if (this.#foregroundBashBackgroundRequestHandler === handler) {
-				this.#foregroundBashBackgroundRequestHandler = undefined;
-			}
-		};
+	registerForegroundFoldParticipant(adapter: FoldAdapter): () => void {
+		return this.#foldCoordinator.registerParticipant(adapter);
+	}
+
+	/** The session-owned fold coordinator, for delivery-side receipt lookup. */
+	get foldCoordinator(): FoldCoordinator {
+		return this.#foldCoordinator;
+	}
+
+	/**
+	 * Best-effort capture of what the interrupted turn still intended to do, so
+	 * the wake turn can finish the original task instead of only reporting output.
+	 */
+	#captureRemainingIntentForFold(): string | undefined {
+		const messages = this.agent.state.messages;
+		for (let index = messages.length - 1; index >= 0; index--) {
+			const message = messages[index];
+			if (message?.role !== "user") continue;
+			const content = message.content;
+			const text =
+				typeof content === "string"
+					? content
+					: Array.isArray(content)
+						? content
+								.map(block => (typeof block === "object" && block && "text" in block ? String(block.text) : ""))
+								.filter(Boolean)
+								.join("\n")
+						: "";
+			const trimmed = text.trim();
+			if (trimmed.length === 0) return undefined;
+			return trimmed.length > 2000 ? `${trimmed.slice(0, 2000)}…` : trimmed;
+		}
+		return undefined;
 	}
 
 	/**
@@ -8478,7 +8641,7 @@ export class AgentSession {
 	 * no fold target exists.
 	 */
 	hasForegroundBashBackgroundRequestHandler(): boolean {
-		return this.#foregroundBashBackgroundRequestHandler !== undefined;
+		return this.#foldCoordinator.hasFoldableParticipant();
 	}
 
 	/** Set the SDK permission policy used by guarded ACP tool execution. */
@@ -8514,11 +8677,17 @@ export class AgentSession {
 	 * Ask the active managed foreground bash call to return as a background job.
 	 * Returns false when no supported foreground tool is currently backgroundable.
 	 */
-	requestForegroundBashBackground(): boolean {
-		const handler = this.#foregroundBashBackgroundRequestHandler;
-		if (!handler) return false;
-		handler();
-		return true;
+	async requestForegroundBashBackground(): Promise<boolean> {
+		if (!this.#foldCoordinator.hasFoldableParticipant()) return false;
+		try {
+			const result = await this.#foldCoordinator.requestFold();
+			return result.status === "folded";
+		} catch (error) {
+			logger.warn("Foreground fold request failed", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return false;
+		}
 	}
 
 	/**

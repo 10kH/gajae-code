@@ -1,7 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { type AgentMessage, ThinkingLevel } from "@gajae-code/agent-core";
-import { type AutocompleteProvider, matchesKey, type SlashCommand } from "@gajae-code/tui";
+import { type AutocompleteProvider, getKeybindings, matchesKey, type SlashCommand } from "@gajae-code/tui";
 import { $pickenv, logger, sanitizeText } from "@gajae-code/utils";
 import { type AppKeybinding, KEYBINDINGS } from "../../config/keybindings";
 import { isSettingsInitialized, settings } from "../../config/settings";
@@ -1855,19 +1855,36 @@ export class InputController {
 		const now = Date.now();
 		if (now - this.#lastBackgroundFoldKeyTime > BACKGROUND_FOLD_DOUBLE_PRESS_MS) {
 			this.#lastBackgroundFoldKeyTime = now;
-			this.ctx.showStatus("Press Ctrl+B again to fold supported foreground bash into a background job");
+			const foldKeys = getKeybindings().getKeys("app.tool.backgroundFold");
+			this.ctx.showStatus(
+				`Press ${foldKeys.join(" / ")} again to fold supported foreground bash into a background job`,
+			);
 			return true;
 		}
 		this.#lastBackgroundFoldKeyTime = 0;
 
-		if (!this.ctx.session.requestForegroundBashBackground?.()) {
+		try {
+			const request = this.ctx.session.requestForegroundBashBackground?.() ?? Promise.resolve(false);
+			void request
+				.then(backgrounded => {
+					if (backgrounded) {
+						this.ctx.showStatus("Folding foreground bash into a quiet background job…");
+						return;
+					}
+					this.ctx.showWarning(
+						"No supported foreground tool can be folded. Use managed async bash/auto-background; raw Ctrl+Z/bg is not supported inside the TUI.",
+					);
+				})
+				.catch(() => {
+					this.ctx.showWarning(
+						"No supported foreground tool can be folded. Use managed async bash/auto-background; raw Ctrl+Z/bg is not supported inside the TUI.",
+					);
+				});
+		} catch {
 			this.ctx.showWarning(
 				"No supported foreground tool can be folded. Use managed async bash/auto-background; raw Ctrl+Z/bg is not supported inside the TUI.",
 			);
-			return true;
 		}
-
-		this.ctx.showStatus("Folding foreground bash into a quiet background job…");
 		return true;
 	}
 

@@ -2937,7 +2937,7 @@
 		}
 	},
 	{
-		"sourceId": "agent_session:registerForegroundBashBackgroundRequestHandler",
+		"sourceId": "agent_session:registerForegroundFoldParticipant",
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",
 		"decision": "exclude",
@@ -2992,7 +2992,7 @@
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",
 		"decision": "exclude",
-		"rationale": "internal accessor/plumbing, not a user-facing control seam",
+		"rationale": "internal accessor/plumbing, not a user-facing SDK control seam",
 		"exclusionMetadata": {
 			"adapterMappings": "not_applicable",
 			"testIds": "not_applicable"

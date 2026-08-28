@@ -18,7 +18,11 @@ import { truncateToVisualLines } from "../modes/components/visual-truncate";
 import { highlightCode, type Theme } from "../modes/theme/theme";
 import bashDescription from "../prompts/tools/bash.md" with { type: "text" };
 import type { ArtifactManager } from "../session/artifacts";
-import type { ClientBridgeTerminalExitStatus, ClientBridgeTerminalOutput } from "../session/client-bridge";
+import type {
+	ClientBridgeTerminalExitStatus,
+	ClientBridgeTerminalHandle,
+	ClientBridgeTerminalOutput,
+} from "../session/client-bridge";
 import {
 	DEFAULT_ARTIFACT_MAX_BYTES,
 	OutputSink,
@@ -62,6 +66,20 @@ import { formatToolWorkingDirectory, replaceTabs } from "./render-utils";
 import { checkTmuxSelfInjection } from "./tmux-self-injection-guard";
 import { ToolAbortError, ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
+
+function sliceTextAfterUtf8ByteOffset(text: string, offsetBytes: number): string {
+	if (offsetBytes <= 0) return text;
+	let consumed = 0;
+	let index = 0;
+	while (index < text.length && consumed < offsetBytes) {
+		const codePoint = text.codePointAt(index);
+		if (codePoint === undefined) break;
+		consumed += Buffer.byteLength(String.fromCodePoint(codePoint), "utf8");
+		index += codePoint > 0xffff ? 2 : 1;
+	}
+	return text.slice(index);
+}
+
 import { clampTimeout, TOOL_TIMEOUTS } from "./tool-timeouts";
 
 export const BASH_DEFAULT_PREVIEW_LINES = 10;
@@ -70,6 +88,7 @@ const BASH_ERROR_MAX_BYTES = 4096;
 const ARTIFACT_SAVE_DIAGNOSTIC_MAX_BYTES = 256;
 const BASH_ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const DEFAULT_AUTO_BACKGROUND_THRESHOLD_MS = 60_000;
+const ACP_RELEASE_TIMEOUT_MS = 1_000;
 const READ_ONLY_BASH_ENV: Record<string, string> = {
 	GREP_OPTIONS: "",
 	GREP_COLOR: "",
@@ -149,6 +168,27 @@ function artifactReferenceIsReachable(text: string, result: BashResult | BashInt
 		artifactTruncatedBytes === undefined ||
 		text.includes(formatArtifactReference(result.artifactId, artifactTruncatedBytes))
 	);
+}
+
+function suffixPrefixOverlap(source: string, target: string): number {
+	if (source.length === 0 || target.length === 0) return 0;
+	const prefix = new Uint32Array(target.length);
+	for (let index = 1; index < target.length; index += 1) {
+		let length = prefix[index - 1] ?? 0;
+		const code = target.charCodeAt(index);
+		while (length > 0 && code !== target.charCodeAt(length)) length = prefix[length - 1] ?? 0;
+		if (code === target.charCodeAt(length)) length += 1;
+		prefix[index] = length;
+	}
+
+	let overlap = 0;
+	for (let index = 0; index < source.length; index += 1) {
+		const code = source.charCodeAt(index);
+		while (overlap > 0 && code !== target.charCodeAt(overlap)) overlap = prefix[overlap - 1] ?? 0;
+		if (code === target.charCodeAt(overlap)) overlap += 1;
+		if (overlap === target.length && index < source.length - 1) overlap = prefix[overlap - 1] ?? 0;
+	}
+	return overlap;
 }
 
 function artifactFailureDiagnosticForResult(result: BashResult | BashInteractiveResult): string | undefined {
@@ -289,6 +329,48 @@ function formatClientTerminalAbortFailure(
 		cancelled: true,
 	};
 	return formatBashFailureMessage(result, outputText, "Command aborted");
+}
+
+function formatClientTerminalReadFailure(
+	prepared: PreparedClientTerminalOutput,
+	readDiagnostic: string,
+	pendingNotices: readonly string[] = [],
+): string {
+	const notices = [
+		...pendingNotices,
+		...(prepared.current.truncated || prepared.locallyTruncated ? ["(output truncated)"] : []),
+		...(prepared.artifactSaveNotice ? [prepared.artifactSaveNotice] : []),
+		`Terminal output recovery failed: ${readDiagnostic}`,
+	];
+	const outputText = [prepared.summary.output || "(no output)", ...notices].filter(Boolean).join("\n");
+	const result: BashResult = {
+		...prepared.summary,
+		exitCode: undefined,
+		cancelled: false,
+	};
+	return formatBashFailureMessage(result, outputText, "Terminal output read failed");
+}
+
+function formatClientTerminalWaitFailure(
+	prepared: PreparedClientTerminalOutput,
+	waitDiagnostic: string,
+	readDiagnostic?: string,
+	pendingNotices: readonly string[] = [],
+): string {
+	const notices = [
+		...pendingNotices,
+		...(prepared.current.truncated || prepared.locallyTruncated ? ["(output truncated)"] : []),
+		...(prepared.artifactSaveNotice ? [prepared.artifactSaveNotice] : []),
+		`Terminal wait failed: ${waitDiagnostic}`,
+		...(readDiagnostic ? [`Terminal output recovery failed: ${readDiagnostic}`] : []),
+	];
+	const outputText = [prepared.summary.output || "(no output)", ...notices].filter(Boolean).join("\n");
+	const result: BashResult = {
+		...prepared.summary,
+		exitCode: undefined,
+		cancelled: false,
+	};
+	return formatBashFailureMessage(result, outputText, "Terminal wait failed");
 }
 
 function appendArtifactDetails(text: string, result: BashResult | BashInteractiveResult): string {
@@ -466,6 +548,21 @@ interface ManagedBashJobHandle {
 	completion: Promise<ManagedBashJobCompletion>;
 	getLatestText: () => string;
 	setBackgrounded: (backgrounded: boolean) => void;
+}
+
+/** The placeholder a folded PTY hands back to its (now finished) foreground call. */
+function interactiveResultFromText(text: string): BashInteractiveResult {
+	return {
+		exitCode: undefined,
+		cancelled: false,
+		timedOut: false,
+		output: text,
+		outputBytes: 0,
+		outputLines: 0,
+		totalBytes: 0,
+		totalLines: 0,
+		truncated: false,
+	};
 }
 
 function normalizeResultOutput(result: BashResult | BashInteractiveResult): string {
@@ -648,6 +745,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		this.description = prompt.render(bashDescription, {
 			asyncEnabled: this.#asyncEnabled,
 			autoBackgroundEnabled: this.#autoBackgroundEnabled,
+			foregroundFoldEnabled: this.session.registerForegroundFoldParticipant !== undefined,
 			autoBackgroundThresholdSeconds: Math.max(0, Math.floor(this.#autoBackgroundThresholdMs / 1000)),
 			hasAstGrep: this.session.settings.get("astGrep.enabled"),
 			hasAstEdit: this.session.settings.get("astEdit.enabled"),
@@ -732,12 +830,15 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		label: string,
 		previewText: string,
 		timeoutSec: number,
-		options: { requestedTimeoutSec?: number; notices?: readonly string[] } = {},
+		options: { requestedTimeoutSec?: number; notices?: readonly string[]; terminalId?: string } = {},
 	): AgentToolResult<BashToolDetails> {
 		const details: BashToolDetails = {
 			timeoutSeconds: timeoutSec,
 			async: { state: "running", jobId, type: "bash" },
 		};
+		// A folded client terminal keeps its remote handle, so the editor's live
+		// terminal card stays bound to the same id after the fold.
+		if (options.terminalId !== undefined) details.terminalId = options.terminalId;
 		if (options.requestedTimeoutSec !== undefined && options.requestedTimeoutSec !== timeoutSec) {
 			details.requestedTimeoutSeconds = options.requestedTimeoutSec;
 		}
@@ -775,6 +876,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		resolvedEnv?: Record<string, string>;
 		onUpdate?: AgentToolUpdateCallback<BashToolDetails>;
 		startBackgrounded: boolean;
+		onCompletion?: () => void;
 		/** Immutable attempt-scoped tool call id, when executed via a tool call. */
 		toolCallId?: string;
 	}): ManagedBashJobHandle {
@@ -845,12 +947,14 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					});
 					const finalText = this.#extractTextResult(finalResult);
 					latestText = finalText;
+					options.onCompletion?.();
 					completion.resolve({ kind: "completed", result: finalResult });
 					await reportProgress(finalText, completedDetails(jobId));
 					return finalText;
 				} catch (error) {
 					const message = error instanceof Error ? error.message : String(error);
 					latestText = message;
+					options.onCompletion?.();
 					completion.resolve({ kind: "failed", error, result: executionResult });
 					await reportProgress(message, failedDetails(jobId));
 					throw error;
@@ -867,6 +971,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				},
 			},
 		);
+		const jobGeneration = manager.getJob(jobId)?.generation ?? jobId;
+		const unregisterOwnerCleanup = manager.registerOwnerCleanup(this.session.getAgentId?.() ?? "0-Main", () => {
+			manager.failNow(jobId, jobGeneration, "Bash job owner was torn down.");
+		});
+		void completion.promise.finally(unregisterOwnerCleanup);
 		registerOwnedIfLineaged(manager, options.toolCallId, jobId, this.session.getSessionId?.() ?? undefined);
 
 		return {
@@ -893,9 +1002,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	 */
 	#resolveOwnedJobManager(): AsyncJobManager | undefined {
 		const endpointId = this.session.getSessionId?.() ?? undefined;
-		return (
-			this.session.getAsyncJobManager?.() ?? AsyncJobManager.forEndpoint(endpointId) ?? AsyncJobManager.instance()
-		);
+		if (this.session.getAsyncJobManager) return this.session.getAsyncJobManager();
+		return AsyncJobManager.forEndpoint(endpointId) ?? AsyncJobManager.instance();
 	}
 
 	async #waitForManagedBashJob(
@@ -1165,6 +1273,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		if (!manager) {
 			throw new ToolError("Async job manager unavailable for this session.");
 		}
+		if (!manager.hasCapacity()) {
+			throw new ToolError("Background job limit reached. Wait for running jobs to finish or cancel one.");
+		}
 		const prepared = await this.#prepareBashExecution(input, opts.ctx);
 		const label =
 			opts.label ?? (prepared.command.length > 120 ? `${prepared.command.slice(0, 117)}...` : prepared.command);
@@ -1289,6 +1400,13 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		if (this.session.bashRestrictionProfile === "read-only" && pty) {
 			throw new ToolError("Read-only bash does not allow PTY mode.");
 		}
+		const admissionManager = this.#resolveOwnedJobManager();
+		if (asyncRequested && !admissionManager) {
+			throw new ToolError("Async job manager unavailable for this session.");
+		}
+		if (admissionManager && !admissionManager.hasCapacity()) {
+			throw new ToolError("Background job limit reached. Wait for running jobs to finish or cancel one.");
+		}
 
 		const prepared = await this.#prepareBashExecution(
 			{ command: rawCommand, env: rawEnv, timeout: rawTimeout, cwd },
@@ -1309,7 +1427,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			// that was the process-global instance may have been disposed,
 			// clearing instance() while THIS session's manager stays
 			// registered by endpoint (review thread P1).
-			if (!this.#resolveOwnedJobManager()) {
+			const asyncManager = admissionManager ?? this.#resolveOwnedJobManager();
+			if (!asyncManager) {
 				throw new ToolError("Async job manager unavailable for this session.");
 			}
 			const job = this.#startManagedBashJob({
@@ -1325,6 +1444,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				startBackgrounded: true,
 				toolCallId,
 			});
+			const jobGeneration = asyncManager.getJob(job.jobId)?.generation ?? job.jobId;
+			job.setBackgrounded(true);
+			asyncManager.markBackgrounded(job.jobId, jobGeneration);
 			return this.#buildBackgroundStartResult(job.jobId, job.label, "", timeoutSec, {
 				requestedTimeoutSec,
 				notices: pendingNotices,
@@ -1345,13 +1467,17 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		// and unregistering — the process-global instance may belong to a different
 		// concurrent top-level session (review thread P1).
 		const ownedManager = this.#resolveOwnedJobManager();
-		if (!pty && ownedManager && (this.#autoBackgroundEnabled || !clientTerminalActive)) {
+		// The client-terminal path is now itself manager-backed and foldable, so it no
+		// longer has to be bypassed to make folding work. A capable ACP session keeps
+		// its terminal contract and still folds.
+		if (!pty && ownedManager && !clientTerminalActive) {
 			// With auto-background off, wait past the command's own timeout so the job only
 			// leaves the foreground on an explicit Ctrl+B fold, never on an auto-background timer.
 			const autoBackgroundWaitMs = this.#autoBackgroundEnabled
 				? this.#resolveAutoBackgroundWaitMs(timeoutMs)
 				: timeoutMs + 1_000;
 			const startBackgrounded = autoBackgroundWaitMs === 0;
+			let managedForegroundSettled = false;
 			const job = this.#startManagedBashJob({
 				command,
 				commandCwd,
@@ -1363,18 +1489,59 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				resolvedEnv,
 				onUpdate,
 				startBackgrounded,
+				onCompletion: () => {
+					managedForegroundSettled = true;
+				},
 				toolCallId,
 			});
+			const jobGeneration = ownedManager.getJob(job.jobId)?.generation ?? job.jobId;
 			if (startBackgrounded) {
+				job.setBackgrounded(true);
+				ownedManager.markBackgrounded(job.jobId, jobGeneration);
 				return this.#buildBackgroundStartResult(job.jobId, job.label, "", timeoutSec, {
 					requestedTimeoutSec,
 					notices: pendingNotices,
 				});
 			}
 			const backgroundRequest = Promise.withResolvers<void>();
-			const unregisterBackgroundRequest = this.session.registerForegroundBashBackgroundRequestHandler?.(() => {
-				job.setBackgrounded(true);
-				backgroundRequest.resolve();
+			// Exactly one party may settle the foreground caller. detachObserver (the
+			// fold won) and resolveForegroundObserver (a completion was handed back
+			// after a failed fold) share this flag, so a race cannot double-settle.
+			let foregroundSettled = false;
+			const settleForeground = (): "resolved" | "already-settled" => {
+				if (foregroundSettled || managedForegroundSettled) return "already-settled";
+				foregroundSettled = true;
+				return "resolved";
+			};
+			const unregisterBackgroundRequest = this.session.registerForegroundFoldParticipant?.({
+				kind: "bash-managed",
+				jobId: job.jobId,
+				jobGeneration,
+				label: job.label,
+				cwdSensitive: true,
+				signal,
+				originatingTurn: ctx?.attemptScope !== undefined,
+				outputRef: {
+					jobId: job.jobId,
+					generation: jobGeneration,
+					instruction: `Use the job tool's tail operation for ${job.jobId} to read this command's output.`,
+				},
+				// Bound at registration over the manager that registered THIS job, so
+				// identity can never resolve to another manager's identically-named job.
+				getJob: () => {
+					const current = ownedManager.getJob(job.jobId);
+					return current?.generation === jobGeneration ? current : undefined;
+				},
+				detachObserver: () => {
+					const outcome = settleForeground();
+					if (outcome === "resolved") {
+						job.setBackgrounded(true);
+						ownedManager.markBackgrounded(job.jobId, jobGeneration);
+						backgroundRequest.resolve();
+					}
+					return outcome;
+				},
+				resolveForegroundObserver: () => settleForeground(),
 			});
 			let waitResult: ManagedBashJobCompletion | { kind: "running" } | { kind: "aborted" };
 			try {
@@ -1410,6 +1577,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				throw new ToolAbortError(formatManagedAbortFailure(undefined, undefined, job.getLatestText()));
 			}
 			job.setBackgrounded(true);
+			ownedManager.markBackgrounded(job.jobId, jobGeneration);
 			return this.#buildBackgroundStartResult(job.jobId, job.label, job.getLatestText(), timeoutSec, {
 				requestedTimeoutSec,
 				notices: pendingNotices,
@@ -1417,63 +1585,200 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		}
 
 		if (clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty) {
+			const clientAdmission = ownedManager?.reserveCapacity();
 			const clientHeadBytes = resolveBashOutputSinkHeadBytes(this.session.settings);
 			const clientTailBytes = resolveBashOutputSinkTailBytes(this.session.settings);
-			const handle = await clientBridge.createTerminal({
-				command,
-				cwd: commandCwd,
-				env: resolvedEnv
-					? Object.entries(resolvedEnv).map(([name, value]) => ({ name, value: value as string }))
-					: undefined,
-				outputByteLimit: clientHeadBytes > 0 ? undefined : clientTailBytes,
-			});
-
-			// Emit partial update so the editor can embed the live terminal card.
-			onUpdate?.({ content: [], details: { terminalId: handle.terminalId } });
-
-			const exitPromise = handle.waitForExit();
-			let exitStatus!: ClientBridgeTerminalExitStatus;
-
-			type BridgeRaceResult =
-				| { kind: "exit"; status: ClientBridgeTerminalExitStatus }
-				| { kind: "poll" }
+			const runBoundedCleanup = async (
+				terminal: ClientBridgeTerminalHandle,
+				operation: () => Promise<void>,
+				label: "kill" | "release",
+			): Promise<void> => {
+				const attempt = Promise.resolve()
+					.then(operation)
+					.catch((error: unknown) => {
+						logger.warn(`ACP terminal ${label} failed`, { terminalId: terminal.terminalId, error });
+					});
+				const completed = await Promise.race([
+					attempt.then(() => true),
+					Bun.sleep(ACP_RELEASE_TIMEOUT_MS).then(() => false),
+				]);
+				if (!completed) logger.warn(`ACP terminal ${label} timed out`, { terminalId: terminal.terminalId });
+			};
+			const createPromise = Promise.resolve().then(() =>
+				clientBridge.createTerminal!({
+					command,
+					cwd: commandCwd,
+					env: resolvedEnv
+						? Object.entries(resolvedEnv).map(([name, value]) => ({ name, value: value as string }))
+						: undefined,
+					outputByteLimit: clientHeadBytes > 0 ? undefined : clientTailBytes,
+				}),
+			);
+			const timeout = Promise.withResolvers<{ kind: "timeout" }>();
+			const abort = Promise.withResolvers<{ kind: "aborted" }>();
+			const onCreateAbort = (): void => abort.resolve({ kind: "aborted" });
+			if (signal?.aborted) onCreateAbort();
+			else signal?.addEventListener("abort", onCreateAbort, { once: true });
+			const createTimer = setTimeout(() => timeout.resolve({ kind: "timeout" }), timeoutMs);
+			let createOutcome:
+				| { kind: "created"; handle: ClientBridgeTerminalHandle }
 				| { kind: "timeout" }
 				| { kind: "aborted" };
+			try {
+				createOutcome = await Promise.race([
+					createPromise.then(handle => ({ kind: "created" as const, handle })),
+					timeout.promise,
+					abort.promise,
+				]);
+			} catch (error) {
+				if (clientAdmission) ownedManager?.releaseCapacity(clientAdmission);
+				throw error;
+			} finally {
+				clearTimeout(createTimer);
+				signal?.removeEventListener("abort", onCreateAbort);
+			}
 
-			// Set up abort listener before entering the poll loop. The listener
-			// kicks off `handle.kill()` synchronously so a `session/cancel`
-			// arriving mid-poll terminates the remote command immediately,
-			// instead of waiting for the next `currentOutput()` to return.
-			const { promise: abortedP, resolve: resolveAborted } = Promise.withResolvers<void>();
+			if (createOutcome.kind !== "created") {
+				void createPromise
+					.then(async lateHandle => {
+						await runBoundedCleanup(lateHandle, () => lateHandle.kill(), "kill");
+						await runBoundedCleanup(lateHandle, () => lateHandle.release(), "release");
+					})
+					.catch((error: unknown) => {
+						logger.warn("ACP terminal late create cleanup failed", { error });
+					});
+				if (clientAdmission) ownedManager?.releaseCapacity(clientAdmission);
+				if (createOutcome.kind === "aborted") throw new ToolAbortError("Command aborted");
+				throw new ToolError(`Command timed out after ${timeoutSec} seconds`);
+			}
+
+			let handle: ClientBridgeTerminalHandle;
+			handle = createOutcome.handle;
+
+			// The remote terminal is released exactly once, by whichever path settles
+			// it: a foreground return, a folded background completion, or a failure.
+			let released = false;
+			const releaseTerminalOnce = async (): Promise<void> => {
+				if (released) return;
+				released = true;
+				await runBoundedCleanup(handle, () => handle.release(), "release");
+			};
 			let killPromise: Promise<void> | undefined;
 			const fireKill = (): Promise<void> => {
 				if (killPromise) return killPromise;
-				killPromise = handle.kill().catch((error: unknown) => {
+				try {
+					killPromise = Promise.resolve(handle.kill()).catch((error: unknown) => {
+						logger.warn("ACP terminal kill failed", { terminalId: handle.terminalId, error });
+					});
+				} catch (error) {
 					logger.warn("ACP terminal kill failed", { terminalId: handle.terminalId, error });
-				});
+					killPromise = Promise.resolve();
+				}
 				return killPromise;
 			};
-			const onAbortSignal = () => {
-				resolveAborted();
-				void fireKill();
+			const boundedKill = async (): Promise<void> => {
+				await runBoundedCleanup(handle, fireKill, "kill");
 			};
-			signal?.addEventListener("abort", onAbortSignal, { once: true });
 
+			// Emit partial update so the editor can embed the live terminal card.
 			try {
+				onUpdate?.({ content: [], details: { terminalId: handle.terminalId } });
+			} catch (error) {
+				await boundedKill();
+				await releaseTerminalOnce();
+				if (clientAdmission) ownedManager?.releaseCapacity(clientAdmission);
+				throw error;
+			}
+			let latestText = "";
+			let bridgeJobId!: string;
+			let bridgeBackgrounded = false;
+			let retainedAcpSnapshot = "";
+			let retainedAcpTruncated = false;
+			const ACP_RAW_OVERLAP_BYTES = 512 * 1024;
+			const appendAcpSnapshot = (snapshot: string, upstreamTruncated = false): void => {
+				retainedAcpTruncated ||= upstreamTruncated;
+				if (!snapshot) return;
+				const snapshotBytes = Buffer.byteLength(snapshot, "utf8");
+				const retainedBytes = Buffer.byteLength(retainedAcpSnapshot, "utf8");
+				const boundedSnapshot =
+					snapshotBytes > ACP_RAW_OVERLAP_BYTES
+						? sliceTextAfterUtf8ByteOffset(snapshot, snapshotBytes - ACP_RAW_OVERLAP_BYTES)
+						: snapshot;
+				const boundedRetained =
+					retainedBytes > ACP_RAW_OVERLAP_BYTES
+						? sliceTextAfterUtf8ByteOffset(retainedAcpSnapshot, retainedBytes - ACP_RAW_OVERLAP_BYTES)
+						: retainedAcpSnapshot;
+				const overlap = suffixPrefixOverlap(boundedRetained, boundedSnapshot);
+				const delta = boundedSnapshot.slice(overlap);
+				if (bridgeJobId && delta) ownedManager?.appendOutput(bridgeJobId, delta);
+				retainedAcpSnapshot = boundedSnapshot;
+				retainedAcpTruncated ||= snapshotBytes > ACP_RAW_OVERLAP_BYTES;
+			};
+			const retainedAcpOutput = (): ClientBridgeTerminalOutput => ({
+				output: retainedAcpSnapshot,
+				truncated: retainedAcpTruncated,
+			});
+
+			const runToCompletion = async (
+				runSignal: AbortSignal | undefined,
+			): Promise<AgentToolResult<BashToolDetails>> => {
+				type BridgeRaceResult =
+					| { kind: "exit"; status: ClientBridgeTerminalExitStatus }
+					| { kind: "wait-failed"; error: unknown }
+					| { kind: "poll" }
+					| { kind: "timeout" }
+					| { kind: "aborted" };
+				const exitPromise = Promise.resolve().then(() => handle.waitForExit());
+				const exitRacePromise: Promise<BridgeRaceResult> = exitPromise.then(
+					status => ({ kind: "exit" as const, status }),
+					error => ({ kind: "wait-failed" as const, error }),
+				);
+				let exitStatus!: ClientBridgeTerminalExitStatus;
+
+				// Set up abort listener before entering the poll loop. The listener
+				// kicks off `handle.kill()` synchronously so a `session/cancel`
+				// arriving mid-poll terminates the remote command immediately,
+				// instead of waiting for the next `currentOutput()` to return.
+				const { promise: abortedP, resolve: resolveAborted } = Promise.withResolvers<void>();
+				const deadlineAt = Date.now() + timeoutMs;
+				const readOutput = async (
+					limitMs: number,
+					includeAbort = true,
+					includeExit = false,
+				): Promise<ClientBridgeTerminalOutput | undefined> => {
+					const timeout = Promise.withResolvers<undefined>();
+					const timer = setTimeout(() => timeout.resolve(undefined), Math.max(1, limitMs));
+					return Promise.race([
+						handle.currentOutput(),
+						...(includeAbort ? [abortedP.then(() => undefined as ClientBridgeTerminalOutput | undefined)] : []),
+						...(includeExit
+							? [exitRacePromise.then(() => undefined as ClientBridgeTerminalOutput | undefined)]
+							: []),
+						timeout.promise,
+					]).finally(() => clearTimeout(timer));
+				};
+				const onAbortSignal = () => {
+					resolveAborted();
+					void fireKill();
+				};
+				runSignal?.addEventListener("abort", onAbortSignal, { once: true });
+
 				try {
-					if (signal?.aborted) {
-						await fireKill();
+					if (runSignal?.aborted) {
+						await boundedKill();
 						let current: ClientBridgeTerminalOutput = { output: "", truncated: false };
 						let readDiagnostic: string | undefined;
 						try {
-							current = await handle.currentOutput();
+							current = (await readOutput(1_000, false)) ?? retainedAcpOutput();
 						} catch (error) {
+							current = retainedAcpOutput();
 							readDiagnostic = boundArtifactSaveDiagnostic(error);
 							logger.warn("ACP terminal aborted output read failed", {
 								terminalId: handle.terminalId,
 								error,
 							});
 						}
+						appendAcpSnapshot(current.output, current.truncated);
 						const prepared = await prepareClientTerminalOutput(this.session, current);
 						throw new ToolAbortError(formatClientTerminalAbortFailure(prepared, readDiagnostic, pendingNotices));
 					}
@@ -1482,31 +1787,59 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					// Poll until the process exits, times out, or the caller aborts.
 					for (;;) {
 						const racers: Array<Promise<BridgeRaceResult>> = [
-							exitPromise.then(s => ({ kind: "exit" as const, status: s })),
+							exitRacePromise,
 							timeoutPromise,
 							Bun.sleep(250).then(() => ({ kind: "poll" as const })),
 						];
-						if (signal) {
+						if (runSignal) {
 							racers.push(abortedP.then(() => ({ kind: "aborted" as const })));
 						}
 						const raced = await Promise.race(racers);
 
-						if (raced.kind === "aborted" || signal?.aborted) {
-							await fireKill();
+						if (raced.kind === "aborted" || runSignal?.aborted) {
+							await boundedKill();
 							let current: ClientBridgeTerminalOutput = { output: "", truncated: false };
 							let readDiagnostic: string | undefined;
 							try {
-								current = await handle.currentOutput();
+								current = (await readOutput(1_000, false)) ?? retainedAcpOutput();
 							} catch (error) {
+								current = retainedAcpOutput();
 								readDiagnostic = boundArtifactSaveDiagnostic(error);
 								logger.warn("ACP terminal aborted output read failed", {
 									terminalId: handle.terminalId,
 									error,
 								});
 							}
+							appendAcpSnapshot(current.output, current.truncated);
 							const prepared = await prepareClientTerminalOutput(this.session, current);
 							throw new ToolAbortError(
 								formatClientTerminalAbortFailure(prepared, readDiagnostic, pendingNotices),
+							);
+						}
+
+						if (raced.kind === "wait-failed") {
+							await boundedKill();
+							let current: ClientBridgeTerminalOutput = { output: "", truncated: false };
+							let readDiagnostic: string | undefined;
+							try {
+								current = (await readOutput(1_000, false)) ?? retainedAcpOutput();
+							} catch (error) {
+								current = retainedAcpOutput();
+								readDiagnostic = boundArtifactSaveDiagnostic(error);
+								logger.warn("ACP terminal output recovery after wait failure failed", {
+									terminalId: handle.terminalId,
+									error,
+								});
+							}
+							appendAcpSnapshot(current.output, current.truncated);
+							const prepared = await prepareClientTerminalOutput(this.session, current);
+							throw new ToolError(
+								formatClientTerminalWaitFailure(
+									prepared,
+									boundArtifactSaveDiagnostic(raced.error),
+									readDiagnostic,
+									pendingNotices,
+								),
 							);
 						}
 
@@ -1515,18 +1848,20 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							// RPC cannot let a timed-out command keep running past the
 							// enforced timeout. The handle stays valid post-kill so the
 							// buffered output is still readable.
-							await fireKill();
+							await boundedKill();
 							let current: ClientBridgeTerminalOutput = { output: "", truncated: false };
 							let readDiagnostic: string | undefined;
 							try {
-								current = await handle.currentOutput();
+								current = (await readOutput(1_000, false)) ?? retainedAcpOutput();
 							} catch (error) {
+								current = retainedAcpOutput();
 								readDiagnostic = boundArtifactSaveDiagnostic(error);
 								logger.warn("ACP terminal final output read failed", {
 									terminalId: handle.terminalId,
 									error,
 								});
 							}
+							appendAcpSnapshot(current.output, current.truncated);
 							const prepared = await prepareClientTerminalOutput(this.session, current);
 							const timeoutNotices = [
 								...pendingNotices,
@@ -1555,13 +1890,24 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						// Poll tick: push current output so agent-loop transcript stays consistent.
 						// Race the read against abort so a stuck `terminal/output` RPC does not
 						// delay cancellation.
-						const pollOutput = await Promise.race([
-							handle.currentOutput(),
-							abortedP.then(() => undefined as ClientBridgeTerminalOutput | undefined),
-						]);
+						let pollOutput: ClientBridgeTerminalOutput | undefined;
+						try {
+							pollOutput = await readOutput(Math.max(1, deadlineAt - Date.now()), true, true);
+						} catch (error) {
+							await boundedKill();
+							const diagnostic = boundArtifactSaveDiagnostic(error);
+							const recoveredOutput = retainedAcpOutput();
+							appendAcpSnapshot(recoveredOutput.output, recoveredOutput.truncated);
+							const prepared = await prepareClientTerminalOutput(this.session, recoveredOutput);
+							logger.warn("ACP terminal poll output read failed", {
+								terminalId: handle.terminalId,
+								error,
+							});
+							throw new ToolError(formatClientTerminalReadFailure(prepared, diagnostic, pendingNotices));
+						}
 						if (pollOutput === undefined) {
 							// Abort fired during the poll-tick read; let the next loop iteration
-							// observe `signal?.aborted` and exit via the abort branch.
+							// observe `runSignal?.aborted` and exit via the abort branch.
 							continue;
 						}
 						const { summary, locallyTruncated } = await boundClientTerminalOutput(
@@ -1573,40 +1919,80 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							pollOutput.truncated || locallyTruncated
 								? `${summary.output}${summary.output.endsWith("\n") ? "" : "\n"}(output truncated)`
 								: summary.output;
-						onUpdate?.({
-							content: [{ type: "text", text: pollText }],
-							details: { terminalId: handle.terminalId },
-						});
+						latestText = pollText;
+						appendAcpSnapshot(pollOutput.output, pollOutput.truncated);
+						if (!bridgeBackgrounded) {
+							try {
+								onUpdate?.({
+									content: [{ type: "text", text: pollText }],
+									details: { terminalId: handle.terminalId },
+								});
+							} catch (error) {
+								await boundedKill();
+								const diagnostic = boundArtifactSaveDiagnostic(error);
+								const recoveredOutput = retainedAcpOutput();
+								const prepared = await prepareClientTerminalOutput(this.session, recoveredOutput);
+								throw new ToolError(formatClientTerminalReadFailure(prepared, diagnostic, pendingNotices));
+							}
+						}
 					}
 				} finally {
-					signal?.removeEventListener("abort", onAbortSignal);
+					runSignal?.removeEventListener("abort", onAbortSignal);
 				}
 
-				if (signal?.aborted) {
-					await fireKill();
+				if (runSignal?.aborted) {
+					await boundedKill();
 					let current: ClientBridgeTerminalOutput = { output: "", truncated: false };
 					let readDiagnostic: string | undefined;
 					try {
-						current = await handle.currentOutput();
+						current = (await readOutput(1_000, false)) ?? retainedAcpOutput();
 					} catch (error) {
+						current = retainedAcpOutput();
 						readDiagnostic = boundArtifactSaveDiagnostic(error);
 						logger.warn("ACP terminal aborted output read failed", {
 							terminalId: handle.terminalId,
 							error,
 						});
 					}
+					appendAcpSnapshot(current.output, current.truncated);
 					const prepared = await prepareClientTerminalOutput(this.session, current);
 					throw new ToolAbortError(formatClientTerminalAbortFailure(prepared, readDiagnostic, pendingNotices));
 				}
 
 				// Fetch final output; the terminal is released in the outer finally.
-				const finalOutput = await handle.currentOutput();
+				let finalReadDiagnostic: string | undefined;
+				let finalOutput: ClientBridgeTerminalOutput;
+				try {
+					const recovered = await readOutput(1_000, false);
+					if (recovered === undefined) {
+						finalOutput = retainedAcpOutput();
+						finalReadDiagnostic = "terminal/output read timed out";
+					} else {
+						finalOutput = recovered;
+					}
+				} catch (error) {
+					finalOutput = retainedAcpOutput();
+					finalReadDiagnostic = boundArtifactSaveDiagnostic(error);
+					logger.warn("ACP terminal final output read failed", {
+						terminalId: handle.terminalId,
+						error,
+					});
+				}
+				if (runSignal?.aborted) {
+					await boundedKill();
+					appendAcpSnapshot(finalOutput.output, finalOutput.truncated);
+					const prepared = await prepareClientTerminalOutput(this.session, finalOutput);
+					throw new ToolAbortError(
+						formatClientTerminalAbortFailure(prepared, finalReadDiagnostic, pendingNotices),
+					);
+				}
 
 				// Map exit status: null exitCode with a signal → treat as signal kill (137).
 				const rawExitCode = exitStatus.exitCode;
 				const exitCode: number | undefined =
 					rawExitCode != null ? rawExitCode : exitStatus.signal ? 137 : undefined;
 
+				appendAcpSnapshot(finalOutput.output, finalOutput.truncated);
 				const prepared = await prepareClientTerminalOutput(this.session, finalOutput);
 
 				const bridgeResult: BashResult = {
@@ -1619,19 +2005,188 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				if (finalOutput.truncated || prepared.locallyTruncated) bridgeNotices.push("(output truncated)");
 				for (const notice of pendingNotices) bridgeNotices.push(notice);
 				if (prepared.artifactSaveNotice) bridgeNotices.push(prepared.artifactSaveNotice);
+				if (finalReadDiagnostic) bridgeNotices.push(`Terminal output recovery failed: ${finalReadDiagnostic}`);
 
 				return this.#buildCompletedResult(bridgeResult, timeoutSec, {
 					requestedTimeoutSec,
 					notices: bridgeNotices,
 					terminalId: handle.terminalId,
 				});
-			} finally {
+			};
+
+			// Without a job manager nothing can fold this, so ownership never leaves the
+			// foreground call.
+			if (!ownedManager) {
 				try {
-					await handle.release();
-				} catch (error) {
-					logger.warn("ACP terminal release failed", { terminalId: handle.terminalId, error });
+					return await runToCompletion(signal);
+				} finally {
+					await releaseTerminalOnce();
 				}
 			}
+
+			// Manager-backed runner: the remote command keeps running after a fold and
+			// its completion is delivered like any other background job. createTerminal
+			// already ran above, so exactly ONE remote handle exists and is retained
+			// across the fold.
+			const bridgeManager = ownedManager;
+			const bridgeEndpointId = this.session.getSessionId?.() ?? "local";
+			const bridgeLabel = command.length > 120 ? `${command.slice(0, 117)}...` : command;
+			const bridgeCompletion = Promise.withResolvers<ManagedBashJobCompletion>();
+			let bridgeForegroundSettled = false;
+			const settleBridgeForeground = (): "resolved" | "already-settled" => {
+				if (bridgeForegroundSettled) return "already-settled";
+				bridgeForegroundSettled = true;
+				return "resolved";
+			};
+
+			try {
+				bridgeJobId = bridgeManager.register(
+					"bash",
+					bridgeLabel,
+					async ({ jobId, signal: runSignal, reportProgress }) => {
+						try {
+							const result = await runToCompletion(runSignal);
+							const finalText = this.#extractTextResult(result);
+							latestText = finalText;
+							if (!bridgeBackgrounded) settleBridgeForeground();
+							bridgeCompletion.resolve({ kind: "completed", result });
+							await reportProgress(
+								finalText,
+								bridgeBackgrounded ? { async: { state: "completed", jobId, type: "bash" } } : undefined,
+							);
+							return finalText;
+						} catch (error) {
+							const message = error instanceof Error ? error.message : String(error);
+							latestText = message;
+							if (!bridgeBackgrounded) settleBridgeForeground();
+							bridgeCompletion.resolve({ kind: "failed", error });
+							await reportProgress(
+								message,
+								bridgeBackgrounded ? { async: { state: "failed", jobId, type: "bash" } } : undefined,
+							);
+							throw error;
+						} finally {
+							await releaseTerminalOnce();
+						}
+					},
+					{
+						ownerId: this.session.getAgentId?.() ?? undefined,
+						admissionToken: clientAdmission,
+						onProgress: async (text: string) => {
+							latestText = text;
+						},
+					},
+				);
+			} catch (error) {
+				await boundedKill();
+				await releaseTerminalOnce();
+				if (clientAdmission) ownedManager?.releaseCapacity(clientAdmission);
+				throw error;
+			}
+
+			const bridgeGeneration = bridgeManager.getJob(bridgeJobId)?.generation ?? bridgeJobId;
+			// Owner teardown must not swallow a live remote command. failNow is the one
+			// transition that both fails the job AND enqueues its delivery, so the
+			// failure stays visible instead of becoming a cancelled job that delivers
+			// nothing.
+			const unregisterOwnerCleanup = bridgeManager.registerOwnerCleanup(
+				this.session.getAgentId?.() ?? "0-Main",
+				() => {
+					void boundedKill().then(() => releaseTerminalOnce());
+					bridgeManager.failNow(bridgeJobId, bridgeGeneration, "Client terminal owner was torn down.");
+				},
+			);
+
+			const bridgeHandle: ManagedBashJobHandle = {
+				jobId: bridgeJobId,
+				label: bridgeLabel,
+				completion: bridgeCompletion.promise,
+				getLatestText: () => latestText,
+				setBackgrounded: (next: boolean) => {
+					bridgeBackgrounded = next;
+				},
+			};
+			void bridgeHandle.completion.finally(unregisterOwnerCleanup);
+			registerOwnedIfLineaged(bridgeManager, toolCallId, bridgeJobId, bridgeEndpointId);
+
+			const bridgeFoldRequest = Promise.withResolvers<void>();
+			const bridgeOriginatingTurn = ctx?.attemptScope !== undefined;
+			const unregisterBridgeFold = this.session.registerForegroundFoldParticipant?.({
+				kind: "client-terminal",
+				jobId: bridgeJobId,
+				jobGeneration: bridgeGeneration,
+				label: bridgeLabel,
+				cwdSensitive: true,
+				signal,
+				originatingTurn: bridgeOriginatingTurn,
+				outputRef: {
+					jobId: bridgeJobId,
+					generation: bridgeGeneration,
+					instruction: `Use the job tool's tail operation for ${bridgeJobId} to read this command's output.`,
+				},
+				getJob: () => {
+					const current = bridgeManager.getJob(bridgeJobId);
+					return current?.generation === bridgeGeneration ? current : undefined;
+				},
+				detachObserver: () => {
+					const outcome = settleBridgeForeground();
+					if (outcome === "resolved") {
+						bridgeHandle.setBackgrounded(true);
+						bridgeManager.markBackgrounded(bridgeJobId, bridgeGeneration);
+						bridgeFoldRequest.resolve();
+					}
+					return outcome;
+				},
+				resolveForegroundObserver: () => settleBridgeForeground(),
+			});
+
+			let bridgeWait: ManagedBashJobCompletion | { kind: "running" } | { kind: "aborted" };
+			try {
+				bridgeWait = await this.#waitForManagedBashJob(
+					bridgeHandle,
+					this.#autoBackgroundEnabled ? this.#resolveAutoBackgroundWaitMs(timeoutMs) : timeoutMs + 1_000,
+					signal,
+					bridgeFoldRequest.promise,
+				);
+			} finally {
+				unregisterBridgeFold?.();
+			}
+
+			if (bridgeWait.kind === "completed") {
+				unregisterOwnerCleanup();
+				bridgeManager.acknowledgeDeliveries([bridgeJobId]);
+				unregisterForegroundOwnedBash(bridgeManager, bridgeJobId, bridgeEndpointId);
+				return bridgeWait.result;
+			}
+			if (bridgeWait.kind === "failed") {
+				unregisterOwnerCleanup();
+				bridgeManager.acknowledgeDeliveries([bridgeJobId]);
+				unregisterForegroundOwnedBash(bridgeManager, bridgeJobId, bridgeEndpointId);
+				throw bridgeWait.error;
+			}
+			if (bridgeWait.kind === "aborted") {
+				unregisterOwnerCleanup();
+				bridgeManager.cancel(bridgeJobId);
+				const terminal = await bridgeHandle.completion;
+				bridgeManager.acknowledgeDeliveries([bridgeJobId]);
+				unregisterForegroundOwnedBash(bridgeManager, bridgeJobId, bridgeEndpointId);
+				if (terminal.kind === "failed") {
+					throw new ToolAbortError(
+						formatManagedAbortFailure(terminal.error, undefined, bridgeHandle.getLatestText()),
+					);
+				}
+				throw new ToolAbortError(formatManagedAbortFailure(undefined, undefined, bridgeHandle.getLatestText()));
+			}
+
+			// Folded (or auto-backgrounded): the remote terminal keeps running and its
+			// result arrives as a background completion.
+			bridgeHandle.setBackgrounded(true);
+			bridgeManager.markBackgrounded(bridgeJobId, bridgeGeneration);
+			return this.#buildBackgroundStartResult(bridgeJobId, bridgeLabel, bridgeHandle.getLatestText(), timeoutSec, {
+				requestedTimeoutSec,
+				notices: pendingNotices,
+				terminalId: handle.terminalId,
+			});
 		}
 
 		const spillThreshold = resolveBashOutputSinkTailBytes(this.session.settings);
@@ -1650,6 +2205,17 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				: canUseInteractiveBashPty(pty, ctx)
 					? ctx?.ui
 					: undefined;
+		const ptyAdmission = interactiveUi && ownedManager ? ownedManager.reserveCapacity() : undefined;
+		// A PTY command is foldable too: the runner owns the session, so the fold
+		// registers a job that delivers the run's real outcome after the foreground
+		// has already returned.
+		let ptyFoldUnregister: (() => void) | undefined;
+		let ptyFoldResult: AgentToolResult<BashToolDetails> | undefined;
+		let ptyBackgrounded = false;
+		let lastPtyFoldKeyTime = 0;
+		let ptyJobId!: string;
+		let ptyOutputSeen = false;
+		let ptyOutcome: BashInteractiveResult | undefined;
 		const result: BashResult | BashInteractiveResult = interactiveUi
 			? await runInteractiveBashPty(interactiveUi, {
 					command,
@@ -1663,6 +2229,140 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					artifactPublisher,
 					spillThreshold,
 					headBytes,
+					onControls: controls => {
+						if (!ownedManager) return;
+						const ptyManager = ownedManager;
+						const ptyLabel = command.length > 120 ? `${command.slice(0, 117)}...` : command;
+						const ptyOwnerId = this.session.getAgentId?.() ?? "0-Main";
+						let ptyKillStarted = false;
+						const killPtyOnce = (): void => {
+							if (ptyKillStarted) return;
+							ptyKillStarted = true;
+							try {
+								controls.kill();
+							} catch (error) {
+								logger.warn("PTY kill failed", {
+									jobId: ptyJobId,
+									error: error instanceof Error ? error.message : String(error),
+								});
+							}
+						};
+						const ownerTeardownText = (): string => {
+							const retained = ptyManager.readOutputSince(ptyJobId, 0, { ownerId: ptyOwnerId });
+							const output = ptyOutcome?.output || retained?.text || "";
+							if (!output && !ptyOutcome) return "PTY job owner was torn down.";
+							const summary = ptyOutcome ? { ...ptyOutcome, output } : interactiveResultFromText(output);
+							const body = [
+								output || "(no output)",
+								...(retained?.truncated && !ptyOutcome?.truncated ? ["(output truncated)"] : []),
+							].join("\n");
+							return formatBashFailureMessage(summary, body, "PTY job owner was torn down.");
+						};
+						// The job's runner simply awaits the run that is ALREADY executing,
+						// so registering never re-executes the command.
+						try {
+							ptyJobId = ptyManager.register(
+								"bash",
+								ptyLabel,
+								async () => {
+									let outcome: BashInteractiveResult | undefined;
+									try {
+										outcome = await controls.terminalCompletion;
+										const completed = this.#buildCompletedResult(outcome, timeoutSec, {
+											requestedTimeoutSec,
+										});
+										return this.#extractTextResult(completed);
+									} finally {
+										if (!ptyOutputSeen && outcome)
+											ptyManager.appendOutput(ptyJobId, this.#formatResultOutput(outcome));
+										if (!ptyBackgrounded) ptyManager.cancel(ptyJobId);
+									}
+								},
+								{
+									ownerId: this.session.getAgentId?.() ?? undefined,
+									admissionToken: ptyAdmission,
+									lifecycle: { onCancel: killPtyOnce },
+								},
+							);
+						} catch (error) {
+							killPtyOnce();
+							if (ptyAdmission) ptyManager.releaseCapacity(ptyAdmission);
+							throw error;
+						}
+						const ptyGeneration = ptyManager.getJob(ptyJobId)?.generation ?? ptyJobId;
+						registerOwnedIfLineaged(ptyManager, toolCallId, ptyJobId, this.session.getSessionId?.() ?? undefined);
+						const unregisterPtyOwnerCleanup = ptyManager.registerOwnerCleanup(ptyOwnerId, () => {
+							killPtyOnce();
+							ptyManager.failNow(ptyJobId, ptyGeneration, ownerTeardownText());
+						});
+						void controls.terminalCompletion.then(
+							outcome => {
+								ptyOutcome = outcome;
+							},
+							(error: unknown) => {
+								logger.warn("PTY terminal completion failed", {
+									jobId: ptyJobId,
+									error: error instanceof Error ? error.message : String(error),
+								});
+							},
+						);
+						void controls.terminalCompletion.finally(unregisterPtyOwnerCleanup);
+						ptyFoldUnregister = this.session.registerForegroundFoldParticipant?.({
+							kind: "bash-pty",
+							jobId: ptyJobId,
+							jobGeneration: ptyGeneration,
+							label: ptyLabel,
+							cwdSensitive: true,
+							signal,
+							originatingTurn: ctx?.attemptScope !== undefined,
+							outputRef: {
+								jobId: ptyJobId,
+								generation: ptyGeneration,
+								instruction: `Use the job tool's tail operation for ${ptyJobId} to read this command's output.`,
+							},
+							getJob: () => {
+								const current = ptyManager.getJob(ptyJobId);
+								return current?.generation === ptyGeneration ? current : undefined;
+							},
+							detachObserver: () => {
+								// Output-only continuation: stdin forwarding ends here and the
+								// process is never killed or restarted by folding.
+								const started = this.#buildBackgroundStartResult(ptyJobId, ptyLabel, "", timeoutSec, {
+									requestedTimeoutSec,
+									notices: pendingNotices,
+								});
+								const outcome = controls.detachObserver(
+									interactiveResultFromText(this.#extractTextResult(started)),
+								);
+								if (outcome === "resolved") {
+									controls.detachForegroundCancellation();
+									ptyBackgrounded = true;
+									ptyManager.markBackgrounded(ptyJobId, ptyGeneration);
+									ptyFoldResult = started;
+								}
+								return outcome;
+							},
+							resolveForegroundObserver: () => "already-settled",
+						});
+					},
+					onFoldKey: () => {
+						const now = Date.now();
+						if (now - lastPtyFoldKeyTime > 750) {
+							lastPtyFoldKeyTime = now;
+							return true;
+						}
+						lastPtyFoldKeyTime = 0;
+						if (!this.session.hasForegroundBashBackgroundRequestHandler?.()) return false;
+						void this.session.requestForegroundBashBackground?.();
+						return true;
+					},
+					onOutput: chunk => {
+						ptyOutputSeen = true;
+						if (ptyJobId) ownedManager?.appendOutput(ptyJobId, chunk);
+					},
+				}).catch(error => {
+					if (ptyAdmission) ownedManager?.releaseCapacity(ptyAdmission);
+					throw error;
 				})
 			: await executeBash(command, {
 					cwd: commandCwd,
@@ -1682,6 +2382,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					ignoreShellPrefix: this.session.bashRestrictionProfile === "read-only",
 					disableShellSnapshot: this.session.bashRestrictionProfile === "read-only",
 				});
+		ptyFoldUnregister?.();
+		// Folded: the foreground was settled by the fold, so return the background
+		// -start result verbatim instead of presenting a half-finished command.
+		if (ptyFoldResult) return ptyFoldResult;
+
 		if (result.cancelled) {
 			const noticeSuffix = pendingNotices.length > 0 ? `\n\n${pendingNotices.join("\n")}` : "";
 			const baseCancelledText = normalizeResultOutput(result) || "Command aborted";

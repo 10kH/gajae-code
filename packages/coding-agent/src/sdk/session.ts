@@ -70,6 +70,7 @@ import { Settings, type SkillsSettings } from "../config/settings";
 import { resolveEagerTaskDelegation } from "../config/task-delegation";
 import { CursorExecHandlers } from "../cursor";
 import { EditTool } from "../edit";
+import { describeFoldReceipt } from "../session/fold-coordinator";
 import type { BashRestrictionProfile } from "../tools/bash-allowed-prefixes";
 import { SearchTool } from "../tools/search";
 import "../discovery";
@@ -2066,13 +2067,49 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							if (asyncJobManager!.isDeliverySuppressed(jobId, job?.generation)) return;
 							const deniedOwnedDelivery =
 								ownedCompletion !== undefined && !isOwnedCompletionEnvelopeAllowed(ownedCompletion);
+							// Fold disposition is decided by the coordinator's durable slot state.
+							// `parked` means the fold transaction has not finished capturing its
+							// receipt yet; it replays this completion itself, so enqueuing here
+							// would double-deliver.
+							const foldDisposition = job
+								? session.foldCoordinator.onDelivery(job, result)
+								: ({ kind: "ordinary" } as const);
+							if (foldDisposition.kind === "parked") {
+								if (job) asyncJobManager?.retainParkedDelivery(job, result);
+								return;
+							}
 							const formattedResult = await formatAsyncResultForFollowUp(result, !deniedOwnedDelivery);
+							if (
+								foldDisposition.kind === "receipt" &&
+								job &&
+								!session.foldCoordinator.claimCompletionDelivery(job)
+							)
+								return;
+							// A folded job's result must arrive with its receipt so the wake turn
+							// completes the original task rather than merely reporting output.
+							const deliveredResult =
+								foldDisposition.kind === "receipt"
+									? `${formattedResult}\n\n${describeFoldReceipt(foldDisposition.receipt)}`
+									: formattedResult;
+							// Exactly one transcript notice per completion: a retried delivery
+							// reuses the same job object, so the claim guards against repeats.
+							if (
+								foldDisposition.kind === "receipt" &&
+								job &&
+								session.foldCoordinator.claimCompletionNotice(job)
+							) {
+								session.emitNotice(
+									"info",
+									`Folded job ${foldDisposition.receipt.jobId} (${foldDisposition.receipt.label}) finished.`,
+									"fold",
+								);
+							}
 
 							const durationMs = job ? jobElapsedMs(job) : undefined;
 							session.yieldQueue.enqueue<AsyncResultEntry>("async-result", {
 								jobId,
 								generation: job?.generation ?? "",
-								result: formattedResult,
+								result: deliveredResult,
 								job,
 								durationMs,
 								...(ownedCompletion
@@ -2085,6 +2122,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 										}
 									: {}),
 							});
+							if (job) asyncJobManager?.retainDeliveryClaim(job);
 						},
 					})
 				: options.inheritedAsyncJobManager;
@@ -2540,6 +2578,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// (review thread P1). For a top-level session this equals the
 			// session id.
 			getSessionId: () => AsyncJobManager.endpointIdOf(asyncJobManager) ?? asyncJobEndpointId,
+			registerForegroundFoldParticipant: adapter =>
+				session?.registerForegroundFoldParticipant(adapter) ?? (() => {}),
+			hasForegroundBashBackgroundRequestHandler: () => session?.hasForegroundBashBackgroundRequestHandler() ?? false,
+			requestForegroundBashBackground: () => Promise.resolve(session?.requestForegroundBashBackground() ?? false),
+
 			getCredentialSessionId: () => session?.credentialSessionId ?? credentialSessionId,
 			getMcpManager: () => mcpManager ?? options.inheritedMcpManager,
 			isManagedSessionDestination: () => sessionManager.isManagedDestination(),
@@ -4285,7 +4328,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const sessionAsyncJobManager = asyncJobManager;
 		if (sessionAsyncJobManager) {
 			session.yieldQueue.register<AsyncResultEntry>("async-result", {
-				isStale: entry => sessionAsyncJobManager.isDeliverySuppressed(entry.jobId, entry.generation),
+				isStale: entry => {
+					const stale = sessionAsyncJobManager.isDeliverySuppressed(entry.jobId, entry.generation);
+					if (stale) sessionAsyncJobManager.releaseDeliveryClaim(entry.generation);
+					return stale;
+				},
 				// Build one message per ownership origin so an owned-scope drop of
 				// one turn's message never suppresses other turns'/ordinary
 				// completions batched in the same flush (review thread P2).
@@ -4293,7 +4340,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					entry.ownedCompletion
 						? `${entry.ownedCompletion.lineageIdHash}\u0000${entry.ownedCompletion.promptAttemptEpoch}`
 						: "ordinary",
-				build: buildAsyncResultBatchMessage,
+				build: entries => {
+					try {
+						return buildAsyncResultBatchMessage(entries);
+					} finally {
+						for (const entry of entries) sessionAsyncJobManager.releaseDeliveryClaim(entry.generation);
+					}
+				},
 			});
 		}
 		session.yieldQueue.register<McpNotificationEntry>("mcp-notification", {

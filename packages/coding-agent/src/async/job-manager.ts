@@ -20,6 +20,8 @@ const DELIVERY_PREVIEW_HEAD_BYTES = 32 * 1024;
 const DELIVERY_PREVIEW_TAIL_BYTES = 32 * 1024;
 const DELIVERY_MAX_ATTEMPTS = 3;
 const MAX_DEAD_LETTERED_DELIVERIES = 50;
+const MAX_DEAD_LETTER_OVERFLOW_OWNERS = 64;
+const MAX_EVICTED_DEAD_LETTERS = 64;
 
 export interface AsyncJob {
 	id: string;
@@ -44,6 +46,8 @@ export interface AsyncJob {
 	setupFailureSummary?: string;
 	/** Safe, bounded summary of a terminal local (non-provider) failure kind. */
 	localErrorSummary?: LocalErrorSummary;
+	/** Compact delivery-failure marker retained while the job row remains live. */
+	deliveryFailure?: { attempt: number; lastError?: string; recordedAt: number };
 	metadata?: AsyncJobMetadata;
 	/**
 	 * Registry id of the agent that registered the job (e.g. "0-Main",
@@ -65,6 +69,8 @@ export function jobElapsedMs(job: Pick<AsyncJob, "startTime" | "endTime">, now: 
 }
 
 export interface AsyncJobMetadata {
+	/** Set once a foreground wait has been folded, so surfacing can show folded work. */
+	backgrounded?: boolean;
 	subagent?: {
 		id: string;
 		agent: string;
@@ -244,6 +250,11 @@ export interface AsyncJobManagerOptions {
 	onJobComplete: (jobId: string, text: string, job?: AsyncJob) => void | Promise<void>;
 	maxRunningJobs?: number;
 	retentionMs?: number;
+	maxDeadLetterOverflowOwners?: number;
+}
+
+export interface AsyncJobAdmission {
+	readonly manager: AsyncJobManager;
 }
 
 export interface AsyncJobDisposeDiagnostics {
@@ -255,6 +266,11 @@ interface AsyncJobDelivery {
 	jobId: string;
 	generation: string;
 	job: AsyncJob;
+	/** Delivery-owned public projection fields retained after the live job is evicted. */
+	kind: AsyncJob["type"];
+	label: string;
+	status: AsyncJob["status"];
+	backgrounded: boolean;
 	text: string;
 	originalBytes?: number;
 	truncated?: boolean;
@@ -262,7 +278,19 @@ interface AsyncJobDelivery {
 	nextAttemptAt: number;
 	lastError?: string;
 	ownerId?: string;
+	/** Cleanup-triggered terminal deliveries may retry while disposal drains them. */
+	retryDuringDispose: boolean;
 	promise?: Promise<void>;
+}
+
+interface AsyncJobReceiptClaim {
+	jobId: string;
+	generation: string;
+	kind: AsyncJob["type"];
+	label: string;
+	status: AsyncJob["status"];
+	backgrounded: boolean;
+	ownerId?: string;
 }
 
 interface DeadLetteredDelivery {
@@ -270,6 +298,65 @@ interface DeadLetteredDelivery {
 	generation: string;
 	attempt: number;
 	lastError?: string;
+	recordedAt: number;
+}
+
+/**
+ * A retry-cap delivery failure recorded AFTER its job record was evicted.
+ *
+ * The ordinary dead-letter map is pruned by record existence
+ * ({@link AsyncJobManager.prototype constructor}'s `#pruneEvictedDeadLetters`),
+ * so a failure in that window would otherwise leave no visible terminal state
+ * and breach the no-silent-starvation contract. Scalar-only by design: nothing
+ * here retains an `AsyncJob`.
+ */
+interface EvictedDeadLetteredDelivery {
+	jobId: string;
+	generation: string;
+	ownerId?: string;
+	backgrounded: boolean;
+	attempt: number;
+	lastError?: string;
+	recordedAt: number;
+}
+
+/** Per-job public delivery classification. Exactly one value per terminal job. */
+export type JobDeliveryState = "pending" | "delivered" | "failed-visible";
+
+/** One job as projected by {@link AsyncJobManager.getJobsSnapshot}. */
+export interface AsyncJobSnapshotEntry {
+	id: string;
+	kind: string;
+	label: string;
+	status: AsyncJob["status"];
+	generation: string;
+	backgrounded: boolean;
+	deliveryState: JobDeliveryState;
+}
+
+/** Scalar delivery-failure evidence that may outlive its AsyncJob record. */
+export interface DeadLetteredJobSnapshotEntry {
+	jobId: string;
+	generation: string;
+	ownerId?: string;
+	/** Whether the failed delivery originated from a backgrounded job. */
+	backgrounded?: boolean;
+	attempt: number;
+	lastError?: string;
+	recordedAt: number;
+}
+
+/**
+ * One atomic projection of job + delivery state.
+ *
+ * Computed in a single synchronous pass with no interleaved awaits so it cannot
+ * tear, and consumed verbatim: a UI that re-derives delivery classification from
+ * separate getters can disagree with this and produce a job that is in no public
+ * state at all.
+ */
+export interface AsyncJobsSnapshot {
+	jobs: AsyncJobSnapshotEntry[];
+	deadLettered: DeadLetteredJobSnapshotEntry[];
 }
 
 export interface AsyncJobDeliveryState {
@@ -309,6 +396,8 @@ export interface AsyncJobRegisterOptions {
 	metadata?: AsyncJobMetadata;
 	onProgress?: (text: string, details?: Record<string, unknown>) => void | Promise<void>;
 	lifecycle?: AsyncJobLifecycleCleanup;
+	/** Reserved capacity consumed atomically by this registration. */
+	admissionToken?: AsyncJobAdmission;
 }
 
 /**
@@ -544,6 +633,8 @@ export class AsyncJobManager {
 	readonly #deliveries: AsyncJobDelivery[] = [];
 	readonly #inFlightDeliveries: AsyncJobDelivery[] = [];
 	readonly #suppressedDeliveries = new Set<string>();
+	/** Job ids retained by suppressed generations after terminal-event eviction. */
+	readonly #suppressedDeliveryJobIds = new Map<string, string>();
 	readonly #deliveryAckOwners = new Map<string, string>();
 	readonly #watchedJobs = new Map<string, number>();
 	readonly #watchedGenerations = new Map<string, number>();
@@ -556,9 +647,14 @@ export class AsyncJobManager {
 	readonly #outputRetentionBytes = DEFAULT_JOB_OUTPUT_RETENTION_BYTES;
 	readonly #onJobComplete: AsyncJobManagerOptions["onJobComplete"];
 	readonly #maxRunningJobs: number;
+	#pendingAdmissions = 0;
+	readonly #admissions = new WeakMap<AsyncJobAdmission, boolean>();
 	readonly #retentionMs: number;
+	readonly #maxDeadLetterOverflowOwners: number;
 	#deliveryLoop: Promise<void> | undefined;
 	#disposed = false;
+	#disposing = false;
+	#runningOwnerCleanups = false;
 	readonly #subagentRecords = new Map<string, SubagentRecord>();
 	readonly #terminalEvents = new Map<string, TerminalEvent>();
 	readonly #waitGenerationAliases = new Map<string, string>();
@@ -583,6 +679,16 @@ export class AsyncJobManager {
 	readonly #descriptorResumeRunners = new Map<string, ResumeRunner>();
 	readonly #deadLetteredDeliveries = new Map<string, DeadLetteredDelivery>();
 	readonly #deadLetteredDeliveryOwners = new Map<string, string | undefined>();
+	readonly #deadLetterOverflowByOwner = new Map<string | undefined, number>();
+	readonly #deadLetterOverflowRecordedAt = new Map<string | undefined, number>();
+	/** Retry-cap failures whose job record was already evicted, keyed by the unique generation. */
+	readonly #evictedDeadLetters = new Map<string, EvictedDeadLetteredDelivery>();
+	readonly #parkedDeliveries = new Map<string, AsyncJobDelivery>();
+	readonly #receiptClaims = new Map<string, AsyncJobReceiptClaim>();
+	/** Generations settled by failNow, so the runner's later terminal path is a no-op. */
+	readonly #externallySettled = new Set<string>();
+	/** Closed before #disposed so owner cleanups can settle work but cannot register more. */
+	#registrationClosed = false;
 	readonly #ownerSubagentShutdownLeases = new Map<string, OwnerSubagentShutdownLeaseState>();
 	#ownerSubagentShutdownSeq = 0;
 	#lastDisposeDiagnostics: AsyncJobDisposeDiagnostics = { stuckJobIds: [], deliveriesDrained: true };
@@ -836,7 +942,7 @@ export class AsyncJobManager {
 					const owner = this.#deliveryAckOwners.get(event.generation);
 					if (owner && owner !== state.token) continue;
 					this.#deliveryAckOwners.set(event.generation, state.token);
-					this.#suppressedDeliveries.add(event.generation);
+					this.#suppressDelivery(event.jobId, event.generation);
 				}
 				this.#deliveries.splice(
 					0,
@@ -873,6 +979,10 @@ export class AsyncJobManager {
 		this.#onJobComplete = options.onJobComplete;
 		this.#maxRunningJobs = Math.max(1, Math.floor(options.maxRunningJobs ?? DEFAULT_MAX_RUNNING_JOBS));
 		this.#retentionMs = Math.max(0, Math.floor(options.retentionMs ?? DEFAULT_RETENTION_MS));
+		this.#maxDeadLetterOverflowOwners = Math.max(
+			1,
+			Math.floor(options.maxDeadLetterOverflowOwners ?? MAX_DEAD_LETTER_OVERFLOW_OWNERS),
+		);
 	}
 
 	/**
@@ -914,8 +1024,11 @@ export class AsyncJobManager {
 		if (options?.ownerId && this.#isOwnerSubagentShutdownFenced(options.ownerId)) {
 			throw new OwnerSubagentShutdownError();
 		}
-		const runningCount = this.getRunningJobs().length;
-		if (runningCount >= this.#maxRunningJobs) {
+		if (this.#registrationClosed) throw new Error("Async job manager is shutting down");
+		const admissionToken = options?.admissionToken;
+		if (admissionToken) {
+			if (!this.#consumeAdmission(admissionToken)) throw new Error("Invalid or expired job admission token");
+		} else if (!this.hasCapacity()) {
 			throw new Error(
 				`Background job limit reached (${this.#maxRunningJobs}). Wait for running jobs to finish or cancel one.`,
 			);
@@ -958,6 +1071,13 @@ export class AsyncJobManager {
 				const outcome: SubagentRunOutcome =
 					typeof result === "string" ? { kind: "completed", text: result } : result;
 
+				// failNow already published a terminal state AND enqueued its delivery
+				// for this generation; re-running the terminal path here would publish
+				// twice and deliver twice.
+				if (this.#externallySettled.has(job.generation)) {
+					this.#drainResumeQueue();
+					return;
+				}
 				if (job.status === "cancelled") {
 					job.resultText = outcome.kind === "paused" ? outcome.note : outcome.text;
 					this.#markRecordTerminal(id, "cancelled", job.generation);
@@ -1009,6 +1129,10 @@ export class AsyncJobManager {
 				this.#scheduleEviction(id);
 				this.#drainResumeQueue();
 			} catch (error) {
+				if (this.#externallySettled.has(job.generation)) {
+					this.#drainResumeQueue();
+					return;
+				}
 				if (job.status === "cancelled") {
 					job.errorText = error instanceof Error ? error.message : String(error);
 					this.#markRecordTerminal(id, "cancelled", job.generation);
@@ -1031,6 +1155,7 @@ export class AsyncJobManager {
 				this.#drainResumeQueue();
 			}
 		})().finally(() => {
+			this.#externallySettled.delete(job.generation);
 			this.#settledJobIds.add(id);
 		});
 
@@ -1924,6 +2049,28 @@ export class AsyncJobManager {
 		return this.#filterJobs(this.#jobs.values(), filter).filter(job => job.status === "running");
 	}
 
+	/** Whether a new running job can be admitted without starting side effects. */
+	hasCapacity(filter?: AsyncJobFilter): boolean {
+		return this.getRunningJobs(filter).length + this.#pendingAdmissions < this.#maxRunningJobs;
+	}
+
+	reserveCapacity(): AsyncJobAdmission {
+		if (this.#disposed || this.#registrationClosed || !this.hasCapacity()) {
+			throw new Error(
+				`Background job limit reached (${this.#maxRunningJobs}). Wait for running jobs to finish or cancel one.`,
+			);
+		}
+		const token: AsyncJobAdmission = { manager: this };
+		this.#admissions.set(token, true);
+		this.#pendingAdmissions += 1;
+		return token;
+	}
+
+	releaseCapacity(token: AsyncJobAdmission): void {
+		if (!this.#consumeAdmission(token)) return;
+		this.#notifyChange();
+	}
+
 	getRecentJobs(limit = 10, filter?: AsyncJobFilter): AsyncJob[] {
 		return this.#filterJobs(this.#jobs.values(), filter)
 			.filter(job => job.status !== "running")
@@ -1961,18 +2108,25 @@ export class AsyncJobManager {
 		const byteLength = Buffer.byteLength(chunk, "utf8");
 		if (byteLength === 0) return;
 
-		const startByte = state.nextOffset;
-		const endByte = startByte + byteLength;
-		state.chunks.push({ startByte, endByte, text: chunk });
-		state.retainedBytes += byteLength;
+		const retainedChunk =
+			byteLength > this.#outputRetentionBytes
+				? sliceTextAfterUtf8ByteOffset(chunk, byteLength - this.#outputRetentionBytes)
+				: chunk;
+		const retainedByteLength = Buffer.byteLength(retainedChunk, "utf8");
+		const skippedBytes = byteLength - retainedByteLength;
+		const startByte = state.nextOffset + skippedBytes;
+		const endByte = startByte + retainedByteLength;
+		state.chunks.push({ startByte, endByte, text: retainedChunk });
+		state.retainedBytes += retainedByteLength;
 		state.nextOffset = endByte;
+		if (skippedBytes > 0) state.startOffset = Math.max(state.startOffset, startByte);
 
 		while (state.retainedBytes > this.#outputRetentionBytes && state.chunks.length > 0) {
 			const dropped = state.chunks.shift();
 			if (!dropped) break;
 			const droppedBytes = dropped.endByte - dropped.startByte;
 			state.retainedBytes -= droppedBytes;
-			state.startOffset = dropped.endByte;
+			state.startOffset = Math.max(state.startOffset, dropped.endByte);
 		}
 
 		this.#outputState.set(jobId, state);
@@ -2079,23 +2233,210 @@ export class AsyncJobManager {
 		const deliveries = this.#filterDeliveries(filter);
 		const inFlightDeliveries = this.#filterInFlightDeliveries(filter);
 		const ownerId = filter?.ownerId;
-		const deadLettered = ownerId
-			? Array.from(this.#deadLetteredDeliveries.keys()).filter(
-					jobId => this.#deadLetteredDeliveryOwners.get(jobId) === ownerId,
-				).length
-			: this.#deadLetteredDeliveries.size;
+		const parked = Array.from(this.#parkedDeliveries.values()).filter(
+			delivery => !ownerId || delivery.ownerId === ownerId,
+		);
+		const claims = Array.from(this.#receiptClaims.values()).filter(claim => !ownerId || claim.ownerId === ownerId);
+		const evictedDeadLettered = ownerId
+			? Array.from(this.#evictedDeadLetters.values()).filter(entry => entry.ownerId === ownerId).length
+			: this.#evictedDeadLetters.size;
+		const deadLettered =
+			(ownerId
+				? Array.from(this.#deadLetteredDeliveries.keys()).filter(
+						jobId => this.#deadLetteredDeliveryOwners.get(jobId) === ownerId,
+					).length
+				: this.#deadLetteredDeliveries.size) + evictedDeadLettered;
 		const nextRetryAt = deliveries.reduce<number | undefined>((next, delivery) => {
 			if (next === undefined) return delivery.nextAttemptAt;
 			return Math.min(next, delivery.nextAttemptAt);
 		}, undefined);
 
 		return {
-			queued: deliveries.length + inFlightDeliveries.length,
-			delivering: inFlightDeliveries.length > 0 || (this.#deliveryLoop !== undefined && deliveries.length > 0),
+			queued: deliveries.length + inFlightDeliveries.length + parked.length + claims.length,
+			delivering:
+				inFlightDeliveries.length > 0 ||
+				parked.length > 0 ||
+				claims.length > 0 ||
+				(this.#deliveryLoop !== undefined && deliveries.length > 0),
 			nextRetryAt,
-			pendingJobIds: deliveries.concat(inFlightDeliveries).map(delivery => delivery.jobId),
+			pendingJobIds: [...deliveries, ...inFlightDeliveries, ...parked, ...claims].map(delivery => delivery.jobId),
 			deadLettered,
 		};
+	}
+
+	/**
+	 * One synchronous pass over jobs plus delivery state.
+	 *
+	 * Every returned job carries exactly one {@link JobDeliveryState}, and
+	 * dead-lettered evidence is included even when its record is already gone, so
+	 * no terminal job can end up invisible to the UI.
+	 */
+	getJobsSnapshot(filter?: AsyncJobFilter): AsyncJobsSnapshot {
+		this.#expireMonitorTombstones();
+		this.#pruneEvictedDeadLetters();
+		this.#pruneSuppressedDeliveries();
+
+		const pending = new Set<string>();
+		for (const delivery of this.#deliveries) pending.add(`${delivery.jobId}:${delivery.generation}`);
+		for (const delivery of this.#inFlightDeliveries) pending.add(`${delivery.jobId}:${delivery.generation}`);
+		for (const delivery of this.#parkedDeliveries.values()) pending.add(`${delivery.jobId}:${delivery.generation}`);
+		for (const claim of this.#receiptClaims.values()) pending.add(`${claim.jobId}:${claim.generation}`);
+
+		const failedVisible = new Set<string>();
+		for (const entry of this.#deadLetteredDeliveries.values()) {
+			failedVisible.add(`${entry.jobId}:${entry.generation}`);
+		}
+		for (const entry of this.#evictedDeadLetters.values()) {
+			failedVisible.add(`${entry.jobId}:${entry.generation}`);
+		}
+		for (const job of this.#jobs.values()) {
+			if (job.deliveryFailure) failedVisible.add(`${job.id}:${job.generation}`);
+		}
+
+		const jobs = this.#filterJobs(this.#jobs.values(), filter).map<AsyncJobSnapshotEntry>(job => {
+			const key = `${job.id}:${job.generation}`;
+			const deliveryState: JobDeliveryState = failedVisible.has(key)
+				? "failed-visible"
+				: pending.has(key) || job.status === "running" || job.status === "paused"
+					? "pending"
+					: "delivered";
+			return {
+				id: job.id,
+				kind: job.type,
+				label: job.label,
+				status: job.status,
+				generation: job.generation,
+				backgrounded: job.metadata?.backgrounded === true,
+				deliveryState,
+			};
+		});
+
+		const ownerId = filter?.ownerId;
+		const projectedKeys = new Set(jobs.map(job => `${job.id}:${job.generation}`));
+		// A zero-retention job can disappear from #jobs while its completion
+		// callback is still queued or in flight. Project that delivery from its
+		// immutable scalar fields so folded work remains visible until the callback
+		// reaches a terminal delivery boundary; do not retain or expose its payload.
+		for (const delivery of [...this.#deliveries, ...this.#inFlightDeliveries]) {
+			if (ownerId && delivery.ownerId !== ownerId) continue;
+			const key = `${delivery.jobId}:${delivery.generation}`;
+			if (projectedKeys.has(key)) continue;
+			projectedKeys.add(key);
+			jobs.push({
+				id: delivery.jobId,
+				kind: delivery.kind,
+				label: delivery.label,
+				status: delivery.status,
+				generation: delivery.generation,
+				backgrounded: delivery.backgrounded,
+				deliveryState: "pending",
+			});
+		}
+		for (const delivery of this.#parkedDeliveries.values()) {
+			if (ownerId && delivery.ownerId !== ownerId) continue;
+			const key = `${delivery.jobId}:${delivery.generation}`;
+			if (projectedKeys.has(key)) continue;
+			projectedKeys.add(key);
+			jobs.push({
+				id: delivery.jobId,
+				kind: delivery.kind,
+				label: delivery.label,
+				status: delivery.status,
+				generation: delivery.generation,
+				backgrounded: delivery.backgrounded,
+				deliveryState: "pending",
+			});
+		}
+		for (const claim of this.#receiptClaims.values()) {
+			if (ownerId && claim.ownerId !== ownerId) continue;
+			const key = `${claim.jobId}:${claim.generation}`;
+			if (projectedKeys.has(key)) continue;
+			projectedKeys.add(key);
+			jobs.push({
+				id: claim.jobId,
+				kind: claim.kind,
+				label: claim.label,
+				status: claim.status,
+				generation: claim.generation,
+				backgrounded: claim.backgrounded,
+				deliveryState: "pending",
+			});
+		}
+
+		const deadLettered: DeadLetteredJobSnapshotEntry[] = [];
+		for (const entry of this.#deadLetteredDeliveries.values()) {
+			const entryOwner = this.#deadLetteredDeliveryOwners.get(entry.jobId);
+			if (ownerId && entryOwner !== ownerId) continue;
+			const currentJob = this.#jobs.get(entry.jobId);
+			deadLettered.push({
+				jobId: entry.jobId,
+				generation: entry.generation,
+				ownerId: entryOwner,
+				backgrounded: currentJob?.generation === entry.generation && currentJob.metadata?.backgrounded === true,
+				attempt: entry.attempt,
+				lastError: entry.lastError,
+				recordedAt: entry.recordedAt,
+			});
+		}
+		for (const entry of this.#evictedDeadLetters.values()) {
+			if (ownerId && entry.ownerId !== ownerId) continue;
+			deadLettered.push({ ...entry });
+		}
+		for (const [entryOwner, count] of this.#deadLetterOverflowByOwner) {
+			if (ownerId && entryOwner !== ownerId) continue;
+			deadLettered.push({
+				jobId: `dead-letter-overflow:${entryOwner ?? "unknown"}`,
+				generation: `dead-letter-overflow:${entryOwner ?? "unknown"}`,
+				ownerId: entryOwner,
+				backgrounded: true,
+				attempt: 0,
+				lastError: `${count} additional undelivered completion(s) exceeded retained dead-letter capacity`,
+				recordedAt: this.#deadLetterOverflowRecordedAt.get(entryOwner) ?? Date.now(),
+			});
+		}
+
+		return { jobs, deadLettered };
+	}
+
+	retainParkedDelivery(job: AsyncJob, text: string): void {
+		if (this.#disposed) return;
+		this.#parkedDeliveries.set(job.generation, {
+			jobId: job.id,
+			generation: job.generation,
+			job,
+			kind: job.type,
+			label: job.label,
+			status: job.status,
+			backgrounded: job.metadata?.backgrounded === true,
+			text,
+			attempt: 0,
+			nextAttemptAt: Date.now(),
+			ownerId: job.ownerId,
+			retryDuringDispose: false,
+		});
+		this.#notifyChange();
+	}
+
+	retainDeliveryClaim(job: AsyncJob): void {
+		if (this.#disposed) return;
+		this.#receiptClaims.set(job.generation, {
+			jobId: job.id,
+			generation: job.generation,
+			kind: job.type,
+			label: job.label,
+			status: job.status,
+			backgrounded: job.metadata?.backgrounded === true,
+			ownerId: job.ownerId,
+		});
+		this.#notifyChange();
+	}
+
+	releaseDeliveryClaim(generation: string): void {
+		if (this.#receiptClaims.delete(generation)) this.#notifyChange();
+	}
+
+	clearParkedDelivery(generation: string): void {
+		if (this.#parkedDeliveries.delete(generation)) this.#notifyChange();
 	}
 
 	hasPendingDeliveries(filter?: AsyncJobFilter): boolean {
@@ -2157,9 +2498,21 @@ export class AsyncJobManager {
 		if (uniqueJobIds.length === 0) return 0;
 		for (const jobId of uniqueJobIds) {
 			const currentJob = this.#jobs.get(jobId);
-			if (currentJob) this.#suppressedDeliveries.add(currentJob.generation);
+			if (currentJob) this.#suppressDelivery(currentJob.id, currentJob.generation);
 			for (const delivery of [...this.#deliveries, ...this.#inFlightDeliveries]) {
-				if (delivery.jobId === jobId) this.#suppressedDeliveries.add(delivery.generation);
+				if (delivery.jobId === jobId) this.#suppressDelivery(delivery.jobId, delivery.generation);
+			}
+			for (const parked of this.#parkedDeliveries.values()) {
+				if (parked.jobId === jobId) this.#suppressDelivery(parked.jobId, parked.generation);
+			}
+			for (const claim of this.#receiptClaims.values()) {
+				if (claim.jobId === jobId) this.#suppressDelivery(claim.jobId, claim.generation);
+			}
+			for (const [generation, parked] of this.#parkedDeliveries) {
+				if (parked.jobId === jobId) this.#parkedDeliveries.delete(generation);
+			}
+			for (const [generation, claim] of this.#receiptClaims) {
+				if (claim.jobId === jobId) this.#receiptClaims.delete(generation);
 			}
 		}
 		const before = this.#deliveries.length;
@@ -2168,6 +2521,7 @@ export class AsyncJobManager {
 			this.#deliveries.length,
 			...this.#deliveries.filter(delivery => !this.#isDeliveryAcknowledged(delivery.jobId, delivery.generation)),
 		);
+		this.#notifyChange();
 		return before - this.#deliveries.length;
 	}
 
@@ -2176,6 +2530,36 @@ export class AsyncJobManager {
 	 * matching agent registered; with no filter, cancels every running job
 	 * (used by `dispose()` to nuke the manager's state).
 	 */
+	/**
+	 * Synchronously fail a running job AND enqueue its delivery, exactly once.
+	 *
+	 * An externally owned wait -- an ACP client terminal, say -- can fail while its
+	 * owner is being torn down. `cancel()` is the wrong tool there: it marks the job
+	 * cancelled, and the cancelled path deliberately enqueues NO delivery, so the
+	 * failure would never become visible to anyone. This is the single transition
+	 * that both fails the job and delivers that failure in one synchronous block, so
+	 * it cannot lose the race against disposal.
+	 */
+	failNow(jobId: string, generation: string, errorText: string, options?: { abort?: boolean }): boolean {
+		const job = this.#jobs.get(jobId);
+		if (!job || job.generation !== generation) return false;
+		if (job.status !== "running") return false;
+		if (this.#externallySettled.has(generation)) return false;
+		this.#externallySettled.add(generation);
+		if (options?.abort !== false) job.abortController.abort();
+		job.status = "failed";
+		this.#freezeEndTime(job);
+		job.errorText = errorText;
+		this.#markRecordTerminal(jobId, "failed", generation);
+		this.#publishTerminal(job);
+		this.#enqueueDelivery(jobId, errorText);
+		this.#runLifecycle(jobId, "terminal", job);
+		this.#scheduleEviction(jobId);
+		this.#drainResumeQueue();
+		this.#notifyChange();
+		return true;
+	}
+
 	cancelAll(filter?: AsyncJobFilter): void {
 		for (const job of this.getRunningJobs(filter)) {
 			if (this.cancel(job.id, filter)) this.#scheduleEviction(job.id);
@@ -2247,6 +2631,21 @@ export class AsyncJobManager {
 		};
 	}
 
+	/**
+	 * Mark a running job as backgrounded (folded out of its foreground call).
+	 * Read by getJobsSnapshot so folded work stays visible; safe to call twice.
+	 */
+	markBackgrounded(jobId: string, generation: string): boolean {
+		const job = this.#jobs.get(jobId);
+		if (!job || job.generation !== generation) return false;
+		job.metadata = { ...job.metadata, backgrounded: true };
+		for (const delivery of [...this.#deliveries, ...this.#inFlightDeliveries]) {
+			if (delivery.jobId === jobId && delivery.generation === generation) delivery.backgrounded = true;
+		}
+		this.#notifyChange();
+		return true;
+	}
+
 	async waitForAll(): Promise<void> {
 		await Promise.all(Array.from(this.#jobs.values()).map(job => job.promise));
 	}
@@ -2273,6 +2672,11 @@ export class AsyncJobManager {
 			this.#ensureDeliveryLoop();
 			const loop = this.#deliveryLoop;
 			if (!loop) {
+				const pending = this.#filterDeliveries()[0];
+				if (!pending) return true;
+				const index = this.#deliveries.indexOf(pending);
+				if (index >= 0) this.#deliveries.splice(index, 1);
+				await this.#deliverDelivery(pending);
 				continue;
 			}
 
@@ -2296,12 +2700,22 @@ export class AsyncJobManager {
 	}
 
 	async dispose(options?: { timeoutMs?: number }): Promise<boolean> {
-		this.#disposed = true;
+		// Close registration FIRST, then run owner cleanups, and only then mark the
+		// manager disposed. Setting #disposed before the cleanups made
+		// #ensureDeliveryLoop a no-op, so a failure an owner cleanup settled through
+		// failNow could never be drained -- it sat in the queue and vanished. Closing
+		// registration keeps the original protection (cleanups cannot register fresh
+		// work) without disabling delivery. Errors in cleanups are logged, never
+		// escalated.
+		this.#registrationClosed = true;
 		this.#clearEvictionTimers();
-		// Run-and-clear any remaining owner cleanups before tearing down jobs so
-		// late-arriving timers cannot register fresh work against a disposed
-		// manager. Errors in cleanup callbacks are logged but never escalated.
-		this.runOwnerCleanups();
+		this.#runningOwnerCleanups = true;
+		try {
+			this.runOwnerCleanups();
+		} finally {
+			this.#runningOwnerCleanups = false;
+		}
+		this.#disposing = true;
 		this.cancelAll();
 		for (const tombstone of this.#monitorTombstones.values()) {
 			try {
@@ -2315,19 +2729,34 @@ export class AsyncJobManager {
 		}
 		this.#monitorTombstones.clear();
 		const timeoutMs = options?.timeoutMs ?? 3_000;
+		const disposalDeadline = Date.now() + Math.max(timeoutMs, 0);
 		const waitResult = await this.#waitForAllWithDeadline(timeoutMs);
-		const drained = waitResult.completed ? await this.drainDeliveries({ timeoutMs }) : false;
-		this.#lastDisposeDiagnostics = { stuckJobIds: waitResult.stuckJobIds, deliveriesDrained: drained };
+		const remainingDeliveryMs = Math.max(0, disposalDeadline - Date.now());
+		const drained = await this.drainDeliveries({ timeoutMs: remainingDeliveryMs });
+		if (!drained) this.#projectUndeliveredDisposalFailures();
+		const disposalCompleted = waitResult.completed && drained;
+		this.#lastDisposeDiagnostics = {
+			stuckJobIds: waitResult.stuckJobIds,
+			deliveriesDrained: disposalCompleted,
+		};
 		if (waitResult.stuckJobIds.length > 0) {
 			logger.warn("Async job manager dispose timed out waiting for jobs", { stuckJobIds: waitResult.stuckJobIds });
 		}
 		this.#clearEvictionTimers();
+		this.#disposed = true;
 		this.#jobs.clear();
 		this.#deliveries.length = 0;
 		this.#inFlightDeliveries.length = 0;
 		this.#deadLetteredDeliveries.clear();
+		this.#evictedDeadLetters.clear();
+		this.#parkedDeliveries.clear();
+		this.#receiptClaims.clear();
+		this.#externallySettled.clear();
 		this.#deadLetteredDeliveryOwners.clear();
+		this.#deadLetterOverflowByOwner.clear();
+		this.#deadLetterOverflowRecordedAt.clear();
 		this.#suppressedDeliveries.clear();
+		this.#suppressedDeliveryJobIds.clear();
 		this.#deliveryAckOwners.clear();
 		this.#waitGenerationAliases.clear();
 		this.#watchedJobs.clear();
@@ -2343,7 +2772,16 @@ export class AsyncJobManager {
 		this.#ownerSubagentShutdownLeases.clear();
 		this.#notifyChange();
 		this.#changeListeners.clear();
-		return drained && waitResult.completed;
+		return disposalCompleted;
+	}
+
+	#projectUndeliveredDisposalFailures(): void {
+		const retained = [...this.#deliveries, ...this.#inFlightDeliveries];
+		for (const delivery of retained) {
+			delivery.attempt = Math.max(1, delivery.attempt);
+			delivery.lastError ??= "delivery did not settle before manager disposal deadline";
+			this.#recordDeadLetterOrEvicted(delivery);
+		}
 	}
 
 	#resolveJobId(preferredId?: string): string {
@@ -2352,7 +2790,11 @@ export class AsyncJobManager {
 			let candidate = 1;
 			while (true) {
 				const id = `bg_${candidate}`;
-				if (!this.#jobs.has(id)) {
+				// Never recycle an id that still has a queued or in-flight delivery: the
+				// recycled record would give the pending old delivery a mismatched
+				// generation and #deliverDelivery would silently discard it before
+				// onJobComplete ever ran.
+				if (!this.#jobs.has(id) && !this.#hasDeliveryCollisionForJobId(id)) {
 					return id;
 				}
 				candidate += 1;
@@ -2360,15 +2802,22 @@ export class AsyncJobManager {
 		}
 
 		const base = preferredId.trim();
-		if (!this.#jobs.has(base)) return base;
+		if (!this.#jobs.has(base) && !this.#hasDeliveryCollisionForJobId(base)) return base;
 
 		let suffix = 2;
 		let candidate = `${base}-${suffix}`;
-		while (this.#jobs.has(candidate)) {
+		while (this.#jobs.has(candidate) || this.#hasDeliveryCollisionForJobId(candidate)) {
 			suffix += 1;
 			candidate = `${base}-${suffix}`;
 		}
 		return candidate;
+	}
+
+	#consumeAdmission(token: AsyncJobAdmission): boolean {
+		if (token.manager !== this || this.#admissions.get(token) !== true) return false;
+		this.#admissions.set(token, false);
+		this.#pendingAdmissions -= 1;
+		return true;
 	}
 
 	#scheduleEviction(jobId: string): void {
@@ -2376,6 +2825,10 @@ export class AsyncJobManager {
 		this.#notifyChange();
 		if (this.#retentionMs <= 0) {
 			this.#evictJob(jobId);
+			// The terminal notification above precedes eviction so consumers can see
+			// the terminal transition; publish once more after the record disappears
+			// so observers can project any delivery that still owns the generation.
+			this.#notifyChange();
 			return;
 		}
 		const existing = this.#evictionTimers.get(jobId);
@@ -2397,13 +2850,37 @@ export class AsyncJobManager {
 		this.#runLifecycle(jobId, "evict");
 		this.#purgeTerminalSubagentStateForJob(jobId);
 		const job = this.#jobs.get(jobId);
+		const deadLetter = this.#deadLetteredDeliveries.get(jobId);
+		const failure =
+			job?.deliveryFailure && (!deadLetter || deadLetter.generation === job.generation)
+				? job.deliveryFailure
+				: deadLetter && job?.generation === deadLetter.generation
+					? deadLetter
+					: undefined;
+		if (job && failure) {
+			this.#evictedDeadLetters.set(job.generation, {
+				jobId: job.id,
+				generation: job.generation,
+				ownerId: this.#deadLetteredDeliveryOwners.get(jobId) ?? job.ownerId,
+				backgrounded: job.metadata?.backgrounded === true,
+				attempt: failure.attempt,
+				lastError: failure.lastError,
+				recordedAt: Date.now(),
+			});
+			while (this.#evictedDeadLetters.size > MAX_EVICTED_DEAD_LETTERS) {
+				const oldestGeneration = this.#evictedDeadLetters.keys().next().value;
+				if (oldestGeneration === undefined) break;
+				const oldest = this.#evictedDeadLetters.get(oldestGeneration);
+				if (oldest) this.#recordDeadLetterOverflow(oldest.ownerId);
+				this.#evictedDeadLetters.delete(oldestGeneration);
+			}
+		}
 		this.#jobs.delete(jobId);
 		this.#settledJobIds.delete(jobId);
 		this.#lifecycles.delete(jobId);
 		this.#lifecyclePhases.delete(jobId);
 		this.#deadLetteredDeliveries.delete(jobId);
 		this.#deadLetteredDeliveryOwners.delete(jobId);
-		this.#suppressedDeliveries.delete(jobId);
 		if (job) this.#publishedTerminalGenerations.delete(job.generation);
 		this.#outputState.delete(jobId);
 	}
@@ -2481,10 +2958,16 @@ export class AsyncJobManager {
 	}
 
 	#isDeliveryAcknowledged(jobId: string, generation?: string): boolean {
-		return (
-			(generation !== undefined && this.#suppressedDeliveries.has(generation)) ||
-			this.#suppressedDeliveries.has(jobId)
-		);
+		if (generation !== undefined && this.#suppressedDeliveries.has(generation)) return true;
+		for (const suppressedJobId of this.#suppressedDeliveryJobIds.values()) {
+			if (suppressedJobId === jobId) return true;
+		}
+		return false;
+	}
+
+	#suppressDelivery(jobId: string | null, generation: string): void {
+		this.#suppressedDeliveries.add(generation);
+		if (jobId !== null) this.#suppressedDeliveryJobIds.set(generation, jobId);
 	}
 
 	isDeliverySuppressed(jobId: string, generation?: string): boolean {
@@ -2504,10 +2987,88 @@ export class AsyncJobManager {
 		}
 	}
 
+	/** Whether any queued or in-flight delivery still targets `jobId`. */
+	#hasPendingDeliveryForJobId(jobId: string): boolean {
+		return (
+			this.#deliveries.some(delivery => delivery.jobId === jobId) ||
+			this.#inFlightDeliveries.some(delivery => delivery.jobId === jobId)
+		);
+	}
+
+	/** Whether a retained delivery generation already claims `jobId`. */
+	#hasDeliveryCollisionForJobId(jobId: string): boolean {
+		if (this.#hasPendingDeliveryForJobId(jobId)) return true;
+		for (const parked of this.#parkedDeliveries.values()) {
+			if (parked.jobId === jobId) return true;
+		}
+		for (const claim of this.#receiptClaims.values()) {
+			if (claim.jobId === jobId) return true;
+		}
+		for (const suppressedJobId of this.#suppressedDeliveryJobIds.values()) {
+			if (suppressedJobId === jobId) return true;
+		}
+		if (this.#deadLetteredDeliveries.has(jobId)) return true;
+		for (const entry of this.#evictedDeadLetters.values()) {
+			if (entry.jobId === jobId) return true;
+		}
+		return false;
+	}
+
+	/** Drop suppression projections once no retained state can deliver the generation. */
+	#pruneSuppressedDeliveries(): void {
+		for (const generation of this.#suppressedDeliveries) {
+			let jobRetainsGeneration = false;
+			for (const job of this.#jobs.values()) {
+				if (job.generation === generation) {
+					jobRetainsGeneration = true;
+					break;
+				}
+			}
+			if (jobRetainsGeneration) continue;
+			if (this.#deliveries.some(delivery => delivery.generation === generation)) continue;
+			if (this.#inFlightDeliveries.some(delivery => delivery.generation === generation)) continue;
+			if (this.#parkedDeliveries.has(generation) || this.#receiptClaims.has(generation)) continue;
+			if ([...this.#deadLetteredDeliveries.values()].some(entry => entry.generation === generation)) continue;
+			if (this.#evictedDeadLetters.has(generation)) continue;
+			this.#suppressedDeliveries.delete(generation);
+			this.#suppressedDeliveryJobIds.delete(generation);
+		}
+	}
+
+	/**
+	 * Record a retry-cap failure whose job record is already gone.
+	 *
+	 * Ordering mirrors {@link AsyncJobManager.prototype} `#recordDeadLetter`:
+	 * insert, retire the exact owned tuple, then trim. Retiring before the trim
+	 * means a later trimmed entry can never strand registry authority.
+	 */
+	#recordEvictedDeadLetter(delivery: AsyncJobDelivery): void {
+		this.#evictedDeadLetters.delete(delivery.generation);
+		this.#evictedDeadLetters.set(delivery.generation, {
+			jobId: delivery.jobId,
+			generation: delivery.generation,
+			ownerId: delivery.ownerId,
+			backgrounded: delivery.backgrounded,
+			attempt: delivery.attempt,
+			lastError: delivery.lastError,
+			recordedAt: Date.now(),
+		});
+		retireOwnedRegistrationForDeadLetter(AsyncJobManager.endpointIdOf(this), delivery.jobId, delivery.generation);
+		while (this.#evictedDeadLetters.size > MAX_EVICTED_DEAD_LETTERS) {
+			const oldestGeneration = this.#evictedDeadLetters.keys().next().value;
+			if (oldestGeneration === undefined) return;
+			const oldest = this.#evictedDeadLetters.get(oldestGeneration);
+			if (oldest) this.#recordDeadLetterOverflow(oldest.ownerId);
+			this.#evictedDeadLetters.delete(oldestGeneration);
+		}
+	}
+
 	#recordDeadLetter(delivery: AsyncJobDelivery): void {
 		this.#pruneEvictedDeadLetters();
 		const currentJob = this.#jobs.get(delivery.jobId);
 		if (!currentJob || currentJob.generation !== delivery.generation) return;
+		const recordedAt = Date.now();
+		currentJob.deliveryFailure = { attempt: delivery.attempt, lastError: delivery.lastError, recordedAt };
 		this.#deadLetteredDeliveries.delete(delivery.jobId);
 		this.#deadLetteredDeliveryOwners.delete(delivery.jobId);
 		this.#deadLetteredDeliveries.set(delivery.jobId, {
@@ -2515,6 +3076,7 @@ export class AsyncJobManager {
 			generation: delivery.generation,
 			attempt: delivery.attempt,
 			lastError: delivery.lastError,
+			recordedAt,
 		});
 		this.#deadLetteredDeliveryOwners.set(delivery.jobId, delivery.ownerId);
 		// The dead-lettered delivery never injects a message and has no later
@@ -2529,6 +3091,46 @@ export class AsyncJobManager {
 			this.#deadLetteredDeliveries.delete(oldestJobId);
 			this.#deadLetteredDeliveryOwners.delete(oldestJobId);
 		}
+		this.#notifyChange();
+	}
+
+	#recordDeadLetterOverflow(ownerId: string | undefined): void {
+		if (ownerId === undefined || this.#deadLetterOverflowByOwner.has(ownerId)) {
+			this.#deadLetterOverflowByOwner.set(ownerId, (this.#deadLetterOverflowByOwner.get(ownerId) ?? 0) + 1);
+			if (!this.#deadLetterOverflowRecordedAt.has(ownerId))
+				this.#deadLetterOverflowRecordedAt.set(ownerId, Date.now());
+			return;
+		}
+
+		const namedOwners = [...this.#deadLetterOverflowByOwner.keys()].filter((key): key is string => key !== undefined);
+		if (namedOwners.length >= this.#maxDeadLetterOverflowOwners) {
+			const oldestOwner = namedOwners[0];
+			if (oldestOwner !== undefined) {
+				const oldestCount = this.#deadLetterOverflowByOwner.get(oldestOwner) ?? 0;
+				const oldestRecordedAt = this.#deadLetterOverflowRecordedAt.get(oldestOwner);
+				this.#deadLetterOverflowByOwner.delete(oldestOwner);
+				this.#deadLetterOverflowRecordedAt.delete(oldestOwner);
+				this.#deadLetterOverflowByOwner.set(
+					undefined,
+					(this.#deadLetterOverflowByOwner.get(undefined) ?? 0) + oldestCount,
+				);
+				const unknownRecordedAt = this.#deadLetterOverflowRecordedAt.get(undefined);
+				if (oldestRecordedAt !== undefined) {
+					this.#deadLetterOverflowRecordedAt.set(
+						undefined,
+						unknownRecordedAt === undefined ? oldestRecordedAt : Math.min(unknownRecordedAt, oldestRecordedAt),
+					);
+				}
+			}
+		}
+		this.#deadLetterOverflowByOwner.set(ownerId, 1);
+		this.#deadLetterOverflowRecordedAt.set(ownerId, Date.now());
+	}
+
+	#recordDeadLetterOrEvicted(delivery: AsyncJobDelivery): void {
+		const currentJob = this.#jobs.get(delivery.jobId);
+		if (currentJob?.generation === delivery.generation) this.#recordDeadLetter(delivery);
+		else this.#recordEvictedDeadLetter(delivery);
 	}
 
 	#enqueueDelivery(jobId: string, text: string): void {
@@ -2539,17 +3141,23 @@ export class AsyncJobManager {
 			jobId,
 			generation: job.generation,
 			job,
+			kind: job.type,
+			label: job.label,
+			status: job.status,
+			backgrounded: job.metadata?.backgrounded === true,
 			text: deliveryText.text,
 			originalBytes: deliveryText.originalBytes,
 			truncated: deliveryText.truncated,
 			attempt: 0,
 			nextAttemptAt: Date.now(),
 			ownerId: job.ownerId,
+			retryDuringDispose: this.#runningOwnerCleanups,
 		});
 		while (this.#deliveries.length > DEFAULT_MAX_DELIVERY_QUEUE) {
 			const dropped = this.#deliveries.shift();
-			if (dropped) this.#recordDeadLetter(dropped);
+			if (dropped) this.#recordDeadLetterOrEvicted(dropped);
 		}
+		this.#notifyChange();
 		this.#ensureDeliveryLoop();
 	}
 
@@ -2564,6 +3172,14 @@ export class AsyncJobManager {
 			originalBytes: bytes,
 			truncated: true,
 		};
+	}
+
+	#boundedDeliveryErrorText(text: string): string {
+		const bytes = Buffer.byteLength(text, "utf8");
+		if (bytes <= DELIVERY_MAX_TEXT_BYTES) return text;
+		const marker = ` [async delivery error truncated from ${bytes} bytes]`;
+		const prefixBytes = Math.max(0, DELIVERY_MAX_TEXT_BYTES - Buffer.byteLength(marker, "utf8"));
+		return `${sliceTextToUtf8ByteLength(text, prefixBytes)}${marker}`;
 	}
 
 	#ensureDeliveryLoop(): void {
@@ -2601,6 +3217,7 @@ export class AsyncJobManager {
 				continue;
 
 			this.#deliveries.splice(index, 1);
+			this.#notifyChange();
 			await this.#deliverDelivery(delivery);
 		}
 	}
@@ -2608,6 +3225,7 @@ export class AsyncJobManager {
 	#deliverDelivery(delivery: AsyncJobDelivery): Promise<void> {
 		const promise = (async () => {
 			this.#inFlightDeliveries.push(delivery);
+			this.#notifyChange();
 			try {
 				const currentJob = this.#jobs.get(delivery.jobId);
 				if (currentJob && currentJob.generation !== delivery.generation) return;
@@ -2615,9 +3233,18 @@ export class AsyncJobManager {
 				await this.#onJobComplete(delivery.jobId, delivery.text, delivery.job);
 			} catch (error) {
 				delivery.attempt += 1;
-				delivery.lastError = error instanceof Error ? error.message : String(error);
-				if (delivery.attempt >= DELIVERY_MAX_ATTEMPTS) {
-					this.#recordDeadLetter(delivery);
+				delivery.lastError = this.#boundedDeliveryErrorText(error instanceof Error ? error.message : String(error));
+				if (this.#disposed) {
+					logger.warn("Async job completion delivery dropped after manager disposal", {
+						jobId: delivery.jobId,
+						attempt: delivery.attempt,
+						error: delivery.lastError,
+					});
+				} else if (delivery.attempt >= DELIVERY_MAX_ATTEMPTS) {
+					// Record the failure in the bounded scalar map when its job record has
+					// already been evicted; otherwise #recordDeadLetter is pruned by record
+					// existence and the terminal failure would become invisible.
+					this.#recordDeadLetterOrEvicted(delivery);
 					logger.warn("Async job completion delivery reached retry cap", {
 						jobId: delivery.jobId,
 						attempt: delivery.attempt,
@@ -2626,11 +3253,15 @@ export class AsyncJobManager {
 				} else {
 					delivery.nextAttemptAt = Date.now() + this.#getRetryDelay(delivery.attempt);
 					const currentJob = this.#jobs.get(delivery.jobId);
+					// An evicted record must not end retry eligibility: dispatch already
+					// uses the retained delivery.job when #jobs no longer holds the record,
+					// so only a PRESENT superseding generation discards.
 					if (
-						currentJob?.generation === delivery.generation &&
+						(currentJob === undefined || currentJob.generation === delivery.generation) &&
 						!this.#isDeliveryAcknowledged(delivery.jobId, delivery.generation)
 					) {
 						this.#deliveries.push(delivery);
+						this.#notifyChange();
 					}
 					logger.warn("Async job completion delivery failed", {
 						jobId: delivery.jobId,
@@ -2642,6 +3273,7 @@ export class AsyncJobManager {
 			} finally {
 				const index = this.#inFlightDeliveries.indexOf(delivery);
 				if (index !== -1) this.#inFlightDeliveries.splice(index, 1);
+				this.#notifyChange();
 				if (!this.#disposed && this.#hasDeliverable()) this.#ensureDeliveryLoop();
 			}
 		})();
