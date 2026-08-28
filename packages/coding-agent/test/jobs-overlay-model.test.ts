@@ -100,6 +100,28 @@ describe("jobs overlay model", () => {
 		expect(parseJobRef("noop")).toBeNull();
 		expect(parseJobRef("back")).toBeNull();
 		expect(parseJobRef("other:1")).toBeNull();
+		expect(parseJobRef("folded:bg_1:job:1")).toEqual({ kind: "folded", id: "bg_1", generation: "job:1" });
+	});
+
+	test("folded job rows are drillable read-only details", () => {
+		const snap = snapshot({
+			foldedJobs: [
+				{
+					id: "bg_1",
+					generation: "job:1",
+					kind: "bash",
+					status: "running",
+					label: "sleep 30",
+					deliveryState: "pending",
+					backgrounded: true,
+				},
+			],
+		});
+		const list = buildJobsListItems(snap);
+		expect(list[0]?.disabled).not.toBe(true);
+		const detail = buildJobDetailItems(snap, { kind: "folded", id: "bg_1", generation: "job:1" });
+		expect(detail.map(item => item.label)).toEqual(["Status", "Kind", "Label", "Generation", "Back"]);
+		expect(detail.some(item => item.value.startsWith("action:"))).toBe(false);
 	});
 
 	test("AC9 monitor detail shows status + last output line and a cancel action", () => {

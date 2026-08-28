@@ -186,4 +186,56 @@ describe("live session fold", () => {
 		expect(session.hasForegroundBashBackgroundRequestHandler()).toBe(false);
 		expect(await session.requestForegroundBashBackground()).toBe(false);
 	});
+
+	test("reports false when the fold transaction cannot commit", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ responses: [{ content: ["idle"] }] });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: mock.stream,
+		});
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth3.db"));
+		authStorages.push(authStorage);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			modelRegistry: new ModelRegistry(authStorage, path.join(tempDir, "models3.yml")),
+		});
+
+		const aborted = new AbortController();
+		aborted.abort();
+		const abortedJob = fakeJob("bg_aborted", "job:aborted");
+		const unregisterAborted = session.registerForegroundFoldParticipant({
+			kind: "bash-managed",
+			jobId: abortedJob.id,
+			jobGeneration: abortedJob.generation,
+			label: "aborted",
+			cwdSensitive: false,
+			outputRef: { jobId: abortedJob.id, generation: abortedJob.generation, instruction: "tail" },
+			signal: aborted.signal,
+			getJob: () => abortedJob,
+			detachObserver: () => "resolved",
+			resolveForegroundObserver: () => "resolved",
+		});
+		expect(await session.requestForegroundBashBackground()).toBe(false);
+		unregisterAborted();
+
+		const settledJob = fakeJob("bg_settled", "job:settled");
+		const unregisterSettled = session.registerForegroundFoldParticipant({
+			kind: "bash-managed",
+			jobId: settledJob.id,
+			jobGeneration: settledJob.generation,
+			label: "settled",
+			cwdSensitive: false,
+			outputRef: { jobId: settledJob.id, generation: settledJob.generation, instruction: "tail" },
+			getJob: () => settledJob,
+			detachObserver: () => "already-settled",
+			resolveForegroundObserver: () => "already-settled",
+		});
+		expect(await session.requestForegroundBashBackground()).toBe(false);
+		unregisterSettled();
+	});
 });

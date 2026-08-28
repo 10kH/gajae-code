@@ -136,8 +136,8 @@ describe("folded jobs surfacing", () => {
 			description: "failed-visible",
 			value: "folded:folded-failed:generation-1",
 			hint: "failed",
-			disabled: true,
 		});
+		expect(failedItem?.disabled).not.toBe(true);
 		expect(failedItem?.label).not.toContain("\t");
 
 		const rendered = renderSegment("jobs", segmentContext(observed));
@@ -172,9 +172,9 @@ describe("folded jobs surfacing", () => {
 			label: "dead-letter · gone",
 			description: "failed-visible · attempt 3 · error: terminal failure",
 			hint: "failed",
-			disabled: true,
 			value: "folded:gone:generation-gone",
 		});
+		expect(items[0]?.disabled).not.toBe(true);
 		expect(observed.worstState).toBe("failed");
 		expect(observed.monitors).toEqual(EMPTY_JOBS_SNAPSHOT.monitors);
 

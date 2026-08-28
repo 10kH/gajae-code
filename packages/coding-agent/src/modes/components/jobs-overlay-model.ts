@@ -10,11 +10,12 @@ import { replaceTabs, shortenPath, TRUNCATE_LENGTHS, truncateToWidth } from "../
 import type { JobsSnapshot } from "../jobs-observer";
 import { sanitizeStatusText } from "../shared";
 
-export type JobRefKind = "monitor" | "cron";
+export type JobRefKind = "monitor" | "cron" | "folded";
 
 export interface JobRef {
 	kind: JobRefKind;
 	id: string;
+	generation?: string;
 }
 
 function displayText(text: string, max: number = TRUNCATE_LENGTHS.CONTENT): string {
@@ -49,6 +50,12 @@ export function parseJobRef(value: string): JobRef | null {
 	const id = value.slice(sep + 1);
 	if ((kind === "monitor" || kind === "cron") && id.length > 0) {
 		return { kind, id };
+	}
+	if (kind === "folded") {
+		const generationSep = id.indexOf(":");
+		if (generationSep > 0 && generationSep < id.length - 1) {
+			return { kind, id: id.slice(0, generationSep), generation: id.slice(generationSep + 1) };
+		}
 	}
 	return null;
 }
@@ -105,7 +112,6 @@ export function buildJobsListItems(snapshot: JobsSnapshot): SelectItem[] {
 			label: `${kind} · ${preview(job.label, TRUNCATE_LENGTHS.SHORT)}`,
 			description,
 			hint: job.status === "failed" || job.deliveryState === "failed-visible" ? "failed" : "read-only",
-			disabled: true,
 		});
 	}
 	return items;
@@ -127,6 +133,22 @@ export function buildJobDetailItems(snapshot: JobsSnapshot, ref: JobRef, output 
 			{ value: "noop", label: "Started", description: formatRelative(monitor.startTime) },
 			{ value: "noop", label: "Output", description: preview(lastOutput, TRUNCATE_LENGTHS.CONTENT) },
 			{ value: "action:cancel", label: "Cancel this monitor", hint: "stops the running job" },
+			{ value: "back", label: "Back" },
+		];
+	}
+	if (ref.kind === "folded") {
+		const job = snapshot.foldedJobs?.find(
+			entry => entry.id === ref.id && (ref.generation === undefined || entry.generation === ref.generation),
+		);
+		if (!job) return [{ value: "back", label: "Back (job no longer present)" }];
+		return [
+			{ value: "noop", label: "Status", description: displayText(job.status, TRUNCATE_LENGTHS.SHORT) },
+			{ value: "noop", label: "Kind", description: preview(job.kind, TRUNCATE_LENGTHS.SHORT) },
+			{ value: "noop", label: "Label", description: preview(job.label) },
+			{ value: "noop", label: "Generation", description: preview(job.generation, TRUNCATE_LENGTHS.CONTENT) },
+			...(job.errorText
+				? [{ value: "noop", label: "Error", description: preview(job.errorText, TRUNCATE_LENGTHS.CONTENT) }]
+				: []),
 			{ value: "back", label: "Back" },
 		];
 	}

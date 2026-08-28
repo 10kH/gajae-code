@@ -277,6 +277,8 @@ interface AsyncJobDelivery {
 	nextAttemptAt: number;
 	lastError?: string;
 	ownerId?: string;
+	/** Cleanup-triggered terminal deliveries may retry while disposal drains them. */
+	retryDuringDispose: boolean;
 	promise?: Promise<void>;
 }
 
@@ -650,6 +652,7 @@ export class AsyncJobManager {
 	#deliveryLoop: Promise<void> | undefined;
 	#disposed = false;
 	#disposing = false;
+	#runningOwnerCleanups = false;
 	readonly #subagentRecords = new Map<string, SubagentRecord>();
 	readonly #terminalEvents = new Map<string, TerminalEvent>();
 	readonly #waitGenerationAliases = new Map<string, string>();
@@ -2402,6 +2405,7 @@ export class AsyncJobManager {
 			attempt: 0,
 			nextAttemptAt: Date.now(),
 			ownerId: job.ownerId,
+			retryDuringDispose: false,
 		});
 		this.#notifyChange();
 	}
@@ -2698,7 +2702,12 @@ export class AsyncJobManager {
 		// escalated.
 		this.#registrationClosed = true;
 		this.#clearEvictionTimers();
-		this.runOwnerCleanups();
+		this.#runningOwnerCleanups = true;
+		try {
+			this.runOwnerCleanups();
+		} finally {
+			this.#runningOwnerCleanups = false;
+		}
 		this.#disposing = true;
 		this.cancelAll();
 		for (const tombstone of this.#monitorTombstones.values()) {
@@ -3096,6 +3105,7 @@ export class AsyncJobManager {
 			attempt: 0,
 			nextAttemptAt: Date.now(),
 			ownerId: job.ownerId,
+			retryDuringDispose: this.#runningOwnerCleanups,
 		});
 		while (this.#deliveries.length > DEFAULT_MAX_DELIVERY_QUEUE) {
 			const dropped = this.#deliveries.shift();
@@ -3178,7 +3188,7 @@ export class AsyncJobManager {
 			} catch (error) {
 				delivery.attempt += 1;
 				delivery.lastError = this.#boundedDeliveryErrorText(error instanceof Error ? error.message : String(error));
-				if (this.#disposed || this.#disposing) {
+				if (this.#disposed || (this.#disposing && !delivery.retryDuringDispose)) {
 					logger.warn("Async job completion delivery dropped after manager disposal", {
 						jobId: delivery.jobId,
 						attempt: delivery.attempt,

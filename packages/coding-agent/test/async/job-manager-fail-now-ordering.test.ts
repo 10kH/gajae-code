@@ -137,6 +137,33 @@ describe("AsyncJobManager.failNow", () => {
 		expect(delivered).toEqual(["cleanup failure"]);
 	});
 
+	test("retries cleanup-triggered delivery failures before dead-lettering", async () => {
+		let attempts = 0;
+		const manager = new AsyncJobManager({
+			retentionMs: 60_000,
+			onJobComplete: async () => {
+				attempts += 1;
+				throw new Error("delivery unavailable");
+			},
+		});
+		const gate = Promise.withResolvers<string>();
+		const jobId = manager.register("bash", "remote", async () => gate.promise, {
+			id: "bridge-retry",
+			ownerId: "0-Main",
+		});
+		const generation = manager.getJob(jobId)?.generation ?? "";
+		manager.registerOwnerCleanup("0-Main", () => {
+			manager.failNow(jobId, generation, "cleanup failure");
+		});
+
+		const disposal = manager.dispose({ timeoutMs: 3_000 });
+		gate.resolve("late runner result");
+
+		expect(await disposal).toBe(true);
+		expect(attempts).toBe(3);
+		expect(manager.getLastDisposeDiagnostics().deliveriesDrained).toBe(true);
+	});
+
 	test("closes registration while owner cleanups run during dispose", async () => {
 		const manager = new AsyncJobManager({ retentionMs: 60_000, onJobComplete: async () => {} });
 		let registerDuringCleanup: string | undefined;

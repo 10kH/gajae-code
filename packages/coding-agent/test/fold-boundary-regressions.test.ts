@@ -156,7 +156,7 @@ describe("boundary-review fold regressions", () => {
 	test("a parked completion replay drives deliverParked with its receipt", async () => {
 		const parkedDeliveries: Array<{ jobId: string; text: string }> = [];
 		const intent = Promise.withResolvers<string | undefined>();
-		setTimeout(() => intent.resolve("intent"), 10);
+		void Bun.sleep(10).then(() => intent.resolve("intent"));
 		const coordinator = new FoldCoordinator({
 			armSteeringFence: () => () => {},
 			requestStop: () => {},
