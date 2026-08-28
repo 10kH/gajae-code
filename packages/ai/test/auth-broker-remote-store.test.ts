@@ -234,15 +234,23 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 			expect(active).toHaveLength(1);
 			expect(active[0]?.credential).toMatchObject({ access: "access-fallback" });
 			const inventory = store!.listCredentialInventory("anthropic");
-			expect(inventory).toEqual(
-				expect.arrayContaining([
-					expect.objectContaining({
-						id: initial.snapshot.credentials[0]?.id,
-						disabled: true,
-						disabledCause: expect.stringContaining("invalid_grant"),
-					}),
-				]),
-			);
+			expect(inventory).toHaveLength(2);
+			expect(inventory).toEqual([
+				expect.objectContaining({
+					id: initial.snapshot.credentials[0]?.id,
+					provider: "anthropic",
+					credentialKind: "oauth",
+					disabled: true,
+					disabledCause: "disabled via auth-broker",
+				}),
+				expect.objectContaining({
+					provider: "anthropic",
+					credentialKind: "oauth",
+					disabled: false,
+					accountId: "account-fallback",
+					email: "fallback@example.com",
+				}),
+			]);
 			expect(remote.snapshot.credentials).toHaveLength(1);
 		} finally {
 			clientStorage.close();
