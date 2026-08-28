@@ -227,6 +227,9 @@ export const fileLocksGcAdapter: GcStoreAdapter = {
 			if (removal === "missing") {
 				return { removed: false, skipped: "lock_no_longer_dead_or_missing" };
 			}
+			if (removal === "cleanup_failed") {
+				return { removed: false, skipped: "lock_removal_denied_by_native_identity_guard" };
+			}
 			return { removed: true };
 		} catch (error) {
 			return { removed: false, error: errorMessage(error) };

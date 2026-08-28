@@ -125,7 +125,12 @@ function lockInfo(ownerHostId: string | undefined, ownerToken: string): LockInfo
 }
 
 function writeLockInfo(lockPath: string, info: LockInfo): Promise<LockInfo> {
-	return Bun.write(`${lockPath}/info`, JSON.stringify(info)).then(() => info);
+	// Owner metadata must stay readable by its own process under a restrictive
+	// umask: release re-reads this record to authorize removal, and an info file
+	// born mode 000 under umask 0777 would wedge the lock at first release.
+	return Bun.write(`${lockPath}/info`, JSON.stringify(info), { mode: 0o600 })
+		.then(() => fs.chmod(`${lockPath}/info`, 0o600))
+		.then(() => info);
 }
 
 type LockInfoFileState = {
@@ -282,6 +287,30 @@ async function readLockInfo(lockPath: string): Promise<LockInfo | null> {
 	return { pid, start_time, start_time_format, timestamp, owner_host_id, owner_token };
 }
 
+function parseLockInfoBytes(bytes: string): LockInfo | null {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(bytes);
+	} catch {
+		return null;
+	}
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+	const { pid, start_time, start_time_format, timestamp, owner_host_id, owner_token } = parsed as Partial<LockInfo>;
+	if (
+		typeof pid !== "number" ||
+		!Number.isInteger(pid) ||
+		pid <= 0 ||
+		typeof timestamp !== "number" ||
+		!Number.isFinite(timestamp) ||
+		(start_time !== undefined && (typeof start_time !== "string" || !start_time)) ||
+		(start_time_format !== undefined && (typeof start_time_format !== "string" || !start_time_format)) ||
+		(owner_host_id !== undefined && (typeof owner_host_id !== "string" || !owner_host_id)) ||
+		(owner_token !== undefined && (typeof owner_token !== "string" || !owner_token))
+	)
+		return null;
+	return { pid, start_time, start_time_format, timestamp, owner_host_id, owner_token };
+}
+
 /** @internal */
 export async function readFileLockInfoForGc(lockDir: string): Promise<FileLockOwnerToken | null> {
 	return await readLockInfo(lockDir);
@@ -355,7 +384,7 @@ function ownerIncarnationChanged(owner: FileLockOwnerToken, startTimeCache?: Map
 }
 
 /** Outcome of a guarded lock-dir removal attempt (`removeFileLockDirForGc`). */
-export type FileLockGcRemoval = "removed" | "owner_changed" | "missing";
+export type FileLockGcRemoval = "removed" | "owner_changed" | "missing" | "cleanup_failed";
 
 interface LockDirStatToken {
 	dev: number;
@@ -390,8 +419,9 @@ export async function removeFileLockDirForGc(
 	lockDir: string,
 	expected: FileLockOwnerToken,
 ): Promise<FileLockGcRemoval> {
-	const current = await readLockInfo(lockDir);
-	if (!current) return "missing";
+	const onDiskBytes = await readLockInfoBytes(lockDir);
+	const current = onDiskBytes === null ? null : parseLockInfoBytes(onDiskBytes);
+	if (!current || onDiskBytes === null) return "missing";
 	if (
 		current.pid !== expected.pid ||
 		(expected.start_time !== undefined && current.start_time !== expected.start_time) ||
@@ -401,8 +431,74 @@ export async function removeFileLockDirForGc(
 	) {
 		return "owner_changed";
 	}
-	await fs.rm(lockDir, { recursive: true, force: true });
-	return "removed";
+	// The token comparison above authorizes the content that was judged, not the
+	// pathname. Bind the deletion to that exact tree: capture the directory after
+	// the verdict and remove only while the native identity check still matches,
+	// so a live successor installed in the final window is never removed by a
+	// comparison that predates it (#652 — a live owner is never displaced). The
+	// digest is taken over the exact bytes that were judged, so any rewrite —
+	// including a key-order-different re-serialization of the same fields —
+	// counts as a changed owner.
+	// The canonical native path may refuse a symlinked parent ("reparse_point");
+	// canonicalize first so the identity-bound capture sees the real directory,
+	// mirroring how localLockKey canonicalizes the lock pathname.
+	let nativeCapturePath = lockDir;
+	try {
+		nativeCapturePath = await fs.realpath(lockDir);
+	} catch (error) {
+		if (!isEnoent(error) && !isTransientReleaseError(error)) return "cleanup_failed";
+	}
+	const captured = nativeFileLockBindings().snapshotDirectoryTree(nativeCapturePath);
+	if (!captured.ok || !captured.snapshot) return "owner_changed";
+	const infoEntry = captured.snapshot.entries.find(entry => entry.relativePath === "info");
+	if (!infoEntry?.sha256) return "owner_changed";
+	const judgedDigest = crypto.createHash("sha256").update(onDiskBytes).digest("hex");
+	if (infoEntry.sha256 !== judgedDigest) return "owner_changed";
+	let removed: NativeExactUnlinkResult;
+	try {
+		removed = nativeFileLockBindings().exactRemoveDirectoryTree(nativeCapturePath, captured.snapshot);
+	} catch (error) {
+		// Keep the #2478 transient retry contract: sharing denials surface with
+		// their transient code so callers retry, everything else is a refusal.
+		if (isTransientReleaseError(error)) throw error;
+		return "cleanup_failed";
+	}
+	if (removed.ok) return "removed";
+	// The canonical name may already be detached: the security-critical phase is
+	// done once the verified tree is durably scrubbed and parked under the
+	// no-replace quarantine name with no successor retained. Finish that replay
+	// deterministically by deleting the retained quarantine — the same completion
+	// contract gc-runtime applies to its own exact removals. Any other outcome —
+	// including a retained successor or placeholder — leaves the judged object (or
+	// its replacement) in place and reports the removal as refused.
+	const detachedPath = removed.detachedPath;
+	const verifiedDetach =
+		detachedPath !== undefined &&
+		path.resolve(detachedPath) !== path.resolve(lockDir) &&
+		removed.retainedSuccessorPath === undefined &&
+		removed.retainedPlaceholderPath === undefined &&
+		removed.retainedUnknownPath === undefined;
+	if (verifiedDetach && detachedPath !== undefined) {
+		// The security-critical phase is done: the verified tree was detached from
+		// the canonical name and durably parked under the no-replace quarantine
+		// name with no successor retained. Finish that replay deterministically by
+		// deleting the retained quarantine — the same completion contract gc-runtime
+		// applies to its own exact removals — then report the release as done.
+		try {
+			await fs.rm(detachedPath, { recursive: true, force: true });
+		} catch {
+			// The canonical pathname is free either way; a retained quarantine is
+			// recoverable debris, not a live lock.
+		}
+		return "removed";
+	}
+	if (removed.code === "not_found") return "removed";
+	if (removed.code === "identity_mismatch") return "owner_changed";
+	const refusal: NodeJS.ErrnoException = new Error(
+		`Failed to remove file lock tree: ${removed.code ?? "unknown"}.`,
+	) as NodeJS.ErrnoException;
+	refusal.code = "EACCES";
+	throw refusal;
 }
 
 type OwnerLiveness = "alive" | "dead" | "unknown";
@@ -563,24 +659,39 @@ async function tryAcquireLock(
 	const afterParentMkdir = FileLockTestHooks.afterParentMkdir;
 	if (afterParentMkdir) await afterParentMkdir(lockPath);
 	if (ownerHostId === undefined) {
+		// The final directory is never visible empty: publication stages the fully
+		// populated directory under a private pending name and renames it into place.
+		// A direct mkdir+write here would expose a stale-reclaimable ownerless `.lock`
+		// whose info a delayed publisher later overwrites a successor's record with.
+		const pendingPath = `${lockPath}.pending.${process.pid}.${crypto.randomUUID()}`;
+		const owner = lockInfo(undefined, ownerToken);
 		try {
-			await fs.mkdir(lockPath, { mode: 0o700 });
-			await fs.chmod(lockPath, 0o700);
-		} catch (error) {
-			const code = (error as NodeJS.ErrnoException).code;
-			if (code === "EEXIST") return null;
-			if (isTransientReleaseError(error)) {
-				try {
-					await fs.stat(lockPath);
-					return null;
-				} catch (statError) {
-					if (!isEnoent(statError)) throw statError;
+			await fs.mkdir(pendingPath, { mode: 0o700 });
+			await fs.chmod(pendingPath, 0o700);
+			await writeLockInfo(pendingPath, owner);
+			try {
+				await fs.rename(pendingPath, lockPath);
+			} catch (error) {
+				const code = (error as NodeJS.ErrnoException).code;
+				if (code === "EEXIST" || code === "ENOTEMPTY") return null;
+				if (isTransientReleaseError(error)) {
+					try {
+						await fs.stat(lockPath);
+						return null;
+					} catch (statError) {
+						if (!isEnoent(statError)) throw statError;
+					}
 				}
+				throw error;
 			}
-			throw error;
+			// The rename published this process as the owner, so an onAcquired
+			// failure must still propagate without retrying: the lock exists with
+			// our identity and a retry would race our own release cleanup.
+			onAcquired?.();
+			return owner;
+		} finally {
+			await fs.rm(pendingPath, { recursive: true, force: true }).catch(() => undefined);
 		}
-		onAcquired?.();
-		return await writeLockInfo(lockPath, lockInfo(undefined, ownerToken));
 	}
 
 	const pendingPath = `${lockPath}.pending.${process.pid}.${crypto.randomUUID()}`;
@@ -591,8 +702,6 @@ async function tryAcquireLock(
 		await writeLockInfo(pendingPath, owner);
 		try {
 			await fs.rename(pendingPath, lockPath);
-			onAcquired?.();
-			return owner;
 		} catch (error) {
 			const code = (error as NodeJS.ErrnoException).code;
 			if (code === "EEXIST" || code === "ENOTEMPTY") return null;
@@ -606,6 +715,10 @@ async function tryAcquireLock(
 			}
 			throw error;
 		}
+		// Published above, so an onAcquired failure must propagate instead of
+		// retrying an acquisition that already owns the lock.
+		onAcquired?.();
+		return owner;
 	} finally {
 		await fs.rm(pendingPath, { recursive: true, force: true }).catch(() => undefined);
 	}

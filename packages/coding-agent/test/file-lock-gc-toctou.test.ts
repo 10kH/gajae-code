@@ -91,7 +91,9 @@ describe("withFileLock stale owner liveness (#652)", () => {
 				},
 			}),
 		).rejects.toBe(failure);
-		expect((await fs.readdir(`${file}.lock`)).length).toBe(0);
+		// Publication is staged before onAcquired runs, so the aborted callback
+		// leaves the fully populated lock behind instead of an empty directory.
+		expect((await fs.readdir(`${file}.lock`)).join(",")).toBe("info");
 	});
 
 	test("publishes nested lock directories with private modes under restrictive umask", async () => {
@@ -99,24 +101,44 @@ describe("withFileLock stale owner liveness (#652)", () => {
 		const file = path.join(root, "nested", "deeper", "state.json");
 		const previousUmask = process.umask(0o277);
 		try {
+			const unqualifiedAssertions = Promise.withResolvers<void>();
 			await withFileLock(file, async () => undefined, {
-				onAcquired: async () => {
-					for (const directory of [
-						path.join(root, "nested"),
-						path.join(root, "nested", "deeper"),
-						`${file}.lock`,
-					]) {
-						expect((await fs.stat(directory)).mode & 0o777).toBe(0o700);
-					}
+				onAcquired: () => {
+					(async () => {
+						try {
+							for (const directory of [
+								path.join(root, "nested"),
+								path.join(root, "nested", "deeper"),
+								`${file}.lock`,
+							]) {
+								expect((await fs.stat(directory)).mode & 0o777).toBe(0o700);
+							}
+							expect((await fs.stat(`${file}.lock/info`)).mode & 0o777).toBe(0o600);
+							unqualifiedAssertions.resolve();
+						} catch (error) {
+							unqualifiedAssertions.reject(error);
+						}
+					})();
 				},
 			});
+			await unqualifiedAssertions.promise;
 			const qualifiedFile = path.join(root, "qualified", "state.json");
+			const qualifiedAssertions = Promise.withResolvers<void>();
 			await withFileLock(qualifiedFile, async () => undefined, {
 				ownerHostId: "test-host",
-				onAcquired: async () => {
-					expect((await fs.stat(`${qualifiedFile}.lock`)).mode & 0o777).toBe(0o700);
+				onAcquired: () => {
+					(async () => {
+						try {
+							expect((await fs.stat(`${qualifiedFile}.lock`)).mode & 0o777).toBe(0o700);
+							expect((await fs.stat(`${qualifiedFile}.lock/info`)).mode & 0o777).toBe(0o600);
+							qualifiedAssertions.resolve();
+						} catch (error) {
+							qualifiedAssertions.reject(error);
+						}
+					})();
 				},
 			});
+			await qualifiedAssertions.promise;
 		} finally {
 			process.umask(previousUmask);
 		}
@@ -223,16 +245,25 @@ describe("withFileLock stale owner liveness (#652)", () => {
 		const base = await makeTemp();
 		const lockedFile = path.join(base, "ownerless.json");
 		const lockDir = `${lockedFile}.lock`;
+		// A NON-EMPTY stale directory: staged atomic publication cannot rename over
+		// it, so reclaim must go through the identity-bound native branch, which the
+		// mock below replaces with a fresh live directory between capture and remove.
 		await fs.mkdir(lockDir);
-		const staleTime = new Date(Date.now() - 10_000);
-		await fs.utimes(lockDir, staleTime, staleTime);
+		await writeInfo(lockDir, { pid: DEAD_PID, timestamp: Date.now() - 10_000 });
 		let replaced = false;
 		FileLockTestHooks.nativeQuarantineBindings = () => ({
 			snapshotDirectoryTree,
 			exactRemoveDirectoryTree: () => {
 				replaced = true;
+				// Simulate a successor that took over the path during the removal
+				// window: a fully published live lock, not an empty directory — an
+				// empty one could be atomically replaced by our own staged rename.
 				rmSync(lockDir, { recursive: true, force: true });
 				mkdirSync(lockDir);
+				writeFileSync(
+					path.join(lockDir, "info"),
+					JSON.stringify({ pid: LIVE_PID, start_time: "successor", timestamp: Date.now() }),
+				);
 				return { ok: false, code: "identity_mismatch" };
 			},
 		});
@@ -474,15 +505,18 @@ describe("file lock cleanup failure handling (#2478)", () => {
 		const base = await makeTemp();
 		const lockedFile = path.join(base, "state.json");
 		const lockDir = `${lockedFile}.lock`;
-		const realRm = fs.rm;
 		let denied = true;
-		vi.spyOn(fs, "rm").mockImplementation((async (target, options) => {
-			if (denied && String(target) === lockDir) {
-				denied = false;
-				throw Object.assign(new Error("sharing violation"), { code: "EPERM" });
-			}
-			return await realRm(target, options);
-		}) as typeof fs.rm);
+		FileLockTestHooks.nativeQuarantineBindings = () => ({
+			snapshotDirectoryTree,
+			exactRemoveDirectoryTree: target => {
+				if (denied) {
+					denied = false;
+					throw Object.assign(new Error("sharing violation"), { code: "EPERM" });
+				}
+				rmSync(target, { recursive: true, force: true });
+				return { ok: true };
+			},
+		});
 
 		await withFileLock(lockedFile, async () => {});
 
@@ -553,6 +587,9 @@ describe("file lock cleanup failure handling (#2478)", () => {
 		expect(await fs.exists(lockDir)).toBe(true);
 
 		vi.restoreAllMocks();
+		// The identity-bound release path consults the native bindings hook, not the
+		// fs.rm spy, so the reclaim phase needs the real bindings restored too.
+		FileLockTestHooks.nativeQuarantineBindings = undefined;
 		let entered = false;
 		await withFileLock(lockedFile, async () => {
 			entered = true;
@@ -637,22 +674,23 @@ describe("file lock cleanup failure handling (#2478)", () => {
 		expect(await fs.exists(lockDir)).toBe(true);
 	});
 
-	test("rejects when release fails after successful protected work", async () => {
+	test("releases through a verified detach even when quarantine cleanup fails", async () => {
 		const base = await makeTemp();
 		const lockedFile = path.join(base, "state.json");
 		const lockDir = `${lockedFile}.lock`;
 		const releaseError = Object.assign(new Error("lock removal denied"), { code: "EIO" });
 		let completed = false;
 
+		// The first rm is the quarantine completion after a verified native detach:
+		// the canonical lock name is already free, so a cleanup failure there is
+		// recoverable debris and must not fail the release (or re-leak the lock).
 		vi.spyOn(fs, "rm").mockRejectedValueOnce(releaseError);
 
-		await expect(
-			withFileLock(lockedFile, async () => {
-				completed = true;
-			}),
-		).rejects.toBe(releaseError);
+		await withFileLock(lockedFile, async () => {
+			completed = true;
+		});
 		expect(completed).toBe(true);
-		expect(await fs.exists(lockDir)).toBe(true);
+		expect(await fs.exists(lockDir)).toBe(false);
 	});
 
 	test("releases with the acquisition key when canonicalization transiently fails", async () => {

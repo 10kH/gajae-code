@@ -1030,23 +1030,45 @@ async function reclaimStaleTransitionClaim(transitionDir: string): Promise<void>
 }
 
 /** Run one pathname transition under an atomic `mkdir`/`rmdir` claim. */
+/**
+ * Recover a transition claim this process stranded in a prior failed release.
+ *
+ * `releaseTransitionClaim` rewrites the owner record to its released tombstone
+ * before removing the claim directory, so a transiently denied `rmdir` (Windows
+ * sharing denial, EBUSY/EPERM) leaves a RELEASED owner record plus an intact
+ * claim. Without recovery, that claim is a fail-closed wall this same process
+ * then deadlocks on: the on-disk owner is live (this process), so
+ * `reclaimStaleTransitionClaim` refuses it forever. The recorded released token
+ * authorizes completing exactly that release: the record must still carry the
+ * same token with `released: true` — any other content is a successor's claim
+ * and stays untouched.
+ */
+async function recoverPendingTransitionRelease(transitionDir: string): Promise<boolean> {
+	const pendingToken = pendingTransitionReleases.get(transitionDir);
+	if (pendingToken === undefined) return false;
+	const ownerFile = `${transitionDir}.owner`;
+	try {
+		const pendingOwner = JSON.parse(await fs.readFile(ownerFile, "utf8")) as Partial<SessionStateLockOwner>;
+		if (pendingOwner.token !== pendingToken || pendingOwner.released !== true) return false;
+		await removeTransitionDir(transitionDir);
+		pendingTransitionReleases.delete(transitionDir);
+		return true;
+	} catch {
+		// A still-active denial, a vanished owner record, or unverifiable bytes all
+		// leave the claim in place: stale reclamation owns what this cannot prove.
+		return false;
+	}
+}
+
+/** Run one pathname transition under an atomic `mkdir`/`rmdir` claim. */
 async function withLockPathTransition<T>(lockFile: string, transition: () => Promise<T>): Promise<T> {
 	const transitionDir = `${lockFile}${LOCK_TRANSITION_RESOURCE_SUFFIX}`;
 	const ownerFile = `${transitionDir}.owner`;
 	const owner = await newLockOwner();
 	for (let attempt = 0; attempt < LOCK_ACQUIRE_ATTEMPTS; attempt++) {
-		const pendingToken = pendingTransitionReleases.get(transitionDir);
-		if (pendingToken) {
-			try {
-				const pendingOwner = JSON.parse(await fs.readFile(ownerFile, "utf8")) as Partial<SessionStateLockOwner>;
-				if (pendingOwner.token === pendingToken && pendingOwner.released === true) {
-					await removeTransitionDir(transitionDir);
-					pendingTransitionReleases.delete(transitionDir);
-				}
-			} catch (error) {
-				const code = (error as NodeJS.ErrnoException).code;
-				if (!isTransientLockError(error) && code !== "ENOENT") throw error;
-			}
+		if (await recoverPendingTransitionRelease(transitionDir)) {
+			// The claim this process stranded in an earlier failed release is gone;
+			// fall through and retry the mkdir immediately.
 		}
 		try {
 			await fs.mkdir(transitionDir);
@@ -1071,6 +1093,15 @@ async function withLockPathTransition<T>(lockFile: string, transition: () => Pro
 		try {
 			await releaseTransitionClaim(transitionDir, ownerFile, held);
 		} catch (releaseError) {
+			// The release rewrite may itself have succeeded before the claim-dir
+			// removal was denied (transient sharing denial). Recover the stranded
+			// claim in-process on the following attempts instead of surfacing a
+			// failure whose owner record is already released — and whose unrecovered
+			// claim would wedge every later operation on this state file.
+			if (outcome.ok && pendingTransitionReleases.has(transitionDir)) {
+				await Bun.sleep(LOCK_ACQUIRE_RETRY_MS);
+				continue;
+			}
 			if (!outcome.ok)
 				throw new SessionStateLockUnavailableError(
 					new AggregateError([outcome.error, releaseError], "Lock path transition and release both failed."),
