@@ -14,9 +14,9 @@ import { ACP_SESSION_RECONNECT } from "../src/sdk/session-reconnect";
 import {
 	drainReconnects,
 	expectedBackoffs,
-	flush,
 	type FakeClock,
 	FakeWebSocket,
+	flush,
 	withFakeTransport,
 } from "./helpers/fake-sdk-transport";
 
