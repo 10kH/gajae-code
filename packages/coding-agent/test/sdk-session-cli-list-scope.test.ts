@@ -191,6 +191,17 @@ describe("sdk session list scope filtering", () => {
 		expect(filtered.warnings.join("\n")).toContain("s-gone");
 	});
 
+	test("unknown projected locators never resolve relative to the process cwd", async () => {
+		const repo = await makeRepo("unknown-locator");
+		const selection = await resolveSessionListSelection("repo", repo);
+		const filtered = await filterSessionRowsByScope(
+			[row("s-unknown", "unknown"), row("s-repo", repo)],
+			"repo",
+			selection,
+		);
+		expect(filtered.sessions.map(candidate => candidate.sessionId)).toEqual(["s-repo"]);
+	});
+
 	test("matching rows are retained regardless of their position in the fully traversed listing", async () => {
 		const main = await makeRepo("pager");
 		const other = await makeRepo("pagerother");
