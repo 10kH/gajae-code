@@ -11152,7 +11152,7 @@ export class AgentSession {
 		const rosterClaim = this.#claimIrcRosterCandidate();
 		let hasPendingNextTurnMessages = false;
 		let pendingNextTurnMessageCount = 0;
-		let skipPostPromptRecoveryWait = options?.skipPostPromptRecoveryWait === true;
+		const skipPostPromptRecoveryWait = options?.skipPostPromptRecoveryWait === true;
 		let hindsightRecall: string | undefined;
 		try {
 			this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
