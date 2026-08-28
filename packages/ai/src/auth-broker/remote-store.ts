@@ -721,7 +721,9 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 					// Strip the discriminator so we store the wire-shape SnapshotResponse.
 					const { kind: _kind, ...snapshot } = event;
 					if (!this.#applySnapshot(snapshot, snapshot.generation)) {
-						throw new Error("Auth broker stream snapshot authority was rejected");
+						if (!this.#isSupersededSnapshot(snapshot, snapshot.generation)) {
+							throw new Error("Auth broker stream snapshot authority was rejected");
+						}
 					}
 					return;
 				}
