@@ -76,6 +76,14 @@ describe("splitInternalUrlSel", () => {
 			path: "skill://superpowers:brainstorming",
 			sel: "",
 		});
+		expect(splitInternalUrlSel("skill://superpowers%3Abrainstorming:bogus", { activeSkillNames })).toEqual({
+			path: "skill://superpowers%3Abrainstorming",
+			sel: "bogus",
+		});
+		expect(splitInternalUrlSel("skill://superpowers%3Abrainstorming:raw:bogus", { activeSkillNames })).toEqual({
+			path: "skill://superpowers%3Abrainstorming",
+			sel: "raw:bogus",
+		});
 	});
 
 	it("falls back to ordinary strict skill selectors without a registry", () => {

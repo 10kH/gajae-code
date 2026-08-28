@@ -36,6 +36,18 @@ function normalizeUnicodeSpaces(str: string): string {
 	return str.replace(UNICODE_SPACES, " ");
 }
 
+function rawSkillPrefixForName(authority: string, skillName: string): string | undefined {
+	for (let index = 1; index < authority.length; index++) {
+		if (authority[index] !== ":") continue;
+		try {
+			if (decodeURIComponent(authority.slice(0, index)) === skillName) return authority.slice(0, index);
+		} catch {
+			return undefined;
+		}
+	}
+	return undefined;
+}
+
 function tryMacOSScreenshotPath(filePath: string): string {
 	// macOS writes a narrow no-break space before AM/PM, but the model normalizes it
 	// to a plain space. The original name is not always `…PM.png`: attachment paths
@@ -177,14 +189,23 @@ export function splitInternalUrlSel(
 
 	if (scheme === "skill") {
 		const activeSkillNames = options.activeSkillNames ?? [];
-		if (activeSkillNames.includes(authority)) return { path: rawPath };
+		let decodedAuthority: string | undefined;
+		try {
+			decodedAuthority = decodeURIComponent(authority);
+		} catch {
+			// Let the resolver report malformed URL encoding when no selector boundary
+			// can be established from the raw authority.
+		}
+		if (decodedAuthority !== undefined && activeSkillNames.includes(decodedAuthority)) return { path: rawPath };
 		const skillName = activeSkillNames
-			.filter(name => authority.startsWith(`${name}:`))
+			.filter(name => decodedAuthority?.startsWith(`${name}:`))
 			.sort((a, b) => b.length - a.length)[0];
-		if (skillName) {
+		if (skillName && decodedAuthority !== undefined) {
+			const rawSkillPrefix = rawSkillPrefixForName(authority, skillName);
+			if (!rawSkillPrefix) return { path: rawPath };
 			return {
-				path: `${rawPath.slice(0, schemeEnd)}${skillName}`,
-				sel: authority.slice(skillName.length + 1),
+				path: `${rawPath.slice(0, schemeEnd)}${rawSkillPrefix}`,
+				sel: authority.slice(rawSkillPrefix.length + 1),
 			};
 		}
 		const strict = splitPathAndSel(authority);
