@@ -208,7 +208,15 @@ function chainCacheKey(
 		preferred ?? null,
 		fallbacks,
 		ctx
-			? [ctx.provider, ctx.modelId, ctx.wireModelId ?? null, ctx.api, ctx.baseUrl ?? null, ctx.webSearch ?? null]
+			? [
+					ctx.provider,
+					ctx.modelId,
+					ctx.wireModelId ?? null,
+					ctx.api,
+					ctx.baseUrl ?? null,
+					ctx.webSearch ?? null,
+					ctx.ownerAuthOverride ?? false,
+				]
 			: null,
 	]);
 }
