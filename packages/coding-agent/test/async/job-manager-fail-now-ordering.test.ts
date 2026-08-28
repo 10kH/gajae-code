@@ -164,6 +164,35 @@ describe("AsyncJobManager.failNow", () => {
 		expect(manager.getLastDisposeDiagnostics().deliveriesDrained).toBe(true);
 	});
 
+	test("retries a pre-disposal delivery failure while disposal drains", async () => {
+		const deliveryStarted = Promise.withResolvers<void>();
+		const releaseDelivery = Promise.withResolvers<void>();
+		let attempts = 0;
+		const delivered: string[] = [];
+		const manager = new AsyncJobManager({
+			retentionMs: 60_000,
+			onJobComplete: async (_jobId, text) => {
+				attempts += 1;
+				if (attempts === 1) {
+					deliveryStarted.resolve();
+					await releaseDelivery.promise;
+					throw new Error("pre-disposal delivery unavailable");
+				}
+				delivered.push(text);
+			},
+		});
+		manager.register("bash", "remote", async () => "completion", { id: "pre-disposal" });
+
+		await deliveryStarted.promise;
+		const disposal = manager.dispose({ timeoutMs: 3_000 });
+		releaseDelivery.resolve();
+
+		expect(await disposal).toBe(true);
+		expect(attempts).toBe(2);
+		expect(delivered).toEqual(["completion"]);
+		expect(manager.getLastDisposeDiagnostics().deliveriesDrained).toBe(true);
+	});
+
 	test("closes registration while owner cleanups run during dispose", async () => {
 		const manager = new AsyncJobManager({ retentionMs: 60_000, onJobComplete: async () => {} });
 		let registerDuringCleanup: string | undefined;

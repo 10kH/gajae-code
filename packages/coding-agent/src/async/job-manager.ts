@@ -3191,7 +3191,7 @@ export class AsyncJobManager {
 			} catch (error) {
 				delivery.attempt += 1;
 				delivery.lastError = this.#boundedDeliveryErrorText(error instanceof Error ? error.message : String(error));
-				if (this.#disposed || (this.#disposing && !delivery.retryDuringDispose)) {
+				if (this.#disposed) {
 					logger.warn("Async job completion delivery dropped after manager disposal", {
 						jobId: delivery.jobId,
 						attempt: delivery.attempt,

@@ -375,7 +375,7 @@ describe("AsyncJobManager delivery reliability", () => {
 		}
 	});
 
-	test("late delivery rejection after disposal is not requeued", async () => {
+	test("late delivery rejection during disposal reaches the retry cap", async () => {
 		const deliveryStarted = Promise.withResolvers<void>();
 		const releaseDelivery = Promise.withResolvers<void>();
 		let attempts = 0;
@@ -393,16 +393,16 @@ describe("AsyncJobManager delivery reliability", () => {
 		try {
 			manager.register("bash", "late rejection", async () => "payload");
 			await deliveryStarted.promise;
-			disposePromise = manager.dispose({ timeoutMs: 250 });
+			disposePromise = manager.dispose({ timeoutMs: 3_000 });
 			releaseDelivery.resolve();
 
 			expect(await disposePromise).toBe(true);
-			expect(attempts).toBe(1);
+			expect(attempts).toBe(3);
 			expect(manager.getDeliveryState()).toMatchObject({ queued: 0, deadLettered: 0 });
 		} finally {
 			releaseDelivery.resolve();
 			if (disposePromise) await disposePromise;
-			else await manager.dispose({ timeoutMs: 250 });
+			else await manager.dispose({ timeoutMs: 3_000 });
 		}
 	});
 
