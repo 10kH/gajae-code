@@ -26,6 +26,7 @@ import {
 	type Agent,
 	AgentBusyError,
 	type AgentContext,
+	type AgentMetadataResolverContext,
 	type AgentEvent,
 	type AgentLoopConfig,
 	type AgentMessage,
@@ -117,6 +118,7 @@ import {
 	modelsAreEqual,
 	streamSimple,
 } from "@gajae-code/ai/core";
+import { resolveAnthropicBaseUrlFromEnv } from "@gajae-code/ai/utils/anthropic-auth";
 import {
 	type AuthDisposition,
 	beginAttempt,
@@ -190,8 +192,10 @@ import {
 	isUnexpectedSocketCloseMessage,
 	logger,
 	prompt,
+	$pickCredentialEnv,
 	Snowflake,
 } from "@gajae-code/utils";
+import { isFoundryEnabled } from "@gajae-code/ai/utils/foundry";
 import { createAppendOnlyContextManager, resolveAppendOnlyMode } from "../append-only-mode";
 import {
 	type AsyncJob,
@@ -1652,14 +1656,34 @@ function buildSessionMetadata(
 	provider: string,
 	authStorage: AuthStorage | undefined,
 	credentialSessionId = sessionId,
+	model?: Model,
+	owner?: object,
 ): Record<string, unknown> {
 	const userId: Record<string, string> = { session_id: sessionId };
 	// Only look up account_uuid when the request is going to Anthropic. Injecting
 	// a Anthropic model OAuth account_uuid into requests bound for other providers (including
 	// Anthropic-format-compatible proxies like cloudflare-ai-gateway or gitlab-duo)
 	// would leak the user's Anthropic identity to unrelated third-party APIs.
-	if (provider === "anthropic") {
-		const accountUuid = authStorage?.getOAuthAccountId("anthropic", credentialSessionId);
+	const effectiveBaseUrl =
+		model?.provider === "anthropic" ? (resolveAnthropicBaseUrlFromEnv() ?? model.baseUrl) : undefined;
+	let officialAnthropicEndpoint = false;
+	if (provider === "anthropic" && model?.api === "anthropic-messages") {
+		try {
+			const url = new URL(effectiveBaseUrl ?? "https://api.anthropic.com");
+			officialAnthropicEndpoint =
+				url.protocol === "https:" &&
+				url.hostname === "api.anthropic.com" &&
+				!url.username &&
+				!url.password &&
+				!url.search &&
+				!url.hash &&
+				(url.pathname === "/" || url.pathname === "/v1" || url.pathname === "/v1/");
+		} catch {
+			officialAnthropicEndpoint = false;
+		}
+	}
+	if (officialAnthropicEndpoint) {
+		const accountUuid = authStorage?.getOAuthAccountId("anthropic", credentialSessionId, { owner });
 		if (typeof accountUuid === "string" && accountUuid.length > 0) {
 			userId.account_uuid = accountUuid;
 			// Derive device_id from account_uuid so the payload matches the real CC
@@ -7986,8 +8010,15 @@ export class AgentSession {
 		const sid = this.#providerSessionId ?? sessionId ?? this.sessionManager.getSessionId();
 		this.agent.sessionId = sid;
 		this.agent.providerSessionId = this.#providerCacheSessionId ?? sid;
-		this.agent.setMetadataResolver((provider: string) =>
-			buildSessionMetadata(sid, provider, this.#modelRegistry.authStorage, this.credentialSessionId),
+		this.agent.setMetadataResolver(context =>
+			buildSessionMetadata(
+				sid,
+				context.provider,
+				this.#modelRegistry.authStorage,
+				this.credentialSessionId,
+				this.model,
+				this.#modelRegistry.getAuthStorageOwner(),
+			),
 		);
 	}
 
@@ -21247,6 +21278,8 @@ export class AgentSession {
 						model.provider,
 						this.#modelRegistry.authStorage,
 						this.credentialSessionId,
+						model,
+						this.#modelRegistry.getAuthStorageOwner(),
 					),
 					reasoning: toReasoningEffort(this.thinkingLevel),
 					hideThinkingSummary: this.agent.hideThinkingSummary,
