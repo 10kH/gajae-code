@@ -186,7 +186,7 @@ function suffixPrefixOverlap(source: string, target: string): number {
 		const code = source.charCodeAt(index);
 		while (overlap > 0 && code !== target.charCodeAt(overlap)) overlap = prefix[overlap - 1] ?? 0;
 		if (code === target.charCodeAt(overlap)) overlap += 1;
-		if (overlap === target.length) overlap = prefix[overlap - 1] ?? 0;
+		if (overlap === target.length && index < source.length - 1) overlap = prefix[overlap - 1] ?? 0;
 	}
 	return overlap;
 }
