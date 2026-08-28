@@ -838,6 +838,10 @@ class SdkSessionHelp extends Command {
 			description: "Workspace directory for saved-session resolution (default: current directory)",
 		}),
 		op: Flags.string({ description: "Raw control or global operation" }),
+		scope: Flags.string({
+			description: "list scope: repo (default), cwd, worktree, or all",
+			options: ["repo", "cwd", "worktree", "all"],
+		}),
 		query: Flags.string({ description: "Raw query name" }),
 		"json-input": Flags.string({ description: "SDK request JSON object" }),
 		"json-input-file": Flags.string({ description: "Read SDK request JSON from a 0600 file" }),
@@ -894,6 +898,7 @@ class SdkSessionCommand extends Command {
 			allEvents: Boolean(flagRec["all-events"]),
 			agentDir: flagRec["agent-dir"] as string | undefined,
 			repo: flagRec.repo as string | undefined,
+			scope: flagRec.scope as string | undefined,
 		});
 	}
 }
