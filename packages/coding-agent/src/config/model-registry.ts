@@ -5120,10 +5120,14 @@ export class ModelRegistry {
 	}
 
 	getActiveSearchModelContext(model: Model<Api>): ActiveSearchModelContext {
+		const provider = model.provider.toLowerCase();
 		const ownerAuthOverride =
 			this.authStorage.hasConfigApiKey(model.provider, this.#authStorageConfigOwner) ||
-			model.baseUrl !== undefined ||
-			model.headers !== undefined;
+			this.#providerOverrides.has(provider) ||
+			this.#runtimeProviderOverrides.has(provider) ||
+			this.#modelOverrides.get(provider)?.has(model.id.toLowerCase()) === true ||
+			this.#customProviderAuthHeaders.has(provider) ||
+			this.#runtimeProviderAuthHeaders.has(provider);
 		return {
 			provider: model.provider,
 			modelId: model.id,
