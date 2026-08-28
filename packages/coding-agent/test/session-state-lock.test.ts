@@ -1096,6 +1096,7 @@ describe("coordinator session state lock", () => {
 			throw primary;
 		};
 		setSessionStateLockNativeBindings(() => ({
+			exactUnlinkDirect: () => ({ ok: false, code: "not_found" }),
 			exactUnlink() {
 				throw cleanup;
 			},
@@ -1147,6 +1148,7 @@ describe("coordinator session state lock", () => {
 			if (owner.owner_host_id) releasedHostIds.push(owner.owner_host_id);
 		};
 		setSessionStateLockNativeBindings(() => ({
+			exactUnlinkDirect: () => ({ ok: false, code: "not_found" }),
 			exactUnlink() {
 				exactUnlinkCalls++;
 				return { ok: false, code: "cleanup_failed", retainedUnknownPath: `${lockFile}.quarantine` };
@@ -1246,6 +1248,7 @@ describe("coordinator session state lock", () => {
 		);
 		let exactUnlinkCalls = 0;
 		setSessionStateLockNativeBindings(() => ({
+			exactUnlinkDirect: () => ({ ok: false, code: "not_found" }),
 			exactUnlink() {
 				exactUnlinkCalls++;
 				return { ok: false, code: "cleanup_failed" };
@@ -1310,6 +1313,7 @@ describe("coordinator session state lock", () => {
 			});
 			await fs.writeFile(ownerFile, record);
 			setSessionStateLockNativeBindings(() => ({
+				exactUnlinkDirect: () => ({ ok: false, code: "not_found" }),
 				exactUnlink() {
 					return { ok: false, code: "cleanup_failed", retainedUnknownPath: `${ownerFile}.quarantine` };
 				},

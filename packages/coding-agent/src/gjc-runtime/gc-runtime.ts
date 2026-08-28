@@ -31,7 +31,7 @@ import {
 	removeCanonicalBlob,
 } from "../session/blob-store";
 import { FileSessionStorage, probeSessionRetirement, retireSessionTranscript } from "../session/session-storage";
-
+import { type EmptyDeleteGcReport, runEmptyDeleteGc } from "./empty-delete-gc";
 import { buildGcReportText } from "./gc-render";
 import { collectSessionScopeUsage, type GcSessionScopeUsage, shouldReportSessionScope } from "./gc-session-scope";
 
@@ -168,6 +168,7 @@ export interface GcReport {
 	 * PID-liveness axis above is unchanged by its absence or presence.
 	 */
 	disk?: GcDiskReport;
+	empty_delete_receipts?: EmptyDeleteGcReport;
 }
 
 export interface GcRunResult {
@@ -274,9 +275,11 @@ interface ParsedGcArgs {
 	json: boolean;
 	prune: boolean;
 	repairSessionIndex: boolean;
-	/** Opt-in second axis: report (and with `--prune`, reclaim) on-disk retention. */
 	disk: boolean;
 	help: boolean;
+	emptyDeleteReceipts: boolean;
+	emptyDeleteRoots: string[];
+	emptyDeleteManifests: string[];
 }
 
 class GcUsageError extends Error {}
@@ -286,10 +289,13 @@ function parseGcArgs(argv: string[]): ParsedGcArgs {
 	let prune = false;
 	let repairSessionIndex = false;
 	let disk = false;
-
 	let dryRun = false;
 	let help = false;
-	for (const arg of argv) {
+	let emptyDeleteReceipts = false;
+	const emptyDeleteRoots: string[] = [];
+	const emptyDeleteManifests: string[] = [];
+	for (let i = 0; i < argv.length; i++) {
+		const arg = argv[i]!;
 		switch (arg) {
 			case "--json":
 			case "-j":
@@ -305,7 +311,6 @@ function parseGcArgs(argv: string[]): ParsedGcArgs {
 			case "--disk":
 				disk = true;
 				break;
-
 			case "--dry-run":
 				dryRun = true;
 				break;
@@ -313,15 +318,34 @@ function parseGcArgs(argv: string[]): ParsedGcArgs {
 			case "-h":
 				help = true;
 				break;
+			case "--empty-delete-receipts":
+				emptyDeleteReceipts = true;
+				break;
+			case "--root": {
+				const value = argv[++i];
+				// A following option token is a missing operand, not a root path. Any
+				// dash-prefixed value is rejected (short flags like -j included); spell a
+				// genuinely dash-prefixed path as ./-name so it is unambiguous.
+				if (!value || value.startsWith("-")) throw new GcUsageError("missing_root");
+				emptyDeleteRoots.push(value);
+				break;
+			}
+			case "--manifest": {
+				const value = argv[++i];
+				if (!value || value.startsWith("-")) throw new GcUsageError("missing_manifest");
+				emptyDeleteManifests.push(value);
+				break;
+			}
 			default:
 				throw new GcUsageError(`unknown_flag:${arg}`);
 		}
 	}
 	if (repairSessionIndex && prune) throw new GcUsageError("repair_session_index_cannot_combine_with_prune");
+	if (!emptyDeleteReceipts && (emptyDeleteRoots.length > 0 || emptyDeleteManifests.length > 0))
+		throw new GcUsageError("empty_delete_operands_require_feature_flag");
 	if (repairSessionIndex && dryRun) throw new GcUsageError("repair_session_index_cannot_combine_with_dry_run");
-	// Explicit --dry-run always wins over --prune/--force.
 	if (dryRun) prune = false;
-	return { json, prune, repairSessionIndex, disk, help };
+	return { json, prune, repairSessionIndex, disk, help, emptyDeleteReceipts, emptyDeleteRoots, emptyDeleteManifests };
 }
 
 /**
@@ -404,6 +428,7 @@ export async function collectGcReport(adapters: GcStoreAdapter[], ctx: GcContext
 export function computeExitCode(report: GcReport): number {
 	if (report.errors.length > 0) return 1;
 	if (!report.dry_run && report.counts.failed > 0) return 1;
+	if (report.empty_delete_receipts?.errors.length) return 1;
 	if (report.disk) {
 		if (report.disk.errors.length > 0) return 1;
 		if (!report.disk.dry_run && report.disk.totals.failed > 0) return 1;
@@ -482,6 +507,44 @@ export async function runGjcGcCommand(
 		return { stdout: gcHelpText(), stderr: "", status: 0 };
 	}
 
+	// Resolve and validate every empty-delete operand BEFORE any store collection or
+	// prune can mutate: a malformed manifest or missing operand must fail with status 2
+	// while every candidate is still untouched.
+	let emptyDeleteRoots: string[] = [];
+	if (parsed.emptyDeleteReceipts) {
+		emptyDeleteRoots = [...parsed.emptyDeleteRoots];
+		if (emptyDeleteRoots.some(root => root.includes("\0"))) {
+			return { stdout: "", stderr: "gjc gc: root_invalid\n", status: 2 };
+		}
+		// Every supplied manifest is validated, not just the last: a malformed earlier
+		// manifest must fail the run before any store collection or prune can mutate.
+		for (const manifestPath of parsed.emptyDeleteManifests) {
+			let parsedManifest: unknown;
+			try {
+				const raw = await fsp.readFile(manifestPath, "utf8");
+				parsedManifest = JSON.parse(raw);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				return { stdout: "", stderr: `gjc gc: manifest_invalid: ${message}\n`, status: 2 };
+			}
+			if (typeof parsedManifest !== "object" || parsedManifest === null || Array.isArray(parsedManifest)) {
+				return { stdout: "", stderr: "gjc gc: manifest_shape_invalid\n", status: 2 };
+			}
+			const manifestRoots = (parsedManifest as { roots?: unknown }).roots;
+			if (!Array.isArray(manifestRoots)) {
+				return { stdout: "", stderr: "gjc gc: manifest_roots_required\n", status: 2 };
+			}
+			for (const root of manifestRoots) {
+				if (typeof root !== "string" || root.length === 0 || root.includes("\0")) {
+					return { stdout: "", stderr: "gjc gc: manifest_root_invalid\n", status: 2 };
+				}
+				emptyDeleteRoots.push(root);
+			}
+		}
+		if (emptyDeleteRoots.length === 0) {
+			return { stdout: "", stderr: "gjc gc: empty_delete_receipts_requires_root_or_manifest\n", status: 2 };
+		}
+	}
 	const resolvedAdapters = adapters ?? (await defaultGcAdapters());
 	const ctx: GcContext = { probe: gcPidProbe, force: parsed.prune, env, cwd };
 	const report = await collectGcReport(resolvedAdapters, ctx, parsed.prune);
@@ -495,6 +558,9 @@ export async function runGjcGcCommand(
 			prune: parsed.prune,
 		});
 	}
+	if (parsed.emptyDeleteReceipts) {
+		report.empty_delete_receipts = await runEmptyDeleteGc({ roots: emptyDeleteRoots, prune: parsed.prune });
+	}
 	const scopeUsage = await collectGcSessionScope(cwd, resolveGcAgentDir(env));
 	if (scopeUsage && shouldReportSessionScope(scopeUsage)) report.session_scope = scopeUsage;
 	const sessionIndexFailed =
@@ -503,7 +569,7 @@ export async function runGjcGcCommand(
 		report.session_index?.status === "repair_failed";
 	const status = sessionIndexFailed ? 1 : computeExitCode(report);
 	const stdout = parsed.json
-		? `${JSON.stringify(report, null, 2)}\n`
+		? `${JSON.stringify(report, (_key, value) => (typeof value === "bigint" ? value.toString() : value), 2)}\n`
 		: `${buildGcReportText(report)}${report.disk ? buildGcDiskReportText(report.disk) : ""}`;
 	return { stdout, stderr: "", status };
 }
@@ -513,7 +579,7 @@ export function gcHelpText(): string {
 		"gjc gc - garbage-collect stale GJC session/PID records",
 		"",
 		"USAGE",
-		"  $ gjc gc [--prune|--force] [--disk] [--repair-session-index] [--json]",
+		"  $ gjc gc [--prune|--force] [--disk] [--repair-session-index] [--empty-delete-receipts --root <dir>] [--json]",
 
 		"",
 		"FLAGS",
@@ -522,6 +588,13 @@ export function gcHelpText(): string {
 		"  -j, --json        Emit machine-readable JSON",
 		"  --repair-session-index  Explicitly quarantine a corrupt session-index suffix and retain its valid prefix",
 		"  --disk            Also report on-disk retention (sessions, blobs, artifacts, natives, backups)",
+		"  --empty-delete-receipts  Report/prune empty .gjc-delete-* under --root / --manifest",
+		"  --root <dir>      Operand root for --empty-delete-receipts (repeatable)",
+		'  --manifest <file> JSON {"roots":[...]} for --empty-delete-receipts (repeatable)',
+		"",
+		"  Operand values starting with '-' are rejected as missing operands; spell a",
+		"  dash-prefixed path as ./-name. --root/--manifest without --empty-delete-receipts",
+		"  is a usage error, and every supplied manifest is validated before any prune.",
 		"",
 		"Liveness-only: a record is removed only when its owning process is dead",
 		"(ESRCH). Live / permission-denied / unknown processes are always kept.",
