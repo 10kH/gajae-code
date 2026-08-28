@@ -1608,7 +1608,7 @@ describe("coordinator session state lock", () => {
 		expect(fsSync.existsSync(transitionDir)).toBe(false);
 	});
 
-	it("retains setup cleanup authority when a partial transition owner and claim cleanup fault", async () => {
+	it("retains setup cleanup authority when partial owner cleanup fails", async () => {
 		const { stateFile } = await seededRunningSession("lock-transition-setup-cleanup-fault");
 		const lockFile = `${stateFile}.lock`;
 		const transitionDir = `${lockFile}.transition`;
@@ -1632,19 +1632,12 @@ describe("coordinator session state lock", () => {
 				return exactIdentityNativeBindings.exactUnlink(target, identity);
 			},
 		}));
-		const realRmdir = fs.rmdir;
-		let deniedRmdir = true;
-		vi.spyOn(fs, "rmdir").mockImplementation((async target => {
-			if (deniedRmdir && String(target) === transitionDir) {
-				deniedRmdir = false;
-				throw Object.assign(new Error("claim cleanup fault"), { code: "EIO" });
-			}
-			return await realRmdir(target);
-		}) as typeof fs.rmdir);
-
-		await expect(withSessionStateFileLock(stateFile, async () => "entered")).resolves.toBe("entered");
+		await expect(withSessionStateFileLock(stateFile, async () => "entered")).rejects.toBeInstanceOf(
+			SessionStateLockUnavailableError,
+		);
 		expect(writeFaulted).toBe(true);
-		expect(fsSync.existsSync(transitionDir)).toBe(false);
+		expect(fsSync.existsSync(transitionDir)).toBe(true);
+		expect(await fs.readFile(ownerFile, "utf8")).toBe('{"pid":');
 	});
 
 	it("leaves a legacy directory whose tree changed before the exact removal", async () => {

@@ -1372,35 +1372,26 @@ async function withLockPathTransition<T>(lockFile: string, transition: () => Pro
 			held = await acquireOwnerLock(ownerFile, owner);
 		} catch (error) {
 			const pending = pendingTransitionReleases.get(recoveryKey);
-			let ownerSnapshot: LockOwnerSnapshot | null = null;
-			let ownerCaptureFailed = false;
+			// `acquireOwnerLock` owns the only descriptor that can authorize
+			// cleanup of a failed create. Once it returns an error that descriptor
+			// is gone; a pathname capture here could be a successor's owner and
+			// must never be handed to exact-unlink as our authority.
+			if (pending) pending.recoverable = true;
 			try {
-				ownerSnapshot = await captureRegularLockOwner(ownerFile);
-			} catch {
-				ownerCaptureFailed = true;
-			}
-			if (pending && ownerSnapshot) pending.held = ownerSnapshot;
-			if (ownerCaptureFailed) {
-				if (pending) pending.recoverable = true;
-				throw error;
-			}
-			try {
-				if (ownerSnapshot) {
-					const outcome = exactUnlinkOwnerRecord(ownerFile, ownerSnapshot);
-					if (outcome !== "removed" && outcome !== "absent") throw new Error("Transition owner cleanup refused.");
+				// If no owner pathname exists, setup never established an owner and
+				// this claim can be removed safely. Use lstat only: an unsupported
+				// owner-access strategy must not prevent this ownerless cleanup, and
+				// any existing regular/malformed/symlink record remains fenced.
+				const ownerStat = await fs.lstat(ownerFile).catch(error => {
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+					throw error;
+				});
+				if (!ownerStat) {
+					await removeTransitionDir(transitionDir);
+					pendingTransitionReleases.delete(recoveryKey);
 				}
-				await removeTransitionDir(transitionDir);
-				pendingTransitionReleases.delete(recoveryKey);
 			} catch {
 				if (pending) pending.recoverable = true;
-			}
-			if (pending?.recoverable) {
-				for (let recoveryAttempt = 0; recoveryAttempt < LOCK_ACQUIRE_ATTEMPTS; recoveryAttempt++) {
-					if (await recoverPendingTransitionRelease(transitionDir, recoveryKey)) continue;
-					if (!pendingTransitionReleases.has(recoveryKey)) break;
-					await Bun.sleep(LOCK_ACQUIRE_RETRY_MS);
-				}
-				if (!pendingTransitionReleases.has(recoveryKey)) continue;
 			}
 			throw error;
 		}
