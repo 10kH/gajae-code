@@ -1220,6 +1220,7 @@ async function releaseTransitionClaim(
 	held: LockOwnerSnapshot,
 	recoveryKey: string,
 	transitionGeneration: TransitionDirectoryGeneration,
+	nativePath: string,
 ): Promise<void> {
 	let heldOwner: SessionStateLockOwner;
 	try {
@@ -1235,6 +1236,7 @@ async function releaseTransitionClaim(
 		phase: "release",
 		token: releasedOwner.token,
 		generation: transitionGeneration,
+		nativePath,
 		held,
 		releasedOwner,
 		recoverable: false,
@@ -1634,7 +1636,14 @@ async function withLockPathTransition<T>(lockFile: string, transition: () => Pro
 			error => ({ ok: false as const, error }),
 		);
 		try {
-			await releaseTransitionClaim(transitionDir, ownerFile, held, recoveryKey, transitionGeneration!);
+			await releaseTransitionClaim(
+				transitionDir,
+				ownerFile,
+				held,
+				recoveryKey,
+				transitionGeneration!,
+				pendingSetup.nativePath!,
+			);
 		} catch (releaseError) {
 			// The release rewrite may itself have succeeded before the claim-dir
 			// removal was denied (transient sharing denial). Recover the stranded
@@ -1899,7 +1908,9 @@ export async function withSessionStateFileLock<T>(stateFile: string, operation: 
 			// is no longer ours is left for its owner rather than unlinked by name.
 			let releaseFailure: { error: unknown } | undefined;
 			try {
-				await withLockPathTransition(lockFile, async () => releaseOwnerLock(lockFile, record));
+				await withLockPathTransition(lockFile, async () =>
+				releaseOwnerLock(lockFile, record),
+				);
 			} catch (error) {
 				releaseFailure = { error };
 			}
