@@ -1433,14 +1433,25 @@ export class Broker {
 
 		try {
 			const endpointPath = path.join(record.locator.stateRoot, "sdk", `${record.sessionId}.json`);
-			const [source, metadata] = await Promise.all([fs.readFile(endpointPath, "utf8"), fs.stat(endpointPath)]);
+			const before = await fs.lstat(endpointPath, { bigint: true });
+			if (!before.isFile()) return error("endpoint_stale", "session endpoint is not a regular file");
+			const source = await fs.readFile(endpointPath, "utf8");
+			const metadata = await fs.lstat(endpointPath, { bigint: true });
+			if (
+				before.dev !== metadata.dev ||
+				before.ino !== metadata.ino ||
+				before.size !== metadata.size ||
+				before.mtimeNs !== metadata.mtimeNs ||
+				before.ctimeNs !== metadata.ctimeNs
+			)
+				return error("endpoint_stale", "session endpoint changed during read");
 			const endpoint = JSON.parse(source) as Record<string, unknown>;
 			if (
 				endpoint.sessionId !== record.sessionId ||
 				endpoint.pid !== record.pid ||
 				endpoint.stale === true ||
 				record.endpointMtimeMs === undefined ||
-				Math.abs(metadata.mtimeMs - record.endpointMtimeMs) > 0.001
+				Math.abs(Number(metadata.mtimeNs) / 1_000_000 - record.endpointMtimeMs) > 0.001
 			)
 				return error("endpoint_stale", "session endpoint is stale");
 			await this.index.refresh();
