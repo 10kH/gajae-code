@@ -1077,7 +1077,7 @@ export interface PromptOptions {
 	onSkillPrepared?: (meta: { name: string; path: string; lineCount?: number; cleanedArgs?: string }) => void;
 	/** Optional invocation-scoped cancellation fence used before an accepted skill starts execution. */
 	preflightSignal?: AbortSignal;
-	/** Internal SDK lifecycle owner token. */
+	/** @internal SDK lifecycle owner token. */
 	sdkRunToken?: string;
 }
 
