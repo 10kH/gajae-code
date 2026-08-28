@@ -26,8 +26,9 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		registerRuntimeProvider(modelRegistry);
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		resetSettingsForTest();
+		await modelRegistry?.dispose();
 		authStorage?.close();
 		if (tempDir && fs.existsSync(tempDir)) {
 			fs.rmSync(tempDir, { recursive: true, force: true });
@@ -155,6 +156,7 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		const originalRelocate = ModelsConfigFile.relocate.bind(ModelsConfigFile);
 		let restoreModelsConfigRelocate: (() => void) | undefined;
 		let seedAuth: AuthStorage | undefined;
+		let seedRegistry: ModelRegistry | undefined;
 
 		const restoreEnvironment = () => {
 			setAgentDir(originalAgentDir);
@@ -165,6 +167,7 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		};
 		const cleanup = async () => {
 			restoreModelsConfigRelocate?.();
+			await seedRegistry?.dispose();
 			closeModelCache(cacheDbPath);
 			closeModelCache();
 			seedAuth?.close();
@@ -206,7 +209,7 @@ describe("createAgentSession deferred model pattern resolution", () => {
 				throw new Error("Expected literal and command API-key fixture rows");
 			}
 
-			const seedRegistry = new ModelRegistry(seedAuth, modelsPath);
+			seedRegistry = new ModelRegistry(seedAuth, modelsPath);
 			if (cacheCredential === "selected") {
 				expect(await seedAuth.getApiKey(provider)).toBe(wrongKey);
 			}
