@@ -19729,11 +19729,13 @@ export class AgentSession {
 			if (!isAuthenticated(activeApiKey)) return "unchanged";
 			remaining = await authStorage.invalidateCredentialMatching(provider, activeApiKey, {
 				sessionId: credentialSessionId,
+				owner: this.#modelRegistry.getAuthStorageOwner(),
 			});
 			if (!remaining) return "unchanged";
 		} else {
 			remaining = await authStorage.markUsageLimitReached(provider, credentialSessionId, {
 				retryAfterMs: trigger.retryAfterMs,
+				owner: this.#modelRegistry.getAuthStorageOwner(),
 			});
 		}
 

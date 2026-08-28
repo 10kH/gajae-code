@@ -1069,6 +1069,7 @@ export interface OAuthAccess {
 export interface InvalidateCredentialMatchingOptions {
 	signal?: AbortSignal;
 	sessionId?: string;
+	owner?: object;
 }
 
 function isAbortSignalOption(
@@ -4439,9 +4440,11 @@ export class AuthStorage {
 	async markUsageLimitReached(
 		provider: string,
 		sessionId: string | undefined,
-		options?: { retryAfterMs?: number; baseUrl?: string; signal?: AbortSignal },
+		options?: { retryAfterMs?: number; baseUrl?: string; signal?: AbortSignal; owner?: object },
 	): Promise<boolean> {
 		provider = resolveOAuthStorageProvider(provider);
+		const ownerOverride = this.#configOverrideRegistration(provider, options?.owner);
+		if (ownerOverride && !ownerOverride.envSourced) return false;
 		const sessionCredential = this.#getSessionCredential(provider, sessionId);
 		if (!sessionCredential) return false;
 
@@ -5734,6 +5737,9 @@ export class AuthStorage {
 		const signal = isAbortSignalOption(optionsOrSignal) ? optionsOrSignal : optionsOrSignal?.signal;
 		const sessionId = isAbortSignalOption(optionsOrSignal) ? undefined : optionsOrSignal?.sessionId;
 		const storageProvider = resolveOAuthStorageProvider(provider);
+		const owner = isAbortSignalOption(optionsOrSignal) ? undefined : optionsOrSignal?.owner;
+		const ownerOverride = this.#configOverrideRegistration(storageProvider, owner);
+		if (ownerOverride && !ownerOverride.envSourced && ownerOverride.apiKey === apiKey) return false;
 		const stored = this.#getStoredCredentials(storageProvider);
 		let matched: { id: number; type: AuthCredential["type"]; index: number } | undefined;
 		for (let index = 0; index < stored.length; index++) {

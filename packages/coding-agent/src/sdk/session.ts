@@ -4150,6 +4150,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							await modelRegistry.authStorage.invalidateCredentialMatching(provider, oldKey, {
 								signal: streamOptions?.signal,
 								sessionId: credentialSessionId,
+								owner: modelRegistry.getAuthStorageOwner(),
 							});
 							logger.debug("Retrying provider request after credential invalidation", {
 								provider,
