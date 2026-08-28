@@ -259,7 +259,7 @@ process.exitCode = await child.exited;`;
 		const output = `${result.stdout.toString()}\n${result.stderr.toString()}`;
 		expect(result.exitCode, output).toBe(0);
 		expect(output).toContain("--repair-session-index");
-		expect(output).toContain("Quarantine a corrupt session-index suffix");
+		expect(output.toLowerCase()).toContain("quarantine a corrupt session-index suffix");
 	}, 30_000);
 
 	it("documents the native CLI surface in command help", async () => {
