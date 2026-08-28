@@ -1863,14 +1863,15 @@ export class InputController {
 		}
 		this.#lastBackgroundFoldKeyTime = 0;
 
-		if (!this.ctx.session.requestForegroundBashBackground?.()) {
+		void this.ctx.session.requestForegroundBashBackground?.().then(backgrounded => {
+			if (backgrounded) {
+				this.ctx.showStatus("Folding foreground bash into a quiet background job…");
+				return;
+			}
 			this.ctx.showWarning(
 				"No supported foreground tool can be folded. Use managed async bash/auto-background; raw Ctrl+Z/bg is not supported inside the TUI.",
 			);
-			return true;
-		}
-
-		this.ctx.showStatus("Folding foreground bash into a quiet background job…");
+		});
 		return true;
 	}
 

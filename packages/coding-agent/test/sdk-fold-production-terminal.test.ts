@@ -93,7 +93,7 @@ describe("SDK production ACP fold path", () => {
 		const run = bash.execute("sdk-fold-call", { command: "sleep 30" }, undefined, () => {});
 		await waitFor(() => created!.session.hasForegroundBashBackgroundRequestHandler());
 
-		expect(created.session.requestForegroundBashBackground()).toBe(true);
+		expect(await created.session.requestForegroundBashBackground()).toBe(true);
 		const foreground = await run;
 		expect(foreground.details?.async?.state).toBe("running");
 		const jobId = foreground.details?.async?.jobId;

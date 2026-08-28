@@ -2340,7 +2340,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							return true;
 						}
 						lastPtyFoldKeyTime = 0;
-						return this.session.requestForegroundBashBackground?.() ?? false;
+						if (!this.session.hasForegroundBashBackgroundRequestHandler?.()) return false;
+						void this.session.requestForegroundBashBackground?.();
+						return true;
 					},
 					onOutput: chunk => {
 						ptyOutputSeen = true;

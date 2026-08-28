@@ -8,7 +8,7 @@ describe("foreground bash background fold", () => {
 		const controller = new InputController({
 			session: {
 				hasForegroundBashBackgroundRequestHandler: () => true,
-				requestForegroundBashBackground: () => {
+				requestForegroundBashBackground: async () => {
 					folds += 1;
 					return true;
 				},

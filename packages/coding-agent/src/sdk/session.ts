@@ -2581,7 +2581,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			registerForegroundFoldParticipant: adapter =>
 				session?.registerForegroundFoldParticipant(adapter) ?? (() => {}),
 			hasForegroundBashBackgroundRequestHandler: () => session?.hasForegroundBashBackgroundRequestHandler() ?? false,
-			requestForegroundBashBackground: () => session?.requestForegroundBashBackground() ?? false,
+			requestForegroundBashBackground: () => Promise.resolve(session?.requestForegroundBashBackground() ?? false),
 
 			getCredentialSessionId: () => session?.credentialSessionId ?? credentialSessionId,
 			getMcpManager: () => mcpManager ?? options.inheritedMcpManager,

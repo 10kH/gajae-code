@@ -184,6 +184,6 @@ describe("live session fold", () => {
 		});
 
 		expect(session.hasForegroundBashBackgroundRequestHandler()).toBe(false);
-		expect(session.requestForegroundBashBackground()).toBe(false);
+		expect(await session.requestForegroundBashBackground()).toBe(false);
 	});
 });

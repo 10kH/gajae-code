@@ -155,11 +155,12 @@ describe("boundary-review fold regressions", () => {
 	// wake through the delivery path, not rely on an unrelated idle rearm.
 	test("a parked completion replay drives deliverParked with its receipt", async () => {
 		const parkedDeliveries: Array<{ jobId: string; text: string }> = [];
+		const intent = Promise.withResolvers<string | undefined>();
+		setTimeout(() => intent.resolve("intent"), 10);
 		const coordinator = new FoldCoordinator({
 			armSteeringFence: () => () => {},
 			requestStop: () => {},
-			captureRemainingIntent: () =>
-				new Promise<string | undefined>(resolve => setTimeout(() => resolve("intent"), 10)),
+			captureRemainingIntent: () => intent.promise,
 			deliverParked: (_job, disposition) => {
 				parkedDeliveries.push({ jobId: disposition.receipt.jobId, text: disposition.text });
 			},

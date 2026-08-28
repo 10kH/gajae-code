@@ -241,7 +241,7 @@ export interface ToolSession {
 	/** Whether a foreground wait is currently foldable into a background job. */
 	hasForegroundBashBackgroundRequestHandler?: () => boolean;
 	/** Request that the active foreground wait fold into a background job, if supported. */
-	requestForegroundBashBackground?: () => boolean;
+	requestForegroundBashBackground?: () => Promise<boolean>;
 
 	/** Get the session-owned or inherited async job manager. */
 	getAsyncJobManager?: () => AsyncJobManager | undefined;

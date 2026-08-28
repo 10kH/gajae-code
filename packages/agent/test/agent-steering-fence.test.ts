@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { Agent, type AgentTool } from "@gajae-code/agent-core";
 import { z } from "@gajae-code/ai";
-import { createMockModel } from "@gajae-code/ai/providers/mock";
+import { createMockModel, type MockModel } from "@gajae-code/ai/providers/mock";
 
 function userMessage(text: string) {
 	return { role: "user" as const, content: text, timestamp: Date.now() };
@@ -9,7 +9,7 @@ function userMessage(text: string) {
 
 interface Harness {
 	agent: Agent;
-	mock: ReturnType<typeof createMockModel>;
+	mock: MockModel;
 	entered: Promise<void>;
 	release: () => void;
 }

@@ -8677,17 +8677,17 @@ export class AgentSession {
 	 * Ask the active managed foreground bash call to return as a background job.
 	 * Returns false when no supported foreground tool is currently backgroundable.
 	 */
-	requestForegroundBashBackground(): boolean {
+	async requestForegroundBashBackground(): Promise<boolean> {
 		if (!this.#foldCoordinator.hasFoldableParticipant()) return false;
-		// The fold transaction is async (it captures and persists a receipt before
-		// arming the stop), but the key handler needs a synchronous answer about
-		// whether a fold was initiated.
-		void this.#foldCoordinator.requestFold().catch(error => {
+		try {
+			const result = await this.#foldCoordinator.requestFold();
+			return result.status === "folded";
+		} catch (error) {
 			logger.warn("Foreground fold request failed", {
 				error: error instanceof Error ? error.message : String(error),
 			});
-		});
-		return true;
+			return false;
+		}
 	}
 
 	/**
