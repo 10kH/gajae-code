@@ -2535,8 +2535,11 @@ export class AgentSession {
 	}
 	#acceptSdkAttemptRun(handle: AttemptRunHandle, sdkRunToken?: string): void {
 		const predecessorScope = this.#activeAttemptScope;
+		const predecessorSdkRunToken =
+			predecessorScope === undefined ? undefined : this.#sdkRunTokensByAttemptScope.get(predecessorScope);
 		const carryRecoverySkip =
 			sdkRunToken !== undefined &&
+			predecessorSdkRunToken === sdkRunToken &&
 			predecessorScope !== undefined &&
 			this.#skipPostPromptRecoveryWaitByAttemptScope.delete(predecessorScope);
 		this.#acceptRunHandle(handle);
@@ -5231,6 +5234,7 @@ export class AgentSession {
 	 * seen.
 	 */
 	#coordinatorToolObservations = new WeakMap<object, CoordinatorToolObservation>();
+	#agentEventAdmission = new WeakMap<object, { scope?: AttemptScope; sdkRunToken?: string }>();
 
 	/**
 	 * Capture what is true at the SYNCHRONOUS agent-event boundary, before any async work.
@@ -5286,6 +5290,10 @@ export class AgentSession {
 	}
 
 	#trackAgentEvent = (event: AgentEvent): Promise<void> => {
+		this.#agentEventAdmission.set(event, {
+			scope: this.#activeAttemptScope,
+			sdkRunToken: this.#activeSdkRunToken,
+		});
 		// First statement of the listener: the observation must precede every claim,
 		// reservation, and async hop this handler performs.
 		this.#observeCoordinatorToolEvent(event);
@@ -6567,9 +6575,7 @@ export class AgentSession {
 		sdkRunToken?: string;
 	}): Promise<void> {
 		const continuationAdmission = this.#captureScheduledContinuationAdmission();
-		const scheduledSdkRunToken =
-			options?.sdkRunToken ??
-			(this.#activeAttemptScope ? this.#sdkRunTokensByAttemptScope.get(this.#activeAttemptScope) : undefined);
+		const scheduledSdkRunToken = options?.sdkRunToken;
 		const selectionFenceGeneration =
 			options?.selectionFenceGeneration ??
 			this.#selectionFenceGenerationContext.getStore() ??
@@ -6591,6 +6597,7 @@ export class AgentSession {
 						generation: deferredPromptGeneration,
 						selectionFenceGeneration,
 						deferredPredecessorAgentEnd,
+						sdkRunToken: scheduledSdkRunToken,
 					});
 				} finally {
 					// The recursive call synchronously re-reserved its settlement
@@ -6726,12 +6733,12 @@ export class AgentSession {
 												// agent_start (review P1); their queued messages are in-run
 												// consumptions, not own-run promotions.
 												const startsOwn = options?.maintenanceContinuation !== true;
-												const inheritedSdkRunToken = options?.sdkRunToken ?? scheduledSdkRunToken;
-												const consumedSdkRunToken = startsOwn
-													? acceptance.consumedQueuedMessages
-															.map(message => this.#sdkRunTokensByQueuedMessage.get(message))
-															.find((token): token is string => token !== undefined)
-													: undefined;
+												const inheritedSdkRunToken = options?.continueQueuedOnly
+													? undefined
+													: (options?.sdkRunToken ?? scheduledSdkRunToken);
+												const consumedSdkRunToken = acceptance.consumedQueuedMessages
+													.map(message => this.#sdkRunTokensByQueuedMessage.get(message))
+													.find((token): token is string => token !== undefined);
 												const sdkRunToken = consumedSdkRunToken ?? inheritedSdkRunToken;
 												this.#fireQueuedPromotionHooks(acceptance.consumedQueuedMessages, {
 													startsOwnRun: startsOwn,
@@ -7806,8 +7813,9 @@ export class AgentSession {
 		workerIntegrationSettled = false,
 		scope?: AttemptScopeRef,
 	): Promise<void> {
-		const activeAttemptScopeAtEvent = this.#activeAttemptScope;
-		const activeSdkRunTokenAtEvent = this.#activeSdkRunToken;
+		const admission = this.#agentEventAdmission.get(event);
+		const activeAttemptScopeAtEvent = admission?.scope ?? this.#activeAttemptScope;
+		const activeSdkRunTokenAtEvent = admission?.sdkRunToken ?? this.#activeSdkRunToken;
 		if (event.type === "agent_end" && !workerIntegrationSettled) {
 			await this.#flushWorkerIntegrationForAgentEnd();
 		}
@@ -11211,7 +11219,8 @@ export class AgentSession {
 		const rosterClaim = this.#claimIrcRosterCandidate();
 		let hasPendingNextTurnMessages = false;
 		let pendingNextTurnMessageCount = 0;
-		let skipPostPromptRecoveryWait = options?.skipPostPromptRecoveryWait === true;
+		let skipPostPromptRecoveryWait =
+			options?.skipPostPromptRecoveryWait === true || options?.sdkRunToken !== undefined;
 		let promptAttemptScope: AttemptScope | undefined;
 		let hindsightRecall: string | undefined;
 		try {
@@ -11519,7 +11528,14 @@ export class AgentSession {
 					options?.onPreflightAccepted?.();
 				},
 			});
-			const terminalAttemptScope = this.#activeAttemptScope ?? promptAttemptScope;
+			const activeTerminalScope = this.#activeAttemptScope;
+			const terminalAttemptScope =
+				activeTerminalScope !== undefined &&
+				(this.#skipPostPromptRecoveryWaitByAttemptScope.has(activeTerminalScope) ||
+					(options?.sdkRunToken !== undefined &&
+						this.#sdkRunTokensByAttemptScope.get(activeTerminalScope) === options.sdkRunToken))
+					? activeTerminalScope
+					: promptAttemptScope;
 			if (
 				terminalAttemptScope !== undefined &&
 				this.#skipPostPromptRecoveryWaitByAttemptScope.delete(terminalAttemptScope)

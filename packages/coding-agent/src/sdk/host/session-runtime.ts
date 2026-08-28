@@ -3106,7 +3106,6 @@ function createControlSurface(
 						// ACP terminal settlement is owned by the correlated agent_end
 						// publication. Post-prompt recovery may include independent
 						// subagent work and must not hold that client-facing boundary.
-						skipPostPromptRecoveryWait: true,
 						...(queuedAtDispatch ? { queuedAtDispatch: true } : {}),
 					},
 				),
@@ -3132,8 +3131,7 @@ function createControlSurface(
 			submit(
 				"prompt",
 				undefined,
-				options =>
-					api.sendUserMessage(text, { ...options, deliverAs: "followUp", skipPostPromptRecoveryWait: true }),
+				options => api.sendUserMessage(text, { ...options, deliverAs: "followUp" }),
 				undefined,
 				false,
 				// Follow-ups never start inline; ownership correlates at promotion.
@@ -3146,9 +3144,7 @@ function createControlSurface(
 		abortTerminal: terminalAbort,
 		abortAndPrompt: async text => {
 			await ctx.abort();
-			return await submit("prompt", undefined, options =>
-				api.sendUserMessage(text, { ...options, skipPostPromptRecoveryWait: true }),
-			);
+			return await submit("prompt", undefined, options => api.sendUserMessage(text, { ...options }));
 		},
 		answerAsk: unavailable("ask.answer"),
 		answerGate: async (id, response, expectedSessionId, idempotencyKey) =>
@@ -3178,7 +3174,6 @@ function createControlSurface(
 				options =>
 					ctx.invokeSkill!(name, args, {
 						...options,
-						skipPostPromptRecoveryWait: true,
 						onSkillPrepared: meta => {
 							prepared = meta;
 						},
