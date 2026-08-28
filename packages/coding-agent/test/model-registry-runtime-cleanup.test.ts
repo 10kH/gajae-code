@@ -63,4 +63,60 @@ describe("ModelRegistry runtime source cleanup", () => {
 		expect(registry.authStorage.hasAuth("runtime-provider")).toBe(false);
 		expect(getCustomApi("custom-runtime-cleanup-api")).toBeUndefined();
 	});
+
+	test("shared AuthStorage keeps registry config and fallback ownership isolated", async () => {
+		const secondModelsJsonPath = path.join(tempDir, "models-second.json");
+		await Bun.write(
+			modelsJsonPath,
+			JSON.stringify({
+				providers: {
+					"first-provider": {
+						baseUrl: "https://first.example.com/v1",
+						api: "openai-responses",
+						apiKey: "first-key",
+						models: [{ id: "first-model" }],
+					},
+				},
+			}),
+		);
+		await Bun.write(
+			secondModelsJsonPath,
+			JSON.stringify({
+				providers: {
+					"second-provider": {
+						baseUrl: "https://second.example.com/v1",
+						api: "openai-responses",
+						apiKey: "second-key",
+						models: [{ id: "second-model" }],
+					},
+				},
+			}),
+		);
+
+		const firstRegistry = new ModelRegistry(authStorage, modelsJsonPath, undefined, { automaticRefresh: false });
+		const secondRegistry = new ModelRegistry(authStorage, secondModelsJsonPath, undefined, {
+			automaticRefresh: false,
+		});
+		try {
+			expect(await firstRegistry.getApiKeyForProvider("first-provider")).toBe("first-key");
+			expect(await secondRegistry.getApiKeyForProvider("second-provider")).toBe("second-key");
+
+			// A static reload removes only the reloading registry's owned config key.
+			await Bun.write(modelsJsonPath, JSON.stringify({ providers: {} }));
+			const updatedAt = new Date(Date.now() + 1000);
+			fs.utimesSync(modelsJsonPath, updatedAt, updatedAt);
+			await firstRegistry.refresh("offline");
+			expect(await secondRegistry.getApiKeyForProvider("second-provider")).toBe("second-key");
+
+			// Clearing the shared active config surface must leave each registry's
+			// fallback resolver available until that registry is disposed.
+			authStorage.clearConfigApiKeys();
+			expect(await secondRegistry.getApiKeyForProvider("second-provider")).toBe("second-key");
+			firstRegistry.dispose();
+			expect(await secondRegistry.getApiKeyForProvider("second-provider")).toBe("second-key");
+		} finally {
+			firstRegistry.dispose();
+			secondRegistry.dispose();
+		}
+	});
 });

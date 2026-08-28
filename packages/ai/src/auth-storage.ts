@@ -1268,6 +1268,11 @@ export class AuthStorage {
 	#data: Map<string, StoredCredential[]> = new Map();
 	#runtimeOverrides: Map<string, string> = new Map();
 	#configOverrides: Map<string, string> = new Map();
+	/** Effective config override registrations, including owner-scoped model registries. */
+	#configOverrideRegistrations: Map<string, Map<object, { apiKey: string; envSourced: boolean; order: number }>> =
+		new Map();
+	#unownedConfigOverrides: Map<string, { apiKey: string; envSourced: boolean; order: number }> = new Map();
+	#configOverrideOrder = 0;
 	/**
 	 * Providers whose config override was resolved from a models.yml `apiKeyEnv`
 	 * indirection rather than a literal `apiKey` pin. An env pointer is not a
@@ -1301,6 +1306,7 @@ export class AuthStorage {
 	#credentialRankingMode: CredentialRankingMode = "balanced";
 	#usageLogger?: UsageLogger;
 	#fallbackResolver?: (provider: string) => string | undefined;
+	#ownedFallbackResolvers: Map<object, (provider: string) => string | undefined> = new Map();
 	#store: AuthCredentialStore;
 	#configValueResolver: (config: string, cacheScope?: string) => Promise<string | undefined>;
 	#resolvedStoredApiKeyValues: Map<string, Map<string, { fingerprint: string; usable: boolean }>> = new Map();
@@ -1987,6 +1993,9 @@ export class AuthStorage {
 	 * Lower priority than {@link setRuntimeApiKey} so a CLI `--api-key`
 	 * still wins for the duration of a single invocation.
 	 *
+	 * `options.owner` scopes the override to one registry or other caller. The
+	 * unscoped form is process-wide and is retained for standalone callers.
+	 *
 	 * `options.envSourced` marks the value as resolved from a models.yml
 	 * `apiKeyEnv` indirection. Unlike a literal pin, an env pointer only says
 	 * where to look for a key; when the user has since run `auth login`, the
@@ -1994,44 +2003,108 @@ export class AuthStorage {
 	 * wins over the indirection (stored OAuth credentials still yield, so a
 	 * custom-endpoint bearer is never replaced by an upstream OAuth token).
 	 */
-	setConfigApiKey(provider: string, apiKey: string, options: { envSourced?: boolean } = {}): void {
+	setConfigApiKey(provider: string, apiKey: string, options: { envSourced?: boolean; owner?: object } = {}): void {
 		const storageProvider = resolveOAuthStorageProvider(provider);
-		this.#configOverrides.set(storageProvider, apiKey);
-		if (options.envSourced) {
-			this.#configOverrideEnvSourced.add(storageProvider);
+		const registration = {
+			apiKey,
+			envSourced: options.envSourced === true,
+			order: ++this.#configOverrideOrder,
+		};
+		if (options.owner) {
+			const registrations = this.#configOverrideRegistrations.get(storageProvider) ?? new Map();
+			registrations.set(options.owner, registration);
+			this.#configOverrideRegistrations.set(storageProvider, registrations);
 		} else {
-			this.#configOverrideEnvSourced.delete(storageProvider);
+			this.#unownedConfigOverrides.set(storageProvider, registration);
 		}
-		this.#bumpGeneration("set-config-api-key", storageProvider);
+		this.#reconcileConfigApiKey(storageProvider, "set-config-api-key", true);
 	}
 
 	/**
 	 * Remove a single config-sourced API key override.
 	 */
-	removeConfigApiKey(provider: string): void {
+	removeConfigApiKey(provider: string, owner?: object): void {
 		const storageProvider = resolveOAuthStorageProvider(provider);
-		this.#configOverrideEnvSourced.delete(storageProvider);
-		if (this.#configOverrides.delete(storageProvider)) this.#bumpGeneration("remove-config-api-key", storageProvider);
+		if (owner) {
+			const registrations = this.#configOverrideRegistrations.get(storageProvider);
+			if (!registrations?.delete(owner)) return;
+			if (registrations.size === 0) this.#configOverrideRegistrations.delete(storageProvider);
+		} else {
+			if (!this.#unownedConfigOverrides.delete(storageProvider)) return;
+		}
+		this.#reconcileConfigApiKey(storageProvider, "remove-config-api-key", true);
 	}
 
 	/**
-	 * Drop every config-sourced API key. Called by `ModelRegistry` before
-	 * re-parsing `models.yml` so removed entries actually disappear.
+	 * Drop config-sourced API keys. An owner removes only its own registrations;
+	 * the unscoped form remains an explicit global reset for callers that own the
+	 * entire AuthStorage instance.
 	 */
-	clearConfigApiKeys(): void {
-		const providers = [...this.#configOverrides.keys()];
-		this.#configOverrideEnvSourced.clear();
-		if (providers.length === 0) return;
-		this.#configOverrides.clear();
-		for (const provider of providers) this.#bumpGeneration("clear-config-api-keys", provider);
+	clearConfigApiKeys(owner?: object): void {
+		if (owner) {
+			const providers = [...this.#configOverrideRegistrations.entries()]
+				.filter(([, registrations]) => registrations.has(owner))
+				.map(([provider]) => provider);
+			for (const provider of providers) this.removeConfigApiKey(provider, owner);
+			return;
+		}
+		const providers = new Set([
+			...this.#configOverrides.keys(),
+			...this.#unownedConfigOverrides.keys(),
+			...this.#configOverrideRegistrations.keys(),
+		]);
+		this.#unownedConfigOverrides.clear();
+		this.#configOverrideRegistrations.clear();
+		for (const provider of providers) this.#reconcileConfigApiKey(provider, "clear-config-api-keys", true);
+	}
+
+	#reconcileConfigApiKey(provider: string, reason: string, forceGeneration = false): void {
+		const previous = this.#configOverrides.get(provider);
+		const previousEnvSourced = this.#configOverrideEnvSourced.has(provider);
+		let winner: { apiKey: string; envSourced: boolean; order: number } | undefined =
+			this.#unownedConfigOverrides.get(provider);
+		for (const registration of this.#configOverrideRegistrations.get(provider)?.values() ?? []) {
+			if (!winner || registration.order > winner.order) winner = registration;
+		}
+		if (!winner) {
+			this.#configOverrides.delete(provider);
+			this.#configOverrideEnvSourced.delete(provider);
+		} else {
+			this.#configOverrides.set(provider, winner.apiKey);
+			if (winner.envSourced) this.#configOverrideEnvSourced.add(provider);
+			else this.#configOverrideEnvSourced.delete(provider);
+		}
+		const current = this.#configOverrides.get(provider);
+		const currentEnvSourced = this.#configOverrideEnvSourced.has(provider);
+		if (forceGeneration || previous !== current || previousEnvSourced !== currentEnvSourced) {
+			this.#bumpGeneration(reason, provider);
+		}
 	}
 
 	/**
 	 * Set a fallback resolver for API keys not found in storage or env vars.
 	 * Used for custom provider keys from models.json.
 	 */
-	setFallbackResolver(resolver: (provider: string) => string | undefined): void {
+	setFallbackResolver(resolver: (provider: string) => string | undefined, owner?: object): () => void {
+		if (owner) {
+			this.#ownedFallbackResolvers.set(owner, resolver);
+			return () => {
+				if (this.#ownedFallbackResolvers.get(owner) !== resolver) return;
+				this.#ownedFallbackResolvers.delete(owner);
+			};
+		}
 		this.#fallbackResolver = resolver;
+		return () => {
+			if (this.#fallbackResolver === resolver) this.#fallbackResolver = undefined;
+		};
+	}
+
+	#resolveFallback(provider: string): string | undefined {
+		for (const resolver of [...this.#ownedFallbackResolvers.values()].reverse()) {
+			const value = resolver(provider);
+			if (value !== undefined) return value;
+		}
+		return this.#fallbackResolver?.(provider);
 	}
 
 	/**
@@ -2695,7 +2768,7 @@ export class AuthStorage {
 		if (this.#configOverrides.has(storageProvider))
 			return this.#snapshotSkipResult(storageProvider, "skipped-existing-config");
 		if (getEnvApiKey(storageProvider)) return this.#snapshotSkipResult(storageProvider, "skipped-existing-env");
-		if (this.#fallbackResolver?.(storageProvider))
+		if (this.#resolveFallback(storageProvider))
 			return this.#snapshotSkipResult(storageProvider, "skipped-existing-fallback");
 
 		const result = this.#store.upsertAuthCredentialRemoteIfAbsent
@@ -2776,7 +2849,7 @@ export class AuthStorage {
 		if (this.#configOverrides.has(storageProvider)) return true;
 		if (this.#getCredentialsForProvider(storageProvider).length > 0) return true;
 		if (getEnvApiKey(storageProvider)) return true;
-		if (this.#fallbackResolver?.(storageProvider)) return true;
+		if (this.#resolveFallback(storageProvider)) return true;
 		return false;
 	}
 
@@ -2816,7 +2889,7 @@ export class AuthStorage {
 		}
 		if (credentials.some(credential => credential.type === "oauth")) return "oauth";
 		if (apiKeys.length > 0) return "api_key";
-		if (getEnvApiKey(storageProvider) || this.#fallbackResolver?.(storageProvider)) return "api_key";
+		if (getEnvApiKey(storageProvider) || this.#resolveFallback(storageProvider)) return "api_key";
 		return undefined;
 	}
 
@@ -2869,7 +2942,7 @@ export class AuthStorage {
 		} catch {
 			return false;
 		}
-		return Boolean(getEnvApiKey(storageProvider) || this.#fallbackResolver?.(storageProvider));
+		return Boolean(getEnvApiKey(storageProvider) || this.#resolveFallback(storageProvider));
 	}
 
 	/**
@@ -2930,7 +3003,7 @@ export class AuthStorage {
 		// account_uuid injection would misattribute traffic. Only apply this guard when
 		// sessionPref is absent; a recorded OAuth sticky (sessionPref.type === "oauth") must
 		// NOT be blocked even if an env key also happens to exist.
-		if (!sessionPref && (getEnvApiKey(provider) || this.#fallbackResolver?.(provider))) return undefined;
+		if (!sessionPref && (getEnvApiKey(provider) || this.#resolveFallback(provider))) return undefined;
 		// Resolve the sticky index against the full credential list — the index is
 		// recorded against the unfiltered provider array (by #recordSessionCredential /
 		// #tryOAuthCredential), not the OAuth-only subset, so dereferencing it into the
@@ -5377,7 +5450,7 @@ export class AuthStorage {
 			}
 		}
 
-		return getEnvApiKey(provider) || this.#fallbackResolver?.(provider);
+		return getEnvApiKey(provider) || this.#resolveFallback(provider);
 	}
 
 	/**
@@ -5472,7 +5545,7 @@ export class AuthStorage {
 		if (sessionId) this.#sessionLastCredential.get(provider)?.delete(sessionId);
 		const envKey = getEnvApiKey(provider);
 		if (envKey) return envKey;
-		return this.#fallbackResolver?.(provider) ?? undefined;
+		return this.#resolveFallback(provider) ?? undefined;
 	}
 
 	/**
@@ -5853,7 +5926,7 @@ export class AuthStorage {
 		const stored = this.#getStoredCredentials(provider);
 		if (stored.length === 0) {
 			if (getEnvApiKey(provider)) return `env ${baseLabel ? `(fallback over ${baseLabel})` : ""}`.trim();
-			if (this.#fallbackResolver?.(provider) !== undefined) return `fallback resolver`;
+			if (this.#resolveFallback(provider) !== undefined) return `fallback resolver`;
 			return undefined;
 		}
 

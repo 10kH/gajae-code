@@ -118,6 +118,7 @@ describe("ModelRegistry runtime provider registration", () => {
 			expect(await registry.getApiKeyForProvider("envProvider")).toBe("resolved-env-secret");
 
 			delete process.env[keyEnv];
+			registry.dispose();
 			authStorage.clearConfigApiKeys();
 			const missingEnvRegistry = new ModelRegistry(authStorage, modelsJsonPath);
 			expect(await missingEnvRegistry.getApiKeyForProvider("envProvider")).toBeUndefined();

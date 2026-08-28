@@ -1579,6 +1579,9 @@ export class ModelRegistry {
 	#configError: ConfigError | undefined = undefined;
 	#modelsConfigFile: ConfigFile<ModelsConfig>;
 	#settings: Pick<Settings, "get" | "getGlobal">;
+	readonly #authStorageConfigOwner: object = {};
+	readonly #authStorageFallbackOwner: object = {};
+	#disposeAuthStorageFallbackResolver: (() => void) | undefined;
 	#lastStaticLoadMtime: number | null = null;
 	#lastStaticLoadEnvironmentFingerprint: string | undefined;
 	#lastModelPresetRegistryFingerprint: string | undefined;
@@ -1639,10 +1642,10 @@ export class ModelRegistry {
 		this.#modelPresetRegistryDependencies = registryDependencies;
 		this.#cacheDbPath = modelsPath ? path.join(path.dirname(modelsPath), "models.db") : undefined;
 		// Set up fallback resolver for custom provider API keys
-		this.authStorage.setFallbackResolver(provider => {
+		this.#disposeAuthStorageFallbackResolver = this.authStorage.setFallbackResolver(provider => {
 			const keyConfig = this.#customProviderApiKeys.get(provider);
 			return keyConfig;
-		});
+		}, this.#authStorageFallbackOwner);
 		this.#unsubscribeAuthGeneration = this.authStorage.onGenerationChanged(() => this.#invalidateAvailableModels());
 		// Load models synchronously in constructor
 		this.#loadModels();
@@ -1670,7 +1673,9 @@ export class ModelRegistry {
 		this.#cancelModelPresetRegistryRefresh = undefined;
 		this.#unsubscribeAuthGeneration?.();
 		this.#unsubscribeAuthGeneration = undefined;
-		this.authStorage.setFallbackResolver(() => undefined);
+		this.authStorage.clearConfigApiKeys(this.#authStorageConfigOwner);
+		this.#disposeAuthStorageFallbackResolver?.();
+		this.#disposeAuthStorageFallbackResolver = undefined;
 		this.#catalogChangeListeners.clear();
 	}
 
@@ -1901,7 +1906,7 @@ export class ModelRegistry {
 		// Drop config-sourced apiKeys from AuthStorage before reload; entries
 		// removed from models.yml must actually disappear from the resolver, not
 		// linger from the previous parse. The post-load setters below repopulate.
-		this.authStorage.clearConfigApiKeys();
+		this.authStorage.clearConfigApiKeys(this.#authStorageConfigOwner);
 		// Runtime provider keys are reapplied after #loadModels so they retain
 		// registration-time precedence over colliding static provider keys.
 		this.#providerOverrides.clear();
@@ -1937,7 +1942,7 @@ export class ModelRegistry {
 			this.#customProviderApiKeys.set(provider, resolved);
 			this.#runtimeProviderResolvedApiKeys.set(provider, resolved);
 			this.#runtimeProviderCredentialInstalled.add(provider);
-			this.authStorage.setConfigApiKey(provider, resolved);
+			this.authStorage.setConfigApiKey(provider, resolved, { owner: this.#authStorageConfigOwner });
 			const override = this.#runtimeProviderOverrides.get(provider);
 			if (override) this.#runtimeProviderOverrides.set(provider, { ...override, apiKey: resolved });
 			const authHeader = this.#runtimeProviderAuthHeaders.get(provider);
@@ -1974,7 +1979,7 @@ export class ModelRegistry {
 			this.#customProviderApiKeys.set(provider, resolved);
 			this.#runtimeProviderResolvedApiKeys.set(provider, resolved);
 			this.#runtimeProviderCredentialInstalled.add(provider);
-			this.authStorage.setConfigApiKey(provider, resolved);
+			this.authStorage.setConfigApiKey(provider, resolved, { owner: this.#authStorageConfigOwner });
 		}
 		this.#lastDisabledProviderKey = disabledProviderKey;
 	}
@@ -2614,6 +2619,7 @@ export class ModelRegistry {
 					this.#customProviderApiKeys.set(providerName, localCompatResolvedKey);
 					this.authStorage.setConfigApiKey(providerName, localCompatResolvedKey, {
 						envSourced: !localOpenAICompat.apiKey,
+						owner: this.#authStorageConfigOwner,
 					});
 				} else {
 					keylessProviders.add(providerName);
@@ -2678,7 +2684,10 @@ export class ModelRegistry {
 						: undefined;
 				if (resolved) this.#customProviderApiKeys.set(providerName, resolved);
 				if (resolved) {
-					this.authStorage.setConfigApiKey(providerName, resolved, { envSourced: !providerConfig.apiKey });
+					this.authStorage.setConfigApiKey(providerName, resolved, {
+						envSourced: !providerConfig.apiKey,
+						owner: this.#authStorageConfigOwner,
+					});
 				}
 			}
 
@@ -4384,7 +4393,10 @@ export class ModelRegistry {
 						: undefined;
 				if (resolved) this.#customProviderApiKeys.set(providerName, resolved);
 				if (resolved) {
-					this.authStorage.setConfigApiKey(providerName, resolved, { envSourced: !providerConfig.apiKey });
+					this.authStorage.setConfigApiKey(providerName, resolved, {
+						envSourced: !providerConfig.apiKey,
+						owner: this.#authStorageConfigOwner,
+					});
 				}
 			}
 			for (const modelDef of modelDefs) {
@@ -5168,15 +5180,21 @@ export class ModelRegistry {
 				return;
 			}
 			this.#customProviderApiKeys.delete(provider);
-			this.authStorage.removeConfigApiKey(provider);
+			this.authStorage.removeConfigApiKey(provider, this.#authStorageConfigOwner);
 		} else {
 			this.#customProviderApiKeys.set(provider, resolved);
 			if (runtimeOwned) {
 				this.#runtimeProviderResolvedApiKeys.set(provider, resolved);
 				this.#runtimeProviderCredentialInstalled.add(provider);
 			}
-			if (runtimeOwned) this.authStorage.setConfigApiKey(provider, resolved);
-			else this.authStorage.setConfigApiKey(provider, resolved, { envSourced: true });
+			if (runtimeOwned) {
+				this.authStorage.setConfigApiKey(provider, resolved, { owner: this.#authStorageConfigOwner });
+			} else {
+				this.authStorage.setConfigApiKey(provider, resolved, {
+					envSourced: true,
+					owner: this.#authStorageConfigOwner,
+				});
+			}
 		}
 		const authHeader =
 			this.#runtimeProviderAuthHeaders.get(provider) ?? this.#customProviderAuthHeaders.get(provider);
@@ -5315,7 +5333,7 @@ export class ModelRegistry {
 		this.#runtimeProviderOverrides.delete(providerName);
 		this.#runtimeProviderAuthHeaders.delete(providerName);
 		this.#runtimeModelOverlays = this.#runtimeModelOverlays.filter(overlay => overlay.provider !== providerName);
-		this.authStorage.removeConfigApiKey(providerName);
+		this.authStorage.removeConfigApiKey(providerName, this.#authStorageConfigOwner);
 		this.#clearDescriptorDiscoveryEvidence(providerName);
 	}
 
@@ -5453,7 +5471,7 @@ export class ModelRegistry {
 			this.#runtimeProviderResolvedApiKeys.set(providerName, resolved);
 			this.#runtimeProviderCredentialInstalled.add(providerName);
 			if (config.authHeader !== undefined) this.#runtimeProviderAuthHeaders.set(providerName, config.authHeader);
-			this.authStorage.setConfigApiKey(providerName, resolved);
+			this.authStorage.setConfigApiKey(providerName, resolved, { owner: this.#authStorageConfigOwner });
 		}
 		if (config.oauth && !config.apiKey && this.#runtimeProviderApiKeys.has(providerName)) {
 			const previousApiKey = this.#runtimeProviderResolvedApiKeys.get(providerName);
@@ -5463,7 +5481,7 @@ export class ModelRegistry {
 			this.#runtimeProviderApiKeyEnvNames.delete(providerName);
 			this.#runtimeProviderAuthHeaders.delete(providerName);
 			this.#customProviderApiKeys.delete(providerName);
-			this.authStorage.removeConfigApiKey(providerName);
+			this.authStorage.removeConfigApiKey(providerName, this.#authStorageConfigOwner);
 			this.#runtimeModelOverlays = this.#runtimeModelOverlays.map(overlay => {
 				if (overlay.provider !== providerName) return overlay;
 				const headers = { ...(overlay.headers ?? {}) } as Record<string, string> & {
