@@ -83,6 +83,24 @@ function safeDiagnostic(value: unknown, fallback: string): string {
 	return cleanReason(value) ?? fallback;
 }
 
+export function resolveAuthGatewayReadiness(input: {
+	noAuth: boolean;
+	tokenPresent: boolean;
+	credentialCount: number;
+	modelCount: number;
+}): { ready: boolean; reason: "token_missing" | "provider_credential_missing" | "provider_catalog_empty" | null } {
+	const authReady = input.noAuth || input.tokenPresent;
+	const ready = authReady && input.credentialCount > 0 && input.modelCount > 0;
+	const reason = !authReady
+		? "token_missing"
+		: input.credentialCount === 0
+			? "provider_credential_missing"
+			: input.modelCount === 0
+				? "provider_catalog_empty"
+				: null;
+	return { ready, reason };
+}
+
 function writeCommandFailure(action: AuthGatewayAction, flags: AuthGatewayCommandArgs["flags"], error: unknown): void {
 	const stable = stableErrorForAction(action);
 	const scope = normalizeProviderScope(flags.provider);
@@ -399,17 +417,11 @@ async function runStatus(flags: AuthGatewayCommandArgs["flags"]): Promise<void> 
 	try {
 		const snapshot = await fetchBrokerSnapshot(createBrokerClient(brokerConfig));
 		const tokenPresent = token !== null;
+		const noAuth = flags.noAuth === true;
 		const credentialCount = snapshot.credentials.filter(entry => entry.provider === provider).length;
 		const catalog = createAuthGatewayModelCatalog(provider, getBundledModels(provider as GeneratedProvider));
 		const modelCount = catalog.models.length;
-		const ready = tokenPresent && credentialCount > 0 && modelCount > 0;
-		const reason = !tokenPresent
-			? "token_missing"
-			: credentialCount === 0
-				? "provider_credential_missing"
-				: modelCount === 0
-					? "provider_catalog_empty"
-					: null;
+		const { ready, reason } = resolveAuthGatewayReadiness({ noAuth, tokenPresent, credentialCount, modelCount });
 		const status = {
 			ready,
 			reason,
@@ -433,7 +445,7 @@ async function runStatus(flags: AuthGatewayCommandArgs["flags"]): Promise<void> 
 			process.stdout.write(
 				`token: ${tokenPresent ? chalk.green("present") : chalk.red("missing")} at ${status.tokenFile}\n`,
 			);
-			if (!tokenPresent) {
+			if (!tokenPresent && !noAuth) {
 				process.stdout.write(
 					"Run `gjc auth-gateway token` or `gjc auth-gateway serve` to create a bearer token.\n",
 				);

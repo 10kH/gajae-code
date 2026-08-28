@@ -6,6 +6,7 @@ import {
 	hasEnabledProviderCredential,
 	normalizeProviderScope,
 	redactBrokerUrl,
+	resolveAuthGatewayReadiness,
 } from "../src/cli/auth-gateway-cli";
 
 function snapshotWithProvider(provider: string): AuthCredentialSnapshot {
@@ -75,5 +76,14 @@ describe("auth-gateway broker provider scope", () => {
 
 		expect(filterCredentialCheckResults(results, "openai-codex")).toEqual([results[0]]);
 		expect(filterCredentialCheckResults(results, undefined)).toEqual(results);
+	});
+
+	it("reports a no-auth gateway ready without requiring a bearer token", () => {
+		expect(
+			resolveAuthGatewayReadiness({ noAuth: true, tokenPresent: false, credentialCount: 1, modelCount: 1 }),
+		).toEqual({ ready: true, reason: null });
+		expect(
+			resolveAuthGatewayReadiness({ noAuth: false, tokenPresent: false, credentialCount: 1, modelCount: 1 }),
+		).toEqual({ ready: false, reason: "token_missing" });
 	});
 });
