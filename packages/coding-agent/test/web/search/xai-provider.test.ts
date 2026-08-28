@@ -385,6 +385,46 @@ describe("xAI web search provider", () => {
 		]);
 	});
 
+	it("uses a custom active owner resolver instead of canonical xAI credentials or env", async () => {
+		process.env.PI_XAI_WEB_SEARCH_MODEL = "grok-canonical-env";
+		process.env.XAI_SEARCH_BASE_URL = "https://canonical.xai.example/v1";
+
+		let capturedUrl = "";
+		let capturedHeaders: Record<string, string> = {};
+		let capturedBody: any;
+		using _hook = hookFetch(async (input, init) => {
+			capturedUrl = urlOf(input);
+			capturedHeaders = (init?.headers as Record<string, string>) ?? {};
+			capturedBody = JSON.parse(String(init?.body));
+			return Response.json({
+				output_text: "proxy answer",
+				citations: [{ title: "Proxy", url: "https://proxy.example/source" }],
+			});
+		});
+
+		const result = await new XaiProvider().search({
+			query: "proxy search",
+			systemPrompt: "search",
+			authStorage: auth({ apiKey: "canonical-xai-key" }),
+			activeModelContext: {
+				provider: "custom-proxy",
+				modelId: "grok-local-name",
+				wireModelId: "grok-proxy-model",
+				api: "openai-responses",
+				baseUrl: "https://proxy.example/v1/",
+				headers: { "X-Tenant": "acme" },
+				resolveCredentials: async () => ({ apiKey: "active-owner-key" }),
+			},
+		});
+
+		expect(capturedUrl).toBe("https://proxy.example/v1/responses");
+		expect(capturedUrl).not.toContain("canonical.xai.example");
+		expect(capturedHeaders.Authorization).toBe("Bearer active-owner-key");
+		expect(capturedHeaders["X-Tenant"]).toBe("acme");
+		expect(capturedBody.model).toBe("grok-proxy-model");
+		expect(result.answer).toBe("proxy answer");
+	});
+
 	it("forwards xAI X Search options and parses xAI-specific usage", async () => {
 		let capturedBody: any;
 		using _hook = hookFetch(async (_input, init) => {

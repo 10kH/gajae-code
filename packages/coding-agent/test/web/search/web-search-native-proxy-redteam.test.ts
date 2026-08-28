@@ -261,6 +261,48 @@ describe("native-over-proxy provider red-team", () => {
 		expect(capturedUrl).not.toContain("proxy.example/v1beta");
 	});
 
+	it("custom Gemini owner resolver wins over canonical OAuth and stays on the proxy", async () => {
+		let capturedUrl = "";
+		let capturedHeaders: Record<string, string> = {};
+		using _hook = hookFetch(async (input, init) => {
+			capturedUrl = String(input);
+			capturedHeaders = (init?.headers as Record<string, string>) ?? {};
+			return Response.json({
+				modelVersion: "gemini-proxy",
+				candidates: [
+					{
+						content: { parts: [{ text: "Proxy answer." }] },
+						groundingMetadata: {
+							groundingChunks: [{ web: { uri: "https://example.com/proxy", title: "Proxy" } }],
+						},
+					},
+				],
+			});
+		});
+
+		const result = await new GeminiProvider().search({
+			query: "hello",
+			systemPrompt: "Use web search.",
+			authStorage: oauthAuth({ "google-gemini-cli": "oauth-canonical" }),
+			activeModelContext: {
+				provider: "custom-proxy",
+				modelId: "gemini-local-name",
+				wireModelId: "gemini-proxy-model",
+				api: "google-generative-ai",
+				baseUrl: "https://proxy.example",
+				headers: { "X-Tenant": "acme" },
+				resolveCredentials: async () => ({ apiKey: "active-owner-key" }),
+			},
+		});
+
+		expect(capturedUrl).toBe("https://proxy.example/v1beta/models/gemini-proxy-model:generateContent");
+		expect(capturedUrl).not.toContain("cloudcode-pa.googleapis.com");
+		expect(capturedHeaders["x-goog-api-key"]).toBe("active-owner-key");
+		expect(capturedHeaders.Authorization).toBeUndefined();
+		expect(capturedHeaders["X-Tenant"]).toBe("acme");
+		expect(result.answer).toBe("Proxy answer.");
+	});
+
 	it("does not double-append the version when the active baseUrl is already versioned", async () => {
 		let capturedUrl = "";
 		using _hook = hookFetch(async input => {

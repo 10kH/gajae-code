@@ -389,7 +389,7 @@ export function inferNativeProviderFromModel(ctx: ActiveSearchModelContext | und
 	if (looksXaiFamilyModelId(ctx) && isOpenAICompatWire(ctx.api) && ctx.provider.toLowerCase() === "xai") return "xai";
 	// `codex` hits the ChatGPT backend with local Codex OAuth, so only infer it
 	// for genuine OpenAI endpoints. Custom/proxy OpenAI-compatible models fall
-	// through to `activeContextNativeId` → `openai-compatible` (their own creds).
+	// through to `activeContextNativeId` and reuse their own credentials.
 	if (looksOpenAIFamilyModelId(ctx) && isOpenAICompatWire(ctx.api) && isOpenAIOfficialBaseUrl(ctx.baseUrl)) {
 		return "codex";
 	}
@@ -451,10 +451,11 @@ export function activeContextNativeId(ctx: ActiveSearchModelContext | undefined)
 	if (!ctx || ctx.webSearch === "off") return undefined;
 	const modelId = (ctx.wireModelId ?? ctx.modelId).toLowerCase();
 	// Dispatch must match exactly what each provider can service by reusing the
-	// active credential: the OpenAI-compatible adapter only speaks the two plain
-	// OpenAI wires (not azure), and the Gemini active path only speaks the public
-	// Generative Language wire (not vertex/cloud-code). Returning an id the
-	// provider would reject just wastes a guaranteed-fail attempt before DuckDuckGo.
+	// active credential: xAI-family models use the xAI search tools, the
+	// OpenAI-compatible adapter only speaks the two plain OpenAI wires (not
+	// azure), and the Gemini active path only speaks the public Generative
+	// Language wire (not vertex/cloud-code). Returning an id the provider would
+	// reject just wastes a guaranteed-fail attempt before DuckDuckGo.
 	if (isAnthropicWire(ctx.api) && modelId.startsWith("claude-")) return "anthropic";
 	if (isGenerativeLanguageWire(ctx.api) && modelId.startsWith("gemini-")) return "gemini";
 	if (looksXaiFamilyModelId(ctx) && isOpenAICompatWire(ctx.api) && ctx.provider.toLowerCase() !== "xai") return "xai";

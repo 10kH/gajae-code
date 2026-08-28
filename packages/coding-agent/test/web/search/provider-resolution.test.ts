@@ -102,7 +102,7 @@ describe("native web-search provider resolution", () => {
 		).resolves.toEqual(["xai", "duckduckgo"]);
 	});
 
-	it("infers xAI native search for Grok contexts behind proxies and suppresses generic fallback", async () => {
+	it("does not infer canonical xAI search for Grok contexts behind proxies", async () => {
 		const ctx: ActiveSearchModelContext = {
 			provider: "proxy",
 			modelId: "grok-4.3",
@@ -111,11 +111,11 @@ describe("native web-search provider resolution", () => {
 			webSearch: "on",
 		};
 
-		expect(inferNativeProviderFromModel(ctx)).toBe("xai");
+		expect(inferNativeProviderFromModel(ctx)).toBeUndefined();
 		await expect(ids(ctx, { auth: ["xai", "proxy"] })).resolves.toEqual(["xai", "duckduckgo"]);
 	});
 
-	it("uses xAI wire model ids for native search inference", async () => {
+	it("does not infer canonical xAI from custom xAI wire model ids", async () => {
 		const ctx: ActiveSearchModelContext = {
 			provider: "proxy",
 			modelId: "routed-grok",
@@ -124,8 +124,8 @@ describe("native web-search provider resolution", () => {
 			baseUrl: "https://models.example/v1",
 		};
 
-		expect(inferNativeProviderFromModel(ctx)).toBe("xai");
-		await expect(ids(ctx, { auth: ["xai"] })).resolves.toEqual(["xai", "duckduckgo"]);
+		expect(inferNativeProviderFromModel(ctx)).toBeUndefined();
+		await expect(ids(ctx, { auth: ["xai"] })).resolves.toEqual(["duckduckgo"]);
 	});
 
 	it("honors explicit xAI preference with availability gating before configured fallbacks", async () => {
@@ -246,7 +246,7 @@ describe("native web-search provider resolution", () => {
 				{ provider: "proxy", modelId: "grok-4.3", api: "openai-completions", baseUrl: "https://proxy.example" },
 				{ auth: ["proxy"] },
 			),
-		).resolves.toEqual(["openai-compatible", "duckduckgo"]);
+		).resolves.toEqual(["xai", "duckduckgo"]);
 	});
 
 	it("does not attempt native over a proxy without any resolvable active credential", async () => {
