@@ -99,6 +99,9 @@ function makeStore(rows: StoredAuthCredential[]): ObservableStore {
 		setCache(key, value, expiresAtSec) {
 			cache.set(key, { value, expiresAtSec });
 		},
+		allocateMonotonicSequence() {
+			return 1;
+		},
 		cleanExpiredCache() {},
 	};
 }
@@ -206,6 +209,48 @@ describe("AuthStorage usage cache: last-good failure fallback", () => {
 			gate.resolve(goldReport);
 			await Promise.allSettled(peer ? [cancelled, peer] : [cancelled]);
 		}
+	});
+
+	it("does not let an old scoped usage flight delete its replacement", async () => {
+		storage.close();
+		const rows = [oauthRow(1, "a@example.com")];
+		store = makeStore(rows);
+		const firstGate = Promise.withResolvers<UsageReport[] | null>();
+		const secondGate = Promise.withResolvers<UsageReport[] | null>();
+		let calls = 0;
+		storage = new AuthStorage(store, {
+			fetchUsageReports: async () => {
+				calls += 1;
+				return calls === 1 ? firstGate.promise : secondGate.promise;
+			},
+		});
+		await storage.reload();
+		store.removeAuthCredentialsHard = (_provider, targets) => {
+			const ids = targets.map(target => target.id);
+			for (let index = rows.length - 1; index >= 0; index -= 1) {
+				if (ids.includes(rows[index]!.id)) rows.splice(index, 1);
+			}
+			return { kind: "removed", ids };
+		};
+
+		const first = storage.fetchUsageReports();
+		await waitFor(() => calls === 1);
+		const removal = storage.removeAuthCredentialsHard("anthropic", [
+			{ id: 1, provider: "anthropic", expectedRevision: 1 },
+		]);
+		expect(removal.kind).toBe("removed");
+
+		const second = storage.fetchUsageReports();
+		await waitFor(() => calls === 2);
+		const third = storage.fetchUsageReports();
+		await Bun.sleep(0);
+		expect(calls).toBe(2);
+
+		firstGate.resolve([]);
+		await first;
+		secondGate.resolve([]);
+		await Promise.all([second, third]);
+		storage.close();
 	});
 
 	it("suppresses provider and account details for secret-safe callers", async () => {

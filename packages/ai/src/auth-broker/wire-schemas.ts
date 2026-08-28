@@ -101,6 +101,7 @@ export const refresherScheduleSchema = z
 
 export const snapshotResponseSchema = z
 	.object({
+		epoch: z.string().min(1).optional(),
 		generation: z.number().int(),
 		generatedAt: z.number(),
 		serverNowMs: z.number(),
@@ -124,6 +125,7 @@ export const credentialMetadataRecordSchema = z
 
 export const credentialMetadataResponseSchema = z
 	.object({
+		epoch: z.string().min(1).optional(),
 		generation: z.number().int().nonnegative(),
 		generatedAt: z.number().finite().nonnegative(),
 		credentials: z.array(credentialMetadataRecordSchema),
@@ -143,6 +145,7 @@ export const snapshotStreamSnapshotEventSchema = snapshotResponseSchema
 export const snapshotStreamEntryEventSchema = z
 	.object({
 		kind: z.literal("entry"),
+		epoch: z.string().min(1).optional(),
 		generation: z.number().int(),
 		serverNowMs: z.number(),
 		refresher: refresherScheduleSchema,
@@ -154,6 +157,7 @@ export const snapshotStreamEntryEventSchema = z
 export const snapshotStreamRemovedEventSchema = z
 	.object({
 		kind: z.literal("removed"),
+		epoch: z.string().min(1).optional(),
 		generation: z.number().int(),
 		serverNowMs: z.number(),
 		refresher: refresherScheduleSchema,

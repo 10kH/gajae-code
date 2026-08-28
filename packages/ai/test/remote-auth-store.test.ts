@@ -8,6 +8,7 @@ import {
 	AuthStorage,
 	REMOTE_REFRESH_SENTINEL,
 	RemoteAuthCredentialStore,
+	type SnapshotResponse,
 	SqliteAuthCredentialStore,
 	startAuthBroker,
 } from "../src";
@@ -101,6 +102,10 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 		const apiKey = await clientStorage.getApiKey("anthropic");
 		expect(apiKey).toBe("server-access-rotated");
 		expect(overrideCalls).toBe(1);
+		expect(remoteStore.snapshot.credentials[0]?.credential).toMatchObject({
+			access: "server-access-rotated",
+			refresh: REMOTE_REFRESH_SENTINEL,
+		});
 		// The local oauth refresh helper was used exactly once — by the broker server.
 		expect(refreshSpy).toHaveBeenCalledTimes(1);
 		clientStorage.close();
@@ -139,6 +144,94 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 		remoteStore.close();
 	});
 
+	test("suspect API-key credentials refresh the snapshot without OAuth refresh", async () => {
+		serverStore!.saveApiKey("kagi", "api-key-before-401");
+		await serverStorage!.reload();
+		const brokerClient = new AuthBrokerClient({ url: handle!.url, token });
+		const initialResult = await brokerClient.fetchSnapshot();
+		if (initialResult.status !== 200) throw new Error("expected snapshot");
+		const initialEntry = initialResult.snapshot.credentials.find(entry => entry.provider === "kagi");
+		if (initialEntry?.credential.type !== "api_key") throw new Error("expected API-key credential");
+		const remoteStore = new RemoteAuthCredentialStore({
+			client: brokerClient,
+			initialSnapshot: initialResult.snapshot,
+			streamSnapshots: false,
+		});
+
+		serverStorage!.disableCredentialById(initialEntry.id, "replaced after 401");
+		serverStore!.saveApiKey("kagi", "api-key-after-401");
+		await serverStorage!.reload();
+		const refreshSpy = vi.spyOn(brokerClient, "refreshCredential");
+		await remoteStore.markCredentialSuspect(initialEntry.id);
+
+		expect(refreshSpy).not.toHaveBeenCalled();
+		expect(remoteStore.listAuthCredentials("kagi")).toEqual([
+			expect.objectContaining({
+				provider: "kagi",
+				credential: { type: "api_key", key: "api-key-after-401" },
+			}),
+		]);
+		remoteStore.close();
+	});
+
+	test("orders remote snapshot invalidation behind provider admission tickets", async () => {
+		const brokerClient = new AuthBrokerClient({ url: handle!.url, token });
+		const initialResult = await brokerClient.fetchSnapshot();
+		if (initialResult.status !== 200) throw new Error("expected snapshot");
+		const remoteStore = new RemoteAuthCredentialStore({
+			client: brokerClient,
+			initialSnapshot: initialResult.snapshot,
+			streamSnapshots: false,
+		});
+		const nextSnapshot: SnapshotResponse = {
+			...initialResult.snapshot,
+			generation: initialResult.snapshot.generation + 1,
+			generatedAt: Date.now(),
+			serverNowMs: Date.now(),
+			credentials: [],
+		};
+		vi.spyOn(brokerClient, "fetchSnapshot").mockResolvedValue({
+			status: 200,
+			snapshot: nextSnapshot,
+			generation: nextSnapshot.generation,
+		});
+
+		const ticket = await remoteStore.acquireCredentialDispatchTicket("anthropic");
+		let refreshSettled = false;
+		const refresh = remoteStore.refreshSnapshot().then(() => {
+			refreshSettled = true;
+		});
+		await Bun.sleep(0);
+		expect(refreshSettled).toBe(false);
+		expect(remoteStore.snapshot.credentials).toHaveLength(1);
+
+		ticket.release();
+		await refresh;
+		expect(remoteStore.snapshot.credentials).toHaveLength(0);
+		remoteStore.close();
+	});
+
+	test("aborted dispatch ticket waiters release their queue slot", async () => {
+		const brokerClient = new AuthBrokerClient({ url: handle!.url, token });
+		const initialResult = await brokerClient.fetchSnapshot();
+		if (initialResult.status !== 200) throw new Error("expected snapshot");
+		const remoteStore = new RemoteAuthCredentialStore({
+			client: brokerClient,
+			initialSnapshot: initialResult.snapshot,
+			streamSnapshots: false,
+		});
+		const first = await remoteStore.acquireCredentialDispatchTicket("anthropic");
+		const controller = new AbortController();
+		const second = remoteStore.acquireCredentialDispatchTicket("anthropic", controller.signal);
+		controller.abort();
+		await expect(second).rejects.toThrow(/aborted/);
+
+		first.release();
+		const third = await remoteStore.acquireCredentialDispatchTicket("anthropic");
+		third.release();
+		remoteStore.close();
+	});
+
 	test("RemoteAuthCredentialStore rejects writes from the client", () => {
 		const remoteStore = new RemoteAuthCredentialStore({
 			client: new AuthBrokerClient({ url: handle!.url, token }),
@@ -151,6 +244,176 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 		expect(() =>
 			remoteStore.upsertAuthCredentialForProviderIfAbsent("anthropic", { type: "api_key", key: "x" }),
 		).toThrow(/read-only/);
+		remoteStore.close();
+	});
+
+	test("accepts a lower generation from a restarted broker epoch", async () => {
+		const brokerClient = new AuthBrokerClient({ url: handle!.url, token });
+		const initialSnapshot: SnapshotResponse = {
+			generation: 99,
+			generatedAt: Date.now() - 1_000,
+			serverNowMs: Date.now() - 1_000,
+			refresher: { enabled: false, intervalMs: 0, skewMs: 0, nextSweepInMs: Number.MAX_SAFE_INTEGER },
+			credentials: [
+				{
+					id: 999,
+					provider: "anthropic",
+					credential: {
+						type: "oauth",
+						access: "stale-access",
+						refresh: REMOTE_REFRESH_SENTINEL,
+						expires: Date.now() + 60_000,
+					},
+					identityKey: "stale@example.com",
+					rotatesInMs: null,
+				},
+			],
+		};
+		const remoteStore = new RemoteAuthCredentialStore({
+			client: brokerClient,
+			initialSnapshot,
+			streamSnapshots: false,
+		});
+		await remoteStore.refreshSnapshot();
+		expect(remoteStore.snapshot.generation).toBeLessThan(99);
+		expect(remoteStore.snapshot.credentials[0]?.credential).toMatchObject({ access: "server-access-1" });
+		remoteStore.close();
+	});
+
+	test("rejects delayed data from a retired broker epoch even with a newer timestamp", async () => {
+		let nextSnapshot: SnapshotResponse = {
+			generation: 1,
+			epoch: "200-new-epoch",
+			generatedAt: 100,
+			serverNowMs: 100,
+			refresher: { enabled: false, intervalMs: 0, skewMs: 0, nextSweepInMs: Number.MAX_SAFE_INTEGER },
+			credentials: [],
+		};
+		const fetchImpl = async (): Promise<Response> => {
+			await Bun.sleep(1);
+			return new Response(JSON.stringify(nextSnapshot), {
+				status: 200,
+				headers: { "Content-Type": "application/json", ETag: `"${nextSnapshot.generation}"` },
+			});
+		};
+		const client = new AuthBrokerClient({
+			url: "http://broker.test",
+			token: "token",
+			fetchImpl: fetchImpl as unknown as typeof fetch,
+			maxRetries: 0,
+		});
+		const remoteStore = new RemoteAuthCredentialStore({
+			client,
+			streamSnapshots: false,
+			initialSnapshot: {
+				...nextSnapshot,
+				generation: 99,
+				epoch: "100-old-epoch",
+				serverNowMs: 200,
+			},
+		});
+		await remoteStore.refreshSnapshot();
+		nextSnapshot = { ...nextSnapshot, generation: 100, epoch: "100-old-epoch", serverNowMs: 300 };
+		await expect(remoteStore.refreshSnapshot()).rejects.toThrow("snapshot authority was rejected");
+		expect(remoteStore.snapshot.epoch).toBe("200-new-epoch");
+		expect(remoteStore.snapshot.generation).toBe(1);
+		remoteStore.close();
+	});
+
+	test("rejects unseen opaque broker epochs without authoritative ordering", async () => {
+		let nextSnapshot: SnapshotResponse = {
+			generation: 1,
+			epoch: "opaque-current",
+			generatedAt: 100,
+			serverNowMs: 100,
+			refresher: { enabled: false, intervalMs: 0, skewMs: 0, nextSweepInMs: Number.MAX_SAFE_INTEGER },
+			credentials: [],
+		};
+		const client = new AuthBrokerClient({
+			url: "http://broker.test",
+			token: "token",
+			fetchImpl: (async () =>
+				new Response(JSON.stringify(nextSnapshot), {
+					status: 200,
+					headers: { "Content-Type": "application/json", ETag: `"${nextSnapshot.generation}"` },
+				})) as unknown as typeof fetch,
+			maxRetries: 0,
+		});
+		const remoteStore = new RemoteAuthCredentialStore({
+			client,
+			streamSnapshots: false,
+			initialSnapshot: nextSnapshot,
+		});
+		nextSnapshot = { ...nextSnapshot, epoch: "opaque-delayed", generation: 2, serverNowMs: 200 };
+		await expect(remoteStore.refreshSnapshot()).rejects.toThrow("snapshot authority was rejected");
+		expect(remoteStore.snapshot.epoch).toBe("opaque-current");
+		remoteStore.close();
+	});
+
+	test("does not fail a refresh when an older same-epoch GET is superseded", async () => {
+		const initialSnapshot: SnapshotResponse = {
+			generation: 1,
+			epoch: "100-current-epoch",
+			generatedAt: 100,
+			serverNowMs: 100,
+			refresher: { enabled: false, intervalMs: 0, skewMs: 0, nextSweepInMs: Number.MAX_SAFE_INTEGER },
+			credentials: [],
+		};
+		let nextSnapshot: SnapshotResponse = { ...initialSnapshot, generation: 2, serverNowMs: 200 };
+		const client = new AuthBrokerClient({
+			url: "http://broker.test",
+			token: "token",
+			fetchImpl: (async () => {
+				await Bun.sleep(1);
+				return new Response(JSON.stringify(nextSnapshot), {
+					status: 200,
+					headers: {
+						"Content-Type": "application/json",
+						ETag: `"${nextSnapshot.epoch}:${nextSnapshot.generation}"`,
+					},
+				});
+			}) as unknown as typeof fetch,
+			maxRetries: 0,
+		});
+		const remoteStore = new RemoteAuthCredentialStore({ client, initialSnapshot, streamSnapshots: false });
+
+		await remoteStore.refreshSnapshot();
+		expect(remoteStore.snapshot.generation).toBe(2);
+		nextSnapshot = { ...initialSnapshot, generatedAt: 150, serverNowMs: 150 };
+		await expect(remoteStore.refreshSnapshot()).resolves.toBe(remoteStore.snapshot);
+		expect(remoteStore.snapshot.generation).toBe(2);
+		remoteStore.close();
+	});
+
+	test("rethrows caller cancellation from scoped usage lookup", async () => {
+		const brokerClient = new AuthBrokerClient({ url: handle!.url, token });
+		const remoteStore = new RemoteAuthCredentialStore({
+			client: brokerClient,
+			initialSnapshot: {
+				generation: 0,
+				generatedAt: 0,
+				serverNowMs: 0,
+				refresher: { enabled: false, intervalMs: 0, skewMs: 0, nextSweepInMs: Number.MAX_SAFE_INTEGER },
+				credentials: [],
+			},
+			streamSnapshots: false,
+		});
+		const usage = Promise.withResolvers<{ generatedAt: number; reports: [] }>();
+		vi.spyOn(brokerClient, "fetchUsage").mockImplementation(async () => usage.promise as never);
+		const controller = new AbortController();
+		const request = remoteStore.getUsageReport(
+			"anthropic",
+			{
+				type: "oauth",
+				access: "access",
+				refresh: REMOTE_REFRESH_SENTINEL,
+				expires: Date.now() + 60_000,
+			},
+			controller.signal,
+		);
+		controller.abort();
+		await expect(request).rejects.toThrow(/aborted/);
+		usage.resolve({ generatedAt: Date.now(), reports: [] });
 		remoteStore.close();
 	});
 
@@ -179,9 +442,10 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 			limits: [],
 			metadata: { email: "b@example.com" },
 		};
-		const fetchSpy = vi
-			.spyOn(brokerClient, "fetchUsage")
-			.mockResolvedValue({ generatedAt: Date.now(), reports: [reportForA, reportForB] });
+		const fetchSpy = vi.spyOn(brokerClient, "fetchUsage").mockImplementation(async (_signal, provider) => ({
+			generatedAt: Date.now(),
+			reports: provider === "anthropic" ? [reportForA, reportForB] : [],
+		}));
 
 		const credA = {
 			type: "oauth" as const,
@@ -206,10 +470,10 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 		expect(cached?.metadata?.email).toBe("a@example.com");
 		expect(fetchSpy).toHaveBeenCalledTimes(1);
 
-		// Unknown provider → null, no extra fetch.
+		// Unknown provider is independently scoped and receives an empty response.
 		const miss = await remoteStore.getUsageReport("openai-codex", credA);
 		expect(miss).toBeNull();
-		expect(fetchSpy).toHaveBeenCalledTimes(1);
+		expect(fetchSpy).toHaveBeenCalledTimes(2);
 
 		remoteStore.close();
 	});

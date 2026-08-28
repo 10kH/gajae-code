@@ -6,11 +6,17 @@
 
 - The built-in `kiro` provider now accepts long-lived `KIRO_API_KEY` values (`ksk_…` from [app.kiro.dev](https://app.kiro.dev/settings/api-keys)) in addition to AWS Builder ID OAuth. API-key auth talks to the Kiro service root with `tokentype: API_KEY` and discovers the live model catalog via `ListAvailableModels`. Builder ID login (`gjc auth-broker login kiro` / `AWS_BEARER_TOKEN_KIRO`) is unchanged.
 
+- `AuthGatewayServerOptions` now requires `providerScope`; `AuthGatewayBootOptions` requires the provider-filtered `listModels` callback and an exact-catalog-object `resolveModel`. Direct `@gajae-code/ai` callers must construct one gateway instance per provider and pass a provider-filtered source catalog. This matches the mandatory `--provider=<id>` CLI migration and prevents cross-provider model and credential ambiguity.
+- `AuthGatewayBootOptions` now requires live authority callbacks (`hasProviderCredential`, `reloadProviderCredentials`, and `validateProviderCredential`). Gateway dispatch holds the authority lease through `streamSimple()` admission and rejects credentials revoked during asynchronous selection instead of sending a stale key.
+- `auth-broker serve` now requires an `AuthCredentialStore` with atomic `allocateMonotonicSequence` support for durable broker incarnation epochs; unsupported custom stores fail closed before binding and must migrate to the durable cache-backed contract.
+
 ### Fixed
 
 - The generic OpenAI Responses transport now preserves the typed `server_is_overloaded` code from an HTTP 200 terminal envelope as transport facts (`openaiErrorCode` / `providerCode`), and that statusless code classifies as a `server` fallback trigger. Both terminal shapes that carry the structured failure are covered: `response.failed`, and `response.completed` whose response `status` is `failed` (including the nested `status_details.error` form). Previously the envelope became a plain `Error`, so the only structured evidence of a capacity rejection was lost and consumers had to read provider prose. The code is matched case-sensitively and exactly, so near misses (`server_is_overloaded_now`), case variants (`SERVER_IS_OVERLOADED`), padded variants, and a `cancelled` response carrying the same code all stay untyped and unclassified; the displayed error message is unchanged in every case. The shared Azure Responses path inherits the same parsing. (#5018)
 - Kiro credential selection now rejects control-character injection and keeps non-`ksk_` values on the Builder ID bearer path. API-key failures redact the credential before reaching assistant error output, and the transport accepts provider header overrides without changing the documented endpoint contract.
 - API-key model discovery also retains the contributor-supplied static catalog for offline print-mode resolution, while live `ListAvailableModels` results remain authoritative when available.
+- Auth-gateway boot and dispatch are now provider-scoped: model catalogs reject cross-provider id ambiguity, Codex rows retain `openai-codex-responses`, and requests cannot borrow credentials from another provider.
+- Broker-backed gateway dispatch leases now remain held until the provider's transport-admission boundary, preventing lazy stream construction from releasing authority before outbound dispatch.
 
 ## [0.15.3] - 2026-08-27
 

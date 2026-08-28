@@ -353,6 +353,19 @@ export type FetchImpl = ((input: string | URL | Request, init?: RequestInit) => 
 	preconnect?: typeof globalThis.fetch.preconnect;
 };
 
+/**
+ * Credential returned by an auth retry resolver.
+ *
+ * The optional admission callback lets an authority-bearing caller retain a
+ * credential lease until the replacement provider request is actually
+ * admitted. Ordinary callers can continue returning a string from
+ * {@link StreamOptions.onAuthError}.
+ */
+export interface AuthRetryCredential {
+	apiKey: string;
+	onStreamCreated?: () => void;
+}
+
 export interface StreamOptions {
 	temperature?: number;
 	topP?: number;
@@ -384,7 +397,11 @@ export interface StreamOptions {
 	 * event has been emitted. Returning a different key retries the provider
 	 * request once.
 	 */
-	onAuthError?: (provider: string, apiKey: string, error: unknown) => Promise<string | undefined>;
+	onAuthError?: (
+		provider: string,
+		apiKey: string,
+		error: unknown,
+	) => Promise<string | AuthRetryCredential | undefined>;
 	cacheRetention?: CacheRetention;
 	/**
 	 * Additional headers to include in provider requests.
@@ -449,6 +466,14 @@ export interface StreamOptions {
 		model?: Model<Api>,
 		scope?: AttemptScopeRef,
 	) => void | Promise<void>;
+	/**
+	 * Internal dispatch-admission hook. Providers invoke this immediately before
+	 * submitting an outbound request; stream forwarding retains a first-response
+	 * fallback for custom providers that do not expose a transport seam.
+	 */
+	onStreamCreated?: () => void;
+	/** Internal authority policy: disable provider-owned retries and corrective replays. */
+	disableProviderRetries?: boolean;
 	/**
 	 * Optional callback for raw Server-Sent Events as they arrive from HTTP streaming providers.
 	 *

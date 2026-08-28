@@ -8,6 +8,7 @@
 import { readSseEvents } from "@gajae-code/utils";
 import type { ZodType, infer as zInfer } from "zod/v4";
 import type { AuthCredential } from "../auth-storage";
+import type { Provider } from "../types";
 import type {
 	CredentialDisableRequest,
 	CredentialDisableResponse,
@@ -33,6 +34,8 @@ import {
 	snapshotStreamEventSchema,
 	usageResponseSchema,
 } from "./wire-schemas";
+
+export const AUTH_BROKER_EPOCH_HEADER = "X-GJC-Auth-Broker-Epoch";
 
 export interface AuthBrokerClientOptions {
 	/** Base URL (e.g. `https://broker.tailnet:8765`). Trailing slashes are trimmed. */
@@ -80,24 +83,27 @@ export class AuthBrokerCredentialMetadataUnsupportedError extends AuthBrokerErro
 
 export interface FetchSnapshotOptions {
 	ifGenerationGt?: number;
+	ifEpoch?: string;
 	waitMs?: number;
 	signal?: AbortSignal;
 }
 
 export type FetchSnapshotResult =
 	| { status: 200; snapshot: SnapshotResponse; generation: number }
-	| { status: 304; generation: number };
+	| { status: 304; generation: number; epoch?: string };
 
-function parseGenerationTag(header: string | null): number | undefined {
+function parseSnapshotTag(header: string | null): { epoch?: string; generation: number } | undefined {
 	if (!header) return undefined;
 	let value = header.trim();
 	if (value.startsWith("W/")) value = value.slice(2).trim();
 	if (value.startsWith('"') && value.endsWith('"') && value.length >= 2) {
 		value = value.slice(1, -1);
 	}
-	const generation = Number(value);
+	const separator = value.lastIndexOf(":");
+	const epoch = separator > 0 ? value.slice(0, separator) : undefined;
+	const generation = Number(separator > 0 ? value.slice(separator + 1) : value);
 	if (!Number.isInteger(generation) || generation < 0) return undefined;
-	return generation;
+	return { epoch, generation };
 }
 
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -136,6 +142,7 @@ export class AuthBrokerClient {
 		try {
 			return (await this.#request("GET", "/v1/credentials/metadata", {
 				schema: credentialMetadataResponseSchema,
+				headers: { [AUTH_BROKER_EPOCH_HEADER]: "1" },
 				signal,
 			})) as CredentialMetadataResponse;
 		} catch (error) {
@@ -150,7 +157,11 @@ export class AuthBrokerClient {
 		if (opts.waitMs !== undefined) query.set("wait", String(opts.waitMs));
 		const path = `/v1/snapshot${query.size > 0 ? `?${query.toString()}` : ""}`;
 		const headers: Record<string, string> = {};
-		if (opts.ifGenerationGt !== undefined) headers["If-None-Match"] = `"${opts.ifGenerationGt}"`;
+		headers[AUTH_BROKER_EPOCH_HEADER] = "1";
+		if (opts.ifGenerationGt !== undefined) {
+			const validator = opts.ifEpoch ? `${opts.ifEpoch}:${opts.ifGenerationGt}` : String(opts.ifGenerationGt);
+			headers["If-None-Match"] = `"${validator}"`;
+		}
 		const timeoutMs =
 			opts.waitMs !== undefined && opts.waitMs > 0 ? Math.max(this.#timeoutMs, opts.waitMs + 1000) : undefined;
 		const response = await this.#fetchRaw("GET", path, {
@@ -159,9 +170,13 @@ export class AuthBrokerClient {
 			signal: opts.signal,
 			timeoutMs,
 		});
-		const etagGeneration = parseGenerationTag(response.headers.get("etag"));
+		const etag = parseSnapshotTag(response.headers.get("etag"));
 		if (response.status === 304) {
-			return { status: 304, generation: etagGeneration ?? opts.ifGenerationGt ?? 0 };
+			return {
+				status: 304,
+				generation: etag?.generation ?? opts.ifGenerationGt ?? 0,
+				...(etag?.epoch ? { epoch: etag.epoch } : {}),
+			};
 		}
 		const text = await response.text();
 		const raw = this.#parseJson(text, response.status);
@@ -173,7 +188,7 @@ export class AuthBrokerClient {
 			});
 		}
 		const snapshot = validated.data as SnapshotResponse;
-		return { status: 200, snapshot, generation: etagGeneration ?? snapshot.generation };
+		return { status: 200, snapshot, generation: etag?.generation ?? snapshot.generation };
 	}
 
 	/**
@@ -190,6 +205,7 @@ export class AuthBrokerClient {
 		const headers: Record<string, string> = {
 			Accept: "text/event-stream",
 			Authorization: `Bearer ${this.#token}`,
+			[AUTH_BROKER_EPOCH_HEADER]: "1",
 		};
 		if (opts.signal?.aborted) {
 			throw new AuthBrokerError("Auth broker request aborted", { cause: opts.signal.reason });
@@ -258,12 +274,13 @@ export class AuthBrokerClient {
 		}
 	}
 
-	fetchUsage(signal?: AbortSignal): Promise<UsageResponse> {
+	fetchUsage(signal?: AbortSignal, provider?: Provider): Promise<UsageResponse> {
 		// Validates the envelope (`generatedAt`, `reports[].provider`, `limits`,
 		// `metadata`) but leaves provider-specific extension fields permissive so
 		// the broker can ship new shapes ahead of the client. `raw` is accepted
 		// but normally stripped by the broker before send.
-		return this.#request("GET", "/v1/usage", { schema: usageResponseSchema, signal }) as Promise<UsageResponse>;
+		const path = provider ? `/v1/usage/scoped?provider=${encodeURIComponent(provider)}` : "/v1/usage";
+		return this.#request("GET", path, { schema: usageResponseSchema, signal }) as Promise<UsageResponse>;
 	}
 
 	async refreshCredential(id: number, signal?: AbortSignal): Promise<CredentialRefreshResponse> {
@@ -323,7 +340,13 @@ export class AuthBrokerClient {
 	async #request<TSchema extends ZodType>(
 		method: "GET" | "POST",
 		path: string,
-		opts: { schema: TSchema; auth?: boolean; body?: unknown; signal?: AbortSignal },
+		opts: {
+			schema: TSchema;
+			auth?: boolean;
+			body?: unknown;
+			signal?: AbortSignal;
+			headers?: Record<string, string>;
+		},
 	): Promise<zInfer<TSchema>> {
 		const response = await this.#fetchRaw(method, path, opts);
 		const text = await response.text();

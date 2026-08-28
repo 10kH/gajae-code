@@ -9,10 +9,13 @@
  * Transport security is delegated to the operator (Tailscale / Wireguard);
  * the server only checks a bearer token against an allow-list per request.
  */
+import * as crypto from "node:crypto";
 import { logger } from "@gajae-code/utils";
 import { timingSafeEqual } from "../auth-gateway/http";
 import type { AuthStorage } from "../auth-storage";
+import type { Provider } from "../types";
 import { assertAuthenticatedOrLoopback, parseBind } from "../utils/parse-bind";
+import { AUTH_BROKER_EPOCH_HEADER } from "./client";
 import { cleanReason } from "./redact";
 import { AuthBrokerRefresher, type AuthBrokerRefresherSchedule } from "./refresher";
 import type {
@@ -26,8 +29,6 @@ import type {
 	RefresherSchedule,
 	SnapshotEntry,
 	SnapshotResponse,
-	SnapshotStreamEntryEvent,
-	SnapshotStreamRemovedEvent,
 	SnapshotStreamSnapshotEvent,
 } from "./types";
 import {
@@ -147,24 +148,27 @@ const DISABLE_ROUTE = /^\/v1\/credential\/(\d+)\/disable$/;
 
 const MAX_SNAPSHOT_WAIT_MS = 30_000;
 const DISABLED_NEXT_SWEEP_IN_MS = Number.MAX_SAFE_INTEGER;
+const BROKER_EPOCH_SEQUENCE_CACHE_KEY = "auth-broker:epoch-sequence";
 
-function snapshotHeaders(generation: number): Record<string, string> {
+function snapshotHeaders(epoch: string, generation: number, includeEpoch: boolean): Record<string, string> {
 	return {
-		ETag: `"${generation}"`,
+		ETag: `"${includeEpoch ? `${epoch}:` : ""}${generation}"`,
 		"Cache-Control": "no-store",
 	};
 }
 
-function parseGenerationTag(header: string | null): number | undefined {
+function parseSnapshotTag(header: string | null): { epoch?: string; generation: number } | undefined {
 	if (!header) return undefined;
 	let value = header.trim();
 	if (value.startsWith("W/")) value = value.slice(2).trim();
 	if (value.startsWith('"') && value.endsWith('"') && value.length >= 2) {
 		value = value.slice(1, -1);
 	}
-	const generation = Number(value);
+	const separator = value.lastIndexOf(":");
+	const epoch = separator > 0 ? value.slice(0, separator) : undefined;
+	const generation = Number(separator > 0 ? value.slice(separator + 1) : value);
 	if (!Number.isInteger(generation) || generation < 0) return undefined;
-	return generation;
+	return { epoch, generation };
 }
 
 function parseWaitMs(url: URL): number {
@@ -286,7 +290,12 @@ function computeRotatesInMs(
 	return Math.max(0, rotatesAt - serverNowMs);
 }
 
-function buildSnapshot(storage: AuthStorage, refresher: AuthBrokerRefresher | undefined): SnapshotResponse {
+function buildSnapshot(
+	storage: AuthStorage,
+	refresher: AuthBrokerRefresher | undefined,
+	epoch: string,
+	includeEpoch: boolean,
+): SnapshotResponse {
 	const serverNowMs = Date.now();
 	const base = storage.exportSnapshot();
 	const { wire, nextSweepAt } = resolveRefresherSchedule(refresher, serverNowMs);
@@ -295,6 +304,7 @@ function buildSnapshot(storage: AuthStorage, refresher: AuthBrokerRefresher | un
 		rotatesInMs: computeRotatesInMs(entry, wire, nextSweepAt, serverNowMs),
 	}));
 	return {
+		...(includeEpoch ? { epoch } : {}),
 		generation: base.generation,
 		generatedAt: base.generatedAt,
 		serverNowMs,
@@ -304,15 +314,20 @@ function buildSnapshot(storage: AuthStorage, refresher: AuthBrokerRefresher | un
 }
 
 /** Build the payload-free credential inventory projection for the metadata route. */
-function buildCredentialMetadata(storage: AuthStorage): CredentialMetadataResponse {
+function buildCredentialMetadata(
+	storage: AuthStorage,
+	epoch: string,
+	includeEpoch: boolean,
+): CredentialMetadataResponse {
 	const credentials = storage.listCredentialInventory().map(record => ({
 		id: record.id,
 		provider: record.provider,
 		type: record.credentialKind,
 		identity: record.identityLabel,
-		disabledCause: record.disabledCause,
+		disabledCause: record.disabledCause === null ? null : "disabled via auth-broker",
 	}));
 	return {
+		...(includeEpoch ? { epoch } : {}),
 		generation: storage.getGeneration(),
 		generatedAt: Date.now(),
 		credentials,
@@ -325,21 +340,31 @@ async function serveSnapshot(
 	storage: AuthStorage,
 	gate: GenerationGate,
 	refresher: AuthBrokerRefresher | undefined,
+	epoch: string,
 	peer: string,
 ): Promise<Response> {
 	await storage.reload();
 	let currentGeneration = storage.getGeneration();
-	const clientGeneration = parseGenerationTag(req.headers.get("if-none-match"));
+	const clientTag = parseSnapshotTag(req.headers.get("if-none-match"));
+	const includeEpoch = req.headers.get(AUTH_BROKER_EPOCH_HEADER) === "1";
+	const clientGeneration = clientTag?.generation;
 	const waitMs = parseWaitMs(url);
+	const legacyConditional = clientTag !== undefined && !includeEpoch;
 
-	if (clientGeneration === undefined || currentGeneration !== clientGeneration || waitMs <= 0) {
-		const body = buildSnapshot(storage, refresher);
+	if (
+		legacyConditional ||
+		clientGeneration === undefined ||
+		(includeEpoch && clientTag?.epoch !== epoch) ||
+		currentGeneration !== clientGeneration ||
+		waitMs <= 0
+	) {
+		const body = buildSnapshot(storage, refresher, epoch, includeEpoch);
 		logger.info("auth-broker snapshot served", {
 			peer,
 			credentials: body.credentials.length,
 			generation: body.generation,
 		});
-		return json(200, body, snapshotHeaders(body.generation));
+		return json(200, body, snapshotHeaders(epoch, body.generation, includeEpoch));
 	}
 
 	const delay = delayResult(waitMs);
@@ -348,35 +373,23 @@ async function serveSnapshot(
 	const result = await Promise.race([gate.waitForChange(clientGeneration, waitSignal), delay.promise]);
 	delay.cancel();
 	waitController.abort();
-	if (result === "aborted" || req.signal.aborted) return empty(499, snapshotHeaders(currentGeneration));
+	if (result === "aborted" || req.signal.aborted)
+		return empty(499, snapshotHeaders(epoch, currentGeneration, includeEpoch));
 
 	await storage.reload();
 	currentGeneration = storage.getGeneration();
-	if (currentGeneration !== clientGeneration) {
-		const body = buildSnapshot(storage, refresher);
+	if (currentGeneration !== clientGeneration || (includeEpoch && clientTag?.epoch !== epoch)) {
+		const body = buildSnapshot(storage, refresher, epoch, includeEpoch);
 		logger.info("auth-broker snapshot long-poll changed", {
 			peer,
 			credentials: body.credentials.length,
 			generation: body.generation,
 		});
-		return json(200, body, snapshotHeaders(body.generation));
+		return json(200, body, snapshotHeaders(epoch, body.generation, includeEpoch));
 	}
 
 	logger.info("auth-broker snapshot long-poll unchanged", { peer, generation: currentGeneration });
-	return empty(304, snapshotHeaders(currentGeneration));
-}
-
-/**
- * Stable per-credential fingerprint for SSE delta detection. Field order is
- * fixed by this serializer (NOT by entry insertion order) so a credential
- * built by two different paths still produces the same fingerprint.
- *
- * `rotatesInMs` is intentionally part of the fingerprint: when it shifts we
- * want the client to recompute its `prepareForRequest` deadline rather than
- * keep the stale projection.
- */
-function fingerprintEntry(entry: SnapshotEntry): string {
-	return JSON.stringify([entry.id, entry.provider, entry.identityKey, entry.rotatesInMs, entry.credential]);
+	return empty(304, snapshotHeaders(epoch, currentGeneration, includeEpoch));
 }
 
 function sseEvent(event: string, body: unknown): string {
@@ -387,18 +400,20 @@ function serveSnapshotStream(
 	req: Request,
 	storage: AuthStorage,
 	refresher: AuthBrokerRefresher | undefined,
+	epoch: string,
 	peer: string,
 	keepaliveMs: number,
 ): Response {
 	const encoder = new TextEncoder();
+	const includeEpoch = req.headers.get(AUTH_BROKER_EPOCH_HEADER) === "1";
 	const openedAt = Date.now();
-	const lastByCredId = new Map<number, string>();
 	let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
 	let unsubscribe: (() => void) | null = null;
 	let keepaliveTimer: NodeJS.Timeout | undefined;
 	let abortHandler: (() => void) | null = null;
 	let processing = false;
 	let pendingBumps = 0;
+	let initializing = true;
 	let closed = false;
 	let lastGeneration = -1;
 
@@ -447,9 +462,18 @@ function serveSnapshotStream(
 		try {
 			do {
 				pendingBumps = 0;
-				await storage.reload();
+				try {
+					await storage.reload();
+				} catch (error) {
+					logger.warn("auth-broker stream generation reload failed", {
+						peer,
+						error: cleanReason(error) ?? "credential snapshot reload failed",
+					});
+					cleanup();
+					return;
+				}
 				if (closed) return;
-				const snapshot = buildSnapshot(storage, refresher);
+				const snapshot = buildSnapshot(storage, refresher, epoch, includeEpoch);
 				// Generation must move forward; a duplicate listener firing without a
 				// real bump is a no-op below (fingerprints unchanged).
 				if (snapshot.generation < lastGeneration) {
@@ -460,40 +484,13 @@ function serveSnapshotStream(
 					});
 				}
 				lastGeneration = snapshot.generation;
-				const seenIds = new Set<number>();
-				for (const entry of snapshot.credentials) {
-					seenIds.add(entry.id);
-					const fp = fingerprintEntry(entry);
-					if (lastByCredId.get(entry.id) === fp) continue;
-					lastByCredId.set(entry.id, fp);
-					const payload: SnapshotStreamEntryEvent = {
-						kind: "entry",
-						generation: snapshot.generation,
-						serverNowMs: snapshot.serverNowMs,
-						refresher: snapshot.refresher,
-						entry,
-					};
-					if (!write(sseEvent("entry", payload))) return;
-					logger.debug("auth-broker stream entry", {
-						peer,
-						id: entry.id,
-						provider: entry.provider,
-						generation: snapshot.generation,
-					});
-				}
-				for (const id of [...lastByCredId.keys()]) {
-					if (seenIds.has(id)) continue;
-					lastByCredId.delete(id);
-					const payload: SnapshotStreamRemovedEvent = {
-						kind: "removed",
-						generation: snapshot.generation,
-						serverNowMs: snapshot.serverNowMs,
-						refresher: snapshot.refresher,
-						id,
-					};
-					if (!write(sseEvent("removed", payload))) return;
-					logger.debug("auth-broker stream removed", { peer, id, generation: snapshot.generation });
-				}
+				const snapshotEvent: SnapshotStreamSnapshotEvent = { kind: "snapshot", ...snapshot };
+				if (!write(sseEvent("snapshot", snapshotEvent))) return;
+				logger.debug("auth-broker stream snapshot", {
+					peer,
+					credentialCount: snapshot.credentials.length,
+					generation: snapshot.generation,
+				});
 			} while (pendingBumps > 0 && !closed);
 		} finally {
 			processing = false;
@@ -503,22 +500,39 @@ function serveSnapshotStream(
 	const stream = new ReadableStream<Uint8Array>({
 		async start(c) {
 			controller = c;
-			await storage.reload();
-			const initial = buildSnapshot(storage, refresher);
-			lastGeneration = initial.generation;
-			for (const entry of initial.credentials) lastByCredId.set(entry.id, fingerprintEntry(entry));
-			const initialEvent: SnapshotStreamSnapshotEvent = { kind: "snapshot", ...initial };
-			if (!write(sseEvent("snapshot", initialEvent))) return;
-			keepaliveTimer = setInterval(() => {
-				write(": keepalive\n\n");
-			}, keepaliveMs);
-			keepaliveTimer.unref?.();
+			abortHandler = (): void => cleanup();
+			req.signal.addEventListener("abort", abortHandler, { once: true });
 			unsubscribe = storage.onGenerationChanged(() => {
+				if (initializing) {
+					pendingBumps += 1;
+					return;
+				}
 				void processGenerationBump();
 			});
-			abortHandler = (): void => cleanup();
-			req.signal.addEventListener("abort", abortHandler);
-			logger.info("auth-broker stream opened", { peer, generation: initial.generation });
+			try {
+				await storage.reload();
+				if (closed || req.signal.aborted) {
+					cleanup();
+					return;
+				}
+				const initial = buildSnapshot(storage, refresher, epoch, includeEpoch);
+				lastGeneration = initial.generation;
+				const initialEvent: SnapshotStreamSnapshotEvent = { kind: "snapshot", ...initial };
+				if (!write(sseEvent("snapshot", initialEvent))) return;
+				initializing = false;
+				keepaliveTimer = setInterval(() => {
+					write(": keepalive\n\n");
+				}, keepaliveMs);
+				keepaliveTimer.unref?.();
+				if (pendingBumps > 0) void processGenerationBump();
+				logger.info("auth-broker stream opened", { peer, generation: initial.generation });
+			} catch (error) {
+				logger.warn("auth-broker stream initialization failed", {
+					peer,
+					error: cleanReason(error) ?? "credential snapshot initialization failed",
+				});
+				cleanup();
+			}
 		},
 		cancel() {
 			cleanup();
@@ -543,6 +557,18 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 	assertAuthenticatedOrLoopback(bind, tokens.size, "auth-broker");
 	const version = opts.version;
 	const streamKeepaliveMs = opts.streamKeepaliveMs ?? DEFAULT_STREAM_KEEPALIVE_MS;
+	let epochSequence: number;
+	try {
+		epochSequence = opts.storage.allocateMonotonicSequence(
+			BROKER_EPOCH_SEQUENCE_CACHE_KEY,
+			Math.floor(Date.now() / 1000) + 315_360_000,
+		);
+	} catch (error) {
+		throw new Error(
+			`Auth broker storage must support atomic monotonic sequence allocation: ${cleanReason(error) ?? "unsupported storage"}`,
+		);
+	}
+	const epoch = `${epochSequence}-${crypto.randomUUID()}`;
 
 	const refresher = opts.disableRefresher
 		? undefined
@@ -574,7 +600,11 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 				}
 				if (req.method === "GET" && pathname === "/v1/credentials/metadata") {
 					await opts.storage.reload();
-					const body = buildCredentialMetadata(opts.storage);
+					const body = buildCredentialMetadata(
+						opts.storage,
+						epoch,
+						req.headers.get(AUTH_BROKER_EPOCH_HEADER) === "1",
+					);
 					logger.info("auth-broker credential metadata served", {
 						generation: body.generation,
 						status: "ok",
@@ -582,19 +612,27 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 					return json(200, body);
 				}
 				if (req.method === "GET" && pathname === "/v1/snapshot/stream") {
-					return serveSnapshotStream(req, opts.storage, refresher, peer, streamKeepaliveMs);
+					return serveSnapshotStream(req, opts.storage, refresher, epoch, peer, streamKeepaliveMs);
 				}
 				if (req.method === "GET" && pathname === "/v1/snapshot") {
-					return serveSnapshot(req, url, opts.storage, generationGate, refresher, peer);
+					return serveSnapshot(req, url, opts.storage, generationGate, refresher, epoch, peer);
 				}
-				if (req.method === "GET" && pathname === "/v1/usage") {
+				if (req.method === "GET" && (pathname === "/v1/usage" || pathname === "/v1/usage/scoped")) {
 					try {
 						// AuthStorage caches usage reports internally with a 5-minute per-credential
 						// TTL (USAGE_REPORT_TTL_MS) so back-to-back widget polls re-use the
 						// last fetch instead of hitting provider endpoints repeatedly.
 						// `req.signal` propagates HTTP-client disconnects all the way to the
 						// per-caller cancel without touching the shared upstream fetch.
-						const reports = (await opts.storage.fetchUsageReports?.({ signal: req.signal })) ?? [];
+						const scopedProvider = url.searchParams.get("provider") as Provider | null;
+						if (pathname === "/v1/usage/scoped" && !scopedProvider) {
+							return json(400, { error: "provider is required" });
+						}
+						const reports =
+							(await opts.storage.fetchUsageReports?.({
+								provider: scopedProvider ?? undefined,
+								signal: req.signal,
+							})) ?? [];
 						// Drop the `raw` field — it's the provider-specific upstream body,
 						// large and unstable. Everything UI-relevant lives in `limits` and
 						// `metadata`.
@@ -635,8 +673,7 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 					const id = Number.parseInt(disableMatch[1], 10);
 					const parsed = await parseBody(req, credentialDisableRequestSchema, { allowEmpty: true });
 					if (!parsed.ok) return parsed.response;
-					const cause =
-						parsed.data.cause && parsed.data.cause.length > 0 ? parsed.data.cause : "disabled via auth-broker";
+					const cause = "disabled via auth-broker";
 					const ok = opts.storage.disableCredentialById(id, cause);
 					if (!ok) {
 						logger.info("auth-broker disable miss", { id, peer });

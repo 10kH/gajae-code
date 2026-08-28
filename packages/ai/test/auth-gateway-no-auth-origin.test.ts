@@ -10,15 +10,25 @@ const TEST_MODEL = {
 	api: "anthropic-messages",
 } as Model<Api>;
 
+const testAuthority = () => ({
+	hasProviderCredential: () => true,
+	reloadProviderCredentials: async () => {},
+	validateProviderCredential: () => true,
+});
+
 async function withGateway(
 	bearerTokens: string[],
 	fn: (handle: AuthGatewayServerHandle) => Promise<void>,
 ): Promise<void> {
 	const handle = startAuthGateway({
 		bind: "127.0.0.1:0",
+		providerScope: { provider: TEST_MODEL.provider },
+		...testAuthority(),
 		bearerTokens,
 		version: "test",
-		storage: {} as AuthStorage,
+		storage: {
+			exportSnapshot: () => ({ credentials: [{ provider: TEST_MODEL.provider }] }),
+		} as unknown as AuthStorage,
 		resolveModel: () => TEST_MODEL,
 		listModels: () => [TEST_MODEL],
 	});
@@ -30,6 +40,23 @@ async function withGateway(
 }
 
 describe("auth-gateway no-auth browser origin guard", () => {
+	it("rejects non-loopback no-auth binds before opening a listener", () => {
+		expect(() =>
+			startAuthGateway({
+				bind: "0.0.0.0:0",
+				providerScope: { provider: TEST_MODEL.provider },
+				...testAuthority(),
+				bearerTokens: [],
+				version: "test",
+				storage: {
+					exportSnapshot: () => ({ credentials: [{ provider: TEST_MODEL.provider }] }),
+				} as unknown as AuthStorage,
+				resolveModel: () => TEST_MODEL,
+				listModels: () => [TEST_MODEL],
+			}),
+		).toThrow(/unauthenticated mode is loopback-only/);
+	});
+
 	it("preserves no-auth access for non-browser local clients", async () => {
 		await withGateway([], async gateway => {
 			const response = await fetch(`${gateway.url}/v1/models`);
@@ -49,7 +76,7 @@ describe("auth-gateway no-auth browser origin guard", () => {
 			expect(response.status).toBe(403);
 			expect(response.headers.get("access-control-allow-origin")).toBeNull();
 			const body = (await response.json()) as { error?: string };
-			expect(body.error).toContain("bearer token");
+			expect(body.error).toBe("no-auth rejects requests carrying Origin");
 		});
 	});
 
