@@ -2263,6 +2263,7 @@ export class AsyncJobManager {
 	getJobsSnapshot(filter?: AsyncJobFilter): AsyncJobsSnapshot {
 		this.#expireMonitorTombstones();
 		this.#pruneEvictedDeadLetters();
+		this.#pruneSuppressedDeliveries();
 
 		const pending = new Set<string>();
 		for (const delivery of this.#deliveries) pending.add(`${delivery.jobId}:${delivery.generation}`);
@@ -2977,6 +2978,27 @@ export class AsyncJobManager {
 			if (entry.jobId === jobId) return true;
 		}
 		return false;
+	}
+
+	/** Drop suppression projections once no retained state can deliver the generation. */
+	#pruneSuppressedDeliveries(): void {
+		for (const generation of this.#suppressedDeliveries) {
+			let jobRetainsGeneration = false;
+			for (const job of this.#jobs.values()) {
+				if (job.generation === generation) {
+					jobRetainsGeneration = true;
+					break;
+				}
+			}
+			if (jobRetainsGeneration) continue;
+			if (this.#deliveries.some(delivery => delivery.generation === generation)) continue;
+			if (this.#inFlightDeliveries.some(delivery => delivery.generation === generation)) continue;
+			if (this.#parkedDeliveries.has(generation) || this.#receiptClaims.has(generation)) continue;
+			if ([...this.#deadLetteredDeliveries.values()].some(entry => entry.generation === generation)) continue;
+			if (this.#evictedDeadLetters.has(generation)) continue;
+			this.#suppressedDeliveries.delete(generation);
+			this.#suppressedDeliveryJobIds.delete(generation);
+		}
 	}
 
 	/**

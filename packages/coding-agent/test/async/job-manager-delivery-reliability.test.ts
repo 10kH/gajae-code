@@ -106,14 +106,14 @@ describe("AsyncJobManager delivery reliability", () => {
 
 			const expiredNow = originalNow() + 300_001;
 			vi.spyOn(Date, "now").mockReturnValue(expiredNow);
-			// This prunes the terminal event. The suppressed generation must still
-			// reserve its original id through the independent generation projection.
+			// This prunes the terminal event and the retired suppression projection,
+			// so the original id is available again.
 			manager.getJobsSnapshot();
-			expect(manager.isDeliverySuppressed(originalId)).toBe(true);
 			const replacementId = manager.register("task", "replacement", async () => "replacement", {
 				id: originalId,
 			});
-			expect(replacementId).toBe(`${originalId}-2`);
+			expect(manager.isDeliverySuppressed(originalId)).toBe(false);
+			expect(replacementId).toBe(originalId);
 		} finally {
 			vi.restoreAllMocks();
 			await manager.dispose({ timeoutMs: 250 });
