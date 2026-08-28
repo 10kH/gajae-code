@@ -4862,7 +4862,7 @@ export class ModelRegistry {
 		}
 		for (const provider of this.#customProviderApiKeyEnvNames.keys()) {
 			if (this.#runtimeProviderCredentialInstalled.has(provider)) continue;
-			this.#refreshRotatingConfigApiKey(provider);
+			this.#refreshRotatingConfigApiKey(provider, true);
 		}
 	}
 
@@ -5148,8 +5148,8 @@ export class ModelRegistry {
 		return apiKey;
 	}
 
-	#refreshRotatingConfigApiKey(provider: string): void {
-		const runtimeOwned = this.#runtimeProviderApiKeys.has(provider);
+	#refreshRotatingConfigApiKey(provider: string, forceStatic = false): void {
+		const runtimeOwned = !forceStatic && this.#runtimeProviderApiKeys.has(provider);
 		const envName = runtimeOwned
 			? this.#runtimeProviderApiKeyEnvNames.get(provider)
 			: this.#customProviderApiKeyEnvNames.get(provider);
