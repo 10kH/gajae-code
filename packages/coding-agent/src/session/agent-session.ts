@@ -8016,7 +8016,7 @@ export class AgentSession {
 				context.provider,
 				this.#modelRegistry.authStorage,
 				this.credentialSessionId,
-				this.model,
+				context.model ?? this.model,
 				this.#modelRegistry.getAuthStorageOwner(),
 			),
 		);

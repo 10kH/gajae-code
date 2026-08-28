@@ -35,6 +35,7 @@ import { assertImagePlaceholdersHavePayload } from "./image-placeholder-guard";
 import { createRunResourceLedger } from "./run-resource-ledger";
 import type {
 	AgentContext,
+	AgentMetadataResolverContext,
 	AgentEvent,
 	AgentLoopConfig,
 	AgentMessage,
@@ -466,7 +467,7 @@ export class Agent {
 	#sessionId?: string;
 	#providerSessionId?: string;
 	#metadata?: Record<string, unknown>;
-	#metadataResolver?: (provider: string) => Record<string, unknown> | undefined;
+	#metadataResolver?: (context: AgentMetadataResolverContext) => Record<string, unknown> | undefined;
 	#providerSessionState?: Map<string, ProviderSessionState>;
 	#thinkingBudgets?: ThinkingBudgets;
 	#temperature?: number;
@@ -671,8 +672,12 @@ export class Agent {
 	 * only included for `"anthropic"` requests). Falls back to the static
 	 * {@link metadata} value when no resolver is set.
 	 */
-	metadataForProvider(provider: string): Record<string, unknown> | undefined {
-		if (this.#metadataResolver) return this.#metadataResolver(provider);
+	metadataForProvider(
+		provider: string,
+		model?: Model,
+		transport?: AgentMetadataResolverContext["transport"],
+	): Record<string, unknown> | undefined {
+		if (this.#metadataResolver) return this.#metadataResolver({ provider, model, transport });
 		return this.#metadata;
 	}
 
@@ -684,7 +689,9 @@ export class Agent {
 	 * credential. Pass `undefined` to clear and revert to the static
 	 * {@link metadata} value.
 	 */
-	setMetadataResolver(resolver: ((provider: string) => Record<string, unknown> | undefined) | undefined): void {
+	setMetadataResolver(
+		resolver: ((context: AgentMetadataResolverContext) => Record<string, unknown> | undefined) | undefined,
+	): void {
 		this.#metadataResolver = resolver;
 	}
 

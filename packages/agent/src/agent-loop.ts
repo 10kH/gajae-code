@@ -4523,7 +4523,13 @@ async function streamAssistantResponse(
 	// reflects the credential actually used, not the snapshot from AgentLoopConfig construction.
 	const authCredentialType = config.getAuthCredentialType?.(config.model.provider);
 
-	const resolvedMetadata = config.metadataResolver ? config.metadataResolver(config.model.provider) : config.metadata;
+	const resolvedMetadata = config.metadataResolver
+		? config.metadataResolver({
+				provider: config.model.provider,
+				model: config.model,
+				transport: streamFunction === streamSimple ? "default" : "custom",
+			})
+		: config.metadata;
 
 	// Synthetic recovery requests choose their tool mode explicitly below and
 	// must never consume a queued dynamic choice intended for an ordinary turn.
