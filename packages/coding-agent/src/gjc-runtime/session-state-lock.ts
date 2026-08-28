@@ -97,6 +97,8 @@ interface PendingTransitionRelease {
 	phase: "setup" | "release";
 	token: string;
 	generation?: TransitionDirectoryGeneration;
+	/** Physical claim pathname used for every native identity operation. */
+	nativePath?: string;
 	/** A no-follow descriptor captured immediately after mkdir. This remains the
 	 * authority when setup generation capture itself faults or the pathname is
 	 * replaced before recovery gets to run. */
@@ -1448,11 +1450,14 @@ async function recoverPendingTransitionRelease(transitionDir: string, recoveryKe
 				}
 			}
 			if (parsed.token !== pending.token || parsed.released !== true) return false;
-			let nativeTransitionPath: string;
-			try {
-				nativeTransitionPath = await canonicalTransitionPathPreservingFinal(transitionDir);
-			} catch {
-				return false;
+			let nativeTransitionPath = pending.nativePath;
+			if (nativeTransitionPath === undefined) {
+				try {
+					nativeTransitionPath = await canonicalTransitionPathPreservingFinal(transitionDir);
+					pending.nativePath = nativeTransitionPath;
+				} catch {
+					return false;
+				}
 			}
 			const captured = nativeSessionStateLock().snapshotDirectoryTree(nativeTransitionPath);
 			if (captured.code === "sharing_violation") return false;
@@ -1541,21 +1546,26 @@ async function withLockPathTransition<T>(lockFile: string, transition: () => Pro
 		pendingTransitionReleases.set(recoveryKey, pendingSetup);
 		let transitionGeneration: TransitionDirectoryGeneration;
 		try {
+			// The claim's final component is mutable, but its parent alias is not part of
+			// native identity. Pin the physical parent while this claim is known to be ours;
+			// recovery must not rediscover a different spelling after a fault.
+			pendingSetup.nativePath = await canonicalTransitionPathPreservingFinal(transitionDir);
 			if (process.platform === "win32") {
 				// Windows has no no-follow directory descriptor through Node's fs
-				// flags. A setup fault therefore retains the claim fail-closed below;
-				// only a completed lstat may enter the normal transition path.
-				await SessionStateLockTestHooks.beforeTransitionSetupLstat?.(transitionDir);
+				// flags. Capture the generation immediately after the exclusive mkdir,
+				// before the fault seam, so cleanup remains bound to this claim even when
+				// setup reports a fault after the capture.
 				const transitionStat = await fs.lstat(transitionDir, { bigint: true });
 				if (!transitionStat.isDirectory()) throw new Error("Transition claim is no longer a directory.");
 				transitionGeneration = transitionGenerationFromStat(transitionStat);
+				await SessionStateLockTestHooks.beforeTransitionSetupLstat?.(transitionDir);
 			} else {
 				// Retain no-follow authority before the fault seam and before any
 				// recovery pathname lookup. A later lstat cannot distinguish this
 				// claim from a successor that replaced the name after setup failed.
 				pendingSetup.generationHandle = await fs.open(transitionDir, TRANSITION_DIRECTORY_OPEN_FLAGS);
-				await SessionStateLockTestHooks.beforeTransitionSetupLstat?.(transitionDir);
 				transitionGeneration = await captureTransitionDirectoryGenerationFromHandle(pendingSetup.generationHandle);
+				await SessionStateLockTestHooks.beforeTransitionSetupLstat?.(transitionDir);
 				await pendingSetup.generationHandle.close();
 				pendingSetup.generationHandle = undefined;
 			}
