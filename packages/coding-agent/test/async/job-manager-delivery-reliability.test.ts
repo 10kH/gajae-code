@@ -5,6 +5,8 @@ import {
 	registerOwnedRegistration,
 	resetTerminalAbortRegistriesForTests,
 } from "@gajae-code/coding-agent/session/terminal-abort";
+import { logger } from "@gajae-code/utils";
+import { JobsObserver } from "../../src/modes/jobs-observer";
 
 async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
@@ -336,6 +338,53 @@ describe("AsyncJobManager delivery reliability", () => {
 			expect(second?.recordedAt).toBe(first?.recordedAt);
 		} finally {
 			await manager.dispose({ timeoutMs: 5_000 });
+		}
+	});
+
+	test("keeps the newest overflow owner visible after the owner bucket bound", async () => {
+		let now = 1_000_000;
+		const realNow = Date.now;
+		const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
+		Date.now = () => {
+			now += 1_000_000;
+			return now;
+		};
+		const ownerCount = 3;
+		const manager = new AsyncJobManager({
+			maxRunningJobs: 60,
+			retentionMs: 60_000,
+			maxDeadLetterOverflowOwners: 2,
+			onJobComplete: async () => {
+				throw new Error("overflow owner delivery failed");
+			},
+		});
+
+		try {
+			for (let ownerIndex = 0; ownerIndex < ownerCount; ownerIndex += 1) {
+				const ownerId = `overflow-owner-${ownerIndex}`;
+				for (let jobIndex = 0; jobIndex < 51; jobIndex += 1) {
+					manager.register("bash", `${ownerId}-${jobIndex}`, async () => "payload", {
+						ownerId,
+						metadata: { backgrounded: true },
+					});
+				}
+				await Bun.sleep(500);
+			}
+			const latest = manager.getJobsSnapshot({ ownerId: "overflow-owner-2" }).deadLettered;
+			expect(latest.some(entry => entry.ownerId === "overflow-owner-2")).toBe(true);
+			const observer = new JobsObserver(manager, "overflow-owner-2");
+			try {
+				expect(observer.getSnapshot().worstState).toBe("failed");
+				expect(observer.getSnapshot().failedUnacknowledged).toBe(true);
+			} finally {
+				observer.dispose();
+			}
+		} finally {
+			await manager.dispose({ timeoutMs: 5_000 });
+			Date.now = realNow;
+			warnSpy.mockRestore();
+			errorSpy.mockRestore();
 		}
 	});
 

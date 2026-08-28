@@ -250,6 +250,7 @@ export interface AsyncJobManagerOptions {
 	onJobComplete: (jobId: string, text: string, job?: AsyncJob) => void | Promise<void>;
 	maxRunningJobs?: number;
 	retentionMs?: number;
+	maxDeadLetterOverflowOwners?: number;
 }
 
 export interface AsyncJobAdmission {
@@ -649,6 +650,7 @@ export class AsyncJobManager {
 	#pendingAdmissions = 0;
 	readonly #admissions = new WeakMap<AsyncJobAdmission, boolean>();
 	readonly #retentionMs: number;
+	readonly #maxDeadLetterOverflowOwners: number;
 	#deliveryLoop: Promise<void> | undefined;
 	#disposed = false;
 	#disposing = false;
@@ -977,6 +979,10 @@ export class AsyncJobManager {
 		this.#onJobComplete = options.onJobComplete;
 		this.#maxRunningJobs = Math.max(1, Math.floor(options.maxRunningJobs ?? DEFAULT_MAX_RUNNING_JOBS));
 		this.#retentionMs = Math.max(0, Math.floor(options.retentionMs ?? DEFAULT_RETENTION_MS));
+		this.#maxDeadLetterOverflowOwners = Math.max(
+			1,
+			Math.floor(options.maxDeadLetterOverflowOwners ?? MAX_DEAD_LETTER_OVERFLOW_OWNERS),
+		);
 	}
 
 	/**
@@ -3075,13 +3081,36 @@ export class AsyncJobManager {
 	}
 
 	#recordDeadLetterOverflow(ownerId: string | undefined): void {
-		const key =
-			this.#deadLetterOverflowByOwner.has(ownerId) ||
-			this.#deadLetterOverflowByOwner.size < MAX_DEAD_LETTER_OVERFLOW_OWNERS
-				? ownerId
-				: undefined;
-		this.#deadLetterOverflowByOwner.set(key, (this.#deadLetterOverflowByOwner.get(key) ?? 0) + 1);
-		if (!this.#deadLetterOverflowRecordedAt.has(key)) this.#deadLetterOverflowRecordedAt.set(key, Date.now());
+		if (ownerId === undefined || this.#deadLetterOverflowByOwner.has(ownerId)) {
+			this.#deadLetterOverflowByOwner.set(ownerId, (this.#deadLetterOverflowByOwner.get(ownerId) ?? 0) + 1);
+			if (!this.#deadLetterOverflowRecordedAt.has(ownerId))
+				this.#deadLetterOverflowRecordedAt.set(ownerId, Date.now());
+			return;
+		}
+
+		const namedOwners = [...this.#deadLetterOverflowByOwner.keys()].filter((key): key is string => key !== undefined);
+		if (namedOwners.length >= this.#maxDeadLetterOverflowOwners) {
+			const oldestOwner = namedOwners[0];
+			if (oldestOwner !== undefined) {
+				const oldestCount = this.#deadLetterOverflowByOwner.get(oldestOwner) ?? 0;
+				const oldestRecordedAt = this.#deadLetterOverflowRecordedAt.get(oldestOwner);
+				this.#deadLetterOverflowByOwner.delete(oldestOwner);
+				this.#deadLetterOverflowRecordedAt.delete(oldestOwner);
+				this.#deadLetterOverflowByOwner.set(
+					undefined,
+					(this.#deadLetterOverflowByOwner.get(undefined) ?? 0) + oldestCount,
+				);
+				const unknownRecordedAt = this.#deadLetterOverflowRecordedAt.get(undefined);
+				if (oldestRecordedAt !== undefined) {
+					this.#deadLetterOverflowRecordedAt.set(
+						undefined,
+						unknownRecordedAt === undefined ? oldestRecordedAt : Math.min(unknownRecordedAt, oldestRecordedAt),
+					);
+				}
+			}
+		}
+		this.#deadLetterOverflowByOwner.set(ownerId, 1);
+		this.#deadLetterOverflowRecordedAt.set(ownerId, Date.now());
 	}
 
 	#recordDeadLetterOrEvicted(delivery: AsyncJobDelivery): void {
