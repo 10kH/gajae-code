@@ -7806,6 +7806,8 @@ export class AgentSession {
 		workerIntegrationSettled = false,
 		scope?: AttemptScopeRef,
 	): Promise<void> {
+		const activeAttemptScopeAtEvent = this.#activeAttemptScope;
+		const activeSdkRunTokenAtEvent = this.#activeSdkRunToken;
 		if (event.type === "agent_end" && !workerIntegrationSettled) {
 			await this.#flushWorkerIntegrationForAgentEnd();
 		}
@@ -7827,9 +7829,11 @@ export class AgentSession {
 			// unrelated enqueue.
 			this.yieldQueue.rearmIdle();
 			const isActiveAttempt =
-				deliveryScope === undefined ||
-				this.#activeAttemptScope === undefined ||
-				deliveryScope === this.#activeAttemptScope;
+			const isActiveAttempt =
+				deliveryScope === undefined
+					? this.#activeAttemptScope === activeAttemptScopeAtEvent &&
+						this.#activeSdkRunToken === activeSdkRunTokenAtEvent
+					: deliveryScope === activeAttemptScopeAtEvent;
 			if (this.#foldStopRequested) {
 				this.#foldStopRequested = false;
 				this.agent.setSteeringAdmissionFence(undefined);
