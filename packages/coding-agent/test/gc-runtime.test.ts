@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import type { PathLike } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -412,6 +413,43 @@ describe("runGjcGcCommand", () => {
 		expect(result.stderr).toContain(`${missingRoot}: missing_root`);
 		expect(result.stdout).toBe("");
 		expect(pruned).toBe(0);
+	});
+
+	test("aborts ordinary prune when an explicit empty-delete root races after preflight", async () => {
+		const root = await fs.mkdtemp(path.join(perTestAgentDir, "raced-empty-delete-root-"));
+		const replacement = `${root}-replacement`;
+		let readdirCalls = 0;
+		const realReaddir = fs.readdir;
+		const readdirSpy = spyOn(fs, "readdir");
+		readdirSpy.mockImplementation((async (target: PathLike) => {
+			const entries = await realReaddir(target);
+			if (String(target) === root && readdirCalls++ === 0) await fs.rename(root, replacement);
+			return entries;
+		}) as unknown as typeof fs.readdir);
+		let pruned = 0;
+		const adapter = fakeAdapter("harness_leases", [record("harness_leases")], async () => {
+			pruned += 1;
+			return { removed: true };
+		});
+		try {
+			const result = await runGjcGcCommand(
+				["--prune", "--empty-delete-receipts", "--root", root, "--json"],
+				perTestAgentDir,
+				{},
+				[adapter],
+			);
+			expect(result.status).toBe(1);
+			expect(pruned).toBe(0);
+			const report = JSON.parse(result.stdout) as {
+				dry_run: boolean;
+				empty_delete_receipts?: { errors: string[] };
+			};
+			expect(report.dry_run).toBe(true);
+			expect(report.empty_delete_receipts?.errors).toContain(`${root}: missing_root`);
+		} finally {
+			readdirSpy.mockRestore();
+			await fs.rm(replacement, { recursive: true, force: true });
+		}
 	});
 
 	test("valid explicit empty-delete roots preserve ordinary prune behavior", async () => {

@@ -293,6 +293,55 @@ describe("empty .gjc-delete-* latch", () => {
 		}
 	});
 
+	it("Test 1 Windows authority: ctime-only candidate replacement fails closed", async () => {
+		const dir = await tempRoot("gjc-scan-win-ctime-race-");
+		const candidate = path.join(dir, "candidate.json");
+		ProjectionScanTestHooks.platform = "win32";
+		await fs.writeFile(candidate, JSON.stringify({ session_id: "source" }));
+
+		const realLstat = fs.lstat as unknown as (file: PathLike, options?: unknown) => Promise<BigIntStats>;
+		const lstatSpy = spyOn(fs, "lstat");
+		let candidateLstatCalls = 0;
+		// Leave the enumerated identity without ctime so this exercises the
+		// before/opened and relinked/opened Windows checks, not sameProjectionFile.
+		const cloneStatWithCtime = (stat: BigIntStats, ctimeNs?: bigint): BigIntStats => {
+			const clone = Object.create(Object.getPrototypeOf(stat)) as BigIntStats;
+			Object.assign(clone, stat);
+			if (ctimeNs === undefined) delete (clone as unknown as { ctimeNs?: bigint }).ctimeNs;
+			else clone.ctimeNs = ctimeNs;
+			return clone;
+		};
+		lstatSpy.mockImplementation((async (file: PathLike, options: unknown) => {
+			const stat = await realLstat(file, options);
+			if (String(file) !== candidate) return stat;
+			const call = candidateLstatCalls++;
+			return cloneStatWithCtime(stat, call === 0 ? undefined : call === 1 ? 1n : 2n);
+		}) as unknown as typeof fs.lstat);
+		const realOpen = fs.open;
+		const openSpy = spyOn(fs, "open");
+		openSpy.mockImplementation((async (file: PathLike, flags: unknown) => {
+			if (String(file) !== candidate) return realOpen(file, flags as never);
+			const stat = await realLstat(file, { bigint: true });
+			const opened = cloneStatWithCtime(stat, 2n);
+			return {
+				stat: async () => opened,
+				readFile: async () => JSON.stringify({ session_id: "source" }),
+				close: async () => {},
+			} as unknown as fs.FileHandle;
+		}) as unknown as typeof fs.open);
+		try {
+			const scan = await listCoordinatorJsonFiles(dir);
+			expect(scan.values).toEqual([]);
+			expect(scan.parsed).toBe(0);
+			expect(scan.raced).toBe(1);
+			expect(scan.incomplete).toBe(true);
+			expect(scan.capped).toBe(true);
+		} finally {
+			openSpy.mockRestore();
+			lstatSpy.mockRestore();
+		}
+	});
+
 	it("Test 1 Windows authority: candidate reparse replacement fails closed", async () => {
 		const dir = await tempRoot("gjc-scan-win-reparse-race-");
 		const candidate = path.join(dir, "candidate.json");

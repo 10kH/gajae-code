@@ -133,7 +133,8 @@ async function readProjectionFileSafe(file: string, encoding: "utf8", expected?:
 				before.ino !== opened.ino ||
 				before.nlink !== opened.nlink ||
 				before.size !== opened.size ||
-				before.mtimeNs !== opened.mtimeNs
+				before.mtimeNs !== opened.mtimeNs ||
+				before.ctimeNs !== opened.ctimeNs
 			)
 				throw new ProjectionScanRaceError("candidate changed while opening");
 			const relinked = await fs.lstat(file, { bigint: true });
@@ -144,7 +145,8 @@ async function readProjectionFileSafe(file: string, encoding: "utf8", expected?:
 				relinked.ino !== opened.ino ||
 				relinked.nlink !== opened.nlink ||
 				relinked.size !== opened.size ||
-				relinked.mtimeNs !== opened.mtimeNs
+				relinked.mtimeNs !== opened.mtimeNs ||
+				relinked.ctimeNs !== opened.ctimeNs
 			)
 				throw new ProjectionScanRaceError("candidate changed before read");
 		}

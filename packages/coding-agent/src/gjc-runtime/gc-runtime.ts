@@ -31,7 +31,12 @@ import {
 	removeCanonicalBlob,
 } from "../session/blob-store";
 import { FileSessionStorage, probeSessionRetirement, retireSessionTranscript } from "../session/session-storage";
-import { type EmptyDeleteGcReport, runEmptyDeleteGc } from "./empty-delete-gc";
+import {
+	collectEmptyDeleteReceipts,
+	type EmptyDeleteGcRecord,
+	type EmptyDeleteGcReport,
+	runEmptyDeleteGc,
+} from "./empty-delete-gc";
 import { buildGcReportText } from "./gc-render";
 import { collectSessionScopeUsage, type GcSessionScopeUsage, shouldReportSessionScope } from "./gc-session-scope";
 
@@ -468,6 +473,36 @@ async function preflightEmptyDeleteRoot(root: string): Promise<void> {
 }
 
 /**
+ * Collect every explicit empty-delete root once before starting any destructive
+ * operation. The second pass reuses those identities so a later root race cannot
+ * leave an earlier root pruned before the race is discovered.
+ */
+async function collectEmptyDeleteReceiptsForGc(
+	roots: string[],
+): Promise<{ report: EmptyDeleteGcReport; records: Map<string, EmptyDeleteGcRecord[]> }> {
+	const collected = new Map<string, EmptyDeleteGcRecord[]>();
+	const collect = async (root: string): Promise<EmptyDeleteGcRecord[]> => {
+		const records = await collectEmptyDeleteReceipts(root);
+		collected.set(root, records);
+		return records.map(record => ({
+			...record,
+			identity: record.identity ? { ...record.identity } : undefined,
+			retainedPaths: record.retainedPaths ? { ...record.retainedPaths } : undefined,
+		}));
+	};
+	const report = await runEmptyDeleteGc({ roots, prune: false }, { collect });
+	return { report, records: collected };
+}
+
+function cloneEmptyDeleteRecords(records: EmptyDeleteGcRecord[]): EmptyDeleteGcRecord[] {
+	return records.map(record => ({
+		...record,
+		identity: record.identity ? { ...record.identity } : undefined,
+		retainedPaths: record.retainedPaths ? { ...record.retainedPaths } : undefined,
+	}));
+}
+
+/**
  * Locate and measure the managed scope for `cwd`.
  *
  * Resolution is read-only (it never prepares or writes a scope), and any
@@ -578,9 +613,33 @@ export async function runGjcGcCommand(
 			return { stdout: "", stderr: `gjc gc: ${message}\n`, status: 2 };
 		}
 	}
+	let emptyDeleteReceipts: EmptyDeleteGcReport | undefined;
+	let emptyDeleteRecords: Map<string, EmptyDeleteGcRecord[]> | undefined;
+	if (parsed.emptyDeleteReceipts) {
+		// Discovery is deliberately read-only and covers every root before either the
+		// empty-delete unlink or an ordinary --prune adapter can mutate anything.
+		const collected = await collectEmptyDeleteReceiptsForGc(emptyDeleteRoots);
+		emptyDeleteReceipts = collected.report;
+		emptyDeleteRecords = collected.records;
+		if (parsed.prune && emptyDeleteReceipts.errors.length === 0) {
+			emptyDeleteReceipts = await runEmptyDeleteGc(
+				{ roots: emptyDeleteRoots, prune: true },
+				{
+					collect: async root => {
+						const records = emptyDeleteRecords?.get(root);
+						if (!records) throw new Error(`${root}: empty_delete_collection_missing`);
+						return cloneEmptyDeleteRecords(records);
+					},
+				},
+			);
+		}
+	}
 	const resolvedAdapters = adapters ?? (await defaultGcAdapters());
 	const ctx: GcContext = { probe: gcPidProbe, force: parsed.prune, env, cwd };
-	const report = await collectGcReport(resolvedAdapters, ctx, parsed.prune);
+	// A failed explicit empty-delete discovery or cleanup is a safety gate: report
+	// ordinary candidates, but never perform their destructive prune in that run.
+	const ordinaryPrune = parsed.prune && (emptyDeleteReceipts?.errors.length ?? 0) === 0;
+	const report = await collectGcReport(resolvedAdapters, ctx, ordinaryPrune);
 	report.operation = parsed.repairSessionIndex ? "repair_session_index" : parsed.prune ? "prune" : "dry_run";
 	report.session_index = await collectSessionIndexHealth(parsed.repairSessionIndex, resolveGcAgentDir(env));
 	if (parsed.disk) {
@@ -588,12 +647,10 @@ export async function runGjcGcCommand(
 			agentDir: resolveGcAgentDir(env),
 			env,
 			policy: resolveGcDiskPolicy(diskPolicy),
-			prune: parsed.prune,
+			prune: ordinaryPrune,
 		});
 	}
-	if (parsed.emptyDeleteReceipts) {
-		report.empty_delete_receipts = await runEmptyDeleteGc({ roots: emptyDeleteRoots, prune: parsed.prune });
-	}
+	if (emptyDeleteReceipts) report.empty_delete_receipts = emptyDeleteReceipts;
 	const scopeUsage = await collectGcSessionScope(cwd, resolveGcAgentDir(env));
 	if (scopeUsage && shouldReportSessionScope(scopeUsage)) report.session_scope = scopeUsage;
 	const sessionIndexFailed =
