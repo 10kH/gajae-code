@@ -1,5 +1,6 @@
 import * as path from "node:path";
 import { getAgentDir } from "@gajae-code/utils";
+import { ConfigFile } from "../config/config-file";
 import {
 	type AcceptedModelPresetRegistry,
 	loadAcceptedModelPresetRegistryAsync,
@@ -7,7 +8,6 @@ import {
 import { UnknownModelProfileError, validateModelProfileName } from "../config/model-profile-contract";
 import { mergeModelProfiles } from "../config/model-profiles";
 import { type ModelsConfig, ModelsConfigSchema } from "../config/models-config-schema";
-import { ConfigFile } from "../config/config-file";
 
 export interface CoordinatorModelProfile {
 	name: string;

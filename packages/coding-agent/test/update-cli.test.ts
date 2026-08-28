@@ -1137,7 +1137,7 @@ describe("update-cli install lock", () => {
 		expect(source).toContain(".gjc-install.lock");
 		expect(source).not.toContain("No checksum asset on");
 		expect(source).not.toContain(".update-lock");
-		expect(source).toContain("Remove ${lockFile} only after confirming");
+		expect(source).toContain(`Remove ${String.fromCharCode(36)}{lockFile} only after confirming`);
 	});
 });
 
