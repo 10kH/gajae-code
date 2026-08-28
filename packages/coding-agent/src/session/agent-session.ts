@@ -11472,9 +11472,10 @@ export class AgentSession {
 					options?.onPreflightAccepted?.();
 				},
 			});
+			const terminalAttemptScope = this.#activeAttemptScope ?? promptAttemptScope;
 			if (
-				promptAttemptScope !== undefined &&
-				this.#skipPostPromptRecoveryWaitByAttemptScope.delete(promptAttemptScope)
+				terminalAttemptScope !== undefined &&
+				this.#skipPostPromptRecoveryWaitByAttemptScope.delete(terminalAttemptScope)
 			) {
 				skipPostPromptRecoveryWait = true;
 			}
@@ -20339,7 +20340,14 @@ export class AgentSession {
 						this.#resolveRetry();
 						return;
 					}
-					await this.agent.continue(this.#managedFallbackPromptOptions());
+					await this.agent.continue({
+						...this.#managedFallbackPromptOptions(),
+						onRunAccepted: (handle: AttemptRunHandle) => {
+							this.#acceptRunHandle(handle);
+							if (this.#activeSdkRunToken !== undefined)
+								this.#sdkRunTokensByAttemptScope.set(handle.scope, this.#activeSdkRunToken);
+						},
+					});
 					return;
 				} catch (error) {
 					const attempt = this.#retryAttempt;
