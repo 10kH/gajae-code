@@ -61,6 +61,10 @@ const TRANSIENT_LOCK_ERROR_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
 interface TransitionDirectoryGeneration {
 	dev: bigint;
 	ino: bigint;
+	mode: bigint;
+	nlink: bigint;
+	mtimeNs: bigint;
+	ctimeNs: bigint;
 }
 
 interface PendingTransitionRelease {
@@ -1030,7 +1034,14 @@ async function releaseTransitionClaim(
 		if (owner.token)
 			pendingTransitionReleases.set(transitionDir, {
 				token: owner.token,
-				generation: { dev: transitionStat.dev, ino: transitionStat.ino },
+				generation: {
+					dev: transitionStat.dev,
+					ino: transitionStat.ino,
+					mode: transitionStat.mode,
+					nlink: transitionStat.nlink,
+					mtimeNs: transitionStat.mtimeNs,
+					ctimeNs: transitionStat.ctimeNs,
+				},
 			});
 		throw error;
 	}
@@ -1088,7 +1099,15 @@ async function recoverPendingTransitionRelease(transitionDir: string): Promise<b
 		// A successor may have replaced the claim after the original release failed.
 		// Never let this cleanup remove that new generation, even if its owner sidecar
 		// happens to carry the same released token.
-		if (!current.isDirectory() || current.dev !== pending.generation.dev || current.ino !== pending.generation.ino) {
+		if (
+			!current.isDirectory() ||
+			current.dev !== pending.generation.dev ||
+			current.ino !== pending.generation.ino ||
+			current.mode !== pending.generation.mode ||
+			current.nlink !== pending.generation.nlink ||
+			current.mtimeNs !== pending.generation.mtimeNs ||
+			current.ctimeNs !== pending.generation.ctimeNs
+		) {
 			pendingTransitionReleases.delete(transitionDir);
 			return false;
 		}
@@ -1104,6 +1123,18 @@ async function recoverPendingTransitionRelease(transitionDir: string): Promise<b
 				!captured.snapshot ||
 				captured.snapshot.rootDev !== String(current.dev) ||
 				captured.snapshot.rootIno !== String(current.ino)
+			) {
+				pendingTransitionReleases.delete(transitionDir);
+				return false;
+			}
+			const capturedRoot = captured.snapshot.entries.find(entry => entry.relativePath === "");
+			if (
+				!capturedRoot ||
+				capturedRoot.dev !== String(pending.generation.dev) ||
+				capturedRoot.ino !== String(pending.generation.ino) ||
+				capturedRoot.nlink !== String(pending.generation.nlink) ||
+				capturedRoot.mtimeNs !== String(pending.generation.mtimeNs) ||
+				capturedRoot.ctimeNs !== String(pending.generation.ctimeNs)
 			) {
 				pendingTransitionReleases.delete(transitionDir);
 				return false;
