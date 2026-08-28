@@ -313,6 +313,8 @@ describe("BashTool ACP terminal fold", () => {
 
 		const result = await tool.execute("call-nul-heavy", { command: "printf nul-heavy" }, undefined, () => {});
 		expect(result.details?.terminalId).toBe("term-nul-heavy");
+		const text = result.content.map(part => ("text" in part ? part.text : "")).join("\n");
+		expect(text).toContain("tail");
 	});
 
 	it("appends only the new suffix from a growing cumulative ACP snapshot", async () => {
@@ -339,6 +341,32 @@ describe("BashTool ACP terminal fold", () => {
 		if (!jobId) throw new Error("expected a folded job id");
 		await waitFor(() => h.manager.readOutputSince(jobId, 0)?.text === "abcd");
 		expect(h.manager.readOutputSince(jobId, 0)?.text).toBe("abcd");
+	});
+
+	it("does not duplicate an unchanged cumulative ACP snapshot", async () => {
+		const exit = Promise.withResolvers<{ exitCode: number; signal: null }>();
+		let reads = 0;
+		const handle: ClientBridgeTerminalHandle = {
+			terminalId: "term-repeated-snapshot",
+			waitForExit: () => exit.promise,
+			currentOutput: async () => ({ output: reads++ === 0 ? "abc" : "abc", truncated: false }),
+			kill: async () => {},
+			release: async () => {},
+		};
+		const bridge: ClientBridge = { capabilities: { terminal: true }, createTerminal: async () => handle };
+		const h = makeHarness(bridge);
+		const tool = new BashTool(h.session);
+		const resultPromise = tool.execute("call-repeated-snapshot", { command: "sleep 30" }, undefined, () => {});
+
+		await waitFor(() => reads === 1);
+		await waitFor(() => h.adapters.length === 1);
+		foldVia(h.adapters[0]!);
+		exit.resolve({ exitCode: 0, signal: null });
+		const result = await resultPromise;
+		const jobId = result.details?.async?.jobId;
+		if (!jobId) throw new Error("expected a folded job id");
+		await waitFor(() => h.manager.readOutputSince(jobId, 0)?.text === "abc");
+		expect(h.manager.readOutputSince(jobId, 0)?.text).toBe("abc");
 	});
 
 	it("retains polled ACP output without a job manager", async () => {
@@ -389,6 +417,37 @@ describe("BashTool ACP terminal fold", () => {
 		const text = result.content.map(part => ("text" in part ? part.text : "")).join("\n");
 		expect(text).toContain("normal-exit diagnostics");
 		expect(text).toContain("Terminal output recovery failed");
+	});
+
+	it("retains truncation state from an empty ACP snapshot during recovery", async () => {
+		let outputReads = 0;
+		const exit = Promise.withResolvers<{ exitCode: number; signal: null }>();
+		const handle: ClientBridgeTerminalHandle = {
+			terminalId: "term-empty-truncated-recovery",
+			waitForExit: () => exit.promise,
+			currentOutput: async () => {
+				outputReads += 1;
+				if (outputReads === 1) return { output: "", truncated: true };
+				throw new Error("terminal/output failed after empty truncated snapshot");
+			},
+			kill: async () => {},
+			release: async () => {},
+		};
+		const bridge: ClientBridge = { capabilities: { terminal: true }, createTerminal: async () => handle };
+		const h = makeHarness(bridge);
+		const tool = new BashTool({ ...h.session, getAsyncJobManager: undefined } as unknown as ToolSession);
+
+		const resultPromise = tool.execute(
+			"call-empty-truncated-recovery",
+			{ command: "echo done" },
+			undefined,
+			() => {},
+		);
+		await waitFor(() => outputReads === 1);
+		exit.resolve({ exitCode: 0, signal: null });
+		const result = await resultPromise;
+		const text = result.content.map(part => ("text" in part ? part.text : "")).join("\n");
+		expect(text).toContain("output truncated");
 	});
 
 	it("retains polled ACP output when abort races final recovery", async () => {

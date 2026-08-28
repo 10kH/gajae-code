@@ -408,16 +408,11 @@ describe("AsyncJobManager delivery reliability", () => {
 
 	test("parked fold delivery remains visible until receipt replay", async () => {
 		const manager = new AsyncJobManager({ onJobComplete: () => {}, retentionMs: 0 });
-		let resolveJob!: (value: string) => void;
-		const jobId = manager.register(
-			"bash",
-			"parked fold",
-			() => new Promise<string>(resolve => (resolveJob = resolve)),
-			{
-				id: "parked-fold",
-				metadata: { backgrounded: true },
-			},
-		);
+		const parkedJob = Promise.withResolvers<string>();
+		const jobId = manager.register("bash", "parked fold", () => parkedJob.promise, {
+			id: "parked-fold",
+			metadata: { backgrounded: true },
+		});
 		const job = manager.getJob(jobId);
 		if (!job) throw new Error("expected parked job");
 		manager.retainParkedDelivery(job, "parked output");
@@ -436,7 +431,7 @@ describe("AsyncJobManager delivery reliability", () => {
 		expect(manager.getJobsSnapshot().jobs).toContainEqual(
 			expect.objectContaining({ id: jobId, deliveryState: "pending" }),
 		);
-		resolveJob("done");
+		parkedJob.resolve("done");
 		await manager.waitForAll();
 		await manager.dispose({ timeoutMs: 250 });
 	});
