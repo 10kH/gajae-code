@@ -3825,6 +3825,7 @@ export class AgentSession {
 		let extensionDelivery: Promise<void> | undefined;
 		const releaseLease = () => {
 			if (!lease) return;
+			this.#deferredAgentEndLeases.delete(pending);
 			if (this.#postPromptLeases.get(lease.resourceRunId) === lease) {
 				this.#postPromptLeases.delete(lease.resourceRunId);
 			}
@@ -5367,10 +5368,10 @@ export class AgentSession {
 					this.#postPromptLeases.set(eventLease.resourceRunId, eventLease);
 				if (eventLease) {
 					await this.#runResourceLeaseContext.run(eventLease, () =>
-						this.#handleAgentEvent(event, activePromptHandle, canonicalAdmission),
+						this.#handleAgentEvent(event, activePromptHandle, canonicalAdmission, eventLease),
 					);
 				} else {
-					await this.#handleAgentEvent(event, activePromptHandle, canonicalAdmission);
+					await this.#handleAgentEvent(event, activePromptHandle, canonicalAdmission, undefined);
 				}
 			} catch (error) {
 				logger.warn("Agent event handler failed", { event: event.type, error: String(error) });
@@ -5378,11 +5379,19 @@ export class AgentSession {
 				canonicalAdmission?.release();
 				if (eventLease) {
 					const pendingAgentEnd =
-						event.type === "agent_end" && !maintenanceCheckpoint && this.#pendingAgentEndEmit === event
+						event.type === "agent_end" &&
+						!maintenanceCheckpoint &&
+						(this.#pendingAgentEndEmit === event || this.#deferredAgentEndLeases.has(event))
 							? this.#pendingAgentEndEmit
 							: undefined;
 					if (pendingAgentEnd) {
 						this.#deferredAgentEndLeases.set(pendingAgentEnd, eventLease);
+					} else if (
+						event.type === "agent_end" &&
+						!maintenanceCheckpoint &&
+						this.#deferredAgentEndLeases.has(event)
+					) {
+						// Fast publication took ownership of the lease before the handler unwound.
 					} else {
 						if (event.type === "agent_end" && this.#postPromptLeases.get(eventLease.resourceRunId) === eventLease)
 							this.#postPromptLeases.delete(eventLease.resourceRunId);
@@ -5447,7 +5456,7 @@ export class AgentSession {
 		}
 	}
 
-	async #emitSessionEvent(event: AgentSessionEvent): Promise<void> {
+	async #emitSessionEvent(event: AgentSessionEvent, eventLease?: RunResourceProducerLease): Promise<void> {
 		const attemptScope = (event as AgentSessionEvent & { scope?: AttemptScope }).scope;
 		if (event.type === "turn_start") {
 			this.#extensionTurnGeneration++;
@@ -5489,7 +5498,8 @@ export class AgentSession {
 			this.#pendingAgentEndContinuationHolds.size === 0 &&
 			this.#pendingAgentEndEmit === undefined
 		) {
-			this.#startAgentEndPublication(event);
+			if (eventLease) this.#deferredAgentEndLeases.set(event, eventLease);
+			this.#startAgentEndPublication(event, eventLease);
 			return;
 		}
 		if (event.type === "agent_end" && (this.#livePromptsInFlight() > 0 || this.#agentEventHandlersInFlight > 0)) {
@@ -5601,6 +5611,7 @@ export class AgentSession {
 		event: AgentEvent,
 		activePromptHandle?: string,
 		canonicalAdmission?: CanonicalMessageAdmission,
+		eventLease?: RunResourceProducerLease,
 	): Promise<void> => {
 		const attemptScope = (event as AgentEvent & { scope?: AttemptScope }).scope;
 
@@ -5940,7 +5951,7 @@ export class AgentSession {
 			});
 		}
 
-		await this.#emitSessionEvent(displayEvent);
+		await this.#emitSessionEvent(displayEvent, eventLease);
 		if (event.type === "message_end" && event.message.role === "assistant") {
 			this.#assistantAttemptScopes.set(event.message, {
 				scope: attemptScope,
