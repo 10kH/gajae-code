@@ -228,19 +228,8 @@ function fileLockDirIdentityFromPathState(state: LockInfoPathState, bytes: strin
 
 /** Capture the exact root/info identity that a later stale verdict may authorize. */
 async function captureFileLockDirIdentity(lockDir: string): Promise<GenericFileLockDirIdentity | null> {
-	const before = await lockInfoPathState(lockDir);
-	if (!before) return null;
-	let bytes: string | null;
-	try {
-		bytes = await readLockInfoBytes(lockDir);
-	} catch (error) {
-		if (isEnoent(error)) return null;
-		throw error;
-	}
-	if (bytes === null) return null;
-	const after = await lockInfoPathState(lockDir);
-	if (!after || !sameLockInfoPathState(before, after)) return null;
-	return fileLockDirIdentityFromPathState(after, bytes);
+	const observation = await readLockInfoObservation(lockDir);
+	return observation ? fileLockDirIdentityFromPathState(observation.state, observation.bytes) : null;
 }
 
 /** Resolve parent aliases without following the mutable lock-dir final component. */
@@ -268,7 +257,9 @@ const LOCK_INFO_OPEN_FLAGS =
  * component symlinks on POSIX; lstat/fstat/path revalidation supplies the same
  * rejection on Windows, where O_NOFOLLOW is unavailable.
  */
-async function readLockInfoBytes(lockPath: string): Promise<string | null> {
+type LockInfoObservation = { bytes: string; state: LockInfoPathState };
+
+async function readLockInfoObservation(lockPath: string): Promise<LockInfoObservation | null> {
 	const infoPath = path.join(lockPath, "info");
 	const initial = await lockInfoPathState(lockPath);
 	if (!initial) return null;
@@ -296,10 +287,14 @@ async function readLockInfoBytes(lockPath: string): Promise<string | null> {
 			!sameLockInfoPathState(initial, afterPath)
 		)
 			return null;
-		return bytes.toString("utf8");
+		return { bytes: bytes.toString("utf8"), state: afterPath };
 	} finally {
 		await handle?.close().catch(() => undefined);
 	}
+}
+
+async function readLockInfoBytes(lockPath: string): Promise<string | null> {
+	return (await readLockInfoObservation(lockPath))?.bytes ?? null;
 }
 
 async function readLockInfo(lockPath: string): Promise<LockInfo | null> {
@@ -355,13 +350,26 @@ function parseLockInfoBytes(bytes: string): LockInfo | null {
 }
 
 /** @internal */
+export interface FileLockGcObservation {
+	info: FileLockOwnerToken;
+	bytes: string;
+	identity: GenericFileLockDirIdentity;
+}
+
+/** Capture owner bytes and the identity proving those exact bytes came from this tree. */
+export async function readFileLockObservationForGc(lockDir: string): Promise<FileLockGcObservation | null> {
+	const observation = await readLockInfoObservation(lockDir);
+	if (!observation) return null;
+	const info = parseLockInfoBytes(observation.bytes);
+	if (!info) return null;
+	const identity = fileLockDirIdentityFromPathState(observation.state, observation.bytes);
+	fileLockDirIdentities.set(info, identity);
+	return { info, bytes: observation.bytes, identity };
+}
+
+/** @internal */
 export async function readFileLockInfoForGc(lockDir: string): Promise<FileLockOwnerToken | null> {
-	const info = await readLockInfo(lockDir);
-	if (info) {
-		const identity = await captureFileLockDirIdentity(lockDir);
-		if (identity) fileLockDirIdentities.set(info, identity);
-	}
-	return info;
+	return (await readFileLockObservationForGc(lockDir))?.info ?? null;
 }
 
 /** Owner identity stamped into a `<file>.lock/info` record. */

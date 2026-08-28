@@ -3358,84 +3358,6 @@ pub(crate) mod platform {
 		Err("interrupted")
 	}
 
-	#[cfg(any(target_os = "linux", target_os = "macos"))]
-	/// Directory equivalent of `renameat2(RENAME_NOREPLACE)` for filesystems
-	/// that reject rename flags. `mkdirat` first claims the destination name,
-	/// then the plain rename moves the staged tree over that caller-owned empty
-	/// directory. The placeholder is removed only when the rename reports no
-	/// namespace change.
-	fn rename_directory_no_replace(
-		source_parent_fd: libc::c_int,
-		source: &CString,
-		destination_parent_fd: libc::c_int,
-		destination: &CString,
-	) -> Result<(), &'static str> {
-		// SAFETY: destination_parent_fd is a live descriptor and destination is a
-		// NUL-terminated component owned by this call.
-		if unsafe { libc::mkdirat(destination_parent_fd, destination.as_ptr(), 0o700) } != 0 {
-			return match std::io::Error::last_os_error().raw_os_error() {
-				Some(libc::EEXIST) => Err("quarantine_collision"),
-				Some(libc::EACCES | libc::EPERM) => Err("permission_denied"),
-				_ => Err("io_error"),
-			};
-		}
-		// Pin the placeholder inode so failure cleanup can never remove an empty
-		// successor that replaced our claimed name while the plain rename ran.
-		let mut placeholder: libc::stat = unsafe { std::mem::zeroed() };
-		if unsafe {
-			libc::fstatat(
-				destination_parent_fd,
-				destination.as_ptr(),
-				&mut placeholder,
-				libc::AT_SYMLINK_NOFOLLOW,
-			)
-		} != 0 || placeholder.st_mode & libc::S_IFMT != libc::S_IFDIR
-		{
-			return Err("io_error");
-		}
-		// SAFETY: both parent descriptors and names remain live through the syscall.
-		if unsafe {
-			libc::renameat(
-				source_parent_fd,
-				source.as_ptr(),
-				destination_parent_fd,
-				destination.as_ptr(),
-			)
-		} == 0
-		{
-			return Ok(());
-		}
-		let error = std::io::Error::last_os_error();
-		// SAFETY: the placeholder is empty and owned by this call; a failed rename
-		// leaves it untouched, so AT_REMOVEDIR cannot remove a successor tree.
-		let mut current_placeholder: libc::stat = unsafe { std::mem::zeroed() };
-		let placeholder_matches = unsafe {
-			libc::fstatat(
-				destination_parent_fd,
-				destination.as_ptr(),
-				&mut current_placeholder,
-				libc::AT_SYMLINK_NOFOLLOW,
-			)
-		} == 0 && current_placeholder.st_mode & libc::S_IFMT
-			== libc::S_IFDIR
-			&& current_placeholder.st_dev == placeholder.st_dev
-			&& current_placeholder.st_ino == placeholder.st_ino;
-		if placeholder_matches {
-			// SAFETY: the placeholder is still the empty directory created above;
-			// a failed rename leaves it untouched, so AT_REMOVEDIR cannot remove a
-			// successor tree.
-			unsafe {
-				libc::unlinkat(destination_parent_fd, destination.as_ptr(), libc::AT_REMOVEDIR);
-			}
-		}
-		match error.raw_os_error() {
-			Some(libc::EXDEV) => Err("cross_device"),
-			Some(libc::EACCES | libc::EPERM) => Err("permission_denied"),
-			Some(libc::ENOENT) => Err("not_found"),
-			_ => Err("io_error"),
-		}
-	}
-
 	#[cfg(target_os = "linux")]
 	fn rename_exchange(
 		source_parent_fd: libc::c_int,
@@ -4461,16 +4383,6 @@ pub(crate) mod platform {
 			};
 			let result =
 				rename_no_replace(source_parent, destination_parent, &source_name, &destination_name);
-			#[cfg(any(target_os = "linux", target_os = "macos"))]
-			let result = match result {
-				Err("atomic_unavailable" | "invalid_request") => rename_directory_no_replace(
-					source_parent,
-					&source_name,
-					destination_parent,
-					&destination_name,
-				),
-				other => other,
-			};
 			unsafe {
 				libc::close(source_parent);
 				libc::close(destination_parent);

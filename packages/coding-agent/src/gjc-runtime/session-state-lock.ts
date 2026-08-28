@@ -83,10 +83,11 @@ function transitionGenerationFromStat(stat: fsSync.BigIntStats): TransitionDirec
 }
 
 interface PendingTransitionRelease {
+	phase: "setup" | "release";
 	token: string;
 	generation: TransitionDirectoryGeneration;
-	held: LockOwnerSnapshot;
-	releasedOwner: SessionStateLockOwner;
+	held?: LockOwnerSnapshot;
+	releasedOwner?: SessionStateLockOwner;
 	recoverable: boolean;
 	recovery?: Promise<boolean>;
 }
@@ -642,6 +643,10 @@ function sameLockOwnerSnapshot(left: LockOwnerSnapshot, right: LockOwnerSnapshot
 	);
 }
 
+function sameLockOwnerObject(left: LockOwnerSnapshot, right: LockOwnerSnapshot): boolean {
+	return left.dev === right.dev && left.ino === right.ino && left.nlink === right.nlink;
+}
+
 /**
  * What an identity-bound removal is allowed to conclude.
  *
@@ -1081,6 +1086,7 @@ async function releaseTransitionClaim(
 	// lstat/capture or a rewrite that commits bytes and then reports an I/O fault must not
 	// strand the claim without a generation-bound replay record.
 	pendingTransitionReleases.set(recoveryKey, {
+		phase: "release",
 		token: releasedOwner.token,
 		generation: transitionGeneration,
 		held,
@@ -1204,6 +1210,28 @@ async function recoverPendingTransitionRelease(transitionDir: string, recoveryKe
 			pendingTransitionReleases.delete(pendingKey);
 			return false;
 		}
+		if (pending.phase === "setup") {
+			try {
+				if (pending.held) {
+					const outcome = exactUnlinkOwnerRecord(ownerFile, pending.held);
+					if (outcome !== "removed" && outcome !== "absent") {
+						pendingTransitionReleases.delete(pendingKey);
+						return false;
+					}
+				} else if (await captureRegularLockOwner(ownerFile)) {
+					return false;
+				}
+				await removeTransitionDir(transitionDir);
+				pendingTransitionReleases.delete(pendingKey);
+				return true;
+			} catch {
+				return false;
+			}
+		}
+		if (!pending.held || !pending.releasedOwner) {
+			pendingTransitionReleases.delete(pendingKey);
+			return false;
+		}
 		try {
 			let pendingOwner = await captureRegularLockOwner(ownerFile);
 			if (!pendingOwner) return false;
@@ -1211,8 +1239,19 @@ async function recoverPendingTransitionRelease(transitionDir: string, recoveryKe
 			try {
 				parsed = JSON.parse(pendingOwner.bytes) as Partial<SessionStateLockOwner>;
 			} catch {
+				// A rewrite can truncate the held inode and fail before replacement
+				// bytes land. The malformed payload is still ours only when its object
+				// identity is the held inode; exact unlink then re-proves the current
+				// bytes before removing it. A different inode is a successor and stays.
+				if (!sameLockOwnerObject(pendingOwner, pending.held)) {
+					pendingTransitionReleases.delete(pendingKey);
+					return false;
+				}
+				const outcome = exactUnlinkOwnerRecord(ownerFile, pendingOwner);
+				if (outcome !== "removed" && outcome !== "absent") return false;
+				await removeTransitionDir(transitionDir);
 				pendingTransitionReleases.delete(pendingKey);
-				return false;
+				return true;
 			}
 			if (parsed.token !== pending.token || parsed.released !== true) {
 				// A rewrite may have failed before touching the inode. Retry it only when
@@ -1314,25 +1353,56 @@ async function withLockPathTransition<T>(lockFile: string, transition: () => Pro
 			await Bun.sleep(LOCK_ACQUIRE_RETRY_MS);
 			continue;
 		}
-		let held: LockOwnerSnapshot;
-		try {
-			held = await acquireOwnerLock(ownerFile, owner);
-		} catch (error) {
-			await removeTransitionDir(transitionDir).catch(() => undefined);
-			throw error;
-		}
 		let transitionGeneration: TransitionDirectoryGeneration;
 		try {
 			const transitionStat = await fs.lstat(transitionDir, { bigint: true });
 			if (!transitionStat.isDirectory()) throw new Error("Transition claim is no longer a directory.");
 			transitionGeneration = transitionGenerationFromStat(transitionStat);
 		} catch (error) {
-			// The owner descriptor is the only authority to retract this sidecar after
-			// creation. If generation capture itself faults, keep the claim fail-closed
-			// when that proof cannot complete rather than removing an unrelated file.
-			if (exactUnlinkOwnerRecord(ownerFile, held) !== "removed") throw new SessionStateLockUnavailableError(error);
-			await removeTransitionDir(transitionDir).catch(() => undefined);
 			throw new SessionStateLockUnavailableError(error);
+		}
+		pendingTransitionReleases.set(recoveryKey, {
+			phase: "setup",
+			token: owner.token,
+			generation: transitionGeneration,
+			recoverable: false,
+		});
+		let held: LockOwnerSnapshot;
+		try {
+			held = await acquireOwnerLock(ownerFile, owner);
+		} catch (error) {
+			const pending = pendingTransitionReleases.get(recoveryKey);
+			let ownerSnapshot: LockOwnerSnapshot | null = null;
+			let ownerCaptureFailed = false;
+			try {
+				ownerSnapshot = await captureRegularLockOwner(ownerFile);
+			} catch {
+				ownerCaptureFailed = true;
+			}
+			if (pending && ownerSnapshot) pending.held = ownerSnapshot;
+			if (ownerCaptureFailed) {
+				if (pending) pending.recoverable = true;
+				throw error;
+			}
+			try {
+				if (ownerSnapshot) {
+					const outcome = exactUnlinkOwnerRecord(ownerFile, ownerSnapshot);
+					if (outcome !== "removed" && outcome !== "absent") throw new Error("Transition owner cleanup refused.");
+				}
+				await removeTransitionDir(transitionDir);
+				pendingTransitionReleases.delete(recoveryKey);
+			} catch {
+				if (pending) pending.recoverable = true;
+			}
+			if (pending?.recoverable) {
+				for (let recoveryAttempt = 0; recoveryAttempt < LOCK_ACQUIRE_ATTEMPTS; recoveryAttempt++) {
+					if (await recoverPendingTransitionRelease(transitionDir, recoveryKey)) continue;
+					if (!pendingTransitionReleases.has(recoveryKey)) break;
+					await Bun.sleep(LOCK_ACQUIRE_RETRY_MS);
+				}
+				if (!pendingTransitionReleases.has(recoveryKey)) continue;
+			}
+			throw error;
 		}
 		const outcome = await transition().then(
 			value => ({ ok: true as const, value }),

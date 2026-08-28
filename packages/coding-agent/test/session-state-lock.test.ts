@@ -1590,6 +1590,63 @@ describe("coordinator session state lock", () => {
 		expect(fsSync.existsSync(transitionDir)).toBe(false);
 	});
 
+	it("cleans a malformed transition rewrite only when it is still the held inode", async () => {
+		const { stateFile } = await seededRunningSession("lock-transition-malformed-rewrite-fault");
+		const transitionDir = `${stateFile}.lock.transition`;
+		const ownerFile = `${transitionDir}.owner`;
+		let faulted = false;
+		SessionStateLockTestHooks.beforeOwnerRecordRewrite = async file => {
+			if (!faulted && file === ownerFile) {
+				faulted = true;
+				await fs.writeFile(file, '{"released":');
+				throw new Error("partial rewrite fault");
+			}
+		};
+
+		await expect(withSessionStateFileLock(stateFile, async () => "entered")).resolves.toBe("entered");
+		expect(faulted).toBe(true);
+		expect(fsSync.existsSync(transitionDir)).toBe(false);
+	});
+
+	it("retains setup cleanup authority when a partial transition owner and claim cleanup fault", async () => {
+		const { stateFile } = await seededRunningSession("lock-transition-setup-cleanup-fault");
+		const lockFile = `${stateFile}.lock`;
+		const transitionDir = `${lockFile}.transition`;
+		const ownerFile = `${transitionDir}.owner`;
+		let writeFaulted = false;
+		SessionStateLockTestHooks.ownerRecordWriteFault = async file => {
+			if (file !== ownerFile) return;
+			SessionStateLockTestHooks.ownerRecordWriteFault = undefined;
+			writeFaulted = true;
+			await fs.writeFile(file, '{"pid":');
+			throw new Error("partial transition owner write");
+		};
+		let deniedUnlink = true;
+		setSessionStateLockNativeBindings(() => ({
+			...exactIdentityNativeBindings,
+			exactUnlink(target, identity) {
+				if (deniedUnlink) {
+					deniedUnlink = false;
+					throw Object.assign(new Error("owner cleanup fault"), { code: "EIO" });
+				}
+				return exactIdentityNativeBindings.exactUnlink(target, identity);
+			},
+		}));
+		const realRmdir = fs.rmdir;
+		let deniedRmdir = true;
+		vi.spyOn(fs, "rmdir").mockImplementation((async target => {
+			if (deniedRmdir && String(target) === transitionDir) {
+				deniedRmdir = false;
+				throw Object.assign(new Error("claim cleanup fault"), { code: "EIO" });
+			}
+			return await realRmdir(target);
+		}) as typeof fs.rmdir);
+
+		await expect(withSessionStateFileLock(stateFile, async () => "entered")).resolves.toBe("entered");
+		expect(writeFaulted).toBe(true);
+		expect(fsSync.existsSync(transitionDir)).toBe(false);
+	});
+
 	it("leaves a legacy directory whose tree changed before the exact removal", async () => {
 		const { stateFile } = await seededRunningSession("lock-legacy-exact-cas");
 		const lockFile = `${stateFile}.lock`;
