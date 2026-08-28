@@ -140,7 +140,7 @@ export async function withFakeTransport(run: (clock: FakeClock) => Promise<void>
 	}
 }
 
-const flush = (): Promise<void> => new Promise<void>(resolve => queueMicrotask(resolve));
+export const flush = (): Promise<void> => new Promise<void>(resolve => queueMicrotask(resolve));
 
 export type SessionReconnectBudget = Readonly<{
 	reconnectAttempts: number;

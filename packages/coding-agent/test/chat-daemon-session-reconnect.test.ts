@@ -14,6 +14,7 @@ import { ACP_SESSION_RECONNECT } from "../src/sdk/session-reconnect";
 import {
 	drainReconnects,
 	expectedBackoffs,
+	flush,
 	type FakeClock,
 	FakeWebSocket,
 	withFakeTransport,
@@ -639,9 +640,11 @@ async function awaitSocket(count: number): Promise<FakeWebSocket> {
  */
 async function awaitPosts(provider: FakeSlackProvider, count: number, clock?: FakeClock): Promise<void> {
 	for (let attempt = 0; attempt < 5_000 && provider.posts.length < count; attempt++) {
+		await flush();
 		if (clock) {
 			const pending = clock.pendingDelays();
-			if (pending.length > 0) clock.advanceBy(Math.min(...pending));
+			const backoffs = pending.filter(delay => delay <= 2_000);
+			if (backoffs.length > 0) clock.advanceBy(Math.min(...backoffs));
 		}
 		await Bun.sleep(1);
 	}
@@ -686,6 +689,7 @@ async function awaitRefusals(provider: FakeSlackProvider, count: number): Promis
 /** The replay rides the socket, so settle on the request the host itself observed. */
 async function awaitReplayRequests(host: FakeSessionHost, count: number, clock?: FakeClock): Promise<void> {
 	for (let attempt = 0; attempt < 5_000 && host.replayRequests.length < count; attempt++) {
+		await flush();
 		if (clock) {
 			const pending = clock.pendingDelays();
 			if (pending.length > 0) clock.advanceBy(Math.min(...pending));
