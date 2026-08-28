@@ -1,6 +1,5 @@
 import * as path from "node:path";
 import { getAgentDir } from "@gajae-code/utils";
-import { YAML } from "bun";
 import {
 	type AcceptedModelPresetRegistry,
 	loadAcceptedModelPresetRegistryAsync,
@@ -8,6 +7,7 @@ import {
 import { UnknownModelProfileError, validateModelProfileName } from "../config/model-profile-contract";
 import { mergeModelProfiles } from "../config/model-profiles";
 import { type ModelsConfig, ModelsConfigSchema } from "../config/models-config-schema";
+import { ConfigFile } from "../config/config-file";
 
 export interface CoordinatorModelProfile {
 	name: string;
@@ -52,15 +52,13 @@ export function createCoordinatorModelProfileLoader(agentDir: string): Coordinat
 async function loadCoordinatorModelProfilesFromAgentDir(
 	agentDir: string,
 ): Promise<Map<string, CoordinatorModelProfile>> {
-	const modelsFile = Bun.file(path.join(agentDir, "models.yml"));
 	const accepted = await loadAcceptedModelPresetRegistryAsync(agentDir);
 	if (accepted.error) throw new CoordinatorModelProfileRegistryError(accepted.error);
-	if (!(await modelsFile.exists())) return coordinatorModelProfiles(undefined, accepted.profiles);
 	try {
-		const parsed = YAML.parse(await modelsFile.text());
-		const config = ModelsConfigSchema.safeParse(parsed);
-		if (!config.success) throw config.error;
-		return coordinatorModelProfiles(config.data.profiles, accepted.profiles);
+		const modelsConfig = new ConfigFile("models", ModelsConfigSchema, path.join(agentDir, "models.yml"));
+		const loaded = modelsConfig.tryLoad();
+		if (loaded.status === "error") throw loaded.error;
+		return coordinatorModelProfiles(loaded.value?.profiles, accepted.profiles);
 	} catch (error) {
 		throw new CoordinatorModelProfileRegistryError(error);
 	}
