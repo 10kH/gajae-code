@@ -263,4 +263,39 @@ describe("AuthStorage config-override apiKey", () => {
 			);
 		});
 	});
+
+	test("owner-aware import preflight ignores sibling overrides but preserves omitted-owner global semantics", async () => {
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			if (!authStorage) throw new Error("test setup failed");
+			const ownerA = {};
+			const ownerB = {};
+			authStorage.setConfigApiKey("anthropic", "owner-a-key", { owner: ownerA });
+
+			const ownerBImport = await authStorage.importCredentialIfAbsent(
+				"anthropic",
+				{
+					type: "oauth",
+					access: "owner-b-access",
+					refresh: "owner-b-refresh",
+					expires: Date.now() + 60 * 60_000,
+				},
+				ownerB,
+			);
+			expect(ownerBImport).toMatchObject({ inserted: true, reason: "inserted", provider: "anthropic" });
+			expect(await authStorage.getApiKey("anthropic", undefined, { owner: ownerB })).toBe("owner-b-access");
+
+			const omittedOwnerImport = await authStorage.importCredentialIfAbsent("anthropic", {
+				type: "oauth",
+				access: "omitted-owner-access",
+				refresh: "omitted-owner-refresh",
+				expires: Date.now() + 60 * 60_000,
+			});
+			expect(omittedOwnerImport).toMatchObject({
+				inserted: false,
+				reason: "skipped-existing-config",
+				provider: "anthropic",
+			});
+			expect(await authStorage.getApiKey("anthropic")).toBe("owner-a-key");
+		});
+	});
 });

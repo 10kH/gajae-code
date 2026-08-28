@@ -2861,11 +2861,12 @@ export class AuthStorage {
 	async importCredentialIfAbsent(
 		provider: string,
 		credential: AuthCredential,
+		owner?: object,
 	): Promise<AuthCredentialIfAbsentSnapshotResult> {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		if (this.#runtimeOverrides.has(storageProvider))
 			return this.#snapshotSkipResult(storageProvider, "skipped-existing-runtime");
-		if (this.#configOverrides.has(storageProvider))
+		if (this.#hasConfigOverride(storageProvider, owner))
 			return this.#snapshotSkipResult(storageProvider, "skipped-existing-config");
 		if (getEnvApiKey(storageProvider)) return this.#snapshotSkipResult(storageProvider, "skipped-existing-env");
 		if (this.#resolveFallback(storageProvider))
