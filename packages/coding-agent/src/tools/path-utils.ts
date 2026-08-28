@@ -11,17 +11,20 @@ const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
 const FILE_LINE_RANGE_RE = /^(?:L?\d+(?:[-+]L?\d+|-)?(?:,L?\d+(?:[-+]L?\d+|-)?)*|raw|conflicts)$/i;
 const FILE_LINE_RANGE_ONLY_RE = /^L?\d+(?:[-+]L?\d+|-)?(?:,L?\d+(?:[-+]L?\d+|-)?)*$/i;
 const FILE_RAW_ONLY_RE = /^raw$/i;
-// Schemes whose authority grammar is identifier-shaped and may therefore carry
-// a read selector immediately after the authority. Colons in a path, query, or
-// fragment remain part of the URL and are never considered selectors.
-const INTERNAL_SCHEMES_WITH_SELECTORS: Record<string, true> = {
+// Schemes whose authority grammar is identifier-shaped and cannot contain a
+// literal colon. Colons in a path, query, or fragment remain part of the URL
+// and are never considered selectors.
+const INTERNAL_SCHEMES_WITH_UNAMBIGUOUS_AUTHORITIES: Record<string, true> = {
 	agent: true,
 	artifact: true,
-	issue: true,
-	local: true,
 	memory: true,
-	gjc: true,
+	issue: true,
 	pr: true,
+};
+const INTERNAL_SCHEMES_WITH_SELECTORS: Record<string, true> = {
+	...INTERNAL_SCHEMES_WITH_UNAMBIGUOUS_AUTHORITIES,
+	gjc: true,
+	local: true,
 	rule: true,
 	skill: true,
 };
@@ -170,6 +173,7 @@ export function splitInternalUrlSel(
 	const authority = rawPath.slice(schemeEnd);
 	const firstColon = authority.indexOf(":");
 	if (firstColon === -1) return { path: rawPath };
+	if (firstColon === 0) return { path: rawPath };
 
 	if (scheme === "skill") {
 		const activeSkillNames = options.activeSkillNames ?? [];
@@ -197,6 +201,14 @@ export function splitInternalUrlSel(
 			path: rawPath.slice(0, schemeEnd + selectorColon),
 			sel: authority.slice(selectorColon + 1),
 		};
+	}
+
+	if (!INTERNAL_SCHEMES_WITH_UNAMBIGUOUS_AUTHORITIES[scheme]) {
+		const strict = splitPathAndSel(authority);
+		if (strict.sel !== undefined) {
+			return { path: `${rawPath.slice(0, schemeEnd)}${strict.path}`, sel: strict.sel };
+		}
+		return { path: rawPath };
 	}
 
 	return { path: rawPath.slice(0, schemeEnd + firstColon), sel: authority.slice(firstColon + 1) };
