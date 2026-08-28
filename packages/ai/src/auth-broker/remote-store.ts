@@ -17,7 +17,6 @@ import { getConfigRootDir, isEnoent, logger } from "@gajae-code/utils";
 import {
 	type AuthCredential,
 	type AuthCredentialIfAbsentResult,
-	type AuthCredentialSnapshotEntry,
 	type AuthCredentialStore,
 	assertCanonicalMCPOAuthBinding,
 	type CachedCredentialHealth,
@@ -1013,34 +1012,10 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		return this.listAuthCredentials(provider);
 	}
 
-	#applyProviderEntries(provider: string, entries: AuthCredentialSnapshotEntry[]): void {
-		// `entries` is the broker's authoritative post-upsert list of rows for
-		// `provider`. Drop our existing rows for the same provider and splice in
-		// the fresh set — preserving every other provider's rows in place.
-		const others = this.#snapshot.credentials.filter(entry => entry.provider !== provider);
-		const incoming = entries.map(entry => ({ ...entry, rotatesInMs: null }));
-		this.#snapshot = { ...this.#snapshot, credentials: [...others, ...incoming] };
-	}
-
-	#removeProviderEntries(provider: string): void {
-		const credentials = this.#snapshot.credentials.filter(entry => entry.provider !== provider);
-		this.#applySnapshot({ ...this.#snapshot, credentials }, this.#generation, false);
-	}
 	#removeCredentialEntry(credentialId: number): void {
 		const credentials = this.#snapshot.credentials.filter(entry => entry.id !== credentialId);
 		if (credentials.length === this.#snapshot.credentials.length) return;
 		this.#applySnapshot({ ...this.#snapshot, credentials }, this.#generation, false);
-	}
-	#applyCredentialEntry(entry: AuthCredentialSnapshotEntry): void {
-		const incoming = { ...entry, rotatesInMs: null };
-		const index = this.#snapshot.credentials.findIndex(candidate => candidate.id === entry.id);
-		if (index === -1) {
-			this.#snapshot = { ...this.#snapshot, credentials: [...this.#snapshot.credentials, incoming] };
-			return;
-		}
-		const credentials = [...this.#snapshot.credentials];
-		credentials[index] = incoming;
-		this.#snapshot = { ...this.#snapshot, credentials };
 	}
 	/**
 	 * Fire-and-forget `refreshSnapshot()` after a write. When the SSE stream is

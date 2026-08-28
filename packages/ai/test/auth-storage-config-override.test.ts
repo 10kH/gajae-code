@@ -46,7 +46,6 @@ describe("AuthStorage config-override apiKey", () => {
 	test("setConfigApiKey beats OAuth access token for getApiKey", async () => {
 		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
 			if (!authStorage) throw new Error("test setup failed");
-			const storage = authStorage;
 			await seedOAuth("anthropic", "oauth-from-broker");
 			authStorage.setConfigApiKey("anthropic", "gateway-bearer");
 
