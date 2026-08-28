@@ -964,6 +964,7 @@ describe("AgentSession message pipeline", () => {
 	});
 	it("holds prompt settlement until worker integration is durable", async () => {
 		const integrationStarted = Promise.withResolvers<void>();
+		const sdkIntegrationStarted = Promise.withResolvers<void>();
 		const releaseIntegration = Promise.withResolvers<void>();
 		let integrationRequests = 0;
 		let failIntegration = false;
@@ -1003,6 +1004,7 @@ describe("AgentSession message pipeline", () => {
 				if (failIntegration) throw new Error("worker integration failed");
 				integrationStarted.resolve();
 				if (neverSettle) {
+					sdkIntegrationStarted.resolve();
 					return new Promise<void>(resolve => {
 						signal.addEventListener("abort", () => {
 							integrationAborted = true;
@@ -1047,6 +1049,9 @@ describe("AgentSession message pipeline", () => {
 				secondAgentEnd.resolve();
 		});
 		try {
+			await sdkIntegrationStarted.promise;
+			await Bun.sleep(0);
+			expect(events.filter(event => event.type === "agent_end")).toHaveLength(2);
 			await secondAgentEnd.promise;
 		} finally {
 			unsubscribe();

@@ -3825,13 +3825,18 @@ export class AgentSession {
 	}
 	#startAgentEndPublication(pending: AgentSessionEvent, lease?: RunResourceProducerLease): void {
 		this.#agentEndPublicationInFlight++;
-		this.#agentEndPublicationPromise = this.#publishDeferredAgentEnd(pending, lease);
+		const pendingScope = (pending as AgentSessionEvent & { scope?: AttemptScopeRef }).scope as
+			| AttemptScope
+			| undefined;
+		const sdkTerminal = pendingScope !== undefined && this.#sdkRunTokensByAttemptScope.has(pendingScope);
+		this.#agentEndPublicationPromise = this.#publishDeferredAgentEnd(pending, lease, sdkTerminal);
 		void this.#agentEndPublicationPromise;
 	}
 
 	async #publishDeferredAgentEnd(
 		pending: AgentSessionEvent,
 		lease: RunResourceProducerLease | undefined,
+		sdkTerminal: boolean,
 	): Promise<void> {
 		let extensionDelivery: Promise<void> | undefined;
 		const releaseLease = () => {
@@ -3848,14 +3853,13 @@ export class AgentSession {
 			// must not turn a completed provider run into an ACP prompt that waits on
 			// recovery indefinitely. The bounded integration promise is still awaited
 			// below so ordinary session shutdown retains its drain guarantee.
+			// SDK terminal publication is the authenticated client-facing settlement
+			// boundary. Start worker integration for shutdown/recovery bookkeeping, but
+			// never make the SDK delivery await that independent work.
 			const workerIntegration = this.#flushWorkerIntegrationForAgentEnd();
 			void workerIntegration.catch(error => {
 				logger.warn("Worker integration settled after terminal publication", { error });
 			});
-			const pendingScope = (pending as AgentSessionEvent & { scope?: AttemptScopeRef }).scope as
-				| AttemptScope
-				| undefined;
-			const sdkTerminal = pendingScope !== undefined && this.#sdkRunTokensByAttemptScope.has(pendingScope);
 			// Reserve persistence before notifying synchronous subscribers: a subscriber
 			// may start a successor prompt from agent_end, whose running state must
 			// serialize after this terminal boundary rather than be overwritten by it.
