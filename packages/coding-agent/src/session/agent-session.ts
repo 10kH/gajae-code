@@ -2797,6 +2797,8 @@ export class AgentSession {
 	#extensionRunner: ExtensionRunner | undefined = undefined;
 	/** SDK follow-up ownership by queued message and the attempt that dequeues it. */
 	#sdkRunTokensByQueuedMessage = new WeakMap<AgentMessage, string>();
+	#skipPostPromptRecoveryWaitByQueuedMessage = new WeakSet<AgentMessage>();
+	#skipPostPromptRecoveryWaitForCurrentTurn = false;
 	#sdkRunTokensByAttemptScope = new WeakMap<AttemptScope, string>();
 	#activeSdkRunToken: string | undefined;
 	#activeAttemptScope: AttemptScope | undefined;
@@ -4256,6 +4258,10 @@ export class AgentSession {
 		// submitter to the in-flight run instead of parking the correlation for
 		// an unrelated later agent_start (#4668).
 		this.agent.onSteeringConsumed = (messages, promotion = { startsOwnRun: false }) => {
+			if (messages.some(message => this.#skipPostPromptRecoveryWaitByQueuedMessage.has(message))) {
+				this.#skipPostPromptRecoveryWaitForCurrentTurn = true;
+			}
+			for (const message of messages) this.#skipPostPromptRecoveryWaitByQueuedMessage.delete(message);
 			this.#fireQueuedPromotionHooks(messages, promotion);
 		};
 		this.agent.providerSessionState = this.#providerSessionState;
@@ -11689,6 +11695,7 @@ export class AgentSession {
 			claimsGenuineUserIntent?: boolean;
 			onPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
 			external?: boolean;
+				skipPostPromptRecoveryWait?: boolean;
 		},
 	): Promise<void> {
 		this.#assertNoHandoffTransition();
@@ -11703,6 +11710,7 @@ export class AgentSession {
 			this.#externalSteerAdmissionSeq.set(message, ++this.#steeringAdmissionSeq);
 			if (options.onPromoted) this.#steerPromotionHooks.set(message, options.onPromoted);
 		}
+		if (options?.skipPostPromptRecoveryWait) this.#skipPostPromptRecoveryWaitByQueuedMessage.add(message);
 		if (options?.claimsGenuineUserIntent) {
 			const epoch = this.#claimDeepInterviewUserIntent();
 			this.#deepInterviewGenuineUserMessageEpochs.set(message, epoch);
@@ -12427,6 +12435,7 @@ export class AgentSession {
 					claimsGenuineUserIntent: true,
 					onPromoted: options?.onQueuedPromoted,
 					external: true,
+					skipPostPromptRecoveryWait: options?.skipPostPromptRecoveryWait,
 				});
 				options?.onPreflightAccepted?.();
 				return;
@@ -12446,6 +12455,7 @@ export class AgentSession {
 					claimsGenuineUserIntent: true,
 					onPromoted: options?.onQueuedPromoted,
 					external: true,
+					skipPostPromptRecoveryWait: options?.skipPostPromptRecoveryWait,
 				});
 				// Dispatch-race disposition (#4668 review P1): the SDK snapshot-decided
 				// this submission starts its own turn (idle at dispatch), but the

@@ -3145,7 +3145,9 @@ function createControlSurface(
 		abortTerminal: terminalAbort,
 		abortAndPrompt: async text => {
 			await ctx.abort();
-			return await submit("prompt", undefined, options => api.sendUserMessage(text, options));
+			return await submit("prompt", undefined, options =>
+				api.sendUserMessage(text, { ...options, skipPostPromptRecoveryWait: true }),
+			);
 		},
 		answerAsk: unavailable("ask.answer"),
 		answerGate: async (id, response, expectedSessionId, idempotencyKey) =>
