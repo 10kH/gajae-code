@@ -1039,6 +1039,7 @@ describe("AgentSession message pipeline", () => {
 		neverSettle = true;
 		integrationAborted = false;
 		const sdkSubmission = session.sendUserMessage("sdk terminal fast path", {
+			sdkRunToken: "sdk-terminal-fast-path",
 			skipPostPromptRecoveryWait: true,
 		});
 		await new Promise<void>(resolve => {
@@ -1050,6 +1051,7 @@ describe("AgentSession message pipeline", () => {
 		});
 		expect(integrationAborted).toBe(false);
 		await sdkSubmission;
+		await Bun.sleep(25);
 		expect(integrationAborted).toBe(true);
 
 		failIntegration = true;

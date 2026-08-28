@@ -2540,6 +2540,7 @@ export class AgentSession {
 			predecessorScope !== undefined &&
 			this.#skipPostPromptRecoveryWaitByAttemptScope.delete(predecessorScope);
 		this.#acceptRunHandle(handle);
+		this.#activeSdkRunToken = sdkRunToken;
 		if (sdkRunToken !== undefined) this.#sdkRunTokensByAttemptScope.set(handle.scope, sdkRunToken);
 		if (carryRecoverySkip) this.#skipPostPromptRecoveryWaitByAttemptScope.add(handle.scope);
 	}
@@ -3764,7 +3765,7 @@ export class AgentSession {
 		// Deferrals behind still-pending selection fences are excluded here: they
 		// cannot settle before their fence resolves, and the fence owner may be
 		// waiting on this very settlement (#4519).
-		if (!predecessorPromptStillInFlight) {
+		if (promptWait !== "publication" && !predecessorPromptStillInFlight) {
 			await this.#waitForSessionSettlement(this.#turnSettlementDeferralFloor());
 		}
 		if (flushError) throw flushError;
@@ -3806,6 +3807,9 @@ export class AgentSession {
 		this.#pendingAgentEndEmit = undefined;
 		const lease = this.#deferredAgentEndLeases.get(pending);
 		if (lease) this.#deferredAgentEndLeases.delete(pending);
+		this.#startAgentEndPublication(pending, lease);
+	}
+	#startAgentEndPublication(pending: AgentSessionEvent, lease?: RunResourceProducerLease): void {
 		this.#agentEndPublicationInFlight++;
 		this.#agentEndPublicationPromise = this.#publishDeferredAgentEnd(pending, lease);
 		void this.#agentEndPublicationPromise;
@@ -3865,7 +3869,6 @@ export class AgentSession {
 					logger.warn("Terminal persistence continued after SDK publication", { error }),
 				);
 			} else {
-				await terminalPersistence;
 				await workerIntegration;
 			}
 		};
@@ -4063,9 +4066,19 @@ export class AgentSession {
 					this.#resumeFromOwnedCompletion();
 				try {
 					if (survivors.length === 1) {
-						await this.agent.prompt(first, this.#managedFallbackPromptOptions());
+						await this.agent.prompt(first, {
+							...this.#managedFallbackPromptOptions(),
+							onRunAccepted: (handle: AttemptRunHandle) => {
+								if (handle) this.#acceptSdkAttemptRun(handle);
+							},
+						});
 					} else {
-						await this.agent.prompt(survivors, this.#managedFallbackPromptOptions());
+						await this.agent.prompt(survivors, {
+							...this.#managedFallbackPromptOptions(),
+							onRunAccepted: (handle: AttemptRunHandle) => {
+								if (handle) this.#acceptSdkAttemptRun(handle);
+							},
+						});
 					}
 				} finally {
 					// The owned completions were delivered OR the prompt attempt
@@ -5454,6 +5467,17 @@ export class AgentSession {
 		// have unwound. Subscribers treat this event as the ready signal; flushing it
 		// from abort while either barrier is active permits a successor to race the
 		// prior prompt's cleanup.
+		const sdkTerminal =
+			event.type === "agent_end" && attemptScope !== undefined && this.#sdkRunTokensByAttemptScope.has(attemptScope);
+		if (
+			event.type === "agent_end" &&
+			sdkTerminal &&
+			this.#pendingAgentEndContinuationHolds.size === 0 &&
+			this.#pendingAgentEndEmit === undefined
+		) {
+			this.#startAgentEndPublication(event);
+			return;
+		}
 		if (event.type === "agent_end" && (this.#livePromptsInFlight() > 0 || this.#agentEventHandlersInFlight > 0)) {
 			this.#pendingAgentEndEmit = event;
 			return;
@@ -6539,8 +6563,13 @@ export class AgentSession {
 		predecessorAgentEndHold?: symbol;
 		/** Internal predecessor terminal event sequestered while waiting behind selection. */
 		deferredPredecessorAgentEnd?: AgentSessionEvent;
+		/** Internal causal SDK owner captured when this continuation was scheduled. */
+		sdkRunToken?: string;
 	}): Promise<void> {
 		const continuationAdmission = this.#captureScheduledContinuationAdmission();
+		const scheduledSdkRunToken =
+			options?.sdkRunToken ??
+			(this.#activeAttemptScope ? this.#sdkRunTokensByAttemptScope.get(this.#activeAttemptScope) : undefined);
 		const selectionFenceGeneration =
 			options?.selectionFenceGeneration ??
 			this.#selectionFenceGenerationContext.getStore() ??
@@ -6697,7 +6726,7 @@ export class AgentSession {
 												// agent_start (review P1); their queued messages are in-run
 												// consumptions, not own-run promotions.
 												const startsOwn = options?.maintenanceContinuation !== true;
-												const inheritedSdkRunToken = this.#activeSdkRunToken;
+												const inheritedSdkRunToken = options?.sdkRunToken ?? scheduledSdkRunToken;
 												const consumedSdkRunToken = startsOwn
 													? acceptance.consumedQueuedMessages
 															.map(message => this.#sdkRunTokensByQueuedMessage.get(message))
@@ -6871,8 +6900,12 @@ export class AgentSession {
 		resourceRunId?: string,
 		deferredSelectionFenceGeneration?: number,
 		deferredPredecessorAgentEnd?: AgentSessionEvent,
+		sdkRunToken?: string,
 	): void {
 		const scheduledGeneration = generation;
+		const scheduledSdkRunToken =
+			sdkRunToken ??
+			(this.#activeAttemptScope ? this.#sdkRunTokensByAttemptScope.get(this.#activeAttemptScope) : undefined);
 		const continuationAuthorized = async (
 			signal: AbortSignal,
 			hasPendingNextTurnMessages = false,
@@ -6925,6 +6958,7 @@ export class AgentSession {
 						resourceRunId,
 						selectionFenceGeneration,
 						predecessorAgentEnd,
+						scheduledSdkRunToken,
 					);
 				} finally {
 					this.#endSelectionFenceDeferralTracking(selectionFenceGeneration);
@@ -6972,6 +7006,7 @@ export class AgentSession {
 								promptText,
 								{
 									skipPostPromptRecoveryWait: true,
+									sdkRunToken: scheduledSdkRunToken,
 									skipCompactionCheck: true,
 									predecessorAgentEndHold,
 									onFinalPreflight: ({ hasPendingNextTurnMessages }) =>
@@ -7781,7 +7816,7 @@ export class AgentSession {
 				? eventToken
 				: deliveryScope
 					? this.#sdkRunTokensByAttemptScope.get(deliveryScope as AttemptScope)
-					: this.#activeSdkRunToken;
+					: undefined;
 		const isTerminalAgentEnd =
 			event.type === "agent_end" && !(event.stopReason === "maintenance" && event.maintenanceOutcome !== "aborted");
 		const finishAttempt = () => {
@@ -7803,7 +7838,7 @@ export class AgentSession {
 				this.#attemptRecordStore.retire(deliveryScope as AttemptScope);
 				this.#sdkRunTokensByAttemptScope.delete(deliveryScope as AttemptScope);
 			}
-			if (isActiveAttempt && sdkRunToken === this.#activeSdkRunToken) this.#activeSdkRunToken = undefined;
+			if (isActiveAttempt) this.#activeSdkRunToken = undefined;
 			if (isActiveAttempt) {
 				this.#activeAttemptScope = undefined;
 				this.#activeLogicalRunId = undefined;
@@ -13077,6 +13112,7 @@ export class AgentSession {
 			| "tool_abort"
 			| "internal";
 		silent?: boolean;
+		sdkRunToken?: string;
 	}): void {
 		const abortGoalState = this.getGoalModeState();
 		this.#suppressNextGoalReminderAfterAbortGoalId =
