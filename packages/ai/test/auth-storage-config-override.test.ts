@@ -193,6 +193,8 @@ describe("AuthStorage config-override apiKey", () => {
 			if (!authStorage) throw new Error("test setup failed");
 			const firstOwner = {};
 			const secondOwner = {};
+			const unregisteredOwner = {};
+			await seedOAuth("anthropic", "oauth-global");
 			authStorage.setConfigApiKey("anthropic", "first-key", { owner: firstOwner });
 			authStorage.setConfigApiKey("anthropic", "second-key", { owner: secondOwner });
 
@@ -204,6 +206,14 @@ describe("AuthStorage config-override apiKey", () => {
 				"config override (models.yml)",
 			);
 			expect(await authStorage.getApiKey("anthropic", undefined, { owner: secondOwner })).toBe("second-key");
+			// A caller with no registration of its own must never borrow the latest
+			// sibling owner key; it resolves the shared stored OAuth credential.
+			expect(await authStorage.getApiKey("anthropic", undefined, { owner: unregisteredOwner })).toBe("oauth-global");
+			expect(await authStorage.peekApiKey("anthropic", { owner: unregisteredOwner })).toBe("oauth-global");
+			expect(authStorage.hasAuth("anthropic", undefined, { owner: unregisteredOwner })).toBe(true);
+			expect(authStorage.getEffectiveCredentialType("anthropic", undefined, { owner: unregisteredOwner })).toBe(
+				"oauth",
+			);
 			authStorage.setConfigApiKey("openai-codex-device", "alias-key", { owner: firstOwner });
 			expect(await authStorage.getApiKey("openai-codex", undefined, { owner: firstOwner })).toBe("alias-key");
 

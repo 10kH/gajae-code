@@ -1701,6 +1701,136 @@ describe("signed model preset registry", () => {
 		}
 	});
 
+	test("proves cold startup through signed activation, rollback, pinning, unpinning, and cached restart selection", async () => {
+		const data = await fixture();
+		const revisionOne = signedRegistry(
+			data.privateKey,
+			1,
+			[registryProfile("selected", "provider/model-1")],
+			[registryPreset("model-1", 8_192)],
+		);
+		const revisionTwo = signedRegistry(
+			data.privateKey,
+			2,
+			[registryProfile("selected", "provider/model-2")],
+			[registryPreset("model-2", 16_384)],
+		);
+		const modelsPath = path.join(data.agentDir, "models.yml");
+		await Bun.write(
+			modelsPath,
+			`providers:
+  provider:
+    baseUrl: https://provider.example/v1
+    api: openai-completions
+    auth: none
+`,
+		);
+
+		expect(getModelPresetRegistryStatus({ agentDir: data.agentDir })).toMatchObject({
+			cacheHealth: "empty",
+			activeRevision: undefined,
+			highestSeenRevision: undefined,
+		});
+
+		let authStorage: AuthStorage | undefined;
+		let modelRegistry: ModelRegistry | undefined;
+		let restartedAuthStorage: AuthStorage | undefined;
+		let restartedRegistry: ModelRegistry | undefined;
+		const reload = async (registry: ModelRegistry): Promise<void> => {
+			await data.run(() => registry.refresh("offline"));
+		};
+		const expectSelection = (registry: ModelRegistry, modelId: string, contextWindow: number): void => {
+			expect(registry.getModelProfile("selected")).toMatchObject({
+				source: "registry",
+				modelMapping: { default: `provider/${modelId}` },
+			});
+			expect(registry.find("provider", modelId)).toMatchObject({
+				provider: "provider",
+				id: modelId,
+				contextWindow,
+			});
+		};
+		try {
+			authStorage = await AuthStorage.create(path.join(data.agentDir, "lifecycle-auth.db"));
+			modelRegistry = data.run(
+				() =>
+					new ModelRegistry(authStorage!, modelsPath, undefined, {
+						agentDir: data.agentDir,
+						automaticRefresh: false,
+					}),
+			);
+			expect(modelRegistry.getModelProfile("selected")).toBeUndefined();
+			expect(modelRegistry.find("provider", "model-1")).toBeUndefined();
+
+			await expect(accept(data, revisionOne)).resolves.toMatchObject({ status: "updated", revision: 1 });
+			await reload(modelRegistry);
+			expect(getModelPresetRegistryStatus({ agentDir: data.agentDir })).toMatchObject({
+				cacheHealth: "valid",
+				activeRevision: 1,
+				highestSeenRevision: 1,
+			});
+			expectSelection(modelRegistry, "model-1", 8_192);
+
+			await expect(accept(data, revisionTwo)).resolves.toMatchObject({ status: "updated", revision: 2 });
+			await reload(modelRegistry);
+			expect(getModelPresetRegistryStatus({ agentDir: data.agentDir })).toMatchObject({
+				activeRevision: 2,
+				highestSeenRevision: 2,
+			});
+			expectSelection(modelRegistry, "model-2", 16_384);
+
+			await setModelPresetRegistryPin({ agentDir: data.agentDir, revision: 1 });
+			await reload(modelRegistry);
+			expect(getModelPresetRegistryStatus({ agentDir: data.agentDir })).toMatchObject({
+				activeRevision: 1,
+				pinnedRevision: 1,
+				highestSeenRevision: 2,
+			});
+			expectSelection(modelRegistry, "model-1", 8_192);
+
+			await setModelPresetRegistryPin({ agentDir: data.agentDir, revision: undefined });
+			await reload(modelRegistry);
+			expect(getModelPresetRegistryStatus({ agentDir: data.agentDir })).toMatchObject({
+				activeRevision: 2,
+				pinnedRevision: undefined,
+				highestSeenRevision: 2,
+			});
+			expectSelection(modelRegistry, "model-2", 16_384);
+
+			await rollbackModelPresetRegistry({ agentDir: data.agentDir, revision: 1 });
+			await reload(modelRegistry);
+			expect(getModelPresetRegistryStatus({ agentDir: data.agentDir })).toMatchObject({
+				activeRevision: 1,
+				pinnedRevision: undefined,
+				highestSeenRevision: 2,
+			});
+			expectSelection(modelRegistry, "model-1", 8_192);
+
+			await modelRegistry.dispose();
+			modelRegistry = undefined;
+			authStorage.close();
+			authStorage = undefined;
+			restartedAuthStorage = await AuthStorage.create(path.join(data.agentDir, "lifecycle-restart-auth.db"));
+			restartedRegistry = data.run(
+				() =>
+					new ModelRegistry(restartedAuthStorage!, modelsPath, undefined, {
+						agentDir: data.agentDir,
+						automaticRefresh: false,
+					}),
+			);
+			expect(getModelPresetRegistryStatus({ agentDir: data.agentDir })).toMatchObject({
+				activeRevision: 1,
+				highestSeenRevision: 2,
+			});
+			expectSelection(restartedRegistry, "model-1", 8_192);
+		} finally {
+			if (restartedRegistry) await restartedRegistry.dispose();
+			restartedAuthStorage?.close();
+			if (modelRegistry) await modelRegistry.dispose();
+			authStorage?.close();
+		}
+	});
+
 	test("publishes local controls without waiting for the refresh interval", async () => {
 		const data = await fixture();
 		await accept(data, signedRegistry(data.privateKey, 1));

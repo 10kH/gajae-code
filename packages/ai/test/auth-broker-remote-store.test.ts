@@ -197,6 +197,111 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 		expect(remote.snapshot.credentials[0]!.id).not.toBe(staleEntry.id);
 	});
 
+	test("reconciles a successful broker refresh into the remote snapshot", async () => {
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		remote = new RemoteAuthCredentialStore({ client, streamSnapshots: false });
+		await remote.refreshSnapshot();
+		const initialEntry = remote.snapshot.credentials[0]!;
+		expect(initialEntry.credential.type).toBe("oauth");
+		if (initialEntry.credential.type !== "oauth") throw new Error("expected OAuth credential");
+		const initialGeneration = remote.snapshot.generation;
+		const rotatedExpires = Date.now() + 120_000;
+		const refreshSpy = vi
+			.spyOn(oauthUtils, "refreshOAuthToken")
+			.mockImplementation(async (_provider, credential) => ({
+				...credential,
+				access: "access-broker-rotated",
+				refresh: "refresh-broker-rotated",
+				expires: rotatedExpires,
+			}));
+
+		const refreshed = await remote.refreshOAuthCredential("anthropic", initialEntry.id, initialEntry.credential);
+
+		expect(refreshSpy).toHaveBeenCalledTimes(1);
+		expect(refreshed).toMatchObject({
+			access: "access-broker-rotated",
+			refresh: REMOTE_REFRESH_SENTINEL,
+			expires: rotatedExpires,
+			accountId: "account-a",
+			email: "a@example.com",
+		});
+		expect(remote.snapshot.generation).toBeGreaterThan(initialGeneration);
+		expect(remote.snapshot.credentials).toEqual([
+			expect.objectContaining({
+				id: initialEntry.id,
+				provider: "anthropic",
+				credential: expect.objectContaining({
+					type: "oauth",
+					access: "access-broker-rotated",
+					refresh: REMOTE_REFRESH_SENTINEL,
+				}),
+			}),
+		]);
+		const authoritative = store!.listAuthCredentials("anthropic");
+		expect(authoritative).toHaveLength(1);
+		expect(authoritative[0]?.credential).toMatchObject({
+			type: "oauth",
+			access: "access-broker-rotated",
+			refresh: "refresh-broker-rotated",
+		});
+	});
+
+	test("preserves a broker refresh error when reconciliation reload fails, then recovers on a later reload", async () => {
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		remote = new RemoteAuthCredentialStore({ client, streamSnapshots: false });
+		await remote.refreshSnapshot();
+		const staleEntry = remote.snapshot.credentials[0]!;
+		expect(staleEntry.credential.type).toBe("oauth");
+		if (staleEntry.credential.type !== "oauth") throw new Error("expected OAuth credential");
+
+		const originalAuthError = new AuthBrokerError("Auth broker request failed: 404 Not Found", {
+			status: 404,
+			body: `No credential with id=${staleEntry.id}`,
+		});
+		const reconciliationError = new Error("snapshot reload failed during recovery");
+		const refreshCredentialSpy = vi.spyOn(client, "refreshCredential").mockRejectedValueOnce(originalAuthError);
+		const refreshSnapshotSpy = vi.spyOn(remote, "refreshSnapshot").mockRejectedValueOnce(reconciliationError);
+
+		const failed = await remote.refreshOAuthCredential("anthropic", staleEntry.id, staleEntry.credential).then(
+			() => undefined,
+			error => error,
+		);
+		expect(failed).toBe(originalAuthError);
+		expect(refreshCredentialSpy).toHaveBeenCalledTimes(1);
+		expect(refreshSnapshotSpy).toHaveBeenCalledTimes(1);
+
+		// The failed reconciliation must not strand the remote mirror: broker
+		// authority can still replace the stale row and a later reload recovers it.
+		expect(storage!.disableCredentialById(staleEntry.id, "replaced in test")).toBe(true);
+		storage!.upsertCredential("anthropic", mintOAuthCredential("recovered", Date.now() + 120_000));
+		refreshSnapshotSpy.mockRestore();
+		await remote.refreshSnapshot();
+		await remote.syncInventoryMetadata();
+
+		expect(remote.snapshot.credentials).toHaveLength(1);
+		expect(remote.snapshot.credentials[0]?.id).not.toBe(staleEntry.id);
+		expect(remote.snapshot.credentials[0]?.credential).toMatchObject({
+			type: "oauth",
+			access: "access-recovered",
+			refresh: REMOTE_REFRESH_SENTINEL,
+		});
+		expect(remote.listCredentialInventory("anthropic")).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					id: staleEntry.id,
+					provider: "anthropic",
+					disabled: true,
+					disabledCause: "disabled via auth-broker",
+				}),
+				expect.objectContaining({
+					provider: "anthropic",
+					identityLabel: "recovered@example.com",
+					disabled: false,
+				}),
+			]),
+		);
+	});
+
 	test("disables a remotely-invalid OAuth row through the broker and falls back", async () => {
 		// Keep the revoked row first so the initial round-robin selection attempts
 		// it before the healthy sibling. The client only has a redacted refresh
