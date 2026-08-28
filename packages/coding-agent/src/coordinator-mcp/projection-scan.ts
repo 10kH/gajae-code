@@ -432,7 +432,11 @@ async function scanCoordinatorJsonFiles(
 		try {
 			stat = authority ? await authority.lstat(entry) : await io.lstat(file);
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+			if (
+				(error as NodeJS.ErrnoException).code === "ENOENT" ||
+				(error as NodeJS.ErrnoException).code === "ELOOP" ||
+				error instanceof ProjectionScanRaceError
+			) {
 				raced += 1;
 				continue;
 			}
