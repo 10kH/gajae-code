@@ -1693,8 +1693,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			let bridgeJobId!: string;
 			let bridgeBackgrounded = false;
 			let retainedAcpSnapshot = "";
+			let retainedAcpTruncated = false;
 			const ACP_RAW_OVERLAP_BYTES = 512 * 1024;
-			const appendAcpSnapshot = (snapshot: string): void => {
+			const appendAcpSnapshot = (snapshot: string, upstreamTruncated = false): void => {
 				if (!snapshot) return;
 				const snapshotBytes = Buffer.byteLength(snapshot, "utf8");
 				const retainedBytes = Buffer.byteLength(retainedAcpSnapshot, "utf8");
@@ -1706,14 +1707,15 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					retainedBytes > ACP_RAW_OVERLAP_BYTES
 						? sliceTextAfterUtf8ByteOffset(retainedAcpSnapshot, retainedBytes - ACP_RAW_OVERLAP_BYTES)
 						: retainedAcpSnapshot;
-				const overlap = suffixPrefixOverlap(boundedSnapshot, boundedRetained);
+				const overlap = suffixPrefixOverlap(boundedRetained, boundedSnapshot);
 				const delta = boundedSnapshot.slice(overlap);
 				if (bridgeJobId && delta) ownedManager?.appendOutput(bridgeJobId, delta);
 				retainedAcpSnapshot = boundedSnapshot;
+				retainedAcpTruncated ||= upstreamTruncated || snapshotBytes > ACP_RAW_OVERLAP_BYTES;
 			};
 			const retainedAcpOutput = (): ClientBridgeTerminalOutput => ({
 				output: retainedAcpSnapshot,
-				truncated: true,
+				truncated: retainedAcpTruncated,
 			});
 
 			const runToCompletion = async (
@@ -1775,7 +1777,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 								error,
 							});
 						}
-						appendAcpSnapshot(current.output);
+						appendAcpSnapshot(current.output, current.truncated);
 						const prepared = await prepareClientTerminalOutput(this.session, current);
 						throw new ToolAbortError(formatClientTerminalAbortFailure(prepared, readDiagnostic, pendingNotices));
 					}
@@ -1807,7 +1809,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 									error,
 								});
 							}
-							appendAcpSnapshot(current.output);
+							appendAcpSnapshot(current.output, current.truncated);
 							const prepared = await prepareClientTerminalOutput(this.session, current);
 							throw new ToolAbortError(
 								formatClientTerminalAbortFailure(prepared, readDiagnostic, pendingNotices),
@@ -1828,7 +1830,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 									error,
 								});
 							}
-							appendAcpSnapshot(current.output);
+							appendAcpSnapshot(current.output, current.truncated);
 							const prepared = await prepareClientTerminalOutput(this.session, current);
 							throw new ToolError(
 								formatClientTerminalWaitFailure(
@@ -1858,7 +1860,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 									error,
 								});
 							}
-							appendAcpSnapshot(current.output);
+							appendAcpSnapshot(current.output, current.truncated);
 							const prepared = await prepareClientTerminalOutput(this.session, current);
 							const timeoutNotices = [
 								...pendingNotices,
@@ -1894,7 +1896,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							await boundedKill();
 							const diagnostic = boundArtifactSaveDiagnostic(error);
 							const recoveredOutput = retainedAcpOutput();
-							appendAcpSnapshot(recoveredOutput.output);
+							appendAcpSnapshot(recoveredOutput.output, recoveredOutput.truncated);
 							const prepared = await prepareClientTerminalOutput(this.session, recoveredOutput);
 							logger.warn("ACP terminal poll output read failed", {
 								terminalId: handle.terminalId,
@@ -1917,7 +1919,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 								? `${summary.output}${summary.output.endsWith("\n") ? "" : "\n"}(output truncated)`
 								: summary.output;
 						latestText = pollText;
-						appendAcpSnapshot(pollOutput.output);
+						appendAcpSnapshot(pollOutput.output, pollOutput.truncated);
 						if (!bridgeBackgrounded) {
 							try {
 								onUpdate?.({
@@ -1951,7 +1953,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							error,
 						});
 					}
-					appendAcpSnapshot(current.output);
+					appendAcpSnapshot(current.output, current.truncated);
 					const prepared = await prepareClientTerminalOutput(this.session, current);
 					throw new ToolAbortError(formatClientTerminalAbortFailure(prepared, readDiagnostic, pendingNotices));
 				}
@@ -1977,7 +1979,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				}
 				if (runSignal?.aborted) {
 					await boundedKill();
-					appendAcpSnapshot(finalOutput.output);
+					appendAcpSnapshot(finalOutput.output, finalOutput.truncated);
 					const prepared = await prepareClientTerminalOutput(this.session, finalOutput);
 					throw new ToolAbortError(
 						formatClientTerminalAbortFailure(prepared, finalReadDiagnostic, pendingNotices),
@@ -1989,7 +1991,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				const exitCode: number | undefined =
 					rawExitCode != null ? rawExitCode : exitStatus.signal ? 137 : undefined;
 
-				appendAcpSnapshot(finalOutput.output);
+				appendAcpSnapshot(finalOutput.output, finalOutput.truncated);
 				const prepared = await prepareClientTerminalOutput(this.session, finalOutput);
 
 				const bridgeResult: BashResult = {
