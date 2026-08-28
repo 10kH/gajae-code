@@ -87,6 +87,7 @@ interface PendingTransitionRelease {
 	generation: TransitionDirectoryGeneration;
 	held: LockOwnerSnapshot;
 	releasedOwner: SessionStateLockOwner;
+	recoverable: boolean;
 	recovery?: Promise<boolean>;
 }
 
@@ -1166,6 +1167,10 @@ async function recoverPendingTransitionRelease(transitionDir: string, recoveryKe
 		}
 	}
 	if (pending === undefined) return false;
+	// The record is armed before release's fallible phases, but it is not authority
+	// for a contender while that release is still in progress. The owner that armed
+	// it flips this bit only when a phase actually throws.
+	if (!pending.recoverable) return false;
 	if (pending.recovery) return await pending.recovery;
 	const recovery = (async (): Promise<boolean> => {
 		const ownerFile = `${transitionDir}.owner`;
