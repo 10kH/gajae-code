@@ -170,6 +170,27 @@ function artifactReferenceIsReachable(text: string, result: BashResult | BashInt
 	);
 }
 
+function suffixPrefixOverlap(source: string, target: string): number {
+	if (source.length === 0 || target.length === 0) return 0;
+	const prefix = new Uint32Array(target.length);
+	for (let index = 1; index < target.length; index += 1) {
+		let length = prefix[index - 1] ?? 0;
+		const code = target.charCodeAt(index);
+		while (length > 0 && code !== target.charCodeAt(length)) length = prefix[length - 1] ?? 0;
+		if (code === target.charCodeAt(length)) length += 1;
+		prefix[index] = length;
+	}
+
+	let overlap = 0;
+	for (let index = 0; index < source.length; index += 1) {
+		const code = source.charCodeAt(index);
+		while (overlap > 0 && code !== target.charCodeAt(overlap)) overlap = prefix[overlap - 1] ?? 0;
+		if (code === target.charCodeAt(overlap)) overlap += 1;
+		if (overlap === target.length) overlap = prefix[overlap - 1] ?? 0;
+	}
+	return overlap;
+}
+
 function artifactFailureDiagnosticForResult(result: BashResult | BashInteractiveResult): string | undefined {
 	const diagnostic = (result as OutputSummary).artifactFailureDiagnostic;
 	return typeof diagnostic === "string" && diagnostic.length > 0 ? diagnostic : undefined;
@@ -1685,19 +1706,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					retainedBytes > ACP_RAW_OVERLAP_BYTES
 						? sliceTextAfterUtf8ByteOffset(retainedAcpSnapshot, retainedBytes - ACP_RAW_OVERLAP_BYTES)
 						: retainedAcpSnapshot;
-				let separator = "\u0000";
-				while (boundedSnapshot.includes(separator) || boundedRetained.includes(separator)) separator += "\u0000";
-				const combined = `${boundedSnapshot}${separator}${boundedRetained}`;
-				const prefix = new Uint32Array(combined.length);
-				for (let index = 1; index < combined.length; index += 1) {
-					let candidate = prefix[index - 1] ?? 0;
-					while (candidate > 0 && combined[index] !== combined[candidate]) {
-						candidate = prefix[candidate - 1] ?? 0;
-					}
-					if (combined[index] === combined[candidate]) candidate += 1;
-					prefix[index] = candidate;
-				}
-				const overlap = prefix[combined.length - 1] ?? 0;
+				const overlap = suffixPrefixOverlap(boundedSnapshot, boundedRetained);
 				const delta = boundedSnapshot.slice(overlap);
 				if (bridgeJobId && delta) ownedManager?.appendOutput(bridgeJobId, delta);
 				retainedAcpSnapshot = boundedSnapshot;

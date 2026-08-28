@@ -298,6 +298,23 @@ describe("BashTool ACP terminal fold", () => {
 		expect(text).toContain("Command timed out after 1 seconds");
 	});
 
+	it("handles NUL-heavy ACP snapshots without quadratic delimiter search", async () => {
+		const output = `${"\u0000".repeat(65_536)}tail\n`;
+		const handle: ClientBridgeTerminalHandle = {
+			terminalId: "term-nul-heavy",
+			waitForExit: async () => ({ exitCode: 0, signal: null }),
+			currentOutput: async () => ({ output, truncated: false }),
+			kill: async () => {},
+			release: async () => {},
+		};
+		const bridge: ClientBridge = { capabilities: { terminal: true }, createTerminal: async () => handle };
+		const h = makeHarness(bridge);
+		const tool = new BashTool(h.session);
+
+		const result = await tool.execute("call-nul-heavy", { command: "printf nul-heavy" }, undefined, () => {});
+		expect(result.details?.terminalId).toBe("term-nul-heavy");
+	});
+
 	it("retains polled ACP output without a job manager", async () => {
 		let outputReads = 0;
 		const pendingExit = Promise.withResolvers<ClientBridgeTerminalExitStatus>();
