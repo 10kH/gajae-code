@@ -3,6 +3,7 @@ import { AsyncJobManager } from "../src/async";
 import { JobsObserver } from "../src/modes/jobs-observer";
 import type {
 	ClientBridge,
+	ClientBridgeTerminalExitStatus,
 	ClientBridgeTerminalHandle,
 	ClientBridgeTerminalOutput,
 } from "../src/session/client-bridge";
@@ -242,12 +243,14 @@ describe("BashTool ACP terminal fold", () => {
 	});
 
 	it("returns an update error when post-create ACP cleanup never settles", async () => {
+		const pendingKill = Promise.withResolvers<void>();
+		const pendingRelease = Promise.withResolvers<void>();
 		const handle: ClientBridgeTerminalHandle = {
 			terminalId: "term-update-error",
 			waitForExit: async () => ({ exitCode: 0, signal: null }),
 			currentOutput: async () => ({ output: "", truncated: false }),
-			kill: async () => await new Promise<void>(() => {}),
-			release: async () => await new Promise<void>(() => {}),
+			kill: () => pendingKill.promise,
+			release: () => pendingRelease.promise,
 		};
 		const bridge: ClientBridge = { capabilities: { terminal: true }, createTerminal: async () => handle };
 		const h = makeHarness(bridge);
@@ -265,14 +268,15 @@ describe("BashTool ACP terminal fold", () => {
 
 	it("retains polled ACP output when timeout recovery read expires", async () => {
 		let outputReads = 0;
-		const pendingOutput = new Promise<ClientBridgeTerminalOutput>(() => {});
+		const pendingOutput = Promise.withResolvers<ClientBridgeTerminalOutput>();
+		const pendingExit = Promise.withResolvers<ClientBridgeTerminalExitStatus>();
 		const handle: ClientBridgeTerminalHandle = {
 			terminalId: "term-timeout-recovery",
-			waitForExit: () => new Promise(() => {}),
+			waitForExit: () => pendingExit.promise,
 			currentOutput: async () => {
 				outputReads += 1;
 				if (outputReads === 1) return { output: "polled diagnostics\n", truncated: false };
-				return pendingOutput;
+				return pendingOutput.promise;
 			},
 			kill: async () => {},
 			release: async () => {},
@@ -296,9 +300,10 @@ describe("BashTool ACP terminal fold", () => {
 
 	it("retains polled ACP output without a job manager", async () => {
 		let outputReads = 0;
+		const pendingExit = Promise.withResolvers<ClientBridgeTerminalExitStatus>();
 		const handle: ClientBridgeTerminalHandle = {
 			terminalId: "term-managerless-timeout-recovery",
-			waitForExit: () => new Promise(() => {}),
+			waitForExit: () => pendingExit.promise,
 			currentOutput: async () => {
 				outputReads += 1;
 				if (outputReads <= 3) return { output: "managerless diagnostics\n", truncated: false };
@@ -346,14 +351,14 @@ describe("BashTool ACP terminal fold", () => {
 	it("retains polled ACP output when abort races final recovery", async () => {
 		let outputReads = 0;
 		const exit = Promise.withResolvers<{ exitCode: number; signal: null }>();
-		const pendingOutput = new Promise<ClientBridgeTerminalOutput>(() => {});
+		const pendingOutput = Promise.withResolvers<ClientBridgeTerminalOutput>();
 		const handle: ClientBridgeTerminalHandle = {
 			terminalId: "term-abort-recovery",
 			waitForExit: () => exit.promise,
 			currentOutput: async () => {
 				outputReads += 1;
 				if (outputReads === 1) return { output: "abort diagnostics\n", truncated: false };
-				return pendingOutput;
+				return pendingOutput.promise;
 			},
 			kill: async () => {},
 			release: async () => {},
@@ -374,9 +379,10 @@ describe("BashTool ACP terminal fold", () => {
 	it("kills and retains output when an ACP poll read rejects", async () => {
 		let outputReads = 0;
 		let killCalls = 0;
+		const pendingExit = Promise.withResolvers<ClientBridgeTerminalExitStatus>();
 		const handle: ClientBridgeTerminalHandle = {
 			terminalId: "term-poll-recovery",
-			waitForExit: () => new Promise(() => {}),
+			waitForExit: () => pendingExit.promise,
 			currentOutput: async () => {
 				outputReads += 1;
 				if (outputReads === 1) return { output: "poll diagnostics\n", truncated: false };

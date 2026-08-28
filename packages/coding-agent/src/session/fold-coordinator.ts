@@ -24,6 +24,7 @@
  *    degrade into an ordinary receipt-less completion.
  */
 import type { AsyncJob } from "../async/job-manager";
+import foldReceiptPrompt from "../prompts/tools/fold-receipt.md" with { type: "text" };
 
 /**
  * Idle-flush merge window.
@@ -161,19 +162,21 @@ export type FoldRetireReason = "cancel" | "evict";
  * kinds that can actually change directory.
  */
 export function describeFoldReceipt(receipt: FoldReceipt): string {
-	const lines = [
-		`This result came from a folded ${receipt.kind} wait (job ${receipt.jobId}).`,
-		`Output reference: ${receipt.outputRef.instruction}`,
-	];
-	if (receipt.cwdSensitive) {
-		lines.push(
-			"Session cwd is unchanged; any directory change made by the folded command does not apply to later commands.",
-		);
-	}
-	if (receipt.remainingIntent) {
-		lines.push(`Complete the original request, which was: ${receipt.remainingIntent}`);
-	}
-	return lines.join("\n");
+	return foldReceiptPrompt
+		.replace("{{kind}}", receipt.kind)
+		.replace("{{jobId}}", receipt.jobId)
+		.replace("{{outputInstruction}}", receipt.outputRef.instruction)
+		.replace(
+			"{{cwdNotice}}",
+			receipt.cwdSensitive
+				? "Session cwd is unchanged; any directory change made by the folded command does not apply to later commands.\n"
+				: "",
+		)
+		.replace(
+			"{{intentNotice}}",
+			receipt.remainingIntent ? `Complete the original request, which was: ${receipt.remainingIntent}` : "",
+		)
+		.trim();
 }
 
 export class FoldCoordinator {

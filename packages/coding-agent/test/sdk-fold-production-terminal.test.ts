@@ -5,7 +5,7 @@ import { TempDir } from "@gajae-code/utils";
 import { AsyncJobManager } from "../src/async";
 import { Settings } from "../src/config/settings";
 import { createAcpClientBridge } from "../src/modes/acp/acp-client-bridge";
-import { createAgentSession } from "../src/sdk";
+import { type CreateAgentSessionResult, createAgentSession } from "../src/sdk";
 import { AuthStorage } from "../src/session/auth-storage";
 import type { ClientBridgeTerminalHandle } from "../src/session/client-bridge";
 import { SessionManager } from "../src/session/session-manager";
@@ -20,7 +20,7 @@ async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<voi
 }
 
 describe("SDK production ACP fold path", () => {
-	let created: Awaited<ReturnType<typeof createAgentSession>> | undefined;
+	let created: CreateAgentSessionResult | undefined;
 	let authStorage: AuthStorage | undefined;
 	let tempDir: TempDir | undefined;
 

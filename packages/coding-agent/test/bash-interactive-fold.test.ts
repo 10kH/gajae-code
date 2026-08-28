@@ -4,7 +4,7 @@
  * re-execute the process, and output must stay continuous across the fold.
  */
 import { describe, expect, it } from "bun:test";
-import * as fs from "node:fs";
+import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolContext } from "@gajae-code/agent-core";
@@ -23,26 +23,26 @@ interface CapturedComponent {
 function createTestUi(captured?: { component?: CapturedComponent }): NonNullable<AgentToolContext["ui"]> {
 	return {
 		custom<T>(factory: unknown): Promise<T> {
-			return new Promise<T>((resolve, reject) => {
-				let component: CapturedComponent | undefined;
-				const done = (result: T) => {
-					component?.dispose?.();
-					resolve(result);
-				};
-				try {
-					component = (
-						factory as (
-							tui: { terminal: { rows: number; columns: number }; requestRender: () => void },
-							theme: Record<string, never>,
-							keybindings: Record<string, never>,
-							done: (result: T) => void,
-						) => CapturedComponent
-					)({ terminal: { rows: 40, columns: 120 }, requestRender: () => {} }, {}, {}, done);
-					if (captured) captured.component = component;
-				} catch (error) {
-					reject(error);
-				}
-			});
+			const result = Promise.withResolvers<T>();
+			let component: CapturedComponent | undefined;
+			const done = (value: T) => {
+				component?.dispose?.();
+				result.resolve(value);
+			};
+			try {
+				component = (
+					factory as (
+						tui: { terminal: { rows: number; columns: number }; requestRender: () => void },
+						theme: Record<string, never>,
+						keybindings: Record<string, never>,
+						done: (result: T) => void,
+					) => CapturedComponent
+				)({ terminal: { rows: 40, columns: 120 }, requestRender: () => {} }, {}, {}, done);
+				if (captured) captured.component = component;
+			} catch (error) {
+				result.reject(error);
+			}
+			return result.promise;
 		},
 	} as unknown as NonNullable<AgentToolContext["ui"]>;
 }
@@ -68,16 +68,16 @@ const FOLD_RESULT: BashInteractiveResult = {
 	truncated: false,
 };
 
-function tempDir(): string {
+async function tempDir(): Promise<string> {
 	const dir = path.join(os.tmpdir(), `pty-fold-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-	fs.mkdirSync(dir, { recursive: true });
+	await fs.mkdir(dir, { recursive: true });
 	return dir;
 }
 
-async function waitFor(predicate: () => boolean, timeoutMs = 10_000): Promise<void> {
+async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 10_000): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
-		if (predicate()) return;
+		if (await predicate()) return;
 		await Bun.sleep(10);
 	}
 	throw new Error("waitFor timed out");
@@ -85,7 +85,7 @@ async function waitFor(predicate: () => boolean, timeoutMs = 10_000): Promise<vo
 
 describe("interactive PTY fold ownership", () => {
 	it("settles the foreground on fold while the process keeps running to completion", async () => {
-		const dir = tempDir();
+		const dir = await tempDir();
 		try {
 			await Settings.init({ inMemory: true, cwd: dir });
 			const artifactPath = path.join(dir, "folded.log");
@@ -116,20 +116,24 @@ describe("interactive PTY fold ownership", () => {
 
 			// The process was NOT killed by folding: its post-fold output still lands
 			// in the artifact, so output/artifact state is continuous across the fold.
-			await waitFor(
-				() => fs.existsSync(artifactPath) && fs.readFileSync(artifactPath, "utf-8").includes("AFTER-FOLD"),
-			);
-			const artifact = fs.readFileSync(artifactPath, "utf-8");
+			await waitFor(async () => {
+				try {
+					return (await Bun.file(artifactPath).text()).includes("AFTER-FOLD");
+				} catch {
+					return false;
+				}
+			});
+			const artifact = await Bun.file(artifactPath).text();
 			expect(artifact).toContain("BEFORE-FOLD");
 			expect(artifact).toContain("AFTER-FOLD");
 		} finally {
 			resetSettingsForTest();
-			fs.rmSync(dir, { recursive: true, force: true });
+			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
 
 	it("is idempotent: a second detach reports already-settled", async () => {
-		const dir = tempDir();
+		const dir = await tempDir();
 		try {
 			await Settings.init({ inMemory: true, cwd: dir });
 			const outcomes: string[] = [];
@@ -146,12 +150,12 @@ describe("interactive PTY fold ownership", () => {
 			expect(result.output).toBe("folded into a background job");
 		} finally {
 			resetSettingsForTest();
-			fs.rmSync(dir, { recursive: true, force: true });
+			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
 
 	it("keeps running when the observer view is disposed mid-run", async () => {
-		const dir = tempDir();
+		const dir = await tempDir();
 		try {
 			await Settings.init({ inMemory: true, cwd: dir });
 			const artifactPath = path.join(dir, "dismissed.log");
@@ -173,17 +177,17 @@ describe("interactive PTY fold ownership", () => {
 
 			const result = await runPromise;
 			expect(result.exitCode).toBe(0);
-			const artifact = fs.readFileSync(artifactPath, "utf-8");
+			const artifact = await Bun.file(artifactPath).text();
 			expect(artifact).toContain("START");
 			expect(artifact).toContain("SURVIVED");
 		} finally {
 			resetSettingsForTest();
-			fs.rmSync(dir, { recursive: true, force: true });
+			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
 
 	it("still completes the run when overlay view init fails", async () => {
-		const dir = tempDir();
+		const dir = await tempDir();
 		try {
 			await Settings.init({ inMemory: true, cwd: dir });
 			// The session is started before the overlay exists, so a failed view must
@@ -197,7 +201,7 @@ describe("interactive PTY fold ownership", () => {
 			expect(result.output).toContain("NO-VIEW");
 		} finally {
 			resetSettingsForTest();
-			fs.rmSync(dir, { recursive: true, force: true });
+			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
 
@@ -215,7 +219,7 @@ describe("interactive PTY fold ownership", () => {
 	});
 
 	it("keeps its original deadline after folding, surfacing the expiry as a real outcome", async () => {
-		const dir = tempDir();
+		const dir = await tempDir();
 		try {
 			await Settings.init({ inMemory: true, cwd: dir });
 			let controls: InteractivePtyControls | undefined;
@@ -240,7 +244,7 @@ describe("interactive PTY fold ownership", () => {
 			expect(outcome.timedOut || outcome.exitCode !== 0).toBe(true);
 		} finally {
 			resetSettingsForTest();
-			fs.rmSync(dir, { recursive: true, force: true });
+			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
 });

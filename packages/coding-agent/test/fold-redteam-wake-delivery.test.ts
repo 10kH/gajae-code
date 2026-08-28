@@ -13,7 +13,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { AsyncJobManager } from "../src/async";
 import type { AsyncJob } from "../src/async/job-manager";
-import { type FoldAdapter, FoldCoordinator } from "../src/session/fold-coordinator";
+import { type FoldAdapter, FoldCoordinator, type FoldDeliveryDisposition } from "../src/session/fold-coordinator";
 
 function job(id: string, generation: string, status: AsyncJob["status"] = "running"): AsyncJob {
 	return {
@@ -130,7 +130,7 @@ describe("fold red-team: exactly-once wake and notice across retry + rearm combi
 		coordinator.registerParticipant(probe.adapter);
 		await coordinator.requestFold();
 
-		const dispositions: Array<ReturnType<typeof coordinator.onDelivery>> = [];
+		const dispositions: FoldDeliveryDisposition[] = [];
 		const entryTexts: string[] = [];
 		for (let i = 0; i < 2; i += 1) {
 			const disposition = coordinator.onDelivery(target, `completion-${i}`);

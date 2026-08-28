@@ -5,7 +5,7 @@
  * own completion as dropped and silently kills auto-wake.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import * as fs from "node:fs";
+import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Agent, type AgentTool } from "@gajae-code/agent-core";
@@ -48,16 +48,16 @@ describe("live session fold", () => {
 	let tempDir = "";
 	const authStorages: AuthStorage[] = [];
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		tempDir = path.join(os.tmpdir(), `fold-live-${Snowflake.next()}`);
-		fs.mkdirSync(tempDir, { recursive: true });
+		await fs.mkdir(tempDir, { recursive: true });
 	});
 
 	afterEach(async () => {
 		if (session) await session.dispose();
 		session = undefined;
 		for (const storage of authStorages.splice(0)) storage.close();
-		if (tempDir && fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true });
+		if (tempDir) await fs.rm(tempDir, { recursive: true, force: true });
 		AsyncJobManager.resetForTests();
 	});
 
