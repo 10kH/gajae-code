@@ -29,8 +29,6 @@ import type {
 	RefresherSchedule,
 	SnapshotEntry,
 	SnapshotResponse,
-	SnapshotStreamEntryEvent,
-	SnapshotStreamRemovedEvent,
 	SnapshotStreamSnapshotEvent,
 } from "./types";
 import {
@@ -394,19 +392,6 @@ async function serveSnapshot(
 	return empty(304, snapshotHeaders(epoch, currentGeneration, includeEpoch));
 }
 
-/**
- * Stable per-credential fingerprint for SSE delta detection. Field order is
- * fixed by this serializer (NOT by entry insertion order) so a credential
- * built by two different paths still produces the same fingerprint.
- *
- * `rotatesInMs` is intentionally part of the fingerprint: when it shifts we
- * want the client to recompute its `prepareForRequest` deadline rather than
- * keep the stale projection.
- */
-function fingerprintEntry(entry: SnapshotEntry): string {
-	return JSON.stringify([entry.id, entry.provider, entry.identityKey, entry.rotatesInMs, entry.credential]);
-}
-
 function sseEvent(event: string, body: unknown): string {
 	return `event: ${event}\ndata: ${JSON.stringify(body)}\n\n`;
 }
@@ -422,7 +407,6 @@ function serveSnapshotStream(
 	const encoder = new TextEncoder();
 	const includeEpoch = req.headers.get(AUTH_BROKER_EPOCH_HEADER) === "1";
 	const openedAt = Date.now();
-	const lastByCredId = new Map<number, string>();
 	let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
 	let unsubscribe: (() => void) | null = null;
 	let keepaliveTimer: NodeJS.Timeout | undefined;
@@ -500,42 +484,13 @@ function serveSnapshotStream(
 					});
 				}
 				lastGeneration = snapshot.generation;
-				const seenIds = new Set<number>();
-				for (const entry of snapshot.credentials) {
-					seenIds.add(entry.id);
-					const fp = fingerprintEntry(entry);
-					if (lastByCredId.get(entry.id) === fp) continue;
-					lastByCredId.set(entry.id, fp);
-					const payload: SnapshotStreamEntryEvent = {
-						kind: "entry",
-						...(includeEpoch ? { epoch } : {}),
-						generation: snapshot.generation,
-						serverNowMs: snapshot.serverNowMs,
-						refresher: snapshot.refresher,
-						entry,
-					};
-					if (!write(sseEvent("entry", payload))) return;
-					logger.debug("auth-broker stream entry", {
-						peer,
-						id: entry.id,
-						provider: entry.provider,
-						generation: snapshot.generation,
-					});
-				}
-				for (const id of [...lastByCredId.keys()]) {
-					if (seenIds.has(id)) continue;
-					lastByCredId.delete(id);
-					const payload: SnapshotStreamRemovedEvent = {
-						kind: "removed",
-						...(includeEpoch ? { epoch } : {}),
-						generation: snapshot.generation,
-						serverNowMs: snapshot.serverNowMs,
-						refresher: snapshot.refresher,
-						id,
-					};
-					if (!write(sseEvent("removed", payload))) return;
-					logger.debug("auth-broker stream removed", { peer, id, generation: snapshot.generation });
-				}
+				const snapshotEvent: SnapshotStreamSnapshotEvent = { kind: "snapshot", ...snapshot };
+				if (!write(sseEvent("snapshot", snapshotEvent))) return;
+				logger.debug("auth-broker stream snapshot", {
+					peer,
+					credentialCount: snapshot.credentials.length,
+					generation: snapshot.generation,
+				});
 			} while (pendingBumps > 0 && !closed);
 		} finally {
 			processing = false;
@@ -562,7 +517,6 @@ function serveSnapshotStream(
 				}
 				const initial = buildSnapshot(storage, refresher, epoch, includeEpoch);
 				lastGeneration = initial.generation;
-				for (const entry of initial.credentials) lastByCredId.set(entry.id, fingerprintEntry(entry));
 				const initialEvent: SnapshotStreamSnapshotEvent = { kind: "snapshot", ...initial };
 				if (!write(sseEvent("snapshot", initialEvent))) return;
 				initializing = false;
