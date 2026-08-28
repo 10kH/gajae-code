@@ -8385,13 +8385,13 @@ export class SessionManager {
 			this.#usageStatistics = commit.usageStatistics;
 			this.#flushed = true;
 			this.#ensuredOnDisk = true;
-			this.#managedPersistExpectedIdentity = this.#captureManagedPersistIdentity(sessionFile);
+			this.#managedPersistExpectedIdentity =
+				this.destination.kind === "managed" ? this.#captureManagedPersistIdentity(sessionFile) : undefined;
 			this.#lazyReopenSucceeded = true;
 			this.#lazyReopenFallbackReason = undefined;
 			initialized = true;
 			return true;
-		} catch (error) {
-			SessionManagerTestHooks.lastSidecarInitError = toError(error).message;
+		} catch {
 			return false;
 		} finally {
 			if (!initialized) {
@@ -8572,7 +8572,8 @@ export class SessionManager {
 				this.#lazyReopenFallbackReason = "bounded_first_open_descriptor_changed";
 				return false;
 			}
-			this.#managedPersistExpectedIdentity = this.#captureManagedPersistIdentity(sessionFile);
+			this.#managedPersistExpectedIdentity =
+				this.destination.kind === "managed" ? this.#captureManagedPersistIdentity(sessionFile) : undefined;
 			this.#sessionId = discovery.header.id;
 			this.#sessionName = discovery.header.title;
 			this.#titleSource = discovery.header.titleSource;
