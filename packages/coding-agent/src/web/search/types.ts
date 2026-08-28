@@ -27,6 +27,18 @@ export type SearchProviderId =
 
 export type WebSearchMode = "on" | "off" | "auto";
 
+/** Credentials and request headers resolved for the active model. */
+export interface ActiveSearchModelCredentials {
+	apiKey?: string;
+	headers?: Record<string, string>;
+}
+
+/** Refresh-aware resolver supplied by the model registry for native search. */
+export type ActiveSearchModelCredentialResolver = (options: {
+	sessionId?: string;
+	signal?: AbortSignal;
+}) => Promise<ActiveSearchModelCredentials>;
+
 export interface ActiveSearchModelContext {
 	provider: string;
 	modelId: string;
@@ -34,6 +46,10 @@ export interface ActiveSearchModelContext {
 	api: string;
 	baseUrl?: string;
 	headers?: Record<string, string>;
+	/** Resolve the active model key and current headers before each native search. */
+	resolveCredentials?: ActiveSearchModelCredentialResolver;
+	/** True when registry-owned auth or transport overrides this active model. */
+	ownerAuthOverride?: boolean;
 	webSearch?: WebSearchMode;
 }
 

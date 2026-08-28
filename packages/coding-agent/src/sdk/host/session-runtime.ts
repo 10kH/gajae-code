@@ -8,8 +8,21 @@ import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Api, Model } from "@gajae-code/ai/core";
 import { logger } from "@gajae-code/utils";
 import { AsyncJobManager } from "../../async";
+import {
+	getProxyRoutableProviders,
+	inspectProxyProviderId,
+	requiresQualifiedModelProfileRoleResolution,
+	resolveProxyMode,
+	rewriteSelectorForProxy,
+	tryResolveProxyProviderId,
+} from "../../config/model-profile-activation";
 import { isModelProfileProviderAvailable, projectModelProfileCatalog } from "../../config/model-profile-contract";
-import { type ModelProfileDefinition, resolveProfileBindings } from "../../config/model-profiles";
+import {
+	deriveModelProfileMappedProviders,
+	type ModelProfileDefinition,
+	resolveProfileBindings,
+} from "../../config/model-profiles";
+import { isAuthenticated, kNoAuth } from "../../config/model-registry";
 import { resolveModelChainWithAuth, splitSelectorThinkingSuffix } from "../../config/model-resolver";
 import { type ModelSelectorValue, normalizeModelSelectorValue } from "../../config/model-selector-value";
 import { type Settings, validateSettingPatch } from "../../config/settings";
@@ -26,7 +39,6 @@ import { parseThinkingLevel } from "../../thinking";
 import { ensureBroker } from "../broker/ensure";
 import { SessionIndex } from "../broker/session-index";
 import {
-	collectAuthenticatedProfileProviders,
 	parseSyntheticModelId,
 	resolveSyntheticModelSelection,
 	SYNTHETIC_PROVIDER_ID,
@@ -1118,21 +1130,50 @@ function createQuerySurface(
 		return undefined;
 	};
 	const getProfileCredentialSessionId = () => ctx.credentialSessionId ?? id;
+	const profileSettings = (options.settings ?? ctx.settings) as Pick<Settings, "get"> | undefined;
+	const getProfileAvailableModels = (): Model<Api>[] => {
+		const getAvailableForProfileActivation = ctx.modelRegistry.getAvailableForProfileActivation;
+		return typeof getAvailableForProfileActivation === "function"
+			? getAvailableForProfileActivation.call(ctx.modelRegistry)
+			: ctx.modelRegistry.getAvailable();
+	};
 	const resolveProfileAvailability = async (
 		profile: ModelProfileDefinition,
 		authenticatedProviders: ReadonlySet<string>,
 	): Promise<{ available: boolean; defaultModel?: Model<Api> }> => {
+		if (profile.source !== "user" && inspectProxyProviderId(profileSettings).status === "invalid")
+			return { available: false };
+		const proxyProvider = profile.source === "user" ? undefined : tryResolveProxyProviderId(profileSettings);
+		const proxyAuthenticated = proxyProvider !== undefined && authenticatedProviders.has(proxyProvider);
+		const profileAuthenticated = new Set(authenticatedProviders);
+		if (proxyAuthenticated) {
+			for (const provider of getProxyRoutableProviders(profile)) profileAuthenticated.add(provider);
+		}
 		const rewriteSelectorProvider = (selector: string): string => {
 			const slash = selector.indexOf("/");
 			if (slash < 0) return selector;
 			const provider = selector.slice(0, slash);
-			if (authenticatedProviders.has(provider)) return selector;
+			if (profileAuthenticated.has(provider)) return selector;
 			const group = (profile.alternativeProviderGroups ?? []).find(candidates => candidates.includes(provider));
 			if (!group) return selector;
-			const replacement = group.find(candidate => authenticatedProviders.has(candidate));
+			const replacement = group.find(candidate => profileAuthenticated.has(candidate));
 			return replacement ? replacement + selector.slice(slash) : selector;
 		};
 		try {
+			const proxyMode = profile.source === "user" ? "fallback" : resolveProxyMode(profileSettings);
+			if (profile.source !== "user") {
+				const configuredProviders = ctx.modelRegistry.getConfiguredProviderIds?.() ?? [];
+				if (proxyProvider !== undefined && !configuredProviders.includes(proxyProvider))
+					return { available: false };
+			}
+			if (profile.source !== "user" && proxyMode === "always") {
+				if (
+					proxyProvider === undefined ||
+					!proxyAuthenticated ||
+					!(ctx.modelRegistry.getConfiguredProviderIds?.() ?? []).includes(proxyProvider)
+				)
+					return { available: false };
+			}
 			const bindings = resolveProfileBindings(profile);
 			const assignments: Array<{ value: ModelSelectorValue; isDefault: boolean }> = [];
 			if (bindings.defaultSelector !== undefined) {
@@ -1140,23 +1181,44 @@ function createQuerySurface(
 			}
 			for (const value of Object.values(bindings.modelRoles)) assignments.push({ value, isDefault: false });
 			for (const value of Object.values(bindings.agentModelOverrides)) assignments.push({ value, isDefault: false });
+			const availableModels = getProfileAvailableModels();
+			const resolutionRegistry = {
+				...ctx.modelRegistry,
+				getAvailable: () => availableModels,
+				getApiKey: (model: Model<Api>, sessionId?: string) =>
+					ctx.modelRegistry.getApiKeyForProvider(model.provider, sessionId, model.baseUrl),
+				resolveCanonicalModel: ctx.modelRegistry.resolveCanonicalModel?.bind(ctx.modelRegistry),
+				getCanonicalVariants: ctx.modelRegistry.getCanonicalVariants?.bind(ctx.modelRegistry),
+				getCanonicalId: ctx.modelRegistry.getCanonicalId?.bind(ctx.modelRegistry),
+				resolveModelByLookupAlias: ctx.modelRegistry.resolveModelByLookupAlias?.bind(ctx.modelRegistry),
+				lookupAliasExists: ctx.modelRegistry.lookupAliasExists?.bind(ctx.modelRegistry),
+				clearCanonicalVariant: ctx.modelRegistry.clearCanonicalVariant?.bind(ctx.modelRegistry),
+			};
 			let defaultModel: Model<Api> | undefined;
 			for (const assignment of assignments) {
-				const selectors = normalizeModelSelectorValue(assignment.value).map(rewriteSelectorProvider);
+				let selectors = normalizeModelSelectorValue(assignment.value).map(rewriteSelectorProvider);
+				if (proxyProvider !== undefined && proxyAuthenticated && profile.source !== "user") {
+					selectors = selectors.map(selector =>
+						rewriteSelectorForProxy(
+							selector,
+							proxyProvider,
+							proxyMode,
+							availableModels,
+							new Set(authenticatedProviders),
+							getProxyRoutableProviders(profile),
+						),
+					);
+				}
 				const hasBareSelector = selectors.some(selector => {
 					const suffix = splitSelectorThinkingSuffix(selector);
 					const identity = suffix.thinkingLevel ? suffix.selector : selector;
 					return !identity.includes("/");
 				});
-				if (!assignment.isDefault && !hasBareSelector) continue;
+				if (!assignment.isDefault && !requiresQualifiedModelProfileRoleResolution(profile) && !hasBareSelector)
+					continue;
 				const resolution = await resolveModelChainWithAuth(
 					selectors,
-					{
-						...ctx.modelRegistry,
-						getAvailable: () => ctx.modelRegistry.getAvailable(),
-						getApiKey: (model: Model<Api>, sessionId?: string) =>
-							ctx.modelRegistry.getApiKeyForProvider(model.provider, sessionId, model.baseUrl),
-					},
+					resolutionRegistry,
 					options.settings,
 					getProfileCredentialSessionId(),
 					{
@@ -1173,6 +1235,45 @@ function createQuerySurface(
 		} catch {
 			return { available: false };
 		}
+	};
+	const collectProfileAuthentication = async (
+		profiles: ReadonlyMap<string, ModelProfileDefinition>,
+	): Promise<Set<string>> => {
+		const providers = new Set<string>();
+		for (const profile of profiles.values()) {
+			for (const provider of profile.requiredProviders) providers.add(provider);
+			for (const group of profile.alternativeProviderGroups ?? []) {
+				for (const provider of group) providers.add(provider);
+			}
+			for (const provider of deriveModelProfileMappedProviders(profile)) providers.add(provider);
+		}
+		const authenticated = new Set<string>();
+		await Promise.all(
+			[...providers].map(async provider => {
+				try {
+					const apiKey = await ctx.modelRegistry.getApiKeyForProvider(provider, getProfileCredentialSessionId());
+					if (apiKey === kNoAuth || isAuthenticated(apiKey)) authenticated.add(provider);
+				} catch {
+					// A provider whose credential state cannot be read is not currently configurable.
+				}
+			}),
+		);
+		const proxyProviders = new Set<string>();
+		for (const profile of profiles.values()) {
+			if (profile.source === "user") continue;
+			const proxyProvider = tryResolveProxyProviderId(profileSettings);
+			if (proxyProvider !== undefined) proxyProviders.add(proxyProvider);
+		}
+		for (const proxyProvider of proxyProviders) {
+			try {
+				const apiKey = await ctx.modelRegistry.getApiKeyForProvider(proxyProvider, getProfileCredentialSessionId());
+				if (apiKey === kNoAuth || isAuthenticated(apiKey)) authenticated.add(proxyProvider);
+			} catch {
+				// Passive availability must degrade to unavailable when proxy credential
+				// refresh/storage fails; explicit activation retains its diagnostics.
+			}
+		}
+		return authenticated;
 	};
 	const getDiff = async () => {
 		try {
@@ -1306,9 +1407,7 @@ function createQuerySurface(
 			if (collision) return degraded();
 			let authenticatedProviders: ReadonlySet<string>;
 			try {
-				authenticatedProviders = await collectAuthenticatedProfileProviders(profiles, provider =>
-					ctx.modelRegistry.getApiKeyForProvider(provider, getProfileCredentialSessionId()),
-				);
+				authenticatedProviders = await collectProfileAuthentication(profiles);
 			} catch {
 				// Availability join failed: degrade only the synthetic facade,
 				// retain concrete rows and the active marker readback.
@@ -1326,7 +1425,12 @@ function createQuerySurface(
 			);
 			const availableProfileIds = new Set<string>();
 			for (const [name, profile] of profiles) {
-				if (!isModelProfileProviderAvailable(profile, authenticatedProviders)) continue;
+				if (profile.source !== "user" && inspectProxyProviderId(profileSettings).status === "invalid") continue;
+				const profileAuthenticated = new Set(authenticatedProviders);
+				const proxyProvider = profile.source === "user" ? undefined : tryResolveProxyProviderId(profileSettings);
+				if (proxyProvider !== undefined && profileAuthenticated.has(proxyProvider))
+					for (const provider of getProxyRoutableProviders(profile)) profileAuthenticated.add(provider);
+				if (!isModelProfileProviderAvailable(profile, profileAuthenticated)) continue;
 				if (!fullyResolvedProfiles.has(name)) continue;
 				// A profile with a default mapping is selectable only when its
 				// default chain actually resolves to an authenticated model:
@@ -1397,18 +1501,19 @@ function createQuerySurface(
 			(options.steerStatusLookup ?? (value => reconciliation.lookup("steer", value)))(selector),
 		getModelProfiles: async () => {
 			const profiles = ctx.modelRegistry.getModelProfiles();
-			const authenticatedProviders = await collectAuthenticatedProfileProviders(profiles, provider =>
-				ctx.modelRegistry.getApiKeyForProvider(provider, getProfileCredentialSessionId()),
-			);
+			const authenticatedProviders = await collectProfileAuthentication(profiles);
 			return (await Promise.all(
-				projectModelProfileCatalog(profiles, ctx.modelRegistry.getError()).map(async item => ({
-					...item,
-					available:
-						isModelProfileProviderAvailable(profiles.get(item.id)!, authenticatedProviders) &&
-						(
-							await resolveProfileAvailability(profiles.get(item.id)!, authenticatedProviders)
-						).available,
-				})),
+				projectModelProfileCatalog(profiles, ctx.modelRegistry.getError()).map(async item => {
+					const profile = profiles.get(item.id)!;
+					const profileAuthenticated = new Set(authenticatedProviders);
+					const proxyProvider = profile.source === "user" ? undefined : tryResolveProxyProviderId(profileSettings);
+					if (proxyProvider !== undefined && profileAuthenticated.has(proxyProvider))
+						for (const provider of getProxyRoutableProviders(profile)) profileAuthenticated.add(provider);
+					const available =
+						isModelProfileProviderAvailable(profile, profileAuthenticated) &&
+						(await resolveProfileAvailability(profile, authenticatedProviders)).available;
+					return { ...item, available };
+				}),
 			)) as unknown[];
 		},
 		installedQueries: policy.installedQueries,

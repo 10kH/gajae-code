@@ -168,6 +168,49 @@ describe("auth-broker wire surface", () => {
 			// Refresh token is replaced with the wire sentinel — clients never see it.
 			expect(entry.credential.refresh).toBe(REMOTE_REFRESH_SENTINEL);
 		}
+		expect(entry.revision).toBe(1);
+	});
+
+	test("snapshot client accepts omitted revisions and rejects malformed revisions", async () => {
+		const snapshot = {
+			generation: 1,
+			generatedAt: Date.now(),
+			serverNowMs: Date.now(),
+			refresher: { enabled: false, intervalMs: 0, skewMs: 0, nextSweepInMs: Number.MAX_SAFE_INTEGER },
+			credentials: [
+				{
+					id: 1,
+					provider: "anthropic",
+					credential: {
+						type: "oauth",
+						access: "access-a",
+						refresh: REMOTE_REFRESH_SENTINEL,
+						expires: Date.now() + 60_000,
+					},
+					identityKey: null,
+					rotatesInMs: null,
+				},
+			],
+		};
+		let malformed = false;
+		const dummy = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch: () =>
+				Response.json(
+					malformed ? { ...snapshot, credentials: [{ ...snapshot.credentials[0], revision: 1.5 }] } : snapshot,
+				),
+		});
+		try {
+			const client = new AuthBrokerClient({ url: `http://${dummy.hostname}:${dummy.port}`, token });
+			const accepted = await client.fetchSnapshot();
+			expect(accepted.status).toBe(200);
+			if (accepted.status === 200) expect(accepted.snapshot.credentials[0]?.revision).toBeUndefined();
+			malformed = true;
+			await expect(client.fetchSnapshot()).rejects.toThrow(/schema validation/);
+		} finally {
+			dummy.stop(true);
+		}
 	});
 
 	test("broker refresh posts the real secret only to the stored MCP token endpoint and preserves binding", async () => {
@@ -344,6 +387,7 @@ describe("auth-broker wire surface", () => {
 		const client = new AuthBrokerClient({ url: handle!.url, token });
 		const result = await client.refreshCredential(id);
 		expect(result.entry.id).toBe(id);
+		expect(result.entry.revision).toBe(2);
 		if (result.entry.credential.type === "oauth") {
 			expect(result.entry.credential.access).toBe("access-rotated");
 			expect(result.entry.credential.refresh).toBe(REMOTE_REFRESH_SENTINEL);

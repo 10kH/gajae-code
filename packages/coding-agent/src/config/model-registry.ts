@@ -1,6 +1,7 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import {
 	type Api,
 	type AssistantMessageEventStream,
@@ -55,8 +56,8 @@ function normalizeVllmApiKey(provider: string, apiKey: string | undefined): stri
 
 import { registerOAuthProvider, unregisterOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@gajae-code/ai/utils/oauth/types";
-import { $pickCredentialEnv, $rotatingCredentialEnv, isRecord, logger } from "@gajae-code/utils";
-import { parseModelString, resolveProviderModelReference } from "../config/model-resolver";
+import { $pickCredentialEnv, $rotatingCredentialEnv, getAgentDir, isRecord, logger } from "@gajae-code/utils";
+import { parseModelString, resolveProviderModelReference, splitSelectorThinkingSuffix } from "../config/model-resolver";
 import { isValidThemeColor, type ThemeColor } from "../modes/theme/theme";
 import {
 	type ActiveProviderDescriptor,
@@ -65,10 +66,15 @@ import {
 } from "../sdk/providers";
 import type { AuthStorage, OAuthCredential } from "../session/auth-storage";
 import type { ActiveSearchModelContext, WebSearchMode } from "../web/search/types";
-import { type ConfigError, ConfigFile } from "./config-file";
+import { ConfigError, ConfigFile } from "./config-file";
 import { isAuthenticated, kNoAuth } from "./model-auth";
 import { type ConfiguredModelBindings, ModelBindingsApplier } from "./model-bindings-applier";
 import { ModelDiscoveryManager, type ProviderDiscoveryState } from "./model-discovery-manager";
+import {
+	loadAcceptedModelPresetProfiles,
+	type ModelPresetRegistryDependencies,
+	refreshModelPresetRegistryInBackground,
+} from "./model-preset-registry";
 
 export type { ProviderDiscoveryState, ProviderDiscoveryStatus } from "./model-discovery-manager";
 
@@ -86,6 +92,7 @@ import {
 	type ModelProfileDefinition,
 	mergeModelProfiles,
 } from "./model-profiles";
+import { normalizeModelSelectorValue } from "./model-selector-value";
 import {
 	GJC_MODEL_ASSIGNMENT_TARGET_IDS,
 	type ModelOverride,
@@ -111,6 +118,7 @@ export type { CanonicalModelIndex, CanonicalModelRecord, CanonicalModelVariant, 
 export { isAuthenticated, kNoAuth };
 
 const MAX_SESSION_CANONICAL_VARIANTS = 64;
+const GENERATED_AUTH_HEADER = Symbol("generated-auth-header");
 function firstPositiveDiscoveryNumber(...values: readonly unknown[]): number | undefined {
 	for (const value of values) {
 		const number =
@@ -134,15 +142,18 @@ function stripUrlQuery(value: string): string {
 	return value.slice(0, queryStart) + (fragmentStart < 0 ? "" : value.slice(fragmentStart));
 }
 
-function envAvailabilityFingerprint(): string {
-	return Object.entries(process.env)
-		.filter(
-			([name]) =>
+function envAvailabilityFingerprint(configuredNames?: ReadonlySet<string>): string {
+	const names = new Set(
+		Object.keys(process.env).filter(
+			name =>
 				/(?:_API_KEY|_OAUTH_TOKEN|_ACCESS_TOKEN)$/.test(name) ||
 				/^(?:GH_TOKEN|GITHUB_TOKEN|HF_TOKEN|COPILOT_GITHUB_TOKEN)$/.test(name),
-		)
-		.sort(([left], [right]) => left.localeCompare(right))
-		.map(([name, value]) => `${name}=${value ?? ""}`)
+		),
+	);
+	for (const name of configuredNames ?? []) names.add(name);
+	return [...names]
+		.sort((left, right) => left.localeCompare(right))
+		.map(name => `${name}=${process.env[name] ?? ""}`)
 		.join("\u0000");
 }
 
@@ -576,6 +587,7 @@ export const ModelsConfigFile = new ConfigFile<ModelsConfig>("models", ModelsCon
 
 /** Provider override config (baseUrl, headers, apiKey, compat, transport) without custom models */
 interface ProviderOverride {
+	api?: Api;
 	baseUrl?: string;
 	headers?: Record<string, string>;
 	apiKey?: string;
@@ -584,6 +596,82 @@ interface ProviderOverride {
 	transport?: Model<Api>["transport"];
 	requestTransform?: ModelRequestTransform;
 	cacheRetention?: CacheRetention;
+	isOAuth?: boolean;
+}
+
+function hasMatchingRegistryTransport(left: Model<Api>, right: Model<Api> | ProviderOverride): boolean {
+	return (
+		left.baseUrl === right.baseUrl &&
+		isDeepStrictEqual(left.headers, right.headers) &&
+		left.transport === right.transport &&
+		isDeepStrictEqual(left.requestTransform, right.requestTransform) &&
+		left.cacheRetention === right.cacheRetention &&
+		left.isOAuth === right.isOAuth
+	);
+}
+
+function commonRegistryTransportCompat(models: readonly Model<Api>[]): Model<Api>["compat"] | undefined {
+	if (models.length === 0) return undefined;
+	const records = models.map(model => model.compat as Record<string, unknown> | undefined);
+	const keys = new Set(records.flatMap(record => (record ? Object.keys(record) : [])));
+	const common: Record<string, unknown> = {};
+	for (const key of keys) {
+		const value = records[0]?.[key];
+		if (records.every(record => record !== undefined && isDeepStrictEqual(record[key], value))) common[key] = value;
+	}
+	return Object.keys(common).length > 0 ? (common as Model<Api>["compat"]) : undefined;
+}
+
+function registryModelMetadataWithoutApiSpecificFields(model: Model<Api>): Partial<Model<Api>> {
+	const metadata: Partial<Model<Api>> = {
+		name: model.name,
+		cost: model.cost,
+		contextWindow: model.contextWindow,
+		maxTokens: model.maxTokens,
+	};
+	if (model.longContextPricing !== undefined) metadata.longContextPricing = model.longContextPricing;
+	if (model.premiumMultiplier !== undefined) metadata.premiumMultiplier = model.premiumMultiplier;
+	if (model.priority !== undefined) metadata.priority = model.priority;
+	if (model.contextPromotionTarget !== undefined) metadata.contextPromotionTarget = model.contextPromotionTarget;
+	return metadata;
+}
+
+function registrySelectorResolvesToModel(selector: string, models: readonly Model<Api>[]): boolean {
+	if (models.some(model => model.id === selector || `${model.provider}/${model.id}` === selector)) return true;
+	const suffix = splitSelectorThinkingSuffix(selector);
+	const baseSelector = suffix.thinkingLevel === undefined ? selector : suffix.selector;
+	const parsed = parseModelString(baseSelector);
+	if (parsed) return models.some(model => model.provider === parsed.provider && model.id === parsed.id);
+	return models.some(model => model.id === baseSelector || model.id.endsWith(`/${baseSelector}`));
+}
+
+function filterMaterializedRegistryProfiles(
+	profiles: ReadonlyMap<string, ModelProfileDefinition>,
+	models: readonly Model<Api>[],
+	dynamicProviders: ReadonlySet<string>,
+): Map<string, ModelProfileDefinition> {
+	const filtered = new Map<string, ModelProfileDefinition>();
+	for (const [name, profile] of profiles) {
+		if (
+			profile.source === "registry" &&
+			Object.values(profile.modelMapping).some(selectorValue => {
+				const selectors = normalizeModelSelectorValue(selectorValue);
+				return (
+					selectors.length > 0 &&
+					!selectors.some(selector => {
+						if (registrySelectorResolvesToModel(selector, models)) return true;
+						const suffix = splitSelectorThinkingSuffix(selector);
+						const parsed = parseModelString(suffix.thinkingLevel ? suffix.selector : selector);
+						return parsed !== undefined && dynamicProviders.has(parsed.provider);
+					})
+				);
+			})
+		) {
+			continue;
+		}
+		filtered.set(name, profile);
+	}
+	return filtered;
 }
 
 const PROVIDER_BASE_URL_ENV_ALIASES: Record<string, readonly string[]> = {
@@ -665,7 +753,7 @@ export function mergeDiscoveredModel<TApi extends Api>(
 		return {
 			...model,
 			baseUrl: providerOverride?.baseUrl ?? model.baseUrl ?? existing.baseUrl,
-			headers: existing.headers ? { ...existing.headers, ...model.headers } : model.headers,
+			headers: mergeCaseInsensitiveHeaders(existing.headers, model.headers),
 			requestTransform: mergeRequestTransform(
 				mergeRequestTransform(existing.requestTransform, model.requestTransform),
 				providerOverride?.requestTransform,
@@ -677,7 +765,7 @@ export function mergeDiscoveredModel<TApi extends Api>(
 		return {
 			...model,
 			baseUrl: providerOverride.baseUrl ?? model.baseUrl,
-			headers: providerOverride.headers ? { ...model.headers, ...providerOverride.headers } : model.headers,
+			headers: mergeCaseInsensitiveHeaders(model.headers, providerOverride.headers),
 			...(providerOverride.transport !== undefined ? { transport: providerOverride.transport } : {}),
 			requestTransform: mergeRequestTransform(model.requestTransform, providerOverride.requestTransform),
 		};
@@ -906,7 +994,11 @@ function resolveOAuthAccountIdForAccessToken(
 	authStorage: AuthStorage,
 	provider: string,
 	accessToken: string,
+	owner?: object,
 ): string | undefined {
+	if (authStorage.getEffectiveCredentialType(provider, undefined, owner ? { owner } : undefined) !== "oauth") {
+		return undefined;
+	}
 	const oauthCredentials = getOAuthCredentialsForProvider(authStorage, provider);
 	const matchingCredential = oauthCredentials.find(credential => credential.access === accessToken);
 	if (matchingCredential) {
@@ -1020,6 +1112,15 @@ function applyModelOverride(model: Model<Api>, override: ModelOverride): Model<A
 	}
 	if (override.headers) {
 		result.headers = { ...model.headers, ...override.headers };
+		const explicitAuthKey = Object.keys(override.headers).find(key => key.toLowerCase() === "authorization");
+		if (explicitAuthKey !== undefined) {
+			const explicitAuthValue = override.headers[explicitAuthKey];
+			deleteHeaderCaseInsensitive(result.headers, "Authorization");
+			result.headers[explicitAuthKey] = explicitAuthValue;
+			delete (result.headers as Record<string, string> & { [GENERATED_AUTH_HEADER]?: boolean })[
+				GENERATED_AUTH_HEADER
+			];
+		}
 	}
 	result.compat = mergeCompat(model.compat, override.compat);
 	return enrichModelThinking(result);
@@ -1100,7 +1201,36 @@ function mergeCustomModelHeaders(
 	authHeader: boolean | undefined,
 	apiKeyConfig: string | undefined,
 ): Record<string, string> | undefined {
-	return mergeAuthHeader({ ...providerHeaders, ...modelHeaders }, authHeader, apiKeyConfig);
+	const merged = mergeCaseInsensitiveHeaders(providerHeaders, modelHeaders);
+	return mergeAuthHeader(merged, authHeader, apiKeyConfig);
+}
+
+function mergeCaseInsensitiveHeaders(
+	baseHeaders: Record<string, string> | undefined,
+	overrideHeaders: Record<string, string> | undefined,
+): (Record<string, string> & { [GENERATED_AUTH_HEADER]?: string }) | undefined {
+	const merged: Record<string, string> = {};
+	for (const [key, value] of Object.entries(baseHeaders ?? {})) {
+		if (key.toLowerCase() === "authorization") deleteHeaderCaseInsensitive(merged, "Authorization");
+		merged[key] = value;
+	}
+	for (const [key, value] of Object.entries(overrideHeaders ?? {})) {
+		if (key.toLowerCase() === "authorization") deleteHeaderCaseInsensitive(merged, "Authorization");
+		merged[key] = value;
+	}
+	const baseGenerated = (baseHeaders as (Record<string, string> & { [GENERATED_AUTH_HEADER]?: string }) | undefined)?.[
+		GENERATED_AUTH_HEADER
+	];
+	const overrideGenerated = (
+		overrideHeaders as (Record<string, string> & { [GENERATED_AUTH_HEADER]?: string }) | undefined
+	)?.[GENERATED_AUTH_HEADER];
+	const survivingGenerated =
+		headerValue(overrideHeaders, "Authorization") !== undefined ? overrideGenerated : baseGenerated;
+	if (survivingGenerated !== undefined && headerValue(merged, "Authorization") === survivingGenerated) {
+		(merged as Record<string, string> & { [GENERATED_AUTH_HEADER]?: string })[GENERATED_AUTH_HEADER] =
+			survivingGenerated;
+	}
+	return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
 function mergeAuthHeader(
@@ -1109,11 +1239,41 @@ function mergeAuthHeader(
 	apiKeyConfig: string | undefined,
 ): Record<string, string> | undefined {
 	const nextHeaders = headers && Object.keys(headers).length > 0 ? { ...headers } : undefined;
-	if (!authHeader || !apiKeyConfig) {
+	if (!authHeader || !apiKeyConfig || headerValue(nextHeaders, "Authorization") !== undefined) {
 		return nextHeaders;
 	}
-	const resolvedKey = resolveApiKeyConfig(apiKeyConfig);
-	return resolvedKey ? { ...nextHeaders, Authorization: `Bearer ${resolvedKey}` } : nextHeaders;
+	return apiKeyConfig
+		? ({
+				...nextHeaders,
+				Authorization: `Bearer ${apiKeyConfig}`,
+				[GENERATED_AUTH_HEADER]: `Bearer ${apiKeyConfig}`,
+			} as Record<string, string>)
+		: nextHeaders;
+}
+
+function headerValue(headers: Record<string, string> | undefined, name: string): string | undefined {
+	const lowerName = name.toLowerCase();
+	const key = Object.keys(headers ?? {}).find(candidate => candidate.toLowerCase() === lowerName);
+	return key === undefined ? undefined : headers?.[key];
+}
+
+function deleteHeaderCaseInsensitive(headers: Record<string, string>, name: string): void {
+	const lowerName = name.toLowerCase();
+	for (const key of Object.keys(headers)) {
+		if (key.toLowerCase() === lowerName) delete headers[key];
+	}
+}
+
+function ownsOnlyGeneratedAuthorization(headers: Record<string, string>, generated: string | undefined): boolean {
+	if (generated === undefined) return false;
+	const entries = Object.entries(headers).filter(([key]) => key.toLowerCase() === "authorization");
+	return entries.length === 1 && entries[0]![1] === generated;
+}
+
+function deleteAuthorizationValue(headers: Record<string, string>, value: string): void {
+	for (const key of Object.keys(headers)) {
+		if (key.toLowerCase() === "authorization" && headers[key] === value) delete headers[key];
+	}
 }
 
 /**
@@ -1366,6 +1526,8 @@ interface ConfiguredDiscoveryResult {
 	clearPublishedModelIds?: readonly string[];
 }
 
+type ProviderRefreshFence = { providerId: string; generation: number } | { generations: ReadonlyMap<string, number> };
+
 /**
  * Model registry - loads and manages models, resolves API keys via AuthStorage.
  */
@@ -1384,6 +1546,7 @@ export class ModelRegistry {
 	#sessionCanonicalVariants = new Map<string, string>();
 	#customProviderApiKeys: Map<string, string> = new Map();
 	#customProviderApiKeyEnvNames: Map<string, string> = new Map();
+	#customProviderAuthHeaders: Map<string, boolean> = new Map();
 	#providerWebSearchModes: Map<string, WebSearchMode> = new Map();
 	#keylessProviders: Set<string> = new Set();
 	#optionalAuthProviders: Set<string> = new Set();
@@ -1420,21 +1583,42 @@ export class ModelRegistry {
 	#configError: ConfigError | undefined = undefined;
 	#modelsConfigFile: ConfigFile<ModelsConfig>;
 	#settings: Pick<Settings, "get" | "getGlobal">;
+	readonly #authStorageConfigOwner: object = {};
+	#disposeAuthStorageFallbackResolver: (() => void) | undefined;
 	#lastStaticLoadMtime: number | null = null;
 	#lastStaticLoadEnvironmentFingerprint: string | undefined;
+	#lastModelPresetRegistryFingerprint: string | undefined;
+	#loadedModelPresetRegistryManifestSha256: string | undefined;
+	#modelPresetRegistryAgentDir: string;
+	#modelPresetRegistryDependencies: Omit<ModelPresetRegistryDependencies, "agentDir">;
+	#cancelModelPresetRegistryRefresh: (() => Promise<void>) | undefined;
+	#disposePromise: Promise<void> | undefined;
+	#unsubscribeAuthGeneration: (() => void) | undefined;
 	#staticModelsLoaded = false;
 	#lastDisabledProviderKey: string | undefined;
 	#registeredProviderSources: Set<string> = new Set();
 	#cacheDbPath?: string;
 	#suppressedSelectors: Map<string, number> = new Map();
 	#backgroundRefresh?: Promise<void>;
+	#catalogMutationTail: Promise<void> = Promise.resolve();
+	#pendingCatalogMutations = 0;
+	#catalogRefreshGeneration = 0;
+	#providerRefreshGenerations = new Map<string, number>();
+	#disposed = false;
 	// Runtime extension model overlays — persist across refresh() cycles so that
 	// models registered by extensions survive the model selector's offline reload.
 	#runtimeModelOverlays: CustomModelOverlay[] = [];
 	#runtimeProviderApiKeys: Map<string, string> = new Map();
+	#runtimeProviderResolvedApiKeys: Map<string, string> = new Map();
+	#runtimeProviderCredentialInstalled: Set<string> = new Set();
+	#runtimeProviderApiKeyEnvNames: Map<string, string> = new Map();
 	#runtimeProviderOverrides: Map<string, ProviderOverride> = new Map();
+	#runtimeProviderAuthHeaders: Map<string, boolean> = new Map();
+	#generatedAuthHeaderProviders: Set<string> = new Set();
+	#generatedAuthHeaders: WeakMap<Model<Api>, { authorization?: string; apiKey?: string }> = new WeakMap();
 	#runtimeProvidersBySource: Map<string, Set<string>> = new Map();
 	#runtimeProviderSourceByName: Map<string, string> = new Map();
+	#registryModelKeys: Set<string> = new Set();
 	#rebuildPending: boolean = false;
 	#rebuildSuspended: number = 0;
 	#configuredApiKeyEnvNames: Set<string> = new Set();
@@ -1448,18 +1632,77 @@ export class ModelRegistry {
 		readonly authStorage: AuthStorage,
 		modelsPath?: string,
 		registrySettings?: Pick<Settings, "get" | "getGlobal">,
+		modelPresetRegistryDependencies: ModelPresetRegistryDependencies = {},
 	) {
 		this.#settings = registrySettings ?? settings;
+		const configuredAgentDir = path.resolve(modelPresetRegistryDependencies.agentDir ?? getAgentDir());
 		this.#modelsConfigFile = ModelsConfigFile.relocate(modelsPath);
+		this.#modelPresetRegistryAgentDir = modelPresetRegistryDependencies.agentDir
+			? configuredAgentDir
+			: modelsPath && path.isAbsolute(modelsPath)
+				? path.dirname(modelsPath)
+				: configuredAgentDir;
+		const { agentDir: _agentDir, ...registryDependencies } = modelPresetRegistryDependencies;
+		this.#modelPresetRegistryDependencies = registryDependencies;
 		this.#cacheDbPath = modelsPath ? path.join(path.dirname(modelsPath), "models.db") : undefined;
 		// Set up fallback resolver for custom provider API keys
-		this.authStorage.setFallbackResolver(provider => {
+		this.#disposeAuthStorageFallbackResolver = this.authStorage.setFallbackResolver(provider => {
 			const keyConfig = this.#customProviderApiKeys.get(provider);
 			return keyConfig;
-		});
-		this.authStorage.onGenerationChanged(() => this.#invalidateAvailableModels());
+		}, this.#authStorageConfigOwner);
+		this.#unsubscribeAuthGeneration = this.authStorage.onGenerationChanged(() => this.#invalidateAvailableModels());
 		// Load models synchronously in constructor
 		this.#loadModels();
+		this.#cancelModelPresetRegistryRefresh = refreshModelPresetRegistryInBackground(
+			{
+				...this.#modelPresetRegistryDependencies,
+				agentDir: this.#modelPresetRegistryAgentDir,
+				knownManifestSha256: this.#loadedModelPresetRegistryManifestSha256,
+			},
+			() => {
+				void this.#enqueueCatalogMutation(() => {
+					if (this.#disposed) return;
+					this.#reloadStaticModels();
+					this.#modelBindingsApplier.apply();
+					this.#notifyCatalogChanged();
+				}).catch(() => undefined);
+			},
+		);
+	}
+
+	dispose(): Promise<void> {
+		if (this.#disposePromise) return this.#disposePromise;
+		this.#disposed = true;
+		this.#catalogRefreshGeneration++;
+		const awaitRefreshDisposal = this.#cancelModelPresetRegistryRefresh?.() ?? Promise.resolve();
+		this.#cancelModelPresetRegistryRefresh = undefined;
+		this.#unsubscribeAuthGeneration?.();
+		this.#unsubscribeAuthGeneration = undefined;
+		this.authStorage.clearConfigApiKeys(this.#authStorageConfigOwner);
+		this.#disposeAuthStorageFallbackResolver?.();
+		this.#disposeAuthStorageFallbackResolver = undefined;
+		this.#catalogChangeListeners.clear();
+		this.#disposePromise = awaitRefreshDisposal;
+		return this.#disposePromise;
+	}
+
+	#enqueueCatalogMutation(operation: () => void | Promise<void>): Promise<void> {
+		this.#pendingCatalogMutations++;
+		let run: Promise<void>;
+		if (this.#pendingCatalogMutations === 1) {
+			try {
+				run = Promise.resolve(operation());
+			} catch (error) {
+				run = Promise.reject(error);
+			}
+		} else {
+			run = this.#catalogMutationTail.then(operation);
+		}
+		const completion = run.finally(() => {
+			this.#pendingCatalogMutations--;
+		});
+		this.#catalogMutationTail = completion.catch(() => undefined);
+		return completion;
 	}
 
 	onCatalogChanged(listener: () => void): () => void {
@@ -1471,22 +1714,34 @@ export class ModelRegistry {
 
 	/** Replace the read-only settings snapshot used by profile-scoped resolution. */
 	setScopedSettings(settingsReader: Pick<Settings, "get" | "getGlobal">): void {
+		this.#catalogRefreshGeneration++;
 		this.#settings = settingsReader;
+		this.#staticModelsLoaded = false;
+		this.#reloadStaticModels();
+		this.#rebuildCanonicalIndex();
 	}
 
 	/**
-	 * Reload models from disk (built-in + custom from models.json).
+	 * Reload models from disk (embedded + accepted registry + custom from models.yml).
 	 */
 	async refresh(strategy: ModelRefreshStrategy = "online-if-uncached"): Promise<void> {
-		this.#suspendRebuild();
-		try {
-			this.#reloadStaticModels();
-			this.#suppressedSelectors.clear();
-			await this.#refreshRuntimeDiscoveries(strategy);
-			this.#modelBindingsApplier.apply();
-		} finally {
-			this.#resumeRebuild();
-		}
+		if (this.#disposed) return;
+		await this.#enqueueCatalogMutation(async () => {
+			if (this.#disposed) return;
+			const refreshGeneration = ++this.#catalogRefreshGeneration;
+			const providerRefreshFence: ProviderRefreshFence = {
+				generations: new Map(this.#providerRefreshGenerations),
+			};
+			this.#suspendRebuild();
+			try {
+				this.#reloadStaticModels();
+				this.#suppressedSelectors.clear();
+				await this.#refreshRuntimeDiscoveries(strategy, undefined, refreshGeneration, providerRefreshFence);
+				if (refreshGeneration === this.#catalogRefreshGeneration) this.#modelBindingsApplier.apply();
+			} finally {
+				this.#resumeRebuild();
+			}
+		});
 	}
 
 	refreshInBackground(strategy: ModelRefreshStrategy = "online-if-uncached"): void {
@@ -1508,19 +1763,34 @@ export class ModelRegistry {
 	}
 
 	async refreshProvider(providerId: string, strategy: ModelRefreshStrategy = "online"): Promise<void> {
-		this.#suspendRebuild();
-		try {
-			this.#reloadStaticModels();
-			for (const selector of this.#suppressedSelectors.keys()) {
-				if (selector.startsWith(`${providerId}/`)) {
-					this.#suppressedSelectors.delete(selector);
+		if (this.#disposed) return;
+		const providerRefreshGeneration = (this.#providerRefreshGenerations.get(providerId) ?? 0) + 1;
+		this.#providerRefreshGenerations.set(providerId, providerRefreshGeneration);
+		await this.#enqueueCatalogMutation(async () => {
+			if (this.#disposed) return;
+			const refreshGeneration = this.#catalogRefreshGeneration;
+			this.#suspendRebuild();
+			try {
+				this.#reloadStaticModels();
+				for (const selector of this.#suppressedSelectors.keys()) {
+					if (selector.startsWith(`${providerId}/`)) {
+						this.#suppressedSelectors.delete(selector);
+					}
 				}
+				await this.#refreshRuntimeDiscoveries(strategy, new Set([providerId]), refreshGeneration, {
+					providerId,
+					generation: providerRefreshGeneration,
+				});
+				if (
+					refreshGeneration === this.#catalogRefreshGeneration &&
+					this.#providerRefreshGenerations.get(providerId) === providerRefreshGeneration
+				) {
+					this.#modelBindingsApplier.apply();
+				}
+			} finally {
+				this.#resumeRebuild();
 			}
-			await this.#refreshRuntimeDiscoveries(strategy, new Set([providerId]));
-			this.#modelBindingsApplier.apply();
-		} finally {
-			this.#resumeRebuild();
-		}
+		});
 	}
 
 	admitCachedProviderForStoredLiteralCredential(providerId: string, selector: AuthCredentialSelector): boolean {
@@ -1564,7 +1834,11 @@ export class ModelRegistry {
 			this.#discoveryManager.providerIds().has(providerId) ||
 			PROVIDER_DESCRIPTORS.some(descriptor => descriptor.providerId === providerId);
 		if (!supportsDiscovery) return undefined;
-		const authEvidence = this.authStorage.getStoredLiteralApiKeyEvidenceGeneration(providerId, selector);
+		const authEvidence = this.authStorage.getStoredLiteralApiKeyEvidenceGeneration(
+			providerId,
+			selector,
+			this.#authStorageConfigOwner,
+		);
 		if (!authEvidence) return undefined;
 		return [
 			...this.#loadCachedStandardProviderModels(providerId, authEvidence),
@@ -1608,11 +1882,22 @@ export class ModelRegistry {
 		const currentMtime = this.#modelsConfigFile.getMtimeMs();
 		const disabledProviderKey = [...getDisabledProviderIdsFromSettings(this.#settings)].sort().join("\u0000");
 		const environmentFingerprint = this.#getStaticLoadEnvironmentFingerprint();
+		const acceptedPresets = loadAcceptedModelPresetProfiles(
+			this.#modelPresetRegistryAgentDir,
+			this.#modelPresetRegistryDependencies,
+		);
+		const modelPresetRegistryFingerprint = JSON.stringify({
+			revision: acceptedPresets.revision,
+			manifestSha256: acceptedPresets.manifestSha256,
+			disabled: acceptedPresets.disabled,
+			error: acceptedPresets.error,
+		});
 		if (
 			this.#staticModelsLoaded &&
 			currentMtime === this.#lastStaticLoadMtime &&
 			disabledProviderKey === this.#lastDisabledProviderKey &&
-			environmentFingerprint === this.#lastStaticLoadEnvironmentFingerprint
+			environmentFingerprint === this.#lastStaticLoadEnvironmentFingerprint &&
+			modelPresetRegistryFingerprint === this.#lastModelPresetRegistryFingerprint
 		) {
 			// models.json and settings-derived implicit provider state are unchanged.
 			return;
@@ -1620,6 +1905,7 @@ export class ModelRegistry {
 		this.#modelsConfigFile.invalidate();
 		this.#customProviderApiKeys.clear();
 		this.#customProviderApiKeyEnvNames.clear();
+		this.#customProviderAuthHeaders.clear();
 		this.#providerWebSearchModes.clear();
 		this.#keylessProviders.clear();
 		this.#optionalAuthProviders.clear();
@@ -1631,7 +1917,7 @@ export class ModelRegistry {
 		// Drop config-sourced apiKeys from AuthStorage before reload; entries
 		// removed from models.yml must actually disappear from the resolver, not
 		// linger from the previous parse. The post-load setters below repopulate.
-		this.authStorage.clearConfigApiKeys();
+		this.authStorage.clearConfigApiKeys(this.#authStorageConfigOwner);
 		// Runtime provider keys are reapplied after #loadModels so they retain
 		// registration-time precedence over colliding static provider keys.
 		this.#providerOverrides.clear();
@@ -1641,10 +1927,70 @@ export class ModelRegistry {
 		this.#configError = undefined;
 		this.#loadModels();
 		for (const [provider, apiKeyConfig] of this.#runtimeProviderApiKeys) {
-			const resolved = resolveApiKeyConfig(apiKeyConfig);
+			const resolved = this.#runtimeProviderApiKeyEnvNames.has(provider)
+				? $rotatingCredentialEnv(this.#runtimeProviderApiKeyEnvNames.get(provider)!)
+				: resolveApiKeyConfig(apiKeyConfig);
+			if (!resolved) {
+				this.#runtimeProviderCredentialInstalled.delete(provider);
+				const authHeader = this.#runtimeProviderAuthHeaders.get(provider);
+				if (authHeader === true) {
+					this.#runtimeModelOverlays = this.#runtimeModelOverlays.map(overlay => {
+						if (overlay.provider !== provider) return overlay;
+						const headers = { ...(overlay.headers ?? {}) } as Record<string, string> & {
+							[GENERATED_AUTH_HEADER]?: string;
+						};
+						const generated = headers[GENERATED_AUTH_HEADER];
+						if (typeof generated === "string" && headers.Authorization === generated)
+							delete headers.Authorization;
+						delete headers[GENERATED_AUTH_HEADER];
+						return { ...overlay, headers };
+					});
+				}
+				const override = this.#runtimeProviderOverrides.get(provider);
+				if (override) this.#runtimeProviderOverrides.set(provider, { ...override, apiKey: "" });
+				continue;
+			}
+			this.#customProviderApiKeys.set(provider, resolved);
+			this.#runtimeProviderResolvedApiKeys.set(provider, resolved);
+			this.#runtimeProviderCredentialInstalled.add(provider);
+			this.authStorage.setConfigApiKey(provider, resolved, { owner: this.#authStorageConfigOwner });
+			const override = this.#runtimeProviderOverrides.get(provider);
+			if (override) this.#runtimeProviderOverrides.set(provider, { ...override, apiKey: resolved });
+			const authHeader = this.#runtimeProviderAuthHeaders.get(provider);
+			if (authHeader === true) {
+				this.#runtimeModelOverlays = this.#runtimeModelOverlays.map(overlay => {
+					if (overlay.provider !== provider) return overlay;
+					const headers = { ...(overlay.headers ?? {}) } as Record<string, string> & {
+						[GENERATED_AUTH_HEADER]?: string;
+					};
+					const generated = headers[GENERATED_AUTH_HEADER];
+					const hadAuthorization = headerValue(headers, "Authorization") !== undefined;
+					const ownsAuthorization = ownsOnlyGeneratedAuthorization(headers, generated);
+					if (ownsAuthorization) deleteHeaderCaseInsensitive(headers, "Authorization");
+					if (resolved && (ownsAuthorization || !hadAuthorization))
+						return {
+							...overlay,
+							headers: {
+								...headers,
+								Authorization: `Bearer ${resolved}`,
+								[GENERATED_AUTH_HEADER]: `Bearer ${resolved}`,
+							},
+						};
+					delete headers[GENERATED_AUTH_HEADER];
+					return { ...overlay, headers };
+				});
+			}
+		}
+		this.#loadModels();
+		for (const [provider, apiKeyConfig] of this.#runtimeProviderApiKeys) {
+			const resolved = this.#runtimeProviderApiKeyEnvNames.has(provider)
+				? $rotatingCredentialEnv(this.#runtimeProviderApiKeyEnvNames.get(provider)!)
+				: resolveApiKeyConfig(apiKeyConfig);
 			if (!resolved) continue;
 			this.#customProviderApiKeys.set(provider, resolved);
-			this.authStorage.setConfigApiKey(provider, resolved);
+			this.#runtimeProviderResolvedApiKeys.set(provider, resolved);
+			this.#runtimeProviderCredentialInstalled.add(provider);
+			this.authStorage.setConfigApiKey(provider, resolved, { owner: this.#authStorageConfigOwner });
 		}
 		this.#lastDisabledProviderKey = disabledProviderKey;
 	}
@@ -1670,7 +2016,6 @@ export class ModelRegistry {
 			profiles,
 			error: configError,
 		} = this.#loadCustomModels();
-		this.#configError = configError;
 		this.#keylessProviders = keylessProviders;
 		this.#discoveryManager.setProviders(discoverableProviders);
 		this.#configuredProviderIds = new Set(configuredProviders);
@@ -1681,25 +2026,59 @@ export class ModelRegistry {
 		this.#codexContextWindowOverrides = this.#collectCodexContextWindowOverrides();
 		this.#equivalenceConfig = equivalence;
 		this.#modelBindingsApplier.setBindings(modelBindings);
-		this.#modelProfiles = mergeModelProfiles(profiles);
+		const acceptedPresets = loadAcceptedModelPresetProfiles(
+			this.#modelPresetRegistryAgentDir,
+			this.#modelPresetRegistryDependencies,
+		);
+		const acceptedRegistryError = acceptedPresets.error
+			? new ConfigError("model-preset-registry", undefined, {
+					err: new Error(acceptedPresets.error),
+					stage: "Registry",
+				})
+			: undefined;
+		this.#configError = configError ?? acceptedRegistryError;
 
 		this.#addImplicitDiscoverableProviders(configuredProviders);
 		const builtInModels = this.#applyHardcodedModelPolicies(this.#loadBuiltInModels(overrides));
+		const registryModels = this.#applyHardcodedModelPolicies(acceptedPresets.presets);
+		const acceptedRegistryModelKeys = new Set(registryModels.map(model => `${model.provider}\u0000${model.id}`));
 		const cachedStandardModels = this.#applyHardcodedModelPolicies(this.#loadCachedStandardProviderModels());
 		const cachedDiscoveries = this.#applyHardcodedModelPolicies(this.#loadCachedDiscoverableModels());
-		const resolvedDefaults = this.#mergeResolvedModels(
+		const resolvedProviderCatalog = this.#mergeResolvedModels(
 			this.#mergeResolvedModels(builtInModels, cachedStandardModels),
 			cachedDiscoveries,
 		);
+		const resolvedDefaults = this.#mergeRegistryModelMetadata(resolvedProviderCatalog, registryModels, overrides);
+		const materializedRegistryModelKeys = new Set(
+			resolvedDefaults
+				.map(model => `${model.provider}\u0000${model.id}`)
+				.filter(key => acceptedRegistryModelKeys.has(key)),
+		);
+		this.#registryModelKeys = materializedRegistryModelKeys;
 		const withConfigModels = this.#mergeCustomModels(resolvedDefaults, this.#customModelOverlays);
 		// Merge runtime extension models so they survive refresh() cycles
 		const combined = this.#mergeCustomModels(withConfigModels, this.#runtimeModelOverlays);
 		const withModelOverrides = this.#applyModelOverrides(combined, this.#modelOverrides);
 		this.#models = this.#finalizeModels(this.#applyRuntimeProviderOverrides(withModelOverrides));
+		this.#modelProfiles = mergeModelProfiles(
+			profiles,
+			filterMaterializedRegistryProfiles(
+				acceptedPresets.profiles,
+				this.#models,
+				new Set(acceptedPresets.dynamicProviders),
+			),
+		);
 		this.#rebuildProviderActivity();
 		this.#rebuildCanonicalIndex();
 		this.#lastStaticLoadMtime = this.#modelsConfigFile.getMtimeMs();
 		this.#lastStaticLoadEnvironmentFingerprint = this.#getStaticLoadEnvironmentFingerprint();
+		this.#lastModelPresetRegistryFingerprint = JSON.stringify({
+			revision: acceptedPresets.revision,
+			manifestSha256: acceptedPresets.manifestSha256,
+			disabled: acceptedPresets.disabled,
+			error: acceptedPresets.error,
+		});
+		this.#loadedModelPresetRegistryManifestSha256 = acceptedPresets.manifestSha256;
 		this.#staticModelsLoaded = true;
 	}
 
@@ -1716,6 +2095,10 @@ export class ModelRegistry {
 		}
 		for (const overlay of [...this.#customModelOverlays, ...this.#runtimeModelOverlays])
 			addStaticModel(overlay.provider, overlay.id);
+		for (const model of this.#models) {
+			if (this.#registryModelKeys.has(`${model.provider}\u0000${model.id}`))
+				addStaticModel(model.provider, model.id);
+		}
 
 		const runtimeProviderIds = new Set(this.#runtimeProviderSourceByName.keys());
 		const providerIds = new Set<string>([
@@ -1790,6 +2173,86 @@ export class ModelRegistry {
 				merged.push(replacementModel);
 				indexByKey.set(key, merged.length - 1);
 			}
+		}
+		return merged;
+	}
+
+	#mergeRegistryModelMetadata(
+		baseModels: Model<Api>[],
+		registryModels: Model<Api>[],
+		providerOverrides: ReadonlyMap<string, ProviderOverride>,
+	): Model<Api>[] {
+		const merged = [...baseModels];
+		const indexByKey = new Map(merged.map((model, index) => [`${model.provider}\u0000${model.id}`, index]));
+		for (const registryModel of registryModels) {
+			const key = `${registryModel.provider}\u0000${registryModel.id}`;
+			const existingIndex = indexByKey.get(key);
+			const explicitTransport = this.#resolveProviderOverride(registryModel.provider, providerOverrides);
+			if (existingIndex === undefined) {
+				const transportTemplates = merged.filter(
+					model => model.provider === registryModel.provider && model.api === registryModel.api,
+				);
+				const transportTemplate = transportTemplates[0];
+				const explicitTransportMatches =
+					explicitTransport?.api === registryModel.api && explicitTransport.baseUrl !== undefined;
+				const templatesAgree =
+					transportTemplate !== undefined &&
+					transportTemplates.every(template => hasMatchingRegistryTransport(transportTemplate, template));
+				if (!explicitTransportMatches && transportTemplates.length > 0 && !templatesAgree) continue;
+				if (!transportTemplate && !explicitTransportMatches) continue;
+				const transportSource = explicitTransportMatches ? explicitTransport : transportTemplate!;
+				const inheritedCompat = explicitTransportMatches
+					? explicitTransport?.compat
+					: commonRegistryTransportCompat(transportTemplates);
+				const hydratedRegistryModel = {
+					...registryModel,
+					baseUrl: transportSource.baseUrl!,
+					headers: transportSource.headers,
+					transport: transportSource.transport,
+					requestTransform: transportSource.requestTransform,
+					cacheRetention: transportSource.cacheRetention,
+					isOAuth: transportSource.isOAuth,
+					compat:
+						inheritedCompat || registryModel.compat || explicitTransport?.compat
+							? { ...inheritedCompat, ...registryModel.compat, ...explicitTransport?.compat }
+							: undefined,
+				};
+				merged.push(
+					explicitTransportMatches
+						? this.#applyProviderTransportOverride(hydratedRegistryModel, explicitTransport!)
+						: hydratedRegistryModel,
+				);
+				indexByKey.set(key, merged.length - 1);
+				continue;
+			}
+			const existing = merged[existingIndex]!;
+			const effectiveApi = explicitTransport?.api ?? existing.api;
+			const registryApiMatchesEffectiveTransport = registryModel.api === effectiveApi;
+			const registryMetadata = registryApiMatchesEffectiveTransport
+				? registryModel
+				: registryModelMetadataWithoutApiSpecificFields(registryModel);
+			merged[existingIndex] = {
+				...existing,
+				...registryMetadata,
+				api: explicitTransport?.api ?? existing.api,
+				baseUrl: existing.baseUrl,
+				headers: existing.headers,
+				transport: existing.transport,
+				requestTransform: existing.requestTransform,
+				cacheRetention: existing.cacheRetention,
+				isOAuth: explicitTransport?.isOAuth ?? existing.isOAuth,
+				wireModelId: existing.wireModelId,
+				compat:
+					existing.compat ||
+					(registryApiMatchesEffectiveTransport ? registryModel.compat : undefined) ||
+					explicitTransport?.compat
+						? {
+								...existing.compat,
+								...(registryApiMatchesEffectiveTransport ? registryModel.compat : undefined),
+								...explicitTransport?.compat,
+							}
+						: undefined,
+			};
 		}
 		return merged;
 	}
@@ -2104,6 +2567,11 @@ export class ModelRegistry {
 		const configuredProviders = new Set(Object.keys(value.providers ?? {}));
 
 		for (const [providerName, providerConfig] of providerEntries) {
+			const authMode = (providerConfig.auth ?? "apiKey") as ProviderAuthMode;
+			const isOAuth = resolveCustomModelIsOAuth(
+				(providerConfig.api as Api | undefined) ?? "openai-completions",
+				providerConfig.auth as ProviderAuthMode | undefined,
+			);
 			if (providerConfig.apiKeyEnv) {
 				this.#configuredApiKeyEnvNames.add(providerConfig.apiKeyEnv);
 			}
@@ -2113,12 +2581,16 @@ export class ModelRegistry {
 			if (providerConfig.openaiCompat?.apiKey)
 				this.#configuredApiKeyEnvNames.add(providerConfig.openaiCompat.apiKey);
 			if (providerConfig.webSearch) this.#providerWebSearchModes.set(providerName, providerConfig.webSearch);
-			const providerApiKeyConfig = providerConfig.apiKey ?? resolveApiKeyEnvConfig(providerConfig.apiKeyEnv);
+			const providerApiKeyConfig = providerConfig.apiKey
+				? resolveApiKeyConfig(providerConfig.apiKey)
+				: resolveApiKeyEnvConfig(providerConfig.apiKeyEnv);
 			const localOpenAICompat = providerConfig.openaiCompat;
 			const rotatingApiKeyEnv = providerConfig.apiKey
 				? undefined
 				: (providerConfig.apiKeyEnv ?? (localOpenAICompat?.apiKey ? undefined : localOpenAICompat?.apiKeyEnv));
 			if (rotatingApiKeyEnv) this.#customProviderApiKeyEnvNames.set(providerName, rotatingApiKeyEnv);
+			if (providerConfig.authHeader !== undefined)
+				this.#customProviderAuthHeaders.set(providerName, providerConfig.authHeader);
 			const localOpenAICompatApiKeyConfig = localOpenAICompat
 				? localOpenAICompat.apiKey
 					? resolveApiKeyConfig(localOpenAICompat.apiKey)
@@ -2132,8 +2604,10 @@ export class ModelRegistry {
 						? resolveApiKeyEnvConfig(localOpenAICompat.apiKeyEnv)
 						: undefined;
 				overrides.set(providerName, {
+					api: "openai-completions",
 					baseUrl: localOpenAICompatBaseUrl,
 					apiKey: localOpenAICompatApiKeyConfig,
+					isOAuth,
 					compat: {
 						supportsStore: false,
 						supportsDeveloperRole: false,
@@ -2156,6 +2630,7 @@ export class ModelRegistry {
 					this.#customProviderApiKeys.set(providerName, localCompatResolvedKey);
 					this.authStorage.setConfigApiKey(providerName, localCompatResolvedKey, {
 						envSourced: !localOpenAICompat.apiKey,
+						owner: this.#authStorageConfigOwner,
 					});
 				} else {
 					keylessProviders.add(providerName);
@@ -2177,6 +2652,7 @@ export class ModelRegistry {
 			) {
 				const disableStrictCompat = providerConfig.disableStrictTools ? { disableStrictTools: true } : undefined;
 				overrides.set(providerName, {
+					api: providerConfig.api as Api | undefined,
 					baseUrl: providerConfig.baseUrl,
 					headers: providerConfig.headers,
 					apiKey: providerApiKeyConfig,
@@ -2185,10 +2661,10 @@ export class ModelRegistry {
 					transport: providerConfig.transport,
 					requestTransform: providerConfig.requestTransform,
 					cacheRetention: providerConfig.cacheRetention,
+					isOAuth,
 				});
 			}
 
-			const authMode = (providerConfig.auth ?? "apiKey") as ProviderAuthMode;
 			if (authMode === "none") {
 				keylessProviders.add(providerName);
 			}
@@ -2219,7 +2695,10 @@ export class ModelRegistry {
 						: undefined;
 				if (resolved) this.#customProviderApiKeys.set(providerName, resolved);
 				if (resolved) {
-					this.authStorage.setConfigApiKey(providerName, resolved, { envSourced: !providerConfig.apiKey });
+					this.authStorage.setConfigApiKey(providerName, resolved, {
+						envSourced: !providerConfig.apiKey,
+						owner: this.#authStorageConfigOwner,
+					});
 				}
 			}
 
@@ -2275,7 +2754,7 @@ export class ModelRegistry {
 			);
 		}
 		const current = loaded.value ?? this.#modelsConfigFile.createDefault();
-		if (mergeModelProfiles(current.profiles).has(normalizedName)) {
+		if (current.profiles?.[normalizedName] !== undefined) {
 			throw new Error(`Custom model profile already exists: ${normalizedName}. Choose a unique preset id.`);
 		}
 		const next: ModelsConfig = {
@@ -2401,6 +2880,8 @@ export class ModelRegistry {
 	async #refreshRuntimeDiscoveries(
 		strategy: ModelRefreshStrategy,
 		providerFilter?: ReadonlySet<string>,
+		refreshGeneration = this.#catalogRefreshGeneration,
+		providerRefresh?: ProviderRefreshFence,
 	): Promise<void> {
 		const disabledProviders = getDisabledProviderIdsFromSettings(this.#settings);
 		const selectedDiscoverableProviders = (
@@ -2412,12 +2893,22 @@ export class ModelRegistry {
 			selectedDiscoverableProviders.length === 0
 				? Promise.resolve([] as ConfiguredDiscoveryResult[])
 				: Promise.all(
-						selectedDiscoverableProviders.map(provider => this.#discoverProviderModels(provider, strategy)),
+						selectedDiscoverableProviders.map(provider =>
+							this.#discoverProviderModels(provider, strategy, providerRefresh),
+						),
 					);
 		const [configuredDiscoveryResults, builtInDiscovered] = await Promise.all([
 			configuredDiscoveriesPromise,
-			this.#discoverBuiltInProviderModels(strategy, providerFilter),
+			this.#discoverBuiltInProviderModels(strategy, providerFilter, providerRefresh),
 		]);
+		if (
+			refreshGeneration !== this.#catalogRefreshGeneration ||
+			(providerRefresh !== undefined &&
+				"providerId" in providerRefresh &&
+				this.#providerRefreshGenerations.get(providerRefresh.providerId) !== providerRefresh.generation)
+		) {
+			return;
+		}
 		const currentConfiguredDiscoveryResults = configuredDiscoveryResults.map(result => {
 			const providerConfig = selectedDiscoverableProviders.find(provider => provider.provider === result.provider);
 			const current =
@@ -2584,6 +3075,7 @@ export class ModelRegistry {
 	async #discoverProviderModels(
 		providerConfig: DiscoveryProviderConfig,
 		strategy: ModelRefreshStrategy,
+		providerRefresh?: ProviderRefreshFence,
 	): Promise<ConfiguredDiscoveryResult> {
 		const provider = providerConfig.provider;
 		const preflightEpoch = this.#optionalAuthPreflightEpoch;
@@ -2598,7 +3090,8 @@ export class ModelRegistry {
 		let preflightCompleted = false;
 		const optionalAuth = this.#optionalAuthProviders.has(provider);
 		const shouldPreflightAuth = optionalAuth
-			? this.authStorage.has(provider) || this.authStorage.hasAuth(provider)
+			? this.authStorage.has(provider) ||
+				this.authStorage.hasAuth(provider, undefined, { owner: this.#authStorageConfigOwner })
 			: !this.#isCredentiallessProvider(provider);
 		let preflightAuthConfigurationGeneration = this.authStorage.getProviderConfigurationGeneration(provider);
 		let preflightOAuthRefreshGeneration = this.authStorage.getProviderOAuthRefreshGeneration(provider);
@@ -2639,7 +3132,11 @@ export class ModelRegistry {
 			preflightCompleted = true;
 			if (!preflightFailed && optionalAuth && isCurrentPreflight()) {
 				this.#providerEvidenceApiKeys.set(provider, apiKey);
-				const authGeneration = this.authStorage.getProviderEvidenceGeneration(provider, apiKey);
+				const authGeneration = this.authStorage.getProviderEvidenceGeneration(
+					provider,
+					apiKey,
+					this.#authStorageConfigOwner,
+				);
 				if (apiKey === undefined) this.#credentiallessAuthFallbackProviders.set(provider, authGeneration);
 				else this.#credentiallessAuthFallbackProviders.delete(provider);
 			}
@@ -2688,6 +3185,14 @@ export class ModelRegistry {
 		const isCurrentEndpoint = () =>
 			endpoint ===
 			this.#normalizeDiscoveryEvidenceEndpoint(this.#effectiveDiscoveryProviderConfig(providerConfig).baseUrl ?? "");
+		const isCurrentProviderRefresh = () =>
+			providerRefresh === undefined ||
+			("providerId" in providerRefresh
+				? strategy !== "online-if-uncached" ||
+					(providerRefresh.providerId === provider &&
+						this.#providerRefreshGenerations.get(provider) === providerRefresh.generation)
+				: (this.#providerRefreshGenerations.get(provider) ?? 0) ===
+					(providerRefresh.generations.get(provider) ?? 0));
 		const evidence = this.#configuredDiscoveryEvidence.get(provider);
 		const cacheDynamicModelProvenance = fingerprintConfiguredDiscoveryRequestShape(
 			effectiveProviderConfig,
@@ -2736,7 +3241,7 @@ export class ModelRegistry {
 				),
 			getEvidenceGeneration: provider => this.#getProviderEvidenceGeneration(provider.provider, preflightApiKey),
 			cacheDynamicModelProvenance: cacheLookupProvenance,
-			canPublishCache: isCurrentEndpoint,
+			canPublishCache: () => isCurrentEndpoint() && isCurrentProviderRefresh(),
 		});
 		const authGeneration =
 			mergeInput.authGeneration ??
@@ -2792,7 +3297,7 @@ export class ModelRegistry {
 		return {
 			...providerConfig,
 			baseUrl: effectiveBaseUrl,
-			headers: override?.headers ? { ...providerConfig.headers, ...override.headers } : providerConfig.headers,
+			headers: mergeCaseInsensitiveHeaders(providerConfig.headers, override?.headers),
 			compat: override?.compat ? mergeCompat(providerConfig.compat, override.compat) : providerConfig.compat,
 			requestTransform: mergeRequestTransform(providerConfig.requestTransform, override?.requestTransform),
 			cacheRetention: override?.cacheRetention ?? providerConfig.cacheRetention,
@@ -2822,6 +3327,7 @@ export class ModelRegistry {
 	async #discoverBuiltInProviderModels(
 		strategy: ModelRefreshStrategy,
 		providerFilter?: ReadonlySet<string>,
+		providerRefresh?: ProviderRefreshFence,
 	): Promise<Model<Api>[]> {
 		// Skip providers already handled by configured discovery (e.g. user-configured ollama with discovery.type)
 		const configuredDiscoveryProviders = new Set(this.#discoveryManager.providers.map(p => p.provider));
@@ -2839,7 +3345,7 @@ export class ModelRegistry {
 			return [];
 		}
 		const discoveries = await Promise.all(
-			managerOptions.map(entry => this.#discoverWithModelManager(entry, strategy)),
+			managerOptions.map(entry => this.#discoverWithModelManager(entry, strategy, providerRefresh)),
 		);
 		return discoveries.flat();
 	}
@@ -2874,7 +3380,12 @@ export class ModelRegistry {
 				providerId: "openai-codex",
 				resolveKey: value => value,
 				createOptions: accessToken => {
-					const accountId = resolveOAuthAccountIdForAccessToken(this.authStorage, "openai-codex", accessToken);
+					const accountId = resolveOAuthAccountIdForAccessToken(
+						this.authStorage,
+						"openai-codex",
+						accessToken,
+						this.#authStorageConfigOwner,
+					);
 					return openaiCodexModelManagerOptions({
 						accessToken,
 						accountId,
@@ -2967,6 +3478,7 @@ export class ModelRegistry {
 	async #discoverWithModelManager(
 		{ options, authGeneration, apiKey, endpoint, endpointContainsUserinfo }: ModelManagerDiscoveryOptions,
 		strategy: ModelRefreshStrategy,
+		providerRefresh?: ProviderRefreshFence,
 	): Promise<Model<Api>[]> {
 		const generation = (this.#descriptorDiscoveryGenerations.get(options.providerId) ?? 0) + 1;
 		this.#descriptorDiscoveryGenerations.set(options.providerId, generation);
@@ -2987,18 +3499,34 @@ export class ModelRegistry {
 		// stale fallback, and online-if-uncached reuse all fail closed.
 		const cacheDynamicModelProvenance =
 			reusableCacheProvenance ?? `gajae:non-cacheable-endpoint:${crypto.randomUUID()}`;
-		const isCurrentDiscovery = () =>
+		const isCurrentDiscoveryContext = () =>
 			(this.#descriptorDiscoveryGenerations.get(options.providerId) ?? 0) === generation &&
 			this.#getProviderEvidenceGeneration(options.providerId, apiKey) === authGeneration &&
 			(endpoint ===
 				this.#normalizeDiscoveryEvidenceEndpoint(this.#getProviderBaseUrlForDiscovery(options.providerId) ?? "") ||
 				(canUseCredentialDerivedXiaomiEndpoint && credentialDerivedEndpoint !== undefined));
+		const isCurrentProviderRefresh = () =>
+			providerRefresh === undefined ||
+			("providerId" in providerRefresh
+				? providerRefresh.providerId === options.providerId &&
+					this.#providerRefreshGenerations.get(options.providerId) === providerRefresh.generation
+				: (this.#providerRefreshGenerations.get(options.providerId) ?? 0) ===
+					(providerRefresh.generations.get(options.providerId) ?? 0));
+		const isCurrentDiscovery = () =>
+			isCurrentDiscoveryContext() &&
+			(providerRefresh === undefined || "generations" in providerRefresh || isCurrentProviderRefresh());
+		const canPublishCache = () =>
+			isCurrentDiscoveryContext() &&
+			(providerRefresh === undefined ||
+				("providerId" in providerRefresh
+					? strategy !== "online-if-uncached" || isCurrentDiscovery()
+					: isCurrentProviderRefresh()));
 		try {
 			const manager = createModelManager({
 				...options,
 				cacheDbPath: this.#cacheDbPath,
 				cacheDynamicModelProvenance,
-				canPublishCache: isCurrentDiscovery,
+				canPublishCache,
 				...(options.fetchDynamicModels
 					? {
 							fetchDynamicModels: async () => {
@@ -3159,8 +3687,15 @@ export class ModelRegistry {
 			discoveryApiKey ??
 			(this.#isCredentiallessProvider(providerConfig.provider)
 				? kNoAuth
-				: await this.authStorage.getApiKey(providerConfig.provider));
-		if (apiKey && apiKey !== DEFAULT_LOCAL_TOKEN && apiKey !== kNoAuth) {
+				: await this.authStorage.getApiKey(providerConfig.provider, undefined, {
+						owner: this.#authStorageConfigOwner,
+					}));
+		if (
+			apiKey &&
+			apiKey !== DEFAULT_LOCAL_TOKEN &&
+			apiKey !== kNoAuth &&
+			headerValue(headers, "Authorization") === undefined
+		) {
 			headers.Authorization = `Bearer ${apiKey}`;
 		}
 		const response = await fetch(tagsUrl, {
@@ -3239,8 +3774,15 @@ export class ModelRegistry {
 			discoveryApiKey ??
 			(this.#isCredentiallessProvider(providerConfig.provider)
 				? kNoAuth
-				: await this.authStorage.getApiKey(providerConfig.provider));
-		if (apiKey && apiKey !== DEFAULT_LOCAL_TOKEN && apiKey !== kNoAuth) {
+				: await this.authStorage.getApiKey(providerConfig.provider, undefined, {
+						owner: this.#authStorageConfigOwner,
+					}));
+		if (
+			apiKey &&
+			apiKey !== DEFAULT_LOCAL_TOKEN &&
+			apiKey !== kNoAuth &&
+			headerValue(requestHeaders, "Authorization") === undefined
+		) {
 			requestHeaders.Authorization = `Bearer ${apiKey}`;
 		}
 
@@ -3361,12 +3903,16 @@ export class ModelRegistry {
 			discoveryApiKey ??
 			(this.#isCredentiallessProvider(providerConfig.provider)
 				? kNoAuth
-				: await this.authStorage.getApiKey(providerConfig.provider, undefined, { baseUrl }));
+				: await this.authStorage.getApiKey(providerConfig.provider, undefined, {
+						baseUrl,
+						owner: this.#authStorageConfigOwner,
+					}));
 		if (
 			apiKey &&
 			apiKey !== DEFAULT_LOCAL_TOKEN &&
 			!isVllmNoAuthToken(providerConfig.provider, apiKey) &&
-			apiKey !== kNoAuth
+			apiKey !== kNoAuth &&
+			headerValue(requestHeaders, "Authorization") === undefined
 		) {
 			requestHeaders.Authorization = `Bearer ${apiKey}`;
 		}
@@ -3508,7 +4054,11 @@ export class ModelRegistry {
 			try {
 				fallbackMatchesCurrentEvidence =
 					fallbackEvidenceGeneration ===
-					this.authStorage.getProviderEvidenceGeneration(provider, this.#providerEvidenceApiKeys.get(provider));
+					this.authStorage.getProviderEvidenceGeneration(
+						provider,
+						this.#providerEvidenceApiKeys.get(provider),
+						this.#authStorageConfigOwner,
+					);
 			} catch {
 				// AuthStorage may be unavailable while a registry is being torn down.
 			}
@@ -3516,7 +4066,8 @@ export class ModelRegistry {
 		return (
 			this.#keylessProviders.has(provider) &&
 			(!this.#optionalAuthProviders.has(provider) ||
-				(!this.authStorage.hasAuth(provider) && !this.authStorage.has(provider)) ||
+				(!this.authStorage.hasAuth(provider, undefined, { owner: this.#authStorageConfigOwner }) &&
+					!this.authStorage.has(provider)) ||
 				fallbackMatchesCurrentEvidence)
 		);
 	}
@@ -3527,6 +4078,7 @@ export class ModelRegistry {
 		return this.authStorage.getProviderEvidenceGeneration(
 			provider,
 			resolvedApiKey ?? this.#providerEvidenceApiKeys.get(provider),
+			this.#authStorageConfigOwner,
 		);
 	}
 	#normalizeOpenAIModelsListBaseUrl(baseUrl?: string): string {
@@ -3564,7 +4116,7 @@ export class ModelRegistry {
 
 	#resolveProviderOverride(
 		provider: string,
-		overrides: Map<string, ProviderOverride> = this.#providerOverrides,
+		overrides: ReadonlyMap<string, ProviderOverride> = this.#providerOverrides,
 	): ProviderOverride | undefined {
 		const explicitOverride = overrides.get(provider);
 		if (explicitOverride?.baseUrl) {
@@ -3591,24 +4143,19 @@ export class ModelRegistry {
 
 	#mergeProviderOverride(baseOverride: ProviderOverride | undefined, override: ProviderOverride): ProviderOverride {
 		return {
+			api: override.api ?? baseOverride?.api,
 			baseUrl: override.baseUrl ?? baseOverride?.baseUrl,
 			apiKey: override.apiKey ?? baseOverride?.apiKey,
 			authHeader: override.authHeader ?? baseOverride?.authHeader,
-			headers: override.headers ? { ...(baseOverride?.headers ?? {}), ...override.headers } : baseOverride?.headers,
+			headers: mergeCaseInsensitiveHeaders(baseOverride?.headers, override.headers),
 			compat: override.compat ? mergeCompat(baseOverride?.compat, override.compat) : baseOverride?.compat,
 			transport: override.transport ?? baseOverride?.transport,
 			requestTransform: mergeRequestTransform(baseOverride?.requestTransform, override.requestTransform),
 			cacheRetention: override.cacheRetention ?? baseOverride?.cacheRetention,
+			isOAuth: override.isOAuth ?? baseOverride?.isOAuth,
 		};
 	}
-	#applyProviderTransportOverride<
-		T extends {
-			baseUrl?: string;
-			headers?: Record<string, string>;
-			compat?: Model<Api>["compat"];
-			cacheRetention?: CacheRetention;
-		},
-	>(
+	#applyProviderTransportOverride<T extends Model<Api>>(
 		entry: T,
 		override: Pick<
 			ProviderOverride,
@@ -3622,12 +4169,39 @@ export class ModelRegistry {
 			| "cacheRetention"
 		>,
 	): T {
-		const headers = mergeAuthHeader(
-			override.headers ? { ...entry.headers, ...override.headers } : entry.headers,
-			override.authHeader,
-			override.apiKey,
-		);
-		return {
+		const overrideHeaders = (
+			override.headers ? { ...entry.headers, ...override.headers } : { ...entry.headers }
+		) as Record<string, string> & { [GENERATED_AUTH_HEADER]?: string };
+		const explicitAuthKey = override.headers
+			? Object.keys(override.headers).find(key => key.toLowerCase() === "authorization")
+			: undefined;
+		if (explicitAuthKey !== undefined) {
+			const explicitAuthValue = override.headers![explicitAuthKey]!;
+			deleteHeaderCaseInsensitive(overrideHeaders, "Authorization");
+			overrideHeaders[explicitAuthKey] = explicitAuthValue;
+			delete (overrideHeaders as Record<string, string> & { [GENERATED_AUTH_HEADER]?: string })[
+				GENERATED_AUTH_HEADER
+			];
+		}
+		const existingMarker = (overrideHeaders as Record<string, string> & { [GENERATED_AUTH_HEADER]?: string })[
+			GENERATED_AUTH_HEADER
+		];
+		const managesAuth = override.authHeader !== undefined || override.apiKey !== undefined;
+		const canInject =
+			managesAuth &&
+			override.authHeader === true &&
+			Boolean(override.apiKey) &&
+			(headerValue(overrideHeaders, "Authorization") === undefined ||
+				ownsOnlyGeneratedAuthorization(overrideHeaders, existingMarker));
+		if (canInject) {
+			deleteHeaderCaseInsensitive(overrideHeaders, "Authorization");
+			delete overrideHeaders[GENERATED_AUTH_HEADER];
+		} else if (managesAuth && existingMarker !== undefined) {
+			deleteAuthorizationValue(overrideHeaders, existingMarker);
+			delete overrideHeaders[GENERATED_AUTH_HEADER];
+		}
+		const headers = mergeAuthHeader(overrideHeaders, canInject, canInject ? override.apiKey : undefined);
+		const result = {
 			...entry,
 			compat: mergeProviderCompat(entry.compat, override.compat),
 			baseUrl: override.baseUrl ?? entry.baseUrl,
@@ -3641,6 +4215,21 @@ export class ModelRegistry {
 			),
 			cacheRetention: entry.cacheRetention ?? override.cacheRetention,
 		};
+		if (!canInject && explicitAuthKey !== undefined) {
+			delete (result.headers as Record<string, string> & { [GENERATED_AUTH_HEADER]?: string })[
+				GENERATED_AUTH_HEADER
+			];
+		}
+		const generatedHeader = (
+			result.headers as (Record<string, string> & { [GENERATED_AUTH_HEADER]?: string }) | undefined
+		)?.[GENERATED_AUTH_HEADER];
+		if (generatedHeader !== undefined && result.headers?.Authorization === generatedHeader) {
+			this.#generatedAuthHeaders.set(result, { authorization: result.headers.Authorization });
+		} else if (explicitAuthKey === undefined) {
+			const generated = this.#generatedAuthHeaders.get(entry);
+			if (generated) this.#generatedAuthHeaders.set(result, generated);
+		}
+		return result;
 	}
 	#applyRuntimeProviderOverride(model: Model<Api>, override: ProviderOverride): Model<Api> {
 		const withTransportOverride = this.#applyProviderTransportOverride(
@@ -3653,26 +4242,53 @@ export class ModelRegistry {
 				? withTransportOverride
 				: { ...withTransportOverride, ...(sanitizedBaseUrl === undefined ? {} : { baseUrl: sanitizedBaseUrl }) };
 		const modelCompat = this.#modelOverrides.get(model.provider.toLowerCase())?.get(model.id.toLowerCase())?.compat;
-		return enrichModelThinking(
+		const result = enrichModelThinking(
 			modelCompat
 				? { ...sanitizedTransport, compat: mergeCompat(sanitizedTransport.compat, modelCompat) }
 				: sanitizedTransport,
 		);
+		const generated = this.#generatedAuthHeaders.get(sanitizedTransport);
+		if (generated) this.#generatedAuthHeaders.set(result, generated);
+		return result;
 	}
 	#applyRuntimeProviderOverrides(models: Model<Api>[]): Model<Api>[] {
 		if (this.#runtimeProviderOverrides.size === 0) return models;
 		return models.map(model => {
 			const override = this.#runtimeProviderOverrides.get(model.provider);
 			if (!override) return model;
-			return this.#applyRuntimeProviderOverride(model, override);
+			const runtimeCredentialRevoked =
+				this.#runtimeProviderApiKeys.has(model.provider) &&
+				!this.#runtimeProviderCredentialInstalled.has(model.provider);
+			return this.#applyRuntimeProviderOverride(
+				model,
+				runtimeCredentialRevoked ? { ...override, apiKey: undefined, authHeader: undefined } : override,
+			);
 		});
 	}
 	#finalizeModels(models: Model<Api>[]): Model<Api>[] {
-		return applyFinalCodexGpt56ContextCap(
-			models.map(model => enrichModelThinking({ ...this.#restoreDeclaredThinking(model) })),
-			undefined,
-			this.#codexContextWindowOverrides,
-		);
+		const finalized = models.map(model => enrichModelThinking({ ...this.#restoreDeclaredThinking(model) }));
+		const result = applyFinalCodexGpt56ContextCap(finalized, undefined, this.#codexContextWindowOverrides);
+		for (let index = 0; index < result.length; index++) {
+			if (
+				(result[index]?.headers as (Record<string, string> & { [GENERATED_AUTH_HEADER]?: string }) | undefined)?.[
+					GENERATED_AUTH_HEADER
+				]
+			) {
+				const authorization = result[index]?.headers?.Authorization;
+				const marker = (result[index]?.headers as Record<string, string> & { [GENERATED_AUTH_HEADER]?: string })[
+					GENERATED_AUTH_HEADER
+				];
+				if (authorization && marker === authorization)
+					this.#generatedAuthHeaders.set(result[index]!, { authorization });
+				else
+					delete (result[index]?.headers as Record<string, string> & { [GENERATED_AUTH_HEADER]?: string })[
+						GENERATED_AUTH_HEADER
+					];
+			}
+			const generated = this.#generatedAuthHeaders.get(models[index]!);
+			if (generated) this.#generatedAuthHeaders.set(result[index]!, generated);
+		}
+		return result;
 	}
 	#restoreDeclaredThinking(model: Model<Api>): Model<Api> {
 		const overrideThinking = this.#modelOverrides
@@ -3811,7 +4427,10 @@ export class ModelRegistry {
 						: undefined;
 				if (resolved) this.#customProviderApiKeys.set(providerName, resolved);
 				if (resolved) {
-					this.authStorage.setConfigApiKey(providerName, resolved, { envSourced: !providerConfig.apiKey });
+					this.authStorage.setConfigApiKey(providerName, resolved, {
+						envSourced: !providerConfig.apiKey,
+						owner: this.#authStorageConfigOwner,
+					});
 				}
 			}
 			for (const modelDef of modelDefs) {
@@ -3843,8 +4462,8 @@ export class ModelRegistry {
 	}
 
 	/**
-	 * Get all models (built-in + custom).
-	 * If models.json had errors, returns only built-in models.
+	 * Get all models (embedded + accepted registry + custom).
+	 * If models.yml had errors, returns embedded plus accepted registry models.
 	 */
 	getAll(): Model<Api>[] {
 		return this.#models;
@@ -3859,7 +4478,8 @@ export class ModelRegistry {
 		const disabled = disabledProviders ?? getDisabledProviderIdsFromSettings(this.#settings);
 		return (
 			!disabled.has(model.provider) &&
-			(this.#keylessProviders.has(model.provider) || this.authStorage.hasAuth(model.provider))
+			(this.#keylessProviders.has(model.provider) ||
+				this.authStorage.hasAuth(model.provider, undefined, { owner: this.#authStorageConfigOwner }))
 		);
 	}
 	/** Per-query precomputed variant filter inputs; plan fields are authoritative when provided. */
@@ -3913,7 +4533,9 @@ export class ModelRegistry {
 	 * 6. Unknown (no credential surface)
 	 */
 	#effectiveProviderAuth(provider: string, sessionId?: string): EffectiveProviderAuth {
-		const credentialType = this.authStorage.getEffectiveCredentialType(provider, sessionId);
+		const credentialType = this.authStorage.getEffectiveCredentialType(provider, sessionId, {
+			owner: this.#authStorageConfigOwner,
+		});
 		if (credentialType === "api_key") return "key";
 		if (credentialType === "oauth") return "oauth";
 		if (this.#keylessProviders.has(provider)) return "keyless";
@@ -4263,9 +4885,10 @@ export class ModelRegistry {
 	 * This is a fast check that doesn't refresh OAuth tokens.
 	 */
 	getAvailable(): Model<Api>[] {
+		this.#synchronizeEnvironmentCredentials();
 		const disabledProviders = getDisabledProviderIdsFromSettings(this.#settings);
 		const disabledProviderKey = [...disabledProviders].sort().join("\u0000");
-		const envFingerprint = envAvailabilityFingerprint();
+		const envFingerprint = envAvailabilityFingerprint(this.#configuredApiKeyEnvNames);
 		if (
 			this.#availableModelsCache &&
 			this.#availableModelsDisabledProviders === disabledProviderKey &&
@@ -4277,6 +4900,19 @@ export class ModelRegistry {
 		this.#availableModelsDisabledProviders = disabledProviderKey;
 		this.#availableModelsEnvFingerprint = envFingerprint;
 		return this.#availableModelsCache;
+	}
+
+	#synchronizeEnvironmentCredentials(): void {
+		// Runtime registrations own a provider while their credential is present.
+		// Refresh them first so a missing runtime env key can hand ownership back to
+		// the static config before the static apiKeyEnv pass runs.
+		for (const provider of this.#runtimeProviderApiKeyEnvNames.keys()) {
+			this.#refreshRotatingConfigApiKey(provider);
+		}
+		for (const provider of this.#customProviderApiKeyEnvNames.keys()) {
+			if (this.#runtimeProviderCredentialInstalled.has(provider)) continue;
+			this.#refreshRotatingConfigApiKey(provider, true);
+		}
 	}
 
 	/**
@@ -4348,7 +4984,10 @@ export class ModelRegistry {
 
 	#activeConnectionKind(model: Model<Api>): ActiveProviderDescriptor["connectionKind"] | undefined {
 		const evidence = this.#providerActivity.get(model.provider);
-		if (!this.#isCredentiallessProvider(model.provider) && this.authStorage.hasUsableAuth(model.provider)) {
+		if (
+			!this.#isCredentiallessProvider(model.provider) &&
+			this.authStorage.hasUsableAuth(model.provider, { owner: this.#authStorageConfigOwner })
+		) {
 			if (!evidence) return undefined;
 			const discoveryOnly =
 				!evidence.staticConfigured &&
@@ -4423,14 +5062,20 @@ export class ModelRegistry {
 	 * as providers with stored credentials. See issue #993.
 	 */
 	hasConfiguredAuth(model: Model<Api>): boolean {
-		return this.#keylessProviders.has(model.provider) || this.authStorage.hasAuth(model.provider);
+		return (
+			this.#keylessProviders.has(model.provider) ||
+			this.authStorage.hasAuth(model.provider, undefined, { owner: this.#authStorageConfigOwner })
+		);
 	}
 
 	/**
 	 * Check whether auth is configured for a provider.
 	 */
 	hasConfiguredProviderAuth(provider: string): boolean {
-		return this.#keylessProviders.has(provider) || this.authStorage.hasAuth(provider);
+		return (
+			this.#keylessProviders.has(provider) ||
+			this.authStorage.hasAuth(provider, undefined, { owner: this.#authStorageConfigOwner })
+		);
 	}
 
 	isCredentiallessProvider(provider: string): boolean {
@@ -4465,11 +5110,24 @@ export class ModelRegistry {
 		);
 	}
 
+	/** Opaque owner token for registry-scoped AuthStorage reads. */
+	getAuthStorageOwner(): object {
+		return this.#authStorageConfigOwner;
+	}
+
 	getProviderWebSearchMode(provider: string): WebSearchMode | undefined {
 		return this.#providerWebSearchModes.get(provider);
 	}
 
 	getActiveSearchModelContext(model: Model<Api>): ActiveSearchModelContext {
+		const provider = model.provider.toLowerCase();
+		const ownerAuthOverride =
+			this.authStorage.hasConfigApiKey(model.provider, this.#authStorageConfigOwner) ||
+			this.#providerOverrides.has(provider) ||
+			this.#runtimeProviderOverrides.has(provider) ||
+			this.#modelOverrides.get(provider)?.has(model.id.toLowerCase()) === true ||
+			this.#customProviderAuthHeaders.has(provider) ||
+			this.#runtimeProviderAuthHeaders.has(provider);
 		return {
 			provider: model.provider,
 			modelId: model.id,
@@ -4477,6 +5135,15 @@ export class ModelRegistry {
 			api: model.api,
 			baseUrl: model.baseUrl,
 			headers: model.headers,
+			ownerAuthOverride,
+			resolveCredentials: async ({ sessionId, signal }) => {
+				// Resolve against the current registry model so rotating apiKeyEnv
+				// credentials and generated Authorization headers are synchronized
+				// immediately before native search sends its request.
+				const currentModel = this.find(model.provider, model.id) ?? model;
+				const apiKey = await this.getApiKey(currentModel, sessionId, { signal });
+				return { apiKey, headers: currentModel.headers };
+			},
 			webSearch: this.getProviderWebSearchMode(model.provider),
 		};
 	}
@@ -4507,15 +5174,18 @@ export class ModelRegistry {
 		} = {},
 	): Promise<string | undefined> {
 		this.#refreshRotatingConfigApiKey(model.provider);
-		return this.#getApiKeyOrNoAuth(model.provider, () =>
+		const apiKey = await this.#getApiKeyOrNoAuth(model.provider, () =>
 			this.authStorage.getApiKey(model.provider, sessionId, {
 				baseUrl: model.baseUrl,
 				modelId: model.id,
 				credentialSelector: options.credentialSelector,
 				preferredCredentialSelector: options.preferredCredentialSelector,
+				owner: this.#authStorageConfigOwner,
 				signal: options.signal,
 			}),
 		);
+		this.#applyEffectiveAuthHeader(model, apiKey);
+		return apiKey;
 	}
 
 	/**
@@ -4532,28 +5202,143 @@ export class ModelRegistry {
 		} = {},
 	): Promise<string | undefined> {
 		this.#refreshRotatingConfigApiKey(provider);
-		return this.#getApiKeyOrNoAuth(provider, () =>
+		const apiKey = await this.#getApiKeyOrNoAuth(provider, () =>
 			this.authStorage.getApiKey(provider, sessionId, {
 				baseUrl,
 				credentialSelector: options.credentialSelector,
 				preferredCredentialSelector: options.preferredCredentialSelector,
+				owner: this.#authStorageConfigOwner,
 				signal: options.signal,
 			}),
 		);
+		if (
+			this.#runtimeProviderAuthHeaders.get(provider) === true ||
+			this.#customProviderAuthHeaders.get(provider) === true
+		) {
+			for (const model of this.#models) {
+				if (model.provider === provider) this.#applyEffectiveAuthHeader(model, apiKey);
+			}
+		}
+		return apiKey;
 	}
 
-	#refreshRotatingConfigApiKey(provider: string): void {
-		const envName = this.#customProviderApiKeyEnvNames.get(provider);
+	#refreshRotatingConfigApiKey(provider: string, forceStatic = false): void {
+		const runtimeOwned = !forceStatic && this.#runtimeProviderApiKeys.has(provider);
+		const envName = runtimeOwned
+			? this.#runtimeProviderApiKeyEnvNames.get(provider)
+			: this.#customProviderApiKeyEnvNames.get(provider);
 		if (!envName) return;
 		const resolved = $rotatingCredentialEnv(envName);
-		if (resolved === this.#customProviderApiKeys.get(provider)) return;
+		const previous = runtimeOwned
+			? this.#runtimeProviderResolvedApiKeys.get(provider)
+			: this.#customProviderApiKeys.get(provider);
+		if (resolved === previous && (!runtimeOwned || this.#runtimeProviderCredentialInstalled.has(provider))) return;
 		if (resolved === undefined) {
+			if (runtimeOwned) {
+				if (!this.#runtimeProviderCredentialInstalled.has(provider)) return;
+				this.#runtimeProviderCredentialInstalled.delete(provider);
+				this.#staticModelsLoaded = false;
+				this.#reloadStaticModels();
+				return;
+			}
 			this.#customProviderApiKeys.delete(provider);
-			this.authStorage.removeConfigApiKey(provider);
-			return;
+			this.authStorage.removeConfigApiKey(provider, this.#authStorageConfigOwner);
+		} else {
+			this.#customProviderApiKeys.set(provider, resolved);
+			if (runtimeOwned) {
+				this.#runtimeProviderResolvedApiKeys.set(provider, resolved);
+				this.#runtimeProviderCredentialInstalled.add(provider);
+			}
+			if (runtimeOwned) {
+				this.authStorage.setConfigApiKey(provider, resolved, { owner: this.#authStorageConfigOwner });
+			} else {
+				this.authStorage.setConfigApiKey(provider, resolved, {
+					envSourced: true,
+					owner: this.#authStorageConfigOwner,
+				});
+			}
 		}
-		this.#customProviderApiKeys.set(provider, resolved);
-		this.authStorage.setConfigApiKey(provider, resolved, { envSourced: true });
+		const authHeader =
+			this.#runtimeProviderAuthHeaders.get(provider) ?? this.#customProviderAuthHeaders.get(provider);
+		const runtimeOverride = this.#runtimeProviderOverrides.get(provider);
+		if (runtimeOverride) this.#runtimeProviderOverrides.set(provider, { ...runtimeOverride, apiKey: resolved ?? "" });
+		this.#runtimeModelOverlays = this.#runtimeModelOverlays.map(overlay => {
+			if (overlay.provider !== provider) return overlay;
+			const headers = { ...(overlay.headers ?? {}) } as Record<string, string> & {
+				[GENERATED_AUTH_HEADER]?: string;
+			};
+			const generated = headers[GENERATED_AUTH_HEADER];
+			const hadAuthorization = headerValue(headers, "Authorization") !== undefined;
+			const ownsAuthorization = ownsOnlyGeneratedAuthorization(headers, generated);
+			if (ownsAuthorization) deleteHeaderCaseInsensitive(headers, "Authorization");
+			else if (typeof generated === "string") deleteAuthorizationValue(headers, generated);
+			delete headers[GENERATED_AUTH_HEADER];
+			if (authHeader === true && resolved && (ownsAuthorization || !hadAuthorization)) {
+				headers.Authorization = `Bearer ${resolved}`;
+				headers[GENERATED_AUTH_HEADER] = `Bearer ${resolved}`;
+			}
+			return { ...overlay, headers };
+		});
+		if (authHeader === true) this.#generatedAuthHeaderProviders.add(provider);
+		if (authHeader !== true && !this.#generatedAuthHeaderProviders.has(provider)) return;
+		for (const model of this.#models) {
+			if (model.provider !== provider) continue;
+			const headers = { ...(model.headers ?? {}) } as Record<string, string> & {
+				[GENERATED_AUTH_HEADER]?: string;
+			};
+			const generated =
+				this.#generatedAuthHeaders.get(model) ??
+				(typeof headers[GENERATED_AUTH_HEADER] === "string"
+					? { authorization: headers[GENERATED_AUTH_HEADER] }
+					: undefined);
+			const hadAuthorization = headerValue(headers, "Authorization") !== undefined;
+			const ownsAuthorization = ownsOnlyGeneratedAuthorization(headers, generated?.authorization);
+			if (ownsAuthorization) deleteHeaderCaseInsensitive(headers, "Authorization");
+			else if (generated?.authorization) deleteAuthorizationValue(headers, generated.authorization);
+			if (generated?.apiKey === headers["X-Api-Key"]) delete headers["X-Api-Key"];
+			delete headers[GENERATED_AUTH_HEADER];
+			model.headers =
+				authHeader === true && resolved && (ownsAuthorization || !hadAuthorization)
+					? { ...headers, Authorization: `Bearer ${resolved}`, [GENERATED_AUTH_HEADER]: `Bearer ${resolved}` }
+					: headers;
+			if (authHeader === true && resolved && (ownsAuthorization || !hadAuthorization))
+				this.#generatedAuthHeaders.set(model, { authorization: model.headers.Authorization });
+		}
+		this.#rebuildCanonicalIndex();
+	}
+
+	#applyEffectiveAuthHeader(model: Model<Api>, apiKey: string | undefined): void {
+		const runtimeCredentialRevoked =
+			this.#runtimeProviderApiKeys.has(model.provider) &&
+			!this.#runtimeProviderCredentialInstalled.has(model.provider);
+		const authHeader = runtimeCredentialRevoked
+			? this.#customProviderAuthHeaders.get(model.provider)
+			: (this.#runtimeProviderAuthHeaders.get(model.provider) ??
+				this.#customProviderAuthHeaders.get(model.provider));
+		if (authHeader === true) this.#generatedAuthHeaderProviders.add(model.provider);
+		const headers = { ...(model.headers ?? {}) } as Record<string, string> & {
+			[GENERATED_AUTH_HEADER]?: string;
+		};
+		const generated =
+			this.#generatedAuthHeaders.get(model) ??
+			(typeof headers[GENERATED_AUTH_HEADER] === "string"
+				? { authorization: headers[GENERATED_AUTH_HEADER] }
+				: undefined);
+		const hadAuthorization = headerValue(headers, "Authorization") !== undefined;
+		const ownsAuthorization = ownsOnlyGeneratedAuthorization(headers, generated?.authorization);
+		if (authHeader !== true && generated === undefined && !this.#generatedAuthHeaderProviders.has(model.provider))
+			return;
+		if (ownsAuthorization) deleteHeaderCaseInsensitive(headers, "Authorization");
+		else if (generated?.authorization) deleteAuthorizationValue(headers, generated.authorization);
+		if (generated?.apiKey === headers["X-Api-Key"]) delete headers["X-Api-Key"];
+		delete headers[GENERATED_AUTH_HEADER];
+		model.headers =
+			authHeader === true && apiKey && apiKey !== kNoAuth && (ownsAuthorization || !hadAuthorization)
+				? { ...headers, Authorization: `Bearer ${apiKey}`, [GENERATED_AUTH_HEADER]: `Bearer ${apiKey}` }
+				: headers;
+		if (authHeader === true && apiKey && apiKey !== kNoAuth && (ownsAuthorization || !hadAuthorization)) {
+			this.#generatedAuthHeaders.set(model, { authorization: model.headers.Authorization });
+		}
 	}
 
 	async #peekApiKeyForProvider(
@@ -4569,16 +5354,21 @@ export class ModelRegistry {
 			return kNoAuth;
 		}
 		try {
-			this.authStorage.getProviderEvidenceGeneration(provider);
+			this.authStorage.getProviderEvidenceGeneration(provider, undefined, this.#authStorageConfigOwner);
 		} catch {
 			return undefined;
 		}
 		if (options.refreshOAuth && this.authStorage.hasOAuth(provider)) {
-			return this.authStorage.getApiKey(provider, undefined, { baseUrl: options.baseUrl });
+			return this.authStorage.getApiKey(provider, undefined, {
+				baseUrl: options.baseUrl,
+				owner: this.#authStorageConfigOwner,
+			});
 		}
 		return options.ignoreCredentiallessFallback
-			? this.authStorage.peekApiKey(provider)
-			: this.#getApiKeyOrNoAuth(provider, () => this.authStorage.peekApiKey(provider));
+			? this.authStorage.peekApiKey(provider, { owner: this.#authStorageConfigOwner })
+			: this.#getApiKeyOrNoAuth(provider, () =>
+					this.authStorage.peekApiKey(provider, { owner: this.#authStorageConfigOwner }),
+				);
 	}
 
 	/**
@@ -4604,9 +5394,13 @@ export class ModelRegistry {
 
 	#clearRuntimeProviderState(providerName: string): void {
 		this.#runtimeProviderApiKeys.delete(providerName);
+		this.#runtimeProviderResolvedApiKeys.delete(providerName);
+		this.#runtimeProviderCredentialInstalled.delete(providerName);
+		this.#runtimeProviderApiKeyEnvNames.delete(providerName);
 		this.#runtimeProviderOverrides.delete(providerName);
+		this.#runtimeProviderAuthHeaders.delete(providerName);
 		this.#runtimeModelOverlays = this.#runtimeModelOverlays.filter(overlay => overlay.provider !== providerName);
-		this.authStorage.removeConfigApiKey(providerName);
+		this.authStorage.removeConfigApiKey(providerName, this.#authStorageConfigOwner);
 		this.#clearDescriptorDiscoveryEvidence(providerName);
 	}
 
@@ -4692,7 +5486,6 @@ export class ModelRegistry {
 				sourceId,
 			});
 		}
-
 		let sourceHandoff = false;
 		if (sourceId) {
 			this.#registeredProviderSources.add(sourceId);
@@ -4715,14 +5508,89 @@ export class ModelRegistry {
 			this.#lastStaticLoadMtime = null;
 			this.#staticModelsLoaded = false;
 			this.#reloadStaticModels();
+			if (config.authHeader !== undefined) this.#runtimeProviderAuthHeaders.set(providerName, config.authHeader);
+		}
+		if (config.authHeader !== undefined) {
+			if (config.authHeader === false) {
+				this.#runtimeModelOverlays = this.#runtimeModelOverlays.map(overlay => {
+					if (overlay.provider !== providerName) return overlay;
+					const headers = { ...(overlay.headers ?? {}) } as Record<string, string> & {
+						[GENERATED_AUTH_HEADER]?: string;
+					};
+					const generated = headers[GENERATED_AUTH_HEADER];
+					if (typeof generated === "string" && headers.Authorization === generated) delete headers.Authorization;
+					delete headers[GENERATED_AUTH_HEADER];
+					return { ...overlay, headers };
+				});
+			}
+			this.#runtimeProviderAuthHeaders.set(providerName, config.authHeader);
+			if (config.authHeader === true) this.#generatedAuthHeaderProviders.add(providerName);
 		}
 
 		if (config.apiKey) {
-			this.#customProviderApiKeys.set(providerName, config.apiKey);
+			const resolved = resolveApiKeyConfig(config.apiKey);
+			if (!resolved) return;
+			if (Bun.env[config.apiKey] !== undefined) this.#runtimeProviderApiKeyEnvNames.set(providerName, config.apiKey);
+			else this.#runtimeProviderApiKeyEnvNames.delete(providerName);
+			this.#customProviderApiKeys.set(providerName, resolved);
 			// Persist runtime API keys so they survive #reloadStaticModels() cycles
 			this.#runtimeProviderApiKeys.set(providerName, config.apiKey);
-			const resolved = resolveApiKeyConfig(config.apiKey);
-			if (resolved) this.authStorage.setConfigApiKey(providerName, resolved);
+			this.#runtimeProviderResolvedApiKeys.set(providerName, resolved);
+			this.#runtimeProviderCredentialInstalled.add(providerName);
+			if (config.authHeader !== undefined) this.#runtimeProviderAuthHeaders.set(providerName, config.authHeader);
+			this.authStorage.setConfigApiKey(providerName, resolved, { owner: this.#authStorageConfigOwner });
+		}
+		if (config.oauth && !config.apiKey && this.#runtimeProviderApiKeys.has(providerName)) {
+			const previousApiKey = this.#runtimeProviderResolvedApiKeys.get(providerName);
+			this.#runtimeProviderApiKeys.delete(providerName);
+			this.#runtimeProviderResolvedApiKeys.delete(providerName);
+			this.#runtimeProviderCredentialInstalled.delete(providerName);
+			this.#runtimeProviderApiKeyEnvNames.delete(providerName);
+			this.#runtimeProviderAuthHeaders.delete(providerName);
+			this.#customProviderApiKeys.delete(providerName);
+			this.authStorage.removeConfigApiKey(providerName, this.#authStorageConfigOwner);
+			this.#runtimeModelOverlays = this.#runtimeModelOverlays.map(overlay => {
+				if (overlay.provider !== providerName) return overlay;
+				const headers = { ...(overlay.headers ?? {}) } as Record<string, string> & {
+					[GENERATED_AUTH_HEADER]?: string;
+				};
+				const generated = headers[GENERATED_AUTH_HEADER];
+				for (const key of Object.keys(headers)) {
+					if (key.toLowerCase() !== "authorization") continue;
+					const value = headers[key];
+					if (
+						(typeof generated === "string" && value === generated) ||
+						(previousApiKey !== undefined && value === `Bearer ${previousApiKey}`) ||
+						(previousApiKey === undefined && value.startsWith("Bearer "))
+					)
+						delete headers[key];
+				}
+				delete headers[GENERATED_AUTH_HEADER];
+				return { ...overlay, headers };
+			});
+			const previousOverride = this.#runtimeProviderOverrides.get(providerName);
+			if (previousOverride) {
+				const headers = { ...(previousOverride.headers ?? {}) };
+				for (const key of Object.keys(headers)) {
+					if (key.toLowerCase() !== "authorization") continue;
+					const value = headers[key];
+					if (
+						(previousApiKey !== undefined && value === `Bearer ${previousApiKey}`) ||
+						(previousApiKey === undefined && value.startsWith("Bearer "))
+					)
+						delete headers[key];
+				}
+				this.#runtimeProviderOverrides.set(providerName, {
+					...previousOverride,
+					apiKey: "",
+					authHeader: undefined,
+					isOAuth: true,
+					headers,
+				});
+			}
+			this.#staticModelsLoaded = false;
+			this.#reloadStaticModels();
+			if (config.authHeader !== undefined) this.#runtimeProviderAuthHeaders.set(providerName, config.authHeader);
 		}
 
 		if (config.models && config.models.length > 0) {
@@ -4734,7 +5602,7 @@ export class ModelRegistry {
 					config.baseUrl!,
 					config.api,
 					config.headers,
-					config.apiKey,
+					config.apiKey ? resolveApiKeyConfig(config.apiKey) : undefined,
 					config.authHeader,
 					config.compat,
 					config.requestTransform,
@@ -4756,6 +5624,29 @@ export class ModelRegistry {
 			for (const overlay of newOverlays) {
 				nextModels.push(finalizeCustomModel(overlay, { useDefaults: true }));
 			}
+			if (
+				config.baseUrl ||
+				config.headers ||
+				config.apiKey ||
+				config.authHeader !== undefined ||
+				config.compat !== undefined ||
+				config.requestTransform !== undefined ||
+				config.transport !== undefined
+			) {
+				this.#runtimeProviderOverrides.set(
+					providerName,
+					this.#mergeProviderOverride(this.#runtimeProviderOverrides.get(providerName), {
+						api: config.api,
+						baseUrl: this.#runtimeProviderOverrides.get(providerName)?.baseUrl ?? config.baseUrl,
+						headers: config.headers,
+						apiKey: config.apiKey ? resolveApiKeyConfig(config.apiKey) : undefined,
+						authHeader: config.authHeader,
+						compat: config.compat,
+						requestTransform: config.requestTransform,
+						transport: config.transport,
+					}),
+				);
+			}
 			const runtimeTransportOverride = this.#runtimeProviderOverrides.get(providerName);
 			const withRuntimeTransportOverride = runtimeTransportOverride
 				? nextModels.map(model => {
@@ -4766,7 +5657,9 @@ export class ModelRegistry {
 			const withModelOverrides = this.#applyProviderModelOverrides(providerName, withRuntimeTransportOverride);
 
 			if (config.oauth?.modifyModels) {
-				const credential = this.authStorage.getOAuthCredential(providerName);
+				const credential = this.authStorage.getOAuthCredential(providerName, undefined, {
+					owner: this.#authStorageConfigOwner,
+				});
 				if (credential) {
 					this.#models = this.#finalizeModels(config.oauth.modifyModels(withModelOverrides, credential));
 					this.#rebuildCanonicalIndex();
@@ -4791,9 +5684,10 @@ export class ModelRegistry {
 			config.transport !== undefined
 		) {
 			const transportOverride = {
+				api: config.api,
 				baseUrl: config.baseUrl,
 				headers: config.headers,
-				apiKey: config.apiKey,
+				apiKey: config.apiKey ? resolveApiKeyConfig(config.apiKey) : undefined,
 				authHeader: config.authHeader,
 				compat: config.compat,
 				requestTransform: config.requestTransform,
@@ -4808,6 +5702,11 @@ export class ModelRegistry {
 				if (m.provider !== providerName) return m;
 				return this.#applyRuntimeProviderOverride(m, transportOverride);
 			});
+			if (config.authHeader === false) {
+				for (const model of this.#models) {
+					if (model.provider === providerName) this.#applyEffectiveAuthHeader(model, undefined);
+				}
+			}
 			this.#rebuildCanonicalIndex();
 			this.#rebuildProviderActivity();
 		}

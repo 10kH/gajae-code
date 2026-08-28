@@ -2,10 +2,12 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { AuthBrokerError } from "../src/auth-broker/client";
 import {
 	type AuthCredentialStore,
 	AuthStorage,
 	type CredentialDisabledEvent,
+	readBrokerErrorBody,
 	SqliteAuthCredentialStore,
 } from "../src/auth-storage";
 import * as oauthUtils from "../src/utils/oauth";
@@ -284,6 +286,72 @@ describe("AuthStorage OAuth refresh race", () => {
 			expect(events[0]?.disabledCause).toContain("invalid_grant");
 		});
 	});
+
+	test("preserves the original broker auth error when remote disable reconciliation fails, then recovers after reload", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+
+		await authStorage.set("anthropic", [
+			{
+				type: "oauth",
+				access: "expired-access",
+				refresh: "broker-refresh",
+				expires: Date.now() - 60_000,
+			},
+		]);
+		const credentialId = store.listAuthCredentials("anthropic")[0]!.id;
+		const originalAuthError = new AuthBrokerError("Auth broker refresh failed", {
+			status: 500,
+			body: '{"error":"invalid_grant","error_description":"provider rejected the refresh token"}',
+		});
+		const reconciliationError = new Error("broker reload unavailable during disable");
+		store.refreshOAuthCredential = async () => {
+			throw originalAuthError;
+		};
+		vi.spyOn(store, "tryDisableAuthCredentialIfMatches").mockReturnValue(false);
+		store.disableAuthCredentialRemote = async () => {
+			throw reconciliationError;
+		};
+
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			const failure = await authStorage!.getApiKey("anthropic", "session-broker-error").then(
+				() => undefined,
+				error => error,
+			);
+			expect(failure).toBe(originalAuthError);
+			expect((failure as AuthBrokerError).message).toBe("Auth broker refresh failed");
+			expect((failure as AuthBrokerError).body).toContain("provider rejected the refresh token");
+			expect(events).toHaveLength(0);
+		});
+
+		// A later authoritative reload must still recover the active row after the
+		// failed reconciliation, without disabling or replaying the old token.
+		store.updateAuthCredential(credentialId, {
+			type: "oauth",
+			access: "recovered-access",
+			refresh: "recovered-refresh",
+			expires: Date.now() + 60 * 60_000,
+		});
+		await authStorage.reload();
+		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, credentials) => {
+			const credential = credentials[provider];
+			if (!credential) return null;
+			return { newCredentials: credential, apiKey: credential.access };
+		});
+
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			expect(await authStorage!.getApiKey("anthropic", "session-broker-recovered")).toBe("recovered-access");
+		});
+		const active = store.listAuthCredentials("anthropic");
+		expect(active).toHaveLength(1);
+		expect(active[0]?.id).toBe(credentialId);
+		expect(active[0]?.disabledCause).toBeNull();
+		expect(active[0]?.credential).toMatchObject({
+			type: "oauth",
+			access: "recovered-access",
+			refresh: "recovered-refresh",
+		});
+	});
+
 	test("persists every credential refreshed during candidate preflight", async () => {
 		if (!authStorage || !store) throw new Error("test setup failed");
 
@@ -501,6 +569,36 @@ describe("AuthStorage OAuth refresh race", () => {
 			expect(events[0]?.disabledCause).toContain("authorization grant is invalid");
 		});
 	});
+
+	test.each([
+		[
+			"throwing body membership probe",
+			(error: Error) =>
+				new Proxy(error, {
+					has: () => {
+						throw error;
+					},
+				}),
+		],
+		[
+			"throwing body accessor",
+			(error: Error) =>
+				new Proxy(error, {
+					has(target, property) {
+						return property === "body" || Reflect.has(target, property);
+					},
+					get(target, property, receiver) {
+						if (property === "body") throw error;
+						return Reflect.get(target, property, receiver);
+					},
+				}),
+		],
+	] as const)("preserves the original refresh failure when broker-body inspection throws: %s", (_label, wrap) => {
+		const original = new Error("provider refresh failed");
+		const failure = wrap(original);
+		expect(() => readBrokerErrorBody(failure)).toThrow(failure);
+	});
+
 	test("never replays a stale refresh token upstream when a peer already rotated the row", async () => {
 		if (!authStorage || !store) throw new Error("test setup failed");
 

@@ -302,8 +302,13 @@ export class AuthBrokerClient {
 		}) as Promise<CredentialRefreshResponse>;
 	}
 
-	async disableCredential(id: number, cause: string, signal?: AbortSignal): Promise<CredentialDisableResponse> {
-		const body: CredentialDisableRequest = { cause };
+	async disableCredential(
+		id: number,
+		cause: string,
+		signal?: AbortSignal,
+		expectedRevision?: number,
+	): Promise<CredentialDisableResponse> {
+		const body: CredentialDisableRequest = { cause, ...(expectedRevision === undefined ? {} : { expectedRevision }) };
 		return this.#request("POST", `/v1/credential/${id}/disable`, {
 			body,
 			schema: credentialDisableResponseSchema,

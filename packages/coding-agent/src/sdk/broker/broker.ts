@@ -46,6 +46,8 @@ export interface BrokerSettings {
 	heartbeatTtlMs?: number;
 	/** Broker-owned migration policy. Client lifecycle frames cannot select it. */
 	resolveDirectoryMigration?: (_cwd: string) => Promise<DirectoryMigrationPolicy>;
+	/** Host model resolver override for lifecycle tests and embedders. */
+	resolveModelPin?: SdkHostModelResolver;
 }
 
 type ResolvedBrokerSettings = {
@@ -863,7 +865,8 @@ export class Broker {
 	#completion!: Promise<void>;
 	#resolveCompletion!: () => void;
 	#rejectCompletion!: (error: unknown) => void;
-	readonly #resolveModelPin: SdkHostModelResolver;
+	#resolveModelPin: SdkHostModelResolver;
+	#ownsResolveModelPin: boolean;
 	constructor(settings: BrokerSettings) {
 		this.settings = {
 			agentDir: settings.agentDir,
@@ -874,7 +877,8 @@ export class Broker {
 		};
 		this.index = new SessionIndex(settings.agentDir);
 		this.ledger = new LifecycleLedger(settings.agentDir);
-		this.#resolveModelPin = createDefaultSdkHostModelResolver(this.settings.agentDir);
+		this.#ownsResolveModelPin = settings.resolveModelPin === undefined;
+		this.#resolveModelPin = settings.resolveModelPin ?? createDefaultSdkHostModelResolver(this.settings.agentDir);
 		this.#lock = path.join(settings.agentDir, "sdk", "broker.lock");
 		const completion = Promise.withResolvers<void>();
 		this.#completion = completion.promise;
@@ -1023,6 +1027,8 @@ export class Broker {
 			this.#resolveCompletion = completion.resolve;
 			this.#rejectCompletion = completion.reject;
 			this.#completionTask = null;
+			if (this.#ownsResolveModelPin)
+				this.#resolveModelPin = createDefaultSdkHostModelResolver(this.settings.agentDir);
 			// A drained queue refuses every later startup by design, so a restarted broker
 			// needs a new one or it would admit nothing for the rest of the process.
 			this.#startupAdmissions = new StartupAdmissionQueue(sdkHostStartupConcurrency());
@@ -1285,25 +1291,35 @@ export class Broker {
 		if (this.#heartbeatTimer) clearInterval(this.#heartbeatTimer);
 		this.#heartbeatTimer = null;
 		this.#completionTask = (async () => {
-			await this.#transport?.stop();
-			this.#transport = null;
-			if (mode === "lost-root")
-				await Promise.race([Promise.allSettled(this.#admitted), Bun.sleep(BROKER_SETTLEMENT_MS)]);
-			else await Promise.allSettled(this.#admitted);
-			this.#publication?.close();
-			this.#publication = null;
-			if (mode === "owned-root" && this.discovery?.ownerId === this.#owner) {
-				try {
-					const disk = JSON.parse(await fs.readFile(brokerDiscoveryPath(this.settings.agentDir), "utf8")) as {
-						ownerId?: string;
-					};
-					if (disk.ownerId === this.#owner) await fs.unlink(brokerDiscoveryPath(this.settings.agentDir));
-				} catch (e) {
-					if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+			try {
+				await this.#transport?.stop();
+				this.#transport = null;
+				if (mode === "lost-root")
+					await Promise.race([Promise.allSettled(this.#admitted), Bun.sleep(BROKER_SETTLEMENT_MS)]);
+				else await Promise.allSettled(this.#admitted);
+				this.#publication?.close();
+				this.#publication = null;
+				if (mode === "owned-root" && this.discovery?.ownerId === this.#owner) {
+					try {
+						const disk = JSON.parse(await fs.readFile(brokerDiscoveryPath(this.settings.agentDir), "utf8")) as {
+							ownerId?: string;
+						};
+						if (disk.ownerId === this.#owner) await fs.unlink(brokerDiscoveryPath(this.settings.agentDir));
+					} catch (e) {
+						if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+					}
+					await this.#releaseOwnedLock();
 				}
-				await this.#releaseOwnedLock();
+			} finally {
+				const disposeModelPin = this.#ownsResolveModelPin ? this.#resolveModelPin.dispose?.() : undefined;
+				if (mode === "lost-root" && disposeModelPin !== undefined) {
+					void disposeModelPin.catch(() => undefined);
+					await Promise.race([disposeModelPin, Bun.sleep(BROKER_SETTLEMENT_MS)]);
+				} else {
+					await disposeModelPin;
+				}
+				this.discovery = null;
 			}
-			this.discovery = null;
 		})();
 		void this.#completionTask.then(this.#resolveCompletion, this.#rejectCompletion);
 		return this.#completionTask;
@@ -1417,14 +1433,25 @@ export class Broker {
 
 		try {
 			const endpointPath = path.join(record.locator.stateRoot, "sdk", `${record.sessionId}.json`);
-			const [source, metadata] = await Promise.all([fs.readFile(endpointPath, "utf8"), fs.stat(endpointPath)]);
+			const before = await fs.lstat(endpointPath, { bigint: true });
+			if (!before.isFile()) return error("endpoint_stale", "session endpoint is not a regular file");
+			const source = await fs.readFile(endpointPath, "utf8");
+			const metadata = await fs.lstat(endpointPath, { bigint: true });
+			if (
+				before.dev !== metadata.dev ||
+				before.ino !== metadata.ino ||
+				before.size !== metadata.size ||
+				before.mtimeNs !== metadata.mtimeNs ||
+				before.ctimeNs !== metadata.ctimeNs
+			)
+				return error("endpoint_stale", "session endpoint changed during read");
 			const endpoint = JSON.parse(source) as Record<string, unknown>;
 			if (
 				endpoint.sessionId !== record.sessionId ||
 				endpoint.pid !== record.pid ||
 				endpoint.stale === true ||
 				record.endpointMtimeMs === undefined ||
-				Math.abs(metadata.mtimeMs - record.endpointMtimeMs) > 0.001
+				Math.abs(Number(metadata.mtimeNs) / 1_000_000 - record.endpointMtimeMs) > 0.001
 			)
 				return error("endpoint_stale", "session endpoint is stale");
 			await this.index.refresh();

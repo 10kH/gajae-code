@@ -117,6 +117,7 @@ import {
 	modelsAreEqual,
 	streamSimple,
 } from "@gajae-code/ai/core";
+import { normalizeAnthropicBaseUrl } from "@gajae-code/ai/providers/anthropic";
 import {
 	type AuthDisposition,
 	beginAttempt,
@@ -181,8 +182,10 @@ export interface ForkContextSeedOptions {
 }
 
 import type { AuthCredentialSelector } from "@gajae-code/ai/core";
+import { isFoundryEnabled } from "@gajae-code/ai/utils/foundry";
 import type { MacOSPowerAssertion } from "@gajae-code/natives";
 import {
+	$pickCredentialEnv,
 	extractRetryHint,
 	hasFsCode,
 	isEacces,
@@ -1652,14 +1655,41 @@ function buildSessionMetadata(
 	provider: string,
 	authStorage: AuthStorage | undefined,
 	credentialSessionId = sessionId,
+	model?: Model,
+	owner?: object,
 ): Record<string, unknown> {
 	const userId: Record<string, string> = { session_id: sessionId };
 	// Only look up account_uuid when the request is going to Anthropic. Injecting
 	// a Anthropic model OAuth account_uuid into requests bound for other providers (including
 	// Anthropic-format-compatible proxies like cloudflare-ai-gateway or gitlab-duo)
 	// would leak the user's Anthropic identity to unrelated third-party APIs.
-	if (provider === "anthropic") {
-		const accountUuid = authStorage?.getOAuthAccountId("anthropic", credentialSessionId);
+	const effectiveBaseUrl =
+		model?.provider === "anthropic"
+			? (normalizeAnthropicBaseUrl(
+					(isFoundryEnabled() ? $pickCredentialEnv("FOUNDRY_BASE_URL") : undefined) ?? model.baseUrl,
+				) ?? "https://api.anthropic.com")
+			: undefined;
+	let officialAnthropicEndpoint = false;
+	if (provider === "anthropic" && model?.api === "anthropic-messages") {
+		try {
+			const candidate = effectiveBaseUrl ?? "https://api.anthropic.com";
+			const url = new URL(candidate);
+			const authority = candidate.match(/^[a-z][a-z\d+.-]*:\/\/([^/?#]*)/iu)?.[1];
+			officialAnthropicEndpoint =
+				url.protocol === "https:" &&
+				url.hostname === "api.anthropic.com" &&
+				authority?.toLowerCase() === "api.anthropic.com" &&
+				!url.username &&
+				!url.password &&
+				!url.search &&
+				!url.hash &&
+				(url.pathname === "/" || url.pathname === "/v1" || url.pathname === "/v1/");
+		} catch {
+			officialAnthropicEndpoint = false;
+		}
+	}
+	if (officialAnthropicEndpoint) {
+		const accountUuid = authStorage?.getOAuthAccountId("anthropic", credentialSessionId, { owner });
 		if (typeof accountUuid === "string" && accountUuid.length > 0) {
 			userId.account_uuid = accountUuid;
 			// Derive device_id from account_uuid so the payload matches the real CC
@@ -7986,8 +8016,15 @@ export class AgentSession {
 		const sid = this.#providerSessionId ?? sessionId ?? this.sessionManager.getSessionId();
 		this.agent.sessionId = sid;
 		this.agent.providerSessionId = this.#providerCacheSessionId ?? sid;
-		this.agent.setMetadataResolver((provider: string) =>
-			buildSessionMetadata(sid, provider, this.#modelRegistry.authStorage, this.credentialSessionId),
+		this.agent.setMetadataResolver(context =>
+			buildSessionMetadata(
+				sid,
+				context.provider,
+				this.#modelRegistry.authStorage,
+				this.credentialSessionId,
+				context.model ?? this.model,
+				this.#modelRegistry.getAuthStorageOwner(),
+			),
 		);
 	}
 
@@ -9798,8 +9835,9 @@ export class AgentSession {
 	async setCredentialPin(provider: string, selector: AuthCredentialSelector): Promise<void> {
 		const scopeId = this.credentialSessionId;
 		const authStorage = this.#modelRegistry.authStorage;
-		const target = authStorage.resolveOAuthPinTarget(provider, selector);
-		authStorage.setSessionCredentialSelector(scopeId, provider, target.canonicalSelector);
+		const authStorageOwner = this.#modelRegistry.getAuthStorageOwner();
+		const target = authStorage.resolveOAuthPinTarget(provider, selector, authStorageOwner);
+		authStorage.setSessionCredentialSelector(scopeId, provider, target.canonicalSelector, authStorageOwner);
 		if (target.canonicalSelector.kind === "id" && !this.#credentialStoreIdentity) return;
 		this.sessionManager.appendCustomEntry("auth-credential-pin", {
 			v: 1,
@@ -19697,11 +19735,13 @@ export class AgentSession {
 			if (!isAuthenticated(activeApiKey)) return "unchanged";
 			remaining = await authStorage.invalidateCredentialMatching(provider, activeApiKey, {
 				sessionId: credentialSessionId,
+				owner: this.#modelRegistry.getAuthStorageOwner(),
 			});
 			if (!remaining) return "unchanged";
 		} else {
 			remaining = await authStorage.markUsageLimitReached(provider, credentialSessionId, {
 				retryAfterMs: trigger.retryAfterMs,
+				owner: this.#modelRegistry.getAuthStorageOwner(),
 			});
 		}
 
@@ -21246,6 +21286,8 @@ export class AgentSession {
 						model.provider,
 						this.#modelRegistry.authStorage,
 						this.credentialSessionId,
+						model,
+						this.#modelRegistry.getAuthStorageOwner(),
 					),
 					reasoning: toReasoningEffort(this.thinkingLevel),
 					hideThinkingSummary: this.agent.hideThinkingSummary,

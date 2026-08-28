@@ -18,6 +18,7 @@ import {
 } from "@gajae-code/ai/utils/anthropic-auth";
 import { $credentialEnv, $env } from "@gajae-code/utils";
 import type {
+	ActiveSearchModelCredentials,
 	AnthropicApiResponse,
 	AnthropicCitation,
 	SearchCitation,
@@ -73,6 +74,28 @@ function buildSystemBlocks(
 	});
 }
 
+function mergeHeadersPreservingExplicit(
+	baseHeaders: Record<string, string>,
+	explicitHeaders: Record<string, string> | undefined,
+): Record<string, string> {
+	const merged = { ...baseHeaders };
+	for (const [key, value] of Object.entries(explicitHeaders ?? {})) {
+		for (const existingKey of Object.keys(merged)) {
+			if (existingKey.toLowerCase() === key.toLowerCase()) delete merged[existingKey];
+		}
+		merged[key] = value;
+	}
+	return merged;
+}
+
+function explicitCredentialHeader(headers: Record<string, string> | undefined): string | undefined {
+	for (const [key, value] of Object.entries(headers ?? {})) {
+		const normalized = key.toLowerCase();
+		if (normalized === "authorization" || normalized === "x-api-key") return value;
+	}
+	return undefined;
+}
+
 /**
  * Calls the Anthropic API with web search tool enabled.
  * @param auth - Authentication configuration (API key or OAuth)
@@ -93,7 +116,7 @@ async function callSearch(
 	extraHeaders?: Record<string, string>,
 ): Promise<AnthropicApiResponse> {
 	const url = buildAnthropicUrl(auth);
-	const headers = { ...(extraHeaders ?? {}), ...buildAnthropicSearchHeaders(auth) };
+	const headers = mergeHeadersPreservingExplicit(buildAnthropicSearchHeaders(auth), extraHeaders);
 
 	const systemBlocks = buildSystemBlocks(auth, model, systemPrompt);
 
@@ -284,29 +307,78 @@ export async function searchAnthropic(
 	// proxy), prefer its wire model id and carry its request headers through.
 	let modelOverride: string | undefined;
 	let extraHeaders: Record<string, string> | undefined;
+	const activeContext = "authStorage" in params ? params.activeModelContext : undefined;
+	const activeSessionId = "authStorage" in params ? params.sessionId : undefined;
+	const activeCustomContext =
+		activeContext?.api === "anthropic-messages" &&
+		(activeContext.ownerAuthOverride || activeContext.provider.toLowerCase() !== "anthropic");
 
-	if (searchApiKey) {
-		auth = buildAnthropicAuthConfig(searchApiKey, searchBaseUrl);
-	} else if ("authStorage" in params) {
-		const apiKey = await params.authStorage.getApiKey("anthropic", params.sessionId, {
+	if (activeCustomContext && activeContext?.resolveCredentials) {
+		const activeCredentials = await activeContext.resolveCredentials({
+			sessionId: activeSessionId,
 			signal: params.signal,
 		});
-		if (apiKey) auth = buildAnthropicAuthConfig(apiKey);
-
-		// Fall back to the active model's own credentials + baseUrl when no
-		// canonical Anthropic key exists but the active model speaks the
-		// Anthropic wire (e.g. Claude served through a proxy).
-		const ctx = params.activeModelContext;
-		if (!auth && ctx && ctx.api === "anthropic-messages") {
-			const ctxKey = await params.authStorage.getApiKey(ctx.provider, params.sessionId, {
-				baseUrl: ctx.baseUrl,
-				modelId: ctx.modelId,
+		const ctxKey =
+			activeCredentials.apiKey ?? explicitCredentialHeader(activeCredentials.headers ?? activeContext.headers);
+		if (ctxKey) {
+			auth = buildAnthropicAuthConfig(ctxKey, activeContext.baseUrl);
+			modelOverride = activeContext.wireModelId ?? activeContext.modelId;
+			extraHeaders = activeCredentials.headers ?? activeContext.headers;
+		}
+	} else if (searchApiKey) {
+		auth = buildAnthropicAuthConfig(searchApiKey, searchBaseUrl);
+	} else if ("authStorage" in params) {
+		const ctx = activeContext;
+		const resolveActiveCredentials = ctx?.resolveCredentials;
+		const activeAnthropicWire = ctx?.api === "anthropic-messages";
+		const activeModelOwnsProvider =
+			ctx !== undefined &&
+			resolveActiveCredentials !== undefined &&
+			activeAnthropicWire &&
+			ctx.provider.toLowerCase() === "anthropic";
+		const activeCustomModel =
+			ctx !== undefined &&
+			resolveActiveCredentials !== undefined &&
+			activeAnthropicWire &&
+			ctx.provider.toLowerCase() !== "anthropic";
+		if (activeModelOwnsProvider || activeCustomModel) {
+			const activeCredentials: ActiveSearchModelCredentials = await resolveActiveCredentials({
+				sessionId: params.sessionId,
 				signal: params.signal,
 			});
+			const ctxKey = activeCredentials.apiKey ?? explicitCredentialHeader(activeCredentials.headers ?? ctx.headers);
 			if (ctxKey) {
 				auth = buildAnthropicAuthConfig(ctxKey, ctx.baseUrl);
 				modelOverride = ctx.wireModelId ?? ctx.modelId;
-				extraHeaders = ctx.headers;
+				extraHeaders = activeCredentials.headers ?? ctx.headers;
+			}
+		} else {
+			const apiKey = await params.authStorage.getApiKey("anthropic", params.sessionId, {
+				signal: params.signal,
+			});
+			if (apiKey) auth = buildAnthropicAuthConfig(apiKey);
+
+			// Fall back to the active model's own credentials + baseUrl when no
+			// canonical Anthropic key exists but the active model speaks the
+			// Anthropic wire (e.g. Claude served through a proxy).
+			if (!auth && ctx && ctx.api === "anthropic-messages") {
+				const activeCredentials: ActiveSearchModelCredentials = ctx.resolveCredentials
+					? await ctx.resolveCredentials({ sessionId: params.sessionId, signal: params.signal })
+					: {
+							apiKey: await params.authStorage.getApiKey(ctx.provider, params.sessionId, {
+								baseUrl: ctx.baseUrl,
+								modelId: ctx.modelId,
+								signal: params.signal,
+							}),
+							headers: ctx.headers,
+						};
+				const ctxKey =
+					activeCredentials.apiKey ?? explicitCredentialHeader(activeCredentials.headers ?? ctx.headers);
+				if (ctxKey) {
+					auth = buildAnthropicAuthConfig(ctxKey, ctx.baseUrl);
+					modelOverride = ctx.wireModelId ?? ctx.modelId;
+					extraHeaders = activeCredentials.headers ?? ctx.headers;
+				}
 			}
 		}
 	}

@@ -22,9 +22,18 @@ import {
 	normalizeTierMap,
 	validateAutoroutingSetup,
 } from "../../config/autorouting-contract";
+import {
+	getProxyRoutableProviders,
+	inspectProxyProviderId,
+	requiresQualifiedModelProfileRoleResolution,
+	resolveProxyMode,
+	rewriteSelectorForProxy,
+	tryResolveProxyProviderId,
+} from "../../config/model-profile-activation";
 
 import { isModelProfileProviderAvailable } from "../../config/model-profile-contract";
 import {
+	deriveModelProfileMappedProviders,
 	getModelProfilePresentation,
 	groupModelProfilesForPresetLanding,
 	type ModelProfileDefinition,
@@ -399,6 +408,7 @@ export class ModelSelectorComponent extends Container {
 	#closeAfterAssignment = false;
 	#unsubscribeCatalogChanged: () => void = () => {};
 	#unsubscribeProviderOrderChanged: () => void = () => {};
+	#unsubscribeAuthGeneration: () => void = () => {};
 	#disposed = false;
 	/** Standalone smart-routing entry: cancel closes the selector instead of falling back to the preset landing. */
 	#smartRoutingOnly = false;
@@ -413,6 +423,7 @@ export class ModelSelectorComponent extends Container {
 	#providerAuthById = new Map<string, boolean>();
 	#bareProfileAuthByName = new Map<string, boolean>();
 	#providerAuthPending: boolean = false;
+	#providerAuthRefreshGeneration = 0;
 	#presetLoginHint?: string;
 	#authSessionId?: string;
 	#imageRoleFilter: boolean = false;
@@ -524,6 +535,14 @@ export class ModelSelectorComponent extends Container {
 		if (typeof this.#modelRegistry.onCatalogChanged === "function") {
 			this.#unsubscribeCatalogChanged = this.#modelRegistry.onCatalogChanged(() => {
 				if (this.#disposed) return;
+				if (this.#viewMode === "presets") {
+					this.#refreshCatalogView();
+					this.#clampPresetCursor();
+					void this.#refreshProviderAuth();
+					this.#renderPresetLanding();
+					this.#tui.requestRender();
+					return;
+				}
 				if (this.#refreshCatalogView()) this.#tui.requestRender();
 			});
 		}
@@ -538,6 +557,11 @@ export class ModelSelectorComponent extends Container {
 			panel.updateProviderOrderHint(this.#providerOrderHintFor(panel.getProviderOrder()));
 			this.#tui.requestRender();
 		});
+		this.#unsubscribeAuthGeneration =
+			this.#modelRegistry.authStorage?.onGenerationChanged?.(() => {
+				if (this.#disposed || this.#viewMode !== "presets") return;
+				void this.#refreshProviderAuth();
+			}) ?? (() => {});
 
 		// Load models and do initial render
 		this.#loadModels().then(() => {
@@ -572,8 +596,10 @@ export class ModelSelectorComponent extends Container {
 	override dispose(): void {
 		if (this.#disposed) return;
 		this.#disposed = true;
+		this.#providerAuthRefreshGeneration++;
 		this.#unsubscribeCatalogChanged();
 		this.#unsubscribeProviderOrderChanged();
+		this.#unsubscribeAuthGeneration();
 		super.dispose();
 	}
 
@@ -1301,13 +1327,61 @@ export class ModelSelectorComponent extends Container {
 		return this.#providerAuthById.get(providerId);
 	}
 
+	#getProfileAvailableModels(): Model[] {
+		const getAvailableForProfileActivation = this.#modelRegistry.getAvailableForProfileActivation;
+		return typeof getAvailableForProfileActivation === "function"
+			? getAvailableForProfileActivation.call(this.#modelRegistry)
+			: this.#modelRegistry.getAvailable();
+	}
+
+	#createProfileResolutionRegistry(availableModels: readonly Model[]) {
+		return {
+			getAvailable: () => availableModels as Model[],
+			getApiKey: this.#modelRegistry.getApiKey?.bind(this.#modelRegistry) ?? (async () => undefined),
+			resolveCanonicalModel: this.#modelRegistry.resolveCanonicalModel?.bind(this.#modelRegistry),
+			getCanonicalVariants: this.#modelRegistry.getCanonicalVariants?.bind(this.#modelRegistry),
+			getCanonicalId: this.#modelRegistry.getCanonicalId?.bind(this.#modelRegistry),
+			resolveModelByLookupAlias: this.#modelRegistry.resolveModelByLookupAlias?.bind(this.#modelRegistry),
+			lookupAliasExists: this.#modelRegistry.lookupAliasExists?.bind(this.#modelRegistry),
+			clearCanonicalVariant: this.#modelRegistry.clearCanonicalVariant?.bind(this.#modelRegistry),
+		};
+	}
+
+	#getProfileAuthenticatedProviders(profile: ModelProfileDefinition): Set<string> {
+		if (profile.source !== "user" && inspectProxyProviderId(this.#settings).status === "invalid") return new Set();
+		const authenticated = new Set(
+			[...this.#providerAuthById]
+				.filter(([, providerAuthenticated]) => providerAuthenticated)
+				.map(([provider]) => provider),
+		);
+		const proxyProvider = profile.source === "user" ? undefined : tryResolveProxyProviderId(this.#settings);
+		if (proxyProvider !== undefined && this.#isProviderAuthenticated(proxyProvider) === true) {
+			for (const provider of getProxyRoutableProviders(profile)) authenticated.add(provider);
+		}
+		return authenticated;
+	}
+
+	#rewriteProfileSelectorForProxy(profile: ModelProfileDefinition, selector: string): string {
+		if (profile.source === "user") return selector;
+		const proxyProvider = tryResolveProxyProviderId(this.#settings);
+		if (proxyProvider === undefined || this.#isProviderAuthenticated(proxyProvider) !== true) return selector;
+		return rewriteSelectorForProxy(
+			selector,
+			proxyProvider,
+			resolveProxyMode(this.#settings),
+			this.#getProfileAvailableModels(),
+			new Set(
+				[...this.#providerAuthById].filter(([, authenticated]) => authenticated).map(([provider]) => provider),
+			),
+			getProxyRoutableProviders(profile),
+		);
+	}
+
 	#getMissingProviders(profileOrProfiles: ModelProfileDefinition | ModelProfileDefinition[]): string[] {
 		const profiles = Array.isArray(profileOrProfiles) ? profileOrProfiles : [profileOrProfiles];
 		const missing = new Set<string>();
 		for (const profile of profiles) {
-			const authenticated = new Set(
-				profileRequiredProviders(profile).filter(provider => this.#isProviderAuthenticated(provider) === true),
-			);
+			const authenticated = this.#getProfileAuthenticatedProviders(profile);
 			if (isModelProfileProviderAvailable(profile, authenticated)) continue;
 			const alternativeGroups = profile.alternativeProviderGroups ?? [];
 			const alternativeProviders = new Set(alternativeGroups.flat());
@@ -1325,18 +1399,52 @@ export class ModelSelectorComponent extends Container {
 	#isPresetAuthenticated(profileOrProfiles: ModelProfileDefinition | ModelProfileDefinition[]): boolean {
 		const profiles = Array.isArray(profileOrProfiles) ? profileOrProfiles : [profileOrProfiles];
 		return profiles.every(profile => {
+			if (profile.source !== "user") {
+				if (inspectProxyProviderId(this.#settings).status === "invalid") return false;
+				const proxyProvider = tryResolveProxyProviderId(this.#settings);
+				if (
+					proxyProvider !== undefined &&
+					!(this.#modelRegistry.getConfiguredProviderIds?.() ?? []).includes(proxyProvider)
+				)
+					return false;
+				try {
+					if (resolveProxyMode(this.#settings) === "always") {
+						const configuredProviders = this.#modelRegistry.getConfiguredProviderIds?.() ?? [];
+						if (
+							proxyProvider === undefined ||
+							this.#isProviderAuthenticated(proxyProvider) !== true ||
+							!configuredProviders.includes(proxyProvider)
+						)
+							return false;
+					}
+				} catch {
+					return false;
+				}
+			}
 			if (this.#getMissingProviders(profile).length > 0) return false;
 			const bindings = resolveProfileBindings(profile);
-			const values = [
-				...(bindings.defaultSelector ? [bindings.defaultSelector] : []),
-				...Object.values(bindings.modelRoles),
-				...Object.values(bindings.agentModelOverrides),
+			const assignments = [
+				...(bindings.defaultSelector !== undefined ? [{ value: bindings.defaultSelector, isDefault: true }] : []),
+				...Object.values(bindings.modelRoles).map(value => ({ value, isDefault: false })),
+				...Object.values(bindings.agentModelOverrides).map(value => ({ value, isDefault: false })),
 			];
 			const bareAssignmentsAvailable = this.#bareProfileAuthByName.get(profile.name) ?? true;
-			return values.every(value =>
-				normalizeModelSelectorValue(value).some(selector => {
+			const availableModels = this.#getProfileAvailableModels();
+			return assignments.every(assignment => {
+				let selectors: string[];
+				try {
+					selectors = normalizeModelSelectorValue(assignment.value).map(selector =>
+						this.#rewriteProfileSelectorForProxy(profile, selector),
+					);
+				} catch {
+					return false;
+				}
+				const hasBareSelector = selectors.some(selector => !selector.includes("/"));
+				if (!assignment.isDefault && !requiresQualifiedModelProfileRoleResolution(profile) && !hasBareSelector)
+					return true;
+				return selectors.some(selector => {
 					if (!selector.includes("/")) return bareAssignmentsAvailable;
-					const resolved = resolveModelRoleValue(selector, this.#modelRegistry.getAvailable(), {
+					const resolved = resolveModelRoleValue(selector, availableModels, {
 						settings: this.#settings,
 						modelRegistry: this.#modelRegistry,
 						aliasIntent: "preset-equivalent",
@@ -1357,7 +1465,7 @@ export class ModelSelectorComponent extends Container {
 							return (
 								resolveModelRoleValue(
 									replacementSelector,
-									this.#modelRegistry.getAvailable().filter(model => model.provider === provider),
+									availableModels.filter(model => model.provider === provider),
 									{
 										settings: this.#settings,
 										modelRegistry: this.#modelRegistry,
@@ -1368,8 +1476,8 @@ export class ModelSelectorComponent extends Container {
 							);
 						}) ?? false
 					);
-				}),
-			);
+				});
+			});
 		});
 	}
 
@@ -1383,10 +1491,23 @@ export class ModelSelectorComponent extends Container {
 	}
 
 	async #refreshProviderAuth(): Promise<void> {
+		const refreshGeneration = ++this.#providerAuthRefreshGeneration;
+		this.#providerAuthById = new Map();
+		this.#bareProfileAuthByName = new Map();
+		const availableModels = this.#getProfileAvailableModels();
+		const resolutionRegistry = this.#createProfileResolutionRegistry(availableModels);
 		const providers = new Set<string>();
 		for (const profiles of this.#getPresetGroups().values()) {
 			for (const profile of profiles) {
 				for (const provider of profileRequiredProviders(profile)) providers.add(provider);
+				for (const group of profile.alternativeProviderGroups ?? []) {
+					for (const provider of group) providers.add(provider);
+				}
+				for (const provider of deriveModelProfileMappedProviders(profile)) providers.add(provider);
+				if (profile.source !== "user") {
+					const proxyProvider = tryResolveProxyProviderId(this.#settings);
+					if (proxyProvider !== undefined) providers.add(proxyProvider);
+				}
 				const bindings = resolveProfileBindings(profile);
 				const values = [
 					...(bindings.defaultSelector ? [bindings.defaultSelector] : []),
@@ -1395,7 +1516,7 @@ export class ModelSelectorComponent extends Container {
 				];
 				for (const value of values) {
 					for (const selector of normalizeModelSelectorValue(value)) {
-						const resolved = resolveModelRoleValue(selector, this.#modelRegistry.getAvailable(), {
+						const resolved = resolveModelRoleValue(selector, availableModels, {
 							settings: this.#settings,
 							modelRegistry: this.#modelRegistry,
 							aliasIntent: "preset-equivalent",
@@ -1419,6 +1540,12 @@ export class ModelSelectorComponent extends Container {
 					}
 				}),
 			);
+			if (
+				this.#disposed ||
+				this.#viewMode !== "presets" ||
+				refreshGeneration !== this.#providerAuthRefreshGeneration
+			)
+				return;
 			this.#providerAuthById = new Map(entries);
 			const profileAuthEntries = await Promise.all(
 				[...this.#getPresetGroups().values()].flat().map(async profile => {
@@ -1436,7 +1563,7 @@ export class ModelSelectorComponent extends Container {
 							try {
 								const resolution = await resolveModelChainWithAuth(
 									normalizeModelSelectorValue(value),
-									this.#modelRegistry,
+									resolutionRegistry,
 									this.#settings,
 									this.#authSessionId,
 									{
@@ -1455,11 +1582,23 @@ export class ModelSelectorComponent extends Container {
 					return [profile.name, available.every(Boolean)] as const;
 				}),
 			);
+			if (
+				this.#disposed ||
+				this.#viewMode !== "presets" ||
+				refreshGeneration !== this.#providerAuthRefreshGeneration
+			)
+				return;
 			this.#bareProfileAuthByName = new Map(profileAuthEntries);
 		} finally {
-			this.#providerAuthPending = false;
-			this.#renderPresetLanding();
-			this.#tui.requestRender();
+			if (
+				!this.#disposed &&
+				this.#viewMode === "presets" &&
+				refreshGeneration === this.#providerAuthRefreshGeneration
+			) {
+				this.#providerAuthPending = false;
+				this.#renderPresetLanding();
+				this.#tui.requestRender();
+			}
 		}
 	}
 
@@ -1676,6 +1815,7 @@ export class ModelSelectorComponent extends Container {
 		this.#smartRoutingPanel = undefined;
 		this.#viewMode = "presets";
 		this.#presetCursor = Math.min(this.#presetCursor, Math.max(0, this.#getPresetRows().length - 1));
+		void this.#refreshProviderAuth();
 		this.#renderPresetLanding();
 		this.#tui.requestRender();
 	}

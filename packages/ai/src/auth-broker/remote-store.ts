@@ -836,6 +836,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 				provider: entry.provider,
 				credential: entry.credential as AuthCredential,
 				disabledCause: null,
+				...(entry.revision === undefined ? {} : { revision: entry.revision }),
 			});
 		}
 		return out;
@@ -862,6 +863,32 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 
 	tryDisableAuthCredentialIfMatches(_id: number, _expectedData: string, _disabledCause: string): boolean {
 		return false;
+	}
+
+	/** Disable one credential through the authenticated broker mutation endpoint. */
+	async disableAuthCredentialRemote(
+		credentialId: number,
+		disabledCause: string,
+		signal?: AbortSignal,
+		expectedRevision?: number,
+	): Promise<boolean> {
+		try {
+			await this.#client.disableCredential(credentialId, disabledCause, signal, expectedRevision);
+		} catch (error) {
+			if (!isErrorStatus(error, 404)) throw error;
+			// A peer may have disabled the row first. Reconcile the local mirror so
+			// AuthStorage can select a fallback without ever mutating remote state
+			// through the read-only synchronous methods.
+			await this.refreshSnapshot().catch(refreshError => {
+				logger.debug("auth-broker snapshot refresh after remote disable miss failed", {
+					error: String(refreshError),
+				});
+			});
+			return false;
+		}
+		this.#removeCredentialEntry(credentialId);
+		this.#maybeRefreshSnapshot("disable");
+		return true;
 	}
 
 	async waitForFreshSnapshot(maxWaitMs: number, opts: { signal?: AbortSignal } = {}): Promise<boolean> {
@@ -985,6 +1012,11 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		return this.listAuthCredentials(provider);
 	}
 
+	#removeCredentialEntry(credentialId: number): void {
+		const credentials = this.#snapshot.credentials.filter(entry => entry.id !== credentialId);
+		if (credentials.length === this.#snapshot.credentials.length) return;
+		this.#applySnapshot({ ...this.#snapshot, credentials }, this.#generation, false);
+	}
 	/**
 	 * Fire-and-forget `refreshSnapshot()` after a write. When the SSE stream is
 	 * active the broker will deliver the new generation push, so the extra GET

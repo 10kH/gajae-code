@@ -1346,14 +1346,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const startupAuthConfig = hasInjectedAuth
 		? undefined
 		: (options.startupAuthConfig ?? (await resolveStartupAuthConfig(agentDir)));
+	const ownsModelRegistry = options.modelRegistry === undefined;
 	const ownsAuthStorage = options.modelRegistry === undefined && options.authStorage === undefined;
 	const modelRegistry =
 		options.modelRegistry ??
 		new ModelRegistry(
 			options.authStorage ??
 				(await logger.time("discoverModels", () => discoverAuthStorage(agentDir, startupAuthConfig))),
+			path.join(agentDir, "models.yml"),
+			undefined,
+			{ agentDir },
 		);
 	const authStorage = modelRegistry.authStorage;
+	const authStorageOwner = modelRegistry.getAuthStorageOwner();
 	if (options.authStorage && options.authStorage !== authStorage) {
 		throw new Error(
 			"options.authStorage and options.modelRegistry.authStorage must be the same instance when both are provided",
@@ -1391,7 +1396,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	let credentialScopeId: string | undefined;
 	let credentialScopeLeased = false;
 	let closeOwnedSettings: () => Promise<void> = async () => {};
-	const closeOwnedAuthStorage = (): void => {
+	const closeOwnedAuthStorage = async (): Promise<void> => {
+		if (ownsModelRegistry) await modelRegistry.dispose();
 		if (!hasSession && credentialScopeLeased && credentialScopeId) {
 			authStorage.releaseCredentialScope(credentialScopeId);
 			credentialScopeLeased = false;
@@ -1423,10 +1429,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 		});
 		const applyCredentialSelector = (scopeId: string, provider: string, selector: AuthCredentialSelector): void => {
-			authStorage.setSessionCredentialSelector(scopeId, provider, selector);
+			authStorage.setSessionCredentialSelector(scopeId, provider, selector, authStorageOwner);
 		};
 		const ownsScopedSettings = options.settings === undefined;
 		const settings = options.settings ?? (await logger.time("settings", Settings.loadForScope, { cwd, agentDir }));
+		if (ownsModelRegistry) modelRegistry.setScopedSettings(settings);
 		const autoroutingInactive =
 			settings.get("task.autorouting.enabled") === true && !settings.getEffectiveAutorouting().active;
 		closeOwnedSettings = async (): Promise<void> => {
@@ -1696,10 +1703,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					) {
 						throw new Error("Durable numeric credential pin authority changed");
 					}
-					authStorage.setSessionCredentialSelector(credentialSessionId, record.provider, {
-						kind: pin.kind,
-						value: pin.value,
-					});
+					authStorage.setSessionCredentialSelector(
+						credentialSessionId,
+						record.provider,
+						{
+							kind: pin.kind,
+							value: pin.value,
+						},
+						authStorageOwner,
+					);
 					staleDurableCredentialPins.delete(resolveOAuthStorageProvider(record.provider));
 				}
 			} catch {
@@ -4129,18 +4141,24 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				const requestStartedAt = performance.now();
 				let stream: Awaited<ReturnType<typeof streamSimple>>;
 				try {
+					const effectiveApiKey = await modelRegistry.getApiKey(streamModel, credentialSessionId);
 					stream = await streamSimple(streamModel, context, {
 						...streamOptions,
+						apiKey: effectiveApiKey,
+						authCredentialType: modelRegistry.getSessionCredentialType(streamModel.provider, credentialSessionId),
 						onAuthError: async (provider, oldKey, error) => {
 							await modelRegistry.authStorage.invalidateCredentialMatching(provider, oldKey, {
 								signal: streamOptions?.signal,
 								sessionId: credentialSessionId,
+								owner: modelRegistry.getAuthStorageOwner(),
 							});
 							logger.debug("Retrying provider request after credential invalidation", {
 								provider,
 								error: error instanceof Error ? error.message : String(error),
 							});
-							return modelRegistry.getApiKeyForProvider(provider, credentialSessionId);
+							return modelRegistry.getApiKey(streamModel, credentialSessionId, {
+								signal: streamOptions?.signal,
+							});
 						},
 					});
 				} catch (error) {
@@ -4382,7 +4400,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							);
 							AsyncJobManager.unregisterManager(asyncJobManager);
 						}
-						closeOwnedAuthStorage();
+						await closeOwnedAuthStorage();
 						await closeOwnedSettings();
 					}
 				}
@@ -4652,7 +4670,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 			releaseLocalProtocolOverride();
 			try {
-				closeOwnedAuthStorage();
+				await closeOwnedAuthStorage();
 			} catch (authCleanupError) {
 				logger.warn("Failed to close owned auth storage after startup error", { error: authCleanupError });
 			}

@@ -28,6 +28,21 @@ export type StreamFn = (
 	...args: Parameters<typeof streamSimple>
 ) => AssistantMessageEventStream | Promise<AssistantMessageEventStream>;
 
+/**
+ * Request context supplied to provider-aware metadata resolvers.
+ *
+ * The model is the exact model selected for the concrete request (including
+ * fallback and ephemeral requests), while `transport` distinguishes the
+ * built-in stream path from a caller-supplied stream function. Metadata that
+ * carries provider identity must use both values to fail closed when routing
+ * is not the canonical provider path.
+ */
+export interface AgentMetadataResolverContext {
+	provider: string;
+	model?: Model;
+	transport?: "default" | "custom";
+}
+
 /** Stable identifier for a managed logical run, shared by all of its retry attempts. */
 export type ManagedLogicalRunId = number;
 /** A resource owned by a prompt run until its promise settles. */
@@ -257,7 +272,7 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * current when `AgentLoopConfig` was first constructed). Overrides the static
 	 * `metadata` field when present.
 	 */
-	metadataResolver?: (provider: string) => Record<string, unknown> | undefined;
+	metadataResolver?: (context: AgentMetadataResolverContext) => Record<string, unknown> | undefined;
 
 	/**
 	 * Converts AgentMessage[] to LLM-compatible Message[] before each LLM call.

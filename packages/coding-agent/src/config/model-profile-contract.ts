@@ -120,7 +120,10 @@ export function projectModelProfileCatalog(
 		.map(([id, definition]) => ({
 			id,
 			displayName: formatModelProfileDisplayLabel(definition),
-			source: definition.source === "user" ? ("configured" as const) : ("builtin" as const),
+			source:
+				definition.source === "user" || definition.source === "registry"
+					? ("configured" as const)
+					: ("builtin" as const),
 		}))
 		.sort((left, right) => left.id.localeCompare(right.id));
 }
