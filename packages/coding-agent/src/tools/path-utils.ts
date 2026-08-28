@@ -198,12 +198,11 @@ export function splitInternalUrlSel(
 			// can be established from the raw authority.
 		}
 		if (decodedAuthority !== undefined && activeSkillNames.includes(decodedAuthority)) return { path: rawPath };
-		const skillName = activeSkillNames
-			.filter(name => decodedAuthority?.startsWith(`${name}:`))
-			.sort((a, b) => b.length - a.length)[0];
-		if (skillName && decodedAuthority !== undefined) {
-			const rawSkillPrefix = rawSkillPrefixForName(authority, skillName);
-			if (!rawSkillPrefix) return { path: rawPath };
+		const rawSkillPrefix = activeSkillNames
+			.map(name => ({ name, prefix: rawSkillPrefixForName(authority, name) }))
+			.filter(item => item.prefix !== undefined)
+			.sort((a, b) => b.name.length - a.name.length)[0]?.prefix;
+		if (rawSkillPrefix) {
 			return {
 				path: `${rawPath.slice(0, schemeEnd)}${rawSkillPrefix}${authoritySuffix}`,
 				sel: authority.slice(rawSkillPrefix.length + 1),
