@@ -5513,7 +5513,7 @@ export class ModelRegistry {
 					providerName,
 					this.#mergeProviderOverride(this.#runtimeProviderOverrides.get(providerName), {
 						api: config.api,
-						baseUrl: config.baseUrl,
+						baseUrl: this.#runtimeProviderOverrides.get(providerName)?.baseUrl ?? config.baseUrl,
 						headers: config.headers,
 						apiKey: config.apiKey ? resolveApiKeyConfig(config.apiKey) : undefined,
 						authHeader: config.authHeader,
