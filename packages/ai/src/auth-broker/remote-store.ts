@@ -735,7 +735,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 						event.serverNowMs,
 						event.epoch,
 					);
-					if (!applied) {
+					if (!applied && !this.#isSupersededStreamEvent(event)) {
 						throw new Error("Auth broker stream entry authority was rejected");
 					}
 					return;
@@ -748,13 +748,20 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 						event.serverNowMs,
 						event.epoch,
 					);
-					if (!applied) {
+					if (!applied && !this.#isSupersededStreamEvent(event)) {
 						throw new Error("Auth broker stream removal authority was rejected");
 					}
 					return;
 				}
 			}
 		});
+	}
+
+	#isSupersededStreamEvent(event: SnapshotStreamEvent): boolean {
+		return this.#isSupersededSnapshot(
+			{ ...this.#snapshot, epoch: event.epoch, generation: event.generation, serverNowMs: event.serverNowMs },
+			event.generation,
+		);
 	}
 
 	#applyStreamEntry(
