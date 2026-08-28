@@ -345,6 +345,7 @@ const CANONICAL_GEMINI_PROVIDERS = new Set(["google", "gemini", "google-gemini-c
 
 function hasCustomGeminiSearchContext(ctx: ActiveSearchModelContext): boolean {
 	if (!isGoogleWire(ctx.api)) return false;
+	if (ctx.ownerAuthOverride) return true;
 	if (!isOfficialGeminiBaseUrl(ctx.baseUrl)) return true;
 	const provider = ctx.provider.toLowerCase();
 	return Boolean(ctx.resolveCredentials && !CANONICAL_GEMINI_PROVIDERS.has(provider));
@@ -352,6 +353,7 @@ function hasCustomGeminiSearchContext(ctx: ActiveSearchModelContext): boolean {
 
 function hasCustomXaiSearchContext(ctx: ActiveSearchModelContext): boolean {
 	if (!isOpenAICompatWire(ctx.api)) return false;
+	if (ctx.ownerAuthOverride) return true;
 	const provider = ctx.provider.toLowerCase();
 	if (provider === "xai" && !isOfficialXaiBaseUrl(ctx.baseUrl)) return true;
 	if (!looksXaiFamilyModelId(ctx)) return false;
@@ -440,7 +442,12 @@ export function inferNativeProviderFromModel(ctx: ActiveSearchModelContext | und
 	// `codex` hits the ChatGPT backend with local Codex OAuth, so only infer it
 	// for genuine OpenAI endpoints. Custom/proxy OpenAI-compatible models fall
 	// through to `activeContextNativeId` and reuse their own credentials.
-	if (looksOpenAIFamilyModelId(ctx) && isOpenAICompatWire(ctx.api) && isOpenAIOfficialBaseUrl(ctx.baseUrl)) {
+	if (
+		!ctx.ownerAuthOverride &&
+		looksOpenAIFamilyModelId(ctx) &&
+		isOpenAICompatWire(ctx.api) &&
+		isOpenAIOfficialBaseUrl(ctx.baseUrl)
+	) {
 		return "codex";
 	}
 	return undefined;
@@ -451,6 +458,7 @@ function canUseDirectProviderMapping(ctx: ActiveSearchModelContext, id: SearchPr
 	if (id === "gemini" && hasCustomGeminiSearchContext(ctx)) return false;
 	if (id === "xai" && hasCustomXaiSearchContext(ctx)) return false;
 	if (id !== "codex") return true;
+	if (ctx.ownerAuthOverride) return false;
 	// Same constraint as inference: the ChatGPT-backed codex provider is valid
 	// only for official OpenAI endpoints, not custom/proxy base URLs.
 	return isOpenAIOfficialBaseUrl(ctx.baseUrl);
