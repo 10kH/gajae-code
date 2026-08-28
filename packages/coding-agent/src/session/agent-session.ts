@@ -1077,9 +1077,9 @@ export interface PromptOptions {
 	onSkillPrepared?: (meta: { name: string; path: string; lineCount?: number; cleanedArgs?: string }) => void;
 	/** Optional invocation-scoped cancellation fence used before an accepted skill starts execution. */
 	preflightSignal?: AbortSignal;
-	/** @internal SDK lifecycle owner token. */
-	sdkRunToken?: string;
 }
+
+type InternalPromptOptions = PromptOptions & { sdkRunToken?: string };
 
 function promptPreflightCancelledError(): Error {
 	const error = Object.assign(new Error("Prompt preflight was cancelled before execution."), { code: "busy" });
@@ -10048,8 +10048,8 @@ export class AgentSession {
 		args = "",
 		options?: Pick<
 			PromptOptions,
-			"onPreflightAccepted" | "onPreflightAcceptCommit" | "onSkillPrepared" | "preflightSignal" | "sdkRunToken"
-		>,
+			"onPreflightAccepted" | "onPreflightAcceptCommit" | "onSkillPrepared" | "preflightSignal"
+		> & { sdkRunToken?: string },
 	): Promise<{ name: string; path: string; args?: string; lineCount?: number }> {
 		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		const skillName = name.trim();
@@ -10786,6 +10786,7 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		const internalOptions = options as InternalPromptOptions | undefined;
 		this.#assertRecoveryHydrationPromoted();
 		const owner = this.#sessionAdmissionContext.getStore();
 		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
@@ -10803,14 +10804,14 @@ export class AgentSession {
 						options?.onPreflightAccepted ||
 							options?.onPreflightAcceptCommit ||
 							options?.preflightSignal ||
-							options?.sdkRunToken
+							internalOptions?.sdkRunToken
 							? {
-									...(options.onPreflightAccepted ? { onPreflightAccepted: options.onPreflightAccepted } : {}),
-									...(options.onPreflightAcceptCommit
+									...(options?.onPreflightAccepted ? { onPreflightAccepted: options.onPreflightAccepted } : {}),
+									...(options?.onPreflightAcceptCommit
 										? { onPreflightAcceptCommit: options.onPreflightAcceptCommit }
 										: {}),
-									...(options.preflightSignal ? { preflightSignal: options.preflightSignal } : {}),
-									...(options.sdkRunToken ? { sdkRunToken: options.sdkRunToken } : {}),
+									...(options?.preflightSignal ? { preflightSignal: options.preflightSignal } : {}),
+									...(internalOptions?.sdkRunToken ? { sdkRunToken: internalOptions.sdkRunToken } : {}),
 								}
 							: undefined,
 					);
@@ -11064,8 +11065,7 @@ export class AgentSession {
 			| "onPreflightAccepted"
 			| "onPreflightAcceptCommit"
 			| "preflightSignal"
-			| "sdkRunToken"
-		>,
+		> & { sdkRunToken?: string },
 	): Promise<void> {
 		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		const textContent =
@@ -11166,8 +11166,8 @@ export class AgentSession {
 			| "onPreflightAccepted"
 			| "onPreflightAcceptCommit"
 			| "preflightSignal"
-			| "sdkRunToken"
 		> & {
+		sdkRunToken?: string;
 			prependMessages?: AgentMessage[];
 			skipPostPromptRecoveryWait?: boolean;
 			predecessorAgentEndHold?: symbol;
@@ -12635,7 +12635,7 @@ export class AgentSession {
 							}
 						: undefined,
 				preflightSignal: options?.preflightSignal,
-			});
+			} as InternalPromptOptions);
 		} finally {
 			releaseFollowUpReservation();
 		}
