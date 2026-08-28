@@ -310,7 +310,8 @@ export async function searchAnthropic(
 	const activeContext = "authStorage" in params ? params.activeModelContext : undefined;
 	const activeSessionId = "authStorage" in params ? params.sessionId : undefined;
 	const activeCustomContext =
-		activeContext?.api === "anthropic-messages" && activeContext.provider.toLowerCase() !== "anthropic";
+		activeContext?.api === "anthropic-messages" &&
+		(activeContext.ownerAuthOverride || activeContext.provider.toLowerCase() !== "anthropic");
 
 	if (activeCustomContext && activeContext?.resolveCredentials) {
 		const activeCredentials = await activeContext.resolveCredentials({

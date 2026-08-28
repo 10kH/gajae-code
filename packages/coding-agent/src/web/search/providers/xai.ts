@@ -97,6 +97,7 @@ function isOfficialXaiBaseUrl(baseUrl: string | undefined): boolean {
 
 function isCustomXaiContext(ctx: ActiveSearchModelContext | undefined): ctx is ActiveSearchModelContext {
 	if (!ctx || !isOpenAICompatWire(ctx.api)) return false;
+	if (ctx.ownerAuthOverride) return true;
 	const provider = ctx.provider.toLowerCase();
 	if (provider === "xai" && !isOfficialXaiBaseUrl(ctx.baseUrl)) return true;
 	if (!looksXaiModelId(ctx.wireModelId) && !looksXaiModelId(ctx.modelId)) return false;

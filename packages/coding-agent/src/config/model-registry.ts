@@ -5120,6 +5120,10 @@ export class ModelRegistry {
 	}
 
 	getActiveSearchModelContext(model: Model<Api>): ActiveSearchModelContext {
+		const ownerAuthOverride =
+			this.authStorage.hasConfigApiKey(model.provider, this.#authStorageConfigOwner) ||
+			model.baseUrl !== undefined ||
+			model.headers !== undefined;
 		return {
 			provider: model.provider,
 			modelId: model.id,
@@ -5127,6 +5131,7 @@ export class ModelRegistry {
 			api: model.api,
 			baseUrl: model.baseUrl,
 			headers: model.headers,
+			ownerAuthOverride,
 			resolveCredentials: async ({ sessionId, signal }) => {
 				// Resolve against the current registry model so rotating apiKeyEnv
 				// credentials and generated Authorization headers are synchronized

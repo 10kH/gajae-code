@@ -72,6 +72,7 @@ function isOfficialGeminiBaseUrl(baseUrl: string | undefined): boolean {
 
 function isCustomGeminiContext(ctx: ActiveSearchModelContext | undefined): boolean {
 	if (!ctx || !isGoogleWire(ctx.api)) return false;
+	if (ctx.ownerAuthOverride) return true;
 	if (!isOfficialGeminiBaseUrl(ctx.baseUrl)) return true;
 	const provider = ctx.provider.toLowerCase();
 	return Boolean(ctx.resolveCredentials && !CANONICAL_GEMINI_PROVIDERS.has(provider));

@@ -48,6 +48,8 @@ export interface ActiveSearchModelContext {
 	headers?: Record<string, string>;
 	/** Resolve the active model key and current headers before each native search. */
 	resolveCredentials?: ActiveSearchModelCredentialResolver;
+	/** True when registry-owned auth or transport overrides this active model. */
+	ownerAuthOverride?: boolean;
 	webSearch?: WebSearchMode;
 }
 
