@@ -1109,6 +1109,22 @@ function scrubHealthReason(reason: unknown, secrets: readonly string[] = []): st
 	return value || "credential check failed";
 }
 
+/** Read optional broker error detail without allowing hostile objects to escape classification. */
+/** @internal Tested directly because hostile accessors must preserve the original error identity. */
+export function readBrokerErrorBody(error: unknown): string | undefined {
+	if (error === null || (typeof error !== "object" && typeof error !== "function")) return undefined;
+	try {
+		if (!("body" in error)) return undefined;
+		const body = (error as { body?: unknown }).body;
+		return typeof body === "string" ? body : undefined;
+	} catch {
+		// Preserve the original provider error and its terminal behavior. A proxy or
+		// throwing accessor is untrusted provider data, not a reason to replace the
+		// refresh failure with an inspection error.
+		throw error;
+	}
+}
+
 function requiresOpenAICodexProModel(provider: string, modelId: string | undefined): boolean {
 	return provider === "openai-codex" && typeof modelId === "string" && modelId.includes("-spark");
 }
@@ -5320,10 +5336,7 @@ export class AuthStorage {
 			// their transport message. Include that body for failure classification
 			// (the broker's 500 envelope otherwise hides `invalid_grant`) while
 			// preserving the original error object for callers and diagnostics.
-			const brokerBody =
-				error !== null && typeof error === "object" && "body" in error && typeof error.body === "string"
-					? error.body
-					: undefined;
+			const brokerBody = readBrokerErrorBody(error);
 			const errorMsg = [String(error), brokerBody].filter((part): part is string => Boolean(part)).join(" ");
 			// Peer-rotation recovery runs before ANY failure classification: a
 			// concurrent process may have rotated the refresh token, which

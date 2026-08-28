@@ -6,6 +6,7 @@ import {
 	type AuthCredentialStore,
 	AuthStorage,
 	type CredentialDisabledEvent,
+	readBrokerErrorBody,
 	SqliteAuthCredentialStore,
 } from "../src/auth-storage";
 import * as oauthUtils from "../src/utils/oauth";
@@ -501,6 +502,36 @@ describe("AuthStorage OAuth refresh race", () => {
 			expect(events[0]?.disabledCause).toContain("authorization grant is invalid");
 		});
 	});
+
+	test.each([
+		[
+			"throwing body membership probe",
+			(error: Error) =>
+				new Proxy(error, {
+					has: () => {
+						throw error;
+					},
+				}),
+		],
+		[
+			"throwing body accessor",
+			(error: Error) =>
+				new Proxy(error, {
+					has(target, property) {
+						return property === "body" || Reflect.has(target, property);
+					},
+					get(target, property, receiver) {
+						if (property === "body") throw error;
+						return Reflect.get(target, property, receiver);
+					},
+				}),
+		],
+	] as const)("preserves the original refresh failure when broker-body inspection throws: %s", (_label, wrap) => {
+		const original = new Error("provider refresh failed");
+		const failure = wrap(original);
+		expect(() => readBrokerErrorBody(failure)).toThrow(failure);
+	});
+
 	test("never replays a stale refresh token upstream when a peer already rotated the row", async () => {
 		if (!authStorage || !store) throw new Error("test setup failed");
 
