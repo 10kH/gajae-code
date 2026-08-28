@@ -14,10 +14,11 @@ describe("splitInternalUrlSel", () => {
 		}
 	});
 
-	it("only peels strict selectors from ambiguous resource identities", () => {
-		for (const scheme of ["agent", "local", "memory", "rule", "gjc", "issue", "pr"]) {
+	it("peels explicit authority selectors for identifier-shaped resources", () => {
+		for (const scheme of ["agent", "artifact", "memory", "issue", "pr"]) {
 			expect(splitInternalUrlSel(`${scheme}://namespace:raw:bogus`)).toEqual({
-				path: `${scheme}://namespace:raw:bogus`,
+				path: `${scheme}://namespace`,
+				sel: "raw:bogus",
 			});
 			expect(splitInternalUrlSel(`${scheme}://namespace:raw`)).toEqual({
 				path: `${scheme}://namespace`,
@@ -27,6 +28,28 @@ describe("splitInternalUrlSel", () => {
 				path: `${scheme}://namespace`,
 				sel: "raw:1-5",
 			});
+		}
+	});
+
+	it("preserves literal-colon authorities for path-like resources", () => {
+		for (const scheme of ["local", "rule", "gjc"]) {
+			expect(splitInternalUrlSel(`${scheme}://report:raw.txt`)).toEqual({
+				path: `${scheme}://report:raw.txt`,
+			});
+		}
+	});
+
+	it("preserves ambiguous path-like authorities with URL suffixes", () => {
+		for (const suffix of ["/nested.txt", "?query=value", "#fragment"]) {
+			expect(splitInternalUrlSel(`local://report:raw${suffix}`)).toEqual({
+				path: `local://report:raw${suffix}`,
+			});
+		}
+	});
+
+	it("does not turn empty authorities into selector-bearing root reads", () => {
+		for (const scheme of ["agent", "artifact", "memory", "issue", "pr"]) {
+			expect(splitInternalUrlSel(`${scheme}://:raw`)).toEqual({ path: `${scheme}://:raw` });
 		}
 	});
 
@@ -42,6 +65,14 @@ describe("splitInternalUrlSel", () => {
 		});
 		expect(splitInternalUrlSel("pr://owner/repo?author=team:runtime")).toEqual({
 			path: "pr://owner/repo?author=team:runtime",
+		});
+		expect(splitInternalUrlSel("agent://reviewer_0:bogus/result")).toEqual({
+			path: "agent://reviewer_0/result",
+			sel: "bogus",
+		});
+		expect(splitInternalUrlSel("artifact://3:bogus?range=1-2")).toEqual({
+			path: "artifact://3?range=1-2",
+			sel: "bogus",
 		});
 	});
 
@@ -60,6 +91,18 @@ describe("splitInternalUrlSel", () => {
 		expect(splitInternalUrlSel("skill://superpowers:brainstorming:", { activeSkillNames })).toEqual({
 			path: "skill://superpowers:brainstorming",
 			sel: "",
+		});
+		expect(splitInternalUrlSel("skill://superpowers%3Abrainstorming:bogus", { activeSkillNames })).toEqual({
+			path: "skill://superpowers%3Abrainstorming",
+			sel: "bogus",
+		});
+		expect(splitInternalUrlSel("skill://superpowers%3Abrainstorming:raw:bogus", { activeSkillNames })).toEqual({
+			path: "skill://superpowers%3Abrainstorming",
+			sel: "raw:bogus",
+		});
+		expect(splitInternalUrlSel("skill://superpowers%3Abrainstorming:%ZZ", { activeSkillNames })).toEqual({
+			path: "skill://superpowers%3Abrainstorming",
+			sel: "%ZZ",
 		});
 	});
 
