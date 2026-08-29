@@ -307,6 +307,27 @@ describe("CombinedAutocompleteProvider", () => {
 			expect(values).toContain(`@${hangulName}`);
 		});
 
+		it("uses the same chosung fuzzy lane for explicit Tab", async () => {
+			fs.writeFileSync(path.join(baseDir, hangulName), "content\n");
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "@\u314E\u3131";
+			const result = await provider.getForceFileSuggestions([line], 0, line.length);
+
+			expect(result?.prefix).toBe(line);
+			expect(result?.items.map(item => item.value)).toContain(`@${hangulName}`);
+		});
+
+		it("uses fuzzy contains matching for explicit Tab", async () => {
+			const filename = "project-story.md";
+			fs.writeFileSync(path.join(baseDir, filename), "content\n");
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "@story";
+			const result = await provider.getForceFileSuggestions([line], 0, line.length);
+
+			expect(result?.prefix).toBe(line);
+			expect(result?.items.map(item => item.value)).toContain(`@${filename}`);
+		});
+
 		it("matches chosung against NFD-stored file names", async () => {
 			const nfdName = "\u1112\u1161\u11AB\u1100\u1173\u11AF.txt";
 			fs.writeFileSync(path.join(baseDir, nfdName), "content\n");

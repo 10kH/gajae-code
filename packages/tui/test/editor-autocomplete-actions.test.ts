@@ -625,4 +625,21 @@ describe("Editor Enter handler sync slash completion", () => {
 		expect(submitted).toBe("/model");
 		expect(suggestionsCallCount).toBeGreaterThan(0);
 	});
+
+	it("updates fuzzy suggestions for Korean characters typed after @", async () => {
+		const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "editor-korean-autocomplete-"));
+		try {
+			fs.writeFileSync(path.join(baseDir, "한글.txt"), "content\n");
+			const editor = new Editor(defaultEditorTheme);
+			editor.setAutocompleteProvider(new CombinedAutocompleteProvider([], baseDir));
+
+			editor.handleInput("@");
+			editor.handleInput("ㅎㄱ");
+			await Bun.sleep(100);
+
+			expect(editor.isShowingAutocomplete()).toBe(true);
+		} finally {
+			fs.rmSync(baseDir, { recursive: true, force: true });
+		}
+	});
 });

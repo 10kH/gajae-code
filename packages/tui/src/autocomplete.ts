@@ -922,6 +922,18 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 		}
 
 		// Force extract path prefix - this will always return something
+		const atPrefix = this.#extractAtPrefix(textBeforeCursor);
+		if (atPrefix !== null) {
+			const { rawPrefix, isQuotedPrefix } = parsePathPrefix(atPrefix);
+			const suggestions =
+				rawPrefix.length > 0
+					? await this.#getFuzzyFileSuggestions(rawPrefix, { isQuotedPrefix })
+					: await this.#getFileSuggestions("@");
+			if (suggestions.length === 0) return null;
+
+			return { items: suggestions, prefix: atPrefix };
+		}
+
 		const pathMatch = this.#extractPathPrefix(textBeforeCursor, true);
 		if (pathMatch !== null) {
 			const suggestions = await this.#getFileSuggestions(pathMatch);
