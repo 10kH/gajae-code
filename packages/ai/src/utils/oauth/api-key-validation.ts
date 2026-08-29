@@ -25,7 +25,7 @@ const VALIDATION_DETAILS_LIMIT = 200;
 const VALIDATION_BODY_LIMIT = 64 * 1024;
 
 function redactSecrets(text: string, apiKey: string): string {
-	let safe = text;
+	let safe = text.replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "");
 	if (apiKey) {
 		const escaped = [...apiKey].map(char => char.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&"));
 		const interspersed = new RegExp(escaped.join("[\\s\\x00-\\x1f\\x7f-\\x9f]*"), "gu");
@@ -51,20 +51,33 @@ function boundedDetails(text: string, apiKey: string): string {
 	return trimmed.length > VALIDATION_DETAILS_LIMIT ? `${trimmed.slice(0, VALIDATION_DETAILS_LIMIT)}…` : trimmed;
 }
 
-async function readBoundedBody(response: Response): Promise<string> {
+type BoundedBody = { text: string; truncated: boolean };
+
+async function readBoundedBody(response: Response, signal: AbortSignal): Promise<BoundedBody> {
 	const contentLength = Number(response.headers.get("content-length"));
-	if (Number.isFinite(contentLength) && contentLength > VALIDATION_BODY_LIMIT)
-		return "[response body exceeded validation limit]";
-	if (!response.body) return "";
+	if (Number.isFinite(contentLength) && contentLength > VALIDATION_BODY_LIMIT) {
+		await response.body?.cancel().catch(() => {});
+		return { text: "", truncated: true };
+	}
+	if (!response.body) return { text: "", truncated: false };
 	const reader = response.body.getReader();
 	const chunks: Uint8Array[] = [];
 	let total = 0;
+	let truncated = false;
 	try {
 		while (total < VALIDATION_BODY_LIMIT) {
-			const { done, value } = await reader.read();
+			const { promise, resolve, reject } = Promise.withResolvers<{ done: boolean; value?: Uint8Array }>();
+			const onAbort = () => reject(new Error("Login cancelled"));
+			signal.addEventListener("abort", onAbort, { once: true });
+			reader
+				.read()
+				.then(value => resolve(value), reject)
+				.finally(() => signal.removeEventListener("abort", onAbort));
+			const { done, value } = await promise;
 			if (done) break;
 			if (value) {
 				const remaining = VALIDATION_BODY_LIMIT - total;
+				if (value.byteLength > remaining) truncated = true;
 				chunks.push(value.byteLength > remaining ? value.subarray(0, remaining) : value);
 				total += Math.min(value.byteLength, remaining);
 			}
@@ -80,7 +93,7 @@ async function readBoundedBody(response: Response): Promise<string> {
 		bytes.set(chunk.subarray(0, take), offset);
 		offset += take;
 	}
-	return new TextDecoder().decode(bytes);
+	return { text: new TextDecoder().decode(bytes), truncated };
 }
 
 function errorDetails(error: unknown, apiKey: string): string {
@@ -103,6 +116,7 @@ export async function validateOpenAICompatibleApiKey(options: OpenAICompatibleVa
 	const timeoutSignal = AbortSignal.timeout(VALIDATION_TIMEOUT_MS);
 	const signal = options.signal ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal;
 	const fetchImpl = options.fetch ?? globalThis.fetch;
+	if (signal.aborted) throw new Error("Login cancelled");
 	if (/[\x00-\x1f\x7f-\x9f]/u.test(options.apiKey))
 		throw new Error(`${options.provider} API key contains unsupported control characters`);
 
@@ -123,6 +137,7 @@ export async function validateOpenAICompatibleApiKey(options: OpenAICompatibleVa
 			signal,
 		});
 	} catch (error) {
+		if (signal.aborted) throw new Error("Login cancelled");
 		throw validationFailure(
 			options.provider,
 			options.apiKey,
@@ -134,8 +149,14 @@ export async function validateOpenAICompatibleApiKey(options: OpenAICompatibleVa
 		if (options.requireInferenceResponse) {
 			let body: string;
 			try {
-				body = await readBoundedBody(response);
+				const bounded = await readBoundedBody(response, signal);
+				if (bounded.truncated) throw new Error("inference probe response exceeded validation limit");
+				body = bounded.text;
 			} catch (error) {
+				if (signal.aborted || (error instanceof Error && error.message === "Login cancelled"))
+					throw new Error("Login cancelled");
+				if (error instanceof Error && error.message === "inference probe response exceeded validation limit")
+					throw validationFailure(options.provider, options.apiKey, error.message);
 				throw validationFailure(
 					options.provider,
 					options.apiKey,
@@ -156,7 +177,14 @@ export async function validateOpenAICompatibleApiKey(options: OpenAICompatibleVa
 				typeof parsed === "object" && parsed !== null && "choices" in parsed
 					? (parsed as { choices?: unknown }).choices
 					: undefined;
-			if (!Array.isArray(choices) || choices.length === 0) {
+			const firstChoice = Array.isArray(choices) ? choices[0] : undefined;
+			const hasMessage =
+				typeof firstChoice === "object" &&
+				firstChoice !== null &&
+				"message" in firstChoice &&
+				typeof (firstChoice as { message?: unknown }).message === "object" &&
+				(firstChoice as { message: { content?: unknown } }).message !== null;
+			if (!hasMessage) {
 				throw validationFailure(options.provider, options.apiKey, "the inference probe returned no choices");
 			}
 		}
@@ -165,8 +193,12 @@ export async function validateOpenAICompatibleApiKey(options: OpenAICompatibleVa
 
 	let details = "";
 	try {
-		details = boundedDetails(await readBoundedBody(response), options.apiKey);
+		const bounded = await readBoundedBody(response, signal);
+		details = bounded.truncated
+			? "response body exceeded validation limit"
+			: boundedDetails(bounded.text, options.apiKey);
 	} catch {
+		if (signal.aborted) throw new Error("Login cancelled");
 		// ignore body parse errors, status is enough
 	}
 
@@ -182,10 +214,21 @@ export async function validateOpenAICompatibleApiKey(options: OpenAICompatibleVa
  * list — is not evidence that the credential reached a models endpoint.
  */
 function isModelList(parsed: unknown): boolean {
-	if (Array.isArray(parsed)) return true;
+	const isModelArray = (value: unknown): boolean => {
+		if (!Array.isArray(value)) return false;
+		if (value.length === 0) return true;
+		return value.some(
+			item =>
+				typeof item === "object" &&
+				item !== null &&
+				typeof (item as { id?: unknown }).id === "string" &&
+				(item as { id: string }).id.trim().length > 0,
+		);
+	};
+	if (Array.isArray(parsed)) return isModelArray(parsed);
 	if (typeof parsed !== "object" || parsed === null) return false;
 	const record = parsed as { data?: unknown; models?: unknown };
-	return Array.isArray(record.data) || Array.isArray(record.models);
+	return isModelArray(record.data) || isModelArray(record.models);
 }
 
 /**
@@ -205,6 +248,7 @@ export async function validateApiKeyAgainstModelsEndpoint(options: ModelListVali
 	const timeoutSignal = AbortSignal.timeout(VALIDATION_TIMEOUT_MS);
 	const signal = options.signal ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal;
 	const fetchImpl = options.fetch ?? globalThis.fetch;
+	if (signal.aborted) throw new Error("Login cancelled");
 	if (/[\x00-\x1f\x7f-\x9f]/u.test(options.apiKey))
 		throw new Error(`${options.provider} API key contains unsupported control characters`);
 
@@ -218,6 +262,7 @@ export async function validateApiKeyAgainstModelsEndpoint(options: ModelListVali
 			signal,
 		});
 	} catch (error) {
+		if (signal.aborted) throw new Error("Login cancelled");
 		throw validationFailure(
 			options.provider,
 			options.apiKey,
@@ -228,8 +273,12 @@ export async function validateApiKeyAgainstModelsEndpoint(options: ModelListVali
 	if (response.ok) {
 		let body: string;
 		try {
-			body = await readBoundedBody(response);
+			const bounded = await readBoundedBody(response, signal);
+			if (bounded.truncated) throw new Error("response body exceeded validation limit");
+			body = bounded.text;
 		} catch (error) {
+			if (signal.aborted || (error instanceof Error && error.message === "Login cancelled"))
+				throw new Error("Login cancelled");
 			throw validationFailure(
 				options.provider,
 				options.apiKey,
@@ -256,8 +305,12 @@ export async function validateApiKeyAgainstModelsEndpoint(options: ModelListVali
 
 	let details = "";
 	try {
-		details = boundedDetails(await readBoundedBody(response), options.apiKey);
+		const bounded = await readBoundedBody(response, signal);
+		details = bounded.truncated
+			? "response body exceeded validation limit"
+			: boundedDetails(bounded.text, options.apiKey);
 	} catch {
+		if (signal.aborted) throw new Error("Login cancelled");
 		// ignore body parse errors, status is enough
 	}
 

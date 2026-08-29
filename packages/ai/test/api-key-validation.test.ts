@@ -144,17 +144,24 @@ describe("validateApiKeyAgainstModelsEndpoint", () => {
 	it("requires an inference response instead of accepting a public catalog-shaped body", async () => {
 		stubFetch(() => new Response(JSON.stringify({ object: "list", data: [{ id: "m" }] }), { status: 200 }));
 		await expect(validateInferenceProbe()).rejects.toThrow(/no choices/);
+		stubFetch(() => new Response(JSON.stringify({ choices: [{}] }), { status: 200 }));
+		await expect(validateInferenceProbe()).rejects.toThrow(/no choices/);
+	});
+
+	it("rejects forbidden inference entitlement", async () => {
+		stubFetch(() => new Response('{"error":"forbidden"}', { status: 403 }));
+		await expect(validateInferenceProbe()).rejects.toThrow(/validation failed \(403\)/);
 	});
 
 	it("rejects malformed and oversized inference responses with bounded diagnostics", async () => {
 		stubFetch(() => new Response(`<html>${"x".repeat(100_000)}</html>`, { status: 200 }));
 		const malformed = await validationErrorMessage(validateInferenceProbe);
-		expect(malformed).toContain("non-JSON response");
+		expect(malformed).toContain("validation limit");
 		expect(malformed.length).toBeLessThan(400);
 
 		stubFetch(() => new Response("x".repeat(100_000), { status: 200 }));
 		const oversized = await validationErrorMessage(validateInferenceProbe);
-		expect(oversized).toContain("non-JSON response");
+		expect(oversized).toContain("validation limit");
 		expect(oversized.length).toBeLessThan(400);
 	});
 
@@ -174,6 +181,29 @@ describe("validateApiKeyAgainstModelsEndpoint", () => {
 				requireInferenceResponse: true,
 				signal: controller.signal,
 			}),
-		).rejects.toThrow(/validation failed/);
+		).rejects.toThrow("Login cancelled");
+	});
+
+	it("aborts a hanging response body", async () => {
+		const controller = new AbortController();
+		globalThis.fetch = (async () =>
+			new Response(
+				new ReadableStream({
+					start(stream) {
+						stream.enqueue(new TextEncoder().encode('{"choices":['));
+					},
+				}),
+				{ status: 200 },
+			)) as unknown as typeof globalThis.fetch;
+		const pending = validateOpenAICompatibleApiKey({
+			provider: "Command Code GOAT",
+			apiKey: "cmd-test",
+			baseUrl: "https://example.invalid/v1",
+			model: "zai-org/GLM-5.3",
+			requireInferenceResponse: true,
+			signal: controller.signal,
+		});
+		setTimeout(() => controller.abort(), 10);
+		await expect(pending).rejects.toThrow("Login cancelled");
 	});
 });

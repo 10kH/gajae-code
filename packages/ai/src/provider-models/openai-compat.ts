@@ -873,33 +873,31 @@ export function opencodeGoModelManagerOptions(
 	return openCodeModelManagerOptions("opencode-go", "https://opencode.ai/zen/go/v1", config);
 }
 
-export function commandCodeModelManagerOptions(config?: OpenCodeModelManagerConfig): ModelManagerOptions<Api> {
+export function commandCodeModelManagerOptions(
+	config?: OpenCodeModelManagerConfig,
+): ModelManagerOptions<"openai-completions"> {
 	const apiKey = config?.apiKey;
 	const baseUrl = config?.baseUrl ?? "https://api.commandcode.ai/provider/v1";
 	return {
 		providerId: "commandcode-goat",
 		...(apiKey && {
 			fetchDynamicModels: () =>
-				fetchOpenAICompatibleModels<Api>({
+				fetchOpenAICompatibleModels({
 					api: "openai-completions",
 					provider: "commandcode-goat",
 					baseUrl,
 					apiKey,
-					mapModel: (_entry, defaults) =>
-						({
-							...defaults,
-							api:
-								/(^|\/)claude[-.]/i.test(defaults.id) || /(^|\/)anthropic\//i.test(defaults.id)
-									? "anthropic-messages"
-									: "openai-completions",
-							compat: {
-								...defaults.compat,
-								supportsStore: false,
-								supportsDeveloperRole: false,
-								supportsReasoningEffort: false,
-								reasoningContentField: "reasoning_content",
-							},
-						}) as Model<Api>,
+					mapModel: (_entry, defaults) => ({
+						...defaults,
+						api: "openai-completions",
+						compat: {
+							...defaults.compat,
+							supportsStore: false,
+							supportsDeveloperRole: false,
+							supportsReasoningEffort: false,
+							reasoningContentField: "reasoning_content",
+						},
+					}),
 				}),
 		}),
 	};

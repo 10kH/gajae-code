@@ -6,7 +6,7 @@ export const loginCommandCode = createApiKeyLogin({
 	instructions: "Create or copy your Command Code API key",
 	promptMessage: "Paste your Command Code API key",
 	placeholder: "cmd-...",
-	validationProgressMessage: "Checking Command Code model catalog...",
+	validationProgressMessage: "Verifying Command Code inference entitlement...",
 	validation: {
 		kind: "chat-completions",
 		provider: "Command Code GOAT",

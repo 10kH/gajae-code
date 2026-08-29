@@ -52,7 +52,7 @@ describe("Command Code GOAT login", () => {
 			url: DASHBOARD_URL,
 			instructions: "Create or copy your Command Code API key",
 		});
-		expect(progress).toHaveBeenCalledWith("Checking Command Code model catalog...");
+		expect(progress).toHaveBeenCalledWith("Verifying Command Code inference entitlement...");
 		expect(fetchMock).toHaveBeenCalledTimes(1);
 	});
 
@@ -133,7 +133,7 @@ describe("Command Code GOAT login", () => {
 });
 
 describe("Command Code GOAT fresh descriptor", () => {
-	it("routes Claude models through Anthropic and applies preset compatibility", async () => {
+	it("routes Claude-named models through the OpenAI-compatible gateway", async () => {
 		const realFetch = globalThis.fetch;
 		globalThis.fetch = (async () =>
 			new Response(JSON.stringify({ data: [{ id: "claude-opus-5.5" }, { id: "zai-org/GLM-5.3" }] }), {
@@ -142,7 +142,7 @@ describe("Command Code GOAT fresh descriptor", () => {
 		try {
 			const models = await commandCodeModelManagerOptions({ apiKey: "cmd-test-key" }).fetchDynamicModels?.();
 			expect(models?.find(model => model.id === "claude-opus-5.5")).toMatchObject({
-				api: "anthropic-messages",
+				api: "openai-completions",
 				compat: {
 					supportsStore: false,
 					supportsDeveloperRole: false,

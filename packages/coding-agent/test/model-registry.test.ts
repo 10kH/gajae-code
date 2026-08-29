@@ -67,7 +67,7 @@ test("Command Code fresh descriptor preserves mixed transport and default model"
 		const registry = new ModelRegistry(auth, modelsPath);
 		await registry.refreshProvider("commandcode-goat", "online");
 		const models = registry.getAll().filter(model => model.provider === "commandcode-goat");
-		expect(models.find(model => model.id === "claude-opus-5.5")?.api).toBe("anthropic-messages");
+		expect(models.find(model => model.id === "claude-opus-5.5")?.api).toBe("openai-completions");
 		expect(models.find(model => model.id === "zai-org/GLM-5.3")?.api).toBe("openai-completions");
 		expect(registry.find("commandcode-goat", "zai-org/GLM-5.3")).toBeDefined();
 		const initial = await findInitialModel({
@@ -3430,7 +3430,7 @@ describe("ModelRegistry", () => {
 				maxTokens: 64_000,
 			});
 			expect(registry.find("commandcode-goat", "claude-opus-5.5")).toMatchObject({
-				api: "anthropic-messages",
+				api: "openai-completions",
 				baseUrl: "https://api.commandcode.ai/provider/v1",
 			});
 			expect(registry.find("commandcode-goat", "claude-opus-5.5")?.headers?.Authorization).toBeUndefined();

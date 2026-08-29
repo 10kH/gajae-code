@@ -138,7 +138,7 @@ describe("AuthStorage.checkCredentials", () => {
 		await storage.reload();
 
 		vi.spyOn(claudeUsage.claudeUsageProvider, "fetchUsage").mockRejectedValue(
-			new Error("401 Invalid authentication credentials"),
+			new Error("401 Invalid authentication credentials oat-7\u001b[31m\nnext"),
 		);
 
 		try {
@@ -147,6 +147,7 @@ describe("AuthStorage.checkCredentials", () => {
 			expect(result.ok).toBe(false);
 			expect(result.reason).toContain("401");
 			expect(result.reason).toContain("Invalid authentication");
+			expect(result.reason).not.toMatch(/[\x00-\x1f\x7f-\x9f]/u);
 			// Identity from the stored credential still surfaces so the user
 			// can locate the broken row.
 			expect(result.email).toBe("bob@example.com");

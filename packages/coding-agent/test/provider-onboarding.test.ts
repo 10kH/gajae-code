@@ -234,7 +234,7 @@ describe("provider onboarding setup core", () => {
 		expect(provider).toMatchObject({
 			baseUrl: "https://api.commandcode.ai/provider/v1",
 			apiKeyEnv: "CMD_API_KEY",
-			discovery: { type: "openai-models-list", apiByModelPrefix: { "claude-": "anthropic-messages" } },
+			discovery: { type: "openai-models-list" },
 		});
 		expect(result.modelIds).toEqual([]);
 		expect(formatProviderSetupResult(result)).toContain("Models: discovered automatically");
