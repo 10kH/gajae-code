@@ -59,12 +59,13 @@ async function readBoundedBody(response: Response): Promise<string> {
 	const chunks: Uint8Array[] = [];
 	let total = 0;
 	try {
-		while (total <= VALIDATION_BODY_LIMIT) {
+		while (total < VALIDATION_BODY_LIMIT) {
 			const { done, value } = await reader.read();
 			if (done) break;
 			if (value) {
-				chunks.push(value);
-				total += value.byteLength;
+				const remaining = VALIDATION_BODY_LIMIT - total;
+				chunks.push(value.byteLength > remaining ? value.subarray(0, remaining) : value);
+				total += Math.min(value.byteLength, remaining);
 			}
 		}
 	} finally {

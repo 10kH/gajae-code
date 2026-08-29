@@ -888,7 +888,10 @@ export function commandCodeModelManagerOptions(config?: OpenCodeModelManagerConf
 					mapModel: (_entry, defaults) =>
 						({
 							...defaults,
-							api: defaults.id.toLowerCase().startsWith("claude-") ? "anthropic-messages" : "openai-completions",
+							api:
+								/(^|\/)claude[-.]/i.test(defaults.id) || /(^|\/)anthropic\//i.test(defaults.id)
+									? "anthropic-messages"
+									: "openai-completions",
 							compat: {
 								...defaults.compat,
 								supportsStore: false,
