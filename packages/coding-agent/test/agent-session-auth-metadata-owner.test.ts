@@ -82,6 +82,9 @@ describe("AgentSession auth metadata owner boundary", () => {
 			},
 		]);
 		const owner = {};
+		// A sibling owner override makes omission or replacement of the target
+		// owner observable: unscoped metadata would see an API-key override.
+		authStorage.setConfigApiKey("anthropic", "sibling-api-key", { owner: {} });
 		const mock = createMockModel({ responses: [{ content: ["ok"] }] });
 		Object.defineProperty(mock.model, "provider", { value: "anthropic" });
 		Object.defineProperty(mock.model, "api", { value: "anthropic-messages" });
