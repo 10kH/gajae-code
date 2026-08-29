@@ -147,6 +147,7 @@ describe("Command Code GOAT fresh descriptor", () => {
 					supportsStore: false,
 					supportsDeveloperRole: false,
 					supportsReasoningEffort: false,
+					maxTokensField: "max_tokens",
 					reasoningContentField: "reasoning_content",
 				},
 			});
