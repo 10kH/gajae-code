@@ -29,7 +29,7 @@ import { transportFailureFacts } from "../utils/fallback-transport";
 import { withHttpStatus } from "../utils/http-inspector";
 import { captureUnicodeEscapeEvidence } from "../utils/json-parse";
 import { decodeEventStream } from "./aws-eventstream";
-import { isKiroApiKey, streamKiroApiKey } from "./kiro-api-key";
+import { isKiroApiKey, streamKiroApiKey, toKiroModelId } from "./kiro-api-key";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Provider options
@@ -362,7 +362,11 @@ function buildConversationState(
 		throw new Error("Kiro CodeWhisperer requires at least one message");
 	}
 
-	const modelId = model.wireModelId || model.id;
+	// Normalize the local dashed selector/wire id (e.g. "claude-haiku-4-5") to
+	// the canonical dotted upstream Kiro model id (e.g. "claude-haiku-4.5"),
+	// matching the sibling ksk_ API-key transport (kiro-api-key.ts) so both
+	// auth methods send the same wire form for the same catalog entry.
+	const modelId = toKiroModelId(model.wireModelId || model.id);
 
 	// Build history from all messages except the last
 	const history: WireHistoryMessage[] = [];

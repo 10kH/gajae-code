@@ -1,4 +1,4 @@
-import { describe, expect, it, test, vi } from "bun:test";
+import { afterEach, describe, expect, it, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -88,9 +88,15 @@ describe("Kiro OAuth provider advertisement is coherent with wiring", () => {
 	});
 
 	test("refreshOAuthToken keeps routing kiro through refreshKiroToken (unaffected by login fix)", async () => {
-		await expect(
-			refreshOAuthToken("kiro", { access: "a", refresh: "", expires: Date.now() - 1000 }),
-		).rejects.toThrow(); // no client registration cache / no network in test env — must fail via the kiro path, not "Unknown OAuth provider"
+		const refreshed = { access: "refreshed-access", refresh: "refreshed-refresh", expires: Date.now() + 3600_000 };
+		const refreshKiroTokenSpy = vi.spyOn(kiroOAuthModule, "refreshKiroToken").mockResolvedValue(refreshed);
+		try {
+			const result = await refreshOAuthToken("kiro", { access: "a", refresh: "r", expires: Date.now() - 1000 });
+			expect(refreshKiroTokenSpy).toHaveBeenCalledTimes(1);
+			expect(result).toEqual(refreshed);
+		} finally {
+			refreshKiroTokenSpy.mockRestore();
+		}
 	});
 });
 
@@ -125,6 +131,43 @@ describe("Kiro model catalog and default model", () => {
 		expect(descriptor).toBeDefined();
 		const staticCatalog = kiroApiStaticModels();
 		expect(staticCatalog.some(m => m.id === descriptor?.defaultModel)).toBe(true);
+	});
+});
+
+describe("OAuth CodeWhisperer transport normalizes the wire model id", () => {
+	const originalFetch = globalThis.fetch;
+
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+	});
+
+	test("sends the canonical dotted Kiro model id, not the local dashed catalog alias", async () => {
+		const { streamKiroCodeWhisperer } = await import("../src/providers/kiro-codewhisperer");
+		// The dashed selector as published in models.json (kiroApiStaticModels()
+		// registers both the dotted upstream id and, when it differs, a dashed
+		// local alias like "claude-haiku-4-5").
+		const dashedModel = getBundledModel<"kiro-codewhisperer-stream">("kiro", "claude-haiku-4-5");
+		expect(dashedModel).toBeDefined();
+		if (!dashedModel) throw new Error("expected a dashed Kiro catalog alias for this regression test");
+
+		globalThis.fetch = (async () => new Response("", { status: 500 })) as unknown as typeof fetch;
+
+		let capturedPayload: unknown;
+		const context: Context = { messages: [{ role: "user", content: "hi", timestamp: Date.now() }] };
+		const stream = streamKiroCodeWhisperer(dashedModel, context, {
+			apiKey: "oauth-bearer-token",
+			onPayload: payload => {
+				capturedPayload = payload;
+			},
+		});
+		for await (const _event of stream) {
+			// drain to completion; only onPayload matters for this test
+		}
+
+		const payload = capturedPayload as {
+			conversationState: { currentMessage: { userInputMessage: { modelId?: string } } };
+		};
+		expect(payload.conversationState.currentMessage.userInputMessage.modelId).toBe("claude-haiku-4.5");
 	});
 });
 
