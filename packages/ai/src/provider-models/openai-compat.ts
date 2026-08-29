@@ -875,19 +875,29 @@ export function opencodeGoModelManagerOptions(
 
 export function commandCodeModelManagerOptions(
 	config?: OpenCodeModelManagerConfig,
-): ModelManagerOptions<"openai-completions"> {
+): ModelManagerOptions<Api> {
 	const apiKey = config?.apiKey;
-	const baseUrl = config?.baseUrl ?? "https://api.commandcode.ai/provider/v1";
+	const openAiBaseUrl = config?.baseUrl ?? "https://api.commandcode.ai/provider/v1";
+	const anthropicBaseUrl = openAiBaseUrl.replace(/\/v1\/?$/u, "");
 	return {
 		providerId: "commandcode-goat",
 		...(apiKey && {
 			fetchDynamicModels: () =>
-				fetchOpenAICompatibleModels({
+				fetchOpenAICompatibleModels<Api>({
 					api: "openai-completions",
 					provider: "commandcode-goat",
-					baseUrl,
+					baseUrl: openAiBaseUrl,
 					apiKey,
-					mapModel: (_entry, defaults) => ({
+					mapModel: (_entry, defaults) => {
+						const isClaude = /(?:^|\/)claude(?:[\w.-]|$)/iu.test(defaults.id);
+						if (isClaude) {
+							return {
+								...defaults,
+								api: "anthropic-messages",
+								baseUrl: anthropicBaseUrl,
+							};
+						}
+						return {
 						...defaults,
 						api: "openai-completions",
 						compat: {
@@ -898,7 +908,8 @@ export function commandCodeModelManagerOptions(
 							maxTokensField: "max_tokens",
 							reasoningContentField: "reasoning_content",
 						},
-					}),
+						};
+					},
 				}),
 		}),
 	};

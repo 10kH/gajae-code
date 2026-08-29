@@ -142,16 +142,14 @@ describe("Command Code GOAT fresh descriptor", () => {
 		try {
 			const models = await commandCodeModelManagerOptions({ apiKey: "cmd-test-key" }).fetchDynamicModels?.();
 			expect(models?.find(model => model.id === "claude-opus-5.5")).toMatchObject({
-				api: "openai-completions",
-				compat: {
-					supportsStore: false,
-					supportsDeveloperRole: false,
-					supportsReasoningEffort: false,
-					maxTokensField: "max_tokens",
-					reasoningContentField: "reasoning_content",
-				},
+				api: "anthropic-messages",
+				baseUrl: "https://api.commandcode.ai/provider",
 			});
-			expect(models?.find(model => model.id === "zai-org/GLM-5.3")?.api).toBe("openai-completions");
+			expect(models?.find(model => model.id === "zai-org/GLM-5.3")).toMatchObject({
+			api: "openai-completions",
+			baseUrl: "https://api.commandcode.ai/provider/v1",
+			compat: { maxTokensField: "max_tokens" },
+		});
 		} finally {
 			globalThis.fetch = realFetch;
 		}
