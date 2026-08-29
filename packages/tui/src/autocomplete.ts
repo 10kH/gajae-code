@@ -928,7 +928,12 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 			const suggestions =
 				rawPrefix.length > 0
 					? await this.#getFuzzyFileSuggestions(rawPrefix, { isQuotedPrefix })
-					: await this.#getFileSuggestions("@");
+					: await this.#getFileSuggestions(atPrefix);
+			if (suggestions.length === 0 && rawPrefix.length > 0) {
+				const fallback = await this.#getFileSuggestions(atPrefix);
+				if (fallback.length === 0) return null;
+				return { items: fallback, prefix: atPrefix };
+			}
 			if (suggestions.length === 0) return null;
 
 			return { items: suggestions, prefix: atPrefix };

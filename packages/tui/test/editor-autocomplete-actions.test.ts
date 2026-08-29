@@ -642,4 +642,21 @@ describe("Editor Enter handler sync slash completion", () => {
 			fs.rmSync(baseDir, { recursive: true, force: true });
 		}
 	});
+
+	it("applies a fuzzy @ completion from explicit Tab", async () => {
+		const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "editor-tab-fuzzy-autocomplete-"));
+		try {
+			fs.writeFileSync(path.join(baseDir, "한글.txt"), "content\n");
+			const editor = new Editor(defaultEditorTheme);
+			editor.setAutocompleteProvider(new CombinedAutocompleteProvider([], baseDir));
+			editor.setText("@ㅎㄱ");
+
+			editor.handleInput("\t");
+			await Bun.sleep(100);
+
+			expect(editor.getText()).toBe("@한글.txt ");
+		} finally {
+			fs.rmSync(baseDir, { recursive: true, force: true });
+		}
+	});
 });

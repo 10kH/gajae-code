@@ -107,6 +107,15 @@ describe("CombinedAutocompleteProvider", () => {
 			expect(values).toContain("@.github/");
 			expect(values.some(value => value === "@.git" || value.startsWith("@.git/"))).toBe(false);
 		});
+
+		it("preserves quoted @ metadata for explicit Tab", async () => {
+			fs.writeFileSync(path.join(baseDir, "file name.md"), "content\n");
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const result = await provider.getForceFileSuggestions(['@"'], 0, 2);
+
+			expect(result?.prefix).toBe('@"');
+			expect(result?.items.map(item => item.value)).toContain('@"file name.md"');
+		});
 	});
 
 	describe("@ fuzzy search scoped paths", () => {
