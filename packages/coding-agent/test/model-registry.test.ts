@@ -3419,8 +3419,8 @@ describe("ModelRegistry", () => {
 				maxTokens: 64_000,
 			});
 			expect(registry.find("commandcode-goat", "claude-opus-5.5")).toMatchObject({
-				api: "openai-completions",
-				baseUrl: "https://api.commandcode.ai/provider/v1",
+				api: "anthropic-messages",
+				baseUrl: "https://api.commandcode.ai/provider",
 			});
 			expect(registry.find("commandcode-goat", "claude-opus-5.5")?.headers?.Authorization).toBeUndefined();
 			expect(registry.find("commandcode-goat", "Qwen/Qwen3.8-Max")?.api).toBe("openai-completions");
