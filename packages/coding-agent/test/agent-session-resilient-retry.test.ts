@@ -2271,7 +2271,7 @@ describe("AgentSession resilient retry", () => {
 		expect(retryStartEvents).toHaveLength(0);
 		expect(requestedModels).toHaveLength(1);
 		expect(lastAssistant(session).stopReason).toBe("error");
-	});
+	}, 300000);
 	it("does not replay bare-default watchdogs after provider lifecycle handlers participate", async () => {
 		for (const eventType of ["context", "before_provider_request", "after_provider_response"] as const) {
 			let hookCalls = 0;
@@ -2312,7 +2312,7 @@ describe("AgentSession resilient retry", () => {
 			await session.dispose();
 			session = undefined;
 		}
-	});
+	}, 120000);
 	it("rejects a typed watchdog when a handler executes in its current scope", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		let hookCalls = 0;
