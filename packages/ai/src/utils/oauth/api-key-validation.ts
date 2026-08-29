@@ -54,6 +54,7 @@ function boundedDetails(text: string, apiKey: string): string {
 type BoundedBody = { text: string; truncated: boolean };
 
 async function readBoundedBody(response: Response, signal: AbortSignal): Promise<BoundedBody> {
+	if (signal.aborted) throw new Error("Login cancelled");
 	const contentLength = Number(response.headers.get("content-length"));
 	if (Number.isFinite(contentLength) && contentLength > VALIDATION_BODY_LIMIT) {
 		await response.body?.cancel().catch(() => {});
@@ -66,6 +67,7 @@ async function readBoundedBody(response: Response, signal: AbortSignal): Promise
 	let truncated = false;
 	try {
 		while (total < VALIDATION_BODY_LIMIT) {
+			if (signal.aborted) throw new Error("Login cancelled");
 			const { promise, resolve, reject } = Promise.withResolvers<{ done: boolean; value?: Uint8Array }>();
 			const onAbort = () => reject(new Error("Login cancelled"));
 			signal.addEventListener("abort", onAbort, { once: true });
@@ -77,7 +79,7 @@ async function readBoundedBody(response: Response, signal: AbortSignal): Promise
 			if (done) break;
 			if (value) {
 				const remaining = VALIDATION_BODY_LIMIT - total;
-				if (value.byteLength > remaining) truncated = true;
+				if (value.byteLength >= remaining) truncated = true;
 				chunks.push(value.byteLength > remaining ? value.subarray(0, remaining) : value);
 				total += Math.min(value.byteLength, remaining);
 			}
@@ -178,13 +180,16 @@ export async function validateOpenAICompatibleApiKey(options: OpenAICompatibleVa
 					? (parsed as { choices?: unknown }).choices
 					: undefined;
 			const firstChoice = Array.isArray(choices) ? choices[0] : undefined;
-			const hasMessage =
+			const message =
 				typeof firstChoice === "object" &&
 				firstChoice !== null &&
 				"message" in firstChoice &&
 				typeof (firstChoice as { message?: unknown }).message === "object" &&
-				(firstChoice as { message: { content?: unknown } }).message !== null;
-			if (!hasMessage) {
+				!Array.isArray((firstChoice as { message?: unknown }).message)
+					? (firstChoice as { message: Record<string, unknown> }).message
+					: undefined;
+			const content = message?.content;
+			if (!(typeof content === "string" || (Array.isArray(content) && content.length > 0))) {
 				throw validationFailure(options.provider, options.apiKey, "the inference probe returned no choices");
 			}
 		}
