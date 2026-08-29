@@ -71,9 +71,6 @@ test("Command Code fresh descriptor routes Claude through Anthropic and others t
 			api: "anthropic-messages",
 			baseUrl: "https://api.commandcode.ai/provider",
 		});
-
-
-
 	} finally {
 		globalThis.fetch = previousFetch;
 		auth.close();

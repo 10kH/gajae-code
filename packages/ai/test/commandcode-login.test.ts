@@ -146,10 +146,10 @@ describe("Command Code GOAT fresh descriptor", () => {
 				baseUrl: "https://api.commandcode.ai/provider",
 			});
 			expect(models?.find(model => model.id === "zai-org/GLM-5.3")).toMatchObject({
-			api: "openai-completions",
-			baseUrl: "https://api.commandcode.ai/provider/v1",
-			compat: { maxTokensField: "max_tokens" },
-		});
+				api: "openai-completions",
+				baseUrl: "https://api.commandcode.ai/provider/v1",
+				compat: { maxTokensField: "max_tokens" },
+			});
 		} finally {
 			globalThis.fetch = realFetch;
 		}

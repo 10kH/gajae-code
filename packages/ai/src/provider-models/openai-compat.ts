@@ -873,9 +873,7 @@ export function opencodeGoModelManagerOptions(
 	return openCodeModelManagerOptions("opencode-go", "https://opencode.ai/zen/go/v1", config);
 }
 
-export function commandCodeModelManagerOptions(
-	config?: OpenCodeModelManagerConfig,
-): ModelManagerOptions<Api> {
+export function commandCodeModelManagerOptions(config?: OpenCodeModelManagerConfig): ModelManagerOptions<Api> {
 	const apiKey = config?.apiKey;
 	const openAiBaseUrl = config?.baseUrl ?? "https://api.commandcode.ai/provider/v1";
 	const anthropicBaseUrl = openAiBaseUrl.replace(/\/v1\/?$/u, "");
@@ -898,16 +896,16 @@ export function commandCodeModelManagerOptions(
 							};
 						}
 						return {
-						...defaults,
-						api: "openai-completions",
-						compat: {
-							...defaults.compat,
-							supportsStore: false,
-							supportsDeveloperRole: false,
-							supportsReasoningEffort: false,
-							maxTokensField: "max_tokens",
-							reasoningContentField: "reasoning_content",
-						},
+							...defaults,
+							api: "openai-completions",
+							compat: {
+								...defaults.compat,
+								supportsStore: false,
+								supportsDeveloperRole: false,
+								supportsReasoningEffort: false,
+								maxTokensField: "max_tokens",
+								reasoningContentField: "reasoning_content",
+							},
 						};
 					},
 				}),
