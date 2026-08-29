@@ -58,6 +58,7 @@ afterEach(async () => {
 	SessionStateLockTestHooks.beforeOwnerRecordRewrite = undefined;
 	SessionStateLockTestHooks.beforeTransitionReleaseLstat = undefined;
 	SessionStateLockTestHooks.beforeTransitionSetupLstat = undefined;
+	SessionStateLockTestHooks.afterAcquireContention = undefined;
 	installExactIdentityNatives();
 	setSystemTime();
 	if (ORIGINAL_STATE_FILE === undefined) delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
@@ -793,7 +794,10 @@ describe("coordinator session state lock", () => {
 			await fs.symlink(target, lockFile);
 		};
 
-		await expect(reclaimStaleSessionStateLock(lockFile)).rejects.toBeInstanceOf(SessionStateLockUnavailableError);
+		const failure = await reclaimStaleSessionStateLock(lockFile).catch(error => error);
+		expect(failure).toBeInstanceOf(SessionStateLockUnavailableError);
+		expect(failure).toMatchObject({ lockPath: lockFile, reason: "lock_inspection_failed" });
+		expect((failure as Error).message).toContain(lockFile);
 
 		// The swapped-in link is still a link — it was never opened, read, or unlinked —
 		// and the target it points at was never touched.
@@ -1405,6 +1409,31 @@ describe("coordinator session state lock", () => {
 		expect(await fs.readFile(lockFile, "utf8")).toBe(`{"pid":${DEAD_PID},"owner_host_id":"remote-host"`);
 	});
 
+	it("preserves the exact lock path and typed reason in the resume-facing diagnostic", async () => {
+		const { root, stateFile } = await seededRunningSession("lock-unprovenanced-diagnostic");
+		const lockFile = `${stateFile}.lock`;
+		await fs.writeFile(
+			lockFile,
+			JSON.stringify({
+				pid: DEAD_PID,
+				start_time: "unknown",
+				token: "foreign-malformed-owner",
+				owner_host_id: "remote-host",
+				released: false,
+			}),
+		);
+		const stale = new Date(Date.now() - 60_000);
+		await fs.utimes(lockFile, stale, stale);
+		SessionStateLockTestHooks.unqualifiedOwnerIsLocal = false;
+
+		const failure = await writeToolActivity(root, "call-1", "2026-03-01T00:00:05.000Z").catch(error => error);
+
+		expect(failure).toBeInstanceOf(Error);
+		expect((failure as Error).message).toContain(lockFile);
+		expect((failure as Error).message).toContain("lock_owner_record_unprovenanced");
+		expect(await fs.readFile(lockFile, "utf8")).toContain("foreign-malformed-owner");
+	});
+
 	it("fails closed for an unqualified transition claim on a shared volume", async () => {
 		const { stateFile } = await seededRunningSession("lock-unqualified-transition");
 		const transitionFile = `${stateFile}.lock.transition`;
@@ -1461,15 +1490,41 @@ describe("coordinator session state lock", () => {
 	it("creates no owner record when machine identity is unavailable", async () => {
 		const root = await tempRoot();
 		const stateFile = path.join(root, "lock-host-identity-unavailable.json");
+		const identityFailure = new Error("machine identity unavailable");
 		SessionStateLockTestHooks.ownerHostId = async () => {
-			throw new Error("machine identity unavailable");
+			throw identityFailure;
 		};
 
-		await expect(withSessionStateFileLock(stateFile, async () => "entered")).rejects.toBeInstanceOf(
-			SessionStateLockUnavailableError,
-		);
+		const failure = await withSessionStateFileLock(stateFile, async () => "entered").catch(error => error);
+		expect(failure).toBeInstanceOf(SessionStateLockUnavailableError);
+		expect(failure).toMatchObject({
+			lockPath: `${stateFile}.lock`,
+			reason: "lock_initialization_failed",
+		});
+		expect((failure as SessionStateLockUnavailableError).cause).toBe(identityFailure);
 		expect(fsSync.existsSync(`${stateFile}.lock`)).toBe(false);
 		expect(fsSync.existsSync(`${stateFile}.lock.transition`)).toBe(false);
+	});
+
+	it("names the exact lock path when the state parent cannot be created", async () => {
+		const root = await tempRoot();
+		const blockedParent = path.join(root, "not-a-directory");
+		await fs.writeFile(blockedParent, "occupied");
+		const stateFile = path.join(blockedParent, "runtime-state.json");
+
+		const failure = await withSessionStateFileLock(stateFile, async () => "entered").catch(error => error);
+
+		expect(failure).toBeInstanceOf(SessionStateLockUnavailableError);
+		expect(failure).toMatchObject({
+			lockPath: `${stateFile}.lock`,
+			reason: "lock_initialization_failed",
+		});
+		expect((failure as Error).message).toContain(`${stateFile}.lock`);
+		expect((failure as SessionStateLockUnavailableError).cause).toMatchObject({
+			code: "ENOTDIR",
+			path: blockedParent,
+		});
+		expect(await fs.readFile(blockedParent, "utf8")).toBe("occupied");
 	});
 
 	it("retries machine identity loading after a transient failure", async () => {
@@ -1524,6 +1579,20 @@ describe("coordinator session state lock", () => {
 		await expectReleasedOwner(lockFile);
 		expectReleasedTransition(lockFile);
 		expect(await withSessionStateFileLock(stateFile, async () => "reacquired")).toBe("reacquired");
+	});
+
+	it("preserves a callback-owned lock error unchanged after a successful release", async () => {
+		const { stateFile } = await seededRunningSession("lock-operation-lock-error");
+		const lockFile = `${stateFile}.lock`;
+		const primary = new SessionStateLockUnavailableError(new Error("callback-owned lock error"));
+
+		const observed = await withSessionStateFileLock(stateFile, async () => {
+			throw primary;
+		}).catch(error => error);
+
+		expect(observed).toBe(primary);
+		await expectReleasedOwner(lockFile);
+		expectReleasedTransition(lockFile);
 	});
 
 	it("repairs a partial primary-owner rewrite before releasing its transition claim", async () => {

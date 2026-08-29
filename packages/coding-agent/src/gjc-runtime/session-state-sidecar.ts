@@ -984,9 +984,11 @@ export function eventAffectsCoordinatorRuntimeState(event: RuntimeStateEvent): b
 }
 
 class PreviousRuntimeStateReadError extends Error {
-	constructor() {
-		super("Existing runtime state marker is invalid or unreadable; refusing to overwrite.");
+	constructor(cause?: unknown) {
+		const lockDetail = cause instanceof SessionStateLockUnavailableError ? ` ${cause.message}` : "";
+		super(`Existing runtime state marker is invalid or unreadable; refusing to overwrite.${lockDetail}`);
 		this.name = "PreviousRuntimeStateReadError";
+		if (cause !== undefined) this.cause = cause;
 	}
 }
 
@@ -1413,7 +1415,7 @@ async function withStateFileLock<T>(stateFile: string, operation: () => Promise<
 	try {
 		return await withSessionStateFileLock(stateFile, operation);
 	} catch (error) {
-		if (error instanceof SessionStateLockUnavailableError) throw new PreviousRuntimeStateReadError();
+		if (error instanceof SessionStateLockUnavailableError) throw new PreviousRuntimeStateReadError(error);
 		throw error;
 	}
 }
