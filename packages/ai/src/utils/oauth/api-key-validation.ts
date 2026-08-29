@@ -68,7 +68,7 @@ async function readBoundedBody(response: Response, signal: AbortSignal): Promise
 	let total = 0;
 	let truncated = false;
 	try {
-		while (total < VALIDATION_BODY_LIMIT) {
+		while (!truncated && total <= VALIDATION_BODY_LIMIT) {
 			if (signal.aborted) throw new Error("Login cancelled");
 			const { promise, resolve, reject } = Promise.withResolvers<{ done: boolean; value?: Uint8Array }>();
 			const onAbort = () => reject(new Error("Login cancelled"));
@@ -81,7 +81,7 @@ async function readBoundedBody(response: Response, signal: AbortSignal): Promise
 			if (done) break;
 			if (value) {
 				const remaining = VALIDATION_BODY_LIMIT - total;
-				if (value.byteLength >= remaining) truncated = true;
+				if (value.byteLength > remaining) truncated = true;
 				chunks.push(value.byteLength > remaining ? value.subarray(0, remaining) : value);
 				total += Math.min(value.byteLength, remaining);
 			}

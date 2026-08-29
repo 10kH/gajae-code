@@ -83,6 +83,22 @@ describe("validateApiKeyAgainstModelsEndpoint", () => {
 		await validate();
 	});
 
+	it("accepts a catalog response ending exactly at the body limit", async () => {
+		const prefix = JSON.stringify({ object: "list", data: [] });
+		const body = `${prefix}${" ".repeat(64 * 1024 - prefix.length)}`;
+		expect(new TextEncoder().encode(body).byteLength).toBe(64 * 1024);
+		stubFetch(() => new Response(body, { status: 200 }));
+		await validate();
+	});
+
+	it("rejects a catalog response over the body limit", async () => {
+		const prefix = JSON.stringify({ object: "list", data: [] });
+		const body = `${prefix}${" ".repeat(64 * 1024 + 1 - prefix.length)}`;
+		expect(new TextEncoder().encode(body).byteLength).toBe(64 * 1024 + 1);
+		stubFetch(() => new Response(body, { status: 200 }));
+		await expect(validate()).rejects.toThrow(/validation limit/);
+	});
+
 	it("rejects a 200 with a non-JSON body instead of accepting on status alone", async () => {
 		stubFetch(() => new Response("<html>captive portal</html>", { status: 200 }));
 		await expect(validate()).rejects.toThrow(/non-JSON body.*status alone/s);
