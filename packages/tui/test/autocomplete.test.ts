@@ -109,7 +109,7 @@ describe("CombinedAutocompleteProvider", () => {
 		});
 
 		it("preserves quoted @ metadata for explicit Tab", async () => {
-			fs.writeFileSync(path.join(baseDir, "file name.md"), "content\n");
+			await Bun.write(path.join(baseDir, "file name.md"), "content\n");
 			const provider = new CombinedAutocompleteProvider([], baseDir);
 			const result = await provider.getForceFileSuggestions(['@"'], 0, 2);
 
@@ -317,7 +317,7 @@ describe("CombinedAutocompleteProvider", () => {
 		});
 
 		it("uses the same chosung fuzzy lane for explicit Tab", async () => {
-			fs.writeFileSync(path.join(baseDir, hangulName), "content\n");
+			await Bun.write(path.join(baseDir, hangulName), "content\n");
 			const provider = new CombinedAutocompleteProvider([], baseDir);
 			const line = "@\u314E\u3131";
 			const result = await provider.getForceFileSuggestions([line], 0, line.length);
@@ -328,7 +328,7 @@ describe("CombinedAutocompleteProvider", () => {
 
 		it("uses fuzzy contains matching for explicit Tab", async () => {
 			const filename = "project-story.md";
-			fs.writeFileSync(path.join(baseDir, filename), "content\n");
+			await Bun.write(path.join(baseDir, filename), "content\n");
 			const provider = new CombinedAutocompleteProvider([], baseDir);
 			const line = "@story";
 			const result = await provider.getForceFileSuggestions([line], 0, line.length);
@@ -338,9 +338,9 @@ describe("CombinedAutocompleteProvider", () => {
 		});
 
 		it("merges ignored prefix matches with fuzzy tracked siblings", async () => {
-			fs.writeFileSync(path.join(baseDir, ".gitignore"), "story-ignored.md\nnode_modules/\n");
-			fs.writeFileSync(path.join(baseDir, "story-ignored.md"), "ignored\n");
-			fs.writeFileSync(path.join(baseDir, "story-tracked.md"), "tracked\n");
+			await Bun.write(path.join(baseDir, ".gitignore"), "story-ignored.md\nnode_modules/\n");
+			await Bun.write(path.join(baseDir, "story-ignored.md"), "ignored\n");
+			await Bun.write(path.join(baseDir, "story-tracked.md"), "tracked\n");
 			const provider = new CombinedAutocompleteProvider([], baseDir);
 			const result = await provider.getForceFileSuggestions(["@story"], 0, 6);
 
@@ -348,8 +348,8 @@ describe("CombinedAutocompleteProvider", () => {
 		});
 
 		it("keeps node_modules exact prefix matches reachable from explicit Tab", async () => {
-			fs.mkdirSync(path.join(baseDir, "node_modules"), { recursive: true });
-			fs.writeFileSync(path.join(baseDir, "node_modules", "package.json"), "{}\n");
+			await fs.promises.mkdir(path.join(baseDir, "node_modules"), { recursive: true });
+			await Bun.write(path.join(baseDir, "node_modules", "package.json"), "{}\n");
 			const provider = new CombinedAutocompleteProvider([], baseDir);
 			const line = "@node_modules/pac";
 			const result = await provider.getForceFileSuggestions([line], 0, line.length);
