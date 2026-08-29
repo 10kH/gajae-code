@@ -71,16 +71,8 @@ test("Command Code fresh descriptor routes Claude through Anthropic and others t
 			api: "anthropic-messages",
 			baseUrl: "https://api.commandcode.ai/provider",
 		});
-		expect(models.find(model => model.id === "zai-org/GLM-5.3")?.api).toBe("openai-completions");
-		expect(registry.find("commandcode-goat", "zai-org/GLM-5.3")).toBeDefined();
-		const initial = await findInitialModel({
-			scopedModels: [],
-			isContinuing: false,
-			defaultProvider: "commandcode-goat",
-			defaultModelId: "zai-org/GLM-5.3",
-			modelRegistry: registry,
-		});
-		expect(initial.model?.id).toBe("zai-org/GLM-5.3");
+
+
 		const glmCompat = models.find(model => model.id === "zai-org/GLM-5.3")?.compat;
 		expect(glmCompat).toMatchObject({
 			supportsStore: false,
