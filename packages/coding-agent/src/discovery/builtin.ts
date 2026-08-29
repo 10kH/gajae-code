@@ -93,6 +93,7 @@ async function getConfigDirs(ctx: LoadContext): Promise<Array<{ dir: string; lev
 	return result;
 }
 
+
 async function findNearestProjectConfigDir(
 	cwd: string,
 	repoRoot?: string | null,
