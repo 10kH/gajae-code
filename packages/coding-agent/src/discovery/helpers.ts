@@ -420,6 +420,8 @@ export interface ScanSkillsFromDirOptions {
 	providerId: string;
 	level: "user" | "project";
 	requireDescription?: boolean;
+	/** Optional physical root that every discovered skill must remain within. */
+	containmentRoot?: string;
 }
 
 // Stable ordering used for skill lists in prompts: name (case-insensitive), then name, then path.
@@ -479,7 +481,9 @@ export async function scanSkillsFromDir(
 ): Promise<LoadResult<Skill>> {
 	const items: Skill[] = [];
 	const warnings: string[] = [];
-	const { dir, level, providerId, requireDescription = false } = options;
+	const { dir, level, providerId, requireDescription = false, containmentRoot } = options;
+	const scanDir = await canonicalizePathWithinHome(_ctx, dir, containmentRoot);
+	if (!scanDir) return { items, warnings };
 
 	let entries: fs.Dirent[];
 	let realRoot: string;
@@ -504,21 +508,21 @@ export async function scanSkillsFromDir(
 				return { items, warnings };
 			}
 		}
-		const capturedScanRoot = await captureDirectoryIdentity(dir);
+		const capturedScanRoot = await captureDirectoryIdentity(scanDir);
 		if (!capturedScanRoot) {
 			warnings.push(`Refusing unsafe skills directory: ${dir}`);
 			return { items, warnings };
 		}
 		scanRootIdentity = capturedScanRoot;
 		realRoot = scanRootIdentity.realPath;
-		entries = await fs.promises.readdir(dir, { withFileTypes: true });
-		if (!(await directoryIdentityIsCurrent(dir, scanRootIdentity))) {
+		entries = await fs.promises.readdir(scanDir, { withFileTypes: true });
+		if (!(await directoryIdentityIsCurrent(scanDir, scanRootIdentity))) {
 			warnings.push(`Refusing changed skills directory: ${dir}`);
 			return { items, warnings };
 		}
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-			warnings.push(`Failed to read skills directory: ${dir} (${String(error)})`);
+			warnings.push(`Failed to read skills directory: ${scanDir} (${String(error)})`);
 		}
 		return { items, warnings };
 	}
@@ -528,7 +532,7 @@ export async function scanSkillsFromDir(
 	};
 	const openSkillFileSafely = async (skillPath: string): Promise<FileHandle> => {
 		if (
-			!(await directoryIdentityIsCurrent(dir, scanRootIdentity)) ||
+			!(await directoryIdentityIsCurrent(scanDir, scanRootIdentity)) ||
 			(options.authorityRoot &&
 				authorityIdentity &&
 				!(await directoryIdentityIsCurrent(options.authorityRoot, authorityIdentity)))
@@ -544,7 +548,7 @@ export async function scanSkillsFromDir(
 				handle.stat({ bigint: true }),
 				fs.promises.lstat(skillPath, { bigint: true }),
 				fs.promises.realpath(skillPath),
-				directoryIdentityIsCurrent(dir, scanRootIdentity),
+				directoryIdentityIsCurrent(scanDir, scanRootIdentity),
 				options.authorityRoot && authorityIdentity
 					? directoryIdentityIsCurrent(options.authorityRoot, authorityIdentity)
 					: true,
@@ -665,7 +669,12 @@ export async function scanSkillsFromDir(
 	for (const entry of entries) {
 		if (entry.name.startsWith(".")) continue;
 		if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
-		const skillPath = path.join(dir, entry.name, "SKILL.md");
+		const skillPath = await canonicalizePathWithinHome(
+			_ctx,
+			path.join(scanDir, entry.name, "SKILL.md"),
+			containmentRoot,
+		);
+		if (!skillPath) continue;
 		work.push(loadSkill(skillPath));
 	}
 	await Promise.all(work);
@@ -778,10 +787,14 @@ export async function loadFilesFromDir<T>(
 		transform: (name: string, content: string, path: string, source: SourceMeta) => T | null;
 		/** Whether to recurse into subdirectories (default: false) */
 		recursive?: boolean;
+		/** Optional physical root that every discovered file must remain within. */
+		containmentRoot?: string;
 	},
 ): Promise<LoadResult<T>> {
 	const items: T[] = [];
 	const warnings: string[] = [];
+	const scanDir = await canonicalizePathWithinHome(_ctx, dir, options.containmentRoot);
+	if (!scanDir) return { items, warnings };
 	// Build glob pattern based on extensions and recursion
 	const { extensions, recursive = false } = options;
 
@@ -799,7 +812,7 @@ export async function loadFilesFromDir<T>(
 		const { glob, FileType } = await discoveryNatives();
 		const result = await glob({
 			pattern,
-			path: dir,
+			path: scanDir,
 			gitignore: true,
 			hidden: false,
 			fileType: FileType.File,
@@ -813,13 +826,20 @@ export async function loadFilesFromDir<T>(
 	// Read all matching files in parallel
 	const fileResults = await Promise.all(
 		matches.map(async match => {
-			const filePath = path.join(dir, match.path);
+			const filePath = await canonicalizePathWithinHome(
+				_ctx,
+				path.join(scanDir, match.path),
+				options.containmentRoot,
+			);
+			if (!filePath) return null;
 			const content = await readFile(filePath);
 			return { filePath, content };
 		}),
 	);
 
-	for (const { filePath, content } of fileResults) {
+	for (const result of fileResults) {
+		if (!result) continue;
+		const { filePath, content } = result;
 		if (content === null) {
 			warnings.push(`Failed to read file: ${filePath}`);
 			continue;
@@ -859,7 +879,9 @@ async function readExtensionModuleManifest(
 	_ctx: LoadContext,
 	packageJsonPath: string,
 ): Promise<ExtensionModuleManifest | null> {
-	const content = await readFile(packageJsonPath);
+	const resolvedPackageJsonPath = await canonicalizePathWithinHome(_ctx, packageJsonPath);
+	if (!resolvedPackageJsonPath) return null;
+	const content = await readFile(resolvedPackageJsonPath);
 	if (!content) return null;
 
 	const pkg = tryParseJson<{ gjc?: ExtensionModuleManifest; pi?: ExtensionModuleManifest }>(content);
@@ -883,33 +905,36 @@ async function readExtensionModuleManifest(
  */
 export async function discoverExtensionModulePaths(ctx: LoadContext, dir: string): Promise<string[]> {
 	const discovered = new Set<string>();
+	const discoveryDir = await canonicalizePathWithinHome(ctx, dir);
+	if (!discoveryDir) return [];
 	const { FileType } = await discoveryNatives();
 	// Find all candidate files in parallel using glob
 	const [directFiles, indexFiles, packageJsonFiles] = await Promise.all([
 		// 1. Direct *.ts or *.js files
-		globIf(dir, "*.{ts,js}", FileType.File, false),
+		globIf(discoveryDir, "*.{ts,js}", FileType.File, false),
 		// 2. Subdirectory index files
-		globIf(dir, "*/index.{ts,js}", FileType.File, false),
+		globIf(discoveryDir, "*/index.{ts,js}", FileType.File, false),
 		// 3. Subdirectory package.json files
-		globIf(dir, "*/package.json", FileType.File, false),
+		globIf(discoveryDir, "*/package.json", FileType.File, false),
 	]);
 
 	// Process direct files
 	for (const match of directFiles) {
 		if (match.path.includes("/")) continue;
-		discovered.add(path.join(dir, match.path));
+		const candidatePath = await canonicalizePathWithinHome(ctx, path.join(discoveryDir, match.path));
+		if (candidatePath) discovered.add(candidatePath);
 	}
 	// Track which subdirectories have package.json manifests with declared extensions
 	const subdirsWithDeclaredExtensions = new Set<string>();
 	for (const match of packageJsonFiles) {
 		const subdir = path.dirname(match.path); // e.g., "my-extension"
-		const packageJsonPath = path.join(dir, match.path);
+		const packageJsonPath = path.join(discoveryDir, match.path);
 		const manifest = await readExtensionModuleManifest(ctx, packageJsonPath);
 		const declaredExtensions =
 			manifest?.extensions?.filter((extPath): extPath is string => typeof extPath === "string") ?? [];
 		if (declaredExtensions.length === 0) continue;
 		subdirsWithDeclaredExtensions.add(subdir);
-		const subdirPath = path.join(dir, subdir);
+		const subdirPath = path.join(discoveryDir, subdir);
 		for (const extPath of declaredExtensions) {
 			const configuredPath = path.resolve(subdirPath, extPath);
 			const resolvedConfiguredPath = await canonicalizePathWithinHome(ctx, configuredPath);
@@ -939,7 +964,8 @@ export async function discoverExtensionModulePaths(ctx: LoadContext, dir: string
 		}
 	}
 	for (const preferredPath of preferredIndexBySubdir.values()) {
-		discovered.add(path.join(dir, preferredPath));
+		const candidatePath = await canonicalizePathWithinHome(ctx, path.join(discoveryDir, preferredPath));
+		if (candidatePath) discovered.add(candidatePath);
 	}
 	return [...discovered];
 }
@@ -1189,16 +1215,28 @@ function isWithinOrEqual(root: string, candidate: string): boolean {
  * Resolve a configured path through existing symlinks when an explicit-home
  * load is active. Ordinary discovery keeps its historical lexical path
  * handling; isolated discovery must reject paths that leave the supplied
- * physical home, including paths that escape through an existing symlink.
+ * physical home (or an explicitly selected agent directory), including paths
+ * that escape through an existing symlink. When provided, containmentRoot is
+ * an additional physical boundary, such as a plugin root.
  */
 export async function canonicalizePathWithinHome(
-	ctx: Pick<LoadContext, "home" | "isolatedHome">,
+	ctx: Pick<LoadContext, "home" | "isolatedHome" | "userAgentDir">,
 	target: string,
+	containmentRoot?: string,
 ): Promise<string | undefined> {
 	if (!ctx.isolatedHome) return target;
-	const canonicalHome = await canonicalizeThroughExistingAncestor(ctx.home);
+	const canonicalRoots = await Promise.all(
+		[ctx.home, ctx.userAgentDir]
+			.filter((root): root is string => typeof root === "string")
+			.map(canonicalizeThroughExistingAncestor),
+	);
 	const canonicalTarget = await canonicalizeThroughExistingAncestor(target);
-	return isWithinOrEqual(canonicalHome, canonicalTarget) ? canonicalTarget : undefined;
+	if (!canonicalRoots.some(root => isWithinOrEqual(root, canonicalTarget))) return undefined;
+	if (containmentRoot) {
+		const canonicalContainmentRoot = await canonicalizeThroughExistingAncestor(containmentRoot);
+		if (!isWithinOrEqual(canonicalContainmentRoot, canonicalTarget)) return undefined;
+	}
+	return canonicalTarget;
 }
 
 async function resolveIsolatedPluginPath(home: string, value: string): Promise<string | undefined> {
