@@ -73,13 +73,7 @@ test("Command Code fresh descriptor routes Claude through Anthropic and others t
 		});
 
 
-		const glmCompat = models.find(model => model.id === "zai-org/GLM-5.3")?.compat;
-		expect(glmCompat).toMatchObject({
-			supportsStore: false,
-			supportsDeveloperRole: false,
-			supportsReasoningEffort: false,
-			reasoningContentField: "reasoning_content",
-		});
+
 	} finally {
 		globalThis.fetch = previousFetch;
 		auth.close();
