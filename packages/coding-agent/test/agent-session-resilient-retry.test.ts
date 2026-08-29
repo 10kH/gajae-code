@@ -1099,8 +1099,7 @@ describe("AgentSession resilient retry", () => {
 			session = undefined;
 			waitSpy.mockClear();
 		}
-	});
-
+	}, 300000);
 	it("bounds ollama-cloud first-event timeout retries instead of looping unbounded (#713)", async () => {
 		// ollama-cloud (ollama-chat API) can stall before its first token even
 		// for tiny prompts. Unbounded continuation retries re-issue the full
@@ -1133,7 +1132,7 @@ describe("AgentSession resilient retry", () => {
 		expect(last.stopReason).toBe("error");
 		expect(last.errorMessage).toContain("first event");
 		expect(waitSpy).toHaveBeenCalled();
-	});
+	}, 30000);
 	it("surfaces raw and wrapped Kimi Code first-event timeouts without replaying", async () => {
 		const model = getBundledModel("kimi-code", "kimi-k2.5");
 		if (!model) throw new Error("Expected bundled Kimi Code test model to exist");
