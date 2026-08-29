@@ -25,6 +25,7 @@ interface WorkflowJob {
 
 interface WorkflowDocument {
 	on: { workflow_dispatch: { inputs: Record<string, unknown> } };
+	concurrency?: { group: string };
 	jobs: Record<string, WorkflowJob>;
 }
 
@@ -191,6 +192,8 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		// only: GitHub Actions concurrency has exactly `group` and
 		// `cancel-in-progress`; unknown keys make the workflow fail actionlint.
 		expect(source).toContain("group: dev-ci-virtual-integration\n      cancel-in-progress: false");
+		expect(d.concurrency?.group).not.toContain("'dev-ci-virtual-integration'");
+		expect(source).toContain("format('dev-ci-dispatch-{0}', github.run_id)");
 		expect(source).not.toMatch(/^\s+queue:/m);
 		expect(source).toContain("Select authoritative terminal-green dev base");
 		expect(source).toContain("bun scripts/ci-virtual-integration.ts --select-base");

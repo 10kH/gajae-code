@@ -1608,6 +1608,77 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 	);
 }
 
+export async function persistCoordinatorWorkerIntegrationOutcome(
+	context: RuntimeStateContext,
+	outcome: {
+		kind: "worker_integration" | "terminal_persistence";
+		status: "completed" | "failed" | "timed_out";
+		correlationId?: string;
+		error?: string;
+	},
+): Promise<void> {
+	const stateFile = runtimeStateFileForContext(context);
+	if (!stateFile) return;
+	const identity = normalizedIdentity(context);
+	await serializeStateFileWrite(
+		stateFile,
+		async () =>
+			await withCoordinatorTransactionLock(
+				stateFile,
+				async () =>
+					await withStateFileLock(stateFile, async () => {
+						const previous = await readPreviousPayloadForEvent(stateFile);
+						if (Object.keys(previous).length === 0) return;
+						assertPreviousRuntimeStateIdentity(previous, identity);
+						const now = new Date().toISOString();
+						const terminalPersistenceFailed =
+							outcome.kind === "terminal_persistence" && outcome.status !== "completed";
+						const reconciliation = {
+							status: outcome.status,
+							...(outcome.correlationId ? { correlation_id: outcome.correlationId } : {}),
+							...(outcome.error ? { error: publicSafeErrorMessage(outcome.error) } : {}),
+							observed_at: now,
+						};
+						const failureMessage = publicSafeErrorMessage(
+							outcome.error ??
+								(outcome.status === "timed_out"
+									? "Worker integration timed out after terminal publication."
+									: "Worker integration failed after terminal publication."),
+						);
+						const payload = {
+							...previous,
+							...(terminalPersistenceFailed
+								? {
+										state: "errored",
+										ready_for_input: false,
+										live: false,
+										current_turn_id: null,
+										execution_state: "failed",
+										receipt_state: "absent",
+										ended_at: now,
+										reason: "terminal_persistence_failed",
+										source: "agent_session_reconciliation",
+										event: "terminal_persistence",
+									}
+								: {}),
+							updated_at: now,
+							[outcome.kind]: reconciliation,
+							...(outcome.status !== "completed"
+								? {
+										error: {
+											code: `${outcome.kind}_failed`,
+											message: failureMessage,
+											recoverable: true,
+										},
+									}
+								: {}),
+						};
+						await writeStateFileSync(stateFile, payload, identity.sidecarKeyId);
+					}),
+			),
+	);
+}
+
 function ownerTerminalSignal(reason: postmortem.Reason): TerminalSignal {
 	if (reason === postmortem.Reason.SIGTERM) return "SIGTERM";
 	if (reason === postmortem.Reason.SIGINT) return "SIGINT";

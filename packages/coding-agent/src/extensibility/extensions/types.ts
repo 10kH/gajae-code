@@ -536,7 +536,7 @@ export interface ExtensionContext {
 			onPreflightAcceptCommit?: () => void | Promise<void>;
 			onSkillPrepared?: (meta: { name: string; path: string; lineCount?: number; cleanedArgs?: string }) => void;
 			preflightSignal?: AbortSignal;
-			sdkRunToken?: string;
+			sdkRunCapability?: unknown;
 		},
 	): Promise<unknown>;
 	setPlanMode?(on: boolean): unknown;
@@ -1316,7 +1316,6 @@ export interface ExtensionAPI {
 			onDispatchDisposition?: (promotion: { startsOwnRun: boolean }) => void;
 			preflightSignal?: AbortSignal;
 			/** Internal SDK correlation owner for an exact queued follow-up. */
-			sdkRunToken?: string;
 		},
 	): Promise<void>;
 
@@ -1546,7 +1545,6 @@ export type SendUserMessageHandler = (
 		onQueuedPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
 		preflightSignal?: AbortSignal;
 		/** Internal SDK correlation owner for an exact queued follow-up. */
-		sdkRunToken?: string;
 	},
 ) => void | Promise<void>;
 
@@ -1708,6 +1706,7 @@ export interface ExtensionContextActions {
 			onPreflightAcceptCommit?: () => void | Promise<void>;
 			onSkillPrepared?: (meta: { name: string; path: string; lineCount?: number; cleanedArgs?: string }) => void;
 			preflightSignal?: AbortSignal;
+			sdkRunCapability?: unknown;
 		},
 	) => Promise<unknown>;
 	setPlanMode?: (on: boolean) => unknown;

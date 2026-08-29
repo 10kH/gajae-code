@@ -317,6 +317,7 @@ import {
 	type CoordinatorToolObservation,
 	ownerTerminalContextFromEnvironment,
 	persistCoordinatorRuntimeStateFromEvent,
+	persistCoordinatorWorkerIntegrationOutcome,
 	registerCoordinatorRuntimeStateFinalizer,
 	UNPROVEN_TOOL_LABEL,
 } from "../gjc-runtime/session-state-sidecar";
@@ -461,6 +462,7 @@ import {
 	SKILL_PROMPT_MESSAGE_TYPE,
 } from "./messages";
 import { isLegacyProviderSafetyStopMessage } from "./provider-safety-stop";
+import { readSdkRunCapability } from "./sdk-run-capability";
 import { formatSessionDumpText } from "./session-dump-format";
 import type {
 	BranchSummaryEntry,
@@ -1077,9 +1079,22 @@ export interface PromptOptions {
 	onSkillPrepared?: (meta: { name: string; path: string; lineCount?: number; cleanedArgs?: string }) => void;
 	/** Optional invocation-scoped cancellation fence used before an accepted skill starts execution. */
 	preflightSignal?: AbortSignal;
-	/** Internal SDK lifecycle owner token. */
-	sdkRunToken?: string;
+	/** Internal host capability; ordinary package callers cannot construct the branded value. */
+	sdkRunCapability?: unknown;
 }
+
+type InternalPromptOptions = PromptOptions & { sdkRunToken?: string };
+type InternalCustomMessageOptions = Pick<
+	PromptOptions,
+	| "streamingBehavior"
+	| "toolChoice"
+	| "followUpQueuePolicy"
+	| "onPreflightAccepted"
+	| "onPreflightAcceptCommit"
+	| "preflightSignal"
+> & {
+	sdkRunToken?: string;
+};
 
 function promptPreflightCancelledError(): Error {
 	const error = Object.assign(new Error("Prompt preflight was cancelled before execution."), { code: "busy" });
@@ -1970,9 +1985,24 @@ export type BeforeAgentStartContributor = (event: {
 }) => Promise<BeforeAgentStartInternalMessage | undefined>;
 
 const AGENT_END_WORKER_INTEGRATION_TIMEOUT_MS = 5_000;
+const POST_PUBLICATION_ERROR_MAX_BYTES = 512;
+
+export type WorkerIntegrationOutcome =
+	| { status: "completed" }
+	| { status: "failed"; error: string }
+	| { status: "timed_out" };
+
+function sanitizePostPublicationError(error: string | undefined): string | undefined {
+	if (error === undefined) return undefined;
+	const normalized = error
+		.replace(/[\u0000-\u001f\u007f]/gu, " ")
+		.replace(/\s+/gu, " ")
+		.trim();
+	return truncateHeadBytes(normalized || "unknown worker integration error", POST_PUBLICATION_ERROR_MAX_BYTES).text;
+}
 
 export class WorkerIntegrationRequestScheduler {
-	#inFlight: Promise<void> | undefined = undefined;
+	#inFlight: Promise<WorkerIntegrationOutcome> | undefined = undefined;
 	#pending = false;
 
 	constructor(
@@ -1989,9 +2019,15 @@ export class WorkerIntegrationRequestScheduler {
 	}
 
 	async flush(): Promise<void> {
+		await this.flushWithOutcome();
+	}
+
+	async flushWithOutcome(): Promise<WorkerIntegrationOutcome> {
+		let outcome: WorkerIntegrationOutcome = { status: "completed" };
 		while (this.#inFlight) {
-			await this.#inFlight;
+			outcome = await this.#inFlight;
 		}
+		return outcome;
 	}
 
 	#start(): void {
@@ -2001,16 +2037,22 @@ export class WorkerIntegrationRequestScheduler {
 		try {
 			request = this.request(controller.signal);
 		} catch {
-			request = Promise.resolve();
+			request = Promise.reject(new Error("Worker integration request failed before dispatch."));
 		}
 		let timeout: ReturnType<typeof setTimeout> | undefined;
-		const deadline = new Promise<void>(resolve => {
+		const deadline = new Promise<WorkerIntegrationOutcome>(resolve => {
 			timeout = setTimeout(() => {
 				controller.abort(new Error("Worker integration request timed out"));
-				resolve();
+				resolve({ status: "timed_out" });
 			}, this.timeoutMs);
 		});
-		this.#inFlight = Promise.race([request.catch(() => {}), deadline]).finally(() => {
+		this.#inFlight = Promise.race([
+			request.then(
+				() => ({ status: "completed" as const }),
+				error => ({ status: "failed" as const, error: String(error) }),
+			),
+			deadline,
+		]).finally(() => {
 			if (timeout) clearTimeout(timeout);
 			controller.abort();
 			this.#inFlight = undefined;
@@ -2531,6 +2573,22 @@ export class AgentSession {
 		this.#activeAttemptScope = undefined;
 		this.#activeLogicalRunId = undefined;
 	}
+	#acceptSdkAttemptRun(handle: AttemptRunHandle, sdkRunToken?: string): void {
+		const predecessorScope = this.#activeAttemptScope;
+		const predecessorSdkRunToken =
+			predecessorScope === undefined ? undefined : this.#sdkRunTokensByAttemptScope.get(predecessorScope);
+		const carryRecoverySkip =
+			sdkRunToken !== undefined &&
+			predecessorSdkRunToken === sdkRunToken &&
+			predecessorScope !== undefined &&
+			this.#skipPostPromptRecoveryWaitByAttemptScope.delete(predecessorScope);
+		this.#acceptRunHandle(handle);
+		if (sdkRunToken !== undefined) {
+			this.#activeSdkRunToken = sdkRunToken;
+			this.#sdkRunTokensByAttemptScope.set(handle.scope, sdkRunToken);
+		}
+		if (carryRecoverySkip) this.#skipPostPromptRecoveryWaitByAttemptScope.add(handle.scope);
+	}
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	#pendingNextTurnMessages: Array<{ message: CustomMessage; origin: "turn" | "external" }> = [];
 	#scheduledHiddenNextTurnGeneration: number | undefined = undefined;
@@ -2795,6 +2853,7 @@ export class AgentSession {
 	#extensionRunner: ExtensionRunner | undefined = undefined;
 	/** SDK follow-up ownership by queued message and the attempt that dequeues it. */
 	#sdkRunTokensByQueuedMessage = new WeakMap<AgentMessage, string>();
+	#skipPostPromptRecoveryWaitByAttemptScope = new WeakSet<AttemptScope>();
 	#sdkRunTokensByAttemptScope = new WeakMap<AttemptScope, string>();
 	#activeSdkRunToken: string | undefined;
 	#activeAttemptScope: AttemptScope | undefined;
@@ -3143,6 +3202,7 @@ export class AgentSession {
 	 * orchestrator does not hold it), so there is no self-deadlock.
 	 */
 	#sessionTransitionKind: string | undefined;
+	#coordinatorPersistGeneration = 0;
 
 	#beginSessionTransition(kind: string): void {
 		if (this.#sessionTransitionKind !== undefined) {
@@ -3152,6 +3212,7 @@ export class AgentSession {
 			);
 		}
 		this.#sessionTransitionKind = kind;
+		this.#coordinatorPersistGeneration += 1;
 	}
 
 	#endSessionTransition(): void {
@@ -3751,7 +3812,7 @@ export class AgentSession {
 		// Deferrals behind still-pending selection fences are excluded here: they
 		// cannot settle before their fence resolves, and the fence owner may be
 		// waiting on this very settlement (#4519).
-		if (!predecessorPromptStillInFlight) {
+		if (promptWait !== "publication" && !predecessorPromptStillInFlight) {
 			await this.#waitForSessionSettlement(this.#turnSettlementDeferralFloor());
 		}
 		if (flushError) throw flushError;
@@ -3793,28 +3854,50 @@ export class AgentSession {
 		this.#pendingAgentEndEmit = undefined;
 		const lease = this.#deferredAgentEndLeases.get(pending);
 		if (lease) this.#deferredAgentEndLeases.delete(pending);
+		this.#startAgentEndPublication(pending, lease);
+	}
+	#startAgentEndPublication(pending: AgentSessionEvent, lease?: RunResourceProducerLease): void {
 		this.#agentEndPublicationInFlight++;
-		this.#agentEndPublicationPromise = this.#publishDeferredAgentEnd(pending, lease);
+		const pendingScope = (pending as AgentSessionEvent & { scope?: AttemptScopeRef }).scope as
+			| AttemptScope
+			| undefined;
+		const sdkTerminal = pendingScope !== undefined && this.#sdkRunTokensByAttemptScope.has(pendingScope);
+		this.#agentEndPublicationPromise = this.#publishDeferredAgentEnd(pending, lease, sdkTerminal);
 		void this.#agentEndPublicationPromise;
 	}
 
 	async #publishDeferredAgentEnd(
 		pending: AgentSessionEvent,
 		lease: RunResourceProducerLease | undefined,
+		workerIntegrationSettled: boolean,
 	): Promise<void> {
+		const publicationContext = {
+			sessionId: this.sessionId,
+			cwd: this.sessionManager.getCwd(),
+			sessionFile: this.sessionManager.getSessionFile(),
+		};
+		const publicationScope = (pending as AgentSessionEvent & { scope?: AttemptScopeRef }).scope as
+			| AttemptScope
+			| undefined;
+		const publicationCorrelationId = publicationScope
+			? this.#sdkRunTokensByAttemptScope.get(publicationScope)
+			: undefined;
 		let extensionDelivery: Promise<void> | undefined;
 		const releaseLease = () => {
 			if (!lease) return;
+			this.#deferredAgentEndLeases.delete(pending);
 			if (this.#postPromptLeases.get(lease.resourceRunId) === lease) {
 				this.#postPromptLeases.delete(lease.resourceRunId);
 			}
 			lease.closeDiscovery();
 		};
 		const publish = async () => {
-			// Worker integration is first-party lifecycle persistence, not an extension
-			// hook. Settle it before publishing the terminal boundary while user extension
-			// delivery and coordinator sidecar persistence remain asynchronous.
-			await this.#flushWorkerIntegrationForAgentEnd();
+			let workerIntegration: Promise<WorkerIntegrationOutcome> | undefined;
+			let workerIntegrationOutcome: WorkerIntegrationOutcome | undefined;
+			if (!workerIntegrationSettled) {
+				workerIntegration = this.#flushWorkerIntegrationForAgentEnd();
+				workerIntegrationOutcome = await workerIntegration;
+			}
 			// Reserve persistence before notifying synchronous subscribers: a subscriber
 			// may start a successor prompt from agent_end, whose running state must
 			// serialize after this terminal boundary rather than be overwritten by it.
@@ -3826,17 +3909,69 @@ export class AgentSession {
 			// and busy input state visible after the model has already finished. The queue
 			// preserves transaction order; terminal publication is the user-visible
 			// authority and must not be suppressed by a secondary persistence failure.
-			const terminalPersistence = this.#queueCoordinatorRuntimeStatePersist(pending);
+			const terminalPersistence = this.#queueCoordinatorRuntimeStatePersist(pending, true);
 			this.#emit(pending);
-			void terminalPersistence.catch(error => {
-				logger.warn("Failed to persist terminal coordinator runtime state", { error: String(error) });
-			});
+			void terminalPersistence.then(
+				() => {
+					if (workerIntegrationOutcome) {
+						this.#recordPostPublicationOutcome(
+							publicationContext,
+							publicationCorrelationId,
+							"worker_integration",
+							workerIntegrationOutcome,
+						);
+					}
+					this.#recordPostPublicationOutcome(
+						publicationContext,
+						publicationCorrelationId,
+						"terminal_persistence",
+						{ status: "completed" },
+					);
+				},
+				error => {
+					if (workerIntegrationOutcome) {
+						this.#recordPostPublicationOutcome(
+							publicationContext,
+							publicationCorrelationId,
+							"worker_integration",
+							workerIntegrationOutcome,
+						);
+					}
+					this.#recordPostPublicationOutcome(
+						publicationContext,
+						publicationCorrelationId,
+						"terminal_persistence",
+						{
+							status: "failed",
+							error: String(error),
+						},
+					);
+					logger.warn("Failed to persist terminal coordinator runtime state", { error: String(error) });
+				},
+			);
 			extensionDelivery = this.#queueExtensionEvent(
 				pending,
 				undefined,
 				true,
 				(pending as AgentSessionEvent & { scope?: AttemptScopeRef }).scope,
 			);
+			if (workerIntegrationSettled) {
+				workerIntegration = this.#flushWorkerIntegrationForAgentEnd();
+				void workerIntegration.then(outcome =>
+					this.#recordPostPublicationOutcome(
+						publicationContext,
+						publicationCorrelationId,
+						"worker_integration",
+						outcome,
+					),
+				);
+				await extensionDelivery;
+				void terminalPersistence.catch(error =>
+					logger.warn("Terminal persistence continued after SDK publication", { error }),
+				);
+			} else {
+				// Non-SDK/public publication has already awaited worker integration above.
+			}
 		};
 		try {
 			if (lease) await this.#runResourceLeaseContext.run(lease, publish);
@@ -4032,9 +4167,19 @@ export class AgentSession {
 					this.#resumeFromOwnedCompletion();
 				try {
 					if (survivors.length === 1) {
-						await this.agent.prompt(first, this.#managedFallbackPromptOptions());
+						await this.agent.prompt(first, {
+							...this.#managedFallbackPromptOptions(),
+							onRunAccepted: (handle: AttemptRunHandle) => {
+								if (handle) this.#acceptSdkAttemptRun(handle);
+							},
+						});
 					} else {
-						await this.agent.prompt(survivors, this.#managedFallbackPromptOptions());
+						await this.agent.prompt(survivors, {
+							...this.#managedFallbackPromptOptions(),
+							onRunAccepted: (handle: AttemptRunHandle) => {
+								if (handle) this.#acceptSdkAttemptRun(handle);
+							},
+						});
 					}
 				} finally {
 					// The owned completions were delivered OR the prompt attempt
@@ -4216,6 +4361,18 @@ export class AgentSession {
 			if (messages.some(message => ownedCompletionResumeAction(message) === "fresh")) {
 				this.#resumeFromOwnedCompletion();
 			}
+			const consumedSdkRunTokenForCurrentRun = messages
+				.map(message => this.#sdkRunTokensByQueuedMessage.get(message))
+				.find((token): token is string => token !== undefined);
+			if (
+				consumedSdkRunTokenForCurrentRun !== undefined &&
+				this.#activeAttemptScope !== undefined &&
+				promotion.startsOwnRun !== true
+			) {
+				this.#sdkRunTokensByAttemptScope.set(this.#activeAttemptScope, consumedSdkRunTokenForCurrentRun);
+				this.#skipPostPromptRecoveryWaitByAttemptScope.add(this.#activeAttemptScope);
+				this.#activeSdkRunToken = consumedSdkRunTokenForCurrentRun;
+			}
 			// Monitor task-notifications now carry the owned-completion envelope
 			// (see tools/monitor.ts), so the general drop + fresh-admission paths
 			// above cover them exactly like async results — no monitor-specific
@@ -4251,6 +4408,18 @@ export class AgentSession {
 		// submitter to the in-flight run instead of parking the correlation for
 		// an unrelated later agent_start (#4668).
 		this.agent.onSteeringConsumed = (messages, promotion = { startsOwnRun: false }) => {
+			const consumedSdkRunToken = messages
+				.map(message => this.#sdkRunTokensByQueuedMessage.get(message))
+				.find((token): token is string => token !== undefined);
+			if (
+				consumedSdkRunToken !== undefined &&
+				this.#activeAttemptScope !== undefined &&
+				promotion.startsOwnRun !== true
+			) {
+				this.#sdkRunTokensByAttemptScope.set(this.#activeAttemptScope, consumedSdkRunToken);
+				this.#skipPostPromptRecoveryWaitByAttemptScope.add(this.#activeAttemptScope);
+				this.#activeSdkRunToken = consumedSdkRunToken;
+			}
 			this.#fireQueuedPromotionHooks(messages, promotion);
 		};
 		this.agent.providerSessionState = this.#providerSessionState;
@@ -5163,6 +5332,10 @@ export class AgentSession {
 	 * seen.
 	 */
 	#coordinatorToolObservations = new WeakMap<object, CoordinatorToolObservation>();
+	#agentEventAdmission = new WeakMap<
+		object,
+		{ scope?: AttemptScope; sdkRunToken?: string; persistGeneration: number }
+	>();
 
 	/**
 	 * Capture what is true at the SYNCHRONOUS agent-event boundary, before any async work.
@@ -5218,6 +5391,11 @@ export class AgentSession {
 	}
 
 	#trackAgentEvent = (event: AgentEvent): Promise<void> => {
+		this.#agentEventAdmission.set(event, {
+			scope: this.#activeAttemptScope,
+			sdkRunToken: this.#activeSdkRunToken,
+			persistGeneration: this.#coordinatorPersistGeneration,
+		});
 		// First statement of the listener: the observation must precede every claim,
 		// reservation, and async hop this handler performs.
 		this.#observeCoordinatorToolEvent(event);
@@ -5287,10 +5465,10 @@ export class AgentSession {
 					this.#postPromptLeases.set(eventLease.resourceRunId, eventLease);
 				if (eventLease) {
 					await this.#runResourceLeaseContext.run(eventLease, () =>
-						this.#handleAgentEvent(event, activePromptHandle, canonicalAdmission),
+						this.#handleAgentEvent(event, activePromptHandle, canonicalAdmission, eventLease),
 					);
 				} else {
-					await this.#handleAgentEvent(event, activePromptHandle, canonicalAdmission);
+					await this.#handleAgentEvent(event, activePromptHandle, canonicalAdmission, undefined);
 				}
 			} catch (error) {
 				logger.warn("Agent event handler failed", { event: event.type, error: String(error) });
@@ -5298,11 +5476,19 @@ export class AgentSession {
 				canonicalAdmission?.release();
 				if (eventLease) {
 					const pendingAgentEnd =
-						event.type === "agent_end" && !maintenanceCheckpoint && this.#pendingAgentEndEmit === event
+						event.type === "agent_end" &&
+						!maintenanceCheckpoint &&
+						(this.#pendingAgentEndEmit === event || this.#deferredAgentEndLeases.has(event))
 							? this.#pendingAgentEndEmit
 							: undefined;
 					if (pendingAgentEnd) {
 						this.#deferredAgentEndLeases.set(pendingAgentEnd, eventLease);
+					} else if (
+						event.type === "agent_end" &&
+						!maintenanceCheckpoint &&
+						this.#deferredAgentEndLeases.has(event)
+					) {
+						// Fast publication took ownership of the lease before the handler unwound.
 					} else {
 						if (event.type === "agent_end" && this.#postPromptLeases.get(eventLease.resourceRunId) === eventLease)
 							this.#postPromptLeases.delete(eventLease.resourceRunId);
@@ -5325,6 +5511,36 @@ export class AgentSession {
 	/** Serializes sidecar writes in publication order, independent of write latency. */
 	#coordinatorPersistQueue: Promise<void> = Promise.resolve();
 
+	#recordPostPublicationOutcome(
+		context: { sessionId: string; cwd: string; sessionFile: string | undefined },
+		correlationId: string | undefined,
+		kind: "worker_integration" | "terminal_persistence",
+		outcome: { status: "completed" | "failed" | "timed_out"; error?: string },
+	): void {
+		if (outcome.status !== "completed") {
+			const correlation = correlationId ?? context.sessionId;
+			const safeError = sanitizePostPublicationError(outcome.error);
+			this.#emit({
+				type: "notice",
+				level: "error",
+				source: kind,
+				message: `${kind} ${outcome.status} for ${correlation}${safeError ? `: ${safeError}` : ""}`,
+			});
+		}
+		const persist = () =>
+			persistCoordinatorWorkerIntegrationOutcome(context, {
+				...outcome,
+				kind,
+				correlationId,
+				error: sanitizePostPublicationError(outcome.error),
+			});
+		const queued = this.#coordinatorPersistQueue.then(persist, persist);
+		this.#coordinatorPersistQueue = queued.catch(() => {});
+		void queued.catch(error =>
+			logger.warn("Failed to persist terminal reconciliation outcome", { error: String(error) }),
+		);
+	}
+
 	/**
 	 * Reserve this event's place in the sidecar write order.
 	 *
@@ -5337,10 +5553,19 @@ export class AgentSession {
 	 * its end. It describes a call that was never dispatched, and this file is read as the
 	 * answer to "what is this session doing right now".
 	 */
-	#queueCoordinatorRuntimeStatePersist(event: AgentSessionEvent): Promise<void> {
+	#queueCoordinatorRuntimeStatePersist(event: AgentSessionEvent, propagateFailure = false): Promise<void> {
 		if (isNonDispatchedToolEvent(event)) return Promise.resolve();
 		const observation = this.#coordinatorToolObservations.get(event);
-		const run = () => this.#persistRuntimeStateInBackground(event, observation);
+		const context = {
+			sessionId: this.sessionId,
+			cwd: this.sessionManager.getCwd(),
+			sessionFile: this.sessionManager.getSessionFile(),
+		};
+		const generation = this.#agentEventAdmission.get(event)?.persistGeneration ?? this.#coordinatorPersistGeneration;
+		const run = () =>
+			generation === this.#coordinatorPersistGeneration
+				? this.#persistRuntimeStateInBackground(event, context, observation, propagateFailure)
+				: Promise.resolve();
 		const queued = this.#coordinatorPersistQueue.then(run, run);
 		this.#coordinatorPersistQueue = queued.catch(() => {});
 		return queued;
@@ -5348,24 +5573,19 @@ export class AgentSession {
 
 	async #persistRuntimeStateInBackground(
 		event: AgentSessionEvent,
+		context: { sessionId: string; cwd: string; sessionFile: string | undefined },
 		observation: CoordinatorToolObservation | undefined,
+		propagateFailure: boolean,
 	): Promise<void> {
 		try {
-			await persistCoordinatorRuntimeStateFromEvent(
-				event,
-				{
-					sessionId: this.sessionId,
-					cwd: this.sessionManager.getCwd(),
-					sessionFile: this.sessionManager.getSessionFile(),
-				},
-				observation,
-			);
-		} catch {
+			await persistCoordinatorRuntimeStateFromEvent(event, context, observation);
+		} catch (error) {
 			logger.warn("Failed to persist coordinator runtime state", { event: event.type });
+			if (propagateFailure) throw error;
 		}
 	}
 
-	async #emitSessionEvent(event: AgentSessionEvent): Promise<void> {
+	async #emitSessionEvent(event: AgentSessionEvent, eventLease?: RunResourceProducerLease): Promise<void> {
 		const attemptScope = (event as AgentSessionEvent & { scope?: AttemptScope }).scope;
 		if (event.type === "turn_start") {
 			this.#extensionTurnGeneration++;
@@ -5399,6 +5619,18 @@ export class AgentSession {
 		// have unwound. Subscribers treat this event as the ready signal; flushing it
 		// from abort while either barrier is active permits a successor to race the
 		// prior prompt's cleanup.
+		const sdkTerminal =
+			event.type === "agent_end" && attemptScope !== undefined && this.#sdkRunTokensByAttemptScope.has(attemptScope);
+		if (
+			event.type === "agent_end" &&
+			sdkTerminal &&
+			this.#pendingAgentEndContinuationHolds.size === 0 &&
+			this.#pendingAgentEndEmit === undefined
+		) {
+			if (eventLease) this.#deferredAgentEndLeases.set(event, eventLease);
+			this.#startAgentEndPublication(event, eventLease);
+			return;
+		}
 		if (event.type === "agent_end" && (this.#livePromptsInFlight() > 0 || this.#agentEventHandlersInFlight > 0)) {
 			this.#pendingAgentEndEmit = event;
 			return;
@@ -5508,6 +5740,7 @@ export class AgentSession {
 		event: AgentEvent,
 		activePromptHandle?: string,
 		canonicalAdmission?: CanonicalMessageAdmission,
+		eventLease?: RunResourceProducerLease,
 	): Promise<void> => {
 		const attemptScope = (event as AgentEvent & { scope?: AttemptScope }).scope;
 
@@ -5847,7 +6080,7 @@ export class AgentSession {
 			});
 		}
 
-		await this.#emitSessionEvent(displayEvent);
+		await this.#emitSessionEvent(displayEvent, eventLease);
 		if (event.type === "message_end" && event.message.role === "assistant") {
 			this.#assistantAttemptScopes.set(event.message, {
 				scope: attemptScope,
@@ -6197,6 +6430,7 @@ export class AgentSession {
 						skipCompactionCheck: true,
 						resourceRunId: activePromptHandle,
 						maintenanceContinuation: true,
+						sdkRunToken: attemptScope ? this.#sdkRunTokensByAttemptScope.get(attemptScope) : undefined,
 					});
 				}
 				return;
@@ -6484,8 +6718,11 @@ export class AgentSession {
 		predecessorAgentEndHold?: symbol;
 		/** Internal predecessor terminal event sequestered while waiting behind selection. */
 		deferredPredecessorAgentEnd?: AgentSessionEvent;
+		/** Internal causal SDK owner captured when this continuation was scheduled. */
+		sdkRunToken?: string;
 	}): Promise<void> {
 		const continuationAdmission = this.#captureScheduledContinuationAdmission();
+		const scheduledSdkRunToken = options?.sdkRunToken;
 		const selectionFenceGeneration =
 			options?.selectionFenceGeneration ??
 			this.#selectionFenceGenerationContext.getStore() ??
@@ -6507,6 +6744,7 @@ export class AgentSession {
 						generation: deferredPromptGeneration,
 						selectionFenceGeneration,
 						deferredPredecessorAgentEnd,
+						sdkRunToken: scheduledSdkRunToken,
 					});
 				} finally {
 					// The recursive call synchronously re-reserved its settlement
@@ -6642,18 +6880,18 @@ export class AgentSession {
 												// agent_start (review P1); their queued messages are in-run
 												// consumptions, not own-run promotions.
 												const startsOwn = options?.maintenanceContinuation !== true;
-												const consumedSdkRunToken = startsOwn
-													? acceptance.consumedQueuedMessages
-															.map(message => this.#sdkRunTokensByQueuedMessage.get(message))
-															.find((token): token is string => token !== undefined)
-													: undefined;
+												const inheritedSdkRunToken = options?.continueQueuedOnly
+													? undefined
+													: (options?.sdkRunToken ?? scheduledSdkRunToken);
+												const consumedSdkRunToken = acceptance.consumedQueuedMessages
+													.map(message => this.#sdkRunTokensByQueuedMessage.get(message))
+													.find((token): token is string => token !== undefined);
+												const sdkRunToken = consumedSdkRunToken ?? inheritedSdkRunToken;
 												this.#fireQueuedPromotionHooks(acceptance.consumedQueuedMessages, {
 													startsOwnRun: startsOwn,
 												});
-												if (consumedSdkRunToken !== undefined)
-													this.#sdkRunTokensByAttemptScope.set(handle.scope, consumedSdkRunToken);
-												if (startsOwn) this.#activeSdkRunToken = consumedSdkRunToken;
-												this.#acceptRunHandle(handle);
+												if (startsOwn) this.#activeSdkRunToken = sdkRunToken;
+												this.#acceptSdkAttemptRun(handle, sdkRunToken);
 												options?.onRunAccepted?.(handle);
 												// Keep the queued token available through the acceptance callback;
 												// SDK follow-up owners bind it to the new attempt scope there.
@@ -6816,8 +7054,12 @@ export class AgentSession {
 		resourceRunId?: string,
 		deferredSelectionFenceGeneration?: number,
 		deferredPredecessorAgentEnd?: AgentSessionEvent,
+		sdkRunToken?: string,
 	): void {
 		const scheduledGeneration = generation;
+		const scheduledSdkRunToken =
+			sdkRunToken ??
+			(this.#activeAttemptScope ? this.#sdkRunTokensByAttemptScope.get(this.#activeAttemptScope) : undefined);
 		const continuationAuthorized = async (
 			signal: AbortSignal,
 			hasPendingNextTurnMessages = false,
@@ -6870,6 +7112,7 @@ export class AgentSession {
 						resourceRunId,
 						selectionFenceGeneration,
 						predecessorAgentEnd,
+						scheduledSdkRunToken,
 					);
 				} finally {
 					this.#endSelectionFenceDeferralTracking(selectionFenceGeneration);
@@ -6917,6 +7160,7 @@ export class AgentSession {
 								promptText,
 								{
 									skipPostPromptRecoveryWait: true,
+									sdkRunToken: scheduledSdkRunToken,
 									skipCompactionCheck: true,
 									predecessorAgentEndHold,
 									onFinalPreflight: ({ hasPendingNextTurnMessages }) =>
@@ -7694,16 +7938,16 @@ export class AgentSession {
 		this.#workerIntegrationScheduler?.enqueue();
 	}
 
-	async #flushWorkerIntegrationAttempt(): Promise<void> {
-		await this.#workerIntegrationScheduler?.flush();
+	async #flushWorkerIntegrationAttempt(): Promise<WorkerIntegrationOutcome> {
+		return (await this.#workerIntegrationScheduler?.flushWithOutcome()) ?? { status: "completed" };
 	}
 
-	async #flushWorkerIntegrationForAgentEnd(): Promise<void> {
+	async #flushWorkerIntegrationForAgentEnd(): Promise<WorkerIntegrationOutcome> {
 		if (!this.#workerIntegrationRequestedForTurn) {
 			this.#requestWorkerIntegrationAttempt();
 		}
 		try {
-			await this.#flushWorkerIntegrationAttempt();
+			return await this.#flushWorkerIntegrationAttempt();
 		} finally {
 			this.#workerIntegrationRequestedForTurn = false;
 		}
@@ -7716,6 +7960,9 @@ export class AgentSession {
 		workerIntegrationSettled = false,
 		scope?: AttemptScopeRef,
 	): Promise<void> {
+		const admission = this.#agentEventAdmission.get(event);
+		const activeAttemptScopeAtEvent = admission === undefined ? this.#activeAttemptScope : admission.scope;
+		const activeSdkRunTokenAtEvent = admission === undefined ? this.#activeSdkRunToken : admission.sdkRunToken;
 		if (event.type === "agent_end" && !workerIntegrationSettled) {
 			await this.#flushWorkerIntegrationForAgentEnd();
 		}
@@ -7726,7 +7973,7 @@ export class AgentSession {
 				? eventToken
 				: deliveryScope
 					? this.#sdkRunTokensByAttemptScope.get(deliveryScope as AttemptScope)
-					: this.#activeSdkRunToken;
+					: undefined;
 		const isTerminalAgentEnd =
 			event.type === "agent_end" && !(event.stopReason === "maintenance" && event.maintenanceOutcome !== "aborted");
 		const finishAttempt = () => {
@@ -7737,18 +7984,25 @@ export class AgentSession {
 			// unrelated enqueue.
 			this.yieldQueue.rearmIdle();
 			const isActiveAttempt =
-				deliveryScope === undefined ||
-				this.#activeAttemptScope === undefined ||
-				deliveryScope === this.#activeAttemptScope;
+				deliveryScope === undefined
+					? this.#activeAttemptScope === activeAttemptScopeAtEvent &&
+						this.#activeSdkRunToken === activeSdkRunTokenAtEvent
+					: deliveryScope === activeAttemptScopeAtEvent &&
+						deliveryScope === this.#activeAttemptScope &&
+						this.#activeSdkRunToken === activeSdkRunTokenAtEvent;
 			if (this.#foldStopRequested) {
 				this.#foldStopRequested = false;
 				this.agent.setSteeringAdmissionFence(undefined);
 			}
 			if (deliveryScope) {
 				this.#attemptRecordStore.retire(deliveryScope as AttemptScope);
-				this.#sdkRunTokensByAttemptScope.delete(deliveryScope as AttemptScope);
+				if (
+					activeSdkRunTokenAtEvent !== undefined &&
+					this.#sdkRunTokensByAttemptScope.get(deliveryScope as AttemptScope) === activeSdkRunTokenAtEvent
+				)
+					this.#sdkRunTokensByAttemptScope.delete(deliveryScope as AttemptScope);
 			}
-			if (isActiveAttempt && sdkRunToken === this.#activeSdkRunToken) this.#activeSdkRunToken = undefined;
+			if (isActiveAttempt) this.#activeSdkRunToken = undefined;
 			if (isActiveAttempt) {
 				this.#activeAttemptScope = undefined;
 				this.#activeLogicalRunId = undefined;
@@ -9665,6 +9919,7 @@ export class AgentSession {
 		if (this.#sessionAdmissionClosed || this.#isDisposed) throw this.#sessionAdmissionBusyError();
 		const inFlightPrompt = this.#beginInFlight();
 		let hindsightRecall: string | undefined;
+		let continuationSdkRunToken: string | undefined;
 		try {
 			const volatileProjectContextMessage = await this.#buildVolatileProjectContextMessage();
 			this.agent.appendMessage(volatileProjectContextMessage);
@@ -9700,14 +9955,18 @@ export class AgentSession {
 			await this.agent.continue({
 				...this.#managedFallbackPromptOptions(),
 				onRunAccepted: (handle: AttemptRunHandle) => {
-					this.#acceptRunHandle(handle);
+					continuationSdkRunToken = this.#activeSdkRunToken;
+					this.#acceptSdkAttemptRun(handle, continuationSdkRunToken);
 					if (hindsightRecall) hindsightState?.markRecallSnippetInjected(hindsightRecall);
 				},
 			});
-			await this.#waitForPostPromptRecovery();
+			if (continuationSdkRunToken === undefined) await this.#waitForPostPromptRecovery();
 		} finally {
 			this.#removeEphemeralCustomMessages();
-			await this.#settleEndedInFlight(inFlightPrompt);
+			await this.#settleEndedInFlight(
+				inFlightPrompt,
+				continuationSdkRunToken === undefined ? "full" : "publication",
+			);
 		}
 	}
 
@@ -9917,9 +10176,13 @@ export class AgentSession {
 		args = "",
 		options?: Pick<
 			PromptOptions,
-			"onPreflightAccepted" | "onPreflightAcceptCommit" | "onSkillPrepared" | "preflightSignal" | "sdkRunToken"
+			"onPreflightAccepted" | "onPreflightAcceptCommit" | "onSkillPrepared" | "preflightSignal" | "sdkRunCapability"
 		>,
 	): Promise<{ name: string; path: string; args?: string; lineCount?: number }> {
+		const internalOptions = {
+			...options,
+			sdkRunToken: readSdkRunCapability(options?.sdkRunCapability),
+		};
 		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		const skillName = name.trim();
 		if (!skillName) throw Object.assign(new Error("skill.invoke requires a skill name."), { code: "invalid_input" });
@@ -9965,7 +10228,7 @@ export class AgentSession {
 			lineCount: built.details.lineCount,
 			cleanedArgs: activation.cleanedArgs || undefined,
 		});
-		await this.promptCustomMessage(skillPromptMessage, options);
+		await this.promptCustomMessage(skillPromptMessage, internalOptions as InternalCustomMessageOptions);
 		return {
 			name: skill.name,
 			path: skill.filePath,
@@ -10655,6 +10918,10 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		const sdkRunToken = readSdkRunCapability(options?.sdkRunCapability);
+		const internalOptions: InternalPromptOptions | undefined = options
+			? { ...options, ...(sdkRunToken ? { sdkRunToken } : {}) }
+			: undefined;
 		this.#assertRecoveryHydrationPromoted();
 		const owner = this.#sessionAdmissionContext.getStore();
 		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
@@ -10669,14 +10936,19 @@ export class AgentSession {
 					await this.invokeSkill(
 						invocation.skill.name,
 						invocation.args,
-						options?.onPreflightAccepted || options?.onPreflightAcceptCommit || options?.preflightSignal
+						options?.onPreflightAccepted ||
+							options?.onPreflightAcceptCommit ||
+							options?.preflightSignal ||
+							internalOptions?.sdkRunToken
 							? {
-									...(options.onPreflightAccepted ? { onPreflightAccepted: options.onPreflightAccepted } : {}),
-									...(options.onPreflightAcceptCommit
+									...(options?.onPreflightAccepted
+										? { onPreflightAccepted: options.onPreflightAccepted }
+										: {}),
+									...(options?.onPreflightAcceptCommit
 										? { onPreflightAcceptCommit: options.onPreflightAcceptCommit }
 										: {}),
-									...(options.preflightSignal ? { preflightSignal: options.preflightSignal } : {}),
-									...(options.sdkRunToken ? { sdkRunToken: options.sdkRunToken } : {}),
+									...(options?.preflightSignal ? { preflightSignal: options.preflightSignal } : {}),
+									...(options?.sdkRunCapability ? { sdkRunCapability: options.sdkRunCapability } : {}),
 								}
 							: undefined,
 					);
@@ -10930,9 +11202,13 @@ export class AgentSession {
 			| "onPreflightAccepted"
 			| "onPreflightAcceptCommit"
 			| "preflightSignal"
-			| "sdkRunToken"
+			| "sdkRunCapability"
 		>,
 	): Promise<void> {
+		const sdkRunToken = readSdkRunCapability(options?.sdkRunCapability);
+		const internalOptions: InternalCustomMessageOptions | undefined = options
+			? { ...options, ...(sdkRunToken ? { sdkRunToken } : {}) }
+			: undefined;
 		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		const textContent =
 			typeof message.content === "string"
@@ -11001,7 +11277,7 @@ export class AgentSession {
 				};
 				try {
 					await this.#promptWithMessage(customMessage, textContent, {
-						...options,
+						...internalOptions,
 						onPreflightAccepted: undefined,
 						onPreflightAcceptCommit: commitAcceptance,
 						admissionLease: admission,
@@ -11032,8 +11308,8 @@ export class AgentSession {
 			| "onPreflightAccepted"
 			| "onPreflightAcceptCommit"
 			| "preflightSignal"
-			| "sdkRunToken"
 		> & {
+			sdkRunToken?: string;
 			prependMessages?: AgentMessage[];
 			skipPostPromptRecoveryWait?: boolean;
 			predecessorAgentEndHold?: symbol;
@@ -11100,6 +11376,9 @@ export class AgentSession {
 		const rosterClaim = this.#claimIrcRosterCandidate();
 		let hasPendingNextTurnMessages = false;
 		let pendingNextTurnMessageCount = 0;
+		let skipPostPromptRecoveryWait =
+			options?.skipPostPromptRecoveryWait === true || options?.sdkRunToken !== undefined;
+		let promptAttemptScope: AttemptScope | undefined;
 		let hindsightRecall: string | undefined;
 		try {
 			this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
@@ -11368,9 +11647,10 @@ export class AgentSession {
 				...this.#managedFallbackPromptOptions(),
 				...(options?.sdkRunToken ? { sdkRunToken: options.sdkRunToken } : {}),
 				onRunAccepted: (handle: AttemptRunHandle) => {
-					this.#acceptRunHandle(handle);
-					if (options?.sdkRunToken) {
-						this.#sdkRunTokensByAttemptScope.set(handle.scope, options.sdkRunToken);
+					promptAttemptScope = handle?.scope;
+					if (handle) this.#acceptSdkAttemptRun(handle, options?.sdkRunToken);
+					else this.#acceptRunHandle(handle);
+					if (handle && options?.sdkRunToken) {
 						this.#activeSdkRunToken = options.sdkRunToken;
 					}
 					options?.onRunAccepted?.(handle);
@@ -11405,6 +11685,20 @@ export class AgentSession {
 					options?.onPreflightAccepted?.();
 				},
 			});
+			const activeTerminalScope = this.#activeAttemptScope;
+			const terminalAttemptScope =
+				activeTerminalScope !== undefined &&
+				(this.#skipPostPromptRecoveryWaitByAttemptScope.has(activeTerminalScope) ||
+					(options?.sdkRunToken !== undefined &&
+						this.#sdkRunTokensByAttemptScope.get(activeTerminalScope) === options.sdkRunToken))
+					? activeTerminalScope
+					: promptAttemptScope;
+			if (
+				terminalAttemptScope !== undefined &&
+				this.#skipPostPromptRecoveryWaitByAttemptScope.delete(terminalAttemptScope)
+			) {
+				skipPostPromptRecoveryWait = true;
+			}
 			const terminalAssistant = this.#findLastAssistantMessage();
 			if (
 				rosterClaim &&
@@ -11414,7 +11708,7 @@ export class AgentSession {
 			) {
 				this.#commitIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
 			}
-			if (!options?.skipPostPromptRecoveryWait) {
+			if (!skipPostPromptRecoveryWait) {
 				await this.#waitForPostPromptRecovery();
 			}
 		} catch (error) {
@@ -11439,7 +11733,7 @@ export class AgentSession {
 				this.#releaseIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
 			}
 			this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
-			await this.#settleEndedInFlight(inFlightPrompt, options?.skipPostPromptRecoveryWait ? "publication" : "full");
+			await this.#settleEndedInFlight(inFlightPrompt, skipPostPromptRecoveryWait ? "publication" : "full");
 		}
 	}
 
@@ -11684,6 +11978,7 @@ export class AgentSession {
 			claimsGenuineUserIntent?: boolean;
 			onPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
 			external?: boolean;
+			sdkRunToken?: string;
 		},
 	): Promise<void> {
 		this.#assertNoHandoffTransition();
@@ -11698,6 +11993,7 @@ export class AgentSession {
 			this.#externalSteerAdmissionSeq.set(message, ++this.#steeringAdmissionSeq);
 			if (options.onPromoted) this.#steerPromotionHooks.set(message, options.onPromoted);
 		}
+		if (options?.sdkRunToken) this.#sdkRunTokensByQueuedMessage.set(message, options.sdkRunToken);
 		if (options?.claimsGenuineUserIntent) {
 			const epoch = this.#claimDeepInterviewUserIntent();
 			this.#deepInterviewGenuineUserMessageEpochs.set(message, epoch);
@@ -12280,9 +12576,11 @@ export class AgentSession {
 			/** Internal dispatch disposition used before actual queue consumption. */
 			onDispatchDisposition?: (promotion: { startsOwnRun: boolean }) => void;
 			preflightSignal?: AbortSignal;
-			sdkRunToken?: string;
+			sdkRunCapability?: unknown;
 		},
 	): Promise<void> {
+		const sdkRunToken = readSdkRunCapability(options?.sdkRunCapability);
+		const internalOptions = options ? { ...options, ...(sdkRunToken ? { sdkRunToken } : {}) } : undefined;
 		this.#assertRecoveryHydrationPromoted();
 		const owner = this.#sessionAdmissionContext.getStore();
 		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
@@ -12405,7 +12703,7 @@ export class AgentSession {
 					claimsGenuineUserIntent: true,
 					forceOneAtATime: Boolean(options?.preflightSignal || options?.queuedAtDispatch),
 					onPromoted: options?.onQueuedPromoted,
-					sdkRunToken: options?.sdkRunToken,
+					sdkRunToken: internalOptions?.sdkRunToken,
 				});
 				const cancelQueuedFollowUp = () => queuedFollowUp.cancel();
 				options?.preflightSignal?.addEventListener("abort", cancelQueuedFollowUp, { once: true });
@@ -12420,6 +12718,7 @@ export class AgentSession {
 					claimsGenuineUserIntent: true,
 					onPromoted: options?.onQueuedPromoted,
 					external: true,
+					sdkRunToken: internalOptions?.sdkRunToken,
 				});
 				options?.onPreflightAccepted?.();
 				return;
@@ -12439,6 +12738,7 @@ export class AgentSession {
 					claimsGenuineUserIntent: true,
 					onPromoted: options?.onQueuedPromoted,
 					external: true,
+					sdkRunToken: internalOptions?.sdkRunToken,
 				});
 				// Dispatch-race disposition (#4668 review P1): the SDK snapshot-decided
 				// this submission starts its own turn (idle at dispatch), but the
@@ -12464,7 +12764,7 @@ export class AgentSession {
 			await this.prompt(text, {
 				expandPromptTemplates: false,
 				images,
-				sdkRunToken: options?.sdkRunToken,
+				sdkRunToken: internalOptions?.sdkRunToken,
 				onPreflightAccepted: () => {
 					options?.onPreflightAccepted?.();
 					fireQueuedPromotion();
@@ -12479,7 +12779,7 @@ export class AgentSession {
 							}
 						: undefined,
 				preflightSignal: options?.preflightSignal,
-			});
+			} as InternalPromptOptions);
 		} finally {
 			releaseFollowUpReservation();
 		}
@@ -12988,6 +13288,7 @@ export class AgentSession {
 			| "tool_abort"
 			| "internal";
 		silent?: boolean;
+		sdkRunToken?: string;
 	}): void {
 		const abortGoalState = this.getGoalModeState();
 		this.#suppressNextGoalReminderAfterAbortGoalId =
@@ -13689,6 +13990,9 @@ export class AgentSession {
 						attribution: "user" as const,
 						timestamp: Date.now(),
 					};
+					const selectedSdkRunToken = selectedMessage
+						? this.#sdkRunTokensByQueuedMessage.get(selectedMessage)
+						: undefined;
 					const messageText =
 						message.role === "custom"
 							? this.#getCustomMessageTextContent(message)
@@ -13707,6 +14011,7 @@ export class AgentSession {
 						await this.#promptWithMessage(message, messageText, {
 							admissionLease: admission,
 							resetRetryReplaySafety: true,
+							sdkRunToken: selectedSdkRunToken,
 							onRunAccepted: () => {
 								runAccepted = true;
 								if (selected) this.#fireQueuedPromotionHooks([message], { startsOwnRun: true });
@@ -19268,6 +19573,9 @@ export class AgentSession {
 							const continuation = this.agent.continue({
 								...this.#managedFallbackPromptOptions(),
 								transientRecoveryMessage: this.#escapedNonAsciiRecoveryMessage(),
+								onRunAccepted: (handle: AttemptRunHandle) => {
+									this.#acceptSdkAttemptRun(handle, this.#activeSdkRunToken);
+								},
 							});
 							if (
 								cancellationSignal?.aborted ||
@@ -19306,6 +19614,9 @@ export class AgentSession {
 					await this.agent.continue({
 						...this.#managedFallbackPromptOptions(),
 						transientRecoveryMessage: this.#escapedNonAsciiRecoveryMessage(),
+						onRunAccepted: (handle: AttemptRunHandle) => {
+							this.#acceptSdkAttemptRun(handle, this.#activeSdkRunToken);
+						},
 					});
 				},
 			};
@@ -20249,7 +20560,12 @@ export class AgentSession {
 						this.#resolveRetry();
 						return;
 					}
-					await this.agent.continue(this.#managedFallbackPromptOptions());
+					await this.agent.continue({
+						...this.#managedFallbackPromptOptions(),
+						onRunAccepted: (handle: AttemptRunHandle) => {
+							this.#acceptSdkAttemptRun(handle, this.#activeSdkRunToken);
+						},
+					});
 					return;
 				} catch (error) {
 					const attempt = this.#retryAttempt;

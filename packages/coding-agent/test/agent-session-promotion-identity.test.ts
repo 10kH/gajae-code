@@ -11,6 +11,7 @@ import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
 import { z } from "zod";
+import { createSdkRunCapability } from "../src/sdk/host/sdk-run-capability";
 
 /**
  * Issue #4668 — production-path coverage for queued-promotion run identity.
@@ -229,11 +230,11 @@ describe("queued promotion run identity (#4668)", () => {
 		});
 		const queuedDone = session.sendUserMessage("deferred target", {
 			deliverAs: "followUp",
-			sdkRunToken: "deferred-target-token",
-			onQueuedPromoted: promotion => {
+			sdkRunCapability: createSdkRunCapability("deferred-target-token"),
+			onQueuedPromoted: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => {
 				if (promotion.removed) removals.push("deferred target");
 			},
-		});
+		} as never);
 		await queuedDone;
 		// The deferred target is displayed but NOT in the Agent live queue.
 		const entries = session.getQueuedMessageEntries();
@@ -283,11 +284,11 @@ describe("queued promotion run identity (#4668)", () => {
 		});
 		const queuedDone = session.sendUserMessage("deferred follow-up", {
 			deliverAs: "followUp",
-			sdkRunToken: "deferred-clear-token",
-			onQueuedPromoted: promotion => {
+			sdkRunCapability: createSdkRunCapability("deferred-clear-token"),
+			onQueuedPromoted: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => {
 				if (promotion.removed) removals.push("deferred follow-up");
 			},
-		});
+		} as never);
 		await queuedDone;
 		expect(session.agent.snapshotFollowUp()).toHaveLength(1);
 		const cleared = session.clearQueue();

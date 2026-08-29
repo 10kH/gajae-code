@@ -112,6 +112,35 @@ function fakeReconciliation(): {
 }
 
 describe("PromptDeadlineManager expiry reconciliation (#4668)", () => {
+	test("expires an accepted lease while reconciliation is barriered, without agent_start", async () => {
+		let now = 0;
+		const { reconciliation, state } = fakeReconciliation();
+		const claimStarted = Promise.withResolvers<void>();
+		const releaseClaim = Promise.withResolvers<void>();
+		state.claimStarted = claimStarted.resolve;
+		state.claimRelease = releaseClaim.promise;
+		let expired = 0;
+		const manager = new PromptDeadlineManager({
+			reconciliation: reconciliation as never,
+			getLeaseMs: () => 20,
+			getMaxMs: () => 60_000,
+			now: () => now,
+			onExpired: () => {
+				expired += 1;
+			},
+		});
+		const correlation = { commandId: "barrier-command", turnId: "barrier-turn" };
+		manager.onAccepted(correlation);
+		now = 20;
+		await claimStarted.promise;
+		expect(state.finalizeCalls).toBe(0);
+		releaseClaim.resolve();
+		await Bun.sleep(5);
+		expect(state.finalizeCodes).toContain("prompt_deadline_exceeded");
+		expect(expired).toBe(1);
+		expect(manager.has(correlation)).toBe(false);
+	});
+
 	test("retains lease and pending ownership when finalize fails, retires after durable confirmation", async () => {
 		const { reconciliation, state } = fakeReconciliation();
 		state.finalizeFailures = 1; // first expiry pass fails, the retry succeeds
