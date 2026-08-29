@@ -359,6 +359,106 @@ describe("Cursor request lifecycle", () => {
 		}
 	});
 
+	it("serializes multiple admitted exec responses before turn completion", async () => {
+		const { promise: releaseFirst, resolve: resolveFirst } = Promise.withResolvers<void>();
+		const server = http2.createServer();
+		server.on("stream", (stream: http2.ServerHttp2Stream) => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			stream.once("data", () => {
+				const read = (id: number) =>
+					create(AgentServerMessageSchema, {
+						message: {
+							case: "execServerMessage",
+							value: create(ExecServerMessageSchema, {
+								id,
+								message: { case: "readArgs", value: create(ReadArgsSchema, { path: `/tmp/${id}` }) },
+							}),
+						},
+					});
+				const ended = createTurnEndedMessage();
+				stream.end(
+					Buffer.concat([frameServerMessage(read(1)), frameServerMessage(read(2)), frameServerMessage(ended)]),
+				);
+			});
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", resolve);
+		});
+		try {
+			const address = server.address();
+			if (!address || typeof address === "string") throw new Error("Expected TCP server address");
+			const calls: number[] = [];
+			const consume = (async () => {
+				for await (const _event of streamCursor(
+					{ ...cursorModel, baseUrl: `http://127.0.0.1:${address.port}` },
+					{ messages: [{ role: "user", content: "read", timestamp: 0 }] },
+					{
+						apiKey: "test-token",
+						execHandlers: {
+							async read(args) {
+								const id = Number(args.path.slice(-1));
+								calls.push(id);
+								if (id === 1) await releaseFirst;
+								return { result: createReadSuccessResult(String(id)), toolResult: undefined };
+							},
+						},
+					},
+				)) {
+				}
+			})();
+			await Bun.sleep(10);
+			expect(calls).toEqual([1]);
+			resolveFirst();
+			await consume;
+			expect(calls).toEqual([1, 2]);
+		} finally {
+			await new Promise<void>(resolve => server.close(() => resolve()));
+		}
+	});
+
+	it("bounds a never-settling admitted handler after turnEnded", async () => {
+		const server = http2.createServer();
+		server.on("stream", (stream: http2.ServerHttp2Stream) => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			stream.once("data", () =>
+				stream.end(
+					Buffer.concat([
+						frameServerMessage(createReadExecMessage()),
+						frameServerMessage(createTurnEndedMessage()),
+					]),
+				),
+			);
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", resolve);
+		});
+		try {
+			const address = server.address();
+			if (!address || typeof address === "string") throw new Error("Expected TCP server address");
+			const events: string[] = [];
+			for await (const event of streamCursor(
+				{ ...cursorModel, baseUrl: `http://127.0.0.1:${address.port}` },
+				{ messages: [{ role: "user", content: "read", timestamp: 0 }] },
+				{
+					apiKey: "test-token",
+					streamIdleTimeoutMs: 10,
+					execHandlers: {
+						async read() {
+							await new Promise<void>(() => {});
+							return createReadSuccessResult("");
+						},
+					},
+				},
+			))
+				events.push(event.type);
+			expect(events).toContain("error");
+		} finally {
+			await new Promise<void>(resolve => server.close(() => resolve()));
+		}
+	});
+
 	it("settles an abort promptly and ignores a held handler response released afterward", async () => {
 		const { promise: releasePromise, resolve: releaseHandler } = Promise.withResolvers<void>();
 		const { promise: handlerStarted, resolve: markHandlerStarted } = Promise.withResolvers<void>();

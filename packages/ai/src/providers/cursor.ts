@@ -28,6 +28,7 @@ import type {
 import { normalizeSystemPrompts } from "../utils";
 import { kCursorExecResolved } from "../utils/block-symbols";
 import { AssistantMessageEventStream } from "../utils/event-stream";
+import { getStreamIdleTimeoutMs } from "../utils/idle-iterator";
 import { captureUnicodeEscapeEvidence, parseStreamingJson } from "../utils/json-parse";
 import { connectProxiedSocket, getProxyForUrl } from "../utils/proxy";
 import { formatErrorMessageWithRetryAfter } from "../utils/retry-after";
@@ -275,6 +276,7 @@ interface CursorRequestWriter {
 class CursorRequestCoordinator implements CursorRequestWriter {
 	#state: "open" | "draining" | "failed" | "succeeded" = "open";
 	#tasks = new Set<Promise<void>>();
+	#taskChain = Promise.resolve();
 	#frames: Uint8Array[] = [];
 	#writing = false;
 	#drainWaiters: Array<() => void> = [];
@@ -284,17 +286,21 @@ class CursorRequestCoordinator implements CursorRequestWriter {
 	#stopHeartbeat: () => void;
 	#onSuccess: () => void;
 	#onFailure: (error: Error) => void;
+	#drainTimer: NodeJS.Timeout | null = null;
+	#drainTimeoutMs: number | undefined;
 
 	constructor(
 		request: http2.ClientHttp2Stream,
 		stopHeartbeat: () => void,
 		onSuccess: () => void,
 		onFailure: (error: Error) => void,
+		drainTimeoutMs: number | undefined,
 	) {
 		this.#request = request;
 		this.#stopHeartbeat = stopHeartbeat;
 		this.#onSuccess = onSuccess;
 		this.#onFailure = onFailure;
+		this.#drainTimeoutMs = drainTimeoutMs;
 	}
 
 	isActive(): boolean {
@@ -328,15 +334,20 @@ class CursorRequestCoordinator implements CursorRequestWriter {
 		return () => this.#shellGates.delete(close);
 	}
 
-	admit(task: Promise<void>): void {
+	admit(taskFactory: () => Promise<void>): void {
 		if (!this.canAdmitTask()) return;
-		this.#tasks.add(task);
-		void task.then(
-			() => this.#tasks.delete(task),
+		const orderedTask = this.#taskChain.then(taskFactory);
+		this.#taskChain = orderedTask.then(
+			() => {},
 			error => {
-				this.#tasks.delete(task);
 				this.fail(error instanceof Error ? error : new Error(String(error)));
+				throw error;
 			},
+		);
+		this.#tasks.add(orderedTask);
+		void orderedTask.then(
+			() => this.#tasks.delete(orderedTask),
+			() => this.#tasks.delete(orderedTask),
 		);
 	}
 
@@ -344,11 +355,20 @@ class CursorRequestCoordinator implements CursorRequestWriter {
 		if (this.#state !== "open") return;
 		this.#state = "draining";
 		this.#stopHeartbeat();
+		if (this.#drainTimeoutMs !== undefined && this.#drainTimeoutMs > 0) {
+			this.#drainTimer = setTimeout(() => {
+				this.fail(new Error(`Cursor admitted work drain timed out after ${this.#drainTimeoutMs}ms`));
+			}, this.#drainTimeoutMs);
+		}
 		void Promise.all([...this.#tasks]).then(
 			() => {
 				if (this.#state !== "draining") return;
 				this.#drain(() => {
 					if (this.#state !== "draining") return;
+					if (this.#drainTimer) {
+						clearTimeout(this.#drainTimer);
+						this.#drainTimer = null;
+					}
 					this.#state = "succeeded";
 					this.#onSuccess();
 				});
@@ -361,6 +381,10 @@ class CursorRequestCoordinator implements CursorRequestWriter {
 		if (this.#state === "failed" || this.#state === "succeeded") return;
 		this.#state = "failed";
 		this.#failure = error;
+		if (this.#drainTimer) {
+			clearTimeout(this.#drainTimer);
+			this.#drainTimer = null;
+		}
 		this.#stopHeartbeat();
 		for (const close of this.#shellGates) close();
 		this.#shellGates.clear();
@@ -692,6 +716,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					rejectH2 = undefined;
 					reject?.(error);
 				},
+				getStreamIdleTimeoutMs(options?.streamIdleTimeoutMs),
 			);
 			h2Client.on("error", error => coordinator.fail(error));
 			h2Request.on("error", error => coordinator.fail(error));
@@ -771,6 +796,8 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 						const endError = parseConnectEndStream(messageBytes);
 						if (endError) {
 							coordinator.fail(endError);
+						} else {
+							coordinator.turnEnded();
 						}
 						continue;
 					}
@@ -783,21 +810,22 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 						// Serialize handlers: exec messages can be asynchronous, and resolving the
 						// request on turnEnded before prior handlers finish loses their responses.
 						if (!coordinator.canAdmitTask()) continue;
-						const task = handleServerMessage(
-							serverMessage,
-							output,
-							stream,
-							state,
-							blobStore,
-							coordinator,
-							options?.execHandlers,
-							options?.onToolResult,
-							usageState,
-							requestContextTools,
-							onConversationCheckpoint,
-							requestContextRules,
+						coordinator.admit(() =>
+							handleServerMessage(
+								serverMessage,
+								output,
+								stream,
+								state,
+								blobStore,
+								coordinator,
+								options?.execHandlers,
+								options?.onToolResult,
+								usageState,
+								requestContextTools,
+								onConversationCheckpoint,
+								requestContextRules,
+							),
 						);
-						coordinator.admit(task);
 
 						if (isTurnEnded) {
 							coordinator.turnEnded();
