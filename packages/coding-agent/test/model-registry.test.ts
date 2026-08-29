@@ -17,7 +17,6 @@ import {
 import { streamOpenAICompletions } from "@gajae-code/ai/providers/openai-completions";
 import { kNoAuth, MODEL_ROLE_IDS, ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import {
-	findInitialModel,
 	type ModelLookupRegistry,
 	resolveModelFromString,
 	resolveModelOverride,
