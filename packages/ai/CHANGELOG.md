@@ -17,6 +17,7 @@
 - API-key model discovery also retains the contributor-supplied static catalog for offline print-mode resolution, while live `ListAvailableModels` results remain authoritative when available.
 - Auth-gateway boot and dispatch are now provider-scoped: model catalogs reject cross-provider id ambiguity, Codex rows retain `openai-codex-responses`, and requests cannot borrow credentials from another provider.
 - Broker-backed gateway dispatch leases now remain held until the provider's transport-admission boundary, preventing lazy stream construction from releasing authority before outbound dispatch.
+## [0.15.4] - 2026-08-29
 
 ## [0.15.3] - 2026-08-27
 

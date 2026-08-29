@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.15.4] - 2026-08-29
+
 ### Added
 
 - Added opt-in adaptive compaction thresholding based on context fullness and recent call rate. The default remains disabled, fixed token thresholds keep precedence, and the bounded tracker resets after successful compaction to avoid repeated immediate compactions.
