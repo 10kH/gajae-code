@@ -266,6 +266,150 @@ function parseConnectEndStream(data: Uint8Array): Error | null {
 	}
 }
 
+interface CursorRequestWriter {
+	enqueue(frame: Uint8Array): void;
+	isActive(): boolean;
+	registerShellGate(close: () => void): () => void;
+}
+
+class CursorRequestCoordinator implements CursorRequestWriter {
+	#state: "open" | "draining" | "failed" | "succeeded" = "open";
+	#tasks = new Set<Promise<void>>();
+	#frames: Uint8Array[] = [];
+	#writing = false;
+	#drainWaiters: Array<() => void> = [];
+	#failure: Error | null = null;
+	#shellGates = new Set<() => void>();
+	#request: http2.ClientHttp2Stream;
+	#stopHeartbeat: () => void;
+	#onSuccess: () => void;
+	#onFailure: (error: Error) => void;
+
+	constructor(
+		request: http2.ClientHttp2Stream,
+		stopHeartbeat: () => void,
+		onSuccess: () => void,
+		onFailure: (error: Error) => void,
+	) {
+		this.#request = request;
+		this.#stopHeartbeat = stopHeartbeat;
+		this.#onSuccess = onSuccess;
+		this.#onFailure = onFailure;
+	}
+
+	isActive(): boolean {
+		return this.#state === "open" || this.#state === "draining";
+	}
+
+	canAdmitTask(): boolean {
+		return this.#state === "open";
+	}
+
+	hasTurnEnded(): boolean {
+		return this.#state === "draining" || this.#state === "succeeded";
+	}
+
+	failureError(): Error | null {
+		return this.#failure;
+	}
+
+	enqueue(frame: Uint8Array): void {
+		if (!this.isActive()) return;
+		this.#frames.push(Buffer.from(frame));
+		this.#writeNext();
+	}
+
+	registerShellGate(close: () => void): () => void {
+		if (!this.isActive()) {
+			close();
+			return () => {};
+		}
+		this.#shellGates.add(close);
+		return () => this.#shellGates.delete(close);
+	}
+
+	admit(task: Promise<void>): void {
+		if (!this.canAdmitTask()) return;
+		this.#tasks.add(task);
+		void task.then(
+			() => this.#tasks.delete(task),
+			error => {
+				this.#tasks.delete(task);
+				this.fail(error instanceof Error ? error : new Error(String(error)));
+			},
+		);
+	}
+
+	turnEnded(): void {
+		if (this.#state !== "open") return;
+		this.#state = "draining";
+		this.#stopHeartbeat();
+		void Promise.all([...this.#tasks]).then(
+			() => {
+				if (this.#state !== "draining") return;
+				this.#drain(() => {
+					if (this.#state !== "draining") return;
+					this.#state = "succeeded";
+					this.#onSuccess();
+				});
+			},
+			error => this.fail(error instanceof Error ? error : new Error(String(error))),
+		);
+	}
+
+	fail(error: Error): void {
+		if (this.#state === "failed" || this.#state === "succeeded") return;
+		this.#state = "failed";
+		this.#failure = error;
+		this.#stopHeartbeat();
+		for (const close of this.#shellGates) close();
+		this.#shellGates.clear();
+		this.#frames = [];
+		this.#writing = false;
+		this.#releaseDrains();
+		this.#request.close();
+		this.#onFailure(error);
+	}
+
+	#writeNext(): void {
+		if (this.#writing || !this.isActive()) return;
+		const frame = this.#frames.shift();
+		if (!frame) {
+			this.#releaseDrains();
+			return;
+		}
+		this.#writing = true;
+		try {
+			this.#request.write(frame, error => {
+				this.#writing = false;
+				if (error) {
+					this.fail(error);
+					return;
+				}
+				this.#writeNext();
+			});
+		} catch (error) {
+			this.#writing = false;
+			this.fail(error instanceof Error ? error : new Error(String(error)));
+		}
+	}
+
+	#drain(resolve: () => void): void {
+		if (!this.#writing && this.#frames.length === 0) {
+			resolve();
+			return;
+		}
+		this.#drainWaiters.push(resolve);
+	}
+
+	#releaseDrains(): void {
+		if (this.#writing || this.#frames.length > 0) return;
+		const waiters = this.#drainWaiters;
+		this.#drainWaiters = [];
+		for (const resolve of waiters) resolve();
+	}
+}
+
 function debugBytes(bytes: Uint8Array, asHex: boolean): string {
 	if (asHex) {
 		return Buffer.from(bytes).toString("hex");
@@ -474,40 +618,9 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		let h2Request: http2.ClientHttp2Stream | null = null;
 		let proxiedSocket: Awaited<ReturnType<typeof connectProxiedSocket>> | null = null;
 		let heartbeatTimer: NodeJS.Timeout | null = null;
-		let h2ClientErrorHandler: ((error: Error) => void) | undefined;
-		let h2RequestErrorHandler: ((error: Error) => void) | undefined;
 		let onAbort: (() => void) | undefined;
+		let coordinator: CursorRequestCoordinator = undefined!;
 		const baseUrl = model.baseUrl || CURSOR_API_URL;
-		const h2Completion = Promise.withResolvers<void>();
-		h2Completion.promise.catch(() => {});
-		let h2Settled = false;
-		let h2Failure: unknown;
-		let sawTurnEnded = false;
-		let responseEnded = false;
-		let queueDrained = false;
-		let endStreamError: Error | null = null;
-		const settleH2 = (error?: unknown): void => {
-			if (h2Settled) return;
-			h2Settled = true;
-			if (error !== undefined) {
-				h2Failure = mapH2TransportError(error, baseUrl);
-				h2Completion.reject(h2Failure);
-			} else {
-				h2Completion.resolve();
-			}
-		};
-		const settleH2WhenReady = (): void => {
-			if (!queueDrained) return;
-			if (endStreamError) {
-				settleH2(endStreamError);
-			} else if (sawTurnEnded) {
-				// A drained turnEnded is the successful terminal condition; Cursor
-				// may leave the HTTP/2 response open after sending it.
-				settleH2();
-			} else if (responseEnded) {
-				settleH2(new Error("Cursor HTTP/2 stream ended before turnEnded"));
-			}
-		};
 
 		try {
 			const apiKey = options?.apiKey;
@@ -544,8 +657,6 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			} else {
 				h2Client = http2.connect(baseUrl);
 			}
-			h2ClientErrorHandler = error => settleH2(error);
-			h2Client.on("error", h2ClientErrorHandler);
 
 			options?.onStreamCreated?.();
 			h2Request = h2Client.request({
@@ -560,8 +671,30 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				"x-cursor-client-type": "cli",
 				"x-request-id": crypto.randomUUID(),
 			});
-			h2RequestErrorHandler = error => settleH2(error);
-			h2Request.on("error", h2RequestErrorHandler);
+			const stopHeartbeat = () => {
+				if (heartbeatTimer) {
+					clearInterval(heartbeatTimer);
+					heartbeatTimer = null;
+				}
+			};
+			let resolveH2: (() => void) | undefined;
+			let rejectH2: ((error: Error) => void) | undefined;
+			coordinator = new CursorRequestCoordinator(
+				h2Request,
+				stopHeartbeat,
+				() => {
+					const resolve = resolveH2;
+					resolveH2 = undefined;
+					resolve?.();
+				},
+				error => {
+					const reject = rejectH2;
+					rejectH2 = undefined;
+					reject?.(error);
+				},
+			);
+			h2Client.on("error", error => coordinator.fail(error));
+			h2Request.on("error", error => coordinator.fail(error));
 
 			stream.push({ type: "start", partial: output });
 
@@ -603,38 +736,20 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				touchCursorConversation(conversationId);
 			};
 
-			const messageQueue = createCursorMessageQueueForTest(error => {
-				log("error", "handleServerMessage", { error: String(error) });
-			});
-			const drainMessageQueue = (): void => {
-				void messageQueue.drain().then(
-					() => {
-						queueDrained = true;
-						settleH2WhenReady();
-					},
-					error => {
-						queueDrained = true;
-						settleH2(error);
-					},
-				);
-			};
-
 			h2Request.on("trailers", trailers => {
 				const status = trailers["grpc-status"];
 				const msg = trailers["grpc-message"];
 				if (status && status !== "0") {
-					settleH2(new Error(`gRPC error ${status}: ${decodeURIComponent(String(msg || ""))}`));
+					coordinator.fail(new Error(`gRPC error ${status}: ${decodeURIComponent(String(msg || ""))}`));
 				}
 			});
 			h2Request.on("end", () => {
-				responseEnded = true;
-				drainMessageQueue();
+				if (!coordinator.hasTurnEnded()) {
+					coordinator.fail(new Error("Cursor stream ended before turnEnded"));
+				}
 			});
 			onAbort = () => {
-				h2Request?.close();
-				h2Client?.close();
-				proxiedSocket?.destroy();
-				settleH2(new Error("Request was aborted"));
+				coordinator.fail(new Error("Request was aborted"));
 			};
 			if (options?.signal) {
 				options.signal.addEventListener("abort", onAbort, { once: true });
@@ -653,14 +768,9 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					pendingBuffer = pendingBuffer.subarray(5 + msgLen);
 
 					if (flags & CONNECT_END_STREAM_FLAG) {
-						responseEnded = true;
 						const endError = parseConnectEndStream(messageBytes);
 						if (endError) {
-							endStreamError = endError;
-							settleH2(endError);
-							h2Request?.close();
-						} else {
-							drainMessageQueue();
+							coordinator.fail(endError);
 						}
 						continue;
 					}
@@ -672,26 +782,25 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 							serverMessage.message.value.message?.case === "turnEnded";
 						// Serialize handlers: exec messages can be asynchronous, and resolving the
 						// request on turnEnded before prior handlers finish loses their responses.
-						messageQueue.enqueue(() =>
-							handleServerMessage(
-								serverMessage,
-								output,
-								stream,
-								state,
-								blobStore,
-								h2Request!,
-								options?.execHandlers,
-								options?.onToolResult,
-								usageState,
-								requestContextTools,
-								onConversationCheckpoint,
-								requestContextRules,
-							),
+						if (!coordinator.canAdmitTask()) continue;
+						const task = handleServerMessage(
+							serverMessage,
+							output,
+							stream,
+							state,
+							blobStore,
+							coordinator,
+							options?.execHandlers,
+							options?.onToolResult,
+							usageState,
+							requestContextTools,
+							onConversationCheckpoint,
+							requestContextRules,
 						);
+						coordinator.admit(task);
 
 						if (isTurnEnded) {
-							sawTurnEnded = true;
-							drainMessageQueue();
+							coordinator.turnEnded();
 						}
 					} catch (e) {
 						log("error", "parseServerMessage", { error: String(e) });
@@ -699,24 +808,30 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				}
 			});
 
-			if (h2Settled) {
-				await h2Completion.promise;
-			}
-			h2Request.write(frameConnectMessage(requestBytes));
+			coordinator.enqueue(frameConnectMessage(requestBytes));
 
 			const sendHeartbeat = () => {
-				if (!h2Request || h2Request.closed) {
-					return;
-				}
+				if (!coordinator.isActive()) return;
 				const heartbeatMessage = create(AgentClientMessageSchema, {
 					message: { case: "clientHeartbeat", value: create(ClientHeartbeatSchema, {}) },
 				});
 				const heartbeatBytes = toBinary(AgentClientMessageSchema, heartbeatMessage);
-				h2Request.write(frameConnectMessage(heartbeatBytes));
+				coordinator.enqueue(frameConnectMessage(heartbeatBytes));
 			};
 
 			heartbeatTimer = setInterval(sendHeartbeat, 5000);
-			await h2Completion.promise;
+			await new Promise<void>((resolve, reject) => {
+				resolveH2 = resolve;
+				rejectH2 = reject;
+				const initialFailure = coordinator.failureError();
+				if (initialFailure) {
+					rejectH2 = undefined;
+					reject(initialFailure);
+				} else if (coordinator.hasTurnEnded() && !coordinator.isActive()) {
+					resolveH2 = undefined;
+					resolve();
+				}
+			});
 
 			if (state.currentTextBlock) {
 				const idx = output.content.indexOf(state.currentTextBlock);
@@ -763,8 +878,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		} catch (error) {
 			// Keep the completion promise terminal even for synchronous setup/write
 			// failures that may not emit a separate HTTP/2 error event.
-			if (!h2Settled) settleH2(error);
-			const mappedError = h2Failure ?? error;
+			const mappedError = mapH2TransportError(coordinator?.failureError() ?? error, baseUrl);
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorStatus = extractHttpStatusFromError(mappedError);
 			output.errorMessage = formatErrorMessageWithRetryAfter(mappedError);
@@ -780,13 +894,9 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			if (options?.signal && onAbort) {
 				options.signal.removeEventListener("abort", onAbort);
 			}
-			if (h2Request && h2RequestErrorHandler) {
-				h2Request.removeListener("error", h2RequestErrorHandler);
+			if (h2Request && !h2Request.closed && !h2Request.destroyed) {
+				h2Request.end();
 			}
-			if (h2Client && h2ClientErrorHandler) {
-				h2Client.removeListener("error", h2ClientErrorHandler);
-			}
-			h2Request?.close();
 			h2Client?.close();
 			proxiedSocket?.destroy();
 		}
@@ -823,7 +933,7 @@ async function handleServerMessage(
 	stream: AssistantMessageEventStream,
 	state: BlockState,
 	blobStore: Map<string, Uint8Array>,
-	h2Request: http2.ClientHttp2Stream,
+	writer: CursorRequestWriter,
 	execHandlers: CursorExecHandlers | undefined,
 	onToolResult: CursorToolResultHandler | undefined,
 	usageState: UsageState,
@@ -838,11 +948,11 @@ async function handleServerMessage(
 	if (msgCase === "interactionUpdate") {
 		processInteractionUpdate(msg.message.value, output, stream, state, usageState);
 	} else if (msgCase === "kvServerMessage") {
-		handleKvServerMessage(msg.message.value as KvServerMessage, blobStore, h2Request);
+		handleKvServerMessage(msg.message.value as KvServerMessage, blobStore, writer);
 	} else if (msgCase === "execServerMessage") {
 		await handleExecServerMessage(
 			msg.message.value as ExecServerMessage,
-			h2Request,
+			writer,
 			execHandlers,
 			onToolResult,
 			requestContextTools,
@@ -858,7 +968,7 @@ async function handleServerMessage(
 function handleKvServerMessage(
 	kvMsg: KvServerMessage,
 	blobStore: Map<string, Uint8Array>,
-	h2Request: http2.ClientHttp2Stream,
+	writer: CursorRequestWriter,
 ): void {
 	const kvCase = kvMsg.message.case;
 
@@ -881,7 +991,7 @@ function handleKvServerMessage(
 		});
 
 		const responseBytes = toBinary(AgentClientMessageSchema, kvClientMessage);
-		h2Request.write(frameConnectMessage(responseBytes));
+		writer.enqueue(frameConnectMessage(responseBytes));
 
 		log("kvClient", "getBlobResult", { blobId: blobIdKey.slice(0, 40) });
 	} else if (kvCase === "setBlobArgs") {
@@ -902,14 +1012,14 @@ function handleKvServerMessage(
 		});
 
 		const responseBytes = toBinary(AgentClientMessageSchema, kvClientMessage);
-		h2Request.write(frameConnectMessage(responseBytes));
+		writer.enqueue(frameConnectMessage(responseBytes));
 
 		log("kvClient", "setBlobResult", { blobId: blobIdKey.slice(0, 40) });
 	}
 }
 
 function sendShellStreamEvent(
-	h2Request: http2.ClientHttp2Stream,
+	h2Request: CursorRequestWriter,
 	execMsg: ExecServerMessage,
 	event: ShellStream["event"],
 ): void {
@@ -944,7 +1054,7 @@ function sanitizeShellExecResult(execResult: ShellResult): ShellResult {
 async function handleShellStreamArgs(
 	args: ShellArgs,
 	execMsg: ExecServerMessage,
-	h2Request: http2.ClientHttp2Stream,
+	h2Request: CursorRequestWriter,
 	execHandlers: CursorExecHandlers | undefined,
 	onToolResult: CursorToolResultHandler | undefined,
 ): Promise<void> {
@@ -965,6 +1075,12 @@ async function handleShellStreamArgs(
 	// Buffer for incomplete ANSI sequences across chunks
 	let stdoutBuffer = "";
 	let stderrBuffer = "";
+	let callbacksOpen = true;
+	const unregisterShellGate = h2Request.registerShellGate(() => {
+		callbacksOpen = false;
+		if (stdoutFlushTimer) clearTimeout(stdoutFlushTimer);
+		if (stderrFlushTimer) clearTimeout(stderrFlushTimer);
+	});
 
 	const incompleteEscapeRegex = /\x1b(|\[|\[\d*|\[\?|\[\?\d*|\]\d*;?)$/;
 
@@ -1029,6 +1145,7 @@ async function handleShellStreamArgs(
 
 	const streamCallbacks: CursorShellStreamCallbacks = {
 		onStdout(data: string) {
+			if (!callbacksOpen || !h2Request.isActive()) return;
 			stdoutBuffer += data;
 			if (stdoutBuffer.includes("\n") || stdoutBuffer.length > 4096) {
 				if (stdoutFlushTimer) {
@@ -1041,6 +1158,7 @@ async function handleShellStreamArgs(
 			}
 		},
 		onStderr(data: string) {
+			if (!callbacksOpen || !h2Request.isActive()) return;
 			stderrBuffer += data;
 			if (stderrBuffer.includes("\n") || stderrBuffer.length > 4096) {
 				if (stderrFlushTimer) {
@@ -1087,12 +1205,14 @@ async function handleShellStreamArgs(
 	// Send the final structured shellResult as completion acknowledgement.
 	sendExecClientMessage(h2Request, execMsg, "shellResult", sanitizedExecResult);
 	sendExecClientStreamClose(h2Request, execMsg);
+	callbacksOpen = false;
+	unregisterShellGate();
 
 	log("shellStream", "done", { elapsed: Date.now() - startTs });
 }
 
 function sendShellStreamExitFromResult(
-	h2Request: http2.ClientHttp2Stream,
+	h2Request: CursorRequestWriter,
 	execMsg: ExecServerMessage,
 	execResult: ShellResult,
 	sendBufferedOutput: boolean,
@@ -1201,7 +1321,7 @@ function sendShellStreamExitFromResult(
 
 async function handleExecServerMessage(
 	execMsg: ExecServerMessage,
-	h2Request: http2.ClientHttp2Stream,
+	h2Request: CursorRequestWriter,
 	execHandlers: CursorExecHandlers | undefined,
 	onToolResult: CursorToolResultHandler | undefined,
 	requestContextTools: McpToolDefinition[],
@@ -1620,7 +1740,7 @@ async function handleExecServerMessage(
 }
 
 function sendExecClientMessage<TCase extends NonNullable<ExecClientMessage["message"]["case"]>>(
-	h2Request: http2.ClientHttp2Stream,
+	h2Request: CursorRequestWriter,
 	execMsg: ExecServerMessage,
 	messageCase: TCase,
 	value: Extract<ExecClientMessage["message"], { case: TCase }>["value"],
@@ -1636,13 +1756,13 @@ function sendExecClientMessage<TCase extends NonNullable<ExecClientMessage["mess
 	});
 
 	const responseBytes = toBinary(AgentClientMessageSchema, clientMessage);
-	h2Request.write(frameConnectMessage(responseBytes));
+	h2Request.enqueue(frameConnectMessage(responseBytes));
 
 	log("execClientMessage", messageCase, value);
 }
 
 function sendExecClientThrow(
-	h2Request: http2.ClientHttp2Stream,
+	h2Request: CursorRequestWriter,
 	execMsg: ExecServerMessage,
 	error: string,
 	errorCode: string,
@@ -1656,11 +1776,11 @@ function sendExecClientThrow(
 	const clientMessage = create(AgentClientMessageSchema, {
 		message: { case: "execClientControlMessage", value: controlMessage },
 	});
-	h2Request.write(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
+	h2Request.enqueue(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
 	sendExecClientStreamClose(h2Request, execMsg);
 }
 
-function sendExecClientStreamClose(h2Request: http2.ClientHttp2Stream, execMsg: ExecServerMessage): void {
+function sendExecClientStreamClose(h2Request: CursorRequestWriter, execMsg: ExecServerMessage): void {
 	const closeMessage = create(ExecClientControlMessageSchema, {
 		message: {
 			case: "streamClose",
@@ -1673,7 +1793,7 @@ function sendExecClientStreamClose(h2Request: http2.ClientHttp2Stream, execMsg: 
 		message: { case: "execClientControlMessage", value: closeMessage },
 	});
 	const responseBytes = toBinary(AgentClientMessageSchema, clientMessage);
-	h2Request.write(frameConnectMessage(responseBytes));
+	h2Request.enqueue(frameConnectMessage(responseBytes));
 	log("execClientControl", "streamClose", { id: execMsg.id, execId: execMsg.execId });
 }
 

@@ -1,4 +1,6 @@
 import { describe, expect, it } from "bun:test";
+import * as http2 from "node:http2";
+import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import {
 	buildCursorHistoryForTest,
 	buildCursorRequestContextRules,
@@ -7,8 +9,23 @@ import {
 	resolveExecHandler,
 	streamCursor,
 } from "../src/providers/cursor";
-import type { AgentRunRequest } from "../src/providers/cursor/gen/agent_pb";
-import type { Context, Model } from "../src/types";
+import {
+	type AgentClientMessage,
+	AgentClientMessageSchema,
+	type AgentRunRequest,
+	type AgentServerMessage,
+	AgentServerMessageSchema,
+	ExecServerMessageSchema,
+	InteractionUpdateSchema,
+	ReadArgsSchema,
+	ReadResultSchema,
+	ReadSuccessSchema,
+	ShellArgsSchema,
+	ShellResultSchema,
+	ShellSuccessSchema,
+	TurnEndedUpdateSchema,
+} from "../src/providers/cursor/gen/agent_pb";
+import type { AssistantMessageEvent, Context, CursorShellStreamCallbacks, Model } from "../src/types";
 
 const cursorModel: Model<"cursor-agent"> = {
 	id: "cursor-composer-2.5",
@@ -41,6 +58,72 @@ function captureCursorPayload(context: Context): Promise<AgentRunRequest> {
 
 function isAgentRunRequest(payload: unknown): payload is AgentRunRequest {
 	return !!payload && typeof payload === "object" && "$typeName" in payload;
+}
+
+function frameServerMessage(message: AgentServerMessage): Buffer {
+	const bytes = toBinary(AgentServerMessageSchema, message);
+	return frameConnectPayload(bytes);
+}
+
+function frameConnectPayload(bytes: Uint8Array, flags = 0): Buffer {
+	const frame = Buffer.alloc(5 + bytes.length);
+	frame[0] = flags;
+	frame.writeUInt32BE(bytes.length, 1);
+	frame.set(bytes, 5);
+	return frame;
+}
+
+function decodeClientMessages(chunks: Buffer[]): AgentClientMessage[] {
+	let pending = Buffer.concat(chunks);
+	const messages: AgentClientMessage[] = [];
+	while (pending.length >= 5) {
+		const length = pending.readUInt32BE(1);
+		if (pending.length < 5 + length) break;
+		messages.push(fromBinary(AgentClientMessageSchema, pending.subarray(5, 5 + length)));
+		pending = pending.subarray(5 + length);
+	}
+	return messages;
+}
+
+function createReadExecMessage(id = 1): AgentServerMessage {
+	return create(AgentServerMessageSchema, {
+		message: {
+			case: "execServerMessage",
+			value: create(ExecServerMessageSchema, {
+				id,
+				message: {
+					case: "readArgs",
+					value: create(ReadArgsSchema, { path: "/tmp/example" }),
+				},
+			}),
+		},
+	});
+}
+
+function createTurnEndedMessage(): AgentServerMessage {
+	return create(AgentServerMessageSchema, {
+		message: {
+			case: "interactionUpdate",
+			value: create(InteractionUpdateSchema, {
+				message: {
+					case: "turnEnded",
+					value: create(TurnEndedUpdateSchema, {}),
+				},
+			}),
+		},
+	});
+}
+
+function createReadSuccessResult(output: string) {
+	return create(ReadResultSchema, {
+		result: {
+			case: "success",
+			value: create(ReadSuccessSchema, {
+				path: "/tmp/example",
+				output: { case: "content", value: output },
+			}),
+		},
+	});
 }
 
 describe("Cursor resolveExecHandler execHandlers binding", () => {
@@ -161,6 +244,628 @@ describe("Cursor server message ordering", () => {
 		await expect(rejected).rejects.toThrow("handler failed");
 		await next;
 		expect(events).toEqual(["first", "second"]);
+	});
+});
+
+describe("Cursor request lifecycle", () => {
+	it("drains an admitted exec response before completing after turnEnded", async () => {
+		const { promise: releasePromise, resolve: releaseHandler } = Promise.withResolvers<void>();
+		const { promise: handlerStarted, resolve: markHandlerStarted } = Promise.withResolvers<void>();
+		const { promise: responseReceived, resolve: markResponseReceived } = Promise.withResolvers<void>();
+		const server = http2.createServer();
+		const clientResponseChunks: Buffer[] = [];
+
+		server.on("stream", (stream: http2.ServerHttp2Stream) => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			let receivedRequest = false;
+			stream.on("data", (chunk: Buffer) => {
+				if (receivedRequest) {
+					clientResponseChunks.push(chunk);
+					const messages = decodeClientMessages(clientResponseChunks);
+					if (
+						messages.some(
+							message =>
+								message.message.case === "execClientMessage" &&
+								message.message.value.message.case === "readResult",
+						)
+					) {
+						markResponseReceived();
+						stream.end();
+					}
+					return;
+				}
+				receivedRequest = true;
+				const execMessage = create(AgentServerMessageSchema, {
+					message: {
+						case: "execServerMessage",
+						value: create(ExecServerMessageSchema, {
+							id: 1,
+							message: {
+								case: "readArgs",
+								value: create(ReadArgsSchema, { path: "/tmp/example" }),
+							},
+						}),
+					},
+				});
+				const turnEnded = create(AgentServerMessageSchema, {
+					message: {
+						case: "interactionUpdate",
+						value: create(InteractionUpdateSchema, {
+							message: {
+								case: "turnEnded",
+								value: create(TurnEndedUpdateSchema, {}),
+							},
+						}),
+					},
+				});
+				stream.end(Buffer.concat([frameServerMessage(execMessage), frameServerMessage(turnEnded)]));
+			});
+		});
+
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", resolve);
+		});
+
+		try {
+			const address = server.address();
+			if (!address || typeof address === "string") throw new Error("Expected TCP server address");
+			const events: string[] = [];
+			const model = { ...cursorModel, baseUrl: `http://127.0.0.1:${address.port}` };
+			const consume = (async () => {
+				for await (const event of streamCursor(
+					model,
+					{ messages: [{ role: "user", content: "read", timestamp: 0 }] },
+					{
+						apiKey: "test-token",
+						execHandlers: {
+							async read() {
+								markHandlerStarted();
+								await releasePromise;
+								return {
+									result: create(ReadResultSchema, {
+										result: {
+											case: "success",
+											value: create(ReadSuccessSchema, {
+												path: "/tmp/example",
+												output: { case: "content", value: "ok" },
+											}),
+										},
+									}),
+									toolResult: undefined,
+								};
+							},
+						},
+					},
+				)) {
+					events.push(event.type);
+				}
+			})();
+
+			await handlerStarted;
+			expect(events).not.toContain("done");
+			releaseHandler();
+			await responseReceived;
+			await consume;
+			expect(events.filter(type => type === "done")).toHaveLength(1);
+			expect(events).not.toContain("error");
+			const clientMessages = decodeClientMessages(clientResponseChunks);
+			const clientMessageCases = clientMessages.map(message =>
+				message.message.case === "execClientMessage" ? message.message.value.message.case : message.message.case,
+			);
+			expect(clientMessageCases).toContain("readResult");
+		} finally {
+			await new Promise<void>(resolve => server.close(() => resolve()));
+		}
+	});
+
+	it("settles an abort promptly and ignores a held handler response released afterward", async () => {
+		const { promise: releasePromise, resolve: releaseHandler } = Promise.withResolvers<void>();
+		const { promise: handlerStarted, resolve: markHandlerStarted } = Promise.withResolvers<void>();
+		const server = http2.createServer();
+		server.on("stream", (stream: http2.ServerHttp2Stream) => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			stream.once("data", () => {
+				stream.write(
+					frameServerMessage(
+						create(AgentServerMessageSchema, {
+							message: {
+								case: "execServerMessage",
+								value: create(ExecServerMessageSchema, {
+									id: 1,
+									message: {
+										case: "readArgs",
+										value: create(ReadArgsSchema, { path: "/tmp/example" }),
+									},
+								}),
+							},
+						}),
+					),
+				);
+			});
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", resolve);
+		});
+
+		try {
+			const address = server.address();
+			if (!address || typeof address === "string") throw new Error("Expected TCP server address");
+			const controller = new AbortController();
+			const events: string[] = [];
+			const terminalReasons: string[] = [];
+			const consume = (async () => {
+				for await (const event of streamCursor(
+					{ ...cursorModel, baseUrl: `http://127.0.0.1:${address.port}` },
+					{ messages: [{ role: "user", content: "read", timestamp: 0 }] },
+					{
+						apiKey: "test-token",
+						signal: controller.signal,
+						execHandlers: {
+							async read() {
+								markHandlerStarted();
+								await releasePromise;
+								return {
+									result: create(ReadResultSchema, {
+										result: {
+											case: "success",
+											value: create(ReadSuccessSchema, {
+												path: "/tmp/example",
+												output: { case: "content", value: "late" },
+											}),
+										},
+									}),
+									toolResult: undefined,
+								};
+							},
+						},
+					},
+				)) {
+					events.push(event.type);
+					if (event.type === "error") terminalReasons.push(event.reason);
+				}
+			})();
+
+			await handlerStarted;
+			controller.abort();
+			await consume;
+			expect(events.filter(type => type === "error")).toHaveLength(1);
+			expect(terminalReasons).toEqual(["aborted"]);
+			expect(events).not.toContain("done");
+			releaseHandler();
+			await Promise.resolve();
+			expect(events.filter(type => type === "error")).toHaveLength(1);
+		} finally {
+			releaseHandler();
+			await new Promise<void>(resolve => server.close(() => resolve()));
+		}
+	});
+
+	it("makes retained shell callbacks inert when aborting a held handler", async () => {
+		const { promise: releasePromise, resolve: releaseHandler } = Promise.withResolvers<void>();
+		const { promise: handlerStarted, resolve: markHandlerStarted } = Promise.withResolvers<void>();
+		const { promise: handlerFinished, resolve: markHandlerFinished } = Promise.withResolvers<void>();
+		const { promise: firstClientFrame, resolve: markFirstClientFrame } = Promise.withResolvers<void>();
+		const server = http2.createServer();
+		const clientChunks: Buffer[] = [];
+		server.on("stream", (stream: http2.ServerHttp2Stream) => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			let receivedRequest = false;
+			stream.on("data", (chunk: Buffer) => {
+				if (receivedRequest) {
+					clientChunks.push(chunk);
+					markFirstClientFrame();
+					return;
+				}
+				receivedRequest = true;
+				stream.write(
+					frameServerMessage(
+						create(AgentServerMessageSchema, {
+							message: {
+								case: "execServerMessage",
+								value: create(ExecServerMessageSchema, {
+									id: 2,
+									execId: "shell-2",
+									message: {
+										case: "shellStreamArgs",
+										value: create(ShellArgsSchema, {
+											command: "printf test",
+											workingDirectory: "/tmp",
+										}),
+									},
+								}),
+							},
+						}),
+					),
+				);
+			});
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", resolve);
+		});
+
+		let retainedCallbacks: CursorShellStreamCallbacks | undefined;
+		try {
+			const address = server.address();
+			if (!address || typeof address === "string") throw new Error("Expected TCP server address");
+			const controller = new AbortController();
+			const events: string[] = [];
+			const terminalReasons: string[] = [];
+			const consume = (async () => {
+				for await (const event of streamCursor(
+					{ ...cursorModel, baseUrl: `http://127.0.0.1:${address.port}` },
+					{ messages: [{ role: "user", content: "shell", timestamp: 0 }] },
+					{
+						apiKey: "test-token",
+						signal: controller.signal,
+						execHandlers: {
+							async shellStream(_args, callbacks) {
+								retainedCallbacks = callbacks;
+								markHandlerStarted();
+								await releasePromise;
+								markHandlerFinished();
+								return {
+									result: create(ShellResultSchema, {
+										result: {
+											case: "success",
+											value: create(ShellSuccessSchema, {
+												command: "printf test",
+												workingDirectory: "/tmp",
+											}),
+										},
+									}),
+									toolResult: undefined,
+								};
+							},
+						},
+					},
+				)) {
+					events.push(event.type);
+					if (event.type === "error") terminalReasons.push(event.reason);
+				}
+			})();
+
+			await handlerStarted;
+			await firstClientFrame;
+			controller.abort();
+			await consume;
+			const chunksAfterAbort = clientChunks.length;
+			retainedCallbacks?.onStdout("late output");
+			retainedCallbacks?.onStderr("late error");
+			releaseHandler();
+			await handlerFinished;
+			expect(clientChunks).toHaveLength(chunksAfterAbort);
+			expect(events.filter(type => type === "error")).toHaveLength(1);
+			expect(terminalReasons).toEqual(["aborted"]);
+			expect(events).not.toContain("done");
+		} finally {
+			releaseHandler();
+			await new Promise<void>(resolve => server.close(() => resolve()));
+		}
+	});
+
+	it.each([
+		{
+			name: "non-zero trailers",
+			terminate(stream: http2.ServerHttp2Stream) {
+				stream.end();
+			},
+			respond(stream: http2.ServerHttp2Stream) {
+				stream.respond({ ":status": 200, "content-type": "application/connect+proto" }, { waitForTrailers: true });
+				stream.once("wantTrailers", () => {
+					stream.sendTrailers({ "grpc-status": "13", "grpc-message": "trailer failure" });
+				});
+			},
+			error: "gRPC error 13: trailer failure",
+		},
+		{
+			name: "Connect end-stream error",
+			terminate(stream: http2.ServerHttp2Stream) {
+				stream.write(
+					frameConnectPayload(
+						Buffer.from(JSON.stringify({ error: { code: "internal", message: "end-stream failure" } })),
+						0b00000010,
+					),
+				);
+			},
+			respond(stream: http2.ServerHttp2Stream) {
+				stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			},
+			error: "Connect error internal: end-stream failure",
+		},
+		{
+			name: "request/session failure",
+			terminate(stream: http2.ServerHttp2Stream) {
+				stream.close(http2.constants.NGHTTP2_INTERNAL_ERROR);
+			},
+			respond(stream: http2.ServerHttp2Stream) {
+				stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			},
+			error: "",
+		},
+	])("settles $name once while an exec handler is held", async ({ terminate, respond, error }) => {
+		const { promise: releasePromise, resolve: releaseHandler } = Promise.withResolvers<void>();
+		const { promise: handlerStarted, resolve: markHandlerStarted } = Promise.withResolvers<void>();
+		const { promise: handlerFinished, resolve: markHandlerFinished } = Promise.withResolvers<void>();
+		const clientChunks: Buffer[] = [];
+		const server = http2.createServer();
+		let request: http2.ServerHttp2Stream | undefined;
+		server.on("stream", (stream: http2.ServerHttp2Stream) => {
+			request = stream;
+			stream.on("error", () => {});
+			respond(stream);
+			let receivedRequest = false;
+			stream.on("data", (chunk: Buffer) => {
+				if (receivedRequest) {
+					clientChunks.push(chunk);
+					return;
+				}
+				receivedRequest = true;
+				stream.write(frameServerMessage(createReadExecMessage()));
+			});
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", resolve);
+		});
+
+		try {
+			const address = server.address();
+			if (!address || typeof address === "string") throw new Error("Expected TCP server address");
+			const events: AssistantMessageEvent[] = [];
+			const consume = (async () => {
+				for await (const event of streamCursor(
+					{ ...cursorModel, baseUrl: `http://127.0.0.1:${address.port}` },
+					{ messages: [{ role: "user", content: "read", timestamp: 0 }] },
+					{
+						apiKey: "test-token",
+						execHandlers: {
+							async read() {
+								markHandlerStarted();
+								await releasePromise;
+								markHandlerFinished();
+								return { result: createReadSuccessResult("late"), toolResult: undefined };
+							},
+						},
+					},
+				)) {
+					events.push(event);
+				}
+			})();
+
+			await handlerStarted;
+			if (!request) throw new Error("Expected Cursor request stream");
+			terminate(request);
+			await consume;
+			const terminalEvents = events.filter(event => event.type === "done" || event.type === "error");
+			expect(terminalEvents).toHaveLength(1);
+			const terminal = terminalEvents[0];
+			if (terminal.type !== "error") throw new Error("Expected terminal Cursor error");
+			expect(terminal.reason).toBe("error");
+			if (error) expect(terminal.error.errorMessage).toContain(error);
+			const framesAtTerminal = clientChunks.length;
+			releaseHandler();
+			await handlerFinished;
+			expect(clientChunks).toHaveLength(framesAtTerminal);
+		} finally {
+			releaseHandler();
+			await new Promise<void>(resolve => server.close(() => resolve()));
+		}
+	});
+
+	it("lets terminal failure preempt turnEnded while an admitted exec handler is held", async () => {
+		const { promise: releasePromise, resolve: releaseHandler } = Promise.withResolvers<void>();
+		const { promise: handlerStarted, resolve: markHandlerStarted } = Promise.withResolvers<void>();
+		const { promise: handlerFinished, resolve: markHandlerFinished } = Promise.withResolvers<void>();
+		const clientChunks: Buffer[] = [];
+		const server = http2.createServer();
+		server.on("stream", (stream: http2.ServerHttp2Stream) => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			stream.on("data", (chunk: Buffer) => clientChunks.push(chunk));
+			stream.once("data", () => {
+				stream.write(
+					Buffer.concat([
+						frameServerMessage(createReadExecMessage()),
+						frameServerMessage(createTurnEndedMessage()),
+						frameConnectPayload(
+							Buffer.from(JSON.stringify({ error: { code: "internal", message: "terminal race" } })),
+							0b00000010,
+						),
+					]),
+				);
+			});
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", resolve);
+		});
+
+		try {
+			const address = server.address();
+			if (!address || typeof address === "string") throw new Error("Expected TCP server address");
+			const events: AssistantMessageEvent[] = [];
+			const consume = (async () => {
+				for await (const event of streamCursor(
+					{ ...cursorModel, baseUrl: `http://127.0.0.1:${address.port}` },
+					{ messages: [{ role: "user", content: "read", timestamp: 0 }] },
+					{
+						apiKey: "test-token",
+						execHandlers: {
+							async read() {
+								markHandlerStarted();
+								await releasePromise;
+								markHandlerFinished();
+								return { result: createReadSuccessResult("late"), toolResult: undefined };
+							},
+						},
+					},
+				)) {
+					events.push(event);
+				}
+			})();
+
+			await handlerStarted;
+			await consume;
+			const terminalEvents = events.filter(event => event.type === "done" || event.type === "error");
+			expect(terminalEvents).toHaveLength(1);
+			const terminal = terminalEvents[0];
+			if (terminal.type !== "error") throw new Error("Expected terminal Cursor error");
+			expect(terminal.error.errorMessage).toContain("terminal race");
+			const framesAtTerminal = clientChunks.length;
+			releaseHandler();
+			await handlerFinished;
+			expect(clientChunks).toHaveLength(framesAtTerminal);
+		} finally {
+			releaseHandler();
+			await new Promise<void>(resolve => server.close(() => resolve()));
+		}
+	});
+
+	it("orders normal shell frames and makes retained callbacks inert after completion", async () => {
+		const { promise: shellCompleted, resolve: markShellCompleted } = Promise.withResolvers<void>();
+		const server = http2.createServer();
+		const clientChunks: Buffer[] = [];
+		server.on("stream", (stream: http2.ServerHttp2Stream) => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			let receivedRequest = false;
+			let sentTerminal = false;
+			stream.on("data", (chunk: Buffer) => {
+				if (!receivedRequest) {
+					receivedRequest = true;
+					stream.write(
+						frameServerMessage(
+							create(AgentServerMessageSchema, {
+								message: {
+									case: "execServerMessage",
+									value: create(ExecServerMessageSchema, {
+										id: 3,
+										execId: "shell-3",
+										message: {
+											case: "shellStreamArgs",
+											value: create(ShellArgsSchema, {
+												command: "printf test",
+												workingDirectory: "/tmp",
+											}),
+										},
+									}),
+								},
+							}),
+						),
+					);
+					return;
+				}
+				clientChunks.push(chunk);
+				const messages = decodeClientMessages(clientChunks);
+				const streamClosed = messages.some(
+					message =>
+						message.message.case === "execClientControlMessage" &&
+						message.message.value.message.case === "streamClose",
+				);
+				if (streamClosed && !sentTerminal) {
+					sentTerminal = true;
+					stream.write(frameServerMessage(createTurnEndedMessage()));
+					stream.end();
+				}
+			});
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", resolve);
+		});
+
+		let retainedCallbacks: CursorShellStreamCallbacks | undefined;
+		try {
+			const address = server.address();
+			if (!address || typeof address === "string") throw new Error("Expected TCP server address");
+			const events: AssistantMessageEvent[] = [];
+			for await (const event of streamCursor(
+				{ ...cursorModel, baseUrl: `http://127.0.0.1:${address.port}` },
+				{ messages: [{ role: "user", content: "shell", timestamp: 0 }] },
+				{
+					apiKey: "test-token",
+					execHandlers: {
+						async shellStream(_args, callbacks) {
+							retainedCallbacks = callbacks;
+							callbacks.onStdout("standard output\n");
+							callbacks.onStderr("standard error\n");
+							markShellCompleted();
+							return {
+								result: create(ShellResultSchema, {
+									result: {
+										case: "success",
+										value: create(ShellSuccessSchema, {
+											command: "printf test",
+											workingDirectory: "/tmp",
+										}),
+									},
+								}),
+								toolResult: undefined,
+							};
+						},
+					},
+				},
+			)) {
+				events.push(event);
+			}
+			await shellCompleted;
+			const clientMessages = decodeClientMessages(clientChunks);
+			const shellFrames = clientMessages.flatMap(message => {
+				if (message.message.case === "execClientMessage") {
+					const execMessage = message.message.value.message;
+					if (execMessage.case === "shellStream") return [execMessage.value.event.case];
+					if (execMessage.case === "shellResult") return ["shellResult"];
+				}
+				if (
+					message.message.case === "execClientControlMessage" &&
+					message.message.value.message.case === "streamClose"
+				) {
+					return ["streamClose"];
+				}
+				return [];
+			});
+			expect(shellFrames).toEqual(["start", "stdout", "stderr", "exit", "shellResult", "streamClose"]);
+			expect(events.filter(event => event.type === "done")).toHaveLength(1);
+			const framesAfterCompletion = clientChunks.length;
+			retainedCallbacks?.onStdout("late output\n");
+			retainedCallbacks?.onStderr("late error\n");
+			expect(clientChunks).toHaveLength(framesAfterCompletion);
+		} finally {
+			await new Promise<void>(resolve => server.close(() => resolve()));
+		}
+	});
+
+	it("fails once when the response ends before turnEnded", async () => {
+		const server = http2.createServer();
+		server.on("stream", (stream: http2.ServerHttp2Stream) => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			stream.once("data", () => stream.end());
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", resolve);
+		});
+
+		try {
+			const address = server.address();
+			if (!address || typeof address === "string") throw new Error("Expected TCP server address");
+			const events = [];
+			for await (const event of streamCursor(
+				{ ...cursorModel, baseUrl: `http://127.0.0.1:${address.port}` },
+				{ messages: [{ role: "user", content: "continue", timestamp: 0 }] },
+				{ apiKey: "test-token" },
+			)) {
+				events.push(event);
+			}
+			expect(events.filter(event => event.type === "error")).toHaveLength(1);
+			expect(events).not.toContainEqual(expect.objectContaining({ type: "done" }));
+			const terminal = events.at(-1);
+			if (terminal?.type !== "error") throw new Error("Expected terminal Cursor error");
+			expect(terminal.error.errorMessage).toContain("Cursor stream ended before turnEnded");
+		} finally {
+			await new Promise<void>(resolve => server.close(() => resolve()));
+		}
 	});
 });
 
