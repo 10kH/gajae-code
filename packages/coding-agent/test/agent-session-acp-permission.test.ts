@@ -123,7 +123,7 @@ async function createSessionWithMockModel(
 	responses: NonNullable<MockModelOptions["responses"]>,
 ): Promise<AgentSession> {
 	const mock = createMockModel({ responses });
-	const settings = Settings.isolated({ "compaction.enabled": false });
+	const settings = Settings.isolated({ "compaction.enabled": false, "edit.mode": "apply_patch" });
 	const sessionManager = SessionManager.inMemory(tempDir.path());
 	const agent = new Agent({
 		getApiKey: () => "test-key",
@@ -403,6 +403,7 @@ it("apply_patch custom-wire delete requests ACP permission through agent dispatc
 		{ content: ["done"] },
 	]);
 
+	await session.setActiveToolsByName(["edit"]);
 	await session.prompt("delete with custom apply_patch");
 
 	expect(requests.map(({ toolCallId, title, locations }) => ({ toolCallId, title, locations }))).toEqual([

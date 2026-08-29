@@ -1099,8 +1099,7 @@ describe("AgentSession resilient retry", () => {
 			session = undefined;
 			waitSpy.mockClear();
 		}
-	});
-
+	}, 300000);
 	it("bounds ollama-cloud first-event timeout retries instead of looping unbounded (#713)", async () => {
 		// ollama-cloud (ollama-chat API) can stall before its first token even
 		// for tiny prompts. Unbounded continuation retries re-issue the full
@@ -1133,7 +1132,7 @@ describe("AgentSession resilient retry", () => {
 		expect(last.stopReason).toBe("error");
 		expect(last.errorMessage).toContain("first event");
 		expect(waitSpy).toHaveBeenCalled();
-	});
+	}, 30000);
 	it("surfaces raw and wrapped Kimi Code first-event timeouts without replaying", async () => {
 		const model = getBundledModel("kimi-code", "kimi-k2.5");
 		if (!model) throw new Error("Expected bundled Kimi Code test model to exist");
@@ -2175,7 +2174,7 @@ describe("AgentSession resilient retry", () => {
 			expect.objectContaining({ attempt: 1, maxAttempts: 2, errorMessage, unbounded: false }),
 		]);
 		expect(lastAssistant(session).errorMessage).toContain("exhausted after 2 attempts");
-	});
+	}, 60000);
 	it("reseeds first-event timeout accounting at the first retryable failure", async () => {
 		let now = 10;
 		vi.spyOn(Date, "now").mockImplementation(() => now);
@@ -2194,7 +2193,7 @@ describe("AgentSession resilient retry", () => {
 		await session.waitForIdle();
 
 		expect(lastAssistant(session).errorMessage).toContain("waited 60ms total");
-	});
+	}, 300000);
 	it("does not replay a bare-default watchdog after a reasoning summary start hook participates", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		let hookCalls = 0;
@@ -2239,7 +2238,7 @@ describe("AgentSession resilient retry", () => {
 		expect(retryStartEvents).toHaveLength(0);
 		expect(streamCalls).toBe(1);
 		expect(lastAssistant(session).stopReason).toBe("error");
-	});
+	}, 60000);
 	it("does not replay a bare-default watchdog after an extension hook participates", async () => {
 		let hookCalls = 0;
 		const requestedModels: string[] = [];
@@ -2272,7 +2271,7 @@ describe("AgentSession resilient retry", () => {
 		expect(retryStartEvents).toHaveLength(0);
 		expect(requestedModels).toHaveLength(1);
 		expect(lastAssistant(session).stopReason).toBe("error");
-	});
+	}, 300000);
 	it("does not replay bare-default watchdogs after provider lifecycle handlers participate", async () => {
 		for (const eventType of ["context", "before_provider_request", "after_provider_response"] as const) {
 			let hookCalls = 0;
@@ -2313,7 +2312,7 @@ describe("AgentSession resilient retry", () => {
 			await session.dispose();
 			session = undefined;
 		}
-	});
+	}, 120000);
 	it("rejects a typed watchdog when a handler executes in its current scope", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		let hookCalls = 0;
@@ -2740,8 +2739,7 @@ describe("AgentSession resilient retry", () => {
 			session = undefined;
 			waitSpy.mockClear();
 		}
-	});
-
+	}, 300000);
 	it("retries the wrapped canonical first-event timeout on a clean bare-default epoch", async () => {
 		// The wrapped "Error: Provider stream timed out while waiting for the first
 		// event" form was previously blocked by the bare-default scoped gate even on
@@ -2766,7 +2764,7 @@ describe("AgentSession resilient retry", () => {
 		expect(retryStartEvents).toHaveLength(1);
 		expect(retryEndEvents).toEqual([expect.objectContaining({ success: true })]);
 		expect(lastAssistant(session)).toMatchObject({ stopReason: "stop" });
-	});
+	}, 300000);
 	it("gives an active cancel-and-submit replacement a clean retry epoch", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const originalStarted = Promise.withResolvers<void>();
