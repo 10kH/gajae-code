@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.15.5] - 2026-08-29
+
 ### Added
 
 - `fuzzyFind` subsequence scoring supports Hangul chosung (초성) matching: a bare consonant jamo in the query matches any syllable with that initial consonant. Exact, prefix, and contains tiers are unchanged, so literal matches keep outranking chosung matches.
@@ -53,7 +55,6 @@
 
 - Managed session files may now be up to 128 MiB, keeping retained-tree validation aligned with large resumable session transcripts and checkpoints.
 - Recovery filesystem roots can now open descriptor-retained regular-file streams with no-follow component traversal for bounded external-session ingestion.
-
 
 ### Added
 

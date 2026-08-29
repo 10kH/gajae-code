@@ -773,13 +773,46 @@ function assertContentLengthWithinLimit(response: Response, maxCompressedBytes: 
 export interface RegistryTarballDownloadOptions {
 	fetcher?: typeof fetch;
 	maxCompressedBytes?: number;
+	/** Bounded retry for transient registry reads; production default rides out npm read-after-write propagation. */
+	retry?: { attempts: number; delayMs: number };
 }
+
+/**
+ * A just-published tarball can lag npm's metadata: the 0.15.5 finalize job saw
+ * `npm view` return the sealed integrity while the CDN still answered 404 for
+ * the tarball itself. These statuses (and network-level fetch failures) are
+ * propagation, not evidence conflicts, so they retry within a bounded window;
+ * every byte-level validation (URL policy, SRI, size) still fails immediately.
+ */
+const TRANSIENT_TARBALL_HTTP_STATUSES = new Set([404, 408, 429, 500, 502, 503, 504]);
+const DEFAULT_TARBALL_RETRY = { attempts: 40, delayMs: 15_000 } as const;
+
+class TransientRegistryTarballError extends Error {}
 
 /** Streams only same-origin npm bytes, checks the compressed SRI, then permits inspection. */
 export async function downloadNpmRegistryTarball(
 	tarballUrl: string,
 	expectedSri: string,
 	options: RegistryTarballDownloadOptions = {},
+): Promise<Buffer> {
+	const retry = options.retry ?? DEFAULT_TARBALL_RETRY;
+	if (!Number.isSafeInteger(retry.attempts) || retry.attempts <= 0 || !Number.isSafeInteger(retry.delayMs) || retry.delayMs < 0) {
+		throw new Error("Registry tarball retry policy must use positive safe integers");
+	}
+	for (let attempt = 1; ; attempt += 1) {
+		try {
+			return await downloadNpmRegistryTarballOnce(tarballUrl, expectedSri, options);
+		} catch (error) {
+			if (attempt >= retry.attempts || !(error instanceof TransientRegistryTarballError)) throw error;
+			await Bun.sleep(retry.delayMs);
+		}
+	}
+}
+
+async function downloadNpmRegistryTarballOnce(
+	tarballUrl: string,
+	expectedSri: string,
+	options: RegistryTarballDownloadOptions,
 ): Promise<Buffer> {
 	const fetcher = options.fetcher ?? fetch;
 	const maxCompressedBytes = options.maxCompressedBytes ?? RELEASE_TARBALL_LIMITS.maxCompressedBytes;
@@ -788,7 +821,14 @@ export async function downloadNpmRegistryTarball(
 	}
 	let current = validateNpmRegistryTarballUrl(tarballUrl, "registry tarball URL");
 	for (let redirects = 0; ; redirects += 1) {
-		const response = await fetcher(current.href, { redirect: "manual", headers: { accept: "application/octet-stream" } });
+		let response: Response;
+		try {
+			response = await fetcher(current.href, { redirect: "manual", headers: { accept: "application/octet-stream" } });
+		} catch (error) {
+			throw new TransientRegistryTarballError(
+				`Registry tarball fetch failed: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
 		if (response.status >= 300 && response.status < 400) {
 			if (redirects >= maxTarballRedirects) throw new Error("Registry tarball redirect limit exceeded");
 			const location = response.headers.get("location");
@@ -797,7 +837,11 @@ export async function downloadNpmRegistryTarball(
 			continue;
 		}
 		if (response.url !== "") validateNpmRegistryTarballUrl(response.url, "final registry tarball URL");
-		if (!response.ok) throw new Error(`Registry tarball download failed: HTTP ${response.status}`);
+		if (!response.ok) {
+			const failure = `Registry tarball download failed: HTTP ${response.status}`;
+			if (TRANSIENT_TARBALL_HTTP_STATUSES.has(response.status)) throw new TransientRegistryTarballError(failure);
+			throw new Error(failure);
+		}
 		assertContentLengthWithinLimit(response, maxCompressedBytes);
 		if (response.body === null) throw new Error("Registry tarball response has no body");
 
