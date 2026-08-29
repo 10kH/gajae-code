@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.15.4] - 2026-08-29
+
 ### Fixed
 
 - Path autocomplete matches decomposed (NFD) file names against composed (NFC) input. Composer keystrokes are NFC-normalized while macOS volumes commonly return Hangul and other composed scripts in NFD, so `@한` found nothing even though `한글.txt` existed; both the directory-listing prefix match and the fuzzy filter now compare NFC forms while completion values keep the on-disk name. The native fuzzy finder applies the same normalization to queries and candidates.
