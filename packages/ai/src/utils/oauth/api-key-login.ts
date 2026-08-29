@@ -15,6 +15,7 @@ type ChatCompletionsValidation = {
 	provider: string;
 	baseUrl: string;
 	model: string;
+	requireInferenceResponse?: boolean;
 };
 
 type ModelsEndpointValidation = {
@@ -76,6 +77,7 @@ export function createApiKeyLogin(config: ApiKeyLoginConfig): (options: OAuthCon
 					apiKey: trimmed,
 					baseUrl: config.validation.baseUrl,
 					model: config.validation.model,
+					requireInferenceResponse: config.validation.requireInferenceResponse,
 					signal: options.signal,
 					fetch: options.fetch,
 				});

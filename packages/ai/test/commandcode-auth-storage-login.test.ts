@@ -5,7 +5,7 @@ import * as path from "node:path";
 
 import { AuthStorage, SqliteAuthCredentialStore } from "../src/auth-storage";
 
-const MODELS_URL = "https://api.commandcode.ai/provider/v1/models";
+const INFERENCE_URL = "https://api.commandcode.ai/provider/v1/chat/completions";
 
 function modelsResponse(body: unknown, status = 200): Response {
 	return new Response(typeof body === "string" ? body : JSON.stringify(body), {
@@ -33,9 +33,13 @@ describe("Command Code GOAT AuthStorage login", () => {
 		store = dbStore;
 		const authStorage = new AuthStorage(dbStore);
 		const fetchMock = async (input: string | URL, init?: RequestInit): Promise<Response> => {
-			expect(String(input)).toBe(MODELS_URL);
-			expect(init?.headers).toEqual({ Authorization: "Bearer cmd-storage-key" });
-			return modelsResponse({ data: [] });
+			expect(String(input)).toBe(INFERENCE_URL);
+			expect(init?.method).toBe("POST");
+			expect(init?.headers).toEqual({
+				"Content-Type": "application/json",
+				Authorization: "Bearer cmd-storage-key",
+			});
+			return modelsResponse({ choices: [{ message: { content: "pong" } }] });
 		};
 
 		await authStorage.login("commandcode-goat", {

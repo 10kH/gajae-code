@@ -4,7 +4,7 @@ import { getEnvApiKey } from "../src/stream";
 import { getOAuthProviders } from "../src/utils/oauth";
 import { loginCommandCode } from "../src/utils/oauth/commandcode";
 
-const MODELS_URL = "https://api.commandcode.ai/provider/v1/models";
+const INFERENCE_URL = "https://api.commandcode.ai/provider/v1/chat/completions";
 const DASHBOARD_URL = "https://commandcode.ai/studio/#api-keys";
 
 function modelsResponse(body: unknown, status = 200): Response {
@@ -15,14 +15,23 @@ function modelsResponse(body: unknown, status = 200): Response {
 }
 
 describe("Command Code GOAT login", () => {
-	it("opens the dashboard, prompts for a key, and checks the models catalog", async () => {
+	it("opens the dashboard, prompts for a key, and verifies inference entitlement", async () => {
 		const auth = vi.fn();
 		const progress = vi.fn();
 		const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
-			expect(String(input)).toBe(MODELS_URL);
-			expect(init?.method).toBe("GET");
-			expect(init?.headers).toEqual({ Authorization: "Bearer cmd-test-key" });
-			return modelsResponse({ object: "list", data: [{ id: "zai-org/GLM-5.3" }] });
+			expect(String(input)).toBe(INFERENCE_URL);
+			expect(init?.method).toBe("POST");
+			expect(init?.headers).toEqual({
+				"Content-Type": "application/json",
+				Authorization: "Bearer cmd-test-key",
+			});
+			expect(JSON.parse(String(init?.body))).toEqual({
+				model: "zai-org/GLM-5.3",
+				messages: [{ role: "user", content: "ping" }],
+				max_tokens: 1,
+				temperature: 0,
+			});
+			return modelsResponse({ choices: [{ message: { content: "pong" } }] });
 		});
 
 		const key = await loginCommandCode({

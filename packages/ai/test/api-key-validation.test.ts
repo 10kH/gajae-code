@@ -34,6 +34,16 @@ function validateChatCompletions(): Promise<void> {
 	});
 }
 
+function validateInferenceProbe(): Promise<void> {
+	return validateOpenAICompatibleApiKey({
+		provider: "Command Code GOAT",
+		apiKey: "cmd-test",
+		baseUrl: "https://example.invalid/v1",
+		model: "zai-org/GLM-5.3",
+		requireInferenceResponse: true,
+	});
+}
+
 async function validationErrorMessage(validation: () => Promise<void>): Promise<string> {
 	try {
 		await validation();
@@ -129,5 +139,41 @@ describe("validateApiKeyAgainstModelsEndpoint", () => {
 			throw new Error("network down");
 		}) as unknown as typeof globalThis.fetch;
 		await expect(validate()).rejects.toThrow("network down");
+	});
+
+	it("requires an inference response instead of accepting a public catalog-shaped body", async () => {
+		stubFetch(() => new Response(JSON.stringify({ object: "list", data: [{ id: "m" }] }), { status: 200 }));
+		await expect(validateInferenceProbe()).rejects.toThrow(/no choices/);
+	});
+
+	it("rejects malformed and oversized inference responses with bounded diagnostics", async () => {
+		stubFetch(() => new Response(`<html>${"x".repeat(100_000)}</html>`, { status: 200 }));
+		const malformed = await validationErrorMessage(validateInferenceProbe);
+		expect(malformed).toContain("non-JSON response");
+		expect(malformed.length).toBeLessThan(400);
+
+		stubFetch(() => new Response("x".repeat(100_000), { status: 200 }));
+		const oversized = await validationErrorMessage(validateInferenceProbe);
+		expect(oversized).toContain("non-JSON response");
+		expect(oversized.length).toBeLessThan(400);
+	});
+
+	it("propagates inference probe aborts without accepting the key", async () => {
+		const controller = new AbortController();
+		globalThis.fetch = (async (_input, init) => {
+			controller.abort();
+			init?.signal?.throwIfAborted();
+			return new Response(null, { status: 200 });
+		}) as typeof globalThis.fetch;
+		await expect(
+			validateOpenAICompatibleApiKey({
+				provider: "Command Code GOAT",
+				apiKey: "cmd-test",
+				baseUrl: "https://example.invalid/v1",
+				model: "zai-org/GLM-5.3",
+				requireInferenceResponse: true,
+				signal: controller.signal,
+			}),
+		).rejects.toThrow(/validation failed/);
 	});
 });

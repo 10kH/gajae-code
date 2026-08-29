@@ -8,8 +8,10 @@ export const loginCommandCode = createApiKeyLogin({
 	placeholder: "cmd-...",
 	validationProgressMessage: "Checking Command Code model catalog...",
 	validation: {
-		kind: "models-endpoint",
+		kind: "chat-completions",
 		provider: "Command Code GOAT",
-		modelsUrl: "https://api.commandcode.ai/provider/v1/models",
+		baseUrl: "https://api.commandcode.ai/provider/v1",
+		model: "zai-org/GLM-5.3",
+		requireInferenceResponse: true,
 	},
 });

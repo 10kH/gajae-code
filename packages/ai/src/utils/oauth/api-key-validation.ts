@@ -7,6 +7,7 @@ type OpenAICompatibleValidationOptions = {
 	model: string;
 	signal?: AbortSignal;
 	fetch?: typeof globalThis.fetch;
+	requireInferenceResponse?: boolean;
 };
 
 type ModelListValidationOptions = {
@@ -130,6 +131,35 @@ export async function validateOpenAICompatibleApiKey(options: OpenAICompatibleVa
 	}
 
 	if (response.ok) {
+		if (options.requireInferenceResponse) {
+			let body: string;
+			try {
+				body = await readBoundedBody(response);
+			} catch (error) {
+				throw validationFailure(
+					options.provider,
+					options.apiKey,
+					`the inference probe response could not be read (${errorDetails(error, options.apiKey)})`,
+				);
+			}
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(body);
+			} catch {
+				throw validationFailure(
+					options.provider,
+					options.apiKey,
+					`the inference probe returned a non-JSON response (${boundedDetails(body, options.apiKey)})`,
+				);
+			}
+			const choices =
+				typeof parsed === "object" && parsed !== null && "choices" in parsed
+					? (parsed as { choices?: unknown }).choices
+					: undefined;
+			if (!Array.isArray(choices) || choices.length === 0) {
+				throw validationFailure(options.provider, options.apiKey, "the inference probe returned no choices");
+			}
+		}
 		return;
 	}
 
