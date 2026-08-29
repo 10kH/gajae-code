@@ -8277,7 +8277,10 @@ export class AgentSession {
 				this.#modelRegistry.authStorage,
 				this.credentialSessionId,
 				context.model ?? this.model,
-				this.#modelRegistry.getAuthStorageOwner(),
+				// Optional call: the metadata resolver runs on every prompt, and `owner` is an
+				// optional `buildSessionMetadata` argument. The auth-credential paths keep the
+				// strict call because they genuinely require a real registry owner.
+				this.#modelRegistry.getAuthStorageOwner?.(),
 			),
 		);
 	}
@@ -21603,7 +21606,8 @@ export class AgentSession {
 						this.#modelRegistry.authStorage,
 						this.credentialSessionId,
 						model,
-						this.#modelRegistry.getAuthStorageOwner(),
+						// Optional for the same reason as the main metadata resolver above.
+						this.#modelRegistry.getAuthStorageOwner?.(),
 					),
 					reasoning: toReasoningEffort(this.thinkingLevel),
 					hideThinkingSummary: this.agent.hideThinkingSummary,
