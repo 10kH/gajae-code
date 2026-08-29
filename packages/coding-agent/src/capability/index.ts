@@ -366,7 +366,7 @@ export async function loadCapabilityForHome<T>(
 	const isolatedOptions: LoadOptions = { ...options, isolatedHome: true };
 	const ctx: LoadContext = {
 		cwd,
-		home: resolvedHome,
+		home: canonicalHome,
 		userAgentDir,
 		repoRoot,
 		isolatedHome: true,
