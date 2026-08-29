@@ -284,12 +284,17 @@ export async function loadCapability<T>(capabilityId: string, options: LoadOptio
 		throw new Error(`Unknown capability: "${capabilityId}"`);
 	}
 
-	const cwd = options.cwd ?? getProjectDir();
+	// `isolatedHome` is an internal option used only by loadCapabilityForHome.
+	// Public ordinary loads must always apply the active process settings and
+	// disabled-provider/extension policy, even if a caller supplies that field.
+	const ordinaryOptions: LoadOptions = options.isolatedHome ? { ...options, isolatedHome: false } : options;
+	const cwd = ordinaryOptions.cwd ?? getProjectDir();
 	const home = getTrustedHomeDir();
-	const userAgentDir = options.agentDir ? path.resolve(options.agentDir) : getAgentDir();
+	const userAgentDir = ordinaryOptions.agentDir ? path.resolve(ordinaryOptions.agentDir) : getAgentDir();
 	const profileAuthority =
-		options.profileAuthority ??
-		(options.agentDir && normalizePathForComparison(userAgentDir) !== normalizePathForComparison(getAgentDir())
+		ordinaryOptions.profileAuthority ??
+		(ordinaryOptions.agentDir &&
+		normalizePathForComparison(userAgentDir) !== normalizePathForComparison(getAgentDir())
 			? "custom"
 			: getAgentProfileAuthority());
 	const repoRoot = await findRepoRoot(cwd);
@@ -300,11 +305,11 @@ export async function loadCapability<T>(capabilityId: string, options: LoadOptio
 		profileAuthority,
 		repoRoot,
 		isolatedHome: false,
-		settings: options.settings,
+		settings: ordinaryOptions.settings,
 	};
-	const providers = filterProviders(capability, options);
+	const providers = filterProviders(capability, ordinaryOptions);
 
-	return await loadImpl(capability, providers, ctx, options);
+	return await loadImpl(capability, providers, ctx, ordinaryOptions);
 }
 
 /**
