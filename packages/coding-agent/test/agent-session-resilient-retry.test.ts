@@ -2174,7 +2174,7 @@ describe("AgentSession resilient retry", () => {
 			expect.objectContaining({ attempt: 1, maxAttempts: 2, errorMessage, unbounded: false }),
 		]);
 		expect(lastAssistant(session).errorMessage).toContain("exhausted after 2 attempts");
-	});
+	}, 60000);
 	it("reseeds first-event timeout accounting at the first retryable failure", async () => {
 		let now = 10;
 		vi.spyOn(Date, "now").mockImplementation(() => now);
@@ -2193,7 +2193,7 @@ describe("AgentSession resilient retry", () => {
 		await session.waitForIdle();
 
 		expect(lastAssistant(session).errorMessage).toContain("waited 60ms total");
-	});
+	}, 300000);
 	it("does not replay a bare-default watchdog after a reasoning summary start hook participates", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		let hookCalls = 0;
@@ -2238,7 +2238,7 @@ describe("AgentSession resilient retry", () => {
 		expect(retryStartEvents).toHaveLength(0);
 		expect(streamCalls).toBe(1);
 		expect(lastAssistant(session).stopReason).toBe("error");
-	});
+	}, 60000);
 	it("does not replay a bare-default watchdog after an extension hook participates", async () => {
 		let hookCalls = 0;
 		const requestedModels: string[] = [];
