@@ -904,10 +904,10 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 		if (rawPrefix.length === 0) return prefixSuggestions;
 
 		const fuzzySuggestions = await this.#getFuzzyFileSuggestions(rawPrefix, { isQuotedPrefix });
-		const seen = new Set(prefixSuggestions.map(item => item.value));
+		const seen = new Set(fuzzySuggestions.map(item => item.value));
 		return [
-			...prefixSuggestions,
-			...fuzzySuggestions.filter(item => {
+			...fuzzySuggestions,
+			...prefixSuggestions.filter(item => {
 				if (seen.has(item.value)) return false;
 				seen.add(item.value);
 				return true;

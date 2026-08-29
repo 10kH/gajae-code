@@ -341,10 +341,23 @@ describe("CombinedAutocompleteProvider", () => {
 			await Bun.write(path.join(baseDir, ".gitignore"), "story-ignored.md\nnode_modules/\n");
 			await Bun.write(path.join(baseDir, "story-ignored.md"), "ignored\n");
 			await Bun.write(path.join(baseDir, "story-tracked.md"), "tracked\n");
+			await Bun.$`git -C ${baseDir} init`.quiet();
 			const provider = new CombinedAutocompleteProvider([], baseDir);
 			const result = await provider.getForceFileSuggestions(["@story"], 0, 6);
 
-			expect(result?.items.map(item => item.value)).toEqual(["@story-ignored.md", "@story-tracked.md"]);
+			expect(result?.items.map(item => item.value)).toEqual(["@story-tracked.md", "@story-ignored.md"]);
+		});
+
+		it("keeps an exact file ahead of a fuzzy directory match", async () => {
+			await Bun.write(path.join(baseDir, "target"), "file\n");
+			await fs.promises.mkdir(path.join(baseDir, "target-dir"));
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const values =
+				(await provider.getForceFileSuggestions(["@target"], 0, 7))?.items.map(item => item.value) ?? [];
+
+			expect(values.indexOf("@target")).toBeGreaterThanOrEqual(0);
+			expect(values.indexOf("@target-dir/")).toBeGreaterThanOrEqual(0);
+			expect(values.indexOf("@target")).toBeLessThan(values.indexOf("@target-dir/"));
 		});
 
 		it("keeps node_modules exact prefix matches reachable from explicit Tab", async () => {
