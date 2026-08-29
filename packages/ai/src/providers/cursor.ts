@@ -722,7 +722,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					rejectH2 = undefined;
 					reject?.(error);
 				},
-				getStreamIdleTimeoutMs(options?.streamIdleTimeoutMs),
+				options?.streamIdleTimeoutMs ?? getStreamIdleTimeoutMs(),
 			);
 			h2Client.on("error", error => coordinator.fail(error));
 			h2Request.on("error", error => coordinator.fail(error));
