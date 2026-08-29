@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
@@ -350,7 +351,7 @@ describe("CombinedAutocompleteProvider", () => {
 
 		it("keeps an exact file ahead of a fuzzy directory match", async () => {
 			await Bun.write(path.join(baseDir, "target"), "file\n");
-			await fs.promises.mkdir(path.join(baseDir, "target-dir"));
+			await fsPromises.mkdir(path.join(baseDir, "target-dir"));
 			const provider = new CombinedAutocompleteProvider([], baseDir);
 			const values =
 				(await provider.getForceFileSuggestions(["@target"], 0, 7))?.items.map(item => item.value) ?? [];
@@ -361,7 +362,7 @@ describe("CombinedAutocompleteProvider", () => {
 		});
 
 		it("keeps node_modules exact prefix matches reachable from explicit Tab", async () => {
-			await fs.promises.mkdir(path.join(baseDir, "node_modules"), { recursive: true });
+			await fsPromises.mkdir(path.join(baseDir, "node_modules"), { recursive: true });
 			await Bun.write(path.join(baseDir, "node_modules", "package.json"), "{}\n");
 			const provider = new CombinedAutocompleteProvider([], baseDir);
 			const line = "@node_modules/pac";

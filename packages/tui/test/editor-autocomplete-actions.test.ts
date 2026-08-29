@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
@@ -627,7 +628,7 @@ describe("Editor Enter handler sync slash completion", () => {
 	});
 
 	it("updates fuzzy suggestions for Korean characters typed after @", async () => {
-		const baseDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "editor-korean-autocomplete-"));
+		const baseDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "editor-korean-autocomplete-"));
 		try {
 			await Bun.write(path.join(baseDir, "한글.txt"), "content\n");
 			const editor = new Editor(defaultEditorTheme);
@@ -639,12 +640,12 @@ describe("Editor Enter handler sync slash completion", () => {
 
 			expect(editor.isShowingAutocomplete()).toBe(true);
 		} finally {
-			await fs.promises.rm(baseDir, { recursive: true, force: true });
+			await fsPromises.rm(baseDir, { recursive: true, force: true });
 		}
 	});
 
 	it("applies a fuzzy @ completion from explicit Tab", async () => {
-		const baseDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "editor-tab-fuzzy-autocomplete-"));
+		const baseDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "editor-tab-fuzzy-autocomplete-"));
 		try {
 			await Bun.write(path.join(baseDir, "한글.txt"), "content\n");
 			const editor = new Editor(defaultEditorTheme);
@@ -656,7 +657,7 @@ describe("Editor Enter handler sync slash completion", () => {
 
 			expect(editor.getText()).toBe("@한글.txt ");
 		} finally {
-			await fs.promises.rm(baseDir, { recursive: true, force: true });
+			await fsPromises.rm(baseDir, { recursive: true, force: true });
 		}
 	});
 });
