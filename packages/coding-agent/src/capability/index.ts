@@ -443,7 +443,7 @@ export async function loadCapabilityForHome<T>(
 				path.join(canonicalHome, getConfigDirName(), "agent"),
 				"user agent directory",
 			);
-	await assertExplicitHomeRoots(canonicalHome, cwd, options.agentDir !== undefined);
+	await assertExplicitHomeRoots(canonicalHome, cwd, Boolean(options.agentDir));
 	const repoRootCandidate = await findRepoRoot(cwd);
 	const canonicalRepoRoot = repoRootCandidate ? await canonicalizeThroughExistingAncestor(repoRootCandidate) : null;
 	const repoRoot =
