@@ -370,7 +370,7 @@ export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
 		config => cursorModelManagerOptions(config),
 		catalog("Cursor", ["CURSOR_API_KEY"], { oauthProvider: "cursor" }),
 	),
-	descriptor("kiro", "CLAUDE_3_7_SONNET_20250219_V1_0", config => kiroModelManagerOptions(config)),
+	descriptor("kiro", "auto", config => kiroModelManagerOptions(config)),
 ] as const;
 
 /** Default model IDs for all known providers, built from descriptors + special providers. */

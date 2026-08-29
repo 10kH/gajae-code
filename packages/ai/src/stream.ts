@@ -1258,6 +1258,12 @@ function mapOptionsForApi<TApi extends Api>(
 			});
 		}
 
+		case "kiro-codewhisperer-stream":
+			return castApi<"kiro-codewhisperer-stream">({
+				...base,
+				reasoning: options?.reasoning,
+			});
+
 		default:
 			throw new Error(`Unhandled API in mapOptionsForApi: ${model.api}`);
 	}

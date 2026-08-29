@@ -67,6 +67,7 @@ interface WireToolResult {
 interface WireUserMessage {
 	userInputMessage: {
 		content: string;
+		modelId?: string;
 		userInputMessageContext?: {
 			tools?: { tools: WireToolSpec[] };
 			toolResults?: { toolResults: WireToolResult[][] };
@@ -353,7 +354,7 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 
 function buildConversationState(
 	context: Context,
-	_model: Model<"kiro-codewhisperer-stream">,
+	model: Model<"kiro-codewhisperer-stream">,
 	options: KiroCodeWhispererOptions,
 ): ConversationState {
 	const messages = context.messages;
@@ -361,18 +362,20 @@ function buildConversationState(
 		throw new Error("Kiro CodeWhisperer requires at least one message");
 	}
 
+	const modelId = model.wireModelId || model.id;
+
 	// Build history from all messages except the last
 	const history: WireHistoryMessage[] = [];
 	const systemPrompt = context.systemPrompt?.join("\n") ?? "";
 
 	for (let i = 0; i < messages.length - 1; i++) {
 		const msg = messages[i];
-		history.push(convertToWireMessage(msg, i === 0 ? systemPrompt : undefined));
+		history.push(convertToWireMessage(msg, modelId, i === 0 ? systemPrompt : undefined));
 	}
 
 	// Convert the last message as currentMessage
 	const lastMsg = messages[messages.length - 1];
-	const currentMessage = convertToWireUserMessage(lastMsg, systemPrompt);
+	const currentMessage = convertToWireUserMessage(lastMsg, modelId, systemPrompt);
 
 	// Add tools to the current message context
 	if (context.tools && context.tools.length > 0) {
@@ -392,12 +395,16 @@ function buildConversationState(
 	};
 }
 
-function convertToWireMessage(msg: Context["messages"][number], systemPrompt?: string): WireHistoryMessage {
+function convertToWireMessage(
+	msg: Context["messages"][number],
+	modelId: string,
+	systemPrompt?: string,
+): WireHistoryMessage {
 	if (msg.role === "user") {
-		return convertToWireUserMessage(msg, systemPrompt);
+		return convertToWireUserMessage(msg, modelId, systemPrompt);
 	}
 	if (msg.role === "toolResult") {
-		return convertToWireUserMessage(msg, systemPrompt);
+		return convertToWireUserMessage(msg, modelId, systemPrompt);
 	}
 	// assistant → assistant response
 	const textParts: string[] = [];
@@ -417,7 +424,11 @@ function convertToWireMessage(msg: Context["messages"][number], systemPrompt?: s
 	};
 }
 
-function convertToWireUserMessage(msg: Context["messages"][number], systemPrompt?: string): WireUserMessage {
+function convertToWireUserMessage(
+	msg: Context["messages"][number],
+	modelId: string,
+	systemPrompt?: string,
+): WireUserMessage {
 	let content = extractTextContent(msg);
 	if (systemPrompt) {
 		content = `${systemPrompt}\n\n${content}`;
@@ -426,6 +437,7 @@ function convertToWireUserMessage(msg: Context["messages"][number], systemPrompt
 	const userMsg: WireUserMessage = {
 		userInputMessage: {
 			content,
+			modelId,
 		},
 	};
 

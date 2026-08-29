@@ -3299,6 +3299,16 @@ export class AuthStorage {
 				credentials = await loginKimi(ctrl);
 				break;
 			}
+			case "kiro": {
+				const { loginKiro } = await import("./utils/oauth/kiro");
+				credentials = await loginKiro({
+					onAuth: (url, instructions) => ctrl.onAuth({ url, instructions }),
+					onPrompt: ctrl.onPrompt,
+					onProgress: ctrl.onProgress,
+					signal: ctrl.signal,
+				});
+				break;
+			}
 			case "kilo": {
 				const { loginKilo } = await import("./utils/oauth/kilo");
 				credentials = await loginKilo(ctrl);
