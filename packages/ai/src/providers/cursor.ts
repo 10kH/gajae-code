@@ -277,6 +277,7 @@ class CursorRequestCoordinator implements CursorRequestWriter {
 	#state: "open" | "draining" | "failed" | "succeeded" = "open";
 	#tasks = new Set<Promise<void>>();
 	#taskChain = Promise.resolve();
+	#hasAdmittedTask = false;
 	#frames: Uint8Array[] = [];
 	#writing = false;
 	#drainWaiters: Array<() => void> = [];
@@ -336,12 +337,17 @@ class CursorRequestCoordinator implements CursorRequestWriter {
 
 	admit(taskFactory: () => Promise<void>): void {
 		if (!this.canAdmitTask()) return;
-		const orderedTask = this.#taskChain.then(taskFactory);
+		const orderedTask = this.#hasAdmittedTask
+			? this.#taskChain.then(() => {
+					if (this.#state === "failed" || this.#state === "succeeded") return;
+					return taskFactory();
+				})
+			: taskFactory();
+		this.#hasAdmittedTask = true;
 		this.#taskChain = orderedTask.then(
 			() => {},
 			error => {
 				this.fail(error instanceof Error ? error : new Error(String(error)));
-				throw error;
 			},
 		);
 		this.#tasks.add(orderedTask);

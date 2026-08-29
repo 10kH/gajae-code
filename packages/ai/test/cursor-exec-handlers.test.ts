@@ -425,6 +425,7 @@ describe("Cursor request lifecycle", () => {
 				stream.end(
 					Buffer.concat([
 						frameServerMessage(createReadExecMessage()),
+						frameServerMessage(createReadExecMessage(2)),
 						frameServerMessage(createTurnEndedMessage()),
 					]),
 				),
@@ -438,6 +439,7 @@ describe("Cursor request lifecycle", () => {
 			const address = server.address();
 			if (!address || typeof address === "string") throw new Error("Expected TCP server address");
 			const events: string[] = [];
+			const calls: string[] = [];
 			for await (const event of streamCursor(
 				{ ...cursorModel, baseUrl: `http://127.0.0.1:${address.port}` },
 				{ messages: [{ role: "user", content: "read", timestamp: 0 }] },
@@ -445,7 +447,8 @@ describe("Cursor request lifecycle", () => {
 					apiKey: "test-token",
 					streamIdleTimeoutMs: 10,
 					execHandlers: {
-						async read() {
+						async read(args) {
+							calls.push(args.path);
 							await new Promise<void>(() => {});
 							return createReadSuccessResult("");
 						},
@@ -454,6 +457,7 @@ describe("Cursor request lifecycle", () => {
 			))
 				events.push(event.type);
 			expect(events).toContain("error");
+			expect(calls).toEqual(["/tmp/example"]);
 		} finally {
 			await new Promise<void>(resolve => server.close(() => resolve()));
 		}
