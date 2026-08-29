@@ -914,6 +914,11 @@ function publicationSequence(publicationId: string): number | undefined {
 
 function tailItemFromRouterFrame(frame: SessionRouterFrame): SdkTailItemV1 | undefined {
 	if (frame.name === undefined) return undefined;
+	// The replay response is an out-of-band control frame, not an event-ring
+	// item. Its generation/lastSeq metadata is a response position, and it
+	// intentionally has no event `seq`; projecting it as a tail item would make
+	// the strict event-position validator reject every otherwise valid tail.
+	if (frame.name === "event_replay_result") return undefined;
 	const seq = frame.publicationId === undefined ? undefined : publicationSequence(frame.publicationId);
 	return toTailItemV1(
 		{

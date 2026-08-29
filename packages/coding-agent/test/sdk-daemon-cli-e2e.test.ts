@@ -171,7 +171,14 @@ describe("SDK session CLI", () => {
 							wireLog.push(explicit ? "explicit_replay_request" : "attach_replay_request");
 							if (!explicit) {
 								socket.send(
-									JSON.stringify({ type: "event_replay_result", id: frame.id, ok: true, events: [] }),
+									JSON.stringify({
+										type: "event_replay_result",
+										id: frame.id,
+										ok: true,
+										generation: 1,
+										lastSeq: 0,
+										events: [],
+									}),
 								);
 								return;
 							}
@@ -183,7 +190,14 @@ describe("SDK session CLI", () => {
 							const id = frame.id;
 							void Bun.sleep(EXPLICIT_REPLAY_DELAY_MS).then(() => {
 								try {
-									lastReplayPayload = JSON.stringify({ type: "event_replay_result", id, ok: true, events });
+									lastReplayPayload = JSON.stringify({
+										type: "event_replay_result",
+										id,
+										ok: true,
+										generation: 1,
+										lastSeq: 0,
+										events,
+									});
 									socket.send(lastReplayPayload);
 									wireLog.push("explicit_replay_result");
 								} catch {
@@ -193,7 +207,14 @@ describe("SDK session CLI", () => {
 							return;
 						}
 						socket.send(
-							JSON.stringify({ type: "event_replay_result", id: frame.id, ok: true, events: replayEvents }),
+							JSON.stringify({
+								type: "event_replay_result",
+								id: frame.id,
+								ok: true,
+								generation: 1,
+								lastSeq: 0,
+								events: replayEvents,
+							}),
 						);
 						if (deferredLiveEvents.length > 0 && !deferredLiveDispatched) {
 							deferredLiveDispatched = true;
