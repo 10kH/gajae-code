@@ -1631,6 +1631,8 @@ export async function persistCoordinatorWorkerIntegrationOutcome(
 						if (Object.keys(previous).length === 0) return;
 						assertPreviousRuntimeStateIdentity(previous, identity);
 						const now = new Date().toISOString();
+						const terminalPersistenceFailed =
+							outcome.kind === "terminal_persistence" && outcome.status !== "completed";
 						const reconciliation = {
 							status: outcome.status,
 							...(outcome.correlationId ? { correlation_id: outcome.correlationId } : {}),
@@ -1645,6 +1647,20 @@ export async function persistCoordinatorWorkerIntegrationOutcome(
 						);
 						const payload = {
 							...previous,
+							...(terminalPersistenceFailed
+								? {
+										state: "errored",
+										ready_for_input: false,
+										live: false,
+										current_turn_id: null,
+										execution_state: "failed",
+										receipt_state: "absent",
+										ended_at: now,
+										reason: "terminal_persistence_failed",
+										source: "agent_session_reconciliation",
+										event: "terminal_persistence",
+									}
+								: {}),
 							updated_at: now,
 							[outcome.kind]: reconciliation,
 							...(outcome.status !== "completed"

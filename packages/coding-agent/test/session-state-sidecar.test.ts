@@ -165,6 +165,29 @@ describe("coordinator runtime state sidecar", () => {
 		expect(payload.error).toMatchObject({ code: "worker_integration_failed", recoverable: true });
 	});
 
+	it("terminalizes prior running state when terminal persistence fails", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "agent_start" },
+			{ sessionId: "terminal-failure", cwd: root, sessionFile: null },
+		);
+		await persistCoordinatorWorkerIntegrationOutcome(
+			{ sessionId: "terminal-failure", cwd: root, sessionFile: null },
+			{ kind: "terminal_persistence", status: "failed", error: "write failed" },
+		);
+		await expect(readJson(stateFile)).resolves.toMatchObject({
+			state: "errored",
+			ready_for_input: false,
+			live: false,
+			current_turn_id: null,
+			execution_state: "failed",
+			receipt_state: "absent",
+			error: { code: "terminal_persistence_failed", recoverable: true },
+	});
+	});
+
 	it("regresses signed subprocess bootstrap, continuation, and tamper refusal", async () => {
 		const root = await tempRoot();
 		const stateFile = path.join(root, "state.json");
