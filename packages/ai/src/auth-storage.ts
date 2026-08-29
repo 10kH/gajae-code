@@ -3340,6 +3340,12 @@ export class AuthStorage {
 				await saveApiKeyCredential(apiKey);
 				return;
 			}
+			case "commandcode-goat": {
+				const { loginCommandCode } = await import("./utils/oauth/commandcode");
+				const apiKey = await loginCommandCode(ctrl);
+				await saveApiKeyCredential(apiKey);
+				return;
+			}
 			case "lm-studio": {
 				const { loginLmStudio } = await import("./utils/oauth/lm-studio");
 				const apiKey = await loginLmStudio(ctrl);

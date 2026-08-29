@@ -832,7 +832,7 @@ export interface OpenCodeModelManagerConfig {
 }
 
 function openCodeModelManagerOptions(
-	providerId: "opencode-go" | "opencode-zen",
+	providerId: "opencode-go" | "opencode-zen" | "commandcode-goat",
 	defaultBaseUrl: string,
 	config?: OpenCodeModelManagerConfig,
 ): ModelManagerOptions<"openai-completions"> {
@@ -871,6 +871,35 @@ export function opencodeGoModelManagerOptions(
 	config?: OpenCodeModelManagerConfig,
 ): ModelManagerOptions<"openai-completions"> {
 	return openCodeModelManagerOptions("opencode-go", "https://opencode.ai/zen/go/v1", config);
+}
+
+export function commandCodeModelManagerOptions(config?: OpenCodeModelManagerConfig): ModelManagerOptions<Api> {
+	const apiKey = config?.apiKey;
+	const baseUrl = config?.baseUrl ?? "https://api.commandcode.ai/provider/v1";
+	return {
+		providerId: "commandcode-goat",
+		...(apiKey && {
+			fetchDynamicModels: () =>
+				fetchOpenAICompatibleModels<Api>({
+					api: "openai-completions",
+					provider: "commandcode-goat",
+					baseUrl,
+					apiKey,
+					mapModel: (_entry, defaults) =>
+						({
+							...defaults,
+							api: defaults.id.toLowerCase().startsWith("claude-") ? "anthropic-messages" : "openai-completions",
+							compat: {
+								...defaults.compat,
+								supportsStore: false,
+								supportsDeveloperRole: false,
+								supportsReasoningEffort: false,
+								reasoningContentField: "reasoning_content",
+							},
+						}) as Model<Api>,
+				}),
+		}),
+	};
 }
 
 // ---------------------------------------------------------------------------

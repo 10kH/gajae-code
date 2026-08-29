@@ -43,6 +43,7 @@ export type OAuthProvider =
 	| "openai-codex-device"
 	| "opencode-go"
 	| "opencode-zen"
+	| "commandcode-goat"
 	| "opengateway"
 	| "openrouter"
 	| "parallel"

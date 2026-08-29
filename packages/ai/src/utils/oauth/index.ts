@@ -181,6 +181,11 @@ const builtInOAuthProviders: OAuthProviderInfo[] = [
 		available: true,
 	},
 	{
+		id: "commandcode-goat",
+		name: "Command Code GOAT",
+		available: true,
+	},
+	{
 		id: "openrouter",
 		name: "OpenRouter",
 		available: true,
@@ -400,6 +405,7 @@ export async function refreshOAuthToken(
 		case "huggingface":
 		case "opencode-zen":
 		case "opencode-go":
+		case "commandcode-goat":
 		case "cerebras":
 		case "deepinfra":
 		case "fireworks":

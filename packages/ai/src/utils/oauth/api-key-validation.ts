@@ -1,9 +1,12 @@
+import { sanitizeDisplayLine } from "@gajae-code/utils";
+
 type OpenAICompatibleValidationOptions = {
 	provider: string;
 	apiKey: string;
 	baseUrl: string;
 	model: string;
 	signal?: AbortSignal;
+	fetch?: typeof globalThis.fetch;
 };
 
 type ModelListValidationOptions = {
@@ -11,16 +14,82 @@ type ModelListValidationOptions = {
 	apiKey: string;
 	modelsUrl: string;
 	signal?: AbortSignal;
+	fetch?: typeof globalThis.fetch;
 };
 
 const VALIDATION_TIMEOUT_MS = 15_000;
 
 /** Most characters of an upstream body echoed into a validation error. */
 const VALIDATION_DETAILS_LIMIT = 200;
+const VALIDATION_BODY_LIMIT = 64 * 1024;
 
-function boundedDetails(text: string): string {
-	const trimmed = text.trim();
+function redactSecrets(text: string, apiKey: string): string {
+	let safe = text;
+	if (apiKey) {
+		const escaped = [...apiKey].map(char => char.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&"));
+		const interspersed = new RegExp(escaped.join("[\\s\\x00-\\x1f\\x7f-\\x9f]*"), "gu");
+		safe = safe.replace(interspersed, "[REDACTED]");
+	}
+	safe = sanitizeDisplayLine(safe);
+	safe = safe.replace(/[\x00-\x1f\x7f-\x9f]/gu, " ");
+	if (apiKey) safe = safe.replaceAll(apiKey, "[REDACTED]");
+	// Upstream errors sometimes echo credentials under a field name instead of
+	// returning the exact bearer value. Redact those values before retaining any
+	// bounded diagnostic snippet.
+	safe = safe
+		.replace(/(Bearer\s+)([^\s,}"']+)/giu, "$1[REDACTED]")
+		.replace(
+			/(["']?(?:authorization|proxy-authorization|api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|token|secret|password)["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,}\]]+)/giu,
+			"$1[REDACTED]",
+		);
+	return safe;
+}
+
+function boundedDetails(text: string, apiKey: string): string {
+	const trimmed = redactSecrets(text, apiKey).trim();
 	return trimmed.length > VALIDATION_DETAILS_LIMIT ? `${trimmed.slice(0, VALIDATION_DETAILS_LIMIT)}…` : trimmed;
+}
+
+async function readBoundedBody(response: Response): Promise<string> {
+	const contentLength = Number(response.headers.get("content-length"));
+	if (Number.isFinite(contentLength) && contentLength > VALIDATION_BODY_LIMIT)
+		return "[response body exceeded validation limit]";
+	if (!response.body) return "";
+	const reader = response.body.getReader();
+	const chunks: Uint8Array[] = [];
+	let total = 0;
+	try {
+		while (total <= VALIDATION_BODY_LIMIT) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			if (value) {
+				chunks.push(value);
+				total += value.byteLength;
+			}
+		}
+	} finally {
+		await reader.cancel().catch(() => {});
+	}
+	const bytes = new Uint8Array(Math.min(total, VALIDATION_BODY_LIMIT));
+	let offset = 0;
+	for (const chunk of chunks) {
+		const take = Math.min(chunk.byteLength, bytes.length - offset);
+		if (take <= 0) break;
+		bytes.set(chunk.subarray(0, take), offset);
+		offset += take;
+	}
+	return new TextDecoder().decode(bytes);
+}
+
+function errorDetails(error: unknown, apiKey: string): string {
+	return boundedDetails(error instanceof Error ? error.message : String(error), apiKey);
+}
+
+function validationFailure(provider: string, apiKey: string, suffix: string): Error {
+	const details = boundedDetails(suffix, apiKey);
+	return new Error(
+		details ? `${provider} API key validation failed: ${details}` : `${provider} API key validation failed`,
+	);
 }
 
 /**
@@ -31,21 +100,33 @@ function boundedDetails(text: string): string {
 export async function validateOpenAICompatibleApiKey(options: OpenAICompatibleValidationOptions): Promise<void> {
 	const timeoutSignal = AbortSignal.timeout(VALIDATION_TIMEOUT_MS);
 	const signal = options.signal ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal;
+	const fetchImpl = options.fetch ?? globalThis.fetch;
+	if (/[\x00-\x1f\x7f-\x9f]/u.test(options.apiKey))
+		throw new Error(`${options.provider} API key contains unsupported control characters`);
 
-	const response = await fetch(`${options.baseUrl}/chat/completions`, {
-		method: "POST",
-		headers: {
-			"Content-Type": "application/json",
-			Authorization: `Bearer ${options.apiKey}`,
-		},
-		body: JSON.stringify({
-			model: options.model,
-			messages: [{ role: "user", content: "ping" }],
-			max_tokens: 1,
-			temperature: 0,
-		}),
-		signal,
-	});
+	let response: Response;
+	try {
+		response = await fetchImpl(`${options.baseUrl}/chat/completions`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: `Bearer ${options.apiKey}`,
+			},
+			body: JSON.stringify({
+				model: options.model,
+				messages: [{ role: "user", content: "ping" }],
+				max_tokens: 1,
+				temperature: 0,
+			}),
+			signal,
+		});
+	} catch (error) {
+		throw validationFailure(
+			options.provider,
+			options.apiKey,
+			`request failed (${errorDetails(error, options.apiKey)})`,
+		);
+	}
 
 	if (response.ok) {
 		return;
@@ -53,7 +134,7 @@ export async function validateOpenAICompatibleApiKey(options: OpenAICompatibleVa
 
 	let details = "";
 	try {
-		details = boundedDetails(await response.text());
+		details = boundedDetails(await readBoundedBody(response), options.apiKey);
 	} catch {
 		// ignore body parse errors, status is enough
 	}
@@ -77,38 +158,51 @@ function isModelList(parsed: unknown): boolean {
 }
 
 /**
- * Validate an API key against a provider models endpoint.
+ * Validate a provider models endpoint's reachability and response shape.
  *
  * Useful for providers where access to specific models may vary by plan and
- * should not block key validation.
+ * should not block login; an available model list is not proof that an
+ * authenticated inference request will succeed for the supplied key.
  *
  * A 200 status alone is NOT accepted: a captive portal, misrouting proxy, or
- * broken gateway can answer 200 with an HTML page or an empty JSON object, and
- * accepting the key on status alone would store a credential that was never
- * actually checked. The body must parse as JSON and carry a recognizable model
- * list before the key is considered validated.
+ * broken gateway can answer 200 with an HTML page or an empty JSON object.
+ * The body must parse as JSON and carry a recognizable model list before the
+ * endpoint is considered reachable. This catalog check is not proof that
+ * authenticated inference is entitled to use the supplied key.
  */
 export async function validateApiKeyAgainstModelsEndpoint(options: ModelListValidationOptions): Promise<void> {
 	const timeoutSignal = AbortSignal.timeout(VALIDATION_TIMEOUT_MS);
 	const signal = options.signal ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal;
+	const fetchImpl = options.fetch ?? globalThis.fetch;
+	if (/[\x00-\x1f\x7f-\x9f]/u.test(options.apiKey))
+		throw new Error(`${options.provider} API key contains unsupported control characters`);
 
-	const response = await fetch(options.modelsUrl, {
-		method: "GET",
-		headers: {
-			Authorization: `Bearer ${options.apiKey}`,
-		},
-		signal,
-	});
+	let response: Response;
+	try {
+		response = await fetchImpl(options.modelsUrl, {
+			method: "GET",
+			headers: {
+				Authorization: `Bearer ${options.apiKey}`,
+			},
+			signal,
+		});
+	} catch (error) {
+		throw validationFailure(
+			options.provider,
+			options.apiKey,
+			`request failed (${errorDetails(error, options.apiKey)})`,
+		);
+	}
 
 	if (response.ok) {
 		let body: string;
 		try {
-			body = await response.text();
+			body = await readBoundedBody(response);
 		} catch (error) {
-			throw new Error(
-				`${options.provider} API key validation failed: the models endpoint response body could not be read (${
-					error instanceof Error ? error.message : String(error)
-				})`,
+			throw validationFailure(
+				options.provider,
+				options.apiKey,
+				`the models endpoint response body could not be read (${errorDetails(error, options.apiKey)})`,
 			);
 		}
 		let parsed: unknown;
@@ -117,7 +211,7 @@ export async function validateApiKeyAgainstModelsEndpoint(options: ModelListVali
 		} catch {
 			throw new Error(
 				`${options.provider} API key validation failed: the models endpoint returned ${response.status} with a non-JSON body` +
-					`${body.trim() ? ` (${boundedDetails(body)})` : ""}. Refusing to accept the key on status alone.`,
+					`${body.trim() ? ` (${boundedDetails(body, options.apiKey)})` : ""}. Refusing to accept the key on status alone.`,
 			);
 		}
 		if (!isModelList(parsed)) {
@@ -131,7 +225,7 @@ export async function validateApiKeyAgainstModelsEndpoint(options: ModelListVali
 
 	let details = "";
 	try {
-		details = boundedDetails(await response.text());
+		details = boundedDetails(await readBoundedBody(response), options.apiKey);
 	} catch {
 		// ignore body parse errors, status is enough
 	}
