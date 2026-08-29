@@ -34,6 +34,16 @@ function validateChatCompletions(): Promise<void> {
 	});
 }
 
+function validateInferenceProbe(): Promise<void> {
+	return validateOpenAICompatibleApiKey({
+		provider: "Command Code GOAT",
+		apiKey: "cmd-test",
+		baseUrl: "https://example.invalid/v1",
+		model: "zai-org/GLM-5.3",
+		requireInferenceResponse: true,
+	});
+}
+
 async function validationErrorMessage(validation: () => Promise<void>): Promise<string> {
 	try {
 		await validation();
@@ -71,6 +81,22 @@ describe("validateApiKeyAgainstModelsEndpoint", () => {
 		await validate();
 		stubFetch(() => new Response(JSON.stringify({ models: [{ id: "m" }] }), { status: 200 }));
 		await validate();
+	});
+
+	it("accepts a catalog response ending exactly at the body limit", async () => {
+		const prefix = JSON.stringify({ object: "list", data: [] });
+		const body = `${prefix}${" ".repeat(64 * 1024 - prefix.length)}`;
+		expect(new TextEncoder().encode(body).byteLength).toBe(64 * 1024);
+		stubFetch(() => new Response(body, { status: 200 }));
+		await validate();
+	});
+
+	it("rejects a catalog response over the body limit", async () => {
+		const prefix = JSON.stringify({ object: "list", data: [] });
+		const body = `${prefix}${" ".repeat(64 * 1024 + 1 - prefix.length)}`;
+		expect(new TextEncoder().encode(body).byteLength).toBe(64 * 1024 + 1);
+		stubFetch(() => new Response(body, { status: 200 }));
+		await expect(validate()).rejects.toThrow(/validation limit/);
 	});
 
 	it("rejects a 200 with a non-JSON body instead of accepting on status alone", async () => {
@@ -129,5 +155,99 @@ describe("validateApiKeyAgainstModelsEndpoint", () => {
 			throw new Error("network down");
 		}) as unknown as typeof globalThis.fetch;
 		await expect(validate()).rejects.toThrow("network down");
+	});
+
+	it("requires an inference response instead of accepting a public catalog-shaped body", async () => {
+		stubFetch(() => new Response(JSON.stringify({ object: "list", data: [{ id: "m" }] }), { status: 200 }));
+		await expect(validateInferenceProbe()).rejects.toThrow(/no choices/);
+		stubFetch(() => new Response(JSON.stringify({ choices: [{}] }), { status: 200 }));
+		await expect(validateInferenceProbe()).rejects.toThrow(/no choices/);
+		stubFetch(() => new Response(JSON.stringify({ choices: [{ message: { content: null } }] }), { status: 200 }));
+		await expect(validateInferenceProbe()).rejects.toThrow(/no choices/);
+		stubFetch(() => new Response(JSON.stringify({ choices: [{ message: { content: "   " } }] }), { status: 200 }));
+		await expect(validateInferenceProbe()).rejects.toThrow(/no choices/);
+	});
+
+	it("rejects forbidden inference entitlement", async () => {
+		stubFetch(() => new Response('{"error":"forbidden"}', { status: 403 }));
+		await expect(validateInferenceProbe()).rejects.toThrow(/validation failed \(403\)/);
+	});
+
+	it("rejects malformed and oversized inference responses with bounded diagnostics", async () => {
+		stubFetch(() => new Response(`<html>${"x".repeat(100_000)}</html>`, { status: 200 }));
+		const malformed = await validationErrorMessage(validateInferenceProbe);
+		expect(malformed).toContain("validation limit");
+		expect(malformed.length).toBeLessThan(400);
+
+		stubFetch(() => new Response("x".repeat(100_000), { status: 200 }));
+		const oversized = await validationErrorMessage(validateInferenceProbe);
+		expect(oversized).toContain("validation limit");
+		expect(oversized.length).toBeLessThan(400);
+	});
+
+	it("propagates inference probe aborts without accepting the key", async () => {
+		const controller = new AbortController();
+		globalThis.fetch = (async (_input, init) => {
+			controller.abort();
+			init?.signal?.throwIfAborted();
+			return new Response(null, { status: 200 });
+		}) as typeof globalThis.fetch;
+		await expect(
+			validateOpenAICompatibleApiKey({
+				provider: "Command Code GOAT",
+				apiKey: "cmd-test",
+				baseUrl: "https://example.invalid/v1",
+				model: "zai-org/GLM-5.3",
+				requireInferenceResponse: true,
+				signal: controller.signal,
+			}),
+		).rejects.toThrow("Login cancelled");
+	});
+
+	it("aborts a hanging response body", async () => {
+		const controller = new AbortController();
+		globalThis.fetch = (async () =>
+			new Response(
+				new ReadableStream({
+					start(stream) {
+						stream.enqueue(new TextEncoder().encode('{"choices":['));
+					},
+				}),
+				{ status: 200 },
+			)) as unknown as typeof globalThis.fetch;
+		const pending = validateOpenAICompatibleApiKey({
+			provider: "Command Code GOAT",
+			apiKey: "cmd-test",
+			baseUrl: "https://example.invalid/v1",
+			model: "zai-org/GLM-5.3",
+			requireInferenceResponse: true,
+			signal: controller.signal,
+		});
+		setTimeout(() => controller.abort(), 10);
+		await expect(pending).rejects.toThrow("Login cancelled");
+	});
+
+	it("reports an internal deadline separately from caller cancellation", async () => {
+		globalThis.fetch = (async () =>
+			new Response(
+				new ReadableStream({
+					start(stream) {
+						stream.enqueue(new TextEncoder().encode('{"choices":['));
+					},
+				}),
+				{ status: 200 },
+			)) as unknown as typeof globalThis.fetch;
+		const error = await validationErrorMessage(() =>
+			validateOpenAICompatibleApiKey({
+				provider: "Command Code GOAT",
+				apiKey: "cmd-test",
+				baseUrl: "https://example.invalid/v1",
+				model: "zai-org/GLM-5.3",
+				requireInferenceResponse: true,
+				timeoutMs: 10,
+			}),
+		);
+		expect(error).toContain("validation request timed out");
+		expect(error).not.toContain("cmd-test");
 	});
 });

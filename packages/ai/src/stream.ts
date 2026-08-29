@@ -116,6 +116,7 @@ const serviceProviderMap: Record<string, KeyResolver> = {
 	mistral: "MISTRAL_API_KEY",
 	minimax: "MINIMAX_API_KEY",
 	"minimax-code": "MINIMAX_CODE_API_KEY",
+	"commandcode-goat": "CMD_API_KEY",
 	"minimax-code-cn": "MINIMAX_CODE_CN_API_KEY",
 	"opencode-go": "OPENCODE_API_KEY",
 	"opencode-zen": "OPENCODE_API_KEY",
@@ -222,6 +223,7 @@ export function listProvidersWithEnvKey(): string[] {
  * Used to give OpenCode users an accurate headless auth diagnostic (#755).
  */
 const OPENCODE_SUBSCRIPTION_PROVIDERS = new Set(["opencode-go", "opencode-zen"]);
+const API_KEY_LOGIN_PROVIDERS = new Set(["commandcode-goat"]);
 
 /**
  * Provider-specific credential guidance appended to "no credential" errors.
@@ -240,11 +242,15 @@ export function formatProviderCredentialHint(provider: string): string {
 	const resolver = serviceProviderMap[provider];
 	const envVar = typeof resolver === "string" ? resolver : undefined;
 	const isOpenCodeSubscription = OPENCODE_SUBSCRIPTION_PROVIDERS.has(provider);
+	const isApiKeyLoginProvider = API_KEY_LOGIN_PROVIDERS.has(provider);
 	const parts: string[] = [];
 	if (isOpenCodeSubscription) {
 		parts.push(
 			"OpenCode subscriptions authenticate with an API key (created at https://opencode.ai/auth), not a separate session/OAuth token.",
 		);
+	}
+	if (isApiKeyLoginProvider) {
+		parts.push("Command Code GOAT uses an API key from https://commandcode.ai/studio/#api-keys.");
 	}
 	if (provider === "jetbrains-junie") {
 		parts.push(

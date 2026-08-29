@@ -17,6 +17,7 @@ import {
 import { streamOpenAICompletions } from "@gajae-code/ai/providers/openai-completions";
 import { kNoAuth, MODEL_ROLE_IDS, ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import {
+	findInitialModel,
 	type ModelLookupRegistry,
 	resolveModelFromString,
 	resolveModelOverride,
@@ -48,6 +49,34 @@ test("package exports keep extracted model helpers internal", () => {
 	expect(packageJson.exports["./config/model-equivalence"]).toBeUndefined();
 	expect(packageJson.exports["./config/*"]).toBeDefined();
 	expect(packageJson.exports["./*"]).toBeDefined();
+});
+
+test("Command Code fresh descriptor routes Claude through Anthropic and others through OpenAI", async () => {
+	resetSettingsForTest();
+	const tempDir = path.join(os.tmpdir(), `pi-test-commandcode-fresh-${Snowflake.next()}`);
+	fs.mkdirSync(tempDir, { recursive: true });
+	const modelsPath = path.join(tempDir, "models.json");
+	const auth = await AuthStorage.create(path.join(tempDir, "auth.db"));
+	const previousFetch = globalThis.fetch;
+	globalThis.fetch = (async () =>
+		new Response(JSON.stringify({ data: [{ id: "claude-opus-5.5" }, { id: "zai-org/GLM-5.3" }] }), {
+			status: 200,
+		})) as unknown as typeof fetch;
+	try {
+		await auth.set("commandcode-goat", { type: "api_key", key: "cmd-test-key" });
+		const registry = new ModelRegistry(auth, modelsPath);
+		await registry.refreshProvider("commandcode-goat", "online");
+		const models = registry.getAll().filter(model => model.provider === "commandcode-goat");
+		expect(models.find(model => model.id === "claude-opus-5.5")).toMatchObject({
+			api: "anthropic-messages",
+			baseUrl: "https://api.commandcode.ai/provider",
+		});
+	} finally {
+		globalThis.fetch = previousFetch;
+		auth.close();
+		fs.rmSync(tempDir, { recursive: true, force: true });
+		resetSettingsForTest();
+	}
 });
 
 describe("ModelRegistry", () => {

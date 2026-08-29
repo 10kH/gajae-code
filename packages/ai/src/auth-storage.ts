@@ -1105,13 +1105,20 @@ function safeUsageReport(report: UsageReport): SafeUsageReport {
 }
 
 function scrubHealthReason(reason: unknown, secrets: readonly string[] = []): string {
-	let value = reason instanceof Error ? reason.message : String(reason);
+	let value = (reason instanceof Error ? reason.message : String(reason)).replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "");
 	for (const secret of secrets) {
-		if (secret.length > 0) value = value.split(secret).join("[redacted]");
+		if (secret.length > 0) {
+			value = value.split(secret).join("[redacted]");
+			const escaped = [...secret].map(char => char.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&"));
+			value = value.replace(new RegExp(escaped.join("\\s*"), "gu"), "[redacted]");
+		}
 	}
 	value = value.replace(/bearer\s+[^\s,;]+/gi, "Bearer [redacted]");
 	value = value.replace(/(api[_-]?key|token|secret|authorization)[=:]\s*[^\s,;]+/gi, "$1=[redacted]");
-	value = value.replace(/[\r\n\t ]+/g, " ").trim();
+	value = value
+		.replace(/[\x00-\x1f\x7f-\x9f]+/gu, " ")
+		.replace(/[\r\n\t ]+/g, " ")
+		.trim();
 	if (value.length > 256) value = `${value.slice(0, 253)}...`;
 	return value || "credential check failed";
 }
@@ -3337,6 +3344,12 @@ export class AuthStorage {
 			case "opencode-go": {
 				const { loginOpenCode } = await import("./utils/oauth/opencode");
 				const apiKey = await loginOpenCode(ctrl);
+				await saveApiKeyCredential(apiKey);
+				return;
+			}
+			case "commandcode-goat": {
+				const { loginCommandCode } = await import("./utils/oauth/commandcode");
+				const apiKey = await loginCommandCode(ctrl);
 				await saveApiKeyCredential(apiKey);
 				return;
 			}

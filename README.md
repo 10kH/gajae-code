@@ -131,7 +131,7 @@ gjc setup provider --preset commandcode-goat   # Command Code GOAT plan (CMD_API
 gjc setup provider --preset cline-pass         # ClinePass (CLINE_API_KEY)
 ```
 
-- **Command Code GOAT** — pulls the provider's live `/models` catalog; `claude-*` models route through native Anthropic Messages, everything else through Chat Completions. Aliases: `commandcode`, `goat`.
+- **Command Code GOAT** — discovers the provider's live `/provider/v1/models` catalog and keeps every discovered model, including Claude-named IDs, on the provider's OpenAI-compatible `/chat/completions` transport. Login verifies entitlement with a fixed harmless inference probe before persisting credentials. Aliases: `commandcode`, `goat`.
 - **ClinePass** — no hardcoded models; GJC fetches Cline's live catalog the same way Cline generates its own. Aliases: `clinepass`, `cline`.
 - Also available as presets: `minimax`, `minimax-cn`, `glm`, `alibaba-token-plan` — or `/provider add --preset <name>` inside the TUI.
 

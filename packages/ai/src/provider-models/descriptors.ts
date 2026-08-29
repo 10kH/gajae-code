@@ -14,6 +14,7 @@ import {
 	bizrouterModelManagerOptions,
 	cerebrasModelManagerOptions,
 	cloudflareAiGatewayModelManagerOptions,
+	commandCodeModelManagerOptions,
 	deepinfraModelManagerOptions,
 	deepseekModelManagerOptions,
 	firepassModelManagerOptions,
@@ -203,6 +204,7 @@ export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
 	),
 	descriptor("opencode-zen", "claude-sonnet-4-6", config => opencodeZenModelManagerOptions(config)),
 	descriptor("opencode-go", "kimi-k2.5", config => opencodeGoModelManagerOptions(config)),
+	descriptor("commandcode-goat", "zai-org/GLM-5.3", config => commandCodeModelManagerOptions(config)),
 	catalogDescriptor(
 		"openrouter",
 		"openai/gpt-5.4",

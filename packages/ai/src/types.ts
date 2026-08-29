@@ -167,6 +167,7 @@ export const KNOWN_PROVIDERS = [
 	"mistral",
 	"minimax",
 	"opencode-go",
+	"commandcode-goat",
 	"opencode-zen",
 	"opengateway",
 	"bizrouter",

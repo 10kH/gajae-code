@@ -832,7 +832,7 @@ export interface OpenCodeModelManagerConfig {
 }
 
 function openCodeModelManagerOptions(
-	providerId: "opencode-go" | "opencode-zen",
+	providerId: "opencode-go" | "opencode-zen" | "commandcode-goat",
 	defaultBaseUrl: string,
 	config?: OpenCodeModelManagerConfig,
 ): ModelManagerOptions<"openai-completions"> {
@@ -871,6 +871,46 @@ export function opencodeGoModelManagerOptions(
 	config?: OpenCodeModelManagerConfig,
 ): ModelManagerOptions<"openai-completions"> {
 	return openCodeModelManagerOptions("opencode-go", "https://opencode.ai/zen/go/v1", config);
+}
+
+export function commandCodeModelManagerOptions(config?: OpenCodeModelManagerConfig): ModelManagerOptions<Api> {
+	const apiKey = config?.apiKey;
+	const openAiBaseUrl = config?.baseUrl ?? "https://api.commandcode.ai/provider/v1";
+	const anthropicBaseUrl = openAiBaseUrl.replace(/\/v1\/?$/u, "");
+	return {
+		providerId: "commandcode-goat",
+		...(apiKey && {
+			fetchDynamicModels: () =>
+				fetchOpenAICompatibleModels<Api>({
+					api: "openai-completions",
+					provider: "commandcode-goat",
+					baseUrl: openAiBaseUrl,
+					apiKey,
+					mapModel: (_entry, defaults) => {
+						const isClaude = /(?:^|\/)claude(?:[\w.-]|$)/iu.test(defaults.id);
+						if (isClaude) {
+							return {
+								...defaults,
+								api: "anthropic-messages",
+								baseUrl: anthropicBaseUrl,
+							};
+						}
+						return {
+							...defaults,
+							api: "openai-completions",
+							compat: {
+								...defaults.compat,
+								supportsStore: false,
+								supportsDeveloperRole: false,
+								supportsReasoningEffort: false,
+								maxTokensField: "max_tokens",
+								reasoningContentField: "reasoning_content",
+							},
+						};
+					},
+				}),
+		}),
+	};
 }
 
 // ---------------------------------------------------------------------------
