@@ -14,7 +14,13 @@ import {
 	tryParseJson,
 } from "@gajae-code/utils";
 import type { ExtensionModule } from "../capability/extension-module";
-import { invalidate as invalidateFsCache, readDirEntries, readFile } from "../capability/fs";
+import {
+	invalidate as invalidateFsCache,
+	type ReadFileOptions,
+	type ReadScope,
+	readDirEntries,
+	readFile,
+} from "../capability/fs";
 import { parseRuleConditionAndScope, type Rule, type RuleFrontmatter } from "../capability/rule";
 import type { Skill, SkillFrontmatter } from "../capability/skill";
 import type { LoadContext, LoadResult, SourceMeta } from "../capability/types";
@@ -189,6 +195,21 @@ export function getProjectPath(ctx: LoadContext, source: SourceId, subpath: stri
 	if (!paths.projectDir) return null;
 
 	return path.join(ctx.cwd, paths.projectDir, subpath);
+}
+
+/** Build the filesystem authority for a provider read. */
+export function getReadOptions(
+	ctx: Pick<LoadContext, "home" | "isolatedHome" | "userAgentDir">,
+	scope: ReadScope,
+): ReadFileOptions | undefined {
+	if (!ctx.isolatedHome) return undefined;
+	return {
+		isolatedHome: true,
+		home: ctx.home,
+		userAgentDir: scope === "native" ? ctx.userAgentDir : undefined,
+		scope,
+		bypassCache: true,
+	};
 }
 
 /**
@@ -423,6 +444,8 @@ export interface ScanSkillsFromDirOptions {
 	requireDescription?: boolean;
 	/** Optional physical root that every discovered skill must remain within. */
 	containmentRoot?: string;
+	/** Filesystem authority for explicit-home reads. */
+	scope?: ReadScope;
 }
 
 // Stable ordering used for skill lists in prompts: name (case-insensitive), then name, then path.
@@ -483,7 +506,9 @@ export async function scanSkillsFromDir(
 	const items: Skill[] = [];
 	const warnings: string[] = [];
 	const { dir, level, providerId, requireDescription = false, containmentRoot } = options;
-	const scanDir = await canonicalizePathWithinHome(_ctx, dir, containmentRoot);
+	const scope = options.scope ?? (level === "user" ? "user" : "project");
+	const readOptions = getReadOptions(_ctx, scope);
+	const scanDir = await canonicalizePathWithinHome(_ctx, dir, containmentRoot, scope);
 	if (!scanDir) return { items, warnings };
 
 	let entries: fs.Dirent[];
@@ -674,6 +699,7 @@ export async function scanSkillsFromDir(
 			_ctx,
 			path.join(scanDir, entry.name, "SKILL.md"),
 			containmentRoot,
+			scope,
 		);
 		if (!skillPath) continue;
 		work.push(loadSkill(skillPath));
@@ -790,11 +816,15 @@ export async function loadFilesFromDir<T>(
 		recursive?: boolean;
 		/** Optional physical root that every discovered file must remain within. */
 		containmentRoot?: string;
+		/** Filesystem authority for explicit-home reads. */
+		scope?: ReadScope;
 	},
 ): Promise<LoadResult<T>> {
 	const items: T[] = [];
 	const warnings: string[] = [];
-	const scanDir = await canonicalizePathWithinHome(_ctx, dir, options.containmentRoot);
+	const scope = options.scope ?? (level === "user" ? "user" : "project");
+	const readOptions = getReadOptions(_ctx, scope);
+	const scanDir = await canonicalizePathWithinHome(_ctx, dir, options.containmentRoot, scope);
 	if (!scanDir) return { items, warnings };
 	// Build glob pattern based on extensions and recursion
 	const { extensions, recursive = false } = options;
@@ -831,9 +861,10 @@ export async function loadFilesFromDir<T>(
 				_ctx,
 				path.join(scanDir, match.path),
 				options.containmentRoot,
+				scope,
 			);
 			if (!filePath) return null;
-			const content = await readFile(filePath);
+			const content = await readFile(filePath, readOptions);
 			return { filePath, content };
 		}),
 	);
@@ -879,10 +910,11 @@ interface ExtensionModuleManifest {
 async function readExtensionModuleManifest(
 	_ctx: LoadContext,
 	packageJsonPath: string,
+	scope: ReadScope,
 ): Promise<ExtensionModuleManifest | null> {
-	const resolvedPackageJsonPath = await canonicalizePathWithinHome(_ctx, packageJsonPath);
+	const resolvedPackageJsonPath = await canonicalizePathWithinHome(_ctx, packageJsonPath, undefined, scope);
 	if (!resolvedPackageJsonPath) return null;
-	const content = await readFile(resolvedPackageJsonPath);
+	const content = await readFile(resolvedPackageJsonPath, getReadOptions(_ctx, scope));
 	if (!content) return null;
 
 	const pkg = tryParseJson<{ gjc?: ExtensionModuleManifest; pi?: ExtensionModuleManifest }>(content);
@@ -904,9 +936,15 @@ async function readExtensionModuleManifest(
  * No recursion beyond one level. Complex packages must use package.json manifest.
  * Uses native glob for fast filesystem scanning with gitignore support.
  */
-export async function discoverExtensionModulePaths(ctx: LoadContext, dir: string): Promise<string[]> {
+export async function discoverExtensionModulePaths(
+	ctx: LoadContext,
+	dir: string,
+	options: { scope?: ReadScope } = {},
+): Promise<string[]> {
 	const discovered = new Set<string>();
-	const discoveryDir = await canonicalizePathWithinHome(ctx, dir);
+	const scope = options.scope ?? "project";
+	const readOptions = getReadOptions(ctx, scope);
+	const discoveryDir = await canonicalizePathWithinHome(ctx, dir, undefined, scope);
 	if (!discoveryDir) return [];
 	const { FileType } = await discoveryNatives();
 	// Find all candidate files in parallel using glob
@@ -922,7 +960,12 @@ export async function discoverExtensionModulePaths(ctx: LoadContext, dir: string
 	// Process direct files
 	for (const match of directFiles) {
 		if (match.path.includes("/")) continue;
-		const candidatePath = await canonicalizePathWithinHome(ctx, path.join(discoveryDir, match.path));
+		const candidatePath = await canonicalizePathWithinHome(
+			ctx,
+			path.join(discoveryDir, match.path),
+			undefined,
+			scope,
+		);
 		if (candidatePath) discovered.add(candidatePath);
 	}
 	// Track which subdirectories have package.json manifests with declared extensions
@@ -930,7 +973,7 @@ export async function discoverExtensionModulePaths(ctx: LoadContext, dir: string
 	for (const match of packageJsonFiles) {
 		const subdir = path.dirname(match.path); // e.g., "my-extension"
 		const packageJsonPath = path.join(discoveryDir, match.path);
-		const manifest = await readExtensionModuleManifest(ctx, packageJsonPath);
+		const manifest = await readExtensionModuleManifest(ctx, packageJsonPath, scope);
 		const declaredExtensions =
 			manifest?.extensions?.filter((extPath): extPath is string => typeof extPath === "string") ?? [];
 		if (declaredExtensions.length === 0) continue;
@@ -938,19 +981,19 @@ export async function discoverExtensionModulePaths(ctx: LoadContext, dir: string
 		const subdirPath = path.join(discoveryDir, subdir);
 		for (const extPath of declaredExtensions) {
 			const configuredPath = path.resolve(subdirPath, extPath);
-			const resolvedConfiguredPath = await canonicalizePathWithinHome(ctx, configuredPath);
+			const resolvedConfiguredPath = await canonicalizePathWithinHome(ctx, configuredPath, undefined, scope);
 			if (!resolvedConfiguredPath) continue;
 			let resolvedExtPath = resolvedConfiguredPath;
-			const entries = await readDirEntries(resolvedExtPath);
+			const entries = await readDirEntries(resolvedExtPath, readOptions);
 			if (entries.length !== 0) {
 				const pluginFilePath = entries.find(
 					e => e.isFile() && (e.name === "index.ts" || e.name === "index.js"),
 				)?.name;
 				resolvedExtPath = pluginFilePath ? path.join(resolvedExtPath, pluginFilePath) : resolvedExtPath;
 			}
-			const canonicalExtPath = await canonicalizePathWithinHome(ctx, resolvedExtPath);
+			const canonicalExtPath = await canonicalizePathWithinHome(ctx, resolvedExtPath, undefined, scope);
 			if (!canonicalExtPath) continue;
-			const content = await readFile(canonicalExtPath);
+			const content = await readFile(canonicalExtPath, readOptions);
 			if (content !== null) {
 				discovered.add(canonicalExtPath);
 			}
@@ -967,7 +1010,12 @@ export async function discoverExtensionModulePaths(ctx: LoadContext, dir: string
 		}
 	}
 	for (const preferredPath of preferredIndexBySubdir.values()) {
-		const candidatePath = await canonicalizePathWithinHome(ctx, path.join(discoveryDir, preferredPath));
+		const candidatePath = await canonicalizePathWithinHome(
+			ctx,
+			path.join(discoveryDir, preferredPath),
+			undefined,
+			scope,
+		);
 		if (candidatePath) discovered.add(candidatePath);
 	}
 	return [...discovered];
@@ -1239,12 +1287,12 @@ export async function canonicalizePathWithinHome(
 	ctx: Pick<LoadContext, "home" | "isolatedHome" | "userAgentDir">,
 	target: string,
 	containmentRoot?: string,
+	scope: ReadScope = "project",
 ): Promise<string | undefined> {
 	if (!ctx.isolatedHome) return target;
+	const roots = scope === "native" ? [ctx.home, ctx.userAgentDir] : [ctx.home];
 	const canonicalRoots = await Promise.all(
-		[ctx.home, ctx.userAgentDir]
-			.filter((root): root is string => typeof root === "string")
-			.map(canonicalizeThroughExistingAncestor),
+		roots.filter((root): root is string => typeof root === "string").map(canonicalizeThroughExistingAncestor),
 	);
 	const canonicalTarget = await canonicalizeThroughExistingAncestor(target);
 	if (!canonicalRoots.some(root => isWithinOrEqual(root, canonicalTarget))) return undefined;
