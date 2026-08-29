@@ -1703,7 +1703,10 @@ function buildSessionMetadata(
 			officialAnthropicEndpoint = false;
 		}
 	}
-	if (officialAnthropicEndpoint) {
+	// Without the registry owner, do not query shared auth storage: an unscoped
+	// lookup can attribute a registry-scoped API-key request to another OAuth
+	// account. Compatibility facades therefore retain session_id-only metadata.
+	if (officialAnthropicEndpoint && owner) {
 		const accountUuid = authStorage?.getOAuthAccountId("anthropic", credentialSessionId, { owner });
 		if (typeof accountUuid === "string" && accountUuid.length > 0) {
 			userId.account_uuid = accountUuid;
@@ -8277,7 +8280,10 @@ export class AgentSession {
 				this.#modelRegistry.authStorage,
 				this.credentialSessionId,
 				context.model ?? this.model,
-				this.#modelRegistry.getAuthStorageOwner(),
+				// Optional call: the metadata resolver runs on every prompt, and `owner` is an
+				// optional `buildSessionMetadata` argument. The auth-credential paths keep the
+				// strict call because they genuinely require a real registry owner.
+				this.#modelRegistry.getAuthStorageOwner?.(),
 			),
 		);
 	}
@@ -21603,7 +21609,8 @@ export class AgentSession {
 						this.#modelRegistry.authStorage,
 						this.credentialSessionId,
 						model,
-						this.#modelRegistry.getAuthStorageOwner(),
+						// Optional for the same reason as the main metadata resolver above.
+						this.#modelRegistry.getAuthStorageOwner?.(),
 					),
 					reasoning: toReasoningEffort(this.thinkingLevel),
 					hideThinkingSummary: this.agent.hideThinkingSummary,
