@@ -59,6 +59,7 @@ import {
 } from "./output-meta";
 import { resolveToCwd } from "./path-utils";
 import { formatToolWorkingDirectory, replaceTabs } from "./render-utils";
+import { checkTmuxSelfInjection } from "./tmux-self-injection-guard";
 import { ToolAbortError, ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout, TOOL_TIMEOUTS } from "./tool-timeouts";
@@ -1053,6 +1054,19 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			...internalUrlOptions,
 			ensureLocalParentDirs: this.session.bashRestrictionProfile !== "read-only",
 		});
+		// Issue #5039: refuse tmux write verbs whose target resolves to this
+		// agent's own tmux pane — such bytes forge a human `user` turn in the
+		// transcript. This is after command expansion but before any spawn, so
+		// blocked attempts inject no bytes and create no transcript turn.
+		if (this.session.bashRestrictionProfile !== "read-only") {
+			const injection = await checkTmuxSelfInjection(command, {
+				env: process.env,
+				cwd: this.session.cwd,
+			});
+			if (injection.block) {
+				throw new ToolError(injection.reason ?? "Blocked: tmux self-pane injection.");
+			}
+		}
 		const expandedEnv = env
 			? Object.fromEntries(
 					await Promise.all(

@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Added
+
+- `fuzzyFind` subsequence scoring supports Hangul chosung (초성) matching: a bare consonant jamo in the query matches any syllable with that initial consonant. Exact, prefix, and contains tiers are unchanged, so literal matches keep outranking chosung matches.
 ## [0.15.4] - 2026-08-29
 
 ### Fixed

@@ -302,9 +302,9 @@ const expectedProfiles: Array<{
 		name: "glm-eco",
 		requiredProviders: ["zai"],
 		mapping: {
-			default: "zai/glm-5.3:low",
-			executor: "zai/glm-5.3:low",
-			planner: "zai/glm-5.3:low",
+			default: "zai/glm-5.3-flash:low",
+			executor: "zai/glm-5.3-flash:low",
+			planner: "zai/glm-5.3-flash:low",
 			critic: "zai/glm-5.3:high",
 			architect: "zai/glm-5.3:high",
 		},
@@ -314,7 +314,7 @@ const expectedProfiles: Array<{
 		requiredProviders: ["zai"],
 		mapping: {
 			default: "zai/glm-5.3:high",
-			executor: "zai/glm-5.3:low",
+			executor: "zai/glm-5.3-flash:low",
 			planner: "zai/glm-5.3:high",
 			critic: "zai/glm-5.3:high",
 			architect: "zai/glm-5.3:max",
@@ -325,7 +325,7 @@ const expectedProfiles: Array<{
 		requiredProviders: ["zai"],
 		mapping: {
 			default: "zai/glm-5.3:max",
-			executor: "zai/glm-5.3:high",
+			executor: "zai/glm-5.3-flash:high",
 			planner: "zai/glm-5.3:high",
 			critic: "zai/glm-5.3:max",
 			architect: "zai/glm-5.3:max",

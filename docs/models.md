@@ -268,7 +268,7 @@ Built-in profiles are grouped by provider mix and tier:
 - Alibaba Token Plan: `alibaba-token-plan-balanced` preserves the established Qwen/DeepSeek V4 Pro/GLM mix; `alibaba-token-plan-pro` raises execution and independent criticism with DeepSeek V4 Flash 0731 max and GLM xhigh; `alibaba-token-plan-qwenmaxxing` stays Qwen-only; `alibaba-token-plan-qwen-deepseek` keeps Qwen 3.8 Max (`qwen3.8-max`) on the expensive default (high)/architect (xhigh)/critic (xhigh) roles and spends DeepSeek V4 Flash 0731 on the cheap planner (max) and executor (high) roles; `alibaba-token-plan-glm-deepseek` does the same with GLM 5.2 (`glm-5.2`) as the expensive model
 - Combos: `opus-codex`, `codex-opencodego`, and `fable-opus-codex`
 
-GLM-5.3 always enables thinking and accepts only `low`, `high`, and `max`; `max` is the provider default and is recommended for coding. The GLM tiers preserve the former role ordering by collapsing `minimal`/`low` to `low`, `medium`/`high` to `high`, and `xhigh` to `max`.
+GLM-5.3 always enables thinking and accepts only `low`, `high`, and `max`; `max` is the provider default and is recommended for coding. The GLM tiers preserve the former role ordering by collapsing `minimal`/`low` to `low`, `medium`/`high` to `high`, and `xhigh` to `max`. GLM-5.3-Flash keeps the same text contract (per z.ai docs, its text parameters are consistent with GLM-5.3 with a 1M-token context window) and now backs the high-volume lanes of the GLM tiers: `glm-eco` runs default, executor, and planner on `glm-5.3-flash:low` while critic and architect stay on `glm-5.3:high`; `glm-medium` and `glm-pro` keep every role on `glm-5.3` except the executor, which uses `glm-5.3-flash:low` (Medium) and `glm-5.3-flash:high` (Pro).
 
 Gemini 3.7 Flash is bundled wherever Gemini 3.6 Flash already was (`google/gemini-3.7-flash`, `google-gemini-cli/gemini-3.7-flash`, Copilot, Antigravity effort variants, OpenCode Zen, OpenRouter, Vercel AI Gateway, Cursor, and the other 3.6 Flash gateways). First-class Google transports use `google-level` thinking and accept only `low`, `medium`, and `high`; `minimal` is rejected because the official Gemini API returns an error. Provider defaults stay on the existing Pro-class models.
 
@@ -732,10 +732,14 @@ Extensions can register providers at runtime (`pi.registerProvider(...)`), inclu
 When requesting a key for a provider, effective order is:
 
 1. Runtime override (CLI `--api-key`)
-2. Stored API key credential in `agent.db`
-3. Stored OAuth credential in `agent.db` (with refresh)
-4. Environment variable mapping (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc.)
-5. ModelRegistry fallback resolver (provider `apiKey` from `models.yml`, env-name-or-literal semantics)
+2. `models.yml` `providers.<name>.apiKey` literal pin
+3. Stored API key credential in `agent.db` (written by `auth login`)
+4. `models.yml` `providers.<name>.apiKeyEnv` indirection — a pointer to a key,
+   not a pinned value, so a stored login credential outranks it; it still
+   outranks stored OAuth credentials
+5. Stored OAuth credential in `agent.db` (with refresh)
+6. Environment variable mapping (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc.)
+7. ModelRegistry fallback resolver (provider `apiKey` from `models.yml`, env-name-or-literal semantics)
 
 `models.yml` `apiKey` behavior:
 

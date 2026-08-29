@@ -26,6 +26,13 @@ export interface FallbackTrigger {
 export const STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE = "stream_first_event_timeout";
 /** Stable code for a nominally successful response with no content or token usage. */
 export const EMPTY_RESPONSE_PROVIDER_CODE = "empty_response";
+/**
+ * OpenAI's typed capacity-overload code. It arrives without an HTTP status —
+ * inside an HTTP 200 terminal Responses envelope or a Codex error event — so the
+ * code itself is the only structured evidence of the failure and must survive
+ * the existence gate below. It is always compared case-sensitively.
+ */
+export const SERVER_OVERLOADED_PROVIDER_CODE = "server_is_overloaded";
 
 export type TransportHeaders = Headers | Record<string, string | undefined>;
 
@@ -241,6 +248,11 @@ export function transportFailureFacts(
 		!isContextOverflowCode(normalizedCode) &&
 		normalizedCode !== STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE &&
 		normalizedCode !== EMPTY_RESPONSE_PROVIDER_CODE &&
+		// Matched case-sensitively against the raw code: this is the one gate a
+		// provider-owned code can open on its own, so a cased or padded variant
+		// must not materialize facts that would disqualify an unrelated
+		// bare-default retry.
+		providerCode !== SERVER_OVERLOADED_PROVIDER_CODE &&
 		requestBytes === undefined &&
 		firstEventElapsedMs === undefined &&
 		firstEventTimeoutMs === undefined &&
@@ -360,12 +372,17 @@ export function classifyFallbackTrigger(
 	const retryAfterMs =
 		parseRetryAfterMilliseconds(headers?.get("retry-after-ms") ?? null) ??
 		parseRetryAfterSeconds(headers?.get("retry-after") ?? null);
-	const codes = [facts.openaiErrorCode, facts.anthropicErrorType, facts.providerCode].map(value =>
-		value?.toLowerCase(),
-	);
+	const rawCodes = [facts.openaiErrorCode, facts.anthropicErrorType, facts.providerCode];
+	const codes = rawCodes.map(value => value?.toLowerCase());
 	const code = codes[0] ?? codes[1] ?? codes[2];
+	// The capacity-overload code is provider-owned and is the only code that can
+	// classify without a status, so it is matched case-sensitively — the same
+	// exactness the parser and the session admission use.
+	const rawCode = rawCodes[0] ?? rawCodes[1] ?? rawCodes[2];
 	const triggerClass: FallbackTriggerClass =
-		code === STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE || code === EMPTY_RESPONSE_PROVIDER_CODE
+		code === STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE ||
+		code === EMPTY_RESPONSE_PROVIDER_CODE ||
+		(facts.status === undefined && rawCode === SERVER_OVERLOADED_PROVIDER_CODE)
 			? "server"
 			: isQuotaCode(code)
 				? "quota"

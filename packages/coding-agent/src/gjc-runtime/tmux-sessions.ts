@@ -153,6 +153,8 @@ export interface ForceCloseOwnerDependencies {
 	waitForOwnerExitVerdict?(): Promise<OwnerVerdict>;
 }
 const GJC_TMUX_PSMUX_INCARNATION_OPTION = "@gjc-psmux-incarnation";
+const effectiveSessionEnvironments = new WeakMap<GjcTmuxSessionStatus, NodeJS.ProcessEnv>();
+const fallbackSessionEnvironments = new WeakSet<GjcTmuxSessionStatus>();
 
 const FORCE_CLOSE_VERDICT_TIMEOUT_MS = 15_000;
 const FORCE_CLOSE_VERDICT_POLL_MS = 50;
@@ -305,20 +307,79 @@ function parseSessionLine(line: string): GjcTmuxSessionStatus | null {
 	};
 }
 
-function runListSessions(format: string, env: NodeJS.ProcessEnv = process.env): string[] {
+/** tmux failure shapes that mean "this socket has no server", not "tmux is broken". */
+function isMissingServerFailure(message: string): boolean {
+	return (
+		message.includes("no server running") ||
+		(message.includes("failed to connect to server") && /(?:no such file or directory|not found)/iu.test(message))
+	);
+}
+
+function isMissingSocketFailure(message: string): boolean {
+	return (
+		message.toLowerCase().includes("error connecting to ") &&
+		/(?:no such file or directory|not found)/iu.test(message)
+	);
+}
+
+/**
+ * `$TMUX` is inherited from whatever launched gjc and names the socket tmux
+ * talks to. Terminal hosts that emulate tmux for their own agents can export a
+ * `$TMUX` pointing at a socket they never created, and tmux then fails with
+ * `error connecting to <socket>` — the same message shape as a legitimate
+ * "no server" miss. Returning the socket path lets callers tell the two apart
+ * instead of reporting zero sessions while sessions are live on the default
+ * socket.
+ */
+function inheritedTmuxSocketPath(env: NodeJS.ProcessEnv): string | null {
+	const socket = env.TMUX?.split(",")[0]?.trim();
+	return socket ? socket : null;
+}
+
+function namesInheritedTmuxSocket(message: string, socket: string): boolean {
+	const normalizedMessage = process.platform === "win32" ? message.toLowerCase() : message;
+	const normalizedSocket = process.platform === "win32" ? socket.toLowerCase() : socket;
+	return (
+		(normalizedMessage.includes(`error connecting to ${normalizedSocket} `) ||
+			normalizedMessage.includes(`failed to connect to server: ${normalizedSocket} `)) &&
+		/(?:no such file or directory|not found)/iu.test(message)
+	);
+}
+
+function envWithoutInheritedTmux(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+	const withoutTmux: NodeJS.ProcessEnv = { ...env };
+	delete withoutTmux.TMUX;
+	return withoutTmux;
+}
+
+interface ListedTmuxSessions {
+	lines: string[];
+	env: NodeJS.ProcessEnv;
+}
+
+function runListSessions(format: string, env: NodeJS.ProcessEnv = process.env): ListedTmuxSessions {
+	let effectiveEnv = env;
 	let output = "";
 	try {
 		output = runTmux(["list-sessions", "-F", format], env);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
-		if (
-			message.includes("no server running") ||
-			message.includes("failed to connect to server") ||
-			message.includes("error connecting to")
-		) {
-			return [];
-		}
-		throw error;
+		const inheritedSocket = inheritedTmuxSocketPath(env);
+		// A miss on the default socket is a real empty list; only the inherited
+		// socket is suspect, so retry without it before concluding there is
+		// nothing to list.
+		if (inheritedSocket && namesInheritedTmuxSocket(message, inheritedSocket)) {
+			try {
+				effectiveEnv = envWithoutInheritedTmux(env);
+				output = runTmux(["list-sessions", "-F", format], effectiveEnv);
+			} catch (retryError) {
+				const retryMessage = retryError instanceof Error ? retryError.message : String(retryError);
+				if (isMissingServerFailure(retryMessage) || isMissingSocketFailure(retryMessage))
+					return { lines: [], env: effectiveEnv };
+				throw retryError;
+			}
+		} else if (isMissingServerFailure(message) || isMissingSocketFailure(message)) return { lines: [], env };
+		else throw error;
 	}
 	const lines = output
 		.split("\n")
@@ -333,20 +394,25 @@ function runListSessions(format: string, env: NodeJS.ProcessEnv = process.env): 
 	if (lines.length > 0 && !lines[0].includes("\t")) {
 		const binary = resolveGjcTmuxBinary({ env });
 		if (binary.isPsmux) {
-			return lines.map(line => {
-				const match = line.match(/^([^:]+):\s*(\d+)\s+windows?\s+\(created\s+([^)]+)\)/);
-				if (!match) return line;
-				const [, name, windows, created] = match;
-				const createdEpoch = String(Math.floor(new Date(`${created} UTC`).getTime() / 1000) || 0);
+			return {
+				lines: lines.map(line => {
+					const match = line.match(/^([^:]+):\s*(\d+)\s+windows?\s+\(created\s+([^)]+)\)/);
+					if (!match) return line;
+					const [, name, windows, created] = match;
+					const createdEpoch = String(Math.floor(new Date(`${created} UTC`).getTime() / 1000) || 0);
 
-				return [name, windows, "0", createdEpoch, "", "", "0", "", "", "", "", "", "", "", "", "", ""].join("\t");
-			});
+					return [name, windows, "0", createdEpoch, "", "", "0", "", "", "", "", "", "", "", "", "", ""].join(
+						"\t",
+					);
+				}),
+				env: effectiveEnv,
+			};
 		}
 	}
-	return lines;
+	return { lines, env: effectiveEnv };
 }
 
-function listSessionLines(env: NodeJS.ProcessEnv = process.env): string[] {
+function listSessionLines(env: NodeJS.ProcessEnv = process.env): ListedTmuxSessions {
 	return runListSessions(
 		`#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_created}\t#{${GJC_TMUX_PROFILE_OPTION}}\t#{session_key_table}\t#{session_panes}\t#{pane_pid}\t#{${GJC_TMUX_BRANCH_OPTION}}\t#{${GJC_TMUX_BRANCH_SLUG_OPTION}}\t#{${GJC_TMUX_PROJECT_OPTION}}\t#{${GJC_TMUX_SESSION_ID_OPTION}}\t#{${GJC_TMUX_SESSION_STATE_FILE_OPTION}}\t#{${GJC_TMUX_OWNER_GENERATION_OPTION}}\t#{${GJC_TMUX_VERSION_OPTION}}\t#{${GJC_TMUX_PSMUX_INCARNATION_OPTION}}\t#{session_id}`,
 
@@ -355,8 +421,13 @@ function listSessionLines(env: NodeJS.ProcessEnv = process.env): string[] {
 }
 
 function listRawTmuxSessionNames(env: NodeJS.ProcessEnv = process.env): string[] {
-	return runListSessions("#{session_name}", env).map(line => line.split("\t")[0] ?? line);
+	return runListSessions("#{session_name}", env).lines.map(line => line.split("\t")[0] ?? line);
 }
+
+function assertMutationAuthority(session: GjcTmuxSessionStatus): void {
+	if (fallbackSessionEnvironments.has(session)) throw new Error("gjc_tmux_fallback_authority_unconfirmed");
+}
+
 function canonicalProviderStateDirs(cwd: string): string[] {
 	const gjcDir = path.join(cwd, GJC_DIR);
 	let entries: fsSync.Dirent[];
@@ -424,13 +495,24 @@ function psmuxAuthorityEnvironments(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv[]
 
 export function listGjcTmuxSessions(env: NodeJS.ProcessEnv = process.env): GjcTmuxSessionStatus[] {
 	const discovered = psmuxAuthorityEnvironments(env).flatMap(authorityEnv => {
-		const authority = psmuxAuthorityFromEnv(authorityEnv) ?? undefined;
-		return listSessionLines(authorityEnv)
+		const listed = listSessionLines(authorityEnv);
+		const authority = psmuxAuthorityFromEnv(listed.env) ?? undefined;
+		return listed.lines
 			.map(parseSessionLine)
 			.filter((session): session is GjcTmuxSessionStatus => session != null)
-			.map(session => hydrateSessionFromExactOptions(session, authorityEnv))
+			.map(session => {
+				const hydrated = hydrateSessionFromExactOptions(session, listed.env);
+				effectiveSessionEnvironments.set(hydrated, listed.env);
+				if (listed.env !== authorityEnv) fallbackSessionEnvironments.add(hydrated);
+				return hydrated;
+			})
 			.filter((session): session is GjcTmuxSessionStatus => session?.profile === GJC_TMUX_PROFILE_VALUE)
-			.map(session => (authority ? { ...session, providerAuthority: authority } : session));
+			.map(session => {
+				const result = authority ? { ...session, providerAuthority: authority } : session;
+				effectiveSessionEnvironments.set(result, listed.env);
+				if (listed.env !== authorityEnv) fallbackSessionEnvironments.add(result);
+				return result;
+			});
 	});
 	const names = new Set<string>();
 	for (const session of discovered) {
@@ -443,12 +525,18 @@ export function listGjcTmuxSessions(env: NodeJS.ProcessEnv = process.env): GjcTm
 /** @internal */
 export function listTmuxSessionsForGc(env: NodeJS.ProcessEnv = process.env): GjcTmuxSessionsForGc {
 	const authorityEnvironments = psmuxAuthorityEnvironments(env);
-	const sessions = authorityEnvironments.flatMap(authorityEnv =>
-		listSessionLines(authorityEnv)
+	const sessions = authorityEnvironments.flatMap(authorityEnv => {
+		const listed = listSessionLines(authorityEnv);
+		return listed.lines
 			.map(parseSessionLine)
 			.filter((session): session is GjcTmuxSessionStatus => session != null)
-			.map(session => hydrateSessionFromExactOptions(session, authorityEnv)),
-	);
+			.map(session => {
+				const hydrated = hydrateSessionFromExactOptions(session, listed.env);
+				effectiveSessionEnvironments.set(hydrated, listed.env);
+				if (listed.env !== authorityEnv) fallbackSessionEnvironments.add(hydrated);
+				return hydrated;
+			});
+	});
 	const tagged = sessions
 		.filter(session => session.profile === GJC_TMUX_PROFILE_VALUE)
 		.sort((a, b) => a.name.localeCompare(b.name));
@@ -1148,17 +1236,18 @@ export function readTmuxSessionTagsForGc(
 	env: NodeJS.ProcessEnv = process.env,
 ): GjcTmuxSessionTagsForGc {
 	const session = listGjcTmuxSessions(env).find(candidate => candidate.name === sessionName);
+	const sessionEnv = session ? (effectiveSessionEnvironments.get(session) ?? env) : env;
 	return {
-		profile: readExactOptionForGc(sessionName, GJC_TMUX_PROFILE_OPTION, env),
-		project: readExactOptionForGc(sessionName, GJC_TMUX_PROJECT_OPTION, env),
-		psmuxIncarnation: readExactOptionForGc(sessionName, GJC_TMUX_PSMUX_INCARNATION_OPTION, env),
-		branch: readExactOptionForGc(sessionName, GJC_TMUX_BRANCH_OPTION, env),
-		branchSlug: readExactOptionForGc(sessionName, GJC_TMUX_BRANCH_SLUG_OPTION, env),
-		sessionId: readExactOptionForGc(sessionName, GJC_TMUX_SESSION_ID_OPTION, env),
-		sessionStateFile: readExactOptionForGc(sessionName, GJC_TMUX_SESSION_STATE_FILE_OPTION, env),
-		version: readExactOptionForGc(sessionName, GJC_TMUX_VERSION_OPTION, env),
-		ownerGeneration: readExactOptionForGc(sessionName, GJC_TMUX_OWNER_GENERATION_OPTION, env),
-		nativeSessionId: session?.nativeSessionId ?? readNativeTmuxSessionId(sessionName, env),
+		profile: readExactOptionForGc(sessionName, GJC_TMUX_PROFILE_OPTION, sessionEnv),
+		project: readExactOptionForGc(sessionName, GJC_TMUX_PROJECT_OPTION, sessionEnv),
+		psmuxIncarnation: readExactOptionForGc(sessionName, GJC_TMUX_PSMUX_INCARNATION_OPTION, sessionEnv),
+		branch: readExactOptionForGc(sessionName, GJC_TMUX_BRANCH_OPTION, sessionEnv),
+		branchSlug: readExactOptionForGc(sessionName, GJC_TMUX_BRANCH_SLUG_OPTION, sessionEnv),
+		sessionId: readExactOptionForGc(sessionName, GJC_TMUX_SESSION_ID_OPTION, sessionEnv),
+		sessionStateFile: readExactOptionForGc(sessionName, GJC_TMUX_SESSION_STATE_FILE_OPTION, sessionEnv),
+		version: readExactOptionForGc(sessionName, GJC_TMUX_VERSION_OPTION, sessionEnv),
+		ownerGeneration: readExactOptionForGc(sessionName, GJC_TMUX_OWNER_GENERATION_OPTION, sessionEnv),
+		nativeSessionId: session?.nativeSessionId ?? readNativeTmuxSessionId(sessionName, sessionEnv),
 		createdAt: session?.createdAt,
 		attached: session?.attached,
 		panePids: session?.panePids,
@@ -1171,6 +1260,9 @@ export function removeGjcTmuxSession(
 	expectedIdentity?: ExpectedGjcTmuxSessionIdentity,
 ): GjcTmuxSessionStatus {
 	const session = statusGjcTmuxSession(sessionName, env);
+	assertMutationAuthority(session);
+	const sessionEnv =
+		effectiveSessionEnvironments.get(session) ?? environmentForProviderAuthority(env, session.providerAuthority);
 	if (session.attached || session.panePids.length > 0) {
 		throw new Error(`gjc_tmux_session_live:${sessionName}`);
 	}
@@ -1185,32 +1277,33 @@ export function removeGjcTmuxSession(
 			session.createdAt !== expectedIdentity.createdAt)
 	)
 		throw new Error(`gjc_tmux_owner_changed:${sessionName}`);
-	if (readProfileForExactTarget(session.name, env) !== GJC_TMUX_PROFILE_VALUE) {
+	if (readProfileForExactTarget(session.name, sessionEnv) !== GJC_TMUX_PROFILE_VALUE) {
 		throw new Error(`gjc_tmux_session_not_managed:${sessionName}`);
 	}
-	const nativeSessionId = readNativeTmuxSessionId(session.name, env);
+	const nativeSessionId = readNativeTmuxSessionId(session.name, sessionEnv);
 	if (!nativeSessionId) throw new Error(`gjc_tmux_owner_unverifiable:${sessionName}`);
 	if (expectedIdentity && nativeSessionId !== expectedIdentity.nativeSessionId)
 		throw new Error(`gjc_tmux_owner_changed:${sessionName}`);
 	if (
 		expectedIdentity &&
-		readExactOptionForGc(session.name, GJC_TMUX_OWNER_GENERATION_OPTION, env) !== expectedIdentity.ownerGeneration
+		readExactOptionForGc(session.name, GJC_TMUX_OWNER_GENERATION_OPTION, sessionEnv) !==
+			expectedIdentity.ownerGeneration
 	)
 		throw new Error(`gjc_tmux_owner_changed:${sessionName}`);
-	const firstServer = requireSafeTmuxServerForMutation(resolveGjcTmuxCommand(env), env);
+	const firstServer = requireSafeTmuxServerForMutation(resolveGjcTmuxCommand(sessionEnv), sessionEnv);
 	if (
-		readNativeTmuxSessionId(nativeSessionId, env) !== nativeSessionId ||
-		readProfileForExactTarget(nativeSessionId, env) !== GJC_TMUX_PROFILE_VALUE
+		readNativeTmuxSessionId(nativeSessionId, sessionEnv) !== nativeSessionId ||
+		readProfileForExactTarget(nativeSessionId, sessionEnv) !== GJC_TMUX_PROFILE_VALUE
 	)
 		throw new Error(`gjc_tmux_owner_changed:${sessionName}`);
-	const finalServer = requireSafeTmuxServerForMutation(resolveGjcTmuxCommand(env), env);
+	const finalServer = requireSafeTmuxServerForMutation(resolveGjcTmuxCommand(sessionEnv), sessionEnv);
 	if (finalServer.pid !== firstServer.pid || finalServer.startTime !== firstServer.startTime)
 		throw new Error(`gjc_tmux_owner_changed:${sessionName}`);
 	runGuardedTmuxSessionCommand(
 		nativeSessionId,
 		session.name,
 		finalServer,
-		env,
+		sessionEnv,
 		`kill-session -t '${nativeSessionId}'`,
 		expectedIdentity?.ownerGeneration,
 	);
@@ -1426,7 +1519,9 @@ export async function forceCloseGjcTmuxSession(
 	deps: Partial<ForceCloseOwnerDependencies> = {},
 ): Promise<GjcTmuxSessionStatus> {
 	const session = statusGjcTmuxSession(sessionName, env);
-	const sessionEnv = environmentForProviderAuthority(env, session.providerAuthority);
+	assertMutationAuthority(session);
+	const sessionEnv =
+		effectiveSessionEnvironments.get(session) ?? environmentForProviderAuthority(env, session.providerAuthority);
 	if (readProfileForExactTarget(session.name, sessionEnv) !== GJC_TMUX_PROFILE_VALUE)
 		throw new Error(`gjc_tmux_session_not_managed:${sessionName}`);
 	const exactPanePids = (deps.listPanePids ?? readExactSessionPanePids)(session.name, sessionEnv);
@@ -1560,7 +1655,9 @@ export async function forceCloseGjcTmuxSession(
 
 export function attachGjcTmuxSession(sessionName: string, env: NodeJS.ProcessEnv = process.env): never {
 	const session = statusGjcTmuxSession(sessionName, env);
-	const sessionEnv = environmentForProviderAuthority(env, session.providerAuthority);
+	assertMutationAuthority(session);
+	const sessionEnv =
+		effectiveSessionEnvironments.get(session) ?? environmentForProviderAuthority(env, session.providerAuthority);
 	const authority = session.providerAuthority ?? psmuxAuthorityFromEnv(sessionEnv);
 	const tmuxCommand = authority?.command ?? resolveGjcTmuxCommand(sessionEnv);
 	if (authority) assertGjcTmuxMutationAuthoritySync(authority);

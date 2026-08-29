@@ -124,6 +124,7 @@ import {
 	EMPTY_RESPONSE_PROVIDER_CODE,
 	type FallbackAttemptToken,
 	type FallbackTriggerClass,
+	SERVER_OVERLOADED_PROVIDER_CODE,
 	STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE,
 } from "@gajae-code/ai/utils/fallback-transport";
 import { AttemptRecordStore } from "./attempt-record-store";
@@ -1047,6 +1048,8 @@ export interface PromptOptions {
 	onSkillPrepared?: (meta: { name: string; path: string; lineCount?: number; cleanedArgs?: string }) => void;
 	/** Optional invocation-scoped cancellation fence used before an accepted skill starts execution. */
 	preflightSignal?: AbortSignal;
+	/** Internal SDK lifecycle owner token. */
+	sdkRunToken?: string;
 }
 
 function promptPreflightCancelledError(): Error {
@@ -1297,11 +1300,74 @@ function isBareDefaultMessageOnlyFirstEventTimeout(message: AssistantMessage): b
 			BARE_DEFAULT_WATCHDOG_ERROR.test(message.errorMessage ?? ""))
 	);
 }
+/**
+ * True when the attempt's structured evidence is exactly the provider's typed
+ * capacity-overload code and nothing else: no status, no retained retry header,
+ * no second typed code, no error kind, and none of the transport's other
+ * observations (request size, first-event timing, endpoint class, provider retry
+ * ceiling). The code arrives statuslessly (a Codex error event, an HTTP 200
+ * terminal Responses envelope), so these facts ARE the overload rather than
+ * evidence that the attempt did observable work; any additional fact means the
+ * attempt is no longer provably that bare capacity rejection. The code is
+ * compared case-sensitively, matching the parser and the transport gate.
+ */
+function isExactTypedOverloadFacts(message: AssistantMessage): boolean {
+	if (message.errorKind !== undefined || message.errorStatus !== undefined) return false;
+	const facts = message.transportFailure;
+	if (!facts) return false;
+	return (
+		facts.providerCode === SERVER_OVERLOADED_PROVIDER_CODE &&
+		facts.status === undefined &&
+		facts.anthropicErrorType === undefined &&
+		(facts.openaiErrorCode === undefined || facts.openaiErrorCode === SERVER_OVERLOADED_PROVIDER_CODE) &&
+		(facts.headers === undefined || Object.keys(facts.headers).length === 0) &&
+		facts.requestBytes === undefined &&
+		facts.firstEventElapsedMs === undefined &&
+		facts.firstEventTimeoutMs === undefined &&
+		facts.endpointClass === undefined &&
+		facts.retryMaxAttempts === undefined
+	);
+}
+/**
+ * True when transport facts are exactly the provider's statusless typed
+ * capacity-overload code (the provider code verbatim and, when present, the
+ * OpenAI code verbatim, with no status). The agent loop must not treat the new
+ * facts as managed transaction authority, and managed session fallback must
+ * not gain retry/advance authority from them, so this predicate keeps both
+ * guards reading only typed facts, never error prose.
+ */
+function isStatuslessTypedOverloadFacts(facts: TransportFailureFacts | undefined): boolean {
+	if (!facts) return false;
+	return (
+		facts.status === undefined &&
+		facts.providerCode === SERVER_OVERLOADED_PROVIDER_CODE &&
+		(facts.openaiErrorCode === undefined || facts.openaiErrorCode === SERVER_OVERLOADED_PROVIDER_CODE)
+	);
+}
+
 function isBareDefaultCodexOverload(message: AssistantMessage): boolean {
 	return (
 		message.api === "openai-codex-responses" &&
 		BARE_DEFAULT_CODEX_OVERLOAD_ERROR.test(message.errorMessage ?? "") &&
-		!hasBareDefaultRetryDisqualifyingFacts(message) &&
+		(isExactTypedOverloadFacts(message) || !hasBareDefaultRetryDisqualifyingFacts(message)) &&
+		!assistantMessageHasVisibleOrToolContent(message)
+	);
+}
+
+/**
+ * True when a generic OpenAI Responses turn failed with exactly OpenAI's typed
+ * capacity-overload code. Unlike the Codex and Anthropic admissions this reads
+ * no prose at all: the terminal Responses envelope carries the code in typed
+ * transport facts, so the code plus a content-free attempt is the whole
+ * admission. Both `openaiErrorCode` and the derived `providerCode` must be the
+ * exact code, so a different transport's overload facts cannot enter through
+ * this path.
+ */
+function isBareDefaultOpenAIResponsesOverload(message: AssistantMessage): boolean {
+	return (
+		message.api === "openai-responses" &&
+		message.transportFailure?.openaiErrorCode === SERVER_OVERLOADED_PROVIDER_CODE &&
+		isExactTypedOverloadFacts(message) &&
 		!assistantMessageHasVisibleOrToolContent(message)
 	);
 }
@@ -2365,6 +2431,8 @@ export class AgentSession {
 				this.#followUpPromotionHooks.delete(message);
 				followUpHook({ startsOwnRun: true, removed: true });
 			}
+			this.#sdkRunTokensByQueuedMessage.delete(message);
+			this.#deepInterviewGenuineUserMessageEpochs.delete(message);
 		}
 	}
 	#fireQueuedPromotionHooks(messages: readonly AgentMessage[], promotion?: { startsOwnRun?: boolean }): void {
@@ -2383,6 +2451,29 @@ export class AgentSession {
 				followUpHook({ startsOwnRun: promotion?.startsOwnRun ?? true });
 			}
 		}
+	}
+	#queuedMessagesForSessionTransition(): AgentMessage[] {
+		return [
+			...new Set([
+				...this.agent.snapshotSteering(),
+				...this.agent.snapshotFollowUp(),
+				...this.#deferredSdkFollowUps,
+			]),
+		];
+	}
+	/** Drop queued SDK work when the session identity is replaced. The old
+	 * promotion hooks belong to the predecessor runtime; retaining the message
+	 * would let it execute later under the successor without an owner. */
+	#terminalizeQueuedSdkWorkForSessionTransition(messages: readonly AgentMessage[]): void {
+		if (messages.length === 0) return;
+		this.#fireQueuedRemovalHooks(messages);
+		for (const message of messages) this.#sdkRunTokensByQueuedMessage.delete(message);
+		this.#deferredSdkFollowUps = this.#deferredSdkFollowUps.filter(message => !messages.includes(message));
+	}
+	#resetActiveSdkRunOwnership(): void {
+		this.#activeSdkRunToken = undefined;
+		this.#activeAttemptScope = undefined;
+		this.#activeLogicalRunId = undefined;
 	}
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	#pendingNextTurnMessages: Array<{ message: CustomMessage; origin: "turn" | "external" }> = [];
@@ -2568,6 +2659,8 @@ export class AgentSession {
 	/** SDK follow-up ownership by queued message and the attempt that dequeues it. */
 	#sdkRunTokensByQueuedMessage = new WeakMap<AgentMessage, string>();
 	#sdkRunTokensByAttemptScope = new WeakMap<AttemptScope, string>();
+	#activeSdkRunToken: string | undefined;
+	#activeAttemptScope: AttemptScope | undefined;
 	#attemptAuthority!: AttemptScopeAuthority;
 	#attemptRecordStore!: AttemptRecordStore;
 	#activeLogicalRunId: AttemptRunHandle["logicalRunId"] | undefined;
@@ -2576,6 +2669,7 @@ export class AgentSession {
 		// previously recorded run id rather than throwing inside the callback.
 		if (!handle) return;
 		this.#activeLogicalRunId = handle.logicalRunId;
+		this.#activeAttemptScope = handle.scope;
 	}
 
 	#turnIndex = 0;
@@ -3975,7 +4069,20 @@ export class AgentSession {
 			// when the batch is drained by a continuation the message did not
 			// schedule (a skipped continuation must never discard the correlation
 			// of work that is still consumed; review thread P2).
+			const consumedSdkRunToken =
+				promotion.startsOwnRun === true
+					? [...messages, ...dropped]
+							.map(message => this.#sdkRunTokensByQueuedMessage.get(message))
+							.find((token): token is string => token !== undefined)
+					: undefined;
 			this.#fireQueuedPromotionHooks(messages, promotion);
+			if (consumedSdkRunToken !== undefined) this.#activeSdkRunToken = consumedSdkRunToken;
+			// Dropped or in-run follow-ups have no later own-run acceptance callback;
+			// delete those tokens now. Own-run messages stay mapped until
+			// #scheduleAgentContinue.onRunAccepted binds the new attempt scope.
+			for (const message of dropped) this.#sdkRunTokensByQueuedMessage.delete(message);
+			if (promotion.startsOwnRun !== true)
+				for (const message of messages) this.#sdkRunTokensByQueuedMessage.delete(message);
 		};
 		// Steering consumed mid-run never starts its own run: fire the stored
 		// promotion hook at the REAL dequeue boundary so the SDK attaches the
@@ -6368,18 +6475,23 @@ export class AgentSession {
 												// agent_start (review P1); their queued messages are in-run
 												// consumptions, not own-run promotions.
 												const startsOwn = options?.maintenanceContinuation !== true;
+												const consumedSdkRunToken = startsOwn
+													? acceptance.consumedQueuedMessages
+															.map(message => this.#sdkRunTokensByQueuedMessage.get(message))
+															.find((token): token is string => token !== undefined)
+													: undefined;
 												this.#fireQueuedPromotionHooks(acceptance.consumedQueuedMessages, {
 													startsOwnRun: startsOwn,
 												});
-												for (const message of acceptance.consumedQueuedMessages) {
-													const sdkRunToken = this.#sdkRunTokensByQueuedMessage.get(message);
-													if (sdkRunToken) {
-														this.#sdkRunTokensByAttemptScope.set(handle.scope, sdkRunToken);
-														break;
-													}
-												}
+												if (consumedSdkRunToken !== undefined)
+													this.#sdkRunTokensByAttemptScope.set(handle.scope, consumedSdkRunToken);
+												if (startsOwn) this.#activeSdkRunToken = consumedSdkRunToken;
 												this.#acceptRunHandle(handle);
 												options?.onRunAccepted?.(handle);
+												// Keep the queued token available through the acceptance callback;
+												// SDK follow-up owners bind it to the new attempt scope there.
+												for (const message of acceptance.consumedQueuedMessages)
+													this.#sdkRunTokensByQueuedMessage.delete(message);
 												settleLease();
 												releasePredecessor();
 												if (startsQueuedSuccessor) {
@@ -7441,12 +7553,30 @@ export class AgentSession {
 			await this.#flushWorkerIntegrationForAgentEnd();
 		}
 		const deliveryScope = scope ?? (event as AgentSessionEvent & { scope?: AttemptScopeRef }).scope;
+		const eventToken = (event as AgentSessionEvent & { sdkRunToken?: unknown }).sdkRunToken;
+		const sdkRunToken =
+			typeof eventToken === "string"
+				? eventToken
+				: deliveryScope
+					? this.#sdkRunTokensByAttemptScope.get(deliveryScope as AttemptScope)
+					: this.#activeSdkRunToken;
 		const isTerminalAgentEnd =
 			event.type === "agent_end" && !(event.stopReason === "maintenance" && event.maintenanceOutcome !== "aborted");
 		const finishAttempt = () => {
 			if (!isTerminalAgentEnd) return;
-			if (deliveryScope) this.#attemptRecordStore.retire(deliveryScope as AttemptScope);
-			this.#activeLogicalRunId = undefined;
+			const isActiveAttempt =
+				deliveryScope === undefined ||
+				this.#activeAttemptScope === undefined ||
+				deliveryScope === this.#activeAttemptScope;
+			if (deliveryScope) {
+				this.#attemptRecordStore.retire(deliveryScope as AttemptScope);
+				this.#sdkRunTokensByAttemptScope.delete(deliveryScope as AttemptScope);
+			}
+			if (isActiveAttempt && sdkRunToken === this.#activeSdkRunToken) this.#activeSdkRunToken = undefined;
+			if (isActiveAttempt) {
+				this.#activeAttemptScope = undefined;
+				this.#activeLogicalRunId = undefined;
+			}
 		};
 		if (!this.#extensionRunner) {
 			finishAttempt();
@@ -7459,9 +7589,7 @@ export class AgentSession {
 				await this.#extensionRunner.emit(
 					{
 						type: "agent_start",
-						...(deliveryScope
-							? { sdkRunToken: this.#sdkRunTokensByAttemptScope.get(deliveryScope as AttemptScope) }
-							: {}),
+						...(sdkRunToken ? { sdkRunToken } : {}),
 					},
 					undefined,
 					deliveryScope,
@@ -7472,6 +7600,7 @@ export class AgentSession {
 						type: "agent_failed",
 						error: sanitizePromptFailure(event.error),
 						scope: event.scope,
+						...(sdkRunToken ? { sdkRunToken } : {}),
 					},
 					undefined,
 					deliveryScope,
@@ -7483,6 +7612,7 @@ export class AgentSession {
 						messages: event.messages,
 						stopReason: event.stopReason,
 						maintenanceOutcome: event.maintenanceOutcome,
+						...(sdkRunToken ? { sdkRunToken } : {}),
 					},
 					undefined,
 					deliveryScope,
@@ -9571,7 +9701,7 @@ export class AgentSession {
 		args = "",
 		options?: Pick<
 			PromptOptions,
-			"onPreflightAccepted" | "onPreflightAcceptCommit" | "onSkillPrepared" | "preflightSignal"
+			"onPreflightAccepted" | "onPreflightAcceptCommit" | "onSkillPrepared" | "preflightSignal" | "sdkRunToken"
 		>,
 	): Promise<{ name: string; path: string; args?: string; lineCount?: number }> {
 		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
@@ -10330,6 +10460,7 @@ export class AgentSession {
 										? { onPreflightAcceptCommit: options.onPreflightAcceptCommit }
 										: {}),
 									...(options.preflightSignal ? { preflightSignal: options.preflightSignal } : {}),
+									...(options.sdkRunToken ? { sdkRunToken: options.sdkRunToken } : {}),
 								}
 							: undefined,
 					);
@@ -10583,6 +10714,7 @@ export class AgentSession {
 			| "onPreflightAccepted"
 			| "onPreflightAcceptCommit"
 			| "preflightSignal"
+			| "sdkRunToken"
 		>,
 	): Promise<void> {
 		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
@@ -10684,6 +10816,7 @@ export class AgentSession {
 			| "onPreflightAccepted"
 			| "onPreflightAcceptCommit"
 			| "preflightSignal"
+			| "sdkRunToken"
 		> & {
 			prependMessages?: AgentMessage[];
 			skipPostPromptRecoveryWait?: boolean;
@@ -11017,8 +11150,13 @@ export class AgentSession {
 			const agentPromptOptions = {
 				...(options?.toolChoice ? { toolChoice: options.toolChoice } : undefined),
 				...this.#managedFallbackPromptOptions(),
+				...(options?.sdkRunToken ? { sdkRunToken: options.sdkRunToken } : {}),
 				onRunAccepted: (handle: AttemptRunHandle) => {
 					this.#acceptRunHandle(handle);
+					if (options?.sdkRunToken) {
+						this.#sdkRunTokensByAttemptScope.set(handle.scope, options.sdkRunToken);
+						this.#activeSdkRunToken = options.sdkRunToken;
+					}
 					options?.onRunAccepted?.(handle);
 					options?.admissionLease?.release();
 					// R3.3: the accepted-run wrapper is the exact acceptance boundary —
@@ -12110,6 +12248,7 @@ export class AgentSession {
 			await this.prompt(text, {
 				expandPromptTemplates: false,
 				images,
+				sdkRunToken: options?.sdkRunToken,
 				onPreflightAccepted: () => {
 					options?.onPreflightAccepted?.();
 					fireQueuedPromotion();
@@ -13461,6 +13600,8 @@ export class AgentSession {
 			this.#cancelOwnAsyncJobs();
 			this.#closeAllProviderSessions("new session");
 			this.#rebindProviderSessionState(new Map());
+			this.#terminalizeQueuedSdkWorkForSessionTransition(this.#queuedMessagesForSessionTransition());
+			this.#resetActiveSdkRunOwnership();
 			this.agent.reset();
 			if (!options?.drop) await this.sessionManager.flush();
 			const noLeasePreviousSessionIdentity = this.sessionManager.getSessionId();
@@ -13558,6 +13699,8 @@ export class AgentSession {
 			this.#disconnectFromAgent();
 			this.#closeAllProviderSessions("new session");
 			this.#rebindProviderSessionState(new Map());
+			this.#terminalizeQueuedSdkWorkForSessionTransition(this.#queuedMessagesForSessionTransition());
+			this.#resetActiveSdkRunOwnership();
 			this.agent.reset();
 			this.setTodoPhases([]);
 			this.#syncAgentSessionId();
@@ -13680,6 +13823,8 @@ export class AgentSession {
 			this.yieldQueue.clear();
 			this.#pendingBackgroundExchanges = [];
 			this.#closeAllProviderSessions("context clear");
+			this.#terminalizeQueuedSdkWorkForSessionTransition(this.#queuedMessagesForSessionTransition());
+			this.#resetActiveSdkRunOwnership();
 			this.agent.reset();
 			await this.sessionManager.flush();
 			this.sessionManager.appendContextClearEntry({ sessionId });
@@ -16104,6 +16249,7 @@ export class AgentSession {
 			const rollbackPendingNextTurnMessages = [...this.#pendingNextTurnMessages];
 			const rollbackScheduledHiddenNextTurnGeneration = this.#scheduledHiddenNextTurnGeneration;
 			const rollbackTodoReminderCount = this.#todoReminderCount;
+			const rollbackDeferredSdkFollowUps = [...this.#deferredSdkFollowUps];
 			// Snapshot the agent's executable queues so a rollback restores queued
 			// user work that agent.reset() would otherwise clear.
 			const rollbackAgentSteeringQueue = this.agent.snapshotSteering();
@@ -16144,6 +16290,12 @@ export class AgentSession {
 				this.#rekeyJobManagerForSessionIdentity(rollbackSessionState.sessionId, rollbackSessionState.sessionFile);
 				committed = true;
 				await this.#runToolSessionTransitionCleanups();
+				this.#terminalizeQueuedSdkWorkForSessionTransition([
+					...rollbackAgentSteeringQueue,
+					...rollbackAgentFollowUpQueue,
+					...rollbackDeferredSdkFollowUps,
+				]);
+				this.#resetActiveSdkRunOwnership();
 				this.agent.reset();
 				this.#syncAgentSessionId();
 				this.#rekeyHindsightMemoryForCurrentSessionId();
@@ -16227,6 +16379,7 @@ export class AgentSession {
 				this.#pendingNextTurnMessages = rollbackPendingNextTurnMessages;
 				this.#scheduledHiddenNextTurnGeneration = rollbackScheduledHiddenNextTurnGeneration;
 				this.#todoReminderCount = rollbackTodoReminderCount;
+				this.#deferredSdkFollowUps = rollbackDeferredSdkFollowUps;
 				this.#syncTodoPhasesFromBranch();
 				// Exact-discard only the staged successor; predecessor state was never adopted.
 				const rollbackError = prepared
@@ -18995,6 +19148,18 @@ export class AgentSession {
 				},
 			};
 		}
+		// Issue #5018 preserves managed behavior for the typed statusless
+		// Responses overload: before the code survived transport, this failure
+		// reached the session as an ordinary committed error, so the chain never
+		// discarded or advanced on it. Route it to the exhaustion decision
+		// directly, before the retryable path can classify its new facts.
+		if (isStatuslessTypedOverloadFacts(outcome.failure.transportFailure)) {
+			this.#defaultFallbackChain().resetAttemptBudget();
+			return this.#managedFallbackExhaustionDecision(
+				outcome.failure.message,
+				outcome.failure.message.errorMessage || "Model fallback attempt failed",
+			);
+		}
 		return this.#handleRetryableError(
 			outcome.failure.message,
 			true,
@@ -19453,7 +19618,10 @@ export class AgentSession {
 		}
 		const firstEventTimeout = classification === "first_event_timeout";
 		const emptyResponse = classification === "empty_response";
-		const canReplayProviderOverload = isBareDefaultCodexOverload(message) || isBareDefaultAnthropicOverload(message);
+		const canReplayProviderOverload =
+			isBareDefaultCodexOverload(message) ||
+			isBareDefaultAnthropicOverload(message) ||
+			isBareDefaultOpenAIResponsesOverload(message);
 		const reportedRetryMaxAttempts = transportFailure?.retryMaxAttempts;
 		if (reportedRetryMaxAttempts !== undefined) {
 			this.#providerRetryMaxAttempts = Math.min(
@@ -19496,6 +19664,17 @@ export class AgentSession {
 		const trigger:
 			| { class: FallbackTriggerClass; retryAfterMs?: number; authDisposition?: AuthDisposition }
 			| undefined = this.#fallbackTriggerFor(message, !managedFallback, transportFailure);
+		// OpenAI's typed statusless capacity-overload code (issue #5018) must not
+		// gain managed-chain retry/advance authority from its new facts. Before
+		// the code survived transport, this failure reached the session as an
+		// ordinary committed error and surfaced immediately, so mirror that
+		// behavior with the existing exhaustion decision.
+		if (managedFallback && isStatuslessTypedOverloadFacts(transportFailure)) {
+			return this.#managedFallbackExhaustionDecision(
+				message,
+				message.errorMessage || "Model fallback attempt failed",
+			);
+		}
 		if (!trigger) {
 			return managedOutcome
 				? this.#managedFallbackExhaustionDecision(message, message.errorMessage || "Model fallback attempt failed")
@@ -19934,6 +20113,7 @@ export class AgentSession {
 		preSubmit: PreSubmitBuilder,
 		options?: {
 			toolChoice?: ToolChoice;
+			sdkRunToken?: string;
 			fallbackManaged?: boolean;
 			onRunAccepted?: (handle: AttemptRunHandle) => void;
 		},
@@ -21233,6 +21413,10 @@ export class AgentSession {
 			const previousSystemPrompt = this.agent.state.systemPrompt;
 			const previousAgentSteeringQueue = this.agent.snapshotSteering();
 			const previousAgentFollowUpQueue = this.agent.snapshotFollowUp();
+			const previousDeferredSdkFollowUps = [...this.#deferredSdkFollowUps];
+			const previousActiveSdkRunToken = this.#activeSdkRunToken;
+			const previousActiveAttemptScope = this.#activeAttemptScope;
+			const previousActiveLogicalRunId = this.#activeLogicalRunId;
 
 			this.#steeringMessages = [];
 			this.#followUpMessages = [];
@@ -21280,6 +21464,7 @@ export class AgentSession {
 				// The target session is loaded and MCP selections are restored: discard
 				// pre-switch delivery queues before completing the restored agent state.
 				this.agent.clearAllQueues();
+				this.#resetActiveSdkRunOwnership();
 
 				if (historyRewriteReason) {
 					this.agent.replaceMessages(sessionContext.messages, {
@@ -21464,6 +21649,12 @@ export class AgentSession {
 						...(options?.transition ? { transition: options.transition } : {}),
 					});
 				}
+				this.#terminalizeQueuedSdkWorkForSessionTransition([
+					...previousAgentSteeringQueue,
+					...previousAgentFollowUpQueue,
+					...previousDeferredSdkFollowUps,
+				]);
+				this.#deferredSdkFollowUps = [];
 				return true;
 			} catch (error) {
 				if (transitionCleanupCommitted) throw error;
@@ -21529,6 +21720,10 @@ export class AgentSession {
 				this.#followUpMessages = previousFollowUpMessages;
 				this.#pendingNextTurnMessages = previousPendingNextTurnMessages;
 				this.#scheduledHiddenNextTurnGeneration = previousScheduledHiddenNextTurnGeneration;
+				this.#deferredSdkFollowUps = previousDeferredSdkFollowUps;
+				this.#activeSdkRunToken = previousActiveSdkRunToken;
+				this.#activeAttemptScope = previousActiveAttemptScope;
+				this.#activeLogicalRunId = previousActiveLogicalRunId;
 				this.agent.clearAllQueues();
 				this.agent.restoreSteering(previousAgentSteeringQueue);
 				this.agent.restoreFollowUp(previousAgentFollowUpQueue);
@@ -21595,6 +21790,9 @@ export class AgentSession {
 			}
 
 			const selectedText = this.#extractUserMessageText(selectedEntry.message.content);
+			const previousAgentSteeringQueue = this.agent.snapshotSteering();
+			const previousAgentFollowUpQueue = this.agent.snapshotFollowUp();
+			const previousDeferredSdkFollowUps = [...this.#deferredSdkFollowUps];
 
 			let skipConversationRestore = false;
 
@@ -21630,6 +21828,16 @@ export class AgentSession {
 			}
 			this.#pendingNextTurnMessages = [];
 			this.#scheduledHiddenNextTurnGeneration = undefined;
+			this.#terminalizeQueuedSdkWorkForSessionTransition([
+				...previousAgentSteeringQueue,
+				...previousAgentFollowUpQueue,
+				...previousDeferredSdkFollowUps,
+			]);
+			this.#deferredSdkFollowUps = [];
+			this.#resetActiveSdkRunOwnership();
+			this.agent.clearAllQueues();
+			this.#steeringMessages = [];
+			this.#followUpMessages = [];
 
 			this.#syncTodoPhasesFromBranch();
 			this.#syncAgentSessionId();
@@ -21834,6 +22042,15 @@ export class AgentSession {
 				// No summary, navigating to non-root
 				this.sessionManager.branch(newLeafId);
 			}
+
+			// The history rewrite is now committed. Drop predecessor-owned queued SDK
+			// work at this boundary; cancelled or failed preparation above preserves it.
+			const queuedSdkWork = this.#queuedMessagesForSessionTransition();
+			this.#terminalizeQueuedSdkWorkForSessionTransition(queuedSdkWork);
+			this.#deferredSdkFollowUps = [];
+			this.agent.clearAllQueues();
+			this.#steeringMessages = [];
+			this.#followUpMessages = [];
 
 			// Update agent state through the canonical filtered display context so legacy
 			// request-scoped entries cannot re-enter live history after tree navigation.

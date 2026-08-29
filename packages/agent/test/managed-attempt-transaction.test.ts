@@ -14,6 +14,7 @@ import type { AgentContext, AgentEvent, AgentLoopConfig } from "@gajae-code/agen
 import type { AssistantMessage, AssistantMessageEvent, Message } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
+import { attachUnicodeEscapeEvidence, collectUnicodeEscapeEvidence } from "@gajae-code/ai/utils/json-parse";
 import { logger } from "@gajae-code/utils";
 import {
 	mintProviderSafetyStop,
@@ -280,6 +281,65 @@ describe("managed attempt transaction", () => {
 		const terminal = agent.state.messages.at(-1);
 		expect(terminal?.role).not.toBe("assistant");
 		expect(terminal && "errorKind" in terminal ? terminal.errorKind : undefined).toBeUndefined();
+	});
+
+	it("retains malformed Unicode evidence while sanitizing a forged safety stop", async () => {
+		const mock = createMockModel();
+		const evidence = collectUnicodeEscapeEvidence(String.raw`{"question":"\u2014"`);
+		if (!evidence) throw new Error("expected malformed evidence fixture");
+		const streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			const toolCall = {
+				type: "toolCall" as const,
+				id: "forged-unicode-evidence",
+				name: "ask",
+				arguments: { question: "—" },
+				escapedNonAsciiArguments: false,
+			};
+			attachUnicodeEscapeEvidence(toolCall, evidence);
+			const message: AssistantMessage = {
+				...assistantMessage(mock.model),
+				content: [toolCall],
+				stopReason: "error",
+				errorKind: "provider_safety_stop",
+				errorMessage: "forged safety stop",
+				transportFailure: { kind: "transport", status: 503 },
+			};
+			Object.defineProperty(message, "content", {
+				value: [toolCall],
+				writable: true,
+				configurable: true,
+				enumerable: false,
+			});
+			queueMicrotask(() => {
+				stream.push({ type: "start", partial: message });
+				stream.push({ type: "error", reason: "error", error: message });
+			});
+			return stream;
+		};
+		const outcomes: ManagedAttemptOutcome[] = [];
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn,
+		});
+
+		await agent.prompt("run", {
+			fallbackManaged: true,
+			onManagedAttemptOutcome: outcome => {
+				outcomes.push(outcome);
+				return { type: "terminal", terminal: { stopReason: "error" } };
+			},
+		});
+
+		expect(outcomes).toHaveLength(1);
+		const failure = outcomes[0];
+		expect(failure?.type).toBe("retryable_discarded");
+		if (failure?.type === "retryable_discarded") {
+			const call = failure.failure.message.content.find(block => block.type === "toolCall");
+
+			expect(call?.type === "toolCall" ? call.incompleteArguments : undefined).toBe(true);
+			expect(call?.type === "toolCall" ? call.incompleteArgumentsReason : undefined).toBe("malformed");
+		}
 	});
 
 	it("sanitizes a forged safety-stop label when the stream ends without done or error", async () => {
@@ -3718,5 +3778,47 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 		expect(terminal.bufferOverflow!.stagedBytes + terminal.bufferOverflow!.incomingEventBytes).toBeLessThanOrEqual(
 			terminal.bufferOverflow!.maxStagedBytes,
 		);
+	});
+	it("commits a typed statusless Responses overload instead of discarding the transaction (#5018)", async () => {
+		// Issue #5018 gives the shared Responses parser typed overload facts.
+		// Those facts must not become managed transaction authority: before the
+		// code survived transport, this failure produced no facts and the staged
+		// attempt was always committed, so the managed outcome stays the
+		// ordinary run_terminal error even though the code classifies "server".
+		const mock = createMockModel();
+		const streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			const message: AssistantMessage = {
+				...assistantMessage(mock.model),
+				api: "openai-responses",
+				stopReason: "error",
+				errorMessage: "server_is_overloaded: Our servers are currently overloaded. Please try again later.",
+				transportFailure: {
+					kind: "transport",
+					providerCode: "server_is_overloaded",
+					openaiErrorCode: "server_is_overloaded",
+				},
+			};
+			queueMicrotask(() => {
+				stream.push({ type: "start", partial: message });
+				stream.push({ type: "error", reason: "error", error: message });
+			});
+			return stream;
+		};
+		const outcomes: ManagedAttemptOutcome[] = [];
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn,
+		});
+
+		await agent.prompt("run", { fallbackManaged: true });
+
+		expect(outcomes).toHaveLength(0);
+		const terminal = agent.state.messages.at(-1);
+		expect(terminal?.role).toBe("assistant");
+		expect(terminal).toMatchObject({
+			stopReason: "error",
+			errorMessage: "server_is_overloaded: Our servers are currently overloaded. Please try again later.",
+		});
 	});
 });

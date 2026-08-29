@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Added
+
+- `@` fuzzy file search supports Hangul chosung (초성) matching: a bare consonant matches any syllable with that initial, so `@ㅎㄱ` finds `한글.txt`. Literal and full-syllable matches keep ranking above chosung matches.
 ## [0.15.4] - 2026-08-29
 
 ### Fixed

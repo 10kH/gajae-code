@@ -8,7 +8,7 @@ import {
 	isSessionAuthorityEligible,
 	type SessionIndex,
 } from "../broker/session-index";
-import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
+import { cancellableSleep, lifecycleRequestTimeoutMs } from "../broker/startup-budget";
 import { SdkClient, SdkClientError, type SdkDispatchContext, type SdkDispatchHandler } from "../client/client";
 import { readSdkBrokerDiscovery, readSdkSessionEndpoint, type SdkSessionEndpoint } from "../client/discovery";
 import {
@@ -295,6 +295,8 @@ type AttachedSession = {
 	readonly capability: SessionAttachment;
 	readonly notificationSubscription: NotificationSubscription;
 	notificationCancelled: boolean;
+	/** Consecutive refused notification publications; reset by the next delivered frame. */
+	notificationFailures: number;
 	readonly notificationCursor: { generation: number; seq: number };
 	published: boolean;
 	initializingPublication: boolean;
@@ -342,6 +344,9 @@ const STARTUP_ATTACH_BUDGET_MS = 5_000;
 const STARTUP_STRAGGLER_LOG_LIMIT = 8;
 const ATTACH_CONNECT_TIMEOUT_MS = 10_000;
 const NOTIFICATION_WORK_TIMEOUT_MS = 5_000;
+// Core shutdown waits only for Router reconciliation and client close; provider
+// notification work is bounded separately by NOTIFICATION_WORK_TIMEOUT_MS.
+const ROUTER_SHUTDOWN_TIMEOUT_MS = 5_000;
 /**
  * Idle liveness-sweep cadence (#4689). When the session index is unchanged and
  * no adoption is pending, the 2s reconcile tick is only a change-stamp check;
@@ -352,6 +357,17 @@ const NOTIFICATION_WORK_TIMEOUT_MS = 5_000;
  */
 const SESSION_ROUTER_IDLE_SWEEP_MS = 30_000;
 const NOTIFICATION_WORK_TIMEOUT = Symbol("notification_work_timeout");
+/**
+ * Consecutive local notification-dispatch failures tolerated before the
+ * subscription is conceded. A provider that refuses ONE publication is not a
+ * dead subscription: it has already settled that publication as rejected on its
+ * own side, and the next frame normally succeeds. Cancelling on the first
+ * rejection latched `notificationCancelled` for the life of the
+ * `AttachedSession`, which only a new attachment clears -- a still-running
+ * session never gets one, so its mirroring stayed dead until the session was
+ * restarted. Mirrors {@link DELIVERY_ATTEMPT_LIMIT} on the ordered path.
+ */
+const NOTIFICATION_LOCAL_FAILURE_LIMIT = 5;
 /**
  * Client-message types the native session server authorizes with the
  * per-session endpoint token (`tokens_match` in crates/gjc-sdk server.rs).
@@ -552,10 +568,16 @@ export class SessionRouter {
 			// initial replay delivered. Past that budget the pass continues in the
 			// background instead of owning the caller's deadline.
 			const initialPass = this.#serialReconcile(runEpoch, false, true);
+			// Cancelled as soon as the race settles. Promise.race leaves the loser pending,
+			// and a pending Bun.sleep keeps the event loop alive, so a startup that settled
+			// in milliseconds still owed the rest of the budget before the process could exit.
+			const startupCutoff = new AbortController();
 			const settled = await Promise.race([
 				initialPass.then(() => true),
-				Bun.sleep(this.#deps.startupAttachBudgetMs ?? STARTUP_ATTACH_BUDGET_MS).then(() => false),
-			]);
+				cancellableSleep(this.#deps.startupAttachBudgetMs ?? STARTUP_ATTACH_BUDGET_MS, startupCutoff.signal).then(
+					() => false,
+				),
+			]).finally(() => startupCutoff.abort());
 			if (!settled) {
 				// Name the sessions the budget was spent on. Without this the lapse is
 				// silent and the only symptom is a slow startup somewhere else, which
@@ -586,6 +608,10 @@ export class SessionRouter {
 				() => this.#schedule(this.#serialReconcile(runEpoch, true)),
 				2_000,
 			);
+			// Reconciliation is background upkeep and must not be the reason a host process
+			// stays alive. stop() still clears it on the normal path; this only keeps a
+			// caller that never stops the Router from hanging at exit.
+			timer.unref?.();
 			this.#stopTimer = () => (this.#deps.clearInterval ?? clearInterval)(timer);
 		} catch (error) {
 			if (this.#running(runEpoch)) await this.stop();
@@ -695,13 +721,18 @@ export class SessionRouter {
 		// Provider notification work is detached and bounded independently; core
 		// shutdown waits only for Router reconciliation and client close.
 		const pending = Promise.allSettled([this.#reconcileTail, ...shutdownTasks]);
+		// Cancelled once the race settles, so a completed shutdown does not hold the
+		// event loop open for the remainder of the timeout.
+		const shutdownCutoff = new AbortController();
 		const outcome = await Promise.race([
 			pending.then(results => ({ kind: "settled" as const, results })),
-			Bun.sleep(5_000).then(() => ({ kind: "timeout" as const })),
-		]);
+			cancellableSleep(ROUTER_SHUTDOWN_TIMEOUT_MS, shutdownCutoff.signal).then(() => ({
+				kind: "timeout" as const,
+			})),
+		]).finally(() => shutdownCutoff.abort());
 		if (outcome.kind === "timeout") {
 			logger.warn(
-				"SessionRouter shutdown exceeded 5000ms; authority is revoked and cleanup continues in background.",
+				`SessionRouter shutdown exceeded ${ROUTER_SHUTDOWN_TIMEOUT_MS}ms; authority is revoked and cleanup continues in background.`,
 			);
 			return;
 		}
@@ -1548,6 +1579,7 @@ export class SessionRouter {
 			capability,
 			notificationSubscription,
 			notificationCancelled: false,
+			notificationFailures: 0,
 			notificationCursor,
 			published: false,
 			publication,
@@ -1780,10 +1812,20 @@ export class SessionRouter {
 	}
 
 	async #boundedNotificationWork<T>(work: () => Promise<T> | T): Promise<T | typeof NOTIFICATION_WORK_TIMEOUT> {
-		const timeout: Promise<typeof NOTIFICATION_WORK_TIMEOUT> = Bun.sleep(NOTIFICATION_WORK_TIMEOUT_MS).then(
-			() => NOTIFICATION_WORK_TIMEOUT,
-		);
-		return await Promise.race([Promise.resolve().then(work), timeout]);
+		// The dominant cost of a one-shot `gjc sdk` command: notification work that
+		// finished in milliseconds left this timeout pending, and a pending Bun.sleep
+		// keeps the event loop alive, so the process wrote its response and then idled
+		// for the full budget before exiting.
+		const cutoff = new AbortController();
+		const timeout: Promise<typeof NOTIFICATION_WORK_TIMEOUT> = cancellableSleep(
+			NOTIFICATION_WORK_TIMEOUT_MS,
+			cutoff.signal,
+		).then(() => NOTIFICATION_WORK_TIMEOUT);
+		try {
+			return await Promise.race([Promise.resolve().then(work), timeout]);
+		} finally {
+			cutoff.abort();
+		}
 	}
 
 	#detachNotification(
@@ -1827,15 +1869,25 @@ export class SessionRouter {
 					this.#detachNotification(attached, "cancelled");
 					return;
 				}
+				// A delivered frame ends the consecutive-failure run.
+				attached.notificationFailures = 0;
 				if (frame.seq !== undefined)
 					attached.notificationSubscription.advanceCursor(frame.generation ?? attached.generation, frame.seq);
 			},
 			(error: unknown) => {
-				this.#detachNotification(attached, "cancelled");
+				// Concede only after a bounded consecutive run: a single refused
+				// publication drops that frame, it does not end the subscription.
+				attached.notificationFailures += 1;
+				const detail = error instanceof Error ? error.message : String(error);
+				if (attached.notificationFailures >= NOTIFICATION_LOCAL_FAILURE_LIMIT) {
+					this.#detachNotification(attached, "cancelled");
+					logger.warn(
+						`SDK notification subscription ${attached.notificationSubscription.subscriptionId} failed locally ${attached.notificationFailures} times in a row; cancelling: ${detail}`,
+					);
+					return;
+				}
 				logger.warn(
-					`SDK notification subscription ${attached.notificationSubscription.subscriptionId} failed locally: ${
-						error instanceof Error ? error.message : String(error)
-					}`,
+					`SDK notification subscription ${attached.notificationSubscription.subscriptionId} refused one frame (${attached.notificationFailures}/${NOTIFICATION_LOCAL_FAILURE_LIMIT}); subscription retained: ${detail}`,
 				);
 			},
 		);
@@ -2092,7 +2144,9 @@ export class SessionRouter {
 						this.#failBarrier(attached, "replay went unanswered");
 						return;
 					}
-					await Bun.sleep(REPLAY_RETRY_BACKOFF_MS * 2 ** attempt);
+					// Awaited backoff rather than a raced timeout, but it must still not sleep
+					// through a shutdown: cancelling on stop lets the process exit promptly.
+					await cancellableSleep(REPLAY_RETRY_BACKOFF_MS * 2 ** attempt, this.#stopController.signal);
 					if (attached.barrier.held !== held || !this.#attachmentLive(attached)) return;
 				}
 			}
