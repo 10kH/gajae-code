@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.15.5] - 2026-08-29
+
 - Bash now blocks tmux input commands that resolve to the agent's own pane before spawning the shell, including direct pane targets, session aliases, explicit socket forms, shell wrappers, and inspected script indirection. Read-only inspection and cross-session orchestration remain available, while blocked input cannot reach the transcript as a user turn. (#5039)
 - Saved-session staged model-selection appends now re-authenticate metadata-only drift on the same managed transcript object using its unchanged inode, link count, length, and content digest. A changed successor still fails closed, so native Windows persistence no longer turns routine timestamp updates into `managed_append_identity_mismatch` setup failures.
 - The GLM tiers now spend `zai/glm-5.3-flash` on the high-volume lanes and keep judgment roles on `zai/glm-5.3`: `glm-eco` moves default, executor, and planner to `glm-5.3-flash:low` (critic and architect stay `glm-5.3:high`), `glm-medium` swaps only the executor to `glm-5.3-flash:low`, and `glm-pro` swaps the executor to `glm-5.3-flash:high`. GLM-5.3-Flash also joins the bundled `zai` catalog with GLM-5.3's text contract pinned in `applyGeneratedModelPolicy` (1M context, 128K output, always-on `low`/`high`/`max` reasoning effort), because models.dev currently lists it with null limits and a catalog regeneration would otherwise degrade it to the unknown-window fallback; it is skip-listed in the autorouting tier map as not yet curated.
