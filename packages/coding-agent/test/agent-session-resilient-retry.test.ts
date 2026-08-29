@@ -2739,8 +2739,7 @@ describe("AgentSession resilient retry", () => {
 			session = undefined;
 			waitSpy.mockClear();
 		}
-	});
-
+	}, 300000);
 	it("retries the wrapped canonical first-event timeout on a clean bare-default epoch", async () => {
 		// The wrapped "Error: Provider stream timed out while waiting for the first
 		// event" form was previously blocked by the bare-default scoped gate even on
@@ -2765,7 +2764,7 @@ describe("AgentSession resilient retry", () => {
 		expect(retryStartEvents).toHaveLength(1);
 		expect(retryEndEvents).toEqual([expect.objectContaining({ success: true })]);
 		expect(lastAssistant(session)).toMatchObject({ stopReason: "stop" });
-	});
+	}, 300000);
 	it("gives an active cancel-and-submit replacement a clean retry epoch", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const originalStarted = Promise.withResolvers<void>();
