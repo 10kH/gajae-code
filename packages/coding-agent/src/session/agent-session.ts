@@ -1703,7 +1703,10 @@ function buildSessionMetadata(
 			officialAnthropicEndpoint = false;
 		}
 	}
-	if (officialAnthropicEndpoint) {
+	// Without the registry owner, do not query shared auth storage: an unscoped
+	// lookup can attribute a registry-scoped API-key request to another OAuth
+	// account. Compatibility facades therefore retain session_id-only metadata.
+	if (officialAnthropicEndpoint && owner) {
 		const accountUuid = authStorage?.getOAuthAccountId("anthropic", credentialSessionId, { owner });
 		if (typeof accountUuid === "string" && accountUuid.length > 0) {
 			userId.account_uuid = accountUuid;
