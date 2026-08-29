@@ -337,6 +337,26 @@ describe("CombinedAutocompleteProvider", () => {
 			expect(result?.items.map(item => item.value)).toContain(`@${filename}`);
 		});
 
+		it("merges ignored prefix matches with fuzzy tracked siblings", async () => {
+			fs.writeFileSync(path.join(baseDir, ".gitignore"), "story-ignored.md\nnode_modules/\n");
+			fs.writeFileSync(path.join(baseDir, "story-ignored.md"), "ignored\n");
+			fs.writeFileSync(path.join(baseDir, "story-tracked.md"), "tracked\n");
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const result = await provider.getForceFileSuggestions(["@story"], 0, 6);
+
+			expect(result?.items.map(item => item.value)).toEqual(["@story-ignored.md", "@story-tracked.md"]);
+		});
+
+		it("keeps node_modules exact prefix matches reachable from explicit Tab", async () => {
+			fs.mkdirSync(path.join(baseDir, "node_modules"), { recursive: true });
+			fs.writeFileSync(path.join(baseDir, "node_modules", "package.json"), "{}\n");
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "@node_modules/pac";
+			const result = await provider.getForceFileSuggestions([line], 0, line.length);
+
+			expect(result?.items.map(item => item.value)).toContain("@node_modules/package.json");
+		});
+
 		it("matches chosung against NFD-stored file names", async () => {
 			const nfdName = "\u1112\u1161\u11AB\u1100\u1173\u11AF.txt";
 			fs.writeFileSync(path.join(baseDir, nfdName), "content\n");

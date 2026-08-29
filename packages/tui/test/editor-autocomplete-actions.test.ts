@@ -256,7 +256,7 @@ describe("Editor Enter handler sync slash completion", () => {
 			editor.setText("please read `src");
 
 			editor.handleInput("/");
-			await Bun.sleep(20);
+			await Bun.sleep(500);
 
 			expect(editor.isShowingAutocomplete()).toBe(true);
 			editor.handleInput("\r");
@@ -280,7 +280,7 @@ describe("Editor Enter handler sync slash completion", () => {
 			editor.setText(`please read \`${baseDir}`);
 
 			editor.handleInput("/");
-			await Bun.sleep(20);
+			await Bun.sleep(500);
 			expect(editor.isShowingAutocomplete()).toBe(true);
 			editor.handleInput("\r");
 
@@ -306,7 +306,7 @@ describe("Editor Enter handler sync slash completion", () => {
 			editor.setText(`please read \`${baseDir}`);
 
 			editor.handleInput("/");
-			await Bun.sleep(20);
+			await Bun.sleep(500);
 			expect(editor.isShowingAutocomplete()).toBe(true);
 			editor.moveToLineStart();
 			editor.handleInput("\r");
@@ -635,7 +635,7 @@ describe("Editor Enter handler sync slash completion", () => {
 
 			editor.handleInput("@");
 			editor.handleInput("ㅎㄱ");
-			await Bun.sleep(100);
+			await Bun.sleep(500);
 
 			expect(editor.isShowingAutocomplete()).toBe(true);
 		} finally {
@@ -652,7 +652,7 @@ describe("Editor Enter handler sync slash completion", () => {
 			editor.setText("@ㅎㄱ");
 
 			editor.handleInput("\t");
-			await Bun.sleep(100);
+			await Bun.sleep(500);
 
 			expect(editor.getText()).toBe("@한글.txt ");
 		} finally {

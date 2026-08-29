@@ -408,16 +408,7 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 		// Check for @ file reference (fuzzy search) - must be after a delimiter or at start
 		const atPrefix = this.#extractAtPrefix(textBeforeCursor);
 		if (atPrefix) {
-			const { rawPrefix, isQuotedPrefix } = parsePathPrefix(atPrefix);
-			const suggestions =
-				rawPrefix.length > 0
-					? await this.#getFuzzyFileSuggestions(rawPrefix, { isQuotedPrefix })
-					: await this.#getFileSuggestions("@");
-			if (suggestions.length === 0 && rawPrefix.length > 0) {
-				const fallback = await this.#getFileSuggestions(atPrefix);
-				if (fallback.length === 0) return null;
-				return { items: fallback, prefix: atPrefix };
-			}
+			const suggestions = await this.#getAtFileSuggestions(atPrefix);
 			if (suggestions.length === 0) return null;
 
 			return {
@@ -907,6 +898,23 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 		}
 	}
 
+	async #getAtFileSuggestions(atPrefix: string): Promise<AutocompleteItem[]> {
+		const prefixSuggestions = await this.#getFileSuggestions(atPrefix);
+		const { rawPrefix, isQuotedPrefix } = parsePathPrefix(atPrefix);
+		if (rawPrefix.length === 0) return prefixSuggestions;
+
+		const fuzzySuggestions = await this.#getFuzzyFileSuggestions(rawPrefix, { isQuotedPrefix });
+		const seen = new Set(prefixSuggestions.map(item => item.value));
+		return [
+			...prefixSuggestions,
+			...fuzzySuggestions.filter(item => {
+				if (seen.has(item.value)) return false;
+				seen.add(item.value);
+				return true;
+			}),
+		];
+	}
+
 	// Force file completion (called on Tab key) - always returns suggestions
 	async getForceFileSuggestions(
 		lines: string[],
@@ -924,16 +932,7 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 		// Force extract path prefix - this will always return something
 		const atPrefix = this.#extractAtPrefix(textBeforeCursor);
 		if (atPrefix !== null) {
-			const { rawPrefix, isQuotedPrefix } = parsePathPrefix(atPrefix);
-			const suggestions =
-				rawPrefix.length > 0
-					? await this.#getFuzzyFileSuggestions(rawPrefix, { isQuotedPrefix })
-					: await this.#getFileSuggestions(atPrefix);
-			if (suggestions.length === 0 && rawPrefix.length > 0) {
-				const fallback = await this.#getFileSuggestions(atPrefix);
-				if (fallback.length === 0) return null;
-				return { items: fallback, prefix: atPrefix };
-			}
+			const suggestions = await this.#getAtFileSuggestions(atPrefix);
 			if (suggestions.length === 0) return null;
 
 			return { items: suggestions, prefix: atPrefix };
