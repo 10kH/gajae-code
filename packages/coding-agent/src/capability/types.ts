@@ -33,6 +33,8 @@ export interface LoadContext {
 	profileAuthority?: "default" | "custom";
 	/** Git repository root (directory containing .git), or null if not in a repo */
 	repoRoot: string | null;
+	/** Whether discovery must remain isolated to the supplied home boundary. */
+	isolatedHome?: boolean;
 	/** Owning session settings for provider policy decisions. */
 	settings?: Settings;
 }
