@@ -17,6 +17,7 @@ async function fuzzyFindNative(): Promise<NativeFuzzyFind> {
 }
 
 const PATH_DELIMITERS = new Set([" ", "\t", '"', "'", "="]);
+const MAX_AUTOCOMPLETE_SUGGESTIONS = 100;
 
 function isAbsolutePathLike(value: string): boolean {
 	return path.isAbsolute(value) || path.win32.isAbsolute(value);
@@ -912,7 +913,7 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 				seen.add(item.value);
 				return true;
 			}),
-		];
+		].slice(0, MAX_AUTOCOMPLETE_SUGGESTIONS);
 	}
 
 	// Force file completion (called on Tab key) - always returns suggestions
