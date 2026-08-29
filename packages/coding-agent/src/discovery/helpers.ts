@@ -20,6 +20,8 @@ import {
 	type ReadScope,
 	readDirEntries,
 	readFile,
+	readFileSize,
+	readFileSlice,
 } from "../capability/fs";
 import { parseRuleConditionAndScope, type Rule, type RuleFrontmatter } from "../capability/rule";
 import type { Skill, SkillFrontmatter } from "../capability/skill";
@@ -1342,12 +1344,15 @@ export async function listClaudePluginRoots(
 	const roots: ClaudePluginRoot[] = [];
 	const warnings: string[] = [];
 	const projectRoots: ClaudePluginRoot[] = [];
+	const registryReadOptions: ReadFileOptions | undefined = isolatedHome
+		? { isolatedHome: true, home: canonicalHome, scope: "project", bypassCache: true }
+		: undefined;
 
 	// ── GJC installed plugins registry ───────────────────────────────────────
 	// In production `home` is the provenance-checked home, so `getPluginsDir(home)` resolves to the
 	// same XDG-aware path the marketplace writer uses (reads and writes always agree).
 	// Tests pass a temp dir, which short-circuits the resolver for deterministic isolation.
-	const gjcContent = gjcRegistryPath ? await readFile(gjcRegistryPath) : null;
+	const gjcContent = gjcRegistryPath ? await readFile(gjcRegistryPath, registryReadOptions) : null;
 	if (isolatedHome && !gjcRegistryPath) {
 		warnings.push(`Ignoring GJC plugin registry outside the isolated home: ${rawGjcRegistryPath}`);
 	}
@@ -1400,7 +1405,7 @@ export async function listClaudePluginRoots(
 	// Loaded from the nearest .gjc/plugins/installed_plugins.json relative to cwd.
 	// Project entries take precedence over user entries for the same plugin ID.
 	if (resolvedProjectPath) {
-		const projectContent = projectRegistryPath ? await readFile(projectRegistryPath) : null;
+		const projectContent = projectRegistryPath ? await readFile(projectRegistryPath, registryReadOptions) : null;
 		if (isolatedHome && !projectRegistryPath) {
 			warnings.push(`Ignoring project plugin registry outside the isolated home: ${resolvedProjectPath}`);
 		}
