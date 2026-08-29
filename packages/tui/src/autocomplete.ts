@@ -902,7 +902,7 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 	async #getAtFileSuggestions(atPrefix: string): Promise<AutocompleteItem[]> {
 		const prefixSuggestions = await this.#getFileSuggestions(atPrefix);
 		const { rawPrefix, isQuotedPrefix } = parsePathPrefix(atPrefix);
-		if (rawPrefix.length === 0) return prefixSuggestions;
+		if (rawPrefix.length === 0) return prefixSuggestions.slice(0, MAX_AUTOCOMPLETE_SUGGESTIONS);
 
 		const fuzzySuggestions = await this.#getFuzzyFileSuggestions(rawPrefix, { isQuotedPrefix });
 		const seen = new Set(fuzzySuggestions.map(item => item.value));
