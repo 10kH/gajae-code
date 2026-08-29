@@ -8,6 +8,7 @@ type OpenAICompatibleValidationOptions = {
 	signal?: AbortSignal;
 	fetch?: typeof globalThis.fetch;
 	requireInferenceResponse?: boolean;
+	timeoutMs?: number;
 };
 
 type ModelListValidationOptions = {
@@ -16,6 +17,7 @@ type ModelListValidationOptions = {
 	modelsUrl: string;
 	signal?: AbortSignal;
 	fetch?: typeof globalThis.fetch;
+	timeoutMs?: number;
 };
 
 const VALIDATION_TIMEOUT_MS = 15_000;
@@ -98,6 +100,16 @@ async function readBoundedBody(response: Response, signal: AbortSignal): Promise
 	return { text: new TextDecoder().decode(bytes), truncated };
 }
 
+function abortFailure(
+	provider: string,
+	apiKey: string,
+	callerSignal: AbortSignal | undefined,
+	timeoutSignal: AbortSignal,
+): Error | undefined {
+	if (callerSignal?.aborted) return new Error("Login cancelled");
+	if (timeoutSignal.aborted) return validationFailure(provider, apiKey, "validation request timed out");
+}
+
 function errorDetails(error: unknown, apiKey: string): string {
 	return boundedDetails(error instanceof Error ? error.message : String(error), apiKey);
 }
@@ -115,7 +127,7 @@ function validationFailure(provider: string, apiKey: string, suffix: string): Er
  * Performs a minimal request to verify credentials and endpoint access.
  */
 export async function validateOpenAICompatibleApiKey(options: OpenAICompatibleValidationOptions): Promise<void> {
-	const timeoutSignal = AbortSignal.timeout(VALIDATION_TIMEOUT_MS);
+	const timeoutSignal = AbortSignal.timeout(options.timeoutMs ?? VALIDATION_TIMEOUT_MS);
 	const signal = options.signal ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal;
 	const fetchImpl = options.fetch ?? globalThis.fetch;
 	if (signal.aborted) throw new Error("Login cancelled");
@@ -139,7 +151,8 @@ export async function validateOpenAICompatibleApiKey(options: OpenAICompatibleVa
 			signal,
 		});
 	} catch (error) {
-		if (signal.aborted) throw new Error("Login cancelled");
+		const abortError = abortFailure(options.provider, options.apiKey, options.signal, timeoutSignal);
+		if (abortError) throw abortError;
 		throw validationFailure(
 			options.provider,
 			options.apiKey,
@@ -155,8 +168,9 @@ export async function validateOpenAICompatibleApiKey(options: OpenAICompatibleVa
 				if (bounded.truncated) throw new Error("inference probe response exceeded validation limit");
 				body = bounded.text;
 			} catch (error) {
-				if (signal.aborted || (error instanceof Error && error.message === "Login cancelled"))
-					throw new Error("Login cancelled");
+				const abortError = abortFailure(options.provider, options.apiKey, options.signal, timeoutSignal);
+				if (abortError) throw abortError;
+				if (error instanceof Error && error.message === "Login cancelled") throw error;
 				if (error instanceof Error && error.message === "inference probe response exceeded validation limit")
 					throw validationFailure(options.provider, options.apiKey, error.message);
 				throw validationFailure(
@@ -189,7 +203,7 @@ export async function validateOpenAICompatibleApiKey(options: OpenAICompatibleVa
 					? (firstChoice as { message: Record<string, unknown> }).message
 					: undefined;
 			const content = message?.content;
-			if (!(typeof content === "string" || (Array.isArray(content) && content.length > 0))) {
+			if (!(typeof content === "string" && content.trim().length > 0)) {
 				throw validationFailure(options.provider, options.apiKey, "the inference probe returned no choices");
 			}
 		}
@@ -203,7 +217,8 @@ export async function validateOpenAICompatibleApiKey(options: OpenAICompatibleVa
 			? "response body exceeded validation limit"
 			: boundedDetails(bounded.text, options.apiKey);
 	} catch {
-		if (signal.aborted) throw new Error("Login cancelled");
+		const abortError = abortFailure(options.provider, options.apiKey, options.signal, timeoutSignal);
+		if (abortError) throw abortError;
 		// ignore body parse errors, status is enough
 	}
 
@@ -250,7 +265,7 @@ function isModelList(parsed: unknown): boolean {
  * authenticated inference is entitled to use the supplied key.
  */
 export async function validateApiKeyAgainstModelsEndpoint(options: ModelListValidationOptions): Promise<void> {
-	const timeoutSignal = AbortSignal.timeout(VALIDATION_TIMEOUT_MS);
+	const timeoutSignal = AbortSignal.timeout(options.timeoutMs ?? VALIDATION_TIMEOUT_MS);
 	const signal = options.signal ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal;
 	const fetchImpl = options.fetch ?? globalThis.fetch;
 	if (signal.aborted) throw new Error("Login cancelled");
@@ -267,7 +282,8 @@ export async function validateApiKeyAgainstModelsEndpoint(options: ModelListVali
 			signal,
 		});
 	} catch (error) {
-		if (signal.aborted) throw new Error("Login cancelled");
+		const abortError = abortFailure(options.provider, options.apiKey, options.signal, timeoutSignal);
+		if (abortError) throw abortError;
 		throw validationFailure(
 			options.provider,
 			options.apiKey,
@@ -282,8 +298,9 @@ export async function validateApiKeyAgainstModelsEndpoint(options: ModelListVali
 			if (bounded.truncated) throw new Error("response body exceeded validation limit");
 			body = bounded.text;
 		} catch (error) {
-			if (signal.aborted || (error instanceof Error && error.message === "Login cancelled"))
-				throw new Error("Login cancelled");
+			const abortError = abortFailure(options.provider, options.apiKey, options.signal, timeoutSignal);
+			if (abortError) throw abortError;
+			if (error instanceof Error && error.message === "Login cancelled") throw error;
 			throw validationFailure(
 				options.provider,
 				options.apiKey,
@@ -315,7 +332,8 @@ export async function validateApiKeyAgainstModelsEndpoint(options: ModelListVali
 			? "response body exceeded validation limit"
 			: boundedDetails(bounded.text, options.apiKey);
 	} catch {
-		if (signal.aborted) throw new Error("Login cancelled");
+		const abortError = abortFailure(options.provider, options.apiKey, options.signal, timeoutSignal);
+		if (abortError) throw abortError;
 		// ignore body parse errors, status is enough
 	}
 

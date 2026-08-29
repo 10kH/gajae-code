@@ -146,6 +146,10 @@ describe("validateApiKeyAgainstModelsEndpoint", () => {
 		await expect(validateInferenceProbe()).rejects.toThrow(/no choices/);
 		stubFetch(() => new Response(JSON.stringify({ choices: [{}] }), { status: 200 }));
 		await expect(validateInferenceProbe()).rejects.toThrow(/no choices/);
+		stubFetch(() => new Response(JSON.stringify({ choices: [{ message: { content: null } }] }), { status: 200 }));
+		await expect(validateInferenceProbe()).rejects.toThrow(/no choices/);
+		stubFetch(() => new Response(JSON.stringify({ choices: [{ message: { content: "   " } }] }), { status: 200 }));
+		await expect(validateInferenceProbe()).rejects.toThrow(/no choices/);
 	});
 
 	it("rejects forbidden inference entitlement", async () => {
@@ -205,5 +209,29 @@ describe("validateApiKeyAgainstModelsEndpoint", () => {
 		});
 		setTimeout(() => controller.abort(), 10);
 		await expect(pending).rejects.toThrow("Login cancelled");
+	});
+
+	it("reports an internal deadline separately from caller cancellation", async () => {
+		globalThis.fetch = (async () =>
+			new Response(
+				new ReadableStream({
+					start(stream) {
+						stream.enqueue(new TextEncoder().encode('{"choices":['));
+					},
+				}),
+				{ status: 200 },
+			)) as unknown as typeof globalThis.fetch;
+		const error = await validationErrorMessage(() =>
+			validateOpenAICompatibleApiKey({
+				provider: "Command Code GOAT",
+				apiKey: "cmd-test",
+				baseUrl: "https://example.invalid/v1",
+				model: "zai-org/GLM-5.3",
+				requireInferenceResponse: true,
+				timeoutMs: 10,
+			}),
+		);
+		expect(error).toContain("validation request timed out");
+		expect(error).not.toContain("cmd-test");
 	});
 });
