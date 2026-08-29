@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
@@ -106,6 +107,15 @@ describe("CombinedAutocompleteProvider", () => {
 			const values = result?.items.map(item => item.value) ?? [];
 			expect(values).toContain("@.github/");
 			expect(values.some(value => value === "@.git" || value.startsWith("@.git/"))).toBe(false);
+		});
+
+		it("preserves quoted @ metadata for explicit Tab", async () => {
+			await Bun.write(path.join(baseDir, "file name.md"), "content\n");
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const result = await provider.getForceFileSuggestions(['@"'], 0, 2);
+
+			expect(result?.prefix).toBe('@"');
+			expect(result?.items.map(item => item.value)).toContain('@"file name.md"');
 		});
 	});
 
@@ -305,6 +315,60 @@ describe("CombinedAutocompleteProvider", () => {
 			const result = await provider.getSuggestions([line], 0, line.length);
 			const values = result?.items.map(item => item.value) ?? [];
 			expect(values).toContain(`@${hangulName}`);
+		});
+
+		it("uses the same chosung fuzzy lane for explicit Tab", async () => {
+			await Bun.write(path.join(baseDir, hangulName), "content\n");
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "@\u314E\u3131";
+			const result = await provider.getForceFileSuggestions([line], 0, line.length);
+
+			expect(result?.prefix).toBe(line);
+			expect(result?.items.map(item => item.value)).toContain(`@${hangulName}`);
+		});
+
+		it("uses fuzzy contains matching for explicit Tab", async () => {
+			const filename = "project-story.md";
+			await Bun.write(path.join(baseDir, filename), "content\n");
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "@story";
+			const result = await provider.getForceFileSuggestions([line], 0, line.length);
+
+			expect(result?.prefix).toBe(line);
+			expect(result?.items.map(item => item.value)).toContain(`@${filename}`);
+		});
+
+		it("merges ignored prefix matches with fuzzy tracked siblings", async () => {
+			await Bun.write(path.join(baseDir, ".gitignore"), "story-ignored.md\nnode_modules/\n");
+			await Bun.write(path.join(baseDir, "story-ignored.md"), "ignored\n");
+			await Bun.write(path.join(baseDir, "story-tracked.md"), "tracked\n");
+			await Bun.$`git -C ${baseDir} init`.quiet();
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const result = await provider.getForceFileSuggestions(["@story"], 0, 6);
+
+			expect(result?.items.map(item => item.value)).toEqual(["@story-tracked.md", "@story-ignored.md"]);
+		});
+
+		it("keeps an exact file ahead of a fuzzy directory match", async () => {
+			await Bun.write(path.join(baseDir, "target"), "file\n");
+			await fsPromises.mkdir(path.join(baseDir, "target-dir"));
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const values =
+				(await provider.getForceFileSuggestions(["@target"], 0, 7))?.items.map(item => item.value) ?? [];
+
+			expect(values.indexOf("@target")).toBeGreaterThanOrEqual(0);
+			expect(values.indexOf("@target-dir/")).toBeGreaterThanOrEqual(0);
+			expect(values.indexOf("@target")).toBeLessThan(values.indexOf("@target-dir/"));
+		});
+
+		it("keeps node_modules exact prefix matches reachable from explicit Tab", async () => {
+			await fsPromises.mkdir(path.join(baseDir, "node_modules"), { recursive: true });
+			await Bun.write(path.join(baseDir, "node_modules", "package.json"), "{}\n");
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "@node_modules/pac";
+			const result = await provider.getForceFileSuggestions([line], 0, line.length);
+
+			expect(result?.items.map(item => item.value)).toContain("@node_modules/package.json");
 		});
 
 		it("matches chosung against NFD-stored file names", async () => {
