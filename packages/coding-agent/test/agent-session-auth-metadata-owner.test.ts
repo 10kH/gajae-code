@@ -34,9 +34,6 @@ describe("AgentSession auth metadata owner boundary", () => {
 				accountId: "stored-oauth-account",
 			},
 		]);
-		const owner = {};
-		authStorage.setConfigApiKey("anthropic", "registry-api-key", { owner });
-
 		const mock = createMockModel({ responses: [{ content: ["ok"] }] });
 		Object.defineProperty(mock.model, "provider", { value: "anthropic" });
 		Object.defineProperty(mock.model, "api", { value: "anthropic-messages" });
@@ -55,6 +52,8 @@ describe("AgentSession auth metadata owner boundary", () => {
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry: {
 				authStorage,
+				// The facade delegates a registry-scoped API key, but intentionally
+				// omits getAuthStorageOwner from its compatibility surface.
 				getApiKey: async () => "registry-api-key",
 				getAvailable: () => [mock.model],
 			} as never,
@@ -66,5 +65,52 @@ describe("AgentSession auth metadata owner boundary", () => {
 		expect(requestOptions?.metadata).toEqual({ user_id: JSON.stringify({ session_id: session.sessionId }) });
 		expect(String(requestOptions?.metadata?.user_id)).not.toContain("account_uuid");
 		expect(String(requestOptions?.metadata?.user_id)).not.toContain("device_id");
+	});
+
+	it("propagates account metadata when the real registry owner is available", async () => {
+		const tempDir = TempDir.createSync("@gjc-auth-metadata-owner-positive-");
+		tempDirs.push(tempDir);
+		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		storages.push(authStorage);
+		await authStorage.set("anthropic", [
+			{
+				type: "oauth",
+				access: "stored-oauth-access",
+				refresh: "stored-oauth-refresh",
+				expires: Date.now() + 60 * 60_000,
+				accountId: "stored-oauth-account",
+			},
+		]);
+		const owner = {};
+		const mock = createMockModel({ responses: [{ content: ["ok"] }] });
+		Object.defineProperty(mock.model, "provider", { value: "anthropic" });
+		Object.defineProperty(mock.model, "api", { value: "anthropic-messages" });
+		Object.defineProperty(mock.model, "baseUrl", { value: "https://api.anthropic.com" });
+		let requestOptions: SimpleStreamOptions | undefined;
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], messages: [], tools: [] },
+			streamFn: (model, context, options) => {
+				requestOptions = options;
+				return mock.stream(model, context, options);
+			},
+		});
+		const session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(tempDir.path()),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: {
+				authStorage,
+				getApiKey: async () => "stored-oauth-access",
+				getAvailable: () => [mock.model],
+				getAuthStorageOwner: () => owner,
+			} as never,
+		});
+		sessions.push(session);
+
+		await session.prompt("hello");
+
+		const userId = JSON.parse(String(requestOptions?.metadata?.user_id)) as Record<string, string>;
+		expect(userId).toMatchObject({ session_id: session.sessionId, account_uuid: "stored-oauth-account" });
+		expect(userId.device_id).toMatch(/^[a-f0-9]{64}$/);
 	});
 });
