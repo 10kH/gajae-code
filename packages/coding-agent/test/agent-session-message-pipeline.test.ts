@@ -20,6 +20,8 @@ function eventDelta(event: AgentSessionEvent): string {
 	return ame.delta ?? "";
 }
 
+const testModelRegistry = { getApiKey: async () => "test-key", getAuthStorageOwner: () => undefined };
+
 function createAgent(): Agent {
 	return new Agent({
 		initialState: {
@@ -78,7 +80,7 @@ describe("AgentSession message pipeline", () => {
 			agent: createAgent(),
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: {} as never,
+			modelRegistry: testModelRegistry as never,
 			transformContext,
 			convertToLlm,
 		});
@@ -101,7 +103,7 @@ describe("AgentSession message pipeline", () => {
 			agent: createAgent(),
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: {} as never,
+			modelRegistry: testModelRegistry as never,
 			onPayload: sessionOnPayload,
 		});
 		sessions.push(session);
@@ -126,7 +128,7 @@ describe("AgentSession message pipeline", () => {
 			agent: createAgent(),
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: {} as never,
+			modelRegistry: testModelRegistry as never,
 			onSseEvent: requestOnSseEvent,
 		});
 		sessions.push(session);
@@ -154,7 +156,7 @@ describe("AgentSession message pipeline", () => {
 			agent: createAgent(),
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: {} as never,
+			modelRegistry: testModelRegistry as never,
 			extensionRunner: {
 				emit: extensionEmit,
 				hasHandlers: (eventType: string) => eventType === "message_update",
@@ -230,7 +232,7 @@ describe("AgentSession message pipeline", () => {
 			agent: createAgent(),
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: {} as never,
+			modelRegistry: testModelRegistry as never,
 			extensionRunner: {
 				emit: async (...args: Parameters<typeof extensionEmit>) => {
 					await extensionEmit(...args);
@@ -286,7 +288,7 @@ describe("AgentSession message pipeline", () => {
 			agent: createAgent(),
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: {} as never,
+			modelRegistry: testModelRegistry as never,
 			extensionRunner: {
 				emit: extensionEmit,
 				hasHandlers: (eventType: string) => eventType === "reasoning_summary_end",
@@ -334,7 +336,7 @@ describe("AgentSession message pipeline", () => {
 			agent: createAgent(),
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: {} as never,
+			modelRegistry: testModelRegistry as never,
 		});
 		sessions.push(session);
 
@@ -375,7 +377,7 @@ describe("AgentSession message pipeline", () => {
 			agent: createAgent(),
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: {} as never,
+			modelRegistry: testModelRegistry as never,
 			extensionRunner: {
 				emit: extensionEmit,
 				hasHandlers: () => false,
@@ -403,7 +405,7 @@ describe("AgentSession message pipeline", () => {
 			agent: createAgent(),
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: {} as never,
+			modelRegistry: testModelRegistry as never,
 			extensionRunner: {
 				emit: extensionEmit,
 				hasHandlers: (eventType: string) => eventType === "message_update",
@@ -447,7 +449,7 @@ describe("AgentSession message pipeline", () => {
 			agent: createAgent(),
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: {} as never,
+			modelRegistry: testModelRegistry as never,
 			extensionRunner: {
 				emit: extensionEmit,
 				hasHandlers: (eventType: string) => eventType === "message_update",
@@ -490,7 +492,7 @@ describe("AgentSession message pipeline", () => {
 			agent: createAgent(),
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: {} as never,
+			modelRegistry: testModelRegistry as never,
 		});
 		sessions.push(session);
 
@@ -532,7 +534,7 @@ describe("AgentSession message pipeline", () => {
 			agent: createAgent(),
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: {} as never,
+			modelRegistry: testModelRegistry as never,
 		});
 		sessions.push(session);
 
@@ -569,7 +571,7 @@ describe("AgentSession message pipeline", () => {
 			agent: createAgent(),
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: {} as never,
+			modelRegistry: testModelRegistry as never,
 		});
 		sessions.push(session);
 
@@ -606,7 +608,7 @@ describe("AgentSession message pipeline", () => {
 			agent: createAgent(),
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: {} as never,
+			modelRegistry: testModelRegistry as never,
 		});
 		sessions.push(session);
 
@@ -650,7 +652,7 @@ describe("AgentSession message pipeline", () => {
 			agent: createAgent(),
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: {} as never,
+			modelRegistry: testModelRegistry as never,
 		});
 		sessions.push(session);
 		__sessionStateSidecarPerfCounters.reset();
@@ -674,7 +676,7 @@ describe("AgentSession message pipeline", () => {
 			agent: createAgent(),
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: {} as never,
+			modelRegistry: testModelRegistry as never,
 			extensionRunner: {
 				emit: noHandlerEmit,
 				hasHandlers: () => false,
@@ -698,7 +700,7 @@ describe("AgentSession message pipeline", () => {
 			agent: createAgent(),
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: {} as never,
+			modelRegistry: testModelRegistry as never,
 			extensionRunner: {
 				emit: vi.fn(async (event: { type: string; assistantMessageEvent?: { delta?: string } }) => {
 					extensionCalls.push(
@@ -732,7 +734,7 @@ describe("AgentSession message pipeline", () => {
 			agent: createAgent(),
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: {} as never,
+			modelRegistry: testModelRegistry as never,
 		});
 		sessions.push(session);
 
@@ -838,7 +840,7 @@ describe("AgentSession message pipeline", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: { getApiKey: async () => "test-key" } as never,
+			modelRegistry: testModelRegistry as never,
 		});
 		sessions.push(session);
 
@@ -872,7 +874,7 @@ describe("AgentSession message pipeline", () => {
 			agent: createAgent(),
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: {} as never,
+			modelRegistry: testModelRegistry as never,
 			extensionRunner: {
 				emit: async (event: { type: string }) => {
 					if (event.type !== "agent_end") return;
@@ -927,7 +929,7 @@ describe("AgentSession message pipeline", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: { getApiKey: async () => "test-key" } as never,
+			modelRegistry: testModelRegistry as never,
 		});
 		sessions.push(session);
 		const events: AgentSessionEvent[] = [];
@@ -951,7 +953,7 @@ describe("AgentSession message pipeline", () => {
 			agent: createAgent(),
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: {} as never,
+			modelRegistry: testModelRegistry as never,
 		});
 		sessions.push(session);
 		const agentEnds: AgentSessionEvent[] = [];
@@ -1010,7 +1012,7 @@ describe("AgentSession message pipeline", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: { getApiKey: async () => "test-key" } as never,
+			modelRegistry: testModelRegistry as never,
 			workerIntegrationRequest: signal => {
 				integrationRequests++;
 				if (failIntegration) throw new Error("worker integration failed");
@@ -1128,7 +1130,7 @@ describe("AgentSession message pipeline", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: { getApiKey: async () => "test-key" } as never,
+			modelRegistry: testModelRegistry as never,
 			extensionRunner: {
 				emit: async (event: { type: string }) => {
 					extensionEvents.push(event.type);
