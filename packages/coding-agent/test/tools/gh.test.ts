@@ -228,6 +228,69 @@ describe("parsePrUnifiedDiff", () => {
 			changeType: "modified",
 		});
 	});
+
+	it("decodes octal-escaped UTF-8 bytes in quoted diff headers", () => {
+		const diff = [
+			'diff --git "a/docs/\\355\\225\\234\\352\\270\\200.md" "b/docs/\\355\\225\\234\\352\\270\\200.md"',
+			"index 0000000..1111111 100644",
+			'--- "a/docs/\\355\\225\\234\\352\\270\\200.md"',
+			'+++ "b/docs/\\355\\225\\234\\352\\270\\200.md"',
+			"@@ -1 +1 @@",
+			"-old",
+			"+new",
+		].join("\n");
+
+		const parsed = parsePrUnifiedDiff(diff);
+
+		expect(parsed.files[0]?.path).toBe("docs/\uD55C\uAE00.md");
+	});
+
+	it.each([
+		["two-byte sequence", "caf\\303\\251.md", "caf\u00E9.md"],
+		["four-byte sequence", "\\360\\237\\232\\200.md", "\u{1F680}.md"],
+		["octal bytes beside named escapes and spaces", "na\\tme \\303\\251.md", "na\tme \u00E9.md"],
+		["escaped quote and backslash", 'q\\"b\\\\.md', 'q"b\\.md'],
+		["truncated multi-byte sequence", "x\\303y.md", "x\uFFFDy.md"],
+	])("decodes a quoted header path with a %s", (_label, quoted, expected) => {
+		const diff = [
+			`diff --git "a/${quoted}" "b/${quoted}"`,
+			"index 0000000..1111111 100644",
+			"@@ -1 +1 @@",
+			"+new",
+		].join("\n");
+
+		expect(parsePrUnifiedDiff(diff).files[0]?.path).toBe(expected);
+	});
+
+	it("decodes quoted rename lines", () => {
+		const diff = [
+			'diff --git "a/old \\355\\225\\234.md" "b/new \\352\\270\\200.md"',
+			"similarity index 100%",
+			'rename from "old \\355\\225\\234.md"',
+			'rename to "new \\352\\270\\200.md"',
+		].join("\n");
+
+		const parsed = parsePrUnifiedDiff(diff);
+
+		expect(parsed.files[0]).toMatchObject({
+			changeType: "renamed",
+			oldPath: "old \uD55C.md",
+			path: "new \uAE00.md",
+		});
+	});
+
+	it("keeps unquoted rename lines verbatim", () => {
+		const diff = [
+			"diff --git a/old.md b/new.md",
+			"similarity index 100%",
+			"rename from old.md",
+			"rename to new.md",
+		].join("\n");
+
+		const parsed = parsePrUnifiedDiff(diff);
+
+		expect(parsed.files[0]).toMatchObject({ changeType: "renamed", oldPath: "old.md", path: "new.md" });
+	});
 });
 
 describe("github tool", () => {

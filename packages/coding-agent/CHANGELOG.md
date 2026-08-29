@@ -19,6 +19,7 @@
 
 - Managed-session file identities now use one canonical unsigned 64-bit representation across stat/native boundaries and replacement cleanup receipts. Native Windows file IDs surfaced as signed negative bigints no longer create double-hyphen receipt names that block persistence or reopen; already-written signed receipt names and interrupted pending receipts are recovered only through the existing identity-bound, fail-closed reconciliation paths. (#5095)
 
+- `gh` PR diffs decode git's C-style quoted paths as UTF-8 bytes instead of Latin-1 code points, so non-ASCII file names (`docs/\355\225\234\352\270\200.md`) no longer surface as mojibake in the file list, and quoted `rename from`/`rename to` lines are unquoted the same way instead of keeping their literal quotes and escapes.
 - Confirmed operator `turn.abort` requests now travel through a dedicated local Broker route instead of trusting caller-supplied `operator:true` and `confirm:true` on ordinary SDK frames. The Broker revalidates the exact live endpoint identity, injects a process-bound private capability, preserves post-send uncertainty, and the host uses one capability-free canonical identity for dispatch idempotency, durable admission, and delivery receipts, so forged, stale, dropped, and replayed requests fail closed consistently across restart boundaries.
 
 - Blob references and filesystem-backed blob reads now accept only exact lowercase SHA-256 names before resolving a disk path; canonical references and valid missing-blob behavior are unchanged.

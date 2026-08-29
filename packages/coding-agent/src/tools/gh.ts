@@ -2869,9 +2869,33 @@ function skipDiffHeaderSpaces(text: string, index: number): number {
 	return i;
 }
 
-function parseDiffQuotedEscape(text: string, slashIndex: number): ParsedDiffHeaderToken {
-	const next = text.charAt(slashIndex + 1);
-	if (next === "") return { value: "\\", nextIndex: slashIndex + 1 };
+interface ParsedDiffQuotedEscape {
+	bytes: number[];
+	nextIndex: number;
+}
+
+const DIFF_PATH_ENCODER = new TextEncoder();
+const DIFF_PATH_DECODER = new TextDecoder();
+
+const DIFF_NAMED_ESCAPE_BYTES: Record<string, number> = {
+	a: 0x07,
+	b: 0x08,
+	f: 0x0c,
+	n: 0x0a,
+	r: 0x0d,
+	t: 0x09,
+	v: 0x0b,
+};
+
+/**
+ * Git quotes paths C-style and escapes every byte outside printable ASCII as
+ * octal, so a multi-byte UTF-8 character arrives as consecutive octal escapes.
+ * Escapes therefore yield bytes, and the whole token is decoded once.
+ */
+function parseDiffQuotedEscape(text: string, slashIndex: number): ParsedDiffQuotedEscape {
+	const codePoint = text.codePointAt(slashIndex + 1);
+	if (codePoint === undefined) return { bytes: [0x5c], nextIndex: slashIndex + 1 };
+	const next = String.fromCodePoint(codePoint);
 
 	if (next >= "0" && next <= "7") {
 		let end = slashIndex + 1;
@@ -2880,50 +2904,36 @@ function parseDiffQuotedEscape(text: string, slashIndex: number): ParsedDiffHead
 			if (digit < "0" || digit > "7") break;
 			end += 1;
 		}
-		return {
-			value: String.fromCharCode(Number.parseInt(text.slice(slashIndex + 1, end), 8)),
-			nextIndex: end,
-		};
+		return { bytes: [Number.parseInt(text.slice(slashIndex + 1, end), 8) & 0xff], nextIndex: end };
 	}
 
-	switch (next) {
-		case "a":
-			return { value: "\x07", nextIndex: slashIndex + 2 };
-		case "b":
-			return { value: "\b", nextIndex: slashIndex + 2 };
-		case "f":
-			return { value: "\f", nextIndex: slashIndex + 2 };
-		case "n":
-			return { value: "\n", nextIndex: slashIndex + 2 };
-		case "r":
-			return { value: "\r", nextIndex: slashIndex + 2 };
-		case "t":
-			return { value: "\t", nextIndex: slashIndex + 2 };
-		case "v":
-			return { value: "\v", nextIndex: slashIndex + 2 };
-		case "\\":
-		case '"':
-			return { value: next, nextIndex: slashIndex + 2 };
-		default:
-			return { value: next, nextIndex: slashIndex + 2 };
-	}
+	const named = DIFF_NAMED_ESCAPE_BYTES[next];
+	if (named !== undefined) return { bytes: [named], nextIndex: slashIndex + 2 };
+	return { bytes: Array.from(DIFF_PATH_ENCODER.encode(next)), nextIndex: slashIndex + 1 + next.length };
 }
 
 function parseDiffQuotedToken(text: string, startIndex: number): ParsedDiffHeaderToken | undefined {
 	if (text.charAt(startIndex) !== '"') return undefined;
-	let value = "";
-	for (let i = startIndex + 1; i < text.length; i += 1) {
-		const ch = text.charAt(i);
-		if (ch === '"') return { value, nextIndex: i + 1 };
+	const bytes: number[] = [];
+	for (let i = startIndex + 1; i < text.length; ) {
+		const codePoint = text.codePointAt(i) as number;
+		const ch = String.fromCodePoint(codePoint);
+		if (ch === '"') return { value: DIFF_PATH_DECODER.decode(Uint8Array.from(bytes)), nextIndex: i + 1 };
 		if (ch !== "\\") {
-			value += ch;
+			bytes.push(...DIFF_PATH_ENCODER.encode(ch));
+			i += ch.length;
 			continue;
 		}
 		const escaped = parseDiffQuotedEscape(text, i);
-		value += escaped.value;
-		i = escaped.nextIndex - 1;
+		bytes.push(...escaped.bytes);
+		i = escaped.nextIndex;
 	}
 	return undefined;
+}
+
+function parseDiffPathLine(line: string, prefix: string): string {
+	const rest = line.slice(prefix.length);
+	return parseDiffQuotedToken(rest, 0)?.value ?? rest;
 }
 
 function parseDiffHeaderToken(text: string, startIndex: number): ParsedDiffHeaderToken | undefined {
@@ -2999,11 +3009,11 @@ function parsePrDiffSection(section: string, startOffset: number, endOffset: num
 		}
 		if (line.startsWith("rename from ")) {
 			changeType = "renamed";
-			oldPath = line.slice("rename from ".length);
+			oldPath = parseDiffPathLine(line, "rename from ");
 			continue;
 		}
 		if (line.startsWith("rename to ")) {
-			newPath = line.slice("rename to ".length);
+			newPath = parseDiffPathLine(line, "rename to ");
 			continue;
 		}
 		if (line.startsWith("Binary files ") && line.endsWith(" differ")) {
