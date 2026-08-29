@@ -7,6 +7,7 @@
  * - Loading items for a capability across all providers
  */
 import * as path from "node:path";
+import * as fs from "node:fs/promises";
 import {
 	getAgentDir,
 	getAgentProfileAuthority,
@@ -308,8 +309,14 @@ export async function loadCapabilityForHome<T>(
 		: path.join(resolvedHome, getConfigDirName(), "agent");
 
 	const cwd = path.resolve(options.cwd ?? getProjectDir());
-	const repoRootCandidate = await findRepoRoot(cwd);
-	const repoRoot = repoRootCandidate && isWithinOrEqual(home, repoRootCandidate) ? repoRootCandidate : null;
+	const [canonicalHome, repoRootCandidate] = await Promise.all([
+		fs.realpath(resolvedHome).catch(() => resolvedHome),
+		findRepoRoot(cwd),
+	]);
+	const canonicalRepoRoot = repoRootCandidate
+		? await fs.realpath(repoRootCandidate).catch(() => path.resolve(repoRootCandidate))
+		: null;
+	const repoRoot = canonicalRepoRoot && isWithinOrEqual(canonicalHome, canonicalRepoRoot) ? repoRootCandidate : null;
 	const isolatedOptions: LoadOptions = { ...options, isolatedHome: true };
 	const ctx: LoadContext = { cwd, home: resolvedHome, userAgentDir, repoRoot, settings: isolatedOptions.settings };
 	const providers = filterProviders(capability, isolatedOptions);
