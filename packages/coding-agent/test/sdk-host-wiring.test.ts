@@ -73,6 +73,7 @@ import { reconciliationStorePath } from "../src/sdk/bus/reconciliation-store";
 import type { NotificationSessionController } from "../src/sdk/bus/session-control";
 import { SdkClient } from "../src/sdk/client";
 import { SessionSdkHost } from "../src/sdk/host";
+import { createSdkRunCapability } from "../src/sdk/host/sdk-run-capability";
 import type { SessionAttachment } from "../src/sdk/router/session-router";
 import { createAgentSession } from "../src/sdk/session";
 import {
@@ -89,7 +90,8 @@ import type {
 	ClientBridgePermissionOutcome,
 	ClientBridgePermissionToolCall,
 } from "../src/session/client-bridge";
-import { createSdkRunCapability, readSdkRunCapability } from "../src/session/sdk-run-capability";
+import * as sessionSdkRunCapability from "../src/session/sdk-run-capability";
+import { readSdkRunCapability } from "../src/session/sdk-run-capability";
 import { SessionManager } from "../src/session/session-manager";
 
 type CapturedSendUserMessage = (
@@ -118,6 +120,10 @@ function captureInternalSend(
 import { getAskAnswerSource, registerAskAnswerSource } from "../src/tools/ask-answer-registry";
 import { startProductionSdkHost } from "./helpers/sdk-production-host";
 import { createOrchestrationNotificationsExtension } from "./helpers/telegram-topic-test";
+
+test("SDK capability construction is not exported from the general session module", () => {
+	expect("createSdkRunCapability" in sessionSdkRunCapability).toBe(false);
+});
 
 type SdkPermissionProvider =
 	NonNullable<ExtensionContextActions["setSdkPermissionProvider"]> extends (provider: infer T) => void ? T : never;

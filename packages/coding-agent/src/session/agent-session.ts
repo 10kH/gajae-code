@@ -2583,8 +2583,10 @@ export class AgentSession {
 			predecessorScope !== undefined &&
 			this.#skipPostPromptRecoveryWaitByAttemptScope.delete(predecessorScope);
 		this.#acceptRunHandle(handle);
-		this.#activeSdkRunToken = sdkRunToken;
-		if (sdkRunToken !== undefined) this.#sdkRunTokensByAttemptScope.set(handle.scope, sdkRunToken);
+		if (sdkRunToken !== undefined) {
+			this.#activeSdkRunToken = sdkRunToken;
+			this.#sdkRunTokensByAttemptScope.set(handle.scope, sdkRunToken);
+		}
 		if (carryRecoverySkip) this.#skipPostPromptRecoveryWaitByAttemptScope.add(handle.scope);
 	}
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
@@ -3891,15 +3893,10 @@ export class AgentSession {
 		};
 		const publish = async () => {
 			let workerIntegration: Promise<WorkerIntegrationOutcome> | undefined;
+			let workerIntegrationOutcome: WorkerIntegrationOutcome | undefined;
 			if (!workerIntegrationSettled) {
 				workerIntegration = this.#flushWorkerIntegrationForAgentEnd();
-				const outcome = await workerIntegration;
-				this.#recordPostPublicationOutcome(
-					publicationContext,
-					publicationCorrelationId,
-					"worker_integration",
-					outcome,
-				);
+				workerIntegrationOutcome = await workerIntegration;
 			}
 			// Reserve persistence before notifying synchronous subscribers: a subscriber
 			// may start a successor prompt from agent_end, whose running state must
@@ -3915,14 +3912,31 @@ export class AgentSession {
 			const terminalPersistence = this.#queueCoordinatorRuntimeStatePersist(pending, true);
 			this.#emit(pending);
 			void terminalPersistence.then(
-				() =>
+				() => {
+					if (workerIntegrationOutcome) {
+						this.#recordPostPublicationOutcome(
+							publicationContext,
+							publicationCorrelationId,
+							"worker_integration",
+							workerIntegrationOutcome,
+						);
+					}
 					this.#recordPostPublicationOutcome(
 						publicationContext,
 						publicationCorrelationId,
 						"terminal_persistence",
 						{ status: "completed" },
-					),
+					);
+				},
 				error => {
+					if (workerIntegrationOutcome) {
+						this.#recordPostPublicationOutcome(
+							publicationContext,
+							publicationCorrelationId,
+							"worker_integration",
+							workerIntegrationOutcome,
+						);
+					}
 					this.#recordPostPublicationOutcome(
 						publicationContext,
 						publicationCorrelationId,
@@ -3942,7 +3956,6 @@ export class AgentSession {
 				(pending as AgentSessionEvent & { scope?: AttemptScopeRef }).scope,
 			);
 			if (workerIntegrationSettled) {
-				await extensionDelivery;
 				workerIntegration = this.#flushWorkerIntegrationForAgentEnd();
 				void workerIntegration.then(outcome =>
 					this.#recordPostPublicationOutcome(
@@ -3952,6 +3965,7 @@ export class AgentSession {
 						outcome,
 					),
 				);
+				await extensionDelivery;
 				void terminalPersistence.catch(error =>
 					logger.warn("Terminal persistence continued after SDK publication", { error }),
 				);
@@ -5513,12 +5527,18 @@ export class AgentSession {
 				message: `${kind} ${outcome.status} for ${correlation}${safeError ? `: ${safeError}` : ""}`,
 			});
 		}
-		void persistCoordinatorWorkerIntegrationOutcome(context, {
-			...outcome,
-			kind,
-			correlationId,
-			error: sanitizePostPublicationError(outcome.error),
-		}).catch(error => logger.warn("Failed to persist terminal reconciliation outcome", { error: String(error) }));
+		const persist = () =>
+			persistCoordinatorWorkerIntegrationOutcome(context, {
+				...outcome,
+				kind,
+				correlationId,
+				error: sanitizePostPublicationError(outcome.error),
+			});
+		const queued = this.#coordinatorPersistQueue.then(persist, persist);
+		this.#coordinatorPersistQueue = queued.catch(() => {});
+		void queued.catch(error =>
+			logger.warn("Failed to persist terminal reconciliation outcome", { error: String(error) }),
+		);
 	}
 
 	/**

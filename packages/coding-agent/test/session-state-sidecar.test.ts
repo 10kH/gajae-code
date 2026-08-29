@@ -185,7 +185,7 @@ describe("coordinator runtime state sidecar", () => {
 			execution_state: "failed",
 			receipt_state: "absent",
 			error: { code: "terminal_persistence_failed", recoverable: true },
-	});
+		});
 	});
 
 	it("regresses signed subprocess bootstrap, continuation, and tamper refusal", async () => {

@@ -11,7 +11,7 @@ import {
 	WorkerIntegrationRequestScheduler,
 } from "@gajae-code/coding-agent/session/agent-session";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { createSdkRunCapability } from "../src/session/sdk-run-capability";
+import { createSdkRunCapability } from "../src/sdk/host/sdk-run-capability";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
 function eventDelta(event: AgentSessionEvent): string {
@@ -1098,6 +1098,66 @@ describe("AgentSession message pipeline", () => {
 		await session.waitForIdle();
 		expect(events.filter(event => event.type === "agent_end")).toHaveLength(6);
 	});
+	it("starts SDK worker reconciliation before a slow extension delivery", async () => {
+		const extensionStarted = Promise.withResolvers<void>();
+		const releaseExtension = Promise.withResolvers<void>();
+		let workerStarted = false;
+		const model: Model = {
+			id: "slow-extension-model",
+			name: "slow-extension-model",
+			provider: "mock",
+			api: "mock",
+			baseUrl: "mock://",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200_000,
+			maxTokens: 32_768,
+		};
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["system prompt"], messages: [], tools: [] },
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: createAssistantMessage("") });
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("done") });
+				});
+				return stream;
+			},
+		});
+		const session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: testModelRegistry as never,
+			workerIntegrationRequest: async () => {
+				workerStarted = true;
+			},
+			extensionRunner: {
+				hasHandlers: (eventType: string) => eventType === "agent_end",
+				emitBeforeAgentStart: async () => undefined,
+				emit: async (event: { type: string }) => {
+					if (event.type !== "agent_end") return;
+					extensionStarted.resolve();
+					await releaseExtension.promise;
+				},
+			} as never,
+		});
+		sessions.push(session);
+		const events: AgentSessionEvent[] = [];
+		session.subscribe(event => events.push(event));
+
+		const prompt = session.sendUserMessage("slow extension", {
+			sdkRunCapability: createSdkRunCapability("slow-extension-owner"),
+		} as never);
+		await extensionStarted.promise;
+		expect(workerStarted).toBe(true);
+		expect(events.some(event => event.type === "agent_end")).toBe(true);
+		releaseExtension.resolve();
+		await prompt;
+	});
+
 	it("drains deferred agent_end extension delivery before session shutdown", async () => {
 		const extensionStarted = Promise.withResolvers<void>();
 		const releaseExtension = Promise.withResolvers<void>();

@@ -11,7 +11,7 @@ import { readVisibleSkillActiveState } from "@gajae-code/coding-agent/hooks/skil
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { createSdkRunCapability } from "../src/session/sdk-run-capability";
+import { createSdkRunCapability } from "../src/sdk/host/sdk-run-capability";
 
 let session: AgentSession | undefined;
 let authStorage: AuthStorage | undefined;

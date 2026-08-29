@@ -11,7 +11,7 @@ import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
 import { z } from "zod";
-import { createSdkRunCapability } from "../src/session/sdk-run-capability";
+import { createSdkRunCapability } from "../src/sdk/host/sdk-run-capability";
 
 /**
  * Issue #4668 — production-path coverage for queued-promotion run identity.

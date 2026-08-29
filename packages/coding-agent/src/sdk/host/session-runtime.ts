@@ -28,7 +28,7 @@ import { type ModelSelectorValue, normalizeModelSelectorValue } from "../../conf
 import { type Settings, validateSettingPatch } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import { normalizeGoal } from "../../goals/state";
-import { createSdkRunCapability, type SdkRunCapability } from "../../session/sdk-run-capability";
+import type { SdkRunCapability } from "../../session/sdk-run-capability";
 import {
 	boundTerminalRetentionState,
 	findOwnedRegistrationsForTurn,
@@ -62,6 +62,7 @@ import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "./control/runtime-gate";
 import { SessionSdkHost, type SessionSdkHostOptions } from "./host";
 import { clearAutoroutingInactive, isAutoroutingInactive, markAutoroutingInactive } from "./internal-autorouting-state";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "./query";
+import { createSdkRunCapability } from "./sdk-run-capability";
 import {
 	createSdkCapabilities,
 	createSdkSurfacePolicyForContext,
