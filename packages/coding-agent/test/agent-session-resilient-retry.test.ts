@@ -99,13 +99,15 @@ describe("AgentSession resilient retry", () => {
 	});
 
 	afterEach(async () => {
+		// Teardown uses real timer/deadline state. Restore test clocks and scheduler
+		// hooks before disposing so a mocked Date.now cannot wedge cleanup.
+		vi.restoreAllMocks();
 		if (session) {
 			await session.dispose();
 			session = undefined;
 		}
 		authStorage.close();
 		tempDir.removeSync();
-		vi.restoreAllMocks();
 	});
 
 	function buildSession(options: {
