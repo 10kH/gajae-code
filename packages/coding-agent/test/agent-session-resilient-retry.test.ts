@@ -21,6 +21,8 @@ import {
 	PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION,
 } from "../../ai/src/adapter-internals/provider-safety-stop";
 
+const REAL_DATE_NOW = Date.now;
+
 /**
  * Anthropic's statusless capacity-overload envelope exactly as observed in a
  * live session, including the trailing padding the provider sends.
@@ -102,6 +104,7 @@ describe.serial("AgentSession resilient retry", () => {
 		// Teardown uses real timer/deadline state. Restore test clocks and scheduler
 		// hooks before disposing so a mocked Date.now cannot wedge cleanup.
 		vi.restoreAllMocks();
+		Date.now = REAL_DATE_NOW;
 		const currentSession = session;
 		const currentAuthStorage = authStorage;
 		const currentTempDir = tempDir;
