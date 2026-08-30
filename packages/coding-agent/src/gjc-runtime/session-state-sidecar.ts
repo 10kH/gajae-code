@@ -1597,8 +1597,28 @@ function orderedDistinctStateFiles(stateFiles: readonly string[], platform: Node
 		byIdentity.set(normalizePathForComparison(resolved, platform), resolved);
 	}
 	return [...byIdentity.entries()]
-		.sort(([left], [right]) => left.localeCompare(right))
+		.sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
 		.map(([, stateFile]) => stateFile);
+}
+
+function canonicalDirectoryWithExistingAncestor(directory: string): string {
+	let current = path.resolve(directory);
+	const missing: string[] = [];
+	for (;;) {
+		try {
+			return path.join(fsSync.realpathSync(current), ...missing.reverse());
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new PreviousRuntimeStateReadError(error);
+			const parent = path.dirname(current);
+			if (parent === current) throw new PreviousRuntimeStateReadError(error);
+			missing.push(path.basename(current));
+			current = parent;
+		}
+	}
+}
+
+function canonicalStateFilePath(stateFile: string): string {
+	return path.join(canonicalDirectoryWithExistingAncestor(path.dirname(stateFile)), path.basename(stateFile));
 }
 
 async function withSerializedStateFiles<T>(stateFiles: readonly string[], operation: () => Promise<T>): Promise<T> {
@@ -1883,13 +1903,23 @@ function previousRescopeIdentity(context: RuntimeStateContext, previousCwd: stri
 
 interface CoordinatorRuntimeStateRescopeJournal {
 	schema_version: 1;
+	move_id: string;
 	session_id: string;
 	previous_cwd: string;
 	new_cwd: string;
 	previous_session_file: string | null;
 	new_session_file: string | null;
+	old_state_file: string;
+	new_state_file: string;
+	state_file_mode: "pinned" | "derived";
+	source_sha256: string | null;
+	key_id: string | null;
+	signature: string | null;
 	created_at: string;
 }
+
+const RUNTIME_STATE_RESCOPE_MOVE_ID_PATTERN =
+	/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 function runtimeStateRescopeJournalPath(cwd: string, sessionId: string): string {
 	return path.join(sessionRuntimeDir(cwd, sessionId), "runtime-state-rescope.json");
@@ -1918,50 +1948,150 @@ function parseRuntimeStateRescopeJournal(raw: string): CoordinatorRuntimeStateRe
 	if (
 		!hasExactOwnKeys(journal, [
 			"schema_version",
+			"move_id",
 			"session_id",
 			"previous_cwd",
 			"new_cwd",
 			"previous_session_file",
 			"new_session_file",
+			"old_state_file",
+			"new_state_file",
+			"state_file_mode",
+			"source_sha256",
+			"key_id",
+			"signature",
 			"created_at",
 		]) ||
 		journal.schema_version !== 1 ||
+		typeof journal.move_id !== "string" ||
+		!RUNTIME_STATE_RESCOPE_MOVE_ID_PATTERN.test(journal.move_id) ||
 		typeof journal.session_id !== "string" ||
 		typeof journal.previous_cwd !== "string" ||
 		typeof journal.new_cwd !== "string" ||
 		(journal.previous_session_file !== null && typeof journal.previous_session_file !== "string") ||
 		(journal.new_session_file !== null && typeof journal.new_session_file !== "string") ||
+		typeof journal.old_state_file !== "string" ||
+		typeof journal.new_state_file !== "string" ||
+		(journal.state_file_mode !== "pinned" && journal.state_file_mode !== "derived") ||
+		(journal.source_sha256 !== null &&
+			(typeof journal.source_sha256 !== "string" || !/^[0-9a-f]{64}$/.test(journal.source_sha256))) ||
+		(journal.key_id !== null && typeof journal.key_id !== "string") ||
+		(journal.signature !== null && typeof journal.signature !== "string") ||
 		!isCanonicalIsoTimestamp(journal.created_at)
 	)
 		throw new PreviousRuntimeStateReadError();
 	return journal as unknown as CoordinatorRuntimeStateRescopeJournal;
 }
 
+function rescopeStateFiles(
+	sessionId: string,
+	previousCwd: string,
+	newCwd: string,
+): { oldStateFile: string; newStateFile: string; mode: "pinned" | "derived" } {
+	const explicit = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
+	if (explicit) {
+		const stateFile = canonicalStateFilePath(explicit);
+		return { oldStateFile: stateFile, newStateFile: stateFile, mode: "pinned" };
+	}
+	return {
+		oldStateFile: canonicalStateFilePath(
+			path.join(sessionRuntimeDir(fsSync.realpathSync(previousCwd), sessionId), "runtime-state.json"),
+		),
+		newStateFile: canonicalStateFilePath(
+			path.join(sessionRuntimeDir(fsSync.realpathSync(newCwd), sessionId), "runtime-state.json"),
+		),
+		mode: "derived",
+	};
+}
+
+function journalSignaturePayload(journal: CoordinatorRuntimeStateRescopeJournal): Record<string, unknown> {
+	const { signature: _signature, ...unsigned } = journal;
+	return unsigned;
+}
+
+function verifyRuntimeStateRescopeJournal(journal: CoordinatorRuntimeStateRescopeJournal): void {
+	if (journal.key_id === null) {
+		if (journal.signature !== null) throw new PreviousRuntimeStateReadError();
+		return;
+	}
+	if (
+		journal.signature === null ||
+		!coordinatorSidecarSigningKey ||
+		!verify(
+			null,
+			Buffer.from(canonicalCoordinatorSidecarPayload(journalSignaturePayload(journal))),
+			createPublicKey(coordinatorSidecarSigningKey),
+			Buffer.from(journal.signature, "base64"),
+		)
+	)
+		throw new PreviousRuntimeStateReadError();
+}
+
 export async function prepareCoordinatorRuntimeStateRescope(input: {
+	moveId?: string;
 	sessionId: string;
 	previousCwd: string;
 	newCwd: string;
 	previousSessionFile?: string | null;
 	newSessionFile?: string | null;
-}): Promise<void> {
+}): Promise<string> {
+	const previousCwd = fsSync.realpathSync(input.previousCwd);
+	const newCwd = fsSync.realpathSync(input.newCwd);
+	const stateFiles = rescopeStateFiles(input.sessionId, previousCwd, newCwd);
+	const sourceObservation = readRegularFileForRelocation(stateFiles.oldStateFile);
+	const moveId = input.moveId ?? randomUUID();
+	if (!RUNTIME_STATE_RESCOPE_MOVE_ID_PATTERN.test(moveId)) throw new PreviousRuntimeStateReadError();
+	const identity = normalizedIdentity({
+		sessionId: input.sessionId,
+		cwd: newCwd,
+		sessionFile: input.newSessionFile ?? null,
+	});
 	const journal: CoordinatorRuntimeStateRescopeJournal = {
 		schema_version: 1,
+		move_id: moveId,
 		session_id: input.sessionId,
-		previous_cwd: path.resolve(input.previousCwd),
-		new_cwd: path.resolve(input.newCwd),
+		previous_cwd: previousCwd,
+		new_cwd: newCwd,
 		previous_session_file: input.previousSessionFile ? path.resolve(input.previousSessionFile) : null,
 		new_session_file: input.newSessionFile ? path.resolve(input.newSessionFile) : null,
+		old_state_file: stateFiles.oldStateFile,
+		new_state_file: stateFiles.newStateFile,
+		state_file_mode: stateFiles.mode,
+		source_sha256: sourceObservation?.identity.sha256 ?? null,
+		key_id: identity.sidecarKeyId,
+		signature: null,
 		created_at: new Date().toISOString(),
 	};
+	if (journal.key_id !== null) {
+		if (!coordinatorSidecarSigningKey) throw new PreviousRuntimeStateReadError();
+		journal.signature = sign(
+			null,
+			Buffer.from(canonicalCoordinatorSidecarPayload(journalSignaturePayload(journal))),
+			coordinatorSidecarSigningKey,
+		).toString("base64");
+	}
 	await writeCoordinatorAtomic(
 		runtimeStateRescopeJournalPath(journal.new_cwd, journal.session_id),
 		`${JSON.stringify(journal)}\n`,
 	);
+	return journal.move_id;
 }
 
-export async function clearCoordinatorRuntimeStateRescope(context: RuntimeStateContext): Promise<void> {
-	const journalFile = runtimeStateRescopeJournalPath(context.cwd, context.sessionId);
-	await fs.rm(journalFile, { force: true });
+export async function clearCoordinatorRuntimeStateRescope(
+	context: RuntimeStateContext,
+	expectedMoveId?: string,
+): Promise<void> {
+	const journalFile = runtimeStateRescopeJournalPath(fsSync.realpathSync(context.cwd), context.sessionId);
+	const observed = readRegularFileForRelocation(journalFile);
+	if (!observed) return;
+	const journal = parseRuntimeStateRescopeJournal(observed.raw);
+	verifyRuntimeStateRescopeJournal(journal);
+	if (expectedMoveId !== undefined && journal.move_id !== expectedMoveId) throw new PreviousRuntimeStateReadError();
+	const identity = normalizedIdentity(context);
+	if (journal.session_id !== context.sessionId || journal.key_id !== identity.sidecarKeyId)
+		throw new PreviousRuntimeStateReadError();
+	const removed = exactUnlinkDirect(journalFile, observed.identity);
+	if (!removed.ok && removed.code !== "not_found") throw new PreviousRuntimeStateReadError();
 	await syncCoordinatorDirectory(path.dirname(journalFile));
 }
 
@@ -1970,11 +2100,17 @@ export async function recoverCoordinatorRuntimeStateRescope(context: RuntimeStat
 	const observed = readRegularFileForRelocation(journalFile);
 	if (!observed) return;
 	const journal = parseRuntimeStateRescopeJournal(observed.raw);
+	verifyRuntimeStateRescopeJournal(journal);
 	const current = normalizedIdentity(context);
+	const configuredStateFiles = rescopeStateFiles(journal.session_id, journal.previous_cwd, journal.new_cwd);
 	if (
 		journal.session_id !== current.sessionId ||
 		!sameResolvedPath(journal.new_cwd, current.cwd, current.platform) ||
-		!sameOptionalResolvedPath(journal.new_session_file, current.sessionFile, current.platform)
+		!sameOptionalResolvedPath(journal.new_session_file, current.sessionFile, current.platform) ||
+		journal.key_id !== current.sidecarKeyId ||
+		journal.state_file_mode !== configuredStateFiles.mode ||
+		!sameResolvedPath(journal.old_state_file, configuredStateFiles.oldStateFile, current.platform) ||
+		!sameResolvedPath(journal.new_state_file, configuredStateFiles.newStateFile, current.platform)
 	)
 		throw new PreviousRuntimeStateReadError();
 	const completed = await relocateCoordinatorRuntimeStateForRescope(
@@ -1982,11 +2118,7 @@ export async function recoverCoordinatorRuntimeStateRescope(context: RuntimeStat
 		journal.previous_cwd,
 	);
 	if (!completed) throw new PreviousRuntimeStateReadError();
-	await clearCoordinatorRuntimeStateRescope(context);
-}
-
-function runtimeStateUpdatedAt(payload: Record<string, unknown>): number | null {
-	return isCanonicalIsoTimestamp(payload.updated_at) ? Date.parse(payload.updated_at) : null;
+	await clearCoordinatorRuntimeStateRescope(context, journal.move_id);
 }
 
 function sameExactFileIdentity(left: NativeExactFileIdentity | null, right: NativeExactFileIdentity | null): boolean {
@@ -2031,7 +2163,11 @@ export async function relocateCoordinatorRuntimeStateForRescope(
 	context: RuntimeStateContext,
 	previousCwd: string,
 ): Promise<boolean> {
-	const newStateFile = runtimeStateFileForContext(context);
+	const canonicalNewCwd = fsSync.realpathSync(context.cwd);
+	const canonicalPreviousCwd = fsSync.realpathSync(previousCwd);
+	context = { ...context, cwd: canonicalNewCwd };
+	const rawNewStateFile = runtimeStateFileForContext(context);
+	const newStateFile = rawNewStateFile ? canonicalStateFilePath(rawNewStateFile) : null;
 	if (!newStateFile) return true;
 	const identity = normalizedIdentity(context);
 	const oldIdentity = previousRescopeIdentity(context, previousCwd);
@@ -2040,8 +2176,28 @@ export async function relocateCoordinatorRuntimeStateForRescope(
 	// per-session runtime directory rooted at the (now former) cwd.
 	const oldStateFile = explicitStateFile
 		? newStateFile
-		: path.join(sessionRuntimeDir(path.resolve(previousCwd), identity.sessionId), "runtime-state.json");
+		: canonicalStateFilePath(
+				path.join(sessionRuntimeDir(canonicalPreviousCwd, identity.sessionId), "runtime-state.json"),
+			);
 	const samePath = sameResolvedPath(oldStateFile, newStateFile, identity.platform);
+	let expectedSourceSha256: string | null | undefined;
+	const journalObservation = readRegularFileForRelocation(
+		runtimeStateRescopeJournalPath(canonicalNewCwd, identity.sessionId),
+	);
+	if (journalObservation) {
+		const journal = parseRuntimeStateRescopeJournal(journalObservation.raw);
+		verifyRuntimeStateRescopeJournal(journal);
+		if (
+			journal.session_id !== identity.sessionId ||
+			journal.key_id !== identity.sidecarKeyId ||
+			!sameResolvedPath(journal.previous_cwd, canonicalPreviousCwd, identity.platform) ||
+			!sameResolvedPath(journal.new_cwd, canonicalNewCwd, identity.platform) ||
+			!sameResolvedPath(journal.old_state_file, oldStateFile, identity.platform) ||
+			!sameResolvedPath(journal.new_state_file, newStateFile, identity.platform)
+		)
+			throw new PreviousRuntimeStateReadError();
+		expectedSourceSha256 = journal.source_sha256;
+	}
 	const stateFiles = orderedDistinctStateFiles([oldStateFile, newStateFile], identity.platform);
 	return await withSerializedStateFiles(
 		stateFiles,
@@ -2074,7 +2230,14 @@ export async function relocateCoordinatorRuntimeStateForRescope(
 							? destinationObservation
 							: readPreviousPayloadForRelocation(oldStateFile);
 						const source = sourceObservation.payload;
-						if (Object.keys(source).length === 0) return true;
+						if (Object.keys(source).length === 0) {
+							return expectedSourceSha256 === undefined || destinationIsCurrent;
+						}
+						if (
+							expectedSourceSha256 !== undefined &&
+							(expectedSourceSha256 === null || sourceObservation.identity?.sha256 !== expectedSourceSha256)
+						)
+							return false;
 						// Trust the predecessor only if it authenticates against its OLD identity. A payload
 						// whose signature, key, or old cwd/session-file does not match is left untouched; the
 						// fence, not this repair, remains the authority for a foreign marker.
@@ -2083,13 +2246,7 @@ export async function relocateCoordinatorRuntimeStateForRescope(
 						} catch {
 							return false;
 						}
-						let publishSource = !destinationIsCurrent;
-						if (destinationIsCurrent) {
-							const sourceUpdatedAt = runtimeStateUpdatedAt(source);
-							const destinationUpdatedAt = runtimeStateUpdatedAt(destination);
-							if (sourceUpdatedAt === null || destinationUpdatedAt === null) return false;
-							publishSource = sourceUpdatedAt > destinationUpdatedAt;
-						}
+						const publishSource = !destinationIsCurrent;
 						if (publishSource) {
 							const migrated = {
 								...source,

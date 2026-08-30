@@ -3229,6 +3229,39 @@ export class AgentSession {
 	 */
 	#sessionTransitionKind: string | undefined;
 	#coordinatorPersistGeneration = 0;
+	#coordinatorRescopeBarrier: Promise<void> | undefined;
+	#releaseCoordinatorRescopeBarrier: (() => void) | undefined;
+	#coordinatorRescopeMoveId: string | undefined;
+	#coordinatorEventHandlers = new Set<Promise<void>>();
+	#coordinatorUnbarrieredPersists = new Set<Promise<void>>();
+
+	#beginCoordinatorRescopeBarrier(): Promise<void>[] {
+		if (this.#coordinatorRescopeBarrier) throw new Error("Coordinator rescope barrier is already active.");
+		const barrier = Promise.withResolvers<void>();
+		this.#coordinatorRescopeBarrier = barrier.promise;
+		this.#releaseCoordinatorRescopeBarrier = barrier.resolve;
+		return [...this.#coordinatorEventHandlers];
+	}
+
+	#trackUnbarrieredCoordinatorPersist(persist: Promise<void>): void {
+		this.#coordinatorUnbarrieredPersists.add(persist);
+		void persist.then(
+			() => this.#coordinatorUnbarrieredPersists.delete(persist),
+			() => this.#coordinatorUnbarrieredPersists.delete(persist),
+		);
+	}
+
+	async #drainUnbarrieredCoordinatorPersists(): Promise<void> {
+		while (this.#coordinatorUnbarrieredPersists.size > 0) {
+			await Promise.allSettled([...this.#coordinatorUnbarrieredPersists]);
+		}
+	}
+
+	#endCoordinatorRescopeBarrier(): void {
+		this.#releaseCoordinatorRescopeBarrier?.();
+		this.#releaseCoordinatorRescopeBarrier = undefined;
+		this.#coordinatorRescopeBarrier = undefined;
+	}
 
 	#beginSessionTransition(kind: string): void {
 		if (this.#sessionTransitionKind !== undefined) {
@@ -4069,9 +4102,14 @@ export class AgentSession {
 		}
 		this.#registerRuntimeStateFinalizer();
 		this.#unregisterBeforeMoveListener = this.sessionManager.registerBeforeMoveListener(async move => {
-			await this.#coordinatorPersistQueue;
+			const admittedBeforeBarrier = this.#beginCoordinatorRescopeBarrier();
+			await Promise.allSettled(admittedBeforeBarrier);
+			await this.#drainUnbarrieredCoordinatorPersists();
 			this.#coordinatorPersistGeneration += 1;
+			const moveId = crypto.randomUUID();
+			this.#coordinatorRescopeMoveId = moveId;
 			await prepareCoordinatorRuntimeStateRescope({
+				moveId,
 				sessionId: this.sessionId,
 				previousCwd: move.previousCwd,
 				newCwd: move.newCwd,
@@ -4080,11 +4118,19 @@ export class AgentSession {
 			});
 		});
 		this.#unregisterMoveAbortListener = this.sessionManager.registerMoveAbortListener(async move => {
-			await clearCoordinatorRuntimeStateRescope({
-				sessionId: this.sessionId,
-				cwd: move.newCwd,
-				sessionFile: move.newSessionFile ?? null,
-			});
+			try {
+				await clearCoordinatorRuntimeStateRescope(
+					{
+						sessionId: this.sessionId,
+						cwd: move.newCwd,
+						sessionFile: move.newSessionFile ?? null,
+					},
+					this.#coordinatorRescopeMoveId,
+				);
+			} finally {
+				this.#coordinatorRescopeMoveId = undefined;
+				this.#endCoordinatorRescopeBarrier();
+			}
 		});
 		// Every committed rescope (`move_session`, `/move`, SDK/ACP `session.cwd.move`) funnels
 		// through SessionManager.moveTo, so one after-move listener covers all surfaces: it
@@ -4103,13 +4149,18 @@ export class AgentSession {
 					move.previousCwd,
 				);
 				if (!completed) throw new Error("Coordinator runtime state rescope was refused.");
-				await clearCoordinatorRuntimeStateRescope({
-					sessionId: this.sessionId,
-					cwd: move.newCwd,
-					sessionFile: this.sessionManager.getSessionFile() ?? null,
-				});
+				await clearCoordinatorRuntimeStateRescope(
+					{
+						sessionId: this.sessionId,
+						cwd: move.newCwd,
+						sessionFile: this.sessionManager.getSessionFile() ?? null,
+					},
+					this.#coordinatorRescopeMoveId,
+				);
 			} finally {
 				this.#registerRuntimeStateFinalizer();
+				this.#coordinatorRescopeMoveId = undefined;
+				this.#endCoordinatorRescopeBarrier();
 			}
 		});
 		// Power assertions are taken per turn (see #beginInFlight); nothing acquired here.
@@ -5424,7 +5475,7 @@ export class AgentSession {
 	#coordinatorToolObservations = new WeakMap<object, CoordinatorToolObservation>();
 	#agentEventAdmission = new WeakMap<
 		object,
-		{ scope?: AttemptScope; sdkRunToken?: string; persistGeneration: number }
+		{ scope?: AttemptScope; sdkRunToken?: string; persistGeneration: number; persistBarrier?: Promise<void> }
 	>();
 
 	/**
@@ -5485,6 +5536,7 @@ export class AgentSession {
 			scope: this.#activeAttemptScope,
 			sdkRunToken: this.#activeSdkRunToken,
 			persistGeneration: this.#coordinatorPersistGeneration,
+			persistBarrier: this.#coordinatorRescopeBarrier,
 		});
 		// First statement of the listener: the observation must precede every claim,
 		// reservation, and async hop this handler performs.
@@ -5594,6 +5646,11 @@ export class AgentSession {
 				this.#resolveSessionSettlement();
 			}
 		})();
+		this.#coordinatorEventHandlers.add(handler);
+		void handler.then(
+			() => this.#coordinatorEventHandlers.delete(handler),
+			() => this.#coordinatorEventHandlers.delete(handler),
+		);
 		if (eventLease) eventLease.track("post_prompt", "agent-session-event", handler);
 		return handler;
 	};
@@ -5618,17 +5675,36 @@ export class AgentSession {
 			});
 		}
 		const generation = this.#coordinatorPersistGeneration;
-		const persist = () =>
-			generation === this.#coordinatorPersistGeneration
-				? persistCoordinatorWorkerIntegrationOutcome(context, {
+		const barrier = this.#coordinatorRescopeBarrier;
+		const persist = async () => {
+			if (barrier) {
+				await barrier;
+				return await persistCoordinatorWorkerIntegrationOutcome(
+					{
+						sessionId: this.sessionId,
+						cwd: this.sessionManager.getCwd(),
+						sessionFile: this.sessionManager.getSessionFile(),
+					},
+					{
+						...outcome,
+						kind,
+						correlationId,
+						error: sanitizePostPublicationError(outcome.error),
+					},
+				);
+			}
+			return generation === this.#coordinatorPersistGeneration
+				? await persistCoordinatorWorkerIntegrationOutcome(context, {
 						...outcome,
 						kind,
 						correlationId,
 						error: sanitizePostPublicationError(outcome.error),
 					})
-				: Promise.resolve();
+				: undefined;
+		};
 		const queued = this.#coordinatorPersistQueue.then(persist, persist);
 		this.#coordinatorPersistQueue = queued.catch(() => {});
+		if (!barrier) this.#trackUnbarrieredCoordinatorPersist(queued);
 		void queued.catch(error =>
 			logger.warn("Failed to persist terminal reconciliation outcome", { error: String(error) }),
 		);
@@ -5649,18 +5725,39 @@ export class AgentSession {
 	#queueCoordinatorRuntimeStatePersist(event: AgentSessionEvent, propagateFailure = false): Promise<void> {
 		if (isNonDispatchedToolEvent(event)) return Promise.resolve();
 		const observation = this.#coordinatorToolObservations.get(event);
+		const admission = this.#agentEventAdmission.get(event);
+		const barrier = admission?.persistBarrier;
+		if (barrier) {
+			const run = async () => {
+				await barrier;
+				await this.#persistRuntimeStateInBackground(
+					event,
+					{
+						sessionId: this.sessionId,
+						cwd: this.sessionManager.getCwd(),
+						sessionFile: this.sessionManager.getSessionFile(),
+					},
+					observation,
+					propagateFailure,
+				);
+			};
+			const queued = this.#coordinatorPersistQueue.then(run, run);
+			this.#coordinatorPersistQueue = queued.catch(() => {});
+			return queued;
+		}
 		const context = {
 			sessionId: this.sessionId,
 			cwd: this.sessionManager.getCwd(),
 			sessionFile: this.sessionManager.getSessionFile(),
 		};
-		const generation = this.#agentEventAdmission.get(event)?.persistGeneration ?? this.#coordinatorPersistGeneration;
+		const generation = admission?.persistGeneration ?? this.#coordinatorPersistGeneration;
 		const run = () =>
 			generation === this.#coordinatorPersistGeneration
 				? this.#persistRuntimeStateInBackground(event, context, observation, propagateFailure)
 				: Promise.resolve();
 		const queued = this.#coordinatorPersistQueue.then(run, run);
 		this.#coordinatorPersistQueue = queued.catch(() => {});
+		this.#trackUnbarrieredCoordinatorPersist(queued);
 		return queued;
 	}
 
@@ -8812,6 +8909,23 @@ export class AgentSession {
 		await this.awaitPendingContextTransformations();
 		await this.#waitForSessionSettlement();
 		await this.sessionManager.flush();
+	}
+
+	queueCoordinatorRuntimeStatePersistForTests(event: AgentSessionEvent, gate: Promise<void>): Promise<void> {
+		this.#agentEventAdmission.set(event, {
+			persistGeneration: this.#coordinatorPersistGeneration,
+			persistBarrier: this.#coordinatorRescopeBarrier,
+		});
+		const task = (async () => {
+			await gate;
+			await this.#queueCoordinatorRuntimeStatePersist(event, true);
+		})();
+		this.#coordinatorEventHandlers.add(task);
+		void task.then(
+			() => this.#coordinatorEventHandlers.delete(task),
+			() => this.#coordinatorEventHandlers.delete(task),
+		);
+		return task;
 	}
 
 	async drainAsyncJobDeliveriesForAcp(options?: { timeoutMs?: number }): Promise<boolean> {

@@ -10916,7 +10916,26 @@ export class SessionManager {
 		if (!this.#ownsCwdTransition()) {
 			return this.runExclusiveCwdTransition(() => this.moveTo(newCwd, options));
 		}
-		const resolvedCwd = path.resolve(newCwd);
+		const resolvedCwd = await fs.promises.realpath(path.resolve(newCwd));
+		if (!(await fs.promises.stat(resolvedCwd)).isDirectory()) {
+			throw new Error(`Refusing to rescope: target is not a directory: ${resolvedCwd}`);
+		}
+		if (!options?.targetHandle) {
+			const targetHandle = await SessionManager.openNoFollowDirectory(resolvedCwd);
+			try {
+				const targetIdentity = await targetHandle.stat({ bigint: true });
+				return await this.moveTo(resolvedCwd, {
+					...options,
+					expectedIdentity: options?.expectedIdentity ?? {
+						dev: targetIdentity.dev,
+						ino: targetIdentity.ino,
+					},
+					targetHandle,
+				});
+			} finally {
+				await targetHandle.close();
+			}
+		}
 		if (options?.expectedIdentity || options?.targetHandle) {
 			await this.#assertCwdTargetIdentity(resolvedCwd, options);
 		}
@@ -10961,7 +10980,12 @@ export class SessionManager {
 		let targetIdentityRevalidated = false;
 		if (this.persist && this.#sessionFile) {
 			// Close the persist writer before moving files
-			await this.#closePersistWriter();
+			try {
+				await this.#closePersistWriter();
+			} catch (error) {
+				await this.#runMoveAbortListeners(moveDetails);
+				throw error;
+			}
 			this.#persistChain = Promise.resolve();
 			this.#persistError = undefined;
 			this.#persistErrorReported = false;
@@ -10977,24 +11001,30 @@ export class SessionManager {
 			hadSessionFile = managedMove ? false : this.#storage.existsSync(oldSessionFile);
 			let movedSessionFile = false;
 			let movedArtifactDir = false;
-			const materializedEntries = materializeResidentEntriesForReadSync(
-				this.#fileEntries,
-				this.#residentBlobStores(),
-			);
-			const transitionEntries: FileEntry[] = materializedEntries.map(entry =>
-				entry.type === "session" ? { ...entry, cwd: resolvedCwd } : entry,
-			);
-			residentTransition = this.#prepareResidentTextStoreTransition(
-				{
-					target: { sessionId: this.#sessionId, sessionFile: newSessionFile },
-					primary: {
-						mode: "materialize",
-						sourceEntries: transitionEntries,
-						sourceStores: { textStore: null, imageStore: this.#residentImageBlobStore },
+			try {
+				const materializedEntries = materializeResidentEntriesForReadSync(
+					this.#fileEntries,
+					this.#residentBlobStores(),
+				);
+				const transitionEntries: FileEntry[] = materializedEntries.map(entry =>
+					entry.type === "session" ? { ...entry, cwd: resolvedCwd } : entry,
+				);
+				residentTransition = this.#prepareResidentTextStoreTransition(
+					{
+						target: { sessionId: this.#sessionId, sessionFile: newSessionFile },
+						primary: {
+							mode: "materialize",
+							sourceEntries: transitionEntries,
+							sourceStores: { textStore: null, imageStore: this.#residentImageBlobStore },
+						},
 					},
-				},
-				"retain-and-throw",
-			);
+					"retain-and-throw",
+				);
+			} catch (error) {
+				residentTransition?.dispose();
+				await this.#runMoveAbortListeners(moveDetails);
+				throw error;
+			}
 			const discardResidentTransitionAndThrow = (error: unknown): never => {
 				residentTransition?.dispose();
 				throw error;

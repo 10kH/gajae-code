@@ -234,6 +234,93 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 		}
 	}, 20_000);
 
+	it("issue-4629: events admitted after the generation bump capture the committed cwd", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const cwdB = path.join(cwdA, "repo-b");
+		fs.mkdirSync(cwdB, { recursive: true });
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"] });
+		const unregister = sessionManager.registerBeforeMoveListener(() => {
+			session.agent.emitExternalEvent({ type: "turn_start" });
+		});
+		try {
+			const sessionId = session.sessionId;
+			const launcherFile = path.join(sessionRuntimeDir(cwdA, sessionId), "runtime-state.json");
+			const targetFile = path.join(sessionRuntimeDir(cwdB, sessionId), "runtime-state.json");
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "agent_start" },
+				{ sessionId, cwd: cwdA, sessionFile: sessionManager.getSessionFile() ?? null },
+			);
+
+			await sessionManager.moveTo(cwdB);
+			await session.awaitSessionSettlement();
+			for (let attempt = 0; attempt < 100; attempt++) {
+				const event = (JSON.parse(fs.readFileSync(targetFile, "utf8")) as Record<string, unknown>).event;
+				if (event === "turn_start") break;
+				await Bun.sleep(10);
+			}
+
+			expect(fs.existsSync(launcherFile)).toBe(false);
+			expect((JSON.parse(fs.readFileSync(targetFile, "utf8")) as Record<string, unknown>).event).toBe("turn_start");
+			expect((JSON.parse(fs.readFileSync(targetFile, "utf8")) as Record<string, unknown>).cwd).toBe(
+				path.resolve(cwdB),
+			);
+		} finally {
+			unregister();
+			await session.dispose();
+		}
+	}, 20_000);
+
+	it("issue-4629: a terminal event admitted before the barrier drains before relocation", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const cwdB = path.join(cwdA, "repo-b");
+		fs.mkdirSync(cwdB, { recursive: true });
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"] });
+		const releasePersist = Promise.withResolvers<void>();
+		try {
+			const sessionId = session.sessionId;
+			const launcherFile = path.join(sessionRuntimeDir(cwdA, sessionId), "runtime-state.json");
+			const targetFile = path.join(sessionRuntimeDir(cwdB, sessionId), "runtime-state.json");
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "agent_start" },
+				{ sessionId, cwd: cwdA, sessionFile: sessionManager.getSessionFile() ?? null },
+			);
+			const terminalPersist = session.queueCoordinatorRuntimeStatePersistForTests(
+				{ type: "agent_end", messages: [] },
+				releasePersist.promise,
+			);
+			const move = sessionManager.moveTo(cwdB);
+			await Bun.sleep(10);
+			expect(sessionManager.getCwd()).toBe(cwdA);
+			releasePersist.resolve();
+
+			await Promise.race([
+				move,
+				Bun.sleep(5_000).then(() => {
+					throw new Error(`move remained blocked at ${sessionManager.getCwd()}`);
+				}),
+			]);
+			await terminalPersist;
+			await Promise.race([
+				session.awaitSessionSettlement(),
+				Bun.sleep(5_000).then(() => {
+					throw new Error("terminal event did not settle after move");
+				}),
+			]);
+
+			expect(fs.existsSync(launcherFile)).toBe(false);
+			expect((JSON.parse(fs.readFileSync(targetFile, "utf8")) as Record<string, unknown>).state).toBe("completed");
+		} finally {
+			releasePersist.resolve();
+			await session.dispose();
+		}
+	}, 20_000);
+
 	it("issue-4629: a later before-move listener failure clears the prepared recovery journal", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
@@ -611,6 +698,20 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 		} finally {
 			await session.dispose();
 		}
+	});
+
+	it("treats a direct manager symlink alias of the current cwd as the same physical directory", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "root");
+		const alias = path.join(tempDir, "alias");
+		fs.mkdirSync(cwd);
+		fs.symlinkSync(cwd, alias);
+		const sessionManager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, tempDir));
+
+		await sessionManager.moveTo(alias);
+
+		expect(sessionManager.getCwd()).toBe(fs.realpathSync(cwd));
 	});
 
 	it("accepts a child literally named with leading dots (not a parent escape)", async () => {

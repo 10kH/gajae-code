@@ -290,6 +290,48 @@ describe("coordinator runtime state sidecar", () => {
 		expect(await Bun.file(stateFile).bytes()).toEqual(tampered);
 	});
 
+	it("rejects a tampered signed rescope journal without clearing recovery evidence", async () => {
+		const root = await tempRoot();
+		const launcher = path.join(root, "launcher");
+		const target = path.join(root, "target");
+		await fs.mkdir(launcher);
+		await fs.mkdir(target);
+		const stateFile = path.join(root, "state.json");
+		const fixture = path.join(import.meta.dir, "fixtures", "session-state-sidecar-subprocess.ts");
+		const { privateKey } = generateKeyPairSync("ed25519");
+		const privateDer = privateKey.export({ format: "der", type: "pkcs8" }).toString("base64");
+		const keyId = "355f1a4c355f1a4c355f1a4c355f1a4c355f1a4c355f1a4c355f1a4c355f1a4c";
+		const env = {
+			...process.env,
+			[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: stateFile,
+			[GJC_COORDINATOR_SESSION_ID_ENV]: "155-FinalA4",
+			[GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV]: "true",
+			[GJC_COORDINATOR_SIDECAR_KEY_ID_ENV]: keyId,
+			[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV]: privateDer,
+		};
+		const run = async (args: string[], cwd: string) => {
+			const child = Bun.spawn([process.execPath, fixture, stateFile, ...args], {
+				cwd,
+				env,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			return await child.exited;
+		};
+		expect(await run([], launcher)).toBe(0);
+		expect(await run(["prepare-journal", launcher, target], launcher)).toBe(0);
+		const journalFile = path.join(sessionRuntimeDir(target, "155-FinalA4"), "runtime-state-rescope.json");
+		const journal = await readPayload(journalFile);
+		await Bun.write(journalFile, `${JSON.stringify({ ...journal, previous_cwd: root })}\n`);
+		const beforeJournal = await Bun.file(journalFile).bytes();
+		const beforeState = await Bun.file(stateFile).bytes();
+
+		expect(await run(["recover", target], target)).not.toBe(0);
+
+		expect(await Bun.file(journalFile).bytes()).toEqual(beforeJournal);
+		expect(await Bun.file(stateFile).bytes()).toEqual(beforeState);
+	});
+
 	it("ignores a session root removed between postmortem lock parent creation and acquisition", async () => {
 		const root = await tempRoot();
 		const stateFile = path.join(root, ".gjc", "_session-removed", "state", "runtime-state.json");
@@ -2669,6 +2711,40 @@ describe("coordinator runtime state sidecar", () => {
 		);
 	});
 
+	it("issue-4629: recovery retains a pinned journal when ambient state-file configuration changed", async () => {
+		const root = await tempRoot();
+		const sessionId = "rescope-pinned-config-change";
+		const launcher = path.join(root, "launcher");
+		const target = path.join(root, "target");
+		await fs.mkdir(launcher);
+		await fs.mkdir(target);
+		const originalStateFile = path.join(root, "state-a.json");
+		const replacementStateFile = path.join(root, "state-b.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = originalStateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = sessionId;
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "agent_start" },
+			{ sessionId, cwd: launcher, sessionFile: null },
+		);
+		await prepareCoordinatorRuntimeStateRescope({
+			sessionId,
+			previousCwd: launcher,
+			newCwd: target,
+			previousSessionFile: null,
+			newSessionFile: null,
+		});
+		const journalFile = path.join(sessionRuntimeDir(target, sessionId), "runtime-state-rescope.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = replacementStateFile;
+
+		await expect(
+			recoverCoordinatorRuntimeStateRescope({ sessionId, cwd: target, sessionFile: null }),
+		).rejects.toThrow();
+
+		expect(fsSync.existsSync(journalFile)).toBe(true);
+		expect(fsSync.existsSync(originalStateFile)).toBe(true);
+		expect(fsSync.existsSync(replacementStateFile)).toBe(false);
+	});
+
 	it("issue-4629: cwd-derived rescope preserves a payload already self-healed at the new cwd", async () => {
 		// If the first post-move event already seeded a fresh payload at the new cwd, the
 		// relocation must not clobber that current state with the stale predecessor.
@@ -2698,6 +2774,40 @@ describe("coordinator runtime state sidecar", () => {
 		const afterRelocate = await readPayload(targetFile);
 		expect(afterRelocate.event).toBe("turn_start");
 		expect(afterRelocate.cwd).toBe(path.resolve(target));
+		expect(fsSync.existsSync(launcherFile)).toBe(false);
+	});
+
+	it("issue-4629: an authenticated terminal destination survives a future-dated old running marker", async () => {
+		delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
+		const root = await tempRoot();
+		const sessionId = "rescope-terminal-destination";
+		const launcher = path.join(root, "launcher");
+		const target = path.join(root, "target");
+		await fs.mkdir(launcher);
+		await fs.mkdir(target);
+		const launcherFile = path.join(sessionRuntimeDir(launcher, sessionId), "runtime-state.json");
+		const targetFile = path.join(sessionRuntimeDir(target, sessionId), "runtime-state.json");
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "agent_start" },
+			{ sessionId, cwd: launcher, sessionFile: null },
+		);
+		const old = await readPayload(launcherFile);
+		await Bun.write(launcherFile, `${JSON.stringify({ ...old, updated_at: "2099-01-01T00:00:00.000Z" })}\n`);
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "agent_start" },
+			{ sessionId, cwd: target, sessionFile: null },
+		);
+		await persistCoordinatorRuntimeStateFromEvent(assistantEnd("done"), {
+			sessionId,
+			cwd: target,
+			sessionFile: null,
+		});
+
+		expect(
+			await relocateCoordinatorRuntimeStateForRescope({ sessionId, cwd: target, sessionFile: null }, launcher),
+		).toBe(true);
+
+		expect((await readPayload(targetFile)).state).toBe("completed");
 		expect(fsSync.existsSync(launcherFile)).toBe(false);
 	});
 
@@ -2937,6 +3047,13 @@ describe("coordinator runtime state sidecar", () => {
 			{ type: "agent_start" },
 			{ sessionId, cwd: launcher, sessionFile: null },
 		);
+		await prepareCoordinatorRuntimeStateRescope({
+			sessionId,
+			previousCwd: launcher,
+			newCwd: target,
+			previousSessionFile: null,
+			newSessionFile: null,
+		});
 		__sessionStateSidecarTestHooks.beforeRescopePublish = async () => {
 			const current = await readPayload(launcherFile);
 			await Bun.write(
@@ -2951,6 +3068,15 @@ describe("coordinator runtime state sidecar", () => {
 
 		expect((await readPayload(launcherFile)).event).toBe("newer_old_writer");
 		expect((await readPayload(targetFile)).event).toBe("move_session");
+		__sessionStateSidecarTestHooks.beforeRescopePublish = undefined;
+		await expect(
+			recoverCoordinatorRuntimeStateRescope({ sessionId, cwd: target, sessionFile: null }),
+		).rejects.toThrow();
+		expect((await readPayload(launcherFile)).event).toBe("newer_old_writer");
+		expect((await readPayload(targetFile)).event).toBe("move_session");
+		expect(fsSync.existsSync(path.join(sessionRuntimeDir(target, sessionId), "runtime-state-rescope.json"))).toBe(
+			true,
+		);
 	});
 
 	it("issue-4629: rescope does not touch a foreign session_id at either path", async () => {
@@ -3012,6 +3138,25 @@ describe("coordinator runtime state sidecar", () => {
 		expect(fsSync.lstatSync(launcherFile).isSymbolicLink()).toBe(true);
 		expect(await Bun.file(externalFile).bytes()).toEqual(before);
 		expect(fsSync.existsSync(targetFile)).toBe(false);
+	});
+
+	it("issue-4629: direct relocation deduplicates a symlink cwd alias to one physical state path", async () => {
+		delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
+		const root = await tempRoot();
+		const sessionId = "rescope-cwd-alias";
+		const cwd = path.join(root, "real");
+		const alias = path.join(root, "alias");
+		await fs.mkdir(cwd);
+		await fs.symlink(cwd, alias);
+		const stateFile = path.join(sessionRuntimeDir(cwd, sessionId), "runtime-state.json");
+		await persistCoordinatorRuntimeStateFromEvent({ type: "agent_start" }, { sessionId, cwd, sessionFile: null });
+
+		expect(await relocateCoordinatorRuntimeStateForRescope({ sessionId, cwd: alias, sessionFile: null }, cwd)).toBe(
+			true,
+		);
+
+		expect(fsSync.existsSync(stateFile)).toBe(true);
+		expect((await readPayload(stateFile)).cwd).toBe(path.resolve(cwd));
 	});
 
 	it("issue-4629: a persist concurrent with relocation serializes without corrupting the new-cwd payload", async () => {
