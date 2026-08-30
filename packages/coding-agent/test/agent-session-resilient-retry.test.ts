@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
 import { Agent, type AgentTool, type StreamFn } from "@gajae-code/agent-core";
@@ -20,8 +20,6 @@ import {
 	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
 	PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION,
 } from "../../ai/src/adapter-internals/provider-safety-stop";
-
-const it = test.serial.bind(test);
 
 /**
  * Anthropic's statusless capacity-overload envelope exactly as observed in a
@@ -87,7 +85,7 @@ function assistantMessage(
  *  - retry.enabled=false surfaces immediately;
  *  - first Esc (retryNow) skips the backoff; abortRetry cancels.
  */
-describe("AgentSession resilient retry", () => {
+describe.serial("AgentSession resilient retry", () => {
 	let tempDir: TempDir;
 	let authStorage: AuthStorage;
 	let modelRegistry: ModelRegistry;
@@ -858,6 +856,7 @@ describe("AgentSession resilient retry", () => {
 	});
 
 	it("does not terminalize retryable explicit HTTP statuses", async () => {
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 		for (const [status, message] of [
 			[408, "HTTP 408 request timeout"],
 			[425, "HTTP 425 too early retry your request"],
@@ -869,7 +868,6 @@ describe("AgentSession resilient retry", () => {
 				session = undefined;
 			}
 			session = buildSession({ responses: [{ throw: message }, { content: [`recovered ${status}`] }] });
-			vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 			const { retryStartEvents } = track(session);
 
 			await session.prompt(`trigger retryable HTTP ${status}`);
