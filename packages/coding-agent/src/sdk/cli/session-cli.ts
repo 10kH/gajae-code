@@ -75,7 +75,6 @@ export interface SdkSessionCliArgs {
 	jsonInputFile?: string;
 	jsonInputStdin?: boolean;
 	idempotencyKey?: string;
-	scope?: string;
 	confirm?: boolean;
 	cursor?: string;
 	wait?: boolean;
@@ -84,7 +83,7 @@ export interface SdkSessionCliArgs {
 	untilIdle?: boolean;
 	allEvents?: boolean;
 	repo?: string;
-	scope?: ScopeNameV1;
+	scope?: string;
 	limit?: number;
 	json?: boolean;
 
@@ -453,7 +452,16 @@ export async function runSdkSearch(
 ): Promise<{ result: SdkSearchResultV1; exitCode: 0 | 1 }> {
 	const agentDir = args.agentDir ?? getAgentDir();
 	const locator = await resolveSessionLocator(args.repo ?? process.cwd(), agentDir);
-	const scope = args.scope ?? "repo";
+	const scope: ScopeNameV1 =
+		args.scope === undefined || args.scope === "repo" || args.scope === "pwd" || args.scope === "global"
+			? ((args.scope ?? "repo") as ScopeNameV1)
+			: (() => {
+					throw new SdkSessionCliError(
+						"usage",
+						`Invalid search scope "${args.scope}". Expected repo, pwd, or global.`,
+						2,
+					);
+				})();
 	const request = searchScopeRequest(scope, locator);
 	const resolved = await resolveScopeRequest(request);
 	const outcome = await createService(agentDir).scopedList(request, args.limit, args.cursor);

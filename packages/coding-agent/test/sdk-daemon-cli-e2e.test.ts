@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
 import { Broker } from "../src/sdk/broker/broker";
+import { resolveScopeRequest, scopeRequestV1 } from "../src/sdk/broker/session-scope";
 import { scanRetainedTranscriptTail } from "../src/sdk/cli/session-cli";
 import { SessionManager } from "../src/session/session-manager";
 
@@ -450,16 +451,14 @@ describe("SDK session CLI", () => {
 		expect(`${credentialFlag.stdout}\n${credentialFlag.stderr}`).not.toContain("session-token");
 	}, 60_000);
 	it("returns malformed scoped broker rows in the JSON search envelope", async () => {
-		const scope = {
-			version: 1 as const,
-			requested: "repo" as const,
-			requestAnchor: { cwd: root, worktreeRoot: null },
-			resolved: null,
-			resolution: "not-in-git-worktree" as const,
-		};
 		const originalHandleRequest = broker.handleRequest.bind(broker);
 		broker.handleRequest = async (operation, input, idempotencyKey) => {
 			if (operation !== "session.list") return await originalHandleRequest(operation, input, idempotencyKey);
+			// Echo the locally resolved scope so the malformed ROW is what fails,
+			// not a scope drift the stub accidentally manufactured.
+			const request = scopeRequestV1((input as { scope?: unknown }).scope);
+			if (!request) throw new Error("Expected a ScopeRequestV1 in the stubbed session.list input.");
+			const scope = await resolveScopeRequest(request);
 			return {
 				ok: true,
 				result: {

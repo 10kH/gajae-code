@@ -839,10 +839,7 @@ class SdkSessionHelp extends Command {
 			description: "Workspace directory for saved-session resolution (default: current directory)",
 		}),
 		op: Flags.string({ description: "Raw control or global operation" }),
-		scope: Flags.string({
-			description: "list scope: repo (default), cwd, worktree, or all",
-			options: ["repo", "cwd", "worktree", "all"],
-		}),
+
 		query: Flags.string({ description: "Raw query name" }),
 		"json-input": Flags.string({ description: "SDK request JSON object" }),
 		"json-input-file": Flags.string({ description: "Read SDK request JSON from a 0600 file" }),
@@ -852,7 +849,10 @@ class SdkSessionHelp extends Command {
 		cursor: Flags.string({
 			description: "Raw query continuation cursor, saved checkpoint token, or search continuation cursor",
 		}),
-		scope: Flags.string({ description: "Search scope: repo, pwd, or global (default: repo)" }),
+		scope: Flags.string({
+			description:
+				"session list scope: repo (default), cwd, worktree, or all; search scope: repo (default), pwd, or global",
+		}),
 		limit: Flags.integer({ description: "Search page size from 1 to 100" }),
 		json: Flags.boolean({ description: "Render search as the SdkSearchResultV1 JSON envelope" }),
 		text: Flags.string({ description: "Prompt text for send (alternative to --json-input)" }),

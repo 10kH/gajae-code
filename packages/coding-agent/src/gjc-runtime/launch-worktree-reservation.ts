@@ -12,7 +12,12 @@ import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { resolveEquivalentPath } from "@gajae-code/utils";
-import { processStartTime, removeFileLockDirForGc } from "../config/file-lock";
+import {
+	type FileLockGcObservation,
+	processStartTime,
+	readFileLockObservationForGc,
+	removeFileLockDirForGc,
+} from "../config/file-lock";
 import { processIncarnation } from "../sdk/broker/process-incarnation";
 
 const RESERVATION_VERSION = 1;
@@ -106,7 +111,31 @@ async function removeReservation(
 	lockDir: string,
 	record: LaunchWorktreeReservationRecord,
 ): Promise<"removed" | "kept"> {
-	const result = await removeFileLockDirForGc(lockDir, record);
+	// Capture the exact on-disk identity BEFORE authorizing removal: the generic
+	// GC remover only deletes a tree whose pre-verdict identity it was handed,
+	// so a successor reservation published at the same path is never reaped.
+	let observation: FileLockGcObservation | null;
+	try {
+		observation = await readFileLockObservationForGc(lockDir);
+	} catch {
+		return "kept";
+	}
+	if (!observation) return "kept";
+	let onDisk: unknown;
+	try {
+		onDisk = JSON.parse(observation.bytes);
+	} catch {
+		return "kept";
+	}
+	if (
+		!isReservationRecord(onDisk) ||
+		onDisk.reservationId !== record.reservationId ||
+		onDisk.pid !== record.pid ||
+		onDisk.timestamp !== record.timestamp ||
+		canonicalWorktreePath(onDisk.worktreePath) !== canonicalWorktreePath(record.worktreePath)
+	)
+		return "kept";
+	const result = await removeFileLockDirForGc(lockDir, observation.info, observation.identity);
 	return result === "removed" ? "removed" : "kept";
 }
 

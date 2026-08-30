@@ -30,7 +30,7 @@ async function makeRepo(name: string): Promise<string> {
 function row(sessionId: string, repoLocator: string): SdkSessionRowV1 {
 	return {
 		sessionId,
-		locator: { repo: repoLocator, stateRoot: `${repoLocator}/.gjc/state` },
+		locator: { cwd: repoLocator, worktreeRoot: repoLocator, stateRoot: `${repoLocator}/.gjc/state` },
 		endpointGeneration: 1,
 		pid: 100,
 		live: false,
