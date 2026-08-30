@@ -846,8 +846,10 @@ class SdkSessionHelp extends Command {
 		"json-input": Flags.string({ description: "SDK request JSON object" }),
 		"json-input-file": Flags.string({ description: "Read SDK request JSON from a 0600 file" }),
 		"json-input-stdin": Flags.boolean({ description: "Read SDK request JSON from standard input" }),
-		"idempotency-key": Flags.string({ description: "Caller idempotency key required for SDK lifecycle globals" }),
-		confirm: Flags.boolean({ description: "Confirm a destructive SDK control operation" }),
+		"idempotency-key": Flags.string({
+			description: "Caller idempotency key required for lifecycle globals and terminal abort controls",
+		}),
+		confirm: Flags.boolean({ description: "Confirm a destructive local CLI control operation" }),
 		cursor: Flags.string({
 			description: "Raw query continuation cursor, or a saved checkpoint token to resume tail from",
 		}),

@@ -6,7 +6,7 @@ import { getAgentDir } from "@gajae-code/utils";
 import { repo as resolveGitRepository } from "../../utils/git";
 import { ensureBroker } from "../broker/ensure";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
-import { SdkClientError } from "../client";
+import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../client";
 import { createBrokerSessionLifecycleService } from "../lifecycle/broker-client";
 import type {
 	SessionLifecycleMutationRequest,
@@ -24,6 +24,7 @@ import {
 import { adapterDispositionError, findOperation, type OperationKind } from "../protocol/operation-registry";
 import { type SessionAttachment, SessionRouter, SessionRouterError, type SessionRouterFrame } from "../router";
 import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../session-list";
+import { SESSION_REQUEST_TIMEOUT_MS } from "../session-reconnect";
 import {
 	type SdkCheckpointRecordV1,
 	type SdkRetentionGapV1,
@@ -563,13 +564,88 @@ async function requestControl(
 	const attachment = attachmentFor(router, sessionId);
 	const response = await router.request(
 		sessionId,
-		{ type: "control_request", operation, input, confirm: args.confirm === true },
+		controlRequestFrame(operation, input, args),
 		attachment.generation,
 		attachment,
 		args.timeoutMs === undefined ? undefined : { timeoutMs: args.timeoutMs },
 	);
 	throwResponseFailure(response);
 	return response;
+}
+
+/** Builds the public CLI control envelope without leaking envelope fields into operation input. */
+export function controlRequestFrame(
+	operation: string,
+	input: JsonRecord,
+	args: Pick<SdkSessionCliArgs, "confirm" | "idempotencyKey">,
+): JsonRecord {
+	return {
+		type: "control_request",
+		operation,
+		input,
+		confirm: args.confirm === true,
+		...(args.idempotencyKey ? { idempotencyKey: args.idempotencyKey } : {}),
+	};
+}
+
+const BROKER_OPERATOR_ABORT_FIELDS = new Set(["mode", "scope", "operator"]);
+
+export function operatorAbortBrokerRequest(
+	sessionId: string,
+	operation: string,
+	input: JsonRecord,
+	args: Pick<SdkSessionCliArgs, "confirm" | "idempotencyKey">,
+): JsonRecord | undefined {
+	if (!Object.hasOwn(input, "operator")) return undefined;
+	if (operation !== "turn.abort")
+		throw new SdkSessionCliError("invalid_input", "operator is only available for terminal turn.abort.", 2);
+	if (input.operator !== true)
+		throw new SdkSessionCliError("invalid_input", "turn.abort operator must be true when provided.", 2);
+	if (input.mode !== "terminal")
+		throw new SdkSessionCliError("invalid_input", 'operator turn.abort requires mode:"terminal".', 2);
+	for (const key of Object.keys(input))
+		if (!BROKER_OPERATOR_ABORT_FIELDS.has(key))
+			throw new SdkSessionCliError(`invalid_input`, `Unknown turn.abort terminal field: ${key}`, 2);
+	if (input.scope !== undefined && input.scope !== "turn" && input.scope !== "owned")
+		throw new SdkSessionCliError("invalid_input", 'operator turn.abort scope must be "turn" or "owned".', 2);
+	if (args.confirm !== true)
+		throw new SdkSessionCliError("invalid_input", "operator terminal abort requires --confirm.", 2);
+	if (!args.idempotencyKey)
+		throw new SdkSessionCliError("invalid_input", "operator terminal abort requires --idempotency-key.", 2);
+	return { sessionId, operation: "turn.abort", input, confirm: true };
+}
+
+async function requestBrokerOperatorAbort(
+	agentDir: string,
+	request: JsonRecord,
+	args: SdkSessionCliArgs,
+): Promise<JsonRecord> {
+	const idempotencyKey = args.idempotencyKey;
+	if (!idempotencyKey)
+		throw new SdkSessionCliError("invalid_input", "operator terminal abort requires --idempotency-key.", 2);
+	const discovery = await readSdkBrokerDiscovery(agentDir);
+	if (!discovery) throw new SdkSessionCliError("session_unavailable", "SDK broker discovery is unavailable.", 1);
+	const timeoutMs = args.timeoutMs ?? SESSION_REQUEST_TIMEOUT_MS;
+	const client = await SdkClient.connect(discovery.url, discovery.token, {
+		timeoutMs,
+		reconnectAttempts: 0,
+	});
+	try {
+		const response = await client.global("session.control", request, {
+			idempotencyKey,
+			timeoutMs,
+		});
+		const result = object(response);
+		if (!result) throw new SdkClientError("protocol_error", "SDK broker returned a malformed control response.");
+		throwResponseFailure(result);
+		return result;
+	} finally {
+		await client.close().catch(error => {
+			process.stderr.write(
+				`SDK broker control cleanup failed: ${error instanceof Error ? error.message : String(error)}\n`,
+			);
+		});
+	}
 }
 
 async function requestQuery(
@@ -1413,6 +1489,8 @@ async function runRawControl(
 	const invalid = validateAdapterControl(operation, input);
 	if (invalid) throw new SdkSessionCliError(invalid.code, invalid.message, 2);
 	await ensureBroker({ agentDir });
+	const operatorRequest = operatorAbortBrokerRequest(sessionId, operation, input, args);
+	if (operatorRequest) return await requestBrokerOperatorAbort(agentDir, operatorRequest, args);
 	return await withRouter(agentDir, async router => await requestControl(router, sessionId, operation, input, args));
 }
 

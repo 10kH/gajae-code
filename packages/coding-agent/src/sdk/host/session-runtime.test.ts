@@ -16,6 +16,7 @@ import { Broker } from "../broker/broker";
 import { createKindAwareReconciliation } from "../bus/kind-aware-reconciliation";
 import { createPromptReconciliation } from "../bus/prompt-reconciliation";
 import { createReconciliationStore } from "../bus/reconciliation-store";
+import { BROKER_RUNTIME_ABORT_CAPABILITY_FIELD, setBrokerRuntimeAbortCapabilityForTest } from "./control/runtime-gate";
 import { CursorRegistry, QueryHandlers, RevisionStore } from "./query";
 import {
 	createInvocationReconciliation,
@@ -1010,6 +1011,8 @@ describe("SessionSdkSessionRuntime", () => {
 	});
 	test("SDK-only host admits, replays, and conflicts terminal abort requests durably", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-terminal-abort-"));
+		const operatorCapability = "runtime-terminal-abort-capability";
+		setBrokerRuntimeAbortCapabilityForTest(operatorCapability);
 		const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
 		const api = {
 			on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
@@ -1045,7 +1048,13 @@ describe("SessionSdkSessionRuntime", () => {
 				},
 				abortPromptAndWaitWithTerminal: async (handle, options) => {
 					seamCalls.push({ handle, scope: options.terminal?.scope ?? "none" });
-					return { status: "settled", terminalScope: {} };
+					return {
+						status: "settled",
+						terminalScope: {
+							abortedAttemptEpoch: activeEpoch,
+							lineageIdHash: "runtime-test-lineage",
+						},
+					};
 				},
 			},
 		});
@@ -1140,7 +1149,43 @@ describe("SessionSdkSessionRuntime", () => {
 					}),
 				]),
 			);
+
+			// A separately connected, explicitly confirmed local operator may stop
+			// the active turn and its exact owned work without weakening ordinary
+			// connection ownership checks.
+			transport.feed("local-operator", {
+				type: "control_request",
+				id: "terminal-operator-abort",
+				operation: "turn.abort",
+				input: {
+					mode: "terminal",
+					scope: "owned",
+					operator: true,
+					[BROKER_RUNTIME_ABORT_CAPABILITY_FIELD]: operatorCapability,
+				},
+				confirm: true,
+				idempotencyKey: "terminal-operator-key",
+			} as SdkFrame);
+			await waitForFrame("terminal-operator-abort");
+			expect(seamCalls).toEqual([
+				{ handle: "exact-run-handle", scope: "turn" },
+				{ handle: "later-run-handle", scope: "owned" },
+			]);
+			expect(transport.sent.find(frame => frame.id === "terminal-operator-abort")).toMatchObject({
+				ok: true,
+				result: expect.objectContaining({ turn: "stopped", ownedWork: "stopped" }),
+			});
+			const operatorKeyHash = createHash("sha256").update("terminal-operator-key").digest("hex");
+			const deliveryDeadline = Date.now() + 15_000;
+			while (
+				reconciliationStore.snapshotTerminalScopes().find(record => record.idempotencyKeyHash === operatorKeyHash)
+					?.responseState !== "sent"
+			) {
+				if (Date.now() > deliveryDeadline) throw new Error("Timed out waiting for operator delivery receipt");
+				await Bun.sleep(20);
+			}
 		} finally {
+			setBrokerRuntimeAbortCapabilityForTest(undefined);
 			await handlers.get("session_shutdown")?.({}, ctx);
 			await rm(cwd, { recursive: true, force: true });
 		}
@@ -1351,7 +1396,71 @@ describe("SessionSdkSessionRuntime", () => {
 		}
 	});
 
-	test("SDK-only host re-reads the active prompt AND its owner after an owner-mismatch reservation wins the race", async () => {
+	test("SDK-only operator abort never adopts a turn that starts after idle admission", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-operator-idle-race-"));
+		const capability = "operator-idle-race-capability";
+		setBrokerRuntimeAbortCapabilityForTest(capability);
+		const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
+		const api = {
+			on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
+				handlers.set(event, handler);
+			},
+		} as unknown as ExtensionAPI;
+		const transport = memoryTransport();
+		const reconciliationStore = createReconciliationStore({
+			sessionFile: path.join(cwd, "session.json"),
+			sessionId: transport.sessionId,
+		});
+		const seamCalls: string[] = [];
+		let promptReads = 0;
+		createSdkSessionRuntimeExtension(api, {
+			agentDir: cwd,
+			createTransport: async () => transport,
+			terminalAbortSeams: {
+				getReconciliationStore: () => reconciliationStore,
+				getTerminalTurnEpoch: () => (promptReads++ === 0 ? undefined : 9),
+				getActivePromptHandle: () => (promptReads === 0 ? undefined : "successor-handle"),
+				getActivePromptOwnerConnectionId: () => "successor-owner",
+				cancelPendingPreflightForTerminalAbort: () => {},
+				abortPromptAndWaitWithTerminal: async handle => {
+					seamCalls.push(handle);
+					return { status: "settled", terminalScope: {} };
+				},
+			},
+		});
+		const ctx = extensionContext(transport.sessionId, cwd);
+		try {
+			await handlers.get("session_start")?.({}, ctx);
+			transport.feed("local-operator", {
+				type: "control_request",
+				id: "operator-idle-race",
+				operation: "turn.abort",
+				input: {
+					mode: "terminal",
+					operator: true,
+					[BROKER_RUNTIME_ABORT_CAPABILITY_FIELD]: capability,
+				},
+				confirm: true,
+				idempotencyKey: "operator-idle-race-key",
+			} as SdkFrame);
+			const deadline = Date.now() + 15_000;
+			while (!transport.sent.some(frame => frame.id === "operator-idle-race")) {
+				if (Date.now() > deadline) throw new Error("Timed out waiting for operator idle-race response");
+				await Bun.sleep(20);
+			}
+			expect(transport.sent.find(frame => frame.id === "operator-idle-race")).toMatchObject({
+				ok: true,
+				result: expect.objectContaining({ turn: "no_active_turn", terminal: "terminal_no_effect" }),
+			});
+			expect(seamCalls).toHaveLength(0);
+		} finally {
+			setBrokerRuntimeAbortCapabilityForTest(undefined);
+			await handlers.get("session_shutdown")?.({}, ctx);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("SDK-only host re-reads the active prompt AND its owner after an owner-mismatch reservation race", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-terminal-owner-race-"));
 		const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
 		const api = {

@@ -1,5 +1,10 @@
 import { expect, test } from "bun:test";
 import { type ControlRequest, type ControlSurface, dispatchControl, TypedControlError } from "../src/sdk/host/control";
+import {
+	BROKER_RUNTIME_ABORT_CAPABILITY_FIELD,
+	redactBrokerRuntimeCapabilities,
+	setBrokerRuntimeAbortCapabilityForTest,
+} from "../src/sdk/host/control/runtime-gate";
 import { OPERATIONS } from "../src/sdk/protocol/operation-registry";
 
 const methodByOperation: Record<string, string> = {
@@ -662,6 +667,180 @@ test("turn.abort terminal mode validates strictly and forwards normalized input"
 	const replay = await terminal({ mode: "terminal" }, "key-1");
 	expect(replay).toEqual({ id: "t", ok: true, result: "terminal" });
 	expect(calls).toHaveLength(2);
+});
+
+test("turn.abort rejects forged public operator authority", async () => {
+	const abort = OPERATIONS.find(row => row.sdkId === "turn.abort")!;
+	let calls = 0;
+	const surface = {
+		abort: () => "legacy",
+		abortTerminal: () => {
+			calls++;
+			return "operator";
+		},
+	} as unknown as ControlSurface;
+
+	const response = await dispatchControl(surface, abort, {
+		id: "forged",
+		operation: abort.sdkId,
+		input: { mode: "terminal", scope: "owned", operator: true },
+		idempotencyKey: "forged-key",
+		confirm: true,
+	});
+
+	expect(response).toMatchObject({
+		ok: false,
+		error: { code: "operation_prohibited" },
+	});
+	expect(calls).toBe(0);
+});
+
+test("turn.abort private broker capability is removed from diagnostic frames", () => {
+	const frame = {
+		type: "control_request",
+		operation: "turn.abort",
+		input: {
+			mode: "terminal",
+			operator: true,
+			[BROKER_RUNTIME_ABORT_CAPABILITY_FIELD]: "secret-capability",
+		},
+	};
+	expect(redactBrokerRuntimeCapabilities(frame)).toEqual({
+		type: "control_request",
+		operation: "turn.abort",
+		input: { mode: "terminal", operator: true },
+	});
+	expect(frame.input[BROKER_RUNTIME_ABORT_CAPABILITY_FIELD]).toBe("secret-capability");
+});
+
+test("turn.abort accepts the verified private operator capability and hashes public input", async () => {
+	const abort = OPERATIONS.find(row => row.sdkId === "turn.abort")!;
+	const capability = "test-terminal-abort-capability";
+	const calls: Array<{ input: unknown; key?: string }> = [];
+	const surface = {
+		abort: () => "legacy",
+		abortTerminal: (input: unknown, key?: string) => {
+			calls.push({ input, key });
+			return "operator";
+		},
+	} as unknown as ControlSurface;
+	setBrokerRuntimeAbortCapabilityForTest(capability);
+	try {
+		const input = {
+			mode: "terminal",
+			scope: "owned",
+			operator: true,
+			[BROKER_RUNTIME_ABORT_CAPABILITY_FIELD]: capability,
+		};
+		const first = await dispatchControl(surface, abort, {
+			id: "verified-one",
+			operation: abort.sdkId,
+			input,
+			idempotencyKey: "verified-key",
+			confirm: true,
+		});
+		const replay = await dispatchControl(surface, abort, {
+			id: "verified-two",
+			operation: abort.sdkId,
+			input: {
+				[BROKER_RUNTIME_ABORT_CAPABILITY_FIELD]: capability,
+				operator: true,
+				scope: "owned",
+				mode: "terminal",
+			},
+			idempotencyKey: "verified-key",
+			confirm: true,
+		});
+
+		expect(first).toEqual({ id: "verified-one", ok: true, result: "operator" });
+		expect(replay).toEqual({ id: "verified-two", ok: true, result: "operator" });
+		expect(calls).toEqual([{ input: { mode: "terminal", scope: "owned", operator: true }, key: "verified-key" }]);
+	} finally {
+		setBrokerRuntimeAbortCapabilityForTest(undefined);
+	}
+});
+
+test("turn.abort operator mode requires confirmation and preserves idempotency", async () => {
+	const abort = OPERATIONS.find(row => row.sdkId === "turn.abort")!;
+	const capability = "test-operator-capability";
+	const calls: Array<Record<string, unknown>> = [];
+	const surface = {
+		abort: () => "legacy",
+		abortTerminal: (input: unknown, idempotencyKey?: string) => {
+			calls.push({ ...(input as Record<string, unknown>), idempotencyKey });
+			return "operator";
+		},
+	} as unknown as ControlSurface;
+	setBrokerRuntimeAbortCapabilityForTest(capability);
+	try {
+		const request = (input: Record<string, unknown>, idempotencyKey: string | undefined, confirm: boolean) =>
+			dispatchControl(surface, abort, {
+				id: "operator",
+				operation: abort.sdkId,
+				input,
+				idempotencyKey,
+				confirm,
+			});
+		const operatorInput = {
+			mode: "terminal",
+			scope: "owned",
+			operator: true,
+			[BROKER_RUNTIME_ABORT_CAPABILITY_FIELD]: capability,
+		};
+
+		expect(await request(operatorInput, "operator-no-confirm", false)).toMatchObject({
+			ok: false,
+			error: { code: "invalid_input" },
+		});
+		expect(await request(operatorInput, undefined, true)).toMatchObject({
+			ok: false,
+			error: { code: "invalid_input" },
+		});
+		expect(await request({ ...operatorInput, operator: false }, "operator-false", true)).toMatchObject({
+			ok: false,
+			error: { code: "invalid_input" },
+		});
+		expect(await request(operatorInput, "operator-key", true)).toEqual({
+			id: "operator",
+			ok: true,
+			result: "operator",
+		});
+		expect(calls).toEqual([{ mode: "terminal", scope: "owned", operator: true, idempotencyKey: "operator-key" }]);
+
+		// Same-key/same-authority retries replay, while changing authority conflicts.
+		expect(await request(operatorInput, "operator-key", true)).toEqual({
+			id: "operator",
+			ok: true,
+			result: "operator",
+		});
+		expect(calls).toHaveLength(1);
+		expect(await request(operatorInput, "operator-key", false)).toMatchObject({
+			ok: false,
+			error: { code: "invalid_input" },
+		});
+		expect(await request({ ...operatorInput, operator: false }, "operator-key", true)).toMatchObject({
+			ok: false,
+			error: { code: "invalid_input" },
+		});
+		expect(await request({ mode: "terminal", scope: "owned", operator: true }, "operator-key", true)).toMatchObject({
+			ok: false,
+			error: { code: "operation_prohibited" },
+		});
+		expect(calls).toHaveLength(1);
+		expect(
+			await request(
+				{ mode: "terminal", scope: "owned", [BROKER_RUNTIME_ABORT_CAPABILITY_FIELD]: capability },
+				"operator-key",
+				true,
+			),
+		).toMatchObject({
+			ok: false,
+			error: { code: "idempotency_conflict" },
+		});
+		expect(calls).toHaveLength(1);
+	} finally {
+		setBrokerRuntimeAbortCapabilityForTest(undefined);
+	}
 });
 test("turn.abort terminal normalizes omitted scope before idempotency hashing", async () => {
 	const abort = OPERATIONS.find(row => row.sdkId === "turn.abort")!;

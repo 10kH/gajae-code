@@ -58,8 +58,12 @@ import {
 	resolveReconciliationSessionFile,
 } from "../reconciliation-extensions";
 import { sanitizeTurnResultContent, type TurnResultContent } from "../turn-result";
-import { type ControlSurface, controlRequestFromFrame, dispatchControl } from "./control";
-import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "./control/runtime-gate";
+import { type ControlSurface, controlRequestFromFrame, dispatchControl, terminalAbortIdentity } from "./control";
+import {
+	BROKER_RUNTIME_ABORT_CAPABILITY_FIELD,
+	BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD,
+	hasBrokerRuntimeAbortCapability,
+} from "./control/runtime-gate";
 import { SessionSdkHost, type SessionSdkHostOptions } from "./host";
 import { clearAutoroutingInactive, isAutoroutingInactive, markAutoroutingInactive } from "./internal-autorouting-state";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "./query";
@@ -2269,7 +2273,7 @@ function createControlSurface(
 		}
 	};
 	const terminalAbort = async (
-		input: { mode: "terminal"; scope?: "turn" | "owned" },
+		input: { mode: "terminal"; scope?: "turn" | "owned"; operator?: boolean },
 		idempotencyKey?: string,
 	): Promise<unknown> => {
 		const scope = input.scope === "owned" ? "owned" : "turn";
@@ -2300,10 +2304,12 @@ function createControlSurface(
 				typeof idempotencyKey === "string"
 					? crypto.createHash("sha256").update(idempotencyKey).digest("hex")
 					: undefined;
-			const inputHash = crypto
-				.createHash("sha256")
-				.update(JSON.stringify({ mode: "terminal", scope }))
-				.digest("hex");
+			const abortIdentity = terminalAbortIdentity(
+				{ mode: "terminal", scope, ...(input.operator === true ? { operator: true } : {}) },
+				input.operator === true,
+			);
+			if (!abortIdentity) throw new Error("Terminal abort identity is invalid after dispatch validation.");
+			const inputHash = abortIdentity.inputHash;
 			const stored = (record: SdkOnlyTerminalScopeRecord | SdkOnlyEvictedTerminalKeyEntry) => ({
 				responseState: record.responseState ?? "pending",
 				responsePayloadHash: record.responsePayloadHash ?? inputHash,
@@ -2676,6 +2682,16 @@ function createControlSurface(
 						pendingPreflights.delete(requesterBucketKey);
 				}
 			};
+			const returnNoActiveTurn = async () => {
+				const result = {
+					ok: true,
+					selection: scope,
+					turn: "no_active_turn",
+					terminal: "terminal_no_effect",
+				};
+				await finalizeNoEffectReservation(result);
+				return result;
+			};
 			if (!handle || epoch === undefined) {
 				if ((await writeNoEffect()) === "conflict") {
 					throw Object.assign(new Error("Idempotency key was reused with different input."), {
@@ -2691,6 +2707,10 @@ function createControlSurface(
 					if (replayed !== undefined) return replayed;
 				}
 				cancelRequesterPreflights();
+				// Operator authority overrides connection ownership only for a turn
+				// observed at admission. It must never adopt a successor that starts
+				// while the durable no-effect reservation is being written.
+				if (input.operator === true) return await returnNoActiveTurn();
 				// A prompt for this requester may have become ACTIVE while the
 				// reservation awaited the filesystem transaction: its submit()
 				// cleanup already removed the preflight callback, so cancelling here
@@ -2706,14 +2726,7 @@ function createControlSurface(
 					// No prompt won the race: finalize the reserved row so a later
 					// same-key retry replays this deterministic no_active_turn result
 					// (review thread P2).
-					const noActiveTurnResult = {
-						ok: true,
-						selection: scope,
-						turn: "no_active_turn",
-						terminal: "terminal_no_effect",
-					};
-					await finalizeNoEffectReservation(noActiveTurnResult);
-					return noActiveTurnResult;
+					return await returnNoActiveTurn();
 				}
 				handle = recheckedHandle;
 				epoch = recheckedEpoch;
@@ -2743,7 +2756,11 @@ function createControlSurface(
 			// cleared after a terminal lifecycle boundary) authorizes no client, and
 			// a stale prior owner authorizes only that old client — never a later
 			// turn it did not submit (review thread P1).
-			if (handle && (abortingConnectionId === undefined || !currentOwnerConnectionIds().has(abortingConnectionId))) {
+			if (
+				input.operator !== true &&
+				handle &&
+				(abortingConnectionId === undefined || !currentOwnerConnectionIds().has(abortingConnectionId))
+			) {
 				if ((await writeNoEffect()) === "conflict") {
 					throw Object.assign(new Error("Idempotency key was reused with different input."), {
 						code: "idempotency_conflict",
@@ -4776,21 +4793,13 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					(request.input as { mode?: unknown }).mode !== "terminal"
 				)
 					return;
-				const input = request.input as Record<string, unknown>;
-				const mode = input.mode;
-				const rawScope = input.scope;
-				if (mode !== "terminal") return;
-				if (rawScope !== undefined && rawScope !== "turn" && rawScope !== "owned") return;
-				// A malformed retry (e.g. {mode:"terminal", scope:"turn", extra:true})
-				// rejected by dispatch must never hash as the valid turn input and
-				// advance the legitimate stored row (review thread P2).
-				for (const key of Object.keys(input)) if (key !== "mode" && key !== "scope") return;
-				const scopeInput = rawScope === "owned" ? "owned" : "turn";
+				const rawInput = request.input as Record<string, unknown>;
+				const operatorAuthorized = hasBrokerRuntimeAbortCapability(rawInput);
+				const { [BROKER_RUNTIME_ABORT_CAPABILITY_FIELD]: _capability, ...publicInput } = rawInput;
+				const abortIdentity = terminalAbortIdentity(publicInput, operatorAuthorized);
+				if (!abortIdentity) return;
 				const keyHash = crypto.createHash("sha256").update(String(request.idempotencyKey)).digest("hex");
-				const inputHash = crypto
-					.createHash("sha256")
-					.update(JSON.stringify({ mode: "terminal", scope: scopeInput }))
-					.digest("hex");
+				const inputHash = abortIdentity.inputHash;
 				// Hash the ACTUAL written response payload: the durable state may only
 				// advance when the written response corresponds to the row's payload.
 				// When more than 256 concurrent requests evict an in-flight abort from

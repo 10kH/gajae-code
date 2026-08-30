@@ -7,6 +7,11 @@ import type { NativeDirectoryTreeSnapshot } from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
 import type { ModelProfileErrorDetails } from "../../config/model-profile-contract";
 import { planLaunchWorktree } from "../../gjc-runtime/launch-worktree";
+import { SdkClient, SdkClientError } from "../client";
+import {
+	BROKER_RUNTIME_ABORT_CAPABILITY_FIELD,
+	BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD,
+} from "../host/control/runtime-gate";
 import { createDefaultSdkHostModelResolver, type SdkHostModelResolver } from "../host/model-pin";
 import {
 	type DirectoryMigrationPolicy,
@@ -274,6 +279,12 @@ function isBrokerResponse(value: unknown): value is BrokerResponse {
 	return typeof value === "object" && value !== null && "ok" in value && typeof value.ok === "boolean";
 }
 
+function objectRecord(value: unknown): Record<string, unknown> | undefined {
+	return value !== null && typeof value === "object" && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: undefined;
+}
+
 function normalizeAliasedString(
 	input: Record<string, unknown>,
 	canonical: string,
@@ -387,7 +398,13 @@ function credentialFreeLifecycleResponse(value: unknown): unknown {
 	if (value === null || typeof value !== "object") return value;
 	const output: Record<string, unknown> = {};
 	for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
-		if (key === "token" || key === "url" || (key === "endpoint" && nested !== null && typeof nested === "object"))
+		if (
+			key === BROKER_RUNTIME_ABORT_CAPABILITY_FIELD ||
+			key === BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD ||
+			key === "token" ||
+			key === "url" ||
+			(key === "endpoint" && nested !== null && typeof nested === "object")
+		)
 			continue;
 		output[key] = credentialFreeLifecycleResponse(nested);
 	}
@@ -460,6 +477,90 @@ function sameEndpointRecord(expected: IndexedSession, current: IndexedSession): 
 		current.endpointMtimeMs === expected.endpointMtimeMs &&
 		path.resolve(current.locator.repo) === path.resolve(expected.locator.repo) &&
 		path.resolve(current.locator.stateRoot) === path.resolve(expected.locator.stateRoot)
+	);
+}
+
+const BROKER_SESSION_CONTROL_FIELDS = new Set(["sessionId", "operation", "input", "confirm"]);
+const BROKER_SESSION_CONTROL_ABORT_FIELDS = new Set(["mode", "scope", "operator"]);
+const BROKER_SESSION_CONTROL_TIMEOUT_MS = 10_000;
+
+type BrokerSessionControlRequest = {
+	sessionId: string;
+	abortInput: { mode: "terminal"; scope: "turn" | "owned"; operator: true };
+};
+
+type BrokerSessionControlAuthority = {
+	record: IndexedSession;
+	endpoint: Record<string, unknown>;
+	endpointIdentity: {
+		dev: bigint;
+		ino: bigint;
+		size: bigint;
+		mtimeNs: bigint;
+		ctimeNs: bigint;
+	};
+};
+
+function brokerSessionControlRequest(input: unknown): BrokerSessionControlRequest | BrokerResponse {
+	const frame = objectRecord(input);
+	if (!frame) return error("invalid_input", "session.control input must be an object");
+	for (const key of Object.keys(frame))
+		if (!BROKER_SESSION_CONTROL_FIELDS.has(key))
+			return error("invalid_input", `Unknown session.control field: ${key}`);
+	if (typeof frame.sessionId !== "string" || !isCanonicalSessionId(frame.sessionId))
+		return error("invalid_input", "sessionId must be a canonical safe identifier");
+	if (frame.operation !== "turn.abort") return error("invalid_input", "session.control only supports turn.abort");
+	if (frame.confirm !== true) return error("invalid_input", "session.control requires confirm:true");
+	const abortInput = objectRecord(frame.input);
+	if (!abortInput) return error("invalid_input", "session.control input must be an object");
+	for (const key of Object.keys(abortInput))
+		if (!BROKER_SESSION_CONTROL_ABORT_FIELDS.has(key))
+			return error("invalid_input", `Unknown turn.abort terminal field: ${key}`);
+	if (abortInput.mode !== "terminal") return error("invalid_input", 'turn.abort mode must be "terminal"');
+	const scope = abortInput.scope === undefined ? "turn" : abortInput.scope;
+	if (scope !== "turn" && scope !== "owned")
+		return error("invalid_input", 'turn.abort scope must be "turn" or "owned"');
+	if (abortInput.operator !== true) return error("invalid_input", "session.control requires operator:true");
+	return {
+		sessionId: frame.sessionId,
+		abortInput: { mode: "terminal", scope, operator: true },
+	};
+}
+
+function brokerControlResponse(value: unknown): BrokerResponse {
+	const response = objectRecord(value);
+	if (!response || typeof response.ok !== "boolean")
+		return error("unavailable", "session endpoint returned an invalid control response");
+	if (response.ok)
+		return response.result === undefined
+			? { ok: true }
+			: { ok: true, result: credentialFreeLifecycleResponse(response.result) };
+	const failure = objectRecord(response.error);
+	const code = typeof failure?.code === "string" ? failure.code : "unavailable";
+	const message = typeof failure?.message === "string" ? failure.message : "session endpoint control failed";
+	return { ok: false, error: { code, message } };
+}
+
+function sameSessionControlAuthority(
+	left: BrokerSessionControlAuthority,
+	right: BrokerSessionControlAuthority,
+): boolean {
+	return (
+		sameEndpointRecord(left.record, right.record) &&
+		left.record.processIncarnation === right.record.processIncarnation &&
+		left.record.hostIncarnation === right.record.hostIncarnation &&
+		left.record.lifecycleRequestId === right.record.lifecycleRequestId &&
+		endpointIncarnation(left.record, left.record.sessionId) ===
+			endpointIncarnation(right.record, right.record.sessionId) &&
+		left.endpoint.sessionId === right.endpoint.sessionId &&
+		left.endpoint.pid === right.endpoint.pid &&
+		left.endpoint.url === right.endpoint.url &&
+		left.endpoint.token === right.endpoint.token &&
+		left.endpointIdentity.dev === right.endpointIdentity.dev &&
+		left.endpointIdentity.ino === right.endpointIdentity.ino &&
+		left.endpointIdentity.size === right.endpointIdentity.size &&
+		left.endpointIdentity.mtimeNs === right.endpointIdentity.mtimeNs &&
+		left.endpointIdentity.ctimeNs === right.endpointIdentity.ctimeNs
 	);
 }
 
@@ -1465,6 +1566,139 @@ export class Broker {
 			throw e;
 		}
 	}
+	async #sessionControlAuthority(sessionId: string): Promise<BrokerSessionControlAuthority | BrokerResponse> {
+		await this.index.refresh();
+		const indexed = this.index.listSessions().sessions.find(session => session.sessionId === sessionId);
+		if (
+			!indexed ||
+			!isSessionAuthorityEligible(indexed) ||
+			!indexed.live ||
+			indexed.terminal ||
+			indexed.terminalUncertain
+		)
+			return error("resource_gone", "session endpoint record is gone");
+		if (
+			!Number.isSafeInteger(indexed.endpointGeneration) ||
+			indexed.endpointGeneration <= 0 ||
+			!Number.isSafeInteger(indexed.pid) ||
+			indexed.pid <= 0 ||
+			indexed.endpointMtimeMs === undefined ||
+			!Number.isFinite(indexed.endpointMtimeMs) ||
+			indexed.endpointMtimeMs <= 0 ||
+			typeof indexed.lifecycleRequestId !== "string" ||
+			indexed.lifecycleRequestId.length === 0 ||
+			indexed.lifecycleRequestId.length > 128 ||
+			!/^[A-Za-z0-9._-]+$/u.test(indexed.lifecycleRequestId) ||
+			endpointIncarnation(indexed, indexed.sessionId) === undefined
+		)
+			return error("endpoint_stale", "session endpoint authority is incomplete");
+		let endpointResponse: BrokerResponse;
+		try {
+			endpointResponse = await this.#readEndpoint(indexed, {});
+		} catch {
+			return error("endpoint_stale", "session endpoint is stale");
+		}
+		if (!endpointResponse.ok) return endpointResponse;
+		const endpoint = objectRecord(endpointResponse.result);
+		if (
+			!endpoint ||
+			endpoint.sessionId !== indexed.sessionId ||
+			endpoint.pid !== indexed.pid ||
+			typeof endpoint.url !== "string" ||
+			endpoint.url.length === 0 ||
+			typeof endpoint.token !== "string" ||
+			endpoint.token.length === 0
+		)
+			return error("endpoint_stale", "session endpoint is malformed");
+		try {
+			const endpointIdentity = await fs.lstat(
+				path.join(indexed.locator.stateRoot, "sdk", `${indexed.sessionId}.json`),
+				{ bigint: true },
+			);
+			if (!endpointIdentity.isFile()) return error("endpoint_stale", "session endpoint is not a regular file");
+			return {
+				record: indexed,
+				endpoint,
+				endpointIdentity: {
+					dev: endpointIdentity.dev,
+					ino: endpointIdentity.ino,
+					size: endpointIdentity.size,
+					mtimeNs: endpointIdentity.mtimeNs,
+					ctimeNs: endpointIdentity.ctimeNs,
+				},
+			};
+		} catch (caught) {
+			if ((caught as NodeJS.ErrnoException).code === "ENOENT")
+				return error("resource_gone", "session endpoint record is gone");
+			return error("endpoint_stale", "session endpoint is stale");
+		}
+	}
+	async #sessionControl(input: Record<string, unknown>, idempotencyKey?: string): Promise<BrokerResponse> {
+		if (
+			typeof idempotencyKey !== "string" ||
+			idempotencyKey.length === 0 ||
+			/[\u0000-\u001f\u007f]/u.test(idempotencyKey) ||
+			new TextEncoder().encode(idempotencyKey).length > 128
+		)
+			return error("invalid_input", "idempotencyKey must be a bounded non-empty string");
+		const request = brokerSessionControlRequest(input);
+		if (isBrokerResponse(request)) return request;
+		const target = `session.control\u0000${request.sessionId}`;
+		const previous = this.#chains.get(target) ?? Promise.resolve();
+		let release!: () => void;
+		const current = new Promise<void>(resolve => (release = resolve));
+		const chain = previous.then(() => current);
+		this.#chains.set(target, chain);
+		await previous;
+		try {
+			const authority = await this.#sessionControlAuthority(request.sessionId);
+			if (isBrokerResponse(authority)) return authority;
+			let client: SdkClient;
+			try {
+				client = await SdkClient.connect(authority.endpoint.url as string, authority.endpoint.token as string, {
+					timeoutMs: BROKER_SESSION_CONTROL_TIMEOUT_MS,
+					reconnectAttempts: 0,
+				});
+			} catch (caught) {
+				return caught instanceof SdkClientError
+					? error(caught.code, caught.message)
+					: error("unavailable", "session endpoint is unavailable");
+			}
+			try {
+				const currentAuthority = await this.#sessionControlAuthority(request.sessionId);
+				if (isBrokerResponse(currentAuthority)) return currentAuthority;
+				if (!sameSessionControlAuthority(authority, currentAuthority))
+					return error("endpoint_stale", "session endpoint changed before control dispatch");
+				const response = await client.control(
+					"turn.abort",
+					{
+						...request.abortInput,
+						[BROKER_RUNTIME_ABORT_CAPABILITY_FIELD]: authority.record.lifecycleRequestId,
+					},
+					{
+						confirm: true,
+						idempotencyKey,
+						beforeDispatch: () => {
+							if (!this.runSynchronousEffectWithFreshPublicationAuthority(() => undefined).authorized)
+								throw new SdkClientError("unavailable", "broker publication is unavailable");
+						},
+					},
+				);
+				return brokerControlResponse(response);
+			} catch (caught) {
+				return caught instanceof SdkClientError
+					? error(caught.code, caught.message)
+					: error("unavailable", "session endpoint control is unavailable");
+			} finally {
+				await client.close().catch(() => undefined);
+			}
+		} catch {
+			return error("unavailable", "session control is unavailable");
+		} finally {
+			release();
+			if (this.#chains.get(target) === chain) this.#chains.delete(target);
+		}
+	}
 	#storeSessionListCursor(cursor: SessionListCursor, replacingToken?: string): string | BrokerResponse {
 		const now = Date.now();
 		for (const [token, stored] of this.#sessionListCursors) {
@@ -1541,6 +1775,7 @@ export class Broker {
 		idempotencyKey?: string,
 	): Promise<BrokerResponse> {
 		if (this.#stopping) return error("broker_restarting", "broker is stopping");
+		if (operation === "session.control") return this.#sessionControl(input, idempotencyKey);
 		const fingerprint = lifecycleFingerprint(operation, input);
 		const normalization = normalizeBrokerInput(operation, input);
 		if (isBrokerResponse(normalization)) return normalization;

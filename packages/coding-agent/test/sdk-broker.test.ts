@@ -39,6 +39,7 @@ import {
 import { LifecycleLedger } from "../src/sdk/broker/lifecycle-ledger";
 import { resolveSdkInternalSpawnCommand, resolveSdkInternalSpawnCommandForTest } from "../src/sdk/broker/runtime";
 import { readBrokerStartupFailureMarker, writeBrokerStartupFailureMarker } from "../src/sdk/broker/startup-failure";
+import { BROKER_RUNTIME_ABORT_CAPABILITY_FIELD } from "../src/sdk/host/control/runtime-gate";
 import { prepareManagedSessionScopeForWrite, resolveManagedScope } from "../src/session/internal/managed-session-scope";
 import { SessionManager } from "../src/session/session-manager";
 import {
@@ -3211,6 +3212,165 @@ describe("SDK broker identity and discovery", () => {
 			expect(await fs.readFile(sessionPath, "utf8")).toContain(sessionId);
 		} finally {
 			forged.mockRestore();
+			await broker.stop();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("routes confirmed operator terminal aborts with the indexed private capability", async () => {
+		const dir = await temp();
+		const stateRoot = path.join(dir, ".gjc", "state");
+		const sessionId = "operator-abort";
+		const lifecycleRequestId = "operator-abort-capability";
+		const endpointPath = path.join(stateRoot, "sdk", `${sessionId}.json`);
+		const broker = new Broker({ agentDir: dir });
+		const requests: Array<Record<string, unknown>> = [];
+		let fenceOnNextOpen = false;
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch(request, httpServer) {
+				if (httpServer.upgrade(request)) return;
+				return new Response("WebSocket required", { status: 426 });
+			},
+			websocket: {
+				open(ws) {
+					if (fenceOnNextOpen) {
+						fenceOnNextOpen = false;
+						setPublicationObservationForTest(broker, "absent");
+					}
+					ws.send(JSON.stringify({ type: "hello" }));
+				},
+				message(ws, message) {
+					const frame = JSON.parse(String(message)) as Record<string, unknown>;
+					requests.push(frame);
+					if (typeof frame.id === "string")
+						ws.send(
+							JSON.stringify({
+								id: frame.id,
+								ok: true,
+								result: { turn: "stopped", ownedWork: "stopped" },
+							}),
+						);
+				},
+			},
+		});
+		await broker.start();
+		try {
+			await fs.mkdir(path.dirname(endpointPath), { recursive: true });
+			await fs.writeFile(
+				endpointPath,
+				JSON.stringify({
+					sessionId,
+					pid: process.pid,
+					url: `ws://127.0.0.1:${server.port}`,
+					token: "operator-token",
+				}),
+			);
+			await broker.index.append({
+				type: "host_registered",
+				sessionId,
+				locator: { repo: dir, stateRoot },
+				endpointGeneration: 1,
+				pid: process.pid,
+				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+				lifecycleRequestId,
+			});
+			await broker.index.append({
+				type: "host_heartbeat",
+				sessionId,
+				locator: { repo: dir, stateRoot },
+				endpointGeneration: 1,
+				pid: process.pid,
+			});
+			expect(
+				await broker.handleRequest(
+					"session.control",
+					{
+						sessionId,
+						operation: "turn.abort",
+						input: { mode: "terminal", scope: "owned", operator: true },
+						confirm: true,
+					},
+					"operator-abort-key",
+				),
+			).toEqual({ ok: true, result: { turn: "stopped", ownedWork: "stopped" } });
+			expect(requests).toHaveLength(1);
+			expect(requests[0]).toMatchObject({
+				type: "control_request",
+				operation: "turn.abort",
+				input: {
+					mode: "terminal",
+					scope: "owned",
+					operator: true,
+					[BROKER_RUNTIME_ABORT_CAPABILITY_FIELD]: lifecycleRequestId,
+				},
+				confirm: true,
+				idempotencyKey: "operator-abort-key",
+			});
+			await fs.writeFile(
+				endpointPath,
+				JSON.stringify({
+					sessionId,
+					pid: process.pid,
+					url: `ws://127.0.0.1:${server.port}`,
+					token: "replacement-token",
+				}),
+			);
+			await broker.index.append({
+				type: "host_registered",
+				sessionId,
+				locator: { repo: dir, stateRoot },
+				endpointGeneration: 2,
+				pid: process.pid,
+				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+			});
+			expect(
+				await broker.handleRequest(
+					"session.control",
+					{
+						sessionId,
+						operation: "turn.abort",
+						input: { mode: "terminal", operator: true },
+						confirm: true,
+					},
+					"replacement-abort-key",
+				),
+			).toEqual({
+				ok: false,
+				error: { code: "endpoint_stale", message: "session endpoint authority is incomplete" },
+			});
+			expect(requests).toHaveLength(1);
+
+			await broker.index.append({
+				type: "host_registered",
+				sessionId,
+				locator: { repo: dir, stateRoot },
+				endpointGeneration: 3,
+				pid: process.pid,
+				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+				lifecycleRequestId,
+			});
+			fenceOnNextOpen = true;
+			expect(
+				await broker.handleRequest(
+					"session.control",
+					{
+						sessionId,
+						operation: "turn.abort",
+						input: { mode: "terminal", operator: true },
+						confirm: true,
+					},
+					"stale-broker-abort-key",
+				),
+			).toEqual({
+				ok: false,
+				error: { code: "unavailable", message: "broker publication is unavailable" },
+			});
+			expect(requests).toHaveLength(1);
+		} finally {
+			setPublicationObservationForTest(broker, undefined);
+			server.stop(true);
 			await broker.stop();
 			await fs.rm(dir, { recursive: true, force: true });
 		}
