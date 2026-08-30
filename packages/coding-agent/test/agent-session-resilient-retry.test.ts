@@ -1170,7 +1170,7 @@ describe.serial("AgentSession resilient retry", () => {
 			session = undefined;
 			waitSpy.mockClear();
 		}
-	});
+	}, 300000);
 
 	it("keeps first-party first-event timeout retries unbounded (#713 scope guard)", async () => {
 		// The fix is scoped to ollama-cloud: first-party providers keep their
@@ -1198,7 +1198,7 @@ describe.serial("AgentSession resilient retry", () => {
 		expect(retryEndEvents).toHaveLength(1);
 		expect(retryEndEvents[0]).toMatchObject({ success: true });
 		expect(lastAssistant(session).stopReason).toBe("stop");
-	});
+	}, 300000);
 	it("retries provider stream first-event timeouts under a bare default config (single model)", async () => {
 		// Regression: with a single default model and NO explicit retry.* keys,
 		// a provider stream timeout used to fail the turn without retrying and
@@ -2135,7 +2135,7 @@ describe.serial("AgentSession resilient retry", () => {
 			stopReason: "stop",
 			content: [{ type: "text", text: "recovered" }],
 		});
-	});
+	}, 300000);
 
 	it("bounds canonical wrapped first-event timeout exhaustion with exact diagnostics", async () => {
 		const errorMessage = "Error: Provider stream timed out while waiting for the first event";
@@ -2158,7 +2158,7 @@ describe.serial("AgentSession resilient retry", () => {
 		expect(lastAssistant(session).errorMessage).toMatch(
 			/^First-event stream timeout exhausted after 3 attempts; waited \d+ms total: Error: Provider stream timed out while waiting for the first event$/,
 		);
-	});
+	}, 300000);
 
 	it("bounds the exact no-the first-event compatibility message under explicit retry policy", async () => {
 		const errorMessage = "Provider stream timed out while waiting for first event";

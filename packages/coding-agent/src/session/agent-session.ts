@@ -8477,14 +8477,7 @@ export class AgentSession {
 		// is already failure-absorbing, so this only waits.
 		await this.#coordinatorPersistQueue;
 		this.#pendingBackgroundExchanges = [];
-		this.yieldQueue.clear((kind, entries) => {
-			if (kind !== "async-result") return;
-			for (const entry of entries) {
-				if (typeof entry !== "object" || entry === null) continue;
-				const envelope = (entry as { ownedCompletion?: unknown }).ownedCompletion;
-				if (isOwnedCompletionEnvelope(envelope)) this.#settleOwnedCompletionEnvelope(envelope);
-			}
-		});
+		this.#drainTerminalOwnedYieldEntries();
 
 		this.agent.setOnBeforeYield(undefined);
 		try {
@@ -8504,6 +8497,15 @@ export class AgentSession {
 		// the session that owns the manager goes on to dispose it (which itself
 		// nukes any leftover jobs and pending deliveries).
 		this.#cancelOwnAsyncJobs();
+		// Final drain (Codex review P2 on #5088): an async-job completion that
+		// enqueued during the awaited session_shutdown window above survived the
+		// first drain with a retained delivery claim, and the already-aborted
+		// disposal signal makes its idle-flush task exit before YieldQueue.flush
+		// can run. Producers are now cancelled, so drain once more to settle any
+		// straggler envelope and release its claim before owned-manager teardown
+		// — a shared manager would otherwise keep the claim past this session's
+		// disposal.
+		this.#drainTerminalOwnedYieldEntries();
 		await Promise.allSettled(this.#deferredOwnerShutdownFinalizations);
 		const ownedAsyncManager = this.#ownedAsyncJobManager;
 		if (ownedAsyncManager && this.#disposeAsyncJobManager) {
@@ -12437,6 +12439,40 @@ export class AgentSession {
 		if (job === undefined || status === "completed" || status === "cancelled" || status === "failed") {
 			unregisterOwnedRegistration(envelope.registration);
 		}
+	}
+
+	/**
+	 * Drop every queued yield entry, releasing its retained delivery claim and
+	 * settling terminal owned-completion envelopes so neither outlives this
+	 * session's disposal. Claims resolve to the manager that actually retained
+	 * them: owned entries via their registration endpoint (subagents inherit a
+	 * parent's manager, and the process-global instance may belong to a
+	 * different concurrent session), ordinary entries only on the session-OWNED
+	 * manager. Disposal runs this twice: before the awaited session_shutdown
+	 * emit, and again after producer cancellation — a completion enqueued
+	 * inside that window would otherwise survive disposal, its claim retained
+	 * on a shared manager and interfering with later delivery teardown (Codex
+	 * review P2 on #5088).
+	 */
+	#drainTerminalOwnedYieldEntries(): void {
+		this.yieldQueue.clear((kind, entries) => {
+			if (kind !== "async-result") return;
+			const ownedManager = this.#ownedAsyncJobManager;
+			for (const entry of entries) {
+				if (typeof entry !== "object" || entry === null) continue;
+				const record = entry as { generation?: unknown; ownedCompletion?: unknown };
+				if (typeof record.generation === "string" && record.generation !== "") {
+					const envelope = isOwnedCompletionEnvelope(record.ownedCompletion) ? record.ownedCompletion : undefined;
+					const endpointId = envelope?.registration.endpointId;
+					const manager =
+						(endpointId !== undefined ? AsyncJobManager.forEndpoint(endpointId) : undefined) ?? ownedManager;
+					manager?.releaseDeliveryClaim(record.generation);
+				}
+				if (isOwnedCompletionEnvelope(record.ownedCompletion)) {
+					this.#settleOwnedCompletionEnvelope(record.ownedCompletion);
+				}
+			}
+		});
 	}
 
 	#getCustomMessageTextContent(message: Pick<CustomMessage, "content">): string {
