@@ -893,8 +893,29 @@ describe("file lock cleanup failure handling (#2478)", () => {
 		expect(await fs.exists(`${realFile}.lock`)).toBe(false);
 	});
 
-	test("keeps case-distinct lock keys independent", async () => {
+	/**
+	 * Case-distinct keys carry the semantics 581960b079 documents: distinct
+	 * authorities on case-SENSITIVE directories, converged aliases elsewhere.
+	 * The two halves need different assertions — on a case-insensitive volume
+	 * (default macOS APFS, Windows NTFS) both spellings publish one on-disk
+	 * `.lock` directory, so a NESTED acquire of the alias would wait on its own
+	 * live owner. The suite previously asserted only the case-sensitive half,
+	 * unconditionally, and CI's ubuntu-only test shards never executed it on a
+	 * case-insensitive filesystem (#5082).
+	 */
+	async function directoryIsCaseInsensitive(base: string): Promise<boolean> {
+		const probe = path.join(base, "CaseProbe.tmp");
+		await fs.writeFile(probe, "", "utf8");
+		try {
+			return await fs.exists(path.join(base, "caseprobe.tmp"));
+		} finally {
+			await fs.rm(probe, { force: true });
+		}
+	}
+
+	test("keeps case-distinct lock keys independent on case-sensitive volumes", async () => {
 		const base = await makeTemp();
+		if (await directoryIsCaseInsensitive(base)) return;
 		const upper = path.join(base, "State.json");
 		const lower = path.join(base, "state.json");
 		let upperEntered = false;
@@ -907,6 +928,40 @@ describe("file lock cleanup failure handling (#2478)", () => {
 		});
 		expect(upperEntered).toBe(true);
 		expect(lowerEntered).toBe(true);
+		expect(await fs.exists(`${upper}.lock`)).toBe(false);
+		expect(await fs.exists(`${lower}.lock`)).toBe(false);
+	});
+
+	test("converges case-aliased lock keys on case-insensitive volumes", async () => {
+		const base = await makeTemp();
+		if (!(await directoryIsCaseInsensitive(base))) return;
+		const upper = path.join(base, "State.json");
+		const lower = path.join(base, "state.json");
+
+		// Sequential acquires of both spellings share one converged authority.
+		let upperEntered = false;
+		let lowerEntered = false;
+		await withFileLock(upper, async () => {
+			upperEntered = true;
+		});
+		await withFileLock(lower, async () => {
+			lowerEntered = true;
+		});
+		expect(upperEntered).toBe(true);
+		expect(lowerEntered).toBe(true);
+
+		// Concurrent, independent acquires serialize on the converged key
+		// instead of corrupting ownership; both critical sections complete.
+		let inside = 0;
+		let maxInside = 0;
+		const enter = async (): Promise<void> => {
+			inside += 1;
+			maxInside = Math.max(maxInside, inside);
+			await Bun.sleep(25);
+			inside -= 1;
+		};
+		await Promise.all([withFileLock(upper, enter), withFileLock(lower, enter)]);
+		expect(maxInside).toBe(1);
 		expect(await fs.exists(`${upper}.lock`)).toBe(false);
 		expect(await fs.exists(`${lower}.lock`)).toBe(false);
 	});
