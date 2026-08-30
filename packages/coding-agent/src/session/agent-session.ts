@@ -12284,7 +12284,7 @@ export class AgentSession {
 				try {
 					await this.#promptQueuedHiddenNextTurnMessages(signal);
 				} catch {
-					if (signal.aborted || this.#isDisposed || this.#sessionAdmissionClosing) {
+					if (this.#isDisposed || this.#sessionAdmissionClosing || this.#disposeAbortController.signal.aborted) {
 						this.#pendingNextTurnMessages = [];
 						return;
 					}
@@ -12332,8 +12332,12 @@ export class AgentSession {
 		if (reclassified.length === 0) {
 			return;
 		}
-		if (signal?.aborted || this.#isDisposed || this.#sessionAdmissionClosing) {
+		if (this.#isDisposed || this.#sessionAdmissionClosing || this.#disposeAbortController.signal.aborted) {
 			this.#settleDeliveredOwnedRegistrations(reclassified.map(entry => entry.message));
+			return;
+		}
+		if (signal?.aborted) {
+			this.#pendingNextTurnMessages = [...reclassified, ...this.#pendingNextTurnMessages];
 			return;
 		}
 		// Allocate a fresh root-turn lineage when the drained batch contains a
@@ -12357,8 +12361,12 @@ export class AgentSession {
 		const textContent = this.#getCustomMessageTextContent(message);
 		await this.#syncSkillPromptActiveStateSafely(message, true);
 		try {
-			if (signal?.aborted || this.#isDisposed || this.#sessionAdmissionClosing) {
+			if (this.#isDisposed || this.#sessionAdmissionClosing || this.#disposeAbortController.signal.aborted) {
 				this.#settleDeliveredOwnedRegistrations(reclassified.map(entry => entry.message));
+				return;
+			}
+			if (signal?.aborted) {
+				this.#pendingNextTurnMessages = [...reclassified, ...this.#pendingNextTurnMessages];
 				return;
 			}
 			await this.#promptWithMessage(message, textContent, {
@@ -12367,7 +12375,7 @@ export class AgentSession {
 				preflightSignal: signal,
 			});
 		} catch (error) {
-			if (signal?.aborted || this.#isDisposed || this.#sessionAdmissionClosing) {
+			if (this.#isDisposed || this.#sessionAdmissionClosing || this.#disposeAbortController.signal.aborted) {
 				this.#settleDeliveredOwnedRegistrations(reclassified.map(entry => entry.message));
 				return;
 			}
