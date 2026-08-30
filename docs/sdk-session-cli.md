@@ -186,10 +186,15 @@ gjc sdk session raw control <sessionId> \
 ```
 
 The JSON input accepts only operation fields (`mode`, `scope`, `operator`).
-`--confirm` and `--idempotency-key` are control-envelope flags, not JSON fields.
-Omitting confirmation, omitting the key, or supplying `operator:false` fails
-closed without invoking the terminal-abort surface. Non-operator terminal abort
-retains its existing connection-ownership semantics.
+`--confirm` and `--idempotency-key` are CLI authority inputs, not JSON fields.
+The exact `operator:true` shape is routed through the local Broker, which
+revalidates the current endpoint identity and injects a process-bound private
+capability before dispatch. MCP, ACP, notifications, and ordinary SDK endpoint
+requests cannot mint operator authority: copying `operator:true` and
+`confirm:true` into a public control frame is rejected. Omitting confirmation,
+omitting the key, or supplying `operator:false` fails closed without invoking
+the terminal-abort surface. Non-operator terminal abort retains its existing
+connection-ownership semantics.
 
 `session.get_endpoint` is refused unconditionally: endpoint credentials remain
 an SDK-core implementation detail. The raw hatch validates operation names and

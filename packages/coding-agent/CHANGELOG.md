@@ -6,6 +6,8 @@
 
 ### Fixed
 
+- Confirmed operator `turn.abort` requests now travel through a dedicated local Broker route instead of trusting caller-supplied `operator:true` and `confirm:true` on ordinary SDK frames. The Broker revalidates the exact live endpoint identity, injects a process-bound private capability, preserves post-send uncertainty, and the host uses one capability-free canonical identity for dispatch idempotency, durable admission, and delivery receipts, so forged, stale, dropped, and replayed requests fail closed consistently across restart boundaries.
+
 - Blob references and filesystem-backed blob reads now accept only exact lowercase SHA-256 names before resolving a disk path; canonical references and valid missing-blob behavior are unchanged.
 
 ## [0.15.6] - 2026-08-30

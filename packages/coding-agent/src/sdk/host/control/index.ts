@@ -6,6 +6,8 @@ export {
 	type ControlResponse,
 	controlRequestFromFrame,
 	dispatchControl,
+	type TerminalAbortIdentity,
 	TypedControlError,
+	terminalAbortIdentity,
 } from "./dispatch";
 export type { AbortScope, ControlInput, ControlSurface, ControlValue } from "./operations";

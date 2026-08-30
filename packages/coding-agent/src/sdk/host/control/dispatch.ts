@@ -6,7 +6,12 @@ import {
 import { validateRequiredPromptText } from "../../protocol/adapter-validation";
 import { OPERATIONS, type Operation } from "../../protocol/operation-registry";
 import type { ControlInput, ControlSurface, ControlValue } from "./operations";
-import { brokerRuntimeCloseCapability, hasBrokerRuntimeCloseCapability } from "./runtime-gate";
+import {
+	BROKER_RUNTIME_ABORT_CAPABILITY_FIELD,
+	brokerRuntimeCloseCapability,
+	hasBrokerRuntimeAbortCapability,
+	hasBrokerRuntimeCloseCapability,
+} from "./runtime-gate";
 
 export interface ControlRequest {
 	id: string;
@@ -149,26 +154,28 @@ function inputHash(input: unknown): string {
 		.update(JSON.stringify(canonicalize(input)))
 		.digest("hex");
 }
-/**
- * Normalize a WELL-FORMED terminal abort input for the idempotency hash:
- * omitted scope defaults to "turn", so `{mode:"terminal"}` and
- * `{mode:"terminal", scope:"turn"}` share one idempotency key (the durable
- * terminal-scope replay hashes the same normalized payload). Malformed
- * inputs (unknown fields, invalid mode/scope) are left raw so they are
- * rejected downstream and never collide with a valid input's key.
- */
-function normalizeTerminalAbortInputForHash(input: unknown): unknown {
-	if (typeof input !== "object" || input === null) return input;
-	const record = input as Record<string, unknown>;
-	if (record.mode !== "terminal") return input;
-	for (const key of Object.keys(record)) if (!TERMINAL_ABORT_FIELDS.has(key)) return input;
-	const scope = record.scope;
-	if (scope !== undefined && scope !== "turn" && scope !== "owned") return input;
-	return {
-		mode: "terminal",
-		scope: scope === undefined ? "turn" : scope,
-		...(record.operator === true ? { operator: true } : {}),
+
+export interface TerminalAbortIdentity {
+	input: { mode: "terminal"; scope: "turn" | "owned"; operator?: true };
+	inputHash: string;
+}
+
+/** One strict, capability-free identity shared by dispatch, durable admission, and delivery observation. */
+export function terminalAbortIdentity(input: unknown, operatorAuthorized: boolean): TerminalAbortIdentity | undefined {
+	if (!isInput(input) || input.mode !== "terminal") return undefined;
+	for (const key of Object.keys(input)) if (!TERMINAL_ABORT_FIELDS.has(key)) return undefined;
+	let scope: "turn" | "owned";
+	if (input.scope === undefined || input.scope === "turn") scope = "turn";
+	else if (input.scope === "owned") scope = "owned";
+	else return undefined;
+	if (input.operator !== undefined && input.operator !== true) return undefined;
+	if (input.operator === true && !operatorAuthorized) return undefined;
+	const normalized = {
+		mode: "terminal" as const,
+		scope,
+		...(input.operator === true ? { operator: true as const } : {}),
 	};
+	return { input: normalized, inputHash: inputHash(normalized) };
 }
 
 function text(input: ControlInput, key = "text"): string {
@@ -191,12 +198,13 @@ function invalidInput(message: string): never {
  * before any surface call: only `mode`/`scope`/`operator` fields are accepted,
  * `scope` must be `"turn"` or `"owned"` (default `"turn"`), and a nonempty
  * idempotency key of at most 128 UTF-8 bytes is required on the request envelope.
- * A cross-connection local operator must set `operator:true` and confirm the
- * destructive control request explicitly. Terminal semantics (see the approved
- * plan) always stop the root worker's current turn. `scope:"turn"` leaves owned
- * work running so its completion can resume the root worker; `scope:"owned"`
- * additionally requires exact causal proof and stops that owned work. Operator
- * authority changes only connection ownership, never those settlement proofs.
+ * A cross-connection local operator must arrive through the Broker route with a
+ * private lifecycle capability, set `operator:true`, and confirm the destructive
+ * control request explicitly. Terminal semantics (see the approved plan) always
+ * stop the root worker's current turn. `scope:"turn"` leaves owned work running
+ * so its completion can resume the root worker; `scope:"owned"` additionally
+ * requires exact causal proof and stops that owned work. Operator authority
+ * changes only connection ownership, never those settlement proofs.
  */
 function invokeAbort(
 	surface: ControlSurface,
@@ -421,11 +429,7 @@ function idempotent(
 	const now = Date.now();
 	for (const [key, entry] of requests) if (entry.expiresAt <= now) requests.delete(key);
 	const key = `${row.sdkId}\u0000${request.idempotencyKey}`;
-	// Terminal abort normalizes the omitted scope BEFORE hashing so the
-	// defaulted and explicit shapes share one idempotency key (and reach the
-	// durable terminal-scope replay on eviction); malformed inputs stay raw.
-	const hashInput = row.sdkId === "turn.abort" ? normalizeTerminalAbortInputForHash(request.input) : request.input;
-	const hash = inputHash(hashInput);
+	const hash = inputHash(request.input);
 	const existing = requests.get(key);
 	if (existing) {
 		requests.delete(key);
@@ -462,12 +466,30 @@ export function dispatchControl(
 			failure(request.id, "unknown_operation", `Unknown control operation: ${request.operation}.`),
 		);
 	const brokerCloseAuthorized = row.sdkId === "session.close" && hasBrokerRuntimeCloseCapability(request.input);
+	const brokerAbortInput = row.sdkId === "turn.abort" && isInput(request.input) ? request.input : undefined;
+	const brokerAbortFieldPresent =
+		brokerAbortInput !== undefined && Object.hasOwn(brokerAbortInput, BROKER_RUNTIME_ABORT_CAPABILITY_FIELD);
+	const brokerAbortAuthorized = row.sdkId === "turn.abort" && hasBrokerRuntimeAbortCapability(request.input);
 	if (BROKER_LIFECYCLE_CONTROL_OPERATIONS.has(row.sdkId) && !brokerCloseAuthorized)
 		return Promise.resolve(
 			failure(
 				request.id,
 				"operation_prohibited",
 				`${request.operation} is available only through the Broker lifecycle service.`,
+			),
+		);
+	if (!isInput(request.input))
+		return Promise.resolve(failure(request.id, "invalid_input", "Control input must be an object."));
+	if (
+		row.sdkId === "turn.abort" &&
+		((brokerAbortFieldPresent && !brokerAbortAuthorized) ||
+			(request.input.operator === true && !brokerAbortAuthorized))
+	)
+		return Promise.resolve(
+			failure(
+				request.id,
+				"operation_prohibited",
+				"Operator terminal aborts are available only through the Broker control route.",
 			),
 		);
 	if (
@@ -478,20 +500,42 @@ export function dispatchControl(
 		return Promise.resolve(
 			failure(request.id, "operation_not_session_owned", `${request.operation} is not installed for this session.`),
 		);
-	if (!isInput(request.input))
-		return Promise.resolve(failure(request.id, "invalid_input", "Control input must be an object."));
-	const promptError = validateRequiredPromptText(row.sdkId, request.input);
+	let dispatchRequest: ControlRequest = request;
+	if (row.sdkId === "turn.abort" && request.input.mode === "terminal") {
+		const publicInput = brokerAbortInput
+			? (() => {
+					const { [BROKER_RUNTIME_ABORT_CAPABILITY_FIELD]: _capability, ...input } = brokerAbortInput;
+					return input;
+				})()
+			: request.input;
+		const identity = terminalAbortIdentity(publicInput, brokerAbortAuthorized);
+		if (!identity)
+			return Promise.resolve(failure(request.id, "invalid_input", "Terminal turn.abort input is malformed."));
+		if (identity.input.operator === true && request.confirm !== true)
+			return Promise.resolve(failure(request.id, "invalid_input", "operator terminal abort requires confirm:true."));
+		if (typeof request.idempotencyKey !== "string" || request.idempotencyKey.length === 0)
+			return Promise.resolve(
+				failure(request.id, "invalid_input", "terminal abort requires a nonempty idempotency key."),
+			);
+		if (new TextEncoder().encode(request.idempotencyKey).length > 128)
+			return Promise.resolve(
+				failure(request.id, "invalid_input", "terminal abort idempotency key must be at most 128 UTF-8 bytes."),
+			);
+		dispatchRequest = { ...request, input: identity.input };
+	}
+	const promptError = validateRequiredPromptText(row.sdkId, dispatchRequest.input as ControlInput);
 	if (promptError) return Promise.resolve(failure(request.id, promptError.code, promptError.message));
 	if ((row.sdkId === "context.clear" || row.sdkId === "session.delete") && request.confirm !== true)
 		return Promise.resolve(
 			failure(request.id, "invalid_input", "confirm: true is required for this destructive operation."),
 		);
-	const work = () => execute(surface, row, request);
+	const work = () => execute(surface, row, dispatchRequest);
 	if (row.sdkId === "turn.abort_and_prompt") {
 		const cancellable = surface as PreflightCancellableSurface;
 		if (Object.hasOwn(cancellable, "cancelPendingPreflights")) cancellable.cancelPendingPreflights?.();
 		return serialize(surface, work);
 	}
-	if (row.idempotency === "idempotent" && request.idempotencyKey) return idempotent(surface, row, request, work);
+	if (row.idempotency === "idempotent" && dispatchRequest.idempotencyKey)
+		return idempotent(surface, row, dispatchRequest, work);
 	return row.idempotency === "ordered" && row.sdkId !== "retry.now" ? serialize(surface, work) : work();
 }

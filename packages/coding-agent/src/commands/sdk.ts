@@ -849,7 +849,7 @@ class SdkSessionHelp extends Command {
 		"idempotency-key": Flags.string({
 			description: "Caller idempotency key required for lifecycle globals and terminal abort controls",
 		}),
-		confirm: Flags.boolean({ description: "Confirm a destructive SDK control operation" }),
+		confirm: Flags.boolean({ description: "Confirm a destructive local CLI control operation" }),
 		cursor: Flags.string({
 			description: "Raw query continuation cursor, or a saved checkpoint token to resume tail from",
 		}),
