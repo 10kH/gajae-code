@@ -2034,7 +2034,14 @@ function verifyRuntimeStateRescopeJournal(journal: CoordinatorRuntimeStateRescop
 }
 
 function assertNoRuntimeStateRescopeJournal(context: RuntimeStateContext, identity: RuntimeStateIdentity): void {
-	const journalFile = runtimeStateRescopeJournalPath(fsSync.realpathSync(context.cwd), context.sessionId);
+	let canonicalCwd: string;
+	try {
+		canonicalCwd = fsSync.realpathSync(context.cwd);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+		throw error;
+	}
+	const journalFile = runtimeStateRescopeJournalPath(canonicalCwd, context.sessionId);
 	const observed = readRegularFileForRelocation(journalFile);
 	if (!observed) return;
 	const journal = parseRuntimeStateRescopeJournal(observed.raw);
