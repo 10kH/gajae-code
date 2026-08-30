@@ -8386,6 +8386,8 @@ export class AgentSession {
 	dispose(): Promise<void> {
 		this.#evalExecutionDisposing = true;
 		if (this.#disposePromise) return this.#disposePromise;
+		this.#abortAdmissionEpoch++;
+		this.#isDisposed = true;
 		const { promise, resolve, reject } = Promise.withResolvers<void>();
 		this.#disposePromise = promise;
 		void this.#dispose().then(resolve, reject);
@@ -8394,8 +8396,9 @@ export class AgentSession {
 
 	async #dispose(): Promise<void> {
 		await this.sessionManager.joinCwdTransition();
+		const managedLogicalRunId = this.agent.currentManagedLogicalRunId;
+		const activeResourceRunId = this.agent.activeResourceRunId;
 		const admissionClosed = this.#closeSessionAdmission();
-		this.#isDisposed = true;
 		// Reject new direct Python starts as soon as disposal begins (synchronously,
 		// before any await) so callers cannot race a start against teardown.
 		this.#evalExecutionDisposing = true;
@@ -8406,6 +8409,11 @@ export class AgentSession {
 		// #waitForPostPromptRecovery can keep its admission lease forever while
 		// teardown waits for that same lease to settle.
 		this.abortRetry();
+		// A managed attempt clears Agent's active run before invoking its continuation.
+		// Quarantine that logical resource domain as well, so a continuation that is
+		// already between attempts observes disposal through its ownership signal.
+		const teardownResourceRunId = managedLogicalRunId ?? activeResourceRunId;
+		if (teardownResourceRunId !== undefined) this.agent.resourceLedger.quarantine(String(teardownResourceRunId));
 		this.agent.abort();
 		this.agent.setMainAttemptScopeObserver(undefined);
 		// Disconnect the Agent event bridge NOW — before the maintenance join and the
@@ -19498,11 +19506,15 @@ export class AgentSession {
 	}
 
 	async #handleManagedAttemptOutcome(outcome: ManagedAttemptOutcome): Promise<ManagedAttemptDecision> {
+		const attemptAbortEpoch = this.#abortAdmissionEpoch;
+		const attemptCancelled = () =>
+			this.#isDisposed || this.#sessionAdmissionClosing || this.#abortAdmissionEpoch !== attemptAbortEpoch;
 		const activePromptHandle = this.activePromptHandle;
 		const cancellationSignal = activePromptHandle
 			? this.#runCancellationDomains.lookup(activePromptHandle)?.signal
 			: undefined;
-		if (cancellationSignal?.aborted) return { type: "terminal", terminal: { stopReason: "cancelled" } };
+		if (attemptCancelled() || cancellationSignal?.aborted)
+			return { type: "terminal", terminal: { stopReason: "cancelled" } };
 		if (outcome.type === "run_terminal") {
 			this.#defaultFallbackChain().resetAttemptBudget();
 			return { type: "terminal", terminal: { stopReason: outcome.reason } };
@@ -19538,7 +19550,6 @@ export class AgentSession {
 				const controllerStateBeforeFailure = controller.snapshotRuntimeState();
 				const advanced = controller.recordEscapedArgumentsFailure(errorMessage, false);
 				this.#escapedNonAsciiManagedRetries = 0;
-				const abortEpoch = this.#abortAdmissionEpoch;
 				if (advanced) {
 					const transitionGeneration = ++this.#fallbackTransitionGeneration;
 					return {
@@ -19559,7 +19570,9 @@ export class AgentSession {
 								!ownership.isCurrent() ||
 								ownership.lease.signal.aborted ||
 								cancellationSignal?.aborted ||
-								this.#abortAdmissionEpoch !== abortEpoch ||
+								this.#isDisposed ||
+								this.#sessionAdmissionClosing ||
+								this.#abortAdmissionEpoch !== attemptAbortEpoch ||
 								this.#fallbackTransitionGeneration !== transitionGeneration;
 							if (continuationCancelled) {
 								await restoreOwnedTransition();
@@ -19584,7 +19597,7 @@ export class AgentSession {
 								"escaped_non_ascii",
 								1,
 								cancellationSignal,
-								abortEpoch,
+								attemptAbortEpoch,
 								controllerStateBeforeFailure,
 								previousModel,
 								previousThinkingLevel,
@@ -19593,7 +19606,9 @@ export class AgentSession {
 							);
 							if (!switched) {
 								if (
-									this.#abortAdmissionEpoch !== abortEpoch ||
+									this.#isDisposed ||
+									this.#sessionAdmissionClosing ||
+									this.#abortAdmissionEpoch !== attemptAbortEpoch ||
 									cancellationSignal?.aborted ||
 									this.#fallbackTransitionGeneration !== transitionGeneration
 								) {
@@ -19622,7 +19637,9 @@ export class AgentSession {
 							});
 							if (
 								cancellationSignal?.aborted ||
-								this.#abortAdmissionEpoch !== abortEpoch ||
+								this.#isDisposed ||
+								this.#sessionAdmissionClosing ||
+								this.#abortAdmissionEpoch !== attemptAbortEpoch ||
 								this.#fallbackTransitionGeneration !== transitionGeneration
 							) {
 								await restoreOwnedTransition();
@@ -19641,7 +19658,7 @@ export class AgentSession {
 					};
 				}
 				controller.advance();
-				if (this.#abortAdmissionEpoch !== abortEpoch || cancellationSignal?.aborted)
+				if (attemptCancelled() || cancellationSignal?.aborted)
 					return { type: "terminal", terminal: { stopReason: "cancelled" } };
 				this.#defaultFallbackExhaustedLastTurn = true;
 				return this.#managedFallbackExhaustionDecision(
@@ -19653,7 +19670,7 @@ export class AgentSession {
 			return {
 				type: "retry",
 				continuation: async ownership => {
-					if (!ownership.isCurrent() || ownership.lease.signal.aborted) return;
+					if (attemptCancelled() || !ownership.isCurrent() || ownership.lease.signal.aborted) return;
 					await this.agent.continue({
 						...this.#managedFallbackPromptOptions(),
 						transientRecoveryMessage: this.#escapedNonAsciiRecoveryMessage(),
@@ -19672,7 +19689,7 @@ export class AgentSession {
 			return {
 				type: "maintenance",
 				continuation: async ownership => {
-					if (!ownership.isCurrent() || ownership.lease.signal.aborted) return;
+					if (attemptCancelled() || !ownership.isCurrent() || ownership.lease.signal.aborted) return;
 					const resourceRunId = String(ownership.logicalRunId);
 					const previousLease = this.#postPromptLeases.get(resourceRunId);
 					this.#postPromptLeases.set(resourceRunId, ownership.lease);
@@ -19691,7 +19708,13 @@ export class AgentSession {
 							resourceRunId,
 							ownership.lease.signal,
 						);
-						if (terminalized || successorScheduled || !ownership.isCurrent() || ownership.lease.signal.aborted)
+						if (
+							terminalized ||
+							successorScheduled ||
+							attemptCancelled() ||
+							!ownership.isCurrent() ||
+							ownership.lease.signal.aborted
+						)
 							return;
 						this.agent.requestRunTerminal(ownership.handle.logicalRunId, {
 							stopReason: "error",
@@ -20134,6 +20157,9 @@ export class AgentSession {
 		scope?: AttemptScope,
 		scopeWasClean = this.#isRetryScopeClean(scope),
 	): Promise<boolean | ManagedAttemptDecision> {
+		const retryAbortEpoch = this.#abortAdmissionEpoch;
+		const retryCancelled = () =>
+			this.#isDisposed || this.#sessionAdmissionClosing || this.#abortAdmissionEpoch !== retryAbortEpoch;
 		const controller = this.#defaultFallbackChain();
 		const managedFallback = controller.chain.entries.length > 1;
 		const retrySettings = this.settings.getGroup("retry");
@@ -20145,6 +20171,9 @@ export class AgentSession {
 		const classification = this.#classifyErrorForRetry(message);
 		const localSnapshot = classification === "local_snapshot";
 		const localBufferOverflow = classification === "local_buffer_overflow";
+		if (retryCancelled()) {
+			return managedOutcome ? { type: "terminal", terminal: { stopReason: "cancelled" } } : false;
+		}
 		// A local machinery failure must never stay charged against the provider
 		// fallback budget, no matter which local exit follows (disabled retry,
 		// visible-content surface, bounded retry, exhaustion, or the immediate
@@ -20407,7 +20436,7 @@ export class AgentSession {
 				ownership?.domain.signal ??
 				(activePromptHandle ? this.#runCancellationDomains.lookup(activePromptHandle)?.signal : undefined);
 			if (ownership && (!ownership.isCurrent() || cancellationSignal?.aborted)) return;
-			const abortEpoch = this.#abortAdmissionEpoch;
+			if (retryCancelled()) return;
 			let quotaPoolExhausted = false;
 			if (managedFallback && !credentialRotated && !providerRetryCeilingReached) {
 				const mark = await this.#markFailedCredential(trigger);
@@ -20441,7 +20470,7 @@ export class AgentSession {
 						trigger.class,
 						attemptsUsed,
 						cancellationSignal,
-						abortEpoch,
+						retryAbortEpoch,
 						controllerStateBeforeAdvance,
 						previousModel,
 						previousThinkingLevel,
@@ -20451,7 +20480,7 @@ export class AgentSession {
 				}
 			}
 			if (ownership && (!ownership.isCurrent() || cancellationSignal?.aborted)) {
-				if (this.#abortAdmissionEpoch === abortEpoch) {
+				if (!retryCancelled()) {
 					await this.#restoreDefaultFallbackTransition(
 						controller,
 						controllerStateBeforeAdvance,
@@ -20461,7 +20490,7 @@ export class AgentSession {
 				}
 				return;
 			}
-			if (this.#abortAdmissionEpoch !== abortEpoch) {
+			if (retryCancelled()) {
 				controller.resetForNewTurn();
 				return;
 			}

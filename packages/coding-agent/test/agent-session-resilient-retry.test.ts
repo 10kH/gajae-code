@@ -2511,6 +2511,7 @@ describe("AgentSession resilient retry", () => {
 	});
 	it("disposal cancels a pending idle-stall retry before closing admission", async () => {
 		const retryStarted = Promise.withResolvers<void>();
+		const requestedModels: string[] = [];
 		session = buildSession({
 			responses: [{ throw: "Anthropic stream stalled while waiting for the next event" }],
 			settingsOverrides: {
@@ -2518,7 +2519,9 @@ describe("AgentSession resilient retry", () => {
 				"retry.maxDelayMs": 60_000,
 				"retry.maxRetries": 2,
 			},
+			requestedModels,
 		});
+		const { retryStartEvents, retryEndEvents } = track(session);
 		session.subscribe(event => {
 			if (event.type === "auto_retry_start") retryStarted.resolve();
 		});
@@ -2528,6 +2531,11 @@ describe("AgentSession resilient retry", () => {
 		const disposed = await Promise.race([session.dispose().then(() => true), Bun.sleep(1_000).then(() => false)]);
 		expect(disposed).toBe(true);
 		await prompt;
+		expect(requestedModels).toHaveLength(1);
+		expect(retryStartEvents).toHaveLength(1);
+		expect(retryEndEvents).toEqual([expect.objectContaining({ success: false, attempt: 1 })]);
+		expect(session.isRetrying).toBe(false);
+		expect(session.isStreaming).toBe(false);
 		session = undefined;
 	});
 	it("bounds repeated provider stream idle stalls by retry.maxRetries", async () => {
