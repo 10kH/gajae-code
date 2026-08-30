@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.15.6] - 2026-08-30
+
 ### Fixed
 
 - Composer file autocomplete now keeps the `@` fuzzy/chosung path reachable from explicit Tab and while Korean query characters are typed, without changing ordinary path-prefix completion.

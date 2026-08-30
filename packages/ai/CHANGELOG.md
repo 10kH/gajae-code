@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.15.6] - 2026-08-30
+
 ### Added
 
 - `AuthGatewayServerOptions` now requires `providerScope`; `AuthGatewayBootOptions` requires the provider-filtered `listModels` callback and an exact-catalog-object `resolveModel`. Direct `@gajae-code/ai` callers must construct one gateway instance per provider and pass a provider-filtered source catalog. This matches the mandatory `--provider=<id>` CLI migration and prevents cross-provider model and credential ambiguity.
