@@ -261,6 +261,33 @@ describe("AgentSession managed fallback cancellation completion", () => {
 		markUsageLimitReached.mockRestore();
 	});
 
+	it("cancels a hidden next-turn continuation waiting behind startup", async () => {
+		const calls: string[] = [];
+		createSession((model, context, options) => {
+			calls.push(selector(model));
+			return createMockModel({ responses: [{ content: ["must not run"] }] }).stream(model, context, options);
+		});
+		const startupBarrier = Promise.withResolvers<void>();
+		session!.extendStartupTurnBarrier(startupBarrier.promise);
+		session!.queueDeferredMessageForTests(
+			{
+				role: "custom",
+				customType: "test-hidden-disposal",
+				content: [{ type: "text", text: "hidden successor" }],
+				display: false,
+				details: {},
+				timestamp: Date.now(),
+			},
+			true,
+		);
+		await Bun.sleep(10);
+
+		await session!.dispose();
+
+		expect(calls).toHaveLength(0);
+		expect(session!.getPendingNextTurnMessagesForTests()).toHaveLength(0);
+	});
+
 	it("abandons the overflow-maintenance handoff before any continuation provider call", async () => {
 		const calls: string[] = [];
 		createSession((model, _context, _options) => {

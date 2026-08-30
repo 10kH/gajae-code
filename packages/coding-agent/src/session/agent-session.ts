@@ -2848,6 +2848,7 @@ export class AgentSession {
 	readonly #asyncJobProviderSessionId: string | undefined;
 	#isDisposed = false;
 	#disposePromise: Promise<void> | undefined;
+	readonly #disposeAbortController = new AbortController();
 	#disposeAdmissionClosed: Promise<void> | undefined;
 	#disposePostPromptDrain: Promise<void> | undefined;
 	readonly #toolSessionCleanups = new Set<() => Promise<void> | void>();
@@ -3244,10 +3245,10 @@ export class AgentSession {
 		return { entry, capability: entry.continuationCapability };
 	}
 
-	async #awaitStartupTurnBarrier(): Promise<void> {
+	async #awaitStartupTurnBarrier(signal?: AbortSignal): Promise<void> {
 		const barrier = this.#startupTurnBarrier;
 		if (!barrier) return;
-		await barrier;
+		await awaitPromptInvocationPreflight(barrier, signal);
 		if (this.#startupTurnBarrier === barrier) this.#startupTurnBarrier = undefined;
 	}
 	extendStartupTurnBarrier(barrier: Promise<void>): void {
@@ -4155,8 +4156,20 @@ export class AgentSession {
 				if (dropped.length > 0) this.#settleDeliveredOwnedRegistrations(dropped);
 				const first = survivors[0];
 				if (!first) return;
-				await this.#awaitStartupTurnBarrier();
-				if (this.#isDisposed) return;
+				const settleIfDisposing = (): boolean => {
+					if (!this.#isDisposed && !this.#sessionAdmissionClosing && !this.#disposeAbortController.signal.aborted)
+						return false;
+					this.#settleDeliveredOwnedRegistrations(survivors);
+					return true;
+				};
+				if (settleIfDisposing()) return;
+				try {
+					await this.#awaitStartupTurnBarrier(this.#disposeAbortController.signal);
+				} catch {
+					settleIfDisposing();
+					return;
+				}
+				if (settleIfDisposing()) return;
 				// A user prompt may have started during the barrier/scheduling
 				// delay: if the session is now streaming, mutating the epoch and
 				// lineage here would corrupt the ACTIVE user turn (and
@@ -6822,7 +6835,7 @@ export class AgentSession {
 									settleLease();
 									return;
 								}
-								await this.#awaitStartupTurnBarrier();
+								await this.#awaitStartupTurnBarrier(scheduledSignal);
 								if (!canContinue()) {
 									settleLease();
 									return;
@@ -8394,8 +8407,12 @@ export class AgentSession {
 		this.#disposePromise = promise;
 		this.#abortAdmissionEpoch++;
 		this.#isDisposed = true;
+		this.#disposeAbortController.abort();
 		this.#disposeAdmissionClosed = this.#closeSessionAdmission();
 		this.#disposePostPromptDrain = this.#cancelPostPromptTasks();
+		this.#settleDeliveredOwnedRegistrations(this.#pendingNextTurnMessages.map(entry => entry.message));
+		this.#pendingNextTurnMessages = [];
+		this.#scheduledHiddenNextTurnGeneration = undefined;
 		this.#abortActiveMidRunBarriers();
 		this.abortCompaction();
 		this.abortRetry();
@@ -12227,7 +12244,16 @@ export class AgentSession {
 		}
 		this.#scheduledHiddenNextTurnGeneration = generation;
 		this.#schedulePostPromptTask(
-			async () => {
+			async signal => {
+				if (signal.aborted || this.#isDisposed || this.#sessionAdmissionClosing) return;
+				if (this.#startupTurnBarrier) {
+					try {
+						await this.#awaitStartupTurnBarrier(signal);
+					} catch {
+						return;
+					}
+				}
+				if (signal.aborted || this.#isDisposed || this.#sessionAdmissionClosing) return;
 				if (this.#scheduledHiddenNextTurnGeneration === generation) {
 					this.#scheduledHiddenNextTurnGeneration = undefined;
 				}
@@ -12256,8 +12282,12 @@ export class AgentSession {
 					return;
 				}
 				try {
-					await this.#promptQueuedHiddenNextTurnMessages();
+					await this.#promptQueuedHiddenNextTurnMessages(signal);
 				} catch {
+					if (signal.aborted || this.#isDisposed || this.#sessionAdmissionClosing) {
+						this.#pendingNextTurnMessages = [];
+						return;
+					}
 					// Leave the hidden next-turn messages queued for the next explicit prompt.
 				}
 			},
@@ -12272,7 +12302,7 @@ export class AgentSession {
 		);
 	}
 
-	async #promptQueuedHiddenNextTurnMessages(): Promise<void> {
+	async #promptQueuedHiddenNextTurnMessages(signal?: AbortSignal): Promise<void> {
 		if (this.#pendingNextTurnMessages.length === 0) {
 			return;
 		}
@@ -12302,6 +12332,10 @@ export class AgentSession {
 		if (reclassified.length === 0) {
 			return;
 		}
+		if (signal?.aborted || this.#isDisposed || this.#sessionAdmissionClosing) {
+			this.#settleDeliveredOwnedRegistrations(reclassified.map(entry => entry.message));
+			return;
+		}
 		// Allocate a fresh root-turn lineage when the drained batch contains a
 		// fresh owned envelope OR an EXTERNAL hidden trigger: an external
 		// nextTurn message has no owned envelope, so without this it would
@@ -12323,11 +12357,20 @@ export class AgentSession {
 		const textContent = this.#getCustomMessageTextContent(message);
 		await this.#syncSkillPromptActiveStateSafely(message, true);
 		try {
+			if (signal?.aborted || this.#isDisposed || this.#sessionAdmissionClosing) {
+				this.#settleDeliveredOwnedRegistrations(reclassified.map(entry => entry.message));
+				return;
+			}
 			await this.#promptWithMessage(message, textContent, {
 				prependMessages,
 				skipPostPromptRecoveryWait: true,
+				preflightSignal: signal,
 			});
 		} catch (error) {
+			if (signal?.aborted || this.#isDisposed || this.#sessionAdmissionClosing) {
+				this.#settleDeliveredOwnedRegistrations(reclassified.map(entry => entry.message));
+				return;
+			}
 			// Requeue only the SURVIVING reclassified entries: a completion
 			// denied by scope:"owned" was settled (dropped) above and must
 			// never reach a later prompt — once its scope and now-unoccupied
