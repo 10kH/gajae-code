@@ -6,7 +6,12 @@ import { exactUnlink } from "@gajae-code/natives";
 import { isEnoent, logger, postmortem } from "@gajae-code/utils";
 
 const BLOB_PREFIX = "blob:sha256:";
+const CANONICAL_BLOB_NAME = /^[0-9a-f]{64}$/;
 const TAKE_BLOB_BUFFER_OWNERSHIP = Symbol("takeBlobBufferOwnership");
+
+function isCanonicalBlobHash(hash: string): boolean {
+	return hash.length === 64 && CANONICAL_BLOB_NAME.test(hash);
+}
 
 /**
  * Owner-only permissions for on-disk blob directories and files.
@@ -1126,6 +1131,7 @@ export class BlobStore {
 
 	/** Read blob by hash, returns Buffer or null if not found. */
 	async get(hash: string): Promise<Buffer | null> {
+		if (!isCanonicalBlobHash(hash)) return null;
 		const blobPath = path.join(this.dir, hash);
 		try {
 			const file = Bun.file(blobPath);
@@ -1139,6 +1145,7 @@ export class BlobStore {
 
 	/** Synchronously read blob by hash, returns Buffer or null if not found. */
 	getSync(hash: string): Buffer | null {
+		if (!isCanonicalBlobHash(hash)) return null;
 		const blobPath = path.join(this.dir, hash);
 		try {
 			return fs.readFileSync(blobPath);
@@ -1155,6 +1162,7 @@ export class BlobStore {
 
 	/** Synchronously read blob by hash and verify its content hash; returns null if not found. */
 	getCheckedSync(hash: string): Buffer | null {
+		if (!isCanonicalBlobHash(hash)) return null;
 		const blobPath = path.join(this.dir, hash);
 		try {
 			return verifyBlobFileSync(hash, blobPath);
@@ -1166,6 +1174,7 @@ export class BlobStore {
 
 	/** Check if a blob exists. */
 	async has(hash: string): Promise<boolean> {
+		if (!isCanonicalBlobHash(hash)) return false;
 		try {
 			await fsp.access(path.join(this.dir, hash));
 			return true;
@@ -1321,6 +1330,7 @@ export class EphemeralBlobStore extends BlobStore {
 	}
 
 	getSync(hash: string): Buffer | null {
+		if (!isCanonicalBlobHash(hash)) return null;
 		const cached = this.#bufferCache.get(hash);
 		if (cached) {
 			const blobPath = path.join(this.dir, hash);
@@ -1374,7 +1384,7 @@ export class EphemeralBlobStore extends BlobStore {
 				const blobPath = path.join(this.dir, entry);
 				const stat = fs.lstatSync(blobPath);
 				if (
-					!/^[a-f0-9]{64}$/.test(entry) ||
+					!isCanonicalBlobHash(entry) ||
 					!stat.isFile() ||
 					stat.isSymbolicLink() ||
 					stat.uid !== uid ||
@@ -1534,13 +1544,14 @@ export class ResidentBlobMissingError extends Error {
 
 /** Check if a data string is a blob reference. */
 export function isBlobRef(data: string): boolean {
-	return data.startsWith(BLOB_PREFIX);
+	return parseBlobRef(data) !== null;
 }
 
 /** Extract the SHA-256 hash from a blob reference string. */
 export function parseBlobRef(data: string): string | null {
 	if (!data.startsWith(BLOB_PREFIX)) return null;
-	return data.slice(BLOB_PREFIX.length);
+	const hash = data.slice(BLOB_PREFIX.length);
+	return isCanonicalBlobHash(hash) ? hash : null;
 }
 
 /** Identify provider transport image data URLs so persistence can externalize and restore them losslessly. */
@@ -1731,7 +1742,6 @@ export interface CanonicalBlobEntry {
 	readonly nlink: bigint;
 }
 
-const CANONICAL_BLOB_NAME = /^[0-9a-f]{64}$/;
 const BLOB_REFERENCE = /blob:sha256:([0-9a-f]{64})/g;
 
 /** Longest possible `blob:sha256:<hash>` reference, used to bound chunked scans. */
@@ -1758,7 +1768,7 @@ export async function listCanonicalBlobs(dir: string): Promise<CanonicalBlobEntr
 
 	const entries: CanonicalBlobEntry[] = [];
 	for (const name of names) {
-		if (!CANONICAL_BLOB_NAME.test(name)) continue;
+		if (!isCanonicalBlobHash(name)) continue;
 		const blobPath = path.join(dir, name);
 		let stat: fs.BigIntStats;
 		try {
