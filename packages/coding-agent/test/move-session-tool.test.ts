@@ -9,6 +9,8 @@ import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "@gajae-code/coding-agent/session/messages";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { Snowflake } from "@gajae-code/utils";
+import { sessionRuntimeDir } from "../src/gjc-runtime/session-layout";
+import { persistCoordinatorRuntimeStateFromEvent } from "../src/gjc-runtime/session-state-sidecar";
 import { syncSkillActiveState } from "../src/skill-state/active-state";
 import { moveSessionToolRenderer } from "../src/tools/move-session";
 
@@ -86,6 +88,46 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 			const bashTool = session.getToolByName("bash")!;
 			const pwd = await bashTool.execute("pwd-after-move-session", { command: "pwd" });
 			expect(textContent(pwd)).toContain(cwdB);
+		} finally {
+			await session.dispose();
+		}
+	}, 20_000);
+
+	it("issue-4629: a committed move relocates coordinator runtime state to the new cwd (shared moveTo seam)", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const cwdB = path.join(cwdA, "repo-b");
+		fs.mkdirSync(cwdB, { recursive: true });
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"] });
+		try {
+			const sessionId = session.sessionId;
+			// A running marker at the launch root (as a live turn would have written).
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "agent_start" },
+				{ sessionId, cwd: cwdA, sessionFile: sessionManager.getSessionFile() ?? null },
+			);
+			const launcherFile = path.join(sessionRuntimeDir(cwdA, sessionId), "runtime-state.json");
+			const targetFile = path.join(sessionRuntimeDir(cwdB, sessionId), "runtime-state.json");
+			expect(fs.existsSync(launcherFile)).toBe(true);
+
+			await session.getToolByName("move_session")!.execute("move-relocates-state", { path: "repo-b" });
+			expect(sessionManager.getCwd()).toBe(cwdB);
+
+			// The after-move listener migrated the payload to the new cwd and cleared the orphan.
+			expect(fs.existsSync(launcherFile)).toBe(false);
+			const migrated = JSON.parse(fs.readFileSync(targetFile, "utf8")) as Record<string, unknown>;
+			expect(migrated.cwd).toBe(path.resolve(cwdB));
+
+			// The persist that was previously fenced now succeeds at the new cwd.
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "turn_start" },
+				{ sessionId, cwd: cwdB, sessionFile: sessionManager.getSessionFile() ?? null },
+			);
+			expect((JSON.parse(fs.readFileSync(targetFile, "utf8")) as Record<string, unknown>).cwd).toBe(
+				path.resolve(cwdB),
+			);
 		} finally {
 			await session.dispose();
 		}

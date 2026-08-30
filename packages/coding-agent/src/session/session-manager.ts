@@ -7301,6 +7301,15 @@ export class SessionManager {
 	#cwdTransitionOwner: symbol | undefined;
 	#cwdReadLeaseOwner = Symbol("cwd-read-lease-owner");
 	#cwdGeneration = 0;
+	/**
+	 * Listeners invoked after every committed `moveTo`, for every move surface
+	 * (`move_session`, TUI `/move`, SDK/ACP `session.cwd.move`). They receive the previous
+	 * and new cwd and the previous session file, and run best-effort: a listener throw is
+	 * logged and never turns an already-durable move into a rejection.
+	 */
+	#afterMoveListeners = new Set<
+		(move: { previousCwd: string; newCwd: string; previousSessionFile: string | undefined }) => void | Promise<void>
+	>();
 	/** Number of tool executions currently holding a shared read lease on `cwd`. */
 	#cwdReaderCount = 0;
 	/** Resolved when the last outstanding read lease is released. */
@@ -10732,6 +10741,38 @@ export class SessionManager {
 		return this.#cwdGeneration;
 	}
 
+	/**
+	 * Register a listener invoked after every committed `moveTo`. Returns an idempotent
+	 * unregister handle. Every move surface funnels through `moveTo`, so a single
+	 * registration covers `move_session`, `/move`, and SDK/ACP `session.cwd.move`.
+	 */
+	registerAfterMoveListener(
+		listener: (move: {
+			previousCwd: string;
+			newCwd: string;
+			previousSessionFile: string | undefined;
+		}) => void | Promise<void>,
+	): () => void {
+		this.#afterMoveListeners.add(listener);
+		return () => {
+			this.#afterMoveListeners.delete(listener);
+		};
+	}
+
+	async #runAfterMoveListeners(move: {
+		previousCwd: string;
+		newCwd: string;
+		previousSessionFile: string | undefined;
+	}): Promise<void> {
+		for (const listener of [...this.#afterMoveListeners]) {
+			try {
+				await listener(move);
+			} catch (error) {
+				logger.warn("after-move listener failed", { error: String(error), cwd: move.newCwd });
+			}
+		}
+	}
+
 	#ownsCwdTransition(): boolean {
 		const owner = this.#cwdTransitionOwner;
 		return owner !== undefined && cwdTransitionAls.getStore() === owner;
@@ -11130,6 +11171,13 @@ export class SessionManager {
 		if (this.#sessionFile) {
 			writeTerminalBreadcrumb(resolvedCwd, this.#sessionFile);
 		}
+		// The move is fully committed here; notify every surface's after-move listeners
+		// (coordinator runtime-state relocation, postmortem finalizer rebinding, ...).
+		await this.#runAfterMoveListeners({
+			previousCwd,
+			newCwd: resolvedCwd,
+			previousSessionFile,
+		});
 	}
 
 	/** Sync version for initial creation (no existing writer to close). */

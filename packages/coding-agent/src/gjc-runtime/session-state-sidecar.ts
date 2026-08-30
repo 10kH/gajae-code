@@ -636,6 +636,12 @@ export interface RuntimeStateContext {
 	ownerTerminal?: OwnerTerminalContext | null;
 	/** Internal fail-closed marker set only when managed owner metadata is malformed or missing. */
 	ownerTerminalMetadataInvalid?: boolean;
+	/**
+	 * The session file as it was BEFORE a committed rescope, used only by
+	 * {@link relocateCoordinatorRuntimeStateForRescope} to authenticate the predecessor
+	 * payload against its old identity. Absent outside a move.
+	 */
+	previousSessionFile?: string | null;
 }
 
 interface RuntimeStateIdentity {
@@ -1676,6 +1682,129 @@ export async function persistCoordinatorWorkerIntegrationOutcome(
 								: {}),
 						};
 						await writeStateFileSync(stateFile, payload, identity.sidecarKeyId);
+					}),
+			),
+	);
+}
+
+/**
+ * The old identity a rescued predecessor payload must authenticate against: the launch-root
+ * cwd and the session file as they were BEFORE the move. Signed mode still requires the
+ * predecessor's key id and signature; unsigned mode requires an exact cwd/workdir/session
+ * file match. Reusing {@link normalizedIdentity} keeps the platform, key-id, and path
+ * resolution rules byte-identical with the persist path's fence.
+ */
+function previousRescopeIdentity(context: RuntimeStateContext, previousCwd: string): RuntimeStateIdentity {
+	return normalizedIdentity({
+		sessionId: context.sessionId,
+		cwd: previousCwd,
+		sessionFile: context.previousSessionFile ?? context.sessionFile ?? null,
+		platform: context.platform,
+	});
+}
+
+/**
+ * Repairs the coordinator-shared runtime state after a committed cwd rescope, for every
+ * move surface (`move_session`, TUI `/move`, SDK/ACP `session.cwd.move`) through the one
+ * shared {@link SessionManager.moveTo} seam.
+ *
+ * The identity fence in {@link assertPreviousRuntimeStateIdentity} rejects any write whose
+ * predecessor payload records a different cwd/workdir than the live session. A rescope
+ * changes the session cwd but leaves the predecessor payload pointing at the launch root,
+ * so every later persist for the session would be refused as a foreign marker.
+ *
+ * The predecessor is fully authenticated against its OLD identity before it is trusted:
+ * signed mode verifies the predecessor's key id and Ed25519 signature; unsigned mode
+ * requires an exact old cwd/workdir/session-file match (the same checks the fence applies).
+ * Only a predecessor that passes is rewritten to the new identity and re-signed. When the
+ * state file is cwd-derived rather than pinned by
+ * {@link GJC_COORDINATOR_SESSION_STATE_FILE_ENV}, the payload is migrated to the new path
+ * and the orphaned launch-root file is removed. A payload already self-healed at the new
+ * cwd is left untouched.
+ *
+ * Both the old and new cwd-derived paths are locked (new first, then old) so a concurrent
+ * writer at either path serializes behind this repair. Best-effort by contract: the move
+ * is already durable, so a failure here is logged by the caller and never resurfaced as a
+ * rescope rejection.
+ */
+export async function relocateCoordinatorRuntimeStateForRescope(
+	context: RuntimeStateContext,
+	previousCwd: string,
+): Promise<void> {
+	const newStateFile = runtimeStateFileForContext(context);
+	if (!newStateFile) return;
+	const identity = normalizedIdentity(context);
+	const oldIdentity = previousRescopeIdentity(context, previousCwd);
+	const explicitStateFile = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
+	// A pinned state file never moves with the cwd; a cwd-derived one lives under the
+	// per-session runtime directory rooted at the (now former) cwd.
+	const oldStateFile = explicitStateFile
+		? newStateFile
+		: path.join(sessionRuntimeDir(path.resolve(previousCwd), identity.sessionId), "runtime-state.json");
+	const samePath = sameResolvedPath(oldStateFile, newStateFile, identity.platform);
+	// Authenticate and rewrite the migrated payload under the new-path critical section, then
+	// (for a distinct old path) authenticate and clear the launch-root file under its own
+	// critical section. Locking the new path first is a fixed order shared with the persist
+	// path, so two rescopes or a rescope racing a persist cannot deadlock.
+	const migrate = async (): Promise<void> => {
+		const destination = readPreviousPayload(newStateFile);
+		// The cwd-derived path may already hold a fresh payload seeded at the new cwd (the
+		// first post-move event self-healed there); that current payload is authoritative and
+		// must not be clobbered with the predecessor's state.
+		if (
+			!samePath &&
+			destination.session_id === identity.sessionId &&
+			typeof destination.cwd === "string" &&
+			sameResolvedPath(destination.cwd, identity.cwd, identity.platform)
+		) {
+			return;
+		}
+		const source = samePath ? destination : readPreviousPayload(oldStateFile);
+		if (Object.keys(source).length === 0) return;
+		// Trust the predecessor only if it authenticates against its OLD identity. A payload
+		// whose signature, key, or old cwd/session-file does not match is left untouched \u2014 the
+		// fence, not this repair, remains the authority for a foreign marker.
+		try {
+			assertPreviousRuntimeStateIdentity(source, oldIdentity);
+		} catch {
+			return;
+		}
+		const migrated = {
+			...source,
+			cwd: identity.cwd,
+			workdir: identity.workdir,
+			session_file: identity.sessionFile,
+			branch: branchForContext(context),
+			source: "session_rescope",
+			event: "move_session",
+			updated_at: new Date().toISOString(),
+		};
+		await writeStateFileSync(newStateFile, migrated, identity.sidecarKeyId);
+	};
+	await serializeStateFileWrite(
+		newStateFile,
+		async () =>
+			await withCoordinatorTransactionLock(newStateFile, async () => await withStateFileLock(newStateFile, migrate)),
+	);
+	if (samePath) return;
+	// Remove the orphaned launch-root file so a cwd-scoped coordinator scan of the old root
+	// no longer sees a stale running marker for this session \u2014 but only when it is genuinely
+	// this session's authenticated predecessor.
+	await serializeStateFileWrite(
+		oldStateFile,
+		async () =>
+			await withCoordinatorTransactionLock(
+				oldStateFile,
+				async () =>
+					await withStateFileLock(oldStateFile, async () => {
+						const orphan = readPreviousPayload(oldStateFile);
+						if (Object.keys(orphan).length === 0) return;
+						try {
+							assertPreviousRuntimeStateIdentity(orphan, oldIdentity);
+						} catch {
+							return;
+						}
+						await fs.rm(oldStateFile, { force: true }).catch(() => {});
 					}),
 			),
 	);

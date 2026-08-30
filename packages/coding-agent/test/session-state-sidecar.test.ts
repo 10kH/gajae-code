@@ -30,6 +30,7 @@ import {
 	persistCoordinatorWorkerIntegrationOutcome,
 	publicRuntimeToolActivity,
 	readTerminalRuntimeStateMarker,
+	relocateCoordinatorRuntimeStateForRescope,
 	stateForEvent,
 } from "../src/gjc-runtime/session-state-sidecar";
 import {
@@ -2502,6 +2503,202 @@ describe("coordinator runtime state sidecar", () => {
 				sessionFile: path.join(root, "session.jsonl"),
 			}),
 		).rejects.toThrow();
+	});
+
+	it("issue-4629: cwd-derived rescope migrates the payload, clears the orphan, and unblocks later persists", async () => {
+		// No GJC_COORDINATOR_SESSION_STATE_FILE: the state file is cwd-derived and lives
+		// under the per-session runtime dir rooted at the cwd. move_session changes the cwd
+		// but leaves the predecessor payload pointing at the launch root, so the next persist
+		// would be refused as a foreign marker until the payload is relocated.
+		delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
+		const root = await tempRoot();
+		const sessionId = "rescope-cwd-derived";
+		const launcher = path.join(root, "launcher");
+		const target = path.join(launcher, "sub");
+		await fs.mkdir(target, { recursive: true });
+		const launcherFile = path.join(sessionRuntimeDir(launcher, sessionId), "runtime-state.json");
+		const targetFile = path.join(sessionRuntimeDir(target, sessionId), "runtime-state.json");
+
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "agent_start" },
+			{ sessionId, cwd: launcher, sessionFile: null },
+		);
+		expect((await readPayload(launcherFile)).cwd).toBe(path.resolve(launcher));
+
+		await relocateCoordinatorRuntimeStateForRescope({ sessionId, cwd: target, sessionFile: null }, launcher);
+
+		const migrated = await readPayload(targetFile);
+		expect(migrated.cwd).toBe(path.resolve(target));
+		expect(migrated.workdir).toBe(path.resolve(target));
+		expect(migrated.source).toBe("session_rescope");
+		expect(fsSync.existsSync(launcherFile)).toBe(false);
+
+		// The terminal persist that previously threw now succeeds against the new cwd.
+		await persistCoordinatorRuntimeStateFromEvent(assistantEnd("done"), {
+			sessionId,
+			cwd: target,
+			sessionFile: null,
+		});
+		expect((await readPayload(targetFile)).state).toBe("completed");
+	});
+
+	it("issue-4629: cwd-derived rescope preserves a payload already self-healed at the new cwd", async () => {
+		// If the first post-move event already seeded a fresh payload at the new cwd, the
+		// relocation must not clobber that current state with the stale predecessor.
+		delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
+		const root = await tempRoot();
+		const sessionId = "rescope-self-healed";
+		const launcher = path.join(root, "launcher");
+		const target = path.join(launcher, "sub");
+		await fs.mkdir(target, { recursive: true });
+		const targetFile = path.join(sessionRuntimeDir(target, sessionId), "runtime-state.json");
+
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "agent_start" },
+			{ sessionId, cwd: launcher, sessionFile: null },
+		);
+		// A post-move event self-heals at the new cwd first.
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "turn_start" },
+			{ sessionId, cwd: target, sessionFile: null },
+		);
+		const beforeRelocate = await readPayload(targetFile);
+		expect(beforeRelocate.event).toBe("turn_start");
+
+		await relocateCoordinatorRuntimeStateForRescope({ sessionId, cwd: target, sessionFile: null }, launcher);
+
+		const afterRelocate = await readPayload(targetFile);
+		expect(afterRelocate.event).toBe("turn_start");
+		expect(afterRelocate.cwd).toBe(path.resolve(target));
+	});
+
+	it("issue-4629: pinned-path rescope rewrites the predecessor identity in place", async () => {
+		// A pinned GJC_COORDINATOR_SESSION_STATE_FILE never moves with the cwd, so the
+		// predecessor payload is rewritten in place to the new cwd.
+		const root = await tempRoot();
+		const stateFile = path.join(root, "pinned-runtime-state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		const sessionId = "rescope-pinned";
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = sessionId;
+		const launcher = path.join(root, "launcher");
+		const target = path.join(launcher, "sub");
+		await fs.mkdir(target, { recursive: true });
+
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "agent_start" },
+			{ sessionId, cwd: launcher, sessionFile: null },
+		);
+		expect((await readPayload(stateFile)).cwd).toBe(path.resolve(launcher));
+
+		await relocateCoordinatorRuntimeStateForRescope({ sessionId, cwd: target, sessionFile: null }, launcher);
+		expect((await readPayload(stateFile)).cwd).toBe(path.resolve(target));
+
+		// The persist that would previously have been fenced now succeeds.
+		await persistCoordinatorRuntimeStateFromEvent(assistantEnd("done"), {
+			sessionId,
+			cwd: target,
+			sessionFile: null,
+		});
+		expect((await readPayload(stateFile)).state).toBe("completed");
+	});
+
+	it("issue-4629: rescope does not migrate a predecessor that fails old-identity authentication", async () => {
+		// A payload at the old path whose recorded cwd/session_file does not match the claimed
+		// pre-move identity is a foreign/tampered marker. Relocation must leave both paths
+		// untouched rather than laundering it into an authoritative payload at the new cwd.
+		delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
+		const root = await tempRoot();
+		const sessionId = "rescope-tamper";
+		const launcher = path.join(root, "launcher");
+		const target = path.join(launcher, "sub");
+		await fs.mkdir(target, { recursive: true });
+		const launcherFile = path.join(sessionRuntimeDir(launcher, sessionId), "runtime-state.json");
+		const targetFile = path.join(sessionRuntimeDir(target, sessionId), "runtime-state.json");
+		await fs.mkdir(path.dirname(launcherFile), { recursive: true });
+
+		// Predecessor records a DIFFERENT cwd than the claimed pre-move launcher cwd.
+		const foreign = {
+			schema_version: 1,
+			session_id: sessionId,
+			state: "running",
+			ready_for_input: false,
+			live: true,
+			cwd: path.join(root, "somewhere-else"),
+			workdir: path.join(root, "somewhere-else"),
+			session_file: null,
+			updated_at: "2026-08-12T00:00:00.000Z",
+		};
+		await Bun.write(launcherFile, `${JSON.stringify(foreign)}\n`);
+		const before = await Bun.file(launcherFile).text();
+
+		await relocateCoordinatorRuntimeStateForRescope({ sessionId, cwd: target, sessionFile: null }, launcher);
+
+		// Neither migrated to the new path nor removed from the old path.
+		expect(fsSync.existsSync(targetFile)).toBe(false);
+		expect(await Bun.file(launcherFile).text()).toBe(before);
+	});
+
+	it("issue-4629: rescope does not touch a foreign session_id at either path", async () => {
+		delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
+		const root = await tempRoot();
+		const sessionId = "rescope-owner";
+		const launcher = path.join(root, "launcher");
+		const target = path.join(launcher, "sub");
+		await fs.mkdir(target, { recursive: true });
+		const launcherFile = path.join(sessionRuntimeDir(launcher, sessionId), "runtime-state.json");
+		await fs.mkdir(path.dirname(launcherFile), { recursive: true });
+		const otherSession = {
+			schema_version: 1,
+			session_id: "a-different-session",
+			state: "running",
+			ready_for_input: false,
+			live: true,
+			cwd: path.resolve(launcher),
+			workdir: path.resolve(launcher),
+			session_file: null,
+			updated_at: "2026-08-12T00:00:00.000Z",
+		};
+		await Bun.write(launcherFile, `${JSON.stringify(otherSession)}\n`);
+		const before = await Bun.file(launcherFile).text();
+
+		await relocateCoordinatorRuntimeStateForRescope({ sessionId, cwd: target, sessionFile: null }, launcher);
+
+		expect(fsSync.existsSync(path.join(sessionRuntimeDir(target, sessionId), "runtime-state.json"))).toBe(false);
+		expect(await Bun.file(launcherFile).text()).toBe(before);
+	});
+
+	it("issue-4629: a persist concurrent with relocation serializes without corrupting the new-cwd payload", async () => {
+		// Relocation and a racing persist both take the new-path critical section, so the
+		// result is one consistent payload keyed to the new cwd, never interleaved bytes.
+		delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
+		const root = await tempRoot();
+		const sessionId = "rescope-concurrent";
+		const launcher = path.join(root, "launcher");
+		const target = path.join(launcher, "sub");
+		await fs.mkdir(target, { recursive: true });
+		const targetFile = path.join(sessionRuntimeDir(target, sessionId), "runtime-state.json");
+
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "agent_start" },
+			{ sessionId, cwd: launcher, sessionFile: null },
+		);
+
+		await Promise.all([
+			relocateCoordinatorRuntimeStateForRescope({ sessionId, cwd: target, sessionFile: null }, launcher),
+			persistCoordinatorRuntimeStateFromEvent({ type: "turn_start" }, { sessionId, cwd: target, sessionFile: null }),
+		]);
+
+		// The file parses cleanly and is keyed to the new cwd regardless of interleaving.
+		const payload = await readPayload(targetFile);
+		expect(payload.session_id).toBe(sessionId);
+		expect(payload.cwd).toBe(path.resolve(target));
+		// And a subsequent persist at the new cwd still succeeds (fence unblocked).
+		await persistCoordinatorRuntimeStateFromEvent(assistantEnd("done"), {
+			sessionId,
+			cwd: target,
+			sessionFile: null,
+		});
+		expect((await readPayload(targetFile)).state).toBe("completed");
 	});
 
 	it("issue-4351: completed session reports ready_for_input false with authoritative ended_at", async () => {

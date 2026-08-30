@@ -319,6 +319,7 @@ import {
 	persistCoordinatorRuntimeStateFromEvent,
 	persistCoordinatorWorkerIntegrationOutcome,
 	registerCoordinatorRuntimeStateFinalizer,
+	relocateCoordinatorRuntimeStateForRescope,
 	UNPROVEN_TOOL_LABEL,
 } from "../gjc-runtime/session-state-sidecar";
 import {
@@ -2814,6 +2815,20 @@ export class AgentSession {
 	/** Idempotent unregister handle for this session's resource-GC registration. */
 	#unregisterResourceGc?: () => void;
 	#unregisterRuntimeStateFinalizer?: () => void;
+	#unregisterAfterMoveListener?: () => void;
+	/**
+	 * (Re)register the postmortem finalizer bound to the CURRENT cwd/session file. Called at
+	 * construction and after every committed rescope, so an unexpected exit writes terminal
+	 * state to the session's live location rather than the abandoned launch root.
+	 */
+	#registerRuntimeStateFinalizer(): void {
+		this.#unregisterRuntimeStateFinalizer?.();
+		this.#unregisterRuntimeStateFinalizer = registerCoordinatorRuntimeStateFinalizer({
+			sessionId: this.sessionId,
+			cwd: this.sessionManager.getCwd(),
+			sessionFile: this.sessionManager.getSessionFile(),
+		});
+	}
 	#unregisterSessionMemorySettings?: () => void;
 	/**
 	 * AsyncJobManager owned by this session (top-level only). Subagents leave
@@ -4047,10 +4062,23 @@ export class AgentSession {
 				cwd: () => this.sessionManager.getCwd(),
 			});
 		}
-		this.#unregisterRuntimeStateFinalizer = registerCoordinatorRuntimeStateFinalizer({
-			sessionId: this.sessionId,
-			cwd: this.sessionManager.getCwd(),
-			sessionFile: this.sessionManager.getSessionFile(),
+		this.#registerRuntimeStateFinalizer();
+		// Every committed rescope (`move_session`, `/move`, SDK/ACP `session.cwd.move`) funnels
+		// through SessionManager.moveTo, so one after-move listener covers all surfaces: it
+		// relocates the coordinator-shared runtime state to the new cwd (otherwise the identity
+		// fence refuses every later persist) and rebinds the postmortem finalizer, which
+		// otherwise keeps writing terminal state to the launch root's cwd/session file.
+		this.#unregisterAfterMoveListener = this.sessionManager.registerAfterMoveListener(async move => {
+			await relocateCoordinatorRuntimeStateForRescope(
+				{
+					sessionId: this.sessionId,
+					cwd: move.newCwd,
+					sessionFile: this.sessionManager.getSessionFile() ?? null,
+					previousSessionFile: move.previousSessionFile ?? null,
+				},
+				move.previousCwd,
+			);
+			this.#registerRuntimeStateFinalizer();
 		});
 		// Power assertions are taken per turn (see #beginInFlight); nothing acquired here.
 		this.#evalKernelOwnerId = config.evalKernelOwnerId ?? `agent-session:${Snowflake.next()}`;
@@ -8542,6 +8570,8 @@ export class AgentSession {
 		this.#unregisterSessionMemorySettings = undefined;
 		if (ownerTerminalContextFromEnvironment() === null) this.#unregisterRuntimeStateFinalizer?.();
 		this.#unregisterRuntimeStateFinalizer = undefined;
+		this.#unregisterAfterMoveListener?.();
+		this.#unregisterAfterMoveListener = undefined;
 		await releaseTabsForOwner(this.sessionManager.getSessionId()).catch((error: unknown) =>
 			logger.warn("session dispose: releaseTabsForOwner failed", { error }),
 		);
