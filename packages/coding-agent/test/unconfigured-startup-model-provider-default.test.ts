@@ -59,6 +59,17 @@ describe("unconfigured startup model prefers a curated provider default", () => 
 		);
 	});
 
+	test("preserves a custom provider when its flattened key collides with a provider default", () => {
+		const candidates = [
+			model("openrouter/openai", "gpt-5.4"),
+			model("openrouter", DEFAULT_MODEL_PER_PROVIDER.openrouter),
+		];
+
+		const ordered = orderByProviderDefaultFirst(candidates);
+
+		expect(ordered).toEqual([candidates[1], candidates[0]]);
+	});
+
 	test("keeps catalog order when no candidate is a curated provider default", () => {
 		const candidates = [
 			model("anthropic", "claude-3-5-sonnet-20240620"),

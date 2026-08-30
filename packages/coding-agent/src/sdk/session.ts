@@ -1299,19 +1299,19 @@ function findDeferredExactMcpToolNameCollisions(
 export function orderByProviderDefaultFirst(candidates: readonly Model[]): Model[] {
 	const preferred: Model[] = [];
 	const rest: Model[] = [];
-	const preferredKeys = new Set<string>();
+	const preferredCandidates = new Set<Model>();
 	for (const provider of Object.keys(DEFAULT_MODEL_PER_PROVIDER) as KnownProvider[]) {
 		const defaultId = DEFAULT_MODEL_PER_PROVIDER[provider];
 		for (const candidate of candidates) {
 			if (candidate.provider === provider && candidate.id === defaultId) {
 				preferred.push(candidate);
-				preferredKeys.add(`${candidate.provider}/${candidate.id}`);
+				preferredCandidates.add(candidate);
 			}
 		}
 	}
 	if (preferred.length === 0) return [...candidates];
 	for (const candidate of candidates) {
-		if (!preferredKeys.has(`${candidate.provider}/${candidate.id}`)) rest.push(candidate);
+		if (!preferredCandidates.has(candidate)) rest.push(candidate);
 	}
 	return [...preferred, ...rest];
 }
