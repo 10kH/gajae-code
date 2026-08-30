@@ -155,6 +155,8 @@ export interface ExtensionUIDialogOptions {
 	customInput?: {
 		optionLabel: string;
 		onSubmit: (text: string) => void;
+		/** Empty/whitespace-only submissions may be rejected by the selector. */
+		allowEmpty?: boolean;
 	};
 	/**
 	 * Inline free-text input for a non-answer clarification action. It is
@@ -534,6 +536,7 @@ export interface ExtensionContext {
 			onPreflightAcceptCommit?: () => void | Promise<void>;
 			onSkillPrepared?: (meta: { name: string; path: string; lineCount?: number; cleanedArgs?: string }) => void;
 			preflightSignal?: AbortSignal;
+			sdkRunCapability?: unknown;
 		},
 	): Promise<unknown>;
 	setPlanMode?(on: boolean): unknown;
@@ -752,6 +755,8 @@ export interface AgentStartEvent extends SharedAgentStartEvent {
 export interface AgentFailedEvent {
 	type: "agent_failed";
 	error: AgentFailureDiagnostic;
+	/** Internal SDK queue-owner binding for exact lifecycle attribution. */
+	sdkRunToken?: string;
 	/** Attempt correlation for the failing run, when scoped (matches the
 	 * agent_start/agent_end scope contract). */
 	scope?: AttemptScope;
@@ -1311,7 +1316,6 @@ export interface ExtensionAPI {
 			onDispatchDisposition?: (promotion: { startsOwnRun: boolean }) => void;
 			preflightSignal?: AbortSignal;
 			/** Internal SDK correlation owner for an exact queued follow-up. */
-			sdkRunToken?: string;
 		},
 	): Promise<void>;
 
@@ -1541,7 +1545,6 @@ export type SendUserMessageHandler = (
 		onQueuedPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
 		preflightSignal?: AbortSignal;
 		/** Internal SDK correlation owner for an exact queued follow-up. */
-		sdkRunToken?: string;
 	},
 ) => void | Promise<void>;
 
@@ -1703,6 +1706,7 @@ export interface ExtensionContextActions {
 			onPreflightAcceptCommit?: () => void | Promise<void>;
 			onSkillPrepared?: (meta: { name: string; path: string; lineCount?: number; cleanedArgs?: string }) => void;
 			preflightSignal?: AbortSignal;
+			sdkRunCapability?: unknown;
 		},
 	) => Promise<unknown>;
 	setPlanMode?: (on: boolean) => unknown;

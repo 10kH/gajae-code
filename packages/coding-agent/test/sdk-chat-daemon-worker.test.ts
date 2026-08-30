@@ -1309,6 +1309,9 @@ describe("chat daemon worker", () => {
 			root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-slack-production-host-"));
 			const agentDir = path.join(root, ".gjc", "agent");
 			const host = await startProductionSdkHost(root);
+			const endpointIdentity = await fs.stat(path.join(root, ".gjc", "state", "sdk", `${host.sessionId}.json`), {
+				bigint: true,
+			});
 			const index = await new SessionIndex(agentDir).open();
 			const config = {
 				identity: "fingerprint-only",
@@ -1380,6 +1383,13 @@ describe("chat daemon worker", () => {
 						endpointMtimeMs: host.endpointMtimeMs,
 						url: host.endpoint.url,
 						token: host.endpoint.token,
+						endpointIdentity: {
+							mtimeMs: host.endpointMtimeMs,
+							mtimeNs: endpointIdentity.mtimeNs,
+							ctimeNs: endpointIdentity.ctimeNs,
+							size: endpointIdentity.size,
+							ino: endpointIdentity.ino,
+						},
 					}),
 					updatedAt: Date.now(),
 					seenEventIds: [],
@@ -1392,6 +1402,7 @@ describe("chat daemon worker", () => {
 				const firstProvider = new FakeSlackProvider();
 				const firstRuntime = startRuntime(firstProvider);
 				await withStageTimeout("first runtime start", firstRuntime.start());
+				await withStageTimeout("first runtime admission", firstRuntime.reconcile({ waitForReplay: true }));
 				const firstCommandResult = firstProvider.waitForPostCount(1, post =>
 					post.text.includes('"operation":"todo.list"'),
 				);
@@ -1408,6 +1419,7 @@ describe("chat daemon worker", () => {
 					post.text.includes('"operation":"todo.list"'),
 				);
 				await withStageTimeout("restarted runtime start", restartedRuntime.start());
+				await withStageTimeout("restarted runtime admission", restartedRuntime.reconcile({ waitForReplay: true }));
 				await restartedProvider.handler?.(command("after-restart"));
 				await withStageTimeout("restarted Slack SDK result", restartedCommandResult);
 				expect(restartedProvider.posts.filter(post => post.text.includes('"operation":"todo.list"'))).toHaveLength(

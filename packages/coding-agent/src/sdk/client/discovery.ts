@@ -35,7 +35,7 @@ export class SdkDiscoveryError extends Error {
 
 export type SdkSessionEndpointScope = "default" | "chat";
 
-function endpointDirectory(repo: string, scope: SdkSessionEndpointScope = "default"): string {
+export function endpointDirectory(repo: string, scope: SdkSessionEndpointScope = "default"): string {
 	return scope === "chat" ? path.join(repo, ".gjc", "state", "chat", "sdk") : path.join(repo, ".gjc", "state", "sdk");
 }
 function isUsableSessionId(sessionId: string): boolean {
@@ -132,6 +132,8 @@ export async function readSdkSessionEndpoint(
 	if (!isUsableSessionId(sessionId)) return null;
 	const file = path.join(endpointDirectory(repo, scope), `${sessionId}.json`);
 	try {
+		const stat = await fs.lstat(file);
+		if (!stat.isFile()) return null;
 		return parseEndpoint(sessionId, file, JSON.parse(await fs.readFile(file, "utf8")));
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;

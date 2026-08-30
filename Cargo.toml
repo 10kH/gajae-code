@@ -4,7 +4,7 @@ exclude = ["crates/brush-core-vendored", "crates/brush-builtins-vendored", "crat
 resolver = "3"
 
 [workspace.package]
-version = "0.15.2"
+version = "0.15.6"
 edition = "2024"
 license = "MIT"
 authors = ["Yeachan-Heo"]
@@ -215,6 +215,7 @@ clap = { version = "4", features = ["derive"] }
 # ──────────────────────────────────────────────────────────────────────────────
 regex = "1"
 similar = "3.1.0"
+unicode-normalization = "0.1"
 unicode-segmentation = "1.13"
 unicode-width = "0.2"
 

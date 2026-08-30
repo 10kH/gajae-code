@@ -2177,7 +2177,7 @@ describe("autorouting boundary red-team generation 4 delta re-attacks", () => {
 			parserObserved["artifact://3:bogus"]?.sel === "bogus" &&
 			parserObserved["artifact://3:-100"]?.sel === "-100" &&
 			parserObserved["agent://3:raw:1-100"]?.sel === "raw:1-100" &&
-			parserObserved["agent://3:bogus"]?.sel === undefined;
+			parserObserved["agent://3:bogus"]?.sel === "bogus";
 		const cyclePass =
 			JSON.stringify(remappedCycle?.nested) ===
 				JSON.stringify({

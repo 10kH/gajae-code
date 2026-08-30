@@ -17,11 +17,11 @@ import { getConfigRootDir, isEnoent, logger } from "@gajae-code/utils";
 import {
 	type AuthCredential,
 	type AuthCredentialIfAbsentResult,
-	type AuthCredentialSnapshotEntry,
 	type AuthCredentialStore,
 	assertCanonicalMCPOAuthBinding,
 	type CachedCredentialHealth,
 	type CachedUsagePresentation,
+	type CredentialDispatchTicket,
 	type CredentialInventoryRecord,
 	type MCPOAuthRefreshClient,
 	type OAuthCredential,
@@ -37,6 +37,7 @@ import {
 	AuthBrokerCredentialMetadataUnsupportedError,
 	AuthBrokerStreamUnsupportedError,
 } from "./client";
+import { cleanReason } from "./redact";
 import type {
 	CredentialMetadataRecord,
 	RefresherSchedule,
@@ -72,6 +73,11 @@ const MAX_WAIT_MS = 5_000;
 const BACKGROUND_WAIT_MS = 30_000;
 const BACKGROUND_BACKOFF_INITIAL_MS = 500;
 const BACKGROUND_BACKOFF_MAX_MS = 30_000;
+
+function epochRank(epoch: string): number | undefined {
+	const match = /^(\d+)-/.exec(epoch);
+	return match ? Number(match[1]) : undefined;
+}
 const PRESENTATION_FRESH_MS = 5 * 60_000;
 const PRESENTATION_RETENTION_MS = 24 * 60 * 60_000;
 const PRESENTATION_SIDECAR_VERSION = 1;
@@ -138,12 +144,7 @@ function presentationRecordKey(provider: string, identityDigest: string): string
 }
 
 function safePresentationReason(value: unknown): string | null {
-	if (value === null || value === undefined) return null;
-	let reason = value instanceof Error ? value.message : String(value);
-	reason = reason.replace(/bearer\s+[^\s,;]+/gi, "Bearer [redacted]");
-	reason = reason.replace(/(api[_-]?key|token|secret|authorization)[=:]\s*[^\s,;]+/gi, "$1=[redacted]");
-	reason = reason.replace(/[\r\n\t ]+/g, " ").trim();
-	return reason.length > 256 ? `${reason.slice(0, 253)}...` : reason || null;
+	return cleanReason(value) ?? null;
 }
 
 export interface RemoteAuthCredentialStoreOptions {
@@ -168,10 +169,17 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	#snapshot: SnapshotResponse = emptySnapshot();
 	#snapshotReceivedAt = Date.now();
 	#generation = 0;
+	#epoch?: string;
+	#retiredEpochs = new Set<string>();
+	#snapshotAuthorityTail: Promise<void> = Promise.resolve();
+	#snapshotListeners = new Set<() => void>();
 	#backgroundAbort = new AbortController();
 	#cache: Map<string, CacheEntry> = new Map();
 	#usageCache?: UsageCacheEntry;
 	#usageInflight?: Promise<UsageReport[] | null>;
+	#scopedUsageCache = new Map<Provider, UsageCacheEntry>();
+	#scopedUsageInflight = new Map<Provider, Promise<UsageReport[] | null>>();
+	#scopedUsageFailures = new Map<Provider, number>();
 	#usageCacheEpoch = 0;
 	#inventoryMetadata = new Map<number, CredentialMetadataRecord>();
 	#inventoryMetadataGeneration = -1;
@@ -201,6 +209,8 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	#streamingActive = false;
 	/** Latched once the broker has answered 404 — never try the stream again. */
 	#streamingUnsupported = false;
+	#loadingInitialSnapshot = true;
+	#snapshotAuthoritative = false;
 
 	constructor(opts: RemoteAuthCredentialStoreOptions) {
 		this.#client = opts.client;
@@ -208,6 +218,8 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		this.#presentationPath = opts.presentationPath ?? defaultPresentationSidecarPath();
 		this.#presentationAuthority = createHash("sha256").update(this.#client.baseUrl).digest("hex");
 		this.#applySnapshot(opts.initialSnapshot ?? emptySnapshot(), opts.initialSnapshot?.generation ?? 0, false);
+		this.#loadingInitialSnapshot = false;
+		this.#snapshotAuthoritative = opts.initialSnapshot !== undefined;
 		this.#setInventoryState("pending", this.#generation, {
 			status: "pending",
 			reason: "credential metadata sync pending",
@@ -269,9 +281,11 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 				if (!record.health && !record.usage) continue;
 				this.#persistedPresentations.set(key, record);
 			}
-			this.#reconcilePersistedPresentations();
-			this.#hydratePresentations();
-			this.#queuePresentationWrite();
+			if (this.#snapshotAuthoritative) {
+				this.#reconcilePersistedPresentations();
+				this.#hydratePresentations();
+				this.#queuePresentationWrite();
+			}
 		} catch (error) {
 			logger.debug("auth-broker presentation sidecar invalid", { error: String(error) });
 		}
@@ -373,10 +387,50 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		};
 	}
 
-	#applySnapshot(snapshot: SnapshotResponse, generation: number, scheduleMetadata = true): void {
-		const generationChanged = generation !== this.#generation || this.#inventoryMetadataGeneration !== generation;
+	#applySnapshot(snapshot: SnapshotResponse, generation: number, scheduleMetadata = true): boolean {
+		// Broker generations are process-local and reset when the broker restarts.
+		// A lower generation from a newer server timestamp is therefore a new
+		// broker epoch, while an older timestamp is an out-of-order response from
+		// the current epoch and must be discarded.
+		if (this.#epoch) {
+			if (!snapshot.epoch) return false;
+			if (snapshot.epoch === this.#epoch) {
+				if (generation < this.#generation) return false;
+				if (generation === this.#generation && snapshot.serverNowMs < this.#snapshot.serverNowMs) return false;
+			} else {
+				if (this.#retiredEpochs.has(snapshot.epoch)) return false;
+				const currentRank = epochRank(this.#epoch);
+				const incomingRank = epochRank(snapshot.epoch);
+				// An unseen epoch is only safe to accept when both broker epochs carry
+				// the authoritative monotonic sequence prefix. Opaque epoch strings
+				// cannot prove that a delayed response is newer, so fail closed rather
+				// than letting it replace the current credential snapshot.
+				if (currentRank === undefined || incomingRank === undefined || incomingRank <= currentRank) return false;
+				this.#retiredEpochs.add(this.#epoch);
+			}
+		} else if (snapshot.epoch) {
+			// First epoch-bearing response establishes the authority namespace.
+		} else if (
+			(generation < this.#generation && snapshot.serverNowMs <= this.#snapshot.serverNowMs) ||
+			(generation === this.#generation && snapshot.serverNowMs < this.#snapshot.serverNowMs)
+		) {
+			// Epoch-less legacy brokers use serverNowMs as the restart discriminator:
+			// accept a reset generation only when the broker proves it is newer than
+			// the last accepted legacy snapshot, while delayed old responses fail closed.
+			if (
+				(generation < this.#generation && snapshot.serverNowMs <= this.#snapshot.serverNowMs) ||
+				(generation === this.#generation && snapshot.serverNowMs < this.#snapshot.serverNowMs)
+			)
+				return false;
+		}
+		const generationChanged =
+			generation !== this.#generation ||
+			snapshot.epoch !== this.#epoch ||
+			this.#inventoryMetadataGeneration !== generation;
 		this.#snapshot = snapshot;
 		this.#generation = generation;
+		if (!this.#loadingInitialSnapshot) this.#snapshotAuthoritative = true;
+		this.#epoch = snapshot.epoch ?? this.#epoch;
 		this.#snapshotReceivedAt = Date.now();
 		if (generationChanged) {
 			this.#inventoryMetadata.clear();
@@ -398,8 +452,76 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 				if (scheduleMetadata) this.#scheduleInventoryMetadataSync();
 			}
 		}
-		this.#reconcilePersistedPresentations();
-		this.#hydratePresentations();
+		if (this.#snapshotAuthoritative) {
+			this.#reconcilePersistedPresentations();
+			this.#hydratePresentations();
+		}
+		for (const listener of this.#snapshotListeners) listener();
+		return true;
+	}
+
+	/**
+	 * A full GET can race the SSE stream. Once a newer snapshot from the same
+	 * broker epoch has been accepted, an older GET is merely superseded data —
+	 * not an authority failure that should turn a healthy request into a 503.
+	 * Epoch regressions remain rejected so a delayed response from a retired
+	 * broker cannot cross an authority boundary.
+	 */
+	#isSupersededSnapshot(snapshot: SnapshotResponse, generation: number): boolean {
+		if (this.#epoch !== undefined || snapshot.epoch !== undefined) {
+			return (
+				snapshot.epoch === this.#epoch &&
+				(generation < this.#generation ||
+					(generation === this.#generation && snapshot.serverNowMs < this.#snapshot.serverNowMs))
+			);
+		}
+		return (
+			(generation < this.#generation && snapshot.serverNowMs <= this.#snapshot.serverNowMs) ||
+			(generation === this.#generation && snapshot.serverNowMs < this.#snapshot.serverNowMs)
+		);
+	}
+
+	onSnapshotChanged(listener: () => void): () => void {
+		this.#snapshotListeners.add(listener);
+		return () => this.#snapshotListeners.delete(listener);
+	}
+
+	#withSnapshotAuthority<T>(operation: () => Promise<T>): Promise<T> {
+		const run = this.#snapshotAuthorityTail.then(operation);
+		this.#snapshotAuthorityTail = run.then(
+			() => undefined,
+			() => undefined,
+		);
+		return run;
+	}
+
+	/**
+	 * Queue a provider-admission ticket behind all currently pending snapshot
+	 * authority work. Snapshot applications that arrive after this ticket wait
+	 * for its release, so a revocation is ordered either before admission or
+	 * after it — never in the middle of the dispatch boundary.
+	 */
+	async acquireCredentialDispatchTicket(_provider: Provider, signal?: AbortSignal): Promise<CredentialDispatchTicket> {
+		const previous = this.#snapshotAuthorityTail;
+		const deferred = Promise.withResolvers<void>();
+		const ticketTail = previous.then(
+			() => deferred.promise,
+			() => deferred.promise,
+		);
+		this.#snapshotAuthorityTail = ticketTail;
+		let released = false;
+		const release = (): void => {
+			if (released) return;
+			released = true;
+			deferred.resolve();
+		};
+		try {
+			await this.#raceWithSignal(previous, signal);
+		} catch (error) {
+			release();
+			throw error;
+		}
+		return { release };
 	}
 
 	#setInventoryState(
@@ -471,6 +593,20 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		for (let attempt = 0; attempt < 2; attempt += 1) {
 			try {
 				const metadata = await this.#client.fetchCredentialMetadata();
+				if (metadata.epoch !== this.#epoch) {
+					if (attempt === 0) {
+						await this.refreshSnapshot().catch(() => {});
+						continue;
+					}
+					this.#inventoryMetadata.clear();
+					this.#inventoryMetadataGeneration = -1;
+					this.#setInventoryState("mismatch", this.#generation, {
+						status: "mismatch",
+						reason: "credential metadata epoch mismatch",
+						generation: this.#generation,
+					});
+					return this.getInventoryMetadataState();
+				}
 				if (metadata.generation !== this.#generation) {
 					if (attempt === 0) {
 						await this.refreshSnapshot().catch(() => {});
@@ -542,10 +678,19 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 			try {
 				const result = await this.#client.fetchSnapshot({
 					ifGenerationGt: this.#generation,
+					ifEpoch: this.#epoch,
 					waitMs: BACKGROUND_WAIT_MS,
 					signal: this.#backgroundAbort.signal,
 				});
-				if (result.status === 200) this.#applySnapshot(result.snapshot, result.generation);
+				if (result.status === 200) {
+					await this.#withSnapshotAuthority(async () => {
+						if (!this.#applySnapshot(result.snapshot, result.generation)) {
+							if (!this.#isSupersededSnapshot(result.snapshot, result.generation)) {
+								throw new Error("Auth broker background snapshot authority was rejected");
+							}
+						}
+					});
+				}
 				backoffMs = BACKGROUND_BACKOFF_INITIAL_MS;
 			} catch (error) {
 				if (this.#closed || this.#backgroundAbort.signal.aborted) break;
@@ -562,39 +707,61 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 			for await (const event of iterator) {
 				if (this.#closed || this.#backgroundAbort.signal.aborted) break;
 				this.#streamingActive = true;
-				this.#applyStreamEvent(event);
+				await this.#applyStreamEvent(event);
 			}
 		} finally {
 			this.#streamingActive = false;
 		}
 	}
 
-	#applyStreamEvent(event: SnapshotStreamEvent): void {
-		switch (event.kind) {
-			case "snapshot": {
-				// Strip the discriminator so we store the wire-shape SnapshotResponse.
-				const { kind: _kind, ...snapshot } = event;
-				if (snapshot.generation < this.#generation) {
-					logger.debug("auth-broker stream snapshot older than local; ignoring", {
-						local: this.#generation,
-						incoming: snapshot.generation,
-					});
+	async #applyStreamEvent(event: SnapshotStreamEvent): Promise<void> {
+		await this.#withSnapshotAuthority(async () => {
+			switch (event.kind) {
+				case "snapshot": {
+					// Strip the discriminator so we store the wire-shape SnapshotResponse.
+					const { kind: _kind, ...snapshot } = event;
+					if (!this.#applySnapshot(snapshot, snapshot.generation)) {
+						if (!this.#isSupersededSnapshot(snapshot, snapshot.generation)) {
+							throw new Error("Auth broker stream snapshot authority was rejected");
+						}
+					}
 					return;
 				}
-				this.#applySnapshot(snapshot, snapshot.generation);
-				return;
+				case "entry": {
+					const applied = this.#applyStreamEntry(
+						event.entry,
+						event.refresher,
+						event.generation,
+						event.serverNowMs,
+						event.epoch,
+					);
+					if (!applied && !this.#isSupersededStreamEvent(event)) {
+						throw new Error("Auth broker stream entry authority was rejected");
+					}
+					return;
+				}
+				case "removed": {
+					const applied = this.#removeStreamCredential(
+						event.id,
+						event.refresher,
+						event.generation,
+						event.serverNowMs,
+						event.epoch,
+					);
+					if (!applied && !this.#isSupersededStreamEvent(event)) {
+						throw new Error("Auth broker stream removal authority was rejected");
+					}
+					return;
+				}
 			}
-			case "entry": {
-				if (event.generation < this.#generation) return;
-				this.#applyStreamEntry(event.entry, event.refresher, event.generation, event.serverNowMs);
-				return;
-			}
-			case "removed": {
-				if (event.generation < this.#generation) return;
-				this.#removeStreamCredential(event.id, event.refresher, event.generation, event.serverNowMs);
-				return;
-			}
-		}
+		});
+	}
+
+	#isSupersededStreamEvent(event: SnapshotStreamEvent): boolean {
+		return this.#isSupersededSnapshot(
+			{ ...this.#snapshot, epoch: event.epoch, generation: event.generation, serverNowMs: event.serverNowMs },
+			event.generation,
+		);
 	}
 
 	#applyStreamEntry(
@@ -602,18 +769,33 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		refresher: RefresherSchedule,
 		generation: number,
 		serverNowMs: number,
-	): void {
+		epoch?: string,
+	): boolean {
+		if (!epoch && this.#epoch && epochRank(this.#epoch) !== undefined) return false;
 		const index = this.#snapshot.credentials.findIndex(candidate => candidate.id === entry.id);
 		const credentials =
 			index === -1
 				? [...this.#snapshot.credentials, entry]
 				: this.#snapshot.credentials.map((candidate, i) => (i === index ? entry : candidate));
-		this.#applySnapshot({ ...this.#snapshot, generation, serverNowMs, refresher, credentials }, generation);
+		return this.#applySnapshot(
+			{ ...this.#snapshot, epoch, generation, serverNowMs, refresher, credentials },
+			generation,
+		);
 	}
 
-	#removeStreamCredential(id: number, refresher: RefresherSchedule, generation: number, serverNowMs: number): void {
+	#removeStreamCredential(
+		id: number,
+		refresher: RefresherSchedule,
+		generation: number,
+		serverNowMs: number,
+		epoch?: string,
+	): boolean {
+		if (!epoch && this.#epoch && epochRank(this.#epoch) !== undefined) return false;
 		const credentials = this.#snapshot.credentials.filter(entry => entry.id !== id);
-		this.#applySnapshot({ ...this.#snapshot, generation, serverNowMs, refresher, credentials }, generation);
+		return this.#applySnapshot(
+			{ ...this.#snapshot, epoch, generation, serverNowMs, refresher, credentials },
+			generation,
+		);
 	}
 
 	/**
@@ -628,9 +810,20 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	}
 
 	/** Re-hydrate the in-memory snapshot from the broker. */
-	async refreshSnapshot(): Promise<SnapshotResponse> {
-		const result = await this.#client.fetchSnapshot();
-		if (result.status === 200) this.#applySnapshot(result.snapshot, result.generation);
+	async refreshSnapshot(signal?: AbortSignal): Promise<SnapshotResponse> {
+		const result = await this.#client.fetchSnapshot({ signal });
+		if (result.status === 200) {
+			await this.#raceWithSignal(
+				this.#withSnapshotAuthority(async () => {
+					if (!this.#applySnapshot(result.snapshot, result.generation)) {
+						if (!this.#isSupersededSnapshot(result.snapshot, result.generation)) {
+							throw new Error("Auth broker snapshot authority was rejected");
+						}
+					}
+				}),
+				signal,
+			);
+		}
 		return this.#snapshot;
 	}
 
@@ -643,6 +836,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 				provider: entry.provider,
 				credential: entry.credential as AuthCredential,
 				disabledCause: null,
+				...(entry.revision === undefined ? {} : { revision: entry.revision }),
 			});
 		}
 		return out;
@@ -654,30 +848,68 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	 * authoritative row, so we just mirror it.
 	 */
 	updateAuthCredential(id: number, credential: AuthCredential): void {
-		for (const entry of this.#snapshot.credentials) {
-			if (entry.id !== id) continue;
-			entry.credential = credential as typeof entry.credential;
-			return;
-		}
+		void id;
+		void credential;
+		throw new Error("Remote auth-broker credentials must be updated through broker authority");
 	}
 
 	deleteAuthCredential(_id: number, _disabledCause: string): void {
 		throw new Error("Remote auth-broker credentials can only be disabled on the broker host");
 	}
 
+	allocateMonotonicSequence(_key: string, _expiresAtSec: number): number {
+		throw new Error("Remote auth-broker credentials cannot allocate broker incarnation sequences");
+	}
+
 	tryDisableAuthCredentialIfMatches(_id: number, _expectedData: string, _disabledCause: string): boolean {
 		return false;
 	}
 
+	/** Disable one credential through the authenticated broker mutation endpoint. */
+	async disableAuthCredentialRemote(
+		credentialId: number,
+		disabledCause: string,
+		signal?: AbortSignal,
+		expectedRevision?: number,
+	): Promise<boolean> {
+		try {
+			await this.#client.disableCredential(credentialId, disabledCause, signal, expectedRevision);
+		} catch (error) {
+			if (!isErrorStatus(error, 404)) throw error;
+			// A peer may have disabled the row first. Reconcile the local mirror so
+			// AuthStorage can select a fallback without ever mutating remote state
+			// through the read-only synchronous methods.
+			await this.refreshSnapshot().catch(refreshError => {
+				logger.debug("auth-broker snapshot refresh after remote disable miss failed", {
+					error: String(refreshError),
+				});
+			});
+			return false;
+		}
+		this.#removeCredentialEntry(credentialId);
+		this.#maybeRefreshSnapshot("disable");
+		return true;
+	}
+
 	async waitForFreshSnapshot(maxWaitMs: number, opts: { signal?: AbortSignal } = {}): Promise<boolean> {
 		const previousGeneration = this.#generation;
+		const previousEpoch = this.#epoch;
 		const result = await this.#client.fetchSnapshot({
 			ifGenerationGt: this.#generation,
+			ifEpoch: this.#epoch,
 			waitMs: maxWaitMs,
 			signal: opts.signal,
 		});
-		if (result.status === 200) this.#applySnapshot(result.snapshot, result.generation);
-		return this.#generation !== previousGeneration;
+		if (result.status === 200) {
+			await this.#withSnapshotAuthority(async () => {
+				if (!this.#applySnapshot(result.snapshot, result.generation)) {
+					if (!this.#isSupersededSnapshot(result.snapshot, result.generation)) {
+						throw new Error("Auth broker freshness snapshot authority was rejected");
+					}
+				}
+			});
+		}
+		return this.#generation !== previousGeneration || this.#epoch !== previousEpoch;
 	}
 
 	async prepareForRequest(credentialId: number, opts: { signal?: AbortSignal } = {}): Promise<boolean> {
@@ -689,12 +921,17 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	}
 
 	async markCredentialSuspect(credentialId: number, opts: { signal?: AbortSignal } = {}): Promise<void> {
-		const { entry } = await this.#client.refreshCredential(credentialId, opts.signal);
-		if (entry.credential.type !== "oauth") {
-			throw new Error(`Broker returned non-OAuth credential for id=${credentialId}`);
+		const current = this.#snapshot.credentials.find(entry => entry.id === credentialId);
+		if (current?.credential.type !== "oauth") {
+			// API-key rows have no refresh token, and a stale id may already have
+			// disappeared. A 401 means the broker may have rotated or removed the
+			// row; refresh the authoritative snapshot so the caller can reselect a
+			// live key instead of hitting the OAuth endpoint.
+			await this.refreshSnapshot(opts.signal);
+			return;
 		}
-		this.#applyCredentialEntry(entry);
-		this.#maybeRefreshSnapshot("suspect credential refresh");
+		await this.#client.refreshCredential(credentialId, opts.signal);
+		await this.refreshSnapshot(opts.signal);
 	}
 
 	replaceAuthCredentialsForProvider(_provider: string, _credentials: AuthCredential[]): StoredAuthCredential[] {
@@ -728,8 +965,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	async deleteAuthCredentialsRemote(provider: string, disabledCause: string): Promise<void> {
 		const existing = this.listAuthCredentials(provider);
 		for (const entry of existing) await this.#client.disableCredential(entry.id, disabledCause);
-		this.#removeProviderEntries(provider);
-		this.#maybeRefreshSnapshot("delete");
+		await this.refreshSnapshot();
 	}
 
 	/**
@@ -740,9 +976,8 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	 * any concurrent peer (refresh, generation bump) stays in sync.
 	 */
 	async upsertAuthCredentialRemote(provider: string, credential: AuthCredential): Promise<StoredAuthCredential[]> {
-		const { entries } = await this.#client.uploadCredential(provider, credential);
-		this.#applyProviderEntries(provider, entries);
-		this.#maybeRefreshSnapshot("upload");
+		await this.#client.uploadCredential(provider, credential);
+		await this.refreshSnapshot();
 		return this.listAuthCredentials(provider);
 	}
 
@@ -750,9 +985,8 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		provider: string,
 		credential: AuthCredential,
 	): Promise<AuthCredentialIfAbsentResult> {
-		const { inserted, reason, entries } = await this.#client.uploadCredentialIfAbsent(provider, credential);
-		this.#applyProviderEntries(provider, entries);
-		this.#maybeRefreshSnapshot("upload-if-absent");
+		const { inserted, reason } = await this.#client.uploadCredentialIfAbsent(provider, credential);
+		await this.refreshSnapshot();
 		return { inserted, reason, provider, entries: this.listAuthCredentials(provider) };
 	}
 
@@ -771,38 +1005,18 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		}
 		await this.refreshSnapshot();
 		for (const credential of credentials) {
-			const { entries } = await this.#client.uploadCredential(provider, credential);
-			this.#applyProviderEntries(provider, entries);
+			await this.#client.uploadCredential(provider, credential);
+			await this.refreshSnapshot();
 		}
 		this.#maybeRefreshSnapshot("replace");
 		return this.listAuthCredentials(provider);
 	}
 
-	#applyProviderEntries(provider: string, entries: AuthCredentialSnapshotEntry[]): void {
-		// `entries` is the broker's authoritative post-upsert list of rows for
-		// `provider`. Drop our existing rows for the same provider and splice in
-		// the fresh set — preserving every other provider's rows in place.
-		const others = this.#snapshot.credentials.filter(entry => entry.provider !== provider);
-		const incoming = entries.map(entry => ({ ...entry, rotatesInMs: null }));
-		this.#snapshot = { ...this.#snapshot, credentials: [...others, ...incoming] };
-	}
-
-	#removeProviderEntries(provider: string): void {
-		const credentials = this.#snapshot.credentials.filter(entry => entry.provider !== provider);
+	#removeCredentialEntry(credentialId: number): void {
+		const credentials = this.#snapshot.credentials.filter(entry => entry.id !== credentialId);
+		if (credentials.length === this.#snapshot.credentials.length) return;
 		this.#applySnapshot({ ...this.#snapshot, credentials }, this.#generation, false);
 	}
-	#applyCredentialEntry(entry: AuthCredentialSnapshotEntry): void {
-		const incoming = { ...entry, rotatesInMs: null };
-		const index = this.#snapshot.credentials.findIndex(candidate => candidate.id === entry.id);
-		if (index === -1) {
-			this.#snapshot = { ...this.#snapshot, credentials: [...this.#snapshot.credentials, incoming] };
-			return;
-		}
-		const credentials = [...this.#snapshot.credentials];
-		credentials[index] = incoming;
-		this.#snapshot = { ...this.#snapshot, credentials };
-	}
-
 	/**
 	 * Fire-and-forget `refreshSnapshot()` after a write. When the SSE stream is
 	 * active the broker will deliver the new generation push, so the extra GET
@@ -863,6 +1077,9 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	#invalidateUsageCache(): void {
 		this.#usageCache = undefined;
 		this.#usageInflight = undefined;
+		this.#scopedUsageCache.clear();
+		this.#scopedUsageInflight.clear();
+		this.#scopedUsageFailures.clear();
 		this.#usageCacheEpoch += 1;
 	}
 
@@ -878,9 +1095,8 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		_credential: OAuthCredential,
 		signal?: AbortSignal,
 	): Promise<OAuthCredentials> {
-		let entry: AuthCredentialSnapshotEntry;
 		try {
-			({ entry } = await this.#client.refreshCredential(credentialId, signal));
+			await this.#client.refreshCredential(credentialId, signal);
 		} catch (error) {
 			if (isErrorStatus(error, 404) && !this.#streamingActive) {
 				await this.refreshSnapshot().catch(refreshError => {
@@ -891,15 +1107,12 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 			}
 			throw error;
 		}
-		if (!this.#streamingActive) {
-			await this.refreshSnapshot().catch(error => {
-				logger.debug("auth-broker snapshot refresh after credential refresh failed", { error: String(error) });
-			});
+		await this.refreshSnapshot(signal);
+		const accepted = this.#snapshot.credentials.find(candidate => candidate.id === credentialId);
+		if (accepted?.credential.type !== "oauth") {
+			throw new Error(`Broker snapshot no longer contains OAuth credential id=${credentialId}`);
 		}
-		if (entry.credential.type !== "oauth") {
-			throw new Error(`Broker returned non-OAuth credential for id=${credentialId}`);
-		}
-		const refreshed = entry.credential;
+		const refreshed = accepted.credential;
 		return {
 			access: refreshed.access,
 			refresh: REMOTE_REFRESH_SENTINEL,
@@ -917,21 +1130,21 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		client: MCPOAuthRefreshClient,
 		signal?: AbortSignal,
 	): Promise<OAuthCredential> {
-		const { entry } = await this.#client.refreshMCPCredential(credentialId, client, signal);
-		if (entry.credential.type !== "oauth") {
-			throw new Error(`Broker returned non-OAuth credential for id=${credentialId}`);
+		await this.#client.refreshMCPCredential(credentialId, client, signal);
+		await this.refreshSnapshot(signal);
+		const accepted = this.#snapshot.credentials.find(candidate => candidate.id === credentialId);
+		if (accepted?.credential.type !== "oauth") {
+			throw new Error(`Broker snapshot no longer contains OAuth credential id=${credentialId}`);
 		}
 		assertCanonicalMCPOAuthBinding(credential.mcpBinding);
-		assertCanonicalMCPOAuthBinding(entry.credential.mcpBinding);
+		assertCanonicalMCPOAuthBinding(accepted.credential.mcpBinding);
 		if (
-			entry.credential.mcpBinding.resourceOrigin !== credential.mcpBinding.resourceOrigin ||
-			entry.credential.mcpBinding.tokenEndpoint !== credential.mcpBinding.tokenEndpoint
+			accepted.credential.mcpBinding.resourceOrigin !== credential.mcpBinding.resourceOrigin ||
+			accepted.credential.mcpBinding.tokenEndpoint !== credential.mcpBinding.tokenEndpoint
 		) {
 			throw new Error("Broker returned mismatched MCP OAuth credential binding");
 		}
-		this.#applyCredentialEntry(entry);
-		this.#maybeRefreshSnapshot("MCP credential refresh");
-		return entry.credential;
+		return accepted.credential;
 	}
 
 	/**
@@ -942,6 +1155,10 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	 */
 	async fetchUsageReports(signal?: AbortSignal): Promise<UsageReport[] | null> {
 		return this.#raceWithSignal(this.#loadUsageReports(), signal);
+	}
+
+	async fetchUsageReportsForProvider(provider: Provider, signal?: AbortSignal): Promise<UsageReport[] | null> {
+		return this.#raceWithSignal(this.#loadUsageReports(provider), signal);
 	}
 
 	/** Synchronous, zero-network usage presentation read. */
@@ -1075,7 +1292,16 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		credential: OAuthCredential,
 		signal?: AbortSignal,
 	): Promise<UsageReport | null> {
-		const reports = await this.#raceWithSignal(this.#loadUsageReports(), signal);
+		let reports: UsageReport[] | null;
+		try {
+			reports = await this.#raceWithSignal(this.#loadUsageReports(provider), signal);
+		} catch (error) {
+			// A caller cancellation is control flow, not a missing usage report.
+			// Preserve it so selection/dispatch can stop promptly; only ordinary
+			// broker/provider failures degrade to "no usage".
+			if (signal?.aborted) throw error;
+			return null;
+		}
 		if (!reports) return null;
 		return matchUsageReport(reports, provider, credential);
 	}
@@ -1160,7 +1386,41 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		}
 	}
 
-	#loadUsageReports(): Promise<UsageReport[] | null> {
+	#loadUsageReports(provider?: Provider): Promise<UsageReport[] | null> {
+		if (provider) {
+			const cached = this.#scopedUsageCache.get(provider);
+			if (cached && Date.now() - cached.fetchedAt < USAGE_CACHE_TTL_MS) return Promise.resolve(cached.reports);
+			const failedAt = this.#scopedUsageFailures.get(provider);
+			if (failedAt !== undefined && Date.now() - failedAt < USAGE_CACHE_TTL_MS) return Promise.resolve(null);
+			const existing = this.#scopedUsageInflight.get(provider);
+			if (existing) return existing;
+			const epoch = this.#usageCacheEpoch;
+			const inflight = this.#client
+				.fetchUsage(undefined, provider)
+				.then(body => {
+					if (this.#usageCacheEpoch === epoch) {
+						this.#scopedUsageCache.set(provider, { reports: body.reports, fetchedAt: Date.now() });
+						this.#scopedUsageFailures.delete(provider);
+						this.#recordUsageReports(body.reports, epoch);
+					}
+					return body.reports;
+				})
+				.catch(error => {
+					logger.warn("auth-broker scoped usage fetch failed", {
+						provider,
+						error: cleanReason(error) ?? "Usage unavailable.",
+					});
+					if (this.#usageCacheEpoch === epoch) this.#scopedUsageFailures.set(provider, Date.now());
+					return null;
+				})
+				.finally(() => {
+					if (this.#scopedUsageInflight.get(provider) === inflight) {
+						this.#scopedUsageInflight.delete(provider);
+					}
+				});
+			this.#scopedUsageInflight.set(provider, inflight);
+			return inflight;
+		}
 		const cached = this.#usageCache;
 		if (cached && Date.now() - cached.fetchedAt < USAGE_CACHE_TTL_MS) {
 			return Promise.resolve(cached.reports);
@@ -1194,6 +1454,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 			this.#persistedPresentations.clear();
 		});
 		this.#closed = true;
+		this.#snapshotListeners.clear();
 		this.#cache.clear();
 		this.#usagePresentations.clear();
 		this.#inventoryMetadata.clear();
@@ -1217,9 +1478,7 @@ function snapshotIdentityLabel(entry: SnapshotEntry): string | null {
 
 function safePresentationUsageReport(report: UsageReport): SafeUsageReport {
 	const sanitize = (value: string): string =>
-		value
-			.replace(/bearer\s+[^\s,;]+/gi, "Bearer [redacted]")
-			.replace(/(api[_-]?key|token|secret|authorization)[=:]\s*[^\s,;]+/gi, "$1=[redacted]")
+		(cleanReason(value) ?? "Usage unavailable.")
 			.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
 			.replace(/\s+/g, " ")
 			.trim()

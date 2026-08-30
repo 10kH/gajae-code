@@ -19,12 +19,13 @@ interface WorkflowJob {
 	needs?: string[];
 	if?: string;
 	env?: Record<string, string>;
-	concurrency?: { group: string; "cancel-in-progress"?: string | boolean; queue?: string };
+	concurrency?: { group: string; "cancel-in-progress"?: string | boolean };
 	steps: WorkflowStep[];
 }
 
 interface WorkflowDocument {
 	on: { workflow_dispatch: { inputs: Record<string, unknown> } };
+	concurrency?: { group: string };
 	jobs: Record<string, WorkflowJob>;
 }
 
@@ -187,7 +188,13 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		const source = await Bun.file(".github/workflows/dev-ci.yml").text();
 		// Every candidate must serialize: each one selects a dev base and materializes
 		// a merge, so concurrent runs could validate incompatible integration states.
-		expect(source).toContain("group: dev-ci-virtual-integration\n      cancel-in-progress: false\n      queue: max");
+		// Candidates must serialize on one non-cancelling lane with schema-valid keys
+		// only: GitHub Actions concurrency has exactly `group` and
+		// `cancel-in-progress`; unknown keys make the workflow fail actionlint.
+		expect(source).toContain("group: dev-ci-virtual-integration\n      cancel-in-progress: false");
+		expect(d.concurrency?.group).not.toContain("'dev-ci-virtual-integration'");
+		expect(source).toContain("format('dev-ci-dispatch-{0}', github.run_id)");
+		expect(source).not.toMatch(/^\s+queue:/m);
 		expect(source).toContain("Select authoritative terminal-green dev base");
 		expect(source).toContain("bun scripts/ci-virtual-integration.ts --select-base");
 		expect(source).toContain("CI_VI_BASE_SHA: ${{ steps.green-dev.outputs.base_sha }}");
@@ -237,6 +244,30 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		}
 		expect(offenders).toEqual([]);
 	});
+	test("builds and restores Linux native addons before GJC state-gate shards", async () => {
+		const d = await workflow();
+		const native = requiredJob(d, "gjc-state-gates-native");
+		const matrix = requiredJob(d, "gjc-state-gates-matrix");
+		expect(native.steps.some(step => step.uses?.includes("actions/checkout"))).toBe(true);
+		expect(native.steps.some(step => step.uses?.includes("dtolnay/rust-toolchain"))).toBe(true);
+		const build = namedStep(native, "Build required Linux native addon variants");
+		expect(build.run).toBe("bun run ci:build:native");
+		expect(requiredEnvValue(build, "TARGET_PLATFORM")).toBe("linux");
+		expect(requiredEnvValue(build, "TARGET_ARCH")).toBe("x64");
+		expect(requiredEnvValue(build, "TARGET_VARIANTS")).toBe("baseline modern");
+		const verify = namedStep(native, "Verify required native addon variants");
+		expect(verify.run).toContain("pi_natives.linux-x64-baseline.node");
+		expect(verify.run).toContain("pi_natives.linux-x64-modern.node");
+		const upload = namedStep(native, "Upload state-gate native addon(s)");
+		expect(upload.with?.name).toBe("dev-state-gates-native-${{ github.run_id }}");
+		expect(matrix.needs).toEqual(["gjc-state-gates-native"]);
+		const download = namedStep(matrix, "Download state-gate native addon(s)");
+		expect(download.with?.name).toBe("dev-state-gates-native-${{ github.run_id }}");
+		expect(download.with?.path).toBe("packages/natives/native");
+		const matrixVerify = namedStep(matrix, "Verify state-gate native addon variants");
+		expect(matrixVerify.run).toContain("pi_natives.linux-x64-baseline.node");
+		expect(matrixVerify.run).toContain("pi_natives.linux-x64-modern.node");
+	});
 	test("virtual integration serializes every merge candidate without cancellation", async () => {
 		const d = await workflow();
 		const virtual = requiredJob(d, "virtual-integration");
@@ -244,6 +275,12 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		expect(raw).toBeDefined();
 		expect(raw!.group).toBe("dev-ci-virtual-integration");
 		expect(raw!["cancel-in-progress"]).toBe(false);
-		expect(raw!.queue).toBe("max");
+		// Regression for the dev workflow_dispatch zero-step "Virtual integration
+		// validation" terminal-red incident burst (runs 33025650533..33038420275):
+		// the job block previously carried an unsupported `queue: max` key that is
+		// outside GitHub Actions' documented concurrency schema and made every
+		// static workflow gate fail. Concurrency admits only group +
+		// cancel-in-progress; queue depth is platform-controlled.
+		expect(Object.keys(raw!).sort()).toEqual(["cancel-in-progress", "group"]);
 	});
 });

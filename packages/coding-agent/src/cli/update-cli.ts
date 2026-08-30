@@ -17,6 +17,8 @@ import { isUpdateChannel, UPDATE_CHANNELS, type UpdateChannel } from "../config/
 import { installDefaultGjcDefinitions } from "../defaults/gjc-defaults";
 import { theme } from "../modes/theme/theme";
 import { getNotificationConfig, type NotificationProvider, resolveNotificationProvider } from "../sdk/bus/config";
+import type { TelemetryDetails, TelemetryEventName } from "../telemetry";
+import { recordTelemetryEvent } from "../telemetry";
 import { runDaemonCommand } from "./daemon-cli";
 import {
 	fetchGithubChannelRelease,
@@ -163,11 +165,12 @@ function isPathInDirectory(filePath: string, directoryPath: string): boolean {
 }
 
 export type PackageManagerTarget = { manager: "npm"; packageName: string };
+type MigrationUpdateTarget = { method: "migrate"; path: string; previousPath?: string };
 export type UpdateTarget =
 	| { method: "bun" }
 	| { method: "npm"; packageName: string }
 	| { method: "binary"; path: string }
-	| { method: "migrate"; path: string; previousPath?: string };
+	| MigrationUpdateTarget;
 
 type PathPlatform = NodeJS.Platform;
 type PackageExists = (packageName: string, packageRoot: string) => boolean;
@@ -504,6 +507,73 @@ async function verifyInstalledRuntime(
 			smokeTestOutput: error instanceof Error ? error.message : String(error),
 		};
 	}
+}
+
+interface MigrationTargetVerificationOptions {
+	runtimePath: string;
+	verifyChecksum: () => Promise<void>;
+	verifyRuntime: () => Promise<InstalledVersionVerification>;
+}
+
+interface MigrationChecksumOptions {
+	tag: string;
+	assetName: string;
+	filePath: string;
+}
+
+type MigrationChecksumVerifier = (options: MigrationChecksumOptions) => Promise<unknown>;
+
+async function verifyMigrationTargetWith(
+	options: MigrationTargetVerificationOptions,
+): Promise<InstalledVersionVerification> {
+	try {
+		await options.verifyChecksum();
+	} catch {
+		return { ok: false, path: options.runtimePath };
+	}
+	return await options.verifyRuntime();
+}
+
+async function verifyMigrationTarget(
+	release: Pick<ReleaseInfo, "tag" | "version">,
+	runtimePath: string,
+	verifyChecksum: MigrationChecksumVerifier = verifyDownloadedBinaryChecksum,
+	verifyRuntime: (
+		expectedVersion: string,
+		runtimePath: string,
+	) => Promise<InstalledVersionVerification> = verifyInstalledRuntime,
+): Promise<InstalledVersionVerification> {
+	return await verifyMigrationTargetWith({
+		runtimePath,
+		verifyChecksum: async () => {
+			await verifyChecksum({
+				tag: release.tag,
+				assetName: getBinaryName(),
+				filePath: runtimePath,
+			});
+		},
+		verifyRuntime: async () => await verifyRuntime(release.version, runtimePath),
+	});
+}
+
+export async function verifyMigrationTargetForTest(
+	options: MigrationTargetVerificationOptions,
+): Promise<InstalledVersionVerification> {
+	return await verifyMigrationTargetWith(options);
+}
+
+export async function verifyMigrationTargetAdapterForTest(options: {
+	release: Pick<ReleaseInfo, "tag" | "version">;
+	runtimePath: string;
+	verifyChecksum: MigrationChecksumVerifier;
+	verifyRuntime: (expectedVersion: string, runtimePath: string) => Promise<InstalledVersionVerification>;
+}): Promise<InstalledVersionVerification> {
+	return await verifyMigrationTarget(
+		options.release,
+		options.runtimePath,
+		options.verifyChecksum,
+		options.verifyRuntime,
+	);
 }
 
 function printRestartGuidance(): void {
@@ -1062,6 +1132,7 @@ async function updateViaBinaryAt(
 export interface UpdateCommandDependencies {
 	getLatestRelease?: (options?: LatestReleaseLookupOptions) => Promise<ReleaseInfo>;
 	resolveUpdateTarget?: () => Promise<UpdateTarget>;
+	verifyMigrationTarget?: (release: ReleaseInfo, runtimePath: string) => Promise<InstalledVersionVerification>;
 	performUpdate?: (
 		target: UpdateTarget,
 		expectedVersion: string,
@@ -1073,6 +1144,7 @@ export interface UpdateCommandDependencies {
 	restartDaemon?: (settings: Settings) => Promise<void>;
 	recoverNotifications?: (settings: Settings) => Promise<void>;
 	runPostUpdateRecovery?: (runtimePath: string) => Promise<void>;
+	recordTelemetryEvent?: (event: TelemetryEventName, details: TelemetryDetails) => unknown;
 	exit?: (code: number) => never;
 }
 
@@ -1265,6 +1337,24 @@ export function resolveUpdateDecision(options: {
 	return { install: true, kind: options.comparison > 0 ? "new-version" : "force" };
 }
 
+function printVerifiedMigrationTarget(target: MigrationUpdateTarget, version: string): void {
+	console.log(
+		chalk.green(
+			`${theme.status.success} Standalone ${APP_NAME} ${version} is already installed and verified at ${target.path}`,
+		),
+	);
+	if (target.previousPath) {
+		console.log(chalk.yellow(`${target.previousPath} shadows it on PATH.`));
+		console.log(
+			chalk.cyan(
+				`The standalone directory ${path.dirname(target.path)} must precede the shim directory ${path.dirname(target.previousPath)} on PATH.`,
+			),
+		);
+		return;
+	}
+	console.log(chalk.cyan(`Ensure the standalone directory ${path.dirname(target.path)} is on PATH.`));
+}
+
 export async function runUpdateCommand(
 	opts: UpdateCommandOptions,
 	deps: UpdateCommandDependencies = {},
@@ -1272,9 +1362,28 @@ export async function runUpdateCommand(
 	const channel = opts.channel ?? "stable";
 	const lookupRelease = deps.getLatestRelease ?? getLatestRelease;
 	const resolveTarget = deps.resolveUpdateTarget ?? resolveUpdateTarget;
+	const verifyTarget = deps.verifyMigrationTarget ?? verifyMigrationTarget;
 	const update = deps.performUpdate ?? performUpdate;
 	const refreshDefaults = deps.refreshInstalledDefaultSkills ?? refreshInstalledDefaultSkills;
 	const exit = deps.exit ?? process.exit;
+	const recordEvent = deps.recordTelemetryEvent ?? ((event, details) => recordTelemetryEvent(event, details));
+	const pendingTelemetry = new Set<Promise<void>>();
+	const record = (event: TelemetryEventName, details: TelemetryDetails): void => {
+		const result = recordEvent(event, details);
+		if (result !== null && (typeof result === "object" || typeof result === "function") && "then" in result) {
+			const pending = Promise.resolve(result as PromiseLike<unknown>).then(
+				() => undefined,
+				() => undefined,
+			);
+			pendingTelemetry.add(pending);
+			void pending.finally(() => pendingTelemetry.delete(pending));
+		}
+	};
+	const flushTelemetryBeforeExit = async (): Promise<never> => {
+		await Promise.race([Promise.allSettled([...pendingTelemetry]), Bun.sleep(2000)]);
+		return exit(1);
+	};
+	record("update_check_started", { channel });
 
 	console.log(chalk.dim(`Current version: ${VERSION}`));
 	if (channel !== "stable") {
@@ -1285,16 +1394,18 @@ export async function runUpdateCommand(
 	try {
 		target = await resolveTarget();
 	} catch (err) {
+		record("update_check_completed", { channel, result: "failed" });
 		console.error(chalk.red(err instanceof Error ? err.message : String(err)));
-		return exit(1);
+		return flushTelemetryBeforeExit();
 	}
 
 	let release: ReleaseInfo;
 	try {
 		release = await lookupRelease({ channel });
 	} catch (err) {
+		record("update_check_completed", { channel, result: "failed" });
 		console.error(chalk.red(`Failed to check for updates: ${err}`));
-		return exit(1);
+		return flushTelemetryBeforeExit();
 	}
 
 	// A config file that exists but could not be read changes which registry
@@ -1307,12 +1418,13 @@ export async function runUpdateCommand(
 	try {
 		comparison = compareVersions(release.version, VERSION);
 	} catch (err) {
+		record("update_check_completed", { channel, result: "failed" });
 		console.error(
 			chalk.red(
 				`Failed to check for updates: the ${channel} channel reported an unparseable version "${release.version}": ${err instanceof Error ? err.message : String(err)}`,
 			),
 		);
-		return exit(1);
+		return flushTelemetryBeforeExit();
 	}
 
 	const decision = resolveUpdateDecision({
@@ -1323,7 +1435,24 @@ export async function runUpdateCommand(
 		migrate: target?.method === "migrate",
 	});
 
+	if (target.method === "migrate" && decision.install && !opts.force) {
+		const releaseLock = await acquireBinaryUpdateLock(target.path);
+		try {
+			const verification = await verifyTarget(release, target.path);
+			if (verification.ok) {
+				record("update_check_completed", { channel, result: "available" });
+				record("update_install_started", { channel, installMethod: target.method });
+				printVerifiedMigrationTarget(target, release.version);
+				record("update_install_completed", { channel, result: "installed", installMethod: target.method });
+				return;
+			}
+		} finally {
+			await releaseLock();
+		}
+	}
+
 	if (!decision.install) {
+		record("update_check_completed", { channel, result: "up_to_date" });
 		console.log(chalk.green(`${theme.status.success} Already up to date`));
 		return;
 	}
@@ -1338,9 +1467,14 @@ export async function runUpdateCommand(
 		console.log(chalk.yellow(`Forcing reinstall of ${release.version}`));
 	}
 
-	if (opts.check) return;
+	record("update_check_completed", { channel, result: "available" });
+	if (opts.check) {
+		record("update_install_completed", { channel, result: "skipped" });
+		return;
+	}
 
 	let installedVersion: string | undefined;
+	record("update_install_started", { channel, installMethod: target.method });
 	try {
 		const resolved = target ?? (await resolveTarget());
 		const verification = await update(resolved, release.version, release.registry);
@@ -1349,16 +1483,18 @@ export async function runUpdateCommand(
 			await (deps.runPostUpdateRecovery ?? runPostUpdateRecovery)(verification.path);
 		} else if (!deps.performUpdate) throw new Error("verified installed runtime path is unavailable");
 	} catch (err) {
+		record("update_install_failed", { channel, result: "failed", installMethod: target.method });
 		const prefix = installedVersion
 			? `Updated to ${installedVersion}, but post-update recovery failed`
 			: "Update failed";
 		console.error(chalk.red(`${prefix}: ${err}`));
-		return exit(1);
+		return flushTelemetryBeforeExit();
 	}
 
 	// The installed runtime completes recovery before this old updater process
 	// refreshes opt-in local definitions, avoiding stale-module daemon control.
 	await refreshDefaults();
+	record("update_install_completed", { channel, result: "installed", installMethod: target.method });
 }
 
 /**

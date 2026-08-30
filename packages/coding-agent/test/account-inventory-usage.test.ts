@@ -150,4 +150,42 @@ describe("account inventory usage", () => {
 		// Row payloads never carry the key bytes.
 		expect(JSON.stringify(snapshot.rows).includes(CODEX_ENV_KEY)).toBe(false);
 	});
+
+	it("uses the owning registry key for same-provider config probes", async () => {
+		const provider = "shared-provider";
+		stubEnvKey(provider, undefined);
+		const firstOwner = {};
+		const secondOwner = {};
+		const probes: Array<{ key: string | undefined; baseUrl: string | undefined }> = [];
+		const authStorage = makeAuthStorage({
+			listCredentialInventory: () => [],
+			hasConfigApiKey: (_provider, owner) => owner === firstOwner || owner === secondOwner,
+			getEffectiveCredentialType: (_provider, _sessionId, options) =>
+				options?.owner === firstOwner || options?.owner === secondOwner ? "api_key" : undefined,
+			peekApiKey: async (_provider, options) =>
+				options?.owner === firstOwner ? "first-key" : options?.owner === secondOwner ? "second-key" : undefined,
+			checkApiKeyCredential: async (_provider, key, options) => {
+				probes.push({ key, baseUrl: options?.baseUrl });
+				return { provider, type: "api_key", ok: true };
+			},
+		});
+		const firstRegistry = {
+			getAvailable: () => [{ provider }],
+			getProviderBaseUrl: () => "https://first.example.com",
+			getAuthStorageOwner: () => firstOwner,
+		};
+		const secondRegistry = {
+			getAvailable: () => [{ provider }],
+			getProviderBaseUrl: () => "https://second.example.com",
+			getAuthStorageOwner: () => secondOwner,
+		};
+
+		await checkAccountInventory({ authStorage, modelRegistry: firstRegistry });
+		await checkAccountInventory({ authStorage, modelRegistry: secondRegistry });
+
+		expect(probes).toEqual([
+			{ key: "first-key", baseUrl: "https://first.example.com" },
+			{ key: "second-key", baseUrl: "https://second.example.com" },
+		]);
+	});
 });

@@ -283,6 +283,13 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * Generation 177 consumes an exact same-window lean settlement receipt only
  * after its autonomous ask lead-in publishes successfully, preventing idle
  * replay without changing the serving protocol.
+ * Generation 178: idle publication waits for positioned identity delivery to
+ * cross the native writer barrier before the independent broadcast lane.
+ * Generation 179 tolerates a bounded consecutive run of refused notification
+ * publications in the router instead of cancelling the subscription on the
+ * first refusal, so an owner still running the generation-178 router keeps
+ * killing a session's mirroring after one transient rejection and must be
+ * replaced across this upgrade.
  */
 export const DAEMON_GENERATION = 179;
 

@@ -17,6 +17,8 @@ import {
 	type AuthCredentialSelector,
 	type CredentialDisabledEvent,
 	codexToolWireName,
+	DEFAULT_MODEL_PER_PROVIDER,
+	type KnownProvider,
 	type Message,
 	type Model,
 	type ProviderSessionState,
@@ -71,6 +73,7 @@ import { resolveEagerTaskDelegation } from "../config/task-delegation";
 import { CursorExecHandlers } from "../cursor";
 import { EditTool } from "../edit";
 import type { MasterModeContext } from "../master-mode/context";
+import { describeFoldReceipt } from "../session/fold-coordinator";
 import type { BashRestrictionProfile } from "../tools/bash-allowed-prefixes";
 import { SearchTool } from "../tools/search";
 import "../discovery";
@@ -1287,6 +1290,45 @@ function findDeferredExactMcpToolNameCollisions(
 	return [...collisions];
 }
 
+/**
+ * Order candidates so each known provider's curated default model is tried
+ * before the rest of the catalog.
+ *
+ * Provider catalogs are not ranked by fitness — a withdrawn model whose ID
+ * carries an older date suffix sorts ahead of its current replacement — so
+ * picking the first credentialed entry can start an unconfigured install on a
+ * model the provider no longer serves. `DEFAULT_MODEL_PER_PROVIDER` is the
+ * curated table `findInitialModel` already sweeps for the same purpose;
+ * reusing it keeps both unconfigured paths on one source of truth. Candidates
+ * that are not a provider default keep their original relative order.
+ */
+export function orderByProviderDefaultFirst(
+	candidates: readonly Model[],
+	providerOrder: readonly string[] = Object.keys(DEFAULT_MODEL_PER_PROVIDER),
+): Model[] {
+	const preferred: Model[] = [];
+	const rest: Model[] = [];
+	const preferredCandidates = new Set<Model>();
+	const seenProviders = new Set<string>();
+	for (const rawProvider of [...providerOrder, ...Object.keys(DEFAULT_MODEL_PER_PROVIDER)]) {
+		const provider = rawProvider.trim().toLowerCase();
+		if (!provider || seenProviders.has(provider) || !(provider in DEFAULT_MODEL_PER_PROVIDER)) continue;
+		seenProviders.add(provider);
+		const defaultId = DEFAULT_MODEL_PER_PROVIDER[provider as KnownProvider];
+		for (const candidate of candidates) {
+			if (candidate.provider.trim().toLowerCase() === provider && candidate.id === defaultId) {
+				preferred.push(candidate);
+				preferredCandidates.add(candidate);
+			}
+		}
+	}
+	if (preferred.length === 0) return [...candidates];
+	for (const candidate of candidates) {
+		if (!preferredCandidates.has(candidate)) rest.push(candidate);
+	}
+	return [...preferred, ...rest];
+}
+
 const AUTOMATION_TOOL_NAMES = new Set<AutomationToolName>(["browser", "computer"]);
 
 function validateAutomationTools(options: CreateAgentSessionOptions): AutomationTools {
@@ -1352,14 +1394,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const startupAuthConfig = hasInjectedAuth
 		? undefined
 		: (options.startupAuthConfig ?? (await resolveStartupAuthConfig(agentDir)));
+	const ownsModelRegistry = options.modelRegistry === undefined;
 	const ownsAuthStorage = options.modelRegistry === undefined && options.authStorage === undefined;
 	const modelRegistry =
 		options.modelRegistry ??
 		new ModelRegistry(
 			options.authStorage ??
 				(await logger.time("discoverModels", () => discoverAuthStorage(agentDir, startupAuthConfig))),
+			path.join(agentDir, "models.yml"),
+			undefined,
+			{ agentDir },
 		);
 	const authStorage = modelRegistry.authStorage;
+	const authStorageOwner = modelRegistry.getAuthStorageOwner();
 	if (options.authStorage && options.authStorage !== authStorage) {
 		throw new Error(
 			"options.authStorage and options.modelRegistry.authStorage must be the same instance when both are provided",
@@ -1397,7 +1444,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	let credentialScopeId: string | undefined;
 	let credentialScopeLeased = false;
 	let closeOwnedSettings: () => Promise<void> = async () => {};
-	const closeOwnedAuthStorage = (): void => {
+	const closeOwnedAuthStorage = async (): Promise<void> => {
+		if (ownsModelRegistry) await modelRegistry.dispose();
 		if (!hasSession && credentialScopeLeased && credentialScopeId) {
 			authStorage.releaseCredentialScope(credentialScopeId);
 			credentialScopeLeased = false;
@@ -1429,10 +1477,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 		});
 		const applyCredentialSelector = (scopeId: string, provider: string, selector: AuthCredentialSelector): void => {
-			authStorage.setSessionCredentialSelector(scopeId, provider, selector);
+			authStorage.setSessionCredentialSelector(scopeId, provider, selector, authStorageOwner);
 		};
 		const ownsScopedSettings = options.settings === undefined;
 		const settings = options.settings ?? (await logger.time("settings", Settings.loadForScope, { cwd, agentDir }));
+		if (ownsModelRegistry) modelRegistry.setScopedSettings(settings);
 		const autoroutingInactive =
 			settings.get("task.autorouting.enabled") === true && !settings.getEffectiveAutorouting().active;
 		closeOwnedSettings = async (): Promise<void> => {
@@ -1702,10 +1751,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					) {
 						throw new Error("Durable numeric credential pin authority changed");
 					}
-					authStorage.setSessionCredentialSelector(credentialSessionId, record.provider, {
-						kind: pin.kind,
-						value: pin.value,
-					});
+					authStorage.setSessionCredentialSelector(
+						credentialSessionId,
+						record.provider,
+						{
+							kind: pin.kind,
+							value: pin.value,
+						},
+						authStorageOwner,
+					);
 					staleDurableCredentialPins.delete(resolveOAuthStorageProvider(record.provider));
 				}
 			} catch {
@@ -2073,13 +2127,49 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							if (asyncJobManager!.isDeliverySuppressed(jobId, job?.generation)) return;
 							const deniedOwnedDelivery =
 								ownedCompletion !== undefined && !isOwnedCompletionEnvelopeAllowed(ownedCompletion);
+							// Fold disposition is decided by the coordinator's durable slot state.
+							// `parked` means the fold transaction has not finished capturing its
+							// receipt yet; it replays this completion itself, so enqueuing here
+							// would double-deliver.
+							const foldDisposition = job
+								? session.foldCoordinator.onDelivery(job, result)
+								: ({ kind: "ordinary" } as const);
+							if (foldDisposition.kind === "parked") {
+								if (job) asyncJobManager?.retainParkedDelivery(job, result);
+								return;
+							}
 							const formattedResult = await formatAsyncResultForFollowUp(result, !deniedOwnedDelivery);
+							if (
+								foldDisposition.kind === "receipt" &&
+								job &&
+								!session.foldCoordinator.claimCompletionDelivery(job)
+							)
+								return;
+							// A folded job's result must arrive with its receipt so the wake turn
+							// completes the original task rather than merely reporting output.
+							const deliveredResult =
+								foldDisposition.kind === "receipt"
+									? `${formattedResult}\n\n${describeFoldReceipt(foldDisposition.receipt)}`
+									: formattedResult;
+							// Exactly one transcript notice per completion: a retried delivery
+							// reuses the same job object, so the claim guards against repeats.
+							if (
+								foldDisposition.kind === "receipt" &&
+								job &&
+								session.foldCoordinator.claimCompletionNotice(job)
+							) {
+								session.emitNotice(
+									"info",
+									`Folded job ${foldDisposition.receipt.jobId} (${foldDisposition.receipt.label}) finished.`,
+									"fold",
+								);
+							}
 
 							const durationMs = job ? jobElapsedMs(job) : undefined;
 							session.yieldQueue.enqueue<AsyncResultEntry>("async-result", {
 								jobId,
 								generation: job?.generation ?? "",
-								result: formattedResult,
+								result: deliveredResult,
 								job,
 								durationMs,
 								...(ownedCompletion
@@ -2092,6 +2182,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 										}
 									: {}),
 							});
+							if (job) asyncJobManager?.retainDeliveryClaim(job);
 						},
 					})
 				: options.inheritedAsyncJobManager;
@@ -2547,6 +2638,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// (review thread P1). For a top-level session this equals the
 			// session id.
 			getSessionId: () => AsyncJobManager.endpointIdOf(asyncJobManager) ?? asyncJobEndpointId,
+			registerForegroundFoldParticipant: adapter =>
+				session?.registerForegroundFoldParticipant(adapter) ?? (() => {}),
+			hasForegroundBashBackgroundRequestHandler: () => session?.hasForegroundBashBackgroundRequestHandler() ?? false,
+			requestForegroundBashBackground: () => Promise.resolve(session?.requestForegroundBashBackground() ?? false),
+
 			getCredentialSessionId: () => session?.credentialSessionId ?? credentialSessionId,
 			getMcpManager: () => mcpManager ?? options.inheritedMcpManager,
 			isManagedSessionDestination: () => sessionManager.isManagedDestination(),
@@ -3390,8 +3486,30 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		if (!model && !options.modelPattern && !startupCredentialModelRejected) {
 			// Re-resolve the allowed set: extension factories above may have
 			// registered providers/models that weren't visible at startup.
-			const fallbackCandidates = await resolveAllowedModels(modelRegistry, settings, modelMatchPreferences);
-			for (const candidate of fallbackCandidates) {
+			const allowedFallbackCandidates = await resolveAllowedModels(modelRegistry, settings, modelMatchPreferences);
+			// A fresh provider discovery can disprove a bundled model while the
+			// general available catalog retains it for offline/profile compatibility.
+			// Exclude only those positively disproved bundled entries from the
+			// unconfigured startup path; explicit model/profile resolution above keeps
+			// its existing precedence and semantics.
+			const profileAvailableKeys = new Set(
+				modelRegistry
+					.getAvailableForProfileActivation()
+					.map(candidate => `${candidate.provider}\u0000${candidate.id}`),
+			);
+			const fallbackCandidates = allowedFallbackCandidates.filter(candidate =>
+				profileAvailableKeys.has(`${candidate.provider}\u0000${candidate.id}`),
+			);
+			// Candidate order is not a quality signal: catalogs sort retired models
+			// ahead of current ones whenever their IDs carry older date suffixes, so
+			// an unconfigured install would otherwise start on a model its provider
+			// has already withdrawn. Sweep each known provider's curated default
+			// first — the same table `findInitialModel` consults — and only then fall
+			// back to catalog order.
+			for (const candidate of orderByProviderDefaultFirst(
+				fallbackCandidates,
+				modelRegistry.automaticProviderOrder(credentialSessionId),
+			)) {
 				if (await hasModelApiKey(candidate)) {
 					model = candidate;
 					break;
@@ -4113,18 +4231,24 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				const requestStartedAt = performance.now();
 				let stream: Awaited<ReturnType<typeof streamSimple>>;
 				try {
+					const effectiveApiKey = await modelRegistry.getApiKey(streamModel, credentialSessionId);
 					stream = await streamSimple(streamModel, context, {
 						...streamOptions,
+						apiKey: effectiveApiKey,
+						authCredentialType: modelRegistry.getSessionCredentialType(streamModel.provider, credentialSessionId),
 						onAuthError: async (provider, oldKey, error) => {
 							await modelRegistry.authStorage.invalidateCredentialMatching(provider, oldKey, {
 								signal: streamOptions?.signal,
 								sessionId: credentialSessionId,
+								owner: modelRegistry.getAuthStorageOwner(),
 							});
 							logger.debug("Retrying provider request after credential invalidation", {
 								provider,
 								error: error instanceof Error ? error.message : String(error),
 							});
-							return modelRegistry.getApiKeyForProvider(provider, credentialSessionId);
+							return modelRegistry.getApiKey(streamModel, credentialSessionId, {
+								signal: streamOptions?.signal,
+							});
 						},
 					});
 				} catch (error) {
@@ -4337,7 +4461,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const sessionAsyncJobManager = asyncJobManager;
 		if (sessionAsyncJobManager) {
 			session.yieldQueue.register<AsyncResultEntry>("async-result", {
-				isStale: entry => sessionAsyncJobManager.isDeliverySuppressed(entry.jobId, entry.generation),
+				isStale: entry => {
+					const stale = sessionAsyncJobManager.isDeliverySuppressed(entry.jobId, entry.generation);
+					if (stale) sessionAsyncJobManager.releaseDeliveryClaim(entry.generation);
+					return stale;
+				},
 				// Build one message per ownership origin so an owned-scope drop of
 				// one turn's message never suppresses other turns'/ordinary
 				// completions batched in the same flush (review thread P2).
@@ -4345,7 +4473,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					entry.ownedCompletion
 						? `${entry.ownedCompletion.lineageIdHash}\u0000${entry.ownedCompletion.promptAttemptEpoch}`
 						: "ordinary",
-				build: buildAsyncResultBatchMessage,
+				build: entries => {
+					try {
+						return buildAsyncResultBatchMessage(entries);
+					} finally {
+						for (const entry of entries) sessionAsyncJobManager.releaseDeliveryClaim(entry.generation);
+					}
+				},
 			});
 		}
 		session.yieldQueue.register<McpNotificationEntry>("mcp-notification", {
@@ -4381,7 +4515,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							);
 							AsyncJobManager.unregisterManager(asyncJobManager);
 						}
-						closeOwnedAuthStorage();
+						await closeOwnedAuthStorage();
 						await closeOwnedSettings();
 					}
 				}
@@ -4651,7 +4785,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 			releaseLocalProtocolOverride();
 			try {
-				closeOwnedAuthStorage();
+				await closeOwnedAuthStorage();
 			} catch (authCleanupError) {
 				logger.warn("Failed to close owned auth storage after startup error", { error: authCleanupError });
 			}

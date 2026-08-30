@@ -21,6 +21,7 @@ import {
 	type AuthCredential,
 	type AuthCredentialStore,
 	AuthStorage,
+	extractStructuredApiKeyToken,
 	type StoredAuthCredential,
 } from "../src/auth-storage";
 import * as claudeUsage from "../src/usage/claude";
@@ -71,10 +72,27 @@ function makeStore(
 		setCache(key, value, expiresAtSec) {
 			cache.set(key, { value, expiresAtSec });
 		},
+		allocateMonotonicSequence() {
+			return 1;
+		},
 		cleanExpiredCache() {},
 		...(refresh ? { refreshOAuthCredential: refresh } : {}),
 	};
 }
+
+describe("extractStructuredApiKeyToken", () => {
+	it("extracts the token field from structured OAuth API keys", () => {
+		expect(extractStructuredApiKeyToken('{"token":"access-token","enterpriseUrl":"https://example.test"}')).toBe(
+			"access-token",
+		);
+	});
+
+	it("rejects malformed or non-token API keys", () => {
+		expect(extractStructuredApiKeyToken("plain-token")).toBeUndefined();
+		expect(extractStructuredApiKeyToken('{"access":"wrong-field"}')).toBeUndefined();
+		expect(extractStructuredApiKeyToken("{not-json")).toBeUndefined();
+	});
+});
 
 describe("AuthStorage.checkCredentials", () => {
 	afterEach(() => {
@@ -120,7 +138,7 @@ describe("AuthStorage.checkCredentials", () => {
 		await storage.reload();
 
 		vi.spyOn(claudeUsage.claudeUsageProvider, "fetchUsage").mockRejectedValue(
-			new Error("401 Invalid authentication credentials"),
+			new Error("401 Invalid authentication credentials oat-7\u001b[31m\nnext"),
 		);
 
 		try {
@@ -129,6 +147,7 @@ describe("AuthStorage.checkCredentials", () => {
 			expect(result.ok).toBe(false);
 			expect(result.reason).toContain("401");
 			expect(result.reason).toContain("Invalid authentication");
+			expect(result.reason).not.toMatch(/[\x00-\x1f\x7f-\x9f]/u);
 			// Identity from the stored credential still surfaces so the user
 			// can locate the broken row.
 			expect(result.email).toBe("bob@example.com");

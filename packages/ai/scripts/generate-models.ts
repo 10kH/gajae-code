@@ -35,6 +35,7 @@ import {
 	UNK_MAX_TOKENS,
 } from "../src/provider-models/openai-compat";
 import { getGitLabDuoModels } from "../src/providers/gitlab-duo";
+import { kiroApiStaticModels } from "../src/providers/kiro-api-key";
 import { JWT_CLAIM_PATH } from "../src/providers/openai-codex/constants";
 import type { Model } from "../src/types";
 import { fetchAntigravityDiscoveryModels } from "../src/utils/discovery/antigravity";
@@ -337,6 +338,25 @@ export function injectJetBrainsJunieModels(models: Model[]): void {
 
 	for (const metadata of junieModels) {
 		const existing = models.find(model => model.provider === "jetbrains-junie" && model.id === metadata.id);
+		if (existing) {
+			Object.assign(existing, metadata);
+		} else {
+			models.push(metadata);
+		}
+	}
+}
+
+/**
+ * Bundle the static Kiro (Amazon Q Developer / CodeWhisperer) catalog so both
+ * the AWS Builder ID OAuth path and the `ksk_` API-key path have selectable
+ * models out of the box. Kiro has no public unauthenticated model-listing
+ * endpoint, so this mirrors the same static catalog `kiroApiStaticModels()`
+ * uses for the API-key discovery fallback (issue #5064).
+ */
+export function injectKiroModels(models: Model[]): void {
+	const kiroModels = kiroApiStaticModels();
+	for (const metadata of kiroModels) {
+		const existing = models.find(model => model.provider === "kiro" && model.id === metadata.id);
 		if (existing) {
 			Object.assign(existing, metadata);
 		} else {
@@ -733,6 +753,7 @@ async function generateModels() {
 	allModels = applyClaudeOpusVisionCorrections(allModels);
 	injectAlibabaTokenPlanModels(allModels);
 	injectJetBrainsJunieModels(allModels);
+	injectKiroModels(allModels);
 	applyGeneratedModelPolicies(allModels);
 	// This provider-specific correction must run after generic policy inference,
 	// which otherwise caps unknown OpenAI-compatible models at `high`.

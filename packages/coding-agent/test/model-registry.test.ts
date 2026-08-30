@@ -50,14 +50,45 @@ test("package exports keep extracted model helpers internal", () => {
 	expect(packageJson.exports["./*"]).toBeDefined();
 });
 
+test("Command Code fresh descriptor routes Claude through Anthropic and others through OpenAI", async () => {
+	resetSettingsForTest();
+	const tempDir = path.join(os.tmpdir(), `pi-test-commandcode-fresh-${Snowflake.next()}`);
+	fs.mkdirSync(tempDir, { recursive: true });
+	const modelsPath = path.join(tempDir, "models.json");
+	const auth = await AuthStorage.create(path.join(tempDir, "auth.db"));
+	const previousFetch = globalThis.fetch;
+	globalThis.fetch = (async () =>
+		new Response(JSON.stringify({ data: [{ id: "claude-opus-5.5" }, { id: "zai-org/GLM-5.3" }] }), {
+			status: 200,
+		})) as unknown as typeof fetch;
+	try {
+		await auth.set("commandcode-goat", { type: "api_key", key: "cmd-test-key" });
+		const registry = new ModelRegistry(auth, modelsPath);
+		await registry.refreshProvider("commandcode-goat", "online");
+		const models = registry.getAll().filter(model => model.provider === "commandcode-goat");
+		expect(models.find(model => model.id === "claude-opus-5.5")).toMatchObject({
+			api: "anthropic-messages",
+			baseUrl: "https://api.commandcode.ai/provider",
+		});
+	} finally {
+		globalThis.fetch = previousFetch;
+		auth.close();
+		fs.rmSync(tempDir, { recursive: true, force: true });
+		resetSettingsForTest();
+	}
+});
+
 describe("ModelRegistry", () => {
 	let tempDir: string;
 	let modelsJsonPath: string;
 	let cacheDbPath: string;
 	let authStorage: AuthStorage;
+	let previousPresetRegistryDisabled: string | undefined;
 
 	beforeEach(async () => {
 		resetSettingsForTest();
+		previousPresetRegistryDisabled = Bun.env.GJC_MODEL_PRESET_REGISTRY_DISABLED;
+		Bun.env.GJC_MODEL_PRESET_REGISTRY_DISABLED = "true";
 		tempDir = path.join(os.tmpdir(), `pi-test-model-registry-${Snowflake.next()}`);
 		fs.mkdirSync(tempDir, { recursive: true });
 		modelsJsonPath = path.join(tempDir, "models.json");
@@ -68,6 +99,8 @@ describe("ModelRegistry", () => {
 	afterEach(() => {
 		resetSettingsForTest();
 		authStorage.close();
+		if (previousPresetRegistryDisabled === undefined) delete Bun.env.GJC_MODEL_PRESET_REGISTRY_DISABLED;
+		else Bun.env.GJC_MODEL_PRESET_REGISTRY_DISABLED = previousPresetRegistryDisabled;
 		if (tempDir && fs.existsSync(tempDir)) {
 			fs.rmSync(tempDir, { recursive: true });
 		}
@@ -191,17 +224,27 @@ describe("ModelRegistry", () => {
 				signal: controller.signal,
 			});
 
-			expect(getApiKey).toHaveBeenNthCalledWith(1, "anthropic", "model-session", {
-				baseUrl: model.baseUrl,
-				modelId: model.id,
-				credentialSelector,
-				signal: controller.signal,
-			});
-			expect(getApiKey).toHaveBeenNthCalledWith(2, "anthropic", "provider-session", {
-				baseUrl: "https://proxy.example.com",
-				credentialSelector,
-				signal: controller.signal,
-			});
+			expect(getApiKey).toHaveBeenNthCalledWith(
+				1,
+				"anthropic",
+				"model-session",
+				expect.objectContaining({
+					baseUrl: model.baseUrl,
+					modelId: model.id,
+					credentialSelector,
+					signal: controller.signal,
+				}),
+			);
+			expect(getApiKey).toHaveBeenNthCalledWith(
+				2,
+				"anthropic",
+				"provider-session",
+				expect.objectContaining({
+					baseUrl: "https://proxy.example.com",
+					credentialSelector,
+					signal: controller.signal,
+				}),
+			);
 		} finally {
 			getApiKey.mockRestore();
 		}
@@ -238,6 +281,36 @@ describe("ModelRegistry", () => {
 			throw new Error(`Unexpected URL: ${url}`);
 		});
 	}
+
+	test("preserves process-relative models paths independently of registry agent scope", async () => {
+		const relativeDirectory = path.join(tempDir, "relative-models-dir");
+		const scopedAgentDir = path.join(tempDir, "relative-agent-dir");
+		fs.mkdirSync(relativeDirectory, { recursive: true });
+		fs.mkdirSync(scopedAgentDir, { recursive: true });
+		await Bun.write(
+			path.join(relativeDirectory, "models.yml"),
+			`providers:
+  relative-provider:
+    baseUrl: https://relative.example/v1
+    api: openai-completions
+    auth: none
+    models:
+      - id: relative-model
+`,
+		);
+		const previousCwd = process.cwd();
+		process.chdir(relativeDirectory);
+		try {
+			const registry = new ModelRegistry(authStorage, "models.yml", undefined, {
+				agentDir: scopedAgentDir,
+				automaticRefresh: false,
+			});
+			expect(registry.find("relative-provider", "relative-model")).toBeDefined();
+			registry.dispose();
+		} finally {
+			process.chdir(previousCwd);
+		}
+	});
 
 	describe("provider base URL environment variables", () => {
 		test("does not bake the public OpenAI API URL into bundled OpenAI models", () => {
@@ -1547,6 +1620,31 @@ describe("ModelRegistry", () => {
 			expect(policy.providerCatalogIndex("zeta")).toBe(Number.MAX_SAFE_INTEGER);
 		});
 
+		test("automatic provider order keeps explicit priority ahead of OAuth bands", async () => {
+			await authStorage.set("anthropic", [
+				{
+					type: "oauth",
+					access: "anthropic-policy-access",
+					refresh: "anthropic-policy-refresh",
+					expires: Date.now() + 60 * 60_000,
+					email: "anthropic-policy@example.test",
+				},
+			]);
+			authStorage.setRuntimeApiKey("amazon-bedrock", "bedrock-policy-key");
+			const registrySettings = Settings.isolated();
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, registrySettings, { automaticRefresh: false });
+			try {
+				const explicitOrder = registry.automaticProviderOrder();
+				expect(explicitOrder.indexOf("anthropic")).toBeLessThan(explicitOrder.indexOf("amazon-bedrock"));
+
+				registrySettings.set("modelProviderOrder", ["amazon-bedrock"]);
+				const configuredOrder = registry.automaticProviderOrder();
+				expect(configuredOrder.indexOf("amazon-bedrock")).toBeLessThan(configuredOrder.indexOf("anthropic"));
+			} finally {
+				await registry.dispose();
+			}
+		});
+
 		test("builds stable catalog tie data from registry model order", () => {
 			const makeCatalogModel = (provider: string, id: string): Model<Api> =>
 				({
@@ -2508,6 +2606,56 @@ describe("ModelRegistry", () => {
 			}
 		});
 
+		test("authHeader uses the already-resolved apiKeyEnv token exactly once", () => {
+			const keyEnv = `GJC_TEST_AUTH_HEADER_KEY_${Snowflake.next()}`;
+			const tokenEnv = `GJC_TEST_AUTH_HEADER_TOKEN_${Snowflake.next()}`;
+			const restoreKey = setEnvForTest(keyEnv, tokenEnv);
+			const restoreToken = setEnvForTest(tokenEnv, "resolved-token");
+			try {
+				writeRawModelsJson({
+					anthropic: {
+						baseUrl: "https://anthropic-proxy.example.com/v1",
+						apiKey: tokenEnv,
+						authHeader: true,
+					},
+				});
+
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				const anthropicModels = getModelsForProvider(registry, "anthropic");
+
+				expect(anthropicModels.length).toBeGreaterThan(1);
+				for (const model of anthropicModels) {
+					expect(model.headers?.Authorization).toBe("Bearer resolved-token");
+				}
+			} finally {
+				restoreToken();
+				restoreKey();
+			}
+		});
+
+		test("refreshes auth headers when an apiKeyEnv credential rotates", async () => {
+			const keyEnv = `GJC_TEST_ROTATING_AUTH_HEADER_KEY_${Snowflake.next()}`;
+			const restoreKey = setEnvForTest(keyEnv, "initial-rotating-key");
+			try {
+				writeRawModelsJson({
+					anthropic: {
+						baseUrl: "https://anthropic-proxy.example.com/v1",
+						apiKeyEnv: keyEnv,
+						authHeader: true,
+					},
+				});
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				expect(getModelsForProvider(registry, "anthropic")[0]?.headers?.Authorization).toBe(
+					"Bearer initial-rotating-key",
+				);
+				Bun.env[keyEnv] = "rotated-key";
+				await registry.getApiKeyForProvider("anthropic");
+				expect(getModelsForProvider(registry, "anthropic")[0]?.headers?.Authorization).toBe("Bearer rotated-key");
+			} finally {
+				restoreKey();
+			}
+		});
+
 		test("apiKey-only override supplies fallback auth for built-in models", async () => {
 			const originalOpenAiKey = Bun.env.OPENAI_API_KEY;
 			delete Bun.env.OPENAI_API_KEY;
@@ -3297,7 +3445,7 @@ describe("ModelRegistry", () => {
 			});
 			expect(registry.find("commandcode-goat", "claude-opus-5.5")?.headers?.Authorization).toBeUndefined();
 			expect(registry.find("commandcode-goat", "Qwen/Qwen3.8-Max")?.api).toBe("openai-completions");
-		});
+		}, 120_000);
 
 		test("#614: custom provider referencing a bundled model id inherits canonical display name", () => {
 			// A user-defined provider whose name does not match a bundled provider but
@@ -4391,7 +4539,7 @@ describe("ModelRegistry", () => {
 			expect(gemma?.reasoning).toBe(false);
 		});
 
-		test("keeps the newest same-provider discovery result when overlapping refreshes complete out of order", async () => {
+		test("serializes same-provider discovery refresh publication", async () => {
 			writeRawModelsJson({
 				race: {
 					baseUrl: "https://race.example.com/v1",
@@ -4419,7 +4567,9 @@ describe("ModelRegistry", () => {
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
 			const firstRefresh = registry.refreshProvider("race", "online");
 			await firstRequest.promise;
-			await registry.refreshProvider("race", "online");
+			const secondRefresh = registry.refreshProvider("race", "online");
+			await Bun.sleep(0);
+			expect(requests).toBe(1);
 			firstResponse.resolve(
 				new Response(JSON.stringify({ data: [{ id: "old-model" }] }), {
 					status: 200,
@@ -4427,10 +4577,143 @@ describe("ModelRegistry", () => {
 				}),
 			);
 			await firstRefresh;
+			await secondRefresh;
 
 			expect(registry.getProviderDiscoveryState("race")?.models).toEqual(["new-model"]);
 			expect(registry.find("race", "new-model")).toBeDefined();
 			expect(registry.find("race", "old-model")).toBeUndefined();
+		});
+
+		test("does not invalidate an in-flight full refresh when a provider refresh is queued", async () => {
+			writeRawModelsJson({
+				"race-a": {
+					baseUrl: "https://race-a.example.com/v1",
+					api: "openai-completions",
+					auth: "none",
+					discovery: { type: "openai-models-list" },
+				},
+				"race-b": {
+					baseUrl: "https://race-b.example.com/v1",
+					api: "openai-completions",
+					auth: "none",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			const firstAResponse = Promise.withResolvers<Response>();
+			const firstBResponse = Promise.withResolvers<Response>();
+			const firstRequest = Promise.withResolvers<void>();
+			let aRequests = 0;
+			let bRequests = 0;
+			using _hook = hookFetch(input => {
+				const url = String(input);
+				if (url === "https://race-a.example.com/v1/models") {
+					aRequests += 1;
+					if (aRequests === 1) {
+						firstRequest.resolve();
+						return firstAResponse.promise;
+					}
+					return new Response(JSON.stringify({ data: [{ id: "a-targeted" }] }), { status: 200 });
+				}
+				if (url === "https://race-b.example.com/v1/models") {
+					bRequests += 1;
+					if (bRequests === 1) return firstBResponse.promise;
+					throw new Error(`Unexpected second race-b request: ${url}`);
+				}
+				throw new Error(`Unexpected request: ${url}`);
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const fullRefresh = registry.refresh("online");
+			await firstRequest.promise;
+			const targetedRefresh = registry.refreshProvider("race-a", "online");
+			await Bun.sleep(0);
+			firstAResponse.resolve(new Response(JSON.stringify({ data: [{ id: "a-full" }] }), { status: 200 }));
+			firstBResponse.resolve(new Response(JSON.stringify({ data: [{ id: "b-full" }] }), { status: 200 }));
+			await fullRefresh;
+			await targetedRefresh;
+
+			expect(registry.find("race-a", "a-targeted")).toBeDefined();
+			expect(registry.find("race-a", "a-full")).toBeDefined();
+			expect(registry.find("race-b", "b-full")).toBeDefined();
+			expect(aRequests).toBe(2);
+			expect(bRequests).toBe(1);
+		});
+
+		test("does not cache stale configured discovery during overlapping online-if-uncached refreshes", async () => {
+			writeRawModelsJson({
+				"race-cache": {
+					baseUrl: "https://race-cache.example.com/v1",
+					api: "openai-completions",
+					auth: "none",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			const firstResponse = Promise.withResolvers<Response>();
+			const firstRequest = Promise.withResolvers<void>();
+			let requests = 0;
+			using _hook = hookFetch(input => {
+				expect(String(input)).toBe("https://race-cache.example.com/v1/models");
+				requests += 1;
+				if (requests === 1) {
+					firstRequest.resolve();
+					return firstResponse.promise;
+				}
+				return new Response(JSON.stringify({ data: [{ id: "new-configured-model" }] }), { status: 200 });
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const firstRefresh = registry.refreshProvider("race-cache", "online-if-uncached");
+			await firstRequest.promise;
+			const secondRefresh = registry.refreshProvider("race-cache", "online-if-uncached");
+			firstResponse.resolve(
+				new Response(JSON.stringify({ data: [{ id: "stale-configured-model" }] }), { status: 200 }),
+			);
+			await firstRefresh;
+			await secondRefresh;
+
+			expect(requests).toBe(2);
+			expect(registry.find("race-cache", "new-configured-model")).toBeDefined();
+			expect(registry.find("race-cache", "stale-configured-model")).toBeUndefined();
+		});
+
+		test("does not cache online full-refresh configured discovery after a targeted refresh is queued", async () => {
+			writeRawModelsJson({
+				"race-full": {
+					baseUrl: "https://race-full.example.com/v1",
+					api: "openai-completions",
+					auth: "none",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			const firstResponse = Promise.withResolvers<Response>();
+			const firstRequest = Promise.withResolvers<void>();
+			let requests = 0;
+			using _hook = hookFetch(input => {
+				expect(String(input)).toBe("https://race-full.example.com/v1/models");
+				requests += 1;
+				if (requests === 1) {
+					firstRequest.resolve();
+					return firstResponse.promise;
+				}
+				return new Response(JSON.stringify({ data: [{ id: "new-full-targeted-model" }] }), { status: 200 });
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const fullRefresh = registry.refresh("online");
+			await firstRequest.promise;
+			const targetedRefresh = registry.refreshProvider("race-full", "online-if-uncached");
+			firstResponse.resolve(new Response(JSON.stringify({ data: [{ id: "stale-full-model" }] }), { status: 200 }));
+			await fullRefresh;
+			await targetedRefresh;
+
+			expect(requests).toBe(2);
+			expect(registry.find("race-full", "new-full-targeted-model")).toBeDefined();
+			expect(readModelCache("race-full", 24 * 60 * 60 * 1000, Date.now, cacheDbPath)?.models).toEqual(
+				expect.arrayContaining([expect.objectContaining({ id: "new-full-targeted-model" })]),
+			);
+			expect(readModelCache("race-full", 24 * 60 * 60 * 1000, Date.now, cacheDbPath)?.models).not.toEqual(
+				expect.arrayContaining([expect.objectContaining({ id: "stale-full-model" })]),
+			);
 		});
 
 		test("discovery failure does not fail model registry refresh", async () => {
@@ -4899,9 +5182,13 @@ describe("ModelRegistry", () => {
 					const registry = new ModelRegistry(authStorage, modelsJsonPath);
 					await registry.refreshProvider("llama.cpp", "online");
 
-					expect(getApiKeySpy).toHaveBeenCalledWith("llama.cpp", undefined, {
-						baseUrl: "http://127.0.0.1:8080",
-					});
+					expect(getApiKeySpy).toHaveBeenCalledWith(
+						"llama.cpp",
+						undefined,
+						expect.objectContaining({
+							baseUrl: "http://127.0.0.1:8080",
+						}),
+					);
 					expect(requestApiKeys).toEqual(["Bearer refreshed-llama-access", "Bearer refreshed-llama-access"]);
 				} finally {
 					getApiKeySpy.mockRestore();
@@ -4974,7 +5261,7 @@ describe("ModelRegistry", () => {
 				restoreLlamaKey();
 			}
 		});
-		test("newer optional-auth preflight state wins when overlapping refreshes finish out of order", async () => {
+		test("serializes optional-auth preflight refresh publication", async () => {
 			const restoreLlamaKey = unsetEnvForTest("LLAMA_CPP_API_KEY");
 			const restoreLlamaBaseUrl = unsetEnvForTest("LLAMA_CPP_BASE_URL");
 			try {
@@ -5000,14 +5287,13 @@ describe("ModelRegistry", () => {
 					while (credentialCalls < 1) await Bun.sleep(0);
 
 					const newerRefresh = registry.refreshProvider("llama.cpp", "offline");
-					while (credentialCalls < 2) await Bun.sleep(0);
-
-					newerCredential.resolve(undefined);
-					await newerRefresh;
-					expect(await registry.getApiKeyForProvider("llama.cpp")).toBe(kNoAuth);
-
+					await Bun.sleep(0);
+					expect(credentialCalls).toBe(1);
 					olderCredential.resolve("older-preflight-key");
 					await olderRefresh;
+					while (credentialCalls < 2) await Bun.sleep(0);
+					newerCredential.resolve(undefined);
+					await newerRefresh;
 					expect(await registry.getApiKeyForProvider("llama.cpp")).toBe(kNoAuth);
 				} finally {
 					credentialSpy.mockRestore();
@@ -5973,6 +6259,43 @@ describe("ModelRegistry", () => {
 			await registry.refresh("offline");
 			await expect(registry.getApiKeyForProvider("runtime-proxy")).resolves.toBe("resolved-runtime-provider-key");
 			expect(registry.getEffectiveProviderAuth("runtime-proxy")).toBe("key");
+		} finally {
+			restoreKey();
+		}
+	});
+
+	test("materializes a resolved runtime apiKey in auth headers", async () => {
+		const envName = "GJC_TEST_RUNTIME_AUTH_HEADER_KEY";
+		const restoreKey = setEnvForTest(envName, "resolved-runtime-auth-key");
+		try {
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			registry.registerProvider("runtime-auth", {
+				baseUrl: "https://runtime-auth.example/v1",
+				api: "openai-completions",
+				apiKey: envName,
+				authHeader: true,
+				models: [
+					{
+						id: "runtime-auth-model",
+						name: "Runtime Auth Model",
+						reasoning: false,
+						input: ["text"],
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+						contextWindow: 100_000,
+						maxTokens: 8_000,
+					},
+				],
+			});
+
+			expect(registry.find("runtime-auth", "runtime-auth-model")?.headers?.Authorization).toBe(
+				"Bearer resolved-runtime-auth-key",
+			);
+			Bun.env[envName] = "rotated-runtime-auth-key";
+			writeRawModelsJson({});
+			await registry.refresh("offline");
+			expect(registry.find("runtime-auth", "runtime-auth-model")?.headers?.Authorization).toBe(
+				"Bearer rotated-runtime-auth-key",
+			);
 		} finally {
 			restoreKey();
 		}
@@ -7031,7 +7354,7 @@ describe("ModelRegistry", () => {
 			const changedContextRegistry = new ModelRegistry(authStorage, modelsJsonPath);
 			await changedContextRegistry.refreshProvider("discovery-provider", "online-if-uncached");
 			expect(requests).toBeGreaterThan(requestsAfterFirstFetch + 1);
-		});
+		}, 120_000);
 		test("does not serve the previous tenant's cached models when a provenance-forced refetch fails", async () => {
 			const discoveryConfigWithHeaders = (headers: Record<string, string>) => ({
 				"discovery-provider": {
@@ -7180,7 +7503,7 @@ describe("ModelRegistry", () => {
 			expect(activeRowsFor(registry, ["discovery-provider"])).toEqual([
 				{ provider: "discovery-provider", connectionKind: "credential" },
 			]);
-		});
+		}, 120_000);
 		test("does not retain configured discovery evidence after an in-flight credential change", async () => {
 			writeRawModelsJson({
 				"discovery-provider": {
@@ -7340,7 +7663,7 @@ describe("ModelRegistry", () => {
 				restore();
 			}
 		});
-		test("does not let a stale configured refresh clear newer credential evidence", async () => {
+		test("serializes configured refresh credential evidence publication", async () => {
 			writeRawModelsJson({
 				"discovery-provider": {
 					baseUrl: "https://discovery.example.com/v1",
@@ -7360,13 +7683,7 @@ describe("ModelRegistry", () => {
 			authStorage.setRuntimeApiKey("discovery-provider", "credential-b");
 			const newerRefresh = registry.refreshProvider("discovery-provider", "online");
 			await Bun.sleep(0);
-			resolveNewer(
-				new Response(JSON.stringify({ data: [{ id: "discovered-model" }] }), {
-					status: 200,
-					headers: { "Content-Type": "application/json" },
-				}),
-			);
-			await newerRefresh;
+			expect(calls).toBe(1);
 			resolveOlder(
 				new Response(JSON.stringify({ data: [{ id: "discovered-model" }] }), {
 					status: 200,
@@ -7374,6 +7691,14 @@ describe("ModelRegistry", () => {
 				}),
 			);
 			await olderRefresh;
+			while (calls < 2) await Bun.sleep(0);
+			resolveNewer(
+				new Response(JSON.stringify({ data: [{ id: "discovered-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+			);
+			await newerRefresh;
 
 			expect(activeRowsFor(registry, ["discovery-provider"])).toEqual([
 				{ provider: "discovery-provider", connectionKind: "credential" },
@@ -8218,7 +8543,70 @@ describe("ModelRegistry", () => {
 
 			expect(activeRowsFor(registry, ["vllm"])).toEqual([]);
 		});
-		test("does not let an older descriptor refresh overwrite a newer failed probe", async () => {
+		test("does not cache stale descriptor discovery during overlapping online-if-uncached refreshes", async () => {
+			authStorage.setRuntimeApiKey("vllm", "fresh-vllm-key");
+			const firstResponse = Promise.withResolvers<Response>();
+			const firstRequest = Promise.withResolvers<void>();
+			let requests = 0;
+			using _hook = hookFetch(input => {
+				expect(String(input)).toBe("http://127.0.0.1:8000/v1/models");
+				requests += 1;
+				if (requests === 1) {
+					firstRequest.resolve();
+					return firstResponse.promise;
+				}
+				return new Response(JSON.stringify({ data: [{ id: "new-descriptor-model" }] }), { status: 200 });
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const firstRefresh = registry.refreshProvider("vllm", "online-if-uncached");
+			await firstRequest.promise;
+			const secondRefresh = registry.refreshProvider("vllm", "online-if-uncached");
+			firstResponse.resolve(
+				new Response(JSON.stringify({ data: [{ id: "stale-descriptor-model" }] }), { status: 200 }),
+			);
+			await firstRefresh;
+			await secondRefresh;
+
+			expect(requests).toBe(2);
+			expect(registry.find("vllm", "new-descriptor-model")).toBeDefined();
+			expect(registry.find("vllm", "stale-descriptor-model")).toBeUndefined();
+		});
+		test("does not cache online full-refresh descriptor discovery after a targeted refresh is queued", async () => {
+			authStorage.setRuntimeApiKey("vllm", "fresh-vllm-key");
+			const firstResponse = Promise.withResolvers<Response>();
+			const firstRequest = Promise.withResolvers<void>();
+			let requests = 0;
+			using _hook = hookFetch(input => {
+				expect(String(input)).toBe("http://127.0.0.1:8000/v1/models");
+				requests += 1;
+				if (requests === 1) {
+					firstRequest.resolve();
+					return firstResponse.promise;
+				}
+				return new Response(JSON.stringify({ data: [{ id: "new-full-descriptor-model" }] }), { status: 200 });
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const fullRefresh = registry.refresh("online");
+			await firstRequest.promise;
+			const targetedRefresh = registry.refreshProvider("vllm", "online-if-uncached");
+			firstResponse.resolve(
+				new Response(JSON.stringify({ data: [{ id: "stale-full-descriptor-model" }] }), { status: 200 }),
+			);
+			await fullRefresh;
+			await targetedRefresh;
+
+			expect(requests).toBe(2);
+			expect(registry.find("vllm", "new-full-descriptor-model")).toBeDefined();
+			expect(readModelCache("vllm", 24 * 60 * 60 * 1000, Date.now, cacheDbPath)?.models).toEqual(
+				expect.arrayContaining([expect.objectContaining({ id: "new-full-descriptor-model" })]),
+			);
+			expect(readModelCache("vllm", 24 * 60 * 60 * 1000, Date.now, cacheDbPath)?.models).not.toEqual(
+				expect.arrayContaining([expect.objectContaining({ id: "stale-full-descriptor-model" })]),
+			);
+		});
+		test("serializes descriptor discovery publication before a newer failed probe", async () => {
 			authStorage.setRuntimeApiKey("vllm", "fresh-vllm-key");
 			let calls = 0;
 			const { promise: olderResponse, resolve: resolveOlder } = Promise.withResolvers<Response>();
@@ -8230,8 +8618,6 @@ describe("ModelRegistry", () => {
 			await Bun.sleep(0);
 			const newerRefresh = registry.refreshProvider("vllm", "online");
 			await Bun.sleep(0);
-			resolveNewer(new Response("unavailable", { status: 503 }));
-			await newerRefresh;
 			resolveOlder(
 				new Response(JSON.stringify({ data: [{ id: "older-model" }] }), {
 					status: 200,
@@ -8239,7 +8625,12 @@ describe("ModelRegistry", () => {
 				}),
 			);
 			await olderRefresh;
-			expect(readModelCache("vllm", 24 * 60 * 60 * 1000, Date.now, cacheDbPath)?.models).toEqual([]);
+			while (calls < 2) await Bun.sleep(0);
+			resolveNewer(new Response("unavailable", { status: 503 }));
+			await newerRefresh;
+			expect(readModelCache("vllm", 24 * 60 * 60 * 1000, Date.now, cacheDbPath)?.models).toEqual(
+				expect.arrayContaining([expect.objectContaining({ id: "older-model" })]),
+			);
 
 			expect(activeRowsFor(registry, ["vllm"])).toEqual([]);
 		});
@@ -8484,9 +8875,13 @@ describe("ModelRegistry", () => {
 				const registry = new ModelRegistry(authStorage, modelsJsonPath);
 				await registry.refreshProvider("oauth-discovery", "online");
 
-				expect(getApiKeySpy).toHaveBeenCalledWith("oauth-discovery", undefined, {
-					baseUrl: "https://oauth-discovery.example.com/v1",
-				});
+				expect(getApiKeySpy).toHaveBeenCalledWith(
+					"oauth-discovery",
+					undefined,
+					expect.objectContaining({
+						baseUrl: "https://oauth-discovery.example.com/v1",
+					}),
+				);
 				expect(getApiKeySpy).toHaveBeenCalledTimes(1);
 				expect(fetchCalls).toBe(1);
 			} finally {

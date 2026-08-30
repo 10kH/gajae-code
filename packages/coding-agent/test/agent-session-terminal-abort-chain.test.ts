@@ -151,14 +151,16 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			settings,
 			modelRegistry,
 			toolRegistry: new Map([[bashTool.name, bashTool as unknown as AgentTool]]),
+			ownedAsyncJobManager: manager,
+			disposeAsyncJobManager: true,
 		});
 		session.setSdkPermissionMode("allow");
 	});
 
 	afterEach(async () => {
+		await session?.dispose();
 		AsyncJobManager.setInstance(undefined);
 		AsyncJobManager.unregisterManager(manager);
-		await session?.dispose();
 		authStorage?.close();
 		authStorage = undefined;
 		if (fs.existsSync(tempDir)) {
@@ -1453,13 +1455,19 @@ describe("terminal abort registers a turn scope so left-running owned work class
 					],
 				},
 			},
-			{ triggerTurn: true, deliverAs: "followUp" },
+			{ triggerTurn: true, deliverAs: "nextTurn" },
 		);
 		await waitFor(
 			() => lookupOwnedRegistration(jobId, generation, bindEndpoint) === undefined,
 			"tuple settled after direct idle owned-monitor delivery",
 			10_000,
 		);
+		// The tuple can settle from the delivery finally block before the direct
+		// prompt attempt has published its terminal agent event. Join that
+		// boundary before afterEach tears down the owned manager, otherwise the
+		// teardown races the delivery's final rearm/cleanup microtasks.
+		await session.waitForIdle();
+		await session.dispose();
 	}, 20_000);
 
 	it("newSession takes the transition shutdown lease on the session-owned manager, not a foreign global", async () => {

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test, vi } 
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { closeModelCache, Effort, getBundledModel, type Model } from "@gajae-code/ai";
+import { closeModelCache, DEFAULT_MODEL_PER_PROVIDER, Effort, getBundledModel, type Model } from "@gajae-code/ai";
 import { ModelRegistry, ModelsConfigFile } from "@gajae-code/coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
@@ -26,8 +26,9 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		registerRuntimeProvider(modelRegistry);
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		resetSettingsForTest();
+		await modelRegistry?.dispose();
 		authStorage?.close();
 		if (tempDir && fs.existsSync(tempDir)) {
 			fs.rmSync(tempDir, { recursive: true, force: true });
@@ -155,6 +156,7 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		const originalRelocate = ModelsConfigFile.relocate.bind(ModelsConfigFile);
 		let restoreModelsConfigRelocate: (() => void) | undefined;
 		let seedAuth: AuthStorage | undefined;
+		let seedRegistry: ModelRegistry | undefined;
 
 		const restoreEnvironment = () => {
 			setAgentDir(originalAgentDir);
@@ -165,6 +167,7 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		};
 		const cleanup = async () => {
 			restoreModelsConfigRelocate?.();
+			await seedRegistry?.dispose();
 			closeModelCache(cacheDbPath);
 			closeModelCache();
 			seedAuth?.close();
@@ -206,7 +209,7 @@ describe("createAgentSession deferred model pattern resolution", () => {
 				throw new Error("Expected literal and command API-key fixture rows");
 			}
 
-			const seedRegistry = new ModelRegistry(seedAuth, modelsPath);
+			seedRegistry = new ModelRegistry(seedAuth, modelsPath);
 			if (cacheCredential === "selected") {
 				expect(await seedAuth.getApiKey(provider)).toBe(wrongKey);
 			}
@@ -1003,6 +1006,177 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			await session.dispose();
 		}
 	});
+
+	test("honors explicit provider priority when selecting curated startup defaults", async () => {
+		const anthropicDefault = getBundledModel("anthropic", DEFAULT_MODEL_PER_PROVIDER.anthropic);
+		const bedrockDefault = getBundledModel("amazon-bedrock", DEFAULT_MODEL_PER_PROVIDER["amazon-bedrock"]);
+		if (!anthropicDefault || !bedrockDefault) throw new Error("Expected bundled Anthropic and Bedrock defaults");
+
+		authStorage.setRuntimeApiKey("anthropic", "anthropic-test-key");
+		authStorage.setRuntimeApiKey("amazon-bedrock", "bedrock-test-key");
+		const settings = Settings.isolated({ modelProviderOrder: ["amazon-bedrock", "anthropic"] });
+		const { session } = await createAgentSession({
+			...buildSessionOptions(),
+			settings,
+		});
+
+		try {
+			expect(session.model).toMatchObject({ provider: bedrockDefault.provider, id: bedrockDefault.id });
+			expect(session.model?.id).not.toBe(anthropicDefault.id);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("skips a curated default disproved by fresh provider discovery", async () => {
+		const staleAuth = await AuthStorage.create(path.join(tempDir, `stale-default-${Snowflake.next()}.db`));
+		const staleRegistry = new ModelRegistry(
+			staleAuth,
+			path.join(tempDir, `stale-default-${Snowflake.next()}.yml`),
+			undefined,
+			{ automaticRefresh: false },
+		);
+		const currentModelId = "claude-opus-4-6";
+		try {
+			staleAuth.setRuntimeApiKey("anthropic", "anthropic-test-key");
+			using _hook = hookFetch(input => {
+				const url = String(input);
+				if (url === "https://models.dev/api.json") {
+					return new Response(JSON.stringify({ anthropic: { models: {} } }), {
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				if (!url.endsWith("/models")) throw new Error(`Unexpected model discovery request: ${input}`);
+				return new Response(JSON.stringify({ data: [{ id: currentModelId }] }), {
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+			await staleRegistry.refreshProvider("anthropic", "online");
+
+			const curatedDefault = DEFAULT_MODEL_PER_PROVIDER.anthropic;
+			expect(staleRegistry.getAvailable().some(model => model.id === curatedDefault)).toBe(true);
+			expect(staleRegistry.getAvailableForProfileActivation().some(model => model.id === curatedDefault)).toBe(
+				false,
+			);
+
+			const settings = Settings.isolated({
+				enabledModels: [`anthropic/${curatedDefault}`, `anthropic/${currentModelId}`],
+			});
+			const { session } = await createAgentSession({
+				...buildSessionOptions(),
+				authStorage: staleAuth,
+				modelRegistry: staleRegistry,
+				settings,
+			});
+			try {
+				expect(session.model).toMatchObject({ provider: "anthropic", id: currentModelId });
+			} finally {
+				await session.dispose();
+			}
+		} finally {
+			staleRegistry.dispose();
+			staleAuth.close();
+		}
+	});
+
+	test(
+		"same-provider sibling registry overrides do not block startup or session pin validation",
+		async () => {
+			const provider = "anthropic";
+			const model = getBundledModel(provider, "claude-sonnet-4-5");
+			if (!model) throw new Error("Expected bundled Anthropic model");
+			const modelId = model.id;
+			const sharedAuth = await AuthStorage.create(path.join(tempDir, `shared-selector-${Snowflake.next()}.db`));
+			const firstRegistry = new ModelRegistry(
+				sharedAuth,
+				path.join(tempDir, `shared-selector-a-${Snowflake.next()}.yml`),
+				undefined,
+				{
+					automaticRefresh: false,
+				},
+			);
+			const secondRegistry = new ModelRegistry(
+				sharedAuth,
+				path.join(tempDir, `shared-selector-b-${Snowflake.next()}.yml`),
+				undefined,
+				{
+					automaticRefresh: false,
+				},
+			);
+			let session:
+				| {
+						model: Model | undefined;
+						setCredentialPin(provider: string, selector: { kind: "id"; value: string }): Promise<void>;
+						dispose(): Promise<void>;
+				  }
+				| undefined;
+			try {
+				await sharedAuth.set(provider, [
+					{
+						type: "oauth",
+						access: "shared-selector-access",
+						refresh: "shared-selector-refresh",
+						expires: Date.now() + 60 * 60_000,
+						email: "shared-selector@example.test",
+					},
+				]);
+				const row = sharedAuth.listCredentialInventory(provider)[0];
+				if (!row) throw new Error("Expected shared selector OAuth row");
+				const selector = { kind: "id" as const, value: String(row.id) };
+				secondRegistry.registerProvider(provider, {
+					baseUrl: "https://shared-selector-b.example.test",
+					api: "anthropic-messages",
+					apiKey: "shared-selector-second-key",
+				});
+				expect(await secondRegistry.getApiKeyForProvider(provider)).toBe("shared-selector-second-key");
+
+				// Registry B's same-provider key must not make registry A's OAuth selector
+				// appear unusable. This is the direct owner-scoped startup authority check.
+				expect(
+					await firstRegistry.getApiKeyForProvider(provider, undefined, undefined, {
+						credentialSelector: selector,
+					}),
+				).toBe("shared-selector-access");
+
+				const result = await createAgentSession({
+					cwd: tempDir,
+					agentDir: tempDir,
+					sessionManager: SessionManager.inMemory(tempDir),
+					modelRegistry: firstRegistry,
+					modelPattern: `${provider}/${modelId}`,
+					credentialSelector: { provider, selector, raw: `${provider}/id:${row.id}` },
+					settings: Settings.isolated({ "compaction.enabled": false, "todo.enabled": false }),
+					disableExtensionDiscovery: true,
+					extensions: [],
+					skills: [],
+					contextFiles: [],
+					promptTemplates: [],
+					slashCommands: [],
+					enableMCP: false,
+					enableLsp: false,
+					workspaceTree: { rootPath: tempDir, rendered: "", truncated: false, totalLines: 0, agentsMdFiles: [] },
+					toolNames: [],
+					rules: [],
+				});
+				session = result.session;
+				expect(session.model).toMatchObject({ provider, id: modelId });
+				await session.setCredentialPin(provider, selector);
+
+				secondRegistry.dispose();
+				expect(
+					await firstRegistry.getApiKeyForProvider(provider, undefined, undefined, {
+						credentialSelector: selector,
+					}),
+				).toBe("shared-selector-access");
+			} finally {
+				await session?.dispose();
+				firstRegistry.dispose();
+				secondRegistry.dispose();
+				sharedAuth.close();
+			}
+		},
+		{ timeout: 60_000 },
+	);
 
 	test("uses an unqualified credential selector while checking fallback model availability", async () => {
 		const anthropicModel = getBundledModel("anthropic", "claude-sonnet-4-5");

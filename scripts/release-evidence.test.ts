@@ -287,6 +287,43 @@ describe("release package evidence", () => {
 		)).rejects.toThrow("redirect destination");
 		expect(() => validateNpmRegistryTarballUrl("https://evil.invalid/ai.tgz", "test tarball")).toThrow("must remain");
 	});
+	test("retries transient registry tarball reads within the bounded window and fails closed otherwise", async () => {
+		const tarball = fixtureTarball('{"name":"@gajae-code/ai","version":"1.2.3"}\n');
+		const url = "https://registry.npmjs.org/@gajae-code%2fai/-/ai-1.2.3.tgz";
+
+		// Propagation 404s resolve once the CDN catches up.
+		let laggedCalls = 0;
+		const fetchLagged = (async () => {
+			laggedCalls += 1;
+			if (laggedCalls < 3) return new Response(null, { status: 404 });
+			return new Response(tarball);
+		}) as unknown as typeof fetch;
+		await expect(downloadNpmRegistryTarball(url, sha512Sri(tarball), {
+			fetcher: fetchLagged,
+			maxCompressedBytes: tarball.length,
+			retry: { attempts: 5, delayMs: 0 },
+		})).resolves.toEqual(tarball);
+		expect(laggedCalls).toBe(3);
+
+		// The bounded window still fails closed when propagation never lands.
+		const fetchGone = (async () => new Response(null, { status: 404 })) as unknown as typeof fetch;
+		await expect(downloadNpmRegistryTarball(url, sha512Sri(tarball), {
+			fetcher: fetchGone,
+			retry: { attempts: 2, delayMs: 0 },
+		})).rejects.toThrow("HTTP 404");
+
+		// Non-transient statuses never retry.
+		let unauthorizedCalls = 0;
+		const fetchUnauthorized = (async () => {
+			unauthorizedCalls += 1;
+			return new Response(null, { status: 401 });
+		}) as unknown as typeof fetch;
+		await expect(downloadNpmRegistryTarball(url, sha512Sri(tarball), {
+			fetcher: fetchUnauthorized,
+			retry: { attempts: 5, delayMs: 0 },
+		})).rejects.toThrow("HTTP 401");
+		expect(unauthorizedCalls).toBe(1);
+	});
 	test("requires exactly the complete sorted 13-package set and closed expected schema", () => {
 		const { expected } = expectedFixture();
 		expect(expected.packages).toHaveLength(13);

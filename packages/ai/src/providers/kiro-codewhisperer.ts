@@ -11,6 +11,7 @@
  * not from any AGPL reference implementation.
  */
 import { $credentialEnv, $env, extractHttpStatusFromError } from "@gajae-code/utils";
+import type { Effort } from "../model-thinking";
 import type {
 	Api,
 	AssistantMessage,
@@ -28,12 +29,15 @@ import { transportFailureFacts } from "../utils/fallback-transport";
 import { withHttpStatus } from "../utils/http-inspector";
 import { captureUnicodeEscapeEvidence } from "../utils/json-parse";
 import { decodeEventStream } from "./aws-eventstream";
+import { isKiroApiKey, streamKiroApiKey, toKiroModelId } from "./kiro-api-key";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Provider options
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface KiroCodeWhispererOptions extends StreamOptions {
+	/** Effort level for Kiro API-key reasoning. */
+	reasoning?: Effort | boolean;
 	/** AWS region for the CodeWhisperer streaming endpoint. */
 	region?: string;
 	/** Profile ARN for enterprise IAM Identity Center accounts. */
@@ -63,6 +67,7 @@ interface WireToolResult {
 interface WireUserMessage {
 	userInputMessage: {
 		content: string;
+		modelId?: string;
 		userInputMessageContext?: {
 			tools?: { tools: WireToolSpec[] };
 			toolResults?: { toolResults: WireToolResult[][] };
@@ -143,6 +148,11 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 	context: Context,
 	options: KiroCodeWhispererOptions,
 ): AssistantMessageEventStream => {
+	const token = resolveBearerToken(options.apiKey);
+	if (isKiroApiKey(token)) {
+		return streamKiroApiKey(model, context, { ...options, apiKey: token });
+	}
+
 	const stream = new AssistantMessageEventStream();
 
 	(async () => {
@@ -175,7 +185,7 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 			const bearerToken = resolveBearerToken(options.apiKey);
 			if (!bearerToken) {
 				throw new Error(
-					"No Kiro credentials found. Run 'gjc auth-broker login kiro' to authenticate via AWS Builder ID, or set AWS_BEARER_TOKEN_KIRO.",
+					"No Kiro credentials found. Set KIRO_API_KEY (ksk_ from https://app.kiro.dev/settings/api-keys) or run 'gjc auth-broker login kiro'.",
 				);
 			}
 
@@ -344,7 +354,7 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 
 function buildConversationState(
 	context: Context,
-	_model: Model<"kiro-codewhisperer-stream">,
+	model: Model<"kiro-codewhisperer-stream">,
 	options: KiroCodeWhispererOptions,
 ): ConversationState {
 	const messages = context.messages;
@@ -352,18 +362,24 @@ function buildConversationState(
 		throw new Error("Kiro CodeWhisperer requires at least one message");
 	}
 
+	// Normalize the local dashed selector/wire id (e.g. "claude-haiku-4-5") to
+	// the canonical dotted upstream Kiro model id (e.g. "claude-haiku-4.5"),
+	// matching the sibling ksk_ API-key transport (kiro-api-key.ts) so both
+	// auth methods send the same wire form for the same catalog entry.
+	const modelId = toKiroModelId(model.wireModelId || model.id);
+
 	// Build history from all messages except the last
 	const history: WireHistoryMessage[] = [];
 	const systemPrompt = context.systemPrompt?.join("\n") ?? "";
 
 	for (let i = 0; i < messages.length - 1; i++) {
 		const msg = messages[i];
-		history.push(convertToWireMessage(msg, i === 0 ? systemPrompt : undefined));
+		history.push(convertToWireMessage(msg, modelId, i === 0 ? systemPrompt : undefined));
 	}
 
 	// Convert the last message as currentMessage
 	const lastMsg = messages[messages.length - 1];
-	const currentMessage = convertToWireUserMessage(lastMsg, systemPrompt);
+	const currentMessage = convertToWireUserMessage(lastMsg, modelId, systemPrompt);
 
 	// Add tools to the current message context
 	if (context.tools && context.tools.length > 0) {
@@ -383,12 +399,16 @@ function buildConversationState(
 	};
 }
 
-function convertToWireMessage(msg: Context["messages"][number], systemPrompt?: string): WireHistoryMessage {
+function convertToWireMessage(
+	msg: Context["messages"][number],
+	modelId: string,
+	systemPrompt?: string,
+): WireHistoryMessage {
 	if (msg.role === "user") {
-		return convertToWireUserMessage(msg, systemPrompt);
+		return convertToWireUserMessage(msg, modelId, systemPrompt);
 	}
 	if (msg.role === "toolResult") {
-		return convertToWireUserMessage(msg, systemPrompt);
+		return convertToWireUserMessage(msg, modelId, systemPrompt);
 	}
 	// assistant → assistant response
 	const textParts: string[] = [];
@@ -408,7 +428,11 @@ function convertToWireMessage(msg: Context["messages"][number], systemPrompt?: s
 	};
 }
 
-function convertToWireUserMessage(msg: Context["messages"][number], systemPrompt?: string): WireUserMessage {
+function convertToWireUserMessage(
+	msg: Context["messages"][number],
+	modelId: string,
+	systemPrompt?: string,
+): WireUserMessage {
 	let content = extractTextContent(msg);
 	if (systemPrompt) {
 		content = `${systemPrompt}\n\n${content}`;
@@ -417,6 +441,7 @@ function convertToWireUserMessage(msg: Context["messages"][number], systemPrompt
 	const userMsg: WireUserMessage = {
 		userInputMessage: {
 			content,
+			modelId,
 		},
 	};
 
@@ -541,7 +566,7 @@ function handleToolUseEvent(
 
 function resolveBearerToken(apiKey: string | undefined): string | undefined {
 	if (!apiKey) {
-		return $credentialEnv("AWS_BEARER_TOKEN_KIRO") ?? undefined;
+		return $credentialEnv("KIRO_API_KEY") ?? $credentialEnv("AWS_BEARER_TOKEN_KIRO") ?? undefined;
 	}
 
 	// Structured API key (from getOAuthApiKey) contains the access token as JSON

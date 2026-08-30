@@ -312,7 +312,7 @@ export class ExtensionUiController {
 				session.retryNow();
 				return { retried: true, immediate: true };
 			case "bash.background":
-				if (!session.requestForegroundBashBackground())
+				if (!(await session.requestForegroundBashBackground()))
 					throw Object.assign(new Error("The active bash command cannot be moved to a managed background job."), {
 						code: "not_foldable",
 					});
@@ -1154,6 +1154,7 @@ export class ExtensionUiController {
 				customInput: dialogOptions?.customInput
 					? {
 							optionLabel: dialogOptions.customInput.optionLabel,
+							allowEmpty: (dialogOptions.customInput as { allowEmpty?: boolean }).allowEmpty,
 							onSubmit: text => {
 								const optionLabel = dialogOptions.customInput?.optionLabel;
 								this.hideHookSelector();

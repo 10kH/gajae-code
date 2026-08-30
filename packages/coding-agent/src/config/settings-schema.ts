@@ -1726,6 +1726,17 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"telemetry.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "interaction",
+			label: "Anonymous Usage Telemetry",
+			description:
+				"Send minimal allowlisted update and adoption events. Disabled by default; no prompts, paths, environment, identity, or arbitrary errors are collected.",
+		},
+	},
+
 	"starReminder.enabled": {
 		type: "boolean",
 		default: true,
@@ -1943,6 +1954,52 @@ export const SETTINGS_SCHEMA = {
 				{ value: "300000", label: "300K tokens", description: "Large context window" },
 				{ value: "500000", label: "500K tokens", description: "Very large context window" },
 			],
+		},
+	},
+
+	"compaction.adaptive.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "context",
+			label: "Adaptive Compaction",
+			description: "Adjust compaction frequency by context size and call rate",
+		},
+	},
+	"compaction.adaptive.baseThresholdPercent": {
+		type: "number",
+		default: 85,
+		ui: {
+			tab: "context",
+			label: "Adaptive Base Threshold %",
+			description: "Base context percentage used when adaptive compaction is enabled",
+		},
+	},
+	"compaction.adaptive.aggression": {
+		type: "number",
+		default: 0.15,
+		ui: {
+			tab: "context",
+			label: "Adaptive Aggression",
+			description: "How strongly call rate lowers the compaction threshold; use 0 to 1",
+		},
+	},
+	"compaction.adaptive.turnWindow": {
+		type: "number",
+		default: 15,
+		ui: {
+			tab: "context",
+			label: "Call-Rate Window",
+			description: "Minutes of recent calls considered by adaptive compaction",
+		},
+	},
+	"compaction.adaptive.minThresholdPercent": {
+		type: "number",
+		default: 50,
+		ui: {
+			tab: "context",
+			label: "Adaptive Floor %",
+			description: "Lowest context percentage adaptive compaction may lower the threshold to",
 		},
 	},
 
@@ -4338,6 +4395,13 @@ export interface CompactionSettings {
 	strategy: "context-full" | "handoff" | "off";
 	thresholdPercent: number;
 	thresholdTokens: number;
+	adaptive: {
+		enabled: boolean;
+		baseThresholdPercent: number;
+		aggression: number;
+		turnWindow: number;
+		minThresholdPercent: number;
+	};
 	reserveTokens: number;
 	keepRecentTokens: number;
 	handoffSaveToDisk: boolean;

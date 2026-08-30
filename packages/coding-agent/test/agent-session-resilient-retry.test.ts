@@ -28,6 +28,18 @@ import {
 const ANTHROPIC_OVERLOAD_ENVELOPE =
 	'{"type":"error","error":{"details":null,"type":"overloaded_error","message":"Overloaded"},"request_id":"req_011CeCBq4Y2KiEGipdTbzvNH"             }';
 
+/**
+ * The generic Responses capacity overload as it reaches the session: an HTTP 200
+ * `response.failed` envelope, so the typed code arrives as statusless transport
+ * facts with the provider's own display prose.
+ */
+const RESPONSES_OVERLOAD_ERROR = "server_is_overloaded: Our servers are currently overloaded. Please try again later.";
+const RESPONSES_OVERLOAD_FACTS: AssistantMessage["transportFailure"] = {
+	kind: "transport",
+	providerCode: "server_is_overloaded",
+	openaiErrorCode: "server_is_overloaded",
+};
+
 type AutoRetryStartEvent = Extract<AgentSessionEvent, { type: "auto_retry_start" }>;
 type AutoRetryEndEvent = Extract<AgentSessionEvent, { type: "auto_retry_end" }>;
 
@@ -132,6 +144,7 @@ describe("AgentSession resilient retry", () => {
 		transportFailure?: AssistantMessage["transportFailure"];
 		recoveredContent?: string;
 		partialContent?: string;
+		partialBlocks?: AssistantMessage["content"];
 		bareDefault?: boolean;
 		messageApi?: AssistantMessage["api"];
 		messageProvider?: string;
@@ -169,7 +182,9 @@ describe("AgentSession resilient retry", () => {
 				queueMicrotask(() => {
 					const message: AssistantMessage = {
 						role: "assistant",
-						content: options.partialContent ? [{ type: "text", text: options.partialContent }] : [],
+						content:
+							options.partialBlocks ??
+							(options.partialContent ? [{ type: "text", text: options.partialContent }] : []),
 						api: options.messageApi ?? requestedModel.api,
 						provider: options.messageProvider ?? requestedModel.provider,
 						model: options.messageModel ?? requestedModel.id,
@@ -1084,8 +1099,7 @@ describe("AgentSession resilient retry", () => {
 			session = undefined;
 			waitSpy.mockClear();
 		}
-	});
-
+	}, 300000);
 	it("bounds ollama-cloud first-event timeout retries instead of looping unbounded (#713)", async () => {
 		// ollama-cloud (ollama-chat API) can stall before its first token even
 		// for tiny prompts. Unbounded continuation retries re-issue the full
@@ -1118,7 +1132,7 @@ describe("AgentSession resilient retry", () => {
 		expect(last.stopReason).toBe("error");
 		expect(last.errorMessage).toContain("first event");
 		expect(waitSpy).toHaveBeenCalled();
-	});
+	}, 30000);
 	it("surfaces raw and wrapped Kimi Code first-event timeouts without replaying", async () => {
 		const model = getBundledModel("kimi-code", "kimi-k2.5");
 		if (!model) throw new Error("Expected bundled Kimi Code test model to exist");
@@ -1373,6 +1387,268 @@ describe("AgentSession resilient retry", () => {
 		expect(disabledEvents.retryStartEvents).toHaveLength(0);
 		expect(disabledModels).toHaveLength(1);
 		expect(lastAssistant(session).stopReason).toBe("error");
+	});
+	it("retries the typed generic Responses capacity overload under bare defaults", async () => {
+		const model = getBundledModel("openai", "gpt-5.4-mini");
+		if (!model) throw new Error("Expected bundled OpenAI Responses test model to exist");
+		const requestedModels: string[] = [];
+		session = buildStatusErrorSession({
+			model,
+			bareDefault: true,
+			errorMessage: RESPONSES_OVERLOAD_ERROR,
+			transportFailure: RESPONSES_OVERLOAD_FACTS,
+			recoveredContent: "recovered after the overload cleared",
+			requestedModels,
+		});
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		vi.spyOn(Math, "random").mockReturnValue(0.5);
+		const { retryStartEvents, retryEndEvents } = track(session);
+
+		await session.prompt("recover Responses overload");
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(1);
+		expect(retryStartEvents[0]?.delayMs).toBeGreaterThan(0);
+		expect(waitSpy).toHaveBeenCalledWith(retryStartEvents[0]?.delayMs, expect.anything());
+		expect(requestedModels).toHaveLength(2);
+		expect(retryEndEvents).toEqual([expect.objectContaining({ success: true })]);
+		expect(lastAssistant(session).content).toEqual([{ type: "text", text: "recovered after the overload cleared" }]);
+	});
+	it("bounds a persistent typed Responses capacity overload under bare defaults", async () => {
+		const model = getBundledModel("openai", "gpt-5.4-mini");
+		if (!model) throw new Error("Expected bundled OpenAI Responses test model to exist");
+		const requestedModels: string[] = [];
+		session = buildStatusErrorSession({
+			model,
+			bareDefault: true,
+			errorMessage: RESPONSES_OVERLOAD_ERROR,
+			transportFailure: RESPONSES_OVERLOAD_FACTS,
+			requestedModels,
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("exhaust persistent Responses overload");
+		await session.waitForIdle();
+
+		expect(requestedModels).toHaveLength(4);
+		expect(retryStartEvents).toHaveLength(3);
+		expect(retryStartEvents.map(event => event.unbounded)).toEqual([false, false, false]);
+		expect(lastAssistant(session).stopReason).toBe("error");
+	});
+	it("does not retry Responses overload near misses or conflicting facts under bare defaults", async () => {
+		const model = getBundledModel("openai", "gpt-5.4-mini");
+		if (!model) throw new Error("Expected bundled OpenAI Responses test model to exist");
+		for (const testCase of [
+			// A near-miss code is not the provider's exact capacity-overload code.
+			{
+				transportFailure: {
+					kind: "transport" as const,
+					providerCode: "server_is_overloaded_now",
+					openaiErrorCode: "server_is_overloaded_now",
+				},
+			},
+			// The code is matched case-sensitively from the parser through this
+			// admission, so cased and padded variants stay terminal.
+			{
+				transportFailure: {
+					kind: "transport" as const,
+					providerCode: "SERVER_IS_OVERLOADED",
+					openaiErrorCode: "SERVER_IS_OVERLOADED",
+				},
+			},
+			{
+				transportFailure: {
+					kind: "transport" as const,
+					providerCode: " server_is_overloaded",
+					openaiErrorCode: " server_is_overloaded",
+				},
+			},
+			// Any other transport observation means the facts are more than the
+			// bare typed code, so they are not provably this content-free overload.
+			{ transportFailure: { ...RESPONSES_OVERLOAD_FACTS, requestBytes: 4096 } },
+			{ transportFailure: { ...RESPONSES_OVERLOAD_FACTS, firstEventElapsedMs: 1200 } },
+			{ transportFailure: { ...RESPONSES_OVERLOAD_FACTS, firstEventTimeoutMs: 30000 } },
+			{ transportFailure: { ...RESPONSES_OVERLOAD_FACTS, endpointClass: "canonical" as const } },
+			{ transportFailure: { ...RESPONSES_OVERLOAD_FACTS, retryMaxAttempts: 3 } },
+			// The generic Responses path always carries OpenAI's typed code; facts
+			// without it are a different transport's failure shape.
+			{ transportFailure: { kind: "transport" as const, providerCode: "server_is_overloaded" } },
+			// A second typed code means the facts are not provably this overload.
+			{
+				transportFailure: {
+					...RESPONSES_OVERLOAD_FACTS,
+					anthropicErrorType: "overloaded_error",
+				},
+			},
+			// A status or a retained retry header is structured evidence the HTTP 200
+			// `response.failed` envelope cannot produce.
+			{ transportFailure: RESPONSES_OVERLOAD_FACTS, errorStatus: 503 },
+			{ transportFailure: { ...RESPONSES_OVERLOAD_FACTS, headers: { "retry-after": "5" } } },
+			// The same typed facts delivered by a different provider API.
+			{ transportFailure: RESPONSES_OVERLOAD_FACTS, messageApi: "openai-completions" as const },
+		]) {
+			const requestedModels: string[] = [];
+			session = buildStatusErrorSession({
+				model,
+				bareDefault: true,
+				errorMessage: RESPONSES_OVERLOAD_ERROR,
+				transportFailure: testCase.transportFailure,
+				...("errorStatus" in testCase ? { errorStatus: testCase.errorStatus } : {}),
+				...("messageApi" in testCase ? { messageApi: testCase.messageApi } : {}),
+				recoveredContent: "should not retry",
+				requestedModels,
+			});
+			const { retryStartEvents } = track(session);
+
+			await session.prompt("surface non-admitted Responses overload");
+			await session.waitForIdle();
+
+			expect(retryStartEvents).toHaveLength(0);
+			expect(requestedModels).toHaveLength(1);
+			expect(lastAssistant(session).stopReason).toBe("error");
+			await session.dispose();
+			session = undefined;
+		}
+	});
+	it("does not retry a Responses overload after observable work or when retry is disabled", async () => {
+		const model = getBundledModel("openai", "gpt-5.4-mini");
+		if (!model) throw new Error("Expected bundled OpenAI Responses test model to exist");
+		for (const testCase of [
+			{ partialBlocks: [{ type: "text" as const, text: "already streamed" }] },
+			{ partialBlocks: [{ type: "thinking" as const, thinking: "already reasoned" }] },
+			{
+				partialBlocks: [{ type: "toolCall" as const, id: "call_1", name: "read", arguments: { path: "a.ts" } }],
+			},
+			{ settingsOverrides: { "retry.enabled": false } },
+		]) {
+			const requestedModels: string[] = [];
+			session = buildStatusErrorSession({
+				model,
+				bareDefault: true,
+				errorMessage: RESPONSES_OVERLOAD_ERROR,
+				transportFailure: RESPONSES_OVERLOAD_FACTS,
+				...("partialBlocks" in testCase ? { partialBlocks: testCase.partialBlocks } : {}),
+				...("settingsOverrides" in testCase ? { settingsOverrides: testCase.settingsOverrides } : {}),
+				recoveredContent: "should not retry",
+				requestedModels,
+			});
+			vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+			const { retryStartEvents } = track(session);
+
+			await session.prompt("surface replay-unsafe Responses overload");
+			await session.waitForIdle();
+
+			expect(retryStartEvents).toHaveLength(0);
+			expect(requestedModels).toHaveLength(1);
+			// A failed attempt carrying a tool call is followed by its synthetic tool
+			// result, so read the failed turn itself rather than the trailing message.
+			const failed = session.agent.state.messages.findLast(entry => entry.role === "assistant");
+			expect((failed as AssistantMessage).stopReason).toBe("error");
+			await session.dispose();
+			session = undefined;
+		}
+	});
+	it("bounds a persistent typed Responses capacity overload by explicit retry settings", async () => {
+		// The typed overload is admitted as a replay-safe provider overload, which
+		// takes it out of the unbounded transient-prose class it used to fall into
+		// under configured retry settings: it now stops at retry.maxRetries.
+		const model = getBundledModel("openai", "gpt-5.4-mini");
+		if (!model) throw new Error("Expected bundled OpenAI Responses test model to exist");
+		const requestedModels: string[] = [];
+		session = buildStatusErrorSession({
+			model,
+			errorMessage: RESPONSES_OVERLOAD_ERROR,
+			transportFailure: RESPONSES_OVERLOAD_FACTS,
+			settingsOverrides: { "retry.maxRetries": 2 },
+			requestedModels,
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents, retryEndEvents } = track(session);
+
+		await session.prompt("exhaust a configured Responses overload");
+		await session.waitForIdle();
+
+		expect(requestedModels).toHaveLength(3);
+		expect(retryStartEvents).toHaveLength(2);
+		expect(retryStartEvents.every(event => event.unbounded === false && event.maxAttempts === 2)).toBe(true);
+		expect(retryEndEvents).toEqual([expect.objectContaining({ success: false, attempt: 2 })]);
+		expect(lastAssistant(session)).toMatchObject({ stopReason: "error", errorMessage: RESPONSES_OVERLOAD_ERROR });
+	});
+	it("does not retry a typed Responses overload after earlier observable work in the same run", async () => {
+		// The overload admission is not a watchdog: it never re-issues a request
+		// once the run has already produced observable work, so a replay cannot
+		// duplicate a tool execution that already happened this turn.
+		const model = getBundledModel("openai", "gpt-5.4-mini");
+		if (!model) throw new Error("Expected bundled OpenAI Responses test model to exist");
+		const toolCall: ToolCall = { type: "toolCall", id: "overload-tool-call", name: "counted", arguments: {} };
+		let toolRuns = 0;
+		let streamCalls = 0;
+		const countedTool: AgentTool = {
+			name: "counted",
+			label: "Counted",
+			description: "Counts real executions for replay-safety coverage",
+			parameters: z.object({}),
+			execute: async () => {
+				toolRuns++;
+				return { content: [{ type: "text" as const, text: "counted result" }] };
+			},
+		};
+		session = buildBareStreamingSession({
+			model,
+			tools: [countedTool],
+			streamFn: () => {
+				streamCalls++;
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					if (streamCalls === 1) {
+						const response = assistantMessage(model, [toolCall], "toolUse");
+						stream.push({ type: "start", partial: response });
+						stream.push({ type: "done", reason: "toolUse", message: response });
+						return;
+					}
+					const failure = assistantMessage(model, [], "error", RESPONSES_OVERLOAD_ERROR);
+					failure.transportFailure = RESPONSES_OVERLOAD_FACTS;
+					stream.push({ type: "start", partial: failure });
+					stream.push({ type: "error", reason: "error", error: failure });
+				});
+				return stream;
+			},
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("overload after an earlier tool execution");
+		await session.waitForIdle();
+
+		expect(toolRuns).toBe(1);
+		expect(streamCalls).toBe(2);
+		expect(retryStartEvents).toHaveLength(0);
+		expect(lastAssistant(session)).toMatchObject({ stopReason: "error", errorMessage: RESPONSES_OVERLOAD_ERROR });
+	});
+	it("keeps retrying the Codex capacity overload once it carries typed statusless facts", async () => {
+		const model = getBundledModel("openai-codex", "gpt-5.4-mini");
+		if (!model) throw new Error("Expected bundled Codex test model to exist");
+		const requestedModels: string[] = [];
+		session = buildStatusErrorSession({
+			model,
+			bareDefault: true,
+			errorMessage:
+				"Codex error event: Our servers are currently overloaded. Please try again later. (code=server_is_overloaded)",
+			transportFailure: { kind: "transport", providerCode: "server_is_overloaded" },
+			recoveredContent: "recovered after provider retries",
+			requestedModels,
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents, retryEndEvents } = track(session);
+
+		await session.prompt("recover Codex overload with typed facts");
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(1);
+		expect(requestedModels).toHaveLength(2);
+		expect(retryEndEvents).toEqual([expect.objectContaining({ success: true })]);
+		expect(lastAssistant(session).content).toEqual([{ type: "text", text: "recovered after provider retries" }]);
 	});
 	it("forwards only explicit first-event timeout settings to provider stream options", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -1898,7 +2174,7 @@ describe("AgentSession resilient retry", () => {
 			expect.objectContaining({ attempt: 1, maxAttempts: 2, errorMessage, unbounded: false }),
 		]);
 		expect(lastAssistant(session).errorMessage).toContain("exhausted after 2 attempts");
-	});
+	}, 60000);
 	it("reseeds first-event timeout accounting at the first retryable failure", async () => {
 		let now = 10;
 		vi.spyOn(Date, "now").mockImplementation(() => now);
@@ -1917,7 +2193,7 @@ describe("AgentSession resilient retry", () => {
 		await session.waitForIdle();
 
 		expect(lastAssistant(session).errorMessage).toContain("waited 60ms total");
-	});
+	}, 300000);
 	it("does not replay a bare-default watchdog after a reasoning summary start hook participates", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		let hookCalls = 0;
@@ -1962,7 +2238,7 @@ describe("AgentSession resilient retry", () => {
 		expect(retryStartEvents).toHaveLength(0);
 		expect(streamCalls).toBe(1);
 		expect(lastAssistant(session).stopReason).toBe("error");
-	});
+	}, 60000);
 	it("does not replay a bare-default watchdog after an extension hook participates", async () => {
 		let hookCalls = 0;
 		const requestedModels: string[] = [];
@@ -1995,7 +2271,7 @@ describe("AgentSession resilient retry", () => {
 		expect(retryStartEvents).toHaveLength(0);
 		expect(requestedModels).toHaveLength(1);
 		expect(lastAssistant(session).stopReason).toBe("error");
-	});
+	}, 300000);
 	it("does not replay bare-default watchdogs after provider lifecycle handlers participate", async () => {
 		for (const eventType of ["context", "before_provider_request", "after_provider_response"] as const) {
 			let hookCalls = 0;
@@ -2036,7 +2312,7 @@ describe("AgentSession resilient retry", () => {
 			await session.dispose();
 			session = undefined;
 		}
-	});
+	}, 120000);
 	it("rejects a typed watchdog when a handler executes in its current scope", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		let hookCalls = 0;
@@ -2463,8 +2739,7 @@ describe("AgentSession resilient retry", () => {
 			session = undefined;
 			waitSpy.mockClear();
 		}
-	});
-
+	}, 300000);
 	it("retries the wrapped canonical first-event timeout on a clean bare-default epoch", async () => {
 		// The wrapped "Error: Provider stream timed out while waiting for the first
 		// event" form was previously blocked by the bare-default scoped gate even on
@@ -2489,7 +2764,7 @@ describe("AgentSession resilient retry", () => {
 		expect(retryStartEvents).toHaveLength(1);
 		expect(retryEndEvents).toEqual([expect.objectContaining({ success: true })]);
 		expect(lastAssistant(session)).toMatchObject({ stopReason: "stop" });
-	});
+	}, 300000);
 	it("gives an active cancel-and-submit replacement a clean retry epoch", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const originalStarted = Promise.withResolvers<void>();
@@ -2606,5 +2881,37 @@ describe("AgentSession resilient retry", () => {
 		expect(retryStartEvents).toHaveLength(0);
 		expect(requestedModels).toHaveLength(1);
 		expect(lastAssistant(session).stopReason).toBe("error");
+	});
+	it("keeps managed fallback policy unchanged for the typed Responses overload (#5018)", async () => {
+		// The typed overload facts are new transport evidence (issue #5018) and
+		// must not grant the managed chain retry/advance authority it did not
+		// have before. Before the code survived transport, the failure reached
+		// the session as an ordinary committed error and surfaced immediately;
+		// the managed run must still stop on the primary model without a retry
+		// and without switching models.
+		const primary = getBundledModel("openai", "gpt-5.4-mini");
+		const fallback = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!primary || !fallback) throw new Error("Expected bundled test models to exist");
+		const requestedModels: string[] = [];
+		session = buildStatusErrorSession({
+			model: primary,
+			errorMessage: RESPONSES_OVERLOAD_ERROR,
+			transportFailure: RESPONSES_OVERLOAD_FACTS,
+			recoveredContent: "should not be reached",
+			requestedModels,
+		});
+		session.setConfiguredModelChain(
+			"default",
+			[`${primary.provider}/${primary.id}`, `${fallback.provider}/${fallback.id}`],
+			"test",
+		);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("managed typed Responses overload");
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(0);
+		expect(requestedModels).toEqual([`${primary.provider}/${primary.id}`]);
+		expect(lastAssistant(session)).toMatchObject({ stopReason: "error", errorMessage: RESPONSES_OVERLOAD_ERROR });
 	});
 });

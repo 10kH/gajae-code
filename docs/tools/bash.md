@@ -57,12 +57,12 @@ Stdout and stderr are merged before the model sees them. Non-zero exit codes are
 8. Execution path splits:
    1. `async: true` -> `#startManagedBashJob()` registers a session async job and returns immediately.
    2. Non-PTY with `bash.autoBackground.enabled` and an async job manager -> starts a managed job, waits up to `min(thresholdMs, timeoutMs - 1000)`, and either returns the completed result or converts the run into a background job.
-   3. Otherwise runs foreground execution.
+   3. Foreground non-PTY, ACP client-terminal, and PTY waits are manager-backed when async support is available, so the fold chord can transfer ownership without restarting the command; otherwise they remain ordinary foreground waits.
 9. Foreground non-PTY calls `executeBash()` from `packages/coding-agent/src/exec/bash-executor.ts`.
 10. Foreground PTY calls `runInteractiveBashPty()` from `packages/coding-agent/src/tools/bash-interactive.ts`.
 11. Both paths allocate an output artifact first when `session.allocateOutputArtifact` is available. The artifact path/id are passed into the sink so large output can spill to disk.
 12. `executeBash()` loads shell settings, optional shell snapshot, and shell minimizer settings, then runs via a persistent native `Shell` session or one-shot `executeShell()`. `docs/bash-tool-runtime.md` covers that path in detail.
-13. `runInteractiveBashPty()` creates a `PtySession`, overlays an xterm-backed console UI, forwards user key input into the PTY, captures output through `OutputSink`, and kills the PTY on dismiss/dispose.
+13. `runInteractiveBashPty()` creates a `PtySession`, overlays an xterm-backed console UI, forwards user key input into the PTY, captures output through `OutputSink`, and keeps the PTY owned by the manager when its observer folds. Escape explicitly kills; disposal alone never kills folded work.
 14. On completion, `#buildCompletedResult()` formats `(no output)` when needed, attaches truncation metadata from the `OutputSink` summary, and re-checks exit status / timeout / cancellation before returning.
 15. On non-zero exit, timeout, missing exit status, or cancellation, `#buildResultText()` throws with the captured output included in the error message.
 
@@ -73,7 +73,7 @@ Stdout and stderr are merged before the model sees them. Non-zero exit codes are
    - Streams tail-only updates through `streamTailUpdates()` and `TailBuffer(DEFAULT_MAX_BYTES)`.
 2. Foreground PTY
    - Requires `pty: true`, UI context, and `GJC_NO_PTY !== "1"`.
-   - Uses `runInteractiveBashPty()` and a `PtySession` overlay.
+   - Uses `runInteractiveBashPty()` and a `PtySession` overlay; observer disposal is non-owning, while Escape or `job cancel` kills the session.
    - Supports interactive input; `Esc` kills the session from the overlay.
 3. Explicit background job
    - Requires `async: true` and `async.enabled`.
@@ -83,7 +83,11 @@ Stdout and stderr are merged before the model sees them. Non-zero exit codes are
    - Starts like a foreground managed job, then backgrounds it when it outlives the wait window.
 5. Intercepted command
    - No subprocess created.
-   - Returns a `ToolError` pointing the model at `read`, `search`, `find`, `edit`, or `write`.
+
+6. Foreground fold
+   - The remappable `app.tool.backgroundFold` chord (Alt+Shift+B by default; Cmd+B on macOS) can fold a running managed non-PTY Bash wait, ACP client-terminal wait, or PTY wait into a manager-owned job.
+   - The foreground turn stops cleanly after the result boundary; completion wakes a later turn with a receipt containing output, original intent, and a `job` retrieval handle.
+   - Folded jobs retain their original deadline and live `job tail` output. PTY observer disposal is non-owning; `job cancel` kills the live PTY through the manager lifecycle.
 
 ## Side Effects
 - Filesystem
@@ -103,7 +107,7 @@ Stdout and stderr are merged before the model sees them. Non-zero exit codes are
   - Background start messages direct the agent to the `job` tool (use `list: true` for a snapshot, or pass `poll: [id]` to wait).
 - Background work / cancellation
   - Async and auto-background jobs continue after the initial tool return.
-  - Cancellation aborts the native run; PTY overlay dismissal also kills the PTY.
+  - Cancellation aborts the native run; Escape and `job cancel` kill a PTY, while overlay disposal alone is non-owning for folded work.
 
 ## Limits & Caps
 - Default timeout: `300s` (`TOOL_TIMEOUTS.bash.default` in `packages/coding-agent/src/tools/tool-timeouts.ts`).

@@ -94,6 +94,60 @@ describe("Anthropic native search over a proxy", () => {
 		).rejects.toThrow();
 		expect(calls).toBe(0);
 	});
+
+	it("uses each same-provider registry's active key and endpoint", async () => {
+		const requests: Array<{ url: string; key: string | undefined }> = [];
+		using _hook = hookFetch(async (input, init) => {
+			const headers = (init?.headers as Record<string, string>) ?? {};
+			requests.push({
+				url: String(input),
+				key: headers["x-api-key"] ?? headers.Authorization?.replace(/^Bearer /, ""),
+			});
+			return Response.json({
+				id: "msg-shared",
+				model: "claude-sonnet-4",
+				usage: { input_tokens: 1, output_tokens: 1 },
+				content: [
+					{
+						type: "web_search_tool_result",
+						content: [{ type: "web_search_result", title: "Alpha", url: "https://example.com/a" }],
+					},
+				],
+			});
+		});
+
+		const firstContext: ActiveSearchModelContext = {
+			...ctx,
+			provider: "shared-provider",
+			baseUrl: "https://first.example",
+			resolveCredentials: async () => ({ apiKey: "first-key" }),
+		};
+		const secondContext: ActiveSearchModelContext = {
+			...ctx,
+			provider: "shared-provider",
+			baseUrl: "https://second.example",
+			resolveCredentials: async () => ({ apiKey: "second-key" }),
+		};
+		const canonicalStorage = keyAuth({ anthropic: "canonical-unowned-key" });
+
+		await new AnthropicProvider().search({
+			query: "hello",
+			systemPrompt: "Use web search.",
+			authStorage: canonicalStorage,
+			activeModelContext: firstContext,
+		});
+		await new AnthropicProvider().search({
+			query: "hello",
+			systemPrompt: "Use web search.",
+			authStorage: canonicalStorage,
+			activeModelContext: secondContext,
+		});
+
+		expect(requests).toEqual([
+			{ url: "https://first.example/v1/messages?beta=true", key: "first-key" },
+			{ url: "https://second.example/v1/messages?beta=true", key: "second-key" },
+		]);
+	});
 });
 
 describe("Gemini native search over a proxy", () => {

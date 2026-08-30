@@ -343,7 +343,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 						return { retried: true, immediate: true };
 					}
 					case "bash.background": {
-						if (!session.requestForegroundBashBackground())
+						if (!(await session.requestForegroundBashBackground()))
 							throw Object.assign(
 								new Error("The active bash command cannot be moved to a managed background job."),
 								{ code: "not_foldable" },

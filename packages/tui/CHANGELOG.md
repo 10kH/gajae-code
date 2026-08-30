@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+## [0.15.6] - 2026-08-30
+
+### Fixed
+
+- Composer file autocomplete now keeps the `@` fuzzy/chosung path reachable from explicit Tab and while Korean query characters are typed, without changing ordinary path-prefix completion.
+
+## [0.15.5] - 2026-08-29
+
+### Added
+
+- `@` fuzzy file search supports Hangul chosung (초성) matching: a bare consonant matches any syllable with that initial, so `@ㅎㄱ` finds `한글.txt`. Literal and full-syllable matches keep ranking above chosung matches.
+
+## [0.15.4] - 2026-08-29
+
+### Fixed
+
+- Path autocomplete matches decomposed (NFD) file names against composed (NFC) input. Composer keystrokes are NFC-normalized while macOS volumes commonly return Hangul and other composed scripts in NFD, so `@한` found nothing even though `한글.txt` existed; both the directory-listing prefix match and the fuzzy filter now compare NFC forms while completion values keep the on-disk name. The native fuzzy finder applies the same normalization to queries and candidates.
+
+## [0.15.3] - 2026-08-27
+
 ### Fixed
 
 - Loader instances can opt into layout-only repaint requests so transient status animation does not force unchanged transcript subtree reconstruction.

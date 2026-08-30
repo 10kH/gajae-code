@@ -11,10 +11,31 @@ import {
 } from "@gajae-code/ai";
 import { setAgentDir } from "@gajae-code/utils";
 import { runAuthBrokerCommand } from "../src/cli/auth-broker-cli";
-import { runAuthGatewayCommand } from "../src/cli/auth-gateway-cli";
+import { matchesProviderCredential, runAuthGatewayCommand } from "../src/cli/auth-gateway-cli";
 
 const SECRET = "auth-cli-provider-secret";
 const ENV_KEYS = ["GJC_AUTH_BROKER_URL", "GJC_AUTH_BROKER_TOKEN"] as const;
+
+describe("auth gateway credential matching", () => {
+	it("accepts the token from a structured OAuth API key", () => {
+		expect(
+			matchesProviderCredential(
+				{
+					id: 1,
+					provider: "anthropic",
+					credential: {
+						type: "oauth",
+						access: "access-token",
+						refresh: "__remote__",
+						expires: Date.now() + 60_000,
+					},
+					identityKey: null,
+				},
+				'{"token":"access-token","enterpriseUrl":"https://example.test"}',
+			),
+		).toBe(true);
+	});
+});
 
 async function captureOutput(run: () => Promise<void>): Promise<{ stdout: string; stderr: string }> {
 	const originalStdout = process.stdout.write.bind(process.stdout);
@@ -115,7 +136,7 @@ describe("auth CLI diagnostic redaction", () => {
 		process.exitCode = 0;
 		const textOutput = await captureOutput(() => runAuthBrokerCommand({ action: "status", flags: { json: false } }));
 		expect(textOutput.stdout).not.toContain(SECRET);
-		expect(textOutput.stdout).toContain("api_key=[redacted]");
+		expect(textOutput.stdout).toContain("Credential diagnostic unavailable.");
 	});
 
 	it("redacts provider check reasons in gateway text and JSON output", async () => {
@@ -149,19 +170,42 @@ describe("auth CLI diagnostic redaction", () => {
 				runAuthGatewayCommand({ action: "check", flags: { json: true } }),
 			);
 			expect(jsonOutput.stdout).not.toContain(SECRET);
-			expect(jsonOutput.stdout).toContain("api_key=[redacted]");
+			expect(jsonOutput.stdout).toContain("Credential check failed.");
 
 			process.exitCode = 0;
 			const textOutput = await captureOutput(() =>
 				runAuthGatewayCommand({ action: "check", flags: { json: false } }),
 			);
 			expect(textOutput.stdout).not.toContain(SECRET);
-			expect(textOutput.stdout).toContain("api_key=[redacted]");
+			expect(textOutput.stdout).toContain("Credential check failed.");
 		} finally {
 			await handle?.close();
 			brokerStorage?.close();
 			brokerStore?.close();
 			await fs.rm(brokerDir, { recursive: true, force: true });
 		}
+	});
+
+	it("uses a stable generic message when credential checking fails at command level", async () => {
+		process.env.GJC_AUTH_BROKER_URL = "https://broker.example";
+		process.env.GJC_AUTH_BROKER_TOKEN = "operator-token";
+		vi.spyOn(AuthBrokerClient.prototype, "fetchSnapshot").mockResolvedValue({
+			status: 200,
+			generation: 1,
+			snapshot: {
+				generation: 1,
+				generatedAt: 1,
+				serverNowMs: 1,
+				refresher: { enabled: false, intervalMs: 0, skewMs: 0, nextSweepInMs: Number.MAX_SAFE_INTEGER },
+				credentials: [],
+			},
+		});
+		vi.spyOn(AuthStorage.prototype, "checkCredentials").mockRejectedValue(
+			new Error(`provider account=${SECRET} email=user@example.com`),
+		);
+		const output = await captureOutput(() => runAuthGatewayCommand({ action: "check", flags: { json: false } }));
+		expect(output.stderr).not.toContain(SECRET);
+		expect(output.stderr).not.toContain("user@example.com");
+		expect(output.stderr).toContain("Credential check failed.");
 	});
 });

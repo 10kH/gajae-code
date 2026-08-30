@@ -329,7 +329,12 @@ function getByPath(obj: RawSettings, segments: string[]): unknown {
 
 const PATH_SCOPED_ARRAY_SETTINGS = new Set<SettingPath>(["enabledModels", "disabledProviders"]);
 /** Operator-owned settings which must never be workspace-controlled or runtime-overridden. */
-const GLOBAL_ONLY_SETTINGS = new Set<SettingPath>(["crashReport.upstream", "crashReport.upstreamDsn", "ui.language"]);
+const GLOBAL_ONLY_SETTINGS = new Set<SettingPath>([
+	"crashReport.upstream",
+	"crashReport.upstreamDsn",
+	"ui.language",
+	"telemetry.enabled",
+]);
 const LEGACY_THEME_NAME_REPLACEMENTS = {
 	dark: "red-claw",
 	light: "blue-crab",
@@ -1174,7 +1179,7 @@ export class Settings implements NotificationSettingsReader {
 		for (const key of Object.keys(SETTINGS_SCHEMA) as SettingPath[]) {
 			if (key.startsWith(`${prefix}.`)) {
 				const suffix = key.slice(prefix.length + 1);
-				result[suffix] = this.get(key);
+				setByPath(result, suffix.split("."), this.get(key));
 			}
 		}
 		return result as unknown as GroupTypeMap[G];

@@ -181,6 +181,11 @@ const builtInOAuthProviders: OAuthProviderInfo[] = [
 		available: true,
 	},
 	{
+		id: "commandcode-goat",
+		name: "Command Code GOAT",
+		available: true,
+	},
+	{
 		id: "openrouter",
 		name: "OpenRouter",
 		available: true,
@@ -400,6 +405,7 @@ export async function refreshOAuthToken(
 		case "huggingface":
 		case "opencode-zen":
 		case "opencode-go":
+		case "commandcode-goat":
 		case "cerebras":
 		case "deepinfra":
 		case "fireworks":
@@ -534,10 +540,19 @@ export function resolveOAuthStorageProvider(provider: OAuthProviderId): OAuthPro
  * Get list of OAuth providers.
  */
 export function getOAuthProviders(): OAuthProviderInfo[] {
-	const customProviders = Array.from(customOAuthProviders.values(), provider => ({
-		id: provider.id,
-		name: provider.name,
-		available: true,
-	}));
+	const builtInIds = new Set(builtInOAuthProviders.map(provider => provider.id));
+	// A custom provider colliding with a built-in id (e.g. an external
+	// integration mistakenly registering "kiro") must never produce a
+	// duplicate list entry: AuthStorage.login()'s switch statement always
+	// dispatches a matched built-in `case` before falling through to the
+	// custom-provider registry, so the built-in always wins the route and
+	// the advertised list must reflect that, not double-list the id.
+	const customProviders = Array.from(customOAuthProviders.values())
+		.filter(provider => !builtInIds.has(provider.id))
+		.map(provider => ({
+			id: provider.id,
+			name: provider.name,
+			available: true,
+		}));
 	return [...builtInOAuthProviders, ...customProviders];
 }

@@ -27,6 +27,7 @@ import {
 	persistCoordinatorRuntimeInputReady,
 	persistCoordinatorRuntimeStateFromEvent,
 	persistCoordinatorRuntimeStateFromPostmortem,
+	persistCoordinatorWorkerIntegrationOutcome,
 	publicRuntimeToolActivity,
 	readTerminalRuntimeStateMarker,
 	stateForEvent,
@@ -131,6 +132,62 @@ async function readJson(file: string): Promise<Record<string, unknown>> {
 }
 
 describe("coordinator runtime state sidecar", () => {
+	it("persists post-publication integration failures with correlation", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "agent_start" },
+			{ sessionId: "reconcile", cwd: root, sessionFile: null },
+		);
+		await persistCoordinatorRuntimeStateFromEvent(
+			{
+				type: "agent_end",
+				messages: [{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] }],
+			},
+			{ sessionId: "reconcile", cwd: root, sessionFile: null },
+		);
+		await persistCoordinatorWorkerIntegrationOutcome(
+			{ sessionId: "reconcile", cwd: root, sessionFile: null },
+			{
+				kind: "worker_integration",
+				status: "failed",
+				correlationId: "cmd:turn",
+				error: "worker\u0000 unavailable\n",
+			},
+		);
+		const payload = await readJson(stateFile);
+		expect(payload.worker_integration).toMatchObject({
+			status: "failed",
+			correlation_id: "cmd:turn",
+			error: "worker  unavailable",
+		});
+		expect(payload.error).toMatchObject({ code: "worker_integration_failed", recoverable: true });
+	});
+
+	it("terminalizes prior running state when terminal persistence fails", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "agent_start" },
+			{ sessionId: "terminal-failure", cwd: root, sessionFile: null },
+		);
+		await persistCoordinatorWorkerIntegrationOutcome(
+			{ sessionId: "terminal-failure", cwd: root, sessionFile: null },
+			{ kind: "terminal_persistence", status: "failed", error: "write failed" },
+		);
+		await expect(readJson(stateFile)).resolves.toMatchObject({
+			state: "errored",
+			ready_for_input: false,
+			live: false,
+			current_turn_id: null,
+			execution_state: "failed",
+			receipt_state: "absent",
+			error: { code: "terminal_persistence_failed", recoverable: true },
+		});
+	});
+
 	it("regresses signed subprocess bootstrap, continuation, and tamper refusal", async () => {
 		const root = await tempRoot();
 		const stateFile = path.join(root, "state.json");

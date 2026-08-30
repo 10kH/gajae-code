@@ -118,6 +118,7 @@ describe("ModelRegistry runtime provider registration", () => {
 			expect(await registry.getApiKeyForProvider("envProvider")).toBe("resolved-env-secret");
 
 			delete process.env[keyEnv];
+			registry.dispose();
 			authStorage.clearConfigApiKeys();
 			const missingEnvRegistry = new ModelRegistry(authStorage, modelsJsonPath);
 			expect(await missingEnvRegistry.getApiKeyForProvider("envProvider")).toBeUndefined();
@@ -406,6 +407,94 @@ describe("ModelRegistry runtime provider registration", () => {
 		expect(registry.authStorage.hasAuth("runtime-provider")).toBe(true);
 
 		delete process.env.TEST_RUNTIME_KEY;
+	});
+
+	test("runtime literal credentials take precedence over colliding static apiKeyEnv credentials", async () => {
+		const staticKeyEnv = `GJC_TEST_STATIC_COLLISION_KEY_${Snowflake.next()}`;
+		process.env[staticKeyEnv] = "static-collision-key";
+		await Bun.write(
+			modelsJsonPath,
+			JSON.stringify({
+				providers: {
+					"collision-provider": {
+						baseUrl: "https://collision.example.com/v1",
+						api: "openai-completions",
+						apiKeyEnv: staticKeyEnv,
+						authHeader: true,
+						models: [{ ...baseModel, id: "collision-model" }],
+					},
+				},
+			}),
+		);
+
+		try {
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			registry.registerProvider(
+				"collision-provider",
+				{ apiKey: "runtime-literal-key", authHeader: true },
+				"ext://runtime",
+			);
+
+			expect(await registry.getApiKeyForProvider("collision-provider")).toBe("runtime-literal-key");
+			expect(registry.getAvailable().some(model => model.provider === "collision-provider")).toBe(true);
+			expect(registry.find("collision-provider", "collision-model")?.headers?.Authorization).toBe(
+				"Bearer runtime-literal-key",
+			);
+
+			registry.clearSourceRegistrations("ext://runtime");
+			expect(await registry.getApiKeyForProvider("collision-provider")).toBe("static-collision-key");
+			expect(registry.find("collision-provider", "collision-model")?.headers?.Authorization).toBe(
+				"Bearer static-collision-key",
+			);
+		} finally {
+			delete process.env[staticKeyEnv];
+		}
+	});
+
+	test("runtime apiKeyEnv removal restores static credentials and generated headers", async () => {
+		const staticKeyEnv = `GJC_TEST_STATIC_RESTORE_KEY_${Snowflake.next()}`;
+		const runtimeKeyEnv = `GJC_TEST_RUNTIME_RESTORE_KEY_${Snowflake.next()}`;
+		process.env[staticKeyEnv] = "static-restore-key";
+		process.env[runtimeKeyEnv] = "runtime-restore-key";
+		await Bun.write(
+			modelsJsonPath,
+			JSON.stringify({
+				providers: {
+					"restore-provider": {
+						baseUrl: "https://restore.example.com/v1",
+						api: "openai-completions",
+						apiKeyEnv: staticKeyEnv,
+						authHeader: true,
+						models: [{ ...baseModel, id: "restore-model" }],
+					},
+				},
+			}),
+		);
+
+		try {
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			registry.registerProvider("restore-provider", { apiKey: runtimeKeyEnv, authHeader: true }, "ext://runtime");
+			expect(await registry.getApiKeyForProvider("restore-provider")).toBe("runtime-restore-key");
+			expect(registry.find("restore-provider", "restore-model")?.headers?.Authorization).toBe(
+				"Bearer runtime-restore-key",
+			);
+
+			delete process.env[runtimeKeyEnv];
+			expect(registry.getAvailable().some(model => model.provider === "restore-provider")).toBe(true);
+			expect(await registry.getApiKeyForProvider("restore-provider")).toBe("static-restore-key");
+			expect(registry.find("restore-provider", "restore-model")?.headers?.Authorization).toBe(
+				"Bearer static-restore-key",
+			);
+
+			process.env[runtimeKeyEnv] = "runtime-restore-key-2";
+			expect(await registry.getApiKeyForProvider("restore-provider")).toBe("runtime-restore-key-2");
+			expect(registry.find("restore-provider", "restore-model")?.headers?.Authorization).toBe(
+				"Bearer runtime-restore-key-2",
+			);
+		} finally {
+			delete process.env[staticKeyEnv];
+			delete process.env[runtimeKeyEnv];
+		}
 	});
 
 	test("extension-registered custom API handler survives model refresh", async () => {

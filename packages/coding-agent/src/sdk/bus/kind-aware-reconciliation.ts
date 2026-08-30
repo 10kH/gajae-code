@@ -21,6 +21,8 @@ import type {
 	ReconciliationStore,
 } from "./reconciliation-store";
 
+const EMPTY_PROMPT_FAILURE = { code: "prompt_failed", message: "Prompt submission failed." } as const;
+
 export type { ReconciliationKind };
 
 export interface KindCorrelation extends PromptCorrelation {
@@ -51,8 +53,13 @@ export interface KindAwareReconciliation {
 		kind: ReconciliationKind,
 		correlation: PromptCorrelation | undefined,
 		frame:
-			| { type: "agent_start" | "agent_end"; content?: TurnResultContent }
-			| { type: "agent_failed"; error: unknown; content?: TurnResultContent },
+			| {
+					type: "agent_start" | "agent_end";
+					content?: TurnResultContent;
+					hasActivity?: boolean;
+					outcome?: SdkPromptTerminalOutcome;
+			  }
+			| { type: "agent_failed"; error: unknown; content?: TurnResultContent; hasActivity?: boolean },
 	): Promise<void>;
 	claimPendingOutcome(
 		kind: ReconciliationKind,
@@ -340,8 +347,13 @@ export function createKindAwareReconciliation(
 		kind: ReconciliationKind,
 		correlation: PromptCorrelation | undefined,
 		frame:
-			| { type: "agent_start" | "agent_end"; content?: TurnResultContent }
-			| { type: "agent_failed"; error: unknown; content?: TurnResultContent },
+			| {
+					type: "agent_start" | "agent_end";
+					content?: TurnResultContent;
+					hasActivity?: boolean;
+					outcome?: SdkPromptTerminalOutcome;
+			  }
+			| { type: "agent_failed"; error: unknown; content?: TurnResultContent; hasActivity?: boolean },
 	) => {
 		if (!correlation) return;
 		await queueMutation(candidate => {
@@ -355,7 +367,13 @@ export function createKindAwareReconciliation(
 				// as-is (cleanupRecords is intentionally not re-run). First reason wins: a
 				// late generic frame never overwrites a specific one. Persisted so the reason
 				// survives reconnect/restart reconciliation.
-				if (frame.type === "agent_failed" && record.error === undefined) {
+				if (frame.type === "agent_failed") {
+					const failure = sanitizePromptFailure(frame.error);
+					if (
+						record.error !== undefined &&
+						!(record.error.code === "agent_failed" && failure.code !== "agent_failed")
+					)
+						return { value: undefined, changed: false };
 					record.error = sanitizePromptFailure(frame.error);
 					return { value: undefined, changed: true };
 				}
@@ -373,7 +391,9 @@ export function createKindAwareReconciliation(
 			if (frame.type === "agent_failed") {
 				// agent_failed is additive diagnostics; agent_end remains the sole
 				// terminal lifecycle boundary for the correlated invocation.
-				record.error ??= sanitizePromptFailure(frame.error);
+				const failure = sanitizePromptFailure(frame.error);
+				if (record.error === undefined || (record.error.code === "agent_failed" && failure.code !== "agent_failed"))
+					record.error = failure;
 				delete record.deadlineRecoveryPending;
 				delete record.deadlineMaxAt;
 				return { value: undefined, changed: true };
@@ -404,7 +424,17 @@ export function createKindAwareReconciliation(
 				record.receiptState = record.pendingReceiptState ?? "missing";
 				record.pendingReceiptState = undefined;
 			} else {
-				record.status = record.error === undefined ? "terminal_ok" : "failed";
+				if (
+					kind === "prompt" &&
+					record.error === undefined &&
+					frame.type === "agent_end" &&
+					frame.outcome?.kind !== "stopped" &&
+					!frame.content?.text.trim() &&
+					!frame.hasActivity
+				) {
+					record.status = "failed";
+					record.error = EMPTY_PROMPT_FAILURE;
+				} else record.status = record.error === undefined ? "terminal_ok" : "failed";
 				record.receiptState = frame.content?.text?.trim() ? "present" : "missing";
 			}
 			cleanupRecords(candidate);
@@ -445,6 +475,7 @@ export function createKindAwareReconciliation(
 					: undefined;
 		const content =
 			typeof arg4 === "function" ? arg6 : typeof arg5 === "object" && arg5 !== null && "code" in arg5 ? arg6 : arg5;
+		const sanitizedContent = sanitizeTurnResultContent(content);
 		await queueMutation(candidate => {
 			if (isCurrent !== undefined && !isCurrent()) return { value: undefined, changed: false };
 			const record = candidate.get(keyOf(kind, correlation));
@@ -455,8 +486,15 @@ export function createKindAwareReconciliation(
 			if (finalOutcome?.kind === "failed") {
 				record.status = "failed";
 				record.error = recordError ?? { code: finalOutcome.code, message: finalOutcome.message };
+			} else if (
+				kind === "prompt" &&
+				((finalOutcome === undefined && !sanitizedContent?.text.trim()) ||
+					(finalOutcome?.kind !== "stopped" && content !== undefined && !sanitizedContent?.text.trim()))
+			) {
+				record.status = "failed";
+				record.error = EMPTY_PROMPT_FAILURE;
 			} else record.status = "terminal_ok";
-			record.content = sanitizeTurnResultContent(content);
+			record.content = sanitizedContent;
 			record.outcome = finalOutcome;
 			record.receiptState = record.pendingReceiptState ?? "unknown";
 			record.pendingOutcome = undefined;

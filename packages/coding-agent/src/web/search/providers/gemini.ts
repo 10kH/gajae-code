@@ -16,7 +16,13 @@ import {
 } from "@gajae-code/ai/providers/google-gemini-headers";
 import { fetchWithRetry } from "@gajae-code/utils";
 
-import type { SearchCitation, SearchResponse, SearchSource } from "../../../web/search/types";
+import type {
+	ActiveSearchModelContext,
+	ActiveSearchModelCredentials,
+	SearchCitation,
+	SearchResponse,
+	SearchSource,
+} from "../../../web/search/types";
 import { SearchProviderError } from "../../../web/search/types";
 import type { SearchParams } from "./base";
 import { SearchProvider } from "./base";
@@ -37,6 +43,49 @@ const RATE_LIMIT_BUDGET_MS = 30 * 1000;
 
 const GEMINI_PROVIDERS = ["google-gemini-cli", "google-antigravity"] as const;
 type GeminiProviderId = (typeof GEMINI_PROVIDERS)[number];
+
+function isGenerativeLanguageWire(api: string): boolean {
+	return api === "google-generative-ai" || api === "google-generative-language" || api === "gemini-wire";
+}
+
+function isGoogleWire(api: string): boolean {
+	return isGenerativeLanguageWire(api) || api === "google-gemini-cli" || api === "google-vertex";
+}
+
+const OFFICIAL_GEMINI_HOSTS = new Set([
+	"cloudcode-pa.googleapis.com",
+	"daily-cloudcode-pa.googleapis.com",
+	"daily-cloudcode-pa.sandbox.googleapis.com",
+	"generativelanguage.googleapis.com",
+]);
+const CANONICAL_GEMINI_PROVIDERS = new Set(["google", "gemini", "google-gemini-cli", "google-antigravity"]);
+
+function isOfficialGeminiBaseUrl(baseUrl: string | undefined): boolean {
+	if (!baseUrl?.trim()) return true;
+	try {
+		const host = new URL(baseUrl).hostname.toLowerCase().replace(/^\[/, "").replace(/\]$/, "").replace(/\.$/, "");
+		return OFFICIAL_GEMINI_HOSTS.has(host);
+	} catch {
+		return false;
+	}
+}
+
+function isCustomGeminiContext(ctx: ActiveSearchModelContext | undefined): boolean {
+	if (!ctx || !isGoogleWire(ctx.api)) return false;
+	if (ctx.ownerAuthOverride) return true;
+	if (!isOfficialGeminiBaseUrl(ctx.baseUrl)) return true;
+	const provider = ctx.provider.toLowerCase();
+	return Boolean(ctx.resolveCredentials && !CANONICAL_GEMINI_PROVIDERS.has(provider));
+}
+
+function isCustomGenerativeLanguageContext(ctx: ActiveSearchModelContext | undefined): boolean {
+	return isGenerativeLanguageWire(ctx?.api ?? "") && isCustomGeminiContext(ctx);
+}
+
+function hasHeader(headers: Record<string, string>, name: string): boolean {
+	const normalized = name.toLowerCase();
+	return Object.keys(headers).some(key => key.toLowerCase() === normalized);
+}
 
 interface GeminiToolParams {
 	google_search?: Record<string, unknown>;
@@ -433,19 +482,28 @@ export async function searchGemini(params: GeminiSearchParams): Promise<SearchRe
  * Native Gemini web search over the public Generative Language REST API
  * (`{baseUrl}/v1beta/models/{model}:generateContent`), reusing the ACTIVE
  * model's own API key + baseUrl. This is the "native search over a proxy" path
- * for `google-generative-ai` wire models whose canonical gemini-cli/antigravity
- * OAuth is absent. Distinct from {@link searchGemini}, which speaks the Cloud
- * Code Assist API with OAuth.
+ * for Generative Language wire models. Distinct from {@link searchGemini},
+ * which speaks the Cloud Code Assist API with OAuth.
  */
 async function searchGeminiViaGenerativeLanguage(params: SearchParams): Promise<SearchResponse> {
 	const ctx = params.activeModelContext;
 	if (!ctx) throw new SearchProviderError("gemini", "Gemini web search requires active model context", 400);
-	const apiKey = await params.authStorage.getApiKey(ctx.provider, params.sessionId, {
-		baseUrl: ctx.baseUrl,
-		modelId: ctx.modelId,
-		signal: params.signal,
-	});
-	if (!apiKey) throw new SearchProviderError("gemini", `No credentials for ${ctx.provider}`, 401);
+	const activeCredentials: ActiveSearchModelCredentials = ctx.resolveCredentials
+		? await ctx.resolveCredentials({ sessionId: params.sessionId, signal: params.signal })
+		: {
+				apiKey: await params.authStorage.getApiKey(ctx.provider, params.sessionId, {
+					baseUrl: ctx.baseUrl,
+					modelId: ctx.modelId,
+					signal: params.signal,
+				}),
+				headers: ctx.headers,
+			};
+	const apiKey = activeCredentials.apiKey;
+	const headers = { ...(activeCredentials.headers ?? ctx.headers ?? {}) };
+	if (apiKey && !hasHeader(headers, "x-goog-api-key")) headers["x-goog-api-key"] = apiKey;
+	if (!apiKey && !hasHeader(headers, "x-goog-api-key")) {
+		throw new SearchProviderError("gemini", `No credentials for ${ctx.provider}`, 401);
+	}
 
 	const model = ctx.wireModelId ?? ctx.modelId;
 	const base = (ctx.baseUrl ?? "https://generativelanguage.googleapis.com").replace(/\/+$/, "");
@@ -468,7 +526,10 @@ async function searchGeminiViaGenerativeLanguage(params: SearchParams): Promise<
 
 	const response = await fetch(url, {
 		method: "POST",
-		headers: { ...(ctx.headers ?? {}), "x-goog-api-key": apiKey, "Content-Type": "application/json" },
+		headers: {
+			...headers,
+			...(hasHeader(headers, "content-type") ? {} : { "Content-Type": "application/json" }),
+		},
 		body: JSON.stringify(body),
 		signal: withHardTimeout(params.signal, "llm"),
 	});
@@ -534,11 +595,22 @@ export class GeminiProvider extends SearchProvider {
 	}
 
 	search(params: SearchParams): Promise<SearchResponse> {
-		// Native-over-proxy: when canonical gemini-cli/antigravity OAuth is
-		// absent but the active model speaks the Generative Language wire, reuse
-		// its own API key + baseUrl instead of failing closed.
 		const ctx = params.activeModelContext;
-		if (!hasGeminiOAuth(params.authStorage) && ctx?.api === "google-generative-ai") {
+		// Native-over-proxy: a custom model's owner-bound resolver must win over
+		// canonical Gemini OAuth. Otherwise the request would silently leave the
+		// proxy and hit Cloud Code with another registry's identity.
+		if (isCustomGeminiContext(ctx)) {
+			if (isCustomGenerativeLanguageContext(ctx)) return searchGeminiViaGenerativeLanguage(params);
+			return Promise.reject(
+				new SearchProviderError(
+					"gemini",
+					`Gemini native search does not support custom ${ctx?.api ?? ""} transports`,
+					400,
+				),
+			);
+		}
+		// Preserve the existing active-key fallback when canonical OAuth is absent.
+		if (!hasGeminiOAuth(params.authStorage) && ctx && isGenerativeLanguageWire(ctx.api)) {
 			return searchGeminiViaGenerativeLanguage(params);
 		}
 		return searchGemini({

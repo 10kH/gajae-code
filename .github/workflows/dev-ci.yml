@@ -43,7 +43,7 @@ permissions:
 # real validation events and stay in the normal group.
 concurrency:
   group: >-
-    ${{ github.event_name == 'workflow_dispatch' && inputs.head_sha != '' && 'dev-ci-virtual-integration'
+    ${{ github.event_name == 'workflow_dispatch' && inputs.head_sha != '' && format('dev-ci-dispatch-{0}', github.run_id)
     || (github.event_name == 'pull_request' && github.event.action == 'edited' && github.event.changes.body != null && github.event.changes.title == null && github.event.changes.base == null)
     && format('{0}-{1}-body-edit', github.workflow, github.ref)
     || format('{0}-{1}', github.workflow, github.ref) }}
@@ -418,6 +418,8 @@ jobs:
           # The session-state lock's owner-record create/retract protocol depends on
           # Windows handle-sharing semantics (no FILE_SHARE_DELETE on the create
           # descriptor), so its suite is proven here rather than on Ubuntu (#4990).
+          bun test ./packages/coding-agent/test/empty-delete-receipt-latch.test.ts
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           bun test ./packages/coding-agent/test/session-state-lock.test.ts
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           bun test ./packages/coding-agent/test/sdk-lifecycle-ready-then-exit.test.ts
@@ -950,11 +952,71 @@ jobs:
           CI_DEV_AFFECTED_PLAN: ${{ runner.temp }}/ci-dev-affected-evidence/.ci-dev-affected-plan.json
         run: bun scripts/ci-dev-affected.ts --validate-aggregate
 
+  # State-gate tests import the package native entrypoint on the current dev head.
+  # Build both Linux x64 ISA variants once and publish them to every gate shard;
+  # this keeps the gate independent from affected-plan relevance and prevents a
+  # missing pi_natives.linux-x64-modern.node from failing before tests start.
+  gjc-state-gates-native:
+    name: gjc-state-gates / native addon
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') && !(github.event_name == 'pull_request' && github.event.action == 'edited' && github.event.changes.body != null && github.event.changes.title == null && github.event.changes.base == null) }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          node-version: "24"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: "1.4.0"
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
+        with:
+          toolchain: nightly-2026-04-29
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          shared-key: dev-state-gates-native-linux-x64
+          cache-on-failure: true
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+          cache-workspace-crates: true
+      - name: Restore bun dependency cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-1.4.0-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+          restore-keys: |
+            bun-1.4.0-${{ runner.os }}-
+      - name: Install system deps
+        run: bash scripts/ci-install-system-deps.sh
+      - run: bun install --frozen-lockfile
+      - name: Build required Linux native addon variants
+        env:
+          TARGET_PLATFORM: linux
+          TARGET_ARCH: x64
+          TARGET_VARIANTS: baseline modern
+        run: bun run ci:build:native
+      - name: Verify required native addon variants
+        run: |
+          test -f packages/natives/native/pi_natives.linux-x64-baseline.node
+          test -f packages/natives/native/pi_natives.linux-x64-modern.node
+      - name: Upload state-gate native addon(s)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: dev-state-gates-native-${{ github.run_id }}
+          path: |
+            packages/natives/native/pi_natives.linux-x64-baseline.node
+            packages/natives/native/pi_natives.linux-x64-modern.node
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
   gjc-state-gates-matrix:
     name: gjc-state-gates / ${{ matrix.group }}
     # No `affected-plan` dependency, so this needs its own body-edit guard.
     if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') && !(github.event_name == 'pull_request' && github.event.action == 'edited' && github.event.changes.body != null && github.event.changes.title == null && github.event.changes.base == null) }}
-
+    needs: [gjc-state-gates-native]
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     strategy:
@@ -982,6 +1044,15 @@ jobs:
           restore-keys: |
             bun-1.4.0-${{ runner.os }}-
       - run: bun install --frozen-lockfile
+      - name: Download state-gate native addon(s)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: dev-state-gates-native-${{ github.run_id }}
+          path: packages/natives/native
+      - name: Verify state-gate native addon variants
+        run: |
+          test -f packages/natives/native/pi_natives.linux-x64-baseline.node
+          test -f packages/natives/native/pi_natives.linux-x64-modern.node
       - name: Run GJC state gate shard
         run: bun scripts/ci-gjc-state-gates.ts --group=${{ matrix.group }}
 
@@ -1004,8 +1075,9 @@ jobs:
   # selected risk canaries. A dispatch remains available for exact-head bootstrap
   # evidence. Every merge candidate shares one non-cancelling lane: a candidate
   # selects and materializes against dev, so overlapping candidates could otherwise
-  # validate against incompatible integration state. Keep up to 100 candidates
-  # pending instead of replacing an older pending validation.
+  # validate against incompatible integration state. GitHub's queue depth is fixed
+  # by capacity; candidates without a free slot wait pending instead of replacing
+  # an older pending validation.
   virtual-integration:
     name: Virtual integration validation
     needs: [affected-plan, affected]
@@ -1013,7 +1085,6 @@ jobs:
     concurrency:
       group: dev-ci-virtual-integration
       cancel-in-progress: false
-      queue: max
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     permissions:

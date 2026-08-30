@@ -549,6 +549,22 @@ function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
 			levels: [Effort.Low, Effort.High, Effort.Max],
 		};
 	}
+	// GLM-5.3-Flash keeps GLM-5.3's text contract: 1M context, 128K output, and
+	// the same always-on low/high/max reasoning_effort. models.dev currently
+	// lists it with null limits, so pin the contract the same way.
+	// https://docs.z.ai/guides/llm/glm-5.3-flash ("Text parameters are
+	// consistent with GLM-5.3, with support for a 1M-token context window.")
+	if (model.provider === "zai" && model.id === "glm-5.3-flash") {
+		model.contextWindow = 1_000_000;
+		model.maxTokens = 131_072;
+		model.thinking = {
+			mode: "effort",
+			minLevel: Effort.Low,
+			maxLevel: Effort.Max,
+			defaultLevel: Effort.Max,
+			levels: [Effort.Low, Effort.High, Effort.Max],
+		};
+	}
 	// Groq's agentic `compound` systems reject `reasoning_effort` outright
 	// (400 "`reasoning_effort` is not supported with this model", verified
 	// 2026-08-23), yet models.dev advertises them as reasoning models. Drop the

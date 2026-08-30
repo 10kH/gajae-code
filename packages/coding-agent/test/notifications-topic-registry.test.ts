@@ -798,6 +798,10 @@ test("publishes exact durable authority generation 179 at serving epoch 88", () 
 	// same-window lean settlement receipts; serving protocol remains epoch 88.
 	// Generation 178: idle publication waits for positioned identity delivery to
 	// cross the native writer barrier before the independent broadcast lane.
+	// Generation 179: the router tolerates a bounded consecutive run of refused
+	// notification publications instead of cancelling the subscription on the
+	// first refusal, so generation-178 owners that kill a session's mirroring
+	// after one transient rejection are replaced across this upgrade.
 	expect(DAEMON_GENERATION).toBe(179);
 	expect(SERVING_EPOCH).toBe(88);
 });

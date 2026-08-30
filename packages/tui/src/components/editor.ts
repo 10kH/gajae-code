@@ -1994,7 +1994,7 @@ export class Editor implements Component, Focusable {
 				this.#tryTriggerAutocomplete();
 			}
 			// Also auto-trigger when typing letters/path chars in a completable context
-			else if (/[a-zA-Z0-9.\-_/]/.test(char)) {
+			else if (/[\p{L}0-9.\-_/]/u.test(char)) {
 				const currentLine = this.#state.lines[this.#state.cursorLine] || "";
 				const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
 				// Check if we're in a slash command or inline slash token

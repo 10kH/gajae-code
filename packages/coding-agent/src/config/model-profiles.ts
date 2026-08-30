@@ -8,6 +8,7 @@ export interface ModelProfileDefinition {
 	name: string;
 	requiredProviders: string[];
 	displayName?: string;
+	providerGroup?: string;
 	/**
 	 * Optional groups of providers that are interchangeable fallbacks.
 	 * Each group is an array of provider ids where at least one must be
@@ -19,7 +20,7 @@ export interface ModelProfileDefinition {
 	 */
 	alternativeProviderGroups?: readonly (readonly string[])[];
 	modelMapping: Partial<Record<ModelProfileRole, ModelSelectorValue>>;
-	source: "builtin" | "user";
+	source: "builtin" | "registry" | "user";
 }
 
 export interface ResolvedProfileBinding {
@@ -247,22 +248,22 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 		architect: "anthropic/claude-fable-5:xhigh",
 	}),
 	profile("glm-eco", ["zai"], {
-		default: "zai/glm-5.3:low",
-		executor: "zai/glm-5.3:low",
-		planner: "zai/glm-5.3:low",
+		default: "zai/glm-5.3-flash:low",
+		executor: "zai/glm-5.3-flash:low",
+		planner: "zai/glm-5.3-flash:low",
 		critic: "zai/glm-5.3:high",
 		architect: "zai/glm-5.3:high",
 	}),
 	profile("glm-medium", ["zai"], {
 		default: "zai/glm-5.3:high",
-		executor: "zai/glm-5.3:low",
+		executor: "zai/glm-5.3-flash:low",
 		planner: "zai/glm-5.3:high",
 		critic: "zai/glm-5.3:high",
 		architect: "zai/glm-5.3:max",
 	}),
 	profile("glm-pro", ["zai"], {
 		default: "zai/glm-5.3:max",
-		executor: "zai/glm-5.3:high",
+		executor: "zai/glm-5.3-flash:high",
 		planner: "zai/glm-5.3:high",
 		critic: "zai/glm-5.3:max",
 		architect: "zai/glm-5.3:max",
@@ -673,12 +674,14 @@ const PROFILE_RECOMMENDATIONS: Record<string, string> = {
 };
 
 export function getModelProfilePresentation(
-	profile: string | Pick<ModelProfileDefinition, "name" | "displayName">,
+	profile: string | Pick<ModelProfileDefinition, "name" | "displayName" | "providerGroup">,
 ): ModelProfilePresentation {
 	const name = typeof profile === "string" ? profile : profile.name;
 	const displayName = typeof profile === "string" ? undefined : profile.displayName;
 	const presentation = PROFILE_PRESENTATION[name];
 	if (presentation) return presentation;
+	if (typeof profile !== "string" && profile.providerGroup)
+		return { displayName: formatModelProfileDisplayLabel(profile), providerGroup: profile.providerGroup };
 	return { displayName: formatModelProfileDisplayLabel({ name, displayName }), providerGroup: "CUSTOM" };
 }
 
@@ -732,17 +735,56 @@ export function recommendModelProfileForProvider(
 	return recommended ? profiles.get(recommended) : undefined;
 }
 
-export function mergeModelProfiles(userProfiles?: ModelsConfig["profiles"]): Map<string, ModelProfileDefinition> {
+export type RegistryModelProfilesInput =
+	| ReadonlyMap<string, ModelProfileDefinition>
+	| readonly ModelProfileDefinition[]
+	| Readonly<Record<string, ModelProfileDefinition>>;
+
+function cloneModelSelectorValue(value: ModelSelectorValue): ModelSelectorValue {
+	return Array.isArray(value) ? [...value] : value;
+}
+
+function cloneModelProfileDefinition(
+	definition: ModelProfileDefinition,
+	source: ModelProfileDefinition["source"] = definition.source,
+): ModelProfileDefinition {
+	return {
+		name: definition.name,
+		displayName: definition.displayName,
+		providerGroup: definition.providerGroup,
+		requiredProviders: [...definition.requiredProviders],
+		alternativeProviderGroups: definition.alternativeProviderGroups?.map(group => [...group]),
+		modelMapping: Object.fromEntries(
+			Object.entries(definition.modelMapping).map(([role, value]) => [role, cloneModelSelectorValue(value)]),
+		) as Partial<Record<ModelProfileRole, ModelSelectorValue>>,
+		source,
+	};
+}
+
+function registryProfileEntries(
+	input: RegistryModelProfilesInput | undefined,
+): Array<[string, ModelProfileDefinition]> {
+	if (!input) return [];
+	if (input instanceof Map) return [...input.entries()];
+	if (Array.isArray(input)) return input.map(definition => [definition.name, definition]);
+	return Object.entries(input);
+}
+
+export function mergeModelProfiles(
+	userProfiles?: ModelsConfig["profiles"],
+	registryProfiles?: RegistryModelProfilesInput,
+): Map<string, ModelProfileDefinition> {
 	const profiles = new Map<string, ModelProfileDefinition>();
 	for (const definition of BUILTIN_MODEL_PROFILES) {
-		profiles.set(definition.name, {
-			...definition,
-			requiredProviders: [...definition.requiredProviders],
-			modelMapping: { ...definition.modelMapping },
-		});
+		profiles.set(definition.name, cloneModelProfileDefinition(definition, "builtin"));
+	}
+	for (const [name, definition] of registryProfileEntries(registryProfiles)) {
+		profiles.set(name, cloneModelProfileDefinition({ ...definition, name }, "registry"));
 	}
 	for (const [name, definition] of Object.entries(userProfiles ?? {})) {
-		const modelMapping = { ...definition.model_mapping };
+		const modelMapping = Object.fromEntries(
+			Object.entries(definition.model_mapping).map(([role, value]) => [role, cloneModelSelectorValue(value)]),
+		) as Partial<Record<ModelProfileRole, ModelSelectorValue>>;
 		profiles.set(name, {
 			name,
 			displayName: definition.display_name,

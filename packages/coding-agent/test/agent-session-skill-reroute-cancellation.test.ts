@@ -11,6 +11,7 @@ import { readVisibleSkillActiveState } from "@gajae-code/coding-agent/hooks/skil
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { createSdkRunCapability } from "../src/sdk/host/sdk-run-capability";
 
 let session: AgentSession | undefined;
 let authStorage: AuthStorage | undefined;
@@ -41,7 +42,7 @@ afterEach(async () => {
 	tempDir = undefined;
 });
 
-test("forwards preflight cancellation when a prompt reroutes to a skill", async () => {
+test.serial("forwards preflight cancellation when a prompt reroutes to a skill", async () => {
 	tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-skill-reroute-cancel-"));
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 	authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
@@ -99,7 +100,44 @@ test("forwards preflight cancellation when a prompt reroutes to a skill", async 
 	});
 });
 
-test("cancels an ordinary prompt while it waits on the startup barrier", async () => {
+test.serial("keeps SDK ownership when an internal skill invocation becomes a custom prompt", async () => {
+	tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-skill-sdk-owner-"));
+	const skillPath = path.join(tempDir, "SKILL.md");
+	fs.writeFileSync(skillPath, "# Fixture skill\n\n{{args}}\n");
+	const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+	authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
+	authStorage.setRuntimeApiKey("anthropic", "test-key");
+	const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+	const agent = new Agent({
+		getApiKey: () => "test-key",
+		initialState: { model, systemPrompt: ["Test"], tools: [] },
+	});
+	session = new AgentSession({
+		agent,
+		sessionManager: createLifecycleIndependentSessionManager(),
+		settings: Settings.isolated(),
+		modelRegistry,
+		skills: [
+			{
+				name: "fixture-skill",
+				description: "Fixture skill",
+				filePath: skillPath,
+				baseDir: tempDir,
+				source: "test",
+			},
+		],
+	});
+	const promptCustomMessage = vi.spyOn(session, "promptCustomMessage").mockResolvedValue(undefined);
+	await session.invokeSkill("fixture-skill", "owned", {
+		sdkRunCapability: createSdkRunCapability("skill-owner-token"),
+	});
+	expect(promptCustomMessage).toHaveBeenCalledWith(
+		expect.objectContaining({ customType: expect.any(String) }),
+		expect.objectContaining({ sdkRunToken: "skill-owner-token" }),
+	);
+});
+
+test.serial("cancels an ordinary prompt while it waits on the startup barrier", async () => {
 	tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-prompt-admission-cancel-"));
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 	authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
@@ -129,7 +167,7 @@ test("cancels an ordinary prompt while it waits on the startup barrier", async (
 	startupBarrier.resolve();
 });
 
-test("rolls back workflow state seeded after durable acceptance when preflight is cancelled", async () => {
+test.serial("rolls back workflow state seeded after durable acceptance when preflight is cancelled", async () => {
 	tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-skill-state-cancel-"));
 	const skillDir = path.join(tempDir, "deep-interview");
 	const skillPath = path.join(skillDir, "SKILL.md");
@@ -175,7 +213,7 @@ test("rolls back workflow state seeded after durable acceptance when preflight i
 	expect(fs.existsSync(modeStatePath(tempDir, sessionId, "deep-interview"))).toBe(false);
 	expect(agent.state.messages).toHaveLength(0);
 });
-test("rolls back a real subskill activation after durable acceptance is cancelled", async () => {
+test.serial("rolls back a real subskill activation after durable acceptance is cancelled", async () => {
 	tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-subskill-state-cancel-"));
 	const skillDir = path.join(tempDir, "deep-interview");
 	const skillPath = path.join(skillDir, "SKILL.md");
@@ -253,7 +291,7 @@ test("rolls back a real subskill activation after durable acceptance is cancelle
 	expect(agent.state.messages).toHaveLength(0);
 });
 
-test("cancels only its accepted idle follow-up before it can execute", async () => {
+test.serial("cancels only its accepted idle follow-up before it can execute", async () => {
 	tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-idle-follow-up-cancel-"));
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 	authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
@@ -280,9 +318,9 @@ test("cancels only its accepted idle follow-up before it can execute", async () 
 	await session.sendUserMessage("owned follow-up", {
 		deliverAs: "followUp",
 		preflightSignal: controller.signal,
-		sdkRunToken: "sdk-owned-follow-up",
+		sdkRunCapability: createSdkRunCapability("sdk-owned-follow-up"),
 		onPreflightAcceptCommit: () => {},
-	});
+	} as never);
 	controller.abort();
 
 	expect(agent.snapshotFollowUp()).toMatchObject([{ content: [{ type: "text", text: "unrelated follow-up" }] }]);
@@ -290,7 +328,7 @@ test("cancels only its accepted idle follow-up before it can execute", async () 
 	await Bun.sleep(0);
 	expect(agent.state.messages).toHaveLength(0);
 });
-test("defers an SDK follow-up behind pre-existing queued work so its run token binds", async () => {
+test.serial("defers an SDK follow-up behind pre-existing queued work so its run token binds", async () => {
 	tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-follow-up-defer-"));
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 	authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
@@ -317,9 +355,9 @@ test("defers an SDK follow-up behind pre-existing queued work so its run token b
 	await session.sendUserMessage("owned follow-up", {
 		deliverAs: "followUp",
 		preflightSignal: controller.signal,
-		sdkRunToken: "sdk-owned-follow-up-deferred",
+		sdkRunCapability: createSdkRunCapability("sdk-owned-follow-up-deferred"),
 		onPreflightAcceptCommit: () => {},
-	});
+	} as never);
 
 	// The SDK-owned follow-up must not sit behind the unrelated message: at the
 	// next acceptance the unrelated message would run first and the SDK message
@@ -329,7 +367,7 @@ test("defers an SDK follow-up behind pre-existing queued work so its run token b
 	expect(agent.snapshotFollowUp()[0]).toMatchObject({ content: [{ type: "text", text: "unrelated follow-up" }] });
 });
 
-test("releases a deferred SDK follow-up only after queued work drains", async () => {
+test.serial("releases a deferred SDK follow-up only after queued work drains", async () => {
 	tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-follow-up-release-"));
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 	authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
@@ -356,9 +394,9 @@ test("releases a deferred SDK follow-up only after queued work drains", async ()
 	await session.sendUserMessage("owned follow-up", {
 		deliverAs: "followUp",
 		preflightSignal: new AbortController().signal,
-		sdkRunToken: "sdk-owned-follow-up-release",
+		sdkRunCapability: createSdkRunCapability("sdk-owned-follow-up-release"),
 		onPreflightAcceptCommit: () => {},
-	});
+	} as never);
 	expect(agent.snapshotFollowUp()).toHaveLength(1);
 
 	// agent_end while queued work is still pending must hold the SDK follow-up.
@@ -374,7 +412,7 @@ test("releases a deferred SDK follow-up only after queued work drains", async ()
 	expect(agent.snapshotFollowUp()).toHaveLength(1);
 	expect(agent.snapshotFollowUp()[0]).toMatchObject({ content: [{ type: "text", text: "owned follow-up" }] });
 });
-test("releases the next deferred SDK follow-up when a released one is cancelled", async () => {
+test.serial("releases the next deferred SDK follow-up when a released one is cancelled", async () => {
 	tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-follow-up-advance-"));
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 	authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
@@ -402,15 +440,15 @@ test("releases the next deferred SDK follow-up when a released one is cancelled"
 	await session.sendUserMessage("owned m1", {
 		deliverAs: "followUp",
 		preflightSignal: firstController.signal,
-		sdkRunToken: "token-m1",
+		sdkRunCapability: createSdkRunCapability("token-m1"),
 		onPreflightAcceptCommit: () => {},
-	});
+	} as never);
 	await session.sendUserMessage("owned m2", {
 		deliverAs: "followUp",
 		preflightSignal: secondController.signal,
-		sdkRunToken: "token-m2",
+		sdkRunCapability: createSdkRunCapability("token-m2"),
 		onPreflightAcceptCommit: () => {},
-	});
+	} as never);
 	// Both SDK follow-ups are deferred behind the pre-existing queued work.
 	expect(agent.snapshotFollowUp()).toHaveLength(1);
 

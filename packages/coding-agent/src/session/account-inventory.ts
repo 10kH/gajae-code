@@ -76,6 +76,7 @@ export interface AccountInventoryInput {
 	modelRegistry?: {
 		getAvailable?: () => Array<{ provider: string }>;
 		getProviderBaseUrl?: (provider: string) => string | undefined;
+		getAuthStorageOwner?: () => object;
 	};
 	sessionId?: string;
 	provider?: string;
@@ -323,8 +324,8 @@ function freshUsageCache(report: CachedUsageReport["report"]): AccountUsageCache
 	};
 }
 
-function canPinStoredOAuth(authStorage: AuthStorage, provider: string): boolean {
-	if (authStorage.hasRuntimeApiKey(provider) || authStorage.hasConfigApiKey(provider)) return false;
+function canPinStoredOAuth(authStorage: AuthStorage, provider: string, owner?: object): boolean {
+	if (authStorage.hasRuntimeApiKey(provider) || authStorage.hasConfigApiKey(provider, owner)) return false;
 	return !getEnvApiKey(provider);
 }
 
@@ -368,6 +369,7 @@ function addStoredRows(
 	inventory: CredentialInventoryRecord[],
 	sessionId: string | undefined,
 	baseUrlResolver?: (provider: string) => string | undefined,
+	authStorageOwner?: object,
 ): void {
 	const removalTargetIds = new Set(
 		(typeof authStorage.listCredentialRemovalTargets === "function"
@@ -382,7 +384,9 @@ function addStoredRows(
 			typeof record.provider === "string" &&
 			authStorage.getSessionCredentialRowId(record.provider, sessionId) === record.id;
 		const canPin =
-			record.credentialKind === "oauth" && !record.disabled && canPinStoredOAuth(authStorage, record.provider);
+			record.credentialKind === "oauth" &&
+			!record.disabled &&
+			canPinStoredOAuth(authStorage, record.provider, authStorageOwner);
 		const canRemove = removalTargetIds.has(record.id);
 		rows.push({
 			id: sourceId(record.provider, "stored", record.id),
@@ -417,12 +421,17 @@ function addSyntheticRows(
 	authStorage: AuthStorage,
 	providers: Set<string>,
 	sessionId: string | undefined,
+	authStorageOwner?: object,
 ): void {
 	for (const provider of [...providers].sort((a, b) => a.localeCompare(b))) {
 		const runtime = authStorage.hasRuntimeApiKey(provider);
-		const config = authStorage.hasConfigApiKey(provider);
+		const config = authStorage.hasConfigApiKey(provider, authStorageOwner);
 		const env = Boolean(getEnvApiKey(provider));
-		const effectiveType = authStorage.getEffectiveCredentialType(provider, sessionId);
+		const effectiveType = authStorage.getEffectiveCredentialType(
+			provider,
+			sessionId,
+			authStorageOwner ? { owner: authStorageOwner } : undefined,
+		);
 
 		const add = (source: AccountInventorySource): void => {
 			const selected =
@@ -469,10 +478,16 @@ export function buildAccountInventorySnapshot(input: AccountInventoryInput): Acc
 	const nowMs = input.nowMs ?? Date.now();
 	const inventory = input.authStorage.listCredentialInventory();
 	const rows: AccountInventoryRow[] = [];
-	addStoredRows(rows, input.authStorage, inventory, input.sessionId, provider =>
-		input.modelRegistry?.getProviderBaseUrl?.(provider),
+	const authStorageOwner = input.modelRegistry?.getAuthStorageOwner?.();
+	addStoredRows(
+		rows,
+		input.authStorage,
+		inventory,
+		input.sessionId,
+		provider => input.modelRegistry?.getProviderBaseUrl?.(provider),
+		authStorageOwner,
 	);
-	addSyntheticRows(rows, input.authStorage, providerSet(input, inventory), input.sessionId);
+	addSyntheticRows(rows, input.authStorage, providerSet(input, inventory), input.sessionId, authStorageOwner);
 	rows.sort((left, right) => left.id.localeCompare(right.id));
 	return { generatedAt: nowMs, generation: input.authStorage.getGeneration(), rows };
 }
@@ -518,6 +533,7 @@ export async function checkAccountInventory(input: AccountInventoryInput): Promi
 	const rows = input.provider ? fullSnapshot.rows.filter(row => row.provider === input.provider) : fullSnapshot.rows;
 	const snapshot: AccountInventorySnapshot = { ...fullSnapshot, rows };
 	const authStorage = input.authStorage;
+	const authStorageOwner = input.modelRegistry?.getAuthStorageOwner?.();
 	applyStoredCheck(
 		rows,
 		await authStorage.checkCredentials({
@@ -530,13 +546,13 @@ export async function checkAccountInventory(input: AccountInventoryInput): Promi
 		let key: string | undefined;
 		if (row.source === "env") key = getEnvApiKey(row.provider);
 		else if (row.source === "runtime" && authStorage.hasRuntimeApiKey(row.provider))
-			key = await authStorage.peekApiKey(row.provider);
+			key = await authStorage.peekApiKey(row.provider, authStorageOwner ? { owner: authStorageOwner } : undefined);
 		else if (
 			row.source === "config" &&
-			authStorage.hasConfigApiKey(row.provider) &&
+			authStorage.hasConfigApiKey(row.provider, authStorageOwner) &&
 			!authStorage.hasRuntimeApiKey(row.provider)
 		) {
-			key = await authStorage.peekApiKey(row.provider);
+			key = await authStorage.peekApiKey(row.provider, authStorageOwner ? { owner: authStorageOwner } : undefined);
 		}
 		const result = key
 			? await authStorage.checkApiKeyCredential(row.provider as Provider, key, {

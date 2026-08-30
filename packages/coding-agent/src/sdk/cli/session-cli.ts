@@ -1,8 +1,10 @@
 import { randomBytes } from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { replaceTabs, truncateToWidth } from "@gajae-code/tui";
 import { getAgentDir } from "@gajae-code/utils";
+import { repo as resolveGitRepository } from "../../utils/git";
 import { ensureBroker } from "../broker/ensure";
 import { resolveSessionLocator } from "../broker/session-index";
 import {
@@ -24,7 +26,11 @@ import type {
 	SessionReconcileUncertainTarget,
 } from "../lifecycle/service";
 import { PROMPT_CLIENT_REF_MAX_LENGTH } from "../prompt-status";
-import { validateAdapterControl, validateAdapterSecretFields } from "../protocol/adapter-validation";
+import {
+	validateAdapterControl,
+	validateAdapterSecretFields,
+	validateRequiredPromptText,
+} from "../protocol/adapter-validation";
 import { adapterDispositionError, findOperation, type OperationKind } from "../protocol/operation-registry";
 import { type SessionAttachment, SessionRouter, SessionRouterError, type SessionRouterFrame } from "../router";
 import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../session-list";
@@ -49,10 +55,12 @@ export type SdkSessionCliAction =
 	| "status"
 	| "tail"
 	| "retire"
+	| "global"
 	| "raw"
 	| "control"
 	| "query"
 	| "global";
+export type SdkSessionListScope = "repo" | "cwd" | "worktree" | "all";
 export type SdkSessionCliRawKind = "control" | "query" | "global";
 
 export interface SdkSessionCliArgs {
@@ -67,6 +75,7 @@ export interface SdkSessionCliArgs {
 	jsonInputFile?: string;
 	jsonInputStdin?: boolean;
 	idempotencyKey?: string;
+	scope?: string;
 	confirm?: boolean;
 	cursor?: string;
 	wait?: boolean;
@@ -512,16 +521,156 @@ export function renderSdkSearchTable(result: SdkSearchResultV1): string {
 	return lines.join("\n");
 }
 
-async function runList(agentDir: string): Promise<unknown> {
+const SESSION_LIST_SCOPES: readonly SdkSessionListScope[] = ["repo", "cwd", "worktree", "all"];
+/** Row workspaces whose locator cannot be canonicalized still get one deterministic identity. */
+const WORKSPACE_IDENTITY_CACHE_LIMIT = 4096;
+
+interface WorkspaceIdentity {
+	/** Canonical workspace path (realpath when it exists, lexical resolve otherwise). */
+	canonicalPath: string;
+	/** Canonical containing worktree root; null outside a Git checkout. */
+	repoRoot: string | null;
+	/** Canonical Git common dir; shared by the main checkout and linked worktrees. */
+	commonDir: string | null;
+}
+
+export interface SdkSessionListSelection {
+	scope: SdkSessionListScope;
+	selection: WorkspaceIdentity;
+	/** Bounded, credential-free descriptor included in list output. */
+	descriptor: {
+		scope: SdkSessionListScope;
+		path: string;
+		worktreeRoot?: string;
+		commonDir?: string;
+	};
+}
+
+/** Parses `--scope`; missing means `repo`, anything else invalid is a usage error. */
+export function parseSessionListScope(value: string | undefined): SdkSessionListScope {
+	if (value === undefined) return "repo";
+	if ((SESSION_LIST_SCOPES as readonly string[]).includes(value)) return value as SdkSessionListScope;
+	throw new SdkSessionCliError(
+		"usage",
+		`Invalid scope "${value}". Expected one of: ${SESSION_LIST_SCOPES.join(", ")}.`,
+		2,
+	);
+}
+
+async function canonicalWorkspacePath(target: string): Promise<string> {
+	try {
+		return await fs.realpath(target);
+	} catch {
+		// A removed or unreadable workspace keeps a deterministic lexical identity
+		// instead of guessing a broader or narrower one.
+		return path.resolve(target);
+	}
+}
+
+const workspaceIdentityCache = new Map<string, WorkspaceIdentity>();
+
+/** Resolves (and caches) the Git identity of one workspace locator. */
+async function workspaceIdentity(target: string): Promise<WorkspaceIdentity> {
+	const canonicalPath = await canonicalWorkspacePath(target);
+	const cached = workspaceIdentityCache.get(canonicalPath);
+	if (cached) return cached;
+	if (target === "unknown") {
+		const unavailable = { canonicalPath, repoRoot: null, commonDir: null };
+		workspaceIdentityCache.set(canonicalPath, unavailable);
+		return unavailable;
+	}
+	try {
+		if (!(await fs.stat(target)).isDirectory()) throw new Error("workspace is not a directory");
+	} catch {
+		// A removed or unreadable locator cannot prove Git membership. Keeping it
+		// outside every identity is the narrowest safe result for row filtering.
+		const unavailable = { canonicalPath, repoRoot: null, commonDir: null };
+		workspaceIdentityCache.set(canonicalPath, unavailable);
+		return unavailable;
+	}
+	const repository = await resolveGitRepository.resolve(canonicalPath);
+	const identity: WorkspaceIdentity = repository
+		? {
+				canonicalPath,
+				repoRoot: await canonicalWorkspacePath(repository.repoRoot),
+				commonDir: await canonicalWorkspacePath(repository.commonDir),
+			}
+		: { canonicalPath, repoRoot: null, commonDir: null };
+	if (workspaceIdentityCache.size >= WORKSPACE_IDENTITY_CACHE_LIMIT) workspaceIdentityCache.clear();
+	workspaceIdentityCache.set(canonicalPath, identity);
+	return identity;
+}
+
+/**
+ * Resolves the list selection from `--repo` (default: process cwd) under the
+ * effective scope. Outside Git, `repo`/`worktree` fail typed and actionable —
+ * they never broaden to `all`; `cwd` remains an exact canonical match.
+ */
+export async function resolveSessionListSelection(
+	scope: SdkSessionListScope,
+	repoArg: string | undefined,
+): Promise<SdkSessionListSelection> {
+	const selection = await workspaceIdentity(repoArg ?? process.cwd());
+	if (scope !== "cwd" && !selection.repoRoot)
+		throw new SdkSessionCliError(
+			"not_a_repository",
+			`--scope ${scope} requires a Git repository, but "${selection.canonicalPath}" is outside any Git checkout. ` +
+				"Use --scope cwd for an exact workspace match or --scope all for the full broker listing.",
+			1,
+		);
+	const descriptor: SdkSessionListSelection["descriptor"] = {
+		scope,
+		path: selection.canonicalPath,
+		...(selection.repoRoot ? { worktreeRoot: selection.repoRoot, commonDir: selection.commonDir! } : {}),
+	};
+	return { scope, selection, descriptor };
+}
+
+/**
+ * Filters fully traversed broker rows by the selection scope. Row workspaces
+ * are canonicalized and cached per distinct locator; `repo` matches the shared
+ * common dir across the main checkout and linked worktrees, `worktree` the
+ * containing worktree only, and `cwd` the exact canonical workspace.
+ */
+export async function filterSessionRowsByScope(
+	rows: readonly SdkSessionRowV1[],
+	scope: SdkSessionListScope,
+	selection: SdkSessionListSelection,
+): Promise<{ sessions: SdkSessionRowV1[]; warnings: string[] }> {
+	if (scope === "all") return { sessions: [...rows], warnings: [] };
+	const warnings: string[] = [];
+	const sessions: SdkSessionRowV1[] = [];
+	for (const row of rows) {
+		const identity = await workspaceIdentity(row.locator.cwd);
+		let keep: boolean;
+		if (scope === "cwd") keep = identity.canonicalPath === selection.selection.canonicalPath;
+		else if (scope === "worktree")
+			keep = identity.repoRoot !== null && identity.repoRoot === selection.selection.repoRoot;
+		else keep = identity.commonDir !== null && identity.commonDir === selection.selection.commonDir;
+		if (keep) sessions.push(row);
+		else if (identity.repoRoot === null && identity.commonDir === null)
+			warnings.push(
+				`Session ${row.sessionId} workspace "${row.locator.cwd}" is outside Git; excluded by scope ${scope}.`,
+			);
+	}
+	return { sessions, warnings };
+}
+
+async function runList(agentDir: string, args: SdkSessionCliArgs): Promise<unknown> {
+	const scope = parseSessionListScope(args.scope);
+	const { selection, descriptor } = await resolveSessionListSelection(scope, args.repo);
 	const listing = await sessionRows(agentDir);
+	const filtered = await filterSessionRowsByScope(listing.sessions, scope, { scope, selection, descriptor });
 	return {
 		ok: true,
 		result: {
 			version: SESSION_ROWS_VERSION,
 			source: "broker",
+			scope,
+			selection: descriptor,
 			...(listing.indexSeq === undefined ? {} : { indexSeq: listing.indexSeq }),
-			sessions: listing.sessions,
-			warnings: listing.warnings,
+			sessions: filtered.sessions,
+			warnings: [...listing.warnings, ...filtered.warnings],
 		},
 	};
 }
@@ -663,6 +812,8 @@ async function runSend(agentDir: string, sessionId: string, args: SdkSessionCliA
 	if (args.text !== undefined && Object.keys(input).length > 0)
 		throw new SdkSessionCliError("usage", "Use either --text or one JSON input source for the prompt, not both.", 2);
 	const promptInput: JsonRecord = args.text === undefined ? { ...input } : { text: args.text };
+	const promptError = validateRequiredPromptText("turn.prompt", promptInput);
+	if (promptError) throw new SdkSessionCliError(promptError.code, promptError.message, 2);
 	const inputRef = clientRefFromInput(promptInput);
 	const clientRef = inputRef ?? args.opRef?.trim() ?? createOperationRef();
 	if (args.opRef !== undefined && inputRef !== undefined && inputRef !== args.opRef.trim())
@@ -923,6 +1074,11 @@ function publicationSequence(publicationId: string): number | undefined {
 
 function tailItemFromRouterFrame(frame: SessionRouterFrame): SdkTailItemV1 | undefined {
 	if (frame.name === undefined) return undefined;
+	// The replay response is an out-of-band control frame, not an event-ring
+	// item. Its generation/lastSeq metadata is a response position, and it
+	// intentionally has no event `seq`; projecting it as a tail item would make
+	// the strict event-position validator reject every otherwise valid tail.
+	if (frame.name === "event_replay_result") return undefined;
 	const seq = frame.publicationId === undefined ? undefined : publicationSequence(frame.publicationId);
 	return toTailItemV1(
 		{
@@ -1528,7 +1684,7 @@ export async function runSdkSessionCli(
 			);
 		const agentDir = args.agentDir ?? getAgentDir();
 		if (action === "list") {
-			writeOutput(stripSecretFields(await runList(agentDir)));
+			writeOutput(stripSecretFields(await runList(agentDir, args)));
 			return;
 		}
 		if (action === "search") {

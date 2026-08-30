@@ -1,4 +1,4 @@
-import type { SearchCitation, SearchResponse, SearchSource } from "../types";
+import type { ActiveSearchModelCredentials, SearchCitation, SearchResponse, SearchSource } from "../types";
 import { SearchProviderError } from "../types";
 import type { SearchParams } from "./base";
 import { SearchProvider } from "./base";
@@ -6,6 +6,11 @@ import { extractTextSources } from "./text-citations";
 import { classifyProviderHttpError, withHardTimeout } from "./utils";
 
 type JsonObject = Record<string, unknown>;
+
+function hasHeader(headers: Record<string, string>, name: string): boolean {
+	const normalized = name.toLowerCase();
+	return Object.keys(headers).some(key => key.toLowerCase() === normalized);
+}
 
 function isJsonObject(value: unknown): value is JsonObject {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -154,15 +159,25 @@ export class OpenAICompatibleSearchProvider extends SearchProvider {
 		if (ctx.api !== "openai-responses" && ctx.api !== "openai-completions") {
 			throw new SearchProviderError(this.id, `OpenAI-compatible web search does not support ${ctx.api}`, 400);
 		}
-		const apiKey = await params.authStorage.getApiKey(ctx.provider, params.sessionId, {
-			baseUrl: ctx.baseUrl,
-			modelId: ctx.modelId,
-			signal: params.signal,
-		});
-		if (!apiKey) throw new SearchProviderError(this.id, `No credentials for ${ctx.provider}`, 401);
+		const activeCredentials: ActiveSearchModelCredentials = ctx.resolveCredentials
+			? await ctx.resolveCredentials({ sessionId: params.sessionId, signal: params.signal })
+			: {
+					apiKey: await params.authStorage.getApiKey(ctx.provider, params.sessionId, {
+						baseUrl: ctx.baseUrl,
+						modelId: ctx.modelId,
+						signal: params.signal,
+					}),
+					headers: ctx.headers,
+				};
+		const apiKey = activeCredentials.apiKey;
+		const headers = { ...(activeCredentials.headers ?? ctx.headers ?? {}) };
+		if (apiKey && !hasHeader(headers, "authorization")) headers.Authorization = `Bearer ${apiKey}`;
+		if (!hasHeader(headers, "authorization")) {
+			throw new SearchProviderError(this.id, `No credentials for ${ctx.provider}`, 401);
+		}
+		if (!hasHeader(headers, "content-type")) headers["Content-Type"] = "application/json";
 		const model = ctx.wireModelId ?? ctx.modelId;
 		const baseUrl = ctx.baseUrl ?? "";
-		const headers = { ...(ctx.headers ?? {}), Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" };
 		const messages = [
 			{ role: "system", content: params.systemPrompt },
 			{ role: "user", content: params.query },

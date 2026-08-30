@@ -386,6 +386,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 				options?.toolChoice !== undefined &&
 				options.toolChoice !== "auto" &&
 				options.toolChoice !== "none";
+			options.onStreamCreated?.();
 			let response = await fetchWithRetry(
 				attempt => `${endpoints[Math.min(attempt, endpoints.length - 1)]}/v1internal:streamGenerateContent?alt=sse`,
 				{
@@ -404,6 +405,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 				const error = createGeminiCliHttpError(response, errorText);
 				if (
 					!options?.fallbackManaged &&
+					!options?.disableProviderRetries &&
 					firstTokenTime === undefined &&
 					isForcedToolChoiceUnsupportedError(error, true)
 				) {
@@ -425,6 +427,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 					};
 					requestBodyJson = JSON.stringify(requestBody);
 					rawRequestDump = { ...rawRequestDump, body: requestBody };
+					options.onStreamCreated?.();
 					response = await fetchWithRetry(
 						attempt =>
 							`${endpoints[Math.min(attempt, endpoints.length - 1)]}/v1internal:streamGenerateContent?alt=sse`,

@@ -142,11 +142,13 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 			};
 			let openaiStream: Awaited<ReturnType<typeof client.responses.create>>;
 			try {
+				options?.onStreamCreated?.();
 				openaiStream = await client.responses.create(params, { signal: requestSignal });
 			} catch (error) {
 				if (
 					!isForcedToolChoiceUnsupportedError(error, isForcedAzureResponsesToolChoice(params.tool_choice)) ||
-					options?.fallbackManaged
+					options?.fallbackManaged ||
+					options?.disableProviderRetries
 				) {
 					throw error;
 				}
@@ -165,6 +167,7 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 				});
 				delete params.tool_choice;
 				rawRequestDump = { ...rawRequestDump, body: params };
+				options?.onStreamCreated?.();
 				openaiStream = await client.responses.create(params, { signal: requestSignal });
 			}
 			streamConnected = true;

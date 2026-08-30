@@ -1,7 +1,8 @@
 /**
  * Shared factory for API-key-paste "login" flows.
  *
- * Several providers (Cerebras, Synthetic, Moonshot, Together, NanoGPT, ZenMux)
+ * Several providers (Cerebras, Synthetic, Moonshot, Together, NanoGPT, ZenMux,
+ * Command Code GOAT)
  * don't actually implement OAuth — they just ask the user to paste an API key,
  * optionally validate it, and return the trimmed key.
  */
@@ -14,6 +15,7 @@ type ChatCompletionsValidation = {
 	provider: string;
 	baseUrl: string;
 	model: string;
+	requireInferenceResponse?: boolean;
 };
 
 type ModelsEndpointValidation = {
@@ -35,10 +37,12 @@ export type ApiKeyLoginConfig = {
 	placeholder: string;
 	/** Validation strategy, or `null` to skip validation. */
 	validation: ChatCompletionsValidation | ModelsEndpointValidation | null;
+	validationProgressMessage?: string;
 };
 
 export function createApiKeyLogin(config: ApiKeyLoginConfig): (options: OAuthController) => Promise<string> {
 	return async function login(options: OAuthController): Promise<string> {
+		if (options.signal?.aborted) throw new Error("Login cancelled");
 		if (!options.onPrompt) {
 			throw new Error(`${config.providerLabel} login requires onPrompt callback`);
 		}
@@ -61,16 +65,21 @@ export function createApiKeyLogin(config: ApiKeyLoginConfig): (options: OAuthCon
 		if (!trimmed) {
 			throw new Error("API key is required");
 		}
+		if (/[\x00-\x1f\x7f-\x9f]/u.test(trimmed)) {
+			throw new Error("API key contains unsupported control characters");
+		}
 
 		if (config.validation) {
-			options.onProgress?.("Validating API key...");
+			options.onProgress?.(config.validationProgressMessage ?? "Validating API key...");
 			if (config.validation.kind === "chat-completions") {
 				await validateOpenAICompatibleApiKey({
 					provider: config.validation.provider,
 					apiKey: trimmed,
 					baseUrl: config.validation.baseUrl,
 					model: config.validation.model,
+					requireInferenceResponse: config.validation.requireInferenceResponse,
 					signal: options.signal,
+					fetch: options.fetch,
 				});
 			} else {
 				await validateApiKeyAgainstModelsEndpoint({
@@ -78,8 +87,10 @@ export function createApiKeyLogin(config: ApiKeyLoginConfig): (options: OAuthCon
 					apiKey: trimmed,
 					modelsUrl: config.validation.modelsUrl,
 					signal: options.signal,
+					fetch: options.fetch,
 				});
 			}
+			if (options.signal?.aborted) throw new Error("Login cancelled");
 		}
 
 		return trimmed;

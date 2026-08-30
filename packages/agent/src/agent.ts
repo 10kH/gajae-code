@@ -38,6 +38,7 @@ import type {
 	AgentEvent,
 	AgentLoopConfig,
 	AgentMessage,
+	AgentMetadataResolverContext,
 	AgentState,
 	AgentTool,
 	AgentToolContext,
@@ -67,6 +68,9 @@ const RUNTIME_FAILURE_CODES = new Set([
 	"local_snapshot_failure",
 	"provider_down",
 	"provider_unavailable",
+	"provider_rejected",
+	"provider_http_402",
+	"provider_http_429",
 	"upstream_stream_interrupted",
 	"argument_validation",
 	"execution",
@@ -120,11 +124,19 @@ function safeErrorStatus(error: unknown): number | undefined {
 	try {
 		return (
 			extractHttpStatusFromError({ status: (error as { errorStatus?: unknown } | undefined)?.errorStatus }) ??
-			extractHttpStatusFromError(error)
+			extractHttpStatusFromError(error) ??
+			extractHttpStatusFromError((error as { transportFailure?: unknown } | undefined)?.transportFailure)
 		);
 	} catch {
 		return undefined;
 	}
+}
+
+function providerFailureCode(error: unknown): string | undefined {
+	const status = safeErrorStatus(error);
+	if (status === undefined) return undefined;
+	if (status === 402 || status === 429) return `provider_http_${status}`;
+	return "provider_rejected";
 }
 
 function assertUserImagePlaceholdersHavePayload(messages: readonly AgentMessage[]): void {
@@ -455,7 +467,7 @@ export class Agent {
 	#sessionId?: string;
 	#providerSessionId?: string;
 	#metadata?: Record<string, unknown>;
-	#metadataResolver?: (provider: string) => Record<string, unknown> | undefined;
+	#metadataResolver?: (context: AgentMetadataResolverContext) => Record<string, unknown> | undefined;
 	#providerSessionState?: Map<string, ProviderSessionState>;
 	#thinkingBudgets?: ThinkingBudgets;
 	#temperature?: number;
@@ -494,6 +506,8 @@ export class Agent {
 	#onHarmonyLeak?: (event: HarmonyAuditEvent) => void | Promise<void>;
 	#onBeforeYield?: () => Promise<void> | void;
 	#shouldPause?: AgentLoopConfig["shouldPause"];
+	/** While set and returning true, steering is neither admitted nor dequeued. */
+	#steeringAdmissionFence?: () => boolean;
 	#maintainContext?: AgentLoopConfig["maintainContext"];
 	#telemetry?: AgentLoopConfig["telemetry"];
 	#appendOnlyContext?: AppendOnlyContextManager;
@@ -658,8 +672,12 @@ export class Agent {
 	 * only included for `"anthropic"` requests). Falls back to the static
 	 * {@link metadata} value when no resolver is set.
 	 */
-	metadataForProvider(provider: string): Record<string, unknown> | undefined {
-		if (this.#metadataResolver) return this.#metadataResolver(provider);
+	metadataForProvider(
+		provider: string,
+		model?: Model,
+		transport?: AgentMetadataResolverContext["transport"],
+	): Record<string, unknown> | undefined {
+		if (this.#metadataResolver) return this.#metadataResolver({ provider, model, transport });
 		return this.#metadata;
 	}
 
@@ -671,7 +689,9 @@ export class Agent {
 	 * credential. Pass `undefined` to clear and revert to the static
 	 * {@link metadata} value.
 	 */
-	setMetadataResolver(resolver: ((provider: string) => Record<string, unknown> | undefined) | undefined): void {
+	setMetadataResolver(
+		resolver: ((context: AgentMetadataResolverContext) => Record<string, unknown> | undefined) | undefined,
+	): void {
 		this.#metadataResolver = resolver;
 	}
 
@@ -878,6 +898,24 @@ export class Agent {
 
 	setShouldPause(fn: AgentLoopConfig["shouldPause"] | undefined): void {
 		this.#shouldPause = fn;
+	}
+
+	/** The currently installed cooperative pause checkpoint, if any. */
+	get shouldPause(): AgentLoopConfig["shouldPause"] | undefined {
+		return this.#shouldPause;
+	}
+
+	/**
+	 * Fence old-turn steering admission.
+	 *
+	 * The loop polls steering UPSTREAM of its pause checkpoint (and again on the
+	 * immediate-interrupt path), so a cooperative stop alone cannot prevent one
+	 * more old-turn model call once a steering message has already been dequeued.
+	 * While the fence returns true the poll yields no messages AND does not
+	 * dequeue, so the queue survives intact for the next turn.
+	 */
+	setSteeringAdmissionFence(fn: (() => boolean) | undefined): void {
+		this.#steeringAdmissionFence = fn;
 	}
 
 	setMaintainContext(fn: AgentLoopConfig["maintainContext"] | undefined): void {
@@ -1900,6 +1938,12 @@ export class Agent {
 					skipInitialSteeringPoll = false;
 					return [];
 				}
+				// Fenced: yield nothing and dequeue nothing, so a steer submitted while a
+				// fold is being claimed is neither consumed by the run being wound down
+				// nor lost.
+				if (this.#steeringAdmissionFence?.() === true) {
+					return [];
+				}
 				const queued = this.#dequeueSteeringMessages();
 				if (this.#activeRunId !== runId) {
 					this.#steeringQueue = [...queued, ...this.#steeringQueue];
@@ -2080,6 +2124,10 @@ export class Agent {
 			if (this.#activeRunId !== runId) {
 				return;
 			}
+			const providerCode = providerFailureCode(err);
+			const runtimeFailureCode = abortController.signal.aborted
+				? "aborted"
+				: (managedLocalErrorDiagnostic(err)?.errorKind ?? providerCode);
 
 			const errorMsg: AgentMessage = {
 				role: "assistant",
@@ -2116,10 +2164,7 @@ export class Agent {
 				// signal, and a local staging failure comes from the identity-
 				// checked managedLocalErrorDiagnostic — a foreign error that
 				// self-declares a local kind still maps to agent_failed.
-				error: sanitizeAgentFailure(
-					err,
-					abortController.signal.aborted ? "aborted" : managedLocalErrorDiagnostic(err)?.errorKind,
-				),
+				error: sanitizeAgentFailure(err, runtimeFailureCode),
 				scope: handle.scope,
 			});
 			this.requestRunTerminal(managedLogicalRunOwner ?? runId, {

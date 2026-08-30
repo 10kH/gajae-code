@@ -69,7 +69,7 @@ import {
 } from "./event-webhook";
 import {
 	type CoordinatorModelProfileLoader,
-	loadCoordinatorModelProfiles,
+	createCoordinatorModelProfileLoader,
 	resolveCoordinatorMpreset,
 } from "./model-preset";
 import {
@@ -83,6 +83,7 @@ import {
 	requireCoordinatorMutation,
 	safeOpenCoordinatorArtifact,
 } from "./policy";
+import { listCoordinatorJsonFiles } from "./projection-scan";
 import {
 	answerBindingMatches,
 	buildCoordinatorAskAnswerSchema,
@@ -1497,26 +1498,17 @@ function publicSdkAcknowledgement(result: RuntimePromptAcknowledgement): Record<
 }
 
 async function listJsonFiles(dir: string): Promise<unknown[]> {
-	try {
-		const entries = await fs.readdir(dir);
-		const values = await Promise.all(
-			entries
-				.filter(entry => entry.endsWith(".json") && !entry.startsWith(".gjc-"))
-				.map(async entry => {
-					try {
-						return await readJsonFile(path.join(dir, entry));
-					} catch (error) {
-						if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-						logger.warn("Coordinator projection read failed", { path: entry, error: String(error) });
-						throw error;
-					}
-				}),
-		);
-		return values.filter(value => value !== null);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-		throw error;
+	const scan = await listCoordinatorJsonFiles(dir);
+	if (scan.capped) throw new Error("coordinator_projection_scan_incomplete");
+	if (scan.skippedEmpty > 0 || scan.skippedDebris > 0) {
+		logger.warn("Coordinator projection scan skipped debris", {
+			dir,
+			parsed: scan.parsed,
+			skippedDebris: scan.skippedDebris,
+			skippedEmpty: scan.skippedEmpty,
+		});
 	}
+	return scan.values;
 }
 
 const COORDINATOR_STATUS_EVENT_LIMIT = 100;
@@ -3263,7 +3255,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		await routerReady;
 	}
 	const platform = options.platform ?? process.platform;
-	const loadModelProfiles = services.resolveModelProfiles ?? loadCoordinatorModelProfiles;
+	const loadModelProfiles = services.resolveModelProfiles ?? createCoordinatorModelProfileLoader(routerAgentDir);
 	// Every authoritative projection is scoped by the collision-resistant namespace identity.
 	const namespaceDir = coordinatorNamespacePath(config);
 	// The prior human-readable directory is migration input only; it is never authority.
@@ -8415,6 +8407,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			}
 			if (name === "gjc_coordinator_start_session") {
 				requireCoordinatorMutation(config, "sessions", args);
+				const suppliedPrompt = Object.hasOwn(args, "prompt");
+				if (suppliedPrompt && (typeof args.prompt !== "string" || args.prompt.trim().length === 0))
+					return { ok: false, error: { code: "invalid_input", message: "Prompt must not be empty." } };
 				const idempotencyKey = requiredIdempotencyKey(args);
 				const cwd = await canonicalBrokerWorkspace(await assertCoordinatorWorkdir(config, args.cwd));
 				const mpresetResolution = await resolveCoordinatorMpreset(args.mpreset, loadModelProfiles);
@@ -8437,7 +8432,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						error: { code: "unknown_model", message: modelResolution.error },
 					};
 				}
-				const prompt = typeof args.prompt === "string" && args.prompt.length > 0 ? args.prompt : null;
+				const prompt = suppliedPrompt ? (args.prompt as string) : null;
 				/**
 				 * A prepared session is deliberately not ready for input: its readiness
 				 * is withheld until an operator-supplied thread is bound and activation
@@ -9082,10 +9077,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			}
 			if (name === "gjc_coordinator_send_prompt") {
 				requireCoordinatorMutation(config, "sessions", args);
+				if (typeof args.prompt !== "string" || args.prompt.trim().length === 0)
+					return { ok: false, error: { code: "invalid_input", message: "Prompt must not be empty." } };
 				const idempotencyKey = requiredIdempotencyKey(args);
 				const sessionId = safeExternalId("session", args.session_id);
-				if (typeof args.prompt !== "string" || args.prompt.length === 0)
-					return { ok: false, error: { code: "invalid_input", message: "prompt is required" } };
 				const prompt = args.prompt;
 				return await withToolIdempotency(
 					name,

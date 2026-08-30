@@ -63,6 +63,25 @@ describe("JobsObserver", () => {
 		await manager.dispose();
 	});
 
+	test("does not count a backgrounded monitor that is also surfaced as folded work", async () => {
+		const manager = makeManager();
+		const observer = new JobsObserver(manager, OWNER);
+		const backgroundedId = registerMonitor(manager, "folded monitor");
+		const backgrounded = manager.getJob(backgroundedId);
+		if (!backgrounded) throw new Error("expected backgrounded monitor job");
+		manager.markBackgrounded(backgroundedId, backgrounded.generation);
+		registerMonitor(manager, "active monitor");
+
+		const snapshot = observer.getSnapshot();
+		expect(snapshot.activeMonitorCount).toBe(1);
+		expect(snapshot.foldedJobs).toEqual(
+			expect.arrayContaining([expect.objectContaining({ id: backgroundedId, backgrounded: true })]),
+		);
+
+		observer.dispose();
+		await manager.dispose();
+	});
+
 	test("cancelMonitor rejects a foreign owner's monitor id", async () => {
 		const manager = makeManager();
 		const observer = new JobsObserver(manager, OWNER);
@@ -123,6 +142,31 @@ describe("JobsObserver", () => {
 		const snapshot = observer.getSnapshot();
 		expect(snapshot.worstState).toBe("failed");
 		expect(snapshot.failedUnacknowledged).toBe(true);
+
+		observer.dispose();
+		await manager.dispose();
+	});
+
+	test("handled foreground failures do not latch or surface as folded jobs", async () => {
+		const manager = makeManager();
+		const observer = new JobsObserver(manager, OWNER);
+
+		const jobId = manager.register(
+			"bash",
+			"handled foreground failure",
+			async () => {
+				throw new Error("foreground failure");
+			},
+			{ ownerId: OWNER },
+		);
+		await flush();
+
+		const snapshot = observer.getSnapshot();
+		expect(manager.getJob(jobId)?.status).toBe("failed");
+		expect(manager.getJob(jobId)?.metadata?.backgrounded).not.toBe(true);
+		expect(snapshot.failedUnacknowledged).toBe(false);
+		expect(snapshot.worstState).toBe("none");
+		expect(snapshot.foldedJobs).not.toEqual(expect.arrayContaining([expect.objectContaining({ id: jobId })]));
 
 		observer.dispose();
 		await manager.dispose();

@@ -20,6 +20,7 @@ import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
 import * as util from "node:util";
 import {
+	AdaptiveCompactionTracker,
 	type AfterToolCallContext,
 	type AfterToolCallResult,
 	type Agent,
@@ -116,6 +117,7 @@ import {
 	modelsAreEqual,
 	streamSimple,
 } from "@gajae-code/ai/core";
+import { normalizeAnthropicBaseUrl } from "@gajae-code/ai/providers/anthropic";
 import {
 	type AuthDisposition,
 	beginAttempt,
@@ -123,6 +125,7 @@ import {
 	EMPTY_RESPONSE_PROVIDER_CODE,
 	type FallbackAttemptToken,
 	type FallbackTriggerClass,
+	SERVER_OVERLOADED_PROVIDER_CODE,
 	STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE,
 } from "@gajae-code/ai/utils/fallback-transport";
 import { AttemptRecordStore } from "./attempt-record-store";
@@ -179,8 +182,10 @@ export interface ForkContextSeedOptions {
 }
 
 import type { AuthCredentialSelector } from "@gajae-code/ai/core";
+import { isFoundryEnabled } from "@gajae-code/ai/utils/foundry";
 import type { MacOSPowerAssertion } from "@gajae-code/natives";
 import {
+	$pickCredentialEnv,
 	extractRetryHint,
 	hasFsCode,
 	isEacces,
@@ -312,6 +317,7 @@ import {
 	type CoordinatorToolObservation,
 	ownerTerminalContextFromEnvironment,
 	persistCoordinatorRuntimeStateFromEvent,
+	persistCoordinatorWorkerIntegrationOutcome,
 	registerCoordinatorRuntimeStateFinalizer,
 	UNPROVEN_TOOL_LABEL,
 } from "../gjc-runtime/session-state-sidecar";
@@ -441,6 +447,7 @@ import {
 } from "./contribution-prep";
 import { canonicalCoordinatorToolLabel } from "./coordinator-tool-label";
 import { pruneStaleFileMentions } from "./file-mention-pruning";
+import { describeFoldReceipt, FOLD_WAKE_MERGE_WINDOW_MS, type FoldAdapter, FoldCoordinator } from "./fold-coordinator";
 import type { MemoryGuardRestoreResult } from "./memory-guard-checkpoint-participant";
 import {
 	type BashExecutionMessage,
@@ -455,6 +462,7 @@ import {
 	SKILL_PROMPT_MESSAGE_TYPE,
 } from "./messages";
 import { isLegacyProviderSafetyStopMessage } from "./provider-safety-stop";
+import { readSdkRunCapability } from "./sdk-run-capability";
 import { formatSessionDumpText } from "./session-dump-format";
 import type {
 	BranchSummaryEntry,
@@ -469,7 +477,6 @@ import type {
 	SessionManagerCloseOutcome,
 	SessionMemoryStats,
 } from "./session-manager";
-
 import {
 	createReadonlySessionManager,
 	getLatestCompactionEntry,
@@ -486,6 +493,8 @@ import {
 	bindToolLineage,
 	classifyOwnedEnvelope,
 	isOwnedCompletionEnvelope,
+	isOwnedCompletionEnvelopeAllowed,
+	lookupOwnedRegistration,
 	lookupTerminalScope,
 	mintTurnLineageIdHash,
 	type OwnedCompletionEnvelope,
@@ -494,10 +503,34 @@ import {
 	settleToolLineageRegistrationWindow,
 	unregisterOwnedRegistration,
 } from "./terminal-abort";
-
 import { ToolChoiceQueue } from "./tool-choice-queue";
 import { pruneSupersededMaintenanceReminders, pruneSupersededVolatileProjectContext } from "./volatile-context-pruning";
 import { YieldQueue } from "./yield-queue";
+
+const ASYNC_INLINE_RESULT_MAX_CHARS = 12_000;
+const ASYNC_PREVIEW_MAX_CHARS = 4_000;
+
+async function formatParkedAsyncResult(
+	sessionManager: SessionManager,
+	result: string,
+	allowArtifact = true,
+): Promise<string> {
+	if (result.length <= ASYNC_INLINE_RESULT_MAX_CHARS) return result;
+	const preview = `${result.slice(0, ASYNC_PREVIEW_MAX_CHARS)}\n\n[Output truncated. Showing first ${ASYNC_PREVIEW_MAX_CHARS.toLocaleString()} characters.]`;
+	try {
+		if (!allowArtifact) return preview;
+		const { path: artifactPath, id: artifactId } = await sessionManager.allocateArtifactPath("async");
+		if (artifactPath && artifactId) {
+			await Bun.write(artifactPath, result);
+			return `${preview}\nFull output: artifact://${artifactId}`;
+		}
+	} catch (error) {
+		logger.warn("Failed to persist parked async follow-up artifact", {
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
+	return preview;
+}
 
 /**
  * #4560: structured workflow recovery projection from canonical durable
@@ -1046,7 +1079,22 @@ export interface PromptOptions {
 	onSkillPrepared?: (meta: { name: string; path: string; lineCount?: number; cleanedArgs?: string }) => void;
 	/** Optional invocation-scoped cancellation fence used before an accepted skill starts execution. */
 	preflightSignal?: AbortSignal;
+	/** Internal host capability; ordinary package callers cannot construct the branded value. */
+	sdkRunCapability?: unknown;
 }
+
+type InternalPromptOptions = PromptOptions & { sdkRunToken?: string };
+type InternalCustomMessageOptions = Pick<
+	PromptOptions,
+	| "streamingBehavior"
+	| "toolChoice"
+	| "followUpQueuePolicy"
+	| "onPreflightAccepted"
+	| "onPreflightAcceptCommit"
+	| "preflightSignal"
+> & {
+	sdkRunToken?: string;
+};
 
 function promptPreflightCancelledError(): Error {
 	const error = Object.assign(new Error("Prompt preflight was cancelled before execution."), { code: "busy" });
@@ -1296,11 +1344,74 @@ function isBareDefaultMessageOnlyFirstEventTimeout(message: AssistantMessage): b
 			BARE_DEFAULT_WATCHDOG_ERROR.test(message.errorMessage ?? ""))
 	);
 }
+/**
+ * True when the attempt's structured evidence is exactly the provider's typed
+ * capacity-overload code and nothing else: no status, no retained retry header,
+ * no second typed code, no error kind, and none of the transport's other
+ * observations (request size, first-event timing, endpoint class, provider retry
+ * ceiling). The code arrives statuslessly (a Codex error event, an HTTP 200
+ * terminal Responses envelope), so these facts ARE the overload rather than
+ * evidence that the attempt did observable work; any additional fact means the
+ * attempt is no longer provably that bare capacity rejection. The code is
+ * compared case-sensitively, matching the parser and the transport gate.
+ */
+function isExactTypedOverloadFacts(message: AssistantMessage): boolean {
+	if (message.errorKind !== undefined || message.errorStatus !== undefined) return false;
+	const facts = message.transportFailure;
+	if (!facts) return false;
+	return (
+		facts.providerCode === SERVER_OVERLOADED_PROVIDER_CODE &&
+		facts.status === undefined &&
+		facts.anthropicErrorType === undefined &&
+		(facts.openaiErrorCode === undefined || facts.openaiErrorCode === SERVER_OVERLOADED_PROVIDER_CODE) &&
+		(facts.headers === undefined || Object.keys(facts.headers).length === 0) &&
+		facts.requestBytes === undefined &&
+		facts.firstEventElapsedMs === undefined &&
+		facts.firstEventTimeoutMs === undefined &&
+		facts.endpointClass === undefined &&
+		facts.retryMaxAttempts === undefined
+	);
+}
+/**
+ * True when transport facts are exactly the provider's statusless typed
+ * capacity-overload code (the provider code verbatim and, when present, the
+ * OpenAI code verbatim, with no status). The agent loop must not treat the new
+ * facts as managed transaction authority, and managed session fallback must
+ * not gain retry/advance authority from them, so this predicate keeps both
+ * guards reading only typed facts, never error prose.
+ */
+function isStatuslessTypedOverloadFacts(facts: TransportFailureFacts | undefined): boolean {
+	if (!facts) return false;
+	return (
+		facts.status === undefined &&
+		facts.providerCode === SERVER_OVERLOADED_PROVIDER_CODE &&
+		(facts.openaiErrorCode === undefined || facts.openaiErrorCode === SERVER_OVERLOADED_PROVIDER_CODE)
+	);
+}
+
 function isBareDefaultCodexOverload(message: AssistantMessage): boolean {
 	return (
 		message.api === "openai-codex-responses" &&
 		BARE_DEFAULT_CODEX_OVERLOAD_ERROR.test(message.errorMessage ?? "") &&
-		!hasBareDefaultRetryDisqualifyingFacts(message) &&
+		(isExactTypedOverloadFacts(message) || !hasBareDefaultRetryDisqualifyingFacts(message)) &&
+		!assistantMessageHasVisibleOrToolContent(message)
+	);
+}
+
+/**
+ * True when a generic OpenAI Responses turn failed with exactly OpenAI's typed
+ * capacity-overload code. Unlike the Codex and Anthropic admissions this reads
+ * no prose at all: the terminal Responses envelope carries the code in typed
+ * transport facts, so the code plus a content-free attempt is the whole
+ * admission. Both `openaiErrorCode` and the derived `providerCode` must be the
+ * exact code, so a different transport's overload facts cannot enter through
+ * this path.
+ */
+function isBareDefaultOpenAIResponsesOverload(message: AssistantMessage): boolean {
+	return (
+		message.api === "openai-responses" &&
+		message.transportFailure?.openaiErrorCode === SERVER_OVERLOADED_PROVIDER_CODE &&
+		isExactTypedOverloadFacts(message) &&
 		!assistantMessageHasVisibleOrToolContent(message)
 	);
 }
@@ -1559,14 +1670,44 @@ function buildSessionMetadata(
 	provider: string,
 	authStorage: AuthStorage | undefined,
 	credentialSessionId = sessionId,
+	model?: Model,
+	owner?: object,
 ): Record<string, unknown> {
 	const userId: Record<string, string> = { session_id: sessionId };
 	// Only look up account_uuid when the request is going to Anthropic. Injecting
 	// a Anthropic model OAuth account_uuid into requests bound for other providers (including
 	// Anthropic-format-compatible proxies like cloudflare-ai-gateway or gitlab-duo)
 	// would leak the user's Anthropic identity to unrelated third-party APIs.
-	if (provider === "anthropic") {
-		const accountUuid = authStorage?.getOAuthAccountId("anthropic", credentialSessionId);
+	const effectiveBaseUrl =
+		model?.provider === "anthropic"
+			? (normalizeAnthropicBaseUrl(
+					(isFoundryEnabled() ? $pickCredentialEnv("FOUNDRY_BASE_URL") : undefined) ?? model.baseUrl,
+				) ?? "https://api.anthropic.com")
+			: undefined;
+	let officialAnthropicEndpoint = false;
+	if (provider === "anthropic" && model?.api === "anthropic-messages") {
+		try {
+			const candidate = effectiveBaseUrl ?? "https://api.anthropic.com";
+			const url = new URL(candidate);
+			const authority = candidate.match(/^[a-z][a-z\d+.-]*:\/\/([^/?#]*)/iu)?.[1];
+			officialAnthropicEndpoint =
+				url.protocol === "https:" &&
+				url.hostname === "api.anthropic.com" &&
+				authority?.toLowerCase() === "api.anthropic.com" &&
+				!url.username &&
+				!url.password &&
+				!url.search &&
+				!url.hash &&
+				(url.pathname === "/" || url.pathname === "/v1" || url.pathname === "/v1/");
+		} catch {
+			officialAnthropicEndpoint = false;
+		}
+	}
+	// Without the registry owner, do not query shared auth storage: an unscoped
+	// lookup can attribute a registry-scoped API-key request to another OAuth
+	// account. Compatibility facades therefore retain session_id-only metadata.
+	if (officialAnthropicEndpoint && owner) {
+		const accountUuid = authStorage?.getOAuthAccountId("anthropic", credentialSessionId, { owner });
 		if (typeof accountUuid === "string" && accountUuid.length > 0) {
 			userId.account_uuid = accountUuid;
 			// Derive device_id from account_uuid so the payload matches the real CC
@@ -1847,9 +1988,24 @@ export type BeforeAgentStartContributor = (event: {
 }) => Promise<BeforeAgentStartInternalMessage | undefined>;
 
 const AGENT_END_WORKER_INTEGRATION_TIMEOUT_MS = 5_000;
+const POST_PUBLICATION_ERROR_MAX_BYTES = 512;
+
+export type WorkerIntegrationOutcome =
+	| { status: "completed" }
+	| { status: "failed"; error: string }
+	| { status: "timed_out" };
+
+function sanitizePostPublicationError(error: string | undefined): string | undefined {
+	if (error === undefined) return undefined;
+	const normalized = error
+		.replace(/[\u0000-\u001f\u007f]/gu, " ")
+		.replace(/\s+/gu, " ")
+		.trim();
+	return truncateHeadBytes(normalized || "unknown worker integration error", POST_PUBLICATION_ERROR_MAX_BYTES).text;
+}
 
 export class WorkerIntegrationRequestScheduler {
-	#inFlight: Promise<void> | undefined = undefined;
+	#inFlight: Promise<WorkerIntegrationOutcome> | undefined = undefined;
 	#pending = false;
 
 	constructor(
@@ -1866,9 +2022,15 @@ export class WorkerIntegrationRequestScheduler {
 	}
 
 	async flush(): Promise<void> {
+		await this.flushWithOutcome();
+	}
+
+	async flushWithOutcome(): Promise<WorkerIntegrationOutcome> {
+		let outcome: WorkerIntegrationOutcome = { status: "completed" };
 		while (this.#inFlight) {
-			await this.#inFlight;
+			outcome = await this.#inFlight;
 		}
+		return outcome;
 	}
 
 	#start(): void {
@@ -1878,16 +2040,22 @@ export class WorkerIntegrationRequestScheduler {
 		try {
 			request = this.request(controller.signal);
 		} catch {
-			request = Promise.resolve();
+			request = Promise.reject(new Error("Worker integration request failed before dispatch."));
 		}
 		let timeout: ReturnType<typeof setTimeout> | undefined;
-		const deadline = new Promise<void>(resolve => {
+		const deadline = new Promise<WorkerIntegrationOutcome>(resolve => {
 			timeout = setTimeout(() => {
 				controller.abort(new Error("Worker integration request timed out"));
-				resolve();
+				resolve({ status: "timed_out" });
 			}, this.timeoutMs);
 		});
-		this.#inFlight = Promise.race([request.catch(() => {}), deadline]).finally(() => {
+		this.#inFlight = Promise.race([
+			request.then(
+				() => ({ status: "completed" as const }),
+				error => ({ status: "failed" as const, error: String(error) }),
+			),
+			deadline,
+		]).finally(() => {
 			if (timeout) clearTimeout(timeout);
 			controller.abort();
 			this.#inFlight = undefined;
@@ -2364,6 +2532,8 @@ export class AgentSession {
 				this.#followUpPromotionHooks.delete(message);
 				followUpHook({ startsOwnRun: true, removed: true });
 			}
+			this.#sdkRunTokensByQueuedMessage.delete(message);
+			this.#deepInterviewGenuineUserMessageEpochs.delete(message);
 		}
 	}
 	#fireQueuedPromotionHooks(messages: readonly AgentMessage[], promotion?: { startsOwnRun?: boolean }): void {
@@ -2382,6 +2552,45 @@ export class AgentSession {
 				followUpHook({ startsOwnRun: promotion?.startsOwnRun ?? true });
 			}
 		}
+	}
+	#queuedMessagesForSessionTransition(): AgentMessage[] {
+		return [
+			...new Set([
+				...this.agent.snapshotSteering(),
+				...this.agent.snapshotFollowUp(),
+				...this.#deferredSdkFollowUps,
+			]),
+		];
+	}
+	/** Drop queued SDK work when the session identity is replaced. The old
+	 * promotion hooks belong to the predecessor runtime; retaining the message
+	 * would let it execute later under the successor without an owner. */
+	#terminalizeQueuedSdkWorkForSessionTransition(messages: readonly AgentMessage[]): void {
+		if (messages.length === 0) return;
+		this.#fireQueuedRemovalHooks(messages);
+		for (const message of messages) this.#sdkRunTokensByQueuedMessage.delete(message);
+		this.#deferredSdkFollowUps = this.#deferredSdkFollowUps.filter(message => !messages.includes(message));
+	}
+	#resetActiveSdkRunOwnership(): void {
+		this.#activeSdkRunToken = undefined;
+		this.#activeAttemptScope = undefined;
+		this.#activeLogicalRunId = undefined;
+	}
+	#acceptSdkAttemptRun(handle: AttemptRunHandle, sdkRunToken?: string): void {
+		const predecessorScope = this.#activeAttemptScope;
+		const predecessorSdkRunToken =
+			predecessorScope === undefined ? undefined : this.#sdkRunTokensByAttemptScope.get(predecessorScope);
+		const carryRecoverySkip =
+			sdkRunToken !== undefined &&
+			predecessorSdkRunToken === sdkRunToken &&
+			predecessorScope !== undefined &&
+			this.#skipPostPromptRecoveryWaitByAttemptScope.delete(predecessorScope);
+		this.#acceptRunHandle(handle);
+		if (sdkRunToken !== undefined) {
+			this.#activeSdkRunToken = sdkRunToken;
+			this.#sdkRunTokensByAttemptScope.set(handle.scope, sdkRunToken);
+		}
+		if (carryRecoverySkip) this.#skipPostPromptRecoveryWaitByAttemptScope.add(handle.scope);
 	}
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	#pendingNextTurnMessages: Array<{ message: CustomMessage; origin: "turn" | "external" }> = [];
@@ -2430,6 +2639,8 @@ export class AgentSession {
 	// required to re-trigger. A content signature (not object identity) is used so
 	// it survives the message-array rebuild that compaction/prune perform.
 	#lastMidRunMaintenanceAnchorSignature: string | undefined = undefined;
+	#adaptiveCompactionTracker = new AdaptiveCompactionTracker();
+	#adaptiveCompactionRecordedMessageKey: string | undefined;
 	#resourceSampler: () => EmergencyCompactionSample = () => this.#defaultResourceSample();
 	#retainedMemorySampler: (() => RetainedMemorySample) | undefined;
 
@@ -2514,7 +2725,88 @@ export class AgentSession {
 		onPersisted?: () => void;
 		appendedToAgent: boolean;
 	}> = [];
-	#foregroundBashBackgroundRequestHandler: (() => void) | undefined;
+	/**
+	 * Set by a fold and consumed once by the pause checkpoint, so a fold ends its
+	 * own turn without pausing any later turn.
+	 */
+	#foldStopRequested = false;
+	/**
+	 * The single linearization point for folding a foreground wait. Arrow deps
+	 * capture `this` but are only invoked after construction.
+	 */
+	readonly #foldCoordinator = new FoldCoordinator({
+		hasActiveTurn: () => this.activePromptHandle !== undefined,
+		armSteeringFence: () => {
+			this.agent.setSteeringAdmissionFence(() => true);
+			return () => this.agent.setSteeringAdmissionFence(undefined);
+		},
+		requestStop: () => {
+			this.#foldStopRequested = true;
+		},
+		captureRemainingIntent: () => this.#captureRemainingIntentForFold(),
+		// A parked completion replayed after the fold must schedule its own wake.
+		// This mirrors exactly what the sdk delivery seam does for a live receipt
+		// delivery, so the parked path cannot rely on an unrelated idle rearm.
+		deliverParked: (job, disposition) => {
+			const endpointId = this.#ownedAsyncJobManager
+				? AsyncJobManager.endpointIdOf(this.#ownedAsyncJobManager)
+				: undefined;
+			const registration = lookupOwnedRegistration(job.id, job.generation, endpointId);
+			if (this.#ownedAsyncJobManager?.isDeliverySuppressed(job.id, job.generation)) {
+				this.#ownedAsyncJobManager.clearParkedDelivery(job.generation);
+				return;
+			}
+			if (this.#foldCoordinator.claimCompletionNotice(job)) {
+				this.emitNotice(
+					"info",
+					`Folded job ${disposition.receipt.jobId} (${disposition.receipt.label}) finished.`,
+					"fold",
+				);
+			}
+			const ownedCompletion = registration
+				? {
+						lineageIdHash: registration.lineageIdHash,
+						promptAttemptEpoch: registration.promptAttemptEpoch,
+						registration,
+					}
+				: undefined;
+			const allowArtifact = ownedCompletion === undefined || isOwnedCompletionEnvelopeAllowed(ownedCompletion);
+			void formatParkedAsyncResult(this.sessionManager, disposition.text, allowArtifact)
+				.then(formattedResult => {
+					const manager = this.#ownedAsyncJobManager;
+					if (manager?.isDeliverySuppressed(job.id, job.generation)) {
+						manager.clearParkedDelivery(job.generation);
+						return;
+					}
+					if (!this.#foldCoordinator.claimCompletionDelivery(job)) {
+						manager?.clearParkedDelivery(job.generation);
+						return;
+					}
+					try {
+						manager?.retainDeliveryClaim(job);
+						if (manager?.isDeliverySuppressed(job.id, job.generation)) {
+							manager.releaseDeliveryClaim(job.generation);
+							manager.clearParkedDelivery(job.generation);
+							return;
+						}
+						this.yieldQueue.enqueue("async-result", {
+							jobId: disposition.receipt.jobId,
+							generation: disposition.receipt.jobGeneration,
+							result: `${formattedResult}\n\n${describeFoldReceipt(disposition.receipt)}`,
+							job,
+							durationMs: undefined,
+							ownedCompletion,
+						});
+					} finally {
+						manager?.clearParkedDelivery(job.generation);
+					}
+				})
+				.catch(error => {
+					this.#ownedAsyncJobManager?.clearParkedDelivery(job.generation);
+					logger.warn("Parked folded delivery formatting failed", { error: String(error) });
+				});
+		},
+	});
 
 	// Python execution state
 	#evalAbortControllers = new Set<AbortController>();
@@ -2564,7 +2856,10 @@ export class AgentSession {
 	#extensionRunner: ExtensionRunner | undefined = undefined;
 	/** SDK follow-up ownership by queued message and the attempt that dequeues it. */
 	#sdkRunTokensByQueuedMessage = new WeakMap<AgentMessage, string>();
+	#skipPostPromptRecoveryWaitByAttemptScope = new WeakSet<AttemptScope>();
 	#sdkRunTokensByAttemptScope = new WeakMap<AttemptScope, string>();
+	#activeSdkRunToken: string | undefined;
+	#activeAttemptScope: AttemptScope | undefined;
 	#attemptAuthority!: AttemptScopeAuthority;
 	#attemptRecordStore!: AttemptRecordStore;
 	#activeLogicalRunId: AttemptRunHandle["logicalRunId"] | undefined;
@@ -2573,6 +2868,7 @@ export class AgentSession {
 		// previously recorded run id rather than throwing inside the callback.
 		if (!handle) return;
 		this.#activeLogicalRunId = handle.logicalRunId;
+		this.#activeAttemptScope = handle.scope;
 	}
 
 	#turnIndex = 0;
@@ -2909,6 +3205,7 @@ export class AgentSession {
 	 * orchestrator does not hold it), so there is no self-deadlock.
 	 */
 	#sessionTransitionKind: string | undefined;
+	#coordinatorPersistGeneration = 0;
 
 	#beginSessionTransition(kind: string): void {
 		if (this.#sessionTransitionKind !== undefined) {
@@ -2918,6 +3215,7 @@ export class AgentSession {
 			);
 		}
 		this.#sessionTransitionKind = kind;
+		this.#coordinatorPersistGeneration += 1;
 	}
 
 	#endSessionTransition(): void {
@@ -3517,7 +3815,7 @@ export class AgentSession {
 		// Deferrals behind still-pending selection fences are excluded here: they
 		// cannot settle before their fence resolves, and the fence owner may be
 		// waiting on this very settlement (#4519).
-		if (!predecessorPromptStillInFlight) {
+		if (promptWait !== "publication" && !predecessorPromptStillInFlight) {
 			await this.#waitForSessionSettlement(this.#turnSettlementDeferralFloor());
 		}
 		if (flushError) throw flushError;
@@ -3559,28 +3857,50 @@ export class AgentSession {
 		this.#pendingAgentEndEmit = undefined;
 		const lease = this.#deferredAgentEndLeases.get(pending);
 		if (lease) this.#deferredAgentEndLeases.delete(pending);
+		this.#startAgentEndPublication(pending, lease);
+	}
+	#startAgentEndPublication(pending: AgentSessionEvent, lease?: RunResourceProducerLease): void {
 		this.#agentEndPublicationInFlight++;
-		this.#agentEndPublicationPromise = this.#publishDeferredAgentEnd(pending, lease);
+		const pendingScope = (pending as AgentSessionEvent & { scope?: AttemptScopeRef }).scope as
+			| AttemptScope
+			| undefined;
+		const sdkTerminal = pendingScope !== undefined && this.#sdkRunTokensByAttemptScope.has(pendingScope);
+		this.#agentEndPublicationPromise = this.#publishDeferredAgentEnd(pending, lease, sdkTerminal);
 		void this.#agentEndPublicationPromise;
 	}
 
 	async #publishDeferredAgentEnd(
 		pending: AgentSessionEvent,
 		lease: RunResourceProducerLease | undefined,
+		workerIntegrationSettled: boolean,
 	): Promise<void> {
+		const publicationContext = {
+			sessionId: this.sessionId,
+			cwd: this.sessionManager.getCwd(),
+			sessionFile: this.sessionManager.getSessionFile(),
+		};
+		const publicationScope = (pending as AgentSessionEvent & { scope?: AttemptScopeRef }).scope as
+			| AttemptScope
+			| undefined;
+		const publicationCorrelationId = publicationScope
+			? this.#sdkRunTokensByAttemptScope.get(publicationScope)
+			: undefined;
 		let extensionDelivery: Promise<void> | undefined;
 		const releaseLease = () => {
 			if (!lease) return;
+			this.#deferredAgentEndLeases.delete(pending);
 			if (this.#postPromptLeases.get(lease.resourceRunId) === lease) {
 				this.#postPromptLeases.delete(lease.resourceRunId);
 			}
 			lease.closeDiscovery();
 		};
 		const publish = async () => {
-			// Worker integration is first-party lifecycle persistence, not an extension
-			// hook. Settle it before publishing the terminal boundary while user extension
-			// delivery and coordinator sidecar persistence remain asynchronous.
-			await this.#flushWorkerIntegrationForAgentEnd();
+			let workerIntegration: Promise<WorkerIntegrationOutcome> | undefined;
+			let workerIntegrationOutcome: WorkerIntegrationOutcome | undefined;
+			if (!workerIntegrationSettled) {
+				workerIntegration = this.#flushWorkerIntegrationForAgentEnd();
+				workerIntegrationOutcome = await workerIntegration;
+			}
 			// Reserve persistence before notifying synchronous subscribers: a subscriber
 			// may start a successor prompt from agent_end, whose running state must
 			// serialize after this terminal boundary rather than be overwritten by it.
@@ -3589,16 +3909,72 @@ export class AgentSession {
 			// behind this terminal transition, but do not make the interactive terminal
 			// wait for the filesystem-backed lock/write to settle. On slow or lock-hostile
 			// mounts such as WSL drvfs, waiting here leaves the foreground activity loader
-			// and busy input state visible after the model has already finished.
-			const terminalPersistence = this.#queueCoordinatorRuntimeStatePersist(pending);
+			// and busy input state visible after the model has already finished. The queue
+			// preserves transaction order; terminal publication is the user-visible
+			// authority and must not be suppressed by a secondary persistence failure.
+			const terminalPersistence = this.#queueCoordinatorRuntimeStatePersist(pending, true);
 			this.#emit(pending);
-			await terminalPersistence;
+			void terminalPersistence.then(
+				() => {
+					if (workerIntegrationOutcome) {
+						this.#recordPostPublicationOutcome(
+							publicationContext,
+							publicationCorrelationId,
+							"worker_integration",
+							workerIntegrationOutcome,
+						);
+					}
+					this.#recordPostPublicationOutcome(
+						publicationContext,
+						publicationCorrelationId,
+						"terminal_persistence",
+						{ status: "completed" },
+					);
+				},
+				error => {
+					if (workerIntegrationOutcome) {
+						this.#recordPostPublicationOutcome(
+							publicationContext,
+							publicationCorrelationId,
+							"worker_integration",
+							workerIntegrationOutcome,
+						);
+					}
+					this.#recordPostPublicationOutcome(
+						publicationContext,
+						publicationCorrelationId,
+						"terminal_persistence",
+						{
+							status: "failed",
+							error: String(error),
+						},
+					);
+					logger.warn("Failed to persist terminal coordinator runtime state", { error: String(error) });
+				},
+			);
 			extensionDelivery = this.#queueExtensionEvent(
 				pending,
 				undefined,
 				true,
 				(pending as AgentSessionEvent & { scope?: AttemptScopeRef }).scope,
 			);
+			if (workerIntegrationSettled) {
+				workerIntegration = this.#flushWorkerIntegrationForAgentEnd();
+				void workerIntegration.then(outcome =>
+					this.#recordPostPublicationOutcome(
+						publicationContext,
+						publicationCorrelationId,
+						"worker_integration",
+						outcome,
+					),
+				);
+				await extensionDelivery;
+				void terminalPersistence.catch(error =>
+					logger.warn("Terminal persistence continued after SDK publication", { error }),
+				);
+			} else {
+				// Non-SDK/public publication has already awaited worker integration above.
+			}
 		};
 		try {
 			if (lease) await this.#runResourceLeaseContext.run(lease, publish);
@@ -3794,9 +4170,19 @@ export class AgentSession {
 					this.#resumeFromOwnedCompletion();
 				try {
 					if (survivors.length === 1) {
-						await this.agent.prompt(first, this.#managedFallbackPromptOptions());
+						await this.agent.prompt(first, {
+							...this.#managedFallbackPromptOptions(),
+							onRunAccepted: (handle: AttemptRunHandle) => {
+								if (handle) this.#acceptSdkAttemptRun(handle);
+							},
+						});
 					} else {
-						await this.agent.prompt(survivors, this.#managedFallbackPromptOptions());
+						await this.agent.prompt(survivors, {
+							...this.#managedFallbackPromptOptions(),
+							onRunAccepted: (handle: AttemptRunHandle) => {
+								if (handle) this.#acceptSdkAttemptRun(handle);
+							},
+						});
 					}
 				} finally {
 					// The owned completions were delivered OR the prompt attempt
@@ -3814,11 +4200,32 @@ export class AgentSession {
 					async () => {
 						await run();
 					},
-					{ delayMs: 1 },
+					// One merge window, so staggered completions share a single wake
+					// turn instead of each buying its own.
+					{ delayMs: FOLD_WAKE_MERGE_WINDOW_MS },
 				);
 			},
 		});
 		this.agent.setOnBeforeYield(() => this.yieldQueue.flush("streaming"));
+		// Stop-after-result, never abort: a fold arms this once and the loop ends the
+		// turn at its next checkpoint. Consuming the flag here keeps the pause scoped
+		// to the folded turn instead of pausing everything that follows. The
+		// config-provided checkpoint (subagent requestPause, RLM research) is OR-ed
+		// in, never replaced.
+		// sdk/session.ts threads the config's shouldPause into new Agent, so the
+		// Agent's current checkpoint IS the config-provided one (subagent
+		// requestPause, RLM research). Capture and OR it rather than replace it.
+		const configuredShouldPause = this.agent.shouldPause;
+		this.agent.setShouldPause(() => {
+			if (configuredShouldPause?.() === true) return true;
+			if (!this.#foldStopRequested) return false;
+			this.#foldStopRequested = false;
+			// The folded turn has now actually stopped: steering admission must be
+			// restored so later turns drain their queues normally (the fence stays
+			// armed from the fold until exactly this point).
+			this.agent.setSteeringAdmissionFence(undefined);
+			return true;
+		});
 		this.agent.setMaintainContext((context, lifecycle) =>
 			this.#trackMidRunMaintenance(
 				this.awaitPendingContextTransformations().then(() => this.#runMidRunMaintenance(context, lifecycle)),
@@ -3957,6 +4364,18 @@ export class AgentSession {
 			if (messages.some(message => ownedCompletionResumeAction(message) === "fresh")) {
 				this.#resumeFromOwnedCompletion();
 			}
+			const consumedSdkRunTokenForCurrentRun = messages
+				.map(message => this.#sdkRunTokensByQueuedMessage.get(message))
+				.find((token): token is string => token !== undefined);
+			if (
+				consumedSdkRunTokenForCurrentRun !== undefined &&
+				this.#activeAttemptScope !== undefined &&
+				promotion.startsOwnRun !== true
+			) {
+				this.#sdkRunTokensByAttemptScope.set(this.#activeAttemptScope, consumedSdkRunTokenForCurrentRun);
+				this.#skipPostPromptRecoveryWaitByAttemptScope.add(this.#activeAttemptScope);
+				this.#activeSdkRunToken = consumedSdkRunTokenForCurrentRun;
+			}
 			// Monitor task-notifications now carry the owned-completion envelope
 			// (see tools/monitor.ts), so the general drop + fresh-admission paths
 			// above cover them exactly like async results — no monitor-specific
@@ -3972,13 +4391,38 @@ export class AgentSession {
 			// when the batch is drained by a continuation the message did not
 			// schedule (a skipped continuation must never discard the correlation
 			// of work that is still consumed; review thread P2).
+			const consumedSdkRunToken =
+				promotion.startsOwnRun === true
+					? [...messages, ...dropped]
+							.map(message => this.#sdkRunTokensByQueuedMessage.get(message))
+							.find((token): token is string => token !== undefined)
+					: undefined;
 			this.#fireQueuedPromotionHooks(messages, promotion);
+			if (consumedSdkRunToken !== undefined) this.#activeSdkRunToken = consumedSdkRunToken;
+			// Dropped or in-run follow-ups have no later own-run acceptance callback;
+			// delete those tokens now. Own-run messages stay mapped until
+			// #scheduleAgentContinue.onRunAccepted binds the new attempt scope.
+			for (const message of dropped) this.#sdkRunTokensByQueuedMessage.delete(message);
+			if (promotion.startsOwnRun !== true)
+				for (const message of messages) this.#sdkRunTokensByQueuedMessage.delete(message);
 		};
 		// Steering consumed mid-run never starts its own run: fire the stored
 		// promotion hook at the REAL dequeue boundary so the SDK attaches the
 		// submitter to the in-flight run instead of parking the correlation for
 		// an unrelated later agent_start (#4668).
 		this.agent.onSteeringConsumed = (messages, promotion = { startsOwnRun: false }) => {
+			const consumedSdkRunToken = messages
+				.map(message => this.#sdkRunTokensByQueuedMessage.get(message))
+				.find((token): token is string => token !== undefined);
+			if (
+				consumedSdkRunToken !== undefined &&
+				this.#activeAttemptScope !== undefined &&
+				promotion.startsOwnRun !== true
+			) {
+				this.#sdkRunTokensByAttemptScope.set(this.#activeAttemptScope, consumedSdkRunToken);
+				this.#skipPostPromptRecoveryWaitByAttemptScope.add(this.#activeAttemptScope);
+				this.#activeSdkRunToken = consumedSdkRunToken;
+			}
 			this.#fireQueuedPromotionHooks(messages, promotion);
 		};
 		this.agent.providerSessionState = this.#providerSessionState;
@@ -4891,6 +5335,10 @@ export class AgentSession {
 	 * seen.
 	 */
 	#coordinatorToolObservations = new WeakMap<object, CoordinatorToolObservation>();
+	#agentEventAdmission = new WeakMap<
+		object,
+		{ scope?: AttemptScope; sdkRunToken?: string; persistGeneration: number }
+	>();
 
 	/**
 	 * Capture what is true at the SYNCHRONOUS agent-event boundary, before any async work.
@@ -4946,6 +5394,11 @@ export class AgentSession {
 	}
 
 	#trackAgentEvent = (event: AgentEvent): Promise<void> => {
+		this.#agentEventAdmission.set(event, {
+			scope: this.#activeAttemptScope,
+			sdkRunToken: this.#activeSdkRunToken,
+			persistGeneration: this.#coordinatorPersistGeneration,
+		});
 		// First statement of the listener: the observation must precede every claim,
 		// reservation, and async hop this handler performs.
 		this.#observeCoordinatorToolEvent(event);
@@ -5015,10 +5468,10 @@ export class AgentSession {
 					this.#postPromptLeases.set(eventLease.resourceRunId, eventLease);
 				if (eventLease) {
 					await this.#runResourceLeaseContext.run(eventLease, () =>
-						this.#handleAgentEvent(event, activePromptHandle, canonicalAdmission),
+						this.#handleAgentEvent(event, activePromptHandle, canonicalAdmission, eventLease),
 					);
 				} else {
-					await this.#handleAgentEvent(event, activePromptHandle, canonicalAdmission);
+					await this.#handleAgentEvent(event, activePromptHandle, canonicalAdmission, undefined);
 				}
 			} catch (error) {
 				logger.warn("Agent event handler failed", { event: event.type, error: String(error) });
@@ -5026,11 +5479,19 @@ export class AgentSession {
 				canonicalAdmission?.release();
 				if (eventLease) {
 					const pendingAgentEnd =
-						event.type === "agent_end" && !maintenanceCheckpoint && this.#pendingAgentEndEmit === event
+						event.type === "agent_end" &&
+						!maintenanceCheckpoint &&
+						(this.#pendingAgentEndEmit === event || this.#deferredAgentEndLeases.has(event))
 							? this.#pendingAgentEndEmit
 							: undefined;
 					if (pendingAgentEnd) {
 						this.#deferredAgentEndLeases.set(pendingAgentEnd, eventLease);
+					} else if (
+						event.type === "agent_end" &&
+						!maintenanceCheckpoint &&
+						this.#deferredAgentEndLeases.has(event)
+					) {
+						// Fast publication took ownership of the lease before the handler unwound.
 					} else {
 						if (event.type === "agent_end" && this.#postPromptLeases.get(eventLease.resourceRunId) === eventLease)
 							this.#postPromptLeases.delete(eventLease.resourceRunId);
@@ -5053,21 +5514,61 @@ export class AgentSession {
 	/** Serializes sidecar writes in publication order, independent of write latency. */
 	#coordinatorPersistQueue: Promise<void> = Promise.resolve();
 
+	#recordPostPublicationOutcome(
+		context: { sessionId: string; cwd: string; sessionFile: string | undefined },
+		correlationId: string | undefined,
+		kind: "worker_integration" | "terminal_persistence",
+		outcome: { status: "completed" | "failed" | "timed_out"; error?: string },
+	): void {
+		if (outcome.status !== "completed") {
+			const correlation = correlationId ?? context.sessionId;
+			const safeError = sanitizePostPublicationError(outcome.error);
+			this.#emit({
+				type: "notice",
+				level: "error",
+				source: kind,
+				message: `${kind} ${outcome.status} for ${correlation}${safeError ? `: ${safeError}` : ""}`,
+			});
+		}
+		const persist = () =>
+			persistCoordinatorWorkerIntegrationOutcome(context, {
+				...outcome,
+				kind,
+				correlationId,
+				error: sanitizePostPublicationError(outcome.error),
+			});
+		const queued = this.#coordinatorPersistQueue.then(persist, persist);
+		this.#coordinatorPersistQueue = queued.catch(() => {});
+		void queued.catch(error =>
+			logger.warn("Failed to persist terminal reconciliation outcome", { error: String(error) }),
+		);
+	}
+
 	/**
 	 * Reserve this event's place in the sidecar write order.
 	 *
 	 * Called immediately BEFORE local delivery so a synchronous subscriber that re-enters
 	 * the session cannot get its own, later event persisted first. The returned promise is
-	 * only awaited where durability must precede delivery (terminal `agent_end`).
+	 * awaited only by callers that explicitly require a durable handoff; interactive
+	 * terminal delivery remains independent of this secondary sink.
 	 *
 	 * A pairing-only tool event takes no place in that order at all — neither its start nor
 	 * its end. It describes a call that was never dispatched, and this file is read as the
 	 * answer to "what is this session doing right now".
 	 */
-	#queueCoordinatorRuntimeStatePersist(event: AgentSessionEvent): Promise<void> {
+	#queueCoordinatorRuntimeStatePersist(event: AgentSessionEvent, propagateFailure = false): Promise<void> {
 		if (isNonDispatchedToolEvent(event)) return Promise.resolve();
 		const observation = this.#coordinatorToolObservations.get(event);
-		const run = () => this.#persistRuntimeStateInBackground(event, observation);
+		const context = {
+			sessionId: this.sessionId,
+			cwd: this.sessionManager.getCwd(),
+			sessionFile: this.sessionManager.getSessionFile(),
+		};
+		const generation = this.#agentEventAdmission.get(event)?.persistGeneration ?? this.#coordinatorPersistGeneration;
+		const run = () =>
+			generation === this.#coordinatorPersistGeneration
+				? this.#persistRuntimeStateInBackground(event, context, observation, propagateFailure)
+				: Promise.resolve();
 		const queued = this.#coordinatorPersistQueue.then(run, run);
 		this.#coordinatorPersistQueue = queued.catch(() => {});
 		return queued;
@@ -5075,24 +5576,19 @@ export class AgentSession {
 
 	async #persistRuntimeStateInBackground(
 		event: AgentSessionEvent,
+		context: { sessionId: string; cwd: string; sessionFile: string | undefined },
 		observation: CoordinatorToolObservation | undefined,
+		propagateFailure: boolean,
 	): Promise<void> {
 		try {
-			await persistCoordinatorRuntimeStateFromEvent(
-				event,
-				{
-					sessionId: this.sessionId,
-					cwd: this.sessionManager.getCwd(),
-					sessionFile: this.sessionManager.getSessionFile(),
-				},
-				observation,
-			);
-		} catch {
+			await persistCoordinatorRuntimeStateFromEvent(event, context, observation);
+		} catch (error) {
 			logger.warn("Failed to persist coordinator runtime state", { event: event.type });
+			if (propagateFailure) throw error;
 		}
 	}
 
-	async #emitSessionEvent(event: AgentSessionEvent): Promise<void> {
+	async #emitSessionEvent(event: AgentSessionEvent, eventLease?: RunResourceProducerLease): Promise<void> {
 		const attemptScope = (event as AgentSessionEvent & { scope?: AttemptScope }).scope;
 		if (event.type === "turn_start") {
 			this.#extensionTurnGeneration++;
@@ -5126,6 +5622,18 @@ export class AgentSession {
 		// have unwound. Subscribers treat this event as the ready signal; flushing it
 		// from abort while either barrier is active permits a successor to race the
 		// prior prompt's cleanup.
+		const sdkTerminal =
+			event.type === "agent_end" && attemptScope !== undefined && this.#sdkRunTokensByAttemptScope.has(attemptScope);
+		if (
+			event.type === "agent_end" &&
+			sdkTerminal &&
+			this.#pendingAgentEndContinuationHolds.size === 0 &&
+			this.#pendingAgentEndEmit === undefined
+		) {
+			if (eventLease) this.#deferredAgentEndLeases.set(event, eventLease);
+			this.#startAgentEndPublication(event, eventLease);
+			return;
+		}
 		if (event.type === "agent_end" && (this.#livePromptsInFlight() > 0 || this.#agentEventHandlersInFlight > 0)) {
 			this.#pendingAgentEndEmit = event;
 			return;
@@ -5134,8 +5642,12 @@ export class AgentSession {
 		if (event.type === "agent_end") {
 			// Start the durable terminal write before synchronous subscribers can
 			// re-enter prompt(), so a successor's running transition serializes after it.
-			await this.#queueCoordinatorRuntimeStatePersist(event);
+			// Do not let a lock-hostile sidecar suppress the terminal event itself.
+			const terminalPersistence = this.#queueCoordinatorRuntimeStatePersist(event);
 			this.#emit(event);
+			void terminalPersistence.catch(error => {
+				logger.warn("Failed to persist terminal coordinator runtime state", { error: String(error) });
+			});
 			await this.#emitExtensionEvent(event);
 			return;
 		}
@@ -5231,6 +5743,7 @@ export class AgentSession {
 		event: AgentEvent,
 		activePromptHandle?: string,
 		canonicalAdmission?: CanonicalMessageAdmission,
+		eventLease?: RunResourceProducerLease,
 	): Promise<void> => {
 		const attemptScope = (event as AgentEvent & { scope?: AttemptScope }).scope;
 
@@ -5570,7 +6083,7 @@ export class AgentSession {
 			});
 		}
 
-		await this.#emitSessionEvent(displayEvent);
+		await this.#emitSessionEvent(displayEvent, eventLease);
 		if (event.type === "message_end" && event.message.role === "assistant") {
 			this.#assistantAttemptScopes.set(event.message, {
 				scope: attemptScope,
@@ -5920,6 +6433,7 @@ export class AgentSession {
 						skipCompactionCheck: true,
 						resourceRunId: activePromptHandle,
 						maintenanceContinuation: true,
+						sdkRunToken: attemptScope ? this.#sdkRunTokensByAttemptScope.get(attemptScope) : undefined,
 					});
 				}
 				return;
@@ -6207,8 +6721,11 @@ export class AgentSession {
 		predecessorAgentEndHold?: symbol;
 		/** Internal predecessor terminal event sequestered while waiting behind selection. */
 		deferredPredecessorAgentEnd?: AgentSessionEvent;
+		/** Internal causal SDK owner captured when this continuation was scheduled. */
+		sdkRunToken?: string;
 	}): Promise<void> {
 		const continuationAdmission = this.#captureScheduledContinuationAdmission();
+		const scheduledSdkRunToken = options?.sdkRunToken;
 		const selectionFenceGeneration =
 			options?.selectionFenceGeneration ??
 			this.#selectionFenceGenerationContext.getStore() ??
@@ -6230,6 +6747,7 @@ export class AgentSession {
 						generation: deferredPromptGeneration,
 						selectionFenceGeneration,
 						deferredPredecessorAgentEnd,
+						sdkRunToken: scheduledSdkRunToken,
 					});
 				} finally {
 					// The recursive call synchronously re-reserved its settlement
@@ -6365,18 +6883,23 @@ export class AgentSession {
 												// agent_start (review P1); their queued messages are in-run
 												// consumptions, not own-run promotions.
 												const startsOwn = options?.maintenanceContinuation !== true;
+												const inheritedSdkRunToken = options?.continueQueuedOnly
+													? undefined
+													: (options?.sdkRunToken ?? scheduledSdkRunToken);
+												const consumedSdkRunToken = acceptance.consumedQueuedMessages
+													.map(message => this.#sdkRunTokensByQueuedMessage.get(message))
+													.find((token): token is string => token !== undefined);
+												const sdkRunToken = consumedSdkRunToken ?? inheritedSdkRunToken;
 												this.#fireQueuedPromotionHooks(acceptance.consumedQueuedMessages, {
 													startsOwnRun: startsOwn,
 												});
-												for (const message of acceptance.consumedQueuedMessages) {
-													const sdkRunToken = this.#sdkRunTokensByQueuedMessage.get(message);
-													if (sdkRunToken) {
-														this.#sdkRunTokensByAttemptScope.set(handle.scope, sdkRunToken);
-														break;
-													}
-												}
-												this.#acceptRunHandle(handle);
+												if (startsOwn) this.#activeSdkRunToken = sdkRunToken;
+												this.#acceptSdkAttemptRun(handle, sdkRunToken);
 												options?.onRunAccepted?.(handle);
+												// Keep the queued token available through the acceptance callback;
+												// SDK follow-up owners bind it to the new attempt scope there.
+												for (const message of acceptance.consumedQueuedMessages)
+													this.#sdkRunTokensByQueuedMessage.delete(message);
 												settleLease();
 												releasePredecessor();
 												if (startsQueuedSuccessor) {
@@ -6534,8 +7057,12 @@ export class AgentSession {
 		resourceRunId?: string,
 		deferredSelectionFenceGeneration?: number,
 		deferredPredecessorAgentEnd?: AgentSessionEvent,
+		sdkRunToken?: string,
 	): void {
 		const scheduledGeneration = generation;
+		const scheduledSdkRunToken =
+			sdkRunToken ??
+			(this.#activeAttemptScope ? this.#sdkRunTokensByAttemptScope.get(this.#activeAttemptScope) : undefined);
 		const continuationAuthorized = async (
 			signal: AbortSignal,
 			hasPendingNextTurnMessages = false,
@@ -6588,6 +7115,7 @@ export class AgentSession {
 						resourceRunId,
 						selectionFenceGeneration,
 						predecessorAgentEnd,
+						scheduledSdkRunToken,
 					);
 				} finally {
 					this.#endSelectionFenceDeferralTracking(selectionFenceGeneration);
@@ -6635,6 +7163,7 @@ export class AgentSession {
 								promptText,
 								{
 									skipPostPromptRecoveryWait: true,
+									sdkRunToken: scheduledSdkRunToken,
 									skipCompactionCheck: true,
 									predecessorAgentEndHold,
 									onFinalPreflight: ({ hasPendingNextTurnMessages }) =>
@@ -7412,16 +7941,16 @@ export class AgentSession {
 		this.#workerIntegrationScheduler?.enqueue();
 	}
 
-	async #flushWorkerIntegrationAttempt(): Promise<void> {
-		await this.#workerIntegrationScheduler?.flush();
+	async #flushWorkerIntegrationAttempt(): Promise<WorkerIntegrationOutcome> {
+		return (await this.#workerIntegrationScheduler?.flushWithOutcome()) ?? { status: "completed" };
 	}
 
-	async #flushWorkerIntegrationForAgentEnd(): Promise<void> {
+	async #flushWorkerIntegrationForAgentEnd(): Promise<WorkerIntegrationOutcome> {
 		if (!this.#workerIntegrationRequestedForTurn) {
 			this.#requestWorkerIntegrationAttempt();
 		}
 		try {
-			await this.#flushWorkerIntegrationAttempt();
+			return await this.#flushWorkerIntegrationAttempt();
 		} finally {
 			this.#workerIntegrationRequestedForTurn = false;
 		}
@@ -7434,16 +7963,53 @@ export class AgentSession {
 		workerIntegrationSettled = false,
 		scope?: AttemptScopeRef,
 	): Promise<void> {
+		const admission = this.#agentEventAdmission.get(event);
+		const activeAttemptScopeAtEvent = admission === undefined ? this.#activeAttemptScope : admission.scope;
+		const activeSdkRunTokenAtEvent = admission === undefined ? this.#activeSdkRunToken : admission.sdkRunToken;
 		if (event.type === "agent_end" && !workerIntegrationSettled) {
 			await this.#flushWorkerIntegrationForAgentEnd();
 		}
 		const deliveryScope = scope ?? (event as AgentSessionEvent & { scope?: AttemptScopeRef }).scope;
+		const eventToken = (event as AgentSessionEvent & { sdkRunToken?: unknown }).sdkRunToken;
+		const sdkRunToken =
+			typeof eventToken === "string"
+				? eventToken
+				: deliveryScope
+					? this.#sdkRunTokensByAttemptScope.get(deliveryScope as AttemptScope)
+					: undefined;
 		const isTerminalAgentEnd =
 			event.type === "agent_end" && !(event.stopReason === "maintenance" && event.maintenanceOutcome !== "aborted");
 		const finishAttempt = () => {
 			if (!isTerminalAgentEnd) return;
-			if (deliveryScope) this.#attemptRecordStore.retire(deliveryScope as AttemptScope);
-			this.#activeLogicalRunId = undefined;
+			// A merged wake batch whose flush fired while still streaming cleared its
+			// pending flag without rescheduling. Returning to idle is exactly when it
+			// becomes deliverable again, so rearm here rather than waiting for an
+			// unrelated enqueue.
+			this.yieldQueue.rearmIdle();
+			const isActiveAttempt =
+				deliveryScope === undefined
+					? this.#activeAttemptScope === activeAttemptScopeAtEvent &&
+						this.#activeSdkRunToken === activeSdkRunTokenAtEvent
+					: deliveryScope === activeAttemptScopeAtEvent &&
+						deliveryScope === this.#activeAttemptScope &&
+						this.#activeSdkRunToken === activeSdkRunTokenAtEvent;
+			if (this.#foldStopRequested) {
+				this.#foldStopRequested = false;
+				this.agent.setSteeringAdmissionFence(undefined);
+			}
+			if (deliveryScope) {
+				this.#attemptRecordStore.retire(deliveryScope as AttemptScope);
+				if (
+					activeSdkRunTokenAtEvent !== undefined &&
+					this.#sdkRunTokensByAttemptScope.get(deliveryScope as AttemptScope) === activeSdkRunTokenAtEvent
+				)
+					this.#sdkRunTokensByAttemptScope.delete(deliveryScope as AttemptScope);
+			}
+			if (isActiveAttempt) this.#activeSdkRunToken = undefined;
+			if (isActiveAttempt) {
+				this.#activeAttemptScope = undefined;
+				this.#activeLogicalRunId = undefined;
+			}
 		};
 		if (!this.#extensionRunner) {
 			finishAttempt();
@@ -7456,9 +8022,7 @@ export class AgentSession {
 				await this.#extensionRunner.emit(
 					{
 						type: "agent_start",
-						...(deliveryScope
-							? { sdkRunToken: this.#sdkRunTokensByAttemptScope.get(deliveryScope as AttemptScope) }
-							: {}),
+						...(sdkRunToken ? { sdkRunToken } : {}),
 					},
 					undefined,
 					deliveryScope,
@@ -7469,6 +8033,7 @@ export class AgentSession {
 						type: "agent_failed",
 						error: sanitizePromptFailure(event.error),
 						scope: event.scope,
+						...(sdkRunToken ? { sdkRunToken } : {}),
 					},
 					undefined,
 					deliveryScope,
@@ -7480,6 +8045,7 @@ export class AgentSession {
 						messages: event.messages,
 						stopReason: event.stopReason,
 						maintenanceOutcome: event.maintenanceOutcome,
+						...(sdkRunToken ? { sdkRunToken } : {}),
 					},
 					undefined,
 					deliveryScope,
@@ -7702,12 +8268,23 @@ export class AgentSession {
 	 * such event.
 	 */
 	#syncAgentSessionId(sessionId?: string): void {
+		this.#resetAdaptiveCompactionState();
 		this.#reasoningControlContextGeneration++;
 		const sid = this.#providerSessionId ?? sessionId ?? this.sessionManager.getSessionId();
 		this.agent.sessionId = sid;
 		this.agent.providerSessionId = this.#providerCacheSessionId ?? sid;
-		this.agent.setMetadataResolver((provider: string) =>
-			buildSessionMetadata(sid, provider, this.#modelRegistry.authStorage, this.credentialSessionId),
+		this.agent.setMetadataResolver(context =>
+			buildSessionMetadata(
+				sid,
+				context.provider,
+				this.#modelRegistry.authStorage,
+				this.credentialSessionId,
+				context.model ?? this.model,
+				// Optional call: the metadata resolver runs on every prompt, and `owner` is an
+				// optional `buildSessionMetadata` argument. The auth-credential paths keep the
+				// strict call because they genuinely require a real registry owner.
+				this.#modelRegistry.getAuthStorageOwner?.(),
+			),
 		);
 	}
 
@@ -8320,13 +8897,39 @@ export class AgentSession {
 	 * handler, so Ctrl+B-style folding fails closed instead of aborting or
 	 * shell-suspending arbitrary work.
 	 */
-	registerForegroundBashBackgroundRequestHandler(handler: () => void): () => void {
-		this.#foregroundBashBackgroundRequestHandler = handler;
-		return () => {
-			if (this.#foregroundBashBackgroundRequestHandler === handler) {
-				this.#foregroundBashBackgroundRequestHandler = undefined;
-			}
-		};
+	registerForegroundFoldParticipant(adapter: FoldAdapter): () => void {
+		return this.#foldCoordinator.registerParticipant(adapter);
+	}
+
+	/** The session-owned fold coordinator, for delivery-side receipt lookup. */
+	get foldCoordinator(): FoldCoordinator {
+		return this.#foldCoordinator;
+	}
+
+	/**
+	 * Best-effort capture of what the interrupted turn still intended to do, so
+	 * the wake turn can finish the original task instead of only reporting output.
+	 */
+	#captureRemainingIntentForFold(): string | undefined {
+		const messages = this.agent.state.messages;
+		for (let index = messages.length - 1; index >= 0; index--) {
+			const message = messages[index];
+			if (message?.role !== "user") continue;
+			const content = message.content;
+			const text =
+				typeof content === "string"
+					? content
+					: Array.isArray(content)
+						? content
+								.map(block => (typeof block === "object" && block && "text" in block ? String(block.text) : ""))
+								.filter(Boolean)
+								.join("\n")
+						: "";
+			const trimmed = text.trim();
+			if (trimmed.length === 0) return undefined;
+			return trimmed.length > 2000 ? `${trimmed.slice(0, 2000)}…` : trimmed;
+		}
+		return undefined;
 	}
 
 	/**
@@ -8335,7 +8938,7 @@ export class AgentSession {
 	 * no fold target exists.
 	 */
 	hasForegroundBashBackgroundRequestHandler(): boolean {
-		return this.#foregroundBashBackgroundRequestHandler !== undefined;
+		return this.#foldCoordinator.hasFoldableParticipant();
 	}
 
 	/** Set the SDK permission policy used by guarded ACP tool execution. */
@@ -8371,11 +8974,17 @@ export class AgentSession {
 	 * Ask the active managed foreground bash call to return as a background job.
 	 * Returns false when no supported foreground tool is currently backgroundable.
 	 */
-	requestForegroundBashBackground(): boolean {
-		const handler = this.#foregroundBashBackgroundRequestHandler;
-		if (!handler) return false;
-		handler();
-		return true;
+	async requestForegroundBashBackground(): Promise<boolean> {
+		if (!this.#foldCoordinator.hasFoldableParticipant()) return false;
+		try {
+			const result = await this.#foldCoordinator.requestFold();
+			return result.status === "folded";
+		} catch (error) {
+			logger.warn("Foreground fold request failed", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return false;
+		}
 	}
 
 	/**
@@ -9316,6 +9925,7 @@ export class AgentSession {
 		if (this.#sessionAdmissionClosed || this.#isDisposed) throw this.#sessionAdmissionBusyError();
 		const inFlightPrompt = this.#beginInFlight();
 		let hindsightRecall: string | undefined;
+		let continuationSdkRunToken: string | undefined;
 		try {
 			const volatileProjectContextMessage = await this.#buildVolatileProjectContextMessage();
 			this.agent.appendMessage(volatileProjectContextMessage);
@@ -9351,14 +9961,18 @@ export class AgentSession {
 			await this.agent.continue({
 				...this.#managedFallbackPromptOptions(),
 				onRunAccepted: (handle: AttemptRunHandle) => {
-					this.#acceptRunHandle(handle);
+					continuationSdkRunToken = this.#activeSdkRunToken;
+					this.#acceptSdkAttemptRun(handle, continuationSdkRunToken);
 					if (hindsightRecall) hindsightState?.markRecallSnippetInjected(hindsightRecall);
 				},
 			});
-			await this.#waitForPostPromptRecovery();
+			if (continuationSdkRunToken === undefined) await this.#waitForPostPromptRecovery();
 		} finally {
 			this.#removeEphemeralCustomMessages();
-			await this.#settleEndedInFlight(inFlightPrompt);
+			await this.#settleEndedInFlight(
+				inFlightPrompt,
+				continuationSdkRunToken === undefined ? "full" : "publication",
+			);
 		}
 	}
 
@@ -9486,8 +10100,9 @@ export class AgentSession {
 	async setCredentialPin(provider: string, selector: AuthCredentialSelector): Promise<void> {
 		const scopeId = this.credentialSessionId;
 		const authStorage = this.#modelRegistry.authStorage;
-		const target = authStorage.resolveOAuthPinTarget(provider, selector);
-		authStorage.setSessionCredentialSelector(scopeId, provider, target.canonicalSelector);
+		const authStorageOwner = this.#modelRegistry.getAuthStorageOwner();
+		const target = authStorage.resolveOAuthPinTarget(provider, selector, authStorageOwner);
+		authStorage.setSessionCredentialSelector(scopeId, provider, target.canonicalSelector, authStorageOwner);
 		if (target.canonicalSelector.kind === "id" && !this.#credentialStoreIdentity) return;
 		this.sessionManager.appendCustomEntry("auth-credential-pin", {
 			v: 1,
@@ -9567,9 +10182,13 @@ export class AgentSession {
 		args = "",
 		options?: Pick<
 			PromptOptions,
-			"onPreflightAccepted" | "onPreflightAcceptCommit" | "onSkillPrepared" | "preflightSignal"
+			"onPreflightAccepted" | "onPreflightAcceptCommit" | "onSkillPrepared" | "preflightSignal" | "sdkRunCapability"
 		>,
 	): Promise<{ name: string; path: string; args?: string; lineCount?: number }> {
+		const internalOptions = {
+			...options,
+			sdkRunToken: readSdkRunCapability(options?.sdkRunCapability),
+		};
 		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		const skillName = name.trim();
 		if (!skillName) throw Object.assign(new Error("skill.invoke requires a skill name."), { code: "invalid_input" });
@@ -9615,7 +10234,7 @@ export class AgentSession {
 			lineCount: built.details.lineCount,
 			cleanedArgs: activation.cleanedArgs || undefined,
 		});
-		await this.promptCustomMessage(skillPromptMessage, options);
+		await this.promptCustomMessage(skillPromptMessage, internalOptions as InternalCustomMessageOptions);
 		return {
 			name: skill.name,
 			path: skill.filePath,
@@ -10305,6 +10924,14 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		const hasUsableImage =
+			options?.images?.some(image => typeof image?.data === "string" && image.data.trim().length > 0) === true;
+		if (typeof text !== "string" || (text.trim().length === 0 && !hasUsableImage))
+			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
+		const sdkRunToken = readSdkRunCapability(options?.sdkRunCapability);
+		const internalOptions: InternalPromptOptions | undefined = options
+			? { ...options, ...(sdkRunToken ? { sdkRunToken } : {}) }
+			: undefined;
 		this.#assertRecoveryHydrationPromoted();
 		const owner = this.#sessionAdmissionContext.getStore();
 		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
@@ -10319,13 +10946,19 @@ export class AgentSession {
 					await this.invokeSkill(
 						invocation.skill.name,
 						invocation.args,
-						options?.onPreflightAccepted || options?.onPreflightAcceptCommit || options?.preflightSignal
+						options?.onPreflightAccepted ||
+							options?.onPreflightAcceptCommit ||
+							options?.preflightSignal ||
+							internalOptions?.sdkRunToken
 							? {
-									...(options.onPreflightAccepted ? { onPreflightAccepted: options.onPreflightAccepted } : {}),
-									...(options.onPreflightAcceptCommit
+									...(options?.onPreflightAccepted
+										? { onPreflightAccepted: options.onPreflightAccepted }
+										: {}),
+									...(options?.onPreflightAcceptCommit
 										? { onPreflightAcceptCommit: options.onPreflightAcceptCommit }
 										: {}),
-									...(options.preflightSignal ? { preflightSignal: options.preflightSignal } : {}),
+									...(options?.preflightSignal ? { preflightSignal: options.preflightSignal } : {}),
+									...(options?.sdkRunCapability ? { sdkRunCapability: options.sdkRunCapability } : {}),
 								}
 							: undefined,
 					);
@@ -10359,6 +10992,10 @@ export class AgentSession {
 
 		// Expand file-based prompt templates if requested
 		const expandedText = expandPromptTemplates ? expandPromptTemplate(text, [...this.#promptTemplates]) : text;
+		const expandedHasUsableImage =
+			options?.images?.some(image => typeof image?.data === "string" && image.data.trim().length > 0) === true;
+		if (expandedText.trim().length === 0 && !expandedHasUsableImage)
+			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
 		assertImagePlaceholdersHavePayload(expandedText, options?.images);
 		const workflowIntentDiff = options?.synthetic ? null : buildWorkflowIntentDiff(expandedText);
 		const claimsGenuineUserIntent = !options?.synthetic && options?.attribution !== "agent";
@@ -10579,8 +11216,13 @@ export class AgentSession {
 			| "onPreflightAccepted"
 			| "onPreflightAcceptCommit"
 			| "preflightSignal"
+			| "sdkRunCapability"
 		>,
 	): Promise<void> {
+		const sdkRunToken = readSdkRunCapability(options?.sdkRunCapability);
+		const internalOptions: InternalCustomMessageOptions | undefined = options
+			? { ...options, ...(sdkRunToken ? { sdkRunToken } : {}) }
+			: undefined;
 		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		const textContent =
 			typeof message.content === "string"
@@ -10649,7 +11291,7 @@ export class AgentSession {
 				};
 				try {
 					await this.#promptWithMessage(customMessage, textContent, {
-						...options,
+						...internalOptions,
 						onPreflightAccepted: undefined,
 						onPreflightAcceptCommit: commitAcceptance,
 						admissionLease: admission,
@@ -10681,6 +11323,7 @@ export class AgentSession {
 			| "onPreflightAcceptCommit"
 			| "preflightSignal"
 		> & {
+			sdkRunToken?: string;
 			prependMessages?: AgentMessage[];
 			skipPostPromptRecoveryWait?: boolean;
 			predecessorAgentEndHold?: symbol;
@@ -10747,6 +11390,9 @@ export class AgentSession {
 		const rosterClaim = this.#claimIrcRosterCandidate();
 		let hasPendingNextTurnMessages = false;
 		let pendingNextTurnMessageCount = 0;
+		let skipPostPromptRecoveryWait =
+			options?.skipPostPromptRecoveryWait === true || options?.sdkRunToken !== undefined;
+		let promptAttemptScope: AttemptScope | undefined;
 		let hindsightRecall: string | undefined;
 		try {
 			this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
@@ -11013,8 +11659,14 @@ export class AgentSession {
 			const agentPromptOptions = {
 				...(options?.toolChoice ? { toolChoice: options.toolChoice } : undefined),
 				...this.#managedFallbackPromptOptions(),
+				...(options?.sdkRunToken ? { sdkRunToken: options.sdkRunToken } : {}),
 				onRunAccepted: (handle: AttemptRunHandle) => {
-					this.#acceptRunHandle(handle);
+					promptAttemptScope = handle?.scope;
+					if (handle) this.#acceptSdkAttemptRun(handle, options?.sdkRunToken);
+					else this.#acceptRunHandle(handle);
+					if (handle && options?.sdkRunToken) {
+						this.#activeSdkRunToken = options.sdkRunToken;
+					}
 					options?.onRunAccepted?.(handle);
 					options?.admissionLease?.release();
 					// R3.3: the accepted-run wrapper is the exact acceptance boundary —
@@ -11047,6 +11699,20 @@ export class AgentSession {
 					options?.onPreflightAccepted?.();
 				},
 			});
+			const activeTerminalScope = this.#activeAttemptScope;
+			const terminalAttemptScope =
+				activeTerminalScope !== undefined &&
+				(this.#skipPostPromptRecoveryWaitByAttemptScope.has(activeTerminalScope) ||
+					(options?.sdkRunToken !== undefined &&
+						this.#sdkRunTokensByAttemptScope.get(activeTerminalScope) === options.sdkRunToken))
+					? activeTerminalScope
+					: promptAttemptScope;
+			if (
+				terminalAttemptScope !== undefined &&
+				this.#skipPostPromptRecoveryWaitByAttemptScope.delete(terminalAttemptScope)
+			) {
+				skipPostPromptRecoveryWait = true;
+			}
 			const terminalAssistant = this.#findLastAssistantMessage();
 			if (
 				rosterClaim &&
@@ -11056,7 +11722,7 @@ export class AgentSession {
 			) {
 				this.#commitIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
 			}
-			if (!options?.skipPostPromptRecoveryWait) {
+			if (!skipPostPromptRecoveryWait) {
 				await this.#waitForPostPromptRecovery();
 			}
 		} catch (error) {
@@ -11081,7 +11747,7 @@ export class AgentSession {
 				this.#releaseIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
 			}
 			this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
-			await this.#settleEndedInFlight(inFlightPrompt, options?.skipPostPromptRecoveryWait ? "publication" : "full");
+			await this.#settleEndedInFlight(inFlightPrompt, skipPostPromptRecoveryWait ? "publication" : "full");
 		}
 	}
 
@@ -11285,12 +11951,18 @@ export class AgentSession {
 	 * Queue a steering message to interrupt the agent mid-run.
 	 */
 	async steer(text: string, images?: ImageContent[]): Promise<void> {
+		const hasUsableImage =
+			images?.some(image => typeof image?.data === "string" && image.data.trim().length > 0) === true;
+		if (typeof text !== "string" || (text.trim().length === 0 && !hasUsableImage))
+			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
 		this.#assertRecoveryHydrationPromoted();
 		if (text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
 		}
 
 		const expandedText = expandPromptTemplate(text, [...this.#promptTemplates]);
+		if (expandedText.trim().length === 0 && !hasUsableImage)
+			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
 		assertImagePlaceholdersHavePayload(expandedText, images);
 		await this.#queueSteer(expandedText, images, { claimsGenuineUserIntent: true });
 	}
@@ -11303,12 +11975,18 @@ export class AgentSession {
 		images?: ImageContent[],
 		options?: Pick<PromptOptions, "followUpQueuePolicy">,
 	): Promise<void> {
+		const hasUsableImage =
+			images?.some(image => typeof image?.data === "string" && image.data.trim().length > 0) === true;
+		if (typeof text !== "string" || (text.trim().length === 0 && !hasUsableImage))
+			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
 		this.#assertRecoveryHydrationPromoted();
 		if (text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
 		}
 
 		const expandedText = expandPromptTemplate(text, [...this.#promptTemplates]);
+		if (expandedText.trim().length === 0 && !hasUsableImage)
+			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
 		assertImagePlaceholdersHavePayload(expandedText, images);
 		await this.#queueFollowUp(expandedText, images, {
 			forceOneAtATime: options?.followUpQueuePolicy === "sequential",
@@ -11326,6 +12004,7 @@ export class AgentSession {
 			claimsGenuineUserIntent?: boolean;
 			onPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
 			external?: boolean;
+			sdkRunToken?: string;
 		},
 	): Promise<void> {
 		this.#assertNoHandoffTransition();
@@ -11340,6 +12019,7 @@ export class AgentSession {
 			this.#externalSteerAdmissionSeq.set(message, ++this.#steeringAdmissionSeq);
 			if (options.onPromoted) this.#steerPromotionHooks.set(message, options.onPromoted);
 		}
+		if (options?.sdkRunToken) this.#sdkRunTokensByQueuedMessage.set(message, options.sdkRunToken);
 		if (options?.claimsGenuineUserIntent) {
 			const epoch = this.#claimDeepInterviewUserIntent();
 			this.#deepInterviewGenuineUserMessageEpochs.set(message, epoch);
@@ -11922,9 +12602,11 @@ export class AgentSession {
 			/** Internal dispatch disposition used before actual queue consumption. */
 			onDispatchDisposition?: (promotion: { startsOwnRun: boolean }) => void;
 			preflightSignal?: AbortSignal;
-			sdkRunToken?: string;
+			sdkRunCapability?: unknown;
 		},
 	): Promise<void> {
+		const sdkRunToken = readSdkRunCapability(options?.sdkRunCapability);
+		const internalOptions = options ? { ...options, ...(sdkRunToken ? { sdkRunToken } : {}) } : undefined;
 		this.#assertRecoveryHydrationPromoted();
 		const owner = this.#sessionAdmissionContext.getStore();
 		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
@@ -11945,7 +12627,15 @@ export class AgentSession {
 			const textParts: string[] = [];
 			images = [];
 			for (const part of content) {
+				if (!part || typeof part !== "object" || Array.isArray(part))
+					throw Object.assign(new Error("sendUserMessage content blocks must be objects."), {
+						code: "invalid_input",
+					});
 				if (part.type === "text") {
+					if (typeof part.text !== "string")
+						throw Object.assign(new Error("sendUserMessage text blocks must contain string text."), {
+							code: "invalid_input",
+						});
 					textParts.push(part.text);
 				} else {
 					images.push(part);
@@ -11954,6 +12644,10 @@ export class AgentSession {
 			text = textParts.join("\n");
 			if (images.length === 0) images = undefined;
 		}
+		const hasUsableImage =
+			images?.some(image => typeof image?.data === "string" && image.data.trim().length > 0) === true;
+		if (text.trim().length === 0 && !hasUsableImage)
+			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
 
 		let admissionSignal = options?.preflightSignal
 			? AbortSignal.any([this.#promptPreflightAbortController.signal, options.preflightSignal])
@@ -12047,7 +12741,7 @@ export class AgentSession {
 					claimsGenuineUserIntent: true,
 					forceOneAtATime: Boolean(options?.preflightSignal || options?.queuedAtDispatch),
 					onPromoted: options?.onQueuedPromoted,
-					sdkRunToken: options?.sdkRunToken,
+					sdkRunToken: internalOptions?.sdkRunToken,
 				});
 				const cancelQueuedFollowUp = () => queuedFollowUp.cancel();
 				options?.preflightSignal?.addEventListener("abort", cancelQueuedFollowUp, { once: true });
@@ -12062,6 +12756,7 @@ export class AgentSession {
 					claimsGenuineUserIntent: true,
 					onPromoted: options?.onQueuedPromoted,
 					external: true,
+					sdkRunToken: internalOptions?.sdkRunToken,
 				});
 				options?.onPreflightAccepted?.();
 				return;
@@ -12081,6 +12776,7 @@ export class AgentSession {
 					claimsGenuineUserIntent: true,
 					onPromoted: options?.onQueuedPromoted,
 					external: true,
+					sdkRunToken: internalOptions?.sdkRunToken,
 				});
 				// Dispatch-race disposition (#4668 review P1): the SDK snapshot-decided
 				// this submission starts its own turn (idle at dispatch), but the
@@ -12106,6 +12802,7 @@ export class AgentSession {
 			await this.prompt(text, {
 				expandPromptTemplates: false,
 				images,
+				sdkRunToken: internalOptions?.sdkRunToken,
 				onPreflightAccepted: () => {
 					options?.onPreflightAccepted?.();
 					fireQueuedPromotion();
@@ -12120,7 +12817,7 @@ export class AgentSession {
 							}
 						: undefined,
 				preflightSignal: options?.preflightSignal,
-			});
+			} as InternalPromptOptions);
 		} finally {
 			releaseFollowUpReservation();
 		}
@@ -12629,6 +13326,7 @@ export class AgentSession {
 			| "tool_abort"
 			| "internal";
 		silent?: boolean;
+		sdkRunToken?: string;
 	}): void {
 		const abortGoalState = this.getGoalModeState();
 		this.#suppressNextGoalReminderAfterAbortGoalId =
@@ -13330,6 +14028,9 @@ export class AgentSession {
 						attribution: "user" as const,
 						timestamp: Date.now(),
 					};
+					const selectedSdkRunToken = selectedMessage
+						? this.#sdkRunTokensByQueuedMessage.get(selectedMessage)
+						: undefined;
 					const messageText =
 						message.role === "custom"
 							? this.#getCustomMessageTextContent(message)
@@ -13348,6 +14049,7 @@ export class AgentSession {
 						await this.#promptWithMessage(message, messageText, {
 							admissionLease: admission,
 							resetRetryReplaySafety: true,
+							sdkRunToken: selectedSdkRunToken,
 							onRunAccepted: () => {
 								runAccepted = true;
 								if (selected) this.#fireQueuedPromotionHooks([message], { startsOwnRun: true });
@@ -13457,6 +14159,8 @@ export class AgentSession {
 			this.#cancelOwnAsyncJobs();
 			this.#closeAllProviderSessions("new session");
 			this.#rebindProviderSessionState(new Map());
+			this.#terminalizeQueuedSdkWorkForSessionTransition(this.#queuedMessagesForSessionTransition());
+			this.#resetActiveSdkRunOwnership();
 			this.agent.reset();
 			if (!options?.drop) await this.sessionManager.flush();
 			const noLeasePreviousSessionIdentity = this.sessionManager.getSessionId();
@@ -13554,6 +14258,8 @@ export class AgentSession {
 			this.#disconnectFromAgent();
 			this.#closeAllProviderSessions("new session");
 			this.#rebindProviderSessionState(new Map());
+			this.#terminalizeQueuedSdkWorkForSessionTransition(this.#queuedMessagesForSessionTransition());
+			this.#resetActiveSdkRunOwnership();
 			this.agent.reset();
 			this.setTodoPhases([]);
 			this.#syncAgentSessionId();
@@ -13676,6 +14382,8 @@ export class AgentSession {
 			this.yieldQueue.clear();
 			this.#pendingBackgroundExchanges = [];
 			this.#closeAllProviderSessions("context clear");
+			this.#terminalizeQueuedSdkWorkForSessionTransition(this.#queuedMessagesForSessionTransition());
+			this.#resetActiveSdkRunOwnership();
 			this.agent.reset();
 			await this.sessionManager.flush();
 			this.sessionManager.appendContextClearEntry({ sessionId });
@@ -15857,6 +16565,7 @@ export class AgentSession {
 					fromExtension,
 					preserveData,
 				);
+				this.#recordAdaptiveCompactionReset(tokensBefore);
 				await this.#applyCompactionPostAppend(compactionEntryId, firstKeptEntryId, fromExtension);
 
 				const compactionResult: CompactionResult = {
@@ -16099,6 +16808,7 @@ export class AgentSession {
 			const rollbackPendingNextTurnMessages = [...this.#pendingNextTurnMessages];
 			const rollbackScheduledHiddenNextTurnGeneration = this.#scheduledHiddenNextTurnGeneration;
 			const rollbackTodoReminderCount = this.#todoReminderCount;
+			const rollbackDeferredSdkFollowUps = [...this.#deferredSdkFollowUps];
 			// Snapshot the agent's executable queues so a rollback restores queued
 			// user work that agent.reset() would otherwise clear.
 			const rollbackAgentSteeringQueue = this.agent.snapshotSteering();
@@ -16139,6 +16849,12 @@ export class AgentSession {
 				this.#rekeyJobManagerForSessionIdentity(rollbackSessionState.sessionId, rollbackSessionState.sessionFile);
 				committed = true;
 				await this.#runToolSessionTransitionCleanups();
+				this.#terminalizeQueuedSdkWorkForSessionTransition([
+					...rollbackAgentSteeringQueue,
+					...rollbackAgentFollowUpQueue,
+					...rollbackDeferredSdkFollowUps,
+				]);
+				this.#resetActiveSdkRunOwnership();
 				this.agent.reset();
 				this.#syncAgentSessionId();
 				this.#rekeyHindsightMemoryForCurrentSessionId();
@@ -16222,6 +16938,7 @@ export class AgentSession {
 				this.#pendingNextTurnMessages = rollbackPendingNextTurnMessages;
 				this.#scheduledHiddenNextTurnGeneration = rollbackScheduledHiddenNextTurnGeneration;
 				this.#todoReminderCount = rollbackTodoReminderCount;
+				this.#deferredSdkFollowUps = rollbackDeferredSdkFollowUps;
 				this.#syncTodoPhasesFromBranch();
 				// Exact-discard only the staged successor; predecessor state was never adopted.
 				const rollbackError = prepared
@@ -16380,7 +17097,12 @@ export class AgentSession {
 		// which breaks the provider prompt-cache prefix mid-epoch. Only prune at a
 		// sanctioned maintenance boundary, i.e. when the un-pruned context already
 		// crosses the compaction threshold. Pruning may then avert full compaction.
-		if (!shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens))
+		const adaptiveCompactionSettings = this.#recordAdaptiveCompactionCall(
+			contextTokens,
+			compactionSettings,
+			assistantMessage,
+		);
+		if (!shouldCompact(contextTokens, contextWindow, adaptiveCompactionSettings, autoCompactionOutputReserveTokens))
 			return true;
 		const pruneEstimate = estimateToolOutputPruneSavings(this.sessionManager.getBranch(), DEFAULT_PRUNE_CONFIG, {
 			relaxedMinimum: 0,
@@ -16391,7 +17113,7 @@ export class AgentSession {
 			!shouldCompact(
 				Math.max(0, contextTokens - pruneEstimate.tokensSaved),
 				contextWindow,
-				compactionSettings,
+				adaptiveCompactionSettings,
 				autoCompactionOutputReserveTokens,
 			)
 		) {
@@ -16399,7 +17121,8 @@ export class AgentSession {
 			if (ownershipSignal?.aborted) return false;
 			if (pruneResult) contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
 		}
-		if (shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens)) {
+		const prunedCompactionSettings = this.#compactionSettingsWithAdaptiveState(compactionSettings);
+		if (shouldCompact(contextTokens, contextWindow, prunedCompactionSettings, autoCompactionOutputReserveTokens)) {
 			// Try promotion first — if a larger model is available, switch instead of compacting
 			const promoted = await this.#tryContextPromotion(assistantMessage, ownershipSignal);
 			if (ownershipSignal?.aborted) return false;
@@ -16453,7 +17176,7 @@ export class AgentSession {
 			}
 			if (isAborted()) return result("aborted");
 
-			// In-place context-full maintenance only. "off" defers entirely; "handoff"
+			// context-full maintenance. "off" defers entirely; "handoff"
 			// keeps its existing agent_end / pre-prompt boundaries (a mid-tool-loop
 			// session swap would be far more disruptive than the overflow it avoids).
 			const compactionSettings = this.settings.getGroup("compaction");
@@ -16469,7 +17192,12 @@ export class AgentSession {
 			const autoCompactionOutputReserveTokens = 0;
 			const anchor = this.#findMidRunUsageAnchor(context.messages);
 			let contextTokens = this.#estimateMidRunContextTokens(context.messages);
-			if (!shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens)) {
+			const adaptiveCompactionSettings = anchor
+				? this.#recordAdaptiveCompactionCall(contextTokens, compactionSettings, anchor.message)
+				: this.#compactionSettingsWithAdaptiveState(compactionSettings);
+			if (
+				!shouldCompact(contextTokens, contextWindow, adaptiveCompactionSettings, autoCompactionOutputReserveTokens)
+			) {
 				return result("not-needed");
 			}
 			// Anti-loop (#1662): a given provider response anchors at most one
@@ -16503,7 +17231,7 @@ export class AgentSession {
 				!shouldCompact(
 					Math.max(0, contextTokens - pruneEstimate.tokensSaved),
 					contextWindow,
-					compactionSettings,
+					adaptiveCompactionSettings,
 					autoCompactionOutputReserveTokens,
 				)
 			) {
@@ -16512,7 +17240,9 @@ export class AgentSession {
 				if (pruneResult?.failure === "artifact_persistence") return result("failed");
 				if (pruneResult) contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
 			}
-			if (!shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens)) {
+			if (
+				!shouldCompact(contextTokens, contextWindow, adaptiveCompactionSettings, autoCompactionOutputReserveTokens)
+			) {
 				return pruneResult?.committed ? result("pruned", true) : result("not-needed");
 			}
 
@@ -16675,7 +17405,8 @@ export class AgentSession {
 		// Model maxTokens is a capability ceiling, not a per-turn reservation.
 		// Auto maintenance should track actual context fullness.
 		const autoCompactionOutputReserveTokens = 0;
-		if (!shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens)) {
+		const adaptiveCompactionSettings = this.#compactionSettingsWithAdaptiveState(compactionSettings);
+		if (!shouldCompact(contextTokens, contextWindow, adaptiveCompactionSettings, autoCompactionOutputReserveTokens)) {
 			// Below the compaction threshold: optionally run evidence-gated maintenance
 			// pruning (opt-in, high savings + cache-epoch payback required).
 			await this.#maybeRunBelowThresholdMaintenancePrune();
@@ -16691,19 +17422,59 @@ export class AgentSession {
 			!shouldCompact(
 				Math.max(0, contextTokens - pruneEstimate.tokensSaved),
 				contextWindow,
-				compactionSettings,
+				adaptiveCompactionSettings,
 				autoCompactionOutputReserveTokens,
 			)
 		) {
 			const pruneResult = await this.#pruneToolOutputs(undefined, true);
 			if (pruneResult) contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
 		}
-		if (shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens)) {
+		const prunedCompactionSettings = this.#compactionSettingsWithAdaptiveState(compactionSettings);
+		if (shouldCompact(contextTokens, contextWindow, prunedCompactionSettings, autoCompactionOutputReserveTokens)) {
 			await this.#runAutoCompaction("threshold", false, false, {
 				continueAfterMaintenance: false,
 				deferHandoffMaintenance: false,
 			});
 		}
+	}
+
+	#recordAdaptiveCompactionCall<T extends { adaptive?: { enabled: boolean; turnWindow: number } }>(
+		contextTokens: number,
+		settings: T,
+		assistantMessage: AssistantMessage,
+	): T {
+		if (!settings.adaptive?.enabled) return settings;
+		this.#adaptiveCompactionTracker.setWindowMs(settings.adaptive.turnWindow * 60_000);
+		const messageKey = this.#adaptiveCompactionMessageKey(assistantMessage);
+		if (this.#adaptiveCompactionRecordedMessageKey === messageKey) {
+			return this.#compactionSettingsWithAdaptiveState(settings);
+		}
+		this.#adaptiveCompactionRecordedMessageKey = messageKey;
+		this.#adaptiveCompactionTracker.recordCall(contextTokens);
+		return this.#compactionSettingsWithAdaptiveState(settings);
+	}
+
+	#adaptiveCompactionMessageKey(message: AssistantMessage): string {
+		return `${message.provider}\u0000${message.model}\u0000${message.timestamp}\u0000${message.usage?.totalTokens ?? ""}`;
+	}
+
+	#compactionSettingsWithAdaptiveState<T extends { adaptive?: { enabled: boolean } }>(settings: T): T {
+		if (!settings.adaptive?.enabled) return settings;
+		return {
+			...settings,
+			adaptiveState: this.#adaptiveCompactionTracker.decisionState(),
+		};
+	}
+
+	#resetAdaptiveCompactionState(): void {
+		this.#adaptiveCompactionTracker.reset();
+		this.#adaptiveCompactionRecordedMessageKey = undefined;
+	}
+
+	#recordAdaptiveCompactionReset(contextTokens: number): void {
+		this.#adaptiveCompactionTracker.reset();
+		this.#adaptiveCompactionTracker.recordCompact(contextTokens);
+		this.#adaptiveCompactionRecordedMessageKey = undefined;
 	}
 
 	#assistantEndedWithSuccessfulYield(assistantMessage: AssistantMessage): boolean {
@@ -18156,6 +18927,7 @@ export class AgentSession {
 				fromExtension,
 				preserveData,
 			);
+			this.#recordAdaptiveCompactionReset(tokensBefore);
 			await this.#applyCompactionPostAppend(compactionEntryId, firstKeptEntryId, fromExtension);
 			if (autoCompactionSignal.aborted) return await emitAborted();
 
@@ -18839,6 +19611,9 @@ export class AgentSession {
 							const continuation = this.agent.continue({
 								...this.#managedFallbackPromptOptions(),
 								transientRecoveryMessage: this.#escapedNonAsciiRecoveryMessage(),
+								onRunAccepted: (handle: AttemptRunHandle) => {
+									this.#acceptSdkAttemptRun(handle, this.#activeSdkRunToken);
+								},
 							});
 							if (
 								cancellationSignal?.aborted ||
@@ -18877,6 +19652,9 @@ export class AgentSession {
 					await this.agent.continue({
 						...this.#managedFallbackPromptOptions(),
 						transientRecoveryMessage: this.#escapedNonAsciiRecoveryMessage(),
+						onRunAccepted: (handle: AttemptRunHandle) => {
+							this.#acceptSdkAttemptRun(handle, this.#activeSdkRunToken);
+						},
 					});
 				},
 			};
@@ -18934,6 +19712,18 @@ export class AgentSession {
 					messages: [outcome.failure.message],
 				},
 			};
+		}
+		// Issue #5018 preserves managed behavior for the typed statusless
+		// Responses overload: before the code survived transport, this failure
+		// reached the session as an ordinary committed error, so the chain never
+		// discarded or advanced on it. Route it to the exhaustion decision
+		// directly, before the retryable path can classify its new facts.
+		if (isStatuslessTypedOverloadFacts(outcome.failure.transportFailure)) {
+			this.#defaultFallbackChain().resetAttemptBudget();
+			return this.#managedFallbackExhaustionDecision(
+				outcome.failure.message,
+				outcome.failure.message.errorMessage || "Model fallback attempt failed",
+			);
 		}
 		return this.#handleRetryableError(
 			outcome.failure.message,
@@ -19294,11 +20084,13 @@ export class AgentSession {
 			if (!isAuthenticated(activeApiKey)) return "unchanged";
 			remaining = await authStorage.invalidateCredentialMatching(provider, activeApiKey, {
 				sessionId: credentialSessionId,
+				owner: this.#modelRegistry.getAuthStorageOwner(),
 			});
 			if (!remaining) return "unchanged";
 		} else {
 			remaining = await authStorage.markUsageLimitReached(provider, credentialSessionId, {
 				retryAfterMs: trigger.retryAfterMs,
+				owner: this.#modelRegistry.getAuthStorageOwner(),
 			});
 		}
 
@@ -19393,7 +20185,10 @@ export class AgentSession {
 		}
 		const firstEventTimeout = classification === "first_event_timeout";
 		const emptyResponse = classification === "empty_response";
-		const canReplayProviderOverload = isBareDefaultCodexOverload(message) || isBareDefaultAnthropicOverload(message);
+		const canReplayProviderOverload =
+			isBareDefaultCodexOverload(message) ||
+			isBareDefaultAnthropicOverload(message) ||
+			isBareDefaultOpenAIResponsesOverload(message);
 		const reportedRetryMaxAttempts = transportFailure?.retryMaxAttempts;
 		if (reportedRetryMaxAttempts !== undefined) {
 			this.#providerRetryMaxAttempts = Math.min(
@@ -19436,6 +20231,17 @@ export class AgentSession {
 		const trigger:
 			| { class: FallbackTriggerClass; retryAfterMs?: number; authDisposition?: AuthDisposition }
 			| undefined = this.#fallbackTriggerFor(message, !managedFallback, transportFailure);
+		// OpenAI's typed statusless capacity-overload code (issue #5018) must not
+		// gain managed-chain retry/advance authority from its new facts. Before
+		// the code survived transport, this failure reached the session as an
+		// ordinary committed error and surfaced immediately, so mirror that
+		// behavior with the existing exhaustion decision.
+		if (managedFallback && isStatuslessTypedOverloadFacts(transportFailure)) {
+			return this.#managedFallbackExhaustionDecision(
+				message,
+				message.errorMessage || "Model fallback attempt failed",
+			);
+		}
 		if (!trigger) {
 			return managedOutcome
 				? this.#managedFallbackExhaustionDecision(message, message.errorMessage || "Model fallback attempt failed")
@@ -19792,7 +20598,12 @@ export class AgentSession {
 						this.#resolveRetry();
 						return;
 					}
-					await this.agent.continue(this.#managedFallbackPromptOptions());
+					await this.agent.continue({
+						...this.#managedFallbackPromptOptions(),
+						onRunAccepted: (handle: AttemptRunHandle) => {
+							this.#acceptSdkAttemptRun(handle, this.#activeSdkRunToken);
+						},
+					});
 					return;
 				} catch (error) {
 					const attempt = this.#retryAttempt;
@@ -19874,6 +20685,7 @@ export class AgentSession {
 		preSubmit: PreSubmitBuilder,
 		options?: {
 			toolChoice?: ToolChoice;
+			sdkRunToken?: string;
 			fallbackManaged?: boolean;
 			onRunAccepted?: (handle: AttemptRunHandle) => void;
 		},
@@ -20828,6 +21640,9 @@ export class AgentSession {
 						model.provider,
 						this.#modelRegistry.authStorage,
 						this.credentialSessionId,
+						model,
+						// Optional for the same reason as the main metadata resolver above.
+						this.#modelRegistry.getAuthStorageOwner?.(),
 					),
 					reasoning: toReasoningEffort(this.thinkingLevel),
 					hideThinkingSummary: this.agent.hideThinkingSummary,
@@ -21173,6 +21988,10 @@ export class AgentSession {
 			const previousSystemPrompt = this.agent.state.systemPrompt;
 			const previousAgentSteeringQueue = this.agent.snapshotSteering();
 			const previousAgentFollowUpQueue = this.agent.snapshotFollowUp();
+			const previousDeferredSdkFollowUps = [...this.#deferredSdkFollowUps];
+			const previousActiveSdkRunToken = this.#activeSdkRunToken;
+			const previousActiveAttemptScope = this.#activeAttemptScope;
+			const previousActiveLogicalRunId = this.#activeLogicalRunId;
 
 			this.#steeringMessages = [];
 			this.#followUpMessages = [];
@@ -21220,6 +22039,7 @@ export class AgentSession {
 				// The target session is loaded and MCP selections are restored: discard
 				// pre-switch delivery queues before completing the restored agent state.
 				this.agent.clearAllQueues();
+				this.#resetActiveSdkRunOwnership();
 
 				if (historyRewriteReason) {
 					this.agent.replaceMessages(sessionContext.messages, {
@@ -21404,6 +22224,12 @@ export class AgentSession {
 						...(options?.transition ? { transition: options.transition } : {}),
 					});
 				}
+				this.#terminalizeQueuedSdkWorkForSessionTransition([
+					...previousAgentSteeringQueue,
+					...previousAgentFollowUpQueue,
+					...previousDeferredSdkFollowUps,
+				]);
+				this.#deferredSdkFollowUps = [];
 				return true;
 			} catch (error) {
 				if (transitionCleanupCommitted) throw error;
@@ -21469,6 +22295,10 @@ export class AgentSession {
 				this.#followUpMessages = previousFollowUpMessages;
 				this.#pendingNextTurnMessages = previousPendingNextTurnMessages;
 				this.#scheduledHiddenNextTurnGeneration = previousScheduledHiddenNextTurnGeneration;
+				this.#deferredSdkFollowUps = previousDeferredSdkFollowUps;
+				this.#activeSdkRunToken = previousActiveSdkRunToken;
+				this.#activeAttemptScope = previousActiveAttemptScope;
+				this.#activeLogicalRunId = previousActiveLogicalRunId;
 				this.agent.clearAllQueues();
 				this.agent.restoreSteering(previousAgentSteeringQueue);
 				this.agent.restoreFollowUp(previousAgentFollowUpQueue);
@@ -21535,6 +22365,9 @@ export class AgentSession {
 			}
 
 			const selectedText = this.#extractUserMessageText(selectedEntry.message.content);
+			const previousAgentSteeringQueue = this.agent.snapshotSteering();
+			const previousAgentFollowUpQueue = this.agent.snapshotFollowUp();
+			const previousDeferredSdkFollowUps = [...this.#deferredSdkFollowUps];
 
 			let skipConversationRestore = false;
 
@@ -21570,6 +22403,16 @@ export class AgentSession {
 			}
 			this.#pendingNextTurnMessages = [];
 			this.#scheduledHiddenNextTurnGeneration = undefined;
+			this.#terminalizeQueuedSdkWorkForSessionTransition([
+				...previousAgentSteeringQueue,
+				...previousAgentFollowUpQueue,
+				...previousDeferredSdkFollowUps,
+			]);
+			this.#deferredSdkFollowUps = [];
+			this.#resetActiveSdkRunOwnership();
+			this.agent.clearAllQueues();
+			this.#steeringMessages = [];
+			this.#followUpMessages = [];
 
 			this.#syncTodoPhasesFromBranch();
 			this.#syncAgentSessionId();
@@ -21774,6 +22617,15 @@ export class AgentSession {
 				// No summary, navigating to non-root
 				this.sessionManager.branch(newLeafId);
 			}
+
+			// The history rewrite is now committed. Drop predecessor-owned queued SDK
+			// work at this boundary; cancelled or failed preparation above preserves it.
+			const queuedSdkWork = this.#queuedMessagesForSessionTransition();
+			this.#terminalizeQueuedSdkWorkForSessionTransition(queuedSdkWork);
+			this.#deferredSdkFollowUps = [];
+			this.agent.clearAllQueues();
+			this.#steeringMessages = [];
+			this.#followUpMessages = [];
 
 			// Update agent state through the canonical filtered display context so legacy
 			// request-scoped entries cannot re-enter live history after tree navigation.

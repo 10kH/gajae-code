@@ -54,6 +54,18 @@ const ZERO_USAGE: Usage = {
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
 
+const testAuthority = (storage: AuthStorage, provider: string) => ({
+	hasProviderCredential: () => storage.exportSnapshot().credentials.some(entry => entry.provider === provider),
+	reloadProviderCredentials: () => storage.reload(),
+	validateProviderCredential: (candidateProvider: string, apiKey: string) =>
+		storage.exportSnapshot().credentials.some(entry => {
+			if (entry.provider !== candidateProvider) return false;
+			return entry.credential.type === "api_key"
+				? entry.credential.key === apiKey
+				: entry.credential.access === apiKey;
+		}),
+});
+
 function baseAssistant(overrides?: Partial<AssistantMessage>): AssistantMessage {
 	return {
 		role: "assistant",
@@ -175,12 +187,12 @@ describe("pi-native parseRequest", () => {
 		expect("notARealField" in parsed.options).toBe(false);
 	});
 
-	it("preserves headers, metadata, sessionId, thinkingBudgets", () => {
+	it("preserves safe headers and strips credential-bearing headers", () => {
 		const parsed = parseRequest({
 			modelId: "x",
 			context: baseContext,
 			options: {
-				headers: { "x-foo": "bar" },
+				headers: { "x-foo": "bar", Authorization: "Bearer attacker", "X-API-Key": "attacker-key" },
 				metadata: { user_id: "u" },
 				sessionId: "explicit-session",
 				thinkingBudgets: { high: 8192 },
@@ -570,9 +582,11 @@ describe("pi-native managed gateway credential failure marking", () => {
 		]);
 		const gateway = startAuthGateway({
 			bind: "127.0.0.1:0",
+			providerScope: { provider },
 			bearerTokens: ["gateway-test-token"],
 			version: "test",
 			storage,
+			...testAuthority(storage, provider),
 			resolveModel: id => (id === model.id ? model : undefined),
 			listModels: () => [model],
 		});
@@ -653,10 +667,13 @@ describe("pi-native managed gateway credential failure marking", () => {
 		]);
 		const gateway = startAuthGateway({
 			bind: "127.0.0.1:0",
+			providerScope: { provider },
 			bearerTokens: ["gateway-test-token"],
 			version: "test",
 			storage,
+			...testAuthority(storage, provider),
 			resolveModel: id => (id === model.id ? model : undefined),
+			listModels: () => [model],
 		});
 		try {
 			const response = await fetch(`${gateway.url}/v1/chat/completions`, {
@@ -707,10 +724,13 @@ describe("pi-native managed gateway credential failure marking", () => {
 		]);
 		const gateway = startAuthGateway({
 			bind: "127.0.0.1:0",
+			providerScope: { provider },
 			bearerTokens: ["gateway-test-token"],
 			version: "test",
 			storage,
+			...testAuthority(storage, provider),
 			resolveModel: id => (id === model.id ? model : undefined),
+			listModels: () => [model],
 		});
 		const request = () =>
 			fetch(`${gateway.url}/v1/pi/stream`, {

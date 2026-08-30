@@ -402,16 +402,24 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 			};
 			const openaiStream = await callWithCopilotModelRetry(
 				async () => {
+					options?.onStreamCreated?.();
 					const { data, response, request_id } = await client.responses
 						.create(params, { signal: requestSignal })
 						.withResponse();
 					await notifyProviderResponse(options, response, model, request_id);
 					return data;
 				},
-				{ provider: model.provider, signal: requestSignal, fallbackManaged: options?.fallbackManaged },
+				{
+					provider: model.provider,
+					signal: requestSignal,
+					fallbackManaged: options?.fallbackManaged,
+					requestMaxRetries: options?.requestMaxRetries,
+					disableProviderRetries: options?.disableProviderRetries,
+				},
 			).catch(async error => {
 				if (
 					options?.fallbackManaged ||
+					options?.disableProviderRetries ||
 					!isForcedToolChoiceUnsupportedError(error, isForcedOpenAIResponsesToolChoice(params.tool_choice))
 				) {
 					throw error;
@@ -431,6 +439,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 				});
 				delete params.tool_choice;
 				if (rawRequestDump) rawRequestDump.body = params;
+				options?.onStreamCreated?.();
 				const { data, response, request_id } = await client.responses
 					.create(params, { signal: requestSignal })
 					.withResponse();

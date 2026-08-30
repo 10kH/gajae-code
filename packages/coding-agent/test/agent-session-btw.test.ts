@@ -168,7 +168,12 @@ function createHarness(options: HarnessOptions = {}): {
 		agent,
 		sessionManager,
 		settings: Settings.isolated({ "compaction.enabled": false, "retry.enabled": true }),
-		modelRegistry: { getApiKey, getAvailable: () => [model] } as never,
+		modelRegistry: {
+			authStorage: undefined,
+			getApiKey,
+			getAvailable: () => [model],
+			getAuthStorageOwner: () => ({}),
+		} as never,
 		convertToLlm: options.convert ?? (async messages => convertToLlm(messages)),
 		onPayload: options.onPayload,
 		onResponse: options.onResponse,

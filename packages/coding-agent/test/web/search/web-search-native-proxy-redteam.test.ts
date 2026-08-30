@@ -120,6 +120,21 @@ describe("native-over-proxy provider-chain red-team", () => {
 		expect(activeContextNativeId(ctx)).toBeUndefined();
 		await expect(chainIds(ctx, keyAuth({ proxy: "sk-proxy" }))).resolves.toEqual(["duckduckgo"]);
 	});
+
+	it("does not select canonical Gemini search for a custom Cloud Code wire", async () => {
+		const ctx: ActiveSearchModelContext = {
+			provider: "google-gemini-cli",
+			modelId: "gemini-proxy",
+			api: "google-gemini-cli",
+			baseUrl: "https://proxy.example",
+			resolveCredentials: async () => ({ apiKey: "active-owner-key" }),
+		};
+
+		expect(activeContextNativeId(ctx)).toBeUndefined();
+		await expect(chainIds(ctx, oauthAuth({ "google-gemini-cli": "oauth-canonical" }))).resolves.toEqual([
+			"duckduckgo",
+		]);
+	});
 });
 
 describe("native-over-proxy provider red-team", () => {
@@ -238,7 +253,7 @@ describe("native-over-proxy provider red-team", () => {
 		expect(result.details.error).toContain("Gemini native search returned no grounding sources");
 	});
 
-	it("canonical Gemini OAuth still uses Cloud Code instead of the active Generative Language fallback", async () => {
+	it("canonical Gemini OAuth still uses Cloud Code for an official active endpoint", async () => {
 		let capturedUrl = "";
 		using _hook = hookFetch(async input => {
 			capturedUrl = String(input);
@@ -250,15 +265,135 @@ describe("native-over-proxy provider red-team", () => {
 			systemPrompt: "Use web search.",
 			authStorage: oauthAuth({ "google-gemini-cli": "oauth-active", proxy: "sk-active" }),
 			activeModelContext: {
-				provider: "proxy",
+				provider: "google-gemini-cli",
 				modelId: "gemini-2.5-pro",
 				api: "google-generative-ai",
-				baseUrl: "https://proxy.example",
+				baseUrl: "https://cloudcode-pa.googleapis.com",
 			},
 		});
 
 		expect(capturedUrl).toContain("https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent");
-		expect(capturedUrl).not.toContain("proxy.example/v1beta");
+		expect(capturedUrl).not.toContain("/v1beta");
+	});
+
+	it("canonical Gemini provider uses the owner key and proxy endpoint over canonical OAuth", async () => {
+		let capturedUrl = "";
+		let capturedHeaders: Record<string, string> = {};
+		using _hook = hookFetch(async (input, init) => {
+			capturedUrl = String(input);
+			capturedHeaders = (init?.headers as Record<string, string>) ?? {};
+			return Response.json({
+				modelVersion: "gemini-proxy",
+				candidates: [
+					{
+						content: { parts: [{ text: "Proxy answer." }] },
+						groundingMetadata: {
+							groundingChunks: [{ web: { uri: "https://example.com/proxy", title: "Proxy" } }],
+						},
+					},
+				],
+			});
+		});
+
+		await new GeminiProvider().search({
+			query: "hello",
+			systemPrompt: "Use web search.",
+			authStorage: oauthAuth({ "google-gemini-cli": "oauth-canonical" }),
+			activeModelContext: {
+				provider: "google-gemini-cli",
+				modelId: "gemini-local-name",
+				wireModelId: "gemini-proxy-model",
+				api: "google-generative-ai",
+				baseUrl: "https://proxy.example",
+				headers: { "X-Tenant": "acme" },
+				resolveCredentials: async () => ({ apiKey: "active-owner-key" }),
+			},
+		});
+
+		expect(capturedUrl).toBe("https://proxy.example/v1beta/models/gemini-proxy-model:generateContent");
+		expect(capturedUrl).not.toContain("cloudcode-pa.googleapis.com");
+		expect(capturedHeaders["x-goog-api-key"]).toBe("active-owner-key");
+		expect(capturedHeaders.Authorization).toBeUndefined();
+		expect(capturedHeaders["X-Tenant"]).toBe("acme");
+	});
+
+	it("custom Gemini owner resolver wins over canonical OAuth and stays on the proxy", async () => {
+		let capturedUrl = "";
+		let capturedHeaders: Record<string, string> = {};
+		using _hook = hookFetch(async (input, init) => {
+			capturedUrl = String(input);
+			capturedHeaders = (init?.headers as Record<string, string>) ?? {};
+			return Response.json({
+				modelVersion: "gemini-proxy",
+				candidates: [
+					{
+						content: { parts: [{ text: "Proxy answer." }] },
+						groundingMetadata: {
+							groundingChunks: [{ web: { uri: "https://example.com/proxy", title: "Proxy" } }],
+						},
+					},
+				],
+			});
+		});
+
+		const result = await new GeminiProvider().search({
+			query: "hello",
+			systemPrompt: "Use web search.",
+			authStorage: oauthAuth({ "google-gemini-cli": "oauth-canonical" }),
+			activeModelContext: {
+				provider: "custom-proxy",
+				modelId: "gemini-local-name",
+				wireModelId: "gemini-proxy-model",
+				api: "google-generative-ai",
+				baseUrl: "https://proxy.example",
+				headers: { "X-Tenant": "acme" },
+				resolveCredentials: async () => ({ apiKey: "active-owner-key" }),
+			},
+		});
+
+		expect(capturedUrl).toBe("https://proxy.example/v1beta/models/gemini-proxy-model:generateContent");
+		expect(capturedUrl).not.toContain("cloudcode-pa.googleapis.com");
+		expect(capturedHeaders["x-goog-api-key"]).toBe("active-owner-key");
+		expect(capturedHeaders.Authorization).toBeUndefined();
+		expect(capturedHeaders["X-Tenant"]).toBe("acme");
+		expect(result.answer).toBe("Proxy answer.");
+	});
+
+	it("rejects unsupported custom Cloud Code transports before resolving canonical OAuth", async () => {
+		let oauthLookups = 0;
+		let fetchCalls = 0;
+		const authStorage = {
+			hasAuth: (provider: string) => provider === "google-gemini-cli",
+			hasOAuth: (provider: string) => provider === "google-gemini-cli",
+			getOAuthAccess: async () => {
+				oauthLookups++;
+				return { accessToken: "oauth-canonical", projectId: "canonical-project" };
+			},
+			getApiKey: () => undefined,
+			getSessionCredentialType: () => "oauth",
+		} as unknown as AuthStorage;
+		using _hook = hookFetch(async () => {
+			fetchCalls++;
+			return Response.json({});
+		});
+
+		await expect(
+			new GeminiProvider().search({
+				query: "hello",
+				systemPrompt: "Use web search.",
+				authStorage,
+				activeModelContext: {
+					provider: "google-gemini-cli",
+					modelId: "gemini-proxy",
+					api: "google-gemini-cli",
+					baseUrl: "https://proxy.example",
+					resolveCredentials: async () => ({ apiKey: "active-owner-key" }),
+				},
+			}),
+		).rejects.toMatchObject({ provider: "gemini", status: 400 });
+
+		expect(oauthLookups).toBe(0);
+		expect(fetchCalls).toBe(0);
 	});
 
 	it("does not double-append the version when the active baseUrl is already versioned", async () => {

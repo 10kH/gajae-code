@@ -7,6 +7,7 @@ import {
 	classifyFallbackTrigger,
 	EMPTY_RESPONSE_PROVIDER_CODE,
 	getBundledModel,
+	SERVER_OVERLOADED_PROVIDER_CODE,
 	streamAnthropic,
 	streamOpenAICompletions,
 	transportFailureFacts,
@@ -97,6 +98,75 @@ describe("fallback transport facts", () => {
 			openaiErrorCode: undefined,
 			headers: undefined,
 		});
+	});
+
+	it("retains the statusless capacity-overload code and classifies it as a server failure", () => {
+		// The generic Responses `response.failed` envelope arrives on an HTTP 200
+		// stream: the typed code is the only structured evidence, so it must
+		// survive the existence gate instead of collapsing into untyped prose.
+		const responsesOverload = transportFailureFacts({ openaiErrorCode: SERVER_OVERLOADED_PROVIDER_CODE });
+		expect(responsesOverload).toEqual({
+			kind: "transport",
+			status: undefined,
+			providerCode: SERVER_OVERLOADED_PROVIDER_CODE,
+			anthropicErrorType: undefined,
+			openaiErrorCode: SERVER_OVERLOADED_PROVIDER_CODE,
+			headers: undefined,
+		});
+		expect(transportFailureFacts(responsesOverload)).toEqual(responsesOverload);
+		expect(classifyFallbackTrigger(responsesOverload)).toEqual({ class: "server" });
+
+		const codexOverload = transportFailureFacts({ code: SERVER_OVERLOADED_PROVIDER_CODE });
+		expect(codexOverload).toMatchObject({
+			providerCode: SERVER_OVERLOADED_PROVIDER_CODE,
+			openaiErrorCode: undefined,
+		});
+		expect(classifyFallbackTrigger(codexOverload)).toEqual({ class: "server" });
+	});
+
+	it("keeps HTTP status precedence over a capacity-overload body code", () => {
+		expect(
+			classifyFallbackTrigger(
+				transportFailureFacts({ status: 401, error: { code: SERVER_OVERLOADED_PROVIDER_CODE } }),
+			),
+		).toEqual({ class: "auth", authDisposition: "credential" });
+		expect(
+			classifyFallbackTrigger(
+				transportFailureFacts({ status: 403, error: { code: SERVER_OVERLOADED_PROVIDER_CODE } }),
+			),
+		).toEqual({ class: "auth", authDisposition: "forbidden" });
+		expect(
+			classifyFallbackTrigger(
+				transportFailureFacts({
+					status: 429,
+					error: { code: SERVER_OVERLOADED_PROVIDER_CODE },
+					headers: { "retry-after": "5" },
+				}),
+			),
+		).toEqual({ class: "rate_limit", retryAfterMs: 5000 });
+	});
+
+	it("leaves near-miss and case-variant overload codes untyped and unclassified", () => {
+		// The overload code is the only code that opens the existence gate on its
+		// own, so it is matched case-sensitively: a cased or padded variant must
+		// neither materialize facts nor classify as a server failure.
+		for (const code of [
+			"server_is_overloaded_now",
+			"is_overloaded",
+			"server_overloaded",
+			"overloaded",
+			"SERVER_IS_OVERLOADED",
+			"Server_Is_Overloaded",
+			" server_is_overloaded",
+			"server_is_overloaded ",
+		]) {
+			expect(transportFailureFacts({ openaiErrorCode: code })).toBeUndefined();
+			expect(transportFailureFacts({ code })).toBeUndefined();
+			expect(classifyFallbackTrigger({ kind: "transport", providerCode: code })).toEqual({ class: "other" });
+			expect(classifyFallbackTrigger({ kind: "transport", openaiErrorCode: code, providerCode: code })).toEqual({
+				class: "other",
+			});
+		}
 	});
 
 	it("normalizes provider transport metadata without parsing error text", () => {

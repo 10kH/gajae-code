@@ -69,6 +69,11 @@ async function routerFixture(
 		onFrame?: (attachment: SessionAttachment, frame: SessionRouterFrame) => void | Promise<void>;
 		onNotificationSubscription?: (subscription: NotificationSubscription) => void | Promise<void>;
 		onNotificationSubscriptionReady?: (subscription: NotificationSubscription) => void | Promise<void>;
+		onNotificationSubscriptionRemoved?: (
+			subscription: NotificationSubscription,
+			reason?: "removed" | "replaced" | "replaced_same_generation" | "cancelled",
+		) => void | Promise<void>;
+		onNotificationFrame?: (subscription: NotificationSubscription, frame: SessionRouterFrame) => void | Promise<void>;
 		start?: boolean;
 		initiallyIndexed?: boolean;
 		onIndexRefresh?: () => void | Promise<void>;
@@ -188,6 +193,8 @@ async function routerFixture(
 			onFrame: options.onFrame,
 			onNotificationSubscription: options.onNotificationSubscription,
 			onNotificationSubscriptionReady: options.onNotificationSubscriptionReady,
+			onNotificationSubscriptionRemoved: options.onNotificationSubscriptionRemoved,
+			onNotificationFrame: options.onNotificationFrame,
 			onSessionRemoved: options.onSessionRemoved,
 			setInterval: (() => 0) as unknown as typeof setInterval,
 			clearInterval: (() => {}) as unknown as typeof clearInterval,
@@ -716,6 +723,113 @@ describe("SessionRouter dispatch authority", () => {
 		}
 	});
 
+	test("retains a notification subscription when a single publication is refused", async () => {
+		// A provider that refuses ONE publication has already settled that frame as
+		// rejected on its own side; the next frame normally succeeds. Cancelling the
+		// subscription there latched notificationCancelled for the life of the
+		// AttachedSession, and a still-running session never gets a new one, so its
+		// mirroring stayed dead until that session was restarted.
+		const delivered: string[] = [];
+		const subscriptions: NotificationSubscription[] = [];
+		let refuseNext = true;
+		const fixture = await routerFixture({
+			onNotificationSubscription: subscription => {
+				subscriptions.push(subscription);
+			},
+			onNotificationFrame: (_subscription, frame) => {
+				delivered.push(String(frame.name));
+				if (!refuseNext) return;
+				refuseNext = false;
+				throw new Error("Telegram publication rejected before send: trusted attachment lease is stale");
+			},
+		});
+		try {
+			fixture.clients[0]?.emit({ type: "refused", sessionId: fixture.sessionId });
+			await waitFor(() => delivered.length === 1, "The first notification frame was not dispatched.");
+			await Bun.sleep(10);
+			fixture.clients[0]?.emit({ type: "accepted", sessionId: fixture.sessionId });
+			await waitFor(() => delivered.length === 2, "A single refused publication cancelled the subscription.");
+			expect(delivered).toEqual(["refused", "accepted"]);
+			expect(subscriptions[0]?.isActive()).toBe(true);
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+
+	test("ends the refusal run at the next delivered notification frame", async () => {
+		// The bound is on CONSECUTIVE refusals. A provider that refuses four frames,
+		// delivers one, then refuses four more never reaches the limit, so an
+		// intermittent authority flip cannot accumulate into a cancellation.
+		const delivered: string[] = [];
+		const subscriptions: NotificationSubscription[] = [];
+		let refuse = true;
+		const fixture = await routerFixture({
+			onNotificationSubscription: subscription => {
+				subscriptions.push(subscription);
+			},
+			onNotificationFrame: (_subscription, frame) => {
+				delivered.push(String(frame.name));
+				if (refuse) throw new Error("publication refused");
+			},
+		});
+		try {
+			for (const round of ["a", "b"]) {
+				for (let index = 0; index < 4; index++) {
+					const expected = delivered.length + 1;
+					fixture.clients[0]?.emit({ type: `${round}${index}`, sessionId: fixture.sessionId });
+					await waitFor(() => delivered.length === expected, `Frame ${round}${index} was not dispatched.`);
+					await Bun.sleep(5);
+				}
+				refuse = false;
+				const accepted = delivered.length + 1;
+				fixture.clients[0]?.emit({ type: `${round}-ok`, sessionId: fixture.sessionId });
+				await waitFor(() => delivered.length === accepted, `Frame ${round}-ok was not dispatched.`);
+				await Bun.sleep(5);
+				refuse = true;
+			}
+			expect(delivered).toHaveLength(10);
+			expect(subscriptions[0]?.isActive()).toBe(true);
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+
+	test("cancels a notification subscription after a bounded run of refusals", async () => {
+		// The tolerance is bounded: a provider that never accepts anything is still
+		// conceded, so a permanently broken subscription cannot be dispatched to
+		// forever. The exact count is the contract -- the run, not the first frame.
+		const delivered: string[] = [];
+		const removals: string[] = [];
+		const subscriptions: NotificationSubscription[] = [];
+		const fixture = await routerFixture({
+			onNotificationSubscription: subscription => {
+				subscriptions.push(subscription);
+			},
+			onNotificationSubscriptionRemoved: (_subscription, reason) => {
+				removals.push(String(reason));
+			},
+			onNotificationFrame: (_subscription, frame) => {
+				delivered.push(String(frame.name));
+				throw new Error("publication refused");
+			},
+		});
+		try {
+			for (let index = 0; index < 8; index++) {
+				fixture.clients[0]?.emit({ type: `refused-${index}`, sessionId: fixture.sessionId });
+				await Bun.sleep(10);
+			}
+			// Five consecutive refusals are dispatched; the sixth frame finds the
+			// subscription already conceded and is never handed to the provider.
+			expect(delivered).toEqual(["refused-0", "refused-1", "refused-2", "refused-3", "refused-4"]);
+			expect(removals).toEqual(["cancelled"]);
+			expect(subscriptions[0]?.isActive()).toBe(false);
+			// Core attachment authority is untouched by a conceded subscription.
+			expect(fixture.router.attachment(fixture.sessionId)?.isCurrent()).toBe(true);
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+
 	test("keeps a rejecting provider publication provisional", async () => {
 		const entered = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
@@ -738,6 +852,30 @@ describe("SessionRouter dispatch authority", () => {
 		await starting;
 		expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
 		await fixture.router.stop();
+	});
+
+	test("restarts cleanly when stop overlaps an in-flight startup", async () => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const fixture = await routerFixture({
+			start: false,
+			onAttachment: async () => {
+				entered.resolve();
+				await release.promise;
+			},
+		});
+		const firstStart = fixture.router.start();
+		await entered.promise;
+		const stopping = fixture.router.stop();
+		release.resolve();
+		await stopping;
+		await firstStart;
+		await fixture.router.start();
+		try {
+			expect(fixture.router.attachment(fixture.sessionId)?.isCurrent()).toBe(true);
+		} finally {
+			await fixture.router.stop();
+		}
 	});
 
 	test("holds live frames until provider publication succeeds", async () => {
@@ -1424,8 +1562,7 @@ describe("SessionRouter dispatch authority", () => {
 			await fixture.router.start();
 			expect(fixture.clients).toHaveLength(1);
 			expect(readyCount).toBe(0);
-			expect(fixture.attachments).toHaveLength(1);
-			expect(fixture.attachments[0]?.isCurrent()).toBe(false);
+			expect(fixture.attachments).toHaveLength(0);
 			expect(fixture.clients[0]?.requests).toEqual([]);
 			expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
 		} finally {
@@ -1520,9 +1657,9 @@ describe("SessionRouter dispatch authority", () => {
 
 	test("rejects an endpoint rewritten after its indexed stat", async () => {
 		const fixture = await routerFixture({ start: false });
-		const realStat = fsPromises.stat;
+		const realStat = fsPromises.lstat;
 		let rewritten = false;
-		const statSpy = spyOn(fsPromises, "stat").mockImplementation((async (file, options) => {
+		const statSpy = spyOn(fsPromises, "lstat").mockImplementation((async (file, options) => {
 			const stat = await realStat(file, options);
 			if (!rewritten && file === fixture.endpointFile) {
 				rewritten = true;
@@ -1537,7 +1674,7 @@ describe("SessionRouter dispatch authority", () => {
 				);
 			}
 			return stat;
-		}) as typeof fsPromises.stat);
+		}) as typeof fsPromises.lstat);
 		try {
 			await fixture.router.start();
 			expect(rewritten).toBe(true);
@@ -1572,9 +1709,9 @@ describe("SessionRouter dispatch authority", () => {
 		);
 		fixture.authority.pid = 43;
 		fixture.authority.endpointMtimeMs = fs.statSync(fixture.endpointFile).mtimeMs;
-		const realStat = fsPromises.stat;
+		const realStat = fsPromises.lstat;
 		let blockedValidation = false;
-		const statSpy = spyOn(fsPromises, "stat").mockImplementation((async (file, options) => {
+		const statSpy = spyOn(fsPromises, "lstat").mockImplementation((async (file, options) => {
 			const stat = await realStat(file, options);
 			if (!blockedValidation && file === fixture.endpointFile) {
 				blockedValidation = true;
@@ -1582,7 +1719,7 @@ describe("SessionRouter dispatch authority", () => {
 				await releaseEndpointValidation.promise;
 			}
 			return stat;
-		}) as typeof fsPromises.stat);
+		}) as typeof fsPromises.lstat);
 		try {
 			const reconciliation = fixture.router.reconcile();
 			await endpointValidationEntered.promise;
@@ -2431,6 +2568,60 @@ describe("SessionRouter dispatch authority", () => {
 			expect(sent).toHaveLength(1);
 		} finally {
 			await router.stop();
+		}
+	});
+	test("sendMaintenance fails closed when the endpoint is substituted with a symlink", async () => {
+		const fixture = await routerFixture();
+		const attachment = fixture.router.attachment(fixture.sessionId);
+		const sent = fixture.clients[0]?.sent;
+		expect(attachment?.isCurrent()).toBe(true);
+		const originalPath = `${fixture.endpointFile}.original`;
+		fs.renameSync(fixture.endpointFile, originalPath);
+		fs.symlinkSync(originalPath, fixture.endpointFile);
+		try {
+			await expect(attachment!.sendMaintenance?.("lease-after-symlink")).rejects.toThrow(
+				/endpoint authority changed/i,
+			);
+			expect(sent).toHaveLength(0);
+			expect(attachment!.isCurrent()).toBe(true);
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+	test("retires and recreates a same-generation attachment after an identical-byte inode replacement", async () => {
+		const reasons: Array<"removed" | "replaced" | "replaced_same_generation" | undefined> = [];
+		const fixture = await routerFixture({
+			start: false,
+			onSessionRemoved: (_attachment, reason) => {
+				reasons.push(reason);
+			},
+		});
+		const preservedTimestamp = new Date(1_700_000_000_000);
+		fs.utimesSync(fixture.endpointFile, preservedTimestamp, preservedTimestamp);
+		fixture.authority.endpointMtimeMs = fs.statSync(fixture.endpointFile).mtimeMs;
+		try {
+			await fixture.router.start();
+			const predecessor = fixture.router.attachment(fixture.sessionId)!;
+			const originalIno = fs.lstatSync(fixture.endpointFile).ino;
+			const staging = `${fixture.endpointFile}.same-byte.tmp`;
+			fs.writeFileSync(staging, fs.readFileSync(fixture.endpointFile));
+			fs.renameSync(staging, fixture.endpointFile);
+			fs.utimesSync(fixture.endpointFile, preservedTimestamp, preservedTimestamp);
+			const replacement = fs.lstatSync(fixture.endpointFile);
+			expect(replacement.ino).not.toBe(originalIno);
+			expect(replacement.mtimeMs).toBe(fixture.authority.endpointMtimeMs);
+
+			await fixture.router.reconcile();
+			const successor = fixture.router.attachment(fixture.sessionId);
+			expect(predecessor.isCurrent()).toBe(false);
+			expect(successor).not.toBeNull();
+			expect(successor).not.toBe(predecessor);
+			expect(successor?.isCurrent()).toBe(true);
+			expect(successor?.authorityId).not.toBe(predecessor.authorityId);
+			await waitFor(() => reasons.length > 0, "same-generation predecessor was not retired");
+			expect(reasons).toContain("replaced_same_generation");
+		} finally {
+			await fixture.router.stop();
 		}
 	});
 	test("idle sweep retires an attachment whose row goes dead or stale (#4689 review)", async () => {

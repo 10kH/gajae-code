@@ -49,6 +49,8 @@ export interface SessionSdkHostOptions extends HostEndpointAdapters {
 	query?: (connectionId: string, frame: SdkFrame) => unknown | Promise<unknown>;
 	/** Test/lifecycle seam invoked synchronously before fire-and-forget dispatch. */
 	onFrameAdmitted?: (connectionId: string, frame: SdkFrame) => void;
+	/** Synchronously rejects external input while a runtime is being replaced. */
+	onFrameAdmission?: (connectionId: string, frame: SdkFrame) => SdkFrame | undefined;
 	/** Best-effort diagnostic observation of accepted control/query frames. */
 	onRequest?: SdkRequestObserver;
 	/** Runs before a control response is sent; identity transitions use sendTerminal. */
@@ -414,6 +416,11 @@ export class SessionSdkHost {
 
 	async #onFrame(connectionId: string, frame: SdkFrame): Promise<void> {
 		try {
+			const admissionRejection = this.#options.onFrameAdmission?.(connectionId, frame);
+			if (admissionRejection !== undefined) {
+				await this.#send(connectionId, admissionRejection);
+				return;
+			}
 			switch (frame.type) {
 				case "master_capability_verify": {
 					const result = this.#options.masterCapabilityVerify?.({

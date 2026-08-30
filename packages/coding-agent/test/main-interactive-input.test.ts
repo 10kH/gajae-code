@@ -47,16 +47,18 @@ describe("submitInteractiveInput", () => {
 		const session = {
 			prompt: vi.fn(async () => {}),
 			promptCustomMessage: vi.fn(async () => {}),
+			continuePersistedHistory: vi.fn(async () => {}),
 		};
 		const input = createInput({ text: "", started: true });
 
 		await submitInteractiveInput(mode, session, input);
 
 		expect(mode.markPendingSubmissionStarted).not.toHaveBeenCalled();
-		expect(session.prompt).toHaveBeenCalledWith("", { images: undefined });
+		expect(session.continuePersistedHistory).toHaveBeenCalledTimes(1);
+		expect(session.prompt).not.toHaveBeenCalled();
 		expect(mode.finishPendingSubmission).toHaveBeenCalledWith(input);
 		expect(mode.showError).not.toHaveBeenCalled();
-		expect(waiter.dispose).toHaveBeenCalledTimes(1);
+		expect(waiter.dispose).not.toHaveBeenCalled();
 	});
 
 	it("skips prompting when optimistic submission was cancelled before start", async () => {
@@ -229,6 +231,29 @@ describe("submitInteractiveInput", () => {
 		await submitInteractiveInput(mode, session, createInput());
 
 		expect(waiter.dispose).toHaveBeenCalledTimes(1);
+	});
+
+	it("contains an identity-precondition prompt rejection and leaves the input loop usable", async () => {
+		const mode = {
+			markPendingSubmissionStarted: vi.fn(() => true),
+			finishPendingSubmission: vi.fn(),
+			showError: vi.fn(),
+			checkShutdownRequested: vi.fn(async () => {}),
+			waitForAgentEnd: vi.fn(() => ({ promise: Promise.resolve(), dispose: vi.fn() })),
+		};
+		const session = {
+			prompt: vi.fn(async () => {
+				throw new Error("managed_append_identity_mismatch");
+			}),
+			promptCustomMessage: vi.fn(async () => {}),
+		};
+		const input = createInput();
+
+		await expect(submitInteractiveInput(mode, session, input)).resolves.toBeUndefined();
+
+		expect(mode.showError).toHaveBeenCalledWith("managed_append_identity_mismatch");
+		expect(mode.finishPendingSubmission).toHaveBeenCalledWith(input);
+		expect(mode.checkShutdownRequested).toHaveBeenCalledTimes(1);
 	});
 });
 

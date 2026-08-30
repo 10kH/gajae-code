@@ -17,6 +17,7 @@ import type {
 } from "../session/agent-session";
 import type { ArtifactManager } from "../session/artifacts";
 import type { ClientBridge } from "../session/client-bridge";
+import type { FoldAdapter } from "../session/fold-coordinator";
 import type { CustomMessage } from "../session/messages";
 import type { ToolChoiceQueue } from "../session/tool-choice-queue";
 import type { SkillActiveEntry } from "../skill-state/active-state";
@@ -235,12 +236,13 @@ export interface ToolSession {
 	assertEvalExecutionAllowed?: () => void;
 	/** Track tool-owned eval work so session disposal can await/abort it like direct session eval runs. */
 	trackEvalExecution?<T>(execution: Promise<T>, abortController: AbortController): Promise<T>;
-	/** Register a safe request handler that asks a managed foreground bash call to fold into a background job. */
-	registerForegroundBashBackgroundRequestHandler?: (handler: () => void) => () => void;
-	/** Whether a managed foreground bash call is currently foldable into a background job. */
+	/** Register a foldable foreground wait so the fold chord can move it into a background job. */
+	registerForegroundFoldParticipant?: (adapter: FoldAdapter) => () => void;
+	/** Whether a foreground wait is currently foldable into a background job. */
 	hasForegroundBashBackgroundRequestHandler?: () => boolean;
-	/** Request that the active managed foreground bash call fold into a background job, if supported. */
-	requestForegroundBashBackground?: () => boolean;
+	/** Request that the active foreground wait fold into a background job, if supported. */
+	requestForegroundBashBackground?: () => Promise<boolean>;
+
 	/** Get the session-owned or inherited async job manager. */
 	getAsyncJobManager?: () => AsyncJobManager | undefined;
 	/** Resolves when the session queues user steering (or `signal` aborts) without consuming it; wait-style tools use this to end their observation early. */

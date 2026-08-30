@@ -6,7 +6,9 @@ import { clampExplicitThinkingLevelForModel, formatClampedModelSelector } from "
 import { validateModelProfileName } from "./model-profile-contract";
 import {
 	aggregateModelProfileRequiredProviders,
+	deriveModelProfileMappedProviders,
 	formatModelProfileDisplayLabel,
+	type ModelProfileDefinition,
 	PROXY_ROUTABLE_PROVIDER_IDS,
 	resolveProfileBindings,
 } from "./model-profiles";
@@ -537,19 +539,40 @@ function rewriteBindingsProviders(
  * preset. Returns undefined when unset or empty. Passwords/labels are never
  * treated as proxy ids here; only lowercase provider ids from settings.
  */
-function resolveProxyProviderId(settings: Pick<Settings, "get" | "getGlobal" | "getOverride">): string | undefined {
-	const value = settings.get("modelProfile.proxyProvider");
-	if (typeof value !== "string" || value.trim() === "") return undefined;
-	const id = value.trim().toLowerCase();
-	if (!/^[a-z0-9][a-z0-9._-]*$/.test(id)) {
+export function resolveProxyProviderId(settings: Pick<Settings, "get"> | undefined): string | undefined {
+	const config = inspectProxyProviderId(settings);
+	if (config.status === "unset") return undefined;
+	if (config.status === "invalid") {
 		throw new Error(
-			`modelProfile.proxyProvider must be a lowercase provider id (got "${value.trim()}"). Configure an OpenAI-compatible proxy with \`gjc setup provider\`, then set its id here.`,
+			`modelProfile.proxyProvider must be a lowercase provider id (got "${config.value}"). Configure an OpenAI-compatible proxy with \`gjc setup provider\`, then set its id here.`,
 		);
 	}
-	return id;
+	return config.id;
 }
 
-function resolveProxyMode(settings: Pick<Settings, "get" | "getGlobal" | "getOverride">): "fallback" | "always" {
+export type ProxyProviderConfig =
+	| { status: "unset" }
+	| { status: "configured"; id: string }
+	| { status: "invalid"; value: string };
+
+export function inspectProxyProviderId(settings: Pick<Settings, "get"> | undefined): ProxyProviderConfig {
+	if (!settings) return { status: "unset" };
+	const value = settings.get("modelProfile.proxyProvider");
+	if (typeof value !== "string" || value.trim() === "") return { status: "unset" };
+	const id = value.trim().toLowerCase();
+	return /^[a-z0-9][a-z0-9._-]*$/.test(id) ? { status: "configured", id } : { status: "invalid", value: value.trim() };
+}
+
+/** Passive surfaces fail closed on malformed settings instead of throwing. */
+export function tryResolveProxyProviderId(settings: Pick<Settings, "get"> | undefined): string | undefined {
+	const config = inspectProxyProviderId(settings);
+	return config.status === "configured" ? config.id : undefined;
+}
+
+export type ModelProfileProxyMode = "fallback" | "always";
+
+export function resolveProxyMode(settings: Pick<Settings, "get"> | undefined): ModelProfileProxyMode {
+	if (!settings) return "fallback";
 	const value = settings.get("modelProfile.proxyMode");
 	if (value === undefined || value === "fallback" || value === "always") return value ?? "fallback";
 	throw new Error(`modelProfile.proxyMode must be "fallback" or "always" (got "${String(value)}")`);
@@ -563,12 +586,35 @@ function resolveProxyMode(settings: Pick<Settings, "get" | "getGlobal" | "getOve
  * not retain the upstream provider prefix. Missing or ambiguous matches fail
  * closed rather than leaving an unauthenticated role selector behind.
  */
-function rewriteSelectorForProxy(
+export function getProxyRoutableProviders(profile: ModelProfileDefinition): ReadonlySet<string> {
+	if (profile.source === "user") return new Set();
+	return profile.source === "registry"
+		? new Set([
+				...PROXY_ROUTABLE_PROVIDER_IDS,
+				...profile.requiredProviders,
+				...deriveModelProfileMappedProviders(profile),
+			])
+		: PROXY_ROUTABLE_PROVIDER_IDS;
+}
+
+/**
+ * Profile sources whose non-default qualified role bindings are part of the
+ * activation contract. Proxy rewrites run before role resolution, so a
+ * rewritten selector satisfies this prerequisite when its concrete proxy
+ * model is present in the effective catalog. Embedded built-ins intentionally
+ * retain their legacy tolerance for stale qualified role tails.
+ */
+export function requiresQualifiedModelProfileRoleResolution(profile: Pick<ModelProfileDefinition, "source">): boolean {
+	return profile.source === "user" || profile.source === "registry";
+}
+
+export function rewriteSelectorForProxy(
 	selector: string,
 	proxyProvider: string,
-	proxyMode: "fallback" | "always",
+	proxyMode: ModelProfileProxyMode,
 	allModels: Model<Api>[],
 	directlyAuthenticated: ReadonlySet<string>,
+	routableProviders: ReadonlySet<string>,
 ): string {
 	const suffix = splitSelectorThinkingSuffix(selector);
 	const baseSelector = suffix.selector;
@@ -589,7 +635,7 @@ function rewriteSelectorForProxy(
 	}
 	const directProvider = baseSelector.substring(0, slash);
 	if (proxyMode === "fallback" && directlyAuthenticated.has(directProvider)) return selector;
-	if (!PROXY_ROUTABLE_PROVIDER_IDS.has(directProvider)) return selector;
+	if (!routableProviders.has(directProvider)) return selector;
 	if (proxyProvider === directProvider) {
 		throw new Error(`Configured proxy "${proxyProvider}" cannot route its own direct selector "${baseSelector}"`);
 	}
@@ -613,9 +659,10 @@ function rewriteSelectorValueForProxy(
 	proxyMode: "fallback" | "always",
 	allModels: Model<Api>[],
 	directlyAuthenticated: ReadonlySet<string>,
+	routableProviders: ReadonlySet<string>,
 ): ModelSelectorValue {
 	const selectors = normalizeModelSelectorValue(selectorValue).map(selector =>
-		rewriteSelectorForProxy(selector, proxyProvider, proxyMode, allModels, directlyAuthenticated),
+		rewriteSelectorForProxy(selector, proxyProvider, proxyMode, allModels, directlyAuthenticated, routableProviders),
 	);
 	return selectors.length === 1 && typeof selectorValue === "string" ? selectors[0] : selectors;
 }
@@ -630,6 +677,7 @@ function rewriteBindingsForProxy(
 	proxyMode: "fallback" | "always",
 	allModels: Model<Api>[],
 	directlyAuthenticated: ReadonlySet<string>,
+	routableProviders: ReadonlySet<string>,
 ): {
 	defaultSelector?: ModelSelectorValue;
 	modelRoles: Record<string, ModelSelectorValue>;
@@ -643,18 +691,33 @@ function rewriteBindingsForProxy(
 					proxyMode,
 					allModels,
 					directlyAuthenticated,
+					routableProviders,
 				)
 			: undefined,
 		modelRoles: Object.fromEntries(
 			Object.entries(bindings.modelRoles).map(([role, selector]) => [
 				role,
-				rewriteSelectorValueForProxy(selector, proxyProvider, proxyMode, allModels, directlyAuthenticated),
+				rewriteSelectorValueForProxy(
+					selector,
+					proxyProvider,
+					proxyMode,
+					allModels,
+					directlyAuthenticated,
+					routableProviders,
+				),
 			]),
 		),
 		agentModelOverrides: Object.fromEntries(
 			Object.entries(bindings.agentModelOverrides).map(([role, selector]) => [
 				role,
-				rewriteSelectorValueForProxy(selector, proxyProvider, proxyMode, allModels, directlyAuthenticated),
+				rewriteSelectorValueForProxy(
+					selector,
+					proxyProvider,
+					proxyMode,
+					allModels,
+					directlyAuthenticated,
+					routableProviders,
+				),
 			]),
 		),
 	};
@@ -888,13 +951,25 @@ export async function prepareModelProfileActivation(
 		const requiredProviders = aggregateModelProfileRequiredProviders(profile.requiredProviders, profile);
 		const alternativeGroups = profile.alternativeProviderGroups ?? [];
 		const alternativeSet = new Set(alternativeGroups.flat());
+		const requiredProviderSet = new Set(requiredProviders);
+		const authenticationProbeProviders = new Set<string>([
+			...requiredProviders,
+			...alternativeSet,
+			...deriveModelProfileMappedProviders(profile),
+		]);
 
 		const missingProviders: string[] = [];
 		const authenticatedProviders: string[] = [];
-		for (const provider of requiredProviders) {
-			const apiKey = await options.modelRegistry.getApiKeyForProvider(provider, credentialSessionId);
+		for (const provider of authenticationProbeProviders) {
+			let apiKey: string | undefined;
+			try {
+				apiKey = await options.modelRegistry.getApiKeyForProvider(provider, credentialSessionId);
+			} catch (error) {
+				if (requiredProviderSet.has(provider) && !alternativeSet.has(provider)) throw error;
+				continue;
+			}
 			if (apiKey !== kNoAuth && !isAuthenticated(apiKey)) {
-				missingProviders.push(provider);
+				if (requiredProviderSet.has(provider)) missingProviders.push(provider);
 			} else {
 				authenticatedProviders.push(provider);
 			}
@@ -905,8 +980,18 @@ export async function prepareModelProfileActivation(
 		// A proxy-routable strict provider is satisfied through the configured
 		// OpenAI-compatible proxy when that proxy is itself authenticated; otherwise
 		// we fail closed pointing at the proxy (or the provider when none is set).
-		const proxyProvider = profile.source === "builtin" ? resolveProxyProviderId(options.settings) : undefined;
-		const proxyMode = profile.source === "builtin" ? resolveProxyMode(options.settings) : "fallback";
+		const proxyProvider = profile.source !== "user" ? resolveProxyProviderId(options.settings) : undefined;
+		const proxyMode = profile.source !== "user" ? resolveProxyMode(options.settings) : "fallback";
+		const proxyRoutableProviders =
+			profile.source === "user"
+				? new Set<string>()
+				: profile.source === "registry"
+					? new Set([
+							...PROXY_ROUTABLE_PROVIDER_IDS,
+							...profile.requiredProviders,
+							...deriveModelProfileMappedProviders(profile),
+						])
+					: PROXY_ROUTABLE_PROVIDER_IDS;
 		if (proxyMode === "always" && proxyProvider === undefined) {
 			throw new Error('modelProfile.proxyMode "always" requires modelProfile.proxyProvider');
 		}
@@ -931,13 +1016,13 @@ export async function prepareModelProfileActivation(
 		}
 
 		const strictMissing = missingProviders.filter(
-			provider => !PROXY_ROUTABLE_PROVIDER_IDS.has(provider) && !alternativeSet.has(provider),
+			provider => !proxyRoutableProviders.has(provider) && !alternativeSet.has(provider),
 		);
 		if (strictMissing.length > 0) {
 			throw new ModelProfileCredentialError(profileLabel, strictMissing);
 		}
 		const strictRoutableMissing = missingProviders.filter(
-			provider => PROXY_ROUTABLE_PROVIDER_IDS.has(provider) && !alternativeSet.has(provider),
+			provider => proxyRoutableProviders.has(provider) && !alternativeSet.has(provider),
 		);
 		if (strictRoutableMissing.length > 0 && (proxyProvider === undefined || !proxyAuthenticated)) {
 			throw new ModelProfileCredentialError(
@@ -948,7 +1033,7 @@ export async function prepareModelProfileActivation(
 		for (const group of alternativeGroups) {
 			const groupAuthenticated = group.some(provider => authenticatedProviders.includes(provider));
 			if (groupAuthenticated) continue;
-			const allRoutable = group.every(provider => PROXY_ROUTABLE_PROVIDER_IDS.has(provider));
+			const allRoutable = group.every(provider => proxyRoutableProviders.has(provider));
 			if (allRoutable && proxyAuthenticated) continue;
 			throw new ModelProfileCredentialError(
 				profileLabel,
@@ -960,20 +1045,22 @@ export async function prepareModelProfileActivation(
 			options.modelRegistry.getAvailableForProfileActivation?.() ??
 			options.modelRegistry.getAvailable?.() ??
 			options.modelRegistry.getAll();
+		const roleCatalogModels = options.modelRegistry.getAll();
 		let bindings = resolveProfileBindings(profile);
-		if (missingProviders.length > 0 && alternativeGroups.length > 0) {
+		if (alternativeGroups.length > 0) {
 			bindings = rewriteBindingsProviders(bindings, new Set(authenticatedProviders), alternativeGroups);
 		}
 		// Built-in preset selectors are routed through a configured authenticated
 		// proxy according to the selected mode. This session-scoped rewrite is never
 		// persisted to models.yml.
-		if (proxyProvider !== undefined && proxyAuthenticated && profile.source === "builtin") {
+		if (proxyProvider !== undefined && proxyAuthenticated && profile.source !== "user") {
 			bindings = rewriteBindingsForProxy(
 				bindings,
 				proxyProvider,
 				proxyMode,
 				availableModels,
 				new Set(authenticatedProviders),
+				proxyRoutableProviders,
 			);
 		}
 		const defaultSelectors = bindings.defaultSelector ? normalizeModelSelectorValue(bindings.defaultSelector) : [];
@@ -1038,14 +1125,14 @@ export async function prepareModelProfileActivation(
 		][]) {
 			modelRoles[role] = await resolveAndClampSelectorValue(
 				selectorValue,
-				availableModels,
+				roleCatalogModels,
 				{
 					settings: options.settings as Settings,
 					modelRegistry: options.modelRegistry as ModelRegistry,
 					sessionId: options.session.sessionId,
 					credentialSessionId,
 					aliasIntent: "preset-equivalent",
-					requireQualifiedResolution: profile.source !== "builtin",
+					requireQualifiedResolution: requiresQualifiedModelProfileRoleResolution(profile),
 				},
 				profileLabel,
 				role,
@@ -1059,14 +1146,14 @@ export async function prepareModelProfileActivation(
 		][]) {
 			agentModelOverrides[role] = await resolveAndClampSelectorValue(
 				selectorValue,
-				availableModels,
+				roleCatalogModels,
 				{
 					settings: options.settings as Settings,
 					modelRegistry: options.modelRegistry as ModelRegistry,
 					sessionId: options.session.sessionId,
 					credentialSessionId,
 					aliasIntent: "preset-equivalent",
-					requireQualifiedResolution: profile.source !== "builtin",
+					requireQualifiedResolution: requiresQualifiedModelProfileRoleResolution(profile),
 				},
 				profileLabel,
 				role,

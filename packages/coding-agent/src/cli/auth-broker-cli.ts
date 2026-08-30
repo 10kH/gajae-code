@@ -17,6 +17,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as readline from "node:readline";
 import { cleanReason } from "@gajae-code/ai/auth-broker/redact";
 import {
 	AuthBrokerClient,
@@ -226,19 +227,46 @@ async function runLogin(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
 	await runLocalLogin(providerArg as OAuthProvider);
 }
 
+function promptForLogin(rl: readline.Interface, question: string): Promise<string> {
+	const { promise, resolve } = Promise.withResolvers<string>();
+	rl.question(question, answer => resolve(answer));
+	return promise;
+}
+
 async function runLocalLogin(provider: OAuthProvider): Promise<void> {
-	// Spawn the pi-ai CLI in-process — it handles the per-provider OAuth dance
-	// and persists into the same SQLite store the broker uses.
-	const piAiCli = Bun.fileURLToPath(import.meta.resolve("@gajae-code/ai/cli"));
-	const proc = Bun.spawn({
-		cmd: [process.execPath, piAiCli, "login", provider],
-		stdin: "inherit",
-		stdout: "inherit",
-		stderr: "inherit",
-	});
-	const exitCode = await proc.exited;
-	if (exitCode !== 0) {
-		throw new Error(`pi-ai login exited with code ${exitCode}`);
+	// Drive AuthStorage.login() in-process against the local SQLite store the
+	// broker uses. Previously this spawned a child process resolved via
+	// `import.meta.resolve("@gajae-code/ai/cli")`, which requires an on-disk
+	// `node_modules` package resolution — present in a source/dev checkout but
+	// absent inside a compiled `bun build --compile` binary's `$bunfs`, so the
+	// standalone binary failed with a module-resolution error (issue #5064).
+	// `AuthStorage` is already a normal, statically-traceable import from
+	// `@gajae-code/ai/core` (see the top of this file), so it bundles cleanly
+	// into the compiled binary the same way every other `@gajae-code/ai/core`
+	// export used elsewhere in this file already does.
+	const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+	const store = await SqliteAuthCredentialStore.open(getAgentDbPath());
+	const storage = new AuthStorage(store);
+	await storage.reload();
+	try {
+		await storage.login(provider, {
+			onAuth(info) {
+				const { url, instructions } = info;
+				process.stdout.write(`\nOpen this URL in your browser:\n${url}\n`);
+				if (instructions) process.stdout.write(`${instructions}\n`);
+				process.stdout.write("\n");
+			},
+			onProgress(message) {
+				process.stdout.write(`${message}\n`);
+			},
+			onPrompt(p) {
+				return promptForLogin(rl, `${p.message}${p.placeholder ? ` (${p.placeholder})` : ""}: `);
+			},
+		});
+		process.stdout.write(`\nCredentials saved to ${getAgentDbPath()}\n`);
+	} finally {
+		store.close();
+		rl.close();
 	}
 }
 

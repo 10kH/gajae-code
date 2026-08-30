@@ -81,6 +81,7 @@ export const credentialSnapshotEntrySchema = z
 		provider: z.string().min(1),
 		credential: snapshotCredentialSchema,
 		identityKey: z.string().nullable(),
+		revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
 	})
 	.strict();
 
@@ -101,6 +102,7 @@ export const refresherScheduleSchema = z
 
 export const snapshotResponseSchema = z
 	.object({
+		epoch: z.string().min(1).optional(),
 		generation: z.number().int(),
 		generatedAt: z.number(),
 		serverNowMs: z.number(),
@@ -124,6 +126,7 @@ export const credentialMetadataRecordSchema = z
 
 export const credentialMetadataResponseSchema = z
 	.object({
+		epoch: z.string().min(1).optional(),
 		generation: z.number().int().nonnegative(),
 		generatedAt: z.number().finite().nonnegative(),
 		credentials: z.array(credentialMetadataRecordSchema),
@@ -143,6 +146,7 @@ export const snapshotStreamSnapshotEventSchema = snapshotResponseSchema
 export const snapshotStreamEntryEventSchema = z
 	.object({
 		kind: z.literal("entry"),
+		epoch: z.string().min(1).optional(),
 		generation: z.number().int(),
 		serverNowMs: z.number(),
 		refresher: refresherScheduleSchema,
@@ -154,6 +158,7 @@ export const snapshotStreamEntryEventSchema = z
 export const snapshotStreamRemovedEventSchema = z
 	.object({
 		kind: z.literal("removed"),
+		epoch: z.string().min(1).optional(),
 		generation: z.number().int(),
 		serverNowMs: z.number(),
 		refresher: refresherScheduleSchema,
@@ -212,6 +217,7 @@ export const credentialRefreshResponseSchema = z
 export const credentialDisableRequestSchema = z
 	.object({
 		cause: z.string().optional(),
+		expectedRevision: z.number().int().positive().optional(),
 	})
 	.strict();
 

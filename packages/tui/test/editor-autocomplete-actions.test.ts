@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
@@ -256,7 +257,7 @@ describe("Editor Enter handler sync slash completion", () => {
 			editor.setText("please read `src");
 
 			editor.handleInput("/");
-			await Bun.sleep(20);
+			await Bun.sleep(500);
 
 			expect(editor.isShowingAutocomplete()).toBe(true);
 			editor.handleInput("\r");
@@ -280,7 +281,7 @@ describe("Editor Enter handler sync slash completion", () => {
 			editor.setText(`please read \`${baseDir}`);
 
 			editor.handleInput("/");
-			await Bun.sleep(20);
+			await Bun.sleep(500);
 			expect(editor.isShowingAutocomplete()).toBe(true);
 			editor.handleInput("\r");
 
@@ -306,7 +307,7 @@ describe("Editor Enter handler sync slash completion", () => {
 			editor.setText(`please read \`${baseDir}`);
 
 			editor.handleInput("/");
-			await Bun.sleep(20);
+			await Bun.sleep(500);
 			expect(editor.isShowingAutocomplete()).toBe(true);
 			editor.moveToLineStart();
 			editor.handleInput("\r");
@@ -624,5 +625,39 @@ describe("Editor Enter handler sync slash completion", () => {
 		// then cancels autocomplete and submits the completed text.
 		expect(submitted).toBe("/model");
 		expect(suggestionsCallCount).toBeGreaterThan(0);
+	});
+
+	it("updates fuzzy suggestions for Korean characters typed after @", async () => {
+		const baseDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "editor-korean-autocomplete-"));
+		try {
+			await Bun.write(path.join(baseDir, "한글.txt"), "content\n");
+			const editor = new Editor(defaultEditorTheme);
+			editor.setAutocompleteProvider(new CombinedAutocompleteProvider([], baseDir));
+
+			editor.handleInput("@");
+			editor.handleInput("ㅎㄱ");
+			await Bun.sleep(500);
+
+			expect(editor.isShowingAutocomplete()).toBe(true);
+		} finally {
+			await fsPromises.rm(baseDir, { recursive: true, force: true });
+		}
+	});
+
+	it("applies a fuzzy @ completion from explicit Tab", async () => {
+		const baseDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "editor-tab-fuzzy-autocomplete-"));
+		try {
+			await Bun.write(path.join(baseDir, "한글.txt"), "content\n");
+			const editor = new Editor(defaultEditorTheme);
+			editor.setAutocompleteProvider(new CombinedAutocompleteProvider([], baseDir));
+			editor.setText("@ㅎㄱ");
+
+			editor.handleInput("\t");
+			await Bun.sleep(500);
+
+			expect(editor.getText()).toBe("@한글.txt ");
+		} finally {
+			await fsPromises.rm(baseDir, { recursive: true, force: true });
+		}
 	});
 });

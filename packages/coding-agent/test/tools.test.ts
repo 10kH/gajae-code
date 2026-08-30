@@ -10,6 +10,7 @@ import { DEFAULT_BASH_INTERCEPTOR_RULES, Settings } from "@gajae-code/coding-age
 import { EditTool } from "@gajae-code/coding-agent/edit";
 import { saveAgentBashOriginalArtifact } from "@gajae-code/coding-agent/session/agent-session";
 import { ArtifactManager } from "@gajae-code/coding-agent/session/artifacts";
+import type { FoldAdapter } from "@gajae-code/coding-agent/session/fold-coordinator";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import {
 	DEFAULT_ARTIFACT_MAX_BYTES,
@@ -241,6 +242,23 @@ function createTestToolContext(toolNames: string[]): AgentToolContext {
 		abort: () => {},
 		toolNames,
 	} as AgentToolContext;
+}
+
+/**
+ * Drive a fold the way the coordinator does: hand the adapter the receipt it
+ * would have captured, which settles the foreground caller exactly once.
+ */
+function foldViaAdapter(adapter: FoldAdapter): void {
+	adapter.detachObserver({
+		jobId: adapter.jobId,
+		jobGeneration: adapter.jobGeneration,
+		kind: adapter.kind,
+		label: adapter.label,
+		outputRef: adapter.outputRef,
+		remainingIntent: undefined,
+		foldedAt: Date.now(),
+		cwdSensitive: adapter.cwdSensitive,
+	});
 }
 
 describe("Coding Agent Tools", () => {
@@ -1531,11 +1549,35 @@ function b() {
 			}
 			const runningJob = asyncJobManager.getJob(jobId);
 			expect(runningJob?.status).toBe("running");
+			expect(runningJob?.metadata?.backgrounded).toBe(true);
 			await runningJob?.promise;
 			await asyncJobManager.drainDeliveries({ timeoutMs: 1 });
 			expect(deliveries).toHaveLength(1);
 			expect(deliveries[0]?.jobId).toBe(jobId);
 			expect(deliveries[0]?.text).toContain("done");
+			await asyncJobManager.dispose();
+		});
+
+		it("marks zero-wait auto-background jobs in the manager snapshot", async () => {
+			const asyncJobManager = new AsyncJobManager({ onJobComplete: async () => {} });
+			AsyncJobManager.setInstance(asyncJobManager);
+			const tool = new BashTool(
+				createTestToolSession(
+					testDir,
+					Settings.isolated({
+						"bash.autoBackground.enabled": true,
+						"bash.autoBackground.thresholdMs": 0,
+					}),
+					{ getSessionId: () => "test-session" },
+				),
+			);
+
+			const result = await tool.execute("test-call-9-auto-zero-wait", { command: "sleep 0.05" });
+			const jobId = result.details?.async?.jobId;
+			if (!jobId) throw new Error("expected an immediate auto-background job id");
+			expect(asyncJobManager.getJob(jobId)?.metadata?.backgrounded).toBe(true);
+			expect(asyncJobManager.getJobsSnapshot().jobs.find(job => job.id === jobId)?.backgrounded).toBe(true);
+			await asyncJobManager.getJob(jobId)?.promise;
 			await asyncJobManager.dispose();
 		});
 
@@ -1563,6 +1605,8 @@ function b() {
 			const asyncStarted = await tool.execute("test-call-async-tail", { command, async: true });
 			const asyncJobId = asyncStarted.details?.async?.jobId;
 			expect(asyncJobId).toBeDefined();
+			expect(asyncJobManager.getJob(asyncJobId!)?.metadata?.backgrounded).toBe(true);
+			expect(asyncJobManager.getJobsSnapshot().jobs.find(job => job.id === asyncJobId)?.backgrounded).toBe(true);
 			await asyncJobManager.getJob(asyncJobId!)?.promise;
 			await asyncJobManager.drainDeliveries({ timeoutMs: 1 });
 
@@ -1622,7 +1666,7 @@ function b() {
 				},
 			});
 			AsyncJobManager.setInstance(asyncJobManager);
-			let backgroundRequestHandler: (() => void) | undefined;
+			let foldAdapter: FoldAdapter | undefined;
 			const autoBackgroundBashTool = wrapToolWithMetaNotice(
 				new BashTool(
 					createTestToolSession(
@@ -1633,10 +1677,10 @@ function b() {
 						}),
 						{
 							getSessionId: () => "test-session",
-							registerForegroundBashBackgroundRequestHandler: handler => {
-								backgroundRequestHandler = handler;
+							registerForegroundFoldParticipant: adapter => {
+								foldAdapter = adapter;
 								return () => {
-									if (backgroundRequestHandler === handler) backgroundRequestHandler = undefined;
+									if (foldAdapter === adapter) foldAdapter = undefined;
 								};
 							},
 						},
@@ -1658,18 +1702,18 @@ function b() {
 				},
 			);
 
-			for (let i = 0; i < 50 && !backgroundRequestHandler; i++) {
+			for (let i = 0; i < 50 && !foldAdapter; i++) {
 				await Bun.sleep(10);
 			}
-			expect(backgroundRequestHandler).toBeDefined();
-			backgroundRequestHandler?.();
+			expect(foldAdapter).toBeDefined();
+			if (foldAdapter) foldViaAdapter(foldAdapter);
 
 			const result = await resultPromise;
 			expect(result.details?.async?.state).toBe("running");
 			expect(result.details?.async?.type).toBe("bash");
 			expect(getTextOutput(result)).toContain("Background job");
 			expect(getTextOutput(result)).toContain("start");
-			expect(backgroundRequestHandler).toBeUndefined();
+			expect(foldAdapter).toBeUndefined();
 
 			const jobId = result.details?.async?.jobId;
 			if (!jobId) {
@@ -1677,6 +1721,8 @@ function b() {
 			}
 			const runningJob = asyncJobManager.getJob(jobId);
 			expect(runningJob?.status).toBe("running");
+			expect(runningJob?.metadata?.backgrounded).toBe(true);
+			expect(asyncJobManager.getJobsSnapshot().jobs.find(job => job.id === jobId)?.backgrounded).toBe(true);
 			await runningJob?.promise;
 			await asyncJobManager.drainDeliveries({ timeoutMs: 1 });
 			const postFoldProgress = updates.filter(update => update.text.includes("after-fold"));
@@ -1696,7 +1742,7 @@ function b() {
 				},
 			});
 			AsyncJobManager.setInstance(asyncJobManager);
-			let backgroundRequestHandler: (() => void) | undefined;
+			let foldAdapter: FoldAdapter | undefined;
 			const foregroundBashTool = wrapToolWithMetaNotice(
 				new BashTool(
 					createTestToolSession(
@@ -1706,10 +1752,10 @@ function b() {
 						}),
 						{
 							getSessionId: () => "test-session",
-							registerForegroundBashBackgroundRequestHandler: handler => {
-								backgroundRequestHandler = handler;
+							registerForegroundFoldParticipant: adapter => {
+								foldAdapter = adapter;
 								return () => {
-									if (backgroundRequestHandler === handler) backgroundRequestHandler = undefined;
+									if (foldAdapter === adapter) foldAdapter = undefined;
 								};
 							},
 						},
@@ -1725,11 +1771,11 @@ function b() {
 				undefined,
 			);
 
-			for (let i = 0; i < 50 && !backgroundRequestHandler; i++) {
+			for (let i = 0; i < 50 && !foldAdapter; i++) {
 				await Bun.sleep(10);
 			}
-			expect(backgroundRequestHandler).toBeDefined();
-			backgroundRequestHandler?.();
+			expect(foldAdapter).toBeDefined();
+			if (foldAdapter) foldViaAdapter(foldAdapter);
 
 			const result = await resultPromise;
 			expect(result.details?.async?.state).toBe("running");
@@ -1785,6 +1831,8 @@ function b() {
 			}
 			const runningJob = asyncJobManager.getJob(jobId);
 			expect(runningJob?.status).toBe("running");
+			expect(runningJob?.metadata?.backgrounded).toBe(true);
+			expect(asyncJobManager.getJobsSnapshot().jobs.find(job => job.id === jobId)?.backgrounded).toBe(true);
 			await runningJob?.promise;
 			await asyncJobManager.drainDeliveries({ timeoutMs: 1 });
 			expect(deliveries).toHaveLength(1);

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
@@ -107,6 +108,15 @@ describe("CombinedAutocompleteProvider", () => {
 			expect(values).toContain("@.github/");
 			expect(values.some(value => value === "@.git" || value.startsWith("@.git/"))).toBe(false);
 		});
+
+		it("preserves quoted @ metadata for explicit Tab", async () => {
+			await Bun.write(path.join(baseDir, "file name.md"), "content\n");
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const result = await provider.getForceFileSuggestions(['@"'], 0, 2);
+
+			expect(result?.prefix).toBe('@"');
+			expect(result?.items.map(item => item.value)).toContain('@"file name.md"');
+		});
 	});
 
 	describe("@ fuzzy search scoped paths", () => {
@@ -143,6 +153,22 @@ describe("CombinedAutocompleteProvider", () => {
 			expect(values).not.toContain("@../outside/nested/deeper/zzz.ts");
 			expect(values.some(value => value.includes("alpha-local.ts"))).toBe(false);
 		});
+
+		it("resolves an NFC parent component without falling back to sibling directories", async () => {
+			const nfdParent = "\u1112\u1161\u11AB";
+			const nfcParent = nfdParent.normalize("NFC");
+			const decoyParent = `${nfcParent}-decoy`;
+			fs.mkdirSync(path.join(baseDir, nfdParent));
+			fs.mkdirSync(path.join(baseDir, decoyParent));
+			fs.writeFileSync(path.join(baseDir, nfdParent, "target.ts"), "export const target = 1;\n");
+			fs.writeFileSync(path.join(baseDir, decoyParent, "target.ts"), "export const decoy = 1;\n");
+
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = `@${nfcParent}/target`;
+			const result = await provider.getSuggestions([line], 0, line.length);
+
+			expect(result?.items.map(item => item.value)).toEqual([`@${nfdParent}/target.ts`]);
+		});
 	});
 	describe("dot-slash path completion", () => {
 		let baseDir: string;
@@ -174,6 +200,235 @@ describe("CombinedAutocompleteProvider", () => {
 			expect(result).not.toBeNull();
 			const values = result?.items.map(item => item.value) ?? [];
 			expect(values).toContain("./src/");
+		});
+	});
+
+	describe("unicode-normalized path matching", () => {
+		let baseDir: string;
+		const nfdDirectory = "\u1112\u1161\u11AB";
+		const nfdName = "\u1112\u1161\u11AB\u1100\u1173\u11AF.txt";
+
+		beforeEach(() => {
+			baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "autocomplete-nfc-test-"));
+		});
+
+		afterEach(() => {
+			fs.rmSync(baseDir, { recursive: true, force: true });
+		});
+
+		it("matches NFD directory entries against an NFC prefix", async () => {
+			fs.writeFileSync(path.join(baseDir, nfdName), "content\n");
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "./\uD55C";
+			const result = await provider.getForceFileSuggestions([line], 0, line.length);
+			expect(result).not.toBeNull();
+			const values = result?.items.map(item => item.value) ?? [];
+			expect(values).toContain(`./${nfdName}`);
+		});
+
+		it("matches NFD entries in the @ fuzzy lane against an NFC query", async () => {
+			fs.writeFileSync(path.join(baseDir, nfdName), "content\n");
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "@\uD55C\uAE00";
+			const result = await provider.getSuggestions([line], 0, line.length);
+			const values = result?.items.map(item => item.value) ?? [];
+			expect(values).toContain(`@${nfdName}`);
+		});
+
+		it("traverses an NFD directory from an NFC path prefix", async () => {
+			fs.mkdirSync(path.join(baseDir, nfdDirectory));
+			fs.writeFileSync(path.join(baseDir, nfdDirectory, nfdName), "content\n");
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "./\uD55C/";
+			const result = await provider.getForceFileSuggestions([line], 0, line.length);
+			const values = result?.items.map(item => item.value) ?? [];
+			expect(values).toContain(`./${nfdDirectory}/${nfdName}`);
+		});
+
+		it("keeps normalized directory completions stable across the directory cache", async () => {
+			fs.mkdirSync(path.join(baseDir, nfdDirectory));
+			fs.writeFileSync(path.join(baseDir, nfdDirectory, nfdName), "content\n");
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = `./${nfdDirectory.normalize("NFC")}/`;
+
+			const first = await provider.getForceFileSuggestions([line], 0, line.length);
+			const second = await provider.getForceFileSuggestions([line], 0, line.length);
+
+			expect(first?.items.map(item => item.value)).toEqual([`./${nfdDirectory}/${nfdName}`]);
+			expect(second?.items.map(item => item.value)).toEqual([`./${nfdDirectory}/${nfdName}`]);
+		});
+
+		it("preserves exact on-disk spelling across mixed NFC/NFD parent components", async () => {
+			const outerNfd = nfdDirectory;
+			const innerNfd = nfdName.slice(0, -4);
+			const childNfd = `${nfdDirectory}${innerNfd}.txt`;
+			const outerNfc = outerNfd.normalize("NFC");
+			const innerNfc = innerNfd.normalize("NFC");
+			const childNfc = childNfd.normalize("NFC");
+			fs.mkdirSync(path.join(baseDir, outerNfd, innerNfd), { recursive: true });
+			fs.writeFileSync(path.join(baseDir, outerNfd, innerNfd, childNfd), "content\n");
+
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = `./${outerNfc}/${innerNfc}/${childNfc}`;
+			const result = await provider.getForceFileSuggestions([line], 0, line.length);
+
+			expect(result?.items.map(item => item.value)).toEqual([`./${outerNfd}/${innerNfd}/${childNfd}`]);
+		});
+
+		it("stats symlink children relative to the resolved normalized parent", async () => {
+			const nfcParent = nfdDirectory.normalize("NFC");
+			const parentPath = path.join(baseDir, nfdDirectory);
+			const targetPath = path.join(baseDir, "symlink-target");
+			fs.mkdirSync(parentPath);
+			fs.mkdirSync(targetPath);
+			fs.writeFileSync(path.join(targetPath, "child.txt"), "content\n");
+			try {
+				fs.symlinkSync(targetPath, path.join(parentPath, "linked"), "dir");
+			} catch {
+				return;
+			}
+
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = `./${nfcParent}/lin`;
+			const result = await provider.getForceFileSuggestions([line], 0, line.length);
+
+			expect(result?.items.map(item => item.value)).toContain(`./${nfdDirectory}/linked/`);
+		});
+	});
+
+	describe("hangul chosung fuzzy matching", () => {
+		let baseDir: string;
+		const hangulName = "\uD55C\uAE00.txt";
+
+		beforeEach(() => {
+			baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "autocomplete-chosung-test-"));
+		});
+
+		afterEach(() => {
+			fs.rmSync(baseDir, { recursive: true, force: true });
+		});
+
+		it("matches syllable initials from a bare-consonant @ query", async () => {
+			fs.writeFileSync(path.join(baseDir, hangulName), "content\n");
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "@\u314E\u3131";
+			const result = await provider.getSuggestions([line], 0, line.length);
+			const values = result?.items.map(item => item.value) ?? [];
+			expect(values).toContain(`@${hangulName}`);
+		});
+
+		it("uses the same chosung fuzzy lane for explicit Tab", async () => {
+			await Bun.write(path.join(baseDir, hangulName), "content\n");
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "@\u314E\u3131";
+			const result = await provider.getForceFileSuggestions([line], 0, line.length);
+
+			expect(result?.prefix).toBe(line);
+			expect(result?.items.map(item => item.value)).toContain(`@${hangulName}`);
+		});
+
+		it("uses fuzzy contains matching for explicit Tab", async () => {
+			const filename = "project-story.md";
+			await Bun.write(path.join(baseDir, filename), "content\n");
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "@story";
+			const result = await provider.getForceFileSuggestions([line], 0, line.length);
+
+			expect(result?.prefix).toBe(line);
+			expect(result?.items.map(item => item.value)).toContain(`@${filename}`);
+		});
+
+		it("merges ignored prefix matches with fuzzy tracked siblings", async () => {
+			await Bun.write(path.join(baseDir, ".gitignore"), "story-ignored.md\nnode_modules/\n");
+			await Bun.write(path.join(baseDir, "story-ignored.md"), "ignored\n");
+			await Bun.write(path.join(baseDir, "story-tracked.md"), "tracked\n");
+			await Bun.$`git -C ${baseDir} init`.quiet();
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const result = await provider.getForceFileSuggestions(["@story"], 0, 6);
+
+			expect(result?.items.map(item => item.value)).toEqual(["@story-tracked.md", "@story-ignored.md"]);
+		});
+
+		it("keeps an exact file ahead of a fuzzy directory match", async () => {
+			await Bun.write(path.join(baseDir, "target"), "file\n");
+			await fsPromises.mkdir(path.join(baseDir, "target-dir"));
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const values =
+				(await provider.getForceFileSuggestions(["@target"], 0, 7))?.items.map(item => item.value) ?? [];
+
+			expect(values.indexOf("@target")).toBeGreaterThanOrEqual(0);
+			expect(values.indexOf("@target-dir/")).toBeGreaterThanOrEqual(0);
+			expect(values.indexOf("@target")).toBeLessThan(values.indexOf("@target-dir/"));
+		});
+
+		it("keeps node_modules exact prefix matches reachable from explicit Tab", async () => {
+			await fsPromises.mkdir(path.join(baseDir, "node_modules"), { recursive: true });
+			await Bun.write(path.join(baseDir, "node_modules", "package.json"), "{}\n");
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "@node_modules/pac";
+			const result = await provider.getForceFileSuggestions([line], 0, line.length);
+
+			expect(result?.items.map(item => item.value)).toContain("@node_modules/package.json");
+		});
+
+		it("matches chosung against NFD-stored file names", async () => {
+			const nfdName = "\u1112\u1161\u11AB\u1100\u1173\u11AF.txt";
+			fs.writeFileSync(path.join(baseDir, nfdName), "content\n");
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "@\u314E\u3131";
+			const result = await provider.getSuggestions([line], 0, line.length);
+			const values = result?.items.map(item => item.value) ?? [];
+			expect(values).toContain(`@${nfdName}`);
+		});
+
+		it("mixes chosung with full syllables in one query", async () => {
+			fs.writeFileSync(path.join(baseDir, hangulName), "content\n");
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "@\u314E\uAE00";
+			const result = await provider.getSuggestions([line], 0, line.length);
+			const values = result?.items.map(item => item.value) ?? [];
+			expect(values).toContain(`@${hangulName}`);
+		});
+
+		it("does not match syllables whose initials differ", async () => {
+			fs.writeFileSync(path.join(baseDir, hangulName), "content\n");
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "@\u3134\u3137";
+			const result = await provider.getSuggestions([line], 0, line.length);
+			const values = result?.items.map(item => item.value) ?? [];
+			expect(values).not.toContain(`@${hangulName}`);
+		});
+
+		it("ranks a literal jamo file name above a chosung match", async () => {
+			const literalName = "\u314E\u3131.txt";
+			fs.writeFileSync(path.join(baseDir, hangulName), "content\n");
+			fs.writeFileSync(path.join(baseDir, literalName), "content\n");
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "@\u314E\u3131";
+			const result = await provider.getSuggestions([line], 0, line.length);
+			const values = result?.items.map(item => item.value) ?? [];
+			expect(values.indexOf(`@${literalName}`)).toBeGreaterThanOrEqual(0);
+			expect(values.indexOf(`@${hangulName}`)).toBeGreaterThan(values.indexOf(`@${literalName}`));
+		});
+
+		it("keeps ascii fuzzy queries unaffected", async () => {
+			fs.writeFileSync(path.join(baseDir, "history-search.ts"), "content\n");
+			fs.writeFileSync(path.join(baseDir, hangulName), "content\n");
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "@histsr";
+			const result = await provider.getSuggestions([line], 0, line.length);
+			const values = result?.items.map(item => item.value) ?? [];
+			expect(values).toContain("@history-search.ts");
+			expect(values).not.toContain(`@${hangulName}`);
+		});
+
+		it("keeps separator-bearing chosung queries accepted by native fuzzy search", async () => {
+			fs.writeFileSync(path.join(baseDir, hangulName), "content\n");
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "@ㅎ-ㄱ";
+			const result = await provider.getSuggestions([line], 0, line.length);
+			const values = result?.items.map(item => item.value) ?? [];
+			expect(values).toContain(`@${hangulName}`);
 		});
 	});
 });
@@ -336,6 +591,28 @@ describe("trySyncSlashCompletion", () => {
 		// Both should be present; order depends on fuzzyScore internals
 		expect(modelIdx).not.toBe(-1);
 		expect(modeIdx).not.toBe(-1);
+	});
+
+	it("scores Hangul chosung slash-command matches", () => {
+		const provider = new CombinedAutocompleteProvider(
+			[{ name: "한글명령", description: "Korean command", value: "한글명령" }],
+			"/tmp",
+		);
+		const result = provider.trySyncSlashCompletion("/ㅎㄱ");
+		expect(result?.items.map(item => item.value)).toEqual(["한글명령"]);
+	});
+
+	it("normalizes separators and rejects unrelated commands for mixed Hangul queries", () => {
+		const provider = new CombinedAutocompleteProvider(
+			[
+				{ name: "한글명령", description: "Korean command", value: "한글명령" },
+				{ name: "model", description: "Switch model", value: "model" },
+			],
+			"/tmp",
+		);
+
+		expect(provider.trySyncSlashCompletion("/ㅎ-ㄱ")?.items.map(item => item.value)).toEqual(["한글명령"]);
+		expect(provider.trySyncSlashCompletion("/ㅎㄱ-model")).toBeNull();
 	});
 
 	it("matches case-insensitively", () => {

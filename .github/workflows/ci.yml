@@ -783,16 +783,19 @@ jobs:
                     fi
                     # npm is read-after-write eventually consistent: re-observe
                     # with bounded backoff until the sealed integrity is visible.
+                    # 0.15.4 proved 60s is not enough (agent-core became visible
+                    # only after the window elapsed, failing an otherwise clean
+                    # publish); allow up to 10 minutes.
                     attempt=0
                     while :; do
                        attempt=$((attempt + 1))
                        observed="$(npm view "${name}@${version}" dist.integrity --registry="$registry" 2>/dev/null || true)"
                        [ "$observed" = "$expected_sri" ] && break
-                       if [ "$attempt" -ge 12 ]; then
+                       if [ "$attempt" -ge 40 ]; then
                           echo "$name@$version did not become visible with the sealed integrity" >&2
                           exit 1
                        fi
-                       sleep 5
+                       sleep 15
                     done
                  fi
                  tagged="$(npm view "${name}@${npm_tag}" version --registry="$registry" 2>/dev/null || true)"

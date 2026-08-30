@@ -6,7 +6,7 @@ This document describes how the coding-agent currently loads models, applies ove
 
 Primary implementation files:
 
-- `src/config/model-registry.ts` — loads built-in + custom models, provider overrides, runtime discovery, auth integration
+- `src/config/model-registry.ts` — loads embedded + signed-registry + custom models, provider overrides, runtime discovery, auth integration
 - `src/config/model-resolver.ts` — parses model patterns and selects models for the default and agent roles
 - `src/config/settings-schema.ts` — model-related settings (`modelRoles`, provider transport preferences)
 - `src/session/auth-storage.ts` — API key + OAuth resolution order
@@ -211,7 +211,35 @@ The same presets are available inside the TUI:
 /provider add --preset commandcode-goat
 ```
 
-Presets only write `models.yml` entries that reference documented environment variable names (`MINIMAX_CODE_API_KEY`, `MINIMAX_CODE_CN_API_KEY`, `ZAI_API_KEY`, `ALIBABA_TOKEN_PLAN_API_KEY`, `CLINE_API_KEY`, or `CMD_API_KEY`); they do not store or validate real credentials. The GLM preset aliases (`glm`, `zai`, `z-ai`) write an OpenAI-compatible custom provider named `glm-proxy` and do not replace the first-class `zai` provider. The Alibaba Token Plan preset (aliases: `alibaba`, `token-plan`) writes an OpenAI-compatible custom provider named `alibaba-token-plan` with per-model API routing. The ClinePass preset (aliases: `clinepass`, `cline`) does not hardcode models: Cline's inference API has no working `/models` route, so GJC follows Cline's own catalog-generation source and fetches the live `cline-pass` provider catalog from `https://models.dev/api.json`. The Command Code GOAT preset (aliases: `commandcode`, `command-code`, `goat`) fetches its live `/provider/v1/models` catalog, routes every current or future `claude-*` model through Anthropic Messages, and routes other models through Chat Completions. Create the corresponding API key in the provider dashboard before inference; plan entitlement is enforced by the provider.
+Presets only write `models.yml` entries that reference documented environment variable names (`MINIMAX_CODE_API_KEY`, `MINIMAX_CODE_CN_API_KEY`, `ZAI_API_KEY`, `ALIBABA_TOKEN_PLAN_API_KEY`, `CLINE_API_KEY`, or `CMD_API_KEY`); they do not store or validate real credentials. The GLM preset aliases (`glm`, `zai`, `z-ai`) write an OpenAI-compatible custom provider named `glm-proxy` and do not replace the first-class `zai` provider. The Alibaba Token Plan preset (aliases: `alibaba`, `token-plan`) writes an OpenAI-compatible custom provider named `alibaba-token-plan` with per-model API routing. The ClinePass preset (aliases: `clinepass`, `cline`) does not hardcode models: Cline's inference API has no working `/models` route, so GJC follows Cline's own catalog-generation source and fetches the live `cline-pass` provider catalog from `https://models.dev/api.json`. The Command Code GOAT preset (aliases: `commandcode`, `command-code`, `goat`) fetches its live `/provider/v1/models` catalog, keeps every current or future model—including Claude-named IDs—on the provider's documented OpenAI-compatible `/chat/completions` transport, and requires a fixed harmless inference entitlement probe before login persistence. Create the corresponding API key in the provider dashboard before inference; plan entitlement is enforced by the provider.
+
+## Signed remote preset registry
+
+GJC ships its embedded model metadata and profiles as an immutable bootstrap fallback, then overlays a separately published signed registry before applying local configuration:
+
+1. embedded model presets and profiles
+2. the last accepted `Yeachan-Heo/gajae-code-presets` registry snapshot
+3. user `~/.gjc/agent/models.yml` entries and overrides
+
+Local user configuration always wins. Registry refresh never writes `models.yml`, and a failed, partial, oversized, incompatible, downgraded, equivocated, digest-mismatched, or untrusted update never replaces the active snapshot. Startup reads only the verified local cache and does not wait for network I/O; a delayed best-effort refresh runs at a bounded cadence. Offline cold starts use embedded data, while offline warm starts use the last-known-good accepted snapshot.
+
+The registry manifest is canonical JSON signed with a compiled Ed25519 trust root. Signatures are 64-byte Ed25519 values encoded as canonical RFC 4648 Base64; unused padding bits must be zero, so two encodings of the same signature cannot produce distinct anti-equivocation digests. The signed payload binds the monotonic revision, consumer-contract compatibility, immutable revision paths, exact byte counts, SHA-256 digests, source commit provenance, snapshot, profile data, and credential-free model metadata. GJC sends no cookies, authorization headers, API keys, or provider credentials when fetching it. Registry schemas do not permit endpoints, request headers, credentials, environment references, commands, scripts, or arbitrary executable content. Selectors, preset identifiers, display text, and context-promotion targets reject Unicode format controls. Registry provider IDs are slash-free (`[a-z0-9][a-z0-9._-]*`), matching profile `requiredProviders` and the first-slash selector boundary used at runtime.
+
+Administrative commands:
+
+```sh
+gjc models presets status [--json]
+gjc models presets refresh [--json]
+gjc models presets rollback <accepted-revision> [--json]
+gjc models presets pin <accepted-revision> [--json]
+gjc models presets unpin [--json]
+gjc models presets disable [--json]
+gjc models presets enable [--json]
+```
+
+`status` reports deterministic, credential-free provenance: active and highest-seen revisions, manifest/snapshot/profile/preset digests, signature key id, source GJC commit, accepted/published/check timestamps, retained removed entries, cache health, history, and pin/disable state. Rollback and pin can select only previously verified retained revisions; neither lowers the highest-seen anti-rollback floor, and selected generations are protected from bounded-history eviction. A rollback remains selected across background refreshes until another rollback/pin is chosen or `unpin` returns selection to the highest accepted revision. When a registry revision removes a profile, GJC retains that profile plus only the removed model metadata and dynamic-provider declarations it references so an existing default/current selection remains usable without unboundedly copying the whole prior catalog.
+
+The cache and control files live under `~/.gjc/agent/model-presets/` (respecting `GJC_CODING_AGENT_DIR`). Writes use an interprocess lock, file fsync, and atomic rename. POSIX filesystems also receive a parent-directory durability barrier; Windows does not expose an equivalent directory fsync through Bun/Node, so it retains the file-fsync + atomic-rename guarantee with weaker crash durability for the renamed directory entry. `GJC_MODEL_PRESET_REGISTRY_URL` may override the manifest URL only with credential-free HTTPS; the trust root cannot be replaced at runtime. `GJC_MODEL_PRESET_REGISTRY_DISABLED=1` provides a non-destructive environment disable.
 
 ## Model profiles (`--mpreset`)
 
@@ -268,7 +296,7 @@ Built-in profiles are grouped by provider mix and tier:
 - Alibaba Token Plan: `alibaba-token-plan-balanced` preserves the established Qwen/DeepSeek V4 Pro/GLM mix; `alibaba-token-plan-pro` raises execution and independent criticism with DeepSeek V4 Flash 0731 max and GLM xhigh; `alibaba-token-plan-qwenmaxxing` stays Qwen-only; `alibaba-token-plan-qwen-deepseek` keeps Qwen 3.8 Max (`qwen3.8-max`) on the expensive default (high)/architect (xhigh)/critic (xhigh) roles and spends DeepSeek V4 Flash 0731 on the cheap planner (max) and executor (high) roles; `alibaba-token-plan-glm-deepseek` does the same with GLM 5.2 (`glm-5.2`) as the expensive model
 - Combos: `opus-codex`, `codex-opencodego`, and `fable-opus-codex`
 
-GLM-5.3 always enables thinking and accepts only `low`, `high`, and `max`; `max` is the provider default and is recommended for coding. The GLM tiers preserve the former role ordering by collapsing `minimal`/`low` to `low`, `medium`/`high` to `high`, and `xhigh` to `max`.
+GLM-5.3 always enables thinking and accepts only `low`, `high`, and `max`; `max` is the provider default and is recommended for coding. The GLM tiers preserve the former role ordering by collapsing `minimal`/`low` to `low`, `medium`/`high` to `high`, and `xhigh` to `max`. GLM-5.3-Flash keeps the same text contract (per z.ai docs, its text parameters are consistent with GLM-5.3 with a 1M-token context window) and now backs the high-volume lanes of the GLM tiers: `glm-eco` runs default, executor, and planner on `glm-5.3-flash:low` while critic and architect stay on `glm-5.3:high`; `glm-medium` and `glm-pro` keep every role on `glm-5.3` except the executor, which uses `glm-5.3-flash:low` (Medium) and `glm-5.3-flash:high` (Pro).
 
 Gemini 3.7 Flash is bundled wherever Gemini 3.6 Flash already was (`google/gemini-3.7-flash`, `google-gemini-cli/gemini-3.7-flash`, Copilot, Antigravity effort variants, OpenCode Zen, OpenRouter, Vercel AI Gateway, Cursor, and the other 3.6 Flash gateways). First-class Google transports use `google-level` thinking and accept only `low`, `medium`, and `high`; `minimal` is rejected because the official Gemini API returns an error. Provider defaults stay on the existing Pro-class models.
 
@@ -732,10 +760,14 @@ Extensions can register providers at runtime (`pi.registerProvider(...)`), inclu
 When requesting a key for a provider, effective order is:
 
 1. Runtime override (CLI `--api-key`)
-2. Stored API key credential in `agent.db`
-3. Stored OAuth credential in `agent.db` (with refresh)
-4. Environment variable mapping (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc.)
-5. ModelRegistry fallback resolver (provider `apiKey` from `models.yml`, env-name-or-literal semantics)
+2. `models.yml` `providers.<name>.apiKey` literal pin
+3. Stored API key credential in `agent.db` (written by `auth login`)
+4. `models.yml` `providers.<name>.apiKeyEnv` indirection — a pointer to a key,
+   not a pinned value, so a stored login credential outranks it; it still
+   outranks stored OAuth credentials
+5. Stored OAuth credential in `agent.db` (with refresh)
+6. Environment variable mapping (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc.)
+7. ModelRegistry fallback resolver (provider `apiKey` from `models.yml`, env-name-or-literal semantics)
 
 `models.yml` `apiKey` behavior:
 

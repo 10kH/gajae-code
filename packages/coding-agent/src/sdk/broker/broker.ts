@@ -35,7 +35,7 @@ import {
 	executeLifecycle,
 	isCanonicalSessionId,
 	prepareSpawnChildHostLaunch,
-	validateBrokerModelPreset,
+	validateBrokerModelPresetSync,
 } from "./lifecycle";
 import {
 	type LifecycleDurableEffectsReceipt,
@@ -72,14 +72,16 @@ export interface BrokerSettings {
 	heartbeatTtlMs?: number;
 	/** Broker-owned migration policy. Client lifecycle frames cannot select it. */
 	resolveDirectoryMigration?: (_cwd: string) => Promise<DirectoryMigrationPolicy>;
-	/** Live-only, host-mediated capability verifier. It retains no request input. */
 	/** Exact managed-substrate authority. Tests inject an in-memory provider. */
 	spawnSubstrateProvider?: SpawnSubstrateProvider;
 	/** Ordered Q26 host control seam; production uses exact endpoint attachments. */
 	spawnPromptLayer?: SpawnPromptLayer;
+	/** Live-only, host-mediated capability verifier. It retains no request input. */
 	masterCapabilityVerifier?: MasterCapabilityVerifier;
 	/** Grace before an orphaned spawn child closes; schema-bounded in production. */
 	masterOrphanGraceMs?: number;
+	/** Host model resolver override for lifecycle tests and embedders. */
+	resolveModelPin?: SdkHostModelResolver;
 }
 
 type ResolvedBrokerSettings = {
@@ -1170,7 +1172,8 @@ export class Broker {
 	#completion!: Promise<void>;
 	#resolveCompletion!: () => void;
 	#rejectCompletion!: (error: unknown) => void;
-	readonly #resolveModelPin: SdkHostModelResolver;
+	#resolveModelPin: SdkHostModelResolver;
+	#ownsResolveModelPin: boolean;
 	constructor(settings: BrokerSettings) {
 		this.settings = {
 			agentDir: settings.agentDir,
@@ -1185,7 +1188,8 @@ export class Broker {
 		};
 		this.index = new SessionIndex(settings.agentDir);
 		this.ledger = new LifecycleLedger(settings.agentDir);
-		this.#resolveModelPin = createDefaultSdkHostModelResolver(this.settings.agentDir);
+		this.#ownsResolveModelPin = settings.resolveModelPin === undefined;
+		this.#resolveModelPin = settings.resolveModelPin ?? createDefaultSdkHostModelResolver(this.settings.agentDir);
 		if (!this.settings.masterCapabilityVerifier)
 			this.settings.masterCapabilityVerifier = createMasterCapabilityVerifier(this.index);
 		this.#spawnPromptLayer = settings.spawnPromptLayer ?? {
@@ -1262,7 +1266,7 @@ export class Broker {
 				// Validate the optional profile BEFORE any new durable claim or substrate
 				// effect. Generic lifecycle create validates it; spawn must do the same.
 				if (admission.modelPreset !== undefined) {
-					const validated = validateBrokerModelPreset(this.settings.agentDir, admission.modelPreset);
+					const validated = validateBrokerModelPresetSync(this.settings.agentDir, admission.modelPreset);
 					if (isBrokerResponse(validated)) return validated;
 					admission.modelPreset = validated;
 				}
@@ -2336,6 +2340,8 @@ export class Broker {
 			this.#resolveCompletion = completion.resolve;
 			this.#rejectCompletion = completion.reject;
 			this.#completionTask = null;
+			if (this.#ownsResolveModelPin)
+				this.#resolveModelPin = createDefaultSdkHostModelResolver(this.settings.agentDir);
 			// A drained queue refuses every later startup by design, so a restarted broker
 			// needs a new one or it would admit nothing for the rest of the process.
 			this.#startupAdmissions = new StartupAdmissionQueue(sdkHostStartupConcurrency());
@@ -2611,25 +2617,35 @@ export class Broker {
 		if (this.#heartbeatTimer) clearInterval(this.#heartbeatTimer);
 		this.#heartbeatTimer = null;
 		this.#completionTask = (async () => {
-			await this.#transport?.stop();
-			this.#transport = null;
-			if (mode === "lost-root")
-				await Promise.race([Promise.allSettled(this.#admitted), Bun.sleep(BROKER_SETTLEMENT_MS)]);
-			else await Promise.allSettled(this.#admitted);
-			this.#publication?.close();
-			this.#publication = null;
-			if (mode === "owned-root" && this.discovery?.ownerId === this.#owner) {
-				try {
-					const disk = JSON.parse(await fs.readFile(brokerDiscoveryPath(this.settings.agentDir), "utf8")) as {
-						ownerId?: string;
-					};
-					if (disk.ownerId === this.#owner) await fs.unlink(brokerDiscoveryPath(this.settings.agentDir));
-				} catch (e) {
-					if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+			try {
+				await this.#transport?.stop();
+				this.#transport = null;
+				if (mode === "lost-root")
+					await Promise.race([Promise.allSettled(this.#admitted), Bun.sleep(BROKER_SETTLEMENT_MS)]);
+				else await Promise.allSettled(this.#admitted);
+				this.#publication?.close();
+				this.#publication = null;
+				if (mode === "owned-root" && this.discovery?.ownerId === this.#owner) {
+					try {
+						const disk = JSON.parse(await fs.readFile(brokerDiscoveryPath(this.settings.agentDir), "utf8")) as {
+							ownerId?: string;
+						};
+						if (disk.ownerId === this.#owner) await fs.unlink(brokerDiscoveryPath(this.settings.agentDir));
+					} catch (e) {
+						if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+					}
+					await this.#releaseOwnedLock();
 				}
-				await this.#releaseOwnedLock();
+			} finally {
+				const disposeModelPin = this.#ownsResolveModelPin ? this.#resolveModelPin.dispose?.() : undefined;
+				if (mode === "lost-root" && disposeModelPin !== undefined) {
+					void disposeModelPin.catch(() => undefined);
+					await Promise.race([disposeModelPin, Bun.sleep(BROKER_SETTLEMENT_MS)]);
+				} else {
+					await disposeModelPin;
+				}
+				this.discovery = null;
 			}
-			this.discovery = null;
 		})();
 		void this.#completionTask.then(this.#resolveCompletion, this.#rejectCompletion);
 		return this.#completionTask;

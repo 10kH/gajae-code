@@ -10,7 +10,7 @@
  * `~/.gjc/auth-gateway.token`.
  *
  * To run: `bun --cwd packages/ai test test/auth-gateway-anthropic-caching.test.ts`
- * with the gateway live (`gjc auth-gateway serve` or pm2).
+ * with the gateway live (`gjc auth-gateway serve --provider=<provider>` or pm2).
  */
 import { describe, expect, it } from "bun:test";
 import { AUTH_GATEWAY_E2E_URL, checkAuthGatewayE2EAvailable } from "./helpers";
@@ -32,7 +32,7 @@ interface AnthropicResponse {
 
 const MODEL = Bun.env.GJC_E2E_ANTHROPIC_MODEL ?? "claude-sonnet-4-5";
 
-const gateway = await checkAuthGatewayE2EAvailable();
+const gateway = await checkAuthGatewayE2EAvailable({ provider: "anthropic", modelId: MODEL });
 
 // Build a system prompt that comfortably exceeds Anthropic's 1024-token cache
 // floor for Sonnet. Using a deterministic repeated paragraph so cache keys are

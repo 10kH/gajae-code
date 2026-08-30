@@ -11,17 +11,20 @@ const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
 const FILE_LINE_RANGE_RE = /^(?:L?\d+(?:[-+]L?\d+|-)?(?:,L?\d+(?:[-+]L?\d+|-)?)*|raw|conflicts)$/i;
 const FILE_LINE_RANGE_ONLY_RE = /^L?\d+(?:[-+]L?\d+|-)?(?:,L?\d+(?:[-+]L?\d+|-)?)*$/i;
 const FILE_RAW_ONLY_RE = /^raw$/i;
-// Schemes whose authority grammar is identifier-shaped and may therefore carry
-// a read selector immediately after the authority. Colons in a path, query, or
-// fragment remain part of the URL and are never considered selectors.
-const INTERNAL_SCHEMES_WITH_SELECTORS: Record<string, true> = {
+// Schemes whose authority grammar is identifier-shaped and cannot contain a
+// literal colon. Colons in a path, query, or fragment remain part of the URL
+// and are never considered selectors.
+const INTERNAL_SCHEMES_WITH_UNAMBIGUOUS_AUTHORITIES: Record<string, true> = {
 	agent: true,
 	artifact: true,
-	issue: true,
-	local: true,
 	memory: true,
-	gjc: true,
+	issue: true,
 	pr: true,
+};
+const INTERNAL_SCHEMES_WITH_SELECTORS: Record<string, true> = {
+	...INTERNAL_SCHEMES_WITH_UNAMBIGUOUS_AUTHORITIES,
+	gjc: true,
+	local: true,
 	rule: true,
 	skill: true,
 };
@@ -31,6 +34,18 @@ const TOP_LEVEL_INTERNAL_URL_PREFIXES = ["agent://", "artifact://", "rule://", "
 
 function normalizeUnicodeSpaces(str: string): string {
 	return str.replace(UNICODE_SPACES, " ");
+}
+
+function rawSkillPrefixForName(authority: string, skillName: string): string | undefined {
+	for (let index = 1; index < authority.length; index++) {
+		if (authority[index] !== ":") continue;
+		try {
+			if (decodeURIComponent(authority.slice(0, index)) === skillName) return authority.slice(0, index);
+		} catch {
+			return undefined;
+		}
+	}
+	return undefined;
 }
 
 function tryMacOSScreenshotPath(filePath: string): string {
@@ -149,12 +164,11 @@ export function splitPathAndSel(rawPath: string): { path: string; sel?: string }
 /**
  * Variant of {@link splitPathAndSel} for internal URLs (`scheme://...`).
  *
- * Artifact authorities are generated identifiers, so their complete tail is
- * unambiguously a selector and malformed selectors can be rejected before
- * resolving the artifact. Other resources may legitimately use colons in
- * their identities, so they only lose strict, recognized selector suffixes.
- * Skill authorities additionally use the active registry to distinguish a
- * skill name from its selector without making path-utils depend on skills.
+ * Selector-capable internal authorities use identifier-shaped resource names,
+ * so an authority-only `:<tail>` is an explicit read selector even when the
+ * selector is malformed. Skill authorities are the exception: namespaced
+ * skill names already contain a colon, so the active registry gets first
+ * refusal and the fallback recognizes a later colon as the selector boundary.
  */
 export function splitInternalUrlSel(
 	rawPath: string,
@@ -167,32 +181,66 @@ export function splitInternalUrlSel(
 
 	const schemeEnd = schemeMatch[0].length;
 	const authorityTerminator = rawPath.slice(schemeEnd).search(/[/?#]/);
-	if (authorityTerminator !== -1) return { path: rawPath };
-	const authority = rawPath.slice(schemeEnd);
+	const authorityEnd = authorityTerminator === -1 ? rawPath.length : schemeEnd + authorityTerminator;
+	const authority = rawPath.slice(schemeEnd, authorityEnd);
+	const authoritySuffix = rawPath.slice(authorityEnd);
 	const firstColon = authority.indexOf(":");
 	if (firstColon === -1) return { path: rawPath };
-
-	if (scheme === "artifact") {
-		return { path: rawPath.slice(0, schemeEnd + firstColon), sel: authority.slice(firstColon + 1) };
-	}
+	if (firstColon === 0) return { path: rawPath };
 
 	if (scheme === "skill") {
 		const activeSkillNames = options.activeSkillNames ?? [];
-		if (activeSkillNames.includes(authority)) return { path: rawPath };
-		const skillName = activeSkillNames
-			.filter(name => authority.startsWith(`${name}:`))
-			.sort((a, b) => b.length - a.length)[0];
-		if (skillName) {
+		let decodedAuthority: string | undefined;
+		try {
+			decodedAuthority = decodeURIComponent(authority);
+		} catch {
+			// Let the resolver report malformed URL encoding when no selector boundary
+			// can be established from the raw authority.
+		}
+		if (decodedAuthority !== undefined && activeSkillNames.includes(decodedAuthority)) return { path: rawPath };
+		const rawSkillPrefix = activeSkillNames
+			.map(name => ({ name, prefix: rawSkillPrefixForName(authority, name) }))
+			.filter(item => item.prefix !== undefined)
+			.sort((a, b) => b.name.length - a.name.length)[0]?.prefix;
+		if (rawSkillPrefix) {
 			return {
-				path: `${rawPath.slice(0, schemeEnd)}${skillName}`,
-				sel: authority.slice(skillName.length + 1),
+				path: `${rawPath.slice(0, schemeEnd)}${rawSkillPrefix}${authoritySuffix}`,
+				sel: authority.slice(rawSkillPrefix.length + 1),
 			};
 		}
+		const strict = splitPathAndSel(authority);
+		if (strict.sel !== undefined) {
+			return { path: `${rawPath.slice(0, schemeEnd)}${strict.path}${authoritySuffix}`, sel: strict.sel };
+		}
+		const firstTail = authority.slice(firstColon + 1);
+		if (FILE_LINE_RANGE_RE.test(firstTail)) {
+			return { path: `${rawPath.slice(0, schemeEnd + firstColon)}${authoritySuffix}`, sel: firstTail };
+		}
+		const selectorColon = authority.indexOf(":", firstColon + 1);
+		if (selectorColon === -1) return { path: rawPath };
+		return {
+			path: `${rawPath.slice(0, schemeEnd + selectorColon)}${authoritySuffix}`,
+			sel: authority.slice(selectorColon + 1),
+		};
 	}
 
-	const strict = splitPathAndSel(authority);
-	if (strict.sel === undefined) return { path: rawPath };
-	return { path: `${rawPath.slice(0, schemeEnd)}${strict.path}`, sel: strict.sel };
+	if (!INTERNAL_SCHEMES_WITH_UNAMBIGUOUS_AUTHORITIES[scheme]) {
+		// A path/query/fragment after a path-like authority makes a colon-bearing
+		// resource identity indistinguishable from an authority selector. Preserve
+		// the complete URL; path-like selectors are accepted only on authority-only
+		// URLs, where the existing strict grammar is the sole interpretation.
+		if (authoritySuffix !== "") return { path: rawPath };
+		const strict = splitPathAndSel(authority);
+		if (strict.sel !== undefined) {
+			return { path: `${rawPath.slice(0, schemeEnd)}${strict.path}`, sel: strict.sel };
+		}
+		return { path: rawPath };
+	}
+
+	return {
+		path: `${rawPath.slice(0, schemeEnd + firstColon)}${authoritySuffix}`,
+		sel: authority.slice(firstColon + 1),
+	};
 }
 
 function assertNotInternalUrl(expanded: string, original: string): void {

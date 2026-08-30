@@ -32,6 +32,34 @@ directory).
 every indexed session into the versioned row DTO (`SESSION_ROWS_VERSION`). Each
 row is credential-free and carries:
 
+The list is fully paginated before scope filtering. By default its effective
+scope is `repo`. Select a scope with:
+
+```sh
+gjc sdk session list --scope repo|cwd|worktree|all [--repo <path>]
+```
+
+`--repo` is the selected workspace path and defaults to the process cwd. The
+result reports the effective `scope` and a bounded credential-free `selection`
+descriptor containing the canonical selected path and, for Git selections,
+the canonical worktree root and Git common directory.
+
+- `repo` matches the canonical Git common directory, so the main checkout and
+  linked worktrees are included while another repository is excluded.
+- `worktree` matches only the selected path's canonical containing worktree.
+- `cwd` matches only the exact canonical selected workspace; nested directories
+  do not match.
+- `all` preserves the complete unfiltered Broker listing.
+
+For a path outside Git, `repo` and `worktree` fail with the typed
+`not_a_repository` operational error and an actionable suggestion to use
+`cwd` or `all`; they never broaden the result. `cwd` remains available for an
+exact canonical path match. Unreadable or removed row workspaces are excluded
+from Git scopes deterministically and reported in `warnings`.
+
+The raw global `session.list` route remains unfiltered, and `inspect`, `send`,
+`status`, `tail`, `retire`, and raw control/query behavior is unchanged.
+
 - `sessionId` and the `locator` (`cwd`, `worktreeRoot`, `stateRoot`), where `cwd`
   is the canonical workspace directory and `worktreeRoot` is the canonical Git
   worktree root or `null` outside a worktree;

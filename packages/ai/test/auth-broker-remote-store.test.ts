@@ -12,6 +12,7 @@ import {
 	SqliteAuthCredentialStore,
 	startAuthBroker,
 } from "../src";
+import * as oauthUtils from "../src/utils/oauth";
 
 const ANTHROPIC_ENV = ["ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN"] as const;
 const savedEnv: Partial<Record<(typeof ANTHROPIC_ENV)[number], string | undefined>> = {};
@@ -128,7 +129,7 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 		expect(remote.listCredentialInventory("anthropic")).toEqual(
 			expect.arrayContaining([
 				expect.objectContaining({ id: activeId, disabled: false }),
-				expect.objectContaining({ id: disabledId, disabled: true, disabledCause: "revoked in test" }),
+				expect.objectContaining({ id: disabledId, disabled: true, disabledCause: "disabled via auth-broker" }),
 			]),
 		);
 		for (const row of remote.listCredentialInventory()) expect(row).not.toHaveProperty("credential");
@@ -196,6 +197,171 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 		expect(remote.snapshot.credentials[0]!.id).not.toBe(staleEntry.id);
 	});
 
+	test("reconciles a successful broker refresh into the remote snapshot", async () => {
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		remote = new RemoteAuthCredentialStore({ client, streamSnapshots: false });
+		await remote.refreshSnapshot();
+		const initialEntry = remote.snapshot.credentials[0]!;
+		expect(initialEntry.credential.type).toBe("oauth");
+		if (initialEntry.credential.type !== "oauth") throw new Error("expected OAuth credential");
+		const initialGeneration = remote.snapshot.generation;
+		const rotatedExpires = Date.now() + 120_000;
+		const refreshSpy = vi
+			.spyOn(oauthUtils, "refreshOAuthToken")
+			.mockImplementation(async (_provider, credential) => ({
+				...credential,
+				access: "access-broker-rotated",
+				refresh: "refresh-broker-rotated",
+				expires: rotatedExpires,
+			}));
+
+		const refreshed = await remote.refreshOAuthCredential("anthropic", initialEntry.id, initialEntry.credential);
+
+		expect(refreshSpy).toHaveBeenCalledTimes(1);
+		expect(refreshed).toMatchObject({
+			access: "access-broker-rotated",
+			refresh: REMOTE_REFRESH_SENTINEL,
+			expires: rotatedExpires,
+			accountId: "account-a",
+			email: "a@example.com",
+		});
+		expect(remote.snapshot.generation).toBeGreaterThan(initialGeneration);
+		expect(remote.snapshot.credentials).toEqual([
+			expect.objectContaining({
+				id: initialEntry.id,
+				provider: "anthropic",
+				credential: expect.objectContaining({
+					type: "oauth",
+					access: "access-broker-rotated",
+					refresh: REMOTE_REFRESH_SENTINEL,
+				}),
+			}),
+		]);
+		const authoritative = store!.listAuthCredentials("anthropic");
+		expect(authoritative).toHaveLength(1);
+		expect(authoritative[0]?.credential).toMatchObject({
+			type: "oauth",
+			access: "access-broker-rotated",
+			refresh: "refresh-broker-rotated",
+		});
+	});
+
+	test("preserves a broker refresh error when reconciliation reload fails, then recovers on a later reload", async () => {
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		remote = new RemoteAuthCredentialStore({ client, streamSnapshots: false });
+		await remote.refreshSnapshot();
+		const staleEntry = remote.snapshot.credentials[0]!;
+		expect(staleEntry.credential.type).toBe("oauth");
+		if (staleEntry.credential.type !== "oauth") throw new Error("expected OAuth credential");
+
+		const originalAuthError = new AuthBrokerError("Auth broker request failed: 404 Not Found", {
+			status: 404,
+			body: `No credential with id=${staleEntry.id}`,
+		});
+		const reconciliationError = new Error("snapshot reload failed during recovery");
+		const refreshCredentialSpy = vi.spyOn(client, "refreshCredential").mockRejectedValueOnce(originalAuthError);
+		const refreshSnapshotSpy = vi.spyOn(remote, "refreshSnapshot").mockRejectedValueOnce(reconciliationError);
+
+		const failed = await remote.refreshOAuthCredential("anthropic", staleEntry.id, staleEntry.credential).then(
+			() => undefined,
+			error => error,
+		);
+		expect(failed).toBe(originalAuthError);
+		expect(refreshCredentialSpy).toHaveBeenCalledTimes(1);
+		expect(refreshSnapshotSpy).toHaveBeenCalledTimes(1);
+
+		// The failed reconciliation must not strand the remote mirror: broker
+		// authority can still replace the stale row and a later reload recovers it.
+		expect(storage!.disableCredentialById(staleEntry.id, "replaced in test")).toBe(true);
+		storage!.upsertCredential("anthropic", mintOAuthCredential("recovered", Date.now() + 120_000));
+		refreshSnapshotSpy.mockRestore();
+		await remote.refreshSnapshot();
+		await remote.syncInventoryMetadata();
+
+		expect(remote.snapshot.credentials).toHaveLength(1);
+		expect(remote.snapshot.credentials[0]?.id).not.toBe(staleEntry.id);
+		expect(remote.snapshot.credentials[0]?.credential).toMatchObject({
+			type: "oauth",
+			access: "access-recovered",
+			refresh: REMOTE_REFRESH_SENTINEL,
+		});
+		expect(remote.listCredentialInventory("anthropic")).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					id: staleEntry.id,
+					provider: "anthropic",
+					disabled: true,
+					disabledCause: "disabled via auth-broker",
+				}),
+				expect.objectContaining({
+					provider: "anthropic",
+					identityLabel: "recovered@example.com",
+					disabled: false,
+				}),
+			]),
+		);
+	});
+
+	test("disables a remotely-invalid OAuth row through the broker and falls back", async () => {
+		// Keep the revoked row first so the initial round-robin selection attempts
+		// it before the healthy sibling. The client only has a redacted refresh
+		// sentinel; the broker remains the sole mutation authority.
+		store!.saveOAuth("anthropic", mintOAuthCredential("fallback", Date.now() + 120_000));
+		await storage!.reload();
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		const initial = await client.fetchSnapshot();
+		if (initial.status !== 200) throw new Error("expected snapshot");
+		remote = new RemoteAuthCredentialStore({ client, initialSnapshot: initial.snapshot, streamSnapshots: false });
+		const clientStorage = new AuthStorage(remote, { rankingStrategyResolver: () => undefined });
+		await clientStorage.reload();
+		const disableSpy = vi.spyOn(client, "disableCredential");
+		const refreshSpy = vi.spyOn(oauthUtils, "refreshOAuthToken").mockImplementation(async (_provider, credential) => {
+			if (credential.refresh === "refresh-a") {
+				throw new Error('HTTP 400 invalid_grant {"error":"invalid_grant"}');
+			}
+			return {
+				...credential,
+				access: "access-fallback-rotated",
+				refresh: "refresh-fallback-rotated",
+				expires: Date.now() + 120_000,
+			};
+		});
+
+		try {
+			const apiKey = await clientStorage.getApiKey("anthropic");
+			expect(apiKey).toBe("access-fallback");
+			expect(disableSpy).toHaveBeenCalledTimes(1);
+			expect(disableSpy.mock.calls[0]?.[0]).toBe(initial.snapshot.credentials[0]?.id);
+			expect(disableSpy.mock.calls[0]?.[1]).toContain("invalid_grant");
+			expect(refreshSpy).toHaveBeenCalledTimes(2);
+
+			const active = store!.listAuthCredentials("anthropic");
+			expect(active).toHaveLength(1);
+			expect(active[0]?.credential).toMatchObject({ access: "access-fallback" });
+			const inventory = store!.listCredentialInventory("anthropic");
+			expect(inventory).toHaveLength(2);
+			expect(inventory).toEqual([
+				expect.objectContaining({
+					id: initial.snapshot.credentials[0]?.id,
+					provider: "anthropic",
+					credentialKind: "oauth",
+					disabled: true,
+					disabledCause: "disabled via auth-broker",
+				}),
+				expect.objectContaining({
+					provider: "anthropic",
+					credentialKind: "oauth",
+					disabled: false,
+					accountId: "account-fallback",
+					email: "fallback@example.com",
+				}),
+			]);
+			expect(remote.snapshot.credentials).toHaveLength(1);
+		} finally {
+			clientStorage.close();
+		}
+	});
+
 	test("records aggregate usage only for the current snapshot generation", async () => {
 		const client = new AuthBrokerClient({ url: handle!.url, token });
 		remote = new RemoteAuthCredentialStore({ client, streamSnapshots: false });
@@ -213,6 +379,49 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 		storage!.disableCredentialById(entry.id, "removed in test");
 		await remote.refreshSnapshot();
 		expect(remote.peekCachedUsagePresentation(entry.provider as never, entry.id)).toBeUndefined();
+	});
+
+	test("does not let an obsolete scoped usage flight delete its replacement", async () => {
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		remote = new RemoteAuthCredentialStore({ client, streamSnapshots: false });
+		await remote.refreshSnapshot();
+
+		const first = Promise.withResolvers<{ generatedAt: number; reports: [] }>();
+		const second = Promise.withResolvers<{ generatedAt: number; reports: [] }>();
+		const fetchUsage = vi.spyOn(client, "fetchUsage").mockImplementation((_signal, provider) => {
+			if (provider !== "anthropic") throw new Error("expected scoped usage fetch");
+			return (fetchUsage.mock.calls.length === 1 ? first.promise : second.promise) as never;
+		});
+
+		const firstRequest = remote.fetchUsageReportsForProvider("anthropic" as never);
+		expect(fetchUsage).toHaveBeenCalledTimes(1);
+		// This is the same invalidation path used when a snapshot generation
+		// changes. A second request must be allowed to install its own flight.
+		remote.deleteCachePrefix("usage_cache:");
+		const secondRequest = remote.fetchUsageReportsForProvider("anthropic" as never);
+		expect(fetchUsage).toHaveBeenCalledTimes(2);
+
+		first.resolve({ generatedAt: Date.now(), reports: [] });
+		await firstRequest;
+		// The first promise has settled, but the replacement remains coalesced.
+		expect(fetchUsage).toHaveBeenCalledTimes(2);
+		second.resolve({ generatedAt: Date.now(), reports: [] });
+		await secondRequest;
+		await remote.fetchUsageReportsForProvider("anthropic" as never);
+		expect(fetchUsage).toHaveBeenCalledTimes(2);
+	});
+
+	test("degrades ordinary scoped usage failures to a null report", async () => {
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		remote = new RemoteAuthCredentialStore({ client, streamSnapshots: false });
+		await remote.refreshSnapshot();
+		const fetchUsage = vi
+			.spyOn(client, "fetchUsage")
+			.mockRejectedValue(new Error("broker usage unavailable: secret"));
+
+		await expect(remote.fetchUsageReportsForProvider("anthropic" as never)).resolves.toBeNull();
+		await expect(remote.fetchUsageReportsForProvider("anthropic" as never)).resolves.toBeNull();
+		expect(fetchUsage).toHaveBeenCalledTimes(1);
 	});
 
 	test("hydrates metadata and durable health/usage presentations for one-shot consumers", async () => {

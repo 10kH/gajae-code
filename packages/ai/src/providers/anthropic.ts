@@ -2143,6 +2143,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				const idleTimeoutAbortError = new Error("Anthropic stream stalled while waiting for the next event");
 				const { requestSignal } = activeAbortTracker;
 				setRawRequestDump(params);
+				options?.onStreamCreated?.();
 				const anthropicRequest = client.messages.create(
 					{ ...params, stream: true },
 					{
@@ -2616,6 +2617,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					}
 					if (
 						!options?.fallbackManaged &&
+						!options?.disableProviderRetries &&
 						!disableStrictTools &&
 						firstTokenTime === undefined &&
 						hasStrictAnthropicTools(params) &&
@@ -2636,6 +2638,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						!droppedForcedToolChoice &&
 						firstTokenTime === undefined &&
 						!options?.fallbackManaged &&
+						!options?.disableProviderRetries &&
 						isSentForcedAnthropicToolChoice(params.tool_choice) &&
 						isForcedToolChoiceUnsupportedError(streamFailure, true)
 					) {
@@ -2667,6 +2670,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					const maskedProxyRejection = isAnthropicMaskedProxyRejection(streamFailure);
 					if (
 						!options?.fallbackManaged &&
+						!options?.disableProviderRetries &&
 						thinkingReplayRepairScope === "none" &&
 						thinkingReplayRepairAttempts < ANTHROPIC_MAX_THINKING_REPAIRS &&
 						firstTokenTime === undefined &&
@@ -2804,6 +2808,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					}
 					if (
 						!options?.fallbackManaged &&
+						!options?.disableProviderRetries &&
 						!dropFastMode &&
 						resolveServiceTier(options?.serviceTier, model.provider) === "priority" &&
 						firstTokenTime === undefined &&
@@ -2825,6 +2830,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					}
 					if (
 						!options?.fallbackManaged &&
+						!options?.disableProviderRetries &&
 						generatedCacheBudget > 0 &&
 						firstTokenTime === undefined &&
 						isAnthropicCacheBreakpointOverflowError(streamFailure)
@@ -2862,7 +2868,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					// Anthropic and non-CPA proxies are untouched.
 					const cpaAliasFailure = parseCpaToolAliasRestoreFailure(streamFailure);
 					if (cpaAliasFailure && firstTokenTime === undefined) {
-						if (options?.fallbackManaged) {
+						if (options?.fallbackManaged || options?.disableProviderRetries) {
 							// The managed fallback controller owns retries: never retry
 							// inside the attempt it handed us. Record the corrective
 							// steering against this exact turn and surface the raw error;

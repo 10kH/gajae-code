@@ -844,6 +844,7 @@ async function openInitialCodexEventStream(
 	if (websocketState && shouldUseCodexWebSocket(model, websocketState, options?.preferWebsockets)) {
 		const websocketRetryBudget = getCodexWebSocketRetryBudget(options);
 		let websocketRetries = 0;
+		let lastWebsocketError: Error | undefined;
 		while (true) {
 			try {
 				return await openCodexWebSocketTransport(
@@ -855,6 +856,7 @@ async function openInitialCodexEventStream(
 				);
 			} catch (error) {
 				const websocketError = error instanceof Error ? error : new Error(String(error));
+				lastWebsocketError = websocketError;
 				const isFatal = isCodexWebSocketFatalError(websocketError);
 				const activateFallback = isFatal || websocketRetries >= websocketRetryBudget;
 				recordCodexWebSocketFailure(websocketState, activateFallback);
@@ -874,6 +876,9 @@ async function openInitialCodexEventStream(
 				}
 				break;
 			}
+		}
+		if (options?.fallbackManaged || options?.disableProviderRetries) {
+			throw lastWebsocketError ?? new Error("Codex websocket transport failed");
 		}
 	}
 	return openCodexSseTransport(model, requestContext, requestSetup, options, websocketState, transformedBody);
@@ -1571,6 +1576,8 @@ function handleOutputItemDone(
 			arguments: terminalArguments as Record<string, unknown>,
 		};
 		captureUnicodeEscapeEvidence(toolCall, item.arguments);
+		delete runtime.currentBlock.escapedNonAsciiArguments;
+		delete runtime.currentBlock.escapedUnicodeArgumentEvidence;
 		Object.assign(runtime.currentBlock, toolCall);
 		captureUnicodeEscapeEvidence(runtime.currentBlock, item.arguments);
 		delete (runtime.currentBlock as { partialJson?: string }).partialJson;
@@ -1625,6 +1632,8 @@ function handleOutputItemDone(
 			arguments: { input: terminalInput },
 			customWireName: item.name,
 		};
+		delete runtime.currentBlock.escapedNonAsciiArguments;
+		delete runtime.currentBlock.escapedUnicodeArgumentEvidence;
 		Object.assign(runtime.currentBlock, toolCall);
 		delete (runtime.currentBlock as { partialJson?: string }).partialJson;
 		delete (runtime.currentBlock as { doneInput?: string }).doneInput;
@@ -1735,6 +1744,7 @@ async function tryRetryWithoutForcedToolChoice(
 ): Promise<boolean> {
 	if (
 		context.options?.fallbackManaged ||
+		context.options?.disableProviderRetries ||
 		runtime.toolChoiceFallbackAttempted ||
 		context.output.content.length > 0 ||
 		context.firstTokenTime !== undefined ||
@@ -1838,7 +1848,8 @@ async function tryReconnectCodexWebSocketOnConnectionLimit(
 		!websocketState ||
 		runtime.transport !== "websocket" ||
 		context.options?.signal?.aborted ||
-		context.options?.fallbackManaged
+		context.options?.fallbackManaged ||
+		context.options?.disableProviderRetries
 	) {
 		return false;
 	}
@@ -1901,6 +1912,7 @@ async function tryRecoverCodexPreviousResponseNotFound(
 		runtime.previousResponseRecoveryAttempted ||
 		!websocketState ||
 		context.options?.fallbackManaged ||
+		context.options?.disableProviderRetries ||
 		runtime.transport !== "websocket" ||
 		context.output.content.length > 0 ||
 		context.options?.signal?.aborted ||
@@ -1941,7 +1953,8 @@ async function tryReplayWebsocketFailureOverSse(
 		runtime.canSafelyReplayWebsocketOverSse &&
 		!runtime.sawTerminalEvent &&
 		!context.options?.signal?.aborted &&
-		!context.options?.fallbackManaged;
+		!context.options?.fallbackManaged &&
+		!context.options?.disableProviderRetries;
 	if (!canReplay) return false;
 
 	const state = websocketState;
@@ -1995,7 +2008,8 @@ async function tryRetryCodexProviderError(
 		context.output.content.length > 0 ||
 		runtime.providerRetryAttempt >= resolveRetryBudget(context.options?.streamMaxRetries, CODEX_MAX_RETRIES) ||
 		context.options?.signal?.aborted ||
-		context.options?.fallbackManaged
+		context.options?.fallbackManaged ||
+		context.options?.disableProviderRetries
 	) {
 		return false;
 	}
@@ -2115,7 +2129,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 			try {
 				initialTransport = await openInitialCodexEventStream(model, streamOptions, requestSetup, requestContext);
 			} catch (error) {
-				if (streamOptions.fallbackManaged) throw error;
+				if (streamOptions.fallbackManaged || streamOptions.disableProviderRetries) throw error;
 				initialTransport = await retryCodexInitialTransportWithoutToolChoice(
 					model,
 					streamOptions,
@@ -2629,6 +2643,7 @@ class CodexWebSocketConnection {
 		signal?: AbortSignal,
 		firstEventTimeoutMs?: number,
 		idleTimeoutMs = this.#idleTimeoutMs,
+		onStreamCreated?: () => void,
 	): AsyncGenerator<Record<string, unknown>> {
 		if (!this.#socket || this.#socket.readyState !== WebSocket.OPEN) {
 			throw createCodexWebSocketTransportError("websocket connection is unavailable");
@@ -2650,6 +2665,7 @@ class CodexWebSocketConnection {
 		}
 
 		try {
+			onStreamCreated?.();
 			this.#socket.send(JSON.stringify(request));
 			let sawFirstProgress = false;
 			const startedAt = Date.now();
@@ -2791,7 +2807,7 @@ async function openCodexSseEventStream(
 	signal?: AbortSignal,
 	onSseEvent?: OpenAICodexResponsesOptions["onSseEvent"],
 	fetchOverride?: FetchImpl,
-	options?: Pick<OpenAICodexResponsesOptions, "requestMaxRetries">,
+	options?: Pick<OpenAICodexResponsesOptions, "requestMaxRetries" | "onStreamCreated">,
 ): Promise<AsyncGenerator<Record<string, unknown>>> {
 	const headers = createCodexHeaders(requestHeaders, accountId, apiKey, sessionId, "sse", state);
 	logCodexDebug("codex request", {
@@ -2801,6 +2817,7 @@ async function openCodexSseEventStream(
 		sentTurnStateHeader: headers.has(X_CODEX_TURN_STATE_HEADER),
 		sentModelsEtagHeader: headers.has(X_MODELS_ETAG_HEADER),
 	});
+	options?.onStreamCreated?.();
 	const response = await fetchWithRetry(url, {
 		method: "POST",
 		headers,
@@ -2841,7 +2858,7 @@ async function openCodexWebSocketEventStream(
 	request: Record<string, unknown>,
 	state: CodexWebSocketSessionState,
 	signal?: AbortSignal,
-	options?: Pick<OpenAICodexResponsesOptions, "streamFirstEventTimeoutMs" | "streamIdleTimeoutMs">,
+	options?: Pick<OpenAICodexResponsesOptions, "streamFirstEventTimeoutMs" | "streamIdleTimeoutMs" | "onStreamCreated">,
 	firstEventTimeoutMs?: number,
 ): Promise<AsyncGenerator<Record<string, unknown>>> {
 	const connection = await getOrCreateCodexWebSocketConnection(state, url, headers, signal, options);
@@ -2850,6 +2867,7 @@ async function openCodexWebSocketEventStream(
 		signal,
 		firstEventTimeoutMs,
 		getCodexWebSocketIdleTimeoutMs(options?.streamIdleTimeoutMs),
+		options?.onStreamCreated,
 	);
 }
 

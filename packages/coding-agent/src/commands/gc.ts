@@ -20,6 +20,11 @@ function resolveDiskPolicyFromSettings(): Partial<GcDiskPolicy> | undefined {
 export default class Gc extends Command {
 	static description = "Garbage-collect stale GJC session/PID records (dry-run by default)";
 	static strict = false;
+	// The hand parser in gc-runtime owns the real syntax (repeatable space-form
+	// operands, dash-prefix rejection, orphan-operand rules); delegate help so the
+	// public output is the authoritative gcHelpText() instead of generic flag
+	// metadata that would advertise unsupported `--flag=<value>` forms.
+	static delegateHelp = true;
 	static flags = {
 		json: Flags.boolean({ char: "j", description: "Emit machine-readable JSON", default: false }),
 		prune: Flags.boolean({ description: "Remove stale records (default: report only)", default: false }),
@@ -33,6 +38,18 @@ export default class Gc extends Command {
 			description: "Quarantine a corrupt session-index suffix and retain its valid prefix",
 			default: false,
 		}),
+		"empty-delete-receipts": Flags.boolean({
+			description: "Report (and with --prune, prune) empty .gjc-delete-* receipts under --root/--manifest",
+			default: false,
+		}),
+		root: Flags.string({
+			description: "Operand root for --empty-delete-receipts (repeatable)",
+			multiple: true,
+		}),
+		manifest: Flags.string({
+			description: 'JSON {"roots":[...]} file for --empty-delete-receipts (repeatable)',
+			multiple: true,
+		}),
 	};
 
 	static examples = [
@@ -44,6 +61,8 @@ export default class Gc extends Command {
 		"gjc gc --disk --json",
 		"gjc gc --disk --prune",
 		"gjc gc --repair-session-index --json",
+		"gjc gc --empty-delete-receipts --root ~/.gjc/agent/session-states",
+		"gjc gc --empty-delete-receipts --manifest receipts-manifest.json --prune --json",
 	];
 
 	async run(): Promise<void> {
