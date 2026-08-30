@@ -2468,6 +2468,32 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 										if (!opened.isDirectory()) {
 											throw new Error(`Directory does not exist or is not a directory: ${resolvedPath}`);
 										}
+										const revalidatedFrom = await fs.realpath(from);
+										const revalidatedTarget = await fs.realpath(resolvedPath);
+										const revalidatedRelative = path.relative(revalidatedFrom, revalidatedTarget);
+										if (
+											revalidatedFrom !== canonicalFrom ||
+											revalidatedTarget !== canonicalTarget ||
+											revalidatedRelative === "" ||
+											revalidatedRelative === ".." ||
+											revalidatedRelative.startsWith(`..${path.sep}`) ||
+											path.isAbsolute(revalidatedRelative)
+										) {
+											throw new Error(
+												`Directory identity changed during confinement validation: ${resolvedPath}`,
+											);
+										}
+										const named = await fs.lstat(revalidatedTarget, { bigint: true });
+										if (
+											!named.isDirectory() ||
+											named.isSymbolicLink() ||
+											named.dev !== opened.dev ||
+											named.ino !== opened.ino
+										) {
+											throw new Error(
+												`Directory identity changed during confinement validation: ${resolvedPath}`,
+											);
+										}
 										expectedIdentity = { dev: opened.dev, ino: opened.ino };
 										await fs.access(canonicalTarget, nodeFs.constants.R_OK | nodeFs.constants.X_OK);
 									} catch (error) {

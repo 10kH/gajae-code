@@ -874,6 +874,40 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 		}
 	});
 
+	it("rejects an ancestor replaced after canonical descendant validation", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const parent = path.join(cwdA, "parent");
+		const parkedParent = path.join(cwdA, "parent-original");
+		const target = path.join(parent, "repo");
+		const outsideParent = path.join(tempDir, "outside-parent");
+		const outsideTarget = path.join(outsideParent, "repo");
+		fs.mkdirSync(target, { recursive: true });
+		fs.mkdirSync(outsideTarget, { recursive: true });
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"] });
+		const originalOpen = SessionManager.openNoFollowDirectory;
+		let swapped = false;
+		const openSpy = spyOn(SessionManager, "openNoFollowDirectory").mockImplementation(async dir => {
+			if (!swapped) {
+				swapped = true;
+				fs.renameSync(parent, parkedParent);
+				fs.symlinkSync(outsideParent, parent);
+			}
+			return await originalOpen.call(SessionManager, dir);
+		});
+		try {
+			await expect(
+				session.getToolByName("move_session")!.execute("move-ancestor-swap", { path: "parent/repo" }),
+			).rejects.toThrow(/identity changed|identity or access unavailable/);
+			expect(sessionManager.getCwd()).toBe(cwdA);
+		} finally {
+			openSpy.mockRestore();
+			await session.dispose();
+		}
+	}, 20_000);
+
 	it("treats a direct manager symlink alias of the current cwd as the same physical directory", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
