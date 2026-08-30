@@ -8390,6 +8390,8 @@ export class AgentSession {
 	dispose(): Promise<void> {
 		this.#evalExecutionDisposing = true;
 		if (this.#disposePromise) return this.#disposePromise;
+		const { promise, resolve, reject } = Promise.withResolvers<void>();
+		this.#disposePromise = promise;
 		this.#abortAdmissionEpoch++;
 		this.#isDisposed = true;
 		this.#disposeAdmissionClosed = this.#closeSessionAdmission();
@@ -8401,8 +8403,6 @@ export class AgentSession {
 		this.agent.abort();
 		this.agent.setMainAttemptScopeObserver(undefined);
 		this.#disconnectFromAgent();
-		const { promise, resolve, reject } = Promise.withResolvers<void>();
-		this.#disposePromise = promise;
 		void this.#dispose().then(resolve, reject);
 		return promise;
 	}
