@@ -8388,16 +8388,22 @@ export class AgentSession {
 		if (this.#disposePromise) return this.#disposePromise;
 		this.#abortAdmissionEpoch++;
 		this.#isDisposed = true;
+		this.abortRetry();
+		this.#quarantineAgentRunResources();
 		const { promise, resolve, reject } = Promise.withResolvers<void>();
 		this.#disposePromise = promise;
 		void this.#dispose().then(resolve, reject);
 		return promise;
 	}
 
+	/** Cancel the active logical run domain, including managed continuations detached from Agent's active attempt. */
+	#quarantineAgentRunResources(): void {
+		const resourceRunId = this.agent.currentManagedLogicalRunId ?? this.agent.activeResourceRunId;
+		if (resourceRunId !== undefined) this.agent.resourceLedger.quarantine(String(resourceRunId));
+	}
+
 	async #dispose(): Promise<void> {
 		await this.sessionManager.joinCwdTransition();
-		const managedLogicalRunId = this.agent.currentManagedLogicalRunId;
-		const activeResourceRunId = this.agent.activeResourceRunId;
 		const admissionClosed = this.#closeSessionAdmission();
 		// Reject new direct Python starts as soon as disposal begins (synchronously,
 		// before any await) so callers cannot race a start against teardown.
@@ -8409,11 +8415,7 @@ export class AgentSession {
 		// #waitForPostPromptRecovery can keep its admission lease forever while
 		// teardown waits for that same lease to settle.
 		this.abortRetry();
-		// A managed attempt clears Agent's active run before invoking its continuation.
-		// Quarantine that logical resource domain as well, so a continuation that is
-		// already between attempts observes disposal through its ownership signal.
-		const teardownResourceRunId = managedLogicalRunId ?? activeResourceRunId;
-		if (teardownResourceRunId !== undefined) this.agent.resourceLedger.quarantine(String(teardownResourceRunId));
+		this.#quarantineAgentRunResources();
 		this.agent.abort();
 		this.agent.setMainAttemptScopeObserver(undefined);
 		// Disconnect the Agent event bridge NOW — before the maintenance join and the
@@ -20619,8 +20621,9 @@ export class AgentSession {
 
 			if (managedOutcome) {
 				try {
+					if (retryCancelled() || ownershipCancelled()) return;
 					await this.#checkEstimatedContextBeforePrompt();
-					if (ownershipCancelled()) {
+					if (retryCancelled() || ownershipCancelled()) {
 						const attempt = this.#retryAttempt;
 						this.#retryAttempt = 0;
 						await this.#emitSessionEvent({
