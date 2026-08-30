@@ -663,6 +663,58 @@ test("turn.abort terminal mode validates strictly and forwards normalized input"
 	expect(replay).toEqual({ id: "t", ok: true, result: "terminal" });
 	expect(calls).toHaveLength(2);
 });
+test("turn.abort operator mode requires confirmation and preserves idempotency", async () => {
+	const abort = OPERATIONS.find(row => row.sdkId === "turn.abort")!;
+	const calls: Array<Record<string, unknown>> = [];
+	const surface = {
+		abort: () => "legacy",
+		abortTerminal: (input: unknown, idempotencyKey?: string) => {
+			calls.push({ ...(input as Record<string, unknown>), idempotencyKey });
+			return "operator";
+		},
+	} as unknown as ControlSurface;
+	const request = (input: Record<string, unknown>, idempotencyKey: string | undefined, confirm: boolean) =>
+		dispatchControl(surface, abort, {
+			id: "operator",
+			operation: abort.sdkId,
+			input,
+			idempotencyKey,
+			confirm,
+		});
+	const operatorInput = { mode: "terminal", scope: "owned", operator: true };
+
+	expect(await request(operatorInput, "operator-no-confirm", false)).toMatchObject({
+		ok: false,
+		error: { code: "invalid_input" },
+	});
+	expect(await request(operatorInput, undefined, true)).toMatchObject({
+		ok: false,
+		error: { code: "invalid_input" },
+	});
+	expect(await request({ ...operatorInput, operator: false }, "operator-false", true)).toMatchObject({
+		ok: false,
+		error: { code: "invalid_input" },
+	});
+	expect(await request(operatorInput, "operator-key", true)).toEqual({
+		id: "operator",
+		ok: true,
+		result: "operator",
+	});
+	expect(calls).toEqual([{ mode: "terminal", scope: "owned", operator: true, idempotencyKey: "operator-key" }]);
+
+	// Same-key/same-authority retries replay, while changing authority conflicts.
+	expect(await request(operatorInput, "operator-key", true)).toEqual({
+		id: "operator",
+		ok: true,
+		result: "operator",
+	});
+	expect(calls).toHaveLength(1);
+	expect(await request({ mode: "terminal", scope: "owned" }, "operator-key", true)).toMatchObject({
+		ok: false,
+		error: { code: "idempotency_conflict" },
+	});
+	expect(calls).toHaveLength(1);
+});
 test("turn.abort terminal normalizes omitted scope before idempotency hashing", async () => {
 	const abort = OPERATIONS.find(row => row.sdkId === "turn.abort")!;
 	let calls = 0;

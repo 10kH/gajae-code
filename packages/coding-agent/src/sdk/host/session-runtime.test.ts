@@ -1045,7 +1045,13 @@ describe("SessionSdkSessionRuntime", () => {
 				},
 				abortPromptAndWaitWithTerminal: async (handle, options) => {
 					seamCalls.push({ handle, scope: options.terminal?.scope ?? "none" });
-					return { status: "settled", terminalScope: {} };
+					return {
+						status: "settled",
+						terminalScope: {
+							abortedAttemptEpoch: activeEpoch,
+							lineageIdHash: "runtime-test-lineage",
+						},
+					};
 				},
 			},
 		});
@@ -1140,6 +1146,27 @@ describe("SessionSdkSessionRuntime", () => {
 					}),
 				]),
 			);
+
+			// A separately connected, explicitly confirmed local operator may stop
+			// the active turn and its exact owned work without weakening ordinary
+			// connection ownership checks.
+			transport.feed("local-operator", {
+				type: "control_request",
+				id: "terminal-operator-abort",
+				operation: "turn.abort",
+				input: { mode: "terminal", scope: "owned", operator: true },
+				confirm: true,
+				idempotencyKey: "terminal-operator-key",
+			} as SdkFrame);
+			await waitForFrame("terminal-operator-abort");
+			expect(seamCalls).toEqual([
+				{ handle: "exact-run-handle", scope: "turn" },
+				{ handle: "later-run-handle", scope: "owned" },
+			]);
+			expect(transport.sent.find(frame => frame.id === "terminal-operator-abort")).toMatchObject({
+				ok: true,
+				result: expect.objectContaining({ turn: "stopped", ownedWork: "stopped" }),
+			});
 		} finally {
 			await handlers.get("session_shutdown")?.({}, ctx);
 			await rm(cwd, { recursive: true, force: true });

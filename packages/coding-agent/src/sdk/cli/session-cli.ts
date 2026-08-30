@@ -563,13 +563,28 @@ async function requestControl(
 	const attachment = attachmentFor(router, sessionId);
 	const response = await router.request(
 		sessionId,
-		{ type: "control_request", operation, input, confirm: args.confirm === true },
+		controlRequestFrame(operation, input, args),
 		attachment.generation,
 		attachment,
 		args.timeoutMs === undefined ? undefined : { timeoutMs: args.timeoutMs },
 	);
 	throwResponseFailure(response);
 	return response;
+}
+
+/** Builds the public CLI control envelope without leaking envelope fields into operation input. */
+export function controlRequestFrame(
+	operation: string,
+	input: JsonRecord,
+	args: Pick<SdkSessionCliArgs, "confirm" | "idempotencyKey">,
+): JsonRecord {
+	return {
+		type: "control_request",
+		operation,
+		input,
+		confirm: args.confirm === true,
+		...(args.idempotencyKey ? { idempotencyKey: args.idempotencyKey } : {}),
+	};
 }
 
 async function requestQuery(

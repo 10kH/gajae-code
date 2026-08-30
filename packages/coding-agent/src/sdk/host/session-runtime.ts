@@ -2269,7 +2269,7 @@ function createControlSurface(
 		}
 	};
 	const terminalAbort = async (
-		input: { mode: "terminal"; scope?: "turn" | "owned" },
+		input: { mode: "terminal"; scope?: "turn" | "owned"; operator?: boolean },
 		idempotencyKey?: string,
 	): Promise<unknown> => {
 		const scope = input.scope === "owned" ? "owned" : "turn";
@@ -2302,7 +2302,7 @@ function createControlSurface(
 					: undefined;
 			const inputHash = crypto
 				.createHash("sha256")
-				.update(JSON.stringify({ mode: "terminal", scope }))
+				.update(JSON.stringify({ mode: "terminal", scope, ...(input.operator === true ? { operator: true } : {}) }))
 				.digest("hex");
 			const stored = (record: SdkOnlyTerminalScopeRecord | SdkOnlyEvictedTerminalKeyEntry) => ({
 				responseState: record.responseState ?? "pending",
@@ -2743,7 +2743,11 @@ function createControlSurface(
 			// cleared after a terminal lifecycle boundary) authorizes no client, and
 			// a stale prior owner authorizes only that old client — never a later
 			// turn it did not submit (review thread P1).
-			if (handle && (abortingConnectionId === undefined || !currentOwnerConnectionIds().has(abortingConnectionId))) {
+			if (
+				input.operator !== true &&
+				handle &&
+				(abortingConnectionId === undefined || !currentOwnerConnectionIds().has(abortingConnectionId))
+			) {
 				if ((await writeNoEffect()) === "conflict") {
 					throw Object.assign(new Error("Idempotency key was reused with different input."), {
 						code: "idempotency_conflict",

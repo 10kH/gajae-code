@@ -164,14 +164,18 @@ function normalizeTerminalAbortInputForHash(input: unknown): unknown {
 	for (const key of Object.keys(record)) if (!TERMINAL_ABORT_FIELDS.has(key)) return input;
 	const scope = record.scope;
 	if (scope !== undefined && scope !== "turn" && scope !== "owned") return input;
-	return { mode: "terminal", scope: scope === undefined ? "turn" : scope };
+	return {
+		mode: "terminal",
+		scope: scope === undefined ? "turn" : scope,
+		...(record.operator === true ? { operator: true } : {}),
+	};
 }
 
 function text(input: ControlInput, key = "text"): string {
 	return input[key] as string;
 }
 
-const TERMINAL_ABORT_FIELDS = new Set(["mode", "scope"]);
+const TERMINAL_ABORT_FIELDS = new Set(["mode", "scope", "operator"]);
 
 function invalidInput(message: string): never {
 	throw new TypedControlError("invalid_input", message);
@@ -184,15 +188,22 @@ function invalidInput(message: string): never {
  * input is dropped and the ordinary argument-less `surface.abort()` runs.
  *
  * Terminal mode (`mode:"terminal"`) is validated strictly and side-effect-free
- * before any surface call: only `mode`/`scope` fields are accepted, `scope`
- * must be `"turn"` or `"owned"` (default `"turn"`), and a nonempty idempotency
- * key of at most 128 UTF-8 bytes is required on the request envelope. Terminal
- * semantics (see the approved plan): stop the root worker's current turn and
- * block only its own continuation routes; left-running owned work keeps
- * running and its completions are delivered normally so the root worker can
- * resume with a fresh attempt — owned delivery is NOT suppressed.
+ * before any surface call: only `mode`/`scope`/`operator` fields are accepted,
+ * `scope` must be `"turn"` or `"owned"` (default `"turn"`), and a nonempty
+ * idempotency key of at most 128 UTF-8 bytes is required on the request envelope.
+ * A cross-connection local operator must set `operator:true` and confirm the
+ * destructive control request explicitly. Terminal semantics (see the approved
+ * plan) always stop the root worker's current turn. `scope:"turn"` leaves owned
+ * work running so its completion can resume the root worker; `scope:"owned"`
+ * additionally requires exact causal proof and stops that owned work. Operator
+ * authority changes only connection ownership, never those settlement proofs.
  */
-function invokeAbort(surface: ControlSurface, input: ControlInput, idempotencyKey: string | undefined): ControlValue {
+function invokeAbort(
+	surface: ControlSurface,
+	input: ControlInput,
+	confirm: boolean | undefined,
+	idempotencyKey: string | undefined,
+): ControlValue {
 	const mode = input.mode === undefined ? "turn" : input.mode;
 	if (mode === "turn") return surface.abort();
 	if (mode !== "terminal") invalidInput('turn.abort mode must be "turn" or "terminal".');
@@ -200,12 +211,18 @@ function invokeAbort(surface: ControlSurface, input: ControlInput, idempotencyKe
 		if (!TERMINAL_ABORT_FIELDS.has(key)) invalidInput(`Unknown turn.abort terminal field: ${key}`);
 	const scope = input.scope === undefined ? "turn" : input.scope;
 	if (scope !== "turn" && scope !== "owned") invalidInput('turn.abort terminal scope must be "turn" or "owned".');
+	if (input.operator !== undefined && input.operator !== true)
+		invalidInput("turn.abort terminal operator must be true when provided.");
+	if (input.operator === true && confirm !== true) invalidInput("operator terminal abort requires confirm:true.");
 	if (typeof idempotencyKey !== "string" || idempotencyKey.length === 0)
 		invalidInput("terminal abort requires a nonempty idempotency key.");
 	if (new TextEncoder().encode(idempotencyKey).length > 128)
 		invalidInput("terminal abort idempotency key must be at most 128 UTF-8 bytes.");
 	if (!surface.abortTerminal) invalidInput("terminal abort is not supported by this surface.");
-	return surface.abortTerminal({ mode: "terminal", scope }, idempotencyKey);
+	return surface.abortTerminal(
+		{ mode: "terminal", scope, ...(input.operator === true ? { operator: true } : {}) },
+		idempotencyKey,
+	);
 }
 function invoke(
 	surface: ControlSurface,
@@ -222,7 +239,7 @@ function invoke(
 		case "turn.follow_up":
 			return surface.followUp(text(input));
 		case "turn.abort":
-			return invokeAbort(surface, input, idempotencyKey);
+			return invokeAbort(surface, input, confirm, idempotencyKey);
 		case "turn.abort_and_prompt":
 			return surface.abortAndPrompt(text(input));
 		case "ask.answer":

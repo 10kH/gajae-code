@@ -11,6 +11,8 @@ export type AbortScope = "turn" | "owned";
 export interface TerminalAbortInput {
 	mode: "terminal";
 	scope?: AbortScope;
+	/** Confirmed local override for a turn owned by another SDK connection. */
+	operator?: boolean;
 }
 export type ControlInput = Record<string, unknown>;
 
