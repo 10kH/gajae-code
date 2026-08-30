@@ -6,6 +6,7 @@
  * AWS SSO OIDC / CodeWhisperer streaming path used by `gjc auth-broker login kiro`.
  */
 import { $env } from "@gajae-code/utils";
+import { assertAwsRegionLabel } from "../adapter-internals/aws-region";
 import { Effort } from "../model-thinking";
 import type {
 	Api,
@@ -53,17 +54,38 @@ export function isKiroApiKey(value: string | undefined): value is string {
 
 export function kiroApiRegion(options?: { region?: string }): string {
 	return (
-		options?.region ||
-		$env.KIRO_API_REGION ||
-		$env.KIRO_REGION ||
-		$env.AWS_REGION ||
-		$env.AWS_DEFAULT_REGION ||
+		options?.region ??
+		$env.KIRO_API_REGION ??
+		$env.KIRO_REGION ??
+		$env.AWS_REGION ??
+		$env.AWS_DEFAULT_REGION ??
 		DEFAULT_REGION
 	);
 }
 
 export function kiroApiBaseUrl(region: string): string {
+	assertAwsRegionLabel(region);
 	return `https://q.${region}.amazonaws.com/`;
+}
+
+function isRegionDerivedKiroApiBaseUrl(baseUrl: string): boolean {
+	try {
+		const url = new URL(baseUrl);
+		const match = /^q\.([a-z0-9-]+)\.amazonaws\.com$/.exec(url.hostname);
+		if (!match) return false;
+		assertAwsRegionLabel(match[1]);
+		return (
+			url.protocol === "https:" &&
+			url.username === "" &&
+			url.password === "" &&
+			url.port === "" &&
+			url.pathname === "/" &&
+			url.search === "" &&
+			url.hash === ""
+		);
+	} catch {
+		return false;
+	}
 }
 
 export function toKiroModelId(modelId: string): string {
@@ -279,12 +301,13 @@ export async function fetchKiroApiModels(
 	apiKey: string,
 	region?: string,
 ): Promise<Model<"kiro-codewhisperer-stream">[]> {
-	const resolvedRegion = region || kiroApiRegion();
+	const resolvedRegion = region ?? kiroApiRegion();
 	const baseUrl = kiroApiBaseUrl(resolvedRegion);
 	const response = await fetch(baseUrl, {
 		method: "POST",
 		headers: kiroApiHeaders(apiKey, LIST_TARGET),
 		body: JSON.stringify({ origin: KIRO_ORIGIN }),
+		redirect: "error",
 		signal: AbortSignal.timeout(15_000),
 	});
 	if (!response.ok) {
@@ -585,8 +608,9 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 					"Kiro API key missing. Set KIRO_API_KEY to a ksk_ key from https://app.kiro.dev/settings/api-keys.",
 				);
 			}
-			const region = kiroApiRegion(options);
-			const endpoint = model.baseUrl || kiroApiBaseUrl(region);
+			const configuredBaseUrl = model.baseUrl;
+			const usesExplicitBaseUrl = Boolean(configuredBaseUrl) && !isRegionDerivedKiroApiBaseUrl(configuredBaseUrl);
+			const endpoint = configuredBaseUrl || kiroApiBaseUrl(kiroApiRegion(options));
 			const request = buildApiKeyRequest(model, context, options);
 			options?.onPayload?.(request, model, options?.attemptScope);
 
@@ -594,6 +618,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				method: "POST",
 				headers: { ...kiroApiHeaders(apiKey, CHAT_TARGET), ...(options.headers ?? {}) },
 				body: JSON.stringify(request),
+				...(usesExplicitBaseUrl ? {} : { redirect: "error" as const }),
 				signal: options.signal,
 			});
 			if (!response.ok) {

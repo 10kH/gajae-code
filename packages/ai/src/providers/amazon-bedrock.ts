@@ -8,6 +8,7 @@
  */
 
 import { $credentialEnv, $env, $flag, extractHttpStatusFromError, fetchWithRetry } from "@gajae-code/utils";
+import { assertAwsRegionLabel } from "../adapter-internals/aws-region";
 import type { Effort } from "../model-thinking";
 import {
 	mapEffortToAnthropicAdaptiveEffort,
@@ -202,9 +203,10 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 
 		const blocks = output.content as Block[];
 		let rawRequestDump: RawHttpRequestDump | undefined;
-		const region = options.region || $env.AWS_REGION || $env.AWS_DEFAULT_REGION || "us-east-1";
+		const region = options.region ?? $env.AWS_REGION ?? $env.AWS_DEFAULT_REGION ?? "us-east-1";
 
 		try {
+			assertAwsRegionLabel(region);
 			const cacheRetention = resolveCacheRetention(options.cacheRetention);
 			const resolvedToolChoice = resolveToolChoice(model, options.toolChoice);
 			const toolConfig = convertToolConfig(context.tools, resolvedToolChoice.resolvedChoice);
@@ -303,6 +305,7 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 					method: "POST",
 					headers: await buildRequestHeaders(retryBody),
 					body: retryBody,
+					redirect: "error",
 					signal: options.signal,
 					maxAttempts: 1,
 				});
@@ -312,6 +315,7 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 				method: "POST",
 				headers: requestHeaders,
 				body,
+				redirect: "error",
 				signal: options.signal,
 				maxAttempts: resolveRetryBudget(options.requestMaxRetries, 4) + 1,
 			});

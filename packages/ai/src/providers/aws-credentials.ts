@@ -22,6 +22,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { $env, getTrustedHomeDir, isEnoent, logger } from "@gajae-code/utils";
+import { assertAwsRegionLabel } from "../adapter-internals/aws-region";
 import {
 	type AwsIniFile,
 	classifyAwsProfileCapability,
@@ -155,6 +156,7 @@ async function readSsoCredentials(
 		}
 	}
 	if (!startUrl || !ssoRegion) return undefined;
+	assertAwsRegionLabel(ssoRegion);
 
 	const token = await loadSsoCachedToken(startUrl, sessionName);
 	if (!token?.accessToken) {
@@ -172,6 +174,7 @@ async function readSsoCredentials(
 	const response = await fetch(url, {
 		method: "GET",
 		headers: { "x-amz-sso_bearer_token": token.accessToken },
+		redirect: "error",
 		signal,
 	});
 	if (!response.ok) {
