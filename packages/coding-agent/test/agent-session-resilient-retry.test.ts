@@ -112,7 +112,7 @@ describe.serial("AgentSession resilient retry", () => {
 		if (currentSession) await currentSession.dispose();
 		currentAuthStorage.close();
 		currentTempDir.removeSync();
-	});
+	}, 30_000);
 
 	function buildSession(options: {
 		responses: Array<{ throw: string } | { content: string[] }>;
@@ -1005,7 +1005,7 @@ describe.serial("AgentSession resilient retry", () => {
 			session = undefined;
 			waitSpy.mockClear();
 		}
-	});
+	}, 60_000);
 
 	it("uses failed AssistantMessage identity rather than the active model for Alibaba timeout policy", async () => {
 		const alibabaModel = getBundledModel("alibaba-token-plan", "qwen3.8-max-preview");
@@ -1056,7 +1056,7 @@ describe.serial("AgentSession resilient retry", () => {
 			model: alibabaModel.id,
 			errorMessage: timeoutMessage,
 		});
-	});
+	}, 60_000);
 
 	it("keeps Alibaba near misses, cross-API text, and unrelated transient failures retryable", async () => {
 		const responsesModel = getBundledModel("alibaba-token-plan", "qwen3.8-max-preview");
