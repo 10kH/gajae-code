@@ -2848,6 +2848,8 @@ export class AgentSession {
 	readonly #asyncJobProviderSessionId: string | undefined;
 	#isDisposed = false;
 	#disposePromise: Promise<void> | undefined;
+	#disposeAdmissionClosed: Promise<void> | undefined;
+	#disposePostPromptDrain: Promise<void> | undefined;
 	readonly #toolSessionCleanups = new Set<() => Promise<void> | void>();
 	readonly #toolSessionTransitionCleanups = new Set<() => Promise<void> | void>();
 	readonly #deferredOwnerShutdownFinalizations = new Set<Promise<void>>();
@@ -6530,9 +6532,11 @@ export class AgentSession {
 				});
 			}
 			this.#resolveRetry();
+			if (this.#isDisposed || this.#sessionAdmissionClosing) return;
 
 			const compactionTask = this.#schedulePostPromptTask(
 				async () => {
+					if (this.#isDisposed || this.#sessionAdmissionClosing) return;
 					await this.#checkCompaction(msg, true, undefined, activePromptHandle);
 				},
 				{ resourceRunId: activePromptHandle },
@@ -8388,8 +8392,15 @@ export class AgentSession {
 		if (this.#disposePromise) return this.#disposePromise;
 		this.#abortAdmissionEpoch++;
 		this.#isDisposed = true;
+		this.#disposeAdmissionClosed = this.#closeSessionAdmission();
+		this.#disposePostPromptDrain = this.#cancelPostPromptTasks();
+		this.#abortActiveMidRunBarriers();
+		this.abortCompaction();
 		this.abortRetry();
 		this.#quarantineAgentRunResources();
+		this.agent.abort();
+		this.agent.setMainAttemptScopeObserver(undefined);
+		this.#disconnectFromAgent();
 		const { promise, resolve, reject } = Promise.withResolvers<void>();
 		this.#disposePromise = promise;
 		void this.#dispose().then(resolve, reject);
@@ -8404,26 +8415,7 @@ export class AgentSession {
 
 	async #dispose(): Promise<void> {
 		await this.sessionManager.joinCwdTransition();
-		const admissionClosed = this.#closeSessionAdmission();
-		// Reject new direct Python starts as soon as disposal begins (synchronously,
-		// before any await) so callers cannot race a start against teardown.
-		this.#evalExecutionDisposing = true;
-		this.#abortActiveMidRunBarriers();
-		this.abortCompaction();
-		// Disposal does not use the public abort unwind, so cancel any pending
-		// retry before closing admission. Otherwise a prompt waiting on
-		// #waitForPostPromptRecovery can keep its admission lease forever while
-		// teardown waits for that same lease to settle.
-		this.abortRetry();
-		this.#quarantineAgentRunResources();
-		this.agent.abort();
-		this.agent.setMainAttemptScopeObserver(undefined);
-		// Disconnect the Agent event bridge NOW — before the maintenance join and the
-		// bounded idle / forceAbort below — so no agent_end emitted during teardown
-		// (including the one forceAbort emits) can re-enter #handleAgentEvent and start
-		// fresh post-turn maintenance or mutate the closing session. Maintenance promises
-		// are joined directly (not via events), so this does not affect the join.
-		this.#disconnectFromAgent();
+		const admissionClosed = this.#disposeAdmissionClosed ?? this.#closeSessionAdmission();
 		// R2-5: join any in-flight mid-run maintenance invocation before teardown so the
 		// abort-aware maintenance promise (already aborted above) settles and cannot touch
 		// torn-down state afterward.
@@ -8472,7 +8464,7 @@ export class AgentSession {
 		this.#workflowGateEmitter = undefined;
 		this.#notifyWorkflowGateEmitterChanged(this.sessionId, undefined);
 		await this.#flushWorkerIntegrationAttempt();
-		await this.#cancelPostPromptTasks();
+		await (this.#disposePostPromptDrain ?? this.#cancelPostPromptTasks());
 		// Cancel jobs this agent registered so a subagent's teardown doesn't
 		// leak its background bash/task work into the parent's manager. Only
 		// the session that owns the manager goes on to dispose it (which itself
@@ -19628,6 +19620,15 @@ export class AgentSession {
 										),
 									],
 								});
+								return;
+							}
+							if (
+								attemptCancelled() ||
+								!ownership.isCurrent() ||
+								ownership.lease.signal.aborted ||
+								this.#fallbackTransitionGeneration !== transitionGeneration
+							) {
+								await restoreOwnedTransition();
 								return;
 							}
 							const continuation = this.agent.continue({
