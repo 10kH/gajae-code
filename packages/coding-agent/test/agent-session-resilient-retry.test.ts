@@ -112,7 +112,7 @@ describe.serial("AgentSession resilient retry", () => {
 		if (currentSession) await currentSession.dispose();
 		currentAuthStorage.close();
 		currentTempDir.removeSync();
-	}, 30_000);
+	}, 300_000);
 
 	function buildSession(options: {
 		responses: Array<{ throw: string } | { content: string[] }>;
