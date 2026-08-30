@@ -21,7 +21,7 @@ import {
 	PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION,
 } from "../../ai/src/adapter-internals/provider-safety-stop";
 
-const it = test.serial;
+const it = test.serial.bind(test);
 
 /**
  * Anthropic's statusless capacity-overload envelope exactly as observed in a
