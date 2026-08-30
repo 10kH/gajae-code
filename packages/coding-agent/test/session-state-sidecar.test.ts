@@ -2658,13 +2658,18 @@ describe("coordinator runtime state sidecar", () => {
 			{ type: "agent_start" },
 			{ sessionId, cwd: launcher, sessionFile: null },
 		);
-		await prepareCoordinatorRuntimeStateRescope({
+		const moveId = await prepareCoordinatorRuntimeStateRescope({
 			sessionId,
 			previousCwd: launcher,
 			newCwd: target,
 			previousSessionFile: null,
 			newSessionFile: null,
 		});
+		await markCoordinatorRuntimeStateRescopePublishing(
+			{ sessionId, cwd: target, sessionFile: null },
+			launcher,
+			moveId,
+		);
 		expect(fsSync.existsSync(journalFile)).toBe(true);
 
 		await recoverCoordinatorRuntimeStateRescope({ sessionId, cwd: target, sessionFile: null });
@@ -2693,13 +2698,18 @@ describe("coordinator runtime state sidecar", () => {
 			{ type: "agent_start" },
 			{ sessionId, cwd: launcher, sessionFile: null },
 		);
-		await prepareCoordinatorRuntimeStateRescope({
+		const moveId = await prepareCoordinatorRuntimeStateRescope({
 			sessionId,
 			previousCwd: launcher,
 			newCwd: target,
 			previousSessionFile: null,
 			newSessionFile: null,
 		});
+		await markCoordinatorRuntimeStateRescopePublishing(
+			{ sessionId, cwd: target, sessionFile: null },
+			launcher,
+			moveId,
+		);
 		expect(
 			await relocateCoordinatorRuntimeStateForRescope({ sessionId, cwd: target, sessionFile: null }, launcher),
 		).toBe(true);
@@ -2790,13 +2800,18 @@ describe("coordinator runtime state sidecar", () => {
 		const target = path.join(root, "target");
 		await fs.mkdir(launcher);
 		await fs.mkdir(target);
-		await prepareCoordinatorRuntimeStateRescope({
+		const moveId = await prepareCoordinatorRuntimeStateRescope({
 			sessionId,
 			previousCwd: launcher,
 			newCwd: target,
 			previousSessionFile: null,
 			newSessionFile: null,
 		});
+		await markCoordinatorRuntimeStateRescopePublishing(
+			{ sessionId, cwd: target, sessionFile: null },
+			launcher,
+			moveId,
+		);
 
 		await recoverCoordinatorRuntimeStateRescope({ sessionId, cwd: target, sessionFile: null });
 

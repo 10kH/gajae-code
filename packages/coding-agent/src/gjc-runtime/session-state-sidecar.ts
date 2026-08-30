@@ -2222,23 +2222,40 @@ export async function recoverCoordinatorRuntimeStateRescope(context: RuntimeStat
 	const journal = parseRuntimeStateRescopeJournal(observed.raw);
 	verifyRuntimeStateRescopeJournal(journal);
 	const current = normalizedIdentity(context);
+	const configuredStateFiles = rescopeStateFiles(journal.session_id, journal.previous_cwd, journal.new_cwd);
+	if (
+		journal.session_id !== context.sessionId ||
+		journal.key_id !== current.sidecarKeyId ||
+		journal.state_file_mode !== configuredStateFiles.mode ||
+		!sameResolvedPath(journal.old_state_file, configuredStateFiles.oldStateFile, current.platform) ||
+		!sameResolvedPath(journal.new_state_file, configuredStateFiles.newStateFile, current.platform)
+	)
+		throw new PreviousRuntimeStateReadError();
 	if (
 		sameResolvedPath(journal.previous_cwd, current.cwd, current.platform) &&
 		sameOptionalResolvedPath(journal.previous_session_file, current.sessionFile, current.platform)
 	) {
 		if (journal.phase !== "prepared") throw new PreviousRuntimeStateReadError();
+		const source = readPreviousPayloadForRelocation(journal.old_state_file);
+		if (Object.keys(source.payload).length === 0) {
+			if (journal.source_sha256 !== null) throw new PreviousRuntimeStateReadError();
+		} else {
+			assertRelocationRuntimeStateIdentity(
+				source.payload,
+				previousRescopeIdentity(
+					{ ...context, previousSessionFile: journal.previous_session_file },
+					journal.previous_cwd,
+				),
+			);
+			if (source.identity?.sha256 !== journal.source_sha256) throw new PreviousRuntimeStateReadError();
+		}
 		await clearCoordinatorRuntimeStateRescope(context, journal.move_id, journal.new_cwd);
 		return;
 	}
-	const configuredStateFiles = rescopeStateFiles(journal.session_id, journal.previous_cwd, journal.new_cwd);
 	if (
-		journal.session_id !== context.sessionId ||
 		!sameResolvedPath(journal.new_cwd, current.cwd, current.platform) ||
 		!sameOptionalResolvedPath(journal.new_session_file, current.sessionFile, current.platform) ||
-		journal.key_id !== current.sidecarKeyId ||
-		journal.state_file_mode !== configuredStateFiles.mode ||
-		!sameResolvedPath(journal.old_state_file, configuredStateFiles.oldStateFile, current.platform) ||
-		!sameResolvedPath(journal.new_state_file, configuredStateFiles.newStateFile, current.platform)
+		journal.phase !== "publishing"
 	)
 		throw new PreviousRuntimeStateReadError();
 	const completed = await relocateCoordinatorRuntimeStateForRescope(
