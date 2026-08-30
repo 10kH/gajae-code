@@ -14,6 +14,7 @@ import { sessionRuntimeDir } from "../src/gjc-runtime/session-layout";
 import {
 	__sessionStateSidecarTestHooks,
 	persistCoordinatorRuntimeStateFromEvent,
+	prepareCoordinatorRuntimeStateRescope,
 } from "../src/gjc-runtime/session-state-sidecar";
 import { syncSkillActiveState } from "../src/skill-state/active-state";
 import { moveSessionToolRenderer } from "../src/tools/move-session";
@@ -471,6 +472,46 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 			expect(
 				fs.existsSync(path.join(sessionRuntimeDir(cwdB, session.sessionId), "runtime-state-rescope.json")),
 			).toBe(false);
+		} finally {
+			unregister();
+			await session.dispose();
+		}
+	}, 20_000);
+
+	it("issue-4629: an early before-move failure does not clear a journal this session did not prepare", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const cwdB = path.join(cwdA, "repo-b");
+		fs.mkdirSync(cwdB, { recursive: true });
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const unregister = sessionManager.registerBeforeMoveListener(() => {
+			throw new Error("early listener refused");
+		});
+		const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"] });
+		try {
+			const sessionId = session.sessionId;
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "agent_start" },
+				{ sessionId, cwd: cwdA, sessionFile: sessionManager.getSessionFile() ?? null },
+			);
+			await prepareCoordinatorRuntimeStateRescope({
+				sessionId,
+				previousCwd: cwdA,
+				newCwd: cwdB,
+				previousSessionFile: sessionManager.getSessionFile() ?? null,
+				newSessionFile: path.join(
+					SessionManager.managedDestination(cwdB, tempDir).directory,
+					path.basename(sessionManager.getSessionFile()!),
+				),
+			});
+			const journalFile = path.join(sessionRuntimeDir(cwdB, sessionId), "runtime-state-rescope.json");
+			const original = fs.readFileSync(journalFile);
+
+			await expect(sessionManager.moveTo(cwdB)).rejects.toThrow("early listener refused");
+
+			expect(sessionManager.getCwd()).toBe(cwdA);
+			expect(fs.readFileSync(journalFile)).toEqual(original);
 		} finally {
 			unregister();
 			await session.dispose();

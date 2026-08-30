@@ -4148,15 +4148,18 @@ export class AgentSession {
 			});
 		});
 		this.#unregisterMoveAbortListener = this.sessionManager.registerMoveAbortListener(async move => {
+			const moveId = this.#coordinatorRescopeMoveId;
 			try {
-				await clearCoordinatorRuntimeStateRescope(
-					{
-						sessionId: this.sessionId,
-						cwd: move.newCwd,
-						sessionFile: move.newSessionFile ?? null,
-					},
-					this.#coordinatorRescopeMoveId,
-				);
+				if (moveId) {
+					await clearCoordinatorRuntimeStateRescope(
+						{
+							sessionId: this.sessionId,
+							cwd: move.newCwd,
+							sessionFile: move.newSessionFile ?? null,
+						},
+						moveId,
+					);
+				}
 			} finally {
 				this.#coordinatorRescopeMoveId = undefined;
 				this.#endCoordinatorRescopeBarrier();

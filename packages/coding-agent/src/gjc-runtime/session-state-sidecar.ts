@@ -2073,6 +2073,12 @@ export async function prepareCoordinatorRuntimeStateRescope(input: {
 	await writeCoordinatorAtomic(
 		runtimeStateRescopeJournalPath(journal.new_cwd, journal.session_id),
 		`${JSON.stringify(journal)}\n`,
+		{
+			rename: async (source, destination) => {
+				const published = renameNoReplacePath(source, destination);
+				if (!published.ok) throw new PreviousRuntimeStateReadError();
+			},
+		},
 	);
 	return journal.move_id;
 }

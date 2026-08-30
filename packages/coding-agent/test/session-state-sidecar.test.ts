@@ -2745,6 +2745,41 @@ describe("coordinator runtime state sidecar", () => {
 		expect(fsSync.existsSync(replacementStateFile)).toBe(false);
 	});
 
+	it("issue-4629: preparing a new move never replaces an existing recovery journal", async () => {
+		delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
+		const root = await tempRoot();
+		const sessionId = "rescope-journal-no-replace";
+		const launcher = path.join(root, "launcher");
+		const target = path.join(root, "target");
+		await fs.mkdir(launcher);
+		await fs.mkdir(target);
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "agent_start" },
+			{ sessionId, cwd: launcher, sessionFile: null },
+		);
+		await prepareCoordinatorRuntimeStateRescope({
+			sessionId,
+			previousCwd: launcher,
+			newCwd: target,
+			previousSessionFile: null,
+			newSessionFile: null,
+		});
+		const journalFile = path.join(sessionRuntimeDir(target, sessionId), "runtime-state-rescope.json");
+		const original = await Bun.file(journalFile).bytes();
+
+		await expect(
+			prepareCoordinatorRuntimeStateRescope({
+				sessionId,
+				previousCwd: launcher,
+				newCwd: target,
+				previousSessionFile: null,
+				newSessionFile: null,
+			}),
+		).rejects.toThrow();
+
+		expect(await Bun.file(journalFile).bytes()).toEqual(original);
+	});
+
 	it("issue-4629: cwd-derived rescope preserves a payload already self-healed at the new cwd", async () => {
 		// If the first post-move event already seeded a fresh payload at the new cwd, the
 		// relocation must not clobber that current state with the stale predecessor.
