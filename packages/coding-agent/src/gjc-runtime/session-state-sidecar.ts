@@ -3,6 +3,12 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AssistantMessage } from "@gajae-code/ai/core";
+import {
+	exactReplacePath,
+	exactUnlinkDirect,
+	type NativeExactFileIdentity,
+	renameNoReplacePath,
+} from "@gajae-code/natives";
 import { normalizePathForComparison, postmortem } from "@gajae-code/utils";
 import { withFileLock } from "../config/file-lock";
 import {
@@ -164,6 +170,13 @@ export const __sessionStateSidecarPerfCounters = {
 		this.persistFromEventCalls = 0;
 	},
 };
+
+/** Test-only barriers for deterministic rescope transaction race coverage. */
+export const __sessionStateSidecarTestHooks: {
+	afterRescopeLocksAcquired?: () => void | Promise<void>;
+	beforePersistFromEvent?: (eventType: string, cwd: string) => void | Promise<void>;
+	beforeRescopePublish?: () => void | Promise<void>;
+} = {};
 
 interface RuntimeStateEvent {
 	type: string;
@@ -1077,6 +1090,78 @@ function readPreviousPayload(stateFile: string): Record<string, unknown> {
 	}
 }
 
+type RelocationPayloadObservation = {
+	payload: Record<string, unknown>;
+	identity: NativeExactFileIdentity | null;
+};
+
+function sameRelocationFileIdentity(left: fsSync.BigIntStats, right: fsSync.BigIntStats): boolean {
+	return (
+		left.dev === right.dev &&
+		left.ino === right.ino &&
+		left.nlink === right.nlink &&
+		left.size === right.size &&
+		left.mtimeNs === right.mtimeNs &&
+		left.ctimeNs === right.ctimeNs &&
+		left.isFile() &&
+		right.isFile() &&
+		!left.isSymbolicLink() &&
+		!right.isSymbolicLink()
+	);
+}
+
+/** Read relocation authority from one no-follow, identity-revalidated regular file. */
+function readRegularFileForRelocation(stateFile: string): { raw: string; identity: NativeExactFileIdentity } | null {
+	let before: fsSync.BigIntStats;
+	try {
+		before = fsSync.lstatSync(stateFile, { bigint: true });
+	} catch (error) {
+		if (isAbsentStateFileError(error)) return null;
+		throw new PreviousRuntimeStateReadError(error);
+	}
+	if (!before.isFile() || before.isSymbolicLink()) throw new PreviousRuntimeStateReadError();
+	const flags = fsSync.constants.O_RDONLY | (process.platform === "win32" ? 0 : (fsSync.constants.O_NOFOLLOW ?? 0));
+	let descriptor: number | undefined;
+	try {
+		descriptor = fsSync.openSync(stateFile, flags);
+		const opened = fsSync.fstatSync(descriptor, { bigint: true });
+		if (!sameRelocationFileIdentity(before, opened)) throw new PreviousRuntimeStateReadError();
+		const raw = fsSync.readFileSync(descriptor, "utf8");
+		const after = fsSync.lstatSync(stateFile, { bigint: true });
+		const finalOpened = fsSync.fstatSync(descriptor, { bigint: true });
+		const parent = fsSync.lstatSync(path.dirname(stateFile), { bigint: true });
+		if (!sameRelocationFileIdentity(opened, finalOpened) || !sameRelocationFileIdentity(opened, after))
+			throw new PreviousRuntimeStateReadError();
+		if (!parent.isDirectory() || parent.isSymbolicLink()) throw new PreviousRuntimeStateReadError();
+		return {
+			raw,
+			identity: {
+				dev: opened.dev,
+				ino: opened.ino,
+				nlink: opened.nlink,
+				parentDev: parent.dev,
+				parentIno: parent.ino,
+				size: opened.size,
+				mtimeNs: opened.mtimeNs,
+				sha256: createHash("sha256").update(raw).digest("hex"),
+				quarantineName: `.gjc-delete-runtime-state-${randomUUID()}.json`,
+			},
+		};
+	} catch (error) {
+		if (error instanceof PreviousRuntimeStateReadError) throw error;
+		throw new PreviousRuntimeStateReadError(error);
+	} finally {
+		if (descriptor !== undefined) fsSync.closeSync(descriptor);
+	}
+}
+
+function readPreviousPayloadForRelocation(stateFile: string): RelocationPayloadObservation {
+	const observed = readRegularFileForRelocation(stateFile);
+	return observed
+		? { payload: parsePreviousPayload(observed.raw), identity: observed.identity }
+		: { payload: {}, identity: null };
+}
+
 /**
  * Reads the authoritative bytes on disk, every time, inside the state-file lock.
  *
@@ -1187,6 +1272,24 @@ function assertPreviousRuntimeStateIdentity(previous: Record<string, unknown>, i
 		)
 			throw new PreviousRuntimeStateReadError();
 	}
+}
+
+/** Relocation never accepts the coordinator bootstrap exception or partial identity rows. */
+function assertRelocationRuntimeStateIdentity(previous: Record<string, unknown>, input: RuntimeStateIdentity): void {
+	assertPreviousRuntimeStateIdentity(previous, input);
+	if (
+		typeof previous.cwd !== "string" ||
+		typeof previous.workdir !== "string" ||
+		!sameResolvedPath(previous.cwd, input.cwd, input.platform) ||
+		!sameResolvedPath(previous.workdir, input.cwd, input.platform) ||
+		(previous.session_file !== input.sessionFile &&
+			!(
+				typeof previous.session_file === "string" &&
+				typeof input.sessionFile === "string" &&
+				sameResolvedPath(previous.session_file, input.sessionFile, input.platform)
+			))
+	)
+		throw new PreviousRuntimeStateReadError();
 }
 
 function runtimeStateFileForContext(context: RuntimeStateContext): string | null {
@@ -1408,6 +1511,44 @@ async function writeStateFileSync(
 	await writeStateFile(stateFile, finalizeSidecarPayload(payload, keyId));
 }
 
+async function writeStateFileSyncConditional(
+	stateFile: string,
+	payload: Record<string, unknown>,
+	keyId: string | null,
+	expectedDestination: NativeExactFileIdentity | null,
+): Promise<void> {
+	const contents = `${JSON.stringify(finalizeSidecarPayload(payload, keyId))}\n`;
+	await writeCoordinatorAtomic(stateFile, contents, {
+		rename: async (source, destination) => {
+			if (!expectedDestination) {
+				const published = renameNoReplacePath(source, destination);
+				if (!published.ok) throw new PreviousRuntimeStateReadError();
+				return;
+			}
+			const stat = fsSync.lstatSync(source, { bigint: true });
+			const parent = fsSync.lstatSync(path.dirname(source), { bigint: true });
+			if (!stat.isFile() || stat.isSymbolicLink() || !parent.isDirectory() || parent.isSymbolicLink())
+				throw new PreviousRuntimeStateReadError();
+			const replaced = exactReplacePath(
+				source,
+				destination,
+				{
+					dev: stat.dev,
+					ino: stat.ino,
+					nlink: stat.nlink,
+					parentDev: parent.dev,
+					parentIno: parent.ino,
+					size: stat.size,
+					mtimeNs: stat.mtimeNs,
+					sha256: createHash("sha256").update(contents).digest("hex"),
+				},
+				expectedDestination,
+			);
+			if (!replaced.ok) throw new PreviousRuntimeStateReadError();
+		},
+	});
+}
+
 /**
  * The state-file critical section, shared byte-for-byte with the Coordinator MCP writer.
  *
@@ -1447,6 +1588,41 @@ async function withCoordinatorTransactionLock<T>(stateFile: string, operation: (
 			throw new PreviousRuntimeStateReadError();
 		throw error;
 	}
+}
+
+function orderedDistinctStateFiles(stateFiles: readonly string[], platform: NodeJS.Platform): string[] {
+	const byIdentity = new Map<string, string>();
+	for (const stateFile of stateFiles) {
+		const resolved = path.resolve(stateFile);
+		byIdentity.set(normalizePathForComparison(resolved, platform), resolved);
+	}
+	return [...byIdentity.entries()]
+		.sort(([left], [right]) => left.localeCompare(right))
+		.map(([, stateFile]) => stateFile);
+}
+
+async function withSerializedStateFiles<T>(stateFiles: readonly string[], operation: () => Promise<T>): Promise<T> {
+	const [stateFile, ...remaining] = stateFiles;
+	if (!stateFile) return await operation();
+	return await serializeStateFileWrite(stateFile, async () => await withSerializedStateFiles(remaining, operation));
+}
+
+async function withCoordinatorTransactionLocks<T>(
+	stateFiles: readonly string[],
+	operation: () => Promise<T>,
+): Promise<T> {
+	const [stateFile, ...remaining] = stateFiles;
+	if (!stateFile) return await operation();
+	return await withCoordinatorTransactionLock(
+		stateFile,
+		async () => await withCoordinatorTransactionLocks(remaining, operation),
+	);
+}
+
+async function withStateFileLocks<T>(stateFiles: readonly string[], operation: () => Promise<T>): Promise<T> {
+	const [stateFile, ...remaining] = stateFiles;
+	if (!stateFile) return await operation();
+	return await withStateFileLock(stateFile, async () => await withStateFileLocks(remaining, operation));
 }
 
 async function writeStateFile(stateFile: string, payload: Record<string, unknown>): Promise<void> {
@@ -1538,6 +1714,8 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 	const stateFile = runtimeStateFileForContext(context);
 	const state = stateForEvent(event);
 	if (!stateFile) return;
+	const beforePersistFromEvent = __sessionStateSidecarTestHooks.beforePersistFromEvent;
+	if (beforePersistFromEvent) await beforePersistFromEvent(event.type, context.cwd);
 	if (!state) {
 		const activityPhase = toolActivityPhaseForEvent(event);
 		if (!activityPhase) return;
@@ -1703,6 +1881,128 @@ function previousRescopeIdentity(context: RuntimeStateContext, previousCwd: stri
 	});
 }
 
+interface CoordinatorRuntimeStateRescopeJournal {
+	schema_version: 1;
+	session_id: string;
+	previous_cwd: string;
+	new_cwd: string;
+	previous_session_file: string | null;
+	new_session_file: string | null;
+	created_at: string;
+}
+
+function runtimeStateRescopeJournalPath(cwd: string, sessionId: string): string {
+	return path.join(sessionRuntimeDir(cwd, sessionId), "runtime-state-rescope.json");
+}
+
+function sameOptionalResolvedPath(
+	left: string | null,
+	right: string | null,
+	platform: NodeJS.Platform = process.platform,
+): boolean {
+	return (
+		left === right ||
+		(typeof left === "string" && typeof right === "string" && sameResolvedPath(left, right, platform))
+	);
+}
+
+function parseRuntimeStateRescopeJournal(raw: string): CoordinatorRuntimeStateRescopeJournal {
+	let value: unknown;
+	try {
+		value = JSON.parse(raw);
+	} catch {
+		throw new PreviousRuntimeStateReadError();
+	}
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new PreviousRuntimeStateReadError();
+	const journal = value as Record<string, unknown>;
+	if (
+		!hasExactOwnKeys(journal, [
+			"schema_version",
+			"session_id",
+			"previous_cwd",
+			"new_cwd",
+			"previous_session_file",
+			"new_session_file",
+			"created_at",
+		]) ||
+		journal.schema_version !== 1 ||
+		typeof journal.session_id !== "string" ||
+		typeof journal.previous_cwd !== "string" ||
+		typeof journal.new_cwd !== "string" ||
+		(journal.previous_session_file !== null && typeof journal.previous_session_file !== "string") ||
+		(journal.new_session_file !== null && typeof journal.new_session_file !== "string") ||
+		!isCanonicalIsoTimestamp(journal.created_at)
+	)
+		throw new PreviousRuntimeStateReadError();
+	return journal as unknown as CoordinatorRuntimeStateRescopeJournal;
+}
+
+export async function prepareCoordinatorRuntimeStateRescope(input: {
+	sessionId: string;
+	previousCwd: string;
+	newCwd: string;
+	previousSessionFile?: string | null;
+	newSessionFile?: string | null;
+}): Promise<void> {
+	const journal: CoordinatorRuntimeStateRescopeJournal = {
+		schema_version: 1,
+		session_id: input.sessionId,
+		previous_cwd: path.resolve(input.previousCwd),
+		new_cwd: path.resolve(input.newCwd),
+		previous_session_file: input.previousSessionFile ? path.resolve(input.previousSessionFile) : null,
+		new_session_file: input.newSessionFile ? path.resolve(input.newSessionFile) : null,
+		created_at: new Date().toISOString(),
+	};
+	await writeCoordinatorAtomic(
+		runtimeStateRescopeJournalPath(journal.new_cwd, journal.session_id),
+		`${JSON.stringify(journal)}\n`,
+	);
+}
+
+export async function clearCoordinatorRuntimeStateRescope(context: RuntimeStateContext): Promise<void> {
+	const journalFile = runtimeStateRescopeJournalPath(context.cwd, context.sessionId);
+	await fs.rm(journalFile, { force: true });
+	await syncCoordinatorDirectory(path.dirname(journalFile));
+}
+
+export async function recoverCoordinatorRuntimeStateRescope(context: RuntimeStateContext): Promise<void> {
+	const journalFile = runtimeStateRescopeJournalPath(context.cwd, context.sessionId);
+	const observed = readRegularFileForRelocation(journalFile);
+	if (!observed) return;
+	const journal = parseRuntimeStateRescopeJournal(observed.raw);
+	const current = normalizedIdentity(context);
+	if (
+		journal.session_id !== current.sessionId ||
+		!sameResolvedPath(journal.new_cwd, current.cwd, current.platform) ||
+		!sameOptionalResolvedPath(journal.new_session_file, current.sessionFile, current.platform)
+	)
+		throw new PreviousRuntimeStateReadError();
+	const completed = await relocateCoordinatorRuntimeStateForRescope(
+		{ ...context, previousSessionFile: journal.previous_session_file },
+		journal.previous_cwd,
+	);
+	if (!completed) throw new PreviousRuntimeStateReadError();
+	await clearCoordinatorRuntimeStateRescope(context);
+}
+
+function runtimeStateUpdatedAt(payload: Record<string, unknown>): number | null {
+	return isCanonicalIsoTimestamp(payload.updated_at) ? Date.parse(payload.updated_at) : null;
+}
+
+function sameExactFileIdentity(left: NativeExactFileIdentity | null, right: NativeExactFileIdentity | null): boolean {
+	return (
+		left === right ||
+		(left !== null &&
+			right !== null &&
+			left.dev === right.dev &&
+			left.ino === right.ino &&
+			left.nlink === right.nlink &&
+			left.size === right.size &&
+			left.mtimeNs === right.mtimeNs &&
+			left.sha256 === right.sha256)
+	);
+}
+
 /**
  * Repairs the coordinator-shared runtime state after a committed cwd rescope, for every
  * move surface (`move_session`, TUI `/move`, SDK/ACP `session.cwd.move`) through the one
@@ -1730,9 +2030,9 @@ function previousRescopeIdentity(context: RuntimeStateContext, previousCwd: stri
 export async function relocateCoordinatorRuntimeStateForRescope(
 	context: RuntimeStateContext,
 	previousCwd: string,
-): Promise<void> {
+): Promise<boolean> {
 	const newStateFile = runtimeStateFileForContext(context);
-	if (!newStateFile) return;
+	if (!newStateFile) return true;
 	const identity = normalizedIdentity(context);
 	const oldIdentity = previousRescopeIdentity(context, previousCwd);
 	const explicitStateFile = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
@@ -1742,69 +2042,89 @@ export async function relocateCoordinatorRuntimeStateForRescope(
 		? newStateFile
 		: path.join(sessionRuntimeDir(path.resolve(previousCwd), identity.sessionId), "runtime-state.json");
 	const samePath = sameResolvedPath(oldStateFile, newStateFile, identity.platform);
-	// Authenticate and rewrite the migrated payload under the new-path critical section, then
-	// (for a distinct old path) authenticate and clear the launch-root file under its own
-	// critical section. Locking the new path first is a fixed order shared with the persist
-	// path, so two rescopes or a rescope racing a persist cannot deadlock.
-	const migrate = async (): Promise<void> => {
-		const destination = readPreviousPayload(newStateFile);
-		// The cwd-derived path may already hold a fresh payload seeded at the new cwd (the
-		// first post-move event self-healed there); that current payload is authoritative and
-		// must not be clobbered with the predecessor's state.
-		if (
-			!samePath &&
-			destination.session_id === identity.sessionId &&
-			typeof destination.cwd === "string" &&
-			sameResolvedPath(destination.cwd, identity.cwd, identity.platform)
-		) {
-			return;
-		}
-		const source = samePath ? destination : readPreviousPayload(oldStateFile);
-		if (Object.keys(source).length === 0) return;
-		// Trust the predecessor only if it authenticates against its OLD identity. A payload
-		// whose signature, key, or old cwd/session-file does not match is left untouched \u2014 the
-		// fence, not this repair, remains the authority for a foreign marker.
-		try {
-			assertPreviousRuntimeStateIdentity(source, oldIdentity);
-		} catch {
-			return;
-		}
-		const migrated = {
-			...source,
-			cwd: identity.cwd,
-			workdir: identity.workdir,
-			session_file: identity.sessionFile,
-			branch: branchForContext(context),
-			source: "session_rescope",
-			event: "move_session",
-			updated_at: new Date().toISOString(),
-		};
-		await writeStateFileSync(newStateFile, migrated, identity.sidecarKeyId);
-	};
-	await serializeStateFileWrite(
-		newStateFile,
+	const stateFiles = orderedDistinctStateFiles([oldStateFile, newStateFile], identity.platform);
+	return await withSerializedStateFiles(
+		stateFiles,
 		async () =>
-			await withCoordinatorTransactionLock(newStateFile, async () => await withStateFileLock(newStateFile, migrate)),
-	);
-	if (samePath) return;
-	// Remove the orphaned launch-root file so a cwd-scoped coordinator scan of the old root
-	// no longer sees a stale running marker for this session \u2014 but only when it is genuinely
-	// this session's authenticated predecessor.
-	await serializeStateFileWrite(
-		oldStateFile,
-		async () =>
-			await withCoordinatorTransactionLock(
-				oldStateFile,
+			await withCoordinatorTransactionLocks(
+				stateFiles,
 				async () =>
-					await withStateFileLock(oldStateFile, async () => {
-						const orphan = readPreviousPayload(oldStateFile);
-						if (Object.keys(orphan).length === 0) return;
-						try {
-							assertPreviousRuntimeStateIdentity(orphan, oldIdentity);
-						} catch {
-							return;
+					await withStateFileLocks(stateFiles, async () => {
+						await __sessionStateSidecarTestHooks.afterRescopeLocksAcquired?.();
+						const destinationObservation = readPreviousPayloadForRelocation(newStateFile);
+						const destination = destinationObservation.payload;
+						if (samePath && Object.keys(destination).length > 0) {
+							try {
+								assertRelocationRuntimeStateIdentity(destination, identity);
+								return true;
+							} catch {
+								// A pinned predecessor still carries the old identity and is migrated below.
+							}
 						}
-						await fs.rm(oldStateFile, { force: true }).catch(() => {});
+						let destinationIsCurrent = false;
+						if (!samePath && Object.keys(destination).length > 0) {
+							try {
+								assertRelocationRuntimeStateIdentity(destination, identity);
+							} catch {
+								return false;
+							}
+							destinationIsCurrent = true;
+						}
+						const sourceObservation = samePath
+							? destinationObservation
+							: readPreviousPayloadForRelocation(oldStateFile);
+						const source = sourceObservation.payload;
+						if (Object.keys(source).length === 0) return true;
+						// Trust the predecessor only if it authenticates against its OLD identity. A payload
+						// whose signature, key, or old cwd/session-file does not match is left untouched; the
+						// fence, not this repair, remains the authority for a foreign marker.
+						try {
+							assertRelocationRuntimeStateIdentity(source, oldIdentity);
+						} catch {
+							return false;
+						}
+						let publishSource = !destinationIsCurrent;
+						if (destinationIsCurrent) {
+							const sourceUpdatedAt = runtimeStateUpdatedAt(source);
+							const destinationUpdatedAt = runtimeStateUpdatedAt(destination);
+							if (sourceUpdatedAt === null || destinationUpdatedAt === null) return false;
+							publishSource = sourceUpdatedAt > destinationUpdatedAt;
+						}
+						if (publishSource) {
+							const migrated = {
+								...source,
+								cwd: identity.cwd,
+								workdir: identity.workdir,
+								session_file: identity.sessionFile,
+								branch: branchForContext(context),
+								source: "session_rescope",
+								event: "move_session",
+								updated_at: new Date().toISOString(),
+							};
+							await __sessionStateSidecarTestHooks.beforeRescopePublish?.();
+							await writeStateFileSyncConditional(
+								newStateFile,
+								migrated,
+								identity.sidecarKeyId,
+								destinationObservation.identity,
+							);
+						}
+						if (samePath) return true;
+						// Remove the orphan while both path transactions remain held. Re-read and authenticate
+						// so an unexpected non-cooperating replacement is never removed as this session's state.
+						const orphanObservation = readPreviousPayloadForRelocation(oldStateFile);
+						const orphan = orphanObservation.payload;
+						if (Object.keys(orphan).length === 0) return true;
+						try {
+							assertRelocationRuntimeStateIdentity(orphan, oldIdentity);
+						} catch {
+							return false;
+						}
+						if (!sameExactFileIdentity(sourceObservation.identity, orphanObservation.identity)) return false;
+						if (!orphanObservation.identity) throw new PreviousRuntimeStateReadError();
+						const removed = exactUnlinkDirect(oldStateFile, orphanObservation.identity);
+						if (!removed.ok && removed.code !== "not_found") throw new PreviousRuntimeStateReadError();
+						return true;
 					}),
 			),
 	);

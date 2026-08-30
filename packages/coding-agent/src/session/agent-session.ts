@@ -315,9 +315,12 @@ import {
 } from "../gjc-runtime/session-layout";
 import {
 	type CoordinatorToolObservation,
+	clearCoordinatorRuntimeStateRescope,
 	ownerTerminalContextFromEnvironment,
 	persistCoordinatorRuntimeStateFromEvent,
 	persistCoordinatorWorkerIntegrationOutcome,
+	prepareCoordinatorRuntimeStateRescope,
+	recoverCoordinatorRuntimeStateRescope,
 	registerCoordinatorRuntimeStateFinalizer,
 	relocateCoordinatorRuntimeStateForRescope,
 	UNPROVEN_TOOL_LABEL,
@@ -2815,6 +2818,8 @@ export class AgentSession {
 	/** Idempotent unregister handle for this session's resource-GC registration. */
 	#unregisterResourceGc?: () => void;
 	#unregisterRuntimeStateFinalizer?: () => void;
+	#unregisterBeforeMoveListener?: () => void;
+	#unregisterMoveAbortListener?: () => void;
 	#unregisterAfterMoveListener?: () => void;
 	/**
 	 * (Re)register the postmortem finalizer bound to the CURRENT cwd/session file. Called at
@@ -4063,22 +4068,49 @@ export class AgentSession {
 			});
 		}
 		this.#registerRuntimeStateFinalizer();
+		this.#unregisterBeforeMoveListener = this.sessionManager.registerBeforeMoveListener(async move => {
+			await this.#coordinatorPersistQueue;
+			this.#coordinatorPersistGeneration += 1;
+			await prepareCoordinatorRuntimeStateRescope({
+				sessionId: this.sessionId,
+				previousCwd: move.previousCwd,
+				newCwd: move.newCwd,
+				previousSessionFile: move.previousSessionFile ?? null,
+				newSessionFile: move.newSessionFile ?? null,
+			});
+		});
+		this.#unregisterMoveAbortListener = this.sessionManager.registerMoveAbortListener(async move => {
+			await clearCoordinatorRuntimeStateRescope({
+				sessionId: this.sessionId,
+				cwd: move.newCwd,
+				sessionFile: move.newSessionFile ?? null,
+			});
+		});
 		// Every committed rescope (`move_session`, `/move`, SDK/ACP `session.cwd.move`) funnels
 		// through SessionManager.moveTo, so one after-move listener covers all surfaces: it
 		// relocates the coordinator-shared runtime state to the new cwd (otherwise the identity
 		// fence refuses every later persist) and rebinds the postmortem finalizer, which
 		// otherwise keeps writing terminal state to the launch root's cwd/session file.
 		this.#unregisterAfterMoveListener = this.sessionManager.registerAfterMoveListener(async move => {
-			await relocateCoordinatorRuntimeStateForRescope(
-				{
+			try {
+				const completed = await relocateCoordinatorRuntimeStateForRescope(
+					{
+						sessionId: this.sessionId,
+						cwd: move.newCwd,
+						sessionFile: this.sessionManager.getSessionFile() ?? null,
+						previousSessionFile: move.previousSessionFile ?? null,
+					},
+					move.previousCwd,
+				);
+				if (!completed) throw new Error("Coordinator runtime state rescope was refused.");
+				await clearCoordinatorRuntimeStateRescope({
 					sessionId: this.sessionId,
 					cwd: move.newCwd,
 					sessionFile: this.sessionManager.getSessionFile() ?? null,
-					previousSessionFile: move.previousSessionFile ?? null,
-				},
-				move.previousCwd,
-			);
-			this.#registerRuntimeStateFinalizer();
+				});
+			} finally {
+				this.#registerRuntimeStateFinalizer();
+			}
 		});
 		// Power assertions are taken per turn (see #beginInFlight); nothing acquired here.
 		this.#evalKernelOwnerId = config.evalKernelOwnerId ?? `agent-session:${Snowflake.next()}`;
@@ -4088,6 +4120,13 @@ export class AgentSession {
 		this.#retainedMemorySampler = config.retainedMemorySampler;
 		this.#ownedMcpManager = config.ownedMcpManager;
 		this.#startupTurnBarrier = config.startupTurnBarrier;
+		this.extendStartupTurnBarrier(
+			recoverCoordinatorRuntimeStateRescope({
+				sessionId: this.sessionId,
+				cwd: this.sessionManager.getCwd(),
+				sessionFile: this.sessionManager.getSessionFile() ?? null,
+			}),
+		);
 		this.#scopedModels = config.scopedModels ?? [];
 		this.#thinkingLevel = config.thinkingLevel;
 		this.#promptTemplates = config.promptTemplates ?? [];
@@ -5578,13 +5617,16 @@ export class AgentSession {
 				message: `${kind} ${outcome.status} for ${correlation}${safeError ? `: ${safeError}` : ""}`,
 			});
 		}
+		const generation = this.#coordinatorPersistGeneration;
 		const persist = () =>
-			persistCoordinatorWorkerIntegrationOutcome(context, {
-				...outcome,
-				kind,
-				correlationId,
-				error: sanitizePostPublicationError(outcome.error),
-			});
+			generation === this.#coordinatorPersistGeneration
+				? persistCoordinatorWorkerIntegrationOutcome(context, {
+						...outcome,
+						kind,
+						correlationId,
+						error: sanitizePostPublicationError(outcome.error),
+					})
+				: Promise.resolve();
 		const queued = this.#coordinatorPersistQueue.then(persist, persist);
 		this.#coordinatorPersistQueue = queued.catch(() => {});
 		void queued.catch(error =>
@@ -8570,6 +8612,10 @@ export class AgentSession {
 		this.#unregisterSessionMemorySettings = undefined;
 		if (ownerTerminalContextFromEnvironment() === null) this.#unregisterRuntimeStateFinalizer?.();
 		this.#unregisterRuntimeStateFinalizer = undefined;
+		this.#unregisterBeforeMoveListener?.();
+		this.#unregisterBeforeMoveListener = undefined;
+		this.#unregisterMoveAbortListener?.();
+		this.#unregisterMoveAbortListener = undefined;
 		this.#unregisterAfterMoveListener?.();
 		this.#unregisterAfterMoveListener = undefined;
 		await releaseTabsForOwner(this.sessionManager.getSessionId()).catch((error: unknown) =>

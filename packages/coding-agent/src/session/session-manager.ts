@@ -7310,6 +7310,22 @@ export class SessionManager {
 	#afterMoveListeners = new Set<
 		(move: { previousCwd: string; newCwd: string; previousSessionFile: string | undefined }) => void | Promise<void>
 	>();
+	#beforeMoveListeners = new Set<
+		(move: {
+			previousCwd: string;
+			newCwd: string;
+			previousSessionFile: string | undefined;
+			newSessionFile: string | undefined;
+		}) => void | Promise<void>
+	>();
+	#moveAbortListeners = new Set<
+		(move: {
+			previousCwd: string;
+			newCwd: string;
+			previousSessionFile: string | undefined;
+			newSessionFile: string | undefined;
+		}) => void | Promise<void>
+	>();
 	/** Number of tool executions currently holding a shared read lease on `cwd`. */
 	#cwdReaderCount = 0;
 	/** Resolved when the last outstanding read lease is released. */
@@ -10759,6 +10775,58 @@ export class SessionManager {
 		};
 	}
 
+	registerBeforeMoveListener(
+		listener: (move: {
+			previousCwd: string;
+			newCwd: string;
+			previousSessionFile: string | undefined;
+			newSessionFile: string | undefined;
+		}) => void | Promise<void>,
+	): () => void {
+		this.#beforeMoveListeners.add(listener);
+		return () => {
+			this.#beforeMoveListeners.delete(listener);
+		};
+	}
+
+	async #runBeforeMoveListeners(move: {
+		previousCwd: string;
+		newCwd: string;
+		previousSessionFile: string | undefined;
+		newSessionFile: string | undefined;
+	}): Promise<void> {
+		for (const listener of [...this.#beforeMoveListeners]) await listener(move);
+	}
+
+	registerMoveAbortListener(
+		listener: (move: {
+			previousCwd: string;
+			newCwd: string;
+			previousSessionFile: string | undefined;
+			newSessionFile: string | undefined;
+		}) => void | Promise<void>,
+	): () => void {
+		this.#moveAbortListeners.add(listener);
+		return () => {
+			this.#moveAbortListeners.delete(listener);
+		};
+	}
+
+	async #runMoveAbortListeners(move: {
+		previousCwd: string;
+		newCwd: string;
+		previousSessionFile: string | undefined;
+		newSessionFile: string | undefined;
+	}): Promise<void> {
+		for (const listener of [...this.#moveAbortListeners]) {
+			try {
+				await listener(move);
+			} catch (error) {
+				logger.warn("move-abort listener failed", { error: String(error), cwd: move.newCwd });
+			}
+		}
+	}
+
 	async #runAfterMoveListeners(move: {
 		previousCwd: string;
 		newCwd: string;
@@ -10867,6 +10935,15 @@ export class SessionManager {
 					)
 				: this.destination;
 		const newSessionDir = nextDestination.directory;
+		const nextSessionFile = this.#sessionFile
+			? path.join(newSessionDir, path.basename(this.#sessionFile))
+			: undefined;
+		const moveDetails = {
+			previousCwd,
+			newCwd: resolvedCwd,
+			previousSessionFile,
+			newSessionFile: nextSessionFile,
+		};
 		let hadSessionFile = false;
 		const managedMove = this.destination.kind === "managed" && nextDestination.kind === "managed";
 		let managedSourceStore: ManagedSessionDescendantStore | undefined;
@@ -10874,7 +10951,14 @@ export class SessionManager {
 		let rollbackManagedMove: (() => Promise<void>) | undefined;
 		let residentTransition: PreparedResidentStoreTransition | undefined;
 		const hadPersistedSession = this.#ensuredOnDisk;
+		try {
+			await this.#runBeforeMoveListeners(moveDetails);
+		} catch (error) {
+			await this.#runMoveAbortListeners(moveDetails);
+			throw error;
+		}
 
+		let targetIdentityRevalidated = false;
 		if (this.persist && this.#sessionFile) {
 			// Close the persist writer before moving files
 			await this.#closePersistWriter();
@@ -10883,7 +10967,7 @@ export class SessionManager {
 			this.#persistErrorReported = false;
 
 			const oldSessionFile = this.#sessionFile;
-			const newSessionFile = path.join(newSessionDir, path.basename(oldSessionFile));
+			const newSessionFile = nextSessionFile!;
 			const oldArtifactDir = oldSessionFile.slice(0, -6); // strip .jsonl
 			const newArtifactDir = newSessionFile.slice(0, -6);
 			let managedTranscript!: ReturnType<ManagedSessionDescendantStore["readExpected"]>;
@@ -11038,6 +11122,10 @@ export class SessionManager {
 						if (!isEnoent(err)) throw err;
 					}
 				}
+				if (options?.expectedIdentity || options?.targetHandle) {
+					await this.#assertCwdTargetIdentity(resolvedCwd, options);
+					targetIdentityRevalidated = true;
+				}
 			} catch (err) {
 				if (managedMove && managedDestinationStore) {
 					try {
@@ -11089,6 +11177,7 @@ export class SessionManager {
 					if (movedArtifactDir) await movePathAcrossDevicesSafe(newArtifactDir, oldArtifactDir);
 					if (movedSessionFile) await movePathAcrossDevicesSafe(newSessionFile, oldSessionFile);
 				}
+				await this.#runMoveAbortListeners(moveDetails);
 				discardResidentTransitionAndThrow(err);
 			}
 			this.#sessionFile = newSessionFile;
@@ -11096,8 +11185,13 @@ export class SessionManager {
 
 		// Update cwd and sessionDir after physical publication succeeds. Metadata failures restore the source
 		// authority but deliberately retain any destination publication evidence rather than deleting it.
-		if (options?.expectedIdentity || options?.targetHandle) {
-			await this.#assertCwdTargetIdentity(resolvedCwd, options);
+		if (!targetIdentityRevalidated && (options?.expectedIdentity || options?.targetHandle)) {
+			try {
+				await this.#assertCwdTargetIdentity(resolvedCwd, options);
+			} catch (error) {
+				await this.#runMoveAbortListeners(moveDetails);
+				throw error;
+			}
 		}
 		this.#cwdGeneration += 1;
 		this.cwd = resolvedCwd;
@@ -11157,12 +11251,14 @@ export class SessionManager {
 				const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 				if (header) applyHeaderPatch(header, { cwd: previousCwd });
 				this.#headerExportRevision++;
+				await this.#runMoveAbortListeners(moveDetails);
 				throw error;
 			}
 			// The destination has already been published. Retain it rather than moving it
 			// back over the source after a metadata failure.
 			this.#managedTranscriptStoreCache = null;
 			this.#headerExportRevision++;
+			await this.#runAfterMoveListeners(moveDetails);
 			throw error;
 		}
 		if (residentTransition) this.#commitResidentTextStoreTransition(residentTransition);
@@ -11173,11 +11269,7 @@ export class SessionManager {
 		}
 		// The move is fully committed here; notify every surface's after-move listeners
 		// (coordinator runtime-state relocation, postmortem finalizer rebinding, ...).
-		await this.#runAfterMoveListeners({
-			previousCwd,
-			newCwd: resolvedCwd,
-			previousSessionFile,
-		});
+		await this.#runAfterMoveListeners(moveDetails);
 	}
 
 	/** Sync version for initial creation (no existing writer to close). */

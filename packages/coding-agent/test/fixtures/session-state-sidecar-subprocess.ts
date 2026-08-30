@@ -1,7 +1,21 @@
-import { persistCoordinatorRuntimeStateFromEvent } from "../../src/gjc-runtime/session-state-sidecar";
+import {
+	persistCoordinatorRuntimeStateFromEvent,
+	relocateCoordinatorRuntimeStateForRescope,
+} from "../../src/gjc-runtime/session-state-sidecar";
 
 const stateFile = process.argv[2];
 if (!stateFile) throw new Error("state file required");
+if (process.argv[3] === "relocate") {
+	const previousCwd = process.argv[4];
+	const newCwd = process.argv[5];
+	if (!previousCwd || !newCwd) throw new Error("previous and new cwd required");
+	const completed = await relocateCoordinatorRuntimeStateForRescope(
+		{ sessionId: "155-FinalA4", cwd: newCwd, sessionFile: null },
+		previousCwd,
+	);
+	if (!completed) throw new Error("relocation refused");
+	process.exit(0);
+}
 const context = { sessionId: "155-FinalA4", cwd: process.cwd(), sessionFile: null };
 await persistCoordinatorRuntimeStateFromEvent({ type: "agent_start" }, context);
 await persistCoordinatorRuntimeStateFromEvent({ type: "tool_execution_start", toolCallId: "fixture-call" }, context, {

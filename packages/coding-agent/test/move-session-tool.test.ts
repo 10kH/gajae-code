@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -8,9 +8,13 @@ import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "@gajae-code/coding-agent/session/messages";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { Snowflake } from "@gajae-code/utils";
+import { postmortem, Snowflake } from "@gajae-code/utils";
+import { FileLockTestHooks } from "../src/config/file-lock";
 import { sessionRuntimeDir } from "../src/gjc-runtime/session-layout";
-import { persistCoordinatorRuntimeStateFromEvent } from "../src/gjc-runtime/session-state-sidecar";
+import {
+	__sessionStateSidecarTestHooks,
+	persistCoordinatorRuntimeStateFromEvent,
+} from "../src/gjc-runtime/session-state-sidecar";
 import { syncSkillActiveState } from "../src/skill-state/active-state";
 import { moveSessionToolRenderer } from "../src/tools/move-session";
 
@@ -34,6 +38,8 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 	const processCwdAtStart = process.cwd();
 
 	afterEach(() => {
+		FileLockTestHooks.afterParentMkdir = undefined;
+		__sessionStateSidecarTestHooks.beforePersistFromEvent = undefined;
 		if (process.cwd() !== processCwdAtStart) {
 			process.chdir(processCwdAtStart);
 		}
@@ -129,6 +135,124 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 				path.resolve(cwdB),
 			);
 		} finally {
+			await session.dispose();
+		}
+	}, 20_000);
+
+	it("issue-4629: a relocation failure still rebinds the postmortem finalizer to the committed cwd", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const cwdB = path.join(cwdA, "repo-b");
+		fs.mkdirSync(cwdB, { recursive: true });
+		const registered = new Map<string, Parameters<typeof postmortem.register>[1]>();
+		const registerSpy = spyOn(postmortem, "register").mockImplementation((id, callback) => {
+			registered.set(id, callback);
+			return () => {
+				registered.delete(id);
+			};
+		});
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"] });
+		try {
+			const sessionId = session.sessionId;
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "agent_start" },
+				{ sessionId, cwd: cwdA, sessionFile: sessionManager.getSessionFile() ?? null },
+			);
+			const targetFile = path.join(sessionRuntimeDir(cwdB, sessionId), "runtime-state.json");
+			FileLockTestHooks.afterParentMkdir = lockPath => {
+				if (lockPath.includes(path.join(cwdB, ".gjc")) && lockPath.endsWith("mutation.lock.lock"))
+					throw new Error("injected relocation lock failure");
+			};
+
+			await session.getToolByName("move_session")!.execute("move-finalizer-rebind", { path: "repo-b" });
+			expect(sessionManager.getCwd()).toBe(cwdB);
+			FileLockTestHooks.afterParentMkdir = undefined;
+			const finalizer = registered.get("coordinator-runtime-state");
+			expect(finalizer).toBeDefined();
+			await finalizer!(postmortem.Reason.EXIT);
+
+			expect(fs.existsSync(targetFile)).toBe(true);
+			expect((JSON.parse(fs.readFileSync(targetFile, "utf8")) as Record<string, unknown>).cwd).toBe(
+				path.resolve(cwdB),
+			);
+		} finally {
+			FileLockTestHooks.afterParentMkdir = undefined;
+			await session.dispose();
+			registerSpy.mockRestore();
+		}
+	}, 20_000);
+
+	it("issue-4629: a move drains admitted old-cwd state and fences queued stale writes before relocation", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const cwdB = path.join(cwdA, "repo-b");
+		fs.mkdirSync(cwdB, { recursive: true });
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"] });
+		try {
+			const sessionId = session.sessionId;
+			const launcherFile = path.join(sessionRuntimeDir(cwdA, sessionId), "runtime-state.json");
+			const targetFile = path.join(sessionRuntimeDir(cwdB, sessionId), "runtime-state.json");
+			const oldPersistStarted = Promise.withResolvers<void>();
+			const releaseOldPersist = Promise.withResolvers<void>();
+			let blocked = false;
+			__sessionStateSidecarTestHooks.beforePersistFromEvent = async (eventType, cwd) => {
+				if (blocked || eventType !== "agent_start" || cwd !== cwdA) return;
+				blocked = true;
+				oldPersistStarted.resolve();
+				await releaseOldPersist.promise;
+			};
+			session.agent.emitExternalEvent({ type: "agent_start" });
+			await oldPersistStarted.promise;
+			const move = sessionManager.moveTo(cwdB);
+			session.agent.emitExternalEvent({ type: "turn_start" });
+			let moveSettled = false;
+			void move.finally(() => {
+				moveSettled = true;
+			});
+			await Bun.sleep(25);
+			expect(moveSettled).toBe(false);
+
+			releaseOldPersist.resolve();
+			await move;
+			expect(fs.existsSync(launcherFile)).toBe(false);
+			expect((JSON.parse(fs.readFileSync(targetFile, "utf8")) as Record<string, unknown>).event).toBe(
+				"move_session",
+			);
+
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "turn_start" },
+				{ sessionId, cwd: cwdB, sessionFile: sessionManager.getSessionFile() ?? null },
+			);
+			expect((JSON.parse(fs.readFileSync(targetFile, "utf8")) as Record<string, unknown>).event).toBe("turn_start");
+		} finally {
+			__sessionStateSidecarTestHooks.beforePersistFromEvent = undefined;
+			await session.dispose();
+		}
+	}, 20_000);
+
+	it("issue-4629: a later before-move listener failure clears the prepared recovery journal", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const cwdB = path.join(cwdA, "repo-b");
+		fs.mkdirSync(cwdB, { recursive: true });
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"] });
+		const unregister = sessionManager.registerBeforeMoveListener(() => {
+			throw new Error("later listener refused");
+		});
+		try {
+			await expect(sessionManager.moveTo(cwdB)).rejects.toThrow("later listener refused");
+			expect(sessionManager.getCwd()).toBe(cwdA);
+			expect(
+				fs.existsSync(path.join(sessionRuntimeDir(cwdB, session.sessionId), "runtime-state-rescope.json")),
+			).toBe(false);
+		} finally {
+			unregister();
 			await session.dispose();
 		}
 	}, 20_000);
@@ -939,6 +1063,9 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 			await expect(moveTool.execute("move-flush-fail", { path: "repo-b" })).rejects.toThrow(/flush exploded/);
 			expect(sessionManager.getCwd()).toBe(cwdA);
 			expect(process.cwd()).toBe(cwdA);
+			expect(
+				fs.existsSync(path.join(sessionRuntimeDir(repoB, session.sessionId), "runtime-state-rescope.json")),
+			).toBe(false);
 			const retry = await moveTool.execute("move-flush-retry", { path: "repo-b" });
 			expect(textContent(retry)).toContain("repo-b");
 			expect(sessionManager.getCwd()).toBe(fs.realpathSync(repoB));
@@ -946,7 +1073,7 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 			await session.dispose();
 			process.chdir(restoreProcessCwd);
 		}
-	});
+	}, 20_000);
 
 	it("reports a committed move when final move metadata fails after publication", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
