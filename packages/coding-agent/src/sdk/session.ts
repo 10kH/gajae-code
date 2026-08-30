@@ -17,6 +17,8 @@ import {
 	type AuthCredentialSelector,
 	type CredentialDisabledEvent,
 	codexToolWireName,
+	DEFAULT_MODEL_PER_PROVIDER,
+	type KnownProvider,
 	type Message,
 	type Model,
 	type ProviderSessionState,
@@ -1280,6 +1282,45 @@ function findDeferredExactMcpToolNameCollisions(
 		seen.add(toolName);
 	}
 	return [...collisions];
+}
+
+/**
+ * Order candidates so each known provider's curated default model is tried
+ * before the rest of the catalog.
+ *
+ * Provider catalogs are not ranked by fitness — a withdrawn model whose ID
+ * carries an older date suffix sorts ahead of its current replacement — so
+ * picking the first credentialed entry can start an unconfigured install on a
+ * model the provider no longer serves. `DEFAULT_MODEL_PER_PROVIDER` is the
+ * curated table `findInitialModel` already sweeps for the same purpose;
+ * reusing it keeps both unconfigured paths on one source of truth. Candidates
+ * that are not a provider default keep their original relative order.
+ */
+export function orderByProviderDefaultFirst(
+	candidates: readonly Model[],
+	providerOrder: readonly string[] = Object.keys(DEFAULT_MODEL_PER_PROVIDER),
+): Model[] {
+	const preferred: Model[] = [];
+	const rest: Model[] = [];
+	const preferredCandidates = new Set<Model>();
+	const seenProviders = new Set<string>();
+	for (const rawProvider of [...providerOrder, ...Object.keys(DEFAULT_MODEL_PER_PROVIDER)]) {
+		const provider = rawProvider.trim().toLowerCase();
+		if (!provider || seenProviders.has(provider) || !(provider in DEFAULT_MODEL_PER_PROVIDER)) continue;
+		seenProviders.add(provider);
+		const defaultId = DEFAULT_MODEL_PER_PROVIDER[provider as KnownProvider];
+		for (const candidate of candidates) {
+			if (candidate.provider.trim().toLowerCase() === provider && candidate.id === defaultId) {
+				preferred.push(candidate);
+				preferredCandidates.add(candidate);
+			}
+		}
+	}
+	if (preferred.length === 0) return [...candidates];
+	for (const candidate of candidates) {
+		if (!preferredCandidates.has(candidate)) rest.push(candidate);
+	}
+	return [...preferred, ...rest];
 }
 
 const AUTOMATION_TOOL_NAMES = new Set<AutomationToolName>(["browser", "computer"]);
@@ -3422,8 +3463,30 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		if (!model && !options.modelPattern && !startupCredentialModelRejected) {
 			// Re-resolve the allowed set: extension factories above may have
 			// registered providers/models that weren't visible at startup.
-			const fallbackCandidates = await resolveAllowedModels(modelRegistry, settings, modelMatchPreferences);
-			for (const candidate of fallbackCandidates) {
+			const allowedFallbackCandidates = await resolveAllowedModels(modelRegistry, settings, modelMatchPreferences);
+			// A fresh provider discovery can disprove a bundled model while the
+			// general available catalog retains it for offline/profile compatibility.
+			// Exclude only those positively disproved bundled entries from the
+			// unconfigured startup path; explicit model/profile resolution above keeps
+			// its existing precedence and semantics.
+			const profileAvailableKeys = new Set(
+				modelRegistry
+					.getAvailableForProfileActivation()
+					.map(candidate => `${candidate.provider}\u0000${candidate.id}`),
+			);
+			const fallbackCandidates = allowedFallbackCandidates.filter(candidate =>
+				profileAvailableKeys.has(`${candidate.provider}\u0000${candidate.id}`),
+			);
+			// Candidate order is not a quality signal: catalogs sort retired models
+			// ahead of current ones whenever their IDs carry older date suffixes, so
+			// an unconfigured install would otherwise start on a model its provider
+			// has already withdrawn. Sweep each known provider's curated default
+			// first — the same table `findInitialModel` consults — and only then fall
+			// back to catalog order.
+			for (const candidate of orderByProviderDefaultFirst(
+				fallbackCandidates,
+				modelRegistry.automaticProviderOrder(credentialSessionId),
+			)) {
 				if (await hasModelApiKey(candidate)) {
 					model = candidate;
 					break;

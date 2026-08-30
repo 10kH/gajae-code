@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test, vi } 
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { closeModelCache, Effort, getBundledModel, type Model } from "@gajae-code/ai";
+import { closeModelCache, DEFAULT_MODEL_PER_PROVIDER, Effort, getBundledModel, type Model } from "@gajae-code/ai";
 import { ModelRegistry, ModelsConfigFile } from "@gajae-code/coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
@@ -1004,6 +1004,78 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			expect(authStorage.hasRuntimePreferredCredentialSelector("runtime-provider")).toBe(false);
 		} finally {
 			await session.dispose();
+		}
+	});
+
+	test("honors explicit provider priority when selecting curated startup defaults", async () => {
+		const anthropicDefault = getBundledModel("anthropic", DEFAULT_MODEL_PER_PROVIDER.anthropic);
+		const bedrockDefault = getBundledModel("amazon-bedrock", DEFAULT_MODEL_PER_PROVIDER["amazon-bedrock"]);
+		if (!anthropicDefault || !bedrockDefault) throw new Error("Expected bundled Anthropic and Bedrock defaults");
+
+		authStorage.setRuntimeApiKey("anthropic", "anthropic-test-key");
+		authStorage.setRuntimeApiKey("amazon-bedrock", "bedrock-test-key");
+		const settings = Settings.isolated({ modelProviderOrder: ["amazon-bedrock", "anthropic"] });
+		const { session } = await createAgentSession({
+			...buildSessionOptions(),
+			settings,
+		});
+
+		try {
+			expect(session.model).toMatchObject({ provider: bedrockDefault.provider, id: bedrockDefault.id });
+			expect(session.model?.id).not.toBe(anthropicDefault.id);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("skips a curated default disproved by fresh provider discovery", async () => {
+		const staleAuth = await AuthStorage.create(path.join(tempDir, `stale-default-${Snowflake.next()}.db`));
+		const staleRegistry = new ModelRegistry(
+			staleAuth,
+			path.join(tempDir, `stale-default-${Snowflake.next()}.yml`),
+			undefined,
+			{ automaticRefresh: false },
+		);
+		const currentModelId = "claude-opus-4-6";
+		try {
+			staleAuth.setRuntimeApiKey("anthropic", "anthropic-test-key");
+			using _hook = hookFetch(input => {
+				const url = String(input);
+				if (url === "https://models.dev/api.json") {
+					return new Response(JSON.stringify({ anthropic: { models: {} } }), {
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				if (!url.endsWith("/models")) throw new Error(`Unexpected model discovery request: ${input}`);
+				return new Response(JSON.stringify({ data: [{ id: currentModelId }] }), {
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+			await staleRegistry.refreshProvider("anthropic", "online");
+
+			const curatedDefault = DEFAULT_MODEL_PER_PROVIDER.anthropic;
+			expect(staleRegistry.getAvailable().some(model => model.id === curatedDefault)).toBe(true);
+			expect(staleRegistry.getAvailableForProfileActivation().some(model => model.id === curatedDefault)).toBe(
+				false,
+			);
+
+			const settings = Settings.isolated({
+				enabledModels: [`anthropic/${curatedDefault}`, `anthropic/${currentModelId}`],
+			});
+			const { session } = await createAgentSession({
+				...buildSessionOptions(),
+				authStorage: staleAuth,
+				modelRegistry: staleRegistry,
+				settings,
+			});
+			try {
+				expect(session.model).toMatchObject({ provider: "anthropic", id: currentModelId });
+			} finally {
+				await session.dispose();
+			}
+		} finally {
+			staleRegistry.dispose();
+			staleAuth.close();
 		}
 	});
 

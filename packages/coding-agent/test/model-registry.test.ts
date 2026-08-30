@@ -1620,6 +1620,31 @@ describe("ModelRegistry", () => {
 			expect(policy.providerCatalogIndex("zeta")).toBe(Number.MAX_SAFE_INTEGER);
 		});
 
+		test("automatic provider order keeps explicit priority ahead of OAuth bands", async () => {
+			await authStorage.set("anthropic", [
+				{
+					type: "oauth",
+					access: "anthropic-policy-access",
+					refresh: "anthropic-policy-refresh",
+					expires: Date.now() + 60 * 60_000,
+					email: "anthropic-policy@example.test",
+				},
+			]);
+			authStorage.setRuntimeApiKey("amazon-bedrock", "bedrock-policy-key");
+			const registrySettings = Settings.isolated();
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, registrySettings, { automaticRefresh: false });
+			try {
+				const explicitOrder = registry.automaticProviderOrder();
+				expect(explicitOrder.indexOf("anthropic")).toBeLessThan(explicitOrder.indexOf("amazon-bedrock"));
+
+				registrySettings.set("modelProviderOrder", ["amazon-bedrock"]);
+				const configuredOrder = registry.automaticProviderOrder();
+				expect(configuredOrder.indexOf("amazon-bedrock")).toBeLessThan(configuredOrder.indexOf("anthropic"));
+			} finally {
+				await registry.dispose();
+			}
+		});
+
 		test("builds stable catalog tie data from registry model order", () => {
 			const makeCatalogModel = (provider: string, id: string): Model<Api> =>
 				({

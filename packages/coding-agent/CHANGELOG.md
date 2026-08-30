@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- An install with no configured model no longer starts on a model its provider has already withdrawn. The startup fallback now applies the configured provider-priority policy, skips bundled defaults disproved by fresh provider discovery, and only then preserves catalog order for remaining candidates. Explicit model and profile selections, enabled-model allowlists, credential selectors, disabled providers, and provider/id collision-safe candidate membership remain unchanged.
+
 ## [0.15.6] - 2026-08-30
 
 - Auth metadata remains session-only when a compatibility registry has auth storage but no owner accessor, preventing an unscoped OAuth account lookup from attributing a registry-scoped API-key request to the wrong account.
