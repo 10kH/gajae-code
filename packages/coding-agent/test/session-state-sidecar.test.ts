@@ -13,6 +13,7 @@ import {
 	__sessionStateSidecarTestHooks,
 	canonicalCoordinatorSidecarPayload,
 	classifyRuntimeToolActivity,
+	clearCoordinatorRuntimeStateRescope,
 	eventAffectsCoordinatorRuntimeState,
 	GJC_COORDINATOR_SESSION_BRANCH_ENV,
 	GJC_COORDINATOR_SESSION_ID_ENV,
@@ -25,6 +26,7 @@ import {
 	GJC_TMUX_OWNER_GENERATION_ENV,
 	GJC_TMUX_OWNER_SERVER_KEY_ENV,
 	GJC_TMUX_OWNER_STATE_DIR_ENV,
+	markCoordinatorRuntimeStateRescopePublishing,
 	ownerTerminalContextFromEnvironment,
 	persistCoordinatorRuntimeInputReady,
 	persistCoordinatorRuntimeStateFromEvent,
@@ -2778,6 +2780,176 @@ describe("coordinator runtime state sidecar", () => {
 		).rejects.toThrow();
 
 		expect(await Bun.file(journalFile).bytes()).toEqual(original);
+	});
+
+	it("issue-4629: a prepared move with no source marker recovers as a completed no-op", async () => {
+		delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
+		const root = await tempRoot();
+		const sessionId = "rescope-absent-source";
+		const launcher = path.join(root, "launcher");
+		const target = path.join(root, "target");
+		await fs.mkdir(launcher);
+		await fs.mkdir(target);
+		await prepareCoordinatorRuntimeStateRescope({
+			sessionId,
+			previousCwd: launcher,
+			newCwd: target,
+			previousSessionFile: null,
+			newSessionFile: null,
+		});
+
+		await recoverCoordinatorRuntimeStateRescope({ sessionId, cwd: target, sessionFile: null });
+
+		expect(fsSync.existsSync(path.join(sessionRuntimeDir(launcher, sessionId), "runtime-state-rescope.json"))).toBe(
+			false,
+		);
+		expect(fsSync.existsSync(path.join(sessionRuntimeDir(target, sessionId), "runtime-state-rescope.json"))).toBe(
+			false,
+		);
+	});
+
+	it("issue-4629: restart at the old cwd retires a pre-commit move intent and permits retry", async () => {
+		delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
+		const root = await tempRoot();
+		const sessionId = "rescope-precommit-crash";
+		const launcher = path.join(root, "launcher");
+		const target = path.join(root, "target");
+		await fs.mkdir(launcher);
+		await fs.mkdir(target);
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "agent_start" },
+			{ sessionId, cwd: launcher, sessionFile: null },
+		);
+		await prepareCoordinatorRuntimeStateRescope({
+			sessionId,
+			previousCwd: launcher,
+			newCwd: target,
+			previousSessionFile: null,
+			newSessionFile: null,
+		});
+
+		await recoverCoordinatorRuntimeStateRescope({ sessionId, cwd: launcher, sessionFile: null });
+		await prepareCoordinatorRuntimeStateRescope({
+			sessionId,
+			previousCwd: launcher,
+			newCwd: target,
+			previousSessionFile: null,
+			newSessionFile: null,
+		});
+
+		expect(fsSync.existsSync(path.join(sessionRuntimeDir(launcher, sessionId), "runtime-state-rescope.json"))).toBe(
+			true,
+		);
+		expect((await readPayload(path.join(sessionRuntimeDir(launcher, sessionId), "runtime-state.json"))).cwd).toBe(
+			path.resolve(launcher),
+		);
+	});
+
+	it("issue-4629: restart at the old cwd preserves a move whose publication phase began", async () => {
+		delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
+		const root = await tempRoot();
+		const sessionId = "rescope-publishing-crash";
+		const launcher = path.join(root, "launcher");
+		const target = path.join(root, "target");
+		await fs.mkdir(launcher);
+		await fs.mkdir(target);
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "agent_start" },
+			{ sessionId, cwd: launcher, sessionFile: null },
+		);
+		const moveId = await prepareCoordinatorRuntimeStateRescope({
+			sessionId,
+			previousCwd: launcher,
+			newCwd: target,
+			previousSessionFile: null,
+			newSessionFile: null,
+		});
+		await markCoordinatorRuntimeStateRescopePublishing(
+			{ sessionId, cwd: target, sessionFile: null },
+			launcher,
+			moveId,
+		);
+
+		await expect(
+			recoverCoordinatorRuntimeStateRescope({ sessionId, cwd: launcher, sessionFile: null }),
+		).rejects.toThrow();
+
+		expect(fsSync.existsSync(path.join(sessionRuntimeDir(launcher, sessionId), "runtime-state-rescope.json"))).toBe(
+			true,
+		);
+		expect(fsSync.existsSync(path.join(sessionRuntimeDir(target, sessionId), "runtime-state-rescope.json"))).toBe(
+			true,
+		);
+	});
+
+	it("issue-4629: pinned recovery keeps journal namespace separate from coordinator payload identity", async () => {
+		const root = await tempRoot();
+		const sessionId = "agent-session-id";
+		const launcher = path.join(root, "launcher");
+		const target = path.join(root, "target");
+		await fs.mkdir(launcher);
+		await fs.mkdir(target);
+		const stateFile = path.join(root, "pinned.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "coordinator-session-id";
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "agent_start" },
+			{ sessionId, cwd: launcher, sessionFile: null },
+		);
+		const moveId = await prepareCoordinatorRuntimeStateRescope({
+			sessionId,
+			previousCwd: launcher,
+			newCwd: target,
+			previousSessionFile: null,
+			newSessionFile: null,
+		});
+		await markCoordinatorRuntimeStateRescopePublishing(
+			{ sessionId, cwd: target, sessionFile: null },
+			launcher,
+			moveId,
+		);
+
+		await recoverCoordinatorRuntimeStateRescope({ sessionId, cwd: target, sessionFile: null });
+
+		expect((await readPayload(stateFile)).session_id).toBe("coordinator-session-id");
+		expect((await readPayload(stateFile)).cwd).toBe(path.resolve(target));
+	});
+
+	it("issue-4629: an active move journal fences concurrent old-cwd event writers", async () => {
+		delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
+		const root = await tempRoot();
+		const sessionId = "rescope-writer-fence";
+		const launcher = path.join(root, "launcher");
+		const target = path.join(root, "target");
+		await fs.mkdir(launcher);
+		await fs.mkdir(target);
+		const stateFile = path.join(sessionRuntimeDir(launcher, sessionId), "runtime-state.json");
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "agent_start" },
+			{ sessionId, cwd: launcher, sessionFile: null },
+		);
+		const before = await Bun.file(stateFile).bytes();
+		const moveId = await prepareCoordinatorRuntimeStateRescope({
+			sessionId,
+			previousCwd: launcher,
+			newCwd: target,
+			previousSessionFile: null,
+			newSessionFile: null,
+		});
+
+		await expect(
+			persistCoordinatorRuntimeStateFromEvent(
+				{ type: "turn_start" },
+				{ sessionId, cwd: launcher, sessionFile: null },
+			),
+		).rejects.toThrow();
+		expect(await Bun.file(stateFile).bytes()).toEqual(before);
+		await clearCoordinatorRuntimeStateRescope({ sessionId, cwd: target, sessionFile: null }, moveId, launcher);
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "turn_start" },
+			{ sessionId, cwd: launcher, sessionFile: null },
+		);
+		expect((await readPayload(stateFile)).event).toBe("turn_start");
 	});
 
 	it("issue-4629: cwd-derived rescope preserves a payload already self-healed at the new cwd", async () => {

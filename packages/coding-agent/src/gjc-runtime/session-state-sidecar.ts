@@ -1679,6 +1679,7 @@ async function persistCoordinatorRuntimeToolActivity(
 				stateFile,
 				async () =>
 					await withStateFileLock(stateFile, async () => {
+						assertNoRuntimeStateRescopeJournal(context, identity);
 						const previous = await readPreviousPayloadForEvent(stateFile);
 						if (Object.keys(previous).length === 0) return;
 						assertPreviousRuntimeStateIdentity(previous, identity);
@@ -1758,6 +1759,7 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 				stateFile,
 				async () =>
 					await withStateFileLock(stateFile, async () => {
+						assertNoRuntimeStateRescopeJournal(context, identity);
 						const nowMs = Date.now();
 						const now = new Date(nowMs).toISOString();
 						const previous = await readPreviousPayloadForEvent(stateFile);
@@ -1833,6 +1835,7 @@ export async function persistCoordinatorWorkerIntegrationOutcome(
 				stateFile,
 				async () =>
 					await withStateFileLock(stateFile, async () => {
+						assertNoRuntimeStateRescopeJournal(context, identity);
 						const previous = await readPreviousPayloadForEvent(stateFile);
 						if (Object.keys(previous).length === 0) return;
 						assertPreviousRuntimeStateIdentity(previous, identity);
@@ -1913,6 +1916,7 @@ interface CoordinatorRuntimeStateRescopeJournal {
 	new_state_file: string;
 	state_file_mode: "pinned" | "derived";
 	source_sha256: string | null;
+	phase: "prepared" | "publishing";
 	key_id: string | null;
 	signature: string | null;
 	created_at: string;
@@ -1958,6 +1962,7 @@ function parseRuntimeStateRescopeJournal(raw: string): CoordinatorRuntimeStateRe
 			"new_state_file",
 			"state_file_mode",
 			"source_sha256",
+			"phase",
 			"key_id",
 			"signature",
 			"created_at",
@@ -1975,6 +1980,7 @@ function parseRuntimeStateRescopeJournal(raw: string): CoordinatorRuntimeStateRe
 		(journal.state_file_mode !== "pinned" && journal.state_file_mode !== "derived") ||
 		(journal.source_sha256 !== null &&
 			(typeof journal.source_sha256 !== "string" || !/^[0-9a-f]{64}$/.test(journal.source_sha256))) ||
+		(journal.phase !== "prepared" && journal.phase !== "publishing") ||
 		(journal.key_id !== null && typeof journal.key_id !== "string") ||
 		(journal.signature !== null && typeof journal.signature !== "string") ||
 		!isCanonicalIsoTimestamp(journal.created_at)
@@ -2027,6 +2033,22 @@ function verifyRuntimeStateRescopeJournal(journal: CoordinatorRuntimeStateRescop
 		throw new PreviousRuntimeStateReadError();
 }
 
+function assertNoRuntimeStateRescopeJournal(context: RuntimeStateContext, identity: RuntimeStateIdentity): void {
+	const journalFile = runtimeStateRescopeJournalPath(fsSync.realpathSync(context.cwd), context.sessionId);
+	const observed = readRegularFileForRelocation(journalFile);
+	if (!observed) return;
+	const journal = parseRuntimeStateRescopeJournal(observed.raw);
+	verifyRuntimeStateRescopeJournal(journal);
+	if (journal.session_id !== context.sessionId || journal.key_id !== identity.sidecarKeyId)
+		throw new PreviousRuntimeStateReadError();
+	if (
+		!sameResolvedPath(journal.previous_cwd, identity.cwd, identity.platform) &&
+		!sameResolvedPath(journal.new_cwd, identity.cwd, identity.platform)
+	)
+		throw new PreviousRuntimeStateReadError();
+	throw new PreviousRuntimeStateReadError();
+}
+
 export async function prepareCoordinatorRuntimeStateRescope(input: {
 	moveId?: string;
 	sessionId: string;
@@ -2038,7 +2060,6 @@ export async function prepareCoordinatorRuntimeStateRescope(input: {
 	const previousCwd = fsSync.realpathSync(input.previousCwd);
 	const newCwd = fsSync.realpathSync(input.newCwd);
 	const stateFiles = rescopeStateFiles(input.sessionId, previousCwd, newCwd);
-	const sourceObservation = readRegularFileForRelocation(stateFiles.oldStateFile);
 	const moveId = input.moveId ?? randomUUID();
 	if (!RUNTIME_STATE_RESCOPE_MOVE_ID_PATTERN.test(moveId)) throw new PreviousRuntimeStateReadError();
 	const identity = normalizedIdentity({
@@ -2046,59 +2067,145 @@ export async function prepareCoordinatorRuntimeStateRescope(input: {
 		cwd: newCwd,
 		sessionFile: input.newSessionFile ?? null,
 	});
-	const journal: CoordinatorRuntimeStateRescopeJournal = {
-		schema_version: 1,
-		move_id: moveId,
-		session_id: input.sessionId,
-		previous_cwd: previousCwd,
-		new_cwd: newCwd,
-		previous_session_file: input.previousSessionFile ? path.resolve(input.previousSessionFile) : null,
-		new_session_file: input.newSessionFile ? path.resolve(input.newSessionFile) : null,
-		old_state_file: stateFiles.oldStateFile,
-		new_state_file: stateFiles.newStateFile,
-		state_file_mode: stateFiles.mode,
-		source_sha256: sourceObservation?.identity.sha256 ?? null,
-		key_id: identity.sidecarKeyId,
-		signature: null,
-		created_at: new Date().toISOString(),
-	};
-	if (journal.key_id !== null) {
-		if (!coordinatorSidecarSigningKey) throw new PreviousRuntimeStateReadError();
-		journal.signature = sign(
-			null,
-			Buffer.from(canonicalCoordinatorSidecarPayload(journalSignaturePayload(journal))),
-			coordinatorSidecarSigningKey,
-		).toString("base64");
-	}
-	await writeCoordinatorAtomic(
-		runtimeStateRescopeJournalPath(journal.new_cwd, journal.session_id),
-		`${JSON.stringify(journal)}\n`,
+	const oldIdentity = previousRescopeIdentity(
 		{
-			rename: async (source, destination) => {
-				const published = renameNoReplacePath(source, destination);
-				if (!published.ok) throw new PreviousRuntimeStateReadError();
-			},
+			sessionId: input.sessionId,
+			cwd: newCwd,
+			sessionFile: input.newSessionFile ?? null,
+			previousSessionFile: input.previousSessionFile ?? null,
 		},
+		previousCwd,
 	);
-	return journal.move_id;
+	return await withSerializedStateFiles([stateFiles.oldStateFile], async () =>
+		withCoordinatorTransactionLocks([stateFiles.oldStateFile], async () =>
+			withStateFileLocks([stateFiles.oldStateFile], async () => {
+				const sourceObservation = readPreviousPayloadForRelocation(stateFiles.oldStateFile);
+				if (Object.keys(sourceObservation.payload).length > 0)
+					assertRelocationRuntimeStateIdentity(sourceObservation.payload, oldIdentity);
+				const journal: CoordinatorRuntimeStateRescopeJournal = {
+					schema_version: 1,
+					move_id: moveId,
+					session_id: input.sessionId,
+					previous_cwd: previousCwd,
+					new_cwd: newCwd,
+					previous_session_file: input.previousSessionFile ? path.resolve(input.previousSessionFile) : null,
+					new_session_file: input.newSessionFile ? path.resolve(input.newSessionFile) : null,
+					old_state_file: stateFiles.oldStateFile,
+					new_state_file: stateFiles.newStateFile,
+					state_file_mode: stateFiles.mode,
+					source_sha256: sourceObservation.identity?.sha256 ?? null,
+					phase: "prepared",
+					key_id: identity.sidecarKeyId,
+					signature: null,
+					created_at: new Date().toISOString(),
+				};
+				if (journal.key_id !== null) {
+					if (!coordinatorSidecarSigningKey) throw new PreviousRuntimeStateReadError();
+					journal.signature = sign(
+						null,
+						Buffer.from(canonicalCoordinatorSidecarPayload(journalSignaturePayload(journal))),
+						coordinatorSidecarSigningKey,
+					).toString("base64");
+				}
+				const writeJournal = async (journalFile: string): Promise<void> => {
+					await writeCoordinatorAtomic(journalFile, `${JSON.stringify(journal)}\n`, {
+						rename: async (source, destination) => {
+							const published = renameNoReplacePath(source, destination);
+							if (!published.ok) throw new PreviousRuntimeStateReadError();
+						},
+					});
+				};
+				await writeJournal(runtimeStateRescopeJournalPath(journal.previous_cwd, journal.session_id));
+				await writeJournal(runtimeStateRescopeJournalPath(journal.new_cwd, journal.session_id));
+				return journal.move_id;
+			}),
+		),
+	);
+}
+
+export async function markCoordinatorRuntimeStateRescopePublishing(
+	context: RuntimeStateContext,
+	previousCwd: string,
+	moveId: string,
+): Promise<void> {
+	const identity = normalizedIdentity(context);
+	const journalFiles = orderedDistinctStateFiles(
+		[previousCwd, context.cwd].map(cwd =>
+			runtimeStateRescopeJournalPath(fsSync.realpathSync(cwd), context.sessionId),
+		),
+		identity.platform,
+	);
+	for (const journalFile of journalFiles) {
+		const observed = readRegularFileForRelocation(journalFile);
+		if (!observed) throw new PreviousRuntimeStateReadError();
+		const journal = parseRuntimeStateRescopeJournal(observed.raw);
+		verifyRuntimeStateRescopeJournal(journal);
+		if (
+			journal.move_id !== moveId ||
+			journal.session_id !== context.sessionId ||
+			journal.key_id !== identity.sidecarKeyId ||
+			journal.phase !== "prepared"
+		)
+			throw new PreviousRuntimeStateReadError();
+		journal.phase = "publishing";
+		journal.signature = null;
+		if (journal.key_id !== null) {
+			if (!coordinatorSidecarSigningKey) throw new PreviousRuntimeStateReadError();
+			journal.signature = sign(
+				null,
+				Buffer.from(canonicalCoordinatorSidecarPayload(journalSignaturePayload(journal))),
+				coordinatorSidecarSigningKey,
+			).toString("base64");
+		}
+		const contents = `${JSON.stringify(journal)}\n`;
+		await writeCoordinatorAtomic(journalFile, contents, {
+			rename: async (source, destination) => {
+				const sourceStat = fsSync.lstatSync(source, { bigint: true });
+				const sourceParent = fsSync.lstatSync(path.dirname(source), { bigint: true });
+				const replaced = exactReplacePath(
+					source,
+					destination,
+					{
+						dev: sourceStat.dev,
+						ino: sourceStat.ino,
+						nlink: sourceStat.nlink,
+						parentDev: sourceParent.dev,
+						parentIno: sourceParent.ino,
+						size: sourceStat.size,
+						mtimeNs: sourceStat.mtimeNs,
+						sha256: createHash("sha256").update(contents).digest("hex"),
+					},
+					observed.identity,
+				);
+				if (!replaced.ok) throw new PreviousRuntimeStateReadError();
+			},
+		});
+	}
 }
 
 export async function clearCoordinatorRuntimeStateRescope(
 	context: RuntimeStateContext,
 	expectedMoveId?: string,
+	previousCwd?: string,
 ): Promise<void> {
-	const journalFile = runtimeStateRescopeJournalPath(fsSync.realpathSync(context.cwd), context.sessionId);
-	const observed = readRegularFileForRelocation(journalFile);
-	if (!observed) return;
-	const journal = parseRuntimeStateRescopeJournal(observed.raw);
-	verifyRuntimeStateRescopeJournal(journal);
-	if (expectedMoveId !== undefined && journal.move_id !== expectedMoveId) throw new PreviousRuntimeStateReadError();
 	const identity = normalizedIdentity(context);
-	if (journal.session_id !== context.sessionId || journal.key_id !== identity.sidecarKeyId)
-		throw new PreviousRuntimeStateReadError();
-	const removed = exactUnlinkDirect(journalFile, observed.identity);
-	if (!removed.ok && removed.code !== "not_found") throw new PreviousRuntimeStateReadError();
-	await syncCoordinatorDirectory(path.dirname(journalFile));
+	const candidateCwds = [context.cwd, previousCwd].filter((cwd): cwd is string => typeof cwd === "string");
+	const journalFiles = orderedDistinctStateFiles(
+		candidateCwds.map(cwd => runtimeStateRescopeJournalPath(fsSync.realpathSync(cwd), context.sessionId)),
+		identity.platform,
+	);
+	for (const journalFile of journalFiles) {
+		const observed = readRegularFileForRelocation(journalFile);
+		if (!observed) continue;
+		const journal = parseRuntimeStateRescopeJournal(observed.raw);
+		verifyRuntimeStateRescopeJournal(journal);
+		if (expectedMoveId !== undefined && journal.move_id !== expectedMoveId) throw new PreviousRuntimeStateReadError();
+		if (journal.session_id !== context.sessionId || journal.key_id !== identity.sidecarKeyId)
+			throw new PreviousRuntimeStateReadError();
+		const removed = exactUnlinkDirect(journalFile, observed.identity);
+		if (!removed.ok && removed.code !== "not_found") throw new PreviousRuntimeStateReadError();
+		await syncCoordinatorDirectory(path.dirname(journalFile));
+	}
 }
 
 export async function recoverCoordinatorRuntimeStateRescope(context: RuntimeStateContext): Promise<void> {
@@ -2108,9 +2215,17 @@ export async function recoverCoordinatorRuntimeStateRescope(context: RuntimeStat
 	const journal = parseRuntimeStateRescopeJournal(observed.raw);
 	verifyRuntimeStateRescopeJournal(journal);
 	const current = normalizedIdentity(context);
+	if (
+		sameResolvedPath(journal.previous_cwd, current.cwd, current.platform) &&
+		sameOptionalResolvedPath(journal.previous_session_file, current.sessionFile, current.platform)
+	) {
+		if (journal.phase !== "prepared") throw new PreviousRuntimeStateReadError();
+		await clearCoordinatorRuntimeStateRescope(context, journal.move_id, journal.new_cwd);
+		return;
+	}
 	const configuredStateFiles = rescopeStateFiles(journal.session_id, journal.previous_cwd, journal.new_cwd);
 	if (
-		journal.session_id !== current.sessionId ||
+		journal.session_id !== context.sessionId ||
 		!sameResolvedPath(journal.new_cwd, current.cwd, current.platform) ||
 		!sameOptionalResolvedPath(journal.new_session_file, current.sessionFile, current.platform) ||
 		journal.key_id !== current.sidecarKeyId ||
@@ -2124,7 +2239,7 @@ export async function recoverCoordinatorRuntimeStateRescope(context: RuntimeStat
 		journal.previous_cwd,
 	);
 	if (!completed) throw new PreviousRuntimeStateReadError();
-	await clearCoordinatorRuntimeStateRescope(context, journal.move_id);
+	await clearCoordinatorRuntimeStateRescope(context, journal.move_id, journal.previous_cwd);
 }
 
 function sameExactFileIdentity(left: NativeExactFileIdentity | null, right: NativeExactFileIdentity | null): boolean {
@@ -2188,13 +2303,13 @@ export async function relocateCoordinatorRuntimeStateForRescope(
 	const samePath = sameResolvedPath(oldStateFile, newStateFile, identity.platform);
 	let expectedSourceSha256: string | null | undefined;
 	const journalObservation = readRegularFileForRelocation(
-		runtimeStateRescopeJournalPath(canonicalNewCwd, identity.sessionId),
+		runtimeStateRescopeJournalPath(canonicalNewCwd, context.sessionId),
 	);
 	if (journalObservation) {
 		const journal = parseRuntimeStateRescopeJournal(journalObservation.raw);
 		verifyRuntimeStateRescopeJournal(journal);
 		if (
-			journal.session_id !== identity.sessionId ||
+			journal.session_id !== context.sessionId ||
 			journal.key_id !== identity.sidecarKeyId ||
 			!sameResolvedPath(journal.previous_cwd, canonicalPreviousCwd, identity.platform) ||
 			!sameResolvedPath(journal.new_cwd, canonicalNewCwd, identity.platform) ||
@@ -2237,7 +2352,7 @@ export async function relocateCoordinatorRuntimeStateForRescope(
 							: readPreviousPayloadForRelocation(oldStateFile);
 						const source = sourceObservation.payload;
 						if (Object.keys(source).length === 0) {
-							return expectedSourceSha256 === undefined || destinationIsCurrent;
+							return expectedSourceSha256 === undefined || expectedSourceSha256 === null || destinationIsCurrent;
 						}
 						if (
 							expectedSourceSha256 !== undefined &&
@@ -2514,6 +2629,7 @@ export async function persistCoordinatorRuntimeStateFromPostmortem(
 				stateFile,
 				async () =>
 					await withStateFileLock(stateFile, async () => {
+						assertNoRuntimeStateRescopeJournal(context, identity);
 						const previous = readPreviousPayload(stateFile);
 						assertPreviousRuntimeStateIdentity(previous, identity);
 						if (shouldPreserveTerminalPayload(previous as RuntimeStateSidecarPayload, identity)) return;
@@ -2585,16 +2701,21 @@ export async function persistCoordinatorRuntimeStateFromPostmortem(
 	});
 }
 
-export function registerCoordinatorRuntimeStateFinalizer(context: RuntimeStateContext): () => void {
+export function registerCoordinatorRuntimeStateFinalizer(
+	context: RuntimeStateContext,
+	resolveContext?: () => RuntimeStateContext,
+): () => void {
 	if (!runtimeStateFileForContext(context)) return () => {};
-	const ownerTerminal = ownerTerminalContextFromEnvironment();
-	const finalizerContext: RuntimeStateContext =
-		ownerTerminal === "invalid"
-			? { ...context, ownerTerminalMetadataInvalid: true }
-			: ownerTerminal
-				? { ...context, ownerTerminal }
-				: context;
 	return postmortem.register("coordinator-runtime-state", async reason => {
+		const liveContext = resolveContext?.() ?? context;
+		const ownerTerminal = ownerTerminalContextFromEnvironment();
+		const finalizerContext: RuntimeStateContext =
+			ownerTerminal === "invalid"
+				? { ...liveContext, ownerTerminalMetadataInvalid: true }
+				: ownerTerminal
+					? { ...liveContext, ownerTerminal }
+					: liveContext;
+		await recoverCoordinatorRuntimeStateRescope(finalizerContext);
 		await persistCoordinatorRuntimeStateFromPostmortem(reason, finalizerContext);
 	});
 }

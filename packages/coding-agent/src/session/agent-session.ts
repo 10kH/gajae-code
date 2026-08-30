@@ -316,6 +316,7 @@ import {
 import {
 	type CoordinatorToolObservation,
 	clearCoordinatorRuntimeStateRescope,
+	markCoordinatorRuntimeStateRescopePublishing,
 	ownerTerminalContextFromEnvironment,
 	persistCoordinatorRuntimeStateFromEvent,
 	persistCoordinatorWorkerIntegrationOutcome,
@@ -2820,6 +2821,7 @@ export class AgentSession {
 	#unregisterRuntimeStateFinalizer?: () => void;
 	#unregisterBeforeMoveListener?: () => void;
 	#unregisterMoveAbortListener?: () => void;
+	#unregisterMovePublicationListener?: () => void;
 	#unregisterAfterMoveListener?: () => void;
 	/**
 	 * (Re)register the postmortem finalizer bound to the CURRENT cwd/session file. Called at
@@ -2828,11 +2830,15 @@ export class AgentSession {
 	 */
 	#registerRuntimeStateFinalizer(): void {
 		this.#unregisterRuntimeStateFinalizer?.();
-		this.#unregisterRuntimeStateFinalizer = registerCoordinatorRuntimeStateFinalizer({
+		const currentContext = () => ({
 			sessionId: this.sessionId,
 			cwd: this.sessionManager.getCwd(),
 			sessionFile: this.sessionManager.getSessionFile(),
 		});
+		this.#unregisterRuntimeStateFinalizer = registerCoordinatorRuntimeStateFinalizer(
+			currentContext(),
+			currentContext,
+		);
 	}
 	#unregisterSessionMemorySettings?: () => void;
 	/**
@@ -4150,7 +4156,7 @@ export class AgentSession {
 		this.#unregisterMoveAbortListener = this.sessionManager.registerMoveAbortListener(async move => {
 			const moveId = this.#coordinatorRescopeMoveId;
 			try {
-				if (moveId) {
+				if (moveId && !move.preserveRecoveryJournal) {
 					await clearCoordinatorRuntimeStateRescope(
 						{
 							sessionId: this.sessionId,
@@ -4158,12 +4164,26 @@ export class AgentSession {
 							sessionFile: move.newSessionFile ?? null,
 						},
 						moveId,
+						move.previousCwd,
 					);
 				}
 			} finally {
 				this.#coordinatorRescopeMoveId = undefined;
 				this.#endCoordinatorRescopeBarrier();
 			}
+		});
+		this.#unregisterMovePublicationListener = this.sessionManager.registerMovePublicationListener(async move => {
+			const moveId = this.#coordinatorRescopeMoveId;
+			if (!moveId) throw new Error("Coordinator rescope publication has no prepared move identity.");
+			await markCoordinatorRuntimeStateRescopePublishing(
+				{
+					sessionId: this.sessionId,
+					cwd: move.newCwd,
+					sessionFile: move.newSessionFile ?? null,
+				},
+				move.previousCwd,
+				moveId,
+			);
 		});
 		// Every committed rescope (`move_session`, `/move`, SDK/ACP `session.cwd.move`) funnels
 		// through SessionManager.moveTo, so one after-move listener covers all surfaces: it
@@ -4189,6 +4209,7 @@ export class AgentSession {
 						sessionFile: this.sessionManager.getSessionFile() ?? null,
 					},
 					this.#coordinatorRescopeMoveId,
+					move.previousCwd,
 				);
 			} finally {
 				this.#registerRuntimeStateFinalizer();
@@ -8747,6 +8768,8 @@ export class AgentSession {
 		this.#unregisterBeforeMoveListener = undefined;
 		this.#unregisterMoveAbortListener?.();
 		this.#unregisterMoveAbortListener = undefined;
+		this.#unregisterMovePublicationListener?.();
+		this.#unregisterMovePublicationListener = undefined;
 		this.#unregisterAfterMoveListener?.();
 		this.#unregisterAfterMoveListener = undefined;
 		await releaseTabsForOwner(this.sessionManager.getSessionId()).catch((error: unknown) =>

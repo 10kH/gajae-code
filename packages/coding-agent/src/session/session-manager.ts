@@ -7324,6 +7324,15 @@ export class SessionManager {
 			newCwd: string;
 			previousSessionFile: string | undefined;
 			newSessionFile: string | undefined;
+			preserveRecoveryJournal?: boolean;
+		}) => void | Promise<void>
+	>();
+	#movePublicationListeners = new Set<
+		(move: {
+			previousCwd: string;
+			newCwd: string;
+			previousSessionFile: string | undefined;
+			newSessionFile: string | undefined;
 		}) => void | Promise<void>
 	>();
 	/** Number of tool executions currently holding a shared read lease on `cwd`. */
@@ -10781,6 +10790,7 @@ export class SessionManager {
 			newCwd: string;
 			previousSessionFile: string | undefined;
 			newSessionFile: string | undefined;
+			preserveRecoveryJournal?: boolean;
 		}) => void | Promise<void>,
 	): () => void {
 		this.#beforeMoveListeners.add(listener);
@@ -10798,12 +10808,37 @@ export class SessionManager {
 		for (const listener of [...this.#beforeMoveListeners]) await listener(move);
 	}
 
+	registerMovePublicationListener(
+		listener: (move: {
+			previousCwd: string;
+			newCwd: string;
+			previousSessionFile: string | undefined;
+			newSessionFile: string | undefined;
+			preserveRecoveryJournal?: boolean;
+		}) => void | Promise<void>,
+	): () => void {
+		this.#movePublicationListeners.add(listener);
+		return () => {
+			this.#movePublicationListeners.delete(listener);
+		};
+	}
+
+	async #runMovePublicationListeners(move: {
+		previousCwd: string;
+		newCwd: string;
+		previousSessionFile: string | undefined;
+		newSessionFile: string | undefined;
+	}): Promise<void> {
+		for (const listener of [...this.#movePublicationListeners]) await listener(move);
+	}
+
 	registerMoveAbortListener(
 		listener: (move: {
 			previousCwd: string;
 			newCwd: string;
 			previousSessionFile: string | undefined;
 			newSessionFile: string | undefined;
+			preserveRecoveryJournal?: boolean;
 		}) => void | Promise<void>,
 	): () => void {
 		this.#moveAbortListeners.add(listener);
@@ -10817,6 +10852,7 @@ export class SessionManager {
 		newCwd: string;
 		previousSessionFile: string | undefined;
 		newSessionFile: string | undefined;
+		preserveRecoveryJournal?: boolean;
 	}): Promise<void> {
 		for (const listener of [...this.#moveAbortListeners]) {
 			try {
@@ -10911,6 +10947,8 @@ export class SessionManager {
 		options?: {
 			expectedIdentity?: { dev: bigint; ino: bigint };
 			targetHandle?: { stat: (opts: { bigint: true }) => Promise<fs.BigIntStats> };
+			expectedSourceIdentity?: { dev: bigint; ino: bigint };
+			sourceHandle?: { stat: (opts: { bigint: true }) => Promise<fs.BigIntStats> };
 		},
 	): Promise<void> {
 		if (!this.#ownsCwdTransition()) {
@@ -10938,6 +10976,12 @@ export class SessionManager {
 		}
 		if (options?.expectedIdentity || options?.targetHandle) {
 			await this.#assertCwdTargetIdentity(resolvedCwd, options);
+		}
+		if (options?.expectedSourceIdentity || options?.sourceHandle) {
+			await this.#assertCwdTargetIdentity(this.cwd, {
+				expectedIdentity: options.expectedSourceIdentity,
+				targetHandle: options.sourceHandle,
+			});
 		}
 		if (resolvedCwd === this.cwd) return;
 		const previousCwd = this.cwd;
@@ -10978,6 +11022,7 @@ export class SessionManager {
 		}
 
 		let targetIdentityRevalidated = false;
+		let publicationStarted = false;
 		if (this.persist && this.#sessionFile) {
 			// Close the persist writer before moving files
 			try {
@@ -11068,6 +11113,14 @@ export class SessionManager {
 				destination.fsyncTree();
 			};
 			try {
+				await this.#runMovePublicationListeners(moveDetails);
+				publicationStarted = true;
+			} catch (error) {
+				residentTransition?.dispose();
+				await this.#runMoveAbortListeners(moveDetails);
+				throw error;
+			}
+			try {
 				if (managedMove) {
 					if (previousDestination.kind !== "managed" || nextDestination.kind !== "managed")
 						throw new Error("managed_move_destination_unavailable");
@@ -11153,6 +11206,12 @@ export class SessionManager {
 					}
 				}
 				if (options?.expectedIdentity || options?.targetHandle) {
+					if (options.expectedSourceIdentity || options.sourceHandle) {
+						await this.#assertCwdTargetIdentity(previousCwd, {
+							expectedIdentity: options.expectedSourceIdentity,
+							targetHandle: options.sourceHandle,
+						});
+					}
 					await this.#assertCwdTargetIdentity(resolvedCwd, options);
 					targetIdentityRevalidated = true;
 				}
@@ -11197,6 +11256,7 @@ export class SessionManager {
 						)
 							await managedSourceStore.publishNoReplace(path.basename(oldSessionFile), managedTranscript.bytes);
 					} catch (rollbackErr) {
+						await this.#runMoveAbortListeners({ ...moveDetails, preserveRecoveryJournal: true });
 						discardResidentTransitionAndThrow(
 							new Error(`Failed to rollback managed move: ${toError(rollbackErr).message}`, {
 								cause: toError(err),
@@ -11204,19 +11264,41 @@ export class SessionManager {
 						);
 					}
 				} else {
-					if (movedArtifactDir) await movePathAcrossDevicesSafe(newArtifactDir, oldArtifactDir);
-					if (movedSessionFile) await movePathAcrossDevicesSafe(newSessionFile, oldSessionFile);
+					try {
+						if (movedArtifactDir) await movePathAcrossDevicesSafe(newArtifactDir, oldArtifactDir);
+						if (movedSessionFile) await movePathAcrossDevicesSafe(newSessionFile, oldSessionFile);
+					} catch (rollbackError) {
+						await this.#runMoveAbortListeners({ ...moveDetails, preserveRecoveryJournal: true });
+						discardResidentTransitionAndThrow(
+							new Error(`Failed to rollback move: ${toError(rollbackError).message}`, { cause: toError(err) }),
+						);
+					}
 				}
 				await this.#runMoveAbortListeners(moveDetails);
 				discardResidentTransitionAndThrow(err);
 			}
 			this.#sessionFile = newSessionFile;
 		}
+		if (!publicationStarted) {
+			try {
+				await this.#runMovePublicationListeners(moveDetails);
+				publicationStarted = true;
+			} catch (error) {
+				await this.#runMoveAbortListeners(moveDetails);
+				throw error;
+			}
+		}
 
 		// Update cwd and sessionDir after physical publication succeeds. Metadata failures restore the source
 		// authority but deliberately retain any destination publication evidence rather than deleting it.
 		if (!targetIdentityRevalidated && (options?.expectedIdentity || options?.targetHandle)) {
 			try {
+				if (options.expectedSourceIdentity || options.sourceHandle) {
+					await this.#assertCwdTargetIdentity(previousCwd, {
+						expectedIdentity: options.expectedSourceIdentity,
+						targetHandle: options.sourceHandle,
+					});
+				}
 				await this.#assertCwdTargetIdentity(resolvedCwd, options);
 			} catch (error) {
 				await this.#runMoveAbortListeners(moveDetails);
@@ -11261,6 +11343,7 @@ export class SessionManager {
 					await rollbackManagedMove();
 				} catch (rollbackError) {
 					if (toError(rollbackError).message !== "cleanup_pending") {
+						await this.#runMoveAbortListeners({ ...moveDetails, preserveRecoveryJournal: true });
 						throw new Error(`Failed to rollback managed move: ${toError(rollbackError).message}`, {
 							cause: toError(error),
 						});

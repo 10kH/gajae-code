@@ -888,10 +888,10 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
 		const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"] });
 		const originalOpen = SessionManager.openNoFollowDirectory;
-		let swapped = false;
+		let openCount = 0;
 		const openSpy = spyOn(SessionManager, "openNoFollowDirectory").mockImplementation(async dir => {
-			if (!swapped) {
-				swapped = true;
+			openCount += 1;
+			if (openCount === 2) {
 				fs.renameSync(parent, parkedParent);
 				fs.symlinkSync(outsideParent, parent);
 			}
@@ -900,6 +900,36 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 		try {
 			await expect(
 				session.getToolByName("move_session")!.execute("move-ancestor-swap", { path: "parent/repo" }),
+			).rejects.toThrow(/identity changed|identity or access unavailable/);
+			expect(sessionManager.getCwd()).toBe(cwdA);
+		} finally {
+			openSpy.mockRestore();
+			await session.dispose();
+		}
+	}, 20_000);
+
+	it("rejects the launch root being replaced after its physical identity is pinned", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const parkedRoot = path.join(tempDir, "root-original");
+		const target = path.join(cwdA, "repo");
+		fs.mkdirSync(target, { recursive: true });
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"] });
+		const originalOpen = SessionManager.openNoFollowDirectory;
+		let openCount = 0;
+		const openSpy = spyOn(SessionManager, "openNoFollowDirectory").mockImplementation(async dir => {
+			openCount += 1;
+			if (openCount === 2) {
+				fs.renameSync(cwdA, parkedRoot);
+				fs.mkdirSync(path.join(cwdA, "repo"), { recursive: true });
+			}
+			return await originalOpen.call(SessionManager, dir);
+		});
+		try {
+			await expect(
+				session.getToolByName("move_session")!.execute("move-root-swap", { path: "repo" }),
 			).rejects.toThrow(/identity changed|identity or access unavailable/);
 			expect(sessionManager.getCwd()).toBe(cwdA);
 		} finally {
