@@ -8401,6 +8401,11 @@ export class AgentSession {
 		this.#evalExecutionDisposing = true;
 		this.#abortActiveMidRunBarriers();
 		this.abortCompaction();
+		// Disposal does not use the public abort unwind, so cancel any pending
+		// retry before closing admission. Otherwise a prompt waiting on
+		// #waitForPostPromptRecovery can keep its admission lease forever while
+		// teardown waits for that same lease to settle.
+		this.abortRetry();
 		this.agent.abort();
 		this.agent.setMainAttemptScopeObserver(undefined);
 		// Disconnect the Agent event bridge NOW — before the maintenance join and the
