@@ -10954,6 +10954,23 @@ export class SessionManager {
 		if (!this.#ownsCwdTransition()) {
 			return this.runExclusiveCwdTransition(() => this.moveTo(newCwd, options));
 		}
+		if (!options?.sourceHandle) {
+			const sourceHandle = await SessionManager.openNoFollowDirectory(this.cwd);
+			try {
+				const sourceIdentity = await sourceHandle.stat({ bigint: true });
+				if (!sourceIdentity.isDirectory()) throw new Error(`Current cwd is not a directory: ${this.cwd}`);
+				return await this.moveTo(newCwd, {
+					...options,
+					expectedSourceIdentity: options?.expectedSourceIdentity ?? {
+						dev: sourceIdentity.dev,
+						ino: sourceIdentity.ino,
+					},
+					sourceHandle,
+				});
+			} finally {
+				await sourceHandle.close();
+			}
+		}
 		const resolvedCwd = await fs.promises.realpath(path.resolve(newCwd));
 		if (!(await fs.promises.stat(resolvedCwd)).isDirectory()) {
 			throw new Error(`Refusing to rescope: target is not a directory: ${resolvedCwd}`);

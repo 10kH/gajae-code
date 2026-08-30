@@ -952,6 +952,33 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 		expect(sessionManager.getCwd()).toBe(fs.realpathSync(cwd));
 	});
 
+	it("rejects direct manager moves when the source root is replaced after pinning", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const parkedRoot = path.join(tempDir, "root-original");
+		const cwdB = path.join(tempDir, "target");
+		fs.mkdirSync(cwdA);
+		fs.mkdirSync(cwdB);
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const originalOpen = SessionManager.openNoFollowDirectory;
+		let openCount = 0;
+		const openSpy = spyOn(SessionManager, "openNoFollowDirectory").mockImplementation(async dir => {
+			openCount += 1;
+			if (openCount === 2) {
+				fs.renameSync(cwdA, parkedRoot);
+				fs.mkdirSync(cwdA);
+			}
+			return await originalOpen.call(SessionManager, dir);
+		});
+		try {
+			await expect(sessionManager.moveTo(cwdB)).rejects.toThrow(/replaced path|identity changed/);
+			expect(sessionManager.getCwd()).toBe(cwdA);
+		} finally {
+			openSpy.mockRestore();
+		}
+	});
+
 	it("accepts a child literally named with leading dots (not a parent escape)", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
