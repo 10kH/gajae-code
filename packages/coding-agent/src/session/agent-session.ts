@@ -3280,7 +3280,12 @@ export class AgentSession {
 			}
 			throw this.#sessionAdmissionBusyError();
 		}
-		if (kind === "prompt") await awaitPromptInvocationPreflight(this.#awaitStartupTurnBarrier(), signal);
+		if (kind === "prompt") {
+			const startupSignal = signal
+				? AbortSignal.any([signal, this.#disposeAbortController.signal])
+				: this.#disposeAbortController.signal;
+			await awaitPromptInvocationPreflight(this.#awaitStartupTurnBarrier(startupSignal), startupSignal);
+		}
 		const bypassesSelectionFence =
 			options?.bypassSelectionFenceGeneration !== undefined &&
 			options.bypassSelectionFenceGeneration < this.#selectionFenceGeneration;
@@ -6674,7 +6679,11 @@ export class AgentSession {
 			options?.onSkip?.();
 			return Promise.resolve();
 		}
-		const signal = reservation?.ok ? reservation.lease.signal : this.#postPromptTasksAbortController.signal;
+		const taskSignal = reservation?.ok ? reservation.lease.signal : this.#postPromptTasksAbortController.signal;
+		// Disposal is a session-wide terminal fence. Compose it with the selected
+		// logical-resource signal so stale leases from earlier runs cannot keep a
+		// post-prompt task alive after the current run was quarantined.
+		const signal = AbortSignal.any([taskSignal, this.#disposeAbortController.signal]);
 		const runScheduled = async () => {
 			if (delayMs > 0) {
 				try {
@@ -8459,6 +8468,8 @@ export class AgentSession {
 		await admissionClosed;
 		await this.#agentEndPublicationPromise;
 		await this.#queuedExtensionEvents;
+		await this.#agentEndHandlingPromise;
+		await this.#waitForSessionSettlement();
 		// Drain the sidecar write order for the same reason the two queues above are
 		// drained: each entry writes under the native identity-bound state-file lock, so a
 		// still-queued write would run after the session that owns it is gone — releasing
@@ -8467,7 +8478,14 @@ export class AgentSession {
 		// is already failure-absorbing, so this only waits.
 		await this.#coordinatorPersistQueue;
 		this.#pendingBackgroundExchanges = [];
-		this.yieldQueue.clear();
+		this.yieldQueue.clear((kind, entries) => {
+			if (kind !== "async-result") return;
+			for (const entry of entries) {
+				if (typeof entry !== "object" || entry === null) continue;
+				const envelope = (entry as { ownedCompletion?: unknown }).ownedCompletion;
+				if (isOwnedCompletionEnvelope(envelope)) this.#settleOwnedCompletionEnvelope(envelope);
+			}
+		});
 
 		this.agent.setOnBeforeYield(undefined);
 		try {
@@ -12405,18 +12423,20 @@ export class AgentSession {
 		// another session's manager (which lacks the same local job id) would
 		// see job === undefined and remove a still-live registration (review
 		// thread P1).
-		const manager = this.#ownedAsyncJobManager ?? AsyncJobManager.instance();
 		for (const message of messages) {
 			const details = (message as { details?: { ownedCompletions?: OwnedCompletionEnvelope[] } }).details;
-			for (const envelope of details?.ownedCompletions ?? []) {
-				const job = manager?.getJob(envelope.registration.jobId);
-				const status = job?.generation === envelope.registration.jobGeneration ? job?.status : undefined;
-				// Evicted jobs have no live record (job === undefined); terminal
-				// statuses settle the registration.
-				if (job === undefined || status === "completed" || status === "cancelled" || status === "failed") {
-					unregisterOwnedRegistration(envelope.registration);
-				}
-			}
+			for (const envelope of details?.ownedCompletions ?? []) this.#settleOwnedCompletionEnvelope(envelope);
+		}
+	}
+
+	#settleOwnedCompletionEnvelope(envelope: OwnedCompletionEnvelope): void {
+		const manager = this.#ownedAsyncJobManager ?? AsyncJobManager.instance();
+		const job = manager?.getJob(envelope.registration.jobId);
+		const status = job?.generation === envelope.registration.jobGeneration ? job?.status : undefined;
+		// Evicted jobs have no live record (job === undefined); terminal statuses
+		// settle the registration.
+		if (job === undefined || status === "completed" || status === "cancelled" || status === "failed") {
+			unregisterOwnedRegistration(envelope.registration);
 		}
 	}
 

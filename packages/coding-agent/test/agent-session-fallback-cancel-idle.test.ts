@@ -288,6 +288,24 @@ describe("AgentSession managed fallback cancellation completion", () => {
 		expect(session!.getPendingNextTurnMessagesForTests()).toHaveLength(0);
 	});
 
+	it("cancels an ordinary prompt waiting behind startup during disposal", async () => {
+		const calls: string[] = [];
+		createSession((model, context, options) => {
+			calls.push(selector(model));
+			return createMockModel({ responses: [{ content: ["must not run"] }] }).stream(model, context, options);
+		});
+		const startupBarrier = Promise.withResolvers<void>();
+		session!.extendStartupTurnBarrier(startupBarrier.promise);
+		const prompt = session!.prompt("ordinary prompt behind startup");
+		await Bun.sleep(10);
+
+		const dispose = session!.dispose();
+		await expect(prompt).rejects.toMatchObject({ code: "busy" });
+		await dispose;
+
+		expect(calls).toHaveLength(0);
+	});
+
 	it("abandons the overflow-maintenance handoff before any continuation provider call", async () => {
 		const calls: string[] = [];
 		createSession((model, _context, _options) => {

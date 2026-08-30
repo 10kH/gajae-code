@@ -112,7 +112,10 @@ export class YieldQueue {
 		}
 	}
 
-	clear(): void {
+	clear(onDrop?: (kind: string, entries: readonly unknown[]) => void): void {
+		if (onDrop) {
+			for (const [kind, entries] of this.#entries) onDrop(kind, entries);
+		}
 		this.#entries.clear();
 		this.#idleFlushPending = false;
 	}
