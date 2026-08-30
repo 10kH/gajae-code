@@ -17,6 +17,8 @@ import {
 	type AuthCredentialSelector,
 	type CredentialDisabledEvent,
 	codexToolWireName,
+	DEFAULT_MODEL_PER_PROVIDER,
+	type KnownProvider,
 	type Message,
 	type Model,
 	type ProviderSessionState,
@@ -1280,6 +1282,38 @@ function findDeferredExactMcpToolNameCollisions(
 		seen.add(toolName);
 	}
 	return [...collisions];
+}
+
+/**
+ * Order candidates so each known provider's curated default model is tried
+ * before the rest of the catalog.
+ *
+ * Provider catalogs are not ranked by fitness — a withdrawn model whose ID
+ * carries an older date suffix sorts ahead of its current replacement — so
+ * picking the first credentialed entry can start an unconfigured install on a
+ * model the provider no longer serves. `DEFAULT_MODEL_PER_PROVIDER` is the
+ * curated table `findInitialModel` already sweeps for the same purpose;
+ * reusing it keeps both unconfigured paths on one source of truth. Candidates
+ * that are not a provider default keep their original relative order.
+ */
+export function orderByProviderDefaultFirst(candidates: readonly Model[]): Model[] {
+	const preferred: Model[] = [];
+	const rest: Model[] = [];
+	const preferredKeys = new Set<string>();
+	for (const provider of Object.keys(DEFAULT_MODEL_PER_PROVIDER) as KnownProvider[]) {
+		const defaultId = DEFAULT_MODEL_PER_PROVIDER[provider];
+		for (const candidate of candidates) {
+			if (candidate.provider === provider && candidate.id === defaultId) {
+				preferred.push(candidate);
+				preferredKeys.add(`${candidate.provider}/${candidate.id}`);
+			}
+		}
+	}
+	if (preferred.length === 0) return [...candidates];
+	for (const candidate of candidates) {
+		if (!preferredKeys.has(`${candidate.provider}/${candidate.id}`)) rest.push(candidate);
+	}
+	return [...preferred, ...rest];
 }
 
 const AUTOMATION_TOOL_NAMES = new Set<AutomationToolName>(["browser", "computer"]);
@@ -3423,7 +3457,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// Re-resolve the allowed set: extension factories above may have
 			// registered providers/models that weren't visible at startup.
 			const fallbackCandidates = await resolveAllowedModels(modelRegistry, settings, modelMatchPreferences);
-			for (const candidate of fallbackCandidates) {
+			// Candidate order is not a quality signal: catalogs sort retired models
+			// ahead of current ones whenever their IDs carry older date suffixes, so
+			// an unconfigured install would otherwise start on a model its provider
+			// has already withdrawn. Sweep each known provider's curated default
+			// first — the same table `findInitialModel` consults — and only then fall
+			// back to catalog order.
+			for (const candidate of orderByProviderDefaultFirst(fallbackCandidates)) {
 				if (await hasModelApiKey(candidate)) {
 					model = candidate;
 					break;
