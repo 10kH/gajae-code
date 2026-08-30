@@ -3234,14 +3234,27 @@ export class AgentSession {
 	#coordinatorRescopeMoveId: string | undefined;
 	#coordinatorEventHandlers = new Set<Promise<void>>();
 	#coordinatorUnbarrieredPersists = new Set<Promise<void>>();
+	#coordinatorReleasedBarrierPersists = new Set<Promise<void>>();
 
-	#beginCoordinatorRescopeBarrier(): Promise<void>[] {
+	#beginCoordinatorRescopeBarrier(): {
+		eventHandlers: Promise<void>[];
+		releasedBarrierPersists: Promise<void>[];
+	} {
 		if (this.#coordinatorRescopeBarrier) throw new Error("Coordinator rescope barrier is already active.");
+		const releasedBarrierPersists = [...this.#coordinatorReleasedBarrierPersists];
 		const barrier = Promise.withResolvers<void>();
 		this.#coordinatorRescopeBarrier = barrier.promise;
 		this.#releaseCoordinatorRescopeBarrier = barrier.resolve;
 		this.#bindPendingAgentEndToRescopeBarrier();
-		return [...this.#coordinatorEventHandlers];
+		return { eventHandlers: [...this.#coordinatorEventHandlers], releasedBarrierPersists };
+	}
+
+	#trackReleasedBarrierPersist(persist: Promise<void>): void {
+		this.#coordinatorReleasedBarrierPersists.add(persist);
+		void persist.then(
+			() => this.#coordinatorReleasedBarrierPersists.delete(persist),
+			() => this.#coordinatorReleasedBarrierPersists.delete(persist),
+		);
 	}
 
 	#bindPendingAgentEndToRescopeBarrier(): void {
@@ -4116,7 +4129,10 @@ export class AgentSession {
 		this.#registerRuntimeStateFinalizer();
 		this.#unregisterBeforeMoveListener = this.sessionManager.registerBeforeMoveListener(async move => {
 			const admittedBeforeBarrier = this.#beginCoordinatorRescopeBarrier();
-			await Promise.allSettled(admittedBeforeBarrier);
+			await Promise.allSettled([
+				...admittedBeforeBarrier.eventHandlers,
+				...admittedBeforeBarrier.releasedBarrierPersists,
+			]);
 			this.#bindPendingAgentEndToRescopeBarrier();
 			await this.#drainUnbarrieredCoordinatorPersists();
 			this.#coordinatorPersistGeneration += 1;
@@ -5719,7 +5735,8 @@ export class AgentSession {
 		const queued = barrier
 			? barrier.then(() => this.#appendCoordinatorPersist(persist))
 			: this.#appendCoordinatorPersist(persist);
-		if (!barrier) this.#trackUnbarrieredCoordinatorPersist(queued);
+		if (barrier) this.#trackReleasedBarrierPersist(queued);
+		else this.#trackUnbarrieredCoordinatorPersist(queued);
 		void queued.catch(error =>
 			logger.warn("Failed to persist terminal reconciliation outcome", { error: String(error) }),
 		);
@@ -5756,7 +5773,9 @@ export class AgentSession {
 					propagateFailure,
 				);
 			};
-			return barrier.then(() => this.#appendCoordinatorPersist(run));
+			const queued = barrier.then(() => this.#appendCoordinatorPersist(run));
+			this.#trackReleasedBarrierPersist(queued);
+			return queued;
 		}
 		const context = {
 			sessionId: this.sessionId,

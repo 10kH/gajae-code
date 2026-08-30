@@ -402,6 +402,58 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 		}
 	}, 20_000);
 
+	it("issue-4629: a second rescope drains the prior move's released-barrier writes", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const cwdB = path.join(cwdA, "repo-b");
+		const cwdC = path.join(cwdA, "repo-c");
+		fs.mkdirSync(cwdB, { recursive: true });
+		fs.mkdirSync(cwdC, { recursive: true });
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"] });
+		const deferredPersistStarted = Promise.withResolvers<void>();
+		const releaseDeferredPersist = Promise.withResolvers<void>();
+		const unregister = sessionManager.registerBeforeMoveListener(move => {
+			if (move.newCwd === path.resolve(cwdB)) session.agent.emitExternalEvent({ type: "turn_start" });
+		});
+		try {
+			const sessionId = session.sessionId;
+			const stateA = path.join(sessionRuntimeDir(cwdA, sessionId), "runtime-state.json");
+			const stateB = path.join(sessionRuntimeDir(cwdB, sessionId), "runtime-state.json");
+			const stateC = path.join(sessionRuntimeDir(cwdC, sessionId), "runtime-state.json");
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "agent_start" },
+				{ sessionId, cwd: cwdA, sessionFile: sessionManager.getSessionFile() ?? null },
+			);
+			__sessionStateSidecarTestHooks.beforePersistFromEvent = async (eventType, cwd) => {
+				if (eventType !== "turn_start" || cwd !== path.resolve(cwdB)) return;
+				deferredPersistStarted.resolve();
+				await releaseDeferredPersist.promise;
+			};
+
+			await sessionManager.moveTo(cwdB);
+			await deferredPersistStarted.promise;
+			unregister();
+			const secondMove = sessionManager.moveTo(cwdC);
+			await Bun.sleep(10);
+			expect(sessionManager.getCwd()).toBe(path.resolve(cwdB));
+			releaseDeferredPersist.resolve();
+
+			await secondMove;
+			await session.awaitSessionSettlement();
+
+			expect(fs.existsSync(stateA)).toBe(false);
+			expect(fs.existsSync(stateB)).toBe(false);
+			expect((JSON.parse(fs.readFileSync(stateC, "utf8")) as Record<string, unknown>).cwd).toBe(path.resolve(cwdC));
+			expect(fs.existsSync(path.join(sessionRuntimeDir(cwdC, sessionId), "runtime-state-rescope.json"))).toBe(false);
+		} finally {
+			unregister();
+			releaseDeferredPersist.resolve();
+			await session.dispose();
+		}
+	}, 20_000);
+
 	it("issue-4629: a later before-move listener failure clears the prepared recovery journal", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
