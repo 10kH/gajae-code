@@ -321,6 +321,87 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 		}
 	}, 20_000);
 
+	it("issue-4629: a parked pre-move agent_end rehomes to the committed cwd", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const cwdB = path.join(cwdA, "repo-b");
+		fs.mkdirSync(cwdB, { recursive: true });
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"] });
+		try {
+			const sessionId = session.sessionId;
+			const launcherFile = path.join(sessionRuntimeDir(cwdA, sessionId), "runtime-state.json");
+			const targetFile = path.join(sessionRuntimeDir(cwdB, sessionId), "runtime-state.json");
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "agent_start" },
+				{ sessionId, cwd: cwdA, sessionFile: sessionManager.getSessionFile() ?? null },
+			);
+			session.parkAgentEndForCoordinatorPersistForTests({ type: "agent_end", messages: [] });
+
+			await sessionManager.moveTo(cwdB);
+			session.flushParkedAgentEndForCoordinatorPersistForTests();
+			await session.awaitSessionSettlement();
+			for (let attempt = 0; attempt < 100; attempt++) {
+				const state = (JSON.parse(fs.readFileSync(targetFile, "utf8")) as Record<string, unknown>).state;
+				if (state === "completed") break;
+				await Bun.sleep(10);
+			}
+
+			expect(fs.existsSync(launcherFile)).toBe(false);
+			expect((JSON.parse(fs.readFileSync(targetFile, "utf8")) as Record<string, unknown>).state).toBe("completed");
+		} finally {
+			await session.dispose();
+		}
+	}, 20_000);
+
+	it("issue-4629: a post-barrier write cannot queue ahead of a delayed pre-barrier reservation", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const cwdB = path.join(cwdA, "repo-b");
+		fs.mkdirSync(cwdB, { recursive: true });
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"] });
+		const releasePreBarrier = Promise.withResolvers<void>();
+		try {
+			const sessionId = session.sessionId;
+			const launcherFile = path.join(sessionRuntimeDir(cwdA, sessionId), "runtime-state.json");
+			const targetFile = path.join(sessionRuntimeDir(cwdB, sessionId), "runtime-state.json");
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "agent_start" },
+				{ sessionId, cwd: cwdA, sessionFile: sessionManager.getSessionFile() ?? null },
+			);
+			const preBarrierPersist = session.queueCoordinatorRuntimeStatePersistForTests(
+				{ type: "turn_start" },
+				releasePreBarrier.promise,
+			);
+			const move = sessionManager.moveTo(cwdB);
+			await Bun.sleep(10);
+			session.agent.emitExternalEvent({ type: "turn_start" });
+			await Bun.sleep(10);
+			releasePreBarrier.resolve();
+
+			await Promise.race([
+				move,
+				Bun.sleep(5_000).then(() => {
+					throw new Error("move deadlocked behind a deferred post-barrier write");
+				}),
+			]);
+			await preBarrierPersist;
+			await session.awaitSessionSettlement();
+			for (let attempt = 0; attempt < 100 && !fs.existsSync(targetFile); attempt++) await Bun.sleep(10);
+
+			expect(fs.existsSync(launcherFile)).toBe(false);
+			expect((JSON.parse(fs.readFileSync(targetFile, "utf8")) as Record<string, unknown>).cwd).toBe(
+				path.resolve(cwdB),
+			);
+		} finally {
+			releasePreBarrier.resolve();
+			await session.dispose();
+		}
+	}, 20_000);
+
 	it("issue-4629: a later before-move listener failure clears the prepared recovery journal", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);

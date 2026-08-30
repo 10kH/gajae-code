@@ -3240,7 +3240,20 @@ export class AgentSession {
 		const barrier = Promise.withResolvers<void>();
 		this.#coordinatorRescopeBarrier = barrier.promise;
 		this.#releaseCoordinatorRescopeBarrier = barrier.resolve;
+		this.#bindPendingAgentEndToRescopeBarrier();
 		return [...this.#coordinatorEventHandlers];
+	}
+
+	#bindPendingAgentEndToRescopeBarrier(): void {
+		if (!this.#coordinatorRescopeBarrier || !this.#pendingAgentEndEmit) return;
+		const admission = this.#agentEventAdmission.get(this.#pendingAgentEndEmit);
+		if (admission && !admission.persistBarrier) admission.persistBarrier = this.#coordinatorRescopeBarrier;
+	}
+
+	#appendCoordinatorPersist(run: () => Promise<void>): Promise<void> {
+		const queued = this.#coordinatorPersistQueue.then(run, run);
+		this.#coordinatorPersistQueue = queued.catch(() => {});
+		return queued;
 	}
 
 	#trackUnbarrieredCoordinatorPersist(persist: Promise<void>): void {
@@ -4104,6 +4117,7 @@ export class AgentSession {
 		this.#unregisterBeforeMoveListener = this.sessionManager.registerBeforeMoveListener(async move => {
 			const admittedBeforeBarrier = this.#beginCoordinatorRescopeBarrier();
 			await Promise.allSettled(admittedBeforeBarrier);
+			this.#bindPendingAgentEndToRescopeBarrier();
 			await this.#drainUnbarrieredCoordinatorPersists();
 			this.#coordinatorPersistGeneration += 1;
 			const moveId = crypto.randomUUID();
@@ -5702,8 +5716,9 @@ export class AgentSession {
 					})
 				: undefined;
 		};
-		const queued = this.#coordinatorPersistQueue.then(persist, persist);
-		this.#coordinatorPersistQueue = queued.catch(() => {});
+		const queued = barrier
+			? barrier.then(() => this.#appendCoordinatorPersist(persist))
+			: this.#appendCoordinatorPersist(persist);
 		if (!barrier) this.#trackUnbarrieredCoordinatorPersist(queued);
 		void queued.catch(error =>
 			logger.warn("Failed to persist terminal reconciliation outcome", { error: String(error) }),
@@ -5741,9 +5756,7 @@ export class AgentSession {
 					propagateFailure,
 				);
 			};
-			const queued = this.#coordinatorPersistQueue.then(run, run);
-			this.#coordinatorPersistQueue = queued.catch(() => {});
-			return queued;
+			return barrier.then(() => this.#appendCoordinatorPersist(run));
 		}
 		const context = {
 			sessionId: this.sessionId,
@@ -5755,8 +5768,7 @@ export class AgentSession {
 			generation === this.#coordinatorPersistGeneration
 				? this.#persistRuntimeStateInBackground(event, context, observation, propagateFailure)
 				: Promise.resolve();
-		const queued = this.#coordinatorPersistQueue.then(run, run);
-		this.#coordinatorPersistQueue = queued.catch(() => {});
+		const queued = this.#appendCoordinatorPersist(run);
 		this.#trackUnbarrieredCoordinatorPersist(queued);
 		return queued;
 	}
@@ -8926,6 +8938,18 @@ export class AgentSession {
 			() => this.#coordinatorEventHandlers.delete(task),
 		);
 		return task;
+	}
+
+	parkAgentEndForCoordinatorPersistForTests(event: Extract<AgentSessionEvent, { type: "agent_end" }>): void {
+		this.#agentEventAdmission.set(event, {
+			persistGeneration: this.#coordinatorPersistGeneration,
+			persistBarrier: this.#coordinatorRescopeBarrier,
+		});
+		this.#pendingAgentEndEmit = event;
+	}
+
+	flushParkedAgentEndForCoordinatorPersistForTests(): void {
+		this.#flushPendingAgentEnd();
 	}
 
 	async drainAsyncJobDeliveriesForAcp(options?: { timeoutMs?: number }): Promise<boolean> {
