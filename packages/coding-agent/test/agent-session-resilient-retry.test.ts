@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
 import { Agent, type AgentTool, type StreamFn } from "@gajae-code/agent-core";
@@ -20,6 +20,8 @@ import {
 	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
 	PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION,
 } from "../../ai/src/adapter-internals/provider-safety-stop";
+
+const it = test.serial;
 
 /**
  * Anthropic's statusless capacity-overload envelope exactly as observed in a
@@ -102,12 +104,13 @@ describe("AgentSession resilient retry", () => {
 		// Teardown uses real timer/deadline state. Restore test clocks and scheduler
 		// hooks before disposing so a mocked Date.now cannot wedge cleanup.
 		vi.restoreAllMocks();
-		if (session) {
-			await session.dispose();
-			session = undefined;
-		}
-		authStorage.close();
-		tempDir.removeSync();
+		const currentSession = session;
+		const currentAuthStorage = authStorage;
+		const currentTempDir = tempDir;
+		session = undefined;
+		if (currentSession) await currentSession.dispose();
+		currentAuthStorage.close();
+		currentTempDir.removeSync();
 	});
 
 	function buildSession(options: {
