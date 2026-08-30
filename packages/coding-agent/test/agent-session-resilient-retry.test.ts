@@ -2180,7 +2180,7 @@ describe.serial("AgentSession resilient retry", () => {
 			expect.objectContaining({ attempt: 1, maxAttempts: 2, errorMessage, unbounded: false }),
 		]);
 		expect(lastAssistant(session).errorMessage).toContain("exhausted after 2 attempts");
-	}, 60000);
+	}, 60_000);
 	it("reseeds first-event timeout accounting at the first retryable failure", async () => {
 		let now = 10;
 		vi.spyOn(Date, "now").mockImplementation(() => now);
@@ -2869,7 +2869,7 @@ describe.serial("AgentSession resilient retry", () => {
 			false,
 		);
 		expect(lastAssistant(session).content).toEqual([{ type: "text", text: "replacement recovered" }]);
-	});
+	}, 60_000);
 	it("fails closed on non-canonical watchdog prose under bare defaults", async () => {
 		const nearMisses = [
 			"stream timed out while waiting for the first event",

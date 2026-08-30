@@ -8469,7 +8469,6 @@ export class AgentSession {
 		await this.#agentEndPublicationPromise;
 		await this.#queuedExtensionEvents;
 		await this.#agentEndHandlingPromise;
-		await this.#waitForSessionSettlement();
 		// Drain the sidecar write order for the same reason the two queues above are
 		// drained: each entry writes under the native identity-bound state-file lock, so a
 		// still-queued write would run after the session that owns it is gone — releasing
