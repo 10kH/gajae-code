@@ -4584,6 +4584,22 @@ export class ModelRegistry {
 	autoroutingProviderOrder(): readonly string[] {
 		return projectCatalogProviderOrder(getConfiguredProviderOrderFromSettings(), this.#models);
 	}
+
+	/**
+	 * Provider priority for automatic model selection. Explicit provider order
+	 * wins first, followed by omitted OAuth providers, then other providers;
+	 * catalog order breaks ties within each policy band.
+	 */
+	automaticProviderOrder(sessionId?: string): readonly string[] {
+		const policy = this.#buildProviderSelectionPolicy(sessionId);
+		return [...policy.orderedProviders()].sort((left, right) => {
+			const rankDifference = policy.rank(left) - policy.rank(right);
+			return rankDifference !== 0
+				? rankDifference
+				: policy.providerCatalogIndex(left) - policy.providerCatalogIndex(right);
+		});
+	}
+
 	#providerRankMap(policy: ProviderSelectionPolicy): Map<string, number> {
 		const providerRank = new Map<string, number>();
 		for (const provider of policy.orderedProviders()) {

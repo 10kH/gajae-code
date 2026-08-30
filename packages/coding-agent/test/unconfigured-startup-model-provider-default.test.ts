@@ -44,6 +44,17 @@ describe("unconfigured startup model prefers a curated provider default", () => 
 		expect(ordered[0]?.id).toBe(anthropicDefault);
 	});
 
+	test("uses explicit provider priority before curated default table order", () => {
+		const candidates = [
+			model("anthropic", anthropicDefault),
+			model("amazon-bedrock", DEFAULT_MODEL_PER_PROVIDER["amazon-bedrock"]),
+		];
+
+		const ordered = orderByProviderDefaultFirst(candidates, ["amazon-bedrock", "anthropic"]);
+
+		expect(ordered).toEqual([candidates[1], candidates[0]]);
+	});
+
 	test("preserves every candidate so credential scanning still sees the full set", () => {
 		const candidates = [
 			model("anthropic", "claude-3-5-sonnet-20240620"),

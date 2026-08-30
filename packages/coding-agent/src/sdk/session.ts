@@ -1296,14 +1296,21 @@ function findDeferredExactMcpToolNameCollisions(
  * reusing it keeps both unconfigured paths on one source of truth. Candidates
  * that are not a provider default keep their original relative order.
  */
-export function orderByProviderDefaultFirst(candidates: readonly Model[]): Model[] {
+export function orderByProviderDefaultFirst(
+	candidates: readonly Model[],
+	providerOrder: readonly string[] = Object.keys(DEFAULT_MODEL_PER_PROVIDER),
+): Model[] {
 	const preferred: Model[] = [];
 	const rest: Model[] = [];
 	const preferredCandidates = new Set<Model>();
-	for (const provider of Object.keys(DEFAULT_MODEL_PER_PROVIDER) as KnownProvider[]) {
-		const defaultId = DEFAULT_MODEL_PER_PROVIDER[provider];
+	const seenProviders = new Set<string>();
+	for (const rawProvider of [...providerOrder, ...Object.keys(DEFAULT_MODEL_PER_PROVIDER)]) {
+		const provider = rawProvider.trim().toLowerCase();
+		if (!provider || seenProviders.has(provider) || !(provider in DEFAULT_MODEL_PER_PROVIDER)) continue;
+		seenProviders.add(provider);
+		const defaultId = DEFAULT_MODEL_PER_PROVIDER[provider as KnownProvider];
 		for (const candidate of candidates) {
-			if (candidate.provider === provider && candidate.id === defaultId) {
+			if (candidate.provider.trim().toLowerCase() === provider && candidate.id === defaultId) {
 				preferred.push(candidate);
 				preferredCandidates.add(candidate);
 			}
@@ -3456,14 +3463,30 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		if (!model && !options.modelPattern && !startupCredentialModelRejected) {
 			// Re-resolve the allowed set: extension factories above may have
 			// registered providers/models that weren't visible at startup.
-			const fallbackCandidates = await resolveAllowedModels(modelRegistry, settings, modelMatchPreferences);
+			const allowedFallbackCandidates = await resolveAllowedModels(modelRegistry, settings, modelMatchPreferences);
+			// A fresh provider discovery can disprove a bundled model while the
+			// general available catalog retains it for offline/profile compatibility.
+			// Exclude only those positively disproved bundled entries from the
+			// unconfigured startup path; explicit model/profile resolution above keeps
+			// its existing precedence and semantics.
+			const profileAvailableKeys = new Set(
+				modelRegistry
+					.getAvailableForProfileActivation()
+					.map(candidate => `${candidate.provider}\u0000${candidate.id}`),
+			);
+			const fallbackCandidates = allowedFallbackCandidates.filter(candidate =>
+				profileAvailableKeys.has(`${candidate.provider}\u0000${candidate.id}`),
+			);
 			// Candidate order is not a quality signal: catalogs sort retired models
 			// ahead of current ones whenever their IDs carry older date suffixes, so
 			// an unconfigured install would otherwise start on a model its provider
 			// has already withdrawn. Sweep each known provider's curated default
 			// first — the same table `findInitialModel` consults — and only then fall
 			// back to catalog order.
-			for (const candidate of orderByProviderDefaultFirst(fallbackCandidates)) {
+			for (const candidate of orderByProviderDefaultFirst(
+				fallbackCandidates,
+				modelRegistry.automaticProviderOrder(credentialSessionId),
+			)) {
 				if (await hasModelApiKey(candidate)) {
 					model = candidate;
 					break;
