@@ -2850,6 +2850,7 @@ export class AgentSession {
 	readonly #disposeAsyncJobManager: boolean;
 	#ownedMcpManager: MCPManager | undefined;
 	#startupTurnBarrier: Promise<void> | undefined;
+	#startupTurnBarrierPending = false;
 	#pendingPythonMessages: Array<{
 		message: PythonExecutionMessage;
 		onPersisted?: () => void;
@@ -3331,16 +3332,33 @@ export class AgentSession {
 		return { entry, capability: entry.continuationCapability };
 	}
 
-	async #awaitStartupTurnBarrier(signal?: AbortSignal): Promise<void> {
-		const barrier = this.#startupTurnBarrier;
+	#setStartupTurnBarrier(barrier: Promise<void> | undefined): void {
+		this.#startupTurnBarrier = barrier;
+		this.#startupTurnBarrierPending = barrier !== undefined;
 		if (!barrier) return;
-		await awaitPromptInvocationPreflight(barrier, signal);
-		if (this.#startupTurnBarrier === barrier) this.#startupTurnBarrier = undefined;
+		void barrier.then(
+			() => {
+				if (this.#startupTurnBarrier === barrier) this.#startupTurnBarrierPending = false;
+			},
+			() => {
+				if (this.#startupTurnBarrier === barrier) this.#startupTurnBarrierPending = false;
+			},
+		);
+	}
+	async #awaitStartupTurnBarrier(signal?: AbortSignal): Promise<void> {
+		while (true) {
+			const barrier = this.#startupTurnBarrier;
+			if (!barrier) return;
+			await awaitPromptInvocationPreflight(barrier, signal);
+			if (this.#startupTurnBarrier !== barrier) continue;
+			this.#setStartupTurnBarrier(undefined);
+			return;
+		}
 	}
 	extendStartupTurnBarrier(barrier: Promise<void>): void {
 		const current = this.#startupTurnBarrier;
-		this.#startupTurnBarrier = current ? Promise.all([current, barrier]).then(() => {}) : barrier;
-		void this.#startupTurnBarrier.catch(() => {});
+		this.#setStartupTurnBarrier(current ? Promise.all([current, barrier]).then(() => {}) : barrier);
+		void this.#startupTurnBarrier?.catch(() => {});
 	}
 
 	async #withSessionAdmission<T>(
@@ -4231,7 +4249,7 @@ export class AgentSession {
 		this.#disposeAsyncJobManager = config.disposeAsyncJobManager ?? true;
 		this.#retainedMemorySampler = config.retainedMemorySampler;
 		this.#ownedMcpManager = config.ownedMcpManager;
-		this.#startupTurnBarrier = config.startupTurnBarrier;
+		this.#setStartupTurnBarrier(config.startupTurnBarrier);
 		// Only arm the recovery barrier when a rescope journal is actually pending. Arming it
 		// unconditionally flips #startupTurnBarrier from absent to a (resolved) promise for
 		// every session, which makes barrier-gated post-turn work (e.g. the hidden-next-turn
@@ -4331,7 +4349,7 @@ export class AgentSession {
 				// agent.prompt directly, allocates right before admission.
 				this.agent.followUp(message);
 			},
-			injectIdle: async messages => {
+			injectIdle: async (messages, signal) => {
 				// Mandated boundary comment (corrected turn semantics): same origin
 				// split as the streaming injector — an allowed owned-completion
 				// delivery starts a fresh turn attempt/lineage and is not a
@@ -4353,7 +4371,7 @@ export class AgentSession {
 				};
 				if (settleIfDisposing()) return;
 				try {
-					await this.#awaitStartupTurnBarrier(this.#disposeAbortController.signal);
+					await this.#awaitStartupTurnBarrier(signal ?? this.#disposeAbortController.signal);
 				} catch {
 					settleIfDisposing();
 					return;
@@ -4400,13 +4418,15 @@ export class AgentSession {
 				}
 			},
 			scheduleIdleFlush: run => {
+				// The startup barrier already gates injectIdle, so begin waiting on a
+				// pending barrier immediately. Once readiness has settled, ordinary
+				// idle wakes retain the fixed merge window.
+				const delayMs = this.#startupTurnBarrierPending ? 0 : FOLD_WAKE_MERGE_WINDOW_MS;
 				this.#schedulePostPromptTask(
-					async () => {
-						await run();
+					async signal => {
+						await run(signal);
 					},
-					// One merge window, so staggered completions share a single wake
-					// turn instead of each buying its own.
-					{ delayMs: FOLD_WAKE_MERGE_WINDOW_MS },
+					{ delayMs },
 				);
 			},
 		});

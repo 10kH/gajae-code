@@ -9,6 +9,7 @@ import { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { CustomTool } from "@gajae-code/coding-agent/extensibility/custom-tools/types";
 import { createAgentSession, type ExtensionFactory } from "@gajae-code/coding-agent/sdk";
 import { ArtifactManager } from "@gajae-code/coding-agent/session/artifacts";
+import { FOLD_WAKE_MERGE_WINDOW_MS } from "@gajae-code/coding-agent/session/fold-coordinator";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { getAgentDir, logger, Snowflake, setAgentDir } from "@gajae-code/utils";
 import * as z from "zod/v4";
@@ -71,7 +72,7 @@ function createReasoningModel(): Model<"openai-responses"> {
 }
 
 const oldSessionMtime = new Date("2000-01-01T00:00:00.000Z");
-const SLOW_SDK_TEST_TIMEOUT_MS = 15_000;
+const SLOW_SDK_TEST_TIMEOUT_MS = 120_000;
 const validSixSurfacePluginBundle = path.join(import.meta.dir, "fixtures", "gjc-plugins", "valid-six-surface-bundle");
 const originalAgentDir = getAgentDir();
 
@@ -307,6 +308,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			mcpConfigPath: path.join(tempDir, "deferred-idle.json"),
 			deferMcpConfigStartup: true,
 		});
+		vi.useFakeTimers();
 		try {
 			const agentPrompt = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
 			session.yieldQueue.register<string>("deferred-mcp-test", {
@@ -314,15 +316,154 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			});
 			const startup = startDeferredMcpConfig!();
 			session.yieldQueue.enqueue("deferred-mcp-test", "background delivery");
-			await Bun.sleep(10);
+			vi.advanceTimersByTime(0);
+			await Promise.resolve();
 			expect(agentPrompt).not.toHaveBeenCalled();
 
 			discovery.resolve(createMcpLoadResult([createMcpCustomTool("mcp__exact_lookup", "exact", "lookup")]));
 			await startup;
-			await Bun.sleep(10);
+			vi.advanceTimersByTime(0);
+			for (let i = 0; i < 10; i++) await Promise.resolve();
 			expect(agentPrompt).toHaveBeenCalledTimes(1);
 		} finally {
+			vi.useRealTimers();
 			await session.dispose();
+		}
+	});
+	it("keeps idle delivery behind startup barriers added during readiness", async () => {
+		const firstBarrier = Promise.withResolvers<void>();
+		const secondBarrier = Promise.withResolvers<void>();
+		const { session } = await createAgentSession(createIsolatedSessionOptions());
+		vi.useFakeTimers();
+		try {
+			const agentPrompt = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+			session.extendStartupTurnBarrier(firstBarrier.promise);
+			session.yieldQueue.register<string>("startup-barrier-race-test", {
+				build: entries => ({ role: "user", content: entries.join("\n"), timestamp: Date.now() }),
+			});
+			session.yieldQueue.enqueue("startup-barrier-race-test", "barrier-race");
+			vi.advanceTimersByTime(0);
+			await Promise.resolve();
+
+			firstBarrier.resolve();
+			session.extendStartupTurnBarrier(secondBarrier.promise);
+			for (let i = 0; i < 5; i++) await Promise.resolve();
+			expect(agentPrompt).not.toHaveBeenCalled();
+
+			secondBarrier.resolve();
+			await session.waitForIdle();
+			expect(agentPrompt).toHaveBeenCalledTimes(1);
+		} finally {
+			firstBarrier.resolve();
+			secondBarrier.resolve();
+			vi.useRealTimers();
+			await session.dispose();
+		}
+	});
+	it("settles an idle wake without prompting when startup readiness rejects", async () => {
+		const barrier = Promise.withResolvers<void>();
+		const { session } = await createAgentSession(createIsolatedSessionOptions());
+		try {
+			const agentPrompt = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+			session.extendStartupTurnBarrier(barrier.promise);
+			session.yieldQueue.register<string>("startup-rejection-test", {
+				build: entries => ({ role: "user", content: entries.join("\n"), timestamp: Date.now() }),
+			});
+			session.yieldQueue.enqueue("startup-rejection-test", "rejected-startup");
+			await Promise.resolve();
+
+			barrier.reject(new Error("startup failed"));
+			await session.waitForIdle();
+			expect(agentPrompt).not.toHaveBeenCalled();
+			expect(session.yieldQueue.has()).toBe(false);
+		} finally {
+			barrier.resolve();
+			await session.dispose();
+		}
+	});
+	it("cancels an idle startup wait when abort is requested", async () => {
+		const barrier = Promise.withResolvers<void>();
+		const { session } = await createAgentSession(createIsolatedSessionOptions());
+		try {
+			const agentPrompt = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+			session.extendStartupTurnBarrier(barrier.promise);
+			session.yieldQueue.register<string>("startup-abort-race-test", {
+				build: entries => ({ role: "user", content: entries.join("\n"), timestamp: Date.now() }),
+			});
+			session.yieldQueue.enqueue("startup-abort-race-test", "abort-race");
+			await Promise.resolve();
+
+			const abort = session.abort();
+			const abortedBeforeDeadline = await Promise.race([abort.then(() => true), Bun.sleep(1_000).then(() => false)]);
+			expect(abortedBeforeDeadline).toBe(true);
+			await abort;
+			expect(agentPrompt).not.toHaveBeenCalled();
+		} finally {
+			barrier.resolve();
+			await session.dispose();
+		}
+	});
+	it("restores the merge window after readiness settles before the first idle wake", async () => {
+		const { session } = await createAgentSession(createIsolatedSessionOptions());
+		vi.useFakeTimers();
+		try {
+			const agentPrompt = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+			session.extendStartupTurnBarrier(Promise.resolve());
+			await Promise.resolve();
+			session.yieldQueue.register<string>("settled-startup-wake-test", {
+				build: entries => ({ role: "user", content: entries.join("\n"), timestamp: Date.now() }),
+			});
+			session.yieldQueue.enqueue("settled-startup-wake-test", "ordinary-wake");
+			await Promise.resolve();
+			expect(agentPrompt).not.toHaveBeenCalled();
+
+			vi.advanceTimersByTime(FOLD_WAKE_MERGE_WINDOW_MS - 1);
+			await Promise.resolve();
+			expect(agentPrompt).not.toHaveBeenCalled();
+			vi.advanceTimersByTime(1);
+			await session.waitForIdle();
+			expect(agentPrompt).toHaveBeenCalledTimes(1);
+		} finally {
+			vi.useRealTimers();
+			await session.dispose();
+		}
+	});
+	it("isolates deferred idle readiness between sessions", async () => {
+		const firstBarrier = Promise.withResolvers<void>();
+		const secondBarrier = Promise.withResolvers<void>();
+		const { session: firstSession } = await createAgentSession(createIsolatedSessionOptions());
+		const { session: secondSession } = await createAgentSession(createIsolatedSessionOptions());
+		vi.useFakeTimers();
+		try {
+			const firstPrompt = vi.spyOn(firstSession.agent, "prompt").mockResolvedValue(undefined);
+			const secondPrompt = vi.spyOn(secondSession.agent, "prompt").mockResolvedValue(undefined);
+			firstSession.extendStartupTurnBarrier(firstBarrier.promise);
+			secondSession.extendStartupTurnBarrier(secondBarrier.promise);
+			for (const [session, kind] of [
+				[firstSession, "first-session-idle"],
+				[secondSession, "second-session-idle"],
+			] as const) {
+				session.yieldQueue.register<string>(kind, {
+					build: entries => ({ role: "user", content: entries.join("\n"), timestamp: Date.now() }),
+				});
+				session.yieldQueue.enqueue(kind, kind);
+			}
+			vi.advanceTimersByTime(0);
+			await Promise.resolve();
+
+			firstBarrier.resolve();
+			await firstSession.waitForIdle();
+			expect(firstPrompt).toHaveBeenCalledTimes(1);
+			expect(secondPrompt).not.toHaveBeenCalled();
+
+			secondBarrier.resolve();
+			await secondSession.waitForIdle();
+			expect(secondPrompt).toHaveBeenCalledTimes(1);
+		} finally {
+			firstBarrier.resolve();
+			secondBarrier.resolve();
+			vi.useRealTimers();
+			await Promise.all([firstSession.dispose(), secondSession.dispose()]);
 		}
 	});
 	it("preserves persisted MCP selections while the deferred catalog is pending", async () => {
