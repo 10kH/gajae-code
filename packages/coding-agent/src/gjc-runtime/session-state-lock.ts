@@ -1582,7 +1582,7 @@ async function reclaimStaleTransitionClaim(transitionDir: string, quarantineName
 		return;
 	}
 	if (!validLockOwner(owner)) return;
-	if (await lockOwnerIsAlive(owner)) return;
+	if (owner.released !== true && (await lockOwnerIsAlive(owner))) return;
 	const generation = transitionGenerationFromStat(stat);
 	const nativePath = await canonicalOwnedTransitionPath(transitionDir).catch(() => null);
 	if (!nativePath) return;

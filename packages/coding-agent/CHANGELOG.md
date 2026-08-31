@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Windows session-state locks now drain late terminal reconciliation writes before disposal returns and safely reclaim dead transition claims, including released owner tombstones left by interrupted cleanup. (#5102)
+
 - Deferred MCP startup now releases queued idle yields as soon as readiness settles without bypassing prompt admission. Barrier extensions remain gated, rejected startup drops the wake without prompting, settled sessions retain the normal idle merge window, and readiness stays session-local. (#5085)
 
 - ACP deep-interview's real subprocess fixture now retires its owned lifecycle sessions before broker/root cleanup, preventing detached session hosts from recreating the fixture root after teardown. (#5086)
