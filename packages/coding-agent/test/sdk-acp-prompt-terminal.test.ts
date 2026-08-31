@@ -468,6 +468,7 @@ test("ACP rejects a successor that reuses a retained prompt correlation", async 
 		await expect(bounded(failed, "first failure settlement")).rejects.toMatchObject({ code: "prompt_failed" });
 
 		const replacement = prompt(fixture, "reused correlation");
+		void replacement.catch(() => undefined);
 		await waitFor(() => fixture.promptDeliveryCount() === 2, "replacement prompt delivery");
 		await expect(bounded(replacement, "reused correlation rejection")).rejects.toMatchObject({
 			code: "invalid_prompt_acknowledgement",
