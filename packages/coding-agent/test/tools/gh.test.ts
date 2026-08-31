@@ -250,7 +250,7 @@ describe("parsePrUnifiedDiff", () => {
 		["four-byte sequence", "\\360\\237\\232\\200.md", "\u{1F680}.md"],
 		["octal bytes beside named escapes and spaces", "na\\tme \\303\\251.md", "na\tme \u00E9.md"],
 		["escaped quote and backslash", 'q\\"b\\\\.md', 'q"b\\.md'],
-		["truncated multi-byte sequence", "x\\303y.md", "x\uFFFDy.md"],
+		["truncated multi-byte sequence kept in escaped form", "x\\303y.md", "x\\303y.md"],
 	])("decodes a quoted header path with a %s", (_label, quoted, expected) => {
 		const diff = [
 			`diff --git "a/${quoted}" "b/${quoted}"`,
@@ -276,6 +276,51 @@ describe("parsePrUnifiedDiff", () => {
 			changeType: "renamed",
 			oldPath: "old \uD55C.md",
 			path: "new \uAE00.md",
+		});
+	});
+
+	it("keeps distinct invalid-UTF-8 byte sequences distinct", () => {
+		const diffFor = (quoted: string) =>
+			[`diff --git "a/${quoted}" "b/${quoted}"`, "index 0000000..1111111 100644", "@@ -1 +1 @@", "+new"].join("\n");
+
+		const first = parsePrUnifiedDiff(diffFor("x\\303y.md")).files[0]?.path;
+		const second = parsePrUnifiedDiff(diffFor("x\\304y.md")).files[0]?.path;
+
+		expect(first).toBe("x\\303y.md");
+		expect(second).toBe("x\\304y.md");
+		expect(first).not.toBe(second);
+		expect(first).not.toContain("\uFFFD");
+	});
+
+	it.each([
+		["two-digit octal", "x\\77y.md"],
+		["octal above \\377", "x\\455y.md"],
+		["unknown escape", "x\\qy.md"],
+	])("keeps a %s escape in its source form", (_label, quoted) => {
+		const diff = [
+			`diff --git "a/${quoted}" "b/${quoted}"`,
+			"index 0000000..1111111 100644",
+			"@@ -1 +1 @@",
+			"+new",
+		].join("\n");
+
+		expect(parsePrUnifiedDiff(diff).files[0]?.path).toBe(quoted);
+	});
+
+	it("preserves invalid-UTF-8 rename metadata in escaped form", () => {
+		const diff = [
+			'diff --git "a/old \\303.md" "b/new \\304.md"',
+			"similarity index 100%",
+			'rename from "old \\303.md"',
+			'rename to "new \\304.md"',
+		].join("\n");
+
+		const parsed = parsePrUnifiedDiff(diff);
+
+		expect(parsed.files[0]).toMatchObject({
+			changeType: "renamed",
+			oldPath: "old \\303.md",
+			path: "new \\304.md",
 		});
 	});
 

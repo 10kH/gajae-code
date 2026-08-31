@@ -2870,12 +2870,12 @@ function skipDiffHeaderSpaces(text: string, index: number): number {
 }
 
 interface ParsedDiffQuotedEscape {
-	bytes: number[];
+	byte: number;
 	nextIndex: number;
 }
 
 const DIFF_PATH_ENCODER = new TextEncoder();
-const DIFF_PATH_DECODER = new TextDecoder();
+const DIFF_PATH_DECODER = new TextDecoder("utf-8", { fatal: true });
 
 const DIFF_NAMED_ESCAPE_BYTES: Record<string, number> = {
 	a: 0x07,
@@ -2885,47 +2885,60 @@ const DIFF_NAMED_ESCAPE_BYTES: Record<string, number> = {
 	r: 0x0d,
 	t: 0x09,
 	v: 0x0b,
+	"\\": 0x5c,
+	'"': 0x22,
 };
 
 /**
- * Git quotes paths C-style and escapes every byte outside printable ASCII as
- * octal, so a multi-byte UTF-8 character arrives as consecutive octal escapes.
- * Escapes therefore yield bytes, and the whole token is decoded once.
+ * Git quotes paths C-style: its named escapes plus exactly three octal digits
+ * per byte (leading digit 0-3), so a multi-byte UTF-8 character arrives as
+ * consecutive octal escapes. Anything else is malformed for this grammar.
  */
-function parseDiffQuotedEscape(text: string, slashIndex: number): ParsedDiffQuotedEscape {
-	const codePoint = text.codePointAt(slashIndex + 1);
-	if (codePoint === undefined) return { bytes: [0x5c], nextIndex: slashIndex + 1 };
-	const next = String.fromCodePoint(codePoint);
-
-	if (next >= "0" && next <= "7") {
-		let end = slashIndex + 1;
-		while (end < text.length && end < slashIndex + 4) {
-			const digit = text.charAt(end);
-			if (digit < "0" || digit > "7") break;
-			end += 1;
-		}
-		return { bytes: [Number.parseInt(text.slice(slashIndex + 1, end), 8) & 0xff], nextIndex: end };
+function parseDiffQuotedEscape(text: string, slashIndex: number): ParsedDiffQuotedEscape | undefined {
+	const first = text.charAt(slashIndex + 1);
+	if (first >= "0" && first <= "3") {
+		const second = text.charAt(slashIndex + 2);
+		const third = text.charAt(slashIndex + 3);
+		if (second < "0" || second > "7" || third < "0" || third > "7") return undefined;
+		return { byte: Number.parseInt(text.slice(slashIndex + 1, slashIndex + 4), 8), nextIndex: slashIndex + 4 };
 	}
-
-	const named = DIFF_NAMED_ESCAPE_BYTES[next];
-	if (named !== undefined) return { bytes: [named], nextIndex: slashIndex + 2 };
-	return { bytes: Array.from(DIFF_PATH_ENCODER.encode(next)), nextIndex: slashIndex + 1 + next.length };
+	const named = DIFF_NAMED_ESCAPE_BYTES[first];
+	if (named === undefined) return undefined;
+	return { byte: named, nextIndex: slashIndex + 2 };
 }
 
+/**
+ * Escaped bytes are decoded as strict UTF-8. A token holding invalid UTF-8 or
+ * a malformed escape keeps its escaped source form, so distinct non-UTF-8
+ * byte sequences never collapse into one replacement-character path.
+ */
 function parseDiffQuotedToken(text: string, startIndex: number): ParsedDiffHeaderToken | undefined {
 	if (text.charAt(startIndex) !== '"') return undefined;
 	const bytes: number[] = [];
+	let malformed = false;
 	for (let i = startIndex + 1; i < text.length; ) {
 		const codePoint = text.codePointAt(i) as number;
 		const ch = String.fromCodePoint(codePoint);
-		if (ch === '"') return { value: DIFF_PATH_DECODER.decode(Uint8Array.from(bytes)), nextIndex: i + 1 };
+		if (ch === '"') {
+			if (!malformed) {
+				try {
+					return { value: DIFF_PATH_DECODER.decode(Uint8Array.from(bytes)), nextIndex: i + 1 };
+				} catch {}
+			}
+			return { value: text.slice(startIndex + 1, i), nextIndex: i + 1 };
+		}
 		if (ch !== "\\") {
 			bytes.push(...DIFF_PATH_ENCODER.encode(ch));
 			i += ch.length;
 			continue;
 		}
 		const escaped = parseDiffQuotedEscape(text, i);
-		bytes.push(...escaped.bytes);
+		if (escaped === undefined) {
+			malformed = true;
+			i += 2;
+			continue;
+		}
+		bytes.push(escaped.byte);
 		i = escaped.nextIndex;
 	}
 	return undefined;
