@@ -1582,11 +1582,9 @@ async function reclaimStaleTransitionClaim(transitionDir: string, quarantineName
 		return;
 	}
 	if (!validLockOwner(owner)) return;
-	// A released tombstone is written after its transition directory is created.
-	// Refuse an older tombstone paired with a fresh directory, which prevents a
-	// contender from deleting a successor claim using an unrelated prior release.
-	if (owner.released === true && ownerSnapshot.mtimeNs < stat.mtimeNs) return;
-	if (owner.released !== true && (await lockOwnerIsAlive(owner))) return;
+	// Released tombstones intentionally remain fail-closed: they carry no live
+	// process proof and are not generation-bound to the sibling directory.
+	if (owner.released === true || (await lockOwnerIsAlive(owner))) return;
 	const generation = transitionGenerationFromStat(stat);
 	const nativePath = await canonicalOwnedTransitionPath(transitionDir).catch(() => null);
 	if (!nativePath) return;
