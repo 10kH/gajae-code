@@ -107,6 +107,8 @@ interface PromptWaiter {
 	acknowledged: boolean;
 	/** True once turn.prompt / skill.invoke has been sent; cancel must not fake-settle after this. */
 	dispatched: boolean;
+	/** True only while the dispatched control request can still reveal its correlation. */
+	acknowledgementPending: boolean;
 
 	/** Highest inbound frame sequence already observed when the prompt was acknowledged. */
 	boundary: number;
@@ -1688,6 +1690,7 @@ export class AcpAgent implements Agent {
 		const waiter: PromptWaiter = {
 			acknowledged: false,
 			dispatched: false,
+			acknowledgementPending: false,
 			boundary: record.inboundSequence,
 			correlation: {},
 			emittedAssistantText: "",
@@ -1752,6 +1755,7 @@ export class AcpAgent implements Agent {
 			return await response;
 		}
 
+		waiter.acknowledgementPending = true;
 		const acknowledgementTask = (async (): Promise<PromptResponse> => {
 			if (waiter.settled || record.activePrompt !== waiter) return await response;
 			const acknowledgement = skillInvocation
@@ -1855,6 +1859,7 @@ export class AcpAgent implements Agent {
 			this.#settlePrompt(params.sessionId, record, waiter);
 			return await response;
 		})().finally(() => {
+			waiter.acknowledgementPending = false;
 			this.#retiredPromptAcknowledgements.delete(params.sessionId);
 		});
 		// Settlement can win before the SDK answers `turn.prompt`; acknowledgement processing
@@ -1945,6 +1950,7 @@ export class AcpAgent implements Agent {
 			) {
 				record.activePrompt = undefined;
 				waiter.settled = true;
+				this.#fenceRetiredPromptAcknowledgement(params.sessionId, waiter);
 				waiter.deferredFrames.length = 0;
 				waiter.terminal = undefined;
 				waiter.resolve({ stopReason: "cancelled" });
@@ -2402,7 +2408,8 @@ export class AcpAgent implements Agent {
 	}
 
 	#fenceRetiredPromptAcknowledgement(id: string, waiter: PromptWaiter): void {
-		if (waiter.dispatched && !waiter.acknowledged) this.#retiredPromptAcknowledgements.add(id);
+		if (waiter.dispatched && waiter.acknowledgementPending && !waiter.acknowledged)
+			this.#retiredPromptAcknowledgements.add(id);
 	}
 
 	#recoverSessionAfterTransportFailure(id: string, adapter: AcpSdkAdapter, error: Error): void {

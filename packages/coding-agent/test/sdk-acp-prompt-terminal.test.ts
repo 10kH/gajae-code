@@ -77,6 +77,7 @@ async function createFixture(
 		blockIdleUpdate?: boolean;
 		blockWorkingReconciliation?: boolean;
 		deferSecondPromptAcknowledgement?: boolean;
+		deferFirstPromptAcknowledgement?: boolean;
 		reusePromptCorrelationOnSecond?: boolean;
 	} = {},
 ): Promise<Fixture> {
@@ -257,7 +258,11 @@ async function createFixture(
 									})())
 								: {},
 				});
-				if (frame.operation === "turn.prompt" && options.deferSecondPromptAcknowledgement && promptDeliveries === 2)
+				if (
+					frame.operation === "turn.prompt" &&
+					((options.deferFirstPromptAcknowledgement && promptDeliveries === 1) ||
+						(options.deferSecondPromptAcknowledgement && promptDeliveries === 2))
+				)
 					deferredPromptAcknowledgement = () =>
 						socket.send(
 							JSON.stringify({
@@ -693,6 +698,36 @@ test("ACP reconciliation releases a successor whose delayed acknowledgement is i
 		);
 	} finally {
 		fixture.releaseIdleUpdate();
+		fixture.releasePromptAcknowledgement();
+		fixture.dispose();
+	}
+});
+
+test("ACP preflight cancellation fences a delayed prompt acknowledgement", async () => {
+	const fixture = await createFixture({
+		deferFirstPromptAcknowledgement: true,
+		abortAcknowledgement: {
+			ok: true,
+			selection: "turn",
+			turn: "stopped",
+			terminal: "terminal_no_effect",
+			disposition: "preflight_cancelled",
+		},
+	});
+	try {
+		const pending = prompt(fixture, "preflight cancellation with delayed acknowledgement");
+		await bounded(fixture.promptDelivered, "prompt delivery");
+		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "preflight cancellation");
+		expect(await bounded(pending, "preflight-cancelled settlement")).toEqual({ stopReason: "cancelled" });
+		await expect(prompt(fixture, "blocked successor")).rejects.toMatchObject({ code: "conflict" });
+
+		fixture.releasePromptAcknowledgement();
+		await Bun.sleep(10);
+		const successor = prompt(fixture, "successor after acknowledgement retirement");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "successor prompt delivery");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(successor, "successor completion")).toEqual({ stopReason: "end_turn" });
+	} finally {
 		fixture.releasePromptAcknowledgement();
 		fixture.dispose();
 	}

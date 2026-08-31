@@ -850,6 +850,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	await expect(bounded(preflightCancelledSkill, "preflight-cancelled ACP skill")).resolves.toEqual({
 		stopReason: "cancelled",
 	});
+	await Bun.sleep(100);
 	holdSkillPreflight = false;
 	const listedOwned = await bounded(agent.listSessions({ cwd }), "list owned session");
 	expect(listedOwned.sessions).toEqual([
