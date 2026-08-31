@@ -25,7 +25,7 @@ function createHarness(initialStreaming: boolean) {
 	let streaming = initialStreaming;
 	const streamingMessages: AgentMessage[] = [];
 	const idleBatches: AgentMessage[][] = [];
-	const scheduledFlushes: Array<() => Promise<void>> = [];
+	const scheduledFlushes: Array<{ run: () => Promise<void>; onSkip: () => void }> = [];
 	const queue = new YieldQueue({
 		isStreaming: () => streaming,
 		injectStreaming: message => {
@@ -34,8 +34,8 @@ function createHarness(initialStreaming: boolean) {
 		injectIdle: async messages => {
 			idleBatches.push(messages);
 		},
-		scheduleIdleFlush: run => {
-			scheduledFlushes.push(run);
+		scheduleIdleFlush: (run, onSkip) => {
+			scheduledFlushes.push({ run, onSkip });
 		},
 	});
 	return {
@@ -80,10 +80,24 @@ describe("YieldQueue", () => {
 		expect(harness.scheduledFlushes).toHaveLength(1);
 		expect(harness.idleBatches).toHaveLength(0);
 
-		await harness.scheduledFlushes[0]!();
+		await harness.scheduledFlushes[0]!.run();
 
 		expect(harness.idleBatches).toHaveLength(1);
 		expect(harness.idleBatches[0]?.map(messageText)).toEqual(["a,b"]);
+	});
+
+	test("a skipped idle callback releases the debounce latch", () => {
+		const harness = createHarness(false);
+		harness.queue.register<Entry>("items", {
+			build: entries => userMessage(entries.map(entry => entry.id).join(",")),
+		});
+
+		harness.queue.enqueue("items", { id: "a" });
+		expect(harness.scheduledFlushes).toHaveLength(1);
+		harness.scheduledFlushes[0]!.onSkip();
+		harness.queue.enqueue("items", { id: "b" });
+
+		expect(harness.scheduledFlushes).toHaveLength(2);
 	});
 
 	test("isStale drops stale entries and keeps survivors", async () => {

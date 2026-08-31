@@ -432,12 +432,14 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 				build: entries => ({ role: "user", content: entries.join("\n"), timestamp: Date.now() }),
 			});
 			session.yieldQueue.enqueue("startup-abort-race-test", "abort-race");
+			const directFlush = session.yieldQueue.flush("idle");
 			await Promise.resolve();
 
 			const abort = session.abort();
 			const abortedBeforeDeadline = await Promise.race([abort.then(() => true), Bun.sleep(1_000).then(() => false)]);
 			expect(abortedBeforeDeadline).toBe(true);
 			await abort;
+			await directFlush;
 			expect(agentPrompt).not.toHaveBeenCalled();
 		} finally {
 			barrier.resolve();

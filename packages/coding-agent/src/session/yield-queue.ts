@@ -19,7 +19,8 @@ export interface YieldQueueOptions {
 	isStreaming: () => boolean;
 	injectStreaming(msg: AgentMessage): void;
 	injectIdle(messages: AgentMessage[], signal?: AbortSignal): Promise<void>;
-	scheduleIdleFlush(run: (signal?: AbortSignal) => Promise<void>): void;
+	scheduleIdleFlush(run: (signal?: AbortSignal) => Promise<void>, onSkip: () => void): void;
+	getIdleFlushSignal?(): AbortSignal | undefined;
 }
 
 type YieldFlushMode = "streaming" | "idle";
@@ -105,7 +106,7 @@ export class YieldQueue {
 		}
 		if (mode === "idle" && idleMessages.length > 0) {
 			try {
-				await this.#options.injectIdle(idleMessages, signal);
+				await this.#options.injectIdle(idleMessages, signal ?? this.#options.getIdleFlushSignal?.());
 			} catch (error) {
 				logger.warn("Yield queue idle dispatch failed", { error: formatError(error) });
 			}
@@ -144,11 +145,16 @@ export class YieldQueue {
 		if (this.#idleFlushPending) return;
 		this.#idleFlushPending = true;
 		try {
-			this.#options.scheduleIdleFlush(async signal => {
-				this.#idleFlushPending = false;
-				if (this.#options.isStreaming()) return;
-				await this.flush("idle", signal);
-			});
+			this.#options.scheduleIdleFlush(
+				async signal => {
+					this.#idleFlushPending = false;
+					if (this.#options.isStreaming()) return;
+					await this.flush("idle", signal);
+				},
+				() => {
+					this.#idleFlushPending = false;
+				},
+			);
 		} catch (error) {
 			this.#idleFlushPending = false;
 			logger.warn("Yield queue idle flush scheduling failed", { error: formatError(error) });

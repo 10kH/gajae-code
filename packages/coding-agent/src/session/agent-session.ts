@@ -4448,7 +4448,7 @@ export class AgentSession {
 					this.#settleDeliveredOwnedRegistrations(survivors.filter(message => !handedOffToFollowUp.has(message)));
 				}
 			},
-			scheduleIdleFlush: run => {
+			scheduleIdleFlush: (run, onSkip) => {
 				// The startup barrier already gates injectIdle, so begin waiting on a
 				// pending barrier immediately. Once readiness has settled, ordinary
 				// idle wakes retain the fixed merge window.
@@ -4457,9 +4457,10 @@ export class AgentSession {
 					async signal => {
 						await run(signal);
 					},
-					{ delayMs, excludeFromPostPromptRecovery: true },
+					{ delayMs, onSkip, excludeFromPostPromptRecovery: true },
 				);
 			},
+			getIdleFlushSignal: () => this.#postPromptTasksAbortController.signal,
 		});
 		this.agent.setOnBeforeYield(() => this.yieldQueue.flush("streaming"));
 		// Stop-after-result, never abort: a fold arms this once and the loop ends the
