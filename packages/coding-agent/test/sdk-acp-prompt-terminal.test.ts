@@ -21,8 +21,10 @@ type AdvisoryQuery = "context.get" | "session.metadata";
 type Fixture = {
 	agent: AcpAgent;
 	sessionId: string;
+	cwd: string;
 	updates: SessionNotification[];
 	promptDelivered: Promise<void>;
+	workingUpdateEntered: Promise<void>;
 	promptDeliveryCount(): number;
 	sendStopped(reason: StoppedReason): void;
 	sendFailed(code: FailedCode): void;
@@ -83,6 +85,7 @@ async function createFixture(
 		deferSecondPromptAcknowledgement?: boolean;
 		deferFirstPromptAcknowledgement?: boolean;
 		reusePromptCorrelationOnSecond?: boolean;
+		failBrokerSessionClose?: boolean;
 	} = {},
 ): Promise<Fixture> {
 	const tempDir = TempDir.createSync("@sdk-acp-prompt-terminal-");
@@ -97,6 +100,7 @@ async function createFixture(
 	const blockedAdvisoryQueries: Array<{ socket: TestSocket; id: string; result: unknown }> = [];
 	const idleUpdateRelease = Promise.withResolvers<void>();
 	const workingUpdateRelease = Promise.withResolvers<void>();
+	const workingUpdateEntered = Promise.withResolvers<void>();
 	const agentMessageUpdateRelease = Promise.withResolvers<void>();
 	let blockNextIdleUpdate = false;
 	let blockNextWorkingUpdate = options.blockInitialWorkingUpdate === true;
@@ -191,6 +195,50 @@ async function createFixture(
 					return;
 				}
 				if (frame.type === "broker_request") {
+					if (options.failBrokerSessionClose && frame.operation === "session.close") {
+						socket.send(
+							JSON.stringify({
+								type: "broker_response",
+								id: frame.id,
+								ok: false,
+								error: { code: "close_uncertain", message: "close outcome uncertain" },
+							}),
+						);
+						return;
+					}
+					if (frame.operation === "session.list") {
+						if ((frame.input as { resolveSessionId?: string } | undefined)?.resolveSessionId === sessionId) {
+							socket.send(
+								JSON.stringify({
+									type: "broker_response",
+									id: frame.id,
+									ok: true,
+									result: {
+										sessions: [],
+										savedSession: { id: sessionId, path: path.join(cwd, "saved-session.jsonl") },
+									},
+								}),
+							);
+							return;
+						}
+						socket.send(
+							JSON.stringify({
+								type: "broker_response",
+								id: frame.id,
+								ok: true,
+								result: {
+									sessions: [
+										{
+											sessionId,
+											locator: { cwd, worktreeRoot: null, stateRoot: path.join(cwd, ".gjc", "state") },
+											live: false,
+										},
+									],
+								},
+							}),
+						);
+						return;
+					}
 					// Every broker interaction (session.list, session.get_endpoint,
 					// session.create) is answered with the exact authority: the
 					// router's reconcile resolves the session through this fixture.
@@ -330,6 +378,7 @@ async function createFixture(
 					(update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase === "working"
 				) {
 					blockNextWorkingUpdate = false;
+					workingUpdateEntered.resolve();
 					await workingUpdateRelease.promise;
 				}
 				updates.push(update);
@@ -360,8 +409,10 @@ async function createFixture(
 	return {
 		agent,
 		sessionId: created.sessionId,
+		cwd,
 		updates,
 		promptDelivered: delivered.promise,
+		workingUpdateEntered: workingUpdateEntered.promise,
 		promptDeliveryCount: () => promptDeliveries,
 		sendStopped,
 		sendFailed,
@@ -731,6 +782,53 @@ test("ACP terminal settlement does not await final-text delivery", async () => {
 	}
 });
 
+test("ACP successor terminal decoration does not wait for a predecessor advisory query", async () => {
+	const fixture = await createFixture({ blockedAdvisoryQuery: "context.get" });
+	try {
+		const first = prompt(fixture, "blocked predecessor decoration");
+		await bounded(fixture.promptDelivered, "first prompt delivery");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(first, "first terminal settlement")).toEqual({ stopReason: "end_turn" });
+		await waitFor(() => fixture.blockedAdvisoryQueryCount() === 1, "blocked predecessor advisory query");
+
+		const idleBefore = idlePhaseUpdates(fixture.updates);
+		const second = prompt(fixture, "independent successor decoration");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "second prompt delivery");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(second, "second terminal settlement")).toEqual({ stopReason: "end_turn" });
+		await waitFor(() => idlePhaseUpdates(fixture.updates) > idleBefore, "successor idle decoration");
+	} finally {
+		fixture.releaseBlockedAdvisoryQueries();
+		fixture.dispose();
+	}
+});
+
+test("ACP uncertain teardown retains active prompt correlation for same-id reattachment", async () => {
+	const fixture = await createFixture({ failBrokerSessionClose: true, reusePromptCorrelationOnSecond: true });
+	try {
+		const first = prompt(fixture, "prompt closed uncertainly");
+		void first.catch(() => undefined);
+		await bounded(fixture.promptDelivered, "first prompt delivery");
+		await expect(fixture.agent.closeSession({ sessionId: fixture.sessionId })).rejects.toMatchObject({
+			code: "terminal_uncertain",
+		});
+		expect(await bounded(first, "closed prompt settlement")).toEqual({ stopReason: "cancelled" });
+		await bounded(
+			fixture.agent.loadSession({ sessionId: fixture.sessionId, cwd: fixture.cwd, mcpServers: [] }),
+			"same-id reattachment",
+		);
+		const replacement = prompt(fixture, "reused correlation after uncertain close");
+		void replacement.catch(() => undefined);
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "replacement prompt delivery");
+		await expect(bounded(replacement, "retained-correlation rejection")).rejects.toMatchObject({
+			code: "invalid_prompt_acknowledgement",
+		});
+	} finally {
+		fixture.releaseBlockedAdvisoryQueries();
+		fixture.dispose();
+	}
+});
+
 test("ACP terminal processing preserves FIFO behind an earlier correlated update", async () => {
 	const fixture = await createFixture({ blockInitialWorkingUpdate: true });
 	try {
@@ -971,6 +1069,7 @@ test("ACP deferred terminal remains FIFO behind an earlier deferred publication"
 	try {
 		const pending = prompt(fixture, "deferred FIFO terminal");
 		await bounded(fixture.promptDelivered, "prompt delivery");
+		await bounded(fixture.workingUpdateEntered, "deferred working update barrier");
 		let settled = false;
 		void pending.then(() => {
 			settled = true;

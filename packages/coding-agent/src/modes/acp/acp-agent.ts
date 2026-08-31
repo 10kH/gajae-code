@@ -160,8 +160,6 @@ type SessionRecord = {
 	reconnectUnsubscribe: () => void;
 	/** Per-session frame work queue; callbacks never race prompt ownership. */
 	frameTail: Promise<void>;
-	/** Detached terminal-owned publications serialized in terminal arrival order. */
-	terminalTail?: Promise<void>;
 	/** Advances when an owned terminal retires all earlier frame publications. */
 	publicationGeneration: number;
 	/** Monotonic at WebSocket ingress, before queued work begins. */
@@ -2471,10 +2469,14 @@ export class AcpAgent implements Agent {
 		try {
 			this.#advanceSessionEpoch(id);
 			if (record) {
+				const waiter = record.activePrompt;
+				if (waiter) {
+					this.#rememberSettledPromptCorrelation(id, record, waiter.correlation);
+					this.#fenceRetiredPromptAcknowledgement(id, waiter);
+				}
 				this.#sessions.delete(id);
 				record.unsubscribe();
 				record.reconnectUnsubscribe();
-				const waiter = record.activePrompt;
 				record.activePrompt = undefined;
 				// `session/close` is the client asking to end its own work, so the pending turn
 				// settles as `cancelled` rather than surfacing a spurious error. ACP: "Agents
@@ -2905,19 +2907,17 @@ export class AcpAgent implements Agent {
 			if (promptOwner) promptOwner.messageProgress = undefined;
 			else record.sessionMessageProgress = undefined;
 		}
-		if (isTerminal) this.#scheduleTerminalUpdates(id, record, adapter, publicationGeneration, event, promptOwner);
+		if (isTerminal) this.#scheduleTerminalUpdates(id, adapter, publicationGeneration, event, promptOwner);
 	}
 
 	#scheduleTerminalUpdates(
 		id: string,
-		record: SessionRecord,
 		adapter: AcpSdkAdapter,
 		publicationGeneration: number,
 		event: JsonObject,
 		promptOwner: PromptWaiter | undefined,
 	): void {
-		const prior = record.terminalTail ?? Promise.resolve();
-		const task = prior.then(async () => {
+		const task = (async () => {
 			if (event.type === "agent_failed") {
 				await this.#publishPromptPhaseIdle(id, adapter);
 				return;
@@ -2951,16 +2951,10 @@ export class AcpAgent implements Agent {
 				}
 			}
 			await this.#emitEndOfTurnUpdates(id, adapter, publicationGeneration);
+		})();
+		void task.catch(error => {
+			logger.warn("acp_terminal_update_failed", { sessionId: id, error: String(error) });
 		});
-		let terminalTail: Promise<void>;
-		terminalTail = task
-			.catch(error => {
-				logger.warn("acp_terminal_update_failed", { sessionId: id, error: String(error) });
-			})
-			.finally(() => {
-				if (record.terminalTail === terminalTail) record.terminalTail = undefined;
-			});
-		record.terminalTail = terminalTail;
 	}
 
 	async #rejectPrompt(
