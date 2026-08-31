@@ -227,6 +227,85 @@ describe("AgentSession managed fallback cancellation completion", () => {
 		expect(events.find(event => event.type === "agent_end")).toMatchObject({ stopReason: "cancelled" });
 	});
 
+	it("fences managed fallback retry preparation when disposal wins before allocation", async () => {
+		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!primary) throw new Error("Expected bundled primary model");
+		const calls: string[] = [];
+		authStorage.removeRuntimeApiKey("anthropic");
+		await authStorage.set("anthropic", { type: "api_key", key: "stored-key" });
+		createSession(model => {
+			calls.push(selector(model));
+			return failingStream(model);
+		});
+		const markStarted = Promise.withResolvers<void>();
+		const releaseMark = Promise.withResolvers<void>();
+		const markUsageLimitReached = vi.spyOn(authStorage, "markUsageLimitReached").mockImplementation(async () => {
+			markStarted.resolve();
+			await releaseMark.promise;
+			return false;
+		});
+		const events: AgentSessionEvent[] = [];
+		session!.subscribe(event => events.push(event));
+
+		const run = session!.prompt("dispose during managed credential preparation");
+		await markStarted.promise;
+		const dispose = session!.dispose();
+		releaseMark.resolve();
+		await dispose;
+		await run;
+
+		expect(calls).toEqual([selector(primary)]);
+		expect(events.filter(event => event.type === "auto_retry_start")).toHaveLength(0);
+		expect(session!.isRetrying).toBe(false);
+		expect(session!.isStreaming).toBe(false);
+		markUsageLimitReached.mockRestore();
+	});
+
+	it("cancels a hidden next-turn continuation waiting behind startup", async () => {
+		const calls: string[] = [];
+		createSession((model, context, options) => {
+			calls.push(selector(model));
+			return createMockModel({ responses: [{ content: ["must not run"] }] }).stream(model, context, options);
+		});
+		const startupBarrier = Promise.withResolvers<void>();
+		session!.extendStartupTurnBarrier(startupBarrier.promise);
+		session!.queueDeferredMessageForTests(
+			{
+				role: "custom",
+				customType: "test-hidden-disposal",
+				content: [{ type: "text", text: "hidden successor" }],
+				display: false,
+				details: {},
+				timestamp: Date.now(),
+			},
+			true,
+		);
+		await Bun.sleep(10);
+
+		await session!.dispose();
+
+		expect(calls).toHaveLength(0);
+		expect(session!.getPendingNextTurnMessagesForTests()).toHaveLength(0);
+	});
+
+	it("cancels an ordinary prompt waiting behind startup during disposal", async () => {
+		const calls: string[] = [];
+		createSession((model, context, options) => {
+			calls.push(selector(model));
+			return createMockModel({ responses: [{ content: ["must not run"] }] }).stream(model, context, options);
+		});
+		const startupBarrier = Promise.withResolvers<void>();
+		session!.extendStartupTurnBarrier(startupBarrier.promise);
+		const prompt = session!.prompt("ordinary prompt behind startup");
+		await Bun.sleep(10);
+
+		const dispose = session!.dispose();
+		await expect(prompt).rejects.toMatchObject({ code: "busy" });
+		await dispose;
+
+		expect(calls).toHaveLength(0);
+	});
+
 	it("abandons the overflow-maintenance handoff before any continuation provider call", async () => {
 		const calls: string[] = [];
 		createSession((model, _context, _options) => {

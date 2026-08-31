@@ -3,6 +3,12 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AssistantMessage } from "@gajae-code/ai/core";
+import {
+	exactReplacePath,
+	exactUnlinkDirect,
+	type NativeExactFileIdentity,
+	renameNoReplacePath,
+} from "@gajae-code/natives";
 import { normalizePathForComparison, postmortem } from "@gajae-code/utils";
 import { withFileLock } from "../config/file-lock";
 import {
@@ -164,6 +170,14 @@ export const __sessionStateSidecarPerfCounters = {
 		this.persistFromEventCalls = 0;
 	},
 };
+
+/** Test-only barriers for deterministic rescope transaction race coverage. */
+export const __sessionStateSidecarTestHooks: {
+	afterRescopeLocksAcquired?: () => void | Promise<void>;
+	beforeRescopeJournalWrite?: (cwd: string) => void | Promise<void>;
+	beforePersistFromEvent?: (eventType: string, cwd: string) => void | Promise<void>;
+	beforeRescopePublish?: () => void | Promise<void>;
+} = {};
 
 interface RuntimeStateEvent {
 	type: string;
@@ -636,6 +650,12 @@ export interface RuntimeStateContext {
 	ownerTerminal?: OwnerTerminalContext | null;
 	/** Internal fail-closed marker set only when managed owner metadata is malformed or missing. */
 	ownerTerminalMetadataInvalid?: boolean;
+	/**
+	 * The session file as it was BEFORE a committed rescope, used only by
+	 * {@link relocateCoordinatorRuntimeStateForRescope} to authenticate the predecessor
+	 * payload against its old identity. Absent outside a move.
+	 */
+	previousSessionFile?: string | null;
 }
 
 interface RuntimeStateIdentity {
@@ -1071,6 +1091,78 @@ function readPreviousPayload(stateFile: string): Record<string, unknown> {
 	}
 }
 
+type RelocationPayloadObservation = {
+	payload: Record<string, unknown>;
+	identity: NativeExactFileIdentity | null;
+};
+
+function sameRelocationFileIdentity(left: fsSync.BigIntStats, right: fsSync.BigIntStats): boolean {
+	return (
+		left.dev === right.dev &&
+		left.ino === right.ino &&
+		left.nlink === right.nlink &&
+		left.size === right.size &&
+		left.mtimeNs === right.mtimeNs &&
+		left.ctimeNs === right.ctimeNs &&
+		left.isFile() &&
+		right.isFile() &&
+		!left.isSymbolicLink() &&
+		!right.isSymbolicLink()
+	);
+}
+
+/** Read relocation authority from one no-follow, identity-revalidated regular file. */
+function readRegularFileForRelocation(stateFile: string): { raw: string; identity: NativeExactFileIdentity } | null {
+	let before: fsSync.BigIntStats;
+	try {
+		before = fsSync.lstatSync(stateFile, { bigint: true });
+	} catch (error) {
+		if (isAbsentStateFileError(error)) return null;
+		throw new PreviousRuntimeStateReadError(error);
+	}
+	if (!before.isFile() || before.isSymbolicLink()) throw new PreviousRuntimeStateReadError();
+	const flags = fsSync.constants.O_RDONLY | (process.platform === "win32" ? 0 : (fsSync.constants.O_NOFOLLOW ?? 0));
+	let descriptor: number | undefined;
+	try {
+		descriptor = fsSync.openSync(stateFile, flags);
+		const opened = fsSync.fstatSync(descriptor, { bigint: true });
+		if (!sameRelocationFileIdentity(before, opened)) throw new PreviousRuntimeStateReadError();
+		const raw = fsSync.readFileSync(descriptor, "utf8");
+		const after = fsSync.lstatSync(stateFile, { bigint: true });
+		const finalOpened = fsSync.fstatSync(descriptor, { bigint: true });
+		const parent = fsSync.lstatSync(path.dirname(stateFile), { bigint: true });
+		if (!sameRelocationFileIdentity(opened, finalOpened) || !sameRelocationFileIdentity(opened, after))
+			throw new PreviousRuntimeStateReadError();
+		if (!parent.isDirectory() || parent.isSymbolicLink()) throw new PreviousRuntimeStateReadError();
+		return {
+			raw,
+			identity: {
+				dev: opened.dev,
+				ino: opened.ino,
+				nlink: opened.nlink,
+				parentDev: parent.dev,
+				parentIno: parent.ino,
+				size: opened.size,
+				mtimeNs: opened.mtimeNs,
+				sha256: createHash("sha256").update(raw).digest("hex"),
+				quarantineName: `.gjc-delete-runtime-state-${randomUUID()}.json`,
+			},
+		};
+	} catch (error) {
+		if (error instanceof PreviousRuntimeStateReadError) throw error;
+		throw new PreviousRuntimeStateReadError(error);
+	} finally {
+		if (descriptor !== undefined) fsSync.closeSync(descriptor);
+	}
+}
+
+function readPreviousPayloadForRelocation(stateFile: string): RelocationPayloadObservation {
+	const observed = readRegularFileForRelocation(stateFile);
+	return observed
+		? { payload: parsePreviousPayload(observed.raw), identity: observed.identity }
+		: { payload: {}, identity: null };
+}
+
 /**
  * Reads the authoritative bytes on disk, every time, inside the state-file lock.
  *
@@ -1181,6 +1273,24 @@ function assertPreviousRuntimeStateIdentity(previous: Record<string, unknown>, i
 		)
 			throw new PreviousRuntimeStateReadError();
 	}
+}
+
+/** Relocation never accepts the coordinator bootstrap exception or partial identity rows. */
+function assertRelocationRuntimeStateIdentity(previous: Record<string, unknown>, input: RuntimeStateIdentity): void {
+	assertPreviousRuntimeStateIdentity(previous, input);
+	if (
+		typeof previous.cwd !== "string" ||
+		typeof previous.workdir !== "string" ||
+		!sameResolvedPath(previous.cwd, input.cwd, input.platform) ||
+		!sameResolvedPath(previous.workdir, input.cwd, input.platform) ||
+		(previous.session_file !== input.sessionFile &&
+			!(
+				typeof previous.session_file === "string" &&
+				typeof input.sessionFile === "string" &&
+				sameResolvedPath(previous.session_file, input.sessionFile, input.platform)
+			))
+	)
+		throw new PreviousRuntimeStateReadError();
 }
 
 function runtimeStateFileForContext(context: RuntimeStateContext): string | null {
@@ -1402,6 +1512,44 @@ async function writeStateFileSync(
 	await writeStateFile(stateFile, finalizeSidecarPayload(payload, keyId));
 }
 
+async function writeStateFileSyncConditional(
+	stateFile: string,
+	payload: Record<string, unknown>,
+	keyId: string | null,
+	expectedDestination: NativeExactFileIdentity | null,
+): Promise<void> {
+	const contents = `${JSON.stringify(finalizeSidecarPayload(payload, keyId))}\n`;
+	await writeCoordinatorAtomic(stateFile, contents, {
+		rename: async (source, destination) => {
+			if (!expectedDestination) {
+				const published = renameNoReplacePath(source, destination);
+				if (!published.ok) throw new PreviousRuntimeStateReadError();
+				return;
+			}
+			const stat = fsSync.lstatSync(source, { bigint: true });
+			const parent = fsSync.lstatSync(path.dirname(source), { bigint: true });
+			if (!stat.isFile() || stat.isSymbolicLink() || !parent.isDirectory() || parent.isSymbolicLink())
+				throw new PreviousRuntimeStateReadError();
+			const replaced = exactReplacePath(
+				source,
+				destination,
+				{
+					dev: stat.dev,
+					ino: stat.ino,
+					nlink: stat.nlink,
+					parentDev: parent.dev,
+					parentIno: parent.ino,
+					size: stat.size,
+					mtimeNs: stat.mtimeNs,
+					sha256: createHash("sha256").update(contents).digest("hex"),
+				},
+				expectedDestination,
+			);
+			if (!replaced.ok) throw new PreviousRuntimeStateReadError();
+		},
+	});
+}
+
 /**
  * The state-file critical section, shared byte-for-byte with the Coordinator MCP writer.
  *
@@ -1443,6 +1591,101 @@ async function withCoordinatorTransactionLock<T>(stateFile: string, operation: (
 	}
 }
 
+function orderedDistinctStateFiles(stateFiles: readonly string[], platform: NodeJS.Platform): string[] {
+	const byIdentity = new Map<string, string>();
+	for (const stateFile of stateFiles) {
+		const resolved = path.resolve(stateFile);
+		byIdentity.set(normalizePathForComparison(resolved, platform), resolved);
+	}
+	return [...byIdentity.entries()]
+		.sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+		.map(([, stateFile]) => stateFile);
+}
+
+function canonicalDirectoryWithExistingAncestor(directory: string): string {
+	let current = path.resolve(directory);
+	const missing: string[] = [];
+	for (;;) {
+		try {
+			return path.join(fsSync.realpathSync(current), ...missing.reverse());
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new PreviousRuntimeStateReadError(error);
+			const parent = path.dirname(current);
+			if (parent === current) throw new PreviousRuntimeStateReadError(error);
+			missing.push(path.basename(current));
+			current = parent;
+		}
+	}
+}
+
+function canonicalStateFilePath(stateFile: string): string {
+	return path.join(canonicalDirectoryWithExistingAncestor(path.dirname(stateFile)), path.basename(stateFile));
+}
+
+function assertPinnedDirectoryIdentity(cwd: string, expected: { dev: bigint; ino: bigint }): void {
+	const stat = fsSync.lstatSync(cwd, { bigint: true });
+	if (!stat.isDirectory() || stat.isSymbolicLink() || stat.dev !== expected.dev || stat.ino !== expected.ino)
+		throw new PreviousRuntimeStateReadError();
+}
+
+function assertNoSymlinkDirectoryComponents(root: string, directory: string): void {
+	const relative = path.relative(root, directory);
+	if (relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative))
+		throw new PreviousRuntimeStateReadError();
+	let current = root;
+	for (const component of relative.split(path.sep)) {
+		current = path.join(current, component);
+		try {
+			const stat = fsSync.lstatSync(current);
+			if (!stat.isDirectory() || stat.isSymbolicLink()) throw new PreviousRuntimeStateReadError();
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") break;
+			throw error;
+		}
+	}
+}
+
+function confinedJournalPath(cwd: string, sessionId: string, platform: NodeJS.Platform): string {
+	const canonicalRoot = fsSync.realpathSync(cwd);
+	const rawJournalFile = runtimeStateRescopeJournalPath(canonicalRoot, sessionId);
+	assertNoSymlinkDirectoryComponents(canonicalRoot, path.dirname(rawJournalFile));
+	const journalFile = canonicalStateFilePath(rawJournalFile);
+	const pathImpl = platform === "win32" ? path.win32 : path;
+	const relative = pathImpl.relative(canonicalRoot, journalFile);
+	if (
+		relative === "" ||
+		relative === ".." ||
+		relative.startsWith(`..${pathImpl.sep}`) ||
+		pathImpl.isAbsolute(relative)
+	)
+		throw new PreviousRuntimeStateReadError();
+	return journalFile;
+}
+
+async function withSerializedStateFiles<T>(stateFiles: readonly string[], operation: () => Promise<T>): Promise<T> {
+	const [stateFile, ...remaining] = stateFiles;
+	if (!stateFile) return await operation();
+	return await serializeStateFileWrite(stateFile, async () => await withSerializedStateFiles(remaining, operation));
+}
+
+async function withCoordinatorTransactionLocks<T>(
+	stateFiles: readonly string[],
+	operation: () => Promise<T>,
+): Promise<T> {
+	const [stateFile, ...remaining] = stateFiles;
+	if (!stateFile) return await operation();
+	return await withCoordinatorTransactionLock(
+		stateFile,
+		async () => await withCoordinatorTransactionLocks(remaining, operation),
+	);
+}
+
+async function withStateFileLocks<T>(stateFiles: readonly string[], operation: () => Promise<T>): Promise<T> {
+	const [stateFile, ...remaining] = stateFiles;
+	if (!stateFile) return await operation();
+	return await withStateFileLock(stateFile, async () => await withStateFileLocks(remaining, operation));
+}
+
 async function writeStateFile(stateFile: string, payload: Record<string, unknown>): Promise<void> {
 	await writeCoordinatorAtomic(stateFile, `${JSON.stringify(payload)}\n`);
 }
@@ -1477,6 +1720,7 @@ async function persistCoordinatorRuntimeToolActivity(
 				stateFile,
 				async () =>
 					await withStateFileLock(stateFile, async () => {
+						assertNoRuntimeStateRescopeJournal(context, identity);
 						const previous = await readPreviousPayloadForEvent(stateFile);
 						if (Object.keys(previous).length === 0) return;
 						assertPreviousRuntimeStateIdentity(previous, identity);
@@ -1532,6 +1776,8 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 	const stateFile = runtimeStateFileForContext(context);
 	const state = stateForEvent(event);
 	if (!stateFile) return;
+	const beforePersistFromEvent = __sessionStateSidecarTestHooks.beforePersistFromEvent;
+	if (beforePersistFromEvent) await beforePersistFromEvent(event.type, context.cwd);
 	if (!state) {
 		const activityPhase = toolActivityPhaseForEvent(event);
 		if (!activityPhase) return;
@@ -1554,6 +1800,7 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 				stateFile,
 				async () =>
 					await withStateFileLock(stateFile, async () => {
+						assertNoRuntimeStateRescopeJournal(context, identity);
 						const nowMs = Date.now();
 						const now = new Date(nowMs).toISOString();
 						const previous = await readPreviousPayloadForEvent(stateFile);
@@ -1629,6 +1876,7 @@ export async function persistCoordinatorWorkerIntegrationOutcome(
 				stateFile,
 				async () =>
 					await withStateFileLock(stateFile, async () => {
+						assertNoRuntimeStateRescopeJournal(context, identity);
 						const previous = await readPreviousPayloadForEvent(stateFile);
 						if (Object.keys(previous).length === 0) return;
 						assertPreviousRuntimeStateIdentity(previous, identity);
@@ -1676,6 +1924,586 @@ export async function persistCoordinatorWorkerIntegrationOutcome(
 								: {}),
 						};
 						await writeStateFileSync(stateFile, payload, identity.sidecarKeyId);
+					}),
+			),
+	);
+}
+
+/**
+ * The old identity a rescued predecessor payload must authenticate against: the launch-root
+ * cwd and the session file as they were BEFORE the move. Signed mode still requires the
+ * predecessor's key id and signature; unsigned mode requires an exact cwd/workdir/session
+ * file match. Reusing {@link normalizedIdentity} keeps the platform, key-id, and path
+ * resolution rules byte-identical with the persist path's fence.
+ */
+function previousRescopeIdentity(context: RuntimeStateContext, previousCwd: string): RuntimeStateIdentity {
+	return normalizedIdentity({
+		sessionId: context.sessionId,
+		cwd: previousCwd,
+		sessionFile: context.previousSessionFile ?? context.sessionFile ?? null,
+		platform: context.platform,
+	});
+}
+
+interface CoordinatorRuntimeStateRescopeJournal {
+	schema_version: 1;
+	move_id: string;
+	session_id: string;
+	previous_cwd: string;
+	new_cwd: string;
+	previous_session_file: string | null;
+	new_session_file: string | null;
+	old_state_file: string;
+	new_state_file: string;
+	state_file_mode: "pinned" | "derived";
+	source_sha256: string | null;
+	phase: "prepared" | "publishing";
+	key_id: string | null;
+	signature: string | null;
+	created_at: string;
+}
+
+const RUNTIME_STATE_RESCOPE_MOVE_ID_PATTERN =
+	/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+function runtimeStateRescopeJournalPath(cwd: string, sessionId: string): string {
+	return path.join(sessionRuntimeDir(cwd, sessionId), "runtime-state-rescope.json");
+}
+
+function sameOptionalResolvedPath(
+	left: string | null,
+	right: string | null,
+	platform: NodeJS.Platform = process.platform,
+): boolean {
+	return (
+		left === right ||
+		(typeof left === "string" && typeof right === "string" && sameResolvedPath(left, right, platform))
+	);
+}
+
+function parseRuntimeStateRescopeJournal(raw: string): CoordinatorRuntimeStateRescopeJournal {
+	let value: unknown;
+	try {
+		value = JSON.parse(raw);
+	} catch {
+		throw new PreviousRuntimeStateReadError();
+	}
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new PreviousRuntimeStateReadError();
+	const journal = value as Record<string, unknown>;
+	if (
+		!hasExactOwnKeys(journal, [
+			"schema_version",
+			"move_id",
+			"session_id",
+			"previous_cwd",
+			"new_cwd",
+			"previous_session_file",
+			"new_session_file",
+			"old_state_file",
+			"new_state_file",
+			"state_file_mode",
+			"source_sha256",
+			"phase",
+			"key_id",
+			"signature",
+			"created_at",
+		]) ||
+		journal.schema_version !== 1 ||
+		typeof journal.move_id !== "string" ||
+		!RUNTIME_STATE_RESCOPE_MOVE_ID_PATTERN.test(journal.move_id) ||
+		typeof journal.session_id !== "string" ||
+		typeof journal.previous_cwd !== "string" ||
+		typeof journal.new_cwd !== "string" ||
+		(journal.previous_session_file !== null && typeof journal.previous_session_file !== "string") ||
+		(journal.new_session_file !== null && typeof journal.new_session_file !== "string") ||
+		typeof journal.old_state_file !== "string" ||
+		typeof journal.new_state_file !== "string" ||
+		(journal.state_file_mode !== "pinned" && journal.state_file_mode !== "derived") ||
+		(journal.source_sha256 !== null &&
+			(typeof journal.source_sha256 !== "string" || !/^[0-9a-f]{64}$/.test(journal.source_sha256))) ||
+		(journal.phase !== "prepared" && journal.phase !== "publishing") ||
+		(journal.key_id !== null && typeof journal.key_id !== "string") ||
+		(journal.signature !== null && typeof journal.signature !== "string") ||
+		!isCanonicalIsoTimestamp(journal.created_at)
+	)
+		throw new PreviousRuntimeStateReadError();
+	return journal as unknown as CoordinatorRuntimeStateRescopeJournal;
+}
+
+function rescopeStateFiles(
+	sessionId: string,
+	previousCwd: string,
+	newCwd: string,
+): { oldStateFile: string; newStateFile: string; mode: "pinned" | "derived" } {
+	const explicit = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
+	if (explicit) {
+		const stateFile = canonicalStateFilePath(explicit);
+		return { oldStateFile: stateFile, newStateFile: stateFile, mode: "pinned" };
+	}
+	return {
+		oldStateFile: canonicalStateFilePath(
+			path.join(sessionRuntimeDir(fsSync.realpathSync(previousCwd), sessionId), "runtime-state.json"),
+		),
+		newStateFile: canonicalStateFilePath(
+			path.join(sessionRuntimeDir(fsSync.realpathSync(newCwd), sessionId), "runtime-state.json"),
+		),
+		mode: "derived",
+	};
+}
+
+function journalSignaturePayload(journal: CoordinatorRuntimeStateRescopeJournal): Record<string, unknown> {
+	const { signature: _signature, ...unsigned } = journal;
+	return unsigned;
+}
+
+function verifyRuntimeStateRescopeJournal(journal: CoordinatorRuntimeStateRescopeJournal): void {
+	if (journal.key_id === null) {
+		if (journal.signature !== null) throw new PreviousRuntimeStateReadError();
+		return;
+	}
+	if (
+		journal.signature === null ||
+		!coordinatorSidecarSigningKey ||
+		!verify(
+			null,
+			Buffer.from(canonicalCoordinatorSidecarPayload(journalSignaturePayload(journal))),
+			createPublicKey(coordinatorSidecarSigningKey),
+			Buffer.from(journal.signature, "base64"),
+		)
+	)
+		throw new PreviousRuntimeStateReadError();
+}
+
+function assertNoRuntimeStateRescopeJournal(context: RuntimeStateContext, identity: RuntimeStateIdentity): void {
+	let canonicalCwd: string;
+	try {
+		canonicalCwd = fsSync.realpathSync(context.cwd);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+		throw error;
+	}
+	const journalFile = runtimeStateRescopeJournalPath(canonicalCwd, context.sessionId);
+	const observed = readRegularFileForRelocation(journalFile);
+	if (!observed) return;
+	const journal = parseRuntimeStateRescopeJournal(observed.raw);
+	verifyRuntimeStateRescopeJournal(journal);
+	if (journal.session_id !== context.sessionId || journal.key_id !== identity.sidecarKeyId)
+		throw new PreviousRuntimeStateReadError();
+	if (
+		!sameResolvedPath(journal.previous_cwd, identity.cwd, identity.platform) &&
+		!sameResolvedPath(journal.new_cwd, identity.cwd, identity.platform)
+	)
+		throw new PreviousRuntimeStateReadError();
+	throw new PreviousRuntimeStateReadError();
+}
+
+export async function prepareCoordinatorRuntimeStateRescope(input: {
+	moveId?: string;
+	sessionId: string;
+	previousCwd: string;
+	newCwd: string;
+	previousCwdIdentity?: { dev: bigint; ino: bigint };
+	newCwdIdentity?: { dev: bigint; ino: bigint };
+	previousSessionFile?: string | null;
+	newSessionFile?: string | null;
+}): Promise<string> {
+	const previousStat = fsSync.lstatSync(input.previousCwd, { bigint: true });
+	const newStat = fsSync.lstatSync(input.newCwd, { bigint: true });
+	const previousCwdIdentity = input.previousCwdIdentity ?? { dev: previousStat.dev, ino: previousStat.ino };
+	const newCwdIdentity = input.newCwdIdentity ?? { dev: newStat.dev, ino: newStat.ino };
+	assertPinnedDirectoryIdentity(input.previousCwd, previousCwdIdentity);
+	assertPinnedDirectoryIdentity(input.newCwd, newCwdIdentity);
+	const previousCwd = fsSync.realpathSync(input.previousCwd);
+	const newCwd = fsSync.realpathSync(input.newCwd);
+	const stateFiles = rescopeStateFiles(input.sessionId, previousCwd, newCwd);
+	const moveId = input.moveId ?? randomUUID();
+	if (!RUNTIME_STATE_RESCOPE_MOVE_ID_PATTERN.test(moveId)) throw new PreviousRuntimeStateReadError();
+	const identity = normalizedIdentity({
+		sessionId: input.sessionId,
+		cwd: newCwd,
+		sessionFile: input.newSessionFile ?? null,
+	});
+	const previousJournalFile = confinedJournalPath(previousCwd, input.sessionId, identity.platform);
+	const newJournalFile = confinedJournalPath(newCwd, input.sessionId, identity.platform);
+	const oldIdentity = previousRescopeIdentity(
+		{
+			sessionId: input.sessionId,
+			cwd: newCwd,
+			sessionFile: input.newSessionFile ?? null,
+			previousSessionFile: input.previousSessionFile ?? null,
+		},
+		previousCwd,
+	);
+	return await withSerializedStateFiles([stateFiles.oldStateFile], async () =>
+		withCoordinatorTransactionLocks([stateFiles.oldStateFile], async () =>
+			withStateFileLocks([stateFiles.oldStateFile], async () => {
+				const sourceObservation = readPreviousPayloadForRelocation(stateFiles.oldStateFile);
+				if (Object.keys(sourceObservation.payload).length > 0)
+					assertRelocationRuntimeStateIdentity(sourceObservation.payload, oldIdentity);
+				const journal: CoordinatorRuntimeStateRescopeJournal = {
+					schema_version: 1,
+					move_id: moveId,
+					session_id: input.sessionId,
+					previous_cwd: previousCwd,
+					new_cwd: newCwd,
+					previous_session_file: input.previousSessionFile ? path.resolve(input.previousSessionFile) : null,
+					new_session_file: input.newSessionFile ? path.resolve(input.newSessionFile) : null,
+					old_state_file: stateFiles.oldStateFile,
+					new_state_file: stateFiles.newStateFile,
+					state_file_mode: stateFiles.mode,
+					source_sha256: sourceObservation.identity?.sha256 ?? null,
+					phase: "prepared",
+					key_id: identity.sidecarKeyId,
+					signature: null,
+					created_at: new Date().toISOString(),
+				};
+				if (journal.key_id !== null) {
+					if (!coordinatorSidecarSigningKey) throw new PreviousRuntimeStateReadError();
+					journal.signature = sign(
+						null,
+						Buffer.from(canonicalCoordinatorSidecarPayload(journalSignaturePayload(journal))),
+						coordinatorSidecarSigningKey,
+					).toString("base64");
+				}
+				const writeJournal = async (journalFile: string): Promise<void> => {
+					await writeCoordinatorAtomic(journalFile, `${JSON.stringify(journal)}\n`, {
+						rename: async (source, destination) => {
+							const published = renameNoReplacePath(source, destination);
+							if (!published.ok) throw new PreviousRuntimeStateReadError();
+						},
+					});
+				};
+				await __sessionStateSidecarTestHooks.beforeRescopeJournalWrite?.(previousCwd);
+				assertPinnedDirectoryIdentity(input.previousCwd, previousCwdIdentity);
+				await writeJournal(previousJournalFile);
+				if (confinedJournalPath(previousCwd, input.sessionId, identity.platform) !== previousJournalFile)
+					throw new PreviousRuntimeStateReadError();
+				assertPinnedDirectoryIdentity(input.previousCwd, previousCwdIdentity);
+				await __sessionStateSidecarTestHooks.beforeRescopeJournalWrite?.(newCwd);
+				assertPinnedDirectoryIdentity(input.newCwd, newCwdIdentity);
+				await writeJournal(newJournalFile);
+				if (confinedJournalPath(newCwd, input.sessionId, identity.platform) !== newJournalFile)
+					throw new PreviousRuntimeStateReadError();
+				assertPinnedDirectoryIdentity(input.previousCwd, previousCwdIdentity);
+				assertPinnedDirectoryIdentity(input.newCwd, newCwdIdentity);
+				return journal.move_id;
+			}),
+		),
+	);
+}
+
+export async function markCoordinatorRuntimeStateRescopePublishing(
+	context: RuntimeStateContext,
+	previousCwd: string,
+	moveId: string,
+): Promise<void> {
+	const identity = normalizedIdentity(context);
+	const journalFiles = orderedDistinctStateFiles(
+		[previousCwd, context.cwd].map(cwd =>
+			runtimeStateRescopeJournalPath(fsSync.realpathSync(cwd), context.sessionId),
+		),
+		identity.platform,
+	);
+	for (const journalFile of journalFiles) {
+		const observed = readRegularFileForRelocation(journalFile);
+		if (!observed) throw new PreviousRuntimeStateReadError();
+		const journal = parseRuntimeStateRescopeJournal(observed.raw);
+		verifyRuntimeStateRescopeJournal(journal);
+		if (
+			journal.move_id !== moveId ||
+			journal.session_id !== context.sessionId ||
+			journal.key_id !== identity.sidecarKeyId ||
+			journal.phase !== "prepared"
+		)
+			throw new PreviousRuntimeStateReadError();
+		journal.phase = "publishing";
+		journal.signature = null;
+		if (journal.key_id !== null) {
+			if (!coordinatorSidecarSigningKey) throw new PreviousRuntimeStateReadError();
+			journal.signature = sign(
+				null,
+				Buffer.from(canonicalCoordinatorSidecarPayload(journalSignaturePayload(journal))),
+				coordinatorSidecarSigningKey,
+			).toString("base64");
+		}
+		const contents = `${JSON.stringify(journal)}\n`;
+		await writeCoordinatorAtomic(journalFile, contents, {
+			rename: async (source, destination) => {
+				const sourceStat = fsSync.lstatSync(source, { bigint: true });
+				const sourceParent = fsSync.lstatSync(path.dirname(source), { bigint: true });
+				const replaced = exactReplacePath(
+					source,
+					destination,
+					{
+						dev: sourceStat.dev,
+						ino: sourceStat.ino,
+						nlink: sourceStat.nlink,
+						parentDev: sourceParent.dev,
+						parentIno: sourceParent.ino,
+						size: sourceStat.size,
+						mtimeNs: sourceStat.mtimeNs,
+						sha256: createHash("sha256").update(contents).digest("hex"),
+					},
+					observed.identity,
+				);
+				if (!replaced.ok) throw new PreviousRuntimeStateReadError();
+			},
+		});
+	}
+}
+
+export async function clearCoordinatorRuntimeStateRescope(
+	context: RuntimeStateContext,
+	expectedMoveId?: string,
+	previousCwd?: string,
+): Promise<void> {
+	const identity = normalizedIdentity(context);
+	const candidateCwds = [context.cwd, previousCwd].filter((cwd): cwd is string => typeof cwd === "string");
+	const journalFiles = orderedDistinctStateFiles(
+		candidateCwds.map(cwd => runtimeStateRescopeJournalPath(fsSync.realpathSync(cwd), context.sessionId)),
+		identity.platform,
+	);
+	for (const journalFile of journalFiles) {
+		const observed = readRegularFileForRelocation(journalFile);
+		if (!observed) continue;
+		const journal = parseRuntimeStateRescopeJournal(observed.raw);
+		verifyRuntimeStateRescopeJournal(journal);
+		if (expectedMoveId !== undefined && journal.move_id !== expectedMoveId) throw new PreviousRuntimeStateReadError();
+		if (journal.session_id !== context.sessionId || journal.key_id !== identity.sidecarKeyId)
+			throw new PreviousRuntimeStateReadError();
+		const removed = exactUnlinkDirect(journalFile, observed.identity);
+		if (!removed.ok && removed.code !== "not_found") throw new PreviousRuntimeStateReadError();
+		await syncCoordinatorDirectory(path.dirname(journalFile));
+	}
+}
+
+/**
+ * Cheap synchronous probe for a pending rescope-recovery journal at this cwd. Sessions
+ * that never moved (the overwhelming majority) have none, so callers use this to avoid
+ * arming a startup-turn barrier for a no-op recovery \u2014 an armed barrier is not free even
+ * when it resolves immediately: it flips the session's startup gate from absent to present
+ * and reorders barrier-gated post-turn work.
+ */
+export function hasCoordinatorRuntimeStateRescopeJournal(context: RuntimeStateContext): boolean {
+	try {
+		return readRegularFileForRelocation(runtimeStateRescopeJournalPath(context.cwd, context.sessionId)) !== null;
+	} catch {
+		return false;
+	}
+}
+
+export async function recoverCoordinatorRuntimeStateRescope(context: RuntimeStateContext): Promise<void> {
+	const journalFile = runtimeStateRescopeJournalPath(context.cwd, context.sessionId);
+	const observed = readRegularFileForRelocation(journalFile);
+	if (!observed) return;
+	const journal = parseRuntimeStateRescopeJournal(observed.raw);
+	verifyRuntimeStateRescopeJournal(journal);
+	const current = normalizedIdentity(context);
+	const configuredStateFiles = rescopeStateFiles(journal.session_id, journal.previous_cwd, journal.new_cwd);
+	if (
+		journal.session_id !== context.sessionId ||
+		journal.key_id !== current.sidecarKeyId ||
+		journal.state_file_mode !== configuredStateFiles.mode ||
+		!sameResolvedPath(journal.old_state_file, configuredStateFiles.oldStateFile, current.platform) ||
+		!sameResolvedPath(journal.new_state_file, configuredStateFiles.newStateFile, current.platform)
+	)
+		throw new PreviousRuntimeStateReadError();
+	if (
+		sameResolvedPath(journal.previous_cwd, current.cwd, current.platform) &&
+		sameOptionalResolvedPath(journal.previous_session_file, current.sessionFile, current.platform)
+	) {
+		if (journal.phase !== "prepared") throw new PreviousRuntimeStateReadError();
+		const source = readPreviousPayloadForRelocation(journal.old_state_file);
+		if (Object.keys(source.payload).length === 0) {
+			if (journal.source_sha256 !== null) throw new PreviousRuntimeStateReadError();
+		} else {
+			assertRelocationRuntimeStateIdentity(
+				source.payload,
+				previousRescopeIdentity(
+					{ ...context, previousSessionFile: journal.previous_session_file },
+					journal.previous_cwd,
+				),
+			);
+			if (source.identity?.sha256 !== journal.source_sha256) throw new PreviousRuntimeStateReadError();
+		}
+		await clearCoordinatorRuntimeStateRescope(context, journal.move_id, journal.new_cwd);
+		return;
+	}
+	if (
+		!sameResolvedPath(journal.new_cwd, current.cwd, current.platform) ||
+		!sameOptionalResolvedPath(journal.new_session_file, current.sessionFile, current.platform) ||
+		journal.phase !== "publishing"
+	)
+		throw new PreviousRuntimeStateReadError();
+	const completed = await relocateCoordinatorRuntimeStateForRescope(
+		{ ...context, previousSessionFile: journal.previous_session_file },
+		journal.previous_cwd,
+	);
+	if (!completed) throw new PreviousRuntimeStateReadError();
+	await clearCoordinatorRuntimeStateRescope(context, journal.move_id, journal.previous_cwd);
+}
+
+function sameExactFileIdentity(left: NativeExactFileIdentity | null, right: NativeExactFileIdentity | null): boolean {
+	return (
+		left === right ||
+		(left !== null &&
+			right !== null &&
+			left.dev === right.dev &&
+			left.ino === right.ino &&
+			left.nlink === right.nlink &&
+			left.size === right.size &&
+			left.mtimeNs === right.mtimeNs &&
+			left.sha256 === right.sha256)
+	);
+}
+
+/**
+ * Repairs the coordinator-shared runtime state after a committed cwd rescope, for every
+ * move surface (`move_session`, TUI `/move`, SDK/ACP `session.cwd.move`) through the one
+ * shared {@link SessionManager.moveTo} seam.
+ *
+ * The identity fence in {@link assertPreviousRuntimeStateIdentity} rejects any write whose
+ * predecessor payload records a different cwd/workdir than the live session. A rescope
+ * changes the session cwd but leaves the predecessor payload pointing at the launch root,
+ * so every later persist for the session would be refused as a foreign marker.
+ *
+ * The predecessor is fully authenticated against its OLD identity before it is trusted:
+ * signed mode verifies the predecessor's key id and Ed25519 signature; unsigned mode
+ * requires an exact old cwd/workdir/session-file match (the same checks the fence applies).
+ * Only a predecessor that passes is rewritten to the new identity and re-signed. When the
+ * state file is cwd-derived rather than pinned by
+ * {@link GJC_COORDINATOR_SESSION_STATE_FILE_ENV}, the payload is migrated to the new path
+ * and the orphaned launch-root file is removed. A payload already self-healed at the new
+ * cwd is left untouched.
+ *
+ * Both the old and new cwd-derived paths are locked (new first, then old) so a concurrent
+ * writer at either path serializes behind this repair. Best-effort by contract: the move
+ * is already durable, so a failure here is logged by the caller and never resurfaced as a
+ * rescope rejection.
+ */
+export async function relocateCoordinatorRuntimeStateForRescope(
+	context: RuntimeStateContext,
+	previousCwd: string,
+): Promise<boolean> {
+	const canonicalNewCwd = fsSync.realpathSync(context.cwd);
+	const canonicalPreviousCwd = fsSync.realpathSync(previousCwd);
+	context = { ...context, cwd: canonicalNewCwd };
+	const rawNewStateFile = runtimeStateFileForContext(context);
+	const newStateFile = rawNewStateFile ? canonicalStateFilePath(rawNewStateFile) : null;
+	if (!newStateFile) return true;
+	const identity = normalizedIdentity(context);
+	const oldIdentity = previousRescopeIdentity(context, previousCwd);
+	const explicitStateFile = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
+	// A pinned state file never moves with the cwd; a cwd-derived one lives under the
+	// per-session runtime directory rooted at the (now former) cwd.
+	const oldStateFile = explicitStateFile
+		? newStateFile
+		: canonicalStateFilePath(
+				path.join(sessionRuntimeDir(canonicalPreviousCwd, identity.sessionId), "runtime-state.json"),
+			);
+	const samePath = sameResolvedPath(oldStateFile, newStateFile, identity.platform);
+	let expectedSourceSha256: string | null | undefined;
+	const journalObservation = readRegularFileForRelocation(
+		runtimeStateRescopeJournalPath(canonicalNewCwd, context.sessionId),
+	);
+	if (journalObservation) {
+		const journal = parseRuntimeStateRescopeJournal(journalObservation.raw);
+		verifyRuntimeStateRescopeJournal(journal);
+		if (
+			journal.session_id !== context.sessionId ||
+			journal.key_id !== identity.sidecarKeyId ||
+			!sameResolvedPath(journal.previous_cwd, canonicalPreviousCwd, identity.platform) ||
+			!sameResolvedPath(journal.new_cwd, canonicalNewCwd, identity.platform) ||
+			!sameResolvedPath(journal.old_state_file, oldStateFile, identity.platform) ||
+			!sameResolvedPath(journal.new_state_file, newStateFile, identity.platform)
+		)
+			throw new PreviousRuntimeStateReadError();
+		expectedSourceSha256 = journal.source_sha256;
+	}
+	const stateFiles = orderedDistinctStateFiles([oldStateFile, newStateFile], identity.platform);
+	return await withSerializedStateFiles(
+		stateFiles,
+		async () =>
+			await withCoordinatorTransactionLocks(
+				stateFiles,
+				async () =>
+					await withStateFileLocks(stateFiles, async () => {
+						await __sessionStateSidecarTestHooks.afterRescopeLocksAcquired?.();
+						const destinationObservation = readPreviousPayloadForRelocation(newStateFile);
+						const destination = destinationObservation.payload;
+						if (samePath && Object.keys(destination).length > 0) {
+							try {
+								assertRelocationRuntimeStateIdentity(destination, identity);
+								return true;
+							} catch {
+								// A pinned predecessor still carries the old identity and is migrated below.
+							}
+						}
+						let destinationIsCurrent = false;
+						if (!samePath && Object.keys(destination).length > 0) {
+							try {
+								assertRelocationRuntimeStateIdentity(destination, identity);
+							} catch {
+								return false;
+							}
+							destinationIsCurrent = true;
+						}
+						const sourceObservation = samePath
+							? destinationObservation
+							: readPreviousPayloadForRelocation(oldStateFile);
+						const source = sourceObservation.payload;
+						if (Object.keys(source).length === 0) {
+							return expectedSourceSha256 === undefined || expectedSourceSha256 === null || destinationIsCurrent;
+						}
+						if (
+							expectedSourceSha256 !== undefined &&
+							(expectedSourceSha256 === null || sourceObservation.identity?.sha256 !== expectedSourceSha256)
+						)
+							return false;
+						// Trust the predecessor only if it authenticates against its OLD identity. A payload
+						// whose signature, key, or old cwd/session-file does not match is left untouched; the
+						// fence, not this repair, remains the authority for a foreign marker.
+						try {
+							assertRelocationRuntimeStateIdentity(source, oldIdentity);
+						} catch {
+							return false;
+						}
+						const publishSource = !destinationIsCurrent;
+						if (publishSource) {
+							const migrated = {
+								...source,
+								cwd: identity.cwd,
+								workdir: identity.workdir,
+								session_file: identity.sessionFile,
+								branch: branchForContext(context),
+								source: "session_rescope",
+								event: "move_session",
+								updated_at: new Date().toISOString(),
+							};
+							await __sessionStateSidecarTestHooks.beforeRescopePublish?.();
+							await writeStateFileSyncConditional(
+								newStateFile,
+								migrated,
+								identity.sidecarKeyId,
+								destinationObservation.identity,
+							);
+						}
+						if (samePath) return true;
+						// Remove the orphan while both path transactions remain held. Re-read and authenticate
+						// so an unexpected non-cooperating replacement is never removed as this session's state.
+						const orphanObservation = readPreviousPayloadForRelocation(oldStateFile);
+						const orphan = orphanObservation.payload;
+						if (Object.keys(orphan).length === 0) return true;
+						try {
+							assertRelocationRuntimeStateIdentity(orphan, oldIdentity);
+						} catch {
+							return false;
+						}
+						if (!sameExactFileIdentity(sourceObservation.identity, orphanObservation.identity)) return false;
+						if (!orphanObservation.identity) throw new PreviousRuntimeStateReadError();
+						const removed = exactUnlinkDirect(oldStateFile, orphanObservation.identity);
+						if (!removed.ok && removed.code !== "not_found") throw new PreviousRuntimeStateReadError();
+						return true;
 					}),
 			),
 	);
@@ -1902,6 +2730,7 @@ export async function persistCoordinatorRuntimeStateFromPostmortem(
 				stateFile,
 				async () =>
 					await withStateFileLock(stateFile, async () => {
+						assertNoRuntimeStateRescopeJournal(context, identity);
 						const previous = readPreviousPayload(stateFile);
 						assertPreviousRuntimeStateIdentity(previous, identity);
 						if (shouldPreserveTerminalPayload(previous as RuntimeStateSidecarPayload, identity)) return;
@@ -1973,16 +2802,21 @@ export async function persistCoordinatorRuntimeStateFromPostmortem(
 	});
 }
 
-export function registerCoordinatorRuntimeStateFinalizer(context: RuntimeStateContext): () => void {
+export function registerCoordinatorRuntimeStateFinalizer(
+	context: RuntimeStateContext,
+	resolveContext?: () => RuntimeStateContext,
+): () => void {
 	if (!runtimeStateFileForContext(context)) return () => {};
-	const ownerTerminal = ownerTerminalContextFromEnvironment();
-	const finalizerContext: RuntimeStateContext =
-		ownerTerminal === "invalid"
-			? { ...context, ownerTerminalMetadataInvalid: true }
-			: ownerTerminal
-				? { ...context, ownerTerminal }
-				: context;
 	return postmortem.register("coordinator-runtime-state", async reason => {
+		const liveContext = resolveContext?.() ?? context;
+		const ownerTerminal = ownerTerminalContextFromEnvironment();
+		const finalizerContext: RuntimeStateContext =
+			ownerTerminal === "invalid"
+				? { ...liveContext, ownerTerminalMetadataInvalid: true }
+				: ownerTerminal
+					? { ...liveContext, ownerTerminal }
+					: liveContext;
+		await recoverCoordinatorRuntimeStateRescope(finalizerContext);
 		await persistCoordinatorRuntimeStateFromPostmortem(reason, finalizerContext);
 	});
 }

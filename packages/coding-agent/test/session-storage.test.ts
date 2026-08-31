@@ -1353,6 +1353,176 @@ describe("replacement cleanup receipt reconcile TOCTOU resilience", () => {
 		expect(fs.existsSync(path.join(root, "concurrent-reconcile"))).toBe(true);
 	});
 
+	it("canonicalizes signed file ids from an interrupted pending Windows receipt", () => {
+		const destination = path.join(root, "session.jsonl");
+		const staging = path.join(root, ".session.replacement");
+		const predecessorPath = path.join(root, "predecessor");
+		fs.writeFileSync(destination, "successor\n");
+		fs.writeFileSync(staging, "prepared\n");
+		fs.writeFileSync(predecessorPath, "predecessor\n");
+		const predecessor = snapshot(predecessorPath);
+		const successor = snapshot(destination);
+		const signedIno = -7_984_882_139_327_873_970n;
+		const pending = path.join(root, `.gjc-replace-receipt-pending-${randomUUID()}.json`);
+		fs.writeFileSync(
+			pending,
+			JSON.stringify({
+				version: 3,
+				staging,
+				destination,
+				predecessor: { ...predecessor, ino: signedIno.toString() },
+				successor: { ...successor, ino: signedIno.toString() },
+			}),
+		);
+		let publishedReceiptPath: string | undefined;
+		const realRename = native.renameNoReplacePath;
+		vi.spyOn(native, "renameNoReplacePath").mockImplementation((source, target) => {
+			if (source === pending) publishedReceiptPath = target;
+			return realRename(source, target);
+		});
+
+		replay("signed-pending-receipt");
+
+		expect(publishedReceiptPath).toContain(BigInt.asUintN(64, signedIno).toString(16));
+		expect(path.basename(publishedReceiptPath!)).not.toContain("--");
+		expect(fs.existsSync(path.join(root, "signed-pending-receipt"))).toBe(true);
+	});
+
+	it("reconciles an already-written double-hyphen Windows receipt without weakening inode authority", () => {
+		const predecessorPath = path.join(root, "predecessor");
+		fs.writeFileSync(predecessorPath, "predecessor\n");
+		const predecessor = snapshot(predecessorPath);
+		const pending = path.join(root, `.gjc-replace-receipt-pending-${randomUUID()}.json`);
+		fs.writeFileSync(pending, JSON.stringify({ version: 3, legacy: "signed Windows file id" }));
+		const actualReceipt = snapshot(pending);
+		const signedIno = -7_984_882_139_327_873_970n;
+		const unsignedIno = BigInt.asUintN(64, signedIno);
+		const receipt = path.join(
+			root,
+			`.gjc-replace-cleanup-${BigInt(predecessor.dev).toString(16)}-${BigInt(predecessor.ino).toString(16)}-receipt-${BigInt(actualReceipt.dev).toString(16)}-${signedIno.toString(16)}.json`,
+		);
+		fs.renameSync(pending, receipt);
+		const actualIno = BigInt(actualReceipt.ino);
+		const realFstat = fs.fstatSync.bind(fs);
+		const realLstat = fs.lstatSync.bind(fs);
+		const withSignedIno = (stat: fs.BigIntStats): fs.BigIntStats => {
+			const synthetic = Object.create(stat) as fs.BigIntStats;
+			Object.defineProperty(synthetic, "ino", { value: signedIno });
+			return synthetic;
+		};
+		vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number, options?: fs.StatOptions) => {
+			const stat = realFstat(fd, options as never) as unknown as fs.BigIntStats;
+			return stat.ino === actualIno ? withSignedIno(stat) : stat;
+		}) as typeof fs.fstatSync);
+		vi.spyOn(fs, "lstatSync").mockImplementation(((pathname: fs.PathLike, options?: fs.StatOptions) => {
+			const stat = realLstat(pathname, options as never) as unknown as fs.BigIntStats;
+			return path.resolve(String(pathname)) === receipt ? withSignedIno(stat) : stat;
+		}) as typeof fs.lstatSync);
+		const realExactUnlink = native.exactUnlink;
+		vi.spyOn(native, "exactUnlink").mockImplementation((pathname, expected) => {
+			if (pathname !== receipt) return realExactUnlink(pathname, expected);
+			expect(expected.ino).toBe(unsignedIno);
+			expect(expected.quarantineName).not.toContain("--");
+			const detachedPath = path.join(root, expected.quarantineName!);
+			fs.renameSync(pathname, detachedPath);
+			return { ok: true, detachedPath };
+		});
+
+		replay("signed-canonical-receipt");
+
+		expect(fs.existsSync(receipt)).toBe(false);
+		expect(fs.existsSync(path.join(root, "signed-canonical-receipt"))).toBe(true);
+	});
+
+	it("recovers a signed version-one receipt only through its fully validated predecessor proof", () => {
+		const predecessorSeed = path.join(root, ".predecessor");
+		fs.writeFileSync(predecessorSeed, "predecessor\n");
+		const actualPredecessor = snapshot(predecessorSeed);
+		const signedIno = -7_984_882_139_327_873_970n;
+		const unsignedIno = BigInt.asUintN(64, signedIno);
+		const predecessor = path.join(
+			root,
+			`.gjc-exact-replace-destination-${BigInt(actualPredecessor.dev).toString(16)}-${signedIno.toString(16)}`,
+		);
+		fs.renameSync(predecessorSeed, predecessor);
+		const receipt = path.join(
+			root,
+			`.gjc-replace-cleanup-${BigInt(actualPredecessor.dev).toString(16)}-${signedIno.toString(16)}.json`,
+		);
+		fs.writeFileSync(
+			receipt,
+			JSON.stringify({
+				version: 1,
+				predecessor,
+				successor: path.join(root, "session.jsonl"),
+				identity: { ...actualPredecessor, ino: signedIno.toString() },
+			}),
+		);
+		const actualIno = BigInt(actualPredecessor.ino);
+		const realFstat = fs.fstatSync.bind(fs);
+		const realLstat = fs.lstatSync.bind(fs);
+		const withSignedIno = (stat: fs.BigIntStats): fs.BigIntStats => {
+			const synthetic = Object.create(stat) as fs.BigIntStats;
+			Object.defineProperty(synthetic, "ino", { value: signedIno });
+			return synthetic;
+		};
+		vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number, options?: fs.StatOptions) => {
+			const stat = realFstat(fd, options as never) as unknown as fs.BigIntStats;
+			return stat.ino === actualIno ? withSignedIno(stat) : stat;
+		}) as typeof fs.fstatSync);
+		vi.spyOn(fs, "lstatSync").mockImplementation(((pathname: fs.PathLike, options?: fs.StatOptions) => {
+			const stat = realLstat(pathname, options as never) as unknown as fs.BigIntStats;
+			return path.resolve(String(pathname)) === predecessor ? withSignedIno(stat) : stat;
+		}) as typeof fs.lstatSync);
+		const realExactUnlink = native.exactUnlink;
+		vi.spyOn(native, "exactUnlink").mockImplementation((pathname, expected) => {
+			if (pathname !== predecessor && pathname !== receipt) return realExactUnlink(pathname, expected);
+			if (pathname === predecessor) expect(expected.ino).toBe(unsignedIno);
+			fs.unlinkSync(pathname);
+			return { ok: true };
+		});
+
+		replay("signed-v1-receipt");
+
+		expect(fs.existsSync(predecessor)).toBe(false);
+		expect(fs.existsSync(receipt)).toBe(false);
+		expect(fs.existsSync(path.join(root, "signed-v1-receipt"))).toBe(true);
+	});
+
+	it("rejects non-canonical and out-of-range signed receipt file ids", () => {
+		for (const ino of ["-0", "-01", "-8000000000000001"]) {
+			const receipt = path.join(root, `.gjc-replace-cleanup-1-2-receipt-3-${ino}.json`);
+			fs.writeFileSync(receipt, "receipt");
+
+			expect(() => replay(`invalid-signed-${ino}`)).toThrow("managed_replace_cleanup_receipt_invalid");
+			expect(fs.readFileSync(receipt, "utf8")).toBe("receipt");
+			fs.rmSync(receipt);
+		}
+	});
+
+	it("rejects an out-of-range signed identity in an interrupted pending receipt", () => {
+		const destination = path.join(root, "session.jsonl");
+		const staging = path.join(root, ".session.replacement");
+		fs.writeFileSync(destination, "successor\n");
+		fs.writeFileSync(staging, "prepared\n");
+		const identity = snapshot(destination);
+		const pending = path.join(root, `.gjc-replace-receipt-pending-${randomUUID()}.json`);
+		fs.writeFileSync(
+			pending,
+			JSON.stringify({
+				version: 3,
+				staging,
+				destination,
+				predecessor: { ...identity, ino: "-9223372036854775809" },
+				successor: identity,
+			}),
+		);
+
+		expect(() => replay("invalid-signed-pending")).toThrow("managed_replace_cleanup_receipt_invalid");
+		expect(fs.existsSync(pending)).toBe(true);
+		expect(fs.existsSync(path.join(root, "invalid-signed-pending"))).toBe(false);
+	});
+
 	it("rejects invalid_request when the pending receipt disappears into a conflicting destination", () => {
 		const { pending, receipt } = pendingReceipt();
 		const realRename = native.renameNoReplacePath;

@@ -290,8 +290,8 @@ export interface ManagedBoundedAppendExpectation {
 
 function managedFileIdentityFromNative(identity: RecoveryFsIdentity): ManagedFileIdentity {
 	return {
-		dev: BigInt(identity.dev),
-		ino: BigInt(identity.ino),
+		dev: canonicalFileId(BigInt(identity.dev)),
+		ino: canonicalFileId(BigInt(identity.ino)),
 		nlink: BigInt(identity.nlink),
 		size: Number(identity.size),
 		mtimeNs: BigInt(identity.mtimeNs),
@@ -346,6 +346,12 @@ type LegacyReplacementCleanupIdentity = {
 };
 
 const U64_MAX = 18_446_744_073_709_551_615n;
+const I64_ABS_MIN = 9_223_372_036_854_775_808n;
+
+function canonicalFileId(value: bigint): bigint {
+	if (value < -I64_ABS_MIN || value > U64_MAX) throw new Error("file_identity_out_of_range");
+	return BigInt.asUintN(64, value);
+}
 
 function parseCanonicalU64(value: unknown): bigint | undefined {
 	if (typeof value !== "string" || !/^(0|[1-9][0-9]*)$/.test(value) || value.length > 20) return undefined;
@@ -353,10 +359,19 @@ function parseCanonicalU64(value: unknown): bigint | undefined {
 	return parsed <= U64_MAX ? parsed : undefined;
 }
 
-function parseLegacyHexU64(value: string): bigint | undefined {
-	if (!/^[0-9a-f]+$/.test(value) || value.length > 16) return undefined;
-	const parsed = BigInt(`0x${value}`);
-	return parsed <= U64_MAX ? parsed : undefined;
+function parseFileId(value: unknown): bigint | undefined {
+	const canonical = parseCanonicalU64(value);
+	if (canonical !== undefined) return canonical;
+	if (typeof value !== "string" || !/^-[1-9][0-9]*$/.test(value) || value.length > 20) return undefined;
+	const parsed = BigInt(value);
+	return parsed >= -I64_ABS_MIN ? canonicalFileId(parsed) : undefined;
+}
+
+function parseFileIdHex(value: string): bigint | undefined {
+	if (/^(0|[1-9a-f][0-9a-f]*)$/.test(value) && value.length <= 16) return BigInt(`0x${value}`);
+	if (!/^-[1-9a-f][0-9a-f]*$/.test(value) || value.length > 17) return undefined;
+	const magnitude = BigInt(`0x${value.slice(1)}`);
+	return magnitude <= I64_ABS_MIN ? canonicalFileId(-magnitude) : undefined;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -365,19 +380,21 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 		: undefined;
 }
 
-function legacyReplacementCleanupReceiptBinding(name: string): { dev: bigint; ino: bigint } | undefined {
-	const match = /^\.gjc-replace-cleanup-([0-9a-f]+)-([0-9a-f]+)\.json$/.exec(name);
+function legacyReplacementCleanupReceiptBinding(
+	name: string,
+): { dev: bigint; ino: bigint; encodedDev: string; encodedIno: string } | undefined {
+	const match = /^\.gjc-replace-cleanup-(-?(?:0|[1-9a-f][0-9a-f]*))-(-?(?:0|[1-9a-f][0-9a-f]*))\.json$/.exec(name);
 	if (!match?.[1] || !match[2]) return undefined;
-	const dev = parseLegacyHexU64(match[1]);
-	const ino = parseLegacyHexU64(match[2]);
-	return dev !== undefined && ino !== undefined ? { dev, ino } : undefined;
+	const dev = parseFileIdHex(match[1]);
+	const ino = parseFileIdHex(match[2]);
+	return dev !== undefined && ino !== undefined ? { dev, ino, encodedDev: match[1], encodedIno: match[2] } : undefined;
 }
 
 function parseLegacyReplacementCleanupIdentity(value: unknown): LegacyReplacementCleanupIdentity | undefined {
 	const identity = asRecord(value);
 	if (!identity) return undefined;
-	const dev = parseCanonicalU64(identity.dev);
-	const ino = parseCanonicalU64(identity.ino);
+	const dev = parseFileId(identity.dev);
+	const ino = parseFileId(identity.ino);
 	const nlink = parseCanonicalU64(identity.nlink);
 	const size = parseCanonicalU64(identity.size);
 	const mtimeNs = parseCanonicalU64(identity.mtimeNs);
@@ -417,28 +434,50 @@ function replacementCleanupReceiptBinding(
 	name: string,
 ): { predecessor: { dev: bigint; ino: bigint }; receipt: { dev: bigint; ino: bigint } } | undefined {
 	const match =
-		/^\.gjc-replace-cleanup-(0|[1-9a-f][0-9a-f]*)-(0|[1-9a-f][0-9a-f]*)-receipt-(0|[1-9a-f][0-9a-f]*)-(0|[1-9a-f][0-9a-f]*)\.json$/.exec(
+		/^\.gjc-replace-cleanup-(-?(?:0|[1-9a-f][0-9a-f]*))-(-?(?:0|[1-9a-f][0-9a-f]*))-receipt-(-?(?:0|[1-9a-f][0-9a-f]*))-(-?(?:0|[1-9a-f][0-9a-f]*))\.json$/.exec(
 			name,
 		);
 	if (!match?.[1] || !match[2] || !match[3] || !match[4]) return undefined;
-	const predecessor = { dev: BigInt(`0x${match[1]}`), ino: BigInt(`0x${match[2]}`) };
-	const receipt = { dev: BigInt(`0x${match[3]}`), ino: BigInt(`0x${match[4]}`) };
-	return predecessor.dev <= U64_MAX && predecessor.ino <= U64_MAX && receipt.dev <= U64_MAX && receipt.ino <= U64_MAX
-		? { predecessor, receipt }
+	const predecessor = { dev: parseFileIdHex(match[1]), ino: parseFileIdHex(match[2]) };
+	const receipt = { dev: parseFileIdHex(match[3]), ino: parseFileIdHex(match[4]) };
+	return predecessor.dev !== undefined &&
+		predecessor.ino !== undefined &&
+		receipt.dev !== undefined &&
+		receipt.ino !== undefined
+		? { predecessor: { dev: predecessor.dev, ino: predecessor.ino }, receipt: { dev: receipt.dev, ino: receipt.ino } }
 		: undefined;
 }
 
 function parseReplacementIdentity(value: unknown): ManagedFileSnapshot["identity"] | undefined {
-	const parsed = parseLegacyReplacementCleanupIdentity(value);
-	if (!parsed || parsed.size > BigInt(Number.MAX_SAFE_INTEGER)) return undefined;
+	const identity = asRecord(value);
+	if (!identity) return undefined;
+	const dev = parseFileId(identity.dev);
+	const ino = parseFileId(identity.ino);
+	const nlink = parseCanonicalU64(identity.nlink);
+	const size = parseCanonicalU64(identity.size);
+	const mtimeNs = parseCanonicalU64(identity.mtimeNs);
+	const ctimeNs = parseCanonicalU64(identity.ctimeNs);
+	const sha256 = identity.sha256;
+	if (
+		dev === undefined ||
+		ino === undefined ||
+		nlink === undefined ||
+		size === undefined ||
+		size > BigInt(Number.MAX_SAFE_INTEGER) ||
+		mtimeNs === undefined ||
+		ctimeNs === undefined ||
+		typeof sha256 !== "string" ||
+		!/^[0-9a-f]{64}$/.test(sha256)
+	)
+		return undefined;
 	return {
-		dev: parsed.dev,
-		ino: parsed.ino,
-		nlink: parsed.nlink,
-		size: Number(parsed.size),
-		mtimeNs: parsed.mtimeNs,
-		ctimeNs: parsed.ctimeNs,
-		sha256: parsed.sha256,
+		dev,
+		ino,
+		nlink,
+		size: Number(size),
+		mtimeNs,
+		ctimeNs,
+		sha256,
 	};
 }
 
@@ -463,8 +502,8 @@ function parseReplacementCleanupReceipt(bytes: Uint8Array): ReplacementCleanupRe
 
 function serializeReplacementIdentity(identity: ManagedFileSnapshot["identity"]): SerializedReplacementIdentity {
 	return {
-		dev: identity.dev.toString(),
-		ino: identity.ino.toString(),
+		dev: canonicalFileId(identity.dev).toString(),
+		ino: canonicalFileId(identity.ino).toString(),
 		nlink: identity.nlink.toString(),
 		size: String(identity.size),
 		mtimeNs: identity.mtimeNs.toString(),
@@ -480,7 +519,7 @@ function replacementReceiptPath(
 ): string {
 	return path.join(
 		baseDir,
-		`.gjc-replace-cleanup-${predecessor.dev.toString(16)}-${predecessor.ino.toString(16)}-receipt-${receipt.dev.toString(16)}-${receipt.ino.toString(16)}.json`,
+		`.gjc-replace-cleanup-${canonicalFileId(predecessor.dev).toString(16)}-${canonicalFileId(predecessor.ino).toString(16)}-receipt-${canonicalFileId(receipt.dev).toString(16)}-${canonicalFileId(receipt.ino).toString(16)}.json`,
 	);
 }
 
@@ -488,7 +527,7 @@ function replacementReceiptRetirementName(
 	receipt: { dev: bigint; ino: bigint },
 	predecessor: { dev: bigint; ino: bigint },
 ): string {
-	return `.gjc-receipt-remove-${receipt.dev.toString(16)}-${receipt.ino.toString(16)}-${predecessor.dev.toString(16)}-${predecessor.ino.toString(16)}`;
+	return `.gjc-receipt-remove-${canonicalFileId(receipt.dev).toString(16)}-${canonicalFileId(receipt.ino).toString(16)}-${canonicalFileId(predecessor.dev).toString(16)}-${canonicalFileId(predecessor.ino).toString(16)}`;
 }
 
 function replacementReceiptPlaceholderRetirementName(
@@ -496,7 +535,7 @@ function replacementReceiptPlaceholderRetirementName(
 	predecessor: { dev: bigint; ino: bigint },
 	receipt: { dev: bigint; ino: bigint },
 ): string {
-	return `.gjc-receipt-placeholder-remove-${placeholder.dev.toString(16)}-${placeholder.ino.toString(16)}-${predecessor.dev.toString(16)}-${predecessor.ino.toString(16)}-${receipt.dev.toString(16)}-${receipt.ino.toString(16)}`;
+	return `.gjc-receipt-placeholder-remove-${canonicalFileId(placeholder.dev).toString(16)}-${canonicalFileId(placeholder.ino).toString(16)}-${canonicalFileId(predecessor.dev).toString(16)}-${canonicalFileId(predecessor.ino).toString(16)}-${canonicalFileId(receipt.dev).toString(16)}-${canonicalFileId(receipt.ino).toString(16)}`;
 }
 
 /**
@@ -805,7 +844,7 @@ export function managedDirectoryRoot(configuredRoot: string): ManagedDirectoryRo
 	const canonicalPath = fs.realpathSync.native(configuredRoot);
 	const stat = fs.lstatSync(canonicalPath, { bigint: true });
 	if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`Unsafe managed root: ${configuredRoot}`);
-	return Object.freeze({ canonicalPath, dev: stat.dev, ino: stat.ino });
+	return Object.freeze({ canonicalPath, dev: canonicalFileId(stat.dev), ino: canonicalFileId(stat.ino) });
 }
 
 export function retainManagedDirectoryAuthority(
@@ -819,7 +858,7 @@ export function retainManagedDirectoryAuthority(
 	if (process.platform !== "linux") return undefined;
 	const named = fs.lstatSync(resolved, { bigint: true });
 	if (!named.isDirectory() || named.isSymbolicLink()) throw new Error("Managed directory authority is unavailable");
-	if (expected && (named.dev !== expected.dev || named.ino !== expected.ino))
+	if (expected && (canonicalFileId(named.dev) !== expected.dev || canonicalFileId(named.ino) !== expected.ino))
 		throw new Error("Managed directory identity changed before retention");
 	const rootAuthority = nativeSessionStorage().openRecoveryFsRoot(root.canonicalPath);
 	try {
@@ -832,7 +871,11 @@ export function retainManagedDirectoryAuthority(
 		)
 			throw new Error("Managed root authority changed");
 		const relative = path.relative(root.canonicalPath, resolved).split(path.sep).join("/");
-		return rootAuthority.retainManagedDirectory(relative, named.dev.toString(), named.ino.toString());
+		return rootAuthority.retainManagedDirectory(
+			relative,
+			canonicalFileId(named.dev).toString(),
+			canonicalFileId(named.ino).toString(),
+		);
 	} finally {
 		rootAuthority.close();
 	}
@@ -852,7 +895,12 @@ function ensureDirectoryComponent(pathname: string): boolean {
 
 export function assertManagedDirectoryRoot(root: ManagedDirectoryRoot): void {
 	const named = fs.lstatSync(root.canonicalPath, { bigint: true });
-	if (!named.isDirectory() || named.isSymbolicLink() || named.dev !== root.dev || named.ino !== root.ino) {
+	if (
+		!named.isDirectory() ||
+		named.isSymbolicLink() ||
+		canonicalFileId(named.dev) !== root.dev ||
+		canonicalFileId(named.ino) !== root.ino
+	) {
 		throw new Error(`Managed root authority changed: ${root.canonicalPath}`);
 	}
 }
@@ -932,7 +980,12 @@ function verifyExistingManagedPathSecurity(
 	expected: fs.BigIntStats,
 ): void {
 	const verified = validateNativeSecurityResult(
-		nativeSessionStorage().verifyOwnerOnlyPathSecurityExpected(pathname, kind, expected.dev, expected.ino),
+		nativeSessionStorage().verifyOwnerOnlyPathSecurityExpected(
+			pathname,
+			kind,
+			canonicalFileId(expected.dev),
+			canonicalFileId(expected.ino),
+		),
 		"verify",
 		kind,
 	);
@@ -945,7 +998,12 @@ function secureExistingManagedDirectory(pathname: string, kind: "directory" | "f
 	const safeKind = kind === "directory" ? named.isDirectory() : named.isFile();
 	if (!safeKind || named.isSymbolicLink()) throw new Error(`Unsafe managed ${kind}: ${pathname}`);
 	const verified = validateNativeSecurityResult(
-		nativeSessionStorage().verifyOwnerOnlyPathSecurityExpected(pathname, kind, named.dev, named.ino),
+		nativeSessionStorage().verifyOwnerOnlyPathSecurityExpected(
+			pathname,
+			kind,
+			canonicalFileId(named.dev),
+			canonicalFileId(named.ino),
+		),
 		"verify",
 		kind,
 	);
@@ -953,7 +1011,12 @@ function secureExistingManagedDirectory(pathname: string, kind: "directory" | "f
 	if (verified.ok) return;
 	if (verified.code !== "acl_verify_failed") throw securityError(pathname, verified);
 	const repaired = validateNativeSecurityResult(
-		nativeSessionStorage().repairOwnerOnlyPathSecurityExpected(pathname, kind, named.dev, named.ino),
+		nativeSessionStorage().repairOwnerOnlyPathSecurityExpected(
+			pathname,
+			kind,
+			canonicalFileId(named.dev),
+			canonicalFileId(named.ino),
+		),
 		"verify",
 		kind,
 	);
@@ -1015,8 +1078,8 @@ export class ManagedSessionDescendantStore {
 					throw new Error(rootIdentity.code ?? "Managed subtree identity unavailable");
 				this.#subtreeRoot = Object.freeze({
 					canonicalPath: this.#baseDir,
-					dev: BigInt(rootIdentity.identity.dev),
-					ino: BigInt(rootIdentity.identity.ino),
+					dev: canonicalFileId(BigInt(rootIdentity.identity.dev)),
+					ino: canonicalFileId(BigInt(rootIdentity.identity.ino)),
 				});
 			} else {
 				const captured = retained.authority.snapshotManagedTree(relative);
@@ -1024,8 +1087,8 @@ export class ManagedSessionDescendantStore {
 					throw new Error(captured.code ?? "Managed subtree identity unavailable");
 				this.#subtreeRoot = Object.freeze({
 					canonicalPath: this.#baseDir,
-					dev: BigInt(captured.snapshot.rootDev),
-					ino: BigInt(captured.snapshot.rootIno),
+					dev: canonicalFileId(BigInt(captured.snapshot.rootDev)),
+					ino: canonicalFileId(BigInt(captured.snapshot.rootIno)),
 				});
 			}
 			this.#authority = retained.authority;
@@ -1036,7 +1099,11 @@ export class ManagedSessionDescendantStore {
 		assertManagedDirectoryRoot(root);
 		ensureManagedDirectory(this.#baseDir, root, this.#policy);
 		const subtreeStat = fs.lstatSync(this.#baseDir, { bigint: true });
-		this.#subtreeRoot = Object.freeze({ canonicalPath: this.#baseDir, dev: subtreeStat.dev, ino: subtreeStat.ino });
+		this.#subtreeRoot = Object.freeze({
+			canonicalPath: this.#baseDir,
+			dev: canonicalFileId(subtreeStat.dev),
+			ino: canonicalFileId(subtreeStat.ino),
+		});
 		if (process.platform === "linux") {
 			const before = fs.lstatSync(this.#baseDir, { bigint: true });
 			const authority = nativeSessionStorage().openRecoveryFsRoot(this.#baseDir);
@@ -1044,8 +1111,8 @@ export class ManagedSessionDescendantStore {
 			if (
 				!retained.ok ||
 				!retained.identity ||
-				retained.identity.dev !== before.dev.toString() ||
-				retained.identity.ino !== before.ino.toString()
+				retained.identity.dev !== canonicalFileId(before.dev).toString() ||
+				retained.identity.ino !== canonicalFileId(before.ino).toString()
 			) {
 				authority.close();
 				throw new Error("Managed descendant root identity changed");
@@ -1150,7 +1217,11 @@ export class ManagedSessionDescendantStore {
 	#assertBound(): void {
 		if (!this.#authority) {
 			const named = fs.statSync(this.#baseDir, { bigint: true });
-			if (!named.isDirectory() || named.dev !== this.#subtreeRoot.dev || named.ino !== this.#subtreeRoot.ino)
+			if (
+				!named.isDirectory() ||
+				canonicalFileId(named.dev) !== this.#subtreeRoot.dev ||
+				canonicalFileId(named.ino) !== this.#subtreeRoot.ino
+			)
 				throw new Error("Managed descendant root binding changed");
 			return;
 		}
@@ -1170,10 +1241,10 @@ export class ManagedSessionDescendantStore {
 			!retained.identity ||
 			!named.isDirectory() ||
 			named.isSymbolicLink() ||
-			retained.identity.dev !== named.dev.toString() ||
+			retained.identity.dev !== canonicalFileId(named.dev).toString() ||
 			retained.identity.dev !== this.#subtreeRoot.dev.toString() ||
 			retained.identity.ino !== this.#subtreeRoot.ino.toString() ||
-			retained.identity.ino !== named.ino.toString()
+			retained.identity.ino !== canonicalFileId(named.ino).toString()
 		) {
 			throw new Error("Managed descendant root binding changed");
 		}
@@ -1283,7 +1354,7 @@ export class ManagedSessionDescendantStore {
 		const parsed = parseLegacyReplacementCleanupReceipt(receipt.bytes);
 		const expectedPredecessor = path.join(
 			this.#baseDir,
-			`.gjc-exact-replace-destination-${binding.dev.toString(16)}-${binding.ino.toString(16)}`,
+			`.gjc-exact-replace-destination-${binding.encodedDev}-${binding.encodedIno}`,
 		);
 		if (
 			!parsed ||
@@ -1488,13 +1559,17 @@ export class ManagedSessionDescendantStore {
 			this.#assertBound();
 			return Object.freeze({
 				canonicalPath: this.#resolve(relativePath),
-				dev: BigInt(ensured.identity.dev),
-				ino: BigInt(ensured.identity.ino),
+				dev: canonicalFileId(BigInt(ensured.identity.dev)),
+				ino: canonicalFileId(BigInt(ensured.identity.ino)),
 			});
 		}
 		ensureManagedDirectory(this.#resolve(relativePath), this.#root, this.#policy);
 		const named = fs.lstatSync(this.#resolve(relativePath), { bigint: true });
-		return Object.freeze({ canonicalPath: this.#resolve(relativePath), dev: named.dev, ino: named.ino });
+		return Object.freeze({
+			canonicalPath: this.#resolve(relativePath),
+			dev: canonicalFileId(named.dev),
+			ino: canonicalFileId(named.ino),
+		});
 	}
 
 	async publishNoReplace(relativePath: string, bytes: Uint8Array): Promise<void> {
@@ -1878,7 +1953,7 @@ export class ManagedSessionDescendantStore {
 		for (const component of components.slice(0, -1)) {
 			current = path.join(current, component);
 			const stat = fs.lstatSync(current, { bigint: true });
-			if (!stat.isDirectory() || stat.isSymbolicLink() || stat.dev !== this.#subtreeRoot.dev)
+			if (!stat.isDirectory() || stat.isSymbolicLink() || canonicalFileId(stat.dev) !== this.#subtreeRoot.dev)
 				throw new Error("Managed descendant path escapes retained store");
 		}
 	}
@@ -1999,8 +2074,8 @@ export class ManagedSessionDescendantStore {
 			if (
 				!rootBefore.isDirectory() ||
 				rootBefore.isSymbolicLink() ||
-				rootBefore.dev !== this.#subtreeRoot.dev ||
-				rootBefore.ino !== this.#subtreeRoot.ino
+				canonicalFileId(rootBefore.dev) !== this.#subtreeRoot.dev ||
+				canonicalFileId(rootBefore.ino) !== this.#subtreeRoot.ino
 			)
 				throw new Error("Managed descendant root binding changed");
 			let fd: number | undefined;
@@ -2031,8 +2106,8 @@ export class ManagedSessionDescendantStore {
 					throw new Error("Managed descendant root binding changed");
 				this.#assertBound();
 				return managedAppendReceiptFromIdentity({
-					dev: opened.dev,
-					ino: opened.ino,
+					dev: canonicalFileId(opened.dev),
+					ino: canonicalFileId(opened.ino),
 					nlink: opened.nlink,
 					size: Number(opened.size),
 					mtimeNs: opened.mtimeNs,
@@ -2076,8 +2151,8 @@ export class ManagedSessionDescendantStore {
 		if (
 			!rootBefore.isDirectory() ||
 			rootBefore.isSymbolicLink() ||
-			rootBefore.dev !== this.#subtreeRoot.dev ||
-			rootBefore.ino !== this.#subtreeRoot.ino
+			canonicalFileId(rootBefore.dev) !== this.#subtreeRoot.dev ||
+			canonicalFileId(rootBefore.ino) !== this.#subtreeRoot.ino
 		)
 			throw new Error("Managed descendant root binding changed");
 		const resolved = this.#resolve(relativePath);
@@ -2099,8 +2174,8 @@ export class ManagedSessionDescendantStore {
 			if (retained?.identity) {
 				const expected = retained.identity;
 				if (
-					before.dev.toString() !== expected.dev ||
-					before.ino.toString() !== expected.ino ||
+					canonicalFileId(before.dev).toString() !== expected.dev ||
+					canonicalFileId(before.ino).toString() !== expected.ino ||
 					before.nlink.toString() !== expected.nlink ||
 					before.size.toString() !== expected.size ||
 					before.mtimeNs.toString() !== expected.mtimeNs ||
@@ -2110,8 +2185,8 @@ export class ManagedSessionDescendantStore {
 			}
 			if (
 				expectedDescriptor &&
-				(before.dev !== expectedDescriptor.dev ||
-					before.ino !== expectedDescriptor.ino ||
+				(canonicalFileId(before.dev) !== expectedDescriptor.dev ||
+					canonicalFileId(before.ino) !== expectedDescriptor.ino ||
 					before.nlink !== (expectedDescriptor.nlink ?? before.nlink) ||
 					Number(before.size) !== expectedDescriptor.size ||
 					before.mtimeNs !== expectedDescriptor.mtimeNs ||
@@ -2154,8 +2229,8 @@ export class ManagedSessionDescendantStore {
 			return {
 				bytes,
 				stat: {
-					dev: after.dev,
-					ino: after.ino,
+					dev: canonicalFileId(after.dev),
+					ino: canonicalFileId(after.ino),
 					nlink: after.nlink,
 					size: Number(after.size),
 					mtimeNs: after.mtimeNs,
@@ -2194,8 +2269,8 @@ export class ManagedSessionDescendantStore {
 		return {
 			bytes: Buffer.from(read.data),
 			identity: {
-				dev: BigInt(read.identity.dev),
-				ino: BigInt(read.identity.ino),
+				dev: canonicalFileId(BigInt(read.identity.dev)),
+				ino: canonicalFileId(BigInt(read.identity.ino)),
 				nlink: BigInt(read.identity.nlink),
 				size: Number(read.identity.size),
 				mtimeNs: BigInt(read.identity.mtimeNs),
@@ -2217,8 +2292,8 @@ export class ManagedSessionDescendantStore {
 				size: BigInt(expected.identity.size),
 				mtimeNs: expected.identity.mtimeNs,
 				sha256: expected.identity.sha256,
-				parentDev: parent.dev,
-				parentIno: parent.ino,
+				parentDev: canonicalFileId(parent.dev),
+				parentIno: canonicalFileId(parent.ino),
 				quarantineName: `.gjc-remove-${process.pid}-${randomUUID()}`,
 			});
 			if (
@@ -2647,8 +2722,8 @@ function bootId(): string | undefined {
 
 function identity(stat: fs.BigIntStats, sha256 = ""): ManagedFileSnapshot["identity"] {
 	return {
-		dev: stat.dev,
-		ino: stat.ino,
+		dev: canonicalFileId(stat.dev),
+		ino: canonicalFileId(stat.ino),
 		nlink: stat.nlink,
 		size: Number(stat.size),
 		mtimeNs: stat.mtimeNs,
@@ -3163,8 +3238,8 @@ function replaceManagedFileGeneratedSync(
 			fsyncDirectory(parent);
 			receiptCleanup = {
 				path: receiptPath,
-				parentDev: parentIdentity.dev,
-				parentIno: parentIdentity.ino,
+				parentDev: canonicalFileId(parentIdentity.dev),
+				parentIno: canonicalFileId(parentIdentity.ino),
 				identity: publishedReceiptIdentity,
 				predecessor: expectedDestination,
 			};
@@ -3184,8 +3259,8 @@ function replaceManagedFileGeneratedSync(
 					dev: successor.dev,
 					ino: successor.ino,
 					nlink: successor.nlink,
-					parentDev: parentIdentity.dev,
-					parentIno: parentIdentity.ino,
+					parentDev: canonicalFileId(parentIdentity.dev),
+					parentIno: canonicalFileId(parentIdentity.ino),
 					size: BigInt(successor.size),
 					mtimeNs: successor.mtimeNs,
 					sha256: successor.sha256,
@@ -3194,8 +3269,8 @@ function replaceManagedFileGeneratedSync(
 					dev: expectedDestination.dev,
 					ino: expectedDestination.ino,
 					nlink: expectedDestination.nlink,
-					parentDev: parentIdentity.dev,
-					parentIno: parentIdentity.ino,
+					parentDev: canonicalFileId(parentIdentity.dev),
+					parentIno: canonicalFileId(parentIdentity.ino),
 					size: BigInt(expectedDestination.size),
 					mtimeNs: expectedDestination.mtimeNs,
 					sha256: expectedDestination.sha256,

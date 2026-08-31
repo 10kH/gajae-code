@@ -315,10 +315,16 @@ import {
 } from "../gjc-runtime/session-layout";
 import {
 	type CoordinatorToolObservation,
+	clearCoordinatorRuntimeStateRescope,
+	hasCoordinatorRuntimeStateRescopeJournal,
+	markCoordinatorRuntimeStateRescopePublishing,
 	ownerTerminalContextFromEnvironment,
 	persistCoordinatorRuntimeStateFromEvent,
 	persistCoordinatorWorkerIntegrationOutcome,
+	prepareCoordinatorRuntimeStateRescope,
+	recoverCoordinatorRuntimeStateRescope,
 	registerCoordinatorRuntimeStateFinalizer,
+	relocateCoordinatorRuntimeStateForRescope,
 	UNPROVEN_TOOL_LABEL,
 } from "../gjc-runtime/session-state-sidecar";
 import {
@@ -2814,6 +2820,27 @@ export class AgentSession {
 	/** Idempotent unregister handle for this session's resource-GC registration. */
 	#unregisterResourceGc?: () => void;
 	#unregisterRuntimeStateFinalizer?: () => void;
+	#unregisterBeforeMoveListener?: () => void;
+	#unregisterMoveAbortListener?: () => void;
+	#unregisterMovePublicationListener?: () => void;
+	#unregisterAfterMoveListener?: () => void;
+	/**
+	 * (Re)register the postmortem finalizer bound to the CURRENT cwd/session file. Called at
+	 * construction and after every committed rescope, so an unexpected exit writes terminal
+	 * state to the session's live location rather than the abandoned launch root.
+	 */
+	#registerRuntimeStateFinalizer(): void {
+		this.#unregisterRuntimeStateFinalizer?.();
+		const currentContext = () => ({
+			sessionId: this.sessionId,
+			cwd: this.sessionManager.getCwd(),
+			sessionFile: this.sessionManager.getSessionFile(),
+		});
+		this.#unregisterRuntimeStateFinalizer = registerCoordinatorRuntimeStateFinalizer(
+			currentContext(),
+			currentContext,
+		);
+	}
 	#unregisterSessionMemorySettings?: () => void;
 	/**
 	 * AsyncJobManager owned by this session (top-level only). Subagents leave
@@ -2848,6 +2875,9 @@ export class AgentSession {
 	readonly #asyncJobProviderSessionId: string | undefined;
 	#isDisposed = false;
 	#disposePromise: Promise<void> | undefined;
+	readonly #disposeAbortController = new AbortController();
+	#disposeAdmissionClosed: Promise<void> | undefined;
+	#disposePostPromptDrain: Promise<void> | undefined;
 	readonly #toolSessionCleanups = new Set<() => Promise<void> | void>();
 	readonly #toolSessionTransitionCleanups = new Set<() => Promise<void> | void>();
 	readonly #deferredOwnerShutdownFinalizations = new Set<Promise<void>>();
@@ -3206,6 +3236,65 @@ export class AgentSession {
 	 */
 	#sessionTransitionKind: string | undefined;
 	#coordinatorPersistGeneration = 0;
+	#coordinatorRescopeBarrier: Promise<void> | undefined;
+	#releaseCoordinatorRescopeBarrier: (() => void) | undefined;
+	#coordinatorRescopeMoveId: string | undefined;
+	#coordinatorEventHandlers = new Set<Promise<void>>();
+	#coordinatorUnbarrieredPersists = new Set<Promise<void>>();
+	#coordinatorReleasedBarrierPersists = new Set<Promise<void>>();
+
+	#beginCoordinatorRescopeBarrier(): {
+		eventHandlers: Promise<void>[];
+		releasedBarrierPersists: Promise<void>[];
+	} {
+		if (this.#coordinatorRescopeBarrier) throw new Error("Coordinator rescope barrier is already active.");
+		const releasedBarrierPersists = [...this.#coordinatorReleasedBarrierPersists];
+		const barrier = Promise.withResolvers<void>();
+		this.#coordinatorRescopeBarrier = barrier.promise;
+		this.#releaseCoordinatorRescopeBarrier = barrier.resolve;
+		this.#bindPendingAgentEndToRescopeBarrier();
+		return { eventHandlers: [...this.#coordinatorEventHandlers], releasedBarrierPersists };
+	}
+
+	#trackReleasedBarrierPersist(persist: Promise<void>): void {
+		this.#coordinatorReleasedBarrierPersists.add(persist);
+		void persist.then(
+			() => this.#coordinatorReleasedBarrierPersists.delete(persist),
+			() => this.#coordinatorReleasedBarrierPersists.delete(persist),
+		);
+	}
+
+	#bindPendingAgentEndToRescopeBarrier(): void {
+		if (!this.#coordinatorRescopeBarrier || !this.#pendingAgentEndEmit) return;
+		const admission = this.#agentEventAdmission.get(this.#pendingAgentEndEmit);
+		if (admission) admission.persistBarrier = this.#coordinatorRescopeBarrier;
+	}
+
+	#appendCoordinatorPersist(run: () => Promise<void>): Promise<void> {
+		const queued = this.#coordinatorPersistQueue.then(run, run);
+		this.#coordinatorPersistQueue = queued.catch(() => {});
+		return queued;
+	}
+
+	#trackUnbarrieredCoordinatorPersist(persist: Promise<void>): void {
+		this.#coordinatorUnbarrieredPersists.add(persist);
+		void persist.then(
+			() => this.#coordinatorUnbarrieredPersists.delete(persist),
+			() => this.#coordinatorUnbarrieredPersists.delete(persist),
+		);
+	}
+
+	async #drainUnbarrieredCoordinatorPersists(): Promise<void> {
+		while (this.#coordinatorUnbarrieredPersists.size > 0) {
+			await Promise.allSettled([...this.#coordinatorUnbarrieredPersists]);
+		}
+	}
+
+	#endCoordinatorRescopeBarrier(): void {
+		this.#releaseCoordinatorRescopeBarrier?.();
+		this.#releaseCoordinatorRescopeBarrier = undefined;
+		this.#coordinatorRescopeBarrier = undefined;
+	}
 
 	#beginSessionTransition(kind: string): void {
 		if (this.#sessionTransitionKind !== undefined) {
@@ -3242,10 +3331,10 @@ export class AgentSession {
 		return { entry, capability: entry.continuationCapability };
 	}
 
-	async #awaitStartupTurnBarrier(): Promise<void> {
+	async #awaitStartupTurnBarrier(signal?: AbortSignal): Promise<void> {
 		const barrier = this.#startupTurnBarrier;
 		if (!barrier) return;
-		await barrier;
+		await awaitPromptInvocationPreflight(barrier, signal);
 		if (this.#startupTurnBarrier === barrier) this.#startupTurnBarrier = undefined;
 	}
 	extendStartupTurnBarrier(barrier: Promise<void>): void {
@@ -3277,7 +3366,12 @@ export class AgentSession {
 			}
 			throw this.#sessionAdmissionBusyError();
 		}
-		if (kind === "prompt") await awaitPromptInvocationPreflight(this.#awaitStartupTurnBarrier(), signal);
+		if (kind === "prompt") {
+			const startupSignal = signal
+				? AbortSignal.any([signal, this.#disposeAbortController.signal])
+				: this.#disposeAbortController.signal;
+			await awaitPromptInvocationPreflight(this.#awaitStartupTurnBarrier(startupSignal), startupSignal);
+		}
 		const bypassesSelectionFence =
 			options?.bypassSelectionFenceGeneration !== undefined &&
 			options.bypassSelectionFenceGeneration < this.#selectionFenceGeneration;
@@ -4039,10 +4133,96 @@ export class AgentSession {
 				cwd: () => this.sessionManager.getCwd(),
 			});
 		}
-		this.#unregisterRuntimeStateFinalizer = registerCoordinatorRuntimeStateFinalizer({
-			sessionId: this.sessionId,
-			cwd: this.sessionManager.getCwd(),
-			sessionFile: this.sessionManager.getSessionFile(),
+		this.#registerRuntimeStateFinalizer();
+		this.#unregisterBeforeMoveListener = this.sessionManager.registerBeforeMoveListener(async move => {
+			const admittedBeforeBarrier = this.#beginCoordinatorRescopeBarrier();
+			await Promise.allSettled([
+				...admittedBeforeBarrier.eventHandlers,
+				...admittedBeforeBarrier.releasedBarrierPersists,
+			]);
+			this.#bindPendingAgentEndToRescopeBarrier();
+			await this.#drainUnbarrieredCoordinatorPersists();
+			this.#coordinatorPersistGeneration += 1;
+			const moveId = crypto.randomUUID();
+			this.#coordinatorRescopeMoveId = moveId;
+			await prepareCoordinatorRuntimeStateRescope({
+				moveId,
+				sessionId: this.sessionId,
+				previousCwd: move.previousCwd,
+				newCwd: move.newCwd,
+				previousCwdIdentity: move.previousCwdIdentity,
+				newCwdIdentity: move.newCwdIdentity,
+				previousSessionFile: move.previousSessionFile ?? null,
+				newSessionFile: move.newSessionFile ?? null,
+			});
+		});
+		this.#unregisterMoveAbortListener = this.sessionManager.registerMoveAbortListener(async move => {
+			const moveId = this.#coordinatorRescopeMoveId;
+			try {
+				if (moveId && !move.preserveRecoveryJournal) {
+					await clearCoordinatorRuntimeStateRescope(
+						{
+							sessionId: this.sessionId,
+							cwd: move.newCwd,
+							sessionFile: move.newSessionFile ?? null,
+						},
+						moveId,
+						move.previousCwd,
+					);
+				}
+			} finally {
+				this.#coordinatorRescopeMoveId = undefined;
+				this.#endCoordinatorRescopeBarrier();
+			}
+		});
+		this.#unregisterMovePublicationListener = this.sessionManager.registerMovePublicationListener(async move => {
+			const moveId = this.#coordinatorRescopeMoveId;
+			if (!moveId) throw new Error("Coordinator rescope publication has no prepared move identity.");
+			await markCoordinatorRuntimeStateRescopePublishing(
+				{
+					sessionId: this.sessionId,
+					cwd: move.newCwd,
+					sessionFile: move.newSessionFile ?? null,
+				},
+				move.previousCwd,
+				moveId,
+			);
+		});
+		// Every committed rescope (`move_session`, `/move`, SDK/ACP `session.cwd.move`) funnels
+		// through SessionManager.moveTo, so one after-move listener covers all surfaces: it
+		// relocates the coordinator-shared runtime state to the new cwd (otherwise the identity
+		// fence refuses every later persist) and rebinds the postmortem finalizer, which
+		// otherwise keeps writing terminal state to the launch root's cwd/session file.
+		this.#unregisterAfterMoveListener = this.sessionManager.registerAfterMoveListener(async move => {
+			let completed = false;
+			try {
+				const relocated = await relocateCoordinatorRuntimeStateForRescope(
+					{
+						sessionId: this.sessionId,
+						cwd: move.newCwd,
+						sessionFile: this.sessionManager.getSessionFile() ?? null,
+						previousSessionFile: move.previousSessionFile ?? null,
+					},
+					move.previousCwd,
+				);
+				if (!relocated) throw new Error("Coordinator runtime state rescope was refused.");
+				await clearCoordinatorRuntimeStateRescope(
+					{
+						sessionId: this.sessionId,
+						cwd: move.newCwd,
+						sessionFile: this.sessionManager.getSessionFile() ?? null,
+					},
+					this.#coordinatorRescopeMoveId,
+					move.previousCwd,
+				);
+				completed = true;
+			} finally {
+				this.#registerRuntimeStateFinalizer();
+				if (completed) {
+					this.#coordinatorRescopeMoveId = undefined;
+					this.#endCoordinatorRescopeBarrier();
+				}
+			}
 		});
 		// Power assertions are taken per turn (see #beginInFlight); nothing acquired here.
 		this.#evalKernelOwnerId = config.evalKernelOwnerId ?? `agent-session:${Snowflake.next()}`;
@@ -4052,6 +4232,18 @@ export class AgentSession {
 		this.#retainedMemorySampler = config.retainedMemorySampler;
 		this.#ownedMcpManager = config.ownedMcpManager;
 		this.#startupTurnBarrier = config.startupTurnBarrier;
+		// Only arm the recovery barrier when a rescope journal is actually pending. Arming it
+		// unconditionally flips #startupTurnBarrier from absent to a (resolved) promise for
+		// every session, which makes barrier-gated post-turn work (e.g. the hidden-next-turn
+		// drain) take an extra scheduler hop and reorder against terminal-abort requeue.
+		const rescopeRecoveryContext = {
+			sessionId: this.sessionId,
+			cwd: this.sessionManager.getCwd(),
+			sessionFile: this.sessionManager.getSessionFile() ?? null,
+		};
+		if (hasCoordinatorRuntimeStateRescopeJournal(rescopeRecoveryContext)) {
+			this.extendStartupTurnBarrier(recoverCoordinatorRuntimeStateRescope(rescopeRecoveryContext));
+		}
 		this.#scopedModels = config.scopedModels ?? [];
 		this.#thinkingLevel = config.thinkingLevel;
 		this.#promptTemplates = config.promptTemplates ?? [];
@@ -4153,8 +4345,20 @@ export class AgentSession {
 				if (dropped.length > 0) this.#settleDeliveredOwnedRegistrations(dropped);
 				const first = survivors[0];
 				if (!first) return;
-				await this.#awaitStartupTurnBarrier();
-				if (this.#isDisposed) return;
+				const settleIfDisposing = (): boolean => {
+					if (!this.#isDisposed && !this.#sessionAdmissionClosing && !this.#disposeAbortController.signal.aborted)
+						return false;
+					this.#settleDeliveredOwnedRegistrations(survivors);
+					return true;
+				};
+				if (settleIfDisposing()) return;
+				try {
+					await this.#awaitStartupTurnBarrier(this.#disposeAbortController.signal);
+				} catch {
+					settleIfDisposing();
+					return;
+				}
+				if (settleIfDisposing()) return;
 				// A user prompt may have started during the barrier/scheduling
 				// delay: if the session is now streaming, mutating the epoch and
 				// lineage here would corrupt the ACTIVE user turn (and
@@ -5337,7 +5541,7 @@ export class AgentSession {
 	#coordinatorToolObservations = new WeakMap<object, CoordinatorToolObservation>();
 	#agentEventAdmission = new WeakMap<
 		object,
-		{ scope?: AttemptScope; sdkRunToken?: string; persistGeneration: number }
+		{ scope?: AttemptScope; sdkRunToken?: string; persistGeneration: number; persistBarrier?: Promise<void> }
 	>();
 
 	/**
@@ -5398,6 +5602,7 @@ export class AgentSession {
 			scope: this.#activeAttemptScope,
 			sdkRunToken: this.#activeSdkRunToken,
 			persistGeneration: this.#coordinatorPersistGeneration,
+			persistBarrier: this.#coordinatorRescopeBarrier,
 		});
 		// First statement of the listener: the observation must precede every claim,
 		// reservation, and async hop this handler performs.
@@ -5507,6 +5712,11 @@ export class AgentSession {
 				this.#resolveSessionSettlement();
 			}
 		})();
+		this.#coordinatorEventHandlers.add(handler);
+		void handler.then(
+			() => this.#coordinatorEventHandlers.delete(handler),
+			() => this.#coordinatorEventHandlers.delete(handler),
+		);
 		if (eventLease) eventLease.track("post_prompt", "agent-session-event", handler);
 		return handler;
 	};
@@ -5530,15 +5740,39 @@ export class AgentSession {
 				message: `${kind} ${outcome.status} for ${correlation}${safeError ? `: ${safeError}` : ""}`,
 			});
 		}
-		const persist = () =>
-			persistCoordinatorWorkerIntegrationOutcome(context, {
-				...outcome,
-				kind,
-				correlationId,
-				error: sanitizePostPublicationError(outcome.error),
-			});
-		const queued = this.#coordinatorPersistQueue.then(persist, persist);
-		this.#coordinatorPersistQueue = queued.catch(() => {});
+		const generation = this.#coordinatorPersistGeneration;
+		const barrier = this.#coordinatorRescopeBarrier;
+		const persist = async () => {
+			if (barrier) {
+				await barrier;
+				return await persistCoordinatorWorkerIntegrationOutcome(
+					{
+						sessionId: this.sessionId,
+						cwd: this.sessionManager.getCwd(),
+						sessionFile: this.sessionManager.getSessionFile(),
+					},
+					{
+						...outcome,
+						kind,
+						correlationId,
+						error: sanitizePostPublicationError(outcome.error),
+					},
+				);
+			}
+			return generation === this.#coordinatorPersistGeneration
+				? await persistCoordinatorWorkerIntegrationOutcome(context, {
+						...outcome,
+						kind,
+						correlationId,
+						error: sanitizePostPublicationError(outcome.error),
+					})
+				: undefined;
+		};
+		const queued = barrier
+			? barrier.then(() => this.#appendCoordinatorPersist(persist))
+			: this.#appendCoordinatorPersist(persist);
+		if (barrier) this.#trackReleasedBarrierPersist(queued);
+		else this.#trackUnbarrieredCoordinatorPersist(queued);
 		void queued.catch(error =>
 			logger.warn("Failed to persist terminal reconciliation outcome", { error: String(error) }),
 		);
@@ -5559,18 +5793,38 @@ export class AgentSession {
 	#queueCoordinatorRuntimeStatePersist(event: AgentSessionEvent, propagateFailure = false): Promise<void> {
 		if (isNonDispatchedToolEvent(event)) return Promise.resolve();
 		const observation = this.#coordinatorToolObservations.get(event);
+		const admission = this.#agentEventAdmission.get(event);
+		const barrier = admission?.persistBarrier;
+		if (barrier) {
+			const run = async () => {
+				await barrier;
+				await this.#persistRuntimeStateInBackground(
+					event,
+					{
+						sessionId: this.sessionId,
+						cwd: this.sessionManager.getCwd(),
+						sessionFile: this.sessionManager.getSessionFile(),
+					},
+					observation,
+					propagateFailure,
+				);
+			};
+			const queued = barrier.then(() => this.#appendCoordinatorPersist(run));
+			this.#trackReleasedBarrierPersist(queued);
+			return queued;
+		}
 		const context = {
 			sessionId: this.sessionId,
 			cwd: this.sessionManager.getCwd(),
 			sessionFile: this.sessionManager.getSessionFile(),
 		};
-		const generation = this.#agentEventAdmission.get(event)?.persistGeneration ?? this.#coordinatorPersistGeneration;
+		const generation = admission?.persistGeneration ?? this.#coordinatorPersistGeneration;
 		const run = () =>
 			generation === this.#coordinatorPersistGeneration
 				? this.#persistRuntimeStateInBackground(event, context, observation, propagateFailure)
 				: Promise.resolve();
-		const queued = this.#coordinatorPersistQueue.then(run, run);
-		this.#coordinatorPersistQueue = queued.catch(() => {});
+		const queued = this.#appendCoordinatorPersist(run);
+		this.#trackUnbarrieredCoordinatorPersist(queued);
 		return queued;
 	}
 
@@ -6530,9 +6784,11 @@ export class AgentSession {
 				});
 			}
 			this.#resolveRetry();
+			if (this.#isDisposed || this.#sessionAdmissionClosing) return;
 
 			const compactionTask = this.#schedulePostPromptTask(
 				async () => {
+					if (this.#isDisposed || this.#sessionAdmissionClosing) return;
 					await this.#checkCompaction(msg, true, undefined, activePromptHandle);
 				},
 				{ resourceRunId: activePromptHandle },
@@ -6657,7 +6913,11 @@ export class AgentSession {
 			options?.onSkip?.();
 			return Promise.resolve();
 		}
-		const signal = reservation?.ok ? reservation.lease.signal : this.#postPromptTasksAbortController.signal;
+		const taskSignal = reservation?.ok ? reservation.lease.signal : this.#postPromptTasksAbortController.signal;
+		// Disposal is a session-wide terminal fence. Compose it with the selected
+		// logical-resource signal so stale leases from earlier runs cannot keep a
+		// post-prompt task alive after the current run was quarantined.
+		const signal = AbortSignal.any([taskSignal, this.#disposeAbortController.signal]);
 		const runScheduled = async () => {
 			if (delayMs > 0) {
 				try {
@@ -6818,7 +7078,7 @@ export class AgentSession {
 									settleLease();
 									return;
 								}
-								await this.#awaitStartupTurnBarrier();
+								await this.#awaitStartupTurnBarrier(scheduledSignal);
 								if (!canContinue()) {
 									settleLease();
 									return;
@@ -8388,13 +8648,35 @@ export class AgentSession {
 		if (this.#disposePromise) return this.#disposePromise;
 		const { promise, resolve, reject } = Promise.withResolvers<void>();
 		this.#disposePromise = promise;
+		this.#abortAdmissionEpoch++;
+		this.#isDisposed = true;
+		this.#disposeAbortController.abort();
+		this.#disposeAdmissionClosed = this.#closeSessionAdmission();
+		this.#disposePostPromptDrain = this.#cancelPostPromptTasks();
+		this.#settleDeliveredOwnedRegistrations(this.#pendingNextTurnMessages.map(entry => entry.message));
+		this.#pendingNextTurnMessages = [];
+		this.#scheduledHiddenNextTurnGeneration = undefined;
+		this.#abortActiveMidRunBarriers();
+		this.abortCompaction();
+		this.abortRetry();
+		this.#quarantineAgentRunResources();
+		this.agent.abort();
+		this.agent.setMainAttemptScopeObserver(undefined);
+		this.#disconnectFromAgent();
 		void this.#dispose().then(resolve, reject);
 		return promise;
 	}
 
+	/** Cancel the active logical run domain, including managed continuations detached from Agent's active attempt. */
+	#quarantineAgentRunResources(): void {
+		const resourceRunId = this.agent.currentManagedLogicalRunId ?? this.agent.activeResourceRunId;
+		if (resourceRunId !== undefined) this.agent.resourceLedger.quarantine(String(resourceRunId));
+	}
+
 	async #dispose(): Promise<void> {
-		await this.sessionManager.joinCwdTransition();
-		const admissionClosed = this.#closeSessionAdmission();
+		const admissionClosed = this.#disposeAdmissionClosed ?? this.#closeSessionAdmission();
+		await admissionClosed;
+		await this.sessionManager.closeCwdMoveAdmission();
 		this.#isDisposed = true;
 		// Reject new direct Python starts as soon as disposal begins (synchronously,
 		// before any await) so callers cannot race a start against teardown.
@@ -8432,9 +8714,9 @@ export class AgentSession {
 				this.agent.forceAbort("Session disposed");
 			}
 		}
-		await admissionClosed;
 		await this.#agentEndPublicationPromise;
 		await this.#queuedExtensionEvents;
+		await this.#agentEndHandlingPromise;
 		// Drain the sidecar write order for the same reason the two queues above are
 		// drained: each entry writes under the native identity-bound state-file lock, so a
 		// still-queued write would run after the session that owns it is gone — releasing
@@ -8443,7 +8725,7 @@ export class AgentSession {
 		// is already failure-absorbing, so this only waits.
 		await this.#coordinatorPersistQueue;
 		this.#pendingBackgroundExchanges = [];
-		this.yieldQueue.clear();
+		this.#drainTerminalOwnedYieldEntries();
 
 		this.agent.setOnBeforeYield(undefined);
 		try {
@@ -8457,12 +8739,21 @@ export class AgentSession {
 		this.#workflowGateEmitter = undefined;
 		this.#notifyWorkflowGateEmitterChanged(this.sessionId, undefined);
 		await this.#flushWorkerIntegrationAttempt();
-		await this.#cancelPostPromptTasks();
+		await (this.#disposePostPromptDrain ?? this.#cancelPostPromptTasks());
 		// Cancel jobs this agent registered so a subagent's teardown doesn't
 		// leak its background bash/task work into the parent's manager. Only
 		// the session that owns the manager goes on to dispose it (which itself
 		// nukes any leftover jobs and pending deliveries).
 		this.#cancelOwnAsyncJobs();
+		// Final drain (Codex review P2 on #5088): an async-job completion that
+		// enqueued during the awaited session_shutdown window above survived the
+		// first drain with a retained delivery claim, and the already-aborted
+		// disposal signal makes its idle-flush task exit before YieldQueue.flush
+		// can run. Producers are now cancelled, so drain once more to settle any
+		// straggler envelope and release its claim before owned-manager teardown
+		// — a shared manager would otherwise keep the claim past this session's
+		// disposal.
+		this.#drainTerminalOwnedYieldEntries();
 		await Promise.allSettled(this.#deferredOwnerShutdownFinalizations);
 		const ownedAsyncManager = this.#ownedAsyncJobManager;
 		if (ownedAsyncManager && this.#disposeAsyncJobManager) {
@@ -8499,6 +8790,14 @@ export class AgentSession {
 		this.#unregisterSessionMemorySettings = undefined;
 		if (ownerTerminalContextFromEnvironment() === null) this.#unregisterRuntimeStateFinalizer?.();
 		this.#unregisterRuntimeStateFinalizer = undefined;
+		this.#unregisterBeforeMoveListener?.();
+		this.#unregisterBeforeMoveListener = undefined;
+		this.#unregisterMoveAbortListener?.();
+		this.#unregisterMoveAbortListener = undefined;
+		this.#unregisterMovePublicationListener?.();
+		this.#unregisterMovePublicationListener = undefined;
+		this.#unregisterAfterMoveListener?.();
+		this.#unregisterAfterMoveListener = undefined;
 		await releaseTabsForOwner(this.sessionManager.getSessionId()).catch((error: unknown) =>
 			logger.warn("session dispose: releaseTabsForOwner failed", { error }),
 		);
@@ -8693,6 +8992,35 @@ export class AgentSession {
 		await this.awaitPendingContextTransformations();
 		await this.#waitForSessionSettlement();
 		await this.sessionManager.flush();
+	}
+
+	queueCoordinatorRuntimeStatePersistForTests(event: AgentSessionEvent, gate: Promise<void>): Promise<void> {
+		this.#agentEventAdmission.set(event, {
+			persistGeneration: this.#coordinatorPersistGeneration,
+			persistBarrier: this.#coordinatorRescopeBarrier,
+		});
+		const task = (async () => {
+			await gate;
+			await this.#queueCoordinatorRuntimeStatePersist(event, true);
+		})();
+		this.#coordinatorEventHandlers.add(task);
+		void task.then(
+			() => this.#coordinatorEventHandlers.delete(task),
+			() => this.#coordinatorEventHandlers.delete(task),
+		);
+		return task;
+	}
+
+	parkAgentEndForCoordinatorPersistForTests(event: Extract<AgentSessionEvent, { type: "agent_end" }>): void {
+		this.#agentEventAdmission.set(event, {
+			persistGeneration: this.#coordinatorPersistGeneration,
+			persistBarrier: this.#coordinatorRescopeBarrier,
+		});
+		this.#pendingAgentEndEmit = event;
+	}
+
+	flushParkedAgentEndForCoordinatorPersistForTests(): void {
+		this.#flushPendingAgentEnd();
 	}
 
 	async drainAsyncJobDeliveriesForAcp(options?: { timeoutMs?: number }): Promise<boolean> {
@@ -12220,7 +12548,16 @@ export class AgentSession {
 		}
 		this.#scheduledHiddenNextTurnGeneration = generation;
 		this.#schedulePostPromptTask(
-			async () => {
+			async signal => {
+				if (signal.aborted || this.#isDisposed || this.#sessionAdmissionClosing) return;
+				if (this.#startupTurnBarrier) {
+					try {
+						await this.#awaitStartupTurnBarrier(signal);
+					} catch {
+						return;
+					}
+				}
+				if (signal.aborted || this.#isDisposed || this.#sessionAdmissionClosing) return;
 				if (this.#scheduledHiddenNextTurnGeneration === generation) {
 					this.#scheduledHiddenNextTurnGeneration = undefined;
 				}
@@ -12249,8 +12586,12 @@ export class AgentSession {
 					return;
 				}
 				try {
-					await this.#promptQueuedHiddenNextTurnMessages();
+					await this.#promptQueuedHiddenNextTurnMessages(signal);
 				} catch {
+					if (this.#isDisposed || this.#sessionAdmissionClosing || this.#disposeAbortController.signal.aborted) {
+						this.#pendingNextTurnMessages = [];
+						return;
+					}
 					// Leave the hidden next-turn messages queued for the next explicit prompt.
 				}
 			},
@@ -12265,7 +12606,7 @@ export class AgentSession {
 		);
 	}
 
-	async #promptQueuedHiddenNextTurnMessages(): Promise<void> {
+	async #promptQueuedHiddenNextTurnMessages(signal?: AbortSignal): Promise<void> {
 		if (this.#pendingNextTurnMessages.length === 0) {
 			return;
 		}
@@ -12295,6 +12636,14 @@ export class AgentSession {
 		if (reclassified.length === 0) {
 			return;
 		}
+		if (this.#isDisposed || this.#sessionAdmissionClosing || this.#disposeAbortController.signal.aborted) {
+			this.#settleDeliveredOwnedRegistrations(reclassified.map(entry => entry.message));
+			return;
+		}
+		if (signal?.aborted) {
+			this.#pendingNextTurnMessages = [...reclassified, ...this.#pendingNextTurnMessages];
+			return;
+		}
 		// Allocate a fresh root-turn lineage when the drained batch contains a
 		// fresh owned envelope OR an EXTERNAL hidden trigger: an external
 		// nextTurn message has no owned envelope, so without this it would
@@ -12316,11 +12665,24 @@ export class AgentSession {
 		const textContent = this.#getCustomMessageTextContent(message);
 		await this.#syncSkillPromptActiveStateSafely(message, true);
 		try {
+			if (this.#isDisposed || this.#sessionAdmissionClosing || this.#disposeAbortController.signal.aborted) {
+				this.#settleDeliveredOwnedRegistrations(reclassified.map(entry => entry.message));
+				return;
+			}
+			if (signal?.aborted) {
+				this.#pendingNextTurnMessages = [...reclassified, ...this.#pendingNextTurnMessages];
+				return;
+			}
 			await this.#promptWithMessage(message, textContent, {
 				prependMessages,
 				skipPostPromptRecoveryWait: true,
+				preflightSignal: signal,
 			});
 		} catch (error) {
+			if (this.#isDisposed || this.#sessionAdmissionClosing || this.#disposeAbortController.signal.aborted) {
+				this.#settleDeliveredOwnedRegistrations(reclassified.map(entry => entry.message));
+				return;
+			}
 			// Requeue only the SURVIVING reclassified entries: a completion
 			// denied by scope:"owned" was settled (dropped) above and must
 			// never reach a later prompt — once its scope and now-unoccupied
@@ -12347,19 +12709,55 @@ export class AgentSession {
 		// another session's manager (which lacks the same local job id) would
 		// see job === undefined and remove a still-live registration (review
 		// thread P1).
-		const manager = this.#ownedAsyncJobManager ?? AsyncJobManager.instance();
 		for (const message of messages) {
 			const details = (message as { details?: { ownedCompletions?: OwnedCompletionEnvelope[] } }).details;
-			for (const envelope of details?.ownedCompletions ?? []) {
-				const job = manager?.getJob(envelope.registration.jobId);
-				const status = job?.generation === envelope.registration.jobGeneration ? job?.status : undefined;
-				// Evicted jobs have no live record (job === undefined); terminal
-				// statuses settle the registration.
-				if (job === undefined || status === "completed" || status === "cancelled" || status === "failed") {
-					unregisterOwnedRegistration(envelope.registration);
+			for (const envelope of details?.ownedCompletions ?? []) this.#settleOwnedCompletionEnvelope(envelope);
+		}
+	}
+
+	#settleOwnedCompletionEnvelope(envelope: OwnedCompletionEnvelope): void {
+		const manager = this.#ownedAsyncJobManager ?? AsyncJobManager.instance();
+		const job = manager?.getJob(envelope.registration.jobId);
+		const status = job?.generation === envelope.registration.jobGeneration ? job?.status : undefined;
+		// Evicted jobs have no live record (job === undefined); terminal statuses
+		// settle the registration.
+		if (job === undefined || status === "completed" || status === "cancelled" || status === "failed") {
+			unregisterOwnedRegistration(envelope.registration);
+		}
+	}
+
+	/**
+	 * Drop every queued yield entry, releasing its retained delivery claim and
+	 * settling terminal owned-completion envelopes so neither outlives this
+	 * session's disposal. Claims resolve to the manager that actually retained
+	 * them: owned entries via their registration endpoint (subagents inherit a
+	 * parent's manager, and the process-global instance may belong to a
+	 * different concurrent session), ordinary entries only on the session-OWNED
+	 * manager. Disposal runs this twice: before the awaited session_shutdown
+	 * emit, and again after producer cancellation — a completion enqueued
+	 * inside that window would otherwise survive disposal, its claim retained
+	 * on a shared manager and interfering with later delivery teardown (Codex
+	 * review P2 on #5088).
+	 */
+	#drainTerminalOwnedYieldEntries(): void {
+		this.yieldQueue.clear((kind, entries) => {
+			if (kind !== "async-result") return;
+			const ownedManager = this.#ownedAsyncJobManager;
+			for (const entry of entries) {
+				if (typeof entry !== "object" || entry === null) continue;
+				const record = entry as { generation?: unknown; ownedCompletion?: unknown };
+				if (typeof record.generation === "string" && record.generation !== "") {
+					const envelope = isOwnedCompletionEnvelope(record.ownedCompletion) ? record.ownedCompletion : undefined;
+					const endpointId = envelope?.registration.endpointId;
+					const manager =
+						(endpointId !== undefined ? AsyncJobManager.forEndpoint(endpointId) : undefined) ?? ownedManager;
+					manager?.releaseDeliveryClaim(record.generation);
+				}
+				if (isOwnedCompletionEnvelope(record.ownedCompletion)) {
+					this.#settleOwnedCompletionEnvelope(record.ownedCompletion);
 				}
 			}
-		}
+		});
 	}
 
 	#getCustomMessageTextContent(message: Pick<CustomMessage, "content">): string {
@@ -19493,11 +19891,15 @@ export class AgentSession {
 	}
 
 	async #handleManagedAttemptOutcome(outcome: ManagedAttemptOutcome): Promise<ManagedAttemptDecision> {
+		const attemptAbortEpoch = this.#abortAdmissionEpoch;
+		const attemptCancelled = () =>
+			this.#isDisposed || this.#sessionAdmissionClosing || this.#abortAdmissionEpoch !== attemptAbortEpoch;
 		const activePromptHandle = this.activePromptHandle;
 		const cancellationSignal = activePromptHandle
 			? this.#runCancellationDomains.lookup(activePromptHandle)?.signal
 			: undefined;
-		if (cancellationSignal?.aborted) return { type: "terminal", terminal: { stopReason: "cancelled" } };
+		if (attemptCancelled() || cancellationSignal?.aborted)
+			return { type: "terminal", terminal: { stopReason: "cancelled" } };
 		if (outcome.type === "run_terminal") {
 			this.#defaultFallbackChain().resetAttemptBudget();
 			return { type: "terminal", terminal: { stopReason: outcome.reason } };
@@ -19533,7 +19935,6 @@ export class AgentSession {
 				const controllerStateBeforeFailure = controller.snapshotRuntimeState();
 				const advanced = controller.recordEscapedArgumentsFailure(errorMessage, false);
 				this.#escapedNonAsciiManagedRetries = 0;
-				const abortEpoch = this.#abortAdmissionEpoch;
 				if (advanced) {
 					const transitionGeneration = ++this.#fallbackTransitionGeneration;
 					return {
@@ -19554,7 +19955,9 @@ export class AgentSession {
 								!ownership.isCurrent() ||
 								ownership.lease.signal.aborted ||
 								cancellationSignal?.aborted ||
-								this.#abortAdmissionEpoch !== abortEpoch ||
+								this.#isDisposed ||
+								this.#sessionAdmissionClosing ||
+								this.#abortAdmissionEpoch !== attemptAbortEpoch ||
 								this.#fallbackTransitionGeneration !== transitionGeneration;
 							if (continuationCancelled) {
 								await restoreOwnedTransition();
@@ -19579,7 +19982,7 @@ export class AgentSession {
 								"escaped_non_ascii",
 								1,
 								cancellationSignal,
-								abortEpoch,
+								attemptAbortEpoch,
 								controllerStateBeforeFailure,
 								previousModel,
 								previousThinkingLevel,
@@ -19588,7 +19991,9 @@ export class AgentSession {
 							);
 							if (!switched) {
 								if (
-									this.#abortAdmissionEpoch !== abortEpoch ||
+									this.#isDisposed ||
+									this.#sessionAdmissionClosing ||
+									this.#abortAdmissionEpoch !== attemptAbortEpoch ||
 									cancellationSignal?.aborted ||
 									this.#fallbackTransitionGeneration !== transitionGeneration
 								) {
@@ -19608,6 +20013,15 @@ export class AgentSession {
 								});
 								return;
 							}
+							if (
+								attemptCancelled() ||
+								!ownership.isCurrent() ||
+								ownership.lease.signal.aborted ||
+								this.#fallbackTransitionGeneration !== transitionGeneration
+							) {
+								await restoreOwnedTransition();
+								return;
+							}
 							const continuation = this.agent.continue({
 								...this.#managedFallbackPromptOptions(),
 								transientRecoveryMessage: this.#escapedNonAsciiRecoveryMessage(),
@@ -19617,7 +20031,9 @@ export class AgentSession {
 							});
 							if (
 								cancellationSignal?.aborted ||
-								this.#abortAdmissionEpoch !== abortEpoch ||
+								this.#isDisposed ||
+								this.#sessionAdmissionClosing ||
+								this.#abortAdmissionEpoch !== attemptAbortEpoch ||
 								this.#fallbackTransitionGeneration !== transitionGeneration
 							) {
 								await restoreOwnedTransition();
@@ -19636,7 +20052,7 @@ export class AgentSession {
 					};
 				}
 				controller.advance();
-				if (this.#abortAdmissionEpoch !== abortEpoch || cancellationSignal?.aborted)
+				if (attemptCancelled() || cancellationSignal?.aborted)
 					return { type: "terminal", terminal: { stopReason: "cancelled" } };
 				this.#defaultFallbackExhaustedLastTurn = true;
 				return this.#managedFallbackExhaustionDecision(
@@ -19648,7 +20064,7 @@ export class AgentSession {
 			return {
 				type: "retry",
 				continuation: async ownership => {
-					if (!ownership.isCurrent() || ownership.lease.signal.aborted) return;
+					if (attemptCancelled() || !ownership.isCurrent() || ownership.lease.signal.aborted) return;
 					await this.agent.continue({
 						...this.#managedFallbackPromptOptions(),
 						transientRecoveryMessage: this.#escapedNonAsciiRecoveryMessage(),
@@ -19667,7 +20083,7 @@ export class AgentSession {
 			return {
 				type: "maintenance",
 				continuation: async ownership => {
-					if (!ownership.isCurrent() || ownership.lease.signal.aborted) return;
+					if (attemptCancelled() || !ownership.isCurrent() || ownership.lease.signal.aborted) return;
 					const resourceRunId = String(ownership.logicalRunId);
 					const previousLease = this.#postPromptLeases.get(resourceRunId);
 					this.#postPromptLeases.set(resourceRunId, ownership.lease);
@@ -19686,7 +20102,13 @@ export class AgentSession {
 							resourceRunId,
 							ownership.lease.signal,
 						);
-						if (terminalized || successorScheduled || !ownership.isCurrent() || ownership.lease.signal.aborted)
+						if (
+							terminalized ||
+							successorScheduled ||
+							attemptCancelled() ||
+							!ownership.isCurrent() ||
+							ownership.lease.signal.aborted
+						)
 							return;
 						this.agent.requestRunTerminal(ownership.handle.logicalRunId, {
 							stopReason: "error",
@@ -20129,6 +20551,9 @@ export class AgentSession {
 		scope?: AttemptScope,
 		scopeWasClean = this.#isRetryScopeClean(scope),
 	): Promise<boolean | ManagedAttemptDecision> {
+		const retryAbortEpoch = this.#abortAdmissionEpoch;
+		const retryCancelled = () =>
+			this.#isDisposed || this.#sessionAdmissionClosing || this.#abortAdmissionEpoch !== retryAbortEpoch;
 		const controller = this.#defaultFallbackChain();
 		const managedFallback = controller.chain.entries.length > 1;
 		const retrySettings = this.settings.getGroup("retry");
@@ -20140,6 +20565,9 @@ export class AgentSession {
 		const classification = this.#classifyErrorForRetry(message);
 		const localSnapshot = classification === "local_snapshot";
 		const localBufferOverflow = classification === "local_buffer_overflow";
+		if (retryCancelled()) {
+			return managedOutcome ? { type: "terminal", terminal: { stopReason: "cancelled" } } : false;
+		}
 		// A local machinery failure must never stay charged against the provider
 		// fallback budget, no matter which local exit follows (disabled retry,
 		// visible-content surface, bounded retry, exhaustion, or the immediate
@@ -20402,7 +20830,7 @@ export class AgentSession {
 				ownership?.domain.signal ??
 				(activePromptHandle ? this.#runCancellationDomains.lookup(activePromptHandle)?.signal : undefined);
 			if (ownership && (!ownership.isCurrent() || cancellationSignal?.aborted)) return;
-			const abortEpoch = this.#abortAdmissionEpoch;
+			if (retryCancelled()) return;
 			let quotaPoolExhausted = false;
 			if (managedFallback && !credentialRotated && !providerRetryCeilingReached) {
 				const mark = await this.#markFailedCredential(trigger);
@@ -20436,7 +20864,7 @@ export class AgentSession {
 						trigger.class,
 						attemptsUsed,
 						cancellationSignal,
-						abortEpoch,
+						retryAbortEpoch,
 						controllerStateBeforeAdvance,
 						previousModel,
 						previousThinkingLevel,
@@ -20446,7 +20874,7 @@ export class AgentSession {
 				}
 			}
 			if (ownership && (!ownership.isCurrent() || cancellationSignal?.aborted)) {
-				if (this.#abortAdmissionEpoch === abortEpoch) {
+				if (!retryCancelled()) {
 					await this.#restoreDefaultFallbackTransition(
 						controller,
 						controllerStateBeforeAdvance,
@@ -20456,7 +20884,7 @@ export class AgentSession {
 				}
 				return;
 			}
-			if (this.#abortAdmissionEpoch !== abortEpoch) {
+			if (retryCancelled()) {
 				controller.resetForNewTurn();
 				return;
 			}
@@ -20585,8 +21013,9 @@ export class AgentSession {
 
 			if (managedOutcome) {
 				try {
+					if (retryCancelled() || ownershipCancelled()) return;
 					await this.#checkEstimatedContextBeforePrompt();
-					if (ownershipCancelled()) {
+					if (retryCancelled() || ownershipCancelled()) {
 						const attempt = this.#retryAttempt;
 						this.#retryAttempt = 0;
 						await this.#emitSessionEvent({

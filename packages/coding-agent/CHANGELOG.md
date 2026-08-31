@@ -2,7 +2,20 @@
 
 ## [Unreleased]
 
+- ACP deep-interview's real subprocess fixture now retires its owned lifecycle sessions before broker/root cleanup, preventing detached session hosts from recreating the fixture root after teardown. (#5086)
+- The ACP fixture tracks broker startup through its full producer deadline and tracks session creation before awaiting responses, keeps its independent broker fallback client available when runtime shutdown fails, and retires sessions first seen in either broker inventory phase directly through that fallback across cleanup retries. Verified broker-startup rejection no longer strands the root, while an unverified child-reap failure retains cleanup authority. Reconciliation recognizes the real ACP `terminal_uncertain` after-send wire envelope as transport uncertainty while preserving semantic close diagnostics, then accepts terminal races only after strict inventory proves unambiguous and certain retirement. A stalled broker-client transport close no longer blocks authoritative lease/root cleanup, and the child environment confines Windows profile and temporary paths to the fixture root. (#5086)
+
 - An install with no configured model no longer starts on a model its provider has already withdrawn. The startup fallback now applies the configured provider-priority policy, skips bundled defaults disproved by fresh provider discovery, and only then preserves catalog order for remaining candidates. Explicit model and profile selections, enabled-model allowlists, credential selectors, disabled providers, and provider/id collision-safe candidate membership remain unchanged.
+
+### Fixed
+
+- Post-install update verification now preserves a bounded, secret-redacted stderr/stdout cause when the newly installed `gjc --version` exits unsuccessfully, so runtime guards such as Bun version incompatibilities remain actionable instead of collapsing to a generic verification failure. (#5108)
+
+- Managed-session file identities now use one canonical unsigned 64-bit representation across stat/native boundaries and replacement cleanup receipts. Native Windows file IDs surfaced as signed negative bigints no longer create double-hyphen receipt names that block persistence or reopen; already-written signed receipt names and interrupted pending receipts are recovered only through the existing identity-bound, fail-closed reconciliation paths. (#5095)
+
+- Confirmed operator `turn.abort` requests now travel through a dedicated local Broker route instead of trusting caller-supplied `operator:true` and `confirm:true` on ordinary SDK frames. The Broker revalidates the exact live endpoint identity, injects a process-bound private capability, preserves post-send uncertainty, and the host uses one capability-free canonical identity for dispatch idempotency, durable admission, and delivery receipts, so forged, stale, dropped, and replayed requests fail closed consistently across restart boundaries.
+
+- Blob references and filesystem-backed blob reads now accept only exact lowercase SHA-256 names before resolving a disk path; canonical references and valid missing-blob behavior are unchanged.
 
 ## [0.15.6] - 2026-08-30
 
@@ -17,6 +30,8 @@
 - ACP prompt terminal publication no longer waits behind post-prompt worker integration or recovery work. SDK prompts pass the correlated `agent_end` boundary through immediately, while the existing bounded integration drain continues independently, preventing streamed turns from remaining pending until `sdk.promptDeadlineMs` when owned subagent work lingers. (#5030)
 
 ### Fixed
+
+- `move_session`, TUI `/move`, and SDK/ACP `session.cwd.move` no longer strand coordinator runtime-state persistence for the rest of the session. All three surfaces now cross one `SessionManager.moveTo` lifecycle: admitted old-cwd sidecar writes drain before commit, later queued writes are generation-fenced, and a durable rescope journal records the exact old/new cwd and session-file identities before publication so restart can finish an interrupted migration. Relocation holds both canonical state paths' process, namespace, and state-file locks in deterministic order across read/authenticate/write/remove; signed predecessors and destinations require the matching key id plus a valid Ed25519 signature, unsigned rows require complete exact cwd/workdir/session-file identity, and coordinator bootstrap or partial rows are never laundered into authoritative state. No-follow descriptor reads and native identity-bound orphan retirement reject symlink/path replacement, a valid self-healed destination is preserved while its authenticated old marker is removed, and rejected/tampered evidence stays intact with the journal retained for recovery. Rollback clears the prepared journal, committed metadata failures still run relocation, and postmortem finalizer rebinding is unconditional even when repair fails, so unexpected exit targets the live cwd/session file. (#4629)
 
 - Session resume no longer spends minutes in a CPU-hot 5ms loop when `runtime-state.json.lock` contains corrupt or unprovenanced debris. Session-state acquisition now uses a two-second monotonic wall-time budget with capped exponential backoff and typed exact-path diagnostics; stale malformed records are reclaimed only when their local host provenance and dead PID are proved, old empty legacy lock directories are removed only through exact tree identity, and live, foreign, or replacement owners remain fail-closed. (#5062)
 

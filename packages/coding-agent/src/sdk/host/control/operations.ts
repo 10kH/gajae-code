@@ -11,6 +11,8 @@ export type AbortScope = "turn" | "owned";
 export interface TerminalAbortInput {
 	mode: "terminal";
 	scope?: AbortScope;
+	/** Broker-authorized local override; public SDK callers cannot grant this authority. */
+	operator?: boolean;
 }
 export type ControlInput = Record<string, unknown>;
 
