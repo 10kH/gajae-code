@@ -2851,8 +2851,9 @@ export class AcpAgent implements Agent {
 		// watchdog rescued it.
 		if (activePrompt) this.#settlePrompt(record, activePrompt);
 		// A failure terminal has no trustworthy end-of-turn usage or title. The rejected
-		// prompt response releases the client turn; publishing an uncorrelated phase update
-		// here could overwrite a replacement prompt after transport backpressure.
+		// prompt response releases the client turn; the best-effort phase update reconciles
+		// a successor that starts while its transport write is backpressured.
+		if (event.type === "agent_failed") void this.#publishPromptPhaseIdle(id, adapter);
 		if (event.type === "agent_end") await this.#emitEndOfTurnUpdates(id, adapter);
 	}
 
@@ -2904,6 +2905,19 @@ export class AcpAgent implements Agent {
 					_meta: { gjcPhase: "idle", running: false, gjcRunning: false },
 				},
 			});
+			// A successor can start while the idle write is backpressured. Reconcile the
+			// observable phase after the write completes so the old terminal cannot remain
+			// the last session state for a newer active prompt.
+			const current = this.#sessions.get(id);
+			if (current?.adapter === adapter && current.activePrompt)
+				await this.#connection.sessionUpdate({
+					sessionId: id,
+					update: {
+						sessionUpdate: "session_info_update",
+						updatedAt: new Date().toISOString(),
+						_meta: { gjcPhase: "working", running: true, gjcRunning: true },
+					},
+				});
 		} catch {
 			// The client transport is gone; there is no phase left to restore.
 		}

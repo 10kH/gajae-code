@@ -32,6 +32,7 @@ type Fixture = {
 	queryCalls: string[];
 	blockedAdvisoryQueryCount(): number;
 	releaseBlockedAdvisoryQueries(): void;
+	releaseIdleUpdate(): void;
 	sendTerminal(frame: Record<string, unknown>): void;
 };
 
@@ -70,6 +71,7 @@ async function createFixture(
 		cancelSettlementGraceMs?: number;
 		abortAcknowledgement?: Record<string, unknown>;
 		blockedAdvisoryQuery?: AdvisoryQuery;
+		blockIdleUpdate?: boolean;
 	} = {},
 ): Promise<Fixture> {
 	const tempDir = TempDir.createSync("@sdk-acp-prompt-terminal-");
@@ -82,6 +84,8 @@ async function createFixture(
 	const updates: SessionNotification[] = [];
 	const queryCalls: string[] = [];
 	const blockedAdvisoryQueries: Array<{ socket: TestSocket; id: string; result: unknown }> = [];
+	const idleUpdateRelease = Promise.withResolvers<void>();
+	let blockNextIdleUpdate = false;
 	const delivered = Promise.withResolvers<void>();
 	const abort = new AbortController();
 	let promptSocket: TestSocket | undefined;
@@ -270,7 +274,17 @@ async function createFixture(
 	});
 	const agent = new AcpAgent(
 		{
-			sessionUpdate: async (update: SessionNotification) => updates.push(update),
+			sessionUpdate: async (update: SessionNotification) => {
+				if (
+					blockNextIdleUpdate &&
+					update.update.sessionUpdate === "session_info_update" &&
+					(update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase === "idle"
+				) {
+					blockNextIdleUpdate = false;
+					await idleUpdateRelease.promise;
+				}
+				updates.push(update);
+			},
 			signal: abort.signal,
 			closed: Promise.withResolvers<void>().promise,
 		} as unknown as AgentSideConnection,
@@ -291,6 +305,7 @@ async function createFixture(
 			),
 		"bootstrap update",
 	);
+	blockNextIdleUpdate = options.blockIdleUpdate === true;
 	blockAdvisoryQuery = true;
 
 	return {
@@ -311,6 +326,7 @@ async function createFixture(
 					JSON.stringify({ type: "query_response", id: blocked.id, ok: true, result: blocked.result }),
 				);
 		},
+		releaseIdleUpdate: () => idleUpdateRelease.resolve(),
 		sendTerminal,
 		dispose: () => {
 			abort.abort();
@@ -404,7 +420,16 @@ test("ACP rejects immediately when correlated agent_failed is the only terminal"
 			code: "prompt_failed",
 			message: "provider_unavailable: diagnostic from fixture",
 		});
-		expect(fixture.updates).toHaveLength(updatesBefore);
+		await waitFor(() => fixture.updates.length === updatesBefore + 1, "failure idle update");
+		expect(
+			fixture.updates
+				.slice(updatesBefore)
+				.map(update =>
+					update.update.sessionUpdate === "session_info_update"
+						? (update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase
+						: update.update.sessionUpdate,
+				),
+		).toEqual(["idle"]);
 		expect(fixture.queryCalls.filter(query => query === "context.get")).toHaveLength(contextQueriesBefore);
 		expect(fixture.queryCalls.filter(query => query === "session.metadata")).toHaveLength(metadataQueriesBefore);
 	} finally {
@@ -413,7 +438,7 @@ test("ACP rejects immediately when correlated agent_failed is the only terminal"
 });
 
 test("ACP failure settlement cannot publish stale phase state over a replacement prompt", async () => {
-	const fixture = await createFixture();
+	const fixture = await createFixture({ blockIdleUpdate: true });
 	try {
 		const failed = prompt(fixture, "first prompt fails");
 		await bounded(fixture.promptDelivered, "first prompt delivery");
@@ -422,18 +447,25 @@ test("ACP failure settlement cannot publish stale phase state over a replacement
 		const updatesAfterFailure = fixture.updates.length;
 
 		const replacement = prompt(fixture, "replacement prompt");
+		// `prompt()` installs the successor waiter before its first session update.
+		// Keep the prior idle transport blocked across that admission boundary.
+		await Bun.sleep(10);
+		fixture.releaseIdleUpdate();
+		await waitFor(
+			() =>
+				fixture.updates
+					.slice(updatesAfterFailure)
+					.filter(update => update.update.sessionUpdate === "session_info_update")
+					.map(update => (update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase)
+					.slice(-2)
+					.join(",") === "idle,working",
+			"successor phase reconciliation",
+		);
+		expect((fixture.updates.at(-1)?.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase).toBe("working");
 		fixture.sendStopped("end_turn");
 		expect(await bounded(replacement, "replacement terminal settlement")).toEqual({ stopReason: "end_turn" });
-		expect(
-			fixture.updates
-				.slice(updatesAfterFailure)
-				.some(
-					update =>
-						update.update.sessionUpdate === "session_info_update" &&
-						(update.update as { _meta?: { gjcAgentFailed?: boolean } })._meta?.gjcAgentFailed === true,
-				),
-		).toBe(false);
 	} finally {
+		fixture.releaseIdleUpdate();
 		fixture.dispose();
 	}
 });
