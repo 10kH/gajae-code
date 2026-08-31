@@ -2392,6 +2392,7 @@ export class AgentSession {
 	#preProfileModel: Model | undefined;
 	#sessionAdmissionQueue: SessionAdmissionEntry[] = [];
 	#activeSessionAdmission: SessionAdmissionEntry | undefined;
+	#startupPromptWaiters = new Set<Promise<void>>();
 	#sessionAdmissionClosing = false;
 	#sessionAdmissionClosed = false;
 	#sessionAdmissionContext = new AsyncLocalStorage<SessionAdmissionEntry>();
@@ -2850,6 +2851,7 @@ export class AgentSession {
 	readonly #disposeAsyncJobManager: boolean;
 	#ownedMcpManager: MCPManager | undefined;
 	#startupTurnBarrier: Promise<void> | undefined;
+	#startupTurnBarrierPending = false;
 	#pendingPythonMessages: Array<{
 		message: PythonExecutionMessage;
 		onPersisted?: () => void;
@@ -3049,6 +3051,7 @@ export class AgentSession {
 	#cancelAndSubmitAbortOutcomeProviderForTests: (() => Promise<AbortOutcome>) | undefined = undefined;
 	#postPromptTasks = new Set<Promise<void>>();
 	#postPromptTaskSelectionFenceGenerations = new Map<Promise<void>, number>();
+	#postPromptTaskRecoveryExcluded = new Set<Promise<void>>();
 	#postPromptTasksPromise: Promise<void> | undefined = undefined;
 	#postPromptTasksResolve: (() => void) | undefined = undefined;
 	#postPromptTasksAbortController = new AbortController();
@@ -3331,16 +3334,61 @@ export class AgentSession {
 		return { entry, capability: entry.continuationCapability };
 	}
 
-	async #awaitStartupTurnBarrier(signal?: AbortSignal): Promise<void> {
-		const barrier = this.#startupTurnBarrier;
+	#setStartupTurnBarrier(barrier: Promise<void> | undefined): void {
+		this.#startupTurnBarrier = barrier;
+		this.#startupTurnBarrierPending = barrier !== undefined;
 		if (!barrier) return;
-		await awaitPromptInvocationPreflight(barrier, signal);
-		if (this.#startupTurnBarrier === barrier) this.#startupTurnBarrier = undefined;
+		void barrier.then(
+			() => {
+				if (this.#startupTurnBarrier === barrier) this.#startupTurnBarrierPending = false;
+			},
+			() => {
+				if (this.#startupTurnBarrier === barrier) this.#startupTurnBarrierPending = false;
+			},
+		);
+	}
+	async #awaitStartupTurnBarrier(signal?: AbortSignal): Promise<void> {
+		while (true) {
+			const barrier = this.#startupTurnBarrier;
+			if (!barrier) return;
+			await awaitPromptInvocationPreflight(barrier, signal);
+			// Cross one task boundary before clearing readiness. Promise reaction
+			// chains fully drain before timers, so every extension published by the
+			// captured barrier's settlement becomes visible without an arbitrary
+			// microtask-depth cap.
+			const publicationTurn = Promise.withResolvers<void>();
+			const timer = setTimeout(publicationTurn.resolve, 0);
+			try {
+				await awaitPromptInvocationPreflight(publicationTurn.promise, signal);
+			} finally {
+				clearTimeout(timer);
+			}
+			if (this.#startupTurnBarrier !== barrier) continue;
+			this.#setStartupTurnBarrier(undefined);
+			return;
+		}
+	}
+	async #awaitStartupPromptWaiters(signal?: AbortSignal): Promise<void> {
+		while (this.#startupPromptWaiters.size > 0) {
+			await awaitPromptInvocationPreflight(Promise.all([...this.#startupPromptWaiters]), signal);
+			await Promise.resolve();
+		}
+	}
+	#reserveStartupPromptWaiter(): () => void {
+		const waiter = Promise.withResolvers<void>();
+		this.#startupPromptWaiters.add(waiter.promise);
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			this.#startupPromptWaiters.delete(waiter.promise);
+			waiter.resolve();
+		};
 	}
 	extendStartupTurnBarrier(barrier: Promise<void>): void {
 		const current = this.#startupTurnBarrier;
-		this.#startupTurnBarrier = current ? Promise.all([current, barrier]).then(() => {}) : barrier;
-		void this.#startupTurnBarrier.catch(() => {});
+		this.#setStartupTurnBarrier(current ? Promise.all([current, barrier]).then(() => {}) : barrier);
+		void this.#startupTurnBarrier?.catch(() => {});
 	}
 
 	async #withSessionAdmission<T>(
@@ -3352,6 +3400,8 @@ export class AgentSession {
 			allowDuringClosing?: boolean;
 			bypassSelectionFenceGeneration?: number;
 			allowPromptContinuationReentry?: boolean;
+			idleDelivery?: boolean;
+			startupPromptWaiterRelease?: () => void;
 		},
 	): Promise<T> {
 		const owner = this.#sessionAdmissionContext.getStore();
@@ -3366,11 +3416,20 @@ export class AgentSession {
 			}
 			throw this.#sessionAdmissionBusyError();
 		}
+		const releaseStartupPromptWaiter =
+			kind === "prompt" && options?.idleDelivery !== true
+				? (options?.startupPromptWaiterRelease ?? this.#reserveStartupPromptWaiter())
+				: undefined;
 		if (kind === "prompt") {
 			const startupSignal = signal
 				? AbortSignal.any([signal, this.#disposeAbortController.signal])
 				: this.#disposeAbortController.signal;
-			await awaitPromptInvocationPreflight(this.#awaitStartupTurnBarrier(startupSignal), startupSignal);
+			try {
+				await awaitPromptInvocationPreflight(this.#awaitStartupTurnBarrier(startupSignal), startupSignal);
+			} finally {
+				releaseStartupPromptWaiter?.();
+			}
+			if (options?.idleDelivery === true) await this.#awaitStartupPromptWaiters(startupSignal);
 		}
 		const bypassesSelectionFence =
 			options?.bypassSelectionFenceGeneration !== undefined &&
@@ -4231,7 +4290,7 @@ export class AgentSession {
 		this.#disposeAsyncJobManager = config.disposeAsyncJobManager ?? true;
 		this.#retainedMemorySampler = config.retainedMemorySampler;
 		this.#ownedMcpManager = config.ownedMcpManager;
-		this.#startupTurnBarrier = config.startupTurnBarrier;
+		this.#setStartupTurnBarrier(config.startupTurnBarrier);
 		// Only arm the recovery barrier when a rescope journal is actually pending. Arming it
 		// unconditionally flips #startupTurnBarrier from absent to a (resolved) promise for
 		// every session, which makes barrier-gated post-turn work (e.g. the hidden-next-turn
@@ -4331,7 +4390,7 @@ export class AgentSession {
 				// agent.prompt directly, allocates right before admission.
 				this.agent.followUp(message);
 			},
-			injectIdle: async messages => {
+			injectIdle: async (messages, signal) => {
 				// Mandated boundary comment (corrected turn semantics): same origin
 				// split as the streaming injector — an allowed owned-completion
 				// delivery starts a fresh turn attempt/lineage and is not a
@@ -4351,43 +4410,37 @@ export class AgentSession {
 					this.#settleDeliveredOwnedRegistrations(survivors);
 					return true;
 				};
-				if (settleIfDisposing()) return;
 				try {
-					await this.#awaitStartupTurnBarrier(this.#disposeAbortController.signal);
-				} catch {
-					settleIfDisposing();
-					return;
-				}
-				if (settleIfDisposing()) return;
-				// A user prompt may have started during the barrier/scheduling
-				// delay: if the session is now streaming, mutating the epoch and
-				// lineage here would corrupt the ACTIVE user turn (and
-				// agent.prompt would then reject as busy, losing the drained
-				// completion). Route the survivors through followUp — the
-				// streaming injector's path — which allocates the fresh resume
-				// lineage at actual admission (review thread P1).
-				if (this.isStreaming) {
-					for (const message of survivors) this.agent.followUp(message);
-					return;
-				}
-				if (survivors.some(message => ownedCompletionResumeAction(message) === "fresh"))
-					this.#resumeFromOwnedCompletion();
-				try {
-					if (survivors.length === 1) {
-						await this.agent.prompt(first, {
-							...this.#managedFallbackPromptOptions(),
-							onRunAccepted: (handle: AttemptRunHandle) => {
-								if (handle) this.#acceptSdkAttemptRun(handle);
-							},
-						});
-					} else {
-						await this.agent.prompt(survivors, {
-							...this.#managedFallbackPromptOptions(),
-							onRunAccepted: (handle: AttemptRunHandle) => {
-								if (handle) this.#acceptSdkAttemptRun(handle);
-							},
-						});
-					}
+					await this.#withSessionAdmission(
+						"prompt",
+						async () => {
+							if (settleIfDisposing()) return;
+							if (this.isStreaming) {
+								await awaitPromptInvocationPreflight(this.agent.waitForIdle(), signal);
+								if (settleIfDisposing()) return;
+							}
+							if (survivors.some(message => ownedCompletionResumeAction(message) === "fresh"))
+								this.#resumeFromOwnedCompletion();
+							if (survivors.length === 1) {
+								await this.agent.prompt(first, {
+									...this.#managedFallbackPromptOptions(),
+									onRunAccepted: (handle: AttemptRunHandle) => {
+										if (handle) this.#acceptSdkAttemptRun(handle);
+									},
+								});
+							} else {
+								await this.agent.prompt(survivors, {
+									...this.#managedFallbackPromptOptions(),
+									onRunAccepted: (handle: AttemptRunHandle) => {
+										if (handle) this.#acceptSdkAttemptRun(handle);
+									},
+								});
+							}
+						},
+						signal,
+						undefined,
+						{ idleDelivery: true },
+					);
 				} finally {
 					// The owned completions were delivered OR the prompt attempt
 					// failed (e.g. provider rejection): either way the yield
@@ -4399,16 +4452,19 @@ export class AgentSession {
 					this.#settleDeliveredOwnedRegistrations(survivors);
 				}
 			},
-			scheduleIdleFlush: run => {
+			scheduleIdleFlush: (run, onSkip) => {
+				// The startup barrier already gates injectIdle, so begin waiting on a
+				// pending barrier immediately. Once readiness has settled, ordinary
+				// idle wakes retain the fixed merge window.
+				const delayMs = this.#startupTurnBarrierPending ? 0 : FOLD_WAKE_MERGE_WINDOW_MS;
 				this.#schedulePostPromptTask(
-					async () => {
-						await run();
+					async signal => {
+						await run(signal);
 					},
-					// One merge window, so staggered completions share a single wake
-					// turn instead of each buying its own.
-					{ delayMs: FOLD_WAKE_MERGE_WINDOW_MS },
+					{ delayMs, onSkip, excludeFromPostPromptRecovery: true },
 				);
 			},
+			getIdleFlushSignal: () => this.#postPromptTasksAbortController.signal,
 		});
 		this.agent.setOnBeforeYield(() => this.yieldQueue.flush("streaming"));
 		// Stop-after-result, never abort: a fold arms this once and the loop ends the
@@ -6861,9 +6917,11 @@ export class AgentSession {
 		selectionFenceGeneration: number,
 		lease?: RunResourceProducerLease,
 		leaseTask: Promise<void> = task,
+		excludeFromRecovery = false,
 	): void {
 		this.#postPromptTasks.add(task);
 		this.#postPromptTaskSelectionFenceGenerations.set(task, selectionFenceGeneration);
+		if (excludeFromRecovery) this.#postPromptTaskRecoveryExcluded.add(task);
 		this.#ensurePostPromptTasksPromise();
 		if (lease) {
 			lease.track("post_prompt", "agent-session", leaseTask);
@@ -6874,6 +6932,7 @@ export class AgentSession {
 			.finally(() => {
 				this.#postPromptTasks.delete(task);
 				this.#postPromptTaskSelectionFenceGenerations.delete(task);
+				this.#postPromptTaskRecoveryExcluded.delete(task);
 				if (this.#postPromptTasks.size === 0) this.#resolvePostPromptTasks();
 			});
 	}
@@ -6887,6 +6946,7 @@ export class AgentSession {
 			resourceRunId?: string;
 			leaseTask?: Promise<void>;
 			selectionFenceGeneration?: number;
+			excludeFromPostPromptRecovery?: boolean;
 		},
 	): Promise<void> {
 		const selectionFenceGeneration =
@@ -6945,6 +7005,7 @@ export class AgentSession {
 			selectionFenceGeneration,
 			reservation?.ok ? reservation.lease : undefined,
 			options?.leaseTask,
+			options?.excludeFromPostPromptRecovery,
 		);
 		return scheduled;
 	}
@@ -7482,6 +7543,7 @@ export class AgentSession {
 		this.#postPromptTasksAbortController = new AbortController();
 		this.#postPromptTasks.clear();
 		this.#postPromptTaskSelectionFenceGenerations.clear();
+		this.#postPromptTaskRecoveryExcluded.clear();
 		this.#releaseDeferredAgentEndContinuations();
 		this.#resolveTtsrResume();
 		this.#resolvePostPromptTasks();
@@ -7503,8 +7565,11 @@ export class AgentSession {
 				await this.#ttsrResumePromise;
 				continue;
 			}
-			if (this.#postPromptTasksPromise) {
-				await this.#postPromptTasksPromise;
+			const recoveryTasks = [...this.#postPromptTasks].filter(
+				task => !this.#postPromptTaskRecoveryExcluded.has(task),
+			);
+			if (recoveryTasks.length > 0) {
+				await Promise.allSettled(recoveryTasks);
 				continue;
 			}
 			// Tracked post-prompt tasks cover deferred continuations scheduled from
@@ -7526,7 +7591,9 @@ export class AgentSession {
 	 */
 	async #waitForPostPromptTasksBeforeSelectionFence(selectionFenceGeneration: number): Promise<void> {
 		const precedingTasks = [...this.#postPromptTasks].filter(
-			task => (this.#postPromptTaskSelectionFenceGenerations.get(task) ?? 0) < selectionFenceGeneration,
+			task =>
+				!this.#postPromptTaskRecoveryExcluded.has(task) &&
+				(this.#postPromptTaskSelectionFenceGenerations.get(task) ?? 0) < selectionFenceGeneration,
 		);
 		if (precedingTasks.length > 0) await Promise.allSettled(precedingTasks);
 	}
@@ -8962,14 +9029,24 @@ export class AgentSession {
 				await this.#waitForPostPromptTasksBeforeSelectionFence(ignoreSelectionFenceGeneration);
 			}
 			await this.#waitForSessionSettlement(ignoreSelectionFenceGeneration);
+			const hasBlockingPostPromptTasks =
+				ignoreSelectionFenceGeneration === undefined
+					? this.#postPromptTasks.size > 0
+					: [...this.#postPromptTasks].some(
+							task =>
+								!this.#postPromptTaskRecoveryExcluded.has(task) &&
+								(this.#postPromptTaskSelectionFenceGenerations.get(task) ?? 0) < ignoreSelectionFenceGeneration,
+						);
 			if (
 				!this.agent.state.isStreaming &&
 				!this.#retryPromise &&
 				!this.#ttsrResumePromise &&
-				!this.#postPromptTasksPromise &&
+				!hasBlockingPostPromptTasks &&
 				!this.#isSessionSettlementPending(ignoreSelectionFenceGeneration)
 			)
 				return;
+			if (ignoreSelectionFenceGeneration === undefined && hasBlockingPostPromptTasks && this.#postPromptTasksPromise)
+				await this.#postPromptTasksPromise;
 		}
 	}
 
@@ -11252,6 +11329,19 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		const releaseStartupPromptWaiter = this.#reserveStartupPromptWaiter();
+		try {
+			await this.#promptInternal(text, options, releaseStartupPromptWaiter);
+		} finally {
+			releaseStartupPromptWaiter();
+		}
+	}
+
+	async #promptInternal(
+		text: string,
+		options: PromptOptions | undefined,
+		releaseStartupPromptWaiter: () => void,
+	): Promise<void> {
 		const hasUsableImage =
 			options?.images?.some(image => typeof image?.data === "string" && image.data.trim().length > 0) === true;
 		if (typeof text !== "string" || (text.trim().length === 0 && !hasUsableImage))
@@ -11397,7 +11487,12 @@ export class AgentSession {
 							attribution: promptAttribution,
 							timestamp: Date.now(),
 						}
-					: { role: "user" as const, content: userContent, attribution: promptAttribution, timestamp: Date.now() };
+					: {
+							role: "user" as const,
+							content: userContent,
+							attribution: promptAttribution,
+							timestamp: Date.now(),
+						};
 				if (deepInterviewUserIntentEpoch !== undefined)
 					this.#deepInterviewGenuineUserMessageEpochs.set(message, deepInterviewUserIntentEpoch);
 				await this.refreshGjcSubskillTools();
@@ -11425,6 +11520,8 @@ export class AgentSession {
 				}
 			},
 			options?.preflightSignal,
+			undefined,
+			{ startupPromptWaiterRelease: releaseStartupPromptWaiter },
 		);
 	}
 
@@ -13813,12 +13910,14 @@ export class AgentSession {
 			this.#promptPreflightCancellationGeneration++;
 			this.#promptPreflightAbortController.abort();
 			this.#promptPreflightAbortController = new AbortController();
+			this.#drainTerminalOwnedYieldEntries();
+			const overlappingPostPromptDrain = this.#cancelPostPromptTasks();
 			// Abort visibility is per-request: a later real abort must not inherit an
 			// earlier silent abort's suppression and swallow the user-visible notice.
 			if (options?.silent !== true) this.#silentAbortPending = false;
 			// Capture the unwind: the field clears once the first abort settles, and
 			// the awaits below must keep watching THIS unwind, not a successor's.
-			const sharedUnwind = this.#abortUnwind;
+			const sharedUnwind = Promise.all([this.#abortUnwind, overlappingPostPromptDrain]).then(() => {});
 			if (options?.timeoutMs !== undefined) {
 				const timeoutMs = Math.max(0, options.timeoutMs);
 				const deadline = Date.now() + timeoutMs;
@@ -13849,6 +13948,7 @@ export class AgentSession {
 		this.#abortUnwind = unwind.promise;
 		try {
 			this.#abortOptions(options);
+			this.#drainTerminalOwnedYieldEntries();
 			const postPromptDrain = this.#cancelPostPromptTasks();
 			const managedLogicalRunId =
 				this.#defaultFallbackChain().chain.entries.length > 1 ? this.agent.currentManagedLogicalRunId : undefined;

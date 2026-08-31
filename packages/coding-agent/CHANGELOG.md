@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Deferred MCP startup now releases queued idle yields as soon as readiness settles without bypassing prompt admission. Barrier extensions remain gated, rejected startup drops the wake without prompting, settled sessions retain the normal idle merge window, and readiness stays session-local. (#5085)
+
 - ACP deep-interview's real subprocess fixture now retires its owned lifecycle sessions before broker/root cleanup, preventing detached session hosts from recreating the fixture root after teardown. (#5086)
 - The ACP fixture tracks broker startup through its full producer deadline and tracks session creation before awaiting responses, keeps its independent broker fallback client available when runtime shutdown fails, and retires sessions first seen in either broker inventory phase directly through that fallback across cleanup retries. Verified broker-startup rejection no longer strands the root, while an unverified child-reap failure retains cleanup authority. Reconciliation recognizes the real ACP `terminal_uncertain` after-send wire envelope as transport uncertainty while preserving semantic close diagnostics, then accepts terminal races only after strict inventory proves unambiguous and certain retirement. A stalled broker-client transport close no longer blocks authoritative lease/root cleanup, and the child environment confines Windows profile and temporary paths to the fixture root. (#5086)
 
