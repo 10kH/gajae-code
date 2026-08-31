@@ -2946,6 +2946,7 @@ export class AcpAgent implements Agent {
 					},
 				},
 				adapter,
+				publicationGeneration,
 			);
 		}
 		if (event.type === "message_end" && object(event.message)?.role === "assistant") {
@@ -2969,6 +2970,7 @@ export class AcpAgent implements Agent {
 							},
 						},
 						adapter,
+						publicationGeneration,
 					);
 				} else if (resolution.kind === "divergent") {
 					logger.warn("acp_final_text_diverged", {
