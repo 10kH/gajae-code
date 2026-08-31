@@ -2806,6 +2806,14 @@ export interface PrDiffFile {
 	changeType: "modified" | "added" | "deleted" | "renamed" | "binary";
 	/** Pre-image path for renames/deletes; same as `path` otherwise. */
 	oldPath?: string;
+	/**
+	 * Set when `path` kept its C-style escaped source form because the quoted
+	 * token held invalid UTF-8 or a malformed escape; distinguishes it from a
+	 * valid path whose decoded text looks identical.
+	 */
+	pathEscaped?: boolean;
+	/** Same as {@link PrDiffFile.pathEscaped}, for `oldPath`. */
+	oldPathEscaped?: boolean;
 	/** Byte offset of the section's `diff --git` line in the unified diff. */
 	startOffset: number;
 	/** Byte offset of the next section (or end-of-text). */
@@ -2861,6 +2869,8 @@ export function parsePrUnifiedDiff(text: string): PrDiffPayload {
 interface ParsedDiffHeaderToken {
 	value: string;
 	nextIndex: number;
+	/** Set when the token kept its C-style escaped source form. */
+	escaped?: boolean;
 }
 
 function skipDiffHeaderSpaces(text: string, index: number): number {
@@ -2869,61 +2879,85 @@ function skipDiffHeaderSpaces(text: string, index: number): number {
 	return i;
 }
 
-function parseDiffQuotedEscape(text: string, slashIndex: number): ParsedDiffHeaderToken {
-	const next = text.charAt(slashIndex + 1);
-	if (next === "") return { value: "\\", nextIndex: slashIndex + 1 };
-
-	if (next >= "0" && next <= "7") {
-		let end = slashIndex + 1;
-		while (end < text.length && end < slashIndex + 4) {
-			const digit = text.charAt(end);
-			if (digit < "0" || digit > "7") break;
-			end += 1;
-		}
-		return {
-			value: String.fromCharCode(Number.parseInt(text.slice(slashIndex + 1, end), 8)),
-			nextIndex: end,
-		};
-	}
-
-	switch (next) {
-		case "a":
-			return { value: "\x07", nextIndex: slashIndex + 2 };
-		case "b":
-			return { value: "\b", nextIndex: slashIndex + 2 };
-		case "f":
-			return { value: "\f", nextIndex: slashIndex + 2 };
-		case "n":
-			return { value: "\n", nextIndex: slashIndex + 2 };
-		case "r":
-			return { value: "\r", nextIndex: slashIndex + 2 };
-		case "t":
-			return { value: "\t", nextIndex: slashIndex + 2 };
-		case "v":
-			return { value: "\v", nextIndex: slashIndex + 2 };
-		case "\\":
-		case '"':
-			return { value: next, nextIndex: slashIndex + 2 };
-		default:
-			return { value: next, nextIndex: slashIndex + 2 };
-	}
+interface ParsedDiffQuotedEscape {
+	byte: number;
+	nextIndex: number;
 }
 
+const DIFF_PATH_ENCODER = new TextEncoder();
+const DIFF_PATH_DECODER = new TextDecoder("utf-8", { fatal: true });
+
+const DIFF_NAMED_ESCAPE_BYTES: Record<string, number> = {
+	a: 0x07,
+	b: 0x08,
+	f: 0x0c,
+	n: 0x0a,
+	r: 0x0d,
+	t: 0x09,
+	v: 0x0b,
+	"\\": 0x5c,
+	'"': 0x22,
+};
+
+/**
+ * Git quotes paths C-style: its named escapes plus exactly three octal digits
+ * per byte (leading digit 0-3), so a multi-byte UTF-8 character arrives as
+ * consecutive octal escapes. Anything else is malformed for this grammar.
+ */
+function parseDiffQuotedEscape(text: string, slashIndex: number): ParsedDiffQuotedEscape | undefined {
+	const first = text.charAt(slashIndex + 1);
+	if (first >= "0" && first <= "3") {
+		const second = text.charAt(slashIndex + 2);
+		const third = text.charAt(slashIndex + 3);
+		if (second < "0" || second > "7" || third < "0" || third > "7") return undefined;
+		return { byte: Number.parseInt(text.slice(slashIndex + 1, slashIndex + 4), 8), nextIndex: slashIndex + 4 };
+	}
+	const named = DIFF_NAMED_ESCAPE_BYTES[first];
+	if (named === undefined) return undefined;
+	return { byte: named, nextIndex: slashIndex + 2 };
+}
+
+/**
+ * Escaped bytes are decoded as strict UTF-8. A token holding invalid UTF-8 or
+ * a malformed escape keeps its escaped source form, so distinct non-UTF-8
+ * byte sequences never collapse into one replacement-character path.
+ */
 function parseDiffQuotedToken(text: string, startIndex: number): ParsedDiffHeaderToken | undefined {
 	if (text.charAt(startIndex) !== '"') return undefined;
-	let value = "";
-	for (let i = startIndex + 1; i < text.length; i += 1) {
-		const ch = text.charAt(i);
-		if (ch === '"') return { value, nextIndex: i + 1 };
+	const bytes: number[] = [];
+	let malformed = false;
+	for (let i = startIndex + 1; i < text.length; ) {
+		const codePoint = text.codePointAt(i) as number;
+		const ch = String.fromCodePoint(codePoint);
+		if (ch === '"') {
+			if (!malformed) {
+				try {
+					return { value: DIFF_PATH_DECODER.decode(Uint8Array.from(bytes)), nextIndex: i + 1 };
+				} catch {}
+			}
+			return { value: text.slice(startIndex + 1, i), nextIndex: i + 1, escaped: true };
+		}
 		if (ch !== "\\") {
-			value += ch;
+			bytes.push(...DIFF_PATH_ENCODER.encode(ch));
+			i += ch.length;
 			continue;
 		}
 		const escaped = parseDiffQuotedEscape(text, i);
-		value += escaped.value;
-		i = escaped.nextIndex - 1;
+		if (escaped === undefined) {
+			malformed = true;
+			i += 2;
+			continue;
+		}
+		bytes.push(escaped.byte);
+		i = escaped.nextIndex;
 	}
 	return undefined;
+}
+
+function parseDiffPathLine(line: string, prefix: string): { value: string; escaped?: boolean } {
+	const rest = line.slice(prefix.length);
+	const token = parseDiffQuotedToken(rest, 0);
+	return token ? { value: token.value, escaped: token.escaped } : { value: rest };
 }
 
 function parseDiffHeaderToken(text: string, startIndex: number): ParsedDiffHeaderToken | undefined {
@@ -2940,7 +2974,14 @@ function stripPrDiffPathPrefix(value: string, prefix: "a/" | "b/"): string | und
 	return value.startsWith(prefix) ? value.slice(prefix.length) : undefined;
 }
 
-function parsePrDiffHeaderPaths(header: string): { oldPath?: string; newPath?: string } {
+interface PrDiffHeaderPaths {
+	oldPath?: string;
+	newPath?: string;
+	oldPathEscaped?: boolean;
+	newPathEscaped?: boolean;
+}
+
+function parsePrDiffHeaderPaths(header: string): PrDiffHeaderPaths {
 	const trail = header.slice("diff --git ".length);
 	if (trail.startsWith('"')) {
 		const oldToken = parseDiffQuotedToken(trail, 0);
@@ -2950,6 +2991,8 @@ function parsePrDiffHeaderPaths(header: string): { oldPath?: string; newPath?: s
 		return {
 			oldPath: stripPrDiffPathPrefix(oldToken.value, "a/"),
 			newPath: stripPrDiffPathPrefix(newToken.value, "b/"),
+			oldPathEscaped: oldToken.escaped,
+			newPathEscaped: newToken.escaped,
 		};
 	}
 
@@ -2980,6 +3023,8 @@ function parsePrDiffSection(section: string, startOffset: number, endOffset: num
 	const headerPaths = parsePrDiffHeaderPaths(header);
 	let oldPath = headerPaths.oldPath;
 	let newPath = headerPaths.newPath;
+	let oldPathEscaped = headerPaths.oldPathEscaped;
+	let newPathEscaped = headerPaths.newPathEscaped;
 
 	let changeType: PrDiffFile["changeType"] = "modified";
 	let isBinary = false;
@@ -2999,11 +3044,11 @@ function parsePrDiffSection(section: string, startOffset: number, endOffset: num
 		}
 		if (line.startsWith("rename from ")) {
 			changeType = "renamed";
-			oldPath = line.slice("rename from ".length);
+			({ value: oldPath, escaped: oldPathEscaped } = parseDiffPathLine(line, "rename from "));
 			continue;
 		}
 		if (line.startsWith("rename to ")) {
-			newPath = line.slice("rename to ".length);
+			({ value: newPath, escaped: newPathEscaped } = parseDiffPathLine(line, "rename to "));
 			continue;
 		}
 		if (line.startsWith("Binary files ") && line.endsWith(" differ")) {
@@ -3028,8 +3073,15 @@ function parsePrDiffSection(section: string, startOffset: number, endOffset: num
 		deletions = 0;
 	}
 
-	const displayPath =
-		changeType === "deleted" ? (oldPath ?? newPath ?? "(unknown)") : (newPath ?? oldPath ?? "(unknown)");
+	const preferOld = changeType === "deleted";
+	const displayPath = preferOld ? (oldPath ?? newPath ?? "(unknown)") : (newPath ?? oldPath ?? "(unknown)");
+	const displayEscaped = preferOld
+		? oldPath !== undefined
+			? oldPathEscaped
+			: newPathEscaped
+		: newPath !== undefined
+			? newPathEscaped
+			: oldPathEscaped;
 	const file: PrDiffFile = {
 		path: displayPath,
 		additions,
@@ -3038,8 +3090,12 @@ function parsePrDiffSection(section: string, startOffset: number, endOffset: num
 		startOffset,
 		endOffset,
 	};
-	if (oldPath && oldPath !== displayPath) {
+	if (displayEscaped) {
+		file.pathEscaped = true;
+	}
+	if (oldPath && (oldPath !== displayPath || oldPathEscaped !== displayEscaped)) {
 		file.oldPath = oldPath;
+		if (oldPathEscaped) file.oldPathEscaped = true;
 	}
 	return file;
 }

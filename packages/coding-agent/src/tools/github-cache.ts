@@ -103,7 +103,7 @@ export function openDb(): Database | null {
 		// than running an in-place ALTER dance.
 		const userVersion = (db.prepare("PRAGMA user_version").get() as { user_version?: number } | undefined)
 			?.user_version;
-		if (userVersion !== undefined && userVersion < 3) {
+		if (userVersion !== undefined && userVersion < 4) {
 			db.run("DROP TABLE IF EXISTS github_view_cache");
 		}
 		db.run(`
@@ -120,7 +120,7 @@ export function openDb(): Database | null {
 				PRIMARY KEY (auth_key, repo, kind, number, include_comments)
 			);
 			CREATE INDEX IF NOT EXISTS idx_github_view_cache_fetched ON github_view_cache(fetched_at);
-			PRAGMA user_version = 3;
+			PRAGMA user_version = 4;
 		`);
 		protectDbFiles(dbPath);
 		cachedDb = db;
