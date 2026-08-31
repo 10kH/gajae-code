@@ -3145,6 +3145,10 @@ export class AcpAgent implements Agent {
 		try {
 			await this.#connection.sessionUpdate(notification);
 		} catch (error) {
+			// A validated terminal can retire this publication while it is blocked in
+			// the client transport. Its failure belongs to the drained prompt and must
+			// not tear down a successor that has since taken session ownership.
+			if (record.terminalDrain) return;
 			const failure = this.#frameProcessingFailure(error);
 			await this.#failSession(id, record.adapter, failure);
 			throw failure;
