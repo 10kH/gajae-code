@@ -160,8 +160,8 @@ type SessionRecord = {
 	reconnectUnsubscribe: () => void;
 	/** Per-session frame work queue; callbacks never race prompt ownership. */
 	frameTail: Promise<void>;
-	/** Prior nonterminal work draining after an out-of-queue terminal settlement. */
-	terminalDrain?: Promise<void>;
+	/** Detached terminal-owned publications serialized in terminal arrival order. */
+	terminalTail?: Promise<void>;
 	/** Advances when an owned terminal retires all earlier frame publications. */
 	publicationGeneration: number;
 	/** Monotonic at WebSocket ingress, before queued work begins. */
@@ -480,52 +480,9 @@ function logDroppedPromptTerminal(
 	});
 }
 
-const ACP_FAILURE_DIAGNOSTIC_CODES = new Set([
-	"agent_failed",
-	"local_snapshot_failure",
-	"provider_down",
-	"provider_unavailable",
-	"provider_rejected",
-	"provider_http_402",
-	"provider_http_429",
-	"upstream_stream_interrupted",
-	"argument_validation",
-	"execution",
-	"local_buffer_overflow",
-	"escaped_arguments_discarded",
-	"prompt_failed",
-	"terminal_uncertain",
-	"skill_runtime",
-	"io_error",
-]);
-
 function terminalOutcome(event: JsonObject): SdkPromptTerminalOutcome | undefined {
 	const outcome = object(event.outcome);
-	if (!outcome) {
-		const error = event.type === "agent_failed" ? object(event.error) : undefined;
-		if (typeof error?.code === "string" && typeof error.message === "string") {
-			// The runtime emits this diagnostic immediately before its authoritative
-			// agent_end(cancelled). It is a cancellation boundary, not a provider
-			// failure, and must also settle when that trailing boundary is lost.
-			if (event.type === "agent_failed" && error.code === "aborted")
-				return { kind: "stopped", reason: "cancelled", provenance: "client_cancel" };
-			if (event.type === "agent_failed" && error.code === "prompt_deadline_exceeded")
-				return {
-					kind: "failed",
-					code: "prompt_deadline_exceeded",
-					message: "prompt_deadline_exceeded: Agent run failed.",
-					provenance: "deadline",
-				};
-			const diagnosticCode = ACP_FAILURE_DIAGNOSTIC_CODES.has(error.code) ? error.code : "agent_failed";
-			return {
-				kind: "failed",
-				code: "prompt_failed",
-				message: `${diagnosticCode}: Agent run failed.`,
-				provenance: "agent_failed",
-			};
-		}
-		return undefined;
-	}
+	if (!outcome) return undefined;
 	if (
 		outcome.kind === "stopped" &&
 		(outcome.reason === "end_turn" ||
@@ -1640,7 +1597,7 @@ export class AcpAgent implements Agent {
 				"conflict",
 				"ACP session is still reconciling a previous prompt acknowledgement.",
 			);
-		record.publicationGeneration++;
+
 		const payload = acpPromptPayload(params.prompt);
 		const skillInvocation = acpSkillInvocation(params.prompt);
 		if (!skillInvocation) {
@@ -1691,6 +1648,7 @@ export class AcpAgent implements Agent {
 					MAX_PROMPT_FRAME_BYTES / 1024,
 				)} KiB transport limit. Attach a smaller or more compressed image.`,
 			);
+		record.publicationGeneration++;
 		const { promise: response, resolve, reject } = Promise.withResolvers<PromptResponse>();
 		const waiter: PromptWaiter = {
 			acknowledged: false,
@@ -2419,14 +2377,8 @@ export class AcpAgent implements Agent {
 			this.#retiredPromptAcknowledgements.add(id);
 	}
 
-	#armTerminalDrain(record: SessionRecord): void {
+	#advanceTerminalGeneration(record: SessionRecord): void {
 		record.publicationGeneration++;
-		const pendingFrames = record.frameTail;
-		let drain: Promise<void>;
-		drain = pendingFrames.finally(() => {
-			if (record.terminalDrain === drain) record.terminalDrain = undefined;
-		});
-		record.terminalDrain = drain;
 	}
 
 	#recoverSessionAfterTransportFailure(id: string, adapter: AcpSdkAdapter, error: Error): void {
@@ -2773,13 +2725,6 @@ export class AcpAgent implements Agent {
 		// watchdog, so queued processing cannot turn unrelated host traffic into turn liveness.
 		this.#refreshPromptWatchdog(id, record, frame);
 		++record.inboundSequence;
-		const received = receivedSdkEvent(frame);
-		if (received?.event.type === "agent_end" || received?.event.type === "agent_failed") {
-			void this.#handleSdkFrame(id, adapter, frame).catch(async error => {
-				await this.#failSession(id, adapter, this.#frameProcessingFailure(error));
-			});
-			return;
-		}
 		const frameGeneration = record.publicationGeneration;
 		const task = record.frameTail.then(async () => await this.#handleSdkFrame(id, adapter, frame, frameGeneration));
 		record.frameTail = task.catch(async error => {
@@ -2824,7 +2769,8 @@ export class AcpAgent implements Agent {
 		if (!received) return;
 		const { event, wirePayload } = received;
 		let publicationGeneration = ingressPublicationGeneration ?? record.publicationGeneration;
-		const isTerminal = event.type === "agent_end" || event.type === "agent_failed";
+		const outcome = event.type === "agent_end" || event.type === "agent_failed" ? terminalOutcome(event) : undefined;
+		const isTerminal = event.type === "agent_end" || (event.type === "agent_failed" && outcome !== undefined);
 		if (event.type === "notice" && event.source === "autorouting" && typeof event.message === "string") {
 			record.routingInactiveNotice = event.message;
 			return;
@@ -2832,7 +2778,7 @@ export class AcpAgent implements Agent {
 		const derivedCorrelation = sdkFrameCorrelation(frame, event);
 		const correlation = derivedCorrelation ?? {};
 		const activePrompt = record.activePrompt;
-		const outcome = isTerminal ? terminalOutcome(event) : undefined;
+		let terminalPromptOwner: PromptWaiter | undefined;
 		const settledCorrelation = record.settledPromptCorrelations.some(settled =>
 			correlationsMatch(settled, correlation),
 		);
@@ -2856,7 +2802,8 @@ export class AcpAgent implements Agent {
 				return;
 			}
 			if (activePrompt.terminal) return;
-			this.#armTerminalDrain(record);
+			terminalPromptOwner = activePrompt;
+			this.#advanceTerminalGeneration(record);
 			publicationGeneration = record.publicationGeneration;
 			if (!outcome) {
 				await this.#rejectPrompt(
@@ -2871,7 +2818,7 @@ export class AcpAgent implements Agent {
 			// Failure diagnostics are useful but advisory. Settle before any mapped
 			// session update can await a backpressured client transport; otherwise an
 			// already-decided failure can still lose to the inactivity watchdog.
-			if (event.type === "agent_failed") this.#settlePrompt(id, record, activePrompt);
+			this.#settlePrompt(id, record, activePrompt);
 		}
 		if (!isTerminal && derivedCorrelation === undefined) return;
 		if (!isTerminal && hasCorrelation(correlation)) {
@@ -2892,12 +2839,13 @@ export class AcpAgent implements Agent {
 			if (!activePrompt || activePrompt.settled || !correlationsMatch(activePrompt.correlation, correlation)) return;
 		}
 		const promptOwner =
-			activePrompt &&
+			terminalPromptOwner ??
+			(activePrompt &&
 			!activePrompt.settled &&
 			activePrompt.acknowledged &&
 			correlationsExactlyMatch(activePrompt.correlation, correlation)
 				? activePrompt
-				: undefined;
+				: undefined);
 		const toolCallId = typeof event.toolCallId === "string" ? event.toolCallId : undefined;
 		if (
 			toolCallId &&
@@ -2936,7 +2884,7 @@ export class AcpAgent implements Agent {
 			// The prompt rejection carries the sanitized failure diagnostic. Publishing
 			// a second session update after settlement would be stale as soon as the client
 			// starts a replacement turn, and an in-flight transport write cannot be revoked.
-			if (event.type !== "agent_failed")
+			if (!(event.type === "agent_failed" && isTerminal))
 				await this.#publishSessionUpdate(id, notification, adapter, publicationGeneration);
 		}
 		if (toolCallId && event.type === "tool_execution_end") record.toolArgs.delete(toolCallId);
@@ -2959,7 +2907,23 @@ export class AcpAgent implements Agent {
 			if (promptOwner) promptOwner.messageProgress = undefined;
 			else record.sessionMessageProgress = undefined;
 		}
-		if (event.type === "agent_end") {
+		if (isTerminal) this.#scheduleTerminalUpdates(id, record, adapter, publicationGeneration, event, promptOwner);
+	}
+
+	#scheduleTerminalUpdates(
+		id: string,
+		record: SessionRecord,
+		adapter: AcpSdkAdapter,
+		publicationGeneration: number,
+		event: JsonObject,
+		promptOwner: PromptWaiter | undefined,
+	): void {
+		const prior = record.terminalTail ?? Promise.resolve();
+		const task = prior.then(async () => {
+			if (event.type === "agent_failed") {
+				await this.#publishPromptPhaseIdle(id, adapter);
+				return;
+			}
 			const finalText = typeof event.finalText === "string" ? event.finalText : "";
 			if (promptOwner && finalText) {
 				const resolution = resolveAcpFinalText(promptOwner.emittedAssistantText, finalText);
@@ -2988,19 +2952,17 @@ export class AcpAgent implements Agent {
 					});
 				}
 			}
-		}
-		// The terminal frame is the turn's end, so it settles the prompt before anything
-		// else is asked of the session host. `#emitEndOfTurnUpdates` queries `context.get`
-		// and `session.metadata`, and a host that stops producing the moment it publishes
-		// its terminal answers neither: sequencing settlement behind those advisory
-		// queries is what left a finished turn reported as running until the inactivity
-		// watchdog rescued it.
-		if (activePrompt) this.#settlePrompt(id, record, activePrompt);
-		// A failure terminal has no trustworthy end-of-turn usage or title. The rejected
-		// prompt response releases the client turn; the best-effort phase update reconciles
-		// a successor that starts while its transport write is backpressured.
-		if (event.type === "agent_failed") void this.#publishPromptPhaseIdle(id, adapter);
-		if (event.type === "agent_end") await this.#emitEndOfTurnUpdates(id, adapter, publicationGeneration);
+			await this.#emitEndOfTurnUpdates(id, adapter, publicationGeneration);
+		});
+		let terminalTail: Promise<void>;
+		terminalTail = task
+			.catch(error => {
+				logger.warn("acp_terminal_update_failed", { sessionId: id, error: String(error) });
+			})
+			.finally(() => {
+				if (record.terminalTail === terminalTail) record.terminalTail = undefined;
+			});
+		record.terminalTail = terminalTail;
 	}
 
 	async #rejectPrompt(
@@ -3164,6 +3126,14 @@ export class AcpAgent implements Agent {
 		if (!record || (expectedAdapter && record.adapter !== expectedAdapter)) return;
 		try {
 			await this.#connection.sessionUpdate(notification);
+			const current = this.#sessions.get(id);
+			if (
+				current &&
+				((expectedAdapter && current.adapter !== expectedAdapter) ||
+					(publicationGeneration !== undefined && publicationGeneration !== current.publicationGeneration))
+			) {
+				void this.#publishPromptPhase(id, current.adapter, current.activePrompt);
+			}
 		} catch (error) {
 			// A validated terminal can retire this publication while it is blocked in
 			// the client transport. Its failure belongs to the drained prompt and must

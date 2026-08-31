@@ -1141,6 +1141,15 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		prompt: [{ type: "text", text: "complete before acknowledgement" }],
 	});
 	expect(await bounded(fastPrompt, "pre-acknowledgement prompt completion")).toEqual({ stopReason: "end_turn" });
+	await waitFor(
+		() =>
+			updates.some(
+				update =>
+					update.update.sessionUpdate === "agent_message_chunk" &&
+					(update.update as { content?: { text?: string } }).content?.text === "fast",
+			),
+		"pre-acknowledgement detached final text",
+	);
 	expect(
 		updates.some(
 			update =>
