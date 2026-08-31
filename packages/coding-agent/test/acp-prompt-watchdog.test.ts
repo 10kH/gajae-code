@@ -815,8 +815,12 @@ test("a late acknowledgement tombstones a prompt rejected before ownership was k
 		const abandonedError = await bounded(abandoned, "watchdog rejection before acknowledgement");
 		expect(abandonedError).toBeInstanceOf(Error);
 		expect((abandonedError as Error).message).toContain("ACP prompt was abandoned");
+		await expect(prompt(fixture, "blocked until late acknowledgement")).rejects.toMatchObject({
+			code: "conflict",
+		});
 
 		fixture.acknowledgePrompt();
+		await Bun.sleep(10);
 
 		const { pending } = await startTurn(fixture);
 		expect(fixture.correlation()).not.toEqual(stale);

@@ -840,7 +840,13 @@ test("ACP drops a mismatched pre-ack terminal without publication or queries", a
 		);
 		await bounded(fixture.promptDelivered, "prompt delivery");
 		await waitFor(
-			() => errorSpy.mock.calls.some(([event]) => event === "acp_prompt_terminal_dropped"),
+			() =>
+				errorSpy.mock.calls.some(
+					([event, detail]) =>
+						event === "acp_prompt_terminal_dropped" &&
+						(detail as { sessionId?: string; terminalType?: string })?.sessionId === "prompt-terminal-session" &&
+						(detail as { terminalType?: string })?.terminalType === "agent_end",
+				),
 			"deferred mismatched terminal drop log",
 		);
 		expect(errorSpy).toHaveBeenCalledWith("acp_prompt_terminal_dropped", {

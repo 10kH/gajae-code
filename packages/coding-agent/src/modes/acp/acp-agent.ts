@@ -2000,6 +2000,7 @@ export class AcpAgent implements Agent {
 		clearPromptWatchdog(waiter);
 		record.cancelRequested = false;
 		waiter.settled = true;
+		this.#fenceRetiredPromptAcknowledgement(id, waiter);
 		waiter.deferredFrames.length = 0;
 		waiter.deferredActivityFrames.length = 0;
 		waiter.terminal = undefined;
@@ -2384,6 +2385,10 @@ export class AcpAgent implements Agent {
 		);
 	}
 
+	#fenceRetiredPromptAcknowledgement(id: string, waiter: PromptWaiter): void {
+		if (waiter.dispatched && !waiter.acknowledged) this.#retiredPromptAcknowledgements.add(id);
+	}
+
 	#recoverSessionAfterTransportFailure(id: string, adapter: AcpSdkAdapter, error: Error): void {
 		const record = this.#sessions.get(id);
 		if (!record || record.adapter !== adapter) return;
@@ -2542,7 +2547,7 @@ export class AcpAgent implements Agent {
 		if (waiter) {
 			clearPromptWatchdog(waiter);
 			this.#rememberSettledPromptCorrelation(id, record, waiter.correlation);
-			if (!waiter.acknowledged) this.#retiredPromptAcknowledgements.add(id);
+			this.#fenceRetiredPromptAcknowledgement(id, waiter);
 		}
 		waiter?.reject(error);
 		try {
@@ -2956,6 +2961,7 @@ export class AcpAgent implements Agent {
 		record.activePrompt = undefined;
 		clearPromptWatchdog(waiter);
 		waiter.settled = true;
+		this.#fenceRetiredPromptAcknowledgement(id, waiter);
 		waiter.deferredFrames.length = 0;
 		waiter.deferredActivityFrames.length = 0;
 		waiter.terminal = undefined;
