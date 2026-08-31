@@ -1633,8 +1633,6 @@ export class AcpAgent implements Agent {
 		if (!record) throw new AcpSdkAdapterError("not_found", `Unknown session, not found: ${params.sessionId}`);
 		if (record.activePrompt) throw new AcpSdkAdapterError("conflict", "ACP session already has an active prompt.");
 		if (record.authFailure) throw new AcpSdkAdapterError("authentication_failed", record.authFailure);
-		if (record.terminalDrain)
-			throw new AcpSdkAdapterError("conflict", "ACP session is still draining frames from the previous prompt.");
 		if (this.#retiredPromptAcknowledgements.has(params.sessionId))
 			throw new AcpSdkAdapterError(
 				"conflict",
@@ -2416,6 +2414,15 @@ export class AcpAgent implements Agent {
 			this.#retiredPromptAcknowledgements.add(id);
 	}
 
+	#armTerminalDrain(record: SessionRecord): void {
+		const pendingFrames = record.frameTail;
+		let drain: Promise<void>;
+		drain = pendingFrames.finally(() => {
+			if (record.terminalDrain === drain) record.terminalDrain = undefined;
+		});
+		record.terminalDrain = drain;
+	}
+
 	#recoverSessionAfterTransportFailure(id: string, adapter: AcpSdkAdapter, error: Error): void {
 		const record = this.#sessions.get(id);
 		if (!record || record.adapter !== adapter) return;
@@ -2762,12 +2769,6 @@ export class AcpAgent implements Agent {
 		++record.inboundSequence;
 		const received = receivedSdkEvent(frame);
 		if (received?.event.type === "agent_end" || received?.event.type === "agent_failed") {
-			const pendingFrames = record.frameTail;
-			let drain: Promise<void>;
-			drain = pendingFrames.finally(() => {
-				if (record.terminalDrain === drain) record.terminalDrain = undefined;
-			});
-			record.terminalDrain = drain;
 			void this.#handleSdkFrame(id, adapter, frame).catch(async error => {
 				await this.#failSession(id, adapter, this.#frameProcessingFailure(error));
 			});
@@ -2842,6 +2843,7 @@ export class AcpAgent implements Agent {
 				return;
 			}
 			if (activePrompt.terminal) return;
+			this.#armTerminalDrain(record);
 			if (!outcome) {
 				await this.#rejectPrompt(
 					record,
