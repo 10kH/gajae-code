@@ -3352,9 +3352,13 @@ export class AgentSession {
 			const barrier = this.#startupTurnBarrier;
 			if (!barrier) return;
 			await awaitPromptInvocationPreflight(barrier, signal);
-			// Let later reactions to the same readiness promise publish an
-			// extension before deciding the captured barrier is still current.
-			await Promise.resolve();
+			// Drain chained readiness reactions before clearing the captured
+			// barrier. Extensions publish startup dependencies from promise
+			// reactions; re-reading across a bounded microtask drain preserves that
+			// ordering without introducing a timer into startup admission.
+			for (let reaction = 0; reaction < 16 && this.#startupTurnBarrier === barrier; reaction++) {
+				await Promise.resolve();
+			}
 			if (this.#startupTurnBarrier !== barrier) continue;
 			this.#setStartupTurnBarrier(undefined);
 			return;
@@ -4396,7 +4400,6 @@ export class AgentSession {
 				if (dropped.length > 0) this.#settleDeliveredOwnedRegistrations(dropped);
 				const first = survivors[0];
 				if (!first) return;
-				const handedOffToFollowUp = new Set<AgentMessage>();
 				const settleIfDisposing = (): boolean => {
 					if (!this.#isDisposed && !this.#sessionAdmissionClosing && !this.#disposeAbortController.signal.aborted)
 						return false;
@@ -4409,11 +4412,8 @@ export class AgentSession {
 						async () => {
 							if (settleIfDisposing()) return;
 							if (this.isStreaming) {
-								for (const message of survivors) {
-									this.agent.followUp(message);
-									handedOffToFollowUp.add(message);
-								}
-								return;
+								await awaitPromptInvocationPreflight(this.agent.waitForIdle(), signal);
+								if (settleIfDisposing()) return;
 							}
 							if (survivors.some(message => ownedCompletionResumeAction(message) === "fresh"))
 								this.#resumeFromOwnedCompletion();
@@ -4445,7 +4445,7 @@ export class AgentSession {
 					// failure, otherwise repeated failed idle resumptions leak
 					// terminal tuples into the global registries until capacity
 					// is exhausted (review thread P2).
-					this.#settleDeliveredOwnedRegistrations(survivors.filter(message => !handedOffToFollowUp.has(message)));
+					this.#settleDeliveredOwnedRegistrations(survivors);
 				}
 			},
 			scheduleIdleFlush: (run, onSkip) => {

@@ -324,7 +324,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			discovery.resolve(createMcpLoadResult([createMcpCustomTool("mcp__exact_lookup", "exact", "lookup")]));
 			await startup;
 			vi.advanceTimersByTime(0);
-			for (let i = 0; i < 10; i++) await Promise.resolve();
+			for (let i = 0; i < 30; i++) await Promise.resolve();
 			expect(agentPrompt).toHaveBeenCalledTimes(1);
 			vi.advanceTimersByTime(FOLD_WAKE_MERGE_WINDOW_MS);
 			await Promise.resolve();
@@ -355,6 +355,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			expect(agentPrompt).not.toHaveBeenCalled();
 
 			secondBarrier.resolve();
+			vi.advanceTimersByTime(0);
 			await session.waitForIdle();
 			expect(agentPrompt).toHaveBeenCalledTimes(1);
 		} finally {
@@ -397,7 +398,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 				promptAccepted.resolve();
 				await explicitRun.promise;
 			});
-			const followUp = vi.spyOn(session.agent, "followUp");
+			vi.spyOn(session.agent, "waitForIdle").mockImplementation(async () => await explicitRun.promise);
 			session.extendStartupTurnBarrier(barrier.promise);
 			session.yieldQueue.register<string>("startup-prompt-priority-test", {
 				build: entries => ({ role: "user", content: entries.join("\n"), timestamp: Date.now() }),
@@ -412,10 +413,11 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			for (let i = 0; i < 10; i++) await Promise.resolve();
 			expect(agentPrompt).toHaveBeenCalledTimes(1);
 			expect(JSON.stringify(agentPrompt.mock.calls[0]?.[0])).toContain("explicit-before-idle");
-			expect(followUp).toHaveBeenCalledTimes(1);
-			expect(JSON.stringify(followUp.mock.calls[0]?.[0])).toContain("idle-after-explicit");
 			explicitRun.resolve();
 			await explicit;
+			await session.waitForIdle();
+			expect(agentPrompt).toHaveBeenCalledTimes(2);
+			expect(JSON.stringify(agentPrompt.mock.calls[1]?.[0])).toContain("idle-after-explicit");
 		} finally {
 			barrier.resolve();
 			explicitRun.resolve();
@@ -452,6 +454,8 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		try {
 			const agentPrompt = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
 			session.extendStartupTurnBarrier(Promise.resolve());
+			await Promise.resolve();
+			vi.advanceTimersByTime(0);
 			await Promise.resolve();
 			session.yieldQueue.register<string>("settled-startup-wake-test", {
 				build: entries => ({ role: "user", content: entries.join("\n"), timestamp: Date.now() }),
@@ -495,11 +499,13 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			await Promise.resolve();
 
 			firstBarrier.resolve();
+			vi.advanceTimersByTime(0);
 			await firstSession.waitForIdle();
 			expect(firstPrompt).toHaveBeenCalledTimes(1);
 			expect(secondPrompt).not.toHaveBeenCalled();
 
 			secondBarrier.resolve();
+			vi.advanceTimersByTime(0);
 			await secondSession.waitForIdle();
 			expect(secondPrompt).toHaveBeenCalledTimes(1);
 		} finally {
