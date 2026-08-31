@@ -198,6 +198,7 @@ export class OAuthSelectorComponent extends Container {
 		try {
 			isValid = await this.#validateAuthCallback(providerId);
 		} catch (error) {
+			if (generation !== this.#validationGeneration) return;
 			if (this.#onValidationError?.(error)) return;
 			isValid = false;
 		}

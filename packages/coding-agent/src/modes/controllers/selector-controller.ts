@@ -5,6 +5,7 @@ import {
 	type AuthCredentialSelector,
 	type CredentialRemovalTarget,
 	isSqliteCorruptionError,
+	isSqliteError,
 	type Model,
 	resolveOAuthStorageProvider,
 } from "@gajae-code/ai/core";
@@ -127,6 +128,12 @@ import {
 	logCredentialAutoImportFailures,
 	runExternalCredentialAutoImport,
 } from "../../setup/credential-auto-import";
+
+function credentialStoreOperationError(action: "Login" | "Logout", error: unknown): string {
+	const code = error && typeof error === "object" ? (error as { code?: unknown }).code : undefined;
+	return `${action} failed: credential store operation failed${typeof code === "string" ? ` (${code})` : ""}.`;
+}
+
 import {
 	filterAutoImportOAuthCredentials,
 	formatDiscoverySummary,
@@ -1375,7 +1382,7 @@ export class SelectorController {
 						this.ctx.session.credentialSessionId,
 					);
 				} catch (error) {
-					if (isSqliteCorruptionError(error)) throw error;
+					if (isSqliteError(error)) throw error;
 				}
 			}),
 		);
@@ -3686,8 +3693,10 @@ export class SelectorController {
 				await this.#handleLogout(selectedProviderId);
 				return;
 			} catch (error: unknown) {
-				if (!isSqliteCorruptionError(error)) throw error;
-				this.ctx.showError(CREDENTIAL_STORE_UNREADABLE_MESSAGE);
+				if (isSqliteCorruptionError(error)) this.ctx.showError(CREDENTIAL_STORE_UNREADABLE_MESSAGE);
+				else if (isSqliteError(error))
+					this.ctx.showError(credentialStoreOperationError(mode === "login" ? "Login" : "Logout", error));
+				else throw error;
 				return;
 			}
 		}
@@ -3704,8 +3713,9 @@ export class SelectorController {
 					return;
 				}
 			} catch (error: unknown) {
-				if (!isSqliteCorruptionError(error)) throw error;
-				this.ctx.showError(CREDENTIAL_STORE_UNREADABLE_MESSAGE);
+				if (isSqliteCorruptionError(error)) this.ctx.showError(CREDENTIAL_STORE_UNREADABLE_MESSAGE);
+				else if (isSqliteError(error)) this.ctx.showError(credentialStoreOperationError("Logout", error));
+				else throw error;
 				return;
 			}
 		}
@@ -3853,10 +3863,14 @@ export class SelectorController {
 							return !!apiKey;
 						},
 						onValidationError: error => {
-							if (!isSqliteCorruptionError(error)) return false;
+							if (!isSqliteError(error)) return false;
 							selector.stopValidation();
 							done();
-							this.ctx.showError(CREDENTIAL_STORE_UNREADABLE_MESSAGE);
+							this.ctx.showError(
+								isSqliteCorruptionError(error)
+									? CREDENTIAL_STORE_UNREADABLE_MESSAGE
+									: credentialStoreOperationError("Login", error),
+							);
 							return true;
 						},
 						requestRender: () => {

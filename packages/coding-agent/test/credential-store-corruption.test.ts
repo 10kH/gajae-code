@@ -289,9 +289,32 @@ describe("credential corruption presentation", () => {
 		await Bun.sleep(0);
 		expect(errors).toEqual([CREDENTIAL_STORE_UNREADABLE_MESSAGE]);
 		selector.dispose();
+
+		const pending = Promise.withResolvers<boolean>();
+		const staleErrors: unknown[] = [];
+		const staleSelector = new OAuthSelectorComponent(
+			"login",
+			{
+				hasAuth: (provider: string) => provider === "anthropic",
+				getGeneration: () => 1,
+			} as never,
+			() => undefined,
+			() => undefined,
+			{
+				validateAuth: () => pending.promise,
+				onValidationError: error => {
+					staleErrors.push(error);
+					return true;
+				},
+			},
+		);
+		staleSelector.dispose();
+		pending.reject(corruption);
+		await Bun.sleep(0);
+		expect(staleErrors).toEqual([]);
 	});
 
-	test("bare /logout maps known corruption but does not mask arbitrary refresh failures", async () => {
+	test("bare /logout maps corruption, surfaces SQLite busy, and contains provider failures", async () => {
 		const errors: string[] = [];
 		const corruptionController = new SelectorController({
 			session: {
@@ -306,6 +329,20 @@ describe("credential corruption presentation", () => {
 		} as never);
 		await expect(corruptionController.showOAuthSelector("logout")).resolves.toBeUndefined();
 		expect(errors).toEqual([CREDENTIAL_STORE_UNREADABLE_MESSAGE]);
+
+		const busyController = new SelectorController({
+			session: {
+				credentialSessionId: "credential-session",
+				modelRegistry: {
+					getApiKeyForProvider: async () => {
+						throw Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" });
+					},
+				},
+			},
+			showError: (message: string) => errors.push(message),
+		} as never);
+		await expect(busyController.showOAuthSelector("logout")).resolves.toBeUndefined();
+		expect(errors.at(-1)).toBe("Logout failed: credential store operation failed (SQLITE_BUSY).");
 
 		const arbitraryFailure = new Error("credential refresh transport failed");
 		const arbitraryController = new SelectorController({
@@ -322,7 +359,7 @@ describe("credential corruption presentation", () => {
 			showError: () => errors.push("unexpected arbitrary error"),
 		} as never);
 		await expect(arbitraryController.showOAuthSelector("logout")).resolves.toBeUndefined();
-		expect(errors).toEqual([CREDENTIAL_STORE_UNREADABLE_MESSAGE]);
+		expect(errors).not.toContain("unexpected arbitrary error");
 	});
 
 	test("provider /login contains SQLITE_CORRUPT without closing or rewriting the credential store", async () => {
