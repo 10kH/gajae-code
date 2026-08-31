@@ -1593,6 +1593,8 @@ async function reclaimStaleTransitionClaim(transitionDir: string, quarantineName
 		root.ctimeNs !== String(generation.ctimeNs)
 	)
 		return;
+	const ownerRemoval = exactUnlinkOwnerRecord(`${transitionDir}.owner`, ownerSnapshot, quarantineName);
+	if (ownerRemoval !== "removed" && ownerRemoval !== "absent") return;
 	const removed = nativeSessionStateLock().exactRemoveDirectoryTree(nativePath, captured.snapshot);
 	if (removed.ok || removed.code === "not_found") return;
 	if (
