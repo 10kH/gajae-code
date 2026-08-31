@@ -100,6 +100,26 @@ describe("YieldQueue", () => {
 		expect(harness.scheduledFlushes).toHaveLength(2);
 	});
 
+	test("a stale skipped callback cannot clear newer flush ownership", async () => {
+		const harness = createHarness(false);
+		harness.queue.register<Entry>("items", {
+			build: entries => userMessage(entries.map(entry => entry.id).join(",")),
+		});
+
+		harness.queue.enqueue("items", { id: "aborted" });
+		expect(harness.scheduledFlushes).toHaveLength(1);
+		harness.queue.clear();
+		harness.queue.enqueue("items", { id: "fresh" });
+		expect(harness.scheduledFlushes).toHaveLength(2);
+
+		harness.scheduledFlushes[0]!.onSkip();
+		harness.queue.enqueue("items", { id: "coalesced" });
+		expect(harness.scheduledFlushes).toHaveLength(2);
+
+		await harness.scheduledFlushes[1]!.run();
+		expect(harness.idleBatches[0]?.map(messageText)).toEqual(["fresh,coalesced"]);
+	});
+
 	test("isStale drops stale entries and keeps survivors", async () => {
 		const harness = createHarness(true);
 		let survivorIds: string[] = [];

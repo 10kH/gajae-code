@@ -13942,6 +13942,7 @@ export class AgentSession {
 		this.#abortUnwind = unwind.promise;
 		try {
 			this.#abortOptions(options);
+			this.#drainTerminalOwnedYieldEntries();
 			const postPromptDrain = this.#cancelPostPromptTasks();
 			const managedLogicalRunId =
 				this.#defaultFallbackChain().chain.entries.length > 1 ? this.agent.currentManagedLogicalRunId : undefined;

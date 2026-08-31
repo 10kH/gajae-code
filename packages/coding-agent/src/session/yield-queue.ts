@@ -40,6 +40,7 @@ export class YieldQueue {
 	readonly #dispatchers = new Map<string, StoredDispatcher>();
 	readonly #entries = new Map<string, unknown[]>();
 	#idleFlushPending = false;
+	#idleFlushPendingOwner: symbol | undefined;
 
 	constructor(options: YieldQueueOptions) {
 		this.#options = options;
@@ -86,6 +87,7 @@ export class YieldQueue {
 	async flush(mode: YieldFlushMode, signal?: AbortSignal): Promise<void> {
 		if (mode === "idle") {
 			this.#idleFlushPending = false;
+			this.#idleFlushPendingOwner = undefined;
 		}
 		const idleMessages: AgentMessage[] = [];
 		for (const [kind, dispatcher] of this.#dispatchers) {
@@ -119,6 +121,7 @@ export class YieldQueue {
 		}
 		this.#entries.clear();
 		this.#idleFlushPending = false;
+		this.#idleFlushPendingOwner = undefined;
 	}
 
 	/** Drop only the queued entries of a single kind, leaving other kinds intact. */
@@ -144,19 +147,21 @@ export class YieldQueue {
 	#scheduleIdleFlush(): void {
 		if (this.#idleFlushPending) return;
 		this.#idleFlushPending = true;
-		try {
-			this.#options.scheduleIdleFlush(
-				async signal => {
-					this.#idleFlushPending = false;
-					if (this.#options.isStreaming()) return;
-					await this.flush("idle", signal);
-				},
-				() => {
-					this.#idleFlushPending = false;
-				},
-			);
-		} catch (error) {
+		const owner = Symbol("idle-flush");
+		this.#idleFlushPendingOwner = owner;
+		const releaseOwner = () => {
+			if (this.#idleFlushPendingOwner !== owner) return;
+			this.#idleFlushPendingOwner = undefined;
 			this.#idleFlushPending = false;
+		};
+		try {
+			this.#options.scheduleIdleFlush(async signal => {
+				releaseOwner();
+				if (this.#options.isStreaming()) return;
+				await this.flush("idle", signal);
+			}, releaseOwner);
+		} catch (error) {
+			releaseOwner();
 			logger.warn("Yield queue idle flush scheduling failed", { error: formatError(error) });
 		}
 	}
