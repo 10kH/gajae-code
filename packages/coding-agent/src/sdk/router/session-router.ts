@@ -3,9 +3,11 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { logger, resolveEquivalentPath } from "@gajae-code/utils";
 import {
+	canonicalSessionCwd,
 	SessionIndex as DefaultSessionIndex,
 	type IndexedSession,
 	isSessionAuthorityEligible,
+	resolveSessionLocator,
 	type SessionIndex,
 } from "../broker/session-index";
 import { cancellableSleep, lifecycleRequestTimeoutMs } from "../broker/startup-budget";
@@ -258,6 +260,8 @@ export type SessionRouterProviderDeps = Pick<
 
 export interface SessionRouterOptions {
 	agentDir: string;
+	/** Limits attachment to exact ids selected by a Broker-scoped operation. */
+	sessionIds?: readonly string[];
 	deps?: SessionRouterDeps;
 	/** Runtime-specific identity validation; Router supplies a conservative fallback. */
 	correlateFrame?: SessionRouterFrameCorrelator;
@@ -565,6 +569,7 @@ type AdoptedSession = {
  */
 export class SessionRouter {
 	readonly #agentDir: string;
+	readonly #sessionIds: ReadonlySet<string> | undefined;
 	readonly #deps: SessionRouterDeps;
 	readonly #correlateFrame: SessionRouterFrameCorrelator;
 	readonly #index: SessionIndex;
@@ -603,6 +608,7 @@ export class SessionRouter {
 
 	constructor(options: SessionRouterOptions) {
 		this.#agentDir = options.agentDir;
+		this.#sessionIds = options.sessionIds === undefined ? undefined : new Set(options.sessionIds);
 		this.#deps = options.deps ?? {};
 		this.#correlateFrame = options.correlateFrame ?? fallbackCorrelation;
 		this.#index = this.#deps.createIndex?.(options.agentDir) ?? new DefaultSessionIndex(options.agentDir);
@@ -753,11 +759,11 @@ export class SessionRouter {
 				"pre_send",
 				"Broker lifecycle result omitted an exact session endpoint authority.",
 			);
-		const repo = path.resolve(fallback.cwd);
-		const stateRoot = path.join(repo, ".gjc", "state");
+		const cwd = await canonicalSessionCwd(fallback.cwd);
+		const stateRoot = path.join(cwd, ".gjc", "state");
 		const indexed: IndexedSession = {
 			sessionId,
-			locator: { repo, stateRoot },
+			locator: await resolveSessionLocator(cwd, stateRoot),
 			endpointGeneration,
 			pid,
 			endpointMtimeMs,
@@ -1206,7 +1212,11 @@ export class SessionRouter {
 		const live =
 			indexed.warnings.length === 0
 				? indexed.sessions.filter(
-						session => session.live && isSessionAuthorityEligible(session) && !session.terminalUncertain,
+						session =>
+							session.live &&
+							isSessionAuthorityEligible(session) &&
+							!session.terminalUncertain &&
+							(this.#sessionIds === undefined || this.#sessionIds.has(session.sessionId)),
 					)
 				: [];
 		const liveIds = new Set(live.map(session => session.sessionId));
@@ -1361,15 +1371,11 @@ export class SessionRouter {
 		indexed: IndexedSession,
 	): Promise<{ endpoint: SdkSessionEndpoint; identity: SessionEndpointIdentity } | null> {
 		if (!isSessionAuthorityEligible(indexed)) return null;
-		const repo = path.resolve(indexed.locator.repo);
-		const defaultStateRoot = path.join(repo, ".gjc", "state");
-		// The session index stores the lifecycle caller's lexical cwd in `locator.repo`
-		// (reconcileReadyScope re-scopes only that field) while `locator.stateRoot` is
-		// the host process's physical path, because process.cwd() resolves symlinks.
-		// The scope test therefore compares path identity, not spelling: a lexical
-		// match fails for every symlinked cwd (macOS /var -> /private/var,
-		// /home/jun/desk -> /data/Lina-Desk), the adopted attachment is retired on
-		// reconcile, and session/new surfaces "lost exact Router authority".
+		const cwd = indexed.locator.cwd;
+		const defaultStateRoot = path.join(cwd, ".gjc", "state");
+		// Locator cwd is already canonical. `stateRoot` remains the host-provided
+		// authority path, so this comparison resolves equivalent paths only for the
+		// state-root identity boundary; cwd never retains lexical symlink spellings.
 		const indexedStateRoot = resolveEquivalentPath(indexed.locator.stateRoot);
 		const scope =
 			indexedStateRoot === resolveEquivalentPath(defaultStateRoot)
@@ -1378,9 +1384,9 @@ export class SessionRouter {
 					? "chat"
 					: undefined;
 		if (!scope || indexed.endpointMtimeMs === undefined || !Number.isFinite(indexed.endpointMtimeMs)) return null;
-		const endpointPath = path.join(endpointDirectory(repo, scope), `${indexed.sessionId}.json`);
+		const endpointPath = path.join(endpointDirectory(cwd, scope), `${indexed.sessionId}.json`);
 		const endpointIdentity = await lstatEndpoint(endpointPath);
-		const endpoint = await readSdkSessionEndpoint(repo, indexed.sessionId, scope);
+		const endpoint = await readSdkSessionEndpoint(cwd, indexed.sessionId, scope);
 		if (!endpoint || endpoint.stale || endpoint.pid !== indexed.pid) return null;
 		if (!endpointIdentity || endpointIdentity.mtimeMs !== indexed.endpointMtimeMs) return null;
 		// Identity is proven INSIDE this authority read (#4730 review): sampling it

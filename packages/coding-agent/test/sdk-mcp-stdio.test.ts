@@ -54,7 +54,7 @@ test("shipped MCP stdio advertises confirm and forwards confirmed destructive co
 		await index.append({
 			type: "host_registered",
 			sessionId,
-			locator: { repo, stateRoot },
+			locator: { cwd: repo, worktreeRoot: null, stateRoot },
 			endpointGeneration: 1,
 			pid: process.pid,
 			endpointMtimeMs,
@@ -62,7 +62,7 @@ test("shipped MCP stdio advertises confirm and forwards confirmed destructive co
 		await index.append({
 			type: "host_heartbeat",
 			sessionId,
-			locator: { repo, stateRoot },
+			locator: { cwd: repo, worktreeRoot: null, stateRoot },
 			endpointGeneration: 1,
 			pid: process.pid,
 			endpointMtimeMs,

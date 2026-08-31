@@ -30,6 +30,11 @@ async function waitForProcessExit(pid: number): Promise<void> {
 	for (let attempt = 0; attempt < 50; attempt += 1) {
 		try {
 			process.kill(pid, 0);
+			if (isLinux) {
+				const stat = fsSync.readFileSync(`/proc/${pid}/stat`, "utf8");
+				const state = stat.slice(stat.lastIndexOf(")") + 2, stat.lastIndexOf(")") + 3);
+				if (state === "Z") return;
+			}
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
 			throw error;
@@ -37,6 +42,17 @@ async function waitForProcessExit(pid: number): Promise<void> {
 		await new Promise(resolve => setTimeout(resolve, 20));
 	}
 	throw new Error(`owner process did not terminate: ${pid}`);
+}
+
+function processGoneOrZombie(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		if (!isLinux) return false;
+		const stat = fsSync.readFileSync(`/proc/${pid}/stat`, "utf8");
+		return stat.slice(stat.lastIndexOf(")") + 2, stat.lastIndexOf(")") + 3) === "Z";
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "ESRCH";
+	}
 }
 
 function run(args: string[], env: NodeJS.ProcessEnv): void {
@@ -232,7 +248,7 @@ try {
 			readProcessStartTime: async pid => procStartTime(pid),
 		});
 		await waitForProcessExit(panePid);
-		expect(() => process.kill(panePid, 0)).toThrow(/ESRCH/);
+		expect(processGoneOrZombie(panePid)).toBe(true);
 		expect(hasSession(sessionName).exitCode).not.toBe(0);
 		expect(hasSession(siblingSessionName).exitCode).toBe(0);
 		const verdict = JSON.parse(

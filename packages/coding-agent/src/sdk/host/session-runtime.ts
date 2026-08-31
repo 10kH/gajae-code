@@ -37,8 +37,15 @@ import {
 	settleOwnedWork,
 } from "../../session/terminal-abort";
 import { parseThinkingLevel } from "../../thinking";
+import { readEndpointFile } from "../broker/endpoint-authority";
 import { ensureBroker } from "../broker/ensure";
-import { SessionIndex } from "../broker/session-index";
+import { processIncarnation } from "../broker/process-incarnation";
+import {
+	type MasterRoleAttestationV2,
+	resolveSessionLocator,
+	SessionIndex,
+	type SessionLocatorV2,
+} from "../broker/session-index";
 import {
 	parseSyntheticModelId,
 	resolveSyntheticModelSelection,
@@ -107,6 +114,65 @@ const SDK_ONLY_TERMINAL_PUBLICATION_WAIT_MS = 1_000;
  *  after this bound are abandoned — their durable broker state is the recovery
  *  authority, and outcomes are inherently uncertain. */
 const GATE_RESOLUTION_QUIESCENCE_MS = 5_000;
+/** Master verification fields are ephemeral protocol values, not unbounded input. */
+const MASTER_AUTH_VALUE_MAX_LENGTH = 512;
+const MASTER_AUTH_VALUE_PATTERN = /^[A-Za-z0-9_-]+$/u;
+/** Keep replay protection finite even when an authenticated client floods nonces. */
+const MASTER_NONCE_REPLAY_MAX_ENTRIES = 1_024;
+/** Verification exchanges complete in seconds; retain replay evidence for a bounded window. */
+const MASTER_NONCE_REPLAY_TTL_MS = 5 * 60_000;
+
+export type MasterCapabilityReplayState = Map<string, number>;
+
+export function verifyMasterCapabilityFrame(input: {
+	frame: { nonce: unknown; attestationEpoch: unknown; capability: unknown };
+	expectedCapability: string | undefined;
+	expectedEpoch: string | undefined;
+	replay: MasterCapabilityReplayState;
+	now?: number;
+}): { ok: boolean; nonce: string; attestationEpoch: string } {
+	const now = input.now ?? Date.now();
+	for (const [consumedNonce, expiresAt] of input.replay) {
+		if (expiresAt <= now) input.replay.delete(consumedNonce);
+	}
+	const bounded = (value: unknown): value is string =>
+		typeof value === "string" &&
+		value.length > 0 &&
+		value.length <= MASTER_AUTH_VALUE_MAX_LENGTH &&
+		MASTER_AUTH_VALUE_PATTERN.test(value);
+	const nonce = bounded(input.frame.nonce) ? input.frame.nonce : "";
+	const epoch = bounded(input.frame.attestationEpoch) ? input.frame.attestationEpoch : "";
+	const capability = bounded(input.frame.capability) ? input.frame.capability : "";
+	const expectedCapability = bounded(input.expectedCapability) ? input.expectedCapability : "";
+	const expectedEpoch = bounded(input.expectedEpoch) ? input.expectedEpoch : "";
+	const authenticatedFields =
+		bounded(input.frame.nonce) &&
+		bounded(input.frame.attestationEpoch) &&
+		bounded(input.frame.capability) &&
+		bounded(input.expectedCapability) &&
+		bounded(input.expectedEpoch) &&
+		epoch === expectedEpoch;
+	const expectedBytes = Buffer.from(expectedCapability);
+	const capabilityBytes = Buffer.from(capability);
+	const capabilityMatches =
+		authenticatedFields &&
+		expectedBytes.length === capabilityBytes.length &&
+		crypto.timingSafeEqual(expectedBytes, capabilityBytes);
+	const reusable = capabilityMatches && !input.replay.has(nonce);
+	if (reusable) {
+		if (input.replay.size >= MASTER_NONCE_REPLAY_MAX_ENTRIES) {
+			const oldest = input.replay.keys().next().value;
+			if (typeof oldest === "string") input.replay.delete(oldest);
+		}
+		input.replay.set(nonce, now + MASTER_NONCE_REPLAY_TTL_MS);
+	}
+	return {
+		ok: reusable,
+		nonce,
+		attestationEpoch: authenticatedFields ? epoch : "",
+	};
+}
+
 /** Maximum time a replaced runtime may retain a lifecycle persistence task. */
 const LIFECYCLE_QUIESCENCE_MS = 1_000;
 
@@ -146,6 +212,8 @@ export interface SessionSdkRuntimeOptions
 	settings?: Settings;
 	/** Mutable shadow of patched config values merged into query readback. */
 	configOverrides?: Map<string, unknown>;
+	/** Stable master lineage identity retained across session switches/branches. */
+	masterOwnerSessionId?: string;
 }
 
 export interface SdkOnlyInvocationRecord extends InvocationCorrelation {
@@ -415,6 +483,12 @@ export interface CreateSdkSessionRuntimeOptions {
 	onSdkRequest?: SessionSdkHostOptions["onRequest"];
 	/** Mutable shadow of patched config values merged into query readback. */
 	configOverrides?: Map<string, unknown>;
+	/** In-memory master capability for private broker verification only. */
+	masterCapability?: string;
+	/** Opaque direct-role epoch this effective host may adopt. */
+	masterAttestationEpoch?: string;
+	/** Stable master lineage identity retained across session switches/branches. */
+	masterOwnerSessionId?: string;
 	/** Private session-owned terminal-abort capabilities; never exposed on ExtensionContext. */
 	terminalAbortSeams?: SdkOnlyTerminalAbortSeams;
 	/** Callback when a frame is admitted to the runtime (test harness). */
@@ -3429,6 +3503,107 @@ export function registerSdkOnlyNotificationCommand(api: ExtensionAPI): void {
 	});
 }
 
+export function masterAttestationForEffectiveHost(input: {
+	masterCapability: string | undefined;
+	attestationEpoch: string | undefined;
+	ownerSessionId?: string;
+	sessionId: string;
+	pid: number;
+	processIncarnation: string | undefined;
+	direct: MasterRoleAttestationV2 | undefined;
+}): MasterRoleAttestationV2 | undefined {
+	const direct = input.direct;
+	if (
+		input.masterCapability === undefined ||
+		input.attestationEpoch === undefined ||
+		direct === undefined ||
+		direct.ownerSessionId !== (input.ownerSessionId ?? input.sessionId) ||
+		direct.launchPid !== input.pid ||
+		direct.launchProcessIncarnation !== input.processIncarnation ||
+		direct.attestationEpoch !== input.attestationEpoch
+	)
+		return undefined;
+	return direct;
+}
+
+function masterDirectAttestation(input: {
+	masterCapability: string | undefined;
+	attestationEpoch: string | undefined;
+	ownerSessionId?: string;
+	sessionId: string;
+	pid: number;
+	processIncarnation: string | undefined;
+}): MasterRoleAttestationV2 | undefined {
+	if (
+		input.masterCapability === undefined ||
+		input.attestationEpoch === undefined ||
+		input.processIncarnation === undefined
+	)
+		return undefined;
+	return {
+		version: 2,
+		ownerSessionId: input.ownerSessionId ?? input.sessionId,
+		launchPid: input.pid,
+		launchProcessIncarnation: input.processIncarnation,
+		role: "master",
+		attestationEpoch: input.attestationEpoch,
+	};
+}
+
+function sameMasterAttestation(left: MasterRoleAttestationV2, right: MasterRoleAttestationV2): boolean {
+	return (
+		left.version === right.version &&
+		left.ownerSessionId === right.ownerSessionId &&
+		left.launchPid === right.launchPid &&
+		left.launchProcessIncarnation === right.launchProcessIncarnation &&
+		left.role === right.role &&
+		left.attestationEpoch === right.attestationEpoch
+	);
+}
+
+/**
+ * Establish direct master authority for the session currently hosted by this
+ * process. Session identity transitions retain the master capability and epoch
+ * but require a new direct attestation before their effective endpoint can
+ * adopt that authority.
+ */
+export async function reattestMasterSessionIdentity(input: {
+	index: SessionIndex;
+	locator: SessionLocatorV2;
+	masterCapability: string | undefined;
+	attestationEpoch: string | undefined;
+	ownerSessionId?: string;
+	sessionId: string;
+	pid: number;
+	processIncarnation: string | undefined;
+}): Promise<MasterRoleAttestationV2 | undefined> {
+	const masterRole = masterDirectAttestation(input);
+	if (!masterRole) return undefined;
+	const directExists = input.index.listSessionIdentities().some(row => {
+		const processIdentity = row.hostIncarnation ?? row.processIncarnation;
+		return (
+			row.sessionId === input.sessionId &&
+			row.endpointGeneration === 0 &&
+			row.pid === input.pid &&
+			processIdentity === input.processIncarnation &&
+			row.masterRole !== undefined &&
+			sameMasterAttestation(row.masterRole, masterRole)
+		);
+	});
+	if (!directExists) {
+		await input.index.append({
+			type: "host_registered",
+			sessionId: input.sessionId,
+			locator: input.locator,
+			endpointGeneration: 0,
+			pid: input.pid,
+			processIncarnation: input.processIncarnation,
+			masterRole,
+		});
+	}
+	return masterRole;
+}
+
 function quiescingFrame(frame: Record<string, unknown>): Record<string, unknown> | undefined {
 	const error = { code: "session_quiescing", message: "The session endpoint is being replaced." };
 	const id = typeof frame.id === "string" ? frame.id : "";
@@ -4189,6 +4364,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		await current.registerBroker();
 		current.runtime.emitEvent({ type: "turn_start", sessionId: ctx.sessionManager.getSessionId() });
 	});
+	const consumedMasterNonces = new Map<string, number>();
 	api.on("turn_end", (_event, ctx) =>
 		lifecycleStateForContext(ctx, "agent_end")?.runtime.emitEvent({
 			type: "turn_end",
@@ -4748,6 +4924,13 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		};
 		runtime = new SessionSdkSessionRuntime({
 			transport,
+			masterCapabilityVerify: frame =>
+				verifyMasterCapabilityFrame({
+					frame,
+					expectedCapability: options.masterCapability,
+					expectedEpoch: options.masterAttestationEpoch,
+					replay: consumedMasterNonces,
+				}),
 			onFrameAdmission: (_connectionId, frame) =>
 				inputGate.quiescing ? quiescingFrame(frame as Record<string, unknown>) : undefined,
 			control: async (connectionId, frame) => {
@@ -4855,18 +5038,60 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const disposeGate = ctx.workflowGate?.onGateEmitted?.(gate =>
 			runtime.emitEvent({ kind: "workflow_gate", payload: gate }),
 		);
+		let publishedEndpointUrl: string | undefined;
 		let brokerRegistered = false;
 		const registerBroker = async (): Promise<void> => {
 			if (brokerRegistered) return;
 			try {
 				await ensureBroker({ agentDir: options.agentDir });
 				const index = await new SessionIndex(options.agentDir).open();
-				const locator = { repo: path.resolve(ctx.cwd), stateRoot };
+				const locator = await resolveSessionLocator(ctx.cwd, stateRoot);
+				const effectiveIncarnation = processIncarnation(process.pid);
+				const direct = await reattestMasterSessionIdentity({
+					index,
+					locator,
+					masterCapability: options.masterCapability,
+					attestationEpoch: options.masterAttestationEpoch,
+					ownerSessionId: options.masterOwnerSessionId,
+					sessionId,
+					pid: process.pid,
+					processIncarnation: effectiveIncarnation,
+				});
 				await runtime.registerWithBroker({
 					register: async input => {
-						const endpointMtimeMs = (await fs.stat(path.join(input.stateRoot, "sdk", `${input.sessionId}.json`)))
-							.mtimeMs;
-						await index.append({ type: "host_registered", ...input, locator, pid: process.pid, endpointMtimeMs });
+						if (publishedEndpointUrl === undefined)
+							throw new Error("SDK transport endpoint was not published before broker registration.");
+						const endpointPath = path.join(input.stateRoot, "sdk", `${input.sessionId}.json`);
+						const file = await readEndpointFile(endpointPath);
+						if (!file) throw new Error("SDK endpoint could not be read as a stable regular file.");
+						const endpoint = JSON.parse(file.source) as Record<string, unknown>;
+						if (
+							endpoint.sessionId !== input.sessionId ||
+							endpoint.pid !== process.pid ||
+							endpoint.url !== publishedEndpointUrl ||
+							endpoint.token !== transport.token
+						)
+							throw new Error("SDK endpoint did not match the published transport authority.");
+						const endpointMtimeMs = file.mtimeMs;
+						const endpointFileId = `${file.dev}:${file.ino}`;
+						const masterRole = masterAttestationForEffectiveHost({
+							masterCapability: options.masterCapability,
+							attestationEpoch: options.masterAttestationEpoch,
+							ownerSessionId: options.masterOwnerSessionId,
+							sessionId: input.sessionId,
+							pid: process.pid,
+							processIncarnation: effectiveIncarnation,
+							direct,
+						});
+						await index.append({
+							type: "host_registered",
+							...input,
+							locator,
+							pid: process.pid,
+							endpointMtimeMs,
+							endpointFileId,
+							...(masterRole ? { masterRole } : {}),
+						});
 					},
 					unregister: async input => {
 						await index.append({ type: "host_unregistered", ...input, locator, pid: process.pid });
@@ -4908,7 +5133,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		lifecycleOwnerHolder.state = runtimeOwner;
 		active = runtimeOwner;
 		try {
-			await runtime.start();
+			publishedEndpointUrl = (await runtime.start()).url;
 			await registerBroker();
 		} catch (error) {
 			active = undefined;

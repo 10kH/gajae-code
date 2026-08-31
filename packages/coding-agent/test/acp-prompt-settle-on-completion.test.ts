@@ -190,7 +190,7 @@ async function createFixture(
 						await index.append({
 							type: "host_registered",
 							sessionId,
-							locator: { repo: cwd, stateRoot: path.join(cwd, ".gjc", "state") },
+							locator: { cwd: cwd, worktreeRoot: null, stateRoot: path.join(cwd, ".gjc", "state") },
 							endpointGeneration: 1,
 							pid: process.pid,
 							endpointMtimeMs,

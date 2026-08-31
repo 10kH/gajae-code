@@ -23,9 +23,9 @@ never prints. `--agent-dir` selects the broker state directory.
 - `gjc sdk session list` — broker `session.list` projected to the versioned,
   credential-free row DTO (session id, locator, pid, liveness, tombstone,
   activity, heartbeat, identity provenance, ambiguity).
-- `gjc sdk session inspect <sessionId>` — one indexed row; when the broker is
-  absent, falls back to a credential-free offline projection from the local
-  endpoint discovery record.
+- `gjc sdk session inspect <sessionId>` — one indexed row from the broker. It
+  never reads endpoint discovery records directly: a missing or unavailable
+  broker fails closed rather than exposing endpoint authority outside SDK core.
 - `gjc sdk session send <sessionId> --text <prompt>` — ordered `turn.prompt`
   carrying a caller-chosen operation reference (ULID). `--wait` polls
   `turn.result` with `kind: "prompt"` until terminal or the wait window elapses;
@@ -60,3 +60,27 @@ mechanism.
 `tail` reports a `retention_gap` with the missing sequence range and a
 `resync` checkpoint when retained history or the event ring dropped entries;
 `--strict` turns any gap into exit code 1.
+
+## Scoped search
+
+`gjc sdk search [--scope repo|pwd|global] [--json]` lists broker-visible
+sessions inside one exact scope (default `repo`: the identical canonical Git
+worktree, never a path prefix). Every result carries a scope/status envelope
+(requested and resolved scope, `populated`, `empty`, `not-in-git-worktree`,
+or `unavailable`); empty and non-Git results exit 0 and never fall back to a
+wider scope. Rows are probed after scoping (`reachable`, `unreachable`,
+`stale`) without printing endpoint credentials.
+
+## Local-only spawn
+
+`gjc sdk spawn --cwd <dir> --prompt <task> [--model <selector>] [--profile <name>]`
+creates one task-seeded background child through the broker and is legal only
+inside a live interactive `gjc --master` session. Each invocation uses a fresh
+idempotency identity: one identity yields at most one child and one seed
+prompt, replays return stored outcomes, and a semantically new task requires a
+new invocation. `spawn_in_progress` and `terminal_uncertain` are honest
+states, never retry triggers. The task and master capability never persist in
+broker state, logs, or output; spawn is prohibited on MCP, ACP, daemon CLI/raw,
+Telegram, Discord, and Slack surfaces. Clean up children through the standard
+`session.close` path; orphaned children are reaped after
+`sdk.masterOrphanGraceMs`.

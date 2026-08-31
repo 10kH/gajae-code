@@ -37,7 +37,7 @@ async function appendSessionIndexEvent(agentDir: string): Promise<void> {
 	await index.append({
 		type: "host_registered",
 		sessionId: "gc-session",
-		locator: { repo: "/tmp/repo", stateRoot: "/tmp/state" },
+		locator: { cwd: "/tmp/repo", worktreeRoot: null, stateRoot: "/tmp/state" },
 		endpointGeneration: 1,
 		pid: process.pid,
 		endpointMtimeMs: Date.now(),

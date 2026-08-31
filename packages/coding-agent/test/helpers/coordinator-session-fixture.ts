@@ -212,7 +212,7 @@ export function fixtureBrokerRows(
 } {
 	const base = {
 		sessionId,
-		locator: { repo: root },
+		locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
 		endpointGeneration: FIXTURE_ENDPOINT_GENERATION,
 		pid: process.pid,
 		endpointMtimeMs: FIXTURE_ENDPOINT_MTIME_MS,

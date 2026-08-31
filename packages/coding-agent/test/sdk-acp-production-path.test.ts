@@ -165,8 +165,16 @@ test("production ACP routes zero-session SDK globals through the broker adapter"
 });
 
 test("production ACP drains session.list continuation pages before returning sessions", async () => {
-	const pageOne = { sessionId: "page-one", locator: { repo: "/workspace" }, live: true };
-	const pageTwo = { sessionId: "page-two", locator: { repo: "/workspace" }, live: false };
+	const pageOne = {
+		sessionId: "page-one",
+		locator: { cwd: "/workspace", worktreeRoot: null, stateRoot: "/workspace/.gjc/state" },
+		live: true,
+	};
+	const pageTwo = {
+		sessionId: "page-two",
+		locator: { cwd: "/workspace", worktreeRoot: null, stateRoot: "/workspace/.gjc/state" },
+		live: false,
+	};
 	const fixture = await createSessionListBroker(input =>
 		input.cursor === undefined
 			? { ok: true, result: { sessions: [pageOne], continuationCursor: "page-2" } }
@@ -186,7 +194,11 @@ test("production ACP drains session.list continuation pages before returning ses
 });
 
 test("production ACP rejects an ok:false session.list continuation instead of returning page one", async () => {
-	const pageOne = { sessionId: "page-one", locator: { repo: "/workspace" }, live: true };
+	const pageOne = {
+		sessionId: "page-one",
+		locator: { cwd: "/workspace", worktreeRoot: null, stateRoot: "/workspace/.gjc/state" },
+		live: true,
+	};
 	const fixture = await createSessionListBroker(input =>
 		input.cursor === undefined
 			? { ok: true, result: { sessions: [pageOne], continuationCursor: "page-2" } }
@@ -254,7 +266,12 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	const cwd = path.join(directory, "workspace");
 	const token = "acp-contract-token";
 	const brokerSessions: Record<string, unknown>[] = [
-		{ sessionId: "owned-session", locator: { repo: cwd }, live: true, endpointGeneration: 1 },
+		{
+			sessionId: "owned-session",
+			locator: { cwd, worktreeRoot: null, stateRoot: path.join(cwd, ".gjc", "state") },
+			live: true,
+			endpointGeneration: 1,
+		},
 	];
 	const lifecycleInputs: Record<string, unknown>[] = [];
 	const brokerRequests: Record<string, unknown>[] = [];
@@ -634,7 +651,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	await index.append({
 		type: "host_registered",
 		sessionId: "owned-session",
-		locator: { repo: cwd, stateRoot: path.join(cwd, ".gjc", "state") },
+		locator: { cwd: cwd, worktreeRoot: null, stateRoot: path.join(cwd, ".gjc", "state") },
 		endpointGeneration: 1,
 		pid: process.pid,
 		endpointMtimeMs,

@@ -9,7 +9,7 @@ import { SessionIndex } from "../src/sdk/broker/session-index";
 const event = (sessionId: string) => ({
 	type: "host_registered" as const,
 	sessionId,
-	locator: { repo: "r", stateRoot: "q" },
+	locator: { cwd: "r", worktreeRoot: null, stateRoot: "q" },
 	endpointGeneration: 1,
 	pid: process.pid,
 });
@@ -345,7 +345,7 @@ describe("SDK session index lock contention (#4544)", () => {
 			expect(
 				await index.unregisterIfCurrent({
 					sessionId: "retire-me",
-					locator: { repo: "r", stateRoot: "q" },
+					locator: { cwd: "r", worktreeRoot: null, stateRoot: "q" },
 					endpointGeneration: 1,
 					pid: process.pid,
 					indexSeq: appended.indexSeq,
@@ -382,7 +382,7 @@ describe("SDK session index lock contention (#4544)", () => {
 			expect(
 				await index.unregisterIfCurrent({
 					sessionId: "live-host",
-					locator: { repo: "r", stateRoot: "q" },
+					locator: { cwd: "r", worktreeRoot: null, stateRoot: "q" },
 					endpointGeneration: 1,
 					pid: process.pid,
 					indexSeq: live.indexSeq,

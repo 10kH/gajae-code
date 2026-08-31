@@ -72,6 +72,7 @@ import { Settings, type SkillsSettings } from "../config/settings";
 import { resolveEagerTaskDelegation } from "../config/task-delegation";
 import { CursorExecHandlers } from "../cursor";
 import { EditTool } from "../edit";
+import type { MasterModeContext } from "../master-mode/context";
 import { describeFoldReceipt } from "../session/fold-coordinator";
 import type { BashRestrictionProfile } from "../tools/bash-allowed-prefixes";
 import { SearchTool } from "../tools/search";
@@ -122,7 +123,9 @@ import { normalizePluginHook } from "../hooks/normalize";
 import { initializeLocalRoot, LocalProtocolHandler, type LocalProtocolOptions } from "../internal-urls";
 import type { LspStartupServerInfo } from "../lsp";
 import { shutdownAll as shutdownAllLspClients } from "../lsp/client";
+import { createMasterPeerSnapshotContributor, MASTER_PEER_SNAPSHOT_CUSTOM_TYPE } from "../master-mode/first-request";
 import btwUserPrompt from "../prompts/system/btw-user.md" with { type: "text" };
+import masterModeTemplate from "../prompts/system/master-mode.md" with { type: "text" };
 import asyncResultTemplate from "../prompts/tools/async-result.md" with { type: "text" };
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { createLazyService } from "../runtime/lazy-service";
@@ -191,6 +194,7 @@ import { guardToolForUltragoalAsk } from "../tools/ultragoal-ask-guard";
 import { EventBus } from "../utils/event-bus";
 import { buildNamedToolChoice, buildNamedToolChoiceResult } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
+import { createSessionLifecycleService } from "./lifecycle/client";
 import {
 	attachLifecycleStartupCapability,
 	lifecycleMcpStartupTimeoutOption,
@@ -527,6 +531,8 @@ export interface CreateAgentSessionOptions {
 	 * @internal CLI-only startup optimization; SDK callers retain synchronous loading by default.
 	 */
 	deferMcpConfigStartup?: boolean;
+	/** Process-local master authority. Never persist or pass to lifecycle children. */
+	masterModeContext?: MasterModeContext;
 	/**
 	 * Defer memory backend startup until the caller has applied startup model profiles.
 	 * @internal CLI-only ordering guard; SDK callers retain immediate startup by default.
@@ -1348,6 +1354,7 @@ function validateAutomationTools(options: CreateAgentSessionOptions): Automation
 
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
 	const automationTools = validateAutomationTools(options);
+	const masterModeContext = options.masterModeContext;
 	const lifecycleStartupCapability = (
 		options as CreateAgentSessionOptions & { [lifecycleStartupCapabilityOption]?: SdkStartupCapability }
 	)[lifecycleStartupCapabilityOption];
@@ -2719,6 +2726,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getToolForExecution: name => session?.getToolForExecution(name),
 			agentRegistry,
 			getSessionSpawns: () => options.spawns ?? "*",
+			getMasterBashCapability: () => masterModeContext?.getCapability(),
+			getMasterOwnerSessionId: () => masterModeContext?.ownerSessionId,
 			getModelString: () => (hasExplicitModel && model ? formatModelString(model) : undefined),
 			getActiveModelString,
 			getPlanModeState: () => session?.getPlanModeState(),
@@ -3267,6 +3276,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							controller: notificationSessionController,
 							spawnedByGjc,
 							sdkHostModeSupported: options.sdkHostModeSupported,
+							...(masterModeContext
+								? {
+										masterCapability: masterModeContext.getCapability(),
+										masterAttestationEpoch: masterModeContext.attestationEpoch,
+										masterOwnerSessionId: masterModeContext.ownerSessionId,
+									}
+								: {}),
 							// INTERNAL terminal-abort seams, threaded directly from the
 							// owning session (NOT on the public extension context).
 							terminalAbortSeams: {
@@ -3317,6 +3333,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							createTransport: input => createSdkWebSocketTransport(input),
 							settings,
 							configOverrides: new Map(),
+							...(masterModeContext
+								? {
+										masterCapability: masterModeContext.getCapability(),
+										masterAttestationEpoch: masterModeContext.attestationEpoch,
+										masterOwnerSessionId: masterModeContext.ownerSessionId,
+									}
+								: {}),
 							// INTERNAL terminal-abort seams, threaded directly from the
 							// owning session (NOT on the public extension context).
 							terminalAbortSeams: {
@@ -3893,16 +3916,20 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				if (hasSession) session.configWarnings.push(warning);
 				logger.warn("Context file discovery warning", { warning });
 			}
+			// The master doctrine block is appended exactly once, AFTER any custom
+			// system-prompt transformation, and only for the master session itself.
+			const withMasterGuidance = (built: BuildSystemPromptResult): BuildSystemPromptResult =>
+				masterModeContext ? { ...built, systemPrompt: [...built.systemPrompt, masterModeTemplate.trim()] } : built;
 			if (options.systemPrompt === undefined) {
-				return defaultPrompt;
+				return withMasterGuidance(defaultPrompt);
 			}
 			if (Array.isArray(options.systemPrompt)) {
-				return { systemPrompt: options.systemPrompt, warnings: defaultPrompt.warnings };
+				return withMasterGuidance({ systemPrompt: options.systemPrompt, warnings: defaultPrompt.warnings });
 			}
-			return {
+			return withMasterGuidance({
 				systemPrompt: options.systemPrompt(defaultPrompt.systemPrompt),
 				warnings: defaultPrompt.warnings,
-			};
+			});
 		};
 
 		const toolNamesFromRegistry = Array.from(toolRegistry.keys());
@@ -4461,6 +4488,31 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// carried by the host replay ring through the internal runtime seam above.
 		if (autoroutingInactive) session.configWarnings.push(AUTOROUTING_INACTIVE_WARNING);
 		hasSession = true;
+		if (masterModeContext) {
+			// One scoped, no-probe peer snapshot immediately before the FIRST accepted
+			// provider request; see createMasterPeerSnapshotContributor for the
+			// discard/reuse/no-duplicate semantics.
+			const capturedSession = session;
+			session.registerBeforeAgentStartContributor(
+				createMasterPeerSnapshotContributor({
+					lifecycle: createSessionLifecycleService(agentDir),
+					ownerSessionId: masterModeContext.ownerSessionId,
+					getSessionId: () => sessionManager.getSessionId(),
+					scope: masterModeContext.scope,
+					getCwd: getLiveCwd,
+					hasPersistedInjection: () =>
+						capturedSession.sessionManager
+							.getBranch()
+							.some(
+								entry =>
+									entry.type === "message" &&
+									(entry.message as { customType?: string }).customType === MASTER_PEER_SNAPSHOT_CUSTOM_TYPE,
+							),
+					onError: error =>
+						logger.debug("master peer snapshot injection failed", { error: safeErrorForLog(error) }),
+				}),
+			);
+		}
 		const sessionAsyncJobManager = asyncJobManager;
 		if (sessionAsyncJobManager) {
 			session.yieldQueue.register<AsyncResultEntry>("async-result", {

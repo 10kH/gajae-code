@@ -80,7 +80,7 @@ try {
 	await index.append({
 		type: "host_registered",
 		sessionId: "s1",
-		locator: { repo, stateRoot: path.join(repo, ".gjc", "state") },
+		locator: { cwd: repo, worktreeRoot: null, stateRoot: path.join(repo, ".gjc", "state") },
 		endpointGeneration: 1,
 		pid: process.pid,
 		endpointMtimeMs,

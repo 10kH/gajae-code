@@ -1,6 +1,6 @@
 import { logger } from "@gajae-code/utils";
 import { AUTOROUTING_INACTIVE_WARNING } from "../../config/autorouting-contract";
-import { redactBrokerRuntimeCapabilities } from "./control/runtime-gate";
+import { redactBrokerRuntimeCapabilities, redactObservedRequestContent } from "./control/runtime-gate";
 import { type EventFrame, SessionEventStream } from "./events";
 import { isAutoroutingInactive } from "./internal-autorouting-state";
 import { type ProviderLease, ReverseLeaseError, ReverseLeaseRuntime } from "./reverse-leases";
@@ -88,6 +88,12 @@ export interface SessionSdkHostOptions extends HostEndpointAdapters {
 	 * that fails is never read as authorization.
 	 */
 	activationGate?: SessionActivationGate;
+	/** Private one-shot master-capability verification; never durable or public SDK surface. */
+	masterCapabilityVerify?: (frame: { nonce: unknown; attestationEpoch: unknown; capability: unknown }) => {
+		ok: boolean;
+		nonce: string;
+		attestationEpoch: string;
+	};
 }
 
 /** Shared by the replay filter and transport live broadcasts: a connection
@@ -416,6 +422,21 @@ export class SessionSdkHost {
 				return;
 			}
 			switch (frame.type) {
+				case "master_capability_verify": {
+					const result = this.#options.masterCapabilityVerify?.({
+						nonce: frame.nonce,
+						attestationEpoch: frame.attestationEpoch,
+						capability: frame.capability,
+					}) ?? { ok: false, nonce: "", attestationEpoch: "" };
+					await this.#send(connectionId, {
+						type: "master_capability_verify_result",
+						id: typeof frame.id === "string" ? frame.id : "",
+						ok: result.ok,
+						nonce: result.nonce,
+						attestationEpoch: result.attestationEpoch,
+					});
+					break;
+				}
 				case "control_request": {
 					this.#observeRequest("control", connectionId, frame);
 					// Deferred readiness withholds `session_ready`, but the control
@@ -616,7 +637,7 @@ export class SessionSdkHost {
 	}
 	#observeRequest(kind: "control" | "query", connectionId: string, frame: SdkFrame): void {
 		try {
-			this.#options.onRequest?.(kind, connectionId, redactBrokerRuntimeCapabilities(frame));
+			this.#options.onRequest?.(kind, connectionId, redactObservedRequestContent(redactBrokerRuntimeCapabilities(frame)));
 		} catch {
 			// Diagnostic observers must not change request handling.
 		}

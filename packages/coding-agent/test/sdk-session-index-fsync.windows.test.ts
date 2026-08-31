@@ -29,7 +29,7 @@ describe.skipIf(process.platform !== "win32")("Windows session-index snapshot fs
 		await index.append({
 			type: "host_registered",
 			sessionId: "win",
-			locator: { repo: "r", stateRoot: "q" },
+			locator: { cwd: "r", worktreeRoot: null, stateRoot: "q" },
 			endpointGeneration: 1,
 			pid: process.pid,
 			hostIncarnation: "windows-ci-seam",
@@ -49,7 +49,7 @@ describe.skipIf(process.platform !== "win32")("Windows session-index snapshot fs
 		await index.append({
 			type: "host_registered",
 			sessionId: "win2",
-			locator: { repo: "r", stateRoot: "q" },
+			locator: { cwd: "r", worktreeRoot: null, stateRoot: "q" },
 			endpointGeneration: 1,
 			pid: process.pid,
 			hostIncarnation: "windows-ci-seam",

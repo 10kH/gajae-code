@@ -3,13 +3,24 @@ import * as fs from "node:fs/promises";
 import path from "node:path";
 import * as native from "@gajae-code/natives";
 import { FileLockTestHooks } from "../src/config/file-lock";
-import { SessionIndex, type SessionIndexEvent, sessionIndexChecksum } from "../src/sdk/broker/session-index";
-import { SDK_STATE_VERSION } from "../src/sdk/broker/state-version";
+import {
+	canonicalSessionCwd,
+	SessionIndex,
+	type SessionIndexEvent,
+	sessionIndexChecksum,
+	sessionWorktreeRoot,
+} from "../src/sdk/broker/session-index";
+import {
+	assertSupportedStateVersion,
+	SDK_STATE_VERSION,
+	SESSION_INDEX_EVENT_VERSION,
+	UnsupportedStateVersionError,
+} from "../src/sdk/broker/state-version";
 
 const event = (sessionId: string) => ({
 	type: "host_registered" as const,
 	sessionId,
-	locator: { repo: "r", stateRoot: "q" },
+	locator: { cwd: "r", worktreeRoot: null, stateRoot: "q" },
 	endpointGeneration: 1,
 	pid: process.pid,
 });
@@ -226,7 +237,7 @@ describe("SDK session index", () => {
 		expect(await index.repair()).toMatchObject({ status: "healthy", repaired: false });
 		await index.append({
 			...event("after"),
-			locator: { repo: "r".repeat(4 * 1024 * 1024), stateRoot: "q" },
+			locator: { cwd: "r".repeat(4 * 1024 * 1024), worktreeRoot: null, stateRoot: "q" },
 		});
 		const snapshot = JSON.parse(await fs.readFile(path.join(sessionsDir, "index.snapshot.json"), "utf8"));
 		expect(snapshot.indexSeq).toBe(3);
@@ -246,7 +257,7 @@ describe("SDK session index", () => {
 		await fs.writeFile(snapshotFile, JSON.stringify(invalidSnapshot));
 		const oversized = {
 			...event("oversized"),
-			locator: { repo: "r".repeat(4 * 1024 * 1024), stateRoot: "q" },
+			locator: { cwd: "r".repeat(4 * 1024 * 1024), worktreeRoot: null, stateRoot: "q" },
 			version: SDK_STATE_VERSION,
 			indexSeq: 2,
 			ts: Date.now(),
@@ -497,7 +508,7 @@ describe("SDK session index", () => {
 				await index.append({
 					type: "host_registered",
 					sessionId: process.env.WRITER_ID + "-" + i,
-					locator: { repo: "r", stateRoot: "q" },
+					locator: { cwd: "r", worktreeRoot: null, stateRoot: "q" },
 					endpointGeneration: 1,
 					pid: process.pid,
 				});
@@ -567,7 +578,7 @@ describe("SDK session index", () => {
 			ts: Date.now(),
 			type: "lifecycle_terminal",
 			sessionId: "stale-writer",
-			locator: { repo: "unknown", stateRoot: "q" },
+			locator: { cwd: "unknown", worktreeRoot: null, stateRoot: "q" },
 			endpointGeneration: 0,
 			pid: process.pid,
 			terminalUncertain: true,
@@ -596,7 +607,7 @@ describe("SDK session index", () => {
 		const writers = await Promise.all([new SessionIndex(dir).open(), new SessionIndex(dir).open()]);
 		const largeEvent = (sessionId: string) => ({
 			...event(sessionId),
-			locator: { repo: "r".repeat(300_000), stateRoot: "q" },
+			locator: { cwd: "r".repeat(300_000), worktreeRoot: null, stateRoot: "q" },
 		});
 		for (let round = 0; round < 3; round++) {
 			await Promise.all(
@@ -729,13 +740,13 @@ describe("SDK session index", () => {
 		const sessionsDir = path.join(dir, "sdk", "sessions");
 		await fs.mkdir(sessionsDir, { recursive: true });
 		const snapshotFile = path.join(sessionsDir, "index.snapshot.json");
-		await fs.writeFile(snapshotFile, JSON.stringify({ version: 4, indexSeq: 7, events: [] }));
+		await fs.writeFile(snapshotFile, JSON.stringify({ version: 5, indexSeq: 7, events: [] }));
 		const unsupported = new SessionIndex(dir);
 		expect(await unsupported.diagnose()).toMatchObject({ status: "unsupported", validPrefixSeq: 0, snapshotSeq: 7 });
 		expect(await unsupported.repair()).toMatchObject({ status: "unsupported", repaired: false });
 		await expect(new SessionIndex(dir).open()).rejects.toThrow(/Unsupported SDK state version/);
 		const futureOne = { ...event("supported-prefix"), version: SDK_STATE_VERSION, indexSeq: 1, ts: 1 };
-		const futureTwo = { ...event("future-event"), version: 2, indexSeq: 2, ts: 2 };
+		const futureTwo = { ...event("future-event"), version: SESSION_INDEX_EVENT_VERSION + 1, indexSeq: 2, ts: 2 };
 		await fs.writeFile(
 			snapshotFile,
 			JSON.stringify({
@@ -760,7 +771,7 @@ describe("SDK session index", () => {
 			snapshotSeq: 2,
 		});
 		expect(await futureSnapshot.repair()).toMatchObject({ status: "unsupported", repaired: false });
-		await expect(futureSnapshot.open()).rejects.toThrow(/maximum supported version is 1/);
+		await expect(futureSnapshot.open()).rejects.toThrow(/maximum supported version is 4/);
 		const invalidFutureSnapshot = JSON.stringify({
 			version: 2,
 			indexSeq: 99,
@@ -787,6 +798,55 @@ describe("SDK session index", () => {
 		const replay = await new SessionIndex(dir).open();
 		expect(replay.listSessions().warnings).toEqual([]);
 		expect(replay.listSessions().sessions.map(s => s.sessionId)).toEqual(["legacy"]);
+	});
+	it("fences locator-v2 log events from older readers before snapshot rotation", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-event-fence-"));
+		const sessionsDir = path.join(dir, "sdk", "sessions");
+		const log = path.join(sessionsDir, "index.jsonl");
+		await fs.mkdir(sessionsDir, { recursive: true });
+		const legacy = {
+			version: SDK_STATE_VERSION,
+			indexSeq: 1,
+			type: "host_registered" as const,
+			sessionId: "legacy-prefix",
+			locator: { repo: dir, stateRoot: path.join(dir, ".gjc", "state") },
+			endpointGeneration: 1,
+			pid: process.pid,
+			ts: 1,
+		};
+		await fs.writeFile(
+			log,
+			`${JSON.stringify({
+				...legacy,
+				checksum: sessionIndexChecksum(legacy as unknown as Omit<SessionIndexEvent, "checksum">),
+			})}\n`,
+		);
+
+		const index = await new SessionIndex(dir).open();
+		const locatorV2 = await index.append(event("locator-v2"));
+		expect(locatorV2.version).toBe(SESSION_INDEX_EVENT_VERSION);
+		expect(await fs.exists(path.join(sessionsDir, "index.snapshot.json"))).toBe(false);
+
+		const entries = (await fs.readFile(log, "utf8"))
+			.trim()
+			.split("\n")
+			.map(line => JSON.parse(line));
+		expect(entries).toMatchObject([
+			{ version: SDK_STATE_VERSION },
+			{ version: SESSION_INDEX_EVENT_VERSION, locator: { cwd: "r", worktreeRoot: null, stateRoot: "q" } },
+		]);
+		let thrown: unknown;
+		try {
+			for (const entry of entries) assertSupportedStateVersion(log, entry);
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).toBeInstanceOf(UnsupportedStateVersionError);
+		expect(thrown).toMatchObject({
+			code: "unsupported_state_version",
+			version: SESSION_INDEX_EVENT_VERSION,
+			maximumSupportedVersion: SDK_STATE_VERSION,
+		});
 	});
 	it("compacts idempotently: a second snapshot of the same history is byte-identical", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
@@ -1077,12 +1137,12 @@ describe("SDK session index", () => {
 			const sessionId = `ambiguous-${terminateHigherGeneration ? "higher" : "lower"}`;
 			const alternate = await index.append({
 				...event(sessionId),
-				locator: { repo: "alternate", stateRoot: "alternate-state" },
+				locator: { cwd: "alternate", worktreeRoot: null, stateRoot: "alternate-state" },
 				endpointGeneration: 1,
 			});
 			const current = await index.append({
 				...event(sessionId),
-				locator: { repo: "current", stateRoot: "current-state" },
+				locator: { cwd: "current", worktreeRoot: null, stateRoot: "current-state" },
 				endpointGeneration: 2,
 			});
 			const terminated = terminateHigherGeneration ? current : alternate;
@@ -1143,7 +1203,7 @@ describe("SDK session index", () => {
 			const bookkeeping = {
 				type: "host_registered" as const,
 				sessionId,
-				locator: { repo: "r", stateRoot: dir },
+				locator: { cwd: "r", worktreeRoot: null, stateRoot: dir },
 				endpointGeneration: 0,
 				pid: process.pid,
 			};
@@ -1177,7 +1237,7 @@ describe("SDK session index", () => {
 			await index.append({
 				type: conflicting.type,
 				sessionId,
-				locator: { repo: "other", stateRoot: "other-state" },
+				locator: { cwd: "other", worktreeRoot: null, stateRoot: "other-state" },
 				endpointGeneration: conflicting.endpointGeneration,
 				pid: process.pid,
 			});
@@ -1199,7 +1259,7 @@ describe("SDK session index", () => {
 		const bookkeeping = await index.append({
 			type: "host_registered",
 			sessionId,
-			locator: { repo: "r", stateRoot: dir },
+			locator: { cwd: "r", worktreeRoot: null, stateRoot: dir },
 			endpointGeneration: 0,
 			pid: process.pid,
 		});
@@ -1234,7 +1294,7 @@ describe("SDK session index", () => {
 		await index.append({
 			type: "host_registered",
 			sessionId,
-			locator: { repo: "elsewhere", stateRoot: "not-the-agent-dir" },
+			locator: { cwd: "elsewhere", worktreeRoot: null, stateRoot: "not-the-agent-dir" },
 			endpointGeneration: 0,
 			pid: process.pid,
 		});
@@ -1258,7 +1318,7 @@ describe("SDK session index", () => {
 		await index.append({
 			type: "host_registered",
 			sessionId,
-			locator: { repo: "r", stateRoot: real },
+			locator: { cwd: "r", worktreeRoot: null, stateRoot: real },
 			endpointGeneration: 0,
 			pid: process.pid,
 		});
@@ -1284,18 +1344,18 @@ describe("SDK session index", () => {
 			await index.append({
 				type: "host_registered",
 				sessionId,
-				locator: { repo: "r", stateRoot: dir },
+				locator: { cwd: "r", worktreeRoot: null, stateRoot: dir },
 				endpointGeneration: 0,
 				pid: process.pid,
 			});
 			const survivor = await index.append({
 				...event(sessionId),
-				locator: { repo: "survivor", stateRoot: "survivor-root" },
+				locator: { cwd: "survivor", worktreeRoot: null, stateRoot: "survivor-root" },
 				endpointGeneration: terminatedIsHigher ? 1 : 2,
 			});
 			const terminated = await index.append({
 				...event(sessionId),
-				locator: { repo: "terminated", stateRoot: "terminated-root" },
+				locator: { cwd: "terminated", worktreeRoot: null, stateRoot: "terminated-root" },
 				endpointGeneration: terminatedIsHigher ? 2 : 1,
 			});
 			expect(index.listSessions().sessions).toEqual([
@@ -1376,15 +1436,19 @@ describe("SDK session index", () => {
 		try {
 			await index.append({
 				type: "host_registered",
-				locator: { repo: dir, stateRoot: dir },
+				locator: { cwd: dir, worktreeRoot: null, stateRoot: dir },
 				...expected,
 			});
 			const closed = await index.append({
 				type: "session_closed",
-				locator: { repo: dir, stateRoot: dir },
+				locator: { cwd: dir, worktreeRoot: null, stateRoot: dir },
 				...expected,
 			});
-			await index.append({ type: "session_deleted", locator: { repo: dir, stateRoot: dir }, ...expected });
+			await index.append({
+				type: "session_deleted",
+				locator: { cwd: dir, worktreeRoot: null, stateRoot: dir },
+				...expected,
+			});
 			const historical = index.findHistoricalSessionIdentity(expected);
 			if (!historical) throw new Error("Expected historical retirement identity");
 			expect(index.findSessionClosedEvidence(historical)).toBe(closed.indexSeq);
@@ -1392,11 +1456,19 @@ describe("SDK session index", () => {
 			const delayedExpected = { ...expected, sessionId: "retirement-delayed" };
 			await index.append({
 				type: "host_registered",
-				locator: { repo: dir, stateRoot: dir },
+				locator: { cwd: dir, worktreeRoot: null, stateRoot: dir },
 				...delayedExpected,
 			});
-			await index.append({ type: "session_deleted", locator: { repo: dir, stateRoot: dir }, ...delayedExpected });
-			await index.append({ type: "session_closed", locator: { repo: dir, stateRoot: dir }, ...delayedExpected });
+			await index.append({
+				type: "session_deleted",
+				locator: { cwd: dir, worktreeRoot: null, stateRoot: dir },
+				...delayedExpected,
+			});
+			await index.append({
+				type: "session_closed",
+				locator: { cwd: dir, worktreeRoot: null, stateRoot: dir },
+				...delayedExpected,
+			});
 			const delayedHistorical = index.findHistoricalSessionIdentity(delayedExpected);
 			if (!delayedHistorical) throw new Error("Expected delayed historical identity");
 			expect(index.findSessionClosedEvidence(delayedHistorical)).toBeUndefined();
@@ -1503,7 +1575,7 @@ describe("SDK session index", () => {
 					indexSeq: ++seq,
 					type,
 					sessionId: `old-${i}`,
-					locator: { repo: "/tmp/old", stateRoot: "/tmp/old/.gjc/state" },
+					locator: { cwd: "/tmp/old", worktreeRoot: null, stateRoot: "/tmp/old/.gjc/state" },
 					endpointGeneration: 1,
 					pid: 2147480000 + i,
 					ts: now - (7500 - i) * 2000,
@@ -1568,7 +1640,7 @@ describe("SDK session index", () => {
 				indexSeq: first.indexSeq,
 				type: "host_registered" as const,
 				sessionId,
-				locator: { repo: "r", stateRoot: "q" },
+				locator: { cwd: "r", worktreeRoot: null, stateRoot: "q" },
 				endpointGeneration: 1,
 				pid: process.pid,
 				ts: first.ts,
@@ -1652,7 +1724,7 @@ describe("SDK session index", () => {
 				indexSeq: first.indexSeq,
 				type: "host_registered" as const,
 				sessionId: "combo-z",
-				locator: { repo: "r".repeat(1 + pad), stateRoot: "q" },
+				locator: { cwd: "r".repeat(1 + pad), worktreeRoot: null, stateRoot: "q" },
 				endpointGeneration: 1,
 				pid: process.pid,
 				ts: first.ts,
@@ -1745,7 +1817,7 @@ describe("SDK session index", () => {
 			indexSeq: first.indexSeq,
 			type: "host_registered" as const,
 			sessionId: "snap-new",
-			locator: { repo: "r", stateRoot: "q" },
+			locator: { cwd: "r", worktreeRoot: null, stateRoot: "q" },
 			endpointGeneration: 1,
 			pid: process.pid,
 			ts: first.ts,
@@ -1812,5 +1884,65 @@ describe("SDK session index", () => {
 		// Without locked reclassification the tail read sees an empty log at
 		// offset 0 and keeps the stale projection; the locked path must replay.
 		expect(reader.listSessions().sessions.map(s => s.sessionId)).toEqual(["base", "late"]);
+	});
+	it("quarantines legacy repo-only rows with a re-register diagnostic", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-legacy-locator-"));
+		const legacy = {
+			version: SDK_STATE_VERSION,
+			indexSeq: 1,
+			type: "host_registered" as const,
+			sessionId: "legacy-session",
+			locator: { repo: dir, stateRoot: path.join(dir, ".gjc", "state") },
+			endpointGeneration: 1,
+			pid: process.pid,
+			ts: Date.now(),
+		};
+		const line = {
+			...legacy,
+			checksum: sessionIndexChecksum(legacy as unknown as Omit<SessionIndexEvent, "checksum">),
+		};
+		const sessionsDir = path.join(dir, "sdk", "sessions");
+		await fs.mkdir(sessionsDir, { recursive: true });
+		await fs.writeFile(path.join(sessionsDir, "index.jsonl"), `${JSON.stringify(line)}\n`);
+		const index = await new SessionIndex(dir).open();
+		expect(index.listSessions().sessions).toEqual([]);
+		expect(index.listSessions().warnings).toContain(
+			"Session legacy-session has a legacy locator row and must re-register.",
+		);
+		const audit = await fs.readFile(path.join(sessionsDir, "index-audit.jsonl"), "utf8");
+		expect(audit).toContain('"code":"rejected_legacy_locator"');
+		expect(audit).toContain('"sessionId":"legacy-session"');
+	});
+	it("quarantines mixed locator rows that retain a legacy repo key", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-mixed-locator-"));
+		const mixed = {
+			version: SDK_STATE_VERSION,
+			indexSeq: 1,
+			type: "host_registered" as const,
+			sessionId: "mixed-session",
+			locator: { cwd: dir, worktreeRoot: null, stateRoot: path.join(dir, ".gjc", "state"), repo: dir },
+			endpointGeneration: 1,
+			pid: process.pid,
+			ts: Date.now(),
+		};
+		const line = {
+			...mixed,
+			checksum: sessionIndexChecksum(mixed as unknown as Omit<SessionIndexEvent, "checksum">),
+		};
+		const sessionsDir = path.join(dir, "sdk", "sessions");
+		await fs.mkdir(sessionsDir, { recursive: true });
+		await fs.writeFile(path.join(sessionsDir, "index.jsonl"), `${JSON.stringify(line)}\n`);
+		const index = await new SessionIndex(dir).open();
+		expect(index.listSessions().sessions).toEqual([]);
+		expect(index.listSessions().warnings).toContain(
+			"Session mixed-session has a legacy locator row and must re-register.",
+		);
+	});
+	it("canonicalizes cwd and reports null worktree root outside Git", async () => {
+		const real = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-canonical-"));
+		const link = `${real}-link`;
+		await fs.symlink(real, link);
+		expect(await canonicalSessionCwd(link)).toBe(real);
+		expect(await sessionWorktreeRoot(real)).toBeNull();
 	});
 });

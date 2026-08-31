@@ -8,7 +8,9 @@
  *
  * Coverage is byte-identical to the original monolithic file's ACP loop.
  */
-import { test } from "bun:test";
+import { expect, test } from "bun:test";
+import { AcpSdkAdapter } from "../src/sdk/acp";
+import type { SdkClient } from "../src/sdk/client";
 import {
 	adapterPrefix,
 	assertAcpRow,
@@ -29,3 +31,16 @@ for (const operation of OPERATIONS) {
 		}, 60_000);
 	}
 }
+
+test("session.spawn rejects capability-shaped input before ACP Broker dispatch", async () => {
+	const adapter = new AcpSdkAdapter({ client: {} as SdkClient });
+	await expect(
+		adapter.global("session.spawn", {
+			cwd: process.cwd(),
+			task: "adapter disposition probe",
+			masterCapability: "capability-shaped-probe",
+			model: "openai/gpt-4o-mini",
+			profile: "default",
+		}),
+	).rejects.toMatchObject({ code: "operation_prohibited" });
+});

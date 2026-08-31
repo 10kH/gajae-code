@@ -1,14 +1,16 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { logger, resolveEquivalentPath } from "@gajae-code/utils";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import { withFileLock } from "../../config/file-lock";
+import { repo } from "../../utils/git";
 import { processIncarnation } from "./process-incarnation";
 import {
+	assertSupportedSessionIndexEventVersion,
 	assertSupportedSnapshotVersion,
-	assertSupportedStateVersion,
 	SDK_STATE_VERSION,
+	SESSION_INDEX_EVENT_VERSION,
 	SESSION_INDEX_SNAPSHOT_VERSION,
 	UnsupportedStateVersionError,
 } from "./state-version";
@@ -53,12 +55,79 @@ export interface SessionIndexProcessObservation {
 	readonly incarnation: string;
 	readonly isRunning: () => boolean;
 }
+/**
+ * Canonical location facts for one SDK session.
+ *
+ * `cwd` is always a realpath-canonicalized directory. `worktreeRoot` is the
+ * canonical Git worktree root when `cwd` is in a worktree, otherwise `null`.
+ * `stateRoot` retains its host-provided authority spelling and is never derived
+ * from either canonical path.
+ */
+export type SessionLocatorV2 = {
+	cwd: string;
+	worktreeRoot: string | null;
+	stateRoot: string;
+};
+
+/** Durable master-role facts. `attestationEpoch` is opaque random broker state. */
+export type MasterRoleAttestationV2 = {
+	version: 2;
+	ownerSessionId: string;
+	launchPid: number;
+	launchProcessIncarnation: string;
+	role: "master";
+	attestationEpoch: string;
+};
+
+export function newMasterAttestationEpoch(): string {
+	return randomBytes(32).toString("base64url");
+}
+
+/** Canonicalize a cwd without making an unavailable path a launch failure. */
+export async function canonicalSessionCwd(cwd: string): Promise<string> {
+	try {
+		return await fs.realpath(cwd);
+	} catch {
+		return path.resolve(cwd);
+	}
+}
+
+/** Resolve the canonical worktree root; non-Git and probe failures are `null`. */
+export async function sessionWorktreeRoot(cwd: string): Promise<string | null> {
+	try {
+		const repository = await repo.resolve(cwd);
+		return repository ? await canonicalSessionCwd(repository.repoRoot) : null;
+	} catch {
+		return null;
+	}
+}
+
+/** Build the only permitted locator shape for a newly registered session. */
+export async function resolveSessionLocator(cwd: string, stateRoot: string): Promise<SessionLocatorV2> {
+	const canonicalCwd = await canonicalSessionCwd(cwd);
+	return { cwd: canonicalCwd, worktreeRoot: await sessionWorktreeRoot(canonicalCwd), stateRoot };
+}
+
+function sessionLocatorV2(locator: unknown): locator is SessionLocatorV2 {
+	if (typeof locator !== "object" || locator === null || Array.isArray(locator)) return false;
+	const keys = Object.keys(locator);
+	if (keys.length !== 3 || !keys.every(key => key === "cwd" || key === "worktreeRoot" || key === "stateRoot"))
+		return false;
+	return (
+		typeof (locator as { cwd?: unknown }).cwd === "string" &&
+		(locator as { cwd: string }).cwd.length > 0 &&
+		(typeof (locator as { worktreeRoot?: unknown }).worktreeRoot === "string" ||
+			(locator as { worktreeRoot?: unknown }).worktreeRoot === null) &&
+		typeof (locator as { stateRoot?: unknown }).stateRoot === "string" &&
+		(locator as { stateRoot: string }).stateRoot.length > 0
+	);
+}
 export interface SessionIndexEvent {
-	version: typeof SDK_STATE_VERSION;
+	version: typeof SDK_STATE_VERSION | typeof SESSION_INDEX_EVENT_VERSION;
 	indexSeq: number;
 	type: SessionIndexEventType;
 	sessionId: string;
-	locator: { repo: string; stateRoot: string };
+	locator: SessionLocatorV2;
 	endpointGeneration: number;
 	pid: number;
 	/**
@@ -69,23 +138,28 @@ export interface SessionIndexEvent {
 	 */
 	processIncarnation?: string;
 	endpointMtimeMs?: number;
+	/** Immutable endpoint file identity captured by the broker at registration. */
+	endpointFileId?: string;
 	lifecycleRequestId?: string;
 	terminalUncertain?: boolean;
 	/** OS process incarnation (C1); absent on legacy v1/v2 events. */
 	hostIncarnation?: string;
 	/** Present on host_heartbeat checkpoints (C2). */
 	activity?: SessionActivity;
+	masterRole?: MasterRoleAttestationV2;
 	ts: number;
 	checksum: string;
 }
 export interface IndexedSession {
 	sessionId: string;
-	locator: { repo: string; stateRoot: string };
+	locator: SessionLocatorV2;
 	endpointGeneration: number;
 	pid: number;
 	/** OS start incarnation of `pid` as published by its own host at registration. */
 	processIncarnation?: string;
 	endpointMtimeMs?: number;
+	/** Immutable endpoint file identity captured by the broker at registration. */
+	endpointFileId?: string;
 	live: boolean;
 	indexSeq: number;
 	lifecycleRequestId?: string;
@@ -95,6 +169,7 @@ export interface IndexedSession {
 	activity?: SessionActivity;
 	/** Wall-clock timestamp of the latest admitted heartbeat, when one exists. */
 	lastHeartbeatAt?: number;
+	masterRole?: MasterRoleAttestationV2;
 	/** True when more than one unresolved authority-fencing state-root identity claims this session id. */
 	ambiguous: boolean;
 	/** True when the identity's latest event is terminal (DR-1 retains stopped rows for inspection/offline tail). */
@@ -164,7 +239,10 @@ interface SessionIndexScan {
 }
 
 /** Admission-fence rejection codes recorded in the durable index audit (C5/C4). */
-export type SessionIndexAuditCode = "rejected_superseded_incarnation" | "rejected_after_tombstone";
+export type SessionIndexAuditCode =
+	| "rejected_superseded_incarnation"
+	| "rejected_after_tombstone"
+	| "rejected_legacy_locator";
 export interface SessionIndexAuditRecord {
 	version: typeof SDK_STATE_VERSION;
 	code: SessionIndexAuditCode;
@@ -268,6 +346,14 @@ const tupleKey = (event: SessionIndexEvent) =>
 const effectiveIncarnation = (event: SessionIndexEvent) => event.hostIncarnation ?? event.processIncarnation;
 const identityKey = (event: SessionIndexEvent) => `${tupleKey(event)}\u0000${effectiveIncarnation(event) ?? ""}`;
 
+function hasSessionLocatorV2(event: SessionIndexEvent): boolean {
+	return sessionLocatorV2(event.locator);
+}
+
+function legacyLocatorDiagnostic(event: SessionIndexEvent): string {
+	return `Session ${event.sessionId} has a legacy locator row and must re-register.`;
+}
+
 interface ResolvedRetentionPolicy {
 	clock: () => number;
 	maxAgeMs: number;
@@ -305,7 +391,17 @@ interface Admission {
  */
 function admitEvents(events: SessionIndexEvent[]): Admission {
 	const authoritative = new Map<string, { incarnation: string | undefined; indexSeq: number }>();
+	const rejected: RejectedEvent[] = [];
 	for (const event of events) {
+		if (!hasSessionLocatorV2(event)) {
+			rejected.push({
+				code: "rejected_legacy_locator",
+				event,
+				supersededByIncarnation: undefined,
+				supersededByIndexSeq: event.indexSeq,
+			});
+			continue;
+		}
 		if (event.type !== "host_registered") continue;
 		const key = tupleKey(event);
 		const current = authoritative.get(key);
@@ -314,8 +410,8 @@ function admitEvents(events: SessionIndexEvent[]): Admission {
 		}
 	}
 	const admitted: SessionIndexEvent[] = [];
-	const rejected: RejectedEvent[] = [];
 	for (const event of events) {
+		if (!hasSessionLocatorV2(event)) continue;
 		const authority = authoritative.get(tupleKey(event));
 		if (
 			authority !== undefined &&
@@ -378,7 +474,7 @@ function auditRecords(events: SessionIndexEvent[], ts: number): SessionIndexAudi
 		indexSeq: rejection.event.indexSeq,
 		sessionId: rejection.event.sessionId,
 		endpointGeneration: rejection.event.endpointGeneration,
-		stateRoot: rejection.event.locator.stateRoot,
+		stateRoot: hasSessionLocatorV2(rejection.event) ? rejection.event.locator.stateRoot : "unknown",
 		...(rejection.event.hostIncarnation !== undefined ? { hostIncarnation: rejection.event.hostIncarnation } : {}),
 		...(rejection.supersededByIncarnation !== undefined
 			? { supersededByIncarnation: rejection.supersededByIncarnation }
@@ -499,10 +595,12 @@ function projectIdentity(
 		pid: latest.pid,
 		processIncarnation: latest.processIncarnation,
 		endpointMtimeMs: latest.endpointMtimeMs,
+		endpointFileId: latest.endpointFileId,
 		lifecycleRequestId: latest.lifecycleRequestId,
 		terminalUncertain,
 		indexSeq: latest.indexSeq,
 		hostIncarnation: latest.hostIncarnation,
+		masterRole: latest.masterRole,
 		identityProvenance: recordedIncarnation === undefined ? "legacy" : "composite",
 		activity: heartbeat?.activity,
 		lastHeartbeatAt: heartbeat?.ts,
@@ -1140,6 +1238,9 @@ export class SessionIndex {
 		if (scan.diagnosis.status === "unsupported") throw scan.unsupportedError!;
 		this.#events = [...scan.snapshotEvents, ...scan.validLogEvents];
 		this.#warnings = [];
+		for (const event of this.#events) {
+			if (!hasSessionLocatorV2(event)) this.#warn(legacyLocatorDiagnostic(event));
+		}
 		this.#logOffset = scan.logContents?.length ?? 0;
 		this.#corruptSuffix = scan.diagnosis.status === "corrupt";
 		if (scan.diagnosis.reason === "invalid snapshot") this.#warnings.push("Invalid session index snapshot");
@@ -1195,7 +1296,7 @@ export class SessionIndex {
 			if (Array.isArray(snapshot.events)) {
 				try {
 					for (const event of snapshot.events) {
-						assertSupportedStateVersion(snapshotFor(this.#agentDir), event);
+						assertSupportedSessionIndexEventVersion(snapshotFor(this.#agentDir), event);
 						supportedEvents.push(event as SessionIndexEvent);
 					}
 				} catch (error) {
@@ -1234,7 +1335,7 @@ export class SessionIndex {
 				if (!line) continue;
 				try {
 					const event = JSON.parse(line) as SessionIndexEvent;
-					assertSupportedStateVersion(logFor(this.#agentDir), event);
+					assertSupportedSessionIndexEventVersion(logFor(this.#agentDir), event);
 					const { checksum, ...unsigned } = event;
 					if (checksum !== sessionIndexChecksum(unsigned)) {
 						corrupt = true;
@@ -1401,7 +1502,7 @@ export class SessionIndex {
 			let event: SessionIndexEvent;
 			try {
 				event = JSON.parse(line) as SessionIndexEvent;
-				assertSupportedStateVersion(logFor(this.#agentDir), event);
+				assertSupportedSessionIndexEventVersion(logFor(this.#agentDir), event);
 			} catch (error) {
 				if (error instanceof UnsupportedStateVersionError) throw error;
 				corrupt = true;
@@ -1485,7 +1586,7 @@ export class SessionIndex {
 				}
 				const unsigned: Omit<SessionIndexEvent, "checksum"> = {
 					...input,
-					version: SDK_STATE_VERSION,
+					version: SESSION_INDEX_EVENT_VERSION,
 					indexSeq: this.indexSeq + 1,
 					ts: input.ts ?? Date.now(),
 				};
@@ -1535,7 +1636,7 @@ export class SessionIndex {
 						session.processIncarnation === expected.processIncarnation &&
 						(session.hostIncarnation ?? session.processIncarnation) ===
 							(expected.hostIncarnation ?? expected.processIncarnation) &&
-						resolveEquivalentPath(session.locator.repo) === resolveEquivalentPath(expected.locator.repo) &&
+						resolveEquivalentPath(session.locator.cwd) === resolveEquivalentPath(expected.locator.cwd) &&
 						path.resolve(session.locator.stateRoot) === path.resolve(expected.locator.stateRoot),
 				);
 				let currentRoot: IndexedSession | undefined;
@@ -1543,7 +1644,7 @@ export class SessionIndex {
 					if (
 						session.sessionId !== expected.sessionId ||
 						session.terminal ||
-						resolveEquivalentPath(session.locator.repo) !== resolveEquivalentPath(expected.locator.repo) ||
+						resolveEquivalentPath(session.locator.cwd) !== resolveEquivalentPath(expected.locator.cwd) ||
 						path.resolve(session.locator.stateRoot) !== path.resolve(expected.locator.stateRoot)
 					)
 						continue;
@@ -1564,7 +1665,7 @@ export class SessionIndex {
 				)
 					return false;
 				const unsigned: Omit<SessionIndexEvent, "checksum"> = {
-					version: SDK_STATE_VERSION,
+					version: SESSION_INDEX_EVENT_VERSION,
 					indexSeq: this.indexSeq + 1,
 					ts: Date.now(),
 					type: "host_unregistered",
@@ -2100,7 +2201,7 @@ export class SessionIndex {
 					const current = probed.get(`${row.sessionId}\u0000${row.endpointGeneration}\u0000${row.pid}`);
 					if (current === undefined || current !== recordedIncarnation) continue;
 					const unsigned: Omit<SessionIndexEvent, "checksum"> = {
-						version: SDK_STATE_VERSION,
+						version: SESSION_INDEX_EVENT_VERSION,
 						indexSeq: this.indexSeq + events.length + 1,
 						type: "host_heartbeat",
 						sessionId: row.sessionId,
@@ -2109,6 +2210,7 @@ export class SessionIndex {
 						pid: row.pid,
 						...(row.processIncarnation === undefined ? {} : { processIncarnation: row.processIncarnation }),
 						...(row.hostIncarnation === undefined ? {} : { hostIncarnation: row.hostIncarnation }),
+						...(row.masterRole === undefined ? {} : { masterRole: row.masterRole }),
 						activity: { state: "active", at: now },
 						ts: now,
 					};
@@ -2145,7 +2247,7 @@ export class SessionIndex {
 				item.sessionId === registration.sessionId &&
 				item.endpointGeneration === registration.endpointGeneration &&
 				item.pid === registration.pid &&
-				resolveEquivalentPath(item.locator.repo) === resolveEquivalentPath(registration.locator.repo) &&
+				resolveEquivalentPath(item.locator.cwd) === resolveEquivalentPath(registration.locator.cwd) &&
 				path.resolve(item.locator.stateRoot) === path.resolve(registration.locator.stateRoot) &&
 				(lifecycleRequestId === undefined || item.lifecycleRequestId === lifecycleRequestId) &&
 				(incarnation === undefined || (item.hostIncarnation ?? item.processIncarnation) === incarnation),
@@ -2180,10 +2282,12 @@ export class SessionIndex {
 					pid: event.pid,
 					processIncarnation: event.processIncarnation,
 					endpointMtimeMs: event.endpointMtimeMs,
+					endpointFileId: event.endpointFileId,
 					lifecycleRequestId: event.lifecycleRequestId,
 					terminalUncertain: false,
 					indexSeq: event.indexSeq,
 					hostIncarnation: event.hostIncarnation,
+					masterRole: event.masterRole,
 					identityProvenance: event.hostIncarnation === undefined ? "legacy" : "composite",
 					ambiguous: false,
 					live: alive(event.pid),

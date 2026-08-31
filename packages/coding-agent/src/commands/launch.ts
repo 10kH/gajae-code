@@ -2,20 +2,30 @@
  * Root command for the coding agent CLI.
  */
 
-import { APP_NAME, setProjectDir } from "@gajae-code/utils";
+import { APP_NAME, getAgentDir, setProjectDir } from "@gajae-code/utils";
 import { Args, Command } from "@gajae-code/utils/cli";
 import { assertLocalLaunchArgs, parseArgs } from "../cli/args";
 import { ROOT_LAUNCH_FLAGS } from "../cli/root-flags";
 import { writeCoordinatorAtomic } from "../coordinator-mcp/durability";
 import { launchDefaultTmuxIfNeeded } from "../gjc-runtime/launch-tmux";
-import { type PreparedLaunchWorktree, prepareLaunchWorktree } from "../gjc-runtime/launch-worktree";
+import {
+	type GjcLaunchWorktreePlan,
+	type PreparedLaunchWorktree,
+	parseLaunchWorktreeMode,
+	planLaunchWorktree,
+	prepareLaunchWorktree,
+} from "../gjc-runtime/launch-worktree";
+import { type LaunchWorktreeReservation, reserveLaunchWorktree } from "../gjc-runtime/launch-worktree-reservation";
 import {
 	GJC_COORDINATOR_SESSION_ID_ENV,
 	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
 	GJC_TMUX_OWNER_GENERATION_ENV,
 } from "../gjc-runtime/session-state-sidecar";
 import { runRootCommand } from "../main";
+import { assertMasterLaunchArgs } from "../master-mode/context";
 import { prepareAcpTerminalAuthArgs } from "../modes/acp/terminal-auth";
+import { type IndexedSession, SessionIndex } from "../sdk/broker/session-index";
+import { worktreeOccupant } from "../sdk/broker/worktree-occupancy";
 
 export async function persistCoordinatorLaunchFailure(
 	error: unknown,
@@ -56,6 +66,54 @@ export async function persistCoordinatorLaunchFailure(
 	await writeCoordinatorAtomic(stateFile, `${JSON.stringify(payload, null, 2)}\n`);
 }
 
+function worktreeInUseError(worktreePath: string, occupant?: string): Error {
+	const holder = occupant ? `session ${occupant}` : "another launch";
+	return new Error(
+		`worktree_in_use:${worktreePath} is already held by ${holder}. ` +
+			"Use gjc --worktree <name> for a separate checkout, or stop that session.",
+	);
+}
+
+async function reserveLaunchWorktreeOrFail(agentDir: string, worktreePath: string): Promise<LaunchWorktreeReservation> {
+	const reservation = await reserveLaunchWorktree(agentDir, worktreePath);
+	if (!reservation) throw worktreeInUseError(worktreePath);
+	return reservation;
+}
+
+/** Test seam for the path-keyed atomic reservation. */
+export async function reserveLaunchWorktreeForTest(
+	agentDir: string,
+	worktreePath: string,
+): Promise<LaunchWorktreeReservation> {
+	return await reserveLaunchWorktreeOrFail(agentDir, worktreePath);
+}
+
+async function assertLaunchWorktreeUnoccupied(worktree: GjcLaunchWorktreePlan | { enabled: false }): Promise<void> {
+	if (!worktree.enabled) return;
+	let sessions: readonly IndexedSession[];
+	try {
+		sessions = (await new SessionIndex(getAgentDir()).open()).listSessionIdentities();
+	} catch {
+		throw new Error(`worktree_occupancy_unavailable:${worktree.worktreePath}`);
+	}
+	const occupant = worktreeOccupant(sessions, worktree.worktreePath);
+	if (occupant) throw worktreeInUseError(worktree.worktreePath, occupant);
+}
+
+async function reserveLaunchWorktreePreflight(
+	worktree: GjcLaunchWorktreePlan | { enabled: false },
+): Promise<LaunchWorktreeReservation | undefined> {
+	if (!worktree.enabled) return undefined;
+	const reservation = await reserveLaunchWorktreeOrFail(getAgentDir(), worktree.worktreePath);
+	try {
+		await assertLaunchWorktreeUnoccupied(worktree);
+		return reservation;
+	} catch (error) {
+		await reservation.release();
+		throw error;
+	}
+}
+
 export default class Index extends Command {
 	static description = "Red-claw AI coding assistant";
 	static hidden = true;
@@ -93,34 +151,44 @@ export default class Index extends Command {
 		const { args } = prepareAcpTerminalAuthArgs(this.argv);
 		const parsed = parseArgs([...args], "deferred");
 		if (parsed.mode !== "acp") assertLocalLaunchArgs(parsed);
+		assertMasterLaunchArgs(parsed);
 		if (parsed.help || parsed.version) {
 			await runRootCommand(parsed, args);
 			return;
 		}
 
 		let launch: PreparedLaunchWorktree;
+		let reservation: LaunchWorktreeReservation | undefined;
 		try {
+			const plannedWorktree = planLaunchWorktree(process.cwd(), parseLaunchWorktreeMode(args).mode);
+			reservation = await reserveLaunchWorktreePreflight(plannedWorktree);
 			launch = prepareLaunchWorktree(process.cwd(), args);
 		} catch (error) {
+			await reservation?.release();
 			await persistCoordinatorLaunchFailure(error, process.cwd());
 			throw error;
 		}
-		if (launch.worktree.enabled) {
-			process.chdir(launch.cwd);
-			setProjectDir(launch.cwd);
+		try {
+			if (launch.worktree.enabled) {
+				process.chdir(launch.cwd);
+				setProjectDir(launch.cwd);
+			}
+			const launchParsed = parseArgs(launch.args, "deferred");
+			if (launchParsed.mode !== "acp") assertLocalLaunchArgs(launchParsed);
+			assertMasterLaunchArgs(launchParsed);
+			if (
+				launchDefaultTmuxIfNeeded({
+					parsed: launchParsed,
+					rawArgs: launch.args,
+					cwd: launch.cwd,
+					worktreeBranch: launch.worktree.enabled && !launch.worktree.detached ? launch.worktree.branchName : null,
+					project: launch.cwd,
+				})
+			)
+				return;
+			await runRootCommand(launchParsed, launch.args);
+		} finally {
+			await reservation?.release();
 		}
-		const launchParsed = parseArgs(launch.args, "deferred");
-		if (launchParsed.mode !== "acp") assertLocalLaunchArgs(launchParsed);
-		if (
-			launchDefaultTmuxIfNeeded({
-				parsed: launchParsed,
-				rawArgs: launch.args,
-				cwd: launch.cwd,
-				worktreeBranch: launch.worktree.enabled && !launch.worktree.detached ? launch.worktree.branchName : null,
-				project: launch.cwd,
-			})
-		)
-			return;
-		await runRootCommand(launchParsed, launch.args);
 	}
 }

@@ -3,6 +3,8 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as brokerEnsure from "../src/sdk/broker/ensure";
+import { resolveSessionLocator } from "../src/sdk/broker/session-index";
+import { resolveScopeRequest } from "../src/sdk/broker/session-scope";
 import { lifecycleRequestTimeoutMs } from "../src/sdk/broker/startup-budget";
 import { SdkClient } from "../src/sdk/client/client";
 import * as sdkDiscovery from "../src/sdk/client/discovery";
@@ -161,7 +163,12 @@ describe("SessionLifecycleService", () => {
 				ok: true,
 				result: {
 					indexSeq: 7,
-					sessions: [{ sessionId: "second", locator: { repo: "/workspace" } }],
+					sessions: [
+						{
+							sessionId: "second",
+							locator: { cwd: "/workspace", worktreeRoot: null, stateRoot: "/workspace/.gjc/state" },
+						},
+					],
 					warnings: ["second-page-warning"],
 				},
 			},
@@ -176,7 +183,11 @@ describe("SessionLifecycleService", () => {
 				indexSeq: 7,
 				sessions: [
 					{ sessionId: "first", live: true },
-					{ sessionId: "second", repo: "/workspace" },
+					{
+						sessionId: "second",
+						cwd: "/workspace",
+						locator: { cwd: "/workspace", worktreeRoot: null, stateRoot: "/workspace/.gjc/state" },
+					},
 				],
 				warnings: ["first-page-warning"],
 				savedSession: { id: "saved", path: "/saved.jsonl", identity: savedTranscriptIdentity },
@@ -186,6 +197,62 @@ describe("SessionLifecycleService", () => {
 			{ operation: "session.list", input: {}, options: {} },
 			{ operation: "session.list", input: { cursor: "page-2" }, options: {} },
 		]);
+	});
+	it("rejects scoped pagination when a later page drifts from the frozen observation", async () => {
+		const { service, client } = serviceWith();
+		const anchor = await resolveSessionLocator(process.cwd(), path.join(process.cwd(), ".gjc", "state"));
+		const scopeRequest = {
+			version: 1 as const,
+			requested: "global" as const,
+			requestAnchor: { cwd: anchor.cwd, worktreeRoot: anchor.worktreeRoot },
+		};
+		const scope = await resolveScopeRequest(scopeRequest);
+		client.responses.push(
+			{
+				ok: true,
+				result: {
+					indexSeq: 7,
+					sessions: [],
+					warnings: [],
+					scope,
+					observedAt: "2026-08-25T03:00:00.000Z",
+					continuationCursor: "next",
+				},
+			},
+			{
+				ok: true,
+				result: { indexSeq: 8, sessions: [], warnings: [], scope, observedAt: "2026-08-25T03:00:01.000Z" },
+			},
+		);
+		const result = await service.list({ actor, capability: "session.list", target: { scope: scopeRequest } });
+		expect(result).toMatchObject({ ok: false, certainty: "uncertain", error: { code: "scope_observation_drift" } });
+	});
+	it("maps malformed scoped locator rows to a malformed_response failure", async () => {
+		const anchor = await resolveSessionLocator(process.cwd(), path.join(process.cwd(), ".gjc", "state"));
+		const scopeRequest = {
+			version: 1 as const,
+			requested: "global" as const,
+			requestAnchor: { cwd: anchor.cwd, worktreeRoot: anchor.worktreeRoot },
+		};
+		const scope = await resolveScopeRequest(scopeRequest);
+		const { service } = serviceWith({
+			ok: true,
+			result: {
+				indexSeq: 7,
+				sessions: [{ sessionId: "malformed", locator: { cwd: "/workspace", worktreeRoot: null } }],
+				warnings: [],
+				scope,
+				observedAt: "2026-08-25T03:00:00.000Z",
+			},
+		});
+
+		await expect(
+			service.list({ actor, capability: "session.list", target: { scope: scopeRequest } }),
+		).resolves.toMatchObject({
+			ok: false,
+			certainty: "uncertain",
+			error: { code: "malformed_response" },
+		});
 	});
 	it("fails safely when a Broker list cursor repeats", async () => {
 		const { service, client } = serviceWith();

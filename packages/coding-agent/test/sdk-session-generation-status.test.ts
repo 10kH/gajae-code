@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { processIncarnation } from "../src/sdk/broker/process-incarnation";
-import { SessionIndex } from "../src/sdk/broker/session-index";
+import { SessionIndex, type SessionLocatorV2 } from "../src/sdk/broker/session-index";
 import { SessionRouter } from "../src/sdk/router";
 
 const tempDirs: string[] = [];
@@ -20,13 +20,17 @@ async function fixture(policy: ConstructorParameters<typeof SessionIndex>[1] = {
 	tempDirs.push(agentDir);
 	const index = await new SessionIndex(agentDir, policy).open();
 	const router = new SessionRouter({ agentDir, deps: { createIndex: () => index } });
-	const locator = { repo: agentDir, stateRoot: path.join(agentDir, ".gjc", "state") };
+	const locator: SessionLocatorV2 = {
+		cwd: agentDir,
+		worktreeRoot: null,
+		stateRoot: path.join(agentDir, ".gjc", "state"),
+	};
 	return { agentDir, index, locator, router };
 }
 
 async function register(
 	index: SessionIndex,
-	locator: { repo: string; stateRoot: string },
+	locator: SessionLocatorV2,
 	sessionId: string,
 	endpointGeneration: number,
 	options: { hostIncarnation?: string; ts?: number } = {},
@@ -45,7 +49,7 @@ async function register(
 
 async function retire(
 	index: SessionIndex,
-	locator: { repo: string; stateRoot: string },
+	locator: SessionLocatorV2,
 	sessionId: string,
 	endpointGeneration: number,
 	type: "host_unregistered" | "session_closed" | "session_deleted",
@@ -189,7 +193,7 @@ describe("SessionRouter exact generation status", () => {
 		await register(index, locator, "ambiguous-session", 1);
 		await register(
 			index,
-			{ repo: locator.repo, stateRoot: path.join(locator.repo, "foreign-state") },
+			{ cwd: locator.cwd, worktreeRoot: locator.worktreeRoot, stateRoot: path.join(locator.cwd, "foreign-state") },
 			"ambiguous-session",
 			2,
 		);
@@ -204,8 +208,9 @@ describe("SessionRouter exact generation status", () => {
 	test("ignores a terminal historical root when the same generation is live on a new root", async () => {
 		const { index, locator, router } = await fixture();
 		const replacementLocator = {
-			repo: locator.repo,
-			stateRoot: path.join(locator.repo, "replacement-state"),
+			cwd: locator.cwd,
+			worktreeRoot: locator.worktreeRoot,
+			stateRoot: path.join(locator.cwd, "replacement-state"),
 		};
 		await register(index, locator, "resolved-root-session", 2);
 		await retire(index, locator, "resolved-root-session", 2, "host_unregistered");
@@ -220,7 +225,11 @@ describe("SessionRouter exact generation status", () => {
 	test("revalidates process incarnation after replay before reporting current", async () => {
 		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-generation-pid-reuse-"));
 		tempDirs.push(agentDir);
-		const locator = { repo: agentDir, stateRoot: path.join(agentDir, ".gjc", "state") };
+		const locator: SessionLocatorV2 = {
+			cwd: agentDir,
+			worktreeRoot: null,
+			stateRoot: path.join(agentDir, ".gjc", "state"),
+		};
 		let running = true;
 		let observedIncarnation = "linux:100";
 		const index = await new SessionIndex(
@@ -246,7 +255,11 @@ describe("SessionRouter exact generation status", () => {
 	test("retries when the index changes between the observation plan and commit", async () => {
 		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-generation-plan-race-"));
 		tempDirs.push(agentDir);
-		const locator = { repo: agentDir, stateRoot: path.join(agentDir, ".gjc", "state") };
+		const locator: SessionLocatorV2 = {
+			cwd: agentDir,
+			worktreeRoot: null,
+			stateRoot: path.join(agentDir, ".gjc", "state"),
+		};
 		let index: SessionIndex;
 		let raced = false;
 		index = await new SessionIndex(
@@ -295,7 +308,7 @@ describe("SessionRouter exact generation status", () => {
 		for (let generation = 1; generation <= 33; generation++)
 			await register(
 				index,
-				{ repo: agentDir, stateRoot: path.join(agentDir, `state-${generation}`) },
+				{ cwd: agentDir, worktreeRoot: null, stateRoot: path.join(agentDir, `state-${generation}`) },
 				"probe-budget-session",
 				generation,
 			);
@@ -349,7 +362,7 @@ describe("SessionRouter exact generation status", () => {
 		expect(serialized).not.toContain("token");
 		expect(serialized).not.toContain("url");
 		expect(serialized).not.toContain("pid");
-		expect(serialized).not.toContain(locator.repo);
+		expect(serialized).not.toContain(locator.cwd);
 		expect(serialized).not.toContain("endpointMtime");
 		expect(serialized).not.toContain("incarnation");
 		expect(serialized).not.toContain("lifecycleRequest");

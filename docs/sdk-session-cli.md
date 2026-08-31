@@ -60,7 +60,9 @@ from Git scopes deterministically and reported in `warnings`.
 The raw global `session.list` route remains unfiltered, and `inspect`, `send`,
 `status`, `tail`, `retire`, and raw control/query behavior is unchanged.
 
-- `sessionId` and the `locator` (`repo`, `stateRoot`);
+- `sessionId` and the `locator` (`cwd`, `worktreeRoot`, `stateRoot`), where `cwd`
+  is the canonical workspace directory and `worktreeRoot` is the canonical Git
+  worktree root or `null` outside a worktree;
 - `endpointGeneration`, `pid`, `live`, `deleted` (tombstone), `indexSeq`;
 - `hostIncarnation` and `identityProvenance` (`composite` | `legacy`);
 - `activity` (`{state: active|idle, at}`) and `lastHeartbeatAt`;
@@ -247,3 +249,53 @@ envelope to stdout with a non-zero exit: usage errors exit `2`, operational
 failures (broker unavailable, session unavailable, retention gap, wait
 timeout) exit `1`. Error details are recursively redacted of secret-shaped
 fields before rendering.
+
+## Scoped search (`gjc sdk search`)
+
+`gjc sdk search [--scope repo|pwd|global] [--limit N] [--cursor <token>] [--json]`
+lists broker-visible sessions inside one exact scope. The default scope is
+`repo`: the identical canonical Git worktree of the invoking directory, never a
+path prefix or subtree. `pwd` matches the exact canonical working directory and
+`global` covers every broker-visible row.
+
+Every result — table and JSON, populated and empty — carries a scope/status
+envelope: the requested scope, the canonical resolved scope, a status
+(`populated`, `empty`, `not-in-git-worktree`, `unavailable`), and the
+observation time. Running `--scope repo` outside a Git worktree is a successful
+empty result (`not-in-git-worktree`, exit 0) and never falls back to `pwd` or
+`global`. Broker unavailability keeps the locally resolved scope, exits
+non-zero, and stays credential-free. Continuation cursors are frozen: a
+continuation that supplies a different scope or anchor fails with
+`scope_cursor_mismatch` instead of re-scoping.
+
+Rows are probed only after scope filtering, through broker/router-owned
+credential-free attachments, yielding `reachable`, `unreachable`, or `stale`.
+
+## Local-only spawn (`gjc sdk spawn`)
+
+`gjc sdk spawn --cwd <dir> --prompt <task> [--model <selector>] [--profile <name>] [--json]`
+creates one task-seeded background child session through the broker. It is
+legal only inside a live interactive `gjc --master` session: the command needs
+the master's transient capability (threaded through the master session
+environment) and the broker verifies it against the live effective master host
+before any effect. Spawn is prohibited on MCP, ACP, daemon CLI/raw session CLI,
+Telegram, Discord, and Slack surfaces.
+
+Each invocation uses a fresh idempotency identity. One identity produces at
+most one child substrate and one seed prompt; repeated requests replay the
+stored outcome. A semantically new task requires a new invocation, never a
+retry of an old identity. `spawn_in_progress` and `terminal_uncertain` are
+honest durable states: inspect with `gjc sdk search` or session status instead
+of retrying blindly.
+
+The task text and master capability never persist anywhere in broker state —
+no plaintext, hash, or derived verifier appears in the lifecycle ledger, spawn
+authority journal, receipts, logs, or output. Spawn output renders only safe
+fields: result code, claim id, child session id, substrate kind, and opaque
+seed facts.
+
+Close spawned children through the standard `session.close` path; the broker
+closes only an exactly re-proven substrate and retains uncertainty on identity
+mismatch. Children orphaned by confirmed master loss are reaped after
+`sdk.masterOrphanGraceMs` (default 120000 ms, bounded 60000..3600000), with the
+orphan clock preserved across broker restarts.

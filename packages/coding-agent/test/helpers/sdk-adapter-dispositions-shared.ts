@@ -273,6 +273,14 @@ export function inputFor(operation: Operation, secret = false): Record<string, u
 			return { id: "missing-extension", on: true };
 		case "session.cwd.move":
 			return { path: process.cwd() };
+		case "session.spawn":
+			return {
+				cwd: process.cwd(),
+				task: "adapter disposition probe",
+				masterCapability: "capability-shaped-probe",
+				model: "openai/gpt-4o-mini",
+				profile: "default",
+			};
 		case "session.get_endpoint":
 			return { sessionId: "missing-session" };
 		case "transcript.body":
@@ -326,7 +334,7 @@ export async function fixture(): Promise<AdapterFixture> {
 	await broker.index.append({
 		type: "host_registered",
 		sessionId,
-		locator: { repo, stateRoot },
+		locator: { cwd: repo, worktreeRoot: null, stateRoot },
 		endpointGeneration: 1,
 		pid: process.pid,
 		processIncarnation: hostIncarnation,

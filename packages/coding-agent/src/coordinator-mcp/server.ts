@@ -1530,7 +1530,10 @@ function brokerSessionId(record: Record<string, unknown>): string | null {
 }
 
 function brokerSessionScope(record: Record<string, unknown>): string | null {
-	return firstString(asRecord(record.locator) ?? {}, ["repo"]);
+	// Locator v2 records the canonical workspace directory as `cwd`; the removed
+	// `repo` field is never translated, so reading it here silently dropped every
+	// broker row and failed open with an empty scoped listing.
+	return firstString(asRecord(record.locator) ?? {}, ["cwd"]);
 }
 
 function sameCanonicalPath(left: string, right: string, platform: NodeJS.Platform): boolean {

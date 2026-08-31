@@ -877,3 +877,22 @@ End-to-end manual check once `gjc notify setup` has paired your private chat:
 Commands are accepted only from the paired chat. Duplicate Telegram updates and
 replayed topic reservations reuse their original request identity; they never
 allocate or spawn a second session.
+
+## Master mode surfaces
+
+`gjc --master [--scope repo|pwd|global]` launches an interactive-TUI-only
+master session (default scope `repo`). The master receives one bundled
+operating-guidance block appended after custom system-prompt transformation and
+exactly one scoped, no-probe broker peer snapshot immediately before its first
+accepted provider request; idle masters collect nothing.
+
+Master orchestration is broker-routed and best effort: scoped discovery via
+`gjc sdk search` (result-level scope envelopes, exact worktree/cwd identity,
+no scope fallback) and task-seeded children via the local-only `gjc sdk spawn`
+(see docs/sdk-session-cli.md). The broker is the sole authority for
+master-created lifecycle: an opaque idempotency identity serializes each spawn
+behind a durable create-or-join claim, seed delivery is Q26-correlated (never
+blindly re-sent), close mutates only an exactly re-proven substrate, and
+orphaned children converge through ordinary close after
+`sdk.masterOrphanGraceMs`. Task text and master capability are transient
+dispatch inputs and never persist in any durable store, log, or output.

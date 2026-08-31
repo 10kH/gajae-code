@@ -115,6 +115,26 @@ describe("managed owner supervisor", () => {
 			await fs.rm(stateDir, { recursive: true, force: true });
 		}
 	});
+	it("does not persist or forward a Broker-redacted child command", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
+		try {
+			const result = await runSupervisor(
+				stateDir,
+				[
+					process.execPath,
+					"-e",
+					"if (process.env.GJC_MANAGED_OWNER_COMMAND_JSON || process.env.GJC_MANAGED_OWNER_REDACT_COMMAND) process.exit(19)",
+				],
+				{ GJC_MANAGED_OWNER_REDACT_COMMAND: "1" },
+			);
+			expect(result.exitCode, result.stderr).toBe(0);
+			const root = lifecyclePaths(stateDir, "session-2681", "generation-2681").root;
+			const files = await fs.readdir(root);
+			expect(files.filter(file => file.includes("binding") || file.includes("receipt"))).toEqual([]);
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
 
 	it("records SIGABRT through the missing native child reference path", async () => {
 		if (process.platform !== "linux") return;

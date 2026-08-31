@@ -90,14 +90,17 @@ import { acpFinalTextFromMessage } from "../acp/final-text";
 import { ensureBroker } from "../broker/ensure";
 import { publishSessionHostRuntimeEvidence, type SessionHostRuntimePublication } from "../broker/lifecycle";
 import { processIncarnation } from "../broker/process-incarnation";
-import { SessionIndex } from "../broker/session-index";
+import { resolveSessionLocator, SessionIndex } from "../broker/session-index";
 import {
 	CAP_GATED_FRAME_KINDS,
 	createSdkSurfaceFactory,
+	masterAttestationForEffectiveHost,
+	reattestMasterSessionIdentity,
 	type SessionSdkHost,
 	SessionSdkSessionRuntime,
 	shouldHostSdk,
 	TOOL_ACTIVITY_CAPABILITY,
+	verifyMasterCapabilityFrame,
 } from "../host";
 import { type AbortScope, type ControlSurface, dispatchControl, TypedControlError } from "../host/control";
 import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "../host/control/runtime-gate";
@@ -4043,6 +4046,12 @@ export function createNotificationsExtension(
 		controller?: NotificationSessionController;
 		/** Whether this host mode can own the root SDK endpoint. Default: true. */
 		sdkHostModeSupported?: boolean;
+		/** In-memory master capability for private broker verification only. */
+		masterCapability?: string;
+		/** Opaque direct-role epoch this effective host may adopt. */
+		masterAttestationEpoch?: string;
+		/** Stable master lineage identity retained across session switches/branches. */
+		masterOwnerSessionId?: string;
 		onSdkRequest?: (kind: "control" | "query", connectionId: string, frame: Record<string, unknown>) => void;
 		runBtwTurn?: (question: string, signal: AbortSignal) => Promise<{ replyText: string }>;
 		/** Observes settlement of optional session-branch startup after reconciliation completes. */
@@ -4103,6 +4112,7 @@ export function createNotificationsExtension(
 		  }
 		| undefined;
 	let extensionShuttingDown = false;
+	const consumedMasterNonces = new Map<string, number>();
 
 	async function ensureTelegramOwner(settings: Settings): Promise<"ready" | "blocked_identity"> {
 		if (!telegramTopicsEnabled()) return "blocked_identity";
@@ -6588,6 +6598,7 @@ export function createNotificationsExtension(
 		}
 
 		sdkRuntime = new SessionSdkSessionRuntime({
+			masterOwnerSessionId: options.masterOwnerSessionId,
 			transport: {
 				sessionId: id,
 				stateRoot,
@@ -6607,6 +6618,13 @@ export function createNotificationsExtension(
 			...(activationGate ? { activationGate } : {}),
 			...(settings ? { settings } : {}),
 			...(configOverrides ? { configOverrides } : {}),
+			masterCapabilityVerify: frame =>
+				verifyMasterCapabilityFrame({
+					frame,
+					expectedCapability: options.masterCapability,
+					expectedEpoch: options.masterAttestationEpoch,
+					replay: consumedMasterNonces,
+				}),
 			connectionCapabilities: connectionId => hostCapCache.get(connectionId),
 			installProviderDefinitions,
 			onProviderDefinitionsRemoved: removeProviderDefinitions,
@@ -7758,13 +7776,36 @@ export function createNotificationsExtension(
 					throwIfLifecycleStopped();
 					const index = await new SessionIndex(agentDir).open();
 					throwIfLifecycleStopped();
-					const locator = { repo: path.resolve(ctx.cwd), stateRoot: endpointStateRoot };
-					const endpointMtimeMs = fs.statSync(path.join(endpointStateRoot, "sdk", `${id}.json`)).mtimeMs;
+					const locator = await resolveSessionLocator(ctx.cwd, endpointStateRoot);
+					const endpointPath = path.join(endpointStateRoot, "sdk", `${id}.json`);
+					const endpointMtimeMs = fs.statSync(endpointPath).mtimeMs;
+					const endpointIdentity = fs.statSync(endpointPath, { bigint: true });
+					const endpointFileId = `${endpointIdentity.dev}:${endpointIdentity.ino}`;
 					const hostProcessIncarnation = processIncarnation(process.pid);
+					const direct = await reattestMasterSessionIdentity({
+						index,
+						locator,
+						masterCapability: options.masterCapability,
+						attestationEpoch: options.masterAttestationEpoch,
+						ownerSessionId: options.masterOwnerSessionId,
+						sessionId: id,
+						pid: process.pid,
+						processIncarnation: hostProcessIncarnation,
+					});
+					throwIfLifecycleStopped();
 					await host.registerWithBroker({
 						// The endpoint is written before registration. Its exact mtime
 						// binds this index generation to that discovery record.
 						register: async input => {
+							const masterRole = masterAttestationForEffectiveHost({
+								masterCapability: options.masterCapability,
+								attestationEpoch: options.masterAttestationEpoch,
+								ownerSessionId: options.masterOwnerSessionId,
+								sessionId: input.sessionId,
+								pid: process.pid,
+								processIncarnation: hostProcessIncarnation,
+								direct,
+							});
 							await index.append({
 								type: "host_registered",
 								...input,
@@ -7776,6 +7817,8 @@ export function createNotificationsExtension(
 								// teardown identity provable after that workspace is gone.
 								...(hostProcessIncarnation ? { processIncarnation: hostProcessIncarnation } : {}),
 								endpointMtimeMs,
+								endpointFileId,
+								...(masterRole ? { masterRole } : {}),
 								...(lifecycleRequestId ? { lifecycleRequestId } : {}),
 							});
 						},

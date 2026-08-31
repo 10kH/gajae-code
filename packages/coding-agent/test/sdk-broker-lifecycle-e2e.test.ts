@@ -1052,7 +1052,7 @@ const endpoint=path.join(root,'sdk',id+'.json');
 fs.writeFileSync(endpoint,JSON.stringify({sessionId:id,pid:process.pid,url:process.env.GJC_HANGING_UPGRADE_URL,token:'hang'}));
 const m=fs.statSync(endpoint).mtimeMs;
 const log=path.join(agent,'sdk','sessions','index.jsonl');fs.mkdirSync(path.dirname(log),{recursive:true});const indexSeq=fs.existsSync(log)?fs.readFileSync(log,'utf8').trim().split('\\n').filter(Boolean).length+1:1;
-const event={type:'host_registered',sessionId:id,locator:{repo:agent,stateRoot:root},endpointGeneration:1,pid:process.pid,endpointMtimeMs:m,version:1,indexSeq,ts:Date.now()};
+const event={type:'host_registered',sessionId:id,locator: { cwd: agent, worktreeRoot: null, stateRoot: root },endpointGeneration:1,pid:process.pid,endpointMtimeMs:m,version:1,indexSeq,ts:Date.now()};
 event.checksum=crypto.createHash('sha256').update(JSON.stringify(event)).digest('hex');fs.appendFileSync(log,JSON.stringify(event)+'\\n');
 setInterval(()=>{},1000);
 `,
@@ -1119,7 +1119,7 @@ fs.writeFileSync(path.join(agent,'fixture.request.json'),process.env.GJC_SDK_LIF
 fs.writeFileSync(path.join(root,'sdk',id+'.json'),JSON.stringify({sessionId:id,pid:process.pid,url:'ws://127.0.0.1:1',token:'fake'}));
 const m=fs.statSync(path.join(root,'sdk',id+'.json')).mtimeMs;
 const log=path.join(agent,'sdk','sessions','index.jsonl');fs.mkdirSync(path.dirname(log),{recursive:true});const indexSeq=fs.existsSync(log)?fs.readFileSync(log,'utf8').trim().split('\\n').filter(Boolean).length+1:1;
-const event={type:'host_registered',sessionId:id,locator:{repo:'fixture',stateRoot:root},endpointGeneration:1,pid:process.pid,endpointMtimeMs:m,version:1,indexSeq,ts:Date.now()};
+const event={type:'host_registered',sessionId:id,locator: { cwd: 'fixture', worktreeRoot: null, stateRoot: root },endpointGeneration:1,pid:process.pid,endpointMtimeMs:m,version:1,indexSeq,ts:Date.now()};
 event.checksum=crypto.createHash('sha256').update(JSON.stringify(event)).digest('hex');fs.appendFileSync(log,JSON.stringify(event)+'\\n');
 setInterval(()=>{},1000);
 `,
@@ -2723,12 +2723,12 @@ await fs.mkdir(path.dirname(endpoint), { recursive: true, mode: 0o700 });
 await fs.writeFile(endpoint, JSON.stringify({ sessionId: request.sessionId, pid: process.pid, url: "ws://127.0.0.1:1", token: "owned-startup-failure" }), { mode: 0o600 });
 const index = await new SessionIndex(process.env.GJC_AGENT_DIR!).open();
 const endpointGeneration = 1;
-await index.append({ type: "host_registered", sessionId: request.sessionId, locator: { repo: request.cwd, stateRoot: request.stateRoot }, endpointGeneration, pid: process.pid, endpointMtimeMs: (await fs.stat(endpoint)).mtimeMs, lifecycleRequestId: request.effectMarker });
+await index.append({ type: "host_registered", sessionId: request.sessionId, locator: { cwd: request.cwd, worktreeRoot: null, stateRoot: request.stateRoot }, endpointGeneration, pid: process.pid, endpointMtimeMs: (await fs.stat(endpoint)).mtimeMs, lifecycleRequestId: request.effectMarker });
 const source = await fs.readFile(request.sessionPath);
 const stat = await fs.stat(request.sessionPath, { bigint: true });
 await writeSessionLifecycleFailure(request.stateRoot, request.sessionId, request.effectMarker, { phase: "startup", reason: "failed", message: "owned synthetic startup failure" }, { endpointGeneration, fenced: true, runtimeRemoved: true, hostStopped: true, brokerRegistrationReleased: true }, { digest: createHash("sha256").update(source).digest("hex"), identity: { dev: stat.dev.toString(), ino: stat.ino.toString(), size: Number(stat.size), mtimeMs: Number(stat.mtimeMs), mtimeNs: stat.mtimeNs.toString(), sha256: createHash("sha256").update(source).digest("hex") } });
 
-await index.append({ type: "host_unregistered", sessionId: request.sessionId, locator: { repo: request.cwd, stateRoot: request.stateRoot }, endpointGeneration, pid: process.pid, lifecycleRequestId: request.effectMarker });
+await index.append({ type: "host_unregistered", sessionId: request.sessionId, locator: { cwd: request.cwd, worktreeRoot: null, stateRoot: request.stateRoot }, endpointGeneration, pid: process.pid, lifecycleRequestId: request.effectMarker });
 await fs.rm(endpoint);
 `,
 		);
@@ -2896,7 +2896,7 @@ test("session index rejects a stale unregister from an earlier matching PID-gene
 	const host = spawnDisposableHost();
 	const shared = {
 		sessionId: "reused-registration",
-		locator: { repo: "fixture", stateRoot: path.join(agentDir, "state") },
+		locator: { cwd: "fixture", worktreeRoot: null, stateRoot: path.join(agentDir, "state") },
 		endpointGeneration: 5,
 		pid: host.pid,
 		lifecycleRequestId: "same-marker",
@@ -2919,7 +2919,7 @@ test("session index proves ordinary host unregistration using a newer matching r
 	const host = spawnDisposableHost();
 	const shared = {
 		sessionId: "ordinary-host",
-		locator: { repo: "fixture", stateRoot: path.join(agentDir, "state") },
+		locator: { cwd: "fixture", worktreeRoot: null, stateRoot: path.join(agentDir, "state") },
 		endpointGeneration: 6,
 		pid: host.pid,
 	};
@@ -3074,7 +3074,7 @@ const endpoint=path.join(root,'sdk',id+'.json');
 fs.writeFileSync(endpoint,JSON.stringify({sessionId:id,pid:process.ppid,url:process.env.GJC_FOREIGN_ENDPOINT_URL,token:'foreign'}));
 const m=fs.statSync(endpoint).mtimeMs;
 const log=path.join(agent,'sdk','sessions','index.jsonl');fs.mkdirSync(path.dirname(log),{recursive:true});const indexSeq=fs.existsSync(log)?fs.readFileSync(log,'utf8').trim().split('\\n').filter(Boolean).length+1:1;
-const event={type:'host_registered',sessionId:id,locator:{repo:'foreign',stateRoot:root},endpointGeneration:1,pid:process.ppid,endpointMtimeMs:m,version:1,indexSeq,ts:Date.now()};
+const event={type:'host_registered',sessionId:id,locator: { cwd: 'foreign', worktreeRoot: null, stateRoot: root },endpointGeneration:1,pid:process.ppid,endpointMtimeMs:m,version:1,indexSeq,ts:Date.now()};
 event.checksum=crypto.createHash('sha256').update(JSON.stringify(event)).digest('hex');fs.appendFileSync(log,JSON.stringify(event)+'\\n');
 setInterval(()=>{},1000);
 `,
@@ -3130,7 +3130,7 @@ test("broker fences ambiguous state roots from checkpoint, endpoint, and resume 
 		const alternate = await broker.index.append({
 			type: "host_registered",
 			sessionId,
-			locator: { repo: root, stateRoot: alternateStateRoot },
+			locator: { cwd: root, worktreeRoot: null, stateRoot: alternateStateRoot },
 			endpointGeneration: 1,
 			pid: process.pid,
 			endpointMtimeMs: 1,
@@ -3138,7 +3138,7 @@ test("broker fences ambiguous state roots from checkpoint, endpoint, and resume 
 		const current = await broker.index.append({
 			type: "host_registered",
 			sessionId,
-			locator: { repo: root, stateRoot },
+			locator: { cwd: root, worktreeRoot: null, stateRoot },
 			endpointGeneration: 2,
 			pid: process.pid,
 			endpointMtimeMs,
@@ -3204,7 +3204,7 @@ test("broker fences ambiguous state roots from checkpoint, endpoint, and resume 
 		const replayAlternate = await broker.index.append({
 			type: "host_registered",
 			sessionId,
-			locator: { repo: root, stateRoot: alternateStateRoot },
+			locator: { cwd: root, worktreeRoot: null, stateRoot: alternateStateRoot },
 			endpointGeneration: alternate.endpointGeneration,
 			pid: process.pid,
 			endpointMtimeMs: 1,
@@ -3256,7 +3256,7 @@ test("broker promotes the lower-generation root after the higher-generation root
 		const alternate = await broker.index.append({
 			type: "host_registered",
 			sessionId,
-			locator: { repo: alternateRepo, stateRoot: alternateStateRoot },
+			locator: { cwd: alternateRepo, worktreeRoot: null, stateRoot: alternateStateRoot },
 			endpointGeneration: 1,
 			pid: process.pid,
 			endpointMtimeMs: alternateEndpointMtimeMs,
@@ -3264,7 +3264,7 @@ test("broker promotes the lower-generation root after the higher-generation root
 		const current = await broker.index.append({
 			type: "host_registered",
 			sessionId,
-			locator: { repo: root, stateRoot: currentStateRoot },
+			locator: { cwd: root, worktreeRoot: null, stateRoot: currentStateRoot },
 			endpointGeneration: 2,
 			pid: process.pid,
 			endpointMtimeMs: 1,
@@ -3311,7 +3311,7 @@ test("broker refuses a stale registered PID when no durable effect marker proves
 		await broker.index.append({
 			type: "host_registered",
 			sessionId: "stale",
-			locator: { repo: "fixture", stateRoot },
+			locator: { cwd: "fixture", worktreeRoot: null, stateRoot },
 			endpointGeneration: 1,
 			pid: host.pid,
 		});
@@ -3346,7 +3346,7 @@ test("broker closes a live host whose workspace state root is gone using its reg
 		await broker.index.append({
 			type: "host_registered",
 			sessionId: "wrong-incarnation",
-			locator: { repo: "fixture", stateRoot },
+			locator: { cwd: "fixture", worktreeRoot: null, stateRoot },
 			endpointGeneration: 1,
 			pid,
 			processIncarnation: `${incarnation}-recycled`,
@@ -3367,7 +3367,7 @@ test("broker closes a live host whose workspace state root is gone using its reg
 		await broker.index.append({
 			type: "host_registered",
 			sessionId: "orphan",
-			locator: { repo: "fixture", stateRoot },
+			locator: { cwd: "fixture", worktreeRoot: null, stateRoot },
 			endpointGeneration: 1,
 			pid,
 			processIncarnation: incarnation,
@@ -3413,7 +3413,7 @@ test("broker refuses same-generation close authority from a prior endpoint incar
 		await broker.index.append({
 			type: "host_registered",
 			sessionId,
-			locator: { repo: "fixture", stateRoot },
+			locator: { cwd: "fixture", worktreeRoot: null, stateRoot },
 			endpointGeneration: 1,
 			pid: host.pid,
 			endpointMtimeMs,
@@ -3479,7 +3479,7 @@ test("dead endpoint cleanup preserves a successor rebound between capture and na
 		await broker.index.append({
 			type: "host_registered",
 			sessionId,
-			locator: { repo: root, stateRoot },
+			locator: { cwd: root, worktreeRoot: null, stateRoot },
 			endpointGeneration: 1,
 			pid: child.pid,
 			endpointMtimeMs,
@@ -3549,7 +3549,7 @@ test("broker rebinds implicit close only for a matching non-empty lifecycle requ
 			);
 			const replacementIncarnation = successor ? `${processIdentity}:successor` : processIdentity;
 			const sessionId = `close-rebind-${label}`;
-			const locator = { repo: "fixture", stateRoot };
+			const locator = { cwd: "fixture", worktreeRoot: null, stateRoot };
 			await fs.writeFile(
 				path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`),
 				JSON.stringify({
@@ -3630,7 +3630,7 @@ test("broker atomically reuses the indexed live owner for distinct resume keys",
 		await broker.index.append({
 			type: "host_registered",
 			sessionId,
-			locator: { repo: root, stateRoot },
+			locator: { cwd: root, worktreeRoot: null, stateRoot },
 			endpointGeneration: 17,
 			pid: host.pid,
 			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
@@ -3640,7 +3640,7 @@ test("broker atomically reuses the indexed live owner for distinct resume keys",
 		await broker.index.append({
 			type: "host_heartbeat",
 			sessionId,
-			locator: { repo: root, stateRoot },
+			locator: { cwd: root, worktreeRoot: null, stateRoot },
 			endpointGeneration: 17,
 			pid: host.pid,
 			processIncarnation: hostIncarnation,
@@ -3694,7 +3694,7 @@ test("broker never signals a PID reused after its lifecycle marker was written",
 		await broker.index.append({
 			type: "host_registered",
 			sessionId,
-			locator: { repo: "fixture", stateRoot },
+			locator: { cwd: "fixture", worktreeRoot: null, stateRoot },
 			endpointGeneration: 7,
 			pid: host.pid,
 			endpointMtimeMs: (await fs.stat(endpoint)).mtimeMs,
@@ -3769,7 +3769,7 @@ test("broker binds close-escalation terminal uncertainty to the indexed reused-p
 		await broker.index.append({
 			type: "host_registered",
 			sessionId,
-			locator: { repo: agentDir, stateRoot },
+			locator: { cwd: agentDir, worktreeRoot: null, stateRoot },
 			endpointGeneration: 1,
 			pid: child.pid,
 			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
@@ -3843,7 +3843,7 @@ test("broker records terminal uncertainty when SIGKILL re-verification fails aft
 		await broker.index.append({
 			type: "host_registered",
 			sessionId,
-			locator: { repo: "fixture", stateRoot },
+			locator: { cwd: "fixture", worktreeRoot: null, stateRoot },
 			endpointGeneration: 9,
 			pid: child.pid,
 			endpointMtimeMs: (await fs.stat(endpoint)).mtimeMs,
@@ -3888,7 +3888,7 @@ test("reconcile_uncertain retires one dead create identity and refuses live host
 		await broker.index.append({
 			type: "lifecycle_terminal",
 			sessionId,
-			locator: { repo: agentDir, stateRoot },
+			locator: { cwd: agentDir, worktreeRoot: null, stateRoot },
 			endpointGeneration: 4,
 			pid: child.pid!,
 			endpointMtimeMs: 1,
@@ -4046,7 +4046,7 @@ test("reconcile_uncertain replays a ledger-stage receipt after deletion and same
 		await broker.index.append({
 			type: "host_registered",
 			sessionId,
-			locator: { repo: agentDir, stateRoot },
+			locator: { cwd: agentDir, worktreeRoot: null, stateRoot },
 			endpointGeneration: input.endpointGeneration,
 			pid: process.pid,
 			endpointMtimeMs: input.endpointMtimeMs,
@@ -4057,7 +4057,7 @@ test("reconcile_uncertain replays a ledger-stage receipt after deletion and same
 		await broker.index.append({
 			type: "host_registered",
 			sessionId,
-			locator: { repo: agentDir, stateRoot },
+			locator: { cwd: agentDir, worktreeRoot: null, stateRoot },
 			endpointGeneration: input.endpointGeneration,
 			pid: child.pid,
 			endpointMtimeMs: input.endpointMtimeMs,
@@ -4068,7 +4068,7 @@ test("reconcile_uncertain replays a ledger-stage receipt after deletion and same
 		await broker.index.append({
 			type: "lifecycle_terminal",
 			sessionId,
-			locator: { repo: agentDir, stateRoot },
+			locator: { cwd: agentDir, worktreeRoot: null, stateRoot },
 			endpointGeneration: input.endpointGeneration,
 			pid: child.pid,
 			endpointMtimeMs: input.endpointMtimeMs,
@@ -4208,7 +4208,7 @@ test("reconcile_uncertain fails closed when deletion wins the closure append rac
 		await broker.index.append({
 			type: "lifecycle_terminal",
 			sessionId,
-			locator: { repo: agentDir, stateRoot },
+			locator: { cwd: agentDir, worktreeRoot: null, stateRoot },
 			endpointGeneration: input.endpointGeneration,
 			pid: child.pid,
 			endpointMtimeMs: input.endpointMtimeMs,
@@ -4334,7 +4334,7 @@ test("dead-registration sweeps retain terminal rows without appending duplicate 
 		await broker.index.append({
 			type: "host_registered",
 			sessionId: "sweep-terminal",
-			locator: { repo: agentDir, stateRoot },
+			locator: { cwd: agentDir, worktreeRoot: null, stateRoot },
 			endpointGeneration: 1,
 			pid: deadPid,
 		});
@@ -4366,7 +4366,7 @@ test("dead-registration sweep retains stale and uncertain live registrations", a
 		await broker.index.append({
 			type: "host_registered",
 			sessionId: "sweep-stale-heartbeat",
-			locator: { repo: agentDir, stateRoot },
+			locator: { cwd: agentDir, worktreeRoot: null, stateRoot },
 			endpointGeneration: 1,
 			pid: process.pid,
 			processIncarnation: hostIncarnation,
@@ -4389,7 +4389,7 @@ test("dead-registration sweep retains stale and uncertain live registrations", a
 		await broker.index.append({
 			type: "host_registered",
 			sessionId: "sweep-eperm",
-			locator: { repo: agentDir, stateRoot },
+			locator: { cwd: agentDir, worktreeRoot: null, stateRoot },
 			endpointGeneration: 2,
 			pid: epermPid,
 			processIncarnation: "unreadable-eperm",
@@ -4401,7 +4401,7 @@ test("dead-registration sweep retains stale and uncertain live registrations", a
 		await broker.index.append({
 			type: "host_registered",
 			sessionId: "sweep-unreadable-incarnation",
-			locator: { repo: agentDir, stateRoot },
+			locator: { cwd: agentDir, worktreeRoot: null, stateRoot },
 			endpointGeneration: 3,
 			pid: process.pid,
 			processIncarnation: hostIncarnation,
@@ -4434,7 +4434,7 @@ test("dead-registration sweep retires a reused identity without signaling its re
 		await broker.index.append({
 			type: "host_registered",
 			sessionId: "sweep-reused-pid",
-			locator: { repo: agentDir, stateRoot },
+			locator: { cwd: agentDir, worktreeRoot: null, stateRoot },
 			endpointGeneration: 1,
 			pid: replacement.pid,
 			processIncarnation: "retired-incarnation",
@@ -4470,7 +4470,7 @@ test("dead-registration sweep retires a dead losing root and preserves the live 
 		const live = await broker.index.append({
 			type: "host_registered",
 			sessionId: "sweep-losing-root",
-			locator: { repo: agentDir, stateRoot: liveStateRoot },
+			locator: { cwd: agentDir, worktreeRoot: null, stateRoot: liveStateRoot },
 			endpointGeneration: 1,
 			pid: process.pid,
 			processIncarnation: hostIncarnation,
@@ -4479,7 +4479,7 @@ test("dead-registration sweep retires a dead losing root and preserves the live 
 		await broker.index.append({
 			type: "host_registered",
 			sessionId: "sweep-losing-root",
-			locator: { repo: agentDir, stateRoot: deadStateRoot },
+			locator: { cwd: agentDir, worktreeRoot: null, stateRoot: deadStateRoot },
 			endpointGeneration: 2,
 			pid: deadPid,
 			processIncarnation: "dead-incarnation",
@@ -4513,7 +4513,7 @@ test("dead-registration sweep retains terminal uncertainty appended after its sn
 	try {
 		expect(() => process.kill(deadPid, 0)).toThrow();
 		await broker.start();
-		const locator = { repo: agentDir, stateRoot };
+		const locator = { cwd: agentDir, worktreeRoot: null, stateRoot };
 		await broker.index.append({
 			type: "host_registered",
 			sessionId: "sweep-race",
@@ -4561,7 +4561,7 @@ test("conditional unregister accepts a reconciled equivalent repository locator"
 		await index.append({
 			type: "host_registered",
 			sessionId: "reconciled-repo",
-			locator: { repo: repoAlias, stateRoot },
+			locator: { cwd: repoAlias, worktreeRoot: null, stateRoot },
 			endpointGeneration: 1,
 			pid: host.pid,
 			processIncarnation: hostIncarnation,
@@ -4572,7 +4572,7 @@ test("conditional unregister accepts a reconciled equivalent repository locator"
 		await index.append({
 			type: "record_reconciled",
 			sessionId: expected.sessionId,
-			locator: { repo, stateRoot },
+			locator: { cwd: repo, worktreeRoot: null, stateRoot },
 			endpointGeneration: expected.endpointGeneration,
 			pid: expected.pid,
 			processIncarnation: hostIncarnation,
@@ -4582,7 +4582,7 @@ test("conditional unregister accepts a reconciled equivalent repository locator"
 		expect(index.listSessions().sessions).toEqual([
 			expect.objectContaining({
 				sessionId: "reconciled-repo",
-				locator: { repo: repoAlias, stateRoot },
+				locator: { cwd: repoAlias, worktreeRoot: null, stateRoot },
 				identityProvenance: "composite",
 				live: false,
 				terminal: true,
@@ -4602,7 +4602,7 @@ test("close preserves terminal uncertainty when conditional endpoint unregister 
 	try {
 		expect(() => process.kill(deadPid, 0)).toThrow();
 		await broker.start();
-		const locator = { repo: root, stateRoot };
+		const locator = { cwd: root, worktreeRoot: null, stateRoot };
 		await broker.index.append({
 			type: "host_registered",
 			sessionId: "close-unregister-race",
@@ -4674,7 +4674,7 @@ test("close removes an unchanged dead endpoint with a fractional nanosecond mtim
 		await broker.index.append({
 			type: "host_registered",
 			sessionId,
-			locator: { repo: root, stateRoot },
+			locator: { cwd: root, worktreeRoot: null, stateRoot },
 			endpointGeneration: 1,
 			pid: deadPid,
 			processIncarnation: "dead-incarnation",
@@ -4724,10 +4724,10 @@ await fs.mkdir(path.dirname(endpoint), { recursive: true, mode: 0o700 });
 await fs.writeFile(endpoint, JSON.stringify({ sessionId: request.sessionId, pid: process.pid, url: "ws://127.0.0.1:1", token: "retained-startup-failure" }), { mode: 0o600 });
 const index = await new SessionIndex(process.env.GJC_AGENT_DIR!).open();
 const endpointGeneration = 1;
-await index.append({ type: "host_registered", sessionId: request.sessionId, locator: { repo: request.cwd, stateRoot: request.stateRoot }, endpointGeneration, pid: process.pid, endpointMtimeMs: (await fs.stat(endpoint)).mtimeMs, lifecycleRequestId: request.effectMarker });
+await index.append({ type: "host_registered", sessionId: request.sessionId, locator: { cwd: request.cwd, worktreeRoot: null, stateRoot: request.stateRoot }, endpointGeneration, pid: process.pid, endpointMtimeMs: (await fs.stat(endpoint)).mtimeMs, lifecycleRequestId: request.effectMarker });
 const source = await fs.readFile(request.sessionPath);
 const stat = await fs.stat(request.sessionPath, { bigint: true });
-await index.append({ type: "host_unregistered", sessionId: request.sessionId, locator: { repo: request.cwd, stateRoot: request.stateRoot }, endpointGeneration, pid: process.pid, lifecycleRequestId: request.effectMarker });
+await index.append({ type: "host_unregistered", sessionId: request.sessionId, locator: { cwd: request.cwd, worktreeRoot: null, stateRoot: request.stateRoot }, endpointGeneration, pid: process.pid, lifecycleRequestId: request.effectMarker });
 await writeSessionLifecycleFailure(request.stateRoot, request.sessionId, request.effectMarker, { phase: "startup", reason: "failed", message: "owned scrubbed startup failure" }, { endpointGeneration, fenced: true, runtimeRemoved: true, hostStopped: true, brokerRegistrationReleased: true }, { digest: createHash("sha256").update(source).digest("hex"), identity: { dev: stat.dev.toString(), ino: stat.ino.toString(), size: Number(stat.size), mtimeMs: Number(stat.mtimeMs), mtimeNs: stat.mtimeNs.toString(), sha256: createHash("sha256").update(source).digest("hex") } });
 await Bun.sleep(150);
 `,
@@ -4827,7 +4827,7 @@ test("idempotent lifecycle replay refreshes authority after a broker restart", a
 		await initial.index.append({
 			type: "host_registered",
 			sessionId,
-			locator: { repo: root, stateRoot },
+			locator: { cwd: root, worktreeRoot: null, stateRoot },
 			endpointGeneration: 2,
 			pid: host.pid,
 			endpointMtimeMs,
@@ -4837,7 +4837,7 @@ test("idempotent lifecycle replay refreshes authority after a broker restart", a
 		await initial.index.append({
 			type: "host_heartbeat",
 			sessionId,
-			locator: { repo: root, stateRoot },
+			locator: { cwd: root, worktreeRoot: null, stateRoot },
 			endpointGeneration: 2,
 			pid: host.pid,
 			processIncarnation: hostIncarnation,

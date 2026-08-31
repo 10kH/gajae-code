@@ -1,14 +1,12 @@
 export const SDK_STATE_VERSION = 1;
 
-// The session-index snapshot carries its own format version, independent of the shared
-// SDK_STATE_VERSION used by discovery, the lifecycle ledger, and per-event records.
-// Version 2 snapshots relax the on-disk schema to allow gaps in indexSeq (compaction
-// drops terminal+dead sessions and superseded heartbeats), so an older broker must
-// hard-fail rather than silently fall back to a truncated log. Version 3 snapshots may
-// additionally carry composite-identity events (hostIncarnation, activity checkpoints,
-// session_deleted tombstones) and retention-compacted sessions; v2 (and v1) snapshots
-// remain readable. Bumping only this constant keeps the broker protocol untouched.
-export const SESSION_INDEX_SNAPSHOT_VERSION = 3;
+// The session-index snapshot and event log share one format version. Version 4
+// requires SessionLocatorV2 (`cwd`, `worktreeRoot`, `stateRoot`) on every
+// retained row. New v4 events force older brokers to fail closed before they
+// misread `cwd` as the former `repo`; pre-v4 snapshots remain readable only to
+// quarantine legacy rows.
+export const SESSION_INDEX_SNAPSHOT_VERSION = 4;
+export const SESSION_INDEX_EVENT_VERSION = SESSION_INDEX_SNAPSHOT_VERSION;
 
 export class UnsupportedStateVersionError extends Error {
 	readonly code = "unsupported_state_version";
@@ -35,11 +33,25 @@ export function assertSupportedStateVersion(file: string, value: unknown): void 
 	}
 }
 
-// Fences the session-index snapshot format independently of SDK_STATE_VERSION. An older
-// broker (whose SESSION_INDEX_SNAPSHOT_VERSION is below 3) trips assertSupportedStateVersion
-// on a version-3 snapshot and refuses to start; a current broker accepts the legacy
-// contiguous format (version 1), the gapped version-2 format, and the version-3 format
-// with composite-identity events.
+/** Rejects session-index events outside the known legacy and current formats. */
+export function assertSupportedSessionIndexEventVersion(file: string, value: unknown): void {
+	if (!value || typeof value !== "object") return;
+	const record = value as { version?: unknown; stateVersion?: unknown };
+	for (const version of [record.version, record.stateVersion]) {
+		if (
+			typeof version === "number" &&
+			Number.isFinite(version) &&
+			version !== SDK_STATE_VERSION &&
+			version !== SESSION_INDEX_EVENT_VERSION
+		) {
+			throw new UnsupportedStateVersionError(file, version, SESSION_INDEX_EVENT_VERSION);
+		}
+	}
+}
+
+// Fences future session-index snapshot formats. Locator-v2 row validation below
+// rejects legacy `repo` rows without translating them, while snapshots predating
+// v4 remain readable solely to quarantine those rows with a re-register diagnostic.
 export function assertSupportedSnapshotVersion(file: string, value: unknown): void {
 	if (!value || typeof value !== "object") return;
 	const record = value as { version?: unknown; stateVersion?: unknown };

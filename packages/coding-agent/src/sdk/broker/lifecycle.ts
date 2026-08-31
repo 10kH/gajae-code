@@ -66,6 +66,7 @@ import {
 	sanitizeSdkStartupMessage,
 } from "../startup-capability";
 import type { Broker, BrokerCleanupEvidence, BrokerCleanupIdentity, BrokerResponse } from "./broker";
+import { readEndpointFile } from "./endpoint-authority";
 import { decodeLifecycleUtf8, parseLifecycleJson } from "./lifecycle-codec";
 import type {
 	LifecycleCleanupProof,
@@ -81,7 +82,12 @@ import {
 	processIncarnation,
 } from "./process-incarnation";
 import { resolveSdkInternalSpawnCommand, type SdkInternalSpawnCommand } from "./runtime";
-import { type IndexedSession, isSessionAuthorityEligible } from "./session-index";
+import {
+	type IndexedSession,
+	isSessionAuthorityEligible,
+	resolveSessionLocator,
+	type SessionLocatorV2,
+} from "./session-index";
 import {
 	cancellableSleep,
 	DEFAULT_READINESS_TIMEOUT_MS,
@@ -89,6 +95,7 @@ import {
 	READINESS_TIMEOUT_INVALID_MESSAGE,
 	startupQueueWaitMs,
 } from "./startup-budget";
+import { worktreeOccupant } from "./worktree-occupancy";
 
 export {
 	type ProcessIncarnationCommandRunner,
@@ -612,7 +619,7 @@ function text(value: unknown): string | undefined {
 	return typeof value === "string" && value ? value : undefined;
 }
 
-function validateBrokerModelPresetSync(agentDir: string, requestedProfile: string): string | BrokerResponse {
+export function validateBrokerModelPresetSync(agentDir: string, requestedProfile: string): string | BrokerResponse {
 	const modelsConfigFile = ModelsConfigFile.relocate(path.join(agentDir, "models.yml"));
 	modelsConfigFile.invalidate();
 	const loaded = modelsConfigFile.tryLoad();
@@ -733,7 +740,7 @@ function lifecycleWorktreeTarget(input: Input): SessionLifecycleWorktreeTarget |
 }
 
 type LiveResumeRecord = {
-	locator: { repo: string; stateRoot: string };
+	locator: SessionLocatorV2;
 	endpointGeneration: number;
 	pid: number;
 	endpointMtimeMs?: number;
@@ -755,7 +762,7 @@ type ResumeScope = {
 };
 function sameResumeLocator(record: LiveResumeRecord, cwd: string, root: string): boolean {
 	return (
-		resolveEquivalentPath(record.locator.repo) === resolveEquivalentPath(cwd) &&
+		resolveEquivalentPath(record.locator.cwd) === resolveEquivalentPath(cwd) &&
 		resolveEquivalentPath(record.locator.stateRoot) === resolveEquivalentPath(root)
 	);
 }
@@ -777,7 +784,7 @@ function sameLiveResumeRecord(expected: LiveResumeRecord, current: LiveResumeRec
 		current.endpointGeneration === expected.endpointGeneration &&
 		current.pid === expected.pid &&
 		current.endpointMtimeMs === expected.endpointMtimeMs &&
-		sameResumeLocator(current, expected.locator.repo, expected.locator.stateRoot)
+		sameResumeLocator(current, expected.locator.cwd, expected.locator.stateRoot)
 	);
 }
 
@@ -916,14 +923,17 @@ async function reconcileReadyScope(broker: Broker, id: string, scope: string | u
 	if (!scope) return;
 	await broker.index.refresh();
 	const record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
-	if (!record || record.locator.repo === scope) return;
-	// The host records its physical cwd, which Darwin canonicalizes from /var to
-	// /private/var. Preserve the lifecycle caller's lexical cwd for ACP's scoped
-	// listing while retaining the host-provided state root for endpoint binding.
+	if (!record) return;
+	const cwd = canonicalExistingPath(scope);
+	if (record.locator.cwd === cwd) return;
+	// Locator cwd is canonical everywhere. Reconcile only a pre-existing host row
+	// whose canonical registration race observed a different path; it never retains
+	// a caller's lexical spelling for ACP or any other scope consumer.
+	const locator = await resolveSessionLocator(scope, record.locator.stateRoot);
 	await broker.index.append({
 		type: "record_reconciled",
 		sessionId: id,
-		locator: { ...record.locator, repo: scope },
+		locator,
 		endpointGeneration: record.endpointGeneration,
 		pid: record.pid,
 		// Reconciliation only re-scopes the locator, so every identity fact the host
@@ -933,6 +943,8 @@ async function reconcileReadyScope(broker: Broker, id: string, scope: string | u
 		...(record.hostIncarnation === undefined ? {} : { hostIncarnation: record.hostIncarnation }),
 		...(record.lifecycleRequestId === undefined ? {} : { lifecycleRequestId: record.lifecycleRequestId }),
 		endpointMtimeMs: record.endpointMtimeMs,
+		...(record.endpointFileId === undefined ? {} : { endpointFileId: record.endpointFileId }),
+		...(record.masterRole === undefined ? {} : { masterRole: record.masterRole }),
 	});
 }
 
@@ -964,6 +976,66 @@ function command(broker: Broker): LifecycleCommand {
 	return lifecycleCommandResolversForTest.get(broker)?.() ?? resolveSdkInternalSpawnCommand("session-host-internal");
 }
 
+/**
+ * Reuses the ordinary lifecycle host bootstrap without performing its direct
+ * process spawn. Broker-owned substrate providers receive this exact argv and
+ * split inherited/child-specific environment contract as their only launch
+ * authority for session.spawn.
+ */
+export type SpawnChildHostLaunch = {
+	childId: string;
+	cwd: string;
+	stateRoot: string;
+	argv: readonly string[];
+	inheritedEnv: Readonly<Record<string, string>>;
+	env: Readonly<Record<string, string>>;
+	effectMarker: string;
+};
+
+export function prepareSpawnChildHostLaunch(
+	broker: Broker,
+	input: { cwd: string; modelId?: string; modelPreset?: string; childId?: string; receivedAt?: number },
+): SpawnChildHostLaunch {
+	const cwd = path.resolve(input.cwd);
+	const childId = input.childId ?? randomUUID();
+	const stateRoot = defaultStateRoot(cwd);
+	const effectMarker = randomUUID();
+	const deadlines = deriveLifecycleDeadlines(input.receivedAt ?? Date.now(), DEFAULT_READINESS_TIMEOUT_MS);
+	const request: SessionLifecycleLaunchRequest = {
+		operation: "session.create",
+		sessionId: childId,
+		cwd,
+		stateRoot,
+		effectMarker,
+		...deadlines,
+		...(input.modelId === undefined ? {} : { modelId: input.modelId }),
+		...(input.modelPreset === undefined ? {} : { modelPreset: input.modelPreset }),
+	};
+	const cmd = command(broker);
+	const inherited = "kind" in cmd ? cmd.env : process.env;
+	const inheritedEnv = Object.fromEntries(
+		Object.entries(inherited).filter(
+			(entry): entry is [string, string] => entry[0] !== "GJC_MASTER_CAPABILITY" && typeof entry[1] === "string",
+		),
+	);
+	return {
+		childId,
+		cwd,
+		stateRoot,
+		argv: [cmd.file, ...cmd.args],
+		inheritedEnv,
+		env: {
+			GJC_AGENT_DIR: broker.settings.agentDir,
+			GJC_CODING_AGENT_DIR: broker.settings.agentDir,
+			GJC_SESSION_ID: childId,
+			GJC_STATE_ROOT: stateRoot,
+			GJC_LIFECYCLE_REQUEST_ID: effectMarker,
+			GJC_SDK_LIFECYCLE_REQUEST: JSON.stringify(request),
+		},
+		effectMarker,
+	};
+}
+
 const lifecycleMarkerPath = (root: string, id: string) => path.join(root, "sdk", `${id}.lifecycle.json`);
 const lifecycleReadyPath = (root: string, id: string) => path.join(root, "sdk", `${id}.lifecycle.ready.json`);
 const lifecycleFailurePath = (root: string, id: string, effectMarker: string) =>
@@ -973,6 +1045,7 @@ type ReadyAuthority = {
 	endpoint: Record<string, unknown>;
 	endpointSource: string;
 	endpointMtimeMs: number;
+	endpointFileId?: string;
 	endpointGeneration: number;
 };
 type ReadinessResult =
@@ -3351,7 +3424,7 @@ async function recordTerminalUncertain(
 		await broker.index.append({
 			type: "lifecycle_terminal",
 			sessionId: id,
-			locator: { repo: "unknown", stateRoot: root },
+			locator: { cwd: "unknown", worktreeRoot: null, stateRoot: root },
 			endpointGeneration: 0,
 			pid,
 			terminalUncertain: true,
@@ -3667,7 +3740,10 @@ async function removeExactDeadSessionEndpoint(
 				: finalEndpointPath;
 	let handle: fs.FileHandle | undefined;
 	try {
-		handle = await fs.open(endpointSource, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
+		handle = await fs.open(
+			endpointSource,
+			fsSync.constants.O_RDONLY | (fsSync.constants.O_NOFOLLOW ?? 0) | (fsSync.constants.O_NONBLOCK ?? 0),
+		);
 		const metadata = await handle.stat({ bigint: true });
 		if (!metadata.isFile() || metadata.nlink !== 1n || metadata.size > 4096n) return false;
 		const bytes = Buffer.alloc(Number(metadata.size) + 1);
@@ -3847,10 +3923,9 @@ async function currentReadyAuthority(
 	if (!(await hasOwnedReadinessEvidence(broker, root, id, expected))) return undefined;
 	const endpointPath = path.join(root, "sdk", `${id}.json`);
 	try {
-		const [endpointSource, endpointMetadata] = await Promise.all([
-			fs.readFile(endpointPath, "utf8"),
-			fs.stat(endpointPath),
-		]);
+		const endpointFile = await readEndpointFile(endpointPath);
+		if (!endpointFile) return undefined;
+		const endpointSource = endpointFile.source;
 		const endpoint = JSON.parse(endpointSource) as {
 			sessionId?: unknown;
 			url?: unknown;
@@ -3870,7 +3945,9 @@ async function currentReadyAuthority(
 			record.terminalUncertain ||
 			record.pid !== expected.pid ||
 			resolveEquivalentPath(record.locator.stateRoot) !== resolveEquivalentPath(root) ||
-			record.endpointMtimeMs !== endpointMetadata.mtimeMs ||
+			(record.endpointFileId !== undefined && record.endpointFileId !== `${endpointFile.dev}:${endpointFile.ino}`) ||
+			(record.processIncarnation !== undefined && record.processIncarnation !== expected.incarnation) ||
+			record.endpointMtimeMs !== endpointFile.mtimeMs ||
 			endpoint.pid !== expected.pid ||
 			endpoint.sessionId !== id ||
 			typeof endpoint.url !== "string" ||
@@ -3885,7 +3962,8 @@ async function currentReadyAuthority(
 		return {
 			endpoint: endpoint as Record<string, unknown>,
 			endpointSource,
-			endpointMtimeMs: endpointMetadata.mtimeMs,
+			endpointMtimeMs: endpointFile.mtimeMs,
+			...(record.endpointFileId === undefined ? {} : { endpointFileId: record.endpointFileId }),
 			endpointGeneration: record.endpointGeneration,
 		};
 	} catch {
@@ -3897,6 +3975,7 @@ function sameReadyAuthority(left: ReadyAuthority, right: ReadyAuthority): boolea
 	return (
 		left.endpointSource === right.endpointSource &&
 		left.endpointMtimeMs === right.endpointMtimeMs &&
+		left.endpointFileId === right.endpointFileId &&
 		left.endpointGeneration === right.endpointGeneration
 	);
 }
@@ -4020,6 +4099,15 @@ function worktreeIntent(plan: GjcLaunchWorktreePlan | undefined): LifecycleWorkt
 		baseRef: plan.baseRef,
 		...(plan.branchName ? { branchName: plan.branchName } : {}),
 	};
+}
+
+/** Test seam for the worktree occupancy boundary. */
+export function worktreeOccupantForTest(
+	sessions: IndexedSession[],
+	worktreePath: string,
+	observe: (pid: number, expectedIncarnation: string | undefined) => ProcessObservation = observeProcess,
+): string | null {
+	return worktreeOccupant(sessions, worktreePath, observe);
 }
 
 function preparePlannedWorktree(plan: GjcLaunchWorktreePlan): SessionLifecycleWorktreeReceipt {
@@ -4453,7 +4541,7 @@ async function validateDeletePath(
 	broker: Broker,
 	input: Input,
 	id: string,
-	record: { locator: { repo: string; stateRoot: string } } | undefined,
+	record: { locator: SessionLocatorV2 } | undefined,
 	cleanup?: CleanupEvidence,
 ): Promise<ValidatedDelete | BrokerResponse> {
 	const sessionPath = text(input.sessionPath);
@@ -4467,7 +4555,7 @@ async function validateDeletePath(
 	const canonicalRequestedRoot = canonicalExistingPath(requestedRoot);
 	if (
 		record &&
-		(canonicalExistingPath(record.locator.repo) !== cwd ||
+		(canonicalExistingPath(record.locator.cwd) !== cwd ||
 			canonicalExistingPath(record.locator.stateRoot) !== canonicalRequestedRoot)
 	)
 		return fail("invalid_input", "session.delete locator does not match the indexed session.");
@@ -4557,7 +4645,7 @@ async function validateDeletePath(
 }
 type CloseAuthority = { endpointGeneration: number; endpointIncarnation: string };
 type CloseRecord = {
-	locator: { repo: string; stateRoot: string };
+	locator: SessionLocatorV2;
 	endpointGeneration: number;
 	pid: number;
 	endpointMtimeMs?: number;
@@ -4621,7 +4709,7 @@ function sameCloseStoredProcessIdentity(expected: CloseRecord, current: CloseRec
 		typeof expected.lifecycleRequestId === "string" &&
 		expected.lifecycleRequestId.length > 0 &&
 		current.lifecycleRequestId === expected.lifecycleRequestId &&
-		path.resolve(current.locator.repo) === path.resolve(expected.locator.repo) &&
+		path.resolve(current.locator.cwd) === path.resolve(expected.locator.cwd) &&
 		path.resolve(current.locator.stateRoot) === path.resolve(expected.locator.stateRoot)
 	);
 }
@@ -4639,7 +4727,7 @@ function sameCloseEndpointIdentity(expected: CloseRecord, current: CloseRecord):
 		current.endpointMtimeMs !== undefined &&
 		expected.endpointMtimeMs !== undefined &&
 		current.lifecycleRequestId === expected.lifecycleRequestId &&
-		path.resolve(current.locator.repo) === path.resolve(expected.locator.repo) &&
+		path.resolve(current.locator.cwd) === path.resolve(expected.locator.cwd) &&
 		path.resolve(current.locator.stateRoot) === path.resolve(expected.locator.stateRoot)
 	);
 }
@@ -4656,7 +4744,7 @@ function sameCloseGeneration(expected: CloseRecord, current: CloseRecord & { liv
 		current.endpointMtimeMs === expected.endpointMtimeMs &&
 		current.lifecycleRequestId === expected.lifecycleRequestId &&
 		current.processIncarnation === expected.processIncarnation &&
-		path.resolve(current.locator.repo) === path.resolve(expected.locator.repo) &&
+		path.resolve(current.locator.cwd) === path.resolve(expected.locator.cwd) &&
 		path.resolve(current.locator.stateRoot) === path.resolve(expected.locator.stateRoot)
 	);
 }
@@ -4827,6 +4915,14 @@ async function executeLifecycleResponse(
 				"incarnation_unavailable",
 				"OS process incarnation authority is unavailable; refusing to spawn a lifecycle session.",
 			);
+		if (launch.worktreePlan) {
+			const occupant = worktreeOccupant(broker.index.listSessions().sessions, launch.worktreePlan.worktreePath);
+			if (occupant && occupant !== launch.id)
+				return fail(
+					"worktree_in_use",
+					`The requested worktree is already held by session ${occupant}. Choose another worktree name or stop that session.`,
+				);
+		}
 		const effectMarker = randomUUID();
 		const plannedWorktreeIntent = worktreeIntent(launch.worktreePlan);
 		const effectIntent: LifecycleEffectIntentWithDeadline = {
@@ -4933,7 +5029,13 @@ async function executeLifecycleResponse(
 					// by the OS rather than captured (#4712 review).
 					stdio: "ignore",
 					env: {
-						...("kind" in cmd ? cmd.env : process.env),
+						// Master capability is process-local to direct Bash children and must
+						// never cross a broker lifecycle launch boundary.
+						...Object.fromEntries(
+							Object.entries("kind" in cmd ? cmd.env : process.env).filter(
+								([key]) => key !== "GJC_MASTER_CAPABILITY",
+							),
+						),
 						GJC_AGENT_DIR: broker.settings.agentDir,
 						GJC_CODING_AGENT_DIR: broker.settings.agentDir,
 						GJC_SESSION_ID: launch.id,

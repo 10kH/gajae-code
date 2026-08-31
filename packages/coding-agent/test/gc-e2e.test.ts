@@ -110,7 +110,7 @@ describe("gjc gc end-to-end (harness lease adapter)", () => {
 		await index.append({
 			type: "host_registered",
 			sessionId: "repairable-session",
-			locator: { repo: base, stateRoot: path.join(base, "state") },
+			locator: { cwd: base, worktreeRoot: null, stateRoot: path.join(base, "state") },
 			endpointGeneration: 1,
 			pid: process.pid,
 			endpointMtimeMs: Date.now(),

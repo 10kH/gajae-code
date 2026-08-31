@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import * as path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import type { Component } from "@gajae-code/tui";
 import { getKeybindings, ImageProtocol, TERMINAL, Text, visibleWidth } from "@gajae-code/tui";
@@ -17,6 +18,7 @@ import { InternalUrlRouter } from "../internal-urls";
 import { truncateToVisualLines } from "../modes/components/visual-truncate";
 import { highlightCode, type Theme } from "../modes/theme/theme";
 import bashDescription from "../prompts/tools/bash.md" with { type: "text" };
+import { renderSpawnTable, runSdkSpawn, type SdkSpawnArgs } from "../sdk/cli/master-cli";
 import type { ArtifactManager } from "../session/artifacts";
 import type {
 	ClientBridgeTerminalExitStatus,
@@ -87,6 +89,7 @@ export const BASH_DEFAULT_PREVIEW_LINES = 10;
 const BASH_ERROR_MAX_BYTES = 4096;
 const ARTIFACT_SAVE_DIAGNOSTIC_MAX_BYTES = 256;
 const BASH_ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const MASTER_CAPABILITY_ENV = "GJC_MASTER_CAPABILITY";
 const DEFAULT_AUTO_BACKGROUND_THRESHOLD_MS = 60_000;
 const ACP_RELEASE_TIMEOUT_MS = 1_000;
 const READ_ONLY_BASH_ENV: Record<string, string> = {
@@ -601,6 +604,107 @@ function normalizeBashEnv(env: Record<string, string> | undefined): Record<strin
 	return normalized;
 }
 
+/**
+ * Return true only for a direct, shell-syntax-free `gjc sdk spawn` command.
+ *
+ * Master authority is process-local and must not become ambient state for an
+ * arbitrary shell pipeline. Keep a tiny lexer here instead of a prefix check:
+ * shell quoting is allowed for ordinary argument values, while operators,
+ * expansions, escapes, globbing, and line breaks all refuse the privileged
+ * environment injection path.
+ */
+function strictDirectSdkSpawnTokens(command: string): string[] | undefined {
+	if (command.length === 0) return undefined;
+	const tokens: string[] = [];
+	let token = "";
+	let tokenStarted = false;
+	let quote: "'" | '"' | undefined;
+	for (const character of command) {
+		if (quote !== undefined) {
+			if (character === quote) {
+				quote = undefined;
+				tokenStarted = true;
+			} else {
+				token += character;
+				tokenStarted = true;
+			}
+			continue;
+		}
+		if (";&|<>()$`\\*?[]{}#!\n\r".includes(character)) return undefined;
+		if (character === "'" || character === '"') {
+			quote = character;
+			tokenStarted = true;
+			continue;
+		}
+		if (/\s/u.test(character)) {
+			if (tokenStarted) {
+				tokens.push(token);
+				token = "";
+				tokenStarted = false;
+			}
+			continue;
+		}
+		token += character;
+		tokenStarted = true;
+	}
+	if (quote !== undefined) return undefined;
+	if (tokenStarted) tokens.push(token);
+	return tokens.length >= 3 && tokens[0] === "gjc" && tokens[1] === "sdk" && tokens[2] === "spawn"
+		? tokens
+		: undefined;
+}
+
+export function isStrictDirectSdkSpawnCommand(command: string): boolean {
+	return strictDirectSdkSpawnTokens(command) !== undefined;
+}
+
+export function parseDirectSdkSpawnArgs(command: string): SdkSpawnArgs {
+	const tokens = strictDirectSdkSpawnTokens(command);
+	if (tokens === undefined) throw new ToolError("Master spawn command is not a direct shell-safe invocation.");
+	const args: SdkSpawnArgs = {};
+	for (let index = 3; index < tokens.length; index++) {
+		const token = tokens[index]!;
+		if (token === "--json") {
+			args.json = true;
+			continue;
+		}
+		const equals = token.indexOf("=");
+		const name = equals < 0 ? token : token.slice(0, equals);
+		const value = equals < 0 ? tokens[++index] : token.slice(equals + 1);
+		if (value === undefined || value.length === 0) throw new ToolError(`Master spawn flag ${name} requires a value.`);
+		switch (name) {
+			case "--cwd":
+				args.cwd = value;
+				break;
+			case "--prompt":
+				args.prompt = value;
+				break;
+			case "--model":
+				args.model = value;
+				break;
+			case "--profile":
+				args.profile = value;
+				break;
+			case "--idempotency-key":
+				args.idempotencyKey = value;
+				break;
+			case "--agent-dir":
+				throw new ToolError("Master spawn cannot override the session agent directory.");
+			default:
+				throw new ToolError(`Unsupported master spawn flag: ${name}`);
+		}
+	}
+	return args;
+}
+
+export function masterCommandEnvOverrides(
+	env: Record<string, string> | undefined,
+	directMasterSpawn: boolean,
+): Record<string, string> {
+	if (directMasterSpawn) return {};
+	return Object.fromEntries(Object.entries(env ?? {}).filter(([key]) => key !== MASTER_CAPABILITY_ENV));
+}
+
 function escapeBashEnvValueForDisplay(value: string): string {
 	return value
 		.replaceAll("\\", "\\\\")
@@ -874,6 +978,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		notices?: readonly string[];
 
 		resolvedEnv?: Record<string, string>;
+		directMasterSpawn: boolean;
 		onUpdate?: AgentToolUpdateCallback<BashToolDetails>;
 		startBackgrounded: boolean;
 		onCompletion?: () => void;
@@ -885,7 +990,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			throw new ToolError("Background job manager unavailable for this session.");
 		}
 
-		const label = options.command.length > 120 ? `${options.command.slice(0, 117)}...` : options.command;
+		const label = options.directMasterSpawn
+			? "gjc sdk spawn"
+			: options.command.length > 120
+				? `${options.command.slice(0, 117)}...`
+				: options.command;
 		let latestText = "";
 		let backgrounded = options.startBackgrounded;
 		const runningDetails = (jobId: string): Record<string, unknown> | undefined =>
@@ -908,37 +1017,37 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 
 				let executionResult: BashResult | BashInteractiveResult | undefined;
 				try {
-					const result = await executeBash(options.command, {
-						cwd: options.commandCwd,
-						settings: this.session.settings,
-						sessionKey: `${this.session.getSessionId?.() ?? ""}:async:${jobId}`,
-						timeout: options.timeoutMs,
-						signal: runSignal,
-						env: options.resolvedEnv,
-						artifactPath,
-						artifactId,
-						artifactPublisher,
-						spillThreshold,
-						headBytes,
-						oneShot: true,
-						ignoreShellPrefix: this.session.bashRestrictionProfile === "read-only",
-						disableShellSnapshot: this.session.bashRestrictionProfile === "read-only",
-						onChunk: chunk => {
-							tailBuffer.append(chunk);
-							latestText = tailBuffer.text();
-							void reportProgress(latestText, runningDetails(jobId));
-						},
-						onRawChunk: chunk => {
-							// Forward the unthrottled sanitized chunk to the async-job
-							// substrate so the Monitor tool can read the complete process
-							// stream by byte offset, independent of the throttled preview
-							// path above.
-							manager.appendOutput(jobId, chunk);
-						},
-						onMinimizedSave: async originalText => {
-							return saveBashOriginalArtifact(this.session, originalText);
-						},
-					});
+					const result = options.directMasterSpawn
+						? await this.#runDirectMasterSpawn(
+								options.command,
+								options.commandCwd,
+								options.timeoutMs,
+								runSignal,
+								options.resolvedEnv,
+							)
+						: await executeBash(options.command, {
+								cwd: options.commandCwd,
+								settings: this.session.settings,
+								sessionKey: `${this.session.getSessionId?.() ?? ""}:async:${jobId}`,
+								timeout: options.timeoutMs,
+								signal: runSignal,
+								env: options.resolvedEnv,
+								artifactPath,
+								artifactId,
+								artifactPublisher,
+								spillThreshold,
+								headBytes,
+								oneShot: true,
+								ignoreShellPrefix: this.session.bashRestrictionProfile === "read-only",
+								disableShellSnapshot: this.session.bashRestrictionProfile === "read-only",
+								onChunk: chunk => {
+									tailBuffer.append(chunk);
+									latestText = tailBuffer.text();
+									void reportProgress(latestText, runningDetails(jobId));
+								},
+								onRawChunk: chunk => manager.appendOutput(jobId, chunk),
+								onMinimizedSave: async originalText => saveBashOriginalArtifact(this.session, originalText),
+							});
 					executionResult = result;
 					const finalResult = this.#buildCompletedResult(result, options.timeoutSec, {
 						requestedTimeoutSec: options.requestedTimeoutSec,
@@ -1061,6 +1170,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		command: string;
 		commandCwd: string;
 		resolvedEnv: Record<string, string>;
+		directMasterSpawn: boolean;
 		requestedTimeoutSec: number;
 		timeoutSec: number;
 		timeoutMs: number;
@@ -1206,14 +1316,26 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		// silently ignore the caller's override.
 		const explicitAgentDirOverride =
 			expandedEnv?.GJC_CODING_AGENT_DIR !== undefined || expandedEnv?.PI_CODING_AGENT_DIR !== undefined;
+		// The master capability is a one-shot authority for the direct spawn CLI,
+		// never ambient state for ordinary Bash or a chained/pipelined descendant.
+		// Check both spellings so cwd normalization or URL expansion cannot turn a
+		// command that contained shell syntax into a privileged one.
+		const directMasterSpawn = isStrictDirectSdkSpawnCommand(rawCommand) && isStrictDirectSdkSpawnCommand(command);
+		const masterCapability = directMasterSpawn ? this.session.getMasterBashCapability?.() : undefined;
+		const masterOwnerSessionId = directMasterSpawn ? this.session.getMasterOwnerSessionId?.() : undefined;
+		const commandEnvOverrides = masterCommandEnvOverrides(expandedEnv, directMasterSpawn);
 		const resolvedEnv = {
 			...buildGjcRuntimeSessionEnv({
 				sessionFile: null,
 				sessionId: this.session.getSessionId?.(),
 				cwd: this.session.cwd,
 			}),
-			...(sessionAgentDir && !explicitAgentDirOverride ? { GJC_CODING_AGENT_DIR: sessionAgentDir } : {}),
-			...expandedEnv,
+			...(sessionAgentDir && (!explicitAgentDirOverride || directMasterSpawn)
+				? { GJC_CODING_AGENT_DIR: sessionAgentDir }
+				: {}),
+			...commandEnvOverrides,
+			...(masterCapability ? { [MASTER_CAPABILITY_ENV]: masterCapability } : {}),
+			...(masterOwnerSessionId ? { GJC_MASTER_OWNER_SESSION_ID: masterOwnerSessionId } : {}),
 			...(this.session.bashRestrictionProfile === "read-only" ? READ_ONLY_BASH_ENV : {}),
 			...(allowedPrefixes && allowedPrefixes.length > 0 ? { [GJC_RESTRICTED_ROLE_AGENT_BASH_ENV]: "1" } : {}),
 		};
@@ -1245,7 +1367,80 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		const sleepAdvisory = longSleepAdvisory(command, timeoutSec);
 		if (sleepAdvisory) notices.push(sleepAdvisory);
 
-		return { command, commandCwd, resolvedEnv, requestedTimeoutSec, timeoutSec, timeoutMs, notices };
+		return {
+			command,
+			commandCwd,
+			resolvedEnv,
+			directMasterSpawn,
+			requestedTimeoutSec,
+			timeoutSec,
+			timeoutMs,
+			notices,
+		};
+	}
+
+	async #runDirectMasterSpawn(
+		command: string,
+		commandCwd: string,
+		timeoutMs: number,
+		signal: AbortSignal | undefined,
+		resolvedEnv: Record<string, string> | undefined,
+	): Promise<BashResult> {
+		const masterCapability = resolvedEnv?.[MASTER_CAPABILITY_ENV];
+		const sessionAgentDir = resolvedEnv?.GJC_CODING_AGENT_DIR;
+		if (masterCapability === undefined || sessionAgentDir === undefined)
+			throw new ToolError("Master spawn authority context is unavailable.");
+		const args = parseDirectSdkSpawnArgs(command);
+		args.agentDir = sessionAgentDir;
+		if (args.cwd !== undefined && !path.isAbsolute(args.cwd)) args.cwd = path.resolve(commandCwd, args.cwd);
+		const request = runSdkSpawn(args, {
+			env: {
+				...process.env,
+				GJC_MASTER_CAPABILITY: masterCapability,
+				GJC_SESSION_ID: resolvedEnv?.GJC_MASTER_OWNER_SESSION_ID ?? this.session.getSessionId?.() ?? undefined,
+				GJC_CODING_AGENT_DIR: sessionAgentDir,
+			},
+		});
+		const timeout = Bun.sleep(timeoutMs).then(() => {
+			throw new ToolError(`Command timed out after ${Math.ceil(timeoutMs / 1000)} seconds`);
+		});
+		const aborted = Promise.withResolvers<never>();
+		const onAbort = (): void => aborted.reject(new ToolAbortError("Command aborted"));
+		if (signal?.aborted) onAbort();
+		else signal?.addEventListener("abort", onAbort, { once: true });
+		let result: Awaited<typeof request>;
+		try {
+			result = await Promise.race([request, timeout, aborted.promise]);
+		} finally {
+			signal?.removeEventListener("abort", onAbort);
+		}
+		const output = args.json ? JSON.stringify(result.rendered) : renderSpawnTable(result.rendered);
+		const outputBytes = Buffer.byteLength(output, "utf8");
+		const outputLines = output.split("\n").length;
+		return {
+			output,
+			exitCode: result.exitCode,
+			cancelled: false,
+			truncated: false,
+			totalLines: outputLines,
+			totalBytes: outputBytes,
+			outputLines,
+			outputBytes,
+		};
+	}
+
+	async #executeDirectMasterSpawn(
+		command: string,
+		commandCwd: string,
+		timeoutSec: number,
+		timeoutMs: number,
+		requestedTimeoutSec: number,
+		notices: readonly string[],
+		signal: AbortSignal | undefined,
+		resolvedEnv: Record<string, string>,
+	): Promise<AgentToolResult<BashToolDetails>> {
+		const result = await this.#runDirectMasterSpawn(command, commandCwd, timeoutMs, signal, resolvedEnv);
+		return this.#buildCompletedResult(result, timeoutSec, { requestedTimeoutSec, notices });
 	}
 
 	/**
@@ -1343,8 +1538,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						spillThreshold,
 						headBytes,
 						oneShot: true,
-						ignoreShellPrefix: this.session.bashRestrictionProfile === "read-only",
-						disableShellSnapshot: this.session.bashRestrictionProfile === "read-only",
+						ignoreShellPrefix: this.session.bashRestrictionProfile === "read-only" || prepared.directMasterSpawn,
+						disableShellSnapshot:
+							this.session.bashRestrictionProfile === "read-only" || prepared.directMasterSpawn,
 						onChunk: chunk => {
 							tailBuffer.append(chunk);
 							void reportProgress(tailBuffer.text(), {
@@ -1416,11 +1612,25 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			command,
 			commandCwd,
 			resolvedEnv,
+			directMasterSpawn,
 			requestedTimeoutSec,
 			timeoutSec,
 			timeoutMs,
 			notices: pendingNotices,
 		} = prepared;
+		const masterCapability = directMasterSpawn ? resolvedEnv[MASTER_CAPABILITY_ENV] : undefined;
+		if (directMasterSpawn && masterCapability !== undefined && !asyncRequested) {
+			return await this.#executeDirectMasterSpawn(
+				command,
+				commandCwd,
+				timeoutSec,
+				timeoutMs,
+				requestedTimeoutSec,
+				pendingNotices,
+				signal,
+				resolvedEnv,
+			);
+		}
 
 		if (asyncRequested) {
 			// Availability is endpoint-first: a concurrent top-level session
@@ -1440,6 +1650,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				notices: pendingNotices,
 
 				resolvedEnv,
+				directMasterSpawn,
 				onUpdate,
 				startBackgrounded: true,
 				toolCallId,
@@ -1457,7 +1668,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		// Skip when pty=true (PTY needs the local terminal UI).
 		const clientBridge =
 			this.session.bashRestrictionProfile === "read-only" ? undefined : this.session.getClientBridge?.();
-		const clientTerminalActive = Boolean(clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty);
+		const clientTerminalActive = Boolean(
+			!directMasterSpawn && clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty,
+		);
 
 		// Run non-PTY bash through the managed job path so Ctrl+B-twice fold-on-demand works
 		// even when auto-background is disabled. When a client terminal will handle the
@@ -1487,6 +1700,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				notices: pendingNotices,
 
 				resolvedEnv,
+				directMasterSpawn,
 				onUpdate,
 				startBackgrounded,
 				onCompletion: () => {
@@ -2200,7 +2414,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		const artifactPublisher = createBashArtifactPublisher(this.session);
 
 		const interactiveUi =
-			this.session.bashRestrictionProfile === "read-only"
+			this.session.bashRestrictionProfile === "read-only" || directMasterSpawn
 				? undefined
 				: canUseInteractiveBashPty(pty, ctx)
 					? ctx?.ui
@@ -2368,7 +2582,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					cwd: commandCwd,
 					settings: this.session.settings,
 					sessionKey: this.session.getSessionId?.() ?? undefined,
-					oneShot: this.session.bashRestrictionProfile === "read-only",
+					oneShot: this.session.bashRestrictionProfile === "read-only" || directMasterSpawn,
 					timeout: timeoutMs,
 					signal,
 					env: resolvedEnv,
@@ -2379,8 +2593,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					headBytes,
 					onChunk: streamTailUpdates(tailBuffer, onUpdate),
 					onMinimizedSave: async originalText => saveBashOriginalArtifact(this.session, originalText),
-					ignoreShellPrefix: this.session.bashRestrictionProfile === "read-only",
-					disableShellSnapshot: this.session.bashRestrictionProfile === "read-only",
+					ignoreShellPrefix: this.session.bashRestrictionProfile === "read-only" || directMasterSpawn,
+					disableShellSnapshot: this.session.bashRestrictionProfile === "read-only" || directMasterSpawn,
 				});
 		ptyFoldUnregister?.();
 		// Folded: the foreground was settled by the fold, so return the background

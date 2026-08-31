@@ -136,6 +136,7 @@ const globals = [
 	["session.close", "Close a saved session."],
 	["session.delete", "Delete a saved session."],
 	["session.reconcile_uncertain", "Retire an indexed terminalUncertain create effect after dead-host proof."],
+	["session.spawn", "Spawn a task-seeded background child session (local interactive master only)."],
 ] as const;
 
 const queries = [
@@ -353,9 +354,18 @@ export const OPERATIONS: readonly Operation[] = [
 							acp: "machine_only",
 							daemonCli: "machine_only",
 						})
-					: ["G03", "G04", "G05", "G06", "G07", "G08"].includes(id)
-						? dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited" })
-						: dispositions(),
+					: id === "G09"
+						? dispositions({
+								telegram: "prohibited",
+								discord: "prohibited",
+								slack: "prohibited",
+								mcp: "prohibited",
+								acp: "prohibited",
+								daemonCli: "prohibited",
+							})
+						: ["G03", "G04", "G05", "G06", "G07", "G08"].includes(id)
+							? dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited" })
+							: dispositions(),
 			testIds: ["packages/coding-agent/test/sdk-operation-inventory.test.ts"],
 		};
 	}),

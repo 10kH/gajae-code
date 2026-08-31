@@ -10,6 +10,7 @@ const FLAG_VALUES: Record<string, string> = {
 describe("CLI root flag parity", () => {
 	it("keeps every advertised flag connected to its runtime parser", () => {
 		for (const [name, descriptor] of Object.entries(ROOT_LAUNCH_FLAGS)) {
+			if (name === "scope") continue;
 			if (name === "worktree") {
 				expect(parseLaunchWorktreeMode(["--worktree", "feature/root-flags"]).mode).toEqual({
 					enabled: true,
@@ -18,12 +19,21 @@ describe("CLI root flag parity", () => {
 				});
 				continue;
 			}
-
 			const argv = [`--${name}`];
 			if (name === "default") argv.unshift("--mpreset", "test");
 			if (descriptor.kind === "string") argv.push(descriptor.options?.[0] ?? FLAG_VALUES[name] ?? "value");
 			expect(() => assertLocalLaunchArgs(parseArgs(argv))).not.toThrow();
 		}
+	});
+
+	it("parses exact master scopes and rejects invalid scope uses", () => {
+		expect(parseArgs(["--master"])).toMatchObject({ master: true, masterScope: "repo" });
+		expect(parseArgs(["--master", "--scope", "pwd"])).toMatchObject({ master: true, masterScope: "pwd" });
+		expect(parseArgs(["--master", "--scope=global"])).toMatchObject({ master: true, masterScope: "global" });
+		expect(() => parseArgs(["--scope", "repo"])).toThrow("--scope requires --master");
+		expect(() => parseArgs(["--master", "--scope"])).toThrow("--scope requires a value");
+		expect(() => parseArgs(["--master", "--scope", "Repo"])).toThrow("invalid --scope value");
+		expect(() => parseArgs(["--master", "--scope", "repo", "--scope", "pwd"])).toThrow("conflicting values");
 	});
 
 	it("keeps compact worktree forms and the literal delimiter intact", () => {

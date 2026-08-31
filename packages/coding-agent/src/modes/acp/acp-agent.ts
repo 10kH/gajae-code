@@ -36,7 +36,7 @@ import {
 	type SetSessionModeRequest,
 	type SetSessionModeResponse,
 } from "@agentclientprotocol/sdk";
-import { getAgentDir, logger } from "@gajae-code/utils";
+import { getAgentDir, logger, resolveEquivalentPath } from "@gajae-code/utils";
 import packageJson from "../../../package.json" with { type: "json" };
 import {
 	ACP_SESSION_RECONNECT,
@@ -49,6 +49,7 @@ import {
 import { resolveAcpFinalText } from "../../sdk/acp/final-text";
 import { ACP_MCP_LIFECYCLE_TIMEOUT_MS, type SessionLifecycleMcpServer } from "../../sdk/acp/mcp";
 import { ensureBroker } from "../../sdk/broker/ensure";
+import { canonicalSessionCwd } from "../../sdk/broker/session-index";
 import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../../sdk/client";
 import type { AbortScope } from "../../sdk/host/control/operations";
 import { SYNTHETIC_PROVIDER_ID } from "../../sdk/model-profile-namespace";
@@ -183,7 +184,7 @@ function promptWaiterRetired(record: SessionRecord, waiter: PromptWaiter): boole
 
 type BrokerSession = {
 	sessionId: string;
-	locator?: { repo?: string };
+	locator?: { cwd?: string; worktreeRoot?: string | null; stateRoot?: string };
 	live?: boolean;
 	endpointGeneration?: number;
 	endpointMtimeMs?: number;
@@ -273,13 +274,14 @@ export function paginateAcpSessions(
 	offset: number,
 	sessionMetadata: ReadonlyMap<string, { title?: string; updatedAt?: string }> = new Map(),
 ): ListSessionsResponse {
+	const canonicalCwd = cwd === undefined ? undefined : resolveEquivalentPath(cwd);
 	const filtered = listed
 		.map(value => object(value) as BrokerSession | undefined)
 		.filter(
-			(value): value is BrokerSession & { locator: { repo: string } } =>
-				typeof value?.sessionId === "string" && typeof value.locator?.repo === "string",
+			(value): value is BrokerSession & { locator: { cwd: string } } =>
+				typeof value?.sessionId === "string" && typeof value.locator?.cwd === "string",
 		)
-		.filter(value => !cwd || value.locator.repo === cwd);
+		.filter(value => canonicalCwd === undefined || value.locator.cwd === canonicalCwd);
 	const sessions = filtered.slice(offset, offset + SESSION_PAGE_SIZE).map(value => {
 		const metadata = sessionMetadata.get(value.sessionId);
 		const updatedAt =
@@ -292,7 +294,7 @@ export function paginateAcpSessions(
 						: undefined;
 		return {
 			sessionId: value.sessionId,
-			cwd: value.locator.repo,
+			cwd: value.locator.cwd,
 			title:
 				typeof metadata?.title === "string" && metadata.title
 					? metadata.title
@@ -1409,38 +1411,34 @@ export class AcpAgent implements Agent {
 
 	async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
 		if (params.cwd) this.#assertAbsoluteCwd(params.cwd);
+		const canonicalCwd = params.cwd ? await canonicalSessionCwd(params.cwd) : undefined;
 		const adapter = await this.#brokerAdapter();
 		const listing = await collectAcpSessionList(input => adapter.global("session.list", input));
 		const listed = Array.isArray(listing.sessions) ? listing.sessions : [];
 
-		if (params.cwd) {
+		if (canonicalCwd) {
 			const discovered = new Set<string>();
 			for (const session of listed) {
 				const candidate = object(session) as BrokerSession | undefined;
 				if (
 					typeof candidate?.sessionId !== "string" ||
-					typeof candidate.locator?.repo !== "string" ||
-					path.resolve(candidate.locator.repo) !== path.resolve(params.cwd)
+					typeof candidate.locator?.cwd !== "string" ||
+					candidate.locator.cwd !== canonicalCwd
 				)
 					continue;
 				if (discovered.has(candidate.sessionId))
 					throw new AcpSdkAdapterError("conflict", `Broker returned duplicate session id: ${candidate.sessionId}`);
 				discovered.add(candidate.sessionId);
 				const knownCwd = this.#knownSessionCwds.get(candidate.sessionId);
-				if (knownCwd && path.resolve(knownCwd) !== path.resolve(params.cwd))
+				if (knownCwd && (await canonicalSessionCwd(knownCwd)) !== canonicalCwd)
 					throw new AcpSdkAdapterError(
 						"conflict",
 						`ACP session ${candidate.sessionId} has conflicting cwd authority.`,
 					);
-				this.#knownSessionCwds.set(candidate.sessionId, params.cwd);
+				this.#knownSessionCwds.set(candidate.sessionId, canonicalCwd);
 			}
 		}
-		return paginateAcpSessions(
-			listed,
-			params.cwd ?? undefined,
-			this.#cursor(params.cursor),
-			this.#knownSessionMetadata,
-		);
+		return paginateAcpSessions(listed, canonicalCwd, this.#cursor(params.cursor), this.#knownSessionMetadata);
 	}
 
 	closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
@@ -2143,14 +2141,15 @@ export class AcpAgent implements Agent {
 	}
 
 	async #scopedBrokerSession(id: string, cwd: string): Promise<BrokerSession | undefined> {
+		const canonicalCwd = await canonicalSessionCwd(cwd);
 		const adapter = await this.#brokerAdapter();
-		const result = await collectAcpSessionList(input => adapter.global("session.list", input), { cwd });
+		const result = await collectAcpSessionList(input => adapter.global("session.list", input), { cwd: canonicalCwd });
 
 		const matches: BrokerSession[] = [];
 		for (const item of Array.isArray(result?.sessions) ? result.sessions : []) {
 			const session = object(item) as BrokerSession | undefined;
 			if (session?.sessionId !== id) continue;
-			if (typeof session.locator?.repo !== "string" || path.resolve(session.locator.repo) !== path.resolve(cwd))
+			if (typeof session.locator?.cwd !== "string" || session.locator.cwd !== canonicalCwd)
 				throw new AcpSdkAdapterError("conflict", `Broker returned conflicting session scope for ${id}.`);
 			matches.push(session);
 		}

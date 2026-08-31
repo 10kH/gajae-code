@@ -232,6 +232,11 @@ function registerBrokerOwner(
 function brokerSpawnEnvironment(command: SdkInternalSpawnCommand, override?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 	const environment = { ...(override ?? command.env) };
 	delete environment.BUN_OPTIONS;
+	// The master capability is a transient in-memory dispatch input. A broker
+	// cold-started from the master's own Bash environment would otherwise inherit
+	// it and pass it on to every substrate child it later launches, so it is
+	// stripped at the lifecycle boundary exactly as lifecycle children strip it.
+	delete environment.GJC_MASTER_CAPABILITY;
 	if (command.kind === "bun-source") {
 		delete environment.PI_COMPILED;
 		delete environment.GJC_COMPILED;

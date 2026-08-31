@@ -230,6 +230,20 @@ it("treats explicit broker env as a complete allowlist and still scrubs runtime 
 	expect(environment.AMBIENT_SENTINEL).toBeUndefined();
 });
 
+it("never lets the master capability cross into a cold-started broker", () => {
+	const command = resolveSdkInternalSpawnCommandForTest("broker-internal", {});
+	// A broker cold-started from the master's own Bash environment would otherwise
+	// inherit the transient capability and hand it to every substrate child.
+	const environment = brokerSpawnEnvironmentForTest(command, {
+		PATH: process.env.PATH,
+		GJC_MASTER_CAPABILITY: "must-not-cross-the-lifecycle-boundary",
+		OWNED_SENTINEL: "kept",
+	});
+	expect(environment.GJC_MASTER_CAPABILITY).toBeUndefined();
+	expect(JSON.stringify(environment)).not.toContain("must-not-cross-the-lifecycle-boundary");
+	expect(environment.OWNED_SENTINEL).toBe("kept");
+});
+
 it("fails closed when compiled marker evidence disagrees", () => {
 	expect(() =>
 		resolveSdkInternalSpawnCommandForTest("broker-internal", {
@@ -1899,6 +1913,54 @@ describe("SDK broker identity and discovery", () => {
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	}, 20_000);
+	it("freezes a scoped session list descriptor and rejects conflicting continuation scope", async () => {
+		const dir = await temp();
+		const worktree = path.join(dir, "worktree");
+		const stateRoot = path.join(dir, "state");
+		await fs.mkdir(worktree, { recursive: true });
+		const git = Bun.spawn(["git", "init", "-q", worktree]);
+		await git.exited;
+		const broker = new Broker({ agentDir: dir });
+		await broker.index.open();
+		for (const sessionId of ["scope-a", "scope-b"]) {
+			await broker.index.append({
+				type: "host_registered",
+				sessionId,
+				locator: { cwd: worktree, worktreeRoot: worktree, stateRoot },
+				endpointGeneration: 1,
+				pid: process.pid,
+			});
+		}
+		const scope = {
+			version: 1 as const,
+			requested: "repo" as const,
+			requestAnchor: { cwd: worktree, worktreeRoot: worktree },
+		};
+		const first = await broker.handleRequest("session.list", { scope, limit: 1 });
+		expect(first.ok).toBe(true);
+		if (!first.ok) return;
+		const firstResult = first.result as {
+			scope: unknown;
+			observedAt: string;
+			continuationCursor?: string;
+			sessions: unknown[];
+		};
+		expect(firstResult.sessions).toHaveLength(1);
+		expect(firstResult.continuationCursor).toBeString();
+		const mismatched = await broker.handleRequest("session.list", {
+			cursor: firstResult.continuationCursor,
+			scope: { ...scope, requested: "pwd" },
+		});
+		expect(mismatched).toEqual({
+			ok: false,
+			error: { code: "scope_cursor_mismatch", message: "scope must match the cursor snapshot" },
+		});
+		const second = await broker.handleRequest("session.list", { cursor: firstResult.continuationCursor });
+		expect(second.ok).toBe(true);
+		if (!second.ok) return;
+		expect((second.result as { scope: unknown; observedAt: string }).scope).toEqual(firstResult.scope);
+		expect((second.result as { observedAt: string }).observedAt).toBe(firstResult.observedAt);
+	});
 	it("returns only an endpoint bound to the indexed incarnation", async () => {
 		const dir = await temp();
 		const stateRoot = path.join(dir, "state");
@@ -1911,7 +1973,7 @@ describe("SDK broker identity and discovery", () => {
 		await broker.index.append({
 			type: "host_registered",
 			sessionId: "s",
-			locator: { repo: "r", stateRoot },
+			locator: { cwd: "r", worktreeRoot: null, stateRoot },
 			endpointGeneration: 3,
 			pid: process.pid,
 			endpointMtimeMs,
@@ -1919,7 +1981,7 @@ describe("SDK broker identity and discovery", () => {
 		await broker.index.append({
 			type: "host_heartbeat",
 			sessionId: "s",
-			locator: { repo: "r", stateRoot },
+			locator: { cwd: "r", worktreeRoot: null, stateRoot },
 			endpointGeneration: 3,
 			pid: process.pid,
 		});
@@ -1953,7 +2015,7 @@ describe("SDK broker identity and discovery", () => {
 		await broker.index.append({
 			type: "host_registered",
 			sessionId: "s",
-			locator: { repo: "r", stateRoot },
+			locator: { cwd: "r", worktreeRoot: null, stateRoot },
 			endpointGeneration: 4,
 			pid: process.pid,
 			endpointMtimeMs: endpointMtimeMs + 1,
@@ -1961,7 +2023,7 @@ describe("SDK broker identity and discovery", () => {
 		await broker.index.append({
 			type: "host_heartbeat",
 			sessionId: "s",
-			locator: { repo: "r", stateRoot },
+			locator: { cwd: "r", worktreeRoot: null, stateRoot },
 			endpointGeneration: 4,
 			pid: process.pid,
 		});
@@ -1997,7 +2059,7 @@ describe("SDK broker identity and discovery", () => {
 			await broker.index.append({
 				type: "host_registered",
 				sessionId,
-				locator: { repo: liveCwd, stateRoot },
+				locator: { cwd: liveCwd, worktreeRoot: null, stateRoot },
 				endpointGeneration: 1,
 				pid: process.pid,
 				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
@@ -2005,7 +2067,7 @@ describe("SDK broker identity and discovery", () => {
 			await broker.index.append({
 				type: "host_heartbeat",
 				sessionId,
-				locator: { repo: liveCwd, stateRoot },
+				locator: { cwd: liveCwd, worktreeRoot: null, stateRoot },
 				endpointGeneration: 1,
 				pid: process.pid,
 			});
@@ -2216,7 +2278,7 @@ describe("SDK broker identity and discovery", () => {
 			await broker.index.append({
 				type: "host_registered",
 				sessionId,
-				locator: { repo: cwd, stateRoot },
+				locator: { cwd: cwd, worktreeRoot: null, stateRoot },
 				endpointGeneration: 1,
 				pid: 999_999_999,
 			});
@@ -2305,7 +2367,7 @@ describe("SDK broker identity and discovery", () => {
 			await broker.index.append({
 				type: "host_registered",
 				sessionId,
-				locator: { repo: cwd, stateRoot },
+				locator: { cwd: cwd, worktreeRoot: null, stateRoot },
 				endpointGeneration: 1,
 				pid: 999_999_999,
 			});
@@ -2441,7 +2503,7 @@ describe("SDK broker identity and discovery", () => {
 			await broker.index.append({
 				type: "host_registered",
 				sessionId,
-				locator: { repo: cwd, stateRoot },
+				locator: { cwd: cwd, worktreeRoot: null, stateRoot },
 				endpointGeneration: 1,
 				pid: 999_999_999,
 			});
@@ -2573,7 +2635,7 @@ describe("SDK broker identity and discovery", () => {
 			await broker.index.append({
 				type: "host_registered",
 				sessionId,
-				locator: { repo: cwd, stateRoot },
+				locator: { cwd: cwd, worktreeRoot: null, stateRoot },
 				endpointGeneration: 1,
 				pid: 999_999_999,
 			});
@@ -2721,7 +2783,7 @@ describe("SDK broker identity and discovery", () => {
 			await broker.index.append({
 				type: "host_registered",
 				sessionId,
-				locator: { repo: cwd, stateRoot },
+				locator: { cwd: cwd, worktreeRoot: null, stateRoot },
 				endpointGeneration: 1,
 				pid: 999_999_999,
 			});
@@ -2851,7 +2913,7 @@ describe("SDK broker identity and discovery", () => {
 		await broker.index.append({
 			type: "host_registered",
 			sessionId,
-			locator: { repo: cwd, stateRoot },
+			locator: { cwd: cwd, worktreeRoot: null, stateRoot },
 			endpointGeneration: 1,
 			pid: 999_999_999,
 		});
@@ -3270,7 +3332,7 @@ describe("SDK broker identity and discovery", () => {
 			await broker.index.append({
 				type: "host_registered",
 				sessionId,
-				locator: { repo: dir, stateRoot },
+				locator: { cwd: dir, worktreeRoot: null, stateRoot },
 				endpointGeneration: 1,
 				pid: process.pid,
 				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
@@ -3279,7 +3341,7 @@ describe("SDK broker identity and discovery", () => {
 			await broker.index.append({
 				type: "host_heartbeat",
 				sessionId,
-				locator: { repo: dir, stateRoot },
+				locator: { cwd: dir, worktreeRoot: null, stateRoot },
 				endpointGeneration: 1,
 				pid: process.pid,
 			});
@@ -3320,7 +3382,7 @@ describe("SDK broker identity and discovery", () => {
 			await broker.index.append({
 				type: "host_registered",
 				sessionId,
-				locator: { repo: dir, stateRoot },
+				locator: { cwd: dir, worktreeRoot: null, stateRoot },
 				endpointGeneration: 2,
 				pid: process.pid,
 				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
@@ -3345,7 +3407,7 @@ describe("SDK broker identity and discovery", () => {
 			await broker.index.append({
 				type: "host_registered",
 				sessionId,
-				locator: { repo: dir, stateRoot },
+				locator: { cwd: dir, worktreeRoot: null, stateRoot },
 				endpointGeneration: 3,
 				pid: process.pid,
 				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
@@ -3405,7 +3467,7 @@ describe("SDK broker identity and discovery", () => {
 						await broker.index.append({
 							type: "host_registered",
 							sessionId,
-							locator: { repo: dir, stateRoot },
+							locator: { cwd: dir, worktreeRoot: null, stateRoot },
 							endpointGeneration: 2,
 							pid: process.pid,
 							endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
@@ -3435,7 +3497,7 @@ describe("SDK broker identity and discovery", () => {
 			await broker.index.append({
 				type: "host_registered",
 				sessionId,
-				locator: { repo: dir, stateRoot },
+				locator: { cwd: dir, worktreeRoot: null, stateRoot },
 				endpointGeneration: 1,
 				pid: process.pid,
 				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
@@ -3443,7 +3505,7 @@ describe("SDK broker identity and discovery", () => {
 			await broker.index.append({
 				type: "host_heartbeat",
 				sessionId,
-				locator: { repo: dir, stateRoot },
+				locator: { cwd: dir, worktreeRoot: null, stateRoot },
 				endpointGeneration: 1,
 				pid: process.pid,
 			});
@@ -3504,7 +3566,7 @@ describe("SDK broker identity and discovery", () => {
 			await broker.index.append({
 				type: "host_registered",
 				sessionId,
-				locator: { repo: dir, stateRoot },
+				locator: { cwd: dir, worktreeRoot: null, stateRoot },
 				endpointGeneration: 1,
 				pid: process.pid,
 				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
@@ -3513,7 +3575,7 @@ describe("SDK broker identity and discovery", () => {
 			await broker.index.append({
 				type: "host_heartbeat",
 				sessionId,
-				locator: { repo: dir, stateRoot },
+				locator: { cwd: dir, worktreeRoot: null, stateRoot },
 				endpointGeneration: 1,
 				pid: process.pid,
 			});

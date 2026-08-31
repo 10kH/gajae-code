@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { createCoordinatorMcpServer } from "../../src/coordinator-mcp/server";
-import { writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
+import { type BrokerDiscovery, brokerProcessIncarnation, writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
 import type { SdkClient } from "../../src/sdk/client/client";
 import {
 	coordinatorFixtureRoot,
@@ -47,23 +47,27 @@ async function createServerWithSessions(
 ) {
 	const agentDir = path.join(root, "agent-global");
 	const env = options.env ?? serverEnv(root);
-	await writeBrokerDiscovery(agentDir, {
+	const discovery: BrokerDiscovery = {
 		version: 1,
 		protocolVersion: 3,
 		packageGeneration: "test",
 		ownerId: "test",
 		pid: process.pid,
+		incarnation: brokerProcessIncarnation(process.pid) ?? "test-incarnation",
 		host: "127.0.0.1",
 		port: 1,
 		url: "ws://sdk.example.test",
 		token: "test-token",
 		startedAt: Date.now(),
 		heartbeatAt: Date.now(),
-	});
+	};
+	await writeBrokerDiscovery(agentDir, discovery);
 	const server = createCoordinatorMcpServer({
 		env,
 		services: {
 			getAgentDir: () => agentDir,
+			ensureBroker: async () => discovery,
+			readSdkBrokerDiscovery: async () => discovery,
 			connectBroker: async () =>
 				({
 					global: async (operation: string, input: Record<string, unknown>) => {
@@ -93,6 +97,16 @@ async function createServer(root: string, options: { registerFirst?: boolean } =
 }
 
 describe("gjc_coordinator_list_sessions registration marker", () => {
+	it("materializes complete locator-v2 rows for broker fixtures", () => {
+		const root = "/tmp/coordinator-locator-v2";
+		const row = fixtureBrokerRows(root, REGISTERED_ID).live;
+		expect(row.locator).toEqual({
+			cwd: root,
+			worktreeRoot: null,
+			stateRoot: path.join(root, ".gjc", "state"),
+		});
+	});
+
 	it("reports registered for projected sessions and unregistered for broker-only ones", async () => {
 		const root = await coordinatorFixtureRoot(tempDirs);
 		const server = await createServer(root);
@@ -162,14 +176,46 @@ describe("gjc_coordinator_list_sessions registration marker", () => {
 		const hostile = await createServerWithSessions(
 			root,
 			[
-				{ sessionId: "", locator: { repo: root }, live: true },
-				{ sessionId: 12345, locator: { repo: root }, live: true },
-				{ sessionId: null, locator: { repo: root }, live: true },
-				{ sessionId: "../escape", locator: { repo: root }, live: true },
-				{ sessionId: "a/b/c", locator: { repo: root }, live: true },
-				{ sessionId: `${"x".repeat(200)}`, locator: { repo: root }, live: true },
-				{ sessionId: REGISTERED_ID, locator: { repo: root }, live: true },
-				{ sessionId: REGISTERED_ID, locator: { repo: root }, live: true },
+				{
+					sessionId: "",
+					locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+					live: true,
+				},
+				{
+					sessionId: 12345,
+					locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+					live: true,
+				},
+				{
+					sessionId: null,
+					locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+					live: true,
+				},
+				{
+					sessionId: "../escape",
+					locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+					live: true,
+				},
+				{
+					sessionId: "a/b/c",
+					locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+					live: true,
+				},
+				{
+					sessionId: `${"x".repeat(200)}`,
+					locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+					live: true,
+				},
+				{
+					sessionId: REGISTERED_ID,
+					locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+					live: true,
+				},
+				{
+					sessionId: REGISTERED_ID,
+					locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+					live: true,
+				},
 			],
 			{ registerFirst: false },
 		);
@@ -258,10 +304,14 @@ describe("gjc_coordinator_list_sessions registration marker", () => {
 		const root = await coordinatorFixtureRoot(tempDirs);
 		const rows = Array.from({ length: 400 }, (_, index) => ({
 			sessionId: `bulk-${`${index}`.padStart(4, "0")}`,
-			locator: { repo: root },
+			locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
 			live: true,
 		}));
-		rows.push({ sessionId: REGISTERED_ID, locator: { repo: root }, live: true });
+		rows.push({
+			sessionId: REGISTERED_ID,
+			locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+			live: true,
+		});
 		const server = await createServerWithSessions(root, rows);
 		await writeDurableCoordinatorSession({ sessionId: REGISTERED_ID, cwd: root, env: serverEnv(root) });
 

@@ -263,7 +263,7 @@ async function sessionIndexOwnerSnapshot(agentDir: string): Promise<SessionIndex
 		.listSessions()
 		.sessions.map(session => ({
 			sessionId: session.sessionId,
-			repo: session.locator.repo,
+			repo: session.locator.cwd,
 			stateRoot: session.locator.stateRoot,
 		}))
 		.sort((left, right) =>
@@ -298,7 +298,7 @@ async function assertReadyOwner(
 	).resolves.toBeNull();
 	const owners = await registeredOwners(life.agentDir, sessionId);
 	expect(owners).toHaveLength(1);
-	expect(owners[0]!.locator).toMatchObject({ repo: workspace.cwd, stateRoot: workspace.stateRoot });
+	expect(owners[0]!.locator).toMatchObject({ cwd: workspace.cwd, worktreeRoot: null, stateRoot: workspace.stateRoot });
 }
 
 function resumeInput(

@@ -39,7 +39,9 @@ import { BUNDLED_GROK_BUILD_EXTENSION_ID, getBundledGrokBuildExtensionFactory } 
 import { initializeWithSettings } from "./discovery";
 import { exportFromFile } from "./export/html";
 import type { ExtensionUIContext } from "./extensibility/extensions/types";
+import { releaseLaunchWorktreeReservationAfterRegistration } from "./gjc-runtime/launch-worktree-reservation";
 import { persistCoordinatorRuntimeInputReady } from "./gjc-runtime/session-state-sidecar";
+import { assertMasterLaunchArgs, assertMasterLaunchDisposition, createMasterModeContext } from "./master-mode/context";
 import type { AcpStartupOptions } from "./modes/acp/startup-options";
 import type { SessionSelectionResult } from "./modes/components/session-selector";
 import type { InteractiveMode } from "./modes/interactive-mode";
@@ -56,7 +58,7 @@ import {
 	discoverAuthStorage,
 } from "./sdk";
 import { processIncarnation } from "./sdk/broker/process-incarnation";
-import { SessionIndex } from "./sdk/broker/session-index";
+import { newMasterAttestationEpoch, resolveSessionLocator, SessionIndex } from "./sdk/broker/session-index";
 import type { AgentSession } from "./session/agent-session";
 import { SessionMigrationBusyError } from "./session/internal/session-open-errors";
 import {
@@ -1366,6 +1368,7 @@ export async function runRootCommand(
 	deps: RunRootCommandDependencies = {},
 ): Promise<void> {
 	const parsedArgs = parsed;
+	assertMasterLaunchArgs(parsedArgs);
 	let initialThemeInitialized = false;
 	let autoChdirApplied = false;
 	let bareResumeSessionManager: SessionManager | undefined;
@@ -1553,6 +1556,22 @@ export async function runRootCommand(
 		print: Boolean(parsedArgs.print),
 		mode: parsedArgs.mode,
 	});
+	// Master admission runs unconditionally and BEFORE any session state is
+	// opened or created. Nesting it under nonInteractiveError skipped it for a
+	// non-TTY launch carrying prepared input, which resolves to autoPrint with no
+	// error, so `--master <prompt>` proceeded as an ordinary auto-print run.
+	try {
+		assertMasterLaunchDisposition({
+			master: parsedArgs.master,
+			isInteractive: disposition.isInteractive,
+			autoPrint: disposition.autoPrint,
+			nonInteractiveError: disposition.nonInteractiveError,
+		});
+	} catch (error) {
+		process.stderr.write(`${chalk.red(error instanceof Error ? error.message : "Invalid master launch")}\n`);
+		if (!deps.suppressProcessExit) process.exitCode = 1;
+		return;
+	}
 	if (disposition.nonInteractiveError) {
 		process.stderr.write(`${chalk.red(disposition.nonInteractiveError)}\n`);
 		process.exit(1);
@@ -1676,6 +1695,14 @@ export async function runRootCommand(
 			}
 		}
 	}
+	const masterModeContext =
+		parsedArgs.master === true && sessionManager
+			? createMasterModeContext(
+					parsedArgs.masterScope ?? "repo",
+					sessionManager.getSessionId(),
+					newMasterAttestationEpoch(),
+				)
+			: undefined;
 
 	const { options: sessionOptions } = await logger.time(
 		"buildSessionOptions",
@@ -1742,6 +1769,7 @@ export async function runRootCommand(
 	sessionOptions.notificationHostModeSupported = isInteractive;
 	sessionOptions.sdkHostModeSupported = isInteractive;
 	sessionOptions.settings = settingsInstance;
+	sessionOptions.masterModeContext = masterModeContext;
 	if (isInteractive && sessionOptions.mcpConfigPath) {
 		sessionOptions.deferMcpConfigStartup = true;
 	}
@@ -1826,7 +1854,7 @@ export async function runRootCommand(
 	const directSessionId = process.env.GJC_LIFECYCLE_REQUEST_ID ? undefined : sessionManager?.getSessionId();
 	if (directSessionId) {
 		const sessionIndex = new SessionIndex(settingsInstance.getAgentDir());
-		const locator = { repo: sessionManager?.getCwd() ?? cwd, stateRoot: settingsInstance.getAgentDir() };
+		const locator = await resolveSessionLocator(sessionManager?.getCwd() ?? cwd, settingsInstance.getAgentDir());
 		// A pid is reusable, so the broker's teardown fence needs this session's OS
 		// start incarnation recorded alongside the pid it publishes.
 		const directSessionIncarnation = processIncarnation(process.pid);
@@ -1837,7 +1865,31 @@ export async function runRootCommand(
 			endpointGeneration: 0,
 			pid: process.pid,
 			...(directSessionIncarnation ? { processIncarnation: directSessionIncarnation } : {}),
+			...(masterModeContext && directSessionIncarnation
+				? {
+						masterRole: {
+							version: 2,
+							ownerSessionId: masterModeContext.ownerSessionId,
+							launchPid: process.pid,
+							launchProcessIncarnation: directSessionIncarnation,
+							role: "master" as const,
+							attestationEpoch: masterModeContext.attestationEpoch,
+						},
+					}
+				: {}),
 		});
+		if (locator.worktreeRoot !== null) {
+			try {
+				await releaseLaunchWorktreeReservationAfterRegistration(
+					settingsInstance.getAgentDir(),
+					locator.worktreeRoot,
+				);
+			} catch (error) {
+				logger.warn("Failed to release launch worktree reservation after host registration", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
 		postmortem.register("direct-session-index", async () => {
 			await sessionIndex.append({
 				type: "host_unregistered",

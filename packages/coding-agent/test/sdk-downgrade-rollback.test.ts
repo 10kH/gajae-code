@@ -177,7 +177,7 @@ test("v1 SDK state transforms to a rollback directory and is executable by the p
 	await index.append({
 		type: "host_registered",
 		sessionId: "rollback-session",
-		locator: { repo: source, stateRoot: path.join(source, "state") },
+		locator: { cwd: source, worktreeRoot: null, stateRoot: path.join(source, "state") },
 		endpointGeneration: 1,
 		pid: process.pid,
 	});
@@ -333,7 +333,13 @@ test("v1 SDK state transforms to a rollback directory and is executable by the p
 			schemaVersion: 1,
 			sourceVersion: 1,
 			targetVersion: 1,
-			omissions: [],
+			omissions: [
+				{
+					path: path.join("sdk", "sessions", "index.jsonl"),
+					field: "version",
+					reason: "session index format 4 is not readable by the rollback target",
+				},
+			],
 			copied: expect.any(Array),
 			pretrainBinary: {
 				baseRef: manifest.baseRef,

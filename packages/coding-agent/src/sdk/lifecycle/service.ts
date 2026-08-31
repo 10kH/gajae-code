@@ -1,6 +1,15 @@
 import { createHash } from "node:crypto";
 import path from "node:path";
 import {
+	resolvedScopeV1,
+	resolveScopeRequest,
+	type ScopeRequestV1,
+	type SdkSearchResultV1,
+	type SdkSearchRowV1,
+	scopeRequestV1,
+	searchRowV1,
+} from "../broker/session-scope";
+import {
 	SessionListTraversalError,
 	type SessionListTraversalPage,
 	sessionListPageFromResponse,
@@ -141,6 +150,9 @@ export interface SessionDeleteTarget {
 export interface SessionListTarget {
 	readonly cwd?: string;
 	readonly resolveSessionId?: string;
+	readonly scope?: ScopeRequestV1;
+	readonly limit?: number;
+	readonly cursor?: string;
 }
 
 interface SessionLifecycleMutationRequestBase<
@@ -197,7 +209,8 @@ export interface SessionLifecycleListEntry {
 	readonly live?: boolean;
 	readonly endpointGeneration?: number;
 	readonly terminalUncertain?: boolean;
-	readonly repo?: string;
+	readonly cwd?: string;
+	readonly locator?: { readonly cwd: string; readonly worktreeRoot: string | null; readonly stateRoot: string };
 }
 
 export interface SessionLifecycleListResult {
@@ -206,6 +219,8 @@ export interface SessionLifecycleListResult {
 	readonly warnings: readonly string[];
 	readonly savedSession?: SessionLifecycleSavedSession;
 }
+
+export type SessionScopedListResult = SdkSearchResultV1;
 
 export interface SessionCreateResult {
 	readonly ok: true;
@@ -240,7 +255,7 @@ export interface SessionReconcileUncertainResult {
 export interface SessionListSuccessResult {
 	readonly ok: true;
 	readonly operation: "session.list";
-	readonly result: SessionLifecycleListResult;
+	readonly result: SessionLifecycleListResult | SessionScopedListResult;
 }
 
 export interface SessionLifecycleError {
@@ -289,6 +304,7 @@ export type SessionListFailure = {
 	readonly operation: "session.list";
 	readonly certainty: SessionLifecycleCertainty;
 	readonly error: SessionLifecycleError;
+	readonly result?: SessionScopedListResult;
 };
 
 export type SessionCreateOutcome = SessionCreateResult | SessionCreateFailure;
@@ -582,12 +598,24 @@ function listResult(value: unknown): SessionLifecycleListResult | undefined {
 			live?: boolean;
 			endpointGeneration?: number;
 			terminalUncertain?: boolean;
-			repo?: string;
+			cwd?: string;
+			locator?: { cwd: string; worktreeRoot: string | null; stateRoot: string };
 		} = { sessionId: entry.sessionId };
 		if (typeof entry.live === "boolean") item.live = entry.live;
 		if (typeof entry.endpointGeneration === "number") item.endpointGeneration = entry.endpointGeneration;
 		if (typeof entry.terminalUncertain === "boolean") item.terminalUncertain = entry.terminalUncertain;
-		if (isRecord(entry.locator) && typeof entry.locator.repo === "string") item.repo = entry.locator.repo;
+		if (isRecord(entry.locator) && typeof entry.locator.cwd === "string") item.cwd = entry.locator.cwd;
+		if (
+			isRecord(entry.locator) &&
+			typeof entry.locator.cwd === "string" &&
+			(entry.locator.worktreeRoot === null || typeof entry.locator.worktreeRoot === "string") &&
+			typeof entry.locator.stateRoot === "string"
+		)
+			item.locator = {
+				cwd: entry.locator.cwd,
+				worktreeRoot: entry.locator.worktreeRoot,
+				stateRoot: entry.locator.stateRoot,
+			};
 		sessions.push(item);
 	}
 	const warnings: string[] = [];
@@ -600,10 +628,40 @@ function listResult(value: unknown): SessionLifecycleListResult | undefined {
 	if (savedSessionPresent && !savedSession) return undefined;
 	return { indexSeq, sessions, warnings, ...(savedSession ? { savedSession } : {}) };
 }
+
+function scopedPage(value: unknown): { scope: SdkSearchResultV1["scope"]; observedAt: string } | undefined {
+	if (!isRecord(value)) return undefined;
+	const scope = resolvedScopeV1(value.scope);
+	return scope && typeof value.observedAt === "string" ? { scope, observedAt: value.observedAt } : undefined;
+}
+
+function scopedSearchRows(sessions: readonly SessionLifecycleListEntry[]): SdkSearchRowV1[] | undefined {
+	const rows: SdkSearchRowV1[] = [];
+	for (const session of sessions) {
+		const locator = session.locator;
+		if (
+			locator === undefined ||
+			typeof locator.cwd !== "string" ||
+			(locator.worktreeRoot !== null && typeof locator.worktreeRoot !== "string") ||
+			typeof locator.stateRoot !== "string"
+		)
+			return undefined;
+		rows.push(
+			searchRowV1({
+				sessionId: session.sessionId,
+				locator: { cwd: locator.cwd, worktreeRoot: locator.worktreeRoot, stateRoot: locator.stateRoot },
+				live: session.live === true,
+			}),
+		);
+	}
+	return rows;
+}
 type LifecycleListPage = {
 	readonly result: SessionLifecycleListResult;
 	readonly sessions: readonly SessionLifecycleListEntry[];
 	readonly continuationCursor?: unknown;
+	readonly scope?: SdkSearchResultV1["scope"];
+	readonly observedAt?: string;
 };
 
 function brokerError(value: unknown): { code: string; message: string } | undefined {
@@ -647,6 +705,24 @@ function brokerErrorFromThrown(value: unknown): { code: string; message: string;
 	return { code, message, ...(requestSent === undefined ? {} : { requestSent }) };
 }
 
+function unavailableScopedList(scope: SdkSearchResultV1["scope"]): SessionListFailure {
+	return {
+		ok: false,
+		operation: "session.list",
+		certainty: "retryable",
+		error: { code: "unavailable", message: "broker search is unavailable" },
+		result: {
+			version: 1,
+			scope,
+			status: "unavailable",
+			observedAt: new Date().toISOString(),
+			rows: [],
+			warnings: [],
+			error: { code: "unavailable", message: "broker search is unavailable" },
+		},
+	};
+}
+
 const TRANSPORT_ERROR_CODES = new Set([
 	"timeout",
 	"connection_closed",
@@ -678,7 +754,110 @@ export class SessionLifecycleService {
 		this.#client = client;
 	}
 
-	async #execute(
+	async scopedList(scope: ScopeRequestV1, limit?: number, cursor?: string): Promise<SessionListOutcome> {
+		return await this.#list(
+			{
+				actor: { id: "gjc-sdk-search-cli", namespace: "sdk:search-cli" },
+				capability: "session.list",
+				target: {
+					scope,
+					...(limit === undefined ? {} : { limit }),
+					...(cursor === undefined ? {} : { cursor }),
+				},
+			},
+			true,
+		);
+	}
+
+	async #singleScopedList(
+		request: Omit<SessionListRequest, "operation">,
+		target: Readonly<Record<string, unknown>>,
+		locallyResolvedScope: SdkSearchResultV1["scope"],
+	): Promise<SessionListOutcome> {
+		let response: unknown;
+		try {
+			response = await this.#client.global(
+				"session.list",
+				{ ...target },
+				{
+					...(request.timeoutMs === undefined ? {} : { timeoutMs: request.timeoutMs }),
+				},
+			);
+		} catch (thrown) {
+			const error = brokerError(thrown) ?? brokerErrorFromThrown(thrown);
+			if (!error || error.code === "unavailable") return unavailableScopedList(locallyResolvedScope);
+			return failure("session.list", certaintyForThrownError(error), error.code, error.message);
+		}
+		const error = brokerError(response);
+		if (error) {
+			if (error.code === "unavailable") return unavailableScopedList(locallyResolvedScope);
+			return failure("session.list", certaintyForBrokerCode(error.code), error.code, error.message);
+		}
+		if (!isRecord(response) || response.ok !== true)
+			return failure(
+				"session.list",
+				"uncertain",
+				"malformed_response",
+				"lifecycle broker returned a malformed scoped list result",
+			);
+		const page = sessionListPageFromResponse(response);
+		const result = page === undefined ? undefined : listResult(page);
+		const pageScope = page === undefined ? undefined : scopedPage(page);
+		if (page === undefined || !result || !pageScope)
+			return failure(
+				"session.list",
+				"uncertain",
+				"malformed_response",
+				"lifecycle broker returned a malformed scoped list result",
+			);
+		if (JSON.stringify(pageScope.scope) !== JSON.stringify(locallyResolvedScope))
+			return failure(
+				"session.list",
+				"uncertain",
+				"scope_observation_drift",
+				"lifecycle broker scope does not match the locally resolved request scope",
+			);
+		const continuationCursor = page.continuationCursor;
+		if (
+			continuationCursor !== undefined &&
+			(typeof continuationCursor !== "string" || continuationCursor.length === 0)
+		)
+			return failure(
+				"session.list",
+				"uncertain",
+				"malformed_response",
+				"lifecycle broker returned a malformed scoped list result",
+			);
+		const rows = scopedSearchRows(result.sessions);
+		if (!rows)
+			return failure(
+				"session.list",
+				"uncertain",
+				"malformed_response",
+				"lifecycle broker returned a malformed scoped list result",
+			);
+		return {
+			ok: true,
+			operation: "session.list",
+			result: {
+				version: 1,
+				scope: pageScope.scope,
+				status:
+					pageScope.scope.resolution === "not-in-git-worktree"
+						? "not-in-git-worktree"
+						: rows.length === 0
+							? "empty"
+							: "populated",
+				observedAt: pageScope.observedAt,
+				indexSeq: result.indexSeq,
+				rows,
+				...(continuationCursor === undefined ? {} : { cursor: continuationCursor }),
+				warnings: result.warnings,
+			},
+		};
+	}
+
+	async execute(
 		request: SessionLifecycleMutationRequest,
 		idempotencyKeyOverride?: string,
 	): Promise<
@@ -759,19 +938,6 @@ export class SessionLifecycleService {
 			| SessionReconcileUncertainOutcome;
 	}
 
-	async execute(
-		request: SessionLifecycleMutationRequest,
-	): Promise<
-		| SessionCreateOutcome
-		| SessionForkOutcome
-		| SessionResumeOutcome
-		| SessionCloseOutcome
-		| SessionDeleteOutcome
-		| SessionReconcileUncertainOutcome
-	> {
-		return this.#execute(request);
-	}
-
 	async executeWithIdempotencyKey(
 		request: SessionLifecycleMutationRequest,
 		idempotencyKey: string,
@@ -783,7 +949,7 @@ export class SessionLifecycleService {
 		| SessionDeleteOutcome
 		| SessionReconcileUncertainOutcome
 	> {
-		return this.#execute(request, idempotencyKey);
+		return this.execute(request, idempotencyKey);
 	}
 
 	async create(request: Omit<SessionCreateRequest, "operation">): Promise<SessionCreateOutcome> {
@@ -816,6 +982,9 @@ export class SessionLifecycleService {
 	}
 
 	async list(request: Omit<SessionListRequest, "operation">): Promise<SessionListOutcome> {
+		return await this.#list(request, false);
+	}
+	async #list(request: Omit<SessionListRequest, "operation">, singleScopedPage: boolean): Promise<SessionListOutcome> {
 		if (!validActor((request as { actor?: unknown }).actor))
 			return failure("session.list", "terminal", "unauthorized", "authenticated actor is required");
 		if ((request as { capability?: unknown }).capability !== "session.list")
@@ -823,6 +992,24 @@ export class SessionLifecycleService {
 		const target = request.target ?? {};
 		if (!validTarget(target))
 			return failure("session.list", "terminal", "invalid_request", "target must be an object");
+		const scopeRequest = target.scope === undefined ? undefined : scopeRequestV1(target.scope);
+		if (target.scope !== undefined && !scopeRequest)
+			return failure("session.list", "terminal", "invalid_request", "scope must be a valid ScopeRequestV1");
+		let locallyResolvedScope: SdkSearchResultV1["scope"] | undefined;
+		if (scopeRequest !== undefined) {
+			try {
+				locallyResolvedScope = await resolveScopeRequest(scopeRequest);
+			} catch (cause) {
+				return failure(
+					"session.list",
+					"terminal",
+					"invalid_request",
+					cause instanceof Error ? cause.message : "scope could not be resolved",
+				);
+			}
+		}
+		if (singleScopedPage && locallyResolvedScope !== undefined)
+			return await this.#singleScopedList(request, target, locallyResolvedScope);
 		let pages: readonly SessionListTraversalPage<unknown, LifecycleListPage>[];
 		try {
 			pages = await traverseSessionList<Record<string, unknown>, unknown, LifecycleListPage>(
@@ -838,14 +1025,22 @@ export class SessionLifecycleService {
 					const page = sessionListPageFromResponse(response);
 					if (!page) return undefined;
 					const result = listResult(page);
+					const scoped = scopedPage(page);
 					return result
-						? { result, sessions: result.sessions, continuationCursor: page.continuationCursor }
+						? {
+								result,
+								sessions: result.sessions,
+								continuationCursor: page.continuationCursor,
+								...(scoped === undefined ? {} : scoped),
+							}
 						: undefined;
 				},
 			);
 		} catch (thrown) {
 			if (thrown instanceof BrokerSessionListResponseError) {
 				const error = thrown.brokerError;
+				if (error.code === "unavailable" && locallyResolvedScope)
+					return unavailableScopedList(locallyResolvedScope);
 				return failure("session.list", certaintyForBrokerCode(error.code), error.code, error.message);
 			}
 			if (thrown instanceof SessionListTraversalError)
@@ -860,6 +1055,8 @@ export class SessionLifecycleService {
 							: "session.list exceeded the page budget",
 				);
 			const error = brokerError(thrown) ?? brokerErrorFromThrown(thrown);
+			if (locallyResolvedScope && (!error || error.code === "unavailable"))
+				return unavailableScopedList(locallyResolvedScope);
 			return error
 				? failure("session.list", certaintyForThrownError(error), error.code, error.message)
 				: failure("session.list", "retryable", "unavailable", "lifecycle broker request was unavailable");
@@ -873,6 +1070,68 @@ export class SessionLifecycleService {
 				"lifecycle broker returned a malformed list result",
 			);
 		const { result } = firstPage.page;
+		if (request.target?.scope !== undefined) {
+			const scope = firstPage.page.scope;
+			const observedAt = firstPage.page.observedAt;
+			if (!scope || !observedAt)
+				return failure(
+					"session.list",
+					"uncertain",
+					"malformed_response",
+					"lifecycle broker returned a malformed scoped list result",
+				);
+			const frozenScope = JSON.stringify(scope);
+			const frozenIndexSeq = result.indexSeq;
+			for (const page of pages) {
+				const pageScope = page.page.scope;
+				const pageObservedAt = page.page.observedAt;
+				if (
+					pageScope === undefined ||
+					pageObservedAt !== observedAt ||
+					page.page.result.indexSeq !== frozenIndexSeq ||
+					JSON.stringify(pageScope) !== frozenScope
+				)
+					return failure(
+						"session.list",
+						"uncertain",
+						"scope_observation_drift",
+						"lifecycle broker changed the frozen scope observation across list pages",
+					);
+			}
+			if (locallyResolvedScope && JSON.stringify(locallyResolvedScope) !== frozenScope)
+				return failure(
+					"session.list",
+					"uncertain",
+					"scope_observation_drift",
+					"lifecycle broker scope does not match the locally resolved request scope",
+				);
+			const rows = scopedSearchRows(pages.flatMap(page => page.page.result.sessions));
+			if (!rows)
+				return failure(
+					"session.list",
+					"uncertain",
+					"malformed_response",
+					"lifecycle broker returned a malformed scoped list result",
+				);
+			return {
+				ok: true,
+				operation: "session.list",
+				result: {
+					version: 1,
+					scope,
+					status:
+						scope.resolution === "not-in-git-worktree"
+							? "not-in-git-worktree"
+							: rows.length === 0
+								? "empty"
+								: "populated",
+					observedAt,
+					indexSeq: result.indexSeq,
+					rows,
+					warnings: result.warnings,
+				},
+			};
+		}
 		return {
 			ok: true,
 			operation: "session.list",

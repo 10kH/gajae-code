@@ -262,7 +262,7 @@ describe("chat daemon worker", () => {
 		await index.append({
 			type: "host_registered",
 			sessionId: "session",
-			locator: { repo: root, stateRoot },
+			locator: { cwd: root, worktreeRoot: null, stateRoot },
 			endpointGeneration: 1,
 			pid: process.pid,
 			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
@@ -514,7 +514,7 @@ describe("chat daemon worker", () => {
 		await index.append({
 			type: "host_registered",
 			sessionId: "session",
-			locator: { repo: root, stateRoot: path.join(stateRoot, "chat") },
+			locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(stateRoot, "chat") },
 			endpointGeneration: 1,
 			pid: process.pid,
 			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
@@ -567,7 +567,7 @@ describe("chat daemon worker", () => {
 		await index.append({
 			type: "host_registered",
 			sessionId: "session",
-			locator: { repo: root, stateRoot },
+			locator: { cwd: root, worktreeRoot: null, stateRoot },
 			endpointGeneration: 1,
 			pid: process.pid,
 			endpointMtimeMs: authorizedMtimeMs,
@@ -632,7 +632,7 @@ describe("chat daemon worker", () => {
 		await index.append({
 			type: "host_registered",
 			sessionId: "session",
-			locator: { repo: root, stateRoot },
+			locator: { cwd: root, worktreeRoot: null, stateRoot },
 			endpointGeneration: 1,
 			pid: process.pid,
 			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
@@ -677,7 +677,7 @@ describe("chat daemon worker", () => {
 		await index.append({
 			type: "host_registered",
 			sessionId: "session",
-			locator: { repo: root, stateRoot },
+			locator: { cwd: root, worktreeRoot: null, stateRoot },
 			endpointGeneration: 2,
 			pid: process.pid,
 			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
@@ -705,7 +705,7 @@ describe("chat daemon worker", () => {
 		await index.append({
 			type: "host_registered",
 			sessionId: "session",
-			locator: { repo: root, stateRoot },
+			locator: { cwd: root, worktreeRoot: null, stateRoot },
 			endpointGeneration: 1,
 			pid: process.pid,
 			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
@@ -760,7 +760,7 @@ describe("chat daemon worker", () => {
 		await index.append({
 			type: "host_registered",
 			sessionId: "session",
-			locator: { repo: root, stateRoot },
+			locator: { cwd: root, worktreeRoot: null, stateRoot },
 			endpointGeneration: 1,
 			pid: process.pid,
 			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
@@ -793,7 +793,7 @@ describe("chat daemon worker", () => {
 		await index.append({
 			type: "host_registered",
 			sessionId: "session",
-			locator: { repo: root, stateRoot },
+			locator: { cwd: root, worktreeRoot: null, stateRoot },
 			endpointGeneration: 1,
 			pid: process.pid,
 			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
@@ -920,7 +920,7 @@ describe("chat daemon worker", () => {
 		await index.append({
 			type: "host_registered",
 			sessionId: "session",
-			locator: { repo: root, stateRoot },
+			locator: { cwd: root, worktreeRoot: null, stateRoot },
 			endpointGeneration: 1,
 			pid: process.pid,
 			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
@@ -1071,7 +1071,7 @@ describe("chat daemon worker", () => {
 		await index.append({
 			type: "host_registered",
 			sessionId: "session",
-			locator: { repo: root, stateRoot },
+			locator: { cwd: root, worktreeRoot: null, stateRoot },
 			endpointGeneration: 1,
 			pid: process.pid,
 			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
@@ -1222,7 +1222,7 @@ describe("chat daemon worker", () => {
 			await index.append({
 				type: "host_registered",
 				sessionId: "session",
-				locator: { repo: root, stateRoot },
+				locator: { cwd: root, worktreeRoot: null, stateRoot },
 				endpointGeneration: 1,
 				pid: process.pid,
 				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
@@ -1359,7 +1359,7 @@ describe("chat daemon worker", () => {
 				await index.append({
 					type: "host_registered",
 					sessionId: host.sessionId,
-					locator: { repo: root, stateRoot: path.join(root, ".gjc", "state") },
+					locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
 					endpointGeneration: 1,
 					pid: host.endpoint.pid,
 					endpointMtimeMs: host.endpointMtimeMs,
