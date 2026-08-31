@@ -92,6 +92,21 @@ switch (scenario) {
 		);
 		break;
 	}
+	case "stale-dead-transition": {
+		const transitionDir = `${lockFile}.transition`;
+		await fs.mkdir(transitionDir);
+		await fs.writeFile(
+			`${transitionDir}.owner`,
+			JSON.stringify({
+				pid: DEAD_PID,
+				start_time: "unknown",
+				token: "stale-dead-transition",
+				owner_host_id: "probe-local-host",
+			}),
+		);
+		break;
+	}
+
 	case "race-replacement": {
 		await fs.writeFile(
 			lockFile,
