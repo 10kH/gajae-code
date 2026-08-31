@@ -283,11 +283,17 @@ export class ChatDaemonRuntime {
 
 	async start(): Promise<void> {
 		if (this.#cleanupWork.size > 0 || this.#retirementWork.size > 0) {
+			const retirements = [...this.#retirementWork.entries()];
 			const settled = await Promise.race([
-				Promise.allSettled([...this.#cleanupWork.values(), ...this.#retirementWork.values()]).then(() => true),
+				Promise.all([
+					Promise.allSettled([...this.#cleanupWork.values()]),
+					Promise.all(retirements.map(([, retirement]) => retirement)),
+				]).then(() => true),
 				Bun.sleep(5_000).then(() => false),
 			]);
 			if (!settled) throw new Error("Prior provider cleanup did not settle before chat daemon restart.");
+			for (const [sessionId, retirement] of retirements)
+				if (this.#retirementWork.get(sessionId) === retirement) this.#retirementWork.delete(sessionId);
 		}
 		this.#attachments.clear();
 		const retainedProvider =
@@ -429,7 +435,12 @@ export class ChatDaemonRuntime {
 		const discord = this.#discord;
 		const slack = this.#slack;
 		const barrier = (async () => {
-			await this.#retirementWork.get(attachment.sessionId)?.catch(() => undefined);
+			const retirement = this.#retirementWork.get(attachment.sessionId);
+			if (retirement) {
+				await retirement;
+				if (this.#retirementWork.get(attachment.sessionId) === retirement)
+					this.#retirementWork.delete(attachment.sessionId);
+			}
 			await this.#cleanupWork.get(attachment.sessionId)?.catch(() => undefined);
 			await discord?.recoverCleanup(attachment.sessionId, attachment.generation);
 			await slack?.recoverCleanup(attachment.sessionId, attachment.generation);
@@ -467,7 +478,7 @@ export class ChatDaemonRuntime {
 		const discord = this.#discord;
 		const slack = this.#slack;
 		const previous = this.#retirementWork.get(sessionId);
-		const work = (previous ? previous.catch(() => undefined) : Promise.resolve()).then(async () => {
+		const work = (previous ?? Promise.resolve()).then(async () => {
 			// Capture the predecessor providers before stop() can clear the runtime
 			// fields. The successor barrier owns this promise until every retirement
 			// waiter settles, even when takeover overlaps worker shutdown.
@@ -475,9 +486,7 @@ export class ChatDaemonRuntime {
 			await slack?.retireAttachment(sessionId, attachment.generation);
 		});
 		this.#retirementWork.set(sessionId, work);
-		return work.finally(() => {
-			if (this.#retirementWork.get(sessionId) === work) this.#retirementWork.delete(sessionId);
-		});
+		return work;
 	}
 
 	async #handleFrame(attachment: SessionAttachment, correlated: CorrelatedFrame): Promise<void> {

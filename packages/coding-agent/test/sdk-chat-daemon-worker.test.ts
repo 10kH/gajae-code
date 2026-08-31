@@ -5,7 +5,7 @@ import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { ChatDaemonRuntime } from "../src/sdk/bus/chat-daemon-runtime";
 import { ChatEffectJournal } from "../src/sdk/bus/chat-effect-journal";
-import { ConversationStore } from "../src/sdk/bus/conversation-store";
+import { ConversationStore, conversationStorePath } from "../src/sdk/bus/conversation-store";
 import type {
 	DiscordInboundEvent,
 	DiscordMessageComponent,
@@ -188,6 +188,7 @@ class FakeDiscordProvider implements DiscordProvider {
 }
 
 class FakeSdkClient implements SessionRouterClient {
+	readonly closeEntered = Promise.withResolvers<void>();
 	closed = false;
 	sent: Record<string, unknown>[] = [];
 	requests: Record<string, unknown>[] = [];
@@ -241,6 +242,7 @@ class FakeSdkClient implements SessionRouterClient {
 	}
 	async close(): Promise<void> {
 		this.closed = true;
+		this.closeEntered.resolve();
 	}
 }
 
@@ -695,10 +697,16 @@ describe("chat daemon worker", () => {
 
 	it("discards queued frames emitted by a same-generation successor attachment", async () => {
 		const scenarios = [
-			{ name: "same-generation first pass", generation: 1, stopDuringTakeover: false },
-			{ name: "same-generation repeated pass", generation: 1, stopDuringTakeover: false },
-			{ name: "same-generation worker shutdown", generation: 1, stopDuringTakeover: true },
-			{ name: "cross-generation replacement", generation: 2, stopDuringTakeover: false },
+			{ name: "same-generation first pass", generation: 1, stopDuringTakeover: false, retirementFails: false },
+			{ name: "same-generation repeated pass", generation: 1, stopDuringTakeover: false, retirementFails: false },
+			{ name: "same-generation worker shutdown", generation: 1, stopDuringTakeover: true, retirementFails: false },
+			{
+				name: "same-generation retirement failure",
+				generation: 1,
+				stopDuringTakeover: false,
+				retirementFails: true,
+			},
+			{ name: "cross-generation replacement", generation: 2, stopDuringTakeover: false, retirementFails: false },
 		] as const;
 		for (const scenario of scenarios) {
 			root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-chat-frame-"));
@@ -770,6 +778,7 @@ describe("chat daemon worker", () => {
 			oldClient.handler?.({ type: "turn_stream", sessionId: "session", text: `blocked ${scenario.name}` });
 			await entered.promise;
 			oldClient.handler?.({ type: "turn_stream", sessionId: "session", text: `stale queued ${scenario.name}` });
+			if (scenario.retirementFails) await fs.writeFile(conversationStorePath(agentDir, "discord"), "{");
 			await fs.writeFile(
 				endpointPath,
 				JSON.stringify({ sessionId: "session", pid: process.pid, url: "ws://127.0.0.1:1", token: "new-token" }),
@@ -782,8 +791,22 @@ describe("chat daemon worker", () => {
 				pid: process.pid,
 				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
 			});
-			const replacementReplay = newClient.waitForRequest(frame => frame.type === "event_replay");
 			tick?.();
+			if (scenario.retirementFails) {
+				await withStageTimeout("failed successor attachment close", newClient.closeEntered.promise);
+				expect(newClient.handler).toBeUndefined();
+				await fs.rm(conversationStorePath(agentDir, "discord"), { force: true });
+				release.resolve();
+				await withStageTimeout("worker shutdown after retirement failure", runtime.stop());
+				expect(provider.messages.some(message => message.content.includes(`blocked ${scenario.name}`))).toBe(false);
+				expect(provider.messages.some(message => message.content.includes(`stale queued ${scenario.name}`))).toBe(
+					false,
+				);
+				await fs.rm(root, { recursive: true, force: true });
+				root = "";
+				continue;
+			}
+			const replacementReplay = newClient.waitForRequest(frame => frame.type === "event_replay");
 			await replacementReplay;
 			expect(oldClient.closed).toBe(true);
 			expect(newClient.handler).toBeDefined();
@@ -809,7 +832,7 @@ describe("chat daemon worker", () => {
 			await fs.rm(root, { recursive: true, force: true });
 			root = "";
 		}
-	});
+	}, 30_000);
 
 	it("persists Slack action authority across restart, restores it for inbound replies, and clears resolved actions", async () => {
 		root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-slack-worker-"));
