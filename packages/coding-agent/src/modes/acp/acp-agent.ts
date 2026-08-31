@@ -476,7 +476,17 @@ function logDroppedPromptTerminal(
 
 function terminalOutcome(event: JsonObject): SdkPromptTerminalOutcome | undefined {
 	const outcome = object(event.outcome);
-	if (!outcome) return undefined;
+	if (!outcome) {
+		const error = event.type === "agent_failed" ? object(event.error) : undefined;
+		if (typeof error?.code === "string" && typeof error.message === "string")
+			return {
+				kind: "failed",
+				code: "prompt_failed",
+				message: `${error.code}: ${error.message}`,
+				provenance: "agent_failed",
+			};
+		return undefined;
+	}
 	if (
 		outcome.kind === "stopped" &&
 		(outcome.reason === "end_turn" ||
@@ -2670,7 +2680,7 @@ export class AcpAgent implements Agent {
 		const received = receivedSdkEvent(frame);
 		if (!received) return;
 		const { event, wirePayload } = received;
-		const isTerminal = event.type === "agent_end";
+		const isTerminal = event.type === "agent_end" || event.type === "agent_failed";
 		if (event.type === "notice" && event.source === "autorouting" && typeof event.message === "string") {
 			record.routingInactiveNotice = event.message;
 			return;
@@ -2832,9 +2842,10 @@ export class AcpAgent implements Agent {
 		// queries is what left a finished turn reported as running until the inactivity
 		// watchdog rescued it.
 		if (activePrompt) this.#settlePrompt(record, activePrompt);
-		// agent_failed is correlated diagnostic state while the run is still live.
-		// Only the authoritative agent_end boundary may publish end-of-turn usage,
-		// title, and idle integration updates.
+		// A failure terminal has no trustworthy end-of-turn usage or title. Settlement
+		// still releases the client phase immediately; a later agent_end is suppressed by
+		// the settled-correlation tombstone above.
+		if (event.type === "agent_failed") void this.#publishPromptPhaseIdle(id, adapter);
 		if (event.type === "agent_end") await this.#emitEndOfTurnUpdates(id, adapter);
 	}
 

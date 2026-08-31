@@ -387,15 +387,19 @@ test("ACP prompt rejects prompt_deadline_exceeded terminal outcomes with their c
 	}
 });
 
-test("ACP defers end-of-turn advisory updates until agent_end after diagnostic agent_failed", async () => {
+test("ACP rejects immediately when correlated agent_failed is the only terminal", async () => {
 	const fixture = await createFixture();
 	try {
 		const contextQueriesBefore = fixture.queryCalls.filter(query => query === "context.get").length;
 		const metadataQueriesBefore = fixture.queryCalls.filter(query => query === "session.metadata").length;
 		const idleUpdatesBefore = idlePhaseUpdates(fixture.updates);
-		const pending = prompt(fixture, "diagnostic before terminal");
+		const pending = prompt(fixture, "failure-only terminal");
 		await bounded(fixture.promptDelivered, "prompt delivery");
 		fixture.sendDiagnostic();
+		await expect(bounded(pending, "agent_failed settlement")).rejects.toMatchObject({
+			code: "prompt_failed",
+			message: "provider_unavailable: diagnostic from fixture",
+		});
 		await waitFor(
 			() =>
 				fixture.updates.some(
@@ -414,13 +418,66 @@ test("ACP defers end-of-turn advisory updates until agent_end after diagnostic a
 		).toHaveLength(1);
 		expect(fixture.queryCalls.filter(query => query === "context.get")).toHaveLength(contextQueriesBefore);
 		expect(fixture.queryCalls.filter(query => query === "session.metadata")).toHaveLength(metadataQueriesBefore);
-		expect(idlePhaseUpdates(fixture.updates)).toBe(idleUpdatesBefore);
+		await waitFor(() => idlePhaseUpdates(fixture.updates) === idleUpdatesBefore + 1, "failure idle update");
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP settles once when agent_end arrives after correlated agent_failed", async () => {
+	const fixture = await createFixture();
+	try {
+		let settleCount = 0;
+		const pending = prompt(fixture, "failure then late end").then(
+			result => {
+				settleCount++;
+				return result;
+			},
+			error => {
+				settleCount++;
+				throw error;
+			},
+		);
+		await bounded(fixture.promptDelivered, "prompt delivery");
+		fixture.sendDiagnostic();
+		await expect(bounded(pending, "agent_failed settlement")).rejects.toMatchObject({ code: "prompt_failed" });
+		await waitFor(() => idlePhaseUpdates(fixture.updates) > 1, "failure idle update");
+		const updatesAfterFailure = fixture.updates.length;
+		const queriesAfterFailure = fixture.queryCalls.length;
 
 		fixture.sendStopped("end_turn");
-		expect(await bounded(pending, "agent_end settlement")).toEqual({ stopReason: "end_turn" });
-		await waitFor(() => idlePhaseUpdates(fixture.updates) === idleUpdatesBefore + 1, "agent_end idle update");
-		expect(fixture.queryCalls.filter(query => query === "context.get")).toHaveLength(contextQueriesBefore + 1);
-		expect(fixture.queryCalls.filter(query => query === "session.metadata")).toHaveLength(metadataQueriesBefore + 1);
+		await Bun.sleep(30);
+
+		expect(settleCount).toBe(1);
+		expect(fixture.updates).toHaveLength(updatesAfterFailure);
+		expect(fixture.queryCalls).toHaveLength(queriesAfterFailure);
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP ignores agent_failed correlated to another turn", async () => {
+	const fixture = await createFixture();
+	try {
+		let settled = false;
+		const pending = prompt(fixture, "correlation isolation").finally(() => {
+			settled = true;
+		});
+		await bounded(fixture.promptDelivered, "prompt delivery");
+		const updatesBefore = fixture.updates.length;
+		fixture.sendTerminal({
+			type: "agent_failed",
+			sessionId: "prompt-terminal-session",
+			commandId: "foreign-command",
+			turnId: "foreign-turn",
+			error: { code: "provider_unavailable", message: "foreign failure" },
+		});
+		await Bun.sleep(30);
+
+		expect(settled).toBe(false);
+		expect(fixture.updates).toHaveLength(updatesBefore);
+		fixture.sendStopped("end_turn");
+		expect(await bounded(pending, "matching terminal settlement")).toEqual({ stopReason: "end_turn" });
 	} finally {
 		fixture.dispose();
 	}
@@ -607,7 +664,7 @@ for (const terminalType of ["agent_end"] as const) {
 	});
 }
 
-test("ACP preserves the fixed settlement-grace invalid-terminal rejection", async () => {
+test("ACP preserves the settlement-grace failure diagnostic", async () => {
 	const fixture = await createFixture();
 	try {
 		const pending = prompt(fixture, "unsettled prompt resources");
@@ -633,9 +690,8 @@ test("ACP preserves the fixed settlement-grace invalid-terminal rejection", asyn
 			},
 		});
 		await expect(bounded(pending, "unsettled prompt rejection")).rejects.toMatchObject({
-			code: "connection_closed",
-			message:
-				"ACP prompt terminal was invalid: Prompt resources did not settle before the terminalization grace expired.",
+			code: "prompt_failed",
+			message: "terminal_uncertain: Prompt resources did not settle before the terminalization grace expired.",
 		});
 	} finally {
 		fixture.dispose();
@@ -670,7 +726,7 @@ test("ACP releases the running phase and accepts a new prompt after a settlement
 			},
 		});
 		await expect(bounded(pending, "unsettled prompt rejection")).rejects.toMatchObject({
-			code: "connection_closed",
+			code: "prompt_failed",
 		});
 		const lastUpdate = fixture.updates.at(-1);
 		expect(lastUpdate?.update.sessionUpdate).toBe("session_info_update");
