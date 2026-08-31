@@ -1308,7 +1308,13 @@ async function acquireOwnerLock(
 		} catch {
 			throw error;
 		}
-		if (!validLockOwner(observed) || observed.released !== true) throw error;
+		if (!validLockOwner(observed)) throw error;
+		if (observed.released !== true) {
+			if (await lockOwnerIsAlive(observed)) throw error;
+			const removed = exactUnlinkOwnerRecord(file, current, quarantineName);
+			if (removed !== "removed" && removed !== "absent") throw error;
+			return await createOwnerLock(file, owner, quarantineName);
+		}
 		try {
 			return await rewriteHeldOwnerRecord(file, current, owner);
 		} catch (error) {
@@ -1593,10 +1599,12 @@ async function reclaimStaleTransitionClaim(transitionDir: string, quarantineName
 		root.ctimeNs !== String(generation.ctimeNs)
 	)
 		return;
-	const ownerRemoval = exactUnlinkOwnerRecord(`${transitionDir}.owner`, ownerSnapshot, quarantineName);
-	if (ownerRemoval !== "removed" && ownerRemoval !== "absent") return;
 	const removed = nativeSessionStateLock().exactRemoveDirectoryTree(nativePath, captured.snapshot);
-	if (removed.ok || removed.code === "not_found") return;
+	if (removed.ok || removed.code === "not_found") {
+		const ownerRemoval = exactUnlinkOwnerRecord(`${transitionDir}.owner`, ownerSnapshot, quarantineName);
+		if (ownerRemoval !== "removed" && ownerRemoval !== "absent") return;
+		return;
+	}
 	if (
 		removed.code === "cleanup_pending" &&
 		removed.payloadDurable === true &&
@@ -1604,8 +1612,11 @@ async function reclaimStaleTransitionClaim(transitionDir: string, quarantineName
 		removed.retainedSuccessorPath === undefined &&
 		removed.retainedUnknownPath === undefined &&
 		removed.retainedPlaceholderPath === undefined
-	)
+	) {
+		const ownerRemoval = exactUnlinkOwnerRecord(`${transitionDir}.owner`, ownerSnapshot, quarantineName);
+		if (ownerRemoval !== "removed" && ownerRemoval !== "absent") return;
 		return;
+	}
 	throw new SessionStateLockUnavailableError(
 		new Error(`Stale transition claim could not be reclaimed (${removed.code ?? "unknown"}).`),
 	);
