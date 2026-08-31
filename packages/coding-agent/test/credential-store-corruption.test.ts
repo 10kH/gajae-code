@@ -1,14 +1,22 @@
 import { Database } from "bun:sqlite";
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { AuthStorage, isSqliteCorruptionError, SqliteAuthCredentialStore } from "@gajae-code/ai/core";
+import { OAuthSelectorComponent } from "../src/modes/components/oauth-selector";
 import { SelectorController } from "../src/modes/controllers/selector-controller";
+import { getThemeByName, setThemeInstance } from "../src/modes/theme/theme";
 import { CREDENTIAL_STORE_UNREADABLE_MESSAGE } from "../src/session/credential-store-errors";
 
 const roots: string[] = [];
 const cliEntry = path.join(import.meta.dir, "../src/cli.ts");
+
+beforeAll(async () => {
+	const testTheme = await getThemeByName("red-claw");
+	if (!testTheme) throw new Error("Failed to load test theme");
+	setThemeInstance(testTheme);
+});
 
 async function tempRoot(prefix: string): Promise<string> {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
@@ -254,6 +262,35 @@ describe("credential SQLite corruption classification", () => {
 });
 
 describe("credential corruption presentation", () => {
+	test("bare /login async validation surfaces known corruption through the selector callback", async () => {
+		const corruption = Object.assign(new Error("database disk image is malformed"), { code: "SQLITE_CORRUPT" });
+		const errors: string[] = [];
+		let selector: OAuthSelectorComponent;
+		selector = new OAuthSelectorComponent(
+			"login",
+			{
+				hasAuth: (provider: string) => provider === "anthropic",
+				getGeneration: () => 1,
+			} as never,
+			() => undefined,
+			() => undefined,
+			{
+				validateAuth: async () => {
+					throw corruption;
+				},
+				onValidationError: error => {
+					if (!isSqliteCorruptionError(error)) return false;
+					selector.stopValidation();
+					errors.push(CREDENTIAL_STORE_UNREADABLE_MESSAGE);
+					return true;
+				},
+			},
+		);
+		await Bun.sleep(0);
+		expect(errors).toEqual([CREDENTIAL_STORE_UNREADABLE_MESSAGE]);
+		selector.dispose();
+	});
+
 	test("bare /logout maps known corruption but does not mask arbitrary refresh failures", async () => {
 		const errors: string[] = [];
 		const corruptionController = new SelectorController({
@@ -272,19 +309,20 @@ describe("credential corruption presentation", () => {
 
 		const arbitraryFailure = new Error("credential refresh transport failed");
 		const arbitraryController = new SelectorController({
+			isStopped: () => true,
 			session: {
 				credentialSessionId: "credential-session",
 				modelRegistry: {
+					authStorage: { hasAuth: () => true },
 					getApiKeyForProvider: async () => {
 						throw arbitraryFailure;
 					},
 				},
 			},
-			showError: () => {
-				throw new Error("arbitrary failures must not be rendered as credential corruption");
-			},
+			showError: () => errors.push("unexpected arbitrary error"),
 		} as never);
-		await expect(arbitraryController.showOAuthSelector("logout")).rejects.toBe(arbitraryFailure);
+		await expect(arbitraryController.showOAuthSelector("logout")).resolves.toBeUndefined();
+		expect(errors).toEqual([CREDENTIAL_STORE_UNREADABLE_MESSAGE]);
 	});
 
 	test("provider /login contains SQLITE_CORRUPT without closing or rewriting the credential store", async () => {

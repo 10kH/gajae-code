@@ -56,6 +56,7 @@ export class OAuthSelectorComponent extends Container {
 	#onCancelCallback: () => void;
 	#statusMessage: string | undefined;
 	#validateAuthCallback?: (providerId: string) => Promise<boolean>;
+	#onValidationError?: (error: unknown) => boolean;
 	#requestRenderCallback?: () => void;
 	#authState: Map<string, "checking" | "valid" | "invalid"> = new Map();
 	#externalCredentialCandidates: ImportableCredential[] = [];
@@ -76,6 +77,7 @@ export class OAuthSelectorComponent extends Container {
 		onCancel: () => void,
 		options?: {
 			validateAuth?: (providerId: string) => Promise<boolean>;
+			onValidationError?: (error: unknown) => boolean;
 			requestRender?: () => void;
 			externalCredentialCandidates?: ImportableCredential[];
 		} & Partial<OAuthSelectorAccountOptions>,
@@ -86,6 +88,7 @@ export class OAuthSelectorComponent extends Container {
 		this.#onSelectCallback = onSelect;
 		this.#onCancelCallback = onCancel;
 		this.#validateAuthCallback = options?.validateAuth;
+		this.#onValidationError = options?.onValidationError;
 		this.#requestRenderCallback = options?.requestRender;
 		this.#externalCredentialCandidates = options?.externalCredentialCandidates ?? [];
 		this.#accountProviderId = options?.accountProviderId;
@@ -194,7 +197,8 @@ export class OAuthSelectorComponent extends Container {
 		let isValid = false;
 		try {
 			isValid = await this.#validateAuthCallback(providerId);
-		} catch {
+		} catch (error) {
+			if (this.#onValidationError?.(error)) return;
 			isValid = false;
 		}
 		if (generation !== this.#validationGeneration) return;

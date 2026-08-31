@@ -1368,9 +1368,16 @@ export class SelectorController {
 	async #refreshOAuthProviderAuthState(): Promise<void> {
 		const oauthProviders = getOAuthProviders();
 		await Promise.all(
-			oauthProviders.map(provider =>
-				this.ctx.session.modelRegistry.getApiKeyForProvider(provider.id, this.ctx.session.credentialSessionId),
-			),
+			oauthProviders.map(async provider => {
+				try {
+					await this.ctx.session.modelRegistry.getApiKeyForProvider(
+						provider.id,
+						this.ctx.session.credentialSessionId,
+					);
+				} catch (error) {
+					if (isSqliteCorruptionError(error)) throw error;
+				}
+			}),
 		);
 	}
 	/**
@@ -3844,6 +3851,13 @@ export class SelectorController {
 								this.ctx.session.credentialSessionId,
 							);
 							return !!apiKey;
+						},
+						onValidationError: error => {
+							if (!isSqliteCorruptionError(error)) return false;
+							selector.stopValidation();
+							done();
+							this.ctx.showError(CREDENTIAL_STORE_UNREADABLE_MESSAGE);
+							return true;
 						},
 						requestRender: () => {
 							this.ctx.ui.requestLayoutRender("oauth-selector-spinner");
