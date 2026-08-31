@@ -3201,6 +3201,50 @@ test("broker fences ambiguous state roots from checkpoint, endpoint, and resume 
 				endpoint: { token: "current-token" },
 			},
 		});
+
+		const originalHandleRequest = broker.handleRequest.bind(broker);
+		let racingOwner: Awaited<ReturnType<typeof broker.index.append>> | undefined;
+		broker.handleRequest = async (operation, input, idempotencyKey) => {
+			const response = await originalHandleRequest(operation, input, idempotencyKey);
+			if (operation === "session.get_endpoint" && input.sessionId === sessionId && racingOwner === undefined) {
+				racingOwner = await broker.index.append({
+					type: "host_registered",
+					sessionId,
+					locator: { cwd: root, worktreeRoot: null, stateRoot: alternateStateRoot },
+					endpointGeneration: alternate.endpointGeneration,
+					pid: process.pid,
+					endpointMtimeMs: 1,
+				});
+			}
+			return response;
+		};
+		expect(
+			await broker.handleRequest(
+				"session.resume",
+				{ cwd: root, stateRoot, sessionId, sessionPath },
+				"racing-owner-resume",
+			),
+		).toEqual({
+			ok: false,
+			error: {
+				code: "endpoint_stale",
+				message: "Session authority became ambiguous while it was being verified.",
+			},
+		});
+		broker.handleRequest = originalHandleRequest;
+		if (!racingOwner) throw new Error("Expected the competing live owner to be registered.");
+		await broker.index.append({
+			type: "host_unregistered",
+			sessionId,
+			locator: racingOwner.locator,
+			endpointGeneration: racingOwner.endpointGeneration,
+			pid: racingOwner.pid,
+			...(racingOwner.processIncarnation === undefined
+				? {}
+				: { processIncarnation: racingOwner.processIncarnation }),
+			...(racingOwner.hostIncarnation === undefined ? {} : { hostIncarnation: racingOwner.hostIncarnation }),
+		});
+
 		const replayAlternate = await broker.index.append({
 			type: "host_registered",
 			sessionId,

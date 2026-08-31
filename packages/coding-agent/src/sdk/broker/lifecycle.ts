@@ -740,6 +740,7 @@ function lifecycleWorktreeTarget(input: Input): SessionLifecycleWorktreeTarget |
 }
 
 type LiveResumeRecord = {
+	sessionId: string;
 	locator: SessionLocatorV2;
 	endpointGeneration: number;
 	pid: number;
@@ -786,6 +787,18 @@ function sameLiveResumeRecord(expected: LiveResumeRecord, current: LiveResumeRec
 		current.endpointMtimeMs === expected.endpointMtimeMs &&
 		sameResumeLocator(current, expected.locator.cwd, expected.locator.stateRoot)
 	);
+}
+
+function liveResumeAuthority(
+	sessions: readonly LiveResumeRecord[],
+	sessionId: string,
+): { kind: "none" } | { kind: "ambiguous" } | { kind: "live"; record: LiveResumeRecord } {
+	const indexedCandidates = sessions.filter(session => session.sessionId === sessionId);
+	if (indexedCandidates.some(session => !isSessionAuthorityEligible(session))) return { kind: "ambiguous" };
+	const liveCandidates = indexedCandidates.filter(session => session.live);
+	if (liveCandidates.length > 1) return { kind: "ambiguous" };
+	const record = liveCandidates[0];
+	return record ? { kind: "live", record } : { kind: "none" };
 }
 
 type ValidatedTranscript = {
@@ -4834,15 +4847,12 @@ async function executeLifecycleResponse(
 		await broker.index.refresh();
 		if (operation === "session.resume") {
 			const requestedSessionId = sessionId(input);
-			const indexedCandidates = requestedSessionId
-				? broker.index.listSessions().sessions.filter(session => session.sessionId === requestedSessionId)
-				: [];
-			if (indexedCandidates.some(session => !isSessionAuthorityEligible(session)))
+			const authority = requestedSessionId
+				? liveResumeAuthority(broker.index.listSessions().sessions, requestedSessionId)
+				: { kind: "none" as const };
+			if (authority.kind === "ambiguous")
 				return fail("endpoint_stale", "Session authority is ambiguous and cannot be resumed safely.");
-			const existingCandidates = indexedCandidates.filter(session => session.live);
-			if (existingCandidates.length > 1)
-				return fail("endpoint_stale", "Multiple live session owners claim this session id.");
-			const existing = existingCandidates[0];
+			const existing = authority.kind === "live" ? authority.record : undefined;
 			if (existing?.live) {
 				const initialScope = await validateLiveResumeScope(broker, input, requestedSessionId!, existing);
 				if ("ok" in initialScope) return initialScope;
@@ -4860,9 +4870,10 @@ async function executeLifecycleResponse(
 						"Session is already live but its incarnation-bound endpoint is unavailable.",
 					);
 				await broker.index.refresh();
-				const current = broker.index
-					.listSessions()
-					.sessions.find(session => session.sessionId === requestedSessionId);
+				const finalAuthority = liveResumeAuthority(broker.index.listSessions().sessions, requestedSessionId!);
+				if (finalAuthority.kind === "ambiguous")
+					return fail("endpoint_stale", "Session authority became ambiguous while it was being verified.");
+				const current = finalAuthority.kind === "live" ? finalAuthority.record : undefined;
 				if (!current || !sameLiveResumeRecord(existing, current))
 					return fail("endpoint_stale", "Live session changed while its resume authority was being verified.");
 				const finalScope = await validateLiveResumeScope(broker, input, requestedSessionId!, current);
