@@ -474,6 +474,25 @@ function logDroppedPromptTerminal(
 	});
 }
 
+const ACP_FAILURE_DIAGNOSTIC_CODES = new Set([
+	"agent_failed",
+	"local_snapshot_failure",
+	"provider_down",
+	"provider_unavailable",
+	"provider_rejected",
+	"provider_http_402",
+	"provider_http_429",
+	"upstream_stream_interrupted",
+	"argument_validation",
+	"execution",
+	"local_buffer_overflow",
+	"escaped_arguments_discarded",
+	"prompt_failed",
+	"terminal_uncertain",
+	"skill_runtime",
+	"io_error",
+]);
+
 function terminalOutcome(event: JsonObject): SdkPromptTerminalOutcome | undefined {
 	const outcome = object(event.outcome);
 	if (!outcome) {
@@ -484,12 +503,19 @@ function terminalOutcome(event: JsonObject): SdkPromptTerminalOutcome | undefine
 			// failure, and must also settle when that trailing boundary is lost.
 			if (event.type === "agent_failed" && error.code === "aborted")
 				return { kind: "stopped", reason: "cancelled", provenance: "client_cancel" };
-			const deadline = error.code === "prompt_deadline_exceeded";
+			if (event.type === "agent_failed" && error.code === "prompt_deadline_exceeded")
+				return {
+					kind: "failed",
+					code: "prompt_deadline_exceeded",
+					message: "prompt_deadline_exceeded: Agent run failed.",
+					provenance: "deadline",
+				};
+			const diagnosticCode = ACP_FAILURE_DIAGNOSTIC_CODES.has(error.code) ? error.code : "agent_failed";
 			return {
 				kind: "failed",
-				code: deadline ? "prompt_deadline_exceeded" : "prompt_failed",
-				message: `${error.code}: ${error.message}`,
-				provenance: deadline ? "deadline" : "agent_failed",
+				code: "prompt_failed",
+				message: `${diagnosticCode}: Agent run failed.`,
+				provenance: "agent_failed",
 			};
 		}
 		return undefined;
@@ -510,7 +536,12 @@ function terminalOutcome(event: JsonObject): SdkPromptTerminalOutcome | undefine
 		typeof outcome.message === "string" &&
 		(outcome.provenance === "agent_failed" || outcome.provenance === "deadline")
 	)
-		return outcome as SdkPromptTerminalOutcome;
+		return {
+			kind: "failed",
+			code: outcome.code,
+			message: `${outcome.code}: Agent run failed.`,
+			provenance: outcome.provenance,
+		};
 	return undefined;
 }
 
@@ -1203,6 +1234,8 @@ export class AcpAgent implements Agent {
 	readonly #sessions = new Map<string, SessionRecord>();
 	/** Retain settled prompt identities across automatic transport reattachment. */
 	readonly #retiredPromptCorrelations = new Map<string, PromptCorrelation[]>();
+	/** Prevent a successor admission while a retired prompt can still reveal its identity. */
+	readonly #retiredPromptAcknowledgements = new Set<string>();
 	readonly #attaching = new Map<string, PendingAttachment>();
 	readonly #resolvingExisting = new Map<string, PendingAttachment>();
 	readonly #knownSessionCwds = new Map<string, string>();
@@ -1519,6 +1552,7 @@ export class AcpAgent implements Agent {
 							this.#knownSessionMcpServers.delete(params.sessionId);
 							this.#knownSessionMetadata.delete(params.sessionId);
 							this.#retiredPromptCorrelations.delete(params.sessionId);
+							this.#retiredPromptAcknowledgements.delete(params.sessionId);
 							return {};
 						}
 						throw error;
@@ -1536,6 +1570,7 @@ export class AcpAgent implements Agent {
 				this.#knownSessionMetadata.delete(params.sessionId);
 				this.#pendingDeleteLocators.delete(params.sessionId);
 				this.#retiredPromptCorrelations.delete(params.sessionId);
+				this.#retiredPromptAcknowledgements.delete(params.sessionId);
 				return {};
 			} finally {
 				this.#finishTeardown(params.sessionId);
@@ -1594,6 +1629,11 @@ export class AcpAgent implements Agent {
 		if (!record) throw new AcpSdkAdapterError("not_found", `Unknown session, not found: ${params.sessionId}`);
 		if (record.activePrompt) throw new AcpSdkAdapterError("conflict", "ACP session already has an active prompt.");
 		if (record.authFailure) throw new AcpSdkAdapterError("authentication_failed", record.authFailure);
+		if (this.#retiredPromptAcknowledgements.has(params.sessionId))
+			throw new AcpSdkAdapterError(
+				"conflict",
+				"ACP session is still reconciling a previous prompt acknowledgement.",
+			);
 		const payload = acpPromptPayload(params.prompt);
 		const skillInvocation = acpSkillInvocation(params.prompt);
 		if (!skillInvocation) {
@@ -1669,16 +1709,19 @@ export class AcpAgent implements Agent {
 			await record.adapter.ensureProviders();
 		} catch (error) {
 			if (waiter.settled || record.cancelRequested || record.activePrompt !== waiter) {
+				this.#retiredPromptAcknowledgements.delete(params.sessionId);
 				if (!waiter.settled) await this.#settleCancelledPrompt(params.sessionId, record, waiter);
 				return await response;
 			}
 			if (record.activePrompt === waiter) {
 				record.activePrompt = undefined;
+				this.#retiredPromptAcknowledgements.delete(params.sessionId);
 				void this.#publishPromptPhaseIdle(params.sessionId, record.adapter);
 			}
 			throw error;
 		}
 		if (waiter.settled || record.cancelRequested || record.activePrompt !== waiter) {
+			this.#retiredPromptAcknowledgements.delete(params.sessionId);
 			if (!waiter.settled) await this.#settleCancelledPrompt(params.sessionId, record, waiter);
 			return await response;
 		}
@@ -1783,9 +1826,11 @@ export class AcpAgent implements Agent {
 						);
 					continue;
 				}
-				const task = record.frameTail.then(
-					async () => await this.#handleSdkFrame(params.sessionId, record.adapter, deferredFrame),
-				);
+				const task = deferredIsTerminal
+					? this.#handleSdkFrame(params.sessionId, record.adapter, deferredFrame)
+					: record.frameTail.then(
+							async () => await this.#handleSdkFrame(params.sessionId, record.adapter, deferredFrame),
+						);
 				record.frameTail = task.catch(
 					async error =>
 						await this.#failSession(params.sessionId, record.adapter, this.#frameProcessingFailure(error)),
@@ -1793,7 +1838,9 @@ export class AcpAgent implements Agent {
 			}
 			this.#settlePrompt(params.sessionId, record, waiter);
 			return await response;
-		})();
+		})().finally(() => {
+			this.#retiredPromptAcknowledgements.delete(params.sessionId);
+		});
 		// Settlement can win before the SDK answers `turn.prompt`; acknowledgement processing
 		// must remain alive to tombstone its eventual correlation without holding the ACP caller.
 		void acknowledgementTask.catch(() => undefined);
@@ -2314,9 +2361,20 @@ export class AcpAgent implements Agent {
 
 	#rememberSettledPromptCorrelation(id: string, record: SessionRecord, correlation: PromptCorrelation): void {
 		if (!hasCompleteCorrelation(correlation)) return;
-		const retained = record.settledPromptCorrelations;
+		const shared = this.#retiredPromptCorrelations.get(id);
+		const retained = shared ?? record.settledPromptCorrelations;
+		if (shared && shared !== record.settledPromptCorrelations) {
+			for (const candidate of record.settledPromptCorrelations) {
+				if (
+					hasCompleteCorrelation(candidate) &&
+					!retained.some(settled => correlationsExactlyMatch(settled, candidate))
+				)
+					retained.push(candidate);
+			}
+		}
 		if (!retained.some(settled => correlationsExactlyMatch(settled, correlation))) retained.push(correlation);
 		while (retained.length > SETTLED_PROMPT_CORRELATION_RETENTION) retained.shift();
+		record.settledPromptCorrelations = retained;
 		this.#retiredPromptCorrelations.set(id, retained);
 	}
 
@@ -2383,6 +2441,7 @@ export class AcpAgent implements Agent {
 		this.#knownSessionMcpServers.delete(id);
 		this.#knownSessionMetadata.delete(id);
 		this.#retiredPromptCorrelations.delete(id);
+		this.#retiredPromptAcknowledgements.delete(id);
 	}
 
 	async #closeOwnedSession(id: string): Promise<CloseSessionResponse> {
@@ -2398,6 +2457,7 @@ export class AcpAgent implements Agent {
 			this.#knownSessionMcpServers.delete(id);
 			this.#knownSessionMetadata.delete(id);
 			this.#retiredPromptCorrelations.delete(id);
+			this.#retiredPromptAcknowledgements.delete(id);
 			return {};
 		} finally {
 			this.#finishTeardown(id);
@@ -2482,6 +2542,7 @@ export class AcpAgent implements Agent {
 		if (waiter) {
 			clearPromptWatchdog(waiter);
 			this.#rememberSettledPromptCorrelation(id, record, waiter.correlation);
+			if (!waiter.acknowledged) this.#retiredPromptAcknowledgements.add(id);
 		}
 		waiter?.reject(error);
 		try {
@@ -2667,6 +2728,13 @@ export class AcpAgent implements Agent {
 		// watchdog, so queued processing cannot turn unrelated host traffic into turn liveness.
 		this.#refreshPromptWatchdog(id, record, frame);
 		++record.inboundSequence;
+		const received = receivedSdkEvent(frame);
+		if (received?.event.type === "agent_end" || received?.event.type === "agent_failed") {
+			void this.#handleSdkFrame(id, adapter, frame).catch(async error => {
+				await this.#failSession(id, adapter, this.#frameProcessingFailure(error));
+			});
+			return;
+		}
 		const task = record.frameTail.then(async () => await this.#handleSdkFrame(id, adapter, frame));
 		record.frameTail = task.catch(
 			async error => await this.#failSession(id, adapter, this.#frameProcessingFailure(error)),
@@ -2686,6 +2754,7 @@ export class AcpAgent implements Agent {
 					clearPromptWatchdog(waiter);
 					waiter.settled = true;
 					this.#rememberSettledPromptCorrelation(id, record, waiter.correlation);
+					if (!waiter.acknowledged) this.#retiredPromptAcknowledgements.add(id);
 					waiter.reject(
 						new AcpSdkAdapterError(
 							"connection_closed",
@@ -2735,15 +2804,11 @@ export class AcpAgent implements Agent {
 			}
 			if (activePrompt.terminal) return;
 			if (!outcome) {
-				const detail =
-					typeof (event as { error?: { message?: unknown } }).error?.message === "string"
-						? (event as { error: { message: string } }).error.message
-						: "the prompt terminal omitted a valid normalized outcome";
 				await this.#rejectPrompt(
 					record,
 					id,
 					activePrompt,
-					new AcpSdkAdapterError("connection_closed", `ACP prompt terminal was invalid: ${detail}`),
+					new AcpSdkAdapterError("connection_closed", "ACP prompt terminal was invalid or incomplete."),
 				);
 				return;
 			}
@@ -3743,6 +3808,7 @@ export class AcpAgent implements Agent {
 		this.#knownSessionMcpServers.clear();
 		this.#knownSessionMetadata.clear();
 		this.#retiredPromptCorrelations.clear();
+		this.#retiredPromptAcknowledgements.clear();
 		this.#pendingDeleteLocators.clear();
 		this.#pendingCloseIdempotencyKeys.clear();
 		if (this.#lifecycleOperations.size === 0) this.#lifecycleOperations.clear();

@@ -394,7 +394,7 @@ test("a pre-acknowledgement terminal uses correlation carried by its event paylo
 	}
 });
 
-test("a deferred terminal processing failure is contained by the frame queue", async () => {
+test("a terminal settlement is not reversed by a final-text publication failure", async () => {
 	const fixture = await createFixture({ terminalBeforeAcknowledgement: true, rejectFinalTextUpdate: true });
 	try {
 		const pending = fixture.agent.prompt({
@@ -409,7 +409,7 @@ test("a deferred terminal processing failure is contained by the frame queue", a
 			),
 			"deferred terminal processing failure",
 		);
-		expect(outcome).toMatchObject({ code: "frame_processing_failed" });
+		expect(outcome).toBeUndefined();
 		expect(fixture.clock.pending).toBe(0);
 	} finally {
 		fixture.dispose();

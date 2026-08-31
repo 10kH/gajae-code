@@ -602,7 +602,7 @@ test("ACP rejects immediately when correlated agent_failed is the only terminal"
 		fixture.sendDiagnostic();
 		await expect(bounded(pending, "agent_failed settlement")).rejects.toMatchObject({
 			code: "prompt_failed",
-			message: "provider_unavailable: diagnostic from fixture",
+			message: "provider_unavailable: Agent run failed.",
 		});
 		await waitFor(() => fixture.updates.length === updatesBefore + 1, "failure idle update");
 		expect(
@@ -1010,7 +1010,7 @@ test("ACP preserves the settlement-grace failure diagnostic", async () => {
 		});
 		await expect(bounded(pending, "unsettled prompt rejection")).rejects.toMatchObject({
 			code: "prompt_failed",
-			message: "terminal_uncertain: Prompt resources did not settle before the terminalization grace expired.",
+			message: "terminal_uncertain: Agent run failed.",
 		});
 	} finally {
 		fixture.dispose();

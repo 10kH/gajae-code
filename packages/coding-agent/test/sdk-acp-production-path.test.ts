@@ -276,6 +276,10 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	const lifecycleInputs: Record<string, unknown>[] = [];
 	const brokerRequests: Record<string, unknown>[] = [];
 	const promptInputs: Record<string, unknown>[] = [];
+	const currentPromptCorrelation = (): { commandId: string; turnId: string } => ({
+		commandId: `prompt-command-${promptInputs.length}`,
+		turnId: `prompt-turn-${promptInputs.length}`,
+	});
 	const skillInputs: Record<string, unknown>[] = [];
 	const controlOperations: string[] = [];
 	const abortFrames: Record<string, unknown>[] = [];
@@ -559,8 +563,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 								JSON.stringify({
 									type: "agent_end",
 									sessionId: "owned-session",
-									commandId: "prompt-command",
-									turnId: "prompt-turn",
+									...currentPromptCorrelation(),
 									finalText: "fast",
 									outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
 								}),
@@ -602,7 +605,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 							ok: true,
 							result:
 								frame.operation === "turn.prompt"
-									? { commandId: "prompt-command", turnId: "prompt-turn", accepted: true }
+										? { ...currentPromptCorrelation(), accepted: true }
 									: frame.operation === "skill.invoke"
 										? { commandId: "skill-command", turnId: "skill-turn", accepted: true }
 										: frame.operation === "turn.abort"
@@ -947,8 +950,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 				type: "event",
 				kind: event.type,
 				sessionId: created.sessionId,
-				commandId: "prompt-command",
-				turnId: "prompt-turn",
+				...currentPromptCorrelation(),
 				payload: { event_type: event.type, event },
 			}),
 		);
@@ -1014,8 +1016,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		JSON.stringify({
 			type: "agent_end",
 			sessionId: created.sessionId,
-			commandId: "prompt-command",
-			turnId: "prompt-turn",
+			...currentPromptCorrelation(),
 			outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
 		}),
 	);
@@ -1069,8 +1070,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		JSON.stringify({
 			type: "agent_end",
 			sessionId: created.sessionId,
-			commandId: "prompt-command",
-			turnId: "prompt-turn",
+			...currentPromptCorrelation(),
 			outcome: { kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
 		}),
 	);
@@ -1111,8 +1111,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		JSON.stringify({
 			type: "agent_end",
 			sessionId: created.sessionId,
-			commandId: "prompt-command",
-			turnId: "prompt-turn",
+			...currentPromptCorrelation(),
 			outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
 		}),
 	);
@@ -1129,8 +1128,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		JSON.stringify({
 			type: "agent_end",
 			sessionId: created.sessionId,
-			commandId: "prompt-command",
-			turnId: "prompt-turn",
+			...currentPromptCorrelation(),
 			outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
 		}),
 	);
