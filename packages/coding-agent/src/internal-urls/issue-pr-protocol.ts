@@ -375,8 +375,10 @@ function buildSingleResource({
 
 function formatFileLine(idx: number, file: PrDiffFile, repo: string, prNumber: number): string {
 	const stats = file.changeType === "binary" ? "(binary)" : `+${file.additions} -${file.deletions}`;
-	const rename = file.oldPath ? `  (renamed from ${file.oldPath})` : "";
-	return `${idx}. ${file.path}  ${stats}  [${file.changeType}]${rename}\n   pr://${repo}/${prNumber}/diff/${idx}`;
+	const escapedNote = file.pathEscaped ? " (escaped non-UTF-8 name)" : "";
+	const renameNote = file.oldPathEscaped ? " (escaped non-UTF-8 name)" : "";
+	const rename = file.oldPath ? `  (renamed from ${file.oldPath}${renameNote})` : "";
+	return `${idx}. ${file.path}${escapedNote}  ${stats}  [${file.changeType}]${rename}\n   pr://${repo}/${prNumber}/diff/${idx}`;
 }
 
 async function fetchAndRenderPrDiff(

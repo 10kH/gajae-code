@@ -2806,6 +2806,14 @@ export interface PrDiffFile {
 	changeType: "modified" | "added" | "deleted" | "renamed" | "binary";
 	/** Pre-image path for renames/deletes; same as `path` otherwise. */
 	oldPath?: string;
+	/**
+	 * Set when `path` kept its C-style escaped source form because the quoted
+	 * token held invalid UTF-8 or a malformed escape; distinguishes it from a
+	 * valid path whose decoded text looks identical.
+	 */
+	pathEscaped?: boolean;
+	/** Same as {@link PrDiffFile.pathEscaped}, for `oldPath`. */
+	oldPathEscaped?: boolean;
 	/** Byte offset of the section's `diff --git` line in the unified diff. */
 	startOffset: number;
 	/** Byte offset of the next section (or end-of-text). */
@@ -2861,6 +2869,8 @@ export function parsePrUnifiedDiff(text: string): PrDiffPayload {
 interface ParsedDiffHeaderToken {
 	value: string;
 	nextIndex: number;
+	/** Set when the token kept its C-style escaped source form. */
+	escaped?: boolean;
 }
 
 function skipDiffHeaderSpaces(text: string, index: number): number {
@@ -2925,7 +2935,7 @@ function parseDiffQuotedToken(text: string, startIndex: number): ParsedDiffHeade
 					return { value: DIFF_PATH_DECODER.decode(Uint8Array.from(bytes)), nextIndex: i + 1 };
 				} catch {}
 			}
-			return { value: text.slice(startIndex + 1, i), nextIndex: i + 1 };
+			return { value: text.slice(startIndex + 1, i), nextIndex: i + 1, escaped: true };
 		}
 		if (ch !== "\\") {
 			bytes.push(...DIFF_PATH_ENCODER.encode(ch));
@@ -2944,9 +2954,10 @@ function parseDiffQuotedToken(text: string, startIndex: number): ParsedDiffHeade
 	return undefined;
 }
 
-function parseDiffPathLine(line: string, prefix: string): string {
+function parseDiffPathLine(line: string, prefix: string): { value: string; escaped?: boolean } {
 	const rest = line.slice(prefix.length);
-	return parseDiffQuotedToken(rest, 0)?.value ?? rest;
+	const token = parseDiffQuotedToken(rest, 0);
+	return token ? { value: token.value, escaped: token.escaped } : { value: rest };
 }
 
 function parseDiffHeaderToken(text: string, startIndex: number): ParsedDiffHeaderToken | undefined {
@@ -2963,7 +2974,14 @@ function stripPrDiffPathPrefix(value: string, prefix: "a/" | "b/"): string | und
 	return value.startsWith(prefix) ? value.slice(prefix.length) : undefined;
 }
 
-function parsePrDiffHeaderPaths(header: string): { oldPath?: string; newPath?: string } {
+interface PrDiffHeaderPaths {
+	oldPath?: string;
+	newPath?: string;
+	oldPathEscaped?: boolean;
+	newPathEscaped?: boolean;
+}
+
+function parsePrDiffHeaderPaths(header: string): PrDiffHeaderPaths {
 	const trail = header.slice("diff --git ".length);
 	if (trail.startsWith('"')) {
 		const oldToken = parseDiffQuotedToken(trail, 0);
@@ -2973,6 +2991,8 @@ function parsePrDiffHeaderPaths(header: string): { oldPath?: string; newPath?: s
 		return {
 			oldPath: stripPrDiffPathPrefix(oldToken.value, "a/"),
 			newPath: stripPrDiffPathPrefix(newToken.value, "b/"),
+			oldPathEscaped: oldToken.escaped,
+			newPathEscaped: newToken.escaped,
 		};
 	}
 
@@ -3003,6 +3023,8 @@ function parsePrDiffSection(section: string, startOffset: number, endOffset: num
 	const headerPaths = parsePrDiffHeaderPaths(header);
 	let oldPath = headerPaths.oldPath;
 	let newPath = headerPaths.newPath;
+	let oldPathEscaped = headerPaths.oldPathEscaped;
+	let newPathEscaped = headerPaths.newPathEscaped;
 
 	let changeType: PrDiffFile["changeType"] = "modified";
 	let isBinary = false;
@@ -3022,11 +3044,11 @@ function parsePrDiffSection(section: string, startOffset: number, endOffset: num
 		}
 		if (line.startsWith("rename from ")) {
 			changeType = "renamed";
-			oldPath = parseDiffPathLine(line, "rename from ");
+			({ value: oldPath, escaped: oldPathEscaped } = parseDiffPathLine(line, "rename from "));
 			continue;
 		}
 		if (line.startsWith("rename to ")) {
-			newPath = parseDiffPathLine(line, "rename to ");
+			({ value: newPath, escaped: newPathEscaped } = parseDiffPathLine(line, "rename to "));
 			continue;
 		}
 		if (line.startsWith("Binary files ") && line.endsWith(" differ")) {
@@ -3051,8 +3073,9 @@ function parsePrDiffSection(section: string, startOffset: number, endOffset: num
 		deletions = 0;
 	}
 
-	const displayPath =
-		changeType === "deleted" ? (oldPath ?? newPath ?? "(unknown)") : (newPath ?? oldPath ?? "(unknown)");
+	const preferOld = changeType === "deleted";
+	const displayPath = preferOld ? (oldPath ?? newPath ?? "(unknown)") : (newPath ?? oldPath ?? "(unknown)");
+	const displayEscaped = (preferOld ? oldPath !== undefined : newPath === undefined) ? oldPathEscaped : newPathEscaped;
 	const file: PrDiffFile = {
 		path: displayPath,
 		additions,
@@ -3061,8 +3084,12 @@ function parsePrDiffSection(section: string, startOffset: number, endOffset: num
 		startOffset,
 		endOffset,
 	};
+	if (displayEscaped) {
+		file.pathEscaped = true;
+	}
 	if (oldPath && oldPath !== displayPath) {
 		file.oldPath = oldPath;
+		if (oldPathEscaped) file.oldPathEscaped = true;
 	}
 	return file;
 }

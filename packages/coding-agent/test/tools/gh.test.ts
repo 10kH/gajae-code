@@ -283,13 +283,52 @@ describe("parsePrUnifiedDiff", () => {
 		const diffFor = (quoted: string) =>
 			[`diff --git "a/${quoted}" "b/${quoted}"`, "index 0000000..1111111 100644", "@@ -1 +1 @@", "+new"].join("\n");
 
-		const first = parsePrUnifiedDiff(diffFor("x\\303y.md")).files[0]?.path;
-		const second = parsePrUnifiedDiff(diffFor("x\\304y.md")).files[0]?.path;
+		const first = parsePrUnifiedDiff(diffFor("x\\303y.md")).files[0];
+		const second = parsePrUnifiedDiff(diffFor("x\\304y.md")).files[0];
 
-		expect(first).toBe("x\\303y.md");
-		expect(second).toBe("x\\304y.md");
-		expect(first).not.toBe(second);
-		expect(first).not.toContain("\uFFFD");
+		expect(first).toMatchObject({ path: "x\\303y.md", pathEscaped: true });
+		expect(second).toMatchObject({ path: "x\\304y.md", pathEscaped: true });
+		expect(first?.path).not.toBe(second?.path);
+		expect(first?.path).not.toContain("\uFFFD");
+	});
+
+	it.each([
+		["an invalid byte", "x\\303y.md", "x\\\\303y.md"],
+		["a malformed escape", "x\\qy.md", "x\\\\qy.md"],
+	])("separates %s fallback from a valid literal-backslash path", (_label, invalidQuoted, validQuoted) => {
+		const diffFor = (quoted: string) =>
+			[`diff --git "a/${quoted}" "b/${quoted}"`, "index 0000000..1111111 100644", "@@ -1 +1 @@", "+new"].join("\n");
+
+		const invalid = parsePrUnifiedDiff(diffFor(invalidQuoted)).files[0];
+		const valid = parsePrUnifiedDiff(diffFor(validQuoted)).files[0];
+
+		expect(invalid?.path).toBe(valid?.path);
+		expect(invalid?.pathEscaped).toBe(true);
+		expect(valid?.pathEscaped).toBeUndefined();
+	});
+
+	it("separates invalid and valid literal-backslash rename metadata", () => {
+		const diffFor = (oldQuoted: string, newQuoted: string) =>
+			[
+				`diff --git "a/${oldQuoted}" "b/${newQuoted}"`,
+				"similarity index 100%",
+				`rename from "${oldQuoted}"`,
+				`rename to "${newQuoted}"`,
+			].join("\n");
+
+		const invalid = parsePrUnifiedDiff(diffFor("old \\303.md", "new \\304.md")).files[0];
+		const valid = parsePrUnifiedDiff(diffFor("old \\\\303.md", "new \\\\304.md")).files[0];
+
+		expect(invalid).toMatchObject({
+			changeType: "renamed",
+			oldPath: "old \\303.md",
+			oldPathEscaped: true,
+			path: "new \\304.md",
+			pathEscaped: true,
+		});
+		expect(valid).toMatchObject({ changeType: "renamed", oldPath: "old \\303.md", path: "new \\304.md" });
+		expect(valid?.pathEscaped).toBeUndefined();
+		expect(valid?.oldPathEscaped).toBeUndefined();
 	});
 
 	it.each([
