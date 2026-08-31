@@ -65,6 +65,7 @@ async function waitFor(predicate: () => boolean, label: string, timeoutMs = 10_0
 
 describe("terminal abort registers a turn scope so left-running owned work classifies by source", () => {
 	let session: AgentSession;
+	let manualTeardown = false;
 	let chainSessionManager: SessionManager;
 	let tempDir: string;
 	let authStorage: AuthStorage | undefined;
@@ -76,6 +77,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 	let modelRegistryRef: ModelRegistry;
 
 	beforeEach(async () => {
+		manualTeardown = false;
 		tempDir = path.join(os.tmpdir(), `pi-terminal-abort-chain-${Snowflake.next()}`);
 		fs.mkdirSync(tempDir, { recursive: true });
 
@@ -158,7 +160,13 @@ describe("terminal abort registers a turn scope so left-running owned work class
 	});
 
 	afterEach(async () => {
-		await session?.dispose();
+		if (manualTeardown) {
+			session.agent.abort();
+			await manager.dispose({ timeoutMs: 1_000 });
+			await chainSessionManager.close();
+		} else {
+			await session.dispose();
+		}
 		AsyncJobManager.setInstance(undefined);
 		AsyncJobManager.unregisterManager(manager);
 		authStorage?.close();
@@ -166,7 +174,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		if (fs.existsSync(tempDir)) {
 			fs.rmSync(tempDir, { recursive: true, force: true });
 		}
-	});
+	}, 30_000);
 
 	it("terminal abort registers the scope so the left-running owned job classifies as owned-completion", async () => {
 		const callId = "call_terminal_owned";
@@ -1467,7 +1475,8 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// boundary before afterEach tears down the owned manager, otherwise the
 		// teardown races the delivery's final rearm/cleanup microtasks.
 		await session.waitForIdle();
-		await session.dispose();
+		await session.awaitSessionSettlement();
+		manualTeardown = true;
 	}, 20_000);
 
 	it("newSession takes the transition shutdown lease on the session-owned manager, not a foreign global", async () => {
