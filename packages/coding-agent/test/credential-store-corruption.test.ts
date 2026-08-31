@@ -231,6 +231,26 @@ describe("credential SQLite corruption classification", () => {
 		await expect(authStorage.getApiKey("anthropic")).rejects.toMatchObject({ code: "SQLITE_CORRUPT" });
 		store.close();
 	});
+
+	test("the real SQLite update path propagates index corruption", async () => {
+		const root = await tempRoot("gjc-credential-real-update-");
+		const dbPath = path.join(root, "agent.db");
+		await seedCredentialDb(dbPath);
+		await corruptIndexRootPage(dbPath, "idx_auth_provider_identity");
+		const store = await SqliteAuthCredentialStore.open(dbPath);
+		const row = store.listCredentialInventory("anthropic")[0];
+		expect(row).toBeDefined();
+		expect(() =>
+			store.updateAuthCredential(row!.id, {
+				type: "oauth",
+				access: "replacement-access",
+				refresh: "replacement-refresh",
+				expires: Date.now() + 60_000,
+				email: row!.email,
+			}),
+		).toThrow(expect.objectContaining({ code: "SQLITE_CORRUPT" }));
+		store.close();
+	});
 });
 
 describe("credential corruption presentation", () => {

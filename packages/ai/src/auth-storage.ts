@@ -7118,19 +7118,15 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 	}
 
 	updateAuthCredential(id: number, credential: AuthCredential): void {
-		try {
-			const providerRow = this.#db.prepare("SELECT provider FROM auth_credentials WHERE id = ?").get(id) as
-				| { provider?: string }
-				| undefined;
-			const provider = providerRow?.provider ?? "";
-			const serialized = serializeCredential(provider, credential);
-			if (!serialized) return;
-			this.#updateStmt.run(serialized.credentialType, serialized.data, serialized.identityKey, id);
-			if (provider) {
-				this.#purgeSupersededDisabledRows(provider, this.listAuthCredentials(provider));
-			}
-		} catch {
-			// Ignore update failures
+		const providerRow = this.#db.prepare("SELECT provider FROM auth_credentials WHERE id = ?").get(id) as
+			| { provider?: string }
+			| undefined;
+		const provider = providerRow?.provider ?? "";
+		const serialized = serializeCredential(provider, credential);
+		if (!serialized) return;
+		this.#updateStmt.run(serialized.credentialType, serialized.data, serialized.identityKey, id);
+		if (provider) {
+			this.#purgeSupersededDisabledRows(provider, this.listAuthCredentials(provider));
 		}
 	}
 
