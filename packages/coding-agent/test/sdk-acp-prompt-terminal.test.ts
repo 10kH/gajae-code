@@ -25,6 +25,7 @@ type Fixture = {
 	updates: SessionNotification[];
 	promptDelivered: Promise<void>;
 	workingUpdateEntered: Promise<void>;
+	idleUpdateEntered: Promise<void>;
 	promptDeliveryCount(): number;
 	sendStopped(reason: StoppedReason): void;
 	sendFailed(code: FailedCode): void;
@@ -99,6 +100,7 @@ async function createFixture(
 	const queryCalls: string[] = [];
 	const blockedAdvisoryQueries: Array<{ socket: TestSocket; id: string; result: unknown }> = [];
 	const idleUpdateRelease = Promise.withResolvers<void>();
+	const idleUpdateEntered = Promise.withResolvers<void>();
 	const workingUpdateRelease = Promise.withResolvers<void>();
 	const workingUpdateEntered = Promise.withResolvers<void>();
 	const agentMessageUpdateRelease = Promise.withResolvers<void>();
@@ -370,6 +372,7 @@ async function createFixture(
 					(update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase === "idle"
 				) {
 					blockNextIdleUpdate = false;
+					idleUpdateEntered.resolve();
 					await idleUpdateRelease.promise;
 				}
 				if (
@@ -413,6 +416,7 @@ async function createFixture(
 		updates,
 		promptDelivered: delivered.promise,
 		workingUpdateEntered: workingUpdateEntered.promise,
+		idleUpdateEntered: idleUpdateEntered.promise,
 		promptDeliveryCount: () => promptDeliveries,
 		sendStopped,
 		sendFailed,
@@ -816,6 +820,27 @@ test("ACP successor terminal decoration does not wait for a predecessor advisory
 		expect(fixture.updates).toHaveLength(updatesAfterSuccessor);
 	} finally {
 		fixture.releaseBlockedAdvisoryQueries();
+		fixture.dispose();
+	}
+});
+
+test("ACP successor waits only while ready predecessor metadata is being delivered", async () => {
+	const fixture = await createFixture({ blockIdleUpdate: true });
+	try {
+		const first = prompt(fixture, "blocked predecessor metadata delivery");
+		await bounded(fixture.promptDelivered, "first prompt delivery");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(first, "first terminal settlement")).toEqual({ stopReason: "end_turn" });
+		await bounded(fixture.idleUpdateEntered, "entered predecessor metadata delivery");
+		await expect(prompt(fixture, "successor blocked by metadata delivery")).rejects.toMatchObject({
+			code: "conflict",
+		});
+		fixture.releaseIdleUpdate();
+		const { pending: successor } = await promptWhenDelivered(fixture, "successor after metadata delivery", 2);
+		fixture.sendStopped("end_turn");
+		expect(await bounded(successor, "successor after metadata delivery")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		fixture.releaseIdleUpdate();
 		fixture.dispose();
 	}
 });

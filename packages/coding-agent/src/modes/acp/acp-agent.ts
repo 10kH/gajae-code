@@ -162,6 +162,8 @@ type SessionRecord = {
 	frameTail: Promise<void>;
 	/** Unstreamed terminal text must publish before a successor can own the transcript. */
 	finalTextTail?: Promise<void>;
+	/** Ready terminal metadata writes must finish before a successor owns those fields. */
+	terminalMetadataTail?: Promise<void>;
 	/** Advances when an owned terminal retires all earlier frame publications. */
 	publicationGeneration: number;
 	/** Monotonic at WebSocket ingress, before queued work begins. */
@@ -1599,6 +1601,8 @@ export class AcpAgent implements Agent {
 			);
 		if (record.finalTextTail)
 			throw new AcpSdkAdapterError("conflict", "ACP session is still publishing the previous prompt's final text.");
+		if (record.terminalMetadataTail)
+			throw new AcpSdkAdapterError("conflict", "ACP session is still publishing the previous prompt's metadata.");
 
 		const payload = acpPromptPayload(params.prompt);
 		const skillInvocation = acpSkillInvocation(params.prompt);
@@ -3101,38 +3105,48 @@ export class AcpAgent implements Agent {
 			);
 		};
 		if (!ownsCurrentGeneration()) return;
-		if (typeof usage?.tokens === "number" && typeof usage.contextWindow === "number") {
+		const record = this.#sessions.get(id);
+		if (!record || record.adapter !== adapter) return;
+		const publishTask = (async () => {
+			if (typeof usage?.tokens === "number" && typeof usage.contextWindow === "number") {
+				await this.#publishSessionUpdate(
+					id,
+					{
+						sessionId: id,
+						update: {
+							sessionUpdate: "usage_update",
+							size: usage.contextWindow,
+							used: usage.tokens,
+						},
+					},
+					adapter,
+					publicationGeneration,
+				);
+			}
+			if (!ownsCurrentGeneration()) return;
+			const updatedAt = new Date().toISOString();
+			this.#knownSessionMetadata.set(id, { ...(title ? { title } : {}), updatedAt });
 			await this.#publishSessionUpdate(
 				id,
 				{
 					sessionId: id,
 					update: {
-						sessionUpdate: "usage_update",
-						size: usage.contextWindow,
-						used: usage.tokens,
+						sessionUpdate: "session_info_update",
+						...(title ? { title } : {}),
+						updatedAt,
+						_meta: { gjcPhase: "idle", running: false, gjcRunning: false },
 					},
 				},
 				adapter,
 				publicationGeneration,
 			);
-		}
-		if (!ownsCurrentGeneration()) return;
-		const updatedAt = new Date().toISOString();
-		this.#knownSessionMetadata.set(id, { ...(title ? { title } : {}), updatedAt });
-		await this.#publishSessionUpdate(
-			id,
-			{
-				sessionId: id,
-				update: {
-					sessionUpdate: "session_info_update",
-					...(title ? { title } : {}),
-					updatedAt,
-					_meta: { gjcPhase: "idle", running: false, gjcRunning: false },
-				},
-			},
-			adapter,
-			publicationGeneration,
-		);
+		})();
+		let metadataTail: Promise<void>;
+		metadataTail = publishTask.finally(() => {
+			if (record.terminalMetadataTail === metadataTail) record.terminalMetadataTail = undefined;
+		});
+		record.terminalMetadataTail = metadataTail;
+		await metadataTail;
 	}
 
 	async #publishSessionUpdate(
