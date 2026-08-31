@@ -1809,12 +1809,10 @@ export class AcpAgent implements Agent {
 						);
 					continue;
 				}
-				const task = deferredIsTerminal
-					? this.#handleSdkFrame(params.sessionId, record.adapter, deferredFrame)
-					: record.frameTail.then(
-							async () =>
-								await this.#handleSdkFrame(params.sessionId, record.adapter, deferredFrame, deferredGeneration),
-						);
+				const task = record.frameTail.then(
+					async () =>
+						await this.#handleSdkFrame(params.sessionId, record.adapter, deferredFrame, deferredGeneration),
+				);
 				record.frameTail = task.catch(async error => {
 					if (deferredGeneration !== record.publicationGeneration) return;
 					await this.#failSession(params.sessionId, record.adapter, this.#frameProcessingFailure(error));

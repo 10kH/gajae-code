@@ -71,6 +71,7 @@ async function createFixture(
 	options: {
 		terminalBeforeAcknowledgement?: boolean;
 		preAcknowledgementTerminal?: Record<string, unknown>;
+		preAcknowledgementFrames?: Record<string, unknown>[];
 		promptAcknowledgement?: Record<string, unknown>;
 		cancelSettlementGraceMs?: number;
 		abortAcknowledgement?: Record<string, unknown>;
@@ -229,7 +230,9 @@ async function createFixture(
 					promptSocket = socket;
 					promptDeliveries++;
 					delivered.resolve();
-					if (options.terminalBeforeAcknowledgement)
+					if (options.preAcknowledgementFrames)
+						for (const deferredFrame of options.preAcknowledgementFrames) sendTerminal(deferredFrame);
+					else if (options.terminalBeforeAcknowledgement)
 						sendTerminal(
 							options.preAcknowledgementTerminal ?? {
 								type: "agent_end",
@@ -942,6 +945,42 @@ test("ACP prompt settles exactly once when terminal arrives before acknowledgeme
 			),
 		).toHaveLength(idleUpdatesBefore + 1);
 	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP deferred terminal remains FIFO behind an earlier deferred publication", async () => {
+	const fixture = await createFixture({
+		blockInitialWorkingUpdate: true,
+		preAcknowledgementFrames: [
+			{
+				type: "agent_start",
+				sessionId: "prompt-terminal-session",
+				commandId: "prompt-terminal-command",
+				turnId: "prompt-terminal-turn",
+			},
+			{
+				type: "agent_end",
+				sessionId: "prompt-terminal-session",
+				commandId: "prompt-terminal-command",
+				turnId: "prompt-terminal-turn",
+				outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+			},
+		],
+	});
+	try {
+		const pending = prompt(fixture, "deferred FIFO terminal");
+		await bounded(fixture.promptDelivered, "prompt delivery");
+		let settled = false;
+		void pending.then(() => {
+			settled = true;
+		});
+		await Promise.resolve();
+		expect(settled).toBe(false);
+		fixture.releaseWorkingUpdate();
+		expect(await bounded(pending, "deferred FIFO terminal settlement")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		fixture.releaseWorkingUpdate();
 		fixture.dispose();
 	}
 });
