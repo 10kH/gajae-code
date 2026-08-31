@@ -5047,6 +5047,58 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		const keyDigest = createHash("sha256").update(idempotencyKey).digest("hex");
 		return path.join(namespaceDir, "idempotency", `${keyDigest}.json`);
 	}
+	const idempotencyFlights = new Map<string, { requestDigest: string; promise: Promise<Record<string, unknown>> }>();
+	type IdempotencyFlightAdmission =
+		| { kind: "conflict"; response: Record<string, unknown> }
+		| { kind: "joined"; promise: Promise<Record<string, unknown>> }
+		| { kind: "owner"; run: (operation: Promise<Record<string, unknown>>) => Promise<Record<string, unknown>> };
+	function admitIdempotencyFlight(
+		tool: string,
+		idempotencyKey: string,
+		canonicalArgs: Record<string, unknown>,
+	): IdempotencyFlightAdmission {
+		const keyDigest = createHash("sha256").update(idempotencyKey).digest("hex");
+		const requestDigest = createHash("sha256")
+			.update(canonicalJson({ tool, args: canonicalArgs }))
+			.digest("hex");
+		const existingFlight = idempotencyFlights.get(keyDigest);
+		if (existingFlight) {
+			if (existingFlight.requestDigest !== requestDigest)
+				return {
+					kind: "conflict",
+					response: {
+						ok: false,
+						error: { code: "idempotency_conflict", message: "idempotency key was used with a different request" },
+					},
+				};
+			return { kind: "joined", promise: existingFlight.promise };
+		}
+		const result = Promise.withResolvers<Record<string, unknown>>();
+		const flight = { requestDigest, promise: result.promise };
+		idempotencyFlights.set(keyDigest, flight);
+		return {
+			kind: "owner",
+			run: async operation => {
+				void operation.then(result.resolve, result.reject);
+				try {
+					return await result.promise;
+				} finally {
+					if (idempotencyFlights.get(keyDigest) === flight) idempotencyFlights.delete(keyDigest);
+				}
+			},
+		};
+	}
+	async function withIdempotencyFlight(
+		tool: string,
+		idempotencyKey: string,
+		canonicalArgs: Record<string, unknown>,
+		operation: () => Promise<Record<string, unknown>>,
+	): Promise<Record<string, unknown>> {
+		const admission = admitIdempotencyFlight(tool, idempotencyKey, canonicalArgs);
+		if (admission.kind === "conflict") return admission.response;
+		if (admission.kind === "joined") return await admission.promise;
+		return await admission.run(operation());
+	}
 	async function withOrderedSessionStateLocks<T>(
 		lockFiles: readonly string[],
 		operation: () => Promise<T>,
@@ -5078,6 +5130,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		recoverInProgress = false,
 		isNonterminal: (response: Record<string, unknown>) => boolean = isRouterRequestAmbiguous,
 		lockAlreadyHeld = false,
+		flightAlreadyOwned = false,
 	): Promise<Record<string, unknown>> {
 		const keyDigest = createHash("sha256").update(idempotencyKey).digest("hex");
 		const requestDigest = createHash("sha256")
@@ -5182,7 +5235,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			});
 			return response;
 		};
-		return lockAlreadyHeld ? execute() : withSessionStateLock(lockFile, execute);
+		const executeWithLock = async (): Promise<Record<string, unknown>> =>
+			lockAlreadyHeld ? await execute() : await withSessionStateLock(lockFile, execute);
+		return flightAlreadyOwned
+			? await executeWithLock()
+			: await withIdempotencyFlight(tool, idempotencyKey, canonicalArgs, executeWithLock);
 	}
 
 	async function brokerSession(
@@ -8783,7 +8840,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						code === "live_session"
 					);
 				};
-				return await withOrderedSessionStateLocks(
+				const flight = admitIdempotencyFlight(name, retirementKey, canonicalArgs);
+				if (flight.kind === "conflict") return flight.response;
+				if (flight.kind === "joined") return await flight.promise;
+				const retirementOperation = withOrderedSessionStateLocks(
 					[idempotencyLockFile(creationKey), idempotencyLockFile(retirementKey)],
 					async () =>
 						await withToolIdempotency(
@@ -8967,8 +9027,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							true,
 							isRetirementRetryable,
 							true,
+							true,
 						),
 				);
+				return await flight.run(retirementOperation);
 			}
 			if (name === "gjc_coordinator_activate_session") {
 				requireCoordinatorMutation(config, "sessions", args);
