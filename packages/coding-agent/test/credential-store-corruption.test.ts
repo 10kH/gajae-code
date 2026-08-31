@@ -205,7 +205,7 @@ describe("credential SQLite corruption classification", () => {
 		}
 	});
 
-	test("OAuth refresh persistence propagates credential SQLite corruption", async () => {
+	test.each(["SQLITE_CORRUPT", "SQLITE_BUSY"])("OAuth refresh persistence propagates %s", async code => {
 		const root = await tempRoot("gjc-credential-refresh-write-");
 		const dbPath = path.join(root, "agent.db");
 		const store = await SqliteAuthCredentialStore.open(dbPath);
@@ -225,10 +225,10 @@ describe("credential SQLite corruption classification", () => {
 		});
 		await authStorage.reload();
 		store.updateAuthCredential = () => {
-			throw Object.assign(new Error("database disk image is malformed"), { code: "SQLITE_CORRUPT" });
+			throw Object.assign(new Error("credential database persistence failed"), { code });
 		};
 
-		await expect(authStorage.getApiKey("anthropic")).rejects.toMatchObject({ code: "SQLITE_CORRUPT" });
+		await expect(authStorage.getApiKey("anthropic")).rejects.toMatchObject({ code });
 		store.close();
 	});
 
