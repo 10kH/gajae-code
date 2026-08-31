@@ -712,9 +712,12 @@ test("a blocked Telegram ownership race preserves the canonical endpoint and wit
 	);
 	const previousLifecycleRequestId = process.env.GJC_LIFECYCLE_REQUEST_ID;
 	process.env.GJC_LIFECYCLE_REQUEST_ID = "ambient-marker-must-not-win";
-	await handlers.get("session_start")!({ type: "session_start" }, sessionContext);
-	if (previousLifecycleRequestId === undefined) delete process.env.GJC_LIFECYCLE_REQUEST_ID;
-	else process.env.GJC_LIFECYCLE_REQUEST_ID = previousLifecycleRequestId;
+	try {
+		await handlers.get("session_start")!({ type: "session_start" }, sessionContext);
+	} finally {
+		if (previousLifecycleRequestId === undefined) delete process.env.GJC_LIFECYCLE_REQUEST_ID;
+		else process.env.GJC_LIFECYCLE_REQUEST_ID = previousLifecycleRequestId;
+	}
 	await expect(capability.promise).resolves.toEqual({ status: "started" });
 	const defaultEndpoint = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 	const chatStateRoot = path.join(cwd, ".gjc", "state", "chat");
