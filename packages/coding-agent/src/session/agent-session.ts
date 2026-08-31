@@ -316,6 +316,7 @@ import {
 import {
 	type CoordinatorToolObservation,
 	clearCoordinatorRuntimeStateRescope,
+	hasCoordinatorRuntimeStateRescopeJournal,
 	markCoordinatorRuntimeStateRescopePublishing,
 	ownerTerminalContextFromEnvironment,
 	persistCoordinatorRuntimeStateFromEvent,
@@ -4231,13 +4232,18 @@ export class AgentSession {
 		this.#retainedMemorySampler = config.retainedMemorySampler;
 		this.#ownedMcpManager = config.ownedMcpManager;
 		this.#startupTurnBarrier = config.startupTurnBarrier;
-		this.extendStartupTurnBarrier(
-			recoverCoordinatorRuntimeStateRescope({
-				sessionId: this.sessionId,
-				cwd: this.sessionManager.getCwd(),
-				sessionFile: this.sessionManager.getSessionFile() ?? null,
-			}),
-		);
+		// Only arm the recovery barrier when a rescope journal is actually pending. Arming it
+		// unconditionally flips #startupTurnBarrier from absent to a (resolved) promise for
+		// every session, which makes barrier-gated post-turn work (e.g. the hidden-next-turn
+		// drain) take an extra scheduler hop and reorder against terminal-abort requeue.
+		const rescopeRecoveryContext = {
+			sessionId: this.sessionId,
+			cwd: this.sessionManager.getCwd(),
+			sessionFile: this.sessionManager.getSessionFile() ?? null,
+		};
+		if (hasCoordinatorRuntimeStateRescopeJournal(rescopeRecoveryContext)) {
+			this.extendStartupTurnBarrier(recoverCoordinatorRuntimeStateRescope(rescopeRecoveryContext));
+		}
 		this.#scopedModels = config.scopedModels ?? [];
 		this.#thinkingLevel = config.thinkingLevel;
 		this.#promptTemplates = config.promptTemplates ?? [];

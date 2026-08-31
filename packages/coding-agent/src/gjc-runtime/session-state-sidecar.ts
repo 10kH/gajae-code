@@ -2277,6 +2277,21 @@ export async function clearCoordinatorRuntimeStateRescope(
 	}
 }
 
+/**
+ * Cheap synchronous probe for a pending rescope-recovery journal at this cwd. Sessions
+ * that never moved (the overwhelming majority) have none, so callers use this to avoid
+ * arming a startup-turn barrier for a no-op recovery \u2014 an armed barrier is not free even
+ * when it resolves immediately: it flips the session's startup gate from absent to present
+ * and reorders barrier-gated post-turn work.
+ */
+export function hasCoordinatorRuntimeStateRescopeJournal(context: RuntimeStateContext): boolean {
+	try {
+		return readRegularFileForRelocation(runtimeStateRescopeJournalPath(context.cwd, context.sessionId)) !== null;
+	} catch {
+		return false;
+	}
+}
+
 export async function recoverCoordinatorRuntimeStateRescope(context: RuntimeStateContext): Promise<void> {
 	const journalFile = runtimeStateRescopeJournalPath(context.cwd, context.sessionId);
 	const observed = readRegularFileForRelocation(journalFile);
