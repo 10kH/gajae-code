@@ -388,9 +388,16 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 	it("admits an explicit prompt before an idle wake released by startup", async () => {
 		authStorage.setRuntimeApiKey("openai", "test-key");
 		const barrier = Promise.withResolvers<void>();
+		const explicitRun = Promise.withResolvers<void>();
+		const promptAccepted = Promise.withResolvers<void>();
 		const { session } = await createAgentSession(createIsolatedSessionOptions());
 		try {
-			const agentPrompt = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+			const agentPrompt = vi.spyOn(session.agent, "prompt").mockImplementation(async (_message, promptOptions) => {
+				if (!Array.isArray(promptOptions)) promptOptions?.onRunAccepted?.(undefined as never, undefined as never);
+				promptAccepted.resolve();
+				await explicitRun.promise;
+			});
+			const followUp = vi.spyOn(session.agent, "followUp");
 			session.extendStartupTurnBarrier(barrier.promise);
 			session.yieldQueue.register<string>("startup-prompt-priority-test", {
 				build: entries => ({ role: "user", content: entries.join("\n"), timestamp: Date.now() }),
@@ -401,13 +408,17 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			expect(agentPrompt).not.toHaveBeenCalled();
 
 			barrier.resolve();
-			await explicit;
-			await session.waitForIdle();
-			expect(agentPrompt).toHaveBeenCalledTimes(2);
+			await promptAccepted.promise;
+			for (let i = 0; i < 10; i++) await Promise.resolve();
+			expect(agentPrompt).toHaveBeenCalledTimes(1);
 			expect(JSON.stringify(agentPrompt.mock.calls[0]?.[0])).toContain("explicit-before-idle");
-			expect(JSON.stringify(agentPrompt.mock.calls[1]?.[0])).toContain("idle-after-explicit");
+			expect(followUp).toHaveBeenCalledTimes(1);
+			expect(JSON.stringify(followUp.mock.calls[0]?.[0])).toContain("idle-after-explicit");
+			explicitRun.resolve();
+			await explicit;
 		} finally {
 			barrier.resolve();
+			explicitRun.resolve();
 			await session.dispose();
 		}
 	});
@@ -1559,60 +1570,64 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		RESUME_SDK_TEST_TIMEOUT_MS,
 	);
 
-	it("restores fallback MCP, thinking, and service-tier state in memory without rewriting the session file", async () => {
-		const sessionManager = SessionManager.create(tempDir, tempDir);
-		sessionManager.appendMessage({
-			role: "user",
-			content: "resume me",
-			timestamp: Date.now(),
-		});
-		const sessionFile = sessionManager.getSessionFile();
-		expect(sessionFile).toBeDefined();
-		await sessionManager.rewriteEntries();
-		fs.utimesSync(sessionFile!, oldSessionMtime, oldSessionMtime);
-		const persistedBeforeResume = fs.readFileSync(sessionFile!, "utf8");
-		const persistedMtimeBeforeResume = fs.statSync(sessionFile!).mtimeMs;
-		const resumedManager = await SessionManager.open(sessionFile!, tempDir);
-		const { session } = await createAgentSession({
-			cwd: tempDir,
-			agentDir: tempDir,
-			modelRegistry,
-			sessionManager: resumedManager,
-			settings: Settings.isolated({
-				"mcp.discoveryMode": true,
-				"mcp.discoveryDefaultServers": ["github"],
-				defaultThinkingLevel: "high",
-				serviceTier: "priority",
-			}),
-			model: createReasoningModel(),
-			disableExtensionDiscovery: true,
-			skills: [],
-			contextFiles: [],
-			promptTemplates: [],
-			slashCommands: [],
-			enableMCP: false,
-			enableLsp: false,
-			toolNames: ["read", "search_tool_bm25"],
-			customTools: [
-				createMcpCustomTool("mcp__github_create_issue", "github", "create_issue"),
-				createMcpCustomTool("mcp__slack_post_message", "slack", "post_message"),
-			],
-		});
-		try {
-			expect(session.thinkingLevel).toBe(ThinkingLevel.High);
-			expect(session.serviceTier).toBe("priority");
-			expect(session.getSelectedMCPToolNames()).toEqual(["mcp__github_create_issue"]);
-			expect(session.getActiveToolNames()).toEqual(
-				expect.arrayContaining(["read", "search_tool_bm25", "mcp__github_create_issue"]),
-			);
-			expect(session.getActiveToolNames()).not.toContain("mcp__slack_post_message");
-			expect(session.sessionManager.buildSessionContext().hasPersistedMCPToolSelection).toBe(false);
-			expect(fs.readFileSync(sessionFile!, "utf8")).toBe(persistedBeforeResume);
-			expect(fs.statSync(sessionFile!).mtimeMs).toBe(persistedMtimeBeforeResume);
-		} finally {
-			await session.dispose();
-		}
-	}, RESUME_SDK_TEST_TIMEOUT_MS);
+	it(
+		"restores fallback MCP, thinking, and service-tier state in memory without rewriting the session file",
+		async () => {
+			const sessionManager = SessionManager.create(tempDir, tempDir);
+			sessionManager.appendMessage({
+				role: "user",
+				content: "resume me",
+				timestamp: Date.now(),
+			});
+			const sessionFile = sessionManager.getSessionFile();
+			expect(sessionFile).toBeDefined();
+			await sessionManager.rewriteEntries();
+			fs.utimesSync(sessionFile!, oldSessionMtime, oldSessionMtime);
+			const persistedBeforeResume = fs.readFileSync(sessionFile!, "utf8");
+			const persistedMtimeBeforeResume = fs.statSync(sessionFile!).mtimeMs;
+			const resumedManager = await SessionManager.open(sessionFile!, tempDir);
+			const { session } = await createAgentSession({
+				cwd: tempDir,
+				agentDir: tempDir,
+				modelRegistry,
+				sessionManager: resumedManager,
+				settings: Settings.isolated({
+					"mcp.discoveryMode": true,
+					"mcp.discoveryDefaultServers": ["github"],
+					defaultThinkingLevel: "high",
+					serviceTier: "priority",
+				}),
+				model: createReasoningModel(),
+				disableExtensionDiscovery: true,
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+				toolNames: ["read", "search_tool_bm25"],
+				customTools: [
+					createMcpCustomTool("mcp__github_create_issue", "github", "create_issue"),
+					createMcpCustomTool("mcp__slack_post_message", "slack", "post_message"),
+				],
+			});
+			try {
+				expect(session.thinkingLevel).toBe(ThinkingLevel.High);
+				expect(session.serviceTier).toBe("priority");
+				expect(session.getSelectedMCPToolNames()).toEqual(["mcp__github_create_issue"]);
+				expect(session.getActiveToolNames()).toEqual(
+					expect.arrayContaining(["read", "search_tool_bm25", "mcp__github_create_issue"]),
+				);
+				expect(session.getActiveToolNames()).not.toContain("mcp__slack_post_message");
+				expect(session.sessionManager.buildSessionContext().hasPersistedMCPToolSelection).toBe(false);
+				expect(fs.readFileSync(sessionFile!, "utf8")).toBe(persistedBeforeResume);
+				expect(fs.statSync(sessionFile!).mtimeMs).toBe(persistedMtimeBeforeResume);
+			} finally {
+				await session.dispose();
+			}
+		},
+		RESUME_SDK_TEST_TIMEOUT_MS,
+	);
 
 	it(
 		"rebuilds explicit MCP custom-tool selections when resuming with requested MCP tools",

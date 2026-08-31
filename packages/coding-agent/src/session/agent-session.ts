@@ -4396,6 +4396,7 @@ export class AgentSession {
 				if (dropped.length > 0) this.#settleDeliveredOwnedRegistrations(dropped);
 				const first = survivors[0];
 				if (!first) return;
+				const handedOffToFollowUp = new Set<AgentMessage>();
 				const settleIfDisposing = (): boolean => {
 					if (!this.#isDisposed && !this.#sessionAdmissionClosing && !this.#disposeAbortController.signal.aborted)
 						return false;
@@ -4407,6 +4408,13 @@ export class AgentSession {
 						"prompt",
 						async () => {
 							if (settleIfDisposing()) return;
+							if (this.isStreaming) {
+								for (const message of survivors) {
+									this.agent.followUp(message);
+									handedOffToFollowUp.add(message);
+								}
+								return;
+							}
 							if (survivors.some(message => ownedCompletionResumeAction(message) === "fresh"))
 								this.#resumeFromOwnedCompletion();
 							if (survivors.length === 1) {
@@ -4437,7 +4445,7 @@ export class AgentSession {
 					// failure, otherwise repeated failed idle resumptions leak
 					// terminal tuples into the global registries until capacity
 					// is exhausted (review thread P2).
-					this.#settleDeliveredOwnedRegistrations(survivors);
+					this.#settleDeliveredOwnedRegistrations(survivors.filter(message => !handedOffToFollowUp.has(message)));
 				}
 			},
 			scheduleIdleFlush: run => {
@@ -9016,14 +9024,24 @@ export class AgentSession {
 				await this.#waitForPostPromptTasksBeforeSelectionFence(ignoreSelectionFenceGeneration);
 			}
 			await this.#waitForSessionSettlement(ignoreSelectionFenceGeneration);
+			const hasBlockingPostPromptTasks =
+				ignoreSelectionFenceGeneration === undefined
+					? this.#postPromptTasks.size > 0
+					: [...this.#postPromptTasks].some(
+							task =>
+								!this.#postPromptTaskRecoveryExcluded.has(task) &&
+								(this.#postPromptTaskSelectionFenceGenerations.get(task) ?? 0) < ignoreSelectionFenceGeneration,
+						);
 			if (
 				!this.agent.state.isStreaming &&
 				!this.#retryPromise &&
 				!this.#ttsrResumePromise &&
-				!this.#postPromptTasksPromise &&
+				!hasBlockingPostPromptTasks &&
 				!this.#isSessionSettlementPending(ignoreSelectionFenceGeneration)
 			)
 				return;
+			if (ignoreSelectionFenceGeneration === undefined && hasBlockingPostPromptTasks && this.#postPromptTasksPromise)
+				await this.#postPromptTasksPromise;
 		}
 	}
 
