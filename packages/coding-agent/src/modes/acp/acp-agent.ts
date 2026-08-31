@@ -1767,11 +1767,27 @@ export class AcpAgent implements Agent {
 					"invalid_prompt_acknowledgement",
 					"SDK prompt acknowledgement must accept the prompt and include commandId and turnId.",
 				);
-			if (this.#hasRetiredPromptCorrelation(params.sessionId, record, acknowledgementCorrelation))
+			if (this.#hasRetiredPromptCorrelation(params.sessionId, record, acknowledgementCorrelation)) {
+				try {
+					const abortAcknowledgement = await record.adapter.cancel("turn");
+					if (!isAbortAcknowledged(abortAcknowledgement, "turn"))
+						throw new Error("SDK did not confirm retirement of the reused prompt correlation.");
+				} catch (error) {
+					await this.#failSession(
+						params.sessionId,
+						record.adapter,
+						new AcpSdkAdapterError(
+							"connection_closed",
+							`ACP could not retire a prompt with a reused correlation: ${error instanceof Error ? error.message : String(error)}`,
+						),
+					);
+					throw error;
+				}
 				throw new AcpSdkAdapterError(
 					"invalid_prompt_acknowledgement",
 					"SDK prompt acknowledgement reused a settled commandId/turnId pair.",
 				);
+			}
 			// Retain the acknowledgement ingress boundary with its complete correlation.
 			waiter.boundary = record.inboundSequence;
 			waiter.correlation = acknowledgementCorrelation;
@@ -2759,7 +2775,7 @@ export class AcpAgent implements Agent {
 					clearPromptWatchdog(waiter);
 					waiter.settled = true;
 					this.#rememberSettledPromptCorrelation(id, record, waiter.correlation);
-					if (!waiter.acknowledged) this.#retiredPromptAcknowledgements.add(id);
+					this.#fenceRetiredPromptAcknowledgement(id, waiter);
 					waiter.reject(
 						new AcpSdkAdapterError(
 							"connection_closed",
