@@ -3352,12 +3352,16 @@ export class AgentSession {
 			const barrier = this.#startupTurnBarrier;
 			if (!barrier) return;
 			await awaitPromptInvocationPreflight(barrier, signal);
-			// Drain chained readiness reactions before clearing the captured
-			// barrier. Extensions publish startup dependencies from promise
-			// reactions; re-reading across a bounded microtask drain preserves that
-			// ordering without introducing a timer into startup admission.
-			for (let reaction = 0; reaction < 16 && this.#startupTurnBarrier === barrier; reaction++) {
-				await Promise.resolve();
+			// Cross one task boundary before clearing readiness. Promise reaction
+			// chains fully drain before timers, so every extension published by the
+			// captured barrier's settlement becomes visible without an arbitrary
+			// microtask-depth cap.
+			const publicationTurn = Promise.withResolvers<void>();
+			const timer = setTimeout(publicationTurn.resolve, 0);
+			try {
+				await awaitPromptInvocationPreflight(publicationTurn.promise, signal);
+			} finally {
+				clearTimeout(timer);
 			}
 			if (this.#startupTurnBarrier !== barrier) continue;
 			this.#setStartupTurnBarrier(undefined);
@@ -13906,12 +13910,14 @@ export class AgentSession {
 			this.#promptPreflightCancellationGeneration++;
 			this.#promptPreflightAbortController.abort();
 			this.#promptPreflightAbortController = new AbortController();
+			this.#drainTerminalOwnedYieldEntries();
+			const overlappingPostPromptDrain = this.#cancelPostPromptTasks();
 			// Abort visibility is per-request: a later real abort must not inherit an
 			// earlier silent abort's suppression and swallow the user-visible notice.
 			if (options?.silent !== true) this.#silentAbortPending = false;
 			// Capture the unwind: the field clears once the first abort settles, and
 			// the awaits below must keep watching THIS unwind, not a successor's.
-			const sharedUnwind = this.#abortUnwind;
+			const sharedUnwind = Promise.all([this.#abortUnwind, overlappingPostPromptDrain]).then(() => {});
 			if (options?.timeoutMs !== undefined) {
 				const timeoutMs = Math.max(0, options.timeoutMs);
 				const deadline = Date.now() + timeoutMs;

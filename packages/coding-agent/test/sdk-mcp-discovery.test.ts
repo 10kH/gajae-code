@@ -309,7 +309,6 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			mcpConfigPath: path.join(tempDir, "deferred-idle.json"),
 			deferMcpConfigStartup: true,
 		});
-		vi.useFakeTimers();
 		try {
 			const agentPrompt = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
 			session.yieldQueue.register<string>("deferred-mcp-test", {
@@ -317,20 +316,16 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			});
 			const startup = startDeferredMcpConfig!();
 			session.yieldQueue.enqueue("deferred-mcp-test", "background delivery");
-			vi.advanceTimersByTime(0);
-			await Promise.resolve();
+			const idleFlush = session.yieldQueue.flush("idle");
+			await Bun.sleep(10);
 			expect(agentPrompt).not.toHaveBeenCalled();
 
 			discovery.resolve(createMcpLoadResult([createMcpCustomTool("mcp__exact_lookup", "exact", "lookup")]));
 			await startup;
-			vi.advanceTimersByTime(0);
-			for (let i = 0; i < 30; i++) await Promise.resolve();
-			expect(agentPrompt).toHaveBeenCalledTimes(1);
-			vi.advanceTimersByTime(FOLD_WAKE_MERGE_WINDOW_MS);
-			await Promise.resolve();
+			await idleFlush;
+			await session.waitForIdle();
 			expect(agentPrompt).toHaveBeenCalledTimes(1);
 		} finally {
-			vi.useRealTimers();
 			await session.dispose();
 		}
 	});
@@ -338,7 +333,6 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		const firstBarrier = Promise.withResolvers<void>();
 		const secondBarrier = Promise.withResolvers<void>();
 		const { session } = await createAgentSession(createIsolatedSessionOptions());
-		vi.useFakeTimers();
 		try {
 			const agentPrompt = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
 			session.extendStartupTurnBarrier(firstBarrier.promise);
@@ -346,8 +340,8 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 				build: entries => ({ role: "user", content: entries.join("\n"), timestamp: Date.now() }),
 			});
 			session.yieldQueue.enqueue("startup-barrier-race-test", "barrier-race");
-			vi.advanceTimersByTime(0);
-			await Promise.resolve();
+			const idleFlush = session.yieldQueue.flush("idle");
+			await Bun.sleep(10);
 
 			firstBarrier.resolve();
 			session.extendStartupTurnBarrier(secondBarrier.promise);
@@ -355,13 +349,12 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			expect(agentPrompt).not.toHaveBeenCalled();
 
 			secondBarrier.resolve();
-			vi.advanceTimersByTime(0);
+			await idleFlush;
 			await session.waitForIdle();
 			expect(agentPrompt).toHaveBeenCalledTimes(1);
 		} finally {
 			firstBarrier.resolve();
 			secondBarrier.resolve();
-			vi.useRealTimers();
 			await session.dispose();
 		}
 	});
@@ -448,15 +441,46 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			await session.dispose();
 		}
 	});
-	it("restores the merge window after readiness settles before the first idle wake", async () => {
+	it("keeps only post-overlap idle wakes across concurrent aborts", async () => {
+		const abortIdle = Promise.withResolvers<void>();
 		const { session } = await createAgentSession(createIsolatedSessionOptions());
 		vi.useFakeTimers();
 		try {
 			const agentPrompt = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+			vi.spyOn(session.agent, "waitForIdle").mockImplementation(async () => await abortIdle.promise);
+			session.yieldQueue.register<string>("overlapping-abort-idle-test", {
+				build: entries => ({ role: "user", content: entries.join("\n"), timestamp: Date.now() }),
+			});
+
+			session.yieldQueue.enqueue("overlapping-abort-idle-test", "before-first-abort");
+			const firstAbort = session.abort();
+			session.yieldQueue.enqueue("overlapping-abort-idle-test", "between-aborts");
+			const secondAbort = session.abort();
+			session.yieldQueue.enqueue("overlapping-abort-idle-test", "after-second-abort");
+
+			abortIdle.resolve();
+			await Promise.all([firstAbort, secondAbort]);
+			vi.advanceTimersByTime(FOLD_WAKE_MERGE_WINDOW_MS);
+			await session.waitForIdle();
+			expect(agentPrompt).toHaveBeenCalledTimes(1);
+			expect(JSON.stringify(agentPrompt.mock.calls[0]?.[0])).toContain("after-second-abort");
+			expect(JSON.stringify(agentPrompt.mock.calls[0]?.[0])).not.toContain("between-aborts");
+		} finally {
+			abortIdle.resolve();
+			vi.useRealTimers();
+			await session.dispose();
+		}
+	});
+	it("restores the merge window after readiness settles before the first idle wake", async () => {
+		authStorage.setRuntimeApiKey("openai", "test-key");
+		const { session } = await createAgentSession(createIsolatedSessionOptions());
+		try {
+			const agentPrompt = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
 			session.extendStartupTurnBarrier(Promise.resolve());
-			await Promise.resolve();
-			vi.advanceTimersByTime(0);
-			await Promise.resolve();
+			await session.prompt("settle startup readiness");
+			expect(agentPrompt).toHaveBeenCalledTimes(1);
+			agentPrompt.mockClear();
+			vi.useFakeTimers();
 			session.yieldQueue.register<string>("settled-startup-wake-test", {
 				build: entries => ({ role: "user", content: entries.join("\n"), timestamp: Date.now() }),
 			});
@@ -480,7 +504,6 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		const secondBarrier = Promise.withResolvers<void>();
 		const { session: firstSession } = await createAgentSession(createIsolatedSessionOptions());
 		const { session: secondSession } = await createAgentSession(createIsolatedSessionOptions());
-		vi.useFakeTimers();
 		try {
 			const firstPrompt = vi.spyOn(firstSession.agent, "prompt").mockResolvedValue(undefined);
 			const secondPrompt = vi.spyOn(secondSession.agent, "prompt").mockResolvedValue(undefined);
@@ -495,23 +518,23 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 				});
 				session.yieldQueue.enqueue(kind, kind);
 			}
-			vi.advanceTimersByTime(0);
-			await Promise.resolve();
+			const firstFlush = firstSession.yieldQueue.flush("idle");
+			const secondFlush = secondSession.yieldQueue.flush("idle");
+			await Bun.sleep(10);
 
 			firstBarrier.resolve();
-			vi.advanceTimersByTime(0);
+			await firstFlush;
 			await firstSession.waitForIdle();
 			expect(firstPrompt).toHaveBeenCalledTimes(1);
 			expect(secondPrompt).not.toHaveBeenCalled();
 
 			secondBarrier.resolve();
-			vi.advanceTimersByTime(0);
+			await secondFlush;
 			await secondSession.waitForIdle();
 			expect(secondPrompt).toHaveBeenCalledTimes(1);
 		} finally {
 			firstBarrier.resolve();
 			secondBarrier.resolve();
-			vi.useRealTimers();
 			await Promise.all([firstSession.dispose(), secondSession.dispose()]);
 		}
 	});
