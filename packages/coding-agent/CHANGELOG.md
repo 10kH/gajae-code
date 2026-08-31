@@ -11,6 +11,8 @@
 
 ### Fixed
 
+- Interactive `/login`, `/logout`, and account inventory commands now keep the TUI alive when the credential database reports `SQLITE_CORRUPT` or `SQLITE_NOTADB`. They show a bounded, payload-free recovery message and never auto-repair or delete the database. (#5070)
+
 - SDK lifecycle readiness now uses the same descriptor-bound endpoint identity tolerance as broker endpoint reads and selects owners by scoped state root, process incarnation, and lifecycle marker instead of bare session ID. This restores default source-host startup, shipped SDK lifecycle topology, shared-agent saved-source isolation, cold resume/fork cleanup, local SDK-only broker recovery, and generated operation-matrix closure after the master-mode merge. (#5114)
 
 - Coordinator event watchers now advertise the exact supported event-kind enum, while outbox entity validation and durable WAL/active-turn cleanup reuse their existing authority helpers instead of leaving those checks disconnected. (#5115)

@@ -4,6 +4,7 @@ import {
 	type Api,
 	type AuthCredentialSelector,
 	type CredentialRemovalTarget,
+	isSqliteCorruptionError,
 	type Model,
 	resolveOAuthStorageProvider,
 } from "@gajae-code/ai/core";
@@ -106,6 +107,7 @@ import { TelegramDaemonController } from "../../sdk/bus/telegram-daemon-control"
 import { runTelegramSetup, type TelegramSetupPreflight } from "../../sdk/bus/telegram-setup";
 import { clearPersistentPinForRemovedRows } from "../../session/account-inventory";
 import type { DefaultFallbackRuntimeState } from "../../session/agent-session";
+import { CREDENTIAL_STORE_UNREADABLE_MESSAGE } from "../../session/credential-store-errors";
 import { type SessionInfo, SessionManager } from "../../session/session-manager";
 import { getTreeForInternalRead } from "../../session/session-manager-internal";
 import { FileSessionStorage } from "../../session/session-storage";
@@ -3557,7 +3559,8 @@ export class SelectorController {
 			}
 			this.ctx.ui.requestRender();
 		} catch (error: unknown) {
-			this.ctx.showError(`Login failed: ${error instanceof Error ? error.message : String(error)}`);
+			if (isSqliteCorruptionError(error)) this.ctx.showError(CREDENTIAL_STORE_UNREADABLE_MESSAGE);
+			else this.ctx.showError(`Login failed: ${error instanceof Error ? error.message : String(error)}`);
 		} finally {
 			oauthUrlCopyLease.release();
 			if (useManualInput) {
@@ -3599,7 +3602,8 @@ export class SelectorController {
 				`Successfully removed ${result.ids.length} stored credential${result.ids.length === 1 ? "" : "s"} from ${providerId}.`,
 			);
 		} catch (error: unknown) {
-			this.ctx.showError(`Logout failed: ${error instanceof Error ? error.message : String(error)}`);
+			if (isSqliteCorruptionError(error)) this.ctx.showError(CREDENTIAL_STORE_UNREADABLE_MESSAGE);
+			else this.ctx.showError(`Logout failed: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
 
@@ -3616,75 +3620,87 @@ export class SelectorController {
 				return;
 			}
 			const authStorage = this.ctx.session.modelRegistry.authStorage;
-			const hasOAuthInventory = authStorage
-				.listCredentialInventory(selectedProviderId)
-				.some(row => row.provider === selectedProviderId && row.credentialKind === "oauth");
-			const hasRemovableCredential = authStorage
-				.listCredentialRemovalTargets(selectedProviderId)
-				.some(target => target.provider === selectedProviderId);
-			if (mode === "logout" && hasOAuthInventory && !hasRemovableCredential) {
+			try {
+				const hasOAuthInventory = authStorage
+					.listCredentialInventory(selectedProviderId)
+					.some(row => row.provider === selectedProviderId && row.credentialKind === "oauth");
+				const hasRemovableCredential = authStorage
+					.listCredentialRemovalTargets(selectedProviderId)
+					.some(target => target.provider === selectedProviderId);
+				if (mode === "logout" && hasOAuthInventory && !hasRemovableCredential) {
+					await this.#handleLogout(selectedProviderId);
+					return;
+				}
+				if (hasOAuthInventory && !options?.manualCode) {
+					this.showSelector(done => {
+						let selector: OAuthSelectorComponent;
+						selector = new OAuthSelectorComponent(
+							mode,
+							authStorage,
+							() => undefined,
+							() => {
+								selector.stopValidation();
+								done();
+								this.ctx.ui.requestRender();
+							},
+							{
+								accountProviderId: selectedProviderId,
+								onAccountSelect: async (selectorValue: AuthCredentialSelector) => {
+									await this.ctx.session.setCredentialPin(selectedProviderId, selectorValue);
+									selector.stopValidation();
+									done();
+									this.ctx.showStatus(`Pinned OAuth account for ${selectedProviderId} to this session.`);
+								},
+								onAutoSelect: async () => {
+									await this.ctx.session.setCredentialAuto(selectedProviderId);
+									selector.stopValidation();
+									done();
+									this.ctx.showStatus(`Using AUTO (ranked) OAuth accounts for ${selectedProviderId}.`);
+								},
+								onAddAccount: async () => {
+									selector.stopValidation();
+									done();
+									await this.#handleOAuthLogin(selectedProviderId, options);
+								},
+								onAccountRemove: async targets => {
+									await this.#handleLogout(selectedProviderId, targets);
+									selector.stopValidation();
+									done();
+								},
+							},
+						);
+						return { component: selector, focus: selector };
+					});
+					return;
+				}
+				if (mode === "login") {
+					await this.#handleOAuthLogin(selectedProviderId, options);
+					return;
+				}
+				// mode === "logout" with no OAuth accounts: remove stored api-key credentials directly.
 				await this.#handleLogout(selectedProviderId);
 				return;
-			}
-			if (hasOAuthInventory && !options?.manualCode) {
-				this.showSelector(done => {
-					let selector: OAuthSelectorComponent;
-					selector = new OAuthSelectorComponent(
-						mode,
-						authStorage,
-						() => undefined,
-						() => {
-							selector.stopValidation();
-							done();
-							this.ctx.ui.requestRender();
-						},
-						{
-							accountProviderId: selectedProviderId,
-							onAccountSelect: async (selectorValue: AuthCredentialSelector) => {
-								await this.ctx.session.setCredentialPin(selectedProviderId, selectorValue);
-								selector.stopValidation();
-								done();
-								this.ctx.showStatus(`Pinned OAuth account for ${selectedProviderId} to this session.`);
-							},
-							onAutoSelect: async () => {
-								await this.ctx.session.setCredentialAuto(selectedProviderId);
-								selector.stopValidation();
-								done();
-								this.ctx.showStatus(`Using AUTO (ranked) OAuth accounts for ${selectedProviderId}.`);
-							},
-							onAddAccount: async () => {
-								selector.stopValidation();
-								done();
-								await this.#handleOAuthLogin(selectedProviderId, options);
-							},
-							onAccountRemove: async targets => {
-								await this.#handleLogout(selectedProviderId, targets);
-								selector.stopValidation();
-								done();
-							},
-						},
-					);
-					return { component: selector, focus: selector };
-				});
+			} catch (error: unknown) {
+				if (!isSqliteCorruptionError(error)) throw error;
+				this.ctx.showError(CREDENTIAL_STORE_UNREADABLE_MESSAGE);
 				return;
 			}
-			if (mode === "login") {
-				await this.#handleOAuthLogin(selectedProviderId, options);
-				return;
-			}
-			// mode === "logout" with no OAuth accounts: remove stored api-key credentials directly.
-			await this.#handleLogout(selectedProviderId);
-			return;
 		}
 
 		if (mode === "logout") {
-			await this.#refreshOAuthProviderAuthState();
-			const oauthProviders = getOAuthProviders();
-			const loggedInProviders = oauthProviders.filter(provider =>
-				this.ctx.session.modelRegistry.authStorage.hasAuth(provider.id),
-			);
-			if (loggedInProviders.length === 0) {
-				this.ctx.showStatus("No OAuth providers logged in. Use /login first.");
+			try {
+				await this.#refreshOAuthProviderAuthState();
+				const oauthProviders = getOAuthProviders();
+				const loggedInProviders = oauthProviders.filter(provider =>
+					this.ctx.session.modelRegistry.authStorage.hasAuth(provider.id),
+				);
+				if (loggedInProviders.length === 0) {
+					this.ctx.showStatus("No OAuth providers logged in. Use /login first.");
+					return;
+				}
+			} catch (error: unknown) {
+				if (!isSqliteCorruptionError(error)) throw error;
+				this.ctx.showError(CREDENTIAL_STORE_UNREADABLE_MESSAGE);
 				return;
 			}
 		}
@@ -3807,37 +3823,42 @@ export class SelectorController {
 				}
 			}
 		}
-		this.showSelector(done => {
-			let selector: OAuthSelectorComponent;
-			selector = new OAuthSelectorComponent(
-				mode,
-				this.ctx.session.modelRegistry.authStorage,
-				async (selectedProviderId: string) => {
-					selector.stopValidation();
-					done();
-					await this.showOAuthSelector(mode, selectedProviderId);
-				},
-				() => {
-					selector.stopValidation();
-					done();
-					this.ctx.ui.requestLayoutRender("oauth-selector-close");
-				},
-				{
-					validateAuth: async (selectedProviderId: string) => {
-						const apiKey = await this.ctx.session.modelRegistry.getApiKeyForProvider(
-							selectedProviderId,
-							this.ctx.session.credentialSessionId,
-						);
-						return !!apiKey;
+		try {
+			this.showSelector(done => {
+				let selector: OAuthSelectorComponent;
+				selector = new OAuthSelectorComponent(
+					mode,
+					this.ctx.session.modelRegistry.authStorage,
+					async (selectedProviderId: string) => {
+						selector.stopValidation();
+						done();
+						await this.showOAuthSelector(mode, selectedProviderId);
 					},
-					requestRender: () => {
-						this.ctx.ui.requestLayoutRender("oauth-selector-spinner");
+					() => {
+						selector.stopValidation();
+						done();
+						this.ctx.ui.requestLayoutRender("oauth-selector-close");
 					},
-					externalCredentialCandidates,
-				},
-			);
-			return { component: selector, focus: selector };
-		});
+					{
+						validateAuth: async (selectedProviderId: string) => {
+							const apiKey = await this.ctx.session.modelRegistry.getApiKeyForProvider(
+								selectedProviderId,
+								this.ctx.session.credentialSessionId,
+							);
+							return !!apiKey;
+						},
+						requestRender: () => {
+							this.ctx.ui.requestLayoutRender("oauth-selector-spinner");
+						},
+						externalCredentialCandidates,
+					},
+				);
+				return { component: selector, focus: selector };
+			});
+		} catch (error: unknown) {
+			if (!isSqliteCorruptionError(error)) throw error;
+			this.ctx.showError(CREDENTIAL_STORE_UNREADABLE_MESSAGE);
+		}
 	}
 
 	showDebugSelector(): void {
