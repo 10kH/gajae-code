@@ -35,6 +35,7 @@ type Fixture = {
 	releaseBlockedAdvisoryQueries(): void;
 	releaseIdleUpdate(): void;
 	releaseWorkingUpdate(): void;
+	releasePromptAcknowledgement(): void;
 	sendTerminal(frame: Record<string, unknown>): void;
 };
 
@@ -75,6 +76,7 @@ async function createFixture(
 		blockedAdvisoryQuery?: AdvisoryQuery;
 		blockIdleUpdate?: boolean;
 		blockWorkingReconciliation?: boolean;
+		deferSecondPromptAcknowledgement?: boolean;
 	} = {},
 ): Promise<Fixture> {
 	const tempDir = TempDir.createSync("@sdk-acp-prompt-terminal-");
@@ -95,6 +97,7 @@ async function createFixture(
 	const abort = new AbortController();
 	let promptSocket: TestSocket | undefined;
 	let promptDeliveries = 0;
+	let deferredPromptAcknowledgement: (() => void) | undefined;
 	let blockAdvisoryQuery = false;
 	let server!: ReturnType<typeof Bun.serve>;
 
@@ -228,31 +231,39 @@ async function createFixture(
 							},
 						);
 				}
-				socket.send(
-					JSON.stringify({
-						type: "control_response",
-						id: frame.id,
-						ok: true,
-						result:
-							frame.operation === "turn.prompt"
-								? (options.promptAcknowledgement ?? { commandId, turnId, accepted: true })
-								: frame.operation === "turn.abort"
-									? (options.abortAcknowledgement ??
-										(() => {
-											const scope =
-												(frame.input as { scope?: string })?.scope === "owned" ? "owned" : "turn";
-											return {
-												ok: true,
-												selection: scope,
-												turn: "stopped",
-												ownedWork: scope === "owned" ? "stopped" : "left_running",
-												automaticDelivery: scope === "owned" ? "none" : "enabled",
-												resumeOnOwnedCompletion: scope !== "owned",
-											};
-										})())
-									: {},
-					}),
-				);
+				const response = JSON.stringify({
+					type: "control_response",
+					id: frame.id,
+					ok: true,
+					result:
+						frame.operation === "turn.prompt"
+							? (options.promptAcknowledgement ?? { commandId, turnId, accepted: true })
+							: frame.operation === "turn.abort"
+								? (options.abortAcknowledgement ??
+									(() => {
+										const scope = (frame.input as { scope?: string })?.scope === "owned" ? "owned" : "turn";
+										return {
+											ok: true,
+											selection: scope,
+											turn: "stopped",
+											ownedWork: scope === "owned" ? "stopped" : "left_running",
+											automaticDelivery: scope === "owned" ? "none" : "enabled",
+											resumeOnOwnedCompletion: scope !== "owned",
+										};
+									})())
+								: {},
+				});
+				if (frame.operation === "turn.prompt" && options.deferSecondPromptAcknowledgement && promptDeliveries === 2)
+					deferredPromptAcknowledgement = () =>
+						socket.send(
+							JSON.stringify({
+								type: "control_response",
+								id: frame.id,
+								ok: true,
+								result: { accepted: true, commandId },
+							}),
+						);
+				else socket.send(response);
 			},
 		},
 	});
@@ -347,6 +358,7 @@ async function createFixture(
 			idleUpdateRelease.resolve();
 		},
 		releaseWorkingUpdate: () => workingUpdateRelease.resolve(),
+		releasePromptAcknowledgement: () => deferredPromptAcknowledgement?.(),
 		sendTerminal,
 		dispose: () => {
 			abort.abort();
@@ -491,6 +503,51 @@ test("ACP failure settlement cannot publish stale phase state over a replacement
 	}
 });
 
+test("ACP reconciliation releases a successor whose delayed acknowledgement is invalid", async () => {
+	const fixture = await createFixture({ blockIdleUpdate: true, deferSecondPromptAcknowledgement: true });
+	try {
+		const failed = prompt(fixture, "first prompt fails");
+		await bounded(fixture.promptDelivered, "first prompt delivery");
+		fixture.sendDiagnostic();
+		await expect(bounded(failed, "first failure settlement")).rejects.toMatchObject({ code: "prompt_failed" });
+
+		const updatesAfterFailure = fixture.updates.length;
+		const replacement = prompt(fixture, "replacement with invalid acknowledgement");
+		await Bun.sleep(10);
+		fixture.releaseIdleUpdate();
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "replacement prompt delivery");
+		await waitFor(
+			() =>
+				fixture.updates
+					.slice(updatesAfterFailure)
+					.some(
+						update =>
+							update.update.sessionUpdate === "session_info_update" &&
+							(update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase === "working",
+					),
+			"successor working reconciliation",
+		);
+
+		fixture.releasePromptAcknowledgement();
+		await expect(bounded(replacement, "invalid acknowledgement rejection")).rejects.toMatchObject({
+			code: "invalid_prompt_acknowledgement",
+		});
+		await waitFor(
+			() =>
+				fixture.updates
+					.slice(updatesAfterFailure)
+					.filter(update => update.update.sessionUpdate === "session_info_update")
+					.map(update => (update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase)
+					.at(-1) === "idle",
+			"invalid acknowledgement idle reconciliation",
+		);
+	} finally {
+		fixture.releaseIdleUpdate();
+		fixture.releasePromptAcknowledgement();
+		fixture.dispose();
+	}
+});
+
 test("ACP settles once when agent_end arrives after correlated agent_failed", async () => {
 	const fixture = await createFixture();
 	try {
@@ -601,8 +658,8 @@ test("ACP rejects malformed acknowledgement and drops a stale pre-ack terminal",
 		await expect(bounded(pending, "malformed acknowledgement rejection")).rejects.toMatchObject({
 			code: "invalid_prompt_acknowledgement",
 		});
-		await Bun.sleep(30);
-		expect(fixture.updates).toHaveLength(updatesBefore);
+		await waitFor(() => fixture.updates.length === updatesBefore + 1, "malformed acknowledgement idle update");
+		expect((fixture.updates.at(-1)?.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase).toBe("idle");
 		expect(fixture.queryCalls).toHaveLength(queriesBefore);
 	} finally {
 		fixture.dispose();

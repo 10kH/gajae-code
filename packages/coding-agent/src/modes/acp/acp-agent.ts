@@ -1661,7 +1661,10 @@ export class AcpAgent implements Agent {
 				if (!waiter.settled) await this.#settleCancelledPrompt(params.sessionId, record, waiter);
 				return await response;
 			}
-			if (record.activePrompt === waiter) record.activePrompt = undefined;
+			if (record.activePrompt === waiter) {
+				record.activePrompt = undefined;
+				void this.#publishPromptPhaseIdle(params.sessionId, record.adapter);
+			}
 			throw error;
 		}
 		if (waiter.settled || record.cancelRequested || record.activePrompt !== waiter) {
@@ -1795,7 +1798,10 @@ export class AcpAgent implements Agent {
 			clearPromptWatchdog(waiter);
 			waiter.terminal = undefined;
 			waiter.settled = true;
-			if (record.activePrompt === waiter) record.activePrompt = undefined;
+			if (record.activePrompt === waiter) {
+				record.activePrompt = undefined;
+				void this.#publishPromptPhaseIdle(params.sessionId, record.adapter);
+			}
 			// Keep a late terminal for this (cancelled) turn closed, exactly like the
 			// other settlement paths, so an aborted run's trailing frame can never
 			// publish over a later prompt that reuses the identity.
@@ -1814,7 +1820,6 @@ export class AcpAgent implements Agent {
 				// The client's turn is settled by the return; the advisory idle publication
 				// must not gate it and must still be attempted so the running phase is
 				// released (gjcRunning:false) instead of spinning behind a settled cancel.
-				void this.#publishPromptPhaseIdle(params.sessionId, record.adapter);
 				return { stopReason: "cancelled" };
 			}
 			throw error;
