@@ -13,6 +13,7 @@ import {
 	type SessionNotification,
 } from "@agentclientprotocol/sdk";
 import { startFixtureBrokerWithLeaseForTest } from "../src/sdk/broker/ensure";
+import { resolveSessionLocator, type SessionLocatorV2 } from "../src/sdk/broker/session-index";
 import { lifecycleRequestTimeoutMs } from "../src/sdk/broker/startup-budget";
 import { SdkClient, SdkClientError } from "../src/sdk/client";
 import { sessionListPageFromResponse, traverseSessionList } from "../src/sdk/session-list";
@@ -209,13 +210,17 @@ interface FixtureBrokerListClient {
 	global(operation: string, input: Record<string, unknown>): Promise<unknown>;
 }
 
+function fixtureSessionOwner(cwd = "/fixture/workspace"): SessionLocatorV2 {
+	return { cwd, worktreeRoot: null, stateRoot: path.join(cwd, ".gjc", "state") };
+}
+
 async function listedFixtureSessionIds(
 	brokerClient: FixtureBrokerListClient,
-	cwd: string,
+	owner: SessionLocatorV2,
 	timeoutMs = 15_000,
 ): Promise<Set<string>> {
 	const pages = await traverseSessionList(
-		{ cwd },
+		{ cwd: owner.cwd },
 		input => bounded(brokerClient.global("session.list", input), "broker session list", timeoutMs),
 		sessionListPageFromResponse,
 	);
@@ -230,18 +235,32 @@ async function listedFixtureSessionIds(
 				throw new Error("session.list returned a session row without sessionId.");
 			if (!("locator" in session) || !session.locator || typeof session.locator !== "object")
 				throw new Error(`session.list row ${session.sessionId} omitted its locator.`);
-			if (!("repo" in session.locator) || typeof session.locator.repo !== "string")
-				throw new Error(`session.list row ${session.sessionId} omitted its repository scope.`);
+			if (!("cwd" in session.locator) || typeof session.locator.cwd !== "string")
+				throw new Error(`session.list row ${session.sessionId} omitted its cwd authority.`);
+			if (
+				!("worktreeRoot" in session.locator) ||
+				(session.locator.worktreeRoot !== null && typeof session.locator.worktreeRoot !== "string")
+			)
+				throw new Error(`session.list row ${session.sessionId} omitted its worktree authority.`);
+			if (!("stateRoot" in session.locator) || typeof session.locator.stateRoot !== "string")
+				throw new Error(`session.list row ${session.sessionId} omitted its state-root authority.`);
+			if (session.locator.stateRoot !== owner.stateRoot) continue;
+			const exactOwner = session.locator.cwd === owner.cwd && session.locator.worktreeRoot === owner.worktreeRoot;
+			const uncertainCreateOwner = session.locator.cwd === "unknown" && session.locator.worktreeRoot === null;
+			if (!exactOwner && !uncertainCreateOwner)
+				throw new Error(`session.list row ${session.sessionId} conflicts with the fixture owner locator.`);
 			if (!("terminal" in session) || typeof session.terminal !== "boolean")
 				throw new Error(`session.list row ${session.sessionId} omitted terminal state.`);
 			if (!("terminalUncertain" in session) || typeof session.terminalUncertain !== "boolean")
 				throw new Error(`session.list row ${session.sessionId} omitted terminal uncertainty state.`);
 			if (!("ambiguous" in session) || typeof session.ambiguous !== "boolean")
 				throw new Error(`session.list row ${session.sessionId} omitted ambiguity state.`);
+			if (uncertainCreateOwner && !session.terminalUncertain)
+				throw new Error(`session.list row ${session.sessionId} has an invalid uncertain-create owner sentinel.`);
 			if (session.ambiguous) throw new Error(`session.list row ${session.sessionId} has ambiguous ownership.`);
 			if (session.terminalUncertain)
 				throw new Error(`session.list row ${session.sessionId} has terminal_uncertain ownership.`);
-			if (session.locator.repo !== cwd || session.terminal) continue;
+			if (session.terminal) continue;
 			sessionIds.add(session.sessionId);
 		}
 	}
@@ -356,18 +375,8 @@ async function shutdownFixtureSubprocess(
 	retireSessions: () => Promise<void>,
 	stop: () => Promise<void>,
 ): Promise<void> {
-	const failures: unknown[] = [];
-	try {
-		await retireSessions();
-	} catch (error) {
-		failures.push(error);
-	}
-	try {
-		await stop();
-	} catch (error) {
-		failures.push(error);
-	}
-	if (failures.length > 0) throw aggregateFailures("ACP fixture subprocess cleanup failed", failures);
+	await retireSessions();
+	await stop();
 }
 
 async function disposeBrokerClientAfterShutdown(
@@ -548,6 +557,12 @@ describe("ACP deep-interview wire path", () => {
 		);
 		expect(brokerCloseCalls).toBe(0);
 		expect(sessionIds).toEqual(new Set(["first"]));
+		expect(shutdownAttempts).toBe(0);
+		await expect(cleanupFixtureRoot(cleanup, { absenceObservationMs: 0 })).rejects.toThrow(
+			"Fixture broker runtime cleanup failed.",
+		);
+		expect(brokerCloseCalls).toBe(0);
+		expect(shutdownAttempts).toBe(1);
 		await cleanupFixtureRoot(cleanup, { absenceObservationMs: 0 });
 		expect(brokerCloseCalls).toBe(1);
 		expect(retirementCalls).toEqual(["second", "first", "first"]);
@@ -782,7 +797,7 @@ describe("ACP deep-interview wire path", () => {
 				{
 					global: async () => ({ ok: true, result: { sessions: [], warnings: ["corrupt snapshot"] } }),
 				},
-				"/fixture/workspace",
+				fixtureSessionOwner(),
 			),
 		).rejects.toThrow("session.list inventory is incomplete");
 
@@ -795,7 +810,7 @@ describe("ACP deep-interview wire path", () => {
 							sessions: [
 								{
 									sessionId: "ambiguous",
-									locator: { repo: "/fixture/workspace" },
+									locator: fixtureSessionOwner(),
 									terminal: false,
 									terminalUncertain: false,
 									ambiguous: true,
@@ -805,7 +820,7 @@ describe("ACP deep-interview wire path", () => {
 						},
 					}),
 				},
-				"/fixture/workspace",
+				fixtureSessionOwner(),
 			),
 		).rejects.toThrow("ambiguous ownership");
 
@@ -818,7 +833,7 @@ describe("ACP deep-interview wire path", () => {
 							sessions: [
 								{
 									sessionId: "uncertain",
-									locator: { repo: "/fixture/workspace" },
+									locator: fixtureSessionOwner(),
 									terminal: true,
 									terminalUncertain: true,
 									ambiguous: false,
@@ -828,7 +843,102 @@ describe("ACP deep-interview wire path", () => {
 						},
 					}),
 				},
-				"/fixture/workspace",
+				fixtureSessionOwner(),
+			),
+		).rejects.toThrow("terminal_uncertain ownership");
+	});
+
+	it("lists only live sessions owned by the fixture locator", async () => {
+		const owner = fixtureSessionOwner();
+		const foreignOwner = fixtureSessionOwner("/foreign/workspace");
+		const ids = await listedFixtureSessionIds(
+			{
+				global: async () => ({
+					ok: true,
+					result: {
+						sessions: [
+							{
+								sessionId: "fixture-live",
+								locator: owner,
+								terminal: false,
+								terminalUncertain: false,
+								ambiguous: false,
+							},
+							{
+								sessionId: "fixture-terminal",
+								locator: owner,
+								terminal: true,
+								terminalUncertain: false,
+								ambiguous: false,
+							},
+							{
+								sessionId: "foreign-live",
+								locator: foreignOwner,
+								terminal: false,
+								terminalUncertain: false,
+								ambiguous: false,
+							},
+						],
+						warnings: [],
+					},
+				}),
+			},
+			owner,
+		);
+		expect(ids).toEqual(new Set(["fixture-live"]));
+	});
+
+	it("isolates foreign locators and rejects conflicting or uncertain fixture ownership", async () => {
+		const owner = { ...fixtureSessionOwner(), worktreeRoot: "/fixture/repository" };
+		const page = (sessions: Record<string, unknown>[]) => ({ ok: true, result: { sessions, warnings: [] } });
+		const row = (sessionId: string, locator: SessionLocatorV2, terminalUncertain = false) => ({
+			sessionId,
+			locator,
+			terminal: false,
+			terminalUncertain,
+			ambiguous: false,
+		});
+		const foreignRows = [
+			row("foreign-repository", {
+				cwd: "/foreign/workspace",
+				worktreeRoot: owner.worktreeRoot,
+				stateRoot: "/foreign/workspace/.gjc/state",
+			}),
+			row(
+				"foreign-uncertain",
+				{ cwd: "unknown", worktreeRoot: null, stateRoot: "/foreign/workspace/.gjc/state" },
+				true,
+			),
+		];
+		await expect(listedFixtureSessionIds({ global: async () => page(foreignRows) }, owner)).resolves.toEqual(
+			new Set(),
+		);
+
+		await expect(
+			listedFixtureSessionIds(
+				{
+					global: async () =>
+						page([
+							row("conflicting-state-owner", {
+								cwd: "/other/workspace",
+								worktreeRoot: "/other/repository",
+								stateRoot: owner.stateRoot,
+							}),
+						]),
+				},
+				owner,
+			),
+		).rejects.toThrow("conflicts with the fixture owner locator");
+
+		await expect(
+			listedFixtureSessionIds(
+				{
+					global: async () =>
+						page([
+							row("uncertain-create", { cwd: "unknown", worktreeRoot: null, stateRoot: owner.stateRoot }, true),
+						]),
+				},
+				owner,
 			),
 		).rejects.toThrow("terminal_uncertain ownership");
 	});
@@ -1039,6 +1149,7 @@ describe("ACP deep-interview wire path", () => {
 			await fs.promises.mkdir(dir, { recursive: true });
 		const workspace = path.join(root, "workspace");
 		await fs.promises.mkdir(path.join(workspace, ".gjc", "skills", "wire-skill"), { recursive: true });
+		const sessionOwner = await resolveSessionLocator(workspace, path.join(workspace, ".gjc", "state"));
 		await fs.promises.writeFile(
 			path.join(workspace, ".gjc", "skills", "wire-skill", "SKILL.md"),
 			"---\nname: wire-skill\ndescription: Complete one deterministic ACP turn.\n---\n\nReturn one short completion message.\n",
@@ -1095,7 +1206,7 @@ describe("ACP deep-interview wire path", () => {
 					() =>
 						retireFixtureSessions(
 							sessionIds,
-							() => listedFixtureSessionIds(brokerClient, workspace),
+							() => listedFixtureSessionIds(brokerClient, sessionOwner),
 							async sessionId => {
 								if (!connection)
 									throw new FixtureSessionCloseTransportError(
@@ -1120,7 +1231,7 @@ describe("ACP deep-interview wire path", () => {
 												timeoutMs: BROKER_SESSION_CLOSE_TIMEOUT_MS,
 											},
 										),
-									() => listedFixtureSessionIds(brokerClient, workspace),
+									() => listedFixtureSessionIds(brokerClient, sessionOwner),
 								),
 							sessionCreateState.uncertain || sessionCreateState.inFlight > 0
 								? SESSION_CREATE_RECONCILIATION_MS
@@ -1131,7 +1242,11 @@ describe("ACP deep-interview wire path", () => {
 				);
 				subprocessShutdownVerified = true;
 			},
-			dispose: () => stderrDrain,
+			dispose: () => {
+				if (!subprocessShutdownVerified)
+					throw new Error("ACP fixture subprocess retained until session retirement and shutdown succeed.");
+				return stderrDrain;
+			},
 		});
 		subprocessRegistered = true;
 		let stderr = "";
