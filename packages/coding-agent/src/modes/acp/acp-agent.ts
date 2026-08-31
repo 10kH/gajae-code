@@ -1201,6 +1201,8 @@ export class AcpAgent implements Agent {
 	readonly #pendingRouterFrames = new Map<string, Record<string, unknown>[]>();
 	#routerStartPromise: Promise<void> | undefined;
 	readonly #sessions = new Map<string, SessionRecord>();
+	/** Retain settled prompt identities across automatic transport reattachment. */
+	readonly #retiredPromptCorrelations = new Map<string, PromptCorrelation[]>();
 	readonly #attaching = new Map<string, PendingAttachment>();
 	readonly #resolvingExisting = new Map<string, PendingAttachment>();
 	readonly #knownSessionCwds = new Map<string, string>();
@@ -1516,6 +1518,7 @@ export class AcpAgent implements Agent {
 							this.#ownedSessionIds.delete(params.sessionId);
 							this.#knownSessionMcpServers.delete(params.sessionId);
 							this.#knownSessionMetadata.delete(params.sessionId);
+							this.#retiredPromptCorrelations.delete(params.sessionId);
 							return {};
 						}
 						throw error;
@@ -1532,6 +1535,7 @@ export class AcpAgent implements Agent {
 				this.#knownSessionMcpServers.delete(params.sessionId);
 				this.#knownSessionMetadata.delete(params.sessionId);
 				this.#pendingDeleteLocators.delete(params.sessionId);
+				this.#retiredPromptCorrelations.delete(params.sessionId);
 				return {};
 			} finally {
 				this.#finishTeardown(params.sessionId);
@@ -1720,20 +1724,17 @@ export class AcpAgent implements Agent {
 					"invalid_prompt_acknowledgement",
 					"SDK prompt acknowledgement must accept the prompt and include commandId and turnId.",
 				);
+			if (this.#hasRetiredPromptCorrelation(params.sessionId, record, acknowledgementCorrelation))
+				throw new AcpSdkAdapterError(
+					"invalid_prompt_acknowledgement",
+					"SDK prompt acknowledgement reused a settled commandId/turnId pair.",
+				);
 			// Retain the acknowledgement ingress boundary with its complete correlation.
 			waiter.boundary = record.inboundSequence;
 			waiter.correlation = acknowledgementCorrelation;
 			waiter.acknowledged = true;
 			if (promptWaiterRetired(record, waiter)) {
-				if (
-					!record.settledPromptCorrelations.some(settled =>
-						correlationsExactlyMatch(settled, acknowledgementCorrelation),
-					)
-				) {
-					record.settledPromptCorrelations.push(acknowledgementCorrelation);
-					while (record.settledPromptCorrelations.length > SETTLED_PROMPT_CORRELATION_RETENTION)
-						record.settledPromptCorrelations.shift();
-				}
+				this.#rememberSettledPromptCorrelation(params.sessionId, record, acknowledgementCorrelation);
 				return await response;
 			}
 			// Frames held while ownership was unknown belong to this prompt only when the
@@ -1790,7 +1791,7 @@ export class AcpAgent implements Agent {
 						await this.#failSession(params.sessionId, record.adapter, this.#frameProcessingFailure(error)),
 				);
 			}
-			this.#settlePrompt(record, waiter);
+			this.#settlePrompt(params.sessionId, record, waiter);
 			return await response;
 		})();
 		// Settlement can win before the SDK answers `turn.prompt`; acknowledgement processing
@@ -1812,11 +1813,7 @@ export class AcpAgent implements Agent {
 			// Keep a late terminal for this (cancelled) turn closed, exactly like the
 			// other settlement paths, so an aborted run's trailing frame can never
 			// publish over a later prompt that reuses the identity.
-			if (hasCompleteCorrelation(waiter.correlation)) {
-				record.settledPromptCorrelations.push(waiter.correlation);
-				while (record.settledPromptCorrelations.length > SETTLED_PROMPT_CORRELATION_RETENTION)
-					record.settledPromptCorrelations.shift();
-			}
+			this.#rememberSettledPromptCorrelation(params.sessionId, record, waiter.correlation);
 			// A prompt cancelled before the SDK acknowledged it still ends this turn by
 			// client request, and ACP is explicit: "Agents MUST catch these errors and
 			// return the semantically meaningful `cancelled` stop reason, so that Clients
@@ -1961,11 +1958,7 @@ export class AcpAgent implements Agent {
 		waiter.terminal = undefined;
 		// A late terminal for this turn must stay closed rather than publish over a
 		// prompt the client has already been told is cancelled.
-		if (hasCompleteCorrelation(waiter.correlation)) {
-			record.settledPromptCorrelations.push(waiter.correlation);
-			while (record.settledPromptCorrelations.length > SETTLED_PROMPT_CORRELATION_RETENTION)
-				record.settledPromptCorrelations.shift();
-		}
+		this.#rememberSettledPromptCorrelation(id, record, waiter.correlation);
 		// The client's turn ends with the resolution, not with the advisory idle update.
 		// Publishing the phase transition first made a backpressured ACP transport hold
 		// the settlement hostage: `sessionUpdate` awaits the stream write, a client that
@@ -2266,7 +2259,7 @@ export class AcpAgent implements Agent {
 				unsubscribe: () => {},
 				reconnectUnsubscribe: () => {},
 				frameTail: Promise.resolve(),
-				settledPromptCorrelations: [],
+				settledPromptCorrelations: this.#retiredPromptCorrelations.get(id) ?? [],
 				inboundSequence: 0,
 				connectionId: adapter.connectionId,
 				busy: false,
@@ -2317,6 +2310,20 @@ export class AcpAgent implements Agent {
 			}
 			throw error;
 		}
+	}
+
+	#rememberSettledPromptCorrelation(id: string, record: SessionRecord, correlation: PromptCorrelation): void {
+		if (!hasCompleteCorrelation(correlation)) return;
+		const retained = record.settledPromptCorrelations;
+		if (!retained.some(settled => correlationsExactlyMatch(settled, correlation))) retained.push(correlation);
+		while (retained.length > SETTLED_PROMPT_CORRELATION_RETENTION) retained.shift();
+		this.#retiredPromptCorrelations.set(id, retained);
+	}
+
+	#hasRetiredPromptCorrelation(id: string, record: SessionRecord, correlation: PromptCorrelation): boolean {
+		return (this.#retiredPromptCorrelations.get(id) ?? record.settledPromptCorrelations).some(settled =>
+			correlationsExactlyMatch(settled, correlation),
+		);
 	}
 
 	#recoverSessionAfterTransportFailure(id: string, adapter: AcpSdkAdapter, error: Error): void {
@@ -2373,6 +2380,7 @@ export class AcpAgent implements Agent {
 		this.#ownedSessionIds.delete(id);
 		this.#knownSessionMcpServers.delete(id);
 		this.#knownSessionMetadata.delete(id);
+		this.#retiredPromptCorrelations.delete(id);
 	}
 
 	async #closeOwnedSession(id: string): Promise<CloseSessionResponse> {
@@ -2387,6 +2395,7 @@ export class AcpAgent implements Agent {
 			this.#ownedSessionIds.delete(id);
 			this.#knownSessionMcpServers.delete(id);
 			this.#knownSessionMetadata.delete(id);
+			this.#retiredPromptCorrelations.delete(id);
 			return {};
 		} finally {
 			this.#finishTeardown(id);
@@ -2648,7 +2657,9 @@ export class AcpAgent implements Agent {
 		if (!record || record.adapter !== adapter) return;
 		if (typeof frame.connectionId === "string") record.connectionId = frame.connectionId;
 		// Ingress ordering is recorded before queued work begins.
+		const wasBusy = record.busy;
 		this.#observeSessionActivity(record, frame);
+		if (wasBusy && !record.busy && !record.activePrompt) void this.#publishPromptPhaseIdle(id, adapter);
 		// Correlation is checked at ingress before a prompt-owned frame may refresh the
 		// watchdog, so queued processing cannot turn unrelated host traffic into turn liveness.
 		this.#refreshPromptWatchdog(id, record, frame);
@@ -2671,11 +2682,7 @@ export class AcpAgent implements Agent {
 					record.activePrompt = undefined;
 					clearPromptWatchdog(waiter);
 					waiter.settled = true;
-					if (hasCorrelation(waiter.correlation)) {
-						record.settledPromptCorrelations.push(waiter.correlation);
-						while (record.settledPromptCorrelations.length > SETTLED_PROMPT_CORRELATION_RETENTION)
-							record.settledPromptCorrelations.shift();
-					}
+					this.#rememberSettledPromptCorrelation(id, record, waiter.correlation);
 					waiter.reject(
 						new AcpSdkAdapterError(
 							"connection_closed",
@@ -2741,7 +2748,7 @@ export class AcpAgent implements Agent {
 			// Failure diagnostics are useful but advisory. Settle before any mapped
 			// session update can await a backpressured client transport; otherwise an
 			// already-decided failure can still lose to the inactivity watchdog.
-			if (event.type === "agent_failed") this.#settlePrompt(record, activePrompt);
+			if (event.type === "agent_failed") this.#settlePrompt(id, record, activePrompt);
 		}
 		if (!isTerminal && derivedCorrelation === undefined) return;
 		if (!isTerminal && hasCorrelation(correlation)) {
@@ -2862,7 +2869,7 @@ export class AcpAgent implements Agent {
 		// its terminal answers neither: sequencing settlement behind those advisory
 		// queries is what left a finished turn reported as running until the inactivity
 		// watchdog rescued it.
-		if (activePrompt) this.#settlePrompt(record, activePrompt);
+		if (activePrompt) this.#settlePrompt(id, record, activePrompt);
 		// A failure terminal has no trustworthy end-of-turn usage or title. The rejected
 		// prompt response releases the client turn; the best-effort phase update reconciles
 		// a successor that starts while its transport write is backpressured.
@@ -2884,11 +2891,7 @@ export class AcpAgent implements Agent {
 		waiter.deferredFrames.length = 0;
 		waiter.deferredActivityFrames.length = 0;
 		waiter.terminal = undefined;
-		if (hasCompleteCorrelation(waiter.correlation)) {
-			record.settledPromptCorrelations.push(waiter.correlation);
-			while (record.settledPromptCorrelations.length > SETTLED_PROMPT_CORRELATION_RETENTION)
-				record.settledPromptCorrelations.shift();
-		}
+		this.#rememberSettledPromptCorrelation(id, record, waiter.correlation);
 		// The turn is over even though it ended badly, so the client's running phase has
 		// to be released. Rejection is the settlement; the advisory idle publication must
 		// never gate it (a backpressured transport would otherwise hold the rejection
@@ -2912,13 +2915,15 @@ export class AcpAgent implements Agent {
 		if (!record || record.adapter !== adapter || record.activePrompt) return;
 		try {
 			let observedPrompt: PromptWaiter | undefined;
+			let observedBusy = false;
 			for (;;) {
+				const observedWorking = observedPrompt !== undefined || observedBusy;
 				await this.#connection.sessionUpdate({
 					sessionId: id,
 					update: {
 						sessionUpdate: "session_info_update",
-						...(observedPrompt ? { updatedAt: new Date().toISOString() } : {}),
-						_meta: observedPrompt
+						...(observedWorking ? { updatedAt: new Date().toISOString() } : {}),
+						_meta: observedWorking
 							? { gjcPhase: "working", running: true, gjcRunning: true }
 							: { gjcPhase: "idle", running: false, gjcRunning: false },
 					},
@@ -2927,15 +2932,16 @@ export class AcpAgent implements Agent {
 				// Continue until the last published phase describes the current waiter.
 				const current = this.#sessions.get(id);
 				if (!current || current.adapter !== adapter) return;
-				if (current.activePrompt === observedPrompt) return;
+				if (current.activePrompt === observedPrompt && current.busy === observedBusy) return;
 				observedPrompt = current.activePrompt;
+				observedBusy = current.busy;
 			}
 		} catch {
 			// The client transport is gone; there is no phase left to restore.
 		}
 	}
 
-	#settlePrompt(record: SessionRecord, waiter: PromptWaiter): void {
+	#settlePrompt(id: string, record: SessionRecord, waiter: PromptWaiter): void {
 		if (record.activePrompt !== waiter || waiter.settled || !waiter.acknowledged || !waiter.terminal) return;
 		// A terminal captured before acknowledgement is only this prompt's terminal when the
 		// eventual acknowledgement correlates with it; otherwise it belonged to an earlier prompt.
@@ -2946,12 +2952,8 @@ export class AcpAgent implements Agent {
 		record.activePrompt = undefined;
 		clearPromptWatchdog(waiter);
 		waiter.settled = true;
-		if (hasCorrelation(waiter.correlation)) {
-			record.settledPromptCorrelations.push(waiter.correlation);
-			while (record.settledPromptCorrelations.length > SETTLED_PROMPT_CORRELATION_RETENTION)
-				record.settledPromptCorrelations.shift();
-		}
 		const { outcome } = waiter.terminal;
+		this.#rememberSettledPromptCorrelation(id, record, waiter.correlation);
 		if (outcome.kind === "stopped") {
 			waiter.resolve({ stopReason: outcome.reason });
 			return;
@@ -3729,6 +3731,7 @@ export class AcpAgent implements Agent {
 		this.#ownedSessionIds.clear();
 		this.#knownSessionMcpServers.clear();
 		this.#knownSessionMetadata.clear();
+		this.#retiredPromptCorrelations.clear();
 		this.#pendingDeleteLocators.clear();
 		this.#pendingCloseIdempotencyKeys.clear();
 		if (this.#lifecycleOperations.size === 0) this.#lifecycleOperations.clear();

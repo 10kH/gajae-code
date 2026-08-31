@@ -77,6 +77,7 @@ async function createFixture(
 		blockIdleUpdate?: boolean;
 		blockWorkingReconciliation?: boolean;
 		deferSecondPromptAcknowledgement?: boolean;
+		reusePromptCorrelationOnSecond?: boolean;
 	} = {},
 ): Promise<Fixture> {
 	const tempDir = TempDir.createSync("@sdk-acp-prompt-terminal-");
@@ -98,6 +99,10 @@ async function createFixture(
 	let promptSocket: TestSocket | undefined;
 	let promptDeliveries = 0;
 	let deferredPromptAcknowledgement: (() => void) | undefined;
+	const activeCorrelation = (): { commandId: string; turnId: string } => {
+		const suffix = promptDeliveries > 1 && !options.reusePromptCorrelationOnSecond ? `-${promptDeliveries}` : "";
+		return { commandId: `${commandId}${suffix}`, turnId: `${turnId}${suffix}` };
+	};
 	let blockAdvisoryQuery = false;
 	let server!: ReturnType<typeof Bun.serve>;
 
@@ -107,24 +112,25 @@ async function createFixture(
 	};
 	const sendTerminal = (frame: Record<string, unknown>): void => send(frame);
 	const sendStopped = (reason: StoppedReason): void => {
+		const correlation = activeCorrelation();
 		send({
 			type: "agent_end",
 			sessionId,
-			commandId,
-			turnId,
+			...correlation,
 			outcome: { kind: "stopped", reason, provenance: reason === "cancelled" ? "client_cancel" : "agent" },
 		});
 	};
 	const sendDiagnostic = (): void => {
+		const correlation = activeCorrelation();
 		send({
 			type: "agent_failed",
 			sessionId,
-			commandId,
-			turnId,
+			...correlation,
 			error: { code: "provider_unavailable", message: "diagnostic from fixture" },
 		});
 	};
 	const sendFailed = (code: FailedCode): void => {
+		const correlation = activeCorrelation();
 		const outcome = {
 			kind: "failed" as const,
 			code,
@@ -134,15 +140,13 @@ async function createFixture(
 		send({
 			type: "agent_failed",
 			sessionId,
-			commandId,
-			turnId,
+			...correlation,
 			outcome,
 		});
 		send({
 			type: "agent_end",
 			sessionId,
-			commandId,
-			turnId,
+			...correlation,
 			outcome,
 		});
 	};
@@ -237,7 +241,7 @@ async function createFixture(
 					ok: true,
 					result:
 						frame.operation === "turn.prompt"
-							? (options.promptAcknowledgement ?? { commandId, turnId, accepted: true })
+							? (options.promptAcknowledgement ?? { ...activeCorrelation(), accepted: true })
 							: frame.operation === "turn.abort"
 								? (options.abortAcknowledgement ??
 									(() => {
@@ -455,6 +459,24 @@ test("ACP preserves cancellation when runtime abort failure precedes agent_end",
 	}
 });
 
+test("ACP rejects a successor that reuses a retained prompt correlation", async () => {
+	const fixture = await createFixture({ reusePromptCorrelationOnSecond: true });
+	try {
+		const failed = prompt(fixture, "retained correlation owner");
+		await bounded(fixture.promptDelivered, "first prompt delivery");
+		fixture.sendDiagnostic();
+		await expect(bounded(failed, "first failure settlement")).rejects.toMatchObject({ code: "prompt_failed" });
+
+		const replacement = prompt(fixture, "reused correlation");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "replacement prompt delivery");
+		await expect(bounded(replacement, "reused correlation rejection")).rejects.toMatchObject({
+			code: "invalid_prompt_acknowledgement",
+		});
+	} finally {
+		fixture.dispose();
+	}
+});
+
 test("ACP malformed correlated agent_failed still releases the running phase", async () => {
 	const fixture = await createFixture();
 	try {
@@ -497,7 +519,7 @@ test("ACP preserves a failure-only prompt deadline classifier", async () => {
 	}
 });
 
-test("ACP ignores a wrapped failure without a diagnostic instead of tearing down the session", async () => {
+test("ACP preserves a wrapped normalized failure without tearing down the session", async () => {
 	const fixture = await createFixture();
 	try {
 		const pending = prompt(fixture, "wrapped malformed failure");
@@ -524,6 +546,39 @@ test("ACP ignores a wrapped failure without a diagnostic instead of tearing down
 			code: "prompt_failed",
 		});
 		const next = prompt(fixture, "prompt after wrapped malformed failure");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "successor prompt delivery");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(next, "prompt after wrapped malformed failure")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP rejects a wrapped failure without diagnostic or outcome and keeps the session usable", async () => {
+	const fixture = await createFixture();
+	try {
+		const idleBefore = idlePhaseUpdates(fixture.updates);
+		const pending = prompt(fixture, "wrapped malformed failure");
+		await bounded(fixture.promptDelivered, "prompt delivery");
+		fixture.sendTerminal({
+			type: "event",
+			payload: {
+				event_type: "agent_failed",
+				event: {
+					type: "agent_failed",
+					sessionId: "prompt-terminal-session",
+					commandId: "prompt-terminal-command",
+					turnId: "prompt-terminal-turn",
+				},
+			},
+		});
+		await expect(bounded(pending, "wrapped malformed failure settlement")).rejects.toMatchObject({
+			code: "connection_closed",
+		});
+		await waitFor(() => idlePhaseUpdates(fixture.updates) > idleBefore, "wrapped malformed idle update");
+
+		const next = prompt(fixture, "prompt after wrapped malformed failure");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "successor prompt delivery");
 		fixture.sendStopped("end_turn");
 		expect(await bounded(next, "prompt after wrapped malformed failure")).toEqual({ stopReason: "end_turn" });
 	} finally {
@@ -638,6 +693,46 @@ test("ACP reconciliation releases a successor whose delayed acknowledgement is i
 	} finally {
 		fixture.releaseIdleUpdate();
 		fixture.releasePromptAcknowledgement();
+		fixture.dispose();
+	}
+});
+
+test("ACP failure phase reconciliation follows background agent activity", async () => {
+	const fixture = await createFixture({ blockIdleUpdate: true });
+	try {
+		const failed = prompt(fixture, "foreground prompt fails");
+		await bounded(fixture.promptDelivered, "foreground prompt delivery");
+		fixture.sendDiagnostic();
+		await expect(bounded(failed, "foreground failure settlement")).rejects.toMatchObject({
+			code: "prompt_failed",
+		});
+		const updatesAfterFailure = fixture.updates.length;
+
+		fixture.sendTerminal({ type: "agent_start", sessionId: "prompt-terminal-session" });
+		fixture.releaseIdleUpdate();
+		await waitFor(
+			() =>
+				fixture.updates
+					.slice(updatesAfterFailure)
+					.some(
+						update =>
+							update.update.sessionUpdate === "session_info_update" &&
+							(update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase === "working",
+					),
+			"background working update",
+		);
+		fixture.sendTerminal({ type: "agent_end", sessionId: "prompt-terminal-session" });
+		await waitFor(
+			() =>
+				fixture.updates
+					.slice(updatesAfterFailure)
+					.filter(update => update.update.sessionUpdate === "session_info_update")
+					.map(update => (update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase)
+					.at(-1) === "idle",
+			"background idle reconciliation",
+		);
+	} finally {
+		fixture.releaseIdleUpdate();
 		fixture.dispose();
 	}
 });
@@ -899,6 +994,7 @@ test("ACP malformed agent_failed cannot publish stale idle state over a replacem
 		const updatesAfterFailure = fixture.updates.length;
 
 		const replacement = prompt(fixture, "replacement after malformed failure");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "replacement prompt delivery");
 		fixture.sendStopped("end_turn");
 		expect(await bounded(replacement, "replacement completion")).toEqual({ stopReason: "end_turn" });
 		await waitFor(
@@ -990,9 +1086,10 @@ test("ACP releases the running phase and accepts a new prompt after a settlement
 		await expect(bounded(pending, "unsettled prompt rejection")).rejects.toMatchObject({
 			code: "prompt_failed",
 		});
-		// The wedged session refused every later turn with `conflict`, which surfaced in
+		// the wedged session refused every later turn with `conflict`, which surfaced in
 		// the client as a permanent "a foreground turn is already active".
 		const next = prompt(fixture, "prompt after rejection");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "successor prompt delivery");
 		fixture.sendStopped("end_turn");
 		expect(await bounded(next, "prompt after rejection")).toEqual({ stopReason: "end_turn" });
 	} finally {
@@ -1018,6 +1115,7 @@ test("ACP settles a cancelled prompt when the aborted turn never publishes a ter
 				),
 		).toHaveLength(1);
 		const next = prompt(fixture, "prompt after cancel");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "successor prompt delivery");
 		fixture.sendStopped("end_turn");
 		expect(await bounded(next, "prompt after cancel")).toEqual({ stopReason: "end_turn" });
 	} finally {
