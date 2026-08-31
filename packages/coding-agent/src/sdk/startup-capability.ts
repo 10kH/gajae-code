@@ -190,6 +190,7 @@ export class SdkStartupCapability {
 	constructor(
 		readonly rollback?: SdkStartupRollbackTracker,
 		readonly readiness: "immediate" | "deferred" = "immediate",
+		readonly lifecycleRequestId?: string,
 	) {}
 
 	normalizeFailure(phase: SdkStartupPhase, reason: SdkStartupReason, error?: unknown): SdkStartupFailure {

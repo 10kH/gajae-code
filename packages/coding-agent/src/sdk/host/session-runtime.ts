@@ -472,6 +472,8 @@ export interface CreateSdkSessionRuntimeOptions {
 	agentDir: string;
 	/** Lifecycle-owned sessions require broker publication before they become usable. */
 	brokerRegistrationRequired?: boolean;
+	/** Trusted broker-issued lifecycle marker bound to lifecycle host index events. */
+	lifecycleRequestId?: string;
 	createTransport(input: {
 		sessionId: string;
 		stateRoot: string;
@@ -5043,6 +5045,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const registerBroker = async (): Promise<void> => {
 			if (brokerRegistered) return;
 			try {
+				if (options.brokerRegistrationRequired && !options.lifecycleRequestId)
+					throw new Error("Lifecycle broker registration requires a request identity.");
 				await ensureBroker({ agentDir: options.agentDir });
 				const index = await new SessionIndex(options.agentDir).open();
 				const locator = await resolveSessionLocator(ctx.cwd, stateRoot);
@@ -5090,11 +5094,18 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 							pid: process.pid,
 							endpointMtimeMs,
 							endpointFileId,
+							...(options.lifecycleRequestId ? { lifecycleRequestId: options.lifecycleRequestId } : {}),
 							...(masterRole ? { masterRole } : {}),
 						});
 					},
 					unregister: async input => {
-						await index.append({ type: "host_unregistered", ...input, locator, pid: process.pid });
+						await index.append({
+							type: "host_unregistered",
+							...input,
+							locator,
+							pid: process.pid,
+							...(options.lifecycleRequestId ? { lifecycleRequestId: options.lifecycleRequestId } : {}),
+						});
 					},
 				});
 				brokerRegistered = true;

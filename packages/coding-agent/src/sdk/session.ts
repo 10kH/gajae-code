@@ -3330,6 +3330,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						createSdkSessionRuntimeExtension(api, {
 							agentDir,
 							brokerRegistrationRequired: lifecycleStartupCapability !== undefined,
+							...(lifecycleStartupCapability?.lifecycleRequestId
+								? { lifecycleRequestId: lifecycleStartupCapability.lifecycleRequestId }
+								: {}),
 							createTransport: input => createSdkWebSocketTransport(input),
 							settings,
 							configOverrides: new Map(),

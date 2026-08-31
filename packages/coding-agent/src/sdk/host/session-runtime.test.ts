@@ -3351,6 +3351,7 @@ describe("SessionSdkSessionRuntime", () => {
 		createSdkSessionRuntimeExtension(api, {
 			agentDir,
 			brokerRegistrationRequired: true,
+			lifecycleRequestId: "broker-required-marker",
 			createTransport: async ({ sessionId, stateRoot, token }) => ({
 				sessionId,
 				stateRoot,

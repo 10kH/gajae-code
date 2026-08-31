@@ -172,6 +172,7 @@ test("SDK-only runtime registers its broker endpoint and retracts it on shutdown
 	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-only-broker-"));
 	const cwd = path.join(agentDir, "workspace");
 	const sessionId = "sdk-only-live";
+	const lifecycleRequestId = "sdk-only-live-marker";
 	const broker = new Broker({ agentDir });
 	await broker.start();
 	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => void | Promise<void>>();
@@ -182,6 +183,8 @@ test("SDK-only runtime registers its broker endpoint and retracts it on shutdown
 	} as unknown as ExtensionAPI;
 	createSdkSessionRuntimeExtension(api, {
 		agentDir,
+		brokerRegistrationRequired: true,
+		lifecycleRequestId,
 		createTransport: input => createSdkWebSocketTransport(input),
 	});
 	const pendingGateIds = new Set(["gate-answer", "gate-approve", "gate-drain"]);
@@ -218,6 +221,10 @@ test("SDK-only runtime registers its broker endpoint and retracts it on shutdown
 		const start = handlers.get("session_start");
 		if (!start) throw new Error("SDK-only session_start handler was not registered.");
 		await start({}, context);
+		await broker.index.refresh();
+		expect(broker.index.listSessions().sessions.find(session => session.sessionId === sessionId)).toMatchObject({
+			lifecycleRequestId,
+		});
 		expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 })).toMatchObject({
 			ok: true,
 			result: { sessionId, pid: process.pid, url: expect.stringMatching(/^ws:\/\/127\.0\.0\.1:/) },
@@ -315,6 +322,7 @@ test("SDK-only runtime rejects an endpoint substituted before broker registratio
 	createSdkSessionRuntimeExtension(api, {
 		agentDir,
 		brokerRegistrationRequired: true,
+		lifecycleRequestId: "sdk-registration-authority-marker",
 		createTransport: async input => {
 			const transport = await createSdkWebSocketTransport(input);
 			const realStart = transport.start.bind(transport);
