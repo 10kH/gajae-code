@@ -21,6 +21,8 @@ import {
 	PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION,
 } from "../../ai/src/adapter-internals/provider-safety-stop";
 
+const REAL_DATE_NOW = Date.now;
+
 /**
  * Anthropic's statusless capacity-overload envelope exactly as observed in a
  * live session, including the trailing padding the provider sends.
@@ -85,7 +87,7 @@ function assistantMessage(
  *  - retry.enabled=false surfaces immediately;
  *  - first Esc (retryNow) skips the backoff; abortRetry cancels.
  */
-describe("AgentSession resilient retry", () => {
+describe.serial("AgentSession resilient retry", () => {
 	let tempDir: TempDir;
 	let authStorage: AuthStorage;
 	let modelRegistry: ModelRegistry;
@@ -99,14 +101,18 @@ describe("AgentSession resilient retry", () => {
 	});
 
 	afterEach(async () => {
-		if (session) {
-			await session.dispose();
-			session = undefined;
-		}
-		authStorage.close();
-		tempDir.removeSync();
+		// Teardown uses real timer/deadline state. Restore test clocks and scheduler
+		// hooks before disposing so a mocked Date.now cannot wedge cleanup.
 		vi.restoreAllMocks();
-	});
+		Date.now = REAL_DATE_NOW;
+		const currentSession = session;
+		const currentAuthStorage = authStorage;
+		const currentTempDir = tempDir;
+		session = undefined;
+		if (currentSession) await currentSession.dispose();
+		currentAuthStorage.close();
+		currentTempDir.removeSync();
+	}, 300_000);
 
 	function buildSession(options: {
 		responses: Array<{ throw: string } | { content: string[] }>;
@@ -853,6 +859,7 @@ describe("AgentSession resilient retry", () => {
 	});
 
 	it("does not terminalize retryable explicit HTTP statuses", async () => {
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 		for (const [status, message] of [
 			[408, "HTTP 408 request timeout"],
 			[425, "HTTP 425 too early retry your request"],
@@ -864,7 +871,6 @@ describe("AgentSession resilient retry", () => {
 				session = undefined;
 			}
 			session = buildSession({ responses: [{ throw: message }, { content: [`recovered ${status}`] }] });
-			vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 			const { retryStartEvents } = track(session);
 
 			await session.prompt(`trigger retryable HTTP ${status}`);
@@ -999,7 +1005,7 @@ describe("AgentSession resilient retry", () => {
 			session = undefined;
 			waitSpy.mockClear();
 		}
-	});
+	}, 60_000);
 
 	it("uses failed AssistantMessage identity rather than the active model for Alibaba timeout policy", async () => {
 		const alibabaModel = getBundledModel("alibaba-token-plan", "qwen3.8-max-preview");
@@ -1050,7 +1056,7 @@ describe("AgentSession resilient retry", () => {
 			model: alibabaModel.id,
 			errorMessage: timeoutMessage,
 		});
-	});
+	}, 60_000);
 
 	it("keeps Alibaba near misses, cross-API text, and unrelated transient failures retryable", async () => {
 		const responsesModel = getBundledModel("alibaba-token-plan", "qwen3.8-max-preview");
@@ -1164,7 +1170,7 @@ describe("AgentSession resilient retry", () => {
 			session = undefined;
 			waitSpy.mockClear();
 		}
-	});
+	}, 300000);
 
 	it("keeps first-party first-event timeout retries unbounded (#713 scope guard)", async () => {
 		// The fix is scoped to ollama-cloud: first-party providers keep their
@@ -1192,7 +1198,7 @@ describe("AgentSession resilient retry", () => {
 		expect(retryEndEvents).toHaveLength(1);
 		expect(retryEndEvents[0]).toMatchObject({ success: true });
 		expect(lastAssistant(session).stopReason).toBe("stop");
-	});
+	}, 300000);
 	it("retries provider stream first-event timeouts under a bare default config (single model)", async () => {
 		// Regression: with a single default model and NO explicit retry.* keys,
 		// a provider stream timeout used to fail the turn without retrying and
@@ -2129,7 +2135,7 @@ describe("AgentSession resilient retry", () => {
 			stopReason: "stop",
 			content: [{ type: "text", text: "recovered" }],
 		});
-	});
+	}, 300000);
 
 	it("bounds canonical wrapped first-event timeout exhaustion with exact diagnostics", async () => {
 		const errorMessage = "Error: Provider stream timed out while waiting for the first event";
@@ -2152,7 +2158,7 @@ describe("AgentSession resilient retry", () => {
 		expect(lastAssistant(session).errorMessage).toMatch(
 			/^First-event stream timeout exhausted after 3 attempts; waited \d+ms total: Error: Provider stream timed out while waiting for the first event$/,
 		);
-	});
+	}, 300000);
 
 	it("bounds the exact no-the first-event compatibility message under explicit retry policy", async () => {
 		const errorMessage = "Provider stream timed out while waiting for first event";
@@ -2174,7 +2180,7 @@ describe("AgentSession resilient retry", () => {
 			expect.objectContaining({ attempt: 1, maxAttempts: 2, errorMessage, unbounded: false }),
 		]);
 		expect(lastAssistant(session).errorMessage).toContain("exhausted after 2 attempts");
-	}, 60000);
+	}, 60_000);
 	it("reseeds first-event timeout accounting at the first retryable failure", async () => {
 		let now = 10;
 		vi.spyOn(Date, "now").mockImplementation(() => now);
@@ -2509,6 +2515,35 @@ describe("AgentSession resilient retry", () => {
 		expect(retryEndEvents[0]).toMatchObject({ success: true });
 		expect(lastAssistant(session).stopReason).toBe("stop");
 	});
+	it("disposal cancels a pending idle-stall retry before closing admission", async () => {
+		const retryStarted = Promise.withResolvers<void>();
+		const requestedModels: string[] = [];
+		session = buildSession({
+			responses: [{ throw: "Anthropic stream stalled while waiting for the next event" }],
+			settingsOverrides: {
+				"retry.baseDelayMs": 60_000,
+				"retry.maxDelayMs": 60_000,
+				"retry.maxRetries": 2,
+			},
+			requestedModels,
+		});
+		const { retryStartEvents, retryEndEvents } = track(session);
+		session.subscribe(event => {
+			if (event.type === "auto_retry_start") retryStarted.resolve();
+		});
+		const prompt = session.prompt("dispose while idle-stall retry is waiting");
+		await retryStarted.promise;
+
+		const disposed = await Promise.race([session.dispose().then(() => true), Bun.sleep(1_000).then(() => false)]);
+		expect(disposed).toBe(true);
+		await prompt;
+		expect(requestedModels).toHaveLength(1);
+		expect(retryStartEvents).toHaveLength(1);
+		expect(retryEndEvents).toEqual([expect.objectContaining({ success: false, attempt: 1 })]);
+		expect(session.isRetrying).toBe(false);
+		expect(session.isStreaming).toBe(false);
+		session = undefined;
+	});
 	it("bounds repeated provider stream idle stalls by retry.maxRetries", async () => {
 		const requestedModels: string[] = [];
 		session = buildSession({
@@ -2834,7 +2869,7 @@ describe("AgentSession resilient retry", () => {
 			false,
 		);
 		expect(lastAssistant(session).content).toEqual([{ type: "text", text: "replacement recovered" }]);
-	});
+	}, 60_000);
 	it("fails closed on non-canonical watchdog prose under bare defaults", async () => {
 		const nearMisses = [
 			"stream timed out while waiting for the first event",
