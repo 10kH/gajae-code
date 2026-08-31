@@ -9,6 +9,7 @@ const sourceRoot = path.resolve(import.meta.dir, "../src/providers");
 
 type Scenario =
 	| "aws-sso"
+	| "aws-imds"
 	| "bedrock-bearer"
 	| "bedrock-sigv4"
 	| "codewhisperer"
@@ -149,6 +150,23 @@ async function childMain(): Promise<void> {
 			if (forcedToolChoiceProbe && captures.length === 1) {
 				return new Response("validationException: This model does not support forced toolChoice", { status: 400 });
 			}
+			if (!redirectServer && scenario === "aws-imds" && captures.length === 1) {
+				return new Response("imds-test-token", { status: 200 });
+			}
+			if (!redirectServer && scenario === "aws-imds" && captures.length === 2) {
+				return new Response("test-role\n", { status: 200 });
+			}
+			if (!redirectServer && scenario === "aws-imds" && captures.length === 3) {
+				return new Response(
+					JSON.stringify({
+						AccessKeyId: "imds-access-key",
+						SecretAccessKey: "imds-secret-key",
+						Token: "imds-session-token",
+						Expiration: "2099-01-01T00:00:00Z",
+					}),
+					{ status: 200 },
+				);
+			}
 			if (scenario === "kiro-discovered-stream" && captures.length === 1) {
 				return new Response(JSON.stringify({ models: [{ modelId: "test-model" }] }), { status: 200 });
 			}
@@ -205,6 +223,13 @@ async function childMain(): Promise<void> {
 		const { resolveAwsCredentials } = await import(pathToFileURL(path.join(sourceRoot, "aws-credentials.ts")).href);
 		try {
 			await resolveAwsCredentials({ profile: "test-sso", region: "us-east-1" });
+		} catch (cause) {
+			error = cause instanceof Error ? cause.message : String(cause);
+		}
+	} else if (scenario === "aws-imds") {
+		const { resolveAwsCredentials } = await import(pathToFileURL(path.join(sourceRoot, "aws-credentials.ts")).href);
+		try {
+			await resolveAwsCredentials({ profile: "missing", region: "us-east-1" });
 		} catch (cause) {
 			error = cause instanceof Error ? cause.message : String(cause);
 		}
@@ -389,6 +414,7 @@ if (process.argv[2] === CHILD_FLAG) {
 			AWS_SESSION_TOKEN: scenario === "bedrock-sigv4" ? "test-session-token" : "",
 			KIRO_API_KEY: scenario.startsWith("kiro-") ? "ksk_test-secret" : "",
 		};
+		if (scenario === "aws-imds") env.AWS_EC2_METADATA_DISABLED = "false";
 		if (options.source !== "project") env.AWS_REGION = region;
 		const proc = Bun.spawn(
 			[
@@ -422,6 +448,7 @@ if (process.argv[2] === CHILD_FLAG) {
 	describe("AWS region credential destination", () => {
 		test.each([
 			"aws-sso",
+			"aws-imds",
 			"bedrock-bearer",
 			"bedrock-sigv4",
 			"codewhisperer",
@@ -545,6 +572,17 @@ if (process.argv[2] === CHILD_FLAG) {
 			"-us-east-1",
 			"us-east-1-",
 		])("rejects malformed region %p before Kiro API-key discovery", async region => {
+			const result = await probe("kiro-discovery", region);
+			expect(result.fetches).toHaveLength(0);
+			expect(result.error).toBe("Invalid AWS region: expected a lowercase ASCII DNS label.");
+		});
+
+		test.each([
+			"us-east-1\n",
+			"us-east-1\r",
+			"us-east-1\u2028",
+			"us-east-1\u2029",
+		])("rejects a trailing line terminator before Kiro API-key discovery", async region => {
 			const result = await probe("kiro-discovery", region);
 			expect(result.fetches).toHaveLength(0);
 			expect(result.error).toBe("Invalid AWS region: expected a lowercase ASCII DNS label.");

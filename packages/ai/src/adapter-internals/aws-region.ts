@@ -7,7 +7,8 @@ const AWS_REGION_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
  * parsing as part of that label.
  */
 export function assertAwsRegionLabel(region: unknown): asserts region is string {
-	if (typeof region !== "string" || !AWS_REGION_LABEL.test(region)) {
+	const match = typeof region === "string" ? AWS_REGION_LABEL.exec(region) : undefined;
+	if (!match || match[0] !== region) {
 		throw new Error("Invalid AWS region: expected a lowercase ASCII DNS label.");
 	}
 }
