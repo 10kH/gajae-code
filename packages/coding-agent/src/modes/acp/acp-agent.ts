@@ -162,6 +162,8 @@ type SessionRecord = {
 	frameTail: Promise<void>;
 	/** Prior nonterminal work draining after an out-of-queue terminal settlement. */
 	terminalDrain?: Promise<void>;
+	/** Advances when an owned terminal retires all earlier frame publications. */
+	publicationGeneration: number;
 	/** Monotonic at WebSocket ingress, before queued work begins. */
 	inboundSequence: number;
 	/** Updated at ingress so a prompt acknowledgement can distinguish a steer from a fresh turn. */
@@ -1848,13 +1850,14 @@ export class AcpAgent implements Agent {
 						);
 					continue;
 				}
+				const deferredGeneration = record.publicationGeneration;
 				const task = deferredIsTerminal
 					? this.#handleSdkFrame(params.sessionId, record.adapter, deferredFrame)
 					: record.frameTail.then(
 							async () => await this.#handleSdkFrame(params.sessionId, record.adapter, deferredFrame),
 						);
 				record.frameTail = task.catch(async error => {
-					if (record.terminalDrain) return;
+					if (deferredGeneration !== record.publicationGeneration) return;
 					await this.#failSession(params.sessionId, record.adapter, this.#frameProcessingFailure(error));
 				});
 			}
@@ -2331,6 +2334,7 @@ export class AcpAgent implements Agent {
 				unsubscribe: () => {},
 				reconnectUnsubscribe: () => {},
 				frameTail: Promise.resolve(),
+				publicationGeneration: 0,
 				settledPromptCorrelations: this.#retiredPromptCorrelations.get(id) ?? [],
 				inboundSequence: 0,
 				connectionId: adapter.connectionId,
@@ -2415,6 +2419,7 @@ export class AcpAgent implements Agent {
 	}
 
 	#armTerminalDrain(record: SessionRecord): void {
+		record.publicationGeneration++;
 		const pendingFrames = record.frameTail;
 		let drain: Promise<void>;
 		drain = pendingFrames.finally(() => {
@@ -2774,9 +2779,10 @@ export class AcpAgent implements Agent {
 			});
 			return;
 		}
+		const frameGeneration = record.publicationGeneration;
 		const task = record.frameTail.then(async () => await this.#handleSdkFrame(id, adapter, frame));
 		record.frameTail = task.catch(async error => {
-			if (record.terminalDrain) return;
+			if (frameGeneration !== record.publicationGeneration) return;
 			await this.#failSession(id, adapter, this.#frameProcessingFailure(error));
 		});
 	}
@@ -2811,6 +2817,7 @@ export class AcpAgent implements Agent {
 		const received = receivedSdkEvent(frame);
 		if (!received) return;
 		const { event, wirePayload } = received;
+		let publicationGeneration = record.publicationGeneration;
 		const isTerminal = event.type === "agent_end" || event.type === "agent_failed";
 		if (event.type === "notice" && event.source === "autorouting" && typeof event.message === "string") {
 			record.routingInactiveNotice = event.message;
@@ -2844,6 +2851,7 @@ export class AcpAgent implements Agent {
 			}
 			if (activePrompt.terminal) return;
 			this.#armTerminalDrain(record);
+			publicationGeneration = record.publicationGeneration;
 			if (!outcome) {
 				await this.#rejectPrompt(
 					record,
@@ -2922,7 +2930,8 @@ export class AcpAgent implements Agent {
 			// The prompt rejection carries the sanitized failure diagnostic. Publishing
 			// a second session update after settlement would be stale as soon as the client
 			// starts a replacement turn, and an in-flight transport write cannot be revoked.
-			if (event.type !== "agent_failed") await this.#publishSessionUpdate(id, notification, adapter);
+			if (event.type !== "agent_failed")
+				await this.#publishSessionUpdate(id, notification, adapter, publicationGeneration);
 		}
 		if (toolCallId && event.type === "tool_execution_end") record.toolArgs.delete(toolCallId);
 		if (event.type === "agent_start") {
@@ -2983,7 +2992,7 @@ export class AcpAgent implements Agent {
 		// prompt response releases the client turn; the best-effort phase update reconciles
 		// a successor that starts while its transport write is backpressured.
 		if (event.type === "agent_failed") void this.#publishPromptPhaseIdle(id, adapter);
-		if (event.type === "agent_end") await this.#emitEndOfTurnUpdates(id, adapter);
+		if (event.type === "agent_end") await this.#emitEndOfTurnUpdates(id, adapter, publicationGeneration);
 	}
 
 	async #rejectPrompt(
@@ -3079,7 +3088,7 @@ export class AcpAgent implements Agent {
 		waiter.reject(new AcpSdkAdapterError(outcome.code, outcome.message));
 	}
 
-	async #emitEndOfTurnUpdates(id: string, adapter: AcpSdkAdapter): Promise<void> {
+	async #emitEndOfTurnUpdates(id: string, adapter: AcpSdkAdapter, publicationGeneration: number): Promise<void> {
 		let usage: JsonObject | undefined;
 		let title: string | undefined;
 		try {
@@ -3113,6 +3122,7 @@ export class AcpAgent implements Agent {
 					},
 				},
 				adapter,
+				publicationGeneration,
 			);
 		}
 		const updatedAt = new Date().toISOString();
@@ -3129,6 +3139,7 @@ export class AcpAgent implements Agent {
 				},
 			},
 			adapter,
+			publicationGeneration,
 		);
 	}
 
@@ -3136,6 +3147,7 @@ export class AcpAgent implements Agent {
 		id: string,
 		notification: SessionNotification,
 		expectedAdapter?: AcpSdkAdapter,
+		publicationGeneration?: number,
 	): Promise<void> {
 		// A session that is gone has no update channel, so this is a drop and not a failure:
 		// whoever owned the frame is the one that ended the session. Callers whose bookkeeping
@@ -3148,7 +3160,7 @@ export class AcpAgent implements Agent {
 			// A validated terminal can retire this publication while it is blocked in
 			// the client transport. Its failure belongs to the drained prompt and must
 			// not tear down a successor that has since taken session ownership.
-			if (record.terminalDrain) return;
+			if (publicationGeneration !== undefined && publicationGeneration !== record.publicationGeneration) return;
 			const failure = this.#frameProcessingFailure(error);
 			await this.#failSession(id, record.adapter, failure);
 			throw failure;
