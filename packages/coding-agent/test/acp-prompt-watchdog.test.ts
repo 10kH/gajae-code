@@ -142,6 +142,7 @@ type FixtureOptions = {
 	agentStartBeforeAcknowledgement?: boolean;
 	deferFirstPromptAcknowledgement?: boolean;
 	cancelSettlementGraceMs?: number;
+	preflightCancelAcknowledgement?: boolean;
 };
 
 async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
@@ -305,6 +306,7 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 										ok: true,
 										selection: scope,
 										turn: "stopped",
+										...(options.preflightCancelAcknowledgement ? { disposition: "preflight_cancelled" } : {}),
 										ownedWork: scope === "owned" ? "stopped" : "left_running",
 										automaticDelivery: scope === "owned" ? "none" : "enabled",
 										resumeOnOwnedCompletion: scope !== "owned",
@@ -946,6 +948,24 @@ test("a cancelled pre-acknowledgement prompt settles without its acknowledgement
 		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "cancel acknowledgement");
 		expect(await bounded(pending, "pre-acknowledgement cancellation")).toEqual({ stopReason: "cancelled" });
 
+		fixture.acknowledgePrompt();
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("a preflight-cancelled prompt clears its watchdog before settlement", async () => {
+	const fixture = await createFixture({
+		deferFirstPromptAcknowledgement: true,
+		preflightCancelAcknowledgement: true,
+	});
+	try {
+		const pending = prompt(fixture, "preflight cancel cleanup");
+		await waitFor(() => fixture.correlation().commandId.length > 0, "prompt dispatch");
+		expect(fixture.clock.pending).toBe(1);
+		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "preflight cancel acknowledgement");
+		expect(await bounded(pending, "preflight cancellation settlement")).toEqual({ stopReason: "cancelled" });
+		expect(fixture.clock.pending).toBe(0);
 		fixture.acknowledgePrompt();
 	} finally {
 		fixture.dispose();

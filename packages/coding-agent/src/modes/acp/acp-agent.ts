@@ -1913,9 +1913,12 @@ export class AcpAgent implements Agent {
 				!waiter.settled
 			) {
 				record.activePrompt = undefined;
+				record.cancelRequested = false;
+				clearPromptWatchdog(waiter);
 				waiter.settled = true;
 				this.#fenceRetiredPromptAcknowledgement(params.sessionId, waiter);
 				waiter.deferredFrames.length = 0;
+				waiter.deferredActivityFrames.length = 0;
 				waiter.terminal = undefined;
 				waiter.resolve({ stopReason: "cancelled" });
 				// Release the running phase for consistency with the resolved cancel; the
