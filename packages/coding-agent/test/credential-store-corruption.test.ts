@@ -22,9 +22,9 @@ async function seedCredentialDb(dbPath: string): Promise<void> {
 		for (let index = 0; index < 400; index += 1) {
 			const provider = index % 5 === 0 ? "anthropic" : `fixture-provider-${index % 5}`;
 			store.saveOAuth(provider, {
-				type: "oauth",
 				access: `access-${index}`,
 				refresh: `refresh-${index}`,
+				expires: Date.now() + 60_000,
 				email: `account-${index}@example.test`,
 			});
 		}
@@ -33,7 +33,7 @@ async function seedCredentialDb(dbPath: string): Promise<void> {
 	}
 }
 
-async function corruptIndexRootPage(dbPath: string, indexName: string): Promise<Buffer> {
+async function corruptIndexRootPage(dbPath: string, indexName: string): Promise<Buffer<ArrayBuffer>> {
 	const database = new Database(dbPath);
 	let pageSize: number;
 	let rootPage: number;
@@ -48,7 +48,9 @@ async function corruptIndexRootPage(dbPath: string, indexName: string): Promise<
 	} finally {
 		database.close();
 	}
-	const bytes = Buffer.from(await fs.readFile(dbPath));
+	const fileBytes = await fs.readFile(dbPath);
+	const bytes = Buffer.alloc(fileBytes.byteLength);
+	fileBytes.copy(bytes);
 	const pageOffset = (rootPage - 1) * pageSize;
 	expect(bytes[pageOffset]).toBe(2);
 	bytes[pageOffset] = 0;
@@ -161,15 +163,15 @@ describe("credential SQLite corruption classification", () => {
 		const dbPath = path.join(root, "agent.db");
 		const store = await SqliteAuthCredentialStore.open(dbPath);
 		store.saveOAuth("anthropic", {
-			type: "oauth",
 			access: "access-a",
 			refresh: "refresh-a",
+			expires: Date.now() + 60_000,
 			email: "a@example.test",
 		});
 		store.saveOAuth("anthropic", {
-			type: "oauth",
 			access: "access-b",
 			refresh: "refresh-b",
+			expires: Date.now() + 60_000,
 			email: "b@example.test",
 		});
 		const before = store.listCredentialInventory("anthropic");
