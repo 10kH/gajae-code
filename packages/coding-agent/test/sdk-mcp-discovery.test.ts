@@ -73,7 +73,7 @@ function createReasoningModel(): Model<"openai-responses"> {
 
 const oldSessionMtime = new Date("2000-01-01T00:00:00.000Z");
 const SLOW_SDK_TEST_TIMEOUT_MS = 15_000;
-const RESUME_SDK_TEST_TIMEOUT_MS = 120_000;
+const FALLBACK_SDK_TEST_TIMEOUT_MS = 30_000;
 const validSixSurfacePluginBundle = path.join(import.meta.dir, "fixtures", "gjc-plugins", "valid-six-surface-bundle");
 const originalAgentDir = getAgentDir();
 
@@ -1598,7 +1598,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 				await resumedSession.dispose();
 			}
 		},
-		RESUME_SDK_TEST_TIMEOUT_MS,
+		SLOW_SDK_TEST_TIMEOUT_MS,
 	);
 
 	it(
@@ -1657,7 +1657,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 				await session.dispose();
 			}
 		},
-		RESUME_SDK_TEST_TIMEOUT_MS,
+		FALLBACK_SDK_TEST_TIMEOUT_MS,
 	);
 
 	it(
@@ -1721,6 +1721,6 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 				await resumedSession.dispose();
 			}
 		},
-		RESUME_SDK_TEST_TIMEOUT_MS,
+		SLOW_SDK_TEST_TIMEOUT_MS,
 	);
 });
