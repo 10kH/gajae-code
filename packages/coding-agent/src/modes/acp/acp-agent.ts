@@ -1854,7 +1854,8 @@ export class AcpAgent implements Agent {
 				const task = deferredIsTerminal
 					? this.#handleSdkFrame(params.sessionId, record.adapter, deferredFrame)
 					: record.frameTail.then(
-							async () => await this.#handleSdkFrame(params.sessionId, record.adapter, deferredFrame),
+							async () =>
+								await this.#handleSdkFrame(params.sessionId, record.adapter, deferredFrame, deferredGeneration),
 						);
 				record.frameTail = task.catch(async error => {
 					if (deferredGeneration !== record.publicationGeneration) return;
@@ -2780,14 +2781,19 @@ export class AcpAgent implements Agent {
 			return;
 		}
 		const frameGeneration = record.publicationGeneration;
-		const task = record.frameTail.then(async () => await this.#handleSdkFrame(id, adapter, frame));
+		const task = record.frameTail.then(async () => await this.#handleSdkFrame(id, adapter, frame, frameGeneration));
 		record.frameTail = task.catch(async error => {
 			if (frameGeneration !== record.publicationGeneration) return;
 			await this.#failSession(id, adapter, this.#frameProcessingFailure(error));
 		});
 	}
 
-	async #handleSdkFrame(id: string, adapter: AcpSdkAdapter, frame: JsonObject): Promise<void> {
+	async #handleSdkFrame(
+		id: string,
+		adapter: AcpSdkAdapter,
+		frame: JsonObject,
+		ingressPublicationGeneration?: number,
+	): Promise<void> {
 		const record = this.#sessions.get(id);
 		if (!record || record.adapter !== adapter) return;
 		if ((frame.type === "hello" || frame.type === "server_hello") && typeof frame.connectionId === "string") {
@@ -2817,7 +2823,7 @@ export class AcpAgent implements Agent {
 		const received = receivedSdkEvent(frame);
 		if (!received) return;
 		const { event, wirePayload } = received;
-		let publicationGeneration = record.publicationGeneration;
+		let publicationGeneration = ingressPublicationGeneration ?? record.publicationGeneration;
 		const isTerminal = event.type === "agent_end" || event.type === "agent_failed";
 		if (event.type === "notice" && event.source === "autorouting" && typeof event.message === "string") {
 			record.routingInactiveNotice = event.message;
