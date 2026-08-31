@@ -160,6 +160,8 @@ type SessionRecord = {
 	reconnectUnsubscribe: () => void;
 	/** Per-session frame work queue; callbacks never race prompt ownership. */
 	frameTail: Promise<void>;
+	/** Unstreamed terminal text must publish before a successor can own the transcript. */
+	finalTextTail?: Promise<void>;
 	/** Advances when an owned terminal retires all earlier frame publications. */
 	publicationGeneration: number;
 	/** Monotonic at WebSocket ingress, before queued work begins. */
@@ -1595,6 +1597,8 @@ export class AcpAgent implements Agent {
 				"conflict",
 				"ACP session is still reconciling a previous prompt acknowledgement.",
 			);
+		if (record.finalTextTail)
+			throw new AcpSdkAdapterError("conflict", "ACP session is still publishing the previous prompt's final text.");
 
 		const payload = acpPromptPayload(params.prompt);
 		const skillInvocation = acpSkillInvocation(params.prompt);
@@ -2907,23 +2911,24 @@ export class AcpAgent implements Agent {
 			if (promptOwner) promptOwner.messageProgress = undefined;
 			else record.sessionMessageProgress = undefined;
 		}
-		if (isTerminal) this.#scheduleTerminalUpdates(id, adapter, publicationGeneration, event, promptOwner);
+		if (isTerminal) this.#scheduleTerminalUpdates(id, record, adapter, publicationGeneration, event, promptOwner);
 	}
 
 	#scheduleTerminalUpdates(
 		id: string,
+		record: SessionRecord,
 		adapter: AcpSdkAdapter,
 		publicationGeneration: number,
 		event: JsonObject,
 		promptOwner: PromptWaiter | undefined,
 	): void {
-		const task = (async () => {
-			if (event.type === "agent_failed") {
-				await this.#publishPromptPhaseIdle(id, adapter);
-				return;
-			}
-			const finalText = typeof event.finalText === "string" ? event.finalText : "";
-			if (promptOwner && finalText) {
+		if (event.type === "agent_failed") {
+			void this.#publishPromptPhaseIdle(id, adapter);
+			return;
+		}
+		const finalText = typeof event.finalText === "string" ? event.finalText : "";
+		if (promptOwner && finalText) {
+			const finalTextTask = (async () => {
 				const resolution = resolveAcpFinalText(promptOwner.emittedAssistantText, finalText);
 				if (resolution.kind === "emit") {
 					promptOwner.emittedAssistantText += resolution.text;
@@ -2949,10 +2954,18 @@ export class AcpAgent implements Agent {
 						finalLength: resolution.final.text.length,
 					});
 				}
-			}
-			await this.#emitEndOfTurnUpdates(id, adapter, publicationGeneration);
-		})();
-		void task.catch(error => {
+			})();
+			let finalTextTail: Promise<void>;
+			finalTextTail = finalTextTask
+				.catch(error => {
+					logger.warn("acp_terminal_update_failed", { sessionId: id, error: String(error) });
+				})
+				.finally(() => {
+					if (record.finalTextTail === finalTextTail) record.finalTextTail = undefined;
+				});
+			record.finalTextTail = finalTextTail;
+		}
+		void this.#emitEndOfTurnUpdates(id, adapter, publicationGeneration).catch(error => {
 			logger.warn("acp_terminal_update_failed", { sessionId: id, error: String(error) });
 		});
 	}

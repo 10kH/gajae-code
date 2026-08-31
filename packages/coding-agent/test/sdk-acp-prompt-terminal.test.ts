@@ -765,6 +765,9 @@ test("ACP terminal settlement does not await final-text delivery", async () => {
 					update.update.content.text === "detached final report",
 			),
 		).toBe(false);
+		await expect(prompt(fixture, "successor blocked by predecessor final text")).rejects.toMatchObject({
+			code: "conflict",
+		});
 		fixture.releaseAgentMessageUpdate();
 		await waitFor(
 			() =>
@@ -776,6 +779,9 @@ test("ACP terminal settlement does not await final-text delivery", async () => {
 				),
 			"detached final-text delivery",
 		);
+		const { pending: successor } = await promptWhenDelivered(fixture, "successor after final-text delivery", 2);
+		fixture.sendStopped("end_turn");
+		expect(await bounded(successor, "successor after final-text delivery")).toEqual({ stopReason: "end_turn" });
 	} finally {
 		fixture.releaseAgentMessageUpdate();
 		fixture.dispose();
