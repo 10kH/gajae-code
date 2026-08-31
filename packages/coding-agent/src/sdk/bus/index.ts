@@ -4499,12 +4499,14 @@ export function createNotificationsExtension(
 
 	async function startSession(ctx: ExtensionContext): Promise<SessionStartResult> {
 		const id = sessionId(ctx);
-		const lifecycleRequestId = safeLifecycleRequestId(process.env.GJC_LIFECYCLE_REQUEST_ID);
 		const { settings, cfg, settingsAvailable } = resolveSettings(options.settings);
 		const notificationsEnabledForSession = controller.query(ctx).genericSessionEnabled;
 		const sdkEnabledForSession =
 			(options.sdkHostModeSupported ?? true) && shouldHostSdk(settings, isNotificationEligibleContext(ctx));
 		const lifecycleRequired = lifecycleStartupCapability !== undefined;
+		const lifecycleRequestId = lifecycleRequired
+			? safeLifecycleRequestId(lifecycleStartupCapability.lifecycleRequestId)
+			: safeLifecycleRequestId(process.env.GJC_LIFECYCLE_REQUEST_ID);
 		/** The broker-issued readiness intent for this exact lifecycle-managed session. */
 		const lifecycleReadiness = lifecycleStartupCapability?.readiness ?? "immediate";
 		const failLifecycleStartup = (
@@ -7769,6 +7771,8 @@ export function createNotificationsExtension(
 			}
 			const agentDir = lifecycleAgentDir ?? settings?.getAgentDir?.();
 			if (lifecycleRequired && !agentDir) throw new Error("Lifecycle SDK host requires an agent directory.");
+			if (lifecycleRequired && !lifecycleRequestId)
+				throw new Error("Lifecycle SDK host requires a capability-bound request identity.");
 
 			if (agentDir) {
 				try {

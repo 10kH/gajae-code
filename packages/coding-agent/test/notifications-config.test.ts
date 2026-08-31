@@ -1987,7 +1987,7 @@ describe("notifications config", () => {
 			let notify: { handler(args: string, ctx: ExtensionCommandContext): Promise<void> | void } | undefined;
 			let providerReady = false;
 			const rollback = new SdkStartupRollbackTracker();
-			const capability = new SdkStartupCapability(rollback);
+			const capability = new SdkStartupCapability(rollback, "immediate", "notifications-config-marker");
 			const api = {
 				on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
 					handlers.set(event, handler);

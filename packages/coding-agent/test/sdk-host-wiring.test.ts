@@ -539,7 +539,7 @@ test("lifecycle teardown swallows dual owner failures without surfacing an exten
 	dirs.push(cwd);
 	const sessionId = `cleanup-proof-${Date.now()}`;
 	const tracker = new SdkStartupRollbackTracker();
-	const capability = new SdkStartupCapability(tracker);
+	const capability = new SdkStartupCapability(tracker, "immediate", "cleanup-proof-marker");
 	const stop = spyOn(SessionSdkHost.prototype, "stop").mockRejectedValueOnce(new Error("host stop failed"));
 	const nativeStop = (NotificationServer.prototype as unknown as { stopAndWait: () => Promise<void> }).stopAndWait;
 	(NotificationServer.prototype as unknown as { stopAndWait: () => Promise<void> }).stopAndWait = async () => {
@@ -622,7 +622,7 @@ test("lifecycle cleanup fences same-id startup and preserves proven owner releas
 	dirs.push(cwd);
 	const sessionId = `cleanup-retry-${Date.now()}`;
 	const tracker = new SdkStartupRollbackTracker();
-	const capability = new SdkStartupCapability(tracker);
+	const capability = new SdkStartupCapability(tracker, "immediate", "cleanup-retry-marker");
 	const hostStop = spyOn(SessionSdkHost.prototype, "stop");
 	const serverStart = spyOn(NotificationServer.prototype, "start");
 	const nativeStop = (NotificationServer.prototype as unknown as { stopAndWait: () => Promise<void> }).stopAndWait;
@@ -695,7 +695,8 @@ test("a blocked Telegram ownership race preserves the canonical endpoint and wit
 			return typeof value === "function" ? value.bind(target) : value;
 		},
 	}) as Settings;
-	const capability = new SdkStartupCapability(new SdkStartupRollbackTracker());
+	const lifecycleRequestId = "telegram-sibling-capability-marker";
+	const capability = new SdkStartupCapability(new SdkStartupRollbackTracker(), "immediate", lifecycleRequestId);
 	const sessionContext = context(cwd, sessionId);
 	const handlers = start(
 		sessionContext,
@@ -709,7 +710,14 @@ test("a blocked Telegram ownership race preserves the canonical endpoint and wit
 		undefined,
 		async () => "attached",
 	);
-	await handlers.get("session_start")!({ type: "session_start" }, sessionContext);
+	const previousLifecycleRequestId = process.env.GJC_LIFECYCLE_REQUEST_ID;
+	process.env.GJC_LIFECYCLE_REQUEST_ID = "ambient-marker-must-not-win";
+	try {
+		await handlers.get("session_start")!({ type: "session_start" }, sessionContext);
+	} finally {
+		if (previousLifecycleRequestId === undefined) delete process.env.GJC_LIFECYCLE_REQUEST_ID;
+		else process.env.GJC_LIFECYCLE_REQUEST_ID = previousLifecycleRequestId;
+	}
 	await expect(capability.promise).resolves.toEqual({ status: "started" });
 	const defaultEndpoint = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 	const chatStateRoot = path.join(cwd, ".gjc", "state", "chat");
@@ -727,9 +735,16 @@ test("a blocked Telegram ownership race preserves the canonical endpoint and wit
 			sessionId,
 			locator: { cwd: path.resolve(cwd), worktreeRoot: null, stateRoot },
 			endpointMtimeMs: fs.statSync(defaultEndpoint).mtimeMs,
+			lifecycleRequestId,
 		}),
 	);
 	await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
+	const stoppedIndex = await new SessionIndex(agentDir).open();
+	await stoppedIndex.refresh();
+	expect(stoppedIndex.listSessions().sessions.find(session => session.sessionId === sessionId)).toMatchObject({
+		lifecycleRequestId,
+		terminal: true,
+	});
 }, 60_000);
 
 test("production SDK host starts exactly one instrumented server (no duplicate auto-host)", async () => {
@@ -758,7 +773,7 @@ test("lifecycle session shutdown disposes the exact endpoint once", async () => 
 	dirs.push(cwd);
 	const sessionId = `cleanup-once-${Date.now()}`;
 	const tracker = new SdkStartupRollbackTracker();
-	const capability = new SdkStartupCapability(tracker);
+	const capability = new SdkStartupCapability(tracker, "immediate", "cleanup-once-marker");
 	const stop = spyOn(SessionSdkHost.prototype, "stop");
 	try {
 		const sessionContext = context(cwd, sessionId);
@@ -801,7 +816,7 @@ test("lifecycle startup settles failure when native callback registration throws
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prestart-failure-"));
 	dirs.push(cwd);
 	const sessionId = "prestart-failure";
-	const capability = new SdkStartupCapability();
+	const capability = new SdkStartupCapability(undefined, "immediate", "prestart-failure-marker");
 	const hook = spyOn(NotificationServer.prototype, "onSdkFrame").mockImplementation(() => {
 		throw new Error("token=prestart-secret");
 	});
@@ -908,7 +923,7 @@ test("session_start swallows startup plus owner-release failure without surfacin
 test("lifecycle startup reports an actionable error when native capability registration is missing", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-missing-capability-callback-"));
 	dirs.push(cwd);
-	const capability = new SdkStartupCapability();
+	const capability = new SdkStartupCapability(undefined, "immediate", "missing-capability-marker");
 	const prototype = NotificationServer.prototype as unknown as { onNegotiatedCapabilities?: unknown };
 	const original = prototype.onNegotiatedCapabilities;
 	try {
@@ -935,7 +950,7 @@ test("lifecycle startup reports an actionable error when native capability regis
 test("lifecycle startup settles native capability incompatibility before constructing the host", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-native-incompatible-"));
 	dirs.push(cwd);
-	const capability = new SdkStartupCapability();
+	const capability = new SdkStartupCapability(undefined, "immediate", "native-incompatible-marker");
 	const original = (NotificationServer.prototype as unknown as { retireIfUnclaimed?: unknown }).retireIfUnclaimed;
 	try {
 		(NotificationServer.prototype as unknown as { retireIfUnclaimed?: unknown }).retireIfUnclaimed = undefined;
@@ -4330,7 +4345,7 @@ for (const eventType of ["session_switch", "session_branch"] as const) {
 		// throws the retained-retry AggregateError.
 		const stop = spyOn(SessionSdkHost.prototype, "stop").mockRejectedValueOnce(new Error("host stop failed"));
 		try {
-			const startupCapability = new SdkStartupCapability();
+			const startupCapability = new SdkStartupCapability(undefined, "immediate", "rotation-failure-marker");
 			const handlers = start(ctx, undefined, () => {}, false, new Map(), {
 				startupCapability,
 				lifecycleRequired: true,

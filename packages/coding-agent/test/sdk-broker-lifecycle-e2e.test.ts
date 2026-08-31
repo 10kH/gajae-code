@@ -31,7 +31,7 @@ import {
 } from "../src/sdk/broker/lifecycle";
 import { parseLifecycleJson } from "../src/sdk/broker/lifecycle-codec";
 import { LifecycleLedger } from "../src/sdk/broker/lifecycle-ledger";
-import { SessionIndex } from "../src/sdk/broker/session-index";
+import { SessionIndex, type SessionIndexEvent } from "../src/sdk/broker/session-index";
 import { runSdkSessionCli } from "../src/sdk/cli";
 import { SdkClient } from "../src/sdk/client";
 import { readSdkBrokerDiscovery } from "../src/sdk/client/discovery";
@@ -3201,6 +3201,50 @@ test("broker fences ambiguous state roots from checkpoint, endpoint, and resume 
 				endpoint: { token: "current-token" },
 			},
 		});
+
+		const originalHandleRequest = broker.handleRequest.bind(broker);
+		let racingOwner: SessionIndexEvent | undefined;
+		broker.handleRequest = async (operation, input, idempotencyKey) => {
+			const response = await originalHandleRequest(operation, input, idempotencyKey);
+			if (operation === "session.get_endpoint" && input.sessionId === sessionId && racingOwner === undefined) {
+				racingOwner = await broker.index.append({
+					type: "host_registered",
+					sessionId,
+					locator: { cwd: root, worktreeRoot: null, stateRoot: alternateStateRoot },
+					endpointGeneration: alternate.endpointGeneration,
+					pid: process.pid,
+					endpointMtimeMs: 1,
+				});
+			}
+			return response;
+		};
+		expect(
+			await broker.handleRequest(
+				"session.resume",
+				{ cwd: root, stateRoot, sessionId, sessionPath },
+				"racing-owner-resume",
+			),
+		).toEqual({
+			ok: false,
+			error: {
+				code: "endpoint_stale",
+				message: "Session authority became ambiguous while it was being verified.",
+			},
+		});
+		broker.handleRequest = originalHandleRequest;
+		if (!racingOwner) throw new Error("Expected the competing live owner to be registered.");
+		await broker.index.append({
+			type: "host_unregistered",
+			sessionId,
+			locator: racingOwner.locator,
+			endpointGeneration: racingOwner.endpointGeneration,
+			pid: racingOwner.pid,
+			...(racingOwner.processIncarnation === undefined
+				? {}
+				: { processIncarnation: racingOwner.processIncarnation }),
+			...(racingOwner.hostIncarnation === undefined ? {} : { hostIncarnation: racingOwner.hostIncarnation }),
+		});
+
 		const replayAlternate = await broker.index.append({
 			type: "host_registered",
 			sessionId,
@@ -3672,6 +3716,51 @@ test("broker atomically reuses the indexed live owner for distinct resume keys",
 		await fs.rm(root, { recursive: true, force: true });
 	}
 });
+test("session.create rejects a forged effective host incarnation during readiness", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-forged-host-incarnation-"));
+	const workspace = path.join(root, "workspace");
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(workspace, ".gjc", "state");
+	const broker = new Broker({ agentDir });
+	try {
+		await fs.mkdir(workspace, { recursive: true });
+		await broker.start();
+		const index = await new SessionIndex(agentDir).open();
+		const forgeOwner = (async () => {
+			const row = await waitFor(async () => {
+				await index.refresh();
+				return index
+					.listSessionIdentities()
+					.find(session => session.endpointGeneration > 0 && session.lifecycleRequestId !== undefined);
+			}, "lifecycle host registration");
+			const actualIncarnation = row.hostIncarnation ?? row.processIncarnation;
+			if (!actualIncarnation) throw new Error("Expected lifecycle host incarnation.");
+			const forgedIncarnation = `${actualIncarnation}:forged`;
+			await index.append({
+				type: "host_registered",
+				sessionId: row.sessionId,
+				locator: row.locator,
+				endpointGeneration: row.endpointGeneration,
+				pid: row.pid,
+				endpointMtimeMs: row.endpointMtimeMs,
+				...(row.endpointFileId === undefined ? {} : { endpointFileId: row.endpointFileId }),
+				lifecycleRequestId: row.lifecycleRequestId,
+				processIncarnation: actualIncarnation,
+				hostIncarnation: forgedIncarnation,
+			});
+		})();
+		const response = await broker.handleRequest(
+			"session.create",
+			{ cwd: workspace, stateRoot, readinessTimeoutMs: 7_000 },
+			"forged-host-incarnation",
+		);
+		await forgeOwner;
+		expect(response).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+	} finally {
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 20_000);
 test("broker never signals a PID reused after its lifecycle marker was written", async () => {
 	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-reused-"));
 	const stateRoot = path.join(agentDir, "state");

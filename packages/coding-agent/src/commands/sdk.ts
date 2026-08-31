@@ -583,6 +583,7 @@ export async function runSessionHost(
 				...(mcpStartupTimeoutMs !== undefined ? { mcpStartupTimeoutMs } : {}),
 				...(request.readiness ? { readiness: request.readiness } : {}),
 				...(request.modelId ? { modelId: request.modelId } : {}),
+				lifecycleRequestId: effectMarker,
 			});
 		} catch (error) {
 			throw await registrationFailure(error);

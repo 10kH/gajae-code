@@ -66,7 +66,7 @@ import {
 	sanitizeSdkStartupMessage,
 } from "../startup-capability";
 import type { Broker, BrokerCleanupEvidence, BrokerCleanupIdentity, BrokerResponse } from "./broker";
-import { readEndpointFile } from "./endpoint-authority";
+import { matchesIndexedEndpointFile, readEndpointFile } from "./endpoint-authority";
 import { decodeLifecycleUtf8, parseLifecycleJson } from "./lifecycle-codec";
 import type {
 	LifecycleCleanupProof,
@@ -740,10 +740,13 @@ function lifecycleWorktreeTarget(input: Input): SessionLifecycleWorktreeTarget |
 }
 
 type LiveResumeRecord = {
+	sessionId: string;
 	locator: SessionLocatorV2;
 	endpointGeneration: number;
 	pid: number;
 	endpointMtimeMs?: number;
+	processIncarnation?: string;
+	hostIncarnation?: string;
 	live: boolean;
 	ambiguous: boolean;
 };
@@ -784,8 +787,22 @@ function sameLiveResumeRecord(expected: LiveResumeRecord, current: LiveResumeRec
 		current.endpointGeneration === expected.endpointGeneration &&
 		current.pid === expected.pid &&
 		current.endpointMtimeMs === expected.endpointMtimeMs &&
+		(current.hostIncarnation ?? current.processIncarnation) ===
+			(expected.hostIncarnation ?? expected.processIncarnation) &&
 		sameResumeLocator(current, expected.locator.cwd, expected.locator.stateRoot)
 	);
+}
+
+function liveResumeAuthority(
+	sessions: readonly LiveResumeRecord[],
+	sessionId: string,
+): { kind: "none" } | { kind: "ambiguous" } | { kind: "live"; record: LiveResumeRecord } {
+	const indexedCandidates = sessions.filter(session => session.sessionId === sessionId);
+	if (indexedCandidates.some(session => !isSessionAuthorityEligible(session))) return { kind: "ambiguous" };
+	const liveCandidates = indexedCandidates.filter(session => session.live);
+	if (liveCandidates.length > 1) return { kind: "ambiguous" };
+	const record = liveCandidates[0];
+	return record ? { kind: "live", record } : { kind: "none" };
 }
 
 type ValidatedTranscript = {
@@ -919,10 +936,25 @@ async function validateLiveResumeScope(
 		sessionIdentity: session.identity,
 	};
 }
-async function reconcileReadyScope(broker: Broker, id: string, scope: string | undefined): Promise<void> {
+async function reconcileReadyScope(
+	broker: Broker,
+	id: string,
+	scope: string | undefined,
+	root: string,
+	expected: EffectMarker,
+): Promise<void> {
 	if (!scope) return;
 	await broker.index.refresh();
-	const record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
+	const record = broker.index
+		.listSessions()
+		.sessions.find(
+			session =>
+				session.sessionId === id &&
+				resolveEquivalentPath(session.locator.stateRoot) === resolveEquivalentPath(root) &&
+				session.pid === expected.pid &&
+				(session.hostIncarnation ?? session.processIncarnation) === expected.incarnation &&
+				session.lifecycleRequestId === expected.effectMarker,
+		);
 	if (!record) return;
 	const cwd = canonicalExistingPath(scope);
 	if (record.locator.cwd === cwd) return;
@@ -3938,16 +3970,24 @@ async function currentReadyAuthority(
 		// native-dead child; do not refuse a native-alive ready host for a stale live bit.
 		await broker.heartbeatSessions();
 		await broker.index.refresh();
-		const record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
+		const record = broker.index
+			.listSessions()
+			.sessions.find(
+				session =>
+					session.sessionId === id &&
+					session.pid === expected.pid &&
+					resolveEquivalentPath(session.locator.stateRoot) === resolveEquivalentPath(root) &&
+					(session.hostIncarnation ?? session.processIncarnation) === expected.incarnation &&
+					session.lifecycleRequestId === expected.effectMarker,
+			);
 		if (
 			!record ||
 			record.terminal ||
 			record.terminalUncertain ||
 			record.pid !== expected.pid ||
 			resolveEquivalentPath(record.locator.stateRoot) !== resolveEquivalentPath(root) ||
-			(record.endpointFileId !== undefined && record.endpointFileId !== `${endpointFile.dev}:${endpointFile.ino}`) ||
-			(record.processIncarnation !== undefined && record.processIncarnation !== expected.incarnation) ||
-			record.endpointMtimeMs !== endpointFile.mtimeMs ||
+			(record.hostIncarnation ?? record.processIncarnation) !== expected.incarnation ||
+			!matchesIndexedEndpointFile(endpointFile, record) ||
 			endpoint.pid !== expected.pid ||
 			endpoint.sessionId !== id ||
 			typeof endpoint.url !== "string" ||
@@ -3974,7 +4014,7 @@ async function currentReadyAuthority(
 function sameReadyAuthority(left: ReadyAuthority, right: ReadyAuthority): boolean {
 	return (
 		left.endpointSource === right.endpointSource &&
-		left.endpointMtimeMs === right.endpointMtimeMs &&
+		Math.abs(left.endpointMtimeMs - right.endpointMtimeMs) <= 0.001 &&
 		left.endpointFileId === right.endpointFileId &&
 		left.endpointGeneration === right.endpointGeneration
 	);
@@ -4808,13 +4848,15 @@ async function executeLifecycleResponse(
 	if (operation === "session.create" || operation === "session.fork" || operation === "session.resume") {
 		await broker.index.refresh();
 		await broker.heartbeatSessions();
+		await broker.index.refresh();
 		if (operation === "session.resume") {
 			const requestedSessionId = sessionId(input);
-			const existing = requestedSessionId
-				? broker.index.listSessions().sessions.find(session => session.sessionId === requestedSessionId)
-				: undefined;
-			if (existing && !isSessionAuthorityEligible(existing))
+			const authority = requestedSessionId
+				? liveResumeAuthority(broker.index.listSessions().sessions, requestedSessionId)
+				: { kind: "none" as const };
+			if (authority.kind === "ambiguous")
 				return fail("endpoint_stale", "Session authority is ambiguous and cannot be resumed safely.");
+			const existing = authority.kind === "live" ? authority.record : undefined;
 			if (existing?.live) {
 				const initialScope = await validateLiveResumeScope(broker, input, requestedSessionId!, existing);
 				if ("ok" in initialScope) return initialScope;
@@ -4831,16 +4873,17 @@ async function executeLifecycleResponse(
 						"live_session",
 						"Session is already live but its incarnation-bound endpoint is unavailable.",
 					);
-				await broker.index.refresh();
-				const current = broker.index
-					.listSessions()
-					.sessions.find(session => session.sessionId === requestedSessionId);
-				if (!current || !sameLiveResumeRecord(existing, current))
-					return fail("endpoint_stale", "Live session changed while its resume authority was being verified.");
-				const finalScope = await validateLiveResumeScope(broker, input, requestedSessionId!, current);
+				const finalScope = await validateLiveResumeScope(broker, input, requestedSessionId!, existing);
 				if ("ok" in finalScope) return finalScope;
 				if (!sameResumeSessionIdentity(initialScope, finalScope))
 					return fail("endpoint_stale", "Saved session changed while its resume authority was being verified.");
+				await broker.index.refresh();
+				const finalAuthority = liveResumeAuthority(broker.index.listSessions().sessions, requestedSessionId!);
+				if (finalAuthority.kind === "ambiguous")
+					return fail("endpoint_stale", "Session authority became ambiguous while it was being verified.");
+				const current = finalAuthority.kind === "live" ? finalAuthority.record : undefined;
+				if (!current || !sameLiveResumeRecord(existing, current))
+					return fail("endpoint_stale", "Live session changed while its resume authority was being verified.");
 				if (current.endpointMtimeMs === undefined)
 					return fail("endpoint_stale", "Live session endpoint authority is incomplete.");
 				return {
@@ -5175,7 +5218,7 @@ async function executeLifecycleResponse(
 									`Session ${launch.id} did not register an endpoint before the readiness timeout.`,
 								);
 		}
-		await reconcileReadyScope(broker, launch.id, launch.cwd);
+		await reconcileReadyScope(broker, launch.id, launch.cwd, launch.root, spawnedAuthority);
 		const verified = await currentReadyAuthority(broker, launch.id, launch.root, spawnedAuthority);
 		if (!verified || !sameReadyAuthority(readiness.authority, verified)) {
 			const exited =

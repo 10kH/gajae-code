@@ -3281,6 +3281,7 @@ describe("SessionSdkSessionRuntime", () => {
 			},
 		} as any;
 		const sessionId = "broker-recovery";
+		const endpointUrl = "ws://127.0.0.1:1";
 		createSdkSessionRuntimeExtension(api, {
 			agentDir,
 			createTransport: async ({ stateRoot, token }) => ({
@@ -3292,8 +3293,8 @@ describe("SessionSdkSessionRuntime", () => {
 				start: async () => {
 					const endpoint = path.join(stateRoot, "sdk", `${sessionId}.json`);
 					await mkdir(path.dirname(endpoint), { recursive: true });
-					await writeFile(endpoint, JSON.stringify({ sessionId, token, pid: process.pid }));
-					return { url: "ws://127.0.0.1:1" };
+					await writeFile(endpoint, JSON.stringify({ sessionId, token, pid: process.pid, url: endpointUrl }));
+					return { url: endpointUrl };
 				},
 				stop: async () => {},
 			}),
@@ -3350,6 +3351,7 @@ describe("SessionSdkSessionRuntime", () => {
 		createSdkSessionRuntimeExtension(api, {
 			agentDir,
 			brokerRegistrationRequired: true,
+			lifecycleRequestId: "broker-required-marker",
 			createTransport: async ({ sessionId, stateRoot, token }) => ({
 				sessionId,
 				stateRoot,
