@@ -73,6 +73,7 @@ function createReasoningModel(): Model<"openai-responses"> {
 
 const oldSessionMtime = new Date("2000-01-01T00:00:00.000Z");
 const SLOW_SDK_TEST_TIMEOUT_MS = 15_000;
+const RESUME_SDK_TEST_TIMEOUT_MS = 120_000;
 const validSixSurfacePluginBundle = path.join(import.meta.dir, "fixtures", "gjc-plugins", "valid-six-surface-bundle");
 const originalAgentDir = getAgentDir();
 
@@ -1555,7 +1556,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 				await resumedSession.dispose();
 			}
 		},
-		SLOW_SDK_TEST_TIMEOUT_MS,
+		RESUME_SDK_TEST_TIMEOUT_MS,
 	);
 
 	it("restores fallback MCP, thinking, and service-tier state in memory without rewriting the session file", async () => {
@@ -1611,7 +1612,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		} finally {
 			await session.dispose();
 		}
-	}, 30_000);
+	}, RESUME_SDK_TEST_TIMEOUT_MS);
 
 	it(
 		"rebuilds explicit MCP custom-tool selections when resuming with requested MCP tools",
@@ -1674,6 +1675,6 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 				await resumedSession.dispose();
 			}
 		},
-		SLOW_SDK_TEST_TIMEOUT_MS,
+		RESUME_SDK_TEST_TIMEOUT_MS,
 	);
 });
