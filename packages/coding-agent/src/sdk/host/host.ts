@@ -637,7 +637,11 @@ export class SessionSdkHost {
 	}
 	#observeRequest(kind: "control" | "query", connectionId: string, frame: SdkFrame): void {
 		try {
-			this.#options.onRequest?.(kind, connectionId, redactObservedRequestContent(redactBrokerRuntimeCapabilities(frame)));
+			this.#options.onRequest?.(
+				kind,
+				connectionId,
+				redactObservedRequestContent(redactBrokerRuntimeCapabilities(frame)),
+			);
 		} catch {
 			// Diagnostic observers must not change request handling.
 		}
