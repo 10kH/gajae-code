@@ -9,6 +9,8 @@
 
 ### Fixed
 
+- SDK lifecycle readiness now uses the same descriptor-bound endpoint identity tolerance as broker endpoint reads and selects owners by scoped state root, process incarnation, and lifecycle marker instead of bare session ID. This restores default source-host startup, shipped SDK lifecycle topology, shared-agent saved-source isolation, cold resume/fork cleanup, local SDK-only broker recovery, and generated operation-matrix closure after the master-mode merge. (#5114)
+
 - Coordinator event watchers now advertise the exact supported event-kind enum, while outbox entity validation and durable WAL/active-turn cleanup reuse their existing authority helpers instead of leaving those checks disconnected. (#5115)
 - Post-install update verification now preserves a bounded, secret-redacted stderr/stdout cause when the newly installed `gjc --version` exits unsuccessfully, so runtime guards such as Bun version incompatibilities remain actionable instead of collapsing to a generic verification failure. (#5108)
 - Concurrent coordinator mutations sharing one idempotency key now join the same in-process flight before taking the durable key lock, so a slow accepted prompt cannot make its retry time out as unavailable. Conflicting in-flight requests still fail closed, completed responses remain durably replayable, and different keys remain isolated. (#5110)

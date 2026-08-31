@@ -33,7 +33,7 @@ import {
 	readBrokerDiscovery,
 	redactBrokerDiscovery,
 } from "./discovery";
-import { readEndpointFile } from "./endpoint-authority";
+import { matchesIndexedEndpointFile, readEndpointFile } from "./endpoint-authority";
 import { deriveIdempotencyIdentity, getBrokerIdentityKey } from "./identity";
 import {
 	canonicalDeleteLocatorPath,
@@ -2868,9 +2868,7 @@ export class Broker {
 				endpoint.sessionId !== record.sessionId ||
 				endpoint.pid !== record.pid ||
 				endpoint.stale === true ||
-				record.endpointMtimeMs === undefined ||
-				Math.abs(file.mtimeMs - record.endpointMtimeMs) > 0.001 ||
-				(record.endpointFileId !== undefined && `${file.dev}:${file.ino}` !== record.endpointFileId)
+				!matchesIndexedEndpointFile(file, record)
 			)
 				return error("endpoint_stale", "session endpoint is stale");
 			await this.index.refresh();

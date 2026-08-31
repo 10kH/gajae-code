@@ -66,7 +66,7 @@ import {
 	sanitizeSdkStartupMessage,
 } from "../startup-capability";
 import type { Broker, BrokerCleanupEvidence, BrokerCleanupIdentity, BrokerResponse } from "./broker";
-import { readEndpointFile } from "./endpoint-authority";
+import { matchesIndexedEndpointFile, readEndpointFile } from "./endpoint-authority";
 import { decodeLifecycleUtf8, parseLifecycleJson } from "./lifecycle-codec";
 import type {
 	LifecycleCleanupProof,
@@ -919,10 +919,25 @@ async function validateLiveResumeScope(
 		sessionIdentity: session.identity,
 	};
 }
-async function reconcileReadyScope(broker: Broker, id: string, scope: string | undefined): Promise<void> {
+async function reconcileReadyScope(
+	broker: Broker,
+	id: string,
+	scope: string | undefined,
+	root: string,
+	expected: EffectMarker,
+): Promise<void> {
 	if (!scope) return;
 	await broker.index.refresh();
-	const record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
+	const record = broker.index
+		.listSessions()
+		.sessions.find(
+			session =>
+				session.sessionId === id &&
+				resolveEquivalentPath(session.locator.stateRoot) === resolveEquivalentPath(root) &&
+				session.pid === expected.pid &&
+				(session.processIncarnation === undefined || session.processIncarnation === expected.incarnation) &&
+				session.lifecycleRequestId === expected.effectMarker,
+		);
 	if (!record) return;
 	const cwd = canonicalExistingPath(scope);
 	if (record.locator.cwd === cwd) return;
@@ -3938,16 +3953,24 @@ async function currentReadyAuthority(
 		// native-dead child; do not refuse a native-alive ready host for a stale live bit.
 		await broker.heartbeatSessions();
 		await broker.index.refresh();
-		const record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
+		const record = broker.index
+			.listSessions()
+			.sessions.find(
+				session =>
+					session.sessionId === id &&
+					session.pid === expected.pid &&
+					resolveEquivalentPath(session.locator.stateRoot) === resolveEquivalentPath(root) &&
+					(session.processIncarnation === undefined || session.processIncarnation === expected.incarnation) &&
+					session.lifecycleRequestId === expected.effectMarker,
+			);
 		if (
 			!record ||
 			record.terminal ||
 			record.terminalUncertain ||
 			record.pid !== expected.pid ||
 			resolveEquivalentPath(record.locator.stateRoot) !== resolveEquivalentPath(root) ||
-			(record.endpointFileId !== undefined && record.endpointFileId !== `${endpointFile.dev}:${endpointFile.ino}`) ||
 			(record.processIncarnation !== undefined && record.processIncarnation !== expected.incarnation) ||
-			record.endpointMtimeMs !== endpointFile.mtimeMs ||
+			!matchesIndexedEndpointFile(endpointFile, record) ||
 			endpoint.pid !== expected.pid ||
 			endpoint.sessionId !== id ||
 			typeof endpoint.url !== "string" ||
@@ -3974,7 +3997,7 @@ async function currentReadyAuthority(
 function sameReadyAuthority(left: ReadyAuthority, right: ReadyAuthority): boolean {
 	return (
 		left.endpointSource === right.endpointSource &&
-		left.endpointMtimeMs === right.endpointMtimeMs &&
+		Math.abs(left.endpointMtimeMs - right.endpointMtimeMs) <= 0.001 &&
 		left.endpointFileId === right.endpointFileId &&
 		left.endpointGeneration === right.endpointGeneration
 	);
@@ -4808,13 +4831,18 @@ async function executeLifecycleResponse(
 	if (operation === "session.create" || operation === "session.fork" || operation === "session.resume") {
 		await broker.index.refresh();
 		await broker.heartbeatSessions();
+		await broker.index.refresh();
 		if (operation === "session.resume") {
 			const requestedSessionId = sessionId(input);
-			const existing = requestedSessionId
-				? broker.index.listSessions().sessions.find(session => session.sessionId === requestedSessionId)
-				: undefined;
-			if (existing && !isSessionAuthorityEligible(existing))
+			const indexedCandidates = requestedSessionId
+				? broker.index.listSessions().sessions.filter(session => session.sessionId === requestedSessionId)
+				: [];
+			if (indexedCandidates.some(session => !isSessionAuthorityEligible(session)))
 				return fail("endpoint_stale", "Session authority is ambiguous and cannot be resumed safely.");
+			const existingCandidates = indexedCandidates.filter(session => session.live);
+			if (existingCandidates.length > 1)
+				return fail("endpoint_stale", "Multiple live session owners claim this session id.");
+			const existing = existingCandidates[0];
 			if (existing?.live) {
 				const initialScope = await validateLiveResumeScope(broker, input, requestedSessionId!, existing);
 				if ("ok" in initialScope) return initialScope;
@@ -5175,7 +5203,7 @@ async function executeLifecycleResponse(
 									`Session ${launch.id} did not register an endpoint before the readiness timeout.`,
 								);
 		}
-		await reconcileReadyScope(broker, launch.id, launch.cwd);
+		await reconcileReadyScope(broker, launch.id, launch.cwd, launch.root, spawnedAuthority);
 		const verified = await currentReadyAuthority(broker, launch.id, launch.root, spawnedAuthority);
 		if (!verified || !sameReadyAuthority(readiness.authority, verified)) {
 			const exited =
