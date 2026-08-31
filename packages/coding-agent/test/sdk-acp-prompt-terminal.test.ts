@@ -435,6 +435,102 @@ test("ACP prompt rejects prompt_deadline_exceeded terminal outcomes with their c
 	}
 });
 
+test("ACP preserves cancellation when runtime abort failure precedes agent_end", async () => {
+	const fixture = await createFixture();
+	try {
+		const pending = prompt(fixture, "runtime cancellation");
+		await bounded(fixture.promptDelivered, "prompt delivery");
+		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "cancel acknowledgement");
+		fixture.sendTerminal({
+			type: "agent_failed",
+			sessionId: "prompt-terminal-session",
+			commandId: "prompt-terminal-command",
+			turnId: "prompt-terminal-turn",
+			error: { code: "aborted", message: "Agent run failed." },
+		});
+		fixture.sendStopped("cancelled");
+		expect(await bounded(pending, "runtime cancellation settlement")).toEqual({ stopReason: "cancelled" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP malformed correlated agent_failed still releases the running phase", async () => {
+	const fixture = await createFixture();
+	try {
+		const idleBefore = idlePhaseUpdates(fixture.updates);
+		const pending = prompt(fixture, "malformed failure phase");
+		await bounded(fixture.promptDelivered, "prompt delivery");
+		fixture.sendTerminal({
+			type: "agent_failed",
+			sessionId: "prompt-terminal-session",
+			commandId: "prompt-terminal-command",
+			turnId: "prompt-terminal-turn",
+			error: { code: 503, message: "invalid diagnostic" },
+		});
+		await expect(bounded(pending, "malformed failure settlement")).rejects.toMatchObject({
+			code: "connection_closed",
+		});
+		await waitFor(() => idlePhaseUpdates(fixture.updates) > idleBefore, "malformed failure idle update");
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP preserves a failure-only prompt deadline classifier", async () => {
+	const fixture = await createFixture();
+	try {
+		const pending = prompt(fixture, "failure-only deadline");
+		await bounded(fixture.promptDelivered, "prompt delivery");
+		fixture.sendTerminal({
+			type: "agent_failed",
+			sessionId: "prompt-terminal-session",
+			commandId: "prompt-terminal-command",
+			turnId: "prompt-terminal-turn",
+			error: { code: "prompt_deadline_exceeded", message: "deadline diagnostic" },
+		});
+		await expect(bounded(pending, "failure-only deadline settlement")).rejects.toMatchObject({
+			code: "prompt_deadline_exceeded",
+		});
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP ignores a wrapped failure without a diagnostic instead of tearing down the session", async () => {
+	const fixture = await createFixture();
+	try {
+		const pending = prompt(fixture, "wrapped malformed failure");
+		await bounded(fixture.promptDelivered, "prompt delivery");
+		fixture.sendTerminal({
+			type: "event",
+			payload: {
+				event_type: "agent_failed",
+				event: {
+					type: "agent_failed",
+					sessionId: "prompt-terminal-session",
+					commandId: "prompt-terminal-command",
+					turnId: "prompt-terminal-turn",
+					outcome: {
+						kind: "failed",
+						code: "prompt_failed",
+						message: "wrapped failure",
+						provenance: "agent_failed",
+					},
+				},
+			},
+		});
+		await expect(bounded(pending, "wrapped malformed failure settlement")).rejects.toMatchObject({
+			code: "prompt_failed",
+		});
+		const next = prompt(fixture, "prompt after wrapped malformed failure");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(next, "prompt after wrapped malformed failure")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
 test("ACP rejects immediately when correlated agent_failed is the only terminal", async () => {
 	const fixture = await createFixture();
 	try {
@@ -481,9 +577,8 @@ test("ACP failure settlement cannot publish stale phase state over a replacement
 		const replacement = prompt(fixture, "replacement prompt");
 		// `prompt()` installs the successor waiter before its first session update.
 		// Keep the prior idle transport blocked across that admission boundary.
-		await Bun.sleep(10);
-		fixture.releaseIdleUpdate();
 		await waitFor(() => fixture.promptDeliveryCount() === 2, "replacement prompt delivery");
+		fixture.releaseIdleUpdate();
 		fixture.sendStopped("end_turn");
 		fixture.releaseWorkingUpdate();
 		expect(await bounded(replacement, "replacement terminal settlement")).toEqual({ stopReason: "end_turn" });
@@ -513,9 +608,8 @@ test("ACP reconciliation releases a successor whose delayed acknowledgement is i
 
 		const updatesAfterFailure = fixture.updates.length;
 		const replacement = prompt(fixture, "replacement with invalid acknowledgement");
-		await Bun.sleep(10);
-		fixture.releaseIdleUpdate();
 		await waitFor(() => fixture.promptDeliveryCount() === 2, "replacement prompt delivery");
+		fixture.releaseIdleUpdate();
 		await waitFor(
 			() =>
 				fixture.updates

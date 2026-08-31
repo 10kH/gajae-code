@@ -478,13 +478,20 @@ function terminalOutcome(event: JsonObject): SdkPromptTerminalOutcome | undefine
 	const outcome = object(event.outcome);
 	if (!outcome) {
 		const error = event.type === "agent_failed" ? object(event.error) : undefined;
-		if (typeof error?.code === "string" && typeof error.message === "string")
+		if (typeof error?.code === "string" && typeof error.message === "string") {
+			// The runtime emits this diagnostic immediately before its authoritative
+			// agent_end(cancelled). It is a cancellation boundary, not a provider
+			// failure, and must also settle when that trailing boundary is lost.
+			if (event.type === "agent_failed" && error.code === "aborted")
+				return { kind: "stopped", reason: "cancelled", provenance: "client_cancel" };
+			const deadline = error.code === "prompt_deadline_exceeded";
 			return {
 				kind: "failed",
-				code: "prompt_failed",
+				code: deadline ? "prompt_deadline_exceeded" : "prompt_failed",
 				message: `${error.code}: ${error.message}`,
-				provenance: "agent_failed",
+				provenance: deadline ? "deadline" : "agent_failed",
 			};
+		}
 		return undefined;
 	}
 	if (
@@ -2727,7 +2734,6 @@ export class AcpAgent implements Agent {
 					id,
 					activePrompt,
 					new AcpSdkAdapterError("connection_closed", `ACP prompt terminal was invalid: ${detail}`),
-					event.type !== "agent_failed",
 				);
 				return;
 			}
@@ -2784,7 +2790,9 @@ export class AcpAgent implements Agent {
 			},
 		};
 		const notifications = wirePayload
-			? mapAgentWireEventPayloadToAcpSessionUpdates(wirePayload as never, id, mapperOptions)
+			? event.type === "agent_failed" && !object(event.error)
+				? []
+				: mapAgentWireEventPayloadToAcpSessionUpdates(wirePayload as never, id, mapperOptions)
 			: event.type === "agent_failed" && object(event.error)
 				? mapAgentSessionEventToAcpSessionUpdates(event as unknown as AgentSessionEvent, id, mapperOptions)
 				: [];
