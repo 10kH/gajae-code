@@ -1369,9 +1369,7 @@ export class SelectorController {
 		const oauthProviders = getOAuthProviders();
 		await Promise.all(
 			oauthProviders.map(provider =>
-				this.ctx.session.modelRegistry
-					.getApiKeyForProvider(provider.id, this.ctx.session.credentialSessionId)
-					.catch(() => undefined),
+				this.ctx.session.modelRegistry.getApiKeyForProvider(provider.id, this.ctx.session.credentialSessionId),
 			),
 		);
 	}

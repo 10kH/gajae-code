@@ -207,6 +207,39 @@ describe("credential SQLite corruption classification", () => {
 });
 
 describe("credential corruption presentation", () => {
+	test("bare /logout maps known corruption but does not mask arbitrary refresh failures", async () => {
+		const errors: string[] = [];
+		const corruptionController = new SelectorController({
+			session: {
+				credentialSessionId: "credential-session",
+				modelRegistry: {
+					getApiKeyForProvider: async () => {
+						throw Object.assign(new Error("database disk image is malformed"), { code: "SQLITE_CORRUPT" });
+					},
+				},
+			},
+			showError: (message: string) => errors.push(message),
+		} as never);
+		await expect(corruptionController.showOAuthSelector("logout")).resolves.toBeUndefined();
+		expect(errors).toEqual([CREDENTIAL_STORE_UNREADABLE_MESSAGE]);
+
+		const arbitraryFailure = new Error("credential refresh transport failed");
+		const arbitraryController = new SelectorController({
+			session: {
+				credentialSessionId: "credential-session",
+				modelRegistry: {
+					getApiKeyForProvider: async () => {
+						throw arbitraryFailure;
+					},
+				},
+			},
+			showError: () => {
+				throw new Error("arbitrary failures must not be rendered as credential corruption");
+			},
+		} as never);
+		await expect(arbitraryController.showOAuthSelector("logout")).rejects.toBe(arbitraryFailure);
+	});
+
 	test("provider /login contains SQLITE_CORRUPT without closing or rewriting the credential store", async () => {
 		const root = await tempRoot("gjc-credential-login-");
 		const dbPath = path.join(root, "agent.db");
