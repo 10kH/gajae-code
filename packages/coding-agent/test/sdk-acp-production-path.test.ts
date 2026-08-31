@@ -605,7 +605,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 							ok: true,
 							result:
 								frame.operation === "turn.prompt"
-										? { ...currentPromptCorrelation(), accepted: true }
+									? { ...currentPromptCorrelation(), accepted: true }
 									: frame.operation === "skill.invoke"
 										? { commandId: "skill-command", turnId: "skill-turn", accepted: true }
 										: frame.operation === "turn.abort"
