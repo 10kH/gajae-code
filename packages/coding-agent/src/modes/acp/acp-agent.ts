@@ -2531,7 +2531,7 @@ export class AcpAgent implements Agent {
 		}
 		const event = receivedSdkEvent(frame)?.event;
 		if (event?.type === "agent_start") record.busy = true;
-		else if (event?.type === "agent_end") record.busy = false;
+		else if (event?.type === "agent_end" || event?.type === "agent_failed") record.busy = false;
 	}
 
 	#frameProcessingFailure(error: unknown): AcpSdkAdapterError {
@@ -2789,8 +2789,10 @@ export class AcpAgent implements Agent {
 				notification.update.content.type === "text"
 			)
 				promptOwner.emittedAssistantText += notification.update.content.text;
-			if (event.type === "agent_failed") void this.#publishPromptFailureUpdate(id, notification, adapter);
-			else await this.#publishSessionUpdate(id, notification, adapter);
+			// The prompt rejection carries the sanitized failure diagnostic. Publishing
+			// a second session update after settlement would be stale as soon as the client
+			// starts a replacement turn, and an in-flight transport write cannot be revoked.
+			if (event.type !== "agent_failed") await this.#publishSessionUpdate(id, notification, adapter);
 		}
 		if (toolCallId && event.type === "tool_execution_end") record.toolArgs.delete(toolCallId);
 		if (event.type === "agent_start") {
@@ -2847,9 +2849,9 @@ export class AcpAgent implements Agent {
 		// queries is what left a finished turn reported as running until the inactivity
 		// watchdog rescued it.
 		if (activePrompt) this.#settlePrompt(record, activePrompt);
-		// A failure terminal has no trustworthy end-of-turn usage or title. A later
-		// agent_end is suppressed by the settled-correlation tombstone above.
-		if (event.type === "agent_failed") void this.#publishPromptPhaseIdle(id, adapter);
+		// A failure terminal has no trustworthy end-of-turn usage or title. The rejected
+		// prompt response releases the client turn; publishing an uncorrelated phase update
+		// here could overwrite a replacement prompt after transport backpressure.
 		if (event.type === "agent_end") await this.#emitEndOfTurnUpdates(id, adapter);
 	}
 
@@ -2902,26 +2904,6 @@ export class AcpAgent implements Agent {
 			});
 		} catch {
 			// The client transport is gone; there is no phase left to restore.
-		}
-	}
-
-	/**
-	 * Publishes the sanitized failure diagnostic without retaining the inbound frame
-	 * queue or failing a replacement prompt when the client transport is backpressured.
-	 * The prompt rejection itself remains the authoritative terminal result.
-	 */
-	async #publishPromptFailureUpdate(
-		id: string,
-		notification: SessionNotification,
-		adapter: AcpSdkAdapter,
-	): Promise<void> {
-		const record = this.#sessions.get(id);
-		if (!record || record.adapter !== adapter) return;
-		try {
-			await this.#connection.sessionUpdate(notification);
-		} catch {
-			// Advisory failure metadata cannot invalidate an already-settled prompt or
-			// tear down a replacement turn that is using the same session transport.
 		}
 	}
 
