@@ -2898,26 +2898,25 @@ export class AcpAgent implements Agent {
 		const record = this.#sessions.get(id);
 		if (!record || record.adapter !== adapter || record.activePrompt) return;
 		try {
-			await this.#connection.sessionUpdate({
-				sessionId: id,
-				update: {
-					sessionUpdate: "session_info_update",
-					_meta: { gjcPhase: "idle", running: false, gjcRunning: false },
-				},
-			});
-			// A successor can start while the idle write is backpressured. Reconcile the
-			// observable phase after the write completes so the old terminal cannot remain
-			// the last session state for a newer active prompt.
-			const current = this.#sessions.get(id);
-			if (current?.adapter === adapter && current.activePrompt)
+			let observedPrompt: PromptWaiter | undefined;
+			for (;;) {
 				await this.#connection.sessionUpdate({
 					sessionId: id,
 					update: {
 						sessionUpdate: "session_info_update",
-						updatedAt: new Date().toISOString(),
-						_meta: { gjcPhase: "working", running: true, gjcRunning: true },
+						...(observedPrompt ? { updatedAt: new Date().toISOString() } : {}),
+						_meta: observedPrompt
+							? { gjcPhase: "working", running: true, gjcRunning: true }
+							: { gjcPhase: "idle", running: false, gjcRunning: false },
 					},
 				});
+				// A prompt may start or finish while any phase write is backpressured.
+				// Continue until the last published phase describes the current waiter.
+				const current = this.#sessions.get(id);
+				if (!current || current.adapter !== adapter) return;
+				if (current.activePrompt === observedPrompt) return;
+				observedPrompt = current.activePrompt;
+			}
 		} catch {
 			// The client transport is gone; there is no phase left to restore.
 		}
