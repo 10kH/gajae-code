@@ -31,7 +31,7 @@ import {
 } from "../src/sdk/broker/lifecycle";
 import { parseLifecycleJson } from "../src/sdk/broker/lifecycle-codec";
 import { LifecycleLedger } from "../src/sdk/broker/lifecycle-ledger";
-import { SessionIndex } from "../src/sdk/broker/session-index";
+import { SessionIndex, type SessionIndexEvent } from "../src/sdk/broker/session-index";
 import { runSdkSessionCli } from "../src/sdk/cli";
 import { SdkClient } from "../src/sdk/client";
 import { readSdkBrokerDiscovery } from "../src/sdk/client/discovery";
@@ -3203,7 +3203,7 @@ test("broker fences ambiguous state roots from checkpoint, endpoint, and resume 
 		});
 
 		const originalHandleRequest = broker.handleRequest.bind(broker);
-		let racingOwner: Awaited<ReturnType<typeof broker.index.append>> | undefined;
+		let racingOwner: SessionIndexEvent | undefined;
 		broker.handleRequest = async (operation, input, idempotencyKey) => {
 			const response = await originalHandleRequest(operation, input, idempotencyKey);
 			if (operation === "session.get_endpoint" && input.sessionId === sessionId && racingOwner === undefined) {
