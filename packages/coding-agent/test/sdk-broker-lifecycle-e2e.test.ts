@@ -3716,6 +3716,51 @@ test("broker atomically reuses the indexed live owner for distinct resume keys",
 		await fs.rm(root, { recursive: true, force: true });
 	}
 });
+test("session.create rejects a forged effective host incarnation during readiness", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-forged-host-incarnation-"));
+	const workspace = path.join(root, "workspace");
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(workspace, ".gjc", "state");
+	const broker = new Broker({ agentDir });
+	try {
+		await fs.mkdir(workspace, { recursive: true });
+		await broker.start();
+		const index = await new SessionIndex(agentDir).open();
+		const forgeOwner = (async () => {
+			const row = await waitFor(async () => {
+				await index.refresh();
+				return index
+					.listSessionIdentities()
+					.find(session => session.endpointGeneration > 0 && session.lifecycleRequestId !== undefined);
+			}, "lifecycle host registration");
+			const actualIncarnation = row.hostIncarnation ?? row.processIncarnation;
+			if (!actualIncarnation) throw new Error("Expected lifecycle host incarnation.");
+			const forgedIncarnation = `${actualIncarnation}:forged`;
+			await index.append({
+				type: "host_registered",
+				sessionId: row.sessionId,
+				locator: row.locator,
+				endpointGeneration: row.endpointGeneration,
+				pid: row.pid,
+				endpointMtimeMs: row.endpointMtimeMs,
+				...(row.endpointFileId === undefined ? {} : { endpointFileId: row.endpointFileId }),
+				lifecycleRequestId: row.lifecycleRequestId,
+				processIncarnation: actualIncarnation,
+				hostIncarnation: forgedIncarnation,
+			});
+		})();
+		const response = await broker.handleRequest(
+			"session.create",
+			{ cwd: workspace, stateRoot, readinessTimeoutMs: 7_000 },
+			"forged-host-incarnation",
+		);
+		await forgeOwner;
+		expect(response).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+	} finally {
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 20_000);
 test("broker never signals a PID reused after its lifecycle marker was written", async () => {
 	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-reused-"));
 	const stateRoot = path.join(agentDir, "state");

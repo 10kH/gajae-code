@@ -745,6 +745,8 @@ type LiveResumeRecord = {
 	endpointGeneration: number;
 	pid: number;
 	endpointMtimeMs?: number;
+	processIncarnation?: string;
+	hostIncarnation?: string;
 	live: boolean;
 	ambiguous: boolean;
 };
@@ -785,6 +787,8 @@ function sameLiveResumeRecord(expected: LiveResumeRecord, current: LiveResumeRec
 		current.endpointGeneration === expected.endpointGeneration &&
 		current.pid === expected.pid &&
 		current.endpointMtimeMs === expected.endpointMtimeMs &&
+		(current.hostIncarnation ?? current.processIncarnation) ===
+			(expected.hostIncarnation ?? expected.processIncarnation) &&
 		sameResumeLocator(current, expected.locator.cwd, expected.locator.stateRoot)
 	);
 }
@@ -948,7 +952,7 @@ async function reconcileReadyScope(
 				session.sessionId === id &&
 				resolveEquivalentPath(session.locator.stateRoot) === resolveEquivalentPath(root) &&
 				session.pid === expected.pid &&
-				(session.processIncarnation === undefined || session.processIncarnation === expected.incarnation) &&
+				(session.hostIncarnation ?? session.processIncarnation) === expected.incarnation &&
 				session.lifecycleRequestId === expected.effectMarker,
 		);
 	if (!record) return;
@@ -3973,7 +3977,7 @@ async function currentReadyAuthority(
 					session.sessionId === id &&
 					session.pid === expected.pid &&
 					resolveEquivalentPath(session.locator.stateRoot) === resolveEquivalentPath(root) &&
-					(session.processIncarnation === undefined || session.processIncarnation === expected.incarnation) &&
+					(session.hostIncarnation ?? session.processIncarnation) === expected.incarnation &&
 					session.lifecycleRequestId === expected.effectMarker,
 			);
 		if (
@@ -3982,7 +3986,7 @@ async function currentReadyAuthority(
 			record.terminalUncertain ||
 			record.pid !== expected.pid ||
 			resolveEquivalentPath(record.locator.stateRoot) !== resolveEquivalentPath(root) ||
-			(record.processIncarnation !== undefined && record.processIncarnation !== expected.incarnation) ||
+			(record.hostIncarnation ?? record.processIncarnation) !== expected.incarnation ||
 			!matchesIndexedEndpointFile(endpointFile, record) ||
 			endpoint.pid !== expected.pid ||
 			endpoint.sessionId !== id ||
@@ -4869,6 +4873,10 @@ async function executeLifecycleResponse(
 						"live_session",
 						"Session is already live but its incarnation-bound endpoint is unavailable.",
 					);
+				const finalScope = await validateLiveResumeScope(broker, input, requestedSessionId!, existing);
+				if ("ok" in finalScope) return finalScope;
+				if (!sameResumeSessionIdentity(initialScope, finalScope))
+					return fail("endpoint_stale", "Saved session changed while its resume authority was being verified.");
 				await broker.index.refresh();
 				const finalAuthority = liveResumeAuthority(broker.index.listSessions().sessions, requestedSessionId!);
 				if (finalAuthority.kind === "ambiguous")
@@ -4876,10 +4884,6 @@ async function executeLifecycleResponse(
 				const current = finalAuthority.kind === "live" ? finalAuthority.record : undefined;
 				if (!current || !sameLiveResumeRecord(existing, current))
 					return fail("endpoint_stale", "Live session changed while its resume authority was being verified.");
-				const finalScope = await validateLiveResumeScope(broker, input, requestedSessionId!, current);
-				if ("ok" in finalScope) return finalScope;
-				if (!sameResumeSessionIdentity(initialScope, finalScope))
-					return fail("endpoint_stale", "Saved session changed while its resume authority was being verified.");
 				if (current.endpointMtimeMs === undefined)
 					return fail("endpoint_stale", "Live session endpoint authority is incomplete.");
 				return {
