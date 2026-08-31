@@ -28,6 +28,8 @@ import {
 	runPackageManagerUpdateForTest,
 	runPostUpdateRecoveryForTest,
 	runUpdateCommand,
+	sanitizeVerificationOutputForTest,
+	verifyInstalledVersionForTest,
 	verifyMigrationTargetAdapterForTest,
 	verifyMigrationTargetForTest,
 } from "../src/cli/update-cli";
@@ -228,6 +230,76 @@ describe("update-cli binary release assets", () => {
 		expect(message).toContain("stale or partial update");
 		expect(message).toContain("native addon release mismatch");
 		expect(message).not.toContain("undefined");
+	});
+
+	it("preserves Bun version guard stderr when installed version verification fails", async () => {
+		const verification = await verifyInstalledVersionForTest({
+			expectedVersion: "0.15.6",
+			runtimePath: "/Users/test/.bun/bin/gjc",
+			runVersion: async () => ({
+				exitCode: 1,
+				stderr:
+					"error: gjc requires Bun >= 1.4.0, but the running Bun is v1.3.14.\n  detected Bun runtime: /Users/test/.bun/bin/bun\n",
+				stdout: "",
+			}),
+		});
+		const message = formatVerificationFailureForTest(verification, "0.15.6");
+
+		expect(message).toContain("requires Bun >= 1.4.0");
+		expect(message).toContain("running Bun is v1.3.14");
+		expect(message).toContain("at /Users/test/.bun/bin/gjc");
+	});
+
+	it("uses stdout when failed installed version verification has no stderr", async () => {
+		const verification = await verifyInstalledVersionForTest({
+			expectedVersion: "0.15.6",
+			runtimePath: "/opt/gjc",
+			runVersion: async () => ({ exitCode: 1, stderr: "", stdout: "runtime bootstrap failed on stdout\n" }),
+		});
+
+		expect(formatVerificationFailureForTest(verification, "0.15.6")).toContain("runtime bootstrap failed on stdout");
+	});
+
+	it("still parses successful installed version output", async () => {
+		const verification = await verifyInstalledVersionForTest({
+			expectedVersion: "0.15.6",
+			runtimePath: "C:\\Tools\\gjc.exe",
+			runVersion: async runtimePath => {
+				expect(runtimePath).toBe("C:\\Tools\\gjc.exe");
+				return { exitCode: 0, stderr: "", stdout: "gjc/0.15.6\n" };
+			},
+		});
+
+		expect(verification).toEqual({
+			ok: true,
+			actual: "0.15.6",
+			path: "C:\\Tools\\gjc.exe",
+		});
+	});
+
+	it("keeps the generic fallback when failed installed version verification has no output", () => {
+		const output = sanitizeVerificationOutputForTest("  \n\t", "");
+
+		expect(
+			formatVerificationFailureForTest({ ok: false, path: "C:\\Tools\\gjc.exe", versionOutput: output }, "0.15.6"),
+		).toBe("could not verify updated version at C:\\Tools\\gjc.exe");
+	});
+
+	it("bounds failed installed version verification output", () => {
+		const output = sanitizeVerificationOutputForTest("x".repeat(1_000), undefined);
+
+		expect(output).toHaveLength(512);
+		expect(output).toEndWith("...");
+	});
+
+	it("redacts secrets before reporting failed installed version verification output", () => {
+		const output = sanitizeVerificationOutputForTest(
+			"Authorization: Bearer abcdefghijklmnopqrstuvwxyz api_key=sk-abcdefghijklmnopqrstuvwxyz012345",
+			undefined,
+		);
+
+		expect(output).not.toContain("abcdefghijklmnopqrstuvwxyz");
+		expect(output).toContain("redacted");
 	});
 
 	it("includes actionable guidance when a release asset download fails", () => {
