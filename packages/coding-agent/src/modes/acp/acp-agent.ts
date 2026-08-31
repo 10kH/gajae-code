@@ -2477,7 +2477,10 @@ export class AcpAgent implements Agent {
 		record.reconnectUnsubscribe();
 		const waiter = record.activePrompt;
 		record.activePrompt = undefined;
-		if (waiter) clearPromptWatchdog(waiter);
+		if (waiter) {
+			clearPromptWatchdog(waiter);
+			this.#rememberSettledPromptCorrelation(id, record, waiter.correlation);
+		}
 		waiter?.reject(error);
 		try {
 			await adapter.close();
@@ -2657,9 +2660,7 @@ export class AcpAgent implements Agent {
 		if (!record || record.adapter !== adapter) return;
 		if (typeof frame.connectionId === "string") record.connectionId = frame.connectionId;
 		// Ingress ordering is recorded before queued work begins.
-		const wasBusy = record.busy;
 		this.#observeSessionActivity(record, frame);
-		if (wasBusy && !record.busy && !record.activePrompt) void this.#publishPromptPhaseIdle(id, adapter);
 		// Correlation is checked at ingress before a prompt-owned frame may refresh the
 		// watchdog, so queued processing cannot turn unrelated host traffic into turn liveness.
 		this.#refreshPromptWatchdog(id, record, frame);
@@ -2913,17 +2914,22 @@ export class AcpAgent implements Agent {
 	async #publishPromptPhaseIdle(id: string, adapter: AcpSdkAdapter): Promise<void> {
 		const record = this.#sessions.get(id);
 		if (!record || record.adapter !== adapter || record.activePrompt) return;
+		await this.#publishPromptPhase(id, adapter, undefined);
+	}
+
+	async #publishPromptPhase(
+		id: string,
+		adapter: AcpSdkAdapter,
+		observedPrompt: PromptWaiter | undefined,
+	): Promise<void> {
 		try {
-			let observedPrompt: PromptWaiter | undefined;
-			let observedBusy = false;
 			for (;;) {
-				const observedWorking = observedPrompt !== undefined || observedBusy;
 				await this.#connection.sessionUpdate({
 					sessionId: id,
 					update: {
 						sessionUpdate: "session_info_update",
-						...(observedWorking ? { updatedAt: new Date().toISOString() } : {}),
-						_meta: observedWorking
+						...(observedPrompt ? { updatedAt: new Date().toISOString() } : {}),
+						_meta: observedPrompt
 							? { gjcPhase: "working", running: true, gjcRunning: true }
 							: { gjcPhase: "idle", running: false, gjcRunning: false },
 					},
@@ -2931,10 +2937,13 @@ export class AcpAgent implements Agent {
 				// A prompt may start or finish while any phase write is backpressured.
 				// Continue until the last published phase describes the current waiter.
 				const current = this.#sessions.get(id);
-				if (!current || current.adapter !== adapter) return;
-				if (current.activePrompt === observedPrompt && current.busy === observedBusy) return;
+				if (!current) return;
+				if (current.adapter !== adapter) {
+					void this.#publishPromptPhase(id, current.adapter, current.activePrompt);
+					return;
+				}
+				if (current.activePrompt === observedPrompt) return;
 				observedPrompt = current.activePrompt;
-				observedBusy = current.busy;
 			}
 		} catch {
 			// The client transport is gone; there is no phase left to restore.

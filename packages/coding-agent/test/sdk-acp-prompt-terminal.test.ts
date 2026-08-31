@@ -698,46 +698,6 @@ test("ACP reconciliation releases a successor whose delayed acknowledgement is i
 	}
 });
 
-test("ACP failure phase reconciliation follows background agent activity", async () => {
-	const fixture = await createFixture({ blockIdleUpdate: true });
-	try {
-		const failed = prompt(fixture, "foreground prompt fails");
-		await bounded(fixture.promptDelivered, "foreground prompt delivery");
-		fixture.sendDiagnostic();
-		await expect(bounded(failed, "foreground failure settlement")).rejects.toMatchObject({
-			code: "prompt_failed",
-		});
-		const updatesAfterFailure = fixture.updates.length;
-
-		fixture.sendTerminal({ type: "agent_start", sessionId: "prompt-terminal-session" });
-		fixture.releaseIdleUpdate();
-		await waitFor(
-			() =>
-				fixture.updates
-					.slice(updatesAfterFailure)
-					.some(
-						update =>
-							update.update.sessionUpdate === "session_info_update" &&
-							(update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase === "working",
-					),
-			"background working update",
-		);
-		fixture.sendTerminal({ type: "agent_end", sessionId: "prompt-terminal-session" });
-		await waitFor(
-			() =>
-				fixture.updates
-					.slice(updatesAfterFailure)
-					.filter(update => update.update.sessionUpdate === "session_info_update")
-					.map(update => (update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase)
-					.at(-1) === "idle",
-			"background idle reconciliation",
-		);
-	} finally {
-		fixture.releaseIdleUpdate();
-		fixture.dispose();
-	}
-});
-
 test("ACP settles once when agent_end arrives after correlated agent_failed", async () => {
 	const fixture = await createFixture();
 	try {
