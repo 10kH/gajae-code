@@ -835,7 +835,7 @@ function toolSchema(name: CoordinatorToolName): {
 				properties: {
 					after_seq: { type: "integer", minimum: 0 },
 					session_id: sessionId,
-					event_types: { type: "array", items: { type: "string" } },
+					event_types: { type: "array", items: { type: "string", enum: [...COORDINATOR_EVENT_KINDS] } },
 					timeout_ms: {
 						type: "number",
 						description: "Bounded event long-poll timeout in milliseconds, capped at 30 seconds.",
@@ -2637,11 +2637,6 @@ async function writeActiveTurn(namespaceDir: string, turn: TurnRecord): Promise<
 	});
 }
 
-async function clearActiveTurn(namespaceDir: string, turn: TurnRecord): Promise<void> {
-	const active = asRecord(await readJsonFile(activeTurnFile(namespaceDir, turn.session_id)));
-	if (active?.turn_id === turn.turn_id) await removeCoordinatorFile(activeTurnFile(namespaceDir, turn.session_id));
-}
-
 async function readSessionState(namespaceDir: string, sessionId: string): Promise<CoordinatorSessionState | null> {
 	return (await readJsonFile(sessionStateFile(namespaceDir, sessionId))) as CoordinatorSessionState | null;
 }
@@ -2661,9 +2656,6 @@ async function writeSessionStateUnlocked(
 	} = {},
 ): Promise<CoordinatorSessionState> {
 	const persisted = await readSessionState(namespaceDir, sessionId);
-	const session = asRecord(
-		await readJsonFile(path.join(namespaceDir, "sessions", `${safeExternalId("session", sessionId)}.json`)),
-	);
 	// An overwrite is a canonical lifecycle repair, not proof that tool activity ended.
 	const previous = options.overwrite ? null : persisted;
 	const hasCurrentTurn = Object.hasOwn(options, "currentTurnId");
@@ -6773,7 +6765,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					// any stale pointer directly: once the turn projection is rewritten
 					// terminal, readActiveTurn() intentionally rejects it and cannot
 					// discover the legacy active-turn file to clear.
-					await fs.rm(activeTurnFile(namespaceDir, sessionId), { force: true });
+					await removeCoordinatorFile(activeTurnFile(namespaceDir, sessionId));
 				}
 				// A runtime sidecar can advance a live session while the canonical WAL still
 				// needs projection repair. Preserve that observed lifecycle state (and its
