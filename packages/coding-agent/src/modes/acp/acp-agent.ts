@@ -2359,6 +2359,8 @@ export class AcpAgent implements Agent {
 		const mcpServers = this.#knownSessionMcpServers.get(id) ?? [];
 		try {
 			await this.#attachExisting(id, cwd, mcpServers);
+			const current = this.#sessions.get(id);
+			if (current) void this.#publishPromptPhase(id, current.adapter, current.activePrompt);
 		} catch (attachError) {
 			const detail = attachError instanceof Error ? attachError.message : String(attachError);
 			logger.warn(`ACP session ${id} auto-reattach after transport loss failed: ${detail}`);
