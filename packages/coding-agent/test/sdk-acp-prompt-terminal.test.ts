@@ -463,6 +463,25 @@ test("ACP failure settlement does not wait for diagnostic publication", async ()
 	}
 });
 
+test("ACP blocked failure diagnostics do not retain a replacement prompt", async () => {
+	const fixture = await createFixture({ blockFailureUpdate: true });
+	try {
+		const failed = prompt(fixture, "first prompt fails");
+		await bounded(fixture.promptDelivered, "first prompt delivery");
+		fixture.sendDiagnostic();
+		await expect(bounded(failed, "first failure settlement")).rejects.toMatchObject({ code: "prompt_failed" });
+
+		const replacement = prompt(fixture, "replacement prompt");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(replacement, "replacement terminal settlement")).toEqual({ stopReason: "end_turn" });
+
+		fixture.releaseFailureUpdate();
+	} finally {
+		fixture.releaseFailureUpdate();
+		fixture.dispose();
+	}
+});
+
 test("ACP settles once when agent_end arrives after correlated agent_failed", async () => {
 	const fixture = await createFixture();
 	try {
