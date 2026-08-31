@@ -3071,7 +3071,16 @@ export class AcpAgent implements Agent {
 		}
 		// The prompt settled before these queries were asked, so a host that answers late
 		// must not report the session idle after the next turn has already started.
-		if (this.#sessions.get(id)?.activePrompt) return;
+		const ownsCurrentGeneration = (): boolean => {
+			const current = this.#sessions.get(id);
+			return Boolean(
+				current &&
+					current.adapter === adapter &&
+					current.publicationGeneration === publicationGeneration &&
+					!current.activePrompt,
+			);
+		};
+		if (!ownsCurrentGeneration()) return;
 		if (typeof usage?.tokens === "number" && typeof usage.contextWindow === "number") {
 			await this.#publishSessionUpdate(
 				id,
@@ -3087,6 +3096,7 @@ export class AcpAgent implements Agent {
 				publicationGeneration,
 			);
 		}
+		if (!ownsCurrentGeneration()) return;
 		const updatedAt = new Date().toISOString();
 		this.#knownSessionMetadata.set(id, { ...(title ? { title } : {}), updatedAt });
 		await this.#publishSessionUpdate(

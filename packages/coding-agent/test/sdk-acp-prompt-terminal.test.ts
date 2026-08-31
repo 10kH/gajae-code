@@ -797,6 +797,10 @@ test("ACP successor terminal decoration does not wait for a predecessor advisory
 		fixture.sendStopped("end_turn");
 		expect(await bounded(second, "second terminal settlement")).toEqual({ stopReason: "end_turn" });
 		await waitFor(() => idlePhaseUpdates(fixture.updates) > idleBefore, "successor idle decoration");
+		const updatesAfterSuccessor = fixture.updates.length;
+		fixture.releaseBlockedAdvisoryQueries();
+		await Bun.sleep(0);
+		expect(fixture.updates).toHaveLength(updatesAfterSuccessor);
 	} finally {
 		fixture.releaseBlockedAdvisoryQueries();
 		fixture.dispose();
