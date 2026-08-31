@@ -524,7 +524,10 @@ test("ACP prompt rejects prompt_failed terminal outcomes with their code", async
 		const pending = prompt(fixture, "failed prompt");
 		await bounded(fixture.promptDelivered, "prompt delivery");
 		fixture.sendFailed("prompt_failed");
-		await expect(bounded(pending, "prompt failure")).rejects.toMatchObject({ code: "prompt_failed" });
+		await expect(bounded(pending, "prompt failure")).rejects.toMatchObject({
+			code: "prompt_failed",
+			message: "prompt_failed from fixture",
+		});
 	} finally {
 		fixture.dispose();
 	}
@@ -626,8 +629,9 @@ test("ACP preserves an explicit prompt deadline terminal classifier after its di
 			error: { code: "prompt_deadline_exceeded", message: "deadline diagnostic" },
 		});
 		fixture.sendFailed("prompt_deadline_exceeded");
-		await expect(bounded(pending, "failure-only deadline settlement")).rejects.toMatchObject({
+		await expect(bounded(pending, "deadline failure")).rejects.toMatchObject({
 			code: "prompt_deadline_exceeded",
+			message: "prompt_deadline_exceeded from fixture",
 		});
 	} finally {
 		fixture.dispose();
@@ -1326,7 +1330,7 @@ test("ACP preserves the settlement-grace failure diagnostic", async () => {
 		});
 		await expect(bounded(pending, "unsettled prompt rejection")).rejects.toMatchObject({
 			code: "prompt_failed",
-			message: "prompt_failed: Agent run failed.",
+			message: "Prompt resources did not settle before the terminalization grace expired.",
 		});
 	} finally {
 		fixture.dispose();

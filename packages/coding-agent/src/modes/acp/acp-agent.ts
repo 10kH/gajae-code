@@ -502,7 +502,7 @@ function terminalOutcome(event: JsonObject): SdkPromptTerminalOutcome | undefine
 		return {
 			kind: "failed",
 			code: outcome.code,
-			message: `${outcome.code}: Agent run failed.`,
+			message: outcome.message,
 			provenance: outcome.provenance,
 		};
 	return undefined;
