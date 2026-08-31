@@ -3075,7 +3075,13 @@ function parsePrDiffSection(section: string, startOffset: number, endOffset: num
 
 	const preferOld = changeType === "deleted";
 	const displayPath = preferOld ? (oldPath ?? newPath ?? "(unknown)") : (newPath ?? oldPath ?? "(unknown)");
-	const displayEscaped = (preferOld ? oldPath !== undefined : newPath === undefined) ? oldPathEscaped : newPathEscaped;
+	const displayEscaped = preferOld
+		? oldPath !== undefined
+			? oldPathEscaped
+			: newPathEscaped
+		: newPath !== undefined
+			? newPathEscaped
+			: oldPathEscaped;
 	const file: PrDiffFile = {
 		path: displayPath,
 		additions,
@@ -3087,7 +3093,7 @@ function parsePrDiffSection(section: string, startOffset: number, endOffset: num
 	if (displayEscaped) {
 		file.pathEscaped = true;
 	}
-	if (oldPath && oldPath !== displayPath) {
+	if (oldPath && (oldPath !== displayPath || oldPathEscaped !== displayEscaped)) {
 		file.oldPath = oldPath;
 		if (oldPathEscaped) file.oldPathEscaped = true;
 	}

@@ -375,6 +375,24 @@ describe("parsePrUnifiedDiff", () => {
 
 		expect(parsed.files[0]).toMatchObject({ changeType: "renamed", oldPath: "old.md", path: "new.md" });
 	});
+
+	it("retains old-path identity when opposite encoding tags share the same display text", () => {
+		const diff = [
+			'diff --git "a/old \\303.md" "b/new \\\\303.md"',
+			"similarity index 100%",
+			'rename from "old \\303.md"',
+			'rename to "new \\\\303.md"',
+		].join("\n");
+
+		const file = parsePrUnifiedDiff(diff).files[0];
+		expect(file).toMatchObject({
+			changeType: "renamed",
+			path: "new \\303.md",
+			oldPath: "old \\303.md",
+			oldPathEscaped: true,
+		});
+		expect(file?.pathEscaped).toBeUndefined();
+	});
 });
 
 describe("github tool", () => {
