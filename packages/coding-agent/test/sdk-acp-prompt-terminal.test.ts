@@ -32,6 +32,7 @@ type Fixture = {
 	queryCalls: string[];
 	blockedAdvisoryQueryCount(): number;
 	releaseBlockedAdvisoryQueries(): void;
+	releaseFailureUpdate(): void;
 	sendTerminal(frame: Record<string, unknown>): void;
 };
 
@@ -70,6 +71,7 @@ async function createFixture(
 		cancelSettlementGraceMs?: number;
 		abortAcknowledgement?: Record<string, unknown>;
 		blockedAdvisoryQuery?: AdvisoryQuery;
+		blockFailureUpdate?: boolean;
 	} = {},
 ): Promise<Fixture> {
 	const tempDir = TempDir.createSync("@sdk-acp-prompt-terminal-");
@@ -82,6 +84,7 @@ async function createFixture(
 	const updates: SessionNotification[] = [];
 	const queryCalls: string[] = [];
 	const blockedAdvisoryQueries: Array<{ socket: TestSocket; id: string; result: unknown }> = [];
+	const failureUpdateRelease = Promise.withResolvers<void>();
 	const delivered = Promise.withResolvers<void>();
 	const abort = new AbortController();
 	let promptSocket: TestSocket | undefined;
@@ -270,7 +273,15 @@ async function createFixture(
 	});
 	const agent = new AcpAgent(
 		{
-			sessionUpdate: async (update: SessionNotification) => updates.push(update),
+			sessionUpdate: async (update: SessionNotification) => {
+				if (
+					options.blockFailureUpdate &&
+					update.update.sessionUpdate === "session_info_update" &&
+					(update.update as { _meta?: { gjcAgentFailed?: boolean } })._meta?.gjcAgentFailed === true
+				)
+					await failureUpdateRelease.promise;
+				updates.push(update);
+			},
 			signal: abort.signal,
 			closed: Promise.withResolvers<void>().promise,
 		} as unknown as AgentSideConnection,
@@ -311,6 +322,7 @@ async function createFixture(
 					JSON.stringify({ type: "query_response", id: blocked.id, ok: true, result: blocked.result }),
 				);
 		},
+		releaseFailureUpdate: () => failureUpdateRelease.resolve(),
 		sendTerminal,
 		dispose: () => {
 			abort.abort();
@@ -420,6 +432,33 @@ test("ACP rejects immediately when correlated agent_failed is the only terminal"
 		expect(fixture.queryCalls.filter(query => query === "session.metadata")).toHaveLength(metadataQueriesBefore);
 		await waitFor(() => idlePhaseUpdates(fixture.updates) === idleUpdatesBefore + 1, "failure idle update");
 	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP failure settlement does not wait for diagnostic publication", async () => {
+	const fixture = await createFixture({ blockFailureUpdate: true });
+	try {
+		const pending = prompt(fixture, "backpressured failure diagnostic");
+		await bounded(fixture.promptDelivered, "prompt delivery");
+		fixture.sendDiagnostic();
+
+		await expect(bounded(pending, "agent_failed settlement")).rejects.toMatchObject({
+			code: "prompt_failed",
+			message: "provider_unavailable: diagnostic from fixture",
+		});
+		fixture.releaseFailureUpdate();
+		await waitFor(
+			() =>
+				fixture.updates.some(
+					update =>
+						update.update.sessionUpdate === "session_info_update" &&
+						(update.update as { _meta?: { gjcAgentFailed?: boolean } })._meta?.gjcAgentFailed === true,
+				),
+			"released failure diagnostic",
+		);
+	} finally {
+		fixture.releaseFailureUpdate();
 		fixture.dispose();
 	}
 });

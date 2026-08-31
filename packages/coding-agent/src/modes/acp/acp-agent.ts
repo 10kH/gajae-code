@@ -2726,6 +2726,10 @@ export class AcpAgent implements Agent {
 				return;
 			}
 			activePrompt.terminal = { outcome, correlation };
+			// Failure diagnostics are useful but advisory. Settle before any mapped
+			// session update can await a backpressured client transport; otherwise an
+			// already-decided failure can still lose to the inactivity watchdog.
+			if (event.type === "agent_failed") this.#settlePrompt(record, activePrompt);
 		}
 		if (!isTerminal && derivedCorrelation === undefined) return;
 		if (!isTerminal && hasCorrelation(correlation)) {
@@ -2842,9 +2846,8 @@ export class AcpAgent implements Agent {
 		// queries is what left a finished turn reported as running until the inactivity
 		// watchdog rescued it.
 		if (activePrompt) this.#settlePrompt(record, activePrompt);
-		// A failure terminal has no trustworthy end-of-turn usage or title. Settlement
-		// still releases the client phase immediately; a later agent_end is suppressed by
-		// the settled-correlation tombstone above.
+		// A failure terminal has no trustworthy end-of-turn usage or title. A later
+		// agent_end is suppressed by the settled-correlation tombstone above.
 		if (event.type === "agent_failed") void this.#publishPromptPhaseIdle(id, adapter);
 		if (event.type === "agent_end") await this.#emitEndOfTurnUpdates(id, adapter);
 	}
