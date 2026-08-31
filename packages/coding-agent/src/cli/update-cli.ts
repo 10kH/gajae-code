@@ -9,7 +9,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { pipeline } from "node:stream/promises";
-import { $which, APP_NAME, isCompiledBinary, isEnoent, VERSION } from "@gajae-code/utils";
+import { $which, APP_NAME, isCompiledBinary, isEnoent, redactCrashSecrets, VERSION } from "@gajae-code/utils";
 import { $ } from "bun";
 import chalk from "chalk";
 import { Settings } from "../config/settings";
@@ -55,6 +55,7 @@ export interface InstalledVersionVerification {
 	ok: boolean;
 	actual?: string;
 	path?: string;
+	versionOutput?: string;
 	smokeTestFailed?: boolean;
 	smokeTestOutput?: string;
 	cleanupWarning?: string;
@@ -462,6 +463,71 @@ export function parseReportedVersionForTest(output: string): string | undefined 
 	return parseReportedVersion(output);
 }
 
+const VERIFICATION_OUTPUT_MAX_LENGTH = 512;
+const ANSI_ESCAPE = /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))/gu;
+const UNSAFE_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/gu;
+
+function sanitizeVerificationOutput(...streams: Array<string | undefined>): string | undefined {
+	const output = streams
+		.map(stream => stream?.replace(ANSI_ESCAPE, "").replace(UNSAFE_CONTROL, " ").replace(/\s+/g, " ").trim() ?? "")
+		.filter(Boolean)
+		.filter((stream, index, all) => all.indexOf(stream) === index)
+		.join(" ");
+	if (!output) return undefined;
+	const redacted = redactCrashSecrets(output);
+	if (redacted.length <= VERIFICATION_OUTPUT_MAX_LENGTH) return redacted;
+	return `${redacted.slice(0, VERIFICATION_OUTPUT_MAX_LENGTH - 3)}...`;
+}
+
+export function sanitizeVerificationOutputForTest(
+	stderr: string | undefined,
+	stdout: string | undefined,
+): string | undefined {
+	return sanitizeVerificationOutput(stderr, stdout);
+}
+
+interface InstalledVersionCommandResult {
+	exitCode: number | null;
+	stdout: string;
+	stderr: string;
+}
+
+type InstalledVersionCommandRunner = (runtimePath: string) => Promise<InstalledVersionCommandResult>;
+
+async function verifyInstalledVersionWith(
+	expectedVersion: string,
+	runtimePath: string | undefined,
+	runVersion: InstalledVersionCommandRunner,
+): Promise<InstalledVersionVerification> {
+	if (!runtimePath) return { ok: false };
+	try {
+		const result = await runVersion(runtimePath);
+		if (result.exitCode !== 0) {
+			return {
+				ok: false,
+				path: runtimePath,
+				versionOutput: sanitizeVerificationOutput(result.stderr, result.stdout),
+			};
+		}
+		const actual = parseReportedVersion(result.stdout);
+		return { ok: actual === expectedVersion, actual, path: runtimePath };
+	} catch (error) {
+		return {
+			ok: false,
+			path: runtimePath,
+			versionOutput: sanitizeVerificationOutput(error instanceof Error ? error.message : String(error)),
+		};
+	}
+}
+
+export async function verifyInstalledVersionForTest(options: {
+	expectedVersion: string;
+	runtimePath: string | undefined;
+	runVersion: InstalledVersionCommandRunner;
+}): Promise<InstalledVersionVerification> {
+	return await verifyInstalledVersionWith(options.expectedVersion, options.runtimePath, options.runVersion);
+}
+
 /**
  * Run the resolved gjc binary and check if it reports the expected version.
  */
@@ -469,15 +535,14 @@ async function verifyInstalledVersion(
 	expectedVersion: string,
 	runtimePath: string | undefined = resolveGjcPath(),
 ): Promise<InstalledVersionVerification> {
-	if (!runtimePath) return { ok: false };
-	try {
-		const result = await $`${runtimePath} --version`.quiet().nothrow();
-		if (result.exitCode !== 0) return { ok: false, path: runtimePath };
-		const actual = parseReportedVersion(result.text());
-		return { ok: actual === expectedVersion, actual, path: runtimePath };
-	} catch {
-		return { ok: false, path: runtimePath };
-	}
+	return await verifyInstalledVersionWith(expectedVersion, runtimePath, async resolvedPath => {
+		const result = await $`${resolvedPath} --version`.quiet().nothrow();
+		return {
+			exitCode: result.exitCode,
+			stdout: result.stdout.toString(),
+			stderr: result.stderr.toString(),
+		};
+	});
 }
 
 async function verifyInstalledRuntime(
@@ -665,7 +730,8 @@ function formatVerificationFailure(result: InstalledVersionVerification, expecte
 	if (result.actual) {
 		return `${APP_NAME} at ${result.path} still reports ${result.actual} (expected ${expectedVersion})`;
 	}
-	return `could not verify updated version${result.path ? ` at ${result.path}` : ""}`;
+	const outputSuffix = result.versionOutput ? `: ${result.versionOutput}` : "";
+	return `could not verify updated version${result.path ? ` at ${result.path}` : ""}${outputSuffix}`;
 }
 
 export function formatVerificationFailureForTest(

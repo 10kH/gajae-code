@@ -9,6 +9,8 @@
 
 ### Fixed
 
+- Post-install update verification now preserves a bounded, secret-redacted stderr/stdout cause when the newly installed `gjc --version` exits unsuccessfully, so runtime guards such as Bun version incompatibilities remain actionable instead of collapsing to a generic verification failure. (#5108)
+
 - Managed-session file identities now use one canonical unsigned 64-bit representation across stat/native boundaries and replacement cleanup receipts. Native Windows file IDs surfaced as signed negative bigints no longer create double-hyphen receipt names that block persistence or reopen; already-written signed receipt names and interrupted pending receipts are recovered only through the existing identity-bound, fail-closed reconciliation paths. (#5095)
 
 - Confirmed operator `turn.abort` requests now travel through a dedicated local Broker route instead of trusting caller-supplied `operator:true` and `confirm:true` on ordinary SDK frames. The Broker revalidates the exact live endpoint identity, injects a process-bound private capability, preserves post-send uncertainty, and the host uses one capability-free canonical identity for dispatch idempotency, durable admission, and delivery receipts, so forged, stale, dropped, and replayed requests fail closed consistently across restart boundaries.
