@@ -72,7 +72,7 @@ function createReasoningModel(): Model<"openai-responses"> {
 }
 
 const oldSessionMtime = new Date("2000-01-01T00:00:00.000Z");
-const SLOW_SDK_TEST_TIMEOUT_MS = 120_000;
+const SLOW_SDK_TEST_TIMEOUT_MS = 15_000;
 const validSixSurfacePluginBundle = path.join(import.meta.dir, "fixtures", "gjc-plugins", "valid-six-surface-bundle");
 const originalAgentDir = getAgentDir();
 
@@ -325,6 +325,9 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			vi.advanceTimersByTime(0);
 			for (let i = 0; i < 10; i++) await Promise.resolve();
 			expect(agentPrompt).toHaveBeenCalledTimes(1);
+			vi.advanceTimersByTime(FOLD_WAKE_MERGE_WINDOW_MS);
+			await Promise.resolve();
+			expect(agentPrompt).toHaveBeenCalledTimes(1);
 		} finally {
 			vi.useRealTimers();
 			await session.dispose();
@@ -376,6 +379,32 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			await session.waitForIdle();
 			expect(agentPrompt).not.toHaveBeenCalled();
 			expect(session.yieldQueue.has()).toBe(false);
+		} finally {
+			barrier.resolve();
+			await session.dispose();
+		}
+	});
+	it("admits an explicit prompt before an idle wake released by startup", async () => {
+		authStorage.setRuntimeApiKey("openai", "test-key");
+		const barrier = Promise.withResolvers<void>();
+		const { session } = await createAgentSession(createIsolatedSessionOptions());
+		try {
+			const agentPrompt = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+			session.extendStartupTurnBarrier(barrier.promise);
+			session.yieldQueue.register<string>("startup-prompt-priority-test", {
+				build: entries => ({ role: "user", content: entries.join("\n"), timestamp: Date.now() }),
+			});
+			session.yieldQueue.enqueue("startup-prompt-priority-test", "idle-after-explicit");
+			const explicit = session.prompt("explicit-before-idle");
+			await Promise.resolve();
+			expect(agentPrompt).not.toHaveBeenCalled();
+
+			barrier.resolve();
+			await explicit;
+			await session.waitForIdle();
+			expect(agentPrompt).toHaveBeenCalledTimes(2);
+			expect(JSON.stringify(agentPrompt.mock.calls[0]?.[0])).toContain("explicit-before-idle");
+			expect(JSON.stringify(agentPrompt.mock.calls[1]?.[0])).toContain("idle-after-explicit");
 		} finally {
 			barrier.resolve();
 			await session.dispose();
