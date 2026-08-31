@@ -130,10 +130,13 @@ export type ChatDaemonAction = "stop" | "reload";
  * session-index lock every 2s; staleness retirement moved to a 30s sweep and
  * lease heartbeats no longer force an authority reconcile. A pre-upgrade owner
  * would retain the old hot polling loop, so replacement is required.
+ * Discord generation 72 / Slack generation 75 serialize same-generation
+ * successor attachment admission behind predecessor provider retirement, so a
+ * pre-upgrade owner cannot retain the queue race fixed by #5120.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 71,
-	slack: 74,
+	discord: 72,
+	slack: 75,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {

@@ -258,6 +258,7 @@ export class ChatDaemonRuntime {
 	readonly #router: SessionRouter;
 	readonly #attachments = new Map<string, SessionAttachment>();
 	readonly #cleanupWork = new Map<string, Promise<void>>();
+	readonly #retirementWork = new Map<string, Promise<void>>();
 	readonly #attachmentBarriers = new Map<string, Promise<void>>();
 	#discord: DiscordNotificationDaemon | undefined;
 	#slack: SlackNotificationDaemon | undefined;
@@ -281,9 +282,9 @@ export class ChatDaemonRuntime {
 	}
 
 	async start(): Promise<void> {
-		if (this.#cleanupWork.size > 0) {
+		if (this.#cleanupWork.size > 0 || this.#retirementWork.size > 0) {
 			const settled = await Promise.race([
-				Promise.allSettled([...this.#cleanupWork.values()]).then(() => true),
+				Promise.allSettled([...this.#cleanupWork.values(), ...this.#retirementWork.values()]).then(() => true),
 				Bun.sleep(5_000).then(() => false),
 			]);
 			if (!settled) throw new Error("Prior provider cleanup did not settle before chat daemon restart.");
@@ -428,6 +429,7 @@ export class ChatDaemonRuntime {
 		const discord = this.#discord;
 		const slack = this.#slack;
 		const barrier = (async () => {
+			await this.#retirementWork.get(attachment.sessionId)?.catch(() => undefined);
 			await this.#cleanupWork.get(attachment.sessionId)?.catch(() => undefined);
 			await discord?.recoverCleanup(attachment.sessionId, attachment.generation);
 			await slack?.recoverCleanup(attachment.sessionId, attachment.generation);
@@ -451,11 +453,31 @@ export class ChatDaemonRuntime {
 	): Promise<void> {
 		if (this.#attachments.get(attachment.sessionId) !== attachment) return;
 		if (reason === "replaced_same_generation") {
-			await this.#discord?.retireAttachment(attachment.sessionId, attachment.generation);
-			await this.#slack?.retireAttachment(attachment.sessionId, attachment.generation);
+			const retirement = this.#trackRetirement(attachment);
+			this.#attachments.delete(attachment.sessionId);
+			await retirement;
+			return;
 		}
 		this.#attachments.delete(attachment.sessionId);
 		if (reason === "removed") await this.#trackCleanup(attachment);
+	}
+
+	#trackRetirement(attachment: SessionAttachment): Promise<void> {
+		const sessionId = attachment.sessionId;
+		const discord = this.#discord;
+		const slack = this.#slack;
+		const previous = this.#retirementWork.get(sessionId);
+		const work = (previous ? previous.catch(() => undefined) : Promise.resolve()).then(async () => {
+			// Capture the predecessor providers before stop() can clear the runtime
+			// fields. The successor barrier owns this promise until every retirement
+			// waiter settles, even when takeover overlaps worker shutdown.
+			await discord?.retireAttachment(sessionId, attachment.generation);
+			await slack?.retireAttachment(sessionId, attachment.generation);
+		});
+		this.#retirementWork.set(sessionId, work);
+		return work.finally(() => {
+			if (this.#retirementWork.get(sessionId) === work) this.#retirementWork.delete(sessionId);
+		});
 	}
 
 	async #handleFrame(attachment: SessionAttachment, correlated: CorrelatedFrame): Promise<void> {

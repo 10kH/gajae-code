@@ -76,6 +76,7 @@ class FakeSlackProvider implements SlackProviderClient {
 class FakeDiscordProvider implements DiscordProvider {
 	readonly applicationId = "app";
 	readonly botUserId = "bot";
+	readonly stopEntered = Promise.withResolvers<void>();
 	started = false;
 	stopped = false;
 	threads: DiscordThread[] = [];
@@ -182,6 +183,7 @@ class FakeDiscordProvider implements DiscordProvider {
 	}
 	async stop(): Promise<void> {
 		this.stopped = true;
+		this.stopEntered.resolve();
 	}
 }
 
@@ -692,91 +694,121 @@ describe("chat daemon worker", () => {
 	});
 
 	it("discards queued frames emitted by a same-generation successor attachment", async () => {
-		root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-chat-frame-"));
-		const agentDir = path.join(root, "agent");
-		const stateRoot = path.join(root, ".gjc", "state");
-		const endpointPath = path.join(stateRoot, "sdk", "session.json");
-		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
-		await fs.writeFile(
-			endpointPath,
-			JSON.stringify({ sessionId: "session", pid: process.pid, url: "ws://127.0.0.1:1", token: "old-token" }),
-		);
-		const index = await new SessionIndex(agentDir).open();
-		await index.append({
-			type: "host_registered",
-			sessionId: "session",
-			locator: { cwd: root, worktreeRoot: null, stateRoot },
-			endpointGeneration: 1,
-			pid: process.pid,
-			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
-		});
-		const provider = new FakeDiscordProvider();
-		const entered = Promise.withResolvers<void>();
-		const release = Promise.withResolvers<void>();
-		let blockLookup = false;
-		provider.findMessageByNonce = async () => {
-			if (!blockLookup) return null;
-			entered.resolve();
-			await release.promise;
-			return null;
-		};
-		const oldClient = new FakeSdkClient();
-		const newClient = new FakeSdkClient();
-		let tick: (() => void) | undefined;
-		let createClientCalls = 0;
-		const runtime = new ChatDaemonRuntime(
-			{
-				kind: "discord",
-				agentDir,
-				config: {
-					identity: "fingerprint-only",
-					notifications: {
-						discord: { botToken: "bot-token", applicationId: "app", guildId: "guild", parentChannelId: "parent" },
+		const scenarios = [
+			{ name: "same-generation first pass", generation: 1, stopDuringTakeover: false },
+			{ name: "same-generation repeated pass", generation: 1, stopDuringTakeover: false },
+			{ name: "same-generation worker shutdown", generation: 1, stopDuringTakeover: true },
+			{ name: "cross-generation replacement", generation: 2, stopDuringTakeover: false },
+		] as const;
+		for (const scenario of scenarios) {
+			root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-chat-frame-"));
+			const agentDir = path.join(root, "agent");
+			const stateRoot = path.join(root, ".gjc", "state");
+			const endpointPath = path.join(stateRoot, "sdk", "session.json");
+			await fs.mkdir(path.dirname(endpointPath), { recursive: true });
+			await fs.writeFile(
+				endpointPath,
+				JSON.stringify({ sessionId: "session", pid: process.pid, url: "ws://127.0.0.1:1", token: "old-token" }),
+			);
+			const index = await new SessionIndex(agentDir).open();
+			await index.append({
+				type: "host_registered",
+				sessionId: "session",
+				locator: { cwd: root, worktreeRoot: null, stateRoot },
+				endpointGeneration: 1,
+				pid: process.pid,
+				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+			});
+			const provider = new FakeDiscordProvider();
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			let blockLookup = false;
+			provider.findMessageByNonce = async () => {
+				if (!blockLookup) return null;
+				entered.resolve();
+				await release.promise;
+				return null;
+			};
+			const oldClient = new FakeSdkClient();
+			const newClient = new FakeSdkClient();
+			newClient.replayEvents = [
+				{ type: "event", name: "session_ready", sessionId: "session", generation: scenario.generation },
+			];
+			let tick: (() => void) | undefined;
+			let createClientCalls = 0;
+			const runtime = new ChatDaemonRuntime(
+				{
+					kind: "discord",
+					agentDir,
+					config: {
+						identity: "fingerprint-only",
+						notifications: {
+							discord: {
+								botToken: "bot-token",
+								applicationId: "app",
+								guildId: "guild",
+								parentChannelId: "parent",
+							},
+						},
 					},
 				},
-			},
-			{
-				createDiscordProvider: () => provider,
-				routerDeps: {
-					createClient: async () => (++createClientCalls === 1 ? oldClient : newClient),
-					createIndex: () => index,
-					setInterval: ((callback: () => void) => {
-						tick = callback;
-						return 0;
-					}) as unknown as typeof setInterval,
-					clearInterval: (() => {}) as typeof clearInterval,
+				{
+					createDiscordProvider: () => provider,
+					routerDeps: {
+						createClient: async () => (++createClientCalls === 1 ? oldClient : newClient),
+						createIndex: () => index,
+						setInterval: ((callback: () => void) => {
+							tick = callback;
+							return 0;
+						}) as unknown as typeof setInterval,
+						clearInterval: (() => {}) as typeof clearInterval,
+					},
 				},
-			},
-		);
-		await runtime.start();
-		blockLookup = true;
-		oldClient.handler?.({ type: "turn_stream", sessionId: "session", text: "block" });
-		await entered.promise;
-		oldClient.handler?.({ type: "turn_stream", sessionId: "session", text: "stale queued" });
-		await fs.writeFile(
-			endpointPath,
-			JSON.stringify({ sessionId: "session", pid: process.pid, url: "ws://127.0.0.1:1", token: "new-token" }),
-		);
-		await index.append({
-			type: "host_registered",
-			sessionId: "session",
-			locator: { cwd: root, worktreeRoot: null, stateRoot },
-			endpointGeneration: 1,
-			pid: process.pid,
-			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
-		});
-		const replacementReplay = newClient.waitForRequest(frame => frame.type === "event_replay");
-		tick?.();
-		await replacementReplay;
-		expect(oldClient.closed).toBe(true);
-		expect(newClient.handler).toBeDefined();
-		release.resolve();
-		const freshDelivered = provider.waitForMessage(message => message.content.includes("fresh replacement"));
-		newClient.handler?.({ type: "turn_stream", sessionId: "session", text: "fresh replacement" });
-		await freshDelivered;
-		expect(provider.messages.some(message => message.content.includes("fresh replacement"))).toBe(true);
-		expect(provider.messages.some(message => message.content.includes("stale queued"))).toBe(false);
-		await runtime.stop();
+			);
+			await runtime.start();
+			blockLookup = true;
+			oldClient.handler?.({ type: "turn_stream", sessionId: "session", text: `blocked ${scenario.name}` });
+			await entered.promise;
+			oldClient.handler?.({ type: "turn_stream", sessionId: "session", text: `stale queued ${scenario.name}` });
+			await fs.writeFile(
+				endpointPath,
+				JSON.stringify({ sessionId: "session", pid: process.pid, url: "ws://127.0.0.1:1", token: "new-token" }),
+			);
+			await index.append({
+				type: "host_registered",
+				sessionId: "session",
+				locator: { cwd: root, worktreeRoot: null, stateRoot },
+				endpointGeneration: scenario.generation,
+				pid: process.pid,
+				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+			});
+			const replacementReplay = newClient.waitForRequest(frame => frame.type === "event_replay");
+			tick?.();
+			await replacementReplay;
+			expect(oldClient.closed).toBe(true);
+			expect(newClient.handler).toBeDefined();
+			const freshContent = `fresh replacement ${scenario.name}`;
+			if (scenario.stopDuringTakeover) {
+				newClient.handler?.({ type: "turn_stream", sessionId: "session", text: freshContent });
+				const stopping = runtime.stop();
+				await provider.stopEntered.promise;
+				release.resolve();
+				await withStageTimeout("worker shutdown after successor takeover", stopping);
+			} else {
+				const freshDelivered = provider.waitForMessage(message => message.content.includes(freshContent));
+				newClient.handler?.({ type: "turn_stream", sessionId: "session", text: freshContent });
+				release.resolve();
+				await withStageTimeout("successor frame delivery", freshDelivered);
+				expect(provider.messages.some(message => message.content.includes(freshContent))).toBe(true);
+				await runtime.stop();
+			}
+			expect(provider.messages.some(message => message.content.includes(`blocked ${scenario.name}`))).toBe(false);
+			expect(provider.messages.some(message => message.content.includes(`stale queued ${scenario.name}`))).toBe(
+				false,
+			);
+			await fs.rm(root, { recursive: true, force: true });
+			root = "";
+		}
 	});
 
 	it("persists Slack action authority across restart, restores it for inbound replies, and clears resolved actions", async () => {
