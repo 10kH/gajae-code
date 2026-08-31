@@ -174,6 +174,7 @@ export const __sessionStateSidecarPerfCounters = {
 /** Test-only barriers for deterministic rescope transaction race coverage. */
 export const __sessionStateSidecarTestHooks: {
 	afterRescopeLocksAcquired?: () => void | Promise<void>;
+	beforeRescopeJournalWrite?: (cwd: string) => void | Promise<void>;
 	beforePersistFromEvent?: (eventType: string, cwd: string) => void | Promise<void>;
 	beforeRescopePublish?: () => void | Promise<void>;
 } = {};
@@ -1621,6 +1622,46 @@ function canonicalStateFilePath(stateFile: string): string {
 	return path.join(canonicalDirectoryWithExistingAncestor(path.dirname(stateFile)), path.basename(stateFile));
 }
 
+function assertPinnedDirectoryIdentity(cwd: string, expected: { dev: bigint; ino: bigint }): void {
+	const stat = fsSync.lstatSync(cwd, { bigint: true });
+	if (!stat.isDirectory() || stat.isSymbolicLink() || stat.dev !== expected.dev || stat.ino !== expected.ino)
+		throw new PreviousRuntimeStateReadError();
+}
+
+function assertNoSymlinkDirectoryComponents(root: string, directory: string): void {
+	const relative = path.relative(root, directory);
+	if (relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative))
+		throw new PreviousRuntimeStateReadError();
+	let current = root;
+	for (const component of relative.split(path.sep)) {
+		current = path.join(current, component);
+		try {
+			const stat = fsSync.lstatSync(current);
+			if (!stat.isDirectory() || stat.isSymbolicLink()) throw new PreviousRuntimeStateReadError();
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") break;
+			throw error;
+		}
+	}
+}
+
+function confinedJournalPath(cwd: string, sessionId: string, platform: NodeJS.Platform): string {
+	const canonicalRoot = fsSync.realpathSync(cwd);
+	const rawJournalFile = runtimeStateRescopeJournalPath(canonicalRoot, sessionId);
+	assertNoSymlinkDirectoryComponents(canonicalRoot, path.dirname(rawJournalFile));
+	const journalFile = canonicalStateFilePath(rawJournalFile);
+	const pathImpl = platform === "win32" ? path.win32 : path;
+	const relative = pathImpl.relative(canonicalRoot, journalFile);
+	if (
+		relative === "" ||
+		relative === ".." ||
+		relative.startsWith(`..${pathImpl.sep}`) ||
+		pathImpl.isAbsolute(relative)
+	)
+		throw new PreviousRuntimeStateReadError();
+	return journalFile;
+}
+
 async function withSerializedStateFiles<T>(stateFiles: readonly string[], operation: () => Promise<T>): Promise<T> {
 	const [stateFile, ...remaining] = stateFiles;
 	if (!stateFile) return await operation();
@@ -2061,9 +2102,17 @@ export async function prepareCoordinatorRuntimeStateRescope(input: {
 	sessionId: string;
 	previousCwd: string;
 	newCwd: string;
+	previousCwdIdentity?: { dev: bigint; ino: bigint };
+	newCwdIdentity?: { dev: bigint; ino: bigint };
 	previousSessionFile?: string | null;
 	newSessionFile?: string | null;
 }): Promise<string> {
+	const previousStat = fsSync.lstatSync(input.previousCwd, { bigint: true });
+	const newStat = fsSync.lstatSync(input.newCwd, { bigint: true });
+	const previousCwdIdentity = input.previousCwdIdentity ?? { dev: previousStat.dev, ino: previousStat.ino };
+	const newCwdIdentity = input.newCwdIdentity ?? { dev: newStat.dev, ino: newStat.ino };
+	assertPinnedDirectoryIdentity(input.previousCwd, previousCwdIdentity);
+	assertPinnedDirectoryIdentity(input.newCwd, newCwdIdentity);
 	const previousCwd = fsSync.realpathSync(input.previousCwd);
 	const newCwd = fsSync.realpathSync(input.newCwd);
 	const stateFiles = rescopeStateFiles(input.sessionId, previousCwd, newCwd);
@@ -2074,6 +2123,8 @@ export async function prepareCoordinatorRuntimeStateRescope(input: {
 		cwd: newCwd,
 		sessionFile: input.newSessionFile ?? null,
 	});
+	const previousJournalFile = confinedJournalPath(previousCwd, input.sessionId, identity.platform);
+	const newJournalFile = confinedJournalPath(newCwd, input.sessionId, identity.platform);
 	const oldIdentity = previousRescopeIdentity(
 		{
 			sessionId: input.sessionId,
@@ -2122,8 +2173,19 @@ export async function prepareCoordinatorRuntimeStateRescope(input: {
 						},
 					});
 				};
-				await writeJournal(runtimeStateRescopeJournalPath(journal.previous_cwd, journal.session_id));
-				await writeJournal(runtimeStateRescopeJournalPath(journal.new_cwd, journal.session_id));
+				await __sessionStateSidecarTestHooks.beforeRescopeJournalWrite?.(previousCwd);
+				assertPinnedDirectoryIdentity(input.previousCwd, previousCwdIdentity);
+				await writeJournal(previousJournalFile);
+				if (confinedJournalPath(previousCwd, input.sessionId, identity.platform) !== previousJournalFile)
+					throw new PreviousRuntimeStateReadError();
+				assertPinnedDirectoryIdentity(input.previousCwd, previousCwdIdentity);
+				await __sessionStateSidecarTestHooks.beforeRescopeJournalWrite?.(newCwd);
+				assertPinnedDirectoryIdentity(input.newCwd, newCwdIdentity);
+				await writeJournal(newJournalFile);
+				if (confinedJournalPath(newCwd, input.sessionId, identity.platform) !== newJournalFile)
+					throw new PreviousRuntimeStateReadError();
+				assertPinnedDirectoryIdentity(input.previousCwd, previousCwdIdentity);
+				assertPinnedDirectoryIdentity(input.newCwd, newCwdIdentity);
 				return journal.move_id;
 			}),
 		),

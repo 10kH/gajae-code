@@ -3266,7 +3266,7 @@ export class AgentSession {
 	#bindPendingAgentEndToRescopeBarrier(): void {
 		if (!this.#coordinatorRescopeBarrier || !this.#pendingAgentEndEmit) return;
 		const admission = this.#agentEventAdmission.get(this.#pendingAgentEndEmit);
-		if (admission && !admission.persistBarrier) admission.persistBarrier = this.#coordinatorRescopeBarrier;
+		if (admission) admission.persistBarrier = this.#coordinatorRescopeBarrier;
 	}
 
 	#appendCoordinatorPersist(run: () => Promise<void>): Promise<void> {
@@ -4149,6 +4149,8 @@ export class AgentSession {
 				sessionId: this.sessionId,
 				previousCwd: move.previousCwd,
 				newCwd: move.newCwd,
+				previousCwdIdentity: move.previousCwdIdentity,
+				newCwdIdentity: move.newCwdIdentity,
 				previousSessionFile: move.previousSessionFile ?? null,
 				newSessionFile: move.newSessionFile ?? null,
 			});
@@ -4191,8 +4193,9 @@ export class AgentSession {
 		// fence refuses every later persist) and rebinds the postmortem finalizer, which
 		// otherwise keeps writing terminal state to the launch root's cwd/session file.
 		this.#unregisterAfterMoveListener = this.sessionManager.registerAfterMoveListener(async move => {
+			let completed = false;
 			try {
-				const completed = await relocateCoordinatorRuntimeStateForRescope(
+				const relocated = await relocateCoordinatorRuntimeStateForRescope(
 					{
 						sessionId: this.sessionId,
 						cwd: move.newCwd,
@@ -4201,7 +4204,7 @@ export class AgentSession {
 					},
 					move.previousCwd,
 				);
-				if (!completed) throw new Error("Coordinator runtime state rescope was refused.");
+				if (!relocated) throw new Error("Coordinator runtime state rescope was refused.");
 				await clearCoordinatorRuntimeStateRescope(
 					{
 						sessionId: this.sessionId,
@@ -4211,10 +4214,13 @@ export class AgentSession {
 					this.#coordinatorRescopeMoveId,
 					move.previousCwd,
 				);
+				completed = true;
 			} finally {
 				this.#registerRuntimeStateFinalizer();
-				this.#coordinatorRescopeMoveId = undefined;
-				this.#endCoordinatorRescopeBarrier();
+				if (completed) {
+					this.#coordinatorRescopeMoveId = undefined;
+					this.#endCoordinatorRescopeBarrier();
+				}
 			}
 		});
 		// Power assertions are taken per turn (see #beginInFlight); nothing acquired here.
@@ -8662,8 +8668,23 @@ export class AgentSession {
 	}
 
 	async #dispose(): Promise<void> {
-		await this.sessionManager.joinCwdTransition();
 		const admissionClosed = this.#disposeAdmissionClosed ?? this.#closeSessionAdmission();
+		await admissionClosed;
+		await this.sessionManager.closeCwdMoveAdmission();
+		this.#isDisposed = true;
+		// Reject new direct Python starts as soon as disposal begins (synchronously,
+		// before any await) so callers cannot race a start against teardown.
+		this.#evalExecutionDisposing = true;
+		this.#abortActiveMidRunBarriers();
+		this.abortCompaction();
+		this.agent.abort();
+		this.agent.setMainAttemptScopeObserver(undefined);
+		// Disconnect the Agent event bridge NOW — before the maintenance join and the
+		// bounded idle / forceAbort below — so no agent_end emitted during teardown
+		// (including the one forceAbort emits) can re-enter #handleAgentEvent and start
+		// fresh post-turn maintenance or mutate the closing session. Maintenance promises
+		// are joined directly (not via events), so this does not affect the join.
+		this.#disconnectFromAgent();
 		// R2-5: join any in-flight mid-run maintenance invocation before teardown so the
 		// abort-aware maintenance promise (already aborted above) settles and cannot touch
 		// torn-down state afterward.
@@ -8687,7 +8708,6 @@ export class AgentSession {
 				this.agent.forceAbort("Session disposed");
 			}
 		}
-		await admissionClosed;
 		await this.#agentEndPublicationPromise;
 		await this.#queuedExtensionEvents;
 		await this.#agentEndHandlingPromise;

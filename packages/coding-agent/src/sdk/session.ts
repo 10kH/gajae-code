@@ -2536,6 +2536,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 													if (path.resolve(process.cwd()) !== path.resolve(canonicalFrom)) {
 														throw new Error("Process cwd did not restore to the launch root.");
 													}
+													await SessionManager.assertProcessCwdIdentity({
+														dev: sourceOpened.dev,
+														ino: sourceOpened.ino,
+													});
 												} catch (error) {
 													restoreErrors.push(error instanceof Error ? error : new Error(String(error)));
 												}
@@ -2579,6 +2583,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 													await SessionManager.assertProcessCwdIdentity(expectedIdentity);
 												} catch (error) {
 													setProjectDir(canonicalFrom);
+													await SessionManager.assertProcessCwdIdentity({
+														dev: sourceOpened.dev,
+														ino: sourceOpened.ino,
+													});
 													throw error;
 												}
 											}

@@ -7299,6 +7299,7 @@ export class SessionManager {
 	/** Serializes model, SDK, and ACP cwd transitions; dispose joins this tail. */
 	#cwdTransitionTail: Promise<void> = Promise.resolve();
 	#cwdTransitionOwner: symbol | undefined;
+	#cwdMoveAdmissionClosed = false;
 	#cwdReadLeaseOwner = Symbol("cwd-read-lease-owner");
 	#cwdGeneration = 0;
 	/**
@@ -7316,6 +7317,8 @@ export class SessionManager {
 			newCwd: string;
 			previousSessionFile: string | undefined;
 			newSessionFile: string | undefined;
+			previousCwdIdentity: { dev: bigint; ino: bigint };
+			newCwdIdentity: { dev: bigint; ino: bigint };
 		}) => void | Promise<void>
 	>();
 	#moveAbortListeners = new Set<
@@ -7324,6 +7327,8 @@ export class SessionManager {
 			newCwd: string;
 			previousSessionFile: string | undefined;
 			newSessionFile: string | undefined;
+			previousCwdIdentity: { dev: bigint; ino: bigint };
+			newCwdIdentity: { dev: bigint; ino: bigint };
 			preserveRecoveryJournal?: boolean;
 		}) => void | Promise<void>
 	>();
@@ -7333,6 +7338,8 @@ export class SessionManager {
 			newCwd: string;
 			previousSessionFile: string | undefined;
 			newSessionFile: string | undefined;
+			previousCwdIdentity: { dev: bigint; ino: bigint };
+			newCwdIdentity: { dev: bigint; ino: bigint };
 		}) => void | Promise<void>
 	>();
 	/** Number of tool executions currently holding a shared read lease on `cwd`. */
@@ -10762,6 +10769,12 @@ export class SessionManager {
 	async joinCwdTransition(): Promise<void> {
 		await this.#cwdTransitionTail;
 	}
+
+	async closeCwdMoveAdmission(): Promise<void> {
+		await this.runExclusiveCwdTransition(async () => {
+			this.#cwdMoveAdmissionClosed = true;
+		});
+	}
 	getCwdGeneration(): number {
 		return this.#cwdGeneration;
 	}
@@ -10790,6 +10803,8 @@ export class SessionManager {
 			newCwd: string;
 			previousSessionFile: string | undefined;
 			newSessionFile: string | undefined;
+			previousCwdIdentity: { dev: bigint; ino: bigint };
+			newCwdIdentity: { dev: bigint; ino: bigint };
 			preserveRecoveryJournal?: boolean;
 		}) => void | Promise<void>,
 	): () => void {
@@ -10804,6 +10819,8 @@ export class SessionManager {
 		newCwd: string;
 		previousSessionFile: string | undefined;
 		newSessionFile: string | undefined;
+		previousCwdIdentity: { dev: bigint; ino: bigint };
+		newCwdIdentity: { dev: bigint; ino: bigint };
 	}): Promise<void> {
 		for (const listener of [...this.#beforeMoveListeners]) await listener(move);
 	}
@@ -10814,6 +10831,8 @@ export class SessionManager {
 			newCwd: string;
 			previousSessionFile: string | undefined;
 			newSessionFile: string | undefined;
+			previousCwdIdentity: { dev: bigint; ino: bigint };
+			newCwdIdentity: { dev: bigint; ino: bigint };
 			preserveRecoveryJournal?: boolean;
 		}) => void | Promise<void>,
 	): () => void {
@@ -10828,6 +10847,8 @@ export class SessionManager {
 		newCwd: string;
 		previousSessionFile: string | undefined;
 		newSessionFile: string | undefined;
+		previousCwdIdentity: { dev: bigint; ino: bigint };
+		newCwdIdentity: { dev: bigint; ino: bigint };
 	}): Promise<void> {
 		for (const listener of [...this.#movePublicationListeners]) await listener(move);
 	}
@@ -10838,6 +10859,8 @@ export class SessionManager {
 			newCwd: string;
 			previousSessionFile: string | undefined;
 			newSessionFile: string | undefined;
+			previousCwdIdentity: { dev: bigint; ino: bigint };
+			newCwdIdentity: { dev: bigint; ino: bigint };
 			preserveRecoveryJournal?: boolean;
 		}) => void | Promise<void>,
 	): () => void {
@@ -10852,6 +10875,8 @@ export class SessionManager {
 		newCwd: string;
 		previousSessionFile: string | undefined;
 		newSessionFile: string | undefined;
+		previousCwdIdentity: { dev: bigint; ino: bigint };
+		newCwdIdentity: { dev: bigint; ino: bigint };
 		preserveRecoveryJournal?: boolean;
 	}): Promise<void> {
 		for (const listener of [...this.#moveAbortListeners]) {
@@ -10954,6 +10979,7 @@ export class SessionManager {
 		if (!this.#ownsCwdTransition()) {
 			return this.runExclusiveCwdTransition(() => this.moveTo(newCwd, options));
 		}
+		if (this.#cwdMoveAdmissionClosed) throw new Error("Session cwd move admission is closed.");
 		if (!options?.sourceHandle) {
 			const sourceHandle = await SessionManager.openNoFollowDirectory(this.cwd);
 			try {
@@ -10972,13 +10998,26 @@ export class SessionManager {
 			}
 		}
 		const resolvedCwd = await fs.promises.realpath(path.resolve(newCwd));
-		if (!(await fs.promises.stat(resolvedCwd)).isDirectory()) {
+		const resolvedIdentity = await fs.promises.lstat(resolvedCwd, { bigint: true });
+		if (!resolvedIdentity.isDirectory() || resolvedIdentity.isSymbolicLink()) {
 			throw new Error(`Refusing to rescope: target is not a directory: ${resolvedCwd}`);
 		}
 		if (!options?.targetHandle) {
 			const targetHandle = await SessionManager.openNoFollowDirectory(resolvedCwd);
 			try {
 				const targetIdentity = await targetHandle.stat({ bigint: true });
+				const revalidatedCwd = await fs.promises.realpath(path.resolve(newCwd));
+				const namedIdentity = await fs.promises.lstat(revalidatedCwd, { bigint: true });
+				if (
+					revalidatedCwd !== resolvedCwd ||
+					!namedIdentity.isDirectory() ||
+					namedIdentity.isSymbolicLink() ||
+					namedIdentity.dev !== resolvedIdentity.dev ||
+					namedIdentity.ino !== resolvedIdentity.ino ||
+					targetIdentity.dev !== resolvedIdentity.dev ||
+					targetIdentity.ino !== resolvedIdentity.ino
+				)
+					throw new Error(`Refusing to rescope: target identity changed: ${resolvedCwd}`);
 				return await this.moveTo(resolvedCwd, {
 					...options,
 					expectedIdentity: options?.expectedIdentity ?? {
@@ -11018,11 +11057,15 @@ export class SessionManager {
 		const nextSessionFile = this.#sessionFile
 			? path.join(newSessionDir, path.basename(this.#sessionFile))
 			: undefined;
+		const pinnedSourceIdentity = await options.sourceHandle.stat({ bigint: true });
+		const pinnedTargetIdentity = await options.targetHandle.stat({ bigint: true });
 		const moveDetails = {
 			previousCwd,
 			newCwd: resolvedCwd,
 			previousSessionFile,
 			newSessionFile: nextSessionFile,
+			previousCwdIdentity: { dev: pinnedSourceIdentity.dev, ino: pinnedSourceIdentity.ino },
+			newCwdIdentity: { dev: pinnedTargetIdentity.dev, ino: pinnedTargetIdentity.ino },
 		};
 		let hadSessionFile = false;
 		const managedMove = this.destination.kind === "managed" && nextDestination.kind === "managed";

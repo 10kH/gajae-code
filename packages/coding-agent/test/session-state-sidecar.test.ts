@@ -110,6 +110,7 @@ function git(cwd: string, args: string[]): void {
 afterEach(async () => {
 	FileLockTestHooks.afterParentMkdir = undefined;
 	__sessionStateSidecarTestHooks.afterRescopeLocksAcquired = undefined;
+	__sessionStateSidecarTestHooks.beforeRescopeJournalWrite = undefined;
 	__sessionStateSidecarTestHooks.beforePersistFromEvent = undefined;
 	__sessionStateSidecarTestHooks.beforeRescopePublish = undefined;
 	setSystemTime();
@@ -2757,6 +2758,30 @@ describe("coordinator runtime state sidecar", () => {
 		expect(fsSync.existsSync(replacementStateFile)).toBe(false);
 	});
 
+	it("issue-4629: journal preparation rejects a symlinked target runtime root", async () => {
+		delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
+		const root = await tempRoot();
+		const sessionId = "rescope-journal-symlink";
+		const launcher = path.join(root, "launcher");
+		const target = path.join(root, "target");
+		const outside = path.join(root, "outside");
+		await fs.mkdir(launcher);
+		await fs.mkdir(target);
+		await fs.mkdir(outside);
+		await fs.symlink(outside, path.join(target, ".gjc"));
+
+		await expect(
+			prepareCoordinatorRuntimeStateRescope({
+				sessionId,
+				previousCwd: launcher,
+				newCwd: target,
+				previousSessionFile: null,
+				newSessionFile: null,
+			}),
+		).rejects.toThrow();
+
+		expect(fsSync.existsSync(path.join(outside, `_session-${sessionId}`, "runtime-state-rescope.json"))).toBe(false);
+	});
 	it("issue-4629: preparing a new move never replaces an existing recovery journal", async () => {
 		delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
 		const root = await tempRoot();
