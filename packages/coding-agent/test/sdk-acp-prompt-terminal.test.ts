@@ -746,6 +746,7 @@ test("ACP keeps generic correlated agent_failed additive until authoritative age
 test("ACP terminal settlement does not await final-text delivery", async () => {
 	const fixture = await createFixture({ blockedAgentMessageText: "detached final report" });
 	try {
+		const idleBefore = idlePhaseUpdates(fixture.updates);
 		const pending = prompt(fixture, "blocked final text");
 		await bounded(fixture.promptDelivered, "prompt delivery");
 		fixture.sendTerminal({
@@ -765,6 +766,7 @@ test("ACP terminal settlement does not await final-text delivery", async () => {
 					update.update.content.text === "detached final report",
 			),
 		).toBe(false);
+		expect(idlePhaseUpdates(fixture.updates)).toBe(idleBefore);
 		await expect(prompt(fixture, "successor blocked by predecessor final text")).rejects.toMatchObject({
 			code: "conflict",
 		});
@@ -779,6 +781,7 @@ test("ACP terminal settlement does not await final-text delivery", async () => {
 				),
 			"detached final-text delivery",
 		);
+		await waitFor(() => idlePhaseUpdates(fixture.updates) > idleBefore, "idle after final-text delivery");
 		const { pending: successor } = await promptWhenDelivered(fixture, "successor after final-text delivery", 2);
 		fixture.sendStopped("end_turn");
 		expect(await bounded(successor, "successor after final-text delivery")).toEqual({ stopReason: "end_turn" });

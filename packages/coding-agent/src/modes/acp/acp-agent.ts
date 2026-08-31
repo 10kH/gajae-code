@@ -2929,6 +2929,7 @@ export class AcpAgent implements Agent {
 			void this.#publishPromptPhaseIdle(id, adapter);
 			return;
 		}
+		let decorationStart = Promise.resolve();
 		const finalText = typeof event.finalText === "string" ? event.finalText : "";
 		if (promptOwner && finalText) {
 			const finalTextTask = (async () => {
@@ -2967,10 +2968,13 @@ export class AcpAgent implements Agent {
 					if (record.finalTextTail === finalTextTail) record.finalTextTail = undefined;
 				});
 			record.finalTextTail = finalTextTail;
+			decorationStart = finalTextTail;
 		}
-		void this.#emitEndOfTurnUpdates(id, adapter, publicationGeneration).catch(error => {
-			logger.warn("acp_terminal_update_failed", { sessionId: id, error: String(error) });
-		});
+		void decorationStart
+			.then(async () => await this.#emitEndOfTurnUpdates(id, adapter, publicationGeneration))
+			.catch(error => {
+				logger.warn("acp_terminal_update_failed", { sessionId: id, error: String(error) });
+			});
 	}
 
 	async #rejectPrompt(
