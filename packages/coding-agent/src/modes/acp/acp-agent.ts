@@ -118,7 +118,7 @@ interface PromptWaiter {
 	settled: boolean;
 	terminal?: { outcome: SdkPromptTerminalOutcome; correlation: PromptCorrelation };
 	/** Frames for an already-settled correlation held until acknowledgement resolves ownership. */
-	deferredFrames: JsonObject[];
+	deferredFrames: Array<{ frame: JsonObject; publicationGeneration: number }>;
 	/** Activity frames held until acknowledgement establishes exact prompt ownership. */
 	deferredActivityFrames: JsonObject[];
 	/** Clock reading of the last frame proven to belong to this prompt; watchdog silence baseline. */
@@ -1640,6 +1640,7 @@ export class AcpAgent implements Agent {
 				"conflict",
 				"ACP session is still reconciling a previous prompt acknowledgement.",
 			);
+		record.publicationGeneration++;
 		const payload = acpPromptPayload(params.prompt);
 		const skillInvocation = acpSkillInvocation(params.prompt);
 		if (!skillInvocation) {
@@ -1817,7 +1818,7 @@ export class AcpAgent implements Agent {
 			}
 			if (observedDeferredActivity) this.#armPromptWatchdog(params.sessionId, record, waiter);
 			const deferred = waiter.deferredFrames.splice(0);
-			for (const deferredFrame of deferred) {
+			for (const { frame: deferredFrame, publicationGeneration: deferredGeneration } of deferred) {
 				const deferredEvent = receivedSdkEvent(deferredFrame)?.event;
 				if (!deferredEvent) continue;
 				const deferredCorrelation = sdkFrameCorrelation(deferredFrame, deferredEvent) ?? {};
@@ -1850,7 +1851,6 @@ export class AcpAgent implements Agent {
 						);
 					continue;
 				}
-				const deferredGeneration = record.publicationGeneration;
 				const task = deferredIsTerminal
 					? this.#handleSdkFrame(params.sessionId, record.adapter, deferredFrame)
 					: record.frameTail.then(
@@ -2846,7 +2846,7 @@ export class AcpAgent implements Agent {
 			}
 			if (!activePrompt.acknowledged) {
 				// Hold the entire frame until the prompt acknowledgement proves ownership.
-				activePrompt.deferredFrames.push(frame);
+				activePrompt.deferredFrames.push({ frame, publicationGeneration });
 				return;
 			}
 			const matchesPrompt = correlationsExactlyMatch(activePrompt.correlation, correlation);
@@ -2877,7 +2877,7 @@ export class AcpAgent implements Agent {
 		if (!isTerminal && hasCorrelation(correlation)) {
 			if (!activePrompt || activePrompt.settled) return;
 			if (!activePrompt.acknowledged) {
-				activePrompt.deferredFrames.push(frame);
+				activePrompt.deferredFrames.push({ frame, publicationGeneration });
 				return;
 			}
 			if (!correlationsExactlyMatch(activePrompt.correlation, correlation)) return;
@@ -2886,7 +2886,7 @@ export class AcpAgent implements Agent {
 			// Frames for an already-settled correlation stay closed until an active prompt
 			// acknowledges the exact same identity.
 			if (activePrompt && !activePrompt.settled && !activePrompt.acknowledged) {
-				activePrompt.deferredFrames.push(frame);
+				activePrompt.deferredFrames.push({ frame, publicationGeneration });
 				return;
 			}
 			if (!activePrompt || activePrompt.settled || !correlationsMatch(activePrompt.correlation, correlation)) return;
