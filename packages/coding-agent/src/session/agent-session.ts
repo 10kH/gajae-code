@@ -315,10 +315,16 @@ import {
 } from "../gjc-runtime/session-layout";
 import {
 	type CoordinatorToolObservation,
+	clearCoordinatorRuntimeStateRescope,
+	hasCoordinatorRuntimeStateRescopeJournal,
+	markCoordinatorRuntimeStateRescopePublishing,
 	ownerTerminalContextFromEnvironment,
 	persistCoordinatorRuntimeStateFromEvent,
 	persistCoordinatorWorkerIntegrationOutcome,
+	prepareCoordinatorRuntimeStateRescope,
+	recoverCoordinatorRuntimeStateRescope,
 	registerCoordinatorRuntimeStateFinalizer,
+	relocateCoordinatorRuntimeStateForRescope,
 	UNPROVEN_TOOL_LABEL,
 } from "../gjc-runtime/session-state-sidecar";
 import {
@@ -2814,6 +2820,27 @@ export class AgentSession {
 	/** Idempotent unregister handle for this session's resource-GC registration. */
 	#unregisterResourceGc?: () => void;
 	#unregisterRuntimeStateFinalizer?: () => void;
+	#unregisterBeforeMoveListener?: () => void;
+	#unregisterMoveAbortListener?: () => void;
+	#unregisterMovePublicationListener?: () => void;
+	#unregisterAfterMoveListener?: () => void;
+	/**
+	 * (Re)register the postmortem finalizer bound to the CURRENT cwd/session file. Called at
+	 * construction and after every committed rescope, so an unexpected exit writes terminal
+	 * state to the session's live location rather than the abandoned launch root.
+	 */
+	#registerRuntimeStateFinalizer(): void {
+		this.#unregisterRuntimeStateFinalizer?.();
+		const currentContext = () => ({
+			sessionId: this.sessionId,
+			cwd: this.sessionManager.getCwd(),
+			sessionFile: this.sessionManager.getSessionFile(),
+		});
+		this.#unregisterRuntimeStateFinalizer = registerCoordinatorRuntimeStateFinalizer(
+			currentContext(),
+			currentContext,
+		);
+	}
 	#unregisterSessionMemorySettings?: () => void;
 	/**
 	 * AsyncJobManager owned by this session (top-level only). Subagents leave
@@ -3209,6 +3236,65 @@ export class AgentSession {
 	 */
 	#sessionTransitionKind: string | undefined;
 	#coordinatorPersistGeneration = 0;
+	#coordinatorRescopeBarrier: Promise<void> | undefined;
+	#releaseCoordinatorRescopeBarrier: (() => void) | undefined;
+	#coordinatorRescopeMoveId: string | undefined;
+	#coordinatorEventHandlers = new Set<Promise<void>>();
+	#coordinatorUnbarrieredPersists = new Set<Promise<void>>();
+	#coordinatorReleasedBarrierPersists = new Set<Promise<void>>();
+
+	#beginCoordinatorRescopeBarrier(): {
+		eventHandlers: Promise<void>[];
+		releasedBarrierPersists: Promise<void>[];
+	} {
+		if (this.#coordinatorRescopeBarrier) throw new Error("Coordinator rescope barrier is already active.");
+		const releasedBarrierPersists = [...this.#coordinatorReleasedBarrierPersists];
+		const barrier = Promise.withResolvers<void>();
+		this.#coordinatorRescopeBarrier = barrier.promise;
+		this.#releaseCoordinatorRescopeBarrier = barrier.resolve;
+		this.#bindPendingAgentEndToRescopeBarrier();
+		return { eventHandlers: [...this.#coordinatorEventHandlers], releasedBarrierPersists };
+	}
+
+	#trackReleasedBarrierPersist(persist: Promise<void>): void {
+		this.#coordinatorReleasedBarrierPersists.add(persist);
+		void persist.then(
+			() => this.#coordinatorReleasedBarrierPersists.delete(persist),
+			() => this.#coordinatorReleasedBarrierPersists.delete(persist),
+		);
+	}
+
+	#bindPendingAgentEndToRescopeBarrier(): void {
+		if (!this.#coordinatorRescopeBarrier || !this.#pendingAgentEndEmit) return;
+		const admission = this.#agentEventAdmission.get(this.#pendingAgentEndEmit);
+		if (admission) admission.persistBarrier = this.#coordinatorRescopeBarrier;
+	}
+
+	#appendCoordinatorPersist(run: () => Promise<void>): Promise<void> {
+		const queued = this.#coordinatorPersistQueue.then(run, run);
+		this.#coordinatorPersistQueue = queued.catch(() => {});
+		return queued;
+	}
+
+	#trackUnbarrieredCoordinatorPersist(persist: Promise<void>): void {
+		this.#coordinatorUnbarrieredPersists.add(persist);
+		void persist.then(
+			() => this.#coordinatorUnbarrieredPersists.delete(persist),
+			() => this.#coordinatorUnbarrieredPersists.delete(persist),
+		);
+	}
+
+	async #drainUnbarrieredCoordinatorPersists(): Promise<void> {
+		while (this.#coordinatorUnbarrieredPersists.size > 0) {
+			await Promise.allSettled([...this.#coordinatorUnbarrieredPersists]);
+		}
+	}
+
+	#endCoordinatorRescopeBarrier(): void {
+		this.#releaseCoordinatorRescopeBarrier?.();
+		this.#releaseCoordinatorRescopeBarrier = undefined;
+		this.#coordinatorRescopeBarrier = undefined;
+	}
 
 	#beginSessionTransition(kind: string): void {
 		if (this.#sessionTransitionKind !== undefined) {
@@ -4047,10 +4133,96 @@ export class AgentSession {
 				cwd: () => this.sessionManager.getCwd(),
 			});
 		}
-		this.#unregisterRuntimeStateFinalizer = registerCoordinatorRuntimeStateFinalizer({
-			sessionId: this.sessionId,
-			cwd: this.sessionManager.getCwd(),
-			sessionFile: this.sessionManager.getSessionFile(),
+		this.#registerRuntimeStateFinalizer();
+		this.#unregisterBeforeMoveListener = this.sessionManager.registerBeforeMoveListener(async move => {
+			const admittedBeforeBarrier = this.#beginCoordinatorRescopeBarrier();
+			await Promise.allSettled([
+				...admittedBeforeBarrier.eventHandlers,
+				...admittedBeforeBarrier.releasedBarrierPersists,
+			]);
+			this.#bindPendingAgentEndToRescopeBarrier();
+			await this.#drainUnbarrieredCoordinatorPersists();
+			this.#coordinatorPersistGeneration += 1;
+			const moveId = crypto.randomUUID();
+			this.#coordinatorRescopeMoveId = moveId;
+			await prepareCoordinatorRuntimeStateRescope({
+				moveId,
+				sessionId: this.sessionId,
+				previousCwd: move.previousCwd,
+				newCwd: move.newCwd,
+				previousCwdIdentity: move.previousCwdIdentity,
+				newCwdIdentity: move.newCwdIdentity,
+				previousSessionFile: move.previousSessionFile ?? null,
+				newSessionFile: move.newSessionFile ?? null,
+			});
+		});
+		this.#unregisterMoveAbortListener = this.sessionManager.registerMoveAbortListener(async move => {
+			const moveId = this.#coordinatorRescopeMoveId;
+			try {
+				if (moveId && !move.preserveRecoveryJournal) {
+					await clearCoordinatorRuntimeStateRescope(
+						{
+							sessionId: this.sessionId,
+							cwd: move.newCwd,
+							sessionFile: move.newSessionFile ?? null,
+						},
+						moveId,
+						move.previousCwd,
+					);
+				}
+			} finally {
+				this.#coordinatorRescopeMoveId = undefined;
+				this.#endCoordinatorRescopeBarrier();
+			}
+		});
+		this.#unregisterMovePublicationListener = this.sessionManager.registerMovePublicationListener(async move => {
+			const moveId = this.#coordinatorRescopeMoveId;
+			if (!moveId) throw new Error("Coordinator rescope publication has no prepared move identity.");
+			await markCoordinatorRuntimeStateRescopePublishing(
+				{
+					sessionId: this.sessionId,
+					cwd: move.newCwd,
+					sessionFile: move.newSessionFile ?? null,
+				},
+				move.previousCwd,
+				moveId,
+			);
+		});
+		// Every committed rescope (`move_session`, `/move`, SDK/ACP `session.cwd.move`) funnels
+		// through SessionManager.moveTo, so one after-move listener covers all surfaces: it
+		// relocates the coordinator-shared runtime state to the new cwd (otherwise the identity
+		// fence refuses every later persist) and rebinds the postmortem finalizer, which
+		// otherwise keeps writing terminal state to the launch root's cwd/session file.
+		this.#unregisterAfterMoveListener = this.sessionManager.registerAfterMoveListener(async move => {
+			let completed = false;
+			try {
+				const relocated = await relocateCoordinatorRuntimeStateForRescope(
+					{
+						sessionId: this.sessionId,
+						cwd: move.newCwd,
+						sessionFile: this.sessionManager.getSessionFile() ?? null,
+						previousSessionFile: move.previousSessionFile ?? null,
+					},
+					move.previousCwd,
+				);
+				if (!relocated) throw new Error("Coordinator runtime state rescope was refused.");
+				await clearCoordinatorRuntimeStateRescope(
+					{
+						sessionId: this.sessionId,
+						cwd: move.newCwd,
+						sessionFile: this.sessionManager.getSessionFile() ?? null,
+					},
+					this.#coordinatorRescopeMoveId,
+					move.previousCwd,
+				);
+				completed = true;
+			} finally {
+				this.#registerRuntimeStateFinalizer();
+				if (completed) {
+					this.#coordinatorRescopeMoveId = undefined;
+					this.#endCoordinatorRescopeBarrier();
+				}
+			}
 		});
 		// Power assertions are taken per turn (see #beginInFlight); nothing acquired here.
 		this.#evalKernelOwnerId = config.evalKernelOwnerId ?? `agent-session:${Snowflake.next()}`;
@@ -4060,6 +4232,18 @@ export class AgentSession {
 		this.#retainedMemorySampler = config.retainedMemorySampler;
 		this.#ownedMcpManager = config.ownedMcpManager;
 		this.#startupTurnBarrier = config.startupTurnBarrier;
+		// Only arm the recovery barrier when a rescope journal is actually pending. Arming it
+		// unconditionally flips #startupTurnBarrier from absent to a (resolved) promise for
+		// every session, which makes barrier-gated post-turn work (e.g. the hidden-next-turn
+		// drain) take an extra scheduler hop and reorder against terminal-abort requeue.
+		const rescopeRecoveryContext = {
+			sessionId: this.sessionId,
+			cwd: this.sessionManager.getCwd(),
+			sessionFile: this.sessionManager.getSessionFile() ?? null,
+		};
+		if (hasCoordinatorRuntimeStateRescopeJournal(rescopeRecoveryContext)) {
+			this.extendStartupTurnBarrier(recoverCoordinatorRuntimeStateRescope(rescopeRecoveryContext));
+		}
 		this.#scopedModels = config.scopedModels ?? [];
 		this.#thinkingLevel = config.thinkingLevel;
 		this.#promptTemplates = config.promptTemplates ?? [];
@@ -5357,7 +5541,7 @@ export class AgentSession {
 	#coordinatorToolObservations = new WeakMap<object, CoordinatorToolObservation>();
 	#agentEventAdmission = new WeakMap<
 		object,
-		{ scope?: AttemptScope; sdkRunToken?: string; persistGeneration: number }
+		{ scope?: AttemptScope; sdkRunToken?: string; persistGeneration: number; persistBarrier?: Promise<void> }
 	>();
 
 	/**
@@ -5418,6 +5602,7 @@ export class AgentSession {
 			scope: this.#activeAttemptScope,
 			sdkRunToken: this.#activeSdkRunToken,
 			persistGeneration: this.#coordinatorPersistGeneration,
+			persistBarrier: this.#coordinatorRescopeBarrier,
 		});
 		// First statement of the listener: the observation must precede every claim,
 		// reservation, and async hop this handler performs.
@@ -5527,6 +5712,11 @@ export class AgentSession {
 				this.#resolveSessionSettlement();
 			}
 		})();
+		this.#coordinatorEventHandlers.add(handler);
+		void handler.then(
+			() => this.#coordinatorEventHandlers.delete(handler),
+			() => this.#coordinatorEventHandlers.delete(handler),
+		);
 		if (eventLease) eventLease.track("post_prompt", "agent-session-event", handler);
 		return handler;
 	};
@@ -5550,15 +5740,39 @@ export class AgentSession {
 				message: `${kind} ${outcome.status} for ${correlation}${safeError ? `: ${safeError}` : ""}`,
 			});
 		}
-		const persist = () =>
-			persistCoordinatorWorkerIntegrationOutcome(context, {
-				...outcome,
-				kind,
-				correlationId,
-				error: sanitizePostPublicationError(outcome.error),
-			});
-		const queued = this.#coordinatorPersistQueue.then(persist, persist);
-		this.#coordinatorPersistQueue = queued.catch(() => {});
+		const generation = this.#coordinatorPersistGeneration;
+		const barrier = this.#coordinatorRescopeBarrier;
+		const persist = async () => {
+			if (barrier) {
+				await barrier;
+				return await persistCoordinatorWorkerIntegrationOutcome(
+					{
+						sessionId: this.sessionId,
+						cwd: this.sessionManager.getCwd(),
+						sessionFile: this.sessionManager.getSessionFile(),
+					},
+					{
+						...outcome,
+						kind,
+						correlationId,
+						error: sanitizePostPublicationError(outcome.error),
+					},
+				);
+			}
+			return generation === this.#coordinatorPersistGeneration
+				? await persistCoordinatorWorkerIntegrationOutcome(context, {
+						...outcome,
+						kind,
+						correlationId,
+						error: sanitizePostPublicationError(outcome.error),
+					})
+				: undefined;
+		};
+		const queued = barrier
+			? barrier.then(() => this.#appendCoordinatorPersist(persist))
+			: this.#appendCoordinatorPersist(persist);
+		if (barrier) this.#trackReleasedBarrierPersist(queued);
+		else this.#trackUnbarrieredCoordinatorPersist(queued);
 		void queued.catch(error =>
 			logger.warn("Failed to persist terminal reconciliation outcome", { error: String(error) }),
 		);
@@ -5579,18 +5793,38 @@ export class AgentSession {
 	#queueCoordinatorRuntimeStatePersist(event: AgentSessionEvent, propagateFailure = false): Promise<void> {
 		if (isNonDispatchedToolEvent(event)) return Promise.resolve();
 		const observation = this.#coordinatorToolObservations.get(event);
+		const admission = this.#agentEventAdmission.get(event);
+		const barrier = admission?.persistBarrier;
+		if (barrier) {
+			const run = async () => {
+				await barrier;
+				await this.#persistRuntimeStateInBackground(
+					event,
+					{
+						sessionId: this.sessionId,
+						cwd: this.sessionManager.getCwd(),
+						sessionFile: this.sessionManager.getSessionFile(),
+					},
+					observation,
+					propagateFailure,
+				);
+			};
+			const queued = barrier.then(() => this.#appendCoordinatorPersist(run));
+			this.#trackReleasedBarrierPersist(queued);
+			return queued;
+		}
 		const context = {
 			sessionId: this.sessionId,
 			cwd: this.sessionManager.getCwd(),
 			sessionFile: this.sessionManager.getSessionFile(),
 		};
-		const generation = this.#agentEventAdmission.get(event)?.persistGeneration ?? this.#coordinatorPersistGeneration;
+		const generation = admission?.persistGeneration ?? this.#coordinatorPersistGeneration;
 		const run = () =>
 			generation === this.#coordinatorPersistGeneration
 				? this.#persistRuntimeStateInBackground(event, context, observation, propagateFailure)
 				: Promise.resolve();
-		const queued = this.#coordinatorPersistQueue.then(run, run);
-		this.#coordinatorPersistQueue = queued.catch(() => {});
+		const queued = this.#appendCoordinatorPersist(run);
+		this.#trackUnbarrieredCoordinatorPersist(queued);
 		return queued;
 	}
 
@@ -8440,8 +8674,23 @@ export class AgentSession {
 	}
 
 	async #dispose(): Promise<void> {
-		await this.sessionManager.joinCwdTransition();
 		const admissionClosed = this.#disposeAdmissionClosed ?? this.#closeSessionAdmission();
+		await admissionClosed;
+		await this.sessionManager.closeCwdMoveAdmission();
+		this.#isDisposed = true;
+		// Reject new direct Python starts as soon as disposal begins (synchronously,
+		// before any await) so callers cannot race a start against teardown.
+		this.#evalExecutionDisposing = true;
+		this.#abortActiveMidRunBarriers();
+		this.abortCompaction();
+		this.agent.abort();
+		this.agent.setMainAttemptScopeObserver(undefined);
+		// Disconnect the Agent event bridge NOW — before the maintenance join and the
+		// bounded idle / forceAbort below — so no agent_end emitted during teardown
+		// (including the one forceAbort emits) can re-enter #handleAgentEvent and start
+		// fresh post-turn maintenance or mutate the closing session. Maintenance promises
+		// are joined directly (not via events), so this does not affect the join.
+		this.#disconnectFromAgent();
 		// R2-5: join any in-flight mid-run maintenance invocation before teardown so the
 		// abort-aware maintenance promise (already aborted above) settles and cannot touch
 		// torn-down state afterward.
@@ -8465,7 +8714,6 @@ export class AgentSession {
 				this.agent.forceAbort("Session disposed");
 			}
 		}
-		await admissionClosed;
 		await this.#agentEndPublicationPromise;
 		await this.#queuedExtensionEvents;
 		await this.#agentEndHandlingPromise;
@@ -8542,6 +8790,14 @@ export class AgentSession {
 		this.#unregisterSessionMemorySettings = undefined;
 		if (ownerTerminalContextFromEnvironment() === null) this.#unregisterRuntimeStateFinalizer?.();
 		this.#unregisterRuntimeStateFinalizer = undefined;
+		this.#unregisterBeforeMoveListener?.();
+		this.#unregisterBeforeMoveListener = undefined;
+		this.#unregisterMoveAbortListener?.();
+		this.#unregisterMoveAbortListener = undefined;
+		this.#unregisterMovePublicationListener?.();
+		this.#unregisterMovePublicationListener = undefined;
+		this.#unregisterAfterMoveListener?.();
+		this.#unregisterAfterMoveListener = undefined;
 		await releaseTabsForOwner(this.sessionManager.getSessionId()).catch((error: unknown) =>
 			logger.warn("session dispose: releaseTabsForOwner failed", { error }),
 		);
@@ -8736,6 +8992,35 @@ export class AgentSession {
 		await this.awaitPendingContextTransformations();
 		await this.#waitForSessionSettlement();
 		await this.sessionManager.flush();
+	}
+
+	queueCoordinatorRuntimeStatePersistForTests(event: AgentSessionEvent, gate: Promise<void>): Promise<void> {
+		this.#agentEventAdmission.set(event, {
+			persistGeneration: this.#coordinatorPersistGeneration,
+			persistBarrier: this.#coordinatorRescopeBarrier,
+		});
+		const task = (async () => {
+			await gate;
+			await this.#queueCoordinatorRuntimeStatePersist(event, true);
+		})();
+		this.#coordinatorEventHandlers.add(task);
+		void task.then(
+			() => this.#coordinatorEventHandlers.delete(task),
+			() => this.#coordinatorEventHandlers.delete(task),
+		);
+		return task;
+	}
+
+	parkAgentEndForCoordinatorPersistForTests(event: Extract<AgentSessionEvent, { type: "agent_end" }>): void {
+		this.#agentEventAdmission.set(event, {
+			persistGeneration: this.#coordinatorPersistGeneration,
+			persistBarrier: this.#coordinatorRescopeBarrier,
+		});
+		this.#pendingAgentEndEmit = event;
+	}
+
+	flushParkedAgentEndForCoordinatorPersistForTests(): void {
+		this.#flushPendingAgentEnd();
 	}
 
 	async drainAsyncJobDeliveriesForAcp(options?: { timeoutMs?: number }): Promise<boolean> {
