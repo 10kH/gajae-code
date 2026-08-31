@@ -5047,6 +5047,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		const keyDigest = createHash("sha256").update(idempotencyKey).digest("hex");
 		return path.join(namespaceDir, "idempotency", `${keyDigest}.json`);
 	}
+	const idempotencyFlights = new Map<string, { requestDigest: string; promise: Promise<Record<string, unknown>> }>();
 	async function withOrderedSessionStateLocks<T>(
 		lockFiles: readonly string[],
 		operation: () => Promise<T>,
@@ -5182,7 +5183,23 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			});
 			return response;
 		};
-		return lockAlreadyHeld ? execute() : withSessionStateLock(lockFile, execute);
+		const existingFlight = idempotencyFlights.get(keyDigest);
+		if (existingFlight) {
+			if (existingFlight.requestDigest !== requestDigest)
+				return {
+					ok: false,
+					error: { code: "idempotency_conflict", message: "idempotency key was used with a different request" },
+				};
+			return await existingFlight.promise;
+		}
+		const promise = lockAlreadyHeld ? execute() : withSessionStateLock(lockFile, execute);
+		const flight = { requestDigest, promise };
+		idempotencyFlights.set(keyDigest, flight);
+		try {
+			return await promise;
+		} finally {
+			if (idempotencyFlights.get(keyDigest) === flight) idempotencyFlights.delete(keyDigest);
+		}
 	}
 
 	async function brokerSession(

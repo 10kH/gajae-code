@@ -10,6 +10,7 @@
 ### Fixed
 
 - Post-install update verification now preserves a bounded, secret-redacted stderr/stdout cause when the newly installed `gjc --version` exits unsuccessfully, so runtime guards such as Bun version incompatibilities remain actionable instead of collapsing to a generic verification failure. (#5108)
+- Concurrent coordinator mutations sharing one idempotency key now join the same in-process flight before taking the durable key lock, so a slow accepted prompt cannot make its retry time out as unavailable. Conflicting in-flight requests still fail closed, completed responses remain durably replayable, and different keys remain isolated. (#5110)
 
 - Managed-session file identities now use one canonical unsigned 64-bit representation across stat/native boundaries and replacement cleanup receipts. Native Windows file IDs surfaced as signed negative bigints no longer create double-hyphen receipt names that block persistence or reopen; already-written signed receipt names and interrupted pending receipts are recovered only through the existing identity-bound, fail-closed reconciliation paths. (#5095)
 

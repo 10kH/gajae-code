@@ -2788,7 +2788,23 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 	it("serializes concurrent same-key retries into one durable turn", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
-		const server = await createSdkControlServer(root, controls);
+		const receiptPersisted = Promise.withResolvers<void>();
+		const releaseFinalization = Promise.withResolvers<void>();
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			{
+				afterPromptReceiptPersisted: async () => {
+					receiptPersisted.resolve();
+					await releaseFinalization.promise;
+				},
+			},
+		);
 		await registerSdkSession(server, root);
 		const request = {
 			session_id: "visible-session",
@@ -2796,12 +2812,110 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			idempotency_key: "concurrent-prompt-key",
 			allow_mutation: true,
 		};
-		const [first, replay] = await Promise.all([
-			server.callTool("gjc_coordinator_send_prompt", request),
-			server.callTool("gjc_coordinator_send_prompt", request),
-		]);
+		const firstPromise = server.callTool("gjc_coordinator_send_prompt", request);
+		await receiptPersisted.promise;
+		const replayPromise = server.callTool("gjc_coordinator_send_prompt", request);
+		await Bun.sleep(2_100);
+		releaseFinalization.resolve();
+		const [first, replay] = await Promise.all([firstPromise, replayPromise]);
 		expect(replay).toEqual(first);
 		expect(lifecycleControls(controls).filter(control => control.operation === "turn.prompt")).toHaveLength(1);
+	});
+	it("rejects an in-flight same-key conflict without joining the owned turn", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const receiptPersisted = Promise.withResolvers<void>();
+		const releaseFinalization = Promise.withResolvers<void>();
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			{
+				afterPromptReceiptPersisted: async () => {
+					receiptPersisted.resolve();
+					await releaseFinalization.promise;
+				},
+			},
+		);
+		await registerSdkSession(server, root);
+		const firstPromise = server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "owned prompt",
+			idempotency_key: "in-flight-conflict-key",
+			allow_mutation: true,
+		});
+		await receiptPersisted.promise;
+		const conflict = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "conflicting prompt",
+			idempotency_key: "in-flight-conflict-key",
+			allow_mutation: true,
+		});
+		expect(conflict).toMatchObject({ ok: false, error: { code: "idempotency_conflict" } });
+		releaseFinalization.resolve();
+		await expect(firstPromise).resolves.toMatchObject({ ok: true, operation: "turn.prompt" });
+		expect(lifecycleControls(controls).filter(control => control.operation === "turn.prompt")).toHaveLength(1);
+	});
+	it("keeps different idempotency keys isolated while one prompt finalization is in flight", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const receiptPersisted = Promise.withResolvers<void>();
+		const releaseFinalization = Promise.withResolvers<void>();
+		const sessions = ["visible-session", "isolated-session"].map(sessionId => ({
+			sessionId,
+			locator: { repo: root },
+			live: true,
+			endpointGeneration: 1,
+			pid: 101,
+			endpointMtimeMs: 1,
+		}));
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			undefined,
+			undefined,
+			sessions,
+			undefined,
+			undefined,
+			{
+				afterPromptReceiptPersisted: async sessionId => {
+					if (sessionId !== "visible-session") return;
+					receiptPersisted.resolve();
+					await releaseFinalization.promise;
+				},
+			},
+		);
+		await registerSdkSession(server, root);
+		await server.callTool("gjc_coordinator_register_session", {
+			session_id: "isolated-session",
+			cwd: root,
+			tmux_session: "isolated-session",
+			tmux_target: "isolated-session:0.0",
+			idempotency_key: "register-isolated-session",
+			allow_mutation: true,
+		});
+		const firstPromise = server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "held prompt",
+			idempotency_key: "held-prompt-key",
+			allow_mutation: true,
+		});
+		await receiptPersisted.promise;
+		await expect(
+			server.callTool("gjc_coordinator_send_prompt", {
+				session_id: "isolated-session",
+				prompt: "independent prompt",
+				idempotency_key: "independent-prompt-key",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true, session_id: "isolated-session", operation: "turn.prompt" });
+		releaseFinalization.resolve();
+		await expect(firstPromise).resolves.toMatchObject({ ok: true, session_id: "visible-session" });
+		expect(lifecycleControls(controls).filter(control => control.operation === "turn.prompt")).toHaveLength(2);
 	});
 	it("recovers a committed report after the outer idempotency receipt is left in progress", async () => {
 		const root = await tempRoot();
