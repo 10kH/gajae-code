@@ -677,6 +677,51 @@ for (const terminalType of ["agent_end"] as const) {
 	});
 }
 
+test("ACP malformed agent_failed cannot publish stale idle state over a replacement prompt", async () => {
+	const fixture = await createFixture();
+	try {
+		const failed = prompt(fixture, "malformed failure terminal");
+		await bounded(fixture.promptDelivered, "prompt delivery");
+		fixture.sendTerminal({
+			type: "agent_failed",
+			sessionId: "prompt-terminal-session",
+			commandId: "prompt-terminal-command",
+			turnId: "prompt-terminal-turn",
+			error: { code: 503, message: "invalid diagnostic" },
+		});
+		await expect(bounded(failed, "malformed failure rejection")).rejects.toMatchObject({
+			code: "connection_closed",
+		});
+		const updatesAfterFailure = fixture.updates.length;
+
+		const replacement = prompt(fixture, "replacement after malformed failure");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(replacement, "replacement completion")).toEqual({ stopReason: "end_turn" });
+		await waitFor(
+			() =>
+				fixture.updates
+					.slice(updatesAfterFailure)
+					.some(
+						update =>
+							update.update.sessionUpdate === "session_info_update" &&
+							(update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase === "idle",
+					),
+			"replacement idle update",
+		);
+		expect(
+			fixture.updates
+				.slice(updatesAfterFailure)
+				.filter(
+					update =>
+						update.update.sessionUpdate === "session_info_update" &&
+						(update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase === "idle",
+				),
+		).toHaveLength(1);
+	} finally {
+		fixture.dispose();
+	}
+});
+
 test("ACP preserves the settlement-grace failure diagnostic", async () => {
 	const fixture = await createFixture();
 	try {

@@ -2722,6 +2722,7 @@ export class AcpAgent implements Agent {
 					id,
 					activePrompt,
 					new AcpSdkAdapterError("connection_closed", `ACP prompt terminal was invalid: ${detail}`),
+					event.type !== "agent_failed",
 				);
 				return;
 			}
@@ -2860,6 +2861,7 @@ export class AcpAgent implements Agent {
 		id: string,
 		waiter: PromptWaiter,
 		error: AcpSdkAdapterError,
+		publishIdle = true,
 	): Promise<void> {
 		if (record.activePrompt !== waiter || waiter.settled) return;
 		record.activePrompt = undefined;
@@ -2879,7 +2881,7 @@ export class AcpAgent implements Agent {
 		// forever). Skipping the idle publish entirely is what left a client composer
 		// spinning on a turn that already produced its terminal.
 		waiter.reject(error);
-		void this.#publishPromptPhaseIdle(id, record.adapter);
+		if (publishIdle) void this.#publishPromptPhaseIdle(id, record.adapter);
 	}
 
 	/**
