@@ -8810,6 +8810,10 @@ export class AgentSession {
 		this.#workflowGateEmitter = undefined;
 		this.#notifyWorkflowGateEmitterChanged(this.sessionId, undefined);
 		await this.#flushWorkerIntegrationAttempt();
+		// Worker integration completion can enqueue terminal reconciliation while the
+		// flush above is pending; drain that late producer before disposal resolves.
+		await this.#coordinatorPersistQueue;
+		await this.#drainUnbarrieredCoordinatorPersists();
 		await (this.#disposePostPromptDrain ?? this.#cancelPostPromptTasks());
 		// Cancel jobs this agent registered so a subagent's teardown doesn't
 		// leak its background bash/task work into the parent's manager. Only
