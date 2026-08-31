@@ -160,6 +160,8 @@ type SessionRecord = {
 	reconnectUnsubscribe: () => void;
 	/** Per-session frame work queue; callbacks never race prompt ownership. */
 	frameTail: Promise<void>;
+	/** Prior nonterminal work draining after an out-of-queue terminal settlement. */
+	terminalDrain?: Promise<void>;
 	/** Monotonic at WebSocket ingress, before queued work begins. */
 	inboundSequence: number;
 	/** Updated at ingress so a prompt acknowledgement can distinguish a steer from a fresh turn. */
@@ -1631,6 +1633,8 @@ export class AcpAgent implements Agent {
 		if (!record) throw new AcpSdkAdapterError("not_found", `Unknown session, not found: ${params.sessionId}`);
 		if (record.activePrompt) throw new AcpSdkAdapterError("conflict", "ACP session already has an active prompt.");
 		if (record.authFailure) throw new AcpSdkAdapterError("authentication_failed", record.authFailure);
+		if (record.terminalDrain)
+			throw new AcpSdkAdapterError("conflict", "ACP session is still draining frames from the previous prompt.");
 		if (this.#retiredPromptAcknowledgements.has(params.sessionId))
 			throw new AcpSdkAdapterError(
 				"conflict",
@@ -1851,10 +1855,10 @@ export class AcpAgent implements Agent {
 					: record.frameTail.then(
 							async () => await this.#handleSdkFrame(params.sessionId, record.adapter, deferredFrame),
 						);
-				record.frameTail = task.catch(
-					async error =>
-						await this.#failSession(params.sessionId, record.adapter, this.#frameProcessingFailure(error)),
-				);
+				record.frameTail = task.catch(async error => {
+					if (record.terminalDrain) return;
+					await this.#failSession(params.sessionId, record.adapter, this.#frameProcessingFailure(error));
+				});
 			}
 			this.#settlePrompt(params.sessionId, record, waiter);
 			return await response;
@@ -2758,15 +2762,22 @@ export class AcpAgent implements Agent {
 		++record.inboundSequence;
 		const received = receivedSdkEvent(frame);
 		if (received?.event.type === "agent_end" || received?.event.type === "agent_failed") {
+			const pendingFrames = record.frameTail;
+			let drain: Promise<void>;
+			drain = pendingFrames.finally(() => {
+				if (record.terminalDrain === drain) record.terminalDrain = undefined;
+			});
+			record.terminalDrain = drain;
 			void this.#handleSdkFrame(id, adapter, frame).catch(async error => {
 				await this.#failSession(id, adapter, this.#frameProcessingFailure(error));
 			});
 			return;
 		}
 		const task = record.frameTail.then(async () => await this.#handleSdkFrame(id, adapter, frame));
-		record.frameTail = task.catch(
-			async error => await this.#failSession(id, adapter, this.#frameProcessingFailure(error)),
-		);
+		record.frameTail = task.catch(async error => {
+			if (record.terminalDrain) return;
+			await this.#failSession(id, adapter, this.#frameProcessingFailure(error));
+		});
 	}
 
 	async #handleSdkFrame(id: string, adapter: AcpSdkAdapter, frame: JsonObject): Promise<void> {
