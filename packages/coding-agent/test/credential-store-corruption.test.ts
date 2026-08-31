@@ -204,6 +204,33 @@ describe("credential SQLite corruption classification", () => {
 			database.close();
 		}
 	});
+
+	test("OAuth refresh persistence propagates credential SQLite corruption", async () => {
+		const root = await tempRoot("gjc-credential-refresh-write-");
+		const dbPath = path.join(root, "agent.db");
+		const store = await SqliteAuthCredentialStore.open(dbPath);
+		store.saveOAuth("anthropic", {
+			access: "expired-access",
+			refresh: "refresh-token",
+			expires: Date.now() - 60_000,
+			email: "refresh@example.test",
+		});
+		const authStorage = new AuthStorage(store, {
+			refreshOAuthCredential: async () => ({
+				access: "fresh-access",
+				refresh: "fresh-refresh",
+				expires: Date.now() + 60_000,
+				email: "refresh@example.test",
+			}),
+		});
+		await authStorage.reload();
+		store.updateAuthCredential = () => {
+			throw Object.assign(new Error("database disk image is malformed"), { code: "SQLITE_CORRUPT" });
+		};
+
+		await expect(authStorage.getApiKey("anthropic")).rejects.toMatchObject({ code: "SQLITE_CORRUPT" });
+		store.close();
+	});
 });
 
 describe("credential corruption presentation", () => {

@@ -37,6 +37,7 @@ import type {
 	OAuthProvider,
 	OAuthProviderId,
 } from "./utils/oauth/types";
+import { isSqliteCorruptionError } from "./utils/sqlite-errors";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Credential Types
@@ -5408,6 +5409,7 @@ export class AuthStorage {
 			this.#recordSessionCredential(provider, sessionId, "oauth", selection.index);
 			return { apiKey: result.apiKey, credential: updated };
 		} catch (error) {
+			if (isSqliteCorruptionError(error)) throw error;
 			// Auth-broker errors retain the sanitized upstream body separately from
 			// their transport message. Include that body for failure classification
 			// (the broker's 500 envelope otherwise hides `invalid_grant`) while
