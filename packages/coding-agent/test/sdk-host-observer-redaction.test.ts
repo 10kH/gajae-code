@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import {
 	BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD,
-	redactBrokerRuntimeCloseCapability,
+	redactBrokerRuntimeCapabilities,
 	redactObservedRequestContent,
 } from "../src/sdk/host/control/runtime-gate";
 
@@ -145,7 +145,7 @@ describe("observed request redaction", () => {
 			operation: "session.close",
 			input: { sessionId: "child", [BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD]: "broker-only" },
 		};
-		const observed = redactObservedRequestContent(redactBrokerRuntimeCloseCapability(closeFrame)) as {
+		const observed = redactObservedRequestContent(redactBrokerRuntimeCapabilities(closeFrame)) as {
 			input: Record<string, unknown>;
 		};
 		expect(JSON.stringify(observed)).not.toContain("broker-only");

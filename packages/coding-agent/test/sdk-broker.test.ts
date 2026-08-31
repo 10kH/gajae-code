@@ -3332,7 +3332,7 @@ describe("SDK broker identity and discovery", () => {
 			await broker.index.append({
 				type: "host_registered",
 				sessionId,
-				locator: { repo: dir, stateRoot },
+				locator: { cwd: dir, worktreeRoot: null, stateRoot },
 				endpointGeneration: 1,
 				pid: process.pid,
 				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
@@ -3341,7 +3341,7 @@ describe("SDK broker identity and discovery", () => {
 			await broker.index.append({
 				type: "host_heartbeat",
 				sessionId,
-				locator: { repo: dir, stateRoot },
+				locator: { cwd: dir, worktreeRoot: null, stateRoot },
 				endpointGeneration: 1,
 				pid: process.pid,
 			});
@@ -3382,7 +3382,7 @@ describe("SDK broker identity and discovery", () => {
 			await broker.index.append({
 				type: "host_registered",
 				sessionId,
-				locator: { repo: dir, stateRoot },
+				locator: { cwd: dir, worktreeRoot: null, stateRoot },
 				endpointGeneration: 2,
 				pid: process.pid,
 				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
@@ -3407,7 +3407,7 @@ describe("SDK broker identity and discovery", () => {
 			await broker.index.append({
 				type: "host_registered",
 				sessionId,
-				locator: { repo: dir, stateRoot },
+				locator: { cwd: dir, worktreeRoot: null, stateRoot },
 				endpointGeneration: 3,
 				pid: process.pid,
 				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
