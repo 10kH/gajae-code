@@ -29,6 +29,7 @@ type Fixture = {
 	idleUpdateEntered: Promise<void>;
 	agentMessageUpdateEntered: Promise<void>;
 	failureDiagnosticEntered: Promise<void>;
+	terminalReservationEntered: Promise<void>;
 	promptDeliveryCount(): number;
 	sendStopped(reason: StoppedReason): void;
 	sendFailed(code: FailedCode): void;
@@ -93,6 +94,7 @@ async function createFixture(
 		deferFirstPromptAcknowledgement?: boolean;
 		reusePromptCorrelationOnSecond?: boolean;
 		failBrokerSessionClose?: boolean;
+		observeTerminalReservation?: boolean;
 	} = {},
 ): Promise<Fixture> {
 	const tempDir = TempDir.createSync("@sdk-acp-prompt-terminal-");
@@ -113,6 +115,7 @@ async function createFixture(
 	const agentMessageUpdateEntered = Promise.withResolvers<void>();
 	const failureDiagnosticRelease = Promise.withResolvers<void>();
 	const failureDiagnosticEntered = Promise.withResolvers<void>();
+	const terminalReservationEntered = Promise.withResolvers<void>();
 	let blockNextIdleUpdate = false;
 	let blockNextWorkingUpdate = options.blockInitialWorkingUpdate === true;
 	const delivered = Promise.withResolvers<void>();
@@ -413,6 +416,21 @@ async function createFixture(
 		} as unknown as AgentSideConnection,
 		{
 			agentDir,
+			...(options.observeTerminalReservation
+				? {
+						promptWatchdogClock: {
+							now: () => Date.now(),
+							schedule: () => {
+								let armed = true;
+								return () => {
+									if (!armed) return;
+									armed = false;
+									terminalReservationEntered.resolve();
+								};
+							},
+						},
+					}
+				: {}),
 			...(options.cancelSettlementGraceMs === undefined
 				? {}
 				: { cancelSettlementGraceMs: options.cancelSettlementGraceMs }),
@@ -441,6 +459,7 @@ async function createFixture(
 		idleUpdateEntered: idleUpdateEntered.promise,
 		agentMessageUpdateEntered: agentMessageUpdateEntered.promise,
 		failureDiagnosticEntered: failureDiagnosticEntered.promise,
+		terminalReservationEntered: terminalReservationEntered.promise,
 		promptDeliveryCount: () => promptDeliveries,
 		sendStopped,
 		sendFailed,
@@ -1306,7 +1325,11 @@ test("ACP terminal processing preserves FIFO behind an earlier correlated update
 });
 
 test("ACP background publication failure remains fatal after a prompt generation starts", async () => {
-	const fixture = await createFixture({ blockInitialWorkingUpdate: true, rejectBlockedWorkingUpdate: true });
+	const fixture = await createFixture({
+		blockInitialWorkingUpdate: true,
+		rejectBlockedWorkingUpdate: true,
+		observeTerminalReservation: true,
+	});
 	try {
 		fixture.sendTerminal({ type: "agent_start", sessionId: "prompt-terminal-session" });
 		await bounded(fixture.workingUpdateEntered, "entered background working publication");
@@ -1314,6 +1337,7 @@ test("ACP background publication failure remains fatal after a prompt generation
 		void pending.catch(() => undefined);
 		await bounded(fixture.promptDelivered, "prompt delivery");
 		fixture.sendStopped("end_turn");
+		await bounded(fixture.terminalReservationEntered, "terminal reservation");
 		fixture.releaseWorkingUpdate();
 		await expect(bounded(pending, "background publication session failure")).rejects.toMatchObject({
 			code: "frame_processing_failed",
