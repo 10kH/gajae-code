@@ -176,6 +176,7 @@ export { CURSOR_CLIENT_VERSION };
 
 const conversationStateCache = new Map<string, ConversationStateStructure>();
 const conversationBlobStores = new Map<string, Map<string, Uint8Array>>();
+const conversationUsageContextCache = new Map<string, CursorUsageContext>();
 
 // F15: bound the module-global conversation caches so long-lived / many-session use cannot
 // grow them without limit. LRU by conversation count + TTL on idle conversations.
@@ -187,6 +188,7 @@ const conversationLastAccess = new Map<string, number>();
 export function disposeCursorConversation(conversationId: string): void {
 	conversationStateCache.delete(conversationId);
 	conversationBlobStores.delete(conversationId);
+	conversationUsageContextCache.delete(conversationId);
 	conversationLastAccess.delete(conversationId);
 }
 
@@ -666,6 +668,9 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			const blobStore = conversationBlobStores.get(conversationId) ?? new Map<string, Uint8Array>();
 			conversationBlobStores.set(conversationId, blobStore);
 			const cachedState = conversationStateCache.get(conversationId);
+			const usageContext = buildCursorUsageContext(context);
+			const previousUsageContext = conversationUsageContextCache.get(conversationId);
+			conversationUsageContextCache.set(conversationId, usageContext);
 			const { requestBytes, conversationState } = buildGrpcRequest(model, context, options, {
 				conversationId,
 				blobStore,
@@ -711,6 +716,23 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			let resolveH2: (() => void) | undefined;
 			let rejectH2: ((error: Error) => void) | undefined;
 			const inboundEnd = Promise.withResolvers<void>();
+			let inboundSettled = false;
+			let inboundTimeout: NodeJS.Timeout | undefined;
+			const settleInbound = (error?: Error) => {
+				if (inboundSettled) return;
+				inboundSettled = true;
+				if (inboundTimeout) {
+					clearTimeout(inboundTimeout);
+					inboundTimeout = undefined;
+				}
+				if (error) inboundEnd.reject(error);
+				else inboundEnd.resolve();
+			};
+			void inboundEnd.promise.catch(() => {});
+			inboundTimeout = setTimeout(
+				() => settleInbound(new Error("Cursor stream did not reach its inbound terminal frame")),
+				options?.streamIdleTimeoutMs ?? getStreamIdleTimeoutMs(),
+			);
 			coordinator = new CursorRequestCoordinator(
 				h2Request,
 				stopHeartbeat,
@@ -726,8 +748,14 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				},
 				options?.streamIdleTimeoutMs ?? getStreamIdleTimeoutMs(),
 			);
-			h2Client.on("error", error => coordinator.fail(error));
-			h2Request.on("error", error => coordinator.fail(error));
+			h2Client.on("error", error => {
+				settleInbound(error);
+				coordinator.fail(error);
+			});
+			h2Request.on("error", error => {
+				settleInbound(error);
+				coordinator.fail(error);
+			});
 
 			stream.push({ type: "start", partial: output });
 
@@ -736,7 +764,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			let currentThinkingBlock: (ThinkingContent & { index: number }) | null = null;
 			let currentToolCall: ToolCallState | null = null;
 			const cachedConversationUsedTokens =
-				cachedState && countCursorHistoryTurns(context.messages) >= (cachedState.turns?.length ?? 0)
+				cachedState && canReuseCursorUsageContext(previousUsageContext, usageContext)
 					? (cachedState.tokenDetails?.usedTokens ?? 0)
 					: 0;
 			const usageState: UsageState = {
@@ -786,12 +814,16 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				}
 			});
 			h2Request.on("end", () => {
-				inboundEnd.resolve();
+				settleInbound();
 				if (!coordinator.hasTurnEnded()) {
 					coordinator.fail(new Error("Cursor stream ended before turnEnded"));
 				}
 			});
+			h2Request.on("close", () => {
+				if (!inboundSettled) settleInbound(new Error("Cursor stream closed before inbound completion"));
+			});
 			onAbort = () => {
+				settleInbound(new Error("Request was aborted"));
 				coordinator.fail(new Error("Request was aborted"));
 			};
 			if (options?.signal) {
@@ -992,6 +1024,11 @@ interface UsageState {
 	checkpointOutputTokens: number;
 	/** Whether the current stream received a checkpoint, including an explicit zero. */
 	hasConversationCheckpoint: boolean;
+}
+
+interface CursorUsageContext {
+	systemPromptKey: string;
+	messageKeys: string[];
 }
 
 async function handleServerMessage(
@@ -3260,24 +3297,23 @@ function buildConversationTurns(messages: Message[], blobStore: Map<string, Uint
 	return turns;
 }
 
-function countCursorHistoryTurns(messages: Message[]): number {
-	let count = 0;
-	for (let i = 0; i < messages.length; i++) {
-		const message = messages[i];
-		if (
-			(message.role !== "user" && message.role !== "developer") ||
-			(extractUserMessageText(message).length === 0 && !hasUserMessageImages(message))
-		) {
-			continue;
-		}
-		for (let j = i + 1; j < messages.length; j++) {
-			if (messages[j].role === "user" || messages[j].role === "developer") {
-				count++;
-				break;
-			}
-		}
-	}
-	return count;
+function buildCursorUsageContext(context: Context): CursorUsageContext {
+	return {
+		systemPromptKey: hashCursorUsageValue(context.systemPrompt ?? []),
+		messageKeys: context.messages.map(message => hashCursorUsageValue(message)),
+	};
+}
+
+function hashCursorUsageValue(value: unknown): string {
+	return createHash("sha256")
+		.update(JSON.stringify(value) ?? "")
+		.digest("hex");
+}
+
+function canReuseCursorUsageContext(previous: CursorUsageContext | undefined, current: CursorUsageContext): boolean {
+	if (!previous || previous.systemPromptKey !== current.systemPromptKey) return false;
+	if (previous.messageKeys.length > current.messageKeys.length) return false;
+	return previous.messageKeys.every((key, index) => key === current.messageKeys[index]);
 }
 
 /** Exported for tests: decodes Cursor history blobs built from conversation messages. */
