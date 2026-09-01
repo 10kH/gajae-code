@@ -451,6 +451,8 @@ export async function loadCapabilityForHome<T>(
 		canonicalizeThroughExistingAncestor(resolvedHome),
 		canonicalizeThroughExistingAncestor(lexicalCwd),
 	]);
+	const homeStats = await fs.stat(canonicalHome);
+	const homeIdentity = { dev: homeStats.dev, ino: homeStats.ino };
 	// Every explicit-home cwd must resolve inside the supplied physical home.
 	// Allowing an outside cwd would let repository and plugin-registry discovery
 	// walk unrelated ancestors before the isolated boundary can take effect.
@@ -476,6 +478,7 @@ export async function loadCapabilityForHome<T>(
 	await assertExplicitHomeRoots(canonicalHome, cwd, Boolean(options.agentDir), effectiveProviderIds);
 	const repoRootCandidate = await findRepoRoot(cwd, canonicalHome, {
 		isolatedHome: true,
+		homeIdentity,
 		home: canonicalHome,
 		bypassCache: true,
 	});
@@ -490,6 +493,7 @@ export async function loadCapabilityForHome<T>(
 		userAgentDir,
 		repoRoot,
 		isolatedHome: true,
+		homeIdentity,
 		settings: isolatedOptions.settings,
 	};
 
