@@ -493,7 +493,7 @@ function oidcRequestFailure(url: string, response: Response): string {
  * Non-2xx responses without an `error` field still fail closed.
  */
 async function createTokenOnce(url: string, init: RequestInit & { signal?: AbortSignal }): Promise<CreateTokenResult> {
-	const response = await fetch(url, init);
+	const response = await fetch(url, { ...init, redirect: "error" });
 	const rawBody = await response.text();
 	let data: CreateTokenSuccess | CreateTokenError;
 	try {
