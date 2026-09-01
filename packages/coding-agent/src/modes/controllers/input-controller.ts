@@ -420,6 +420,14 @@ export class InputController {
 			if (this.ctx.cancelPendingSubmission()) {
 				return true;
 			}
+			if (options.processes && this.ctx.session.isBashRunning) {
+				this.ctx.session.abortBash();
+				return true;
+			}
+			if (options.processes && this.ctx.session.isEvalRunning) {
+				this.ctx.session.abortEval();
+				return true;
+			}
 			// A queued steer on a live stream is owned by the steering branch below,
 			// which silently consumes it and auto-continues. This branch counts the same
 			// queue as cancellable work, and a streaming turn always has the indicator
@@ -432,6 +440,8 @@ export class InputController {
 				options.streaming === true &&
 				this.ctx.session.isStreaming &&
 				this.ctx.session.hasQueuedSteering &&
+				!this.ctx.session.isBashRunning &&
+				!this.ctx.session.isEvalRunning &&
 				!this.#steerConsumePending
 			) {
 				this.#steerConsumePending = true;

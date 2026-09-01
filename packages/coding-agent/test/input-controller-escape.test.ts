@@ -1030,6 +1030,36 @@ describe("InputController escape behavior", () => {
 		expect(editor.getText()).toBe("do this instead");
 	});
 
+	it("preserves bash precedence over queued-steer consumption with the busy indicator mounted", () => {
+		const { ctx, editor, spies } = createContext();
+		(ctx.session as { isStreaming: boolean; hasQueuedSteering: boolean; isBashRunning: boolean }).isStreaming = true;
+		(ctx.session as { hasQueuedSteering: boolean; isBashRunning: boolean }).hasQueuedSteering = true;
+		(ctx.session as { isBashRunning: boolean }).isBashRunning = true;
+		ctx.loadingAnimation = {} as InteractiveModeContext["loadingAnimation"];
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.onEscape?.();
+
+		expect(spies.abortBash).toHaveBeenCalledTimes(1);
+		expect(spies.abort).not.toHaveBeenCalled();
+	});
+
+	it("preserves python precedence over queued-steer consumption with the busy indicator mounted", () => {
+		const { ctx, editor, spies } = createContext();
+		(ctx.session as { isStreaming: boolean; hasQueuedSteering: boolean; isEvalRunning: boolean }).isStreaming = true;
+		(ctx.session as { hasQueuedSteering: boolean; isEvalRunning: boolean }).hasQueuedSteering = true;
+		(ctx.session as { isEvalRunning: boolean }).isEvalRunning = true;
+		ctx.loadingAnimation = {} as InteractiveModeContext["loadingAnimation"];
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.onEscape?.();
+
+		expect(spies.abortEval).toHaveBeenCalledTimes(1);
+		expect(spies.abort).not.toHaveBeenCalled();
+	});
+
 	it("consumes a queued steer on the first Ctrl+C while the streaming busy indicator is mounted", () => {
 		const { ctx, inputListeners, spies } = createContext();
 		(ctx.session as { isStreaming: boolean; hasQueuedSteering: boolean }).isStreaming = true;
