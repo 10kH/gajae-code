@@ -1002,7 +1002,7 @@ async function handleServerMessage(
 			requestContextRules,
 		);
 	} else if (msgCase === "conversationCheckpointUpdate") {
-		handleConversationCheckpointUpdate(msg.message.value, output, usageState, onConversationCheckpoint);
+		handleConversationCheckpointUpdate(msg.message.value, usageState, onConversationCheckpoint);
 	}
 }
 
@@ -2857,7 +2857,6 @@ function processInteractionUpdate(
 
 function handleConversationCheckpointUpdate(
 	checkpoint: ConversationStateStructure,
-	output: AssistantMessage,
 	usageState: UsageState,
 	onConversationCheckpoint?: (checkpoint: ConversationStateStructure) => void,
 ): void {

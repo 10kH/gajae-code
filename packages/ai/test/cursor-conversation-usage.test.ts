@@ -1,8 +1,7 @@
 import { describe, expect, it } from "bun:test";
 
-import type { Usage } from "../src/types";
-
 import { finalizeCursorUsageForTest } from "../src/providers/cursor";
+import type { Usage } from "../src/types";
 
 /**
  * Mirror of `calculatePromptTokens` in `@gajae-code/agent`, which drives the
