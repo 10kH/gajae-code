@@ -136,8 +136,6 @@ interface PromptWaiter {
 	/** Whether ANY overlapping cancel attempt for this prompt was acknowledged:
 	 *  a later failed attempt must not erase an earlier success (review thread P2). */
 	cancelAcknowledged?: boolean;
-	/** Inbound sequence when cancellation was acknowledged; newer activity remains authoritative. */
-	cancelAcknowledgedSequence?: number;
 	/** In-flight cancel attempts for this prompt: cancellation intent must stay
 	 *  set while any attempt can still acknowledge, so a failure only clears
 	 *  the shared flag when no attempt remains pending (review thread P2). */
@@ -171,6 +169,7 @@ type SessionRecord = {
 	inboundSequence: number;
 	/** Updated at ingress so a prompt acknowledgement can distinguish a steer from a fresh turn. */
 	busy: boolean;
+	backgroundBusy: boolean;
 	/** Start/update args retained because tool_execution_end does not carry them. */
 	toolArgs: Map<string, unknown>;
 	/** Message projection state for correlationless session-scoped assistant events. */
@@ -1928,7 +1927,6 @@ export class AcpAgent implements Agent {
 				);
 			if (waiter) {
 				waiter.cancelAcknowledged = true;
-				waiter.cancelAcknowledgedSequence = record.inboundSequence;
 			}
 			if (waiter && record.activePrompt !== waiter) {
 				waiter.cancelAttemptResolve?.(true);
@@ -2016,7 +2014,7 @@ export class AcpAgent implements Agent {
 		// when nothing settled the prompt the client already asked to cancel.
 		if (this.#sessions.get(id) !== record || record.activePrompt !== waiter || waiter.settled) return;
 		record.activePrompt = undefined;
-		if (waiter.cancelAcknowledgedSequence === record.inboundSequence) record.busy = false;
+		if (!record.backgroundBusy) record.busy = false;
 		clearPromptWatchdog(waiter);
 		record.cancelRequested = false;
 		waiter.settled = true;
@@ -2333,6 +2331,7 @@ export class AcpAgent implements Agent {
 				inboundSequence: 0,
 				connectionId: adapter.connectionId,
 				busy: false,
+				backgroundBusy: false,
 				toolArgs: new Map(),
 			};
 			record.unsubscribe = adapter.onFrame(frame => this.#enqueueSdkFrame(id, adapter!, frame));
@@ -2648,12 +2647,26 @@ export class AcpAgent implements Agent {
 
 	#observeSessionActivity(record: SessionRecord, frame: JsonObject): void {
 		if (frame.type === "activity") {
-			if (frame.state === "busy") record.busy = true;
-			else if (frame.state === "idle") record.busy = false;
+			if (frame.state === "busy") {
+				record.busy = true;
+				if (!record.activePrompt) record.backgroundBusy = true;
+			} else if (frame.state === "idle") {
+				record.busy = false;
+				record.backgroundBusy = false;
+			}
 			return;
 		}
 		const event = receivedSdkEvent(frame)?.event;
-		if (event?.type === "agent_start") record.busy = true;
+		if (event?.type === "agent_start") {
+			record.busy = true;
+			const correlation = sdkFrameCorrelation(frame, event);
+			if (
+				!record.activePrompt ||
+				!correlation ||
+				!correlationsExactlyMatch(record.activePrompt.correlation, correlation)
+			)
+				record.backgroundBusy = true;
+		}
 	}
 
 	#frameProcessingFailure(error: unknown): AcpSdkAdapterError {
@@ -2835,7 +2848,10 @@ export class AcpAgent implements Agent {
 		const derivedCorrelation = sdkFrameCorrelation(frame, event);
 		const correlation = derivedCorrelation ?? {};
 		const activePrompt = record.activePrompt;
-		if (isTerminal && !hasCompleteCorrelation(correlation) && !activePrompt) record.busy = false;
+		if (isTerminal && !hasCompleteCorrelation(correlation) && !activePrompt) {
+			record.busy = false;
+			record.backgroundBusy = false;
+		}
 		let terminalPromptOwner: PromptWaiter | undefined;
 		const settledCorrelation = record.settledPromptCorrelations.some(settled =>
 			correlationsMatch(settled, correlation),
@@ -2860,7 +2876,7 @@ export class AcpAgent implements Agent {
 				return;
 			}
 			if (activePrompt.terminal) return;
-			record.busy = false;
+			record.busy = record.backgroundBusy;
 			terminalPromptOwner = activePrompt;
 			this.#advanceTerminalGeneration(record);
 			publicationGeneration = record.publicationGeneration;
