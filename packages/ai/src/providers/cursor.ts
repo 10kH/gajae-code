@@ -967,15 +967,23 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			finalizeCursorUsage(output, usageState);
 			const stateToCommit =
 				usageState.pendingCheckpoint ?? conversationStateCache.get(conversationId) ?? conversationState;
-			if (usageState.hasConversationCheckpoint || usageState.conversationUsedTokens > 0) {
+			if (
+				usageState.pendingCheckpoint ||
+				usageState.hasConversationCheckpoint ||
+				usageState.conversationUsedTokens > 0
+			) {
 				conversationStateCache.set(
 					conversationId,
 					create(ConversationStateStructureSchema, {
 						...stateToCommit,
-						tokenDetails: create(ConversationTokenDetailsSchema, {
-							usedTokens: output.usage.totalTokens,
-							maxTokens: stateToCommit.tokenDetails?.maxTokens ?? 0,
-						}),
+						...(usageState.hasConversationCheckpoint || usageState.conversationUsedTokens > 0
+							? {
+									tokenDetails: create(ConversationTokenDetailsSchema, {
+										usedTokens: output.usage.totalTokens,
+										maxTokens: stateToCommit.tokenDetails?.maxTokens ?? 0,
+									}),
+								}
+							: {}),
 					}),
 				);
 				touchCursorConversation(conversationId);
@@ -1066,6 +1074,7 @@ interface CursorUsageContext {
 	modelKey: string;
 	systemPromptKey: string;
 	customSystemPromptKey: string;
+	toolsKey: string;
 	messageKeys: string[];
 }
 
@@ -3344,6 +3353,7 @@ function buildCursorUsageContext(
 		modelKey: hashCursorUsageValue({ provider: model.provider, id: model.id, wireModelId: model.wireModelId }),
 		systemPromptKey: hashCursorUsageValue(context.systemPrompt ?? []),
 		customSystemPromptKey: hashCursorUsageValue(options?.customSystemPrompt ?? ""),
+		toolsKey: hashCursorUsageValue(context.tools ?? []),
 		messageKeys: context.messages.map(message => hashCursorUsageMessage(message)),
 	};
 }
@@ -3363,7 +3373,8 @@ function canReuseCursorUsageContext(previous: CursorUsageContext | undefined, cu
 		!previous ||
 		previous.modelKey !== current.modelKey ||
 		previous.systemPromptKey !== current.systemPromptKey ||
-		previous.customSystemPromptKey !== current.customSystemPromptKey
+		previous.customSystemPromptKey !== current.customSystemPromptKey ||
+		previous.toolsKey !== current.toolsKey
 	)
 		return false;
 	if (previous.messageKeys.length > current.messageKeys.length) return false;
