@@ -1251,3 +1251,24 @@ test("a pre-ack agent_start keeps the live prompt on the inference bound", async
 		fixture.dispose();
 	}
 });
+
+test("a pre-ack watchdog rejection retires tentative foreground activity", async () => {
+	const fixture = await createFixture({
+		agentStartBeforeAcknowledgement: true,
+		deferFirstPromptAcknowledgement: true,
+	});
+	try {
+		const pending = prompt(fixture, "pre-ack watchdog retirement");
+		void pending.catch(() => undefined);
+		await waitFor(() => fixture.promptDeliveryCount() === 1, "prompt delivery");
+		const idleBefore = idleUpdates(fixture.updates);
+		fixture.clock.advance(ACP_PROMPT_INFERENCE_TIMEOUT_MS + 1);
+		await Bun.sleep(0);
+		await waitFor(() => idleUpdates(fixture.updates) > idleBefore, "pre-ack idle phase");
+		fixture.acknowledgePrompt();
+		await Bun.sleep(0);
+		expect(idleUpdates(fixture.updates)).toBeGreaterThan(idleBefore);
+	} finally {
+		fixture.dispose();
+	}
+});

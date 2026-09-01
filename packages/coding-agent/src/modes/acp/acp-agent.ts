@@ -3174,6 +3174,7 @@ export class AcpAgent implements Agent {
 	): Promise<void> {
 		if (record.activePrompt !== waiter || waiter.settled) return;
 		record.activePrompt = undefined;
+		if (!waiter.acknowledged) record.busy = record.backgroundBusy;
 		clearPromptWatchdog(waiter);
 		waiter.settled = true;
 		this.#fenceRetiredPromptAcknowledgement(id, waiter);
