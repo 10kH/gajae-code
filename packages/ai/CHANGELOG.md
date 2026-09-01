@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- OpenCode Go's bundled catalog now contains all 33 models advertised by its live provider list, including the seven newly published models. Canonical endpoint metadata supplies their transport, multimodal input, limits, pricing, and reasoning capabilities, while generated output remains deterministic and preserves fail-closed selection when a live catalog is unavailable (#5144).
+
 - SQLite corruption detection is now shared by credential and capability-cache surfaces, so callers can recognize `SQLITE_CORRUPT` and `SQLITE_NOTADB` without inspecting provider-specific error details.
 
 - OpenAI Codex WebSockets are now opt-in on Windows. Bun 1.4.0 can segfault in its Windows TLS WebSocket handshake, so the automatic model preference uses SSE on Windows while the explicit WebSocket setting remains available for operators who have a newer safe runtime.
