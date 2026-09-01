@@ -8786,11 +8786,15 @@ export class AgentSession {
 		await this.#agentEndHandlingPromise;
 		// Drain the sidecar write order for the same reason the two queues above are
 		// drained: each entry writes under the native identity-bound state-file lock, so a
-		// still-queued write would run after the session that owns it is gone — releasing
+		// a still-queued write would run after the session that owns it is gone — releasing
 		// a lock whose owner no longer exists, and under `bun test --isolate` calling into
 		// the addon after the runtime tore down the context it was scheduled in. The chain
 		// is already failure-absorbing, so this only waits.
 		await this.#coordinatorPersistQueue;
+		// Terminal publication records its reconciliation from a promise reaction, which
+		// can append after the queue snapshot above was awaited. Drain the tracked writes
+		// again so disposal cannot return while that late reconciliation still owns a lock.
+		await this.#drainUnbarrieredCoordinatorPersists();
 		this.#pendingBackgroundExchanges = [];
 		this.#drainTerminalOwnedYieldEntries();
 
@@ -8806,6 +8810,10 @@ export class AgentSession {
 		this.#workflowGateEmitter = undefined;
 		this.#notifyWorkflowGateEmitterChanged(this.sessionId, undefined);
 		await this.#flushWorkerIntegrationAttempt();
+		// Worker integration completion can enqueue terminal reconciliation while the
+		// flush above is pending; drain that late producer before disposal resolves.
+		await this.#coordinatorPersistQueue;
+		await this.#drainUnbarrieredCoordinatorPersists();
 		await (this.#disposePostPromptDrain ?? this.#cancelPostPromptTasks());
 		// Cancel jobs this agent registered so a subagent's teardown doesn't
 		// leak its background bash/task work into the parent's manager. Only
