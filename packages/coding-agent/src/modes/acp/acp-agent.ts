@@ -1610,6 +1610,11 @@ export class AcpAgent implements Agent {
 			throw new AcpSdkAdapterError("conflict", "ACP session is still publishing the previous prompt's final text.");
 		if (this.#terminalMetadataTails.has(params.sessionId))
 			throw new AcpSdkAdapterError("conflict", "ACP session is still publishing the previous prompt's metadata.");
+		if (this.#failureDiagnosticTails.has(params.sessionId))
+			throw new AcpSdkAdapterError(
+				"conflict",
+				"ACP session is still publishing the previous prompt's failure diagnostic.",
+			);
 
 		const payload = acpPromptPayload(params.prompt);
 		const skillInvocation = acpSkillInvocation(params.prompt);
@@ -2746,6 +2751,23 @@ export class AcpAgent implements Agent {
 		// Correlation is checked at ingress before a prompt-owned frame may refresh the
 		// watchdog, so queued processing cannot turn unrelated host traffic into turn liveness.
 		this.#refreshPromptWatchdog(id, record, frame);
+		const received = receivedSdkEvent(frame);
+		const ingressEvent = received?.event;
+		const ingressOutcome =
+			ingressEvent?.type === "agent_end" || ingressEvent?.type === "agent_failed"
+				? terminalOutcome(ingressEvent)
+				: undefined;
+		const ingressIsTerminal =
+			ingressEvent?.type === "agent_end" ||
+			(ingressEvent?.type === "agent_failed" && ingressOutcome?.kind === "failed");
+		const ingressCorrelation = ingressEvent ? sdkFrameCorrelation(frame, ingressEvent) : undefined;
+		if (
+			ingressIsTerminal &&
+			record.activePrompt?.acknowledged &&
+			ingressCorrelation &&
+			correlationsExactlyMatch(record.activePrompt.correlation, ingressCorrelation)
+		)
+			clearPromptWatchdog(record.activePrompt);
 		++record.inboundSequence;
 		const frameGeneration = record.publicationGeneration;
 		const task = record.frameTail.then(async () => await this.#handleSdkFrame(id, adapter, frame, frameGeneration));
@@ -3789,17 +3811,8 @@ export class AcpAgent implements Agent {
 						record.adapter,
 					);
 				}
-				await this.#publishSessionUpdate(
-					id,
-					{
-						sessionId: id,
-						update: {
-							sessionUpdate: "session_info_update",
-							_meta: { gjcPhase: "idle", running: false, gjcRunning: false },
-						},
-					},
-					record.adapter,
-				);
+				const current = this.#sessions.get(id);
+				if (current) await this.#publishPromptPhase(id, current.adapter, this.#promptPhaseOwner(current));
 			})().catch(() => undefined);
 		});
 	}

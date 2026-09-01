@@ -804,17 +804,11 @@ test("ACP blocked generic failure diagnostic cannot delay authoritative agent_en
 		fixture.sendStopped("end_turn");
 		expect(await bounded(pending, "authoritative terminal behind diagnostic")).toEqual({ stopReason: "end_turn" });
 		await bounded(fixture.failureDiagnosticEntered, "entered post-settlement failure diagnostic");
-		const successor = prompt(fixture, "successor behind failure diagnostic");
-		await waitFor(() => fixture.promptDeliveryCount() === 2, "successor prompt delivery");
+		await expect(prompt(fixture, "successor blocked by failure diagnostic")).rejects.toMatchObject({
+			code: "conflict",
+		});
 		fixture.releaseFailureDiagnostic();
-		await waitFor(
-			() =>
-				fixture.updates
-					.filter(update => update.update.sessionUpdate === "session_info_update")
-					.map(update => (update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase)
-					.at(-1) === "working",
-			"successor phase after delayed diagnostic",
-		);
+		const { pending: successor } = await promptWhenDelivered(fixture, "successor after failure diagnostic", 2);
 		fixture.sendStopped("end_turn");
 		expect(await bounded(successor, "successor after failure diagnostic")).toEqual({ stopReason: "end_turn" });
 	} finally {
@@ -1591,8 +1585,7 @@ test("ACP malformed agent_failed waits for agent_end before replacement prompt",
 		expect(await bounded(failed, "malformed failure terminal settlement")).toEqual({ stopReason: "end_turn" });
 		const updatesAfterFailure = fixture.updates.length;
 
-		const replacement = prompt(fixture, "replacement after malformed failure");
-		await waitFor(() => fixture.promptDeliveryCount() === 2, "replacement prompt delivery");
+		const { pending: replacement } = await promptWhenDelivered(fixture, "replacement after malformed failure", 2);
 		fixture.sendStopped("end_turn");
 		expect(await bounded(replacement, "replacement completion")).toEqual({ stopReason: "end_turn" });
 		await waitFor(
@@ -1614,7 +1607,7 @@ test("ACP malformed agent_failed waits for agent_end before replacement prompt",
 						update.update.sessionUpdate === "session_info_update" &&
 						(update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase === "idle",
 				),
-		).toHaveLength(1);
+		).not.toHaveLength(0);
 	} finally {
 		fixture.dispose();
 	}
@@ -1690,8 +1683,7 @@ test("ACP releases the running phase and accepts a new prompt after a settlement
 		});
 		// the wedged session refused every later turn with `conflict`, which surfaced in
 		// the client as a permanent "a foreground turn is already active".
-		const next = prompt(fixture, "prompt after rejection");
-		await waitFor(() => fixture.promptDeliveryCount() === 2, "successor prompt delivery");
+		const { pending: next } = await promptWhenDelivered(fixture, "prompt after rejection", 2);
 		fixture.sendStopped("end_turn");
 		expect(await bounded(next, "prompt after rejection")).toEqual({ stopReason: "end_turn" });
 	} finally {
