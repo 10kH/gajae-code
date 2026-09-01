@@ -620,6 +620,31 @@ test("ACP malformed correlated agent_failed remains diagnostic until agent_end",
 	}
 });
 
+test("ACP agent_failed cannot terminalize with a stopped outcome", async () => {
+	const fixture = await createFixture();
+	try {
+		const pending = prompt(fixture, "stopped outcome on failure event");
+		await bounded(fixture.promptDelivered, "prompt delivery");
+		let settled = false;
+		void pending.then(() => {
+			settled = true;
+		});
+		fixture.sendTerminal({
+			type: "agent_failed",
+			sessionId: "prompt-terminal-session",
+			commandId: "prompt-terminal-command",
+			turnId: "prompt-terminal-turn",
+			outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+		});
+		await Promise.resolve();
+		expect(settled).toBe(false);
+		fixture.sendStopped("cancelled");
+		expect(await bounded(pending, "authoritative stopped terminal")).toEqual({ stopReason: "cancelled" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
 test("ACP preserves an explicit prompt deadline terminal classifier after its diagnostic", async () => {
 	const fixture = await createFixture();
 	try {

@@ -2781,7 +2781,7 @@ export class AcpAgent implements Agent {
 		const { event, wirePayload } = received;
 		let publicationGeneration = ingressPublicationGeneration ?? record.publicationGeneration;
 		const outcome = event.type === "agent_end" || event.type === "agent_failed" ? terminalOutcome(event) : undefined;
-		const isTerminal = event.type === "agent_end" || (event.type === "agent_failed" && outcome !== undefined);
+		const isTerminal = event.type === "agent_end" || (event.type === "agent_failed" && outcome?.kind === "failed");
 		if (event.type === "notice" && event.source === "autorouting" && typeof event.message === "string") {
 			record.routingInactiveNotice = event.message;
 			return;
