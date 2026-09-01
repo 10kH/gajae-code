@@ -774,8 +774,8 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			let currentThinkingBlock: (ThinkingContent & { index: number }) | null = null;
 			let currentToolCall: ToolCallState | null = null;
 			const cachedConversationUsedTokens =
-				cachedState && canReuseCursorUsageContext(previousUsageContext, usageContext)
-					? (cachedState.tokenDetails?.usedTokens ?? 0)
+				conversationState.tokenDetails && canReuseCursorUsageContext(previousUsageContext, usageContext)
+					? conversationState.tokenDetails.usedTokens
 					: 0;
 			const usageState: UsageState = {
 				sawTokenDelta: false,
@@ -867,7 +867,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 							serverMessage.message.case === "interactionUpdate" &&
 							serverMessage.message.value.message?.case === "turnEnded";
 						const isConversationCheckpoint = serverMessage.message.case === "conversationCheckpointUpdate";
-						if (isConversationCheckpoint && !coordinator.canAdmitTask()) {
+						if (isConversationCheckpoint) {
 							handleConversationCheckpointUpdate(
 								serverMessage.message.value as ConversationStateStructure,
 								output,

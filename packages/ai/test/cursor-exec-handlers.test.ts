@@ -6,15 +6,17 @@ import {
 	buildCursorRequestContextRules,
 	buildCursorSystemPromptJsons,
 	createCursorMessageQueueForTest,
+	disposeCursorConversation,
 	resolveExecHandler,
 	streamCursor,
 } from "../src/providers/cursor";
+import type { AgentRunRequest, AgentServerMessage } from "../src/providers/cursor/gen/agent_pb";
 import {
 	type AgentClientMessage,
 	AgentClientMessageSchema,
-	type AgentRunRequest,
-	type AgentServerMessage,
 	AgentServerMessageSchema,
+	ConversationStateStructureSchema,
+	ConversationTokenDetailsSchema,
 	ExecServerMessageSchema,
 	InteractionUpdateSchema,
 	ReadArgsSchema,
@@ -109,6 +111,19 @@ function createTurnEndedMessage(): AgentServerMessage {
 					case: "turnEnded",
 					value: create(TurnEndedUpdateSchema, {}),
 				},
+			}),
+		},
+	});
+}
+
+function createConversationCheckpointMessage(usedTokens?: number): AgentServerMessage {
+	return create(AgentServerMessageSchema, {
+		message: {
+			case: "conversationCheckpointUpdate",
+			value: create(ConversationStateStructureSchema, {
+				...(usedTokens === undefined
+					? {}
+					: { tokenDetails: create(ConversationTokenDetailsSchema, { usedTokens }) }),
 			}),
 		},
 	});
@@ -248,6 +263,133 @@ describe("Cursor server message ordering", () => {
 });
 
 describe("Cursor request lifecycle", () => {
+	it("applies a checkpoint delivered after turnEnded before finalizing usage", async () => {
+		const server = http2.createServer();
+		server.on("stream", (stream: http2.ServerHttp2Stream) => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			stream.once("data", () => {
+				stream.write(frameServerMessage(createTurnEndedMessage()));
+				setTimeout(() => {
+					stream.end(frameServerMessage(createConversationCheckpointMessage(321)));
+				}, 5);
+			});
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", resolve);
+		});
+
+		const conversationId = `checkpoint-late-${crypto.randomUUID()}`;
+		try {
+			const address = server.address();
+			if (!address || typeof address === "string") throw new Error("Expected TCP server address");
+			const events: AssistantMessageEvent[] = [];
+			for await (const event of streamCursor(
+				{ ...cursorModel, baseUrl: `http://127.0.0.1:${address.port}` },
+				{ messages: [{ role: "user", content: "checkpoint", timestamp: 0 }] },
+				{ apiKey: "test-token", conversationId },
+			)) {
+				events.push(event);
+			}
+			const done = events.find(
+				(event): event is Extract<AssistantMessageEvent, { type: "done" }> => event.type === "done",
+			);
+			expect(done?.message.usage.input).toBe(321);
+			expect(events.filter(event => event.type === "error")).toHaveLength(0);
+		} finally {
+			disposeCursorConversation(conversationId);
+			await new Promise<void>(resolve => server.close(() => resolve()));
+		}
+	});
+
+	it("rolls back checkpoint usage when a stream fails before retry", async () => {
+		const server = http2.createServer();
+		let requestCount = 0;
+		server.on("stream", (stream: http2.ServerHttp2Stream) => {
+			requestCount++;
+			stream.on("error", () => {});
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			stream.once("data", () => {
+				if (requestCount === 1) {
+					stream.write(frameServerMessage(createConversationCheckpointMessage(500)));
+					setTimeout(() => stream.close(http2.constants.NGHTTP2_INTERNAL_ERROR), 5);
+					return;
+				}
+				stream.end(frameServerMessage(createTurnEndedMessage()));
+			});
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", resolve);
+		});
+
+		const conversationId = `checkpoint-rollback-${crypto.randomUUID()}`;
+		try {
+			const address = server.address();
+			if (!address || typeof address === "string") throw new Error("Expected TCP server address");
+			const model = { ...cursorModel, baseUrl: `http://127.0.0.1:${address.port}` };
+			const firstEvents: AssistantMessageEvent[] = [];
+			for await (const event of streamCursor(
+				model,
+				{ messages: [{ role: "user", content: "first", timestamp: 0 }] },
+				{ apiKey: "test-token", conversationId },
+			)) {
+				firstEvents.push(event);
+			}
+			expect(firstEvents.some(event => event.type === "error")).toBe(true);
+
+			const secondEvents: AssistantMessageEvent[] = [];
+			for await (const event of streamCursor(
+				model,
+				{ messages: [{ role: "user", content: "retry", timestamp: 0 }] },
+				{ apiKey: "test-token", conversationId },
+			)) {
+				secondEvents.push(event);
+			}
+			const done = secondEvents.find(
+				(event): event is Extract<AssistantMessageEvent, { type: "done" }> => event.type === "done",
+			);
+			expect(done?.message.usage.input).toBe(0);
+		} finally {
+			disposeCursorConversation(conversationId);
+			await new Promise<void>(resolve => server.close(() => resolve()));
+		}
+	});
+
+	it("allows a delayed inbound terminal when the watchdog is disabled", async () => {
+		const server = http2.createServer();
+		server.on("stream", (stream: http2.ServerHttp2Stream) => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			stream.once("data", () => {
+				stream.write(frameServerMessage(createTurnEndedMessage()));
+				setTimeout(() => stream.end(), 25);
+			});
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", resolve);
+		});
+
+		const conversationId = `checkpoint-watchdog-${crypto.randomUUID()}`;
+		try {
+			const address = server.address();
+			if (!address || typeof address === "string") throw new Error("Expected TCP server address");
+			const events: AssistantMessageEvent[] = [];
+			for await (const event of streamCursor(
+				{ ...cursorModel, baseUrl: `http://127.0.0.1:${address.port}` },
+				{ messages: [{ role: "user", content: "watchdog", timestamp: 0 }] },
+				{ apiKey: "test-token", conversationId, streamIdleTimeoutMs: 0 },
+			)) {
+				events.push(event);
+			}
+			expect(events.filter(event => event.type === "done")).toHaveLength(1);
+			expect(events.filter(event => event.type === "error")).toHaveLength(0);
+		} finally {
+			disposeCursorConversation(conversationId);
+			await new Promise<void>(resolve => server.close(() => resolve()));
+		}
+	});
+
 	it("drains an admitted exec response before completing after turnEnded", async () => {
 		const { promise: releasePromise, resolve: releaseHandler } = Promise.withResolvers<void>();
 		const { promise: handlerStarted, resolve: markHandlerStarted } = Promise.withResolvers<void>();
