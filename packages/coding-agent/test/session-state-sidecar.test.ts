@@ -1435,6 +1435,7 @@ describe("coordinator runtime state sidecar", () => {
 		).catch((error: unknown) => error as Error);
 
 		expect(failure).toBeInstanceOf(Error);
+		if (!(failure instanceof Error)) throw new Error("Expected persistence failure");
 		expect(failure.name).toBe("ForeignRuntimeStateError");
 		expect(failure.message).toContain("D:\\Users\\Operator\\Repo");
 		expect(failure.message).toContain(root);
