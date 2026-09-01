@@ -1,11 +1,25 @@
-name: Spoofed version sync
+name: Spoofed version drift
 
 # We impersonate Claude Code and Gemini CLI via User-Agent / attribution
 # headers. Anthropic gates newer models behind a minimum client version, so a
 # stale `claude-cli/<version>` shows up as an HTTP 400 on a model that is
-# otherwise available. This keeps the spoofed versions pinned to the newest
-# upstream release instead of whatever was current when the constant was last
-# touched by hand.
+# otherwise available. The constants were only ever bumped by hand and had
+# drifted (Gemini CLI by six minor releases), so this schedules the existing
+# drift check.
+#
+# Detection only, deliberately. The job holds no write scope: the repository
+# runs a default-deny token policy (scripts/check-workflow-permissions.ts) with
+# exactly three narrowly-justified exceptions, and dev requires the signed
+# exact-head PR contract — so a bot-opened PR would still need a human verdict.
+# Buying `contents: write` + `pull-requests: write` for a daily cron would not
+# remove that human step, it would only widen the token surface. A red
+# scheduled run is the signal; remediation is one command:
+#
+#   bun scripts/check-spoofed-versions.ts --update
+#
+# This check is intentionally NOT part of `ci:check:full`: an upstream release
+# would otherwise redden every unrelated pull request instead of raising a
+# maintenance signal here.
 
 on:
   schedule:
@@ -20,49 +34,37 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  sync:
-    name: Bump spoofed external tool versions
+  drift:
+    name: Check spoofed external tool versions
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     permissions:
-      contents: write
-      pull-requests: write
+      contents: read
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
-          ref: dev
+          persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
           bun-version: "1.4.0"
-      - name: Apply upstream version bumps
-        run: bun scripts/check-spoofed-versions.ts --update
-      - name: Open or update the bump pull request
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Compare spoofed versions against upstream releases
+        id: drift
+        run: bun scripts/check-spoofed-versions.ts
+      - name: Explain remediation on drift
+        if: ${{ failure() && steps.drift.outcome == 'failure' }}
         run: |
-          set -euo pipefail
-          if git diff --quiet; then
-            echo "No spoofed version drift."
-            exit 0
-          fi
-          branch=chore/spoofed-version-sync
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -B "$branch"
-          git commit --all --message "chore(ai): sync spoofed external tool versions
-
-          Upstream released newer Claude Code / Gemini CLI builds. Anthropic
-          gates newer models behind a minimum client version, so a stale
-          spoofed version surfaces as an HTTP 400 on an otherwise-available
-          model.
-
-          Confidence: high
-          Scope-risk: narrow
-          Reversibility: easy
-          Tested: bun scripts/check-spoofed-versions.ts"
-          git push --force-with-lease origin "$branch"
-          if [ -z "$(gh pr list --head "$branch" --base dev --state open --json number --jq '.[].number')" ]; then
-            gh pr create --base dev --head "$branch" \
-              --title "chore(ai): sync spoofed external tool versions" \
-              --body "Automated bump from \`scripts/check-spoofed-versions.ts --update\`."
-          fi
+          {
+            echo "## Spoofed version drift"
+            echo
+            echo "An impersonated tool released a newer version. Anthropic gates newer"
+            echo "models behind a minimum client version, so a stale fingerprint surfaces"
+            echo "as an HTTP 400 on a model the account can otherwise reach."
+            echo
+            echo 'Remediation, from a `dev` checkout:'
+            echo
+            echo '```sh'
+            echo 'bun scripts/check-spoofed-versions.ts --update'
+            echo '```'
+            echo
+            echo "Then open a pull request targeting \`dev\` with a CHANGELOG entry."
+          } >> "$GITHUB_STEP_SUMMARY"
