@@ -563,6 +563,39 @@ test("ACP prompt rejects prompt_failed terminal outcomes with their code", async
 	}
 });
 
+test("ACP publishes final text from an explicit failure-only terminal", async () => {
+	const fixture = await createFixture();
+	try {
+		const pending = prompt(fixture, "failure final text");
+		await bounded(fixture.promptDelivered, "prompt delivery");
+		fixture.sendTerminal({
+			type: "agent_failed",
+			sessionId: "prompt-terminal-session",
+			commandId: "prompt-terminal-command",
+			turnId: "prompt-terminal-turn",
+			outcome: {
+				kind: "failed",
+				code: "prompt_failed",
+				message: "failure with final text",
+				provenance: "agent_failed",
+			},
+			finalText: "partial answer before failure",
+		});
+		await expect(bounded(pending, "failure settlement")).rejects.toMatchObject({ code: "prompt_failed" });
+		await waitFor(
+			() =>
+				fixture.updates.some(
+					update =>
+						update.update.sessionUpdate === "agent_message_chunk" &&
+						(update.update as { content: { text: string } }).content.text === "partial answer before failure",
+				),
+			"failure final text publication",
+		);
+	} finally {
+		fixture.dispose();
+	}
+});
+
 test("ACP prompt rejects prompt_deadline_exceeded terminal outcomes with their code", async () => {
 	const fixture = await createFixture();
 	try {

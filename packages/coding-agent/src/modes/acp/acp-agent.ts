@@ -3072,11 +3072,7 @@ export class AcpAgent implements Agent {
 		event: JsonObject,
 		promptOwner: PromptWaiter | undefined,
 	): void {
-		if (event.type === "agent_failed") {
-			if (promptOwner) this.#flushFailureDiagnostics(id, promptOwner, adapter);
-			void this.#publishPromptPhaseIdle(id, adapter);
-			return;
-		}
+		const failedTerminal = event.type === "agent_failed";
 		if (promptOwner) this.#flushFailureDiagnostics(id, promptOwner, adapter);
 		let decorationStart = Promise.resolve();
 		const finalText = typeof event.finalText === "string" ? event.finalText : "";
@@ -3119,6 +3115,10 @@ export class AcpAgent implements Agent {
 				});
 			this.#finalTextTails.set(id, finalTextTail);
 			decorationStart = finalTextTail;
+		}
+		if (failedTerminal) {
+			void decorationStart.then(async () => await this.#publishPromptPhaseIdle(id, adapter));
+			return;
 		}
 		void decorationStart
 			.then(async () => await this.#emitEndOfTurnUpdates(id, adapter, publicationGeneration))
