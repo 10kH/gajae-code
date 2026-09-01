@@ -26,6 +26,7 @@ type Fixture = {
 	promptDelivered: Promise<void>;
 	workingUpdateEntered: Promise<void>;
 	idleUpdateEntered: Promise<void>;
+	agentMessageUpdateEntered: Promise<void>;
 	promptDeliveryCount(): number;
 	sendStopped(reason: StoppedReason): void;
 	sendFailed(code: FailedCode): void;
@@ -104,6 +105,7 @@ async function createFixture(
 	const workingUpdateRelease = Promise.withResolvers<void>();
 	const workingUpdateEntered = Promise.withResolvers<void>();
 	const agentMessageUpdateRelease = Promise.withResolvers<void>();
+	const agentMessageUpdateEntered = Promise.withResolvers<void>();
 	let blockNextIdleUpdate = false;
 	let blockNextWorkingUpdate = options.blockInitialWorkingUpdate === true;
 	const delivered = Promise.withResolvers<void>();
@@ -364,8 +366,10 @@ async function createFixture(
 					update.update.sessionUpdate === "agent_message_chunk" &&
 					update.update.content.type === "text" &&
 					update.update.content.text === options.blockedAgentMessageText
-				)
+				) {
+					agentMessageUpdateEntered.resolve();
 					await agentMessageUpdateRelease.promise;
+				}
 				if (
 					blockNextIdleUpdate &&
 					update.update.sessionUpdate === "session_info_update" &&
@@ -417,6 +421,7 @@ async function createFixture(
 		promptDelivered: delivered.promise,
 		workingUpdateEntered: workingUpdateEntered.promise,
 		idleUpdateEntered: idleUpdateEntered.promise,
+		agentMessageUpdateEntered: agentMessageUpdateEntered.promise,
 		promptDeliveryCount: () => promptDeliveries,
 		sendStopped,
 		sendFailed,
@@ -780,6 +785,7 @@ test("ACP terminal settlement does not await final-text delivery", async () => {
 	const fixture = await createFixture({ blockedAgentMessageText: "detached final report" });
 	try {
 		const idleBefore = idlePhaseUpdates(fixture.updates);
+		const queriesBefore = fixture.queryCalls.length;
 		const pending = prompt(fixture, "blocked final text");
 		await bounded(fixture.promptDelivered, "prompt delivery");
 		fixture.sendTerminal({
@@ -791,6 +797,7 @@ test("ACP terminal settlement does not await final-text delivery", async () => {
 			outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
 		});
 		expect(await bounded(pending, "settlement before final-text delivery")).toEqual({ stopReason: "end_turn" });
+		await bounded(fixture.agentMessageUpdateEntered, "entered final-text delivery");
 		expect(
 			fixture.updates.some(
 				update =>
@@ -800,6 +807,7 @@ test("ACP terminal settlement does not await final-text delivery", async () => {
 			),
 		).toBe(false);
 		expect(idlePhaseUpdates(fixture.updates)).toBe(idleBefore);
+		expect(fixture.queryCalls).toHaveLength(queriesBefore);
 		await expect(prompt(fixture, "successor blocked by predecessor final text")).rejects.toMatchObject({
 			code: "conflict",
 		});
@@ -864,6 +872,32 @@ test("ACP successor waits only while ready predecessor metadata is being deliver
 		const { pending: successor } = await promptWhenDelivered(fixture, "successor after metadata delivery", 2);
 		fixture.sendStopped("end_turn");
 		expect(await bounded(successor, "successor after metadata delivery")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		fixture.releaseIdleUpdate();
+		fixture.dispose();
+	}
+});
+
+test("ACP metadata delivery fence survives same-id record replacement", async () => {
+	const fixture = await createFixture({ blockIdleUpdate: true });
+	try {
+		const first = prompt(fixture, "metadata across reattachment");
+		await bounded(fixture.promptDelivered, "first prompt delivery");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(first, "first terminal settlement")).toEqual({ stopReason: "end_turn" });
+		await bounded(fixture.idleUpdateEntered, "entered predecessor metadata delivery");
+		await bounded(fixture.agent.closeSession({ sessionId: fixture.sessionId }), "session close during metadata");
+		await bounded(
+			fixture.agent.loadSession({ sessionId: fixture.sessionId, cwd: fixture.cwd, mcpServers: [] }),
+			"same-id metadata reattachment",
+		);
+		await expect(prompt(fixture, "successor blocked across record replacement")).rejects.toMatchObject({
+			code: "conflict",
+		});
+		fixture.releaseIdleUpdate();
+		const { pending: successor } = await promptWhenDelivered(fixture, "successor after replaced metadata", 2);
+		fixture.sendStopped("end_turn");
+		expect(await bounded(successor, "successor after replaced metadata")).toEqual({ stopReason: "end_turn" });
 	} finally {
 		fixture.releaseIdleUpdate();
 		fixture.dispose();

@@ -162,8 +162,6 @@ type SessionRecord = {
 	frameTail: Promise<void>;
 	/** Unstreamed terminal text must publish before a successor can own the transcript. */
 	finalTextTail?: Promise<void>;
-	/** Ready terminal metadata writes must finish before a successor owns those fields. */
-	terminalMetadataTail?: Promise<void>;
 	/** Advances when an owned terminal retires all earlier frame publications. */
 	publicationGeneration: number;
 	/** Monotonic at WebSocket ingress, before queued work begins. */
@@ -1201,6 +1199,8 @@ export class AcpAgent implements Agent {
 	readonly #retiredPromptCorrelations = new Map<string, PromptCorrelation[]>();
 	/** Prevent a successor admission while a retired prompt can still reveal its identity. */
 	readonly #retiredPromptAcknowledgements = new Set<string>();
+	/** Ready terminal metadata writes retain ownership across same-id record replacement. */
+	readonly #terminalMetadataTails = new Map<string, Promise<void>>();
 	readonly #attaching = new Map<string, PendingAttachment>();
 	readonly #resolvingExisting = new Map<string, PendingAttachment>();
 	readonly #knownSessionCwds = new Map<string, string>();
@@ -1601,7 +1601,7 @@ export class AcpAgent implements Agent {
 			);
 		if (record.finalTextTail)
 			throw new AcpSdkAdapterError("conflict", "ACP session is still publishing the previous prompt's final text.");
-		if (record.terminalMetadataTail)
+		if (this.#terminalMetadataTails.has(params.sessionId))
 			throw new AcpSdkAdapterError("conflict", "ACP session is still publishing the previous prompt's metadata.");
 
 		const payload = acpPromptPayload(params.prompt);
@@ -3143,9 +3143,9 @@ export class AcpAgent implements Agent {
 		})();
 		let metadataTail: Promise<void>;
 		metadataTail = publishTask.finally(() => {
-			if (record.terminalMetadataTail === metadataTail) record.terminalMetadataTail = undefined;
+			if (this.#terminalMetadataTails.get(id) === metadataTail) this.#terminalMetadataTails.delete(id);
 		});
-		record.terminalMetadataTail = metadataTail;
+		this.#terminalMetadataTails.set(id, metadataTail);
 		await metadataTail;
 	}
 
@@ -3881,6 +3881,7 @@ export class AcpAgent implements Agent {
 		this.#knownSessionMetadata.clear();
 		this.#retiredPromptCorrelations.clear();
 		this.#retiredPromptAcknowledgements.clear();
+		this.#terminalMetadataTails.clear();
 		this.#pendingDeleteLocators.clear();
 		this.#pendingCloseIdempotencyKeys.clear();
 		if (this.#lifecycleOperations.size === 0) this.#lifecycleOperations.clear();
