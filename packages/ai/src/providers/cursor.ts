@@ -734,7 +734,13 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			let currentTextBlock: (TextContent & { index: number }) | null = null;
 			let currentThinkingBlock: (ThinkingContent & { index: number }) | null = null;
 			let currentToolCall: ToolCallState | null = null;
-			const usageState: UsageState = { sawTokenDelta: false, conversationUsedTokens: 0 };
+			const cachedConversationUsedTokens = cachedState?.tokenDetails?.usedTokens ?? 0;
+			const usageState: UsageState = {
+				sawTokenDelta: false,
+				conversationUsedTokens: cachedConversationUsedTokens,
+				checkpointOutputTokens: 0,
+				hasConversationCheckpoint: false,
+			};
 
 			const state: BlockState = {
 				get currentTextBlock() {
@@ -814,6 +820,16 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 						const isTurnEnded =
 							serverMessage.message.case === "interactionUpdate" &&
 							serverMessage.message.value.message?.case === "turnEnded";
+						const isConversationCheckpoint = serverMessage.message.case === "conversationCheckpointUpdate";
+						if (isConversationCheckpoint && !coordinator.canAdmitTask()) {
+							handleConversationCheckpointUpdate(
+								serverMessage.message.value as ConversationStateStructure,
+								output,
+								usageState,
+								onConversationCheckpoint,
+							);
+							continue;
+						}
 						// Serialize handlers: exec messages can be asynchronous, and resolving the
 						// request on turnEnded before prior handlers finish loses their responses.
 						if (!coordinator.canAdmitTask()) continue;
@@ -966,6 +982,10 @@ interface UsageState {
 	 * token consumption as counted by Cursor, not this turn's output.
 	 */
 	conversationUsedTokens: number;
+	/** Output tokens already included in the latest checkpoint snapshot. */
+	checkpointOutputTokens: number;
+	/** Whether the current stream received a checkpoint, including an explicit zero. */
+	hasConversationCheckpoint: boolean;
 }
 
 async function handleServerMessage(
@@ -1002,7 +1022,7 @@ async function handleServerMessage(
 			requestContextRules,
 		);
 	} else if (msgCase === "conversationCheckpointUpdate") {
-		handleConversationCheckpointUpdate(msg.message.value, usageState, onConversationCheckpoint);
+		handleConversationCheckpointUpdate(msg.message.value, output, usageState, onConversationCheckpoint);
 	}
 }
 
@@ -2857,18 +2877,21 @@ function processInteractionUpdate(
 
 function handleConversationCheckpointUpdate(
 	checkpoint: ConversationStateStructure,
+	output: AssistantMessage,
 	usageState: UsageState,
 	onConversationCheckpoint?: (checkpoint: ConversationStateStructure) => void,
 ): void {
 	onConversationCheckpoint?.(checkpoint);
 	const usedTokens = checkpoint.tokenDetails?.usedTokens ?? 0;
-	if (usedTokens <= 0) {
+	if (!checkpoint.tokenDetails) {
 		return;
 	}
 	// `used_tokens` counts the whole conversation, so it is prompt-side usage and
 	// must not be attributed to this turn's output. Checkpoints can arrive while
 	// output is still streaming; the split is applied once the stream finalizes.
 	usageState.conversationUsedTokens = usedTokens;
+	usageState.checkpointOutputTokens = output.usage.output;
+	usageState.hasConversationCheckpoint = true;
 }
 
 /**
@@ -2879,15 +2902,20 @@ function handleConversationCheckpointUpdate(
  */
 export function finalizeCursorUsage(output: AssistantMessage, usageState: UsageState): void {
 	const used = usageState.conversationUsedTokens;
-	if (used <= 0) {
+	if (!usageState.hasConversationCheckpoint && used <= 0) {
 		return;
 	}
-	output.usage.input = Math.max(0, used - output.usage.output);
+	const outputIncludedInSnapshot = usageState.hasConversationCheckpoint ? usageState.checkpointOutputTokens : 0;
+	output.usage.input = Math.max(0, used - outputIncludedInSnapshot);
 	output.usage.totalTokens = output.usage.input + output.usage.output;
 }
 
 /** Exposes {@link finalizeCursorUsage} for tests without a live HTTP/2 stream. */
-export function finalizeCursorUsageForTest(usedTokens: number, outputTokens: number): Usage {
+export function finalizeCursorUsageForTest(
+	usedTokens: number,
+	outputTokens: number,
+	options: { checkpointOutputTokens?: number; hasConversationCheckpoint?: boolean } = {},
+): Usage {
 	const usage: Usage = {
 		input: 0,
 		output: outputTokens,
@@ -2896,7 +2924,13 @@ export function finalizeCursorUsageForTest(usedTokens: number, outputTokens: num
 		totalTokens: outputTokens,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	};
-	finalizeCursorUsage({ usage } as AssistantMessage, { sawTokenDelta: true, conversationUsedTokens: usedTokens });
+	finalizeCursorUsage({ usage } as AssistantMessage, {
+		sawTokenDelta: true,
+		conversationUsedTokens: usedTokens,
+		checkpointOutputTokens:
+			options.checkpointOutputTokens ?? ((options.hasConversationCheckpoint ?? usedTokens > 0) ? outputTokens : 0),
+		hasConversationCheckpoint: options.hasConversationCheckpoint ?? usedTokens > 0,
+	});
 	return usage;
 }
 

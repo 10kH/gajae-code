@@ -39,6 +39,14 @@ describe("cursor conversation usage", () => {
 		expect(usage.input + usage.output).toBe(100);
 	});
 
+	it("does not subtract output produced after a periodic checkpoint", () => {
+		const usage = finalizeCursorUsageForTest(100, 15, { checkpointOutputTokens: 10 });
+
+		expect(usage.input).toBe(90);
+		expect(usage.output).toBe(15);
+		expect(usage.totalTokens).toBe(105);
+	});
+
 	it("reports prompt tokens to the compaction accounting path", () => {
 		const usage = finalizeCursorUsageForTest(21_594, 14);
 
@@ -69,6 +77,21 @@ describe("cursor conversation usage", () => {
 
 		expect(usage.input).toBe(0);
 		expect(usage.output).toBe(91);
+	});
+
+	it("uses the cached conversation total when a warm turn has no checkpoint", () => {
+		const usage = finalizeCursorUsageForTest(10_000, 100, { hasConversationCheckpoint: false });
+
+		expect(usage.input).toBe(10_000);
+		expect(usage.output).toBe(100);
+		expect(usage.totalTokens).toBe(10_100);
+	});
+
+	it("accepts an explicit zero checkpoint as a reset", () => {
+		const usage = finalizeCursorUsageForTest(0, 91, { hasConversationCheckpoint: true });
+
+		expect(usage.input).toBe(0);
+		expect(usage.totalTokens).toBe(91);
 	});
 
 	it("never reports negative prompt tokens when output exceeds reported usage", () => {
