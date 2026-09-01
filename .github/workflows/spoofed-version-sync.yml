@@ -1,0 +1,68 @@
+name: Spoofed version sync
+
+# We impersonate Claude Code and Gemini CLI via User-Agent / attribution
+# headers. Anthropic gates newer models behind a minimum client version, so a
+# stale `claude-cli/<version>` shows up as an HTTP 400 on a model that is
+# otherwise available. This keeps the spoofed versions pinned to the newest
+# upstream release instead of whatever was current when the constant was last
+# touched by hand.
+
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Bump spoofed external tool versions
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: dev
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: "1.4.0"
+      - name: Apply upstream version bumps
+        run: bun scripts/check-spoofed-versions.ts --update
+      - name: Open or update the bump pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            echo "No spoofed version drift."
+            exit 0
+          fi
+          branch=chore/spoofed-version-sync
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$branch"
+          git commit --all --message "chore(ai): sync spoofed external tool versions
+
+          Upstream released newer Claude Code / Gemini CLI builds. Anthropic
+          gates newer models behind a minimum client version, so a stale
+          spoofed version surfaces as an HTTP 400 on an otherwise-available
+          model.
+
+          Confidence: high
+          Scope-risk: narrow
+          Reversibility: easy
+          Tested: bun scripts/check-spoofed-versions.ts"
+          git push --force-with-lease origin "$branch"
+          if [ -z "$(gh pr list --head "$branch" --base dev --state open --json number --jq '.[].number')" ]; then
+            gh pr create --base dev --head "$branch" \
+              --title "chore(ai): sync spoofed external tool versions" \
+              --body "Automated bump from \`scripts/check-spoofed-versions.ts --update\`."
+          fi
