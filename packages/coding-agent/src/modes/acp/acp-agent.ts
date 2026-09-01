@@ -160,8 +160,6 @@ type SessionRecord = {
 	reconnectUnsubscribe: () => void;
 	/** Per-session frame work queue; callbacks never race prompt ownership. */
 	frameTail: Promise<void>;
-	/** Unstreamed terminal text must publish before a successor can own the transcript. */
-	finalTextTail?: Promise<void>;
 	/** Advances when an owned terminal retires all earlier frame publications. */
 	publicationGeneration: number;
 	/** Monotonic at WebSocket ingress, before queued work begins. */
@@ -1201,6 +1199,8 @@ export class AcpAgent implements Agent {
 	readonly #retiredPromptAcknowledgements = new Set<string>();
 	/** Ready terminal metadata writes retain ownership across same-id record replacement. */
 	readonly #terminalMetadataTails = new Map<string, Promise<void>>();
+	/** Unstreamed terminal text retains transcript ownership across same-id replacement. */
+	readonly #finalTextTails = new Map<string, Promise<void>>();
 	readonly #attaching = new Map<string, PendingAttachment>();
 	readonly #resolvingExisting = new Map<string, PendingAttachment>();
 	readonly #knownSessionCwds = new Map<string, string>();
@@ -1599,7 +1599,7 @@ export class AcpAgent implements Agent {
 				"conflict",
 				"ACP session is still reconciling a previous prompt acknowledgement.",
 			);
-		if (record.finalTextTail)
+		if (this.#finalTextTails.has(params.sessionId))
 			throw new AcpSdkAdapterError("conflict", "ACP session is still publishing the previous prompt's final text.");
 		if (this.#terminalMetadataTails.has(params.sessionId))
 			throw new AcpSdkAdapterError("conflict", "ACP session is still publishing the previous prompt's metadata.");
@@ -2896,7 +2896,12 @@ export class AcpAgent implements Agent {
 			// a second session update after settlement would be stale as soon as the client
 			// starts a replacement turn, and an in-flight transport write cannot be revoked.
 			if (!(event.type === "agent_failed" && isTerminal))
-				await this.#publishSessionUpdate(id, notification, adapter, publicationGeneration);
+				await this.#publishSessionUpdate(
+					id,
+					notification,
+					adapter,
+					promptOwner ? publicationGeneration : undefined,
+				);
 		}
 		if (toolCallId && event.type === "tool_execution_end") record.toolArgs.delete(toolCallId);
 		if (event.type === "agent_start") {
@@ -2911,19 +2916,18 @@ export class AcpAgent implements Agent {
 					},
 				},
 				adapter,
-				publicationGeneration,
+				promptOwner ? publicationGeneration : undefined,
 			);
 		}
 		if (event.type === "message_end" && object(event.message)?.role === "assistant") {
 			if (promptOwner) promptOwner.messageProgress = undefined;
 			else record.sessionMessageProgress = undefined;
 		}
-		if (isTerminal) this.#scheduleTerminalUpdates(id, record, adapter, publicationGeneration, event, promptOwner);
+		if (isTerminal) this.#scheduleTerminalUpdates(id, adapter, publicationGeneration, event, promptOwner);
 	}
 
 	#scheduleTerminalUpdates(
 		id: string,
-		record: SessionRecord,
 		adapter: AcpSdkAdapter,
 		publicationGeneration: number,
 		event: JsonObject,
@@ -2969,9 +2973,9 @@ export class AcpAgent implements Agent {
 					logger.warn("acp_terminal_update_failed", { sessionId: id, error: String(error) });
 				})
 				.finally(() => {
-					if (record.finalTextTail === finalTextTail) record.finalTextTail = undefined;
+					if (this.#finalTextTails.get(id) === finalTextTail) this.#finalTextTails.delete(id);
 				});
-			record.finalTextTail = finalTextTail;
+			this.#finalTextTails.set(id, finalTextTail);
 			decorationStart = finalTextTail;
 		}
 		void decorationStart
@@ -3882,6 +3886,7 @@ export class AcpAgent implements Agent {
 		this.#retiredPromptCorrelations.clear();
 		this.#retiredPromptAcknowledgements.clear();
 		this.#terminalMetadataTails.clear();
+		this.#finalTextTails.clear();
 		this.#pendingDeleteLocators.clear();
 		this.#pendingCloseIdempotencyKeys.clear();
 		if (this.#lifecycleOperations.size === 0) this.#lifecycleOperations.clear();

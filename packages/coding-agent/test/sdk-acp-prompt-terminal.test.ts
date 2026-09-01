@@ -83,6 +83,7 @@ async function createFixture(
 		blockIdleUpdate?: boolean;
 		blockWorkingReconciliation?: boolean;
 		blockInitialWorkingUpdate?: boolean;
+		rejectBlockedWorkingUpdate?: boolean;
 		blockedAgentMessageText?: string;
 		deferSecondPromptAcknowledgement?: boolean;
 		deferFirstPromptAcknowledgement?: boolean;
@@ -188,6 +189,7 @@ async function createFixture(
 		},
 		websocket: {
 			open(socket) {
+				promptSocket = socket;
 				socket.send(JSON.stringify({ type: "hello", connectionId: "sdk-acp-prompt-terminal" }));
 			},
 			message(socket, raw) {
@@ -387,6 +389,7 @@ async function createFixture(
 					blockNextWorkingUpdate = false;
 					workingUpdateEntered.resolve();
 					await workingUpdateRelease.promise;
+					if (options.rejectBlockedWorkingUpdate) throw new Error("blocked working update rejected");
 				}
 				updates.push(update);
 			},
@@ -832,6 +835,39 @@ test("ACP terminal settlement does not await final-text delivery", async () => {
 	}
 });
 
+test("ACP final-text delivery fence survives same-id record replacement", async () => {
+	const fixture = await createFixture({ blockedAgentMessageText: "reattached predecessor text" });
+	try {
+		const first = prompt(fixture, "final text across reattachment");
+		await bounded(fixture.promptDelivered, "first prompt delivery");
+		fixture.sendTerminal({
+			type: "agent_end",
+			sessionId: "prompt-terminal-session",
+			commandId: "prompt-terminal-command",
+			turnId: "prompt-terminal-turn",
+			finalText: "reattached predecessor text",
+			outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+		});
+		expect(await bounded(first, "first terminal settlement")).toEqual({ stopReason: "end_turn" });
+		await bounded(fixture.agentMessageUpdateEntered, "entered predecessor final-text delivery");
+		await bounded(fixture.agent.closeSession({ sessionId: fixture.sessionId }), "session close during final text");
+		await bounded(
+			fixture.agent.loadSession({ sessionId: fixture.sessionId, cwd: fixture.cwd, mcpServers: [] }),
+			"same-id final-text reattachment",
+		);
+		await expect(prompt(fixture, "successor blocked across final-text replacement")).rejects.toMatchObject({
+			code: "conflict",
+		});
+		fixture.releaseAgentMessageUpdate();
+		const { pending: successor } = await promptWhenDelivered(fixture, "successor after replaced final text", 2);
+		fixture.sendStopped("end_turn");
+		expect(await bounded(successor, "successor after replaced final text")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		fixture.releaseAgentMessageUpdate();
+		fixture.dispose();
+	}
+});
+
 test("ACP successor terminal decoration does not wait for a predecessor advisory query", async () => {
 	const fixture = await createFixture({ blockedAdvisoryQuery: "context.get" });
 	try {
@@ -957,6 +993,24 @@ test("ACP terminal processing preserves FIFO behind an earlier correlated update
 					(update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase === "working",
 			),
 		).toBe(true);
+	} finally {
+		fixture.releaseWorkingUpdate();
+		fixture.dispose();
+	}
+});
+
+test("ACP background publication failure remains fatal after a prompt generation starts", async () => {
+	const fixture = await createFixture({ blockInitialWorkingUpdate: true, rejectBlockedWorkingUpdate: true });
+	try {
+		fixture.sendTerminal({ type: "agent_start", sessionId: "prompt-terminal-session" });
+		await bounded(fixture.workingUpdateEntered, "entered background working publication");
+		const pending = prompt(fixture, "prompt during failed background publication");
+		void pending.catch(() => undefined);
+		await bounded(fixture.promptDelivered, "prompt delivery");
+		fixture.releaseWorkingUpdate();
+		await expect(bounded(pending, "background publication session failure")).rejects.toMatchObject({
+			code: "frame_processing_failed",
+		});
 	} finally {
 		fixture.releaseWorkingUpdate();
 		fixture.dispose();
