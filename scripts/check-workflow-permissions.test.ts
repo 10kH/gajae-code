@@ -10,6 +10,7 @@ import {
 const CI_WORKFLOW = ".github/workflows/ci.yml";
 const DEV_CI_WORKFLOW = ".github/workflows/dev-ci.yml";
 const PR_VALIDATION_WORKFLOW = ".github/workflows/pr-validation.yml";
+const SPOOFED_VERSION_WORKFLOW = ".github/workflows/spoofed-version-sync.yml";
 const repoRoot = `${import.meta.dir}/..`;
 
 async function parsedWorkflow(file: string): Promise<Record<string, unknown>> {
@@ -40,6 +41,7 @@ describe("workflow permission policy", () => {
 			".github/workflows/dev-ci.yml",
 			".github/workflows/pr-validation.yml",
 			".github/workflows/public-site-sync.yml",
+			".github/workflows/spoofed-version-sync.yml",
 		]);
 	});
 
@@ -88,6 +90,21 @@ describe("workflow permission policy", () => {
 		// allowlisted write scope in this workflow.
 		expect(jobWriteScopes(document)).toEqual(["validate.checks"]);
 		expect(JOB_WRITE_ALLOWLIST).toContainEqual({ workflow: PR_VALIDATION_WORKFLOW, job: "validate", scope: "checks" });
+	});
+
+	test("spoofed-version-sync.yml detects drift with no write scope anywhere", async () => {
+		const workflows = await readWorkflowDocuments();
+		const spoofedVersion = workflows.find(workflow => workflow.file === SPOOFED_VERSION_WORKFLOW);
+		expect(spoofedVersion).toBeDefined();
+		const document = documentRecord(spoofedVersion!.document);
+
+		// The scheduled drift check reports; it never pushes a branch or opens a
+		// pull request. dev requires the signed exact-head PR contract, so write
+		// scopes here could not remove the human step they would be bought for.
+		expect(REQUIRED_READ_DEFAULT).toContain(SPOOFED_VERSION_WORKFLOW);
+		expect(document.permissions).toEqual({ contents: "read" });
+		expect(jobWriteScopes(document)).toEqual([]);
+		expect(JOB_WRITE_ALLOWLIST.some(entry => entry.workflow === SPOOFED_VERSION_WORKFLOW)).toBe(false);
 	});
 
 	test("detects a ci.yml workflow contents write mutation", async () => {

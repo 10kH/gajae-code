@@ -39,6 +39,7 @@ export const REQUIRED_READ_DEFAULT: readonly string[] = [
 	".github/workflows/dev-ci.yml",
 	".github/workflows/pr-validation.yml",
 	".github/workflows/public-site-sync.yml",
+	".github/workflows/spoofed-version-sync.yml",
 ];
 
 const READ_SCOPE_ALLOWLIST: Readonly<Record<string, readonly string[]>> = {
