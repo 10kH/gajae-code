@@ -47,6 +47,14 @@ describe("cursor conversation usage", () => {
 		expect(usage.totalTokens).toBe(105);
 	});
 
+	it("does not reuse pre-compaction output after a checkpoint decrease", () => {
+		const usage = finalizeCursorUsageForTest(80, 30, { checkpointOutputTokens: 0 });
+
+		expect(usage.input).toBe(80);
+		expect(usage.output).toBe(30);
+		expect(usage.totalTokens).toBe(110);
+	});
+
 	it("reports prompt tokens to the compaction accounting path", () => {
 		const usage = finalizeCursorUsageForTest(21_594, 14);
 

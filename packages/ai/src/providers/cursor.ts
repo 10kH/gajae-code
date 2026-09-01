@@ -677,10 +677,12 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			const usageContext = buildCursorUsageContext(context, model, options);
 			previousUsageContext = conversationUsageContextCache.get(conversationId);
 			conversationUsageContextCache.set(conversationId, usageContext);
+			const reusableCachedState =
+				cachedState && canReuseCursorUsageContext(previousUsageContext, usageContext) ? cachedState : undefined;
 			const { requestBytes, conversationState } = buildGrpcRequest(model, context, options, {
 				conversationId,
 				blobStore,
-				conversationState: cachedState,
+				conversationState: reusableCachedState,
 			});
 			conversationStateCache.set(conversationId, conversationState);
 			touchCursorConversation(conversationId);
@@ -2976,11 +2978,13 @@ function handleConversationCheckpointUpdate(
 	if (!checkpoint.tokenDetails) {
 		return;
 	}
+	const previousUsedTokens = usageState.conversationUsedTokens;
 	// `used_tokens` counts the whole conversation, so it is prompt-side usage and
 	// must not be attributed to this turn's output. Checkpoints can arrive while
 	// output is still streaming; the split is applied once the stream finalizes.
 	usageState.conversationUsedTokens = usedTokens;
-	usageState.checkpointOutputTokens = output.usage.output;
+	usageState.checkpointOutputTokens =
+		usageState.hasConversationCheckpoint && usedTokens < previousUsedTokens ? 0 : output.usage.output;
 	usageState.hasConversationCheckpoint = true;
 }
 
