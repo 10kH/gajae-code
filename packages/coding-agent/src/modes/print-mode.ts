@@ -5,6 +5,7 @@
  * - `gjc -p "prompt"` - text output
  * - `gjc --mode json "prompt"` - JSON event stream
  */
+import type { AgentMessage } from "@gajae-code/agent-core";
 import { type AssistantMessage, type ImageContent, isContextOverflow } from "@gajae-code/ai/core";
 import { isKnownSinkPeerClosedError, logger, sanitizeText } from "@gajae-code/utils";
 import { loadSlashCommands } from "../extensibility/slash-commands";
@@ -45,6 +46,48 @@ export interface PrintModeOptions {
  * it is intentionally NOT covered by this exit code.
  */
 export const CONTEXT_OVERFLOW_EXIT_CODE = 78;
+
+const EMPTY_TURN_ERROR = {
+	code: "empty_response",
+	message: "Turn completed without assistant text.",
+} as const;
+
+export type PrintTerminalDisposition =
+	| { status: "success"; assistantText: true }
+	| { status: "failure"; error: typeof EMPTY_TURN_ERROR | { code: "assistant_error"; message: string } };
+
+function assistantText(message: AssistantMessage): string {
+	return message.content
+		.filter((content): content is { type: "text"; text: string } => content.type === "text")
+		.map(content => content.text)
+		.join("");
+}
+
+export function resolvePrintTerminalDisposition(
+	messages: readonly AgentMessage[],
+	submittedPrompt: boolean,
+	turnStartIndex?: number,
+): PrintTerminalDisposition | undefined {
+	if (!submittedPrompt) return undefined;
+	const turnMessages = turnStartIndex === undefined ? messages : messages.slice(turnStartIndex);
+	const lastAssistant = turnMessages.findLast((message): message is AssistantMessage => message.role === "assistant");
+	if (!lastAssistant) return { status: "failure", error: EMPTY_TURN_ERROR };
+	if (
+		(lastAssistant.stopReason === "error" || lastAssistant.stopReason === "aborted") &&
+		!isSilentAbort(lastAssistant.errorMessage)
+	) {
+		return {
+			status: "failure",
+			error: {
+				code: "assistant_error",
+				message: sanitizeText(lastAssistant.errorMessage || `Request ${lastAssistant.stopReason}`),
+			},
+		};
+	}
+	if (isSilentAbort(lastAssistant.errorMessage)) return undefined;
+	if (assistantText(lastAssistant).trim().length === 0) return { status: "failure", error: EMPTY_TURN_ERROR };
+	return { status: "success", assistantText: true };
+}
 
 /**
  * Build an actionable stderr diagnostic for a terminal context-overflow error in
@@ -201,6 +244,8 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 	let unsubscribe: (() => void) | undefined;
 	let submittedPrompt = false;
 	let consumedCommand = false;
+	let jsonFailureObserved = false;
+	let lastPromptMessageStart: number | undefined;
 
 	try {
 		for (const warning of new Set(session.configWarnings)) {
@@ -237,6 +282,14 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 		// when it must render the JSON event stream.
 		if (mode === "json") {
 			unsubscribe = session.subscribe(event => {
+				if (
+					event.type === "agent_failed" ||
+					(event.type === "message_end" &&
+						event.message.role === "assistant" &&
+						(event.message.stopReason === "error" || event.message.stopReason === "aborted"))
+				) {
+					jsonFailureObserved = true;
+				}
 				stdout.write(`${JSON.stringify(event)}\n`);
 			});
 		}
@@ -265,6 +318,7 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 				if (command !== false) text = command.prompt;
 			}
 			submittedPrompt = true;
+			lastPromptMessageStart = session.state.messages.length;
 			await session.prompt(text, images ? { images } : undefined);
 		};
 
@@ -275,6 +329,16 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 		}
 		for (const message of messages) {
 			await logger.time("print:prompt:next", () => submitInput(message));
+		}
+
+		const terminal = resolvePrintTerminalDisposition(session.state.messages, submittedPrompt, lastPromptMessageStart);
+		if (terminal?.status === "failure") {
+			if (!options.suppressProcessExit) process.exitCode = 1;
+			if (mode === "json" && !jsonFailureObserved) {
+				stdout.write(`${JSON.stringify({ type: "agent_failed", error: terminal.error })}\n`);
+			} else if (mode === "text" && terminal.error.code === EMPTY_TURN_ERROR.code) {
+				await writeStderrAndQuiesce(`${terminal.error.message}\n`);
+			}
 		}
 
 		// In text mode, output final response.
