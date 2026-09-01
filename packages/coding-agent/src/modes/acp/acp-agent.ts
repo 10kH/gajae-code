@@ -117,6 +117,8 @@ interface PromptWaiter {
 	emittedAssistantText: string;
 	settled: boolean;
 	terminal?: { outcome: SdkPromptTerminalOutcome; correlation: PromptCorrelation };
+	/** Exact terminal observed at ingress; no later timeout/cancel/frame failure may supersede it. */
+	terminalReserved: boolean;
 	/** Additive diagnostics held until settlement so they cannot block the terminal response writer. */
 	failureDiagnostics: Array<{ notification: SessionNotification; publicationGeneration: number }>;
 	/** Frames for an already-settled correlation held until acknowledgement resolves ownership. */
@@ -1677,6 +1679,7 @@ export class AcpAgent implements Agent {
 			correlation: {},
 			emittedAssistantText: "",
 			settled: false,
+			terminalReserved: false,
 			failureDiagnostics: [],
 			deferredFrames: [],
 			deferredActivityFrames: [],
@@ -1835,13 +1838,17 @@ export class AcpAgent implements Agent {
 						);
 					continue;
 				}
-				if (deferredIsTerminal) clearPromptWatchdog(waiter);
+				if (deferredIsTerminal) {
+					waiter.terminalReserved = true;
+					clearPromptWatchdog(waiter);
+				}
 				const task = record.frameTail.then(
 					async () =>
 						await this.#handleSdkFrame(params.sessionId, record.adapter, deferredFrame, deferredGeneration),
 				);
 				record.frameTail = task.catch(async error => {
 					if (deferredGeneration !== record.publicationGeneration) return;
+					if (record.activePrompt?.terminalReserved) return;
 					await this.#failSession(params.sessionId, record.adapter, this.#frameProcessingFailure(error));
 				});
 			}
@@ -2013,6 +2020,7 @@ export class AcpAgent implements Agent {
 		// The authoritative terminal wins whenever it arrives in time; this only runs
 		// when nothing settled the prompt the client already asked to cancel.
 		if (this.#sessions.get(id) !== record || record.activePrompt !== waiter || waiter.settled) return;
+		if (waiter.terminalReserved) return;
 		record.activePrompt = undefined;
 		if (!record.backgroundBusy) record.busy = false;
 		clearPromptWatchdog(waiter);
@@ -2659,13 +2667,7 @@ export class AcpAgent implements Agent {
 		const event = receivedSdkEvent(frame)?.event;
 		if (event?.type === "agent_start") {
 			record.busy = true;
-			const correlation = sdkFrameCorrelation(frame, event);
-			if (
-				!record.activePrompt ||
-				!correlation ||
-				!correlationsExactlyMatch(record.activePrompt.correlation, correlation)
-			)
-				record.backgroundBusy = true;
+			if (!record.activePrompt) record.backgroundBusy = true;
 		}
 	}
 
@@ -2703,7 +2705,7 @@ export class AcpAgent implements Agent {
 	 */
 	#refreshPromptWatchdog(id: string, record: SessionRecord, frame: JsonObject): void {
 		const waiter = record.activePrompt;
-		if (!waiter || waiter.settled) return;
+		if (!waiter || waiter.settled || waiter.terminalReserved) return;
 		const event = receivedSdkEvent(frame)?.event;
 		const correlation = watchdogCorrelationFrom(frame, event);
 		if (!waiter.acknowledged) {
@@ -2739,7 +2741,7 @@ export class AcpAgent implements Agent {
 	 * turn can no longer be observed, it does not cancel or tear down the session.
 	 */
 	async #expirePromptWatchdog(id: string, record: SessionRecord, waiter: PromptWaiter): Promise<void> {
-		if (record.activePrompt !== waiter || waiter.settled) return;
+		if (record.activePrompt !== waiter || waiter.settled || waiter.terminalReserved) return;
 		const silenceMs = Math.max(0, this.#promptWatchdogClock.now() - waiter.lastFrameAt);
 		const cause = this.#promptTransportGone(id, record) ?? "the SDK session host stopped producing frames";
 		logger.error("acp_prompt_watchdog_expired", {
@@ -2791,13 +2793,16 @@ export class AcpAgent implements Agent {
 			record.activePrompt?.acknowledged &&
 			ingressCorrelation &&
 			correlationsExactlyMatch(record.activePrompt.correlation, ingressCorrelation)
-		)
+		) {
+			record.activePrompt.terminalReserved = true;
 			clearPromptWatchdog(record.activePrompt);
+		}
 		++record.inboundSequence;
 		const frameGeneration = record.publicationGeneration;
 		const task = record.frameTail.then(async () => await this.#handleSdkFrame(id, adapter, frame, frameGeneration));
 		record.frameTail = task.catch(async error => {
 			if (frameGeneration !== record.publicationGeneration) return;
+			if (record.activePrompt?.terminalReserved) return;
 			await this.#failSession(id, adapter, this.#frameProcessingFailure(error));
 		});
 	}
@@ -3303,6 +3308,8 @@ export class AcpAgent implements Agent {
 			// A validated terminal can retire this publication while it is blocked in
 			// the client transport. Its failure belongs to the drained prompt and must
 			// not tear down a successor that has since taken session ownership.
+			const current = this.#sessions.get(id);
+			if (current && current.adapter === record.adapter && current.activePrompt?.terminalReserved) return;
 			if (publicationGeneration !== undefined && publicationGeneration !== record.publicationGeneration) return;
 			const failure = this.#frameProcessingFailure(error);
 			await this.#failSession(id, record.adapter, failure);

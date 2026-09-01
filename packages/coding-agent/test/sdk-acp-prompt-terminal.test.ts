@@ -1408,6 +1408,14 @@ test("ACP deferred terminal remains FIFO behind an earlier deferred publication"
 		expect(settled).toBe(false);
 		fixture.releaseWorkingUpdate();
 		expect(await bounded(pending, "deferred FIFO terminal settlement")).toEqual({ stopReason: "end_turn" });
+		await waitFor(
+			() =>
+				fixture.updates
+					.filter(update => update.update.sessionUpdate === "session_info_update")
+					.map(update => (update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase)
+					.at(-1) === "idle",
+			"deferred terminal idle phase",
+		);
 	} finally {
 		fixture.releaseWorkingUpdate();
 		fixture.dispose();
