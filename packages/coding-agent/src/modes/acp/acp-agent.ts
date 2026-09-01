@@ -1705,6 +1705,7 @@ export class AcpAgent implements Agent {
 			}
 			if (record.activePrompt === waiter) {
 				record.activePrompt = undefined;
+				record.busy = record.backgroundBusy;
 				this.#retiredPromptAcknowledgements.delete(params.sessionId);
 				void this.#publishPromptPhaseIdle(params.sessionId, record.adapter);
 			}
@@ -1798,10 +1799,19 @@ export class AcpAgent implements Agent {
 					watchdogCorrelationFrom(deferredFrame, deferredEvent),
 				);
 				if (deferredEvent?.type === "agent_start" && !matchesWaiter) {
-					record.backgroundBusy = true;
 					const deferredCorrelation = sdkFrameCorrelation(deferredFrame, deferredEvent);
-					record.backgroundCorrelation =
-						deferredCorrelation && hasCompleteCorrelation(deferredCorrelation) ? deferredCorrelation : undefined;
+					const tombstoned =
+						deferredCorrelation &&
+						record.settledPromptCorrelations.some(settled =>
+							correlationsExactlyMatch(settled, deferredCorrelation),
+						);
+					if (!tombstoned) {
+						record.backgroundBusy = true;
+						record.backgroundCorrelation =
+							deferredCorrelation && hasCompleteCorrelation(deferredCorrelation)
+								? deferredCorrelation
+								: undefined;
+					}
 				}
 				if (matchesWaiter) {
 					this.#observePromptActivity(waiter, deferredFrame);
@@ -1833,6 +1843,17 @@ export class AcpAgent implements Agent {
 					continue;
 				}
 				const matchesPrompt = correlationsExactlyMatch(waiter.correlation, deferredCorrelation);
+				if (
+					!matchesPrompt &&
+					deferredIsTerminal &&
+					record.backgroundCorrelation &&
+					correlationsExactlyMatch(record.backgroundCorrelation, deferredCorrelation)
+				) {
+					record.backgroundBusy = false;
+					record.backgroundCorrelation = undefined;
+					record.busy = true;
+					continue;
+				}
 				if (
 					!matchesPrompt &&
 					record.settledPromptCorrelations.some(settled => correlationsExactlyMatch(settled, deferredCorrelation))
@@ -1959,6 +1980,7 @@ export class AcpAgent implements Agent {
 				!waiter.settled
 			) {
 				record.activePrompt = undefined;
+				record.busy = record.backgroundBusy;
 				record.cancelRequested = false;
 				clearPromptWatchdog(waiter);
 				waiter.settled = true;
