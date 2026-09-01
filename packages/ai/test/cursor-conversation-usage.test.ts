@@ -87,6 +87,18 @@ describe("cursor conversation usage", () => {
 		expect(usage.totalTokens).toBe(10_100);
 	});
 
+	it("advances a checkpoint-free baseline exactly once across warm turns", () => {
+		const firstTurn = finalizeCursorUsageForTest(10_000, 100, { hasConversationCheckpoint: false });
+		const secondTurn = finalizeCursorUsageForTest(firstTurn.totalTokens, 50, { hasConversationCheckpoint: false });
+		const thirdTurn = finalizeCursorUsageForTest(secondTurn.totalTokens, 25, { hasConversationCheckpoint: false });
+
+		expect(firstTurn.totalTokens).toBe(10_100);
+		expect(secondTurn.input).toBe(10_100);
+		expect(secondTurn.totalTokens).toBe(10_150);
+		expect(thirdTurn.input).toBe(10_150);
+		expect(thirdTurn.totalTokens).toBe(10_175);
+	});
+
 	it("accepts an explicit zero checkpoint as a reset", () => {
 		const usage = finalizeCursorUsageForTest(0, 91, { hasConversationCheckpoint: true });
 
