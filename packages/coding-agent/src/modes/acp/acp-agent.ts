@@ -3177,7 +3177,8 @@ export class AcpAgent implements Agent {
 				current &&
 					current.adapter === adapter &&
 					current.publicationGeneration === publicationGeneration &&
-					!current.activePrompt,
+					!current.activePrompt &&
+					!current.busy,
 			);
 		};
 		if (!ownsCurrentGeneration()) return;

@@ -950,6 +950,34 @@ test("ACP successor terminal decoration does not wait for a predecessor advisory
 	}
 });
 
+test("ACP predecessor terminal metadata cannot overwrite a background successor", async () => {
+	const fixture = await createFixture({ blockedAdvisoryQuery: "context.get" });
+	try {
+		const first = prompt(fixture, "background metadata isolation");
+		await bounded(fixture.promptDelivered, "first prompt delivery");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(first, "first terminal settlement")).toEqual({ stopReason: "end_turn" });
+		await waitFor(() => fixture.blockedAdvisoryQueryCount() === 1, "blocked predecessor advisory query");
+		fixture.sendTerminal({ type: "agent_start", sessionId: "prompt-terminal-session" });
+		await waitFor(
+			() =>
+				fixture.updates
+					.filter(update => update.update.sessionUpdate === "session_info_update")
+					.map(update => (update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase)
+					.at(-1) === "working",
+			"background working phase",
+		);
+		const updatesBeforeRelease = fixture.updates.length;
+		fixture.releaseBlockedAdvisoryQueries();
+		await Bun.sleep(0);
+		expect(fixture.updates).toHaveLength(updatesBeforeRelease);
+		fixture.sendTerminal({ type: "agent_end", sessionId: "prompt-terminal-session" });
+	} finally {
+		fixture.releaseBlockedAdvisoryQueries();
+		fixture.dispose();
+	}
+});
+
 test("ACP successor waits only while ready predecessor metadata is being delivered", async () => {
 	const fixture = await createFixture({ blockIdleUpdate: true });
 	try {
