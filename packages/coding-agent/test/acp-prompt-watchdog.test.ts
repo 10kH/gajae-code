@@ -80,6 +80,7 @@ type Fixture = {
 	clock: VirtualClock;
 	/** Correlation the fixture host acknowledged for the turn currently in flight. */
 	correlation(): { commandId: string; turnId: string };
+	promptDeliveryCount(): number;
 	/** Sends one raw frame down the session socket, correlation included or omitted verbatim. */
 	send(frame: Record<string, unknown>): void;
 	sendAssistantText(text: string): void;
@@ -142,6 +143,7 @@ type FixtureOptions = {
 	agentStartBeforeAcknowledgement?: boolean;
 	deferFirstPromptAcknowledgement?: boolean;
 	cancelSettlementGraceMs?: number;
+	preflightCancelAcknowledgement?: boolean;
 };
 
 async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
@@ -305,6 +307,7 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 										ok: true,
 										selection: scope,
 										turn: "stopped",
+										...(options.preflightCancelAcknowledgement ? { disposition: "preflight_cancelled" } : {}),
 										ownedWork: scope === "owned" ? "stopped" : "left_running",
 										automaticDelivery: scope === "owned" ? "none" : "enabled",
 										resumeOnOwnedCompletion: scope !== "owned",
@@ -385,6 +388,7 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 		updates,
 		clock,
 		correlation: () => ({ commandId, turnId }),
+		promptDeliveryCount: () => turnCount,
 		send,
 		sendAssistantText,
 		sendStopped,
@@ -413,9 +417,40 @@ function prompt(fixture: Fixture, text: string): Promise<{ stopReason: StoppedRe
  */
 async function startTurn(fixture: Fixture): Promise<{ pending: Promise<{ stopReason: StoppedReason }> }> {
 	const started = workingUpdates(fixture.updates);
+	const expectedDelivery = fixture.promptDeliveryCount() + 1;
 	const pending = prompt(fixture, "work");
-	await waitFor(() => workingUpdates(fixture.updates) > started, "turn start");
+	await waitFor(
+		() => fixture.promptDeliveryCount() === expectedDelivery && workingUpdates(fixture.updates) > started,
+		"turn start",
+	);
 	return { pending };
+}
+
+async function startTurnAfterFence(fixture: Fixture): Promise<{ pending: Promise<{ stopReason: StoppedReason }> }> {
+	for (;;) {
+		const started = workingUpdates(fixture.updates);
+		const pending = prompt(fixture, "work");
+		const outcome = await Promise.race([
+			pending.then(
+				() => ({ kind: "settled" as const }),
+				error => ({ kind: "rejected" as const, error }),
+			),
+			waitFor(() => workingUpdates(fixture.updates) > started, "successor turn start").then(() => ({
+				kind: "delivered" as const,
+			})),
+		]);
+		if (outcome.kind === "delivered") return { pending };
+		if (
+			outcome.kind === "rejected" &&
+			outcome.error instanceof Error &&
+			"code" in outcome.error &&
+			outcome.error.code === "conflict"
+		) {
+			await Bun.sleep(0);
+			continue;
+		}
+		throw outcome.kind === "rejected" ? outcome.error : new Error("Successor settled before delivery barrier");
+	}
 }
 
 test("a prompt awaiting the model past the inference bound is rejected instead of hanging", async () => {
@@ -442,8 +477,37 @@ test("a prompt awaiting the model past the inference bound is rejected instead o
 		expect(message).toContain('"agent_start"');
 		expect(message).toContain(`commandId=${commandId}`);
 		expect(message).toContain(`turnId=${turnId}`);
-		// The client's running phase is released, so the composer stops spinning.
-		expect(idleUpdates(fixture.updates)).toBe(idleBefore + 1);
+		// The ACP waiter is retired, but the host did not acknowledge cancellation and
+		// remains observably busy until it publishes a real terminal/activity boundary.
+		expect(idleUpdates(fixture.updates)).toBe(idleBefore);
+		expect(workingUpdates(fixture.updates)).toBeGreaterThan(0);
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("a foreign failed terminal cannot clear host busy before watchdog rejection", async () => {
+	const fixture = await createFixture();
+	try {
+		const { pending } = await startTurn(fixture);
+		const idleBefore = idleUpdates(fixture.updates);
+		fixture.send({
+			type: "agent_failed",
+			sessionId: fixture.sessionId,
+			commandId: "foreign-command",
+			turnId: "foreign-turn",
+			outcome: { kind: "failed", code: "prompt_failed", message: "foreign failure", provenance: "agent_failed" },
+		});
+		fixture.clock.advance(ACP_PROMPT_INFERENCE_TIMEOUT_MS + 1);
+		await bounded(
+			pending.then(
+				() => undefined,
+				() => undefined,
+			),
+			"watchdog rejection after foreign terminal",
+		);
+		expect(idleUpdates(fixture.updates)).toBe(idleBefore);
+		expect(workingUpdates(fixture.updates)).toBeGreaterThan(0);
 	} finally {
 		fixture.dispose();
 	}
@@ -523,7 +587,7 @@ test("a normal agent_end settles the prompt once and disarms the watchdog", asyn
 		expect(fixture.clock.pending).toBe(0);
 
 		fixture.clock.advance(ACP_PROMPT_INACTIVITY_TIMEOUT_MS * 3);
-		await Bun.sleep(10);
+		await Bun.sleep(0);
 
 		// No second settlement: no rejection, no extra phase publication.
 		expect(fixture.updates.length).toBe(updatesAfterSettle);
@@ -576,7 +640,7 @@ test("a tool call running past the idle bound is protected while it runs, not af
 		// A `bash` that blocks far past the idle bound is evidenced as running, so the
 		// silence it produces is legitimate and must not be rejected.
 		fixture.clock.advance(ACP_PROMPT_TOOL_ACTIVITY_TIMEOUT_MS - 1);
-		await Bun.sleep(10);
+		await Bun.sleep(0);
 		expect(settled).toBe(false);
 
 		const ended = toolCallUpdates(fixture.updates);
@@ -627,7 +691,7 @@ test("a tool call still in flight keeps the wide bound armed across silent gaps"
 		await waitFor(() => toolCallUpdates(fixture.updates) > ended, "second tool call end");
 
 		fixture.clock.advance(ACP_PROMPT_INACTIVITY_TIMEOUT_MS * 3);
-		await Bun.sleep(10);
+		await Bun.sleep(0);
 		expect(settled).toBe(false);
 
 		fixture.sendStopped("end_turn");
@@ -656,12 +720,12 @@ test("a turn silent after agent_start is not killed while the model is still ans
 		// executing, but a dispatched model call has not answered, so the evidence-free
 		// bound is the wrong one to apply.
 		fixture.clock.advance(ACP_PROMPT_INACTIVITY_TIMEOUT_MS + 1);
-		await Bun.sleep(10);
+		await Bun.sleep(0);
 		expect(settled).toBe(false);
 
 		// Still one tick short of the inference bound after the whole gap.
 		fixture.clock.advance(ACP_PROMPT_INFERENCE_TIMEOUT_MS - ACP_PROMPT_INACTIVITY_TIMEOUT_MS - 2);
-		await Bun.sleep(10);
+		await Bun.sleep(0);
 		expect(settled).toBe(false);
 
 		const chunks = textChunks(fixture.updates);
@@ -699,11 +763,11 @@ test("a turn silent after tool_execution_end is not killed while the model is re
 		// provider call had not answered yet. No tool is running, so the wide tool bound is
 		// correctly retired — but the turn is still legitimately silent.
 		fixture.clock.advance(ACP_PROMPT_INACTIVITY_TIMEOUT_MS + 1);
-		await Bun.sleep(10);
+		await Bun.sleep(0);
 		expect(settled).toBe(false);
 
 		fixture.clock.advance(ACP_PROMPT_INFERENCE_TIMEOUT_MS - ACP_PROMPT_INACTIVITY_TIMEOUT_MS - 2);
-		await Bun.sleep(10);
+		await Bun.sleep(0);
 		expect(settled).toBe(false);
 
 		const chunks = textChunks(fixture.updates);
@@ -815,10 +879,12 @@ test("a late acknowledgement tombstones a prompt rejected before ownership was k
 		const abandonedError = await bounded(abandoned, "watchdog rejection before acknowledgement");
 		expect(abandonedError).toBeInstanceOf(Error);
 		expect((abandonedError as Error).message).toContain("ACP prompt was abandoned");
+		await expect(prompt(fixture, "blocked until late acknowledgement")).rejects.toMatchObject({
+			code: "conflict",
+		});
 
 		fixture.acknowledgePrompt();
-
-		const { pending } = await startTurn(fixture);
+		const { pending } = await startTurnAfterFence(fixture);
 		expect(fixture.correlation()).not.toEqual(stale);
 		const armedBeforeStaleFrames = fixture.clock.armed;
 		const chunksBefore = textChunks(fixture.updates);
@@ -923,6 +989,24 @@ test("a cancelled pre-acknowledgement prompt settles without its acknowledgement
 	}
 });
 
+test("a preflight-cancelled prompt clears its watchdog before settlement", async () => {
+	const fixture = await createFixture({
+		deferFirstPromptAcknowledgement: true,
+		preflightCancelAcknowledgement: true,
+	});
+	try {
+		const pending = prompt(fixture, "preflight cancel cleanup");
+		await waitFor(() => fixture.correlation().commandId.length > 0, "prompt dispatch");
+		expect(fixture.clock.pending).toBe(1);
+		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "preflight cancel acknowledgement");
+		expect(await bounded(pending, "preflight cancellation settlement")).toEqual({ stopReason: "cancelled" });
+		expect(fixture.clock.pending).toBe(0);
+		fixture.acknowledgePrompt();
+	} finally {
+		fixture.dispose();
+	}
+});
+
 test("a settled turn's stale message frame does not narrow the live turn off the inference bound", async () => {
 	const fixture = await createFixture();
 	try {
@@ -953,7 +1037,7 @@ test("a settled turn's stale message frame does not narrow the live turn off the
 		expect(fixture.clock.armed).toEqual(armedBefore);
 		expect(fixture.clock.armed?.at).toBe(fixture.clock.now() + ACP_PROMPT_INFERENCE_TIMEOUT_MS);
 		fixture.clock.advance(ACP_PROMPT_INACTIVITY_TIMEOUT_MS + 1);
-		await Bun.sleep(10);
+		await Bun.sleep(0);
 		expect(settled).toBe(false);
 
 		fixture.sendStopped("end_turn");
@@ -1072,6 +1156,15 @@ test("correlationless assistant text does not consume the prompt final text", as
 		});
 
 		expect(await bounded(pending, "prompt completion")).toEqual({ stopReason: "end_turn" });
+		await waitFor(
+			() =>
+				fixture.updates.some(
+					update =>
+						update.update.sessionUpdate === "agent_message_chunk" &&
+						(update.update as { content: { text: string } }).content.text === finalText,
+				),
+			"detached authoritative final text",
+		);
 		const published = fixture.updates
 			.filter(update => update.update.sessionUpdate === "agent_message_chunk")
 			.map(update => (update.update as { content: { text: string } }).content.text);
@@ -1141,7 +1234,7 @@ test("a pre-ack agent_start keeps the live prompt on the inference bound", async
 		);
 
 		fixture.clock.advance(ACP_PROMPT_INACTIVITY_TIMEOUT_MS + 1);
-		await Bun.sleep(10);
+		await Bun.sleep(0);
 		expect(settled).toBe(false);
 
 		fixture.clock.advance(ACP_PROMPT_INFERENCE_TIMEOUT_MS - ACP_PROMPT_INACTIVITY_TIMEOUT_MS);
@@ -1154,6 +1247,27 @@ test("a pre-ack agent_start keeps the live prompt on the inference bound", async
 		);
 		expect(error).toBeInstanceOf(Error);
 		expect((error as Error).message).toContain(`${Math.round(ACP_PROMPT_INFERENCE_TIMEOUT_MS / 1_000)}s of silence`);
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("a pre-ack watchdog rejection retires tentative foreground activity", async () => {
+	const fixture = await createFixture({
+		agentStartBeforeAcknowledgement: true,
+		deferFirstPromptAcknowledgement: true,
+	});
+	try {
+		const pending = prompt(fixture, "pre-ack watchdog retirement");
+		void pending.catch(() => undefined);
+		await waitFor(() => fixture.promptDeliveryCount() === 1, "prompt delivery");
+		const idleBefore = idleUpdates(fixture.updates);
+		fixture.clock.advance(ACP_PROMPT_INFERENCE_TIMEOUT_MS + 1);
+		await Bun.sleep(0);
+		await waitFor(() => idleUpdates(fixture.updates) > idleBefore, "pre-ack idle phase");
+		fixture.acknowledgePrompt();
+		await Bun.sleep(0);
+		expect(idleUpdates(fixture.updates)).toBeGreaterThan(idleBefore);
 	} finally {
 		fixture.dispose();
 	}
