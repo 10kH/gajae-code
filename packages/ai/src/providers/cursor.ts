@@ -668,7 +668,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			const blobStore = conversationBlobStores.get(conversationId) ?? new Map<string, Uint8Array>();
 			conversationBlobStores.set(conversationId, blobStore);
 			const cachedState = conversationStateCache.get(conversationId);
-			const usageContext = buildCursorUsageContext(context);
+			const usageContext = buildCursorUsageContext(context, model);
 			const previousUsageContext = conversationUsageContextCache.get(conversationId);
 			conversationUsageContextCache.set(conversationId, usageContext);
 			const { requestBytes, conversationState } = buildGrpcRequest(model, context, options, {
@@ -729,10 +729,14 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				else inboundEnd.resolve();
 			};
 			void inboundEnd.promise.catch(() => {});
-			inboundTimeout = setTimeout(
-				() => settleInbound(new Error("Cursor stream did not reach its inbound terminal frame")),
-				options?.streamIdleTimeoutMs ?? getStreamIdleTimeoutMs(),
-			);
+			const armInboundTimeout = () => {
+				const timeoutMs = options?.streamIdleTimeoutMs ?? 0;
+				if (timeoutMs <= 0 || inboundSettled) return;
+				inboundTimeout = setTimeout(
+					() => settleInbound(new Error("Cursor stream did not reach its inbound terminal frame")),
+					timeoutMs,
+				);
+			};
 			coordinator = new CursorRequestCoordinator(
 				h2Request,
 				stopHeartbeat,
@@ -920,6 +924,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					resolve();
 				}
 			});
+			armInboundTimeout();
 			await inboundEnd.promise;
 
 			if (state.currentTextBlock) {
@@ -955,6 +960,10 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			}
 
 			finalizeCursorUsage(output, usageState);
+			conversationUsageContextCache.set(conversationId, {
+				...usageContext,
+				messageKeys: [...usageContext.messageKeys, hashCursorUsageMessage(output)],
+			});
 			calculateCost(model, output.usage);
 
 			output.duration = Date.now() - startTime;
@@ -1027,6 +1036,7 @@ interface UsageState {
 }
 
 interface CursorUsageContext {
+	modelKey: string;
 	systemPromptKey: string;
 	messageKeys: string[];
 }
@@ -3297,11 +3307,16 @@ function buildConversationTurns(messages: Message[], blobStore: Map<string, Uint
 	return turns;
 }
 
-function buildCursorUsageContext(context: Context): CursorUsageContext {
+function buildCursorUsageContext(context: Context, model: Model<"cursor-agent">): CursorUsageContext {
 	return {
+		modelKey: hashCursorUsageValue({ provider: model.provider, id: model.id, wireModelId: model.wireModelId }),
 		systemPromptKey: hashCursorUsageValue(context.systemPrompt ?? []),
-		messageKeys: context.messages.map(message => hashCursorUsageValue(message)),
+		messageKeys: context.messages.map(message => hashCursorUsageMessage(message)),
 	};
+}
+
+function hashCursorUsageMessage(message: { role: string; content: unknown }): string {
+	return hashCursorUsageValue({ role: message.role, content: message.content });
 }
 
 function hashCursorUsageValue(value: unknown): string {
@@ -3311,7 +3326,8 @@ function hashCursorUsageValue(value: unknown): string {
 }
 
 function canReuseCursorUsageContext(previous: CursorUsageContext | undefined, current: CursorUsageContext): boolean {
-	if (!previous || previous.systemPromptKey !== current.systemPromptKey) return false;
+	if (!previous || previous.modelKey !== current.modelKey || previous.systemPromptKey !== current.systemPromptKey)
+		return false;
 	if (previous.messageKeys.length > current.messageKeys.length) return false;
 	return previous.messageKeys.every((key, index) => key === current.messageKeys[index]);
 }
