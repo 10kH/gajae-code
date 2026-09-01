@@ -2719,6 +2719,12 @@ export class AcpAgent implements Agent {
 				record.settledPromptCorrelations.some(settled => correlationsExactlyMatch(settled, correlation))
 			)
 				return;
+			if (
+				record.activePrompt?.terminalReserved &&
+				correlation &&
+				correlationsExactlyMatch(record.activePrompt.correlation, correlation)
+			)
+				return;
 			record.busy = true;
 			if (
 				!record.activePrompt ||
