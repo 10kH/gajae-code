@@ -374,6 +374,20 @@ describe("generated model policies", () => {
 		});
 	});
 
+	it("pins the measured Cursor Kimi K3 context window across regeneration", () => {
+		const models = [
+			createModel({ id: "kimi-k3-low", api: "cursor-agent", provider: "cursor" }),
+			createModel({ id: "kimi-k3-high", api: "cursor-agent", provider: "cursor" }),
+			createModel({ id: "kimi-k3-max", api: "cursor-agent", provider: "cursor" }),
+			createModel({ id: "kimi-k3-low", api: "openai-completions", provider: "openrouter" }),
+		];
+
+		applyGeneratedModelPolicies(models);
+
+		expect(models.slice(0, 3).map(model => model.contextWindow)).toEqual([1_048_576, 1_048_576, 1_048_576]);
+		expect(models[3]?.contextWindow).toBe(200_000);
+	});
+
 	it("removes unsupported reasoning controls only from Groq compound systems", () => {
 		const models = [
 			createModel({ id: "groq/compound", api: "openai-completions", provider: "groq" }),
