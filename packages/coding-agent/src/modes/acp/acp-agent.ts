@@ -172,6 +172,7 @@ type SessionRecord = {
 	/** Updated at ingress so a prompt acknowledgement can distinguish a steer from a fresh turn. */
 	busy: boolean;
 	backgroundBusy: boolean;
+	backgroundCorrelation?: PromptCorrelation;
 	/** Start/update args retained because tool_execution_end does not carry them. */
 	toolArgs: Map<string, unknown>;
 	/** Message projection state for correlationless session-scoped assistant events. */
@@ -1796,7 +1797,12 @@ export class AcpAgent implements Agent {
 					waiter.correlation,
 					watchdogCorrelationFrom(deferredFrame, deferredEvent),
 				);
-				if (deferredEvent?.type === "agent_start" && !matchesWaiter) record.backgroundBusy = true;
+				if (deferredEvent?.type === "agent_start" && !matchesWaiter) {
+					record.backgroundBusy = true;
+					const deferredCorrelation = sdkFrameCorrelation(deferredFrame, deferredEvent);
+					record.backgroundCorrelation =
+						deferredCorrelation && hasCompleteCorrelation(deferredCorrelation) ? deferredCorrelation : undefined;
+				}
 				if (matchesWaiter) {
 					this.#observePromptActivity(waiter, deferredFrame);
 					observedDeferredActivity = true;
@@ -2666,6 +2672,7 @@ export class AcpAgent implements Agent {
 			} else if (frame.state === "idle") {
 				record.busy = false;
 				record.backgroundBusy = false;
+				record.backgroundCorrelation = undefined;
 			}
 			return;
 		}
@@ -2683,8 +2690,10 @@ export class AcpAgent implements Agent {
 				record.activePrompt.terminalReserved ||
 				(record.activePrompt.acknowledged &&
 					(!correlation || !correlationsExactlyMatch(record.activePrompt.correlation, correlation)))
-			)
+			) {
 				record.backgroundBusy = true;
+				record.backgroundCorrelation = correlation && hasCompleteCorrelation(correlation) ? correlation : undefined;
+			}
 		}
 	}
 
@@ -2874,11 +2883,15 @@ export class AcpAgent implements Agent {
 		const settledCorrelation = record.settledPromptCorrelations.some(settled =>
 			correlationsMatch(settled, correlation),
 		);
+		const ownsBackgroundTerminal = record.backgroundCorrelation
+			? hasCompleteCorrelation(correlation) && correlationsExactlyMatch(record.backgroundCorrelation, correlation)
+			: !hasCorrelation(correlation);
 		if (isTerminal) {
 			if (!activePrompt) {
-				if (settledCorrelation || (hasCorrelation(correlation) && !hasCompleteCorrelation(correlation))) return;
+				if (!record.backgroundBusy || !ownsBackgroundTerminal || settledCorrelation) return;
 				record.busy = false;
 				record.backgroundBusy = false;
+				record.backgroundCorrelation = undefined;
 				await this.#publishPromptPhase(id, record.adapter, undefined);
 				return;
 			}
@@ -2886,11 +2899,13 @@ export class AcpAgent implements Agent {
 				hasCompleteCorrelation(correlation) && correlationsExactlyMatch(activePrompt.correlation, correlation);
 			if (
 				record.backgroundBusy &&
+				ownsBackgroundTerminal &&
 				!matchesActivePrompt &&
 				!settledCorrelation &&
 				(!hasCorrelation(correlation) || hasCompleteCorrelation(correlation))
 			) {
 				record.backgroundBusy = false;
+				record.backgroundCorrelation = undefined;
 				record.busy = true;
 				await this.#publishPromptPhase(id, record.adapter, activePrompt);
 				return;
