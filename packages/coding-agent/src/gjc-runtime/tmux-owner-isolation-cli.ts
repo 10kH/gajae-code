@@ -201,12 +201,9 @@ export async function runTmuxOwnerIsolationCliFromStdin(): Promise<void> {
 	const stdin = await readOneBoundedJsonLine();
 	const output = stdin === null ? cliFailure("invalid_json_line") : await runTmuxOwnerIsolationCli(stdin);
 	process.stdout.write(`${output}\n`);
-	const request = stdin === null ? null : parseOwnerIsolationRequest(stdin);
-	if (request?.op === "bootstrap") {
-		try {
-			if (JSON.parse(output).ok !== true) process.exitCode = 1;
-		} catch {
-			process.exitCode = 1;
-		}
+	try {
+		if (JSON.parse(output).ok === false) process.exitCode = 1;
+	} catch {
+		process.exitCode = 1;
 	}
 }
