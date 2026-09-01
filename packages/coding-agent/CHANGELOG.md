@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- A runtime-state marker recorded against a different workspace path now reports that mismatch instead of claiming the file is unreadable, and a terminal, not-live marker that travelled into the current workspace with its session directory is adopted rather than refused. Live, non-terminal, and out-of-workspace markers are still refused untouched.
+
 - Headless SDK substrate close now reports success when exact teardown observes the recorded process gone even if cleanup unlinks the durable proof first; live or identity-ambiguous substrates still report `substrate_mismatch`. (#5130)
 
 - Windows session-state locks now drain late terminal reconciliation writes before disposal returns and safely reclaim valid dead transition claims during resume. (#5102)

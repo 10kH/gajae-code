@@ -1012,6 +1012,65 @@ class PreviousRuntimeStateReadError extends Error {
 	}
 }
 
+/**
+ * A readable, well-formed marker recorded against a different workspace path.
+ *
+ * Separate from {@link PreviousRuntimeStateReadError} because the two demand different
+ * operator responses: an unreadable marker points at file damage, while a foreign marker
+ * points at the same session directory being reachable from two checkouts.
+ */
+class ForeignRuntimeStateError extends Error {
+	readonly recordedCwd: string;
+	readonly currentCwd: string;
+	constructor(previous: Record<string, unknown>, input: RuntimeStateIdentity) {
+		const recorded = typeof previous.cwd === "string" ? previous.cwd : "<unknown>";
+		super(
+			`Existing runtime state marker belongs to a different workspace; refusing to overwrite. ` +
+				`recorded cwd ${recorded}, current cwd ${input.cwd}. ` +
+				`A live or in-flight marker is never adopted; delete it only if no session is running there.`,
+		);
+		this.name = "ForeignRuntimeStateError";
+		this.recordedCwd = recorded;
+		this.currentCwd = input.cwd;
+	}
+}
+
+/**
+ * A foreign marker is adoptable only when every one of these holds:
+ *
+ * - it already reached a terminal state and is explicitly not live, so no owner can still
+ *   be writing to it (`live` must be `false` rather than merely absent: an older or
+ *   truncated marker that omits the field says nothing about whether its owner runs);
+ * - the marker file itself lives inside the current workspace, which is what distinguishes
+ *   a session directory that travelled here with its repository from one that still
+ *   belongs to a different workspace on this machine.
+ *
+ * The second condition is the load-bearing one. Terminal-and-not-live alone would let a
+ * finished `C:\...` session be adopted by a `D:\...` workspace, and those are unrelated
+ * working trees that must never inherit each other's runtime identity.
+ */
+function isAdoptableForeignRuntimeState(
+	previous: Record<string, unknown>,
+	input: RuntimeStateIdentity,
+	stateFile: string | null,
+): boolean {
+	if (previous.live !== false) return false;
+	if (previous.state !== "completed" && previous.state !== "errored") return false;
+	if (!stateFile) return false;
+	return pathIsInside(stateFile, input.cwd, input.platform);
+}
+
+/** True when `candidate` resolves to `root` itself or something beneath it. */
+function pathIsInside(candidate: string, root: string, platform: NodeJS.Platform = process.platform): boolean {
+	if (sameResolvedPath(candidate, root, platform)) return true;
+	const normalizedRoot = normalizePathForComparison(root, platform);
+	const normalizedCandidate = normalizePathForComparison(candidate, platform);
+	if (!normalizedRoot || !normalizedCandidate) return false;
+	const separator = platform === "win32" ? "\\" : "/";
+	const prefix = normalizedRoot.endsWith(separator) ? normalizedRoot : `${normalizedRoot}${separator}`;
+	return normalizedCandidate.startsWith(prefix);
+}
+
 class RuntimeToolActivityRefusedError extends Error {
 	constructor(reason: string) {
 		super(`Refusing to overwrite the coordinator tool-activity snapshot: ${reason}.`);
@@ -1224,7 +1283,11 @@ function shouldPreserveTerminalPayload(previous: RuntimeStateSidecarPayload, inp
 	);
 }
 
-function assertPreviousRuntimeStateIdentity(previous: Record<string, unknown>, input: RuntimeStateIdentity): void {
+function assertPreviousRuntimeStateIdentity(
+	previous: Record<string, unknown>,
+	input: RuntimeStateIdentity,
+	stateFile: string | null = null,
+): void {
 	if (Object.keys(previous).length === 0) return;
 	if (previous.session_id !== input.sessionId) throw new PreviousRuntimeStateReadError();
 	// Signed coordinator mode never trusts an unsigned predecessor. The sole exception
@@ -1261,17 +1324,26 @@ function assertPreviousRuntimeStateIdentity(previous: Record<string, unknown>, i
 	if (coordinatorSeed) return;
 	// If the previous payload has runtime identity fields, verify them fully.
 	if (typeof previous.cwd === "string" && typeof previous.workdir === "string") {
-		if (
-			!sameResolvedPath(previous.cwd, input.cwd, input.platform) ||
-			!sameResolvedPath(previous.workdir, input.cwd, input.platform) ||
-			(previous.session_file !== input.sessionFile &&
-				!(
-					typeof previous.session_file === "string" &&
+		const pathsMatch =
+			sameResolvedPath(previous.cwd, input.cwd, input.platform) &&
+			sameResolvedPath(previous.workdir, input.cwd, input.platform) &&
+			(previous.session_file === input.sessionFile ||
+				(typeof previous.session_file === "string" &&
 					typeof input.sessionFile === "string" &&
-					sameResolvedPath(previous.session_file, input.sessionFile, input.platform)
-				))
-		)
-			throw new PreviousRuntimeStateReadError();
+					sameResolvedPath(previous.session_file, input.sessionFile, input.platform)));
+		if (!pathsMatch) {
+			// A marker whose recorded workspace differs from the current one is readable and
+			// well-formed; it simply belongs to another checkout. Reporting that as a read
+			// failure sends operators hunting for file corruption that does not exist.
+			//
+			// A session directory committed to version control reaches a second machine this
+			// way, so the mismatch is ordinary rather than exceptional. When the recorded
+			// marker is already terminal and not live, nothing can still be writing to it and
+			// adopting it is safe; anything else still refuses, because a live or in-flight
+			// marker from another workspace may have a running owner behind it.
+			if (!isAdoptableForeignRuntimeState(previous, input, stateFile))
+				throw new ForeignRuntimeStateError(previous, input);
+		}
 	}
 }
 
@@ -1723,7 +1795,7 @@ async function persistCoordinatorRuntimeToolActivity(
 						assertNoRuntimeStateRescopeJournal(context, identity);
 						const previous = await readPreviousPayloadForEvent(stateFile);
 						if (Object.keys(previous).length === 0) return;
-						assertPreviousRuntimeStateIdentity(previous, identity);
+						assertPreviousRuntimeStateIdentity(previous, identity, stateFile);
 						// A tool event that lands after the session settled must never
 						// resurrect it into a live-looking state.
 						if (previous.state === "completed" || previous.state === "errored") return;
@@ -1804,7 +1876,7 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 						const nowMs = Date.now();
 						const now = new Date(nowMs).toISOString();
 						const previous = await readPreviousPayloadForEvent(stateFile);
-						assertPreviousRuntimeStateIdentity(previous, identity);
+						assertPreviousRuntimeStateIdentity(previous, identity, stateFile);
 						const finalResponse = finalResponseForEvent(event);
 						const terminalReceipt =
 							state === "completed" || state === "errored"
@@ -1879,7 +1951,7 @@ export async function persistCoordinatorWorkerIntegrationOutcome(
 						assertNoRuntimeStateRescopeJournal(context, identity);
 						const previous = await readPreviousPayloadForEvent(stateFile);
 						if (Object.keys(previous).length === 0) return;
-						assertPreviousRuntimeStateIdentity(previous, identity);
+						assertPreviousRuntimeStateIdentity(previous, identity, stateFile);
 						const now = new Date().toISOString();
 						const terminalPersistenceFailed =
 							outcome.kind === "terminal_persistence" && outcome.status !== "completed";
@@ -2732,7 +2804,7 @@ export async function persistCoordinatorRuntimeStateFromPostmortem(
 					await withStateFileLock(stateFile, async () => {
 						assertNoRuntimeStateRescopeJournal(context, identity);
 						const previous = readPreviousPayload(stateFile);
-						assertPreviousRuntimeStateIdentity(previous, identity);
+						assertPreviousRuntimeStateIdentity(previous, identity, stateFile);
 						if (shouldPreserveTerminalPayload(previous as RuntimeStateSidecarPayload, identity)) return;
 						// The immutable owner verdict remains in its lifecycle artifact; never replace a
 						// complete agent terminal payload merely to mirror that verdict here.
