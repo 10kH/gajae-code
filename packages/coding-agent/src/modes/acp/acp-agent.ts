@@ -2998,9 +2998,11 @@ export class AcpAgent implements Agent {
 			// a second session update after settlement would be stale as soon as the client
 			// starts a replacement turn, and an in-flight transport write cannot be revoked.
 			if (!(event.type === "agent_failed" && isTerminal))
-				if (event.type === "agent_failed" && promptOwner)
-					promptOwner.failureDiagnostics.push({ notification, publicationGeneration });
-				else
+				if (event.type === "agent_failed") {
+					const diagnosticOwner = promptOwner ?? record.activePrompt;
+					if (diagnosticOwner) diagnosticOwner.failureDiagnostics.push({ notification, publicationGeneration });
+					else this.#scheduleFailureDiagnostic(id, notification, adapter, publicationGeneration);
+				} else
 					await this.#publishSessionUpdate(
 						id,
 						notification,
@@ -3040,7 +3042,9 @@ export class AcpAgent implements Agent {
 		const prior = this.#failureDiagnosticTails.get(id) ?? Promise.resolve();
 		const task = prior.then(async () => {
 			await Bun.sleep(0);
-			await this.#publishSessionUpdate(id, notification, adapter, publicationGeneration);
+			const owner = this.#sessions.get(id);
+			if (!owner || owner.adapter !== adapter) return;
+			await this.#connection.sessionUpdate(notification);
 			const current = this.#sessions.get(id);
 			if (current) await this.#publishPromptPhase(id, current.adapter, this.#promptPhaseOwner(current));
 		});

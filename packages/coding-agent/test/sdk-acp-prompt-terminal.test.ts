@@ -817,6 +817,25 @@ test("ACP blocked generic failure diagnostic cannot delay authoritative agent_en
 	}
 });
 
+test("ACP correlationless failure diagnostic cannot delay authoritative agent_end", async () => {
+	const fixture = await createFixture({ blockFailureDiagnosticUpdate: true });
+	try {
+		const pending = prompt(fixture, "correlationless diagnostic ordering");
+		await bounded(fixture.promptDelivered, "prompt delivery");
+		fixture.sendTerminal({
+			type: "agent_failed",
+			sessionId: "prompt-terminal-session",
+			error: { code: "background_warning", message: "correlationless advisory" },
+		});
+		await Promise.resolve();
+		fixture.sendStopped("end_turn");
+		expect(await bounded(pending, "terminal behind correlationless diagnostic")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		fixture.releaseFailureDiagnostic();
+		fixture.dispose();
+	}
+});
+
 test("ACP reconnect retirement flushes buffered failure diagnostics", async () => {
 	const fixture = await createFixture();
 	try {
