@@ -3,10 +3,12 @@
 #[cfg(any(unix, test))]
 use std::io::{self, Read};
 use std::{
+	panic::{AssertUnwindSafe, catch_unwind},
 	path::{Component, Path, PathBuf},
 	sync::{
-		Arc,
+		Arc, OnceLock,
 		atomic::{AtomicBool, Ordering},
+		mpsc::{SyncSender, sync_channel},
 	},
 };
 
@@ -1252,6 +1254,7 @@ pub fn exact_unlink_direct(
 	};
 	platform::exact_unlink_direct(Path::new(&path), &identity)
 }
+
 /// Atomically replace a staged regular file only after validating the exact
 /// staged source and expected destination.
 ///
@@ -1283,6 +1286,7 @@ pub fn exact_replace_path(
 			&expected_destination,
 		)
 	}
+
 	#[cfg(not(any(unix, windows)))]
 	{
 		let _ = (source_path, destination_path, expected_source, expected_destination);
@@ -1290,7 +1294,45 @@ pub fn exact_replace_path(
 	}
 }
 
-/// Restore only the detached object that still has the supplied platform
+/// Start direct exact unlink without retaining an N-API task or promise.
+///
+/// Cleanup is best effort: the detached operation is intentionally abandoned
+/// when the process exits, while the exact identity checks still protect any
+/// pathname that remains alive long enough to be examined. A bounded queue
+/// keeps cleanup bursts from spawning an unbounded number of OS threads; work
+/// that cannot be queued is left for the owning reconciliation pass.
+#[napi]
+pub fn exact_unlink_direct_detached(path: String, identity: NativeExactFileIdentity) -> bool {
+	let queue = detached_cleanup_sender();
+	queue.worker_started && queue.sender.try_send((path, identity)).is_ok()
+}
+
+type DetachedCleanupJob = (String, NativeExactFileIdentity);
+
+struct DetachedCleanupQueue {
+	sender:         SyncSender<DetachedCleanupJob>,
+	worker_started: bool,
+}
+
+fn detached_cleanup_sender() -> &'static DetachedCleanupQueue {
+	static QUEUE: OnceLock<DetachedCleanupQueue> = OnceLock::new();
+	QUEUE.get_or_init(|| {
+		let (sender, receiver) = sync_channel::<DetachedCleanupJob>(64);
+		let worker_started = std::thread::Builder::new()
+			.name("pi-natives-exact-unlink-cleanup".to_owned())
+			.spawn(move || {
+				while let Ok((path, identity)) = receiver.recv() {
+					let _ = catch_unwind(AssertUnwindSafe(|| {
+						let _ = exact_unlink_direct(path, identity);
+					}));
+				}
+			})
+			.is_ok();
+		DetachedCleanupQueue { sender, worker_started }
+	})
+}
+
+/// Restore only the detached object that still has the supplied exact
 #[cfg_attr(clippy, doc = "")]
 /// identity. The detached and original paths must retain the same validated
 /// parent, and restoration never replaces an existing original path.
@@ -4736,9 +4778,6 @@ pub(crate) mod platform {
 		Err(match std::io::Error::last_os_error().raw_os_error() {
 			Some(libc::EEXIST) => "already_exists",
 			Some(libc::EXDEV) => "cross_device",
-			// A filesystem without hard links reports EPERM for a valid request, which
-			// is indistinguishable here from a denied one; both leave the destination
-			// unpublished.
 			Some(libc::EACCES | libc::EPERM) => "permission_denied",
 			Some(libc::ENOENT) => "not_found",
 			Some(libc::EINTR) => "interrupted",
@@ -4793,9 +4832,10 @@ pub(crate) mod platform {
 				&& stat_mtime_ns(&opened) == i128::from(identity.mtime_ns)
 				&& (identity.allow_hard_link
 					|| (opened.st_nlink == 1 && identity.nlink.is_none_or(|nlink| nlink == 1)))
-				&& identity
-					.nlink
-					.is_none_or(|nlink| nlink == opened.st_nlink as u64)
+				&& (identity.allow_hard_link
+					|| identity
+						.nlink
+						.is_none_or(|nlink| nlink == opened.st_nlink as u64))
 				&& identity.sha256.as_ref() == Some(&digest)
 				&& named.st_mode & libc::S_IFMT == libc::S_IFREG
 				&& named.st_dev == opened.st_dev
