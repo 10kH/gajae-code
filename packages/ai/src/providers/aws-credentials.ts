@@ -22,6 +22,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { $env, getTrustedHomeDir, isEnoent, logger } from "@gajae-code/utils";
+import { assertAwsRegionLabel } from "../adapter-internals/aws-region";
 import {
 	type AwsIniFile,
 	classifyAwsProfileCapability,
@@ -155,6 +156,7 @@ async function readSsoCredentials(
 		}
 	}
 	if (!startUrl || !ssoRegion) return undefined;
+	assertAwsRegionLabel(ssoRegion);
 
 	const token = await loadSsoCachedToken(startUrl, sessionName);
 	if (!token?.accessToken) {
@@ -172,6 +174,7 @@ async function readSsoCredentials(
 	const response = await fetch(url, {
 		method: "GET",
 		headers: { "x-amz-sso_bearer_token": token.accessToken },
+		redirect: "error",
 		signal,
 	});
 	if (!response.ok) {
@@ -411,6 +414,7 @@ async function readImdsCredentials(parentSignal: AbortSignal | undefined): Promi
 		const tokenRes = await fetch(`http://${IMDS_HOST}/latest/api/token`, {
 			method: "PUT",
 			headers: { "x-aws-ec2-metadata-token-ttl-seconds": "21600" },
+			redirect: "error",
 			signal,
 		});
 		if (!tokenRes.ok) return undefined;
@@ -418,6 +422,7 @@ async function readImdsCredentials(parentSignal: AbortSignal | undefined): Promi
 
 		const roleRes = await fetch(`http://${IMDS_HOST}/latest/meta-data/iam/security-credentials/`, {
 			headers: { "x-aws-ec2-metadata-token": token },
+			redirect: "error",
 			signal,
 		});
 		if (!roleRes.ok) return undefined;
@@ -428,6 +433,7 @@ async function readImdsCredentials(parentSignal: AbortSignal | undefined): Promi
 			`http://${IMDS_HOST}/latest/meta-data/iam/security-credentials/${encodeURIComponent(role)}`,
 			{
 				headers: { "x-aws-ec2-metadata-token": token },
+				redirect: "error",
 				signal,
 			},
 		);

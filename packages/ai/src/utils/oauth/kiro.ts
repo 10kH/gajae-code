@@ -8,6 +8,7 @@
  * and AWS public documentation, not from any third-party reference.
  */
 import { scheduler } from "node:timers/promises";
+import { assertAwsRegionLabel } from "../../adapter-internals/aws-region";
 import type { OAuthCredentials } from "./types";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -148,6 +149,7 @@ export async function registerClient(
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify(body),
+		redirect: "error",
 		signal,
 	});
 
@@ -195,6 +197,7 @@ export async function startDeviceAuthorization(
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify(body),
+		redirect: "error",
 		signal,
 	});
 
@@ -328,6 +331,7 @@ export async function refreshKiroToken(credentials: OAuthCredentials): Promise<O
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify(body),
+		redirect: "error",
 	});
 
 	const data = (await response.json()) as CreateTokenSuccess | CreateTokenError;
@@ -466,11 +470,12 @@ export function importSsoCacheToken(): OAuthCredentials | undefined {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function ssoOidcEndpoint(region: string, pathSuffix: string): string {
+	assertAwsRegionLabel(region);
 	return `https://oidc.${region}.amazonaws.com${pathSuffix}`;
 }
 
 async function fetchOidc(url: string, init: RequestInit & { signal?: AbortSignal }): Promise<Response> {
-	const response = await fetch(url, init);
+	const response = await fetch(url, { ...init, redirect: "error" });
 	if (!response.ok) {
 		throw new Error(oidcRequestFailure(url, response));
 	}
@@ -488,7 +493,7 @@ function oidcRequestFailure(url: string, response: Response): string {
  * Non-2xx responses without an `error` field still fail closed.
  */
 async function createTokenOnce(url: string, init: RequestInit & { signal?: AbortSignal }): Promise<CreateTokenResult> {
-	const response = await fetch(url, init);
+	const response = await fetch(url, { ...init, redirect: "error" });
 	const rawBody = await response.text();
 	let data: CreateTokenSuccess | CreateTokenError;
 	try {
