@@ -807,6 +807,14 @@ test("ACP blocked generic failure diagnostic cannot delay authoritative agent_en
 		const successor = prompt(fixture, "successor behind failure diagnostic");
 		await waitFor(() => fixture.promptDeliveryCount() === 2, "successor prompt delivery");
 		fixture.releaseFailureDiagnostic();
+		await waitFor(
+			() =>
+				fixture.updates
+					.filter(update => update.update.sessionUpdate === "session_info_update")
+					.map(update => (update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase)
+					.at(-1) === "working",
+			"successor phase after delayed diagnostic",
+		);
 		fixture.sendStopped("end_turn");
 		expect(await bounded(successor, "successor after failure diagnostic")).toEqual({ stopReason: "end_turn" });
 	} finally {

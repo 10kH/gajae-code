@@ -2954,6 +2954,8 @@ export class AcpAgent implements Agent {
 		const task = prior.then(async () => {
 			await Bun.sleep(0);
 			await this.#publishSessionUpdate(id, notification, adapter, publicationGeneration);
+			const current = this.#sessions.get(id);
+			if (current) await this.#publishPromptPhase(id, current.adapter, this.#promptPhaseOwner(current));
 		});
 		let tail: Promise<void>;
 		tail = task
