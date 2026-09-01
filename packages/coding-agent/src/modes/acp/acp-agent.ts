@@ -2886,6 +2886,7 @@ export class AcpAgent implements Agent {
 				const waiter = record.activePrompt;
 				if (waiter && !waiter.settled && !waiter.terminal) {
 					record.activePrompt = undefined;
+					record.busy = record.backgroundBusy;
 					clearPromptWatchdog(waiter);
 					waiter.settled = true;
 					this.#rememberSettledPromptCorrelation(id, record, waiter.correlation);
@@ -3108,6 +3109,8 @@ export class AcpAgent implements Agent {
 			const owner = this.#sessions.get(id);
 			if (!owner || owner.adapter !== adapter) return;
 			await this.#connection.sessionUpdate(notification);
+			const finalTextTail = this.#finalTextTails.get(id);
+			if (finalTextTail) await finalTextTail;
 			const current = this.#sessions.get(id);
 			if (current) await this.#publishPromptPhase(id, current.adapter, this.#promptPhaseOwner(current));
 		});

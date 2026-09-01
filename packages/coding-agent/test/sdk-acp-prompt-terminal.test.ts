@@ -568,6 +568,7 @@ test("ACP publishes final text from an explicit failure-only terminal", async ()
 	try {
 		const pending = prompt(fixture, "failure final text");
 		await bounded(fixture.promptDelivered, "prompt delivery");
+		fixture.sendDiagnostic();
 		fixture.sendTerminal({
 			type: "agent_failed",
 			sessionId: "prompt-terminal-session",
@@ -591,6 +592,25 @@ test("ACP publishes final text from an explicit failure-only terminal", async ()
 				),
 			"failure final text publication",
 		);
+		await waitFor(
+			() =>
+				fixture.updates
+					.filter(update => update.update.sessionUpdate === "session_info_update")
+					.map(update => (update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase)
+					.at(-1) === "idle",
+			"failure idle phase",
+		);
+		const finalTextIndex = fixture.updates.findIndex(
+			update =>
+				update.update.sessionUpdate === "agent_message_chunk" &&
+				(update.update as { content: { text: string } }).content.text === "partial answer before failure",
+		);
+		const finalIdleIndex = fixture.updates.findLastIndex(
+			update =>
+				update.update.sessionUpdate === "session_info_update" &&
+				(update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase === "idle",
+		);
+		expect(finalTextIndex).toBeLessThan(finalIdleIndex);
 	} finally {
 		fixture.dispose();
 	}
@@ -875,6 +895,20 @@ test("ACP reconnect retirement flushes buffered failure diagnostics", async () =
 		const pending = prompt(fixture, "diagnostic before reconnect");
 		await bounded(fixture.promptDelivered, "prompt delivery");
 		const updatesBefore = fixture.updates.length;
+		fixture.sendTerminal({
+			type: "agent_start",
+			sessionId: "prompt-terminal-session",
+			commandId: "prompt-terminal-command",
+			turnId: "prompt-terminal-turn",
+		});
+		await waitFor(
+			() =>
+				fixture.updates
+					.filter(update => update.update.sessionUpdate === "session_info_update")
+					.map(update => (update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase)
+					.at(-1) === "working",
+			"foreground working phase",
+		);
 		fixture.sendDiagnostic();
 		fixture.sendTerminal({ type: "hello", connectionId: "replacement-connection" });
 		await expect(bounded(pending, "reconnect prompt rejection")).rejects.toMatchObject({
@@ -890,6 +924,14 @@ test("ACP reconnect retirement flushes buffered failure diagnostics", async () =
 							(update.update as { _meta?: { gjcAgentFailed?: boolean } })._meta?.gjcAgentFailed === true,
 					),
 			"reconnect-retired failure diagnostic",
+		);
+		await waitFor(
+			() =>
+				fixture.updates
+					.filter(update => update.update.sessionUpdate === "session_info_update")
+					.map(update => (update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase)
+					.at(-1) === "idle",
+			"reconnect idle phase",
 		);
 	} finally {
 		fixture.dispose();
