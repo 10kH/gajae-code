@@ -136,6 +136,8 @@ interface PromptWaiter {
 	/** Whether ANY overlapping cancel attempt for this prompt was acknowledged:
 	 *  a later failed attempt must not erase an earlier success (review thread P2). */
 	cancelAcknowledged?: boolean;
+	/** Inbound sequence when cancellation was acknowledged; newer activity remains authoritative. */
+	cancelAcknowledgedSequence?: number;
 	/** In-flight cancel attempts for this prompt: cancellation intent must stay
 	 *  set while any attempt can still acknowledge, so a failure only clears
 	 *  the shared flag when no attempt remains pending (review thread P2). */
@@ -1799,7 +1801,13 @@ export class AcpAgent implements Agent {
 				const deferredEvent = receivedSdkEvent(deferredFrame)?.event;
 				if (!deferredEvent) continue;
 				const deferredCorrelation = sdkFrameCorrelation(deferredFrame, deferredEvent) ?? {};
-				const deferredIsTerminal = deferredEvent.type === "agent_end" || deferredEvent.type === "agent_failed";
+				const deferredOutcome =
+					deferredEvent.type === "agent_end" || deferredEvent.type === "agent_failed"
+						? terminalOutcome(deferredEvent)
+						: undefined;
+				const deferredIsTerminal =
+					deferredEvent.type === "agent_end" ||
+					(deferredEvent.type === "agent_failed" && deferredOutcome?.kind === "failed");
 				if (!hasCompleteCorrelation(deferredCorrelation)) {
 					if (deferredIsTerminal)
 						logDroppedPromptTerminal(
@@ -1828,6 +1836,7 @@ export class AcpAgent implements Agent {
 						);
 					continue;
 				}
+				if (deferredIsTerminal) clearPromptWatchdog(waiter);
 				const task = record.frameTail.then(
 					async () =>
 						await this.#handleSdkFrame(params.sessionId, record.adapter, deferredFrame, deferredGeneration),
@@ -1917,7 +1926,10 @@ export class AcpAgent implements Agent {
 					"abort_unacknowledged",
 					"SDK did not acknowledge cancellation of the active prompt.",
 				);
-			if (waiter) waiter.cancelAcknowledged = true;
+			if (waiter) {
+				waiter.cancelAcknowledged = true;
+				waiter.cancelAcknowledgedSequence = record.inboundSequence;
+			}
 			if (waiter && record.activePrompt !== waiter) {
 				waiter.cancelAttemptResolve?.(true);
 				return;
@@ -2004,7 +2016,7 @@ export class AcpAgent implements Agent {
 		// when nothing settled the prompt the client already asked to cancel.
 		if (this.#sessions.get(id) !== record || record.activePrompt !== waiter || waiter.settled) return;
 		record.activePrompt = undefined;
-		record.busy = false;
+		if (waiter.cancelAcknowledgedSequence === record.inboundSequence) record.busy = false;
 		clearPromptWatchdog(waiter);
 		record.cancelRequested = false;
 		waiter.settled = true;

@@ -1728,6 +1728,28 @@ test("ACP settles a cancelled prompt when the aborted turn never publishes a ter
 	}
 });
 
+test("ACP cancel grace preserves background activity that starts after acknowledgement", async () => {
+	const fixture = await createFixture({ cancelSettlementGraceMs: 25 });
+	try {
+		const pending = prompt(fixture, "cancel with background successor");
+		await bounded(fixture.promptDelivered, "prompt delivery");
+		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "cancel acknowledgement");
+		fixture.sendTerminal({ type: "agent_start", sessionId: "prompt-terminal-session" });
+		expect(await bounded(pending, "cancelled foreground settlement")).toEqual({ stopReason: "cancelled" });
+		await waitFor(
+			() =>
+				fixture.updates
+					.filter(update => update.update.sessionUpdate === "session_info_update")
+					.map(update => (update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase)
+					.at(-1) === "working",
+			"background working after cancel grace",
+		);
+		fixture.sendTerminal({ type: "agent_end", sessionId: "prompt-terminal-session" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
 test("ACP keeps the authoritative terminal when it arrives inside the cancel grace", async () => {
 	const fixture = await createFixture({ cancelSettlementGraceMs: 1_000 });
 	try {
