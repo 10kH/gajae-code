@@ -27,7 +27,16 @@ describe("cursor conversation usage", () => {
 
 		expect(usage.input).toBe(21_580);
 		expect(usage.output).toBe(14);
+		expect(usage.cacheRead).toBe(0);
+		expect(usage.cacheWrite).toBe(0);
 		expect(usage.totalTokens).toBe(21_594);
+	});
+
+	it("does not double-count checkpoint totals as output", () => {
+		const usage = finalizeCursorUsageForTest(100, 10);
+
+		expect(usage.output).toBe(10);
+		expect(usage.input + usage.output).toBe(100);
 	});
 
 	it("reports prompt tokens to the compaction accounting path", () => {
@@ -67,5 +76,14 @@ describe("cursor conversation usage", () => {
 
 		expect(usage.input).toBe(0);
 		expect(usage.totalTokens).toBe(91);
+	});
+
+	it("resets usage for a new turn instead of accumulating prior checkpoints", () => {
+		const firstTurn = finalizeCursorUsageForTest(10_000, 100);
+		const secondTurn = finalizeCursorUsageForTest(250, 25);
+
+		expect(firstTurn.totalTokens).toBe(10_000);
+		expect(secondTurn.input).toBe(225);
+		expect(secondTurn.totalTokens).toBe(250);
 	});
 });
