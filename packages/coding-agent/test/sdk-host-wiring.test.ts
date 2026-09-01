@@ -5216,7 +5216,7 @@ test("SDK host replay gaps are generation-scoped and sequence gaps remain cohere
 	await host.stop();
 });
 
-test("Q17 returns resource_gone without an assistant and reads a completed persisted turn after reopen", async () => {
+test("Q17 returns resource_gone without readable assistant text and reads a completed persisted turn after reopen", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-last-assistant-"));
 	dirs.push(cwd);
 	const original = SessionManager.create(cwd, cwd);
@@ -5241,7 +5241,11 @@ test("Q17 returns resource_gone without an assistant and reads a completed persi
 		modelRegistry: new ModelRegistry(authStorage, path.join(cwd, "models.yml")),
 	});
 	agentSession.subscribe(() => {});
-	const sessionContext = { ...context(cwd, sessionId), sessionManager };
+	const sessionContext = {
+		...context(cwd, sessionId),
+		sessionManager,
+		getTranscript: () => agentSession.getTranscript(),
+	};
 	const handlers = start(
 		sessionContext,
 		undefined,
@@ -5275,16 +5279,13 @@ test("Q17 returns resource_gone without an assistant and reads a completed persi
 			frames.some(
 				frame => frame.type === "control_command_result" && frame.requestId === "before" && frame.status === "ok",
 			),
-		"empty Q17 response",
+		"empty Q17 resource_gone response",
 	);
 	expect(
 		JSON.parse(
 			String(frames.find(frame => frame.type === "control_command_result" && frame.requestId === "before")?.message),
 		),
-	).toMatchObject({
-		ok: false,
-		error: { code: "resource_gone" },
-	});
+	).toMatchObject({ ok: false, error: { code: "resource_gone" } });
 	socket.send(
 		JSON.stringify({
 			type: "control_request",
@@ -5307,6 +5308,18 @@ test("Q17 returns resource_gone without an assistant and reads a completed persi
 			}),
 		]),
 	);
+	const completedAssistant = sessionManager
+		.getBranch()
+		.findLast(entry => entry.type === "message" && entry.message.role === "assistant");
+	if (!completedAssistant || completedAssistant.type !== "message" || completedAssistant.message.role !== "assistant")
+		throw new Error("Expected persisted assistant response");
+	sessionManager.appendMessage({
+		...completedAssistant.message,
+		content: [{ type: "toolCall", id: "trailing-tool", name: "read", arguments: {} }],
+		stopReason: "toolUse",
+		timestamp: Date.now(),
+	});
+	await sessionManager.flush();
 	query("after");
 	await waitFor(
 		() =>
@@ -5329,7 +5342,21 @@ test("Q17 returns resource_gone without an assistant and reads a completed persi
 	await sessionManager.close();
 
 	const reopenedSessionManager = await SessionManager.open(sessionFile, cwd);
-	const reopenedSessionContext = { ...context(cwd, sessionId), sessionManager: reopenedSessionManager };
+	const reopenedAgentSession = new AgentSession({
+		agent: new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: createMockModel({ responses: [] }).stream,
+		}),
+		sessionManager: reopenedSessionManager,
+		settings: Settings.isolated({ "compaction.enabled": false }),
+		modelRegistry: new ModelRegistry(authStorage, path.join(cwd, "models.yml")),
+	});
+	const reopenedSessionContext = {
+		...context(cwd, sessionId),
+		sessionManager: reopenedSessionManager,
+		getTranscript: () => reopenedAgentSession.getTranscript(),
+	};
 	const reopenedHandlers = start(reopenedSessionContext);
 	await waitFor(() => fs.existsSync(endpointFile), "reopened SDK endpoint");
 	const reopenedEndpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
@@ -5370,6 +5397,7 @@ test("Q17 returns resource_gone without an assistant and reads a completed persi
 	});
 	await closeSocket(reopenedSocket);
 	await reopenedHandlers.get("session_shutdown")?.({ type: "session_shutdown" }, reopenedSessionContext);
+	await reopenedAgentSession.dispose();
 	await reopenedSessionManager.close();
 	authStorage.close();
 	closeModelCache(path.join(cwd, "models.db"));
