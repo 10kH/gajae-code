@@ -2667,7 +2667,7 @@ export class AcpAgent implements Agent {
 		const event = receivedSdkEvent(frame)?.event;
 		if (event?.type === "agent_start") {
 			record.busy = true;
-			if (!record.activePrompt) record.backgroundBusy = true;
+			if (!record.activePrompt || record.activePrompt.terminalReserved) record.backgroundBusy = true;
 		}
 	}
 
