@@ -2865,6 +2865,19 @@ export class AcpAgent implements Agent {
 				await this.#publishPromptPhase(id, record.adapter, undefined);
 				return;
 			}
+			const matchesActivePrompt =
+				hasCompleteCorrelation(correlation) && correlationsExactlyMatch(activePrompt.correlation, correlation);
+			if (
+				record.backgroundBusy &&
+				!matchesActivePrompt &&
+				!settledCorrelation &&
+				(!hasCorrelation(correlation) || hasCompleteCorrelation(correlation))
+			) {
+				record.backgroundBusy = false;
+				record.busy = true;
+				await this.#publishPromptPhase(id, record.adapter, activePrompt);
+				return;
+			}
 			// Terminal ownership requires a complete identity. Unowned, partial, and
 			// duplicate terminals are never allowed to publish or query anything.
 			if (activePrompt.settled) return;
