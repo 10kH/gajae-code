@@ -1103,7 +1103,9 @@ test("ACP retires overlapping anonymous background runs independently", async ()
 		await waitFor(() => idlePhaseUpdates(fixture.updates) > 0, "foreground idle phase");
 
 		fixture.sendTerminal({ type: "agent_start", sessionId: "prompt-terminal-session" });
+		fixture.sendTerminal({ type: "activity", sessionId: "prompt-terminal-session", state: "busy" });
 		fixture.sendTerminal({ type: "agent_start", sessionId: "prompt-terminal-session" });
+		fixture.sendTerminal({ type: "activity", sessionId: "prompt-terminal-session", state: "busy" });
 		await waitFor(
 			() =>
 				fixture.updates
@@ -1114,9 +1116,11 @@ test("ACP retires overlapping anonymous background runs independently", async ()
 		);
 		const idleBeforeFirstTerminal = idlePhaseUpdates(fixture.updates);
 		fixture.sendTerminal({ type: "agent_end", sessionId: "prompt-terminal-session" });
+		fixture.sendTerminal({ type: "activity", sessionId: "prompt-terminal-session", state: "idle" });
 		await Bun.sleep(0);
 		expect(idlePhaseUpdates(fixture.updates)).toBe(idleBeforeFirstTerminal);
 		fixture.sendTerminal({ type: "agent_end", sessionId: "prompt-terminal-session" });
+		fixture.sendTerminal({ type: "activity", sessionId: "prompt-terminal-session", state: "idle" });
 		await waitFor(
 			() => idlePhaseUpdates(fixture.updates) > idleBeforeFirstTerminal,
 			"final anonymous background idle phase",

@@ -2704,6 +2704,11 @@ export class AcpAgent implements Agent {
 					record.backgroundAnonymousCount = Math.max(record.backgroundAnonymousCount, 1);
 				}
 			} else if (frame.state === "idle") {
+				if (record.backgroundAnonymousCount > 0 || record.backgroundCorrelations.length > 0) {
+					record.busy = true;
+					record.backgroundBusy = true;
+					return;
+				}
 				record.busy = false;
 				record.backgroundBusy = false;
 				record.backgroundAnonymousCount = 0;
