@@ -172,7 +172,8 @@ type SessionRecord = {
 	/** Updated at ingress so a prompt acknowledgement can distinguish a steer from a fresh turn. */
 	busy: boolean;
 	backgroundBusy: boolean;
-	backgroundCorrelation?: PromptCorrelation;
+	backgroundAnonymousBusy: boolean;
+	backgroundCorrelations: PromptCorrelation[];
 	/** Start/update args retained because tool_execution_end does not carry them. */
 	toolArgs: Map<string, unknown>;
 	/** Message projection state for correlationless session-scoped assistant events. */
@@ -1807,10 +1808,14 @@ export class AcpAgent implements Agent {
 						);
 					if (!tombstoned) {
 						record.backgroundBusy = true;
-						record.backgroundCorrelation =
-							deferredCorrelation && hasCompleteCorrelation(deferredCorrelation)
-								? deferredCorrelation
-								: undefined;
+						if (deferredCorrelation && hasCompleteCorrelation(deferredCorrelation)) {
+							if (
+								!record.backgroundCorrelations.some(owner =>
+									correlationsExactlyMatch(owner, deferredCorrelation),
+								)
+							)
+								record.backgroundCorrelations.push(deferredCorrelation);
+						} else record.backgroundAnonymousBusy = true;
 					}
 				}
 				if (matchesWaiter) {
@@ -1846,11 +1851,12 @@ export class AcpAgent implements Agent {
 				if (
 					!matchesPrompt &&
 					deferredIsTerminal &&
-					record.backgroundCorrelation &&
-					correlationsExactlyMatch(record.backgroundCorrelation, deferredCorrelation)
+					record.backgroundCorrelations.some(owner => correlationsExactlyMatch(owner, deferredCorrelation))
 				) {
-					record.backgroundBusy = false;
-					record.backgroundCorrelation = undefined;
+					record.backgroundCorrelations = record.backgroundCorrelations.filter(
+						owner => !correlationsExactlyMatch(owner, deferredCorrelation),
+					);
+					record.backgroundBusy = record.backgroundAnonymousBusy || record.backgroundCorrelations.length > 0;
 					record.busy = true;
 					continue;
 				}
@@ -2374,6 +2380,8 @@ export class AcpAgent implements Agent {
 				connectionId: adapter.connectionId,
 				busy: false,
 				backgroundBusy: false,
+				backgroundAnonymousBusy: false,
+				backgroundCorrelations: [],
 				toolArgs: new Map(),
 			};
 			record.unsubscribe = adapter.onFrame(frame => this.#enqueueSdkFrame(id, adapter!, frame));
@@ -2691,11 +2699,15 @@ export class AcpAgent implements Agent {
 		if (frame.type === "activity") {
 			if (frame.state === "busy") {
 				record.busy = true;
-				if (!record.activePrompt) record.backgroundBusy = true;
+				if (!record.activePrompt) {
+					record.backgroundBusy = true;
+					record.backgroundAnonymousBusy = true;
+				}
 			} else if (frame.state === "idle") {
 				record.busy = false;
 				record.backgroundBusy = false;
-				record.backgroundCorrelation = undefined;
+				record.backgroundAnonymousBusy = false;
+				record.backgroundCorrelations.length = 0;
 			}
 			return;
 		}
@@ -2715,7 +2727,10 @@ export class AcpAgent implements Agent {
 					(!correlation || !correlationsExactlyMatch(record.activePrompt.correlation, correlation)))
 			) {
 				record.backgroundBusy = true;
-				record.backgroundCorrelation = correlation && hasCompleteCorrelation(correlation) ? correlation : undefined;
+				if (correlation && hasCompleteCorrelation(correlation)) {
+					if (!record.backgroundCorrelations.some(owner => correlationsExactlyMatch(owner, correlation)))
+						record.backgroundCorrelations.push(correlation);
+				} else record.backgroundAnonymousBusy = true;
 			}
 		}
 	}
@@ -2906,15 +2921,21 @@ export class AcpAgent implements Agent {
 		const settledCorrelation = record.settledPromptCorrelations.some(settled =>
 			correlationsMatch(settled, correlation),
 		);
-		const ownsBackgroundTerminal = record.backgroundCorrelation
-			? hasCompleteCorrelation(correlation) && correlationsExactlyMatch(record.backgroundCorrelation, correlation)
-			: !hasCorrelation(correlation);
+		const ownedBackgroundCorrelation = hasCompleteCorrelation(correlation)
+			? record.backgroundCorrelations.find(owner => correlationsExactlyMatch(owner, correlation))
+			: undefined;
+		const ownsBackgroundTerminal =
+			ownedBackgroundCorrelation !== undefined || (!hasCorrelation(correlation) && record.backgroundAnonymousBusy);
 		if (isTerminal) {
 			if (!activePrompt) {
 				if (!record.backgroundBusy || !ownsBackgroundTerminal || settledCorrelation) return;
-				record.busy = false;
-				record.backgroundBusy = false;
-				record.backgroundCorrelation = undefined;
+				if (ownedBackgroundCorrelation)
+					record.backgroundCorrelations = record.backgroundCorrelations.filter(
+						owner => !correlationsExactlyMatch(owner, ownedBackgroundCorrelation),
+					);
+				else record.backgroundAnonymousBusy = false;
+				record.backgroundBusy = record.backgroundAnonymousBusy || record.backgroundCorrelations.length > 0;
+				record.busy = record.backgroundBusy;
 				await this.#publishPromptPhase(id, record.adapter, undefined);
 				return;
 			}
@@ -2927,8 +2948,12 @@ export class AcpAgent implements Agent {
 				!settledCorrelation &&
 				(!hasCorrelation(correlation) || hasCompleteCorrelation(correlation))
 			) {
-				record.backgroundBusy = false;
-				record.backgroundCorrelation = undefined;
+				if (ownedBackgroundCorrelation)
+					record.backgroundCorrelations = record.backgroundCorrelations.filter(
+						owner => !correlationsExactlyMatch(owner, ownedBackgroundCorrelation),
+					);
+				else record.backgroundAnonymousBusy = false;
+				record.backgroundBusy = record.backgroundAnonymousBusy || record.backgroundCorrelations.length > 0;
 				record.busy = true;
 				await this.#publishPromptPhase(id, record.adapter, activePrompt);
 				return;
