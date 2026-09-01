@@ -22,6 +22,10 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/devswha/gajae-code-app"><strong>🖥️ Desktop app (experimental, community-built)</strong></a> — a third-party, community-built desktop interface for Gajae-Code. Not an official first-party app; use at your own discretion.
+</p>
+
+<p align="center">
   <a href="#quick-start">Quick Start</a> ·
   <a href="#why-gajae-code">Why</a> ·
   <a href="#bring-your-coding-plan">Coding Plans</a> ·
