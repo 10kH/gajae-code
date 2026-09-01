@@ -172,7 +172,7 @@ type SessionRecord = {
 	/** Updated at ingress so a prompt acknowledgement can distinguish a steer from a fresh turn. */
 	busy: boolean;
 	backgroundBusy: boolean;
-	backgroundAnonymousBusy: boolean;
+	backgroundAnonymousCount: number;
 	backgroundCorrelations: PromptCorrelation[];
 	/** Start/update args retained because tool_execution_end does not carry them. */
 	toolArgs: Map<string, unknown>;
@@ -1815,7 +1815,7 @@ export class AcpAgent implements Agent {
 								)
 							)
 								record.backgroundCorrelations.push(deferredCorrelation);
-						} else record.backgroundAnonymousBusy = true;
+						} else record.backgroundAnonymousCount++;
 					}
 				}
 				if (matchesWaiter) {
@@ -1856,7 +1856,7 @@ export class AcpAgent implements Agent {
 					record.backgroundCorrelations = record.backgroundCorrelations.filter(
 						owner => !correlationsExactlyMatch(owner, deferredCorrelation),
 					);
-					record.backgroundBusy = record.backgroundAnonymousBusy || record.backgroundCorrelations.length > 0;
+					record.backgroundBusy = record.backgroundAnonymousCount > 0 || record.backgroundCorrelations.length > 0;
 					record.busy = true;
 					continue;
 				}
@@ -2380,7 +2380,7 @@ export class AcpAgent implements Agent {
 				connectionId: adapter.connectionId,
 				busy: false,
 				backgroundBusy: false,
-				backgroundAnonymousBusy: false,
+				backgroundAnonymousCount: 0,
 				backgroundCorrelations: [],
 				toolArgs: new Map(),
 			};
@@ -2701,12 +2701,12 @@ export class AcpAgent implements Agent {
 				record.busy = true;
 				if (!record.activePrompt) {
 					record.backgroundBusy = true;
-					record.backgroundAnonymousBusy = true;
+					record.backgroundAnonymousCount = Math.max(record.backgroundAnonymousCount, 1);
 				}
 			} else if (frame.state === "idle") {
 				record.busy = false;
 				record.backgroundBusy = false;
-				record.backgroundAnonymousBusy = false;
+				record.backgroundAnonymousCount = 0;
 				record.backgroundCorrelations.length = 0;
 			}
 			return;
@@ -2736,7 +2736,7 @@ export class AcpAgent implements Agent {
 				if (correlation && hasCompleteCorrelation(correlation)) {
 					if (!record.backgroundCorrelations.some(owner => correlationsExactlyMatch(owner, correlation)))
 						record.backgroundCorrelations.push(correlation);
-				} else record.backgroundAnonymousBusy = true;
+				} else record.backgroundAnonymousCount++;
 			}
 		}
 	}
@@ -2932,7 +2932,8 @@ export class AcpAgent implements Agent {
 			? record.backgroundCorrelations.find(owner => correlationsExactlyMatch(owner, correlation))
 			: undefined;
 		const ownsBackgroundTerminal =
-			ownedBackgroundCorrelation !== undefined || (!hasCorrelation(correlation) && record.backgroundAnonymousBusy);
+			ownedBackgroundCorrelation !== undefined ||
+			(!hasCorrelation(correlation) && record.backgroundAnonymousCount > 0);
 		if (isTerminal) {
 			if (!activePrompt) {
 				if (!record.backgroundBusy || !ownsBackgroundTerminal || settledCorrelation) return;
@@ -2940,8 +2941,8 @@ export class AcpAgent implements Agent {
 					record.backgroundCorrelations = record.backgroundCorrelations.filter(
 						owner => !correlationsExactlyMatch(owner, ownedBackgroundCorrelation),
 					);
-				else record.backgroundAnonymousBusy = false;
-				record.backgroundBusy = record.backgroundAnonymousBusy || record.backgroundCorrelations.length > 0;
+				else record.backgroundAnonymousCount--;
+				record.backgroundBusy = record.backgroundAnonymousCount > 0 || record.backgroundCorrelations.length > 0;
 				record.busy = record.backgroundBusy;
 				await this.#publishPromptPhase(id, record.adapter, undefined);
 				return;
@@ -2959,8 +2960,8 @@ export class AcpAgent implements Agent {
 					record.backgroundCorrelations = record.backgroundCorrelations.filter(
 						owner => !correlationsExactlyMatch(owner, ownedBackgroundCorrelation),
 					);
-				else record.backgroundAnonymousBusy = false;
-				record.backgroundBusy = record.backgroundAnonymousBusy || record.backgroundCorrelations.length > 0;
+				else record.backgroundAnonymousCount--;
+				record.backgroundBusy = record.backgroundAnonymousCount > 0 || record.backgroundCorrelations.length > 0;
 				record.busy = true;
 				await this.#publishPromptPhase(id, record.adapter, activePrompt);
 				return;

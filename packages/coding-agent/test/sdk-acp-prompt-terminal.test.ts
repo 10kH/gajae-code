@@ -1093,6 +1093,39 @@ test("ACP predecessor terminal metadata cannot overwrite a background successor"
 	}
 });
 
+test("ACP retires overlapping anonymous background runs independently", async () => {
+	const fixture = await createFixture();
+	try {
+		const foreground = prompt(fixture, "establish anonymous lifecycle");
+		await bounded(fixture.promptDelivered, "foreground prompt delivery");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(foreground, "foreground settlement")).toEqual({ stopReason: "end_turn" });
+		await waitFor(() => idlePhaseUpdates(fixture.updates) > 0, "foreground idle phase");
+
+		fixture.sendTerminal({ type: "agent_start", sessionId: "prompt-terminal-session" });
+		fixture.sendTerminal({ type: "agent_start", sessionId: "prompt-terminal-session" });
+		await waitFor(
+			() =>
+				fixture.updates
+					.filter(update => update.update.sessionUpdate === "session_info_update")
+					.map(update => (update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase)
+					.at(-1) === "working",
+			"anonymous background working phase",
+		);
+		const idleBeforeFirstTerminal = idlePhaseUpdates(fixture.updates);
+		fixture.sendTerminal({ type: "agent_end", sessionId: "prompt-terminal-session" });
+		await Bun.sleep(0);
+		expect(idlePhaseUpdates(fixture.updates)).toBe(idleBeforeFirstTerminal);
+		fixture.sendTerminal({ type: "agent_end", sessionId: "prompt-terminal-session" });
+		await waitFor(
+			() => idlePhaseUpdates(fixture.updates) > idleBeforeFirstTerminal,
+			"final anonymous background idle phase",
+		);
+	} finally {
+		fixture.dispose();
+	}
+});
+
 test("ACP successor waits only while ready predecessor metadata is being delivered", async () => {
 	const fixture = await createFixture({ blockIdleUpdate: true });
 	try {
