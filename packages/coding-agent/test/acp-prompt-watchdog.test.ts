@@ -477,9 +477,10 @@ test("a prompt awaiting the model past the inference bound is rejected instead o
 		expect(message).toContain('"agent_start"');
 		expect(message).toContain(`commandId=${commandId}`);
 		expect(message).toContain(`turnId=${turnId}`);
-		// The client's running phase is released, so the composer stops spinning.
-		await waitFor(() => idleUpdates(fixture.updates) > idleBefore, "watchdog idle phase");
-		expect(idleUpdates(fixture.updates)).toBe(idleBefore + 1);
+		// The ACP waiter is retired, but the host did not acknowledge cancellation and
+		// remains observably busy until it publishes a real terminal/activity boundary.
+		expect(idleUpdates(fixture.updates)).toBe(idleBefore);
+		expect(workingUpdates(fixture.updates)).toBeGreaterThan(0);
 	} finally {
 		fixture.dispose();
 	}
