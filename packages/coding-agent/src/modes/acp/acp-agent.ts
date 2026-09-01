@@ -1883,6 +1883,7 @@ export class AcpAgent implements Agent {
 			waiter.settled = true;
 			if (record.activePrompt === waiter) {
 				record.activePrompt = undefined;
+				record.busy = record.backgroundBusy;
 				void this.#publishPromptPhaseIdle(params.sessionId, record.adapter);
 			}
 			// Keep a late terminal for this (cancelled) turn closed, exactly like the
