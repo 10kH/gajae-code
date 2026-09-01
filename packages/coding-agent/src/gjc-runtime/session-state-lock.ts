@@ -1308,7 +1308,13 @@ async function acquireOwnerLock(
 		} catch {
 			throw error;
 		}
-		if (!validLockOwner(observed) || observed.released !== true) throw error;
+		if (!validLockOwner(observed)) throw error;
+		if (observed.released !== true) {
+			if (await lockOwnerIsAlive(observed)) throw error;
+			const removed = exactUnlinkOwnerRecord(file, current, quarantineName);
+			if (removed !== "removed" && removed !== "absent") throw error;
+			return await createOwnerLock(file, owner, quarantineName);
+		}
 		try {
 			return await rewriteHeldOwnerRecord(file, current, owner);
 		} catch (error) {
@@ -1549,7 +1555,7 @@ async function releaseTransitionClaim(
 }
 
 async function reclaimStaleTransitionClaim(transitionDir: string, quarantineName: string): Promise<void> {
-	const stat = await fs.lstat(transitionDir).catch(() => null);
+	const stat = await fs.lstat(transitionDir, { bigint: true }).catch(() => null);
 	if (!stat) return;
 	// Regular-file claims belong to the superseded protocol. They retain the old
 	// exact-identity stale path; released PID-1 tombstones deliberately require
@@ -1566,9 +1572,56 @@ async function reclaimStaleTransitionClaim(transitionDir: string, quarantineName
 		return;
 	}
 	if (!stat.isDirectory()) throw new SessionStateLockUnavailableError();
-	// No portable operation can atomically prove that this directory + sibling
-	// sidecar are still the dead claim two concurrent reclaimers inspected. A
-	// crashed atomic claim therefore stays fail-closed for explicit recovery.
+	if (process.platform !== "win32") return;
+	const ownerSnapshot = await captureRegularLockOwner(`${transitionDir}.owner`);
+	if (!ownerSnapshot) return;
+	let owner: unknown;
+	try {
+		owner = JSON.parse(ownerSnapshot.bytes);
+	} catch {
+		return;
+	}
+	if (!validLockOwner(owner)) return;
+	// Released tombstones intentionally remain fail-closed: they carry no live
+	// process proof and are not generation-bound to the sibling directory.
+	if (owner.released === true || (await lockOwnerIsAlive(owner))) return;
+	const generation = transitionGenerationFromStat(stat);
+	const nativePath = await canonicalOwnedTransitionPath(transitionDir).catch(() => null);
+	if (!nativePath) return;
+	const captured = nativeSessionStateLock().snapshotDirectoryTree(nativePath);
+	if (!captured.ok || !captured.snapshot) return;
+	const root = captured.snapshot.entries.find(entry => entry.relativePath === "");
+	if (
+		!root ||
+		root.kind !== "directory" ||
+		root.dev !== String(generation.dev) ||
+		root.ino !== String(generation.ino) ||
+		root.nlink !== String(generation.nlink) ||
+		root.mtimeNs !== String(generation.mtimeNs) ||
+		root.ctimeNs !== String(generation.ctimeNs)
+	)
+		return;
+	const removed = nativeSessionStateLock().exactRemoveDirectoryTree(nativePath, captured.snapshot);
+	if (removed.ok || removed.code === "not_found") {
+		const ownerRemoval = exactUnlinkOwnerRecord(`${transitionDir}.owner`, ownerSnapshot, quarantineName);
+		if (ownerRemoval !== "removed" && ownerRemoval !== "absent") return;
+		return;
+	}
+	if (
+		removed.code === "cleanup_pending" &&
+		removed.payloadDurable === true &&
+		removed.detachedPath === `${nativePath}.removing` &&
+		removed.retainedSuccessorPath === undefined &&
+		removed.retainedUnknownPath === undefined &&
+		removed.retainedPlaceholderPath === undefined
+	) {
+		const ownerRemoval = exactUnlinkOwnerRecord(`${transitionDir}.owner`, ownerSnapshot, quarantineName);
+		if (ownerRemoval !== "removed" && ownerRemoval !== "absent") return;
+		return;
+	}
+	throw new SessionStateLockUnavailableError(
+		new Error(`Stale transition claim could not be reclaimed (${removed.code ?? "unknown"}).`),
+	);
 }
 
 /** Run one pathname transition under an atomic `mkdir`/`rmdir` claim. */
