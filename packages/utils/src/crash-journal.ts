@@ -22,6 +22,24 @@ export const CRASH_EVENT_KIND = "gjc-crash-event.v1";
 /** Preview cap for the message class carried by an event. */
 export const CRASH_EVENT_MESSAGE_MAX_BYTES = 256;
 
+/** Bounded execution provenance carried only on newly written occurrences. */
+export type CrashProvenance = "product" | "eval" | "bun_test";
+
+/**
+ * Classify only process-level harness modes that are explicit and stable.
+ * Everything else is product provenance, including source checkouts, CLI
+ * invocations, SDK/ACP hosts, and native-loader failures.
+ */
+export function detectCrashProvenance(
+	argv: readonly string[] = process.argv,
+	env: NodeJS.ProcessEnv = process.env,
+	execArgv: readonly string[] = process.execArgv,
+): CrashProvenance {
+	if (env.BUN_TEST !== undefined) return "bun_test";
+	if (execArgv[0] === "-e" || execArgv[0] === "--eval" || argv[0] === "-e" || argv[0] === "--eval") return "eval";
+	return "product";
+}
+
 export type CrashEvent =
 	| CrashOccurrenceEvent
 	| CrashRefusedEvent
@@ -38,6 +56,8 @@ export interface CrashOccurrenceEvent {
 	readonly at: number;
 	readonly errorName: string;
 	readonly messageClass: string;
+	/** Legacy events omit this and are treated as product crashes. */
+	readonly provenance?: CrashProvenance;
 }
 
 export interface CrashRefusedEvent {
@@ -109,6 +129,7 @@ export function formatCrashEventLine(event: CrashEvent): string {
 						id: event.recordId,
 						at: event.at,
 						n: sanitizeEventText(truncateUtf8(event.errorName, 64)),
+						...(event.provenance && event.provenance !== "product" ? { p: event.provenance } : {}),
 						...(messageClass === undefined ? {} : { m: messageClass }),
 					}
 				: event.kind === "reported"
@@ -181,7 +202,19 @@ export function parseCrashEventLine(line: string): CrashEvent | undefined {
 			if (typeof body.fpv !== "number" || !Number.isSafeInteger(body.fpv) || body.fpv < 1) return undefined;
 			const errorName = typeof body.n === "string" ? sanitizeEventText(body.n) : "Error";
 			const messageClass = typeof body.m === "string" ? sanitizeEventText(body.m) : "";
-			return { kind: "occurrence", fingerprint, fpv: body.fpv, recordId: body.id, at, errorName, messageClass };
+			const provenance = body.p === undefined ? undefined : body.p;
+			if (provenance !== undefined && provenance !== "product" && provenance !== "eval" && provenance !== "bun_test")
+				return undefined;
+			return {
+				kind: "occurrence",
+				fingerprint,
+				fpv: body.fpv,
+				recordId: body.id,
+				at,
+				errorName,
+				messageClass,
+				...(provenance === undefined ? {} : { provenance }),
+			};
 		}
 		case "reported": {
 			if (!fingerprint) return undefined;

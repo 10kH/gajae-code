@@ -13,7 +13,8 @@ import * as path from "node:path";
 import { isMainThread } from "node:worker_threads";
 import { BROKEN_PIPE_EXIT_CODE, createProcessStdoutEpipeClassifier } from "./broken-pipe";
 import { type CrashFingerprint, computeCrashFingerprint, formatCrashRecordMarker } from "./crash-fingerprint";
-import { appendCrashEvent, appendFatalCrashEvent } from "./crash-journal";
+import type { CrashProvenance } from "./crash-journal";
+import { appendCrashEvent, appendFatalCrashEvent, detectCrashProvenance } from "./crash-journal";
 import { redactCrashSecrets } from "./crash-redaction";
 import { getCrashEventsPath, getCrashLogPath, getHandledErrorEventsPath, getHandledErrorLogPath } from "./dirs";
 import * as logger from "./logger";
@@ -460,7 +461,8 @@ function boundCrashRecord(report: string, maxBytes: number = CRASH_RECORD_MAX_BY
  * `process.exit`. Returns the path written, or `undefined` on failure.
  */
 export function recordFatalCrash(label: string, reason: unknown, options: CrashRecordOptions = {}): string | undefined {
-	const written = writeCrashRecord(label, describeFatal(reason), options);
+	const provenance = detectCrashProvenance();
+	const written = writeCrashRecord(label, describeFatal(reason), { ...options, provenance });
 	if (!written) return undefined;
 	appendFatalCrashEvent(
 		{
@@ -471,11 +473,18 @@ export function recordFatalCrash(label: string, reason: unknown, options: CrashR
 			at: written.now.getTime(),
 			errorName: written.fingerprint.errorName,
 			messageClass: written.fingerprint.messageClass,
+			provenance,
 		},
 		getCrashEventsTarget(written.target, options.path),
 	);
 	return written.target;
 }
+
+/**
+ * Classify only process-level harness modes that are explicit and stable.
+ * Everything else is product provenance, including source checkouts, CLI
+ * invocations, SDK/ACP hosts, and native-loader failures.
+ */
 
 const handledErrorFingerprints = new Set<string>();
 const HANDLED_ERROR_FINGERPRINT_LIMIT = 256;
@@ -552,6 +561,7 @@ export function resetHandledErrorDedupeForTest(): void {
 interface CrashRecordOptions {
 	path?: string;
 	now?: Date;
+	provenance?: CrashProvenance;
 }
 
 interface WrittenCrashRecord {
@@ -591,7 +601,7 @@ function writeCrashRecord(
 		// The marker is the record's identity, so it is budgeted first and appended
 		// after truncation: an oversized body can never evict it.
 		const body = boundCrashRecord(
-			`${now.toISOString()} pid=${process.pid} [${label}] ` +
+			`${now.toISOString()} pid=${process.pid} [${label}${options.provenance && options.provenance !== "product" ? `;provenance=${options.provenance}` : ""}] ` +
 				`${redactCrashSecrets(fatal.name)}: ${redactCrashSecrets(fatal.message)}\n` +
 				`${stack}${payload}`,
 			CRASH_RECORD_MAX_BYTES - Buffer.byteLength(markerLine, "utf8") - 1,
