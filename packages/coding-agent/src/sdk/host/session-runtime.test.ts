@@ -17,7 +17,7 @@ import { createKindAwareReconciliation } from "../bus/kind-aware-reconciliation"
 import { createPromptReconciliation } from "../bus/prompt-reconciliation";
 import { createReconciliationStore } from "../bus/reconciliation-store";
 import { BROKER_RUNTIME_ABORT_CAPABILITY_FIELD, setBrokerRuntimeAbortCapabilityForTest } from "./control/runtime-gate";
-import { CursorRegistry, QueryHandlers, RevisionStore, type QueryResponse } from "./query";
+import { CursorRegistry, QueryHandlers, type QueryResponse, RevisionStore } from "./query";
 import {
 	createInvocationReconciliation,
 	createSdkSessionRuntimeExtension,
@@ -212,7 +212,10 @@ test("session.last_assistant returns the latest projected readable text past non
 		],
 	});
 
-	expect(await queryLastAssistant(ctx, sessionId)).toMatchObject({ ok: true, page: { items: ["first line\nsecond line"] } });
+	expect(await queryLastAssistant(ctx, sessionId)).toMatchObject({
+		ok: true,
+		page: { items: ["first line\nsecond line"] },
+	});
 });
 
 test("session.last_assistant returns resource_gone when the projected transcript has no readable assistant text", async () => {

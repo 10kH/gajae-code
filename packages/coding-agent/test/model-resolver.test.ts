@@ -1128,7 +1128,7 @@ describe("OpenAI Codex default resolution", () => {
 			defaultModelId: model.id,
 			scopedModels: [],
 			isContinuing: false,
-			modelRegistry: { getAvailable: () => [model], getApiKey: async () => "test-key" },
+			modelRegistry: { getAvailable: () => [model] },
 		});
 
 		expect(result.model).toBe(model);

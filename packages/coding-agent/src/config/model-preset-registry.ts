@@ -1167,11 +1167,7 @@ function recoverStateCopiesSync(
 		(!primaryEvidence.allGenerationsVerified || primaryEvidence.duplicateRevision)
 	)
 		if (!options.allowInvalidPrimaryFallback || !backupEvidence?.fullyVerified) {
-			try {
-				validateStateGenerations(primaryEvidence.state, trustedKeys);
-			} catch (error) {
-				throw error;
-			}
+			validateStateGenerations(primaryEvidence.state, trustedKeys);
 		}
 	if (
 		backupEvidence &&
