@@ -117,6 +117,8 @@ interface PromptWaiter {
 	emittedAssistantText: string;
 	settled: boolean;
 	terminal?: { outcome: SdkPromptTerminalOutcome; correlation: PromptCorrelation };
+	/** Additive diagnostics held until settlement so they cannot block the terminal response writer. */
+	failureDiagnostics: Array<{ notification: SessionNotification; publicationGeneration: number }>;
 	/** Frames for an already-settled correlation held until acknowledgement resolves ownership. */
 	deferredFrames: Array<{ frame: JsonObject; publicationGeneration: number }>;
 	/** Activity frames held until acknowledgement establishes exact prompt ownership. */
@@ -147,6 +149,7 @@ interface PromptWaiter {
 }
 
 type PromptCorrelation = { commandId?: string; turnId?: string };
+type PromptPhaseOwner = PromptWaiter | "background" | undefined;
 
 type BrokerConnection = { adapter: AcpSdkAdapter; client: SdkClient };
 type PendingAttachment = { epoch: number; task: Promise<void> };
@@ -1607,13 +1610,6 @@ export class AcpAgent implements Agent {
 			throw new AcpSdkAdapterError("conflict", "ACP session is still publishing the previous prompt's final text.");
 		if (this.#terminalMetadataTails.has(params.sessionId))
 			throw new AcpSdkAdapterError("conflict", "ACP session is still publishing the previous prompt's metadata.");
-		if (this.#failureDiagnosticTails.has(params.sessionId))
-			throw new AcpSdkAdapterError(
-				"conflict",
-				"ACP session is still publishing the previous prompt's failure diagnostic.",
-			);
-		if (this.#promptPhaseTails.has(params.sessionId))
-			throw new AcpSdkAdapterError("conflict", "ACP session is still publishing the previous prompt's phase.");
 
 		const payload = acpPromptPayload(params.prompt);
 		const skillInvocation = acpSkillInvocation(params.prompt);
@@ -1675,6 +1671,7 @@ export class AcpAgent implements Agent {
 			correlation: {},
 			emittedAssistantText: "",
 			settled: false,
+			failureDiagnostics: [],
 			deferredFrames: [],
 			deferredActivityFrames: [],
 			lastFrameAt: this.#promptWatchdogClock.now(),
@@ -1936,6 +1933,7 @@ export class AcpAgent implements Agent {
 				waiter.deferredActivityFrames.length = 0;
 				waiter.terminal = undefined;
 				waiter.resolve({ stopReason: "cancelled" });
+				this.#flushFailureDiagnostics(params.sessionId, waiter, record.adapter);
 				// Release the running phase for consistency with the resolved cancel; the
 				// publication is advisory and must never gate the settlement above.
 				void this.#publishPromptPhaseIdle(params.sessionId, record.adapter);
@@ -2001,6 +1999,7 @@ export class AcpAgent implements Agent {
 		// when nothing settled the prompt the client already asked to cancel.
 		if (this.#sessions.get(id) !== record || record.activePrompt !== waiter || waiter.settled) return;
 		record.activePrompt = undefined;
+		record.busy = false;
 		clearPromptWatchdog(waiter);
 		record.cancelRequested = false;
 		waiter.settled = true;
@@ -2018,6 +2017,7 @@ export class AcpAgent implements Agent {
 		// ran — the acknowledged cancel left the prompt pending forever, the client
 		// force-cancelled, and the next prompt collided with the stale foreground turn.
 		waiter.resolve({ stopReason: "cancelled" });
+		this.#flushFailureDiagnostics(id, waiter, record.adapter);
 		void this.#publishPromptPhaseIdle(id, record.adapter);
 	}
 
@@ -2433,7 +2433,7 @@ export class AcpAgent implements Agent {
 		try {
 			await this.#attachExisting(id, cwd, mcpServers);
 			const current = this.#sessions.get(id);
-			if (current) void this.#publishPromptPhase(id, current.adapter, current.activePrompt);
+			if (current) void this.#publishPromptPhase(id, current.adapter, this.#promptPhaseOwner(current));
 		} catch (attachError) {
 			const detail = attachError instanceof Error ? attachError.message : String(attachError);
 			logger.warn(`ACP session ${id} auto-reattach after transport loss failed: ${detail}`);
@@ -2637,7 +2637,11 @@ export class AcpAgent implements Agent {
 		}
 		const event = receivedSdkEvent(frame)?.event;
 		if (event?.type === "agent_start") record.busy = true;
-		else if (event?.type === "agent_end" || event?.type === "agent_failed") record.busy = false;
+		else if (
+			event?.type === "agent_end" ||
+			(event?.type === "agent_failed" && terminalOutcome(event)?.kind === "failed")
+		)
+			record.busy = false;
 	}
 
 	#frameProcessingFailure(error: unknown): AcpSdkAdapterError {
@@ -2908,7 +2912,7 @@ export class AcpAgent implements Agent {
 			// starts a replacement turn, and an in-flight transport write cannot be revoked.
 			if (!(event.type === "agent_failed" && isTerminal))
 				if (event.type === "agent_failed" && promptOwner)
-					this.#scheduleFailureDiagnostic(id, notification, adapter, publicationGeneration);
+					promptOwner.failureDiagnostics.push({ notification, publicationGeneration });
 				else
 					await this.#publishSessionUpdate(
 						id,
@@ -2947,9 +2951,10 @@ export class AcpAgent implements Agent {
 		publicationGeneration: number,
 	): void {
 		const prior = this.#failureDiagnosticTails.get(id) ?? Promise.resolve();
-		const task = prior.then(
-			async () => await this.#publishSessionUpdate(id, notification, adapter, publicationGeneration),
-		);
+		const task = prior.then(async () => {
+			await Bun.sleep(0);
+			await this.#publishSessionUpdate(id, notification, adapter, publicationGeneration);
+		});
 		let tail: Promise<void>;
 		tail = task
 			.catch(error => {
@@ -2961,6 +2966,12 @@ export class AcpAgent implements Agent {
 		this.#failureDiagnosticTails.set(id, tail);
 	}
 
+	#flushFailureDiagnostics(id: string, waiter: PromptWaiter, adapter: AcpSdkAdapter): void {
+		for (const { notification, publicationGeneration } of waiter.failureDiagnostics)
+			this.#scheduleFailureDiagnostic(id, notification, adapter, publicationGeneration);
+		waiter.failureDiagnostics.length = 0;
+	}
+
 	#scheduleTerminalUpdates(
 		id: string,
 		adapter: AcpSdkAdapter,
@@ -2969,13 +2980,16 @@ export class AcpAgent implements Agent {
 		promptOwner: PromptWaiter | undefined,
 	): void {
 		if (event.type === "agent_failed") {
+			if (promptOwner) this.#flushFailureDiagnostics(id, promptOwner, adapter);
 			void this.#publishPromptPhaseIdle(id, adapter);
 			return;
 		}
+		if (promptOwner) this.#flushFailureDiagnostics(id, promptOwner, adapter);
 		let decorationStart = Promise.resolve();
 		const finalText = typeof event.finalText === "string" ? event.finalText : "";
 		if (promptOwner && finalText) {
 			const finalTextTask = (async () => {
+				await Bun.sleep(0);
 				const resolution = resolveAcpFinalText(promptOwner.emittedAssistantText, finalText);
 				if (resolution.kind === "emit") {
 					promptOwner.emittedAssistantText += resolution.text;
@@ -3029,6 +3043,7 @@ export class AcpAgent implements Agent {
 	): Promise<void> {
 		if (record.activePrompt !== waiter || waiter.settled) return;
 		record.activePrompt = undefined;
+		record.busy = false;
 		clearPromptWatchdog(waiter);
 		waiter.settled = true;
 		this.#fenceRetiredPromptAcknowledgement(id, waiter);
@@ -3042,6 +3057,7 @@ export class AcpAgent implements Agent {
 		// forever). Skipping the idle publish entirely is what left a client composer
 		// spinning on a turn that already produced its terminal.
 		waiter.reject(error);
+		this.#flushFailureDiagnostics(id, waiter, record.adapter);
 		if (publishIdle) void this.#publishPromptPhaseIdle(id, record.adapter);
 	}
 
@@ -3056,20 +3072,20 @@ export class AcpAgent implements Agent {
 	 */
 	async #publishPromptPhaseIdle(id: string, adapter: AcpSdkAdapter): Promise<void> {
 		const record = this.#sessions.get(id);
-		if (!record || record.adapter !== adapter || record.activePrompt) return;
-		await this.#publishPromptPhase(id, adapter, undefined);
+		if (!record || record.adapter !== adapter) return;
+		await this.#publishPromptPhase(id, adapter, this.#promptPhaseOwner(record));
 	}
 
-	async #publishPromptPhase(
-		id: string,
-		adapter: AcpSdkAdapter,
-		observedPrompt: PromptWaiter | undefined,
-	): Promise<void> {
+	#promptPhaseOwner(record: SessionRecord): PromptPhaseOwner {
+		return record.activePrompt ?? (record.busy ? "background" : undefined);
+	}
+
+	async #publishPromptPhase(id: string, adapter: AcpSdkAdapter, observedPrompt: PromptPhaseOwner): Promise<void> {
 		const pending = this.#promptPhaseTails.get(id);
 		if (pending) {
 			await pending;
 			const current = this.#sessions.get(id);
-			if (current) await this.#publishPromptPhase(id, current.adapter, current.activePrompt);
+			if (current) await this.#publishPromptPhase(id, current.adapter, this.#promptPhaseOwner(current));
 			return;
 		}
 		const task = this.#runPromptPhase(id, adapter, observedPrompt);
@@ -3081,8 +3097,9 @@ export class AcpAgent implements Agent {
 		await tail;
 	}
 
-	async #runPromptPhase(id: string, adapter: AcpSdkAdapter, observedPrompt: PromptWaiter | undefined): Promise<void> {
+	async #runPromptPhase(id: string, adapter: AcpSdkAdapter, observedPrompt: PromptPhaseOwner): Promise<void> {
 		try {
+			await Bun.sleep(0);
 			for (;;) {
 				await this.#connection.sessionUpdate({
 					sessionId: id,
@@ -3099,11 +3116,12 @@ export class AcpAgent implements Agent {
 				const current = this.#sessions.get(id);
 				if (!current) return;
 				if (current.adapter !== adapter) {
-					void this.#publishPromptPhase(id, current.adapter, current.activePrompt);
+					void this.#publishPromptPhase(id, current.adapter, this.#promptPhaseOwner(current));
 					return;
 				}
-				if (current.activePrompt === observedPrompt) return;
-				observedPrompt = current.activePrompt;
+				const currentOwner = this.#promptPhaseOwner(current);
+				if (currentOwner === observedPrompt) return;
+				observedPrompt = currentOwner;
 			}
 		} catch {
 			// The client transport is gone; there is no phase left to restore.
@@ -3224,7 +3242,7 @@ export class AcpAgent implements Agent {
 				((expectedAdapter && current.adapter !== expectedAdapter) ||
 					(publicationGeneration !== undefined && publicationGeneration !== current.publicationGeneration))
 			) {
-				void this.#publishPromptPhase(id, current.adapter, current.activePrompt);
+				void this.#publishPromptPhase(id, current.adapter, this.#promptPhaseOwner(current));
 			}
 		} catch (error) {
 			// A validated terminal can retire this publication while it is blocked in

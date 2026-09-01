@@ -3,6 +3,7 @@ import * as path from "node:path";
 import type { AgentSideConnection, PromptRequest, SessionNotification } from "@agentclientprotocol/sdk";
 import { logger, TempDir } from "@gajae-code/utils";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
+import { AcpSdkAdapter } from "../src/sdk/acp/adapter";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
 import {
 	type ExactSessionAuthorityFixture,
@@ -781,21 +782,14 @@ test("ACP keeps generic correlated agent_failed additive until authoritative age
 			},
 		);
 		fixture.sendDiagnostic();
-		await waitFor(() => fixture.updates.length === updatesBefore + 1, "failure diagnostic update");
+		await Promise.resolve();
+		expect(fixture.updates).toHaveLength(updatesBefore);
 		expect(settled).toBe(false);
-		expect(
-			fixture.updates
-				.slice(updatesBefore)
-				.map(update =>
-					update.update.sessionUpdate === "session_info_update"
-						? (update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase
-						: update.update.sessionUpdate,
-				),
-		).toEqual(["error"]);
 		expect(fixture.queryCalls.filter(query => query === "context.get")).toHaveLength(contextQueriesBefore);
 		expect(fixture.queryCalls.filter(query => query === "session.metadata")).toHaveLength(metadataQueriesBefore);
 		fixture.sendStopped("end_turn");
 		expect(await bounded(pending, "authoritative agent_end settlement")).toEqual({ stopReason: "end_turn" });
+		await waitFor(() => fixture.updates.length > updatesBefore, "post-settlement failure diagnostic update");
 	} finally {
 		fixture.dispose();
 	}
@@ -807,14 +801,12 @@ test("ACP blocked generic failure diagnostic cannot delay authoritative agent_en
 		const pending = prompt(fixture, "blocked generic failure diagnostic");
 		await bounded(fixture.promptDelivered, "prompt delivery");
 		fixture.sendDiagnostic();
-		await bounded(fixture.failureDiagnosticEntered, "entered generic failure diagnostic");
 		fixture.sendStopped("end_turn");
 		expect(await bounded(pending, "authoritative terminal behind diagnostic")).toEqual({ stopReason: "end_turn" });
-		await expect(prompt(fixture, "successor blocked by failure diagnostic")).rejects.toMatchObject({
-			code: "conflict",
-		});
+		await bounded(fixture.failureDiagnosticEntered, "entered post-settlement failure diagnostic");
+		const successor = prompt(fixture, "successor behind failure diagnostic");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "successor prompt delivery");
 		fixture.releaseFailureDiagnostic();
-		const { pending: successor } = await promptWhenDelivered(fixture, "successor after failure diagnostic", 2);
 		fixture.sendStopped("end_turn");
 		expect(await bounded(successor, "successor after failure diagnostic")).toEqual({ stopReason: "end_turn" });
 	} finally {
@@ -825,6 +817,17 @@ test("ACP blocked generic failure diagnostic cannot delay authoritative agent_en
 
 test("ACP terminal settlement does not await final-text delivery", async () => {
 	const fixture = await createFixture({ blockedAgentMessageText: "detached final report" });
+	const queryEntered = Promise.withResolvers<void>();
+	const originalQuery = AcpSdkAdapter.prototype.query;
+	const querySpy = vi.spyOn(AcpSdkAdapter.prototype, "query").mockImplementation(async function (
+		this: AcpSdkAdapter,
+		query,
+		input,
+		cursor,
+	) {
+		queryEntered.resolve();
+		return await originalQuery.call(this, query, input, cursor);
+	});
 	try {
 		const idleBefore = idlePhaseUpdates(fixture.updates);
 		const queriesBefore = fixture.queryCalls.length;
@@ -850,6 +853,12 @@ test("ACP terminal settlement does not await final-text delivery", async () => {
 		).toBe(false);
 		expect(idlePhaseUpdates(fixture.updates)).toBe(idleBefore);
 		expect(fixture.queryCalls).toHaveLength(queriesBefore);
+		let queryAdmitted = false;
+		void queryEntered.promise.then(() => {
+			queryAdmitted = true;
+		});
+		await Promise.resolve();
+		expect(queryAdmitted).toBe(false);
 		await expect(prompt(fixture, "successor blocked by predecessor final text")).rejects.toMatchObject({
 			code: "conflict",
 		});
@@ -869,6 +878,7 @@ test("ACP terminal settlement does not await final-text delivery", async () => {
 		fixture.sendStopped("end_turn");
 		expect(await bounded(successor, "successor after final-text delivery")).toEqual({ stopReason: "end_turn" });
 	} finally {
+		querySpy.mockRestore();
 		fixture.releaseAgentMessageUpdate();
 		fixture.dispose();
 	}
@@ -992,11 +1002,19 @@ test("ACP prompt phase fence survives same-id record replacement", async () => {
 			fixture.agent.loadSession({ sessionId: fixture.sessionId, cwd: fixture.cwd, mcpServers: [] }),
 			"same-id phase reattachment",
 		);
-		await expect(prompt(fixture, "successor blocked across phase replacement")).rejects.toMatchObject({
-			code: "conflict",
-		});
+		fixture.sendTerminal({ type: "agent_start", sessionId: "prompt-terminal-session" });
+		const successor = prompt(fixture, "successor across phase replacement");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "successor prompt delivery");
 		fixture.releaseIdleUpdate();
-		const { pending: successor } = await promptWhenDelivered(fixture, "successor after replaced phase", 2);
+		await waitFor(
+			() =>
+				fixture.updates
+					.filter(update => update.update.sessionUpdate === "session_info_update")
+					.map(update => (update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase)
+					.at(-1) === "working",
+			"background working phase after replacement",
+		);
+		fixture.sendTerminal({ type: "agent_end", sessionId: "prompt-terminal-session" });
 		fixture.sendStopped("end_turn");
 		expect(await bounded(successor, "successor after replaced phase")).toEqual({ stopReason: "end_turn" });
 	} finally {
@@ -1091,11 +1109,9 @@ test("ACP failure settlement cannot publish stale phase state over a replacement
 		await expect(bounded(failed, "first failure settlement")).rejects.toMatchObject({ code: "prompt_failed" });
 		const updatesAfterFailure = fixture.updates.length;
 
-		await expect(prompt(fixture, "replacement blocked by phase delivery")).rejects.toMatchObject({
-			code: "conflict",
-		});
+		const replacement = prompt(fixture, "replacement prompt");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "replacement prompt delivery");
 		fixture.releaseIdleUpdate();
-		const { pending: replacement } = await promptWhenDelivered(fixture, "replacement prompt", 2);
 		fixture.sendStopped("end_turn");
 		expect(await bounded(replacement, "replacement terminal settlement")).toEqual({ stopReason: "end_turn" });
 		await waitFor(
@@ -1122,15 +1138,9 @@ test("ACP reconciliation releases a successor whose delayed acknowledgement is i
 		await expect(bounded(failed, "first failure settlement")).rejects.toMatchObject({ code: "prompt_failed" });
 
 		const updatesAfterFailure = fixture.updates.length;
-		await expect(prompt(fixture, "replacement blocked by phase delivery")).rejects.toMatchObject({
-			code: "conflict",
-		});
+		const replacement = prompt(fixture, "replacement with invalid acknowledgement");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "replacement prompt delivery");
 		fixture.releaseIdleUpdate();
-		const { pending: replacement } = await promptWhenDelivered(
-			fixture,
-			"replacement with invalid acknowledgement",
-			2,
-		);
 		fixture.releasePromptAcknowledgement();
 		await expect(bounded(replacement, "invalid acknowledgement rejection")).rejects.toMatchObject({
 			code: "invalid_prompt_acknowledgement",
@@ -1198,8 +1208,10 @@ test("ACP settles once when agent_end arrives after correlated agent_failed", as
 			},
 		);
 		await bounded(fixture.promptDelivered, "prompt delivery");
+		const idleBeforeFailure = idlePhaseUpdates(fixture.updates);
 		fixture.sendFailed("prompt_failed");
 		await expect(bounded(pending, "agent_failed settlement")).rejects.toMatchObject({ code: "prompt_failed" });
+		await waitFor(() => idlePhaseUpdates(fixture.updates) > idleBeforeFailure, "failure idle phase");
 		const updatesAfterFailure = fixture.updates.length;
 		const queriesAfterFailure = fixture.queryCalls.length;
 
@@ -1597,6 +1609,17 @@ test("ACP settles a cancelled prompt when the aborted turn never publishes a ter
 		const updatesBefore = fixture.updates.length;
 		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "cancel acknowledgement");
 		expect(await bounded(pending, "cancelled settlement")).toEqual({ stopReason: "cancelled" });
+		await waitFor(
+			() =>
+				fixture.updates
+					.slice(updatesBefore)
+					.some(
+						update =>
+							update.update.sessionUpdate === "session_info_update" &&
+							(update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase === "idle",
+					),
+			"cancelled idle phase",
+		);
 		expect(
 			fixture.updates
 				.slice(updatesBefore)

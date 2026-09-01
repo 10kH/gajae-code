@@ -80,6 +80,7 @@ type Fixture = {
 	clock: VirtualClock;
 	/** Correlation the fixture host acknowledged for the turn currently in flight. */
 	correlation(): { commandId: string; turnId: string };
+	promptDeliveryCount(): number;
 	/** Sends one raw frame down the session socket, correlation included or omitted verbatim. */
 	send(frame: Record<string, unknown>): void;
 	sendAssistantText(text: string): void;
@@ -387,6 +388,7 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 		updates,
 		clock,
 		correlation: () => ({ commandId, turnId }),
+		promptDeliveryCount: () => turnCount,
 		send,
 		sendAssistantText,
 		sendStopped,
@@ -415,8 +417,12 @@ function prompt(fixture: Fixture, text: string): Promise<{ stopReason: StoppedRe
  */
 async function startTurn(fixture: Fixture): Promise<{ pending: Promise<{ stopReason: StoppedReason }> }> {
 	const started = workingUpdates(fixture.updates);
+	const expectedDelivery = fixture.promptDeliveryCount() + 1;
 	const pending = prompt(fixture, "work");
-	await waitFor(() => workingUpdates(fixture.updates) > started, "turn start");
+	await waitFor(
+		() => fixture.promptDeliveryCount() === expectedDelivery && workingUpdates(fixture.updates) > started,
+		"turn start",
+	);
 	return { pending };
 }
 
@@ -472,6 +478,7 @@ test("a prompt awaiting the model past the inference bound is rejected instead o
 		expect(message).toContain(`commandId=${commandId}`);
 		expect(message).toContain(`turnId=${turnId}`);
 		// The client's running phase is released, so the composer stops spinning.
+		await waitFor(() => idleUpdates(fixture.updates) > idleBefore, "watchdog idle phase");
 		expect(idleUpdates(fixture.updates)).toBe(idleBefore + 1);
 	} finally {
 		fixture.dispose();
@@ -1121,6 +1128,15 @@ test("correlationless assistant text does not consume the prompt final text", as
 		});
 
 		expect(await bounded(pending, "prompt completion")).toEqual({ stopReason: "end_turn" });
+		await waitFor(
+			() =>
+				fixture.updates.some(
+					update =>
+						update.update.sessionUpdate === "agent_message_chunk" &&
+						(update.update as { content: { text: string } }).content.text === finalText,
+				),
+			"detached authoritative final text",
+		);
 		const published = fixture.updates
 			.filter(update => update.update.sessionUpdate === "agent_message_chunk")
 			.map(update => (update.update as { content: { text: string } }).content.text);
