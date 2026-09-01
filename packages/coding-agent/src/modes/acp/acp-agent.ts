@@ -2671,8 +2671,13 @@ export class AcpAgent implements Agent {
 		}
 		const event = receivedSdkEvent(frame)?.event;
 		if (event?.type === "agent_start") {
-			record.busy = true;
 			const correlation = sdkFrameCorrelation(frame, event);
+			if (
+				correlation &&
+				record.settledPromptCorrelations.some(settled => correlationsExactlyMatch(settled, correlation))
+			)
+				return;
+			record.busy = true;
 			if (
 				!record.activePrompt ||
 				record.activePrompt.terminalReserved ||
