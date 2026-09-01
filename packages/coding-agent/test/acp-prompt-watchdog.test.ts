@@ -486,6 +486,33 @@ test("a prompt awaiting the model past the inference bound is rejected instead o
 	}
 });
 
+test("a foreign failed terminal cannot clear host busy before watchdog rejection", async () => {
+	const fixture = await createFixture();
+	try {
+		const { pending } = await startTurn(fixture);
+		const idleBefore = idleUpdates(fixture.updates);
+		fixture.send({
+			type: "agent_failed",
+			sessionId: fixture.sessionId,
+			commandId: "foreign-command",
+			turnId: "foreign-turn",
+			outcome: { kind: "failed", code: "prompt_failed", message: "foreign failure", provenance: "agent_failed" },
+		});
+		fixture.clock.advance(ACP_PROMPT_INFERENCE_TIMEOUT_MS + 1);
+		await bounded(
+			pending.then(
+				() => undefined,
+				() => undefined,
+			),
+			"watchdog rejection after foreign terminal",
+		);
+		expect(idleUpdates(fixture.updates)).toBe(idleBefore);
+		expect(workingUpdates(fixture.updates)).toBeGreaterThan(0);
+	} finally {
+		fixture.dispose();
+	}
+});
+
 test("a prompt refreshed by frames just under the bound is never rejected", async () => {
 	const fixture = await createFixture();
 	try {

@@ -2637,11 +2637,6 @@ export class AcpAgent implements Agent {
 		}
 		const event = receivedSdkEvent(frame)?.event;
 		if (event?.type === "agent_start") record.busy = true;
-		else if (
-			event?.type === "agent_end" ||
-			(event?.type === "agent_failed" && terminalOutcome(event)?.kind === "failed")
-		)
-			record.busy = false;
 	}
 
 	#frameProcessingFailure(error: unknown): AcpSdkAdapterError {
@@ -2806,6 +2801,7 @@ export class AcpAgent implements Agent {
 		const derivedCorrelation = sdkFrameCorrelation(frame, event);
 		const correlation = derivedCorrelation ?? {};
 		const activePrompt = record.activePrompt;
+		if (isTerminal && !hasCompleteCorrelation(correlation) && !activePrompt) record.busy = false;
 		let terminalPromptOwner: PromptWaiter | undefined;
 		const settledCorrelation = record.settledPromptCorrelations.some(settled =>
 			correlationsMatch(settled, correlation),
@@ -2830,6 +2826,7 @@ export class AcpAgent implements Agent {
 				return;
 			}
 			if (activePrompt.terminal) return;
+			record.busy = false;
 			terminalPromptOwner = activePrompt;
 			this.#advanceTerminalGeneration(record);
 			publicationGeneration = record.publicationGeneration;
