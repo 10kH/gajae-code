@@ -710,6 +710,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			};
 			let resolveH2: (() => void) | undefined;
 			let rejectH2: ((error: Error) => void) | undefined;
+			const inboundEnd = Promise.withResolvers<void>();
 			coordinator = new CursorRequestCoordinator(
 				h2Request,
 				stopHeartbeat,
@@ -734,7 +735,10 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			let currentTextBlock: (TextContent & { index: number }) | null = null;
 			let currentThinkingBlock: (ThinkingContent & { index: number }) | null = null;
 			let currentToolCall: ToolCallState | null = null;
-			const cachedConversationUsedTokens = cachedState?.tokenDetails?.usedTokens ?? 0;
+			const cachedConversationUsedTokens =
+				cachedState && countCursorHistoryTurns(context.messages) >= (cachedState.turns?.length ?? 0)
+					? (cachedState.tokenDetails?.usedTokens ?? 0)
+					: 0;
 			const usageState: UsageState = {
 				sawTokenDelta: false,
 				conversationUsedTokens: cachedConversationUsedTokens,
@@ -782,6 +786,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				}
 			});
 			h2Request.on("end", () => {
+				inboundEnd.resolve();
 				if (!coordinator.hasTurnEnded()) {
 					coordinator.fail(new Error("Cursor stream ended before turnEnded"));
 				}
@@ -883,6 +888,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					resolve();
 				}
 			});
+			await inboundEnd.promise;
 
 			if (state.currentTextBlock) {
 				const idx = output.content.indexOf(state.currentTextBlock);
@@ -3252,6 +3258,26 @@ function buildConversationTurns(messages: Message[], blobStore: Map<string, Uint
 	}
 
 	return turns;
+}
+
+function countCursorHistoryTurns(messages: Message[]): number {
+	let count = 0;
+	for (let i = 0; i < messages.length; i++) {
+		const message = messages[i];
+		if (
+			(message.role !== "user" && message.role !== "developer") ||
+			(extractUserMessageText(message).length === 0 && !hasUserMessageImages(message))
+		) {
+			continue;
+		}
+		for (let j = i + 1; j < messages.length; j++) {
+			if (messages[j].role === "user" || messages[j].role === "developer") {
+				count++;
+				break;
+			}
+		}
+	}
+	return count;
 }
 
 /** Exported for tests: decodes Cursor history blobs built from conversation messages. */
