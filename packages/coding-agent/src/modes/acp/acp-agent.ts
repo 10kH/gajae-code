@@ -3425,7 +3425,13 @@ export class AcpAgent implements Agent {
 			// the client transport. Its failure belongs to the drained prompt and must
 			// not tear down a successor that has since taken session ownership.
 			const current = this.#sessions.get(id);
-			if (current && current.adapter === record.adapter && current.activePrompt?.terminalReserved) return;
+			if (
+				publicationGeneration !== undefined &&
+				current &&
+				current.adapter === record.adapter &&
+				current.activePrompt?.terminalReserved
+			)
+				return;
 			if (publicationGeneration !== undefined && publicationGeneration !== record.publicationGeneration) return;
 			const failure = this.#frameProcessingFailure(error);
 			await this.#failSession(id, record.adapter, failure);

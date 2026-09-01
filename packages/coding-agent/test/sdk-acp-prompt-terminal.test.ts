@@ -1313,6 +1313,7 @@ test("ACP background publication failure remains fatal after a prompt generation
 		const pending = prompt(fixture, "prompt during failed background publication");
 		void pending.catch(() => undefined);
 		await bounded(fixture.promptDelivered, "prompt delivery");
+		fixture.sendStopped("end_turn");
 		fixture.releaseWorkingUpdate();
 		await expect(bounded(pending, "background publication session failure")).rejects.toMatchObject({
 			code: "frame_processing_failed",
