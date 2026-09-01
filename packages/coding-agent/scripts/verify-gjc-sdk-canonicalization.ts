@@ -1567,6 +1567,24 @@ function isTypeOnlyTmuxPrimitiveOccurrence(contents: string, occurrence: TmuxPri
 	return /^\s*(?:export\s+)?type\b/.test(contents.slice(lineStart, lineEnd === -1 ? contents.length : lineEnd));
 }
 
+function isExactTmuxSelfInjectionGuardVerb(
+	file: string,
+	contents: string,
+	occurrence: TmuxPrimitiveOccurrence,
+): boolean {
+	if (file !== "packages/coding-agent/src/tools/tmux-self-injection-guard.ts") return false;
+	const declaration = 'const INPUT_VERBS = new Set(["send-keys", "paste-buffer", "send-prefix"]);';
+	const declarationStart = contents.indexOf(declaration);
+	if (declarationStart === -1 || contents.indexOf(declaration, declarationStart + 1) !== -1) return false;
+	const references = [...contents.matchAll(/\bINPUT_VERBS\b/g)];
+	if (references.length !== 2) return false;
+	const guardUse = "INPUT_VERBS.has(invocation.verb)";
+	const guardUseStart = contents.indexOf(guardUse);
+	if (guardUseStart === -1 || contents.indexOf(guardUse, guardUseStart + 1) !== -1) return false;
+	if (!references.some(reference => reference.index === guardUseStart)) return false;
+	return occurrence.start >= declarationStart && occurrence.end <= declarationStart + declaration.length;
+}
+
 function tmuxMachineBusViolations(file: string, contents: string): string[] {
 	if (isGeneratedDocumentationIndex(file)) return [];
 	const allowedTeamFallbackRanges =
@@ -1581,7 +1599,8 @@ function tmuxMachineBusViolations(file: string, contents: string): string[] {
 		if (
 			isExactTeamFallback ||
 			isExactTmuxScrollCopyModeSendKeys(file, contents, occurrence) ||
-			isTypeOnlyTmuxPrimitiveOccurrence(contents, occurrence)
+			isTypeOnlyTmuxPrimitiveOccurrence(contents, occurrence) ||
+			isExactTmuxSelfInjectionGuardVerb(file, contents, occurrence)
 		)
 			continue;
 		const detail =
@@ -3143,6 +3162,21 @@ fi
 	await runSelfTestFixture(
 		{
 			"packages/coding-agent/src/unsanctioned.ts": 'Bun.spawnSync(["tmux", "send-keys", "-t", "pane", "prompt"]);\n',
+		},
+		1,
+		"tmux send-keys content injection is outside sanctioned process lifecycle",
+	);
+	await runSelfTestFixture(
+		{
+			"packages/coding-agent/src/tools/tmux-self-injection-guard.ts":
+				'const INPUT_VERBS = new Set(["send-keys", "paste-buffer", "send-prefix"]);\nfunction guarded(invocation: { verb: string }): void { if (!INPUT_VERBS.has(invocation.verb)) return; }\n',
+		},
+		0,
+	);
+	await runSelfTestFixture(
+		{
+			"packages/coding-agent/src/tools/tmux-self-injection-guard.ts":
+				'const INPUT_VERBS = new Set(["send-keys", "paste-buffer", "send-prefix"]);\nfunction guarded(invocation: { verb: string }): void { if (!INPUT_VERBS.has(invocation.verb)) return; }\nfor (const verb of INPUT_VERBS) Bun.spawnSync(["tmux", verb, "-t", pane, prompt]);\n',
 		},
 		1,
 		"tmux send-keys content injection is outside sanctioned process lifecycle",
