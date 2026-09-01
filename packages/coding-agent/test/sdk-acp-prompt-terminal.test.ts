@@ -823,6 +823,33 @@ test("ACP blocked generic failure diagnostic cannot delay authoritative agent_en
 	}
 });
 
+test("ACP reconnect retirement flushes buffered failure diagnostics", async () => {
+	const fixture = await createFixture();
+	try {
+		const pending = prompt(fixture, "diagnostic before reconnect");
+		await bounded(fixture.promptDelivered, "prompt delivery");
+		const updatesBefore = fixture.updates.length;
+		fixture.sendDiagnostic();
+		fixture.sendTerminal({ type: "hello", connectionId: "replacement-connection" });
+		await expect(bounded(pending, "reconnect prompt rejection")).rejects.toMatchObject({
+			code: "connection_closed",
+		});
+		await waitFor(
+			() =>
+				fixture.updates
+					.slice(updatesBefore)
+					.some(
+						update =>
+							update.update.sessionUpdate === "session_info_update" &&
+							(update.update as { _meta?: { gjcAgentFailed?: boolean } })._meta?.gjcAgentFailed === true,
+					),
+			"reconnect-retired failure diagnostic",
+		);
+	} finally {
+		fixture.dispose();
+	}
+});
+
 test("ACP terminal settlement does not await final-text delivery", async () => {
 	const fixture = await createFixture({ blockedAgentMessageText: "detached final report" });
 	const queryEntered = Promise.withResolvers<void>();

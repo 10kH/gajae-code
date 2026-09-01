@@ -2744,7 +2744,8 @@ export class AcpAgent implements Agent {
 	#enqueueSdkFrame(id: string, adapter: AcpSdkAdapter, frame: JsonObject): void {
 		const record = this.#sessions.get(id);
 		if (!record || record.adapter !== adapter) return;
-		if (typeof frame.connectionId === "string") record.connectionId = frame.connectionId;
+		if (frame.type !== "hello" && frame.type !== "server_hello" && typeof frame.connectionId === "string")
+			record.connectionId = frame.connectionId;
 		// Ingress ordering is recorded before queued work begins.
 		this.#observeSessionActivity(record, frame);
 		// Correlation is checked at ingress before a prompt-owned frame may refresh the
@@ -2784,6 +2785,7 @@ export class AcpAgent implements Agent {
 							"The prompt owner connection was lost before completion.",
 						),
 					);
+					this.#flushFailureDiagnostics(id, waiter, record.adapter);
 					// The turn is settled by the rejection; release the running phase
 					// best-effort so a cancelled prompt is not left reporting working.
 					void this.#publishPromptPhaseIdle(id, record.adapter);
