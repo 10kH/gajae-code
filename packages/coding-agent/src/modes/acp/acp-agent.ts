@@ -1808,7 +1808,7 @@ export class AcpAgent implements Agent {
 						? terminalOutcome(deferredEvent)
 						: undefined;
 				const deferredIsTerminal =
-					deferredEvent.type === "agent_end" ||
+					(deferredEvent.type === "agent_end" && deferredOutcome !== undefined) ||
 					(deferredEvent.type === "agent_failed" && deferredOutcome?.kind === "failed");
 				if (!hasCompleteCorrelation(deferredCorrelation)) {
 					if (deferredIsTerminal)
@@ -2785,7 +2785,7 @@ export class AcpAgent implements Agent {
 				? terminalOutcome(ingressEvent)
 				: undefined;
 		const ingressIsTerminal =
-			ingressEvent?.type === "agent_end" ||
+			(ingressEvent?.type === "agent_end" && ingressOutcome !== undefined) ||
 			(ingressEvent?.type === "agent_failed" && ingressOutcome?.kind === "failed");
 		const ingressCorrelation = ingressEvent ? sdkFrameCorrelation(frame, ingressEvent) : undefined;
 		if (
