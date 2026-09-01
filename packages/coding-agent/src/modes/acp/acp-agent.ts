@@ -2853,18 +2853,21 @@ export class AcpAgent implements Agent {
 		const derivedCorrelation = sdkFrameCorrelation(frame, event);
 		const correlation = derivedCorrelation ?? {};
 		const activePrompt = record.activePrompt;
-		if (isTerminal && !hasCompleteCorrelation(correlation) && !activePrompt) {
-			record.busy = false;
-			record.backgroundBusy = false;
-		}
 		let terminalPromptOwner: PromptWaiter | undefined;
 		const settledCorrelation = record.settledPromptCorrelations.some(settled =>
 			correlationsMatch(settled, correlation),
 		);
 		if (isTerminal) {
+			if (!activePrompt) {
+				if (settledCorrelation || (hasCorrelation(correlation) && !hasCompleteCorrelation(correlation))) return;
+				record.busy = false;
+				record.backgroundBusy = false;
+				await this.#publishPromptPhase(id, record.adapter, undefined);
+				return;
+			}
 			// Terminal ownership requires a complete identity. Unowned, partial, and
 			// duplicate terminals are never allowed to publish or query anything.
-			if (!activePrompt || activePrompt.settled) return;
+			if (activePrompt.settled) return;
 			if (!hasCompleteCorrelation(correlation)) {
 				logDroppedPromptTerminal(id, event, "incomplete_correlation", correlation, activePrompt.correlation);
 				return;
