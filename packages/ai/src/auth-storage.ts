@@ -4945,7 +4945,9 @@ export class AuthStorage {
 						!refreshedCredentials.persistedByLease,
 						credentialId,
 					);
-				} catch {}
+				} catch (error) {
+					if (isSqliteError(error)) throw error;
+				}
 			}),
 		);
 

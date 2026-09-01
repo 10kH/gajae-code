@@ -223,13 +223,17 @@ describe("credential SQLite corruption classification", () => {
 			expires: Date.now() - 60_000,
 			email: "refresh@example.test",
 		});
+		let refreshCalls = 0;
 		const authStorage = new AuthStorage(store, {
-			refreshOAuthCredential: async () => ({
-				access: "fresh-access",
-				refresh: "fresh-refresh",
-				expires: Date.now() + 60_000,
-				email: "refresh@example.test",
-			}),
+			refreshOAuthCredential: async () => {
+				refreshCalls += 1;
+				return {
+					access: "fresh-access",
+					refresh: "fresh-refresh",
+					expires: Date.now() + 60_000,
+					email: "refresh@example.test",
+				};
+			},
 		});
 		await authStorage.reload();
 		store.updateAuthCredential = () => {
@@ -237,6 +241,7 @@ describe("credential SQLite corruption classification", () => {
 		};
 
 		await expect(authStorage.getApiKey("anthropic")).rejects.toMatchObject({ code });
+		expect(refreshCalls).toBe(1);
 		store.close();
 	});
 
