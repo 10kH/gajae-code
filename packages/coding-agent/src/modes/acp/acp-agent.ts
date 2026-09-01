@@ -3186,6 +3186,7 @@ export class AcpAgent implements Agent {
 		if (!ownsCurrentGeneration()) return;
 		const record = this.#sessions.get(id);
 		if (!record || record.adapter !== adapter) return;
+		const observedPhaseOwner = this.#promptPhaseOwner(record);
 		const publishTask = (async () => {
 			if (typeof usage?.tokens === "number" && typeof usage.contextWindow === "number") {
 				await this.#publishSessionUpdate(
@@ -3219,6 +3220,9 @@ export class AcpAgent implements Agent {
 				adapter,
 				publicationGeneration,
 			);
+			const current = this.#sessions.get(id);
+			if (current && this.#promptPhaseOwner(current) !== observedPhaseOwner)
+				await this.#publishPromptPhase(id, current.adapter, this.#promptPhaseOwner(current));
 		})();
 		let metadataTail: Promise<void>;
 		metadataTail = publishTask.finally(() => {

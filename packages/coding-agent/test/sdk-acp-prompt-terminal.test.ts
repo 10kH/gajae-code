@@ -1016,10 +1016,45 @@ test("ACP successor waits only while ready predecessor metadata is being deliver
 		await expect(prompt(fixture, "successor blocked by metadata delivery")).rejects.toMatchObject({
 			code: "conflict",
 		});
+		const idleBeforeRelease = idlePhaseUpdates(fixture.updates);
 		fixture.releaseIdleUpdate();
+		await waitFor(() => idlePhaseUpdates(fixture.updates) > idleBeforeRelease, "released stale idle metadata");
 		const { pending: successor } = await promptWhenDelivered(fixture, "successor after metadata delivery", 2);
 		fixture.sendStopped("end_turn");
 		expect(await bounded(successor, "successor after metadata delivery")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		fixture.releaseIdleUpdate();
+		fixture.dispose();
+	}
+});
+
+test("ACP background start during metadata delivery reconverges to working", async () => {
+	const fixture = await createFixture({ blockIdleUpdate: true });
+	try {
+		const first = prompt(fixture, "background during metadata delivery");
+		await bounded(fixture.promptDelivered, "first prompt delivery");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(first, "first terminal settlement")).toEqual({ stopReason: "end_turn" });
+		await bounded(fixture.idleUpdateEntered, "entered predecessor metadata delivery");
+		fixture.sendTerminal({ type: "agent_start", sessionId: "prompt-terminal-session" });
+		await waitFor(
+			() =>
+				fixture.updates
+					.filter(update => update.update.sessionUpdate === "session_info_update")
+					.map(update => (update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase)
+					.at(-1) === "working",
+			"initial background working phase",
+		);
+		fixture.releaseIdleUpdate();
+		await waitFor(
+			() =>
+				fixture.updates
+					.filter(update => update.update.sessionUpdate === "session_info_update")
+					.map(update => (update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase)
+					.at(-1) === "working",
+			"reconciled background working phase",
+		);
+		fixture.sendTerminal({ type: "agent_end", sessionId: "prompt-terminal-session" });
 	} finally {
 		fixture.releaseIdleUpdate();
 		fixture.dispose();
