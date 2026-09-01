@@ -1201,6 +1201,10 @@ export class AcpAgent implements Agent {
 	readonly #terminalMetadataTails = new Map<string, Promise<void>>();
 	/** Unstreamed terminal text retains transcript ownership across same-id replacement. */
 	readonly #finalTextTails = new Map<string, Promise<void>>();
+	/** Generic failure diagnostics publish independently from authoritative terminal ingress. */
+	readonly #failureDiagnosticTails = new Map<string, Promise<void>>();
+	/** Prompt phase writes retain ordering across same-id record replacement. */
+	readonly #promptPhaseTails = new Map<string, Promise<void>>();
 	readonly #attaching = new Map<string, PendingAttachment>();
 	readonly #resolvingExisting = new Map<string, PendingAttachment>();
 	readonly #knownSessionCwds = new Map<string, string>();
@@ -1603,6 +1607,13 @@ export class AcpAgent implements Agent {
 			throw new AcpSdkAdapterError("conflict", "ACP session is still publishing the previous prompt's final text.");
 		if (this.#terminalMetadataTails.has(params.sessionId))
 			throw new AcpSdkAdapterError("conflict", "ACP session is still publishing the previous prompt's metadata.");
+		if (this.#failureDiagnosticTails.has(params.sessionId))
+			throw new AcpSdkAdapterError(
+				"conflict",
+				"ACP session is still publishing the previous prompt's failure diagnostic.",
+			);
+		if (this.#promptPhaseTails.has(params.sessionId))
+			throw new AcpSdkAdapterError("conflict", "ACP session is still publishing the previous prompt's phase.");
 
 		const payload = acpPromptPayload(params.prompt);
 		const skillInvocation = acpSkillInvocation(params.prompt);
@@ -2896,12 +2907,15 @@ export class AcpAgent implements Agent {
 			// a second session update after settlement would be stale as soon as the client
 			// starts a replacement turn, and an in-flight transport write cannot be revoked.
 			if (!(event.type === "agent_failed" && isTerminal))
-				await this.#publishSessionUpdate(
-					id,
-					notification,
-					adapter,
-					promptOwner ? publicationGeneration : undefined,
-				);
+				if (event.type === "agent_failed" && promptOwner)
+					this.#scheduleFailureDiagnostic(id, notification, adapter, publicationGeneration);
+				else
+					await this.#publishSessionUpdate(
+						id,
+						notification,
+						adapter,
+						promptOwner ? publicationGeneration : undefined,
+					);
 		}
 		if (toolCallId && event.type === "tool_execution_end") record.toolArgs.delete(toolCallId);
 		if (event.type === "agent_start") {
@@ -2924,6 +2938,27 @@ export class AcpAgent implements Agent {
 			else record.sessionMessageProgress = undefined;
 		}
 		if (isTerminal) this.#scheduleTerminalUpdates(id, adapter, publicationGeneration, event, promptOwner);
+	}
+
+	#scheduleFailureDiagnostic(
+		id: string,
+		notification: SessionNotification,
+		adapter: AcpSdkAdapter,
+		publicationGeneration: number,
+	): void {
+		const prior = this.#failureDiagnosticTails.get(id) ?? Promise.resolve();
+		const task = prior.then(
+			async () => await this.#publishSessionUpdate(id, notification, adapter, publicationGeneration),
+		);
+		let tail: Promise<void>;
+		tail = task
+			.catch(error => {
+				logger.warn("acp_failure_diagnostic_update_failed", { sessionId: id, error: String(error) });
+			})
+			.finally(() => {
+				if (this.#failureDiagnosticTails.get(id) === tail) this.#failureDiagnosticTails.delete(id);
+			});
+		this.#failureDiagnosticTails.set(id, tail);
 	}
 
 	#scheduleTerminalUpdates(
@@ -3030,6 +3065,23 @@ export class AcpAgent implements Agent {
 		adapter: AcpSdkAdapter,
 		observedPrompt: PromptWaiter | undefined,
 	): Promise<void> {
+		const pending = this.#promptPhaseTails.get(id);
+		if (pending) {
+			await pending;
+			const current = this.#sessions.get(id);
+			if (current) await this.#publishPromptPhase(id, current.adapter, current.activePrompt);
+			return;
+		}
+		const task = this.#runPromptPhase(id, adapter, observedPrompt);
+		let tail: Promise<void>;
+		tail = task.finally(() => {
+			if (this.#promptPhaseTails.get(id) === tail) this.#promptPhaseTails.delete(id);
+		});
+		this.#promptPhaseTails.set(id, tail);
+		await tail;
+	}
+
+	async #runPromptPhase(id: string, adapter: AcpSdkAdapter, observedPrompt: PromptWaiter | undefined): Promise<void> {
 		try {
 			for (;;) {
 				await this.#connection.sessionUpdate({
@@ -3887,6 +3939,8 @@ export class AcpAgent implements Agent {
 		this.#retiredPromptAcknowledgements.clear();
 		this.#terminalMetadataTails.clear();
 		this.#finalTextTails.clear();
+		this.#failureDiagnosticTails.clear();
+		this.#promptPhaseTails.clear();
 		this.#pendingDeleteLocators.clear();
 		this.#pendingCloseIdempotencyKeys.clear();
 		if (this.#lifecycleOperations.size === 0) this.#lifecycleOperations.clear();
