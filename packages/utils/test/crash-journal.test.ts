@@ -7,6 +7,7 @@ import {
 	appendCrashEvent,
 	CRASH_EVENT_MAX_BYTES,
 	type CrashOccurrenceEvent,
+	detectCrashProvenance,
 	formatCrashEventLine,
 	parseCrashEventLine,
 } from "../src/crash-journal";
@@ -32,9 +33,21 @@ function occurrence(overrides: Partial<CrashOccurrenceEvent> = {}): CrashOccurre
 }
 
 describe("crash event line", () => {
+	it("classifies explicit eval and inherited Bun test children without changing product defaults", () => {
+		expect(detectCrashProvenance([], {}, ["-e", "throw new Error()"])).toBe("eval");
+		expect(detectCrashProvenance(["gjc"], { BUN_TEST: "1" }, ["script.ts"])).toBe("bun_test");
+		expect(detectCrashProvenance(["gjc", "launch"], {}, ["script.ts"])).toBe("product");
+	});
+
 	it("round-trips an occurrence", () => {
 		const line = formatCrashEventLine(occurrence());
 		expect(parseCrashEventLine(line)).toEqual(occurrence());
+	});
+
+	it("round-trips non-product provenance while legacy events remain unchanged", () => {
+		const event = occurrence({ provenance: "bun_test" });
+		expect(parseCrashEventLine(formatCrashEventLine(event))).toEqual(event);
+		expect(parseCrashEventLine(formatCrashEventLine(occurrence()))).toEqual(occurrence());
 	});
 
 	it("keeps a hostile oversized message inside the 512-byte line budget", () => {
@@ -104,6 +117,34 @@ describe("appendCrashEvent", () => {
 });
 
 describe("recordFatalCrash identity", () => {
+	it("marks eval and inherited Bun test children while leaving a CLI script as product", () => {
+		const dir = tempDir();
+		const modulePath = path.resolve(import.meta.dir, "../src/postmortem.ts");
+		const run = (args: string[], env: Record<string, string>, suffix: string) => {
+			const target = path.join(dir, `${suffix}.log`);
+			const journal = path.join(dir, "gjc-crash-events.jsonl");
+			const source =
+				`import { recordFatalCrash } from ${JSON.stringify(modulePath)};\n` +
+				`recordFatalCrash("Uncaught Exception", new Error("${suffix}"), { path: ${JSON.stringify(target)} });\n`;
+			const script = path.join(dir, `${suffix}.ts`);
+			fs.writeFileSync(script, source);
+			const spawned = Bun.spawnSync({
+				cmd: args.length === 0 ? [process.execPath, script] : [process.execPath, ...args],
+				env,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			expect(spawned.exitCode).toBe(0);
+			const event = parseCrashEventLine(fs.readFileSync(journal, "utf8").split("\n").filter(Boolean).at(-1) ?? "");
+			return event?.kind === "occurrence" ? event.provenance : undefined;
+		};
+		const cleanEnv = { ...process.env } as Record<string, string>;
+		delete cleanEnv.BUN_TEST;
+		expect(run(["-e", `await import(${JSON.stringify(path.join(dir, "eval.ts"))})`], cleanEnv, "eval")).toBe("eval");
+		expect(run([], { ...cleanEnv, BUN_TEST: "1" }, "bun-test")).toBe("bun_test");
+		expect(run([], cleanEnv, "cli")).toBeUndefined();
+	});
+
 	it("appends a parseable identity line and journals the occurrence beside the log", () => {
 		const dir = tempDir();
 		const target = path.join(dir, "gjc-crash.log");

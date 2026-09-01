@@ -15,6 +15,7 @@ import {
 	CRASH_FINGERPRINT_VERSION,
 	CRASH_RECORD_MARKER,
 	type CrashFingerprint,
+	type CrashProvenance,
 	computeCrashFingerprint,
 	parseCrashRecordMarker,
 } from "@gajae-code/utils";
@@ -33,6 +34,7 @@ export interface LoadedCrashRecord {
 	readonly body: string;
 	/** The `Name: message` part of the header line. */
 	readonly headline: string;
+	readonly provenance?: CrashProvenance;
 }
 
 interface ParsedCrashRecord {
@@ -78,6 +80,7 @@ function parseCandidates(contents: string): ParsedCrashRecord[] {
 	let at = 0;
 	let buffer: string[] = [];
 	let started = false;
+	let provenance: CrashProvenance | undefined;
 	let pending: ParsedCrashRecord | undefined;
 	for (const line of contents.split("\n")) {
 		if (pending) {
@@ -92,6 +95,12 @@ function parseCandidates(contents: string): ParsedCrashRecord[] {
 				continue;
 			}
 			headline = header[2] ?? "";
+			const label = line.slice(line.indexOf("[") + 1, line.indexOf("]"));
+			const provenanceValue = label
+				.split(";")
+				.find(part => part.startsWith("provenance="))
+				?.slice(11);
+			provenance = provenanceValue === "eval" || provenanceValue === "bun_test" ? provenanceValue : undefined;
 			at = parsedAt;
 			buffer = [];
 			started = true;
@@ -116,6 +125,7 @@ function parseCandidates(contents: string): ParsedCrashRecord[] {
 						messageClass: fingerprint?.messageClass ?? "",
 						body: lines.join("\n").trimEnd(),
 						headline,
+						...(provenance === undefined ? {} : { provenance }),
 					},
 					complete: false,
 					bound: marker.version === CRASH_FINGERPRINT_VERSION && fingerprint !== undefined,

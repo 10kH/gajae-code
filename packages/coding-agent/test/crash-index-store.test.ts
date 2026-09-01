@@ -17,6 +17,7 @@ import {
 	type CrashSignatureEntry,
 	type CrashStatePaths,
 	compactCrashIndex,
+	emptyCrashIndex,
 	listCrashSignatures,
 	parseCrashIndex,
 	readCrashIndex,
@@ -89,6 +90,20 @@ describe("compactCrashIndex", () => {
 		// Re-running with an empty journal must not change counts.
 		const again = await compactCrashIndex({ paths, now: NOW });
 		expect(again.signatures[fingerprintFor(1)]?.lifetimeCount).toBe(8);
+	});
+
+	it("excludes eval and Bun test occurrences without changing legacy or product events", () => {
+		const index = emptyCrashIndex();
+		expect(applyCrashEvent(index, { ...occurrence(fingerprintFor(90), recordId(90)), provenance: "eval" }, NOW)).toBe(
+			false,
+		);
+		expect(
+			applyCrashEvent(index, { ...occurrence(fingerprintFor(91), recordId(91)), provenance: "bun_test" }, NOW),
+		).toBe(false);
+		expect(applyCrashEvent(index, occurrence(fingerprintFor(92), recordId(92)), NOW)).toBe(true);
+		expect(index.signatures[fingerprintFor(90)]).toBeUndefined();
+		expect(index.signatures[fingerprintFor(91)]).toBeUndefined();
+		expect(index.signatures[fingerprintFor(92)]?.lifetimeCount).toBe(1);
 	});
 
 	it("keeps a maximum-sized legacy entry readable after a later occurrence compaction", async () => {
