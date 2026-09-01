@@ -341,9 +341,18 @@ class CursorRequestCoordinator implements CursorRequestWriter {
 
 	admit(taskFactory: () => Promise<void>): void {
 		if (!this.canAdmitTask()) return;
+		this.#admitOrdered(taskFactory, false);
+	}
+
+	admitCheckpoint(taskFactory: () => Promise<void>): Promise<void> {
+		if (this.#state === "failed") return Promise.reject(this.#failure ?? new Error("Cursor request failed"));
+		return this.#admitOrdered(taskFactory, true);
+	}
+
+	#admitOrdered(taskFactory: () => Promise<void>, allowAfterSuccess: boolean): Promise<void> {
 		const orderedTask = this.#hasAdmittedTask
 			? this.#taskChain.then(() => {
-					if (this.#state === "failed" || this.#state === "succeeded") return;
+					if (this.#state === "failed" || (!allowAfterSuccess && this.#state === "succeeded")) return;
 					return taskFactory();
 				})
 			: taskFactory();
@@ -359,6 +368,7 @@ class CursorRequestCoordinator implements CursorRequestWriter {
 			() => this.#tasks.delete(orderedTask),
 			() => this.#tasks.delete(orderedTask),
 		);
+		return orderedTask;
 	}
 
 	turnEnded(): void {
@@ -670,8 +680,8 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 
 			const conversationId = options?.conversationId ?? options?.sessionId ?? crypto.randomUUID();
 			activeConversationId = conversationId;
-			const blobStore = conversationBlobStores.get(conversationId) ?? new Map<string, Uint8Array>();
-			conversationBlobStores.set(conversationId, blobStore);
+			const cachedBlobStore = conversationBlobStores.get(conversationId);
+			const blobStore = new Map(cachedBlobStore);
 			const cachedState = conversationStateCache.get(conversationId);
 			previousConversationState = cachedState;
 			const usageContext = buildCursorUsageContext(context, model, options);
@@ -685,7 +695,6 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				conversationState: reusableCachedState,
 			});
 			conversationStateCache.set(conversationId, conversationState);
-			touchCursorConversation(conversationId);
 			const requestContextTools = buildMcpToolDefinitions(context.tools);
 			const targetUrl = new URL(baseUrl);
 			const proxyUrl = getProxyForUrl(model.provider, targetUrl);
@@ -772,6 +781,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			stream.push({ type: "start", partial: output });
 
 			let pendingBuffer = Buffer.alloc(0);
+			const checkpointTasks: Promise<void>[] = [];
 			let currentTextBlock: (TextContent & { index: number }) | null = null;
 			let currentThinkingBlock: (ThinkingContent & { index: number }) | null = null;
 			let currentToolCall: ToolCallState | null = null;
@@ -831,7 +841,9 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				}
 			});
 			h2Request.on("close", () => {
-				if (!inboundSettled) settleInbound(new Error("Cursor stream closed before inbound completion"));
+				const error = new Error("Cursor stream closed before inbound completion");
+				if (!inboundSettled) settleInbound(error);
+				coordinator.fail(error);
 			});
 			onAbort = () => {
 				settleInbound(new Error("Request was aborted"));
@@ -870,11 +882,16 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 							serverMessage.message.value.message?.case === "turnEnded";
 						const isConversationCheckpoint = serverMessage.message.case === "conversationCheckpointUpdate";
 						if (isConversationCheckpoint) {
-							handleConversationCheckpointUpdate(
-								serverMessage.message.value as ConversationStateStructure,
-								output,
-								usageState,
-								onConversationCheckpoint,
+							checkpointTasks.push(
+								coordinator.admitCheckpoint(() => {
+									handleConversationCheckpointUpdate(
+										serverMessage.message.value as ConversationStateStructure,
+										output,
+										usageState,
+										onConversationCheckpoint,
+									);
+									return Promise.resolve();
+								}),
 							);
 							continue;
 						}
@@ -933,6 +950,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			});
 			armInboundTimeout();
 			await inboundEnd.promise;
+			await Promise.all(checkpointTasks);
 
 			if (state.currentTextBlock) {
 				const idx = output.content.indexOf(state.currentTextBlock);
@@ -994,6 +1012,8 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				...usageContext,
 				messageKeys: [...usageContext.messageKeys, hashCursorUsageMessage(output)],
 			});
+			conversationBlobStores.set(conversationId, blobStore);
+			touchCursorConversation(conversationId);
 			calculateCost(model, output.usage);
 
 			output.duration = Date.now() - startTime;
