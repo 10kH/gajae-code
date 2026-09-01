@@ -533,14 +533,14 @@ export function createSpawnSubstrateProvider(
 				const afterSignalFailure = await verifyAfterSignal();
 				return afterSignalFailure === "gone" ? { ok: true } : closeFailure(afterSignalFailure);
 			}
-			const afterTerm = await waitForHeadlessExit(proof, provider.verify, sleep);
+			const afterTerm = await waitForHeadlessExit(proof, verifyAfterSignal, sleep);
 			if (afterTerm === "gone") return { ok: true };
 			if (afterTerm !== "verified") return closeFailure(afterTerm);
 			if (!signalHeadless(proof.pid, proof.processIncarnation, platform, "SIGKILL")) {
 				const afterSignalFailure = await verifyAfterSignal();
 				return afterSignalFailure === "gone" ? { ok: true } : closeFailure(afterSignalFailure);
 			}
-			const afterKill = await waitForHeadlessExit(proof, provider.verify, sleep);
+			const afterKill = await waitForHeadlessExit(proof, verifyAfterSignal, sleep);
 			return afterKill === "gone" ? { ok: true } : closeFailure(afterKill);
 		},
 	};

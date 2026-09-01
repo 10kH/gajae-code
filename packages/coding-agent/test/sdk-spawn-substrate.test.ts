@@ -306,11 +306,10 @@ describe("Broker spawn substrate provider", () => {
 			isProcessGone: () => !live,
 			signalHeadless: () => {
 				live = false;
-				if (stateFile) void fs.rm(stateFile, { force: true });
 				return true;
 			},
 			sleep: async () => {
-				await Bun.sleep(0);
+				if (stateFile) await fs.rm(stateFile, { force: true });
 			},
 		});
 		const launched = await provider.launch(launchSpec(cwd));
