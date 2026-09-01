@@ -56,13 +56,13 @@ async function corruptIndexRootPage(dbPath: string, indexName: string): Promise<
 	} finally {
 		database.close();
 	}
-	const fileBytes = await fs.readFile(dbPath);
+	const fileBytes = new Uint8Array(await Bun.file(dbPath).arrayBuffer());
 	const bytes = Buffer.alloc(fileBytes.byteLength);
-	fileBytes.copy(bytes);
+	bytes.set(fileBytes);
 	const pageOffset = (rootPage - 1) * pageSize;
 	expect(bytes[pageOffset]).toBe(2);
 	bytes[pageOffset] = 0;
-	await fs.writeFile(dbPath, bytes);
+	await Bun.write(dbPath, bytes);
 	return bytes;
 }
 
@@ -129,7 +129,7 @@ describe("credential SQLite corruption classification", () => {
 		validStore.close();
 
 		const corruptPath = path.join(root, "corrupt.db");
-		await fs.copyFile(validPath, corruptPath);
+		await Bun.write(corruptPath, Bun.file(validPath));
 		await corruptIndexRootPage(corruptPath, "idx_auth_provider");
 		const corruptStore = await SqliteAuthCredentialStore.open(corruptPath);
 		const corruptError = captureSqliteError(() => corruptStore.listCredentialInventory("anthropic"));
@@ -138,7 +138,7 @@ describe("credential SQLite corruption classification", () => {
 		expect(isSqliteCorruptionError(corruptError)).toBe(true);
 
 		const notDatabasePath = path.join(root, "not-a-database.db");
-		await fs.writeFile(notDatabasePath, "not a database token=credential-secret");
+		await Bun.write(notDatabasePath, "not a database token=credential-secret");
 		const notDatabaseError = await captureOpenError(notDatabasePath);
 		expect(notDatabaseError).toMatchObject({ code: "SQLITE_NOTADB" });
 		expect(isSqliteCorruptionError(notDatabaseError)).toBe(true);
@@ -152,7 +152,7 @@ describe("credential SQLite corruption classification", () => {
 		expect(isSqliteCorruptionError(malformedError)).toBe(false);
 
 		const busyPath = path.join(root, "busy.db");
-		await fs.copyFile(validPath, busyPath);
+		await Bun.write(busyPath, Bun.file(validPath));
 		const lock = new Database(busyPath);
 		lock.run("PRAGMA journal_mode=DELETE");
 		lock.run("BEGIN EXCLUSIVE");
@@ -388,7 +388,7 @@ describe("credential corruption presentation", () => {
 		expect(errors).toEqual([CREDENTIAL_STORE_UNREADABLE_MESSAGE]);
 		expect(errors[0]!.length).toBeLessThanOrEqual(256);
 		expect(errors[0]).not.toMatch(/SQLITE_|database disk image|access-|refresh-|example\.test/);
-		expect(await fs.readFile(dbPath)).toEqual(corruptedBytes);
+		expect(Buffer.from(await Bun.file(dbPath).arrayBuffer())).toEqual(corruptedBytes);
 		store.close();
 	});
 
@@ -398,7 +398,7 @@ describe("credential corruption presentation", () => {
 		const dbPath = path.join(agentDir, "agent.db");
 		await fs.mkdir(agentDir, { recursive: true });
 		const original = Buffer.from("not a database token=credential-secret");
-		await fs.writeFile(dbPath, original);
+		await Bun.write(dbPath, original);
 
 		const text = await runAccounts(agentDir, ["list"]);
 		expect(text.exitCode).toBe(1);
@@ -406,7 +406,7 @@ describe("credential corruption presentation", () => {
 		expect(text.stderr).toBe(`${CREDENTIAL_STORE_UNREADABLE_MESSAGE}\n`);
 		expect(text.stderr.length).toBeLessThanOrEqual(512);
 		expect(text.stderr).not.toMatch(/credential-secret|SQLITE_|file is not a database/);
-		expect(await fs.readFile(dbPath)).toEqual(original);
+		expect(Buffer.from(await Bun.file(dbPath).arrayBuffer())).toEqual(original);
 
 		const json = await runAccounts(agentDir, ["list", "--json"]);
 		expect(json.exitCode).toBe(1);
@@ -417,6 +417,6 @@ describe("credential corruption presentation", () => {
 		});
 		expect(json.stdout.length).toBeLessThanOrEqual(768);
 		expect(json.stdout).not.toMatch(/credential-secret|SQLITE_|file is not a database/);
-		expect(await fs.readFile(dbPath)).toEqual(original);
+		expect(Buffer.from(await Bun.file(dbPath).arrayBuffer())).toEqual(original);
 	});
 });
