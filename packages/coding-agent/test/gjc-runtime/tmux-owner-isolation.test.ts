@@ -213,7 +213,7 @@ describe("tmux owner isolation", () => {
 			const privateMarker = "private-payload-must-not-appear";
 			const result = await runOwnerIsolationEntry(command, `{"private":"${privateMarker}"}\n`);
 			expect(result).toEqual({
-				exitCode: 0,
+				exitCode: 1,
 				stdout: invalidJsonLineResponse,
 				stderr: "",
 			});
@@ -317,7 +317,7 @@ describe("tmux owner isolation", () => {
 			'{"private":"private-payload-must-not-appear"}\nextra\n',
 		);
 		expect(result).toEqual({
-			exitCode: 0,
+			exitCode: 1,
 			stdout: invalidJsonLineResponse,
 			stderr: "",
 		});
@@ -329,7 +329,7 @@ describe("tmux owner isolation", () => {
 			`${"x".repeat(TMUX_OWNER_ISOLATION_MAX_LINE_BYTES + 1)}\n`,
 		);
 		expect(result).toEqual({
-			exitCode: 0,
+			exitCode: 1,
 			stdout: invalidJsonLineResponse,
 			stderr: "",
 		});
