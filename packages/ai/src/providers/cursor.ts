@@ -77,6 +77,7 @@ import {
 	type ConversationStateStructure,
 	ConversationStateStructureSchema,
 	ConversationStepSchema,
+	ConversationTokenDetailsSchema,
 	ConversationTurnStructureSchema,
 	CursorRuleSchema,
 	CursorRuleSource,
@@ -654,6 +655,9 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		let onAbort: (() => void) | undefined;
 		let coordinator: CursorRequestCoordinator = undefined!;
 		const baseUrl = model.baseUrl || CURSOR_API_URL;
+		let activeConversationId: string | undefined;
+		let previousConversationState: ConversationStateStructure | undefined;
+		let previousUsageContext: CursorUsageContext | undefined;
 
 		try {
 			const apiKey = options?.apiKey;
@@ -665,11 +669,13 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			}
 
 			const conversationId = options?.conversationId ?? options?.sessionId ?? crypto.randomUUID();
+			activeConversationId = conversationId;
 			const blobStore = conversationBlobStores.get(conversationId) ?? new Map<string, Uint8Array>();
 			conversationBlobStores.set(conversationId, blobStore);
 			const cachedState = conversationStateCache.get(conversationId);
-			const usageContext = buildCursorUsageContext(context, model);
-			const previousUsageContext = conversationUsageContextCache.get(conversationId);
+			previousConversationState = cachedState;
+			const usageContext = buildCursorUsageContext(context, model, options);
+			previousUsageContext = conversationUsageContextCache.get(conversationId);
 			conversationUsageContextCache.set(conversationId, usageContext);
 			const { requestBytes, conversationState } = buildGrpcRequest(model, context, options, {
 				conversationId,
@@ -806,8 +812,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			};
 
 			const onConversationCheckpoint = (checkpoint: ConversationStateStructure) => {
-				conversationStateCache.set(conversationId, checkpoint);
-				touchCursorConversation(conversationId);
+				usageState.pendingCheckpoint = checkpoint;
 			};
 
 			h2Request.on("trailers", trailers => {
@@ -960,6 +965,21 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			}
 
 			finalizeCursorUsage(output, usageState);
+			const stateToCommit =
+				usageState.pendingCheckpoint ?? conversationStateCache.get(conversationId) ?? conversationState;
+			if (usageState.hasConversationCheckpoint || usageState.conversationUsedTokens > 0) {
+				conversationStateCache.set(
+					conversationId,
+					create(ConversationStateStructureSchema, {
+						...stateToCommit,
+						tokenDetails: create(ConversationTokenDetailsSchema, {
+							usedTokens: output.usage.totalTokens,
+							maxTokens: stateToCommit.tokenDetails?.maxTokens ?? 0,
+						}),
+					}),
+				);
+				touchCursorConversation(conversationId);
+			}
 			conversationUsageContextCache.set(conversationId, {
 				...usageContext,
 				messageKeys: [...usageContext.messageKeys, hashCursorUsageMessage(output)],
@@ -975,6 +995,12 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			});
 			stream.end();
 		} catch (error) {
+			if (activeConversationId) {
+				if (previousConversationState) conversationStateCache.set(activeConversationId, previousConversationState);
+				else conversationStateCache.delete(activeConversationId);
+				if (previousUsageContext) conversationUsageContextCache.set(activeConversationId, previousUsageContext);
+				else conversationUsageContextCache.delete(activeConversationId);
+			}
 			// Keep the completion promise terminal even for synchronous setup/write
 			// failures that may not emit a separate HTTP/2 error event.
 			const mappedError = mapH2TransportError(coordinator?.failureError() ?? error, baseUrl);
@@ -1033,11 +1059,13 @@ interface UsageState {
 	checkpointOutputTokens: number;
 	/** Whether the current stream received a checkpoint, including an explicit zero. */
 	hasConversationCheckpoint: boolean;
+	pendingCheckpoint?: ConversationStateStructure;
 }
 
 interface CursorUsageContext {
 	modelKey: string;
 	systemPromptKey: string;
+	customSystemPromptKey: string;
 	messageKeys: string[];
 }
 
@@ -3307,10 +3335,15 @@ function buildConversationTurns(messages: Message[], blobStore: Map<string, Uint
 	return turns;
 }
 
-function buildCursorUsageContext(context: Context, model: Model<"cursor-agent">): CursorUsageContext {
+function buildCursorUsageContext(
+	context: Context,
+	model: Model<"cursor-agent">,
+	options: CursorOptions | undefined,
+): CursorUsageContext {
 	return {
 		modelKey: hashCursorUsageValue({ provider: model.provider, id: model.id, wireModelId: model.wireModelId }),
 		systemPromptKey: hashCursorUsageValue(context.systemPrompt ?? []),
+		customSystemPromptKey: hashCursorUsageValue(options?.customSystemPrompt ?? ""),
 		messageKeys: context.messages.map(message => hashCursorUsageMessage(message)),
 	};
 }
@@ -3326,7 +3359,12 @@ function hashCursorUsageValue(value: unknown): string {
 }
 
 function canReuseCursorUsageContext(previous: CursorUsageContext | undefined, current: CursorUsageContext): boolean {
-	if (!previous || previous.modelKey !== current.modelKey || previous.systemPromptKey !== current.systemPromptKey)
+	if (
+		!previous ||
+		previous.modelKey !== current.modelKey ||
+		previous.systemPromptKey !== current.systemPromptKey ||
+		previous.customSystemPromptKey !== current.customSystemPromptKey
+	)
 		return false;
 	if (previous.messageKeys.length > current.messageKeys.length) return false;
 	return previous.messageKeys.every((key, index) => key === current.messageKeys[index]);
