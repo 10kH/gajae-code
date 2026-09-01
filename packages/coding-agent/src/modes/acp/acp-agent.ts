@@ -1792,7 +1792,12 @@ export class AcpAgent implements Agent {
 			let observedDeferredActivity = false;
 			for (const deferredFrame of deferredActivityFrames) {
 				const deferredEvent = receivedSdkEvent(deferredFrame)?.event;
-				if (correlationsExactlyMatch(waiter.correlation, watchdogCorrelationFrom(deferredFrame, deferredEvent))) {
+				const matchesWaiter = correlationsExactlyMatch(
+					waiter.correlation,
+					watchdogCorrelationFrom(deferredFrame, deferredEvent),
+				);
+				if (deferredEvent?.type === "agent_start" && !matchesWaiter) record.backgroundBusy = true;
+				if (matchesWaiter) {
 					this.#observePromptActivity(waiter, deferredFrame);
 					observedDeferredActivity = true;
 				}
@@ -2667,7 +2672,14 @@ export class AcpAgent implements Agent {
 		const event = receivedSdkEvent(frame)?.event;
 		if (event?.type === "agent_start") {
 			record.busy = true;
-			if (!record.activePrompt || record.activePrompt.terminalReserved) record.backgroundBusy = true;
+			const correlation = sdkFrameCorrelation(frame, event);
+			if (
+				!record.activePrompt ||
+				record.activePrompt.terminalReserved ||
+				(record.activePrompt.acknowledged &&
+					(!correlation || !correlationsExactlyMatch(record.activePrompt.correlation, correlation)))
+			)
+				record.backgroundBusy = true;
 		}
 	}
 
