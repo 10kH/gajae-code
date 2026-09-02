@@ -55,7 +55,16 @@ try {
 				const frame = JSON.parse(String(raw)) as Record<string, unknown>;
 				received.push(String(frame.type));
 				if (frame.type === "event_replay") {
-					ws.send(JSON.stringify({ type: "event_replay_result", id: frame.id, events: [] }));
+					ws.send(
+						JSON.stringify({
+							type: "event_replay_result",
+							id: frame.id,
+							ok: true,
+							generation: typeof frame.sinceGeneration === "number" ? frame.sinceGeneration : 1,
+							lastSeq: 0,
+							events: [],
+						}),
+					);
 					return;
 				}
 				if (frame.type === "query_request")

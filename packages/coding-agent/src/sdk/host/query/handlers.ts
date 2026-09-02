@@ -108,6 +108,7 @@ export interface SdkCheckpointRecord {
 	revision: number;
 	generation: number;
 	seq: number;
+	idle: boolean;
 }
 
 function isNonNegativeSafeInteger(value: unknown): value is number {
@@ -119,10 +120,11 @@ export function isCheckpointRecord(value: unknown): value is SdkCheckpointRecord
 	const record = value as Record<string, unknown>;
 	const keys = Object.keys(record);
 	return (
-		keys.length === 3 &&
+		keys.length === 4 &&
 		isNonNegativeSafeInteger(record.revision) &&
 		isNonNegativeSafeInteger(record.generation) &&
-		isNonNegativeSafeInteger(record.seq)
+		isNonNegativeSafeInteger(record.seq) &&
+		typeof record.idle === "boolean"
 	);
 }
 const sources: Record<string, { resource: string; method: keyof SessionSurface; mvcc: boolean }> = {
@@ -296,9 +298,10 @@ export class QueryHandlers {
 		let snapshot: unknown;
 		// The cursor may arrive either as the top-level continuation cursor or,
 		// on Q01 only (validated in `dispatch`), as the `checkpointToken` resume
-		// seed. Both are signed checkpoint cursors consumed through the same
-		// CursorRegistry authority; neither mints a fresh snapshot.
-		const rawCursorToken = request.cursor ?? (queryId === "Q01" ? request.input?.checkpointToken : undefined);
+		// seed. Both are consumed through the same CursorRegistry authority, but
+		// only the named input token is required to carry checkpoint purpose.
+		const checkpointToken = queryId === "Q01" ? request.input?.checkpointToken : undefined;
+		const rawCursorToken = request.cursor ?? checkpointToken;
 		if (rawCursorToken !== undefined && typeof rawCursorToken !== "string")
 			return this.#error(request, "invalid_request", false, "checkpointToken must be a non-empty string.");
 		const cursorToken = rawCursorToken;
@@ -309,6 +312,8 @@ export class QueryHandlers {
 				direction: "forward",
 				pageShape: { targetBytes: TARGET_PAGE_BYTES },
 			});
+			if (checkpointToken !== undefined && cursor.purpose !== "checkpoint")
+				throw new CursorError("invalid_input", false, "checkpointToken does not carry checkpoint purpose");
 			selector = assertCursorSelector(cursorSelector(cursor.position), selector);
 			resourceId = selector.resourceId ?? "default";
 			revision = cursor.revision;
@@ -467,10 +472,20 @@ export class QueryHandlers {
 						resource: "transcript",
 						direction: "forward",
 						pageShape: { targetBytes: TARGET_PAGE_BYTES },
+						purpose: "checkpoint",
 					},
 					"transcript",
 					"default",
 				);
+				if (!isCheckpointRecord(exchanged.envelope.highWatermark)) {
+					this.cursors.release(exchanged.cursor);
+					return this.#error(
+						request,
+						"invalid_input",
+						false,
+						"checkpointToken is not an authoritative checkpoint.",
+					);
+				}
 				return {
 					id: request.id,
 					ok: true,
@@ -494,13 +509,18 @@ export class QueryHandlers {
 		// Atomic synchronous capture (C9): entries and event-ring watermark come
 		// from the same host-owned call, so the pinned snapshot revision and the
 		// subscribe position can never straddle a concurrent append.
-		const captured =
-			typeof this.surface.getCheckpointSnapshot === "function" ? this.surface.getCheckpointSnapshot() : undefined;
-		const entries = captured !== undefined ? captured.entries : await this.surface.getTranscriptEntries();
-		const head: SdkCheckpointRecord =
-			captured !== undefined
-				? captured.watermark
-				: { revision: Array.isArray(entries) ? entries.length : 0, generation: 0, seq: 0 };
+		if (typeof this.surface.getCheckpointSnapshot !== "function")
+			return this.#error(request, "unavailable", false, "Atomic session checkpoint capture is unavailable.");
+		const captured = this.surface.getCheckpointSnapshot();
+		const entries = captured.entries;
+		const head = captured.watermark;
+		if (!isCheckpointRecord(head))
+			return this.#error(
+				request,
+				"unavailable",
+				false,
+				"Atomic session checkpoint capture returned an invalid watermark.",
+			);
 		// Mint the snapshot from the exact entries captured with the watermark;
 		// entries appended after this point are excluded from replay by
 		// construction (append-during-checkpoint), and the returned token is the
@@ -517,6 +537,7 @@ export class QueryHandlers {
 			highWatermark: head,
 			nonce,
 			position: { offset: 0, selector: { queryId: "Q01" } },
+			purpose: "checkpoint",
 			direction: "forward",
 			pageShape: { targetBytes: TARGET_PAGE_BYTES },
 		};

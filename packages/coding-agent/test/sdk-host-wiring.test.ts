@@ -1902,6 +1902,10 @@ test("SDK host directly delivers correlated lifecycle frames for an accepted pro
 	const acknowledgement = frames.find(frame => frame.type === "control_response" && frame.id === "prompt-success") as {
 		result?: { commandId?: unknown; turnId?: unknown };
 	};
+	const promptCommandId = acknowledgement.result?.commandId;
+	const promptTurnId = acknowledgement.result?.turnId;
+	if (typeof promptCommandId !== "string" || typeof promptTurnId !== "string")
+		throw new Error("missing accepted prompt correlation");
 	expect(acknowledgement).toMatchObject({
 		ok: true,
 		result: { accepted: true, commandId: expect.any(String), turnId: expect.any(String) },
@@ -1978,6 +1982,48 @@ test("SDK host directly delivers correlated lifecycle frames for an accepted pro
 		"correlated accepted prompt lifecycle",
 	);
 	expect(frames.find(frame => frame.type === "agent_end")).toMatchObject({ finalText: "final answer" });
+	const promptResultId = "prompt-success-result";
+	socket.send(
+		JSON.stringify({
+			type: "query_request",
+			id: promptResultId,
+			query: "turn.result",
+			input: {
+				kind: "prompt",
+				commandId: promptCommandId,
+				turnId: promptTurnId,
+			},
+		}),
+	);
+	await waitFor(() => frames.some(frame => frame.id === promptResultId), "persisted prompt result content");
+	expect(frames.find(frame => frame.id === promptResultId)).toMatchObject({
+		ok: true,
+		result: {
+			status: "terminal_ok",
+			content: { text: "final answer", byteLength: 12, truncated: false },
+		},
+	});
+	const checkpointId = "prompt-success-checkpoint";
+	socket.send(
+		JSON.stringify({
+			type: "query_request",
+			id: checkpointId,
+			query: "session.checkpoint",
+		}),
+	);
+	await waitFor(() => frames.some(frame => frame.id === checkpointId), "production runtime atomic checkpoint");
+	expect(frames.find(frame => frame.id === checkpointId)).toMatchObject({
+		ok: true,
+		result: {
+			checkpointToken: expect.any(String),
+			checkpoint: {
+				revision: 1,
+				generation: expect.any(Number),
+				seq: expect.any(Number),
+				idle: true,
+			},
+		},
+	});
 	await waitFor(
 		() =>
 			frames.some(
@@ -2005,8 +2051,8 @@ test("SDK host directly delivers correlated lifecycle frames for an accepted pro
 		frame => frame.type === "event_replay_result" && frame.id === "observer-replay",
 	) as { events?: Array<Record<string, unknown>> };
 	const correlation = {
-		commandId: acknowledgement.result?.commandId,
-		turnId: acknowledgement.result?.turnId,
+		commandId: promptCommandId,
+		turnId: promptTurnId,
 	};
 	expect(frames.filter(frame => frame.type === "agent_start")).toEqual([
 		expect.objectContaining({ type: "agent_start", sessionId, ...correlation }),

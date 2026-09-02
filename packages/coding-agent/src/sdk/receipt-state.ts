@@ -25,6 +25,16 @@ export function receiptStateForTerminal(source: ReceiptSource): Extract<ReceiptS
 	return reportableReceipt(source) ? "present" : "missing";
 }
 
+/** Terminal receipt evidence is monotonic: present > missing > unknown. */
+export function reduceReceiptState(
+	existing: Exclude<ReceiptState, "absent"> | undefined,
+	incoming: Exclude<ReceiptState, "absent"> | undefined,
+): Exclude<ReceiptState, "absent"> | undefined {
+	if (existing === "present" || incoming === "present") return "present";
+	if (existing === "missing" || incoming === "missing") return "missing";
+	return existing ?? incoming;
+}
+
 export function reduceTerminalReceiptState(input: TerminalReceiptInput): TerminalReceiptState {
 	switch (input.execution) {
 		case "accepted":

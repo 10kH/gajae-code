@@ -18,6 +18,7 @@ export interface CursorEnvelope {
 	issuedAt?: number;
 	/** TTL metadata minted by `CursorRegistry.grant`: wall-clock ms when the cursor expires. */
 	expiresAt?: number;
+	purpose?: "checkpoint";
 	position: unknown;
 	direction: string;
 	pageShape: unknown;
@@ -68,6 +69,7 @@ export interface CursorQueryContext {
 	resourceId?: string;
 	direction: string;
 	pageShape: unknown;
+	purpose?: "checkpoint";
 }
 
 export class CursorError extends Error {
@@ -170,26 +172,68 @@ export class CursorRegistry {
 		cursor: string,
 		connectionId: string,
 		expected: CursorQueryContext,
-		resourceKind: string,
+		_resourceKind: string,
 		resourceId: string,
 	): Promise<{ cursor: string; envelope: CursorEnvelope }> {
 		const envelope = verifyCursor(cursor, this.sessionToken);
-		if (!envelope) throw new CursorError("invalid_cursor", false);
-		if (envelope.expiresAt === undefined || envelope.expiresAt <= this.now()) throw new CursorError("cursor_expired");
+		if (!envelope) {
+			this.release(cursor);
+			throw new CursorError("invalid_cursor", true);
+		}
+		const source = this.#active.get(cursor);
+		if (!source || envelope.expiresAt === undefined) {
+			this.release(cursor);
+			throw new CursorError("invalid_cursor", true);
+		}
+		const validatedAt = this.now();
+		if (source.expiresAt <= validatedAt || envelope.expiresAt <= validatedAt) {
+			this.release(cursor);
+			throw new CursorError("cursor_expired");
+		}
 		if (
 			envelope.sessionId !== expected.sessionId ||
 			(expected.resource !== undefined && envelope.resource !== expected.resource) ||
 			envelope.direction !== expected.direction ||
-			canonicalJson(envelope.pageShape) !== canonicalJson(expected.pageShape)
+			canonicalJson(envelope.pageShape) !== canonicalJson(expected.pageShape) ||
+			envelope.purpose !== expected.purpose ||
+			_resourceKind !== envelope.resource ||
+			source.resourceId !== resourceId
 		)
 			throw new CursorError("invalid_input", false, "cursor does not match query");
+		// Preserve the already-validated source while removing expired target
+		// grants before capacity accounting. The shared timestamp prevents the
+		// source from changing classification at a TTL boundary mid-exchange.
+		this.sweep(cursor, validatedAt);
+		const targetConnectionCount = [...this.#active.values()].filter(
+			item => item.connectionId === connectionId,
+		).length;
+		if (
+			this.#active.size > MAX_CURSORS_PER_SESSION ||
+			targetConnectionCount - (source.connectionId === connectionId ? 1 : 0) >= MAX_CURSORS_PER_CONNECTION
+		)
+			throw new CursorError("snapshot_capacity_exceeded", false);
 		const exchanged: CursorEnvelope = {
 			...envelope,
 			nonce: randomUUID(),
 			issuedAt: undefined,
 			expiresAt: undefined,
 		};
-		const exchangedCursor = await this.grant(connectionId, exchanged, resourceKind, resourceId);
+		const issuedAt = this.now();
+		exchanged.issuedAt = issuedAt;
+		exchanged.expiresAt = issuedAt + CURSOR_TTL_MS;
+		const exchangedCursor = signCursor(exchanged, this.sessionToken);
+		try {
+			this.revisions.transferPin(cursor, exchangedCursor);
+		} catch (error) {
+			if (error instanceof RevisionStoreError) throw new CursorError(error.code, false, error.message);
+			throw error;
+		}
+		this.#active.delete(cursor);
+		this.#active.set(exchangedCursor, {
+			connectionId,
+			resourceId,
+			expiresAt: exchanged.expiresAt,
+		});
 		return { cursor: exchangedCursor, envelope: exchanged };
 	}
 
@@ -227,8 +271,9 @@ export class CursorRegistry {
 	close(): void {
 		for (const cursor of this.#active.keys()) this.release(cursor);
 	}
-	sweep(): void {
-		for (const [cursor, active] of this.#active) if (active.expiresAt <= this.now()) this.release(cursor);
+	sweep(exceptCursor?: string, at = this.now()): void {
+		for (const [cursor, active] of this.#active)
+			if (cursor !== exceptCursor && active.expiresAt <= at) this.release(cursor);
 		this.revisions.sweep();
 	}
 	get size(): number {

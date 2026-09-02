@@ -17,6 +17,7 @@ export interface TurnResultError {
 	code: string;
 	message: string;
 }
+export type TurnResultReceiptState = "absent" | "present" | "missing" | "unknown";
 export interface TurnResultPage {
 	status: TurnResultStatus;
 	kind?: "prompt" | "skill";
@@ -26,6 +27,8 @@ export interface TurnResultPage {
 	acceptedAt?: number;
 	startedAt?: number;
 	terminalAt?: number;
+	receiptState?: TurnResultReceiptState;
+	outcome?: unknown;
 	content?: TurnResultContent;
 	error?: TurnResultError;
 }
@@ -49,5 +52,24 @@ export function sanitizeTurnResultContent(text: unknown): TurnResultContent | un
 		text: bounded,
 		byteLength: new TextEncoder().encode(bounded).length,
 		truncated,
+	};
+}
+
+export function reportableTurnResultContent(content: TurnResultContent | undefined): boolean {
+	return content !== undefined && content.text.trim().length > 0;
+}
+
+/** First reportable invocation-owned content wins; blank evidence remains replaceable. */
+export function reduceTurnResultContent(
+	existing: TurnResultContent | undefined,
+	incoming: TurnResultContent | undefined,
+): TurnResultContent | undefined {
+	if (reportableTurnResultContent(existing)) return existing;
+	if (incoming === undefined) return existing;
+	const sanitized = sanitizeTurnResultContent(incoming.text);
+	if (sanitized === undefined) return existing;
+	return {
+		...sanitized,
+		truncated: sanitized.truncated || incoming.truncated || existing?.truncated === true,
 	};
 }

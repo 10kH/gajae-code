@@ -23,6 +23,13 @@ import { SESSION_REQUEST_TIMEOUT_MS } from "../src/sdk/session-reconnect";
 /** Longer than the 100/200/400ms replay retry ladder the attach pass must not run. */
 const REPLAY_LADDER_WINDOW_MS = 900;
 
+const validReplay = (generation = 1): Record<string, unknown> => ({
+	ok: true,
+	generation,
+	lastSeq: 0,
+	events: [],
+});
+
 const tempDirs: string[] = [];
 
 afterEach(() => {
@@ -81,6 +88,7 @@ async function routerFixture(
 		createBrokerClient?: () => Promise<SessionRouterClient>;
 		indexedRepo?: string;
 		onRequest?: (operation: Record<string, unknown>) => Promise<Record<string, unknown>> | Record<string, unknown>;
+		correlateFrame?: (frame: Record<string, unknown>) => SessionRouterFrame | undefined;
 	} = {},
 ): Promise<RouterFixture> {
 	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-router-authority-"));
@@ -136,6 +144,7 @@ async function routerFixture(
 	const attachments: SessionAttachment[] = [];
 	const router = new SessionRouter({
 		agentDir,
+		correlateFrame: options.correlateFrame,
 		deps: {
 			createIndex: () => index,
 			createClient: async () => {
@@ -169,6 +178,8 @@ async function routerFixture(
 							requestOption?.beforeDispatch?.(context);
 							requestOption?.onDispatch?.(context);
 						}
+						if (operation.type === "event_replay")
+							return validReplay(typeof operation.sinceGeneration === "number" ? operation.sinceGeneration : 1);
 						return options.onRequest ? await options.onRequest(operation) : { events: [] };
 					},
 					close: async () => {},
@@ -316,7 +327,8 @@ function hungRouterFixture(): HungRouterFixture {
 				}
 				return {
 					onFrame: () => () => {},
-					request: async () => ({ events: [] }),
+					request: async operation =>
+						validReplay(typeof operation.sinceGeneration === "number" ? operation.sinceGeneration : 1),
 					close: async () => {},
 					send: frame => healthySent.push(frame),
 				};
@@ -391,7 +403,8 @@ describe("SessionRouter dispatch authority", () => {
 				createClient: async () => {
 					const client: SessionRouterClient = {
 						onFrame: () => () => {},
-						request: async () => ({ events: [] }),
+						request: async operation =>
+							validReplay(typeof operation.sinceGeneration === "number" ? operation.sinceGeneration : 1),
 						close: async () => {},
 						send: () => {},
 					};
@@ -478,7 +491,8 @@ describe("SessionRouter dispatch authority", () => {
 				createClient: async () => {
 					const client: SessionRouterClient = {
 						onFrame: () => () => {},
-						request: async () => ({ events: [] }),
+						request: async operation =>
+							validReplay(typeof operation.sinceGeneration === "number" ? operation.sinceGeneration : 1),
 						close: async () => {},
 						send: () => {},
 					};
@@ -579,7 +593,8 @@ describe("SessionRouter dispatch authority", () => {
 					if (authority.sessionId.includes("unreachable")) throw new Error("connect failed");
 					return {
 						onFrame: () => () => {},
-						request: async () => ({ events: [] }),
+						request: async operation =>
+							validReplay(typeof operation.sinceGeneration === "number" ? operation.sinceGeneration : 1),
 						close: async () => {},
 						send: () => {},
 						sendMaintenance: () => {},
@@ -925,6 +940,99 @@ describe("SessionRouter dispatch authority", () => {
 		await Bun.sleep(10);
 		expect(frames).toHaveLength(1);
 		await fixture.router.stop();
+	});
+
+	test("projects only Router-validated outer ring coordinates", async () => {
+		const frames: SessionRouterFrame[] = [];
+		const fixture = await routerFixture({
+			onFrame: (_attachment, frame) => {
+				frames.push(frame);
+			},
+		});
+		try {
+			fixture.clients[0]?.emit({
+				type: "event",
+				sessionId: fixture.sessionId,
+				payload: { type: "payload-only", generation: 1, seq: 7 },
+			});
+			fixture.clients[0]?.emit({
+				type: "event",
+				sessionId: fixture.sessionId,
+				generation: 1,
+				seq: 8,
+				payload: { type: "outer-owned", generation: 99, seq: 99 },
+			});
+			await waitFor(() => frames.length === 2, "Router frames were not projected.");
+			expect(frames[0]).toMatchObject({ name: "payload-only" });
+			expect(frames[0]?.generation).toBeUndefined();
+			expect(frames[0]?.seq).toBeUndefined();
+			expect(frames[0]?.publicationId).toBeUndefined();
+			expect((frames[0] as unknown as Record<string, unknown>).ringPosition).toBeUndefined();
+			expect(frames[1]).toMatchObject({
+				name: "outer-owned",
+				generation: 1,
+				seq: 8,
+				publicationId: `${fixture.sessionId}:1:8`,
+			});
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+
+	test("strips payload coordinates supplied by an injected correlator", async () => {
+		const frames: SessionRouterFrame[] = [];
+		const fixture = await routerFixture({
+			correlateFrame: frame =>
+				({
+					body: (frame.payload as Record<string, unknown>) ?? frame,
+					name: "custom",
+					sessionId: String(frame.sessionId),
+					generation: 1,
+					seq: 77,
+					publicationId: "payload-only:1:77",
+					ringPosition: { generation: 1, seq: 77 },
+				}) as SessionRouterFrame & { ringPosition: { generation: number; seq: number } },
+			onFrame: (_attachment, frame) => {
+				frames.push(frame);
+			},
+		});
+		try {
+			fixture.clients[0]?.emit({
+				type: "event",
+				sessionId: fixture.sessionId,
+				payload: { type: "payload-only", generation: 1, seq: 77 },
+			});
+			await waitFor(() => frames.length === 1, "Custom-correlated frame was not projected.");
+			expect(frames[0]).toMatchObject({ name: "custom" });
+			expect(frames[0]?.generation).toBeUndefined();
+			expect(frames[0]?.seq).toBeUndefined();
+			expect(frames[0]?.publicationId).toBeUndefined();
+			expect((frames[0] as unknown as Record<string, unknown>).ringPosition).toBeUndefined();
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+
+	test("fails the Router barrier on a partial outer ring coordinate", async () => {
+		const frames: SessionRouterFrame[] = [];
+		const fixture = await routerFixture({
+			onFrame: (_attachment, frame) => {
+				frames.push(frame);
+			},
+		});
+		try {
+			fixture.clients[0]?.emit({
+				type: "event",
+				sessionId: fixture.sessionId,
+				seq: 9,
+				payload: { type: "partial" },
+			});
+			await Bun.sleep(25);
+			expect(frames).toEqual([]);
+			expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
+		} finally {
+			await fixture.router.stop();
+		}
 	});
 
 	test("rejects a command carrying a different same-generation attachment", async () => {
@@ -1330,6 +1438,36 @@ describe("SessionRouter dispatch authority", () => {
 			expect(order).toEqual(["event-entered", "replay-response", "event-settled"]);
 		} finally {
 			releaseEvent.resolve();
+			await fixture.router.stop();
+		}
+	});
+
+	test("strips correlator coordinates from out-of-band replay responses", async () => {
+		const frames: SessionRouterFrame[] = [];
+		const fixture = await routerFixture({
+			correlateFrame: frame =>
+				({
+					body: frame,
+					name: String(frame.type),
+					sessionId: typeof frame.sessionId === "string" ? frame.sessionId : "router-session",
+					generation: 91,
+					seq: 92,
+					publicationId: "correlator:91:92",
+					ringPosition: { generation: 91, seq: 92 },
+				}) as SessionRouterFrame & { ringPosition: { generation: number; seq: number } },
+			onFrame: (_attachment, frame) => {
+				frames.push(frame);
+			},
+		});
+		try {
+			fixture.clients[0]?.emit({ type: "event_replay_result", id: "out-of-band", events: [] });
+			await waitFor(() => frames.length === 1, "Out-of-band replay response was not delivered.");
+			expect(frames[0]?.name).toBe("event_replay_result");
+			expect(frames[0]?.generation).toBeUndefined();
+			expect(frames[0]?.seq).toBeUndefined();
+			expect(frames[0]?.publicationId).toBeUndefined();
+			expect((frames[0] as unknown as Record<string, unknown>).ringPosition).toBeUndefined();
+		} finally {
 			await fixture.router.stop();
 		}
 	});
@@ -1952,7 +2090,7 @@ describe("SessionRouter dispatch authority", () => {
 					onFrame: () => () => {},
 					request: async (frame: Record<string, unknown>) => {
 						if (wedgeReplay && frame.type === "event_replay") await wedgedGate.promise;
-						return { events: [] };
+						return validReplay(typeof frame.sinceGeneration === "number" ? frame.sinceGeneration : 1);
 					},
 					close: async () => {},
 					send: () => {},
@@ -2078,11 +2216,12 @@ describe("SessionRouter dispatch authority", () => {
 				createClient: async authority => ({
 					onFrame: () => () => {},
 					request: async (frame: Record<string, unknown>) => {
-						if (frame.type !== "event_replay") return { events: [] };
+						if (frame.type !== "event_replay")
+							return validReplay(typeof frame.sinceGeneration === "number" ? frame.sinceGeneration : 1);
 						replayRequests.push(authority.sessionId);
 						// The wedged host took the frame and answers nothing at all.
 						if (authority.sessionId === wedged) await wedgedGate.promise;
-						return { events: [] };
+						return validReplay(typeof frame.sinceGeneration === "number" ? frame.sinceGeneration : 1);
 					},
 					close: async () => {},
 					send: () => {},
@@ -2108,11 +2247,10 @@ describe("SessionRouter dispatch authority", () => {
 			expect(router.attachment(healthy)?.isCurrent()).toBe(true);
 			// The wedged replay was attempted, and its pass is still parked on it.
 			expect(replayRequests).toContain(wedged);
-			// The lapse names the session and pid to look at, and no endpoint secret.
-			const lapse = warnings.find(message => message.includes("startup returned before"));
-			expect(lapse).toContain(wedged);
-			expect(lapse).toContain("pid 42");
-			expect(lapse).not.toContain(healthy);
+			// Initial replay is detached from the fleet-wide reconcile tail, so a
+			// wedged host cannot force a startup-lapse warning or block the healthy
+			// attachment. The detached replay remains fenced to its own attachment.
+			expect(warnings.join("\n")).not.toContain("startup returned before");
 			expect(warnings.join("\n")).not.toContain("v1");
 		} finally {
 			warn.mockRestore();
@@ -2185,7 +2323,8 @@ describe("SessionRouter dispatch authority", () => {
 				createClient: async authority => ({
 					onFrame: () => () => {},
 					request: async (frame: Record<string, unknown>) => {
-						if (frame.type !== "event_replay") return { events: [] };
+						if (frame.type !== "event_replay")
+							return validReplay(typeof frame.sinceGeneration === "number" ? frame.sinceGeneration : 1);
 						if (authority.sessionId === sessionId) {
 							replayAttempts++;
 							throw new SdkClientError(
@@ -2195,7 +2334,7 @@ describe("SessionRouter dispatch authority", () => {
 						}
 						transientAttempts++;
 						if (transientAttempts === 1) throw new SdkClientError("connection_closed", "closed before dispatch");
-						return { events: [] };
+						return validReplay(typeof frame.sinceGeneration === "number" ? frame.sinceGeneration : 1);
 					},
 					close: async () => {},
 					send: () => {},
@@ -2282,7 +2421,8 @@ describe("SessionRouter dispatch authority", () => {
 				createIndex: () => index,
 				createClient: async () => ({
 					onFrame: () => () => {},
-					request: async () => ({ events: [] }),
+					request: async operation =>
+						validReplay(typeof operation.sinceGeneration === "number" ? operation.sinceGeneration : 1),
 					close: async () => {},
 					send: () => {},
 					sendMaintenance: () => {},
@@ -2390,7 +2530,8 @@ describe("SessionRouter dispatch authority", () => {
 				createIndex: () => index,
 				createClient: async () => ({
 					onFrame: () => () => {},
-					request: async () => ({ events: [] }),
+					request: async operation =>
+						validReplay(typeof operation.sinceGeneration === "number" ? operation.sinceGeneration : 1),
 					close: async () => {},
 					send: () => {},
 					sendMaintenance: () => {},
@@ -2475,7 +2616,8 @@ describe("SessionRouter dispatch authority", () => {
 				createIndex: () => index,
 				createClient: async () => ({
 					onFrame: () => () => {},
-					request: async () => ({ events: [] }),
+					request: async operation =>
+						validReplay(typeof operation.sinceGeneration === "number" ? operation.sinceGeneration : 1),
 					close: async () => {
 						closedClients++;
 					},
@@ -2568,7 +2710,8 @@ describe("SessionRouter dispatch authority", () => {
 				createIndex: () => index,
 				createClient: async () => ({
 					onFrame: () => () => {},
-					request: async () => ({ events: [] }),
+					request: async operation =>
+						validReplay(typeof operation.sinceGeneration === "number" ? operation.sinceGeneration : 1),
 					close: async () => {},
 					send: (frame: Record<string, unknown>) => {
 						sent.push(frame);
@@ -2717,7 +2860,8 @@ describe("SessionRouter dispatch authority", () => {
 					createIndex: () => index,
 					createClient: async () => ({
 						onFrame: () => () => {},
-						request: async () => ({ events: [] }),
+						request: async operation =>
+							validReplay(typeof operation.sinceGeneration === "number" ? operation.sinceGeneration : 1),
 						close: async () => {},
 						send: () => {},
 						sendMaintenance: () => {},
@@ -2799,7 +2943,8 @@ describe("SessionRouter dispatch authority", () => {
 				createIndex: () => index,
 				createClient: async () => ({
 					onFrame: () => () => {},
-					request: async () => ({ events: [] }),
+					request: async operation =>
+						validReplay(typeof operation.sinceGeneration === "number" ? operation.sinceGeneration : 1),
 					close: async () => {},
 					send: () => {},
 				}),
@@ -2881,7 +3026,8 @@ describe("SessionRouter dispatch authority", () => {
 					if (connectAttempts === 1) throw new Error("endpoint not reachable yet");
 					return {
 						onFrame: () => () => {},
-						request: async () => ({ events: [] }),
+						request: async operation =>
+							validReplay(typeof operation.sinceGeneration === "number" ? operation.sinceGeneration : 1),
 						close: async () => {},
 						send: () => {},
 					};
@@ -2966,7 +3112,8 @@ describe("SessionRouter dispatch authority", () => {
 				createIndex: () => index,
 				createClient: async () => ({
 					onFrame: () => () => {},
-					request: async () => ({ events: [] }),
+					request: async operation =>
+						validReplay(typeof operation.sinceGeneration === "number" ? operation.sinceGeneration : 1),
 					close: async () => {},
 					send: (frame: Record<string, unknown>) => {
 						sent.push(frame);

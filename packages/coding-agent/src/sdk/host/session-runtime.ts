@@ -56,15 +56,22 @@ import {
 import { projectQ10Models } from "../models.js";
 import { PromptDeadlineManager, type PromptTerminalTransitionEvidence } from "../prompt-deadline-manager";
 import { formatPromptFailureForLocalLog, sanitizePromptFailure } from "../prompt-failure";
+import type { SdkPromptTerminalOutcome } from "../prompt-status";
 import { validateRequiredPromptText } from "../protocol/adapter-validation";
 import { OPERATIONS } from "../protocol/operation-registry";
+import { type ReceiptState, reduceReceiptState } from "../receipt-state";
 import {
 	createKindAwareReconciliation,
 	createReconciliationStore,
 	type KindAwareReconciliation,
 	resolveReconciliationSessionFile,
 } from "../reconciliation-extensions";
-import { sanitizeTurnResultContent, type TurnResultContent } from "../turn-result";
+import {
+	reduceTurnResultContent,
+	reportableTurnResultContent,
+	sanitizeTurnResultContent,
+	type TurnResultContent,
+} from "../turn-result";
 import { type ControlSurface, controlRequestFromFrame, dispatchControl, terminalAbortIdentity } from "./control";
 import {
 	BROKER_RUNTIME_ABORT_CAPABILITY_FIELD,
@@ -224,6 +231,8 @@ export interface SdkOnlyInvocationRecord extends InvocationCorrelation {
 	startedAt?: number;
 	terminalAt?: number;
 	error?: { code: string; message: string };
+	content?: TurnResultContent;
+	receiptState?: Exclude<ReceiptState, "absent">;
 	outcome?: unknown;
 	pendingOutcome?: unknown;
 	skillName?: string;
@@ -499,6 +508,8 @@ export interface CreateSdkSessionRuntimeOptions {
 	onLifecycleDrainTimeoutForTests?: () => void;
 	/** Test-only observation of bounded failure-diagnostic deduplication state. */
 	onFailureDiagnosticKeyCountForTests?: (count: number) => void;
+	/** Test-only observation after a resolved invocation completion is reconciled. */
+	onInvocationCompletionReconciledForTests?: (kind: InvocationKind, correlation: InvocationCorrelation) => void;
 }
 
 function unavailable(operation: string): () => never {
@@ -516,7 +527,67 @@ export interface InvocationCorrelation {
 
 export type InvocationKind = "prompt" | "skill" | "steer";
 type InvocationStatus = "accepted" | "in_flight" | "terminal_ok" | "failed" | "uncertain";
+type InvocationOutcome = SdkPromptTerminalOutcome;
+type InvocationOutcomeInput = {
+	kind: string;
+	reason?: unknown;
+	code?: unknown;
+	message?: unknown;
+	provenance?: unknown;
+};
 const EMPTY_PROMPT_FAILURE = { code: "prompt_failed", message: "Prompt submission failed." } as const;
+const PRESERVED_PROVIDER_FAILURE_CODES = new Set([
+	"provider_down",
+	"provider_unavailable",
+	"provider_rejected",
+	"upstream_stream_interrupted",
+	"argument_validation",
+	"execution",
+	"upstream_error",
+	"transport_reset",
+]);
+const isPreservedProviderFailure = (code: string | undefined): boolean =>
+	code !== undefined && (PRESERVED_PROVIDER_FAILURE_CODES.has(code) || code.startsWith("provider_http_"));
+
+/**
+ * Durable reconciliation accepts only the bounded outcome vocabulary from
+ * reconciliation-store.ts. Provider diagnostics keep their specific safe code
+ * in `error`, while the durable outcome is normalized to the public failure
+ * classifier so a failed terminal can never be quarantined on reload.
+ */
+function canonicalFailedOutcome(
+	failure?: { code?: unknown; message?: unknown },
+	provenance: "agent_failed" | "deadline" = "agent_failed",
+): InvocationOutcome {
+	const deadline = provenance === "deadline" || failure?.code === "prompt_deadline_exceeded";
+	return {
+		kind: "failed",
+		code: deadline ? "prompt_deadline_exceeded" : "prompt_failed",
+		message: deadline ? "Prompt deadline exceeded." : EMPTY_PROMPT_FAILURE.message,
+		provenance: deadline ? "deadline" : "agent_failed",
+	};
+}
+
+function canonicalTerminalOutcome(
+	outcome: unknown,
+	failure?: { code?: unknown; message?: unknown },
+): InvocationOutcome | undefined {
+	if (outcome && typeof outcome === "object") {
+		const candidate = outcome as { kind?: unknown; reason?: unknown; provenance?: unknown; code?: unknown };
+		if (candidate.kind === "stopped") {
+			if (candidate.reason === "cancelled" && candidate.provenance === "client_cancel")
+				return { kind: "stopped", reason: "cancelled", provenance: "client_cancel" };
+			return undefined;
+		}
+		if (candidate.kind === "failed")
+			return canonicalFailedOutcome(
+				{ code: candidate.code, message: (outcome as { message?: unknown }).message },
+				candidate.provenance === "deadline" ? "deadline" : "agent_failed",
+			);
+	}
+	if (failure !== undefined) return canonicalFailedOutcome(failure);
+	return undefined;
+}
 interface InvocationRecord extends InvocationCorrelation {
 	kind: InvocationKind;
 	revision: number;
@@ -527,6 +598,9 @@ interface InvocationRecord extends InvocationCorrelation {
 	startedAt?: number;
 	terminalAt?: number;
 	error?: { code: string; message: string };
+	content?: TurnResultContent;
+	receiptState?: Exclude<ReceiptState, "absent">;
+	outcome?: unknown;
 }
 export interface InvocationReconciliation {
 	/** Shared v2 reconciliation owner; present for durable terminal admission. */
@@ -542,7 +616,7 @@ export interface InvocationReconciliation {
 					type: "agent_start" | "agent_end";
 					content?: TurnResultContent;
 					hasActivity?: boolean;
-					outcome?: { kind: "stopped"; reason: "cancelled"; provenance: "client_cancel" };
+					outcome?: InvocationOutcome;
 			  }
 			| { type: "agent_failed"; error: unknown; content?: TurnResultContent; hasActivity?: boolean },
 	): Promise<void>;
@@ -557,8 +631,8 @@ export interface InvocationReconciliation {
 	claimPendingOutcome(
 		kind: InvocationKind,
 		correlation: InvocationCorrelation,
-		outcome: { kind: string; code: string; message: string; provenance?: string },
-	): Promise<unknown>;
+		outcome: InvocationOutcomeInput,
+	): Promise<InvocationOutcome>;
 	// Positional compatibility (exact-head review P1): the 4th argument is either
 	// the generation-fence isCurrent callback or the legacy recordError object;
 	// both shapes are normalized in the implementation so a legacy object can
@@ -566,7 +640,7 @@ export interface InvocationReconciliation {
 	finalizeOutcome(
 		kind: InvocationKind,
 		correlation: InvocationCorrelation,
-		outcome?: { kind: string; code: string; message: string; provenance?: string },
+		outcome?: InvocationOutcomeInput,
 		arg4?: (() => boolean) | { code: string; message: string },
 		// Terminal evidence accepted by finalizeOutcome (exact-head review P1/P2):
 		// when an explicit outcome is absent, a content-bearing, activity-bearing,
@@ -809,25 +883,71 @@ export function createInvocationReconciliation(
 						// so a real lifecycle event is never swallowed.
 					}
 					const current = records.get(recordKey);
+					const incomingOutcome = frame.type === "agent_end" ? canonicalTerminalOutcome(frame.outcome) : undefined;
+					const providerFailure =
+						current?.error !== undefined && current.error.code !== "prompt_deadline_exceeded";
+					if (
+						current !== undefined &&
+						frame.type === "agent_end" &&
+						incomingOutcome?.kind === "failed" &&
+						incomingOutcome.provenance !== "deadline"
+					) {
+						const content = reduceTurnResultContent(current.content, frame.content);
+						const failed = {
+							...current,
+							revision: ++mutationRevision,
+							status: "failed" as const,
+							outcome: incomingOutcome,
+							error:
+								current.error?.code !== "prompt_deadline_exceeded" && current.error !== undefined
+									? current.error
+									: { code: incomingOutcome.code, message: incomingOutcome.message },
+							content,
+							receiptState: reduceReceiptState(
+								current.receiptState,
+								reportableTurnResultContent(content) ? "present" : undefined,
+							),
+						};
+						delete (failed as unknown as { pendingOutcome?: unknown }).pendingOutcome;
+						delete (failed as unknown as { pendingReceiptState?: unknown }).pendingReceiptState;
+						records.set(recordKey, failed);
+						try {
+							await persist();
+						} catch (error) {
+							if (records.get(recordKey) === failed) records.set(recordKey, current);
+							throw error;
+						}
+						return;
+					}
 					if (
 						frame.type === "agent_end" &&
 						current === pending.finalizedRecord &&
+						incomingOutcome?.kind !== "failed" &&
+						!providerFailure &&
 						(kind !== "prompt" ||
-							frame.outcome?.kind === "stopped" ||
+							incomingOutcome?.kind === "stopped" ||
 							frame.hasActivity === true ||
 							frame.content?.text.trim())
 					) {
 						// A real lifecycle end that arrived during deadline finalization is
 						// stronger evidence than the synthetic deadline outcome. Upgrade the
-						// durable terminal instead of treating the event as a duplicate.
+						// durable terminal instead of treating it as a duplicate.
+						const content = reduceTurnResultContent(current.content, frame.content);
 						const upgraded = {
 							...current,
 							revision: ++mutationRevision,
 							status: "terminal_ok" as const,
+							content,
+							...(incomingOutcome?.kind === "stopped" ? { outcome: incomingOutcome } : {}),
+							receiptState: reduceReceiptState(
+								current.receiptState,
+								reportableTurnResultContent(content) ? "present" : undefined,
+							),
 						};
 						// Drop the superseded synthetic deadline error so the surfaced payload is
 						// not the contradictory {status: terminal_ok, error: prompt_deadline_exceeded}.
 						delete (upgraded as Partial<InvocationRecord>).error;
+						if (incomingOutcome?.kind !== "stopped") delete (upgraded as Partial<InvocationRecord>).outcome;
 						records.set(recordKey, upgraded);
 						try {
 							await persist();
@@ -851,18 +971,115 @@ export function createInvocationReconciliation(
 				}
 			}
 			if (record.terminalAt !== undefined) {
+				if (frame.type === "agent_end") {
+					const incomingOutcome = canonicalTerminalOutcome(frame.outcome);
+					if (incomingOutcome?.kind === "failed" && incomingOutcome.provenance !== "deadline") {
+						const content = reduceTurnResultContent(record.content, frame.content);
+						const failed = {
+							...record,
+							revision: ++mutationRevision,
+							status: "failed" as const,
+							outcome: incomingOutcome,
+							error:
+								record.error?.code !== "prompt_deadline_exceeded" && record.error !== undefined
+									? record.error
+									: { code: incomingOutcome.code, message: incomingOutcome.message },
+							content,
+							receiptState: reduceReceiptState(
+								record.receiptState,
+								reportableTurnResultContent(content) ? "present" : undefined,
+							),
+						};
+						delete (failed as unknown as { pendingOutcome?: unknown }).pendingOutcome;
+						delete (failed as unknown as { pendingReceiptState?: unknown }).pendingReceiptState;
+						records.set(recordKey, failed);
+						try {
+							await persist();
+						} catch (error) {
+							if (records.get(recordKey) === failed) records.set(recordKey, record);
+							throw error;
+						}
+						return;
+					}
+				}
+				if (frame.type === "agent_failed" && record.error?.code === "prompt_deadline_exceeded") {
+					const failure = sanitizePromptFailure(frame.error);
+					const next = {
+						...record,
+						revision: ++mutationRevision,
+						status: "failed" as const,
+						error: failure,
+						outcome: canonicalFailedOutcome(failure),
+					};
+					delete (next as unknown as { pendingOutcome?: unknown }).pendingOutcome;
+					delete (next as unknown as { pendingReceiptState?: unknown }).pendingReceiptState;
+					records.set(recordKey, next);
+					try {
+						await persist();
+					} catch (error) {
+						if (records.get(recordKey) === next) records.set(recordKey, record);
+						throw error;
+					}
+					return;
+				}
+				if (frame.type === "agent_end" && record.error?.code !== "prompt_deadline_exceeded") {
+					const content = reduceTurnResultContent(record.content, frame.content);
+					const receiptState = reduceReceiptState(
+						record.receiptState,
+						reportableTurnResultContent(content) ? "present" : undefined,
+					);
+					let outcome = record.outcome;
+					const incomingOutcome = canonicalTerminalOutcome(frame.outcome);
+					if (outcome === undefined) {
+						if (record.status === "failed" && record.error !== undefined)
+							outcome = canonicalFailedOutcome(record.error);
+						else if (record.status === "terminal_ok" && incomingOutcome?.kind === "stopped")
+							outcome = incomingOutcome;
+					}
+					if (content !== record.content || receiptState !== record.receiptState || outcome !== record.outcome) {
+						const enriched = {
+							...record,
+							revision: ++mutationRevision,
+							content,
+							receiptState,
+							...(outcome === undefined ? {} : { outcome }),
+						};
+						records.set(recordKey, enriched);
+						try {
+							await persist();
+						} catch (error) {
+							if (records.get(recordKey) === enriched) records.set(recordKey, record);
+							throw error;
+						}
+					}
+					return;
+				}
 				if (
 					frame.type === "agent_end" &&
 					record.error?.code === "prompt_deadline_exceeded" &&
+					canonicalTerminalOutcome(frame.outcome)?.kind !== "failed" &&
 					(kind !== "prompt" ||
-						frame.outcome?.kind === "stopped" ||
+						canonicalTerminalOutcome(frame.outcome)?.kind === "stopped" ||
 						frame.hasActivity === true ||
 						frame.content?.text.trim())
 				) {
-					const upgraded = { ...record, revision: ++mutationRevision, status: "terminal_ok" as const };
+					const content = reduceTurnResultContent(record.content, frame.content);
+					const incomingOutcome = canonicalTerminalOutcome(frame.outcome);
+					const upgraded = {
+						...record,
+						revision: ++mutationRevision,
+						status: "terminal_ok" as const,
+						content,
+						...(incomingOutcome?.kind === "stopped" ? { outcome: incomingOutcome } : {}),
+						receiptState: reduceReceiptState(
+							record.receiptState,
+							reportableTurnResultContent(content) ? "present" : undefined,
+						),
+					};
 					// The synthetic deadline error is superseded evidence; terminal_ok must not
 					// surface a deadline failure for a prompt that actually completed.
 					delete (upgraded as Partial<InvocationRecord>).error;
+					if (incomingOutcome?.kind !== "stopped") delete (upgraded as Partial<InvocationRecord>).outcome;
 					records.set(recordKey, upgraded);
 					try {
 						await persist();
@@ -919,19 +1136,43 @@ export function createInvocationReconciliation(
 				if (next.error === undefined || (next.error.code === "agent_failed" && failure.code !== "agent_failed"))
 					next.error = failure;
 			} else {
+				const pendingOutcome = (next as unknown as { pendingOutcome?: unknown }).pendingOutcome;
+				delete (next as unknown as { pendingOutcome?: unknown }).pendingOutcome;
+				delete (next as unknown as { pendingReceiptState?: unknown }).pendingReceiptState;
+				next.content = reduceTurnResultContent(next.content, frame.content);
+				const incomingOutcome = canonicalTerminalOutcome(frame.outcome) ?? canonicalTerminalOutcome(pendingOutcome);
 				if (
+					incomingOutcome?.kind === "stopped" &&
+					(next.error === undefined || next.error.code === "prompt_deadline_exceeded")
+				) {
+					next.outcome = incomingOutcome;
+					if (next.error?.code === "prompt_deadline_exceeded") delete next.error;
+					next.status = "terminal_ok";
+				} else if (incomingOutcome?.kind === "failed") {
+					next.outcome = incomingOutcome;
+					if (next.error === undefined)
+						next.error = { code: incomingOutcome.code, message: incomingOutcome.message };
+					next.status = "failed";
+				} else if (next.error !== undefined) {
+					next.outcome = canonicalFailedOutcome(next.error);
+					next.status = "failed";
+				} else if (
 					kind === "prompt" &&
-					next.error === undefined &&
 					frame.type === "agent_end" &&
-					frame.outcome?.kind !== "stopped" &&
 					!frame.content?.text.trim() &&
 					!frame.hasActivity
 				) {
 					next.status = "failed";
 					next.error = EMPTY_PROMPT_FAILURE;
-				} else next.status = next.error === undefined ? "terminal_ok" : "failed";
+					next.outcome = canonicalFailedOutcome(EMPTY_PROMPT_FAILURE);
+				} else next.status = "terminal_ok";
+				next.receiptState = reduceReceiptState(
+					next.receiptState,
+					reportableTurnResultContent(next.content) ? "present" : "missing",
+				);
 				next.terminalAt = Date.now();
 			}
+
 			records.set(recordKey, next);
 			try {
 				await persist();
@@ -942,20 +1183,24 @@ export function createInvocationReconciliation(
 		},
 		lookup(kind, selector) {
 			const record = find(kind, selector);
-			if (!record) return { status: "unknown" };
+			if (!record) return { status: "unknown", receiptState: "unknown" };
 			const identity = {
 				commandId: record.commandId,
 				turnId: record.turnId,
 				...(record.clientRef === undefined ? {} : { clientRef: record.clientRef }),
 				acceptedAt: record.acceptedAt,
 			};
-			if (record.status === "accepted") return { status: "accepted", ...identity };
-			if (record.status === "in_flight") return { status: "in_flight", ...identity, startedAt: record.startedAt };
+			if (record.status === "accepted") return { status: "accepted", receiptState: "absent", ...identity };
+			if (record.status === "in_flight")
+				return { status: "in_flight", receiptState: "absent", ...identity, startedAt: record.startedAt };
 			return {
 				status: record.status,
 				...identity,
 				...(record.startedAt === undefined ? {} : { startedAt: record.startedAt }),
 				terminalAt: record.terminalAt,
+				receiptState: record.receiptState ?? "unknown",
+				...(record.outcome === undefined ? {} : { outcome: record.outcome }),
+				...(reportableTurnResultContent(record.content) ? { content: record.content } : {}),
 				...(record.error === undefined ? {} : { error: record.error }),
 			};
 		},
@@ -982,11 +1227,13 @@ export function createInvocationReconciliation(
 		hydrate,
 		async claimPendingOutcome(kind, correlation, outcome) {
 			const record = records.get(key(kind, correlation));
-			if (!record || record.terminalAt !== undefined || record.kind !== kind) return outcome;
+			const normalized = canonicalTerminalOutcome(outcome);
+			if (normalized === undefined) throw new Error("Invalid terminal outcome.");
+			if (!record || record.terminalAt !== undefined || record.kind !== kind) return normalized;
 			const pending = (record as unknown as { pendingOutcome?: unknown }).pendingOutcome;
-			if (pending !== undefined) return pending;
+			if (pending !== undefined) return canonicalTerminalOutcome(pending) ?? normalized;
 			const next = { ...record, revision: ++mutationRevision } as InvocationRecord & { pendingOutcome?: unknown };
-			next.pendingOutcome = outcome;
+			next.pendingOutcome = normalized;
 			records.set(key(kind, correlation), next);
 			try {
 				await persist();
@@ -994,7 +1241,7 @@ export function createInvocationReconciliation(
 				if (records.get(key(kind, correlation)) === next) records.set(key(kind, correlation), record);
 				throw error;
 			}
-			return outcome;
+			return normalized;
 		},
 		async finalizeOutcome(
 			kind,
@@ -1026,36 +1273,64 @@ export function createInvocationReconciliation(
 			const recordKey = key(kind, correlation);
 			const record = records.get(recordKey);
 			if (!record || record.terminalAt !== undefined || record.kind !== kind) return;
-			const finalOutcome = (outcome ??
-				(record as unknown as { pendingOutcome?: { kind: string; code: string; message: string } })
-					.pendingOutcome) as { kind: string; code: string; message: string } | undefined;
+			const requestedOutcome = canonicalTerminalOutcome(
+				outcome ?? (record as unknown as { pendingOutcome?: unknown }).pendingOutcome,
+			);
+			const priorFailure = record.error;
+			// A provider diagnostic recorded before a deadline finalization is stronger
+			// than the synthetic deadline claim. Preserve it as the terminal failure
+			// intent instead of allowing a later agent_end to look successful.
+			const finalOutcome =
+				priorFailure !== undefined && priorFailure.code !== "prompt_deadline_exceeded"
+					? canonicalFailedOutcome(priorFailure)
+					: requestedOutcome?.kind === "stopped"
+						? requestedOutcome
+						: priorFailure !== undefined &&
+								(requestedOutcome === undefined ||
+									(requestedOutcome.kind === "failed" &&
+										(requestedOutcome.code === "prompt_deadline_exceeded" ||
+											priorFailure.code !== "prompt_deadline_exceeded")))
+							? canonicalFailedOutcome(priorFailure)
+							: requestedOutcome;
 			const previousRecord = { ...record };
 			const finalizedRecord: InvocationRecord = { ...record, revision: ++mutationRevision, terminalAt: Date.now() };
-			if (finalOutcome?.kind === "failed") {
+			finalizedRecord.content = reduceTurnResultContent(finalizedRecord.content, evidence?.content);
+			let resolvedOutcome = finalOutcome;
+			if (resolvedOutcome?.kind === "stopped") {
+				// Stopped is a successful terminal boundary: it must never coexist with
+				// an earlier diagnostic failure.
+				finalizedRecord.status = "terminal_ok";
+				delete finalizedRecord.error;
+			} else if (resolvedOutcome?.kind === "failed") {
 				finalizedRecord.status = "failed";
-				// Legacy positional recordError overrides the recorded cause; the
-				// outcome's own code/message is the default (exact-head review P1).
 				finalizedRecord.error =
 					recordError !== undefined
 						? { code: recordError.code, message: recordError.message }
-						: { code: finalOutcome.code, message: finalOutcome.message };
-			} else if (kind === "prompt" && finalOutcome === undefined) {
+						: priorFailure !== undefined &&
+								(resolvedOutcome.code === "prompt_deadline_exceeded" ||
+									priorFailure.code !== "prompt_deadline_exceeded")
+							? priorFailure
+							: { code: resolvedOutcome.code, message: resolvedOutcome.message };
+			} else if (kind === "prompt") {
 				// Evidence-based empty predicate (exact-head review P1/P2): the same
 				// semantics as the noteTransition agent_end classifier. A
-				// content-bearing, activity-bearing, or explicitly stopped
-				// finalization without an explicit outcome is a successful terminal;
+				// content-bearing or activity-bearing finalization is successful;
 				// only a genuinely empty, no-activity completion fails closed.
 				const terminalText = evidence?.content?.text.trim() ?? "";
 				if (terminalText === "" && !evidence?.hasActivity && evidence?.outcomeKind !== "stopped") {
+					resolvedOutcome = canonicalFailedOutcome(EMPTY_PROMPT_FAILURE);
 					finalizedRecord.status = "failed";
 					finalizedRecord.error = EMPTY_PROMPT_FAILURE;
-				} else {
-					finalizedRecord.status = "terminal_ok";
-				}
-			} else {
-				finalizedRecord.status = "terminal_ok";
-			}
-			(finalizedRecord as unknown as Record<string, unknown>).pendingOutcome = undefined;
+				} else finalizedRecord.status = "terminal_ok";
+			} else finalizedRecord.status = "terminal_ok";
+			finalizedRecord.receiptState = reduceReceiptState(
+				finalizedRecord.receiptState,
+				reportableTurnResultContent(finalizedRecord.content) ? "present" : "unknown",
+			);
+			if (resolvedOutcome === undefined) delete finalizedRecord.outcome;
+			else finalizedRecord.outcome = resolvedOutcome;
+			delete (finalizedRecord as unknown as Record<string, unknown>).pendingOutcome;
+			delete (finalizedRecord as unknown as Record<string, unknown>).pendingReceiptState;
 			if (isCurrent !== undefined && !isCurrent()) return;
 			const commit = Promise.withResolvers<void>();
 			// This promise is an internal coordination signal for lifecycle transitions
@@ -1105,8 +1380,13 @@ export function createInvocationReconciliation(
 			};
 			if (isCurrent !== undefined && !isCurrent()) return;
 			delete next.terminalAt;
-			delete next.error;
-			delete (next as unknown as { outcome?: unknown }).outcome;
+			if (next.error?.code === "prompt_deadline_exceeded" || !isPreservedProviderFailure(next.error?.code))
+				delete next.error;
+			delete next.receiptState;
+			delete (next as unknown as { outcome?: unknown; pendingOutcome?: unknown; pendingReceiptState?: unknown })
+				.outcome;
+			delete (next as unknown as { pendingOutcome?: unknown }).pendingOutcome;
+			delete (next as unknown as { pendingReceiptState?: unknown }).pendingReceiptState;
 			(next as unknown as { deadlineRecoveryPending?: boolean }).deadlineRecoveryPending = true;
 			if (deadlineMaxAt !== undefined) (next as unknown as { deadlineMaxAt?: number }).deadlineMaxAt = deadlineMaxAt;
 			records.set(recordKey, next);
@@ -1145,6 +1425,7 @@ export interface SdkSurfaceFactoryOptions {
 	}) => unknown;
 	steerStatusLookup?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
 	hostTools?: boolean | (() => boolean);
+	getRuntimeHost?: () => SessionSdkHost | undefined;
 }
 
 /** Shared policy, capability, and query-surface factory for every SDK transport. */
@@ -1174,6 +1455,7 @@ function createQuerySurface(
 		}) => unknown;
 		steerStatusLookup?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
 		hostTools?: boolean | (() => boolean);
+		getRuntimeHost?: () => SessionSdkHost | undefined;
 	} = {},
 ): SessionSurface {
 	const policy =
@@ -1577,6 +1859,28 @@ function createQuerySurface(
 			turnId?: string;
 			clientRef?: string;
 		}) => (options.turnResultLookup ?? (value => reconciliation.lookupResult(value.kind, value)))(selector),
+		getCheckpointSnapshot: () => {
+			const host = options.getRuntimeHost?.();
+			if (!host)
+				throw Object.assign(new Error("Atomic session checkpoint capture is unavailable."), {
+					code: "unavailable",
+				});
+			const entries =
+				typeof (ctx as Partial<ExtensionContext>).getTranscript === "function" ? ctx.getTranscript() : undefined;
+			if (!Array.isArray(entries))
+				throw Object.assign(new Error("Atomic session checkpoint capture is unavailable."), {
+					code: "unavailable",
+				});
+			return {
+				entries,
+				watermark: {
+					revision: entries.length,
+					generation: host.events.generation,
+					seq: host.events.sequence,
+					idle: ctx.isIdle(),
+				},
+			};
+		},
 		getSteerStatus: (selector: { commandId?: string; turnId?: string; clientRef?: string }) =>
 			(options.steerStatusLookup ?? (value => reconciliation.lookup("steer", value)))(selector),
 		getModelProfiles: async () => {
@@ -1626,6 +1930,7 @@ export function createSdkSurfaceFactory(
 		turnResultLookup: options.turnResultLookup,
 		steerStatusLookup: options.steerStatusLookup,
 		hostTools: options.hostTools,
+		getRuntimeHost: options.getRuntimeHost,
 	});
 	return {
 		policy,
@@ -1933,6 +2238,7 @@ function createControlSurface(
 	) => void,
 	canResolveGate: () => boolean = () => true,
 	trackGateResolution: <T>(resolution: Promise<T>) => Promise<T> = async resolution => await resolution,
+	onInvocationCompletionReconciledForTests?: (kind: InvocationKind, correlation: InvocationCorrelation) => void,
 ): ControlSurface {
 	const normalizePromptImages = (value: unknown): ImageContent[] => {
 		if (!Array.isArray(value)) return [];
@@ -2180,18 +2486,9 @@ function createControlSurface(
 								try {
 									await reconciliation.noteTransition(kind, correlation, {
 										type: "agent_end",
-										...(typeof result === "string"
-											? {
-													content: {
-														version: 1,
-														type: "text",
-														text: result,
-														byteLength: 0,
-														truncated: false,
-													},
-												}
-											: {}),
+										...(typeof result === "string" ? { content: sanitizeTurnResultContent(result) } : {}),
 									});
+									onInvocationCompletionReconciledForTests?.(kind, correlation);
 									retirePendingOwner?.(kind, correlation, "always");
 								} catch (transitionError) {
 									if (kind === "prompt" || kind === "skill") {
@@ -3844,7 +4141,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		lifecycleOwner?: LifecycleOwner,
 		terminalContent?: TurnResultContent,
 		terminalHasActivity = false,
-		terminalOutcome?: { kind: "stopped"; reason: "cancelled"; provenance: "client_cancel" },
+		terminalOutcome?: InvocationOutcome,
 	): Promise<void> => {
 		const current = lifecycleOwner?.state ?? active;
 		if (!current) return;
@@ -4109,7 +4406,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 								? ({
 										content: terminalContent,
 										hasActivity: terminalHasActivity,
-										outcome: terminalOutcome,
+										...(terminalOutcome?.kind === "stopped" ? { outcome: terminalOutcome } : {}),
 									} satisfies PromptTerminalTransitionEvidence)
 								: undefined,
 						);
@@ -4313,7 +4610,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const terminalOutcome =
 			event.stopReason === "cancelled"
 				? ({ kind: "stopped", reason: "cancelled", provenance: "client_cancel" } as const)
-				: undefined;
+				: failure === undefined
+					? undefined
+					: canonicalFailedOutcome(failure);
 		return trackLifecycle(async () => {
 			if (failure && !failureAlreadyPublished) {
 				for (const key of genericFailureKeys) owner?.failureDiagnosticKeys.delete(key);
@@ -4502,6 +4801,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			});
 			await Promise.race([settled, timeout]);
 		};
+		let runtime: SessionSdkSessionRuntime;
 		const surfaceFactory = createSdkSurfaceFactory({
 			ctx,
 			id: sessionId,
@@ -4511,6 +4811,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			steerStatusLookup: selector => steerReconciliation.lookupSteer(selector),
 			configOverrides: options.configOverrides,
 			settings: options.settings,
+			getRuntimeHost: () => runtime?.host,
 		});
 		const queryHandlers = new QueryHandlers(surfaceFactory.query, sessionId, revisions, cursors);
 		const inputGate = { quiescing: false };
@@ -4567,7 +4868,6 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				skillRecoveryControllers.delete(key);
 			});
 		};
-		let runtime: SessionSdkSessionRuntime;
 		// Durable-first bounded terminalization for accepted submissions that leave
 		// their queue or race a run WITHOUT consumption (exact-head review: clearing
 		// the lease before the durable writes strands the row accepted with no
@@ -4856,6 +5156,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			},
 			() => acceptingGateResolutions,
 			trackGateResolution,
+			options.onInvocationCompletionReconciledForTests,
 		);
 		const installProviderDefinitions = (capability: string, definitions: unknown): void => {
 			if (capability === "permission") {

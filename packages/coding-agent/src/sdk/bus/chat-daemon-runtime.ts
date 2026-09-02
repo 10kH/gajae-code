@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { logger } from "@gajae-code/utils";
 import { SdkClientError } from "../client/client";
 import { SESSION_PREPARED_EVENT } from "../host/host";
 
@@ -260,6 +261,9 @@ export class ChatDaemonRuntime {
 	readonly #cleanupWork = new Map<string, Promise<void>>();
 	readonly #retirementWork = new Map<string, Promise<void>>();
 	readonly #attachmentBarriers = new Map<string, Promise<void>>();
+	readonly #cleanupFailures = new Map<string, unknown>();
+	#replayReady: Promise<void> = Promise.resolve();
+	#stopping = false;
 	#discord: DiscordNotificationDaemon | undefined;
 	#slack: SlackNotificationDaemon | undefined;
 	#presentation: NotificationPresentationEngine | undefined;
@@ -276,24 +280,40 @@ export class ChatDaemonRuntime {
 				...deps.routerDeps,
 				onFrame: async (attachment, frame) => await this.#handleFrame(attachment, frame),
 				onAttachment: async attachment => this.#onAttachment(attachment),
+				onReplayReady: async () => await this.#replayReady,
 				onSessionRemoved: async (attachment, reason) => await this.#onSessionRemoved(attachment, reason),
 			},
 		});
 	}
 
 	async start(): Promise<void> {
+		const replayReady = Promise.withResolvers<void>();
+		this.#replayReady = replayReady.promise;
+		// Startup can fail before any attachment observes the replay barrier. Mark
+		// the rejection handled without changing what actual waiters observe.
+		void this.#replayReady.catch(() => undefined);
 		if (this.#cleanupWork.size > 0 || this.#retirementWork.size > 0) {
 			const retirements = [...this.#retirementWork.entries()];
+			const cleanup = [...this.#cleanupWork.values()];
+			const retirement = retirements.map(([, work]) => work);
 			const settled = await Promise.race([
-				Promise.all([
-					Promise.allSettled([...this.#cleanupWork.values()]),
-					Promise.all(retirements.map(([, retirement]) => retirement)),
-				]).then(() => true),
+				Promise.all([Promise.allSettled(cleanup), Promise.allSettled(retirement)]).then(() => true),
 				Bun.sleep(5_000).then(() => false),
 			]);
 			if (!settled) throw new Error("Prior provider cleanup did not settle before chat daemon restart.");
-			for (const [sessionId, retirement] of retirements)
-				if (this.#retirementWork.get(sessionId) === retirement) this.#retirementWork.delete(sessionId);
+			const failures = await Promise.all([Promise.allSettled(cleanup), Promise.allSettled(retirement)]);
+			const rejected = failures
+				.flat()
+				.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+			if (rejected.length > 0) {
+				logger.warn(`SDK chat daemon retained ${rejected.length} prior cleanup failure(s) for recovery.`);
+			}
+			for (const [sessionId, work] of retirements)
+				if (this.#retirementWork.get(sessionId) === work && !rejected.some(result => result.status === "rejected"))
+					this.#retirementWork.delete(sessionId);
+			for (const [sessionId, work] of [...this.#cleanupWork.entries()])
+				if (work !== undefined && !rejected.some(result => result.status === "rejected"))
+					this.#cleanupWork.delete(sessionId);
 		}
 		this.#attachments.clear();
 		const retainedProvider =
@@ -308,8 +328,10 @@ export class ChatDaemonRuntime {
 			try {
 				await this.#router.start();
 				await retainedProvider.start();
+				replayReady.resolve();
 				return;
 			} catch (error) {
+				replayReady.reject(error);
 				await this.#router.stop().catch(() => undefined);
 				throw error;
 			}
@@ -370,7 +392,9 @@ export class ChatDaemonRuntime {
 			await this.#router.start();
 			if (this.#discord) await this.#discord.start();
 			if (this.#slack) await this.#slack.start();
+			replayReady.resolve();
 		} catch (error) {
+			replayReady.reject(error);
 			await this.stop();
 			throw error;
 		}
@@ -386,6 +410,20 @@ export class ChatDaemonRuntime {
 	}
 
 	async stop(): Promise<void> {
+		this.#stopping = true;
+		let routerError: unknown;
+		try {
+			await this.#router.stop();
+		} catch (error) {
+			routerError = error;
+		}
+		const cleanupDrain = Promise.allSettled([...this.#cleanupWork.values(), ...this.#retirementWork.values()]);
+		const cleanupSettled = await Promise.race([cleanupDrain.then(() => true), Bun.sleep(5_000).then(() => false)]);
+		const cleanupResults = cleanupSettled
+			? await cleanupDrain
+			: [{ status: "rejected" as const, reason: new Error("Provider cleanup exceeded shutdown drain.") }];
+		if (!cleanupSettled)
+			logger.warn("SDK chat daemon cleanup exceeded the shutdown drain; provider stop will invalidate it.");
 		const providerResults = await Promise.allSettled([this.#discord?.stop(), this.#slack?.stop()]);
 		const discordRestartBlocked = this.#discord?.restartBlocked() ?? false;
 		const slackRestartBlocked = this.#slack?.restartBlocked() ?? false;
@@ -395,10 +433,12 @@ export class ChatDaemonRuntime {
 			this.#presentation = undefined;
 			this.#transportHealthy = undefined;
 		}
-		await this.#router.stop();
-		const failures = providerResults.filter(
-			(result): result is PromiseRejectedResult => result.status === "rejected",
-		);
+		this.#stopping = false;
+		const failures = [
+			...(routerError === undefined ? [] : [{ status: "rejected" as const, reason: routerError }]),
+			...cleanupResults,
+			...providerResults,
+		].filter((result): result is PromiseRejectedResult => result.status === "rejected");
 		if (failures.length > 0)
 			throw new AggregateError(
 				failures.map(result => result.reason),
@@ -436,14 +476,33 @@ export class ChatDaemonRuntime {
 		const slack = this.#slack;
 		const barrier = (async () => {
 			const retirement = this.#retirementWork.get(attachment.sessionId);
+			let retirementFailure: unknown;
 			if (retirement) {
-				await retirement;
-				if (this.#retirementWork.get(attachment.sessionId) === retirement)
-					this.#retirementWork.delete(attachment.sessionId);
+				try {
+					await retirement;
+				} catch (error) {
+					retirementFailure = error;
+					logger.warn(`SDK chat daemon retirement cleanup failed before successor attachment: ${String(error)}`);
+				}
 			}
-			await this.#cleanupWork.get(attachment.sessionId)?.catch(() => undefined);
-			await discord?.recoverCleanup(attachment.sessionId, attachment.generation);
-			await slack?.recoverCleanup(attachment.sessionId, attachment.generation);
+			const cleanup = this.#cleanupWork.get(attachment.sessionId);
+			if (cleanup) await cleanup.catch(error => logger.warn(`SDK cleanup retry pending: ${String(error)}`));
+			const [discordRecovered, slackRecovered] = await Promise.all([
+				discord?.recoverCleanup(attachment.sessionId, attachment.generation, attachment.authorityId) ?? true,
+				slack?.recoverCleanup(attachment.sessionId, attachment.generation, attachment.authorityId) ?? true,
+			]);
+			if (!discordRecovered || !slackRecovered)
+				throw new Error("successor_attachment_blocked_until_retirement_is_verified");
+			if (cleanup !== undefined && this.#cleanupWork.get(attachment.sessionId) === cleanup) {
+				this.#cleanupWork.delete(attachment.sessionId);
+				this.#cleanupFailures.delete(attachment.sessionId);
+			}
+			if (
+				retirementFailure !== undefined &&
+				retirement &&
+				this.#retirementWork.get(attachment.sessionId) === retirement
+			)
+				this.#retirementWork.delete(attachment.sessionId);
 		})();
 		this.#attachmentBarriers.set(attachment.sessionId, barrier);
 		try {
@@ -470,7 +529,7 @@ export class ChatDaemonRuntime {
 			return;
 		}
 		this.#attachments.delete(attachment.sessionId);
-		if (reason === "removed") await this.#trackCleanup(attachment);
+		if (reason === "removed" && !this.#stopping) await this.#trackCleanup(attachment);
 	}
 
 	#trackRetirement(attachment: SessionAttachment): Promise<void> {
@@ -478,7 +537,13 @@ export class ChatDaemonRuntime {
 		const discord = this.#discord;
 		const slack = this.#slack;
 		const previous = this.#retirementWork.get(sessionId);
-		const work = (previous ?? Promise.resolve()).then(async () => {
+		const work = (
+			previous
+				? previous.catch(error => {
+						this.#cleanupFailures.set(sessionId, error);
+					})
+				: Promise.resolve()
+		).then(async () => {
 			// Capture the predecessor providers before stop() can clear the runtime
 			// fields. The successor barrier owns this promise until every retirement
 			// waiter settles, even when takeover overlaps worker shutdown.
@@ -486,6 +551,12 @@ export class ChatDaemonRuntime {
 			await slack?.retireAttachment(sessionId, attachment.generation);
 		});
 		this.#retirementWork.set(sessionId, work);
+		void work.then(
+			() => {
+				if (this.#retirementWork.get(sessionId) === work) this.#retirementWork.delete(sessionId);
+			},
+			() => undefined,
+		);
 		return work;
 	}
 
@@ -507,7 +578,10 @@ export class ChatDaemonRuntime {
 		}
 		if (name === SESSION_PREPARED_EVENT || bodyType === SESSION_PREPARED_EVENT) return;
 		if (name === "session_ready") {
-			if (correlated.generation !== attachment.generation) return;
+			// The attachment itself is the endpoint-generation authority. An
+			// unpositioned session_ready frame deliberately carries no ring
+			// generation; reject only an explicit, conflicting Router-owned value.
+			if (correlated.generation !== undefined && correlated.generation !== attachment.generation) return;
 			await this.#resume(
 				sessionId,
 				attachment.generation,
@@ -559,13 +633,26 @@ export class ChatDaemonRuntime {
 	#trackCleanup(attachment: SessionAttachment): Promise<void> {
 		const sessionId = attachment.sessionId;
 		const previous = this.#cleanupWork.get(sessionId);
-		const work = (previous ? previous.catch(() => undefined) : Promise.resolve()).then(async () => {
+		const work = (
+			previous
+				? previous.catch(error => {
+						this.#cleanupFailures.set(sessionId, error);
+					})
+				: Promise.resolve()
+		).then(async () => {
 			await this.#closeProviders(attachment);
 		});
 		this.#cleanupWork.set(sessionId, work);
-		return work.finally(() => {
-			if (this.#cleanupWork.get(sessionId) === work) this.#cleanupWork.delete(sessionId);
-		});
+		void work.then(
+			() => {
+				if (this.#cleanupWork.get(sessionId) === work) {
+					this.#cleanupWork.delete(sessionId);
+					this.#cleanupFailures.delete(sessionId);
+				}
+			},
+			() => undefined,
+		);
+		return work;
 	}
 	async #closeProviders(attachment: SessionAttachment): Promise<void> {
 		const discord = this.#discord;

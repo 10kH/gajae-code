@@ -969,11 +969,7 @@ function extractCheckpoint(response: unknown): CheckpointExtraction {
 	if (gap !== undefined) return { gap };
 	const record = toCheckpointRecordV1(result.checkpoint ?? result);
 	const cursor =
-		typeof result.cursor === "string" && result.cursor
-			? result.cursor
-			: typeof result.checkpointToken === "string" && result.checkpointToken
-				? result.checkpointToken
-				: undefined;
+		typeof result.checkpointToken === "string" && result.checkpointToken ? result.checkpointToken : undefined;
 	return { record, cursor };
 }
 
@@ -1150,12 +1146,6 @@ function eventGapToRetentionGap(
 	return undefined;
 }
 
-function publicationSequence(publicationId: string): number | undefined {
-	const parts = publicationId.split(":");
-	const value = Number(parts.at(-1));
-	return Number.isSafeInteger(value) && value >= 0 ? value : undefined;
-}
-
 function tailItemFromRouterFrame(frame: SessionRouterFrame): SdkTailItemV1 | undefined {
 	if (frame.name === undefined) return undefined;
 	// The replay response is an out-of-band control frame, not an event-ring
@@ -1163,18 +1153,16 @@ function tailItemFromRouterFrame(frame: SessionRouterFrame): SdkTailItemV1 | und
 	// intentionally has no event `seq`; projecting it as a tail item would make
 	// the strict event-position validator reject every otherwise valid tail.
 	if (frame.name === "event_replay_result") return undefined;
-	const seq = frame.publicationId === undefined ? undefined : publicationSequence(frame.publicationId);
+	const seq = frame.seq;
 	return toTailItemV1(
 		{
 			kind: frame.name,
-			...(frame.generation === undefined ? {} : { generation: frame.generation }),
-			...(seq === undefined ? {} : { seq }),
+			...(seq === undefined ? {} : { generation: frame.generation, seq }),
 			payload: frame.body,
 		},
 		{
 			kind: frame.name,
-			...(frame.generation === undefined ? {} : { generation: frame.generation }),
-			...(seq === undefined ? {} : { seq }),
+			...(seq === undefined ? {} : { generation: frame.generation, seq }),
 		},
 	);
 }
@@ -1589,6 +1577,13 @@ async function runLiveTail(
 			const replayItems = rawEvents.map(event => toTailItemV1(event, { kind: "event" }));
 			applyLifecycle(mergeEventTailItems(eventItems, seenEvents, replayItems, include));
 			if (malformed !== undefined) throw malformed;
+			if (checkpoint !== undefined) {
+				const checkpointKey = { generation: checkpoint.generation, seq: checkpoint.seq };
+				if (turnStateKey === undefined || compareTailSeqKeys(checkpointKey, turnStateKey) >= 0) {
+					turnStateKey = checkpointKey;
+					turnIdle = checkpoint.idle;
+				}
+			}
 			if (liveReason === undefined && args.untilIdle === true && turnIdle) liveReason = "idle";
 			if (liveReason === undefined) {
 				const completion = Promise.withResolvers<TailExitReason>();

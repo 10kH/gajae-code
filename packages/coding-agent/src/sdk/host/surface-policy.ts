@@ -62,8 +62,8 @@ const CONTROL_BINDINGS: Readonly<Record<string, string | undefined>> = {
 // Resource queries (`artifact.read`, `runtime.jobs.list`) remain dispatchable when their
 // backing session resource is absent so their handlers can return `resource_gone`.
 // `session.checkpoint` (Q30) is likewise unconditionally installed: it is an SDK-native
-// replay authority that degrades to the live transcript head when the host publishes no
-// durable checkpoint, so it must never be hidden behind a binding gate.
+// replay authority whose handler returns explicit `unavailable` when the host cannot
+// provide one atomic transcript/ring/idle capture, so it must never be hidden behind a binding gate.
 const QUERY_BINDINGS: Readonly<Record<string, string | undefined>> = {
 	"skill.list/state": "getSkillState",
 	"config.list/get": "getConfigItems",

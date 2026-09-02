@@ -524,6 +524,18 @@ export class RevisionStore {
 		await this.#enforceMemory();
 	}
 
+	transferPin(sourceCursorId: string, replacementCursorId: string): void {
+		if (sourceCursorId === replacementCursorId) return;
+		if (this.#pinIndex.has(replacementCursorId))
+			throw new RevisionStoreError("snapshot_capacity_exceeded", "replacement cursor is already pinned");
+		const revision = this.#pinIndex.get(sourceCursorId);
+		if (!revision) throw new RevisionStoreError("snapshot_capacity_exceeded", "snapshot pin is unavailable");
+		revision.pins.delete(sourceCursorId);
+		revision.pins.add(replacementCursorId);
+		this.#pinIndex.delete(sourceCursorId);
+		this.#pinIndex.set(replacementCursorId, revision);
+	}
+
 	unpin(cursorId: string): void {
 		const revision = this.#pinIndex.get(cursorId);
 		if (!revision) return;

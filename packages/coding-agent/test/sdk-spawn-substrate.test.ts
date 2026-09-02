@@ -150,9 +150,7 @@ describe("Broker spawn substrate provider", () => {
 		});
 	});
 
-	it("falls back to an exact headless proof after managed substrate launch failure", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-spawn-substrate-"));
-		temporaryDirectories.push(cwd);
+	it("does not fall back after a managed proof failure without cleanup evidence", async () => {
 		let headlessStarted = false;
 		const provider = createSpawnSubstrateProvider(
 			managedDependencies({
@@ -165,11 +163,80 @@ describe("Broker spawn substrate provider", () => {
 				},
 			}),
 		);
+		await expect(provider.launch(launchSpec())).resolves.toEqual({
+			ok: false,
+			code: "substrate_proof_failed",
+			message: "tmux substrate launch failed: tag round-trip failed; tmux substrate cleanup could not be verified",
+		});
+		expect(headlessStarted).toBeFalse();
+	});
+
+	it("does not fall back after aggregate managed cleanup failure", async () => {
+		let headlessStarted = false;
+		const provider = createSpawnSubstrateProvider(
+			managedDependencies({
+				launchManaged: () => {
+					throw new AggregateError(
+						[new Error("proof failed"), new Error("cleanup target changed")],
+						"gjc_tmux_managed_launch_proof_failed_cleanup_failed",
+					);
+				},
+				startHeadless: () => {
+					headlessStarted = true;
+					return { pid: 999, terminate() {} };
+				},
+			}),
+		);
+		await expect(provider.launch(launchSpec())).resolves.toEqual({
+			ok: false,
+			code: "substrate_proof_failed",
+			message:
+				"tmux substrate launch failed: gjc_tmux_managed_launch_proof_failed_cleanup_failed; tmux substrate cleanup failed: gjc_tmux_managed_launch_proof_failed_cleanup_failed",
+		});
+		expect(headlessStarted).toBeFalse();
+	});
+
+	it("falls back after a managed proof failure only when managed cleanup succeeds", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-spawn-substrate-"));
+		temporaryDirectories.push(cwd);
+		let headlessStarted = false;
+		const provider = createSpawnSubstrateProvider(
+			managedDependencies({
+				processIncarnation: pid => (pid === 701 ? undefined : `darwin:${pid}`),
+				startHeadless: () => {
+					headlessStarted = true;
+					return { pid: 999, terminate() {} };
+				},
+			}),
+		);
 		await expect(provider.launch(launchSpec(cwd))).resolves.toMatchObject({
 			ok: true,
 			proof: { substrateKind: "headless", pid: 999 },
 		});
 		expect(headlessStarted).toBeTrue();
+	});
+
+	it("does not fall back when managed proof cleanup cannot be verified", async () => {
+		let headlessStarted = false;
+		const provider = createSpawnSubstrateProvider(
+			managedDependencies({
+				processIncarnation: () => undefined,
+				closeManaged: async () => {
+					throw new Error("managed child remained live");
+				},
+				startHeadless: () => {
+					headlessStarted = true;
+					return { pid: 999, terminate() {} };
+				},
+			}),
+		);
+		await expect(provider.launch(launchSpec())).resolves.toEqual({
+			ok: false,
+			code: "substrate_proof_failed",
+			message:
+				"tmux substrate launch failed: exact substrate proof failed; tmux substrate cleanup failed: managed child remained live",
+		});
+		expect(headlessStarted).toBeFalse();
 	});
 
 	it("preserves both substrate diagnostics when every substrate fails", async () => {

@@ -41,16 +41,20 @@ export interface SdkSessionRowV1 {
 	ambiguous?: boolean;
 }
 
-export interface SdkCheckpointRecordV1 {
+export interface SdkRingPositionV1 {
 	revision: number;
 	generation: number;
 	seq: number;
 }
 
+export interface SdkCheckpointRecordV1 extends SdkRingPositionV1 {
+	idle: boolean;
+}
+
 export interface SdkRetentionGapV1 {
 	code: "retention_gap";
 	missing?: { from: number; to: number };
-	resync?: SdkCheckpointRecordV1;
+	resync?: SdkRingPositionV1;
 }
 
 /** One tail item: a retained transcript entry or a live event-ring event. */
@@ -165,6 +169,7 @@ export function toCheckpointRecordV1(value: unknown): SdkCheckpointRecordV1 | un
 	const revision = value.revision;
 	const generation = value.generation;
 	const seq = value.seq;
+	const idle = value.idle;
 	if (
 		typeof revision !== "number" ||
 		!Number.isSafeInteger(revision) ||
@@ -174,10 +179,11 @@ export function toCheckpointRecordV1(value: unknown): SdkCheckpointRecordV1 | un
 		generation < 0 ||
 		typeof seq !== "number" ||
 		!Number.isSafeInteger(seq) ||
-		seq < 0
+		seq < 0 ||
+		typeof idle !== "boolean"
 	)
 		return undefined;
-	return { revision, generation, seq };
+	return { revision, generation, seq, idle };
 }
 
 export function toRetentionGapV1(value: unknown): SdkRetentionGapV1 | undefined {
@@ -189,8 +195,21 @@ export function toRetentionGapV1(value: unknown): SdkRetentionGapV1 | undefined 
 		if (typeof from === "number" && Number.isSafeInteger(from) && typeof to === "number" && Number.isSafeInteger(to))
 			gap.missing = { from, to };
 	}
-	const resync = toCheckpointRecordV1(value.resync);
-	if (resync !== undefined) gap.resync = resync;
+	if (isRecord(value.resync)) {
+		const { revision, generation, seq } = value.resync;
+		if (
+			typeof revision === "number" &&
+			Number.isSafeInteger(revision) &&
+			revision >= 0 &&
+			typeof generation === "number" &&
+			Number.isSafeInteger(generation) &&
+			generation >= 0 &&
+			typeof seq === "number" &&
+			Number.isSafeInteger(seq) &&
+			seq >= 0
+		)
+			gap.resync = { revision, generation, seq };
+	}
 	return gap;
 }
 

@@ -2386,6 +2386,7 @@ function sdkQuerySurface(
 	steerStatusLookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown = () => ({
 		status: "unknown",
 	}),
+	getRuntimeHost: () => SessionSdkHost | undefined = () => undefined,
 ): SessionSurface {
 	return createSdkSurfaceFactory({
 		ctx,
@@ -2398,6 +2399,7 @@ function sdkQuerySurface(
 		turnResultLookup,
 		steerStatusLookup,
 		hostTools: () => getInstalledDefinitions("host_tools") !== undefined,
+		getRuntimeHost,
 	}).query;
 }
 
@@ -5284,7 +5286,6 @@ export function createNotificationsExtension(
 					submission.reconciliationKind,
 					correlation,
 					winner,
-					undefined,
 					extra?.error,
 					extra?.finalText,
 				);
@@ -5456,6 +5457,7 @@ export function createNotificationsExtension(
 				settings,
 				selector => kindReconciliation.lookupResult(selector.kind, selector),
 				selector => kindReconciliation.lookupSteer(selector),
+				() => host,
 			),
 			id,
 			revisions,
