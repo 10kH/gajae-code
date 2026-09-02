@@ -7,6 +7,8 @@ function createProvider() {
 		commands: [
 			{ name: "fast", description: "Built-in fast mode" },
 			{ name: "model", description: "Select model" },
+			{ name: "skill:alpha", description: "Alpha skill" },
+			{ name: "skill:beta", description: "Beta skill" },
 			{ name: "skill:deep-interview", description: "Deep interview" },
 			{ name: "skill:ralplan", description: "Consensus planning" },
 			{ name: "skill:ultragoal", description: "Durable goal execution" },
@@ -45,7 +47,7 @@ describe("prompt action skill autocomplete", () => {
 
 	it.each([
 		"please use /ra",
-		"/skill:deep-interview first /skill-deep",
+		"/skill:deep-interview first /model",
 	])("does not offer skill completions after existing prompt text: %s", async line => {
 		const provider = createProvider();
 
@@ -106,5 +108,58 @@ describe("prompt action skill autocomplete", () => {
 		const suggestions = await provider.trySyncSlashCompletion("/skill-te");
 		expect(suggestions?.prefix).toBe("/skill-te");
 		expect(suggestions?.items[0]?.value).toBe("skill:team");
+	});
+
+	it("completes a later same-line skill token and replaces only that token", async () => {
+		const provider = createProvider();
+		const line = "/skill:alpha x /skill:be";
+		const suggestions = await provider.getSuggestions([line], 0, line.length);
+
+		expect(suggestions?.prefix).toBe("/skill:be");
+		expect(suggestions?.items.map(item => item.value)).toEqual(["skill:beta"]);
+
+		const item = suggestions?.items[0];
+		if (!suggestions || !item) throw new Error("expected a skill completion");
+		const applied = provider.applyCompletion([line], 0, line.length, item, suggestions.prefix);
+		expect(applied.lines).toEqual(["/skill:alpha x /skill:beta "]);
+		expect(applied.cursorCol).toBe(applied.lines[0]!.length);
+
+		const tabSeparated = "/skill:alpha x\t/skill:be";
+		expect((await provider.getSuggestions([tabSeparated], 0, tabSeparated.length))?.prefix).toBe("/skill:be");
+	});
+
+	it("preserves suffixes without duplicating a boundary when the cursor is inside a token", async () => {
+		const provider = createProvider();
+		const prefix = "/skill:be";
+		const item = (await provider.getSuggestions([`${prefix} trailing`], 0, prefix.length))?.items[0];
+		if (!item) throw new Error("expected a skill completion");
+
+		const withWhitespace = provider.applyCompletion([`${prefix} trailing`], 0, prefix.length, item, prefix);
+		const withTokenSuffix = provider.applyCompletion([`${prefix}XYZ`], 0, prefix.length, item, prefix);
+
+		expect(withWhitespace.lines).toEqual(["/skill:beta trailing"]);
+		expect(withWhitespace.cursorCol).toBe("/skill:beta".length);
+		expect(withTokenSuffix.lines).toEqual(["/skill:betaXYZ"]);
+		expect(withTokenSuffix.cursorCol).toBe("/skill:beta".length);
+	});
+
+	it("supports a case-insensitive canonical skill prefix and the skill-hyphen prefix", async () => {
+		const provider = createProvider();
+
+		const canonical = await provider.getSuggestions(["/Skill:be"], 0, 9);
+		expect(canonical?.prefix).toBe("/Skill:be");
+		expect(canonical?.items.map(item => item.value)).toEqual(["skill:beta"]);
+
+		const hyphen = await provider.getSuggestions(["/skill-be"], 0, 9);
+		expect(hyphen?.prefix).toBe("/skill-be");
+		expect(hyphen?.items.map(item => item.value)).toEqual(["skill:beta"]);
+	});
+
+	it("keeps ordinary slash-command completion closed after a prior token", async () => {
+		const provider = createProvider();
+
+		expect(await provider.getSuggestions(["/skill:alpha x /mo"], 0, 18)).toBeNull();
+		const line = "ordinary text /mo";
+		expect(await provider.getSuggestions([line], 0, line.length)).toBeNull();
 	});
 });

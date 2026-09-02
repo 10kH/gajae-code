@@ -208,6 +208,48 @@ describe("prompt action autocomplete", () => {
 		expect(editor.isShowingAutocomplete()).toBe(false);
 	});
 
+	it("completes subsequent skill tokens through the production editor provider", async () => {
+		const cases = [
+			{
+				text: "/skill:alpha x /skill:be",
+				expected: "/skill:alpha x /skill:beta ",
+			},
+			{
+				text: "prior content\n/Skill:be",
+				expected: "prior content\n/skill:beta ",
+			},
+		] as const;
+
+		for (const testCase of cases) {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setAutocompleteProvider(
+				createNoopProvider([
+					{ name: "skill:alpha", description: "Alpha skill" },
+					{ name: "skill:beta", description: "Beta skill" },
+				]),
+			);
+			editor.setText(testCase.text);
+
+			editor.handleInput("\t");
+			await Bun.sleep(20);
+			expect(editor.isShowingAutocomplete()).toBe(true);
+			editor.handleInput("\t");
+
+			expect(editor.getText()).toBe(testCase.expected);
+		}
+	});
+
+	it("does not offer skill completion inside a multiline inline-code span", async () => {
+		const provider = createNoopProvider([
+			{ name: "skill:alpha", description: "Alpha skill" },
+			{ name: "skill:beta", description: "Beta skill" },
+		]);
+
+		expect(await provider.getSuggestions(["explain `quoted", "/skill:be"], 1, 9)).toBeNull();
+		expect((await provider.getSuggestions(["explain `quoted`", "/skill:be"], 1, 9))?.prefix).toBe("/skill:be");
+		expect(await provider.getSuggestions(["/skill:be`"], 0, 10)).toBeNull();
+	});
+
 	it("passes the typed trigger to undo and leaves text removal to the editor", async () => {
 		let undoCalls = 0;
 		let undoPrefix = "";

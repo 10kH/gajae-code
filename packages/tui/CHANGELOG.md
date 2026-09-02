@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Skill slash-token autocomplete now recognizes subsequent `/skill:` and `/skill-` tokens on the same or later lines without broadening ordinary inline slash-command completion; completion remains suppressed inside inline code and replaces only the active token.
+
 ## [0.16.0] - 2026-09-02
 
 ## [0.15.6] - 2026-08-30

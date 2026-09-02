@@ -7,9 +7,34 @@ import {
 	type AutocompleteItem,
 	type AutocompleteProvider,
 	CombinedAutocompleteProvider,
+	extractSlashCommandTokenPrefix,
 } from "@gajae-code/tui/autocomplete";
 import { Editor } from "@gajae-code/tui/components/editor";
 import { defaultEditorTheme } from "./test-themes";
+
+describe("skill slash token extraction", () => {
+	it("keeps the first slash token behavior unchanged", () => {
+		expect(extractSlashCommandTokenPrefix("/model")).toBe("/model");
+	});
+
+	it("extracts only a later skill token after whitespace", () => {
+		expect(extractSlashCommandTokenPrefix("/skill:alpha x /skill:be")).toBe("/skill:be");
+		expect(extractSlashCommandTokenPrefix("prior content /skill-be")).toBe("/skill-be");
+	});
+
+	it("does not broaden ordinary inline slash tokens or inline code", () => {
+		expect(extractSlashCommandTokenPrefix("prior content /model")).toBeNull();
+		expect(extractSlashCommandTokenPrefix("prior content /skillful")).toBeNull();
+		expect(extractSlashCommandTokenPrefix("prior content ` /skill:be")).toBeNull();
+		expect(extractSlashCommandTokenPrefix("prior content ` /skill:be`")).toBeNull();
+		expect(extractSlashCommandTokenPrefix("prior content /skill:be`")).toBeNull();
+		expect(extractSlashCommandTokenPrefix("prior content /skill:be\\`")).toBeNull();
+	});
+
+	it("recognizes skill prefixes case-insensitively", () => {
+		expect(extractSlashCommandTokenPrefix("/Skill:be")).toBe("/Skill:be");
+	});
+});
 
 class HashActionProvider implements AutocompleteProvider {
 	async getSuggestions(
@@ -188,6 +213,9 @@ class InlineSkillProvider implements AutocompleteProvider {
 			items: [{ value: "skill:autoresearch", label: "skill:autoresearch" }],
 		};
 	}
+	async getForceFileSuggestions(): Promise<null> {
+		return null;
+	}
 	trySyncSlashCompletion(textBeforeCursor: string): { items: AutocompleteItem[]; prefix: string } | null {
 		this.syncCallCount += 1;
 		const prefix = textBeforeCursor.slice(textBeforeCursor.lastIndexOf("/"));
@@ -363,19 +391,62 @@ describe("Editor Enter handler sync slash completion", () => {
 		expect(editor.isShowingAutocomplete()).toBe(false);
 	});
 
-	it("does not auto-trigger inline slash skill autocomplete after prompt text", async () => {
+	it("auto-triggers inline slash skill autocomplete after prompt text", async () => {
 		const provider = new InlineSkillProvider();
 		const editor = new Editor(defaultEditorTheme);
 		editor.setAutocompleteProvider(provider);
 
-		editor.handleInput("explain with /skill-te");
+		editor.handleInput("explain with /skill-au");
 		await Bun.sleep(0);
 
-		expect(provider.suggestionCalls).toBe(0);
+		expect(provider.suggestionCalls).toBeGreaterThan(0);
+		expect(editor.isShowingAutocomplete()).toBe(true);
+	});
+
+	it("applies inline slash skill completion without changing preceding text", async () => {
+		const provider = new InlineSkillProvider();
+		const editor = new Editor(defaultEditorTheme);
+		editor.setAutocompleteProvider(provider);
+		let submitted = "";
+		editor.onSubmit = text => {
+			submitted = text;
+		};
+
+		editor.handleInput("explain with /skill-au");
+		await Bun.sleep(0);
+		editor.handleInput("\r");
+
+		expect(submitted).toBe("explain with /skill:autoresearch");
+	});
+
+	it("completes a later-line skill token after non-empty prompt content", async () => {
+		const provider = new InlineSkillProvider();
+		const editor = new Editor(defaultEditorTheme);
+		editor.setAutocompleteProvider(provider);
+		editor.setText("explain this\n/skill-au");
+
+		editor.handleInput("\t");
+		await Bun.sleep(0);
+		expect(editor.isShowingAutocomplete()).toBe(true);
+		editor.handleInput("\t");
+
+		expect(editor.getText()).toBe("explain this\n/skill:autoresearch ");
+	});
+
+	it("suppresses a skill token inside a multiline inline-code span", async () => {
+		const provider = new InlineSkillProvider();
+		const editor = new Editor(defaultEditorTheme);
+		editor.setAutocompleteProvider(provider);
+		editor.setText("explain `quoted\n/skill-au");
+
+		editor.handleInput("\t");
+		await Bun.sleep(20);
+
 		expect(editor.isShowingAutocomplete()).toBe(false);
+		expect(editor.getText()).toBe("explain `quoted\n/skill-au");
 	});
 
-	it("submits inline slash skill text without completion", async () => {
+	it("synchronously completes a later-line slash skill token on Enter", () => {
 		const provider = new InlineSkillProvider();
 		const editor = new Editor(defaultEditorTheme);
 		editor.setAutocompleteProvider(provider);
@@ -384,26 +455,11 @@ describe("Editor Enter handler sync slash completion", () => {
 			submitted = text;
 		};
 
-		editor.handleInput("explain with /skill-te");
-		await Bun.sleep(0);
+		editor.setText("explain this\n/skill-au");
 		editor.handleInput("\r");
 
-		expect(submitted).toBe("explain with /skill-te");
-	});
-	it("does not synchronously rewrite a slash skill token on a later prompt line", () => {
-		const provider = new InlineSkillProvider();
-		const editor = new Editor(defaultEditorTheme);
-		editor.setAutocompleteProvider(provider);
-		let submitted = "";
-		editor.onSubmit = text => {
-			submitted = text;
-		};
-
-		editor.setText("explain this\n/skill-te");
-		editor.handleInput("\r");
-
-		expect(submitted).toBe("explain this\n/skill-te");
-		expect(provider.syncCallCount).toBe(0);
+		expect(submitted).toBe("explain this\n/skill:autoresearch");
+		expect(provider.syncCallCount).toBe(1);
 	});
 	it.each(["\n/m", "  /m"])("shows command completion for prompt-start whitespace: %s", async initialText => {
 		const editor = new Editor(defaultEditorTheme);
@@ -430,6 +486,21 @@ describe("Editor Enter handler sync slash completion", () => {
 		editor.handleInput("\r");
 
 		expect(submitted).toBe("please use `/skill-te");
+		expect(provider.syncCallCount).toBe(0);
+	});
+	it("suppresses an escaped-backtick skill token during synchronous Enter completion", () => {
+		const provider = new InlineSkillProvider();
+		const editor = new Editor(defaultEditorTheme);
+		editor.setAutocompleteProvider(provider);
+		let submitted = "";
+		editor.onSubmit = text => {
+			submitted = text;
+		};
+
+		editor.handleInput("please use /skill:te\\`");
+		editor.handleInput("\r");
+
+		expect(submitted).toBe("please use /skill:te\\`");
 		expect(provider.syncCallCount).toBe(0);
 	});
 	it("preserves submitted-command argument completion inside inline code", async () => {

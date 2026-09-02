@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Agent, type AgentMessage } from "@gajae-code/agent-core";
 import { getBundledModel } from "@gajae-code/ai";
+import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { modeStatePath } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
@@ -88,7 +89,7 @@ test.serial("forwards preflight cancellation when a prompt reroutes to a skill",
 		return { name: _name, path: "/tmp/fixture-skill/SKILL.md", args: _args };
 	});
 
-	const prompt = session.prompt("/skill:fixture-skill review", {
+	const prompt = session.prompt("/Skill:fixture-skill review", {
 		preflightSignal: controller.signal,
 	});
 	await rerouteStarted.promise;
@@ -98,6 +99,40 @@ test.serial("forwards preflight cancellation when a prompt reroutes to a skill",
 	expect(invokeSkill).toHaveBeenCalledWith("fixture-skill", "review", {
 		preflightSignal: controller.signal,
 	});
+});
+
+test.serial("does not reroute ordinary text that merely contains a later skill token", async () => {
+	tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-skill-leading-slash-"));
+	const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+	authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
+	authStorage.setRuntimeApiKey("anthropic", "test-key");
+	const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+	const mock = createMockModel({ responses: [{ content: ["ack"] }] });
+	const agent = new Agent({
+		getApiKey: () => "test-key",
+		initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+		streamFn: mock.stream,
+	});
+	session = new AgentSession({
+		agent,
+		sessionManager: createLifecycleIndependentSessionManager(),
+		settings: Settings.isolated({ "compaction.enabled": false }),
+		modelRegistry,
+		skills: [
+			{
+				name: "fixture-skill",
+				description: "Fixture skill",
+				filePath: "/tmp/fixture-skill/SKILL.md",
+				baseDir: "/tmp/fixture-skill",
+				source: "test",
+			},
+		],
+	});
+
+	const invokeSkill = vi.spyOn(session, "invokeSkill");
+	await session.prompt("xskill:noise /skill:fixture-skill review");
+
+	expect(invokeSkill).not.toHaveBeenCalled();
 });
 
 test.serial("keeps SDK ownership when an internal skill invocation becomes a custom prompt", async () => {

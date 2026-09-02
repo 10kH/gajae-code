@@ -122,7 +122,7 @@ export interface LoadSkillsOptions extends SkillsSettings {
  */
 const LOADABLE_SKILL_PROVIDERS = new Set(["native"]);
 
-const BUILT_IN_SKILL_NAMES = new Set<string>(CANONICAL_GJC_WORKFLOW_SKILLS);
+const BUILT_IN_SKILL_NAMES = new Set<string>(CANONICAL_GJC_WORKFLOW_SKILLS.map(name => name.toLowerCase()));
 
 /**
  * Load skills from all configured locations.
@@ -235,21 +235,22 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 		// workflow-routing hijack: warn, and let the session merge keep the bundled
 		// definition authoritative (sdk/session.ts). User-scope copies are not
 		// warned about: installed defaults legitimately mirror bundled skills.
-		if (capSkill.level === "project" && BUILT_IN_SKILL_NAMES.has(capSkill.name)) {
+		if (capSkill.level === "project" && BUILT_IN_SKILL_NAMES.has(capSkill.name.toLowerCase())) {
 			collisionWarnings.push({
 				skillPath: capSkill.path,
 				message: `name collision: "${capSkill.name}" is a bundled GJC workflow skill; the bundled definition takes precedence in sessions and this project copy is never used`,
 			});
 		}
 
-		const existing = skillMap.get(capSkill.name);
+		const skillKey = capSkill.name.toLowerCase();
+		const existing = skillMap.get(skillKey);
 		if (existing) {
 			collisionWarnings.push({
 				skillPath: capSkill.path,
 				message: `name collision: "${capSkill.name}" already loaded from ${existing.filePath}, skipping this one`,
 			});
 		} else {
-			skillMap.set(capSkill.name, {
+			skillMap.set(skillKey, {
 				name: capSkill.name,
 				description: typeof capSkill.frontmatter?.description === "string" ? capSkill.frontmatter.description : "",
 				filePath: capSkill.path,
@@ -318,14 +319,15 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 		const resolvedPath = customRealPaths[i];
 		if (realPathSet.has(resolvedPath)) continue;
 
-		const existing = skillMap.get(skill.name);
+		const skillKey = skill.name.toLowerCase();
+		const existing = skillMap.get(skillKey);
 		if (existing) {
 			collisionWarnings.push({
 				skillPath: skill.filePath,
 				message: `name collision: "${skill.name}" already loaded from ${existing.filePath}, skipping this one`,
 			});
 		} else {
-			skillMap.set(skill.name, skill);
+			skillMap.set(skillKey, skill);
 			realPathSet.add(resolvedPath);
 		}
 	}
@@ -358,7 +360,7 @@ export function getSkillSlashCommandName(skill: Pick<Skill, "name">): string {
 }
 
 export function isNamespacedSkillSlashCommandName(commandName: string): boolean {
-	return commandName.startsWith("skill:");
+	return commandName.toLowerCase().startsWith("skill:");
 }
 
 export function getSkillSlashCommandNames(skill: Pick<Skill, "name">): string[] {
@@ -366,7 +368,7 @@ export function getSkillSlashCommandNames(skill: Pick<Skill, "name">): string[] 
 }
 
 export function isSkillSlashCommandName(commandName: string, skill: Pick<Skill, "name">): boolean {
-	return commandName === getSkillSlashCommandName(skill);
+	return commandName.toLowerCase() === getSkillSlashCommandName(skill).toLowerCase();
 }
 
 export interface ResolvedSkillSlashCommand {
@@ -410,12 +412,19 @@ export function parseSkillInvocations(
 ): ParsedSkillInvocation[] {
 	const trimmedText = text.trim();
 	if (!trimmedText) return [];
-	const canonicalSkillCommandPattern = /(^|\s)\/(skill:[^\s]+)/g;
+	const normalizedSkillsByCommandName = new Map<string, Skill>();
+	for (const [commandName, skill] of skillsByCommandName) {
+		const normalizedCommandName = commandName.toLowerCase();
+		if (!normalizedSkillsByCommandName.has(normalizedCommandName)) {
+			normalizedSkillsByCommandName.set(normalizedCommandName, skill);
+		}
+	}
+	const canonicalSkillCommandPattern = /(^|\s)\/(skill:[^\s]+)/gi;
 	const matches: SkillTokenMatch[] = [];
 	for (const match of trimmedText.matchAll(canonicalSkillCommandPattern)) {
 		const commandName = match[2];
 		if (!commandName) continue;
-		const skill = skillsByCommandName.get(commandName);
+		const skill = normalizedSkillsByCommandName.get(commandName.toLowerCase());
 		if (!skill) continue;
 		const leading = match[1] ?? "";
 		const index = (match.index ?? 0) + leading.length;
@@ -458,10 +467,11 @@ export function resolveSkillSlashCommands(
 	for (const skill of skills) {
 		if (skill.hide === true) continue;
 		for (const name of getSkillSlashCommandNames(skill)) {
-			if (claimedNames.has(name)) {
+			const normalizedName = name.toLowerCase();
+			if (claimedNames.has(normalizedName)) {
 				continue;
 			}
-			claimedNames.add(name);
+			claimedNames.add(normalizedName);
 			commands.push({ name, description: skill.description, skill });
 		}
 	}

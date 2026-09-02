@@ -6,6 +6,8 @@ import {
 	CombinedAutocompleteProvider,
 	extractSlashCommandTokenPrefix,
 	getSlashCommandMatchRank,
+	hasInlineCodeDelimiter,
+	isInsideInlineCodeSpan,
 	normalizeFuzzyText,
 	type SlashCommand,
 } from "@gajae-code/tui";
@@ -140,7 +142,7 @@ function withoutSkillCommandSuggestions(
 	suggestions: { items: AutocompleteItem[]; prefix: string } | null,
 ): { items: AutocompleteItem[]; prefix: string } | null {
 	if (!suggestions) return null;
-	const items = suggestions.items.filter(item => !item.value.startsWith("skill:"));
+	const items = suggestions.items.filter(item => !item.value.toLowerCase().startsWith("skill:"));
 	return items.length > 0 ? { ...suggestions, items } : null;
 }
 
@@ -158,6 +160,21 @@ function getPromptActionPrefix(textBeforeCursor: string): string | null {
 
 function getSlashTokenPrefix(textBeforeCursor: string): string | null {
 	return extractSlashCommandTokenPrefix(textBeforeCursor);
+}
+
+function getRawSlashTokenPrefix(textBeforeCursor: string): string | null {
+	return textBeforeCursor.match(/(?:^|\s)(\/[^\s]*)$/)?.[1] ?? null;
+}
+
+function isSlashTokenInsideInlineCodeSpan(
+	lines: string[],
+	cursorLine: number,
+	textBeforeCursor: string,
+	prefix: string,
+): boolean {
+	const tokenStart = textBeforeCursor.length - prefix.length;
+	const textBeforeToken = [...lines.slice(0, cursorLine), textBeforeCursor.slice(0, tokenStart)].join("\n");
+	return isInsideInlineCodeSpan(textBeforeToken);
 }
 
 export class PromptActionAutocompleteProvider implements AutocompleteProvider {
@@ -211,8 +228,13 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 			}
 		}
 
+		const rawSlashPrefix = getRawSlashTokenPrefix(textBeforeCursor);
 		const slashPrefix = getSlashTokenPrefix(textBeforeCursor);
-		if (slashPrefix) {
+		const slashTokenInsideCode =
+			rawSlashPrefix !== null &&
+			(hasInlineCodeDelimiter(rawSlashPrefix) ||
+				isSlashTokenInsideInlineCodeSpan(lines, cursorLine, textBeforeCursor, rawSlashPrefix));
+		if (slashPrefix && !slashTokenInsideCode) {
 			const baseSuggestions = withoutSkillCommandSuggestions(
 				await this.#baseProvider.getSuggestions(lines, cursorLine, cursorCol),
 			);
@@ -224,6 +246,9 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 				mergeAutocompleteSuggestions(baseSuggestions, skillCommandSuggestions),
 				this.#commands,
 			);
+		}
+		if (rawSlashPrefix && slashTokenInsideCode) {
+			return withoutSkillCommandSuggestions(await this.#baseProvider.getSuggestions(lines, cursorLine, cursorCol));
 		}
 
 		if (!isSettingsInitialized() || settings.get("emojiAutocomplete")) {
@@ -282,12 +307,13 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 			const currentLine = lines[cursorLine] || "";
 			const beforePrefix = currentLine.slice(0, cursorCol - prefix.length);
 			const afterCursor = currentLine.slice(cursorCol);
+			const separator = afterCursor.length === 0 ? " " : "";
 			const newLines = [...lines];
-			newLines[cursorLine] = `${beforePrefix}/${item.value} ${afterCursor}`;
+			newLines[cursorLine] = `${beforePrefix}/${item.value}${separator}${afterCursor}`;
 			return {
 				lines: newLines,
 				cursorLine,
-				cursorCol: beforePrefix.length + item.value.length + 2,
+				cursorCol: beforePrefix.length + item.value.length + 1 + separator.length,
 			};
 		}
 		return this.#baseProvider.applyCompletion(lines, cursorLine, cursorCol, item, prefix);

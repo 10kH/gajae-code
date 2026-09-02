@@ -9,6 +9,7 @@ import {
 	loadSkills,
 	loadSkillsFromDir,
 	parseSkillInvocations,
+	resolveSkillSlashCommands,
 	type Skill,
 } from "@gajae-code/coding-agent/extensibility/skills";
 import { safeRm } from "../../../scripts/safe-cleanup";
@@ -72,6 +73,31 @@ describe("parseSkillInvocations", () => {
 			{ commandName: "skill:alpha", args: "use and for this", skill: alpha },
 			{ commandName: "skill:beta", args: "use and for this", skill: beta },
 		]);
+	});
+
+	it("matches canonical skill invocations case-insensitively", () => {
+		expect(parseSkillInvocations("/Skill:alpha first /SKILL:beta second", skillsByCommandName)).toEqual([
+			{ commandName: "Skill:alpha", args: "first", skill: alpha },
+			{ commandName: "SKILL:beta", args: "second", skill: beta },
+		]);
+	});
+
+	it("deduplicates case-only skill command names consistently", () => {
+		const first = makeSkill("Foo");
+		const second = makeSkill("foo");
+
+		expect(resolveSkillSlashCommands([first, second], new Set())).toEqual([
+			{ name: "skill:Foo", description: "Foo description", skill: first },
+		]);
+		expect(
+			parseSkillInvocations(
+				"/SKILL:foo",
+				new Map([
+					["skill:Foo", first],
+					["skill:foo", second],
+				]),
+			),
+		).toEqual([{ commandName: "SKILL:foo", args: "", skill: first }]);
 	});
 
 	it("does not treat aliases or unknown leading skill commands as invocations", () => {
@@ -483,7 +509,7 @@ description: Skill loaded from a tilde-expanded custom directory.
 				await fs.mkdir(root, { recursive: true });
 				await fs.writeFile(
 					path.join(root, "SKILL.md"),
-					["---", "name: ralplan", "description: On-disk impostor", "---", "", "# Impostor"].join("\n"),
+					["---", "name: RalPlan", "description: On-disk impostor", "---", "", "# Impostor"].join("\n"),
 				);
 
 				// The disk copy is still scanned (installed defaults are a documented
@@ -491,7 +517,7 @@ description: Skill loaded from a tilde-expanded custom directory.
 				// definition authoritative (covered by sdk-skills.test.ts) and the
 				// project-scope copy is diagnosed as a protected-name collision.
 				const { skills, warnings } = await loadSkills({ cwd: tempDir, home: tempHome });
-				expect(skills.some(skill => skill.name === "ralplan")).toBe(true);
+				expect(skills.some(skill => skill.name === "RalPlan")).toBe(true);
 				expect(warnings.some(w => w.message.includes("bundled GJC workflow skill"))).toBe(true);
 
 				// The legacy alias still disables the scope explicitly.
@@ -645,6 +671,32 @@ description: Skill loaded from a tilde-expanded custom directory.
 			expect(skillMap.get("calendar")?.source).toBe("first");
 			expect(collisionWarnings).toHaveLength(1);
 			expect(collisionWarnings[0].message).toContain("name collision");
+		});
+
+		it("keeps project scope authoritative across case-variant names", async () => {
+			const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-case-precedence-skills-"));
+			const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-case-precedence-home-"));
+			try {
+				await fs.mkdir(path.join(tempDir, ".git"));
+				const projectDir = path.join(tempDir, ".gjc", "skills", "foo");
+				const userDir = path.join(tempHome, ".gjc", "agent", "skills", "Foo");
+				await fs.mkdir(projectDir, { recursive: true });
+				await fs.mkdir(userDir, { recursive: true });
+				const skillFile = (name: string, body: string) =>
+					["---", `name: ${name}`, "description: case variant", "---", "", body].join("\n");
+				await fs.writeFile(path.join(projectDir, "SKILL.md"), skillFile("foo", "project body"));
+				await fs.writeFile(path.join(userDir, "SKILL.md"), skillFile("Foo", "user body"));
+
+				const { skills, warnings } = await loadSkills({ cwd: tempDir, home: tempHome });
+				const matches = skills.filter(skill => skill.name.toLowerCase() === "foo");
+				expect(matches).toHaveLength(1);
+				expect(matches[0]?.source).toBe("native:project");
+				expect(matches[0]?.filePath).toBe(path.join(projectDir, "SKILL.md"));
+				expect(warnings.some(w => w.message.includes('name collision: "Foo"'))).toBe(true);
+			} finally {
+				await safeRm(tempDir, { recursive: true, force: true });
+				await safeRm(tempHome, { recursive: true, force: true });
+			}
 		});
 	});
 
