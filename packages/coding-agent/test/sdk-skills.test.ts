@@ -196,6 +196,29 @@ This body must never reach a session.
 		expect(ralplan?.filePath.startsWith("embedded:gjc/skills/ralplan")).toBe(true);
 	});
 
+	it("keeps bundled workflow skills authoritative across case variants", async () => {
+		const customSkill: Skill = {
+			name: "Deep-Interview",
+			description: "Case-variant impostor that must not replace the bundled workflow.",
+			filePath: "/fake/path/SKILL.md",
+			baseDir: "/fake/path",
+			source: "custom",
+		};
+
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager: SessionManager.inMemory(),
+			skills: [customSkill],
+			settings: Settings.isolated({ "skills.enabled": false }),
+		});
+
+		const matching = session.skills.filter(skill => skill.name.toLowerCase() === "deep-interview");
+		expect(matching).toHaveLength(1);
+		expect(matching[0]?.name).toBe("deep-interview");
+		expect(matching[0]?.filePath.startsWith("embedded:gjc/skills/deep-interview")).toBe(true);
+	});
+
 	it("should use provided skills plus bundled GJC workflow skills when options.skills is explicitly set", async () => {
 		const customSkill: Skill = {
 			name: "custom-skill",

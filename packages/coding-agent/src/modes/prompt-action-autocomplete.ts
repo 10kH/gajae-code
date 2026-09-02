@@ -141,7 +141,7 @@ function withoutSkillCommandSuggestions(
 	suggestions: { items: AutocompleteItem[]; prefix: string } | null,
 ): { items: AutocompleteItem[]; prefix: string } | null {
 	if (!suggestions) return null;
-	const items = suggestions.items.filter(item => !item.value.startsWith("skill:"));
+	const items = suggestions.items.filter(item => !item.value.toLowerCase().startsWith("skill:"));
 	return items.length > 0 ? { ...suggestions, items } : null;
 }
 
@@ -159,6 +159,10 @@ function getPromptActionPrefix(textBeforeCursor: string): string | null {
 
 function getSlashTokenPrefix(textBeforeCursor: string): string | null {
 	return extractSlashCommandTokenPrefix(textBeforeCursor);
+}
+
+function getRawSlashTokenPrefix(textBeforeCursor: string): string | null {
+	return textBeforeCursor.match(/(?:^|\s)(\/[^\s]*)$/)?.[1] ?? null;
 }
 
 function isSlashTokenInsideInlineCodeSpan(
@@ -223,8 +227,13 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 			}
 		}
 
+		const rawSlashPrefix = getRawSlashTokenPrefix(textBeforeCursor);
 		const slashPrefix = getSlashTokenPrefix(textBeforeCursor);
-		if (slashPrefix && !isSlashTokenInsideInlineCodeSpan(lines, cursorLine, textBeforeCursor, slashPrefix)) {
+		const slashTokenInsideCode =
+			rawSlashPrefix !== null &&
+			(rawSlashPrefix.includes("`") ||
+				isSlashTokenInsideInlineCodeSpan(lines, cursorLine, textBeforeCursor, rawSlashPrefix));
+		if (slashPrefix && !slashTokenInsideCode) {
 			const baseSuggestions = withoutSkillCommandSuggestions(
 				await this.#baseProvider.getSuggestions(lines, cursorLine, cursorCol),
 			);
@@ -236,6 +245,9 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 				mergeAutocompleteSuggestions(baseSuggestions, skillCommandSuggestions),
 				this.#commands,
 			);
+		}
+		if (rawSlashPrefix && slashTokenInsideCode) {
+			return withoutSkillCommandSuggestions(await this.#baseProvider.getSuggestions(lines, cursorLine, cursorCol));
 		}
 
 		if (!isSettingsInitialized() || settings.get("emojiAutocomplete")) {

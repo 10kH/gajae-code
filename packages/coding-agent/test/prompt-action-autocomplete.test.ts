@@ -247,6 +247,7 @@ describe("prompt action autocomplete", () => {
 
 		expect(await provider.getSuggestions(["explain `quoted", "/skill:be"], 1, 9)).toBeNull();
 		expect((await provider.getSuggestions(["explain `quoted`", "/skill:be"], 1, 9))?.prefix).toBe("/skill:be");
+		expect(await provider.getSuggestions(["/skill:be`"], 0, 10)).toBeNull();
 	});
 
 	it("passes the typed trigger to undo and leaves text removal to the editor", async () => {

@@ -27,6 +27,7 @@ describe("skill slash token extraction", () => {
 		expect(extractSlashCommandTokenPrefix("prior content /skillful")).toBeNull();
 		expect(extractSlashCommandTokenPrefix("prior content ` /skill:be")).toBeNull();
 		expect(extractSlashCommandTokenPrefix("prior content ` /skill:be`")).toBeNull();
+		expect(extractSlashCommandTokenPrefix("prior content /skill:be`")).toBeNull();
 	});
 
 	it("recognizes skill prefixes case-insensitively", () => {

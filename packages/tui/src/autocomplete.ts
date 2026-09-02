@@ -257,6 +257,27 @@ export function isInsideInlineCodeSpan(text: string): boolean {
 	return findOpenInlineCodeSpanStart(text) !== null;
 }
 
+function hasUnescapedInlineCodeDelimiter(text: string): boolean {
+	for (let i = 0; i < text.length; ) {
+		if (text[i] !== "`") {
+			i += 1;
+			continue;
+		}
+		let runEnd = i + 1;
+		while (text[runEnd] === "`") runEnd += 1;
+		if (runEnd - i !== 1) {
+			i = runEnd;
+			continue;
+		}
+
+		let backslashCount = 0;
+		for (let j = i - 1; j >= 0 && text[j] === "\\"; j -= 1) backslashCount += 1;
+		if (backslashCount % 2 === 0) return true;
+		i = runEnd;
+	}
+	return false;
+}
+
 export function isSkillSlashCommandToken(text: string): boolean {
 	return /^\/skill(?::|-)/i.test(text);
 }
@@ -264,7 +285,7 @@ export function isSkillSlashCommandToken(text: string): boolean {
 export function extractSlashCommandTokenPrefix(text: string): string | null {
 	const match = text.match(/(?:^|\s)(\/[^\s]*)$/);
 	const token = match?.[1];
-	if (!token || token.slice(1).includes("/")) return null;
+	if (!token || token.slice(1).includes("/") || hasUnescapedInlineCodeDelimiter(token)) return null;
 
 	const tokenStart = text.length - token.length;
 	if (isInsideInlineCodeSpan(text.slice(0, tokenStart))) return null;
