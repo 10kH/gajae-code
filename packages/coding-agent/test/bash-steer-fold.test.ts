@@ -199,6 +199,17 @@ describe("steer-triggered bash fold", () => {
 		expect(harness.folds).toHaveLength(0);
 	}, 10_000);
 
+	it("parity 5: a session that cannot report steering arrivals is not steer-foldable (fail closed)", async () => {
+		harness = createSteerHarness(cwd, { omitArrivalSeq: true });
+		const tool = new BashTool(harness.session);
+		const resultPromise = tool.execute("steer-gate-no-seq", { command: "sleep 2.4; printf 'done\\n'", timeout: 30 });
+		await Bun.sleep(STEER_FOLD_GRACE_MS + 100);
+		harness.steer();
+		const result = await resultPromise;
+		expect(result.details?.async).toBeUndefined();
+		expect(harness.folds).toHaveLength(0);
+	}, 10_000);
+
 	it("a chord fold inside a turn ends the turn and records a chord reason without the steer line", async () => {
 		harness = createSteerHarness(cwd);
 		const tool = new BashTool(harness.session);

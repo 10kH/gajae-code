@@ -194,18 +194,18 @@ export interface BackgroundActivityTally {
 }
 
 /**
- * Classify running jobs for the activity indicator. Subagents are `task` jobs
- * carrying subagent metadata; monitors are flagged by `metadata.monitor`; every
- * other running job (plain async/folded bash, and task jobs without subagent
- * metadata such as scheduled batches) is background bash from the user's point
- * of view: a command-shaped job that will deliver a result later.
+ * Classify running jobs for the activity indicator using the three locked
+ * predicates: subagents are `task` jobs carrying subagent metadata, monitors
+ * are flagged by `metadata.monitor`, and background bash is a `bash` job that
+ * is not a monitor. A running job matching none of them (a task job without
+ * subagent metadata) is outside this indicator and is not counted.
  */
 export function tallyBackgroundActivity(running: readonly AsyncJobSnapshotItem[]): BackgroundActivityTally {
 	const tally: BackgroundActivityTally = { subagents: 0, backgroundBash: 0, monitors: 0 };
 	for (const item of running) {
 		if (item.type === "task" && item.metadata?.subagent !== undefined) tally.subagents += 1;
 		else if (item.metadata?.monitor === true) tally.monitors += 1;
-		else tally.backgroundBash += 1;
+		else if (item.type === "bash") tally.backgroundBash += 1;
 	}
 	return tally;
 }

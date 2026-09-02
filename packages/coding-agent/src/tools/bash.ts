@@ -1163,8 +1163,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	 * when the wait starts, or one that arrives inside the grace window, never
 	 * folds: the command finishes normally and that steer is consumed at the
 	 * ordinary tool boundary. The watcher keeps observing so a later qualifying
-	 * steer still folds. Returns a stop function; call it when the wait settles.
-	 * No-op when steer folding is gated off.
+	 * steer still folds, and re-checks the gates at that moment so a
+	 * `busyPromptMode`/`interruptMode` change during the command is honored.
+	 * Returns a stop function; call it when the wait settles. No-op when steer
+	 * folding is gated off at start.
 	 */
 	#watchSteerForFold(adapter: FoldAdapter, startedAt: number): () => void {
 		if (!this.#steerFoldEnabled()) return () => {};
@@ -1180,6 +1182,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				if (seq === undefined || watch.signal.aborted) return;
 				after = seq;
 				if (Date.now() - startedAt < STEER_FOLD_GRACE_MS) continue;
+				if (!this.#steerFoldEnabled()) continue;
 				await requestFold("steer", adapter);
 				return;
 			}

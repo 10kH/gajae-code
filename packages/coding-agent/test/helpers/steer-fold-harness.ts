@@ -35,6 +35,8 @@ export interface SteerHarnessOptions {
 	interruptMode?: "immediate" | "wait";
 	/** Omit the interrupt-mode accessor (fail-closed regression). */
 	omitInterruptMode?: boolean;
+	/** Omit the steering-arrival accessor (fail-closed regression). */
+	omitArrivalSeq?: boolean;
 	/** Manager retention for evicted-record probes. */
 	retentionMs?: number;
 }
@@ -137,7 +139,7 @@ export function createSteerHarness(cwd: string, options: SteerHarnessOptions = {
 			(await coordinator.requestFold(adapter, reason)).status === "folded",
 		...(options.omitInterruptMode ? {} : { getInterruptMode: () => agent.getInterruptMode() }),
 		waitForUserSteering: (signal, waitOptions) => agent.waitForSteeringArrival(signal, waitOptions),
-		getSteeringArrivalSeq: () => agent.steeringArrivalSeq,
+		...(options.omitArrivalSeq ? {} : { getSteeringArrivalSeq: () => agent.steeringArrivalSeq }),
 	};
 	return {
 		session,

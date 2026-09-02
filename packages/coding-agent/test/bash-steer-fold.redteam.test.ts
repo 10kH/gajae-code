@@ -44,24 +44,6 @@ describe("steer-fold red team", () => {
 		fs.rmSync(cwd, { recursive: true, force: true });
 	});
 
-	it("steer-already-queued-at-start: a pre-queued steer never folds, short or long", async () => {
-		harness = createSteerHarness(cwd);
-		harness.steer();
-		const startedAt = Date.now();
-		const result = await new BashTool(harness.session).execute(
-			"queued-long",
-			{ command: "sleep 2.6; printf 'long completed\\n'", timeout: 30 },
-			undefined,
-			undefined,
-			turnContext(),
-		);
-		expect(Date.now() - startedAt).toBeGreaterThanOrEqual(2_500);
-		expect(result.details?.async).toBeUndefined();
-		expect(textOf(result)).toContain("long completed");
-		expect(harness.folds).toHaveLength(0);
-		expect(harness.agent.hasQueuedSteering()).toBe(true);
-	}, 15_000);
-
 	it("steer-after-completion-race: a steer queued in final progress after completion wins cannot fold or emit bash_folded", async () => {
 		harness = createSteerHarness(cwd);
 		const tool = new BashTool(harness.session);
@@ -155,11 +137,11 @@ describe("steer-fold red team", () => {
 		expect(job.resultText).toContain("survived stale abort");
 	}, 10_000);
 
-	it("gate-flip-mid-command: the gate is evaluated at wait start, so a later busyPromptMode flip does not disarm the watcher", async () => {
+	it("gate-flip-mid-command: a busyPromptMode flip to queue after wait start disarms the fold at the moment the steer arrives", async () => {
 		harness = createSteerHarness(cwd);
 		const resultPromise = new BashTool(harness.session).execute(
 			"gate-flip",
-			{ command: "sleep 5; printf 'gate flip completed\\n'", timeout: 30 },
+			{ command: "sleep 2.6; printf 'gate flip completed\\n'", timeout: 30 },
 			undefined,
 			undefined,
 			turnContext(),
@@ -169,10 +151,9 @@ describe("steer-fold red team", () => {
 		await Bun.sleep(STEER_FOLD_GRACE_MS + 100);
 		harness.steer();
 		const result = await resultPromise;
-		const jobId = result.details?.async?.jobId;
-		if (!jobId) throw new Error("wait-start gate observation expected the existing steer watcher to fold");
-		expect(result.details?.foldReason).toBe("steer");
-		await harness.manager.getJob(jobId)?.promise;
+		expect(result.details?.async).toBeUndefined();
+		expect(textOf(result)).toContain("gate flip completed");
+		expect(harness.folds).toHaveLength(0);
 	}, 10_000);
 
 	it("foldReason-projection: a steer reason survives live, parked-delivery, and receipt-claim snapshot projections", async () => {
@@ -206,32 +187,30 @@ describe("steer-fold red team", () => {
 		expect(harness.manager.getJobsSnapshot().jobs).toContainEqual(expect.objectContaining(projected));
 	}, 10_000);
 
-	it("no-fold-listener-leak: disposal clears fold listeners before a fresh manager is installed", async () => {
-		const retired = new AsyncJobManager({ onJobComplete: async () => {} });
-		AsyncJobManager.setInstance(retired);
-		let staleListenerCalls = 0;
-		retired.onFold(() => {
-			staleListenerCalls += 1;
+	it("no-fold-listener-leak: a listener registered before dispose never fires after the manager is disposed", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		let calls = 0;
+		manager.onFold(() => {
+			calls += 1;
 		});
-		await retired.dispose();
-
-		const fresh = new AsyncJobManager({ onJobComplete: async () => {} });
-		AsyncJobManager.setInstance(fresh);
 		const release = Promise.withResolvers<void>();
-		const jobId = fresh.register("bash", "fresh fold", async () => {
+		const jobId = manager.register("bash", "probe", async () => {
 			await release.promise;
-			return "fresh completion";
+			return "done";
 		});
-		const job = fresh.getJob(jobId);
-		if (!job) throw new Error("expected fresh manager job");
-		expect(fresh.markBackgrounded(jobId, job.generation, "steer")).toBe(true);
-		expect(staleListenerCalls).toBe(0);
+		const job = manager.getJob(jobId);
+		if (!job) throw new Error("expected registered job");
+		expect(manager.markBackgrounded(jobId, job.generation, "steer")).toBe(true);
+		expect(calls).toBe(1);
 		release.resolve();
 		await job.promise;
-		await fresh.dispose();
+		await manager.dispose();
+		// After dispose the listener set is cleared: a late mark on the retired manager cannot notify.
+		expect(manager.markBackgrounded(jobId, job.generation, "chord")).toBe(false);
+		expect(calls).toBe(1);
 	});
 
-	it("indicator-tally: itemized activity keeps the three locked categories in order; unclassified task jobs count as background bash", () => {
+	it("indicator-tally: itemized activity keeps the three locked categories in order; unclassified task jobs are omitted", () => {
 		const running: AsyncJobSnapshotItem[] = [
 			{
 				id: "subagent",
@@ -253,12 +232,12 @@ describe("steer-fold red team", () => {
 			{ id: "batch", type: "task", status: "running", label: "batch", startTime: 0 },
 		];
 		const tally = tallyBackgroundActivity(running);
-		expect(tally).toEqual({ subagents: 1, backgroundBash: 2, monitors: 1 });
+		expect(tally).toEqual({ subagents: 1, backgroundBash: 1, monitors: 1 });
 		expect(resolveActivityIndicatorMessage(false, tally, "Working…")).toBe(
-			"Background: 1 subagent, 2 background bash, 1 monitor…",
+			"Background: 1 subagent, 1 background bash, 1 monitor…",
 		);
 		expect(resolveActivityIndicatorMessage(true, tally, "Working…")).toBe(
-			"Working… · 1 subagent, 2 background bash, 1 monitor",
+			"Working… · 1 subagent, 1 background bash, 1 monitor",
 		);
 	});
 

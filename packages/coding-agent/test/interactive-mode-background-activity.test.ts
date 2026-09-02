@@ -104,8 +104,8 @@ describe("interactive background activity indicator", () => {
 		const noActivity = { subagents: 0, backgroundBash: 0, monitors: 0 };
 		const mixedActivity = { subagents: 2, backgroundBash: 1, monitors: 1 };
 
-		// A task job without subagent metadata is a command-shaped background job from the user's view.
-		expect(tallyBackgroundActivity(running)).toEqual({ subagents: 1, backgroundBash: 2, monitors: 1 });
+		// A task job without subagent metadata matches none of the three locked predicates and is not counted.
+		expect(tallyBackgroundActivity(running)).toEqual({ subagents: 1, backgroundBash: 1, monitors: 1 });
 		expect(resolveActivityIndicatorMessage(false, noActivity, "Working…")).toBeUndefined();
 		expect(resolveActivityIndicatorMessage(true, noActivity, "Working…")).toBe("Working…");
 		expect(resolveActivityIndicatorMessage(false, mixedActivity, "Working…")).toBe(
@@ -377,7 +377,10 @@ describe("interactive background activity indicator", () => {
 
 		const cancelled = Promise.withResolvers<string>();
 		pendingJobs.push(cancelled);
-		const cancelledJobId = manager.register("task", "cancelled activity", () => cancelled.promise, { ownerId });
+		const cancelledJobId = manager.register("task", "cancelled activity", () => cancelled.promise, {
+			ownerId,
+			metadata: { subagent: { id: "cancelled-subagent", agent: "executor", agentSource: "bundled" } },
+		});
 		await waitFor(() => mode.loadingAnimation !== undefined);
 		expect(manager.cancel(cancelledJobId, { ownerId })).toBe(true);
 		await waitFor(() => mode.loadingAnimation === undefined);
