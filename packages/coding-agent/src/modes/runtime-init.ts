@@ -199,6 +199,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 				return { bytes: new Uint8Array(await file.slice(start, end).arrayBuffer()), totalBytes: file.size };
 			},
 			getJobs: () => session.getAsyncJobSnapshot(),
+			onJobFold: listener => session.onJobFold(listener),
 			setSdkPermissionProvider: provider => session.setSdkPermissionProvider(provider),
 			setSdkClientBridge: bridge => session.setClientBridge(bridge),
 			sdkControl: async (operation, input) => {
@@ -347,7 +348,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 						return { retried: true, immediate: true };
 					}
 					case "bash.background": {
-						if (!(await session.requestForegroundBashBackground()))
+						if (!(await session.requestForegroundBashBackground("sdk_control")))
 							throw Object.assign(
 								new Error("The active bash command cannot be moved to a managed background job."),
 								{ code: "not_foldable" },

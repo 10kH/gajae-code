@@ -6,9 +6,13 @@ import { AsyncJobManager } from "@gajae-code/coding-agent/async/job-manager";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { EventController } from "@gajae-code/coding-agent/modes/controllers/event-controller";
-import { InteractiveMode, resolveActivityIndicatorMessage } from "@gajae-code/coding-agent/modes/interactive-mode";
+import {
+	InteractiveMode,
+	resolveActivityIndicatorMessage,
+	tallyBackgroundActivity,
+} from "@gajae-code/coding-agent/modes/interactive-mode";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
-import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
+import { AgentSession, type AsyncJobSnapshotItem } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { Container, Loader } from "@gajae-code/tui";
@@ -76,11 +80,48 @@ describe("interactive background activity indicator", () => {
 		resetSettingsForTest();
 	});
 
-	it("distinguishes foreground and background activity messages", () => {
-		expect(resolveActivityIndicatorMessage(false, 0, "Working…")).toBeUndefined();
-		expect(resolveActivityIndicatorMessage(false, 1, "Working…")).toBe("Background: 1 task…");
-		expect(resolveActivityIndicatorMessage(false, 2, "Working…")).toBe("Background: 2 tasks…");
-		expect(resolveActivityIndicatorMessage(true, 2, "Working…")).toBe("Working… · 2 background tasks");
+	it("tallies and distinguishes foreground and background activity messages", () => {
+		const running: AsyncJobSnapshotItem[] = [
+			{
+				id: "subagent",
+				type: "task",
+				status: "running",
+				label: "subagent",
+				startTime: 0,
+				metadata: { subagent: { id: "subagent", agent: "executor", agentSource: "bundled" } },
+			},
+			{ id: "bash", type: "bash", status: "running", label: "bash", startTime: 0 },
+			{
+				id: "monitor",
+				type: "bash",
+				status: "running",
+				label: "monitor",
+				startTime: 0,
+				metadata: { monitor: true },
+			},
+			{ id: "other", type: "task", status: "running", label: "other", startTime: 0 },
+		];
+		const noActivity = { subagents: 0, backgroundBash: 0, monitors: 0, other: 0 };
+		const mixedActivity = { subagents: 2, backgroundBash: 1, monitors: 1, other: 0 };
+
+		expect(tallyBackgroundActivity(running)).toEqual({ subagents: 1, backgroundBash: 1, monitors: 1, other: 1 });
+		expect(resolveActivityIndicatorMessage(false, noActivity, "Working…")).toBeUndefined();
+		expect(resolveActivityIndicatorMessage(true, noActivity, "Working…")).toBe("Working…");
+		expect(resolveActivityIndicatorMessage(false, mixedActivity, "Working…")).toBe(
+			"Background: 2 subagents, 1 background bash, 1 monitor…",
+		);
+		expect(resolveActivityIndicatorMessage(true, mixedActivity, "Working…")).toBe(
+			"Working… · 2 subagents, 1 background bash, 1 monitor",
+		);
+		expect(
+			resolveActivityIndicatorMessage(false, { subagents: 1, backgroundBash: 0, monitors: 0, other: 0 }, "Working…"),
+		).toBe("Background: 1 subagent…");
+		expect(
+			resolveActivityIndicatorMessage(true, { subagents: 0, backgroundBash: 1, monitors: 0, other: 0 }, "Working…"),
+		).toBe("Working… · 1 background bash");
+		expect(
+			resolveActivityIndicatorMessage(false, { subagents: 0, backgroundBash: 0, monitors: 0, other: 2 }, "Working…"),
+		).toBe("Background: 2 other jobs…");
 	});
 
 	it("uses layout-only repaints for the foreground activity indicator", () => {
@@ -169,7 +210,12 @@ describe("interactive background activity indicator", () => {
 		if (!ownerId) throw new Error("Expected an owner id");
 		const background = Promise.withResolvers<string>();
 		pendingJobs.push(background);
-		const jobId = manager.register("task", "terminal-boundary activity", () => background.promise, { ownerId });
+		const jobId = manager.register("task", "terminal-boundary activity", () => background.promise, {
+			ownerId,
+			metadata: {
+				subagent: { id: "terminal-boundary-subagent", agent: "executor", agentSource: "bundled" },
+			},
+		});
 		manager.registerSubagentRecord({
 			subagentId: "terminal-boundary-subagent",
 			ownerId,
@@ -188,23 +234,23 @@ describe("interactive background activity indicator", () => {
 		mode.syncActivityIndicator();
 		const backgroundLoader = mode.loadingAnimation;
 		if (!backgroundLoader) throw new Error("Expected background loader after agent_end");
-		expect(renderStatus(mode)).toContain("Background: 1 task…");
+		expect(renderStatus(mode)).toContain("Background: 1 subagent…");
 
 		await controller.handleEvent({ type: "agent_end", messages: [] });
 		mode.syncActivityIndicator();
 		expect(mode.loadingAnimation).toBe(backgroundLoader);
-		expect(renderStatus(mode)).toContain("Background: 1 task…");
+		expect(renderStatus(mode)).toContain("Background: 1 subagent…");
 
 		const releaseSuspension = mode.suspendActivityIndicator();
 		expect(renderStatus(mode)).toBe("");
 		await controller.handleEvent({ type: "agent_end", messages: [] });
 		releaseSuspension();
 		expect(mode.loadingAnimation).toBe(backgroundLoader);
-		expect(renderStatus(mode)).toContain("Background: 1 task…");
+		expect(renderStatus(mode)).toContain("Background: 1 subagent…");
 
 		await controller.handleEvent({ type: "agent_start" });
 		expect(renderStatus(mode)).toContain("Working…");
-		expect(renderStatus(mode)).toContain("1 background task");
+		expect(renderStatus(mode)).toContain("1 subagent");
 
 		background.resolve("done");
 		pendingJobs.pop();
@@ -246,6 +292,7 @@ describe("interactive background activity indicator", () => {
 		pendingJobs.push(foreign);
 		const foreignJobId = manager.register("task", "foreign activity", () => foreign.promise, {
 			ownerId: "foreign-owner",
+			metadata: { subagent: { id: "foreign-subagent", agent: "executor", agentSource: "bundled" } },
 		});
 		manager.registerSubagentRecord({
 			subagentId: "foreign-subagent",
@@ -264,7 +311,10 @@ describe("interactive background activity indicator", () => {
 
 		const background = Promise.withResolvers<string>();
 		pendingJobs.push(background);
-		const jobId = manager.register("task", "background activity", () => background.promise, { ownerId });
+		const jobId = manager.register("task", "background activity", () => background.promise, {
+			ownerId,
+			metadata: { subagent: { id: "owned-subagent", agent: "executor", agentSource: "bundled" } },
+		});
 		expect(mode.loadingAnimation).toBeUndefined();
 		manager.registerSubagentRecord({
 			subagentId: "owned-subagent",
@@ -278,19 +328,19 @@ describe("interactive background activity indicator", () => {
 
 		await waitFor(() => mode.loadingAnimation !== undefined);
 		expect(manager.getAllJobs({ ownerId }).find(job => job.id === jobId)?.status).toBe("running");
-		expect(renderStatus(mode)).toContain("Background: 1 task…");
+		expect(renderStatus(mode)).toContain("Background: 1 subagent…");
 
 		mode.ensureLoadingAnimation();
 		expect(renderStatus(mode)).toContain("Working…");
-		expect(renderStatus(mode)).toContain("1 background task");
+		expect(renderStatus(mode)).toContain("1 subagent");
 
 		mode.stopLoadingAnimation();
-		expect(renderStatus(mode)).toContain("Background: 1 task…");
+		expect(renderStatus(mode)).toContain("Background: 1 subagent…");
 
 		mode.stopLoadingAnimation({ restoreBackground: false });
 		expect(renderStatus(mode)).toBe("");
 		mode.syncActivityIndicator();
-		expect(renderStatus(mode)).toContain("Background: 1 task…");
+		expect(renderStatus(mode)).toContain("Background: 1 subagent…");
 
 		const suspendedBackgroundLoader = mode.loadingAnimation;
 		if (!suspendedBackgroundLoader) throw new Error("Expected background loader before suspension");
@@ -302,7 +352,7 @@ describe("interactive background activity indicator", () => {
 		releaseModalActivity();
 		expect(mode.loadingAnimation).toBe(suspendedBackgroundLoader);
 		expect(stopSuspendedBackgroundLoader).not.toHaveBeenCalled();
-		expect(renderStatus(mode)).toContain("Background: 1 task…");
+		expect(renderStatus(mode)).toContain("Background: 1 subagent…");
 
 		mode.ensureLoadingAnimation();
 		let streaming = true;
@@ -311,12 +361,12 @@ describe("interactive background activity indicator", () => {
 		expect(renderStatus(mode)).toContain("Working…");
 		streaming = false;
 		mode.showError("provider failed");
-		expect(renderStatus(mode)).toContain("Background: 1 task…");
+		expect(renderStatus(mode)).toContain("Background: 1 subagent…");
 
 		const submission = mode.startPendingSubmission({ text: "cancelled", customType: "test" });
 		expect(mode.cancelPendingSubmission()).toBe(true);
 		expect(submission.cancelled).toBe(true);
-		expect(renderStatus(mode)).toContain("Background: 1 task…");
+		expect(renderStatus(mode)).toContain("Background: 1 subagent…");
 
 		background.resolve("done");
 		pendingJobs.pop();
@@ -337,7 +387,10 @@ describe("interactive background activity indicator", () => {
 		mode.stop();
 		const afterStop = Promise.withResolvers<string>();
 		pendingJobs.push(afterStop);
-		const afterStopJobId = manager.register("task", "must not resurrect", () => afterStop.promise, { ownerId });
+		const afterStopJobId = manager.register("task", "must not resurrect", () => afterStop.promise, {
+			ownerId,
+			metadata: { subagent: { id: "after-stop-subagent", agent: "executor", agentSource: "bundled" } },
+		});
 		manager.registerSubagentRecord({
 			subagentId: "after-stop-subagent",
 			ownerId,
@@ -356,7 +409,10 @@ describe("interactive background activity indicator", () => {
 		if (!ownerId) throw new Error("Expected an owner id");
 		const background = Promise.withResolvers<string>();
 		pendingJobs.push(background);
-		const jobId = manager.register("task", "lease activity", () => background.promise, { ownerId });
+		const jobId = manager.register("task", "lease activity", () => background.promise, {
+			ownerId,
+			metadata: { subagent: { id: "lease-subagent", agent: "executor", agentSource: "bundled" } },
+		});
 		manager.registerSubagentRecord({
 			subagentId: "lease-subagent",
 			ownerId,
@@ -386,7 +442,7 @@ describe("interactive background activity indicator", () => {
 		retryLoader.stop();
 		mode.statusContainer.clear();
 		mode.syncActivityIndicator();
-		expect(renderStatus(mode)).toContain("Background: 1 task…");
+		expect(renderStatus(mode)).toContain("Background: 1 subagent…");
 
 		const releaseCustomOuter = mode.suspendActivityIndicator();
 		const customLoader = new Loader(
@@ -405,7 +461,7 @@ describe("interactive background activity indicator", () => {
 		customLoader.stop();
 		mode.statusContainer.clear();
 		releaseCustomOuter();
-		expect(renderStatus(mode)).toContain("Background: 1 task…");
+		expect(renderStatus(mode)).toContain("Background: 1 subagent…");
 
 		const releaseAfterStop = mode.suspendActivityIndicator();
 		const stoppedLoader = new Loader(

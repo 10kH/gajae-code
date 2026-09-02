@@ -312,7 +312,7 @@ export class ExtensionUiController {
 				session.retryNow();
 				return { retried: true, immediate: true };
 			case "bash.background":
-				if (!(await session.requestForegroundBashBackground()))
+				if (!(await session.requestForegroundBashBackground("sdk_control")))
 					throw Object.assign(new Error("The active bash command cannot be moved to a managed background job."), {
 						code: "not_foldable",
 					});

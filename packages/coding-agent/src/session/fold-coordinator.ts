@@ -23,7 +23,7 @@
  *    delivery therefore still carries its receipt and can never silently
  *    degrade into an ordinary receipt-less completion.
  */
-import type { AsyncJob } from "../async/job-manager";
+import type { AsyncJob, FoldReason } from "../async/job-manager";
 import foldReceiptPrompt from "../prompts/tools/fold-receipt.md" with { type: "text" };
 
 /**
@@ -68,6 +68,8 @@ export interface FoldReceipt {
 	foldedAt: number;
 	/** Only command kinds can change directory; task-style waits never do. */
 	cwdSensitive: boolean;
+	/** What triggered the fold; recorded on the job as `metadata.foldReason`. */
+	reason: FoldReason;
 }
 
 /** A terminal completion observed for a folded job. */
@@ -225,8 +227,13 @@ export class FoldCoordinator {
 	 * Nothing awaits before the slot is reserved and the fence is armed, so a
 	 * completion or a steering submission that races the capture cannot slip
 	 * past into the old turn.
+	 *
+	 * A `steer` fold is the one trigger that does NOT end the turn: the steer
+	 * that caused it must be consumed by the same run at the tool boundary
+	 * right after the fold result (subagent-await parity), so no fence is
+	 * armed, no stop is requested, and no remaining intent is captured.
 	 */
-	async requestFold(explicit?: FoldAdapter): Promise<FoldRequestResult> {
+	async requestFold(explicit?: FoldAdapter, reason: FoldReason = "chord"): Promise<FoldRequestResult> {
 		// S1 resolve target.
 		const adapter = explicit ?? this.resolveTarget();
 		if (!adapter) return { status: "unavailable", reason: "no foldable wait is registered" };
@@ -244,7 +251,8 @@ export class FoldCoordinator {
 		// S3 claim + reserve, S4 hand-off is the reservation itself, S5 arm the fence.
 		this.#folding.add(job);
 		this.#slots.set(job, { state: "reserved", adapter, parked: undefined, parkedAt: undefined });
-		const fencesOriginatingTurn = adapter.originatingTurn ?? this.#deps.hasActiveTurn?.() ?? true;
+		const fencesOriginatingTurn =
+			reason !== "steer" && (adapter.originatingTurn ?? this.#deps.hasActiveTurn?.() ?? true);
 		const releaseFence = fencesOriginatingTurn ? this.#deps.armSteeringFence() : () => {};
 
 		let remainingIntent: string | undefined;
@@ -293,6 +301,7 @@ export class FoldCoordinator {
 			remainingIntent,
 			foldedAt: Date.now(),
 			cwdSensitive: adapter.cwdSensitive,
+			reason,
 		};
 
 		// A2 promote to present, preserving any payload parked during capture.

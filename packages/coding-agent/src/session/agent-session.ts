@@ -201,6 +201,8 @@ import {
 	type AsyncJobDeliveryState,
 	AsyncJobManager,
 	asyncJobEndpointId as deriveAsyncJobEndpointId,
+	type FoldReason,
+	type JobFoldEvent,
 	type OwnerSubagentShutdownLease,
 } from "../async";
 import { reset as resetCapabilities } from "../capability";
@@ -9575,13 +9577,37 @@ export class AgentSession {
 	}
 
 	/**
+	 * Subscribe to folds of this session's foreground waits. Backed by the
+	 * session-owned manager (or the process-global instance for legacy setups)
+	 * so the SDK host can publish one `bash_folded` frame per fold.
+	 */
+	onJobFold(listener: (event: JobFoldEvent) => void): () => void {
+		const manager = this.#ownedAsyncJobManager ?? AsyncJobManager.instance();
+		if (!manager) return () => {};
+		const ownerId = this.#agentId;
+		return manager.onFold(event => {
+			if (ownerId && manager.getJob(event.jobId)?.ownerId !== ownerId) return;
+			listener(event);
+		});
+	}
+
+	/**
 	 * Ask the active managed foreground bash call to return as a background job.
 	 * Returns false when no supported foreground tool is currently backgroundable.
+	 * `reason` names the trigger (`chord` for the keybinding, `sdk_control` for
+	 * the `bash.background` control) and is recorded on the folded job.
 	 */
-	async requestForegroundBashBackground(): Promise<boolean> {
+	async requestForegroundBashBackground(reason: FoldReason = "chord", adapter?: FoldAdapter): Promise<boolean> {
 		if (!this.#foldCoordinator.hasFoldableParticipant()) return false;
 		try {
-			const result = await this.#foldCoordinator.requestFold();
+			const result = await this.#foldCoordinator.requestFold(adapter, reason);
+			if (result.status === "folded" && reason === "steer") {
+				this.emitNotice(
+					"info",
+					`Folded ${result.receipt.label} into background job ${result.receipt.jobId} so your message can be handled now.`,
+					"fold",
+				);
+			}
 			return result.status === "folded";
 		} catch (error) {
 			logger.warn("Foreground fold request failed", {
