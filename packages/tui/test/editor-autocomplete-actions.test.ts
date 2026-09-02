@@ -28,6 +28,7 @@ describe("skill slash token extraction", () => {
 		expect(extractSlashCommandTokenPrefix("prior content ` /skill:be")).toBeNull();
 		expect(extractSlashCommandTokenPrefix("prior content ` /skill:be`")).toBeNull();
 		expect(extractSlashCommandTokenPrefix("prior content /skill:be`")).toBeNull();
+		expect(extractSlashCommandTokenPrefix("prior content /skill:be\\`")).toBeNull();
 	});
 
 	it("recognizes skill prefixes case-insensitively", () => {
@@ -485,6 +486,21 @@ describe("Editor Enter handler sync slash completion", () => {
 		editor.handleInput("\r");
 
 		expect(submitted).toBe("please use `/skill-te");
+		expect(provider.syncCallCount).toBe(0);
+	});
+	it("suppresses an escaped-backtick skill token during synchronous Enter completion", () => {
+		const provider = new InlineSkillProvider();
+		const editor = new Editor(defaultEditorTheme);
+		editor.setAutocompleteProvider(provider);
+		let submitted = "";
+		editor.onSubmit = text => {
+			submitted = text;
+		};
+
+		editor.handleInput("please use /skill:te\\`");
+		editor.handleInput("\r");
+
+		expect(submitted).toBe("please use /skill:te\\`");
 		expect(provider.syncCallCount).toBe(0);
 	});
 	it("preserves submitted-command argument completion inside inline code", async () => {

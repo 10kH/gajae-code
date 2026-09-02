@@ -6,6 +6,7 @@ import {
 	CombinedAutocompleteProvider,
 	extractSlashCommandTokenPrefix,
 	getSlashCommandMatchRank,
+	hasInlineCodeDelimiter,
 	isInsideInlineCodeSpan,
 	normalizeFuzzyText,
 	type SlashCommand,
@@ -231,7 +232,7 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 		const slashPrefix = getSlashTokenPrefix(textBeforeCursor);
 		const slashTokenInsideCode =
 			rawSlashPrefix !== null &&
-			(rawSlashPrefix.includes("`") ||
+			(hasInlineCodeDelimiter(rawSlashPrefix) ||
 				isSlashTokenInsideInlineCodeSpan(lines, cursorLine, textBeforeCursor, rawSlashPrefix));
 		if (slashPrefix && !slashTokenInsideCode) {
 			const baseSuggestions = withoutSkillCommandSuggestions(
