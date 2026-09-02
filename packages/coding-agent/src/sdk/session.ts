@@ -67,6 +67,7 @@ import {
 	resolveModelRoleValue,
 	type ScopedModelSelection,
 } from "../config/model-resolver";
+import { normalizeModelSelectorValue } from "../config/model-selector-value";
 import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate } from "../config/prompt-templates";
 import { Settings, type SkillsSettings } from "../config/settings";
 import { resolveEagerTaskDelegation } from "../config/task-delegation";
@@ -1414,6 +1415,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	}
 
 	let agent: Agent;
+	let sessionAgent: Agent | undefined;
 	let session!: AgentSession;
 	let sessionManager!: SessionManager;
 	let hasSession = false;
@@ -1831,8 +1833,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				credentialSessionId,
 			}),
 		);
+		const configuredDefaultPatterns = normalizeModelSelectorValue(settings.getModelRole("default"));
 		let model = options.model;
 		let modelFallbackMessage: string | undefined;
+		if (!hasExplicitModel && configuredDefaultPatterns.length > 0 && !defaultRoleSpec.model) {
+			modelFallbackMessage = `Model ${configuredDefaultPatterns.join(" -> ")} not found`;
+		}
 		const resumeModelBehavior = settings.get("session.resumeModelBehavior");
 		const persistedDefaultChain = existingSession.configuredModelChains.default;
 		const defaultModelEntries =
@@ -3330,6 +3336,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						createSdkSessionRuntimeExtension(api, {
 							agentDir,
 							brokerRegistrationRequired: lifecycleStartupCapability !== undefined,
+							...(lifecycleStartupCapability?.lifecycleRequestId
+								? { lifecycleRequestId: lifecycleStartupCapability.lifecycleRequestId }
+								: {}),
 							createTransport: input => createSdkWebSocketTransport(input),
 							settings,
 							configOverrides: new Map(),
@@ -3538,7 +3547,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// Fall back to first available model with a valid API key, honoring the
 		// path-scoped `enabledModels` allow-list when configured. Skip when the
 		// user explicitly requested a model via --model that wasn't found.
-		if (!model && !options.modelPattern && !startupCredentialModelRejected) {
+		if (
+			!model &&
+			!options.modelPattern &&
+			!startupCredentialModelRejected &&
+			configuredDefaultPatterns.length === 0
+		) {
 			// Re-resolve the allowed set: extension factories above may have
 			// registered providers/models that weren't visible at startup.
 			const allowedFallbackCandidates = await resolveAllowedModels(modelRegistry, settings, modelMatchPreferences);
@@ -4273,13 +4287,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			preferWebsockets: preferOpenAICodexWebsockets,
 			getToolContext: tc => toolContextStore.getContext(tc),
 			getApiKey: async provider => {
-				// Read agent.sessionId at call time so credential selection stays aligned
-				// with metadataResolver after /new, fork, resume, or branch switches.
-				const key = await modelRegistry.getApiKeyForProvider(provider, credentialSessionId);
-				if (!key) {
+				// AgentLoop asks by provider, but the active model carries the
+				// model-scoped credential selector. Read it at call time so model
+				// changes are honored after /new, fork, resume, or branch switches.
+				const liveModel = sessionAgent?.state.model ?? model;
+				const key =
+					liveModel?.provider === provider
+						? await modelRegistry.getApiKey(liveModel, credentialSessionId)
+						: undefined;
+				const providerKey = key ?? (await modelRegistry.getApiKeyForProvider(provider, credentialSessionId));
+				if (!providerKey) {
 					throw new Error(`No API key found for provider "${provider}"`);
 				}
-				return key;
+				return providerKey;
 			},
 			getAuthCredentialType: provider => modelRegistry.getSessionCredentialType(provider, credentialSessionId),
 			streamFn: async (streamModel, context, streamOptions) => {
@@ -4366,6 +4386,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			telemetry: options.telemetry,
 			appendOnlyContext,
 		});
+		sessionAgent = agent;
 
 		cursorEventEmitter = event => agent.emitExternalEvent(event);
 

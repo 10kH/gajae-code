@@ -909,7 +909,7 @@ export declare function exactRemoveDirectoryTree(path: string, snapshot: NativeD
 export declare function exactReplacePath(sourcePath: string, destinationPath: string, expectedSource: NativeExactFileIdentity, expectedDestination: NativeExactFileIdentity): NativeExactUnlinkResult
 
 /**
- * Restore only the detached object that still has the supplied platform
+ * Restore only the detached object that still has the supplied exact
  * identity. The detached and original paths must retain the same validated
  * parent, and restoration never replaces an existing original path.
  */
@@ -934,6 +934,17 @@ export declare function exactUnlink(path: string, identity: NativeExactFileIdent
  * and this path cannot manufacture another exchange placeholder.
  */
 export declare function exactUnlinkDirect(path: string, identity: NativeExactFileIdentity): NativeExactUnlinkResult
+
+/**
+ * Start direct exact unlink without retaining an N-API task or promise.
+ *
+ * Cleanup is best effort: the detached operation is intentionally abandoned
+ * when the process exits, while the exact identity checks still protect any
+ * pathname that remains alive long enough to be examined. A bounded queue
+ * keeps cleanup bursts from spawning an unbounded number of OS threads; work
+ * that cannot be queued is left for the owning reconciliation pass.
+ */
+export declare function exactUnlinkDirectDetached(path: string, identity: NativeExactFileIdentity): boolean
 
 /**
  * Execute a brush shell command.
@@ -2151,6 +2162,22 @@ export interface RecoveryFsRetainedCleanupResult {
   identity?: RecoveryFsIdentity
   treeSnapshot?: NativeDirectoryTreeSnapshot
 }
+
+/**
+ * Publish a staged directory under a destination name that must not already
+ * exist, using descriptor-relative `mkdirat` ownership followed by `renameat`.
+ * This is the directory stand-in for `renameat2(RENAME_NOREPLACE)` on mounts
+ * that reject rename flags with `EINVAL`/`ENOSYS`. The native implementation
+ * validates every path component without following symlinks and never
+ * overwrites a non-empty destination directory.
+ */
+export declare function renameDirectoryNoReplacePath(sourcePath: string, destinationPath: string): NativeNoReplaceResult
+
+/**
+ * Async variant of [`rename_directory_no_replace_path`] scheduled on the
+ * libuv blocking pool.
+ */
+export declare function renameDirectoryNoReplacePathAsync(sourcePath: string, destinationPath: string): Promise<NativeNoReplaceResult>
 
 export declare function renameNoReplacePath(sourcePath: string, destinationPath: string): NativeNoReplaceResult
 

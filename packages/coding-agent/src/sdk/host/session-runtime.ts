@@ -472,6 +472,8 @@ export interface CreateSdkSessionRuntimeOptions {
 	agentDir: string;
 	/** Lifecycle-owned sessions require broker publication before they become usable. */
 	brokerRegistrationRequired?: boolean;
+	/** Trusted broker-issued lifecycle marker bound to lifecycle host index events. */
+	lifecycleRequestId?: string;
 	createTransport(input: {
 		sessionId: string;
 		stateRoot: string;
@@ -1195,18 +1197,15 @@ function createQuerySurface(
 		kind: ctx.sessionMetadata?.kind ?? "main",
 	});
 	const lastAssistant = () => {
-		for (const entry of ctx.sessionManager.getBranch().toReversed()) {
-			if (entry.type !== "message" || entry.message.role !== "assistant") continue;
-			const content = entry.message.content;
-			if (typeof content === "string") return content;
-			if (Array.isArray(content))
-				return content
-					.filter(
-						(block): block is { type: "text"; text: string } =>
-							block.type === "text" && typeof block.text === "string",
-					)
-					.map(block => block.text)
-					.join("");
+		const transcript =
+			typeof (ctx as Partial<ExtensionContext>).getTranscript === "function" ? ctx.getTranscript() : [];
+		for (const entry of transcript.toReversed()) {
+			if (entry.role !== "assistant") continue;
+			const text =
+				typeof entry.body === "string"
+					? entry.body
+					: entry.content?.flatMap(block => (block.type === "text" ? [block.text] : [])).join("\n");
+			if (text !== undefined && text.trim().length > 0) return text;
 		}
 		return undefined;
 	};
@@ -5043,6 +5042,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const registerBroker = async (): Promise<void> => {
 			if (brokerRegistered) return;
 			try {
+				if (options.brokerRegistrationRequired && !options.lifecycleRequestId)
+					throw new Error("Lifecycle broker registration requires a request identity.");
 				await ensureBroker({ agentDir: options.agentDir });
 				const index = await new SessionIndex(options.agentDir).open();
 				const locator = await resolveSessionLocator(ctx.cwd, stateRoot);
@@ -5090,11 +5091,18 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 							pid: process.pid,
 							endpointMtimeMs,
 							endpointFileId,
+							...(options.lifecycleRequestId ? { lifecycleRequestId: options.lifecycleRequestId } : {}),
 							...(masterRole ? { masterRole } : {}),
 						});
 					},
 					unregister: async input => {
-						await index.append({ type: "host_unregistered", ...input, locator, pid: process.pid });
+						await index.append({
+							type: "host_unregistered",
+							...input,
+							locator,
+							pid: process.pid,
+							...(options.lifecycleRequestId ? { lifecycleRequestId: options.lifecycleRequestId } : {}),
+						});
 					},
 				});
 				brokerRegistered = true;

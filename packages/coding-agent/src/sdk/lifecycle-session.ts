@@ -55,6 +55,8 @@ export type CreateLifecycleAgentSessionOptions = Omit<CreateAgentSessionOptions,
 	 * a prepared signal instead of readiness until it is explicitly activated.
 	 */
 	readiness?: "immediate" | "deferred";
+	/** Broker-issued lifecycle request identity published with host registration. */
+	lifecycleRequestId?: string;
 };
 
 /** Internal lifecycle-only session construction with an owner-bound SDK startup result. */
@@ -62,9 +64,15 @@ export async function createLifecycleAgentSession(
 	options: CreateLifecycleAgentSessionOptions = {},
 ): Promise<CreateLifecycleAgentSessionResult> {
 	const rollback = new SdkStartupRollbackTracker();
-	const capability = new SdkStartupCapability(rollback, options.readiness ?? "immediate");
+	const capability = new SdkStartupCapability(rollback, options.readiness ?? "immediate", options.lifecycleRequestId);
 	try {
-		const { modelId, mcpStartupTimeoutMs, readiness: _readiness, ...sessionOptions } = options;
+		const {
+			modelId,
+			mcpStartupTimeoutMs,
+			readiness: _readiness,
+			lifecycleRequestId: _lifecycleRequestId,
+			...sessionOptions
+		} = options;
 		const internalOptions = {
 			...sessionOptions,
 			// Explicit model pin (#4707): resolve through the staged selector

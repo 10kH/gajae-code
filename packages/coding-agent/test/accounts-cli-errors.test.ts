@@ -58,4 +58,12 @@ describe("accounts command error surfacing", () => {
 		expect(mapped?.message).toBe(message);
 		expect(toAccountsCommandError(new Error("unrelated"))).toBeUndefined();
 	});
+
+	it("maps corrupt credential stores to a bounded payload-free error", () => {
+		const mapped = toAccountsCommandError({ code: "SQLITE_CORRUPT", message: "database disk image is malformed" });
+		expect(mapped).toBeInstanceOf(AccountsCommandError);
+		expect(mapped?.message).toContain("Credential store is unreadable");
+		expect(mapped?.message).toContain("PRAGMA integrity_check or REINDEX");
+		expect(mapped?.message).not.toContain("database disk image is malformed");
+	});
 });

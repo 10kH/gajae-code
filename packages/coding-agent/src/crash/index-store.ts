@@ -613,6 +613,7 @@ export function applyCrashEvent(index: CrashIndex, event: CrashEvent, now: numbe
 	}
 
 	// occurrence
+	if (event.provenance === "eval" || event.provenance === "bun_test") return false;
 	// Clear before deduplication: a replayed occurrence after main-index publish
 	// but before retirement-sidecar publish must still supersede a stale tombstone.
 	index.retiredFingerprints = index.retiredFingerprints.filter(fingerprint => fingerprint !== event.fingerprint);
@@ -698,6 +699,7 @@ async function recoverAndRecomputeRetainedCounts(index: CrashIndex, crashLogPath
 	const recordsByFingerprint = new Map<string, LoadedCrashRecord[]>();
 	const seenRecordIds = new Set<string>();
 	for (const record of parseRecoverableCrashRecords(contents)) {
+		if (record.provenance === "eval" || record.provenance === "bun_test") continue;
 		if (seenRecordIds.has(record.recordId)) continue;
 		seenRecordIds.add(record.recordId);
 		const records = recordsByFingerprint.get(record.fingerprint) ?? [];

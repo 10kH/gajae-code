@@ -62,7 +62,12 @@ function installImmediateStdoutMock(output: string[] = []): void {
 /** Minimal mock of the AgentSession text-output path. */
 function createMockSession(
 	messages: Message[],
-	opts?: { contextWindow?: number; autoCompactionEnabled?: boolean; configWarnings?: string[] },
+	opts?: {
+		contextWindow?: number;
+		autoCompactionEnabled?: boolean;
+		configWarnings?: string[];
+		promptResult?: Message;
+	},
 ): AgentSession {
 	return {
 		configWarnings: opts?.configWarnings ?? [],
@@ -76,7 +81,10 @@ function createMockSession(
 		setSlashCommands: () => {},
 		extensionRunner: undefined,
 		subscribe: () => () => {},
-		prompt: async () => {},
+		prompt: async () => {
+			messages.push({ role: "user", content: [{ type: "text", text: "prompt" }], timestamp: Date.now() });
+			if (opts?.promptResult) messages.push(opts.promptResult);
+		},
 		dispose: async () => {},
 	} as unknown as AgentSession;
 }
@@ -96,7 +104,14 @@ function createPrintModeTrackingSession(
 		onDispose?: () => void;
 	} = {},
 ) {
-	const { messages = [], header, events = [], disposeEvents = [], disposeError, onDispose } = options;
+	const {
+		messages = [makeAssistantMessage()],
+		header,
+		events = [],
+		disposeEvents = [],
+		disposeError,
+		onDispose,
+	} = options;
 	const lifecycle: string[] = [];
 	let onEvent: ((event: unknown) => void) | undefined;
 	let unsubscribeCount = 0;
@@ -114,6 +129,7 @@ function createPrintModeTrackingSession(
 	const prompt = vi.fn(async () => {
 		lifecycle.push("prompt:start");
 		for (const event of events) emit(event);
+		messages.push(makeAssistantMessage());
 		lifecycle.push("prompt:end");
 	});
 	// Print mode hands the loaded slash commands to the session before it prompts, so the
@@ -153,17 +169,18 @@ function stdoutError(code: string): Error & { code: string } {
 	return Object.assign(new Error(`stdout ${code}`), { code });
 }
 
-describe("Print mode", () => {
-	let previousExitCode: number | string | null | undefined;
+afterEach(() => {
+	process.exitCode = 0;
+});
 
+describe("Print mode", () => {
 	beforeEach(() => {
-		previousExitCode = process.exitCode;
 		process.exitCode = 0;
 	});
 
 	afterEach(() => {
 		vi.restoreAllMocks();
-		process.exitCode = previousExitCode ?? 0;
+		process.exitCode = 0;
 	});
 
 	it("prints each session configuration warning to stderr once", async () => {
@@ -232,6 +249,62 @@ describe("Print mode", () => {
 		expect(stderrOutput.join("")).toContain("Rate limit exceeded");
 		expect(process.exitCode).toBe(1);
 		expect(exitSpy).not.toHaveBeenCalled();
+	});
+	it("fails text mode when a submitted turn has no assistant text", async () => {
+		const stderrOutput: string[] = [];
+		installImmediateStderrMock(stderrOutput);
+		installImmediateStdoutMock();
+
+		await runPrintMode(createMockSession([makeToolResultMessage()]), {
+			mode: "text",
+			initialMessage: "run the tool",
+		});
+
+		expect(stderrOutput.join("\n")).toContain("Turn completed without assistant text.");
+		expect(process.exitCode).toBe(1);
+	});
+	it("emits a structured empty-response failure and exits nonzero in JSON mode", async () => {
+		const stdoutOutput: string[] = [];
+		installImmediateStderrMock([]);
+		installImmediateStdoutMock(stdoutOutput);
+
+		await runPrintMode(createMockSession([makeToolResultMessage()]), {
+			mode: "json",
+			initialMessage: "run the tool",
+		});
+
+		const rows = stdoutOutput
+			.join("")
+			.trim()
+			.split("\n")
+			.map(row => JSON.parse(row));
+		expect(rows).toContainEqual({
+			type: "agent_failed",
+			error: { code: "empty_response", message: "Turn completed without assistant text." },
+		});
+		expect(process.exitCode).toBe(1);
+	});
+	it("preserves provider failure as a nonzero JSON terminal status", async () => {
+		const stdoutOutput: string[] = [];
+		installImmediateStderrMock([]);
+		installImmediateStdoutMock(stdoutOutput);
+		const failure = makeAssistantMessage({ stopReason: "error", errorMessage: "provider unavailable", content: [] });
+
+		await runPrintMode(createMockSession([], { promptResult: failure }), { mode: "json", initialMessage: "answer" });
+
+		expect(stdoutOutput.join("")).toContain("provider unavailable");
+		expect(process.exitCode).toBe(1);
+	});
+	it("fails trailing tool-only output instead of treating tool activity as success", async () => {
+		installImmediateStderrMock([]);
+		installImmediateStdoutMock();
+
+		await runPrintMode(createMockSession([makeToolResultMessage()]), {
+			mode: "text",
+			initialMessage: "finish this request",
+		});
+
+		expect(process.exitCode).toBe(1);
 	});
 	it("prints the safety-stop hint after the raw refusal for provider safety stops (#4650)", async () => {
 		const stderrOutput: string[] = [];
@@ -588,7 +661,7 @@ describe("Print mode", () => {
 
 describe("Print mode slash-command expansion", () => {
 	it("hands bundled slash commands to the session before the first prompt", async () => {
-		const tracking = createPrintModeTrackingSession();
+		const tracking = createPrintModeTrackingSession({ messages: [makeAssistantMessage()] });
 		installImmediateStdoutMock();
 
 		const order: string[] = [];

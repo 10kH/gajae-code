@@ -37,6 +37,7 @@ import type {
 	OAuthProvider,
 	OAuthProviderId,
 } from "./utils/oauth/types";
+import { isSqliteError } from "./utils/sqlite-errors";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Credential Types
@@ -4944,7 +4945,9 @@ export class AuthStorage {
 						!refreshedCredentials.persistedByLease,
 						credentialId,
 					);
-				} catch {}
+				} catch (error) {
+					if (isSqliteError(error)) throw error;
+				}
 			}),
 		);
 
@@ -5408,6 +5411,7 @@ export class AuthStorage {
 			this.#recordSessionCredential(provider, sessionId, "oauth", selection.index);
 			return { apiKey: result.apiKey, credential: updated };
 		} catch (error) {
+			if (isSqliteError(error)) throw error;
 			// Auth-broker errors retain the sanitized upstream body separately from
 			// their transport message. Include that body for failure classification
 			// (the broker's 500 envelope otherwise hides `invalid_grant`) while
@@ -7116,19 +7120,15 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 	}
 
 	updateAuthCredential(id: number, credential: AuthCredential): void {
-		try {
-			const providerRow = this.#db.prepare("SELECT provider FROM auth_credentials WHERE id = ?").get(id) as
-				| { provider?: string }
-				| undefined;
-			const provider = providerRow?.provider ?? "";
-			const serialized = serializeCredential(provider, credential);
-			if (!serialized) return;
-			this.#updateStmt.run(serialized.credentialType, serialized.data, serialized.identityKey, id);
-			if (provider) {
-				this.#purgeSupersededDisabledRows(provider, this.listAuthCredentials(provider));
-			}
-		} catch {
-			// Ignore update failures
+		const providerRow = this.#db.prepare("SELECT provider FROM auth_credentials WHERE id = ?").get(id) as
+			| { provider?: string }
+			| undefined;
+		const provider = providerRow?.provider ?? "";
+		const serialized = serializeCredential(provider, credential);
+		if (!serialized) return;
+		this.#updateStmt.run(serialized.credentialType, serialized.data, serialized.identityKey, id);
+		if (provider) {
+			this.#purgeSupersededDisabledRows(provider, this.listAuthCredentials(provider));
 		}
 	}
 

@@ -60,6 +60,8 @@ type HeadlessState = {
 	createdAt: number;
 };
 
+const MAX_SUBSTRATE_DIAGNOSTIC_LENGTH = 512;
+
 const HEADLESS_STATE_KEYS = new Set([
 	"version",
 	"pid",
@@ -77,6 +79,15 @@ function messageFor(code: "substrate_unavailable" | "substrate_proof_failed"): s
 	return code === "substrate_unavailable"
 		? "No safe spawn substrate is available."
 		: "The selected spawn substrate could not be proven exactly.";
+}
+
+function launchFailureMessage(selected: "tmux" | "psmux" | "headless", error: unknown): string {
+	const detail = error instanceof Error ? error.message : String(error);
+	const bounded = detail
+		.replace(/[\u0000-\u001f\u007f]/g, " ")
+		.trim()
+		.slice(0, MAX_SUBSTRATE_DIAGNOSTIC_LENGTH);
+	return `${selected} substrate launch failed${bounded ? `: ${bounded}` : ""}`;
 }
 
 function hasOnlyKeys(value: Record<string, unknown>, keys: Set<string>): boolean {
@@ -355,6 +366,57 @@ export function createSpawnSubstrateProvider(
 	const signalHeadless = dependencies.signalHeadless ?? signalExactHeadless;
 	const isGone = dependencies.isProcessGone ?? defaultIsProcessGone;
 	const sleep = dependencies.sleep ?? (milliseconds => Bun.sleep(milliseconds));
+	const launchHeadlessSubstrate = async (spec: SpawnSubstrateLaunchSpec, launchEnv: NodeJS.ProcessEnv) => {
+		let child: SpawnHeadlessProcess;
+		try {
+			child = launchHeadless(spec, launchEnv);
+		} catch {
+			return {
+				ok: false as const,
+				code: "substrate_unavailable" as const,
+				message: messageFor("substrate_unavailable"),
+			};
+		}
+		const incarnation = readIncarnation(child.pid);
+		if (!incarnation) {
+			child.terminate();
+			return {
+				ok: false as const,
+				code: "substrate_proof_failed" as const,
+				message: messageFor("substrate_proof_failed"),
+			};
+		}
+		const providerIdentity = crypto.randomUUID();
+		const state: HeadlessState = {
+			version: 1,
+			pid: child.pid,
+			processIncarnation: incarnation,
+			providerIdentity,
+			childSessionId: spec.childSessionId,
+			createdAt: Date.now(),
+		};
+		const stateFile = stateFileFor(spec, providerIdentity);
+		try {
+			await writeHeadlessState(stateFile, state);
+		} catch {
+			child.terminate();
+			return {
+				ok: false as const,
+				code: "substrate_proof_failed" as const,
+				message: messageFor("substrate_proof_failed"),
+			};
+		}
+		return {
+			ok: true as const,
+			proof: {
+				substrateKind: "headless" as const,
+				providerIdentity,
+				pid: child.pid,
+				processIncarnation: incarnation,
+				stateFileProof: { stateFile, childSessionId: spec.childSessionId },
+			},
+		};
+	};
 
 	const provider: SpawnSubstrateProvider = {
 		async launch(spec) {
@@ -376,8 +438,23 @@ export function createSpawnSubstrateProvider(
 				let managed: ManagedTmuxLaunchProof;
 				try {
 					managed = launchManaged(spec, launchEnv, platform);
-				} catch {
-					return { ok: false, code: "substrate_proof_failed", message: messageFor("substrate_proof_failed") };
+				} catch (error) {
+					const failure = launchFailureMessage(selected, error);
+					try {
+						const fallback = await launchHeadlessSubstrate(spec, launchEnv);
+						if (fallback.ok) return fallback;
+						return {
+							ok: false,
+							code: fallback.code,
+							message: `${failure}; headless substrate failed: ${fallback.message}`,
+						};
+					} catch (fallbackError) {
+						return {
+							ok: false,
+							code: "substrate_unavailable",
+							message: `${failure}; headless substrate failed: ${launchFailureMessage("headless", fallbackError)}`,
+						};
+					}
 				}
 				const incarnation = readIncarnation(managed.pid);
 				if (!incarnation || verifyManaged(managed, launchEnv) !== "verified") {
@@ -386,7 +463,14 @@ export function createSpawnSubstrateProvider(
 					} catch {
 						// The managed close primitive is already exact-proof fenced. Retain its result only in authority state.
 					}
-					return { ok: false, code: "substrate_proof_failed", message: messageFor("substrate_proof_failed") };
+					const failure = launchFailureMessage(selected, new Error("exact substrate proof failed"));
+					const fallback = await launchHeadlessSubstrate(spec, launchEnv);
+					if (fallback.ok) return fallback;
+					return {
+						ok: false,
+						code: fallback.code,
+						message: `${failure}; headless substrate failed: ${fallback.message}`,
+					};
 				}
 				return {
 					ok: true,
@@ -400,43 +484,7 @@ export function createSpawnSubstrateProvider(
 					},
 				};
 			}
-			let child: SpawnHeadlessProcess;
-			try {
-				child = launchHeadless(spec, launchEnv);
-			} catch {
-				return { ok: false, code: "substrate_unavailable", message: messageFor("substrate_unavailable") };
-			}
-			const incarnation = readIncarnation(child.pid);
-			if (!incarnation) {
-				child.terminate();
-				return { ok: false, code: "substrate_proof_failed", message: messageFor("substrate_proof_failed") };
-			}
-			const providerIdentity = crypto.randomUUID();
-			const state: HeadlessState = {
-				version: 1,
-				pid: child.pid,
-				processIncarnation: incarnation,
-				providerIdentity,
-				childSessionId: spec.childSessionId,
-				createdAt: Date.now(),
-			};
-			const stateFile = stateFileFor(spec, providerIdentity);
-			try {
-				await writeHeadlessState(stateFile, state);
-			} catch {
-				child.terminate();
-				return { ok: false, code: "substrate_proof_failed", message: messageFor("substrate_proof_failed") };
-			}
-			return {
-				ok: true,
-				proof: {
-					substrateKind: "headless",
-					providerIdentity,
-					pid: child.pid,
-					processIncarnation: incarnation,
-					stateFileProof: { stateFile, childSessionId: spec.childSessionId },
-				},
-			};
+			return launchHeadlessSubstrate(spec, launchEnv);
 		},
 		async verify(proof) {
 			const managed = managedProofFrom(proof);
@@ -470,23 +518,29 @@ export function createSpawnSubstrateProvider(
 			}
 			if (!isPositiveInteger(proof.pid) || !isNonEmptyString(proof.processIncarnation))
 				return { ok: false, code: "substrate_mismatch" };
+			const pid = proof.pid;
 			const closeFailure = (verdict: "verified" | "mismatch" | "gone") => ({
 				ok: false,
 				code: verdict === "verified" ? "substrate_close_pending" : `substrate_${verdict}`,
 			});
+			const verifyAfterSignal = async (): Promise<"verified" | "mismatch" | "gone"> => {
+				const verdict = await provider.verify(proof);
+				if (verdict === "mismatch" && readIncarnation(pid) === undefined && isGone(pid)) return "gone";
+				return verdict;
+			};
 			// Delivery starts shutdown; only a later exact proof of absence completes it.
 			if (!signalHeadless(proof.pid, proof.processIncarnation, platform, "SIGTERM")) {
-				const afterSignalFailure = await provider.verify(proof);
+				const afterSignalFailure = await verifyAfterSignal();
 				return afterSignalFailure === "gone" ? { ok: true } : closeFailure(afterSignalFailure);
 			}
-			const afterTerm = await waitForHeadlessExit(proof, provider.verify, sleep);
+			const afterTerm = await waitForHeadlessExit(proof, verifyAfterSignal, sleep);
 			if (afterTerm === "gone") return { ok: true };
 			if (afterTerm !== "verified") return closeFailure(afterTerm);
 			if (!signalHeadless(proof.pid, proof.processIncarnation, platform, "SIGKILL")) {
-				const afterSignalFailure = await provider.verify(proof);
+				const afterSignalFailure = await verifyAfterSignal();
 				return afterSignalFailure === "gone" ? { ok: true } : closeFailure(afterSignalFailure);
 			}
-			const afterKill = await waitForHeadlessExit(proof, provider.verify, sleep);
+			const afterKill = await waitForHeadlessExit(proof, verifyAfterSignal, sleep);
 			return afterKill === "gone" ? { ok: true } : closeFailure(afterKill);
 		},
 	};

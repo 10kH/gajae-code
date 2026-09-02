@@ -1029,7 +1029,7 @@ function assertTransaction(transaction: CoordinatorSessionTransactionV1, namespa
 		const rejectedHistorical = request.phase === "rejected";
 		if (
 			rejectedHistorical
-				? !request.safe_receipt || request.safe_receipt.status !== "rejected"
+				? request.safe_receipt?.status !== "rejected"
 				: question.answer_request_id !== request.request_id ||
 					question.claim_fence_epoch !== request.claim_fence_epoch
 		)
@@ -1083,7 +1083,7 @@ function assertTransaction(transaction: CoordinatorSessionTransactionV1, namespa
 			event.transaction_revision > transaction.revision ||
 			typeof event.kind !== "string" ||
 			event.kind.length === 0 ||
-			!["turn", "question", "report", "session", "deletion"].includes(event.entity) ||
+			!isOutboxEntity(event.entity) ||
 			typeof event.entity_id !== "string" ||
 			event.entity_id.length === 0 ||
 			!isRecord(event.payload) ||
@@ -1296,7 +1296,7 @@ export async function listCanonicalActiveSessions(
 		paths.registryLock,
 		async () => {
 			const registry = await readJson<NamespaceRegistryV1>(paths.registry);
-			if (!registry || registry.schema_version !== 1 || registry.namespace_id !== path.basename(paths.root))
+			if (registry?.schema_version !== 1 || registry.namespace_id !== path.basename(paths.root))
 				throw new Error("state_corrupt");
 			return Object.values(registry.roster ?? {})
 				.filter(entry => entry.active || entry.dirty)
@@ -1333,7 +1333,7 @@ export async function readDeliveryDiscoveryCursor(
 		paths.registryLock,
 		async () => {
 			const registry = await readJson<NamespaceRegistryV1>(paths.registry);
-			if (!registry || registry.schema_version !== 1 || registry.namespace_id !== path.basename(paths.root))
+			if (registry?.schema_version !== 1 || registry.namespace_id !== path.basename(paths.root))
 				throw new Error("state_corrupt");
 			return registry.delivery_discovery_cursor ?? "";
 		},
@@ -1660,7 +1660,7 @@ export async function startCreationRemote(
 ): Promise<CreationRequestV1> {
 	return await withNamespaceRegistry(paths, async registry => {
 		const request = registry.creations[keyDigest];
-		if (!request || !request.sidecar_verifier) throw new Error("state_corrupt");
+		if (!request?.sidecar_verifier) throw new Error("state_corrupt");
 		if (
 			request.phase === "claimed" &&
 			(request.sidecar_verifier.key_id !== expectedVerifier.key_id ||
@@ -1687,8 +1687,7 @@ export async function reconcileCreationRemoteVerifier(
 ): Promise<CreationRequestV1> {
 	return await withNamespaceRegistry(paths, async registry => {
 		const request = registry.creations[keyDigest];
-		if (!request || !request.sidecar_verifier || request.phase !== "remote_started")
-			throw new Error("terminal_uncertain");
+		if (!request?.sidecar_verifier || request.phase !== "remote_started") throw new Error("terminal_uncertain");
 		if (!/^[a-f0-9]{64}$/.test(usedKeyId)) throw new Error("terminal_uncertain");
 		if (usedKeyId === candidate.key_id) request.sidecar_verifier = candidate;
 		else if (usedKeyId !== request.sidecar_verifier.key_id) throw new Error("terminal_uncertain");
@@ -2241,7 +2240,7 @@ export async function enumeratePublicDeliveries(
 		paths.registryLock,
 		async () => {
 			const registry = await readJson<NamespaceRegistryV1>(paths.registry);
-			if (!registry || registry.schema_version !== 1 || registry.namespace_id !== path.basename(paths.root))
+			if (registry?.schema_version !== 1 || registry.namespace_id !== path.basename(paths.root))
 				throw new Error("state_corrupt");
 			return [...new Set([...Object.keys(registry.roster ?? {}), ...Object.keys(registry.retained_sessions ?? {})])]
 				.filter(name => COORDINATOR_SESSION_ID_PATTERN.test(name))
@@ -2526,7 +2525,7 @@ export async function replaceCreationRetirementIntent(
 		if (request.phase !== "remote_started" && request.phase !== "uncertain" && request.phase !== "retired")
 			throw new Error("retire_not_allowed");
 		const staged = request.retirement_intent;
-		if (!staged || staged.phase !== "intent" || staged.broker_proof) throw new Error("state_corrupt");
+		if (staged?.phase !== "intent" || staged.broker_proof) throw new Error("state_corrupt");
 		if (staged.retirement_key_digest !== retirementKeyDigest) throw new Error("idempotency_conflict");
 		assertCreationRetirementProofMatches(request, proof, false);
 		staged.phase = "pre_effect_rejected";
@@ -2716,8 +2715,7 @@ export async function removeSessionTransaction(
 				// exporter lease expires instead of deleting an undelivered event.
 				if (Object.values(transaction.outbox).some(event => event.public_delivery.state !== "acknowledged"))
 					return false;
-				await fs.rm(file, { force: true });
-				await syncCoordinatorDirectory(path.dirname(file));
+				await removeCoordinatorStateFile(file);
 				delete registry.roster?.[sessionId];
 				delete registry.retained_sessions?.[sessionId];
 				return true;

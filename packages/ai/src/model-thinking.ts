@@ -278,6 +278,14 @@ export function applyGeneratedModelPolicies(models: ApiModel<Api>[]): void {
 		if (source.provider === "omlx") {
 			source.reasoning = true;
 		}
+		if (
+			source.provider === "cursor" &&
+			(source.id === "kimi-k3-low" || source.id === "kimi-k3-high" || source.id === "kimi-k3-max")
+		) {
+			// Cursor's GetUsableModels metadata omits numeric context limits for
+			// this family. Keep the measured 1M fallback across regeneration.
+			source.contextWindow = 1_048_576;
+		}
 		const model = refreshModelThinking(source);
 		applyGeneratedModelPolicy(model);
 		models[index] = model;

@@ -1224,32 +1224,35 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 	it("retires a stranded start intent only after the indexed retirement proof is supplied", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
+		const retirementStarted = Promise.withResolvers<void>();
+		const releaseRetirement = Promise.withResolvers<void>();
 		const creationKey = "stranded-start-to-retire";
 		const remoteCreateKey = `remote_${createHash("sha256")
 			.update(`gjc_coordinator_start_session\0${creationKey}`)
 			.digest("hex")}`;
 		const server = await createSdkControlServer(root, controls, [], undefined, [], undefined, undefined, {
-			globalResult: operation =>
-				operation === "session.create"
-					? { ok: true, result: { cwd: root } }
-					: operation === "session.reconcile_uncertain"
-						? {
-								ok: true,
-								result: {
-									sessionId: "retired-session",
-									retired: true,
-									ledgerState: "terminal_error",
-									indexType: "session_closed",
-									stateRoot: path.join(root, ".gjc", "state"),
-									endpointGeneration: 2,
-									endpointMtimeMs: 1,
-									processIncarnation: "linux:123",
-									hostIncarnation: "host:123",
-									lifecycleRequestId: "retire-effect",
-									remoteCreateKey,
-								},
-							}
-						: undefined,
+			globalResult: async operation => {
+				if (operation === "session.create") return { ok: true, result: { cwd: root } };
+				if (operation !== "session.reconcile_uncertain") return undefined;
+				retirementStarted.resolve();
+				await releaseRetirement.promise;
+				return {
+					ok: true,
+					result: {
+						sessionId: "retired-session",
+						retired: true,
+						ledgerState: "terminal_error",
+						indexType: "session_closed",
+						stateRoot: path.join(root, ".gjc", "state"),
+						endpointGeneration: 2,
+						endpointMtimeMs: 1,
+						processIncarnation: "linux:123",
+						hostIncarnation: "host:123",
+						lifecycleRequestId: "retire-effect",
+						remoteCreateKey,
+					},
+				};
+			},
 		});
 		const startArgs = { cwd: root, idempotency_key: creationKey, allow_mutation: true };
 		await expect(server.callTool("gjc_coordinator_start_session", startArgs)).resolves.toMatchObject({ ok: false });
@@ -1261,7 +1264,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const original = JSON.parse(await fs.readFile(originalPath, "utf8")) as { request_digest: string; state: string };
 		expect(original.state).toBe("in_progress");
 
-		const retired = await server.callTool("gjc_coordinator_retire_start_session", {
+		const retirementArgs = {
 			cwd: root,
 			session_id: "retired-session",
 			state_root: path.join(root, ".gjc", "state"),
@@ -1275,7 +1278,20 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			request_digest: original.request_digest,
 			idempotency_key: "retire-start-intent",
 			allow_mutation: true,
-		});
+		};
+		const retirementPromise = server.callTool("gjc_coordinator_retire_start_session", retirementArgs);
+		await retirementStarted.promise;
+		const concurrentReplayPromise = server.callTool("gjc_coordinator_retire_start_session", retirementArgs);
+		await expect(
+			server.callTool("gjc_coordinator_retire_start_session", {
+				...retirementArgs,
+				creation_idempotency_key: `${creationKey}-conflict`,
+			}),
+		).resolves.toMatchObject({ ok: false, error: { code: "idempotency_conflict" } });
+		await Bun.sleep(2_100);
+		releaseRetirement.resolve();
+		const [retired, concurrentReplay] = await Promise.all([retirementPromise, concurrentReplayPromise]);
+		expect(concurrentReplay).toEqual(retired);
 		expect(retired).toMatchObject({ ok: true, session_id: "retired-session", retired: true });
 		expect(retired).toMatchObject({
 			lifecycle: {
@@ -1299,21 +1315,6 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			error: { code: "retired" },
 		});
 		expect(controls.filter(control => control.operation === "session.create")).toHaveLength(1);
-		const retirementArgs = {
-			cwd: root,
-			session_id: "retired-session",
-			state_root: path.join(root, ".gjc", "state"),
-			endpoint_generation: 2,
-			endpoint_mtime_ms: 1,
-			process_incarnation: "linux:123",
-			host_incarnation: "host:123",
-			lifecycle_request_id: "retire-effect",
-			remote_create_key: remoteCreateKey,
-			creation_idempotency_key: creationKey,
-			request_digest: original.request_digest,
-			idempotency_key: "retire-start-intent",
-			allow_mutation: true,
-		};
 		const replay = await server.callTool("gjc_coordinator_retire_start_session", retirementArgs);
 		expect(replay).toEqual(retired);
 		expect(controls.filter(control => control.operation === "session.reconcile_uncertain")).toHaveLength(1);
@@ -1324,7 +1325,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			}),
 		).resolves.toMatchObject({ ok: false, error: { code: "retire_not_allowed" } });
 		expect(controls.filter(control => control.operation === "session.reconcile_uncertain")).toHaveLength(1);
-	});
+	}, 10_000);
 
 	it("forwards the complete retirement identity and does not seal malformed broker proofs", async () => {
 		const root = await tempRoot();
@@ -2788,7 +2789,23 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 	it("serializes concurrent same-key retries into one durable turn", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
-		const server = await createSdkControlServer(root, controls);
+		const receiptPersisted = Promise.withResolvers<void>();
+		const releaseFinalization = Promise.withResolvers<void>();
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			{
+				afterPromptReceiptPersisted: async () => {
+					receiptPersisted.resolve();
+					await releaseFinalization.promise;
+				},
+			},
+		);
 		await registerSdkSession(server, root);
 		const request = {
 			session_id: "visible-session",
@@ -2796,12 +2813,73 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			idempotency_key: "concurrent-prompt-key",
 			allow_mutation: true,
 		};
-		const [first, replay] = await Promise.all([
-			server.callTool("gjc_coordinator_send_prompt", request),
-			server.callTool("gjc_coordinator_send_prompt", request),
-		]);
+		const firstPromise = server.callTool("gjc_coordinator_send_prompt", request);
+		await receiptPersisted.promise;
+		const replayPromise = server.callTool("gjc_coordinator_send_prompt", request);
+		await Bun.sleep(2_100);
+		releaseFinalization.resolve();
+		const [first, replay] = await Promise.all([firstPromise, replayPromise]);
 		expect(replay).toEqual(first);
 		expect(lifecycleControls(controls).filter(control => control.operation === "turn.prompt")).toHaveLength(1);
+	}, 10_000);
+	it("rejects an in-flight same-key conflict without joining the owned turn", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const receiptPersisted = Promise.withResolvers<void>();
+		const releaseFinalization = Promise.withResolvers<void>();
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			{
+				afterPromptReceiptPersisted: async () => {
+					receiptPersisted.resolve();
+					await releaseFinalization.promise;
+				},
+			},
+		);
+		await registerSdkSession(server, root);
+		const firstPromise = server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "owned prompt",
+			idempotency_key: "in-flight-conflict-key",
+			allow_mutation: true,
+		});
+		await receiptPersisted.promise;
+		const conflict = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "conflicting prompt",
+			idempotency_key: "in-flight-conflict-key",
+			allow_mutation: true,
+		});
+		expect(conflict).toMatchObject({ ok: false, error: { code: "idempotency_conflict" } });
+		releaseFinalization.resolve();
+		await expect(firstPromise).resolves.toMatchObject({ ok: true, operation: "turn.prompt" });
+		expect(lifecycleControls(controls).filter(control => control.operation === "turn.prompt")).toHaveLength(1);
+	});
+	it("keeps different idempotency keys isolated", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		const first = await server.callTool("gjc_coordinator_report_status", {
+			status: "blocked",
+			summary: "first isolated report",
+			idempotency_key: "first-isolated-key",
+			allow_mutation: true,
+		});
+		const second = await server.callTool("gjc_coordinator_report_status", {
+			status: "blocked",
+			summary: "second isolated report",
+			idempotency_key: "second-isolated-key",
+			allow_mutation: true,
+		});
+		expect(first).toMatchObject({ ok: true, report: { summary: "first isolated report" } });
+		expect(second).toMatchObject({ ok: true, report: { summary: "second isolated report" } });
+		expect(second.report).not.toEqual(first.report);
 	});
 	it("recovers a committed report after the outer idempotency receipt is left in progress", async () => {
 		const root = await tempRoot();

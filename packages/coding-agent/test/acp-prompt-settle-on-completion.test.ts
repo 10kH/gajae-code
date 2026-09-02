@@ -360,7 +360,11 @@ test("a completed turn settles on its terminal frame even when end-of-turn metad
 		expect(fixture.clock.now()).toBe(0);
 		expect(fixture.clock.pending).toBe(0);
 		// The terminal was processed in full, not dropped: its final report reached the
-		// client as an assistant chunk in the same pass that settled the turn.
+		// client as a detached assistant chunk without holding settlement.
+		await waitFor(
+			() => fixture.updates.some(update => update.update.sessionUpdate === "agent_message_chunk"),
+			"detached final text",
+		);
 		expect(
 			fixture.updates
 				.filter(update => update.update.sessionUpdate === "agent_message_chunk")
@@ -382,6 +386,10 @@ test("a pre-acknowledgement terminal uses correlation carried by its event paylo
 		expect(await bounded(pending, "pre-acknowledgement prompt completion")).toEqual({
 			stopReason: "end_turn",
 		});
+		await waitFor(
+			() => fixture.updates.some(update => update.update.sessionUpdate === "agent_message_chunk"),
+			"pre-acknowledgement detached final text",
+		);
 		expect(
 			fixture.updates
 				.filter(update => update.update.sessionUpdate === "agent_message_chunk")
@@ -394,7 +402,7 @@ test("a pre-acknowledgement terminal uses correlation carried by its event paylo
 	}
 });
 
-test("a deferred terminal processing failure is contained by the frame queue", async () => {
+test("a terminal settlement is not reversed by a final-text publication failure", async () => {
 	const fixture = await createFixture({ terminalBeforeAcknowledgement: true, rejectFinalTextUpdate: true });
 	try {
 		const pending = fixture.agent.prompt({
@@ -409,7 +417,7 @@ test("a deferred terminal processing failure is contained by the frame queue", a
 			),
 			"deferred terminal processing failure",
 		);
-		expect(outcome).toMatchObject({ code: "frame_processing_failed" });
+		expect(outcome).toBeUndefined();
 		expect(fixture.clock.pending).toBe(0);
 	} finally {
 		fixture.dispose();
@@ -427,7 +435,11 @@ test("a completed turn settles exactly once for duplicate and late terminal fram
 		await waitFor(() => fixture.queryCalls.includes("session.metadata"), "end-of-turn metadata query");
 		// A late duplicate arriving after settlement must not re-run the end-of-turn work.
 		fixture.sendStopped("end_turn");
-		await Bun.sleep(50);
+		await waitFor(() => phaseUpdates(fixture.updates, "idle") === idleBefore + 1, "single terminal idle update");
+		await waitFor(
+			() => fixture.updates.filter(update => update.update.sessionUpdate === "agent_message_chunk").length === 1,
+			"single detached final text",
+		);
 		expect(phaseUpdates(fixture.updates, "idle")).toBe(idleBefore + 1);
 		expect(fixture.queryCalls.filter(query => query === "context.get")).toHaveLength(1);
 		expect(fixture.queryCalls.filter(query => query === "session.metadata")).toHaveLength(1);

@@ -39,6 +39,7 @@ const LOCK_ACQUIRE_RETRY_MS = 5;
 const LOCK_ACQUIRE_MAX_RETRY_MS = 100;
 const LOCK_ACQUIRE_TIMEOUT_MS = 2_000;
 const LOCK_STALE_MS = 30_000;
+const RELEASED_TRANSITION_GRACE_MS = 1_000;
 
 interface LockRetryBudget {
 	startedAt: number;
@@ -1308,7 +1309,13 @@ async function acquireOwnerLock(
 		} catch {
 			throw error;
 		}
-		if (!validLockOwner(observed) || observed.released !== true) throw error;
+		if (!validLockOwner(observed)) throw error;
+		if (observed.released !== true) {
+			if (await lockOwnerIsAlive(observed)) throw error;
+			const removed = exactUnlinkOwnerRecord(file, current, quarantineName);
+			if (removed !== "removed" && removed !== "absent") throw error;
+			return await createOwnerLock(file, owner, quarantineName);
+		}
 		try {
 			return await rewriteHeldOwnerRecord(file, current, owner);
 		} catch (error) {
@@ -1330,7 +1337,10 @@ async function acquireOwnerLock(
  *
  * Stale-owner reclaim still uses the native identity-bound detach protocol because no live
  * owner or transition claim can vouch for that pathname. A mismatch here likewise leaves a
- * successor strictly alone.
+ * successor strictly alone. A released tombstone is reclaimable on every platform when its
+ * owner host is this installation and the transition directory is proven empty and unchanged:
+ * the tombstone is the release marker, while the directory generation binds that marker to
+ * the exact claim that release failed to remove.
  */
 async function releaseOwnerLock(file: string, held: LockOwnerSnapshot): Promise<void> {
 	let owner: unknown;
@@ -1549,7 +1559,7 @@ async function releaseTransitionClaim(
 }
 
 async function reclaimStaleTransitionClaim(transitionDir: string, quarantineName: string): Promise<void> {
-	const stat = await fs.lstat(transitionDir).catch(() => null);
+	const stat = await fs.lstat(transitionDir, { bigint: true }).catch(() => null);
 	if (!stat) return;
 	// Regular-file claims belong to the superseded protocol. They retain the old
 	// exact-identity stale path; released PID-1 tombstones deliberately require
@@ -1566,9 +1576,72 @@ async function reclaimStaleTransitionClaim(transitionDir: string, quarantineName
 		return;
 	}
 	if (!stat.isDirectory()) throw new SessionStateLockUnavailableError();
-	// No portable operation can atomically prove that this directory + sibling
-	// sidecar are still the dead claim two concurrent reclaimers inspected. A
-	// crashed atomic claim therefore stays fail-closed for explicit recovery.
+	const ownerSnapshot = await captureRegularLockOwner(`${transitionDir}.owner`);
+	if (!ownerSnapshot) return;
+	let owner: unknown;
+	try {
+		owner = JSON.parse(ownerSnapshot.bytes);
+	} catch {
+		return;
+	}
+	if (!validLockOwner(owner)) return;
+	if (owner.released === true) {
+		// A released record is safe only when it is qualified by this installation.
+		// Never let a shared-volume tombstone, an absent identity, or a legacy foreign
+		// identity authorize removal of a claim this process cannot own.
+		if (owner.owner_host_id === undefined) return;
+		const currentHost = await currentOwnerHostId();
+		const legacyHost = await currentLegacyOwnerHostId();
+		if (owner.owner_host_id !== currentHost && owner.owner_host_id !== legacyHost) return;
+		if (Date.now() - Number(ownerSnapshot.mtimeNs / 1_000_000n) < RELEASED_TRANSITION_GRACE_MS) return;
+	} else {
+		if (process.platform !== "win32") return;
+		if (await lockOwnerIsAlive(owner)) return;
+	}
+	const generation = transitionGenerationFromStat(stat);
+	const nativePath = await canonicalOwnedTransitionPath(transitionDir).catch(() => null);
+	if (!nativePath) return;
+	const captured = nativeSessionStateLock().snapshotDirectoryTree(nativePath);
+	if (!captured.ok || !captured.snapshot) return;
+	const root = captured.snapshot.entries.find(entry => entry.relativePath === "");
+	if (
+		!root ||
+		root.kind !== "directory" ||
+		root.dev !== String(generation.dev) ||
+		root.ino !== String(generation.ino) ||
+		root.nlink !== String(generation.nlink) ||
+		root.mtimeNs !== String(generation.mtimeNs) ||
+		root.ctimeNs !== String(generation.ctimeNs)
+	)
+		return;
+	if (captured.snapshot.entries.length !== 1) return;
+	const removed = nativeSessionStateLock().exactRemoveDirectoryTree(nativePath, captured.snapshot);
+	if (removed.ok || removed.code === "not_found") {
+		const ownerRemoval = exactUnlinkOwnerRecord(`${transitionDir}.owner`, ownerSnapshot, quarantineName);
+		if (ownerRemoval !== "removed" && ownerRemoval !== "absent") return;
+		return;
+	}
+	if (
+		removed.code === "cleanup_pending" &&
+		removed.payloadDurable === true &&
+		removed.detachedPath === `${nativePath}.removing` &&
+		removed.retainedSuccessorPath === undefined &&
+		removed.retainedUnknownPath === undefined &&
+		removed.retainedPlaceholderPath === undefined
+	) {
+		// The captured claim is proven empty, so the native detach receipt leaves an
+		// empty directory at detachedPath. Remove that exact directory directly: calling
+		// the detach primitive again would deterministically create a second `.removing`
+		// collision on POSIX. rmdir never follows a directory's contents and refuses if a
+		// successor populated the detached path.
+		await removeTransitionDir(removed.detachedPath);
+		const ownerRemoval = exactUnlinkOwnerRecord(`${transitionDir}.owner`, ownerSnapshot, quarantineName);
+		if (ownerRemoval !== "removed" && ownerRemoval !== "absent") return;
+		return;
+	}
+	throw new SessionStateLockUnavailableError(
+		new Error(`Stale transition claim could not be reclaimed (${removed.code ?? "unknown"}).`),
+	);
 }
 
 /** Run one pathname transition under an atomic `mkdir`/`rmdir` claim. */

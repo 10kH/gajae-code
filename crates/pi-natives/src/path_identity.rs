@@ -3,10 +3,12 @@
 #[cfg(any(unix, test))]
 use std::io::{self, Read};
 use std::{
+	panic::{AssertUnwindSafe, catch_unwind},
 	path::{Component, Path, PathBuf},
 	sync::{
-		Arc,
+		Arc, OnceLock,
 		atomic::{AtomicBool, Ordering},
+		mpsc::{SyncSender, sync_channel},
 	},
 };
 
@@ -362,6 +364,10 @@ pub struct NativeNoReplaceResult {
 
 impl NativeNoReplaceResult {
 	fn from_exact(result: NativeExactUnlinkResult) -> Self {
+		Self::from_exact_with_primitive(result, None)
+	}
+
+	fn from_exact_with_primitive(result: NativeExactUnlinkResult, primitive: Option<&str>) -> Self {
 		let (mutation_state, durability_state, reason) = if result.ok {
 			// A direct no-replace rename commits the namespace mutation, but does not
 			// fsync either parent directory.
@@ -380,7 +386,7 @@ impl NativeNoReplaceResult {
 				Some("destination_identity_changed") => {
 					("committed", "not_provable", "identity_violation")
 				},
-				Some("reparse_point" | "identity_mismatch") => {
+				Some("reparse_point" | "identity_mismatch" | "not_directory" | "not_regular_file") => {
 					("not_committed", "not_attempted", "identity_violation")
 				},
 				// A signal landing before the syscall entered the kernel (or between
@@ -399,16 +405,21 @@ impl NativeNoReplaceResult {
 			mutation_state:   mutation_state.to_owned(),
 			durability_state: durability_state.to_owned(),
 			reason:           reason.to_owned(),
-			primitive:        if cfg!(target_os = "linux") {
-				"renameat2_noreplace"
-			} else if cfg!(target_os = "macos") {
-				"renameatx_np_excl"
-			} else if cfg!(windows) {
-				"windows_rename_noreplace"
-			} else {
-				"unsupported"
-			}
-			.to_owned(),
+			primitive:        primitive.map_or_else(
+				|| {
+					if cfg!(target_os = "linux") {
+						"renameat2_noreplace"
+					} else if cfg!(target_os = "macos") {
+						"renameatx_np_excl"
+					} else if cfg!(windows) {
+						"windows_rename_noreplace"
+					} else {
+						"unsupported"
+					}
+					.to_owned()
+				},
+				str::to_owned,
+			),
 			phase:            if mutation_state == "committed" && !result.ok {
 				"terminal_identity"
 			} else if mutation_state == "committed" {
@@ -1243,6 +1254,7 @@ pub fn exact_unlink_direct(
 	};
 	platform::exact_unlink_direct(Path::new(&path), &identity)
 }
+
 /// Atomically replace a staged regular file only after validating the exact
 /// staged source and expected destination.
 ///
@@ -1274,6 +1286,7 @@ pub fn exact_replace_path(
 			&expected_destination,
 		)
 	}
+
 	#[cfg(not(any(unix, windows)))]
 	{
 		let _ = (source_path, destination_path, expected_source, expected_destination);
@@ -1281,7 +1294,45 @@ pub fn exact_replace_path(
 	}
 }
 
-/// Restore only the detached object that still has the supplied platform
+/// Start direct exact unlink without retaining an N-API task or promise.
+///
+/// Cleanup is best effort: the detached operation is intentionally abandoned
+/// when the process exits, while the exact identity checks still protect any
+/// pathname that remains alive long enough to be examined. A bounded queue
+/// keeps cleanup bursts from spawning an unbounded number of OS threads; work
+/// that cannot be queued is left for the owning reconciliation pass.
+#[napi]
+pub fn exact_unlink_direct_detached(path: String, identity: NativeExactFileIdentity) -> bool {
+	let queue = detached_cleanup_sender();
+	queue.worker_started && queue.sender.try_send((path, identity)).is_ok()
+}
+
+type DetachedCleanupJob = (String, NativeExactFileIdentity);
+
+struct DetachedCleanupQueue {
+	sender:         SyncSender<DetachedCleanupJob>,
+	worker_started: bool,
+}
+
+fn detached_cleanup_sender() -> &'static DetachedCleanupQueue {
+	static QUEUE: OnceLock<DetachedCleanupQueue> = OnceLock::new();
+	QUEUE.get_or_init(|| {
+		let (sender, receiver) = sync_channel::<DetachedCleanupJob>(64);
+		let worker_started = std::thread::Builder::new()
+			.name("pi-natives-exact-unlink-cleanup".to_owned())
+			.spawn(move || {
+				while let Ok((path, identity)) = receiver.recv() {
+					let _ = catch_unwind(AssertUnwindSafe(|| {
+						let _ = exact_unlink_direct(path, identity);
+					}));
+				}
+			})
+			.is_ok();
+		DetachedCleanupQueue { sender, worker_started }
+	})
+}
+
+/// Restore only the detached object that still has the supplied exact
 #[cfg_attr(clippy, doc = "")]
 /// identity. The detached and original paths must retain the same validated
 /// parent, and restoration never replaces an existing original path.
@@ -1314,6 +1365,34 @@ pub fn rename_no_replace_path(
 		Path::new(&source_path),
 		Path::new(&destination_path),
 	))
+}
+
+/// Publish a staged directory under a destination name that must not already
+/// exist.
+///
+/// Uses descriptor-relative `mkdirat` ownership followed by `renameat`.
+/// This is the directory stand-in for `renameat2(RENAME_NOREPLACE)` on mounts
+/// that reject rename flags with `EINVAL`/`ENOSYS`. The native implementation
+/// validates every path component without following symlinks and never
+/// overwrites a non-empty destination directory.
+#[napi]
+pub fn rename_directory_no_replace_path(
+	source_path: String,
+	destination_path: String,
+) -> NativeNoReplaceResult {
+	if source_path.contains('\0') || destination_path.contains('\0') {
+		return NativeNoReplaceResult::from_exact_with_primitive(
+			NativeExactUnlinkResult::failure("invalid_request"),
+			Some("mkdirat_renameat_noreplace"),
+		);
+	}
+	NativeNoReplaceResult::from_exact_with_primitive(
+		platform::rename_directory_path_no_replace(
+			Path::new(&source_path),
+			Path::new(&destination_path),
+		),
+		Some("mkdirat_renameat_noreplace"),
+	)
 }
 
 /// Publish a staged regular file under a destination name that must not already
@@ -1358,6 +1437,18 @@ pub fn rename_no_replace_path_async(
 ) -> task::Promise<NativeNoReplaceResult> {
 	task::blocking("rename_no_replace_path", (), move |_| {
 		Ok(rename_no_replace_path(source_path, destination_path))
+	})
+}
+
+/// Async variant of [`rename_directory_no_replace_path`] scheduled on the
+/// libuv blocking pool.
+#[napi]
+pub fn rename_directory_no_replace_path_async(
+	source_path: String,
+	destination_path: String,
+) -> task::Promise<NativeNoReplaceResult> {
+	task::blocking("rename_directory_no_replace_path", (), move |_| {
+		Ok(rename_directory_no_replace_path(source_path, destination_path))
 	})
 }
 
@@ -3359,6 +3450,59 @@ pub(crate) mod platform {
 	}
 
 	#[cfg(target_os = "linux")]
+	fn rename_directory_no_replace_at(
+		source_parent_fd: libc::c_int,
+		destination_parent_fd: libc::c_int,
+		source: &CString,
+		destination: &CString,
+	) -> Result<(), &'static str> {
+		// `renameat2(RENAME_NOREPLACE)` is unavailable on some shared mounts. Claim
+		// the destination with mkdirat, then replace only that still-empty directory.
+		// The caller has already validated the source descriptor and parent identity.
+		// SAFETY: the parent descriptor is live and destination is NUL-terminated.
+		if unsafe { libc::mkdirat(destination_parent_fd, destination.as_ptr(), 0o700) } != 0 {
+			return Err(match std::io::Error::last_os_error().raw_os_error() {
+				Some(libc::EEXIST | libc::ENOTEMPTY) => "quarantine_collision",
+				Some(libc::ENOENT) => "not_found",
+				Some(libc::EACCES | libc::EPERM) => "permission_denied",
+				_ => "io_error",
+			});
+		}
+		// SAFETY: both parent descriptors and names remain valid for the syscall.
+		let renamed = unsafe {
+			libc::renameat(
+				source_parent_fd,
+				source.as_ptr(),
+				destination_parent_fd,
+				destination.as_ptr(),
+			)
+		};
+		if renamed == 0 {
+			Ok(())
+		} else {
+			let error = std::io::Error::last_os_error();
+			// SAFETY: remove only the empty directory claimed by this call.
+			unsafe { libc::unlinkat(destination_parent_fd, destination.as_ptr(), libc::AT_REMOVEDIR) };
+			Err(match error.raw_os_error() {
+				Some(libc::EEXIST | libc::ENOTEMPTY) => "quarantine_collision",
+				Some(libc::ENOENT) => "not_found",
+				Some(libc::EACCES | libc::EPERM) => "permission_denied",
+				_ => "io_error",
+			})
+		}
+	}
+
+	#[cfg(not(target_os = "linux"))]
+	fn rename_directory_no_replace_at(
+		_: libc::c_int,
+		_: libc::c_int,
+		_: &CString,
+		_: &CString,
+	) -> Result<(), &'static str> {
+		Err("atomic_unavailable")
+	}
+
+	#[cfg(target_os = "linux")]
 	fn rename_exchange(
 		source_parent_fd: libc::c_int,
 		destination_parent_fd: libc::c_int,
@@ -4347,6 +4491,141 @@ pub(crate) mod platform {
 		exact_unlink_at(parent_fd, name.clone(), path, &identity)
 	}
 
+	fn directory_publish_error(error: &std::io::Error) -> &'static str {
+		match error.raw_os_error() {
+			Some(libc::EEXIST | libc::ENOTEMPTY) => "quarantine_collision",
+			Some(libc::ENOENT) => "not_found",
+			Some(libc::EACCES | libc::EPERM) => "permission_denied",
+			Some(libc::EXDEV) => "cross_device",
+			Some(libc::EINTR) => "interrupted",
+			Some(libc::EINVAL) => "invalid_request",
+			_ => "io_error",
+		}
+	}
+
+	/// Descriptor-relative directory publication used when the filesystem
+	/// rejects `renameat2(RENAME_NOREPLACE)`. `mkdirat` claims the destination
+	/// name exclusively; the plain `renameat` can then replace only that empty
+	/// directory. A non-empty destination (including an attacker-published
+	/// `info` file) is never overwritten, and every parent/final component is
+	/// opened with no-follow semantics.
+	#[expect(
+		clippy::undocumented_unsafe_blocks,
+		reason = "publication descriptors are owned here and closed exactly once on every branch"
+	)]
+	pub(super) fn rename_directory_path_no_replace(
+		source_path: &Path,
+		destination_path: &Path,
+	) -> NativeExactUnlinkResult {
+		let (source_parent, source_name) = match open_parent_no_follow(source_path) {
+			Ok(value) => value,
+			Err(result) => return *result,
+		};
+		let source_fd = unsafe {
+			libc::openat(
+				source_parent,
+				source_name.as_ptr(),
+				libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+			)
+		};
+		if source_fd < 0 {
+			let result =
+				NativeExactUnlinkResult::failure(security_code(&std::io::Error::last_os_error()));
+			unsafe { libc::close(source_parent) };
+			return result;
+		}
+		let mut source_stat: libc::stat = unsafe { std::mem::zeroed() };
+		if unsafe { libc::fstat(source_fd, &mut source_stat) } != 0 {
+			let result =
+				NativeExactUnlinkResult::failure(security_code(&std::io::Error::last_os_error()));
+			unsafe {
+				libc::close(source_fd);
+				libc::close(source_parent);
+			}
+			return result;
+		}
+		let (destination_parent, destination_name) = match open_parent_no_follow(destination_path) {
+			Ok(value) => value,
+			Err(result) => {
+				unsafe {
+					libc::close(source_fd);
+					libc::close(source_parent);
+				}
+				return *result;
+			},
+		};
+		let mut source_named: libc::stat = unsafe { std::mem::zeroed() };
+		let source_still_matches = unsafe {
+			libc::fstatat(
+				source_parent,
+				source_name.as_ptr(),
+				&mut source_named,
+				libc::AT_SYMLINK_NOFOLLOW,
+			)
+		} == 0 && source_named.st_mode & libc::S_IFMT == libc::S_IFDIR
+			&& source_named.st_dev == source_stat.st_dev
+			&& source_named.st_ino == source_stat.st_ino;
+		if !source_still_matches {
+			unsafe {
+				libc::close(source_fd);
+				libc::close(source_parent);
+				libc::close(destination_parent);
+			}
+			return NativeExactUnlinkResult::failure("identity_mismatch");
+		}
+		if unsafe { libc::mkdirat(destination_parent, destination_name.as_ptr(), 0o700) } != 0 {
+			let result = NativeExactUnlinkResult::failure(directory_publish_error(
+				&std::io::Error::last_os_error(),
+			));
+			unsafe {
+				libc::close(source_fd);
+				libc::close(source_parent);
+				libc::close(destination_parent);
+			}
+			return result;
+		}
+		let rename_result = unsafe {
+			libc::renameat(
+				source_parent,
+				source_name.as_ptr(),
+				destination_parent,
+				destination_name.as_ptr(),
+			)
+		};
+		let result = if rename_result == 0 {
+			let mut published: libc::stat = unsafe { std::mem::zeroed() };
+			let verified = unsafe {
+				libc::fstatat(
+					destination_parent,
+					destination_name.as_ptr(),
+					&mut published,
+					libc::AT_SYMLINK_NOFOLLOW,
+				)
+			} == 0 && published.st_mode & libc::S_IFMT == libc::S_IFDIR
+				&& published.st_dev == source_stat.st_dev
+				&& published.st_ino == source_stat.st_ino;
+			if verified {
+				NativeExactUnlinkResult::success()
+			} else {
+				NativeExactUnlinkResult::failure("destination_identity_changed")
+			}
+		} else {
+			let error = std::io::Error::last_os_error();
+			// Best-effort cleanup removes only the empty directory this call claimed.
+			// ENOTEMPTY deliberately leaves a contender's metadata untouched.
+			unsafe {
+				libc::unlinkat(destination_parent, destination_name.as_ptr(), libc::AT_REMOVEDIR);
+			}
+			NativeExactUnlinkResult::failure(directory_publish_error(&error))
+		};
+		unsafe {
+			libc::close(source_fd);
+			libc::close(source_parent);
+			libc::close(destination_parent);
+		}
+		result
+	}
+
 	#[expect(
 		clippy::undocumented_unsafe_blocks,
 		reason = "publication descriptors are owned here and closed exactly once on every branch"
@@ -4552,9 +4831,6 @@ pub(crate) mod platform {
 		Err(match std::io::Error::last_os_error().raw_os_error() {
 			Some(libc::EEXIST) => "already_exists",
 			Some(libc::EXDEV) => "cross_device",
-			// A filesystem without hard links reports EPERM for a valid request, which
-			// is indistinguishable here from a denied one; both leave the destination
-			// unpublished.
 			Some(libc::EACCES | libc::EPERM) => "permission_denied",
 			Some(libc::ENOENT) => "not_found",
 			Some(libc::EINTR) => "interrupted",
@@ -4609,9 +4885,10 @@ pub(crate) mod platform {
 				&& stat_mtime_ns(&opened) == i128::from(identity.mtime_ns)
 				&& (identity.allow_hard_link
 					|| (opened.st_nlink == 1 && identity.nlink.is_none_or(|nlink| nlink == 1)))
-				&& identity
-					.nlink
-					.is_none_or(|nlink| nlink == opened.st_nlink as u64)
+				&& (identity.allow_hard_link
+					|| identity
+						.nlink
+						.is_none_or(|nlink| nlink == opened.st_nlink as u64))
 				&& identity.sha256.as_ref() == Some(&digest)
 				&& named.st_mode & libc::S_IFMT == libc::S_IFREG
 				&& named.st_dev == opened.st_dev
@@ -5705,7 +5982,13 @@ pub(crate) mod platform {
 		} else {
 			#[cfg(test)]
 			pause_before_tree_root_rename_for_test();
-			match rename_no_replace(parent, parent, root_name, &final_name) {
+			match rename_no_replace(parent, parent, root_name, &final_name).or_else(|code| {
+				if matches!(code, "invalid_request" | "atomic_unavailable") {
+					rename_directory_no_replace_at(parent, parent, root_name, &final_name)
+				} else {
+					Err(code)
+				}
+			}) {
 				Ok(()) => final_path,
 				Err(code) => {
 					// SAFETY: this branch owns the live descriptors and closes each exactly once.
@@ -6901,6 +7184,10 @@ mod platform {
 	/// stand-in is never requested here and is reported as unavailable rather
 	/// than emulated.
 	pub(super) fn link_path_no_replace(_: &Path, _: &Path) -> NativeExactUnlinkResult {
+		NativeExactUnlinkResult::failure("atomic_unavailable")
+	}
+
+	pub(super) fn rename_directory_path_no_replace(_: &Path, _: &Path) -> NativeExactUnlinkResult {
 		NativeExactUnlinkResult::failure("atomic_unavailable")
 	}
 
@@ -8461,6 +8748,9 @@ mod platform {
 		NativeCanonicalDirectoryIdentity::failure("identity_unavailable")
 	}
 	pub(super) fn rename_path_no_replace(_: &Path, _: &Path) -> NativeExactUnlinkResult {
+		NativeExactUnlinkResult::failure("atomic_unavailable")
+	}
+	pub(super) fn rename_directory_path_no_replace(_: &Path, _: &Path) -> NativeExactUnlinkResult {
 		NativeExactUnlinkResult::failure("atomic_unavailable")
 	}
 	pub(super) fn link_path_no_replace(_: &Path, _: &Path) -> NativeExactUnlinkResult {
@@ -10041,9 +10331,10 @@ mod link_no_replace_tests {
 		os::unix::fs::MetadataExt,
 		path::PathBuf,
 		sync::atomic::{AtomicU64, Ordering},
+		thread,
 	};
 
-	use super::{link_no_replace_path, rename_no_replace_path};
+	use super::{link_no_replace_path, rename_directory_no_replace_path, rename_no_replace_path};
 
 	static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -10141,6 +10432,88 @@ mod link_no_replace_tests {
 			!temporary.0.join("published").exists(),
 			"a rejected directory publish must leave no destination behind"
 		);
+	}
+
+	#[test]
+	fn directory_fallback_publishes_descriptor_relative_without_overwriting() {
+		let temporary = TempDir::new();
+		fs::create_dir(temporary.0.join("staging")).expect("seed staging directory");
+		fs::write(temporary.0.join("staging/info"), b"owner").expect("seed owner record");
+
+		let published =
+			rename_directory_no_replace_path(temporary.join("staging"), temporary.join("published"));
+
+		assert!(published.ok, "directory fallback must publish: {:?}", published.code);
+		assert_eq!(published.primitive, "mkdirat_renameat_noreplace");
+		assert_eq!(
+			fs::read(temporary.0.join("published/info")).expect("read owner record"),
+			b"owner"
+		);
+		assert!(!temporary.0.join("staging").exists(), "staging name must be consumed");
+
+		fs::create_dir(temporary.0.join("staging-again")).expect("seed collision staging");
+		fs::write(temporary.0.join("staging-again/info"), b"successor")
+			.expect("seed successor record");
+		let collision = rename_directory_no_replace_path(
+			temporary.join("staging-again"),
+			temporary.join("published"),
+		);
+		assert!(!collision.ok, "an occupied destination must not be replaced");
+		assert_eq!(collision.reason, "destination_exists");
+		assert_eq!(
+			fs::read(temporary.0.join("published/info")).expect("read original owner"),
+			b"owner"
+		);
+	}
+
+	#[test]
+	fn directory_fallback_rejects_symlinked_staging_without_following_it() {
+		let temporary = TempDir::new();
+		fs::create_dir(temporary.0.join("outside")).expect("seed outside directory");
+		fs::write(temporary.0.join("outside/info"), b"outside").expect("seed outside owner");
+		std::os::unix::fs::symlink(temporary.0.join("outside"), temporary.0.join("staging"))
+			.expect("seed staging symlink");
+
+		let rejected =
+			rename_directory_no_replace_path(temporary.join("staging"), temporary.join("published"));
+
+		assert!(!rejected.ok, "a symlinked staging path must be rejected");
+		assert_eq!(rejected.reason, "identity_violation");
+		assert!(
+			!temporary.0.join("published").exists(),
+			"rejected publish must not create a destination"
+		);
+		assert!(temporary.0.join("outside").exists(), "outside target must remain untouched");
+	}
+
+	#[test]
+	fn directory_fallback_allows_only_one_concurrent_contender_to_claim_the_name() {
+		let temporary = TempDir::new();
+		for name in ["staging-a", "staging-b"] {
+			fs::create_dir(temporary.0.join(name)).expect("seed contender directory");
+			fs::write(temporary.0.join(name).join("info"), name.as_bytes())
+				.expect("seed contender owner");
+		}
+		let destination = temporary.join("published");
+		let left_source = temporary.join("staging-a");
+		let right_source = temporary.join("staging-b");
+		let left_destination = destination.clone();
+		let left =
+			thread::spawn(move || rename_directory_no_replace_path(left_source, left_destination));
+		let right =
+			thread::spawn(move || rename_directory_no_replace_path(right_source, destination));
+		let outcomes = [left.join().expect("left contender"), right.join().expect("right contender")];
+
+		assert_eq!(outcomes.iter().filter(|result| result.ok).count(), 1);
+		assert_eq!(
+			outcomes
+				.iter()
+				.filter(|result| result.reason == "destination_exists")
+				.count(),
+			1
+		);
+		let winner = fs::read(temporary.0.join("published/info")).expect("winner owner record");
+		assert!(winner == b"staging-a" || winner == b"staging-b");
 	}
 }
 

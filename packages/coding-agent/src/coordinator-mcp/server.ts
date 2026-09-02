@@ -83,7 +83,7 @@ import {
 	requireCoordinatorMutation,
 	safeOpenCoordinatorArtifact,
 } from "./policy";
-import { listCoordinatorJsonFiles } from "./projection-scan";
+import { listCoordinatorJsonFilesWithRetry } from "./projection-scan";
 import {
 	answerBindingMatches,
 	buildCoordinatorAskAnswerSchema,
@@ -835,7 +835,7 @@ function toolSchema(name: CoordinatorToolName): {
 				properties: {
 					after_seq: { type: "integer", minimum: 0 },
 					session_id: sessionId,
-					event_types: { type: "array", items: { type: "string" } },
+					event_types: { type: "array", items: { type: "string", enum: [...COORDINATOR_EVENT_KINDS] } },
 					timeout_ms: {
 						type: "number",
 						description: "Bounded event long-poll timeout in milliseconds, capped at 30 seconds.",
@@ -1498,7 +1498,7 @@ function publicSdkAcknowledgement(result: RuntimePromptAcknowledgement): Record<
 }
 
 async function listJsonFiles(dir: string): Promise<unknown[]> {
-	const scan = await listCoordinatorJsonFiles(dir);
+	const scan = await listCoordinatorJsonFilesWithRetry(dir);
 	if (scan.capped) throw new Error("coordinator_projection_scan_incomplete");
 	if (scan.skippedEmpty > 0 || scan.skippedDebris > 0) {
 		logger.warn("Coordinator projection scan skipped debris", {
@@ -2637,11 +2637,6 @@ async function writeActiveTurn(namespaceDir: string, turn: TurnRecord): Promise<
 	});
 }
 
-async function clearActiveTurn(namespaceDir: string, turn: TurnRecord): Promise<void> {
-	const active = asRecord(await readJsonFile(activeTurnFile(namespaceDir, turn.session_id)));
-	if (active?.turn_id === turn.turn_id) await removeCoordinatorFile(activeTurnFile(namespaceDir, turn.session_id));
-}
-
 async function readSessionState(namespaceDir: string, sessionId: string): Promise<CoordinatorSessionState | null> {
 	return (await readJsonFile(sessionStateFile(namespaceDir, sessionId))) as CoordinatorSessionState | null;
 }
@@ -2661,9 +2656,6 @@ async function writeSessionStateUnlocked(
 	} = {},
 ): Promise<CoordinatorSessionState> {
 	const persisted = await readSessionState(namespaceDir, sessionId);
-	const session = asRecord(
-		await readJsonFile(path.join(namespaceDir, "sessions", `${safeExternalId("session", sessionId)}.json`)),
-	);
 	// An overwrite is a canonical lifecycle repair, not proof that tool activity ended.
 	const previous = options.overwrite ? null : persisted;
 	const hasCurrentTurn = Object.hasOwn(options, "currentTurnId");
@@ -5047,6 +5039,58 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		const keyDigest = createHash("sha256").update(idempotencyKey).digest("hex");
 		return path.join(namespaceDir, "idempotency", `${keyDigest}.json`);
 	}
+	const idempotencyFlights = new Map<string, { requestDigest: string; promise: Promise<Record<string, unknown>> }>();
+	type IdempotencyFlightAdmission =
+		| { kind: "conflict"; response: Record<string, unknown> }
+		| { kind: "joined"; promise: Promise<Record<string, unknown>> }
+		| { kind: "owner"; run: (operation: Promise<Record<string, unknown>>) => Promise<Record<string, unknown>> };
+	function admitIdempotencyFlight(
+		tool: string,
+		idempotencyKey: string,
+		canonicalArgs: Record<string, unknown>,
+	): IdempotencyFlightAdmission {
+		const keyDigest = createHash("sha256").update(idempotencyKey).digest("hex");
+		const requestDigest = createHash("sha256")
+			.update(canonicalJson({ tool, args: canonicalArgs }))
+			.digest("hex");
+		const existingFlight = idempotencyFlights.get(keyDigest);
+		if (existingFlight) {
+			if (existingFlight.requestDigest !== requestDigest)
+				return {
+					kind: "conflict",
+					response: {
+						ok: false,
+						error: { code: "idempotency_conflict", message: "idempotency key was used with a different request" },
+					},
+				};
+			return { kind: "joined", promise: existingFlight.promise };
+		}
+		const result = Promise.withResolvers<Record<string, unknown>>();
+		const flight = { requestDigest, promise: result.promise };
+		idempotencyFlights.set(keyDigest, flight);
+		return {
+			kind: "owner",
+			run: async operation => {
+				void operation.then(result.resolve, result.reject);
+				try {
+					return await result.promise;
+				} finally {
+					if (idempotencyFlights.get(keyDigest) === flight) idempotencyFlights.delete(keyDigest);
+				}
+			},
+		};
+	}
+	async function withIdempotencyFlight(
+		tool: string,
+		idempotencyKey: string,
+		canonicalArgs: Record<string, unknown>,
+		operation: () => Promise<Record<string, unknown>>,
+	): Promise<Record<string, unknown>> {
+		const admission = admitIdempotencyFlight(tool, idempotencyKey, canonicalArgs);
+		if (admission.kind === "conflict") return admission.response;
+		if (admission.kind === "joined") return await admission.promise;
+		return await admission.run(operation());
+	}
 	async function withOrderedSessionStateLocks<T>(
 		lockFiles: readonly string[],
 		operation: () => Promise<T>,
@@ -5078,6 +5122,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		recoverInProgress = false,
 		isNonterminal: (response: Record<string, unknown>) => boolean = isRouterRequestAmbiguous,
 		lockAlreadyHeld = false,
+		flightAlreadyOwned = false,
 	): Promise<Record<string, unknown>> {
 		const keyDigest = createHash("sha256").update(idempotencyKey).digest("hex");
 		const requestDigest = createHash("sha256")
@@ -5182,7 +5227,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			});
 			return response;
 		};
-		return lockAlreadyHeld ? execute() : withSessionStateLock(lockFile, execute);
+		const executeWithLock = async (): Promise<Record<string, unknown>> =>
+			lockAlreadyHeld ? await execute() : await withSessionStateLock(lockFile, execute);
+		return flightAlreadyOwned
+			? await executeWithLock()
+			: await withIdempotencyFlight(tool, idempotencyKey, canonicalArgs, executeWithLock);
 	}
 
 	async function brokerSession(
@@ -5284,11 +5333,28 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					sessionId,
 				);
 			} catch (closeError) {
-				throw new SdkClientError(
-					UNOBSERVED_COMPENSATION_CODE,
-					`Coordinator creation failed after remote session ${sessionId} was created, and compensation failed.`,
-					{ primary: error, compensation: closeError, session_id: sessionId },
-				);
+				let listed: Record<string, unknown>;
+				try {
+					listed = await paginatedBrokerSessionList(cwd, { cwd });
+				} catch (listError) {
+					throw new SdkClientError(
+						UNOBSERVED_COMPENSATION_CODE,
+						`Coordinator creation failed after remote session ${sessionId} was created, and compensation failed.`,
+						{ primary: error, compensation: closeError, list: listError, session_id: sessionId },
+					);
+				}
+				const rows = jsonRecords(Array.isArray(listed.sessions) ? listed.sessions : []);
+				const row = rows.find(candidate => brokerSessionId(candidate) === sessionId);
+				const deadUncertain =
+					row !== undefined &&
+					row.live !== true &&
+					(row.terminalUncertain === true || (row as Record<string, unknown>).terminal_uncertain === true);
+				if (!deadUncertain)
+					throw new SdkClientError(
+						UNOBSERVED_COMPENSATION_CODE,
+						`Coordinator creation failed after remote session ${sessionId} was created, and compensation failed.`,
+						{ primary: error, compensation: closeError, session_id: sessionId },
+					);
 			}
 			throw error;
 		}
@@ -6716,7 +6782,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					// any stale pointer directly: once the turn projection is rewritten
 					// terminal, readActiveTurn() intentionally rejects it and cannot
 					// discover the legacy active-turn file to clear.
-					await fs.rm(activeTurnFile(namespaceDir, sessionId), { force: true });
+					await removeCoordinatorFile(activeTurnFile(namespaceDir, sessionId));
 				}
 				// A runtime sidecar can advance a live session while the canonical WAL still
 				// needs projection repair. Preserve that observed lifecycle state (and its
@@ -8783,7 +8849,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						code === "live_session"
 					);
 				};
-				return await withOrderedSessionStateLocks(
+				const flight = admitIdempotencyFlight(name, retirementKey, canonicalArgs);
+				if (flight.kind === "conflict") return flight.response;
+				if (flight.kind === "joined") return await flight.promise;
+				const retirementOperation = withOrderedSessionStateLocks(
 					[idempotencyLockFile(creationKey), idempotencyLockFile(retirementKey)],
 					async () =>
 						await withToolIdempotency(
@@ -8967,8 +9036,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							true,
 							isRetirementRetryable,
 							true,
+							true,
 						),
 				);
+				return await flight.run(retirementOperation);
 			}
 			if (name === "gjc_coordinator_activate_session") {
 				requireCoordinatorMutation(config, "sessions", args);

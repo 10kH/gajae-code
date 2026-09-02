@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { AsyncJobManager } from "../../async";
 import type { Settings } from "../../config/settings";
-import type { ExtensionAPI, ExtensionContext } from "../../extensibility/extensions";
+import type { ExtensionAPI, ExtensionContext, ExtensionTranscriptEntry } from "../../extensibility/extensions";
 import {
 	registerOwnedRegistration,
 	resetTerminalAbortRegistriesForTests,
@@ -17,7 +17,7 @@ import { createKindAwareReconciliation } from "../bus/kind-aware-reconciliation"
 import { createPromptReconciliation } from "../bus/prompt-reconciliation";
 import { createReconciliationStore } from "../bus/reconciliation-store";
 import { BROKER_RUNTIME_ABORT_CAPABILITY_FIELD, setBrokerRuntimeAbortCapabilityForTest } from "./control/runtime-gate";
-import { CursorRegistry, QueryHandlers, RevisionStore } from "./query";
+import { CursorRegistry, QueryHandlers, type QueryResponse, RevisionStore } from "./query";
 import {
 	createInvocationReconciliation,
 	createSdkSessionRuntimeExtension,
@@ -91,6 +91,7 @@ function extensionContext(
 		goalState?: unknown;
 		branch?: unknown[];
 		liveState?: { isStreaming: boolean; steeringQueueDepth: number; followupQueueDepth: number };
+		transcript?: ExtensionTranscriptEntry[];
 	} = {},
 ): ExtensionContext {
 	return {
@@ -103,6 +104,7 @@ function extensionContext(
 			getSessionName: () => undefined,
 			getBranch: () => options.branch ?? [],
 		},
+		getTranscript: () => options.transcript ?? [],
 		getGoalState: () => options.goalState,
 	} as unknown as ExtensionContext;
 }
@@ -148,6 +150,97 @@ async function queryGoalState(
 	if (!response.ok) throw new Error(`goal query failed: ${JSON.stringify(response)}`);
 	return response.page?.items[0];
 }
+
+async function queryLastAssistant(ctx: ExtensionContext, sessionId: string): Promise<QueryResponse> {
+	const surface = createSdkSurfaceFactory({
+		ctx,
+		id: sessionId,
+		api: {} as ExtensionAPI,
+	}).query;
+	const store = new RevisionStore(sessionId);
+	const response = await new QueryHandlers(
+		surface,
+		sessionId,
+		store,
+		new CursorRegistry("last-assistant-test-token", store),
+	).dispatch({
+		query: "session.last_assistant",
+		connectionId: "last-assistant-test-connection",
+	});
+	return response;
+}
+
+test("session.last_assistant returns the latest projected readable text past non-text assistant tails", async () => {
+	const sessionId = "last-assistant-readable-tail";
+	const transcript: ExtensionTranscriptEntry[] = [
+		{
+			id: "visible-readable",
+			role: "assistant",
+			textSummary: "first line second line",
+			ts: new Date(1).toISOString(),
+			content: [
+				{ type: "text", text: "first line" },
+				{ type: "thinking", thinking: "private reasoning" },
+				{ type: "text", text: "second line" },
+			],
+		},
+		...Array.from(
+			{ length: 2_000 },
+			(_, index): ExtensionTranscriptEntry => ({
+				id: `tool-tail-${index}`,
+				role: "assistant",
+				textSummary: "",
+				ts: new Date(index + 2).toISOString(),
+				body: index % 3 === 0 ? "" : index % 3 === 1 ? " \n\t " : undefined,
+				content:
+					index % 3 === 2
+						? [
+								{ type: "thinking", thinking: "not readable" },
+								{ type: "toolCall", id: `call-${index}`, name: "read", arguments: {} },
+							]
+						: undefined,
+			}),
+		),
+	];
+	const ctx = extensionContext(sessionId, "/tmp", {
+		transcript,
+		branch: [
+			{
+				type: "message",
+				message: { role: "assistant", content: [{ type: "text", text: "raw private tail" }] },
+			},
+		],
+	});
+
+	expect(await queryLastAssistant(ctx, sessionId)).toMatchObject({
+		ok: true,
+		page: { items: ["first line\nsecond line"] },
+	});
+});
+
+test("session.last_assistant returns resource_gone when the projected transcript has no readable assistant text", async () => {
+	const sessionId = "last-assistant-empty";
+	const ctx = extensionContext(sessionId, "/tmp", {
+		transcript: [
+			{
+				id: "user",
+				role: "user",
+				textSummary: "hello",
+				ts: new Date(1).toISOString(),
+				body: "hello",
+			},
+			{
+				id: "thinking-only",
+				role: "assistant",
+				textSummary: "",
+				ts: new Date(2).toISOString(),
+				content: [{ type: "thinking", thinking: "private reasoning" }],
+			},
+		],
+	});
+
+	expect(await queryLastAssistant(ctx, sessionId)).toMatchObject({ ok: false, error: { code: "resource_gone" } });
+});
 
 test("native prompt reconciliation fails closed for an explicitly empty assistant result", () => {
 	const reconciliation = createPromptReconciliation();
@@ -3281,6 +3374,7 @@ describe("SessionSdkSessionRuntime", () => {
 			},
 		} as any;
 		const sessionId = "broker-recovery";
+		const endpointUrl = "ws://127.0.0.1:1";
 		createSdkSessionRuntimeExtension(api, {
 			agentDir,
 			createTransport: async ({ stateRoot, token }) => ({
@@ -3292,8 +3386,8 @@ describe("SessionSdkSessionRuntime", () => {
 				start: async () => {
 					const endpoint = path.join(stateRoot, "sdk", `${sessionId}.json`);
 					await mkdir(path.dirname(endpoint), { recursive: true });
-					await writeFile(endpoint, JSON.stringify({ sessionId, token, pid: process.pid }));
-					return { url: "ws://127.0.0.1:1" };
+					await writeFile(endpoint, JSON.stringify({ sessionId, token, pid: process.pid, url: endpointUrl }));
+					return { url: endpointUrl };
 				},
 				stop: async () => {},
 			}),
@@ -3350,6 +3444,7 @@ describe("SessionSdkSessionRuntime", () => {
 		createSdkSessionRuntimeExtension(api, {
 			agentDir,
 			brokerRegistrationRequired: true,
+			lifecycleRequestId: "broker-required-marker",
 			createTransport: async ({ sessionId, stateRoot, token }) => ({
 				sessionId,
 				stateRoot,

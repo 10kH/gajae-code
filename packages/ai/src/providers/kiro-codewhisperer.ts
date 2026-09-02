@@ -11,6 +11,7 @@
  * not from any AGPL reference implementation.
  */
 import { $credentialEnv, $env, extractHttpStatusFromError } from "@gajae-code/utils";
+import { assertAwsRegionLabel } from "../adapter-internals/aws-region";
 import type { Effort } from "../model-thinking";
 import type {
 	Api,
@@ -178,9 +179,10 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 		};
 
 		const blocks = output.content as Block[];
-		const region = options.region || $env.KIRO_REGION || $env.AWS_REGION || $env.AWS_DEFAULT_REGION || DEFAULT_REGION;
+		const region = options.region ?? $env.KIRO_REGION ?? $env.AWS_REGION ?? $env.AWS_DEFAULT_REGION ?? DEFAULT_REGION;
 
 		try {
+			assertAwsRegionLabel(region);
 			// Resolve bearer token
 			const bearerToken = resolveBearerToken(options.apiKey);
 			if (!bearerToken) {
@@ -222,6 +224,7 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 				method: "POST",
 				headers: requestHeaders,
 				body,
+				redirect: "error",
 				signal: options.signal,
 			});
 

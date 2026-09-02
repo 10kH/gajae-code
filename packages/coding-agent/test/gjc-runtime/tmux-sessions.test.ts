@@ -922,7 +922,7 @@ describe("GJC tmux session management", () => {
 			if (command.includes("list-sessions"))
 				return spawnResult(
 					0,
-					[
+					`${[
 						sessionName,
 						"1",
 						"0",
@@ -940,7 +940,7 @@ describe("GJC tmux session management", () => {
 						"",
 						"",
 						"$1",
-					].join("\t") + "\n",
+					].join("\t")}\n`,
 				);
 			if (command.includes("display-message")) {
 				if (command.includes("#{session_id}\t#{session_name}")) return spawnResult(0, `$1\t${sessionName}\n`);

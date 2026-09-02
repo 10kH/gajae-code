@@ -6,6 +6,7 @@ import { getToolChoiceCapabilityCachePath } from "@gajae-code/utils/dirs";
 import { extractHttpStatusFromError } from "@gajae-code/utils/fetch-retry";
 import * as logger from "@gajae-code/utils/logger";
 import type { Api, Model, ToolChoice, ToolChoiceCompat, ToolChoiceSupport, ToolChoiceSupportSource } from "../types";
+import { isSqliteCorruptionError } from "./sqlite-errors";
 
 const supportRank: Record<ToolChoiceSupport, number> = {
 	none: 0,
@@ -575,9 +576,7 @@ class CapabilityCacheCorruptionError extends Error {}
 
 function isCorruptCapabilityCacheError(error: unknown): boolean {
 	if (error instanceof CapabilityCacheCorruptionError) return true;
-	if (!error || typeof error !== "object") return false;
-	const code = (error as { code?: unknown }).code;
-	return code === "SQLITE_CORRUPT" || code === "SQLITE_NOTADB";
+	return isSqliteCorruptionError(error);
 }
 
 /**

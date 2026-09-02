@@ -2357,11 +2357,15 @@ const OPENCODE_GO_BASE_PATH = "https://opencode.ai/zen/go";
 const OPENCODE_ZEN_API_RESOLUTION = createOpenCodeApiResolution("https://opencode.ai/zen");
 const OPENCODE_GO_CHAT_COMPLETIONS_MODEL_IDS = [
 	"deepseek-v4-flash",
+	"deepseek-v4-flash-vision-exp",
 	"deepseek-v4-pro",
 	"glm-5.1",
 	"glm-5.2",
+	"glm-5.3-flash",
 	"kimi-k2.6",
 	"kimi-k2.7-code",
+	"hy4-preview",
+	"longcat-2.0",
 	"mimo-v2.5",
 	"mimo-v2.5-pro",
 ] as const;
@@ -2372,6 +2376,7 @@ const OPENCODE_GO_MESSAGES_MODEL_IDS = [
 	"qwen3.6-plus",
 	"qwen3.7-max",
 	"qwen3.7-plus",
+	"qwen3.8-flash",
 ] as const;
 const OPENCODE_GO_API_OVERRIDES: Readonly<Record<string, Api>> = {
 	...Object.fromEntries(OPENCODE_GO_CHAT_COMPLETIONS_MODEL_IDS.map(id => [id, "openai-completions"])),
@@ -2795,6 +2800,62 @@ const OPENCODE_GO_OFFICIAL_MODELS: Readonly<Record<string, OpenCodeGoOfficialMod
 		input: ["text"],
 		reasoning: true,
 		cost: { input: 0.066, output: 0.26, cacheRead: 0.029, cacheWrite: 0 },
+	},
+	"deepseek-v4-flash-vision-exp": {
+		name: "DeepSeek V4 Flash Vision Exp",
+		contextWindow: 1_000_000,
+		maxTokens: 384_000,
+		input: ["text", "image"],
+		reasoning: true,
+		cost: { input: 0.22, output: 0.66, cacheRead: 0.007, cacheWrite: 0 },
+	},
+	"glm-5.3-flash": {
+		name: "GLM-5.3-Flash (2x usage)",
+		contextWindow: 1_000_000,
+		maxTokens: 131_072,
+		input: ["text", "image"],
+		reasoning: true,
+		cost: { input: 0.075, output: 0.25, cacheRead: 0.015, cacheWrite: 0 },
+	},
+	"grok-4.6": {
+		name: "Grok 4.6",
+		contextWindow: 500_000,
+		maxTokens: 500_000,
+		input: ["text", "image"],
+		reasoning: true,
+		cost: { input: 2, output: 6, cacheRead: 0.5, cacheWrite: 0 },
+	},
+	"hy4-preview": {
+		name: "Hy4 preview",
+		contextWindow: 1_024_000,
+		maxTokens: 64_000,
+		input: ["text"],
+		reasoning: true,
+		cost: { input: 0.834, output: 2.501, cacheRead: 0.042, cacheWrite: 0 },
+	},
+	"longcat-2.0": {
+		name: "LongCat-2.0",
+		contextWindow: 1_000_000,
+		maxTokens: 131_072,
+		input: ["text"],
+		reasoning: true,
+		cost: { input: 0.3, output: 1.2, cacheRead: 0.006, cacheWrite: 0 },
+	},
+	"muse-spark-1.2-contributor": {
+		name: "Muse Spark 1.2 Contributor",
+		contextWindow: 1_048_576,
+		maxTokens: 131_072,
+		input: ["text", "image"],
+		reasoning: true,
+		cost: { input: 0.1, output: 0.2, cacheRead: 0.002, cacheWrite: 0 },
+	},
+	"qwen3.8-flash": {
+		name: "Qwen3.8 Flash",
+		contextWindow: 1_000_000,
+		maxTokens: 131_072,
+		input: ["text", "image"],
+		reasoning: true,
+		cost: { input: 0.15, output: 0.47, cacheRead: 0.016, cacheWrite: 0.2 },
 	},
 };
 

@@ -92,6 +92,38 @@ switch (scenario) {
 		);
 		break;
 	}
+	case "stale-dead-transition": {
+		const transitionDir = `${lockFile}.transition`;
+		await fs.mkdir(transitionDir);
+		await fs.writeFile(
+			`${transitionDir}.owner`,
+			JSON.stringify({
+				pid: DEAD_PID,
+				start_time: "unknown",
+				token: "stale-dead-transition",
+				owner_host_id: "probe-local-host",
+			}),
+		);
+		break;
+	}
+	case "released-transition-tombstone": {
+		const transitionDir = `${lockFile}.transition`;
+		await fs.mkdir(transitionDir, { mode: 0o700 });
+		await fs.writeFile(
+			`${transitionDir}.owner`,
+			JSON.stringify({
+				pid: 1,
+				start_time: "unknown",
+				token: "released-transition-tombstone",
+				owner_host_id: "probe-local-host",
+				released: true,
+			}),
+			{ mode: 0o600 },
+		);
+		await age(transitionDir);
+		break;
+	}
+
 	case "race-replacement": {
 		await fs.writeFile(
 			lockFile,

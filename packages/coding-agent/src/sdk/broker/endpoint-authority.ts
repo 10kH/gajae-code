@@ -15,6 +15,11 @@ export type EndpointFileRead = {
 
 export type EndpointAuthorityFilesystem = Pick<typeof fs, "open">;
 
+export type IndexedEndpointAuthority = {
+	endpointMtimeMs?: number;
+	endpointFileId?: string;
+};
+
 function readFlags(): number {
 	return fsSync.constants.O_RDONLY | (fsSync.constants.O_NOFOLLOW ?? 0) | (fsSync.constants.O_NONBLOCK ?? 0);
 }
@@ -65,4 +70,17 @@ export async function readEndpointFile(
 	} finally {
 		await handle?.close().catch(() => undefined);
 	}
+}
+
+/** Match a descriptor-bound endpoint read to the index representation. */
+export function matchesIndexedEndpointFile(
+	file: Pick<EndpointFileRead, "dev" | "ino" | "mtimeMs">,
+	authority: IndexedEndpointAuthority,
+): boolean {
+	return (
+		authority.endpointMtimeMs !== undefined &&
+		Number.isFinite(authority.endpointMtimeMs) &&
+		Math.abs(file.mtimeMs - authority.endpointMtimeMs) <= 0.001 &&
+		(authority.endpointFileId === undefined || authority.endpointFileId === `${file.dev}:${file.ino}`)
+	);
 }

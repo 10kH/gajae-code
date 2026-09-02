@@ -10,6 +10,7 @@ import {
 	type AuthStorage,
 	type CredentialInventoryRecord,
 	type CredentialRemovalTarget,
+	isSqliteCorruptionError,
 	OAuthCredentialSelectorError,
 	type OAuthPinTarget,
 	resolveOAuthStorageProvider,
@@ -23,6 +24,7 @@ import {
 	checkAccountInventory,
 	clearPersistentPinForRemovedRows,
 } from "../session/account-inventory";
+import { CREDENTIAL_STORE_UNREADABLE_MESSAGE } from "../session/credential-store-errors";
 import { resolveStartupAuthConfig, type StartupAuthConfigSnapshot } from "../session/startup-auth-config";
 
 export const ACCOUNTS_ACTIONS = ["list", "check", "pin", "logout"] as const;
@@ -48,6 +50,7 @@ class AccountsCommandError extends Error {
 	}
 }
 export function toAccountsCommandError(error: unknown): AccountsCommandError | undefined {
+	if (isSqliteCorruptionError(error)) return new AccountsCommandError(CREDENTIAL_STORE_UNREADABLE_MESSAGE);
 	if (error instanceof OAuthCredentialSelectorError) return new AccountsCommandError(error.message);
 	return undefined;
 }
@@ -391,16 +394,17 @@ export async function runAccountsCommand(cmd: AccountsCommandArgs): Promise<void
 			}
 		}
 	} catch (error) {
+		const normalizedError = toAccountsCommandError(error) ?? error;
 		if (cmd.flags.json) {
-			if (!(error instanceof AccountsCommandError)) {
-				process.stderr.write(`accounts command failed: ${cleanReason(error) ?? "Command failed."}\n`);
+			if (!(normalizedError instanceof AccountsCommandError)) {
+				process.stderr.write(`accounts command failed: ${cleanReason(normalizedError) ?? "Command failed."}\n`);
 			}
 			process.exitCode = 1;
-			writeJsonFailure(error);
+			writeJsonFailure(normalizedError);
 			return;
 		}
-		if (error instanceof AccountsCommandError) {
-			process.stderr.write(`${error.message}\n`);
+		if (normalizedError instanceof AccountsCommandError) {
+			process.stderr.write(`${normalizedError.message}\n`);
 			process.exitCode = 1;
 			return;
 		}

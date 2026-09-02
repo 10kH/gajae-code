@@ -18,8 +18,9 @@ export interface YieldDispatcher<P> {
 export interface YieldQueueOptions {
 	isStreaming: () => boolean;
 	injectStreaming(msg: AgentMessage): void;
-	injectIdle(messages: AgentMessage[]): Promise<void>;
-	scheduleIdleFlush(run: () => Promise<void>): void;
+	injectIdle(messages: AgentMessage[], signal?: AbortSignal): Promise<void>;
+	scheduleIdleFlush(run: (signal?: AbortSignal) => Promise<void>, onSkip: () => void): void;
+	getIdleFlushSignal?(): AbortSignal | undefined;
 }
 
 type YieldFlushMode = "streaming" | "idle";
@@ -39,6 +40,7 @@ export class YieldQueue {
 	readonly #dispatchers = new Map<string, StoredDispatcher>();
 	readonly #entries = new Map<string, unknown[]>();
 	#idleFlushPending = false;
+	#idleFlushPendingOwner: symbol | undefined;
 
 	constructor(options: YieldQueueOptions) {
 		this.#options = options;
@@ -82,9 +84,10 @@ export class YieldQueue {
 		return false;
 	}
 
-	async flush(mode: YieldFlushMode): Promise<void> {
+	async flush(mode: YieldFlushMode, signal?: AbortSignal): Promise<void> {
 		if (mode === "idle") {
 			this.#idleFlushPending = false;
+			this.#idleFlushPendingOwner = undefined;
 		}
 		const idleMessages: AgentMessage[] = [];
 		for (const [kind, dispatcher] of this.#dispatchers) {
@@ -105,7 +108,7 @@ export class YieldQueue {
 		}
 		if (mode === "idle" && idleMessages.length > 0) {
 			try {
-				await this.#options.injectIdle(idleMessages);
+				await this.#options.injectIdle(idleMessages, signal ?? this.#options.getIdleFlushSignal?.());
 			} catch (error) {
 				logger.warn("Yield queue idle dispatch failed", { error: formatError(error) });
 			}
@@ -118,6 +121,7 @@ export class YieldQueue {
 		}
 		this.#entries.clear();
 		this.#idleFlushPending = false;
+		this.#idleFlushPendingOwner = undefined;
 	}
 
 	/** Drop only the queued entries of a single kind, leaving other kinds intact. */
@@ -143,14 +147,21 @@ export class YieldQueue {
 	#scheduleIdleFlush(): void {
 		if (this.#idleFlushPending) return;
 		this.#idleFlushPending = true;
-		try {
-			this.#options.scheduleIdleFlush(async () => {
-				this.#idleFlushPending = false;
-				if (this.#options.isStreaming()) return;
-				await this.flush("idle");
-			});
-		} catch (error) {
+		const owner = Symbol("idle-flush");
+		this.#idleFlushPendingOwner = owner;
+		const releaseOwner = () => {
+			if (this.#idleFlushPendingOwner !== owner) return;
+			this.#idleFlushPendingOwner = undefined;
 			this.#idleFlushPending = false;
+		};
+		try {
+			this.#options.scheduleIdleFlush(async signal => {
+				releaseOwner();
+				if (this.#options.isStreaming()) return;
+				await this.flush("idle", signal);
+			}, releaseOwner);
+		} catch (error) {
+			releaseOwner();
 			logger.warn("Yield queue idle flush scheduling failed", { error: formatError(error) });
 		}
 	}
