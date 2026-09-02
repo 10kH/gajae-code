@@ -136,6 +136,41 @@ describe("auth-broker no-auth browser origin guard", () => {
 		expect(fixture.storage.listCredentialInventory()[0]?.disabledCause).toBeNull();
 	});
 
+	test("rejects wrong bearer values before protected route handling", async () => {
+		const fixture = await startFixture(["secret-token"]);
+		const requests = [
+			{
+				method: "GET",
+				route: "/v1/credentials/metadata",
+				headers: { Authorization: "Bearer wrong-token" },
+			},
+			{
+				method: "GET",
+				route: "/v1/snapshot",
+				headers: { Authorization: "Bearer wrong-token", Origin: "https://attacker.example" },
+			},
+			{
+				method: "POST",
+				route: `/v1/credential/${fixture.credentialId}/disable`,
+				headers: {
+					Authorization: "Bearer wrong-token",
+					Origin: "https://attacker.example",
+					"Content-Type": "application/json",
+				},
+				body: "{}",
+			},
+		] as const;
+		const before = JSON.stringify(fixture.storage.listCredentialInventory());
+
+		for (const request of requests) {
+			const { route, ...init } = request;
+			const response = await fetch(`${fixture.handle.url}${route}`, init);
+			expect(response.status).toBe(401);
+			expect(await response.json()).toEqual({ error: "unauthorized" });
+			expect(JSON.stringify(fixture.storage.listCredentialInventory())).toBe(before);
+		}
+	});
+
 	test("preserves authenticated browser-origin clients", async () => {
 		const fixture = await startFixture(["secret-token"]);
 
