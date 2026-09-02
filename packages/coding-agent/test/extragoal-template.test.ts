@@ -70,8 +70,8 @@ describe("Extragoal skill template", () => {
 		expect(template).toContain(
 			"The Extragoal leader is an LLM interpreting this checklist as prompt policy; there is no compiled parser.",
 		);
-		expect(template).toContain("anthropic/claude-fable-5:xhigh");
-		expect(template).toContain("- [ ] anthropic/claude-fable-5:xhigh — default OFF");
+		expect(template).toContain("anthropic/claude-fable-5-1:xhigh");
+		expect(template).toContain("- [ ] anthropic/claude-fable-5-1:xhigh — default OFF");
 		expect(template).toContain("- [x] codex-xhigh — enabled by default");
 		expect(template).toContain("launch all checked reviewers concurrently");
 		expect(template).toContain("same immutable bundle");

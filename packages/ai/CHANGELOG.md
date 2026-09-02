@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Bundled `anthropic/claude-fable-5-1` (Claude Fable 5.1): 1M context, 128K output, `anthropic-adaptive` thinking clamped to `xhigh` on the Messages API, matching the Fable 5 effort ladder exactly. The model is served only by Anthropic's first-party API and requires a Claude Code compatibility version of at least `2.1.251`; older fingerprints are answered with an HTTP 400 `claude_code_version_too_old`, which the `2.1.257` attribution bump clears. Verified live: `2.1.219` returns the 400, `2.1.257` returns 200, `low`/`high`/`xhigh` all stream, and adaptive thinking returns visible summarized content rather than signature-only billed thinking.
+
 ### Fixed
 
 - Cursor's `kimi-k3-low`, `kimi-k3-high`, and `kimi-k3-max` now declare their real 1,048,576-token context window instead of 200,000. The bundled value was understated by 5.2x, so context management compacted these models at roughly a fifth of their usable window. The same underlying model already declares 1,048,576 elsewhere in this catalog (`openrouter/moonshotai/kimi-k3`, `kilo/moonshotai/kimi-k3`, and `opencode-go/kimi-k3` in `provider-models/openai-compat.ts`), so the cursor entries were the inconsistent ones. Measured against the live `cursor-agent` transport, which reports `usage.inputTokens` per request: 1,026,459 input tokens were accepted and answered correctly, while 1,161,948 tokens were silently summarized down to 20,552 and lost the answer. Output `maxTokens` is unchanged at 64,000, which this change did not measure.

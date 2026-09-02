@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- The `claude-fable` and `fable-opus-codex` built-in presets now use `anthropic/claude-fable-5-1` instead of `anthropic/claude-fable-5`, with effort suffixes preserved (`claude-fable` default/architect `xhigh`, critic `high`, planner `low`; `fable-opus-codex` default `high`). Fable 5.1 exposes the identical effort ladder, so no role mapping changed shape, and the non-fable roles (`anthropic/claude-sonnet-5` executor, `anthropic/claude-opus-5` planner/critic, the Codex executor/architect) are untouched. The extragoal reviewer template moves to `anthropic/claude-fable-5-1:xhigh` for the same reason. `claude-fable-5` remains in the catalog for pinned selectors and for gateways that do not serve 5.1.
 - Fresh interactive onboarding now asks for an interface language before showing guidance, supports English, Korean, Simplified Chinese, and Japanese, persists the choice through `ui.language`, and uses a documented English fallback for noninteractive, invalid, cancelled, or unwritable startup.
 - Coordinator projection consumers now retry a bounded number of fresh authoritative scans when concurrent session churn races a candidate. Cap exhaustion, owner disappearance, unsupported authority, and parse failures remain fail-closed, while settled concurrent SDK sessions no longer permanently starve the session reaper or coordinator mutations. (#5168)
 
