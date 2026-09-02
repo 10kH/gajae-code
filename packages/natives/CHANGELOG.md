@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Notification server startup now rejects an empty session token before binding or publishing endpoint discovery, while preserving every nonempty opaque token.
+
 ## [0.16.0] - 2026-09-02
 
 - Added exact-identity detached cleanup export for safely removing stale claim files without following replacement paths or retaining the JavaScript lifecycle; cleanup dispatch uses a bounded native worker queue and reports queue admission so callers can retry saturation.

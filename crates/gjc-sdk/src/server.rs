@@ -1588,8 +1588,15 @@ impl Drop for ServerHandle {
 /// reflects the real (possibly ephemeral) port.
 ///
 /// # Errors
-/// Returns the bind error if the loopback socket cannot be acquired.
+/// Returns [`std::io::ErrorKind::InvalidInput`] when the session token is
+/// empty, or the bind error if the loopback socket cannot be acquired.
 pub async fn start(config: ServerConfig) -> std::io::Result<ServerHandle> {
+	if config.token.is_empty() {
+		return Err(std::io::Error::new(
+			std::io::ErrorKind::InvalidInput,
+			"notification server token must not be empty",
+		));
+	}
 	let listener = TcpListener::bind(SocketAddr::new(config.host, config.port)).await?;
 	let addr = listener.local_addr()?;
 	let (tx, _rx) = broadcast::channel(256);
@@ -2948,6 +2955,78 @@ mod tests {
 		assert_ne!(handle.addr().port(), 0);
 		assert!(handle.addr().ip().is_loopback());
 		handle.stop();
+	}
+
+	#[tokio::test]
+	async fn start_rejects_empty_token_before_endpoint_publication() {
+		let root = std::env::temp_dir().join(format!(
+			"gjc-empty-token-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap()
+				.as_nanos()
+		));
+		std::fs::create_dir_all(&root).unwrap();
+		let mut config = ServerConfig::new("empty-token", "");
+		config.state_root = Some(root.clone());
+		let occupied = TcpListener::bind(SocketAddr::new(config.host, 0))
+			.await
+			.unwrap();
+		config.port = occupied.local_addr().unwrap().port();
+
+		let error = match start(config).await {
+			Ok(handle) => {
+				handle.stop_and_wait().await;
+				panic!("empty token unexpectedly started a server");
+			},
+			Err(error) => error,
+		};
+		assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+		assert_eq!(error.to_string(), "notification server token must not be empty");
+		assert!(
+			!crate::discovery::endpoint_path(&root, "empty-token").exists(),
+			"rejected startup must not publish endpoint discovery"
+		);
+		drop(occupied);
+		std::fs::remove_dir_all(&root).ok();
+	}
+
+	#[tokio::test]
+	async fn nonempty_opaque_and_whitespace_tokens_remain_valid_startup_inputs() {
+		let opaque = "opaque._~-token";
+		let opaque_handle = start(ServerConfig::new("opaque", opaque)).await.unwrap();
+		let mut ws = connect(&opaque_handle, opaque).await;
+		assert!(matches!(next_server_msg(&mut ws).await, ServerMessage::Hello(_)));
+		ws.close(None).await.unwrap();
+		opaque_handle.stop_and_wait().await;
+
+		let whitespace = " \t ";
+		// The query parser intentionally does not percent-decode because production
+		// tokens are URL-safe. Exercise its no-trim contract directly so startup
+		// continues to preserve every nonempty opaque value.
+		assert!(
+			token_from_query(Some("token= \t "))
+				.is_some_and(|candidate| tokens_match(candidate.as_str(), whitespace))
+		);
+		let whitespace_handle = start(ServerConfig::new("whitespace", whitespace))
+			.await
+			.unwrap();
+		assert_ne!(whitespace_handle.addr().port(), 0);
+		whitespace_handle.stop_and_wait().await;
+	}
+
+	#[tokio::test]
+	async fn nonempty_token_rejects_missing_empty_and_wrong_query_credentials() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		for path in ["/", "/?token=", "/?token=wrong"] {
+			let url = format!("ws://{}{}", handle.addr(), path);
+			assert!(connect_async(url).await.is_err(), "credential {path:?} was accepted");
+		}
+		let mut ws = connect(&handle, "secret").await;
+		assert!(matches!(next_server_msg(&mut ws).await, ServerMessage::Hello(_)));
+		ws.close(None).await.unwrap();
+		handle.stop_and_wait().await;
 	}
 
 	#[tokio::test]
