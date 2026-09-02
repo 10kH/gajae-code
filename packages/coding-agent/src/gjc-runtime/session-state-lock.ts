@@ -1585,6 +1585,7 @@ async function reclaimStaleTransitionClaim(transitionDir: string, quarantineName
 		return;
 	}
 	if (!validLockOwner(owner)) return;
+	await SessionStateLockTestHooks.afterTransitionStaleInspection?.(transitionDir);
 	if (owner.released === true) {
 		// A released record is safe only when it is qualified by this installation.
 		// Never let a shared-volume tombstone, an absent identity, or a legacy foreign
