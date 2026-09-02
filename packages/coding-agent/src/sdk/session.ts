@@ -2463,7 +2463,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 										try {
 											canonicalFrom = await fs.realpath(from);
 											canonicalTarget = await fs.realpath(resolvedPath);
-										} catch {
+										} catch (error) {
+											// macOS `realpath(3)` reports EACCES on an unreadable
+											// directory where Linux succeeds and fails later at the
+											// `access` probe; keep both platforms on the access message.
+											const code = (error as NodeJS.ErrnoException)?.code;
+											if (code === "EACCES" || code === "EPERM") {
+												throw new Error(
+													`Directory identity or access unavailable: ${resolvedPath}${
+														error instanceof Error ? ` (${error.message})` : ""
+													}`,
+												);
+											}
 											throw new Error(`Directory does not exist or is not a directory: ${resolvedPath}`);
 										}
 										if (!(await fs.stat(canonicalTarget)).isDirectory()) {
