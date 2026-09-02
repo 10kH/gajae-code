@@ -155,13 +155,13 @@ This lane is **optional and operator-local**: the default gate remains the singl
 
 **Reviewer classes.**
 
-- **(a) Native API models** invoked directly via `--model` in a tool-restricted read-only GJC session (the Default lane, repeated once per model). Strong cross-family picks include `openai-codex/gpt-5.5:xhigh` and `anthropic/claude-fable-5:xhigh`.
+- **(a) Native API models** invoked directly via `--model` in a tool-restricted read-only GJC session (the Default lane, repeated once per model). Strong cross-family picks include `openai-codex/gpt-5.5:xhigh` and `anthropic/claude-fable-5-1:xhigh`.
 - **(b) Engine-backed external commands** — any reviewer endpoint the operator can lawfully drive through the Custom lane's contract. GPT-5.5 Pro via `insane-review` is named here **only as a reference adapter** for a web-only, operator-owned lane; GJC neither vendors nor depends on it.
 
 **Configured reviewers checklist (operator-edited prompt policy, not config).** The Extragoal leader reads this checklist to decide which reviewers run in a round:
 
 - [x] codex-xhigh — enabled by default (native `gjc -p --no-session --model openai-codex/gpt-5.5:xhigh --tools read,search,find ...`)
-- [ ] anthropic/claude-fable-5:xhigh — default OFF (native, token-expensive; opt in per run)
+- [ ] anthropic/claude-fable-5-1:xhigh — default OFF (native, token-expensive; opt in per run)
 - [ ] Pro web via insane-review — default OFF (operator-owned web/ToS lane, reference adapter only)
 
 The Extragoal leader is an LLM interpreting this checklist as prompt policy; there is no compiled parser. Editing a checkbox changes which reviewers the leader launches, and nothing else.
