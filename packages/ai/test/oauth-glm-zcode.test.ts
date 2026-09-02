@@ -15,6 +15,7 @@ import {
 } from "../src/providers/anthropic";
 import { isOAuthToken } from "../src/utils/anthropic-auth";
 import { getOAuthProviders, refreshOAuthToken } from "../src/utils/oauth";
+import { AnthropicOAuthFlow } from "../src/utils/oauth/anthropic";
 import {
 	GLM_ZCODE_ANTHROPIC_BASE_URL,
 	GLM_ZCODE_OAUTH_AUTHORIZE_URL,
@@ -148,6 +149,23 @@ describe("GLM ZCode OAuth login provider", () => {
 		// the instructions must warn about that or the documented flow fails silently.
 		expect(instructions ?? "").toMatch(/desktop app/i);
 		expect(instructions ?? "").toMatch(/cancel/i);
+	});
+
+	it("scopes the desktop-app warning to glm-zcode without exposing login values", async () => {
+		const glmFlow = new GlmZcodeOAuthFlow({ onAuth: () => {}, onPrompt: async () => "" });
+		const { instructions: glmInstructions } = await glmFlow.generateAuthUrl("state-1", GLM_ZCODE_OAUTH_REDIRECT_URI);
+		expect(glmInstructions ?? "").toMatch(/desktop app/i);
+		expect(glmInstructions ?? "").toMatch(/cancel/i);
+		for (const value of [ZCODE_JWT, UPSTREAM, BUSINESS, MINTED_KEY, "auth-code", "state-1"]) {
+			expect(glmInstructions ?? "").not.toContain(value);
+		}
+
+		const anthropicFlow = new AnthropicOAuthFlow({});
+		const { instructions: anthropicInstructions } = await anthropicFlow.generateAuthUrl(
+			"state-1",
+			"http://localhost:54545/callback",
+		);
+		expect(anthropicInstructions ?? "").not.toMatch(/desktop app|broker error 2007|single-use authorization code/i);
 	});
 
 	it("exchanges the code and provisions a Z.AI API key as the credential", async () => {
