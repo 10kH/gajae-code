@@ -7,6 +7,7 @@ import {
 	isSqliteCorruptionError,
 	isSqliteError,
 	type Model,
+	OAuthCredentialSelectorError,
 	resolveOAuthStorageProvider,
 } from "@gajae-code/ai/core";
 import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
@@ -3706,7 +3707,13 @@ export class SelectorController {
 							{
 								accountProviderId: selectedProviderId,
 								onAccountSelect: async (selectorValue: AuthCredentialSelector) => {
-									await this.ctx.session.setCredentialPin(selectedProviderId, selectorValue);
+									try {
+										await this.ctx.session.setCredentialPin(selectedProviderId, selectorValue);
+									} catch (error: unknown) {
+										if (!(error instanceof OAuthCredentialSelectorError)) throw error;
+										this.ctx.showError(error.message);
+										return;
+									}
 									selector.stopValidation();
 									done();
 									this.ctx.showStatus(`Pinned OAuth account for ${selectedProviderId} to this session.`);
