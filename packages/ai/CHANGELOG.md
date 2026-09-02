@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Tokenless loopback auth-broker requests carrying a browser `Origin` header are now rejected before credential reads or mutations. Native loopback clients without `Origin`, authenticated browser-origin clients, and the public health endpoint retain their existing behavior.
 - `glm-zcode` login instructions now warn users who have the ZCode desktop app installed to cancel the browser's `zcode://` open prompt. The app exchanges the single-use authorization code itself, so a code pasted afterwards is rejected by the broker (`500 {"code":2007}`) and the documented paste flow failed without explanation.
 
 ## [0.16.0] - 2026-09-02
