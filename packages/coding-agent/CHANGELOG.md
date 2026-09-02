@@ -4,6 +4,12 @@
 
 - Interactive OAuth account selection now handles a stale or missing pinned credential in place, preserving the session and actionable `/login` or AUTO guidance instead of creating an unhandled rejection and crash record.
 - Named-worktree SDK session.create now gives git worktree add/reuse and workspace install independent 30s budgets instead of charging them against the child 10s semantic-readiness clock. Prep timeouts stay typed and terminal (`worktree_preparation_timeout` / `dependency_preparation_timeout`); Coordinator and ACP preserve those codes instead of collapsing them to `unavailable` or `broker_compensation_unobserved`. Ordinary no-worktree sessions stay 10s/21s.
+- SDK session-index scan/replay now explicitly documents and regression-tests the
+	v4 compatibility boundary: supported v4 session-index events and snapshots are
+	accepted at every entry surface (scan, replay, tail, append, repair), future
+	versions stay fail-closed with data-preserving quarantine, and the generic
+	SDK-state guard (`maximum supported version is 1`) is documented as never
+	applying to session-index rows so the #5181 crash class cannot recur.
 
 ## [0.16.0] - 2026-09-02
 

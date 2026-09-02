@@ -11,9 +11,12 @@ import {
 	sessionWorktreeRoot,
 } from "../src/sdk/broker/session-index";
 import {
+	assertSupportedSessionIndexEventVersion,
+	assertSupportedSnapshotVersion,
 	assertSupportedStateVersion,
 	SDK_STATE_VERSION,
 	SESSION_INDEX_EVENT_VERSION,
+	SESSION_INDEX_SNAPSHOT_VERSION,
 	UnsupportedStateVersionError,
 } from "../src/sdk/broker/state-version";
 
@@ -1936,6 +1939,146 @@ describe("SDK session index", () => {
 		expect(index.listSessions().sessions).toEqual([]);
 		expect(index.listSessions().warnings).toContain(
 			"Session mixed-session has a legacy locator row and must re-register.",
+		);
+	});
+	it("accepts v4 events and snapshots across scan, replay, tail, append, and repair (#5181)", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-v4-accept-"));
+		const sessionsDir = path.join(dir, "sdk", "sessions");
+		const logPath = path.join(sessionsDir, "index.jsonl");
+		const snapshotPath = path.join(sessionsDir, "index.snapshot.json");
+		await fs.mkdir(sessionsDir, { recursive: true });
+		const v4Event = (sessionId: string, indexSeq: number) => {
+			const unsigned = {
+				...event(sessionId),
+				version: SESSION_INDEX_EVENT_VERSION,
+				indexSeq,
+				ts: 1,
+			};
+			return { ...unsigned, checksum: sessionIndexChecksum(unsigned as Parameters<typeof sessionIndexChecksum>[0]) };
+		};
+
+		// Scan + replay of a v4-only log must stay healthy and project the session.
+		await fs.writeFile(logPath, `${JSON.stringify(v4Event("v4-a", 1))}\n`);
+		const scanned = new SessionIndex(dir);
+		expect(await scanned.diagnose()).toMatchObject({ status: "healthy", validPrefixSeq: 1 });
+		const replayed = await new SessionIndex(dir).open();
+		expect(replayed.listSessions().sessions.map(s => s.sessionId)).toEqual(["v4-a"]);
+		expect(replayed.listSessions().warnings).toEqual([]);
+
+		// Keep a second reader open so its refresh exercises the append-only tail path.
+		const tailer = await new SessionIndex(dir).open();
+		// Appending through the replayed reader writes v4 and accepts it.
+		const appended = await replayed.append(event("v4-b"));
+		expect(appended.version).toBe(SESSION_INDEX_EVENT_VERSION);
+		expect((await fs.readFile(logPath, "utf8")).trim().split("\n")).toHaveLength(2);
+
+		// The existing reader tails the grown v4 log without a replay-class crash.
+		expect(await tailer.refreshIfChanged()).toBe(true);
+		expect(tailer.listSessions().sessions.map(s => s.sessionId)).toEqual(["v4-a", "v4-b"]);
+
+		// Snapshot path: a v4 snapshot replays healthy, and repair is a no-op.
+		await tailer.snapshot();
+		const snapshot = JSON.parse(await fs.readFile(snapshotPath, "utf8"));
+		expect(snapshot.version).toBe(SESSION_INDEX_EVENT_VERSION);
+		await fs.rm(logPath);
+		const fromSnapshot = new SessionIndex(dir);
+		expect(await fromSnapshot.diagnose()).toMatchObject({ status: "healthy", validPrefixSeq: 2 });
+		expect(await fromSnapshot.repair()).toMatchObject({ status: "healthy", repaired: false });
+		expect(JSON.parse(await fs.readFile(snapshotPath, "utf8"))).toEqual(snapshot);
+
+		// Mixed v1-prefix + v4-suffix log replays both formats; checksums stay valid.
+		const legacyV1 = {
+			...event("v1-c"),
+			version: SDK_STATE_VERSION,
+			indexSeq: 3,
+			ts: 1,
+		};
+		await fs.writeFile(
+			logPath,
+			[
+				JSON.stringify({
+					...legacyV1,
+					checksum: sessionIndexChecksum(legacyV1 as Parameters<typeof sessionIndexChecksum>[0]),
+				}),
+				JSON.stringify(v4Event("v4-d", 4)),
+				JSON.stringify(v4Event("v4-e", 5)),
+				"",
+			].join("\n"),
+		);
+		const mixed = await new SessionIndex(dir).open();
+		expect(await mixed.diagnose()).toMatchObject({ status: "healthy", validPrefixSeq: 5 });
+		expect(mixed.listSessions().sessions.map(s => s.sessionId)).toEqual(
+			expect.arrayContaining(["v1-c", "v4-d", "v4-e"]),
+		);
+		expect(mixed.listSessions().warnings).toEqual([]);
+	});
+	it("keeps future index versions fail-closed with data-preserving quarantine (#5181)", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-v4-future-"));
+		const sessionsDir = path.join(dir, "sdk", "sessions");
+		const logPath = path.join(sessionsDir, "index.jsonl");
+		const snapshotPath = path.join(sessionsDir, "index.snapshot.json");
+		await fs.mkdir(sessionsDir, { recursive: true });
+		const signed = (version: number, sessionId: string, indexSeq: number) => {
+			const unsigned = { ...event(sessionId), version, indexSeq, ts: 1 };
+			return { ...unsigned, checksum: sessionIndexChecksum(unsigned as Parameters<typeof sessionIndexChecksum>[0]) };
+		};
+
+		// A future v5 log row fails closed BEFORE mutation and preserves every byte.
+		const futureLog = `${JSON.stringify(signed(SESSION_INDEX_EVENT_VERSION, "ok", 1))}\n${JSON.stringify(
+			signed(SESSION_INDEX_EVENT_VERSION + 1, "future", 2),
+		)}\n`;
+		await fs.writeFile(logPath, futureLog);
+		const future = new SessionIndex(dir);
+		expect(await future.diagnose()).toMatchObject({
+			status: "unsupported",
+			validPrefixSeq: 1,
+			reason: expect.stringContaining("maximum supported version is 4"),
+		});
+		expect(await future.repair()).toMatchObject({ status: "unsupported", repaired: false });
+		await expect(new SessionIndex(dir).open()).rejects.toThrow(/maximum supported version is 4/);
+		expect(await fs.readFile(logPath, "utf8")).toBe(futureLog);
+		expect(await fs.exists(snapshotPath)).toBe(false);
+
+		// Repair never manufactures a snapshot from an unsupported log.
+		expect(await fs.readdir(sessionsDir)).not.toContain("quarantine");
+
+		// A malformed row mid-log stays quarantined with full byte contents on repair.
+		await fs.writeFile(
+			logPath,
+			`${JSON.stringify(signed(SESSION_INDEX_EVENT_VERSION, "prefix", 1))}\nbroken-not-json\n`,
+		);
+		const corrupt = await new SessionIndex(dir).open();
+		const repair = await corrupt.repair();
+		expect(repair).toMatchObject({ status: "corrupt", repaired: true });
+		expect(repair.quarantinePath).toEqual(expect.any(String));
+		const quarantinedLog = await fs.readFile(path.join(repair.quarantinePath!, "index.jsonl"), "utf8");
+		expect(quarantinedLog).toContain("broken-not-json");
+		expect(quarantinedLog).toContain('"sessionId":"prefix"');
+		// The valid prefix is republished; the corrupt suffix is dropped from it.
+		const repairedSnapshot = JSON.parse(await fs.readFile(snapshotPath, "utf8"));
+		expect(repairedSnapshot.version).toBe(SESSION_INDEX_EVENT_VERSION);
+		expect(repairedSnapshot.indexSeq).toBe(1);
+	});
+	it("fences the generic state-version guard away from session-index rows (#5181)", async () => {
+		// The exact reported crash class: assertSupportedStateVersion rejects v4
+		// with "maximum supported version is 1", while the dedicated index event
+		// guard accepts v4. The guards must stay distinguishable so no scan path
+		// can apply the generic fence to index rows again.
+		const v4 = { version: SESSION_INDEX_EVENT_VERSION };
+		expect(() => assertSupportedStateVersion("index.jsonl", v4)).toThrow(
+			new UnsupportedStateVersionError("index.jsonl", SESSION_INDEX_EVENT_VERSION),
+		);
+		expect(() => assertSupportedSessionIndexEventVersion("index.jsonl", v4)).not.toThrow();
+		expect(() => assertSupportedSessionIndexEventVersion("index.jsonl", { version: 1 })).not.toThrow();
+		expect(() => assertSupportedSessionIndexEventVersion("index.jsonl", { version: 5 })).toThrow(
+			new UnsupportedStateVersionError("index.jsonl", 5, SESSION_INDEX_EVENT_VERSION),
+		);
+		expect(() =>
+			assertSupportedSnapshotVersion("index.snapshot.json", { version: SESSION_INDEX_SNAPSHOT_VERSION }),
+		).not.toThrow();
+		expect(() => assertSupportedSnapshotVersion("index.snapshot.json", { version: 1 })).not.toThrow();
+		expect(() => assertSupportedSnapshotVersion("index.snapshot.json", { version: 5 })).toThrow(
+			new UnsupportedStateVersionError("index.snapshot.json", 5, SESSION_INDEX_SNAPSHOT_VERSION),
 		);
 	});
 	it("canonicalizes cwd and reports null worktree root outside Git", async () => {
