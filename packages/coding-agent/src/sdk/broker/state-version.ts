@@ -8,6 +8,16 @@ export const SDK_STATE_VERSION = 1;
 export const SESSION_INDEX_SNAPSHOT_VERSION = 4;
 export const SESSION_INDEX_EVENT_VERSION = SESSION_INDEX_SNAPSHOT_VERSION;
 
+/**
+ * Thrown when a persisted SDK state file carries a version this build does not
+ * support. `assertSupportedStateVersion` fences only generic SDK state (broker
+ * discovery, lifecycle-ledger rows, guide cache meta) whose current format is
+ * exactly `SDK_STATE_VERSION`. Session-index files carry their own versions
+ * (see `assertSupportedSessionIndexEventVersion` and
+ * `assertSupportedSnapshotVersion`) and MUST NOT be validated with the generic
+ * guard — a supported v4 index row would crash with "maximum supported version
+ * is 1" (#5181).
+ */
 export class UnsupportedStateVersionError extends Error {
 	readonly code = "unsupported_state_version";
 
@@ -23,6 +33,13 @@ export class UnsupportedStateVersionError extends Error {
 	}
 }
 
+/**
+ * Generic SDK-state fence: rejects any version above `SDK_STATE_VERSION`.
+ * ONLY for generic state whose current format is exactly `SDK_STATE_VERSION`
+ * (broker discovery `broker.json`, lifecycle-ledger rows, guide cache meta).
+ * Never validate session-index rows or snapshots with this guard — they have
+ * dedicated version fences and currently accept v4 (#5181).
+ */
 export function assertSupportedStateVersion(file: string, value: unknown): void {
 	if (!value || typeof value !== "object") return;
 	const record = value as { version?: unknown; stateVersion?: unknown };
