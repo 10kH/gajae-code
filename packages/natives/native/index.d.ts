@@ -2165,7 +2165,9 @@ export interface RecoveryFsRetainedCleanupResult {
 
 /**
  * Publish a staged directory under a destination name that must not already
- * exist, using descriptor-relative `mkdirat` ownership followed by `renameat`.
+ * exist.
+ *
+ * Uses descriptor-relative `mkdirat` ownership followed by `renameat`.
  * This is the directory stand-in for `renameat2(RENAME_NOREPLACE)` on mounts
  * that reject rename flags with `EINVAL`/`ENOSYS`. The native implementation
  * validates every path component without following symlinks and never
