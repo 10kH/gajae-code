@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-09-02
+
 ### Added
 
 - Bundled `anthropic/claude-fable-5-1` (Claude Fable 5.1): 1M context, 128K output, `anthropic-adaptive` thinking clamped to `xhigh` on the Messages API, matching the Fable 5 effort ladder exactly. The model is served only by Anthropic's first-party API and requires a Claude Code compatibility version of at least `2.1.251`; older fingerprints are answered with an HTTP 400 `claude_code_version_too_old`, which the `2.1.257` attribution bump clears. Verified live: `2.1.219` returns the 400, `2.1.257` returns 200, `low`/`high`/`xhigh` all stream, and adaptive thinking returns visible summarized content rather than signature-only billed thinking.
