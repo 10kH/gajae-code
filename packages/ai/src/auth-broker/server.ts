@@ -599,7 +599,7 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 						method: req.method,
 						path: pathname,
 						peer,
-						origin: req.headers.get("origin"),
+						originPresent: true,
 					});
 					return json(403, { error: "no-auth rejects requests carrying Origin" });
 				}

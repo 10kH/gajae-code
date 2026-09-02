@@ -1,7 +1,8 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { logger } from "@gajae-code/utils";
 import { type AuthBrokerServerHandle, AuthStorage, SqliteAuthCredentialStore, startAuthBroker } from "../src";
 
 type BrokerFixture = {
@@ -38,6 +39,7 @@ async function startFixture(bearerTokens: string[]): Promise<BrokerFixture> {
 }
 
 afterEach(async () => {
+	vi.restoreAllMocks();
 	for (const fixture of fixtures.splice(0)) {
 		await fixture.handle.close();
 		fixture.storage.close();
@@ -78,6 +80,24 @@ describe("auth-broker no-auth browser origin guard", () => {
 		expect(response.status).toBe(403);
 		expect(response.headers.get("access-control-allow-origin")).toBeNull();
 		expect(await response.json()).toEqual({ error: "no-auth rejects requests carrying Origin" });
+	});
+
+	test("does not log a request-supplied credential-shaped Origin", async () => {
+		const fixture = await startFixture([]);
+		const info = vi.spyOn(logger, "info");
+		const requestSuppliedSecret = "refresh-secret";
+
+		const response = await fetch(`${fixture.handle.url}/v1/snapshot`, {
+			headers: { Origin: requestSuppliedSecret },
+		});
+
+		expect(response.status).toBe(403);
+		expect(await response.json()).toEqual({ error: "no-auth rejects requests carrying Origin" });
+		expect(JSON.stringify(info.mock.calls)).not.toContain(requestSuppliedSecret);
+		expect(info).toHaveBeenCalledWith(
+			"auth-broker no-auth browser-origin request rejected",
+			expect.objectContaining({ originPresent: true }),
+		);
 	});
 
 	test.each([
