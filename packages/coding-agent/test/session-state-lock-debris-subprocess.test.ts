@@ -110,7 +110,14 @@ describe("session-state lock debris subprocess contract", () => {
 		expect(result.wallMs).toBeLessThan(3_000);
 	});
 
-	it.skipIf(process.platform !== "win32")("reclaims a dead Windows transition claim", async () => {
+	it("reclaims a dead transition claim with in-process identity bindings", async () => {
+		const result = await runProbe("stale-dead-transition");
+		expect(result.entered).toBe(true);
+		expect(result.error).toBeNull();
+		expect(result.wallMs).toBeLessThan(3_000);
+	});
+
+	it("reclaims a dead transition claim on every platform", async () => {
 		const result = await runProbe("stale-dead-transition", true);
 		expect(result.entered).toBe(true);
 		expect(result.error).toBeNull();

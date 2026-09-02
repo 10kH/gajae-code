@@ -226,6 +226,42 @@ describe("coordinator session state lock", () => {
 		expect((await readJson(stateFile)).activity).toMatchObject({ seq: 1, tool: "bash" });
 	});
 
+	it("serializes concurrent resume contenders after reclaiming a dead transition claim", async () => {
+		const { stateFile } = await seededRunningSession("lock-concurrent-resume");
+		const transitionDir = `${stateFile}.lock.transition`;
+		await fs.mkdir(transitionDir);
+		await fs.writeFile(
+			`${transitionDir}.owner`,
+			JSON.stringify({
+				pid: DEAD_PID,
+				start_time: "unknown",
+				token: "dead-resume-transition",
+				owner_host_id: "local-host",
+			}),
+		);
+
+		const order: string[] = [];
+		const firstEntered = Promise.withResolvers<void>();
+		const releaseFirst = Promise.withResolvers<void>();
+		const first = withSessionStateFileLock(stateFile, async () => {
+			order.push("first-entered");
+			firstEntered.resolve();
+			await releaseFirst.promise;
+			order.push("first-released");
+		});
+		await firstEntered.promise;
+
+		const second = withSessionStateFileLock(stateFile, async () => {
+			order.push("second-entered");
+		});
+		await Bun.sleep(100);
+		expect(order).toEqual(["first-entered"]);
+
+		releaseFirst.resolve();
+		await Promise.all([first, second]);
+		expect(order).toEqual(["first-entered", "first-released", "second-entered"]);
+	});
+
 	it("keeps session-state parents, transition claims, and owner records restrictive under umask", async () => {
 		const root = await tempRoot();
 		const stateFile = path.join(root, "nested", "session", "state.json");
@@ -756,9 +792,11 @@ describe("coordinator session state lock", () => {
 				await Bun.write(target, "protected");
 				await create(lockFile, target);
 
-				await expect(writeToolActivity(root, "call-1", "2026-03-01T00:00:05.000Z")).rejects.toThrow(
-					/Existing runtime state marker is invalid or unreadable/,
-				);
+				await expect(writeToolActivity(root, "call-1", "2026-03-01T00:00:05.000Z")).rejects.toMatchObject({
+					name: "SessionStateLockUnavailableError",
+					lockPath: lockFile,
+					reason: "unsafe_lock_path_type",
+				});
 				await expect(reclaimStaleSessionStateLock(lockFile)).rejects.toBeInstanceOf(
 					SessionStateLockUnavailableError,
 				);
@@ -1235,7 +1273,7 @@ describe("coordinator session state lock", () => {
 		expect(await Bun.file(enteredFile).text()).toBe("entered");
 	});
 
-	it("fails closed on a dead atomic transition directory without renameat2", async () => {
+	it("reclaims a dead atomic transition directory through identity-bound removal", async () => {
 		const { stateFile } = await seededRunningSession("lock-dead-atomic-transition");
 		const lockFile = `${stateFile}.lock`;
 		const transitionDir = `${lockFile}.transition`;
@@ -1250,13 +1288,50 @@ describe("coordinator session state lock", () => {
 				owner_host_id: "local-host",
 			}),
 		);
-		let exactUnlinkCalls = 0;
+		let directoryRemovals = 0;
+		let ownerUnlinks = 0;
 		setSessionStateLockNativeBindings(() => ({
-			exactUnlinkDirect: () => ({ ok: false, code: "not_found" }),
-			exactUnlink() {
-				exactUnlinkCalls++;
-				return { ok: false, code: "cleanup_failed" };
+			...exactIdentityNativeBindings,
+			exactUnlink(target, identity) {
+				ownerUnlinks++;
+				return exactIdentityNativeBindings.exactUnlink(target, identity);
 			},
+			exactRemoveDirectoryTree(target, snapshot) {
+				directoryRemovals++;
+				return exactIdentityNativeBindings.exactRemoveDirectoryTree(target, snapshot);
+			},
+		}));
+
+		const entered: string[] = [];
+		await withSessionStateFileLock(stateFile, async () => {
+			entered.push("entered");
+		});
+		expect(entered).toEqual(["entered"]);
+		expect(directoryRemovals).toBe(1);
+		expect(ownerUnlinks).toBeGreaterThanOrEqual(1);
+		expect(fsSync.existsSync(transitionDir)).toBe(false);
+		// The dead record was replaced by this process's own claim cycle; only its
+		// released tombstone may remain.
+		expect(await fs.readFile(ownerFile, "utf8")).not.toContain("dead-atomic-transition");
+	});
+
+	it("fails closed on an atomic transition directory whose owner is alive", async () => {
+		const { stateFile } = await seededRunningSession("lock-live-atomic-transition");
+		const lockFile = `${stateFile}.lock`;
+		const transitionDir = `${lockFile}.transition`;
+		const ownerFile = `${transitionDir}.owner`;
+		await fs.mkdir(transitionDir);
+		await fs.writeFile(
+			ownerFile,
+			JSON.stringify({
+				pid: process.pid,
+				start_time: processStartTime(process.pid) ?? "unknown",
+				token: "live-atomic-transition",
+				owner_host_id: "local-host",
+			}),
+		);
+		setSessionStateLockNativeBindings(() => ({
+			...exactIdentityNativeBindings,
 			snapshotDirectoryTree() {
 				throw new Error("unexpected directory snapshot");
 			},
@@ -1271,13 +1346,144 @@ describe("coordinator session state lock", () => {
 		});
 		await Bun.sleep(300);
 		expect(entered).toEqual([]);
-		expect(exactUnlinkCalls).toBe(0);
 		expect(fsSync.statSync(transitionDir).isDirectory()).toBe(true);
-		expect(await fs.readFile(ownerFile, "utf8")).toContain("dead-atomic-transition");
+		expect(await fs.readFile(ownerFile, "utf8")).toContain("live-atomic-transition");
 		await fs.rm(ownerFile);
 		await fs.rmdir(transitionDir);
 		await contender;
 		expect(entered).toEqual(["entered"]);
+	});
+
+	it("fails closed on a malformed atomic transition directory owner", async () => {
+		const { stateFile } = await seededRunningSession("lock-malformed-atomic-transition");
+		const transitionDir = `${stateFile}.lock.transition`;
+		const ownerFile = `${transitionDir}.owner`;
+		const record = "not-json";
+		await fs.mkdir(transitionDir);
+		await fs.writeFile(ownerFile, record);
+
+		const entered: string[] = [];
+		const contender = withSessionStateFileLock(stateFile, async () => {
+			entered.push("entered");
+		});
+		await Promise.race([contender, Bun.sleep(300)]);
+
+		expect(fsSync.statSync(transitionDir).isDirectory()).toBe(true);
+		expect(await fs.readFile(ownerFile, "utf8")).toBe(record);
+		expect(entered).toEqual([]);
+		await fs.rm(ownerFile);
+		await fs.rmdir(transitionDir);
+		await contender;
+		expect(entered).toEqual(["entered"]);
+	});
+
+	it("fails closed on a foreign-host atomic transition directory owner", async () => {
+		const { stateFile } = await seededRunningSession("lock-foreign-atomic-transition");
+		const transitionDir = `${stateFile}.lock.transition`;
+		const ownerFile = `${transitionDir}.owner`;
+		const record = JSON.stringify({
+			pid: DEAD_PID,
+			start_time: "unknown",
+			token: "foreign-atomic-transition",
+			owner_host_id: "remote-host",
+		});
+		await fs.mkdir(transitionDir);
+		await fs.writeFile(ownerFile, record);
+
+		const entered: string[] = [];
+		const contender = withSessionStateFileLock(stateFile, async () => {
+			entered.push("entered");
+		});
+		await Promise.race([contender, Bun.sleep(300)]);
+
+		expect(await fs.readFile(ownerFile, "utf8")).toBe(record);
+		expect(entered).toEqual([]);
+		await fs.rm(ownerFile);
+		await fs.rmdir(transitionDir);
+		await contender;
+		expect(entered).toEqual(["entered"]);
+	});
+
+	it("reclaims an atomic transition directory whose live pid has a reused incarnation", async () => {
+		const { stateFile } = await seededRunningSession("lock-reused-pid-atomic-transition");
+		const lockFile = `${stateFile}.lock`;
+		const transitionDir = `${lockFile}.transition`;
+		const ownerFile = `${transitionDir}.owner`;
+		await fs.mkdir(transitionDir);
+		await fs.writeFile(
+			ownerFile,
+			JSON.stringify({
+				pid: process.pid,
+				start_time: "Thu Jan  1 00:00:00 1970",
+				start_time_format: "ps-utc-v1",
+				token: "reused-pid-atomic-transition",
+				owner_host_id: "local-host",
+			}),
+		);
+		SessionStateLockTestHooks.probeProcessSignal = () => {
+			throw Object.assign(new Error("operation not permitted"), { code: "EPERM" });
+		};
+
+		const entered: string[] = [];
+		await withSessionStateFileLock(stateFile, async () => {
+			entered.push("entered");
+		});
+
+		expect(entered).toEqual(["entered"]);
+		expect(fsSync.existsSync(transitionDir)).toBe(false);
+		expect(await fs.readFile(ownerFile, "utf8")).not.toContain("reused-pid-atomic-transition");
+	});
+
+	it("serializes two contenders that race through dead atomic transition reclaim", async () => {
+		const { stateFile } = await seededRunningSession("lock-racing-dead-atomic-transition");
+		const transitionDir = `${stateFile}.lock.transition`;
+		await fs.mkdir(transitionDir);
+		await fs.writeFile(
+			`${transitionDir}.owner`,
+			JSON.stringify({
+				pid: DEAD_PID,
+				start_time: "unknown",
+				token: "racing-dead-atomic-transition",
+				owner_host_id: "local-host",
+			}),
+		);
+
+		let inspections = 0;
+		const bothInspected = Promise.withResolvers<void>();
+		const releaseInspection = Promise.withResolvers<void>();
+		SessionStateLockTestHooks.afterTransitionStaleInspection = async target => {
+			if (target !== transitionDir) return;
+			inspections++;
+			if (inspections === 2) bothInspected.resolve();
+			if (inspections <= 2) await releaseInspection.promise;
+		};
+
+		let active = 0;
+		let maximumActive = 0;
+		const entered: string[] = [];
+		const first = withSessionStateFileLock(stateFile, async () => {
+			active++;
+			maximumActive = Math.max(maximumActive, active);
+			entered.push("first");
+			await Bun.sleep(40);
+			active--;
+		});
+		const second = withSessionStateFileLock(stateFile, async () => {
+			active++;
+			maximumActive = Math.max(maximumActive, active);
+			entered.push("second");
+			await Bun.sleep(40);
+			active--;
+		});
+
+		await bothInspected.promise;
+		expect(entered).toEqual([]);
+		releaseInspection.resolve();
+		await Promise.all([first, second]);
+
+		expect(entered).toHaveLength(2);
+		expect(maximumActive).toBe(1);
+		expect(fsSync.existsSync(transitionDir)).toBe(false);
 	});
 
 	for (const target of ["state", "transition"] as const) {
