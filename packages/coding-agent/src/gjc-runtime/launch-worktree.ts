@@ -29,6 +29,27 @@ export interface GjcLaunchWorktreeResult extends GjcLaunchWorktreePlan {
 	createdBranch: boolean;
 	dirty?: boolean;
 }
+export interface LaunchWorktreeAbortOptions {
+	signal?: AbortSignal;
+	deadlineAt?: number;
+	now?: () => number;
+}
+
+export class WorktreePreparationTimeoutError extends Error {
+	readonly code = "worktree_preparation_timeout";
+	constructor(message = "Worktree preparation exceeded its deadline before the session host was spawned.") {
+		super(message);
+		this.name = "WorktreePreparationTimeoutError";
+	}
+}
+
+export class DependencyPreparationTimeoutError extends Error {
+	readonly code = "dependency_preparation_timeout";
+	constructor(message = "Dependency preparation exceeded its deadline before the session host was spawned.") {
+		super(message);
+		this.name = "DependencyPreparationTimeoutError";
+	}
+}
 
 interface GitWorktreeEntry {
 	path: string;
@@ -39,10 +60,93 @@ interface GitWorktreeEntry {
 
 const BRANCH_IN_USE_PATTERN = /already checked out|already used by worktree|is already checked out/i;
 
+function throwIfAborted(options: LaunchWorktreeAbortOptions | undefined, timeout: Error): void {
+	if (options?.signal?.aborted) throw timeout;
+	if (options?.deadlineAt !== undefined && (options.now ?? Date.now)() >= options.deadlineAt) throw timeout;
+}
+
+function sanitizeWorktreeDiagnostic(value: string): string {
+	return value
+		.replace(/([?&](?:token|secret|password|key|api[_-]?key)=[^\s&]*)/giu, "[redacted-query]")
+		.replace(
+			/(^|[^\p{L}\p{N}_-])[\p{L}\p{N}_-]*(?:token|secret|password|api[_-]?key|key|credential|auth)\s*[=:]\s*[^\s,;]+/giu,
+			"$1[redacted-secret]",
+		)
+		.replace(/\b(?:https?|wss?):\/\/[^\s]+/giu, "[redacted-url]")
+		.slice(0, 512);
+}
+
+async function spawnProcessGroup(
+	command: string[],
+	cwd: string,
+	options: LaunchWorktreeAbortOptions | undefined,
+	timeout: Error,
+): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+	throwIfAborted(options, timeout);
+	const [file, ...args] = command;
+	if (!file) throw timeout;
+	const proc = Bun.spawn([file, ...args], {
+		cwd,
+		stdout: "pipe",
+		stderr: "pipe",
+		stdin: "ignore",
+		// Windows has no POSIX process-group kill: parent-only proc.kill() is the
+		// documented seam. Leftover classify still runs after wait on both OS.
+		detached: process.platform !== "win32",
+		...(process.platform === "win32" ? { windowsHide: true } : {}),
+	});
+	const killGroup = (): void => {
+		try {
+			if (process.platform === "win32") proc.kill();
+			else if (proc.pid) process.kill(-proc.pid, "SIGKILL");
+			else proc.kill();
+		} catch {
+			try {
+				proc.kill();
+			} catch {
+				// already gone
+			}
+		}
+	};
+	const onAbort = (): void => {
+		killGroup();
+	};
+	options?.signal?.addEventListener("abort", onAbort, { once: true });
+	let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+	if (options?.deadlineAt !== undefined) {
+		const remaining = options.deadlineAt - (options.now ?? Date.now)();
+		if (remaining <= 0) {
+			killGroup();
+			options?.signal?.removeEventListener("abort", onAbort);
+			await proc.exited.catch(() => undefined);
+			throw timeout;
+		}
+		deadlineTimer = setTimeout(() => {
+			killGroup();
+		}, remaining);
+	}
+	try {
+		const [stdoutBytes, stderrBytes, exitCode] = await Promise.all([
+			new Response(proc.stdout).arrayBuffer(),
+			new Response(proc.stderr).arrayBuffer(),
+			proc.exited,
+		]);
+		throwIfAborted(options, timeout);
+		return {
+			stdout: new TextDecoder().decode(stdoutBytes),
+			stderr: new TextDecoder().decode(stderrBytes),
+			exitCode: exitCode ?? 1,
+		};
+	} finally {
+		if (deadlineTimer) clearTimeout(deadlineTimer);
+		options?.signal?.removeEventListener("abort", onAbort);
+	}
+}
+
 function runGit(cwd: string, args: string[]): string {
 	const result = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
 	if (result.exitCode === 0) return result.stdout.toString().trim();
-	const stderr = result.stderr.toString().trim();
+	const stderr = sanitizeWorktreeDiagnostic(result.stderr.toString().trim());
 	throw new Error(stderr || `git ${args.join(" ")} failed`);
 }
 
@@ -408,6 +512,16 @@ export function planLaunchWorktree(
 
 export function ensureLaunchWorktree(
 	plan: GjcLaunchWorktreePlan | { enabled: false },
+	options?: LaunchWorktreeAbortOptions,
+): GjcLaunchWorktreeResult | { enabled: false } {
+	if (options?.signal || options?.deadlineAt !== undefined) {
+		throw new Error("ensureLaunchWorktree is synchronous; use ensureLaunchWorktreeCancellable for abortable prep.");
+	}
+	return ensureLaunchWorktreeSync(plan);
+}
+
+function ensureLaunchWorktreeSync(
+	plan: GjcLaunchWorktreePlan | { enabled: false },
 ): GjcLaunchWorktreeResult | { enabled: false } {
 	if (!plan.enabled) return { enabled: false };
 	const bucketPath = path.dirname(plan.worktreePath);
@@ -473,7 +587,93 @@ export function ensureLaunchWorktree(
 
 	const result = Bun.spawnSync(["git", ...args], { cwd: plan.repoRoot, stdout: "pipe", stderr: "pipe" });
 	if (result.exitCode !== 0) {
-		const stderr = result.stderr.toString().trim();
+		const stderr = sanitizeWorktreeDiagnostic(result.stderr.toString().trim());
+		if (plan.branchName && BRANCH_IN_USE_PATTERN.test(stderr)) throw new Error(`branch_in_use:${plan.branchName}`);
+		throw new Error(stderr || `worktree_add_failed:${args.join(" ")}`);
+	}
+
+	return {
+		...plan,
+		worktreePath: path.resolve(plan.worktreePath),
+		created: true,
+		reused: false,
+		createdBranch: Boolean(plan.branchName && !branchAlreadyExisted),
+	};
+}
+
+export async function ensureLaunchWorktreeCancellable(
+	plan: GjcLaunchWorktreePlan | { enabled: false },
+	options: LaunchWorktreeAbortOptions = {},
+): Promise<GjcLaunchWorktreeResult | { enabled: false }> {
+	if (!plan.enabled) return { enabled: false };
+	const timeout = new WorktreePreparationTimeoutError();
+	throwIfAborted(options, timeout);
+	const bucketPath = path.dirname(plan.worktreePath);
+	inspectBucketDir(bucketPath);
+	ensureRepositoryBucketIgnored(plan.repoRoot, bucketPath);
+	let allWorktrees = listWorktrees(plan.repoRoot);
+	const staleAtPath = findWorktreeByPath(allWorktrees, plan.worktreePath);
+	if (staleAtPath && !fs.existsSync(staleAtPath.path)) {
+		pruneStaleWorktreePath(plan.repoRoot);
+		allWorktrees = listWorktrees(plan.repoRoot);
+	}
+	throwIfAborted(options, timeout);
+
+	const listedAtPath = findWorktreeByPath(allWorktrees, plan.worktreePath);
+	const existingAtPath = readWorktreeEntryFromPath(plan.repoRoot, plan.worktreePath);
+	if (listedAtPath && !existingAtPath) {
+		if (fs.existsSync(plan.worktreePath)) throw new Error(`worktree_path_conflict:${plan.worktreePath}`);
+		throw new Error(
+			[
+				"worktree_path_unavailable",
+				"The requested launch worktree is still registered by Git but its directory is unavailable or locked.",
+				`Path: ${formatBucketPath(plan.worktreePath)}`,
+				"Safe remediation: inspect the worktree lock and remove or repair it with git worktree remove/prune when it is no longer needed, then relaunch. GJC did not delete or replace the entry.",
+			].join("\n"),
+		);
+	}
+	const expectedBranchRef = plan.branchName ? `refs/heads/${plan.branchName}` : null;
+
+	if (existingAtPath) {
+		let dirty = isWorktreeDirty(plan.worktreePath);
+		if (plan.detached) {
+			if (!existingAtPath.detached) {
+				throw new Error(formatWorktreeTargetMismatch(plan, existingAtPath));
+			}
+			if (existingAtPath.head !== plan.baseRef) {
+				if (dirty) throw new Error(`worktree_dirty:${plan.worktreePath}`);
+				runGit(plan.worktreePath, ["checkout", "--detach", plan.baseRef]);
+				dirty = false;
+			}
+		} else if (existingAtPath.branchRef !== expectedBranchRef) {
+			throw new Error(formatWorktreeTargetMismatch(plan, existingAtPath));
+		}
+		return {
+			...plan,
+			worktreePath: path.resolve(plan.worktreePath),
+			created: false,
+			reused: true,
+			createdBranch: false,
+			...(dirty ? { dirty: true } : {}),
+		};
+	}
+
+	if (fs.existsSync(plan.worktreePath)) throw new Error(`worktree_path_conflict:${plan.worktreePath}`);
+	if (plan.branchName && hasBranchInUse(allWorktrees, plan.branchName, plan.worktreePath)) {
+		throw new Error(`branch_in_use:${plan.branchName}`);
+	}
+
+	ensureBucketDirUsable(path.dirname(plan.worktreePath));
+	throwIfAborted(options, timeout);
+	const branchAlreadyExisted = plan.branchName ? branchExists(plan.repoRoot, plan.branchName) : false;
+	const args = ["worktree", "add"];
+	if (plan.detached) args.push("--detach", plan.worktreePath, plan.baseRef);
+	else if (branchAlreadyExisted) args.push(plan.worktreePath, plan.branchName ?? "");
+	else args.push("-b", plan.branchName ?? "", plan.worktreePath, plan.baseRef);
+
+	const result = await spawnProcessGroup(["git", ...args], plan.repoRoot, options, timeout);
+	if (result.exitCode !== 0) {
+		const stderr = sanitizeWorktreeDiagnostic(result.stderr.trim());
 		if (plan.branchName && BRANCH_IN_USE_PATTERN.test(stderr)) throw new Error(`branch_in_use:${plan.branchName}`);
 		throw new Error(stderr || `worktree_add_failed:${args.join(" ")}`);
 	}
@@ -598,10 +798,49 @@ function installWorkspaceDependencies(
 			stderr: "pipe",
 		});
 	} catch (error) {
-		throw new Error(`worktree_dependency_install_failed:${manager.name}:${String(error)}`);
+		throw new Error(
+			`worktree_dependency_install_failed:${manager.name}:${sanitizeWorktreeDiagnostic(String(error))}`,
+		);
 	}
 	if (result.exitCode !== 0) {
-		throw new Error(`worktree_dependency_install_failed:${manager.name}:${result.stderr.toString().trim()}`);
+		throw new Error(
+			`worktree_dependency_install_failed:${manager.name}:${sanitizeWorktreeDiagnostic(result.stderr.toString().trim())}`,
+		);
+	}
+	let installed: fs.Stats;
+	try {
+		installed = fs.lstatSync(path.join(worktreePath, "node_modules"));
+	} catch (error) {
+		if (fileSystemErrorCode(error) === "ENOENT") return;
+		throw error;
+	}
+	if (!installed.isDirectory() || installed.isSymbolicLink()) throw new Error("worktree_dependency_install_not_local");
+}
+
+async function installWorkspaceDependenciesCancellable(
+	sourceRoot: string,
+	worktreePath: string,
+	manifest: WorkspacePackageManifest | null,
+	options: LaunchWorktreeAbortOptions = {},
+): Promise<void> {
+	const timeout = new DependencyPreparationTimeoutError();
+	throwIfAborted(options, timeout);
+	removeLegacySourceNodeModulesLink(sourceRoot, worktreePath);
+	const manager = resolveWorkspacePackageManager(worktreePath, manifest);
+	const command = workspaceInstallCommand(manager);
+	let result: { stdout: string; stderr: string; exitCode: number };
+	try {
+		result = await spawnProcessGroup(command, worktreePath, options, timeout);
+	} catch (error) {
+		if (error instanceof DependencyPreparationTimeoutError) throw error;
+		throw new Error(
+			`worktree_dependency_install_failed:${manager.name}:${sanitizeWorktreeDiagnostic(String(error))}`,
+		);
+	}
+	if (result.exitCode !== 0) {
+		throw new Error(
+			`worktree_dependency_install_failed:${manager.name}:${sanitizeWorktreeDiagnostic(result.stderr.trim())}`,
+		);
 	}
 	let installed: fs.Stats;
 	try {
@@ -628,6 +867,26 @@ export function ensureReusableNodeModules(sourceRoot: string, worktreePath: stri
 	return "symlink";
 }
 
+export async function ensureReusableNodeModulesCancellable(
+	sourceRoot: string,
+	worktreePath: string,
+	options: LaunchWorktreeAbortOptions = {},
+): Promise<"symlink" | "present" | "missing"> {
+	const timeout = new DependencyPreparationTimeoutError();
+	throwIfAborted(options, timeout);
+	const target = path.join(worktreePath, "node_modules");
+	const manifest = readWorkspacePackageManifest(worktreePath);
+	if (isWorkspaceRoot(worktreePath, manifest)) {
+		await installWorkspaceDependenciesCancellable(sourceRoot, worktreePath, manifest, options);
+		return "present";
+	}
+	if (fs.existsSync(target)) return "present";
+	const source = path.join(sourceRoot, "node_modules");
+	if (!fs.existsSync(source)) return "missing";
+	fs.symlinkSync(source, target, "junction");
+	return "symlink";
+}
+
 /** Result of {@link prepareLaunchWorktree}: the effective working directory, remaining args, and resolved worktree plan. */
 export interface PreparedLaunchWorktree {
 	cwd: string;
@@ -642,4 +901,26 @@ export function prepareLaunchWorktree(cwd: string, args: string[]): PreparedLaun
 	if (!ensured.enabled) return { cwd, args: parsed.remainingArgs, worktree: ensured };
 	ensureReusableNodeModules(ensured.repoRoot, ensured.worktreePath);
 	return { cwd: ensured.worktreePath, args: parsed.remainingArgs, worktree: ensured };
+}
+export function removeOwnedLaunchWorktree(
+	plan: GjcLaunchWorktreePlan,
+	receipt: { created: boolean; reused: boolean; createdBranch: boolean },
+): void {
+	if (!receipt.created || receipt.reused) return;
+	try {
+		runGit(plan.repoRoot, ["worktree", "remove", "--force", plan.worktreePath]);
+	} catch {
+		try {
+			runGit(plan.repoRoot, ["worktree", "prune"]);
+		} catch {
+			// Proof stays on the ledger; leftover classify is best-effort after abort.
+		}
+	}
+	if (receipt.createdBranch && plan.branchName) {
+		try {
+			runGit(plan.repoRoot, ["branch", "-D", plan.branchName]);
+		} catch {
+			// Owned-branch delete is best-effort; collisions keep the pre-existing branch.
+		}
+	}
 }
