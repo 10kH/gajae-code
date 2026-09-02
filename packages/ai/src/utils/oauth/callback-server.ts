@@ -19,6 +19,13 @@ const DEFAULT_TIMEOUT = 300_000;
 const DEFAULT_HOSTNAME = "localhost";
 const CALLBACK_PATH = "/callback";
 
+function serializeScriptData(value: unknown): string {
+	return JSON.stringify(value)
+		.replaceAll("<", "\\u003c")
+		.replaceAll("\u2028", "\\u2028")
+		.replaceAll("\u2029", "\\u2029");
+}
+
 export type CallbackResult = { code: string; state: string };
 
 export interface OAuthCallbackFlowOptions {
@@ -259,7 +266,7 @@ export abstract class OAuthCallbackFlow {
 		});
 
 		return new Response(
-			(templateHtml as unknown as string).replaceAll("__OAUTH_STATE__", JSON.stringify(resultState)),
+			(templateHtml as unknown as string).replaceAll("__OAUTH_STATE__", () => serializeScriptData(resultState)),
 			{
 				status: resultState.ok ? 200 : 500,
 				headers: { "Content-Type": "text/html" },

@@ -13,6 +13,7 @@
 
 - Cursor sessions now report prompt tokens instead of zero. `ConversationTokenDetails.used_tokens` counts the whole conversation, but the checkpoint handler assigned it to `usage.output` and returned early whenever token deltas had been seen — which is the normal streaming path — so `usage.input`, `usage.cacheRead`, and `usage.cacheWrite` were left at their zero initializers for every cursor request. `calculatePromptTokens` therefore fell through to its output-only fallback, so the context indicator tracked the last response's output size rather than the conversation, and automatic compaction never observed a full context. Conversation usage is now recorded through the stream and split into prompt and output tokens when the stream finalizes.
 
+- OAuth callback responses now serialize provider-controlled result fields as safe JSON script data, preventing callback values from terminating the embedded state element while preserving exact JSON values and callback behavior.
 
 ## [0.16.0] - 2026-09-02
 
