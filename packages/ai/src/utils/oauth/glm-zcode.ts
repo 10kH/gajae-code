@@ -387,7 +387,7 @@ export class GlmZcodeOAuthFlow extends OAuthCallbackFlow {
 		return {
 			url: `${authorizeUrl}?${params.toString()}`,
 			instructions:
-				"Complete Z.AI login in your browser. This is an UNOFFICIAL ZCode-based login — use at your own risk; it may stop working or violate ZCode/Z.AI Terms of Service. Because this CLI cannot receive the zcode:// redirect, paste the final redirect URL or authorization code when prompted.",
+				"Complete Z.AI login in your browser. This is an UNOFFICIAL ZCode-based login — use at your own risk; it may stop working or violate ZCode/Z.AI Terms of Service. Because this CLI cannot receive the zcode:// redirect, paste the final redirect URL or authorization code when prompted. If the ZCode desktop app is installed, cancel the browser's prompt to open it: the app exchanges the single-use code itself and the pasted code is then rejected (broker error 2007).",
 		};
 	}
 

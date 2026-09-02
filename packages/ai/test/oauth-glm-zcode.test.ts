@@ -144,6 +144,10 @@ describe("GLM ZCode OAuth login provider", () => {
 		expect(authUrl.searchParams.get("response_type")).toBe("code");
 		expect(authUrl.searchParams.get("state")).toBe("state-1");
 		expect(instructions ?? "").toMatch(/unofficial/i);
+		// A desktop-app install consumes the single-use code before the user can paste it;
+		// the instructions must warn about that or the documented flow fails silently.
+		expect(instructions ?? "").toMatch(/desktop app/i);
+		expect(instructions ?? "").toMatch(/cancel/i);
 	});
 
 	it("exchanges the code and provisions a Z.AI API key as the credential", async () => {
