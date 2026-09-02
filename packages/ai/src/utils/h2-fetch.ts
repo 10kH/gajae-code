@@ -14,6 +14,13 @@
  * or `ConnectionClosed` rather than `HTTP2Unsupported`, so we treat those
  * codes as h2-fallback triggers as well.
  *
+ * ALPN-refusing hosts (notably zcode.z.ai, the GLM ZCode OAuth broker) abort
+ * the TLS handshake entirely when the client offers ALPN h2. Bun reports that
+ * abort as `UNKNOWN_CERTIFICATE_VERIFICATION_ERROR` even though the host's
+ * certificate chain verifies fine over h1 (issue #5178), so that code is a
+ * fallback trigger too — never a reason to accept a bad certificate: the h1
+ * attempt below performs full verification on its own.
+ *
  * Bun negotiates h2 via ALPN over TLS only (no h2c), so plain `http://` URLs
  * skip the attempt entirely — avoids the throw/retry round-trip for localhost.
  *
@@ -36,6 +43,9 @@ export function installH2Fetch(): void {
 		"ConnectionRefused", // Server refused the h2 connection
 		"ConnectionReset", // Server reset during h2 handshake
 		"ConnectionClosed", // Server closed before h2 response
+		// Bun's h2 client reports an ALPN-refusing host's TLS abort with this
+		// code; the h1 fallback below re-verifies the certificate itself.
+		"UNKNOWN_CERTIFICATE_VERIFICATION_ERROR",
 	]);
 	const wrapper = async function h2fetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
 		if (!isHttps(input)) return original(input, init);

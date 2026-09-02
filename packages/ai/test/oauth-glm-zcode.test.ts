@@ -531,4 +531,73 @@ describe("GLM ZCode OAuth login provider", () => {
 		expect(headers["X-ZCode-Agent"]).toBeUndefined();
 		expect(headers["User-Agent"] ?? "").not.toBe("ZCode/3.1.2");
 	});
+	it("throws the documented broker failure shape when the broker rejects the exchange", async () => {
+		const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+			const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+			if (url === GLM_ZCODE_OAUTH_BROKER_TOKEN_URL) {
+				return new Response("upstream says no", { status: 401 });
+			}
+			throw new Error(`Unexpected fetch: ${init?.method ?? "GET"} ${url}`);
+		});
+		const flow = new GlmZcodeOAuthFlow(
+			{ onAuth: () => {}, onPrompt: async () => "" },
+			{ fetch: fetchMock as unknown as typeof fetch },
+		);
+		let caught: unknown;
+		try {
+			await flow.exchangeToken("auth-code", "state-1", GLM_ZCODE_OAUTH_REDIRECT_URI);
+		} catch (error) {
+			caught = error;
+		}
+		expect(caught).toBeInstanceOf(Error);
+		const message = (caught as Error).message;
+		// Failure shape: labeled broker failure with status + redacted body, nothing else.
+		expect(message).toMatch(/^GLM ZCode broker request failed: 401 /);
+		expect(message).not.toMatch(/auth-code|state-1/);
+	});
+
+	it("redacts token-like secrets from broker error bodies", async () => {
+		const leaky = `eyJhbGciOiJIUzI1NiJ9.${Buffer.from(JSON.stringify({ sub: "x" })).toString("base64url")}.sigPART`;
+		const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+			const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+			if (url === GLM_ZCODE_OAUTH_BROKER_TOKEN_URL) {
+				return new Response(`token=${leaky} trace ok`, { status: 500 });
+			}
+			throw new Error(`Unexpected fetch: ${init?.method ?? "GET"} ${url}`);
+		});
+		const flow = new GlmZcodeOAuthFlow(
+			{ onAuth: () => {}, onPrompt: async () => "" },
+			{ fetch: fetchMock as unknown as typeof fetch },
+		);
+		let caught: unknown;
+		try {
+			await flow.exchangeToken("auth-code", "state-1", GLM_ZCODE_OAUTH_REDIRECT_URI);
+		} catch (error) {
+			caught = error;
+		}
+		const message = (caught as Error).message;
+		expect(message).toContain("[redacted-jwt]");
+		expect(message).not.toContain(leaky);
+		expect(message).not.toContain("sigPART");
+	});
+
+	it("throws a labeled failure when the broker response is missing required fields", async () => {
+		const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+			const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+			if (url === GLM_ZCODE_OAUTH_BROKER_TOKEN_URL) {
+				return new Response(JSON.stringify({ code: 2007, msg: "http error" }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			throw new Error(`Unexpected fetch: ${init?.method ?? "GET"} ${url}`);
+		});
+		const flow = new GlmZcodeOAuthFlow(
+			{ onAuth: () => {}, onPrompt: async () => "" },
+			{ fetch: fetchMock as unknown as typeof fetch },
+		);
+		await expect(flow.exchangeToken("auth-code", "state-1", GLM_ZCODE_OAUTH_REDIRECT_URI)).rejects.toThrow(
+			"GLM ZCode broker response missing data.token or data.zai.access_token",
+		);
+	});
 });
