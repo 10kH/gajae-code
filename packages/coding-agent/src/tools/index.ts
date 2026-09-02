@@ -247,8 +247,14 @@ export interface ToolSession {
 
 	/** Get the session-owned or inherited async job manager. */
 	getAsyncJobManager?: () => AsyncJobManager | undefined;
-	/** Resolves when the session queues user steering (or `signal` aborts) without consuming it; wait-style tools use this to end their observation early. */
-	waitForUserSteering?: (signal: AbortSignal) => Promise<void>;
+	/**
+	 * Resolves with the arrival sequence when the session queues user steering, or `undefined` when `signal` aborts,
+	 * without consuming the queue; wait-style tools use this to end their observation early. With `options.after`,
+	 * only a steer newer than that sequence resolves it, so an already-queued steer can be ignored.
+	 */
+	waitForUserSteering?: (signal: AbortSignal, options?: { after?: number }) => Promise<number | undefined>;
+	/** Arrival sequence of the most recent user steer (0 before any); pairs with `waitForUserSteering`'s `after`. */
+	getSteeringArrivalSeq?: () => number;
 	/** Get session ID */
 	getSessionId?: () => string | null;
 	/** Get credential-selection session identity. */

@@ -5351,8 +5351,15 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					generation: event.generation,
 					reason: event.reason,
 				});
-			} catch {
-				// A fold notification is an observation; failing to publish it must not affect the fold.
+			} catch (error) {
+				// The fold already happened; publication failure must not affect it,
+				// but it must leave evidence because a client relying on the event
+				// instead of runtime.jobs.list would otherwise never learn of the fold.
+				logger.warn("sdk: bash_folded publication failed", {
+					jobId: event.jobId,
+					reason: event.reason,
+					error: error instanceof Error ? error.message : String(error),
+				});
 			}
 		});
 		const disposeGate = (): void => {

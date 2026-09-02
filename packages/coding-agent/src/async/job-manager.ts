@@ -85,7 +85,7 @@ export interface JobFoldEvent {
 export interface AsyncJobMetadata {
 	/** Set once a foreground wait has been folded, so surfacing can show folded work. */
 	backgrounded?: boolean;
-	/** Why the wait was folded; always present when `backgrounded` is true. */
+	/** Why a foreground wait was folded; absent for jobs started directly in the background (`async: true`). */
 	foldReason?: FoldReason;
 	subagent?: {
 		id: string;
@@ -349,7 +349,7 @@ export interface AsyncJobSnapshotEntry {
 	status: AsyncJob["status"];
 	generation: string;
 	backgrounded: boolean;
-	/** Present exactly when `backgrounded` is true. */
+	/** Present when `backgrounded` was set by a fold; absent for direct background starts. */
 	foldReason?: FoldReason;
 	deliveryState: JobDeliveryState;
 }

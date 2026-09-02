@@ -1248,6 +1248,53 @@ describe("SessionSdkSessionRuntime", () => {
 		);
 		await runtime.stop();
 	});
+	test("SDK-only host publishes one replayable bash_folded frame per fold and drops the subscription on shutdown", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-bash-folded-"));
+		const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
+		const api = {
+			on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
+				handlers.set(event, handler);
+			},
+			sendUserMessage: async () => {},
+		} as unknown as ExtensionAPI;
+		const transport = memoryTransport();
+		createSdkSessionRuntimeExtension(api, { agentDir: cwd, createTransport: async () => transport });
+		const listeners = new Set<(event: { jobId: string; generation: string; reason: string }) => void>();
+		const ctx = {
+			...extensionContext(transport.sessionId, cwd),
+			onJobFold: (listener: (event: { jobId: string; generation: string; reason: string }) => void) => {
+				listeners.add(listener);
+				return () => listeners.delete(listener);
+			},
+		} as unknown as ExtensionContext;
+		try {
+			await handlers.get("session_start")?.({}, ctx);
+			expect(listeners.size).toBe(1);
+			for (const listener of listeners) listener({ jobId: "bg_7", generation: "bg_7:1", reason: "steer" });
+			transport.feed("client", { type: "event_replay", id: "fold-replay", sinceSeq: 0 });
+			await Bun.sleep(0);
+			const replay = transport.sent.find(
+				frame => frame.type === "event_replay_result" && frame.id === "fold-replay",
+			) as { events?: Array<{ kind?: unknown; payload?: Record<string, unknown> }> } | undefined;
+			const folded = replay?.events?.filter(event => event.kind === "bash_folded") ?? [];
+			expect(folded).toEqual([
+				expect.objectContaining({
+					kind: "bash_folded",
+					payload: {
+						type: "bash_folded",
+						sessionId: transport.sessionId,
+						jobId: "bg_7",
+						generation: "bg_7:1",
+						reason: "steer",
+					},
+				}),
+			]);
+		} finally {
+			await handlers.get("session_shutdown")?.({}, ctx);
+		}
+		expect(listeners.size).toBe(0);
+	});
+
 	test("SDK-only host admits, replays, and conflicts terminal abort requests durably", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-terminal-abort-"));
 		const operatorCapability = "runtime-terminal-abort-capability";

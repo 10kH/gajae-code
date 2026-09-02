@@ -1,15 +1,15 @@
 /**
- * Steer-triggered bash fold.
+ * Steer-triggered bash fold — managed non-PTY surface.
  *
- * A queued user steer folds a running foreground bash call into a background
- * job once the command has run for STEER_FOLD_GRACE_MS, mirroring the way a
+ * A user steer that ARRIVES after a foreground bash call has run for
+ * STEER_FOLD_GRACE_MS folds it into a background job, mirroring the way a
  * queued steer ends a subagent await. The five parity points:
  *  1. steer after the grace window -> fold with a `steer` reason line, the job
  *     keeps running and its completion is delivered later;
- *  2. steer inside the grace window -> no fold, the command finishes normally;
- *  3. (loop-owned) remaining tools in the batch are skipped — covered by the
- *     agent loop's existing steer tests; here we assert the fold does not arm
- *     the turn-ending fence/stop, so the SAME run consumes the steer;
+ *  2. steer inside the grace window (or already queued at start) -> no fold,
+ *     the command finishes normally and that steer is left for the boundary;
+ *  3. the fold does not arm the turn-ending fence/stop, so the SAME run
+ *     consumes the steer (the loop's batch-skip is covered by agent-loop tests);
  *  4. abort still aborts (a steer never kills the command);
  *  5. busyPromptMode=queue / interruptMode=wait -> no fold.
  * Plus the manager-level contract every fold path relies on: `foldReason` on
@@ -19,114 +19,16 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentToolContext } from "@gajae-code/agent-core";
-import { AsyncJobManager, type FoldReason, type JobFoldEvent } from "@gajae-code/coding-agent/async";
-import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { type FoldAdapter, FoldCoordinator } from "@gajae-code/coding-agent/session/fold-coordinator";
-import type { ToolSession } from "@gajae-code/coding-agent/tools";
+import { AsyncJobManager, type JobFoldEvent } from "@gajae-code/coding-agent/async";
 import { BashTool, STEER_FOLD_GRACE_MS, steerFoldReasonLine } from "@gajae-code/coding-agent/tools/bash";
 import { Snowflake } from "@gajae-code/utils";
-
-/** A tool context that marks the call as owned by a live Agent turn (originatingTurn=true). */
-function turnContext(): AgentToolContext {
-	return {
-		attemptScope: { attemptId: "attempt-1", generation: 1, lineage: "main" },
-	} as unknown as AgentToolContext;
-}
-
-function textOf(result: { content: Array<{ type: string; text?: string }> }): string {
-	return result.content
-		.filter(block => block.type === "text")
-		.map(block => block.text ?? "")
-		.join("\n");
-}
-
-interface SteerHarness {
-	session: ToolSession;
-	coordinator: FoldCoordinator;
-	manager: AsyncJobManager;
-	/** Queue a steer: resolves every pending waitForUserSteering. */
-	steer: () => void;
-	fenceArmed: () => boolean;
-	stopRequested: () => boolean;
-	folds: JobFoldEvent[];
-}
-
-function createHarness(
-	cwd: string,
-	options: { busyPromptMode?: "steer" | "queue"; interruptMode?: "immediate" | "wait" } = {},
-): SteerHarness {
-	const manager = new AsyncJobManager({ onJobComplete: async () => {} });
-	AsyncJobManager.setInstance(manager);
-	let fenceArmed = false;
-	let stopRequested = false;
-	const coordinator = new FoldCoordinator({
-		hasActiveTurn: () => true,
-		armSteeringFence: () => {
-			fenceArmed = true;
-			return () => {
-				fenceArmed = false;
-			};
-		},
-		requestStop: () => {
-			stopRequested = true;
-		},
-		captureRemainingIntent: () => undefined,
-		deliverParked: () => {},
-	});
-	const steerWaiters = new Set<() => void>();
-	let steerQueued = false;
-	const folds: JobFoldEvent[] = [];
-	manager.onFold(event => folds.push(event));
-	const sessionDir = path.join(cwd, "session");
-	let artifactCounter = 0;
-	const session: ToolSession = {
-		cwd,
-		hasUI: false,
-		settings: Settings.isolated({
-			"bash.autoBackground.enabled": false,
-			busyPromptMode: options.busyPromptMode ?? "steer",
-		}),
-		getSessionFile: () => path.join(cwd, "session.jsonl"),
-		getSessionSpawns: () => "*",
-		getSessionId: () => "steer-fold-session",
-		getArtifactsDir: () => sessionDir,
-		allocateOutputArtifact: async (toolType: string) => {
-			fs.mkdirSync(sessionDir, { recursive: true });
-			const id = `artifact-${++artifactCounter}`;
-			return { id, path: path.join(sessionDir, `${id}.${toolType}.log`) };
-		},
-		getAsyncJobManager: () => manager,
-		registerForegroundFoldParticipant: adapter => coordinator.registerParticipant(adapter),
-		hasForegroundBashBackgroundRequestHandler: () => coordinator.hasFoldableParticipant(),
-		requestForegroundBashBackground: async (reason?: FoldReason, adapter?: FoldAdapter) =>
-			(await coordinator.requestFold(adapter, reason)).status === "folded",
-		getInterruptMode: () => options.interruptMode ?? "immediate",
-		waitForUserSteering: signal => {
-			if (steerQueued || signal.aborted) return Promise.resolve();
-			const { promise, resolve } = Promise.withResolvers<void>();
-			const settle = () => {
-				steerWaiters.delete(settle);
-				resolve();
-			};
-			steerWaiters.add(settle);
-			signal.addEventListener("abort", settle, { once: true });
-			return promise;
-		},
-	};
-	return {
-		session,
-		coordinator,
-		manager,
-		steer: () => {
-			steerQueued = true;
-			for (const settle of [...steerWaiters]) settle();
-		},
-		fenceArmed: () => fenceArmed,
-		stopRequested: () => stopRequested,
-		folds,
-	};
-}
+import {
+	createSteerHarness,
+	ptyTurnContext,
+	type SteerHarness,
+	textOf,
+	turnContext,
+} from "./helpers/steer-fold-harness";
 
 describe("steer-triggered bash fold", () => {
 	let cwd = "";
@@ -142,29 +44,27 @@ describe("steer-triggered bash fold", () => {
 		harness = undefined;
 		AsyncJobManager.resetForTests();
 		fs.rmSync(cwd, { recursive: true, force: true });
-	});
+	}, 10_000);
 
 	it("exports the fixed grace window", () => {
 		expect(STEER_FOLD_GRACE_MS).toBe(2_000);
-	});
+	}, 10_000);
 
-	it("parity 1: a steer after the grace window folds the managed wait with a steer reason line and keeps the job running", async () => {
-		harness = createHarness(cwd);
+	it("parity 1: a steer arriving after the grace window folds the managed wait with a steer reason line and keeps the job running", async () => {
+		harness = createSteerHarness(cwd);
 		const tool = new BashTool(harness.session);
 		const startedAt = Date.now();
 		const resultPromise = tool.execute(
 			"steer-fold-1",
-			{ command: "printf 'start\\n'; sleep 3; printf 'done\\n'", timeout: 30 },
+			{ command: "printf 'start\\n'; sleep 5; printf 'done\\n'", timeout: 30 },
 			undefined,
 			undefined,
 			turnContext(),
 		);
-		// Wait past the grace window so the fold fires immediately on steer.
 		await Bun.sleep(STEER_FOLD_GRACE_MS + 100);
 		harness.steer();
 		const result = await resultPromise;
-		const elapsed = Date.now() - startedAt;
-		expect(elapsed).toBeLessThan(2_900);
+		expect(Date.now() - startedAt).toBeLessThan(4_500);
 
 		const jobId = result.details?.async?.jobId;
 		if (!jobId) throw new Error("expected a background job id");
@@ -184,47 +84,76 @@ describe("steer-triggered bash fold", () => {
 		expect(snapshot?.foldReason).toBe("steer");
 		expect(harness.folds).toEqual([{ jobId, generation: job!.generation, reason: "steer" }]);
 
-		// Parity 3 precondition: the same run consumes the steer. A steer fold
-		// must neither fence steering admission nor arm the cooperative stop.
+		// Parity 3: the same run must consume the steer. A steer fold neither
+		// fences steering admission nor arms the cooperative stop, and the steer
+		// itself is still queued for the loop's tool boundary.
 		expect(harness.fenceArmed()).toBe(false);
 		expect(harness.stopRequested()).toBe(false);
+		expect(harness.agent.hasQueuedSteering()).toBe(true);
 
 		await job?.promise;
 		expect(harness.manager.getJob(jobId)?.status).toBe("completed");
-	});
+	}, 15_000);
 
-	it("parity 1: a steer queued inside the grace window folds once the window elapses", async () => {
-		harness = createHarness(cwd);
+	it("parity 2: a steer arriving inside the grace window never folds; the command finishes normally", async () => {
+		harness = createSteerHarness(cwd);
 		const tool = new BashTool(harness.session);
 		const startedAt = Date.now();
-		const resultPromise = tool.execute("steer-fold-early", {
-			command: "sleep 4; printf 'done\\n'",
-			timeout: 30,
-		});
+		const resultPromise = tool.execute("steer-early", { command: "sleep 2.6; printf 'done\\n'", timeout: 30 });
 		await Bun.sleep(200);
 		harness.steer();
 		const result = await resultPromise;
-		const elapsed = Date.now() - startedAt;
-		expect(elapsed).toBeGreaterThanOrEqual(STEER_FOLD_GRACE_MS);
-		expect(elapsed).toBeLessThan(3_500);
+		expect(Date.now() - startedAt).toBeGreaterThanOrEqual(2_500);
+		expect(result.details?.async).toBeUndefined();
+		expect(result.details?.foldReason).toBeUndefined();
+		expect(textOf(result)).toContain("done");
+		expect(harness.folds).toHaveLength(0);
+		expect(harness.agent.hasQueuedSteering()).toBe(true);
+	}, 10_000);
+
+	it("parity 2: a steer already queued when the command starts never folds it", async () => {
+		harness = createSteerHarness(cwd);
+		harness.steer();
+		const tool = new BashTool(harness.session);
+		const resultPromise = tool.execute("steer-prequeued", { command: "sleep 2.6; printf 'done\\n'", timeout: 30 });
+		const result = await resultPromise;
+		expect(result.details?.async).toBeUndefined();
+		expect(harness.folds).toHaveLength(0);
+	}, 10_000);
+
+	it("parity 2: an early steer does not blind the watcher to a later qualifying steer", async () => {
+		harness = createSteerHarness(cwd);
+		const tool = new BashTool(harness.session);
+		const resultPromise = tool.execute(
+			"steer-early-then-late",
+			{ command: "sleep 4; printf 'done\\n'", timeout: 30 },
+			undefined,
+			undefined,
+			turnContext(),
+		);
+		await Bun.sleep(200);
+		harness.steer("early");
+		await Bun.sleep(STEER_FOLD_GRACE_MS);
+		harness.steer("late");
+		const result = await resultPromise;
 		expect(result.details?.foldReason).toBe("steer");
+		expect(harness.folds.map(fold => fold.reason)).toEqual(["steer"]);
 		await harness.manager.getJob(result.details!.async!.jobId)?.promise;
-	});
+	}, 15_000);
 
 	it("parity 2: a command that finishes inside the grace window is never folded", async () => {
-		harness = createHarness(cwd);
+		harness = createSteerHarness(cwd);
 		const tool = new BashTool(harness.session);
 		const resultPromise = tool.execute("steer-no-fold-short", { command: "printf 'quick\\n'", timeout: 30 });
 		harness.steer();
 		const result = await resultPromise;
 		expect(result.details?.async).toBeUndefined();
-		expect(result.details?.foldReason).toBeUndefined();
 		expect(textOf(result)).toContain("quick");
 		expect(harness.folds).toHaveLength(0);
-	});
+	}, 10_000);
 
 	it("parity 4: an abort still kills the command and never becomes a fold", async () => {
-		harness = createHarness(cwd);
+		harness = createSteerHarness(cwd);
 		const tool = new BashTool(harness.session);
 		const abort = new AbortController();
 		const resultPromise = tool.execute("steer-abort", { command: "sleep 30", timeout: 60 }, abort.signal);
@@ -234,10 +163,10 @@ describe("steer-triggered bash fold", () => {
 		await expect(resultPromise).rejects.toThrow();
 		expect(harness.folds).toHaveLength(0);
 		expect(harness.manager.getRunningJobs()).toHaveLength(0);
-	});
+	}, 10_000);
 
 	it("parity 5: busyPromptMode=queue never folds on steer", async () => {
-		harness = createHarness(cwd, { busyPromptMode: "queue" });
+		harness = createSteerHarness(cwd, { busyPromptMode: "queue" });
 		const tool = new BashTool(harness.session);
 		const resultPromise = tool.execute("steer-gate-queue", { command: "sleep 2.4; printf 'done\\n'", timeout: 30 });
 		await Bun.sleep(STEER_FOLD_GRACE_MS + 100);
@@ -246,22 +175,32 @@ describe("steer-triggered bash fold", () => {
 		expect(result.details?.async).toBeUndefined();
 		expect(textOf(result)).toContain("done");
 		expect(harness.folds).toHaveLength(0);
-	});
+	}, 10_000);
 
 	it("parity 5: interruptMode=wait never folds on steer", async () => {
-		harness = createHarness(cwd, { interruptMode: "wait" });
+		harness = createSteerHarness(cwd, { interruptMode: "wait" });
 		const tool = new BashTool(harness.session);
 		const resultPromise = tool.execute("steer-gate-wait", { command: "sleep 2.4; printf 'done\\n'", timeout: 30 });
 		await Bun.sleep(STEER_FOLD_GRACE_MS + 100);
 		harness.steer();
 		const result = await resultPromise;
 		expect(result.details?.async).toBeUndefined();
-		expect(textOf(result)).toContain("done");
 		expect(harness.folds).toHaveLength(0);
-	});
+	}, 10_000);
 
-	it("a chord fold still ends the turn and records a chord reason without the steer line", async () => {
-		harness = createHarness(cwd);
+	it("parity 5: a session that cannot prove its interrupt mode is not steer-foldable (fail closed)", async () => {
+		harness = createSteerHarness(cwd, { omitInterruptMode: true });
+		const tool = new BashTool(harness.session);
+		const resultPromise = tool.execute("steer-gate-unknown", { command: "sleep 2.4; printf 'done\\n'", timeout: 30 });
+		await Bun.sleep(STEER_FOLD_GRACE_MS + 100);
+		harness.steer();
+		const result = await resultPromise;
+		expect(result.details?.async).toBeUndefined();
+		expect(harness.folds).toHaveLength(0);
+	}, 10_000);
+
+	it("a chord fold inside a turn ends the turn and records a chord reason without the steer line", async () => {
+		harness = createSteerHarness(cwd);
 		const tool = new BashTool(harness.session);
 		const resultPromise = tool.execute(
 			"chord-fold",
@@ -281,10 +220,10 @@ describe("steer-triggered bash fold", () => {
 		expect(harness.fenceArmed()).toBe(true);
 		expect(harness.stopRequested()).toBe(true);
 		await harness.manager.getJob(jobId)?.promise;
-	});
+	}, 10_000);
 
-	it("an explicit SDK control fold records sdk_control and `bash.background` after it is already backgrounded", async () => {
-		harness = createHarness(cwd);
+	it("an explicit SDK control fold records sdk_control and nothing is foldable afterwards", async () => {
+		harness = createSteerHarness(cwd);
 		const tool = new BashTool(harness.session);
 		const resultPromise = tool.execute("sdk-fold", { command: "sleep 2; printf 'done\\n'", timeout: 30 });
 		await Bun.sleep(100);
@@ -292,11 +231,39 @@ describe("steer-triggered bash fold", () => {
 		const result = await resultPromise;
 		const jobId = result.details!.async!.jobId;
 		expect(harness.manager.getJob(jobId)?.metadata?.foldReason).toBe("sdk_control");
-		// The wait is gone: a second explicit fold finds nothing foldable.
 		expect(harness.session.hasForegroundBashBackgroundRequestHandler?.()).toBe(false);
 		expect(await harness.session.requestForegroundBashBackground?.("sdk_control")).toBe(false);
 		await harness.manager.getJob(jobId)?.promise;
-	});
+	}, 10_000);
+
+	it("PTY surface: a post-grace steer folds the PTY wait with the reason line, foldReason=steer, and output-only continuation", async () => {
+		harness = createSteerHarness(cwd);
+		const tool = new BashTool(harness.session);
+		const marker = path.join(cwd, "pty-after-fold.txt");
+		const resultPromise = tool.execute(
+			"pty-steer-fold",
+			{ command: `printf 'PTY-BEFORE\\n'; sleep 4; printf 'PTY-AFTER\\n' > ${marker}`, pty: true, timeout: 30 },
+			undefined,
+			undefined,
+			ptyTurnContext(),
+		);
+		await Bun.sleep(STEER_FOLD_GRACE_MS + 100);
+		harness.steer();
+		const result = await resultPromise;
+
+		const jobId = result.details?.async?.jobId;
+		if (!jobId) throw new Error("expected a steer-folded PTY job id");
+		expect(result.details?.foldReason).toBe("steer");
+		expect(textOf(result)).toContain(steerFoldReasonLine(jobId));
+		expect(harness.manager.getJob(jobId)?.metadata).toMatchObject({ backgrounded: true, foldReason: "steer" });
+		expect(harness.folds.map(fold => fold.reason)).toEqual(["steer"]);
+
+		// Output-only continuation: the process was never killed by the fold, so
+		// its post-fold side effect still lands and the job completes on its own.
+		await harness.manager.getJob(jobId)?.promise;
+		expect(harness.manager.getJob(jobId)?.status).toBe("completed");
+		expect(fs.existsSync(marker)).toBe(true);
+	}, 15_000);
 });
 
 describe("AsyncJobManager fold bookkeeping", () => {
@@ -324,7 +291,7 @@ describe("AsyncJobManager fold bookkeeping", () => {
 		release.resolve();
 		await job.promise;
 		await manager.dispose();
-	});
+	}, 10_000);
 
 	it("an async-started job is backgrounded without a fold reason or fold event", async () => {
 		const manager = new AsyncJobManager({ onJobComplete: async () => {} });

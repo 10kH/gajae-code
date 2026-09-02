@@ -186,25 +186,26 @@ export function getComposerPlaceholder(
 	return buildComposerPlaceholder(keybindings, context, options);
 }
 
+/** Running background work split into the three kinds the activity indicator names. */
 export interface BackgroundActivityTally {
 	subagents: number;
 	backgroundBash: number;
 	monitors: number;
-	other: number;
 }
 
+/**
+ * Classify running jobs for the activity indicator. Subagents are `task` jobs
+ * carrying subagent metadata; monitors are flagged by `metadata.monitor`; every
+ * other running job (plain async/folded bash, and task jobs without subagent
+ * metadata such as scheduled batches) is background bash from the user's point
+ * of view: a command-shaped job that will deliver a result later.
+ */
 export function tallyBackgroundActivity(running: readonly AsyncJobSnapshotItem[]): BackgroundActivityTally {
-	const tally: BackgroundActivityTally = { subagents: 0, backgroundBash: 0, monitors: 0, other: 0 };
+	const tally: BackgroundActivityTally = { subagents: 0, backgroundBash: 0, monitors: 0 };
 	for (const item of running) {
-		if (item.type === "task" && item.metadata?.subagent !== undefined) {
-			tally.subagents += 1;
-		} else if (item.metadata?.monitor === true) {
-			tally.monitors += 1;
-		} else if (item.type === "bash") {
-			tally.backgroundBash += 1;
-		} else {
-			tally.other += 1;
-		}
+		if (item.type === "task" && item.metadata?.subagent !== undefined) tally.subagents += 1;
+		else if (item.metadata?.monitor === true) tally.monitors += 1;
+		else tally.backgroundBash += 1;
 	}
 	return tally;
 }
@@ -218,7 +219,6 @@ export function resolveActivityIndicatorMessage(
 	if (activity.subagents > 0) parts.push(`${activity.subagents} subagent${activity.subagents === 1 ? "" : "s"}`);
 	if (activity.backgroundBash > 0) parts.push(`${activity.backgroundBash} background bash`);
 	if (activity.monitors > 0) parts.push(`${activity.monitors} monitor${activity.monitors === 1 ? "" : "s"}`);
-	if (activity.other > 0) parts.push(`${activity.other} other job${activity.other === 1 ? "" : "s"}`);
 
 	if (foregroundActive) return parts.length === 0 ? foregroundMessage : `${foregroundMessage} · ${parts.join(", ")}`;
 	return parts.length === 0 ? undefined : `Background: ${parts.join(", ")}…`;

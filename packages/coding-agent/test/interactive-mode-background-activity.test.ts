@@ -99,12 +99,13 @@ describe("interactive background activity indicator", () => {
 				startTime: 0,
 				metadata: { monitor: true },
 			},
-			{ id: "other", type: "task", status: "running", label: "other", startTime: 0 },
+			{ id: "batch", type: "task", status: "running", label: "batch", startTime: 0 },
 		];
-		const noActivity = { subagents: 0, backgroundBash: 0, monitors: 0, other: 0 };
-		const mixedActivity = { subagents: 2, backgroundBash: 1, monitors: 1, other: 0 };
+		const noActivity = { subagents: 0, backgroundBash: 0, monitors: 0 };
+		const mixedActivity = { subagents: 2, backgroundBash: 1, monitors: 1 };
 
-		expect(tallyBackgroundActivity(running)).toEqual({ subagents: 1, backgroundBash: 1, monitors: 1, other: 1 });
+		// A task job without subagent metadata is a command-shaped background job from the user's view.
+		expect(tallyBackgroundActivity(running)).toEqual({ subagents: 1, backgroundBash: 2, monitors: 1 });
 		expect(resolveActivityIndicatorMessage(false, noActivity, "Working…")).toBeUndefined();
 		expect(resolveActivityIndicatorMessage(true, noActivity, "Working…")).toBe("Working…");
 		expect(resolveActivityIndicatorMessage(false, mixedActivity, "Working…")).toBe(
@@ -113,15 +114,15 @@ describe("interactive background activity indicator", () => {
 		expect(resolveActivityIndicatorMessage(true, mixedActivity, "Working…")).toBe(
 			"Working… · 2 subagents, 1 background bash, 1 monitor",
 		);
-		expect(
-			resolveActivityIndicatorMessage(false, { subagents: 1, backgroundBash: 0, monitors: 0, other: 0 }, "Working…"),
-		).toBe("Background: 1 subagent…");
-		expect(
-			resolveActivityIndicatorMessage(true, { subagents: 0, backgroundBash: 1, monitors: 0, other: 0 }, "Working…"),
-		).toBe("Working… · 1 background bash");
-		expect(
-			resolveActivityIndicatorMessage(false, { subagents: 0, backgroundBash: 0, monitors: 0, other: 2 }, "Working…"),
-		).toBe("Background: 2 other jobs…");
+		expect(resolveActivityIndicatorMessage(false, { subagents: 1, backgroundBash: 0, monitors: 0 }, "Working…")).toBe(
+			"Background: 1 subagent…",
+		);
+		expect(resolveActivityIndicatorMessage(true, { subagents: 0, backgroundBash: 1, monitors: 0 }, "Working…")).toBe(
+			"Working… · 1 background bash",
+		);
+		expect(resolveActivityIndicatorMessage(false, { subagents: 0, backgroundBash: 0, monitors: 2 }, "Working…")).toBe(
+			"Background: 2 monitors…",
+		);
 	});
 
 	it("uses layout-only repaints for the foreground activity indicator", () => {

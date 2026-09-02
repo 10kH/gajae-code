@@ -108,6 +108,34 @@ export type FoldRequestResult =
 	| { status: "already-terminal"; reason: string }
 	| { status: "capture-failed"; reason: string };
 
+/**
+ * Session-level answer to "fold the foreground bash now". Consumed by the SDK
+ * `bash.background` control, whose declared error codes are exactly these
+ * non-folded statuses.
+ */
+export type ForegroundFoldOutcome =
+	| { status: "folded"; jobId: string }
+	| { status: "already_backgrounded" }
+	| { status: "no_active_bash" }
+	| { status: "not_foldable"; reason: string };
+
+/** Map a non-folded outcome onto the C52 `bash.background` error contract (`not_foldable` | `already_backgrounded` | `no_active_bash`). */
+export function bashBackgroundControlError(outcome: Exclude<ForegroundFoldOutcome, { status: "folded" }>): Error {
+	switch (outcome.status) {
+		case "already_backgrounded":
+			return Object.assign(new Error("The active bash command has already been moved to a background job."), {
+				code: "already_backgrounded",
+			});
+		case "no_active_bash":
+			return Object.assign(new Error("No foreground bash command is running."), { code: "no_active_bash" });
+		case "not_foldable":
+			return Object.assign(
+				new Error(`The active bash command cannot be moved to a managed background job: ${outcome.reason}`),
+				{ code: "not_foldable" },
+			);
+	}
+}
+
 /** What a delivery should carry, decided by the durable slot state (T2). */
 export type FoldDeliveryDisposition =
 	| { kind: "ordinary" }

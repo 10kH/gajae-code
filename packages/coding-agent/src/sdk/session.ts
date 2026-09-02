@@ -2701,13 +2701,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			trackEvalExecution: (execution, abortController) =>
 				session ? session.trackEvalExecution(execution, abortController) : execution,
 			getAsyncJobManager: () => asyncJobManager,
-			waitForUserSteering: signal => {
-				if (agent) return agent.waitForSteeringArrival(signal);
-				const { promise, resolve } = Promise.withResolvers<void>();
-				if (signal.aborted) resolve();
-				else signal.addEventListener("abort", () => resolve(), { once: true });
+			waitForUserSteering: (signal, options) => {
+				if (agent) return agent.waitForSteeringArrival(signal, options);
+				const { promise, resolve } = Promise.withResolvers<number | undefined>();
+				if (signal.aborted) resolve(undefined);
+				else signal.addEventListener("abort", () => resolve(undefined), { once: true });
 				return promise;
 			},
+			getSteeringArrivalSeq: () => agent?.steeringArrivalSeq ?? 0,
 			// Subagents inherit the parent's manager; its registered endpoint is
 			// authoritative for owned-registration keying and endpoint-first
 			// manager lookup (the child's own id is never registered), so tools

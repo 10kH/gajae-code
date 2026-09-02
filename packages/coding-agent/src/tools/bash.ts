@@ -1144,39 +1144,52 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	 * consumption until the tool finishes, so neither may fold. The
 	 * auto-background setting is deliberately not consulted: like the chord,
 	 * a steer fold is a user action.
+	 *
+	 * Fails closed: a session that cannot prove its interrupt mode or report
+	 * steering arrivals is not steer-foldable.
 	 */
 	#steerFoldEnabled(): boolean {
-		if (!this.session.waitForUserSteering || !this.session.requestForegroundBashBackground) return false;
+		const { waitForUserSteering, getSteeringArrivalSeq, getInterruptMode, requestForegroundBashBackground } =
+			this.session;
+		if (!waitForUserSteering || !getSteeringArrivalSeq || !getInterruptMode || !requestForegroundBashBackground)
+			return false;
 		if (this.session.settings.get("busyPromptMode") !== "steer") return false;
-		return (this.session.getInterruptMode?.() ?? "immediate") === "immediate";
+		return getInterruptMode() === "immediate";
 	}
 
 	/**
-	 * Fold `adapter` on the next queued user steer once the wait has run for
-	 * {@link STEER_FOLD_GRACE_MS} since `startedAt`. Returns a stop function;
-	 * call it when the wait settles so a late steer no longer folds anything.
+	 * Fold `adapter` on the first user steer that ARRIVES after the wait has run
+	 * for {@link STEER_FOLD_GRACE_MS} since `startedAt`. A steer already queued
+	 * when the wait starts, or one that arrives inside the grace window, never
+	 * folds: the command finishes normally and that steer is consumed at the
+	 * ordinary tool boundary. The watcher keeps observing so a later qualifying
+	 * steer still folds. Returns a stop function; call it when the wait settles.
 	 * No-op when steer folding is gated off.
 	 */
 	#watchSteerForFold(adapter: FoldAdapter, startedAt: number): () => void {
 		if (!this.#steerFoldEnabled()) return () => {};
 		const waitForSteer = this.session.waitForUserSteering;
+		const getArrivalSeq = this.session.getSteeringArrivalSeq;
 		const requestFold = this.session.requestForegroundBashBackground;
-		if (!waitForSteer || !requestFold) return () => {};
+		if (!waitForSteer || !getArrivalSeq || !requestFold) return () => {};
 		const watch = new AbortController();
-		void waitForSteer(watch.signal)
-			.then(async () => {
-				if (watch.signal.aborted) return;
-				const remaining = STEER_FOLD_GRACE_MS - (Date.now() - startedAt);
-				if (remaining > 0) await Bun.sleep(remaining);
-				if (watch.signal.aborted) return;
+		const observe = async (): Promise<void> => {
+			let after = getArrivalSeq();
+			while (!watch.signal.aborted) {
+				const seq = await waitForSteer(watch.signal, { after });
+				if (seq === undefined || watch.signal.aborted) return;
+				after = seq;
+				if (Date.now() - startedAt < STEER_FOLD_GRACE_MS) continue;
 				await requestFold("steer", adapter);
-			})
-			.catch((error: unknown) => {
-				logger.warn("Steer-triggered fold failed", {
-					jobId: adapter.jobId,
-					error: error instanceof Error ? error.message : String(error),
-				});
+				return;
+			}
+		};
+		observe().catch((error: unknown) => {
+			logger.warn("Steer-triggered fold failed", {
+				jobId: adapter.jobId,
+				error: error instanceof Error ? error.message : String(error),
 			});
+		});
 		return () => watch.abort();
 	}
 
