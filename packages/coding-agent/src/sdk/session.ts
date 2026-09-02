@@ -1106,7 +1106,8 @@ function buildMCPPromptCommands(manager: MCPManager): LoadedCustomCommand[] {
 function withEmbeddedDefaultGjcSkills(skills: Skill[]): Skill[] {
 	const byName = new Map<string, Skill>();
 	for (const skill of skills) {
-		byName.set(skill.name.toLowerCase(), skill);
+		const key = skill.name.toLowerCase();
+		if (!byName.has(key)) byName.set(key, skill);
 	}
 	// The four public GJC workflow skills are a product invariant: even if a
 	// caller-supplied or filesystem skill shares a name, the bundled definition

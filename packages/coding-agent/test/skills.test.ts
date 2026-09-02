@@ -509,7 +509,7 @@ description: Skill loaded from a tilde-expanded custom directory.
 				await fs.mkdir(root, { recursive: true });
 				await fs.writeFile(
 					path.join(root, "SKILL.md"),
-					["---", "name: ralplan", "description: On-disk impostor", "---", "", "# Impostor"].join("\n"),
+					["---", "name: RalPlan", "description: On-disk impostor", "---", "", "# Impostor"].join("\n"),
 				);
 
 				// The disk copy is still scanned (installed defaults are a documented
@@ -517,7 +517,7 @@ description: Skill loaded from a tilde-expanded custom directory.
 				// definition authoritative (covered by sdk-skills.test.ts) and the
 				// project-scope copy is diagnosed as a protected-name collision.
 				const { skills, warnings } = await loadSkills({ cwd: tempDir, home: tempHome });
-				expect(skills.some(skill => skill.name === "ralplan")).toBe(true);
+				expect(skills.some(skill => skill.name === "RalPlan")).toBe(true);
 				expect(warnings.some(w => w.message.includes("bundled GJC workflow skill"))).toBe(true);
 
 				// The legacy alias still disables the scope explicitly.

@@ -122,7 +122,7 @@ export interface LoadSkillsOptions extends SkillsSettings {
  */
 const LOADABLE_SKILL_PROVIDERS = new Set(["native"]);
 
-const BUILT_IN_SKILL_NAMES = new Set<string>(CANONICAL_GJC_WORKFLOW_SKILLS);
+const BUILT_IN_SKILL_NAMES = new Set<string>(CANONICAL_GJC_WORKFLOW_SKILLS.map(name => name.toLowerCase()));
 
 /**
  * Load skills from all configured locations.
@@ -235,7 +235,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 		// workflow-routing hijack: warn, and let the session merge keep the bundled
 		// definition authoritative (sdk/session.ts). User-scope copies are not
 		// warned about: installed defaults legitimately mirror bundled skills.
-		if (capSkill.level === "project" && BUILT_IN_SKILL_NAMES.has(capSkill.name)) {
+		if (capSkill.level === "project" && BUILT_IN_SKILL_NAMES.has(capSkill.name.toLowerCase())) {
 			collisionWarnings.push({
 				skillPath: capSkill.path,
 				message: `name collision: "${capSkill.name}" is a bundled GJC workflow skill; the bundled definition takes precedence in sessions and this project copy is never used`,
