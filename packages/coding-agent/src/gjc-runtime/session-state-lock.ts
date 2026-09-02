@@ -78,8 +78,8 @@ async function waitForLockRetry(budget: LockRetryBudget): Promise<boolean> {
  * owner record is the sibling `<file>.lock.transition.owner`. `mkdir` admits exactly one
  * contender, while the held directory prevents a successor until release unlinks the
  * validated sidecar and atomically `rmdir`s the claim. A crash before either step leaves a
- * fail-closed directory for explicit recovery; concurrent automatic reclaim cannot prove
- * that a directory + sibling sidecar still name the claim it inspected.
+ * directory that a successor may reclaim only with proof: a host-qualified owner whose pid
+ * is proven dead, plus an exact directory-generation and tree match at removal time.
  *
  * The separate sidecar keeps the claim directory empty, which is what makes `rmdir` the
  * identity-safe portable release primitive. The path stays distinct from `<file>.lock`
@@ -1594,9 +1594,13 @@ async function reclaimStaleTransitionClaim(transitionDir: string, quarantineName
 		const legacyHost = await currentLegacyOwnerHostId();
 		if (owner.owner_host_id !== currentHost && owner.owner_host_id !== legacyHost) return;
 		if (Date.now() - Number(ownerSnapshot.mtimeNs / 1_000_000n) < RELEASED_TRANSITION_GRACE_MS) return;
-	} else {
-		if (process.platform !== "win32") return;
-		if (await lockOwnerIsAlive(owner)) return;
+	} else if (await lockOwnerIsAlive(owner)) {
+		// Only a host-qualified owner whose pid is PROVEN dead (ESRCH, or a live pid
+		// with a provably different incarnation) authorizes reclaim. The generation
+		// + exact-tree checks below then bind the removal to the very directory
+		// inspected here, on every platform; a claim stranded by a force-quit
+		// (`postmortem.quit`) would otherwise wall the session directory forever.
+		return;
 	}
 	const generation = transitionGenerationFromStat(stat);
 	const nativePath = await canonicalOwnedTransitionPath(transitionDir).catch(() => null);
