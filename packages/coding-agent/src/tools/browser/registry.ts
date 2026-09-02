@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import type { Subprocess } from "bun";
@@ -63,6 +64,17 @@ const browsers = new Map<string, BrowserHandle>();
 const browserOpenPromises = new Map<string, Promise<BrowserHandle>>();
 
 /**
+ * Chrome profile warm-up dirs this module created, keyed by the handle that owns one.
+ *
+ * Ownership is a registry-internal fact, not a property of the handle: `BrowserHandle`
+ * is exported and mutable, so a field would let any caller point recursive deletion at
+ * an arbitrary path. Recording the dir here — only on the launch path that created it —
+ * means disposal can delete exactly what this module made and nothing else. A path
+ * prefix check would not prove ownership; an entry in this map does.
+ */
+const ownedWarmupDirs = new WeakMap<BrowserHandle, string>();
+
+/**
  * Upper bound on the CDP `browser.close()` round-trip during a forced (signal-path)
  * teardown before we fall back to killing the Chrome process tree. Only applies when
  * `kill` is set; graceful release still awaits close() unbounded.
@@ -115,6 +127,19 @@ export function browserKeyForTest(
 ): string {
 	const geo = kind.kind === "headless" ? normalizeGeo(opts.geo) : undefined;
 	return browserKey(kind, geo, opts.profileReuse);
+}
+
+/**
+ * Create and register a warm-up dir as registry-owned for `handle`.
+ *
+ * Exists so tests can exercise disposal without spawning Chrome. The caller cannot
+ * supply the deletion target: this module creates the directory itself before recording
+ * ownership, preserving the same invariant as the production launch path.
+ */
+export function createOwnedWarmupDirForTest(handle: BrowserHandle): string {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-profile-warmup-"));
+	ownedWarmupDirs.set(handle, dir);
+	return dir;
 }
 
 export async function acquireBrowser(kind: BrowserKind, opts: AcquireBrowserOptions): Promise<BrowserHandle> {
@@ -172,13 +197,21 @@ async function openBrowserHandle(
 				profileWarmupDir = reuse.warmupDir;
 			}
 		}
-		const browser = await launchHeadlessBrowser({
-			headless: kind.headless,
-			viewport: opts.viewport,
-			profileWarmupDir,
-			...(geo ? { geo } : {}),
-		});
-		return {
+		let browser: Browser;
+		try {
+			browser = await launchHeadlessBrowser({
+				headless: kind.headless,
+				viewport: opts.viewport,
+				profileWarmupDir,
+				...(geo ? { geo } : {}),
+			});
+		} catch (error) {
+			// Launch failed after the warm-up copy landed: drop the temp dir here,
+			// because no handle will exist to carry it into releaseBrowser().
+			removeWarmupDir(profileWarmupDir);
+			throw error;
+		}
+		const handle: BrowserHandle = {
 			key,
 
 			kind,
@@ -188,6 +221,11 @@ async function openBrowserHandle(
 			refCount: 0,
 			stealth: { browserSession: null, override: null },
 		};
+		// Record ownership only here, where this module created the dir. Disposal
+		// deletes solely what this map holds, so a caller-supplied path is never
+		// a deletion target.
+		if (profileWarmupDir) ownedWarmupDirs.set(handle, profileWarmupDir);
+		return handle;
 	}
 	if (kind.kind === "connected") {
 		const cdpUrl = kind.cdpUrl.replace(/\/+$/, "");
@@ -438,6 +476,35 @@ export async function releaseBrowser(handle: BrowserHandle, opts: { kill: boolea
 	}
 }
 
+/**
+ * Delete the warm-up dir this module created for `handle`, if any.
+ *
+ * The path comes from `ownedWarmupDirs`, never from the caller, so recursive deletion
+ * can only ever target a dir this registry made. The entry is consumed first, making a
+ * second call a no-op even if disposal runs twice.
+ *
+ * Best-effort: a leftover temp dir is preferable to a teardown that throws.
+ */
+function removeOwnedWarmupDir(handle: BrowserHandle): void {
+	const dir = ownedWarmupDirs.get(handle);
+	if (dir === undefined) return;
+	ownedWarmupDirs.delete(handle);
+	removeWarmupDir(dir);
+}
+
+/** Delete a dir this module created. Callers must have proven ownership first. */
+function removeWarmupDir(dir: string | undefined): void {
+	if (!dir) return;
+	try {
+		fs.rmSync(dir, { recursive: true, force: true });
+	} catch (err) {
+		logger.debug("Failed to remove Chrome profile warm-up dir", {
+			dir,
+			error: (err as Error).message,
+		});
+	}
+}
+
 async function disposeBrowserHandle(handle: BrowserHandle, opts: { kill: boolean }): Promise<void> {
 	if (handle.kind.kind === "headless") {
 		// Capture the launched Chrome process before close() so a forced (signal-path)
@@ -456,6 +523,9 @@ async function disposeBrowserHandle(handle: BrowserHandle, opts: { kill: boolean
 			}
 		}
 		if (opts.kill && proc?.pid !== undefined) await gracefulKillTreeOnce(proc.pid);
+		// Chrome owns files under the warm-up dir until the process is gone, so this
+		// runs after close()/kill rather than alongside them.
+		removeOwnedWarmupDir(handle);
 		return;
 	}
 	if (handle.kind.kind === "connected") {
