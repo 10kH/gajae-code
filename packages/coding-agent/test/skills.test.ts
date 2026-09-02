@@ -9,6 +9,7 @@ import {
 	loadSkills,
 	loadSkillsFromDir,
 	parseSkillInvocations,
+	resolveSkillSlashCommands,
 	type Skill,
 } from "@gajae-code/coding-agent/extensibility/skills";
 import { safeRm } from "../../../scripts/safe-cleanup";
@@ -72,6 +73,31 @@ describe("parseSkillInvocations", () => {
 			{ commandName: "skill:alpha", args: "use and for this", skill: alpha },
 			{ commandName: "skill:beta", args: "use and for this", skill: beta },
 		]);
+	});
+
+	it("matches canonical skill invocations case-insensitively", () => {
+		expect(parseSkillInvocations("/Skill:alpha first /SKILL:beta second", skillsByCommandName)).toEqual([
+			{ commandName: "Skill:alpha", args: "first", skill: alpha },
+			{ commandName: "SKILL:beta", args: "second", skill: beta },
+		]);
+	});
+
+	it("deduplicates case-only skill command names consistently", () => {
+		const first = makeSkill("Foo");
+		const second = makeSkill("foo");
+
+		expect(resolveSkillSlashCommands([first, second], new Set())).toEqual([
+			{ name: "skill:Foo", description: "Foo description", skill: first },
+		]);
+		expect(
+			parseSkillInvocations(
+				"/SKILL:foo",
+				new Map([
+					["skill:Foo", first],
+					["skill:foo", second],
+				]),
+			),
+		).toEqual([{ commandName: "SKILL:foo", args: "", skill: first }]);
 	});
 
 	it("does not treat aliases or unknown leading skill commands as invocations", () => {

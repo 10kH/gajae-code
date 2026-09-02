@@ -358,7 +358,7 @@ export function getSkillSlashCommandName(skill: Pick<Skill, "name">): string {
 }
 
 export function isNamespacedSkillSlashCommandName(commandName: string): boolean {
-	return commandName.startsWith("skill:");
+	return commandName.toLowerCase().startsWith("skill:");
 }
 
 export function getSkillSlashCommandNames(skill: Pick<Skill, "name">): string[] {
@@ -366,7 +366,7 @@ export function getSkillSlashCommandNames(skill: Pick<Skill, "name">): string[] 
 }
 
 export function isSkillSlashCommandName(commandName: string, skill: Pick<Skill, "name">): boolean {
-	return commandName === getSkillSlashCommandName(skill);
+	return commandName.toLowerCase() === getSkillSlashCommandName(skill).toLowerCase();
 }
 
 export interface ResolvedSkillSlashCommand {
@@ -410,12 +410,19 @@ export function parseSkillInvocations(
 ): ParsedSkillInvocation[] {
 	const trimmedText = text.trim();
 	if (!trimmedText) return [];
-	const canonicalSkillCommandPattern = /(^|\s)\/(skill:[^\s]+)/g;
+	const normalizedSkillsByCommandName = new Map<string, Skill>();
+	for (const [commandName, skill] of skillsByCommandName) {
+		const normalizedCommandName = commandName.toLowerCase();
+		if (!normalizedSkillsByCommandName.has(normalizedCommandName)) {
+			normalizedSkillsByCommandName.set(normalizedCommandName, skill);
+		}
+	}
+	const canonicalSkillCommandPattern = /(^|\s)\/(skill:[^\s]+)/gi;
 	const matches: SkillTokenMatch[] = [];
 	for (const match of trimmedText.matchAll(canonicalSkillCommandPattern)) {
 		const commandName = match[2];
 		if (!commandName) continue;
-		const skill = skillsByCommandName.get(commandName);
+		const skill = normalizedSkillsByCommandName.get(commandName.toLowerCase());
 		if (!skill) continue;
 		const leading = match[1] ?? "";
 		const index = (match.index ?? 0) + leading.length;
@@ -458,10 +465,11 @@ export function resolveSkillSlashCommands(
 	for (const skill of skills) {
 		if (skill.hide === true) continue;
 		for (const name of getSkillSlashCommandNames(skill)) {
-			if (claimedNames.has(name)) {
+			const normalizedName = name.toLowerCase();
+			if (claimedNames.has(normalizedName)) {
 				continue;
 			}
-			claimedNames.add(name);
+			claimedNames.add(normalizedName);
 			commands.push({ name, description: skill.description, skill });
 		}
 	}

@@ -5,6 +5,7 @@ import {
 	type CombinedAutocompleteProvider,
 	extractSlashCommandTokenPrefix,
 	isInsideInlineCodeSpan,
+	isSkillSlashCommandToken,
 	isSlashCommandPromptStart,
 } from "../autocomplete";
 import { BracketedPasteHandler } from "../bracketed-paste";
@@ -1439,7 +1440,7 @@ export class Editor implements Component, Focusable {
 				const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
 				if (
 					(this.#isInSubmittedSlashCommandContext() ||
-						this.#getSlashTokenBeforeCursor()?.startsWith("/skill") === true) &&
+						this.#getSlashTokenBeforeCursor()?.toLowerCase().startsWith("/skill") === true) &&
 					this.#autocompleteProvider?.trySyncSlashCompletion
 				) {
 					const syncResult = this.#autocompleteProvider.trySyncSlashCompletion(textBeforeCursor);
@@ -2895,10 +2896,18 @@ export class Editor implements Component, Focusable {
 	}
 
 	#getSlashTokenBeforeCursor(): string | null {
-		if (!this.#hasOnlyWhitespaceBeforeCursorLine()) return null;
 		const currentLine = this.#state.lines[this.#state.cursorLine] || "";
 		const beforeCursor = currentLine.slice(0, this.#state.cursorCol);
-		return extractSlashCommandTokenPrefix(beforeCursor.trimStart());
+		const token = extractSlashCommandTokenPrefix(beforeCursor.trimStart());
+		if (!token) return null;
+		const tokenStart = beforeCursor.length - token.length;
+		const textBeforeToken = [
+			...this.#state.lines.slice(0, this.#state.cursorLine),
+			beforeCursor.slice(0, tokenStart),
+		].join("\n");
+		if (isInsideInlineCodeSpan(textBeforeToken)) return null;
+		if (isSkillSlashCommandToken(token)) return token;
+		return this.#hasOnlyWhitespaceBeforeCursorLine() ? token : null;
 	}
 
 	#isInSlashTokenContext(): boolean {

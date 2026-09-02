@@ -296,6 +296,7 @@ import type { SessionSwitchEvent } from "../extensibility/shared-events";
 import {
 	buildSkillPromptMessage,
 	getSkillSlashCommandName,
+	isNamespacedSkillSlashCommandName,
 	parseSkillInvocations,
 	type Skill,
 	type SkillWarning,
@@ -11363,7 +11364,12 @@ export class AgentSession {
 		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 
-		if (expandPromptTemplates && text.startsWith("/skill:") && !options?.images?.length) {
+		if (
+			expandPromptTemplates &&
+			text.startsWith("/") &&
+			isNamespacedSkillSlashCommandName(text.slice(1)) &&
+			!options?.images?.length
+		) {
 			const skillCommands = new Map(this.skills.map(skill => [getSkillSlashCommandName(skill), skill]));
 			const invocations = parseSkillInvocations(text, skillCommands);
 			if (invocations.length === 1) {

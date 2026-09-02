@@ -257,9 +257,18 @@ export function isInsideInlineCodeSpan(text: string): boolean {
 	return findOpenInlineCodeSpanStart(text) !== null;
 }
 
+export function isSkillSlashCommandToken(text: string): boolean {
+	return /^\/skill(?::|-)/i.test(text);
+}
+
 export function extractSlashCommandTokenPrefix(text: string): string | null {
-	if (!text.startsWith("/") || /[\s]/.test(text) || text.slice(1).includes("/")) return null;
-	return text;
+	const match = text.match(/(?:^|\s)(\/[^\s]*)$/);
+	const token = match?.[1];
+	if (!token || token.slice(1).includes("/")) return null;
+
+	const tokenStart = text.length - token.length;
+	if (isInsideInlineCodeSpan(text.slice(0, tokenStart))) return null;
+	return tokenStart === 0 || isSkillSlashCommandToken(token) ? token : null;
 }
 export function isSlashCommandPromptStart(lines: string[], cursorLine: number, textBeforeCursor: string): boolean {
 	return lines.slice(0, cursorLine).every(line => line.trim() === "") && textBeforeCursor.trimStart().startsWith("/");

@@ -6,6 +6,7 @@ import {
 	CombinedAutocompleteProvider,
 	extractSlashCommandTokenPrefix,
 	getSlashCommandMatchRank,
+	isInsideInlineCodeSpan,
 	normalizeFuzzyText,
 	type SlashCommand,
 } from "@gajae-code/tui";
@@ -160,6 +161,17 @@ function getSlashTokenPrefix(textBeforeCursor: string): string | null {
 	return extractSlashCommandTokenPrefix(textBeforeCursor);
 }
 
+function isSlashTokenInsideInlineCodeSpan(
+	lines: string[],
+	cursorLine: number,
+	textBeforeCursor: string,
+	prefix: string,
+): boolean {
+	const tokenStart = textBeforeCursor.length - prefix.length;
+	const textBeforeToken = [...lines.slice(0, cursorLine), textBeforeCursor.slice(0, tokenStart)].join("\n");
+	return isInsideInlineCodeSpan(textBeforeToken);
+}
+
 export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 	#baseProvider: CombinedAutocompleteProvider;
 	#actions: PromptActionDefinition[];
@@ -212,7 +224,7 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 		}
 
 		const slashPrefix = getSlashTokenPrefix(textBeforeCursor);
-		if (slashPrefix) {
+		if (slashPrefix && !isSlashTokenInsideInlineCodeSpan(lines, cursorLine, textBeforeCursor, slashPrefix)) {
 			const baseSuggestions = withoutSkillCommandSuggestions(
 				await this.#baseProvider.getSuggestions(lines, cursorLine, cursorCol),
 			);
@@ -282,12 +294,13 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 			const currentLine = lines[cursorLine] || "";
 			const beforePrefix = currentLine.slice(0, cursorCol - prefix.length);
 			const afterCursor = currentLine.slice(cursorCol);
+			const separator = afterCursor.length === 0 ? " " : "";
 			const newLines = [...lines];
-			newLines[cursorLine] = `${beforePrefix}/${item.value} ${afterCursor}`;
+			newLines[cursorLine] = `${beforePrefix}/${item.value}${separator}${afterCursor}`;
 			return {
 				lines: newLines,
 				cursorLine,
-				cursorCol: beforePrefix.length + item.value.length + 2,
+				cursorCol: beforePrefix.length + item.value.length + 1 + separator.length,
 			};
 		}
 		return this.#baseProvider.applyCompletion(lines, cursorLine, cursorCol, item, prefix);
