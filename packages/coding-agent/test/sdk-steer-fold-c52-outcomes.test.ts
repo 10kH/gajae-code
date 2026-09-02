@@ -11,8 +11,13 @@ import { createMockModel, type MockResponse, registerMockApi } from "@gajae-code
 import { TempDir } from "@gajae-code/utils";
 import { AsyncJobManager } from "../src/async";
 import { Settings } from "../src/config/settings";
+import type { ExtensionContextActions, ExtensionUIContext } from "../src/extensibility/extensions/types";
+import { ExtensionUiController } from "../src/modes/controllers/extension-ui-controller";
+import { initializeExtensions } from "../src/modes/runtime-init";
+import type { InteractiveModeContext } from "../src/modes/types";
 import { type CreateAgentSessionResult, createAgentSession } from "../src/sdk";
 import { OPERATIONS } from "../src/sdk/protocol/operation-registry";
+import type { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { bashBackgroundControlError } from "../src/session/fold-coordinator";
 import { SessionManager } from "../src/session/session-manager";
@@ -30,6 +35,45 @@ async function waitFor(predicate: () => boolean, timeoutMs = 10_000): Promise<vo
 		await Bun.sleep(10);
 	}
 	throw new Error("Timed out waiting for C52 outcome state");
+}
+
+type SdkControl = NonNullable<ExtensionContextActions["sdkControl"]>;
+
+/**
+ * Capture the REAL C52 dispatcher of the named surface by initializing it
+ * against `session` with a stub runner, exactly as production does, and
+ * returning its `sdkControl` action.
+ */
+async function captureSdkControl(
+	dispatcher: "runtime-init" | "extension-ui-controller",
+	session: AgentSession,
+): Promise<SdkControl> {
+	let captured: ExtensionContextActions | undefined;
+	const runner = {
+		initialize(_actions: unknown, actions: ExtensionContextActions): void {
+			captured = actions;
+		},
+		onError: () => {},
+		emit: async () => undefined,
+	};
+	// `#private` fields require the real receiver, so forward through a proxy
+	// that binds methods to the live session and overrides only the runner.
+	const target = new Proxy(session, {
+		get(receiver, property) {
+			if (property === "extensionRunner") return runner;
+			const value = Reflect.get(receiver, property, receiver);
+			return typeof value === "function" ? value.bind(receiver) : value;
+		},
+	});
+	if (dispatcher === "runtime-init") {
+		await initializeExtensions(target, { reportSendError: () => {}, reportRuntimeError: () => {} });
+	} else {
+		const controller = new ExtensionUiController({ session: target } as unknown as InteractiveModeContext);
+		controller.initializeHookRunner({} as ExtensionUIContext, false);
+	}
+	const sdkControl = captured?.sdkControl;
+	if (!sdkControl) throw new Error(`${dispatcher} did not expose sdkControl`);
+	return sdkControl;
 }
 
 async function createScenario(options: { autoBackground?: boolean; thresholdMs?: number } = {}): Promise<LiveScenario> {
@@ -145,7 +189,7 @@ describe("C52 bash.background outcomes after prior folds", () => {
 		);
 	}, 30_000);
 
-	test("the public C52 contract maps every non-folded outcome to its declared error code and both dispatchers share the mapper", async () => {
+	test("the public C52 contract maps every non-folded outcome to its declared error code", () => {
 		expect(bashBackgroundControlError({ status: "already_backgrounded" })).toMatchObject({
 			code: "already_backgrounded",
 		});
@@ -154,33 +198,30 @@ describe("C52 bash.background outcomes after prior folds", () => {
 			code: "not_foldable",
 			message: expect.stringContaining("the wait settled"),
 		});
-		// Every code the mapper can produce is a declared C52 error code, and vice versa.
 		const declared = OPERATIONS.find(operation => operation.sdkId === "bash.background")?.errorCodes ?? [];
 		expect(new Set(declared)).toEqual(new Set(["not_foldable", "already_backgrounded", "no_active_bash"]));
+	});
 
-		// The two dispatchers are the only C52 entry points and both go through the typed outcome + shared mapper.
-		for (const file of ["../src/modes/runtime-init.ts", "../src/modes/controllers/extension-ui-controller.ts"]) {
-			const source = await Bun.file(new URL(file, import.meta.url)).text();
-			const dispatcher = source.slice(source.indexOf('case "bash.background"'));
-			const body = dispatcher.slice(0, dispatcher.indexOf("case ", 10));
-			expect(body).toContain('requestForegroundBashBackgroundOutcome("sdk_control")');
-			expect(body).toContain("bashBackgroundControlError(outcome)");
-			expect(body).toContain("return { backgrounded: true, jobId: outcome.jobId }");
-		}
+	for (const dispatcher of ["runtime-init", "extension-ui-controller"] as const) {
+		test(`bash.background through the ${dispatcher} dispatcher returns { backgrounded, jobId } on a fresh fold, then already_backgrounded, then no_active_bash`, async () => {
+			const scenario = await createScenario();
+			scenarios.push(scenario);
+			const { session } = scenario.created;
+			const sdkControl = await captureSdkControl(dispatcher, session);
 
-		// End to end through the dispatcher-equivalent path: after a steer fold the
-		// public control reports already_backgrounded, never not_foldable.
-		const scenario = await createScenario();
-		scenarios.push(scenario);
-		const run = scenario.created.session.prompt("start a command for a control probe");
-		await waitFor(() => scenario.created.session.hasForegroundBashBackgroundRequestHandler());
-		const fresh = await scenario.created.session.requestForegroundBashBackgroundOutcome("sdk_control");
-		expect(fresh).toEqual({ status: "folded", jobId: expect.stringMatching(/^bg_\d+$/) });
-		await run;
-		const repeat = await scenario.created.session.requestForegroundBashBackgroundOutcome("sdk_control");
-		expect(repeat.status).toBe("already_backgrounded");
-		if (repeat.status === "folded") throw new Error("unreachable");
-		expect(bashBackgroundControlError(repeat)).toMatchObject({ code: "already_backgrounded" });
-		await waitFor(() => (scenario.created.session.getAsyncJobSnapshot()?.running.length ?? 0) === 0, 5_000);
-	}, 20_000);
+			await expect(sdkControl("bash.background", {})).rejects.toMatchObject({ code: "no_active_bash" });
+
+			const run = session.prompt("start a command for a control probe");
+			await waitFor(() => session.hasForegroundBashBackgroundRequestHandler());
+			expect(await sdkControl("bash.background", {})).toEqual({
+				backgrounded: true,
+				jobId: expect.stringMatching(/^bg_\d+$/),
+			});
+			await run;
+			await expect(sdkControl("bash.background", {})).rejects.toMatchObject({ code: "already_backgrounded" });
+
+			await waitFor(() => (session.getAsyncJobSnapshot()?.running.length ?? 0) === 0, 5_000);
+			await expect(sdkControl("bash.background", {})).rejects.toMatchObject({ code: "no_active_bash" });
+		}, 20_000);
+	}
 });

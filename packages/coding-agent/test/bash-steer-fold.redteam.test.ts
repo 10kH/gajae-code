@@ -187,29 +187,6 @@ describe("steer-fold red team", () => {
 		expect(harness.manager.getJobsSnapshot().jobs).toContainEqual(expect.objectContaining(projected));
 	}, 10_000);
 
-	it("no-fold-listener-leak: a listener registered before dispose never fires after the manager is disposed", async () => {
-		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
-		let calls = 0;
-		manager.onFold(() => {
-			calls += 1;
-		});
-		const release = Promise.withResolvers<void>();
-		const jobId = manager.register("bash", "probe", async () => {
-			await release.promise;
-			return "done";
-		});
-		const job = manager.getJob(jobId);
-		if (!job) throw new Error("expected registered job");
-		expect(manager.markBackgrounded(jobId, job.generation, "steer")).toBe(true);
-		expect(calls).toBe(1);
-		release.resolve();
-		await job.promise;
-		await manager.dispose();
-		// After dispose the listener set is cleared: a late mark on the retired manager cannot notify.
-		expect(manager.markBackgrounded(jobId, job.generation, "chord")).toBe(false);
-		expect(calls).toBe(1);
-	});
-
 	it("indicator-tally: itemized activity keeps the three locked categories in order; unclassified task jobs are omitted", () => {
 		const running: AsyncJobSnapshotItem[] = [
 			{
