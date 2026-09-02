@@ -11,7 +11,7 @@
  */
 import * as crypto from "node:crypto";
 import { logger } from "@gajae-code/utils";
-import { timingSafeEqual } from "../auth-gateway/http";
+import { isNoAuthBrowserOriginRequest, timingSafeEqual } from "../auth-gateway/http";
 import type { AuthStorage } from "../auth-storage";
 import type { Provider } from "../types";
 import { assertAuthenticatedOrLoopback, parseBind } from "../utils/parse-bind";
@@ -593,6 +593,15 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 				if (req.method === "GET" && pathname === "/v1/healthz") {
 					const body: HealthzResponse = { ok: true, version };
 					return json(200, body);
+				}
+				if (isNoAuthBrowserOriginRequest(req, tokens)) {
+					logger.info("auth-broker no-auth browser-origin request rejected", {
+						method: req.method,
+						path: pathname,
+						peer,
+						origin: req.headers.get("origin"),
+					});
+					return json(403, { error: "no-auth rejects requests carrying Origin" });
 				}
 				if (!isAuthorized(req, tokens)) {
 					logger.info("auth-broker request unauthorized", { method: req.method, path: pathname, peer });

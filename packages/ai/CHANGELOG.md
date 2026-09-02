@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Tokenless loopback auth-broker requests carrying a browser `Origin` header are now rejected before credential reads or mutations. Native loopback clients without `Origin`, authenticated browser-origin clients, and the public health endpoint retain their existing behavior.
+
 ## [0.16.0] - 2026-09-02
 
 ### Added
