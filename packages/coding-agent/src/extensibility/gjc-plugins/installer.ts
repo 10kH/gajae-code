@@ -54,6 +54,11 @@ export type GjcBundleTransactionResult =
 const TAR_MAX_FILES = 8192;
 const TAR_MAX_FILE_BYTES = 16 * 1024 * 1024;
 const TAR_MAX_TOTAL_BYTES = 128 * 1024 * 1024;
+// Preserve the existing aggregate file budget plus the maximum per-entry
+// header/padding overhead and the two terminating TAR blocks.
+const TAR_MAX_ARCHIVE_BYTES = TAR_MAX_TOTAL_BYTES + TAR_MAX_FILES * 1024 + 1024;
+// A gzip stream can be slightly larger than its incompressible TAR payload.
+const TAR_MAX_COMPRESSED_BYTES = TAR_MAX_ARCHIVE_BYTES + 1024 * 1024;
 
 function scopeRoot(scope: GjcPluginScope, cwd: string): string {
 	return scope === "user" ? gjcPluginUserRoot() : gjcPluginProjectRoot(cwd);
@@ -93,6 +98,45 @@ export class GjcPluginSourceUnavailableError extends Error {
 		super("GJC plugin source is unavailable");
 		this.name = "GjcPluginSourceUnavailableError";
 	}
+}
+
+async function readTarballInput(tarPath: string, maxBytes: number): Promise<Buffer> {
+	let file: fs.FileHandle;
+	try {
+		file = await fs.open(tarPath, "r");
+	} catch {
+		throw new GjcPluginSourceUnavailableError();
+	}
+	try {
+		const stat = await file.stat();
+		if (!stat.isFile()) throw new GjcPluginSourceUnavailableError();
+		if (stat.size > maxBytes) {
+			throw new GjcPluginLoadError("security_policy", "GJC plugin tarball exceeds the archive input limit");
+		}
+		const raw = Buffer.allocUnsafe(stat.size);
+		let offset = 0;
+		while (offset < raw.byteLength) {
+			const { bytesRead } = await file.read(raw, offset, raw.byteLength - offset, offset);
+			if (bytesRead === 0) {
+				throw new GjcPluginLoadError("security_policy", "GJC plugin tarball changed while being read");
+			}
+			offset += bytesRead;
+		}
+		const probe = Buffer.allocUnsafe(1);
+		if ((await file.read(probe, 0, 1, offset)).bytesRead !== 0) {
+			throw new GjcPluginLoadError("security_policy", "GJC plugin tarball changed while being read");
+		}
+		return raw;
+	} catch (error) {
+		if (error instanceof GjcPluginLoadError || error instanceof GjcPluginSourceUnavailableError) throw error;
+		throw new GjcPluginSourceUnavailableError();
+	} finally {
+		await file.close().catch(() => {});
+	}
+}
+
+function isGunzipOutputLimitError(error: unknown): boolean {
+	return typeof error === "object" && error !== null && "code" in error && error.code === "ERR_BUFFER_TOO_LARGE";
 }
 
 interface ResolvedSource {
@@ -136,19 +180,15 @@ function tarHeaderChecksumOk(header: Uint8Array): boolean {
 
 /** Minimal, traversal/symlink-safe, resource-bounded extraction of a tar(.gz). */
 async function extractTarball(tarPath: string, destRoot: string): Promise<void> {
-	// A missing or corrupt archive surfaces as a native fs/zlib error. Translate
-	// it here so callers see the same typed source failure they get for every
-	// other unreachable source, instead of a raw errno escaping the lifecycle.
-	let raw: Buffer;
-	try {
-		raw = await fs.readFile(tarPath);
-	} catch {
-		throw new GjcPluginSourceUnavailableError();
-	}
+	const isGzip = /\.(tgz|tar\.gz)$/i.test(tarPath);
+	const raw = await readTarballInput(tarPath, isGzip ? TAR_MAX_COMPRESSED_BYTES : TAR_MAX_ARCHIVE_BYTES);
 	let buf: Buffer;
 	try {
-		buf = /\.(tgz|tar\.gz)$/i.test(tarPath) ? gunzipSync(raw) : raw;
-	} catch {
+		buf = isGzip ? gunzipSync(raw, { maxOutputLength: TAR_MAX_ARCHIVE_BYTES }) : raw;
+	} catch (error) {
+		if (isGunzipOutputLimitError(error)) {
+			throw new GjcPluginLoadError("security_policy", "GJC plugin tarball exceeds the expansion limit");
+		}
 		throw new GjcPluginLoadError("invalid_manifest", "GJC plugin tarball could not be decompressed");
 	}
 	const resolvedRoot = path.resolve(destRoot);

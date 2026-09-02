@@ -17,6 +17,8 @@
 	SDK-state guard (`maximum supported version is 1`) is documented as never
 	applying to session-index rows so the #5181 crash class cannot recur.
 
+- GJC plugin TAR/TGZ installs now bound archive input and aggregate gzip expansion before extraction, preventing compressed bundles from exhausting memory while preserving valid concatenated gzip members.
+
 ## [0.16.0] - 2026-09-02
 
 - Added master mode (`gjc --master [--scope repo|pwd|global]`) with authenticated, broker-authoritative child orchestration: `gjc sdk spawn` creates task-seeded children, scoped `gjc sdk search` discovers broker-visible sessions with paginated results, and locator v2 session rows carry canonical cwd, worktree-root, and state-root identity.

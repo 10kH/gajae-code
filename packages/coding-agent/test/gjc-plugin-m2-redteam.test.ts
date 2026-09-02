@@ -1,8 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { createWriteStream } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { gzipSync } from "node:zlib";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import { createGzip, gzipSync } from "node:zlib";
 import {
 	applyGjcBundleUpdate,
 	bundleIdentity,
@@ -22,6 +25,8 @@ const fixtureFiles = [
 	"prompts/system-appendix.md",
 	"prompts/executor-appendix.md",
 ];
+const TAR_TEST_ARCHIVE_LIMIT = 128 * 1024 * 1024 + 8192 * 1024 + 1024;
+const TAR_TEST_COMPRESSED_LIMIT = TAR_TEST_ARCHIVE_LIMIT + 1024 * 1024;
 
 afterEach(async () => {
 	for (const dir of tempDirs.splice(0)) {
@@ -125,6 +130,41 @@ async function validBundleTarball(options: { prefix?: string; gzip?: boolean } =
 	return await writeTarball(entries, { gzip: options.gzip });
 }
 
+async function validConcatenatedGzipTarball(): Promise<string> {
+	const entries: TarEntry[] = [];
+	for (const rel of fixtureFiles) {
+		entries.push({ name: rel, data: await fs.readFile(path.join(fixtureRoot, rel)) });
+	}
+	const tar = makeTar(entries);
+	const split = Math.floor(tar.byteLength / 2);
+	const dir = await mkTempDir("gjc-m2-redteam-concatenated-gzip-");
+	const file = path.join(dir, "bundle.tgz");
+	await fs.writeFile(file, Buffer.concat([gzipSync(tar.subarray(0, split)), gzipSync(tar.subarray(split))]));
+	return file;
+}
+
+async function writeGzipExpansionMembers(memberBytes: readonly number[]): Promise<string> {
+	const dir = await mkTempDir("gjc-m2-redteam-gzip-expansion-");
+	const file = path.join(dir, "bundle.tgz");
+	const chunk = Buffer.alloc(1024 * 1024);
+	async function* chunks(bytes: number): AsyncGenerator<Buffer> {
+		let remaining = bytes;
+		while (remaining > 0) {
+			const length = Math.min(remaining, chunk.byteLength);
+			yield length === chunk.byteLength ? chunk : chunk.subarray(0, length);
+			remaining -= length;
+		}
+	}
+	for (const bytes of memberBytes) {
+		await pipeline(Readable.from(chunks(bytes)), createGzip(), createWriteStream(file, { flags: "a" }));
+	}
+	return file;
+}
+
+async function writeGzipExpansion(bytes: number): Promise<string> {
+	return writeGzipExpansionMembers([bytes]);
+}
+
 async function makeBundleCopy(name: string, extra?: (dir: string) => Promise<void>): Promise<string> {
 	const dir = await mkTempDir("gjc-m2-redteam-bundle-");
 	await fs.cp(fixtureRoot, dir, { recursive: true });
@@ -196,6 +236,76 @@ describe("GJC plugin installer M2 red-team", () => {
 		expect(await exists(path.join(cwd, ".gjc", "gjc-plugins", "valid-six-surface-bundle", "gajae-plugin.json"))).toBe(
 			true,
 		);
+	});
+
+	test("installs a valid tarball split across concatenated gzip members", async () => {
+		const cwd = await mkProjectCwd();
+		const tarball = await validConcatenatedGzipTarball();
+
+		const result = await installGjcBundle({ cwd }, "project", tarball);
+
+		expect(result).toMatchObject({ ok: true, value: { status: "installed" } });
+		expect((await readRegistry("project", cwd)).plugins.map(plugin => plugin.name)).toEqual([
+			"valid-six-surface-bundle",
+		]);
+	});
+
+	test("rejects aggregate gzip output beyond the tar archive budget", async () => {
+		const cwd = await mkProjectCwd();
+		const tarball = await writeGzipExpansion(TAR_TEST_ARCHIVE_LIMIT + 1);
+
+		await expect(installGjcBundle({ cwd }, "project", tarball)).rejects.toMatchObject({
+			code: "security_policy",
+		});
+		expect(await readRegistry("project", cwd)).toMatchObject({ plugins: [] });
+	});
+
+	test("applies the expansion budget across individually bounded concatenated gzip members", async () => {
+		const cwd = await mkProjectCwd();
+		const memberBytes = Math.floor(TAR_TEST_ARCHIVE_LIMIT / 2) + 1;
+		const tarball = await writeGzipExpansionMembers([memberBytes, memberBytes]);
+
+		await expect(installGjcBundle({ cwd }, "project", tarball)).rejects.toMatchObject({
+			code: "security_policy",
+		});
+		expect(await readRegistry("project", cwd)).toMatchObject({ plugins: [] });
+	});
+
+	test("rejects oversized compressed input before reading the archive", async () => {
+		const cwd = await mkProjectCwd();
+		const dir = await mkTempDir("gjc-m2-redteam-oversized-input-");
+		const tarball = path.join(dir, "bundle.tgz");
+		await fs.writeFile(tarball, "");
+		await fs.truncate(tarball, TAR_TEST_COMPRESSED_LIMIT + 1);
+
+		await expect(installGjcBundle({ cwd }, "project", tarball)).rejects.toMatchObject({
+			code: "security_policy",
+		});
+		expect(await readRegistry("project", cwd)).toMatchObject({ plugins: [] });
+	});
+
+	test("keeps malformed gzip archives classified as invalid manifests", async () => {
+		const cwd = await mkProjectCwd();
+		const dir = await mkTempDir("gjc-m2-redteam-malformed-gzip-");
+		const tarball = path.join(dir, "bundle.tgz");
+		await fs.writeFile(tarball, "not a gzip stream");
+
+		await expect(installGjcBundle({ cwd }, "project", tarball)).rejects.toMatchObject({
+			code: "invalid_manifest",
+		});
+		expect(await readRegistry("project", cwd)).toMatchObject({ plugins: [] });
+	});
+
+	test("keeps truncated gzip members classified as invalid manifests", async () => {
+		const cwd = await mkProjectCwd();
+		const tarball = await writeGzipExpansion(1024);
+		const compressed = await fs.readFile(tarball);
+		await fs.writeFile(tarball, compressed.subarray(0, Math.max(0, compressed.byteLength - 4)));
+
+		await expect(installGjcBundle({ cwd }, "project", tarball)).rejects.toMatchObject({
+			code: "invalid_manifest",
+		});
+		expect(await readRegistry("project", cwd)).toMatchObject({ plugins: [] });
 	});
 
 	test("install of a forbidden-surface bundle leaves no scope files and no registry entry", async () => {
