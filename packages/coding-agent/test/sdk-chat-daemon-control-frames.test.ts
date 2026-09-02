@@ -59,6 +59,7 @@ const PREPARED_FRAME = {
 	name: SESSION_PREPARED_EVENT,
 	sessionId: SESSION_ID,
 	generation: GENERATION,
+	seq: 1,
 };
 
 const READY_FRAME = {
@@ -66,6 +67,7 @@ const READY_FRAME = {
 	name: "session_ready",
 	sessionId: SESSION_ID,
 	generation: GENERATION,
+	seq: 2,
 };
 
 type FrameDeliveryMode = "replay" | "live";
@@ -122,7 +124,7 @@ async function withRuntime(
 					observer = undefined;
 				};
 			},
-			request: async () => ({ ...EVENT_REPLAY_RESULT_FRAME, events: replayEvents }),
+			request: async () => ({ ...EVENT_REPLAY_RESULT_FRAME, events: replayEvents, lastSeq: replayEvents.length }),
 			close: async () => undefined,
 			send: () => undefined,
 		};
@@ -195,9 +197,10 @@ describe("chat daemon control-plane frame containment", () => {
 				kind: "notification",
 				sessionId: SESSION_ID,
 				generation: GENERATION,
+				seq: 2,
 				payload: { ...EVENT_REPLAY_RESULT_FRAME },
 			});
-			deliver({ ...READY_FRAME });
+			deliver({ ...READY_FRAME, seq: 3 });
 			await awaitFirstPublication();
 
 			// Exactly one publication exists and it is the readiness root, so every
@@ -227,6 +230,7 @@ describe("chat daemon event envelope correlation", () => {
 			name: "notification",
 			sessionId: SESSION_ID,
 			generation: GENERATION,
+			seq: 1,
 			payload: { type: "marker", sessionId: SESSION_ID, text },
 		};
 	}
@@ -238,8 +242,11 @@ describe("chat daemon event envelope correlation", () => {
 		frames: Array<Record<string, unknown>>,
 		assert: (harness: RuntimeHarness) => Promise<void>,
 	): Promise<void> {
-		await withRuntime(mode === "replay" ? frames : [], async harness => {
-			if (mode === "live") for (const frame of frames) harness.deliver(frame);
+		const sequenced = frames.map((frame, index) =>
+			frame.type === "event" && frame.generation !== undefined ? { ...frame, seq: index + 1 } : frame,
+		);
+		await withRuntime(mode === "replay" ? sequenced : [], async harness => {
+			if (mode === "live") for (const frame of sequenced) harness.deliver(frame);
 			await assert(harness);
 		});
 	}
@@ -317,7 +324,10 @@ describe("chat daemon event envelope correlation", () => {
 				{ name: "notification", kind: 7 },
 				{ name: undefined, kind: "notification" },
 			])
-				await expectInert({ type: "event", ...aliases, sessionId: SESSION_ID, generation: GENERATION }, mode);
+				await expectInert(
+					{ type: "event", ...aliases, sessionId: SESSION_ID, generation: GENERATION, seq: 1 },
+					mode,
+				);
 		}, 30_000);
 
 		test(`a control-plane payload under an ordinary envelope is inert (${mode})`, async () => {
@@ -327,6 +337,7 @@ describe("chat daemon event envelope correlation", () => {
 					name: "notification",
 					sessionId: SESSION_ID,
 					generation: GENERATION,
+					seq: 1,
 					payload: { ...EVENT_REPLAY_RESULT_FRAME },
 				},
 				mode,
@@ -340,6 +351,7 @@ describe("chat daemon event envelope correlation", () => {
 					name: "notification",
 					sessionId: SESSION_ID,
 					generation: GENERATION,
+					seq: 1,
 					payload: { type: lifecycle, sessionId: SESSION_ID, generation: GENERATION },
 				};
 				await expectInert(smuggled, mode);
@@ -354,6 +366,7 @@ describe("chat daemon event envelope correlation", () => {
 					name: "session_ready",
 					sessionId: "foreign-session",
 					generation: GENERATION,
+					seq: 1,
 					payload: { type: "session_ready", sessionId: SESSION_ID, generation: GENERATION },
 				},
 				mode,
@@ -367,6 +380,7 @@ describe("chat daemon event envelope correlation", () => {
 					name: "notification",
 					sessionId: SESSION_ID,
 					generation: GENERATION,
+					seq: 1,
 					payload: { type: "marker", sessionId: "session-2", text: "conflicting-session-id" },
 				},
 				mode,
@@ -380,6 +394,7 @@ describe("chat daemon event envelope correlation", () => {
 					name: "session_ready",
 					sessionId: SESSION_ID,
 					generation: GENERATION,
+					seq: 1,
 					payload: { type: "session_ready", sessionId: SESSION_ID, generation: GENERATION - 1 },
 				},
 				{
@@ -387,6 +402,7 @@ describe("chat daemon event envelope correlation", () => {
 					name: "notification",
 					sessionId: SESSION_ID,
 					generation: GENERATION,
+					seq: 1,
 					payload: { type: "marker", sessionId: SESSION_ID, generation: GENERATION - 1, text: "conflict" },
 				},
 			])
@@ -406,6 +422,7 @@ describe("chat daemon event envelope correlation", () => {
 						name: "notification",
 						sessionId: SESSION_ID,
 						generation: GENERATION,
+						seq: 1,
 						payload: { type: "marker", sessionId: SESSION_ID, generation, text: "malformed-generation" },
 					},
 					mode,
@@ -417,6 +434,7 @@ describe("chat daemon event envelope correlation", () => {
 						name: "notification",
 						sessionId: SESSION_ID,
 						generation: GENERATION,
+						seq: 1,
 						payload: { type: "marker", sessionId, text: "malformed-session-id" },
 					},
 					mode,
@@ -432,6 +450,7 @@ describe("chat daemon event envelope correlation", () => {
 						name: "notification",
 						sessionId: SESSION_ID,
 						generation: GENERATION,
+						seq: 1,
 						payload: {
 							type: "marker",
 							sessionId: SESSION_ID,

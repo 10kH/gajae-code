@@ -137,7 +137,7 @@ describe("reconciliation-store", () => {
 				message: "Agent run failed.",
 				provenance: "agent_failed",
 			},
-			error: { code: "prompt_failed", message: "Agent run failed." },
+			error: { code: "provider_unavailable", message: "Agent run failed." },
 		});
 	});
 
@@ -249,7 +249,6 @@ describe("reconciliation-store", () => {
 						status: "terminal_ok",
 						terminalAt: 9_000,
 						outcome: { kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
-						pendingOutcome: undefined,
 					}),
 					expect.objectContaining({
 						kind: "prompt",
@@ -503,11 +502,73 @@ describe("reconciliation-store", () => {
 		await fs.rm(root, { recursive: true, force: true });
 	});
 
+	test("unsafe durable diagnostics and replay hashes quarantine on load", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "sdk-recon-unsafe-durable-"));
+		const sessionFile = path.join(root, "s.jsonl");
+		await fs.writeFile(sessionFile, "");
+		const storePath = reconciliationStorePath(sessionFile, "s1");
+		await fs.mkdir(path.dirname(storePath), { recursive: true });
+		try {
+			for (const document of [
+				{
+					version: RECONCILIATION_STORE_VERSION,
+					sessionId: "s1",
+					records: [
+						{
+							kind: "prompt",
+							commandId: "c1",
+							turnId: "t1",
+							status: "failed",
+							acceptedAt: 1,
+							terminalAt: 2,
+							error: { code: "provider_error", message: "x".repeat(4_097) },
+						},
+					],
+				},
+				{
+					version: RECONCILIATION_STORE_VERSION,
+					sessionId: "s1",
+					records: [],
+					terminalScopes: [
+						{
+							selection: "turn",
+							idempotencyKeyHash: hash("key"),
+							idempotencyInputHash: hash("input"),
+							turnDisposition: "stopped",
+							ownedWorkDisposition: "left_running",
+							automaticDeliveryDisposition: "enabled",
+							resumeOnOwnedCompletion: true,
+							turnContinuationFence: {
+								state: "retained",
+								abortedAttemptEpoch: 1,
+								blockedContinuationIds: [],
+								predecessorTombstones: [],
+								ownedCompletionPolicy: "enabled",
+							},
+							responseState: "delivered",
+							responsePayloadHash: "not-a-sha256",
+							acceptedAt: 1,
+						},
+					],
+				},
+			]) {
+				await fs.writeFile(storePath, JSON.stringify(document));
+				const store = createReconciliationStore({ sessionFile, sessionId: "s1" });
+				expect(await store.load()).toEqual([]);
+			}
+			expect((await fs.readdir(path.dirname(storePath))).some(name => name.includes("corrupt"))).toBe(true);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
 	test.each([
 		["turn disposition", { turnDisposition: "bogus" }],
 		["owned-work disposition", { ownedWorkDisposition: "bogus" }],
 		["response state", { responseState: "bogus" }],
 		["empty response payload hash", { responsePayloadHash: "" }],
+		["non-SHA response payload hash", { responsePayloadHash: "not-a-sha256" }],
+		["non-SHA replay payload hash", { replayPayloadHash: "not-a-sha256" }],
 		["publication state", { terminalPublished: "yes" }],
 	])("quarantines an evicted tombstone with invalid %s", async (_field, invalid) => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "sdk-recon-evicted-bad-"));

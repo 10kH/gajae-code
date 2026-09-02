@@ -222,6 +222,8 @@ export interface SessionRouterDeps {
 	onAttachment?: (attachment: SessionAttachment) => Promise<void> | void;
 	/** Called only after the opaque capability becomes externally current. */
 	onAttachmentReady?: (attachment: SessionAttachment) => Promise<void> | void;
+	/** Called before deferred replay may perform provider-facing mutations. */
+	onReplayReady?: () => Promise<void> | void;
 	/** Called when the Broker index no longer reports an attached session as live. */
 	onSessionRemoved?: (
 		attachment: SessionAttachment,
@@ -331,6 +333,9 @@ type AttachedSession = {
 	readonly notificationCursor: { generation: number; seq: number };
 	published: boolean;
 	initializingPublication: boolean;
+	replayPending: boolean;
+	replayPendingSince?: number;
+	replayPendingToken?: object;
 	readyTail: Promise<void>;
 	readonly publication: { promise: Promise<void>; resolve: () => void; reject: (reason?: unknown) => void };
 	dispose: () => void;
@@ -350,6 +355,7 @@ function isUnansweredAfterDispatch(error: unknown): boolean {
 }
 
 const REPLAY_BARRIER_LIMIT = 1_024;
+const REPLAY_PENDING_STALL_MS = 10_000;
 const REPLAY_RETRY_ATTEMPTS = 3;
 const REPLAY_RETRY_BACKOFF_MS = 100;
 const DELIVERY_ATTEMPT_LIMIT = 3;
@@ -429,11 +435,15 @@ function readSequence(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isSafeInteger(value) && value >= 1 ? value : undefined;
 }
 
+function readNonnegativeSequence(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
 async function lstatEndpoint(file: string): Promise<SessionEndpointIdentity | undefined> {
 	const stat = await fs.lstat(file).catch(() => undefined);
-	if (!stat || !stat.isFile()) return undefined;
+	if (!stat?.isFile()) return undefined;
 	const identity = await fs.lstat(file, { bigint: true }).catch(() => undefined);
-	if (!identity || !identity.isFile()) return undefined;
+	if (!identity?.isFile()) return undefined;
 	if (
 		stat.size !== Number(identity.size) ||
 		stat.ino !== Number(identity.ino) ||
@@ -469,18 +479,9 @@ function readFrameSequenceClaim(frame: Record<string, unknown>): {
 	valid: boolean;
 	seq?: number;
 } {
-	const payload =
-		frame.type === "event" && frame.payload && typeof frame.payload === "object" && !Array.isArray(frame.payload)
-			? (frame.payload as Record<string, unknown>)
-			: undefined;
-	const claims: unknown[] = [];
-	if (Object.hasOwn(frame, "seq")) claims.push(frame.seq);
-	if (payload && Object.hasOwn(payload, "seq")) claims.push(payload.seq);
-	if (claims.length === 0) return { claimed: false, valid: true };
-	const sequences = claims.map(readSequence);
-	if (sequences.some(sequence => sequence === undefined)) return { claimed: true, valid: false };
-	if (new Set(sequences).size !== 1) return { claimed: true, valid: false };
-	return { claimed: true, valid: true, seq: sequences[0] };
+	if (!Object.hasOwn(frame, "seq")) return { claimed: false, valid: true };
+	const seq = readSequence(frame.seq);
+	return seq === undefined ? { claimed: true, valid: false } : { claimed: true, valid: true, seq };
 }
 
 function fallbackCorrelation(frame: Record<string, unknown>): SessionRouterFrame | undefined {
@@ -496,12 +497,9 @@ function fallbackCorrelation(frame: Record<string, unknown>): SessionRouterFrame
 	const outerSession = frame.sessionId;
 	const innerSession = payload?.sessionId;
 	const outerGeneration = frame.generation;
-	const innerGeneration = payload?.generation;
 	if (outerSession !== undefined && innerSession !== undefined && outerSession !== innerSession) return undefined;
-	if (outerGeneration !== undefined && innerGeneration !== undefined && outerGeneration !== innerGeneration)
-		return undefined;
 	const sessionClaim = outerSession !== undefined ? outerSession : innerSession;
-	const generationClaim = outerGeneration !== undefined ? outerGeneration : innerGeneration;
+	const generationClaim = outerGeneration;
 	const sessionId = readSession(sessionClaim);
 	const generation = readGeneration(generationClaim);
 	if (sessionClaim !== undefined && sessionId === undefined) return undefined;
@@ -525,7 +523,19 @@ function fallbackCorrelation(frame: Record<string, unknown>): SessionRouterFrame
 		generation,
 		commandId,
 		turnId,
-		seq: readSequence(frame.seq) ?? readSequence(payload?.seq),
+		seq: readSequence(frame.seq),
+	};
+}
+
+function coordinateFreeRouterFrame(correlated: SessionRouterFrame): SessionRouterFrame {
+	return {
+		body: correlated.body,
+		name: correlated.name,
+		sessionId: correlated.sessionId,
+		generation: undefined,
+		seq: undefined,
+		...(correlated.commandId === undefined ? {} : { commandId: correlated.commandId }),
+		...(correlated.turnId === undefined ? {} : { turnId: correlated.turnId }),
 	};
 }
 
@@ -664,7 +674,7 @@ export class SessionRouter {
 			// STARTUP_ATTACH_BUDGET_MS: those attachments are published with their
 			// initial replay delivered. Past that budget the pass continues in the
 			// background instead of owning the caller's deadline.
-			const initialPass = this.#serialReconcile(runEpoch, false, true);
+			const initialPass = this.#serialReconcile(runEpoch, true, true);
 			// Cancelled as soon as the race settles. Promise.race leaves the loser pending,
 			// and a pending Bun.sleep keeps the event loop alive, so a startup that settled
 			// in milliseconds still owed the rest of the budget before the process could exit.
@@ -751,6 +761,7 @@ export class SessionRouter {
 		const endpointMtimeMs = readEndpointMtime(result.endpointMtimeMs);
 		if (
 			sessionId !== fallback.sessionId ||
+			(this.#sessionIds !== undefined && !this.#sessionIds.has(sessionId ?? "")) ||
 			endpointGeneration === undefined ||
 			pid === undefined ||
 			endpointMtimeMs === undefined ||
@@ -825,8 +836,11 @@ export class SessionRouter {
 			attached.dispose();
 			this.#detachNotification(attached, "removed");
 			shutdownTasks.push((async () => await attached.client.close())());
-			void Promise.resolve(this.#deps.onSessionRemoved?.(attached.capability)).catch(error =>
-				logger.warn(`SDK provider cleanup failed during router stop: ${String(error)}`),
+			shutdownTasks.push(
+				Promise.resolve(this.#deps.onSessionRemoved?.(attached.capability)).catch(error => {
+					logger.warn(`SDK provider cleanup failed during router stop: ${String(error)}`);
+					throw error;
+				}),
 			);
 		}
 		this.#adopted.clear();
@@ -891,15 +905,19 @@ export class SessionRouter {
 			onDispatch?: SdkDispatchHandler;
 		},
 	): Promise<Record<string, unknown>> {
+		const matchesExpectedAuthority = (attachment: SessionAttachment): boolean =>
+			expectedAttachment === undefined ||
+			attachment === expectedAttachment ||
+			(expectedAttachment.authorityId !== undefined && attachment.authorityId === expectedAttachment.authorityId);
 		const publishing = this.#sessions.get(sessionId);
-		if (!expectedAttachment || publishing?.capability !== expectedAttachment || !publishing.initializingPublication)
+		if (!publishing || !matchesExpectedAuthority(publishing.capability) || !publishing.initializingPublication)
 			await this.#serialReconcile(this.#runEpoch, true, true);
 		const attached = this.#sessions.get(sessionId);
 		if (!attached || !this.#attachmentPublished(attached))
 			throw new SessionRouterError("pre_send", "SDK session attachment is unavailable: session not published.");
 		if (expectedGeneration !== undefined && expectedGeneration !== attached.generation)
 			throw new SessionRouterError("pre_send", "SDK session endpoint changed before command dispatch.");
-		if (expectedAttachment !== undefined && attached.capability !== expectedAttachment)
+		if (!matchesExpectedAuthority(attached.capability))
 			throw new SessionRouterError("pre_send", "SDK session attachment changed before command dispatch.");
 		if (attached.initializingPublication) {
 			const proven = await this.#readProvenEndpoint(attached.indexed);
@@ -947,10 +965,12 @@ export class SessionRouter {
 					}
 				: {}),
 		});
+		const settled = this.#sessions.get(sessionId);
 		if (
-			!this.#attachmentPublished(attached) ||
-			(expectedGeneration !== undefined && attached.generation !== expectedGeneration) ||
-			(expectedAttachment !== undefined && attached.capability !== expectedAttachment)
+			!settled ||
+			!this.#attachmentPublished(settled) ||
+			(expectedGeneration !== undefined && settled.generation !== expectedGeneration) ||
+			!matchesExpectedAuthority(settled.capability)
 		)
 			throw new SessionRouterError("ambiguous", "SDK session attachment changed while awaiting command response.");
 		return response;
@@ -1537,7 +1557,12 @@ export class SessionRouter {
 			existing.endpointMtimeMs === indexed.endpointMtimeMs &&
 			endpointIdentity !== undefined &&
 			sameEndpointIdentity(existing.endpointIdentity, endpointIdentity);
-		if (existing && resumable && !existing.barrier.failed) {
+		if (
+			existing &&
+			resumable &&
+			!existing.barrier.failed &&
+			(!existing.replayPending || Date.now() - (existing.replayPendingSince ?? Date.now()) < REPLAY_PENDING_STALL_MS)
+		) {
 			this.#reviveTransport(existing);
 			return true;
 		}
@@ -1699,6 +1724,7 @@ export class SessionRouter {
 		});
 		attached = {
 			initializingPublication: false,
+			replayPending: false,
 			id: crypto.randomUUID(),
 			sessionId: indexed.sessionId,
 			endpoint,
@@ -1836,15 +1862,33 @@ export class SessionRouter {
 		// generation fences are unchanged; replay just runs on the attachment's
 		// ready tail like the reconnect path (#4527).
 		if (deferReplay) {
+			const replayToken = {};
+			attached.replayPending = true;
+			attached.replayPendingSince = Date.now();
+			attached.replayPendingToken = replayToken;
 			attached.readyTail = attached.readyTail
 				.catch(() => undefined)
 				.then(async () => {
 					if (!this.#attachmentLive(attached)) return;
+					await this.#deps.onReplayReady?.();
+					if (!this.#attachmentLive(attached)) return;
 					if (!(await this.#deliverRecoveredFrames(attached))) return;
 					await this.#replayAttachment(attached, attached.cursor.seq);
+				})
+				.catch(error => {
+					attached.barrier.failed = true;
+					logger.warn(`SDK deferred replay failed for ${attached.sessionId}: ${String(error)}`);
+				})
+				.finally(() => {
+					if (attached.replayPendingToken === replayToken) {
+						attached.replayPending = false;
+						attached.replayPendingSince = undefined;
+						attached.replayPendingToken = undefined;
+					}
 				});
 			return true;
 		}
+		await this.#deps.onReplayReady?.();
 		if (!(await this.#deliverRecoveredFrames(attached))) return false;
 		await this.#replayAttachment(attached, attached.cursor.seq);
 		return true;
@@ -1852,6 +1896,10 @@ export class SessionRouter {
 
 	async #reinitializeAttachment(attached: AttachedSession): Promise<void> {
 		const previous = attached.readyTail;
+		const replayToken = {};
+		attached.replayPending = true;
+		attached.replayPendingSince = Date.now();
+		attached.replayPendingToken = replayToken;
 		const current = previous
 			.catch(() => undefined)
 			.then(async () => {
@@ -1876,6 +1924,7 @@ export class SessionRouter {
 							logger.warn(`SDK notification subscription reconnect hook failed locally: ${String(error)}`);
 						});
 					await this.#deps.onAttachmentReady?.(attached.capability);
+					await this.#deps.onReplayReady?.();
 				} catch {
 					await this.#retireAttachment(attached);
 					return;
@@ -1884,8 +1933,14 @@ export class SessionRouter {
 				}
 				if (this.#attachmentLive(attached)) await this.#replayAttachment(attached, attached.cursor.seq);
 			});
-		attached.readyTail = current;
-		await current;
+		attached.readyTail = current.finally(() => {
+			if (attached.replayPendingToken === replayToken) {
+				attached.replayPending = false;
+				attached.replayPendingSince = undefined;
+				attached.replayPendingToken = undefined;
+			}
+		});
+		await attached.readyTail;
 	}
 	#reviveTransport(attached: AttachedSession): void {
 		const connect = attached.client.connect?.bind(attached.client);
@@ -1907,7 +1962,14 @@ export class SessionRouter {
 	 */
 	#hasUnhealthyAttachment(): boolean {
 		for (const attached of this.#sessions.values()) {
-			if (attached.barrier.failed || attached.barrier.detached || !attached.published) return true;
+			if (
+				attached.barrier.failed ||
+				attached.barrier.detached ||
+				!attached.published ||
+				(attached.replayPending &&
+					Date.now() - (attached.replayPendingSince ?? Date.now()) >= REPLAY_PENDING_STALL_MS)
+			)
+				return true;
 		}
 		return false;
 	}
@@ -2139,9 +2201,9 @@ export class SessionRouter {
 		const correlated = this.#correlateFrame(frame);
 		if (!correlated) return;
 		if (correlated.sessionId !== undefined && correlated.sessionId !== attached.sessionId) return;
-		if (correlated.generation !== undefined && correlated.generation !== attached.generation) return;
-		this.#dispatchNotificationFrame(attached, correlated);
-		void Promise.resolve(this.#deps.onFrame?.(attached.capability, correlated)).catch(error =>
+		const notificationFrame = coordinateFreeRouterFrame(correlated);
+		this.#dispatchNotificationFrame(attached, notificationFrame);
+		void Promise.resolve(this.#deps.onFrame?.(attached.capability, notificationFrame)).catch(error =>
 			logger.warn(`SDK provider frame hook failed: ${String(error)}`),
 		);
 	}
@@ -2158,26 +2220,18 @@ export class SessionRouter {
 				const correlated = this.#correlateFrame(frame);
 				if (!correlated) return;
 				const sequenceClaim = readFrameSequenceClaim(frame);
-				if (!sequenceClaim.valid) {
+				const ringFrame = frame.type === "event";
+				const generationClaim = Object.hasOwn(frame, "generation");
+				const outerGeneration = generationClaim ? readGeneration(frame.generation) : undefined;
+				const partialCoordinate = ringFrame && sequenceClaim.claimed !== generationClaim;
+				if (!sequenceClaim.valid || partialCoordinate || (generationClaim && outerGeneration === undefined)) {
 					this.#failBarrier(attached, "protocol error: malformed sequence coordinate");
 					return;
 				}
-				const correlatedSeq = correlated.seq === undefined ? undefined : readSequence(correlated.seq);
-				if (correlated.seq !== undefined && correlatedSeq === undefined) {
-					this.#failBarrier(attached, "protocol error: malformed correlated sequence coordinate");
-					return;
-				}
-				if (sequenceClaim.claimed && correlatedSeq !== undefined && correlatedSeq !== sequenceClaim.seq) {
-					this.#failBarrier(attached, "protocol error: inconsistent sequence coordinate");
-					return;
-				}
-				const seq = sequenceClaim.seq ?? correlatedSeq;
+				const seq = ringFrame ? sequenceClaim.seq : undefined;
 				if (correlated.sessionId !== undefined && correlated.sessionId !== attached.sessionId) return;
-				if (correlated.generation !== undefined && correlated.generation !== attached.generation) return;
-				if (seq !== undefined && correlated.generation === undefined) return;
-				const ownsSequence =
-					correlated.generation === attached.generation &&
-					(correlated.sessionId === undefined || correlated.sessionId === attached.sessionId);
+				if (outerGeneration !== undefined && outerGeneration !== attached.generation) return;
+				const ownsSequence = seq !== undefined && outerGeneration === attached.generation;
 				if (seq !== undefined && ownsSequence) {
 					if (seq <= attached.cursor.seq) return;
 					const held = attached.barrier.held;
@@ -2192,16 +2246,19 @@ export class SessionRouter {
 				}
 				const publicationId =
 					seq !== undefined && ownsSequence ? `${attached.sessionId}:${attached.generation}:${seq}` : undefined;
-				let notificationFrame: SessionRouterFrame;
+				const coordinateFree = coordinateFreeRouterFrame(correlated);
+				const notificationFrame: SessionRouterFrame =
+					publicationId === undefined
+						? coordinateFree
+						: { ...coordinateFree, generation: outerGeneration, publicationId, seq };
 				try {
-					notificationFrame = publicationId === undefined ? correlated : { ...correlated, publicationId };
 					this.#dispatchNotificationFrame(attached, notificationFrame);
 					await this.#deps.onFrame?.(attached.capability, notificationFrame);
 				} catch (error) {
 					if (!this.#attachmentLive(attached)) return;
 					if (seq === undefined || !ownsSequence) throw error;
 					this.#failDelivery(attached, seq, error);
-					this.#deps.onFrameSettled?.(attached.capability, { ...correlated, seq });
+					this.#deps.onFrameSettled?.(attached.capability, notificationFrame);
 					return;
 				}
 				if (!this.#attachmentLive(attached)) return;
@@ -2293,12 +2350,40 @@ export class SessionRouter {
 			if (attached.barrier.held !== held || !this.#attachmentLive(attached)) return;
 			await this.#frameTails.get(attached.id)?.catch(() => undefined);
 			if (attached.barrier.held !== held || !this.#attachmentLive(attached)) return;
-			const events = Array.isArray(replay.events)
-				? replay.events.filter(
-						(event): event is Record<string, unknown> =>
-							!!event && typeof event === "object" && !Array.isArray(event),
-					)
-				: [];
+			if (!Array.isArray(replay.events)) {
+				this.#failBarrier(attached, "replay response omitted an events array");
+				return;
+			}
+			if (replay.ok !== true || readGeneration(replay.generation) !== attached.generation) {
+				this.#failBarrier(attached, "replay response failed or crossed generations");
+				return;
+			}
+			const lastSeq = readNonnegativeSequence(replay.lastSeq);
+			if (lastSeq === undefined || lastSeq < sinceSeq) {
+				this.#failBarrier(attached, "replay response omitted a coherent high-watermark");
+				return;
+			}
+			const events = replay.events.filter(
+				(event): event is Record<string, unknown> => !!event && typeof event === "object" && !Array.isArray(event),
+			);
+			if (events.length !== replay.events.length) {
+				this.#failBarrier(attached, "replay response contained a malformed event");
+				return;
+			}
+			let previousSeq = sinceSeq;
+			for (const event of events) {
+				if (event.type !== "event") {
+					this.#failBarrier(attached, "replay response contained a non-event frame");
+					return;
+				}
+				const generation = readGeneration(event.generation);
+				const seq = readSequence(event.seq);
+				if (generation !== attached.generation || seq === undefined || seq <= previousSeq || seq > lastSeq) {
+					this.#failBarrier(attached, "replay response contained invalid or unordered coordinates");
+					return;
+				}
+				previousSeq = seq;
+			}
 			if (replay.gap !== undefined) {
 				const gap = readReplayGap(replay.gap);
 				if (!gap) {
@@ -2314,6 +2399,10 @@ export class SessionRouter {
 						attached,
 						`replay conceded sequences ${gap.fromSeq}-${gap.toSeq} for a request that resumed from seq ${sinceSeq}`,
 					);
+					return;
+				}
+				if (gap.toSeq > lastSeq) {
+					this.#failBarrier(attached, "replay gap exceeded the reported high-watermark");
 					return;
 				}
 				const retained = events

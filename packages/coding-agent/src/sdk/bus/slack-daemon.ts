@@ -1039,16 +1039,21 @@ export class SlackNotificationDaemon {
 		return await this.#track(this.#close(sessionId, marker, true, endpointGeneration));
 	}
 
-	async recoverCleanup(sessionId: string, endpointGeneration: number): Promise<void> {
+	async recoverCleanup(sessionId: string, endpointGeneration: number, authorityId?: string): Promise<boolean> {
 		const found = await this.findSession(sessionId, true);
+		if (!found) return true;
+		if (found.record.endpointGeneration !== endpointGeneration) return true;
+		if (found.record.state === "closed_marker" || found.record.state === "error") return true;
 		if (
-			!found?.record.rootTs ||
-			found.record.state !== "active" ||
-			found.record.endpointGeneration !== endpointGeneration
+			(found.record.state === "posting_root" || found.record.state === "resumed_root") &&
+			found.record.attachmentAuthorityId === authorityId
 		)
-			return;
+			return true;
+		if (found.record.state !== "active") return false;
+		if (!found.record.rootTs) return false;
+		if (found.record.attachmentAuthorityId === authorityId && found.record.cleanupEffectId === undefined) return true;
 		const effectId = `close-marker-cleanup:${sessionId}:${found.record.clientMsgId ?? found.record.rootTs}`;
-		if (found.record.cleanupEffectId !== effectId) return;
+		if (found.record.cleanupEffectId !== effectId) return false;
 		const effect = await this.#journal.read(effectId);
 		if (!effect || (effect.state === "terminal" && !effect.receipt?.messageId && !effect.receipt?.timestamp)) {
 			await this.store.transact(found.key, current =>
@@ -1056,9 +1061,10 @@ export class SlackNotificationDaemon {
 					? nextRecord(current, { cleanupEffectId: undefined, updatedAt: this.#now() })
 					: current,
 			);
-			return;
+			return false;
 		}
 		await this.close(sessionId, "Session closed.", endpointGeneration);
+		return true;
 	}
 
 	async retireAttachment(sessionId: string, endpointGeneration: number): Promise<void> {

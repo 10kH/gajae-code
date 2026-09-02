@@ -3562,7 +3562,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			!model &&
 			!options.modelPattern &&
 			!startupCredentialModelRejected &&
-			configuredDefaultPatterns.length === 0
+			(configuredDefaultPatterns.length === 0 || preferredCredentialProvider !== undefined)
 		) {
 			// Re-resolve the allowed set: extension factories above may have
 			// registered providers/models that weren't visible at startup.

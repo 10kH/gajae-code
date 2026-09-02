@@ -14,7 +14,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { PromptReconciliationStatus, SdkPromptTerminalOutcome } from "../prompt-status";
 import type { ReceiptState } from "../receipt-state";
-import { TURN_RESULT_CONTENT_MAX_BYTES, type TurnResultContent } from "../turn-result";
+import { reportableTurnResultContent, TURN_RESULT_CONTENT_MAX_BYTES, type TurnResultContent } from "../turn-result";
 import type { PromptCorrelation } from "./prompt-reconciliation";
 
 export const RECONCILIATION_STORE_VERSION = 2;
@@ -25,6 +25,16 @@ export const RECONCILIATION_DIR_NAME = ".sdk-reconciliation";
 // durable document can never match a real retry and would make the reserved key
 // invisible (and reusable for an unrelated later abort), so reload rejects it.
 const SHA256_RE = /^[0-9a-f]{64}$/;
+const SAFE_FAILURE_CODE_RE = /^[A-Za-z0-9._-]{1,64}$/;
+const DURABLE_FAILURE_MESSAGE_MAX_BYTES = 4_096;
+
+function isSafeFailureDiagnostic(value: unknown): value is { code: string; message: string } {
+	if (!isRecord(value) || typeof value.code !== "string" || !SAFE_FAILURE_CODE_RE.test(value.code)) return false;
+	return (
+		typeof value.message === "string" &&
+		new TextEncoder().encode(value.message).length <= DURABLE_FAILURE_MESSAGE_MAX_BYTES
+	);
+}
 
 export function resolveReconciliationSessionFile(
 	sessionFile: string | undefined | null,
@@ -207,11 +217,7 @@ function isValidRecord(value: unknown): boolean {
 		const settled = value.status !== "dispatching";
 		if (settled !== (typeof value.settledAt === "number" && Number.isFinite(value.settledAt))) return false;
 		if ((value.status === "rejected" || value.status === "uncertain") !== (value.error !== undefined)) return false;
-		if (
-			value.error !== undefined &&
-			(!isRecord(value.error) || typeof value.error.code !== "string" || typeof value.error.message !== "string")
-		)
-			return false;
+		if (value.error !== undefined && !isSafeFailureDiagnostic(value.error)) return false;
 		return value.receiptState === undefined && value.outcome === undefined;
 	}
 	if (kind !== "prompt" && kind !== "skill") return false;
@@ -274,8 +280,7 @@ function isValidRecord(value: unknown): boolean {
 			return false;
 	}
 	if (value.error !== undefined) {
-		if (!isRecord(value.error)) return false;
-		if (typeof value.error.code !== "string" || typeof value.error.message !== "string") return false;
+		if (!isSafeFailureDiagnostic(value.error)) return false;
 	}
 	return [outcome, pendingOutcome].every(candidate => {
 		if (candidate === undefined) return true;
@@ -286,12 +291,13 @@ function isValidRecord(value: unknown): boolean {
 					candidate.reason as string,
 				) && ["agent", "client_cancel"].includes(candidate.provenance as string)
 			);
-		return (
-			candidate.kind === "failed" &&
-			["prompt_failed", "prompt_deadline_exceeded"].includes(candidate.code as string) &&
-			typeof candidate.message === "string" &&
-			["agent_failed", "deadline"].includes(candidate.provenance as string)
-		);
+		if (
+			candidate.kind !== "failed" ||
+			!["prompt_failed", "prompt_deadline_exceeded"].includes(candidate.code as string) ||
+			!["agent_failed", "deadline"].includes(candidate.provenance as string)
+		)
+			return false;
+		return isSafeFailureDiagnostic({ code: candidate.code, message: candidate.message });
 	});
 }
 /** Terminal scope validation: bounded origin/fence/settlement fields only. */
@@ -361,8 +367,9 @@ function isValidTerminalScope(value: unknown): boolean {
 		responseState !== "failed"
 	)
 		return false;
-	if (typeof responsePayloadHash !== "string" || !responsePayloadHash) return false;
-	if (replayPayloadHash !== undefined && (typeof replayPayloadHash !== "string" || !replayPayloadHash)) return false;
+	if (typeof responsePayloadHash !== "string" || !SHA256_RE.test(responsePayloadHash)) return false;
+	if (replayPayloadHash !== undefined && (typeof replayPayloadHash !== "string" || !SHA256_RE.test(replayPayloadHash)))
+		return false;
 	if (typeof idempotencyKeyHash !== "string" || !SHA256_RE.test(idempotencyKeyHash)) return false;
 	if (typeof idempotencyInputHash !== "string" || !SHA256_RE.test(idempotencyInputHash)) return false;
 	if (terminalPublished !== undefined && typeof terminalPublished !== "boolean") return false;
@@ -406,12 +413,12 @@ function isValidEvictedTerminalKeyEntry(value: unknown): value is EvictedTermina
 		return false;
 	if (
 		value.responsePayloadHash !== undefined &&
-		(typeof value.responsePayloadHash !== "string" || !value.responsePayloadHash)
+		(typeof value.responsePayloadHash !== "string" || !SHA256_RE.test(value.responsePayloadHash))
 	)
 		return false;
 	if (
 		value.replayPayloadHash !== undefined &&
-		(typeof value.replayPayloadHash !== "string" || !value.replayPayloadHash)
+		(typeof value.replayPayloadHash !== "string" || !SHA256_RE.test(value.replayPayloadHash))
 	)
 		return false;
 	if (value.terminalPublished !== undefined && typeof value.terminalPublished !== "boolean") return false;
@@ -550,6 +557,14 @@ export function settleProcessRestart(
 	records: DurableReconciliationRecord[],
 	now: number,
 ): DurableReconciliationRecord[] {
+	const isDeadlineOutcome = (outcome: SdkPromptTerminalOutcome | undefined): boolean =>
+		outcome?.kind === "failed" && outcome.provenance === "deadline";
+	const providerFailureOutcome = (error: { code: string; message: string }): SdkPromptTerminalOutcome => ({
+		kind: "failed",
+		code: "prompt_failed",
+		message: error.message,
+		provenance: "agent_failed",
+	});
 	return records.map(record => {
 		if (record.kind === "steer") {
 			if (record.status !== "dispatching") return record;
@@ -569,29 +584,38 @@ export function settleProcessRestart(
 			return record;
 		}
 		if (record.pendingOutcome !== undefined || record.kind === "prompt") {
+			const { pendingOutcome, pendingReceiptState, ...settledRecord } = record;
+			const providerErrorRecord = record.error;
+			const providerError =
+				providerErrorRecord !== undefined && providerErrorRecord.code !== "prompt_deadline_exceeded";
+			const preserveProviderError = providerError;
 			const outcome: SdkPromptTerminalOutcome =
-				record.error !== undefined && record.pendingOutcome?.kind !== "failed"
-					? {
-							kind: "failed",
-							code: "prompt_failed",
-							message: record.error.message,
-							provenance: "agent_failed",
-						}
-					: (record.pendingOutcome ?? {
+				providerError &&
+				(pendingOutcome === undefined || isDeadlineOutcome(pendingOutcome) || pendingOutcome.kind === "stopped")
+					? providerFailureOutcome(providerErrorRecord)
+					: (pendingOutcome ?? {
 							kind: "failed",
 							code: "prompt_failed",
 							message: "Prompt did not complete before process restart.",
 							provenance: "agent_failed",
 						});
+			const preservedError =
+				providerError && preserveProviderError
+					? providerErrorRecord
+					: outcome.kind === "failed"
+						? { code: outcome.code, message: outcome.message }
+						: undefined;
+			const receiptState = reportableTurnResultContent(record.content)
+				? "present"
+				: (pendingReceiptState ?? (outcome.kind === "stopped" ? "missing" : "unknown"));
 			return {
-				...record,
+				...settledRecord,
 				status: outcome.kind === "stopped" ? "terminal_ok" : "failed",
 				terminalAt: now,
 				outcome,
-				receiptState: record.pendingReceiptState ?? (outcome.kind === "stopped" ? "missing" : "unknown"),
-				pendingOutcome: undefined,
-				pendingReceiptState: undefined,
-				...(outcome.kind === "failed" ? { error: { code: outcome.code, message: outcome.message } } : {}),
+				receiptState,
+
+				...(preservedError !== undefined ? { error: preservedError } : { error: undefined }),
 			};
 		}
 		return {

@@ -24,7 +24,7 @@
 
 import { PROMPT_FAILURE_CODE_MAX, sanitizePromptFailure } from "../prompt-failure";
 import type { SdkPromptTerminalOutcome } from "../prompt-status";
-import type { ReceiptState } from "../receipt-state";
+import { type ReceiptState, reduceReceiptState } from "../receipt-state";
 
 export { PROMPT_FAILURE_CODE_MAX, sanitizePromptFailure };
 export const PROMPT_RECONCILIATION_ACTIVE_CAPACITY = 128;
@@ -209,6 +209,11 @@ export function createPromptReconciliation(options: { now?: () => number } = {})
 		const record = records.get(keyOf(correlation));
 		if (!record) return;
 		if (record.terminalAt !== undefined) {
+			if (frame.type === "agent_end")
+				record.receiptState = reduceReceiptState(
+					record.receiptState,
+					frame.finalText?.trim() ? "present" : undefined,
+				);
 			// The terminal is claimed by one path while the reason arrives on another,
 			// so ordering is not the caller's to control. A late agent_failed enriches
 			// the settled record instead of being dropped; it must not resurrect it,
@@ -229,7 +234,7 @@ export function createPromptReconciliation(options: { now?: () => number } = {})
 			return;
 		}
 		record.terminalAt = now();
-		record.receiptState = frame.finalText?.trim() ? "present" : "missing";
+		record.receiptState = reduceReceiptState(record.receiptState, frame.finalText?.trim() ? "present" : "missing");
 		if (frame.type === "agent_failed") {
 			record.status = "failed";
 			record.error = sanitizePromptFailure(frame.error);

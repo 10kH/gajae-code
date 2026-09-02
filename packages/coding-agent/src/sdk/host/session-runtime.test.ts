@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { AsyncJobManager } from "../../async";
@@ -254,7 +254,10 @@ test("native prompt reconciliation fails closed for an explicitly empty assistan
 		receiptState: "missing",
 	});
 	reconciliation.noteTransition(correlation, { type: "agent_end", finalText: "late text" });
-	expect(reconciliation.lookup({ clientRef: "native-empty-ref" })).toMatchObject({ status: "failed" });
+	expect(reconciliation.lookup({ clientRef: "native-empty-ref" })).toMatchObject({
+		status: "failed",
+		receiptState: "present",
+	});
 });
 
 test("broker reconciliation fails closed for an empty prompt and persists the first terminal result", async () => {
@@ -283,7 +286,9 @@ test("broker reconciliation fails closed for an empty prompt and persists the fi
 	expect(reloaded.lookupResult("prompt", { clientRef: "broker-empty-ref" })).toMatchObject({
 		status: "failed",
 		error: { code: "prompt_failed" },
+		content: { text: "late text", byteLength: 9, truncated: false },
 	});
+	expect(reloaded.lookup("prompt", { clientRef: "broker-empty-ref" })).toMatchObject({ receiptState: "present" });
 	const noOpCorrelation = { commandId: "broker-noop-command", turnId: "broker-noop-turn" };
 	await reconciliation.noteAccepted("prompt", noOpCorrelation, "broker-noop-ref");
 	await reconciliation.finalizeOutcome(
@@ -446,6 +451,42 @@ test("SDK-only finalizeOutcome keeps legacy recordError positional compatibility
 	});
 });
 
+test("SDK-only terminal outcomes survive result projection and durable reload", async () => {
+	let records: unknown[] = [];
+	const store = {
+		path: null,
+		load: async () => records,
+		transact: async (mutator: (current: never[]) => never[]) => {
+			records = mutator(records as never);
+		},
+	} as never;
+	const stopped = { kind: "stopped", reason: "cancelled", provenance: "client_cancel" } as const;
+	const reconciliation = createInvocationReconciliation({ store });
+	const correlation = { commandId: "outcome-command", turnId: "outcome-turn" };
+	await reconciliation.noteAccepted("prompt", correlation, "outcome-ref");
+	await reconciliation.claimPendingOutcome("prompt", correlation, stopped);
+	await reconciliation.finalizeOutcome("prompt", correlation);
+	const projected = reconciliation.lookupResult("prompt", { clientRef: "outcome-ref" });
+	expect(projected).toMatchObject({ status: "terminal_ok", outcome: stopped, receiptState: "unknown" });
+	expect(reconciliation.lookup("prompt", { clientRef: "outcome-ref" })).toMatchObject({ outcome: stopped });
+
+	const reopened = createInvocationReconciliation({ store });
+	await reopened.hydrate();
+	expect(reopened.lookupResult("prompt", { clientRef: "outcome-ref" })).toMatchObject({
+		status: "terminal_ok",
+		outcome: stopped,
+	});
+
+	const direct = createInvocationReconciliation();
+	const directCorrelation = { commandId: "direct-outcome-command", turnId: "direct-outcome-turn" };
+	await direct.noteAccepted("prompt", directCorrelation, "direct-outcome-ref");
+	await direct.noteTransition("prompt", directCorrelation, { type: "agent_end", outcome: stopped });
+	expect(direct.lookupResult("prompt", { clientRef: "direct-outcome-ref" })).toMatchObject({
+		status: "terminal_ok",
+		outcome: stopped,
+	});
+});
+
 test("a late agent failure never overwrites the reason an already terminal record carries", async () => {
 	const reconciliation = createInvocationReconciliation();
 	const correlation = { commandId: "first-reason-command", turnId: "first-reason-turn" };
@@ -493,7 +534,7 @@ test("a failed acceptance persist rolls back the provisional record and reservat
 		"accept persist failed",
 	);
 	reconciliation.release("prompt", "accept-failed-ref");
-	expect(reconciliation.lookup("prompt", first)).toEqual({ status: "unknown" });
+	expect(reconciliation.lookup("prompt", first)).toEqual({ status: "unknown", receiptState: "unknown" });
 
 	const retry = { commandId: "accept-retry-command", turnId: "accept-retry-turn" };
 	reconciliation.admit("prompt", "accept-failed-ref");
@@ -546,6 +587,54 @@ test("a failed uncertainty persist restores the durable deadline terminal until 
 	expect(reconciliation.listDeadlineRecoveryPendingPrompts()).toEqual([
 		{ correlation, acceptedAt: expect.any(Number), deadlineMaxAt: 50 },
 	]);
+});
+
+test("SDK-only markUncertain persists an active-schema record without quarantining siblings", async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-uncertain-reload-"));
+	try {
+		const sessionFile = path.join(root, "session.jsonl");
+		await Bun.write(sessionFile, "");
+		const store = createReconciliationStore({ sessionFile, sessionId: "uncertain-reload" });
+		const reconciliation = createInvocationReconciliation({ store });
+		const correlation = { commandId: "uncertain-reload-command", turnId: "uncertain-reload-turn" };
+		const sibling = { commandId: "uncertain-sibling-command", turnId: "uncertain-sibling-turn" };
+		await reconciliation.noteAccepted("prompt", correlation, "uncertain-reload-ref");
+		await reconciliation.finalizeOutcome("prompt", correlation, {
+			kind: "failed",
+			code: "prompt_deadline_exceeded",
+			message: "deadline",
+		});
+		await reconciliation.noteAccepted("skill", sibling, "uncertain-sibling-ref");
+		await reconciliation.finalizeOutcome("skill", sibling, {
+			kind: "stopped",
+			code: "cancelled",
+			message: "cancelled",
+		});
+
+		await reconciliation.markUncertain("prompt", correlation, undefined, 5_000);
+		const active = store
+			.snapshot()
+			.find(record => record.kind === "prompt" && record.commandId === correlation.commandId) as
+			| Record<string, unknown>
+			| undefined;
+		expect(active).toMatchObject({ status: "accepted", deadlineRecoveryPending: true, deadlineMaxAt: 5_000 });
+		expect(active?.terminalAt).toBeUndefined();
+		expect(active?.receiptState).toBeUndefined();
+		expect(active?.outcome).toBeUndefined();
+		expect(active?.pendingOutcome).toBeUndefined();
+		expect(active?.pendingReceiptState).toBeUndefined();
+
+		const reopenedStore = createReconciliationStore({ sessionFile, sessionId: "uncertain-reload" });
+		const reopened = createInvocationReconciliation({ store: reopenedStore });
+		await reopened.hydrate();
+		expect(reopened.lookup("prompt", { clientRef: "uncertain-reload-ref" })).toMatchObject({ status: "accepted" });
+		expect(reopened.lookup("skill", { clientRef: "uncertain-sibling-ref" })).toMatchObject({
+			status: "terminal_ok",
+		});
+		expect((await readdir(root)).some(name => name.includes("corrupt"))).toBe(false);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
 });
 
 test("durable reload keeps agent_end terminal across a paused successor transition", async () => {
@@ -911,8 +1000,13 @@ test("finalization without an explicit outcome follows the noteTransition eviden
 	await legacyArg5.finalizeOutcome("prompt", legacyCorrelation, undefined, undefined, {
 		content: { version: 1, type: "text", text: "legacy", byteLength: 6, truncated: false },
 	});
-	expect(legacyArg5.lookup("prompt", { clientRef: "final-legacy-ref" })).toMatchObject({
+	await legacyArg5.noteTransition("prompt", legacyCorrelation, {
+		type: "agent_end",
+		content: { version: 1, type: "text", text: "later", byteLength: 5, truncated: false },
+	});
+	expect(legacyArg5.lookupResult("prompt", { clientRef: "final-legacy-ref" })).toMatchObject({
 		status: "terminal_ok",
+		content: { text: "legacy", byteLength: 6, truncated: false },
 	});
 
 	const explicitFailure = createInvocationReconciliation({ store: makeLocalStore() });
@@ -925,7 +1019,56 @@ test("finalization without an explicit outcome follows the noteTransition eviden
 	});
 	expect(explicitFailure.lookup("prompt", { clientRef: "final-failure-ref" })).toMatchObject({
 		status: "failed",
+		receiptState: "unknown",
+		outcome: { kind: "failed", code: "prompt_failed", provenance: "agent_failed" },
+		error: { code: "prompt_failed" },
+	});
+});
+
+test("provider failures outrank later stopped outcomes in both SDK-only terminal paths", async () => {
+	const providerError = Object.assign(new Error("provider rejected"), { code: "provider_rejected" });
+	const transition = createInvocationReconciliation();
+	const transitionCorrelation = { commandId: "precedence-transition-command", turnId: "precedence-transition-turn" };
+	await transition.noteAccepted("prompt", transitionCorrelation, "precedence-transition-ref");
+	await transition.noteTransition("prompt", transitionCorrelation, { type: "agent_failed", error: providerError });
+	await transition.noteTransition("prompt", transitionCorrelation, {
+		type: "agent_end",
+		outcome: { kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
+	});
+	expect(transition.lookupResult("prompt", { clientRef: "precedence-transition-ref" })).toMatchObject({
+		status: "failed",
 		error: { code: "provider_rejected" },
+	});
+
+	const finalized = createInvocationReconciliation();
+	const finalizedCorrelation = { commandId: "precedence-finalize-command", turnId: "precedence-finalize-turn" };
+	await finalized.noteAccepted("prompt", finalizedCorrelation, "precedence-finalize-ref");
+	await finalized.noteTransition("prompt", finalizedCorrelation, { type: "agent_failed", error: providerError });
+	await finalized.claimPendingOutcome("prompt", finalizedCorrelation, {
+		kind: "failed",
+		code: "prompt_deadline_exceeded",
+		message: "deadline",
+	});
+	await finalized.finalizeOutcome("prompt", finalizedCorrelation);
+	expect(finalized.lookupResult("prompt", { clientRef: "precedence-finalize-ref" })).toMatchObject({
+		status: "failed",
+		error: { code: "provider_rejected" },
+	});
+
+	const generic = createInvocationReconciliation();
+	const genericCorrelation = { commandId: "precedence-generic-command", turnId: "precedence-generic-turn" };
+	await generic.noteAccepted("prompt", genericCorrelation, "precedence-generic-ref");
+	await generic.noteTransition("prompt", genericCorrelation, {
+		type: "agent_failed",
+		error: Object.assign(new Error("generic failure"), { code: "agent_failed" }),
+	});
+	await generic.noteTransition("prompt", genericCorrelation, {
+		type: "agent_end",
+		outcome: { kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
+	});
+	expect(generic.lookupResult("prompt", { clientRef: "precedence-generic-ref" })).toMatchObject({
+		status: "failed",
+		error: { code: "agent_failed", message: "Prompt submission failed." },
 	});
 });
 
@@ -945,6 +1088,8 @@ test("a reason attached after a prompt settled is never replaced by a later fail
 		clientRef: "late-reason-ref",
 		acceptedAt: expect.any(Number),
 		terminalAt: expect.any(Number),
+		receiptState: "present",
+		content: { version: 1, type: "text", text: "completed", byteLength: 9, truncated: false },
 	});
 	// A failure delivered after the record settled enriches it with the sanitized reason and
 	// leaves the terminal claim itself (status, terminalAt, identity) untouched.
@@ -1052,6 +1197,7 @@ test("capacity eviction still releases the clientRef and reports honest unknown"
 	}
 	expect(reconciliation.lookup("prompt", { clientRef: "capacity-ref-1" })).toEqual({
 		status: "unknown",
+		receiptState: "unknown",
 	});
 	expect(() => reconciliation.admit("prompt", "capacity-ref-1")).not.toThrow();
 	const retained = {
@@ -3510,6 +3656,8 @@ async function invocationHarness(
 		onLifecycleDrainTimeout?: () => void;
 		onFailureDiagnosticKeyCount?: (count: number) => void;
 		agentFailedWriteFailures?: number;
+		branch?: unknown[];
+		onInvocationCompletionReconciled?: (kind: string, correlation: { commandId: string; turnId: string }) => void;
 	},
 ): Promise<InvocationHarness> {
 	const waiters = new Map<string, (frame: ResponseFrame) => void>();
@@ -3552,6 +3700,9 @@ async function invocationHarness(
 		...(hooks.onFailureDiagnosticKeyCount
 			? { onFailureDiagnosticKeyCountForTests: hooks.onFailureDiagnosticKeyCount }
 			: {}),
+		...(hooks.onInvocationCompletionReconciled
+			? { onInvocationCompletionReconciledForTests: hooks.onInvocationCompletionReconciled }
+			: {}),
 		...(hooks.settings ? { settings: hooks.settings } : {}),
 		createTransport: async ({ sessionId: id, stateRoot, token }) => ({
 			sessionId: id,
@@ -3590,7 +3741,7 @@ async function invocationHarness(
 			getSessionId: () => sessionId,
 			getSessionFile: () => path.join(cwd, ".gjc", "state", `${sessionId}.jsonl`),
 			getSessionName: () => undefined,
-			getBranch: () => [],
+			getBranch: () => hooks.branch ?? [],
 		},
 	};
 	await handlers.get("session_start")?.({}, ctx);
@@ -4465,7 +4616,9 @@ describe("post-acceptance invocation terminalization", () => {
 			expect(secondIds.turnId).not.toBe(firstIds.turnId);
 			await harness.emit("agent_start");
 			await successorStarted.promise;
-			await harness.emit("agent_end");
+			await harness.emit("agent_end", {
+				messages: [{ role: "assistant", content: "predecessor delayed" }],
+			});
 			expect(await harness.query("turn.prompt_status", secondIds)).toMatchObject({
 				result: { status: expect.stringMatching(/accepted|in_flight/) },
 			});
@@ -4473,9 +4626,22 @@ describe("post-acceptance invocation terminalization", () => {
 				status: "failed",
 				error: { code: "aborted" },
 			});
+			const firstResult = await harness.query("turn.result", { kind: "prompt", ...firstIds });
+			expect(firstResult).toMatchObject({
+				result: { status: "failed", content: { text: "predecessor delayed" } },
+			});
 			await harness.emit("agent_end", { messages: [{ role: "assistant", content: "completed" }] });
 			expect(await settledStatus(harness, "turn.prompt_status", secondIds)).toMatchObject({
 				status: "terminal_ok",
+			});
+			expect(await harness.query("turn.result", { kind: "prompt", ...secondIds })).toMatchObject({
+				result: {
+					status: "terminal_ok",
+					content: { text: "completed", byteLength: 9, truncated: false },
+				},
+			});
+			expect(await harness.query("turn.result", { kind: "prompt", ...firstIds })).toMatchObject({
+				result: { content: { text: "predecessor delayed" } },
 			});
 			expect(prompts).toBe(2);
 			await harness.stop();
@@ -4673,6 +4839,190 @@ describe("post-acceptance invocation terminalization", () => {
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
+	test("captures exact bounded content from actual prompt agent_end messages", async () => {
+		const cases = [
+			{ name: "short", agent: "SDK_OK", expected: "SDK_OK", bytes: 6, truncated: false },
+			{ name: "max", agent: "x".repeat(16_384), expected: "x".repeat(16_384), bytes: 16_384, truncated: false },
+			{ name: "blank", agent: " ", expected: undefined, bytes: 0, truncated: false },
+			{
+				name: "overflow",
+				agent: `${"😀".repeat(4_096)}tail`,
+				expected: "😀".repeat(4_096),
+				bytes: 16_384,
+				truncated: true,
+			},
+		] as const;
+		for (const testCase of cases) {
+			const cwd = await mkdtemp(path.join(os.tmpdir(), `gjc-terminal-content-${testCase.name}-`));
+			try {
+				const harness = await invocationHarness(`terminal-content-${testCase.name}`, cwd, {
+					sendUserMessage: async (_content, options) => {
+						await options?.onPreflightAcceptCommit?.();
+						await Promise.withResolvers<void>().promise;
+					},
+				});
+				const accepted = await harness.control("turn.prompt", { text: "hello" });
+				await harness.emit("agent_start");
+				await harness.emit("agent_end", { messages: [{ role: "assistant", content: testCase.agent }] });
+				const result = await settledStatus(harness, "turn.result", {
+					kind: "prompt",
+					commandId: accepted.result?.commandId,
+					turnId: accepted.result?.turnId,
+				});
+				if (testCase.expected === undefined) {
+					expect(result).toMatchObject({ status: "failed" });
+					expect((result as Record<string, unknown>).content).toBeUndefined();
+				} else {
+					expect(result).toMatchObject({
+						status: "terminal_ok",
+						content: {
+							text: testCase.expected,
+							byteLength: testCase.bytes,
+							truncated: testCase.truncated,
+						},
+					});
+				}
+				await harness.stop();
+			} finally {
+				await rm(cwd, { recursive: true, force: true });
+			}
+		}
+	});
+	test("does not reuse a previous branch assistant for a new textless prompt", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-terminal-order-previous-assistant-"));
+		try {
+			const harness = await invocationHarness("terminal-order-previous-assistant", cwd, {
+				branch: [{ type: "message", message: { role: "assistant", content: "PREVIOUS" } }],
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await Promise.withResolvers<void>().promise;
+				},
+			});
+			const accepted = await harness.control("turn.prompt", { text: "textless" });
+			const selector = {
+				kind: "prompt" as const,
+				commandId: accepted.result?.commandId,
+				turnId: accepted.result?.turnId,
+			};
+			await harness.emit("agent_start");
+			await harness.emit("agent_end", { messages: [] });
+			const result = await settledStatus(harness, "turn.result", selector);
+			expect((result as Record<string, unknown>).content).toBeUndefined();
+			await harness.stop();
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+	test("reconciles contract-valid skill completion and agent_end ordering", async () => {
+		const cases = [
+			{
+				name: "completion-real-agent-real",
+				order: "completion-first",
+				completion: "completion",
+				agent: "agent",
+				expected: "completion",
+			},
+			{
+				name: "completion-blank-agent-real",
+				order: "completion-first",
+				completion: " ",
+				agent: "agent",
+				expected: "agent",
+			},
+			{
+				name: "completion-none-agent-real",
+				order: "completion-first",
+				completion: null,
+				agent: "agent",
+				expected: "agent",
+			},
+			{
+				name: "agent-real-completion-real",
+				order: "agent-first",
+				completion: "completion",
+				agent: "agent",
+				expected: "agent",
+			},
+			{
+				name: "agent-real-completion-blank",
+				order: "agent-first",
+				completion: " ",
+				agent: "agent",
+				expected: "agent",
+			},
+			{
+				name: "agent-blank-completion-real",
+				order: "agent-first",
+				completion: "completion",
+				agent: " ",
+				expected: "completion",
+			},
+			{
+				name: "agent-blank-completion-none",
+				order: "agent-first",
+				completion: null,
+				agent: " ",
+				expected: undefined,
+			},
+			{
+				name: "agent-none-completion-real",
+				order: "agent-first",
+				completion: "completion",
+				agent: null,
+				expected: "completion",
+			},
+			{
+				name: "agent-none-completion-blank",
+				order: "agent-first",
+				completion: " ",
+				agent: null,
+				expected: undefined,
+			},
+		] as const;
+		for (const testCase of cases) {
+			const cwd = await mkdtemp(path.join(os.tmpdir(), `gjc-skill-terminal-order-${testCase.name}-`));
+			const completion = Promise.withResolvers<unknown>();
+			const completionReconciled = Promise.withResolvers<void>();
+			try {
+				const harness = await invocationHarness(`skill-terminal-order-${testCase.name}`, cwd, {
+					onInvocationCompletionReconciled: kind => {
+						if (kind === "skill") completionReconciled.resolve();
+					},
+					invokeSkill: async (_name, _args, options) => {
+						await options?.onPreflightAcceptCommit?.();
+						return await completion.promise;
+					},
+				});
+				const accepted = await harness.control("skill.invoke", { name: "ralplan" });
+				const selector = {
+					kind: "skill" as const,
+					commandId: accepted.result?.commandId,
+					turnId: accepted.result?.turnId,
+				};
+				await harness.emit("agent_start");
+				const emitAgentEnd = () =>
+					harness.emit("agent_end", {
+						messages: testCase.agent === null ? [] : [{ role: "assistant", content: testCase.agent }],
+					});
+				if (testCase.order === "completion-first") {
+					completion.resolve(testCase.completion);
+					await completionReconciled.promise;
+					await emitAgentEnd();
+				} else {
+					await emitAgentEnd();
+					completion.resolve(testCase.completion);
+					await completionReconciled.promise;
+				}
+				const result = await harness.query("turn.result", selector);
+				const content = (result.result as { content?: { text?: string } } | undefined)?.content;
+				expect(content?.text).toBe(testCase.expected);
+				await harness.stop();
+			} finally {
+				completion.resolve(undefined);
+				await rm(cwd, { recursive: true, force: true });
+			}
+		}
+	}, 30_000);
 	test("a queued follow-up prompt is not terminalized before the turn runs", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-terminalize-followup-"));
 		try {
@@ -4791,7 +5141,7 @@ describe("post-acceptance invocation terminalization", () => {
 			const rejected = await harness.control("turn.prompt", { text: "hello", clientRef: "preflight-ref" });
 			expect(rejected.ok).toBe(false);
 			const status = await harness.query("turn.prompt_status", { clientRef: "preflight-ref" });
-			expect(status.result).toEqual({ status: "unknown" });
+			expect(status.result as Record<string, unknown>).toEqual({ status: "unknown", receiptState: "unknown" });
 			await harness.stop();
 		} finally {
 			await Bun.sleep(50);

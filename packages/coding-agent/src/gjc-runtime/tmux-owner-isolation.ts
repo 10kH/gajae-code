@@ -489,12 +489,27 @@ export function executeTmuxOwnerIsolationPlanSync(
 			execution.mode === "direct"
 				? deps.spawn([...execution.argv])
 				: deps.spawn([...execution.argv], execution.stdin_line);
-		if (result.exitCode !== 0)
+		if (result.exitCode !== 0) {
+			if (execution.mode === "scoped") {
+				try {
+					const failure = JSON.parse(result.stdout ?? "") as { ok?: boolean; diagnostic?: unknown };
+					if (failure.ok === false && typeof failure.diagnostic === "string")
+						return {
+							ok: false,
+							code: "scope_bootstrap_failed",
+							diagnostic: safeDiagnostic(failure.diagnostic),
+						};
+				} catch {
+					return { ok: false, code: "scope_bootstrap_failed", diagnostic: "scoped_bootstrap_receipt_invalid" };
+				}
+				return { ok: false, code: "scope_bootstrap_failed", diagnostic: "scoped_bootstrap_receipt_invalid" };
+			}
 			return {
 				ok: false,
 				code: "scope_bootstrap_failed",
 				diagnostic: safeDiagnostic(`planned_spawn_failed${result.stderr?.trim() ? `: ${result.stderr}` : ""}`),
 			};
+		}
 		if (execution.mode === "scoped" && !isExactScopedBootstrapSuccessReceipt(result.stdout ?? ""))
 			return {
 				ok: false,

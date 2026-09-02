@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { isCheckpointRecord, type SdkCheckpointRecord } from "../src/sdk/host/query/handlers.js";
+import { isCheckpointRecord, type SdkCheckpointRecord, TARGET_PAGE_BYTES } from "../src/sdk/host/query/handlers.js";
 import {
 	CURSOR_TTL_MS,
 	CursorRegistry,
@@ -26,7 +26,10 @@ const largeEntries = (count: number): unknown[] =>
 		body: `entry-${index}-${"x".repeat(20_000)}`,
 	}));
 
-function surface(transcript: unknown[], watermark?: SdkCheckpointRecord) {
+function surface(
+	transcript: unknown[],
+	watermark: SdkCheckpointRecord = { revision: transcript.length, generation: 0, seq: 0, idle: true },
+) {
 	return {
 		getTranscriptEntries: () => transcript,
 		getContextSnapshot: () => ({}),
@@ -49,9 +52,9 @@ function surface(transcript: unknown[], watermark?: SdkCheckpointRecord) {
 		getQueueMessages: () => [],
 		getExtensions: () => [],
 		getJobs: () => [],
-		// Q30 atomic capture: entries + event-ring watermark in one synchronous
-		// call (C9); absent for surfaces that publish no durable checkpoint.
-		...(watermark === undefined ? {} : { getCheckpointSnapshot: () => ({ entries: transcript, watermark }) }),
+		// Q30 atomic capture: entries + event-ring watermark + idle in one
+		// synchronous call.
+		getCheckpointSnapshot: () => ({ entries: transcript, watermark }),
 	};
 }
 
@@ -84,7 +87,7 @@ describe("SDK session.checkpoint (Q30) replay authority", () => {
 		const result = response.result as CheckpointResult;
 		// Head degrades to the live transcript count when the host publishes no
 		// atomic checkpoint snapshot.
-		expect(result.checkpoint).toEqual({ revision: 4, generation: 0, seq: 0 });
+		expect(result.checkpoint).toEqual({ revision: 4, generation: 0, seq: 0, idle: true });
 		expect(result.revisionId).toBe("1");
 		expect(result.issuedAt).toEqual(expect.any(Number));
 		expect(result.expiresAt - result.issuedAt).toBe(CURSOR_TTL_MS);
@@ -100,7 +103,7 @@ describe("SDK session.checkpoint (Q30) replay authority", () => {
 			revision: "1",
 			direction: "forward",
 			position: { offset: 0, selector: { queryId: "Q01" } },
-			highWatermark: { revision: 4, generation: 0, seq: 0 },
+			highWatermark: { revision: 4, generation: 0, seq: 0, idle: true },
 		});
 		expect(envelope?.issuedAt).toBe(result.issuedAt);
 		expect(envelope?.expiresAt).toBe(result.expiresAt);
@@ -160,25 +163,12 @@ describe("SDK session.checkpoint (Q30) replay authority", () => {
 	});
 
 	it("keeps the checkpoint connection-owned: a new connection must reissue, never echo", async () => {
-		const { handlers } = harness(entries(2));
+		const { handlers, cursors, store } = harness(entries(2));
 		const first = (await handlers.dispatch({ query: "session.checkpoint", connectionId: "c1" }))
 			.result as CheckpointResult;
-		expect(
-			await handlers.dispatch({
-				query: "transcript.list",
-				cursor: first.checkpointToken,
-				connectionId: "c1",
-			}),
-		).toMatchObject({ ok: true, page: { complete: true } });
-		// The same token is refused on another connection (cursor_expired), then
-		// Q30 exchanges the signed claim into a fresh connection-owned grant.
-		expect(
-			await handlers.dispatch({
-				query: "transcript.list",
-				cursor: first.checkpointToken,
-				connectionId: "c2",
-			}),
-		).toMatchObject({ ok: false, error: { code: "cursor_expired", restartQuery: true } });
+		expect(cursors.size).toBe(1);
+		expect(store.pinnedCount).toBe(1);
+		// Q30 transfers the signed source claim into a fresh connection-owned grant.
 		const second = (
 			await handlers.dispatch({
 				query: "session.checkpoint",
@@ -188,6 +178,15 @@ describe("SDK session.checkpoint (Q30) replay authority", () => {
 		).result as CheckpointResult;
 		expect(second.checkpointToken).not.toBe(first.checkpointToken);
 		expect(second.revisionId).toBe(first.revisionId);
+		expect(cursors.size).toBe(1);
+		expect(store.pinnedCount).toBe(1);
+		expect(
+			await handlers.dispatch({
+				query: "transcript.list",
+				cursor: first.checkpointToken,
+				connectionId: "c1",
+			}),
+		).toMatchObject({ ok: false, error: { code: "cursor_expired", restartQuery: true } });
 		expect(
 			await handlers.dispatch({
 				query: "transcript.list",
@@ -195,6 +194,120 @@ describe("SDK session.checkpoint (Q30) replay authority", () => {
 				connectionId: "c2",
 			}),
 		).toMatchObject({ ok: true, page: { complete: true } });
+		expect(cursors.size).toBe(0);
+		expect(store.pinnedCount).toBe(0);
+	});
+
+	it("keeps cursor and revision-pin counts bounded across repeated exchanges", async () => {
+		const { handlers, cursors, store } = harness(entries(2));
+		let token = (
+			(await handlers.dispatch({ query: "session.checkpoint", connectionId: "c0" })).result as CheckpointResult
+		).checkpointToken;
+		for (let index = 1; index <= 64; index++) {
+			const response = await handlers.dispatch({
+				query: "session.checkpoint",
+				input: { checkpointToken: token },
+				connectionId: `c${index}`,
+			});
+			expect(response.ok).toBe(true);
+			token = (response.result as CheckpointResult).checkpointToken;
+			expect(cursors.size).toBe(1);
+			expect(store.pinnedCount).toBe(1);
+		}
+	});
+
+	it("sweeps expired target grants before exchange capacity accounting", async () => {
+		let now = 1_000;
+		const { handlers, cursors, store } = harness(entries(2), undefined, () => now);
+		for (let index = 0; index < 32; index++) {
+			expect(await handlers.dispatch({ query: "session.checkpoint", connectionId: "target" })).toMatchObject({
+				ok: true,
+			});
+		}
+		now += CURSOR_TTL_MS - 1;
+		const source = (
+			(await handlers.dispatch({ query: "session.checkpoint", connectionId: "source" })).result as CheckpointResult
+		).checkpointToken;
+		expect(cursors.size).toBe(33);
+		expect(store.pinnedCount).toBe(33);
+		now += 2;
+		const exchanged = await handlers.dispatch({
+			query: "session.checkpoint",
+			input: { checkpointToken: source },
+			connectionId: "target",
+		});
+		expect(exchanged.ok).toBe(true);
+		expect(cursors.size).toBe(1);
+		expect(store.pinnedCount).toBe(1);
+		expect(
+			await handlers.dispatch({
+				query: "transcript.list",
+				cursor: (exchanged.result as CheckpointResult).checkpointToken,
+				connectionId: "target",
+			}),
+		).toMatchObject({ ok: true, page: { complete: true } });
+	});
+
+	it("rolls back the source cursor and pin when replacement grant fails", async () => {
+		const { handlers, cursors, store } = harness(entries(2));
+		const source = (
+			(await handlers.dispatch({ query: "session.checkpoint", connectionId: "c1" })).result as CheckpointResult
+		).checkpointToken;
+		let failReplacement = true;
+		const originalTransferPin = store.transferPin.bind(store);
+		store.transferPin = (sourceCursorId, replacementCursorId) => {
+			if (failReplacement) {
+				failReplacement = false;
+				throw new Error("replacement pin failed");
+			}
+			originalTransferPin(sourceCursorId, replacementCursorId);
+		};
+		expect(
+			await handlers.dispatch({
+				query: "session.checkpoint",
+				input: { checkpointToken: source },
+				connectionId: "c2",
+			}),
+		).toMatchObject({ ok: false, error: { code: "internal", message: "replacement pin failed" } });
+		expect(cursors.size).toBe(1);
+		expect(store.pinnedCount).toBe(1);
+		expect(await handlers.dispatch({ query: "transcript.list", cursor: source, connectionId: "c1" })).toMatchObject({
+			ok: true,
+			page: { complete: true },
+		});
+		expect(cursors.size).toBe(0);
+		expect(store.pinnedCount).toBe(0);
+	});
+
+	it("releases an exchanged cursor whose checkpoint watermark is invalid", async () => {
+		const { handlers, cursors, store } = harness(entries(2));
+		const revision = await store.createRevision("transcript", "default", entries(2));
+		const source = await cursors.grant(
+			"c1",
+			{
+				cursorVersion: 1,
+				protocolMajor: 3,
+				sessionId: "s1",
+				resource: "transcript",
+				revision,
+				highWatermark: { revision: 2, generation: 0, seq: 0 },
+				purpose: "checkpoint",
+				position: { offset: 0, selector: { queryId: "Q01" } },
+				direction: "forward",
+				pageShape: { targetBytes: TARGET_PAGE_BYTES },
+			},
+			"transcript",
+			"default",
+		);
+		expect(
+			await handlers.dispatch({
+				query: "session.checkpoint",
+				input: { checkpointToken: source },
+				connectionId: "c2",
+			}),
+		).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+		expect(cursors.size).toBe(0);
+		expect(store.pinnedCount).toBe(0);
 	});
 
 	it("rejects a tampered signed cursor (the pinned position cannot be rewound)", async () => {
@@ -212,6 +325,28 @@ describe("SDK session.checkpoint (Q30) replay authority", () => {
 			connectionId: "c",
 		});
 		expect(replay).toMatchObject({ ok: false, error: { code: "invalid_cursor" } });
+	});
+
+	it("cleans up the exact active cursor and pin when its signing authority becomes invalid", async () => {
+		const key = new Uint8Array([1, 2, 3, 4]);
+		const store = new RevisionStore("s1");
+		const cursors = new CursorRegistry(key, store);
+		const handlers = new QueryHandlers(surface(entries(2)), "s1", store, cursors);
+		const source = (
+			(await handlers.dispatch({ query: "session.checkpoint", connectionId: "c1" })).result as CheckpointResult
+		).checkpointToken;
+		expect(cursors.size).toBe(1);
+		expect(store.pinnedCount).toBe(1);
+		key.fill(9);
+		expect(
+			await handlers.dispatch({
+				query: "session.checkpoint",
+				input: { checkpointToken: source },
+				connectionId: "c2",
+			}),
+		).toMatchObject({ ok: false, error: { code: "invalid_cursor", restartQuery: true } });
+		expect(cursors.size).toBe(0);
+		expect(store.pinnedCount).toBe(0);
 	});
 
 	it("rejects empty, whitespace, and non-string checkpointToken inputs", async () => {
@@ -249,6 +384,19 @@ describe("SDK session.checkpoint (Q30) replay authority", () => {
 		expect(both).toMatchObject({ ok: false, error: { code: "invalid_input" } });
 	});
 
+	it("rejects an ordinary continuation cursor when supplied as Q01 checkpointToken", async () => {
+		const { handlers } = harness(largeEntries(20));
+		const first = pageOf(await handlers.dispatch({ query: "transcript.list", connectionId: "c" }));
+		expect(first.complete).toBe(false);
+		expect(first.cursor).toBeDefined();
+		const rejected = await handlers.dispatch({
+			query: "transcript.list",
+			input: { checkpointToken: first.cursor },
+			connectionId: "c",
+		});
+		expect(rejected).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+	});
+
 	it("rejects empty top-level cursors instead of silently dropping them", async () => {
 		const { handlers } = harness(entries(2));
 		const response = await handlers.dispatch({ query: "transcript.list", cursor: "", connectionId: "c" });
@@ -272,13 +420,23 @@ describe("SDK session.checkpoint (Q30) replay authority", () => {
 	});
 
 	it("captures the exact event-ring watermark atomically with the snapshot", async () => {
-		const watermark: SdkCheckpointRecord = { revision: 4, generation: 3, seq: 42 };
+		const watermark: SdkCheckpointRecord = { revision: 4, generation: 3, seq: 42, idle: false };
 		const { handlers } = harness(entries(4), watermark);
 		const checkpoint = (await handlers.dispatch({ query: "session.checkpoint", connectionId: "c" }))
 			.result as CheckpointResult;
 		expect(checkpoint.checkpoint).toEqual(watermark);
 		const envelope = verifyCursor(checkpoint.checkpointToken, "token");
 		expect(envelope?.highWatermark).toEqual(watermark);
+	});
+
+	it("fails explicitly when the host has no atomic checkpoint provider", async () => {
+		const store = new RevisionStore("s1");
+		const { getCheckpointSnapshot: _omitted, ...withoutAtomicCheckpoint } = surface(entries(2));
+		const handlers = new QueryHandlers(withoutAtomicCheckpoint, "s1", store, new CursorRegistry("token", store));
+		expect(await handlers.dispatch({ query: "session.checkpoint", connectionId: "c" })).toMatchObject({
+			ok: false,
+			error: { code: "unavailable" },
+		});
 	});
 
 	it("honors the cursor TTL for checkpoint tokens and reissues after expiry", async () => {
@@ -355,13 +513,23 @@ describe("SDK session.checkpoint (Q30) replay authority", () => {
 	});
 
 	it("honors the per-connection cursor budget", async () => {
-		const { handlers } = harness(entries(1));
+		const { handlers, cursors, store } = harness(entries(1));
+		const tokens: string[] = [];
 		for (let index = 0; index < 32; index++) {
 			const response = await handlers.dispatch({ query: "session.checkpoint", connectionId: "c" });
 			expect(response.ok, `grant ${index + 1}`).toBe(true);
+			tokens.push((response.result as CheckpointResult).checkpointToken);
 		}
 		const exceeded = await handlers.dispatch({ query: "session.checkpoint", connectionId: "c" });
 		expect(exceeded).toMatchObject({ ok: false, error: { code: "snapshot_capacity_exceeded" } });
+		const exchanged = await handlers.dispatch({
+			query: "session.checkpoint",
+			input: { checkpointToken: tokens[0] },
+			connectionId: "c",
+		});
+		expect(exchanged.ok).toBe(true);
+		expect(cursors.size).toBe(32);
+		expect(store.pinnedCount).toBe(32);
 	});
 
 	it("enforces installed-query authority for session.checkpoint", async () => {
@@ -389,10 +557,11 @@ describe("SDK session.checkpoint (Q30) replay authority", () => {
 	});
 
 	it("validates checkpoint records strictly", () => {
-		expect(isCheckpointRecord({ revision: 4, generation: 2, seq: 40 })).toBe(true);
+		expect(isCheckpointRecord({ revision: 4, generation: 2, seq: 40, idle: true })).toBe(true);
 		expect(isCheckpointRecord({ revision: -1, generation: 0, seq: 0 })).toBe(false);
 		expect(isCheckpointRecord({ revision: 1, generation: 0 })).toBe(false);
-		expect(isCheckpointRecord({ revision: 1, generation: 0, seq: 0, extra: 1 })).toBe(false);
+		expect(isCheckpointRecord({ revision: 1, generation: 0, seq: 0, idle: true, extra: 1 })).toBe(false);
 		expect(isCheckpointRecord({ revision: 1.5, generation: 0, seq: 0 })).toBe(false);
+		expect(isCheckpointRecord({ revision: 1, generation: 0, seq: 0 })).toBe(false);
 	});
 });

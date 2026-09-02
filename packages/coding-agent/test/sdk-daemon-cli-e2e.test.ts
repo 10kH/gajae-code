@@ -6,6 +6,8 @@ import path from "node:path";
 import { Broker } from "../src/sdk/broker/broker";
 import { resolveScopeRequest, scopeRequestV1 } from "../src/sdk/broker/session-scope";
 import { scanRetainedTranscriptTail } from "../src/sdk/cli/session-cli";
+import { SessionEventStream } from "../src/sdk/host/events";
+import { type CursorEnvelope, signCursor, verifyCursor } from "../src/sdk/host/query/cursor";
 import { SessionManager } from "../src/session/session-manager";
 
 const cliEntrypoint = path.resolve(import.meta.dir, "../src/cli.ts");
@@ -115,6 +117,7 @@ describe("SDK session CLI", () => {
 	let endpointConnections = 0;
 	let promptStatuses = new Map<string, { status: string }>();
 	let replayEvents: Record<string, unknown>[] = [];
+	let replayGap: Record<string, unknown> | undefined;
 	let deferredLiveEvents: Record<string, unknown>[] = [];
 	let deferredLiveDispatched = false;
 	let openSockets = new Set<Bun.ServerWebSocket<undefined>>();
@@ -127,6 +130,10 @@ describe("SDK session CLI", () => {
 	// Retained transcript rows served by `transcript.list`. Non-empty rows make
 	// the checkpoint advertise a cursor so the CLI actually drains the page.
 	let transcriptRows: Record<string, unknown>[] = [];
+	let checkpointRecord = { revision: 1, generation: 1, seq: 0, idle: false };
+	let checkpointInputToken: unknown;
+	let transcriptCursor: unknown;
+	let signedExchange: { source: string; replacement: string } | undefined;
 	// Exact JSON the fake host put on the wire for the explicit tail replay, so a
 	// test can prove a raw coordinate claim really was transmitted.
 	let lastReplayPayload = "";
@@ -136,6 +143,7 @@ describe("SDK session CLI", () => {
 		receivedControl = undefined;
 		promptStatuses = new Map();
 		replayEvents = [];
+		replayGap = undefined;
 		deferredLiveEvents = [];
 		deferredLiveDispatched = false;
 		openSockets = new Set();
@@ -143,6 +151,10 @@ describe("SDK session CLI", () => {
 		earlyLiveEvents = [];
 		wireLog = [];
 		transcriptRows = [];
+		checkpointRecord = { revision: 1, generation: 1, seq: 0, idle: false };
+		checkpointInputToken = undefined;
+		transcriptCursor = undefined;
+		signedExchange = undefined;
 		lastReplayPayload = "";
 		root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-cli-"));
 		await initializeTestRepository(root);
@@ -210,11 +222,16 @@ describe("SDK session CLI", () => {
 										id,
 										ok: true,
 										generation: 1,
-										lastSeq: 0,
+										lastSeq: events.reduce(
+											(maximum, event) =>
+												typeof event.seq === "number" ? Math.max(maximum, event.seq) : maximum,
+											0,
+										),
 										events,
 									});
 									socket.send(lastReplayPayload);
 									wireLog.push("explicit_replay_result");
+									for (const event of deferredLiveEvents) socket.send(JSON.stringify(event));
 								} catch {
 									// connection already closed
 								}
@@ -227,8 +244,12 @@ describe("SDK session CLI", () => {
 								id: frame.id,
 								ok: true,
 								generation: 1,
-								lastSeq: 0,
+								lastSeq: replayEvents.reduce(
+									(maximum, event) => (typeof event.seq === "number" ? Math.max(maximum, event.seq) : maximum),
+									0,
+								),
 								events: replayEvents,
+								...(replayGap === undefined ? {} : { gap: replayGap }),
 							}),
 						);
 						if (deferredLiveEvents.length > 0 && !deferredLiveDispatched) {
@@ -292,20 +313,51 @@ describe("SDK session CLI", () => {
 							return;
 						}
 						if (frame.query === "session.checkpoint") {
+							checkpointInputToken = (frame.input as Record<string, unknown> | undefined)?.checkpointToken;
+							if (signedExchange !== undefined && checkpointInputToken !== signedExchange.source) {
+								socket.send(
+									JSON.stringify({
+										type: "query_response",
+										id: frame.id,
+										ok: false,
+										error: { code: "invalid_cursor", restartQuery: true },
+									}),
+								);
+								return;
+							}
 							socket.send(
 								JSON.stringify({
 									type: "query_response",
 									id: frame.id,
 									ok: true,
 									result: {
-										checkpoint: { revision: 1, generation: 1, seq: 0 },
-										...(transcriptRows.length > 0 ? { cursor: "transcript-page-1" } : {}),
+										checkpoint: checkpointRecord,
+										...(transcriptRows.length > 0
+											? { checkpointToken: signedExchange?.replacement ?? "transcript-page-1" }
+											: {}),
+										...(signedExchange === undefined ? {} : { cursor: "legacy-must-not-win" }),
 									},
 								}),
 							);
 							return;
 						}
 						if (frame.query === "transcript.list") {
+							transcriptCursor = frame.cursor;
+							if (
+								signedExchange !== undefined &&
+								(frame.cursor !== signedExchange.replacement ||
+									verifyCursor(String(frame.cursor), "tail-e2e-key") === undefined)
+							) {
+								socket.send(
+									JSON.stringify({
+										type: "query_response",
+										id: frame.id,
+										ok: false,
+										error: { code: "invalid_cursor", restartQuery: true },
+									}),
+								);
+								return;
+							}
 							socket.send(
 								JSON.stringify({
 									type: "query_response",
@@ -537,6 +589,86 @@ describe("SDK session CLI", () => {
 		});
 	}, 60_000);
 
+	for (const strict of [false, true]) {
+		it(`starts a fresh ${strict ? "strict" : "non-strict"} tail from an atomic idle checkpoint without a gap`, async () => {
+			checkpointRecord = { revision: 0, generation: 1, seq: 0, idle: true };
+			const args = ["tail", "live", "--until-idle", "--timeout-ms", "1000"];
+			if (strict) args.push("--strict");
+			const tail = await runCli(root, agentDir, args);
+			expect(tail.exitCode, `tail stdout=${tail.stdout}\nstderr=${tail.stderr}`).toBe(0);
+			const result = JSON.parse(tail.stdout).result as Record<string, unknown>;
+			expect(result.terminal).toBe(true);
+			expect(result.checkpoint).toEqual(checkpointRecord);
+			expect(result.gap).toBeUndefined();
+		}, 60_000);
+	}
+
+	for (const strict of [false, true]) {
+		it(`projects a real SessionEventStream eviction in ${strict ? "strict" : "non-strict"} mode`, async () => {
+			const stream = new SessionEventStream({ generation: 1, ringSize: 2 });
+			stream.emit({ kind: "turn_start", payload: { type: "turn_start" } });
+			stream.emit({ kind: "turn_end", payload: { type: "turn_end" } });
+			stream.emit({ kind: "turn_start", payload: { type: "turn_start" } });
+			const evicted = stream.replay(0, 1);
+			replayEvents = evicted.events;
+			replayGap = evicted.gap;
+			checkpointRecord = { revision: 0, generation: 1, seq: 0, idle: false };
+			deferredLiveEvents = [
+				{ type: "event", generation: 1, seq: 4, kind: "turn_end", payload: { type: "turn_end" } },
+			];
+			const args = ["tail", "live", "--until-idle", "--timeout-ms", "20000"];
+			if (strict) args.push("--strict");
+			const tail = await runCli(root, agentDir, args);
+			if (strict) {
+				expect(tail.exitCode).toBe(1);
+				expect(JSON.parse(tail.stdout)).toMatchObject({ ok: false, error: { code: "retention_gap" } });
+			} else {
+				expect(tail.exitCode, tail.stderr).toBe(0);
+				const result = JSON.parse(tail.stdout).result;
+				expect(result.gap).toMatchObject({ code: "retention_gap", missing: { from: 1, to: 1 } });
+				expect(result.items.map((item: Record<string, unknown>) => item.seq)).toEqual([2, 3, 4]);
+			}
+		}, 60_000);
+	}
+
+	it("forwards the exchanged checkpoint token to transcript.list", async () => {
+		checkpointRecord = { revision: 1, generation: 1, seq: 0, idle: true };
+		transcriptRows = [{ id: "assistant-1", role: "assistant", content: "saved" }];
+		const sourceEnvelope: CursorEnvelope = {
+			cursorVersion: 1,
+			protocolMajor: 3,
+			sessionId: "live",
+			resource: "transcript",
+			revision: "revision-1",
+			highWatermark: checkpointRecord,
+			issuedAt: 1,
+			expiresAt: Number.MAX_SAFE_INTEGER,
+			position: { offset: 0, selector: { queryId: "Q01" } },
+			direction: "forward",
+			pageShape: { targetBytes: 256 * 1024 },
+		};
+		const source = signCursor({ ...sourceEnvelope, nonce: "source" }, "tail-e2e-key");
+		const replacement = signCursor({ ...sourceEnvelope, nonce: "replacement" }, "tail-e2e-key");
+		signedExchange = { source, replacement };
+		const tail = await runCli(root, agentDir, [
+			"tail",
+			"live",
+			"--cursor",
+			source,
+			"--until-idle",
+			"--timeout-ms",
+			"1000",
+		]);
+		expect(tail.exitCode, tail.stderr).toBe(0);
+		expect(verifyCursor(String(checkpointInputToken), "tail-e2e-key")).toBeDefined();
+		expect(checkpointInputToken).toBe(source);
+		expect(transcriptCursor).toBe(replacement);
+		expect(transcriptCursor).not.toBe("legacy-must-not-win");
+		const result = JSON.parse(tail.stdout).result as Record<string, unknown>;
+		expect(result.terminal).toBe(true);
+		expect(result.gap).toBeUndefined();
+	}, 60_000);
+
 	it("keeps --until-idle attached when a replayed terminal turn precedes a newer active turn", async () => {
 		// Retained order: turn A already ended, then newer turn B started and is
 		// still running. Turn B's terminal event only arrives as a live frame.
@@ -578,6 +710,42 @@ describe("SDK session CLI", () => {
 			{ kind: "turn_end", seq: 3 },
 		]);
 		expect(result.terminal).toBe(true);
+	}, 60_000);
+
+	it("lets a newer active checkpoint beat an older replayed terminal", async () => {
+		checkpointRecord = { revision: 1, generation: 1, seq: 2, idle: false };
+		replayEvents = [{ type: "event", generation: 1, seq: 1, kind: "turn_end", payload: { type: "turn_end" } }];
+		deferredLiveEvents = [{ type: "event", generation: 1, seq: 3, kind: "turn_end", payload: { type: "turn_end" } }];
+		const tail = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "5000"]);
+		expect(tail.exitCode, tail.stderr).toBe(0);
+		expect(JSON.parse(tail.stdout).result.items.map((item: Record<string, unknown>) => item.seq)).toEqual([1, 3]);
+	}, 60_000);
+
+	it("lets a newer idle checkpoint beat an older replayed start", async () => {
+		checkpointRecord = { revision: 1, generation: 1, seq: 2, idle: true };
+		replayEvents = [{ type: "event", generation: 1, seq: 1, kind: "turn_start", payload: { type: "turn_start" } }];
+		const tail = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "1000"]);
+		expect(tail.exitCode, tail.stderr).toBe(0);
+		expect(JSON.parse(tail.stdout).result).toMatchObject({ terminal: true, checkpoint: checkpointRecord });
+	}, 60_000);
+
+	it("keeps a newer live start active against an older idle checkpoint", async () => {
+		checkpointRecord = { revision: 1, generation: 1, seq: 1, idle: true };
+		explicitReplayEvents = [];
+		earlyLiveEvents = [{ type: "event", generation: 1, seq: 2, kind: "turn_start", payload: { type: "turn_start" } }];
+		deferredLiveEvents = [{ type: "event", generation: 1, seq: 3, kind: "turn_end", payload: { type: "turn_end" } }];
+		const tail = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "4000"]);
+		expect(tail.exitCode, tail.stderr).toBe(0);
+		expect(JSON.parse(tail.stdout).result.items.map((item: Record<string, unknown>) => item.seq)).toEqual([2, 3]);
+	}, 60_000);
+
+	it("lets a newer live terminal beat an older active checkpoint", async () => {
+		checkpointRecord = { revision: 1, generation: 1, seq: 1, idle: false };
+		explicitReplayEvents = [];
+		earlyLiveEvents = [{ type: "event", generation: 1, seq: 2, kind: "turn_end", payload: { type: "turn_end" } }];
+		const tail = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "4000"]);
+		expect(tail.exitCode, tail.stderr).toBe(0);
+		expect(JSON.parse(tail.stdout).result).toMatchObject({ terminal: true });
 	}, 60_000);
 
 	// Out-of-band ordering: the Router delivers live frames as they arrive, while

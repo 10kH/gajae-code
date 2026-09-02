@@ -40,6 +40,19 @@ async function fixture() {
 			message(socket, raw) {
 				sends++;
 				const frame = JSON.parse(String(raw)) as Record<string, unknown>;
+				if (frame.type === "event_replay") {
+					socket.send(
+						JSON.stringify({
+							type: "event_replay_result",
+							id: frame.id,
+							ok: true,
+							generation: typeof frame.sinceGeneration === "number" ? frame.sinceGeneration : 1,
+							lastSeq: 0,
+							events: [],
+						}),
+					);
+					return;
+				}
 				socket.send(
 					JSON.stringify({
 						type: frame.type === "query_request" ? "query_response" : "control_response",

@@ -354,6 +354,8 @@ export class SessionSdkHost {
 			if (this.events.generation !== generation) return "generation_changed";
 			if (this.#readyGeneration === generation) return "already";
 		}
+		if (!this.#started || this.#stopping) return "not_prepared";
+		if (this.events.generation !== generation) return "generation_changed";
 		this.#publishReadiness();
 		return "activated";
 	}

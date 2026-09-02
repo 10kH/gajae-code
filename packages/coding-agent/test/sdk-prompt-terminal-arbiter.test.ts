@@ -174,7 +174,10 @@ describe("SDK prompt terminal arbiter", () => {
 			await reconciliation.finalizeOutcome("prompt", correlation);
 			expect(reconciliation.lookup("prompt", correlation)).toMatchObject({
 				status: "failed",
-				outcome,
+				outcome: {
+					...outcome,
+					message: code === "prompt_deadline_exceeded" ? "Prompt deadline exceeded." : "Prompt submission failed.",
+				},
 				error: { code },
 			});
 		}
@@ -249,7 +252,6 @@ describe("SDK prompt terminal arbiter", () => {
 					kind: "skill",
 					status: "terminal_ok",
 					outcome,
-					pendingOutcome: undefined,
 				},
 			]);
 		}
@@ -285,7 +287,6 @@ describe("SDK prompt terminal arbiter", () => {
 		expect(settled[3]).toMatchObject({
 			status: "terminal_ok",
 			outcome: stopped("cancelled"),
-			pendingOutcome: undefined,
 		});
 	});
 	test("surfaces a late agent_failed reason on a terminal_ok record through the production lookup and persists it", async () => {

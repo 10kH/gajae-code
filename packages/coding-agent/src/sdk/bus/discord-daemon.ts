@@ -166,8 +166,9 @@ export class DiscordNotificationDaemon {
 		expectedGeneration?: number,
 	) => SessionAttachment | null | Promise<SessionAttachment | null>;
 	readonly #effects: ChatEffectJournal;
-	readonly #activeWork = new Set<Promise<unknown>>();
+	readonly #activeWork = new Map<Promise<unknown>, string | undefined>();
 	readonly #workInvalidators = new Set<() => Promise<void>>();
+	readonly #sessionInvalidators = new Map<string, Set<() => Promise<void>>>();
 	readonly #inflightInbound = new Set<string>();
 	#started = false;
 	#lifecycleGeneration = 0;
@@ -264,7 +265,8 @@ export class DiscordNotificationDaemon {
 				await this.options.provider.start(
 					async event => {
 						if (lifecycleGeneration !== this.#lifecycleGeneration || !this.#started) return;
-						await this.#track(this.handleInbound(event));
+						const record = await this.#byThread(event.guildId, event.parentId, event.threadId);
+						await this.#track(this.handleInbound(event), record?.sessionId);
 					},
 					() => {},
 				);
@@ -375,6 +377,9 @@ export class DiscordNotificationDaemon {
 		this.#workGeneration += 1;
 		await Promise.allSettled([...this.#workInvalidators].map(invalidate => invalidate()));
 	}
+	async #invalidateSessionWork(sessionId: string): Promise<void> {
+		await Promise.allSettled([...(this.#sessionInvalidators.get(sessionId) ?? [])].map(invalidate => invalidate()));
+	}
 
 	async #drainActiveWork(deadline: number): Promise<void> {
 		while (this.#activeWork.size > 0) {
@@ -385,7 +390,7 @@ export class DiscordNotificationDaemon {
 				return;
 			}
 			const settled = await Promise.race([
-				Promise.allSettled([...this.#activeWork]).then(() => true),
+				Promise.allSettled([...this.#activeWork.keys()]).then(() => true),
 				Bun.sleep(remaining).then(() => false),
 			]);
 			if (!settled) {
@@ -393,6 +398,17 @@ export class DiscordNotificationDaemon {
 				logger.warn("Discord provider work exceeded the 5000ms shutdown drain; continuing with Router revocation.");
 				return;
 			}
+		}
+	}
+	async #drainSessionWork(sessionId: string, deadline: number): Promise<void> {
+		while (true) {
+			const work = [...this.#activeWork.entries()]
+				.filter(([, activeSessionId]) => activeSessionId === sessionId)
+				.map(([promise]) => promise);
+			if (work.length === 0) return;
+			const remaining = deadline - this.#now();
+			if (remaining <= 0) return;
+			await Promise.race([Promise.allSettled(work), Bun.sleep(remaining)]);
 		}
 	}
 
@@ -422,7 +438,7 @@ export class DiscordNotificationDaemon {
 	 * legitimate create into a spurious teardown rejection.
 	 */
 	async notify(input: DiscordNotificationInput): Promise<DiscordConversation> {
-		return await this.#track(this.#notify(input));
+		return await this.#track(this.#notify(input), input.sessionId);
 	}
 	async #notify(input: DiscordNotificationInput): Promise<DiscordConversation> {
 		await this.#requireLiveBinding(input.sessionId, input.endpointGeneration, input.attachmentAuthorityId);
@@ -457,7 +473,7 @@ export class DiscordNotificationDaemon {
 
 	/** Posts a safe command outcome to the active mapped conversation. */
 	async postCommandResult(sessionId: string, content: string): Promise<boolean> {
-		return await this.#track(this.#postCommandResult(sessionId, content));
+		return await this.#track(this.#postCommandResult(sessionId, content), sessionId);
 	}
 	async #postCommandResult(sessionId: string, content: string): Promise<boolean> {
 		const record = await this.#bySession(sessionId);
@@ -471,13 +487,20 @@ export class DiscordNotificationDaemon {
 		if (closing) await this.#driveClose(closing);
 	}
 
-	async recoverCleanup(sessionId: string, endpointGeneration: number): Promise<void> {
+	async recoverCleanup(sessionId: string, endpointGeneration: number, authorityId?: string): Promise<boolean> {
 		const record = await this.#bySession(sessionId);
-		if (record?.endpointGeneration !== endpointGeneration || !closingIntent(record)) return;
+		if (record?.endpointGeneration !== endpointGeneration) return true;
+		if (record?.state === "closed" || record?.state === "archived" || record?.state === "resuming") return true;
+		if (!closingIntent(record) && record?.state === "active" && record.attachmentAuthorityId === authorityId)
+			return true;
+		if (!closingIntent(record)) return false;
 		await this.#driveClose(record);
+		return true;
 	}
 
 	async retireAttachment(sessionId: string, endpointGeneration: number): Promise<void> {
+		await this.#invalidateSessionWork(sessionId);
+		await this.#drainSessionWork(sessionId, this.#now() + 5_000);
 		const intentKey = this.#intentKey(sessionId);
 		const now = this.#now();
 		await this.#store.transact(intentKey, current => {
@@ -548,7 +571,7 @@ export class DiscordNotificationDaemon {
 		endpointGeneration: number,
 		attachmentAuthorityId?: string,
 	): Promise<DiscordConversation | undefined> {
-		return await this.#track(this.#resumeAdmission(sessionId, endpointGeneration, attachmentAuthorityId));
+		return await this.#track(this.#resumeAdmission(sessionId, endpointGeneration, attachmentAuthorityId), sessionId);
 	}
 	async #resumeAdmission(
 		sessionId: string,
@@ -665,8 +688,8 @@ export class DiscordNotificationDaemon {
 		}
 	}
 
-	#track<T>(work: Promise<T>): Promise<T> {
-		this.#activeWork.add(work);
+	#track<T>(work: Promise<T>, sessionId?: string): Promise<T> {
+		this.#activeWork.set(work, sessionId);
 		return work.finally(() => this.#activeWork.delete(work));
 	}
 
@@ -1871,6 +1894,11 @@ export class DiscordNotificationDaemon {
 	#intentKey(sessionId: string): string {
 		return `${this.options.provider.applicationId}:${this.options.guildId}:${this.options.parentChannelId}:creating:${sessionId}`;
 	}
+	#removeSessionInvalidator(sessionId: string, set: Set<() => Promise<void>>, invalidate: () => Promise<void>): void {
+		set.delete(invalidate);
+		if (set.size === 0 && this.#sessionInvalidators.get(sessionId) === set)
+			this.#sessionInvalidators.delete(sessionId);
+	}
 	async #withCreateIntentLease<T>(intent: DiscordConversation, work: () => Promise<T>): Promise<T> {
 		let lost = false;
 		let renewal: Promise<boolean> | undefined;
@@ -1886,6 +1914,9 @@ export class DiscordNotificationDaemon {
 			await abandonCurrent();
 		};
 		this.#workInvalidators.add(invalidate);
+		const sessionInvalidators = this.#sessionInvalidators.get(intent.sessionId!) ?? new Set<() => Promise<void>>();
+		sessionInvalidators.add(invalidate);
+		this.#sessionInvalidators.set(intent.sessionId!, sessionInvalidators);
 		const renew = async (): Promise<boolean> => {
 			if (lost || workGeneration !== this.#workGeneration) {
 				await invalidate();
@@ -1953,6 +1984,7 @@ export class DiscordNotificationDaemon {
 		} finally {
 			clearInterval(timer);
 			this.#workInvalidators.delete(invalidate);
+			this.#removeSessionInvalidator(intent.sessionId!, sessionInvalidators, invalidate);
 		}
 	}
 	async #clearPending(record: DiscordConversation, actionId: string, actionNonce: string): Promise<void> {
@@ -2076,6 +2108,12 @@ export class DiscordNotificationDaemon {
 			);
 		};
 		this.#workInvalidators.add(invalidate);
+		let sessionInvalidators: Set<() => Promise<void>> | undefined;
+		if (sessionId !== undefined) {
+			sessionInvalidators = this.#sessionInvalidators.get(sessionId) ?? new Set<() => Promise<void>>();
+			sessionInvalidators.add(invalidate);
+			this.#sessionInvalidators.set(sessionId, sessionInvalidators);
+		}
 		const renewLease = async (): Promise<boolean> => {
 			if (renewalLost || workGeneration !== this.#workGeneration) {
 				renewalLost = true;
@@ -2136,6 +2174,8 @@ export class DiscordNotificationDaemon {
 		} finally {
 			clearInterval(timer);
 			this.#workInvalidators.delete(invalidate);
+			if (sessionId !== undefined && sessionInvalidators !== undefined)
+				this.#removeSessionInvalidator(sessionId, sessionInvalidators, invalidate);
 		}
 	}
 

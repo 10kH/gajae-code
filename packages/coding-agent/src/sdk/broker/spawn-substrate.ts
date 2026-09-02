@@ -90,6 +90,30 @@ function launchFailureMessage(selected: "tmux" | "psmux" | "headless", error: un
 	return `${selected} substrate launch failed${bounded ? `: ${bounded}` : ""}`;
 }
 
+function cleanupFailureMessage(selected: "tmux" | "psmux", error: unknown): string {
+	const detail = error instanceof Error ? error.message : String(error);
+	const bounded = detail
+		.replace(/[\u0000-\u001f\u007f]/g, " ")
+		.trim()
+		.slice(0, MAX_SUBSTRATE_DIAGNOSTIC_LENGTH);
+	return `${selected} substrate cleanup failed${bounded ? `: ${bounded}` : ""}`;
+}
+
+function cleanupUncertaintyMessage(selected: "tmux" | "psmux"): string {
+	return `${selected} substrate cleanup could not be verified`;
+}
+
+function cleanupWasVerifiedAfterManagedLaunchFailure(error: unknown): boolean {
+	if (error instanceof AggregateError) return false;
+	const detail = error instanceof Error ? error.message : String(error);
+	// The owner-isolation layer reports a failed tmux allocation before a
+	// managed session exists. That is the only managed launch failure that is
+	// safe to replace with the exact headless substrate. Every other thrown
+	// error may follow a partial create/proof path and therefore needs explicit
+	// cleanup evidence instead of optimistic fallback.
+	return detail.includes("planned_spawn_failed") && !detail.includes("cleanup_uncertain");
+}
+
 function hasOnlyKeys(value: Record<string, unknown>, keys: Set<string>): boolean {
 	return Object.keys(value).every(key => keys.has(key));
 }
@@ -440,6 +464,16 @@ export function createSpawnSubstrateProvider(
 					managed = launchManaged(spec, launchEnv, platform);
 				} catch (error) {
 					const failure = launchFailureMessage(selected, error);
+					if (!cleanupWasVerifiedAfterManagedLaunchFailure(error))
+						return {
+							ok: false,
+							code: "substrate_proof_failed",
+							message: `${failure}; ${
+								error instanceof AggregateError
+									? cleanupFailureMessage(selected, error)
+									: cleanupUncertaintyMessage(selected)
+							}`,
+						};
 					try {
 						const fallback = await launchHeadlessSubstrate(spec, launchEnv);
 						if (fallback.ok) return fallback;
@@ -458,12 +492,21 @@ export function createSpawnSubstrateProvider(
 				}
 				const incarnation = readIncarnation(managed.pid);
 				if (!incarnation || verifyManaged(managed, launchEnv) !== "verified") {
+					let cleanupVerified = false;
+					let cleanupError: unknown;
 					try {
 						await closeManaged(managed, launchEnv);
-					} catch {
-						// The managed close primitive is already exact-proof fenced. Retain its result only in authority state.
+						cleanupVerified = true;
+					} catch (error) {
+						cleanupError = error;
 					}
 					const failure = launchFailureMessage(selected, new Error("exact substrate proof failed"));
+					if (!cleanupVerified)
+						return {
+							ok: false,
+							code: "substrate_proof_failed",
+							message: `${failure}; ${cleanupFailureMessage(selected, cleanupError)}`,
+						};
 					const fallback = await launchHeadlessSubstrate(spec, launchEnv);
 					if (fallback.ok) return fallback;
 					return {

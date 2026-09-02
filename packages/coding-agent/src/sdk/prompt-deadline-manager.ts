@@ -7,6 +7,7 @@ import {
 	promptDeadlineAt,
 	recordAttributableProgress,
 } from "./prompt-deadline-lease";
+import type { SdkPromptTerminalOutcome } from "./prompt-status";
 import type { TurnResultContent } from "./turn-result";
 
 const MAX_EXPIRY_RETRIES = 5;
@@ -26,7 +27,7 @@ export type PromptDeadlineOutcome = {
 export interface PromptTerminalTransitionEvidence {
 	content?: TurnResultContent;
 	hasActivity?: boolean;
-	outcome?: { kind: "stopped"; reason: "cancelled"; provenance: "client_cancel" };
+	outcome?: SdkPromptTerminalOutcome;
 }
 
 function leaseKey(correlation: InvocationCorrelation): string {

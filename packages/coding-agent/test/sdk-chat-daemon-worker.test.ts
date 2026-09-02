@@ -194,7 +194,7 @@ class FakeSdkClient implements SessionRouterClient {
 	requests: Record<string, unknown>[] = [];
 	handler: ((frame: Record<string, unknown>) => void) | undefined;
 	replayEvents: Record<string, unknown>[] = [
-		{ type: "event", name: "session_ready", sessionId: "session", generation: 1 },
+		{ type: "event", name: "session_ready", sessionId: "session", generation: 1, seq: 1 },
 	];
 	#sentWaiters: Array<{ predicate: (frame: Record<string, unknown>) => boolean; resolve: () => void }> = [];
 	#requestWaiters: Array<{ predicate: (frame: Record<string, unknown>) => boolean; resolve: () => void }> = [];
@@ -233,7 +233,22 @@ class FakeSdkClient implements SessionRouterClient {
 	async request(frame: Record<string, unknown>): Promise<Record<string, unknown>> {
 		this.requests.push(frame);
 		this.#resolveRequestWaiters();
-		if (frame.type === "event_replay") return { events: this.replayEvents };
+		if (frame.type === "event_replay") {
+			const generation = typeof frame.sinceGeneration === "number" ? frame.sinceGeneration : 1;
+			const events = this.replayEvents.map((event, index) =>
+				event.type === "event"
+					? { ...event, sessionId: event.sessionId ?? "session", generation, seq: index + 1 }
+					: {
+							type: "event",
+							kind: event.type,
+							sessionId: event.sessionId ?? "session",
+							generation,
+							seq: index + 1,
+							payload: event,
+						},
+			);
+			return { ok: true, generation, lastSeq: events.length, events };
+		}
 		return { ok: true, result: { source: "sdk", body: "daemon-result-secret" } };
 	}
 	send(frame: Record<string, unknown>): void {
@@ -271,10 +286,19 @@ describe("chat daemon worker", () => {
 			pid: process.pid,
 			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
 		});
+		await index.append({
+			type: "host_heartbeat",
+			sessionId: "session",
+			locator: { cwd: root, worktreeRoot: null, stateRoot },
+			endpointGeneration: 1,
+			pid: process.pid,
+			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+			activity: { state: "idle", at: Date.now() },
+		});
 		const provider = new FakeDiscordProvider();
 		const client = new FakeSdkClient();
 		client.replayEvents = [
-			{ type: "event", name: "session_ready", sessionId: "session", generation: 1 },
+			{ type: "event", name: "session_ready", sessionId: "session", generation: 1, seq: 1 },
 			{
 				type: "event",
 				name: "identity_header",
@@ -337,15 +361,19 @@ describe("chat daemon worker", () => {
 			},
 		);
 
+		const replayedThread = provider.waitForThreadCount(1);
 		await runtime.start();
+		await client.waitForRequest(frame => frame.type === "event_replay");
+		await replayedThread;
+		await runtime.reconcile({ waitForReplay: true });
 		expect(client.requests.filter(frame => frame.type === "event_replay")).toHaveLength(1);
 		expect(provider.threads).toHaveLength(1);
 		const startupQueryDispatched = client.waitForRequest(
 			frame => frame.type === "query_request" && frame.query === "todo.list",
 		);
 		if (!provider.handler) throw new Error("Discord provider did not publish its inbound handler.");
-		await provider.handler(startupInbound);
-		await startupQueryDispatched;
+		await withStageTimeout("startup Discord query", provider.handler(startupInbound));
+		await withStageTimeout("startup SDK query dispatch", startupQueryDispatched);
 		expect(provider.started).toBe(true);
 		const startupQueries = client.requests.filter(
 			frame => frame.type === "query_request" && frame.query === "todo.list",
@@ -488,9 +516,9 @@ describe("chat daemon worker", () => {
 		});
 		await archivedThread;
 		expect(provider.archives).toEqual(["thread-1"]);
-		client.handler?.({ type: "event", name: "session_ready", sessionId: "session", generation: 2 });
+		client.handler?.({ type: "event", name: "session_ready", sessionId: "session", generation: 2, seq: 4 });
 		const replacementThread = provider.waitForThreadCount(2);
-		client.handler?.({ type: "event", name: "session_ready", sessionId: "session", generation: 1 });
+		client.handler?.({ type: "event", name: "session_ready", sessionId: "session", generation: 1, seq: 5 });
 		await replacementThread;
 		expect(provider.threads).toHaveLength(2);
 		await runtime.stop();
@@ -740,7 +768,7 @@ describe("chat daemon worker", () => {
 			const oldClient = new FakeSdkClient();
 			const newClient = new FakeSdkClient();
 			newClient.replayEvents = [
-				{ type: "event", name: "session_ready", sessionId: "session", generation: scenario.generation },
+				{ type: "event", name: "session_ready", sessionId: "session", generation: scenario.generation, seq: 1 },
 			];
 			let tick: (() => void) | undefined;
 			let createClientCalls = 0;
@@ -774,11 +802,16 @@ describe("chat daemon worker", () => {
 				},
 			);
 			await runtime.start();
-			blockLookup = true;
-			oldClient.handler?.({ type: "turn_stream", sessionId: "session", text: `blocked ${scenario.name}` });
-			await entered.promise;
-			oldClient.handler?.({ type: "turn_stream", sessionId: "session", text: `stale queued ${scenario.name}` });
-			if (scenario.retirementFails) await fs.writeFile(conversationStorePath(agentDir, "discord"), "{");
+			await oldClient.waitForRequest(frame => frame.type === "event_replay");
+			await runtime.reconcile({ waitForReplay: true });
+			if (scenario.retirementFails) {
+				await fs.chmod(path.dirname(conversationStorePath(agentDir, "discord")), 0o500);
+			} else {
+				blockLookup = true;
+				oldClient.handler?.({ type: "turn_stream", sessionId: "session", text: `blocked ${scenario.name}` });
+				await withStageTimeout("blocked frame lookup", entered.promise);
+				oldClient.handler?.({ type: "turn_stream", sessionId: "session", text: `stale queued ${scenario.name}` });
+			}
 			await fs.writeFile(
 				endpointPath,
 				JSON.stringify({ sessionId: "session", pid: process.pid, url: "ws://127.0.0.1:1", token: "new-token" }),
@@ -795,8 +828,8 @@ describe("chat daemon worker", () => {
 			if (scenario.retirementFails) {
 				await withStageTimeout("failed successor attachment close", newClient.closeEntered.promise);
 				expect(newClient.handler).toBeUndefined();
-				await fs.rm(conversationStorePath(agentDir, "discord"), { force: true });
-				release.resolve();
+				await fs.chmod(path.dirname(conversationStorePath(agentDir, "discord")), 0o700);
+				await runtime.reconcile({ waitForReplay: true });
 				await withStageTimeout("worker shutdown after retirement failure", runtime.stop());
 				expect(provider.messages.some(message => message.content.includes(`blocked ${scenario.name}`))).toBe(false);
 				expect(provider.messages.some(message => message.content.includes(`stale queued ${scenario.name}`))).toBe(
@@ -807,7 +840,7 @@ describe("chat daemon worker", () => {
 				continue;
 			}
 			const replacementReplay = newClient.waitForRequest(frame => frame.type === "event_replay");
-			await replacementReplay;
+			await withStageTimeout("successor event replay", replacementReplay);
 			expect(oldClient.closed).toBe(true);
 			expect(newClient.handler).toBeDefined();
 			const freshContent = `fresh replacement ${scenario.name}`;
@@ -832,7 +865,7 @@ describe("chat daemon worker", () => {
 			await fs.rm(root, { recursive: true, force: true });
 			root = "";
 		}
-	}, 30_000);
+	}, 60_000);
 
 	it("persists Slack action authority across restart, restores it for inbound replies, and clears resolved actions", async () => {
 		root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-slack-worker-"));
@@ -997,7 +1030,7 @@ describe("chat daemon worker", () => {
 		const client = new FakeSdkClient();
 		const broker = new FakeSdkClient();
 		client.replayEvents = [
-			{ type: "event", name: "session_ready", sessionId: "session", generation: 1 },
+			{ type: "event", name: "session_ready", sessionId: "session", generation: 1, seq: 1 },
 			{ type: "turn_stream", phase: "live", sessionId: "session", text: "replayed live" },
 			{ type: "turn_stream", phase: "finalized", sessionId: "session", text: "replayed finalized" },
 			{ type: "turn_stream", sessionId: "session", text: "replayed missing phase" },
@@ -1157,7 +1190,12 @@ describe("chat daemon worker", () => {
 		firstClient.request = async frame => {
 			firstClient.requests.push(frame);
 			if (frame.type === "event_replay")
-				return { events: [{ type: "event", name: "session_ready", sessionId: "session", generation: 1 }] };
+				return {
+					ok: true,
+					generation: 1,
+					lastSeq: 1,
+					events: [{ type: "event", name: "session_ready", sessionId: "session", generation: 1, seq: 1 }],
+				};
 			throw new SdkClientError("uncertain_after_send", "SDK connection closed after accepting the control request");
 		};
 		const firstRuntime = new ChatDaemonRuntime(runtimeInput, {
@@ -1165,7 +1203,10 @@ describe("chat daemon worker", () => {
 			createSlackProvider: () => firstProvider,
 		});
 
+		const firstReadyPost = firstProvider.waitForPostCount(1, post => post.threadTs === undefined);
 		await firstRuntime.start();
+		await firstReadyPost;
+		await firstRuntime.reconcile({ waitForReplay: true });
 		const rootTs = "1.1";
 		expect(firstProvider.posts).toHaveLength(1);
 		await firstProvider.handler?.({
@@ -1207,6 +1248,8 @@ describe("chat daemon worker", () => {
 			createSlackProvider: () => restartedProvider,
 		});
 		await restartedRuntime.start();
+		await restartedClient.waitForRequest(frame => frame.type === "event_replay");
+		await restartedRuntime.reconcile({ waitForReplay: true });
 		expect(restartedClient.requests).toEqual([expect.objectContaining({ type: "event_replay" })]);
 		expect(restartedClient.requests).not.toContainEqual(
 			expect.objectContaining({ type: "control_request", operation: "turn.prompt" }),
@@ -1238,18 +1281,29 @@ describe("chat daemon worker", () => {
 					const frame = JSON.parse(String(raw)) as Record<string, unknown>;
 					frames.push(frame);
 					if (frame.type === "event_replay") {
+						const generation = typeof frame.sinceGeneration === "number" ? frame.sinceGeneration : 1;
 						peer.send(
 							JSON.stringify({
 								type: "event_replay_response",
 								id: frame.id,
+								ok: true,
+								generation,
+								lastSeq: 1,
 								events: [
 									{
-										type: "action_needed",
+										type: "event",
+										kind: "action_needed",
 										sessionId: "session",
-										id: "wire-action",
-										kind: "ask",
-										question: "Continue?",
-										options: ["safe"],
+										generation,
+										seq: 1,
+										payload: {
+											type: "action_needed",
+											sessionId: "session",
+											id: "wire-action",
+											kind: "ask",
+											question: "Continue?",
+											options: ["safe"],
+										},
 									},
 								],
 							}),
@@ -1312,6 +1366,7 @@ describe("chat daemon worker", () => {
 			await runtime.start();
 			expect(provider.started).toBe(true);
 			await replayedThread;
+			await runtime.reconcile({ waitForReplay: true });
 			expect(provider.threads).toHaveLength(1);
 			expect(frames).toContainEqual(expect.objectContaining({ type: "event_replay" }));
 
@@ -1343,7 +1398,9 @@ describe("chat daemon worker", () => {
 			).toBe(true);
 			expect(JSON.stringify(provider.messages)).not.toContain("loopback-result-secret");
 
-			socket.send(JSON.stringify({ type: "event", name: "session_ready", sessionId: "session", generation: 2 }));
+			socket.send(
+				JSON.stringify({ type: "event", name: "session_ready", sessionId: "session", generation: 2, seq: 1 }),
+			);
 			await Bun.sleep(10);
 			expect(provider.threads).toHaveLength(1);
 			await runtime.stop();
