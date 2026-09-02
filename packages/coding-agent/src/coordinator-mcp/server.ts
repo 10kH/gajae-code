@@ -484,6 +484,18 @@ interface CoordinatorEventInput {
 }
 
 const UNOBSERVED_COMPENSATION_CODE = "broker_compensation_unobserved";
+const OBSERVED_BROKER_FAILURE_CODES = new Set([
+	"worktree_preparation_timeout",
+	"dependency_preparation_timeout",
+	"readiness_timeout",
+	"spawn_failed",
+	"worktree_in_use",
+	"startup_admission_timeout",
+	"startup_admission_refused",
+	"incarnation_unavailable",
+	"invalid_input",
+	"broker_request_unavailable",
+]);
 
 const MISSING_FINAL_RESPONSE_ADVISORY = "completion_missing_final_response";
 const PROMPT_ACK_TIMEOUT_REASON = "runtime_prompt_ack_timeout";
@@ -1216,6 +1228,14 @@ const PUBLIC_ERROR_MESSAGES: Record<string, string> = {
 	broker_discovery_unavailable: "SDK broker discovery is unavailable.",
 	broker_request_unavailable: "SDK broker request is unavailable.",
 	broker_transport_unavailable: "SDK broker transport is unavailable.",
+	startup_admission_timeout: "SDK host startup was not admitted before the queue wait cutoff.",
+	startup_admission_refused: "SDK host startup was refused because the broker no longer owns the session root.",
+	worktree_in_use: "The requested worktree is already held by another live session.",
+	worktree_preparation_timeout: "Worktree preparation exceeded its deadline before the session host was spawned.",
+	dependency_preparation_timeout: "Dependency preparation exceeded its deadline before the session host was spawned.",
+	spawn_failed: "Session host could not be spawned.",
+	readiness_timeout: "Session did not become ready before the SDK readiness deadline.",
+	incarnation_unavailable: "OS process incarnation authority is unavailable.",
 	session_closing: "Coordinator session is closing.",
 	session_unavailable: "Coordinator session is unavailable.",
 	session_not_activatable: "Coordinator session cannot be activated.",
@@ -5320,7 +5340,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		} catch (error) {
 			const sessionId = remoteSession.value;
 			if (!sessionId) {
-				if (error instanceof SdkClientError && error.code === "broker_request_unavailable") throw error;
+				if (error instanceof SdkClientError && OBSERVED_BROKER_FAILURE_CODES.has(error.code)) throw error;
 				throw new SdkClientError(
 					UNOBSERVED_COMPENSATION_CODE,
 					"Coordinator creation outcome could not be identified for cleanup.",

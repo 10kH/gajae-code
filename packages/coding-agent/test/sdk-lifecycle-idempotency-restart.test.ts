@@ -421,7 +421,7 @@ it("quarantines terminal-uncertain replay rows with corrupt response or durable-
 		response,
 		responseDigest: createHash("sha256").update(JSON.stringify(response)).digest("hex"),
 		durableEffects: {
-			worktree: { cwdDigest: "worktree", created: true, reused: false },
+			worktree: { cwdDigest: "worktree", created: true, reused: false, createdBranch: true },
 			digest: "corrupt",
 		},
 	});

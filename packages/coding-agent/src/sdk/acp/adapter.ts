@@ -91,6 +91,11 @@ const ACP_MCP_PRESERVED_LAUNCH_CODES = new Set([
 	"startup_admission_timeout",
 	"ready_then_exited",
 	"endpoint_unreadable",
+	"worktree_preparation_timeout",
+	"dependency_preparation_timeout",
+	"readiness_timeout",
+	"spawn_failed",
+	"worktree_in_use",
 ]);
 
 /**
