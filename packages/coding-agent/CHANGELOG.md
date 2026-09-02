@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Named-worktree SDK session.create now gives git worktree add/reuse and workspace install independent 30s budgets instead of charging them against the child 10s semantic-readiness clock. Prep timeouts stay typed and terminal (`worktree_preparation_timeout` / `dependency_preparation_timeout`); Coordinator and ACP preserve those codes instead of collapsing them to `unavailable` or `broker_compensation_unobserved`. Ordinary no-worktree sessions stay 10s/21s.
+
 ## [0.16.0] - 2026-09-02
 
 - Added master mode (`gjc --master [--scope repo|pwd|global]`) with authenticated, broker-authoritative child orchestration: `gjc sdk spawn` creates task-seeded children, scoped `gjc sdk search` discovers broker-visible sessions with paginated results, and locator v2 session rows carry canonical cwd, worktree-root, and state-root identity.
@@ -18,7 +20,6 @@
 
 - A runtime-state marker recorded against a different workspace path now reports that mismatch instead of claiming the file is unreadable, and a terminal, not-live marker that travelled into the current workspace with its session directory is adopted rather than refused. Live, non-terminal, and out-of-workspace markers are still refused untouched.
 - An unavailable provider-qualified `modelRoles.default` selection now reports the requested model instead of silently starting on another provider's baseline. This keeps signed-registry omissions and failed catalog admission actionable rather than routing requests to an unrelated retired model. (#5144)
-
 - Headless SDK substrate close now reports success when exact teardown observes the recorded process gone even if cleanup unlinks the durable proof first; live or identity-ambiguous substrates still report `substrate_mismatch`. (#5130)
 
 - Windows session-state locks now drain late terminal reconciliation writes before disposal returns and safely reclaim valid dead transition claims during resume. (#5102)

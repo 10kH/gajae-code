@@ -814,14 +814,8 @@ test("the ACP MCP launch wrapper reports broker refusal and re-attributes spawn 
 	);
 	expect(acpMcpLaunchFailure(refused, mcpServers)).toBe(refused);
 
-	const masked = acpMcpLaunchFailure(new SdkClientError("spawn_failed", "child exited"), mcpServers) as {
-		code: string;
-		message: string;
-	};
-	expect(masked).toMatchObject({
-		code: "unavailable",
-		message: "MCP server request failed to start (docs, search).",
-	});
+	const preservedSpawn = acpMcpLaunchFailure(new SdkClientError("spawn_failed", "child exited"), mcpServers);
+	expect(preservedSpawn).toMatchObject({ code: "spawn_failed", message: "child exited" });
 
 	const bare = new SdkClientError("spawn_failed", "child exited");
 	expect(acpMcpLaunchFailure(bare, [])).toBe(bare);

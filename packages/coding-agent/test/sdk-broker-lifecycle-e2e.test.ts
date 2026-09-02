@@ -206,7 +206,7 @@ test("ledger restart quarantines terminal response and durable-effect digest cor
 			response,
 			responseDigest: createHash("sha256").update(canonicalJson(response)).digest("hex"),
 			durableEffects: {
-				worktree: { cwdDigest: "a", created: true, reused: false },
+				worktree: { cwdDigest: "a", created: true, reused: false, createdBranch: true },
 				digest: "corrupt",
 			},
 		});

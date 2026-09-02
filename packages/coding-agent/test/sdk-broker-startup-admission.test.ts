@@ -17,8 +17,13 @@ import {
 } from "../src/sdk/broker/lifecycle";
 import {
 	cancellableSleep,
+	DEFAULT_DEPENDENCY_PREPARATION_TIMEOUT_MS,
 	DEFAULT_READINESS_TIMEOUT_MS,
+	DEFAULT_WORKTREE_PREPARATION_TIMEOUT_MS,
+	deriveLifecycleOuterDeadlines,
+	lifecycleRequestTimeoutMs,
 	lifecycleStartupBudgetMs,
+	preparationBudgetMs,
 	startupQueueWaitMs,
 } from "../src/sdk/broker/startup-budget";
 import { normalizeSdkStartupFailure } from "../src/sdk/startup-capability";
@@ -609,6 +614,46 @@ test("the ACP caller deadline covers the admission wait even when readiness is d
 		"closing",
 	);
 	expect(closing.timeoutMs).toBe(5_000);
+});
+test("caller timeout adds independent prep budgets for both worktree input shapes", () => {
+	expect(lifecycleStartupBudgetMs(DEFAULT_READINESS_TIMEOUT_MS)).toBe(20_000);
+	expect(lifecycleRequestTimeoutMs("session.create", { cwd: "/workspace" })).toBe(21_000);
+	expect(
+		lifecycleRequestTimeoutMs("session.create", {
+			cwd: "/workspace",
+			target: { worktree: { enabled: true, name: "x" } },
+		}),
+	).toBe(81_000);
+	expect(
+		lifecycleRequestTimeoutMs("session.create", {
+			cwd: "/workspace",
+			worktree: { enabled: true, name: "x" },
+		}),
+	).toBe(81_000);
+	expect(
+		lifecycleRequestTimeoutMs("session.create", {
+			cwd: "/workspace",
+			target: { worktree: { enabled: true } },
+		}),
+	).toBe(81_000);
+	expect(lifecycleRequestTimeoutMs("session.fork", { worktree: { name: "x" } })).toBe(81_000);
+	expect(lifecycleRequestTimeoutMs("session.resume", { worktree: { enabled: true, name: "x" } })).toBe(81_000);
+	expect(preparationBudgetMs({ cwd: "/workspace" })).toBe(0);
+	expect(preparationBudgetMs({ target: { worktree: { enabled: true } } })).toBe(
+		DEFAULT_WORKTREE_PREPARATION_TIMEOUT_MS + DEFAULT_DEPENDENCY_PREPARATION_TIMEOUT_MS,
+	);
+	expect(preparationBudgetMs({ worktreePreparationTimeoutMs: 1.5 })).toBeUndefined();
+	expect(
+		deriveLifecycleOuterDeadlines({
+			admittedAt: 1_000_000,
+			worktreePrepTimeoutMs: 30_000,
+			dependencyPrepTimeoutMs: 30_000,
+			requestedReadinessTimeoutMs: 10_000,
+		}),
+	).toMatchObject({
+		worktreePreparationDeadlineAt: 1_030_000,
+		lifecycleCleanupDeadlineAt: 1_070_000,
+	});
 });
 
 test("lost-root completion does not wait indefinitely for model resolver disposal", async () => {

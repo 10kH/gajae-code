@@ -1179,6 +1179,37 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		expect(journal.filter(event => event.kind === "session.started")).toHaveLength(1);
 	});
 
+	it("preserves typed worktree preparation timeouts without unobserved compensation", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, [], undefined, undefined, {
+			globalResult: operation =>
+				operation === "session.create"
+					? {
+							ok: false,
+							error: {
+								code: "worktree_preparation_timeout",
+								message: "Worktree preparation exceeded its deadline before the session host was spawned.",
+							},
+						}
+					: undefined,
+		});
+		const started = await server.callTool("gjc_coordinator_start_session", {
+			cwd: root,
+			idempotency_key: "typed-prep-timeout-start",
+			allow_mutation: true,
+		});
+		const delegated = await server.callTool("gjc_delegate_execute", {
+			cwd: root,
+			task: "typed prep timeout",
+			idempotency_key: "typed-prep-timeout-delegate",
+			allow_mutation: true,
+		});
+		expect(started).toMatchObject({ ok: false, error: { code: "worktree_preparation_timeout" } });
+		expect(delegated).toMatchObject({ ok: false, error: { code: "worktree_preparation_timeout" } });
+		expect(controls.filter(control => control.operation === "session.close")).toHaveLength(0);
+	});
+
 	it("compensates a remote session when local binding fails after creation", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];

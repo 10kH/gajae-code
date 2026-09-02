@@ -26,10 +26,13 @@ import {
 import { mergeModelProfiles } from "../../config/model-profiles";
 import { ModelsConfigFile } from "../../config/model-registry";
 import {
-	ensureLaunchWorktree,
-	ensureReusableNodeModules,
+	DependencyPreparationTimeoutError,
+	ensureLaunchWorktreeCancellable,
+	ensureReusableNodeModulesCancellable,
 	type GjcLaunchWorktreePlan,
 	planLaunchWorktree,
+	removeOwnedLaunchWorktree,
+	WorktreePreparationTimeoutError,
 } from "../../gjc-runtime/launch-worktree";
 import { probeLinuxProcPidSync } from "../../gjc-runtime/linux-proc";
 import {
@@ -91,8 +94,11 @@ import {
 import {
 	cancellableSleep,
 	DEFAULT_READINESS_TIMEOUT_MS,
+	deriveLifecycleOuterDeadlines,
 	isValidReadinessTimeoutMs,
+	PREPARATION_TIMEOUT_INVALID_MESSAGE,
 	READINESS_TIMEOUT_INVALID_MESSAGE,
+	readPreparationTimeouts,
 	startupQueueWaitMs,
 } from "./startup-budget";
 import { worktreeOccupant } from "./worktree-occupancy";
@@ -201,6 +207,17 @@ const lifecycleCommandResolversForTest = new WeakMap<Broker, LifecycleCommandRes
 const lifecycleCleanupHooksForTest = new WeakMap<Broker, () => void>();
 const startupAdmittedInputs = new WeakSet<Input>();
 const startupLaunchInputs = new WeakMap<Input, SessionLaunch>();
+type EnsureLaunchWorktreeForTest = (
+	plan: GjcLaunchWorktreePlan,
+	opts: { signal: AbortSignal; deadlineAt: number },
+) => Promise<SessionLifecycleWorktreeReceipt & { createdBranch: boolean }>;
+type EnsureReusableNodeModulesForTest = (
+	sourceRoot: string,
+	worktreePath: string,
+	opts: { signal: AbortSignal; deadlineAt: number },
+) => Promise<"symlink" | "present" | "missing">;
+let ensureLaunchWorktreeForTest: EnsureLaunchWorktreeForTest | undefined;
+let ensureReusableNodeModulesForTest: EnsureReusableNodeModulesForTest | undefined;
 
 /** Test-only hook for simulating a crash immediately after one exact lifecycle detach. */
 export function setLifecycleCleanupHookForTest(broker: Broker, hook: (() => void) | undefined): void {
@@ -219,6 +236,20 @@ export function setLifecycleCommandResolverForTest(
 export function setLifecycleTimingForTest(broker: Broker, timing: LifecycleTiming | undefined): void {
 	if (timing) lifecycleTimingsForTest.set(broker, timing);
 	else lifecycleTimingsForTest.delete(broker);
+}
+export function setEnsureLaunchWorktreeForTest(
+	_broker: Broker | undefined,
+	fn?: EnsureLaunchWorktreeForTest | undefined,
+): void {
+	ensureLaunchWorktreeForTest = typeof _broker === "function" ? (_broker as EnsureLaunchWorktreeForTest) : fn;
+}
+
+export function setEnsureReusableNodeModulesForTest(
+	_broker: Broker | undefined,
+	fn?: EnsureReusableNodeModulesForTest | undefined,
+): void {
+	ensureReusableNodeModulesForTest =
+		typeof _broker === "function" ? (_broker as EnsureReusableNodeModulesForTest) : fn;
 }
 
 let lifecycleHostPlatformForTest: NodeJS.Platform | undefined;
@@ -300,6 +331,7 @@ export interface SessionLifecycleWorktreeReceipt {
 	cwd: string;
 	created: boolean;
 	reused: boolean;
+	createdBranch: boolean;
 	branch?: string;
 }
 
@@ -734,7 +766,7 @@ function isLifecycleWorktreeTarget(value: unknown): value is SessionLifecycleWor
 
 function lifecycleWorktreeTarget(input: Input): SessionLifecycleWorktreeTarget | null | undefined {
 	const target = input.target as Record<string, unknown> | undefined;
-	const worktree = target?.worktree;
+	const worktree = target?.worktree ?? input.worktree;
 	if (worktree === undefined) return undefined;
 	return isLifecycleWorktreeTarget(worktree) ? worktree : null;
 }
@@ -4150,8 +4182,22 @@ export function worktreeOccupantForTest(
 	return worktreeOccupant(sessions, worktreePath, observe);
 }
 
-function preparePlannedWorktree(plan: GjcLaunchWorktreePlan): SessionLifecycleWorktreeReceipt {
-	const prepared = ensureLaunchWorktree(plan);
+async function preparePlannedWorktree(
+	plan: GjcLaunchWorktreePlan,
+	opts: { signal: AbortSignal; deadlineAt: number; now: () => number },
+): Promise<SessionLifecycleWorktreeReceipt> {
+	const hooked = ensureLaunchWorktreeForTest;
+	if (hooked) {
+		const receipt = await hooked(plan, { signal: opts.signal, deadlineAt: opts.deadlineAt });
+		if (!receipt.enabled || path.resolve(receipt.cwd) !== path.resolve(plan.worktreePath))
+			throw new Error("Lifecycle worktree preparation did not preserve the durable worktree identity.");
+		return receipt;
+	}
+	const prepared = await ensureLaunchWorktreeCancellable(plan, {
+		signal: opts.signal,
+		deadlineAt: opts.deadlineAt,
+		now: opts.now,
+	});
 	if (!prepared.enabled || path.resolve(prepared.worktreePath) !== path.resolve(plan.worktreePath))
 		throw new Error("Lifecycle worktree preparation did not preserve the durable worktree identity.");
 	return {
@@ -4159,8 +4205,66 @@ function preparePlannedWorktree(plan: GjcLaunchWorktreePlan): SessionLifecycleWo
 		cwd: path.resolve(prepared.worktreePath),
 		created: prepared.created,
 		reused: prepared.reused,
+		createdBranch: prepared.createdBranch,
 		...(prepared.branchName ? { branch: prepared.branchName } : {}),
 	};
+}
+
+function mapPreparationFailure(error: unknown): BrokerResponse {
+	const message = sanitizeSdkStartupMessage(error);
+	if (
+		error instanceof WorktreePreparationTimeoutError ||
+		(error as { code?: string }).code === "worktree_preparation_timeout"
+	) {
+		return fail("worktree_preparation_timeout", message);
+	}
+	if (
+		error instanceof DependencyPreparationTimeoutError ||
+		(error as { code?: string }).code === "dependency_preparation_timeout"
+	) {
+		return fail("dependency_preparation_timeout", message);
+	}
+	return fail("spawn_failed", `Unable to prepare lifecycle worktree: ${message}`);
+}
+
+function abortWhenDue(
+	controller: AbortController,
+	deadlineAt: number,
+	now: () => number,
+): ReturnType<typeof setInterval> {
+	const tick = (): void => {
+		if (now() >= deadlineAt && !controller.signal.aborted) controller.abort();
+	};
+	tick();
+	return setInterval(tick, 10);
+}
+
+function durableWorktreeEffects(
+	receipt: SessionLifecycleWorktreeReceipt,
+	timings: { worktreePreparationMs?: number; dependencyPreparationMs?: number; spawnAuthorizedAtOffsetMs?: number },
+): LifecycleDurableEffectsReceipt {
+	const worktree = {
+		cwdDigest: createHash("sha256").update(receipt.cwd, "utf8").digest("hex"),
+		created: receipt.created,
+		reused: receipt.reused,
+		createdBranch: receipt.createdBranch,
+		...(receipt.branch ? { branchDigest: createHash("sha256").update(receipt.branch, "utf8").digest("hex") } : {}),
+	};
+	return {
+		worktree,
+		timings,
+		digest: createHash("sha256").update(canonicalJson({ worktree, timings })).digest("hex"),
+	};
+}
+
+function deadlineFieldsPresent(input: Input): boolean {
+	return [
+		input.receivedAt,
+		input.requestedReadinessTimeoutMs,
+		input.semanticReadyDeadlineAt,
+		input.terminationStartDeadlineAt,
+		input.lifecycleCleanupDeadlineAt,
+	].some(value => value !== undefined);
 }
 async function launchInput(
 	broker: Broker,
@@ -4923,8 +5027,16 @@ async function executeLifecycleResponse(
 			const queueWaitMs = startupQueueWaitMs(requestedReadinessTimeoutMs);
 			const launch = await launchInput(broker, operation, input);
 			if ("ok" in launch) return launch;
+			if (launch.worktreePlan && deadlineFieldsPresent(input)) {
+				return fail(
+					"invalid_input",
+					"Lifecycle worktree launches cannot carry a caller-supplied child deadline tuple.",
+				);
+			}
 			const admitted = await broker.runStartup(queueWaitMs, timing, async admittedAt => {
-				const admittedInput = { ...input, ...deriveLifecycleDeadlines(admittedAt, requestedReadinessTimeoutMs) };
+				const admittedInput = launch.worktreePlan
+					? { ...input, admittedAt, requestedReadinessTimeoutMs }
+					: { ...input, ...deriveLifecycleDeadlines(admittedAt, requestedReadinessTimeoutMs) };
 				startupAdmittedInputs.add(admittedInput);
 				startupLaunchInputs.set(admittedInput, launch);
 				try {
@@ -4944,15 +5056,52 @@ async function executeLifecycleResponse(
 			return fail("startup_admission_timeout", failure.message);
 		}
 
-		const deadlines = lifecycleDeadlines(input, input.receivedAt as number);
-
-		if ("ok" in deadlines) return deadlines;
-		const lifecycleDeadline = deadlines.lifecycleCleanupDeadlineAt;
-		const readinessDeadline = deadlines.semanticReadyDeadlineAt;
-		const terminationStartDeadline = deadlines.terminationStartDeadlineAt;
-
 		const launch = startupLaunchInputs.get(input) ?? (await launchInput(broker, operation, input));
 		if ("ok" in launch) return launch;
+		if (launch.worktreePlan && deadlineFieldsPresent(input) && input.admittedAt === undefined) {
+			return fail(
+				"invalid_input",
+				"Lifecycle worktree launches cannot carry a caller-supplied child deadline tuple.",
+			);
+		}
+
+		let childDeadlines: LifecycleDeadlines | undefined;
+		let lifecycleDeadline: number;
+		let readinessDeadline: number;
+		let terminationStartDeadline: number;
+		let outerCleanupDeadlineAt: number | undefined;
+		if (launch.worktreePlan) {
+			const prepTimeouts = readPreparationTimeouts(input);
+			if (!prepTimeouts.ok) return fail("invalid_input", PREPARATION_TIMEOUT_INVALID_MESSAGE);
+			const admittedAt =
+				typeof input.admittedAt === "number" && Number.isSafeInteger(input.admittedAt)
+					? input.admittedAt
+					: timing.now();
+			const requestedReadinessTimeoutMs =
+				typeof input.requestedReadinessTimeoutMs === "number" &&
+				isValidReadinessTimeoutMs(input.requestedReadinessTimeoutMs)
+					? input.requestedReadinessTimeoutMs
+					: readinessTimeout(input);
+			if (typeof requestedReadinessTimeoutMs !== "number") return requestedReadinessTimeoutMs;
+			const outer = deriveLifecycleOuterDeadlines({
+				admittedAt,
+				worktreePrepTimeoutMs: prepTimeouts.worktreePrepTimeoutMs,
+				dependencyPrepTimeoutMs: prepTimeouts.dependencyPrepTimeoutMs,
+				requestedReadinessTimeoutMs,
+			});
+			outerCleanupDeadlineAt = outer.lifecycleCleanupDeadlineAt;
+			lifecycleDeadline = outer.lifecycleCleanupDeadlineAt;
+			readinessDeadline = outer.lifecycleCleanupDeadlineAt;
+			terminationStartDeadline = outer.lifecycleCleanupDeadlineAt;
+		} else {
+			const deadlines = lifecycleDeadlines(input, input.receivedAt as number);
+			if ("ok" in deadlines) return deadlines;
+			childDeadlines = deadlines;
+			lifecycleDeadline = deadlines.lifecycleCleanupDeadlineAt;
+			readinessDeadline = deadlines.semanticReadyDeadlineAt;
+			terminationStartDeadline = deadlines.terminationStartDeadlineAt;
+		}
+
 		if (!hasProcessIncarnationAuthority())
 			return fail(
 				"incarnation_unavailable",
@@ -4972,7 +5121,8 @@ async function executeLifecycleResponse(
 			sessionId: launch.id,
 			stateRoot: launch.root,
 			childOwnershipEstablished: false,
-			lifecycleCleanupDeadlineAt: deadlines.lifecycleCleanupDeadlineAt,
+			lifecycleCleanupDeadlineAt:
+				outerCleanupDeadlineAt ?? (childDeadlines as LifecycleDeadlines).lifecycleCleanupDeadlineAt,
 			...(plannedWorktreeIntent ? { worktree: plannedWorktreeIntent } : {}),
 		};
 
@@ -4989,39 +5139,109 @@ async function executeLifecycleResponse(
 		let worktreeReceipt: SessionLifecycleWorktreeReceipt | undefined;
 		try {
 			if (launch.worktreePlan) {
-				worktreeReceipt = preparePlannedWorktree(launch.worktreePlan);
-				const worktree = {
-					cwdDigest: createHash("sha256").update(worktreeReceipt.cwd, "utf8").digest("hex"),
-					created: worktreeReceipt.created,
-					reused: worktreeReceipt.reused,
-					...(worktreeReceipt.branch
-						? { branchDigest: createHash("sha256").update(worktreeReceipt.branch, "utf8").digest("hex") }
-						: {}),
-				};
-				const durableEffects: LifecycleDurableEffectsReceipt = {
-					worktree,
-					digest: createHash("sha256").update(canonicalJson({ worktree })).digest("hex"),
-				};
-				await broker.ledger.transition(identity, "effect_started", { durableEffects });
-				ensureReusableNodeModules(launch.worktreePlan.repoRoot, launch.worktreePlan.worktreePath);
+				const prepTimeouts = readPreparationTimeouts(input);
+				if (!prepTimeouts.ok) return fail("invalid_input", PREPARATION_TIMEOUT_INVALID_MESSAGE);
+				const admittedAt =
+					typeof input.admittedAt === "number" && Number.isSafeInteger(input.admittedAt)
+						? input.admittedAt
+						: timing.now();
+				const requestedReadinessTimeoutMs =
+					typeof input.requestedReadinessTimeoutMs === "number" &&
+					isValidReadinessTimeoutMs(input.requestedReadinessTimeoutMs)
+						? input.requestedReadinessTimeoutMs
+						: readinessTimeout(input);
+				if (typeof requestedReadinessTimeoutMs !== "number") return requestedReadinessTimeoutMs;
+				const outer = deriveLifecycleOuterDeadlines({
+					admittedAt,
+					worktreePrepTimeoutMs: prepTimeouts.worktreePrepTimeoutMs,
+					dependencyPrepTimeoutMs: prepTimeouts.dependencyPrepTimeoutMs,
+					requestedReadinessTimeoutMs,
+				});
+				const controller = new AbortController();
+				const worktreeStartedAt = timing.now();
+				const worktreeWatch = abortWhenDue(controller, outer.worktreePreparationDeadlineAt, () => timing.now());
+				try {
+					worktreeReceipt = await preparePlannedWorktree(launch.worktreePlan, {
+						signal: controller.signal,
+						deadlineAt: outer.worktreePreparationDeadlineAt,
+						now: () => timing.now(),
+					});
+				} finally {
+					clearInterval(worktreeWatch);
+				}
+				const worktreeDoneAt = timing.now();
+				const worktreePreparationMs = Math.max(0, worktreeDoneAt - worktreeStartedAt);
+				await broker.ledger.transition(identity, "effect_started", {
+					durableEffects: durableWorktreeEffects(worktreeReceipt, { worktreePreparationMs }),
+				});
+				const remainingDepBudget = Math.min(
+					prepTimeouts.dependencyPrepTimeoutMs,
+					Math.max(0, outer.lifecycleCleanupDeadlineAt - worktreeDoneAt - requestedReadinessTimeoutMs),
+				);
+				const dependencyDeadlineAt = worktreeDoneAt + remainingDepBudget;
+				if (timing.now() >= dependencyDeadlineAt) throw new DependencyPreparationTimeoutError();
+				const depWatch = abortWhenDue(controller, dependencyDeadlineAt, () => timing.now());
+				const depHook = ensureReusableNodeModulesForTest;
+				const dependencyStartedAt = timing.now();
+				try {
+					if (depHook) {
+						await depHook(launch.worktreePlan.repoRoot, launch.worktreePlan.worktreePath, {
+							signal: controller.signal,
+							deadlineAt: dependencyDeadlineAt,
+						});
+					} else {
+						await ensureReusableNodeModulesCancellable(
+							launch.worktreePlan.repoRoot,
+							launch.worktreePlan.worktreePath,
+							{
+								signal: controller.signal,
+								deadlineAt: dependencyDeadlineAt,
+								now: () => timing.now(),
+							},
+						);
+					}
+				} finally {
+					clearInterval(depWatch);
+				}
+				const dependencyPreparationMs = Math.max(0, timing.now() - dependencyStartedAt);
+				await broker.ledger.transition(identity, "effect_started", {
+					durableEffects: durableWorktreeEffects(worktreeReceipt, {
+						worktreePreparationMs,
+						dependencyPreparationMs,
+						spawnAuthorizedAtOffsetMs: Math.max(0, timing.now() - admittedAt),
+					}),
+				});
+				const prepSucceededAt = timing.now();
+				childDeadlines = deriveLifecycleDeadlines(prepSucceededAt, requestedReadinessTimeoutMs);
+				readinessDeadline = childDeadlines.semanticReadyDeadlineAt;
+				terminationStartDeadline = childDeadlines.terminationStartDeadlineAt;
+				lifecycleDeadline = childDeadlines.lifecycleCleanupDeadlineAt;
 			}
 			await reapDeadLifecycleMarkers(launch.root);
 		} catch (error) {
-			return fail(
-				"spawn_failed",
-				`Unable to prepare lifecycle worktree: ${error instanceof Error ? error.message : String(error)}`,
-			);
+			if (launch.worktreePlan && worktreeReceipt?.created && !worktreeReceipt.reused) {
+				removeOwnedLaunchWorktree(launch.worktreePlan, worktreeReceipt);
+			}
+			return mapPreparationFailure(error);
 		}
-		if (timing.now() >= readinessDeadline)
+		if (!launch.worktreePlan && timing.now() >= readinessDeadline)
 			return fail(
 				"readiness_timeout",
 				"Lifecycle preparation exhausted the semantic readiness deadline before spawning.",
+			);
+		if (launch.worktreePlan && !childDeadlines)
+			return fail(
+				worktreeReceipt ? "dependency_preparation_timeout" : "worktree_preparation_timeout",
+				worktreeReceipt
+					? "Dependency preparation exceeded its deadline before the session host was spawned."
+					: "Worktree preparation exceeded its deadline before the session host was spawned.",
 			);
 		if (!hasProcessIncarnationAuthority())
 			return fail(
 				"incarnation_unavailable",
 				"OS process incarnation authority is unavailable; refusing to spawn a lifecycle session.",
 			);
+		const deadlines = childDeadlines as LifecycleDeadlines;
 
 		const coordinatorSidecarTarget =
 			typeof launch.coordinatorStateDir === "string" && typeof launch.coordinatorSidecarKeyId === "string"

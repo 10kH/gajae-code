@@ -323,6 +323,10 @@ export function formatLifecycleOutcome(r: SessionLifecycleResponse, verb?: Lifec
 		case "discovery_timeout":
 		case "readiness_timeout":
 			return "\u23f3 The session did not become ready in time. It may still be starting \u2014 check /session_recent.";
+		case "worktree_preparation_timeout":
+			return "\u23f3 Worktree preparation exceeded its deadline before the session host was spawned.";
+		case "dependency_preparation_timeout":
+			return "\u23f3 Dependency preparation exceeded its deadline before the session host was spawned.";
 		case "close_refused":
 			return "\u26a0\ufe0f Close refused: that session is not GJC-managed or did not match.";
 		case "not_found":

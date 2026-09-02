@@ -364,10 +364,10 @@ test("ACP preserves ready_then_exited and endpoint_unreadable with and without M
 	expect(acpMcpLaunchFailure(typed, [])).toBe(typed);
 	const unreadable = new SdkClientError("endpoint_unreadable", "Session s exited; endpoint file is malformed.");
 	expect(acpMcpLaunchFailure(unreadable, mcpServers)).toBe(unreadable);
-	const masked = acpMcpLaunchFailure(new SdkClientError("spawn_failed", "child exited"), mcpServers) as {
+	const preservedSpawn = acpMcpLaunchFailure(new SdkClientError("spawn_failed", "child exited"), mcpServers) as {
 		code: string;
 	};
-	expect(masked.code).toBe("unavailable");
+	expect(preservedSpawn.code).toBe("spawn_failed");
 });
 
 test("lifecycle service certainty for ready_then_exited and endpoint_unreadable is terminal, not retryable", async () => {

@@ -3,6 +3,14 @@ export const DEFAULT_READINESS_TIMEOUT_MS = 10_000;
 export const MIN_READINESS_TIMEOUT_MS = 4_000;
 export const MAX_READINESS_TIMEOUT_MS = 60_000;
 
+/** Bounded git worktree add/reuse window; independent of child semantic readiness. */
+export const DEFAULT_WORKTREE_PREPARATION_TIMEOUT_MS = 30_000;
+export const MIN_PREPARATION_TIMEOUT_MS = 1_000;
+export const MAX_PREPARATION_TIMEOUT_MS = 120_000;
+
+/** Bounded workspace install window; independent of child semantic readiness. */
+export const DEFAULT_DEPENDENCY_PREPARATION_TIMEOUT_MS = 30_000;
+
 export function isValidReadinessTimeoutMs(value: unknown): value is number {
 	return (
 		typeof value === "number" &&
@@ -12,7 +20,17 @@ export function isValidReadinessTimeoutMs(value: unknown): value is number {
 	);
 }
 
+export function isValidPreparationTimeoutMs(value: unknown): value is number {
+	return (
+		typeof value === "number" &&
+		Number.isSafeInteger(value) &&
+		value >= MIN_PREPARATION_TIMEOUT_MS &&
+		value <= MAX_PREPARATION_TIMEOUT_MS
+	);
+}
+
 export const READINESS_TIMEOUT_INVALID_MESSAGE = `readinessTimeoutMs must be an integer between ${MIN_READINESS_TIMEOUT_MS} and ${MAX_READINESS_TIMEOUT_MS}.`;
+export const PREPARATION_TIMEOUT_INVALID_MESSAGE = `worktreePreparationTimeoutMs and dependencyPreparationTimeoutMs must be integers between ${MIN_PREPARATION_TIMEOUT_MS} and ${MAX_PREPARATION_TIMEOUT_MS}.`;
 /**
  * Sleep until the duration elapses or the caller cancels the wait. Queue admission
  * uses this so a granted or refused waiter does not retain its cutoff timer for the
@@ -77,6 +95,10 @@ export function lifecycleStartupBudgetMs(requestedReadinessTimeoutMs: number): n
  * rather than left unextended: the broker queues it for exactly as long as one that
  * asked, so the common path would otherwise fail client-side while the broker runs
  * the startup to a durably persisted terminal result.
+ *
+ * Worktree launches add independent preparation budgets so git add / install cannot
+ * cut the caller while the broker still owns the request. One-arg
+ * {@link lifecycleStartupBudgetMs} stays queue+readiness for no-worktree callers.
  */
 export function lifecycleRequestTimeoutMs(operation: string, input: Record<string, unknown>): number | undefined {
 	const deadlineFields = [
@@ -97,7 +119,127 @@ export function lifecycleRequestTimeoutMs(operation: string, input: Record<strin
 		if (requested !== undefined && !isValidReadinessTimeoutMs(requested)) return undefined;
 		supplied = requested as number | undefined;
 	}
-	if (isStartupLifecycleOperation(operation))
-		return lifecycleStartupBudgetMs(supplied ?? DEFAULT_READINESS_TIMEOUT_MS) + CALLER_DEADLINE_SLACK_MS;
+	if (isStartupLifecycleOperation(operation)) {
+		const readiness = supplied ?? DEFAULT_READINESS_TIMEOUT_MS;
+		const preparation = preparationBudgetMs(input);
+		if (preparation === undefined) return undefined;
+		return lifecycleStartupBudgetMs(readiness) + preparation + CALLER_DEADLINE_SLACK_MS;
+	}
 	return supplied === undefined ? undefined : supplied + CALLER_DEADLINE_SLACK_MS;
+}
+
+function recordEnabled(value: unknown): boolean {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		!Array.isArray(value) &&
+		(value as Record<string, unknown>).enabled === true
+	);
+}
+
+function worktreeNamePresent(value: unknown): boolean {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const name = (value as Record<string, unknown>).name;
+	return typeof name === "string" && name.length > 0;
+}
+
+/**
+ * True when this request will run named or detached worktree preparation.
+ * Coordinator nests the selector at `target.worktree`; Direct/lifecycle service
+ * put `worktree` on the mutation target itself; broker serialization also
+ * accepts `{ worktree: { name } }` without `enabled`.
+ */
+export function lifecycleRequestHasWorktree(input: Record<string, unknown>): boolean {
+	const nested = input.target;
+	if (typeof nested === "object" && nested !== null && !Array.isArray(nested)) {
+		const nestedWorktree = (nested as Record<string, unknown>).worktree;
+		if (recordEnabled(nestedWorktree) || worktreeNamePresent(nestedWorktree)) return true;
+	}
+	const worktree = input.worktree;
+	if (worktree === true) return true;
+	return recordEnabled(worktree) || worktreeNamePresent(worktree);
+}
+
+function readPreparationTimeout(
+	input: Record<string, unknown>,
+	key: "worktreePreparationTimeoutMs" | "dependencyPreparationTimeoutMs",
+): number | undefined | "invalid" {
+	const value = input[key];
+	if (value === undefined) return undefined;
+	return isValidPreparationTimeoutMs(value) ? value : "invalid";
+}
+
+/**
+ * Sum of worktree and dependency preparation budgets, or 0 when the request
+ * has no worktree. Returns `undefined` when an explicit prep field is present
+ * but invalid so callers fail closed instead of silently dropping prep time.
+ */
+export function preparationBudgetMs(input: Record<string, unknown>): number | undefined {
+	const worktreeTimeout = readPreparationTimeout(input, "worktreePreparationTimeoutMs");
+	const dependencyTimeout = readPreparationTimeout(input, "dependencyPreparationTimeoutMs");
+	if (worktreeTimeout === "invalid" || dependencyTimeout === "invalid") return undefined;
+	if (!lifecycleRequestHasWorktree(input)) return 0;
+	return (
+		(worktreeTimeout ?? DEFAULT_WORKTREE_PREPARATION_TIMEOUT_MS) +
+		(dependencyTimeout ?? DEFAULT_DEPENDENCY_PREPARATION_TIMEOUT_MS)
+	);
+}
+
+export interface LifecycleOuterDeadlines {
+	admittedAt: number;
+	worktreePrepTimeoutMs: number;
+	dependencyPrepTimeoutMs: number;
+	requestedReadinessTimeoutMs: number;
+	worktreePreparationDeadlineAt: number;
+	lifecycleCleanupDeadlineAt: number;
+}
+
+/**
+ * Whole-request outer deadlines for a worktree launch. Child semantic readiness
+ * is still derived later at prepSucceededAt. Dependency start is sequential:
+ * callers clip remaining dep budget against `lifecycleCleanupDeadlineAt`
+ * after worktreeDoneAt.
+ */
+export function deriveLifecycleOuterDeadlines(input: {
+	admittedAt: number;
+	worktreePrepTimeoutMs: number;
+	dependencyPrepTimeoutMs: number;
+	requestedReadinessTimeoutMs: number;
+}): LifecycleOuterDeadlines {
+	const { admittedAt, worktreePrepTimeoutMs, dependencyPrepTimeoutMs, requestedReadinessTimeoutMs } = input;
+	if (
+		!Number.isSafeInteger(admittedAt) ||
+		!isValidPreparationTimeoutMs(worktreePrepTimeoutMs) ||
+		!isValidPreparationTimeoutMs(dependencyPrepTimeoutMs) ||
+		!isValidReadinessTimeoutMs(requestedReadinessTimeoutMs)
+	) {
+		throw new Error("Lifecycle outer timing values must be safe integers in the approved ranges.");
+	}
+	const worktreePreparationDeadlineAt = admittedAt + worktreePrepTimeoutMs;
+	const lifecycleCleanupDeadlineAt =
+		admittedAt + worktreePrepTimeoutMs + dependencyPrepTimeoutMs + requestedReadinessTimeoutMs;
+	if (!Number.isSafeInteger(worktreePreparationDeadlineAt) || !Number.isSafeInteger(lifecycleCleanupDeadlineAt)) {
+		throw new Error("Lifecycle outer timing values overflow the safe integer range.");
+	}
+	return {
+		admittedAt,
+		worktreePrepTimeoutMs,
+		dependencyPrepTimeoutMs,
+		requestedReadinessTimeoutMs,
+		worktreePreparationDeadlineAt,
+		lifecycleCleanupDeadlineAt,
+	};
+}
+
+export function readPreparationTimeouts(
+	input: Record<string, unknown>,
+): { ok: true; worktreePrepTimeoutMs: number; dependencyPrepTimeoutMs: number } | { ok: false } {
+	const worktreeTimeout = readPreparationTimeout(input, "worktreePreparationTimeoutMs");
+	const dependencyTimeout = readPreparationTimeout(input, "dependencyPreparationTimeoutMs");
+	if (worktreeTimeout === "invalid" || dependencyTimeout === "invalid") return { ok: false };
+	return {
+		ok: true,
+		worktreePrepTimeoutMs: worktreeTimeout ?? DEFAULT_WORKTREE_PREPARATION_TIMEOUT_MS,
+		dependencyPrepTimeoutMs: dependencyTimeout ?? DEFAULT_DEPENDENCY_PREPARATION_TIMEOUT_MS,
+	};
 }

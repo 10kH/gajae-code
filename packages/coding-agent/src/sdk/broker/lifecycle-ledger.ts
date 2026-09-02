@@ -55,6 +55,7 @@ export interface LifecycleDurableEffectsReceipt {
 		cwdDigest: string;
 		created: boolean;
 		reused: boolean;
+		createdBranch: boolean;
 		branchDigest?: string;
 	};
 	transcript?: {
@@ -62,6 +63,11 @@ export interface LifecycleDurableEffectsReceipt {
 		contentDigest: string;
 	};
 	startup?: LifecycleStartupFailureReceipt;
+	timings?: {
+		worktreePreparationMs?: number;
+		dependencyPreparationMs?: number;
+		spawnAuthorizedAtOffsetMs?: number;
+	};
 	digest?: string;
 }
 

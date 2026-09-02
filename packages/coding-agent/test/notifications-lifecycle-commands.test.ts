@@ -191,6 +191,8 @@ describe("lifecycle command parser (G009)", () => {
 			"spawn_failed",
 			"discovery_timeout",
 			"readiness_timeout",
+			"worktree_preparation_timeout",
+			"dependency_preparation_timeout",
 			"close_refused",
 			"not_found",
 			"terminal_uncertain",
