@@ -24,6 +24,7 @@ import type {
 	Tool,
 	ToolCall,
 	ToolResultMessage,
+	Usage,
 } from "../types";
 import { normalizeSystemPrompts } from "../utils";
 import { kCursorExecResolved } from "../utils/block-symbols";
@@ -76,6 +77,7 @@ import {
 	type ConversationStateStructure,
 	ConversationStateStructureSchema,
 	ConversationStepSchema,
+	ConversationTokenDetailsSchema,
 	ConversationTurnStructureSchema,
 	CursorRuleSchema,
 	CursorRuleSource,
@@ -175,6 +177,7 @@ export { CURSOR_CLIENT_VERSION };
 
 const conversationStateCache = new Map<string, ConversationStateStructure>();
 const conversationBlobStores = new Map<string, Map<string, Uint8Array>>();
+const conversationUsageContextCache = new Map<string, CursorUsageContext>();
 
 // F15: bound the module-global conversation caches so long-lived / many-session use cannot
 // grow them without limit. LRU by conversation count + TTL on idle conversations.
@@ -186,6 +189,7 @@ const conversationLastAccess = new Map<string, number>();
 export function disposeCursorConversation(conversationId: string): void {
 	conversationStateCache.delete(conversationId);
 	conversationBlobStores.delete(conversationId);
+	conversationUsageContextCache.delete(conversationId);
 	conversationLastAccess.delete(conversationId);
 }
 
@@ -337,9 +341,18 @@ class CursorRequestCoordinator implements CursorRequestWriter {
 
 	admit(taskFactory: () => Promise<void>): void {
 		if (!this.canAdmitTask()) return;
+		this.#admitOrdered(taskFactory, false);
+	}
+
+	admitCheckpoint(taskFactory: () => Promise<void>): Promise<void> {
+		if (this.#state === "failed") return Promise.reject(this.#failure ?? new Error("Cursor request failed"));
+		return this.#admitOrdered(taskFactory, true);
+	}
+
+	#admitOrdered(taskFactory: () => Promise<void>, allowAfterSuccess: boolean): Promise<void> {
 		const orderedTask = this.#hasAdmittedTask
 			? this.#taskChain.then(() => {
-					if (this.#state === "failed" || this.#state === "succeeded") return;
+					if (this.#state === "failed" || (!allowAfterSuccess && this.#state === "succeeded")) return;
 					return taskFactory();
 				})
 			: taskFactory();
@@ -355,6 +368,7 @@ class CursorRequestCoordinator implements CursorRequestWriter {
 			() => this.#tasks.delete(orderedTask),
 			() => this.#tasks.delete(orderedTask),
 		);
+		return orderedTask;
 	}
 
 	turnEnded(): void {
@@ -651,6 +665,9 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		let onAbort: (() => void) | undefined;
 		let coordinator: CursorRequestCoordinator = undefined!;
 		const baseUrl = model.baseUrl || CURSOR_API_URL;
+		let activeConversationId: string | undefined;
+		let previousConversationState: ConversationStateStructure | undefined;
+		let previousUsageContext: CursorUsageContext | undefined;
 
 		try {
 			const apiKey = options?.apiKey;
@@ -662,16 +679,22 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			}
 
 			const conversationId = options?.conversationId ?? options?.sessionId ?? crypto.randomUUID();
-			const blobStore = conversationBlobStores.get(conversationId) ?? new Map<string, Uint8Array>();
-			conversationBlobStores.set(conversationId, blobStore);
+			activeConversationId = conversationId;
+			const cachedBlobStore = conversationBlobStores.get(conversationId);
+			const blobStore = new Map(cachedBlobStore);
 			const cachedState = conversationStateCache.get(conversationId);
+			previousConversationState = cachedState;
+			const usageContext = buildCursorUsageContext(context, model, options);
+			previousUsageContext = conversationUsageContextCache.get(conversationId);
+			conversationUsageContextCache.set(conversationId, usageContext);
+			const reusableCachedState =
+				cachedState && canReuseCursorUsageContext(previousUsageContext, usageContext) ? cachedState : undefined;
 			const { requestBytes, conversationState } = buildGrpcRequest(model, context, options, {
 				conversationId,
 				blobStore,
-				conversationState: cachedState,
+				conversationState: reusableCachedState,
 			});
 			conversationStateCache.set(conversationId, conversationState);
-			touchCursorConversation(conversationId);
 			const requestContextTools = buildMcpToolDefinitions(context.tools);
 			const targetUrl = new URL(baseUrl);
 			const proxyUrl = getProxyForUrl(model.provider, targetUrl);
@@ -709,6 +732,28 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			};
 			let resolveH2: (() => void) | undefined;
 			let rejectH2: ((error: Error) => void) | undefined;
+			const inboundEnd = Promise.withResolvers<void>();
+			let inboundSettled = false;
+			let inboundTimeout: NodeJS.Timeout | undefined;
+			const settleInbound = (error?: Error) => {
+				if (inboundSettled) return;
+				inboundSettled = true;
+				if (inboundTimeout) {
+					clearTimeout(inboundTimeout);
+					inboundTimeout = undefined;
+				}
+				if (error) inboundEnd.reject(error);
+				else inboundEnd.resolve();
+			};
+			void inboundEnd.promise.catch(() => {});
+			const armInboundTimeout = () => {
+				const timeoutMs = options?.streamIdleTimeoutMs ?? 0;
+				if (timeoutMs <= 0 || inboundSettled) return;
+				inboundTimeout = setTimeout(
+					() => settleInbound(new Error("Cursor stream did not reach its inbound terminal frame")),
+					timeoutMs,
+				);
+			};
 			coordinator = new CursorRequestCoordinator(
 				h2Request,
 				stopHeartbeat,
@@ -724,16 +769,32 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				},
 				options?.streamIdleTimeoutMs ?? getStreamIdleTimeoutMs(),
 			);
-			h2Client.on("error", error => coordinator.fail(error));
-			h2Request.on("error", error => coordinator.fail(error));
+			h2Client.on("error", error => {
+				settleInbound(error);
+				coordinator.fail(error);
+			});
+			h2Request.on("error", error => {
+				settleInbound(error);
+				coordinator.fail(error);
+			});
 
 			stream.push({ type: "start", partial: output });
 
 			let pendingBuffer = Buffer.alloc(0);
+			const checkpointTasks: Promise<void>[] = [];
 			let currentTextBlock: (TextContent & { index: number }) | null = null;
 			let currentThinkingBlock: (ThinkingContent & { index: number }) | null = null;
 			let currentToolCall: ToolCallState | null = null;
-			const usageState: UsageState = { sawTokenDelta: false };
+			const cachedConversationUsedTokens =
+				conversationState.tokenDetails && canReuseCursorUsageContext(previousUsageContext, usageContext)
+					? conversationState.tokenDetails.usedTokens
+					: 0;
+			const usageState: UsageState = {
+				sawTokenDelta: false,
+				conversationUsedTokens: cachedConversationUsedTokens,
+				checkpointOutputTokens: 0,
+				hasConversationCheckpoint: false,
+			};
 
 			const state: BlockState = {
 				get currentTextBlock() {
@@ -763,8 +824,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			};
 
 			const onConversationCheckpoint = (checkpoint: ConversationStateStructure) => {
-				conversationStateCache.set(conversationId, checkpoint);
-				touchCursorConversation(conversationId);
+				usageState.pendingCheckpoint = checkpoint;
 			};
 
 			h2Request.on("trailers", trailers => {
@@ -775,11 +835,18 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				}
 			});
 			h2Request.on("end", () => {
+				settleInbound();
 				if (!coordinator.hasTurnEnded()) {
 					coordinator.fail(new Error("Cursor stream ended before turnEnded"));
 				}
 			});
+			h2Request.on("close", () => {
+				const error = new Error("Cursor stream closed before inbound completion");
+				if (!inboundSettled) settleInbound(error);
+				coordinator.fail(error);
+			});
 			onAbort = () => {
+				settleInbound(new Error("Request was aborted"));
 				coordinator.fail(new Error("Request was aborted"));
 			};
 			if (options?.signal) {
@@ -813,6 +880,21 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 						const isTurnEnded =
 							serverMessage.message.case === "interactionUpdate" &&
 							serverMessage.message.value.message?.case === "turnEnded";
+						const isConversationCheckpoint = serverMessage.message.case === "conversationCheckpointUpdate";
+						if (isConversationCheckpoint) {
+							checkpointTasks.push(
+								coordinator.admitCheckpoint(() => {
+									handleConversationCheckpointUpdate(
+										serverMessage.message.value as ConversationStateStructure,
+										output,
+										usageState,
+										onConversationCheckpoint,
+									);
+									return Promise.resolve();
+								}),
+							);
+							continue;
+						}
 						// Serialize handlers: exec messages can be asynchronous, and resolving the
 						// request on turnEnded before prior handlers finish loses their responses.
 						if (!coordinator.canAdmitTask()) continue;
@@ -866,6 +948,9 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					resolve();
 				}
 			});
+			armInboundTimeout();
+			await inboundEnd.promise;
+			await Promise.all(checkpointTasks);
 
 			if (state.currentTextBlock) {
 				const idx = output.content.indexOf(state.currentTextBlock);
@@ -899,6 +984,36 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				});
 			}
 
+			finalizeCursorUsage(output, usageState);
+			const stateToCommit =
+				usageState.pendingCheckpoint ?? conversationStateCache.get(conversationId) ?? conversationState;
+			if (
+				usageState.pendingCheckpoint ||
+				usageState.hasConversationCheckpoint ||
+				usageState.conversationUsedTokens > 0
+			) {
+				conversationStateCache.set(
+					conversationId,
+					create(ConversationStateStructureSchema, {
+						...stateToCommit,
+						...(usageState.hasConversationCheckpoint || usageState.conversationUsedTokens > 0
+							? {
+									tokenDetails: create(ConversationTokenDetailsSchema, {
+										usedTokens: output.usage.totalTokens,
+										maxTokens: stateToCommit.tokenDetails?.maxTokens ?? 0,
+									}),
+								}
+							: {}),
+					}),
+				);
+				touchCursorConversation(conversationId);
+			}
+			conversationUsageContextCache.set(conversationId, {
+				...usageContext,
+				messageKeys: [...usageContext.messageKeys, hashCursorUsageMessage(output)],
+			});
+			conversationBlobStores.set(conversationId, blobStore);
+			touchCursorConversation(conversationId);
 			calculateCost(model, output.usage);
 
 			output.duration = Date.now() - startTime;
@@ -910,6 +1025,12 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			});
 			stream.end();
 		} catch (error) {
+			if (activeConversationId) {
+				if (previousConversationState) conversationStateCache.set(activeConversationId, previousConversationState);
+				else conversationStateCache.delete(activeConversationId);
+				if (previousUsageContext) conversationUsageContextCache.set(activeConversationId, previousUsageContext);
+				else conversationUsageContextCache.delete(activeConversationId);
+			}
 			// Keep the completion promise terminal even for synchronous setup/write
 			// failures that may not emit a separate HTTP/2 error event.
 			const mappedError = mapH2TransportError(coordinator?.failureError() ?? error, baseUrl);
@@ -959,6 +1080,24 @@ interface BlockState {
 
 interface UsageState {
 	sawTokenDelta: boolean;
+	/**
+	 * Latest `ConversationTokenDetails.used_tokens`: the whole conversation's
+	 * token consumption as counted by Cursor, not this turn's output.
+	 */
+	conversationUsedTokens: number;
+	/** Output tokens already included in the latest checkpoint snapshot. */
+	checkpointOutputTokens: number;
+	/** Whether the current stream received a checkpoint, including an explicit zero. */
+	hasConversationCheckpoint: boolean;
+	pendingCheckpoint?: ConversationStateStructure;
+}
+
+interface CursorUsageContext {
+	modelKey: string;
+	systemPromptKey: string;
+	customSystemPromptKey: string;
+	toolsKey: string;
+	messageKeys: string[];
 }
 
 async function handleServerMessage(
@@ -2855,17 +2994,58 @@ function handleConversationCheckpointUpdate(
 	onConversationCheckpoint?: (checkpoint: ConversationStateStructure) => void,
 ): void {
 	onConversationCheckpoint?.(checkpoint);
-	if (usageState.sawTokenDelta) {
-		return;
-	}
 	const usedTokens = checkpoint.tokenDetails?.usedTokens ?? 0;
-	if (usedTokens <= 0) {
+	if (!checkpoint.tokenDetails) {
 		return;
 	}
-	if (output.usage.output !== usedTokens) {
-		output.usage.output = usedTokens;
-		output.usage.totalTokens = output.usage.input + output.usage.output;
+	const previousUsedTokens = usageState.conversationUsedTokens;
+	// `used_tokens` counts the whole conversation, so it is prompt-side usage and
+	// must not be attributed to this turn's output. Checkpoints can arrive while
+	// output is still streaming; the split is applied once the stream finalizes.
+	usageState.conversationUsedTokens = usedTokens;
+	usageState.checkpointOutputTokens =
+		usageState.hasConversationCheckpoint && usedTokens < previousUsedTokens ? 0 : output.usage.output;
+	usageState.hasConversationCheckpoint = true;
+}
+
+/**
+ * Cursor streams output tokens as deltas and reports whole-conversation
+ * consumption separately as `ConversationTokenDetails.used_tokens`. Derive
+ * prompt tokens from the difference so context accounting and compaction see a
+ * real prompt size instead of zero.
+ */
+export function finalizeCursorUsage(output: AssistantMessage, usageState: UsageState): void {
+	const used = usageState.conversationUsedTokens;
+	if (!usageState.hasConversationCheckpoint && used <= 0) {
+		return;
 	}
+	const outputIncludedInSnapshot = usageState.hasConversationCheckpoint ? usageState.checkpointOutputTokens : 0;
+	output.usage.input = Math.max(0, used - outputIncludedInSnapshot);
+	output.usage.totalTokens = output.usage.input + output.usage.output;
+}
+
+/** Exposes {@link finalizeCursorUsage} for tests without a live HTTP/2 stream. */
+export function finalizeCursorUsageForTest(
+	usedTokens: number,
+	outputTokens: number,
+	options: { checkpointOutputTokens?: number; hasConversationCheckpoint?: boolean } = {},
+): Usage {
+	const usage: Usage = {
+		input: 0,
+		output: outputTokens,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: outputTokens,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
+	finalizeCursorUsage({ usage } as AssistantMessage, {
+		sawTokenDelta: true,
+		conversationUsedTokens: usedTokens,
+		checkpointOutputTokens:
+			options.checkpointOutputTokens ?? ((options.hasConversationCheckpoint ?? usedTokens > 0) ? outputTokens : 0),
+		hasConversationCheckpoint: options.hasConversationCheckpoint ?? usedTokens > 0,
+	});
+	return usage;
 }
 
 function createBlobId(data: Uint8Array): Uint8Array {
@@ -3186,6 +3366,43 @@ function buildConversationTurns(messages: Message[], blobStore: Map<string, Uint
 	}
 
 	return turns;
+}
+
+function buildCursorUsageContext(
+	context: Context,
+	model: Model<"cursor-agent">,
+	options: CursorOptions | undefined,
+): CursorUsageContext {
+	return {
+		modelKey: hashCursorUsageValue({ provider: model.provider, id: model.id, wireModelId: model.wireModelId }),
+		systemPromptKey: hashCursorUsageValue(context.systemPrompt ?? []),
+		customSystemPromptKey: hashCursorUsageValue(options?.customSystemPrompt ?? ""),
+		toolsKey: hashCursorUsageValue(context.tools ?? []),
+		messageKeys: context.messages.map(message => hashCursorUsageMessage(message)),
+	};
+}
+
+function hashCursorUsageMessage(message: { role: string; content: unknown }): string {
+	return hashCursorUsageValue({ role: message.role, content: message.content });
+}
+
+function hashCursorUsageValue(value: unknown): string {
+	return createHash("sha256")
+		.update(JSON.stringify(value) ?? "")
+		.digest("hex");
+}
+
+function canReuseCursorUsageContext(previous: CursorUsageContext | undefined, current: CursorUsageContext): boolean {
+	if (
+		!previous ||
+		previous.modelKey !== current.modelKey ||
+		previous.systemPromptKey !== current.systemPromptKey ||
+		previous.customSystemPromptKey !== current.customSystemPromptKey ||
+		previous.toolsKey !== current.toolsKey
+	)
+		return false;
+	if (previous.messageKeys.length > current.messageKeys.length) return false;
+	return previous.messageKeys.every((key, index) => key === current.messageKeys[index]);
 }
 
 /** Exported for tests: decodes Cursor history blobs built from conversation messages. */
