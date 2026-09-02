@@ -1,14 +1,15 @@
 import { afterEach, describe, expect, it, setSystemTime, spyOn } from "bun:test";
 import { generateKeyPairSync, verify } from "node:crypto";
+import type { PathLike, StatOptions } from "node:fs";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { postmortem } from "@gajae-code/utils";
-import { FileLockTestHooks } from "../src/config/file-lock";
+import { FileLockTestHooks, processStartTime } from "../src/config/file-lock";
 import { loadInstallationHostId } from "../src/config/machine-identity";
 import { sessionRuntimeDir } from "../src/gjc-runtime/session-layout";
-import { withSessionStateFileLock } from "../src/gjc-runtime/session-state-lock";
+import { SessionStateLockUnavailableError, withSessionStateFileLock } from "../src/gjc-runtime/session-state-lock";
 import {
 	__sessionStateSidecarTestHooks,
 	canonicalCoordinatorSidecarPayload,
@@ -679,6 +680,42 @@ describe("coordinator runtime state sidecar", () => {
 		expect(await Bun.file(stateFile).text()).toBe(evidence);
 	});
 
+	it("reports a live transition timeout without misclassifying or changing runtime state", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "transition-timeout-state.json");
+		const transitionDir = `${stateFile}.lock.transition`;
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "transition-timeout";
+
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "turn_start" },
+			{ sessionId: "fallback", cwd: root, sessionFile: null },
+		);
+		const before = await Bun.file(stateFile).bytes();
+		await fs.mkdir(transitionDir);
+		await fs.writeFile(
+			`${transitionDir}.owner`,
+			JSON.stringify({
+				pid: process.pid,
+				start_time: processStartTime(process.pid) ?? "unknown",
+				token: "live-transition-timeout",
+				owner_host_id: await loadInstallationHostId(),
+			}),
+		);
+
+		const failure = await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "turn_start" },
+			{ sessionId: "fallback", cwd: root, sessionFile: null },
+		).catch(error => error);
+
+		expect(failure).toBeInstanceOf(SessionStateLockUnavailableError);
+		expect(failure).toMatchObject({
+			lockPath: transitionDir,
+			reason: "transition_claim_timeout",
+		});
+		expect(await Bun.file(stateFile).bytes()).toEqual(before);
+	});
+
 	it("preserves directory runtime-state evidence and refuses event and postmortem writes", async () => {
 		const root = await tempRoot();
 		const stateFile = path.join(root, "unreadable-state");
@@ -712,7 +749,11 @@ describe("coordinator runtime state sidecar", () => {
 		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "permission-denied-state";
 		await Bun.write(stateFile, evidence);
 		const denied = Object.assign(new Error("permission denied"), { code: "EACCES" });
-		const stat = spyOn(fs, "stat").mockRejectedValue(denied);
+		const originalStat = fs.stat;
+		const stat = spyOn(fs, "stat").mockImplementation((async (file: PathLike, options?: StatOptions) => {
+			if (String(file) === stateFile) return Promise.reject(denied);
+			return Reflect.apply(originalStat, fs, [file, options]) as never;
+		}) as typeof fs.stat);
 		try {
 			await expect(
 				persistCoordinatorRuntimeStateFromEvent(
@@ -725,8 +766,10 @@ describe("coordinator runtime state sidecar", () => {
 		}
 		expect(await Bun.file(stateFile).text()).toBe(evidence);
 
-		const readFileSync = spyOn(fsSync, "readFileSync").mockImplementation(() => {
-			throw denied;
+		const originalReadFileSync = fsSync.readFileSync;
+		const readFileSync = spyOn(fsSync, "readFileSync").mockImplementation((file, options) => {
+			if (String(file) === stateFile) throw denied;
+			return Reflect.apply(originalReadFileSync, fsSync, [file, options]) as never;
 		});
 		try {
 			await expect(

@@ -226,6 +226,42 @@ describe("coordinator session state lock", () => {
 		expect((await readJson(stateFile)).activity).toMatchObject({ seq: 1, tool: "bash" });
 	});
 
+	it("serializes concurrent resume contenders after reclaiming a dead transition claim", async () => {
+		const { stateFile } = await seededRunningSession("lock-concurrent-resume");
+		const transitionDir = `${stateFile}.lock.transition`;
+		await fs.mkdir(transitionDir);
+		await fs.writeFile(
+			`${transitionDir}.owner`,
+			JSON.stringify({
+				pid: DEAD_PID,
+				start_time: "unknown",
+				token: "dead-resume-transition",
+				owner_host_id: "local-host",
+			}),
+		);
+
+		const order: string[] = [];
+		const firstEntered = Promise.withResolvers<void>();
+		const releaseFirst = Promise.withResolvers<void>();
+		const first = withSessionStateFileLock(stateFile, async () => {
+			order.push("first-entered");
+			firstEntered.resolve();
+			await releaseFirst.promise;
+			order.push("first-released");
+		});
+		await firstEntered.promise;
+
+		const second = withSessionStateFileLock(stateFile, async () => {
+			order.push("second-entered");
+		});
+		await Bun.sleep(100);
+		expect(order).toEqual(["first-entered"]);
+
+		releaseFirst.resolve();
+		await Promise.all([first, second]);
+		expect(order).toEqual(["first-entered", "first-released", "second-entered"]);
+	});
+
 	it("keeps session-state parents, transition claims, and owner records restrictive under umask", async () => {
 		const root = await tempRoot();
 		const stateFile = path.join(root, "nested", "session", "state.json");
@@ -756,9 +792,11 @@ describe("coordinator session state lock", () => {
 				await Bun.write(target, "protected");
 				await create(lockFile, target);
 
-				await expect(writeToolActivity(root, "call-1", "2026-03-01T00:00:05.000Z")).rejects.toThrow(
-					/Existing runtime state marker is invalid or unreadable/,
-				);
+				await expect(writeToolActivity(root, "call-1", "2026-03-01T00:00:05.000Z")).rejects.toMatchObject({
+					name: "SessionStateLockUnavailableError",
+					lockPath: lockFile,
+					reason: "unsafe_lock_path_type",
+				});
 				await expect(reclaimStaleSessionStateLock(lockFile)).rejects.toBeInstanceOf(
 					SessionStateLockUnavailableError,
 				);
