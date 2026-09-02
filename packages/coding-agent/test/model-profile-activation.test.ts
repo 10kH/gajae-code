@@ -100,6 +100,11 @@ function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelP
 				minLevel: ThinkingLevel.Low,
 				maxLevel: ThinkingLevel.XHigh,
 			}),
+			model("anthropic", "claude-fable-5-1", {
+				mode: "effort",
+				minLevel: ThinkingLevel.Low,
+				maxLevel: ThinkingLevel.XHigh,
+			}),
 			model("anthropic", "claude-sonnet-5"),
 			model("anthropic", "claude-opus-4-6", {
 				mode: "effort",
@@ -1210,7 +1215,7 @@ describe("model profile activation", () => {
 		[
 			"fable-opus-codex",
 			{
-				default: "anthropic/claude-fable-5:high",
+				default: "anthropic/claude-fable-5-1:high",
 				executor: "openai-codex/gpt-5.6-terra:medium",
 				planner: "anthropic/claude-opus-5:medium",
 				critic: "anthropic/claude-opus-5:high",

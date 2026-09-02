@@ -291,11 +291,11 @@ const expectedProfiles: Array<{
 		name: "claude-fable",
 		requiredProviders: ["anthropic"],
 		mapping: {
-			default: "anthropic/claude-fable-5:xhigh",
+			default: "anthropic/claude-fable-5-1:xhigh",
 			executor: "anthropic/claude-sonnet-5",
-			planner: "anthropic/claude-fable-5:low",
-			critic: "anthropic/claude-fable-5:high",
-			architect: "anthropic/claude-fable-5:xhigh",
+			planner: "anthropic/claude-fable-5-1:low",
+			critic: "anthropic/claude-fable-5-1:high",
+			architect: "anthropic/claude-fable-5-1:xhigh",
 		},
 	},
 	{
@@ -654,7 +654,7 @@ const expectedProfiles: Array<{
 		name: "fable-opus-codex",
 		requiredProviders: ["anthropic", "openai-codex"],
 		mapping: {
-			default: "anthropic/claude-fable-5:high",
+			default: "anthropic/claude-fable-5-1:high",
 			executor: "openai-codex/gpt-5.6-terra:medium",
 			planner: "anthropic/claude-opus-5:medium",
 			critic: "anthropic/claude-opus-5:high",
@@ -734,7 +734,7 @@ const fixedNonCodexComboMappings: Record<string, Partial<Record<Role, string>>> 
 		critic: "opencode-go/mimo-v2.5-pro",
 	},
 	"fable-opus-codex": {
-		default: "anthropic/claude-fable-5:high",
+		default: "anthropic/claude-fable-5-1:high",
 		planner: "anthropic/claude-opus-5:medium",
 		critic: "anthropic/claude-opus-5:high",
 	},
