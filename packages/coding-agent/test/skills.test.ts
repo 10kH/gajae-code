@@ -672,6 +672,32 @@ description: Skill loaded from a tilde-expanded custom directory.
 			expect(collisionWarnings).toHaveLength(1);
 			expect(collisionWarnings[0].message).toContain("name collision");
 		});
+
+		it("keeps project scope authoritative across case-variant names", async () => {
+			const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-case-precedence-skills-"));
+			const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-case-precedence-home-"));
+			try {
+				await fs.mkdir(path.join(tempDir, ".git"));
+				const projectDir = path.join(tempDir, ".gjc", "skills", "foo");
+				const userDir = path.join(tempHome, ".gjc", "agent", "skills", "Foo");
+				await fs.mkdir(projectDir, { recursive: true });
+				await fs.mkdir(userDir, { recursive: true });
+				const skillFile = (name: string, body: string) =>
+					["---", `name: ${name}`, "description: case variant", "---", "", body].join("\n");
+				await fs.writeFile(path.join(projectDir, "SKILL.md"), skillFile("foo", "project body"));
+				await fs.writeFile(path.join(userDir, "SKILL.md"), skillFile("Foo", "user body"));
+
+				const { skills, warnings } = await loadSkills({ cwd: tempDir, home: tempHome });
+				const matches = skills.filter(skill => skill.name.toLowerCase() === "foo");
+				expect(matches).toHaveLength(1);
+				expect(matches[0]?.source).toBe("native:project");
+				expect(matches[0]?.filePath).toBe(path.join(projectDir, "SKILL.md"));
+				expect(warnings.some(w => w.message.includes('name collision: "Foo"'))).toBe(true);
+			} finally {
+				await safeRm(tempDir, { recursive: true, force: true });
+				await safeRm(tempHome, { recursive: true, force: true });
+			}
+		});
 	});
 
 	describe("buildSkillPromptMessage", () => {

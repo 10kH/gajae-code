@@ -242,14 +242,15 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 			});
 		}
 
-		const existing = skillMap.get(capSkill.name);
+		const skillKey = capSkill.name.toLowerCase();
+		const existing = skillMap.get(skillKey);
 		if (existing) {
 			collisionWarnings.push({
 				skillPath: capSkill.path,
 				message: `name collision: "${capSkill.name}" already loaded from ${existing.filePath}, skipping this one`,
 			});
 		} else {
-			skillMap.set(capSkill.name, {
+			skillMap.set(skillKey, {
 				name: capSkill.name,
 				description: typeof capSkill.frontmatter?.description === "string" ? capSkill.frontmatter.description : "",
 				filePath: capSkill.path,
@@ -318,14 +319,15 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 		const resolvedPath = customRealPaths[i];
 		if (realPathSet.has(resolvedPath)) continue;
 
-		const existing = skillMap.get(skill.name);
+		const skillKey = skill.name.toLowerCase();
+		const existing = skillMap.get(skillKey);
 		if (existing) {
 			collisionWarnings.push({
 				skillPath: skill.filePath,
 				message: `name collision: "${skill.name}" already loaded from ${existing.filePath}, skipping this one`,
 			});
 		} else {
-			skillMap.set(skill.name, skill);
+			skillMap.set(skillKey, skill);
 			realPathSet.add(resolvedPath);
 		}
 	}
