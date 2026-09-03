@@ -12,6 +12,8 @@
 
 ### Fixed
 
+- OpenAI Codex GPT-5.6 Sol selections now reject a known non-Pro ChatGPT OAuth account before dispatch, instead of allowing a binding that fails later with the provider's raw entitlement error. The same rejection is normalized for HTTP and streaming provider responses with guidance to choose a callable model or use an API-key credential.
+
 - Antigravity discovery now keeps mid-rollout models that the backend marks `isInternal` when the same response surfaces them through `agentModelSorts`. Internal models absent from the IDE's surfaced model groups remain hidden, and denylisted or retired selectors still take precedence.
 - Tokenless loopback auth-broker requests carrying a browser `Origin` header are now rejected before credential reads or mutations. Native loopback clients without `Origin`, authenticated browser-origin clients, and the public health endpoint retain their existing behavior.
 - `glm-zcode` login instructions now warn users who have the ZCode desktop app installed to cancel the browser's `zcode://` open prompt. The app exchanges the single-use authorization code itself, so a code pasted afterwards is rejected by the broker (`500 {"code":2007}`) and the documented paste flow failed without explanation.
