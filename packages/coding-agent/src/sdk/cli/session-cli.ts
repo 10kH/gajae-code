@@ -38,10 +38,13 @@ import { SESSION_REQUEST_TIMEOUT_MS } from "../session-reconnect";
 import {
 	type SdkCheckpointRecordV1,
 	type SdkRetentionGapV1,
+	type SdkRingPositionV1,
 	type SdkSessionRowV1,
 	type SdkTailItemV1,
 	SESSION_ROWS_VERSION,
 	stripSecretFields,
+	TailRevisionBuffer,
+	tailItemKey,
 	toCheckpointRecordV1,
 	toRetentionGapV1,
 	toSessionRowV1,
@@ -985,13 +988,6 @@ function extractTranscriptPage(response: unknown): { items: unknown[]; complete:
 	};
 }
 
-function tailItemKey(item: SdkTailItemV1): string {
-	if (item.generation !== undefined && item.seq !== undefined)
-		return `${item.kind}\u0000${item.generation}\u0000${item.seq}`;
-	if (item.id !== undefined) return `${item.kind}\u0000${item.id}`;
-	return `${item.kind}\u0000${JSON.stringify(item.payload)}`;
-}
-
 function mergeTailItems(
 	target: SdkTailItemV1[],
 	seen: Set<string>,
@@ -1006,8 +1002,9 @@ function mergeTailItems(
 	}
 }
 
-/** Canonical ring position of an event item, when the host stated one. */
-type TailSeqKey = { generation: number; seq: number };
+/** Canonical session-wide ring position of an event item, when the host stated one. */
+type TailSeqKey = SdkRingPositionV1;
+type TailLocalPosition = Pick<SdkRingPositionV1, "generation" | "seq">;
 
 function isPositionCoordinate(value: unknown): value is number {
 	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
@@ -1057,7 +1054,7 @@ function classifyRawEventPosition(event: unknown): "unpositioned" | "malformed" 
  * it is never silently downgraded to unpositioned. Claiming neither coordinate
  * is a genuine unpositioned event.
  */
-function classifyTailPosition(item: SdkTailItemV1): TailSeqKey | "unpositioned" | "malformed" {
+function classifyTailPosition(item: SdkTailItemV1): TailLocalPosition | "unpositioned" | "malformed" {
 	if (item.generation === undefined && item.seq === undefined) return "unpositioned";
 	if (!isPositionCoordinate(item.generation) || !isPositionCoordinate(item.seq)) return "malformed";
 	return { generation: item.generation, seq: item.seq };
@@ -1065,10 +1062,13 @@ function classifyTailPosition(item: SdkTailItemV1): TailSeqKey | "unpositioned" 
 
 function tailSeqKey(item: SdkTailItemV1): TailSeqKey | undefined {
 	const position = classifyTailPosition(item);
-	return typeof position === "string" ? undefined : position;
+	return typeof position === "string" || !isPositionCoordinate(item.revision)
+		? undefined
+		: { revision: item.revision, ...position };
 }
 
 function compareTailSeqKeys(left: TailSeqKey, right: TailSeqKey): number {
+	if (left.revision !== right.revision) return left.revision - right.revision;
 	return left.generation !== right.generation ? left.generation - right.generation : left.seq - right.seq;
 }
 
@@ -1112,10 +1112,12 @@ function mergeEventTailItems(
 			target.unpositioned.push(item);
 			continue;
 		}
+		const orderedPosition = tailSeqKey(item);
+		if (orderedPosition === undefined) throw new Error("A positioned tail item has no authoritative revision.");
 		let index = target.positioned.length;
 		for (; index > 0; index--) {
 			const previous = tailSeqKey(target.positioned[index - 1]!);
-			if (previous === undefined || compareTailSeqKeys(previous, position) <= 0) break;
+			if (previous === undefined || compareTailSeqKeys(previous, orderedPosition) <= 0) break;
 		}
 		target.positioned.splice(index, 0, item);
 	}
@@ -1158,11 +1160,13 @@ function tailItemFromRouterFrame(frame: SessionRouterFrame): SdkTailItemV1 | und
 	return toTailItemV1(
 		{
 			kind: frame.name,
+			...(frame.revision === undefined ? {} : { revision: frame.revision }),
 			...(seq === undefined ? {} : { generation: frame.generation, seq }),
 			payload: frame.body,
 		},
 		{
 			kind: frame.name,
+			...(frame.revision === undefined ? {} : { revision: frame.revision }),
 			...(seq === undefined ? {} : { generation: frame.generation, seq }),
 		},
 	);
@@ -1406,6 +1410,7 @@ async function runLiveTail(
 	// evidence.
 	const seenTranscript = new Set<string>();
 	const seenEvents = new Set<string>();
+	const liveRevisionBuffer = new TailRevisionBuffer();
 	let checkpoint: SdkCheckpointRecordV1 | undefined;
 	let gap: SdkRetentionGapV1 | undefined;
 	let liveReason: TailExitReason | undefined;
@@ -1445,7 +1450,7 @@ async function runLiveTail(
 				// close at a contested position win instead of failing closed, and
 				// checking it after the monotonic guard would silently skip a
 				// conflicting kind at an already-decided position.
-				const positionKey = `${position.generation}\u0000${position.seq}`;
+				const positionKey = `${position.revision}\u0000${position.generation}\u0000${position.seq}`;
 				const claimed = claimedLifecycleKinds.get(positionKey);
 				if (claimed !== undefined && claimed !== item.kind) {
 					malformed ??= new SdkSessionCliError(
@@ -1487,9 +1492,17 @@ async function runLiveTail(
 		if (attachment.sessionId !== sessionId) return;
 		const item = tailItemFromRouterFrame(frame);
 		if (!item) return;
-		if (item.revision === undefined && checkpoint?.revision !== undefined) item.revision = checkpoint.revision;
-		// If checkpoint was undefined, queue for later stamping? For now leave without rev
-		applyLifecycle(mergeEventTailItems(eventItems, seenEvents, [item], include));
+		try {
+			applyLifecycle(mergeEventTailItems(eventItems, seenEvents, liveRevisionBuffer.push(item), include));
+		} catch (error) {
+			malformed ??= new SdkSessionCliError(
+				"protocol_error",
+				error instanceof Error ? error.message : "A live tail item had no authoritative revision.",
+				1,
+				{ sessionId, kind: item.kind, generation: item.generation, seq: item.seq },
+			);
+			rejectLive?.(malformed);
+		}
 	};
 
 	return await withRouter(
@@ -1511,6 +1524,10 @@ async function runLiveTail(
 			const extraction = extractCheckpoint(checkpointResponse);
 			checkpoint = extraction.record;
 			gap = extraction.gap;
+			if (checkpoint !== undefined)
+				applyLifecycle(
+					mergeEventTailItems(eventItems, seenEvents, liveRevisionBuffer.resolve(checkpoint.revision), include),
+				);
 			if (gap !== undefined && args.strict === true)
 				throw new SdkSessionCliError(
 					"retention_gap",
@@ -1595,7 +1612,11 @@ async function runLiveTail(
 			applyLifecycle(mergeEventTailItems(eventItems, seenEvents, replayItems, include));
 			if (malformed !== undefined) throw malformed;
 			if (checkpoint !== undefined) {
-				const checkpointKey = { generation: checkpoint.generation, seq: checkpoint.seq };
+				const checkpointKey = {
+					revision: checkpoint.revision,
+					generation: checkpoint.generation,
+					seq: checkpoint.seq,
+				};
 				if (turnStateKey === undefined || compareTailSeqKeys(checkpointKey, turnStateKey) >= 0) {
 					turnStateKey = checkpointKey;
 					turnIdle = checkpoint.idle;

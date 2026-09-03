@@ -338,6 +338,8 @@ type AttachedSession = {
 	replayPending: boolean;
 	replayPendingSince?: number;
 	replayPendingToken?: object;
+	drainingHeldSeq?: number;
+	drainingHeldBatch?: HeldFrame[];
 	readyTail: Promise<void>;
 	readonly publication: { promise: Promise<void>; resolve: () => void; reject: (reason?: unknown) => void };
 	dispose: () => void;
@@ -1899,44 +1901,53 @@ export class SessionRouter {
 	}
 
 	async #reinitializeAttachment(attached: AttachedSession): Promise<void> {
-		const previous = attached.readyTail;
+		// A prior ready tail may be waiting for publication work carried by the dead
+		// socket. Chaining the reconnect behind it prevents the replacement from even
+		// issuing replay. Replace its hold-array identity to fence that tail, but carry
+		// forward frames it had not started draining; the active draining sequence is
+		// already represented by the independent frame tail.
+		if (attached.barrier.held) {
+			const carried = [...(attached.drainingHeldBatch ?? []), ...attached.barrier.held];
+			attached.drainingHeldBatch = undefined;
+			attached.barrier.held = carried
+				.filter(entry => entry.seq !== attached.drainingHeldSeq)
+				.filter((entry, index, entries) => entries.findIndex(candidate => candidate.seq === entry.seq) === index);
+		}
 		const replayToken = {};
 		attached.replayPending = true;
 		attached.replayPendingSince = Date.now();
 		attached.replayPendingToken = replayToken;
-		const current = previous
-			.catch(() => undefined)
-			.then(async () => {
-				if (!this.#attachmentLive(attached)) return;
-				const proven = await this.#readProvenEndpoint(attached.indexed);
-				if (
-					!proven ||
-					proven.endpoint.url !== attached.endpoint.url ||
-					proven.endpoint.token !== attached.endpoint.token ||
-					proven.endpoint.pid !== attached.pid ||
-					!sameEndpointIdentity(attached.endpointIdentity, proven.identity)
-				) {
-					await this.#retireAttachment(attached, proven ? "replaced_same_generation" : undefined);
-					return;
-				}
-				attached.initializingPublication = true;
-				try {
-					void Promise.resolve()
-						.then(() => this.#deps.onNotificationSubscriptionReady?.(attached.notificationSubscription))
-						.catch(error => {
-							this.#detachNotification(attached, "cancelled");
-							logger.warn(`SDK notification subscription reconnect hook failed locally: ${String(error)}`);
-						});
-					await this.#deps.onAttachmentReady?.(attached.capability);
-					await this.#deps.onReplayReady?.();
-				} catch {
-					await this.#retireAttachment(attached);
-					return;
-				} finally {
-					attached.initializingPublication = false;
-				}
-				if (this.#attachmentLive(attached)) await this.#replayAttachment(attached, attached.cursor.seq);
-			});
+		const current = Promise.resolve().then(async () => {
+			if (!this.#attachmentLive(attached)) return;
+			const proven = await this.#readProvenEndpoint(attached.indexed);
+			if (
+				!proven ||
+				proven.endpoint.url !== attached.endpoint.url ||
+				proven.endpoint.token !== attached.endpoint.token ||
+				proven.endpoint.pid !== attached.pid ||
+				!sameEndpointIdentity(attached.endpointIdentity, proven.identity)
+			) {
+				await this.#retireAttachment(attached, proven ? "replaced_same_generation" : undefined);
+				return;
+			}
+			attached.initializingPublication = true;
+			try {
+				void Promise.resolve()
+					.then(() => this.#deps.onNotificationSubscriptionReady?.(attached.notificationSubscription))
+					.catch(error => {
+						this.#detachNotification(attached, "cancelled");
+						logger.warn(`SDK notification subscription reconnect hook failed locally: ${String(error)}`);
+					});
+				await this.#deps.onAttachmentReady?.(attached.capability);
+				await this.#deps.onReplayReady?.();
+			} catch {
+				await this.#retireAttachment(attached);
+				return;
+			} finally {
+				attached.initializingPublication = false;
+			}
+			if (this.#attachmentLive(attached)) await this.#replayAttachment(attached, attached.cursor.seq);
+		});
 		attached.readyTail = current.finally(() => {
 			if (attached.replayPendingToken === replayToken) {
 				attached.replayPending = false;
@@ -2294,7 +2305,19 @@ export class SessionRouter {
 				return;
 			}
 			const batch = held.splice(0, held.length).sort((left, right) => left.seq - right.seq);
-			for (const entry of batch) await this.#enqueueFrame(attached, entry.frame, "ordered");
+			attached.drainingHeldBatch = batch;
+			for (;;) {
+				const entry = batch.shift();
+				if (!entry) break;
+				attached.drainingHeldSeq = entry.seq;
+				try {
+					await this.#enqueueFrame(attached, entry.frame, "ordered");
+				} finally {
+					if (attached.drainingHeldSeq === entry.seq) attached.drainingHeldSeq = undefined;
+				}
+				if (attached.barrier.held !== held) return;
+			}
+			if (attached.drainingHeldBatch === batch) attached.drainingHeldBatch = undefined;
 		}
 	}
 
@@ -2374,7 +2397,7 @@ export class SessionRouter {
 				this.#failBarrier(attached, "replay response contained a malformed event");
 				return;
 			}
-			let previousSeq = sinceSeq;
+			let previousSeq = -1;
 			for (const event of events) {
 				if (event.type !== "event") {
 					this.#failBarrier(attached, "replay response contained a non-event frame");
@@ -2411,7 +2434,7 @@ export class SessionRouter {
 				}
 				const retained = events
 					.map(event => readSequence(event.seq))
-					.find(seq => seq !== undefined && seq <= gap.toSeq);
+					.find(seq => seq !== undefined && seq >= gap.fromSeq && seq <= gap.toSeq);
 				if (retained !== undefined) {
 					this.#failBarrier(
 						attached,

@@ -5224,6 +5224,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		};
 		runtime = new SessionSdkSessionRuntime({
 			transport,
+			eventRevision: () =>
+				typeof (ctx as Partial<ExtensionContext>).getTranscript === "function"
+					? ctx.getTranscript().length
+					: undefined,
 			masterCapabilityVerify: frame =>
 				verifyMasterCapabilityFrame({
 					frame,

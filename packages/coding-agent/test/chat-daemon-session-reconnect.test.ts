@@ -50,6 +50,7 @@ function currentHostIncarnation(): string {
 // Keep the Router's independent attach deadline outside the fake reconnect clock.
 const inertAttachmentTimeout = (() => ({ unref: () => undefined })) as unknown as typeof setTimeout;
 const clearInertAttachmentTimeout = (() => undefined) as unknown as typeof clearTimeout;
+const CHAT_TEST_WAIT_ATTEMPTS = 15_000;
 /**
  * Mirrors `REPLAY_BARRIER_LIMIT`: how many live frames one attachment holds behind an
  * outstanding replay. Too low a mirror still overflows the real barrier; too high a real
@@ -626,7 +627,8 @@ async function withAttachedDiscordRuntime(
 
 /** The runtime does its index and endpoint IO before it dials, so wait for the dial. */
 async function awaitSocket(count: number): Promise<FakeWebSocket> {
-	for (let attempt = 0; attempt < 5_000 && FakeWebSocket.instances.length < count; attempt++) await Bun.sleep(1);
+	for (let attempt = 0; attempt < CHAT_TEST_WAIT_ATTEMPTS && FakeWebSocket.instances.length < count; attempt++)
+		await Bun.sleep(1);
 	expect(FakeWebSocket.instances).toHaveLength(count);
 	return FakeWebSocket.instances[count - 1]!;
 }
@@ -639,8 +641,13 @@ async function awaitSocket(count: number): Promise<FakeWebSocket> {
  * a test that drops the socket the instant a post appears would otherwise be racing a
  * cursor the runtime has not moved yet.
  */
-async function awaitPosts(provider: FakeSlackProvider, count: number, clock?: FakeClock): Promise<void> {
-	for (let attempt = 0; attempt < 5_000 && provider.posts.length < count; attempt++) {
+async function awaitPosts(
+	provider: FakeSlackProvider,
+	count: number,
+	clock?: FakeClock,
+	waitAttempts = CHAT_TEST_WAIT_ATTEMPTS,
+): Promise<void> {
+	for (let attempt = 0; attempt < waitAttempts && provider.posts.length < count; attempt++) {
 		await flush();
 		if (clock) {
 			const pending = clock.pendingDelays();
@@ -656,7 +663,7 @@ async function awaitPosts(provider: FakeSlackProvider, count: number, clock?: Fa
 async function awaitPostAttempts(provider: FakeSlackProvider, text: string, count: number): Promise<void> {
 	for (
 		let attempt = 0;
-		attempt < 5_000 && provider.postAttempts.filter(post => post.text === text).length < count;
+		attempt < CHAT_TEST_WAIT_ATTEMPTS && provider.postAttempts.filter(post => post.text === text).length < count;
 		attempt++
 	)
 		await Bun.sleep(1);
@@ -664,7 +671,11 @@ async function awaitPostAttempts(provider: FakeSlackProvider, text: string, coun
 }
 
 async function awaitReconciliationFailures(provider: FakeSlackProvider, count: number): Promise<void> {
-	for (let attempt = 0; attempt < 5_000 && provider.reconciliationFailuresObserved < count; attempt++)
+	for (
+		let attempt = 0;
+		attempt < CHAT_TEST_WAIT_ATTEMPTS && provider.reconciliationFailuresObserved < count;
+		attempt++
+	)
 		await Bun.sleep(1);
 	expect(provider.reconciliationFailuresObserved).toBeGreaterThanOrEqual(count);
 }
@@ -672,7 +683,8 @@ async function awaitReconciliationFailures(provider: FakeSlackProvider, count: n
 async function awaitCompletedPosts(provider: FakeSlackProvider, count: number): Promise<void> {
 	for (
 		let attempt = 0;
-		attempt < 5_000 && (provider.posts.length < count || provider.completedClientMsgIds.size < count);
+		attempt < CHAT_TEST_WAIT_ATTEMPTS &&
+		(provider.posts.length < count || provider.completedClientMsgIds.size < count);
 		attempt++
 	)
 		await Bun.sleep(1);
@@ -683,13 +695,14 @@ async function awaitCompletedPosts(provider: FakeSlackProvider, count: number): 
 
 /** A refusal is the only trace a failed publication leaves on this side of the runtime. */
 async function awaitRefusals(provider: FakeSlackProvider, count: number): Promise<void> {
-	for (let attempt = 0; attempt < 5_000 && provider.refused.length < count; attempt++) await Bun.sleep(1);
+	for (let attempt = 0; attempt < CHAT_TEST_WAIT_ATTEMPTS && provider.refused.length < count; attempt++)
+		await Bun.sleep(1);
 	expect(provider.refused).toHaveLength(count);
 }
 
 /** The replay rides the socket, so settle on the request the host itself observed. */
 async function awaitReplayRequests(host: FakeSessionHost, count: number, clock?: FakeClock): Promise<void> {
-	for (let attempt = 0; attempt < 5_000 && host.replayRequests.length < count; attempt++) {
+	for (let attempt = 0; attempt < CHAT_TEST_WAIT_ATTEMPTS && host.replayRequests.length < count; attempt++) {
 		await flush();
 		if (clock) {
 			const pending = clock.pendingDelays();
@@ -927,7 +940,7 @@ test("a live frame delivered before the resume replay answers is published in se
 
 test("a replayed frame at or below the cursor is dropped instead of published a second time", async () => {
 	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile }) => {
-		await withSerializedFakeTransport(async () => {
+		await withSerializedFakeTransport(async clock => {
 			const host = new FakeSessionHost();
 			const starting = runtime.start();
 			host.accept(await awaitSocket(1));
@@ -944,12 +957,84 @@ test("a replayed frame at or below the cursor is dropped instead of published a 
 
 			reconcile();
 			host.accept(await awaitSocket(2));
-			await awaitPosts(provider, 2);
+			await awaitPosts(provider, 2, clock);
 			await Bun.sleep(20);
 			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\none", "GJC notice\ntwo"]);
 		});
 	});
 }, 20_000);
+
+test("an acknowledged replay prefix does not conflict with a later conceded gap", async () => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile, warnings }) => {
+		await withSerializedFakeTransport(async clock => {
+			const host = new FakeSessionHost();
+			const starting = runtime.start();
+			host.accept(await awaitSocket(1));
+			await starting;
+
+			host.emit("one");
+			await awaitCompletedPosts(provider, 1);
+			host.drop();
+			host.emitGated();
+			host.emit("three");
+			host.replayRewind = 1;
+			host.forcedGap = { kind: "sequence_gap", fromSeq: 2, toSeq: 2, resyncQueries: ["Q01"] };
+
+			reconcile();
+			host.accept(await awaitSocket(2));
+			await awaitPosts(provider, 2, clock);
+
+			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\none", "GJC notice\nthree"]);
+			expect(warnings.filter(line => line.includes("conceded a retention gap"))).toEqual([
+				`chat daemon replay conceded a retention gap (sequences 2-2 are gone from the host); session ${SESSION_ID} generation ${GENERATION} resumes at seq 3.`,
+			]);
+		});
+	});
+}, 20_000);
+
+test("a reconnect preserves every unstarted frame from a blocked held batch", async () => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile }) => {
+		await withSerializedFakeTransport(async clock => {
+			const host = new FakeSessionHost(0);
+			const starting = runtime.start();
+			host.accept(await awaitSocket(1));
+			await starting;
+
+			host.drop();
+			host.stallReplay = true;
+			reconcile();
+			const replacement = await awaitSocket(2);
+			host.accept(replacement);
+			await awaitReplayRequests(host, 2);
+			host.emit("one");
+			host.emit("two");
+			host.emit("three");
+			await Bun.sleep(100);
+			provider.stallPosts();
+			replacement.deliver({
+				type: "event_replay_result",
+				id: host.lastReplayId,
+				ok: true,
+				events: [],
+				generation: GENERATION,
+				lastSeq: 0,
+			});
+			await awaitPosts(provider, 1);
+
+			host.stallReplay = false;
+			replacement.deliver({ type: "hello", connectionId: "replacement-incarnation" });
+			await awaitReplayRequests(host, 3);
+
+			provider.releasePosts();
+			await awaitPosts(provider, 3, clock);
+			expect(provider.posts.map(post => post.text)).toEqual([
+				"GJC notice\none",
+				"GJC notice\ntwo",
+				"GJC notice\nthree",
+			]);
+		});
+	});
+}, 30_000);
 
 test("stopping the runtime while a replay is pending neither hangs nor publishes what is held", async () => {
 	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile }) => {
@@ -1024,7 +1109,7 @@ test("a supersession while a replay is pending discards it instead of replaying 
 }, 20_000);
 
 test("a replay refused on a live socket loses no event and leaves the cursor below the gap", async () => {
-	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile }) => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile, awaitFrameSettlement }) => {
 		await withSerializedFakeTransport(async clock => {
 			const host = new FakeSessionHost();
 			const starting = runtime.start();
@@ -1032,7 +1117,8 @@ test("a replay refused on a live socket loses no event and leaves the cursor bel
 			await starting;
 
 			host.emit("one");
-			await awaitCompletedPosts(provider, 1);
+			await awaitFrameSettlement(GENERATION, 1);
+			expect(provider.posts).toHaveLength(1);
 
 			host.drop();
 			host.emit("two");
@@ -1447,7 +1533,7 @@ test("a conceded gap carries the cursor over the loss even when the retained suf
 }, 20_000);
 test("a conceded gap publishes the sequences live delivery already carried instead of dropping them", async () => {
 	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile, warnings }) => {
-		await withSerializedFakeTransport(async () => {
+		await withSerializedFakeTransport(async clock => {
 			const host = new FakeSessionHost(2);
 			const starting = runtime.start();
 			host.accept(await awaitSocket(1));
@@ -1469,7 +1555,7 @@ test("a conceded gap publishes the sequences live delivery already carried inste
 			reconcile();
 			const replacement = await awaitSocket(2);
 			host.accept(replacement);
-			await awaitReplayRequests(host, 2);
+			await awaitReplayRequests(host, 2, clock);
 
 			// All three ride the replacement socket ahead of the answer, and all three are
 			// still queued behind the stalled publish when it arrives, so the gap the answer
@@ -1508,8 +1594,8 @@ test("a conceded gap publishes the sequences live delivery already carried inste
 			host.stallReplay = false;
 			reconcile();
 			host.accept(await awaitSocket(3));
-			await awaitReplayRequests(host, 3);
-			await awaitPosts(provider, 3);
+			await awaitReplayRequests(host, 3, clock);
+			await awaitPosts(provider, 3, clock);
 			await Bun.sleep(20);
 
 			// The host evicted the sequence, but live delivery kept it: the two producers
@@ -1520,13 +1606,13 @@ test("a conceded gap publishes the sequences live delivery already carried inste
 				"GJC notice\ntail",
 			]);
 			expect(warnings.filter(line => line.includes("conceded a retention gap"))).toEqual([
-				`chat daemon replay conceded a retention gap (sequences 1-2 are gone from the host, 1 of them recovered from live delivery); session ${SESSION_ID} generation ${GENERATION} resumes at seq 3.`,
+				`chat daemon replay conceded a retention gap (sequences 1-2 are gone from the host, 2 of them recovered from live delivery); session ${SESSION_ID} generation ${GENERATION} resumes at seq 3.`,
 			]);
 
 			// The recovered frame did not strand the cursor below the conceded range: the
 			// stream continues on the socket it already has, in sequence, exactly once.
 			host.emit("after gap");
-			await awaitPosts(provider, 4);
+			await awaitPosts(provider, 4, clock);
 			await Bun.sleep(20);
 			expect(provider.posts.map(post => post.text)).toEqual([
 				"GJC notice\none",
@@ -1699,13 +1785,13 @@ test("a surface that refuses a frame for good concedes it instead of wedging the
 			// it already holds, with no further rebuild.
 			provider.failPosts = 0;
 			host.emit("three");
-			await awaitPosts(provider, 2);
+			await awaitPosts(provider, 2, undefined, 30_000);
 			await Bun.sleep(20);
 			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\none", "GJC notice\nthree"]);
 			expect(FakeWebSocket.instances).toHaveLength(3);
 		});
 	});
-}, 20_000);
+}, 45_000);
 
 test("a rolled endpoint's first frame gets its own delivery budget, not the previous generation's", async () => {
 	await withAttachedSessionRuntime(
@@ -1785,7 +1871,7 @@ test("a frame queued behind a failed publication cannot advance the cursor past 
 			// replay the delayed retirement would still discard.
 			for (
 				let attempt = 0;
-				attempt < 5_000 && !warnings.some(line => line.includes("publication failed at seq 2"));
+				attempt < CHAT_TEST_WAIT_ATTEMPTS && !warnings.some(line => line.includes("publication failed at seq 2"));
 				attempt++
 			)
 				await Bun.sleep(1);

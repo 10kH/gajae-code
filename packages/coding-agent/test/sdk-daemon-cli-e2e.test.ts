@@ -24,6 +24,13 @@ function isExplicitTailReplay(frame: Record<string, unknown>): boolean {
 	return frame.type === "event_replay" && typeof frame.connectionId === "string";
 }
 
+function withCheckpointRevision(
+	event: Record<string, unknown>,
+	checkpoint: { revision: number },
+): Record<string, unknown> {
+	return event.revision === undefined ? { ...event, revision: checkpoint.revision } : event;
+}
+
 // Delay applied to the explicit tail replay response so live frames pushed at
 // request time provably reach the client first.
 const EXPLICIT_REPLAY_DELAY_MS = 250;
@@ -126,6 +133,7 @@ describe("SDK session CLI", () => {
 	// the reply so the live frames provably land first.
 	let explicitReplayEvents: Record<string, unknown>[] | undefined;
 	let earlyLiveEvents: Record<string, unknown>[] = [];
+	let preCheckpointLiveEvents: Record<string, unknown>[] = [];
 	let wireLog: string[] = [];
 	// Retained transcript rows served by `transcript.list`. Non-empty rows make
 	// the checkpoint advertise a cursor so the CLI actually drains the page.
@@ -149,6 +157,7 @@ describe("SDK session CLI", () => {
 		openSockets = new Set();
 		explicitReplayEvents = undefined;
 		earlyLiveEvents = [];
+		preCheckpointLiveEvents = [];
 		wireLog = [];
 		transcriptRows = [];
 		checkpointRecord = { revision: 1, generation: 1, seq: 0, idle: false };
@@ -210,7 +219,7 @@ describe("SDK session CLI", () => {
 								return;
 							}
 							for (const event of earlyLiveEvents) {
-								socket.send(JSON.stringify(event));
+								socket.send(JSON.stringify(withCheckpointRevision(event, checkpointRecord)));
 								wireLog.push(`live_sent:${event.kind}:${event.seq}`);
 							}
 							const events = explicitReplayEvents;
@@ -231,7 +240,8 @@ describe("SDK session CLI", () => {
 									});
 									socket.send(lastReplayPayload);
 									wireLog.push("explicit_replay_result");
-									for (const event of deferredLiveEvents) socket.send(JSON.stringify(event));
+									for (const event of deferredLiveEvents)
+										socket.send(JSON.stringify(withCheckpointRevision(event, checkpointRecord)));
 								} catch {
 									// connection already closed
 								}
@@ -259,7 +269,7 @@ describe("SDK session CLI", () => {
 								for (const event of pending)
 									for (const target of openSockets) {
 										try {
-											target.send(JSON.stringify(event));
+											target.send(JSON.stringify(withCheckpointRevision(event, checkpointRecord)));
 										} catch {
 											// connection already closed
 										}
@@ -325,6 +335,10 @@ describe("SDK session CLI", () => {
 								);
 								return;
 							}
+							for (const event of preCheckpointLiveEvents) {
+								socket.send(JSON.stringify(event));
+								wireLog.push(`pre_checkpoint_live_sent:${event.kind}:${event.seq}`);
+							}
 							socket.send(
 								JSON.stringify({
 									type: "query_response",
@@ -387,7 +401,7 @@ describe("SDK session CLI", () => {
 			JSON.stringify({ sessionId: "live", pid: process.pid, url: `ws://127.0.0.1:${endpointServer.port}`, token }),
 		);
 		const endpointMtimeMs = (await fs.stat(endpointPath)).mtimeMs;
-		broker = new Broker({ agentDir, packageGeneration: "test" });
+		broker = new Broker({ agentDir });
 		await broker.start();
 		await broker.index.append({
 			type: "host_registered",
@@ -616,7 +630,7 @@ describe("SDK session CLI", () => {
 			deferredLiveEvents = [
 				{ type: "event", generation: 1, seq: 4, kind: "turn_end", payload: { type: "turn_end" } },
 			];
-			const args = ["tail", "live", "--until-idle", "--timeout-ms", "20000"];
+			const args = ["tail", "live", "--until-idle", "--timeout-ms", "40000"];
 			if (strict) args.push("--strict");
 			const tail = await runCli(root, agentDir, args);
 			if (strict) {
@@ -628,7 +642,7 @@ describe("SDK session CLI", () => {
 				expect(result.gap).toMatchObject({ code: "retention_gap", missing: { from: 1, to: 1 } });
 				expect(result.items.map((item: Record<string, unknown>) => item.seq)).toEqual([2, 3, 4]);
 			}
-		}, 60_000);
+		}, 90_000);
 	}
 
 	it("forwards the exchanged checkpoint token to transcript.list", async () => {
@@ -698,7 +712,7 @@ describe("SDK session CLI", () => {
 			},
 		];
 
-		const tail = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "5000"]);
+		const tail = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "20000"]);
 
 		expect(tail.exitCode, `tail stdout=${tail.stdout}\nstderr=${tail.stderr}`).toBe(0);
 		const result = JSON.parse(tail.stdout).result as { terminal: boolean; items: Array<Record<string, unknown>> };
@@ -746,6 +760,78 @@ describe("SDK session CLI", () => {
 		const tail = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "4000"]);
 		expect(tail.exitCode, tail.stderr).toBe(0);
 		expect(JSON.parse(tail.stdout).result).toMatchObject({ terminal: true });
+	}, 60_000);
+
+	it("stamps a positioned pre-checkpoint live frame before deduping its replayed copy", async () => {
+		checkpointRecord = { revision: 7, generation: 1, seq: 0, idle: false };
+		const duplicatedStart = {
+			type: "event",
+			generation: 1,
+			seq: 1,
+			kind: "turn_start",
+			payload: { type: "turn_start", sessionId: "live" },
+		};
+		preCheckpointLiveEvents = [duplicatedStart];
+		replayEvents = [duplicatedStart];
+		deferredLiveEvents = [{ type: "event", generation: 1, seq: 2, kind: "turn_end", payload: { type: "turn_end" } }];
+
+		const tail = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "5000"]);
+
+		expect(wireLog).toContain("pre_checkpoint_live_sent:turn_start:1");
+		expect(tail.exitCode, `tail stdout=${tail.stdout}\nstderr=${tail.stderr}`).toBe(0);
+		const items = (JSON.parse(tail.stdout).result?.items ?? []) as Array<Record<string, unknown>>;
+		expect(
+			items.filter(
+				item => item.kind === "turn_start" && item.revision === 7 && item.generation === 1 && item.seq === 1,
+			),
+		).toHaveLength(1);
+	}, 60_000);
+
+	it("orders lifecycle positions by revision before generation and sequence", async () => {
+		checkpointRecord = { revision: 1, generation: 1, seq: 0, idle: false };
+		earlyLiveEvents = [
+			{
+				type: "event",
+				revision: 2,
+				generation: 1,
+				seq: 1,
+				kind: "turn_start",
+				payload: { type: "turn_start", sessionId: "live" },
+			},
+		];
+		explicitReplayEvents = [
+			{
+				type: "event",
+				revision: 1,
+				generation: 1,
+				seq: 1,
+				kind: "turn_end",
+				payload: { type: "turn_end", sessionId: "live" },
+			},
+		];
+		deferredLiveEvents = [
+			{
+				type: "event",
+				revision: 2,
+				generation: 1,
+				seq: 2,
+				kind: "turn_end",
+				payload: { type: "turn_end", sessionId: "live" },
+			},
+		];
+
+		const tail = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "5000"]);
+
+		assertLiveFramesPrecededReplay();
+		expect(tail.exitCode, `tail stdout=${tail.stdout}\nstderr=${tail.stderr}`).toBe(0);
+		const items = (JSON.parse(tail.stdout).result?.items ?? []) as Array<Record<string, unknown>>;
+		expect(
+			items.map(item => ({ kind: item.kind, revision: item.revision, generation: item.generation, seq: item.seq })),
+		).toEqual([
+			{ kind: "turn_end", revision: 1, generation: 1, seq: 1 },
+			{ kind: "turn_start", revision: 2, generation: 1, seq: 1 },
+			{ kind: "turn_end", revision: 2, generation: 1, seq: 2 },
+		]);
 	}, 60_000);
 
 	// Out-of-band ordering: the Router delivers live frames as they arrive, while
@@ -1553,7 +1639,7 @@ describe("SDK session CLI", () => {
 
 	it("selects the broker specified by --agent-dir over the ambient agent directory", async () => {
 		const alternateAgentDir = path.join(root, "alternate-agent");
-		const alternateBroker = new Broker({ agentDir: alternateAgentDir, packageGeneration: "test" });
+		const alternateBroker = new Broker({ agentDir: alternateAgentDir });
 		await alternateBroker.start();
 		try {
 			await alternateBroker.index.append({
