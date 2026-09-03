@@ -16,14 +16,17 @@
 #     indicator plus the manager's completion receipt for the SAME job id.
 #
 # Every run writes `receipt.json` beside the captures binding the outcome to
-# the executed binary (canonical path + SHA-256), the driver's own git HEAD and
-# the bash.ts blob it built from, so a capture can never be mistaken for a run
-# of a different build.
+# the executed binary (absolute path + SHA-256 of the bytes actually run) and
+# listing only the captures THIS invocation wrote. The driver's own checkout
+# state (git HEAD, bash.ts blob) is recorded as driver provenance, not as proof
+# of what source produced the binary. The receipt is finalized on every exit,
+# including unhandled failures, by the EXIT trap.
 #
 # Usage: scripts/dogfood/steer-fold-tmux.sh [<gjc binary>] [<out dir>]
 set -euo pipefail
 
-BIN="$(cd "$(dirname "${1:-$PWD/packages/coding-agent/dist/gjc}")" && pwd)/$(basename "${1:-$PWD/packages/coding-agent/dist/gjc}")"
+BIN="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${1:-$PWD/packages/coding-agent/dist/gjc}")"
+[ -x "$BIN" ] || { echo "not an executable: $BIN" >&2; exit 64; }
 OUT="${2:-$PWD/artifacts/steer-fold/dogfood}"
 mkdir -p "$OUT"
 OUT="$(cd "$OUT" && pwd)"
@@ -36,38 +39,47 @@ pane() { tmux capture-pane -t "$SESSION" -p -S -400; }
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 REPO="$(cd "$(dirname "$SELF")/../.." && pwd)"
 BIN_SHA256="$(shasum -a 256 "$BIN" | cut -d' ' -f1)"
-DRIVER_HEAD="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
-BASH_TS_BLOB="$(git -C "$REPO" rev-parse "HEAD:packages/coding-agent/src/tools/bash.ts" 2>/dev/null || echo unknown)"
-# `getToolInterruptPolicy` occurrences in the compiled bundle: the fix removed
-# the ToolSession seam (declaration + SDK provider), so a fixed build carries
-# fewer hits than a pre-fix build of the same base (observed 2 vs 4).
-BIN_POLICY_SEAM_HITS="$(grep -c -a 'getToolInterruptPolicy' "$BIN" || true)"
+BIN_SIZE="$(stat -f %z "$BIN" 2>/dev/null || stat -c %s "$BIN")"
+DRIVER_HEAD="$(git -C "$REPO" rev-parse HEAD)"
+BASH_TS_BLOB="$(git -C "$REPO" rev-parse "HEAD:packages/coding-agent/src/tools/bash.ts")"
+# Observed discriminator for THIS lineage only: the fix removed two
+# `getToolInterruptPolicy` seams (declaration + SDK provider), so a fixed build
+# has fewer matching lines than a pre-fix build of the same base (2 vs 4).
+# grep exit 1 is "no match" (a legitimate 0); anything >1 is a real error.
+BIN_POLICY_SEAM_HITS="$(grep -c -a 'getToolInterruptPolicy' "$BIN")" || { rc=$?; (( rc == 1 )) || { echo "grep failed on $BIN (rc=$rc)" >&2; exit 70; }; BIN_POLICY_SEAM_HITS=0; }
 OUTCOME="running"; EXIT_CODE=""; JOB=""; NONCE_STATE="unanswered"
+OWNED_CAPTURES=()
 
-receipt() { # writes/overwrites the receipt with the current state
-	cat > "$OUT/receipt.json" <<JSON
-{
-  "schemaVersion": 1,
-  "kind": "steer-fold-tmux-dogfood",
-  "recordedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-  "binary": { "path": "$BIN", "sha256": "$BIN_SHA256", "sizeBytes": $(stat -f %z "$BIN"), "toolInterruptPolicySeamHits": ${BIN_POLICY_SEAM_HITS:-0} },
-  "driver": { "path": "$SELF", "repoHead": "$DRIVER_HEAD", "bashTsBlob": "$BASH_TS_BLOB" },
-  "session": { "tmux": "$SESSION", "cwd": "$WORK", "nonce": "$NONCE" },
-  "outcome": "$OUTCOME", "exitCode": "${EXIT_CODE}", "jobId": "${JOB}", "steerAnswered": "$NONCE_STATE",
-  "captures": [$(ls "$OUT"/*.ansi 2>/dev/null | sed 's|.*/||; s|^|"|; s|$|"|' | paste -sd, -)]
-}
-JSON
+json_str() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"; }
+
+receipt() { # writes the receipt atomically with the current state; never fails the run
+	local caps="" c
+	for c in "${OWNED_CAPTURES[@]+"${OWNED_CAPTURES[@]}"}"; do caps="${caps:+$caps,}$(json_str "$c")"; done
+	local tmp="$OUT/.receipt.json.$$"
+	{
+		printf '{\n'
+		printf '  "schemaVersion": 1,\n  "kind": "steer-fold-tmux-dogfood",\n'
+		printf '  "recordedAt": %s,\n' "$(json_str "$(date -u +%Y-%m-%dT%H:%M:%SZ)")"
+		printf '  "binary": { "absolutePath": %s, "sha256": %s, "sizeBytes": %s, "toolInterruptPolicySeamHits": %s },\n' "$(json_str "$BIN")" "$(json_str "$BIN_SHA256")" "$BIN_SIZE" "$BIN_POLICY_SEAM_HITS"
+		printf '  "driverCheckout": { "path": %s, "repoHead": %s, "bashTsBlob": %s, "note": "state of the checkout that ran the driver; not proof of what source produced the binary" },\n' "$(json_str "$SELF")" "$(json_str "$DRIVER_HEAD")" "$(json_str "$BASH_TS_BLOB")"
+		printf '  "session": { "tmux": %s, "cwd": %s, "nonce": %s },\n' "$(json_str "$SESSION")" "$(json_str "$WORK")" "$(json_str "$NONCE")"
+		printf '  "outcome": %s, "exitCode": %s, "jobId": %s, "steerAnswered": %s,\n' "$(json_str "$OUTCOME")" "$(json_str "$EXIT_CODE")" "$(json_str "$JOB")" "$(json_str "$NONCE_STATE")"
+		printf '  "captures": [%s]\n}\n' "$caps"
+	} > "$tmp" 2>/dev/null && mv -f "$tmp" "$OUT/receipt.json" 2>/dev/null || echo "warn: could not write receipt" >&2
 }
 
 capture() {
 	# Keep escape sequences: the ultragoal PTY gate needs terminal control codes.
 	tmux capture-pane -t "$SESSION" -p -e -S -400 > "$OUT/$1.ansi"
 	pane > "$OUT/$1.txt"
+	OWNED_CAPTURES+=("$1.ansi")
 }
 
 fail() { # <code> <label> <message>
-	capture "fail-$2"
+	# Record the failure state FIRST so the receipt is right even if the pane is gone.
 	OUTCOME="fail:$2"; EXIT_CODE="$1"; receipt
+	capture "fail-$2" 2>/dev/null || echo "warn: could not capture pane for $2" >&2
+	receipt
 	echo "FAIL: $3" >&2
 	exit "$1"
 }
@@ -81,13 +93,21 @@ wait_for() { # <pattern> <timeout-seconds> <label>
 	done
 }
 
-cleanup() {
+finalize() {
+	local rc=$?
+	# An exit that did not pass through fail()/PASS is an unhandled failure.
+	if [ "$OUTCOME" = "running" ]; then OUTCOME="fail:unhandled"; EXIT_CODE="$rc"; fi
+	[ -n "$EXIT_CODE" ] || EXIT_CODE="$rc"
+	receipt
 	tmux kill-session -t "$SESSION" 2>/dev/null || echo "warn: tmux session $SESSION already gone" >&2
 	sleep 1
 	rm -rf "$WORK" 2>/dev/null || echo "warn: could not remove $WORK" >&2
+	exit "$rc"
 }
-trap cleanup EXIT
+trap finalize EXIT
 
+# A reused output directory must not lend a previous run's captures to this one.
+rm -f "$OUT"/*.ansi "$OUT"/*.txt "$OUT"/receipt.json
 cd "$WORK"
 git init -q .
 receipt
