@@ -131,4 +131,54 @@ describe("session-state lock forced-exit recovery", () => {
 		expect(await fs.exists(transitionDir)).toBe(false);
 		expect(sleep).toHaveBeenCalled();
 	});
+
+	it("immediately retries after exact removal of a dead legacy transition record", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-legacy-transition-reclaimed-"));
+		roots.push(root);
+		const stateFile = path.join(root, "runtime-state.json");
+		const transitionFile = `${stateFile}.lock.transition`;
+		await fs.writeFile(
+			transitionFile,
+			JSON.stringify({
+				pid: DEAD_PID,
+				start_time: "unknown",
+				token: "legacy-transition-reclaimed",
+				owner_host_id: "forced-exit-probe-host",
+			}),
+		);
+		installLocalIdentityBindings();
+		const sleep = vi.spyOn(Bun, "sleep");
+
+		await expect(withSessionStateFileLock(stateFile, async () => "resumed")).resolves.toBe("resumed");
+		expect(sleep).not.toHaveBeenCalled();
+	});
+
+	it("keeps backoff when a dead legacy transition record disappears during exact removal", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-legacy-transition-not-found-"));
+		roots.push(root);
+		const stateFile = path.join(root, "runtime-state.json");
+		const transitionFile = `${stateFile}.lock.transition`;
+		await fs.writeFile(
+			transitionFile,
+			JSON.stringify({
+				pid: DEAD_PID,
+				start_time: "unknown",
+				token: "legacy-transition-not-found",
+				owner_host_id: "forced-exit-probe-host",
+			}),
+		);
+		installLocalIdentityBindings();
+		setSessionStateLockNativeBindings(() => ({
+			...exactIdentityNativeBindings,
+			exactUnlink(file, identity) {
+				const removed = exactIdentityNativeBindings.exactUnlink(file, identity);
+				if (!removed.ok) return removed;
+				return { ok: false, code: "not_found" };
+			},
+		}));
+		const sleep = vi.spyOn(Bun, "sleep");
+
+		await expect(withSessionStateFileLock(stateFile, async () => "resumed")).resolves.toBe("resumed");
+		expect(sleep).toHaveBeenCalled();
+	});
 });
