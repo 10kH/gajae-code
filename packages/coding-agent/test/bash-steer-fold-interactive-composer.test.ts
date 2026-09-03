@@ -85,7 +85,7 @@ describe("interactive composer steer over a foreground bash", () => {
 				"bash.autoBackground.enabled": false,
 				"compaction.enabled": false,
 				busyPromptMode: "steer",
-				interruptMode: "immediate",
+				toolInterruptPolicy: "abort_tools",
 			}),
 			model: mock.model,
 			toolNames: ["bash"],
