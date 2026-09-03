@@ -2720,7 +2720,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			hasForegroundBashBackgroundRequestHandler: () => session?.hasForegroundBashBackgroundRequestHandler() ?? false,
 			requestForegroundBashBackground: (reason, adapter) =>
 				Promise.resolve(session?.requestForegroundBashBackground(reason, adapter) ?? false),
-			getToolInterruptPolicy: () => agent?.getToolInterruptPolicy() ?? "abort_tools",
 
 			getCredentialSessionId: () => session?.credentialSessionId ?? credentialSessionId,
 			getMcpManager: () => mcpManager ?? options.inheritedMcpManager,

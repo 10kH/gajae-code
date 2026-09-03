@@ -242,8 +242,6 @@ export interface ToolSession {
 	hasForegroundBashBackgroundRequestHandler?: () => boolean;
 	/** Request that a foreground wait fold into a background job, if supported. `reason` names the trigger; `adapter` targets a specific wait instead of the newest registration. */
 	requestForegroundBashBackground?: (reason?: FoldReason, adapter?: FoldAdapter) => Promise<boolean>;
-	/** Current tool interrupt policy; `finish_tools` lets the running tool finish, so a steer must not fold it. */
-	getToolInterruptPolicy?: () => "abort_tools" | "finish_tools";
 
 	/** Get the session-owned or inherited async job manager. */
 	getAsyncJobManager?: () => AsyncJobManager | undefined;

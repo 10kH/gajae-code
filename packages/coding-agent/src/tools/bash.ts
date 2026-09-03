@@ -1139,20 +1139,22 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 
 	/**
 	 * Whether a queued user steer may fold the running foreground wait. Mirrors
-	 * the loop's own steer admission: `busyPromptMode=queue` never admits a
-	 * steer into the busy run, and `toolInterruptPolicy=finish_tools` explicitly
-	 * lets the tool finish, so neither may fold. The
-	 * auto-background setting is deliberately not consulted: like the chord,
-	 * a steer fold is a user action.
+	 * the loop's steer admission: `busyPromptMode=queue` never admits a steer
+	 * into the busy run, so it never folds. `toolInterruptPolicy` is
+	 * deliberately NOT a gate: `finish_tools` means "do not kill the batch to
+	 * deliver a steer", and a fold kills nothing. It is the one way to deliver
+	 * the steer now AND let the command finish, so it applies under both
+	 * policies; the policy only decides what the loop does with sibling tools
+	 * after the fold returns. The auto-background setting is likewise not
+	 * consulted: like the chord, a steer fold is a user action.
 	 *
-	 * Fails closed: a session that cannot prove its tool interrupt policy or
-	 * report newly admitted steering is not steer-foldable.
+	 * Fails closed: a session that cannot report newly admitted steering or
+	 * accept a fold request is not steer-foldable.
 	 */
 	#steerFoldEnabled(): boolean {
-		const { waitForUserSteering, getToolInterruptPolicy, requestForegroundBashBackground } = this.session;
-		if (!waitForUserSteering || !getToolInterruptPolicy || !requestForegroundBashBackground) return false;
-		if (this.session.settings.get("busyPromptMode") !== "steer") return false;
-		return getToolInterruptPolicy() === "abort_tools";
+		const { waitForUserSteering, requestForegroundBashBackground } = this.session;
+		if (!waitForUserSteering || !requestForegroundBashBackground) return false;
+		return this.session.settings.get("busyPromptMode") === "steer";
 	}
 
 	/**
@@ -1161,8 +1163,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	 * when the wait starts, or one that arrives inside the grace window, never
 	 * folds: the command finishes normally and that steer is consumed at the
 	 * ordinary tool boundary. The watcher keeps observing so a later qualifying
-	 * steer still folds, and re-checks the gates at that moment so a
-	 * `busyPromptMode`/`toolInterruptPolicy` change during the command is honored.
+	 * steer still folds, and re-checks the gate at that moment so a
+	 * `busyPromptMode` change during the command is honored.
 	 * Returns a stop function; call it when the wait settles. No-op when steer
 	 * folding is gated off at start.
 	 */

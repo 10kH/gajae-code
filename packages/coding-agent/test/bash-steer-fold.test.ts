@@ -11,7 +11,7 @@
  *  3. the fold does not arm the turn-ending fence/stop, so the SAME run
  *     consumes the steer (the loop's batch-skip is covered by agent-loop tests);
  *  4. abort still aborts (a steer never kills the command);
- *  5. busyPromptMode=queue / toolInterruptPolicy=finish_tools -> no fold.
+ *  5. busyPromptMode=queue -> no fold; toolInterruptPolicy is not a gate (a fold kills nothing).
  * Plus the manager-level contract every fold path relies on: `foldReason` on
  * the job/snapshot and exactly one `onFold` notification per fold.
  */
@@ -177,27 +177,23 @@ describe("steer-triggered bash fold", () => {
 		expect(harness.folds).toHaveLength(0);
 	}, 10_000);
 
-	it("parity 5: toolInterruptPolicy=finish_tools never folds on steer", async () => {
-		harness = createSteerHarness(cwd, { toolInterruptPolicy: "finish_tools" });
+	it("parity 5: the fold gate does not read toolInterruptPolicy (a fold kills nothing; finish_tools is proven live in bash-steer-fold-finish-tools.test.ts)", async () => {
+		harness = createSteerHarness(cwd);
 		const tool = new BashTool(harness.session);
-		const resultPromise = tool.execute("steer-gate-wait", { command: "sleep 2.4; printf 'done\\n'", timeout: 30 });
+		const resultPromise = tool.execute(
+			"steer-finish-tools",
+			{ command: "sleep 5; printf 'done\\n'", timeout: 30 },
+			undefined,
+			undefined,
+			turnContext(),
+		);
 		await Bun.sleep(STEER_FOLD_GRACE_MS + 100);
 		harness.steer();
 		const result = await resultPromise;
-		expect(result.details?.async).toBeUndefined();
-		expect(harness.folds).toHaveLength(0);
-	}, 10_000);
-
-	it("parity 5: a session that cannot prove its interrupt mode is not steer-foldable (fail closed)", async () => {
-		harness = createSteerHarness(cwd, { omitToolInterruptPolicy: true });
-		const tool = new BashTool(harness.session);
-		const resultPromise = tool.execute("steer-gate-unknown", { command: "sleep 2.4; printf 'done\\n'", timeout: 30 });
-		await Bun.sleep(STEER_FOLD_GRACE_MS + 100);
-		harness.steer();
-		const result = await resultPromise;
-		expect(result.details?.async).toBeUndefined();
-		expect(harness.folds).toHaveLength(0);
-	}, 10_000);
+		expect(result.details?.foldReason).toBe("steer");
+		expect(harness.folds.map(fold => fold.reason)).toEqual(["steer"]);
+		await harness.manager.getJob(result.details!.async!.jobId)?.promise;
+	}, 15_000);
 
 	it("parity 5: a session without a steering-arrival waiter is not steer-foldable (fail closed)", async () => {
 		harness = createSteerHarness(cwd, { omitSteeringWait: true });
