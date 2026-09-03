@@ -453,6 +453,7 @@ type StartupModelProfileArgs = {
 	startupModel?: CreateAgentSessionOptions["model"];
 	startupThinkingLevel?: CreateAgentSessionOptions["thinkingLevel"];
 	preferCachedModels?: boolean;
+	preferCachedDefaultProfile?: boolean;
 };
 
 async function applyStartupModelProfilesWithPolicy(
@@ -484,7 +485,9 @@ async function applyStartupModelProfilesWithPolicy(
 	// deferred `--model <pattern>` path resolved inside createAgentSession.
 	const explicitModel = args.parsedArgs.model ? (args.startupModel ?? args.session.model) : undefined;
 	const defaultProfile = args.settings.get("modelProfile.default");
-	const preferCachedProfiles = args.preferCachedModels === true && args.parsedArgs.mpreset !== undefined;
+	const preferCachedProfiles =
+		(args.preferCachedModels === true && args.parsedArgs.mpreset !== undefined) ||
+		(args.preferCachedDefaultProfile === true && defaultProfile !== undefined);
 	const applyConfiguredProfiles = async (): Promise<boolean> => {
 		let applied = true;
 		if (defaultProfile) {
