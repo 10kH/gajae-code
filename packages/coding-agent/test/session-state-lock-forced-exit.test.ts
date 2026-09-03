@@ -11,6 +11,7 @@ import { exactIdentityNativeBindings } from "./helpers/exact-identity-natives";
 
 const probe = path.join(import.meta.dir, "fixtures", "session-state-lock-forced-exit-probe.ts");
 const roots: string[] = [];
+const DEAD_PID = 2 ** 22 - 1;
 
 async function waitForFile(file: string): Promise<void> {
 	for (let attempt = 0; attempt < 200; attempt++) {
@@ -20,10 +21,34 @@ async function waitForFile(file: string): Promise<void> {
 	throw new Error(`Timed out waiting for ${file}`);
 }
 
+async function seedDeadTransition(root: string, token: string): Promise<{ stateFile: string; transitionDir: string }> {
+	const stateFile = path.join(root, "runtime-state.json");
+	const transitionDir = `${stateFile}.lock.transition`;
+	await fs.mkdir(transitionDir);
+	await fs.writeFile(
+		`${transitionDir}.owner`,
+		JSON.stringify({
+			pid: DEAD_PID,
+			start_time: "unknown",
+			token,
+			owner_host_id: "forced-exit-probe-host",
+		}),
+	);
+	return { stateFile, transitionDir };
+}
+
+function installLocalIdentityBindings(): void {
+	setSessionStateLockNativeBindings(() => exactIdentityNativeBindings);
+	SessionStateLockTestHooks.ownerHostId = () => "forced-exit-probe-host";
+	SessionStateLockTestHooks.legacyOwnerHostId = () => "forced-exit-probe-legacy-host";
+	SessionStateLockTestHooks.unqualifiedOwnerIsLocal = false;
+}
+
 afterEach(async () => {
 	SessionStateLockTestHooks.ownerHostId = undefined;
 	SessionStateLockTestHooks.legacyOwnerHostId = undefined;
 	SessionStateLockTestHooks.unqualifiedOwnerIsLocal = undefined;
+	SessionStateLockTestHooks.afterTransitionClaimContention = undefined;
 	setSessionStateLockNativeBindings(undefined);
 	vi.restoreAllMocks();
 	await Promise.all(roots.splice(0).map(root => fs.rm(root, { recursive: true, force: true })));
@@ -54,10 +79,7 @@ describe("session-state lock forced-exit recovery", () => {
 				owner_host_id: "forced-exit-probe-host",
 			});
 
-			setSessionStateLockNativeBindings(() => exactIdentityNativeBindings);
-			SessionStateLockTestHooks.ownerHostId = () => "forced-exit-probe-host";
-			SessionStateLockTestHooks.legacyOwnerHostId = () => "forced-exit-probe-legacy-host";
-			SessionStateLockTestHooks.unqualifiedOwnerIsLocal = false;
+			installLocalIdentityBindings();
 			const sleep = vi.spyOn(Bun, "sleep");
 
 			await expect(withSessionStateFileLock(stateFile, async () => "resumed")).resolves.toBe("resumed");
@@ -70,4 +92,43 @@ describe("session-state lock forced-exit recovery", () => {
 			}
 		}
 	}, 10_000);
+
+	it("keeps backoff when an EEXIST claim disappears before inspection", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-transition-disappeared-"));
+		roots.push(root);
+		const { stateFile, transitionDir } = await seedDeadTransition(root, "disappeared-before-inspection");
+		installLocalIdentityBindings();
+		let injected = false;
+		SessionStateLockTestHooks.afterTransitionClaimContention = async contended => {
+			if (injected || contended !== transitionDir) return;
+			injected = true;
+			await fs.rm(transitionDir, { recursive: true, force: true });
+			await fs.rm(`${transitionDir}.owner`, { force: true });
+		};
+		const sleep = vi.spyOn(Bun, "sleep");
+
+		await expect(withSessionStateFileLock(stateFile, async () => "resumed")).resolves.toBe("resumed");
+		expect(injected).toBe(true);
+		expect(sleep).toHaveBeenCalled();
+	});
+
+	it("keeps backoff when exact removal reports a lost not_found race", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-transition-not-found-"));
+		roots.push(root);
+		const { stateFile, transitionDir } = await seedDeadTransition(root, "native-not-found-race");
+		installLocalIdentityBindings();
+		setSessionStateLockNativeBindings(() => ({
+			...exactIdentityNativeBindings,
+			exactRemoveDirectoryTree(target, snapshot) {
+				const removed = exactIdentityNativeBindings.exactRemoveDirectoryTree(target, snapshot);
+				if (!removed.ok) return removed;
+				return { ok: false, code: "not_found" };
+			},
+		}));
+		const sleep = vi.spyOn(Bun, "sleep");
+
+		await expect(withSessionStateFileLock(stateFile, async () => "resumed")).resolves.toBe("resumed");
+		expect(await fs.exists(transitionDir)).toBe(false);
+		expect(sleep).toHaveBeenCalled();
+	});
 });

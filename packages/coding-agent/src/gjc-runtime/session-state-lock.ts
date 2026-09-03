@@ -410,6 +410,8 @@ export const SessionStateLockTestHooks: {
 	forcedQuarantineName?: string;
 	/** @internal Observes bounded acquisition retries without changing their timing. */
 	afterAcquireContention?: (lockFile: string, attempt: number, elapsedMs: number) => void;
+	/** @internal Runs after transition mkdir contention and before stale-claim inspection. */
+	afterTransitionClaimContention?: (transitionDir: string) => void | Promise<void>;
 } = {};
 
 /** Raised when the lock could not be acquired; callers map it to their own refusal. */
@@ -1668,14 +1670,14 @@ async function reclaimStaleTransitionClaim(transitionDir: string, quarantineName
 	let stat: fsSync.BigIntStats;
 	try {
 		stat = await fs.lstat(transitionDir, { bigint: true });
-	} catch (error) {
-		return (error as NodeJS.ErrnoException).code === "ENOENT";
+	} catch {
+		return false;
 	}
 	// Regular-file claims belong to the superseded protocol. They retain the old
 	// exact-identity stale path; released PID-1 tombstones deliberately require
 	// explicit cleanup before this atomic-directory protocol can take over.
 	if (stat.isFile()) {
-		const reclaimed = await reclaimStaleOwnerRecord(
+		await reclaimStaleOwnerRecord(
 			transitionDir,
 			{
 				afterInspection: SessionStateLockTestHooks.afterTransitionStaleInspection,
@@ -1683,7 +1685,7 @@ async function reclaimStaleTransitionClaim(transitionDir: string, quarantineName
 			},
 			quarantineName,
 		);
-		return reclaimed === "reclaimed";
+		return false;
 	}
 	if (!stat.isDirectory()) throw new SessionStateLockUnavailableError();
 	const ownerSnapshot = await captureRegularLockOwner(`${transitionDir}.owner`);
@@ -1733,7 +1735,7 @@ async function reclaimStaleTransitionClaim(transitionDir: string, quarantineName
 	const removed = nativeSessionStateLock().exactRemoveDirectoryTree(nativePath, captured.snapshot);
 	if (removed.ok || removed.code === "not_found") {
 		exactUnlinkOwnerRecord(`${transitionDir}.owner`, ownerSnapshot, quarantineName);
-		return true;
+		return removed.ok;
 	}
 	if (
 		removed.code === "cleanup_pending" &&
@@ -2014,6 +2016,7 @@ async function withLockPathTransition<T>(
 		} catch (error) {
 			const code = (error as NodeJS.ErrnoException).code;
 			if (code !== "EEXIST" && !isTransientLockError(error)) throw new SessionStateLockUnavailableError(error);
+			await SessionStateLockTestHooks.afterTransitionClaimContention?.(transitionDir);
 			if (await reclaimStaleTransitionClaim(transitionDir, quarantineName)) continue;
 			if (!(await waitForLockRetry(budget)))
 				throw lockUnavailable(transitionDir, "transition_claim_timeout", budget, error);
