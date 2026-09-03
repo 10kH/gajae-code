@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
 	SessionStateLockTestHooks,
+	SessionStateLockUnavailableError,
 	setSessionStateLockNativeBindings,
 	withSessionStateFileLock,
 } from "../src/gjc-runtime/session-state-lock";
@@ -130,6 +132,54 @@ describe("session-state lock forced-exit recovery", () => {
 		await expect(withSessionStateFileLock(stateFile, async () => "resumed")).resolves.toBe("resumed");
 		expect(await fs.exists(transitionDir)).toBe(false);
 		expect(sleep).toHaveBeenCalled();
+	});
+
+	it("immediately retries after a durable cleanup_pending transition detach", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-transition-cleanup-pending-"));
+		roots.push(root);
+		const { stateFile, transitionDir } = await seedDeadTransition(root, "cleanup-pending-reclaimed");
+		installLocalIdentityBindings();
+		setSessionStateLockNativeBindings(() => ({
+			...exactIdentityNativeBindings,
+			exactRemoveDirectoryTree(target) {
+				const detachedPath = `${target}.removing`;
+				fsSync.renameSync(target, detachedPath);
+				return {
+					ok: false,
+					code: "cleanup_pending",
+					payloadDurable: true,
+					detachedPath,
+				};
+			},
+		}));
+		const sleep = vi.spyOn(Bun, "sleep");
+
+		await expect(withSessionStateFileLock(stateFile, async () => "resumed")).resolves.toBe("resumed");
+		expect(sleep).not.toHaveBeenCalled();
+		expect(await fs.exists(`${transitionDir}.removing`)).toBe(false);
+	});
+
+	it("refuses a cleanup_pending transition receipt that is not durable", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-transition-cleanup-refused-"));
+		roots.push(root);
+		const { stateFile, transitionDir } = await seedDeadTransition(root, "cleanup-pending-refused");
+		installLocalIdentityBindings();
+		setSessionStateLockNativeBindings(() => ({
+			...exactIdentityNativeBindings,
+			exactRemoveDirectoryTree() {
+				return {
+					ok: false,
+					code: "cleanup_pending",
+					payloadDurable: false,
+					detachedPath: `${transitionDir}.removing`,
+				};
+			},
+		}));
+
+		await expect(withSessionStateFileLock(stateFile, async () => "not-entered")).rejects.toBeInstanceOf(
+			SessionStateLockUnavailableError,
+		);
+		expect(await fs.exists(transitionDir)).toBe(true);
 	});
 
 	it("immediately retries after exact removal of a dead legacy transition record", async () => {
