@@ -678,7 +678,6 @@ describe("BashTool ACP terminal fold", () => {
 			hasForegroundBashBackgroundRequestHandler: () => coordinator.hasFoldableParticipant(),
 			requestForegroundBashBackground: async (reason?: FoldReason, adapter?: FoldAdapter) =>
 				(await coordinator.requestFold(adapter, reason)).status === "folded",
-			getToolInterruptPolicy: () => "abort_tools" as const,
 			waitForUserSteering: (signal: AbortSignal) => {
 				if (signal.aborted) return Promise.resolve();
 				const { promise, resolve } = Promise.withResolvers<void>();

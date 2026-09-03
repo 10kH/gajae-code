@@ -31,7 +31,6 @@ export interface SteerHarness {
 
 export interface SteerHarnessOptions {
 	busyPromptMode?: "steer" | "queue";
-	toolInterruptPolicy?: "abort_tools" | "finish_tools";
 	autoBackgroundEnabled?: boolean;
 	autoBackgroundThresholdMs?: number;
 	/** Omit the steering-arrival waiter (fail-closed regression). */
@@ -138,7 +137,6 @@ export function createSteerHarness(cwd: string, options: SteerHarnessOptions = {
 		hasForegroundBashBackgroundRequestHandler: () => coordinator.hasFoldableParticipant(),
 		requestForegroundBashBackground: async (reason?: FoldReason, adapter?: FoldAdapter) =>
 			(await coordinator.requestFold(adapter, reason)).status === "folded",
-		getToolInterruptPolicy: () => options.toolInterruptPolicy ?? "abort_tools",
 		...(options.omitSteeringWait
 			? {}
 			: {

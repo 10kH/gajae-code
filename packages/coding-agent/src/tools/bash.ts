@@ -1163,8 +1163,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	 * when the wait starts, or one that arrives inside the grace window, never
 	 * folds: the command finishes normally and that steer is consumed at the
 	 * ordinary tool boundary. The watcher keeps observing so a later qualifying
-	 * steer still folds, and re-checks the gates at that moment so a
-	 * `busyPromptMode`/`toolInterruptPolicy` change during the command is honored.
+	 * steer still folds, and re-checks the gate at that moment so a
+	 * `busyPromptMode` change during the command is honored.
 	 * Returns a stop function; call it when the wait settles. No-op when steer
 	 * folding is gated off at start.
 	 */

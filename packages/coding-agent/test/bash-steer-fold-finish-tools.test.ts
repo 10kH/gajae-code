@@ -72,7 +72,7 @@ describe("steer fold under toolInterruptPolicy=finish_tools", () => {
 			],
 		});
 		authStorage.setRuntimeApiKey(mock.model.provider, "test-key");
-		// Defaults only: no busyPromptMode/toolInterruptPolicy overrides, like the user.
+		// The user's global config: toolInterruptPolicy=finish_tools. Everything else default.
 		created = await createAgentSession({
 			cwd: tempDir.path(),
 			agentDir: tempDir.path(),
@@ -98,33 +98,44 @@ describe("steer fold under toolInterruptPolicy=finish_tools", () => {
 		await mode.init();
 
 		const results: string[] = [];
+		const stopReasons: string[] = [];
 		const unsub = session.subscribe(e => {
 			if (e.type === "tool_execution_end") results.push(JSON.stringify(e.result));
-			if (e.type === "agent_end") results.push(`agent_end:${String((e as { stopReason?: unknown }).stopReason)}`);
+			if (e.type === "agent_end") stopReasons.push(String((e as { stopReason?: unknown }).stopReason));
 		});
 
-		const run = session.prompt("run it");
-		await waitFor(() => session.hasForegroundBashBackgroundRequestHandler());
-		await Bun.sleep(8_000);
+		try {
+			const run = session.prompt("run it");
+			await waitFor(() => session.hasForegroundBashBackgroundRequestHandler());
+			await Bun.sleep(8_000);
 
-		mode.editor.setText("hello");
-		await mode.editor.onSubmit?.("hello");
-		await Bun.sleep(2_000);
-		// Second Enter on an empty composer (what the user did).
-		mode.editor.setText("");
-		await mode.editor.onSubmit?.("");
-		await Bun.sleep(3_000);
+			const callsBeforeSteer = mock.calls.length;
+			mode.editor.setText("hello");
+			await mode.editor.onSubmit?.("hello");
+			await Bun.sleep(2_000);
+			// Second Enter on an empty composer (what the user did).
+			mode.editor.setText("");
+			await mode.editor.onSubmit?.("");
 
-		const folded = session.getAsyncJobSnapshot()?.running.find(j => j.metadata?.foldReason === "steer");
-		unsub();
-		expect(folded).toBeDefined();
-		expect(folded?.status).toBe("running");
-		expect(results.some(r => r.includes("Tool execution was aborted"))).toBe(false);
-		expect(results.some(r => r.includes("Folded into background job"))).toBe(true);
-		// The steer was consumed by the same run: nothing drainable remains for the
-		// empty Enter to abort, and the run ended normally rather than by abort.
-		expect(session.drainableQueuedMessageCount).toBe(0);
-		expect(results.filter(r => r.startsWith("agent_end:")).every(r => r === "agent_end:completed")).toBe(true);
-		await run.catch(() => undefined);
+			// The run must end normally: a rejection here (abort) is the bug.
+			await run;
+
+			const folded = session.getAsyncJobSnapshot()?.running.find(j => j.metadata?.foldReason === "steer");
+			expect(folded).toBeDefined();
+			expect(folded?.status).toBe("running");
+			expect(results.some(r => r.includes("Tool execution was aborted"))).toBe(false);
+			expect(results.some(r => r.includes("Folded into background job"))).toBe(true);
+			// The SAME run consumed the steer: one more model call carrying "hello",
+			// and its reply reached the transcript before the run ended.
+			expect(mock.calls.length).toBe(callsBeforeSteer + 1);
+			expect(JSON.stringify(mock.calls[mock.calls.length - 1]?.context.messages)).toContain("hello");
+			expect(JSON.stringify(session.messages)).toContain("reply after steer");
+			// Nothing drainable remained for the empty Enter to abort, and exactly
+			// one turn ended, normally.
+			expect(session.drainableQueuedMessageCount).toBe(0);
+			expect(stopReasons).toEqual(["completed"]);
+		} finally {
+			unsub();
+		}
 	}, 60_000);
 });

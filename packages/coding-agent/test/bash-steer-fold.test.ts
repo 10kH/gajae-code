@@ -177,8 +177,8 @@ describe("steer-triggered bash fold", () => {
 		expect(harness.folds).toHaveLength(0);
 	}, 10_000);
 
-	it("parity 5: toolInterruptPolicy=finish_tools still folds on steer (a fold kills nothing, so the policy is not a gate)", async () => {
-		harness = createSteerHarness(cwd, { toolInterruptPolicy: "finish_tools" });
+	it("parity 5: the fold gate does not read toolInterruptPolicy (a fold kills nothing; finish_tools is proven live in bash-steer-fold-finish-tools.test.ts)", async () => {
+		harness = createSteerHarness(cwd);
 		const tool = new BashTool(harness.session);
 		const resultPromise = tool.execute(
 			"steer-finish-tools",
