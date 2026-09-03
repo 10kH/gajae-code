@@ -23,7 +23,19 @@ function nativeSessionManager(): typeof import("@gajae-code/natives") {
 	return require("@gajae-code/natives") as typeof import("@gajae-code/natives");
 }
 const cwdTransitionAls = new AsyncLocalStorage<symbol>();
-type CwdReadLeaseContext = { active: boolean; owner: symbol };
+type CwdReadLeaseContext = {
+	active: boolean;
+	released: boolean;
+	owner: symbol;
+	suspendedMoveCount: number;
+	committedMoveGeneration?: number;
+	/** Execution-local lineage; sibling tool executions never share this context. */
+	parent?: CwdReadLeaseContext;
+	root?: CwdReadLeaseContext;
+	executionId: symbol;
+	activeBranches: number;
+	suspendedMoveOwner?: symbol;
+};
 const cwdReadLeaseAls = new AsyncLocalStorage<CwdReadLeaseContext>();
 const CWD_NOFOLLOW_OPEN_FLAGS =
 	fs.constants.O_RDONLY |
@@ -7368,6 +7380,7 @@ export class SessionManager {
 	#flushed: boolean = false;
 	#needsFullRewriteOnNextPersist: boolean = false;
 	#readOnlyResume = false;
+	#strictResumeMutationPending = false;
 	#resumedDraftConsumed = false;
 	#ensuredOnDisk: boolean = false;
 	#recoveryHydrationContext: RecoveryHydrationContext | undefined;
@@ -7396,10 +7409,16 @@ export class SessionManager {
 	/** Defense-in-depth (#4443): one-shot warn for adjacent private thinking blocks in persisted assistant transcripts. */
 	#warnedAdjacentThinkingPersist = false;
 	#closeRetryPending = false;
+	#strictClosePending = false;
 	/** Serializes model, SDK, and ACP cwd transitions; dispose joins this tail. */
 	#cwdTransitionTail: Promise<void> = Promise.resolve();
 	#cwdTransitionOwner: symbol | undefined;
+	#cwdMoveAdmissionClosing = false;
 	#cwdMoveAdmissionClosed = false;
+	#pendingCwdMoveAdmissions = new Set<AbortController>();
+	#cwdMoveAdmittedAdmissions = new Set<AbortController>();
+	#cwdMoveAdmittedOwners = new Set<symbol>();
+	#cwdMoveAdmittedOwnerCounts = new Map<symbol, number>();
 	#cwdReadLeaseOwner = Symbol("cwd-read-lease-owner");
 	#cwdGeneration = 0;
 	/**
@@ -10796,11 +10815,32 @@ export class SessionManager {
 	 * only for the async context that already owns the lock — unrelated callers
 	 * queue on the tail instead of skipping it.
 	 */
-	async runExclusiveCwdTransition<T>(fn: () => Promise<T>): Promise<T> {
+	async runExclusiveCwdTransition<T>(fn: () => Promise<T>, options?: { signal?: AbortSignal }): Promise<T> {
 		const owner = this.#cwdTransitionOwner;
 		if (owner !== undefined && cwdTransitionAls.getStore() === owner) {
 			return fn();
 		}
+		const signal = options?.signal;
+		const throwIfAborted = (): void => {
+			if (!signal?.aborted) return;
+			throw signal.reason instanceof Error ? signal.reason : new Error("Session cwd move admission is closed.");
+		};
+		const waitAbortably = async (promise: Promise<void>): Promise<void> => {
+			throwIfAborted();
+			if (!signal) {
+				await promise;
+				return;
+			}
+			const aborted = Promise.withResolvers<void>();
+			const onAbort = () => aborted.resolve();
+			signal.addEventListener("abort", onAbort, { once: true });
+			try {
+				await Promise.race([promise, aborted.promise]);
+			} finally {
+				signal.removeEventListener("abort", onAbort);
+			}
+			throwIfAborted();
+		};
 		const previous = this.#cwdTransitionTail;
 		const { promise, resolve } = Promise.withResolvers<void>();
 		this.#cwdTransitionTail = previous.then(
@@ -10812,17 +10852,101 @@ export class SessionManager {
 		this.#cwdWriterPending += 1;
 		const token = Symbol("cwd-transition");
 		try {
-			await previous.catch(() => {});
+			await waitAbortably(previous.catch(() => {}));
 			// A reader that entered before this writer was announced still holds the
 			// old cwd; the transition may not commit until every such lease is
 			// released, otherwise an in-flight tool resolves paths across the move.
-			while (this.#cwdReaderCount > 0) await this.#cwdReadersIdle;
+			while (this.#cwdReaderCount > 0) await waitAbortably(this.#cwdReadersIdle);
 			this.#cwdTransitionOwner = token;
 			return await cwdTransitionAls.run(token, fn);
 		} finally {
 			if (this.#cwdTransitionOwner === token) this.#cwdTransitionOwner = undefined;
 			this.#cwdWriterPending -= 1;
 			resolve();
+		}
+	}
+
+	async runExclusiveCwdMoveTransition<T>(fn: () => Promise<T>): Promise<T> {
+		if (this.#cwdMoveAdmissionClosing || this.#cwdMoveAdmissionClosed)
+			throw new Error("Session cwd move admission is closed.");
+		const transitionOwner = this.#cwdTransitionOwner;
+		if (
+			this.#strictClosePending &&
+			(transitionOwner === undefined || cwdTransitionAls.getStore() !== transitionOwner)
+		)
+			throw new Error("Session manager is closing.");
+		const readLease = cwdReadLeaseAls.getStore();
+		const rootLease =
+			readLease?.owner === this.#cwdReadLeaseOwner && !readLease.released
+				? (readLease.root ?? readLease)
+				: undefined;
+		const suspendedOwnReadLease = rootLease !== undefined;
+		if (rootLease) {
+			// A move may suspend the shared root lease only when this execution is
+			// the sole active descendant. If a sibling tool is still fenced by the
+			// lease, returning a retry error is safer than restoring the lease while
+			// that sibling continues against the old cwd.
+			const activeBranchLimit = readLease === rootLease ? 1 : 2;
+			if (
+				rootLease.activeBranches > activeBranchLimit ||
+				(rootLease.suspendedMoveOwner !== undefined && rootLease.suspendedMoveOwner !== readLease?.executionId)
+			)
+				throw new Error("Session working directory changed while this tool executed; retry against the new cwd.");
+			rootLease.suspendedMoveCount += 1;
+			rootLease.suspendedMoveOwner ??= readLease?.executionId;
+			if (rootLease.active) {
+				rootLease.active = false;
+				this.#cwdReaderCount -= 1;
+				if (this.#cwdReaderCount === 0) {
+					const drained = this.#cwdReadersDrained;
+					this.#cwdReadersDrained = undefined;
+					drained?.();
+				}
+			}
+		}
+		const admittedBeforeClose = this.#cwdWriterPending === 0 && this.#cwdReaderCount === 0;
+		const admission = new AbortController();
+		this.#pendingCwdMoveAdmissions.add(admission);
+		if (admittedBeforeClose) this.#cwdMoveAdmittedAdmissions.add(admission);
+		try {
+			return await this.runExclusiveCwdTransition(
+				async () => {
+					const owner = this.#cwdTransitionOwner;
+					if (owner === undefined) throw new Error("Session cwd move transition owner is unavailable.");
+					this.#cwdMoveAdmittedAdmissions.add(admission);
+					this.#cwdMoveAdmittedOwners.add(owner);
+					this.#cwdMoveAdmittedOwnerCounts.set(owner, (this.#cwdMoveAdmittedOwnerCounts.get(owner) ?? 0) + 1);
+					try {
+						return await fn();
+					} finally {
+						this.#cwdMoveAdmittedAdmissions.delete(admission);
+						const count = this.#cwdMoveAdmittedOwnerCounts.get(owner) ?? 0;
+						if (count <= 1) {
+							this.#cwdMoveAdmittedOwnerCounts.delete(owner);
+							this.#cwdMoveAdmittedOwners.delete(owner);
+						} else {
+							this.#cwdMoveAdmittedOwnerCounts.set(owner, count - 1);
+						}
+					}
+				},
+				{ signal: admission.signal },
+			);
+		} finally {
+			this.#pendingCwdMoveAdmissions.delete(admission);
+			this.#cwdMoveAdmittedAdmissions.delete(admission);
+			if (suspendedOwnReadLease && rootLease) {
+				rootLease.suspendedMoveCount -= 1;
+				if (rootLease.suspendedMoveCount === 0 && !rootLease.released) {
+					if (this.#cwdReaderCount === 0) {
+						const { promise, resolve } = Promise.withResolvers<void>();
+						this.#cwdReadersIdle = promise;
+						this.#cwdReadersDrained = resolve;
+					}
+					this.#cwdReaderCount += 1;
+					rootLease.active = true;
+					rootLease.suspendedMoveOwner = undefined;
+				}
+			}
 		}
 	}
 
@@ -10839,14 +10963,39 @@ export class SessionManager {
 	async runWithCwdReadLease<T>(fn: () => Promise<T>): Promise<T> {
 		const activeReadLease = cwdReadLeaseAls.getStore();
 		// Nested tool dispatch (for example eval -> tool bridge) inherits the
-		// outer lease's async context. Re-entering that lease must not wait behind
-		// a writer that is already queued: the writer is waiting for the outer
-		// lease, and waiting here would deadlock the session permanently.
-		if (activeReadLease?.active && activeReadLease.owner === this.#cwdReadLeaseOwner) return fn();
+		// outer lease's cwd authority, but receives an execution-local context so
+		// sibling descendants cannot attribute one another's nested move.
+		if (activeReadLease?.owner === this.#cwdReadLeaseOwner && !activeReadLease.released) {
+			const rootLease = activeReadLease.root ?? activeReadLease;
+			if (rootLease.suspendedMoveOwner !== undefined)
+				throw new Error("Session working directory changed while this tool executed; retry against the new cwd.");
+			rootLease.activeBranches += 1;
+			const nestedReadLease: CwdReadLeaseContext = {
+				active: true,
+				released: false,
+				owner: this.#cwdReadLeaseOwner,
+				parent: activeReadLease,
+				root: rootLease,
+				executionId: Symbol("cwd-read-execution"),
+				activeBranches: 0,
+				suspendedMoveCount: 0,
+			};
+			return cwdReadLeaseAls.run(nestedReadLease, async () => {
+				try {
+					return await fn();
+				} finally {
+					if (nestedReadLease.committedMoveGeneration !== undefined)
+						activeReadLease.committedMoveGeneration = nestedReadLease.committedMoveGeneration;
+					nestedReadLease.released = true;
+					rootLease.activeBranches -= 1;
+				}
+			});
+		}
 		const owner = this.#cwdTransitionOwner;
 		// The writer's own async context already holds exclusive access; taking a
 		// read lease there would wait on itself.
 		if (owner !== undefined && cwdTransitionAls.getStore() === owner) return fn();
+		if (this.#strictClosePending || this.#cwdMoveAdmissionClosed) throw new Error("Session manager is closing.");
 		while (this.#cwdWriterPending > 0) await this.#cwdTransitionTail.catch(() => {});
 		if (this.#cwdReaderCount === 0) {
 			const { promise, resolve } = Promise.withResolvers<void>();
@@ -10854,18 +11003,29 @@ export class SessionManager {
 			this.#cwdReadersDrained = resolve;
 		}
 		this.#cwdReaderCount += 1;
-		const readLease: CwdReadLeaseContext = { active: true, owner: this.#cwdReadLeaseOwner };
+		const readLease: CwdReadLeaseContext = {
+			active: true,
+			released: false,
+			owner: this.#cwdReadLeaseOwner,
+			suspendedMoveCount: 0,
+			executionId: Symbol("cwd-read-execution"),
+			activeBranches: 1,
+		};
+		readLease.root = readLease;
 		return cwdReadLeaseAls.run(readLease, async () => {
 			try {
 				return await fn();
 			} finally {
-				readLease.active = false;
-				this.#cwdReaderCount -= 1;
-				if (this.#cwdReaderCount === 0) {
-					const drained = this.#cwdReadersDrained;
-					this.#cwdReadersDrained = undefined;
-					drained?.();
+				if (readLease.active) {
+					readLease.active = false;
+					this.#cwdReaderCount -= 1;
+					if (this.#cwdReaderCount === 0) {
+						const drained = this.#cwdReadersDrained;
+						this.#cwdReadersDrained = undefined;
+						drained?.();
+					}
 				}
+				readLease.released = true;
 			}
 		});
 	}
@@ -10875,13 +11035,34 @@ export class SessionManager {
 		await this.#cwdTransitionTail;
 	}
 
+	async joinCwdReaders(): Promise<void> {
+		while (this.#cwdReaderCount > 0) await this.#cwdReadersIdle;
+	}
+
 	async closeCwdMoveAdmission(): Promise<void> {
-		await this.runExclusiveCwdTransition(async () => {
-			this.#cwdMoveAdmissionClosed = true;
-		});
+		if (this.#cwdMoveAdmissionClosed) return;
+		if (this.#cwdMoveAdmissionClosing) return;
+		this.#cwdMoveAdmissionClosing = true;
+		this.#cwdMoveAdmissionClosed = true;
+		// Preserve moves that already acquired exclusive ownership, but cancel every
+		// queued admission. A queued writer can otherwise pass the initial admission
+		// check after an earlier writer finishes and mutate the closed session.
+		for (const admission of this.#pendingCwdMoveAdmissions) {
+			if (!this.#cwdMoveAdmittedAdmissions.has(admission)) {
+				admission.abort(new Error("Session cwd move admission is closed."));
+			}
+		}
 	}
 	getCwdGeneration(): number {
 		return this.#cwdGeneration;
+	}
+
+	/** Consume a move committed by a nested move_session call in this read lease. */
+	consumeNestedCwdMove(admittedGeneration: number): boolean {
+		const readLease = cwdReadLeaseAls.getStore();
+		const committed = readLease?.committedMoveGeneration;
+		if (readLease) readLease.committedMoveGeneration = undefined;
+		return committed !== undefined && committed !== admittedGeneration && committed === this.#cwdGeneration;
 	}
 
 	/**
@@ -11081,10 +11262,13 @@ export class SessionManager {
 			sourceHandle?: { stat: (opts: { bigint: true }) => Promise<fs.BigIntStats> };
 		},
 	): Promise<void> {
+		if (this.#strictClosePending && !this.#ownsCwdTransition()) throw new Error("Session manager is closing.");
 		if (!this.#ownsCwdTransition()) {
-			return this.runExclusiveCwdTransition(() => this.moveTo(newCwd, options));
+			return this.runExclusiveCwdMoveTransition(() => this.moveTo(newCwd, options));
 		}
-		if (this.#cwdMoveAdmissionClosed) throw new Error("Session cwd move admission is closed.");
+		const owner = this.#cwdTransitionOwner;
+		if (this.#cwdMoveAdmissionClosed && (owner === undefined || !this.#cwdMoveAdmittedOwners.has(owner)))
+			throw new Error("Session cwd move admission is closed.");
 		if (!options?.sourceHandle) {
 			const sourceHandle = await SessionManager.openNoFollowDirectory(this.cwd);
 			try {
@@ -11471,6 +11655,12 @@ export class SessionManager {
 			}
 		}
 		this.#cwdGeneration += 1;
+		const readLease = cwdReadLeaseAls.getStore();
+		if (readLease?.owner === this.#cwdReadLeaseOwner) {
+			readLease.committedMoveGeneration = this.#cwdGeneration;
+			for (let parent = readLease.parent; parent; parent = parent.parent)
+				parent.committedMoveGeneration = this.#cwdGeneration;
+		}
 		this.cwd = resolvedCwd;
 		this.sessionDir = newSessionDir;
 		this.destination = nextDestination;
@@ -11489,13 +11679,13 @@ export class SessionManager {
 		const hasAssistant = this.#fileEntries.some(e => e.type === "message" && e.message.role === "assistant");
 		try {
 			if (this.persist && this.#sessionFile && hadSessionFile) {
-				await this.#appendHeaderPatch({ cwd: resolvedCwd });
+				await this.#appendHeaderPatch({ cwd: resolvedCwd }, { allowStrictClose: true });
 				await this.#rewriteFile();
 			} else if (this.persist && this.#sessionFile && (hasAssistant || (!hadSessionFile && hadPersistedSession))) {
-				await this.#appendHeaderPatch({ cwd: resolvedCwd });
+				await this.#appendHeaderPatch({ cwd: resolvedCwd }, { allowStrictClose: true });
 				await this.#rewriteFile();
 			} else {
-				await this.#appendHeaderPatch({ cwd: resolvedCwd });
+				await this.#appendHeaderPatch({ cwd: resolvedCwd }, { allowStrictClose: true });
 			}
 		} catch (error) {
 			residentTransition?.dispose();
@@ -15902,6 +16092,7 @@ export class SessionManager {
 	 * Used by ACP mode where session/new must create a discoverable session immediately.
 	 */
 	async ensureOnDisk(): Promise<void> {
+		this.#assertRecoveryHydrationWritable();
 		if (!this.persist || !this.#sessionFile) return;
 		if (this.#readOnlyResume) return;
 		if (this.#flushed && !this.#needsFullRewriteOnNextPersist) return;
@@ -16011,7 +16202,9 @@ export class SessionManager {
 
 	/** Close the persistent writer after flushing all pending data. */
 	async close(): Promise<void> {
+		await this.closeCwdMoveAdmission();
 		await this.joinCwdTransition();
+		await this.joinCwdReaders();
 		SessionManager.releaseProcessCwdOwnership(this);
 		// Drain any uncommitted prepared successors before releasing resources so
 		// dispose/shutdown retains exact cleanup authority (#3138).
@@ -16053,10 +16246,16 @@ export class SessionManager {
 	}
 	/** Flush while open, then strictly close; retryable close skips the invalid second flush. */
 	async flushAndCloseStrict(): Promise<SessionManagerCloseOutcome> {
+		let priorFlushError: Error | undefined;
 		if (this.#persistWriter?.getCloseState() !== "close_failed_retryable") {
-			await this.flush();
+			try {
+				await this.flush();
+			} catch (error) {
+				priorFlushError = toError(error);
+			}
 		}
-		return this.closeStrict();
+		const outcome = await this.closeStrict();
+		return priorFlushError && outcome.kind === "closed" ? { kind: "close_unknown", error: priorFlushError } : outcome;
 	}
 
 	/**
@@ -16066,45 +16265,114 @@ export class SessionManager {
 	 * writer closure before any destructive operation.
 	 */
 	async closeStrict(): Promise<SessionManagerCloseOutcome> {
+		this.#strictClosePending = true;
+		await this.closeCwdMoveAdmission();
+		await this.joinCwdTransition();
+		await this.joinCwdReaders();
 		// Drain staged successors on the strict ACP dispose path as well as best-effort close (#3138).
+		let preparedCleanupError: Error | undefined;
 		try {
 			await this.#retryPreparedNewSessionCleanups();
 		} catch (error) {
+			preparedCleanupError = toError(error);
 			logger.warn("Prepared session cleanup during closeStrict failed; retained for retry", {
-				error: toError(error).message,
+				error: preparedCleanupError.message,
 			});
 		}
-		let outcome: SessionManagerCloseOutcome = { kind: "closed" };
-		await this.#queuePersistTask(async () => {
-			const writer = this.#persistWriter;
-			if (!writer) {
-				this.#flushed = true;
-				return;
-			}
+		if (preparedCleanupError) return { kind: "close_failed_retryable", error: preparedCleanupError };
+		let priorPersistError = this.#persistError;
+		if (this.#needsFullRewriteOnNextPersist && (!this.#readOnlyResume || this.#strictResumeMutationPending)) {
+			await this.#persistChain.catch(() => {});
 			try {
-				await writer.close();
-			} catch {
-				// Outcome is captured from the underlying writer's close state below.
+				await this.#rewriteFileContents();
+				if (this.#strictResumeMutationPending && this.#readOnlyResume && this.#sessionFile) {
+					writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+					this.#readOnlyResume = false;
+				}
+				this.#strictResumeMutationPending = false;
+			} catch (error) {
+				priorPersistError ??= toError(error);
+				return { kind: "close_failed_retryable", error: priorPersistError };
 			}
-			outcome = this.#closeOutcomeFromWriter(writer);
-			if (outcome.kind === "closed") {
-				this.#flushed = true;
-				// Confirmed closed: release writer ownership.
-				this.#persistWriter = undefined;
-				this.#persistWriterPath = undefined;
-			} else if (outcome.kind === "close_unknown") {
-				// Quarantined (terminal): release ownership so no retry/finalizer
-				// touches the uncertain fd again.
-				this.#persistWriter = undefined;
-				this.#persistWriterPath = undefined;
+		}
+		let outcome: SessionManagerCloseOutcome = { kind: "closed" };
+		const closePublicationRevision = {
+			entry: this.#entryRevision,
+			header: this.#headerExportRevision,
+			residentBlob: this.#residentBlobRevision,
+		};
+		await this.#queuePersistTask(
+			async () => {
+				const writer = this.#persistWriter;
+				if (!writer) {
+					this.#flushed = true;
+					return;
+				}
+				try {
+					await writer.close();
+				} catch {
+					// Outcome is captured from the underlying writer's close state below.
+				}
+				outcome = this.#closeOutcomeFromWriter(writer);
+				if (outcome.kind === "closed") {
+					this.#flushed = true;
+					// Confirmed closed: release writer ownership.
+					this.#persistWriter = undefined;
+					this.#persistWriterPath = undefined;
+				} else if (outcome.kind === "close_unknown") {
+					// Quarantined (terminal): release ownership so no retry/finalizer
+					// touches the uncertain fd again.
+					this.#persistWriter = undefined;
+					this.#persistWriterPath = undefined;
+				}
+				// close_failed_retryable: RETAIN the writer so a later closeStrict() call
+				// can actually re-dispatch the OS close (ownership stays proven). The
+				// wrapper must not manufacture success or surrender a retryable fd.
+			},
+			{ ignoreError: true },
+		);
+		// A mutation that entered before strict-close admission can finish its
+		// asynchronous preparation after the initial rewrite check. Re-check the
+		// publication debt after writer closure and repair it before releasing any
+		// resident state; strict admission prevents new callers from creating a
+		// second race while this repair is in flight.
+		let observedPersistError = priorPersistError ?? this.#persistError;
+		const mutationDuringWriterClose =
+			this.#entryRevision !== closePublicationRevision.entry ||
+			this.#headerExportRevision !== closePublicationRevision.header ||
+			this.#residentBlobRevision !== closePublicationRevision.residentBlob;
+		if (mutationDuringWriterClose) {
+			this.#needsFullRewriteOnNextPersist = true;
+			if (this.#readOnlyResume) this.#strictResumeMutationPending = true;
+		}
+		const lateRewriteDebt =
+			(this.#needsFullRewriteOnNextPersist || this.#strictResumeMutationPending) &&
+			(!this.#readOnlyResume || this.#strictResumeMutationPending);
+		if (!observedPersistError && outcome.kind === "closed" && !this.#persistWriter && lateRewriteDebt) {
+			try {
+				await this.#rewriteFileContents();
+				if (this.#strictResumeMutationPending && this.#readOnlyResume && this.#sessionFile) {
+					writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+					this.#readOnlyResume = false;
+				}
+				this.#strictResumeMutationPending = false;
+			} catch (error) {
+				observedPersistError = toError(error);
+				outcome = { kind: "close_failed_retryable", error: observedPersistError };
 			}
-			// close_failed_retryable: RETAIN the writer so a later closeStrict() call
-			// can actually re-dispatch the OS close (ownership stays proven). The
-			// wrapper must not manufacture success or surrender a retryable fd.
-		});
+		}
+		const unpublishedMutation =
+			this.persist &&
+			(this.#strictResumeMutationPending || (this.#needsFullRewriteOnNextPersist && !this.#readOnlyResume));
 		// Only tear down the resident blob store on a terminal outcome; a retryable
 		// close leaves the session live for a genuine retry.
-		if (!this.#persistWriter) {
+		if (
+			!observedPersistError &&
+			!this.#persistWriter &&
+			(!this.persist ||
+				(this.#readOnlyResume && !this.#strictResumeMutationPending) ||
+				(!this.#needsFullRewriteOnNextPersist && !this.#strictResumeMutationPending))
+		) {
 			this.#releaseResidentTextStore();
 			this.#retireEphemeralArtifacts();
 			try {
@@ -16114,6 +16382,15 @@ export class SessionManager {
 			}
 			if (this.#preparedNewSessions.size === 0) this.#releaseOwnedManagedAuthority();
 			this.#releaseClosedSessionState();
+		}
+		if (!observedPersistError && !this.#persistWriter && unpublishedMutation && outcome.kind === "closed") {
+			outcome = {
+				kind: "close_failed_retryable",
+				error: new Error("Session manager has unpublished state."),
+			};
+		}
+		if (observedPersistError && outcome.kind === "closed") {
+			return { kind: "close_unknown", error: observedPersistError };
 		}
 		return outcome;
 	}
@@ -17052,6 +17329,7 @@ export class SessionManager {
 	 */
 	#assertRecoveryHydrationWritable(): void {
 		if (this.#recoveryHydrationContext) throw new Error("recovery_hydration_not_promoted");
+		if (this.#strictClosePending) throw new Error("Session manager is closing.");
 	}
 	async setSessionName(name: string, source: "auto" | "user" = "auto"): Promise<boolean> {
 		this.#assertRecoveryHydrationWritable();
@@ -17067,7 +17345,13 @@ export class SessionManager {
 		return true;
 	}
 
-	async #appendHeaderPatch(patch: HeaderPatchRecord["patch"]): Promise<void> {
+	async #appendHeaderPatch(
+		patch: HeaderPatchRecord["patch"],
+		options?: { allowStrictClose?: boolean },
+	): Promise<void> {
+		if (options?.allowStrictClose) {
+			if (this.#recoveryHydrationContext) throw new Error("recovery_hydration_not_promoted");
+		} else this.#assertRecoveryHydrationWritable();
 		const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 		if (!header) return;
 		applyHeaderPatch(header, patch);
@@ -17178,6 +17462,7 @@ export class SessionManager {
 	}
 	_persist(entry: SessionEntry): void {
 		if (!this.persist || !this.#sessionFile) return;
+		if (this.#strictClosePending) throw new Error("Session manager is closing.");
 		const publishResumeBreadcrumb = this.#readOnlyResume;
 		if (this.#persistError) throw this.#persistError;
 
@@ -17766,6 +18051,7 @@ export class SessionManager {
 	 */
 	applyEntryMessageUpdates(entries: readonly SessionMessageEntry[]): void {
 		this.#assertRecoveryHydrationWritable();
+		if (this.#readOnlyResume) this.#strictResumeMutationPending = true;
 		this.#deactivateColdForBranchMutation();
 		for (const updated of entries) {
 			const canonical = this.#byId.get(updated.id);
@@ -17787,6 +18073,7 @@ export class SessionManager {
 		options: { preserveEvictedContent?: boolean } = {},
 	): void {
 		this.#assertRecoveryHydrationWritable();
+		if (this.#readOnlyResume) this.#strictResumeMutationPending = true;
 		this.#deactivateColdForBranchMutation();
 		for (const updated of entries) {
 			const canonical = this.#byId.get(updated.id);
@@ -17814,6 +18101,7 @@ export class SessionManager {
 	 * boundary for both managed and explicit persistent destinations.
 	 */
 	async recoverPersistenceFailure(): Promise<void> {
+		this.#assertRecoveryHydrationWritable();
 		const persistenceError = this.#persistError;
 		if (!persistenceError) return;
 		if (!this.#sessionFile) throw persistenceError;

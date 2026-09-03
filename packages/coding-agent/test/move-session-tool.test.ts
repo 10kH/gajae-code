@@ -1397,6 +1397,289 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 		expect(sessionManager.getCwd()).toBe(fs.realpathSync(repoB));
 	});
 
+	it("rejects a cwd move fenced after teardown without waiting for active readers", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "root");
+		fs.mkdirSync(cwd, { recursive: true });
+		const sessionManager = SessionManager.inMemory(cwd);
+		const readerStarted = Promise.withResolvers<void>();
+		const releaseReader = Promise.withResolvers<void>();
+		const reader = sessionManager.runWithCwdReadLease(async () => {
+			readerStarted.resolve();
+			await releaseReader.promise;
+		});
+		await readerStarted.promise;
+
+		await sessionManager.closeCwdMoveAdmission();
+		const started = Date.now();
+		await expect(sessionManager.moveTo(cwd)).rejects.toThrow("Session cwd move admission is closed.");
+		expect(Date.now() - started).toBeLessThan(1_000);
+
+		releaseReader.resolve();
+		await reader;
+		await sessionManager.close();
+	});
+
+	it("cancels a reader-blocked cwd writer and rejects later writers without delaying close", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "root");
+		const repoA = path.join(cwd, "repo-a");
+		const repoB = path.join(cwd, "repo-b");
+		fs.mkdirSync(repoA, { recursive: true });
+		fs.mkdirSync(repoB, { recursive: true });
+		const sessionManager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, tempDir));
+		const readerStarted = Promise.withResolvers<void>();
+		const releaseReader = Promise.withResolvers<void>();
+		const reader = sessionManager.runWithCwdReadLease(async () => {
+			readerStarted.resolve();
+			await releaseReader.promise;
+		});
+		await readerStarted.promise;
+
+		const pendingMove = sessionManager.moveTo(repoA);
+		const pendingMoveResult = pendingMove.then(
+			() => ({ status: "fulfilled" as const }),
+			error => ({ status: "rejected" as const, error }),
+		);
+		const started = Date.now();
+		const admissionClose = sessionManager.closeCwdMoveAdmission();
+		await expect(sessionManager.moveTo(repoB)).rejects.toThrow("Session cwd move admission is closed.");
+		await admissionClose;
+		expect(Date.now() - started).toBeLessThan(1_000);
+		expect(await pendingMoveResult).toMatchObject({
+			status: "rejected",
+			error: { message: "Session cwd move admission is closed." },
+		});
+
+		releaseReader.resolve();
+		await reader;
+		expect(sessionManager.getCwd()).toBe(fs.realpathSync(cwd));
+		await sessionManager.close();
+	});
+
+	it("cancels a cwd writer queued behind an active writer when admission closes", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "root");
+		const repoA = path.join(cwd, "repo-a");
+		const repoB = path.join(cwd, "repo-b");
+		fs.mkdirSync(repoA, { recursive: true });
+		fs.mkdirSync(repoB, { recursive: true });
+		const sessionManager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, tempDir));
+		const activeStarted = Promise.withResolvers<void>();
+		const releaseActive = Promise.withResolvers<void>();
+		const active = sessionManager.runExclusiveCwdMoveTransition(async () => {
+			activeStarted.resolve();
+			await releaseActive.promise;
+		});
+		await activeStarted.promise;
+
+		const queued = sessionManager.moveTo(repoA).then(
+			() => ({ status: "fulfilled" as const }),
+			error => ({ status: "rejected" as const, error }),
+		);
+		await sessionManager.closeCwdMoveAdmission();
+		releaseActive.resolve();
+		await active;
+
+		expect(await queued).toMatchObject({
+			status: "rejected",
+			error: { message: "Session cwd move admission is closed." },
+		});
+		expect(sessionManager.getCwd()).toBe(fs.realpathSync(cwd));
+		await sessionManager.close();
+	});
+
+	it("closeStrict fences a queued cwd move before releasing manager ownership", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "root");
+		const repoA = path.join(cwd, "repo-a");
+		fs.mkdirSync(repoA, { recursive: true });
+		const sessionManager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, tempDir));
+		const activeStarted = Promise.withResolvers<void>();
+		const releaseActive = Promise.withResolvers<void>();
+		const active = sessionManager.runExclusiveCwdMoveTransition(async () => {
+			activeStarted.resolve();
+			await releaseActive.promise;
+		});
+		await activeStarted.promise;
+		const queued = sessionManager.moveTo(repoA).then(
+			() => ({ status: "fulfilled" as const }),
+			error => ({ status: "rejected" as const, error }),
+		);
+
+		const closing = sessionManager.closeStrict();
+		releaseActive.resolve();
+		await active;
+
+		expect(await queued).toMatchObject({
+			status: "rejected",
+			error: { message: "Session cwd move admission is closed." },
+		});
+		expect(await closing).toEqual({ kind: "closed" });
+		expect(sessionManager.getCwd()).toBe(fs.realpathSync(cwd));
+	});
+
+	it("close fences queued cwd moves and waits for an admitted reader", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "root");
+		const repoA = path.join(cwd, "repo-a");
+		fs.mkdirSync(repoA, { recursive: true });
+		const sessionManager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, tempDir));
+		const readerStarted = Promise.withResolvers<void>();
+		const releaseReader = Promise.withResolvers<void>();
+		const reader = sessionManager.runWithCwdReadLease(async () => {
+			readerStarted.resolve();
+			await releaseReader.promise;
+		});
+		await readerStarted.promise;
+		const queued = sessionManager.moveTo(repoA).then(
+			() => ({ status: "fulfilled" as const }),
+			error => ({ status: "rejected" as const, error }),
+		);
+		let closeSettled = false;
+		const closing = sessionManager.close().finally(() => {
+			closeSettled = true;
+		});
+
+		await Promise.resolve();
+		expect(closeSettled).toBe(false);
+		expect(await queued).toMatchObject({
+			status: "rejected",
+			error: { message: "Session cwd move admission is closed." },
+		});
+		await expect(sessionManager.runWithCwdReadLease(async () => {})).rejects.toThrow("Session manager is closing.");
+
+		releaseReader.resolve();
+		await reader;
+		await closing;
+		expect(closeSettled).toBe(true);
+		expect(sessionManager.getCwd()).toBe(fs.realpathSync(cwd));
+	});
+
+	it("suspends its own cwd read lease while acquiring move authority", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "root");
+		const repoA = path.join(cwd, "repo-a");
+		fs.mkdirSync(repoA, { recursive: true });
+		const sessionManager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, tempDir));
+
+		await sessionManager.runWithCwdReadLease(() => sessionManager.moveTo(repoA));
+
+		expect(sessionManager.getCwd()).toBe(fs.realpathSync(repoA));
+		await sessionManager.close();
+	});
+
+	it("settles concurrent nested moves without restoring a shared lease early", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "root");
+		const repoA = path.join(cwd, "repo-a");
+		const repoB = path.join(cwd, "repo-b");
+		fs.mkdirSync(repoA, { recursive: true });
+		fs.mkdirSync(repoB, { recursive: true });
+		const sessionManager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, tempDir));
+
+		const outcomes = await sessionManager.runWithCwdReadLease(async () =>
+			Promise.all(
+				[repoA, repoB].map(target =>
+					sessionManager.moveTo(target).then(
+						() => "fulfilled" as const,
+						() => "rejected" as const,
+					),
+				),
+			),
+		);
+
+		expect(outcomes).toEqual(["fulfilled", "fulfilled"]);
+		expect(sessionManager.getCwd()).toBe(fs.realpathSync(repoB));
+		await sessionManager.runWithCwdReadLease(async () => {});
+		await sessionManager.close();
+	});
+
+	it("does not resurrect a read lease in a detached nested move", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "root");
+		const repoA = path.join(cwd, "repo-a");
+		const repoB = path.join(cwd, "repo-b");
+		fs.mkdirSync(repoA, { recursive: true });
+		fs.mkdirSync(repoB, { recursive: true });
+		const sessionManager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, tempDir));
+
+		let detachedMove!: Promise<void>;
+		await sessionManager.runWithCwdReadLease(async () => {
+			detachedMove = Promise.resolve().then(() => sessionManager.moveTo(repoA));
+		});
+		await detachedMove;
+		await sessionManager.moveTo(repoB);
+		expect(sessionManager.getCwd()).toBe(fs.realpathSync(repoB));
+		await sessionManager.close();
+	});
+
+	it("retains outer move admission after a reentrant inner transition", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "root");
+		const repoA = path.join(cwd, "repo-a");
+		fs.mkdirSync(repoA, { recursive: true });
+		const sessionManager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, tempDir));
+
+		await sessionManager.runExclusiveCwdMoveTransition(async () => {
+			await sessionManager.runExclusiveCwdMoveTransition(async () => {});
+			await sessionManager.closeCwdMoveAdmission();
+			await sessionManager.moveTo(repoA);
+		});
+
+		expect(sessionManager.getCwd()).toBe(fs.realpathSync(repoA));
+		await sessionManager.close();
+	});
+
+	it("rejects a nested move while a sibling tool still holds the lease", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "root");
+		const repoA = path.join(cwd, "repo-a");
+		fs.mkdirSync(repoA, { recursive: true });
+		const sessionManager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, tempDir));
+		const siblingEntered = Promise.withResolvers<void>();
+		const releaseSibling = Promise.withResolvers<void>();
+
+		await sessionManager.runWithCwdReadLease(async () => {
+			const sibling = sessionManager.runWithCwdReadLease(async () => {
+				siblingEntered.resolve();
+				await releaseSibling.promise;
+				return sessionManager.getCwd();
+			});
+			await siblingEntered.promise;
+
+			const nestedMove = sessionManager
+				.runWithCwdReadLease(() => sessionManager.moveTo(repoA))
+				.then(
+					() => ({ status: "fulfilled" as const }),
+					error => ({ status: "rejected" as const, error }),
+				);
+			expect(await nestedMove).toMatchObject({
+				status: "rejected",
+				error: {
+					message: "Session working directory changed while this tool executed; retry against the new cwd.",
+				},
+			});
+			expect(sessionManager.getCwd()).toBe(cwd);
+			releaseSibling.resolve();
+			expect(await sibling).toBe(cwd);
+		});
+
+		await sessionManager.moveTo(repoA);
+		expect(sessionManager.getCwd()).toBe(fs.realpathSync(repoA));
+		await sessionManager.close();
+	});
+
 	it("rejects without moving when authority rebinding fails, and keeps launch-root tools", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
