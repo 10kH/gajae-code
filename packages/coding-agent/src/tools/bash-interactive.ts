@@ -488,9 +488,12 @@ export async function runInteractiveBashPty(
 								// ignore writes after the command exits
 							}
 						},
-						options.onDismiss ?? (() => session.kill()),
+						() => {
+							if (!inputAttached) return;
+							(options.onDismiss ?? (() => session.kill()))();
+						},
 						() => {},
-						options.onFoldKey ?? (() => false),
+						() => inputAttached && (options.onFoldKey?.() ?? false),
 					);
 					observer = component;
 					return component;

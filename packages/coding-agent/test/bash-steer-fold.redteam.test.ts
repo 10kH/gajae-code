@@ -141,6 +141,26 @@ describe("steer-fold red team", () => {
 		await job.promise;
 	});
 
+	it("timer fold crosses the coordinator boundary and stops the originating turn", async () => {
+		harness = createSteerHarness(cwd, { autoBackgroundEnabled: true, autoBackgroundThresholdMs: 50 });
+		const result = await new BashTool(harness.session).execute(
+			"timer-fold",
+			{ command: "sleep 1; printf 'timer completed\\n'", timeout: 30 },
+			undefined,
+			undefined,
+			turnContext(),
+		);
+		const jobId = result.details?.async?.jobId;
+		if (!jobId) throw new Error("expected timer-folded job");
+		const job = harness.manager.getJob(jobId);
+		if (!job) throw new Error("expected timer-folded job to remain registered");
+		expect(result.details?.foldReason).toBe("timer");
+		expect(harness.fenceArmed()).toBe(true);
+		expect(harness.stopRequested()).toBe(true);
+		expect(harness.folds).toEqual([{ jobId, generation: job.generation, reason: "timer" }]);
+		await job.promise;
+	}, 10_000);
+
 	it("steer-then-abort: aborting the old foreground signal after a steer fold leaves the manager-owned job running", async () => {
 		harness = createSteerHarness(cwd);
 		const abort = new AbortController();
@@ -227,7 +247,15 @@ describe("steer-fold red team", () => {
 				startTime: 0,
 				metadata: { subagent: { id: "subagent", agent: "executor", agentSource: "bundled" } },
 			},
-			{ id: "bash", type: "bash", status: "running", label: "bash", startTime: 0 },
+			{
+				id: "bash",
+				type: "bash",
+				status: "running",
+				label: "bash",
+				startTime: 0,
+				metadata: { backgrounded: true },
+			},
+			{ id: "foreground-bash", type: "bash", status: "running", label: "foreground bash", startTime: 0 },
 			{
 				id: "monitor",
 				type: "bash",

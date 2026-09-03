@@ -273,6 +273,7 @@ describe("interactive PTY fold ownership", () => {
 			if (!controls || !captured.component?.handleInput) throw new Error("expected live PTY controls and overlay");
 			expect(controls.detachObserver(FOLD_RESULT)).toBe("resolved");
 			captured.component.handleInput("MUST-NOT-REACH-PTY\r");
+			captured.component.handleInput("\x1b");
 
 			const foreground = await foregroundPromise;
 			expect(foreground.output).toBe("folded into a background job");

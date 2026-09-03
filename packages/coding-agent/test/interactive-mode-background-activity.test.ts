@@ -90,7 +90,15 @@ describe("interactive background activity indicator", () => {
 				startTime: 0,
 				metadata: { subagent: { id: "subagent", agent: "executor", agentSource: "bundled" } },
 			},
-			{ id: "bash", type: "bash", status: "running", label: "bash", startTime: 0 },
+			{
+				id: "background-bash",
+				type: "bash",
+				status: "running",
+				label: "background bash",
+				startTime: 0,
+				metadata: { backgrounded: true },
+			},
+			{ id: "foreground-bash", type: "bash", status: "running", label: "foreground bash", startTime: 0 },
 			{
 				id: "monitor",
 				type: "bash",
@@ -104,7 +112,8 @@ describe("interactive background activity indicator", () => {
 		const noActivity = { subagents: 0, backgroundBash: 0, monitors: 0 };
 		const mixedActivity = { subagents: 2, backgroundBash: 1, monitors: 1 };
 
-		// A task job without subagent metadata matches none of the three locked predicates and is not counted.
+		// A task job without subagent metadata and a Bash job still owned by the
+		// foreground match none of the three locked predicates and are not counted.
 		expect(tallyBackgroundActivity(running)).toEqual({ subagents: 1, backgroundBash: 1, monitors: 1 });
 		expect(resolveActivityIndicatorMessage(false, noActivity, "Working…")).toBeUndefined();
 		expect(resolveActivityIndicatorMessage(true, noActivity, "Working…")).toBe("Working…");

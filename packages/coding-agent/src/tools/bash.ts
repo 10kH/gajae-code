@@ -1213,7 +1213,24 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		const startedAt = Date.now();
 		const threshold = Promise.withResolvers<{ kind: "running"; reason: FoldReason }>();
 		const thresholdTimer = setTimeout(
-			() => threshold.resolve({ kind: "running", reason: "timer" }),
+			() => {
+				const requestFold = this.session.requestForegroundBashBackground;
+				if (!foldAdapter || !requestFold) {
+					threshold.resolve({ kind: "running", reason: "timer" });
+					return;
+				}
+				void requestFold("timer", foldAdapter)
+					.then(folded => {
+						if (!folded) threshold.resolve({ kind: "running", reason: "timer" });
+					})
+					.catch(error => {
+						logger.warn("Timer-triggered fold failed", {
+							jobId: foldAdapter.jobId,
+							error: error instanceof Error ? error.message : String(error),
+						});
+						threshold.resolve({ kind: "running", reason: "timer" });
+					});
+			},
 			Math.max(0, thresholdMs),
 		);
 		const waiters: Array<

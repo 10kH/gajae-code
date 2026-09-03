@@ -205,7 +205,7 @@ export function tallyBackgroundActivity(running: readonly AsyncJobSnapshotItem[]
 	for (const item of running) {
 		if (item.type === "task" && item.metadata?.subagent !== undefined) tally.subagents += 1;
 		else if (item.metadata?.monitor === true) tally.monitors += 1;
-		else if (item.type === "bash") tally.backgroundBash += 1;
+		else if (item.type === "bash" && item.metadata?.backgrounded === true) tally.backgroundBash += 1;
 	}
 	return tally;
 }
