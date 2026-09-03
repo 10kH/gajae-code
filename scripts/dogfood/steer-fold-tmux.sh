@@ -15,6 +15,11 @@
 #   - the wake is proven by a visible->absent transition of the running-job
 #     indicator plus the manager's completion receipt for the SAME job id.
 #
+# Every run writes `receipt.json` beside the captures binding the outcome to
+# the executed binary (canonical path + SHA-256), the driver's own git HEAD and
+# the bash.ts blob it built from, so a capture can never be mistaken for a run
+# of a different build.
+#
 # Usage: scripts/dogfood/steer-fold-tmux.sh [<gjc binary>] [<out dir>]
 set -euo pipefail
 
@@ -28,6 +33,32 @@ NONCE="steerack$(printf '%04x' $((RANDOM * RANDOM % 65536)))"
 
 pane() { tmux capture-pane -t "$SESSION" -p -S -400; }
 
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+REPO="$(cd "$(dirname "$SELF")/../.." && pwd)"
+BIN_SHA256="$(shasum -a 256 "$BIN" | cut -d' ' -f1)"
+DRIVER_HEAD="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
+BASH_TS_BLOB="$(git -C "$REPO" rev-parse "HEAD:packages/coding-agent/src/tools/bash.ts" 2>/dev/null || echo unknown)"
+# `getToolInterruptPolicy` occurrences in the compiled bundle: the fix removed
+# the ToolSession seam (declaration + SDK provider), so a fixed build carries
+# fewer hits than a pre-fix build of the same base (observed 2 vs 4).
+BIN_POLICY_SEAM_HITS="$(grep -c -a 'getToolInterruptPolicy' "$BIN" || true)"
+OUTCOME="running"; EXIT_CODE=""; JOB=""; NONCE_STATE="unanswered"
+
+receipt() { # writes/overwrites the receipt with the current state
+	cat > "$OUT/receipt.json" <<JSON
+{
+  "schemaVersion": 1,
+  "kind": "steer-fold-tmux-dogfood",
+  "recordedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "binary": { "path": "$BIN", "sha256": "$BIN_SHA256", "sizeBytes": $(stat -f %z "$BIN"), "toolInterruptPolicySeamHits": ${BIN_POLICY_SEAM_HITS:-0} },
+  "driver": { "path": "$SELF", "repoHead": "$DRIVER_HEAD", "bashTsBlob": "$BASH_TS_BLOB" },
+  "session": { "tmux": "$SESSION", "cwd": "$WORK", "nonce": "$NONCE" },
+  "outcome": "$OUTCOME", "exitCode": "${EXIT_CODE}", "jobId": "${JOB}", "steerAnswered": "$NONCE_STATE",
+  "captures": [$(ls "$OUT"/*.ansi 2>/dev/null | sed 's|.*/||; s|^|"|; s|$|"|' | paste -sd, -)]
+}
+JSON
+}
+
 capture() {
 	# Keep escape sequences: the ultragoal PTY gate needs terminal control codes.
 	tmux capture-pane -t "$SESSION" -p -e -S -400 > "$OUT/$1.ansi"
@@ -36,6 +67,7 @@ capture() {
 
 fail() { # <code> <label> <message>
 	capture "fail-$2"
+	OUTCOME="fail:$2"; EXIT_CODE="$1"; receipt
 	echo "FAIL: $3" >&2
 	exit "$1"
 }
@@ -58,6 +90,7 @@ trap cleanup EXIT
 
 cd "$WORK"
 git init -q .
+receipt
 tmux new-session -d -s "$SESSION" -x 140 -y 45 "$BIN"
 wait_for 'ready' 60 composer-ready
 sleep 3
@@ -86,7 +119,7 @@ capture 2-steer-sent
 wait_for 'Folded into background job bg_[0-9]+ because a user steer arrived' 30 folded
 JOB="$(pane | grep -oE 'Folded into background job bg_[0-9]+' | head -1 | grep -oE 'bg_[0-9]+')"
 [ -n "$JOB" ] || fail 2 no-job-id "fold line present but no job id"
-capture 3-folded
+capture 3-folded; receipt
 if pane | grep -q "Tool execution was aborted"; then fail 3 aborted "bash was aborted"; fi
 
 # The running-job indicator must be VISIBLE (the job is alive after the fold)…
@@ -99,7 +132,7 @@ while (( $(pane | grep -c "$NONCE") < 2 )); do
 	if (( $(date +%s) > deadline )); then fail 4 steer-unanswered "model never repeated nonce $NONCE"; fi
 	sleep 1
 done
-capture 4-steer-answered
+NONCE_STATE="answered"; capture 4-steer-answered; receipt
 if pane | grep -q "Tool execution was aborted"; then fail 3 aborted-late "bash was aborted after the steer"; fi
 
 # Wake: the SAME job's completion receipt, then the indicator absent.
@@ -113,5 +146,6 @@ sleep 4
 capture 5-job-finished
 if pane | grep -q "Tool execution was aborted"; then fail 3 aborted-final "abort text present at the end"; fi
 
+OUTCOME="pass"; EXIT_CODE=0; receipt
 echo "PASS: fold=$JOB, no abort, steer answered (nonce $NONCE), $JOB completed and indicator cleared" >&2
 echo "$OUT"
