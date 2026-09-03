@@ -1,16 +1,15 @@
 /**
  * Shared harness for steer-triggered bash fold tests.
  *
- * Wires a real `Agent` steering queue (the production arrival seam), a real
- * `AsyncJobManager`, and a real `FoldCoordinator` behind a minimal
- * `ToolSession`, so the tool under test observes exactly what a live session
- * would: `waitForUserSteering(signal, { after })` resolves only for a steer
- * that ARRIVES after `after`, and `getSteeringArrivalSeq` reports the queue's
- * monotonic arrival counter.
+ * Wires an enqueue-time steering-arrival seam, a real `AsyncJobManager`, and a
+ * real `FoldCoordinator` behind a minimal `ToolSession`. The production Agent
+ * integration is covered by sdk-steer-fold-live-session.test.ts; this harness
+ * isolates Bash fold races while preserving the contract that each wait sees
+ * only a steer admitted after that wait starts.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { Agent, type AgentToolContext } from "@gajae-code/agent-core";
+import type { AgentToolContext } from "@gajae-code/agent-core";
 import { AsyncJobManager, type FoldReason, type JobFoldEvent } from "@gajae-code/coding-agent/async";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { type FoldAdapter, FoldCoordinator } from "@gajae-code/coding-agent/session/fold-coordinator";
@@ -20,9 +19,9 @@ export interface SteerHarness {
 	session: ToolSession;
 	coordinator: FoldCoordinator;
 	manager: AsyncJobManager;
-	agent: Agent;
-	/** Queue a real steer on the agent (never consumed by the harness). */
+	/** Admit a steer into the simulated live run (never consumed by the harness). */
 	steer: (text?: string) => void;
+	hasQueuedSteering: () => boolean;
 	fenceArmed: () => boolean;
 	stopRequested: () => boolean;
 	folds: JobFoldEvent[];
@@ -32,11 +31,11 @@ export interface SteerHarness {
 
 export interface SteerHarnessOptions {
 	busyPromptMode?: "steer" | "queue";
-	interruptMode?: "immediate" | "wait";
-	/** Omit the interrupt-mode accessor (fail-closed regression). */
-	omitInterruptMode?: boolean;
-	/** Omit the steering-arrival accessor (fail-closed regression). */
-	omitArrivalSeq?: boolean;
+	toolInterruptPolicy?: "abort_tools" | "finish_tools";
+	/** Omit the tool-interrupt-policy accessor (fail-closed regression). */
+	omitToolInterruptPolicy?: boolean;
+	/** Omit the steering-arrival waiter (fail-closed regression). */
+	omitSteeringWait?: boolean;
 	/** Manager retention for evicted-record probes. */
 	retentionMs?: number;
 }
@@ -94,7 +93,8 @@ export function textOf(result: { content: Array<{ type: string; text?: string }>
 export function createSteerHarness(cwd: string, options: SteerHarnessOptions = {}): SteerHarness {
 	const manager = new AsyncJobManager({ onJobComplete: async () => {}, retentionMs: options.retentionMs });
 	AsyncJobManager.setInstance(manager);
-	const agent = new Agent({ interruptMode: options.interruptMode ?? "immediate" });
+	const steeringWaiters = new Set<() => void>();
+	let queuedSteering = false;
 	let fenceArmed = false;
 	let stopRequested = false;
 	const coordinator = new FoldCoordinator({
@@ -137,17 +137,35 @@ export function createSteerHarness(cwd: string, options: SteerHarnessOptions = {
 		hasForegroundBashBackgroundRequestHandler: () => coordinator.hasFoldableParticipant(),
 		requestForegroundBashBackground: async (reason?: FoldReason, adapter?: FoldAdapter) =>
 			(await coordinator.requestFold(adapter, reason)).status === "folded",
-		...(options.omitInterruptMode ? {} : { getInterruptMode: () => agent.getInterruptMode() }),
-		waitForUserSteering: (signal, waitOptions) => agent.waitForSteeringArrival(signal, waitOptions),
-		...(options.omitArrivalSeq ? {} : { getSteeringArrivalSeq: () => agent.steeringArrivalSeq }),
+		...(options.omitToolInterruptPolicy
+			? {}
+			: { getToolInterruptPolicy: () => options.toolInterruptPolicy ?? "abort_tools" }),
+		...(options.omitSteeringWait
+			? {}
+			: {
+					waitForUserSteering: (signal: AbortSignal) => {
+						if (signal.aborted) return Promise.resolve();
+						const { promise, resolve } = Promise.withResolvers<void>();
+						const settle = () => {
+							steeringWaiters.delete(settle);
+							signal.removeEventListener("abort", settle);
+							resolve();
+						};
+						steeringWaiters.add(settle);
+						signal.addEventListener("abort", settle, { once: true });
+						return promise;
+					},
+				}),
 	};
 	return {
 		session,
 		coordinator,
 		manager,
-		agent,
-		steer: (text = "steer") =>
-			agent.steer({ role: "user", content: [{ type: "text", text }], timestamp: Date.now() }),
+		steer: () => {
+			queuedSteering = true;
+			for (const resolve of [...steeringWaiters]) resolve();
+		},
+		hasQueuedSteering: () => queuedSteering,
 		fenceArmed: () => fenceArmed,
 		stopRequested: () => stopRequested,
 		folds,

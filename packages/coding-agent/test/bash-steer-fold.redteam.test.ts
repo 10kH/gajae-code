@@ -2,8 +2,8 @@
  * Adversarial regression coverage for steer-triggered Bash folds.
  *
  * Each probe starts from the spec's acceptance criteria and tries to break the
- * contract at a race, an ordering edge, or a gate flip. The harness drives a
- * real Agent steering queue so arrival ordering is the production seam.
+ * contract at a race, an ordering edge, or a gate flip. The harness isolates
+ * enqueue-time arrival ordering; a live AgentSession test covers admission.
  */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
@@ -83,6 +83,36 @@ describe("steer-fold red team", () => {
 		expect(result.details?.foldReason).toBe("steer");
 		expect(harness.folds).toEqual([{ jobId, generation: job.generation, reason: "steer" }]);
 		await job.promise;
+	}, 10_000);
+
+	it("two foreground bash calls in one turn fold once each and keep distinct output ownership", async () => {
+		harness = createSteerHarness(cwd);
+		const first = new BashTool(harness.session).execute(
+			"parallel-fold-a",
+			{ command: "sleep 3; printf 'parallel-a-complete\\n'", timeout: 30 },
+			undefined,
+			undefined,
+			turnContext(),
+		);
+		const second = new BashTool(harness.session).execute(
+			"parallel-fold-b",
+			{ command: "sleep 3; printf 'parallel-b-complete\\n'", timeout: 30 },
+			undefined,
+			undefined,
+			turnContext(),
+		);
+		await Bun.sleep(STEER_FOLD_GRACE_MS + 100);
+		harness.steer();
+		const results = await Promise.all([first, second]);
+		const jobIds = results.map(result => result.details?.async?.jobId);
+		expect(jobIds.every(Boolean)).toBe(true);
+		expect(new Set(jobIds).size).toBe(2);
+		expect(harness.folds).toHaveLength(2);
+		expect(new Set(harness.folds.map(fold => fold.jobId))).toEqual(new Set(jobIds as string[]));
+
+		await Promise.all(jobIds.map(id => harness?.manager.getJob(id!)?.promise));
+		expect(harness.manager.getJob(jobIds[0]!)?.resultText).toContain("parallel-a-complete");
+		expect(harness.manager.getJob(jobIds[1]!)?.resultText).toContain("parallel-b-complete");
 	}, 10_000);
 
 	it("chord-then-steer: a chord fold stays chord and a later steer cannot refold it", async () => {
@@ -216,6 +246,21 @@ describe("steer-fold red team", () => {
 		expect(resolveActivityIndicatorMessage(true, tally, "Working…")).toBe(
 			"Working… · 1 subagent, 1 background bash, 1 monitor",
 		);
+	});
+
+	it("task and subagent waits expose no foreground Bash fold registration path", () => {
+		const repoRoot = path.resolve(import.meta.dir, "../../..");
+		for (const relative of ["packages/coding-agent/src/task", "packages/coding-agent/src/tools/subagent.ts"]) {
+			const absolute = path.join(repoRoot, relative);
+			const sources = fs.statSync(absolute).isDirectory()
+				? fs
+						.readdirSync(absolute, { recursive: true })
+						.map(entry => String(entry))
+						.filter(entry => entry.endsWith(".ts"))
+						.map(entry => fs.readFileSync(path.join(absolute, entry), "utf8"))
+				: [fs.readFileSync(absolute, "utf8")];
+			expect(sources.join("\n")).not.toContain("registerForegroundFoldParticipant");
+		}
 	});
 
 	it("guidance-contract: docs/tools/bash.md and job.md carry the fixed steer result reason line", () => {

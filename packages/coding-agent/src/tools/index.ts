@@ -242,19 +242,13 @@ export interface ToolSession {
 	hasForegroundBashBackgroundRequestHandler?: () => boolean;
 	/** Request that a foreground wait fold into a background job, if supported. `reason` names the trigger; `adapter` targets a specific wait instead of the newest registration. */
 	requestForegroundBashBackground?: (reason?: FoldReason, adapter?: FoldAdapter) => Promise<boolean>;
-	/** Current interrupt mode; `wait` defers steer consumption until the running tool finishes, so a steer must not fold it. */
-	getInterruptMode?: () => "immediate" | "wait";
+	/** Current tool interrupt policy; `finish_tools` lets the running tool finish, so a steer must not fold it. */
+	getToolInterruptPolicy?: () => "abort_tools" | "finish_tools";
 
 	/** Get the session-owned or inherited async job manager. */
 	getAsyncJobManager?: () => AsyncJobManager | undefined;
-	/**
-	 * Resolves with the arrival sequence when the session queues user steering, or `undefined` when `signal` aborts,
-	 * without consuming the queue; wait-style tools use this to end their observation early. With `options.after`,
-	 * only a steer newer than that sequence resolves it, so an already-queued steer can be ignored.
-	 */
-	waitForUserSteering?: (signal: AbortSignal, options?: { after?: number }) => Promise<number | undefined>;
-	/** Arrival sequence of the most recent user steer (0 before any); pairs with `waitForUserSteering`'s `after`. */
-	getSteeringArrivalSeq?: () => number;
+	/** Resolves on a steer admitted after the wait starts, or when `signal` aborts, without consuming the steer. */
+	waitForUserSteering?: (signal: AbortSignal) => Promise<void>;
 	/** Get session ID */
 	getSessionId?: () => string | null;
 	/** Get credential-selection session identity. */

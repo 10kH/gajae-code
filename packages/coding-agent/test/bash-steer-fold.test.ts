@@ -11,7 +11,7 @@
  *  3. the fold does not arm the turn-ending fence/stop, so the SAME run
  *     consumes the steer (the loop's batch-skip is covered by agent-loop tests);
  *  4. abort still aborts (a steer never kills the command);
- *  5. busyPromptMode=queue / interruptMode=wait -> no fold.
+ *  5. busyPromptMode=queue / toolInterruptPolicy=finish_tools -> no fold.
  * Plus the manager-level contract every fold path relies on: `foldReason` on
  * the job/snapshot and exactly one `onFold` notification per fold.
  */
@@ -89,7 +89,7 @@ describe("steer-triggered bash fold", () => {
 		// itself is still queued for the loop's tool boundary.
 		expect(harness.fenceArmed()).toBe(false);
 		expect(harness.stopRequested()).toBe(false);
-		expect(harness.agent.hasQueuedSteering()).toBe(true);
+		expect(harness.hasQueuedSteering()).toBe(true);
 
 		await job?.promise;
 		expect(harness.manager.getJob(jobId)?.status).toBe("completed");
@@ -108,7 +108,7 @@ describe("steer-triggered bash fold", () => {
 		expect(result.details?.foldReason).toBeUndefined();
 		expect(textOf(result)).toContain("done");
 		expect(harness.folds).toHaveLength(0);
-		expect(harness.agent.hasQueuedSteering()).toBe(true);
+		expect(harness.hasQueuedSteering()).toBe(true);
 	}, 10_000);
 
 	it("parity 2: a steer already queued when the command starts never folds it", async () => {
@@ -177,8 +177,8 @@ describe("steer-triggered bash fold", () => {
 		expect(harness.folds).toHaveLength(0);
 	}, 10_000);
 
-	it("parity 5: interruptMode=wait never folds on steer", async () => {
-		harness = createSteerHarness(cwd, { interruptMode: "wait" });
+	it("parity 5: toolInterruptPolicy=finish_tools never folds on steer", async () => {
+		harness = createSteerHarness(cwd, { toolInterruptPolicy: "finish_tools" });
 		const tool = new BashTool(harness.session);
 		const resultPromise = tool.execute("steer-gate-wait", { command: "sleep 2.4; printf 'done\\n'", timeout: 30 });
 		await Bun.sleep(STEER_FOLD_GRACE_MS + 100);
@@ -189,7 +189,7 @@ describe("steer-triggered bash fold", () => {
 	}, 10_000);
 
 	it("parity 5: a session that cannot prove its interrupt mode is not steer-foldable (fail closed)", async () => {
-		harness = createSteerHarness(cwd, { omitInterruptMode: true });
+		harness = createSteerHarness(cwd, { omitToolInterruptPolicy: true });
 		const tool = new BashTool(harness.session);
 		const resultPromise = tool.execute("steer-gate-unknown", { command: "sleep 2.4; printf 'done\\n'", timeout: 30 });
 		await Bun.sleep(STEER_FOLD_GRACE_MS + 100);
@@ -199,8 +199,8 @@ describe("steer-triggered bash fold", () => {
 		expect(harness.folds).toHaveLength(0);
 	}, 10_000);
 
-	it("parity 5: a session that cannot report steering arrivals is not steer-foldable (fail closed)", async () => {
-		harness = createSteerHarness(cwd, { omitArrivalSeq: true });
+	it("parity 5: a session without a steering-arrival waiter is not steer-foldable (fail closed)", async () => {
+		harness = createSteerHarness(cwd, { omitSteeringWait: true });
 		const tool = new BashTool(harness.session);
 		const resultPromise = tool.execute("steer-gate-no-seq", { command: "sleep 2.4; printf 'done\\n'", timeout: 30 });
 		await Bun.sleep(STEER_FOLD_GRACE_MS + 100);

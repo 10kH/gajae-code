@@ -1139,22 +1139,20 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 
 	/**
 	 * Whether a queued user steer may fold the running foreground wait. Mirrors
-	 * the loop's own steer admission: `busyPromptMode=queue` never queues a
-	 * steer for a busy turn, and `interruptMode=wait` explicitly defers steer
-	 * consumption until the tool finishes, so neither may fold. The
+	 * the loop's own steer admission: `busyPromptMode=queue` never admits a
+	 * steer into the busy run, and `toolInterruptPolicy=finish_tools` explicitly
+	 * lets the tool finish, so neither may fold. The
 	 * auto-background setting is deliberately not consulted: like the chord,
 	 * a steer fold is a user action.
 	 *
-	 * Fails closed: a session that cannot prove its interrupt mode or report
-	 * steering arrivals is not steer-foldable.
+	 * Fails closed: a session that cannot prove its tool interrupt policy or
+	 * report newly admitted steering is not steer-foldable.
 	 */
 	#steerFoldEnabled(): boolean {
-		const { waitForUserSteering, getSteeringArrivalSeq, getInterruptMode, requestForegroundBashBackground } =
-			this.session;
-		if (!waitForUserSteering || !getSteeringArrivalSeq || !getInterruptMode || !requestForegroundBashBackground)
-			return false;
+		const { waitForUserSteering, getToolInterruptPolicy, requestForegroundBashBackground } = this.session;
+		if (!waitForUserSteering || !getToolInterruptPolicy || !requestForegroundBashBackground) return false;
 		if (this.session.settings.get("busyPromptMode") !== "steer") return false;
-		return getInterruptMode() === "immediate";
+		return getToolInterruptPolicy() === "abort_tools";
 	}
 
 	/**
@@ -1164,23 +1162,20 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	 * folds: the command finishes normally and that steer is consumed at the
 	 * ordinary tool boundary. The watcher keeps observing so a later qualifying
 	 * steer still folds, and re-checks the gates at that moment so a
-	 * `busyPromptMode`/`interruptMode` change during the command is honored.
+	 * `busyPromptMode`/`toolInterruptPolicy` change during the command is honored.
 	 * Returns a stop function; call it when the wait settles. No-op when steer
 	 * folding is gated off at start.
 	 */
 	#watchSteerForFold(adapter: FoldAdapter, startedAt: number): () => void {
 		if (!this.#steerFoldEnabled()) return () => {};
 		const waitForSteer = this.session.waitForUserSteering;
-		const getArrivalSeq = this.session.getSteeringArrivalSeq;
 		const requestFold = this.session.requestForegroundBashBackground;
-		if (!waitForSteer || !getArrivalSeq || !requestFold) return () => {};
+		if (!waitForSteer || !requestFold) return () => {};
 		const watch = new AbortController();
 		const observe = async (): Promise<void> => {
-			let after = getArrivalSeq();
 			while (!watch.signal.aborted) {
-				const seq = await waitForSteer(watch.signal, { after });
-				if (seq === undefined || watch.signal.aborted) return;
-				after = seq;
+				await waitForSteer(watch.signal);
+				if (watch.signal.aborted) return;
 				if (Date.now() - startedAt < STEER_FOLD_GRACE_MS) continue;
 				if (!this.#steerFoldEnabled()) continue;
 				await requestFold("steer", adapter);

@@ -1,5 +1,4 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
-import { Agent } from "@gajae-code/agent-core";
 import { AsyncJobManager, type FoldReason, type JobFoldEvent } from "../src/async";
 import { JobsObserver } from "../src/modes/jobs-observer";
 import type {
@@ -652,8 +651,13 @@ describe("BashTool ACP terminal fold", () => {
 		const killSpy = spyOn(handle, "kill");
 
 		const h = makeHarness(bridge);
-		// Real steering seam + real coordinator so the fold is driven by a steer, not a manual detach.
-		const agent = new Agent({ interruptMode: "immediate" });
+		// Enqueue-time steering seam + real coordinator so the fold is driven by a
+		// newly admitted steer, not a manual detach. Full Agent admission is covered
+		// by sdk-steer-fold-live-session.test.ts.
+		const steeringWaiters = new Set<() => void>();
+		const steer = () => {
+			for (const resolve of [...steeringWaiters]) resolve();
+		};
 		const coordinator = new FoldCoordinator({
 			hasActiveTurn: () => true,
 			armSteeringFence: () => () => {},
@@ -674,23 +678,32 @@ describe("BashTool ACP terminal fold", () => {
 			hasForegroundBashBackgroundRequestHandler: () => coordinator.hasFoldableParticipant(),
 			requestForegroundBashBackground: async (reason?: FoldReason, adapter?: FoldAdapter) =>
 				(await coordinator.requestFold(adapter, reason)).status === "folded",
-			getInterruptMode: () => agent.getInterruptMode(),
-			waitForUserSteering: (signal: AbortSignal, options?: { after?: number }) =>
-				agent.waitForSteeringArrival(signal, options),
-			getSteeringArrivalSeq: () => agent.steeringArrivalSeq,
+			getToolInterruptPolicy: () => "abort_tools" as const,
+			waitForUserSteering: (signal: AbortSignal) => {
+				if (signal.aborted) return Promise.resolve();
+				const { promise, resolve } = Promise.withResolvers<void>();
+				const settle = () => {
+					steeringWaiters.delete(settle);
+					signal.removeEventListener("abort", settle);
+					resolve();
+				};
+				steeringWaiters.add(settle);
+				signal.addEventListener("abort", settle, { once: true });
+				return promise;
+			},
 		} as unknown as ToolSession;
 		const tool = new BashTool(session);
 		const resultPromise = tool.execute("call-steer-fold", { command: "sleep 30" }, undefined, () => {});
 		await waitFor(() => coordinator.hasFoldableParticipant());
 
 		// Inside the grace window: the steer is left for the boundary, nothing folds.
-		agent.steer({ role: "user", content: [{ type: "text", text: "early" }], timestamp: Date.now() });
+		steer();
 		await Bun.sleep(200);
 		expect(folds).toHaveLength(0);
 		expect(coordinator.hasFoldableParticipant()).toBe(true);
 
 		await Bun.sleep(STEER_FOLD_GRACE_MS);
-		agent.steer({ role: "user", content: [{ type: "text", text: "late" }], timestamp: Date.now() });
+		steer();
 		const result = await resultPromise;
 
 		expect(result.details?.async?.state).toBe("running");
