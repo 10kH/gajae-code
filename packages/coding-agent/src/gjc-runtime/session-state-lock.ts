@@ -55,6 +55,10 @@ function lockRetryElapsedMs(budget: LockRetryBudget): number {
 	return Math.max(0, performance.now() - budget.startedAt);
 }
 
+function lockRetryExhausted(budget: LockRetryBudget): boolean {
+	return lockRetryElapsedMs(budget) >= LOCK_ACQUIRE_TIMEOUT_MS;
+}
+
 async function waitForLockRetry(budget: LockRetryBudget): Promise<boolean> {
 	budget.attempts++;
 	const remainingMs = LOCK_ACQUIRE_TIMEOUT_MS - lockRetryElapsedMs(budget);
@@ -2019,7 +2023,11 @@ async function withLockPathTransition<T>(
 			const code = (error as NodeJS.ErrnoException).code;
 			if (code !== "EEXIST" && !isTransientLockError(error)) throw new SessionStateLockUnavailableError(error);
 			await SessionStateLockTestHooks.afterTransitionClaimContention?.(transitionDir);
-			if (await reclaimStaleTransitionClaim(transitionDir, quarantineName)) continue;
+			if (await reclaimStaleTransitionClaim(transitionDir, quarantineName)) {
+				if (lockRetryExhausted(budget))
+					throw lockUnavailable(transitionDir, "transition_claim_timeout", budget, error);
+				continue;
+			}
 			if (!(await waitForLockRetry(budget)))
 				throw lockUnavailable(transitionDir, "transition_claim_timeout", budget, error);
 			continue;

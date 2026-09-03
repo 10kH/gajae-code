@@ -182,6 +182,52 @@ describe("session-state lock forced-exit recovery", () => {
 		expect(await fs.exists(transitionDir)).toBe(true);
 	});
 
+	it("bounds repeated successful dead-claim reclaims without sleeping", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-transition-reclaim-loop-"));
+		roots.push(root);
+		const { stateFile, transitionDir } = await seedDeadTransition(root, "reclaim-loop-0");
+		const ownerFile = `${transitionDir}.owner`;
+		installLocalIdentityBindings();
+		let elapsedMs = 0;
+		vi.spyOn(performance, "now").mockImplementation(() => {
+			const current = elapsedMs;
+			elapsedMs += 1_000;
+			return current;
+		});
+		let reclaims = 0;
+		setSessionStateLockNativeBindings(() => ({
+			...exactIdentityNativeBindings,
+			exactRemoveDirectoryTree(target, snapshot) {
+				const removed = exactIdentityNativeBindings.exactRemoveDirectoryTree(target, snapshot);
+				if (!removed.ok) return removed;
+				reclaims++;
+				if (reclaims >= 4) throw new Error("reclaim loop escaped its deadline");
+				fsSync.rmSync(ownerFile, { force: true });
+				fsSync.mkdirSync(transitionDir);
+				fsSync.writeFileSync(
+					ownerFile,
+					JSON.stringify({
+						pid: DEAD_PID,
+						start_time: "unknown",
+						token: `reclaim-loop-${reclaims}`,
+						owner_host_id: "forced-exit-probe-host",
+					}),
+				);
+				return removed;
+			},
+		}));
+		const sleep = vi.spyOn(Bun, "sleep");
+
+		const failure = await withSessionStateFileLock(stateFile, async () => "not-entered").catch(error => error);
+		expect(failure).toBeInstanceOf(SessionStateLockUnavailableError);
+		expect(failure).toMatchObject({
+			lockPath: transitionDir,
+			reason: "transition_claim_timeout",
+		});
+		expect(reclaims).toBeGreaterThan(1);
+		expect(sleep).not.toHaveBeenCalled();
+	});
+
 	it("immediately retries after exact removal of a dead legacy transition record", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-legacy-transition-reclaimed-"));
 		roots.push(root);
