@@ -18,6 +18,7 @@ import {
 	capturePathIdentity,
 	type FileIdentity,
 	invalidate as invalidateFsCache,
+	isSingleLinkRegularFileAt,
 	type ReadFileOptions,
 	type ReadScope,
 	readDirEntries,
@@ -451,6 +452,13 @@ async function globIf(
 	} catch {
 		return [];
 	}
+}
+
+async function isAllowedIsolatedExtensionPath(
+	ctx: Pick<LoadContext, "isolatedHome">,
+	filePath: string,
+): Promise<boolean> {
+	return !ctx.isolatedHome || (await isSingleLinkRegularFileAt(filePath));
 }
 
 export interface ScanSkillsFromDirOptions {
@@ -986,7 +994,7 @@ export async function discoverExtensionModulePaths(
 			undefined,
 			scope,
 		);
-		if (candidatePath) discovered.add(candidatePath);
+		if (candidatePath && (await isAllowedIsolatedExtensionPath(ctx, candidatePath))) discovered.add(candidatePath);
 	}
 	// Track which subdirectories have package.json manifests with declared extensions
 	const subdirsWithDeclaredExtensions = new Set<string>();
@@ -1012,7 +1020,7 @@ export async function discoverExtensionModulePaths(
 				resolvedExtPath = pluginFilePath ? path.join(resolvedExtPath, pluginFilePath) : resolvedExtPath;
 			}
 			const canonicalExtPath = await canonicalizePathWithinHome(ctx, resolvedExtPath, undefined, scope);
-			if (!canonicalExtPath) continue;
+			if (!canonicalExtPath || !(await isAllowedIsolatedExtensionPath(ctx, canonicalExtPath))) continue;
 			const content = await readFile(canonicalExtPath, readOptions);
 			if (content !== null) {
 				discovered.add(canonicalExtPath);
@@ -1036,7 +1044,7 @@ export async function discoverExtensionModulePaths(
 			undefined,
 			scope,
 		);
-		if (candidatePath) discovered.add(candidatePath);
+		if (candidatePath && (await isAllowedIsolatedExtensionPath(ctx, candidatePath))) discovered.add(candidatePath);
 	}
 	return [...discovered];
 }
