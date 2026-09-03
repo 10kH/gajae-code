@@ -69,6 +69,21 @@ interface BeforeAgentStartCombinedResult {
 	systemPrompt?: string[];
 }
 
+const BEFORE_AGENT_START_RESULT_KEYS = new Set(["message", "systemPrompt"]);
+const MAX_UNSUPPORTED_RESULT_FIELDS = 8;
+const MAX_RESULT_FIELD_NAME_LENGTH = 80;
+
+function unsupportedBeforeAgentStartResultFields(result: unknown): string[] {
+	if (result === null || typeof result !== "object" || Array.isArray(result)) return [];
+	const fields = Object.keys(result).filter(key => !BEFORE_AGENT_START_RESULT_KEYS.has(key));
+	const bounded = fields
+		.slice(0, MAX_UNSUPPORTED_RESULT_FIELDS)
+		.map(key => key.replace(/[^\x20-\x7e]/gu, "?").slice(0, MAX_RESULT_FIELD_NAME_LENGTH));
+	if (fields.length > MAX_UNSUPPORTED_RESULT_FIELDS)
+		bounded.push(`…and ${fields.length - MAX_UNSUPPORTED_RESULT_FIELDS} more`);
+	return bounded;
+}
+
 export type ExtensionErrorListener = (error: ExtensionError) => void;
 
 /** Bounded timeout for session_shutdown handlers — generous but never infinite. */
@@ -1112,6 +1127,14 @@ export class ExtensionRunner {
 			const handlerResult = await this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs);
 
 			if (handlerResult) {
+				const unsupportedFields = unsupportedBeforeAgentStartResultFields(handlerResult);
+				if (unsupportedFields.length > 0) {
+					this.emitError({
+						extensionPath: ext.path,
+						event: "before_agent_start",
+						error: `Unsupported before_agent_start result field(s): ${unsupportedFields.join(", ")}. Supported fields: message, systemPrompt.`,
+					});
+				}
 				const result = handlerResult as BeforeAgentStartEventResult;
 				if (result.message) {
 					messages.push(result.message);
