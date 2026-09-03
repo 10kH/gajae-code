@@ -151,7 +151,7 @@ import { markAutoroutingInactive } from "../sdk/host/internal-autorouting-state"
 import { createSdkSessionRuntimeExtension, registerSdkOnlyNotificationCommand } from "../sdk/host/session-runtime";
 import { createSdkWebSocketTransport } from "../sdk/host/websocket-transport";
 import type { SecretObfuscator } from "../secrets";
-import { AgentSession, type ForkContextSeed } from "../session/agent-session";
+import { AgentSession, type ForkContextSeed, isSessionDisposalIncompleteError } from "../session/agent-session";
 import { AuthBrokerClient, AuthStorage, RemoteAuthCredentialStore } from "../session/auth-storage";
 import { type CustomMessage, convertToLlm } from "../session/messages";
 import { createReadonlySessionManager, SessionManager } from "../session/session-manager";
@@ -2443,7 +2443,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 										"Cannot rescope a session with caller-owned MCP authority; recreate the session at the target cwd.",
 									);
 								}
-								return sessionManager.runExclusiveCwdTransition(async () => {
+								return sessionManager.runExclusiveCwdMoveTransition(async () => {
 									if (moveConsumed) {
 										throw new Error(
 											"This session has already been rescoped; only one agent-invoked move is allowed per session.",
@@ -4573,38 +4573,49 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		// Attach the live session to the pre-registered ref so peers can route IRC
 		// messages here. Refresh sessionFile in case it was unavailable at pre-register
-		// time. The dispose wrapper below unregisters on teardown.
+		// time. The registered terminal cleanup below unregisters on teardown.
 		agentRegistry.attachSession(resolvedAgentId, session, sessionManager.getSessionFile() ?? null);
 		{
-			const originalDispose = session.dispose.bind(session);
-			session.dispose = async () => {
-				try {
-					await originalDispose();
-				} finally {
+			let cleanupPromise: Promise<void> | undefined;
+			const finishCleanup = async (): Promise<void> => {
+				if (cleanupPromise) return cleanupPromise;
+				const cleanup = (async () => {
+					const failures: unknown[] = [];
 					try {
 						agentRegistry.unregister(resolvedAgentId);
 						releaseCredentialDisabledSubscription();
 						releaseLocalProtocolOverride();
+					} catch (error) {
+						failures.push(error);
 					} finally {
-						// The endpoint is gone: its owned registrations can never
-						// reach a delivery settlement boundary, and foreign-endpoint
-						// tuples are deliberately never classified terminal by other
-						// managers — retire them before unregistering the manager so
-						// repeated session churn cannot saturate the registry
-						// (review thread P2). The endpoint is the manager's live
-						// registration key, which survives newSession/switchSession
-						// rekeying and may differ from the persisted logical session id.
-						if (!options.parentTaskPrefix) {
-							retireOwnedRegistrationsForEndpoint(
-								AsyncJobManager.endpointIdOf(asyncJobManager) ?? asyncJobEndpointId,
-							);
-							AsyncJobManager.unregisterManager(asyncJobManager);
+						try {
+							if (!options.parentTaskPrefix) {
+								retireOwnedRegistrationsForEndpoint(
+									AsyncJobManager.endpointIdOf(asyncJobManager) ?? asyncJobEndpointId,
+								);
+								AsyncJobManager.unregisterManager(asyncJobManager);
+							}
+						} catch (error) {
+							failures.push(error);
 						}
-						await closeOwnedAuthStorage();
-						await closeOwnedSettings();
+						try {
+							await closeOwnedAuthStorage();
+						} catch (error) {
+							failures.push(error);
+						}
+						try {
+							await closeOwnedSettings();
+						} catch (error) {
+							failures.push(error);
+						}
 					}
-				}
+					if (failures.length > 0) throw new AggregateError(failures, "SDK disposal cleanup failed.");
+				})();
+				cleanupPromise = cleanup;
+				void cleanup.catch(() => {});
+				return cleanup;
 			};
+			session.registerToolSessionCleanup(finishCleanup);
 		}
 
 		if (model?.api === "openai-codex-responses") {
@@ -4832,7 +4843,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		let cleanupDiagnostic: unknown;
 		try {
 			if (hasSession) {
-				await session.dispose();
+				try {
+					await session.dispose();
+				} catch (disposeError) {
+					if (!isSessionDisposalIncompleteError(disposeError)) {
+						throw disposeError;
+					}
+					// The first call is intentionally bounded for startup callers. Join the
+					// retained teardown before releasing the resources it still owns.
+					await session.awaitDisposeCompletion();
+				}
 			} else {
 				if (hasRegistered) agentRegistry.unregister(resolvedAgentId);
 				// Admission happens before session construction. Any later startup

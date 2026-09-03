@@ -906,4 +906,161 @@ describe("AgentSession before_agent_start attribution fallback", () => {
 		await disposal;
 		session = undefined as unknown as AgentSession;
 	});
+
+	it("disposal drains a selection between validation and mutation admissions", async () => {
+		createSession();
+		const currentModel = session.model;
+		if (!currentModel) throw new Error("Expected session model");
+		const selectionModel = { ...currentModel, provider: "selection-provider", id: "selection-between-admissions" };
+		authStorage?.setRuntimeApiKey(selectionModel.provider, "selection-key");
+		const admissionGapStarted = Promise.withResolvers<void>();
+		const releaseAdmissionGap = Promise.withResolvers<void>();
+
+		const selection = session.setDefaultModelSelection(selectionModel, undefined, {
+			onBeforeMutationAdmissionForTests: async () => {
+				admissionGapStarted.resolve();
+				await releaseAdmissionGap.promise;
+			},
+		});
+		await Promise.race([
+			admissionGapStarted.promise,
+			Bun.sleep(2_000).then(() => {
+				throw new Error("Selection did not reach the inter-admission idle wait");
+			}),
+		]);
+		const disposal = session.dispose();
+		let disposalSettled = false;
+		void disposal.then(() => {
+			disposalSettled = true;
+		});
+		const queuedPrompt = session.prompt("reject while selection drains");
+		const queuedResult = queuedPrompt.then(
+			() => ({ status: "fulfilled" as const }),
+			error => ({ status: "rejected" as const, error }),
+		);
+		await Bun.sleep(20);
+		expect(disposalSettled).toBe(false);
+
+		releaseAdmissionGap.resolve();
+		const selectionResult = await Promise.race([
+			selection,
+			Bun.sleep(2_000).then(() => {
+				throw new Error("Selection did not settle after its idle wait was released");
+			}),
+		]);
+		expect(selectionResult).toMatchObject({
+			provider: selectionModel.provider,
+			modelId: selectionModel.id,
+		});
+		expect(await queuedResult).toMatchObject({ status: "rejected", error: { code: "busy" } });
+		await Promise.race([
+			disposal,
+			Bun.sleep(2_000).then(() => {
+				throw new Error("Disposal did not settle after the selection completed");
+			}),
+		]);
+		session = undefined as unknown as AgentSession;
+	});
+
+	it("disposal drains a mutation admission activated before its closed-fence recheck", async () => {
+		createSession();
+		const currentModel = session.model;
+		if (!currentModel) throw new Error("Expected session model");
+		const selectionModel = { ...currentModel, provider: "selection-provider", id: "selection-activated" };
+		authStorage?.setRuntimeApiKey(selectionModel.provider, "selection-key");
+		const admissionReady = Promise.withResolvers<void>();
+		const releaseAdmissionReady = Promise.withResolvers<void>();
+
+		const selection = session.setDefaultModelSelection(selectionModel, undefined, {
+			onAfterMutationAdmissionReadyForTests: async () => {
+				admissionReady.resolve();
+				await releaseAdmissionReady.promise;
+			},
+		});
+		await admissionReady.promise;
+		const disposal = session.dispose();
+		let disposalSettled = false;
+		void disposal.then(() => {
+			disposalSettled = true;
+		});
+		const queuedPrompt = session.prompt("reject while activated selection drains");
+		const queuedPromptResult = queuedPrompt.then(
+			() => ({ status: "fulfilled" as const }),
+			error => ({ status: "rejected" as const, error }),
+		);
+		await Bun.sleep(20);
+		expect(disposalSettled).toBe(false);
+
+		releaseAdmissionReady.resolve();
+		await expect(selection).resolves.toMatchObject({
+			provider: selectionModel.provider,
+			modelId: selectionModel.id,
+		});
+		expect(await queuedPromptResult).toMatchObject({ status: "rejected", error: { code: "busy" } });
+		await disposal;
+		session = undefined as unknown as AgentSession;
+	});
+
+	it("disposal rejects a second-phase selection queued behind an active prompt", async () => {
+		createSession();
+		const currentModel = session.model;
+		if (!currentModel) throw new Error("Expected session model");
+		const selectionModel = { ...currentModel, provider: "selection-provider", id: "selection-behind-prompt" };
+		authStorage?.setRuntimeApiKey(selectionModel.provider, "selection-key");
+		const admissionGapStarted = Promise.withResolvers<void>();
+		const releaseAdmissionGap = Promise.withResolvers<void>();
+		const promptAdmissionStarted = Promise.withResolvers<void>();
+		const releasePromptAdmission = Promise.withResolvers<void>();
+		const safetyRelease = setTimeout(() => {
+			releaseAdmissionGap.resolve();
+			releasePromptAdmission.resolve();
+		}, 5_000);
+		safetyRelease.unref?.();
+
+		try {
+			const selection = session.setDefaultModelSelection(selectionModel, undefined, {
+				onBeforeMutationAdmissionForTests: async () => {
+					admissionGapStarted.resolve();
+					await releaseAdmissionGap.promise;
+				},
+			});
+			const selectionResult = selection.then(
+				value => ({ status: "fulfilled" as const, value }),
+				error => ({ status: "rejected" as const, error }),
+			);
+			await admissionGapStarted.promise;
+			const activePrompt = session.runWithPromptAdmissionForTests(async () => {
+				promptAdmissionStarted.resolve();
+				await releasePromptAdmission.promise;
+			});
+			await promptAdmissionStarted.promise;
+			releaseAdmissionGap.resolve();
+			await Promise.resolve();
+			await Promise.resolve();
+
+			const disposal = session.dispose();
+			const queuedPrompt = session.prompt("reject behind active prompt disposal");
+			const queuedPromptResult = queuedPrompt.then(
+				() => ({ status: "fulfilled" as const }),
+				error => ({ status: "rejected" as const, error }),
+			);
+			await Promise.race([
+				disposal,
+				Bun.sleep(2_000).then(() => {
+					throw new Error("Disposal waited for the active prompt admission");
+				}),
+			]);
+			expect(await selectionResult).toMatchObject({ status: "rejected", error: { code: "busy" } });
+			expect(await queuedPromptResult).toMatchObject({ status: "rejected", error: { code: "busy" } });
+			expect(session.model?.id).toBe(currentModel.id);
+
+			releasePromptAdmission.resolve();
+			await activePrompt;
+		} finally {
+			clearTimeout(safetyRelease);
+			releaseAdmissionGap.resolve();
+			releasePromptAdmission.resolve();
+			session = undefined as unknown as AgentSession;
+		}
+	});
 });

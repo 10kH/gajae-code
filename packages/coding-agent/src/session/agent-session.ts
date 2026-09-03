@@ -1577,6 +1577,21 @@ interface EphemeralTurnResult {
  */
 const SIGNAL_TEARDOWN_TIMEOUT_MS = 5_000;
 
+export class SessionDisposalIncompleteError extends Error {
+	constructor(label?: string) {
+		super(
+			label
+				? `Session disposal exceeded its bounded caller deadline while waiting for ${label}.`
+				: "Session disposal exceeded its bounded caller deadline.",
+		);
+		this.name = "SessionDisposalIncompleteError";
+	}
+}
+
+export function isSessionDisposalIncompleteError(error: unknown): error is SessionDisposalIncompleteError {
+	return error instanceof Error && error.name === "SessionDisposalIncompleteError";
+}
+
 const AGENT_BASH_ARTIFACT_SAVE_DIAGNOSTIC_MAX_BYTES = 256;
 
 function boundAgentBashArtifactSaveDiagnostic(error: unknown): string {
@@ -2027,6 +2042,7 @@ function sanitizePostPublicationError(error: string | undefined): string | undef
 
 export class WorkerIntegrationRequestScheduler {
 	#inFlight: Promise<WorkerIntegrationOutcome> | undefined = undefined;
+	#ownedRequests = new Set<Promise<void>>();
 	#pending = false;
 
 	constructor(
@@ -2054,6 +2070,12 @@ export class WorkerIntegrationRequestScheduler {
 		return outcome;
 	}
 
+	async joinOwnedRequests(): Promise<void> {
+		while (this.#ownedRequests.size > 0) {
+			await Promise.allSettled([...this.#ownedRequests]);
+		}
+	}
+
 	#start(): void {
 		this.#pending = false;
 		const controller = new AbortController();
@@ -2063,6 +2085,8 @@ export class WorkerIntegrationRequestScheduler {
 		} catch {
 			request = Promise.reject(new Error("Worker integration request failed before dispatch."));
 		}
+		this.#ownedRequests.add(request);
+		void request.finally(() => this.#ownedRequests.delete(request)).catch(() => {});
 		let timeout: ReturnType<typeof setTimeout> | undefined;
 		const deadline = new Promise<WorkerIntegrationOutcome>(resolve => {
 			timeout = setTimeout(() => {
@@ -2298,6 +2322,7 @@ type SessionAdmissionEntry = {
 	settled: PromiseWithResolvers<void>;
 	released: boolean;
 	selectionFenceGeneration: number;
+	selectionTransaction?: symbol;
 	continuationCapability?: symbol;
 };
 
@@ -2420,6 +2445,8 @@ export class AgentSession {
 	#selectionFenceGenerationContext = new AsyncLocalStorage<number>();
 	#selectionFenceTail: Promise<void> = Promise.resolve();
 	#pendingSelectionFences = 0;
+	#selectionAwaitingMutationTransaction: symbol | undefined;
+	#authorizedClosedSelectionTransaction: symbol | undefined;
 	#selectionFenceDeferredContinuations = new Map<number, number>();
 	#scopedSettlementWaiters = new Set<() => void>();
 	#oldestPendingSelectionFenceGeneration = 0;
@@ -2809,6 +2836,8 @@ export class AgentSession {
 
 	// Compaction state
 	#compactionAbortController: AbortController | undefined = undefined;
+	#compactionCompletion: Promise<void> | undefined;
+	#autoCompactionCompletions = new Set<Promise<AutoCompactionTerminalStatus>>();
 	#autoCompactionAbortController: AbortController | undefined = undefined;
 
 	/** Invocation-scoped EventStream drain barriers owned by active maintenance calls. */
@@ -3052,10 +3081,18 @@ export class AgentSession {
 	#providerCacheSessionId: string | undefined;
 	readonly #asyncJobProviderSessionId: string | undefined;
 	#isDisposed = false;
-	#disposePromise: Promise<void> | undefined;
+	#disposeRunPromise: Promise<void> | undefined;
+	#disposeCallerPromise: Promise<void> | undefined;
+	#disposeCompleted = false;
+	#disposeTerminalError: unknown;
 	readonly #disposeAbortController = new AbortController();
 	#disposeAdmissionClosed: Promise<void> | undefined;
 	#disposePostPromptDrain: Promise<void> | undefined;
+	#disposeDeadline = 0;
+	#disposeDeadlineTimer: NodeJS.Timeout | undefined;
+	#disposeDeadlineExpired: PromiseWithResolvers<void> | undefined;
+	#disposeTimeoutMs = SIGNAL_TEARDOWN_TIMEOUT_MS;
+	#disposeActiveStepLabel: string | undefined;
 	readonly #toolSessionCleanups = new Set<() => Promise<void> | void>();
 	readonly #toolSessionTransitionCleanups = new Set<() => Promise<void> | void>();
 	readonly #deferredOwnerShutdownFinalizations = new Set<Promise<void>>();
@@ -3491,8 +3528,17 @@ export class AgentSession {
 	}
 
 	#activateNextSessionAdmission(): void {
-		if (this.#activeSessionAdmission || this.#sessionAdmissionClosed) return;
-		const next = this.#sessionAdmissionQueue.shift();
+		if (this.#activeSessionAdmission) return;
+		let next: SessionAdmissionEntry | undefined;
+		if (this.#sessionAdmissionClosed) {
+			const index = this.#sessionAdmissionQueue.findIndex(
+				entry => entry.selectionTransaction === this.#authorizedClosedSelectionTransaction,
+			);
+			if (index < 0) return;
+			[next] = this.#sessionAdmissionQueue.splice(index, 1);
+		} else {
+			next = this.#sessionAdmissionQueue.shift();
+		}
 		if (!next) return;
 		this.#activeSessionAdmission = next;
 		next.ready.resolve();
@@ -3574,6 +3620,9 @@ export class AgentSession {
 		continuationAdmission?: ScheduledContinuationAdmission,
 		options?: {
 			allowDuringClosing?: boolean;
+			closedSelectionTransaction?: symbol;
+			selectionTransaction?: symbol;
+			onAfterReadyForTests?: () => Promise<void>;
 			bypassSelectionFenceGeneration?: number;
 			allowPromptContinuationReentry?: boolean;
 			idleDelivery?: boolean;
@@ -3618,8 +3667,11 @@ export class AgentSession {
 		) {
 			await awaitPromptInvocationPreflight(this.#selectionFenceTail, signal);
 		}
+		const closedSelectionAuthorized = (): boolean =>
+			options?.closedSelectionTransaction !== undefined &&
+			options.closedSelectionTransaction === this.#authorizedClosedSelectionTransaction;
 		if (
-			this.#sessionAdmissionClosed ||
+			(this.#sessionAdmissionClosed && !closedSelectionAuthorized()) ||
 			((this.#sessionAdmissionClosing || this.#isDisposed) && options?.allowDuringClosing !== true)
 		)
 			throw this.#sessionAdmissionBusyError();
@@ -3640,6 +3692,7 @@ export class AgentSession {
 			settled: Promise.withResolvers<void>(),
 			released: false,
 			selectionFenceGeneration: this.#selectionFenceGeneration,
+			...(options?.selectionTransaction ? { selectionTransaction: options.selectionTransaction } : {}),
 			...(kind === "prompt" ? { continuationCapability: Symbol("scheduled-continuation") } : {}),
 		};
 		const releaseEntry = () => {
@@ -3659,45 +3712,62 @@ export class AgentSession {
 			releaseEntry();
 			throw error;
 		}
-		if (
-			this.#sessionAdmissionClosed ||
-			((this.#sessionAdmissionClosing || this.#isDisposed) && options?.allowDuringClosing !== true)
-		) {
-			entry.released = true;
-			entry.settled.resolve();
-			if (this.#activeSessionAdmission === entry) this.#activeSessionAdmission = undefined;
-			this.#activateNextSessionAdmission();
-			throw this.#sessionAdmissionBusyError();
-		}
-		// Re-check the handoff fence after activation: a prompt queued before the
-		// transition began must not start once the fence is up.
-		if (kind === "prompt" && this.#handoffTransitionActive) {
-			entry.released = true;
-			entry.settled.resolve();
-			if (this.#activeSessionAdmission === entry) this.#activeSessionAdmission = undefined;
-			this.#activateNextSessionAdmission();
-			throw Object.assign(new AgentBusyError("Cannot start a turn while a handoff is in progress."), {
-				code: "busy",
-			});
-		}
-
-		const release = () => {
-			releaseEntry();
-		};
 		try {
+			await options?.onAfterReadyForTests?.();
+			if (
+				entry.released ||
+				(this.#sessionAdmissionClosed && !closedSelectionAuthorized()) ||
+				((this.#sessionAdmissionClosing || this.#isDisposed) && options?.allowDuringClosing !== true)
+			) {
+				throw this.#sessionAdmissionBusyError();
+			}
+			// Re-check the handoff fence after activation: a prompt queued before the
+			// transition began must not start once the fence is up.
+			if (kind === "prompt" && this.#handoffTransitionActive) {
+				throw Object.assign(new AgentBusyError("Cannot start a turn while a handoff is in progress."), {
+					code: "busy",
+				});
+			}
+
+			const release = () => {
+				releaseEntry();
+			};
 			return await this.#sessionAdmissionContext.run(entry, () => body({ release }));
 		} finally {
-			release();
+			releaseEntry();
 		}
 	}
 
-	async #closeSessionAdmission(): Promise<void> {
+	async #closeSessionAdmission(options?: { waitForActive?: boolean }): Promise<void> {
 		this.#sessionAdmissionClosing = true;
 		const active = this.#activeSessionAdmission;
 		if (active?.kind === "prompt") {
 			this.#promptGeneration++;
 			this.#promptPreflightCancellationGeneration++;
 			this.#promptPreflightAbortController.abort();
+		}
+		if (options?.waitForActive === false) {
+			this.#authorizedClosedSelectionTransaction =
+				active?.kind === "prompt"
+					? undefined
+					: (active?.selectionTransaction ?? this.#selectionAwaitingMutationTransaction);
+			this.#sessionAdmissionClosed = true;
+			const queued = this.#sessionAdmissionQueue.splice(0);
+			for (const entry of queued) {
+				entry.released = true;
+				entry.ready.resolve();
+				entry.settled.resolve();
+			}
+			// Only an active prompt may outlive bounded disposal. A selection mutates
+			// session/model state and must finish (or observe the closed fence) before
+			// teardown closes those resources; its own finally resolves the fence tail.
+			if (active?.kind === "selection") await active.settled.promise;
+			// An abort-ignoring prompt may have queued selection fences behind it, so
+			// that one case must bypass the fence. Otherwise the fence covers a
+			// selection between its validation and mutation admissions as well as one
+			// currently admitted.
+			if (active?.kind !== "prompt") await this.#selectionFenceTail;
+			return;
 		}
 		if (active) await active.settled.promise;
 		await this.#selectionFenceTail;
@@ -5546,21 +5616,26 @@ export class AgentSession {
 
 	async #runToolSessionTransitionCleanups(): Promise<void> {
 		const cleanups = Array.from(this.#toolSessionTransitionCleanups);
-		this.#toolSessionTransitionCleanups.clear();
 		const results = await Promise.allSettled(cleanups.map(async cleanup => await cleanup()));
-		for (const result of results) {
-			if (result.status === "rejected")
-				logger.warn("Tool session transition cleanup failed", { error: String(result.reason) });
+		const failures: unknown[] = [];
+		for (let index = 0; index < results.length; index++) {
+			const result = results[index]!;
+			if (result.status === "fulfilled") this.#toolSessionTransitionCleanups.delete(cleanups[index]!);
+			else failures.push(result.reason);
 		}
+		if (failures.length > 0) throw new AggregateError(failures, "Tool session transition cleanup failed.");
 	}
 
 	async #runToolSessionCleanups(): Promise<void> {
 		const cleanups = Array.from(this.#toolSessionCleanups);
-		this.#toolSessionCleanups.clear();
 		const results = await Promise.allSettled(cleanups.map(async cleanup => await cleanup()));
-		for (const result of results) {
-			if (result.status === "rejected") logger.warn("Tool session cleanup failed", { error: String(result.reason) });
+		const failures: unknown[] = [];
+		for (let index = 0; index < results.length; index++) {
+			const result = results[index]!;
+			if (result.status === "fulfilled") this.#toolSessionCleanups.delete(cleanups[index]!);
+			else failures.push(result.reason);
 		}
+		if (failures.length > 0) throw new AggregateError(failures, "Tool session cleanup failed.");
 	}
 
 	getAsyncJobSnapshot(options?: { recentLimit?: number }): AsyncJobSnapshot | null {
@@ -6035,19 +6110,20 @@ export class AgentSession {
 	 */
 	#queueCoordinatorRuntimeStatePersist(event: AgentSessionEvent, propagateFailure = false): Promise<void> {
 		if (isNonDispatchedToolEvent(event)) return Promise.resolve();
-		const context = this.#captureCoordinatorRuntimeStatePersistContext();
 		const observation = this.#coordinatorToolObservations.get(event);
 		const admission = this.#agentEventAdmission.get(event);
 		const barrier = admission?.persistBarrier;
 		if (barrier) {
 			const run = async () => {
 				await barrier;
+				const context = this.#captureCoordinatorRuntimeStatePersistContext();
 				await this.#persistRuntimeStateInBackground(event, context, observation, propagateFailure);
 			};
 			const queued = barrier.then(() => this.#appendCoordinatorPersist(run));
 			this.#trackReleasedBarrierPersist(queued);
 			return queued;
 		}
+		const context = this.#captureCoordinatorRuntimeStatePersistContext();
 		const generation = admission?.persistGeneration ?? this.#coordinatorPersistGeneration;
 		const run = () =>
 			generation === this.#coordinatorPersistGeneration
@@ -8911,26 +8987,86 @@ export class AgentSession {
 	 */
 	dispose(): Promise<void> {
 		this.#evalExecutionDisposing = true;
-		if (this.#disposePromise) return this.#disposePromise;
-		const { promise, resolve, reject } = Promise.withResolvers<void>();
-		this.#disposePromise = promise;
-		this.#abortAdmissionEpoch++;
-		this.#isDisposed = true;
-		this.#disposeAbortController.abort();
-		this.#disposeAdmissionClosed = this.#closeSessionAdmission();
-		this.#disposePostPromptDrain = this.#cancelPostPromptTasks();
-		this.#settleDeliveredOwnedRegistrations(this.#pendingNextTurnMessages.map(entry => entry.message));
-		this.#pendingNextTurnMessages = [];
-		this.#scheduledHiddenNextTurnGeneration = undefined;
-		this.#abortActiveMidRunBarriers();
-		this.abortCompaction();
-		this.abortRetry();
-		this.#quarantineAgentRunResources();
-		this.agent.abort();
-		this.agent.setMainAttemptScopeObserver(undefined);
-		this.#disconnectFromAgent();
-		void this.#dispose().then(resolve, reject);
-		return promise;
+		if (this.#disposeCompleted) return Promise.resolve();
+		if (this.#disposeTerminalError !== undefined) return Promise.reject(this.#disposeTerminalError);
+		if (this.#disposeCallerPromise) return this.#disposeCallerPromise;
+		if (!this.#disposeRunPromise) {
+			this.#disposeDeadline = Date.now() + this.#disposeTimeoutMs;
+			this.#disposeDeadlineExpired = Promise.withResolvers<void>();
+			this.#disposeDeadlineTimer = setTimeout(() => this.#disposeDeadlineExpired?.resolve(), this.#disposeTimeoutMs);
+			this.#disposeDeadlineTimer.unref?.();
+			this.#abortAdmissionEpoch++;
+			this.#isDisposed = true;
+			// Invalidate every coordinator event admitted before disposal. Handlers may
+			// still unwind, but their captured generation can no longer enqueue a write.
+			this.#coordinatorPersistGeneration += 1;
+			this.#disposeAbortController.abort();
+			// Disposal owns a bounded Agent abort below. Waiting for the active prompt's
+			// admission here would put that unbounded prompt ahead of the abort budget.
+			this.#disposeAdmissionClosed = this.#closeSessionAdmission({ waitForActive: false });
+			this.#disposePostPromptDrain = this.#cancelPostPromptTasks();
+			this.#settleDeliveredOwnedRegistrations(this.#pendingNextTurnMessages.map(entry => entry.message));
+			this.#pendingNextTurnMessages = [];
+			this.#scheduledHiddenNextTurnGeneration = undefined;
+			this.#abortActiveMidRunBarriers();
+			this.abortCompaction();
+			this.abortRetry();
+			this.#quarantineAgentRunResources();
+			this.agent.abort();
+			this.agent.setMainAttemptScopeObserver(undefined);
+			this.#disconnectFromAgent();
+			this.#disposeRunPromise = this.#dispose()
+				.then(
+					() => {
+						this.#disposeCompleted = true;
+					},
+					error => {
+						this.#disposeTerminalError = error;
+						throw error;
+					},
+				)
+				.finally(() => {
+					if (this.#disposeDeadlineTimer) clearTimeout(this.#disposeDeadlineTimer);
+					this.#disposeDeadlineTimer = undefined;
+				});
+			void this.#disposeRunPromise.catch(() => {});
+		}
+		const teardown = this.#disposeRunPromise;
+		const deadlineExpired = this.#disposeDeadlineExpired;
+		if (!deadlineExpired || Date.now() >= this.#disposeDeadline) {
+			return Promise.reject(new SessionDisposalIncompleteError(this.#disposeActiveStepLabel));
+		}
+		const boundedTeardown = Promise.race([
+			teardown,
+			deadlineExpired.promise.then(() => {
+				throw new SessionDisposalIncompleteError(this.#disposeActiveStepLabel);
+			}),
+		]);
+		this.#disposeCallerPromise = boundedTeardown;
+		void boundedTeardown
+			.finally(() => {
+				if (this.#disposeCallerPromise === boundedTeardown) this.#disposeCallerPromise = undefined;
+			})
+			.catch(() => {});
+		return boundedTeardown;
+	}
+
+	/** Join the retained teardown owner without allocating another public deadline. */
+	awaitDisposeCompletion(): Promise<void> {
+		return this.#disposeRunPromise ?? this.dispose();
+	}
+
+	setDisposeTimeoutForTests(timeoutMs: number): void {
+		if (this.#disposeRunPromise) throw new Error("Cannot change the disposal timeout after disposal has started.");
+		this.#disposeTimeoutMs = Math.max(0, timeoutMs);
+	}
+
+	trackPostPromptTaskForTests(task: Promise<void>): void {
+		this.#trackPostPromptTask(task, this.#selectionFenceGeneration);
+	}
+
+	requestWorkerIntegrationForTests(): void {
+		this.#requestWorkerIntegrationAttempt();
 	}
 
 	/** Cancel the active logical run domain, including managed continuations detached from Agent's active attempt. */
@@ -8940,9 +9076,33 @@ export class AgentSession {
 	}
 
 	async #dispose(): Promise<void> {
+		const disposeFailures: Array<{ label: string; error: unknown; critical: boolean }> = [];
+		const awaitDisposeStep = async <T>(
+			label: string,
+			operation: Promise<T>,
+			critical = false,
+		): Promise<T | undefined> => {
+			this.#disposeActiveStepLabel = label;
+			try {
+				return await operation;
+			} catch (error) {
+				disposeFailures.push({ label, error, critical });
+				logger.warn("Session dispose step failed", { label, error: String(error) });
+				return undefined;
+			} finally {
+				if (this.#disposeActiveStepLabel === label) this.#disposeActiveStepLabel = undefined;
+			}
+		};
+		const drainCoordinatorEventHandlers = async (): Promise<void> => {
+			while (this.#coordinatorEventHandlers.size > 0) {
+				await Promise.allSettled([...this.#coordinatorEventHandlers]);
+			}
+		};
 		const admissionClosed = this.#disposeAdmissionClosed ?? this.#closeSessionAdmission();
-		await admissionClosed;
-		await this.sessionManager.closeCwdMoveAdmission();
+		await awaitDisposeStep("session admission close", admissionClosed);
+		await awaitDisposeStep("cwd move admission close", this.sessionManager.closeCwdMoveAdmission());
+		await awaitDisposeStep("admitted cwd transition", this.sessionManager.joinCwdTransition(), true);
+		await awaitDisposeStep("active cwd readers", this.sessionManager.joinCwdReaders(), true);
 		this.#isDisposed = true;
 		// Reject new direct Python starts as soon as disposal begins (synchronously,
 		// before any await) so callers cannot race a start against teardown.
@@ -8960,60 +9120,71 @@ export class AgentSession {
 		// R2-5: join any in-flight mid-run maintenance invocation before teardown so the
 		// abort-aware maintenance promise (already aborted above) settles and cannot touch
 		// torn-down state afterward.
-		await this.#waitForActiveMidRunMaintenance();
+		await awaitDisposeStep("mid-run maintenance", this.#waitForActiveMidRunMaintenance());
 		// R2-5: give the aborted Agent run a bounded chance to settle, then force-
 		// invalidate its run id so an abort-ignoring provider/tool cannot emit a late
 		// message_end after teardown. Mirrors AgentSession.abort({ timeoutMs }).
+		const idleBudgetMs = Math.max(0, Math.min(2_000, this.#disposeDeadline - Date.now()));
 		const disposeIdleSettled = await Promise.race([
 			this.agent.waitForIdle().then(
 				() => true,
 				() => true,
 			),
-			Bun.sleep(2_000).then(() => false),
+			Bun.sleep(idleBudgetMs).then(() => false),
 		]);
 		if (!disposeIdleSettled) {
-			try {
-				this.agent.forceAbort("Session disposed", this.#activeLogicalRunId);
-			} catch {
-				// AttemptScope handle may not be registered for sessions
-				// that don't participate in the facility (e.g. test mocks).
-				this.agent.forceAbort("Session disposed");
-			}
+			this.#forceSessionRecovery();
 		}
-		await this.#agentEndPublicationPromise;
-		await this.#queuedExtensionEvents;
-		await this.#agentEndHandlingPromise;
+		await awaitDisposeStep("active compaction", this.#compactionCompletion ?? Promise.resolve(), true);
+		await awaitDisposeStep(
+			"active auto-compaction",
+			Promise.allSettled([...this.#autoCompactionCompletions]).then(() => {}),
+			true,
+		);
+		await awaitDisposeStep("agent end publication", this.#agentEndPublicationPromise);
+		await awaitDisposeStep("queued extension events", this.#queuedExtensionEvents);
+		await awaitDisposeStep("agent end handling", this.#agentEndHandlingPromise);
+		await awaitDisposeStep("coordinator event handlers", drainCoordinatorEventHandlers(), true);
 		// Drain the sidecar write order for the same reason the two queues above are
 		// drained: each entry writes under the native identity-bound state-file lock, so a
 		// a still-queued write would run after the session that owns it is gone — releasing
 		// a lock whose owner no longer exists, and under `bun test --isolate` calling into
 		// the addon after the runtime tore down the context it was scheduled in. The chain
 		// is already failure-absorbing, so this only waits.
-		await this.#coordinatorPersistQueue;
+		await awaitDisposeStep("coordinator persistence", this.#coordinatorPersistQueue, true);
 		// Terminal publication records its reconciliation from a promise reaction, which
 		// can append after the queue snapshot above was awaited. Drain the tracked writes
 		// again so disposal cannot return while that late reconciliation still owns a lock.
-		await this.#drainUnbarrieredCoordinatorPersists();
+		await awaitDisposeStep("unbarriered coordinator persistence", this.#drainUnbarrieredCoordinatorPersists(), true);
 		this.#pendingBackgroundExchanges = [];
 		this.#drainTerminalOwnedYieldEntries();
 
 		this.agent.setOnBeforeYield(undefined);
 		try {
 			if (this.#extensionRunner?.hasHandlers("session_shutdown")) {
-				await this.#extensionRunner.emit({ type: "session_shutdown" });
+				await awaitDisposeStep(
+					"session shutdown handlers",
+					this.#extensionRunner.emit({ type: "session_shutdown" }),
+				);
 			}
 		} catch (error) {
+			if (isSessionDisposalIncompleteError(error)) throw error;
 			logger.warn("Failed to emit session_shutdown event", { error: String(error) });
 		}
 		this.#workflowGateEmitter?.fence?.();
 		this.#workflowGateEmitter = undefined;
 		this.#notifyWorkflowGateEmitterChanged(this.sessionId, undefined);
-		await this.#flushWorkerIntegrationAttempt();
+		await awaitDisposeStep("worker integration", this.#flushWorkerIntegrationAttempt(), true);
+		await awaitDisposeStep(
+			"worker integration ownership",
+			this.#workerIntegrationScheduler?.joinOwnedRequests() ?? Promise.resolve(),
+			true,
+		);
 		// Worker integration completion can enqueue terminal reconciliation while the
 		// flush above is pending; drain that late producer before disposal resolves.
-		await this.#coordinatorPersistQueue;
-		await this.#drainUnbarrieredCoordinatorPersists();
-		await (this.#disposePostPromptDrain ?? this.#cancelPostPromptTasks());
+		await awaitDisposeStep("post-worker coordinator persistence", this.#coordinatorPersistQueue, true);
+		await awaitDisposeStep("post-worker unbarriered persistence", this.#drainUnbarrieredCoordinatorPersists(), true);
+		await awaitDisposeStep("post-prompt tasks", this.#disposePostPromptDrain ?? this.#cancelPostPromptTasks(), true);
 		// Cancel jobs this agent registered so a subagent's teardown doesn't
 		// leak its background bash/task work into the parent's manager. Only
 		// the session that owns the manager goes on to dispose it (which itself
@@ -9028,32 +9199,37 @@ export class AgentSession {
 		// — a shared manager would otherwise keep the claim past this session's
 		// disposal.
 		this.#drainTerminalOwnedYieldEntries();
-		await Promise.allSettled(this.#deferredOwnerShutdownFinalizations);
+		await awaitDisposeStep("deferred owner shutdown", Promise.allSettled(this.#deferredOwnerShutdownFinalizations));
 		const ownedAsyncManager = this.#ownedAsyncJobManager;
 		if (ownedAsyncManager && this.#disposeAsyncJobManager) {
-			const drained = await ownedAsyncManager.dispose({ timeoutMs: 3_000 });
+			const drained = await awaitDisposeStep("async job manager", ownedAsyncManager.dispose({ timeoutMs: 3_000 }));
 			const deliveryState = ownedAsyncManager.getDeliveryState();
 			if (drained === false && deliveryState) {
 				logger.warn("Async job completion deliveries still pending during dispose", { ...deliveryState });
 			}
-			if (AsyncJobManager.instance() === ownedAsyncManager) {
-				AsyncJobManager.setInstance(undefined);
+			if (drained === false) {
+				await awaitDisposeStep(
+					"async job manager retained runners",
+					ownedAsyncManager.awaitRetainedDisposalCompletion(),
+					true,
+				);
 			}
+			if (AsyncJobManager.instance() === ownedAsyncManager) AsyncJobManager.setInstance(undefined);
 		}
-		await this.#runToolSessionTransitionCleanups();
-		await this.#runToolSessionCleanups();
+		await awaitDisposeStep("tool session transition cleanups", this.#runToolSessionTransitionCleanups(), true);
+		await awaitDisposeStep("tool session cleanups", this.#runToolSessionCleanups(), true);
 		// Only disconnect the MCP manager THIS session owns (top-level sessions that
 		// connected plugin-bundle MCP servers). Subagents and callers that merely
 		// observe the process-global manager must never tear down a manager they do
 		// not own. Mirrors the ownedAsyncJobManager rule above.
 		const ownedMcpManager = this.#ownedMcpManager;
 		if (ownedMcpManager) {
-			await ownedMcpManager.releaseLeases();
+			await awaitDisposeStep("MCP lease release", ownedMcpManager.releaseLeases());
 			if (MCPManager.instance() === ownedMcpManager) {
 				MCPManager.setInstance(undefined);
 			}
 		}
-		await shutdownAllLspClients();
+		await awaitDisposeStep("LSP shutdown", shutdownAllLspClients());
 		// F13: release only THIS session's browser tabs on dispose (kill:false → remote
 		// browsers disconnect, headless close gracefully). Scoped by the session id the
 		// browser tool tagged tabs with, so other live sessions' tabs are untouched.
@@ -9072,29 +9248,40 @@ export class AgentSession {
 		this.#unregisterMovePublicationListener = undefined;
 		this.#unregisterAfterMoveListener?.();
 		this.#unregisterAfterMoveListener = undefined;
-		await releaseTabsForOwner(this.sessionManager.getSessionId()).catch((error: unknown) =>
-			logger.warn("session dispose: releaseTabsForOwner failed", { error }),
+		await awaitDisposeStep("browser tab release", releaseTabsForOwner(this.sessionManager.getSessionId()), true);
+		const pythonExecutionsSettled = await awaitDisposeStep(
+			"Python execution preparation",
+			this.#prepareEvalExecutionsForDispose(),
 		);
-		const pythonExecutionsSettled = await this.#prepareEvalExecutionsForDispose();
 		if (!pythonExecutionsSettled) {
 			logger.warn(
 				"Detaching retained Python kernel ownership during dispose while Python execution is still active",
 			);
 		}
-		await disposeKernelSessionsByOwner(this.#evalKernelOwnerId);
-		await disposeVmContextsByOwner(this.#evalKernelOwnerId);
+		await awaitDisposeStep("Python kernel sessions", disposeKernelSessionsByOwner(this.#evalKernelOwnerId));
+		await awaitDisposeStep("VM contexts", disposeVmContextsByOwner(this.#evalKernelOwnerId));
 		this.#releasePowerAssertion();
 		// Disconnect the agent event listener BEFORE closing session resources so a late
 		// provider/tool message_end cannot append to the closing SessionManager.
 		this.#disconnectFromAgent();
-		await this.memoryBackend.dispose();
-		if (this.#workspaceTreeService) await this.#workspaceTreeService.dispose();
-		if (this.#networkPrewarmService) await this.#networkPrewarmService.dispose();
+		await awaitDisposeStep("memory backend", this.memoryBackend.dispose(), true);
+		if (this.#workspaceTreeService)
+			await awaitDisposeStep("workspace tree", this.#workspaceTreeService.dispose(), true);
+		if (this.#networkPrewarmService)
+			await awaitDisposeStep("network prewarm", this.#networkPrewarmService.dispose(), true);
 		this.#modelRegistry.authStorage?.releaseCredentialScope(this.credentialSessionId);
-		await this.sessionManager.close();
+		let criticalDisposeError: unknown;
+		try {
+			await this.#closeSessionManagerForDispose();
+		} catch (error) {
+			criticalDisposeError = error;
+			logger.warn("Session manager close failed during dispose; continuing independent cleanup", {
+				error: String(error),
+			});
+		}
 		this.#closeAllProviderSessions("dispose");
 		const hindsightState = this.getHindsightSessionState();
-		await hindsightState?.dispose();
+		await awaitDisposeStep("hindsight state", hindsightState?.dispose() ?? Promise.resolve());
 		this.setHindsightSessionState(undefined);
 		if (this.#unsubscribeAppendOnly) {
 			this.#unsubscribeAppendOnly();
@@ -9102,7 +9289,35 @@ export class AgentSession {
 		}
 		this.#eventListeners = [];
 		this.#rebuildEventListenerSnapshot();
+		if (criticalDisposeError !== undefined) {
+			disposeFailures.push({ label: "session manager close", error: criticalDisposeError, critical: true });
+		}
+		if (disposeFailures.length > 0) {
+			throw new AggregateError(
+				disposeFailures.map(failure => failure.error),
+				`Session disposal did not reach a terminal state: ${disposeFailures.map(failure => failure.label).join(", ")}`,
+			);
+		}
 	}
+
+	async #closeSessionManagerForDispose(): Promise<void> {
+		let retryDelayMs = 50;
+		for (;;) {
+			const outcome = await this.sessionManager.closeStrict();
+			if (outcome.kind === "closed") {
+				SessionManager.releaseProcessCwdOwnership(this.sessionManager);
+				return;
+			}
+			if (outcome.kind === "close_unknown") {
+				SessionManager.releaseProcessCwdOwnership(this.sessionManager);
+				throw outcome.error;
+			}
+			logger.warn("Session manager close remains retryable during dispose", { error: outcome.error.message });
+			await Bun.sleep(retryDelayMs);
+			retryDelayMs = Math.min(retryDelayMs * 2, 1_000);
+		}
+	}
+
 	/**
 	 * Strict writer close for ACP session delete. On the first attempt it flushes
 	 * pending writes, then returns the certainty-aware close outcome so the caller
@@ -9276,6 +9491,13 @@ export class AgentSession {
 		await this.awaitPendingContextTransformations();
 		await this.#waitForSessionSettlement();
 		await this.sessionManager.flush();
+	}
+
+	/** Test seam: hold prompt admission while bypassing a pending selection fence. */
+	runWithPromptAdmissionForTests(body: () => Promise<void>): Promise<void> {
+		return this.#withSessionAdmission("prompt", async () => body(), undefined, undefined, {
+			bypassSelectionFenceGeneration: this.#selectionFenceGeneration - 1,
+		});
 	}
 
 	queueCoordinatorRuntimeStatePersistForTests(event: AgentSessionEvent, gate: Promise<void>): Promise<void> {
@@ -9943,7 +10165,10 @@ export class AgentSession {
 						// The lease keeps writers out for the whole execution, so this can
 						// only trip if a caller bypassed the lease; surface it rather than
 						// returning a result computed against a retired cwd.
-						if (this.sessionManager.getCwdGeneration() !== admittedGeneration) {
+						if (
+							this.sessionManager.getCwdGeneration() !== admittedGeneration &&
+							!this.sessionManager.consumeNestedCwdMove(admittedGeneration)
+						) {
 							throw new Error(
 								"Session working directory changed while this tool executed; retry against the new cwd.",
 							);
@@ -14280,6 +14505,7 @@ export class AgentSession {
 			| "internal";
 		silent?: boolean;
 		sdkRunToken?: string;
+		preserveCompaction?: boolean;
 	}): void {
 		const abortGoalState = this.getGoalModeState();
 		this.#suppressNextGoalReminderAfterAbortGoalId =
@@ -14296,7 +14522,8 @@ export class AgentSession {
 		this.#promptPreflightAbortController.abort();
 		this.#promptPreflightAbortController = new AbortController();
 		this.#scheduledHiddenNextTurnGeneration = undefined;
-		this.abortCompaction();
+		if (options?.preserveCompaction) this.#autoCompactionAbortController?.abort();
+		else this.abortCompaction();
 		this.abortHandoff();
 		this.abortBash();
 		this.abortEval();
@@ -14352,6 +14579,7 @@ export class AgentSession {
 			| "tool_abort"
 			| "internal";
 		silent?: boolean;
+		preserveCompaction?: boolean;
 	}): Promise<AbortOutcome> {
 		// Advance the admission epoch SYNCHRONOUSLY, before any await and before the
 		// shared-unwind branch. A second abort that piggybacks on the first unwind
@@ -14369,6 +14597,7 @@ export class AgentSession {
 			this.#promptPreflightAbortController.abort();
 			this.#promptPreflightAbortController = new AbortController();
 			this.#drainTerminalOwnedYieldEntries();
+			if (options?.preserveCompaction !== true) this.abortCompaction();
 			const overlappingPostPromptDrain = this.#cancelPostPromptTasks();
 			// Abort visibility is per-request: a later real abort must not inherit an
 			// earlier silent abort's suppression and swallow the user-visible notice.
@@ -14491,6 +14720,7 @@ export class AgentSession {
 			| "tool_abort"
 			| "internal";
 		silent?: boolean;
+		preserveCompaction?: boolean;
 	}): Promise<void> {
 		const outcome = await this.#abortWithOutcome(options);
 		if (outcome.kind === "error") throw outcome.cause;
@@ -16226,6 +16456,10 @@ export class AgentSession {
 			onBeforeMutation?: () => void;
 			/** Run inside the selection admission after the durable mutation. */
 			onAfterMutation?: () => void;
+			/** Test seam: pause after idle drain but before mutation admission. */
+			onBeforeMutationAdmissionForTests?: () => Promise<void>;
+			/** Test seam: pause after mutation admission activates, before its closed-fence recheck. */
+			onAfterMutationAdmissionReadyForTests?: () => Promise<void>;
 		},
 	): Promise<DefaultModelSelectionResult> {
 		// Reserve the causal selection fence synchronously, before credential
@@ -16241,6 +16475,7 @@ export class AgentSession {
 			throw new Error("Default model selection cannot inherit a thinking level");
 		}
 		const expectedSessionId = this.sessionId;
+		const selectionTransaction = Symbol("default-model-selection");
 		const priorSelectionFence = this.#selectionFenceTail;
 		const selectionFence = Promise.withResolvers<void>();
 		this.#selectionFenceGeneration += 1;
@@ -16276,9 +16511,11 @@ export class AgentSession {
 				},
 				undefined,
 				undefined,
-				{ allowDuringClosing: true },
+				{ allowDuringClosing: true, selectionTransaction },
 			);
+			this.#selectionAwaitingMutationTransaction = selectionTransaction;
 			await this.waitForIdle(selectionFenceGeneration);
+			await options?.onBeforeMutationAdmissionForTests?.();
 			return await this.#withSessionAdmission(
 				"selection",
 				async () => {
@@ -16360,9 +16597,16 @@ export class AgentSession {
 				},
 				undefined,
 				undefined,
-				{ allowDuringClosing: true },
+				{
+					allowDuringClosing: true,
+					closedSelectionTransaction: selectionTransaction,
+					selectionTransaction,
+					onAfterReadyForTests: options?.onAfterMutationAdmissionReadyForTests,
+				},
 			);
 		} finally {
+			if (this.#selectionAwaitingMutationTransaction === selectionTransaction)
+				this.#selectionAwaitingMutationTransaction = undefined;
 			selectionFence.resolve();
 			this.#pendingSelectionFences -= 1;
 			if (this.#oldestPendingSelectionFenceGeneration === selectionFenceGeneration) {
@@ -17421,22 +17665,35 @@ export class AgentSession {
 	 * @param options Optional callbacks for completion/error handling
 	 */
 	async compact(customInstructions?: string, options?: CompactOptions): Promise<CompactionResult> {
+		this.#assertSessionAdmissionOpen();
 		// Serialize with every other session-identity transition via the shared lease
 		// (bidirectional mutual exclusion with handoff/new/switch/branch/clear/fork/
 		// navigateTree). Released in the outer finally below.
 		this.#beginSessionTransition("compact");
+		const completion = Promise.withResolvers<void>();
+		this.#compactionCompletion = completion.promise;
 		try {
 			if (this.#compactionAbortController) {
 				throw new Error("Compaction already in progress");
 			}
-			this.#disconnectFromAgent();
-			await this.abort();
 			const compactionAbortController = new AbortController();
 			this.#compactionAbortController = compactionAbortController;
-			// Take this invocation's state snapshot for the summarizer context.
-			const compactionStateSnapshot = await this.#compactionStateSnapshot({ trackWorkflowRecoveryProgress: true });
-
+			this.#disconnectFromAgent();
 			try {
+				await this.abort({ cause: "compaction", preserveCompaction: true });
+			} catch (error) {
+				this.#compactionAbortController = undefined;
+				throw error;
+			}
+			await this.#waitForAutoCompactionCompletions();
+			try {
+				if (compactionAbortController.signal.aborted) {
+					throw new CompactionCancelledError();
+				}
+				// Take this invocation's state snapshot for the summarizer context.
+				const compactionStateSnapshot = await this.#compactionStateSnapshot({
+					trackWorkflowRecoveryProgress: true,
+				});
 				if (!this.model) {
 					throw new Error("No model selected");
 				}
@@ -17573,9 +17830,11 @@ export class AgentSession {
 				if (this.#compactionAbortController === compactionAbortController) {
 					this.#compactionAbortController = undefined;
 				}
-				this.#reconnectToAgent();
+				if (!this.#isDisposed && !this.#sessionAdmissionClosing) this.#reconnectToAgent();
 			}
 		} finally {
+			completion.resolve();
+			if (this.#compactionCompletion === completion.promise) this.#compactionCompletion = undefined;
 			this.#endSessionTransition();
 		}
 	}
@@ -17637,9 +17896,21 @@ export class AgentSession {
 		}
 	}
 
+	/**
+	 * Wait for every automatic compaction producer currently unwinding. An auto
+	 * compaction owns the session history through its post-append rewrite and
+	 * `session_compact` delivery, so cancelling its signal is not sufficient to
+	 * make that work safe to overlap with a manual compaction.
+	 */
+	async #waitForAutoCompactionCompletions(): Promise<void> {
+		while (this.#autoCompactionCompletions.size > 0) {
+			await Promise.allSettled([...this.#autoCompactionCompletions]);
+		}
+	}
+
 	/** Trigger idle compaction through the auto-compaction flow (with UI events). */
 	async runIdleCompaction(): Promise<void> {
-		if (this.isStreaming || this.isCompacting) return;
+		if (this.#isDisposed || this.#sessionAdmissionClosing || this.isStreaming || this.isCompacting) return;
 		// Do not start idle compaction while a handoff transition owns the session.
 		if (this.isGeneratingHandoff || this.#handoffTransitionActive) return;
 		await this.#runAutoCompaction("idle", false, true);
@@ -19487,7 +19758,27 @@ export class AgentSession {
 	/**
 	 * Internal: Run auto-compaction with events.
 	 */
-	async #runAutoCompaction(
+	#runAutoCompaction(
+		reason: "overflow" | "threshold" | "idle",
+		willRetry: boolean,
+		deferred = false,
+		options?: {
+			continueAfterMaintenance?: boolean;
+			deferHandoffMaintenance?: boolean;
+			force?: boolean;
+			signal?: AbortSignal;
+			beforeTerminalOverflowNoop?: () => void;
+			resourceRunId?: string;
+		},
+	): Promise<AutoCompactionTerminalStatus> {
+		if (this.#isDisposed || this.#sessionAdmissionClosing) return Promise.resolve({ kind: "skipped" });
+		const completion = this.#runAutoCompactionImpl(reason, willRetry, deferred, options);
+		this.#autoCompactionCompletions.add(completion);
+		void completion.finally(() => this.#autoCompactionCompletions.delete(completion)).catch(() => {});
+		return completion;
+	}
+
+	async #runAutoCompactionImpl(
 		reason: "overflow" | "threshold" | "idle",
 		willRetry: boolean,
 		deferred = false,
