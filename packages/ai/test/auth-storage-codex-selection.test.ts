@@ -371,6 +371,82 @@ describe("AuthStorage codex oauth ranking", () => {
 		expect(apiKey?.startsWith("api-acct-plus-")).toBe(true);
 	});
 
+	test("rejects GPT-5.6 Sol for a known non-Pro ChatGPT account", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+
+		await authStorage.set("openai-codex", [{ type: "oauth", ...createCredential("acct-plus", "plus@example.com") }]);
+		const plusReport = createCodexUsageReport({
+			accountId: "acct-plus",
+			primary: { usedFraction: 0.05, resetInMs: 30 * 60 * 1000 },
+			secondary: { usedFraction: 0.05, resetInMs: 6 * 24 * 60 * 60 * 1000 },
+		});
+		plusReport.metadata = { ...plusReport.metadata, planType: "plus" };
+		usageByAccount.set("acct-plus", plusReport);
+
+		await expect(
+			authStorage.getApiKey("openai-codex", "session-sol-plus", { modelId: "gpt-5.6-sol" }),
+		).rejects.toThrow(
+			'This ChatGPT Codex account cannot use model "gpt-5.6-sol". Select a model available to this ChatGPT account',
+		);
+	});
+
+	test("selects a Pro ChatGPT account for GPT-5.6 Sol", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+
+		await authStorage.set("openai-codex", [
+			{ type: "oauth", ...createCredential("acct-plus", "plus@example.com") },
+			{ type: "oauth", ...createCredential("acct-pro", "pro@example.com") },
+		]);
+		const plusReport = createCodexUsageReport({
+			accountId: "acct-plus",
+			primary: { usedFraction: 0.05, resetInMs: 30 * 60 * 1000 },
+			secondary: { usedFraction: 0.05, resetInMs: 6 * 24 * 60 * 60 * 1000 },
+		});
+		plusReport.metadata = { ...plusReport.metadata, planType: "plus" };
+		usageByAccount.set("acct-plus", plusReport);
+		const proReport = createCodexUsageReport({
+			accountId: "acct-pro",
+			primary: { usedFraction: 0.2, resetInMs: 30 * 60 * 1000 },
+			secondary: { usedFraction: 0.2, resetInMs: 6 * 24 * 60 * 60 * 1000 },
+		});
+		proReport.metadata = { ...proReport.metadata, planType: "pro" };
+		usageByAccount.set("acct-pro", proReport);
+
+		await expect(authStorage.getApiKey("openai-codex", "session-sol-pro", { modelId: "gpt-5.6-sol" })).resolves.toBe(
+			"api-acct-pro",
+		);
+	});
+
+	test("does not reject GPT-5.6 Sol when the ChatGPT plan is unavailable", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+
+		await authStorage.set("openai-codex", [
+			{ type: "oauth", ...createCredential("acct-unknown", "unknown@example.com") },
+		]);
+		usageByAccount.set(
+			"acct-unknown",
+			createCodexUsageReport({
+				accountId: "acct-unknown",
+				primary: { usedFraction: 0.05, resetInMs: 30 * 60 * 1000 },
+				secondary: { usedFraction: 0.05, resetInMs: 6 * 24 * 60 * 60 * 1000 },
+			}),
+		);
+
+		await expect(
+			authStorage.getApiKey("openai-codex", "session-sol-unknown", { modelId: "gpt-5.6-sol" }),
+		).resolves.toBe("api-acct-unknown");
+	});
+
+	test("does not apply the ChatGPT entitlement gate to an API-key credential", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+
+		await authStorage.set("openai-codex", { type: "api_key", key: "api-key-credential" });
+
+		await expect(
+			authStorage.getApiKey("openai-codex", "session-sol-api-key", { modelId: "gpt-5.6-sol" }),
+		).resolves.toBe("api-key-credential");
+	});
+
 	test("times out slow usage ranking instead of blocking first account selection", async () => {
 		if (!store) throw new Error("test setup failed");
 

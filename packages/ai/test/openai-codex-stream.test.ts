@@ -1020,6 +1020,48 @@ describe("openai-codex streaming", () => {
 		expect(result.errorMessage).toContain("terminal completion event");
 	});
 
+	it("gives entitlement failures actionable account guidance", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-entitlement-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const model = {
+			...createCodexTestModel("https://chatgpt.com/backend-api"),
+			id: "gpt-5.6-sol",
+			name: "GPT-5.6 Sol",
+			preferWebsockets: false,
+		};
+		const context = createCodexTestContext();
+		const providerMessage = "The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account.";
+
+		global.fetch = vi.fn(
+			async () =>
+				new Response(JSON.stringify({ error: { code: "invalid_request_error", message: providerMessage } }), {
+					status: 400,
+					headers: { "content-type": "application/json" },
+				}),
+		) as unknown as typeof fetch;
+		const httpResult = await streamOpenAICodexResponses(model, context, { apiKey: token }).result();
+		expect(httpResult.stopReason).toBe("error");
+		expect(httpResult.errorMessage).toContain('cannot use model "gpt-5.6-sol"');
+		expect(httpResult.errorMessage).toContain("Select a model available to this ChatGPT account");
+		expect(httpResult.errorMessage).toContain("API-key credential");
+		expect(httpResult.errorMessage).not.toContain("not supported when using Codex");
+
+		const sse = `data: ${JSON.stringify({
+			type: "error",
+			error: { code: "invalid_request_error", message: providerMessage },
+		})}\n\n`;
+		global.fetch = vi.fn(
+			async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+		) as unknown as typeof fetch;
+		const streamResult = await streamOpenAICodexResponses(model, context, { apiKey: token }).result();
+		expect(streamResult.stopReason).toBe("error");
+		expect(streamResult.errorMessage).toContain('cannot use model "gpt-5.6-sol"');
+		expect(streamResult.errorMessage).toContain("Select a model available to this ChatGPT account");
+		expect(streamResult.errorMessage).toContain("API-key credential");
+		expect(streamResult.errorMessage).not.toContain("not supported when using Codex");
+	});
+
 	it("stops reading SSE responses after a terminal response event", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());

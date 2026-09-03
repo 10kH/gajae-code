@@ -26,6 +26,11 @@ import type {
 	UsageReport,
 } from "./usage";
 
+import {
+	formatOpenAICodexChatGPTEntitlementError,
+	requiresOpenAICodexProModel,
+	requiresStrictOpenAICodexProModel,
+} from "./utils/codex-entitlement";
 import { getOAuthApiKey, getOAuthProvider, refreshOAuthToken, resolveOAuthStorageProvider } from "./utils/oauth";
 import { loginDeepInfra } from "./utils/oauth/deepinfra";
 import { loginDeepSeek } from "./utils/oauth/deepseek";
@@ -1138,10 +1143,6 @@ export function readBrokerErrorBody(error: unknown): string | undefined {
 		// refresh failure with an inspection error.
 		throw error;
 	}
-}
-
-function requiresOpenAICodexProModel(provider: string, modelId: string | undefined): boolean {
-	return provider === "openai-codex" && typeof modelId === "string" && modelId.includes("-spark");
 }
 
 function getUsagePlanType(report: UsageReport | null): string | undefined {
@@ -4955,6 +4956,19 @@ export class AuthStorage {
 		// non-Pro accounts can still attempt Spark requests (e.g. trial/grandfathered access).
 		const enforceProRequirement =
 			requiresProModel && candidates.some(candidate => hasOpenAICodexProPlan(candidate.usage));
+		// Spark retains its historical Plus fallback for grandfathered accounts.
+		// Sol is different: a confirmed non-Pro plan cannot call it, so reject the
+		// model before returning an OAuth bearer and letting the turn fail remotely.
+		const strictProRequirement = requiresStrictOpenAICodexProModel(provider, options?.modelId);
+		if (
+			strictProRequirement &&
+			candidates.length > 0 &&
+			candidates.every(
+				candidate => getUsagePlanType(candidate.usage) !== undefined && !hasOpenAICodexProPlan(candidate.usage),
+			)
+		) {
+			throw new Error(formatOpenAICodexChatGPTEntitlementError(options?.modelId));
+		}
 
 		const fallback = candidates[0];
 
