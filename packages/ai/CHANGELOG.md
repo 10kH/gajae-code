@@ -4,6 +4,8 @@
 
 ### Added
 
+- Exported `fetchModelsDevPayload` from `provider-models/openai-compat` and coalesced its downloads. models.dev publishes one catalog document describing every provider, but each models.dev-backed provider downloaded it separately, so a single discovery pass transferred the same payload once per provider (and `packages/coding-agent` kept a second downloader of its own). Downloads are now shared per fetch implementation for a 60s window, failures are not retained, and `coding-agent` model discovery consumes the same fetcher.
+
 - Exported `detectDiscoveredApiFamily` from `utils/discovery/openai-compatible`: infers the wire API family (`anthropic-messages` vs `openai-completions`) for a discovered model on a mixed OpenAI-compatible gateway, using the OpenAI `owned_by` owner first and the model id (`claude-*` vs `gpt-*`/`o1`/`codex`/…) as fallback, returning `undefined` when inconclusive. Consumed by custom-provider auto model discovery in `packages/coding-agent`.
 
 ### Fixed
