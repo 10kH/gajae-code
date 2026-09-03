@@ -163,15 +163,17 @@ describe("session-state lock forced-exit recovery", () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-transition-cleanup-refused-"));
 		roots.push(root);
 		const { stateFile, transitionDir } = await seedDeadTransition(root, "cleanup-pending-refused");
+		const detachedPath = `${transitionDir}.removing`;
 		installLocalIdentityBindings();
 		setSessionStateLockNativeBindings(() => ({
 			...exactIdentityNativeBindings,
-			exactRemoveDirectoryTree() {
+			exactRemoveDirectoryTree(target) {
+				fsSync.renameSync(target, detachedPath);
 				return {
 					ok: false,
 					code: "cleanup_pending",
 					payloadDurable: false,
-					detachedPath: `${transitionDir}.removing`,
+					detachedPath,
 				};
 			},
 		}));
@@ -179,7 +181,8 @@ describe("session-state lock forced-exit recovery", () => {
 		await expect(withSessionStateFileLock(stateFile, async () => "not-entered")).rejects.toBeInstanceOf(
 			SessionStateLockUnavailableError,
 		);
-		expect(await fs.exists(transitionDir)).toBe(true);
+		expect(await fs.exists(transitionDir)).toBe(false);
+		expect(await fs.exists(detachedPath)).toBe(true);
 	});
 
 	it("bounds repeated successful dead-claim reclaims without sleeping", async () => {
