@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-09-03
+
 ### Added
 
 - Exported `fetchModelsDevPayload` from `provider-models/openai-compat` and coalesced its downloads. models.dev publishes one catalog document describing every provider, but each models.dev-backed provider downloaded it separately, so a single discovery pass transferred the same payload once per provider (and `packages/coding-agent` kept a second downloader of its own). Downloads are now shared per fetch implementation for a 60s window, failures are not retained, and `coding-agent` model discovery consumes the same fetcher.

@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-09-03
+
 ### Changed
 
 - `Agent.steer()` now performs enqueue-time admission and returns a `SteerAdmission` result. A steer is pushed onto the steering queue only while a run is live and its signal is not aborted; otherwise it returns `{ admitted: false, reason: "idle" | "aborting" }` and queues nothing. A steer submitted after a turn ended, or during an abort, can no longer sit orphaned in the queue and get consumed by whichever unrelated later prompt polls it first. Callers that need delivery when no run is live route the message themselves (the coding-agent session queues it as a sequential follow-up owned by the next turn).

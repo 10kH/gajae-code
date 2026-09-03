@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-09-03
+
 ### Fixed
 
 - Notification server startup now rejects an empty session token before binding or publishing endpoint discovery, while preserving every nonempty opaque token.
