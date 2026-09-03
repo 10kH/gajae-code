@@ -453,13 +453,15 @@ function deliverCronFire(record: CronScheduleRecord): Promise<void> | undefined 
 		cron_expression: record.snapshot.cron_expression,
 		recurring: record.snapshot.recurring,
 	};
-	const sendPromise = record.session.sendCustomMessage?.(
+	if (!record.session.sendCustomMessage) {
+		// The custom-message router is the only delivery path; treating its absence
+		// as a successful fire would silently retire a one-shot schedule.
+		return Promise.reject(new Error("Cron delivery requires a session custom-message router."));
+	}
+	return record.session.sendCustomMessage(
 		{ customType: "cron-fire", content, display: false, attribution: "agent", details },
 		{ triggerTurn: true, deliverAs: "followUp" },
 	);
-	if (sendPromise) return sendPromise;
-	record.session.steer?.({ customType: "cron-fire", content, details });
-	return undefined;
 }
 
 function scheduleRecord(ownerId: string | undefined, state: OwnerScheduleState, record: CronScheduleRecord): void {

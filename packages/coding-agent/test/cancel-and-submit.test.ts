@@ -92,8 +92,10 @@ describe("AgentSession.cancelAndSubmit", () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled test model");
 		let streamCalls = 0;
-		const streamFn: StreamFn = (_requestedModel, _context, options) => {
+		const requests: AgentMessage[][] = [];
+		const streamFn: StreamFn = (_requestedModel, context, options) => {
 			streamCalls++;
+			requests.push([...(context.messages as AgentMessage[])]);
 			const stream = new AssistantMessageEventStream();
 			if (streamCalls > 1) {
 				queueMicrotask(() => {
@@ -130,7 +132,11 @@ describe("AgentSession.cancelAndSubmit", () => {
 			settings,
 			modelRegistry: new ModelRegistry(authStorage),
 		});
-		return { agent, session };
+		return {
+			agent,
+			session,
+			requestUserTexts: () => requests.map(messages => messages.filter(m => m.role === "user").map(messageText)),
+		};
 	}
 
 	async function waitForStreaming(s: AgentSession): Promise<void> {
@@ -221,6 +227,64 @@ describe("AgentSession.cancelAndSubmit", () => {
 		expect(agent.state.messages.map(messageText)).toContain("send now");
 		expect(agent.state.messages.map(messageText)).toContain("sent");
 		expect(s.isStreaming).toBe(false);
+	});
+
+	it("keeps live-run steers as steers of the replacement turn, applied after its response", async () => {
+		// R6: the aborted turn's admitted steers must stay STEERING of the
+		// replacement run (re-admitted after the replacement is answered), not be
+		// re-labelled as follow-ups drained one turn at a time.
+		const { agent, session: s, requestUserTexts } = buildGatedStreamingSession();
+		const activePrompt = s.prompt("active stream");
+		await waitForStreaming(s);
+		let promoted = 0;
+		await s.sendUserMessage("steer-A", {
+			deliverAs: "steer",
+			onQueuedPromoted: () => {
+				promoted += 1;
+			},
+		});
+		await s.steer("steer-B");
+		expect(agent.snapshotQueues().steering.map(messageText)).toEqual(["steer-A", "steer-B"]);
+
+		// The replacement run is seeded with the old steers at acceptance, with the
+		// run's initial steering poll skipped: the opening model call answers the
+		// replacement prompt and the steers are consumed at the first turn boundary.
+		let steeringAtReplacementStart: string[] | undefined;
+		const unsubscribe = s.subscribe(event => {
+			if (event.type === "agent_start" && steeringAtReplacementStart === undefined)
+				steeringAtReplacementStart = agent.snapshotQueues().steering.map(messageText);
+		});
+		expect(await s.cancelAndSubmit("send now")).toEqual({ kind: "submitted" });
+		unsubscribe();
+		await activePrompt;
+		for (let i = 0; i < 20 && agent.hasQueuedMessages(); i++) {
+			await s.waitForIdle();
+			await Bun.sleep(20);
+		}
+		await s.waitForIdle();
+
+		expect(steeringAtReplacementStart).toEqual(["steer-A", "steer-B"]);
+		// The replacement's OPENING request must carry only its own prompt (this is
+		// what skipInitialSteeringPoll buys); the restored steers arrive together in
+		// a later request of the same run.
+		const contexts = requestUserTexts();
+		const opening = contexts.findIndex(texts => texts.includes("send now"));
+		expect(opening).toBeGreaterThanOrEqual(0);
+		expect(contexts[opening]).not.toContain("steer-A");
+		expect(contexts[opening]).not.toContain("steer-B");
+		// Both restored steers are delivered by later requests of the same run, in
+		// submission order (this session runs the default one-at-a-time mode).
+		const firstSteer = contexts.findIndex(texts => texts.includes("steer-A"));
+		const secondSteer = contexts.findIndex(texts => texts.includes("steer-B"));
+		expect(firstSteer).toBeGreaterThan(opening);
+		expect(secondSteer).toBeGreaterThanOrEqual(firstSteer);
+		const texts = agent.state.messages.map(messageText);
+		expect(texts).toContain("send now");
+		expect(texts.indexOf("send now")).toBeLessThan(texts.indexOf("steer-A"));
+		expect(texts).toContain("steer-B");
+		// The external steer's SDK ownership hook settles exactly once.
+		expect(promoted).toBe(1);
+		expect(agent.snapshotQueues()).toEqual({ steering: [], followUp: [] });
 	});
 
 	it("active provider stream × rollback(finalization failure) restores queues without an outcome seam", async () => {
@@ -328,16 +392,26 @@ describe("AgentSession.cancelAndSubmit", () => {
 	});
 
 	it("committed queue-head removes only the selected duplicate-text display", async () => {
-		const { session: s } = buildSession();
+		const { session: s } = buildGatedStreamingSession();
+		void s.prompt("active stream").catch(() => {});
+		await waitForStreaming(s);
 		await s.steer("duplicate queued text");
 		await s.steer("duplicate queued text");
 		const [selected, remaining] = s.getQueuedMessageEntries();
 		if (!selected || !remaining) throw new Error("expected duplicate queued entries");
 
+		// Observe the queue at the moment the new turn starts: the follow-up is
+		// consumed by that turn as soon as its first response completes.
+		let entriesAtNewTurn: ReturnType<AgentSession["getQueuedMessageEntries"]> | undefined;
+		const unsubscribe = s.subscribe(event => {
+			if (event.type === "agent_start" && entriesAtNewTurn === undefined)
+				entriesAtNewTurn = s.getQueuedMessageEntries();
+		});
 		expect(await s.cancelAndSubmit(selected.text, { queuedEntryId: selected.id })).toEqual({ kind: "submitted" });
-		expect(s.getQueuedMessageEntries()).toEqual([
-			expect.objectContaining({ text: remaining.text, mode: "followUp" }),
-		]);
+		unsubscribe();
+		// The unselected steer of the aborted turn is re-queued as a follow-up of
+		// the new turn; exactly one duplicate-text display remains.
+		expect(entriesAtNewTurn).toEqual([expect.objectContaining({ text: remaining.text, mode: "followUp" })]);
 	});
 
 	it("committed queue-head preserves the original image-bearing queued message", async () => {
@@ -500,19 +574,24 @@ describe("AgentSession.cancelAndSubmit", () => {
 		expect(await s.cancelAndSubmit("send now again")).toEqual({ kind: "refused", reason: "duplicate" });
 		deferred.resolve({ kind: "timeout" });
 		await expect(first).resolves.toEqual({ kind: "rolled_back", outcome: { kind: "timeout" } });
+		// No live run: the steer submitted during the atomic window is not
+		// admitted as steering and lands in the follow-up queue instead.
 		expect(stores(s)).toEqual({
 			...before,
-			agent: { ...before.agent, steering: [...before.agent.steering, "queued during atomic window"] },
-			display: { ...before.display, steering: [...before.display.steering, "queued during atomic window"] },
+			agent: { ...before.agent, followUp: [...before.agent.followUp, "queued during atomic window"] },
+			display: { ...before.display, followUp: [...before.display.followUp, "queued during atomic window"] },
 		});
 	});
 
-	it("no live token × steer-on-interrupt remains unchanged", async () => {
+	it("no live token × idle steer is refused at admission, not resumed by interrupt", async () => {
 		const { agent, session: s } = buildSession();
 		await s.prompt("seed");
 		await s.waitForIdle();
-		agent.steer({ role: "user", content: "idle steer", timestamp: 1 });
-		expect(s.hasQueuedSteering).toBe(true);
+		expect(agent.steer({ role: "user", content: "idle steer", timestamp: 1 })).toEqual({
+			admitted: false,
+			reason: "idle",
+		});
+		expect(s.hasQueuedSteering).toBe(false);
 		await s.abort({ cause: "user_interrupt" });
 		await s.waitForIdle();
 		expect(agent.snapshotQueues().steering).toEqual([]);

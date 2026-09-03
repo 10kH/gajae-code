@@ -2775,16 +2775,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				return m ? buildNamedToolChoice(name, m) : undefined;
 			},
 			buildToolChoiceResult: name => buildNamedToolChoiceResult(name, session.model),
-			steer: msg =>
-				session.agent.steer({
-					role: "custom",
-					customType: msg.customType,
-					content: msg.content,
-					display: false,
-					details: msg.details,
-					attribution: "agent",
-					timestamp: Date.now(),
-				}),
 			sendCustomMessage: (msg, opts) => session.sendCustomMessage(msg, opts),
 			purgeQueuedCustomMessages: predicate => session.purgeQueuedCustomMessages(predicate),
 			peekQueueInvoker: () => session.peekQueueInvoker(),
@@ -4284,7 +4274,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			transformContext,
 			steeringMode: settings.get("steeringMode") ?? "one-at-a-time",
 			followUpMode: settings.get("followUpMode") ?? "one-at-a-time",
-			interruptMode: settings.get("interruptMode") ?? "immediate",
+			toolInterruptPolicy: settings.get("toolInterruptPolicy") ?? "abort_tools",
 			thinkingBudgets: settings.getGroup("thinkingBudgets"),
 			temperature: settings.get("temperature") >= 0 ? settings.get("temperature") : undefined,
 			topP: settings.get("topP") >= 0 ? settings.get("topP") : undefined,

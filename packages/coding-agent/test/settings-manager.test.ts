@@ -556,11 +556,79 @@ describe("Settings", () => {
 		});
 	});
 
-	it("migrates ask.timeout milliseconds once and records schema version one", async () => {
+	it("migrates interruptMode to toolInterruptPolicy and records schema version two", async () => {
+		await writeSettings({ interruptMode: "wait" });
+		let settings = await Settings.init({ cwd: projectDir, agentDir });
+		expect(settings.get("toolInterruptPolicy")).toBe("finish_tools");
+		const raw = await readSettings();
+		expect(raw.configSchemaVersion).toBe(2);
+		expect("interruptMode" in raw).toBe(false);
+
+		resetSettingsForTest();
+		settings = await Settings.init({ cwd: projectDir, agentDir });
+		expect(settings.get("toolInterruptPolicy")).toBe("finish_tools");
+	});
+
+	it("migrates a schema-version-one file to version two without re-running v0 steps", async () => {
+		// A valid v1 ask.timeout in SECONDS above the v0 millisecond heuristic must
+		// survive: re-running the v0 conversion would divide 3600 down to 4.
+		await writeSettings({ configSchemaVersion: 1, ask: { timeout: 3600 }, interruptMode: "immediate" });
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+		expect(settings.get("ask.timeout")).toBe(3600);
+		expect(settings.get("toolInterruptPolicy")).toBe("abort_tools");
+		const raw = await readSettings();
+		expect(raw.configSchemaVersion).toBe(2);
+		expect("interruptMode" in raw).toBe(false);
+	});
+
+	it("normalizes an out-of-range schema marker instead of treating it as a future schema", async () => {
+		// A malformed marker must not slip past the future-schema guard unmigrated:
+		// it normalizes to 0 and the ordered registry runs from the start.
+		await writeSettings({ configSchemaVersion: -3, interruptMode: "wait" });
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+		expect(settings.get("toolInterruptPolicy")).toBe("finish_tools");
+		const raw = await readSettings();
+		expect(raw.configSchemaVersion).toBe(2);
+		expect("interruptMode" in raw).toBe(false);
+	});
+
+	it("normalizes a fractional schema marker above current instead of skipping migrations", async () => {
+		// The future-schema guard must see the NORMALIZED version: 2.5 floors to 2
+		// (already current) while 1.5 floors to 1 and still runs the v1 -> v2 step.
+		await writeSettings({ configSchemaVersion: 2.5, interruptMode: "wait" });
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+		expect(settings.get("toolInterruptPolicy")).toBe("abort_tools");
+		expect((await readSettings()).interruptMode).toBe("wait");
+	});
+
+	it("floors a malformed schema marker instead of re-running earlier migrations", async () => {
+		// A fractional marker must not be read as "unmigrated": the v0 ask.timeout
+		// conversion would re-divide an already-migrated value. Flooring 1.5 to 1
+		// runs only the v1 -> v2 step.
+		await writeSettings({ configSchemaVersion: 1.5, ask: { timeout: 3600 }, interruptMode: "wait" });
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+		expect(settings.get("ask.timeout")).toBe(3600);
+		expect(settings.get("toolInterruptPolicy")).toBe("finish_tools");
+		const raw = await readSettings();
+		expect(raw.configSchemaVersion).toBe(2);
+		expect("interruptMode" in raw).toBe(false);
+	});
+
+	it("drops a malformed legacy interruptMode instead of coercing it", async () => {
+		await writeSettings({ interruptMode: "nonsense" });
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+		// Falls back to the schema default rather than silently meaning abort_tools.
+		expect(settings.get("toolInterruptPolicy")).toBe("abort_tools");
+		const raw = await readSettings();
+		expect("interruptMode" in raw).toBe(false);
+		expect("toolInterruptPolicy" in raw).toBe(false);
+	});
+
+	it("migrates ask.timeout milliseconds once and records the current schema version", async () => {
 		await writeSettings({ ask: { timeout: 30_000 } });
 		let settings = await Settings.init({ cwd: projectDir, agentDir });
 		expect(settings.get("ask.timeout")).toBe(30);
-		expect((await readSettings()).configSchemaVersion).toBe(1);
+		expect((await readSettings()).configSchemaVersion).toBe(2);
 
 		resetSettingsForTest();
 		settings = await Settings.init({ cwd: projectDir, agentDir });

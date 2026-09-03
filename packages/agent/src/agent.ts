@@ -267,11 +267,15 @@ export interface AgentOptions {
 	followUpMode?: "all" | "one-at-a-time";
 
 	/**
-	 * When to interrupt tool execution for steering messages.
-	 * - "immediate": check after each tool call (default)
-	 * - "wait": defer steering until the current turn completes
+	 * Whether a steering message aborts the tool calls still running in the
+	 * current batch.
+	 * - "abort_tools": abort the remaining tools and open the steering turn (default)
+	 * - "finish_tools": let the batch finish, then open the steering turn
+	 *
+	 * This never changes WHEN a steer is consumed: the loop picks it up at the
+	 * next tool/turn boundary either way.
 	 */
-	interruptMode?: "immediate" | "wait";
+	toolInterruptPolicy?: "abort_tools" | "finish_tools";
 	/** Cooperative pause checkpoint passed through to AgentLoopConfig.shouldPause. */
 	shouldPause?: AgentLoopConfig["shouldPause"];
 
@@ -433,6 +437,13 @@ export interface AgentPromptOptions {
 	fallbackManaged?: boolean;
 	/** Continue a cooperative maintenance checkpoint under its existing logical run and cancellation domain. */
 	maintenanceContinuation?: boolean;
+	/**
+	 * Skip the loop's INITIAL steering poll for this run. Used when the caller
+	 * seeds the steering queue at run acceptance but the run's first model call
+	 * must answer its own prompt first; the steering is then consumed at the
+	 * first turn boundary instead of being merged into the opening call.
+	 */
+	skipInitialSteeringPoll?: boolean;
 	/** Called synchronously after this invocation claims the agent run, before asynchronous provider work. */
 	onRunAccepted?: (handle: AttemptRunHandle, acceptance: { consumedQueuedMessages: readonly AgentMessage[] }) => void;
 	/** Called once immediately before every managed upstream request. */
@@ -453,6 +464,13 @@ export type AgentQueueSnapshot = {
 	steering: AgentMessage[];
 	followUp: AgentMessage[];
 };
+
+/**
+ * Result of `Agent.steer()`. A steer is admitted only into a live, non-aborted
+ * run; otherwise the message is NOT queued and the caller (the session) owns
+ * routing it — as a fresh prompt when idle, or after the unwind when aborting.
+ */
+export type SteerAdmission = { admitted: true; runId: number } | { admitted: false; reason: "idle" | "aborting" };
 
 export class Agent {
 	#state: AgentState = {
@@ -482,9 +500,11 @@ export class Agent {
 	#steeringWaiters = new Set<() => void>();
 	#followUpQueue: AgentMessage[] = [];
 	#followUpForceOneAtATime = new WeakSet<AgentMessage>();
+	#followUpBatches = new WeakMap<AgentMessage, readonly AgentMessage[]>();
+	#steeringForceOneAtATime = new WeakSet<AgentMessage>();
 	#steeringMode: "all" | "one-at-a-time";
 	#followUpMode: "all" | "one-at-a-time";
-	#interruptMode: "immediate" | "wait";
+	#toolInterruptPolicy: "abort_tools" | "finish_tools";
 	#sessionId?: string;
 	#providerSessionId?: string;
 	#metadata?: Record<string, unknown>;
@@ -527,7 +547,7 @@ export class Agent {
 	#onHarmonyLeak?: (event: HarmonyAuditEvent) => void | Promise<void>;
 	#onBeforeYield?: () => Promise<void> | void;
 	#shouldPause?: AgentLoopConfig["shouldPause"];
-	/** While set and returning true, steering is neither admitted nor dequeued. */
+	/** While set and returning true, the run does not DEQUEUE steering (admission is unaffected). */
 	#steeringAdmissionFence?: () => boolean;
 	#maintainContext?: AgentLoopConfig["maintainContext"];
 	#telemetry?: AgentLoopConfig["telemetry"];
@@ -593,7 +613,7 @@ export class Agent {
 		this.#transformContext = opts.transformContext;
 		this.#steeringMode = opts.steeringMode || "one-at-a-time";
 		this.#followUpMode = opts.followUpMode || "one-at-a-time";
-		this.#interruptMode = opts.interruptMode || "immediate";
+		this.#toolInterruptPolicy = opts.toolInterruptPolicy || "abort_tools";
 		this.streamFn = opts.streamFn || streamSimple;
 		this.#sessionId = opts.sessionId;
 		this.#providerSessionId = opts.providerSessionId;
@@ -933,7 +953,9 @@ export class Agent {
 	 * immediate-interrupt path), so a cooperative stop alone cannot prevent one
 	 * more old-turn model call once a steering message has already been dequeued.
 	 * While the fence returns true the poll yields no messages AND does not
-	 * dequeue, so the queue survives intact for the next turn.
+	 * dequeue, so the winding-down run cannot consume it. The message is not
+	 * retained past the run's terminal either: `agent_end.disownedSteering`
+	 * hands it to the owner, which re-routes it onto the next turn.
 	 */
 	setSteeringAdmissionFence(fn: (() => boolean) | undefined): void {
 		this.#steeringAdmissionFence = fn;
@@ -1130,12 +1152,12 @@ export class Agent {
 		return this.#followUpMode;
 	}
 
-	setInterruptMode(mode: "immediate" | "wait") {
-		this.#interruptMode = mode;
+	setToolInterruptPolicy(policy: "abort_tools" | "finish_tools") {
+		this.#toolInterruptPolicy = policy;
 	}
 
-	getInterruptMode(): "immediate" | "wait" {
-		return this.#interruptMode;
+	getToolInterruptPolicy(): "abort_tools" | "finish_tools" {
+		return this.#toolInterruptPolicy;
 	}
 
 	setTools(t: AgentTool<any>[]) {
@@ -1187,21 +1209,31 @@ export class Agent {
 	/**
 	 * Queue a steering message to interrupt the agent mid-run.
 	 * Delivered after current tool execution, skips remaining tools.
+	 *
+	 * Enqueue-time admission: the message is pushed only when a run is live and
+	 * its signal is not aborted, so a steer can never be orphaned in the queue
+	 * waiting for whichever unrelated run polls next.
 	 */
-	steer(m: AgentMessage) {
+	steer(m: AgentMessage, options?: { forceOneAtATime?: boolean }): SteerAdmission {
 		assertUserImagePlaceholdersHavePayload([m]);
+		const runId = this.#activeRunId;
+		if (runId === undefined || !this.#state.isStreaming) return { admitted: false, reason: "idle" };
+		if (this.#abortController?.signal.aborted) return { admitted: false, reason: "aborting" };
+		if (options?.forceOneAtATime) this.#steeringForceOneAtATime.add(m);
 		this.#steeringQueue.push(m);
 		for (const notify of [...this.#steeringWaiters]) notify();
+		return { admitted: true, runId };
 	}
 
 	/**
-	 * Resolves when a steering message is queued (or is already queued), or when
-	 * `signal` aborts. The queue is not consumed. Long observation tools use this
+	 * Resolves when a steering message is admitted AFTER this wait started, or
+	 * when `signal` aborts. The queue is not consumed and a message already
+	 * queued before the wait does not resolve it. Long observation tools use this
 	 * to end their wait early so a busy user message is handled at the next tool
 	 * boundary instead of after the full wait window.
 	 */
 	waitForSteeringArrival(signal: AbortSignal): Promise<void> {
-		if (this.#steeringQueue.length > 0 || signal.aborted) return Promise.resolve();
+		if (signal.aborted) return Promise.resolve();
 		const { promise, resolve } = Promise.withResolvers<void>();
 		let settled = false;
 		const settle = () => {
@@ -1213,7 +1245,6 @@ export class Agent {
 		};
 		this.#steeringWaiters.add(settle);
 		signal.addEventListener("abort", settle, { once: true });
-		if (this.#steeringQueue.length > 0 || signal.aborted) settle();
 		return promise;
 	}
 
@@ -1231,6 +1262,21 @@ export class Agent {
 			this.#followUpForceOneAtATime.add(m);
 		}
 		this.#followUpQueue.push(m);
+	}
+
+	/**
+	 * Mark a follow-up message for prompt-by-prompt delivery under `all` mode
+	 * without queueing it. Used when a message is restored ahead of the queue
+	 * (e.g. steering disowned by an ended run and re-routed as a follow-up).
+	 */
+	markFollowUpSequential(m: AgentMessage): void {
+		this.#followUpForceOneAtATime.add(m);
+	}
+
+	/** Preserve one atomic delivery cohort when messages are re-routed into the follow-up queue. */
+	markFollowUpBatch(messages: readonly AgentMessage[]): void {
+		const first = messages[0];
+		if (first && messages.length > 1) this.#followUpBatches.set(first, messages.slice());
 	}
 
 	clearSteeringQueue() {
@@ -1305,23 +1351,37 @@ export class Agent {
 			}
 			return [];
 		}
-		const steering = this.#steeringQueue.slice();
-		this.#steeringQueue = [];
+		// "all" batches within ONE poll only; a per-message sequential mark still
+		// delivers that message on its own, mirroring the follow-up override.
+		const first = this.#steeringQueue[0];
+		if (!first) return [];
+		if (this.#steeringForceOneAtATime.has(first)) {
+			this.#steeringQueue = this.#steeringQueue.slice(1);
+			return [first];
+		}
+		const forcedIndex = this.#steeringQueue.findIndex(message => this.#steeringForceOneAtATime.has(message));
+		const takeCount = forcedIndex === -1 ? this.#steeringQueue.length : forcedIndex;
+		const steering = this.#steeringQueue.slice(0, takeCount);
+		this.#steeringQueue = this.#steeringQueue.slice(takeCount);
 		return steering;
 	}
 
 	#dequeueFollowUpMessages(): AgentMessage[] {
-		if (this.#followUpMode === "one-at-a-time") {
-			if (this.#followUpQueue.length > 0) {
-				const first = this.#followUpQueue[0];
-				this.#followUpQueue = this.#followUpQueue.slice(1);
-				return [first];
-			}
-			return [];
-		}
-
 		const first = this.#followUpQueue[0];
 		if (!first) return [];
+		const batch = this.#followUpBatches.get(first);
+		if (batch) {
+			this.#followUpBatches.delete(first);
+			if (batch.every((message, index) => this.#followUpQueue[index] === message)) {
+				this.#followUpQueue = this.#followUpQueue.slice(batch.length);
+				return [...batch];
+			}
+		}
+		if (this.#followUpMode === "one-at-a-time") {
+			this.#followUpQueue = this.#followUpQueue.slice(1);
+			return [first];
+		}
+
 		if (this.#followUpForceOneAtATime.has(first)) {
 			this.#followUpQueue = this.#followUpQueue.slice(1);
 			return [first];
@@ -1379,21 +1439,8 @@ export class Agent {
 	}
 
 	/**
-	 * Remove ALL queued STEERING messages without touching the follow-up queue.
-	 * Used by the terminal-abort path to purge steering queued for the aborted
-	 * turn (the loop may exit on the abort signal without polling it); the
-	 * follow-up queue is preserved because it may carry owned-completion
-	 * resumes that must still deliver.
-	 */
-	clearSteeringMessages(): void {
-		this.#steeringQueue = [];
-	}
-
-	/**
 	 * Remove queued steering/follow-up messages matching `predicate`, preserving
-	 * order of the rest. `scope` restricts the removal to one queue — the
-	 * terminal-abort steering purge must not wipe the follow-up queue, which
-	 * the owned-completion resume policy preserves.
+	 * order of the rest. `scope` restricts the removal to one queue.
 	 */
 	removeQueuedMessages(
 		predicate: (message: AgentMessage) => boolean,
@@ -1855,7 +1902,7 @@ export class Agent {
 			repetitionPenalty: this.#repetitionPenalty,
 			serviceTier: this.#serviceTier,
 			hideThinkingSummary: this.#hideThinkingSummary,
-			interruptMode: this.#interruptMode,
+			toolInterruptPolicy: this.#toolInterruptPolicy,
 			sessionId: this.#sessionId,
 			providerSessionId: this.#providerSessionId,
 			metadata: this.#metadataResolver ? undefined : this.#metadata,
@@ -1960,9 +2007,16 @@ export class Agent {
 					return [];
 				}
 				// Fenced: yield nothing and dequeue nothing, so a steer submitted while a
-				// fold is being claimed is neither consumed by the run being wound down
-				// nor lost.
+				// fold is being claimed is not consumed by the run being wound down. It
+				// is not lost either: the terminal disowns it to the owner.
 				if (this.#steeringAdmissionFence?.() === true) {
+					return [];
+				}
+				// An aborted run cannot deliver steering: the loop hands drained
+				// messages back and ends. Dequeuing here would fire the in-run
+				// consumption hook for a message the run never delivers, so its SDK
+				// submission would settle as consumed instead of removed at disown.
+				if (abortController.signal.aborted) {
 					return [];
 				}
 				const queued = this.#dequeueSteeringMessages();
@@ -2327,6 +2381,15 @@ export class Agent {
 			scope: handle?.scope,
 		};
 		if (handle) terminalEvent.scope = handle.scope;
+		// The run is over: nothing will poll the steering queue again. Disown
+		// whatever it still holds — unconditionally, so no ownership exception can
+		// leave an ended run's steering behind for an unrelated run to consume —
+		// and hand it to the owner on the terminal event to re-route, hold, or
+		// drop exactly once.
+		if (this.#steeringQueue.length > 0) {
+			terminalEvent.disownedSteering = this.#steeringQueue;
+			this.#steeringQueue = [];
+		}
 		if (domain) {
 			setAgentTerminalOwnerContext(terminalEvent, {
 				resourceRunId,

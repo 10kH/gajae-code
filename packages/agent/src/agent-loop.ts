@@ -4316,6 +4316,11 @@ async function runLoopBody(
 				config.requeueSteeringMessages?.(pendingMessages);
 				break;
 			}
+			// An aborted run must not open another turn: the provider rejects it before
+			// the first token and the attempt only appends an aborted assistant message.
+			// The run's steering (which the poll above deliberately leaves queued once
+			// the signal is aborted) is disowned by the terminal instead.
+			if (loopSignal.aborted) break;
 			if (config.shouldPause?.()) {
 				publishAgentEnd(
 					stream,
@@ -5006,7 +5011,7 @@ async function executeToolCalls(
 	const tools = currentContext.tools;
 	const {
 		getSteeringMessages,
-		interruptMode = "immediate",
+		toolInterruptPolicy = "abort_tools",
 		getToolContext,
 		transformToolCallArguments,
 		intentTracing,
@@ -5020,7 +5025,7 @@ async function executeToolCalls(
 	const emittedToolResults: ToolResultMessage[] = [];
 	const toolCallInfos = toolCalls.map(call => ({ id: call.id, name: call.name }));
 	const batchId = `${assistantMessage.timestamp ?? Date.now()}_${toolCalls[0]?.id ?? "batch"}`;
-	const shouldInterruptImmediately = interruptMode !== "wait";
+	const shouldInterruptImmediately = toolInterruptPolicy !== "finish_tools";
 	const steeringAbortController = new AbortController();
 	const toolSignals = [
 		...(signal ? [signal] : []),

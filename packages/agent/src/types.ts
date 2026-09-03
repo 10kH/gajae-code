@@ -246,11 +246,15 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	initialScope?: AttemptScope;
 
 	/**
-	 * When to interrupt tool execution for steering messages.
-	 * - "immediate" = check after each tool call (default)
-	 * - "wait" = defer steering until the current turn completes
+	 * Whether a steering message aborts the tool calls still running in the
+	 * current batch.
+	 * - "abort_tools": abort the remaining tools and open the steering turn (default)
+	 * - "finish_tools": let the batch finish, then open the steering turn
+	 *
+	 * This never changes WHEN a steer is consumed: the loop picks it up at the
+	 * next tool/turn boundary either way.
 	 */
-	interruptMode?: "immediate" | "wait";
+	toolInterruptPolicy?: "abort_tools" | "finish_tools";
 
 	/**
 	 * Optional session identifier forwarded to LLM providers.
@@ -332,7 +336,7 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	/**
 	 * Returns steering messages to inject into the conversation mid-run.
 	 *
-	 * Called after each tool execution to check for user interruptions unless interruptMode is "wait".
+	 * Called after each tool execution to check for user interruptions unless toolInterruptPolicy is "finish_tools".
 	 * If messages are returned, remaining tool calls are skipped and
 	 * these messages are added to the context before the next LLM call.
 	 */
@@ -803,6 +807,13 @@ export type AgentEvent =
 			stopReason?: "completed" | "paused" | "cancelled" | "maintenance";
 			/** Present iff `stopReason === "maintenance"`; the maintenance outcome. */
 			maintenanceOutcome?: MidRunMaintenanceOutcome;
+			/**
+			 * Steering that was admitted into this run but never consumed before it
+			 * ended (the loop exited on abort, error, pause, or completion without a
+			 * further poll). The Agent clears its queue on every run exit; the owner
+			 * decides once here whether to re-route or drop these messages.
+			 */
+			disownedSteering?: AgentMessage[];
 			/** Present iff `AgentTelemetryConfig` was supplied on this run. */
 			telemetry?: AgentRunSummary;
 			coverage?: AgentRunCoverage;

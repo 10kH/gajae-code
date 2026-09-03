@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Agent, type AgentTool } from "@gajae-code/agent-core";
 import { getBundledModel } from "@gajae-code/ai";
-import { createMockModel, type MockResponse } from "@gajae-code/ai/providers/mock";
+import { createMockModel, type MockModel, type MockResponse } from "@gajae-code/ai/providers/mock";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
@@ -70,6 +70,10 @@ describe("terminal abort registers a turn scope so left-running owned work class
 	let tempDir: string;
 	let authStorage: AuthStorage | undefined;
 	let scriptedResponses: MockResponse[];
+	let mockModelRef: MockModel | undefined;
+	/** Every provider request's serialized context, for negative delivery proofs. */
+	const recordedProviderContexts = (): string[] =>
+		(mockModelRef?.calls ?? []).map(call => JSON.stringify(call.context.messages));
 	let manager: AsyncJobManager;
 	let bashToolRef: BashTool;
 	let toolSession: ToolSession;
@@ -123,6 +127,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		const mock = createMockModel({
 			handler: () => scriptedResponses.shift() ?? stopReply("done"),
 		});
+		mockModelRef = mock;
 
 		const agent = new Agent({
 			getApiKey: () => "test-key",
@@ -511,11 +516,16 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		expect(session.getPendingNextTurnMessagesForTests()).toHaveLength(0);
 	}, 20_000);
 
-	it("terminal abort purges steering queued for the aborted turn but keeps owned-completion follow-ups", async () => {
-		scriptedResponses = [stopReply("ok")];
-		await session.prompt("first turn");
-		// A steer is queued just before the terminal abort wins.
-		session.agent.steer({
+	it("terminal abort disowns steering admitted into the aborted turn but keeps owned-completion follow-ups", async () => {
+		// The steer must be ADMITTED into a live run for the purge/disown decision
+		// to mean anything: steering a finished turn is refused at admission (R1),
+		// which would make the empty-queue assertion below pass for the wrong
+		// reason. Park a tool so the turn is live, admit, then abort terminally.
+		scriptedResponses = [bashCall("sleep 2", "call_hold_turn"), stopReply("must not run")];
+		const promptPromise = session.prompt("hold the turn").catch(() => {});
+		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
+		const callsBeforeAbort = recordedProviderContexts().length;
+		const admission = session.agent.steer({
 			role: "custom",
 			customType: "steer-test",
 			content: [{ type: "text", text: "stale steer" }],
@@ -523,15 +533,26 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			details: {},
 			timestamp: Date.now(),
 		});
+		expect(admission.admitted).toBe(true);
+		expect(session.agent.hasQueuedSteering()).toBe(true);
 		await session.abortPromptAndWait(session.agent.activeResourceRunId ?? "run", {
 			graceMs: TEST_ABORT_GRACE_MS,
 			terminal: { scope: "turn" },
 		});
-		// The queued steering is purged so it cannot alter the next user turn;
-		// the follow-up queue is untouched (owned-completion resumes still deliver).
+		await promptPromise;
+		// Disowned and dropped: it cannot alter a later turn, and no provider
+		// request ever carried it. The follow-up queue is untouched
+		// (owned-completion resumes still deliver).
 		expect(session.agent.hasQueuedSteering()).toBe(false);
 		expect(session.agent.snapshotQueues().followUp).toHaveLength(0);
-	}, 20_000);
+		await session.waitForIdle();
+		expect(
+			recordedProviderContexts()
+				.slice(callsBeforeAbort)
+				.some(text => text.includes("stale steer")),
+		).toBe(false);
+		expect(session.agent.state.messages.some(message => JSON.stringify(message).includes("stale steer"))).toBe(false);
+	}, 30_000);
 	it("terminal abort preserves client steering admitted after the abort snapshot", async () => {
 		// Review thread P1: a client turn.prompt/steer accepted while the abort
 		// is in flight (past its snapshot) is an independent root-turn request
@@ -578,13 +599,14 @@ describe("terminal abort registers a turn scope so left-running owned work class
 	}, 30_000);
 
 	it("terminal abort blocks client steering admitted before the abort snapshot", async () => {
-		// Review thread P1: an SDK steer queued BEFORE the terminal abort begins
-		// is an accepted-pre-close continuation of the aborted attempt, which
-		// the terminal-abort contract requires to be blocked — the abort exits
-		// the loop and only rearms follow-ups, so a stale steer would otherwise
-		// remain queued and alter the next prompt.
-		scriptedResponses = [stopReply("ok")];
-		await session.prompt("first turn");
+		// Review thread P1: an SDK steer admitted into the live turn BEFORE the
+		// terminal abort begins is an accepted-pre-close continuation of the
+		// aborted attempt, which the terminal-abort contract requires to be
+		// blocked — the abort exits the loop and only rearms post-snapshot
+		// steers, so a stale steer would otherwise alter the next prompt.
+		scriptedResponses = [bashCall("sleep 2", "call_hold_turn"), stopReply("unused")];
+		const promptPromise = session.prompt("hold the turn").catch(() => {});
+		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
 		await session.sendUserMessage("pre-abort steer", { deliverAs: "steer" });
 		expect(session.agent.hasQueuedSteering()).toBe(true);
 		await session.abortPromptAndWait(session.agent.activeResourceRunId ?? "run", {
@@ -592,6 +614,22 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			terminal: { scope: "turn" },
 		});
 		expect(session.agent.hasQueuedSteering()).toBe(false);
+		expect(session.getQueuedMessages().steering).toEqual([]);
+		await promptPromise;
+	}, 20_000);
+
+	it("refuses a steer at admission when no turn is live instead of parking it for the next abort", async () => {
+		// Enqueue-time admission: with the turn already finished there is no run
+		// to steer, so the session routes the request as a follow-up owned by
+		// the next turn — never as steering the terminal-abort purge has to
+		// reason about.
+		scriptedResponses = [stopReply("ok"), stopReply("delivered")];
+		await session.prompt("first turn");
+		await session.sendUserMessage("post-turn steer", { deliverAs: "steer" });
+		expect(session.agent.hasQueuedSteering()).toBe(false);
+		await waitFor(() => !session.agent.hasQueuedMessages(), "post-turn steer delivered as its own turn");
+		await session.waitForIdle();
+		expect(session.agent.state.messages.filter(m => m.role === "assistant")).toHaveLength(2);
 	}, 20_000);
 
 	it("terminal abort keeps each abort's steering snapshot scoped to its own admission", async () => {
@@ -632,37 +670,199 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		expect(session.agent.hasQueuedSteering()).toBe(false);
 		await promptPromise;
 	}, 30_000);
-	it("terminal abort keeps the steering display aligned with the purge decisions", async () => {
-		// Review thread P2: the display list must mirror which executable
-		// messages were actually purged — preserved post-snapshot external
-		// steers stay visible and purged internal steers disappear, so the
-		// positional editing APIs never remove a different preserved steer.
+	it("narrows overlapping terminal dispositions monotonically at the run's single terminal", async () => {
+		// The two abort admissions of ONE live run compose into a single disposition
+		// consumed at that run's terminal. Settling the OLDER (looser) admission
+		// last must not widen the newer one: only steering admitted after the
+		// highest snapshot survives.
+		scriptedResponses = [bashCall("sleep 2", "call_hold_turn"), stopReply("late steer answered")];
+		const promptPromise = session.prompt("hold the turn").catch(() => {});
+		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
+		const handle = session.agent.activeResourceRunId ?? "run";
+		// Abort A admitted first (looser: everything after its snapshot survives).
+		const tokenA = session.captureTerminalAbortSteeringSnapshot();
+		expect(tokenA).toBeDefined();
+		await session.sendUserMessage("between-A-and-B", { deliverAs: "steer" });
+		// Abort B admitted second (stricter: only steering after B survives).
+		const tokenB = session.captureTerminalAbortSteeringSnapshot();
+		expect(tokenB).toBeDefined();
+		await session.sendUserMessage("after-B", { deliverAs: "steer" });
+		expect(session.getQueuedMessages().steering).toEqual(["between-A-and-B", "after-B"]);
+
+		let followUpAtTerminal: readonly string[] | undefined;
+		const unsubscribe = session.subscribe(event => {
+			if (event.type === "agent_end" && followUpAtTerminal === undefined)
+				followUpAtTerminal = session.getQueuedMessages().followUp;
+		});
+		// B registers its (stricter) disposition, then A registers its looser one;
+		// the run is still live, so both compose before the terminal settles it.
+		await Promise.all([
+			session.abortPromptAndWait(handle, {
+				graceMs: TEST_ABORT_GRACE_MS,
+				terminal: { scope: "turn", steeringSnapshotToken: tokenB },
+			}),
+			session.abortPromptAndWait(handle, {
+				graceMs: TEST_ABORT_GRACE_MS,
+				terminal: { scope: "turn", steeringSnapshotToken: tokenA },
+			}),
+		]);
+		unsubscribe();
+		// Only the post-B steer survived: A's looser predicate could not widen B's.
+		expect(followUpAtTerminal).toEqual(["after-B"]);
+		expect(session.agent.snapshotSteering()).toEqual([]);
+		await promptPromise;
+	}, 30_000);
+
+	it("classifies a post-terminal custom steer by provenance, not by its triggerTurn flag", async () => {
+		// A terminally aborted turn keeps its continuation fence. A custom steer
+		// arriving afterwards must be classified by WHERE IT CAME FROM: genuine
+		// user input survives as its own root request, while a continuation the
+		// aborted turn's own machinery produced is dropped with its display chip.
+		scriptedResponses = [bashCall("sleep 2", "call_hold_turn"), stopReply("user steer answered")];
+		const promptPromise = session.prompt("hold the turn").catch(() => {});
+		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
+		const handle = session.agent.activeResourceRunId ?? "run";
+		await session.abortPromptAndWait(handle, { graceMs: TEST_ABORT_GRACE_MS, terminal: { scope: "turn" } });
+		await promptPromise;
+
+		// Turn-owned reminder: agent-attributed, no external origin, carries a
+		// display chip. Dropped, and its chip must not linger in the queue pane.
+		const tag = session.enqueueCustomMessageDisplay("stale preview reminder", "steer");
+		await session.sendCustomMessage(
+			{
+				customType: "resolve-reminder",
+				content: "stale preview reminder",
+				display: false,
+				attribution: "agent",
+				details: { __pendingDisplayTag: tag },
+			},
+			{ deliverAs: "steer" },
+		);
+		expect(session.agent.hasQueuedMessages()).toBe(false);
+		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+
+		// A `triggerTurn: true` flag on the SAME turn-owned message must not buy
+		// it a fresh root turn: not queued, never persisted, never sent.
+		await session.sendCustomMessage(
+			{ customType: "resolve-reminder", content: "stale but eager", display: false, attribution: "agent" },
+			{ deliverAs: "steer", triggerTurn: true },
+		);
+		expect(session.agent.hasQueuedMessages()).toBe(false);
+		const eagerInHistory = () =>
+			session.agent.state.messages.some(message => JSON.stringify(message).includes("stale but eager"));
+		expect(eagerInHistory()).toBe(false);
+
+		// An agent-attributed message from an INDEPENDENT external producer (the
+		// trusted-adapter origin bit) is also a root request of its own.
+		await session.sendCustomMessage(
+			{ customType: "ext-notice", content: "external producer notice", display: false, attribution: "agent" },
+			{ deliverAs: "steer", origin: "external" },
+		);
+		await waitFor(() => !session.agent.hasQueuedMessages(), "external-origin custom steer delivered");
+		await session.waitForIdle();
+		expect(
+			session.agent.state.messages.some(
+				message => message.role === "custom" && String(message.content).includes("external producer notice"),
+			),
+		).toBe(true);
+
+		// Genuine user input survives the fence and is delivered as a fresh root.
+		await session.sendCustomMessage(
+			{ customType: "user-skill", content: "user says do this instead", display: false, attribution: "user" },
+			{ deliverAs: "steer" },
+		);
+		await waitFor(() => !session.agent.hasQueuedMessages(), "user custom steer delivered");
+		await session.waitForIdle();
+		expect(
+			session.agent.state.messages.some(
+				message => message.role === "custom" && String(message.content).includes("user says do this instead"),
+			),
+		).toBe(true);
+		expect(
+			session.agent.state.messages.some(
+				message => message.role === "custom" && String(message.content).includes("stale preview reminder"),
+			),
+		).toBe(false);
+		// Neither dropped message survived into history or a provider request.
+		expect(eagerInHistory()).toBe(false);
+		expect(recordedProviderContexts().some(text => text.includes("stale but eager"))).toBe(false);
+		expect(recordedProviderContexts().some(text => text.includes("stale preview reminder"))).toBe(false);
+	}, 30_000);
+
+	it("scopes the fresh-root requirement to its own queued message", async () => {
+		// The requirement to run under a NEW lineage belongs to the specific queued
+		// root request. Removing that request must remove its requirement too: a
+		// later turn-owned continuation must not inherit a fresh identity and
+		// escape the terminal fence.
+		scriptedResponses = [bashCall("sleep 2", "call_hold_turn"), stopReply("should not run")];
+		const promptPromise = session.prompt("hold the turn").catch(() => {});
+		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
+		const handle = session.agent.activeResourceRunId ?? "run";
+		await session.abortPromptAndWait(handle, { graceMs: TEST_ABORT_GRACE_MS, terminal: { scope: "turn" } });
+		await promptPromise;
+		const callsAfterAbort = recordedProviderContexts().length;
+
+		// An independent root request past the fence — the external-custom route
+		// that actually carries the fresh-root marking — queued and then withdrawn
+		// through the production producer-purge path before it could be delivered.
+		await session.sendCustomMessage(
+			{ customType: "ext-notice", content: "withdrawn root request", display: false, attribution: "agent" },
+			{ deliverAs: "steer", origin: "external" },
+		);
+		expect(session.agent.snapshotQueues().followUp).toHaveLength(1);
+		const purged = session.purgeQueuedCustomMessages(message => message.customType === "ext-notice");
+		expect(purged.totalExecutable).toBe(1);
+		expect(session.agent.hasQueuedMessages()).toBe(false);
+
+		// A turn-owned reminder now arrives. It must still be dropped by the fence:
+		// the withdrawn request's requirement left with it.
+		await session.sendCustomMessage(
+			{
+				customType: "resolve-reminder",
+				content: "turn-owned after withdrawal",
+				display: false,
+				attribution: "agent",
+			},
+			{ deliverAs: "steer" },
+		);
+		await session.waitForIdle();
+		expect(session.agent.hasQueuedMessages()).toBe(false);
+		expect(recordedProviderContexts().length).toBe(callsAfterAbort);
+		expect(
+			session.agent.state.messages.some(message => JSON.stringify(message).includes("turn-owned after withdrawal")),
+		).toBe(false);
+	}, 30_000);
+
+	it("terminal abort keeps the queue display aligned with the disown decisions", async () => {
+		// Review thread P2: the display list must mirror what the run's disowned
+		// steering became — a purged internal steer disappears everywhere, and a
+		// preserved post-snapshot external steer is re-routed (queue AND display)
+		// as a follow-up of the fresh turn, so the positional editing APIs never
+		// address a stale entry.
 		scriptedResponses = [bashCall("sleep 2", "call_hold_turn"), stopReply("steer answered")];
 		const promptPromise = session.prompt("hold the turn").catch(() => {});
 		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
 		const handle = session.agent.activeResourceRunId;
-		// Settle the hold turn's abort first so the queue state is stable (no
-		// live loop to poll, and the terminal fence blocks idle auto-continues).
-		await session.abortPromptAndWait(handle ?? "run", { graceMs: TEST_ABORT_GRACE_MS, terminal: { scope: "turn" } });
-		// An internal steer queued just before the abort wins: purged with the
-		// aborted turn's other continuations.
+		// An internal steer admitted into the live turn before the abort wins:
+		// dropped with the aborted turn's other continuations.
 		await session.steer("stale internal steer");
 		// A client steer admitted after the abort admission snapshot: preserved.
 		session.captureTerminalAbortSteeringSnapshot();
 		await session.sendUserMessage("client steer", { deliverAs: "steer" });
+		expect(session.getQueuedMessages().steering).toEqual(["stale internal steer", "client steer"]);
+		let observed: { steering: readonly string[]; followUp: readonly string[] } | undefined;
+		const unsubscribe = session.subscribe(event => {
+			if (event.type === "agent_end" && observed === undefined) observed = session.getQueuedMessages();
+		});
 		await session.abortPromptAndWait(handle ?? "run", { graceMs: TEST_ABORT_GRACE_MS, terminal: { scope: "turn" } });
-		const queued = session.getQueuedMessages();
-		expect(queued.steering).toEqual(["client steer"]);
-		expect(session.agent.snapshotSteering()).toHaveLength(1);
-		// Positional editing stays aligned with the executable queue: removing
-		// the displayed entry removes the preserved steer (not a stale internal
-		// entry at the same index).
-		const [entry] = session.getQueuedMessageEntries();
-		expect(entry?.mode).toBe("steer");
-		const removed = session.removeQueuedMessageForEditing(entry?.id ?? "");
-		expect(removed).toBe("client steer");
-		expect(session.agent.hasQueuedSteering()).toBe(false);
-		expect(session.getQueuedMessages().steering).toHaveLength(0);
+		unsubscribe();
+		// At the aborted run's terminal: internal steer gone, client steer
+		// re-routed as the next turn's follow-up in both queue and display.
+		expect(observed).toEqual({ steering: [], followUp: ["client steer"] });
+		expect(session.agent.snapshotSteering()).toHaveLength(0);
+		// The rearm then consumes it as a fresh turn.
+		await waitFor(() => !session.agent.hasQueuedMessages(), "client steer consumed");
+		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
 		await promptPromise;
 	}, 30_000);
 
@@ -1001,14 +1201,20 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			terminal: { scope: "turn" },
 		});
 		expect(proof).toBeDefined();
-		// The follow-up must SURVIVE the abort purge: the pre-fix steering
-		// purge removed every non-steer message from BOTH queues.
-		expect(session.agent.snapshotQueues().followUp.length).toBe(1);
-		// And it must be rearmed and consumed under a fresh lineage (the mock
-		// model answers it).
+		// The follow-up must SURVIVE the abort purge (the pre-fix steering purge
+		// removed every non-steer message from BOTH queues) and be DELIVERED under
+		// a fresh lineage. Delivery is the strong proof: a purge would also drain
+		// the queue, but only a surviving message reaches the model.
 		await waitFor(
 			() => session.agent.snapshotQueues().followUp.length === 0,
 			"external follow-up rearmed and consumed",
+		);
+		await waitFor(
+			() =>
+				session.agent.state.messages.some(
+					message => message.role === "user" && JSON.stringify(message.content).includes("external follow-up"),
+				),
+			"external follow-up delivered to the model",
 		);
 		await promptPromise;
 	}, 30_000);

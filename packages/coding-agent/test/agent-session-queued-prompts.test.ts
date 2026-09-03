@@ -109,7 +109,7 @@ describe("AgentSession queued prompts (issue #434)", () => {
 			"compaction.enabled": false,
 			steeringMode: "one-at-a-time",
 			followUpMode: "one-at-a-time",
-			interruptMode: "immediate",
+			toolInterruptPolicy: "abort_tools",
 		});
 		session = buildSession([], settings);
 		const canWrite = spyOn(settings, "canWriteDurableConfig").mockReturnValue(false);
@@ -118,14 +118,14 @@ describe("AgentSession queued prompts (issue #434)", () => {
 		try {
 			expect(() => session!.setSteeringMode("all")).toThrow("Repair config.yml");
 			expect(() => session!.setFollowUpMode("all")).toThrow("Repair config.yml");
-			expect(() => session!.setInterruptMode("wait")).toThrow("Repair config.yml");
+			expect(() => session!.setToolInterruptPolicy("finish_tools")).toThrow("Repair config.yml");
 
 			expect(session.agent.getSteeringMode()).toBe("one-at-a-time");
 			expect(session.agent.getFollowUpMode()).toBe("one-at-a-time");
-			expect(session.agent.getInterruptMode()).toBe("immediate");
+			expect(session.agent.getToolInterruptPolicy()).toBe("abort_tools");
 			expect(settings.getGlobal("steeringMode")).toBe("one-at-a-time");
 			expect(settings.getGlobal("followUpMode")).toBe("one-at-a-time");
-			expect(settings.getGlobal("interruptMode")).toBe("immediate");
+			expect(settings.getGlobal("toolInterruptPolicy")).toBe("abort_tools");
 			expect(set).not.toHaveBeenCalled();
 		} finally {
 			canWrite.mockRestore();
@@ -146,7 +146,7 @@ describe("AgentSession queued prompts (issue #434)", () => {
 		// Start the first turn but do not await — it blocks on the gate so the
 		// session stays busy while we queue.
 		const first = session.prompt("p1");
-		await waitUntil(() => session!.isStreaming);
+		await waitUntil(() => session!.agent.state.isStreaming);
 
 		// Queue two prompts as next-turn work (the "queue" busy behavior).
 		await session.prompt("p2", { streamingBehavior: "followUp" });
@@ -211,7 +211,7 @@ describe("AgentSession queued prompts (issue #434)", () => {
 		session.setFollowUpMode("all");
 
 		const first = session.prompt("p1");
-		await waitUntil(() => session!.isStreaming);
+		await waitUntil(() => session!.agent.state.isStreaming);
 
 		await session.prompt("p2", { streamingBehavior: "followUp", followUpQueuePolicy: "sequential" });
 		await session.prompt("p3", { streamingBehavior: "followUp", followUpQueuePolicy: "sequential" });
@@ -239,7 +239,7 @@ describe("AgentSession queued prompts (issue #434)", () => {
 		]);
 
 		const first = session.prompt("p1");
-		await waitUntil(() => session!.isStreaming);
+		await waitUntil(() => session!.agent.state.isStreaming);
 
 		await session.prompt("steer me", { streamingBehavior: "steer" });
 		await session.prompt("queue me", { streamingBehavior: "followUp" });
@@ -271,7 +271,7 @@ describe("AgentSession queued prompts (issue #434)", () => {
 		]);
 
 		const first = session.prompt("p1");
-		await waitUntil(() => session!.isStreaming);
+		await waitUntil(() => session!.agent.state.isStreaming);
 
 		await session.prompt("steer me", { streamingBehavior: "steer" });
 		await session.prompt("queue older", { streamingBehavior: "followUp" });
@@ -304,7 +304,7 @@ describe("AgentSession queued prompts (issue #434)", () => {
 		]);
 
 		const first = session.prompt("p1");
-		await waitUntil(() => session!.isStreaming);
+		await waitUntil(() => session!.agent.state.isStreaming);
 
 		await session.prompt("queue older", { streamingBehavior: "followUp" });
 		await session.prompt("queue newest", { streamingBehavior: "followUp" });

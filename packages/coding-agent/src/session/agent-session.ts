@@ -1063,6 +1063,8 @@ export interface PromptOptions {
 	streamingBehavior?: "steer" | "followUp";
 	/** When set to "sequential", this follow-up is delivered one prompt at a time even if followUpMode is "all". */
 	followUpQueuePolicy?: "respect-mode" | "sequential";
+	/** When set to "sequential", this steer is delivered on its own even if steeringMode is "all". */
+	steerQueuePolicy?: "respect-mode" | "sequential";
 	/** Optional tool choice override for the next LLM call. */
 	toolChoice?: ToolChoice;
 	/** Send as developer/system message instead of user. Providers that support it use the developer role; others fall back to user. */
@@ -1096,6 +1098,7 @@ type InternalCustomMessageOptions = Pick<
 	| "streamingBehavior"
 	| "toolChoice"
 	| "followUpQueuePolicy"
+	| "steerQueuePolicy"
 	| "onPreflightAccepted"
 	| "onPreflightAcceptCommit"
 	| "preflightSignal"
@@ -2499,6 +2502,10 @@ export class AgentSession {
 	// continuation of the aborted attempt that the contract requires to be
 	// blocked (review thread P1).
 	readonly #externalSteerMessages = new WeakSet<AgentMessage>();
+	/** Steers explicitly requested as one-per-poll; preserve this policy if a run disowns them into follow-ups. */
+	readonly #sequentialSteerMessages = new WeakSet<AgentMessage>();
+	/** Non-admitted steers collected while one abort unwind owns delivery. */
+	#abortUnwindSteerFallbacks: AgentMessage[] = [];
 	/** Per-message SDK requester-ownership correlation for queued client steers:
 	 *  fired exactly once when the steer's run accepts it — via the idle
 	 *  auto-continue or the terminal-abort rearm (review thread P1). */
@@ -2543,6 +2550,157 @@ export class AgentSession {
 			this.#sdkRunTokensByQueuedMessage.delete(message);
 			this.#deepInterviewGenuineUserMessageEpochs.delete(message);
 		}
+	}
+
+	/**
+	 * Queued messages that are independent ROOT requests: they must not run under
+	 * a terminally fenced lineage, so a fresh identity is minted when one of them
+	 * is actually delivered. Tracked per message rather than as a session latch,
+	 * so removing the message (queue edit, producer purge, queue clear) removes
+	 * its requirement too and no unrelated continuation inherits it. The mint
+	 * happens at the last synchronous point before `agent.continue*` entry —
+	 * never at enqueue, which would race the ending run's event settlement, and
+	 * never lost when a busy owner defers delivery.
+	 */
+	#freshRootLineageRequests = new WeakSet<AgentMessage>();
+
+	/**
+	 * Bind a tag-only display chip (registered by `enqueueCustomMessageDisplay`
+	 * before dispatch) to the executable message that was actually queued, and
+	 * move it to the list matching how the message was queued.
+	 *
+	 * Without the binding the chip keeps no identity link, so edit/remove/pop fall
+	 * back to POSITIONAL addressing against the Agent queue — and a hidden
+	 * `display:false` custom message occupying an earlier queue slot makes that
+	 * index point at the wrong message. Migrating the entry also keeps the chip's
+	 * mode honest when a requested steer is rerouted to a follow-up.
+	 */
+	#bindCustomDisplayEntry(message: AgentMessage, mode: "steer" | "followUp"): void {
+		const tag = message.role === "custom" ? readPendingDisplayTag(message.details) : undefined;
+		if (tag === undefined) return;
+		const from = mode === "steer" ? this.#followUpMessages : this.#steeringMessages;
+		const to = mode === "steer" ? this.#steeringMessages : this.#followUpMessages;
+		const already = to.find(entry => entry.tag === tag);
+		if (already) {
+			already.message = message;
+			return;
+		}
+		const index = from.findIndex(entry => entry.tag === tag);
+		if (index === -1) return;
+		const [entry] = from.splice(index, 1);
+		if (!entry) return;
+		entry.message = message;
+		to.push(entry);
+	}
+
+	/** True when a queued message still carries an unfulfilled fresh-root requirement. */
+	#hasQueuedFreshRootRequest(): boolean {
+		const { steering, followUp } = this.agent.snapshotQueues();
+		return [...steering, ...followUp].some(message => this.#freshRootLineageRequests.has(message));
+	}
+
+	/**
+	 * Disposition of steering the current run leaves unconsumed when it exits.
+	 * Set by the abort paths before the run ends and consumed exactly once by
+	 * `#settleDisownedSteering` on the run's `agent_end`. Absent means the run
+	 * ended on its own (completed/error/pause): steering it never polled is
+	 * re-routed as sequential follow-ups owned by the next turn.
+	 */
+	#disownedSteeringDisposition:
+		| { kind: "rearm" }
+		| { kind: "terminal"; preserve: (message: AgentMessage) => boolean; snapshotSeq: number }
+		| { kind: "drop" }
+		| { kind: "held" }
+		| undefined;
+
+	/**
+	 * The single owner of steering that a run admitted but never consumed. The
+	 * Agent already cleared its queue; this decides once, per message, whether
+	 * it is delivered as a follow-up of a fresh turn (user interrupt, natural
+	 * end, or a post-snapshot external steer surviving a terminal abort) or
+	 * dropped with its removal disposition (terminal abort, teardown), and keeps
+	 * the display list aligned with that decision.
+	 */
+	#settleDisownedSteering(event: Extract<AgentEvent, { type: "agent_end" }>): void {
+		const disowned = event.disownedSteering ?? [];
+		const disposition = this.#disownedSteeringDisposition;
+		this.#disownedSteeringDisposition = undefined;
+		// A cancel-and-submit snapshotted the queues before aborting and re-queues
+		// them itself once the abort settles; the display list stays as-is.
+		if (disposition?.kind === "held") return;
+		const dropped: AgentMessage[] = [];
+		const rearmed: AgentMessage[] = [];
+		for (const message of disowned) {
+			const keep =
+				disposition === undefined || disposition.kind === "rearm"
+					? true
+					: disposition.kind === "terminal"
+						? disposition.preserve(message)
+						: false;
+			(keep ? rearmed : dropped).push(message);
+		}
+		const droppedSet = new Set(dropped);
+		const rearmedSet = new Set(rearmed);
+		const rearmedDisplays: QueuedDisplayEntry[] = [];
+		this.#steeringMessages = this.#steeringMessages.filter(entry => {
+			if (entry.message !== undefined && droppedSet.has(entry.message)) return false;
+			if (entry.message !== undefined && rearmedSet.has(entry.message)) {
+				rearmedDisplays.push(entry);
+				return false;
+			}
+			// Tag-only display entries (custom skill chips) belong to whichever
+			// custom message carries their tag.
+			if (entry.tag !== undefined) {
+				const owner = disowned.find(
+					message => message.role === "custom" && readPendingDisplayTag(message.details) === entry.tag,
+				);
+				if (owner && droppedSet.has(owner)) return false;
+				if (owner && rearmedSet.has(owner)) {
+					rearmedDisplays.push(entry);
+					return false;
+				}
+			}
+			return true;
+		});
+		// Dropped steering leaves without consumption: terminalize its accepted
+		// SDK submissions boundedly (#4668 review P1).
+		this.#fireQueuedRemovalHooks(dropped);
+		if (rearmed.length === 0) return;
+		// Re-route as sequential follow-ups of the NEXT turn, ahead of any
+		// follow-up queued after them, preserving submission order. Marking
+		// each as sequential first, then restoring ahead of the existing queue,
+		// keeps the existing follow-ups' identity and per-message marks intact.
+		let batch: AgentMessage[] = [];
+		const flushBatch = () => {
+			if (batch.length > 1) this.agent.markFollowUpBatch(batch);
+			batch = [];
+		};
+		for (const message of rearmed) {
+			if (this.#sequentialSteerMessages.has(message)) {
+				flushBatch();
+				this.agent.markFollowUpSequential(message);
+			} else if (this.agent.getSteeringMode() === "all") {
+				batch.push(message);
+			}
+		}
+		flushBatch();
+		this.agent.restoreFollowUp(rearmed);
+		this.#followUpMessages = [...rearmedDisplays, ...this.#followUpMessages];
+		for (const message of rearmed) {
+			// External SDK steers keep their promotion hook: it now fires at the
+			// follow-up promotion boundary with startsOwnRun: true.
+			const steerHook = this.#steerPromotionHooks.get(message);
+			if (steerHook) {
+				this.#steerPromotionHooks.delete(message);
+				this.#followUpPromotionHooks.set(message, steerHook);
+			}
+			this.#externalFollowUps.add(message);
+		}
+		// Nothing else owns delivery of a rearm that did not come from an abort
+		// (a natural end, or a fold whose wake turn must carry the steer): the
+		// abort paths schedule their own continuation and this one is a no-op
+		// once the queue is drained.
+		this.#scheduleQueuedDelivery();
 	}
 	#fireQueuedPromotionHooks(messages: readonly AgentMessage[], promotion?: { startsOwnRun?: boolean }): void {
 		for (const message of messages) {
@@ -5664,6 +5822,10 @@ export class AgentSession {
 		// First statement of the listener: the observation must precede every claim,
 		// reservation, and async hop this handler performs.
 		this.#observeCoordinatorToolEvent(event);
+		// The run that owned the steering queue is over. Decide ONCE, synchronously
+		// and before any ownership gate, what happens to steering it never consumed
+		// — a late terminal of a superseded run must still settle its own steering.
+		if (event.type === "agent_end" && event.disownedSteering?.length) this.#settleDisownedSteering(event);
 		// Reserve canonical message order synchronously. Agent listeners are not
 		// awaited, so a tool-result spill may yield while a later continuation
 		// otherwise overtakes it in persisted/display context.
@@ -7162,10 +7324,14 @@ export class AgentSession {
 										skip("queue_drained");
 										return;
 									}
-									// A scheduled same-turn continuation of a terminally aborted turn is
-									// denied at the final synchronous boundary before agent.continue
-									// entry; no await intervenes between this check and method entry.
-									// Owned-completion deliveries are NOT affected (they use followUp).
+									// Final synchronous boundary before agent.continue* entry; no await
+									// intervenes between here and method entry. A same-turn continuation
+									// of a terminally aborted turn is denied here, while an independent
+									// root request queued past that fence mints its fresh identity here —
+									// so a cancelled or emptied continuation never leaves the session on
+									// an identity that escapes the fence. Owned-completion deliveries are
+									// NOT affected (they use followUp).
+									if (this.#hasQueuedFreshRootRequest()) this.#resumeFromOwnedCompletion();
 									if (this.#isTurnContinuationBlocked()) {
 										skip("terminal_turn");
 										return;
@@ -10491,8 +10657,8 @@ export class AgentSession {
 	}
 
 	/** Current interrupt mode */
-	get interruptMode(): "immediate" | "wait" {
-		return this.agent.getInterruptMode();
+	get toolInterruptPolicy(): "abort_tools" | "finish_tools" {
+		return this.agent.getToolInterruptPolicy();
 	}
 
 	/** Current session file path, or undefined if sessions are disabled */
@@ -10579,7 +10745,7 @@ export class AgentSession {
 			thinking: this.#thinkingLevel ?? "off",
 			steeringMode: this.steeringMode,
 			followUpMode: this.followUpMode,
-			interruptMode: this.interruptMode,
+			toolInterruptPolicy: this.toolInterruptPolicy,
 		};
 	}
 
@@ -11455,7 +11621,15 @@ export class AgentSession {
 
 		// If streaming, queue via steer() or followUp() based on option.
 		// Abort unwind is awaited above so a successor is not busy against leftover in-flight.
-		if (this.#isLiveTurnBusy() && !waitedForAbortUnwind) {
+		// An explicit streamingBehavior submitted while another prompt still holds
+		// or awaits session admission (agent idle, session not yet live) is queued
+		// as well: entering admission behind that prompt would only get this
+		// message cancelled by the predecessor's preflight reset and lost.
+		const promptAdmissionContended =
+			options?.streamingBehavior !== undefined &&
+			(this.#activeSessionAdmission?.kind === "prompt" ||
+				this.#sessionAdmissionQueue.some(entry => entry.kind === "prompt"));
+		if ((this.#isLiveTurnBusy() || promptAdmissionContended) && !waitedForAbortUnwind) {
 			if (!options?.streamingBehavior) {
 				throw new AgentBusyError();
 			}
@@ -11465,7 +11639,10 @@ export class AgentSession {
 					claimsGenuineUserIntent,
 				});
 			} else {
-				await this.#queueSteer(expandedText, options?.images, { claimsGenuineUserIntent });
+				await this.#queueSteer(expandedText, options?.images, {
+					claimsGenuineUserIntent,
+					forceOneAtATime: options.steerQueuePolicy === "sequential",
+				});
 			}
 			if (workflowIntentDiff) {
 				this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
@@ -11478,6 +11655,35 @@ export class AgentSession {
 		await this.#withSessionAdmission(
 			"prompt",
 			async admission => {
+				// A prompt that carries an explicit streamingBehavior and was admitted
+				// behind another prompt (that prompt reset the preflight generation
+				// while this one waited in the admission queue) is a busy submission:
+				// queue it against the now-live turn instead of cancelling it.
+				if (
+					options?.streamingBehavior !== undefined &&
+					this.#isPromptPreflightCancelled(admissionGeneration, admissionSignal) &&
+					options.preflightSignal?.aborted !== true &&
+					!this.#abortUnwind
+				) {
+					admission.release();
+					if (options.streamingBehavior === "followUp") {
+						await this.#queueFollowUp(expandedText, options?.images, {
+							forceOneAtATime: options.followUpQueuePolicy === "sequential",
+							claimsGenuineUserIntent,
+						});
+					} else {
+						await this.#queueSteer(expandedText, options?.images, {
+							claimsGenuineUserIntent,
+							forceOneAtATime: options.steerQueuePolicy === "sequential",
+						});
+					}
+					if (workflowIntentDiff) {
+						this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
+					}
+					if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+					else options?.onPreflightAccepted?.();
+					return;
+				}
 				this.#throwIfPromptPreflightCancelled(admissionGeneration, admissionSignal);
 				if (workflowIntentDiff) {
 					this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
@@ -11652,6 +11858,7 @@ export class AgentSession {
 			| "streamingBehavior"
 			| "toolChoice"
 			| "followUpQueuePolicy"
+			| "steerQueuePolicy"
 			| "onPreflightAccepted"
 			| "onPreflightAcceptCommit"
 			| "preflightSignal"
@@ -11687,6 +11894,7 @@ export class AgentSession {
 			await this.sendCustomMessage(message, {
 				deliverAs: options.streamingBehavior,
 				followUpQueuePolicy: options.followUpQueuePolicy,
+				steerQueuePolicy: options.steerQueuePolicy,
 			});
 			return;
 		}
@@ -11767,6 +11975,7 @@ export class AgentSession {
 			skipPostPromptRecoveryWait?: boolean;
 			predecessorAgentEndHold?: symbol;
 			admissionLease?: SessionAdmissionLease;
+			skipInitialSteeringPoll?: boolean;
 			onRunAccepted?: (handle: AttemptRunHandle) => void;
 			onFinalPreflight?: (context: { hasPendingNextTurnMessages: boolean }) => Promise<boolean>;
 			resetRetryReplaySafety?: boolean;
@@ -12097,6 +12306,7 @@ export class AgentSession {
 
 			const agentPromptOptions = {
 				...(options?.toolChoice ? { toolChoice: options.toolChoice } : undefined),
+				...(options?.skipInitialSteeringPoll ? { skipInitialSteeringPoll: true } : {}),
 				...this.#managedFallbackPromptOptions(),
 				...(options?.sdkRunToken ? { sdkRunToken: options.sdkRunToken } : {}),
 				onRunAccepted: (handle: AttemptRunHandle) => {
@@ -12267,8 +12477,8 @@ export class AgentSession {
 					this.setFollowUpMode(mode);
 					return true;
 				}
-				if (kind === "interrupt" && (mode === "immediate" || mode === "wait")) {
-					this.setInterruptMode(mode);
+				if (kind === "tool_interrupt" && (mode === "abort_tools" || mode === "finish_tools")) {
+					this.setToolInterruptPolicy(mode);
 					return true;
 				}
 				return false;
@@ -12444,6 +12654,7 @@ export class AgentSession {
 			onPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
 			external?: boolean;
 			sdkRunToken?: string;
+			forceOneAtATime?: boolean;
 		},
 	): Promise<void> {
 		this.#assertNoHandoffTransition();
@@ -12452,6 +12663,26 @@ export class AgentSession {
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images && images.length > 0) content.push(...images);
 		const message = { role: "user" as const, content, attribution: "user" as const, timestamp: Date.now() };
+		// Enqueue-time admission: the Agent only accepts a steer into a live,
+		// non-aborted run. Anything else (idle, unwinding after agent_end, another
+		// prompt still in preflight, aborting) has no run to steer, so it is routed
+		// as a sequential follow-up owned by the next turn instead of being parked
+		// in a queue nobody owns.
+		const admission = this.agent.steer(message, options?.forceOneAtATime ? { forceOneAtATime: true } : undefined);
+		if (!admission.admitted) {
+			await this.#queueFollowUp(text, images, {
+				forceOneAtATime: options?.forceOneAtATime,
+				claimsGenuineUserIntent: options?.claimsGenuineUserIntent,
+				onPromoted: options?.onPromoted,
+				sdkRunToken: options?.sdkRunToken,
+				onQueued: message => {
+					if (this.#abortUnwind && !options?.forceOneAtATime) this.#abortUnwindSteerFallbacks.push(message);
+				},
+			});
+			this.#scheduleNonAdmittedSteerContinuation();
+			return;
+		}
+		if (options?.forceOneAtATime) this.#sequentialSteerMessages.add(message);
 		this.#steeringMessages.push(this.#createQueuedDisplayEntry(displayText, undefined, message));
 		if (options?.external) {
 			this.#externalSteerMessages.add(message);
@@ -12463,25 +12694,42 @@ export class AgentSession {
 			const epoch = this.#claimDeepInterviewUserIntent();
 			this.#deepInterviewGenuineUserMessageEpochs.set(message, epoch);
 		}
-		this.agent.steer(message);
-		// A live agent loop polls the steering queue at every tool/turn boundary
-		// and consumes this message on its own. But when a steer is queued while no
-		// loop is actively running — e.g. the session still reports busy only
-		// because a finished prompt is unwinding (deferred agent_end / post-prompt
-		// work) — nothing delivers it until the next explicit prompt or a
-		// user-interrupt abort, so it stalls until the user presses Esc. Schedule a
-		// continue so the steer is delivered promptly. A live loop (or an
-		// already-drained queue) makes the scheduled continue a no-op.
-		// During an abort unwind, the abort's single rearm owns this boundary. Letting
-		// each steer schedule its own continuation can start the first queued message
-		// before the rest of the unwind cohort is admitted, splitting an `all` batch.
-		if (!this.#cancelAndSubmitInProgress && this.#abortUnwind === undefined && this.#canAutoContinueForSteer()) {
-			this.#scheduleAgentContinue({
-				shouldContinue: () => this.#canAutoContinueForSteer() && this.agent.hasQueuedSteering(),
-				rescheduleOnBusy: true,
-				continueQueuedOnly: true,
-			});
-		}
+	}
+
+	/**
+	 * A steer that was not admitted into a live run was requeued as a follow-up.
+	 * `#queueFollowUp` already schedules delivery when the session is idle; this
+	 * covers the unwind window where the session still reports busy only because
+	 * a finished prompt is unwinding (deferred agent_end / post-prompt work), so
+	 * the follow-up gate refuses while no loop actually owns the queue. A live
+	 * loop, a prompt still in preflight, or a drained queue makes the scheduled
+	 * continue a no-op.
+	 */
+	#scheduleNonAdmittedSteerContinuation(): void {
+		// `#queueFollowUp` already schedules delivery when the session is idle; this
+		// only covers the window where that gate refuses (a finished prompt is
+		// unwinding) while no loop owns the queue. The resumable-tail requirement
+		// is kept here on purpose: a message queued against a session that never
+		// ran a turn waits for the next explicit prompt, as it always has.
+		if (this.#cancelAndSubmitInProgress || !this.#canAutoContinueForSteer()) return;
+		if (this.#canAutoContinueForFollowUp()) return;
+		this.#scheduleQueuedDelivery();
+	}
+
+	/**
+	 * Schedule delivery of whatever is queued. Used by every path that enqueues
+	 * without going through `#queueFollowUp` (custom-message steer/follow-up
+	 * routing, disown re-routing, held-steering fallback, a run's terminal): the
+	 * run that would have polled the queue is gone, so nothing else owns it.
+	 */
+	#scheduleQueuedDelivery(delayMs?: number): void {
+		if (this.#cancelAndSubmitInProgress || !this.#canDeliverQueuedMessages()) return;
+		this.#scheduleAgentContinue({
+			...(delayMs === undefined ? {} : { delayMs }),
+			shouldContinue: () => this.#canDeliverQueuedMessages() && this.agent.hasQueuedMessages(),
+			rescheduleOnBusy: true,
+			continueQueuedOnly: true,
+		});
 	}
 
 	/**
@@ -12495,6 +12743,7 @@ export class AgentSession {
 			claimsGenuineUserIntent?: boolean;
 			onPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
 			sdkRunToken?: string;
+			onQueued?: (message: AgentMessage) => void;
 		},
 	): Promise<QueuedFollowUpOwner> {
 		this.#assertNoHandoffTransition();
@@ -12504,6 +12753,7 @@ export class AgentSession {
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images && images.length > 0) content.push(...images);
 		const message = { role: "user" as const, content, attribution: "user" as const, timestamp: Date.now() };
+		options?.onQueued?.(message);
 		// Display entry carries the message identity so positional editing can never
 		// misaddress a deferred SDK follow-up held outside the Agent live queue.
 		const displayEntry = this.#createQueuedDisplayEntry(displayText, undefined, message);
@@ -12587,6 +12837,7 @@ export class AgentSession {
 	 * Gate for idle-path follow-up auto-continue. See `#queueFollowUp` for rationale.
 	 */
 	#canAutoContinueForFollowUp(): boolean {
+		if (this.#abortUnwind) return false;
 		if (this.isStreaming) return false;
 		if (this.isCompacting) return false;
 		if (this.isBashRunning) return false;
@@ -12613,6 +12864,24 @@ export class AgentSession {
 	}
 
 	/**
+	 * Gate for delivering queued messages through `continueQueuedMessages()`.
+	 * Unlike the steer/follow-up auto-continue gates this does NOT require an
+	 * assistant tail: a queued-only continuation delivers the queued turn without
+	 * replaying the tail, so a tool-result tail (paused fold, aborted turn) is
+	 * still deliverable. A live agent loop, a retry, or an in-flight
+	 * compaction/bash/eval owns the session and defers delivery.
+	 */
+	#canDeliverQueuedMessages(): boolean {
+		if (this.#abortUnwind) return false;
+		if (this.agent.state.isStreaming) return false;
+		if (this.isRetrying) return false;
+		if (this.isCompacting) return false;
+		if (this.isBashRunning) return false;
+		if (this.isEvalRunning) return false;
+		return true;
+	}
+
+	/**
 	 * Gate for idle / winding-down steer auto-continue. Unlike the follow-up gate
 	 * this checks `agent.state.isStreaming` (a live agent loop) rather than the
 	 * public `isStreaming` (which stays true while a finished prompt unwinds), so a
@@ -12620,11 +12889,19 @@ export class AgentSession {
 	 * false here because it polls the steering queue itself.
 	 */
 	#canAutoContinueForSteer(): boolean {
+		if (this.#abortUnwind) return false;
 		if (this.agent.state.isStreaming) return false;
 		if (this.isRetrying) return false;
 		const messages = this.agent.state.messages;
 		const last = messages[messages.length - 1];
 		return last?.role === "assistant" || last?.role === "bashExecution" || last?.role === "pythonExecution";
+	}
+
+	#finalizeAbortUnwindSteerBatch(): void {
+		if (this.agent.getSteeringMode() === "all" && this.#abortUnwindSteerFallbacks.length > 1) {
+			this.agent.markFollowUpBatch(this.#abortUnwindSteerFallbacks);
+		}
+		this.#abortUnwindSteerFallbacks = [];
 	}
 
 	queueDeferredMessage(message: CustomMessage): void {
@@ -12915,6 +13192,7 @@ export class AgentSession {
 			triggerTurn?: boolean;
 			deliverAs?: "steer" | "followUp" | "nextTurn";
 			followUpQueuePolicy?: "respect-mode" | "sequential";
+			steerQueuePolicy?: "respect-mode" | "sequential";
 			/** INTERNAL trusted option: origin of a hidden next-turn message —
 			 *  "turn" (produced by the current turn's continuation machinery,
 			 *  purged by a terminal abort) or "external" (background producers,
@@ -12940,6 +13218,53 @@ export class AgentSession {
 			const epoch = preclaimedUserIntentEpoch ?? this.#claimDeepInterviewUserIntent();
 			this.#deepInterviewGenuineUserMessageEpochs.set(appMessage, epoch);
 		}
+		// An explicit steer request routes the same way at every session phase: the
+		// Agent admits it only into a live run, and anything else becomes a
+		// sequential follow-up the next turn delivers. Routing this on the session's
+		// streaming flag instead would strand it during the post-prompt unwind (no
+		// loop owns the queue) and append it without a turn while idle.
+		if (options?.deliverAs === "steer") {
+			// A handoff transition owns the session; a background/custom trigger
+			// (cron, monitor, skill) must not steer against the outgoing turn.
+			this.#assertNoHandoffTransition();
+			const sequential = options.steerQueuePolicy === "sequential" ? { forceOneAtATime: true } : undefined;
+			if (this.agent.steer(appMessage, sequential).admitted) {
+				if (sequential) this.#sequentialSteerMessages.add(appMessage);
+				this.#bindCustomDisplayEntry(appMessage, "steer");
+			} else {
+				// No live run to steer, so this becomes next-turn work. Provenance —
+				// never the caller's `triggerTurn` delivery preference — decides what a
+				// terminal abort's retained fence does with it: genuine user input and
+				// an independent external producer are root requests of their own and
+				// survive; a continuation produced by the aborted turn's own machinery
+				// (preview/plan reminder) is dropped with its removal disposition
+				// rather than leaking into an unrelated later turn.
+				const independentOfTurn = appMessage.attribution === "user" || options.origin === "external";
+				if (this.#isTurnContinuationBlocked() && !independentOfTurn) {
+					const displayTag = readPendingDisplayTag(appMessage.details);
+					if (displayTag !== undefined) {
+						this.#steeringMessages = this.#steeringMessages.filter(entry => entry.tag !== displayTag);
+						this.#followUpMessages = this.#followUpMessages.filter(entry => entry.tag !== displayTag);
+					}
+					this.#settleDeliveredOwnedRegistrations([appMessage]);
+					return;
+				}
+				this.agent.followUp(appMessage, sequential);
+				if (this.#abortUnwind && !sequential) this.#abortUnwindSteerFallbacks.push(appMessage);
+				// The chip now describes follow-up work: keep its mode and identity
+				// aligned with where the executable message actually landed.
+				this.#bindCustomDisplayEntry(appMessage, "followUp");
+				if (independentOfTurn) {
+					this.#externalFollowUps.add(appMessage);
+					// Past a retained terminal fence this message is a NEW root: record
+					// the requirement on the message itself so it survives a deferred
+					// delivery and disappears with the message if it is removed.
+					if (this.#isTurnContinuationBlocked()) this.#freshRootLineageRequests.add(appMessage);
+				}
+				this.#scheduleQueuedDelivery();
+			}
+			return;
+		}
 		if (this.isStreaming) {
 			// A handoff transition owns the session; a background/custom trigger (cron,
 			// monitor, skill) must not steer/follow-up/queue against the outgoing turn
@@ -12950,14 +13275,15 @@ export class AgentSession {
 				return;
 			}
 
-			if (options?.deliverAs === "followUp") {
-				this.agent.followUp(
-					appMessage,
-					options.followUpQueuePolicy === "sequential" ? { forceOneAtATime: true } : undefined,
-				);
-			} else {
-				this.agent.steer(appMessage);
-			}
+			this.agent.followUp(
+				appMessage,
+				options?.followUpQueuePolicy === "sequential" ? { forceOneAtATime: true } : undefined,
+			);
+			this.#bindCustomDisplayEntry(appMessage, "followUp");
+			// The session can report streaming while no agent loop owns the queue
+			// (post-prompt unwind): without a scheduled delivery a cron/monitor
+			// notification would sit queued until unrelated activity.
+			if (!this.agent.state.isStreaming) this.#scheduleQueuedDelivery();
 			return;
 		}
 
@@ -13478,8 +13804,37 @@ export class AgentSession {
 		const fromIndex = queue.findIndex(entry => entry.sequence === sequence);
 		if (fromIndex === -1) return false;
 		const toIndex = direction === "up" ? fromIndex - 1 : fromIndex + 1;
+		if (toIndex < 0 || toIndex >= queue.length) return false;
+		// Identity-based reorder, for the same reason removal is: a display index is
+		// NOT an Agent queue index. Hidden `display:false` custom messages occupy
+		// executable slots without a chip, so mapping the visible position straight
+		// onto the Agent queue reorders an unrelated message while the UI moves the
+		// chip. Resolve both endpoints from the bound messages instead.
+		const fromMessage = queue[fromIndex]?.message;
+		const toMessage = queue[toIndex]?.message;
+		const executable = mode === "steer" ? this.agent.snapshotSteering() : this.agent.snapshotFollowUp();
+		const fromDeferred = fromMessage !== undefined && this.#deferredSdkFollowUps.includes(fromMessage);
+		const toDeferred = toMessage !== undefined && this.#deferredSdkFollowUps.includes(toMessage);
+		// A deferred SDK follow-up is held OUTSIDE the Agent queue, so its display
+		// row cannot be reordered against live messages: the two rows live in
+		// different backing stores and no single index describes both. Reorder
+		// within the deferred store when both rows are deferred; refuse a
+		// cross-store move rather than silently moving an unrelated message.
+		if (fromDeferred || toDeferred) {
+			if (!fromDeferred || !toDeferred || fromMessage === undefined || toMessage === undefined) return false;
+			const deferredFrom = this.#deferredSdkFollowUps.indexOf(fromMessage);
+			const deferredTo = this.#deferredSdkFollowUps.indexOf(toMessage);
+			if (deferredFrom === -1 || deferredTo === -1) return false;
+			const [moved] = this.#deferredSdkFollowUps.splice(deferredFrom, 1);
+			if (moved === undefined) return false;
+			this.#deferredSdkFollowUps.splice(deferredTo, 0, moved);
+			return this.#moveQueuedDisplayEntry(queue, fromIndex, toIndex);
+		}
+		const agentFrom = fromMessage === undefined ? fromIndex : executable.indexOf(fromMessage);
+		const agentTo = toMessage === undefined ? toIndex : executable.indexOf(toMessage);
+		if (agentFrom === -1 || agentTo === -1) return false;
 		const agentMoved =
-			mode === "steer" ? this.agent.moveSteer(fromIndex, toIndex) : this.agent.moveFollowUp(fromIndex, toIndex);
+			mode === "steer" ? this.agent.moveSteer(agentFrom, agentTo) : this.agent.moveFollowUp(agentFrom, agentTo);
 		if (!agentMoved) return false;
 		return this.#moveQueuedDisplayEntry(queue, fromIndex, toIndex);
 	}
@@ -13965,6 +14320,16 @@ export class AgentSession {
 		this.#abortUnwind = unwind.promise;
 		try {
 			this.#abortOptions(options);
+			// Decide what the run's unconsumed steering becomes BEFORE it ends: a
+			// user interrupt (Esc) hands it to a fresh turn; every other cause
+			// (teardown, session switch, compaction, handoff, tool abort) drops it.
+			// A cancel-and-submit owns its snapshot and re-queues explicitly.
+			if (this.#disownedSteeringDisposition === undefined) {
+				this.#disownedSteeringDisposition =
+					(options?.cause ?? "internal") === "user_interrupt" && !this.#cancelAndSubmitInProgress
+						? { kind: "rearm" }
+						: { kind: "drop" };
+			}
 			this.#drainTerminalOwnedYieldEntries();
 			const postPromptDrain = this.#cancelPostPromptTasks();
 			const managedLogicalRunId =
@@ -13993,15 +14358,18 @@ export class AgentSession {
 					this.agent.requestRunTerminal(managedLogicalRunId, { stopReason: "cancelled" });
 				this.#flushPendingBackgroundExchanges();
 				await this.#awaitAbortedTurnTerminal();
+				this.#finalizeAbortUnwindSteerBatch();
+				// Steering disowned by the aborted run was re-routed as follow-ups
+				// on its agent_end; a user interrupt resumes into them promptly.
 				if (
 					!this.#cancelAndSubmitInProgress &&
 					(options?.cause ?? "internal") === "user_interrupt" &&
-					this.agent.hasQueuedSteering()
+					this.agent.hasQueuedMessages()
 				) {
 					this.#scheduleAgentContinue({
 						delayMs: 1,
 						generation: this.#promptGeneration,
-						shouldContinue: () => this.agent.hasQueuedSteering(),
+						shouldContinue: () => this.agent.hasQueuedMessages(),
 						rescheduleOnBusy: true,
 						continueQueuedOnly: true,
 					});
@@ -14014,6 +14382,10 @@ export class AgentSession {
 				if (this.#toolChoiceQueue.hasInFlight) this.#toolChoiceQueue.reject("aborted");
 			}
 		} finally {
+			// No run was live to end (or its terminal already settled): the
+			// disposition must not leak into an unrelated later run's exit.
+			this.#disownedSteeringDisposition = undefined;
+			this.#abortUnwindSteerFallbacks = [];
 			this.#abortUnwind = undefined;
 			this.#abortForceRecoveryStarted = false;
 			unwind.resolve();
@@ -14153,10 +14525,6 @@ export class AgentSession {
 		}
 	> {
 		let registeredScope: { scopeId: string; abortedAttemptEpoch: number; lineageIdHash: string } | undefined;
-		// The purge snapshot is consumed per-admission inside the terminal
-		// block; the rearm below (reachable only when a scope was registered,
-		// i.e. only after the purge ran) reads the same value.
-		let abortSteeringSnapshot: number | undefined;
 		if (options.terminal) {
 			// The terminal scope must be registered for the ABORTED turn's
 			// lineage, never a successor's. A new root turn advances the attempt
@@ -14211,10 +14579,10 @@ export class AgentSession {
 					};
 				}
 				// Terminal abort blocks STEERING continuations of the aborted turn:
-				// purge steering queued just before the abort won (the loop can
-				// exit on the abort signal without polling it) so it cannot alter
-				// the next user turn (review thread P2). The follow-up queue is
-				// preserved — owned-completion resumes must still deliver.
+				// only a client steer admitted AFTER this abort's admission snapshot
+				// survives; everything else was a continuation of the attempt being
+				// terminated (review thread P2). The follow-up queue is preserved —
+				// owned-completion resumes must still deliver.
 				const turnSnapshotKey = `${lineageIdHash}:${this.#promptGeneration}`;
 				const queuedTurnSnapshots = this.#terminalAbortSteeringSnapshots.get(turnSnapshotKey);
 				const snapshotIndex =
@@ -14224,39 +14592,31 @@ export class AgentSession {
 				const consumedSnapshot =
 					queuedTurnSnapshots && snapshotIndex >= 0 ? queuedTurnSnapshots.splice(snapshotIndex, 1)[0] : undefined;
 				if (consumedSnapshot) this.#terminalAbortSteeringSnapshotKeys.delete(consumedSnapshot.token);
-				abortSteeringSnapshot = consumedSnapshot?.seq ?? this.#steeringAdmissionSeq;
+				const snapshotSeq: number = consumedSnapshot?.seq ?? this.#steeringAdmissionSeq;
 				if (queuedTurnSnapshots?.length === 0) {
 					this.#terminalAbortSteeringSnapshots.delete(turnSnapshotKey);
 				}
-				const admittedAfterSnapshot = (message: AgentMessage): boolean =>
-					(this.#externalSteerAdmissionSeq.get(message) ?? 0) > (abortSteeringSnapshot ?? -1);
-				// Steering purge, STEERING queue only: the agent-wide removal
-				// would also wipe the follow-up queue, which owned-completion
-				// resumes must still deliver (review thread P1).
-				const steeringBeforePurge = this.agent.snapshotSteering();
-				const purgedSteering = steeringBeforePurge.filter(
-					message => !(this.#externalSteerMessages.has(message) && admittedAfterSnapshot(message)),
-				);
-				this.agent.removeQueuedMessages(
-					message => !(this.#externalSteerMessages.has(message) && admittedAfterSnapshot(message)),
-					"steering",
-				);
-				// Purged steering leaves without consumption: terminalize its accepted
-				// SDK submissions boundedly (#4668 review P1).
-				this.#fireQueuedRemovalHooks(purgedSteering);
-				// Keep the display list aligned with the ACTUAL purge decisions:
-				// preserved post-snapshot external steers stay visible and
-				// purged internal steers disappear — a stale entry would let the
-				// positional editing APIs remove a different preserved steer
-				// (review thread P2).
-				const steeringAfterPurge = new Set(this.agent.snapshotSteering());
-				const keptSteeringDisplays: QueuedDisplayEntry[] = [];
-				for (let displayIndex = 0; displayIndex < steeringBeforePurge.length; displayIndex++) {
-					if (steeringAfterPurge.has(steeringBeforePurge[displayIndex]!)) {
-						keptSteeringDisplays.push(this.#steeringMessages[displayIndex]!);
-					}
-				}
-				this.#steeringMessages = keptSteeringDisplays;
+				const preserveSteering = (message: AgentMessage): boolean =>
+					this.#externalSteerMessages.has(message) &&
+					(this.#externalSteerAdmissionSeq.get(message) ?? 0) > snapshotSeq;
+				// The live run disowns its steering on agent_end; the disposition
+				// installed here is what settles it (drop pre-snapshot, re-route
+				// post-snapshot external steers as a fresh turn). Nothing is
+				// removed from the Agent queue by the session itself.
+				// Overlapping terminal aborts of the same run may settle out of order:
+				// the disposition only ever NARROWS. The highest admission snapshot
+				// wins, and a preserve decision must satisfy every terminal abort that
+				// registered, so a later stricter snapshot cannot be widened by an
+				// older one settling afterwards.
+				const previous = this.#disownedSteeringDisposition;
+				this.#disownedSteeringDisposition =
+					previous?.kind === "terminal"
+						? {
+								kind: "terminal",
+								snapshotSeq: Math.max(previous.snapshotSeq, snapshotSeq),
+								preserve: (message: AgentMessage) => previous.preserve(message) && preserveSteering(message),
+							}
+						: { kind: "terminal", preserve: preserveSteering, snapshotSeq };
 
 				// Remove ORDINARY follow-ups queued for the aborted turn: the
 				// aborted loop exits without polling them, so a later unrelated
@@ -14311,6 +14671,7 @@ export class AgentSession {
 		}
 		const aborted = this.#runCancellationDomains.abort(handle);
 		if (!aborted.ok) {
+			this.#disownedSteeringDisposition = undefined;
 			if (aborted.reason === "quarantined") {
 				return {
 					...(await this.agent.resourceLedger.waitForSettlement(handle, { graceMs: 0 })),
@@ -14327,6 +14688,9 @@ export class AgentSession {
 		if (handle === this.agent.activeResourceRunId) this.agent.abort();
 		const proof = await this.agent.resourceLedger.waitForSettlement(handle, { graceMs: options.graceMs });
 		if (proof.status === "unfenced") this.agent.resourceLedger.quarantine(handle);
+		// The run's agent_end (if any) consumed the disposition; a settled or
+		// already-ended run must not leave it for an unrelated later exit.
+		this.#disownedSteeringDisposition = undefined;
 		// Rearm surviving owned-completion follow-ups once the abort has
 		// settled: the aborted loop exits before polling the follow-up queue,
 		// so preserving the envelopes alone leaves them stranded until an
@@ -14366,19 +14730,10 @@ export class AgentSession {
 						message =>
 							ownedCompletionResumeAction(message as never) === "fresh" || this.#externalFollowUps.has(message),
 					);
-			// A preserved post-snapshot client steer is also an independent
-			// root-turn request: the abort exits the loop and never polls the
-			// steering queue, so without a rearm the accepted steer stays
-			// stranded until unrelated activity (review thread P1).
-			const hasPreservedSteering = (): boolean =>
-				this.agent
-					.snapshotQueues()
-					.steering.some(
-						message =>
-							this.#externalSteerMessages.has(message) &&
-							(this.#externalSteerAdmissionSeq.get(message) ?? 0) > (abortSteeringSnapshot ?? -1),
-					);
-			if (hasPreservedFollowUp() || hasPreservedSteering()) {
+			// A post-snapshot client steer preserved by the run's disown settlement
+			// is already an external follow-up here (an independent root-turn
+			// request), so one predicate covers both (review thread P1).
+			if (hasPreservedFollowUp()) {
 				// ANY preserved follow-up or steer — an owned-completion resume,
 				// an independently requested external follow-up, or a
 				// post-snapshot client steer — needs a fresh lineage before its
@@ -14393,7 +14748,7 @@ export class AgentSession {
 				this.#scheduleAgentContinue({
 					delayMs: 1,
 					generation: this.#promptGeneration,
-					shouldContinue: () => hasPreservedFollowUp() || hasPreservedSteering(),
+					shouldContinue: () => hasPreservedFollowUp(),
 					// The rearmed continuation must consume the queued steer inside
 					// the run acceptance (continueQueuedMessages) rather than
 					// dequeue it later via getSteeringMessages: a terminal abort
@@ -14481,9 +14836,14 @@ export class AgentSession {
 					];
 				};
 				try {
+					// The aborted run disowns its steering on agent_end; hold it here
+					// (rather than re-routing) because this call owns the snapshot and
+					// re-queues it against the NEW turn below.
+					this.#disownedSteeringDisposition = { kind: "held" };
 					const outcome = this.#cancelAndSubmitAbortOutcomeProviderForTests
 						? await this.#cancelAndSubmitAbortOutcomeProviderForTests()
 						: await this.#abortWithOutcome({ cause: "user_interrupt", timeoutMs: 5_000 });
+					this.#disownedSteeringDisposition = undefined;
 					if (outcome.kind !== "settled") {
 						restore();
 						if (outcome.kind === "error") {
@@ -14525,18 +14885,29 @@ export class AgentSession {
 							followUp: [...heldFollowUp, ...current.followUp],
 						});
 					};
+					// Steers of the aborted turn stay STEERS of the new turn: they are
+					// restored once the new run is accepted (below), so the Agent
+					// admits them into a live run instead of re-labelling them as
+					// follow-ups drained turn after turn. Follow-ups keep their queue.
+					const heldSteering = selected ? [] : queueSnapshot.steering;
+					const heldSteeringDisplays = selected ? [] : steeringDisplaySnapshot;
 					this.agent.restoreQueues({
 						steering: [...queuedDuringWindow.steering],
 						followUp: selected
 							? [...queuedDuringWindow.followUp]
-							: [...queueSnapshot.steering, ...queueSnapshot.followUp, ...queuedDuringWindow.followUp],
+							: [...queueSnapshot.followUp, ...queuedDuringWindow.followUp],
 					});
 					this.#steeringMessages = steeringDisplaysDuringWindow;
-					this.#followUpMessages = [
-						...steeringDisplaySnapshot,
-						...followUpDisplaySnapshot,
-						...followUpDisplaysDuringWindow,
-					];
+					// With a selected entry the held (unselected) messages are re-queued
+					// as follow-ups by restoreHeldQueue once the new run is accepted;
+					// mirror them in the display in the same order.
+					this.#followUpMessages = selected
+						? [
+								...steeringDisplaySnapshot.filter(entry => entry !== selected.display),
+								...followUpDisplaySnapshot.filter(entry => entry !== selected.display),
+								...followUpDisplaysDuringWindow,
+							]
+						: [...followUpDisplaySnapshot, ...followUpDisplaysDuringWindow];
 					const message = selectedMessage ?? {
 						role: "user" as const,
 						content: [{ type: "text" as const, text }],
@@ -14565,8 +14936,19 @@ export class AgentSession {
 							admissionLease: admission,
 							resetRetryReplaySafety: true,
 							sdkRunToken: selectedSdkRunToken,
+							skipInitialSteeringPoll: heldSteering.length > 0,
 							onRunAccepted: () => {
 								runAccepted = true;
+								if (heldSteering.length > 0) {
+									// Re-admit the aborted turn's steers into the replacement run the
+									// moment it is accepted, with the run's INITIAL poll skipped: the
+									// replacement prompt is answered by the opening model call and the
+									// steers are consumed together at its first turn boundary. Doing
+									// this synchronously at acceptance (rather than from an event
+									// listener) keeps the ordering deterministic.
+									this.agent.restoreSteering(heldSteering);
+									this.#steeringMessages = [...heldSteeringDisplays, ...this.#steeringMessages];
+								}
 								if (selected) this.#fireQueuedPromotionHooks([message], { startsOwnRun: true });
 								if (selected) {
 									this.#steeringMessages = this.#steeringMessages.filter(entry => entry !== selected.display);
@@ -14595,6 +14977,10 @@ export class AgentSession {
 		} finally {
 			this.#cancelAndSubmitInProgress = false;
 			this.#cancelAndSubmitPendingNextTurnDrained = false;
+			// Queue work that arrived (or was re-routed) during the atomic window was
+			// deliberately not scheduled while the flag was set; now that it is
+			// cleared, nothing else owns delivery.
+			if (this.agent.hasQueuedMessages()) this.#scheduleQueuedDelivery(1);
 		}
 	}
 
@@ -16556,13 +16942,13 @@ export class AgentSession {
 	}
 
 	/**
-	 * Set interrupt mode.
+	 * Set the tool interrupt policy (whether a steer aborts in-flight tools).
 	 * Saves to settings.
 	 */
-	setInterruptMode(mode: "immediate" | "wait"): void {
+	setToolInterruptPolicy(policy: "abort_tools" | "finish_tools"): void {
 		this.#assertDurableSettingsWritable();
-		this.agent.setInterruptMode(mode);
-		this.settings.set("interruptMode", mode);
+		this.agent.setToolInterruptPolicy(policy);
+		this.settings.set("toolInterruptPolicy", policy);
 	}
 
 	// =========================================================================
@@ -21233,6 +21619,7 @@ export class AgentSession {
 			toolChoice?: ToolChoice;
 			sdkRunToken?: string;
 			fallbackManaged?: boolean;
+			skipInitialSteeringPoll?: boolean;
 			onRunAccepted?: (handle: AttemptRunHandle) => void;
 		},
 		predecessorAgentEndHold?: symbol,

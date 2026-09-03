@@ -1170,7 +1170,7 @@ export class InputController {
 			const promptOptions =
 				streamingBehavior === "followUp"
 					? { streamingBehavior, images, followUpQueuePolicy: "sequential" as const }
-					: { streamingBehavior, images };
+					: { streamingBehavior, images, steerQueuePolicy: "sequential" as const };
 			await this.ctx.withLocalSubmission(text, () => this.ctx.session.prompt(text, promptOptions), {
 				imageCount: images?.length ?? 0,
 			});
@@ -1683,7 +1683,7 @@ export class InputController {
 					},
 					streamingBehavior === "followUp"
 						? { streamingBehavior, followUpQueuePolicy: "sequential" }
-						: { streamingBehavior },
+						: { streamingBehavior, steerQueuePolicy: "sequential" },
 				);
 			}
 			if (this.ctx.session.isStreaming) {

@@ -1579,14 +1579,15 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
-	interruptMode: {
+	toolInterruptPolicy: {
 		type: "enum",
-		values: ["immediate", "wait"] as const,
-		default: "immediate",
+		values: ["abort_tools", "finish_tools"] as const,
+		default: "abort_tools",
 		ui: {
 			tab: "interaction",
-			label: "Interrupt Mode",
-			description: "When steering messages interrupt tool execution",
+			label: "Tool Interrupt Policy",
+			description:
+				"Whether a steering message aborts the tools still running in the current batch (abort_tools) or lets them finish first (finish_tools). Never changes when a steer is consumed: it is always picked up at the next tool/turn boundary either way.",
 		},
 	},
 
@@ -4135,7 +4136,7 @@ export function getEnumValues(path: SettingPath): readonly string[] | undefined 
 	return "values" in def ? (def.values as readonly string[]) : undefined;
 }
 
-export { CONFIG_SCHEMA_VERSION } from "./config-schema-version";
+export { CONFIG_SCHEMA_VERSION, normalizeConfigSchemaVersion } from "./config-schema-version";
 
 export type SettingsSchemaIssue = {
 	path: string;
