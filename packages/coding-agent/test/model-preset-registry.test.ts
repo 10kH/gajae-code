@@ -2197,4 +2197,29 @@ describe("signed model preset registry", () => {
 			accept(data, second, registryFetch(second), { now, maxStateBytes: secondStateBytes + 1 }),
 		).resolves.toMatchObject({ status: "updated", revision: 2 });
 	});
+	test("reuses the verified read while unchanged and re-reads after every durable state change", async () => {
+		const data = await fixture();
+		const first = signedRegistry(data.privateKey, 1, [registryProfile("first-profile")]);
+		await accept(data, first, registryFetch(first));
+
+		const initial = loadAcceptedModelPresetRegistry(data.agentDir);
+		expect(initial.revision).toBe(1);
+		expect(initial.profiles.has("first-profile")).toBe(true);
+		expect(loadAcceptedModelPresetRegistry(data.agentDir)).toBe(initial);
+
+		const second = signedRegistry(data.privateKey, 2, [registryProfile("second-profile")]);
+		await accept(data, second, registryFetch(second));
+		const afterRefresh = loadAcceptedModelPresetRegistry(data.agentDir);
+		expect(afterRefresh).not.toBe(initial);
+		expect(afterRefresh.revision).toBe(2);
+		expect(afterRefresh.profiles.has("second-profile")).toBe(true);
+
+		const statePath = path.join(data.agentDir, "model-presets", "state.json");
+		const tampered = await Bun.file(statePath).json();
+		tampered.history[0].profiles.profiles[0].id = "tampered-profile";
+		await Bun.write(statePath, JSON.stringify(tampered));
+		const afterTamper = loadAcceptedModelPresetRegistry(data.agentDir);
+		expect(afterTamper).not.toBe(afterRefresh);
+		expect(afterTamper.profiles.has("tampered-profile")).toBe(false);
+	});
 });

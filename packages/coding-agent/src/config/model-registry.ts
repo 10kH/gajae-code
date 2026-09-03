@@ -39,6 +39,7 @@ import {
 	UNK_MAX_TOKENS,
 	unregisterCustomApis,
 } from "@gajae-code/ai/core";
+import { fetchModelsDevPayload } from "@gajae-code/ai/provider-models/openai-compat";
 import {
 	detectDiscoveredApiFamily,
 	resolveLoopbackOpenAIBaseUrl,
@@ -4062,12 +4063,7 @@ export class ModelRegistry {
 	async #discoverModelsDevProvider(providerConfig: DiscoveryProviderConfig): Promise<Model<Api>[]> {
 		const baseUrl = providerConfig.baseUrl;
 		if (!baseUrl) throw new Error(`Provider "${providerConfig.provider}" requires baseUrl for models.dev discovery.`);
-		const response = await fetch("https://models.dev/api.json", {
-			headers: { Accept: "application/json" },
-			signal: AbortSignal.timeout(5_000),
-		});
-		if (!response.ok) throw new Error(`HTTP ${response.status} from https://models.dev/api.json`);
-		const payload: unknown = await response.json();
+		const payload: unknown = await fetchModelsDevPayload();
 		if (!isRecord(payload)) return [];
 		const catalogProvider = payload[providerConfig.discovery.modelsDevProvider ?? providerConfig.provider];
 		if (!isRecord(catalogProvider) || !isRecord(catalogProvider.models)) return [];
