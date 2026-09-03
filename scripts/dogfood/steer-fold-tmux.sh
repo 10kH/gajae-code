@@ -23,6 +23,8 @@
 # including unhandled failures, by the EXIT trap.
 #
 # Usage: scripts/dogfood/steer-fold-tmux.sh [<gjc binary>] [<out dir>]
+# Env:   GJC_DOGFOOD_MODEL — model passed as --model (default gpt-5.6-sol). The
+#        run must not depend on whatever the user's config default is that day.
 set -euo pipefail
 
 # ---- Phase 0: evidence channel first. Nothing fallible runs before the output
@@ -37,6 +39,7 @@ BIN_SHA256="incomplete"; BIN_SIZE="null"; BIN_POLICY_SEAM_HITS="null"
 SELF="incomplete"; DRIVER_HEAD="incomplete"; BASH_TS_BLOB="incomplete"
 SESSION="gjc-dogfood-$$"; WORK=""
 NONCE="steerack$(printf '%04x' $((RANDOM * RANDOM % 65536)))"
+MODEL="${GJC_DOGFOOD_MODEL:-gpt-5.6-sol}"
 OUTCOME="running"; EXIT_CODE=""; JOB=""; NONCE_STATE="unanswered"
 OWNED_CAPTURES=()
 RECEIPT_FAILED=0
@@ -62,6 +65,7 @@ receipt() {
 	session="$(json_str "$SESSION")" || return 1
 	work="$(json_str "$WORK")" || return 1
 	nonce="$(json_str "$NONCE")" || return 1
+	local model; model="$(json_str "$MODEL")" || return 1
 	outcome="$(json_str "$OUTCOME")" || return 1
 	exit_code="$(json_str "$EXIT_CODE")" || return 1
 	job="$(json_str "$JOB")" || return 1
@@ -71,7 +75,7 @@ receipt() {
 		printf '  "recordedAt": %s,\n' "$recorded_at"
 		printf '  "binary": { "absolutePath": %s, "sha256": %s, "sizeBytes": %s, "toolInterruptPolicySeamHits": %s },\n' "$binary_path" "$binary_sha" "$BIN_SIZE" "$BIN_POLICY_SEAM_HITS"
 		printf '  "driverCheckout": { "path": %s, "repoHead": %s, "bashTsBlob": %s, "note": "state of the checkout that ran the driver; not proof of what source produced the binary" },\n' "$self" "$head" "$blob"
-		printf '  "session": { "tmux": %s, "cwd": %s, "nonce": %s },\n' "$session" "$work" "$nonce"
+		printf '  "session": { "tmux": %s, "cwd": %s, "nonce": %s, "model": %s },\n' "$session" "$work" "$nonce" "$model"
 		printf '  "outcome": %s, "exitCode": %s, "jobId": %s, "steerAnswered": %s,\n' "$outcome" "$exit_code" "$job" "$answered"
 		printf '  "captures": [%s]\n}\n' "$caps"
 	} > "$tmp" || return 1
@@ -160,7 +164,7 @@ wait_for() { # <pattern> <timeout-seconds> <label>
 cd "$WORK"
 git init -q .
 checkpoint
-tmux new-session -d -s "$SESSION" -x 140 -y 45 "$BIN"
+tmux new-session -d -s "$SESSION" -x 140 -y 45 "$BIN --model $MODEL"
 wait_for 'ready' 60 composer-ready
 sleep 3
 
