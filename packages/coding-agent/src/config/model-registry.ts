@@ -2801,6 +2801,8 @@ export class ModelRegistry {
 			const autoDiscovery: ProviderDiscovery | undefined =
 				!providerConfig.discovery &&
 				!localOpenAICompat &&
+				providerName !== "vllm" &&
+				providerName !== "sglang" &&
 				providerApi !== undefined &&
 				isOpenAIFamilyApi(providerApi) &&
 				effectiveDiscoveryBaseUrl !== undefined
