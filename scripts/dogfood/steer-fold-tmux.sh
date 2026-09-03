@@ -25,21 +25,91 @@
 # Usage: scripts/dogfood/steer-fold-tmux.sh [<gjc binary>] [<out dir>]
 set -euo pipefail
 
-BIN="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${1:-$PWD/packages/coding-agent/dist/gjc}")"
-[ -x "$BIN" ] || { echo "not an executable: $BIN" >&2; exit 64; }
+# ---- Phase 0: evidence channel first. Nothing fallible runs before the output
+# directory is owned, prior evidence is purged, receipt fields have explicit
+# incomplete values, and the EXIT finalizer is armed.
 OUT="${2:-$PWD/artifacts/steer-fold/dogfood}"
 mkdir -p "$OUT"
 OUT="$(cd "$OUT" && pwd)"
-SESSION="gjc-dogfood-$$"
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/gjc-dogfood.XXXXXX")"
+rm -f "$OUT"/*.ansi "$OUT"/*.txt "$OUT"/receipt.json
+BIN="${1:-$PWD/packages/coding-agent/dist/gjc}"
+BIN_SHA256="incomplete"; BIN_SIZE="null"; BIN_POLICY_SEAM_HITS="null"
+SELF="incomplete"; DRIVER_HEAD="incomplete"; BASH_TS_BLOB="incomplete"
+SESSION="gjc-dogfood-$$"; WORK=""
 NONCE="steerack$(printf '%04x' $((RANDOM * RANDOM % 65536)))"
+OUTCOME="running"; EXIT_CODE=""; JOB=""; NONCE_STATE="unanswered"
+OWNED_CAPTURES=()
+RECEIPT_FAILED=0
+# Dedicated exit code: the behavioral run may have passed but its evidence
+# could not be persisted, which is a distinct, reportable failure.
+EXIT_RECEIPT_UNPERSISTED=75
 
-pane() { tmux capture-pane -t "$SESSION" -p -S -400; }
+json_str() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"; }
 
+# Writes the receipt atomically. Returns non-zero on ANY encoding, write, or
+# rename failure so callers (and finalize) can refuse to report success
+# without durable evidence.
+receipt() {
+	local caps="" c tmp="$OUT/.receipt.json.$$"
+	for c in "${OWNED_CAPTURES[@]+"${OWNED_CAPTURES[@]}"}"; do caps="${caps:+$caps,}$(json_str "$c")" || return 1; done
+	local recorded_at binary_path binary_sha self head blob session work nonce outcome exit_code job answered
+	recorded_at="$(json_str "$(date -u +%Y-%m-%dT%H:%M:%SZ)")" || return 1
+	binary_path="$(json_str "$BIN")" || return 1
+	binary_sha="$(json_str "$BIN_SHA256")" || return 1
+	self="$(json_str "$SELF")" || return 1
+	head="$(json_str "$DRIVER_HEAD")" || return 1
+	blob="$(json_str "$BASH_TS_BLOB")" || return 1
+	session="$(json_str "$SESSION")" || return 1
+	work="$(json_str "$WORK")" || return 1
+	nonce="$(json_str "$NONCE")" || return 1
+	outcome="$(json_str "$OUTCOME")" || return 1
+	exit_code="$(json_str "$EXIT_CODE")" || return 1
+	job="$(json_str "$JOB")" || return 1
+	answered="$(json_str "$NONCE_STATE")" || return 1
+	{
+		printf '{\n  "schemaVersion": 1,\n  "kind": "steer-fold-tmux-dogfood",\n'
+		printf '  "recordedAt": %s,\n' "$recorded_at"
+		printf '  "binary": { "absolutePath": %s, "sha256": %s, "sizeBytes": %s, "toolInterruptPolicySeamHits": %s },\n' "$binary_path" "$binary_sha" "$BIN_SIZE" "$BIN_POLICY_SEAM_HITS"
+		printf '  "driverCheckout": { "path": %s, "repoHead": %s, "bashTsBlob": %s, "note": "state of the checkout that ran the driver; not proof of what source produced the binary" },\n' "$self" "$head" "$blob"
+		printf '  "session": { "tmux": %s, "cwd": %s, "nonce": %s },\n' "$session" "$work" "$nonce"
+		printf '  "outcome": %s, "exitCode": %s, "jobId": %s, "steerAnswered": %s,\n' "$outcome" "$exit_code" "$job" "$answered"
+		printf '  "captures": [%s]\n}\n' "$caps"
+	} > "$tmp" || return 1
+	python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$tmp" || { rm -f "$tmp"; return 1; }
+	mv -f "$tmp" "$OUT/receipt.json" || return 1
+}
+
+# Best-effort wrapper for non-terminal checkpoints: remembers a failure so the
+# final exit can refuse to claim success without durable evidence.
+checkpoint() { receipt || { RECEIPT_FAILED=1; echo "warn: receipt checkpoint failed" >&2; }; }
+
+finalize() {
+	local rc=$?
+	# An exit that did not pass through fail()/PASS is an unhandled failure.
+	if [ "$OUTCOME" = "running" ]; then OUTCOME="fail:unhandled"; EXIT_CODE="$rc"; fi
+	[ -n "$EXIT_CODE" ] || EXIT_CODE="$rc"
+	if ! receipt || [ "$RECEIPT_FAILED" = 1 ]; then
+		echo "FAIL: receipt could not be persisted; evidence for this run is not durable" >&2
+		# A behavioral success without durable evidence is not a success.
+		(( rc != 0 )) || rc=$EXIT_RECEIPT_UNPERSISTED
+	fi
+	tmux kill-session -t "$SESSION" 2>/dev/null || echo "warn: tmux session $SESSION already gone" >&2
+	sleep 1
+	[ -z "$WORK" ] || rm -rf "$WORK" 2>/dev/null || echo "warn: could not remove $WORK" >&2
+	exit "$rc"
+}
+trap finalize EXIT
+receipt   # initial receipt: outcome=running, provenance=incomplete
+
+# ---- Phase 1: provenance. Every failure below now lands in finalize with the
+# incomplete fields still visible in the receipt.
+BIN="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$BIN")"
+[ -x "$BIN" ] || { echo "not an executable: $BIN" >&2; exit 64; }
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/gjc-dogfood.XXXXXX")"
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 REPO="$(cd "$(dirname "$SELF")/../.." && pwd)"
 BIN_SHA256="$(shasum -a 256 "$BIN" | cut -d' ' -f1)"
-BIN_SIZE="$(stat -f %z "$BIN" 2>/dev/null || stat -c %s "$BIN")"
+BIN_SIZE="$(python3 -c 'import os,sys; print(os.path.getsize(sys.argv[1]))' "$BIN")"
 DRIVER_HEAD="$(git -C "$REPO" rev-parse HEAD)"
 BASH_TS_BLOB="$(git -C "$REPO" rev-parse "HEAD:packages/coding-agent/src/tools/bash.ts")"
 # Observed discriminator for THIS lineage only: the fix removed two
@@ -47,26 +117,8 @@ BASH_TS_BLOB="$(git -C "$REPO" rev-parse "HEAD:packages/coding-agent/src/tools/b
 # has fewer matching lines than a pre-fix build of the same base (2 vs 4).
 # grep exit 1 is "no match" (a legitimate 0); anything >1 is a real error.
 BIN_POLICY_SEAM_HITS="$(grep -c -a 'getToolInterruptPolicy' "$BIN")" || { rc=$?; (( rc == 1 )) || { echo "grep failed on $BIN (rc=$rc)" >&2; exit 70; }; BIN_POLICY_SEAM_HITS=0; }
-OUTCOME="running"; EXIT_CODE=""; JOB=""; NONCE_STATE="unanswered"
-OWNED_CAPTURES=()
 
-json_str() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"; }
-
-receipt() { # writes the receipt atomically with the current state; never fails the run
-	local caps="" c
-	for c in "${OWNED_CAPTURES[@]+"${OWNED_CAPTURES[@]}"}"; do caps="${caps:+$caps,}$(json_str "$c")"; done
-	local tmp="$OUT/.receipt.json.$$"
-	{
-		printf '{\n'
-		printf '  "schemaVersion": 1,\n  "kind": "steer-fold-tmux-dogfood",\n'
-		printf '  "recordedAt": %s,\n' "$(json_str "$(date -u +%Y-%m-%dT%H:%M:%SZ)")"
-		printf '  "binary": { "absolutePath": %s, "sha256": %s, "sizeBytes": %s, "toolInterruptPolicySeamHits": %s },\n' "$(json_str "$BIN")" "$(json_str "$BIN_SHA256")" "$BIN_SIZE" "$BIN_POLICY_SEAM_HITS"
-		printf '  "driverCheckout": { "path": %s, "repoHead": %s, "bashTsBlob": %s, "note": "state of the checkout that ran the driver; not proof of what source produced the binary" },\n' "$(json_str "$SELF")" "$(json_str "$DRIVER_HEAD")" "$(json_str "$BASH_TS_BLOB")"
-		printf '  "session": { "tmux": %s, "cwd": %s, "nonce": %s },\n' "$(json_str "$SESSION")" "$(json_str "$WORK")" "$(json_str "$NONCE")"
-		printf '  "outcome": %s, "exitCode": %s, "jobId": %s, "steerAnswered": %s,\n' "$(json_str "$OUTCOME")" "$(json_str "$EXIT_CODE")" "$(json_str "$JOB")" "$(json_str "$NONCE_STATE")"
-		printf '  "captures": [%s]\n}\n' "$caps"
-	} > "$tmp" 2>/dev/null && mv -f "$tmp" "$OUT/receipt.json" 2>/dev/null || echo "warn: could not write receipt" >&2
-}
+pane() { tmux capture-pane -t "$SESSION" -p -S -400; }
 
 capture() {
 	# Keep escape sequences: the ultragoal PTY gate needs terminal control codes.
@@ -77,9 +129,9 @@ capture() {
 
 fail() { # <code> <label> <message>
 	# Record the failure state FIRST so the receipt is right even if the pane is gone.
-	OUTCOME="fail:$2"; EXIT_CODE="$1"; receipt
+	OUTCOME="fail:$2"; EXIT_CODE="$1"; checkpoint
 	capture "fail-$2" 2>/dev/null || echo "warn: could not capture pane for $2" >&2
-	receipt
+	checkpoint
 	echo "FAIL: $3" >&2
 	exit "$1"
 }
@@ -93,24 +145,9 @@ wait_for() { # <pattern> <timeout-seconds> <label>
 	done
 }
 
-finalize() {
-	local rc=$?
-	# An exit that did not pass through fail()/PASS is an unhandled failure.
-	if [ "$OUTCOME" = "running" ]; then OUTCOME="fail:unhandled"; EXIT_CODE="$rc"; fi
-	[ -n "$EXIT_CODE" ] || EXIT_CODE="$rc"
-	receipt
-	tmux kill-session -t "$SESSION" 2>/dev/null || echo "warn: tmux session $SESSION already gone" >&2
-	sleep 1
-	rm -rf "$WORK" 2>/dev/null || echo "warn: could not remove $WORK" >&2
-	exit "$rc"
-}
-trap finalize EXIT
-
-# A reused output directory must not lend a previous run's captures to this one.
-rm -f "$OUT"/*.ansi "$OUT"/*.txt "$OUT"/receipt.json
 cd "$WORK"
 git init -q .
-receipt
+checkpoint
 tmux new-session -d -s "$SESSION" -x 140 -y 45 "$BIN"
 wait_for 'ready' 60 composer-ready
 sleep 3
@@ -139,7 +176,7 @@ capture 2-steer-sent
 wait_for 'Folded into background job bg_[0-9]+ because a user steer arrived' 30 folded
 JOB="$(pane | grep -oE 'Folded into background job bg_[0-9]+' | head -1 | grep -oE 'bg_[0-9]+')"
 [ -n "$JOB" ] || fail 2 no-job-id "fold line present but no job id"
-capture 3-folded; receipt
+capture 3-folded; checkpoint
 if pane | grep -q "Tool execution was aborted"; then fail 3 aborted "bash was aborted"; fi
 
 # The running-job indicator must be VISIBLE (the job is alive after the fold)…
@@ -152,7 +189,7 @@ while (( $(pane | grep -c "$NONCE") < 2 )); do
 	if (( $(date +%s) > deadline )); then fail 4 steer-unanswered "model never repeated nonce $NONCE"; fi
 	sleep 1
 done
-NONCE_STATE="answered"; capture 4-steer-answered; receipt
+NONCE_STATE="answered"; capture 4-steer-answered; checkpoint
 if pane | grep -q "Tool execution was aborted"; then fail 3 aborted-late "bash was aborted after the steer"; fi
 
 # Wake: the SAME job's completion receipt, then the indicator absent.
@@ -166,6 +203,6 @@ sleep 4
 capture 5-job-finished
 if pane | grep -q "Tool execution was aborted"; then fail 3 aborted-final "abort text present at the end"; fi
 
-OUTCOME="pass"; EXIT_CODE=0; receipt
+OUTCOME="pass"; EXIT_CODE=0; receipt || exit $EXIT_RECEIPT_UNPERSISTED
 echo "PASS: fold=$JOB, no abort, steer answered (nonce $NONCE), $JOB completed and indicator cleared" >&2
 echo "$OUT"
