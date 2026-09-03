@@ -2197,7 +2197,7 @@ describe("signed model preset registry", () => {
 			accept(data, second, registryFetch(second), { now, maxStateBytes: secondStateBytes + 1 }),
 		).resolves.toMatchObject({ status: "updated", revision: 2 });
 	});
-	test("reuses the verified read while unchanged and re-reads after every durable state change", async () => {
+	test("reuses verification while unchanged without exposing mutable cached contents", async () => {
 		const data = await fixture();
 		const first = signedRegistry(data.privateKey, 1, [registryProfile("first-profile")]);
 		await accept(data, first, registryFetch(first));
@@ -2205,7 +2205,10 @@ describe("signed model preset registry", () => {
 		const initial = loadAcceptedModelPresetRegistry(data.agentDir);
 		expect(initial.revision).toBe(1);
 		expect(initial.profiles.has("first-profile")).toBe(true);
-		expect(loadAcceptedModelPresetRegistry(data.agentDir)).toBe(initial);
+		initial.profiles.clear();
+		initial.presets.length = 0;
+		expect(loadAcceptedModelPresetRegistry(data.agentDir).profiles.has("first-profile")).toBe(true);
+		expect(loadAcceptedModelPresetRegistry(data.agentDir).presets).not.toHaveLength(0);
 
 		const second = signedRegistry(data.privateKey, 2, [registryProfile("second-profile")]);
 		await accept(data, second, registryFetch(second));

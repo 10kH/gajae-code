@@ -1559,6 +1559,19 @@ function acceptedRegistryFromState(
  */
 const acceptedRegistryReadCache = new Map<string, { fingerprint: string; value: AcceptedModelPresetRegistry }>();
 
+function cloneAcceptedModelPresetRegistry(value: AcceptedModelPresetRegistry): AcceptedModelPresetRegistry {
+	return {
+		...value,
+		profiles: new Map(
+			[...value.profiles].map(([id, profile]) => [id, structuredClone(profile)] as [string, ModelProfileDefinition]),
+		),
+		presets: structuredClone(value.presets),
+		dynamicProviders: [...value.dynamicProviders],
+		retainedProfiles: [...value.retainedProfiles],
+		retainedPresets: [...value.retainedPresets],
+	};
+}
+
 function registryFileFingerprint(file: string): string {
 	try {
 		return sha256(fsSync.readFileSync(file));
@@ -1610,10 +1623,12 @@ export function loadAcceptedModelPresetRegistry(
 		return loadAcceptedModelPresetRegistryUncached(agentDir, dependencies);
 	const fingerprint = acceptedRegistryFingerprint(agentDir, dependencies);
 	const cached = acceptedRegistryReadCache.get(agentDir);
-	if (cached && cached.fingerprint === fingerprint) return cached.value;
+	if (cached && cached.fingerprint === fingerprint) return cloneAcceptedModelPresetRegistry(cached.value);
 	const value = loadAcceptedModelPresetRegistryUncached(agentDir, dependencies);
+	const verifiedFingerprint = acceptedRegistryFingerprint(agentDir, dependencies);
+	if (verifiedFingerprint !== fingerprint) return loadAcceptedModelPresetRegistryUncached(agentDir, dependencies);
 	acceptedRegistryReadCache.set(agentDir, { fingerprint, value });
-	return value;
+	return cloneAcceptedModelPresetRegistry(value);
 }
 
 function loadAcceptedModelPresetRegistryUncached(
@@ -1684,10 +1699,12 @@ export async function loadAcceptedModelPresetRegistryAsync(
 		return loadAcceptedModelPresetRegistryAsyncUncached(agentDir, dependencies);
 	const fingerprint = await acceptedRegistryFingerprintAsync(agentDir, dependencies);
 	const cached = acceptedRegistryReadCache.get(agentDir);
-	if (cached && cached.fingerprint === fingerprint) return cached.value;
+	if (cached && cached.fingerprint === fingerprint) return cloneAcceptedModelPresetRegistry(cached.value);
 	const value = await loadAcceptedModelPresetRegistryAsyncUncached(agentDir, dependencies);
+	const verifiedFingerprint = await acceptedRegistryFingerprintAsync(agentDir, dependencies);
+	if (verifiedFingerprint !== fingerprint) return loadAcceptedModelPresetRegistryAsyncUncached(agentDir, dependencies);
 	acceptedRegistryReadCache.set(agentDir, { fingerprint, value });
-	return value;
+	return cloneAcceptedModelPresetRegistry(value);
 }
 
 async function loadAcceptedModelPresetRegistryAsyncUncached(

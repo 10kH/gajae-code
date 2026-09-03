@@ -77,6 +77,7 @@ export async function fetchModelsDevPayload(fetchImpl: typeof fetch = fetch): Pr
 		const response = await fetchImpl(MODELS_DEV_URL, {
 			method: "GET",
 			headers: { Accept: "application/json" },
+			signal: AbortSignal.timeout(5_000),
 		});
 		if (!response.ok) {
 			throw new Error(`models.dev fetch failed: ${response.status}`);
