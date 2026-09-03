@@ -1699,9 +1699,13 @@ export class AcpAgent implements Agent {
 		try {
 			await record.adapter.ensureProviders();
 		} catch (error) {
-			if (waiter.settled || record.cancelRequested || record.activePrompt !== waiter) {
+			if (waiter.settled || record.activePrompt !== waiter) {
 				this.#retiredPromptAcknowledgements.delete(params.sessionId);
-				if (!waiter.settled) await this.#settleCancelledPrompt(params.sessionId, record, waiter);
+				return await response;
+			}
+			if (record.cancelRequested && waiter.cancelAcknowledged) {
+				this.#retiredPromptAcknowledgements.delete(params.sessionId);
+				await this.#settleCancelledPrompt(params.sessionId, record, waiter);
 				return await response;
 			}
 			if (record.activePrompt === waiter) {
@@ -1712,9 +1716,13 @@ export class AcpAgent implements Agent {
 			}
 			throw error;
 		}
-		if (waiter.settled || record.cancelRequested || record.activePrompt !== waiter) {
+		if (waiter.settled || record.activePrompt !== waiter) {
 			this.#retiredPromptAcknowledgements.delete(params.sessionId);
-			if (!waiter.settled) await this.#settleCancelledPrompt(params.sessionId, record, waiter);
+			return await response;
+		}
+		if (record.cancelRequested && waiter.cancelAcknowledged) {
+			this.#retiredPromptAcknowledgements.delete(params.sessionId);
+			await this.#settleCancelledPrompt(params.sessionId, record, waiter);
 			return await response;
 		}
 
@@ -1739,8 +1747,11 @@ export class AcpAgent implements Agent {
 			);
 		}
 		waiter.dispatched = true;
-		if (waiter.settled || record.cancelRequested || record.activePrompt !== waiter) {
-			if (!waiter.settled) await this.#settleCancelledPrompt(params.sessionId, record, waiter);
+		if (waiter.settled || record.activePrompt !== waiter) {
+			return await response;
+		}
+		if (record.cancelRequested && waiter.cancelAcknowledged) {
+			await this.#settleCancelledPrompt(params.sessionId, record, waiter);
 			return await response;
 		}
 
@@ -1922,7 +1933,7 @@ export class AcpAgent implements Agent {
 			// return the semantically meaningful `cancelled` stop reason, so that Clients
 			// can reliably confirm the cancellation." Surfacing the transport's `busy`
 			// rejection instead would show the user a spurious error for their own cancel.
-			if (record.cancelRequested) {
+			if (record.cancelRequested && waiter.cancelAcknowledged) {
 				record.cancelRequested = false;
 				// The client's turn is settled by the return; the advisory idle publication
 				// must not gate it and must still be attempted so the running phase is
@@ -2006,11 +2017,6 @@ export class AcpAgent implements Agent {
 			}
 			waiter?.cancelAttemptResolve?.(true);
 		} catch (error) {
-			if (waiter && !waiter.dispatched) {
-				await this.#settleCancelledPrompt(params.sessionId, record, waiter);
-				waiter.cancelAttemptResolve?.(true);
-				return;
-			}
 			if (!waiter) record.cancelRequested = false;
 			// Only the LAST in-flight attempt resolves the shared promise false;
 			// an earlier attempt may still acknowledge (review thread P2). After
@@ -2058,7 +2064,8 @@ export class AcpAgent implements Agent {
 
 	async #settleCancelledPrompt(id: string, record: SessionRecord, waiter: PromptWaiter): Promise<void> {
 		// The authoritative terminal wins whenever it arrives in time; this only runs
-		// when nothing settled the prompt the client already asked to cancel.
+		// when nothing settled the prompt after the SDK acknowledged the cancellation.
+		if (!waiter.cancelAcknowledged) return;
 		if (this.#sessions.get(id) !== record || record.activePrompt !== waiter || waiter.settled) return;
 		if (waiter.terminalReserved) return;
 		record.activePrompt = undefined;
@@ -2896,6 +2903,14 @@ export class AcpAgent implements Agent {
 			if (reconnected) {
 				const waiter = record.activePrompt;
 				if (waiter && !waiter.settled && !waiter.terminal) {
+					// A successful abort acknowledgement is authoritative for this prompt even
+					// when the SDK transport changes identity during the cancellation grace.
+					// Treating the reconnect as owner loss would replace the acknowledged
+					// cancellation with connection_closed and leave cancellation nondeterministic.
+					if (record.cancelRequested && waiter.cancelAcknowledged) {
+						await this.#settleCancelledPrompt(id, record, waiter);
+						return;
+					}
 					record.activePrompt = undefined;
 					record.busy = record.backgroundBusy;
 					clearPromptWatchdog(waiter);

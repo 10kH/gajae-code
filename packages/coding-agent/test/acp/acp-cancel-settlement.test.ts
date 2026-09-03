@@ -3,6 +3,7 @@ import * as path from "node:path";
 import type { AgentSideConnection, PromptRequest, SessionNotification } from "@agentclientprotocol/sdk";
 import { logger, TempDir } from "@gajae-code/utils";
 import { AcpAgent } from "../../src/modes/acp/acp-agent";
+import { AcpSdkAdapter } from "../../src/sdk/acp/adapter";
 import { writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
 import {
 	type ExactSessionAuthorityFixture,
@@ -21,6 +22,8 @@ type Fixture = {
 	sessionId: string;
 	updates: SessionNotification[];
 	promptDelivered: Promise<void>;
+	abortDelivered: Promise<void>;
+	promptDeliveryCount(): number;
 	sendStopped(reason: StoppedReason): void;
 	sendFailed(code: string): void;
 	sendToolStart(toolCallId: string): void;
@@ -80,7 +83,9 @@ export function createFixture(
 	options: {
 		cancelSettlementGraceMs?: number;
 		deferPromptAcknowledgement?: boolean;
-		abortAcknowledgement?: Record<string, unknown>;
+		abortAcknowledgement?:
+			| Record<string, unknown>
+			| (() => Record<string, unknown> | Promise<Record<string, unknown>>);
 	} = {},
 ): Promise<Fixture> {
 	return (async () => {
@@ -89,18 +94,22 @@ export function createFixture(
 		const cwd = path.join(tempDir.path(), "workspace");
 		const token = "acp-cancel-settlement-token";
 		const sessionId = "cancel-settlement-session";
-		const commandId = "cancel-settlement-command";
-		const turnId = "cancel-settlement-turn";
 		const updates: SessionNotification[] = [];
 		const queryCalls: string[] = [];
 		const delivered = Promise.withResolvers<void>();
+		const abortDelivered = Promise.withResolvers<void>();
 		const abort = new AbortController();
 		let promptSocket: TestSocket | undefined;
 		let server!: ReturnType<typeof Bun.serve>;
 		let pendingPromptAck: { socket: TestSocket; id: unknown } | undefined;
 		let deferredPromptAckUsed = false;
 		let hangUpdates = false;
+		let promptNumber = 0;
 		const releaseHang = Promise.withResolvers<void>();
+		const activeCorrelation = () => ({
+			commandId: `cancel-settlement-command-${promptNumber}`,
+			turnId: `cancel-settlement-turn-${promptNumber}`,
+		});
 
 		const send = (frame: Record<string, unknown>): void => {
 			if (!promptSocket) throw new Error("Expected prompt socket");
@@ -108,20 +117,20 @@ export function createFixture(
 		};
 		const sendTerminal = (frame: Record<string, unknown>): void => send(frame);
 		const sendStopped = (reason: StoppedReason): void => {
+			const correlation = activeCorrelation();
 			send({
 				type: "agent_end",
 				sessionId,
-				commandId,
-				turnId,
+				...correlation,
 				outcome: { kind: "stopped", reason, provenance: reason === "cancelled" ? "client_cancel" : "agent" },
 			});
 		};
 		const sendFailed = (code: string): void => {
+			const correlation = activeCorrelation();
 			send({
 				type: "agent_failed",
 				sessionId,
-				commandId,
-				turnId,
+				...correlation,
 				outcome: {
 					kind: "failed",
 					code,
@@ -131,12 +140,12 @@ export function createFixture(
 			});
 		};
 		const sendToolStart = (toolCallId: string): void => {
+			const correlation = activeCorrelation();
 			send({
 				type: "event",
 				kind: "tool_execution_start",
 				sessionId,
-				commandId,
-				turnId,
+				...correlation,
 				payload: {
 					event_type: "tool_execution_start",
 					event: {
@@ -149,12 +158,12 @@ export function createFixture(
 			});
 		};
 		const sendToolEnd = (toolCallId: string): void => {
+			const correlation = activeCorrelation();
 			send({
 				type: "event",
 				kind: "tool_execution_end",
 				sessionId,
-				commandId,
-				turnId,
+				...correlation,
 				payload: {
 					event_type: "tool_execution_end",
 					event: {
@@ -181,7 +190,7 @@ export function createFixture(
 				open(socket) {
 					socket.send(JSON.stringify({ type: "hello", connectionId: "acp-cancel-settlement" }));
 				},
-				message(socket, raw) {
+				async message(socket, raw) {
 					const frame = JSON.parse(String(raw)) as Record<string, unknown>;
 					if (frame.type === "register_provider") {
 						socket.send(
@@ -216,6 +225,7 @@ export function createFixture(
 					if (frame.type !== "control_request") return;
 					if (frame.operation === "turn.prompt") {
 						promptSocket = socket;
+						promptNumber++;
 						delivered.resolve();
 						if (options.deferPromptAcknowledgement && !deferredPromptAckUsed) {
 							deferredPromptAckUsed = true;
@@ -223,6 +233,12 @@ export function createFixture(
 							return;
 						}
 					}
+					if (frame.operation === "turn.abort") abortDelivered.resolve();
+					const correlation = activeCorrelation();
+					const abortAcknowledgement =
+						frame.operation === "turn.abort" && typeof options.abortAcknowledgement === "function"
+							? await options.abortAcknowledgement()
+							: options.abortAcknowledgement;
 					socket.send(
 						JSON.stringify({
 							type: "control_response",
@@ -230,9 +246,9 @@ export function createFixture(
 							ok: true,
 							result:
 								frame.operation === "turn.prompt"
-									? { commandId, turnId, accepted: true }
+									? { ...correlation, accepted: true }
 									: frame.operation === "turn.abort"
-										? (options.abortAcknowledgement ??
+										? (abortAcknowledgement ??
 											(() => {
 												const scope =
 													(frame.input as { scope?: string })?.scope === "owned" ? "owned" : "turn";
@@ -250,7 +266,7 @@ export function createFixture(
 					);
 					if (frame.operation === "turn.prompt" && !options.deferPromptAcknowledgement) {
 						// The host starts the turn; the client observes the working phase.
-						socket.send(JSON.stringify({ type: "agent_start", sessionId, commandId, turnId }));
+						socket.send(JSON.stringify({ type: "agent_start", sessionId, ...correlation }));
 					}
 				},
 			},
@@ -302,6 +318,8 @@ export function createFixture(
 			sessionId: created.sessionId,
 			updates,
 			promptDelivered: delivered.promise,
+			abortDelivered: abortDelivered.promise,
+			promptDeliveryCount: () => promptNumber,
 			sendStopped,
 			sendFailed,
 			sendToolStart,
@@ -375,7 +393,7 @@ test("cancel ACK with a suppressed terminal settles the prompt exactly once as c
 		);
 		// The next prompt must be accepted, not refused with `conflict`.
 		const next = prompt(fixture, "prompt after cancel");
-		await bounded(fixture.promptDelivered, "second prompt delivery");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "second prompt delivery");
 		fixture.sendStopped("end_turn");
 		expect(await bounded(next, "prompt after cancel")).toEqual({ stopReason: "end_turn" });
 		const idleBeforeSecond = idlePhaseUpdates(fixture.updates);
@@ -398,6 +416,7 @@ test("a late terminal after cancelled settlement stays closed and cannot double-
 		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "cancel acknowledgement");
 		expect(await bounded(pending, "cancelled settlement")).toEqual({ stopReason: "cancelled" });
 		expect(settleCount).toBe(1);
+		await waitFor(() => idlePhaseUpdates(fixture.updates) > 1, "cancelled idle publication");
 		const updatesAfterSettlement = fixture.updates.length;
 		const queriesAfterSettlement = fixture.queryCalls.length;
 		// The aborted run's terminal arrives after the grace: it must stay closed.
@@ -434,10 +453,134 @@ test("an SDK transport identity change around cancellation settlement does not l
 		expect(settled).toEqual({ stopReason: "cancelled" });
 		// The turn is over; a follow-up prompt must be accepted.
 		const next = prompt(fixture, "prompt after reconnect");
-		await bounded(fixture.promptDelivered, "second prompt delivery");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "second prompt delivery");
 		fixture.sendStopped("end_turn");
 		expect(await bounded(next, "prompt after reconnect")).toEqual({ stopReason: "end_turn" });
 	} finally {
+		fixture.dispose();
+	}
+});
+
+test("a reconnect before abort acknowledgement does not report the prompt as cancelled", async () => {
+	const abortGate = Promise.withResolvers<void>();
+	const fixture = await createFixture({
+		cancelSettlementGraceMs: 5_000,
+		abortAcknowledgement: async () => {
+			await abortGate.promise;
+			return { aborted: true };
+		},
+	});
+	try {
+		let settleCount = 0;
+		const pending = prompt(fixture, "reconnect before abort acknowledgement").then(
+			resolved => {
+				settleCount++;
+				return { resolved };
+			},
+			(error: unknown) => {
+				settleCount++;
+				return { rejected: error as { code?: string } };
+			},
+		);
+		await bounded(fixture.promptDelivered, "prompt delivery");
+		const cancel = fixture.agent.cancel({ sessionId: fixture.sessionId }).catch(() => undefined);
+		await bounded(fixture.abortDelivered, "abort delivery");
+		fixture.reconnect();
+		const promptOutcome = await bounded(pending, "connection-closed before abort acknowledgement");
+		expect(promptOutcome).toEqual({
+			rejected: expect.objectContaining({ code: "connection_closed" }),
+		});
+		expect(settleCount).toBe(1);
+		abortGate.resolve();
+		await bounded(cancel, "abort completion");
+		expect(settleCount).toBe(1);
+		expect(await bounded(pending, "retired prompt after late abort acknowledgement")).toEqual(promptOutcome);
+	} finally {
+		abortGate.resolve();
+		fixture.dispose();
+	}
+});
+
+test("a reconnect before a failed abort does not leave the prompt cancelled", async () => {
+	const abortGate = Promise.withResolvers<void>();
+	const fixture = await createFixture({
+		cancelSettlementGraceMs: 5_000,
+		abortAcknowledgement: async () => {
+			await abortGate.promise;
+			return { turn: "no_active_turn", terminal: "terminal_no_effect" };
+		},
+	});
+	try {
+		let settleCount = 0;
+		const pending = prompt(fixture, "reconnect before failed abort").then(
+			resolved => {
+				settleCount++;
+				return { resolved };
+			},
+			(error: unknown) => {
+				settleCount++;
+				return { rejected: error as { code?: string } };
+			},
+		);
+		await bounded(fixture.promptDelivered, "prompt delivery");
+		const cancel = fixture.agent.cancel({ sessionId: fixture.sessionId });
+		const cancelOutcome = cancel.then(
+			() => ({ resolved: true }),
+			(error: unknown) => ({ rejected: error as { code?: string } }),
+		);
+		await bounded(fixture.abortDelivered, "abort delivery");
+		fixture.reconnect();
+		const promptOutcome = await bounded(pending, "connection-closed before failed abort acknowledgement");
+		expect(promptOutcome).toEqual({
+			rejected: expect.objectContaining({ code: "connection_closed" }),
+		});
+		expect(settleCount).toBe(1);
+		abortGate.resolve();
+		const abortOutcome = await bounded(cancelOutcome, "failed abort result");
+		if (!("rejected" in abortOutcome)) throw new Error("Expected abort failure");
+		expect(
+			abortOutcome.rejected.code === "abort_unacknowledged" || abortOutcome.rejected.code === "uncertain_after_send",
+		).toBe(true);
+		expect(settleCount).toBe(1);
+		expect(await bounded(pending, "retired prompt after failed abort acknowledgement")).toEqual(promptOutcome);
+		// The synthetic hello invalidates the old Router attachment; allow its bounded
+		// reconciliation to publish the successor before sending the follow-up prompt.
+		await Bun.sleep(2_500);
+		const next = prompt(fixture, "prompt after failed abort reconnect");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "prompt after failed abort reconnect");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(next, "prompt after failed abort reconnect completion")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		abortGate.resolve();
+		fixture.dispose();
+	}
+});
+
+test("a failed abort during provider preflight leaves the prompt recoverable", async () => {
+	const fixture = await createFixture({
+		abortAcknowledgement: { turn: "no_active_turn", terminal: "terminal_no_effect" },
+	});
+	const providerPreflight = Promise.withResolvers<void>();
+	const releaseProviderPreflight = Promise.withResolvers<void>();
+	const ensureProviders = vi.spyOn(AcpSdkAdapter.prototype, "ensureProviders").mockImplementation(async () => {
+		providerPreflight.resolve();
+		await releaseProviderPreflight.promise;
+	});
+	try {
+		const pending = prompt(fixture, "abort during provider preflight");
+		await bounded(providerPreflight.promise, "provider preflight");
+		await expect(fixture.agent.cancel({ sessionId: fixture.sessionId })).rejects.toMatchObject({
+			code: "abort_unacknowledged",
+		});
+		releaseProviderPreflight.resolve();
+		await bounded(fixture.promptDelivered, "prompt delivery after failed preflight abort");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(pending, "prompt recovery after failed preflight abort")).toEqual({
+			stopReason: "end_turn",
+		});
+	} finally {
+		releaseProviderPreflight.resolve();
+		ensureProviders.mockRestore();
 		fixture.dispose();
 	}
 });
@@ -464,7 +607,7 @@ test("a prompt acknowledgement rejected mid-cancel still settles the prompt exac
 			"catch-path cancelled idle with gjcRunning false",
 		);
 		const next = prompt(fixture, "prompt after rejected ack");
-		await bounded(fixture.promptDelivered, "second prompt delivery");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "second prompt delivery");
 		fixture.sendStopped("end_turn");
 		expect(await bounded(next, "prompt after rejected ack")).toEqual({ stopReason: "end_turn" });
 	} finally {
@@ -495,7 +638,7 @@ test("a wedged ACP transport cannot hold the acknowledged cancel settlement host
 		fixture.releaseSessionUpdates();
 		await waitFor(() => idleWithGjcRunningFalse(fixture.updates) >= 1, "released idle after wedged cancel");
 		const next = prompt(fixture, "prompt after wedged transport");
-		await bounded(fixture.promptDelivered, "second prompt delivery");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "second prompt delivery");
 		fixture.sendStopped("end_turn");
 		expect(await bounded(next, "prompt after wedged transport")).toEqual({ stopReason: "end_turn" });
 	} finally {
@@ -520,7 +663,7 @@ test("idle is emitted exactly once for a cancelled settlement and stays consiste
 				(update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase === "working",
 		).length;
 		const next = prompt(fixture, "idle consistency next turn");
-		await bounded(fixture.promptDelivered, "second prompt delivery");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "second prompt delivery");
 		// The host reports the new turn as working.
 		await waitFor(
 			() =>
