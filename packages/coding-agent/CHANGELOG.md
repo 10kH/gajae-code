@@ -65,6 +65,8 @@
 
 ### Fixed
 
+- The shipped pirate extension example now appends its instructions through the supported `systemPrompt` result, and unsupported `before_agent_start` result fields emit a bounded diagnostic instead of being silently ignored.
+
 - File locks now use a descriptor-relative exclusive directory-publication fallback
 	when a filesystem returns `EINVAL` for `renameat2(RENAME_NOREPLACE)` (for example
 	WSL2 DrvFs), so `edit` and terminal persistence no longer surface `Failed to publish

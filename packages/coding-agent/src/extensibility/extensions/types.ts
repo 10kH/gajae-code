@@ -1106,7 +1106,7 @@ export type { ToolResultEventResult } from "../shared-events";
 
 export interface BeforeAgentStartEventResult {
 	message?: Pick<CustomMessage, "customType" | "content" | "display" | "details" | "attribution">;
-	/** Replace the system prompt for this turn. If multiple extensions return this, they are chained. */
+	/** Replace the system prompt for this turn. To append, spread event.systemPrompt into the returned array. */
 	systemPrompt?: string[];
 }
 

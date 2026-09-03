@@ -68,7 +68,7 @@ This external path is separate from GJC's native `/skill:deep-interview`: the na
 
 | Extension   | Description                                                          |
 | ----------- | -------------------------------------------------------------------- |
-| `pirate.ts` | Demonstrates `systemPromptAppend` to dynamically modify system prompt |
+| `pirate.ts` | Demonstrates appending a prompt block with `systemPrompt` |
 
 ### External Dependencies
 

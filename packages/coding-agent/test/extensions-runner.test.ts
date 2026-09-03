@@ -605,6 +605,60 @@ describe("ExtensionRunner", () => {
 		});
 	});
 
+	describe("before_agent_start prompt results", () => {
+		it("applies the shipped pirate example's systemPrompt result", async () => {
+			const piratePath = path.resolve(import.meta.dirname, "../examples/extensions/pirate.ts");
+			const result = await loadTestExtensions([piratePath]);
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const pirateCommand = runner.getCommand("pirate");
+			if (!pirateCommand) throw new Error("Expected pirate example command");
+
+			await pirateCommand.handler("", runner.createCommandContext());
+			const promptResult = await runner.emitBeforeAgentStart("hello", undefined, ["base prompt"]);
+
+			expect(promptResult?.systemPrompt).toHaveLength(2);
+			expect(promptResult?.systemPrompt?.[0]).toBe("base prompt");
+			expect(promptResult?.systemPrompt?.[1]).toContain("PIRATE MODE");
+		});
+
+		it("reports unsupported result fields instead of dropping them silently", async () => {
+			const extensionPath = path.join(extensionsDir, "unsupported-before-agent-start.ts");
+			fs.writeFileSync(
+				extensionPath,
+				`export default function(pi) {
+					pi.on("before_agent_start", async () => ({ systemPromptAppend: "ignored" }));
+				}`,
+			);
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const errors: Array<{ extensionPath: string; event: string; error: string }> = [];
+			runner.onError(error => errors.push(error));
+
+			const promptResult = await runner.emitBeforeAgentStart("hello", undefined, ["base prompt"]);
+
+			expect(promptResult).toBeUndefined();
+			expect(errors).toEqual([
+				{
+					extensionPath,
+					event: "before_agent_start",
+					error: "Unsupported before_agent_start result field(s): systemPromptAppend. Supported fields: message, systemPrompt.",
+				},
+			]);
+		});
+	});
+
 	describe("after_provider_response", () => {
 		it("calls handlers with response metadata and reports handler errors without throwing", async () => {
 			const eventsPath = path.join(tempDir.path(), "after-provider-response-events.jsonl");
