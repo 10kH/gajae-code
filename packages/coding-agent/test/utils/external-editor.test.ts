@@ -1,5 +1,21 @@
 import { describe, expect, it } from "bun:test";
-import { trimEditorTrailingNewline } from "../../src/utils/external-editor";
+import { shouldUseExternalEditorShell, trimEditorTrailingNewline } from "../../src/utils/external-editor";
+
+describe("shouldUseExternalEditorShell", () => {
+	it("spawns native Windows executables directly", () => {
+		expect(shouldUseExternalEditorShell("nvim", "win32")).toBe(false);
+		expect(shouldUseExternalEditorShell("C:\\Tools\\nvim.exe", "win32")).toBe(false);
+	});
+
+	it("keeps the shell for Windows batch editors", () => {
+		expect(shouldUseExternalEditorShell("editor.cmd", "win32")).toBe(true);
+		expect(shouldUseExternalEditorShell("C:\\Tools\\editor.bat", "win32")).toBe(true);
+	});
+
+	it("never adds a shell on POSIX", () => {
+		expect(shouldUseExternalEditorShell("editor.cmd", "linux")).toBe(false);
+	});
+});
 
 describe("trimEditorTrailingNewline", () => {
 	it("removes a single CRLF terminator completely", () => {

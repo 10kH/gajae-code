@@ -28,6 +28,16 @@ export function trimEditorTrailingNewline(text: string): string {
 }
 
 /**
+ * Native Windows editor executables must bypass cmd.exe. The shell wrapper
+ * reclaims the shared console input buffer while it waits for the editor,
+ * reopening the cooked-mode window that loses the first keystroke. Batch
+ * files still require a shell on Windows; ordinary executables do not.
+ */
+export function shouldUseExternalEditorShell(editor: string, platform: NodeJS.Platform = process.platform): boolean {
+	return platform === "win32" && /\.(?:cmd|bat)$/iu.test(editor);
+}
+
+/**
  * On Windows the console input buffer is shared between the parent and the
  * child. When the parent TUI stops it restores the console to cooked mode
  * (ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT) and disables
@@ -104,7 +114,10 @@ export async function openInEditor(
 
 		prepareWindowsConsoleForExternalEditor();
 
-		const child = spawn(editor, [...editorArgs, tmpFile], { stdio, shell: process.platform === "win32" });
+		const child = spawn(editor, [...editorArgs, tmpFile], {
+			stdio,
+			shell: shouldUseExternalEditorShell(editor),
+		});
 		const { promise, reject, resolve } = Promise.withResolvers<number>();
 		child.once("exit", (code, signal) => resolve(code ?? (signal ? -1 : 0)));
 		child.once("error", error => reject(error));
