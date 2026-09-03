@@ -239,12 +239,20 @@ function messageEnvelope(
 	envelopeId: string,
 	eventId: string,
 	rootTs: string,
-	overrides: { actorId?: string; clientMsgId?: string; eventContext?: string; text?: string } = {},
+	overrides: {
+		actorId?: string;
+		clientMsgId?: string;
+		eventContext?: string;
+		botId?: string;
+		payloadType?: "event_callback" | "events_api";
+		subtype?: string;
+		text?: string;
+	} = {},
 ): SlackSocketEnvelope {
 	return {
 		envelope_id: envelopeId,
 		payload: {
-			type: "events_api",
+			type: overrides.payloadType ?? "event_callback",
 			event_id: eventId,
 			event_context: overrides.eventContext,
 			team_id: "T1",
@@ -254,6 +262,8 @@ function messageEnvelope(
 				ts: `2.${eventId}`,
 				thread_ts: rootTs,
 				user: overrides.actorId ?? "U1",
+				bot_id: overrides.botId,
+				subtype: overrides.subtype,
 				text: overrides.text ?? "reply",
 				client_msg_id: overrides.clientMsgId,
 			},
@@ -262,6 +272,37 @@ function messageEnvelope(
 }
 
 describe("SlackNotificationDaemon fake-provider acceptance", () => {
+	it("scopes deterministic root publication identities to the configured channel", async () => {
+		const firstAgentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-root-channel-one-"));
+		const secondAgentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-root-channel-two-"));
+		const fake = new FakeSlack();
+		const createDaemon = (agentDir: string, channelId: string) =>
+			new SlackNotificationDaemon({
+				agentDir,
+				repo: agentDir,
+				teamId: "T1",
+				channelId,
+				provider: new SlackProvider(fake),
+				resolveAttachment: async sessionId => endpoint(sessionId),
+				authorizeActor: actorId => actorId === "U1",
+			});
+		const first = createDaemon(firstAgentDir, "C1");
+		const second = createDaemon(secondAgentDir, "C2");
+		try {
+			await first.notify("session", "ready", undefined, 1, "publication");
+			await second.notify("session", "ready", undefined, 1, "publication");
+			const roots = fake.posts.filter(post => post.threadTs === undefined);
+			expect(roots.map(post => post.channel)).toEqual(["C1", "C2"]);
+			expect(new Set(roots.map(post => post.clientMsgId)).size).toBe(2);
+		} finally {
+			await Promise.all([first.stop(), second.stop()]);
+			await Promise.all([
+				fs.rm(firstAgentDir, { recursive: true, force: true }),
+				fs.rm(secondAgentDir, { recursive: true, force: true }),
+			]);
+		}
+	});
+
 	it("acknowledges accepted, rejected, and duplicate envelopes before their outcome", async () => {
 		await withDaemon(async (daemon, fake, injected) => {
 			const root = await daemon.postRoot("session", "root");
@@ -314,6 +355,25 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				},
 			},
 		);
+	});
+
+	it("rejects bot, edited, and thread-broadcast messages in mapped threads", async () => {
+		await withDaemon(async (daemon, fake, injected) => {
+			const root = await daemon.postRoot("session", "root");
+			const cases = [
+				["bot", { botId: "B1" }],
+				["edited", { subtype: "message_changed" }],
+				["broadcast", { subtype: "thread_broadcast" }],
+				["integration", { subtype: "file_share" }],
+			] as const;
+			for (const [name, overrides] of cases) {
+				expect(await daemon.handleEnvelope(messageEnvelope(name, `${name}-event`, root.rootTs!, overrides))).toBe(
+					false,
+				);
+			}
+			expect(fake.acks).toEqual(["bot", "edited", "broadcast", "integration"]);
+			expect(injected).toEqual([]);
+		});
 	});
 
 	it("fails closed when no Slack principal is paired", async () => {
@@ -1098,7 +1158,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 		}
 	});
 
-	it("deduplicates event retries, event contexts, and interaction/message identifiers", async () => {
+	it("deduplicates event and interaction identifiers without treating event context as unique", async () => {
 		await withDaemon(async (daemon, _fake, injected) => {
 			const root = await daemon.postRoot("session", "root");
 			await daemon.notify("session", "question", "event-1");
@@ -1120,12 +1180,25 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 					eventContext: "context-2",
 				}),
 			);
+			await daemon.handleEnvelope(
+				messageEnvelope("same-context", "event-3", root.rootTs!, {
+					clientMsgId: "interaction-3",
+					eventContext: "context-1",
+					text: "next turn",
+				}),
+			);
 			expect(injected).toEqual([
 				expect.objectContaining({
 					type: "reply",
 					id: "event-1",
 					answer: "reply",
 					idempotencyKey: "slack:T1:C1:1.1:U1:event-1:interaction-1",
+				}),
+				expect.objectContaining({
+					type: "user_message",
+					sessionId: "session",
+					text: "next turn",
+					idempotencyKey: "slack:T1:C1:1.1:U1:event-3:interaction-3",
 				}),
 			]);
 		});
@@ -1516,7 +1589,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 			await fs.rm(agentDir, { recursive: true, force: true });
 		}
 	});
-	it("claims /sdk event, context, and retry identifiers before command dispatch", async () => {
+	it("claims /sdk event and retry identifiers before command dispatch", async () => {
 		const commands: Array<{ sessionId: string; content: string }> = [];
 		await withDaemon(
 			async (daemon, _fake) => {
@@ -1544,8 +1617,11 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 							text: "/sdk status",
 						}),
 					),
-				).toBe(false);
-				expect(commands).toEqual([{ sessionId: "session", content: "/sdk status" }]);
+				).toBe(true);
+				expect(commands).toEqual([
+					{ sessionId: "session", content: "/sdk status" },
+					{ sessionId: "session", content: "/sdk status" },
+				]);
 			},
 			{
 				onCommand: async (sessionId, content) => {
@@ -1602,6 +1678,126 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 			await restarted.start();
 			expect(keys).toEqual(["slack:T1:C1:1.1:U1:command-event:command-id"]);
 			expect(Object.values((await restarted.store.load()).conversations)[0]?.inboundDispatches).toEqual([]);
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("replays persisted message classification after pending action state changes", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-message-replay-"));
+		try {
+			const firstProvider = new FakeSlack();
+			const first = new SlackNotificationDaemon({
+				agentDir,
+				repo: agentDir,
+				teamId: "T1",
+				channelId: "C1",
+				provider: new SlackProvider(firstProvider),
+				resolveAttachment: async sessionId => endpoint(sessionId),
+				authorizeActor: actorId => actorId === "U1",
+			});
+			const root = await first.postRoot("session", "root");
+			firstProvider.onAck = async () => {
+				throw new Error("crash after ACK");
+			};
+			await expect(
+				first.handleEnvelope(
+					messageEnvelope("first", "message-event", root.rootTs!, {
+						clientMsgId: "message-id",
+						text: "persisted prompt",
+					}),
+				),
+			).rejects.toThrow("crash after ACK");
+			await first.store.transact("T1:C1:intent:session", current =>
+				current ? { ...current, generation: current.generation + 1, pendingActionId: "new-action" } : current,
+			);
+
+			const replayed: Array<Record<string, unknown>> = [];
+			const restarted = new SlackNotificationDaemon({
+				agentDir,
+				repo: agentDir,
+				teamId: "T1",
+				channelId: "C1",
+				provider: new SlackProvider(new FakeSlack()),
+				resolveAttachment: async sessionId => ({
+					...endpoint(sessionId),
+					send: (frame: Record<string, unknown>) => replayed.push(frame),
+					sendMaintenance: () => {},
+				}),
+				authorizeActor: actorId => actorId === "U1",
+			});
+			await restarted.start();
+			expect(replayed).toEqual([
+				expect.objectContaining({ type: "user_message", sessionId: "session", text: "persisted prompt" }),
+			]);
+			await restarted.stop();
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("adopts an orphaned message effect after pending action state changes", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-orphan-message-"));
+		try {
+			const first = new SlackNotificationDaemon({
+				agentDir,
+				repo: agentDir,
+				teamId: "T1",
+				channelId: "C1",
+				provider: new SlackProvider(new FakeSlack()),
+				resolveAttachment: async sessionId => endpoint(sessionId),
+			});
+			const root = await first.postRoot("session", "root");
+			const effectId = `inbound:T1:C1:${root.rootTs}:U1:message-event:message-id`;
+			const idempotencyKey = `slack:T1:C1:${root.rootTs}:U1:message-event:message-id`;
+			await new ChatEffectJournal({ agentDir, transport: "slack" }).enqueue({
+				id: effectId,
+				kind: "sdk.inbound.user_message",
+				transport: "slack",
+				sessionId: "session",
+				endpointGeneration: 1,
+				payload: {
+					type: "user_message",
+					sessionId: "session",
+					text: "persisted prompt",
+					idempotencyKey,
+					routing: {
+						teamId: "T1",
+						channelId: "C1",
+						rootTs: root.rootTs!,
+						attachmentAuthorityId: "session:1",
+						actorId: "U1",
+						eventId: "message-event",
+						interactionId: "message-id",
+						retryKey: "message-event:message-id",
+						kind: "message",
+					},
+				},
+			});
+			await first.store.transact("T1:C1:intent:session", current =>
+				current ? { ...current, generation: current.generation + 1, pendingActionId: "new-action" } : current,
+			);
+			await first.stop();
+
+			const replayed: Array<Record<string, unknown>> = [];
+			const restarted = new SlackNotificationDaemon({
+				agentDir,
+				repo: agentDir,
+				teamId: "T1",
+				channelId: "C1",
+				provider: new SlackProvider(new FakeSlack()),
+				resolveAttachment: async sessionId => ({
+					...endpoint(sessionId),
+					send: (frame: Record<string, unknown>) => replayed.push(frame),
+					sendMaintenance: () => {},
+				}),
+				authorizeActor: actorId => actorId === "U1",
+			});
+			await restarted.start();
+			expect(replayed).toEqual([
+				expect.objectContaining({ type: "user_message", sessionId: "session", text: "persisted prompt" }),
+			]);
+			await restarted.stop();
 		} finally {
 			await fs.rm(agentDir, { recursive: true, force: true });
 		}
@@ -1702,7 +1898,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 		}
 	});
 
-	it("rejects an action after durable resolution", async () => {
+	it("starts a user turn after durable action resolution", async () => {
 		await withDaemon(async (daemon, _fake, injected) => {
 			const root = await daemon.postRoot("session", "root");
 			await daemon.notify("session", "question", "resolved-action");
@@ -1711,8 +1907,34 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				await daemon.handleEnvelope(
 					messageEnvelope("stale", "stale-event", root.rootTs!, { clientMsgId: "stale-id" }),
 				),
-			).toBe(false);
-			expect(injected).toEqual([]);
+			).toBe(true);
+			expect(injected).toEqual([
+				expect.objectContaining({
+					type: "user_message",
+					sessionId: "session",
+					text: "reply",
+				}),
+			]);
+		});
+	});
+
+	it("does not revive a stale idle notification id as a reply action", async () => {
+		await withDaemon(async (daemon, _fake, injected) => {
+			const root = await daemon.postRoot("session", "root");
+			await daemon.store.transact("T1:C1:intent:session", current =>
+				current ? { ...current, generation: current.generation + 1, pendingActionId: "idle:session#1" } : current,
+			);
+			expect(
+				await daemon.handleEnvelope(
+					messageEnvelope("stale-idle", "stale-idle-event", root.rootTs!, {
+						clientMsgId: "stale-idle-message",
+						text: "fresh prompt",
+					}),
+				),
+			).toBe(true);
+			expect(injected).toEqual([
+				expect.objectContaining({ type: "user_message", sessionId: "session", text: "fresh prompt" }),
+			]);
 		});
 	});
 
