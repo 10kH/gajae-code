@@ -85,13 +85,25 @@ checkpoint() { receipt || { RECEIPT_FAILED=1; echo "warn: receipt checkpoint fai
 
 finalize() {
 	local rc=$?
-	# An exit that did not pass through fail()/PASS is an unhandled failure.
-	if [ "$OUTCOME" = "running" ]; then OUTCOME="fail:unhandled"; EXIT_CODE="$rc"; fi
+	# The process exit status is authoritative. A latched OUTCOME/EXIT_CODE
+	# that disagrees with it (e.g. PASS latched, then the receipt write failed)
+	# must not be persisted as-is.
+	if [ "$OUTCOME" = "running" ]; then OUTCOME="fail:unhandled"; fi
+	if [ "$RECEIPT_FAILED" = 1 ]; then (( rc != 0 )) || rc=$EXIT_RECEIPT_UNPERSISTED; fi
+	if (( rc != 0 )) && { [ "$OUTCOME" = "pass" ] || [ "$EXIT_CODE" != "$rc" ]; }; then
+		[ "$OUTCOME" = "pass" ] && OUTCOME="fail:exit-after-pass"
+		EXIT_CODE="$rc"
+	fi
 	[ -n "$EXIT_CODE" ] || EXIT_CODE="$rc"
-	if ! receipt || [ "$RECEIPT_FAILED" = 1 ]; then
+	if ! receipt; then
 		echo "FAIL: receipt could not be persisted; evidence for this run is not durable" >&2
 		# A behavioral success without durable evidence is not a success.
 		(( rc != 0 )) || rc=$EXIT_RECEIPT_UNPERSISTED
+		# Best-effort second attempt so the receipt, if it lands at all, carries the final rc.
+		EXIT_CODE="$rc"; [ "$OUTCOME" = "pass" ] && OUTCOME="fail:receipt-unpersisted"
+		receipt || true
+	elif [ "$RECEIPT_FAILED" = 1 ]; then
+		echo "FAIL: an earlier receipt checkpoint failed; evidence for this run is not durable" >&2
 	fi
 	tmux kill-session -t "$SESSION" 2>/dev/null || echo "warn: tmux session $SESSION already gone" >&2
 	sleep 1
@@ -203,6 +215,9 @@ sleep 4
 capture 5-job-finished
 if pane | grep -q "Tool execution was aborted"; then fail 3 aborted-final "abort text present at the end"; fi
 
-OUTCOME="pass"; EXIT_CODE=0; receipt || exit $EXIT_RECEIPT_UNPERSISTED
+OUTCOME="pass"; EXIT_CODE=0
+# The final receipt is part of PASS. finalize re-derives OUTCOME/EXIT_CODE from
+# the real exit status, so a failure here can never be persisted as pass/0.
+receipt || exit $EXIT_RECEIPT_UNPERSISTED
 echo "PASS: fold=$JOB, no abort, steer answered (nonce $NONCE), $JOB completed and indicator cleared" >&2
 echo "$OUT"
