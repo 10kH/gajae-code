@@ -212,7 +212,10 @@ describe("openai-completions compatibility", () => {
 		}
 		const rejectedOrigins = [
 			"http://api.x.ai/v1",
+			"https://api.x.ai:/v1",
+			"https://api.x.ai:0443/v1",
 			"https://api.x.ai:444/v1",
+			"https://%61pi.x.ai/v1",
 			"https://@api.x.ai/v1",
 			"https://user@api.x.ai/v1",
 			"https://user:pass@api.x.ai/v1",

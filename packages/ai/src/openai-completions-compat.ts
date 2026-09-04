@@ -60,7 +60,7 @@ function isProductionXaiApiUrl(baseUrl: string): boolean {
 	const authorityTail = baseUrl.slice("https://".length);
 	const authorityEnd = authorityTail.search(/[/?#]/u);
 	const authority = authorityTail.slice(0, authorityEnd === -1 ? undefined : authorityEnd);
-	if (authority.includes("@")) return false;
+	if (!/^api\.x\.ai(?::443)?$/iu.test(authority)) return false;
 	try {
 		const url = new URL(baseUrl);
 		return (
