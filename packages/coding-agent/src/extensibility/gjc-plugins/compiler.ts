@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { parseFrontmatter, pathIsWithin } from "@gajae-code/utils";
+import { classifyStdioInvocation } from "./mcp-policy";
 import { readSchemaDeclaration, schemaHash } from "./metadata";
 import { resolveWithinRoot } from "./paths";
 import { parseManifest, parseSubskillFrontmatter } from "./schema";
@@ -342,17 +343,9 @@ export async function compileGjcPluginBundle(root: string): Promise<NormalizedGj
 		// Derive ownership from the same cwd-aware grammar used at runtime. This
 		// includes bare entrypoint filenames and path-qualified executable commands.
 		if (entry.transport === "stdio") {
-			const { classifyStdioInvocation } = await import("./mcp-policy");
 			const invocation = classifyStdioInvocation(entry, { pluginRoot });
 			await resolveDeclaredDirectory(pluginRoot, path.relative(pluginRoot, invocation.cwd));
-			const ownedPaths = new Set([invocation.ownedRelativePath]);
-			for (const [index, arg] of (entry.args ?? []).entries()) {
-				if (invocation.kind === "launcher" && index === 0) continue;
-				if (arg.startsWith("-")) continue;
-				if (!arg.startsWith(".") && !arg.includes("/")) continue;
-				ownedPaths.add(path.relative(pluginRoot, path.resolve(invocation.cwd, arg)));
-			}
-			for (const relativePath of ownedPaths) {
+			for (const relativePath of new Set(invocation.ownedRelativePaths)) {
 				const abs = await resolveDeclaredFile(pluginRoot, relativePath);
 				const { sha256: digest, bytes } = await hashFile(abs, relativePath, undefined);
 				files.set(relativePath, { sha256: digest, bytes });

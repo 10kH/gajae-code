@@ -104,6 +104,7 @@ export class StdioTransport implements MCPTransport {
 		const cwd = this.config.cwd ?? process.cwd();
 
 		try {
+			await this.config.spawnGuard?.({ command: this.config.command, args, cwd });
 			this.#process = spawnOwnedProcess([this.config.command, ...args], {
 				cwd,
 				env,

@@ -1,11 +1,20 @@
 import { createHash } from "node:crypto";
+import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { bindPluginMcpToPublicNetwork } from "../../runtime-mcp/plugin-network-boundary";
+import type { MCPStdioSpawnLaunch } from "../../runtime-mcp/types";
 import { loadCustomTools } from "../custom-tools/loader";
 import type { CustomTool } from "../custom-tools/types";
+import { compileGjcPluginBundle } from "./compiler";
 import { bundleIdentity } from "./lifecycle-reconciliation";
+import {
+	assertDnsResolvesPublic,
+	assertMcpInstallPolicy,
+	assertUrlAllowed,
+	classifyStdioInvocation,
+} from "./mcp-policy";
 import { canonicalJson, verifyImplementationHash } from "./metadata";
 import { isV2Tool } from "./migration";
 import { resolveWithinRoot } from "./paths";
@@ -196,6 +205,37 @@ async function assertMcpPluginRootOwnedByScope(entry: GjcPluginRegistryEntry, cw
 	const [scopeRootReal, pluginRootReal] = await Promise.all([fs.realpath(scopeRoot), fs.realpath(pluginRoot)]);
 	if (!isWithin(scopeRootReal, pluginRootReal)) {
 		throw new Error(`Installed plugin root escapes its ${entry.scope} registry scope: ${entry.pluginRoot}`);
+	}
+}
+
+async function assertInstalledTreeAuthenticated(entry: GjcPluginRegistryEntry): Promise<void> {
+	const expected = new Set(entry.copiedFiles.map(file => path.normalize(file.relativePath)));
+	const visit = async (directory: string): Promise<void> => {
+		let children: Dirent[];
+		try {
+			children = await fs.readdir(directory, { withFileTypes: true });
+		} catch (error) {
+			throw new Error(
+				`Installed plugin tree is unreadable: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+		for (const child of children.sort((a, b) => a.name.localeCompare(b.name))) {
+			const absolutePath = path.join(directory, child.name);
+			const relativePath = path.normalize(path.relative(entry.pluginRoot, absolutePath));
+			if (child.isSymbolicLink()) throw new Error(`Installed plugin tree contains a symlink: ${relativePath}`);
+			if (child.isDirectory()) {
+				await visit(absolutePath);
+				continue;
+			}
+			if (!child.isFile()) throw new Error(`Installed plugin tree contains an unsupported entry: ${relativePath}`);
+			if (!expected.delete(relativePath)) {
+				throw new Error(`Installed plugin tree contains an unauthenticated file: ${relativePath}`);
+			}
+		}
+	};
+	await visit(entry.pluginRoot);
+	if (expected.size > 0) {
+		throw new Error(`Installed plugin tree is missing authenticated files: ${[...expected].sort().join(", ")}`);
 	}
 }
 
@@ -453,10 +493,6 @@ export async function buildPluginMcpConfigs(input: { cwd: string }): Promise<{
 }> {
 	const { effective, active, quarantine } = await loadValidatedPluginRegistry(input.cwd);
 	if (effective.length === 0) return { configs: {}, quarantine: [] };
-	const [
-		{ assertMcpInstallPolicy, assertDnsResolvesPublic, assertUrlAllowed, classifyStdioInvocation },
-		{ compileGjcPluginBundle },
-	] = await Promise.all([import("./mcp-policy"), import("./compiler")]);
 
 	// A manifest-controlled MCP name such as "constructor" or "toString" must
 	// remain an ordinary own key rather than interacting with Object.prototype.
@@ -467,6 +503,7 @@ export async function buildPluginMcpConfigs(input: { cwd: string }): Promise<{
 		let compileError: unknown;
 		try {
 			await assertMcpPluginRootOwnedByScope(entry, input.cwd);
+			await assertInstalledTreeAuthenticated(entry);
 			const compiled = await compileGjcPluginBundle(entry.pluginRoot);
 			compiledMcps = new Map(compiled.surfaces.mcps.map(surface => [surface.extensionId, surface]));
 		} catch (error) {
@@ -488,14 +525,19 @@ export async function buildPluginMcpConfigs(input: { cwd: string }): Promise<{
 				assertMcpInstallPolicy(cfg, { pluginRoot: entry.pluginRoot });
 				if (cfg.transport === "stdio") {
 					const invocation = classifyStdioInvocation(cfg, { pluginRoot: entry.pluginRoot });
+					for (const relativePath of invocation.ownedRelativePaths) {
+						const ownedFile = entry.copiedFiles.find(
+							file => path.normalize(file.relativePath) === path.normalize(relativePath),
+						);
+						if (!ownedFile) {
+							throw new Error(
+								`MCP "${m.name}": selected file is not in the authenticated copied-file set: ${relativePath}`,
+							);
+						}
+					}
 					const ownedFile = entry.copiedFiles.find(
 						file => path.normalize(file.relativePath) === path.normalize(invocation.ownedRelativePath),
-					);
-					if (!ownedFile) {
-						throw new Error(
-							`MCP "${m.name}": selected entrypoint is not in the authenticated copied-file set: ${invocation.ownedRelativePath}`,
-						);
-					}
+					) as (typeof entry.copiedFiles)[number];
 					const ownedExecutablePath = await resolveRuntimeFile(entry.pluginRoot, ownedFile.relativePath);
 					let command: string;
 					let args: string[] | undefined;
@@ -523,6 +565,62 @@ export async function buildPluginMcpConfigs(input: { cwd: string }): Promise<{
 						// Bun additionally receives an immutable empty config plus flags
 						// that disable ambient dotenv and package auto-install behavior.
 						noInheritEnv: true,
+						spawnGuard: async (launch: MCPStdioSpawnLaunch) => {
+							await assertMcpPluginRootOwnedByScope(entry, input.cwd);
+							await assertInstalledTreeAuthenticated(entry);
+							const freshBundle = await compileGjcPluginBundle(entry.pluginRoot);
+							if (freshBundle.manifestHash !== entry.manifestHash) {
+								throw new Error(`MCP "${m.name}": installed manifest hash drifted before spawn`);
+							}
+							const freshSurface = freshBundle.surfaces.mcps.find(
+								surface => surface.extensionId === m.extensionId,
+							);
+							if (
+								!freshSurface ||
+								freshSurface.configHash !== m.configHash ||
+								canonicalPersistedJson(freshSurface.config) !== canonicalPersistedJson(cfg)
+							) {
+								throw new Error(`MCP "${m.name}": installed manifest/config drifted before spawn`);
+							}
+							const freshInvocation = classifyStdioInvocation(freshSurface.config, {
+								pluginRoot: entry.pluginRoot,
+							});
+							for (const relativePath of freshInvocation.ownedRelativePaths) {
+								const freshOwnedFile = entry.copiedFiles.find(
+									file => path.normalize(file.relativePath) === path.normalize(relativePath),
+								);
+								if (!freshOwnedFile) {
+									throw new Error(
+										`MCP "${m.name}": unauthenticated installed file selected before spawn: ${relativePath}`,
+									);
+								}
+								const freshPath = await resolveRuntimeFile(entry.pluginRoot, freshOwnedFile.relativePath);
+								await verifyImplementationHash(freshPath, freshOwnedFile.sha256);
+							}
+							const freshExecutablePath = await resolveRuntimeFile(
+								entry.pluginRoot,
+								freshInvocation.ownedRelativePath,
+							);
+							const expectedCommand =
+								freshInvocation.kind === "launcher" ? freshInvocation.launcher : freshExecutablePath;
+							const expectedArgs =
+								freshInvocation.kind === "launcher"
+									? [
+											...(freshInvocation.launcher === "bun"
+												? [`--config=${os.devNull}`, "--no-env-file", "--no-install"]
+												: []),
+											freshExecutablePath,
+											...(freshSurface.config.args ?? []).slice(1),
+										]
+									: (freshSurface.config.args ?? []);
+							if (
+								launch.command !== expectedCommand ||
+								path.resolve(launch.cwd) !== path.resolve(freshInvocation.cwd) ||
+								canonicalPersistedJson(launch.args) !== canonicalPersistedJson(expectedArgs)
+							) {
+								throw new Error(`MCP "${m.name}": launch plan drifted before spawn`);
+							}
+						},
 					};
 				} else {
 					const url = assertUrlAllowed(cfg.url ?? "", `MCP "${m.name}" url`);

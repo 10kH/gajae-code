@@ -165,17 +165,33 @@ export type StdioInvocationTarget =
 			entrypoint: string;
 			executablePath: string;
 			ownedRelativePath: string;
+			ownedRelativePaths: string[];
 			cwd: string;
 	  }
 	| {
 			kind: "bundled-executable";
 			executablePath: string;
 			ownedRelativePath: string;
+			ownedRelativePaths: string[];
 			cwd: string;
 	  };
 
 function isWithinOrEqual(root: string, candidate: string): boolean {
 	return candidate === root || pathIsWithin(root, candidate);
+}
+
+function isCrossPlatformAbsolute(value: string): boolean {
+	return path.posix.isAbsolute(value) || path.win32.isAbsolute(value) || /^[A-Za-z]:/.test(value);
+}
+
+function resolveManifestRelative(base: string, value: string, label: string): string {
+	if (isCrossPlatformAbsolute(value)) fail(`${label} must be relative`);
+	const portable = path.posix.normalize(value.replaceAll("\\", "/"));
+	return path.resolve(base, ...portable.split("/"));
+}
+
+function isFileLikeArgument(value: string): boolean {
+	return value.startsWith(".") || value.includes("/") || value.includes("\\") || isCrossPlatformAbsolute(value);
 }
 
 /**
@@ -191,68 +207,73 @@ export function classifyStdioInvocation(
 	const command = entry.command ?? "";
 	if (!command) fail(`MCP "${entry.name}": stdio requires a command`);
 	const root = path.resolve(ctx.pluginRoot);
-	const cwd = entry.cwd ? path.resolve(root, entry.cwd) : root;
+	const cwd = entry.cwd ? resolveManifestRelative(root, entry.cwd, `MCP "${entry.name}": stdio cwd`) : root;
 	if (!isWithinOrEqual(root, cwd)) {
 		fail(`MCP "${entry.name}": stdio cwd escapes plugin root: ${entry.cwd}`);
 	}
+	const args = entry.args ?? [];
+	for (const arg of args) {
+		if (/\$\{?[A-Za-z_]/.test(arg) || arg.includes("`") || arg.includes("$(")) {
+			fail(`MCP "${entry.name}": stdio arg expansion not allowed: ${arg}`);
+		}
+	}
 
 	if (ALLOWED_STDIO_LAUNCHERS.has(command)) {
-		const entrypoint = entry.args?.[0];
+		const entrypoint = args[0];
 		if (!entrypoint) {
 			fail(`MCP "${entry.name}": node/bun stdio launcher requires a bundled script argument`);
 		}
 		if (entrypoint.startsWith("-")) {
 			fail(`MCP "${entry.name}": stdio launcher options before the bundled entrypoint are not allowed`);
 		}
-		if (path.isAbsolute(entrypoint)) {
-			fail(`MCP "${entry.name}": stdio launcher entrypoint must be relative to its bundled cwd`);
-		}
-		const executablePath = path.resolve(cwd, entrypoint);
+		const executablePath = resolveManifestRelative(cwd, entrypoint, `MCP "${entry.name}": stdio launcher entrypoint`);
 		if (!pathIsWithin(root, executablePath)) {
 			fail(`MCP "${entry.name}": stdio script escapes plugin root: ${entrypoint}`);
+		}
+		const ownedRelativePaths = [path.relative(root, executablePath)];
+		for (const arg of args.slice(1)) {
+			if (arg.startsWith("-") || !isFileLikeArgument(arg)) continue;
+			const resolvedArg = resolveManifestRelative(cwd, arg, `MCP "${entry.name}": stdio arg`);
+			if (!pathIsWithin(root, resolvedArg)) fail(`MCP "${entry.name}": stdio arg escapes plugin root: ${arg}`);
+			ownedRelativePaths.push(path.relative(root, resolvedArg));
 		}
 		return {
 			kind: "launcher",
 			launcher: command as "node" | "bun",
 			entrypoint,
 			executablePath,
-			ownedRelativePath: path.relative(root, executablePath),
+			ownedRelativePath: ownedRelativePaths[0] as string,
+			ownedRelativePaths,
 			cwd,
 		};
 	}
 
-	if (path.isAbsolute(command) || (!command.includes("/") && !command.includes("\\"))) {
+	if (isCrossPlatformAbsolute(command) || (!command.includes("/") && !command.includes("\\"))) {
 		fail(`MCP "${entry.name}": stdio command not allowed: ${command}`);
 	}
-	const executablePath = path.resolve(cwd, command);
+	const executablePath = resolveManifestRelative(cwd, command, `MCP "${entry.name}": stdio command`);
 	if (!pathIsWithin(root, executablePath)) {
 		fail(`MCP "${entry.name}": stdio command escapes plugin root: ${command}`);
+	}
+	const ownedRelativePaths = [path.relative(root, executablePath)];
+	for (const arg of args) {
+		if (arg.startsWith("-") || !isFileLikeArgument(arg)) continue;
+		const resolvedArg = resolveManifestRelative(cwd, arg, `MCP "${entry.name}": stdio arg`);
+		if (!pathIsWithin(root, resolvedArg)) fail(`MCP "${entry.name}": stdio arg escapes plugin root: ${arg}`);
+		ownedRelativePaths.push(path.relative(root, resolvedArg));
 	}
 	return {
 		kind: "bundled-executable",
 		executablePath,
-		ownedRelativePath: path.relative(root, executablePath),
+		ownedRelativePath: ownedRelativePaths[0] as string,
+		ownedRelativePaths,
 		cwd,
 	};
 }
 
 /** stdio launcher/path confinement policy. */
 export function assertStdioAllowed(entry: GjcPluginMcpManifestEntry, ctx: StdioPolicyContext): void {
-	const root = path.resolve(ctx.pluginRoot);
-	const invocation = classifyStdioInvocation(entry, ctx);
-	const args = entry.args ?? [];
-	// File-like args must resolve within the plugin root; reject env-expansion.
-	for (const arg of args) {
-		if (/\$\{?[A-Za-z_]/.test(arg) || arg.includes("`") || arg.includes("$(")) {
-			fail(`MCP "${entry.name}": stdio arg expansion not allowed: ${arg}`);
-		}
-		if (arg.startsWith("-")) continue;
-		if (!arg.startsWith(".") && !arg.includes("/")) continue;
-		const resolvedArg = path.resolve(invocation.cwd, arg);
-		if (!pathIsWithin(root, resolvedArg)) {
-			fail(`MCP "${entry.name}": stdio arg escapes plugin root: ${arg}`);
-		}
-	}
+	classifyStdioInvocation(entry, ctx);
 }
 
 /**

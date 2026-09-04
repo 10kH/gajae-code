@@ -12,7 +12,7 @@
 
 - The status-line usage segment now paints only the active model's provider, so switching to Grok no longer keeps a stale Claude 5h/7d pair. Canonical Grok Build reports render only their authoritative weekly window, while monthly credits are omitted instead of being mislabeled as `7d`.
 
-- Bundled plugin MCP launchers now execute only the installed, hashed entrypoint selected by the manifest's effective `cwd`. Node/Bun runtime options cannot precede that entrypoint, path-qualified commands are copied as executable-owned files, and Bun starts with ambient config, dotenv loading, and package auto-install disabled.
+- Bundled plugin MCP launchers now execute only authenticated installed files selected by the manifest's effective `cwd`. Node/Bun runtime options cannot precede the hashed entrypoint, path-qualified commands are copied as executable-owned files, unexpected post-install files quarantine the bundle, and a final manifest/file/launch-plan guard runs immediately before spawn. Bun starts with ambient config, dotenv loading, and package auto-install disabled.
 
 - Moving the `/model` preset cursor now reuses the authentication snapshot produced by catalog and credential refreshes instead of resolving every profile against the full model catalog on each Up/Down keypress; auth-dependent preset actions remain blocked until the initial static refresh and the availability snapshot are complete.
 - Mid-run OpenAI remote-compaction fallback failures now stop before another provider request, surface the local summarization error through ACP/SDK terminal handling, and leave the uncompacted context unsubmitted. Successful local fallback still commits the compaction and resumes normally.

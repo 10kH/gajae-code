@@ -39,12 +39,24 @@ function stdio(command: "node" | "bun", args: string[], cwd = "."): GjcPluginMcp
 
 async function writeBundle(
 	root: string,
-	input: { name: string; command: string; args?: string[]; cwd?: string; serverPath?: string; server?: string },
+	input: {
+		name: string;
+		command: string;
+		args?: string[];
+		cwd?: string;
+		serverPath?: string;
+		server?: string;
+		ownedFiles?: Record<string, string>;
+	},
 ): Promise<void> {
 	const serverPath = input.serverPath ?? "mcp/server.mjs";
 	if (input.server !== undefined) {
 		await fs.mkdir(path.dirname(path.join(root, serverPath)), { recursive: true });
 		await fs.writeFile(path.join(root, serverPath), input.server);
+	}
+	for (const [relativePath, content] of Object.entries(input.ownedFiles ?? {})) {
+		await fs.mkdir(path.dirname(path.join(root, relativePath)), { recursive: true });
+		await fs.writeFile(path.join(root, relativePath), content);
 	}
 	await fs.writeFile(
 		path.join(root, "gajae-plugin.json"),
@@ -61,6 +73,10 @@ async function writeBundle(
 					cwd: input.cwd ?? ".",
 				},
 			],
+			system_appendix: Object.keys(input.ownedFiles ?? {}).map((relativePath, index) => ({
+				name: `owned-launch-config-${index}`,
+				path: relativePath,
+			})),
 		}),
 	);
 }
@@ -121,10 +137,27 @@ describe("bundled plugin MCP launcher contract", () => {
 			stdio("node", ["--run", "server.mjs"]),
 			stdio("node", []),
 			stdio("bun", ["--"]),
+			stdio("node", ["--", "server.mjs"]),
 		];
 		for (const entry of rejected) {
 			expect(() => assertMcpInstallPolicy(entry, { pluginRoot: root })).toThrow();
 		}
+	});
+
+	test("classifies POSIX and Windows path forms consistently on every host", () => {
+		const root = path.resolve("/tmp/plugin-root");
+		for (const entry of [
+			{ ...stdio("node", ["C:\\outside\\server.mjs"]), command: "node" },
+			{ ...stdio("bun", ["..\\outside\\server.ts"]), command: "bun" },
+			{ ...stdio("node", ["server.mjs"], "..\\outside"), command: "node" },
+			{ ...stdio("node", ["server.mjs"]), command: "C:\\Program Files\\nodejs\\node.exe" },
+			{ ...stdio("bun", ["server.ts"]), command: "/usr/bin/bun" },
+		]) {
+			expect(() => assertMcpInstallPolicy(entry, { pluginRoot: root })).toThrow();
+		}
+		expect(() =>
+			assertMcpInstallPolicy({ ...stdio("bun", [], "bin"), command: ".\\server" }, { pluginRoot: root }),
+		).not.toThrow();
 	});
 
 	test("keeps launcher flags after the owned entrypoint as opaque server arguments", () => {
@@ -239,6 +272,28 @@ describe("bundled plugin MCP launcher contract", () => {
 		]);
 	}, 30_000);
 
+	test("passes separators, spaces, quotes, and shell metacharacters only as literal post-entrypoint argv", async () => {
+		const cwd = await tempDir("gjc-plugin-launcher-literal-project-");
+		const source = await tempDir("gjc-plugin-launcher-literal-source-");
+		await writeBundle(source, {
+			name: "literal-argv",
+			command: "node",
+			args: ["mcp/server;literal.mjs", "--", "value with spaces", 'quote="literal"', "semi;colon", "amp&ersand"],
+			serverPath: "mcp/server;literal.mjs",
+			server: mcpServer(),
+		});
+		expect((await installGjcBundle({ cwd }, "project", source)).ok).toBe(true);
+		const connected = await connect(cwd, "literal-argv");
+		expect(connected.errors).toEqual([]);
+		expect(connected.args?.slice(1)).toEqual([
+			"--",
+			"value with spaces",
+			'quote="literal"',
+			"semi;colon",
+			"amp&ersand",
+		]);
+	}, 30_000);
+
 	test("copies and marks a root-confined executable command as installer-owned", async () => {
 		const cwd = await tempDir("gjc-plugin-launcher-project-");
 		const source = await tempDir("gjc-plugin-launcher-executable-");
@@ -264,6 +319,24 @@ describe("bundled plugin MCP launcher contract", () => {
 		}
 	});
 
+	test("copies hardlinked source bytes instead of retaining external inode authority", async () => {
+		const cwd = await tempDir("gjc-plugin-launcher-hardlink-project-");
+		const source = await tempDir("gjc-plugin-launcher-hardlink-source-");
+		const outside = await tempDir("gjc-plugin-launcher-hardlink-outside-");
+		const outsideServer = path.join(outside, "server.mjs");
+		await fs.writeFile(outsideServer, mcpServer());
+		await fs.mkdir(path.join(source, "mcp"), { recursive: true });
+		await fs.link(outsideServer, path.join(source, "mcp/server.mjs"));
+		await writeBundle(source, { name: "hardlink-copy", command: "node" });
+		expect((await installGjcBundle({ cwd }, "project", source)).ok).toBe(true);
+		const entry = (await readRegistry("project", cwd)).plugins[0];
+		const installed = path.join(entry?.pluginRoot ?? "", "mcp/server.mjs");
+		expect((await fs.stat(installed)).ino).not.toBe((await fs.stat(outsideServer)).ino);
+		await fs.writeFile(outsideServer, "throw new Error('outside replacement');\n");
+		const connected = await connect(cwd, "hardlink-copy");
+		expect(connected.errors).toEqual([]);
+	}, 30_000);
+
 	test("blocks outside config/cwd selectors during installation", async () => {
 		const cwd = await tempDir("gjc-plugin-launcher-project-");
 		const outside = await tempDir("gjc-plugin-launcher-outside-");
@@ -288,22 +361,22 @@ describe("bundled plugin MCP launcher contract", () => {
 		const outside = await tempDir("gjc-plugin-launcher-ambient-");
 		const preloadMarker = path.join(outside, "preload-ran.txt");
 		const serverReport = path.join(outside, "server-report.json");
+		const bunfig = `preload = [${JSON.stringify(path.join(outside, "preload.ts"))}]\n`;
 		await writeBundle(source, {
 			name: "ambient-isolation",
 			command: "bun",
 			server: mcpServer(serverReport),
+			ownedFiles: {
+				"bunfig.toml": bunfig,
+				".env": "GJC_PLUGIN_AMBIENT=loaded\n",
+				"package.json": '{"dependencies":{"definitely-not-installed":"latest"}}\n',
+			},
 		});
 		expect((await installGjcBundle({ cwd }, "project", source)).ok).toBe(true);
-		const entry = (await readRegistry("project", cwd)).plugins[0];
 		await fs.writeFile(
 			path.join(outside, "preload.ts"),
 			`await Bun.write(${JSON.stringify(preloadMarker)}, "ran\\n");\n`,
 		);
-		await fs.writeFile(
-			path.join(entry?.pluginRoot ?? "", "bunfig.toml"),
-			`preload = [${JSON.stringify(path.join(outside, "preload.ts"))}]\n`,
-		);
-		await fs.writeFile(path.join(entry?.pluginRoot ?? "", ".env"), "GJC_PLUGIN_AMBIENT=loaded\n");
 
 		const connected = await connect(cwd, "ambient-isolation");
 		expect(connected.errors).toEqual([]);
@@ -311,6 +384,27 @@ describe("bundled plugin MCP launcher contract", () => {
 		expect(await fs.readFile(serverReport, "utf8")).toBe('{"ambient":null}');
 		await expect(fs.readFile(preloadMarker, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
 	}, 30_000);
+
+	test("quarantines extra dotenv, config, package, and executable files added after install", async () => {
+		const cwd = await tempDir("gjc-plugin-launcher-extra-project-");
+		for (const [name, relativePath, content] of [
+			["extra-dotenv", ".env", "TOKEN=ambient\n"],
+			["extra-config", "bunfig.toml", "preload = []\n"],
+			["extra-package", "package.json", '{"type":"commonjs"}\n'],
+			["extra-executable", "mcp/other.mjs", "process.exit(0);\n"],
+		] as const) {
+			const source = await tempDir(`gjc-plugin-launcher-${name}-`);
+			await writeBundle(source, { name, command: "node", server: mcpServer() });
+			expect((await installGjcBundle({ cwd }, "project", source)).ok).toBe(true);
+			const entry = (await readRegistry("project", cwd)).plugins.find(plugin => plugin.name === name);
+			const absolutePath = path.join(entry?.pluginRoot ?? "", relativePath);
+			await fs.mkdir(path.dirname(absolutePath), { recursive: true });
+			await fs.writeFile(absolutePath, content);
+			const runtime = await buildPluginMcpConfigs({ cwd });
+			expect(runtime.configs[name]).toBeUndefined();
+			expect(runtime.quarantine).toContainEqual(expect.objectContaining({ plugin: name, code: "security_policy" }));
+		}
+	});
 
 	test("quarantines an MCP config that no longer matches its compiled registry hash", async () => {
 		const cwd = await tempDir("gjc-plugin-launcher-project-");
@@ -372,5 +466,44 @@ describe("bundled plugin MCP launcher contract", () => {
 		expect(runtime.quarantine).toContainEqual(
 			expect.objectContaining({ plugin: "file-rebind", code: "security_policy" }),
 		);
+	});
+
+	test("fails closed when the installed entrypoint changes after config build but before spawn", async () => {
+		const cwd = await tempDir("gjc-plugin-launcher-toctou-project-");
+		const source = await tempDir("gjc-plugin-launcher-toctou-source-");
+		await writeBundle(source, { name: "spawn-toctou", command: "node", server: mcpServer() });
+		expect((await installGjcBundle({ cwd }, "project", source)).ok).toBe(true);
+		const runtime = await buildPluginMcpConfigs({ cwd });
+		expect(runtime.quarantine).toEqual([]);
+		const entry = (await readRegistry("project", cwd)).plugins[0];
+		await fs.writeFile(path.join(entry?.pluginRoot ?? "", "mcp/server.mjs"), "process.exit(0);\n");
+
+		const manager = new MCPManager(cwd);
+		managers.push(manager);
+		const connected = await manager.connectServers(runtime.configs, {
+			"spawn-toctou": { provider: "gjc-plugins", providerName: "GJC plugin bundle", level: "project" },
+		} as never);
+		expect([...connected.errors.keys()]).toEqual(["spawn-toctou"]);
+		expect(manager.getConnection("spawn-toctou")).toBeUndefined();
+	});
+
+	test("fails closed when the launch plan changes after config build", async () => {
+		const cwd = await tempDir("gjc-plugin-launcher-plan-project-");
+		const source = await tempDir("gjc-plugin-launcher-plan-source-");
+		await writeBundle(source, { name: "plan-toctou", command: "node", server: mcpServer() });
+		expect((await installGjcBundle({ cwd }, "project", source)).ok).toBe(true);
+		const runtime = await buildPluginMcpConfigs({ cwd });
+		expect(runtime.quarantine).toEqual([]);
+		const config = runtime.configs["plan-toctou"];
+		if (!config || config.type === "http" || config.type === "sse") throw new Error("missing stdio config");
+		config.args = [...(config.args ?? []), "unexpected"];
+
+		const manager = new MCPManager(cwd);
+		managers.push(manager);
+		const connected = await manager.connectServers(runtime.configs, {
+			"plan-toctou": { provider: "gjc-plugins", providerName: "GJC plugin bundle", level: "project" },
+		} as never);
+		expect([...connected.errors.keys()]).toEqual(["plan-toctou"]);
+		expect(manager.getConnection("plan-toctou")).toBeUndefined();
 	});
 });
