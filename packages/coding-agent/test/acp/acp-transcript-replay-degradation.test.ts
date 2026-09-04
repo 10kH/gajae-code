@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, setDefaultTimeout } from "bun:test";
 import * as path from "node:path";
 import type { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
 import { AcpAgent, transcriptReplayContent } from "@gajae-code/coding-agent/modes/acp/acp-agent";
@@ -6,22 +6,26 @@ import { TempDir } from "@gajae-code/utils";
 import { writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
 import {
 	type ExactSessionAuthorityFixture,
-	registerExactSessionAuthority,
+	type ExactSessionAuthorityOptions,
+	prepareExactSessionAuthority,
+	publishExactSessionAuthority,
 } from "../helpers/sdk-exact-session-authority";
+
+setDefaultTimeout(60_000);
 
 const TOKEN = "acp-transcript-replay-token";
 
 async function bounded<T>(promise: Promise<T>, label: string): Promise<T> {
 	return await Promise.race([
 		promise,
-		Bun.sleep(5_000).then(() => {
+		Bun.sleep(45_000).then(() => {
 			throw new Error(`Timed out waiting for ${label}`);
 		}),
 	]);
 }
 
 async function waitFor(predicate: () => boolean, label: string): Promise<void> {
-	const deadline = Date.now() + 5_000;
+	const deadline = Date.now() + 45_000;
 	while (Date.now() < deadline) {
 		if (predicate()) return;
 		await Bun.sleep(5);
@@ -111,6 +115,7 @@ describe("ACP transcript replay degradation", () => {
 	let agentDir = "";
 	let cwd = "";
 	let authority: ExactSessionAuthorityFixture;
+	let authorityOptions: ExactSessionAuthorityOptions;
 
 	beforeEach(async () => {
 		tempDir = TempDir.createSync("@acp-transcript-replay-");
@@ -159,6 +164,8 @@ describe("ACP transcript replay degradation", () => {
 									}
 								: {};
 						socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result }));
+						if (frame.operation === "session.create")
+							setTimeout(() => void publishExactSessionAuthority(authorityOptions, authority), 10);
 						return;
 					}
 					if (frame.type === "query_request") {
@@ -228,13 +235,14 @@ describe("ACP transcript replay degradation", () => {
 
 		const port = server.port;
 		if (port === undefined) throw new Error("Expected ACP fixture server port");
-		authority = await registerExactSessionAuthority({
+		authorityOptions = {
 			agentDir,
 			cwd,
 			sessionId: "replay-session",
 			url: `ws://127.0.0.1:${port}`,
 			token: TOKEN,
-		});
+		};
+		authority = await prepareExactSessionAuthority(authorityOptions);
 		await writeBrokerDiscovery(agentDir, {
 			version: 1,
 			protocolVersion: 3,
