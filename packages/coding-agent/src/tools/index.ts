@@ -249,6 +249,14 @@ export interface ToolSession {
 	waitForUserSteering?: (signal: AbortSignal) => Promise<void>;
 	/** Get session ID */
 	getSessionId?: () => string | null;
+	/**
+	 * Opaque async-job ownership/lookup endpoint key. This is not a workflow or
+	 * path identity: workflow/session consumers must use getSessionId(). Only
+	 * AsyncJobManager ownership and endpoint-first lookup may use this accessor
+	 * (subagent-inherited managers are registered under the parent's endpoint;
+	 * review thread P1).
+	 */
+	getAsyncEndpointId?: () => string | null;
 	/** Get credential-selection session identity. */
 	getCredentialSessionId?: () => string | null;
 	/** Scope-held MCP facade for mcp:// resolution. */

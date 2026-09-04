@@ -105,7 +105,9 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 	): Promise<AgentToolResult<JobToolDetails>> {
 		const manager =
 			this.session.getAsyncJobManager?.() ??
-			AsyncJobManager.forEndpoint(this.session.getSessionId?.() ?? undefined) ??
+			AsyncJobManager.forEndpoint(
+				this.session.getAsyncEndpointId?.() ?? this.session.getSessionId?.() ?? undefined,
+			) ??
 			AsyncJobManager.instance();
 		if (!manager) {
 			return {
@@ -396,7 +398,11 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 			const generation = manager.getJob?.(job.id)?.generation;
 			if (!generation) continue;
 			// The endpoint disambiguates concurrent sessions' same job ids (review P1).
-			const registration = lookupOwnedRegistration(job.id, generation, this.session.getSessionId?.() ?? "local");
+			const registration = lookupOwnedRegistration(
+				job.id,
+				generation,
+				this.session.getAsyncEndpointId?.() ?? this.session.getSessionId?.() ?? "local",
+			);
 			if (registration) unregisterOwnedRegistration(registration);
 		}
 
