@@ -111,8 +111,9 @@ function createRegistry(
 	const profileMap = new Map(profiles.map(profile => [profile.name, profile]));
 	return {
 		refresh: vi.fn(async () => {}),
+		refreshStatic: vi.fn(async () => {}),
 		getError: () => undefined,
-		getAvailable: () => [
+		getAvailable: vi.fn(() => [
 			codexModel,
 			anthropicModel,
 			minimaxModel,
@@ -120,7 +121,7 @@ function createRegistry(
 			{ ...noSuffixModel, provider: "provider-b" },
 			...builtinCodexModels,
 			...builtinComboModels,
-		],
+		]),
 		getAll: () => [
 			codexModel,
 			anthropicModel,
@@ -133,7 +134,7 @@ function createRegistry(
 		hasConfiguredProviderAuth: (provider: string) => authenticatedProviders.includes(provider),
 		getDiscoverableProviders: () => [],
 		getCanonicalModels: () => [],
-		getCanonicalModelSelections: () => [],
+		getCanonicalModelSelections: vi.fn(() => []),
 		resolveCanonicalModel: () => undefined,
 		getModelProfiles: () => new Map(profileMap),
 		getModelProfile: (name: string) => profileMap.get(name),
@@ -187,6 +188,143 @@ function cursorRowLabel(selector: ModelSelectorComponent): string | undefined {
 }
 
 describe("preset landing adversarial QA", () => {
+	test("defers browser catalog materialization until model browsing starts", async () => {
+		const registry = Object.assign(createRegistry(["openai-codex"]), {
+			getAvailableForProfileActivation: vi.fn(() => [codexModel, ...builtinCodexModels]),
+		});
+		const ui = { requestRender: vi.fn() } as unknown as TUI;
+		const selector = new ModelSelectorComponent(
+			ui,
+			undefined,
+			Settings.isolated(),
+			registry as never,
+			[],
+			() => {},
+			() => {},
+		);
+
+		await rendered(selector);
+		expect(registry.refreshStatic).toHaveBeenCalledTimes(1);
+		expect(registry.refresh).not.toHaveBeenCalled();
+		expect(registry.getAvailable).not.toHaveBeenCalled();
+		expect(registry.getCanonicalModelSelections).not.toHaveBeenCalled();
+		expect(registry.getAvailableForProfileActivation).toHaveBeenCalled();
+
+		selector.handleInput("g");
+		const text = await rendered(selector);
+		expect(registry.refresh).toHaveBeenCalledTimes(1);
+		expect(registry.getAvailable).toHaveBeenCalledTimes(1);
+		expect(registry.getCanonicalModelSelections).toHaveBeenCalledTimes(1);
+		expect(text).toContain("gpt-5.5");
+	});
+
+	test("renders deferred catalog refresh failures instead of hanging on the loading frame", async () => {
+		const registry = createRegistry(["openai-codex"]);
+		registry.refresh.mockRejectedValueOnce(new Error("offline refresh failed"));
+		const selector = new ModelSelectorComponent(
+			{ requestRender: vi.fn() } as unknown as TUI,
+			undefined,
+			Settings.isolated(),
+			registry as never,
+			[],
+			() => {},
+			() => {},
+		);
+
+		await rendered(selector);
+		selector.handleInput("g");
+		const text = await rendered(selector);
+		expect(text).toContain("offline refresh failed");
+		expect(text).not.toContain("Loading models...");
+	});
+
+	test("retries a failed deferred load when the catalog changes", async () => {
+		let notifyCatalogChanged = () => {};
+		const registry = Object.assign(createRegistry(["openai-codex"]), {
+			onCatalogChanged: (listener: () => void) => {
+				notifyCatalogChanged = listener;
+				return () => {};
+			},
+		});
+		registry.refresh.mockRejectedValueOnce(new Error("offline refresh failed"));
+		const selector = new ModelSelectorComponent(
+			{ requestRender: vi.fn() } as unknown as TUI,
+			undefined,
+			Settings.isolated(),
+			registry as never,
+			[],
+			() => {},
+			() => {},
+		);
+
+		await rendered(selector);
+		selector.handleInput("g");
+		expect(await rendered(selector)).toContain("offline refresh failed");
+		notifyCatalogChanged();
+		const recovered = await rendered(selector);
+		expect(recovered).toContain("gpt-5.5");
+		expect(recovered).not.toContain("offline refresh failed");
+	});
+
+	test("renders static preset refresh failures on the landing", async () => {
+		const registry = createRegistry(["openai-codex"]);
+		registry.refreshStatic.mockRejectedValueOnce(new Error("static refresh failed"));
+		const selector = new ModelSelectorComponent(
+			{ requestRender: vi.fn() } as unknown as TUI,
+			undefined,
+			Settings.isolated(),
+			registry as never,
+			[],
+			() => {},
+			() => {},
+		);
+
+		const text = await rendered(selector);
+		expect(text).toContain("static refresh failed");
+		expect(text).toContain("Model presets");
+	});
+
+	test("re-evaluates preset versus browser mode after static refresh", async () => {
+		let profiles = new Map<string, ModelProfileDefinition>();
+		const addedRegistry = createRegistry(["openai-codex"], []);
+		addedRegistry.getModelProfiles = () => new Map(profiles);
+		addedRegistry.getModelProfile = (name: string) => profiles.get(name);
+		addedRegistry.refreshStatic.mockImplementation(async () => {
+			profiles = new Map([[codexEco.name, codexEco]]);
+		});
+		const added = new ModelSelectorComponent(
+			{ requestRender: vi.fn() } as unknown as TUI,
+			undefined,
+			Settings.isolated(),
+			addedRegistry as never,
+			[],
+			() => {},
+			() => {},
+		);
+		expect(await rendered(added)).toContain("Model presets");
+		expect(addedRegistry.refresh).not.toHaveBeenCalled();
+		expect(addedRegistry.getCanonicalModelSelections).not.toHaveBeenCalled();
+
+		profiles = new Map([[codexEco.name, codexEco]]);
+		const removedRegistry = createRegistry(["openai-codex"], [codexEco]);
+		removedRegistry.getModelProfiles = () => new Map(profiles);
+		removedRegistry.getModelProfile = (name: string) => profiles.get(name);
+		removedRegistry.refreshStatic.mockImplementation(async () => {
+			profiles.clear();
+		});
+		const removed = new ModelSelectorComponent(
+			{ requestRender: vi.fn() } as unknown as TUI,
+			undefined,
+			Settings.isolated(),
+			removedRegistry as never,
+			[],
+			() => {},
+			() => {},
+		);
+		const removedText = await rendered(removed);
+		expect(removedText).toContain("Models");
+		expect(removedRegistry.getAvailable).toHaveBeenCalledTimes(1);
+	});
 	beforeAll(async () => {
 		testTheme = await getThemeByName("red-claw");
 		installTestTheme();
@@ -229,7 +367,7 @@ describe("preset landing adversarial QA", () => {
 		selector.handleInput("\n");
 		selector.handleInput("\n");
 		selector.handleInput("g");
-		const text = normalizeRenderedText(selector.render(260).join("\n"));
+		const text = await rendered(selector);
 		expect(text).toContain("Models");
 		expect(text).toContain("gpt-5.5");
 		expect(text).not.toContain("Preset preview:");
@@ -247,6 +385,7 @@ describe("preset landing adversarial QA", () => {
 		expect(text).toContain("CODEX");
 		selector.handleInput("\x1b[A");
 		selector.handleInput("\n");
+		await rendered(selector);
 		selector.handleInput("\n");
 		text = normalizeRenderedText(selector.render(260).join("\n"));
 		expect(text).toContain("Action for:");
