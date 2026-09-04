@@ -375,10 +375,10 @@ type SessionRows = {
 	sessions: SdkSessionRowV1[];
 };
 
-async function sessionRows(agentDir: string): Promise<SessionRows> {
+async function sessionRows(agentDir: string, input: JsonRecord = {}): Promise<SessionRows> {
 	await ensureBroker({ agentDir });
 	return await withRouter(agentDir, async router => {
-		const response = await paginatedSessionList(router);
+		const response = await paginatedSessionList(router, input);
 		const result = resultObject(response) ?? {};
 		let sessions: SdkSessionRowV1[];
 		try {
@@ -689,7 +689,7 @@ async function runList(agentDir: string, args: SdkSessionCliArgs): Promise<unkno
 }
 
 async function runInspect(agentDir: string, sessionId: string): Promise<unknown> {
-	const listing = await sessionRows(agentDir);
+	const listing = await sessionRows(agentDir, { resolveSessionId: sessionId });
 	const session = listing.sessions.find(candidate => candidate.sessionId === sessionId);
 	if (!session)
 		throw new SdkSessionCliError("session_unavailable", `Session ${sessionId} is not indexed by the broker.`, 1);
