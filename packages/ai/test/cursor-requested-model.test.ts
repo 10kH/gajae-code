@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
+import { fromJson, type JsonValue } from "@bufbuild/protobuf";
 import { resolveCursorWireModelForTest, streamCursor } from "../src/providers/cursor";
-import type { AgentRunRequest } from "../src/providers/cursor/gen/agent_pb";
+import { type AgentRunRequest, AgentRunRequestSchema } from "../src/providers/cursor/gen/agent_pb";
 import type { Context, Model } from "../src/types";
 
 const baseCursorModel: Model<"cursor-agent"> = {
@@ -30,10 +31,11 @@ function captureCursorRequest(model: Model<"cursor-agent">): Promise<AgentRunReq
 		{
 			apiKey: "test-token",
 			onPayload: payload => {
-				if (payload && typeof payload === "object" && "$typeName" in payload) {
-					resolve(payload as AgentRunRequest);
-				} else {
-					reject(new Error("Cursor payload was not an AgentRunRequest"));
+				try {
+					JSON.stringify(payload);
+					resolve(fromJson(AgentRunRequestSchema, payload as JsonValue));
+				} catch (error) {
+					reject(error);
 				}
 				// The payload callback runs before any transport is opened, so the
 				// request contract can be captured without a network connection.
