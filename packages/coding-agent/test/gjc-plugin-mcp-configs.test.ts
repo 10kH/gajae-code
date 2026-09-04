@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
-import { buildPluginMcpConfigs, installGjcBundle } from "../src/extensibility/gjc-plugins";
+import { buildPluginMcpConfigs, installGjcBundle, registryPathForScope } from "../src/extensibility/gjc-plugins";
 import { isPluginMcpPublicNetworkBound } from "../src/runtime-mcp/plugin-network-boundary";
 
 const fixturesRoot = path.join(import.meta.dir, "fixtures", "gjc-plugins");
@@ -33,7 +33,9 @@ describe("plugin MCP runtime config conversion", () => {
 		expect(quarantine).toHaveLength(0);
 		const docs = configs.domain_docs;
 		expect(docs.type).toBe("stdio");
-		expect(docs.command).toBe(Bun.which("bun"));
+		const bun = Bun.which("bun");
+		if (!bun) throw new Error("bun launcher missing");
+		expect(docs.command).toBe(await fs.realpath(bun));
 		// cwd is confined to the installed plugin root.
 		const installedRoot = path.join(cwd, ".gjc", "gjc-plugins", "valid-six-surface-bundle");
 		expect(docs.args?.slice(0, 5)).toEqual([
@@ -45,8 +47,12 @@ describe("plugin MCP runtime config conversion", () => {
 		]);
 		const separator = docs.args?.indexOf("--") ?? -1;
 		expect(docs.args?.[separator + 1]).toBe(path.join(installedRoot, "mcp/domain-docs.ts"));
-		expect(docs.args?.[separator + 2]).toMatch(/^[0-9a-f]{64}$/);
-		expect(docs.args?.[separator + 3]).toBe(installedRoot);
+		expect(docs.args?.[separator + 2]).toBe(registryPathForScope("project", cwd));
+		expect(docs.args?.[separator + 3]).toMatch(/^[0-9a-f]{64}$/);
+		expect(docs.args?.[separator + 4]).toBe("valid-six-surface-bundle");
+		expect(docs.args?.[separator + 5]).toBe(installedRoot);
+		expect(docs.args?.[separator + 6]).toBe(await fs.realpath(installedRoot));
+		expect(docs.args?.[separator + 7]).toBe("");
 		expect(path.resolve(docs.cwd)).toBe(path.resolve(installedRoot));
 	});
 

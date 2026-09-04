@@ -116,6 +116,8 @@ export interface MCPStdioServerConfig extends MCPServerConfigBase {
 	cwd?: string;
 	/** Internal trusted-boundary check run immediately before process creation. */
 	spawnGuard?: (launch: MCPStdioSpawnLaunch) => Promise<void>;
+	/** Internal cleanup run only after the owned stdio child is confirmed exited. */
+	afterProcessExit?: () => Promise<void>;
 	/** Test seam for deterministic mutation after the guard and before process creation. */
 	afterSpawnGuardForTest?: () => Promise<void>;
 }

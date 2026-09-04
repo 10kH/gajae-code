@@ -400,6 +400,7 @@ export class StdioTransport implements MCPTransport {
 			if (teardown.status !== "terminated") {
 				throw new MCPExpectedFailure(new Error(`stdio child teardown ${teardown.status}`));
 			}
+			await this.config.afterProcessExit?.();
 			this.#process = null;
 		}
 

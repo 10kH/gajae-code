@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -144,54 +144,229 @@ function canonicalPersistedJson(value: unknown): string {
 	return canonicalJson(JSON.parse(serialized) as unknown);
 }
 
-const VERIFIED_STDIO_MODULE_WRAPPER = String.raw`
+const VERIFIED_STDIO_MODULE_WRAPPER = `
 import { createHash } from "node:crypto";
-import { constants } from "node:fs";
-import { open, realpath } from "node:fs/promises";
-import { extname } from "node:path";
+import { constants, rmSync } from "node:fs";
+import { mkdir, open, realpath, writeFile } from "node:fs/promises";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
-const [target, expectedHash, expectedCwd, ...serverArgs] = process.argv.slice(1);
-if (!target || !expectedHash || !expectedCwd) throw new Error("invalid verified plugin MCP launch metadata");
-if (await realpath(process.cwd()) !== expectedCwd) throw new Error("verified plugin MCP cwd drifted before execution");
+const [entrypointPath, registryPath, expectedEntryHash, pluginName, pluginRoot, expectedRootReal, cwdRelative, snapshotBaseReal, snapshotRoot, workspaceRootReal, ...serverArgs] = process.argv.slice(1);
+if (!entrypointPath || !registryPath || !expectedEntryHash || !pluginName || !pluginRoot || !expectedRootReal || cwdRelative === undefined || !snapshotBaseReal || !snapshotRoot || !workspaceRootReal) {
+	throw new Error("invalid verified plugin MCP launch metadata");
+}
+if (!/^[a-f0-9]{64}$/u.test(expectedEntryHash)) throw new Error("invalid plugin MCP registry authority hash");
 const flags = constants.O_RDONLY | (typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0);
-const handle = await open(target, flags);
-let bytes;
-try {
-	const before = await handle.stat();
-	if (!before.isFile()) throw new Error("verified plugin MCP entrypoint is not a regular file");
-	bytes = await handle.readFile();
-	const after = await handle.stat();
-	if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size || bytes.byteLength !== after.size) {
-		throw new Error("verified plugin MCP entrypoint changed while reading");
+
+function sha256(bytes) {
+	return createHash("sha256").update(bytes).digest("hex");
+}
+
+function canonicalJson(value) {
+	if (value === null || typeof value !== "object") {
+		const serialized = JSON.stringify(value);
+		if (serialized === undefined) throw new Error("invalid plugin MCP registry value");
+		return serialized;
 	}
-} finally {
-	await handle.close();
+	if (Array.isArray(value)) return "[" + value.map(canonicalJson).join(",") + "]";
+	return "{" + Object.keys(value).sort().map(key => JSON.stringify(key) + ":" + canonicalJson(value[key])).join(",") + "}";
 }
-if (createHash("sha256").update(bytes).digest("hex") !== expectedHash) {
-	throw new Error("verified plugin MCP entrypoint hash mismatch");
+
+function isWithin(root, target) {
+	const rel = relative(root, target);
+	return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
-let source = bytes.toString("utf8").replace(/^#![^\n]*(?:\n|$)/u, match => "//" + match);
-const extension = extname(target).toLowerCase();
-if (globalThis.Bun && (extension === ".ts" || extension === ".tsx" || extension === ".jsx")) {
-	const loader = extension === ".tsx" ? "tsx" : extension === ".jsx" ? "jsx" : "ts";
-	source = new Bun.Transpiler({ loader }).transformSync(source);
+
+function resolveInside(root, relativePath, label) {
+	if (typeof relativePath !== "string" || relativePath.length === 0 || isAbsolute(relativePath)) {
+		throw new Error(label + " is not a relative file path");
+	}
+	const target = resolve(root, relativePath);
+	if (!isWithin(root, target) || target === root) throw new Error(label + " escapes its authenticated root");
+	return target;
 }
-process.argv = [process.execPath, target, ...serverArgs];
-await import("data:text/javascript;base64," + Buffer.from(source).toString("base64"));
+
+async function readStableFile(target, label) {
+	const handle = await open(target, flags);
+	try {
+		const before = await handle.stat();
+		if (!before.isFile()) throw new Error(label + " is not a regular file");
+		const bytes = await handle.readFile();
+		const after = await handle.stat();
+		if (
+			before.dev !== after.dev ||
+			before.ino !== after.ino ||
+			before.size !== after.size ||
+			before.mtimeMs !== after.mtimeMs ||
+			before.ctimeMs !== after.ctimeMs ||
+			bytes.byteLength !== after.size
+		) {
+			throw new Error(label + " changed while reading");
+		}
+		return bytes;
+	} finally {
+		await handle.close();
+	}
+}
+
+const actualRootReal = await realpath(pluginRoot);
+if (actualRootReal !== expectedRootReal) throw new Error("verified plugin MCP root drifted before execution");
+const expectedOriginalCwd = resolve(actualRootReal, cwdRelative);
+if (!isWithin(actualRootReal, expectedOriginalCwd)) throw new Error("verified plugin MCP cwd escapes its root");
+if (await realpath(process.cwd()) !== await realpath(expectedOriginalCwd)) {
+	throw new Error("verified plugin MCP cwd drifted before execution");
+}
+
+const registryBytes = await readStableFile(registryPath, "plugin MCP registry");
+const registry = JSON.parse(registryBytes.toString("utf8"));
+const matches = Array.isArray(registry && registry.plugins)
+	? registry.plugins.filter(entry => entry && entry.name === pluginName && entry.pluginRoot === pluginRoot)
+	: [];
+if (matches.length !== 1) throw new Error("verified plugin MCP registry identity is missing or ambiguous");
+const registryEntry = matches[0];
+if (sha256(Buffer.from(canonicalJson(registryEntry))) !== expectedEntryHash) {
+	throw new Error("verified plugin MCP registry authority drifted before execution");
+}
+if (!Array.isArray(registryEntry.copiedFiles) || registryEntry.copiedFiles.length === 0) {
+	throw new Error("verified plugin MCP copied-file authority is missing");
+}
+
+const entrypointReal = await realpath(entrypointPath);
+if (!isWithin(actualRootReal, entrypointReal)) throw new Error("verified plugin MCP entrypoint escapes its root");
+const entrypointRelative = relative(actualRootReal, entrypointReal);
+if (dirname(snapshotRoot) !== snapshotBaseReal || await realpath(snapshotBaseReal) !== snapshotBaseReal) {
+	throw new Error("verified plugin MCP snapshot base drifted before execution");
+}
+if (isWithin(actualRootReal, snapshotRoot) || isWithin(workspaceRootReal, snapshotRoot)) {
+	throw new Error("verified plugin MCP snapshot overlaps an untrusted root");
+}
+await mkdir(snapshotRoot, { mode: 0o700 });
+if (await realpath(snapshotRoot) !== snapshotRoot) throw new Error("verified plugin MCP snapshot root drifted");
+let cleaned = false;
+function cleanupSnapshot() {
+	if (cleaned) return;
+	cleaned = true;
+	try {
+		process.chdir(snapshotBaseReal);
+	} catch {
+		// The parent transport owns authoritative cleanup after confirmed exit.
+	}
+	try {
+		rmSync(snapshotRoot, { recursive: true, force: true });
+	} catch {
+		// Best effort in-child; the parent transport retries after confirmed exit.
+	}
+}
+process.once("exit", cleanupSnapshot);
+
+try {
+	let entrypointCaptured = false;
+	for (const file of registryEntry.copiedFiles) {
+		if (!file || typeof file.relativePath !== "string" || !/^[a-f0-9]{64}$/u.test(file.sha256)) {
+			throw new Error("verified plugin MCP copied-file record is malformed");
+		}
+		const sourceLexical = resolveInside(pluginRoot, file.relativePath, "plugin MCP source file");
+		const sourceReal = await realpath(sourceLexical);
+		if (!isWithin(actualRootReal, sourceReal)) throw new Error("verified plugin MCP source file escapes its root");
+		const bytes = await readStableFile(sourceReal, "plugin MCP source file");
+		if (sha256(bytes) !== file.sha256) throw new Error("verified plugin MCP source file hash mismatch");
+		const destination = resolveInside(snapshotRoot, file.relativePath, "plugin MCP snapshot file");
+		await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
+		await writeFile(destination, bytes, { flag: "wx", mode: 0o600 });
+		if (sourceReal === entrypointReal) entrypointCaptured = true;
+	}
+	if (!entrypointCaptured) throw new Error("verified plugin MCP entrypoint is not in the copied-file authority");
+	const snapshotCwd = cwdRelative === "" ? snapshotRoot : resolveInside(snapshotRoot, cwdRelative, "plugin MCP snapshot cwd");
+	await mkdir(snapshotCwd, { recursive: true, mode: 0o700 });
+	const snapshotEntrypoint = resolveInside(snapshotRoot, entrypointRelative, "plugin MCP snapshot entrypoint");
+	process.chdir(snapshotCwd);
+	process.argv = [process.execPath, snapshotEntrypoint, ...serverArgs];
+	await import(pathToFileURL(snapshotEntrypoint).href);
+} catch (error) {
+	cleanupSnapshot();
+	throw error;
+}
 `;
 
-function resolveTrustedStdioLauncher(launcher: "node" | "bun"): string {
-	const executable = Bun.which(launcher);
-	if (!executable || !path.isAbsolute(executable))
-		throw new Error(`Trusted stdio launcher is unavailable: ${launcher}`);
-	return executable;
+/**
+ * Resolve host launchers through absolute PATH entries outside the workspace
+ * and installed plugin. Relative entries such as `.` and absolute workspace
+ * entries can otherwise select repository-controlled executables before the
+ * authenticated plugin wrapper.
+ */
+async function resolveTrustedStdioLauncher(
+	launcher: "node" | "bun",
+	workspaceRoot: string,
+	pluginRoot: string,
+): Promise<string> {
+	const lexicalRoots = [workspaceRoot, pluginRoot].map(root => path.resolve(root));
+	const realRoots = await Promise.all(lexicalRoots.map(root => fs.realpath(root)));
+	const untrustedRoots = [...new Set([...lexicalRoots, ...realRoots])];
+	const pathEntries = (Bun.env.PATH ?? "")
+		.split(path.delimiter)
+		.map(entry => {
+			const trimmed = entry.trim();
+			return trimmed.startsWith('"') && trimmed.endsWith('"') ? trimmed.slice(1, -1) : trimmed;
+		})
+		.filter(entry => entry.length > 0 && path.isAbsolute(entry));
+
+	for (const pathEntry of pathEntries) {
+		const candidate = Bun.which(launcher, { PATH: pathEntry });
+		if (!candidate || !path.isAbsolute(candidate)) continue;
+		try {
+			const lexical = path.resolve(candidate);
+			if (untrustedRoots.some(root => isWithin(root, lexical))) continue;
+			const real = await fs.realpath(lexical);
+			if (untrustedRoots.some(root => isWithin(root, real))) continue;
+			if ((await fs.stat(real)).isFile()) return real;
+		} catch {
+			// A stale PATH entry is not launcher authority; try the next one.
+		}
+	}
+	throw new Error(`Trusted stdio launcher is unavailable from absolute host PATH entries: ${launcher}`);
+}
+
+async function resolveTrustedSnapshotBase(
+	workspaceRoot: string,
+	pluginRoot: string,
+): Promise<{
+	baseReal: string;
+	workspaceRootReal: string;
+}> {
+	const lexicalRoots = [workspaceRoot, pluginRoot].map(root => path.resolve(root));
+	const realRoots = await Promise.all(lexicalRoots.map(root => fs.realpath(root)));
+	const untrustedRoots = [...new Set([...lexicalRoots, ...realRoots])];
+	const candidates = [
+		os.tmpdir(),
+		...(process.platform === "win32" ? [] : ["/tmp"]),
+		path.join(os.homedir(), ".gjc", "plugin-mcp-tmp"),
+	];
+	for (const candidate of [...new Set(candidates.map(value => path.resolve(value)))]) {
+		if (untrustedRoots.some(root => isWithin(root, candidate))) continue;
+		try {
+			await fs.mkdir(candidate, { recursive: true, mode: 0o700 });
+			const real = await fs.realpath(candidate);
+			if (untrustedRoots.some(root => isWithin(root, real))) continue;
+			return { baseReal: real, workspaceRootReal: realRoots[0] };
+		} catch {
+			// An unavailable or unwritable base is not snapshot authority.
+		}
+	}
+	throw new Error("Trusted plugin MCP snapshot base is unavailable outside untrusted roots");
 }
 
 function verifiedStdioArgs(input: {
 	launcher: "node" | "bun";
 	entrypointPath: string;
-	entrypointHash: string;
-	cwdRealPath: string;
+	registryPath: string;
+	registryEntryHash: string;
+	pluginName: string;
+	pluginRoot: string;
+	pluginRootReal: string;
+	cwdRelative: string;
+	snapshotBaseReal: string;
+	snapshotRoot: string;
+	workspaceRootReal: string;
 	serverArgs: readonly string[];
 }): string[] {
 	return [
@@ -202,8 +377,15 @@ function verifiedStdioArgs(input: {
 		VERIFIED_STDIO_MODULE_WRAPPER,
 		"--",
 		input.entrypointPath,
-		input.entrypointHash,
-		input.cwdRealPath,
+		input.registryPath,
+		input.registryEntryHash,
+		input.pluginName,
+		input.pluginRoot,
+		input.pluginRootReal,
+		input.cwdRelative,
+		input.snapshotBaseReal,
+		input.snapshotRoot,
+		input.workspaceRootReal,
 		...input.serverArgs,
 	];
 }
@@ -629,13 +811,28 @@ export async function buildPluginMcpConfigs(input: { cwd: string }): Promise<{
 					);
 					if (!ownedFile) throw new Error(`MCP "${m.name}": authenticated entrypoint record is missing`);
 					const ownedExecutablePath = await resolveRuntimeFile(entry.pluginRoot, ownedFile.relativePath);
-					const command = resolveTrustedStdioLauncher(invocation.launcher);
-					const cwdRealPath = await fs.realpath(invocation.cwd);
+					const command = await resolveTrustedStdioLauncher(invocation.launcher, input.cwd, entry.pluginRoot);
+					const registryPath = registryPathForScope(entry.scope, input.cwd);
+					const registryEntryHash = sha256(Buffer.from(canonicalPersistedJson(entry)));
+					const pluginRootReal = await fs.realpath(entry.pluginRoot);
+					const cwdRelative = path.relative(entry.pluginRoot, invocation.cwd);
+					const { baseReal: snapshotBaseReal, workspaceRootReal } = await resolveTrustedSnapshotBase(
+						input.cwd,
+						entry.pluginRoot,
+					);
+					const snapshotRoot = path.join(snapshotBaseReal, `gjc-plugin-mcp-${randomBytes(16).toString("hex")}`);
 					const args = verifiedStdioArgs({
 						launcher: invocation.launcher,
 						entrypointPath: ownedExecutablePath,
-						entrypointHash: ownedFile.sha256,
-						cwdRealPath,
+						registryPath,
+						registryEntryHash,
+						pluginName: entry.name,
+						pluginRoot: entry.pluginRoot,
+						pluginRootReal,
+						cwdRelative,
+						snapshotBaseReal,
+						snapshotRoot,
+						workspaceRootReal,
 						serverArgs: (cfg.args ?? []).slice(1),
 					});
 					configs[m.name] = {
@@ -649,6 +846,9 @@ export async function buildPluginMcpConfigs(input: { cwd: string }): Promise<{
 						// Bun additionally receives an immutable empty config plus flags
 						// that disable ambient dotenv and package auto-install behavior.
 						noInheritEnv: true,
+						afterProcessExit: async () => {
+							await fs.rm(snapshotRoot, { recursive: true, force: true });
+						},
 						spawnGuard: async (launch: MCPStdioSpawnLaunch) => {
 							await assertMcpPluginRootOwnedByScope(entry, input.cwd);
 							await assertInstalledTreeAuthenticated(entry);
@@ -697,18 +897,32 @@ export async function buildPluginMcpConfigs(input: { cwd: string }): Promise<{
 							);
 							if (!freshOwnedFile)
 								throw new Error(`MCP "${m.name}": authenticated entrypoint drifted before spawn`);
-							const expectedCommand = resolveTrustedStdioLauncher(freshInvocation.launcher);
-							const freshCwdRealPath = await fs.realpath(freshInvocation.cwd);
+							const expectedCommand = await resolveTrustedStdioLauncher(
+								freshInvocation.launcher,
+								input.cwd,
+								entry.pluginRoot,
+							);
 							const expectedArgs = verifiedStdioArgs({
 								launcher: freshInvocation.launcher,
 								entrypointPath: freshExecutablePath,
-								entrypointHash: freshOwnedFile.sha256,
-								cwdRealPath: freshCwdRealPath,
+								registryPath,
+								registryEntryHash,
+								pluginName: entry.name,
+								pluginRoot: entry.pluginRoot,
+								pluginRootReal,
+								cwdRelative: path.relative(entry.pluginRoot, freshInvocation.cwd),
+								snapshotBaseReal,
+								snapshotRoot,
+								workspaceRootReal,
 								serverArgs: (freshSurface.config.args ?? []).slice(1),
 							});
+							const [launchCwdReal, expectedCwdReal] = await Promise.all([
+								fs.realpath(launch.cwd),
+								fs.realpath(freshInvocation.cwd),
+							]);
 							if (
 								launch.command !== expectedCommand ||
-								path.resolve(launch.cwd) !== path.resolve(freshInvocation.cwd) ||
+								launchCwdReal !== expectedCwdReal ||
 								canonicalPersistedJson(launch.args) !== canonicalPersistedJson(expectedArgs)
 							) {
 								throw new Error(`MCP "${m.name}": launch plan drifted before spawn`);
