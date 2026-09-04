@@ -39,6 +39,7 @@ describe("Bedrock prompt caching support", () => {
 			"anthropic.claude-3-haiku-20240307-v1:0",
 			"anthropic.claude-3-5-sonnet-20240620-v1:0",
 			"anthropic.claude-3-7-haiku-20250219-v1:0",
+			"anthropic.claude-opus-4-6--preview",
 			"anthropic.claude-v2:0",
 		];
 		for (const [expected, ids] of [

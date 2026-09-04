@@ -488,13 +488,6 @@ function anthropicModelHasRealXHighEffort<TApi extends Api>(model: ApiModel<TApi
 
 function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
 	applyOpenAIModelPricing(model);
-	if (model.provider === "amazon-bedrock" && model.api === "bedrock-converse-stream") {
-		const cacheSupport = supportsBedrockClaudePromptCaching(model.id);
-		if (cacheSupport === false) {
-			model.cost.cacheRead = 0;
-			model.cost.cacheWrite = 0;
-		}
-	}
 	const copilotLimits = model.provider === "github-copilot" ? COPILOT_GENERATED_LIMITS[model.id] : undefined;
 	if (copilotLimits) {
 		model.contextWindow = copilotLimits.contextWindow;
@@ -557,6 +550,13 @@ function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
 	}
 	if (parsedModel.family === "openai") {
 		applyOpenAICatalogPolicy(model, parsedModel);
+	}
+	if (model.provider === "amazon-bedrock" && model.api === "bedrock-converse-stream") {
+		const cacheSupport = supportsBedrockClaudePromptCaching(model.id);
+		if (cacheSupport === false) {
+			model.cost.cacheRead = 0;
+			model.cost.cacheWrite = 0;
+		}
 	}
 	// GLM-5.2 (Zhipu/ZAI): ships a 1M lossless context window, but the bundled
 	// catalog copied GLM-5.1's 200K and that stale value survives generate-models
