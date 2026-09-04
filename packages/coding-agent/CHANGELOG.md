@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+- `/model` provider-tab refreshes now reuse the already loaded static catalog and update only the selected provider's discovery state, avoiding repeated signed preset registry work while retaining full-catalog refresh behavior for static configuration changes.
+- Added the `command` status-line segment for user-produced HUD content. It runs
+  configured user/global shell commands in the background with scheduled cached
+  refreshes, bounded timeout/output, ANSI sanitization, placeholder degradation,
+  disposal cancellation, and custom-editor configuration while preserving
+  synchronous TUI rendering; project-scoped settings cannot trigger execution.
+
 ## [0.16.3] - 2026-09-04
 
 ## [0.16.2] - 2026-09-04
