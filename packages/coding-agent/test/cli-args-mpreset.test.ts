@@ -3,6 +3,7 @@ import { ThinkingLevel } from "@gajae-code/agent-core";
 import { type Model, THINKING_EFFORTS } from "@gajae-code/ai";
 import { CliParseError } from "@gajae-code/utils/cli";
 import { parseArgs } from "../src/cli/args";
+import { ROOT_THINKING_LEVELS } from "../src/cli/root-flags";
 import type { ModelProfileDefinition } from "../src/config/model-profiles";
 import { Settings } from "../src/config/settings";
 import {
@@ -13,6 +14,7 @@ import {
 } from "../src/main";
 import { parseCliCredentialSelector } from "../src/runtime-credential-selector";
 import type { AgentSession } from "../src/session/agent-session";
+import { toReasoningEffort } from "../src/thinking";
 
 const model = (provider: string, id: string): Model =>
 	({ provider, id, name: id, api: "openai-responses", contextWindow: 1000, maxTokens: 1000 }) as Model;
@@ -938,23 +940,75 @@ test("thinking-only startup uses authoritative override semantics", async () => 
 	]);
 });
 
+test("explicit CLI --thinking off overrides a resumed high default without provider effort", async () => {
+	const settings = Settings.isolated({
+		"modelProfile.default": "default-profile",
+		defaultThinkingLevel: ThinkingLevel.High,
+	});
+	const session = fakeSession();
+	const parsedArgs = parseArgs(["--resume", "session-1", "--thinking", "off"]);
+	expect(parsedArgs.resume).toBe("session-1");
+
+	await applyStartupModelProfiles({
+		session,
+		settings,
+		modelRegistry: fakeRegistry([
+			{
+				name: "default-profile",
+				requiredProviders: ["profile-provider"],
+				modelMapping: { default: "profile-provider/default:medium" },
+				source: "user",
+			},
+		]) as never,
+		parsedArgs,
+		startupModel: undefined,
+		startupThinkingLevel: undefined,
+	});
+
+	expect(
+		session.setModelTemporaryCalls.map(call => `${call.model.provider}/${call.model.id}:${call.thinkingLevel}`),
+	).toEqual(["profile-provider/default:high", "profile-provider/default:off"]);
+	expect(session.thinkingLevel).toBe(ThinkingLevel.Off);
+	expect(toReasoningEffort(ThinkingLevel.Off)).toBeUndefined();
+});
+
 describe("CLI --thinking contract", () => {
-	test("accepts every Effort level advertised by help", () => {
-		for (const level of THINKING_EFFORTS) {
+	test("accepts every root thinking level in separate and equals forms", () => {
+		for (const level of ROOT_THINKING_LEVELS) {
 			expect(parseArgs(["--thinking", level]).thinking).toBe(level);
+			expect(parseArgs([`--thinking=${level}`]).thinking).toBe(level);
 		}
+	});
+
+	test("accepts off unchanged in JSON non-interactive startup", () => {
+		expect(parseArgs(["--mode=json", "--print", "--thinking=off", "prompt"])).toMatchObject({
+			mode: "json",
+			print: true,
+			thinking: ThinkingLevel.Off,
+			messages: ["prompt"],
+		});
+	});
+
+	test("keeps off agent-local instead of expanding the provider effort catalog", () => {
+		expect(ROOT_THINKING_LEVELS).toEqual([ThinkingLevel.Off, ...THINKING_EFFORTS]);
+		expect(new Set<string>(THINKING_EFFORTS).has(ThinkingLevel.Off)).toBe(false);
+		expect(toReasoningEffort(ThinkingLevel.Off)).toBeUndefined();
 	});
 
 	test("rejects the retired ultra token instead of silently ignoring it", () => {
 		expect(() => parseArgs(["--thinking", "ultra"])).toThrow(CliParseError);
 		expect(() => parseArgs(["--thinking", "ultra"])).toThrow(
-			/Invalid --thinking level "ultra".*minimal, low, medium, high, xhigh, max/,
+			/Invalid --thinking level "ultra".*off, minimal, low, medium, high, xhigh, max/,
 		);
 	});
 
-	test("rejects unknown tokens fail-closed", () => {
-		expect(() => parseArgs(["--thinking", "ludicrous"])).toThrow(CliParseError);
-		expect(() => parseArgs(["--thinking", "off"])).toThrow(CliParseError);
+	test("rejects inherit and unknown tokens with the advertised levels", () => {
+		for (const rawThinking of ["inherit", "ludicrous"]) {
+			expect(() => parseArgs(["--thinking", rawThinking])).toThrow(CliParseError);
+			expect(() => parseArgs(["--thinking", rawThinking])).toThrow(
+				`Invalid --thinking level "${rawThinking}". Expected one of: ${ROOT_THINKING_LEVELS.join(", ")}`,
+			);
+		}
 	});
 
 	test("rejects a bare --thinking with no value", () => {
@@ -970,5 +1024,14 @@ describe("CLI --thinking contract", () => {
 
 	test("rejects an empty --thinking= value", () => {
 		expect(() => parseArgs(["--thinking="])).toThrow(CliParseError);
+	});
+
+	test("rejects duplicate thinking flags instead of applying order-dependent precedence", () => {
+		for (const args of [
+			["--thinking", "off", "--thinking", "off"],
+			["--thinking=high", "--thinking=off"],
+		]) {
+			expect(() => parseArgs(args)).toThrow("--thinking can only be specified once");
+		}
 	});
 });
