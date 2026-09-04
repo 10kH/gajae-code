@@ -82,6 +82,45 @@ describe("SearchTool timeout", () => {
 		await expect(execution).rejects.toBeInstanceOf(ToolAbortError);
 	});
 
+	it("does not surface partial results collected before a later target times out", async () => {
+		await Bun.write(path.join(tempDir, "second.txt"), "needle\n");
+		let calls = 0;
+		const grep: typeof grepFn = async options => {
+			calls++;
+			if (calls === 1) {
+				return {
+					matches: [
+						{
+							path: "",
+							lineNumber: 1,
+							line: "needle",
+						},
+					],
+					totalMatches: 1,
+					filesWithMatches: 1,
+					filesSearched: 1,
+				};
+			}
+			const signal = options.signal;
+			if (!(signal instanceof AbortSignal)) throw new Error("Expected search abort signal");
+			return await new Promise<GrepResult>((_resolve, reject) => {
+				signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), {
+					once: true,
+				});
+			});
+		};
+		const tool = new SearchTool(createSession(tempDir), { grep });
+
+		await expect(
+			tool.execute("partial-timeout", {
+				pattern: "needle",
+				paths: ["target.txt", "second.txt"],
+				timeout: 0.5,
+			}),
+		).rejects.toThrow("Search timed out after 0.5s; increase timeout or narrow paths/pattern");
+		expect(calls).toBe(2);
+	});
+
 	it("publishes the default and accepted timeout bounds", () => {
 		const tool = new SearchTool(createSession(tempDir));
 		expect(tool.parameters.parse({ pattern: "needle" }).timeout).toBe(5);

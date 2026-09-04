@@ -299,6 +299,24 @@ test("does not signal when authenticated shutdown fails for another reason", asy
 	expect(signalled).toBe(false);
 });
 
+test("continues when a concurrent caller already retired the previous broker", async () => {
+	const previous = discovery(1, "darwin:1:0");
+	const replacement = discovery(2, "darwin:2:0");
+	const discoveries = [previous, replacement, replacement, replacement];
+	const result = await restartSdkBroker(
+		{ agentDir: "/agent" },
+		deps({
+			readDiscovery: async () => discoveries.shift() ?? replacement,
+			shutdown: async () => {
+				throw new Error("connection refused");
+			},
+			ensure: async () => replacement,
+		}),
+	);
+
+	expect(result).toEqual({ previousPid: 1, pid: 2 });
+});
+
 test("does not start a replacement until the old discovery identity disappears", async () => {
 	const previous = discovery(1, "darwin:1:0");
 	let ensured = false;

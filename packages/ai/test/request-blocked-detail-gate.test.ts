@@ -14,9 +14,16 @@ import { createCodexModel } from "./helpers";
 
 describe("parseCodexError: detail-shaped gate rejection", () => {
 	it("includes the HTTP status when the provider returns no error text", async () => {
-		const info = await parseCodexError(new Response(null, { status: 404, statusText: "" }));
+		const info = await parseCodexError(
+			new Response(null, {
+				status: 404,
+				statusText: "",
+				headers: { authorization: "Bearer provider-secret" },
+			}),
+		);
 
 		expect(info.message).toBe("Codex request failed (HTTP 404)");
+		expect(info.message).not.toContain("provider-secret");
 		expect(info.status).toBe(404);
 		expect(info.code).toBeUndefined();
 	});

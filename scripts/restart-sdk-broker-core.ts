@@ -50,12 +50,23 @@ function isUnknownOperation(error: unknown): boolean {
  * Older published brokers answer `broker.shutdown` with `unknown_operation`; their
  * process still stops its published identity on SIGTERM, so fall back to that.
  */
-async function stopPreviousBroker(discovery: BrokerDiscoveryLike, deps: RestartSdkBrokerDeps): Promise<void> {
+async function stopPreviousBroker(
+	agentDir: string,
+	discovery: BrokerDiscoveryLike,
+	deps: RestartSdkBrokerDeps,
+): Promise<void> {
 	try {
 		await deps.shutdown(discovery);
 	} catch (error) {
-		if (!isUnknownOperation(error)) throw error;
-		deps.signal(discovery);
+		if (isUnknownOperation(error)) {
+			deps.signal(discovery);
+			return;
+		}
+		// Another authenticated restart caller may have already retired this exact
+		// identity. Only suppress the transport failure after discovery proves the
+		// old pid/incarnation is no longer published; otherwise fail closed.
+		const current = await deps.readDiscovery(agentDir, Number.POSITIVE_INFINITY);
+		if (current?.pid === discovery.pid && current.incarnation === discovery.incarnation) throw error;
 	}
 }
 
@@ -116,7 +127,7 @@ export async function restartSdkBroker(
 				sessionHostDiscoveryError = reasonFrom(error);
 			}
 		}
-		await stopPreviousBroker(previous, deps);
+		await stopPreviousBroker(options.agentDir, previous, deps);
 		const deadline = Date.now() + gracefulTimeoutMs;
 		while (Date.now() < deadline) {
 			const current = await deps.readDiscovery(options.agentDir, Number.POSITIVE_INFINITY);
