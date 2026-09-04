@@ -197,6 +197,7 @@ import { EventBus } from "../utils/event-bus";
 import { buildNamedToolChoice, buildNamedToolChoiceResult } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
 import { createSessionLifecycleService } from "./lifecycle/client";
+import { lookupSessionApiKey, resolveLiveSessionApiKeyModel } from "./session-api-key";
 import {
 	attachLifecycleStartupCapability,
 	lifecycleMcpStartupTimeoutOption,
@@ -4293,16 +4294,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				// AgentLoop asks by provider, but the active model carries the
 				// model-scoped credential selector. Read it at call time so model
 				// changes are honored after /new, fork, resume, or branch switches.
-				const liveModel = sessionAgent?.state.model ?? model;
-				const key =
-					liveModel?.provider === provider
-						? await modelRegistry.getApiKey(liveModel, credentialSessionId)
-						: undefined;
-				const providerKey = key ?? (await modelRegistry.getApiKeyForProvider(provider, credentialSessionId));
-				if (!providerKey) {
-					throw new Error(`No API key found for provider "${provider}"`);
-				}
-				return providerKey;
+				const liveModel = resolveLiveSessionApiKeyModel(sessionAgent?.state.model, model);
+				return lookupSessionApiKey(modelRegistry, provider, credentialSessionId, liveModel);
 			},
 			getAuthCredentialType: provider => modelRegistry.getSessionCredentialType(provider, credentialSessionId),
 			streamFn: async (streamModel, context, streamOptions) => {
