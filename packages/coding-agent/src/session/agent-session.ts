@@ -5616,24 +5616,47 @@ export class AgentSession {
 
 	async #runToolSessionTransitionCleanups(): Promise<void> {
 		const cleanups = Array.from(this.#toolSessionTransitionCleanups);
-		this.#toolSessionTransitionCleanups.clear();
 		const results = await Promise.allSettled(cleanups.map(async cleanup => await cleanup()));
 		const failures: unknown[] = [];
-		for (const result of results) {
-			if (result.status === "rejected") failures.push(result.reason);
+		for (let index = 0; index < results.length; index++) {
+			const result = results[index]!;
+			if (result.status === "fulfilled") this.#toolSessionTransitionCleanups.delete(cleanups[index]!);
+			else failures.push(result.reason);
 		}
 		if (failures.length > 0) throw new AggregateError(failures, "Tool session transition cleanup failed.");
 	}
 
 	async #runToolSessionCleanups(): Promise<void> {
 		const cleanups = Array.from(this.#toolSessionCleanups);
-		this.#toolSessionCleanups.clear();
 		const results = await Promise.allSettled(cleanups.map(async cleanup => await cleanup()));
 		const failures: unknown[] = [];
-		for (const result of results) {
-			if (result.status === "rejected") failures.push(result.reason);
+		for (let index = 0; index < results.length; index++) {
+			const result = results[index]!;
+			if (result.status === "fulfilled") this.#toolSessionCleanups.delete(cleanups[index]!);
+			else failures.push(result.reason);
 		}
 		if (failures.length > 0) throw new AggregateError(failures, "Tool session cleanup failed.");
+	}
+
+	#claimToolSessionTransitionCleanups(): Promise<void> {
+		const cleanups = Array.from(this.#toolSessionTransitionCleanups);
+		this.#toolSessionTransitionCleanups.clear();
+		return this.#settleClaimedToolSessionCleanups(cleanups, "Tool session transition cleanup failed.");
+	}
+
+	#claimToolSessionCleanups(): Promise<void> {
+		const cleanups = Array.from(this.#toolSessionCleanups);
+		this.#toolSessionCleanups.clear();
+		return this.#settleClaimedToolSessionCleanups(cleanups, "Tool session cleanup failed.");
+	}
+
+	async #settleClaimedToolSessionCleanups(
+		cleanups: readonly (() => Promise<void> | void)[],
+		message: string,
+	): Promise<void> {
+		const results = await Promise.allSettled(cleanups.map(async cleanup => await cleanup()));
+		const failures = results.flatMap(result => (result.status === "rejected" ? [result.reason] : []));
+		if (failures.length > 0) throw new AggregateError(failures, message);
 	}
 
 	getAsyncJobSnapshot(options?: { recentLimit?: number }): AsyncJobSnapshot | null {
@@ -9369,10 +9392,10 @@ export class AgentSession {
 			// one here left signal exit orphaning the subprocess. Each runner clears
 			// its set, so a graceful dispose running first makes this a no-op rather
 			// than a double free.
-			this.#runToolSessionCleanups().catch((error: unknown) =>
+			this.#claimToolSessionCleanups().catch((error: unknown) =>
 				logger.warn("signal teardown: tool session cleanups failed", { error }),
 			),
-			this.#runToolSessionTransitionCleanups().catch((error: unknown) =>
+			this.#claimToolSessionTransitionCleanups().catch((error: unknown) =>
 				logger.warn("signal teardown: tool session transition cleanups failed", { error }),
 			),
 		]);
