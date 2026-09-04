@@ -49,6 +49,13 @@ function parseHostname(baseUrl: string): string | undefined {
 }
 
 function isProductionXaiApiUrl(baseUrl: string): boolean {
+	if (baseUrl !== baseUrl.trim() || baseUrl.includes("?") || baseUrl.includes("#") || baseUrl.includes("\\")) {
+		return false;
+	}
+	const authorityTail = baseUrl.slice("https://".length);
+	const authorityEnd = authorityTail.search(/[/?#]/u);
+	const authority = authorityTail.slice(0, authorityEnd === -1 ? undefined : authorityEnd);
+	if (authority.includes("@")) return false;
 	try {
 		const url = new URL(baseUrl);
 		return (
