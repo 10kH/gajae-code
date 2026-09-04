@@ -35,7 +35,7 @@ import {
 	PREVIEW_LIMITS,
 	splitGroupsByBlankLine,
 } from "./render-utils";
-import { ToolError } from "./tool-errors";
+import { ToolAbortError, ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 
 let searchNativesLoad:
@@ -71,6 +71,7 @@ const searchSchema = z
 			.number()
 			.optional()
 			.describe("files to skip before collecting results — use to paginate when the prior call hit the file limit"),
+		timeout: z.number().min(0.5).max(60).default(5).describe("timeout in seconds (0.5–60)").optional(),
 	})
 	.strict();
 
@@ -90,6 +91,9 @@ export const SINGLE_FILE_MATCHES = 200;
  * (DEFAULT_FILE_LIMIT files × MULTI_FILE_PER_FILE_MATCHES matches) plus
  * pagination headroom so the caller can see total file count. */
 const INTERNAL_TOTAL_CAP = 2000;
+const DEFAULT_SEARCH_TIMEOUT_MS = 5000;
+const MIN_SEARCH_TIMEOUT_MS = 500;
+const MAX_SEARCH_TIMEOUT_MS = 60_000;
 
 /**
  * Detect a `,` that is not inside a `{…}` brace expansion. Used to catch
@@ -235,6 +239,8 @@ export interface SearchToolOptions {
 	context?: number;
 	/** Per-call total match cap used by Cursor's native Pi grep frame. */
 	totalMatchLimit?: number;
+	/** Test or remote override for the native grep implementation. */
+	grep?: typeof grepFn;
 }
 
 type SearchParams = z.infer<typeof searchSchema>;
@@ -266,12 +272,16 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 		_onUpdate?: AgentToolUpdateCallback<SearchToolDetails>,
 		_toolContext?: AgentToolContext,
 	): Promise<AgentToolResult<SearchToolDetails>> {
-		const { pattern, i, gitignore, skip } = params;
+		const { pattern, i, gitignore, skip, timeout } = params;
 		// Recurring real-world failure mode: models omit `paths` for repo-wide
 		// searches. Default to the working directory instead of failing the call.
 		const paths = params.paths ?? ["."];
+		const requestedTimeoutMs = timeout != null ? Math.round(timeout * 1000) : DEFAULT_SEARCH_TIMEOUT_MS;
+		const timeoutMs = Math.min(MAX_SEARCH_TIMEOUT_MS, Math.max(MIN_SEARCH_TIMEOUT_MS, requestedTimeoutMs));
+		const timeoutSignal = AbortSignal.timeout(timeoutMs);
+		const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
 
-		return untilAborted(signal, async () => {
+		return untilAborted(combinedSignal, async () => {
 			const normalizedPattern = pattern.trim();
 			if (!normalizedPattern) {
 				throw new ToolError("Pattern must not be empty");
@@ -345,7 +355,8 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 				const baseDisplayMode = resolveFileDisplayMode(this.session);
 				const immutableDisplayMode = resolveFileDisplayMode(this.session, { immutable: true });
 
-				const { GrepOutputMode, grep } = await searchNatives();
+				const { GrepOutputMode, grep: nativeGrep } = await searchNatives();
+				const grep = this.options.grep ?? nativeGrep;
 				const effectiveOutputMode = GrepOutputMode.Content;
 				// Multi-scope = more than one file may match. We fetch up to
 				// INTERNAL_TOTAL_CAP matches from native grep, then in JS group by
@@ -363,7 +374,10 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 						let totalMatches = 0;
 						let filesSearched = 0;
 						const targets = exactFilePaths
-							? exactFilePaths.map(filePath => ({ basePath: filePath, glob: undefined as string | undefined }))
+							? exactFilePaths.map(filePath => ({
+									basePath: filePath,
+									glob: undefined as string | undefined,
+								}))
 							: (multiTargets ?? []);
 						for (const target of targets) {
 							const targetResult = await grep(
@@ -381,6 +395,8 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 									contextAfter: normalizedContextAfter,
 									maxColumns: DEFAULT_MAX_COLUMN,
 									mode: effectiveOutputMode,
+									signal: combinedSignal,
+									timeoutMs,
 								},
 								undefined,
 							);
@@ -416,6 +432,8 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 								contextAfter: normalizedContextAfter,
 								maxColumns: DEFAULT_MAX_COLUMN,
 								mode: effectiveOutputMode,
+								signal: combinedSignal,
+								timeoutMs,
 							},
 							undefined,
 						);
@@ -648,6 +666,16 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 			} finally {
 				await cleanupArchiveScratch();
 			}
+		}).catch(error => {
+			const nativeTimedOut = error instanceof Error && error.message === "Aborted: Timeout";
+			if ((timeoutSignal.aborted || nativeTimedOut) && !signal?.aborted) {
+				const seconds = timeoutMs % 1000 === 0 ? `${timeoutMs / 1000}` : (timeoutMs / 1000).toFixed(1);
+				throw new ToolError(`Search timed out after ${seconds}s; increase timeout or narrow paths/pattern`);
+			}
+			if (combinedSignal.aborted || (error instanceof Error && error.name === "AbortError")) {
+				throw new ToolAbortError();
+			}
+			throw error;
 		});
 	}
 }
@@ -662,6 +690,7 @@ interface SearchRenderArgs {
 	i?: boolean;
 	gitignore?: boolean;
 	skip?: number;
+	timeout?: number;
 }
 
 const COLLAPSED_TEXT_LIMIT = PREVIEW_LIMITS.COLLAPSED_LINES * 2;
@@ -674,6 +703,7 @@ export const searchToolRenderer = {
 		if (args.i) meta.push("case:insensitive");
 		if (args.gitignore === false) meta.push("gitignore:false");
 		if (args.skip !== undefined && args.skip > 0) meta.push(`skip:${args.skip}`);
+		if (args.timeout !== undefined && args.timeout !== 5) meta.push(`timeout:${args.timeout}s`);
 
 		const text = renderStatusLine(
 			{ icon: "pending", title: "Search", description: args.pattern || "?", meta },

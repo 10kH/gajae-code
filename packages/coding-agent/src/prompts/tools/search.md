@@ -5,6 +5,7 @@ Searches files using powerful regex matching.
 - `paths` accepts an array of files, directories, globs, or internal URLs; when omitted, the whole working directory is searched
 - `paths` is an array; do not embed commas or spaces inside a single entry. Pass `["src", "tests"]` not `["src,tests"]`.
 - Cross-line patterns are detected from literal `\n` or escaped `\\n` in `pattern`
+- `timeout` is in seconds (default 5, range 0.5–60). Increase it only for intentionally broad searches; narrow `paths` first
 </instruction>
 
 <output>
@@ -20,4 +21,5 @@ Searches files using powerful regex matching.
 <critical>
 - Search paths are an array; pass separate entries rather than comma-joined paths.
 - Use a cross-line pattern only when the match actually spans lines.
+- Do not retry a timed-out search unchanged; narrow `paths`/`pattern` or explicitly increase `timeout`.
 </critical>

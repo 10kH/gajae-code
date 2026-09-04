@@ -988,7 +988,7 @@ export const TOOL_CATALOG: Readonly<Record<string, ToolCatalogEntry>> = {
 	"search": {
 		"name": "search",
 		"label": "Search",
-		"description": "Searches files using powerful regex matching.\n\n<instruction>\n- Supports Rust regex syntax (RE2-style — no lookaround or backreferences). Use line anchors or post-filters instead of (?!…)/(?<!…)\n- `paths` accepts an array of files, directories, globs, or internal URLs; when omitted, the whole working directory is searched\n- `paths` is an array; do not embed commas or spaces inside a single entry. Pass `[\"src\", \"tests\"]` not `[\"src,tests\"]`.\n- Cross-line patterns are detected from literal `\\n` or escaped `\\\\n` in `pattern`\n</instruction>\n\n<output>\n</output>\n\n<critical>\n- Search paths are an array; pass separate entries rather than comma-joined paths.\n- Use a cross-line pattern only when the match actually spans lines.\n</critical>",
+		"description": "Searches files using powerful regex matching.\n\n<instruction>\n- Supports Rust regex syntax (RE2-style — no lookaround or backreferences). Use line anchors or post-filters instead of (?!…)/(?<!…)\n- `paths` accepts an array of files, directories, globs, or internal URLs; when omitted, the whole working directory is searched\n- `paths` is an array; do not embed commas or spaces inside a single entry. Pass `[\"src\", \"tests\"]` not `[\"src,tests\"]`.\n- Cross-line patterns are detected from literal `\\n` or escaped `\\\\n` in `pattern`\n- `timeout` is in seconds (default 5, range 0.5–60). Increase it only for intentionally broad searches; narrow `paths` first\n</instruction>\n\n<output>\n</output>\n\n<critical>\n- Search paths are an array; pass separate entries rather than comma-joined paths.\n- Use a cross-line pattern only when the match actually spans lines.\n- Do not retry a timed-out search unchanged; narrow `paths`/`pattern` or explicitly increase `timeout`.\n</critical>",
 		"parameters": {
 			"type": "object",
 			"properties": {
@@ -1016,6 +1016,13 @@ export const TOOL_CATALOG: Readonly<Record<string, ToolCatalogEntry>> = {
 				"skip": {
 					"description": "files to skip before collecting results — use to paginate when the prior call hit the file limit",
 					"type": "number"
+				},
+				"timeout": {
+					"default": 5,
+					"description": "timeout in seconds (0.5–60)",
+					"type": "number",
+					"minimum": 0.5,
+					"maximum": 60
 				}
 			},
 			"required": [

@@ -47,6 +47,7 @@
 
 ## [0.16.1] - 2026-09-03
 
+- File-content search now has a call-wide timeout (`timeout`, default 5 seconds, range 0.5–60) that is forwarded to native grep together with cancellation. Broad filesystem searches can no longer run indefinitely, timeout failures tell callers to narrow the scope or explicitly increase the budget, and user cancellation remains a distinct tool abort.
 - Broker-launched SDK sessions now activate an already-cached default model profile before refreshing provider catalogs in the background, preventing redundant online discovery from consuming the fixed semantic-readiness window while preserving strict refresh fallback when cached profile resolution fails.
 - Native Windows external editors now launch executable commands directly instead of through `cmd.exe`, preventing the shell handoff from swallowing the first editor keystroke; `.cmd` and `.bat` editor commands retain shell execution.
 - Slack Socket Mode now accepts real `event_callback` payloads, routes ordinary active-thread text as new user turns when no ask is pending, keeps idle notifications non-replyable, deduplicates distinct messages without treating shared `event_context` metadata as event identity, and scopes deterministic root message IDs to the configured workspace and channel.
