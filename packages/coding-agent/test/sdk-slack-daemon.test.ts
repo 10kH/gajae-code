@@ -15,6 +15,7 @@ import { type SessionAttachment, SessionRouterError } from "../src/sdk/router";
 class FakeSlack {
 	handler: ((envelope: SlackSocketEnvelope) => void | Promise<void>) | undefined;
 	acks: string[] = [];
+	reactions: Array<{ channel: string; timestamp: string; name: string }> = [];
 	posts: Array<{ channel: string; text: string; threadTs?: string; clientMsgId: string }> = [];
 	knownMessages = new Map<string, { channel: string; ts: string; client_msg_id: string }>();
 	knownTimestamps = new Set<string>();
@@ -61,6 +62,10 @@ class FakeSlack {
 	async ack(envelopeId: string): Promise<void> {
 		this.acks.push(envelopeId);
 		await this.onAck?.(envelopeId);
+	}
+
+	async addReaction(input: { channel: string; timestamp: string; name: string }): Promise<void> {
+		this.reactions.push(input);
 	}
 
 	waitForPostStartCount(count: number): Promise<void> {
@@ -312,6 +317,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 			const duplicate = await daemon.handleEnvelope(messageEnvelope("duplicate", "event-1", root.rootTs!));
 			expect([accepted, rejected, duplicate]).toEqual([true, false, false]);
 			expect(fake.acks).toEqual(["accepted", "rejected", "duplicate"]);
+			expect(fake.reactions).toEqual([{ channel: "C1", timestamp: "2.event-1", name: "eyes" }]);
 			expect(injected).toHaveLength(1);
 		});
 	});
@@ -1736,7 +1742,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 		}
 	});
 
-	it("adopts an orphaned message effect after pending action state changes", async () => {
+	it("rejects an orphaned message effect after a pending action appears", async () => {
 		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-orphan-message-"));
 		try {
 			const first = new SlackNotificationDaemon({
@@ -1750,7 +1756,8 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 			const root = await first.postRoot("session", "root");
 			const effectId = `inbound:T1:C1:${root.rootTs}:U1:message-event:message-id`;
 			const idempotencyKey = `slack:T1:C1:${root.rootTs}:U1:message-event:message-id`;
-			await new ChatEffectJournal({ agentDir, transport: "slack" }).enqueue({
+			const journal = new ChatEffectJournal({ agentDir, transport: "slack" });
+			await journal.enqueue({
 				id: effectId,
 				kind: "sdk.inbound.user_message",
 				transport: "slack",
@@ -1794,9 +1801,8 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				authorizeActor: actorId => actorId === "U1",
 			});
 			await restarted.start();
-			expect(replayed).toEqual([
-				expect.objectContaining({ type: "user_message", sessionId: "session", text: "persisted prompt" }),
-			]);
+			expect(replayed).toEqual([]);
+			expect(await journal.read(effectId)).toMatchObject({ state: "terminal", receipt: { status: "rejected" } });
 			await restarted.stop();
 		} finally {
 			await fs.rm(agentDir, { recursive: true, force: true });
