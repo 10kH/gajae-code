@@ -117,7 +117,8 @@ describe("send_prompt same-session concurrency", () => {
 							const client: SessionRouterClient = {
 								onFrame: () => () => {},
 								request: async frame => {
-									if (frame.type === "event_replay") return {};
+									if (frame.type === "event_replay")
+										return { ok: true, generation: 1, lastSeq: 0, events: [] };
 									expect(frame.type).toBe("control_request");
 									expect(frame.operation).toBe("turn.prompt");
 									return { accepted: true, command_id: "runtime-command", turn_id: "runtime-turn" };
