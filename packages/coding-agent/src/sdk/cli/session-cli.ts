@@ -1672,7 +1672,9 @@ export async function runTail(
 	sessionId: string,
 	args: SdkSessionCliArgs,
 ): Promise<unknown> {
-	const row = (await sessionRows(agentDir)).sessions.find(candidate => candidate.sessionId === sessionId);
+	const row = (await sessionRows(agentDir, { resolveSessionId: sessionId })).sessions.find(
+		candidate => candidate.sessionId === sessionId,
+	);
 	if (!row)
 		throw new SdkSessionCliError("session_unavailable", `Session ${sessionId} is not indexed by the broker.`, 1);
 	if (row.deleted)
