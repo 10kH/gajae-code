@@ -158,69 +158,98 @@ export interface StdioPolicyContext {
 	pluginRoot: string;
 }
 
-// Node/Bun flags that can execute or load code outside the bundled script.
-const DANGEROUS_LAUNCHER_FLAGS = [
-	"-e",
-	"--eval",
-	"-p",
-	"--print",
-	"-r",
-	"--require",
-	"--import",
-	"--loader",
-	"--experimental-loader",
-	"--input-type",
-];
+export interface StdioInvocationTarget {
+	kind: "launcher";
+	launcher: "node" | "bun";
+	entrypoint: string;
+	executablePath: string;
+	ownedRelativePath: string;
+	ownedRelativePaths: string[];
+	cwd: string;
+}
 
-/** stdio launcher/path confinement policy. */
-export function assertStdioAllowed(entry: GjcPluginMcpManifestEntry, ctx: StdioPolicyContext): void {
+function isWithinOrEqual(root: string, candidate: string): boolean {
+	return candidate === root || pathIsWithin(root, candidate);
+}
+
+function isCrossPlatformAbsolute(value: string): boolean {
+	return path.posix.isAbsolute(value) || path.win32.isAbsolute(value) || /^[A-Za-z]:/.test(value);
+}
+
+function resolveManifestRelative(base: string, value: string, label: string): string {
+	if (isCrossPlatformAbsolute(value)) fail(`${label} must be relative`);
+	const portable = path.posix.normalize(value.replaceAll("\\", "/"));
+	return path.resolve(base, ...portable.split("/"));
+}
+
+function isFileLikeArgument(value: string): boolean {
+	return value.startsWith(".") || value.includes("/") || value.includes("\\") || isCrossPlatformAbsolute(value);
+}
+
+/**
+ * Resolve the exact executable file selected by the supported stdio grammar.
+ * Bare Node/Bun launchers accept a direct bundled entrypoint as argv[0]; no
+ * manifest-controlled runtime options or subcommands precede it. Path-qualified
+ * commands are unsupported because they bypass the verified module wrapper.
+ */
+export function classifyStdioInvocation(
+	entry: GjcPluginMcpManifestEntry,
+	ctx: StdioPolicyContext,
+): StdioInvocationTarget {
 	const command = entry.command ?? "";
 	if (!command) fail(`MCP "${entry.name}": stdio requires a command`);
 	const root = path.resolve(ctx.pluginRoot);
-	const base = path.basename(command);
-	const isBareLauncher = !command.includes("/") && ALLOWED_STDIO_LAUNCHERS.has(base);
-	const isRootConfinedExecutable = command.includes("/") && pathIsWithin(root, path.resolve(root, command));
-	// Absolute or relative paths must stay inside the plugin root; bare launchers
-	// must be in the allowlist. An absolute /bin/node is rejected (outside root).
-	if (!isBareLauncher && !isRootConfinedExecutable) {
-		fail(`MCP "${entry.name}": stdio command not allowed: ${command}`);
-	}
-	const usesNodeLauncher = isBareLauncher || ALLOWED_STDIO_LAUNCHERS.has(base);
-	const args = entry.args ?? [];
-	// Reject code-eval/loader flags for node/bun launchers.
-	if (usesNodeLauncher) {
-		for (const arg of args) {
-			const flag = arg.split("=")[0];
-			if (DANGEROUS_LAUNCHER_FLAGS.includes(flag)) {
-				fail(`MCP "${entry.name}": stdio launcher flag not allowed: ${arg}`);
-			}
-		}
-		// Require a root-confined script as the first non-flag argument.
-		const firstScript = args.find(a => !a.startsWith("-"));
-		if (!firstScript) {
-			fail(`MCP "${entry.name}": node/bun stdio launcher requires a bundled script argument`);
-		}
-		if (!pathIsWithin(root, path.resolve(root, firstScript))) {
-			fail(`MCP "${entry.name}": stdio script escapes plugin root: ${firstScript}`);
-		}
-	}
-	// cwd must resolve within the plugin root.
-	const cwd = entry.cwd ? path.resolve(root, entry.cwd) : root;
-	if (!pathIsWithin(root, cwd) && cwd !== root) {
+	const cwd = entry.cwd ? resolveManifestRelative(root, entry.cwd, `MCP "${entry.name}": stdio cwd`) : root;
+	if (!isWithinOrEqual(root, cwd)) {
 		fail(`MCP "${entry.name}": stdio cwd escapes plugin root: ${entry.cwd}`);
 	}
-	// File-like args must resolve within the plugin root; reject env-expansion.
+	const args = entry.args ?? [];
 	for (const arg of args) {
 		if (/\$\{?[A-Za-z_]/.test(arg) || arg.includes("`") || arg.includes("$(")) {
 			fail(`MCP "${entry.name}": stdio arg expansion not allowed: ${arg}`);
 		}
-		if (arg.startsWith("-")) continue;
-		if (!arg.startsWith(".") && !arg.includes("/")) continue;
-		const resolvedArg = path.resolve(root, arg);
-		if (!pathIsWithin(root, resolvedArg)) {
-			fail(`MCP "${entry.name}": stdio arg escapes plugin root: ${arg}`);
-		}
 	}
+
+	if (!ALLOWED_STDIO_LAUNCHERS.has(command)) {
+		fail(`MCP "${entry.name}": stdio command not allowed (expected bare node or bun): ${command}`);
+	}
+	const entrypoint = args[0];
+	if (!entrypoint) {
+		fail(`MCP "${entry.name}": node/bun stdio launcher requires a bundled script argument`);
+	}
+	if (entrypoint.startsWith("-")) {
+		fail(`MCP "${entry.name}": stdio launcher options before the bundled entrypoint are not allowed`);
+	}
+	const executablePath = resolveManifestRelative(cwd, entrypoint, `MCP "${entry.name}": stdio launcher entrypoint`);
+	if (!pathIsWithin(root, executablePath)) {
+		fail(`MCP "${entry.name}": stdio script escapes plugin root: ${entrypoint}`);
+	}
+	const extension = path.extname(executablePath).toLowerCase();
+	const allowedExtensions = command === "node" ? new Set([".mjs"]) : new Set([".mjs", ".js", ".ts", ".jsx", ".tsx"]);
+	if (!allowedExtensions.has(extension)) {
+		fail(`MCP "${entry.name}": unsupported ${command} entrypoint extension: ${extension || "<none>"}`);
+	}
+	const ownedRelativePaths = [path.relative(root, executablePath)];
+	for (const arg of args.slice(1)) {
+		if (arg.startsWith("-") || !isFileLikeArgument(arg)) continue;
+		const resolvedArg = resolveManifestRelative(cwd, arg, `MCP "${entry.name}": stdio arg`);
+		if (!pathIsWithin(root, resolvedArg)) fail(`MCP "${entry.name}": stdio arg escapes plugin root: ${arg}`);
+		ownedRelativePaths.push(path.relative(root, resolvedArg));
+	}
+	return {
+		kind: "launcher",
+		launcher: command as "node" | "bun",
+		entrypoint,
+		executablePath,
+		ownedRelativePath: ownedRelativePaths[0] as string,
+		ownedRelativePaths,
+		cwd,
+	};
+}
+
+/** stdio launcher/path confinement policy. */
+export function assertStdioAllowed(entry: GjcPluginMcpManifestEntry, ctx: StdioPolicyContext): void {
+	classifyStdioInvocation(entry, ctx);
 }
 
 /**

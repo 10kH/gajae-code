@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { parseFrontmatter, pathIsWithin } from "@gajae-code/utils";
+import { classifyStdioInvocation } from "./mcp-policy";
 import { readSchemaDeclaration, schemaHash } from "./metadata";
 import { resolveWithinRoot } from "./paths";
 import { parseManifest, parseSubskillFrontmatter } from "./schema";
@@ -61,6 +62,26 @@ async function readManifestJson(filePath: string): Promise<unknown> {
 	}
 }
 
+async function resolveDeclaredDirectory(pluginRoot: string, rel: string): Promise<string> {
+	const resolved = resolveWithinRoot(pluginRoot, rel || ".");
+	let stat: Awaited<ReturnType<typeof fs.lstat>>;
+	try {
+		stat = await fs.lstat(resolved);
+	} catch (error) {
+		throw new GjcPluginLoadError("missing_file", `Missing GJC plugin directory at ${resolved}`, {
+			cause: error instanceof Error ? error : undefined,
+		});
+	}
+	if (!stat.isDirectory()) {
+		throw new GjcPluginLoadError("security_policy", `GJC plugin cwd must be a real directory: ${rel || "."}`);
+	}
+	const [realRoot, real] = await Promise.all([fs.realpath(pluginRoot), fs.realpath(resolved)]);
+	if (real !== realRoot && !pathIsWithin(realRoot, real)) {
+		throw new GjcPluginLoadError("security_policy", `GJC plugin cwd escapes root via symlink: ${rel || "."}`);
+	}
+	return resolved;
+}
+
 /**
  * Resolve a declared relative path, rejecting lexical escapes AND symlink
  * escapes out of the plugin root. Never imports the file.
@@ -81,7 +102,6 @@ async function resolveDeclaredFile(pluginRoot: string, rel: string): Promise<str
 	}
 	return resolved;
 }
-
 async function hashFile(
 	absPath: string,
 	rel: string,
@@ -320,17 +340,15 @@ export async function compileGjcPluginBundle(root: string): Promise<NormalizedGj
 				`GJC plugin MCP "${entry.name}": ${entry.transport} requires a url`,
 			);
 		}
-		// Hash bundled stdio script args (relative file paths) so the registry owns
-		// their copied-file boundary. Path/security failures must propagate, not be
-		// swallowed, so traversal/symlink-escape/missing bundled files fail compile.
-		for (const arg of entry.args ?? []) {
-			// Skip flags (e.g. "--port", "-v"); only treat clearly path-like args as
-			// bundled files subject to root confinement.
-			if (arg.startsWith("-")) continue;
-			if (!arg.startsWith(".") && !arg.includes("/")) continue;
-			const abs = await resolveDeclaredFile(pluginRoot, arg);
-			const { sha256: digest, bytes } = await hashFile(abs, arg, undefined);
-			files.set(arg, { sha256: digest, bytes });
+		// Derive ownership from the same cwd-aware bare Node/Bun grammar used at runtime.
+		if (entry.transport === "stdio") {
+			const invocation = classifyStdioInvocation(entry, { pluginRoot });
+			await resolveDeclaredDirectory(pluginRoot, path.relative(pluginRoot, invocation.cwd));
+			for (const relativePath of new Set(invocation.ownedRelativePaths)) {
+				const abs = await resolveDeclaredFile(pluginRoot, relativePath);
+				const { sha256: digest, bytes } = await hashFile(abs, relativePath, undefined);
+				files.set(relativePath, { sha256: digest, bytes });
+			}
 		}
 		mcps.push({
 			extensionId: surfaceIds.mcp(entry.name),

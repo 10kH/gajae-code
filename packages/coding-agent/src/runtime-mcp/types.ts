@@ -95,6 +95,12 @@ export interface MCPServerConfigBase {
 }
 
 /** Stdio server configuration */
+export interface MCPStdioSpawnLaunch {
+	command: string;
+	args: readonly string[];
+	cwd: string;
+}
+
 export interface MCPStdioServerConfig extends MCPServerConfigBase {
 	type?: "stdio"; // Default if not specified
 	command: string;
@@ -108,6 +114,10 @@ export interface MCPStdioServerConfig extends MCPServerConfigBase {
 	 */
 	noInheritEnv?: boolean;
 	cwd?: string;
+	/** Internal trusted-boundary check run immediately before process creation. */
+	spawnGuard?: (launch: MCPStdioSpawnLaunch) => Promise<void>;
+	/** Test seam for deterministic mutation after the guard and before process creation. */
+	afterSpawnGuardForTest?: () => Promise<void>;
 }
 
 /** HTTP server configuration (Streamable HTTP transport) */
