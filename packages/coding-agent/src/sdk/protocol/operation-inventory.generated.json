@@ -3968,6 +3968,17 @@
 		}
 	},
 	{
+		"sourceId": "agent_session:reloadSkills",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "internal marketplace lifecycle refresh for the session skill catalog; not an independent SDK ingress operation",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
 		"sourceId": "agent_session:retireWorkspaceTreeForRescope",
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",
