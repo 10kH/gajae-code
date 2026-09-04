@@ -8,15 +8,22 @@ function stripAnsi(text: string): string {
 	return text.replace(/\x1b\[[0-9;]*m/g, "");
 }
 
-function makeSession(fetchUsageReports: () => Promise<unknown>): AgentSession {
+function makeSession(
+	fetchUsageReports: () => Promise<unknown>,
+	model: { id: string; provider?: string; contextWindow: number } = {
+		id: "openai-codex/gpt-5",
+		provider: "openai-codex",
+		contextWindow: 200_000,
+	},
+): AgentSession {
 	const usageStats = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, premiumRequests: 0, cost: 0 };
 	return {
-		state: { messages: [], model: { id: "openai-codex/gpt-5", contextWindow: 200_000 } },
+		state: { messages: [], model },
 		messages: [],
 		systemPrompt: [],
 		agent: { state: { tools: [] } },
 		skills: [],
-		model: { id: "openai-codex/gpt-5", contextWindow: 200_000 },
+		model,
 		modelRegistry: { isUsingOAuth: () => false },
 		isStreaming: false,
 		isFastModeActive: () => false,
@@ -193,26 +200,29 @@ describe("status line usage segment", () => {
 
 	it("keeps rendering non-tiered Anthropic usage windows", async () => {
 		const now = Date.now();
-		const session = makeSession(async () => [
-			{
-				provider: "anthropic",
-				fetchedAt: now,
-				limits: [
-					{
-						id: "anthropic:5h",
-						scope: { provider: "anthropic", windowId: "5h" },
-						window: { id: "5h", resetsAt: now + 90 * 60_000 },
-						amount: { usedFraction: 0.4, unit: "percent" },
-					},
-					{
-						id: "anthropic:7d:opus",
-						scope: { provider: "anthropic", windowId: "7d", tier: "opus" },
-						window: { id: "7d", resetsAt: now + 12 * 3_600_000 },
-						amount: { usedFraction: 0.9, unit: "percent" },
-					},
-				],
-			},
-		]);
+		const session = makeSession(
+			async () => [
+				{
+					provider: "anthropic",
+					fetchedAt: now,
+					limits: [
+						{
+							id: "anthropic:5h",
+							scope: { provider: "anthropic", windowId: "5h" },
+							window: { id: "5h", resetsAt: now + 90 * 60_000 },
+							amount: { usedFraction: 0.4, unit: "percent" },
+						},
+						{
+							id: "anthropic:7d:opus",
+							scope: { provider: "anthropic", windowId: "7d", tier: "opus" },
+							window: { id: "7d", resetsAt: now + 12 * 3_600_000 },
+							amount: { usedFraction: 0.9, unit: "percent" },
+						},
+					],
+				},
+			],
+			{ id: "claude-sonnet-4-5", provider: "anthropic", contextWindow: 200_000 },
+		);
 		const component = new StatusLineComponent(session);
 		component.updateSettings({ preset: "custom", leftSegments: [], rightSegments: ["usage"], showSkillHud: false });
 
@@ -225,26 +235,29 @@ describe("status line usage segment", () => {
 
 	it("renders Grok weekly quota without admitting unrelated tiered windows", async () => {
 		const now = Date.now();
-		const session = makeSession(async () => [
-			{
-				provider: "grok-build",
-				fetchedAt: now,
-				limits: [
-					{
-						id: "grok-build:weekly",
-						scope: { provider: "grok-build", windowId: "weekly" },
-						window: { id: "weekly", resetsAt: now + 6 * 24 * 3_600_000 },
-						amount: { usedFraction: 0.06, unit: "percent" },
-					},
-					{
-						id: "grok-build:weekly:heavy",
-						scope: { provider: "grok-build", windowId: "weekly", tier: "heavy" },
-						window: { id: "weekly", resetsAt: now + 24 * 3_600_000 },
-						amount: { usedFraction: 0.99, unit: "percent" },
-					},
-				],
-			},
-		]);
+		const session = makeSession(
+			async () => [
+				{
+					provider: "grok-build",
+					fetchedAt: now,
+					limits: [
+						{
+							id: "grok-build:weekly",
+							scope: { provider: "grok-build", windowId: "weekly" },
+							window: { id: "weekly", resetsAt: now + 6 * 24 * 3_600_000 },
+							amount: { usedFraction: 0.06, unit: "percent" },
+						},
+						{
+							id: "grok-build:weekly:heavy",
+							scope: { provider: "grok-build", windowId: "weekly", tier: "heavy" },
+							window: { id: "weekly", resetsAt: now + 24 * 3_600_000 },
+							amount: { usedFraction: 0.99, unit: "percent" },
+						},
+					],
+				},
+			],
+			{ id: "grok-build", provider: "grok-build", contextWindow: 200_000 },
+		);
 		const component = new StatusLineComponent(session);
 		component.updateSettings({ preset: "custom", leftSegments: [], rightSegments: ["usage"], showSkillHud: false });
 
@@ -252,6 +265,99 @@ describe("status line usage segment", () => {
 
 		expect(text).toContain("weekly 6% (6d)");
 		expect(text).not.toContain("99%");
+		component.dispose();
+	});
+
+	it("renders xAI weekly quota with the same weekly label as Grok Build", async () => {
+		const now = Date.now();
+		const session = makeSession(
+			async () => [
+				{
+					provider: "xai",
+					fetchedAt: now,
+					limits: [
+						{
+							id: "xai:weekly",
+							scope: { provider: "xai", windowId: "weekly" },
+							window: { id: "weekly", resetsAt: now + 6 * 24 * 3_600_000 },
+							amount: { usedFraction: 0.12, unit: "percent" },
+						},
+						{
+							id: "xai:7d",
+							scope: { provider: "xai", windowId: "7d" },
+							window: { id: "7d", resetsAt: now + 20 * 24 * 3_600_000 },
+							amount: { usedFraction: 0.4, unit: "percent" },
+						},
+					],
+				},
+			],
+			{ id: "grok-4.6", provider: "xai", contextWindow: 200_000 },
+		);
+		const component = new StatusLineComponent(session);
+		component.updateSettings({ preset: "custom", leftSegments: [], rightSegments: ["usage"], showSkillHud: false });
+
+		const text = await waitForUsageText(component);
+
+		expect(text).toContain("weekly 12% (6d)");
+		expect(text).not.toContain("7d");
+		expect(text).not.toContain("40%");
+		component.dispose();
+	});
+
+	it("hides unrelated provider windows when the active model is xAI", async () => {
+		const now = Date.now();
+		const session = makeSession(
+			async () => [
+				{
+					provider: "anthropic",
+					fetchedAt: now,
+					limits: [
+						{
+							id: "anthropic:5h",
+							scope: { provider: "anthropic", windowId: "5h" },
+							window: { id: "5h", resetsAt: now + 90 * 60_000 },
+							amount: { usedFraction: 1, unit: "percent" },
+						},
+						{
+							id: "anthropic:7d",
+							scope: { provider: "anthropic", windowId: "7d" },
+							window: { id: "7d", resetsAt: now + 68 * 3_600_000 },
+							amount: { usedFraction: 0.44, unit: "percent" },
+						},
+					],
+				},
+				{
+					provider: "xai",
+					fetchedAt: now,
+					limits: [
+						{
+							id: "xai:weekly",
+							scope: { provider: "xai", windowId: "weekly" },
+							window: { id: "weekly", resetsAt: now + 56 * 3_600_000 },
+							amount: { usedFraction: 0.18, unit: "percent" },
+						},
+						{
+							id: "xai:7d",
+							scope: { provider: "xai", windowId: "7d" },
+							window: { id: "7d", resetsAt: now + 26 * 24 * 3_600_000 },
+							amount: { usedFraction: 0, unit: "percent" },
+						},
+					],
+				},
+			],
+			{ id: "grok-4.6", provider: "xai", contextWindow: 200_000 },
+		);
+		const component = new StatusLineComponent(session);
+		component.updateSettings({ preset: "custom", leftSegments: [], rightSegments: ["usage"], showSkillHud: false });
+
+		const text = await waitForUsageText(component);
+
+		expect(text).toContain("weekly 18%");
+		expect(text).not.toContain("7d");
+		expect(text).not.toContain("5h");
+		expect(text).not.toContain("100%");
+		expect(text).not.toContain("44%");
+		expect(text).not.toContain("0%");
 		component.dispose();
 	});
 });

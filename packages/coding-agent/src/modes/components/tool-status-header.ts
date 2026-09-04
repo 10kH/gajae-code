@@ -205,6 +205,8 @@ export class StatusLineComponent implements Component {
 
 	// Provider usage caching (5-min TTL, OAuth/sub only)
 	#cachedUsage: SegmentContext["usage"] = null;
+	#cachedUsageReports: unknown = null;
+	#cachedUsageProvider: string | undefined;
 	#usageFetchedAt = 0;
 	#usageInFlight = false;
 
@@ -687,6 +689,8 @@ export class StatusLineComponent implements Component {
 		void fetcher
 			.call(this.session)
 			.then(reports => {
+				this.#cachedUsageReports = reports;
+				this.#cachedUsageProvider = this.#activeUsageProvider();
 				this.#cachedUsage = this.#normalizeUsageReports(reports);
 				this.#usageFetchedAt = Date.now();
 				if (this.#onBranchChange) {
@@ -706,6 +710,8 @@ export class StatusLineComponent implements Component {
 	}
 
 	#normalizeUsageReports(reports: unknown): SegmentContext["usage"] {
+		const activeProvider = this.#activeUsageProvider();
+
 		if (!Array.isArray(reports)) return null;
 		const windows: NonNullable<SegmentContext["usage"]>["windows"] = [];
 		const seen = new Set<string>();
@@ -741,6 +747,7 @@ export class StatusLineComponent implements Component {
 			if (!report || typeof report !== "object") continue;
 			const provider = (report as { provider?: unknown }).provider;
 			const providerId = typeof provider === "string" ? provider : undefined;
+			if (activeProvider && providerId !== activeProvider) continue;
 			const limits = (report as { limits?: unknown }).limits;
 			if (!Array.isArray(limits)) continue;
 			for (const limit of limits) {
@@ -769,15 +776,29 @@ export class StatusLineComponent implements Component {
 					}
 				} else if (windowId === "5h" && !tier) {
 					pushWindow(`${providerId ?? "provider"}:5h`, "5h", fraction, resetsAt, "m");
-				} else if (windowId === "7d" && !tier) {
+				} else if (windowId === "7d" && !tier && providerId !== "grok-build" && providerId !== "xai") {
 					pushWindow(`${providerId ?? "provider"}:7d`, "7d", fraction, resetsAt, "h");
-				} else if (providerId === "grok-build" && windowId === "weekly" && !tier) {
-					pushWindow("grok-build:weekly", "weekly", fraction, resetsAt, "h");
+				} else if (windowId === "weekly" && !tier) {
+					pushWindow(`${providerId ?? "provider"}:weekly`, "weekly", fraction, resetsAt, "h");
 				}
 			}
 		}
 
 		return windows.length > 0 ? { windows } : null;
+	}
+
+	#activeUsageProvider(): string | undefined {
+		const model = this.session.state.model ?? this.session.model;
+		if (!model || typeof model !== "object") return undefined;
+		const provider = (model as { provider?: unknown }).provider;
+		return typeof provider === "string" && provider.length > 0 ? provider : undefined;
+	}
+
+	#syncCachedUsageForActiveProvider(): void {
+		const activeProvider = this.#activeUsageProvider();
+		if (this.#cachedUsageProvider === activeProvider) return;
+		this.#cachedUsageProvider = activeProvider;
+		this.#cachedUsage = this.#normalizeUsageReports(this.#cachedUsageReports);
 	}
 
 	#buildSegmentContext(
@@ -789,7 +810,7 @@ export class StatusLineComponent implements Component {
 	): SegmentContext {
 		const state = this.session.state;
 
-		// Trigger background fetch (5-min TTL); render uses cached value
+		this.#syncCachedUsageForActiveProvider();
 		this.refreshUsageInBackground();
 
 		// Get usage statistics
