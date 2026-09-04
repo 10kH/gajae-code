@@ -116,11 +116,12 @@ export interface LoadSkillsOptions extends SkillsSettings {
 }
 
 /**
- * Skill providers loaded into sessions. Only native `.gjc` skills are live
- * filesystem skills; Claude/Codex convention skills are explicit import
+ * Skill providers loaded into sessions. Native `.gjc` skills and installed
+ * marketplace plugin skills are both live filesystem skills, so both are
+ * enumerated into sessions; Claude/Codex convention skills are explicit import
  * sources into `.gjc` (see skill-management.ts) and are never loaded directly.
  */
-const LOADABLE_SKILL_PROVIDERS = new Set(["native"]);
+const LOADABLE_SKILL_PROVIDERS = new Set(["native", "claude-plugins"]);
 
 const BUILT_IN_SKILL_NAMES = new Set<string>(CANONICAL_GJC_WORKFLOW_SKILLS.map(name => name.toLowerCase()));
 
@@ -149,7 +150,8 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 
 	// Skill scope trust decides which canonical locations are loaded: project
 	// scope covers `.gjc/skills` (walk-up), user scope covers `~/.gjc/agent/skills`
-	// and the legacy user roots. Claude/Codex convention skills are import
+	// and the legacy user roots, and installed marketplace plugins are gated by the
+	// scope they were installed into. Claude/Codex convention skills are import
 	// sources into `.gjc`, never loaded directly.
 	function isSourceEnabled(source: SourceMeta): boolean {
 		const { provider, level } = source;
@@ -162,16 +164,27 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 	// Use capability API to load all skills. `all` (rather than `items`) keeps
 	// shadowed duplicates so this function can apply the documented precedence
 	// itself: project scope beats user scope.
-	const nativeProvider = getCapability<CapabilitySkill>(skillCapability.id)?.providers.find(
-		provider => provider.id === "native",
-	);
+	const providers = getCapability<CapabilitySkill>(skillCapability.id)?.providers ?? [];
+	const nativeProvider = providers.find(provider => provider.id === "native");
 	if (!nativeProvider) throw new Error("Native skill provider is unavailable");
-	const result = await nativeProvider.load({
+	const loadContext = {
 		cwd,
 		home,
 		userAgentDir: options.agentDir,
 		repoRoot: await findRepoRoot(cwd),
-	});
+	};
+	// Native first so its items keep documented precedence on a name tie; every
+	// other loadable provider follows. `isSourceEnabled` still applies scope trust
+	// per item, so widening this list never bypasses the trust gate.
+	const loadableProviders = [
+		nativeProvider,
+		...providers.filter(provider => provider.id !== "native" && LOADABLE_SKILL_PROVIDERS.has(provider.id)),
+	];
+	const loaded = await Promise.all(loadableProviders.map(provider => provider.load(loadContext)));
+	const result = {
+		items: loaded.flatMap(entry => entry.items),
+		warnings: loaded.flatMap(entry => entry.warnings ?? []),
+	};
 
 	const skillMap = new Map<string, Skill>();
 	const realPathSet = new Set<string>();

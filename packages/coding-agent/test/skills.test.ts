@@ -455,6 +455,58 @@ description: Skill loaded from a tilde-expanded custom directory.
 			}
 		});
 
+		it("enumerates installed marketplace plugin skills, still gated by scope trust", async () => {
+			const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-plugin-skills-"));
+			const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-plugin-home-"));
+			try {
+				const installPath = path.join(
+					tempHome,
+					".gjc",
+					"plugins",
+					"cache",
+					"plugins",
+					"demo-pack___demo-market___1.0.0",
+				);
+				const skillDir = path.join(installPath, "skills", "demo-skill");
+				await fs.mkdir(skillDir, { recursive: true });
+				await fs.writeFile(
+					path.join(skillDir, "SKILL.md"),
+					[
+						"---",
+						"name: demo-skill",
+						"description: Installed from a marketplace plugin",
+						"---",
+						"",
+						"# demo-skill",
+					].join("\n"),
+				);
+				await fs.writeFile(
+					path.join(tempHome, ".gjc", "plugins", "installed_plugins.json"),
+					JSON.stringify({
+						version: 2,
+						plugins: {
+							"demo-pack@demo-market": [{ scope: "user", installPath, version: "1.0.0" }],
+						},
+					}),
+				);
+
+				// An installed plugin skill must be enumerated into the session, not
+				// merely resolvable by exact name through the discovery fallback.
+				const { skills } = await loadSkills({ cwd: tempDir, home: tempHome });
+				expect(skills.map(skill => skill.name)).toContain("demo-pack:demo-skill");
+
+				// Widening the loadable-provider set must not bypass scope trust.
+				const userOff = await loadSkills({ cwd: tempDir, home: tempHome, trustUserSkills: false });
+				expect(userOff.skills.map(skill => skill.name)).not.toContain("demo-pack:demo-skill");
+
+				const masterOff = await loadSkills({ cwd: tempDir, home: tempHome, enabled: false });
+				expect(masterOff.skills).toHaveLength(0);
+			} finally {
+				await safeRm(tempDir, { recursive: true, force: true });
+				await safeRm(tempHome, { recursive: true, force: true });
+			}
+		});
+
 		it("project scope shadows user scope, and the nearest project ancestor wins", async () => {
 			const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-precedence-skills-"));
 			const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-precedence-home-"));
