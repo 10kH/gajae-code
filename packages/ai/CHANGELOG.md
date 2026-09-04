@@ -6,6 +6,12 @@
 
 - Cursor payload hooks now receive protobuf requests as JSON-safe values, await asynchronous inspection or replacement, and validate replacement payloads before transport. Checkpoint state containing 64-bit protobuf fields no longer makes hook-side `JSON.stringify` fail on JavaScript `bigint` values.
 
+## [0.16.3] - 2026-09-04
+
+## [0.16.2] - 2026-09-04
+
+- OpenAI Codex GPT-5.6 Sol selections now reject a known non-Pro ChatGPT OAuth account before dispatch, instead of allowing a binding that fails later with the provider's raw entitlement error. The same rejection is normalized for HTTP and streaming provider responses with guidance to choose a callable model or use an API-key credential.
+
 ## [0.16.1] - 2026-09-03
 
 ### Added
@@ -15,8 +21,6 @@
 - Exported `detectDiscoveredApiFamily` from `utils/discovery/openai-compatible`: infers the wire API family (`anthropic-messages` vs `openai-completions`) for a discovered model on a mixed OpenAI-compatible gateway, using the OpenAI `owned_by` owner first and the model id (`claude-*` vs `gpt-*`/`o1`/`codex`/…) as fallback, returning `undefined` when inconclusive. Consumed by custom-provider auto model discovery in `packages/coding-agent`.
 
 ### Fixed
-
-- OpenAI Codex GPT-5.6 Sol selections now reject a known non-Pro ChatGPT OAuth account before dispatch, instead of allowing a binding that fails later with the provider's raw entitlement error. The same rejection is normalized for HTTP and streaming provider responses with guidance to choose a callable model or use an API-key credential.
 
 - Antigravity discovery now keeps mid-rollout models that the backend marks `isInternal` when the same response surfaces them through `agentModelSorts`. Internal models absent from the IDE's surfaced model groups remain hidden, and denylisted or retired selectors still take precedence.
 - Tokenless loopback auth-broker requests carrying a browser `Origin` header are now rejected before credential reads or mutations. Native loopback clients without `Origin`, authenticated browser-origin clients, and the public health endpoint retain their existing behavior.
