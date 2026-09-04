@@ -7,7 +7,7 @@ import { startFixtureBrokerWithLeaseForTest } from "../../src/sdk/broker/ensure"
 import { createNotificationsExtension } from "../../src/sdk/bus";
 import { SessionManager } from "../../src/session/session-manager";
 import {
-	cleanupFixtureRoot,
+	cleanupFixtureRootAfterLateWrite,
 	createFixtureBrokerEnvironment,
 	createFixtureRootCleanup,
 	registerFixtureRuntime,
@@ -149,18 +149,18 @@ export async function startProductionSdkHost(
 				triggerAsk,
 				triggerGate,
 				runCommand: async text => await session.prompt(text),
-				stop: () => cleanupFixtureRoot(cleanup),
+				stop: () => cleanupFixtureRootAfterLateWrite(cleanup),
 			};
 		} catch (error) {
 			try {
-				await cleanupFixtureRoot(cleanup);
+				await cleanupFixtureRootAfterLateWrite(cleanup);
 			} catch (cleanupError) {
 				const failure = new AggregateError(
 					[error, cleanupError],
 					"Production SDK host setup and fixture broker cleanup both failed.",
 				);
 				Object.defineProperty(failure, "retryFixtureCleanup", {
-					value: () => cleanupFixtureRoot(cleanup),
+					value: () => cleanupFixtureRootAfterLateWrite(cleanup),
 				});
 				throw failure;
 			}

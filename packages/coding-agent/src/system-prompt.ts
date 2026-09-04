@@ -368,6 +368,8 @@ export interface BuildSystemPromptOptions {
 	pluginAppendices?: string;
 	/** Repeat full tool descriptions in system prompt. Default: false */
 	repeatToolDescriptions?: boolean;
+	/** Language guidance for internal technical reasoning. Default: off. */
+	reasoningLanguage?: "off" | "english";
 	/** Skills settings for discovery. */
 	skillsSettings?: SkillsSettings;
 	/** Working directory. Default: getProjectDir() */
@@ -542,6 +544,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		appendSystemPrompt,
 		pluginAppendices,
 		repeatToolDescriptions = false,
+		reasoningLanguage = "off",
 		toolNames: providedToolNames,
 		cwd,
 		contextFiles: providedContextFiles,
@@ -710,6 +713,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		tools: toolNames,
 		toolInfo,
 		repeatToolDescriptions,
+		reasoningLanguageEnglish: reasoningLanguage === "english",
 		toolRefs,
 		environment,
 		contextFiles: sanitizedContextFiles,

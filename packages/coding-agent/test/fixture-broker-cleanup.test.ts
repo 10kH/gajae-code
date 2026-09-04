@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import path from "node:path";
 import {
 	cleanupFixtureRoot,
+	cleanupFixtureRootAfterLateWrite,
 	cleanupFixtureRoots,
 	createFixtureBrokerEnvironment,
 	createFixtureRootCleanup,
@@ -96,6 +97,29 @@ describe("fixture broker root cleanup", () => {
 		expect(cleanup.phases.rootRemove).toBe("pending");
 		await cleanupFixtureRoot(cleanup, { rootExists: async () => false });
 		expect(events).toEqual(["shutdown", "dispose", "lease", "lease"]);
+	});
+
+	it("removes one late recreation but still rejects a persistent fixture writer", async () => {
+		const recoveredRoot = await temp();
+		const recovered = createFixtureRootCleanup(recoveredRoot, path.join(recoveredRoot, "agent"), lease([]));
+		let recoveredProbes = 0;
+		await cleanupFixtureRootAfterLateWrite(recovered, {
+			absenceObservationMs: 0,
+			rootExists: async () => recoveredProbes++ === 0,
+		});
+		expect(recovered.recreation?.detail).toBe("fixture root reappeared");
+		expect(fixtureRootForTest(recoveredRoot)).toBeUndefined();
+
+		const persistentRoot = await temp();
+		const persistent = createFixtureRootCleanup(persistentRoot, path.join(persistentRoot, "agent"), lease([]));
+		await expect(
+			cleanupFixtureRootAfterLateWrite(persistent, {
+				absenceObservationMs: 0,
+				rootExists: async () => true,
+			}),
+		).rejects.toThrow("recreated");
+		expect(persistent.phases.rootRemove).toBe("pending");
+		await cleanupFixtureRoot(persistent, { absenceObservationMs: 0, rootExists: async () => false });
 	});
 
 	it("sanitizes and restores the production SDK opt-out without contacting operator state", async () => {

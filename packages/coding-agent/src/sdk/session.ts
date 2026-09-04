@@ -3924,6 +3924,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				appendSystemPrompt: appendPrompt,
 				pluginAppendices: pluginSystemAppendices,
 				repeatToolDescriptions,
+				reasoningLanguage: settings.get("reasoningLanguage"),
 				intentField,
 				toolDiscoveryActive: effectiveDiscoveryMode === "all" || mcpDiscoveryEnabled,
 				eagerTasks: resolveEagerTasks(),
