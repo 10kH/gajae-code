@@ -70,11 +70,16 @@ impl EndpointRecord {
 	) -> Self {
 		let now = now_millis();
 		let host = host.to_owned();
+		let url_host = if host.contains(':') && !host.starts_with('[') {
+			format!("[{host}]")
+		} else {
+			host.clone()
+		};
 		Self {
 			version: 1,
 			session_id: session_id.into(),
 			pid: std::process::id(),
-			url: format!("ws://{host}:{port}"),
+			url: format!("ws://{url_host}:{port}"),
 			host,
 			port,
 			token: token.into(),
@@ -340,6 +345,16 @@ mod tests {
 		let json = serde_json::to_value(&rec).unwrap();
 		assert!(json.get("lifecycleRequestId").is_none());
 		assert!(json.get("startupPromptRef").is_none());
+	}
+
+	#[test]
+	fn endpoint_ipv6_url_uses_bracketed_host() {
+		let rec = EndpointRecord::new("sess-1", "::1", 5555, "secret-token");
+		assert_eq!(rec.host, "::1");
+		assert_eq!(rec.url, "ws://[::1]:5555");
+
+		let already_bracketed = EndpointRecord::new("sess-2", "[::1]", 5555, "secret-token");
+		assert_eq!(already_bracketed.url, "ws://[::1]:5555");
 	}
 
 	#[test]

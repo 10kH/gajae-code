@@ -102,6 +102,19 @@ impl ServerConfig {
 /// its capabilities.
 const CLIENT_HELLO_GRACE: Duration = Duration::from_secs(1);
 
+/// Maximum concurrent TCP connections still completing token-authenticated
+/// WebSocket admission.
+const PREAUTH_HANDSHAKE_TASKS: usize = 16;
+
+/// Maximum time an accepted TCP connection may take to complete WebSocket
+/// admission.
+const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Delay before retrying a listener after a transient accept failure. In
+/// particular, this prevents an `EMFILE`/`ENFILE` loop from starving
+/// handshake and connection cleanup.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(10);
+
 /// Grace period for connection tasks to observe server cancellation before
 /// forced abort.
 const CONNECTION_JOIN_GRACE: Duration = Duration::from_secs(1);
@@ -637,6 +650,48 @@ struct ServerState {
 	/// lifecycle control client can wait for readiness deterministically.
 	session_ready:       Mutex<Option<SessionReady>>,
 	connection_sequence: AtomicU64,
+}
+
+struct ConnectionCleanup {
+	state:         Arc<ServerState>,
+	connection_id: String,
+	generation:    String,
+}
+
+impl ConnectionCleanup {
+	const fn new(state: Arc<ServerState>, connection_id: String, generation: String) -> Self {
+		Self { state, connection_id, generation }
+	}
+}
+
+impl Drop for ConnectionCleanup {
+	fn drop(&mut self) {
+		cleanup_connection(&self.state, &self.connection_id, &self.generation);
+	}
+}
+
+fn cleanup_connection(state: &ServerState, connection_id: &str, generation: &str) {
+	if state.connections.lock().remove(connection_id).is_none() {
+		return;
+	}
+	let _ = state.close_tx.send(connection_id.to_owned());
+	let mut acks = state.acks.lock();
+	let ids: Vec<_> = acks
+		.pending
+		.iter()
+		.filter(|(_, pending)| {
+			pending
+				.origin
+				.as_ref()
+				.is_some_and(|(origin_id, origin_generation)| {
+					origin_id == connection_id && origin_generation == generation
+				})
+		})
+		.map(|(id, _)| id.clone())
+		.collect();
+	for id in ids {
+		acks.finish_disconnect(&id);
+	}
 }
 
 /// An authenticated inbound message paired with its server-assigned connection
@@ -1657,28 +1712,133 @@ pub async fn start(config: ServerConfig) -> std::io::Result<ServerHandle> {
 
 async fn accept_loop(listener: TcpListener, state: Arc<ServerState>, cancel: CancellationToken) {
 	let mut connections = JoinSet::new();
+	let mut handshakes: JoinSet<Option<ConnectionWebSocket>> = JoinSet::new();
+	// Keep one descriptor available so an `EMFILE` accept failure can still
+	// drain one queued socket and return the listener to a state where it can
+	// make progress once a handshake task releases its descriptor.
+	let null_device = if cfg!(windows) { "NUL" } else { "/dev/null" };
+	let mut accept_spare = std::fs::File::open(null_device).ok();
 	loop {
 		tokio::select! {
 			() = cancel.cancelled() => break,
 			joined = connections.join_next(), if !connections.is_empty() => {
 				let _ = joined;
 			},
+			joined = handshakes.join_next(), if !handshakes.is_empty() => {
+				if let Some(Ok(Some(ws))) = joined {
+					connections.spawn(handle_conn(ws, Arc::clone(&state), cancel.clone()));
+				}
+			},
 			accepted = listener.accept() => {
-				let Ok((stream, _peer)) = accepted else { continue };
-				connections.spawn(handle_conn(stream, Arc::clone(&state), cancel.clone()));
+				match accepted {
+					Ok((stream, _peer)) => {
+						if handshakes.len() >= PREAUTH_HANDSHAKE_TASKS {
+							match handshakes.try_join_next() {
+								Some(Ok(Some(ws))) => {
+									connections.spawn(handle_conn(ws, Arc::clone(&state), cancel.clone()));
+								},
+								Some(Ok(None) | Err(_)) => {},
+								None => {
+									drop(stream);
+									continue;
+								},
+							}
+						}
+						handshakes.spawn(handshake_conn(stream, Arc::clone(&state), cancel.clone()));
+					},
+					Err(error) if is_fd_exhaustion(&error) => {
+						if !drain_fd_exhausted_accept(
+							&listener,
+							&cancel,
+							null_device,
+							&mut accept_spare,
+						)
+						.await
+						{
+							break;
+			}
+					},
+					Err(_) => {
+						if !backoff_after_accept_error(&cancel).await {
+							break;
+			}
+					},
+				}
 			}
 		}
 	}
 	cancel.cancel();
-	join_connection_tasks(&mut connections).await;
+	join_connection_tasks(&mut handshakes, &mut connections).await;
 }
 
-async fn join_connection_tasks(connections: &mut JoinSet<()>) {
-	if timeout(CONNECTION_JOIN_GRACE, async { while connections.join_next().await.is_some() {} })
-		.await
-		.is_err()
-	{
+async fn drain_fd_exhausted_accept(
+	listener: &TcpListener,
+	cancel: &CancellationToken,
+	null_device: &str,
+	accept_spare: &mut Option<std::fs::File>,
+) -> bool {
+	// With no spare descriptor, accepting another socket would fail repeatedly
+	// and leave queued clients ahead of future valid upgrades. Close the reserve,
+	// accept one socket for immediate disposal, then recreate the reserve.
+	drop(accept_spare.take());
+	let drained = tokio::select! {
+		() = cancel.cancelled() => return false,
+		accepted = listener.accept() => accepted,
+	};
+	match drained {
+		Ok((stream, _peer)) => drop(stream),
+		Err(_) => {
+			if !backoff_after_accept_error(cancel).await {
+				return false;
+			}
+		},
+	}
+	*accept_spare = std::fs::File::open(null_device).ok();
+	true
+}
+
+async fn backoff_after_accept_error(cancel: &CancellationToken) -> bool {
+	tokio::select! {
+		() = cancel.cancelled() => false,
+		() = sleep(ACCEPT_ERROR_BACKOFF) => true,
+	}
+}
+
+#[cfg(unix)]
+fn is_fd_exhaustion(error: &std::io::Error) -> bool {
+	matches!(error.raw_os_error(), Some(code) if code == libc::EMFILE || code == libc::ENFILE)
+}
+
+#[cfg(windows)]
+fn is_fd_exhaustion(error: &std::io::Error) -> bool {
+	// WSAEMFILE (the Winsock form of ERROR_TOO_MANY_OPEN_FILES).
+	matches!(error.raw_os_error(), Some(4 | 10024))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_fd_exhaustion(_error: &std::io::Error) -> bool {
+	false
+}
+
+type ConnectionWebSocket = tokio_tungstenite::WebSocketStream<TcpStream>;
+
+async fn join_connection_tasks<A: 'static, B: 'static>(
+	handshakes: &mut JoinSet<A>,
+	connections: &mut JoinSet<B>,
+) {
+	let joined = timeout(CONNECTION_JOIN_GRACE, async {
+		while !handshakes.is_empty() || !connections.is_empty() {
+			tokio::select! {
+				_ = handshakes.join_next(), if !handshakes.is_empty() => {},
+				_ = connections.join_next(), if !connections.is_empty() => {},
+			}
+		}
+	})
+	.await;
+	if joined.is_err() {
+		handshakes.abort_all();
 		connections.abort_all();
+		while handshakes.join_next().await.is_some() {}
 		while connections.join_next().await.is_some() {}
 	}
 }
@@ -1687,10 +1847,17 @@ async fn join_connection_tasks(connections: &mut JoinSet<()>) {
 	clippy::result_large_err,
 	reason = "ErrorResponse is the type mandated by tokio-tungstenite's accept_hdr_async callback"
 )]
-async fn handle_conn(stream: TcpStream, state: Arc<ServerState>, cancel: CancellationToken) {
+async fn handshake_conn(
+	stream: TcpStream,
+	state: Arc<ServerState>,
+	cancel: CancellationToken,
+) -> Option<ConnectionWebSocket> {
 	let expected = state.token.clone();
+	let authenticated = Arc::new(AtomicBool::new(false));
+	let authenticated_for_auth = Arc::clone(&authenticated);
 	let auth = move |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
 		if token_from_query(req.uri().query()).is_some_and(|t| tokens_match(&t, &expected)) {
+			authenticated_for_auth.store(true, Ordering::Release);
 			Ok(resp)
 		} else {
 			let body = ErrorResponse::new(Some("unauthorized".to_owned()));
@@ -1706,13 +1873,20 @@ async fn handle_conn(stream: TcpStream, state: Arc<ServerState>, cancel: Cancell
 		max_frame_size: Some(REQUEST_FRAME_BYTES),
 		..WebSocketConfig::default()
 	};
-	let ws = tokio::select! {
-		() = cancel.cancelled() => return,
-		accepted = tokio_tungstenite::accept_hdr_async_with_config(stream, auth, Some(ws_config)) => {
-			let Ok(ws) = accepted else { return };
-			ws
-		},
+	let accepted = tokio::select! {
+		() = cancel.cancelled() => return None,
+		accepted = timeout(
+			HANDSHAKE_DEADLINE,
+			tokio_tungstenite::accept_hdr_async_with_config(stream, auth, Some(ws_config)),
+		) => accepted,
 	};
+	match accepted {
+		Ok(Ok(ws)) if authenticated.load(Ordering::Acquire) => Some(ws),
+		Ok(Ok(_) | Err(_)) | Err(_) => None,
+	}
+}
+
+async fn handle_conn(ws: ConnectionWebSocket, state: Arc<ServerState>, cancel: CancellationToken) {
 	let connection_id =
 		format!("connection:{}", state.connection_sequence.fetch_add(1, Ordering::Relaxed));
 	let generation = "0".to_owned();
@@ -1752,6 +1926,8 @@ async fn handle_conn(stream: TcpStream, state: Arc<ServerState>, cancel: Cancell
 			queued_directed_frames: Arc::clone(&queued_directed_frames),
 			tx:                     direct_tx.clone(),
 		});
+	let _cleanup =
+		ConnectionCleanup::new(Arc::clone(&state), connection_id.clone(), generation.clone());
 
 	// Replay readiness before ask presentation; the ask itself is tailored by the
 	// connection task after insertion and never written before ClientHello policy.
@@ -1761,7 +1937,6 @@ async fn handle_conn(stream: TcpStream, state: Arc<ServerState>, cancel: Cancell
 			.await
 			.is_err()
 	{
-		state.connections.lock().remove(&connection_id);
 		return;
 	}
 	let _ = direct_tx.send(DirectCommand::ReevaluateAsk);
@@ -1962,21 +2137,6 @@ async fn handle_conn(stream: TcpStream, state: Arc<ServerState>, cancel: Cancell
 				}
 			},
 		}
-	}
-	state.connections.lock().remove(&connection_id);
-	let _ = state.close_tx.send(connection_id.clone());
-	let ids: Vec<_> = state
-		.acks
-		.lock()
-		.pending
-		.iter()
-		.filter(|(_, pending)| {
-			pending.origin.as_ref() == Some(&(connection_id.clone(), generation.clone()))
-		})
-		.map(|(id, _)| id.clone())
-		.collect();
-	for id in ids {
-		state.acks.lock().finish_disconnect(&id);
 	}
 }
 
@@ -2341,7 +2501,10 @@ pub(crate) fn tokens_match(a: &str, b: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+	use std::net::Ipv6Addr;
+
 	use futures_util::SinkExt;
+	use tokio::io::{AsyncReadExt, AsyncWriteExt};
 	use tokio_tungstenite::connect_async;
 
 	use super::*;
@@ -2352,6 +2515,166 @@ mod tests {
 	// Tokio's mock clock is process-global. Acquire the lock before constructing
 	// a paused runtime so concurrent libtest workers cannot share its clock.
 	static PAUSED_TIME_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+	async fn partial_handshake(handle: &ServerHandle) -> TcpStream {
+		let mut stream = TcpStream::connect(handle.addr()).await.unwrap();
+		stream
+			.write_all(b"GET /?token=secret HTTP/1.1\r\nHost: localhost\r\n")
+			.await
+			.unwrap();
+		stream
+	}
+
+	async fn observe_preauth_capacity(stalled: &mut Vec<TcpStream>, handle: &ServerHandle) {
+		let mut byte = [0_u8; 1];
+		for _ in 0..PREAUTH_HANDSHAKE_TASKS {
+			let mut probe = TcpStream::connect(handle.addr()).await.unwrap();
+			match timeout(Duration::from_millis(50), probe.read(&mut byte)).await {
+				Ok(Ok(0) | Err(_)) => return,
+				Ok(Ok(_)) => panic!("pre-auth connection returned unexpected bytes"),
+				Err(_) => stalled.push(probe),
+			}
+		}
+		panic!("pre-auth capacity was not observed within bounded probes");
+	}
+
+	#[tokio::test]
+	async fn preauth_capacity_drops_excess_and_recovers_after_deadline() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		let mut stalled = Vec::new();
+		for _ in 0..PREAUTH_HANDSHAKE_TASKS {
+			stalled.push(partial_handshake(&handle).await);
+		}
+		observe_preauth_capacity(&mut stalled, &handle).await;
+
+		tokio::time::sleep(HANDSHAKE_DEADLINE + Duration::from_millis(100)).await;
+		let mut expired = stalled
+			.pop()
+			.expect("at least one admitted partial handshake");
+		let mut byte = [0_u8; 1];
+		assert!(
+			matches!(
+				timeout(Duration::from_secs(1), expired.read(&mut byte)).await,
+				Ok(Ok(0) | Err(_))
+			),
+			"the original partial socket must close at the handshake deadline",
+		);
+		let mut ws = connect(&handle, "secret").await;
+		next_server_hello(&mut ws).await;
+		drop(stalled);
+		handle.stop_and_wait().await;
+	}
+
+	#[tokio::test]
+	async fn legitimate_partial_handshake_can_finish_just_before_deadline() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		let mut stream = partial_handshake(&handle).await;
+		tokio::time::sleep(HANDSHAKE_DEADLINE.saturating_sub(Duration::from_millis(500))).await;
+		stream
+			.write_all(
+				b"Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+			)
+			.await
+			.unwrap();
+		let mut response = [0_u8; 512];
+		let read = timeout(Duration::from_secs(1), stream.read(&mut response))
+			.await
+			.expect("valid partial handshake completes before the deadline")
+			.expect("valid partial handshake response");
+		assert!(String::from_utf8_lossy(&response[..read]).starts_with("HTTP/1.1 101"));
+		handle.stop_and_wait().await;
+	}
+
+	#[tokio::test]
+	async fn authenticated_connection_survives_handshake_deadline() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		let mut ws = connect(&handle, "secret").await;
+		next_server_hello(&mut ws).await;
+		tokio::time::sleep(HANDSHAKE_DEADLINE + Duration::from_millis(100)).await;
+		ws.send(Message::Ping(Vec::new())).await.unwrap();
+		let pong = timeout(Duration::from_secs(1), ws.next())
+			.await
+			.expect("authenticated connection remains live")
+			.expect("websocket remains open")
+			.expect("pong frame");
+		assert!(matches!(pong, Message::Pong(_)));
+		handle.stop_and_wait().await;
+	}
+
+	#[tokio::test]
+	async fn bad_token_handshake_releases_preauth_capacity() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		let mut stalled = Vec::new();
+		for _ in 0..PREAUTH_HANDSHAKE_TASKS {
+			stalled.push(partial_handshake(&handle).await);
+		}
+		observe_preauth_capacity(&mut stalled, &handle).await;
+		drop(
+			stalled
+				.pop()
+				.expect("one admitted partial handshake can release its slot"),
+		);
+
+		let url = format!("ws://{}/?token=wrong", handle.addr());
+		let error = timeout(Duration::from_secs(1), async {
+			loop {
+				if let Err(error @ tokio_tungstenite::tungstenite::Error::Http(_)) =
+					connect_async(&url).await
+				{
+					break error;
+				}
+				tokio::task::yield_now().await;
+			}
+		})
+		.await
+		.expect("bad-token handshake must enter the released admission slot");
+		assert!(
+			matches!(error, tokio_tungstenite::tungstenite::Error::Http(response) if response.status() == StatusCode::UNAUTHORIZED)
+		);
+
+		let valid_url = format!("ws://{}/?token=secret", handle.addr());
+		let mut ws = timeout(Duration::from_secs(1), async {
+			loop {
+				if let Ok((ws, _response)) = connect_async(&valid_url).await {
+					break ws;
+				}
+				tokio::task::yield_now().await;
+			}
+		})
+		.await
+		.expect("bad-token handshake must release its admission slot");
+		next_server_hello(&mut ws).await;
+		drop(stalled);
+		handle.stop_and_wait().await;
+	}
+
+	#[tokio::test]
+	async fn authenticated_connections_are_not_subject_to_preauth_capacity() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		let mut connections = Vec::new();
+		for _ in 0..65 {
+			let mut ws = connect(&handle, "secret").await;
+			next_server_hello(&mut ws).await;
+			connections.push(ws);
+		}
+		assert_eq!(connections.len(), 65);
+		assert_eq!(handle.client_count(), 65);
+		handle.stop_and_wait().await;
+	}
+
+	#[tokio::test]
+	async fn awaited_stop_joins_split_handshake_and_connection_tasks() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		let half_open = partial_handshake(&handle).await;
+		let mut ws = connect(&handle, "secret").await;
+		next_server_hello(&mut ws).await;
+
+		timeout(CONNECTION_JOIN_GRACE + Duration::from_secs(1), handle.stop_and_wait())
+			.await
+			.expect("shutdown joins split handshake and connection tasks");
+		drop(half_open);
+		assert_eq!(handle.client_count(), 0);
+	}
 
 	#[test]
 	fn directed_frame_reservations_are_bounded_and_reusable() {
@@ -2693,15 +3016,53 @@ mod tests {
 
 	#[tokio::test]
 	async fn stalled_connection_tasks_are_aborted_after_shutdown_grace() {
+		let mut handshakes = JoinSet::new();
+		handshakes.spawn(async { std::future::pending::<()>().await });
 		let mut connections = JoinSet::new();
 		connections.spawn(async { std::future::pending::<()>().await });
 		tokio::time::timeout(
 			CONNECTION_JOIN_GRACE + Duration::from_secs(1),
-			join_connection_tasks(&mut connections),
+			join_connection_tasks(&mut handshakes, &mut connections),
 		)
 		.await
 		.expect("connection joins must remain bounded");
+		assert!(handshakes.is_empty());
 		assert!(connections.is_empty());
+	}
+
+	#[tokio::test]
+	async fn aborted_connection_task_removes_state_and_notifies_close() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		let mut close_rx = handle.take_close_receiver().expect("close receiver");
+		let (tx, _rx) = mpsc::unbounded_channel();
+		let connection_id = "aborted-connection".to_owned();
+		handle
+			.state
+			.connections
+			.lock()
+			.insert(connection_id.clone(), Connection {
+				generation: "generation".into(),
+				capabilities: Vec::new(),
+				negotiation: Negotiation::Negotiated,
+				delivered: None,
+				queued_directed_frames: Arc::new(AtomicUsize::new(0)),
+				tx,
+			});
+
+		let cleanup = ConnectionCleanup::new(
+			Arc::clone(&handle.state),
+			connection_id.clone(),
+			"generation".into(),
+		);
+		let task = tokio::spawn(async move {
+			let _cleanup = cleanup;
+			std::future::pending::<()>().await;
+		});
+		task.abort();
+		assert!(task.await.expect_err("aborted task").is_cancelled());
+		assert!(!handle.state.connections.lock().contains_key(&connection_id));
+		assert_eq!(close_rx.recv().await.as_deref(), Some("aborted-connection"));
+		handle.stop_and_wait().await;
 	}
 
 	fn ask(id: &str) -> ActionNeeded {
@@ -2955,6 +3316,22 @@ mod tests {
 		assert_ne!(handle.addr().port(), 0);
 		assert!(handle.addr().ip().is_loopback());
 		handle.stop();
+	}
+
+	#[tokio::test]
+	async fn start_binds_ipv6_loopback_when_available() {
+		let mut config = ServerConfig::new("ipv6", "secret");
+		config.host = IpAddr::V6(Ipv6Addr::LOCALHOST);
+		let handle = match start(config).await {
+			Ok(handle) => handle,
+			Err(error) if error.kind() == std::io::ErrorKind::AddrNotAvailable => return,
+			Err(error) => panic!("IPv6 loopback bind failed: {error}"),
+		};
+		assert!(handle.addr().ip().is_loopback());
+		assert!(handle.addr().ip().is_ipv6());
+		let mut ws = connect(&handle, "secret").await;
+		assert!(matches!(next_server_msg(&mut ws).await, ServerMessage::Hello(_)));
+		handle.stop_and_wait().await;
 	}
 
 	#[tokio::test]
