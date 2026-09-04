@@ -1,12 +1,12 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getTrustedHomeDir } from "@gajae-code/utils";
-import { getCapability } from "../capability";
 import { findRepoRoot } from "../capability/fs";
-import { type Skill as CapabilitySkill, skillCapability } from "../capability/skill";
+import type { Skill as CapabilitySkill } from "../capability/skill";
 import type { SkillsSettings } from "../config/settings-schema";
 import { resolveSkillScopeTrust } from "../config/skill-settings-defaults";
 import { scanClaudeProjectSkills, scanClaudeUserSkills } from "../discovery/claude";
+import { loadMarketplaceSkills } from "../discovery/claude-plugins";
 import { scanCodexProjectSkills, scanCodexUserSkills } from "../discovery/codex";
 import { compareSkillOrder, SOURCE_PATHS, scanSkillsFromDir } from "../discovery/helpers";
 import { CANONICAL_GJC_WORKFLOW_SKILLS } from "../skill-state/canonical-skills";
@@ -226,13 +226,10 @@ function pushDiagnostic(diagnostics: string[], message: string): void {
 async function collectPluginSkills(
 	home: string,
 	cwd: string,
+	allowedLevels: ReadonlySet<"user" | "project">,
 ): Promise<{ items: CapabilitySkill[]; warnings: string[] }> {
-	const provider = getCapability<CapabilitySkill>(skillCapability.id)?.providers.find(
-		candidate => candidate.id === "claude-plugins",
-	);
-	if (!provider) return { items: [], warnings: [] };
 	try {
-		const result = await provider.load({ cwd, home, repoRoot: await findRepoRoot(cwd) });
+		const result = await loadMarketplaceSkills({ cwd, home, repoRoot: await findRepoRoot(cwd) }, allowedLevels);
 		return { items: result.items, warnings: result.warnings ?? [] };
 	} catch (error) {
 		return { items: [], warnings: [`marketplace skill scan failed: ${String(error)}`] };
@@ -412,12 +409,16 @@ export async function discoverRuntimeSkills(
 	// session.skills, so discovery, slash commands, SDK state, and exact-name
 	// invocation cannot drift on manifest paths, namespacing, or enabled roots.
 	if (policy?.enabled === true) {
+		const allowedLevels = new Set<"user" | "project">();
+		if ((source === "all" || source === "project") && sourceEnabled("project", policy)) {
+			allowedLevels.add("project");
+		}
+		if ((source === "all" || source === "user") && sourceEnabled("user", policy)) {
+			allowedLevels.add("user");
+		}
 		scanJobs.push(
-			collectPluginSkills(home, options.cwd).then(result => ({
-				items: result.items
-					.filter(skill => source === "all" || skill.level === source)
-					.filter(skill => sourceEnabled(skill.level, policy))
-					.map(skill => ({ skill, source: skill.level as RuntimeSkillDiscoverySource })),
+			collectPluginSkills(home, options.cwd, allowedLevels).then(result => ({
+				items: result.items.map(skill => ({ skill, source: skill.level as RuntimeSkillDiscoverySource })),
 				warnings: result.warnings,
 				label: "marketplace plugin skills",
 			})),

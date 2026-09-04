@@ -6,6 +6,7 @@ import type { SourceMeta } from "../capability/types";
 import type { SkillsSettings } from "../config/settings";
 import { resolveSkillScopeTrust } from "../config/skill-settings-defaults";
 import { type Skill as CapabilitySkill, getCapability } from "../discovery";
+import { loadMarketplaceSkills } from "../discovery/claude-plugins";
 import { compareSkillOrder, scanSkillsFromDir } from "../discovery/helpers";
 import type { SkillPromptDetails } from "../session/messages";
 import { CANONICAL_GJC_WORKFLOW_SKILLS } from "../skill-state/canonical-skills";
@@ -178,10 +179,18 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 		repoRoot: await findRepoRoot(cwd),
 	};
 	const providerResults = await Promise.all(
-		providers.map(async provider => ({
-			provider,
-			result: await provider.load(loadContext),
-		})),
+		providers.map(async provider => {
+			const allowedLevels = new Set<"user" | "project">();
+			if (projectTrusted) allowedLevels.add("project");
+			if (userTrusted) allowedLevels.add("user");
+			return {
+				provider,
+				result:
+					provider.id === "claude-plugins"
+						? await loadMarketplaceSkills(loadContext, allowedLevels)
+						: await provider.load(loadContext),
+			};
+		}),
 	);
 
 	const skillMap = new Map<string, Skill>();

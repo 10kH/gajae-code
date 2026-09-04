@@ -852,6 +852,14 @@ export async function resolveOrDefaultProjectRegistryPath(cwd: string): Promise<
 
 const pluginRootsCache = new Map<string, { roots: ClaudePluginRoot[]; warnings: string[] }>();
 
+/** Invalidate the exact user/project registry pair and their resolved-root cache entry. */
+export async function invalidateClaudePluginRoots(home: string, cwd?: string): Promise<void> {
+	const resolvedProjectPath = cwd ? await resolveActiveProjectRegistryPath(cwd) : null;
+	invalidateFsCache(path.join(getPluginsDir(home), "installed_plugins.json"));
+	if (resolvedProjectPath) invalidateFsCache(resolvedProjectPath);
+	pluginRootsCache.delete(`${home}:${resolvedProjectPath ?? ""}`);
+}
+
 /**
  * List installed GJC plugin roots from the GJC plugin registry and, when present,
  * the nearest project-scoped registry resolved from `cwd`.
@@ -885,7 +893,7 @@ export async function listClaudePluginRoots(
 				if (!Array.isArray(entries) || entries.length === 0) continue;
 
 				const atIndex = pluginId.lastIndexOf("@");
-				if (atIndex === -1) {
+				if (atIndex <= 0 || atIndex === pluginId.length - 1) {
 					warnings.push(`Invalid plugin ID format (missing @marketplace): ${pluginId}`);
 					continue;
 				}
@@ -927,7 +935,7 @@ export async function listClaudePluginRoots(
 				for (const [pluginId, entries] of Object.entries(projectRegistry.plugins)) {
 					if (!Array.isArray(entries) || entries.length === 0) continue;
 					const atIndex = pluginId.lastIndexOf("@");
-					if (atIndex === -1) {
+					if (atIndex <= 0 || atIndex === pluginId.length - 1) {
 						warnings.push(`Invalid plugin ID format (missing @marketplace): ${pluginId}`);
 						continue;
 					}
