@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import * as path from "node:path";
 import { listSessionHostEntries } from "./restart-sdk-broker";
 import {
 	type BrokerDiscoveryLike,
@@ -45,6 +46,17 @@ test("starts an SDK broker when no owner is published", async () => {
 		),
 	).resolves.toEqual({ pid: 2 });
 	expect(ttlValues).toEqual([Number.POSITIVE_INFINITY]);
+});
+
+test("CLI catches top-level argument failures without printing a stack", async () => {
+	const child = Bun.spawn(
+		[process.execPath, path.join(import.meta.dir, "restart-sdk-broker.ts"), "--graceful-timeout-ms", "0"],
+		{ stdout: "pipe", stderr: "pipe" },
+	);
+	const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+
+	expect(exitCode).toBe(1);
+	expect(stderr.trim()).toBe("Failed to restart SDK broker: --graceful-timeout-ms requires a positive integer.");
 });
 
 test("requests authenticated shutdown before starting a replacement", async () => {
@@ -184,6 +196,36 @@ test("still replaces the broker when a session host cannot be closed", async () 
 		pid: 2,
 		closedSessionIds: ["session-a", "session-c"],
 		unclosedSessionHosts: [{ sessionId: "session-b", reason: "close_refused: endpoint is unavailable" }],
+	});
+});
+
+test("still replaces the broker when session host discovery fails", async () => {
+	const previous = discovery(1, "darwin:1:0");
+	const discoveries = [previous, null, null];
+	const calls: string[] = [];
+	const result = await restartSdkBroker(
+		{ agentDir: "/agent", closeSessionHosts: true },
+		deps({
+			readDiscovery: async () => discoveries.shift() ?? null,
+			listSessionHosts: async () => {
+				calls.push("list");
+				throw new Error("reconnect attempts exhausted");
+			},
+			shutdown: async () => {
+				calls.push("shutdown");
+			},
+			ensure: async () => {
+				calls.push("ensure");
+				return discovery(2, "darwin:2:0");
+			},
+		}),
+	);
+
+	expect(calls).toEqual(["list", "shutdown", "ensure"]);
+	expect(result).toEqual({
+		previousPid: 1,
+		pid: 2,
+		sessionHostDiscoveryError: "reconnect attempts exhausted",
 	});
 });
 

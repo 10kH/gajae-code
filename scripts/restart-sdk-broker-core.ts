@@ -24,6 +24,8 @@ export interface RestartSdkBrokerResult {
 	previousPid?: number;
 	pid: number;
 	closedSessionIds?: string[];
+	/** Failure to discover hosted sessions before replacement; the broker still restarts. */
+	sessionHostDiscoveryError?: string;
 	/** Hosts that survived the close request; the replacement broker still restarts. */
 	unclosedSessionHosts?: UnclosedSessionHost[];
 }
@@ -102,12 +104,17 @@ export async function restartSdkBroker(
 
 	const previous = await deps.readDiscovery(options.agentDir, Number.POSITIVE_INFINITY);
 	let closedSessionIds: string[] | undefined;
+	let sessionHostDiscoveryError: string | undefined;
 	let unclosedSessionHosts: UnclosedSessionHost[] | undefined;
 	if (previous) {
 		if (options.closeSessionHosts) {
-			const outcome = await closeSessionHosts(previous, deps);
-			closedSessionIds = outcome.closed;
-			if (outcome.unclosed.length > 0) unclosedSessionHosts = outcome.unclosed;
+			try {
+				const outcome = await closeSessionHosts(previous, deps);
+				closedSessionIds = outcome.closed;
+				if (outcome.unclosed.length > 0) unclosedSessionHosts = outcome.unclosed;
+			} catch (error) {
+				sessionHostDiscoveryError = reasonFrom(error);
+			}
 		}
 		await stopPreviousBroker(previous, deps);
 		const deadline = Date.now() + gracefulTimeoutMs;
@@ -130,6 +137,7 @@ export async function restartSdkBroker(
 		...(previous ? { previousPid: previous.pid } : {}),
 		pid: replacement.pid,
 		...(closedSessionIds ? { closedSessionIds } : {}),
+		...(sessionHostDiscoveryError ? { sessionHostDiscoveryError } : {}),
 		...(unclosedSessionHosts ? { unclosedSessionHosts } : {}),
 	};
 }
