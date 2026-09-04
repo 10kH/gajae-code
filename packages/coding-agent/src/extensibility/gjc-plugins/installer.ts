@@ -6,7 +6,7 @@ import * as path from "node:path";
 import { gunzipSync } from "node:zlib";
 import { compileGjcPluginBundle } from "./compiler";
 import { classifyStdioInvocation } from "./mcp-policy";
-import { gjcPluginProjectRoot, gjcPluginUserRoot } from "./paths";
+import { gjcPluginInstallRoot, gjcPluginProjectRoot, gjcPluginSafeDirectoryName, gjcPluginUserRoot } from "./paths";
 import { readRegistry, sortRegistryEntries, withRegistryLock, writeRegistryUnlocked } from "./registry";
 import {
 	GJC_PLUGIN_MANIFEST_FILENAME,
@@ -63,14 +63,6 @@ const TAR_MAX_COMPRESSED_BYTES = TAR_MAX_ARCHIVE_BYTES + 1024 * 1024;
 
 function scopeRoot(scope: GjcPluginScope, cwd: string): string {
 	return scope === "user" ? gjcPluginUserRoot() : gjcPluginProjectRoot(cwd);
-}
-
-function safeDirSegment(name: string): string {
-	const seg = name.replace(/[^a-zA-Z0-9._-]/g, "-").replace(/^-+|-+$/g, "");
-	if (!seg || seg === "." || seg === "..") {
-		throw new GjcPluginLoadError("invalid_manifest", `GJC plugin name is not a safe directory segment: ${name}`);
-	}
-	return seg;
 }
 
 async function isDirectory(p: string): Promise<boolean> {
@@ -400,13 +392,6 @@ async function copyValidatedFiles(bundle: NormalizedGjcPluginBundle, stagingDir:
 			return [path.relative(bundle.root, invocation.cwd)];
 		}),
 	);
-	const executablePaths = new Set(
-		bundle.surfaces.mcps.flatMap(surface => {
-			if (surface.transport !== "stdio") return [];
-			const invocation = classifyStdioInvocation(surface.config, { pluginRoot: bundle.root });
-			return invocation.kind === "bundled-executable" ? [invocation.ownedRelativePath] : [];
-		}),
-	);
 	for (const cwdPath of cwdPaths) await fs.mkdir(path.join(stagingDir, cwdPath), { recursive: true });
 	for (const file of bundle.files) {
 		const src = path.join(bundle.root, file.relativePath);
@@ -421,7 +406,6 @@ async function copyValidatedFiles(bundle: NormalizedGjcPluginBundle, stagingDir:
 		const dest = path.join(stagingDir, file.relativePath);
 		await fs.mkdir(path.dirname(dest), { recursive: true });
 		await fs.writeFile(dest, buf);
-		if (executablePaths.has(file.relativePath)) await fs.chmod(dest, 0o700);
 	}
 }
 
@@ -455,9 +439,9 @@ export async function runGjcBundleTransaction(
 		// lock roots or sweep installation remnants.
 		const bundle = await compileGjcPluginBundle(resolved.dir);
 		validateInstallPlan(bundle, []);
-		const dirName = safeDirSegment(bundle.name);
+		const dirName = gjcPluginSafeDirectoryName(bundle.name);
 		const root = scopeRoot(options.scope, options.cwd);
-		const finalDir = path.join(root, dirName);
+		const finalDir = gjcPluginInstallRoot(options.scope, options.cwd, bundle.name);
 
 		// Lock-free refusal preflight. Acquiring a scope lock creates the scope
 		// root and mutates directory metadata, so a create-only refusal must be
@@ -595,7 +579,7 @@ export function candidateRegistryEntry(
 	source: GjcPluginRegistrySource,
 	now: string,
 ): GjcPluginRegistryEntry {
-	const finalDir = path.join(scopeRoot(scope, cwd), safeDirSegment(bundle.name));
+	const finalDir = gjcPluginInstallRoot(scope, cwd, bundle.name);
 	return bundleToRegistryEntry(bundle, finalDir, scope, source, now);
 }
 

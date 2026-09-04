@@ -11,6 +11,19 @@ export function gjcPluginProjectRoot(cwd: string): string {
 	return path.join(cwd, ".gjc", "gjc-plugins");
 }
 
+export function gjcPluginSafeDirectoryName(name: string): string {
+	const segment = name.replace(/[^a-zA-Z0-9._-]/g, "-").replace(/^-+|-+$/g, "");
+	if (!segment || segment === "." || segment === "..") {
+		throw new GjcPluginLoadError("invalid_manifest", `GJC plugin name is not a safe directory segment: ${name}`);
+	}
+	return segment;
+}
+
+export function gjcPluginInstallRoot(scope: "user" | "project", cwd: string, name: string): string {
+	const root = scope === "user" ? gjcPluginUserRoot() : gjcPluginProjectRoot(cwd);
+	return path.join(root, gjcPluginSafeDirectoryName(name));
+}
+
 function isEnoent(error: unknown): boolean {
 	return (error as NodeJS.ErrnoException).code === "ENOENT";
 }

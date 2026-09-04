@@ -94,7 +94,8 @@ export class StdioTransport implements MCPTransport {
 			throw new MCPExpectedFailure(new Error("MCP stdio child teardown is incomplete"));
 		}
 
-		const args = this.config.args ?? [];
+		const command = this.config.command;
+		const args = Object.freeze([...(this.config.args ?? [])]);
 		const env = this.config.noInheritEnv
 			? buildMinimalStdioEnv(this.config.env)
 			: {
@@ -104,13 +105,14 @@ export class StdioTransport implements MCPTransport {
 		const cwd = this.config.cwd ?? process.cwd();
 
 		try {
-			await this.config.spawnGuard?.({ command: this.config.command, args, cwd });
-			this.#process = spawnOwnedProcess([this.config.command, ...args], {
+			await this.config.spawnGuard?.({ command, args, cwd });
+			await this.config.afterSpawnGuardForTest?.();
+			this.#process = spawnOwnedProcess([command, ...args], {
 				cwd,
 				env,
 				stdin: "pipe",
 				gracefulMs: CLOSE_WAIT_MS,
-				name: `mcp-stdio:${this.config.command}`,
+				name: `mcp-stdio:${command}`,
 			});
 		} catch (error) {
 			throw new MCPExpectedFailure(error);

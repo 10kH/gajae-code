@@ -118,6 +118,13 @@ async function connect(
 	};
 }
 
+function runtimeServerArgs(args: readonly string[] | undefined): string[] {
+	const values = args ?? [];
+	const separator = values.indexOf("--");
+	if (separator < 0) throw new Error("verified launcher separator missing");
+	return values.slice(separator + 4);
+}
+
 describe("bundled plugin MCP launcher contract", () => {
 	test("rejects every manifest-controlled pre-entrypoint option and malformed launcher form", () => {
 		const root = path.resolve("/tmp/plugin-root");
@@ -157,7 +164,7 @@ describe("bundled plugin MCP launcher contract", () => {
 		}
 		expect(() =>
 			assertMcpInstallPolicy({ ...stdio("bun", [], "bin"), command: ".\\server" }, { pluginRoot: root }),
-		).not.toThrow();
+		).toThrow();
 	});
 
 	test("keeps launcher flags after the owned entrypoint as opaque server arguments", () => {
@@ -226,8 +233,8 @@ describe("bundled plugin MCP launcher contract", () => {
 
 		const connected = await connect(cwd, "direct-entry");
 		expect(connected.errors).toEqual([]);
-		expect(connected.command).toBe("bun");
-		expect(connected.args?.slice(-1)).toEqual(["--config=ordinary-server-arg"]);
+		expect(path.basename(connected.command ?? "")).toBe(process.platform === "win32" ? "bun.exe" : "bun");
+		expect(runtimeServerArgs(connected.args)).toEqual(["--config=ordinary-server-arg"]);
 	}, 30_000);
 
 	test("preserves an otherwise-empty effective cwd for a sibling entrypoint", async () => {
@@ -265,11 +272,10 @@ describe("bundled plugin MCP launcher contract", () => {
 		const entry = (await readRegistry("project", cwd)).plugins[0];
 		const connected = await connect(cwd, "node-entry");
 		expect(connected.errors).toEqual([]);
-		expect(connected.command).toBe("node");
-		expect(connected.args).toEqual([
-			path.join(entry?.pluginRoot ?? "", "mcp/server.mjs"),
-			"--cwd=ordinary-server-arg",
-		]);
+		expect(path.basename(connected.command ?? "")).toBe(process.platform === "win32" ? "node.exe" : "node");
+		const separator = connected.args?.indexOf("--") ?? -1;
+		expect(connected.args?.[separator + 1]).toBe(path.join(entry?.pluginRoot ?? "", "mcp/server.mjs"));
+		expect(runtimeServerArgs(connected.args)).toEqual(["--cwd=ordinary-server-arg"]);
 	}, 30_000);
 
 	test("passes separators, spaces, quotes, and shell metacharacters only as literal post-entrypoint argv", async () => {
@@ -285,7 +291,7 @@ describe("bundled plugin MCP launcher contract", () => {
 		expect((await installGjcBundle({ cwd }, "project", source)).ok).toBe(true);
 		const connected = await connect(cwd, "literal-argv");
 		expect(connected.errors).toEqual([]);
-		expect(connected.args?.slice(1)).toEqual([
+		expect(runtimeServerArgs(connected.args)).toEqual([
 			"--",
 			"value with spaces",
 			'quote="literal"',
@@ -294,7 +300,7 @@ describe("bundled plugin MCP launcher contract", () => {
 		]);
 	}, 30_000);
 
-	test("copies and marks a root-confined executable command as installer-owned", async () => {
+	test("rejects path-qualified executable and shebang launcher aliases", async () => {
 		const cwd = await tempDir("gjc-plugin-launcher-project-");
 		const source = await tempDir("gjc-plugin-launcher-executable-");
 		await fs.mkdir(path.join(source, "bin"), { recursive: true });
@@ -305,18 +311,7 @@ describe("bundled plugin MCP launcher contract", () => {
 			args: [],
 			cwd: "bin",
 		});
-		expect((await installGjcBundle({ cwd }, "project", source)).ok).toBe(true);
-		const registry = await readRegistry("project", cwd);
-		const entry = registry.plugins[0];
-		expect(entry?.copiedFiles.map(file => file.relativePath)).toContain(path.join("bin", "server"));
-		const installed = path.join(entry?.pluginRoot ?? "", "bin/server");
-		expect(await fs.readFile(installed, "utf8")).toContain("#!/usr/bin/env bun");
-		if (process.platform !== "win32") {
-			expect((await fs.stat(installed)).mode & 0o111).not.toBe(0);
-			const connected = await connect(cwd, "owned-executable");
-			expect(connected.errors).toEqual([]);
-			expect(connected.command).toBe(installed);
-		}
+		await expect(installGjcBundle({ cwd }, "project", source)).rejects.toMatchObject({ code: "security_policy" });
 	});
 
 	test("copies hardlinked source bytes instead of retaining external inode authority", async () => {

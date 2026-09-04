@@ -33,15 +33,20 @@ describe("plugin MCP runtime config conversion", () => {
 		expect(quarantine).toHaveLength(0);
 		const docs = configs.domain_docs;
 		expect(docs.type).toBe("stdio");
-		expect(docs.command).toBe("bun");
+		expect(docs.command).toBe(Bun.which("bun"));
 		// cwd is confined to the installed plugin root.
 		const installedRoot = path.join(cwd, ".gjc", "gjc-plugins", "valid-six-surface-bundle");
-		expect(docs.args).toEqual([
+		expect(docs.args?.slice(0, 5)).toEqual([
 			`--config=${os.devNull}`,
 			"--no-env-file",
 			"--no-install",
-			path.join(installedRoot, "mcp/domain-docs.ts"),
+			"--eval",
+			expect.any(String),
 		]);
+		const separator = docs.args?.indexOf("--") ?? -1;
+		expect(docs.args?.[separator + 1]).toBe(path.join(installedRoot, "mcp/domain-docs.ts"));
+		expect(docs.args?.[separator + 2]).toMatch(/^[0-9a-f]{64}$/);
+		expect(docs.args?.[separator + 3]).toBe(installedRoot);
 		expect(path.resolve(docs.cwd)).toBe(path.resolve(installedRoot));
 	});
 

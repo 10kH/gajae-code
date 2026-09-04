@@ -158,23 +158,15 @@ export interface StdioPolicyContext {
 	pluginRoot: string;
 }
 
-export type StdioInvocationTarget =
-	| {
-			kind: "launcher";
-			launcher: "node" | "bun";
-			entrypoint: string;
-			executablePath: string;
-			ownedRelativePath: string;
-			ownedRelativePaths: string[];
-			cwd: string;
-	  }
-	| {
-			kind: "bundled-executable";
-			executablePath: string;
-			ownedRelativePath: string;
-			ownedRelativePaths: string[];
-			cwd: string;
-	  };
+export interface StdioInvocationTarget {
+	kind: "launcher";
+	launcher: "node" | "bun";
+	entrypoint: string;
+	executablePath: string;
+	ownedRelativePath: string;
+	ownedRelativePaths: string[];
+	cwd: string;
+}
 
 function isWithinOrEqual(root: string, candidate: string): boolean {
 	return candidate === root || pathIsWithin(root, candidate);
@@ -218,52 +210,36 @@ export function classifyStdioInvocation(
 		}
 	}
 
-	if (ALLOWED_STDIO_LAUNCHERS.has(command)) {
-		const entrypoint = args[0];
-		if (!entrypoint) {
-			fail(`MCP "${entry.name}": node/bun stdio launcher requires a bundled script argument`);
-		}
-		if (entrypoint.startsWith("-")) {
-			fail(`MCP "${entry.name}": stdio launcher options before the bundled entrypoint are not allowed`);
-		}
-		const executablePath = resolveManifestRelative(cwd, entrypoint, `MCP "${entry.name}": stdio launcher entrypoint`);
-		if (!pathIsWithin(root, executablePath)) {
-			fail(`MCP "${entry.name}": stdio script escapes plugin root: ${entrypoint}`);
-		}
-		const ownedRelativePaths = [path.relative(root, executablePath)];
-		for (const arg of args.slice(1)) {
-			if (arg.startsWith("-") || !isFileLikeArgument(arg)) continue;
-			const resolvedArg = resolveManifestRelative(cwd, arg, `MCP "${entry.name}": stdio arg`);
-			if (!pathIsWithin(root, resolvedArg)) fail(`MCP "${entry.name}": stdio arg escapes plugin root: ${arg}`);
-			ownedRelativePaths.push(path.relative(root, resolvedArg));
-		}
-		return {
-			kind: "launcher",
-			launcher: command as "node" | "bun",
-			entrypoint,
-			executablePath,
-			ownedRelativePath: ownedRelativePaths[0] as string,
-			ownedRelativePaths,
-			cwd,
-		};
+	if (!ALLOWED_STDIO_LAUNCHERS.has(command)) {
+		fail(`MCP "${entry.name}": stdio command not allowed (expected bare node or bun): ${command}`);
 	}
-
-	if (isCrossPlatformAbsolute(command) || (!command.includes("/") && !command.includes("\\"))) {
-		fail(`MCP "${entry.name}": stdio command not allowed: ${command}`);
+	const entrypoint = args[0];
+	if (!entrypoint) {
+		fail(`MCP "${entry.name}": node/bun stdio launcher requires a bundled script argument`);
 	}
-	const executablePath = resolveManifestRelative(cwd, command, `MCP "${entry.name}": stdio command`);
+	if (entrypoint.startsWith("-")) {
+		fail(`MCP "${entry.name}": stdio launcher options before the bundled entrypoint are not allowed`);
+	}
+	const executablePath = resolveManifestRelative(cwd, entrypoint, `MCP "${entry.name}": stdio launcher entrypoint`);
 	if (!pathIsWithin(root, executablePath)) {
-		fail(`MCP "${entry.name}": stdio command escapes plugin root: ${command}`);
+		fail(`MCP "${entry.name}": stdio script escapes plugin root: ${entrypoint}`);
+	}
+	const extension = path.extname(executablePath).toLowerCase();
+	const allowedExtensions = command === "node" ? new Set([".mjs"]) : new Set([".mjs", ".js", ".ts", ".jsx", ".tsx"]);
+	if (!allowedExtensions.has(extension)) {
+		fail(`MCP "${entry.name}": unsupported ${command} entrypoint extension: ${extension || "<none>"}`);
 	}
 	const ownedRelativePaths = [path.relative(root, executablePath)];
-	for (const arg of args) {
+	for (const arg of args.slice(1)) {
 		if (arg.startsWith("-") || !isFileLikeArgument(arg)) continue;
 		const resolvedArg = resolveManifestRelative(cwd, arg, `MCP "${entry.name}": stdio arg`);
 		if (!pathIsWithin(root, resolvedArg)) fail(`MCP "${entry.name}": stdio arg escapes plugin root: ${arg}`);
 		ownedRelativePaths.push(path.relative(root, resolvedArg));
 	}
 	return {
-		kind: "bundled-executable",
+		kind: "launcher",
+		launcher: command as "node" | "bun",
+		entrypoint,
 		executablePath,
 		ownedRelativePath: ownedRelativePaths[0] as string,
 		ownedRelativePaths,
