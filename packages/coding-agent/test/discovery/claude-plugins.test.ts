@@ -212,6 +212,24 @@ describe("listClaudePluginRoots", () => {
 		expect(result.warnings[0]).toContain("Invalid plugin ID format");
 	});
 
+	test.each(["@market", "plugin@"])("rejects incomplete plugin namespace %s", async pluginId => {
+		const pluginsDir = path.join(tempDir, ".gjc", "plugins");
+		await fs.mkdir(pluginsDir, { recursive: true });
+		await fs.writeFile(
+			path.join(pluginsDir, "installed_plugins.json"),
+			JSON.stringify({
+				version: 2,
+				plugins: {
+					[pluginId]: [{ scope: "user", installPath: "/path/to/invalid", version: "1.0.0" }],
+				},
+			}),
+		);
+
+		const result = await listClaudePluginRoots(tempDir);
+		expect(result.roots).toEqual([]);
+		expect(result.warnings).toEqual([expect.stringContaining("Invalid plugin ID format")]);
+	});
+
 	test("warns on entry without installPath", async () => {
 		const pluginsDir = path.join(tempDir, ".gjc", "plugins");
 		await fs.mkdir(pluginsDir, { recursive: true });

@@ -191,7 +191,7 @@ async function realPathOrSelf(filePath: string): Promise<string> {
 }
 
 interface ScanJobResult {
-	items: Array<{ skill: CapabilitySkill; source: RuntimeSkillDiscoverySource }>;
+	items: Array<{ skill: CapabilitySkill; source: RuntimeSkillDiscoverySource; providerPriority: number }>;
 	warnings: string[];
 	label: string;
 }
@@ -269,6 +269,7 @@ async function scanProjectOrUserDir(
 	level: "project" | "user",
 	label: string,
 	source: RuntimeSkillDiscoverySource,
+	providerPriority: number,
 ): Promise<ScanJobResult> {
 	const result = await scanSkillsFromDir(ctx, {
 		dir,
@@ -277,7 +278,7 @@ async function scanProjectOrUserDir(
 		requireDescription: true,
 	});
 	return {
-		items: result.items.map(skill => ({ skill, source })),
+		items: result.items.map(skill => ({ skill, source, providerPriority })),
 		warnings: result.warnings ?? [],
 		label,
 	};
@@ -337,8 +338,9 @@ function reportConventionImportCandidates(
 ): void {
 	for (const scan of scans.sort((a, b) => a.host.localeCompare(b.host) || a.dir.localeCompare(b.dir))) {
 		for (const skill of scan.skills) {
-			if (seenNames.has(skill.name)) continue;
-			seenNames.add(skill.name);
+			const normalizedName = skill.name.toLowerCase();
+			if (seenNames.has(normalizedName)) continue;
+			seenNames.add(normalizedName);
 			pushDiagnostic(
 				diagnostics,
 				`skill "${skill.name}" found at ${skill.path} (${scan.host} convention): import sources are not loaded directly; copy it into a trusted .gjc/skills directory to enable it, e.g. mkdir -p .gjc/skills/${skill.name} && cp ${skill.path} .gjc/skills/${skill.name}/SKILL.md`,
@@ -387,20 +389,20 @@ export async function discoverRuntimeSkills(
 	const projectContext = { cwd: options.cwd, home, repoRoot: projectDirs.repoRoot };
 	if ((source === "all" || source === "project") && sourceEnabled("project", policy)) {
 		for (const { dir, label } of projectDirs.scans) {
-			scanJobs.push(scanProjectOrUserDir(projectContext, dir, "project", label, "project"));
+			scanJobs.push(scanProjectOrUserDir(projectContext, dir, "project", label, "project", 100));
 		}
 	}
 	if ((source === "all" || source === "user") && sourceEnabled("user", policy)) {
 		for (const dir of getUserSkillDirs(home)) {
 			scanJobs.push(
-				scanProjectOrUserDir({ cwd: options.cwd, home, repoRoot: home }, dir, "user", `user ${dir}`, "user"),
+				scanProjectOrUserDir({ cwd: options.cwd, home, repoRoot: home }, dir, "user", `user ${dir}`, "user", 100),
 			);
 		}
 	}
 	if ((source === "all" || source === "user") && policy?.enabled === true) {
 		for (const dir of getCustomSkillDirs(policy, home)) {
 			scanJobs.push(
-				scanProjectOrUserDir({ cwd: options.cwd, home, repoRoot: home }, dir, "user", `custom ${dir}`, "user"),
+				scanProjectOrUserDir({ cwd: options.cwd, home, repoRoot: home }, dir, "user", `custom ${dir}`, "user", 0),
 			);
 		}
 	}
@@ -418,7 +420,11 @@ export async function discoverRuntimeSkills(
 		}
 		scanJobs.push(
 			collectPluginSkills(home, options.cwd, allowedLevels).then(result => ({
-				items: result.items.map(skill => ({ skill, source: skill.level as RuntimeSkillDiscoverySource })),
+				items: result.items.map(skill => ({
+					skill,
+					source: skill.level as RuntimeSkillDiscoverySource,
+					providerPriority: 70,
+				})),
 				warnings: result.warnings,
 				label: "marketplace plugin skills",
 			})),
@@ -435,6 +441,7 @@ export async function discoverRuntimeSkills(
 	const seenNames = new Set<string>();
 	const seenPaths = new Set<string>();
 	const candidates: RuntimeSkillDiscoveryCandidate[] = [];
+	const orderedItems: ScanJobResult["items"] = [];
 	for (const entry of settled) {
 		if ("error" in entry) {
 			pushDiagnostic(diagnostics, `skill scan failed: ${entry.error}`);
@@ -445,29 +452,34 @@ export async function discoverRuntimeSkills(
 				pushDiagnostic(diagnostics, `${entry.label}: ${warning}`);
 			}
 		}
-		for (const item of entry.items) {
-			if (!isAllowedByPolicy(item.skill, policy, diagnostics)) continue;
-			const realPath = await realPathOrSelf(item.skill.path);
-			if (seenPaths.has(realPath) || seenNames.has(item.skill.name)) {
-				pushDiagnostic(
-					diagnostics,
-					`skill "${item.skill.name}" already resolved from a higher-precedence location; ignoring ${item.skill.path}`,
-				);
-				continue;
-			}
-			seenPaths.add(realPath);
-			seenNames.add(item.skill.name);
-
-			const candidate: RuntimeSkillDiscoveryCandidate = {
-				name: item.skill.name,
-				description:
-					typeof item.skill.frontmatter?.description === "string" ? item.skill.frontmatter.description : "",
-				source: item.source,
-				path: item.skill.path,
-				useWhen: getUseWhen(item.skill),
-			};
-			if (matchesQuery(candidate, options.query ?? "")) candidates.push(candidate);
+		orderedItems.push(...entry.items);
+	}
+	orderedItems.sort((a, b) => {
+		const levelOrder = { project: 0, user: 1 } as const;
+		return levelOrder[a.source] - levelOrder[b.source] || b.providerPriority - a.providerPriority;
+	});
+	for (const item of orderedItems) {
+		if (!isAllowedByPolicy(item.skill, policy, diagnostics)) continue;
+		const realPath = await realPathOrSelf(item.skill.path);
+		const normalizedName = item.skill.name.toLowerCase();
+		if (seenPaths.has(realPath) || seenNames.has(normalizedName)) {
+			pushDiagnostic(
+				diagnostics,
+				`skill "${item.skill.name}" already resolved from a higher-precedence location; ignoring ${item.skill.path}`,
+			);
+			continue;
 		}
+		seenPaths.add(realPath);
+		seenNames.add(normalizedName);
+
+		const candidate: RuntimeSkillDiscoveryCandidate = {
+			name: item.skill.name,
+			description: typeof item.skill.frontmatter?.description === "string" ? item.skill.frontmatter.description : "",
+			source: item.source,
+			path: item.skill.path,
+			useWhen: getUseWhen(item.skill),
+		};
+		if (matchesQuery(candidate, options.query ?? "")) candidates.push(candidate);
 	}
 	candidates.sort((a, b) => compareSkillOrder(a.name, a.path, b.name, b.path));
 	reportConventionImportCandidates(

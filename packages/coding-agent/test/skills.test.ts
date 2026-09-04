@@ -493,11 +493,21 @@ description: Skill loaded from a tilde-expanded custom directory.
 				// An installed plugin skill must be enumerated into the session, not
 				// merely resolvable by exact name through the discovery fallback.
 				const { skills } = await loadSkills({ cwd: tempDir, home: tempHome });
-				expect(skills.map(skill => skill.name)).toContain("demo-pack:demo-skill");
+				const marketplaceSkill = skills.find(skill => skill.name === "demo-pack:demo-skill");
+				expect(marketplaceSkill).toBeDefined();
+				expect(marketplaceSkill?.content).toBeUndefined();
+				expect(marketplaceSkill?.loadContent).toBeFunction();
 
 				// Widening the loadable-provider set must not bypass scope trust.
 				const userOff = await loadSkills({ cwd: tempDir, home: tempHome, trustUserSkills: false });
 				expect(userOff.skills.map(skill => skill.name)).not.toContain("demo-pack:demo-skill");
+
+				const disabled = await loadSkills({
+					cwd: tempDir,
+					home: tempHome,
+					disabledExtensions: ["skill:demo-pack:demo-skill"],
+				});
+				expect(disabled.skills.map(skill => skill.name)).not.toContain("demo-pack:demo-skill");
 
 				const masterOff = await loadSkills({ cwd: tempDir, home: tempHome, enabled: false });
 				expect(masterOff.skills).toHaveLength(0);
