@@ -36,6 +36,11 @@ function makeSession(
 	} as unknown as AgentSession;
 }
 
+function setSessionModel(session: AgentSession, model: { id: string; provider?: string; contextWindow: number }): void {
+	(session.state as unknown as { model: typeof model }).model = model;
+	(session as unknown as { model: typeof model }).model = model;
+}
+
 async function waitForUsageText(component: StatusLineComponent): Promise<string> {
 	let text = "";
 	for (let i = 0; i < 20; i++) {
@@ -268,7 +273,7 @@ describe("status line usage segment", () => {
 		component.dispose();
 	});
 
-	it("renders xAI weekly quota with the same weekly label as Grok Build", async () => {
+	it("does not infer authoritative Grok usage from an xAI report", async () => {
 		const now = Date.now();
 		const session = makeSession(
 			async () => [
@@ -298,13 +303,14 @@ describe("status line usage segment", () => {
 
 		const text = await waitForUsageText(component);
 
-		expect(text).toContain("weekly 12% (6d)");
+		expect(text).not.toContain("weekly");
 		expect(text).not.toContain("7d");
+		expect(text).not.toContain("12%");
 		expect(text).not.toContain("40%");
 		component.dispose();
 	});
 
-	it("hides unrelated provider windows when the active model is xAI", async () => {
+	it("reprojects cached reports after switching the active provider", async () => {
 		const now = Date.now();
 		const session = makeSession(
 			async () => [
@@ -327,37 +333,169 @@ describe("status line usage segment", () => {
 					],
 				},
 				{
-					provider: "xai",
+					provider: "grok-build",
 					fetchedAt: now,
 					limits: [
 						{
-							id: "xai:weekly",
-							scope: { provider: "xai", windowId: "weekly" },
+							id: "grok-build:weekly",
+							scope: { provider: "grok-build", windowId: "weekly" },
 							window: { id: "weekly", resetsAt: now + 56 * 3_600_000 },
 							amount: { usedFraction: 0.18, unit: "percent" },
-						},
-						{
-							id: "xai:7d",
-							scope: { provider: "xai", windowId: "7d" },
-							window: { id: "7d", resetsAt: now + 26 * 24 * 3_600_000 },
-							amount: { usedFraction: 0, unit: "percent" },
 						},
 					],
 				},
 			],
-			{ id: "grok-4.6", provider: "xai", contextWindow: 200_000 },
+			{ id: "claude-sonnet-4-5", provider: "anthropic", contextWindow: 200_000 },
+		);
+		const component = new StatusLineComponent(session);
+		component.updateSettings({ preset: "custom", leftSegments: [], rightSegments: ["usage"], showSkillHud: false });
+
+		const anthropicText = await waitForUsageText(component);
+		expect(anthropicText).toContain("5h 100%");
+
+		const grokModel = { id: "grok-build", provider: "grok-build", contextWindow: 200_000 };
+		setSessionModel(session, grokModel);
+		const grokText = stripAnsi(component.getTopBorder(120).content);
+
+		expect(grokText).toContain("weekly 18%");
+		expect(grokText).not.toContain("5h");
+		expect(grokText).not.toContain("100%");
+		component.dispose();
+	});
+
+	it("clears cached usage when the switched-to provider has no report", async () => {
+		const now = Date.now();
+		const session = makeSession(
+			async () => [
+				{
+					provider: "anthropic",
+					fetchedAt: now,
+					limits: [
+						{
+							id: "anthropic:5h",
+							scope: { provider: "anthropic", windowId: "5h" },
+							window: { id: "5h", resetsAt: now + 90 * 60_000 },
+							amount: { usedFraction: 0.4, unit: "percent" },
+						},
+					],
+				},
+			],
+			{ id: "claude-sonnet-4-5", provider: "anthropic", contextWindow: 200_000 },
+		);
+		const component = new StatusLineComponent(session);
+		component.updateSettings({ preset: "custom", leftSegments: [], rightSegments: ["usage"], showSkillHud: false });
+
+		const anthropicText = await waitForUsageText(component);
+		expect(anthropicText).toContain("5h 40%");
+
+		setSessionModel(session, { id: "grok-build", provider: "grok-build", contextWindow: 200_000 });
+		const grokText = stripAnsi(component.getTopBorder(120).content);
+
+		expect(grokText).not.toContain("5h");
+		expect(grokText).not.toContain("40%");
+		component.dispose();
+	});
+
+	it("does not aggregate usage reports when no active provider is resolved", async () => {
+		const now = Date.now();
+		const session = makeSession(
+			async () => [
+				{
+					provider: "anthropic",
+					fetchedAt: now,
+					limits: [
+						{
+							id: "anthropic:5h",
+							scope: { provider: "anthropic", windowId: "5h" },
+							window: { id: "5h", resetsAt: now + 90 * 60_000 },
+							amount: { usedFraction: 0.4, unit: "percent" },
+						},
+					],
+				},
+			],
+			{ id: "unresolved", contextWindow: 200_000 },
 		);
 		const component = new StatusLineComponent(session);
 		component.updateSettings({ preset: "custom", leftSegments: [], rightSegments: ["usage"], showSkillHud: false });
 
 		const text = await waitForUsageText(component);
 
-		expect(text).toContain("weekly 18%");
-		expect(text).not.toContain("7d");
 		expect(text).not.toContain("5h");
-		expect(text).not.toContain("100%");
-		expect(text).not.toContain("44%");
-		expect(text).not.toContain("0%");
+		expect(text).not.toContain("40%");
+		component.dispose();
+	});
+
+	it("uses the active fallback model in the session state over a stale session model", async () => {
+		const now = Date.now();
+		const session = makeSession(
+			async () => [
+				{
+					provider: "anthropic",
+					fetchedAt: now,
+					limits: [
+						{
+							id: "anthropic:5h",
+							scope: { provider: "anthropic", windowId: "5h" },
+							window: { id: "5h", resetsAt: now + 90 * 60_000 },
+							amount: { usedFraction: 0.4, unit: "percent" },
+						},
+					],
+				},
+				{
+					provider: "openai-codex",
+					fetchedAt: now,
+					limits: [
+						{
+							id: "openai-codex:primary",
+							scope: { provider: "openai-codex", windowId: "5h" },
+							window: { id: "5h", resetsAt: now + 90 * 60_000 },
+							amount: { usedFraction: 0.8, unit: "percent" },
+						},
+					],
+				},
+			],
+			{ id: "claude-sonnet-4-5", provider: "anthropic", contextWindow: 200_000 },
+		);
+		(session as unknown as { model: { id: string; provider: string; contextWindow: number } }).model = {
+			id: "gpt-5",
+			provider: "openai-codex",
+			contextWindow: 200_000,
+		};
+		const component = new StatusLineComponent(session);
+		component.updateSettings({ preset: "custom", leftSegments: [], rightSegments: ["usage"], showSkillHud: false });
+
+		const text = await waitForUsageText(component);
+
+		expect(text).toContain("5h 40%");
+		expect(text).not.toContain("80%");
+		component.dispose();
+	});
+
+	it("matches the OpenAI Codex device provider alias to its canonical report", async () => {
+		const now = Date.now();
+		const session = makeSession(
+			async () => [
+				{
+					provider: "openai-codex",
+					fetchedAt: now,
+					limits: [
+						{
+							id: "openai-codex:primary",
+							scope: { provider: "openai-codex", windowId: "5h", tier: "pro" },
+							window: { id: "5h", resetsAt: now + 180 * 60_000 },
+							amount: { usedFraction: 0.24, unit: "percent" },
+						},
+					],
+				},
+			],
+			{ id: "gpt-5", provider: "openai-codex-device", contextWindow: 200_000 },
+		);
+		const component = new StatusLineComponent(session);
+		component.updateSettings({ preset: "custom", leftSegments: [], rightSegments: ["usage"], showSkillHud: false });
+
+		const text = await waitForUsageText(component);
+
+		expect(text).toContain("5h 24%");
 		component.dispose();
 	});
 });

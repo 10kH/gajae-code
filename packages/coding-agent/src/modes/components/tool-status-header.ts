@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 
+import { resolveOAuthStorageProvider } from "@gajae-code/ai/core";
 import { type Component, truncateToWidth, visibleWidth } from "@gajae-code/tui";
 import { formatCount, getProjectDir, logger } from "@gajae-code/utils";
 import { getShellConfig } from "@gajae-code/utils/shell-config";
@@ -712,7 +713,7 @@ export class StatusLineComponent implements Component {
 	#normalizeUsageReports(reports: unknown): SegmentContext["usage"] {
 		const activeProvider = this.#activeUsageProvider();
 
-		if (!Array.isArray(reports)) return null;
+		if (!activeProvider || !Array.isArray(reports)) return null;
 		const windows: NonNullable<SegmentContext["usage"]>["windows"] = [];
 		const seen = new Set<string>();
 		const now = Date.now();
@@ -746,21 +747,24 @@ export class StatusLineComponent implements Component {
 		for (const report of reports) {
 			if (!report || typeof report !== "object") continue;
 			const provider = (report as { provider?: unknown }).provider;
-			const providerId = typeof provider === "string" ? provider : undefined;
-			if (activeProvider && providerId !== activeProvider) continue;
+			const providerId = typeof provider === "string" ? resolveOAuthStorageProvider(provider) : undefined;
+			if (providerId !== activeProvider) continue;
 			const limits = (report as { limits?: unknown }).limits;
 			if (!Array.isArray(limits)) continue;
 			for (const limit of limits) {
 				if (!limit || typeof limit !== "object") continue;
 				const l = limit as {
 					id?: unknown;
-					scope?: { windowId?: string; tier?: string; modelId?: string };
+					scope?: { provider?: unknown; windowId?: string; tier?: string; modelId?: string };
 					window?: { id?: string; resetsAt?: number };
 					amount?: { usedFraction?: number };
 				};
 				const fraction = l.amount?.usedFraction;
 				if (typeof fraction !== "number") continue;
 				const id = typeof l.id === "string" ? l.id : "";
+				const scopeProvider =
+					typeof l.scope?.provider === "string" ? resolveOAuthStorageProvider(l.scope.provider) : undefined;
+				if (scopeProvider !== undefined && scopeProvider !== providerId) continue;
 				const windowId = l.scope?.windowId ?? l.window?.id;
 				const tier = l.scope?.tier;
 				const modelId = l.scope?.modelId;
@@ -778,8 +782,8 @@ export class StatusLineComponent implements Component {
 					pushWindow(`${providerId ?? "provider"}:5h`, "5h", fraction, resetsAt, "m");
 				} else if (windowId === "7d" && !tier && providerId !== "grok-build" && providerId !== "xai") {
 					pushWindow(`${providerId ?? "provider"}:7d`, "7d", fraction, resetsAt, "h");
-				} else if (windowId === "weekly" && !tier) {
-					pushWindow(`${providerId ?? "provider"}:weekly`, "weekly", fraction, resetsAt, "h");
+				} else if (providerId === "grok-build" && id === "grok-build:weekly" && windowId === "weekly" && !tier) {
+					pushWindow("grok-build:weekly", "weekly", fraction, resetsAt, "h");
 				}
 			}
 		}
@@ -791,7 +795,7 @@ export class StatusLineComponent implements Component {
 		const model = this.session.state.model ?? this.session.model;
 		if (!model || typeof model !== "object") return undefined;
 		const provider = (model as { provider?: unknown }).provider;
-		return typeof provider === "string" && provider.length > 0 ? provider : undefined;
+		return typeof provider === "string" && provider.length > 0 ? resolveOAuthStorageProvider(provider) : undefined;
 	}
 
 	#syncCachedUsageForActiveProvider(): void {
