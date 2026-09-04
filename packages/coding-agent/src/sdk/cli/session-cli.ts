@@ -334,13 +334,14 @@ function throwResponseFailure(response: unknown): void {
 async function paginatedSessionList(
 	router: SessionRouter,
 	input: JsonRecord = {},
-	requestKey = `${SDK_SESSION_CLI_LIFECYCLE_ACTOR.namespace}:session.list`,
+	requestKey = `${SDK_SESSION_CLI_LIFECYCLE_ACTOR.namespace}:session.list:${randomBytes(12).toString("hex")}`,
 ): Promise<unknown> {
 	try {
 		const pages = await traverseSessionList(
 			input,
 			async pageInput => {
-				const response = object(await router.listBrokerSessions(pageInput, requestKey));
+				const cursor = typeof pageInput.cursor === "string" ? pageInput.cursor : "initial";
+				const response = object(await router.listBrokerSessions(pageInput, `${requestKey}:${cursor}`));
 				if (response?.ok === false) {
 					const failure = object(response.error);
 					throw new SdkClientError(
