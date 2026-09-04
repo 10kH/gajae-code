@@ -62,6 +62,54 @@ export function parseModelString(
 		: { provider, id: modelStr.slice(slashIdx + 1) };
 }
 
+export function resolveStartupModelRefreshSelectors(
+	options: {
+		model?: string;
+		provider?: string;
+		credential?: string;
+		continue?: boolean;
+		resume?: string | boolean;
+		hasStartupProfile: boolean;
+	},
+	settings: ModelRoleSettings,
+): ModelSelectorValue | undefined {
+	if (options.credential) return undefined;
+	if (options.model) {
+		return options.provider && !options.model.toLowerCase().startsWith(`${options.provider.toLowerCase()}/`)
+			? `${options.provider}/${options.model}`
+			: options.model;
+	}
+	if (options.hasStartupProfile) return undefined;
+	if (options.continue || options.resume) return undefined;
+	return resolveConfiguredModelPatterns(settings.getModelRole("default"), settings);
+}
+
+export async function refreshMissingQualifiedModelProviders(
+	selectors: ModelSelectorValue | undefined,
+	modelRegistry: Pick<ModelRegistry, "getAvailable" | "getDiscoverableProviders" | "refreshProvider">,
+): Promise<boolean> {
+	const refreshedProviders = new Set<string>();
+	for (const selector of normalizeModelSelectorValue(selectors)) {
+		const parsedSelector = parseModelString(selector);
+		if (!parsedSelector) continue;
+		const provider = modelRegistry
+			.getDiscoverableProviders()
+			.find(candidate => candidate.toLowerCase() === parsedSelector.provider.toLowerCase());
+		if (!provider || refreshedProviders.has(provider)) continue;
+		const availableModels = modelRegistry.getAvailable();
+		const rawModelId = selector.slice(selector.indexOf("/") + 1);
+		if (
+			resolveProviderModelReference(provider, rawModelId, availableModels) ||
+			resolveProviderModelReference(provider, parsedSelector.id, availableModels)
+		)
+			continue;
+
+		await modelRegistry.refreshProvider(provider, "online-if-uncached");
+		refreshedProviders.add(provider);
+	}
+	return refreshedProviders.size > 0;
+}
+
 /**
  * Format a model as "provider/modelId" string.
  */
