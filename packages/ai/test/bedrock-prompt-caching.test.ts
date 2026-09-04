@@ -1,7 +1,8 @@
 import { describe, expect, it } from "bun:test";
-import { getBundledModels } from "../src/models";
+import { applyGeneratedModelPolicies } from "../src/model-thinking";
+import { calculateCost, getBundledModels } from "../src/models";
 import { parseBedrockClaudeGeneration, supportsPromptCaching } from "../src/providers/amazon-bedrock";
-import type { Model } from "../src/types";
+import type { Model, Usage } from "../src/types";
 
 function bedrockModel(id: string, cachePriced = false): Model<"bedrock-converse-stream"> {
 	return {
@@ -21,8 +22,8 @@ function bedrockModel(id: string, cachePriced = false): Model<"bedrock-converse-
 }
 
 describe("Bedrock prompt caching support", () => {
-	it("parses both Claude naming schemes across base ids, regional profiles, and ARNs", () => {
-		for (const id of [
+	it("uses one generation table for request caching and cache-pricing metadata", () => {
+		const accepted = [
 			"anthropic.claude-3-5-haiku-20241022-v1:0",
 			"eu.anthropic.claude-3-7-sonnet-20250219-v1:0",
 			"anthropic.claude-opus-4-20250514-v1:0",
@@ -32,20 +33,35 @@ describe("Bedrock prompt caching support", () => {
 			"apac.anthropic.claude-opus-5",
 			"arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-opus-4-6-v1:0",
 			"arn:aws-us-gov:bedrock:us-gov-west-1::foundation-model/anthropic.claude-opus-4-20250514-v1:0",
-		]) {
-			expect(supportsPromptCaching(bedrockModel(id)), id).toBe(true);
-		}
-	});
-
-	it("keeps unsupported Claude 3.x generations and families uncached", () => {
-		for (const id of [
+		];
+		const rejected = [
 			"anthropic.claude-3-opus-20240229-v1:0",
 			"anthropic.claude-3-haiku-20240307-v1:0",
 			"anthropic.claude-3-5-sonnet-20240620-v1:0",
 			"anthropic.claude-3-7-haiku-20250219-v1:0",
 			"anthropic.claude-v2:0",
-		]) {
-			expect(supportsPromptCaching(bedrockModel(id)), id).toBe(false);
+		];
+		for (const [expected, ids] of [
+			[true, accepted],
+			[false, rejected],
+		] as const) {
+			for (const id of ids) {
+				const models = [bedrockModel(id, true)];
+				expect(supportsPromptCaching(models[0]!), id).toBe(expected);
+				applyGeneratedModelPolicies(models);
+				const model = models[0]!;
+				expect(model.cost.cacheRead !== 0 || model.cost.cacheWrite !== 0, id).toBe(expected);
+				const usage: Usage = {
+					input: 0,
+					output: 0,
+					cacheRead: 1_000_000,
+					cacheWrite: 1_000_000,
+					totalTokens: 2_000_000,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				};
+				calculateCost(model, usage);
+				expect(usage.cost.cacheRead !== 0 || usage.cost.cacheWrite !== 0, id).toBe(expected);
+			}
 		}
 	});
 
@@ -76,6 +92,17 @@ describe("Bedrock prompt caching support", () => {
 			"ANTHROPIC.CLAUDE-OPUS-5",
 		]) {
 			expect(supportsPromptCaching(bedrockModel(id)), id).toBe(false);
+		}
+	});
+
+	it("does not let stale pricing re-enable malformed Claude ids", () => {
+		for (const id of [
+			"anthropic.claude-opus-04-5-20300101-v1:0",
+			"anthropic.claude-opus-4-05-20300101-v1:0",
+			"anthropic.claude-opus-4-5--preview",
+			"ANTHROPIC.CLAUDE-OPUS-5",
+		]) {
+			expect(supportsPromptCaching(bedrockModel(id, true)), id).toBe(false);
 		}
 	});
 

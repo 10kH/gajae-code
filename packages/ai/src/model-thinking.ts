@@ -1,3 +1,4 @@
+import { supportsBedrockClaudePromptCaching } from "./bedrock-claude-cache-policy";
 import {
 	CODEX_GENERIC_CONTEXT_WINDOW,
 	CODEX_GPT_5_6_CONTEXT_CAP,
@@ -487,6 +488,13 @@ function anthropicModelHasRealXHighEffort<TApi extends Api>(model: ApiModel<TApi
 
 function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
 	applyOpenAIModelPricing(model);
+	if (model.provider === "amazon-bedrock" && model.api === "bedrock-converse-stream") {
+		const cacheSupport = supportsBedrockClaudePromptCaching(model.id);
+		if (cacheSupport === false) {
+			model.cost.cacheRead = 0;
+			model.cost.cacheWrite = 0;
+		}
+	}
 	const copilotLimits = model.provider === "github-copilot" ? COPILOT_GENERATED_LIMITS[model.id] : undefined;
 	if (copilotLimits) {
 		model.contextWindow = copilotLimits.contextWindow;

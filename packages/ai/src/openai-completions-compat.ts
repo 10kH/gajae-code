@@ -48,6 +48,23 @@ function parseHostname(baseUrl: string): string | undefined {
 	}
 }
 
+function isProductionXaiApiUrl(baseUrl: string): boolean {
+	try {
+		const url = new URL(baseUrl);
+		return (
+			url.protocol === "https:" &&
+			url.hostname.toLowerCase() === "api.x.ai" &&
+			url.port === "" &&
+			url.username === "" &&
+			url.password === "" &&
+			url.search === "" &&
+			url.hash === ""
+		);
+	} catch {
+		return false;
+	}
+}
+
 function hostnameMatches(hostname: string | undefined, suffix: string): boolean {
 	return hostname !== undefined && (hostname === suffix || hostname.endsWith(`.${suffix}`));
 }
@@ -93,7 +110,7 @@ export function parseDirectXaiReasoningEffortGeneration(
 ): GrokGeneration | undefined {
 	if (model.provider !== "xai") return undefined;
 	if (model.api !== "openai-completions") return undefined;
-	if (parseHostname(resolvedBaseUrl ?? model.baseUrl ?? "") !== "api.x.ai") return undefined;
+	if (!isProductionXaiApiUrl(resolvedBaseUrl ?? model.baseUrl ?? "")) return undefined;
 	if (model.id.includes("/")) return undefined;
 	const generation = parseGrokGeneration(model.id);
 	if (!generation) return undefined;
