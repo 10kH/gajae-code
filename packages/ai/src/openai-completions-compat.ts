@@ -52,6 +52,24 @@ function hostnameMatches(hostname: string | undefined, suffix: string): boolean 
 	return hostname !== undefined && (hostname === suffix || hostname.endsWith(`.${suffix}`));
 }
 
+export type GrokGeneration = {
+	major: number;
+	minor: number;
+};
+
+function parseGrokGeneration(modelId: string): GrokGeneration | undefined {
+	const canonicalId = modelId.startsWith("x-ai/") ? modelId.slice("x-ai/".length) : modelId;
+	const match =
+		/^grok-([1-9]\d?)(?:\.(0|[1-9]\d?))?(?:-(latest|preview|\d{8}|reasoning|\d{4}-reasoning|beta-latest-reasoning|multi-agent-beta-latest))?$/.exec(
+			canonicalId,
+		);
+	if (!match) return undefined;
+	return {
+		major: Number(match[1]),
+		minor: match[2] === undefined ? 0 : Number(match[2]),
+	};
+}
+
 /** Returns whether the request endpoint is an audited reasoning-control transport. */
 export function isAuditedOpenAIReasoningTransport(
 	model: { provider: string; baseUrl?: string },
@@ -61,6 +79,32 @@ export function isAuditedOpenAIReasoningTransport(
 	if (!baseUrl && (model.provider === "openai" || model.provider === "azure-openai")) return true;
 	const hostname = parseHostname(baseUrl);
 	return AUDITED_REASONING_EFFORT_HOST_SUFFIXES.some(suffix => hostnameMatches(hostname, suffix));
+}
+
+/**
+ * xAI's first-party API accepts `reasoning_effort` on Grok 4.5 and later.
+ * Provider labels are user-configurable, so both the provider and the official
+ * API origin must match. Unknown variants fail closed instead of inheriting a
+ * capability from a loose model-id prefix.
+ */
+export function parseDirectXaiReasoningEffortGeneration(
+	model: { provider: string; id: string; api?: string; baseUrl?: string },
+	resolvedBaseUrl?: string,
+): GrokGeneration | undefined {
+	if (model.provider !== "xai") return undefined;
+	if (model.api !== "openai-completions") return undefined;
+	if (parseHostname(resolvedBaseUrl ?? model.baseUrl ?? "") !== "api.x.ai") return undefined;
+	if (model.id.includes("/")) return undefined;
+	const generation = parseGrokGeneration(model.id);
+	if (!generation) return undefined;
+	return generation.major > 4 || (generation.major === 4 && generation.minor >= 5) ? generation : undefined;
+}
+
+export function isDirectXaiReasoningEffortModel(
+	model: { provider: string; id: string; api?: string; baseUrl?: string },
+	resolvedBaseUrl?: string,
+): boolean {
+	return parseDirectXaiReasoningEffortGeneration(model, resolvedBaseUrl) !== undefined;
 }
 
 export type ResolvedOpenAICompat = Required<
@@ -184,8 +228,8 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 		baseUrl.includes("chutes.ai") ||
 		baseUrl.includes("fireworks.ai") ||
 		isDirectDeepseekApi;
-	const isGrok = provider === "xai" || baseUrl.includes("api.x.ai");
-	const isDirectXaiReasoningEffortModel = provider === "xai" && (model.id === "grok-4.5" || model.id === "grok-4.6");
+	const isGrok = provider === "xai" || baseUrl.includes("api.x.ai") || parseGrokGeneration(model.id) !== undefined;
+
 	const isMistral = provider === "mistral" || baseUrl.includes("mistral.ai");
 
 	// Hosts whose chat-completions endpoints are known to accept multiple
@@ -278,7 +322,8 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 		supportsResponsesSessionAffinity: false,
 		supportsMultipleSystemMessages: supportsMultipleSystemMessagesDefault,
 		supportsReasoningEffort:
-			hasAuditedReasoningEffortTransport && ((!isGrok && !isZai) || isDirectXaiReasoningEffortModel),
+			hasAuditedReasoningEffortTransport &&
+			((!isGrok && !isZai) || isOpenRouter || isDirectXaiReasoningEffortModel(model, resolvedBaseUrl)),
 		reasoningEffortMap,
 		supportsUsageInStreaming: !isCerebras,
 		disableReasoningOnForcedToolChoice: isKimiModel || isAnthropicModel || isOpenCodeGoReasoning,

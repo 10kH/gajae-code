@@ -40,6 +40,7 @@ import {
 	unregisterCustomApis,
 } from "@gajae-code/ai/core";
 import { fetchModelsDevPayload } from "@gajae-code/ai/provider-models/openai-compat";
+import { isDirectXaiReasoningEffortModel } from "@gajae-code/ai/providers/openai-completions-compat";
 import {
 	detectDiscoveredApiFamily,
 	resolveLoopbackOpenAIBaseUrl,
@@ -279,11 +280,7 @@ export const GJC_MODEL_ASSIGNMENT_TARGETS: Record<GjcModelAssignmentTargetId, Gj
 
 export function requiresExplicitThinkingChoice(model: Model, role: GjcModelAssignmentTargetId | null): boolean {
 	if (!modelSupportsReasoningControl(model)) return false;
-	if (
-		model.provider === "openai" ||
-		model.provider === "openai-codex" ||
-		(model.provider === "xai" && (model.id === "grok-4.5" || model.id === "grok-4.6"))
-	)
+	if (model.provider === "openai" || model.provider === "openai-codex" || isDirectXaiReasoningEffortModel(model))
 		return true;
 	if (role === null) return false;
 	if (role === "default") return true;
