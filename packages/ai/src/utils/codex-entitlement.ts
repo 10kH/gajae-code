@@ -7,6 +7,26 @@
  * keeps the provider's deterministic rejection wording in one place.
  */
 
+/**
+ * ChatGPT plan types entitled to strict Pro-tier Codex models (e.g. GPT-5.6
+ * Sol) whose reported `plan_type` does not contain the substring "pro".
+ * Business/Enterprise/Team accounts carry the same Sol entitlement as Pro, so
+ * the naive substring test would falsely reject them before dispatch even
+ * though the backend accepts the request.
+ */
+const OPENAI_CODEX_PRO_ENTITLED_PLAN_TYPES = new Set(["business", "enterprise", "team"]);
+
+/**
+ * Whether a ChatGPT `plan_type` is entitled to strict Pro-tier Codex models.
+ * True for any "pro" tier plus the Business/Enterprise/Team tiers. The input is
+ * lowercased defensively so callers may pass a raw or normalized plan type.
+ */
+export function isOpenAICodexProEntitledPlanType(planType: string | undefined): boolean {
+	if (!planType) return false;
+	const normalized = planType.toLowerCase();
+	return normalized.includes("pro") || OPENAI_CODEX_PRO_ENTITLED_PLAN_TYPES.has(normalized);
+}
+
 export function requiresOpenAICodexProModel(provider: string, modelId: string | undefined): boolean {
 	return (
 		provider === "openai-codex" &&

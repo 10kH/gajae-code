@@ -447,6 +447,56 @@ describe("AuthStorage codex oauth ranking", () => {
 		).resolves.toBe("api-key-credential");
 	});
 
+	test.each([
+		"business",
+		"enterprise",
+		"team",
+	])("selects a %s ChatGPT account for GPT-5.6 Sol (Pro-equivalent entitlement)", async planType => {
+		if (!authStorage) throw new Error("test setup failed");
+
+		await authStorage.set("openai-codex", [
+			{ type: "oauth", ...createCredential("acct-entitled", `${planType}@example.com`) },
+		]);
+		const report = createCodexUsageReport({
+			accountId: "acct-entitled",
+			primary: { usedFraction: 0.05, resetInMs: 30 * 60 * 1000 },
+			secondary: { usedFraction: 0.05, resetInMs: 6 * 24 * 60 * 60 * 1000 },
+		});
+		report.metadata = { ...report.metadata, planType };
+		usageByAccount.set("acct-entitled", report);
+
+		await expect(
+			authStorage.getApiKey("openai-codex", `session-sol-${planType}`, { modelId: "gpt-5.6-sol" }),
+		).resolves.toBe("api-acct-entitled");
+	});
+
+	test("prefers a Business ChatGPT account over a non-entitled Plus account for GPT-5.6 Sol", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+
+		await authStorage.set("openai-codex", [
+			{ type: "oauth", ...createCredential("acct-plus", "plus@example.com") },
+			{ type: "oauth", ...createCredential("acct-business", "business@example.com") },
+		]);
+		const plusReport = createCodexUsageReport({
+			accountId: "acct-plus",
+			primary: { usedFraction: 0.05, resetInMs: 30 * 60 * 1000 },
+			secondary: { usedFraction: 0.05, resetInMs: 6 * 24 * 60 * 60 * 1000 },
+		});
+		plusReport.metadata = { ...plusReport.metadata, planType: "plus" };
+		usageByAccount.set("acct-plus", plusReport);
+		const businessReport = createCodexUsageReport({
+			accountId: "acct-business",
+			primary: { usedFraction: 0.2, resetInMs: 30 * 60 * 1000 },
+			secondary: { usedFraction: 0.2, resetInMs: 6 * 24 * 60 * 60 * 1000 },
+		});
+		businessReport.metadata = { ...businessReport.metadata, planType: "business" };
+		usageByAccount.set("acct-business", businessReport);
+
+		await expect(
+			authStorage.getApiKey("openai-codex", "session-sol-business-over-plus", { modelId: "gpt-5.6-sol" }),
+		).resolves.toBe("api-acct-business");
+	});
+
 	test("times out slow usage ranking instead of blocking first account selection", async () => {
 		if (!store) throw new Error("test setup failed");
 

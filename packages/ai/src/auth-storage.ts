@@ -28,6 +28,7 @@ import type {
 
 import {
 	formatOpenAICodexChatGPTEntitlementError,
+	isOpenAICodexProEntitledPlanType,
 	requiresOpenAICodexProModel,
 	requiresStrictOpenAICodexProModel,
 } from "./utils/codex-entitlement";
@@ -1155,11 +1156,11 @@ function getUsagePlanType(report: UsageReport | null): string | undefined {
 function getOpenAICodexPlanPriority(report: UsageReport | null): number {
 	const planType = getUsagePlanType(report);
 	if (!planType) return 1;
-	return planType.includes("pro") ? 0 : 2;
+	return isOpenAICodexProEntitledPlanType(planType) ? 0 : 2;
 }
 
 function hasOpenAICodexProPlan(report: UsageReport | null): boolean {
-	return getUsagePlanType(report)?.includes("pro") === true;
+	return isOpenAICodexProEntitledPlanType(getUsagePlanType(report));
 }
 
 function resolveDefaultRankingStrategy(provider: Provider): CredentialRankingStrategy | undefined {
