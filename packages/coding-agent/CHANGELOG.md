@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- The status-line usage segment now paints only the active model's provider, so switching to Grok no longer keeps a stale Claude 5h/7d pair. Canonical Grok Build reports render only their authoritative weekly window, while monthly credits are omitted instead of being mislabeled as `7d`.
 
 - Mid-run OpenAI remote-compaction fallback failures now stop before another provider request, surface the local summarization error through ACP/SDK terminal handling, and leave the uncompacted context unsubmitted. Successful local fallback still commits the compaction and resumes normally.
 - Opening `/model` now renders the preset landing before constructing the full model browser catalog. Canonical search indexing, sorting, and the redundant offline registry refresh are deferred until the user searches or chooses a browse action, while the lightweight preset-availability check remains immediate and scoped or direct-search selectors still load immediately.
