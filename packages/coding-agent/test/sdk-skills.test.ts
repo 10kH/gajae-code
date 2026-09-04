@@ -4,6 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { DEFAULT_GJC_DEFINITION_NAMES } from "@gajae-code/coding-agent/defaults/gjc-defaults";
+import { clearPluginRootsAndCaches } from "@gajae-code/coding-agent/discovery/helpers";
+import { resolveSkillSlashCommands } from "@gajae-code/coding-agent/extensibility/skills";
 import type { Skill } from "@gajae-code/coding-agent/sdk";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
@@ -96,6 +98,96 @@ Loaded via symbolic link.
 		// Skills should be discovered and exposed on the session
 		expect(session.skills.length).toBeGreaterThan(0);
 		expect(session.skills.some((s: Skill) => s.name === "test-skill")).toBe(true);
+	});
+
+	it("registers marketplace skills for SDK and slash discovery without loading their bodies", async () => {
+		const pluginRoot = path.join(tempHomeDir, "marketplace-cache", "craft-skills");
+		const pluginSkillDir = path.join(pluginRoot, "skills", "design");
+		fs.mkdirSync(pluginSkillDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(pluginSkillDir, "SKILL.md"),
+			"---\nname: design\ndescription: Marketplace design skill.\n---\n\n# Design\n\nPrivate body marker.\n",
+		);
+		const registryPath = path.join(tempDir, ".gjc", "plugins", "installed_plugins.json");
+		fs.mkdirSync(path.dirname(registryPath), { recursive: true });
+		fs.writeFileSync(
+			registryPath,
+			JSON.stringify({
+				version: 2,
+				plugins: {
+					"craft-skills@craft-skills": [
+						{ scope: "project", installPath: pluginRoot, version: "0.14.6", enabled: true },
+					],
+				},
+			}),
+		);
+		clearPluginRootsAndCaches([registryPath]);
+
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: path.join(tempHomeDir, ".gjc", "agent"),
+			sessionManager: SessionManager.inMemory(),
+			settings: createIsolatedSkillsSettings(),
+		});
+		try {
+			const marketplaceSkill = session.skills.find(skill => skill.name === "craft-skills:design");
+			expect(marketplaceSkill).toBeDefined();
+			expect(marketplaceSkill?.content).toBeUndefined();
+			expect(marketplaceSkill?.loadContent).toBeFunction();
+			expect(resolveSkillSlashCommands(session.skills, new Set()).map(command => command.name)).toContain(
+				"skill:craft-skills:design",
+			);
+		} finally {
+			await session.dispose();
+			clearPluginRootsAndCaches([registryPath]);
+		}
+	});
+
+	it("refreshes registered marketplace skills after install and remove lifecycle changes", async () => {
+		const pluginRoot = path.join(tempHomeDir, "marketplace-cache", "lifecycle-plugin");
+		const pluginSkillDir = path.join(pluginRoot, "skills", "helper");
+		fs.mkdirSync(pluginSkillDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(pluginSkillDir, "SKILL.md"),
+			"---\nname: helper\ndescription: Lifecycle helper.\n---\n\n# Helper\n",
+		);
+		const registryPath = path.join(tempDir, ".gjc", "plugins", "installed_plugins.json");
+		fs.mkdirSync(path.dirname(registryPath), { recursive: true });
+		fs.writeFileSync(registryPath, JSON.stringify({ version: 2, plugins: {} }));
+		clearPluginRootsAndCaches([registryPath]);
+
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: path.join(tempHomeDir, ".gjc", "agent"),
+			sessionManager: SessionManager.inMemory(),
+			settings: createIsolatedSkillsSettings(),
+		});
+		try {
+			expect(session.skills.some(skill => skill.name === "lifecycle-plugin:helper")).toBe(false);
+
+			fs.writeFileSync(
+				registryPath,
+				JSON.stringify({
+					version: 2,
+					plugins: {
+						"lifecycle-plugin@test-market": [
+							{ scope: "project", installPath: pluginRoot, version: "1.0.0", enabled: true },
+						],
+					},
+				}),
+			);
+			clearPluginRootsAndCaches([registryPath]);
+			await session.reloadSkills();
+			expect(session.skills.some(skill => skill.name === "lifecycle-plugin:helper")).toBe(true);
+
+			fs.writeFileSync(registryPath, JSON.stringify({ version: 2, plugins: {} }));
+			clearPluginRootsAndCaches([registryPath]);
+			await session.reloadSkills();
+			expect(session.skills.some(skill => skill.name === "lifecycle-plugin:helper")).toBe(false);
+		} finally {
+			await session.dispose();
+			clearPluginRootsAndCaches([registryPath]);
+		}
 	});
 
 	it("should discover skills when skill directory is a symlink", async () => {

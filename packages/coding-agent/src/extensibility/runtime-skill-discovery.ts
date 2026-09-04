@@ -1,16 +1,17 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getPluginsDir, getTrustedHomeDir } from "@gajae-code/utils";
-import { findRepoRoot, invalidate as invalidateFsCache } from "../capability/fs";
-import type { Skill as CapabilitySkill } from "../capability/skill";
+import { getTrustedHomeDir } from "@gajae-code/utils";
+import { getCapability } from "../capability";
+import { findRepoRoot } from "../capability/fs";
+import { type Skill as CapabilitySkill, skillCapability } from "../capability/skill";
 import type { SkillsSettings } from "../config/settings-schema";
 import { resolveSkillScopeTrust } from "../config/skill-settings-defaults";
 import { scanClaudeProjectSkills, scanClaudeUserSkills } from "../discovery/claude";
 import { scanCodexProjectSkills, scanCodexUserSkills } from "../discovery/codex";
-import { compareSkillOrder, listClaudePluginRoots, SOURCE_PATHS, scanSkillsFromDir } from "../discovery/helpers";
+import { compareSkillOrder, SOURCE_PATHS, scanSkillsFromDir } from "../discovery/helpers";
 import { CANONICAL_GJC_WORKFLOW_SKILLS } from "../skill-state/canonical-skills";
 import { expandTilde } from "../tools/path-utils";
-import type { Skill } from "./skills";
+import { loadSkills, type Skill } from "./skills";
 
 export type RuntimeSkillDiscoverySource = "project" | "user";
 
@@ -152,18 +153,6 @@ function getUseWhen(skill: CapabilitySkill): string[] | undefined {
 	return values.length > 0 ? values : undefined;
 }
 
-function toRuntimeSkill(skill: CapabilitySkill, source: RuntimeSkillDiscoverySource): Skill {
-	return {
-		name: skill.name,
-		description: typeof skill.frontmatter?.description === "string" ? skill.frontmatter.description : "",
-		filePath: skill.path,
-		baseDir: skill.path.replace(/[\\/]SKILL\.md$/, ""),
-		source: `runtime:${source}`,
-		hide: skill.frontmatter?.hide === true,
-		_source: { ...skill._source, providerName: "Runtime skill discovery" },
-	};
-}
-
 function sourceEnabled(source: RuntimeSkillDiscoverySource, policy: SkillsSettings | undefined): boolean {
 	if (policy?.enabled !== true) return false;
 	return resolveSkillScopeTrust(policy, source);
@@ -234,23 +223,19 @@ function pushDiagnostic(diagnostics: string[], message: string): void {
 	if (diagnostics.length < MAX_DIAGNOSTICS) diagnostics.push(message);
 }
 
-async function collectPluginSkillDirs(
+async function collectPluginSkills(
 	home: string,
 	cwd: string,
-): Promise<Array<{ dir: string; pluginName: string; level: "user" | "project" }>> {
-	// Ensure the underlying installed_plugins.json fs cache is current — install/upgrade
-	// writers already invalidate via clearPluginRootsAndCaches; this is a defensive
-	// fallback so a stale in-memory cache cannot mask a disabled/removed plugin.
-	invalidateFsCache(`${getPluginsDir(home)}/installed_plugins.json`);
+): Promise<{ items: CapabilitySkill[]; warnings: string[] }> {
+	const provider = getCapability<CapabilitySkill>(skillCapability.id)?.providers.find(
+		candidate => candidate.id === "claude-plugins",
+	);
+	if (!provider) return { items: [], warnings: [] };
 	try {
-		const { roots } = await listClaudePluginRoots(home, cwd);
-		return roots.map(root => ({
-			dir: `${root.path}/skills`,
-			pluginName: root.plugin,
-			level: root.scope,
-		}));
-	} catch {
-		return [];
+		const result = await provider.load({ cwd, home, repoRoot: await findRepoRoot(cwd) });
+		return { items: result.items, warnings: result.warnings ?? [] };
+	} catch (error) {
+		return { items: [], warnings: [`marketplace skill scan failed: ${String(error)}`] };
 	}
 }
 
@@ -423,37 +408,20 @@ export async function discoverRuntimeSkills(
 		}
 	}
 
-	// Marketplace plugin skills: version-stable, enabled-only.
-	// Uses the same trust gate as native user/project scopes and the same
-	// discovery root (<installPath>/skills) the capability provider uses,
-	// namespaced as `plugin:skillName`.
+	// Marketplace plugin skills come from the same provider used to populate
+	// session.skills, so discovery, slash commands, SDK state, and exact-name
+	// invocation cannot drift on manifest paths, namespacing, or enabled roots.
 	if (policy?.enabled === true) {
-		const pluginDirs = await collectPluginSkillDirs(home, options.cwd);
-		for (const entry of pluginDirs) {
-			if (entry.level === "project" && !(source === "all" || source === "project")) continue;
-			if (entry.level === "user" && !(source === "all" || source === "user")) continue;
-			if (!sourceEnabled(entry.level, policy)) continue;
-			const label = `plugin ${entry.pluginName} skills`;
-			scanJobs.push(
-				(async () => {
-					const pluginCtx = { cwd: options.cwd, home, repoRoot: home };
-					const result = await scanSkillsFromDir(pluginCtx, {
-						dir: entry.dir,
-						providerId: "plugin",
-						level: entry.level,
-						requireDescription: true,
-					});
-					for (const skill of result.items) {
-						skill.name = `${entry.pluginName}:${skill.name}`;
-					}
-					return {
-						items: result.items.map(skill => ({ skill, source: entry.level as RuntimeSkillDiscoverySource })),
-						warnings: result.warnings ?? [],
-						label,
-					};
-				})(),
-			);
-		}
+		scanJobs.push(
+			collectPluginSkills(home, options.cwd).then(result => ({
+				items: result.items
+					.filter(skill => source === "all" || skill.level === source)
+					.filter(skill => sourceEnabled(skill.level, policy))
+					.map(skill => ({ skill, source: skill.level as RuntimeSkillDiscoverySource })),
+				warnings: result.warnings,
+				label: "marketplace plugin skills",
+			})),
+		);
 	}
 	if (policy?.enabled === true && policy.customDirectories && policy.customDirectories.length > 0) {
 		for (const dir of getCustomSkillDirs(policy, home)) {
@@ -520,67 +488,12 @@ export async function findRuntimeSkillByName(
 ): Promise<Skill | undefined> {
 	const normalized = name.trim();
 	if (!normalized) return undefined;
-	const scanJobs: Array<Promise<{ skill: CapabilitySkill; source: RuntimeSkillDiscoverySource }[]>> = [];
-	const projectDirs = await getProjectSkillDirs(cwd, home);
-	const projectContext = { cwd, home, repoRoot: projectDirs.repoRoot };
-	if (sourceEnabled("project", policy)) {
-		scanJobs.push(
-			...projectDirs.scans.map(scan =>
-				scanSkillsFromDir(projectContext, {
-					dir: scan.dir,
-					providerId: "runtime",
-					level: "project",
-					requireDescription: true,
-				}).then(result => result.items.map(skill => ({ skill, source: "project" as const }))),
-			),
-		);
-	}
-	if (sourceEnabled("user", policy)) {
-		for (const dir of getUserSkillDirs(home)) {
-			scanJobs.push(
-				scanSkillsFromDir(
-					{ cwd, home, repoRoot: home },
-					{ dir, providerId: "runtime", level: "user", requireDescription: true },
-				).then(result => result.items.map(skill => ({ skill, source: "user" as const }))),
-			);
-		}
-	}
-	if (policy?.enabled === true) {
-		for (const dir of getCustomSkillDirs(policy, home)) {
-			scanJobs.push(
-				scanSkillsFromDir(
-					{ cwd, home, repoRoot: home },
-					{ dir, providerId: "runtime", level: "user", requireDescription: true },
-				).then(result => result.items.map(skill => ({ skill, source: "user" as const }))),
-			);
-		}
-	}
-	if (policy?.enabled === true) {
-		try {
-			const pluginDirs = await collectPluginSkillDirs(home, cwd);
-			for (const entry of pluginDirs) {
-				if (!sourceEnabled(entry.level, policy)) continue;
-				scanJobs.push(
-					scanSkillsFromDir(
-						{ cwd, home, repoRoot: home },
-						{
-							dir: entry.dir,
-							providerId: "plugin",
-							level: entry.level,
-							requireDescription: true,
-						},
-					).then(result => {
-						for (const skill of result.items) skill.name = `${entry.pluginName}:${skill.name}`;
-						return result.items.map(skill => ({ skill, source: entry.level as RuntimeSkillDiscoverySource }));
-					}),
-				);
-			}
-		} catch {}
-	}
-	for (const entry of (await Promise.all(scanJobs)).flat()) {
-		if (entry.skill.name === normalized && isAllowedByPolicy(entry.skill, policy, [])) {
-			return toRuntimeSkill(entry.skill, entry.source);
-		}
-	}
-	return undefined;
+	if (BUILT_IN_SKILL_NAMES.has(normalized)) return undefined;
+	const loaded = await loadSkills({
+		...policy,
+		cwd,
+		home,
+		agentDir: path.join(home, SOURCE_PATHS.native.userAgent),
+	});
+	return loaded.skills.find(skill => skill.name === normalized);
 }

@@ -164,27 +164,25 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 	// Use capability API to load all skills. `all` (rather than `items`) keeps
 	// shadowed duplicates so this function can apply the documented precedence
 	// itself: project scope beats user scope.
-	const providers = getCapability<CapabilitySkill>(skillCapability.id)?.providers ?? [];
-	const nativeProvider = providers.find(provider => provider.id === "native");
-	if (!nativeProvider) throw new Error("Native skill provider is unavailable");
+	const providers =
+		getCapability<CapabilitySkill>(skillCapability.id)?.providers.filter(provider =>
+			LOADABLE_SKILL_PROVIDERS.has(provider.id),
+		) ?? [];
+	if (!providers.some(provider => provider.id === "native")) {
+		throw new Error("Native skill provider is unavailable");
+	}
 	const loadContext = {
 		cwd,
 		home,
 		userAgentDir: options.agentDir,
 		repoRoot: await findRepoRoot(cwd),
 	};
-	// Native first so its items keep documented precedence on a name tie; every
-	// other loadable provider follows. `isSourceEnabled` still applies scope trust
-	// per item, so widening this list never bypasses the trust gate.
-	const loadableProviders = [
-		nativeProvider,
-		...providers.filter(provider => provider.id !== "native" && LOADABLE_SKILL_PROVIDERS.has(provider.id)),
-	];
-	const loaded = await Promise.all(loadableProviders.map(provider => provider.load(loadContext)));
-	const result = {
-		items: loaded.flatMap(entry => entry.items),
-		warnings: loaded.flatMap(entry => entry.warnings ?? []),
-	};
+	const providerResults = await Promise.all(
+		providers.map(async provider => ({
+			provider,
+			result: await provider.load(loadContext),
+		})),
+	);
 
 	const skillMap = new Map<string, Skill>();
 	const realPathSet = new Set<string>();
@@ -210,8 +208,11 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 	// precedence. `all` is already in native provider order with project dirs
 	// before user dirs; a stable sort by level lifts every project item above
 	// every user item, giving: project `.gjc/skills` > user roots.
-	const filteredSkills = result.items
-		.filter(capSkill => {
+	const filteredSkills = providerResults
+		.flatMap(({ provider, result }) =>
+			result.items.map(capSkill => ({ capSkill, providerPriority: provider.priority })),
+		)
+		.filter(({ capSkill }) => {
 			if (!isSourceEnabled(capSkill._source)) return false;
 			if (disabledSkillNames.has(capSkill.name)) return false;
 			if (matchesIgnorePatterns(capSkill.name)) return false;
@@ -220,12 +221,12 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 		})
 		.sort((a, b) => {
 			const levelOrder = { project: 0, user: 1 } as const;
-			return levelOrder[a.level] - levelOrder[b.level];
+			return levelOrder[a.capSkill.level] - levelOrder[b.capSkill.level] || b.providerPriority - a.providerPriority;
 		});
 
 	// Batch resolve all real paths in parallel
 	const realPaths = await Promise.all(
-		filteredSkills.map(async capSkill => {
+		filteredSkills.map(async ({ capSkill }) => {
 			try {
 				return await fs.realpath(capSkill.path);
 			} catch {
@@ -236,7 +237,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 
 	// Process skills with resolved paths
 	for (let i = 0; i < filteredSkills.length; i++) {
-		const capSkill = filteredSkills[i];
+		const { capSkill } = filteredSkills[i];
 		const resolvedPath = realPaths[i];
 
 		// Skip silently if we've already loaded this exact file (via symlink)
@@ -351,7 +352,12 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 
 	return {
 		skills,
-		warnings: [...(result.warnings ?? []).map(w => ({ skillPath: "", message: w })), ...collisionWarnings],
+		warnings: [
+			...providerResults.flatMap(({ result }) =>
+				(result.warnings ?? []).map(message => ({ skillPath: "", message })),
+			),
+			...collisionWarnings,
+		],
 	};
 }
 

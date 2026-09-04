@@ -129,6 +129,7 @@ async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
 				dir: skillsDir,
 				providerId: PROVIDER_ID,
 				level: root.scope,
+				requireDescription: true,
 			});
 			return { root, result, warning };
 		}),

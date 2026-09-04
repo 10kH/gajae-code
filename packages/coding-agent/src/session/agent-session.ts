@@ -883,6 +883,8 @@ export interface AgentSessionConfig {
 	skills?: Skill[];
 	/** Skill loading warnings (already captured by SDK) */
 	skillWarnings?: SkillWarning[];
+	/** Re-enumerate filesystem and marketplace skills after plugin lifecycle changes. */
+	reloadSkills?: () => Promise<{ skills: Skill[]; warnings: SkillWarning[] }>;
 	/** Custom commands (TypeScript slash commands) */
 	customCommands?: LoadedCustomCommand[];
 	skillsSettings?: SkillsSettings;
@@ -3125,6 +3127,7 @@ export class AgentSession {
 
 	#skills: Skill[];
 	#skillWarnings: SkillWarning[];
+	#reloadSkills: AgentSessionConfig["reloadSkills"];
 
 	// Custom commands (TypeScript slash commands)
 	#customCommands: LoadedCustomCommand[] = [];
@@ -4557,6 +4560,7 @@ export class AgentSession {
 		this.agent.setMainAttemptScopeObserver(scope => this.#bindAttemptScope(scope));
 		this.#skills = config.skills ?? [];
 		this.#skillWarnings = config.skillWarnings ?? [];
+		this.#reloadSkills = config.reloadSkills;
 		this.#customCommands = config.customCommands ?? [];
 		this.#skillsSettings = config.skillsSettings;
 		this.#modelRegistry = config.modelRegistry;
@@ -14238,6 +14242,15 @@ export class AgentSession {
 	 */
 	async replaceSkills(skills: Skill[]): Promise<void> {
 		this.#skills = skills;
+		await this.refreshBaseSystemPrompt();
+	}
+
+	/** Refresh the live registered-skill catalog after install/remove/reload. */
+	async reloadSkills(): Promise<void> {
+		if (!this.#reloadSkills) return;
+		const reloaded = await this.#reloadSkills();
+		this.#skills = reloaded.skills;
+		this.#skillWarnings = reloaded.warnings;
 		await this.refreshBaseSystemPrompt();
 	}
 

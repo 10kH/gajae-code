@@ -5,7 +5,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { Model } from "@gajae-code/ai";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { clearPluginRootsAndCaches } from "@gajae-code/coding-agent/discovery/helpers";
 import type { Skill } from "@gajae-code/coding-agent/extensibility/skills";
+import { loadSkills } from "@gajae-code/coding-agent/extensibility/skills";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "@gajae-code/coding-agent/session/messages";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { SkillTool } from "@gajae-code/coding-agent/tools/skill";
@@ -836,6 +838,62 @@ describe("SkillTool", () => {
 		await expect(tool.execute("call-1", { name: "does-not-exist" })).rejects.toBeInstanceOf(ToolError);
 		await expect(tool.execute("call-1", { name: "does-not-exist" })).rejects.toThrow(/Available: ralplan, team/);
 		expect(captured).toHaveLength(0);
+	});
+
+	it("enumerates and invokes registered marketplace skills by their namespaced name", async () => {
+		const cwd = await makeTempCwd();
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "skill-tool-marketplace-home-"));
+		const pluginRoot = path.join(home, "plugin-cache", "craft-skills");
+		const registryPath = path.join(home, ".gjc", "plugins", "installed_plugins.json");
+		try {
+			await makeRuntimeSkill(path.join(pluginRoot, "skills"), "design", "Marketplace design", "Marketplace body.");
+			await fs.mkdir(path.dirname(registryPath), { recursive: true });
+			await fs.writeFile(
+				registryPath,
+				JSON.stringify({
+					version: 2,
+					plugins: {
+						"craft-skills@craft-skills": [
+							{ scope: "user", installPath: pluginRoot, version: "0.14.6", enabled: true },
+						],
+					},
+				}),
+			);
+			clearPluginRootsAndCaches([registryPath]);
+			const settings = runtimeSkillSettings();
+			const loaded = await loadSkills({
+				...settings.getGroup("skills"),
+				cwd,
+				home,
+				disabledExtensions: settings.get("disabledExtensions"),
+			});
+			const captured: CapturedSend[] = [];
+			const tool = new SkillTool(createSession(cwd, loaded.skills, captured, { settings, home }));
+
+			await expect(tool.execute("missing", { name: "missing" })).rejects.toThrow(/Available: craft-skills:design/);
+			const result = await tool.execute("invoke", { name: "craft-skills:design" });
+			expect(result.details?.name).toBe("craft-skills:design");
+			expect(captured[0]?.message.content).toContain("Marketplace body.");
+		} finally {
+			clearPluginRootsAndCaches([registryPath]);
+			await safeRm(cwd, { recursive: true, force: true });
+			await safeRm(home, { recursive: true, force: true });
+		}
+	});
+
+	it("bounds the Available catalog deterministically", async () => {
+		const cwd = await makeTempCwd();
+		const skills = Array.from({ length: 60 }, (_, index) => ({
+			name: `market:${String(index).padStart(2, "0")}`,
+			description: "",
+			filePath: `/unused/${index}/SKILL.md`,
+			baseDir: `/unused/${index}`,
+			source: "test",
+		}));
+		const tool = new SkillTool(createSession(cwd, skills, []));
+		await expect(tool.execute("missing", { name: "missing" })).rejects.toThrow(
+			/Available: market:00, market:01,.*market:49, … \(\+10 more\)/,
+		);
 	});
 
 	it("rejects empty name", async () => {

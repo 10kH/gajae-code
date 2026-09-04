@@ -1967,6 +1967,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				});
 		}
 
+		let skillsCwd = cwd;
 		let skills: Skill[];
 		let skillWarnings: SkillWarning[];
 		if (options.skills !== undefined) {
@@ -2328,6 +2329,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		 * root's AGENTS.md and tree, and subagents inherit the same mismatch.
 		 */
 		const applyRescopedReadState = async (to: string): Promise<void> => {
+			skillsCwd = to;
 			try {
 				const rediscovered = await loadContextFilesResultInternal({ cwd: to });
 				contextFiles = rediscovered.contextFiles;
@@ -4461,6 +4463,26 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			customCommands: customCommandsResult.commands,
 			skills,
 			skillWarnings,
+			reloadSkills:
+				options.skills === undefined
+					? async () => {
+							if (!settings.get("skills.enabled")) {
+								skills = getEmbeddedDefaultGjcSkills();
+								skillWarnings = [];
+							} else {
+								const reloaded = await loadSkills({
+									...settings.getGroup("skills"),
+									agentDir,
+									cwd: skillsCwd,
+									disabledExtensions: settings.get("disabledExtensions"),
+								});
+								skills = withEmbeddedDefaultGjcSkills(reloaded.skills);
+								skillWarnings = reloaded.warnings;
+							}
+							if (!options.parentTaskPrefix) setActiveSkills(skills);
+							return { skills, warnings: skillWarnings };
+						}
+					: undefined,
 			skillsSettings: settings.getGroup("skills"),
 			modelRegistry,
 			taskDepth,

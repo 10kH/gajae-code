@@ -66,6 +66,14 @@ function normalizeSkillName(name: string | undefined): string {
 }
 
 const SKILL_NAME_GLOB_PATTERN = /[*?[\]{}]/;
+const MAX_AVAILABLE_SKILL_NAMES = 50;
+
+function formatAvailableSkills(skills: readonly { name: string }[]): string {
+	const names = [...new Set(skills.map(skill => skill.name))].sort();
+	const visible = names.slice(0, MAX_AVAILABLE_SKILL_NAMES);
+	const omitted = names.length - visible.length;
+	return `${visible.join(", ")}${omitted > 0 ? `, … (+${omitted} more)` : ""}`;
+}
 
 type SkillToolInput = z.infer<typeof skillSchema>;
 
@@ -154,10 +162,10 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 					this.#session.home,
 				));
 			if (!skill) {
-				const available = skills.map(s => s.name).sort();
+				const available = formatAvailableSkills(skills);
 				const hint =
 					available.length > 0
-						? ` Available: ${available.join(", ")}. Use skill_discovery to find project/user runtime skills.`
+						? ` Available: ${available}. Use skill_discovery to find project/user runtime skills.`
 						: " Use skill_discovery to find project/user runtime skills.";
 				throw new ToolError(`skill tool: unknown skill "${requestedName}".${hint}`);
 			}

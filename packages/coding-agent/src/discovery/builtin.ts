@@ -321,7 +321,9 @@ registerProvider<SystemPrompt>(systemPromptCapability.id, {
 // Skills
 async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
 	// Walk up from cwd finding .gjc/skills/ in ancestors (closest first)
-	const ancestors = getAncestorDirs(ctx.cwd, ctx.repoRoot ?? ctx.home);
+	const ancestors = getAncestorDirs(ctx.cwd, ctx.repoRoot ?? ctx.home).filter(
+		({ dir }) => path.resolve(dir) !== path.resolve(ctx.home),
+	);
 	const projectScans = ancestors.flatMap(({ dir }) =>
 		getProjectConfigDirs().map(projectConfigDir =>
 			scanSkillsFromDir(ctx, {
@@ -334,14 +336,21 @@ async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
 	);
 
 	// User-level scan from the active agent-directory profile.
-	const userScans = [
+	const userSkillDirs = [
+		...new Set([
+			path.join(resolveUserAgentDir(ctx), "skills"),
+			path.join(ctx.home, PATHS.userBase, "skills"),
+			path.join(ctx.home, ".gjc", "skills"),
+		]),
+	];
+	const userScans = userSkillDirs.map(dir =>
 		scanSkillsFromDir(ctx, {
-			dir: path.join(resolveUserAgentDir(ctx), "skills"),
+			dir,
 			providerId: PROVIDER_ID,
 			level: "user",
 			requireDescription: true,
 		}),
-	];
+	);
 
 	const results = await Promise.all([...projectScans, ...userScans]);
 
