@@ -410,6 +410,10 @@ export class ModelSelectorComponent extends Container {
 	#unsubscribeProviderOrderChanged: () => void = () => {};
 	#unsubscribeAuthGeneration: () => void = () => {};
 	#disposed = false;
+	#catalogLoaded = false;
+	#catalogLoadPromise?: Promise<void>;
+	#presetCatalogRefreshPending = false;
+	#openSmartRoutingAfterPresetRefresh = false;
 	/** Standalone smart-routing entry: cancel closes the selector instead of falling back to the preset landing. */
 	#smartRoutingOnly = false;
 
@@ -545,11 +549,20 @@ export class ModelSelectorComponent extends Container {
 			this.#unsubscribeCatalogChanged = this.#modelRegistry.onCatalogChanged(() => {
 				if (this.#disposed) return;
 				if (this.#viewMode === "presets") {
-					this.#refreshCatalogView();
+					if (this.#presetCatalogRefreshPending) return;
+					this.#rebuildRoleModels();
 					this.#clampPresetCursor();
 					void this.#refreshProviderAuth();
 					this.#renderPresetLanding();
 					this.#tui.requestRender();
+					return;
+				}
+				if (this.#viewMode === "smart-routing" && this.#smartRoutingPanel) return;
+				// The in-flight load already consumes the latest registry snapshot. Avoid
+				// materializing the same catalog again from its own change notification.
+				if (this.#catalogLoadPromise) return;
+				if (!this.#catalogLoaded) {
+					void this.#initializeCatalogView();
 					return;
 				}
 				if (this.#refreshCatalogView()) this.#tui.requestRender();
@@ -572,34 +585,20 @@ export class ModelSelectorComponent extends Container {
 				void this.#refreshProviderAuth();
 			}) ?? (() => {});
 
-		// Load models and do initial render
-		this.#loadModels().then(() => {
-			this.#buildProviderTabs();
-			if (this.#smartRoutingOnly) {
-				this.#enterSmartRoutingMode();
-				this.#tui.requestRender();
-				return;
-			}
-			if (this.#viewMode === "presets" && (this.#modelRegistry.getModelProfiles?.().size ?? 0) === 0) {
-				this.#viewMode = "models";
-			}
-			if (this.#viewMode === "presets") {
-				void this.#refreshProviderAuth();
+		if (this.#viewMode === "presets") {
+			// The landing only needs profile definitions and provider authentication.
+			// Refresh static configuration without enumerating and canonicalizing the
+			// full browser catalog, then resolve preset authentication once.
+			if ((this.#modelRegistry.getModelProfiles?.().size ?? 0) > 0) {
 				this.#renderPresetLanding();
 			} else {
-				this.#updateTabBar();
-				// Always apply the current search query — the user may have typed
-				// while models were loading asynchronously.
-				const currentQuery = this.#searchInput.getValue();
-				if (currentQuery) {
-					this.#filterModels(currentQuery);
-				} else {
-					this.#updateList();
-				}
+				this.#listContainer.addChild(new Text(theme.fg("muted", "Loading model presets..."), 0, 0));
 			}
-			// Request re-render after models are loaded
 			this.#tui.requestRender();
-		});
+			void this.#initializePresetLanding();
+		} else {
+			void this.#initializeCatalogView();
+		}
 	}
 
 	override dispose(): void {
@@ -1684,6 +1683,39 @@ export class ModelSelectorComponent extends Container {
 		this.#searchInput.setValue(value);
 	}
 
+	async #initializePresetLanding(): Promise<void> {
+		this.#presetCatalogRefreshPending = true;
+		let refreshFailed = false;
+		try {
+			const refreshStatic = this.#modelRegistry.refreshStatic;
+			if (typeof refreshStatic === "function") await refreshStatic.call(this.#modelRegistry);
+			this.#errorMessage = this.#modelRegistry.getError();
+		} catch (error) {
+			refreshFailed = true;
+			this.#errorMessage = error instanceof Error ? error.message : String(error);
+		} finally {
+			this.#presetCatalogRefreshPending = false;
+		}
+		if (this.#disposed || this.#viewMode !== "presets") return;
+		if ((this.#modelRegistry.getModelProfiles?.().size ?? 0) === 0) {
+			this.#viewMode = "models";
+			void this.#initializeCatalogView();
+			return;
+		}
+		this.#rebuildRoleModels();
+		this.#clampPresetCursor();
+		if (this.#openSmartRoutingAfterPresetRefresh) {
+			this.#openSmartRoutingAfterPresetRefresh = false;
+			if (!refreshFailed) {
+				this.#enterSmartRoutingMode();
+				return;
+			}
+		}
+		void this.#refreshProviderAuth();
+		this.#renderPresetLanding();
+		this.#tui.requestRender();
+	}
+
 	#switchToModelMode(seed?: string, options?: { imageRoleFilter?: boolean }): void {
 		this.#viewMode = "models";
 		this.#expandedPresetProviderId = undefined;
@@ -1695,8 +1727,52 @@ export class ModelSelectorComponent extends Container {
 		this.#selectedIndex = 0;
 		this.#imageRoleFilter = options?.imageRoleFilter ?? false;
 		this.#setSearchInputValue(seed ?? this.#searchInput.getValue());
+		void this.#initializeCatalogView();
+	}
+
+	async #initializeCatalogView(): Promise<void> {
+		if (this.#catalogLoaded) {
+			this.#presentCatalogView();
+			return;
+		}
+		if (this.#catalogLoadPromise) return this.#catalogLoadPromise;
+
+		this.#headerContainer.clear();
+		this.#listContainer.clear();
+		this.#listContainer.addChild(new Text(theme.fg("muted", "Loading models..."), 0, 0));
+		this.#tui.requestRender();
+
+		const load = this.#loadModels().then(() => {
+			this.#catalogLoaded = true;
+			if (this.#disposed) return;
+			if (this.#smartRoutingOnly) {
+				this.#enterSmartRoutingMode();
+				return;
+			}
+			if (this.#viewMode === "models") this.#presentCatalogView();
+		});
+		this.#catalogLoadPromise = load;
+		try {
+			await load;
+		} catch (error) {
+			if (!this.#disposed && (this.#viewMode === "models" || this.#viewMode === "smart-routing")) {
+				this.#errorMessage = error instanceof Error ? error.message : String(error);
+				this.#buildProviderTabs();
+				this.#updateTabBar();
+				this.#updateList();
+				this.#tui.requestRender();
+			}
+		} finally {
+			if (this.#catalogLoadPromise === load) this.#catalogLoadPromise = undefined;
+		}
+	}
+
+	#presentCatalogView(): void {
+		this.#buildProviderTabs();
 		this.#updateTabBar();
+		// Apply the latest query: input remains responsive while the catalog loads.
 		this.#filterModels(this.#searchInput.getValue());
+		this.#tui.requestRender();
 	}
 
 	/**
@@ -1879,6 +1955,12 @@ export class ModelSelectorComponent extends Container {
 		this.#headerContainer.addChild(new Text(theme.fg("accent", "Model presets"), 0, 0));
 		for (const line of this.#formatCurrentSessionLines()) {
 			this.#headerContainer.addChild(new Text(line, 0, 0));
+		}
+		if (this.#errorMessage) {
+			for (const line of String(this.#errorMessage).split("\n")) {
+				this.#listContainer.addChild(new Text(theme.fg("error", line), 0, 0));
+			}
+			this.#listContainer.addChild(new Spacer(1));
 		}
 		const rows = this.#getPresetRows();
 		for (let i = 0; i < rows.length; i++) {
@@ -2305,7 +2387,11 @@ export class ModelSelectorComponent extends Container {
 
 	handleInput(keyData: string): void {
 		if (this.#viewMode === "smart-routing") {
-			this.#smartRoutingPanel?.handleInput(keyData);
+			if (this.#smartRoutingPanel) {
+				this.#smartRoutingPanel.handleInput(keyData);
+			} else if (getKeybindings().matches(keyData, "tui.select.cancel")) {
+				this.#onCancelCallback();
+			}
 			return;
 		}
 		if (this.#assignmentState === "assigning") {
@@ -2504,6 +2590,12 @@ export class ModelSelectorComponent extends Container {
 		const row = this.#getSelectedPresetRow();
 		if (!row) return;
 		if (row.kind === "smartRouting") {
+			if (this.#presetCatalogRefreshPending) {
+				this.#openSmartRoutingAfterPresetRefresh = true;
+				this.#presetLoginHint = "Refreshing model configuration...";
+				this.#renderPresetLanding();
+				return;
+			}
 			this.#enterSmartRoutingMode();
 			return;
 		}
