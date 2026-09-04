@@ -1,10 +1,13 @@
 import { describe, expect, it } from "bun:test";
+import type { Context, Model } from "@gajae-code/ai";
 import { Effort } from "@gajae-code/ai/model-thinking";
 import {
 	type GrokCliModelConfig,
 	resolveModels,
 	supportsReasoningEffort,
 } from "../src/defaults/gjc/extensions/grok-cli-vendor/src/models/catalog";
+import { sanitizePayload } from "../src/defaults/gjc/extensions/grok-cli-vendor/src/payload/sanitize";
+import { streamGrokCli } from "../src/defaults/gjc/extensions/grok-cli-vendor/src/provider/stream";
 import {
 	assertBundledGrokCliDefaults,
 	getBundledGrokBuildExtensionFactory,
@@ -108,5 +111,103 @@ describe("bundled Grok CLI defaults", () => {
 				process.env.GJC_GROK_CLI_MODELS = previousGrokCliModels;
 			}
 		}
+	});
+
+	it("keeps registered and sanitized effort ceilings aligned for older and family-variant models", async () => {
+		const previousGrokCliModels = process.env.GJC_GROK_CLI_MODELS;
+		process.env.GJC_GROK_CLI_MODELS = "grok-4.3,grok-4.5-preview";
+		try {
+			const providerConfig = await captureGrokBuildProviderConfig();
+			const modelById = new Map(providerConfig.models?.map(model => [model.id, model]));
+
+			expect(modelById.get("grok-4.3")?.thinking).toEqual({
+				minLevel: Effort.Low,
+				maxLevel: Effort.High,
+				mode: "effort",
+			});
+			expect(modelById.get("grok-4.5-preview")?.thinking).toEqual({
+				minLevel: Effort.Low,
+				maxLevel: Effort.High,
+				mode: "effort",
+			});
+			expect(modelById.get("grok-4.3")?.compat).toEqual({ supportsReasoningEffort: true });
+			expect(modelById.get("grok-4.5-preview")?.compat).toEqual({ supportsReasoningEffort: true });
+			expect(
+				sanitizePayload({ reasoning: { effort: Effort.XHigh } }, "grok-4.3", undefined, process.cwd()).reasoning,
+			).toEqual({ effort: Effort.High });
+			expect(
+				sanitizePayload({ reasoning: { effort: Effort.XHigh } }, "grok-4.5-preview", undefined, process.cwd())
+					.reasoning,
+			).toEqual({ effort: Effort.High });
+		} finally {
+			if (previousGrokCliModels === undefined) {
+				delete process.env.GJC_GROK_CLI_MODELS;
+			} else {
+				process.env.GJC_GROK_CLI_MODELS = previousGrokCliModels;
+			}
+		}
+	});
+
+	it("declares effort support only for catalog-supported Grok models", async () => {
+		const previousGrokCliModels = process.env.GJC_GROK_CLI_MODELS;
+		delete process.env.GJC_GROK_CLI_MODELS;
+		try {
+			const providerConfig = await captureGrokBuildProviderConfig();
+			const modelById = new Map(providerConfig.models?.map(model => [model.id, model]));
+
+			expect(modelById.get("grok-4.6")?.compat).toEqual({ supportsReasoningEffort: true });
+			expect(modelById.get("grok-4.5")?.compat).toEqual({ supportsReasoningEffort: true });
+			expect(modelById.get("grok-build")?.compat).toBeUndefined();
+			expect(modelById.get("grok-composer-2.5-fast")?.compat).toBeUndefined();
+		} finally {
+			if (previousGrokCliModels === undefined) {
+				delete process.env.GJC_GROK_CLI_MODELS;
+			} else {
+				process.env.GJC_GROK_CLI_MODELS = previousGrokCliModels;
+			}
+		}
+	});
+
+	it("keeps xhigh in the full Grok Build request and strips unsupported models safely", async () => {
+		const providerConfig = await captureGrokBuildProviderConfig();
+		const capturePayload = async (modelId: string): Promise<Record<string, unknown>> => {
+			const definition = providerConfig.models?.find(model => model.id === modelId);
+			if (!definition) throw new Error(`Grok Build test model ${modelId} was not registered`);
+			const model = {
+				...definition,
+				api: "openai-responses",
+				baseUrl: providerConfig.baseUrl ?? "https://cli-chat-proxy.grok.com/v1",
+				provider: "grok-build",
+			} as Model<"openai-responses">;
+			const controller = new AbortController();
+			controller.abort();
+			const { promise, resolve } = Promise.withResolvers<Record<string, unknown>>();
+			streamGrokCli(
+				model,
+				{
+					messages: [{ role: "user", content: "hello", timestamp: 0 }],
+					systemPrompt: [],
+				} as unknown as Context,
+				{
+					apiKey: "test-key",
+					reasoning: Effort.XHigh,
+					signal: controller.signal,
+					onPayload: payload => {
+						resolve(payload as Record<string, unknown>);
+					},
+				},
+			);
+			return promise;
+		};
+
+		const supportedPayload = await capturePayload("grok-4.6");
+		expect(supportedPayload.reasoning).toEqual({ effort: Effort.XHigh, summary: "auto" });
+		expect(sanitizePayload(supportedPayload, "grok-4.6", undefined, process.cwd()).reasoning).toEqual({
+			effort: Effort.XHigh,
+		});
+
+		const unsupportedPayload = await capturePayload("grok-build");
+		expect(unsupportedPayload.reasoning).toBeUndefined();
+		expect(sanitizePayload(unsupportedPayload, "grok-build", undefined, process.cwd()).reasoning).toBeUndefined();
 	});
 });

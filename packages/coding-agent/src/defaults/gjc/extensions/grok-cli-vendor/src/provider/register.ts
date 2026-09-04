@@ -7,7 +7,12 @@ import { Effort } from '@gajae-code/ai/model-thinking';
 import type { OAuthCredentials, OAuthLoginCallbacks } from '@gajae-code/ai/utils/oauth/types';
 import { loginXai, refreshXaiToken, XAI_OAUTH_SCOPE } from '@gajae-code/ai/utils/oauth/xai';
 import type { ExtensionAPI, ProviderConfig } from '@gajae-code/coding-agent';
-import { type GrokCliModelConfig, resolveModels } from '../models/catalog.js';
+import {
+  type GrokCliModelConfig,
+  getMaxReasoningEffort,
+  resolveModels,
+  supportsReasoningEffort,
+} from '../models/catalog.js';
 import { sanitizePayload } from '../payload/sanitize.js';
 import { getBaseUrl, isGrokBuildBaseUrlOverrideIgnored } from '../shared/base-url.js';
 import { streamGrokCli } from './stream.js';
@@ -38,7 +43,7 @@ export default function registerGrokCli(api: ExtensionAPI) {
       thinking: m.reasoning
         ? {
             minLevel: Effort.Low,
-            maxLevel: m.maxReasoningEffort ?? Effort.XHigh,
+            maxLevel: getMaxReasoningEffort(m.id) ?? Effort.XHigh,
             mode: 'effort',
           }
         : undefined,
@@ -46,6 +51,12 @@ export default function registerGrokCli(api: ExtensionAPI) {
       cost: m.cost,
       contextWindow: m.contextWindow,
       maxTokens: m.maxTokens,
+      // cli-chat-proxy is not a generic audited OpenAI origin. Carry only the
+      // catalog's model-scoped evidence into core reasoning request gating.
+      compat:
+        m.reasoning && supportsReasoningEffort(m.id)
+          ? { supportsReasoningEffort: true }
+          : undefined,
     })),
     oauth: {
       name: 'Grok Build',

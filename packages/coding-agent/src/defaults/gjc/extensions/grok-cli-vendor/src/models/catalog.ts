@@ -73,6 +73,7 @@ const FALLBACK_MODELS: GrokCliModelConfig[] = [
     cost: COST_43,
     contextWindow: 1_000_000,
     maxTokens: 30_000,
+    maxReasoningEffort: Effort.High,
   },
   {
     // Official metadata and pricing: https://docs.x.ai/developers/models/grok-4.6
@@ -158,23 +159,22 @@ function matchesModelFamily(name: string, modelId: string): boolean {
   return name.startsWith(`${modelId}-`) && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(suffix);
 }
 
+const REASONING_EFFORT_CAPS = [
+  { prefix: 'grok-3-mini', max: Effort.High },
+  { prefix: 'grok-4.3', max: Effort.High },
+  { prefix: 'grok-4.5', max: Effort.High },
+  { prefix: 'grok-4.6', max: Effort.XHigh },
+  { prefix: 'grok-4.20-multi-agent', max: Effort.XHigh },
+] as const;
+
 export function getMaxReasoningEffort(modelId: string): Effort | undefined {
   const name = getCanonicalModelName(modelId);
-  return FALLBACK_MODELS.find((model) => matchesModelFamily(name, model.id.toLowerCase()))
-    ?.maxReasoningEffort;
+  return REASONING_EFFORT_CAPS.find(({ prefix }) => matchesModelFamily(name, prefix))?.max;
 }
-
-const EFFORT_CAPABLE_PREFIXES = [
-  'grok-3-mini',
-  'grok-4.20-multi-agent',
-  'grok-4.3',
-  'grok-4.5',
-  'grok-4.6',
-];
 
 export function supportsReasoningEffort(modelId: string): boolean {
   const name = getCanonicalModelName(modelId);
-  if (!EFFORT_CAPABLE_PREFIXES.some((prefix) => matchesModelFamily(name, prefix))) {
+  if (!REASONING_EFFORT_CAPS.some(({ prefix }) => matchesModelFamily(name, prefix))) {
     return false;
   }
   const model = resolveModels().find((entry) => getCanonicalModelName(entry.id) === name);
