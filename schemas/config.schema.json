@@ -877,6 +877,15 @@
 			"description": "Reasoning depth for thinking-capable models",
 			"default": "high"
 		},
+		"reasoningLanguage": {
+			"type": "string",
+			"enum": [
+				"off",
+				"english"
+			],
+			"description": "Optionally reason through development work in English while preserving the user's response language",
+			"default": "off"
+		},
 		"hideThinkingBlock": {
 			"type": "boolean",
 			"description": "Hide thinking blocks in assistant responses",

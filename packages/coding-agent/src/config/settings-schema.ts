@@ -1243,6 +1243,26 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	reasoningLanguage: {
+		type: "enum",
+		values: ["off", "english"] as const,
+		default: "off",
+		ui: {
+			tab: "model",
+			label: "Reasoning Language",
+			description:
+				"Optionally reason through development work in English while preserving the user's response language",
+			options: [
+				{ value: "off", label: "Off", description: "Do not add reasoning-language guidance" },
+				{
+					value: "english",
+					label: "English",
+					description: "Reason through technical work in English and answer in the user's language",
+				},
+			],
+		},
+	},
+
 	hideThinkingBlock: {
 		type: "boolean",
 		default: false,

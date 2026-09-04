@@ -201,6 +201,19 @@ describe("system Handlebars prompt templates", () => {
 		const reduction = 1 - subBytes / fullBytes;
 		expect(reduction).toBeGreaterThanOrEqual(0.25);
 	});
+
+	test("system-prompt renders opt-in English reasoning guidance without changing the response language", async () => {
+		const templatePath = path.join(systemPromptsDir, "system-prompt.md");
+		const template = await Bun.file(templatePath).text();
+
+		const enabled = prompt.render(template, { ...baseRenderContext, reasoningLanguageEnglish: true });
+		expect(enabled).toContain("<reasoning-language>");
+		expect(enabled).toContain("Reason through development and technical problem-solving in English.");
+		expect(enabled).toContain("Keep user-facing answers in the language the user requested or used.");
+
+		const disabled = prompt.render(template, { ...baseRenderContext, reasoningLanguageEnglish: false });
+		expect(disabled).not.toContain("<reasoning-language>");
+	});
 	test("system-prompt omits obsolete MCP discovery plumbing", async () => {
 		const templatePath = path.join(systemPromptsDir, "system-prompt.md");
 		const template = await Bun.file(templatePath).text();

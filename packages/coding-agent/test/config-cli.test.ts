@@ -55,6 +55,24 @@ describe("config CLI schema coverage", () => {
 		});
 	});
 
+	it("configures opt-in English reasoning with an off default", async () => {
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+		await runConfigCommand({ action: "get", key: "reasoningLanguage", flags: { json: true } });
+		expect(JSON.parse(String(logSpy.mock.calls.at(-1)?.[0])).value).toBe("off");
+
+		await runConfigCommand({ action: "set", key: "reasoningLanguage", value: "english", flags: { json: true } });
+		await runConfigCommand({ action: "get", key: "reasoningLanguage", flags: { json: true } });
+
+		expect(JSON.parse(String(logSpy.mock.calls.at(-1)?.[0]))).toEqual({
+			key: "reasoningLanguage",
+			value: "english",
+			type: "enum",
+			description:
+				"Optionally reason through development work in English while preserving the user's response language",
+		});
+	});
+
 	it("renders record settings as JSON and with record type in text output", async () => {
 		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
