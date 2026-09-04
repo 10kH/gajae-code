@@ -67,12 +67,24 @@ function normalizeSkillName(name: string | undefined): string {
 
 const SKILL_NAME_GLOB_PATTERN = /[*?[\]{}]/;
 const MAX_AVAILABLE_SKILL_NAMES = 50;
+const MAX_AVAILABLE_SKILL_CHARS = 2048;
 
 function formatAvailableSkills(skills: readonly { name: string }[]): string {
 	const names = [...new Set(skills.map(skill => skill.name))].sort();
-	const visible = names.slice(0, MAX_AVAILABLE_SKILL_NAMES);
+	const visible: string[] = [];
+	let visibleChars = 0;
+	for (let index = 0; index < names.length && visible.length < MAX_AVAILABLE_SKILL_NAMES; index++) {
+		const name = names[index];
+		const separatorChars = visible.length > 0 ? 2 : 0;
+		const omittedAfterAdding = names.length - (visible.length + 1);
+		const markerChars = omittedAfterAdding > 0 ? `, … (+${omittedAfterAdding} more)`.length : 0;
+		if (visibleChars + separatorChars + name.length + markerChars > MAX_AVAILABLE_SKILL_CHARS) break;
+		visible.push(name);
+		visibleChars += separatorChars + name.length;
+	}
 	const omitted = names.length - visible.length;
-	return `${visible.join(", ")}${omitted > 0 ? `, … (+${omitted} more)` : ""}`;
+	const marker = omitted > 0 ? `… (+${omitted} more)` : "";
+	return visible.length > 0 && marker ? `${visible.join(", ")}, ${marker}` : visible.join(", ") || marker;
 }
 
 type SkillToolInput = z.infer<typeof skillSchema>;

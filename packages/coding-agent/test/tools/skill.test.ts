@@ -843,10 +843,12 @@ describe("SkillTool", () => {
 	it("enumerates and invokes registered marketplace skills by their namespaced name", async () => {
 		const cwd = await makeTempCwd();
 		const home = await fs.mkdtemp(path.join(os.tmpdir(), "skill-tool-marketplace-home-"));
-		const pluginRoot = path.join(home, "plugin-cache", "craft-skills");
+		const craftRoot = path.join(home, "plugin-cache", "craft-skills");
+		const bstackRoot = path.join(home, "plugin-cache", "bstack");
 		const registryPath = path.join(home, ".gjc", "plugins", "installed_plugins.json");
 		try {
-			await makeRuntimeSkill(path.join(pluginRoot, "skills"), "design", "Marketplace design", "Marketplace body.");
+			await makeRuntimeSkill(path.join(craftRoot, "skills"), "design", "Craft design", "Craft body.");
+			await makeRuntimeSkill(path.join(bstackRoot, "skills"), "design", "Bstack design", "Bstack body.");
 			await fs.mkdir(path.dirname(registryPath), { recursive: true });
 			await fs.writeFile(
 				registryPath,
@@ -854,8 +856,9 @@ describe("SkillTool", () => {
 					version: 2,
 					plugins: {
 						"craft-skills@craft-skills": [
-							{ scope: "user", installPath: pluginRoot, version: "0.14.6", enabled: true },
+							{ scope: "user", installPath: craftRoot, version: "0.14.6", enabled: true },
 						],
+						"bstack@bstack": [{ scope: "user", installPath: bstackRoot, version: "1.1.7", enabled: true }],
 					},
 				}),
 			);
@@ -870,10 +873,18 @@ describe("SkillTool", () => {
 			const captured: CapturedSend[] = [];
 			const tool = new SkillTool(createSession(cwd, loaded.skills, captured, { settings, home }));
 
-			await expect(tool.execute("missing", { name: "missing" })).rejects.toThrow(/Available: craft-skills:design/);
-			const result = await tool.execute("invoke", { name: "craft-skills:design" });
-			expect(result.details?.name).toBe("craft-skills:design");
-			expect(captured[0]?.message.content).toContain("Marketplace body.");
+			await expect(tool.execute("missing", { name: "missing" })).rejects.toThrow(
+				/Available: bstack:design, craft-skills:design/,
+			);
+			await expect(tool.execute("bare", { name: "design" })).rejects.toThrow(/unknown skill "design"/);
+			expect(captured).toHaveLength(0);
+
+			const craft = await tool.execute("craft", { name: "craft-skills:design" });
+			const bstack = await tool.execute("bstack", { name: "bstack:design" });
+			expect(craft.details?.name).toBe("craft-skills:design");
+			expect(bstack.details?.name).toBe("bstack:design");
+			expect(captured[0]?.message.content).toContain("Craft body.");
+			expect(captured[1]?.message.content).toContain("Bstack body.");
 		} finally {
 			clearPluginRootsAndCaches([registryPath]);
 			await safeRm(cwd, { recursive: true, force: true });
@@ -883,17 +894,53 @@ describe("SkillTool", () => {
 
 	it("bounds the Available catalog deterministically", async () => {
 		const cwd = await makeTempCwd();
-		const skills = Array.from({ length: 60 }, (_, index) => ({
-			name: `market:${String(index).padStart(2, "0")}`,
-			description: "",
-			filePath: `/unused/${index}/SKILL.md`,
-			baseDir: `/unused/${index}`,
-			source: "test",
-		}));
-		const tool = new SkillTool(createSession(cwd, skills, []));
-		await expect(tool.execute("missing", { name: "missing" })).rejects.toThrow(
-			/Available: market:00, market:01,.*market:49, … \(\+10 more\)/,
-		);
+		try {
+			const skills = Array.from({ length: 60 }, (_, index) => ({
+				name: `market:${String(59 - index).padStart(2, "0")}`,
+				description: "",
+				filePath: `/unused/${index}/SKILL.md`,
+				baseDir: `/unused/${index}`,
+				source: "test",
+			}));
+			skills.push({ ...skills[0]!, filePath: "/unused/duplicate/SKILL.md" });
+			const tool = new SkillTool(createSession(cwd, skills, []));
+			let message = "";
+			try {
+				await tool.execute("missing", { name: "missing" });
+			} catch (error) {
+				message = error instanceof Error ? error.message : String(error);
+			}
+			const expectedNames = Array.from({ length: 50 }, (_, index) => `market:${String(index).padStart(2, "0")}`);
+			expect(message).toContain(`Available: ${expectedNames.join(", ")}, … (+10 more).`);
+			expect(message).not.toContain("market:50");
+			expect(message).not.toContain("market:59");
+		} finally {
+			await safeRm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("bounds Available output for oversized SDK-supplied skill names", async () => {
+		const cwd = await makeTempCwd();
+		try {
+			const hugeName = `market:${"x".repeat(10_000)}`;
+			const tool = new SkillTool(
+				createSession(
+					cwd,
+					[{ name: hugeName, description: "", filePath: "/unused", baseDir: "/", source: "test" }],
+					[],
+				),
+			);
+			let message = "";
+			try {
+				await tool.execute("missing", { name: "missing" });
+			} catch (error) {
+				message = error instanceof Error ? error.message : String(error);
+			}
+			expect(message.length).toBeLessThan(2200);
+			expect(message).toContain("Available: … (+1 more)");
+		} finally {
+			await safeRm(cwd, { recursive: true, force: true });
+		}
 	});
 
 	it("rejects empty name", async () => {

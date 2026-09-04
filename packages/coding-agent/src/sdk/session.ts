@@ -1967,7 +1967,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				});
 		}
 
-		let skillsCwd = cwd;
 		let skills: Skill[];
 		let skillWarnings: SkillWarning[];
 		if (options.skills !== undefined) {
@@ -2329,7 +2328,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		 * root's AGENTS.md and tree, and subagents inherit the same mismatch.
 		 */
 		const applyRescopedReadState = async (to: string): Promise<void> => {
-			skillsCwd = to;
 			try {
 				const rediscovered = await loadContextFilesResultInternal({ cwd: to });
 				contextFiles = rediscovered.contextFiles;
@@ -2340,15 +2338,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 			if (options.skills === undefined && settings.get("skills.enabled")) {
 				try {
-					const reloaded = await loadSkills({
-						...settings.getGroup("skills"),
-						agentDir,
-						cwd: to,
-						disabledExtensions: settings.get("disabledExtensions"),
-					});
-					skills = withEmbeddedDefaultGjcSkills(reloaded.skills);
-					if (!options.parentTaskPrefix) setActiveSkills(skills);
-					await session?.replaceSkills(skills);
+					await session?.reloadSkills(to);
 				} catch (error) {
 					logger.warn("Failed to reload skills after session rescope", { error: safeErrorForLog(error) });
 				}
@@ -4465,24 +4455,25 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			skillWarnings,
 			reloadSkills:
 				options.skills === undefined
-					? async () => {
+					? async reloadCwd => {
 							if (!settings.get("skills.enabled")) {
-								skills = getEmbeddedDefaultGjcSkills();
-								skillWarnings = [];
+								return { skills: getEmbeddedDefaultGjcSkills(), warnings: [] };
 							} else {
 								const reloaded = await loadSkills({
 									...settings.getGroup("skills"),
 									agentDir,
-									cwd: skillsCwd,
+									cwd: reloadCwd,
 									disabledExtensions: settings.get("disabledExtensions"),
 								});
-								skills = withEmbeddedDefaultGjcSkills(reloaded.skills);
-								skillWarnings = reloaded.warnings;
+								return { skills: withEmbeddedDefaultGjcSkills(reloaded.skills), warnings: reloaded.warnings };
 							}
-							if (!options.parentTaskPrefix) setActiveSkills(skills);
-							return { skills, warnings: skillWarnings };
 						}
 					: undefined,
+			onSkillsReloaded: (reloadedSkills, reloadedWarnings) => {
+				skills = reloadedSkills;
+				skillWarnings = reloadedWarnings;
+				if (!options.parentTaskPrefix) setActiveSkills(reloadedSkills);
+			},
 			skillsSettings: settings.getGroup("skills"),
 			modelRegistry,
 			taskDepth,

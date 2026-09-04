@@ -126,7 +126,7 @@ Loaded via symbolic link.
 		const { session } = await createAgentSession({
 			cwd: tempDir,
 			agentDir: path.join(tempHomeDir, ".gjc", "agent"),
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: SessionManager.inMemory(tempDir),
 			settings: createIsolatedSkillsSettings(),
 		});
 		try {
@@ -137,6 +137,8 @@ Loaded via symbolic link.
 			expect(resolveSkillSlashCommands(session.skills, new Set()).map(command => command.name)).toContain(
 				"skill:craft-skills:design",
 			);
+			expect(marketplaceSkill?.content).toBeUndefined();
+			expect(await marketplaceSkill?.loadContent?.()).toContain("Private body marker.");
 		} finally {
 			await session.dispose();
 			clearPluginRootsAndCaches([registryPath]);
@@ -159,7 +161,7 @@ Loaded via symbolic link.
 		const { session } = await createAgentSession({
 			cwd: tempDir,
 			agentDir: path.join(tempHomeDir, ".gjc", "agent"),
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: SessionManager.inMemory(tempDir),
 			settings: createIsolatedSkillsSettings(),
 		});
 		try {
@@ -176,12 +178,12 @@ Loaded via symbolic link.
 					},
 				}),
 			);
-			clearPluginRootsAndCaches([registryPath]);
 			await session.reloadSkills();
-			expect(session.skills.some(skill => skill.name === "lifecycle-plugin:helper")).toBe(true);
+			const installedSkill = session.skills.find(skill => skill.name === "lifecycle-plugin:helper");
+			expect(installedSkill).toBeDefined();
+			expect(await installedSkill?.loadContent?.()).toContain("# Helper");
 
 			fs.writeFileSync(registryPath, JSON.stringify({ version: 2, plugins: {} }));
-			clearPluginRootsAndCaches([registryPath]);
 			await session.reloadSkills();
 			expect(session.skills.some(skill => skill.name === "lifecycle-plugin:helper")).toBe(false);
 		} finally {
