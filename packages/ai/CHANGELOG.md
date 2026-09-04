@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.16.3] - 2026-09-04
+
 ## [0.16.2] - 2026-09-04
 
 - OpenAI Codex GPT-5.6 Sol selections now reject a known non-Pro ChatGPT OAuth account before dispatch, instead of allowing a binding that fails later with the provider's raw entitlement error. The same rejection is normalized for HTTP and streaming provider responses with guidance to choose a callable model or use an API-key credential.

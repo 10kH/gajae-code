@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.16.3] - 2026-09-04
+
 ## [0.16.2] - 2026-09-04
 
 - Primary model binding now rejects GPT-5.6 Sol when the selected openai-codex OAuth account is known to be below the Pro tier, preventing a raw entitlement failure on the first turn and preserving the prior model on a failed selection.
