@@ -31,6 +31,7 @@
 
 ### Fixed
 
+- OpenAI Codex HTTP failures with an empty response body and empty status text now include the HTTP status in the surfaced message instead of the opaque `Request failed`, while structured provider errors retain their existing messages and classification.
 - Antigravity discovery now keeps mid-rollout models that the backend marks `isInternal` when the same response surfaces them through `agentModelSorts`. Internal models absent from the IDE's surfaced model groups remain hidden, and denylisted or retired selectors still take precedence.
 - Tokenless loopback auth-broker requests carrying a browser `Origin` header are now rejected before credential reads or mutations. Native loopback clients without `Origin`, authenticated browser-origin clients, and the public health endpoint retain their existing behavior.
 - `glm-zcode` login instructions now warn users who have the ZCode desktop app installed to cancel the browser's `zcode://` open prompt. The app exchanges the single-use authorization code itself, so a code pasted afterwards is rejected by the broker (`500 {"code":2007}`) and the documented paste flow failed without explanation.

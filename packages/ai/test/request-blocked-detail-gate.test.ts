@@ -13,6 +13,14 @@ import { createCodexModel } from "./helpers";
 // contract missed it and the session breaker never repaired the request.
 
 describe("parseCodexError: detail-shaped gate rejection", () => {
+	it("includes the HTTP status when the provider returns no error text", async () => {
+		const info = await parseCodexError(new Response(null, { status: 404, statusText: "" }));
+
+		expect(info.message).toBe("Codex request failed (HTTP 404)");
+		expect(info.status).toBe(404);
+		expect(info.code).toBeUndefined();
+	});
+
 	it("classifies a JSON detail body as invalid_prompt", async () => {
 		const response = new Response(JSON.stringify({ detail: "Request blocked." }), { status: 400 });
 		const info = await parseCodexError(response);
