@@ -443,16 +443,61 @@ describe("model selector profiles", () => {
 		registry.getConfiguredProviderIds = () => ["litellm"];
 		registry.getApiKeyForProvider = (async (provider: string) =>
 			provider === "provider-a" ? "direct-key" : undefined) as typeof registry.getApiKeyForProvider;
+		const settings = Settings.isolated({
+			"modelProfile.proxyProvider": "litellm",
+			"modelProfile.proxyMode": "fallback",
+		});
 		const selector = createSelector(() => {}, {
 			registry,
-			settings: Settings.isolated({
-				"modelProfile.proxyProvider": "litellm",
-				"modelProfile.proxyMode": "fallback",
-			}),
+			settings,
 		});
 		await Bun.sleep(10);
-		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		let rendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(rendered).toContain("✓ REGISTRY FALLBACK");
+
+		settings.set("modelProfile.proxyMode", "always");
+		await Bun.sleep(10);
+		rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("✗ REGISTRY FALLBACK");
+	});
+
+	test("fences preset actions and rebuilds availability when disabled providers change", async () => {
+		installTestTheme();
+		const settings = Settings.isolated();
+		const profiles = new Map<string, ModelProfileDefinition>([[profile.name, profile]]);
+		const refreshGate = Promise.withResolvers<"key">();
+		let delayProviderAuth = false;
+		const registry = createRegistry() as unknown as TestModelRegistry & {
+			getAvailableForProfileActivation: () => Model[];
+			getApiKeyForProvider: (provider: string) => Promise<string>;
+		};
+		registry.getModelProfiles = () => new Map(profiles);
+		registry.getModelProfile = (name: string) => profiles.get(name);
+		registry.getAvailableModelProfileNames = () => [...profiles.keys()];
+		registry.getAvailableForProfileActivation = () =>
+			settings.get("disabledProviders").includes("provider-a") ? [] : [defaultModel, alternateModel];
+		registry.getApiKeyForProvider = async provider => {
+			if (delayProviderAuth && provider === "provider-a") return refreshGate.promise;
+			return "key";
+		};
+
+		const selector = createSelector(() => {}, { registry, settings });
+		await Bun.sleep(10);
+		expect(normalizeRenderedText(selector.render(220).join("\n"))).toContain("✓ CUSTOM");
+
+		delayProviderAuth = true;
+		settings.set("disabledProviders", ["provider-a"]);
+		let rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("… CUSTOM");
+
+		selector.handleInput("\n");
+		rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("Refreshing preset availability...");
+		expect(rendered).not.toContain("No available model matches this preset");
+
+		refreshGate.resolve("key");
+		await Bun.sleep(10);
+		expect(normalizeRenderedText(selector.render(220).join("\n"))).toContain("✗ CUSTOM");
 	});
 
 	beforeAll(async () => {
@@ -494,11 +539,63 @@ describe("model selector profiles", () => {
 		expect(rendered).not.toContain("Codex Eco");
 	});
 
+	test("defers authenticated preset actions while availability refresh is pending", async () => {
+		installTestTheme();
+		const gate = Promise.withResolvers<"key">();
+		const registry = createRegistry();
+		registry.getApiKeyForProvider = async () => gate.promise;
+		const selector = createSelector(() => {}, { registry });
+		await Bun.sleep(0);
+
+		let rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("… CODEX");
+
+		selector.handleInput("\n");
+		rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("Refreshing preset availability...");
+		expect(rendered).not.toContain("No available model matches this preset");
+
+		gate.resolve("key");
+		await Bun.sleep(10);
+		selector.handleInput("\n");
+		rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("Codex Eco");
+	});
+
+	test("defers preset actions while the initial static catalog refresh is pending", async () => {
+		installTestTheme();
+		const gate = Promise.withResolvers<void>();
+		const registry = createRegistry() as unknown as TestModelRegistry & {
+			refreshStatic: () => Promise<void>;
+		};
+		registry.refreshStatic = () => gate.promise;
+		const selector = createSelector(() => {}, { registry });
+		await Bun.sleep(0);
+
+		let rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("… CODEX");
+
+		selector.handleInput("\n");
+		rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("Refreshing preset availability...");
+		expect(rendered).not.toContain("Run /login provider-a");
+
+		gate.resolve();
+		await Bun.sleep(10);
+		selector.handleInput("\n");
+		rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("Codex Eco");
+	});
+
 	test("up and down navigation stays on provider rows while collapsed", async () => {
 		installTestTheme();
-		const selector = createSelector(() => {});
+		const registry = createRegistry();
+		const getAvailable = vi.fn(registry.getAvailable);
+		registry.getAvailable = getAvailable;
+		const selector = createSelector(() => {}, { registry });
 		await Bun.sleep(10);
 		installTestTheme();
+		getAvailable.mockClear();
 
 		let rendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(rendered).toContain("CODEX");
@@ -519,6 +616,39 @@ describe("model selector profiles", () => {
 		expect(rendered).toContain("CODEX");
 		expect(rendered).not.toContain("Codex Eco");
 		expect(rendered).not.toContain("profile-a");
+		expect(getAvailable).not.toHaveBeenCalled();
+	});
+
+	test("rebuilds preset availability after profiles change in place", async () => {
+		installTestTheme();
+		const profiles = new Map<string, ModelProfileDefinition>([[profile.name, profile]]);
+		const registry = createRegistry();
+		registry.getModelProfiles = () => new Map(profiles);
+		registry.getModelProfile = (name: string) => profiles.get(name);
+		let selected: ModelSelectorSelection | undefined;
+		const selector = createSelector(
+			selection => {
+				selected = selection;
+			},
+			{ registry },
+		);
+		await Bun.sleep(10);
+
+		const addedProfile: ModelProfileDefinition = {
+			name: "added-profile",
+			displayName: "Added Profile",
+			providerGroup: "ADDED",
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: "provider-a/default" },
+			source: "user",
+		};
+		profiles.set(addedProfile.name, addedProfile);
+		selector.refreshPresetProfiles(addedProfile.name);
+		await Bun.sleep(10);
+
+		selector.handleInput("\n");
+		selector.handleInput("\n");
+		expect(selected).toEqual({ kind: "profile", profileName: "added-profile", setDefault: false });
 	});
 
 	test("landing header shows the session's current preset, model, and role assignments", async () => {

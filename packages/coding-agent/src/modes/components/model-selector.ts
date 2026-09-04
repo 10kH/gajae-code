@@ -426,6 +426,8 @@ export class ModelSelectorComponent extends Container {
 	#presetScopeIndex: number = 0;
 	#providerAuthById = new Map<string, boolean>();
 	#bareProfileAuthByName = new Map<string, boolean>();
+	// Rebuilt with the provider and bare-selector snapshots on every catalog or credential refresh.
+	#profileAuthByName = new Map<string, boolean>();
 	#providerAuthPending: boolean = false;
 	#providerAuthRefreshGeneration = 0;
 	#presetLoginHint?: string;
@@ -569,10 +571,19 @@ export class ModelSelectorComponent extends Container {
 			});
 		}
 
-		// Advisory drift only, and only while the smart-routing panel is mounted. This
-		// must not call refreshState: that would discard the user's unsaved draft.
+		// Proxy and provider-policy changes invalidate preset availability. Provider-order changes are
+		// advisory only while smart routing is mounted and must not discard its draft.
 		this.#unsubscribeProviderOrderChanged = this.#settings.onChanged?.(path => {
-			if (this.#disposed || path !== "modelProviderOrder") return;
+			if (this.#disposed) return;
+			if (
+				path === "modelProfile.proxyProvider" ||
+				path === "modelProfile.proxyMode" ||
+				path === "disabledProviders"
+			) {
+				if (this.#viewMode === "presets") void this.#refreshProviderAuth();
+				return;
+			}
+			if (path !== "modelProviderOrder") return;
 			if (this.#viewMode !== "smart-routing") return;
 			const panel = this.#smartRoutingPanel;
 			if (!panel) return;
@@ -589,6 +600,7 @@ export class ModelSelectorComponent extends Container {
 			// The landing only needs profile definitions and provider authentication.
 			// Refresh static configuration without enumerating and canonicalizing the
 			// full browser catalog, then resolve preset authentication once.
+			this.#presetCatalogRefreshPending = true;
 			if ((this.#modelRegistry.getModelProfiles?.().size ?? 0) > 0) {
 				this.#renderPresetLanding();
 			} else {
@@ -1331,6 +1343,10 @@ export class ModelSelectorComponent extends Container {
 		return this.#modelRegistry.getModelProfile?.(name) ?? this.#modelRegistry.getModelProfiles?.().get(name);
 	}
 
+	#isPresetAvailabilityPending(): boolean {
+		return this.#presetCatalogRefreshPending || this.#providerAuthPending;
+	}
+
 	#isProviderAuthenticated(providerId: string): boolean | undefined {
 		return this.#providerAuthById.get(providerId);
 	}
@@ -1404,9 +1420,13 @@ export class ModelSelectorComponent extends Container {
 		return [...missing].sort((a, b) => a.localeCompare(b));
 	}
 
-	#isPresetAuthenticated(profileOrProfiles: ModelProfileDefinition | ModelProfileDefinition[]): boolean {
+	#isPresetAuthenticated(
+		profileOrProfiles: ModelProfileDefinition | ModelProfileDefinition[],
+		computeCurrent = false,
+	): boolean {
 		const profiles = Array.isArray(profileOrProfiles) ? profileOrProfiles : [profileOrProfiles];
 		return profiles.every(profile => {
+			if (!computeCurrent) return this.#profileAuthByName.get(profile.name) === true;
 			if (profile.source !== "user") {
 				if (inspectProxyProviderId(this.#settings).status === "invalid") return false;
 				const proxyProvider = tryResolveProxyProviderId(this.#settings);
@@ -1502,6 +1522,7 @@ export class ModelSelectorComponent extends Container {
 		const refreshGeneration = ++this.#providerAuthRefreshGeneration;
 		this.#providerAuthById = new Map();
 		this.#bareProfileAuthByName = new Map();
+		this.#profileAuthByName = new Map();
 		const availableModels = this.#getProfileAvailableModels();
 		const resolutionRegistry = this.#createProfileResolutionRegistry(availableModels);
 		const providers = new Set<string>();
@@ -1611,6 +1632,11 @@ export class ModelSelectorComponent extends Container {
 			)
 				return;
 			this.#bareProfileAuthByName = new Map(profileAuthEntries);
+			this.#profileAuthByName = new Map(
+				[...this.#getPresetGroups().values()]
+					.flat()
+					.map(profile => [profile.name, this.#isPresetAuthenticated(profile, true)]),
+			);
 		} finally {
 			if (
 				!this.#disposed &&
@@ -2008,7 +2034,7 @@ export class ModelSelectorComponent extends Container {
 			}
 			if (row.kind === "group") {
 				const authenticated = this.#isPresetGroupUsable(row.profiles);
-				const mark = this.#providerAuthPending ? "…" : authenticated ? "✓" : "✗";
+				const mark = this.#isPresetAvailabilityPending() ? "…" : authenticated ? "✓" : "✗";
 				const containsActive =
 					this.#activeModelProfile !== undefined &&
 					row.profiles.some(profile => profile.name === this.#activeModelProfile);
@@ -2020,7 +2046,7 @@ export class ModelSelectorComponent extends Container {
 			}
 			const presentation = getModelProfilePresentation(row.profile);
 			const authenticated = this.#isPresetAuthenticated(row.profile);
-			const mark = this.#providerAuthPending ? "…" : authenticated ? "✓" : "✗";
+			const mark = this.#isPresetAvailabilityPending() ? "…" : authenticated ? "✓" : "✗";
 			const isActive = row.profile.name === this.#activeModelProfile;
 			const label = `  ${mark} ${presentation.displayName}`;
 			const renderedLabel = selected ? theme.fg("accent", label) : authenticated ? label : theme.fg("dim", label);
@@ -2563,6 +2589,11 @@ export class ModelSelectorComponent extends Container {
 				this.#onSelectCallback({ kind: "deleteProfile", profileName: this.#previewProfileName });
 				return;
 			}
+			if (this.#isPresetAvailabilityPending()) {
+				this.#presetLoginHint = "Refreshing preset availability...";
+				this.#renderPresetLanding();
+				return;
+			}
 			const missing = this.#getMissingProviders(profile);
 			if (missing.length > 0) {
 				this.#presetLoginHint = `Run ${missing.map(provider => `/login ${provider}`).join(", ")}`;
@@ -2615,6 +2646,11 @@ export class ModelSelectorComponent extends Container {
 			return;
 		}
 		if (row.kind === "group") {
+			if (this.#isPresetAvailabilityPending()) {
+				this.#presetLoginHint = "Refreshing preset availability...";
+				this.#renderPresetLanding();
+				return;
+			}
 			// A group is a list of alternative presets; only surface a login hint
 			// when none of its members are usable. A partially-usable group stays
 			// navigable so the user can drill in and pick a usable member.
@@ -2635,6 +2671,11 @@ export class ModelSelectorComponent extends Container {
 				this.#expandSelectedPresetProvider();
 			}
 			this.#presetLoginHint = undefined;
+			this.#renderPresetLanding();
+			return;
+		}
+		if (this.#isPresetAvailabilityPending() && !isCustomUserProfile(row.profile)) {
+			this.#presetLoginHint = "Refreshing preset availability...";
 			this.#renderPresetLanding();
 			return;
 		}
@@ -2675,7 +2716,7 @@ export class ModelSelectorComponent extends Container {
 			this.#presetLoginHint = undefined;
 			this.#clampPresetCursor();
 		}
-		this.#renderPresetLanding();
+		void this.#refreshProviderAuth();
 		this.#tui.requestRender();
 	}
 
