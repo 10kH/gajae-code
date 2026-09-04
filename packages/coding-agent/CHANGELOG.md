@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.16.2] - 2026-09-04
+
 - Primary model binding now rejects GPT-5.6 Sol when the selected openai-codex OAuth account is known to be below the Pro tier, preventing a raw entitlement failure on the first turn and preserving the prior model on a failed selection.
 
 - Fixed the steer-triggered bash fold being skipped under `toolInterruptPolicy: finish_tools`: a composer steer over a long foreground `bash` was aborted instead of folded because the fold gate wrongly treated the policy as an exclusion. `finish_tools` governs sibling tools in the batch, not the fold; the fold kills nothing and now applies under both policies. A tmux dogfood driver (`scripts/dogfood/steer-fold-tmux.sh`) proves the real binary folds, answers the steer in the same turn, and wakes on completion.
