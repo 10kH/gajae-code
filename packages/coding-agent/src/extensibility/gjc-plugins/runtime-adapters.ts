@@ -318,17 +318,17 @@ async function assertInstalledTreeAuthenticated(entry: GjcPluginRegistryEntry): 
 	}
 }
 
-async function loadValidatedPluginRegistry(cwd: string): Promise<ValidatedPluginRegistry> {
+async function loadValidatedPluginRegistry(cwd: string, forceRefresh = false): Promise<ValidatedPluginRegistry> {
 	const registryFiles = await snapshotRegistryFiles(cwd);
 	const registryKey = snapshotsKey(registryFiles);
 	const cached = validatedRegistryCache.get(cwd);
-	if (cached && cached.registryKey === registryKey) {
+	if (!forceRefresh && cached && cached.registryKey === registryKey) {
 		const pluginFiles = await snapshotPluginFiles(cached.effective);
 		const pluginKey = snapshotsKey(pluginFiles);
 		if (cached.pluginKey === pluginKey) return cached;
 	}
 
-	const effective = await loadEffectiveGjcPluginRegistry(cwd);
+	const effective = await loadEffectiveGjcPluginRegistry(cwd, forceRefresh ? { migrate: false } : undefined);
 	const currentRegistryFiles = await snapshotRegistryFiles(cwd);
 	const preQuarantine: SessionQuarantine[] = [];
 	for (const entry of effective) {
@@ -570,7 +570,7 @@ export async function buildPluginMcpConfigs(input: { cwd: string }): Promise<{
 	configs: Record<string, any>;
 	quarantine: SessionQuarantine[];
 }> {
-	const { effective, active, quarantine } = await loadValidatedPluginRegistry(input.cwd);
+	const { effective, active, quarantine } = await loadValidatedPluginRegistry(input.cwd, true);
 	if (effective.length === 0) return { configs: {}, quarantine: [] };
 
 	// A manifest-controlled MCP name such as "constructor" or "toString" must

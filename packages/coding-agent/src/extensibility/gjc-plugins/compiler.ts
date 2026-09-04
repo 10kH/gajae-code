@@ -340,8 +340,7 @@ export async function compileGjcPluginBundle(root: string): Promise<NormalizedGj
 				`GJC plugin MCP "${entry.name}": ${entry.transport} requires a url`,
 			);
 		}
-		// Derive ownership from the same cwd-aware grammar used at runtime. This
-		// includes bare entrypoint filenames and path-qualified executable commands.
+		// Derive ownership from the same cwd-aware bare Node/Bun grammar used at runtime.
 		if (entry.transport === "stdio") {
 			const invocation = classifyStdioInvocation(entry, { pluginRoot });
 			await resolveDeclaredDirectory(pluginRoot, path.relative(pluginRoot, invocation.cwd));

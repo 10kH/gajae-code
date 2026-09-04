@@ -189,8 +189,8 @@ function isFileLikeArgument(value: string): boolean {
 /**
  * Resolve the exact executable file selected by the supported stdio grammar.
  * Bare Node/Bun launchers accept a direct bundled entrypoint as argv[0]; no
- * manifest-controlled runtime options or subcommands precede it. Path commands
- * are resolved from the same effective cwd that the child process will use.
+ * manifest-controlled runtime options or subcommands precede it. Path-qualified
+ * commands are unsupported because they bypass the verified module wrapper.
  */
 export function classifyStdioInvocation(
 	entry: GjcPluginMcpManifestEntry,

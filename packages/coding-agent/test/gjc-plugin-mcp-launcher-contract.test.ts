@@ -482,6 +482,57 @@ describe("bundled plugin MCP launcher contract", () => {
 		expect(manager.getConnection("spawn-toctou")).toBeUndefined();
 	});
 
+	test("executes no replacement bytes changed after the final guard", async () => {
+		const cwd = await tempDir("gjc-plugin-launcher-atomic-project-");
+		const source = await tempDir("gjc-plugin-launcher-atomic-source-");
+		const markerDir = await tempDir("gjc-plugin-launcher-atomic-marker-");
+		const marker = path.join(markerDir, "replacement-ran.txt");
+		await writeBundle(source, { name: "atomic-toctou", command: "node", server: mcpServer() });
+		expect((await installGjcBundle({ cwd }, "project", source)).ok).toBe(true);
+		const runtime = await buildPluginMcpConfigs({ cwd });
+		const config = runtime.configs["atomic-toctou"];
+		if (!config || config.type === "http" || config.type === "sse") throw new Error("missing stdio config");
+		const entry = (await readRegistry("project", cwd)).plugins[0];
+		config.afterSpawnGuardForTest = async () => {
+			await fs.writeFile(
+				path.join(entry?.pluginRoot ?? "", "mcp/server.mjs"),
+				`import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(marker)}, "ran");\n${mcpServer()}`,
+			);
+		};
+
+		const manager = new MCPManager(cwd);
+		managers.push(manager);
+		const connected = await manager.connectServers(runtime.configs, {
+			"atomic-toctou": { provider: "gjc-plugins", providerName: "GJC plugin bundle", level: "project" },
+		} as never);
+		expect([...connected.errors.keys()]).toEqual(["atomic-toctou"]);
+		expect(manager.getConnection("atomic-toctou")).toBeUndefined();
+		await expect(fs.readFile(marker, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	test("rehashes the complete copied-file manifest at the final guard", async () => {
+		const cwd = await tempDir("gjc-plugin-launcher-helper-project-");
+		const source = await tempDir("gjc-plugin-launcher-helper-source-");
+		await writeBundle(source, {
+			name: "helper-toctou",
+			command: "node",
+			server: mcpServer(),
+			ownedFiles: { "mcp/helper.txt": "authenticated helper\n" },
+		});
+		expect((await installGjcBundle({ cwd }, "project", source)).ok).toBe(true);
+		const runtime = await buildPluginMcpConfigs({ cwd });
+		const entry = (await readRegistry("project", cwd)).plugins[0];
+		await fs.writeFile(path.join(entry?.pluginRoot ?? "", "mcp/helper.txt"), "replacement helper\n");
+
+		const manager = new MCPManager(cwd);
+		managers.push(manager);
+		const connected = await manager.connectServers(runtime.configs, {
+			"helper-toctou": { provider: "gjc-plugins", providerName: "GJC plugin bundle", level: "project" },
+		} as never);
+		expect([...connected.errors.keys()]).toEqual(["helper-toctou"]);
+		expect(manager.getConnection("helper-toctou")).toBeUndefined();
+	});
+
 	test("fails closed when the launch plan changes after config build", async () => {
 		const cwd = await tempDir("gjc-plugin-launcher-plan-project-");
 		const source = await tempDir("gjc-plugin-launcher-plan-source-");
@@ -500,5 +551,31 @@ describe("bundled plugin MCP launcher contract", () => {
 		} as never);
 		expect([...connected.errors.keys()]).toEqual(["plan-toctou"]);
 		expect(manager.getConnection("plan-toctou")).toBeUndefined();
+	});
+
+	test("rejects same-scope registry replay to another authenticated bundle root", async () => {
+		const cwd = await tempDir("gjc-plugin-launcher-replay-project-");
+		for (const name of ["replay-a", "replay-b"]) {
+			const source = await tempDir(`gjc-plugin-launcher-${name}-`);
+			await writeBundle(source, { name, command: "node", server: mcpServer() });
+			expect((await installGjcBundle({ cwd }, "project", source)).ok).toBe(true);
+		}
+		await buildPluginMcpConfigs({ cwd });
+		const registryPath = registryPathForScope("project", cwd);
+		const registry = JSON.parse(await fs.readFile(registryPath, "utf8"));
+		const first = registry.plugins.find((plugin: { name: string }) => plugin.name === "replay-a");
+		const second = registry.plugins.find((plugin: { name: string }) => plugin.name === "replay-b");
+		first.pluginRoot = second.pluginRoot;
+		first.manifestPath = second.manifestPath;
+		first.manifestHash = second.manifestHash;
+		first.copiedFiles = second.copiedFiles;
+		first.surfaces = second.surfaces;
+		await fs.writeFile(registryPath, JSON.stringify(registry));
+
+		const runtime = await buildPluginMcpConfigs({ cwd });
+		expect(runtime.configs["replay-a"]).toBeUndefined();
+		expect(runtime.quarantine).toContainEqual(
+			expect.objectContaining({ plugin: "replay-a", code: "security_policy" }),
+		);
 	});
 });
