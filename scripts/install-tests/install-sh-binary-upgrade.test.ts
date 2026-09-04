@@ -139,11 +139,32 @@ function writeFailingBun(dir: string): void {
 	fs.chmodSync(bunPath, 0o755);
 }
 
+function writeRecordingBun(dir: string): void {
+	const bunPath = path.join(dir, "bun");
+	const shim = `#!/bin/sh
+printf '%s\n' "$*" >> "\${GJC_DEV_COMMAND_LOG:?}"
+printf '%s\n' "$(pwd)" >> "\${GJC_DEV_CWD_LOG:?}"
+case "$*" in
+  "run build"|"run install:dev:bin") exit 0 ;;
+  *) echo "unexpected bun command: $*" >&2; exit 98 ;;
+esac
+`;
+	fs.writeFileSync(bunPath, shim);
+	fs.chmodSync(bunPath, 0o755);
+}
+
+interface InstallerOptions {
+	cwd?: string;
+	script?: string;
+}
+
 async function runInstaller(
 	args: string[],
 	env: Record<string, string> = {},
+	options: InstallerOptions = {},
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
-	const proc = Bun.spawn(["sh", installScript, ...args], {
+	const proc = Bun.spawn(["sh", options.script ?? installScript, ...args], {
+		cwd: options.cwd ?? repoRoot,
 		env: {
 			...process.env,
 			PATH: `${sandbox.shimDir}:/usr/bin:/bin`,
@@ -156,6 +177,35 @@ async function runInstaller(
 		stdout: "pipe",
 		stderr: "pipe",
 	});
+	const [stdout, stderr, exitCode] = await Promise.all([
+		new Response(proc.stdout).text(),
+		new Response(proc.stderr).text(),
+		proc.exited,
+	]);
+	return { exitCode, stdout, stderr };
+}
+
+async function runPipedInstaller(
+	args: string[],
+	env: Record<string, string> = {},
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+	const proc = Bun.spawn(["sh", "-s", "--", ...args], {
+		cwd: repoRoot,
+		stdin: "pipe",
+		env: {
+			...process.env,
+			PATH: `${sandbox.shimDir}:/usr/bin:/bin`,
+			GJC_INSTALL_DIR: sandbox.installDir,
+			HOME: sandbox.root,
+			GITHUB_TOKEN: "",
+			GH_TOKEN: "",
+			...env,
+		},
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	proc.stdin.write(await Bun.file(installScript).text());
+	proc.stdin.end();
 	const [stdout, stderr, exitCode] = await Promise.all([
 		new Response(proc.stdout).text(),
 		new Response(proc.stderr).text(),
@@ -198,6 +248,85 @@ describe("install.sh binary-first contract", () => {
 		expect(result.stderr).not.toContain("bun should not run");
 		expect(result.exitCode).toBe(0);
 		expect(fs.readFileSync(path.join(sandbox.installDir, "gjc"), "utf8")).toBe(payload);
+	});
+
+	test("documents --dev in installer help", async () => {
+		const result = await runInstaller(["--help"]);
+		expect(result.exitCode).toBe(0);
+		expect(result.stdout).toContain("--dev");
+		expect(result.stdout).toContain("current checkout");
+	});
+
+	test("--dev runs the build and install shortcuts from the checkout root", async () => {
+		const commandLog = path.join(sandbox.root, "bun-commands.log");
+		const cwdLog = path.join(sandbox.root, "bun-cwds.log");
+		writeRecordingBun(sandbox.shimDir);
+
+		const result = await runInstaller(
+			["--dev"],
+			{
+				GJC_DEV_COMMAND_LOG: commandLog,
+				GJC_DEV_CWD_LOG: cwdLog,
+			},
+			{ cwd: sandbox.root },
+		);
+
+		expect(result.exitCode).toBe(0);
+		expect(fs.readFileSync(commandLog, "utf8").trim().split("\n")).toEqual(["run build", "run install:dev:bin"]);
+		expect(fs.readFileSync(cwdLog, "utf8").trim().split("\n")).toEqual([repoRoot, repoRoot]);
+	});
+
+	test("--dev rejects a non-checkout script without invoking Bun", async () => {
+		const script = path.join(sandbox.root, "not-a-checkout", "scripts", "install.sh");
+		fs.mkdirSync(path.dirname(script), { recursive: true });
+		fs.copyFileSync(installScript, script);
+		const commandLog = path.join(sandbox.root, "bun-commands.log");
+		writeRecordingBun(sandbox.shimDir);
+
+		const result = await runInstaller(
+			["--dev"],
+			{
+				GJC_DEV_COMMAND_LOG: commandLog,
+				GJC_DEV_CWD_LOG: path.join(sandbox.root, "bun-cwds.log"),
+			},
+			{ cwd: sandbox.root, script },
+		);
+
+		expect(result.exitCode).not.toBe(0);
+		expect(result.stderr + result.stdout).toContain("GJC checkout");
+		expect(fs.existsSync(commandLog)).toBe(false);
+	});
+
+	test("--dev rejects piped installers without invoking Bun", async () => {
+		const commandLog = path.join(sandbox.root, "bun-commands.log");
+		writeRecordingBun(sandbox.shimDir);
+
+		const result = await runPipedInstaller(["--dev"], {
+			GJC_DEV_COMMAND_LOG: commandLog,
+			GJC_DEV_CWD_LOG: path.join(sandbox.root, "bun-cwds.log"),
+		});
+
+		expect(result.exitCode).not.toBe(0);
+		expect(result.stderr + result.stdout).toContain("piped");
+		expect(fs.existsSync(commandLog)).toBe(false);
+	});
+
+	test("--dev requires Bun without falling back to a release download", async () => {
+		const result = await runInstaller(["--dev"], { PATH: "/usr/bin:/bin" });
+		expect(result.exitCode).not.toBe(0);
+		expect(result.stderr + result.stdout).toMatch(/requires an existing Bun/i);
+		expect(fs.readdirSync(sandbox.installDir)).toEqual([]);
+	});
+
+	test("--dev rejects release options that would be ignored", async () => {
+		for (const args of [
+			["--dev", "--ref", "v0.15.0"],
+			["--dev", "--channel", "nightly"],
+		]) {
+			const result = await runInstaller(args);
+			expect(result.exitCode).not.toBe(0);
+			expect(result.stderr + result.stdout).toContain("--dev cannot be combined");
+		}
 	});
 
 	test("root install.sh execs the canonical scripts/install.sh from a clone", async () => {

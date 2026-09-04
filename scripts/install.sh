@@ -6,16 +6,19 @@ set -e
 #   curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh
 #   curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh -s -- --channel nightly
 #   curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh -s -- --ref v0.15.0
+#   sh scripts/install.sh --dev
 #
 # Options:
 #   --channel <stable|nightly>  Release channel (default: stable)
 #   --ref <tag> / -r <tag>      Exact GitHub release tag (binary assets required)
 #   --binary                    Explicit binary install (default; no-op alias)
 #   --source                    Development/source install via an existing Bun
+#   --dev                      Build and install the current checkout via Bun (local only)
 #   -h, --help                  Show this help
 #
 # Bun is never detected, installed, or invoked on the default path.
 # --source requires a preinstalled Bun and never downloads one.
+# --dev requires an on-disk GJC checkout and a preinstalled Bun.
 
 REPO="Yeachan-Heo/gajae-code"
 PACKAGE="@gajae-code/coding-agent"
@@ -36,6 +39,10 @@ AUTH_HDR=""
 BACKUP_PATH=""
 DEST_PATH=""
 SOURCE_CLONE_DIR=""
+DEV_REPO_ROOT=""
+DEV_REQUESTED=0
+SOURCE_REQUESTED=0
+BINARY_REQUESTED=0
 
 usage() {
     cat <<'EOF'
@@ -45,12 +52,14 @@ Usage:
   curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh
   sh install.sh [--channel stable|nightly] [--ref <tag>]
   sh install.sh --source [--ref <tag>]
+  sh scripts/install.sh --dev
 
 Options:
   --channel <stable|nightly>  GitHub release channel (default: stable)
   --ref <tag>, -r <tag>       Exact GitHub release tag
   --binary                    Install the prebuilt binary (default)
   --source                    Source/development install; requires existing Bun
+  --dev                      Build and install the current checkout via Bun (local only)
   -h, --help                  Show this help
 
 Environment:
@@ -140,6 +149,28 @@ is_safe_channel() {
 
 has_bun() {
     command -v bun >/dev/null 2>&1
+}
+
+require_dev_checkout() {
+    case "$0" in
+        */scripts/install.sh | scripts/install.sh)
+            ;;
+        *)
+            die "--dev requires running the on-disk scripts/install.sh from a GJC checkout; piped installers cannot use --dev."
+            ;;
+    esac
+
+    script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) ||
+        die "--dev could not resolve the on-disk installer path."
+    DEV_REPO_ROOT=$(CDPATH= cd -- "$script_dir/.." 2>/dev/null && pwd) ||
+        die "--dev could not resolve the GJC checkout root."
+
+    if [ ! -f "$script_dir/install.sh" ] || \
+        [ ! -f "$DEV_REPO_ROOT/package.json" ] || \
+        [ ! -f "$DEV_REPO_ROOT/bun.lock" ] || \
+        [ ! -f "$DEV_REPO_ROOT/packages/coding-agent/package.json" ]; then
+        die "--dev requires a GJC checkout containing scripts/install.sh, package.json, bun.lock, and packages/coding-agent/package.json."
+    fi
 }
 
 has_git() {
@@ -507,6 +538,16 @@ verify_installed_binary() {
     return 0
 }
 
+install_dev() {
+    echo "Building and installing GJC from the current checkout..."
+    cd "$DEV_REPO_ROOT" || die "--dev could not enter the GJC checkout at ${DEV_REPO_ROOT}."
+    bun run build || die "--dev build failed."
+    bun run install:dev:bin || die "--dev install failed."
+    echo ""
+    echo "Installed gjc development build from checkout"
+    echo "Run 'gjc' to get started!"
+}
+
 install_via_bun() {
     echo "Installing from source via existing bun..."
     if [ -n "$REF" ]; then
@@ -615,10 +656,17 @@ install_binary() {
 while [ $# -gt 0 ]; do
     case "$1" in
         --source)
+            SOURCE_REQUESTED=1
             MODE="source"
             shift
             ;;
+        --dev)
+            DEV_REQUESTED=1
+            MODE="dev"
+            shift
+            ;;
         --binary)
+            BINARY_REQUESTED=1
             MODE="binary"
             shift
             ;;
@@ -661,6 +709,14 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+if [ "$DEV_REQUESTED" -eq 1 ]; then
+    if [ "$SOURCE_REQUESTED" -eq 1 ] || [ "$BINARY_REQUESTED" -eq 1 ]; then
+        die "--dev cannot be combined with --source or --binary."
+    fi
+    [ -z "$REF" ] || die "--dev cannot be combined with --ref; it uses the current checkout."
+    [ "$CHANNEL" = "stable" ] || die "--dev cannot be combined with --channel $CHANNEL; it uses the current checkout."
+fi
+
 case "$MODE" in
     source)
         if ! has_bun; then
@@ -670,6 +726,14 @@ Ordinary installs should omit --source and use the prebuilt binary."
         fi
         require_bun_version
         install_via_bun
+        ;;
+    dev)
+        require_dev_checkout
+        if ! has_bun; then
+            die "--dev requires an existing Bun on PATH.
+This installer never downloads Bun. Install it from https://bun.sh/docs/installation"
+        fi
+        install_dev
         ;;
     binary)
         install_binary
