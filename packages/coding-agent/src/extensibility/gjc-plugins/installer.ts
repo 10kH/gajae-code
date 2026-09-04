@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { gunzipSync } from "node:zlib";
 import { compileGjcPluginBundle } from "./compiler";
+import { classifyStdioInvocation } from "./mcp-policy";
 import { gjcPluginProjectRoot, gjcPluginUserRoot } from "./paths";
 import { readRegistry, sortRegistryEntries, withRegistryLock, writeRegistryUnlocked } from "./registry";
 import {
@@ -392,6 +393,21 @@ function sha256(buf: Buffer): string {
  * copied, so the installed tree equals the validated set.
  */
 async function copyValidatedFiles(bundle: NormalizedGjcPluginBundle, stagingDir: string): Promise<void> {
+	const cwdPaths = new Set(
+		bundle.surfaces.mcps.flatMap(surface => {
+			if (surface.transport !== "stdio") return [];
+			const invocation = classifyStdioInvocation(surface.config, { pluginRoot: bundle.root });
+			return [path.relative(bundle.root, invocation.cwd)];
+		}),
+	);
+	const executablePaths = new Set(
+		bundle.surfaces.mcps.flatMap(surface => {
+			if (surface.transport !== "stdio") return [];
+			const invocation = classifyStdioInvocation(surface.config, { pluginRoot: bundle.root });
+			return invocation.kind === "bundled-executable" ? [invocation.ownedRelativePath] : [];
+		}),
+	);
+	for (const cwdPath of cwdPaths) await fs.mkdir(path.join(stagingDir, cwdPath), { recursive: true });
 	for (const file of bundle.files) {
 		const src = path.join(bundle.root, file.relativePath);
 		const lst = await fs.lstat(src);
@@ -405,6 +421,7 @@ async function copyValidatedFiles(bundle: NormalizedGjcPluginBundle, stagingDir:
 		const dest = path.join(stagingDir, file.relativePath);
 		await fs.mkdir(path.dirname(dest), { recursive: true });
 		await fs.writeFile(dest, buf);
+		if (executablePaths.has(file.relativePath)) await fs.chmod(dest, 0o700);
 	}
 }
 

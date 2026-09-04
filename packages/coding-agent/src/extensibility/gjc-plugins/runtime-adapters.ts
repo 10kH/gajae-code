@@ -1,14 +1,15 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { bindPluginMcpToPublicNetwork } from "../../runtime-mcp/plugin-network-boundary";
 import { loadCustomTools } from "../custom-tools/loader";
 import type { CustomTool } from "../custom-tools/types";
 import { bundleIdentity } from "./lifecycle-reconciliation";
-import { verifyImplementationHash } from "./metadata";
+import { canonicalJson, verifyImplementationHash } from "./metadata";
 import { isV2Tool } from "./migration";
 import { resolveWithinRoot } from "./paths";
-import { loadEffectiveGjcPluginRegistry, registryPathForScope } from "./registry";
+import { loadEffectiveGjcPluginRegistry, registryPathForScope, registryRootForScope } from "./registry";
 import { type SessionQuarantine, type SessionValidationResult, validateSessionBundles } from "./session-validation";
 import type { GjcPluginRegistryEntry, GjcPluginScope, JsonSchema202012, NormalizedToolSurfaceV2 } from "./types";
 
@@ -128,6 +129,12 @@ function sha256(buf: Buffer): string {
 	return createHash("sha256").update(buf).digest("hex");
 }
 
+function canonicalPersistedJson(value: unknown): string {
+	const serialized = JSON.stringify(value);
+	if (serialized === undefined) throw new Error("Cannot canonicalize an undefined persisted value");
+	return canonicalJson(JSON.parse(serialized) as unknown);
+}
+
 async function hashFile(snapshot: FileSnapshot): Promise<string> {
 	const key = `${snapshot.path}:${snapshot.mtimeMs}:${snapshot.ctimeMs}:${snapshot.size}:${snapshot.ino}`;
 	const cached = hashCache.get(key);
@@ -178,6 +185,18 @@ async function verifyEntryHashesCached(entry: GjcPluginRegistryEntry): Promise<S
 		}
 	}
 	return null;
+}
+
+async function assertMcpPluginRootOwnedByScope(entry: GjcPluginRegistryEntry, cwd: string): Promise<void> {
+	const scopeRoot = path.resolve(registryRootForScope(entry.scope, cwd));
+	const pluginRoot = path.resolve(entry.pluginRoot);
+	if (!isWithin(scopeRoot, pluginRoot)) {
+		throw new Error(`Installed plugin root escapes its ${entry.scope} registry scope: ${entry.pluginRoot}`);
+	}
+	const [scopeRootReal, pluginRootReal] = await Promise.all([fs.realpath(scopeRoot), fs.realpath(pluginRoot)]);
+	if (!isWithin(scopeRootReal, pluginRootReal)) {
+		throw new Error(`Installed plugin root escapes its ${entry.scope} registry scope: ${entry.pluginRoot}`);
+	}
 }
 
 async function loadValidatedPluginRegistry(cwd: string): Promise<ValidatedPluginRegistry> {
@@ -434,28 +453,75 @@ export async function buildPluginMcpConfigs(input: { cwd: string }): Promise<{
 }> {
 	const { effective, active, quarantine } = await loadValidatedPluginRegistry(input.cwd);
 	if (effective.length === 0) return { configs: {}, quarantine: [] };
-	const { assertMcpInstallPolicy, assertDnsResolvesPublic, assertUrlAllowed } = await import("./mcp-policy");
-	const nodePath = await import("node:path");
+	const [
+		{ assertMcpInstallPolicy, assertDnsResolvesPublic, assertUrlAllowed, classifyStdioInvocation },
+		{ compileGjcPluginBundle },
+	] = await Promise.all([import("./mcp-policy"), import("./compiler")]);
 
 	// A manifest-controlled MCP name such as "constructor" or "toString" must
 	// remain an ordinary own key rather than interacting with Object.prototype.
 	const configs: Record<string, any> = Object.create(null) as Record<string, any>;
 	for (const entry of active) {
 		const disabled = new Set(entry.disabledSurfaceIds);
+		let compiledMcps: Map<string, (typeof entry.surfaces.mcps)[number]> | undefined;
+		let compileError: unknown;
+		try {
+			await assertMcpPluginRootOwnedByScope(entry, input.cwd);
+			const compiled = await compileGjcPluginBundle(entry.pluginRoot);
+			compiledMcps = new Map(compiled.surfaces.mcps.map(surface => [surface.extensionId, surface]));
+		} catch (error) {
+			compileError = error;
+		}
 		for (const m of entry.surfaces.mcps) {
 			if (disabled.has(m.extensionId)) continue;
 			const cfg = m.config;
 			try {
+				if (compileError) throw compileError;
+				const compiled = compiledMcps?.get(m.extensionId);
+				if (
+					!compiled ||
+					m.configHash !== compiled.configHash ||
+					canonicalPersistedJson(cfg) !== canonicalPersistedJson(compiled.config)
+				) {
+					throw new Error(`MCP "${m.name}": persisted config no longer matches its compiled manifest`);
+				}
 				assertMcpInstallPolicy(cfg, { pluginRoot: entry.pluginRoot });
 				if (cfg.transport === "stdio") {
+					const invocation = classifyStdioInvocation(cfg, { pluginRoot: entry.pluginRoot });
+					const ownedFile = entry.copiedFiles.find(
+						file => path.normalize(file.relativePath) === path.normalize(invocation.ownedRelativePath),
+					);
+					if (!ownedFile) {
+						throw new Error(
+							`MCP "${m.name}": selected entrypoint is not in the authenticated copied-file set: ${invocation.ownedRelativePath}`,
+						);
+					}
+					const ownedExecutablePath = await resolveRuntimeFile(entry.pluginRoot, ownedFile.relativePath);
+					let command: string;
+					let args: string[] | undefined;
+					if (invocation.kind === "launcher") {
+						command = invocation.launcher;
+						args = [
+							...(invocation.launcher === "bun"
+								? [`--config=${os.devNull}`, "--no-env-file", "--no-install"]
+								: []),
+							ownedExecutablePath,
+							...(cfg.args ?? []).slice(1),
+						];
+					} else {
+						command = ownedExecutablePath;
+						args = cfg.args;
+					}
 					configs[m.name] = {
 						type: "stdio",
-						command: cfg.command,
-						args: cfg.args,
-						cwd: cfg.cwd ? nodePath.resolve(entry.pluginRoot, cfg.cwd) : entry.pluginRoot,
+						command,
+						args,
+						cwd: invocation.cwd,
 						timeout: 5_000,
 						// Third-party plugin MCP processes must not inherit host secrets;
 						// only a minimal OS allowlist (PATH/HOME/temp/locale) is provided.
+						// Bun additionally receives an immutable empty config plus flags
+						// that disable ambient dotenv and package auto-install behavior.
 						noInheritEnv: true,
 					};
 				} else {

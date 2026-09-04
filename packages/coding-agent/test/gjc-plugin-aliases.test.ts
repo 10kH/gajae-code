@@ -438,13 +438,20 @@ describe("issue #4287 acceptance 2: ambiguous/unsafe aliases fail with actionabl
 	});
 });
 
-async function compileAliasWithMcpServers(manifest: Record<string, unknown>): Promise<{
+async function compileAliasWithMcpServers(
+	manifest: Record<string, unknown>,
+	files: Record<string, string> = {},
+): Promise<{
 	entries: GjcPluginMcpManifestEntry[];
 	registryEntry: GjcPluginRegistryEntry;
 	bundle: NormalizedGjcPluginBundle;
 }> {
 	const root = await mkTemp("gjc-alias-sec-");
 	await writeManifestBundle(root, manifest);
+	for (const [relativePath, content] of Object.entries(files)) {
+		await fs.mkdir(path.dirname(path.join(root, relativePath)), { recursive: true });
+		await fs.writeFile(path.join(root, relativePath), content);
+	}
 	const bundle = await compileGjcPluginBundle(root);
 	const registryEntry: GjcPluginRegistryEntry = {
 		name: bundle.name,
@@ -479,25 +486,26 @@ describe("issue #4287 acceptance 5: aliases never bypass security or collision a
 	});
 
 	test("alias stdio entries keep launcher and flag confinement", async () => {
-		const { entries } = await compileAliasWithMcpServers({
-			kind: "gajae-code-plugin",
-			name: "alias-sec",
-			version: "1.0.0",
-			mcpServers: { shell: { command: "sh", args: ["-c", "evil"] } },
-		});
-		expect(entries[0]?.transport).toBe("stdio");
-		expect(() => assertMcpInstallPolicy(entries[0] as GjcPluginMcpManifestEntry, { pluginRoot: "/tmp" })).toThrow(
-			GjcPluginLoadError,
-		);
+		await expect(
+			compileAliasWithMcpServers({
+				kind: "gajae-code-plugin",
+				name: "alias-sec",
+				version: "1.0.0",
+				mcpServers: { shell: { command: "sh", args: ["-c", "evil"] } },
+			}),
+		).rejects.toBeInstanceOf(GjcPluginLoadError);
 	});
 
 	test("alias MCP names collide with canonical names in the registry authority", async () => {
-		const { registryEntry: aliasedEntry, bundle: aliasedBundle } = await compileAliasWithMcpServers({
-			kind: "gajae-code-plugin",
-			name: "alias-sec",
-			version: "1.0.0",
-			mcpServers: { shared: { command: "bun", args: ["s.ts"] } },
-		});
+		const { registryEntry: aliasedEntry, bundle: aliasedBundle } = await compileAliasWithMcpServers(
+			{
+				kind: "gajae-code-plugin",
+				name: "alias-sec",
+				version: "1.0.0",
+				mcpServers: { shared: { command: "bun", args: ["s.ts"] } },
+			},
+			{ "s.ts": "export {};\n" },
+		);
 		const canonicalRoot = await mkTemp("gjc-alias-canonical-sec-");
 		await writeManifestBundle(canonicalRoot, {
 			kind: "gajae-code-plugin",
@@ -505,6 +513,7 @@ describe("issue #4287 acceptance 5: aliases never bypass security or collision a
 			version: "1.0.0",
 			mcps: [{ name: "shared", transport: "stdio", command: "bun", args: ["s.ts"] }],
 		});
+		await fs.writeFile(path.join(canonicalRoot, "s.ts"), "export {};\n");
 		const canonical = await compileGjcPluginBundle(canonicalRoot);
 		const canonicalEntry: GjcPluginRegistryEntry = {
 			name: canonical.name,
