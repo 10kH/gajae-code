@@ -136,7 +136,8 @@ describe("AgentSession pre-admission artifact spill", () => {
 
 		await session.dispose();
 		session = undefined;
-		await sessionManager.dropSession(sessionManager.getSessionFile()!);
+		await resumed.dropSession(sessionManager.getSessionFile()!);
+		await resumed.close();
 		expect(
 			await fs.stat(path.dirname(artifactPath)).then(
 				() => true,
