@@ -5617,24 +5617,22 @@ export class AgentSession {
 
 	async #runToolSessionTransitionCleanups(): Promise<void> {
 		const cleanups = Array.from(this.#toolSessionTransitionCleanups);
+		this.#toolSessionTransitionCleanups.clear();
 		const results = await Promise.allSettled(cleanups.map(async cleanup => await cleanup()));
 		const failures: unknown[] = [];
-		for (let index = 0; index < results.length; index++) {
-			const result = results[index]!;
-			if (result.status === "fulfilled") this.#toolSessionTransitionCleanups.delete(cleanups[index]!);
-			else failures.push(result.reason);
+		for (const result of results) {
+			if (result.status === "rejected") failures.push(result.reason);
 		}
 		if (failures.length > 0) throw new AggregateError(failures, "Tool session transition cleanup failed.");
 	}
 
 	async #runToolSessionCleanups(): Promise<void> {
 		const cleanups = Array.from(this.#toolSessionCleanups);
+		this.#toolSessionCleanups.clear();
 		const results = await Promise.allSettled(cleanups.map(async cleanup => await cleanup()));
 		const failures: unknown[] = [];
-		for (let index = 0; index < results.length; index++) {
-			const result = results[index]!;
-			if (result.status === "fulfilled") this.#toolSessionCleanups.delete(cleanups[index]!);
-			else failures.push(result.reason);
+		for (const result of results) {
+			if (result.status === "rejected") failures.push(result.reason);
 		}
 		if (failures.length > 0) throw new AggregateError(failures, "Tool session cleanup failed.");
 	}
