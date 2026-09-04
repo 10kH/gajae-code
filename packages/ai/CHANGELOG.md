@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- OpenAI Codex HTTP failures with an empty response body and empty status text now include the HTTP status in the surfaced message instead of the opaque `Request failed`, while structured provider errors retain their existing messages and classification.
 - Bedrock prompt caching is now gated on the Claude generation parsed from the model id instead of version-literal fragments (`-4-`/`-4.`, `claude-haiku`, and two 3.x literals). A future generation's Bedrock id (`us.anthropic.claude-opus-5-…`, or a new model kind) matched none of the literals, so cache points were silently omitted and every request re-paid full input pricing. Behavior for the documented support set — 3.5 Haiku, 3.7 Sonnet, and 4.x naming including `us.`/`eu.`/`au.`/`jp.`/`global.` inference profiles — is unchanged, per AWS's prompt-caching support matrix. A bundled-catalog tripwire now fails when a regenerated catalog introduces a Claude id shape the parser cannot read, so shape drift is loud instead of silently disabling caching.
 
 - Direct-xAI `reasoning_effort` support is now derived from a strictly parsed canonical grok generation (4.5+) instead of the exact ids `grok-4.5`/`grok-4.6` in the compat layer and the coding-agent thinking-choice gate; a future grok release failed the id list, so `supportsReasoningEffort` stayed `false` and the user's thinking level was silently dropped from requests with no error. The generated-policy `reasoning` pin stays scoped to the two rows whose upstream metadata shipped stale — a per-row data correction, not a family rule — so catalog `reasoning: false` flags (including the bundled grok `-non-reasoning` variants) remain authoritative for everything else. Direct capability requires the official xAI origin; private and proxy OpenAI-compatible origins fail closed unless explicitly configured, while reseller routes such as OpenRouter keep their existing audited transport behavior.
@@ -31,7 +32,6 @@
 
 ### Fixed
 
-- OpenAI Codex HTTP failures with an empty response body and empty status text now include the HTTP status in the surfaced message instead of the opaque `Request failed`, while structured provider errors retain their existing messages and classification.
 - Antigravity discovery now keeps mid-rollout models that the backend marks `isInternal` when the same response surfaces them through `agentModelSorts`. Internal models absent from the IDE's surfaced model groups remain hidden, and denylisted or retired selectors still take precedence.
 - Tokenless loopback auth-broker requests carrying a browser `Origin` header are now rejected before credential reads or mutations. Native loopback clients without `Origin`, authenticated browser-origin clients, and the public health endpoint retain their existing behavior.
 - `glm-zcode` login instructions now warn users who have the ZCode desktop app installed to cancel the browser's `zcode://` open prompt. The app exchanges the single-use authorization code itself, so a code pasted afterwards is rejected by the broker (`500 {"code":2007}`) and the documented paste flow failed without explanation.
