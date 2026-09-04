@@ -6,6 +6,7 @@ import type { SourceMeta } from "../capability/types";
 import type { SkillsSettings } from "../config/settings";
 import { resolveSkillScopeTrust } from "../config/skill-settings-defaults";
 import { type Skill as CapabilitySkill, getCapability } from "../discovery";
+import { loadMarketplaceSkills } from "../discovery/claude-plugins";
 import { compareSkillOrder, scanSkillsFromDir } from "../discovery/helpers";
 import type { SkillPromptDetails } from "../session/messages";
 import { CANONICAL_GJC_WORKFLOW_SKILLS } from "../skill-state/canonical-skills";
@@ -116,11 +117,12 @@ export interface LoadSkillsOptions extends SkillsSettings {
 }
 
 /**
- * Skill providers loaded into sessions. Only native `.gjc` skills are live
- * filesystem skills; Claude/Codex convention skills are explicit import
+ * Skill providers loaded into sessions. Native `.gjc` skills and installed
+ * marketplace plugin skills are both live filesystem skills, so both are
+ * enumerated into sessions; Claude/Codex convention skills are explicit import
  * sources into `.gjc` (see skill-management.ts) and are never loaded directly.
  */
-const LOADABLE_SKILL_PROVIDERS = new Set(["native"]);
+const LOADABLE_SKILL_PROVIDERS = new Set(["native", "claude-plugins"]);
 
 const BUILT_IN_SKILL_NAMES = new Set<string>(CANONICAL_GJC_WORKFLOW_SKILLS.map(name => name.toLowerCase()));
 
@@ -149,7 +151,8 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 
 	// Skill scope trust decides which canonical locations are loaded: project
 	// scope covers `.gjc/skills` (walk-up), user scope covers `~/.gjc/agent/skills`
-	// and the legacy user roots. Claude/Codex convention skills are import
+	// and the legacy user roots, and installed marketplace plugins are gated by the
+	// scope they were installed into. Claude/Codex convention skills are import
 	// sources into `.gjc`, never loaded directly.
 	function isSourceEnabled(source: SourceMeta): boolean {
 		const { provider, level } = source;
@@ -162,16 +165,33 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 	// Use capability API to load all skills. `all` (rather than `items`) keeps
 	// shadowed duplicates so this function can apply the documented precedence
 	// itself: project scope beats user scope.
-	const nativeProvider = getCapability<CapabilitySkill>(skillCapability.id)?.providers.find(
-		provider => provider.id === "native",
-	);
-	if (!nativeProvider) throw new Error("Native skill provider is unavailable");
-	const result = await nativeProvider.load({
+	const providers =
+		getCapability<CapabilitySkill>(skillCapability.id)?.providers.filter(provider =>
+			LOADABLE_SKILL_PROVIDERS.has(provider.id),
+		) ?? [];
+	if (!providers.some(provider => provider.id === "native")) {
+		throw new Error("Native skill provider is unavailable");
+	}
+	const loadContext = {
 		cwd,
 		home,
 		userAgentDir: options.agentDir,
 		repoRoot: await findRepoRoot(cwd),
-	});
+	};
+	const providerResults = await Promise.all(
+		providers.map(async provider => {
+			const allowedLevels = new Set<"user" | "project">();
+			if (projectTrusted) allowedLevels.add("project");
+			if (userTrusted) allowedLevels.add("user");
+			return {
+				provider,
+				result:
+					provider.id === "claude-plugins"
+						? await loadMarketplaceSkills(loadContext, allowedLevels)
+						: await provider.load(loadContext),
+			};
+		}),
+	);
 
 	const skillMap = new Map<string, Skill>();
 	const realPathSet = new Set<string>();
@@ -197,8 +217,11 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 	// precedence. `all` is already in native provider order with project dirs
 	// before user dirs; a stable sort by level lifts every project item above
 	// every user item, giving: project `.gjc/skills` > user roots.
-	const filteredSkills = result.items
-		.filter(capSkill => {
+	const filteredSkills = providerResults
+		.flatMap(({ provider, result }) =>
+			result.items.map(capSkill => ({ capSkill, providerPriority: provider.priority })),
+		)
+		.filter(({ capSkill }) => {
 			if (!isSourceEnabled(capSkill._source)) return false;
 			if (disabledSkillNames.has(capSkill.name)) return false;
 			if (matchesIgnorePatterns(capSkill.name)) return false;
@@ -207,12 +230,12 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 		})
 		.sort((a, b) => {
 			const levelOrder = { project: 0, user: 1 } as const;
-			return levelOrder[a.level] - levelOrder[b.level];
+			return levelOrder[a.capSkill.level] - levelOrder[b.capSkill.level] || b.providerPriority - a.providerPriority;
 		});
 
 	// Batch resolve all real paths in parallel
 	const realPaths = await Promise.all(
-		filteredSkills.map(async capSkill => {
+		filteredSkills.map(async ({ capSkill }) => {
 			try {
 				return await fs.realpath(capSkill.path);
 			} catch {
@@ -223,7 +246,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 
 	// Process skills with resolved paths
 	for (let i = 0; i < filteredSkills.length; i++) {
-		const capSkill = filteredSkills[i];
+		const { capSkill } = filteredSkills[i];
 		const resolvedPath = realPaths[i];
 
 		// Skip silently if we've already loaded this exact file (via symlink)
@@ -338,7 +361,12 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 
 	return {
 		skills,
-		warnings: [...(result.warnings ?? []).map(w => ({ skillPath: "", message: w })), ...collisionWarnings],
+		warnings: [
+			...providerResults.flatMap(({ result }) =>
+				(result.warnings ?? []).map(message => ({ skillPath: "", message })),
+			),
+			...collisionWarnings,
+		],
 	};
 }
 

@@ -66,6 +66,26 @@ function normalizeSkillName(name: string | undefined): string {
 }
 
 const SKILL_NAME_GLOB_PATTERN = /[*?[\]{}]/;
+const MAX_AVAILABLE_SKILL_NAMES = 50;
+const MAX_AVAILABLE_SKILL_CHARS = 2048;
+
+function formatAvailableSkills(skills: readonly { name: string }[]): string {
+	const names = [...new Set(skills.map(skill => skill.name))].sort();
+	const visible: string[] = [];
+	let visibleChars = 0;
+	for (let index = 0; index < names.length && visible.length < MAX_AVAILABLE_SKILL_NAMES; index++) {
+		const name = names[index];
+		const separatorChars = visible.length > 0 ? 2 : 0;
+		const omittedAfterAdding = names.length - (visible.length + 1);
+		const markerChars = omittedAfterAdding > 0 ? `, … (+${omittedAfterAdding} more)`.length : 0;
+		if (visibleChars + separatorChars + name.length + markerChars > MAX_AVAILABLE_SKILL_CHARS) break;
+		visible.push(name);
+		visibleChars += separatorChars + name.length;
+	}
+	const omitted = names.length - visible.length;
+	const marker = omitted > 0 ? `… (+${omitted} more)` : "";
+	return visible.length > 0 && marker ? `${visible.join(", ")}, ${marker}` : visible.join(", ") || marker;
+}
 
 type SkillToolInput = z.infer<typeof skillSchema>;
 
@@ -154,10 +174,10 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 					this.#session.home,
 				));
 			if (!skill) {
-				const available = skills.map(s => s.name).sort();
+				const available = formatAvailableSkills(skills);
 				const hint =
 					available.length > 0
-						? ` Available: ${available.join(", ")}. Use skill_discovery to find project/user runtime skills.`
+						? ` Available: ${available}. Use skill_discovery to find project/user runtime skills.`
 						: " Use skill_discovery to find project/user runtime skills.";
 				throw new ToolError(`skill tool: unknown skill "${requestedName}".${hint}`);
 			}

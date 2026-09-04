@@ -883,6 +883,10 @@ export interface AgentSessionConfig {
 	skills?: Skill[];
 	/** Skill loading warnings (already captured by SDK) */
 	skillWarnings?: SkillWarning[];
+	/** Re-enumerate filesystem and marketplace skills after plugin lifecycle changes. */
+	reloadSkills?: (cwd: string) => Promise<{ skills: Skill[]; warnings: SkillWarning[] }>;
+	/** Publish a successfully committed skill catalog to SDK/process snapshots. */
+	onSkillsReloaded?: (skills: Skill[], warnings: SkillWarning[]) => void;
 	/** Custom commands (TypeScript slash commands) */
 	customCommands?: LoadedCustomCommand[];
 	skillsSettings?: SkillsSettings;
@@ -3125,6 +3129,8 @@ export class AgentSession {
 
 	#skills: Skill[];
 	#skillWarnings: SkillWarning[];
+	#reloadSkills: AgentSessionConfig["reloadSkills"];
+	#onSkillsReloaded: AgentSessionConfig["onSkillsReloaded"];
 
 	// Custom commands (TypeScript slash commands)
 	#customCommands: LoadedCustomCommand[] = [];
@@ -4557,6 +4563,8 @@ export class AgentSession {
 		this.agent.setMainAttemptScopeObserver(scope => this.#bindAttemptScope(scope));
 		this.#skills = config.skills ?? [];
 		this.#skillWarnings = config.skillWarnings ?? [];
+		this.#reloadSkills = config.reloadSkills;
+		this.#onSkillsReloaded = config.onSkillsReloaded;
 		this.#customCommands = config.customCommands ?? [];
 		this.#skillsSettings = config.skillsSettings;
 		this.#modelRegistry = config.modelRegistry;
@@ -14239,6 +14247,25 @@ export class AgentSession {
 	async replaceSkills(skills: Skill[]): Promise<void> {
 		this.#skills = skills;
 		await this.refreshBaseSystemPrompt();
+	}
+
+	/** Refresh the live registered-skill catalog after install/remove/reload. */
+	async reloadSkills(cwd = this.sessionManager.getCwd()): Promise<void> {
+		if (!this.#reloadSkills) return;
+		const reloaded = await this.#reloadSkills(cwd);
+		const previousSkills = this.#skills;
+		const previousWarnings = this.#skillWarnings;
+		this.#skills = reloaded.skills;
+		this.#skillWarnings = reloaded.warnings;
+		try {
+			await this.refreshBaseSystemPrompt();
+		} catch (error) {
+			this.#skills = previousSkills;
+			this.#skillWarnings = previousWarnings;
+			await this.refreshBaseSystemPrompt().catch(() => {});
+			throw error;
+		}
+		this.#onSkillsReloaded?.(reloaded.skills, reloaded.warnings);
 	}
 
 	/**

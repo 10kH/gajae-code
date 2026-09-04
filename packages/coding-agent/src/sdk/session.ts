@@ -2338,15 +2338,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 			if (options.skills === undefined && settings.get("skills.enabled")) {
 				try {
-					const reloaded = await loadSkills({
-						...settings.getGroup("skills"),
-						agentDir,
-						cwd: to,
-						disabledExtensions: settings.get("disabledExtensions"),
-					});
-					skills = withEmbeddedDefaultGjcSkills(reloaded.skills);
-					if (!options.parentTaskPrefix) setActiveSkills(skills);
-					await session?.replaceSkills(skills);
+					await session?.reloadSkills(to);
 				} catch (error) {
 					logger.warn("Failed to reload skills after session rescope", { error: safeErrorForLog(error) });
 				}
@@ -4461,6 +4453,27 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			customCommands: customCommandsResult.commands,
 			skills,
 			skillWarnings,
+			reloadSkills:
+				options.skills === undefined
+					? async reloadCwd => {
+							if (!settings.get("skills.enabled")) {
+								return { skills: getEmbeddedDefaultGjcSkills(), warnings: [] };
+							} else {
+								const reloaded = await loadSkills({
+									...settings.getGroup("skills"),
+									agentDir,
+									cwd: reloadCwd,
+									disabledExtensions: settings.get("disabledExtensions"),
+								});
+								return { skills: withEmbeddedDefaultGjcSkills(reloaded.skills), warnings: reloaded.warnings };
+							}
+						}
+					: undefined,
+			onSkillsReloaded: (reloadedSkills, reloadedWarnings) => {
+				skills = reloadedSkills;
+				skillWarnings = reloadedWarnings;
+				if (!options.parentTaskPrefix) setActiveSkills(reloadedSkills);
+			},
 			skillsSettings: settings.getGroup("skills"),
 			modelRegistry,
 			taskDepth,

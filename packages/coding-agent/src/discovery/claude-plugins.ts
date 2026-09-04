@@ -17,6 +17,7 @@ import { rootContainsGjcManifest } from "../extensibility/gjc-plugins";
 import {
 	type ClaudePluginRoot,
 	createSourceMeta,
+	invalidateClaudePluginRoots,
 	listClaudePluginRoots,
 	loadFilesFromDir,
 	scanSkillsFromDir,
@@ -95,12 +96,15 @@ async function resolvePluginDir(
 async function listNonGjcPluginRoots(
 	home: string,
 	cwd: string,
+	allowedLevels: ReadonlySet<"user" | "project"> = new Set(["user", "project"]),
 ): Promise<{ roots: ClaudePluginRoot[]; warnings: string[] }> {
+	await invalidateClaudePluginRoots(home, cwd);
 	const { roots, warnings } = await listClaudePluginRoots(home, cwd);
 	const filteredRoots: ClaudePluginRoot[] = [];
-	const filteredWarnings = [...warnings];
+	const filteredWarnings = allowedLevels.size === 2 ? [...warnings] : [];
 
 	for (const root of roots) {
+		if (!allowedLevels.has(root.scope)) continue;
 		if (await rootContainsGjcManifest(root.path)) {
 			filteredWarnings.push(`[claude-plugins] Skipping gajae-code plugin root (binding-only): ${root.path}`);
 			continue;
@@ -115,11 +119,14 @@ async function listNonGjcPluginRoots(
 // Skills
 // =============================================================================
 
-async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
+export async function loadMarketplaceSkills(
+	ctx: LoadContext,
+	allowedLevels: ReadonlySet<"user" | "project"> = new Set(["user", "project"]),
+): Promise<LoadResult<Skill>> {
 	const items: Skill[] = [];
 	const warnings: string[] = [];
 
-	const { roots, warnings: rootWarnings } = await listNonGjcPluginRoots(ctx.home, ctx.cwd);
+	const { roots, warnings: rootWarnings } = await listNonGjcPluginRoots(ctx.home, ctx.cwd, allowedLevels);
 	warnings.push(...rootWarnings);
 
 	const results = await Promise.all(
@@ -129,6 +136,7 @@ async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
 				dir: skillsDir,
 				providerId: PROVIDER_ID,
 				level: root.scope,
+				requireDescription: true,
 			});
 			return { root, result, warning };
 		}),
@@ -371,7 +379,7 @@ registerProvider<Skill>(skillCapability.id, {
 	displayName: DISPLAY_NAME,
 	description: "Load skills from GJC marketplace plugins",
 	priority: PRIORITY,
-	load: loadSkills,
+	load: loadMarketplaceSkills,
 });
 
 registerProvider<SlashCommand>(slashCommandCapability.id, {

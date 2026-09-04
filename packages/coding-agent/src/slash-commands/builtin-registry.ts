@@ -127,6 +127,7 @@ function toSlashCommandRuntime(runtime: TuiSlashCommandRuntime): SlashCommandRun
 		reloadPlugins: async () => {
 			const projectPath = await resolveActiveProjectRegistryPath(ctx.sessionManager.getCwd());
 			clearPluginRootsAndCaches(projectPath ? [projectPath] : undefined);
+			await ctx.session.reloadSkills();
 			await ctx.refreshSlashCommandState();
 			await ctx.session.refreshSshTool({ activateIfAvailable: true });
 		},

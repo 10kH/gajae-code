@@ -2998,6 +2998,8 @@ export class SelectorController {
 						this.ctx.ui.requestRender();
 						try {
 							await mgr.uninstallPlugin(pluginId, scope);
+							await this.ctx.session.reloadSkills();
+							await this.ctx.refreshSlashCommandState();
 							this.ctx.showStatus(`Uninstalled ${pluginId}`);
 						} catch (err) {
 							this.ctx.showStatus(`Uninstall failed: ${err}`);
@@ -3035,6 +3037,8 @@ export class SelectorController {
 					try {
 						const force = installedIds.has(`${name}@${marketplace}`);
 						await mgr.installPlugin(name, marketplace, { force });
+						await this.ctx.session.reloadSkills();
+						await this.ctx.refreshSlashCommandState();
 						this.ctx.showStatus(`Installed ${name} from ${marketplace}`);
 					} catch (err) {
 						this.ctx.showStatus(`Install failed: ${err}`);
