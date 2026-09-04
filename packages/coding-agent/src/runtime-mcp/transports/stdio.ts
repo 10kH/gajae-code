@@ -13,6 +13,7 @@ import type {
 	JsonRpcRequest,
 	JsonRpcResponse,
 	MCPRequestOptions,
+	MCPStdioPreparedLaunch,
 	MCPStdioServerConfig,
 	MCPTransport,
 } from "../../runtime-mcp/types";
@@ -69,6 +70,7 @@ export class StdioTransport implements MCPTransport {
 	#readLoop: Promise<void> | null = null;
 	#stderrLoop: Promise<void> | null = null;
 	#closePromise: Promise<void> | null = null;
+	#afterProcessExit: (() => Promise<void>) | null = null;
 
 	onClose?: () => void;
 	onError?: (error: Error) => void;
@@ -94,27 +96,32 @@ export class StdioTransport implements MCPTransport {
 			throw new MCPExpectedFailure(new Error("MCP stdio child teardown is incomplete"));
 		}
 
-		const command = this.config.command;
-		const args = Object.freeze([...(this.config.args ?? [])]);
+		let launch: MCPStdioPreparedLaunch = {
+			command: this.config.command,
+			args: Object.freeze([...(this.config.args ?? [])]),
+			cwd: this.config.cwd ?? process.cwd(),
+		};
 		const env = this.config.noInheritEnv
 			? buildMinimalStdioEnv(this.config.env)
 			: {
 					...Bun.env,
 					...this.config.env,
 				};
-		const cwd = this.config.cwd ?? process.cwd();
-
 		try {
-			await this.config.spawnGuard?.({ command, args, cwd });
+			if (this.config.prepareSpawn) launch = await this.config.prepareSpawn(launch);
+			await this.config.spawnGuard?.(launch);
 			await this.config.afterSpawnGuardForTest?.();
-			this.#process = spawnOwnedProcess([command, ...args], {
-				cwd,
+			this.#afterProcessExit = launch.afterProcessExit ?? this.config.afterProcessExit ?? null;
+			this.#process = spawnOwnedProcess([launch.command, ...launch.args], {
+				cwd: launch.cwd,
 				env,
 				stdin: "pipe",
 				gracefulMs: CLOSE_WAIT_MS,
-				name: `mcp-stdio:${command}`,
+				name: `mcp-stdio:${launch.command}`,
 			});
 		} catch (error) {
+			await (launch.afterProcessExit ?? this.#afterProcessExit)?.().catch(() => {});
+			this.#afterProcessExit = null;
 			throw new MCPExpectedFailure(error);
 		}
 
@@ -400,8 +407,12 @@ export class StdioTransport implements MCPTransport {
 			if (teardown.status !== "terminated") {
 				throw new MCPExpectedFailure(new Error(`stdio child teardown ${teardown.status}`));
 			}
-			await this.config.afterProcessExit?.();
-			this.#process = null;
+			try {
+				await this.#afterProcessExit?.();
+			} finally {
+				this.#afterProcessExit = null;
+				this.#process = null;
+			}
 		}
 
 		if (!fromReadLoop && this.#readLoop) {
