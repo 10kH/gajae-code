@@ -1576,9 +1576,27 @@ function cloneAcceptedModelPresetRegistry(value: AcceptedModelPresetRegistry): A
 
 function registryFileFingerprint(file: string): string {
 	try {
-		return sha256(fsSync.readFileSync(file));
-	} catch {
-		return "absent";
+		const stat = fsSync.lstatSync(file);
+		if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MODEL_PRESET_REGISTRY_MAX_STATE_BYTES)
+			return "rejected";
+		const fd = fsSync.openSync(file, "r");
+		try {
+			const hash = crypto.createHash("sha256");
+			const buffer = Buffer.allocUnsafe(64 * 1024);
+			let total = 0;
+			for (;;) {
+				const length = Math.min(buffer.length, MODEL_PRESET_REGISTRY_MAX_STATE_BYTES + 1 - total);
+				const bytesRead = fsSync.readSync(fd, buffer, 0, length, null);
+				if (bytesRead === 0) return hash.digest("hex");
+				total += bytesRead;
+				if (total > MODEL_PRESET_REGISTRY_MAX_STATE_BYTES) return "rejected";
+				hash.update(buffer.subarray(0, bytesRead));
+			}
+		} finally {
+			fsSync.closeSync(fd);
+		}
+	} catch (error) {
+		return isEnoent(error) ? "absent" : "rejected";
 	}
 }
 
@@ -1595,9 +1613,17 @@ function acceptedRegistryFingerprint(
 
 async function registryFileFingerprintAsync(file: string): Promise<string> {
 	try {
-		return sha256(new Uint8Array(await Bun.file(file).arrayBuffer()));
-	} catch {
-		return "absent";
+		const stat = await fs.lstat(file, { bigint: true });
+		if (!stat.isFile() || stat.isSymbolicLink() || stat.size > BigInt(MODEL_PRESET_REGISTRY_MAX_STATE_BYTES))
+			return "rejected";
+		const bytes = new Uint8Array(
+			await Bun.file(file)
+				.slice(0, MODEL_PRESET_REGISTRY_MAX_STATE_BYTES + 1)
+				.arrayBuffer(),
+		);
+		return bytes.byteLength > MODEL_PRESET_REGISTRY_MAX_STATE_BYTES ? "rejected" : sha256(bytes);
+	} catch (error) {
+		return isEnoent(error) ? "absent" : "rejected";
 	}
 }
 
@@ -1624,6 +1650,8 @@ export function loadAcceptedModelPresetRegistry(
 	if (!acceptedRegistryReadIsCacheable(dependencies) || environmentDisabled())
 		return loadAcceptedModelPresetRegistryUncached(agentDir, dependencies);
 	const fingerprint = acceptedRegistryFingerprint(agentDir, dependencies);
+	if (fingerprint.split("|").includes("rejected"))
+		return loadAcceptedModelPresetRegistryUncached(agentDir, dependencies);
 	const cached = acceptedRegistryReadCache.get(agentDir);
 	if (cached && cached.fingerprint === fingerprint) return cloneAcceptedModelPresetRegistry(cached.value);
 	const value = loadAcceptedModelPresetRegistryUncached(agentDir, dependencies);
@@ -1700,6 +1728,8 @@ export async function loadAcceptedModelPresetRegistryAsync(
 	if (!acceptedRegistryReadIsCacheable(dependencies) || environmentDisabled())
 		return loadAcceptedModelPresetRegistryAsyncUncached(agentDir, dependencies);
 	const fingerprint = await acceptedRegistryFingerprintAsync(agentDir, dependencies);
+	if (fingerprint.split("|").includes("rejected"))
+		return loadAcceptedModelPresetRegistryAsyncUncached(agentDir, dependencies);
 	const cached = acceptedRegistryReadCache.get(agentDir);
 	if (cached && cached.fingerprint === fingerprint) return cloneAcceptedModelPresetRegistry(cached.value);
 	const value = await loadAcceptedModelPresetRegistryAsyncUncached(agentDir, dependencies);
