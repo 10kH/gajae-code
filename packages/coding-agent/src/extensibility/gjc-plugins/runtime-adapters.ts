@@ -116,21 +116,11 @@ const initialProcessEnvironment =
 		: Promise.resolve(new Map<string, string>());
 const initialNodeAuthorities = initialProcessEnvironment.then(async environment => {
 	const authorities = new Map<string, string>();
-	const roots = [
-		environment.get("NVM_DIR"),
-		environment.get("RUNNER_TOOL_CACHE"),
-		environment.get("AGENT_TOOLSDIRECTORY"),
-	]
-		.filter((root): root is string => typeof root === "string" && path.isAbsolute(root))
-		.map(root => path.resolve(root));
 	for (const pathEntry of (environment.get("PATH") ?? "").split(path.delimiter).filter(path.isAbsolute)) {
 		const lexical = path.join(pathEntry, process.platform === "win32" ? "node.exe" : "node");
 		try {
 			const real = await fs.realpath(lexical);
-			const root = roots.find(candidate => isWithin(candidate, lexical) || isWithin(candidate, real));
-			if (!root) continue;
-			const rootReal = await fs.realpath(root);
-			if (!isWithin(rootReal, real)) continue;
+			if ([os.tmpdir(), "/tmp", "/var/tmp"].some(root => isWithin(path.resolve(root), real))) continue;
 			const bytes = await readStableFile(real, "Initial Node executable", MCP_LAUNCHER_MAX_BYTES, true);
 			authorities.set(real, sha256(bytes));
 		} catch {
@@ -449,9 +439,7 @@ async function resolveTrustedStdioLauncher(
 				const realCandidate = await fs.realpath(lexicalCandidate);
 				if (
 					!untrustedRoots.some(root => isWithin(root, realCandidate)) &&
-					((await isRootControlledLauncherPath(lexicalCandidate)) ||
-						(await isInitialManagedNodeLauncherPath(lexicalCandidate, untrustedRoots)) ||
-						(await isUserManagedNodeLauncherPath(lexicalCandidate)))
+					(await isInitialManagedNodeLauncherPath(lexicalCandidate, untrustedRoots))
 				) {
 					return realCandidate;
 				}
@@ -460,10 +448,7 @@ async function resolveTrustedStdioLauncher(
 			if (untrustedRoots.some(root => isWithin(root, lexical))) continue;
 			const real = await fs.realpath(lexical);
 			if (untrustedRoots.some(root => isWithin(root, real))) continue;
-			if (await isRootControlledLauncherPath(lexical)) return real;
 			if (await isInitialManagedNodeLauncherPath(lexical, untrustedRoots)) return real;
-			if (await isUserManagedNodeLauncherPath(lexical)) return real;
-			if (await isHostOwnedNodeExecutable(real)) return real;
 		} catch {
 			// A stale PATH entry is not launcher authority; try the next one.
 		}
@@ -478,86 +463,11 @@ async function isInitialManagedNodeLauncherPath(
 	if (process.platform !== "linux") return false;
 	const real = await fs.realpath(executablePath);
 	if (untrustedRoots.some(root => isWithin(root, real))) return false;
-	for (const tempRoot of [os.tmpdir(), "/tmp", "/var/tmp"]) {
-		if (isWithin(path.resolve(tempRoot), real)) return false;
-	}
+	if ([os.tmpdir(), "/tmp", "/var/tmp"].some(root => isWithin(path.resolve(root), real))) return false;
 	const expected = (await initialNodeAuthorities).get(real);
 	if (!expected) return false;
 	const bytes = await readStableFile(real, "Initial Node executable", MCP_LAUNCHER_MAX_BYTES, true);
 	return sha256(bytes) === expected;
-}
-
-async function isUserManagedNodeLauncherPath(executablePath: string): Promise<boolean> {
-	if (process.platform === "win32") return false;
-	const uid = process.getuid?.();
-	if (uid === undefined) return false;
-	const home = path.resolve(os.userInfo().homedir);
-	const initialEnv = await initialProcessEnvironment;
-	const roots = [
-		path.join(home, ".nvm"),
-		path.join(home, ".volta"),
-		path.join(home, ".asdf"),
-		path.join(home, ".local", "share", "mise"),
-		...(initialEnv.get("NVM_DIR") ? [path.resolve(initialEnv.get("NVM_DIR") as string)] : []),
-		...(initialEnv.get("RUNNER_TOOL_CACHE") ? [path.resolve(initialEnv.get("RUNNER_TOOL_CACHE") as string)] : []),
-	];
-	const ownershipRoot = roots.find(root => isWithin(root, executablePath));
-	if (!ownershipRoot) return false;
-	const target = await fs.stat(executablePath);
-	if (!target.isFile() || (target.mode & 0o022) !== 0) return false;
-	let current = path.dirname(executablePath);
-	for (;;) {
-		const stat = await fs.stat(current);
-		const ownerAllowed = stat.uid === 0 || stat.uid === uid;
-		const writableMask = stat.uid === 0 ? 0o022 : 0o002;
-		if (!stat.isDirectory() || !ownerAllowed || (stat.mode & writableMask) !== 0) return false;
-		if (current === ownershipRoot) return true;
-		const parent = path.dirname(current);
-		if (parent === current) return false;
-		current = parent;
-	}
-}
-
-async function isRootControlledLauncherPath(executablePath: string): Promise<boolean> {
-	if (process.platform === "win32") return false;
-	const target = await fs.stat(executablePath);
-	if (!target.isFile() || (target.mode & 0o022) !== 0) return false;
-	let current = path.dirname(executablePath);
-	for (;;) {
-		const stat = await fs.stat(current);
-		if (!stat.isDirectory() || stat.uid !== 0 || (stat.mode & 0o022) !== 0) return false;
-		const parent = path.dirname(current);
-		if (parent === current) return true;
-		current = parent;
-	}
-}
-
-async function isHostOwnedNodeExecutable(executablePath: string): Promise<boolean> {
-	const executable = await fs.stat(executablePath);
-	if (!executable.isFile()) return false;
-	if (process.platform === "win32") {
-		const root = path.parse(process.execPath).root;
-		const trustedRoots = [
-			path.join(root, "Program Files"),
-			path.join(root, "Program Files (x86)"),
-			path.join(root, "Windows"),
-		];
-		return trustedRoots.some(trustedRoot => isWithin(path.resolve(trustedRoot), path.resolve(executablePath)));
-	}
-	if ((executable.mode & 0o022) !== 0) return false;
-	const uid = process.getuid?.();
-	if (uid === undefined) return false;
-	if (executable.uid !== 0) return false;
-	const ownershipRoot = path.parse(executablePath).root;
-	let current = path.dirname(executablePath);
-	for (;;) {
-		const stat = await fs.stat(current);
-		if (!stat.isDirectory() || stat.uid !== 0 || (stat.mode & 0o022) !== 0) return false;
-		if (current === ownershipRoot) return true;
-		const parent = path.dirname(current);
-		if (parent === current) return false;
-		current = parent;
-	}
 }
 
 async function resolveTrustedSnapshotBase(
@@ -689,6 +599,13 @@ async function prepareVerifiedStdioLaunch(input: {
 			input.launcher === "bun"
 				? await readRunningBunExecutable()
 				: await readStableFile(input.launcherPath, "Plugin MCP interpreter", MCP_LAUNCHER_MAX_BYTES, true);
+		if (input.launcher === "node") {
+			const launcherReal = await fs.realpath(input.launcherPath);
+			const expectedLauncherHash = (await initialNodeAuthorities).get(launcherReal);
+			if (!expectedLauncherHash || sha256(launcherBytes) !== expectedLauncherHash) {
+				throw new Error("Plugin MCP Node interpreter drifted from startup authority");
+			}
+		}
 		await fs.writeFile(launcherPath, launcherBytes, { flag: "wx", mode: 0o500 });
 
 		for (const file of input.files) {
