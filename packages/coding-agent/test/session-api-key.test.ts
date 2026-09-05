@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import {
-	assertStableSessionApiKeyCredentialType,
+	isStableSessionApiKeyCredentialType,
 	lookupSessionApiKey,
 	resolveLiveSessionApiKeyModel,
 } from "../src/sdk/session-api-key";
@@ -215,15 +215,8 @@ describe("lookupSessionApiKey (#5081)", () => {
 	});
 
 	it("fails closed when an authentication retry changes credential type", () => {
-		expect(() => assertStableSessionApiKeyCredentialType("api_key", "oauth")).toThrow(
-			"Credential type changed during authentication retry",
-		);
-		try {
-			assertStableSessionApiKeyCredentialType("oauth", "api_key");
-			throw new Error("expected throw");
-		} catch (error) {
-			expect((error as { code?: string }).code).toBe("provider_unavailable");
-		}
-		expect(() => assertStableSessionApiKeyCredentialType("oauth", "oauth")).not.toThrow();
+		expect(isStableSessionApiKeyCredentialType("api_key", "oauth")).toBe(false);
+		expect(isStableSessionApiKeyCredentialType("oauth", "api_key")).toBe(false);
+		expect(isStableSessionApiKeyCredentialType("oauth", "oauth")).toBe(true);
 	});
 });

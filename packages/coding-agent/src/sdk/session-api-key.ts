@@ -21,14 +21,11 @@ export type SessionApiKeyResolution = {
 
 export type SessionApiKeyCredentialType = "api_key" | "oauth" | undefined;
 
-export function assertStableSessionApiKeyCredentialType(
+export function isStableSessionApiKeyCredentialType(
 	previous: SessionApiKeyCredentialType,
 	replacement: SessionApiKeyCredentialType,
-): void {
-	if (previous === replacement) return;
-	throw Object.assign(new Error("Credential type changed during authentication retry"), {
-		code: "provider_unavailable",
-	});
+): boolean {
+	return previous === replacement;
 }
 
 export function resolveLiveSessionApiKeyModel(

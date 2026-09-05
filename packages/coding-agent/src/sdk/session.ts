@@ -198,7 +198,7 @@ import { buildNamedToolChoice, buildNamedToolChoiceResult } from "../utils/tool-
 import type { WorkspaceTree } from "../workspace-tree";
 import { createSessionLifecycleService } from "./lifecycle/client";
 import {
-	assertStableSessionApiKeyCredentialType,
+	isStableSessionApiKeyCredentialType,
 	lookupSessionApiKey,
 	resolveLiveSessionApiKeyModel,
 } from "./session-api-key";
@@ -4346,10 +4346,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								error: error instanceof Error ? error.message : String(error),
 							});
 							const replacementApiKey = await resolveAgentApiKey(provider);
-							assertStableSessionApiKeyCredentialType(
-								streamOptions?.authCredentialType,
-								resolvedCredentialType(provider),
-							);
+							if (
+								!isStableSessionApiKeyCredentialType(
+									streamOptions?.authCredentialType,
+									resolvedCredentialType(provider),
+								)
+							) {
+								return undefined;
+							}
 							return replacementApiKey;
 						},
 					});
