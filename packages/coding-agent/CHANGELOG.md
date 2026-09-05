@@ -5,9 +5,12 @@
 
 - Added selectable `astra-lite`, `astra-default`, and `astra-heavy` CODEX presets with `ASTRA-` labels, plus `astra-fable` and `astra-fable-opus` cross-family review combinations. Existing presets and automatic provider recommendations remain unchanged.
 - Status-line settings now include a draft-local spatial custom editor with exact-slot keyboard reordering, hidden-segment palette management, command text configuration, persisted Confirm/Exit semantics, live multi-row preview compatibility, narrow/Unicode rendering, and deterministic visual evidence.
+- Added opt-in `reasoningLanguage: english` guidance for technical work while preserving the user's requested response language; the default remains off.
 
 ### Fixed
 
+- Task repository bindings now accept explicit `relativeSubdir: "."` as the already-bound worktree root, avoiding unnecessary launch retries while retaining traversal, absolute-path, symlink-escape, and sibling-repository rejection.
+- Blank optional task output schemas now inherit the configured agent/session schema instead of failing successful subagents at completion; malformed nonempty schemas and required-field validation remain fail-closed.
 - Perplexity web search now clamps upstream search breadth to the API's 3–100 contract, retries one structurally empty completion, rejects malformed or ungrounded success payloads through the provider fallback path, and preserves valid grounded responses.
 - Architect/task subagents now retry API-key lookup without the parent session id after a scoped miss, so broker OAuth that works for `gjc -p --no-session` is not thrown away as `Agent run failed` / 0 tokens (#5081 follow-up). Failures still throw `provider_unavailable` without leaking the token.
 - Python work that completes after strict session disposal now returns its result without attempting to append to the closed session transcript.
@@ -16,7 +19,7 @@
 - Skills installed from marketplace plugins are now enumerated into sessions instead of only resolving by exact name. `loadSkills` asked the `native` provider alone, so every installed plugin skill was absent from `/` autocomplete and from the `skill` tool's `Available:` list while `gjc skill list` reported it and the discovery fallback still loaded it — 46 installed skills presented as 5. The already-registered marketplace provider is now loaded alongside `native`, keeping `<plugin>:<skill>` namespacing and per-item scope trust.
 - File-content search now has a call-wide timeout (`timeout`, default 5 seconds, range 0.5–60) that is forwarded through internal-URL resolution and native grep together with cancellation. Native scans poll cancellation around each bounded file, and the tool joins cancellation cleanup before returning instead of leaving scope resolution, archive scratch, or grep workers running after a timeout. Timeout failures tell callers to narrow the scope or explicitly increase the budget, while user cancellation remains a distinct tool abort.
 - `restart:sdk-broker -- --close-session-hosts` now continues replacing the broker when its pre-restart session-host listing fails, reports the partial teardown with exit code 1, tolerates another authenticated restart caller retiring the same exact broker identity, and catches other top-level failures instead of emitting an unhandled-rejection crash record.
-- `install:dev` now builds the workspace native addon before linking the source CLI, preventing fresh or cleaned development checkouts from failing startup with a missing or stale addon.
+- `install:dev` now builds the workspace native addon before linking the source CLI, preventing fresh or cleaned development checkouts from failing startup with a missing or stale addon. The installer also supports the local `--dev` binary shortcut.
 - Plain and explicit-model launches now refresh a missing provider's cached dynamic catalog before resolving a qualified startup selector, so configured models such as `glm-zcode/glm-5.3` no longer open in `no-model` state while preserving cache-only startup for already available models.
 - The explicit thinking-choice gate for xAI models now derives from the parsed grok generation (4.5+) shared with `@gajae-code/ai`, instead of the exact ids `grok-4.5`/`grok-4.6`. A future grok release failed the id list, so `supportsReasoningEffort` stayed `false` and the user's thinking level was silently dropped from requests; reseller-hosted grok routes (OpenRouter & co.) keep their existing audited-transport behavior.
 
@@ -34,8 +37,6 @@
   refreshes, bounded timeout/output, ANSI sanitization, placeholder degradation,
   disposal cancellation, and custom-editor configuration while preserving
   synchronous TUI rendering; project-scoped settings cannot trigger execution.
-
-### Fixed
 
 - Business/Enterprise/Team ChatGPT accounts can bind GPT-5.6 Sol again. The Codex entitlement preflight treated only `plan_type` values containing `"pro"` as eligible, so an `openai-codex` OAuth account on a Business/Enterprise/Team plan was rejected at model-binding/subagent setup time with a spurious entitlement error even though the backend accepts the request. Exact Pro/Business/Enterprise/Team tiers are now recognized as entitled, Plus/Free remain rejected, and unfamiliar plan names are deferred to the provider rather than guessed locally.
 
