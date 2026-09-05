@@ -265,6 +265,33 @@ export function compactionRetryDelay(
 	return Math.max(0, bounded);
 }
 
+export interface CompactionCandidateFailure {
+	readonly model: string;
+	readonly message: string;
+}
+
+/**
+ * Error for an auto-compaction run whose every candidate failed.
+ *
+ * The candidate chain starts at the session model and ends on a same-provider
+ * largest-context fallback, so surfacing only the final error named a model
+ * the user never chose and hid that their own model had already failed the
+ * same way. The message leads with the first failure (the one the user can act
+ * on), then lists every candidate that was tried with its own error. `cause`
+ * is the final error so callers that classify by type keep the same object.
+ */
+export function describeCompactionCandidateFailures(
+	failures: readonly CompactionCandidateFailure[],
+	lastError: unknown,
+): Error {
+	const first = failures[0]!;
+	const lines = failures.map(failure => `  ${failure.model}: ${failure.message}`);
+	return new Error(
+		`${first.message} (${first.model}); ${failures.length} compaction candidates failed:\n${lines.join("\n")}`,
+		{ cause: lastError },
+	);
+}
+
 /** Retry-After is intentionally uncapped. */
 export function effectiveFallbackDelay(
 	baseDelayMs: number,
