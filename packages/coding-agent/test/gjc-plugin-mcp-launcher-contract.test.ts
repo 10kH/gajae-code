@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { pathToFileURL } from "node:url";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import {
 	assertMcpInstallPolicy,
@@ -35,6 +37,12 @@ async function tempDir(prefix: string): Promise<string> {
 
 function stdio(command: "node" | "bun", args: string[], cwd = "."): GjcPluginMcpManifestEntry {
 	return { name: "launcher-contract", transport: "stdio", command, args, cwd };
+}
+
+function trustedSnapshotBase(): string {
+	return process.platform === "win32"
+		? path.join(os.tmpdir(), "gjc-plugin-mcp-private")
+		: path.join("/tmp", `gjc-plugin-mcp-${process.getuid?.() ?? process.pid}`);
 }
 
 async function writeBundle(
@@ -119,10 +127,7 @@ async function connect(
 }
 
 function runtimeServerArgs(args: readonly string[] | undefined): string[] {
-	const values = args ?? [];
-	const separator = values.indexOf("--");
-	if (separator < 0) throw new Error("verified launcher separator missing");
-	return values.slice(separator + 4);
+	return (args ?? []).slice(1);
 }
 
 describe("bundled plugin MCP launcher contract", () => {
@@ -220,7 +225,7 @@ describe("bundled plugin MCP launcher contract", () => {
 		const source = await tempDir("gjc-plugin-launcher-source-");
 		await writeBundle(source, {
 			name: "direct-entry",
-			command: "bun",
+			command: "node",
 			args: ["server.mjs", "--config=ordinary-server-arg"],
 			cwd: "mcp",
 			serverPath: "mcp/server.mjs",
@@ -233,7 +238,8 @@ describe("bundled plugin MCP launcher contract", () => {
 
 		const connected = await connect(cwd, "direct-entry");
 		expect(connected.errors).toEqual([]);
-		expect(path.basename(connected.command ?? "")).toBe(process.platform === "win32" ? "bun.exe" : "bun");
+		expect(path.isAbsolute(connected.command ?? "")).toBe(true);
+		expect(path.relative(cwd, connected.command ?? "").startsWith("..")).toBe(true);
 		expect(runtimeServerArgs(connected.args)).toEqual(["--config=ordinary-server-arg"]);
 	}, 30_000);
 
@@ -243,7 +249,7 @@ describe("bundled plugin MCP launcher contract", () => {
 		await fs.mkdir(path.join(source, "empty-cwd"));
 		await writeBundle(source, {
 			name: "empty-cwd",
-			command: "bun",
+			command: "node",
 			args: ["../server.mjs"],
 			cwd: "empty-cwd",
 			serverPath: "server.mjs",
@@ -273,9 +279,212 @@ describe("bundled plugin MCP launcher contract", () => {
 		const connected = await connect(cwd, "node-entry");
 		expect(connected.errors).toEqual([]);
 		expect(path.basename(connected.command ?? "")).toBe(process.platform === "win32" ? "node.exe" : "node");
-		const separator = connected.args?.indexOf("--") ?? -1;
-		expect(connected.args?.[separator + 1]).toBe(path.join(entry?.pluginRoot ?? "", "mcp/server.mjs"));
+		expect(entry?.copiedFiles.map(file => file.relativePath)).toContain(path.join("mcp", "server.mjs"));
 		expect(runtimeServerArgs(connected.args)).toEqual(["--cwd=ordinary-server-arg"]);
+	}, 30_000);
+
+	test("runs relative imports from an authenticated file snapshot", async () => {
+		const cwd = await tempDir("gjc-plugin-launcher-import-project-");
+		const source = await tempDir("gjc-plugin-launcher-import-source-");
+		const reportPath = path.join(await tempDir("gjc-plugin-launcher-import-report-"), "report.json");
+		const server = mcpServer().replace(
+			'import { writeFileSync } from "node:fs";',
+			`import { writeFileSync } from "node:fs";
+import { helperValue } from "./helper.mjs";
+writeFileSync(${JSON.stringify(reportPath)}, JSON.stringify({ helperValue, entrypointUrl: import.meta.url, cwd: process.cwd() }));`,
+		);
+		await writeBundle(source, {
+			name: "relative-import",
+			command: "node",
+			server,
+			ownedFiles: { "mcp/helper.mjs": 'export const helperValue = "trusted";\n' },
+		});
+		expect((await installGjcBundle({ cwd }, "project", source)).ok).toBe(true);
+		const entry = (await readRegistry("project", cwd)).plugins[0];
+
+		const connected = await connect(cwd, "relative-import");
+		expect(connected.errors).toEqual([]);
+		const report = JSON.parse(await fs.readFile(reportPath, "utf8")) as {
+			helperValue: string;
+			entrypointUrl: string;
+			cwd: string;
+		};
+		expect(report.helperValue).toBe("trusted");
+		expect(report.entrypointUrl.startsWith("file:")).toBe(true);
+		expect(report.entrypointUrl).not.toContain(entry?.pluginRoot ?? "");
+		expect(path.basename(new URL(report.entrypointUrl).pathname)).toBe("server.mjs");
+		expect(path.basename(path.dirname(report.cwd)).startsWith("gjc-plugin-mcp-")).toBe(true);
+		expect(path.basename(report.cwd)).toBe("bundle");
+		expect(report.cwd).not.toBe(path.join(entry?.pluginRoot ?? "", "mcp"));
+	}, 30_000);
+
+	test("rejects bare package resolution outside the authenticated snapshot", async () => {
+		const cwd = await tempDir("gjc-plugin-launcher-package-project-");
+		const source = await tempDir("gjc-plugin-launcher-package-source-");
+		const snapshotBase = trustedSnapshotBase();
+		const marker = path.join(await tempDir("gjc-plugin-launcher-package-marker-"), "outside-package-ran.txt");
+		const packageRoot = path.join(snapshotBase, "node_modules", "outside-package");
+		await fs.mkdir(packageRoot, { recursive: true });
+		await fs.chmod(snapshotBase, 0o700);
+		await fs.writeFile(path.join(packageRoot, "package.json"), '{"type":"module","exports":"./index.mjs"}\n');
+		await fs.writeFile(
+			path.join(packageRoot, "index.mjs"),
+			`import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(marker)}, "ran");\n`,
+		);
+		await writeBundle(source, {
+			name: "outside-package",
+			command: "node",
+			server: `import "outside-package";\n${mcpServer()}`,
+		});
+		expect((await installGjcBundle({ cwd }, "project", source)).ok).toBe(true);
+		try {
+			const connected = await connect(cwd, "outside-package");
+			expect(connected.errors).toHaveLength(1);
+			await expect(fs.readFile(marker, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			await fs.rm(packageRoot, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	test("rejects createRequire before CommonJS can escape the authenticated snapshot", async () => {
+		const cwd = await tempDir("gjc-plugin-launcher-require-project-");
+		const source = await tempDir("gjc-plugin-launcher-require-source-");
+		const outside = await tempDir("gjc-plugin-launcher-require-outside-");
+		const marker = path.join(outside, "commonjs-ran.txt");
+		const commonJs = path.join(outside, "outside.cjs");
+		await fs.writeFile(commonJs, `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran");\n`);
+		await writeBundle(source, {
+			name: "outside-commonjs",
+			command: "node",
+			server: `import { createRequire } from "node:module"; createRequire(import.meta.url)(${JSON.stringify(commonJs)});\n${mcpServer()}`,
+		});
+		expect((await installGjcBundle({ cwd }, "project", source)).ok).toBe(true);
+		const connected = await connect(cwd, "outside-commonjs");
+		expect(connected.errors).toHaveLength(1);
+		await expect(fs.readFile(marker, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+	}, 30_000);
+
+	test("rejects Bun createRequire and direct require before external CommonJS runs", async () => {
+		const cwd = await tempDir("gjc-plugin-launcher-bun-require-project-");
+		const outside = await tempDir("gjc-plugin-launcher-bun-require-outside-");
+		for (const [name, expression] of [
+			["bun-create-require", 'import { createRequire } from "node:module"; createRequire(import.meta.url)'],
+			["bun-direct-require", "require"],
+		] as const) {
+			const source = await tempDir(`gjc-plugin-launcher-${name}-`);
+			const marker = path.join(outside, `${name}.txt`);
+			const commonJs = path.join(outside, `${name}.cjs`);
+			await fs.writeFile(commonJs, `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran");\n`);
+			await writeBundle(source, {
+				name,
+				command: "bun",
+				server: `${expression}(${JSON.stringify(commonJs)});\n${mcpServer()}`,
+			});
+			expect((await installGjcBundle({ cwd }, "project", source)).ok).toBe(true);
+			const connected = await connect(cwd, name);
+			expect(connected.errors.length).toBeGreaterThan(0);
+			await expect(fs.readFile(marker, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+		}
+	}, 30_000);
+
+	test("reaps a dead owner's bounded launch capsule before creating a new one", async () => {
+		const cwd = await tempDir("gjc-plugin-launcher-reap-project-");
+		const source = await tempDir("gjc-plugin-launcher-reap-source-");
+		await writeBundle(source, { name: "stale-reap", command: "node", server: mcpServer() });
+		expect((await installGjcBundle({ cwd }, "project", source)).ok).toBe(true);
+		const base = trustedSnapshotBase();
+		await fs.mkdir(base, { recursive: true, mode: 0o700 });
+		await fs.chmod(base, 0o700);
+		const stale = path.join(base, "gjc-plugin-mcp-99999999-00000000000000000000000000000000");
+		await fs.mkdir(stale, { mode: 0o700 });
+		await fs.writeFile(path.join(stale, "orphan.txt"), "orphan\n");
+
+		const connected = await connect(cwd, "stale-reap");
+		expect(connected.errors).toEqual([]);
+		await expect(fs.stat(stale)).rejects.toMatchObject({ code: "ENOENT" });
+	}, 30_000);
+
+	test("supports concurrent launches from one authenticated config without sharing snapshots", async () => {
+		const cwd = await tempDir("gjc-plugin-launcher-concurrent-project-");
+		const source = await tempDir("gjc-plugin-launcher-concurrent-source-");
+		await writeBundle(source, { name: "concurrent-snapshot", command: "node", server: mcpServer() });
+		expect((await installGjcBundle({ cwd }, "project", source)).ok).toBe(true);
+		const runtime = await buildPluginMcpConfigs({ cwd });
+		const provenance = {
+			"concurrent-snapshot": { provider: "gjc-plugins", providerName: "GJC plugin bundle", level: "project" },
+		} as never;
+		const first = new MCPManager(cwd);
+		const second = new MCPManager(cwd);
+		managers.push(first, second);
+		const [firstResult, secondResult] = await Promise.all([
+			first.connectServers(runtime.configs, provenance),
+			second.connectServers(runtime.configs, provenance),
+		]);
+		expect([...firstResult.errors.entries()]).toEqual([]);
+		expect([...secondResult.errors.entries()]).toEqual([]);
+		await Promise.all([first.disconnectAll(), second.disconnectAll()]);
+	}, 30_000);
+
+	test("removes authenticated snapshots after forced termination and reconnect", async () => {
+		const cwd = await tempDir("gjc-plugin-launcher-cleanup-project-");
+		const source = await tempDir("gjc-plugin-launcher-cleanup-source-");
+		const markerDir = await tempDir("gjc-plugin-launcher-cleanup-marker-");
+		const signalMarker = path.join(markerDir, "sigterm.txt");
+		const cwdMarker = path.join(markerDir, "cwd.txt");
+		await writeBundle(source, {
+			name: "snapshot-cleanup",
+			command: "node",
+			server: `${mcpServer()}\nwriteFileSync(${JSON.stringify(cwdMarker)}, process.cwd());\nsetInterval(() => {}, 1_000);\nprocess.on("SIGTERM", () => writeFileSync(${JSON.stringify(signalMarker)}, "seen"));`,
+		});
+		expect((await installGjcBundle({ cwd }, "project", source)).ok).toBe(true);
+		const runtime = await buildPluginMcpConfigs({ cwd });
+		const config = runtime.configs["snapshot-cleanup"];
+		if (!config || config.type === "http" || config.type === "sse") throw new Error("missing stdio config");
+		const manager = new MCPManager(cwd);
+		managers.push(manager);
+		const provenance = {
+			"snapshot-cleanup": { provider: "gjc-plugins", providerName: "GJC plugin bundle", level: "project" },
+		} as never;
+
+		for (let attempt = 0; attempt < 2; attempt++) {
+			const connected = await manager.connectServers(runtime.configs, provenance);
+			expect([...connected.errors.entries()]).toEqual([]);
+			const snapshotRoot = await fs.readFile(cwdMarker, "utf8");
+			await expect(fs.stat(snapshotRoot)).resolves.toMatchObject({});
+			await manager.disconnectAll();
+			expect(await fs.readFile(signalMarker, "utf8")).toBe("seen");
+			await expect(fs.stat(snapshotRoot)).rejects.toMatchObject({ code: "ENOENT" });
+			await fs.rm(signalMarker, { force: true });
+			await fs.rm(cwdMarker, { force: true });
+		}
+	}, 30_000);
+
+	test("keeps snapshots outside workspace-controlled TMPDIR and removes them on disconnect", async () => {
+		const cwd = await tempDir("gjc-plugin-launcher-tmpdir-project-");
+		const source = await tempDir("gjc-plugin-launcher-tmpdir-source-");
+		const cwdMarker = path.join(await tempDir("gjc-plugin-launcher-tmpdir-marker-"), "cwd.txt");
+		await writeBundle(source, {
+			name: "snapshot-tmpdir",
+			command: "node",
+			server: `${mcpServer()}\nwriteFileSync(${JSON.stringify(cwdMarker)}, process.cwd());`,
+		});
+		expect((await installGjcBundle({ cwd }, "project", source)).ok).toBe(true);
+		const previousTmpdir = process.env.TMPDIR;
+		process.env.TMPDIR = cwd;
+		try {
+			const connected = await connect(cwd, "snapshot-tmpdir");
+			expect(connected.errors).toEqual([]);
+			const snapshotRoot = await fs.readFile(cwdMarker, "utf8");
+			expect(path.relative(cwd, snapshotRoot).startsWith("..")).toBe(true);
+			const entry = (await readRegistry("project", cwd)).plugins[0];
+			expect(path.relative(entry?.pluginRoot ?? "", snapshotRoot).startsWith("..")).toBe(true);
+			await expect(fs.stat(snapshotRoot)).resolves.toMatchObject({});
+			await managers.at(-1)?.disconnectAll();
+			await expect(fs.stat(snapshotRoot)).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			if (previousTmpdir === undefined) delete process.env.TMPDIR;
+			else process.env.TMPDIR = previousTmpdir;
+		}
 	}, 30_000);
 
 	test("passes separators, spaces, quotes, and shell metacharacters only as literal post-entrypoint argv", async () => {
@@ -298,6 +507,184 @@ describe("bundled plugin MCP launcher contract", () => {
 			"semi;colon",
 			"amp&ersand",
 		]);
+	}, 30_000);
+
+	test("does not resolve a bare launcher from attacker-controlled workspace PATH entries", async () => {
+		const cwd = await tempDir("gjc-plugin-launcher-path-project-");
+		const source = await tempDir("gjc-plugin-launcher-path-source-");
+		const marker = path.join(await tempDir("gjc-plugin-launcher-path-marker-"), "ran.txt");
+		await writeBundle(source, {
+			name: "launcher-path",
+			command: "node",
+			server: mcpServer(),
+		});
+		expect((await installGjcBundle({ cwd }, "project", source)).ok).toBe(true);
+		await fs.writeFile(path.join(cwd, "node"), `#!/bin/sh\nprintf ran > ${JSON.stringify(marker)}\nexit 1\n`, {
+			mode: 0o700,
+		});
+		const runtimeAdaptersUrl = pathToFileURL(
+			path.join(import.meta.dir, "../src/extensibility/gjc-plugins/runtime-adapters.ts"),
+		).href;
+		const runtimeMcpUrl = pathToFileURL(path.join(import.meta.dir, "../src/runtime-mcp/index.ts")).href;
+		const probe = `
+const { buildPluginMcpConfigs } = await import(${JSON.stringify(runtimeAdaptersUrl)});
+const { MCPManager } = await import(${JSON.stringify(runtimeMcpUrl)});
+const cwd = process.env.GJC_LAUNCHER_PROBE_CWD;
+if (!cwd) throw new Error("missing probe cwd");
+const runtime = await buildPluginMcpConfigs({ cwd });
+const config = runtime.configs["launcher-path"];
+if (!config) throw new Error("missing launcher config");
+const manager = new MCPManager(cwd);
+const connected = await manager.connectServers({ "launcher-path": config }, {
+  "launcher-path": { provider: "gjc-plugins", providerName: "GJC plugin bundle", level: "project" },
+});
+console.log("LAUNCHER=" + config.command);
+console.log("ERRORS=" + connected.errors.size);
+await manager.disconnectAll();
+`;
+		const child = Bun.spawn([process.execPath, "--eval", probe], {
+			cwd,
+			env: {
+				...process.env,
+				PATH: [cwd, ".", process.env.PATH].filter(Boolean).join(path.delimiter),
+				GJC_LAUNCHER_PROBE_CWD: cwd,
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [exitCode, stdout, stderr] = await Promise.all([
+			child.exited,
+			new Response(child.stdout).text(),
+			new Response(child.stderr).text(),
+		]);
+		expect(exitCode, stderr).toBe(0);
+		const launcherCommand = stdout.match(/^LAUNCHER=(.*)$/mu)?.[1] ?? "";
+		expect(stdout).toContain("ERRORS=0");
+		await expect(fs.readFile(marker, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+		expect(path.isAbsolute(launcherCommand)).toBe(true);
+		expect(path.relative(cwd, launcherCommand).startsWith("..")).toBe(true);
+	}, 30_000);
+
+	test("ignores an attacker-owned absolute interpreter before it can be replaced", async () => {
+		if (process.platform === "win32") return;
+		const cwd = await tempDir("gjc-plugin-launcher-interpreter-project-");
+		const source = await tempDir("gjc-plugin-launcher-interpreter-source-");
+		const launcherDir = await tempDir("gjc-plugin-launcher-interpreter-bin-");
+		const marker = path.join(await tempDir("gjc-plugin-launcher-interpreter-marker-"), "ran.txt");
+		const trustedNode = Bun.which("node");
+		if (!trustedNode) throw new Error("node launcher missing");
+		const selectedLauncher = path.join(launcherDir, "node");
+		const maliciousLauncher = path.join(launcherDir, "malicious-node");
+		await fs.copyFile(await fs.realpath(trustedNode), selectedLauncher);
+		await fs.chmod(selectedLauncher, 0o700);
+		await fs.writeFile(maliciousLauncher, `#!/bin/sh\nprintf ran > ${JSON.stringify(marker)}\nexit 1\n`, {
+			mode: 0o700,
+		});
+		await writeBundle(source, { name: "interpreter-replacement", command: "node", server: mcpServer() });
+		expect((await installGjcBundle({ cwd }, "project", source)).ok).toBe(true);
+
+		const previousPath = process.env.PATH;
+		const previousNvmDir = process.env.NVM_DIR;
+		process.env.PATH = [launcherDir, previousPath].filter(Boolean).join(path.delimiter);
+		process.env.NVM_DIR = launcherDir;
+		try {
+			const runtime = await buildPluginMcpConfigs({ cwd });
+			const config = runtime.configs["interpreter-replacement"];
+			if (config?.type !== "stdio") throw new Error("missing trusted launcher fallback");
+			expect(await fs.realpath(config.command)).not.toBe(await fs.realpath(selectedLauncher));
+			config.afterSpawnGuardForTest = async () => {
+				await fs.rename(maliciousLauncher, selectedLauncher);
+			};
+			const manager = new MCPManager(cwd);
+			managers.push(manager);
+			const connected = await manager.connectServers({ "interpreter-replacement": config }, {
+				"interpreter-replacement": {
+					provider: "gjc-plugins",
+					providerName: "GJC plugin bundle",
+					level: "project",
+				},
+			} as never);
+			expect([...connected.errors.entries()]).toEqual([]);
+			await expect(fs.readFile(marker, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			if (previousPath === undefined) delete process.env.PATH;
+			else process.env.PATH = previousPath;
+			if (previousNvmDir === undefined) delete process.env.NVM_DIR;
+			else process.env.NVM_DIR = previousNvmDir;
+		}
+	}, 30_000);
+
+	test("executes the canonical launcher target when its PATH symlink is retargeted after the final guard", async () => {
+		if (process.platform === "win32") return;
+		const cwd = await tempDir("gjc-plugin-launcher-link-project-");
+		const source = await tempDir("gjc-plugin-launcher-link-source-");
+		const launcherDir = await tempDir("gjc-plugin-launcher-link-bin-");
+		const marker = path.join(await tempDir("gjc-plugin-launcher-link-marker-"), "ran.txt");
+		const trustedNode = Bun.which("node");
+		if (!trustedNode) throw new Error("node launcher missing");
+		const trustedNodeReal = await fs.realpath(trustedNode);
+		const launcherLink = path.join(launcherDir, "node");
+		const maliciousLauncher = path.join(launcherDir, "malicious-node");
+		await fs.symlink(trustedNodeReal, launcherLink);
+		await fs.writeFile(maliciousLauncher, `#!/bin/sh\nprintf ran > ${JSON.stringify(marker)}\nexit 1\n`, {
+			mode: 0o700,
+		});
+		await writeBundle(source, { name: "launcher-link", command: "node", server: mcpServer() });
+		expect((await installGjcBundle({ cwd }, "project", source)).ok).toBe(true);
+
+		const runtimeAdaptersUrl = pathToFileURL(
+			path.join(import.meta.dir, "../src/extensibility/gjc-plugins/runtime-adapters.ts"),
+		).href;
+		const runtimeMcpUrl = pathToFileURL(path.join(import.meta.dir, "../src/runtime-mcp/index.ts")).href;
+		const probe = `
+import * as fs from "node:fs/promises";
+const { buildPluginMcpConfigs } = await import(${JSON.stringify(runtimeAdaptersUrl)});
+const { MCPManager } = await import(${JSON.stringify(runtimeMcpUrl)});
+const cwd = process.env.GJC_LAUNCHER_PROBE_CWD;
+const launcherLink = process.env.GJC_LAUNCHER_LINK;
+const maliciousLauncher = process.env.GJC_MALICIOUS_LAUNCHER;
+const marker = process.env.GJC_LAUNCHER_MARKER;
+if (!cwd || !launcherLink || !maliciousLauncher || !marker) throw new Error("missing probe metadata");
+const runtime = await buildPluginMcpConfigs({ cwd });
+const config = runtime.configs["launcher-link"];
+if (!config || config.type !== "stdio") throw new Error("missing launcher config");
+config.afterSpawnGuardForTest = async () => {
+  const replacement = launcherLink + ".replacement";
+  await fs.symlink(maliciousLauncher, replacement);
+  await fs.rename(replacement, launcherLink);
+};
+const manager = new MCPManager(cwd);
+const connected = await manager.connectServers({ "launcher-link": config }, {
+  "launcher-link": { provider: "gjc-plugins", providerName: "GJC plugin bundle", level: "project" },
+});
+console.log("LAUNCHER=" + config.command);
+console.log("ERRORS=" + connected.errors.size);
+await manager.disconnectAll();
+console.log("MARKER=" + await fs.readFile(marker, "utf8").catch(() => "missing"));
+`;
+		const child = Bun.spawn([process.execPath, "--eval", probe], {
+			cwd,
+			env: {
+				...process.env,
+				PATH: [launcherDir, process.env.PATH].filter(Boolean).join(path.delimiter),
+				GJC_LAUNCHER_PROBE_CWD: cwd,
+				GJC_LAUNCHER_LINK: launcherLink,
+				GJC_MALICIOUS_LAUNCHER: maliciousLauncher,
+				GJC_LAUNCHER_MARKER: marker,
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [exitCode, stdout, stderr] = await Promise.all([
+			child.exited,
+			new Response(child.stdout).text(),
+			new Response(child.stderr).text(),
+		]);
+		expect(exitCode, stderr).toBe(0);
+		expect(stdout).toContain("MARKER=missing");
+		expect(stdout).toContain("ERRORS=0");
+		expect(stdout).toContain(`LAUNCHER=${trustedNodeReal}`);
+		await expect(fs.readFile(marker, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
 	}, 30_000);
 
 	test("rejects path-qualified executable and shebang launcher aliases", async () => {
@@ -350,7 +737,7 @@ describe("bundled plugin MCP launcher contract", () => {
 		}
 	});
 
-	test("neutralizes ambient Bun config, dotenv, and auto-install at the live spawn boundary", async () => {
+	test("fails Bun launch closed before ambient config, dotenv, or auto-install can run", async () => {
 		const cwd = await tempDir("gjc-plugin-launcher-project-");
 		const source = await tempDir("gjc-plugin-launcher-source-");
 		const outside = await tempDir("gjc-plugin-launcher-ambient-");
@@ -374,9 +761,8 @@ describe("bundled plugin MCP launcher contract", () => {
 		);
 
 		const connected = await connect(cwd, "ambient-isolation");
-		expect(connected.errors).toEqual([]);
-		expect(connected.args?.slice(0, 3)).toEqual([`--config=${os.devNull}`, "--no-env-file", "--no-install"]);
-		expect(await fs.readFile(serverReport, "utf8")).toBe('{"ambient":null}');
+		expect(connected.errors).toHaveLength(1);
+		await expect(fs.readFile(serverReport, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
 		await expect(fs.readFile(preloadMarker, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
 	}, 30_000);
 
@@ -505,8 +891,54 @@ describe("bundled plugin MCP launcher contract", () => {
 		const connected = await manager.connectServers(runtime.configs, {
 			"atomic-toctou": { provider: "gjc-plugins", providerName: "GJC plugin bundle", level: "project" },
 		} as never);
-		expect([...connected.errors.keys()]).toEqual(["atomic-toctou"]);
-		expect(manager.getConnection("atomic-toctou")).toBeUndefined();
+		expect([...connected.errors.keys()]).toEqual([]);
+		expect(manager.getConnection("atomic-toctou")).toBeDefined();
+		await expect(fs.readFile(marker, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	test("executes no helper bytes rebound through the registry after the final guard", async () => {
+		const cwd = await tempDir("gjc-plugin-launcher-helper-atomic-project-");
+		const source = await tempDir("gjc-plugin-launcher-helper-atomic-source-");
+		const marker = path.join(await tempDir("gjc-plugin-launcher-helper-atomic-marker-"), "ran.txt");
+		const server = mcpServer().replace(
+			'import { writeFileSync } from "node:fs";',
+			'import { writeFileSync } from "node:fs";\nimport { helperValue } from "./helper.mjs";\nvoid helperValue;',
+		);
+		await writeBundle(source, {
+			name: "helper-atomic-toctou",
+			command: "node",
+			server,
+			ownedFiles: { "mcp/helper.mjs": 'export const helperValue = "trusted";\n' },
+		});
+		expect((await installGjcBundle({ cwd }, "project", source)).ok).toBe(true);
+		const runtime = await buildPluginMcpConfigs({ cwd });
+		const config = runtime.configs["helper-atomic-toctou"];
+		if (!config || config.type === "http" || config.type === "sse") throw new Error("missing stdio config");
+		const entry = (await readRegistry("project", cwd)).plugins[0];
+		const replacement = `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(marker)}, "ran"); export const helperValue = "replacement";\n`;
+		config.afterSpawnGuardForTest = async () => {
+			await fs.writeFile(path.join(entry?.pluginRoot ?? "", "mcp/helper.mjs"), replacement);
+			const registryPath = registryPathForScope("project", cwd);
+			const registry = JSON.parse(await fs.readFile(registryPath, "utf8"));
+			const helper = registry.plugins[0].copiedFiles.find(
+				(file: { relativePath: string }) => file.relativePath === "mcp/helper.mjs",
+			);
+			if (!helper) throw new Error("missing helper authority");
+			helper.sha256 = createHash("sha256").update(replacement).digest("hex");
+			await fs.writeFile(registryPath, JSON.stringify(registry));
+		};
+
+		const manager = new MCPManager(cwd);
+		managers.push(manager);
+		const connected = await manager.connectServers(runtime.configs, {
+			"helper-atomic-toctou": {
+				provider: "gjc-plugins",
+				providerName: "GJC plugin bundle",
+				level: "project",
+			},
+		} as never);
+		expect([...connected.errors.keys()]).toEqual([]);
+		expect(manager.getConnection("helper-atomic-toctou")).toBeDefined();
 		await expect(fs.readFile(marker, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
 	});
 

@@ -225,7 +225,7 @@ export function classifyStdioInvocation(
 		fail(`MCP "${entry.name}": stdio script escapes plugin root: ${entrypoint}`);
 	}
 	const extension = path.extname(executablePath).toLowerCase();
-	const allowedExtensions = command === "node" ? new Set([".mjs"]) : new Set([".mjs", ".js", ".ts", ".jsx", ".tsx"]);
+	const allowedExtensions = command === "node" ? new Set([".mjs"]) : new Set([".mjs", ".ts", ".jsx", ".tsx"]);
 	if (!allowedExtensions.has(extension)) {
 		fail(`MCP "${entry.name}": unsupported ${command} entrypoint extension: ${extension || "<none>"}`);
 	}
