@@ -955,6 +955,7 @@ function mapOptionsForApi<TApi extends Api>(
 		streamMaxRetries: options?.fallbackManaged ? 0 : options?.streamMaxRetries,
 		metadata: options?.metadata,
 		sessionId: options?.sessionId,
+		providerSessionId: options?.providerSessionId,
 		providerSessionState: options?.providerSessionState,
 		onPayload: options?.onPayload,
 		onResponse: options?.onResponse,

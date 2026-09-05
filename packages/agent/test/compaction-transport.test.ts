@@ -109,12 +109,14 @@ describe("maintenance call transport forwarding (#736)", () => {
 
 		await generateSummary([makeUserMessage("Hi")], MODEL, 4096, "k", undefined, undefined, undefined, {
 			sessionId: "turn-session-1",
+			providerSessionId: "provider-session-1",
 			providerSessionState,
 			preferWebsockets: true,
 		});
 
 		expect(captured).toHaveLength(1);
 		expect(captured[0]?.sessionId).toBe("turn-session-1");
+		expect(captured[0]?.providerSessionId).toBe("provider-session-1");
 		expect(captured[0]?.providerSessionState).toBe(providerSessionState);
 		expect(captured[0]?.preferWebsockets).toBe(true);
 	});
@@ -127,12 +129,14 @@ describe("maintenance call transport forwarding (#736)", () => {
 			systemPrompt: ["Live system prompt"],
 			tools: [],
 			sessionId: "turn-session-2",
+			providerSessionId: "provider-session-2",
 			providerSessionState,
 			preferWebsockets: true,
 		});
 
 		expect(captured).toHaveLength(1);
 		expect(captured[0]?.sessionId).toBe("turn-session-2");
+		expect(captured[0]?.providerSessionId).toBe("provider-session-2");
 		expect(captured[0]?.providerSessionState).toBe(providerSessionState);
 		expect(captured[0]?.preferWebsockets).toBe(true);
 	});
@@ -162,12 +166,14 @@ describe("maintenance call transport forwarding (#736)", () => {
 			apiKey: "k",
 			signal: new AbortController().signal,
 			sessionId: "turn-session-3",
+			providerSessionId: "provider-session-3",
 			providerSessionState,
 			preferWebsockets: true,
 		});
 
 		expect(captured).toHaveLength(1);
 		expect(captured[0]?.sessionId).toBe("turn-session-3");
+		expect(captured[0]?.providerSessionId).toBe("provider-session-3");
 		expect(captured[0]?.providerSessionState).toBe(providerSessionState);
 		expect(captured[0]?.preferWebsockets).toBe(true);
 	});
@@ -178,6 +184,7 @@ describe("maintenance call transport forwarding (#736)", () => {
 
 		await compact(makePreparation(), MODEL, "k", undefined, undefined, {
 			sessionId: "turn-session-4",
+			providerSessionId: "provider-session-4",
 			providerSessionState,
 			preferWebsockets: true,
 		});
@@ -187,6 +194,7 @@ describe("maintenance call transport forwarding (#736)", () => {
 		expect(captured).toHaveLength(1);
 		for (const options of captured) {
 			expect(options.sessionId).toBe("turn-session-4");
+			expect(options.providerSessionId).toBe("provider-session-4");
 			expect(options.providerSessionState).toBe(providerSessionState);
 			expect(options.preferWebsockets).toBe(true);
 		}
