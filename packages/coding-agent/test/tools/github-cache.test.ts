@@ -107,6 +107,38 @@ it("refreshes distinct cache identities independently", async () => {
 	}
 });
 
+it("releases a stale refresh marker when the fetch never settles", async () => {
+	vi.useFakeTimers();
+	try {
+		const now = Date.now();
+		const row = { repo: TEST_REPO, kind: "issue" as const, number: 80, includeComments: true };
+		putCached({ ...row, payload: "old", rendered: "old", sourceUrl: "url", fetchedAt: now - 2_000 });
+		const settings = Settings.isolated({ "github.cache.softTtlSec": 1, "github.cache.hardTtlSec": 60 });
+		const never = Promise.withResolvers<{ payload: string; rendered: string; sourceUrl: string }>();
+		await getOrFetchView({ ...row, settings, now, fetchFresh: () => never.promise });
+		await Promise.resolve();
+		await getOrFetchView({
+			...row,
+			settings,
+			now,
+			fetchFresh: async () => ({ payload: "new", rendered: "new", sourceUrl: "url" }),
+		});
+		// The second request is coalesced while the first is genuinely in flight.
+		// The timeout-bound marker is verified by the follow-up after the timeout.
+		await Promise.resolve();
+		await Promise.resolve();
+		vi.advanceTimersByTime(30_000);
+		await Promise.resolve();
+		await Promise.resolve();
+		const retry = vi.fn(async () => ({ payload: "retry", rendered: "retry", sourceUrl: "url" }));
+		await getOrFetchView({ ...row, settings, now, fetchFresh: retry });
+		await Promise.resolve();
+		expect(retry).toHaveBeenCalledTimes(1);
+	} finally {
+		vi.useRealTimers();
+	}
+});
+
 function issuePayload(number: number, body: string) {
 	return {
 		number,

@@ -443,6 +443,7 @@ function storeResult<T>(
 }
 
 const backgroundRefreshes = new Set<string>();
+const BACKGROUND_REFRESH_TIMEOUT_MS = 30_000;
 
 function scheduleBackgroundRefresh<T>(
 	authKey: string,
@@ -456,8 +457,13 @@ function scheduleBackgroundRefresh<T>(
 	if (backgroundRefreshes.has(key)) return;
 	backgroundRefreshes.add(key);
 	queueMicrotask(async () => {
+		const { promise: timeoutPromise, reject: rejectTimeout } = Promise.withResolvers<never>();
+		const timeoutHandle = setTimeout(
+			() => rejectTimeout(new Error("background refresh timed out")),
+			BACKGROUND_REFRESH_TIMEOUT_MS,
+		);
 		try {
-			const fresh = await fetchFresh();
+			const fresh = await Promise.race([fetchFresh(), timeoutPromise]);
 			storeResult(authKey, repo, kind, number, includeComments, fresh, Date.now());
 		} catch (err) {
 			logger.debug("github cache: background refresh failed", {
@@ -467,6 +473,7 @@ function scheduleBackgroundRefresh<T>(
 				number,
 			});
 		} finally {
+			clearTimeout(timeoutHandle);
 			backgroundRefreshes.delete(key);
 		}
 	});
