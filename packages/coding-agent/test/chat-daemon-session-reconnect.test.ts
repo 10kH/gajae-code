@@ -826,7 +826,7 @@ test("an unreachable attached chat session exhausts its long-lived reconnect bud
 }, 20_000);
 
 test("an established chat attachment that loses its open socket resumes from its last acknowledged event", async () => {
-	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile }) => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile, awaitFrameSettlement }) => {
 		await withSerializedFakeTransport(async () => {
 			const host = new FakeSessionHost();
 			const starting = runtime.start();
@@ -834,7 +834,8 @@ test("an established chat attachment that loses its open socket resumes from its
 			await starting;
 
 			host.emit("before the drop");
-			await awaitCompletedPosts(provider, 1);
+			await awaitFrameSettlement(GENERATION, 1);
+			expect(provider.posts).toHaveLength(1);
 
 			// Drop the already-attached, already-active socket, then keep the session
 			// producing: these events exist only in the host's log until delivery resumes.

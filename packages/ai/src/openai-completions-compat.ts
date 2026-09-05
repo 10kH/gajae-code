@@ -48,6 +48,35 @@ function parseHostname(baseUrl: string): string | undefined {
 	}
 }
 
+function isProductionXaiApiUrl(baseUrl: string): boolean {
+	if (
+		/[\u0000-\u0020\u007f]/u.test(baseUrl) ||
+		baseUrl.includes("?") ||
+		baseUrl.includes("#") ||
+		baseUrl.includes("\\")
+	) {
+		return false;
+	}
+	const authorityTail = baseUrl.slice("https://".length);
+	const authorityEnd = authorityTail.search(/[/?#]/u);
+	const authority = authorityTail.slice(0, authorityEnd === -1 ? undefined : authorityEnd);
+	if (!/^api\.x\.ai(?::443)?$/iu.test(authority)) return false;
+	try {
+		const url = new URL(baseUrl);
+		return (
+			url.protocol === "https:" &&
+			url.hostname.toLowerCase() === "api.x.ai" &&
+			url.port === "" &&
+			url.username === "" &&
+			url.password === "" &&
+			url.search === "" &&
+			url.hash === ""
+		);
+	} catch {
+		return false;
+	}
+}
+
 function hostnameMatches(hostname: string | undefined, suffix: string): boolean {
 	return hostname !== undefined && (hostname === suffix || hostname.endsWith(`.${suffix}`));
 }
@@ -93,7 +122,7 @@ export function parseDirectXaiReasoningEffortGeneration(
 ): GrokGeneration | undefined {
 	if (model.provider !== "xai") return undefined;
 	if (model.api !== "openai-completions") return undefined;
-	if (parseHostname(resolvedBaseUrl ?? model.baseUrl ?? "") !== "api.x.ai") return undefined;
+	if (!isProductionXaiApiUrl(resolvedBaseUrl ?? model.baseUrl ?? "")) return undefined;
 	if (model.id.includes("/")) return undefined;
 	const generation = parseGrokGeneration(model.id);
 	if (!generation) return undefined;

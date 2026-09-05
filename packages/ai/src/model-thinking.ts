@@ -1,3 +1,4 @@
+import { supportsBedrockClaudePromptCaching } from "./bedrock-claude-cache-policy";
 import {
 	CODEX_GENERIC_CONTEXT_WINDOW,
 	CODEX_GPT_5_6_CONTEXT_CAP,
@@ -549,6 +550,13 @@ function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
 	}
 	if (parsedModel.family === "openai") {
 		applyOpenAICatalogPolicy(model, parsedModel);
+	}
+	if (model.provider === "amazon-bedrock" && model.api === "bedrock-converse-stream") {
+		const cacheSupport = supportsBedrockClaudePromptCaching(model.id);
+		if (cacheSupport === false) {
+			model.cost.cacheRead = 0;
+			model.cost.cacheWrite = 0;
+		}
 	}
 	// GLM-5.2 (Zhipu/ZAI): ships a 1M lossless context window, but the bundled
 	// catalog copied GLM-5.1's 200K and that stale value survives generate-models
