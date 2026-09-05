@@ -201,6 +201,94 @@ describe("registry fingerprint admission", () => {
 		}
 	});
 
+	test.each([
+		"replace",
+		"remove",
+	] as const)("rejects sync payload %s after reading and closes its fd", async action => {
+		await Bun.write(control, "{}");
+		const replacement = path.join(root, "replacement.json");
+		await Bun.write(replacement, "{}");
+		const realStat = fsSync.fstatSync;
+		let fd: number | undefined;
+		let statCalls = 0;
+		const readSpy = spyOn(fsSync, "readSync");
+		const closeSpy = spyOn(fsSync, "closeSync");
+		const statSpy = spyOn(fsSync, "fstatSync").mockImplementation(((
+			openedFd: number,
+			options?: fsSync.StatOptions,
+		) => {
+			fd = openedFd;
+			if (++statCalls === 2) {
+				expect(readSpy.mock.results.map(result => result.value)).toEqual([2, 0]);
+				if (action === "replace") fsSync.renameSync(replacement, control);
+				else fsSync.unlinkSync(control);
+			}
+			return realStat(openedFd, options);
+		}) as typeof fsSync.fstatSync);
+		try {
+			const result = loadAcceptedModelPresetRegistry(root, { manifestUrl: "https://example.com/registry.json" });
+			expect(result.error).toBe("Registry cache path changed while reading.");
+			expect(statCalls).toBe(2);
+			expect(closeSpy.mock.calls).toEqual([[fd!]]);
+			expect(() => realStat(fd!)).toThrow(/bad file descriptor|EBADF/i);
+		} finally {
+			statSpy.mockRestore();
+			closeSpy.mockRestore();
+			readSpy.mockRestore();
+		}
+	});
+
+	test.each([
+		"replace",
+		"remove",
+	] as const)("rejects async payload %s after reading and closes its handle", async action => {
+		await Bun.write(control, "{}");
+		const replacement = path.join(root, "replacement.json");
+		await Bun.write(replacement, "{}");
+		const realOpen = fs.open;
+		let statCalls = 0;
+		let handle: fs.FileHandle | undefined;
+		const restores: (() => void)[] = [];
+		let closeSpy: { mock: { calls: readonly unknown[][] } } | undefined;
+		const openSpy = spyOn(fs, "open").mockImplementation(async (...args) => {
+			const opened = await realOpen(...args);
+			if (String(args[0]) === control) {
+				handle = opened;
+				const realStat = opened.stat.bind(opened);
+				const readSpy = spyOn(opened, "read");
+				const statSpy = spyOn(opened, "stat").mockImplementation((async (options?: fsSync.StatOptions) => {
+					if (++statCalls === 2) {
+						const reads = await Promise.all(readSpy.mock.results.map(result => result.value));
+						expect(reads).toMatchObject([{ bytesRead: 2 }, { bytesRead: 0 }]);
+						if (action === "replace") await fs.rename(replacement, control);
+						else await fs.unlink(control);
+					}
+					return realStat(options);
+				}) as typeof opened.stat);
+				const close = spyOn(opened, "close");
+				closeSpy = close;
+				restores.push(
+					() => readSpy.mockRestore(),
+					() => statSpy.mockRestore(),
+					() => close.mockRestore(),
+				);
+			}
+			return opened;
+		});
+		try {
+			const result = await loadAcceptedModelPresetRegistryAsync(root, {
+				manifestUrl: "https://example.com/registry.json",
+			});
+			expect(result.error).toBe("Registry cache path changed while reading.");
+			expect(statCalls).toBe(2);
+			expect(closeSpy?.mock.calls).toHaveLength(1);
+			expect(handle?.fd).toBe(-1);
+		} finally {
+			openSpy.mockRestore();
+			for (const restore of restores) restore();
+		}
+	});
+
 	test.each(["sync", "async"] as const)("rejects %s symlinks without hashing their target", async mode => {
 		await Bun.write(path.join(root, "target.json"), "{}");
 		await fs.mkdir(path.dirname(control), { recursive: true });
