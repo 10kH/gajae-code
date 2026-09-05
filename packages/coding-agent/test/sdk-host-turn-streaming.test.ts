@@ -2,12 +2,21 @@ import { describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Agent } from "@gajae-code/agent-core";
+import { createMockModel } from "@gajae-code/ai/providers/mock";
+import { ModelRegistry } from "../src/config/model-registry";
+import { Settings } from "../src/config/settings";
 import type { ExtensionAPI, ExtensionContext } from "../src/extensibility/extensions";
+import { ExtensionRuntime, loadExtensionFromFactory } from "../src/extensibility/extensions/loader";
+import { ExtensionRunner } from "../src/extensibility/extensions/runner";
 import { mapAgentWireEventPayloadToAcpSessionUpdates } from "../src/modes/acp/acp-event-mapper";
 import { toAgentWireEventPayload } from "../src/modes/shared/agent-wire/event-envelope";
 import { createSdkSessionRuntimeExtension } from "../src/sdk/host/session-runtime";
 import type { SdkFrame } from "../src/sdk/host/types";
-import type { AgentSessionEvent } from "../src/session/agent-session";
+import { AgentSession, type AgentSessionEvent } from "../src/session/agent-session";
+import { AuthStorage } from "../src/session/auth-storage";
+import { SessionManager } from "../src/session/session-manager";
+import { EventBus } from "../src/utils/event-bus";
 
 /**
  * The SDK-only host streams turn content to the connections that submitted the
@@ -99,9 +108,10 @@ async function waitFor(predicate: () => boolean, label: string, timeoutMs = 2_00
 async function createHostHarness(
 	sessionId: string,
 	cwd: string,
-	harnessOptions: { settleSubmission?: "never" | "resolve" } = {},
+	harnessOptions: { settleSubmission?: "never" | "resolve"; onSessionEvent?: ExtensionContext["onSessionEvent"] } = {},
 ): Promise<HostHarness> {
 	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
+	const listeners = new Set<(event: AgentSessionEvent) => void>();
 	const waiters = new Map<string, (frame: ControlResponse) => void>();
 	const sent: Array<{ connectionId: string; frame: SdkFrame }> = [];
 	const broadcasts: SdkFrame[] = [];
@@ -158,6 +168,14 @@ async function createHostHarness(
 		sdkBindings: () => [],
 		isIdle: () => idle,
 		abort: () => {},
+		onSessionEvent:
+			harnessOptions.onSessionEvent ??
+			((listener: (event: AgentSessionEvent) => void) => {
+				listeners.add(listener);
+				return () => {
+					listeners.delete(listener);
+				};
+			}),
 		sessionManager: {
 			getSessionId: () => sessionId,
 			getSessionFile: () => path.join(cwd, ".gjc", "state", `${sessionId}.jsonl`),
@@ -175,6 +193,7 @@ async function createHostHarness(
 			return promise;
 		},
 		emit: async (event, payload = {}) => {
+			for (const listener of listeners) listener(payload as AgentSessionEvent);
 			await handlers.get(event)?.(payload, ctx);
 		},
 		clearFrames: () => {
@@ -268,6 +287,101 @@ describe("streamed turn frames", () => {
 });
 
 describe("SDK host turn streaming", () => {
+	test("preserves producer order while a message_update extension handler is blocked", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-stream-order-"));
+		const gate = Promise.withResolvers<void>();
+		const entered = Promise.withResolvers<void>();
+		const authStorage = await AuthStorage.create(":memory:");
+		authStorage.setRuntimeApiKey("mock", "test-key");
+		const modelRegistry = new ModelRegistry(authStorage);
+		const sessionManager = SessionManager.inMemory(cwd);
+		const extensionRuntime = new ExtensionRuntime();
+		const eventBus = new EventBus();
+		let harness: HostHarness | undefined;
+		const extension = await loadExtensionFromFactory(
+			api => {
+				api.on("message_update", async event => {
+					entered.resolve();
+					await gate.promise;
+					await harness?.emit("message_update", event);
+				});
+				api.on("message_end", event => harness?.emit("message_end", event));
+				api.on("tool_execution_start", event => harness?.emit("tool_execution_start", event));
+				api.on("tool_execution_update", event => harness?.emit("tool_execution_update", event));
+				api.on("tool_execution_end", event => harness?.emit("tool_execution_end", event));
+			},
+			cwd,
+			eventBus,
+			extensionRuntime,
+		);
+		const mock = createMockModel({
+			responses: [
+				{ content: ["hello", " world", { type: "toolCall", id: "call_1", name: "read", arguments: {} }] },
+				{ content: [] },
+			],
+		});
+		const session = new AgentSession({
+			agent: new Agent({ initialState: { model: mock.model, tools: [], messages: [] }, streamFn: mock.stream }),
+			sessionManager,
+			settings: Settings.isolated({ "compaction.enabled": false, "todo.reminders": false }),
+			modelRegistry,
+			extensionRunner: new ExtensionRunner([extension], extensionRuntime, cwd, sessionManager, modelRegistry),
+		});
+		const produced: AgentSessionEvent[] = [];
+		const kinds = new Set([
+			"message_update",
+			"message_end",
+			"tool_execution_start",
+			"tool_execution_update",
+			"tool_execution_end",
+		]);
+		session.subscribe(event => {
+			if (kinds.has(event.type)) produced.push(event);
+		});
+		harness = await createHostHarness(SESSION_ID, cwd, { onSessionEvent: listener => session.subscribe(listener) });
+		let prompt: Promise<void> | undefined;
+		try {
+			await harness.control("turn.prompt", { text: "stream this" });
+			await harness.emit("agent_start");
+			harness.clearFrames();
+			prompt = session.prompt("stream this");
+			await entered.promise;
+			await waitFor(
+				() => produced.some(event => event.type === "tool_execution_start"),
+				"tool start while extension is blocked",
+			);
+			const frames = () =>
+				harness!.sent.filter(entry => entry.frame.type === "event" && kinds.has(String(entry.frame.kind)));
+			expect(frames().map(entry => entry.frame.kind)).toEqual(produced.map(event => event.type));
+			const final = produced.find(event => event.type === "message_end" && event.message.role === "assistant");
+			expect(final).toMatchObject({
+				message: {
+					content: [{ type: "text", text: "hello" }, { type: "text", text: " world" }, { type: "toolCall" }],
+				},
+			});
+			gate.resolve();
+			await prompt;
+			expect(frames().map(entry => entry.frame.payload)).toEqual(produced.map(toAgentWireEventPayload));
+			const textEvents = produced.flatMap(event =>
+				event.type === "message_update" && event.assistantMessageEvent.type === "text_delta"
+					? [event.assistantMessageEvent.delta]
+					: [],
+			);
+			expect(textEvents.join("")).toBe("hello world");
+			const finalIndex = produced.indexOf(final!);
+			expect(finalIndex).toBeGreaterThan(produced.findIndex(event => event.type === "message_update"));
+			expect(produced.findIndex(event => event.type === "tool_execution_start")).toBeGreaterThan(finalIndex);
+			expect(frames().every(entry => entry.connectionId === "client")).toBe(true);
+			expect(harness.broadcasts.filter(frame => kinds.has(String(frame.kind)))).toEqual([]);
+		} finally {
+			gate.resolve();
+			await prompt?.catch(() => {});
+			await harness.stop();
+			await session.dispose();
+			authStorage.close();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
 	test("sends one message update only to the accepted prompt owner", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-stream-owner-"));
 		const harness = await createHostHarness(SESSION_ID, cwd);

@@ -2628,6 +2628,19 @@ function createControlSurface(
 							// so their recovery owner is this bounded in-place retry loop: the same
 							// order, retried, until both writes land or the budget is spent.
 							const attemptRejectionTerminalization = async (remaining: number): Promise<void> => {
+								// AgentSession can reject cleanup after its durable terminal was published.
+								// That rejection is diagnostic, not another outcome for this correlation.
+								const record = reconciliation.lookup(kind, correlation) as { status?: string };
+								if (record.status === "terminal_ok" || record.status === "failed") {
+									logger.warn("SDK submission cleanup failed after terminal publication", {
+										kind,
+										commandId: correlation.commandId,
+										turnId: correlation.turnId,
+										error: sanitizePromptFailure(error),
+									});
+									retirePendingOwner?.(kind, correlation, "always");
+									return;
+								}
 								try {
 									await reconciliation.noteTransition(kind, correlation, { type: "agent_failed", error });
 								} catch {
@@ -4231,6 +4244,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		terminalOutcome?: InvocationOutcome,
 		stopReason?: AgentEndEvent["stopReason"],
 		startToken?: string,
+		startTokens?: string[],
 	): Promise<void> => {
 		const current = lifecycleOwner?.state ?? active;
 		if (!current) return;
@@ -4305,10 +4319,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			// turn (queued-while-streaming submissions never push), so a mid-prompt
 			// continuation agent_start with an empty queue leaves the current owner
 			// untouched (review thread P1).
+			const cohort = new Set(startTokens);
+			if (startToken) cohort.add(startToken);
 			const matchingPending =
-				typeof startToken === "string" && startToken.length > 0
-					? current.pending.filter(entry => entry.sdkRunToken === startToken)
-					: current.pending.slice();
+				cohort.size > 0 ? current.pending.filter(entry => cohort.has(entry.sdkRunToken)) : current.pending.slice();
 			const matchingKeys = new Set(matchingPending.map(entry => entry.sdkRunToken));
 			const pendingSnapshot = current.pending.splice(0);
 			const drained = pendingSnapshot
@@ -4326,12 +4340,11 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					attachedInvocations: [],
 				};
 				current.openLifecycleBatches.push(batch);
-				if (typeof startToken === "string" && startToken.length > 0) {
-					const entry = drained.find(item => item.sdkRunToken === startToken);
-					lifecycleRunOwners.set(startToken, {
+				for (const entry of drained) {
+					lifecycleRunOwners.set(entry.sdkRunToken, {
 						state: current,
 						batch,
-						...(entry ? { correlationKey: lifecycleCorrelationKey(entry.correlation) } : {}),
+						correlationKey: lifecycleCorrelationKey(entry.correlation),
 					});
 				}
 				adoptLifecycleBatch(drained);
@@ -4599,6 +4612,14 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						observed = false;
 					}
 				}
+			} else if (type === "agent_start" && transitions.length > 0) {
+				for (const invocation of transitions) {
+					try {
+						current.runtime.emitEvent({ type, sessionId, ...invocation.correlation });
+					} catch {
+						observed = false;
+					}
+				}
 			} else if (type === "agent_end" && transitions.length > 0) {
 				// An invocation-owned terminal must carry the identity it was accepted
 				// under and the normalized outcome. A client that submitted this turn
@@ -4621,9 +4642,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					}
 				}
 			} else {
-				// Everything that does not terminalize an owned invocation keeps the one
-				// uncorrelated frame: `agent_start` and a host-originated run (autonomous
-				// continuation, cron, monitor) that owns no invocation.
+				// Host-originated runs without an invocation keep an uncorrelated frame.
 				try {
 					current.runtime.emitEvent({ type, sessionId });
 				} catch {
@@ -4704,6 +4723,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					undefined,
 					undefined,
 					typeof event.sdkRunToken === "string" ? event.sdkRunToken : undefined,
+					event.sdkRunTokens,
 				),
 			owner,
 		);
@@ -4899,8 +4919,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				? (current.attachedInvocations ?? [])
 				: [];
 		if (invocations.length === 0) return;
-		// The handlers below also renew prompt deadlines, so streaming must never
-		// throw out of them: a frame the wire producer does not recognize is dropped.
+		// Content bypasses the lifecycle replay ring and must never interrupt its producer.
 		if (!event || typeof event.type !== "string" || !STREAMED_TURN_EVENT_TYPES.has(event.type)) return;
 		try {
 			const payload = toAgentWireEventPayload(event as AgentSessionEvent);
@@ -4919,22 +4938,11 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			// Streamed content is best-effort; the turn producing it is authoritative.
 		}
 	};
-	api.on("tool_execution_start", async (event, ctx) => {
+	api.on("tool_execution_start", async (_event, ctx) => {
 		renewAttributableProgress("tool_execution_start", ctx);
-		streamTurnEvent(event, ctx);
 	});
-	api.on("tool_execution_update", async (event, ctx) => {
-		streamTurnEvent(event, ctx);
-	});
-	api.on("tool_execution_end", async (event, ctx) => {
+	api.on("tool_execution_end", async (_event, ctx) => {
 		renewAttributableProgress("tool_execution_end", ctx);
-		streamTurnEvent(event, ctx);
-	});
-	api.on("message_update", async (event, ctx) => {
-		streamTurnEvent(event, ctx);
-	});
-	api.on("message_end", async (event, ctx) => {
-		streamTurnEvent(event, ctx);
 	});
 	const errorCode = (error: unknown): string | undefined =>
 		typeof error === "object" &&
@@ -5598,9 +5606,15 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				});
 			}
 		});
+		// Extension message_update hooks are queued while final/tool hooks are not.
+		// Use only the synchronous session boundary so those paths cannot reorder or duplicate content.
+		const disposeStream = ctx.onSessionEvent?.(event => {
+			if (STREAMED_TURN_EVENT_TYPES.has(event.type)) streamTurnEvent(event, ctx);
+		});
 		const disposeGate = (): void => {
 			disposeWorkflowGate?.();
 			disposeFold?.();
+			disposeStream?.();
 		};
 		let publishedEndpointUrl: string | undefined;
 		let brokerRegistered = false;
