@@ -101,6 +101,11 @@ export interface MCPStdioSpawnLaunch {
 	cwd: string;
 }
 
+export interface MCPStdioPreparedLaunch extends MCPStdioSpawnLaunch {
+	/** Per-attempt cleanup, run after confirmed child exit or failed spawn. */
+	afterProcessExit?: () => Promise<void>;
+}
+
 export interface MCPStdioServerConfig extends MCPServerConfigBase {
 	type?: "stdio"; // Default if not specified
 	command: string;
@@ -114,8 +119,12 @@ export interface MCPStdioServerConfig extends MCPServerConfigBase {
 	 */
 	noInheritEnv?: boolean;
 	cwd?: string;
+	/** Internal trusted-boundary preparation of immutable per-spawn authority. */
+	prepareSpawn?: (launch: MCPStdioSpawnLaunch) => Promise<MCPStdioPreparedLaunch>;
 	/** Internal trusted-boundary check run immediately before process creation. */
 	spawnGuard?: (launch: MCPStdioSpawnLaunch) => Promise<void>;
+	/** Internal cleanup run only after the owned stdio child is confirmed exited. */
+	afterProcessExit?: () => Promise<void>;
 	/** Test seam for deterministic mutation after the guard and before process creation. */
 	afterSpawnGuardForTest?: () => Promise<void>;
 }

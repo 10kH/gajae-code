@@ -23,6 +23,43 @@ import {
 } from "./types";
 import { validateBinding } from "./validation";
 
+const PLUGIN_FILE_MAX_BYTES = 16 * 1024 * 1024;
+
+async function readBoundedFile(absPath: string, rel: string): Promise<Buffer> {
+	const handle = await fs.open(absPath, "r");
+	try {
+		const before = await handle.stat();
+		if (!before.isFile() || before.size > PLUGIN_FILE_MAX_BYTES) {
+			throw new GjcPluginLoadError(
+				"security_policy",
+				`GJC plugin file exceeds ${PLUGIN_FILE_MAX_BYTES} bytes: ${rel}`,
+			);
+		}
+		const chunks: Buffer[] = [];
+		let offset = 0;
+		for (;;) {
+			const remaining = PLUGIN_FILE_MAX_BYTES + 1 - offset;
+			if (remaining <= 0)
+				throw new GjcPluginLoadError(
+					"security_policy",
+					`GJC plugin file exceeds ${PLUGIN_FILE_MAX_BYTES} bytes: ${rel}`,
+				);
+			const chunk = Buffer.allocUnsafe(Math.min(1024 * 1024, remaining));
+			const { bytesRead } = await handle.read(chunk, 0, chunk.byteLength, offset);
+			if (bytesRead === 0) break;
+			chunks.push(chunk.subarray(0, bytesRead));
+			offset += bytesRead;
+		}
+		const after = await handle.stat();
+		if (before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) {
+			throw new GjcPluginLoadError("security_policy", `GJC plugin file changed while reading: ${rel}`);
+		}
+		return Buffer.concat(chunks, offset);
+	} finally {
+		await handle.close();
+	}
+}
+
 function sha256(bytes: Buffer | string): string {
 	return createHash("sha256").update(bytes).digest("hex");
 }
@@ -109,7 +146,7 @@ async function hashFile(
 ): Promise<{ sha256: string; bytes: number }> {
 	let buf: Buffer;
 	try {
-		buf = await fs.readFile(absPath);
+		buf = await readBoundedFile(absPath, rel);
 	} catch (error) {
 		throw new GjcPluginLoadError("missing_file", `Missing GJC plugin file at ${absPath}`, {
 			cause: error instanceof Error ? error : undefined,
