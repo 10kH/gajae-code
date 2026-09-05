@@ -28,6 +28,55 @@ function identityConverter(messages: AgentMessage[]): Message[] {
 }
 
 describe("agentLoop with AgentMessage", () => {
+	it("forwards provider conversation authority separately from generic session affinity", async () => {
+		const mock = createMockModel({ responses: [{ content: ["ok"] }] });
+		const captured: Array<{ sessionId?: string; providerSessionId?: string }> = [];
+		const stream = agentLoop(
+			[createUserMessage("Hello")],
+			{ systemPrompt: ["You are helpful."], messages: [], tools: [] },
+			{
+				model: mock.model,
+				convertToLlm: identityConverter,
+				sessionId: "logical-session",
+				providerSessionId: "opaque-provider-session",
+			},
+			undefined,
+			(model, context, options) => {
+				captured.push({ sessionId: options?.sessionId, providerSessionId: options?.providerSessionId });
+				return mock.stream(model, context, options);
+			},
+		);
+
+		for await (const _event of stream) {
+			// drain
+		}
+
+		expect(captured).toEqual([
+			{ sessionId: "opaque-provider-session", providerSessionId: "opaque-provider-session" },
+		]);
+	});
+
+	it("does not manufacture provider conversation authority from a logical session ID", async () => {
+		const mock = createMockModel({ responses: [{ content: ["ok"] }] });
+		const captured: Array<{ sessionId?: string; providerSessionId?: string }> = [];
+		const stream = agentLoop(
+			[createUserMessage("Hello")],
+			{ systemPrompt: ["You are helpful."], messages: [], tools: [] },
+			{ model: mock.model, convertToLlm: identityConverter, sessionId: "logical-session" },
+			undefined,
+			(model, context, options) => {
+				captured.push({ sessionId: options?.sessionId, providerSessionId: options?.providerSessionId });
+				return mock.stream(model, context, options);
+			},
+		);
+
+		for await (const _event of stream) {
+			// drain
+		}
+
+		expect(captured).toEqual([{ sessionId: "logical-session", providerSessionId: undefined }]);
+	});
+
 	it("forwards first-event timeout overrides to provider stream options", async () => {
 		for (const testCase of [
 			{ name: "absent", timeout: undefined },

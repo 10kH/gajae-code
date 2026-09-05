@@ -444,6 +444,13 @@ export interface StreamOptions {
 	 */
 	sessionId?: string;
 	/**
+	 * Opaque conversation identity owned by the calling agent/session lifecycle.
+	 * Unlike `sessionId`, this MUST NOT be synthesized from prompts, credentials,
+	 * paths, cache keys, or other request content. Providers with a dedicated
+	 * conversation header may use this only when their endpoint policy permits it.
+	 */
+	providerSessionId?: string;
+	/**
 	 * Provider-scoped mutable state store for this agent session.
 	 * Providers can use this to persist transport/session state between turns.
 	 */

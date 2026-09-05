@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { buildAuthGatewayStreamOptionsForTest } from "../src/auth-gateway/server";
 import { encodeResponse, encodeStream, parseRequest } from "../src/providers/openai-chat-server";
 import type { AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream } from "../src/types";
 
@@ -56,6 +57,27 @@ function emptyAssistant(): AssistantMessage {
 }
 
 describe("auth-gateway openai-chat: parseRequest", () => {
+	it("keeps prompt-derived cache affinity separate from provider conversation authority", () => {
+		const first = parseRequest({
+			model: "kimi-k2.5",
+			messages: [{ role: "user", content: "first prompt" }],
+		});
+		const second = parseRequest({
+			model: "kimi-k2.5",
+			messages: [{ role: "user", content: "different prompt" }],
+			prompt_cache_key: "caller-cache-key",
+		});
+
+		const firstOptions = buildAuthGatewayStreamOptionsForTest(first, "openai-completions");
+		const secondOptions = buildAuthGatewayStreamOptionsForTest(second, "openai-completions");
+
+		expect(firstOptions.sessionId).toBeDefined();
+		expect(firstOptions.sessionId).not.toBe(secondOptions.sessionId);
+		expect(secondOptions.sessionId).toBe("caller-cache-key");
+		expect(firstOptions.providerSessionId).toBeUndefined();
+		expect(secondOptions.providerSessionId).toBeUndefined();
+	});
+
 	it("converts a full request into a Context", () => {
 		const parsed = parseRequest({
 			model: "gpt-5.2",

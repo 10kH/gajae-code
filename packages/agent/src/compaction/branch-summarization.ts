@@ -91,6 +91,8 @@ export interface GenerateBranchSummaryOptions {
 	 * reuses the live turn's provider/WebSocket session.
 	 */
 	sessionId?: string;
+	/** Opaque provider conversation identity; never derived from branch-summary content. */
+	providerSessionId?: string;
 	/** Shared provider state map so the branch summary call reuses session-scoped transport/session caches. */
 	providerSessionState?: Map<string, ProviderSessionState>;
 	/** Hint that websocket transport should be preferred when supported by the provider implementation. */
@@ -291,6 +293,7 @@ export async function generateBranchSummary(
 		reserveTokens = 16384,
 		metadata,
 		sessionId,
+		providerSessionId,
 		providerSessionState,
 		preferWebsockets,
 	} = options;
@@ -326,7 +329,16 @@ export async function generateBranchSummary(
 	const response = await instrumentedCompleteSimple(
 		model,
 		{ systemPrompt: [SUMMARIZATION_SYSTEM_PROMPT], messages: summarizationMessages },
-		{ apiKey, signal, maxTokens: 2048, metadata, sessionId, providerSessionState, preferWebsockets },
+		{
+			apiKey,
+			signal,
+			maxTokens: 2048,
+			metadata,
+			sessionId,
+			providerSessionId,
+			providerSessionState,
+			preferWebsockets,
+		},
 		{ telemetry: options.telemetry, oneshotKind: "branch_summary" },
 	);
 

@@ -19722,12 +19722,15 @@ export class AgentSession {
 	 */
 	#maintenanceProviderTransport(): {
 		sessionId: string | undefined;
+		providerSessionId: string | undefined;
 		providerSessionState: Map<string, ProviderSessionState>;
 		preferWebsockets: boolean | undefined;
 		remoteCompactionFallbackHealth: RemoteCompactionFallbackHealthHooks;
 	} {
+		const providerSessionId = this.agent.providerSessionId ?? this.agent.sessionId;
 		return {
-			sessionId: this.agent.providerSessionId ?? this.agent.sessionId,
+			sessionId: providerSessionId,
+			providerSessionId,
 			providerSessionState: this.#providerSessionState,
 			preferWebsockets: this.agent.preferWebsockets,
 			remoteCompactionFallbackHealth: this.#remoteCompactionFallbackHealth,
