@@ -250,16 +250,38 @@ describe("registry fingerprint admission", () => {
 		let handle: fs.FileHandle | undefined;
 		const restores: (() => void)[] = [];
 		let closeSpy: { mock: { calls: readonly unknown[][] } } | undefined;
+		const realFile = Bun.file;
+		let readCompleted = false;
+		const fileSpy = spyOn(Bun, "file").mockImplementation((value, ...args) => {
+			const file = realFile(value as string, ...args);
+			if (typeof value === "number" && value === handle?.fd) {
+				const realSlice = file.slice.bind(file);
+				const sliceSpy = spyOn(file, "slice").mockImplementation(
+					(start?: number | string, end?: number | string, contentType?: string) => {
+						const slice = realSlice(start as number | undefined, end as number | undefined, contentType);
+						const realRead = slice.arrayBuffer.bind(slice);
+						const readSpy = spyOn(slice, "arrayBuffer").mockImplementation(async () => {
+							const bytes = await realRead();
+							expect(Buffer.from(bytes).toString()).toBe("{}");
+							readCompleted = true;
+							return bytes;
+						});
+						restores.push(() => readSpy.mockRestore());
+						return slice;
+					},
+				);
+				restores.push(() => sliceSpy.mockRestore());
+			}
+			return file;
+		});
 		const openSpy = spyOn(fs, "open").mockImplementation(async (...args) => {
 			const opened = await realOpen(...args);
 			if (String(args[0]) === control) {
 				handle = opened;
 				const realStat = opened.stat.bind(opened);
-				const readSpy = spyOn(opened, "read");
 				const statSpy = spyOn(opened, "stat").mockImplementation((async (options?: fsSync.StatOptions) => {
 					if (++statCalls === 2) {
-						const reads = await Promise.all(readSpy.mock.results.map(result => result.value));
-						expect(reads).toMatchObject([{ bytesRead: 2 }, { bytesRead: 0 }]);
+						expect(readCompleted).toBe(true);
 						if (action === "replace") await fs.rename(replacement, control);
 						else await fs.unlink(control);
 					}
@@ -268,7 +290,6 @@ describe("registry fingerprint admission", () => {
 				const close = spyOn(opened, "close");
 				closeSpy = close;
 				restores.push(
-					() => readSpy.mockRestore(),
 					() => statSpy.mockRestore(),
 					() => close.mockRestore(),
 				);
@@ -285,6 +306,7 @@ describe("registry fingerprint admission", () => {
 			expect(handle?.fd).toBe(-1);
 		} finally {
 			openSpy.mockRestore();
+			fileSpy.mockRestore();
 			for (const restore of restores) restore();
 		}
 	});
