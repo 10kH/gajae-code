@@ -1819,7 +1819,6 @@ test("a rolled endpoint's first frame gets its own delivery budget, not the prev
 				await reconcileSettled();
 				await awaitRefusals(provider, 2);
 				await awaitFrameSettlement(GENERATION, 1, 2);
-				await Bun.sleep(50);
 
 				// The endpoint rolls, so the replacement attachment opens a fresh sequence space
 				// whose seq 1 is a different frame. The rounds the old stream spent buy it
