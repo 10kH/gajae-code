@@ -2738,7 +2738,8 @@ export async function getOrFetchIssue(options: IssueViewLookupOptions): Promise<
 		}
 	}
 
-	const doFetch = () => fetchIssueViewFresh(options.cwd, repo, identifier, includeComments, options.signal);
+	const doFetch = (signal?: AbortSignal) =>
+		fetchIssueViewFresh(options.cwd, repo, identifier, includeComments, signal ?? options.signal);
 
 	if (!repo || cacheNumber === undefined) {
 		const fresh = await doFetch();
@@ -2752,6 +2753,7 @@ export async function getOrFetchIssue(options: IssueViewLookupOptions): Promise<
 		includeComments,
 		settings: options.settings,
 		authKey,
+		signal: options.signal,
 		fetchFresh: doFetch,
 	});
 	return {
@@ -2771,7 +2773,8 @@ export async function getOrFetchIssue(options: IssueViewLookupOptions): Promise<
 export async function getOrFetchPr(options: PrViewLookupOptions): Promise<ViewLookupResult<GhPrViewData>> {
 	const includeComments = options.includeComments ?? true;
 	const authKey = options.cacheAuthKey === undefined ? (resolveGithubCacheAuthKey() ?? null) : options.cacheAuthKey;
-	const doFetch = () => fetchPrViewFresh(options.cwd, options.repo, options.number, includeComments, options.signal);
+	const doFetch = (signal?: AbortSignal) =>
+		fetchPrViewFresh(options.cwd, options.repo, options.number, includeComments, signal ?? options.signal);
 	const lookup = await getOrFetchView<GhPrViewData>({
 		repo: options.repo,
 		kind: "pr",
@@ -2779,6 +2782,7 @@ export async function getOrFetchPr(options: PrViewLookupOptions): Promise<ViewLo
 		includeComments,
 		settings: options.settings,
 		authKey,
+		signal: options.signal,
 		fetchFresh: doFetch,
 	});
 	return {
@@ -3121,7 +3125,8 @@ async function fetchPrDiffFresh(
  */
 export async function getOrFetchPrDiff(options: PrDiffLookupOptions): Promise<ViewLookupResult<PrDiffPayload>> {
 	const authKey = options.cacheAuthKey === undefined ? (resolveGithubCacheAuthKey() ?? null) : options.cacheAuthKey;
-	const doFetch = () => fetchPrDiffFresh(options.cwd, options.repo, options.number, options.signal);
+	const doFetch = (signal?: AbortSignal) =>
+		fetchPrDiffFresh(options.cwd, options.repo, options.number, signal ?? options.signal);
 	const lookup = await getOrFetchView<PrDiffPayload>({
 		repo: options.repo,
 		kind: "pr-diff",
@@ -3129,6 +3134,7 @@ export async function getOrFetchPrDiff(options: PrDiffLookupOptions): Promise<Vi
 		includeComments: false,
 		settings: options.settings,
 		authKey,
+		signal: options.signal,
 		fetchFresh: doFetch,
 	});
 	return {

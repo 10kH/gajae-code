@@ -115,7 +115,15 @@ it("releases a stale refresh marker when the fetch never settles", async () => {
 		putCached({ ...row, payload: "old", rendered: "old", sourceUrl: "url", fetchedAt: now - 2_000 });
 		const settings = Settings.isolated({ "github.cache.softTtlSec": 1, "github.cache.hardTtlSec": 60 });
 		const never = Promise.withResolvers<{ payload: string; rendered: string; sourceUrl: string }>();
-		await getOrFetchView({ ...row, settings, now, fetchFresh: () => never.promise });
+		await getOrFetchView({
+			...row,
+			settings,
+			now,
+			fetchFresh: signal => {
+				signal?.addEventListener("abort", () => never.reject(new Error("aborted")), { once: true });
+				return never.promise;
+			},
+		});
 		await Promise.resolve();
 		await getOrFetchView({
 			...row,
@@ -128,8 +136,7 @@ it("releases a stale refresh marker when the fetch never settles", async () => {
 		await Promise.resolve();
 		await Promise.resolve();
 		vi.advanceTimersByTime(30_000);
-		await Promise.resolve();
-		await Promise.resolve();
+		for (let index = 0; index < 8; index += 1) await Promise.resolve();
 		const retry = vi.fn(async () => ({ payload: "retry", rendered: "retry", sourceUrl: "url" }));
 		await getOrFetchView({ ...row, settings, now, fetchFresh: retry });
 		await Promise.resolve();

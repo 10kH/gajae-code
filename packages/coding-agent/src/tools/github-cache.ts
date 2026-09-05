@@ -365,9 +365,10 @@ export interface CacheLookupOptions<T> {
 	 * must bypass persistent cache reads/writes.
 	 */
 	authKey?: string | null;
-	fetchFresh: () => Promise<FreshResult<T>>;
+	fetchFresh: (signal?: AbortSignal) => Promise<FreshResult<T>>;
 	settings?: Settings | undefined;
 	now?: number;
+	signal?: AbortSignal;
 }
 
 export type CacheStatus = "miss" | "fresh" | "stale" | "disabled";
@@ -451,21 +452,25 @@ function scheduleBackgroundRefresh<T>(
 	kind: CacheKind,
 	number: number,
 	includeComments: boolean,
-	fetchFresh: () => Promise<FreshResult<T>>,
+	fetchFresh: (signal?: AbortSignal) => Promise<FreshResult<T>>,
 ): void {
 	const key = JSON.stringify([authKey, normalizeRepo(repo), kind, number, includeComments]);
 	if (backgroundRefreshes.has(key)) return;
 	backgroundRefreshes.add(key);
 	queueMicrotask(async () => {
+		const controller = new AbortController();
+		const fetchPromise = fetchFresh(controller.signal);
 		const { promise: timeoutPromise, reject: rejectTimeout } = Promise.withResolvers<never>();
 		const timeoutHandle = setTimeout(
 			() => rejectTimeout(new Error("background refresh timed out")),
 			BACKGROUND_REFRESH_TIMEOUT_MS,
 		);
 		try {
-			const fresh = await Promise.race([fetchFresh(), timeoutPromise]);
+			const fresh = await Promise.race([fetchPromise, timeoutPromise]);
 			storeResult(authKey, repo, kind, number, includeComments, fresh, Date.now());
 		} catch (err) {
+			controller.abort();
+			await fetchPromise.catch(() => undefined);
 			logger.debug("github cache: background refresh failed", {
 				err: String(err),
 				repo,
@@ -485,7 +490,7 @@ export async function getOrFetchView<T>(options: CacheLookupOptions<T>): Promise
 	const authKey = options.authKey === undefined ? DEFAULT_CACHE_AUTH_KEY : options.authKey;
 
 	if (!ttl.enabled || authKey === null) {
-		const fresh = await options.fetchFresh();
+		const fresh = await options.fetchFresh(options.signal);
 		return { ...fresh, status: "disabled", fetchedAt: now };
 	}
 
@@ -536,7 +541,7 @@ export async function getOrFetchView<T>(options: CacheLookupOptions<T>): Promise
 		}
 	}
 
-	const fresh = await options.fetchFresh();
+	const fresh = await options.fetchFresh(options.signal);
 	const fetchedAt = Date.now();
 	storeResult(authKey, options.repo, options.kind, options.number, options.includeComments, fresh, fetchedAt);
 	return { ...fresh, status: "miss", fetchedAt };
