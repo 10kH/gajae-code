@@ -107,8 +107,8 @@ Re-importing an already-imported session is a no-op: Paseo refuses it and GJC re
 success. A daemon that requires a password is skipped in the same quiet way — the socket probe cannot
 see that, because the TCP connect succeeds, so it is recognized from the CLI's refusal; export
 `PASEO_PASSWORD` if you want announcements to reach a protected daemon. Set `paseo.autoImport` back to
-`false` to stop announcing on future launches. An already-running process keeps its loaded setting;
-exit that session to cancel its pending or active announcement.
+`false` to stop announcing on future launches. Changing it inside the running Settings UI also cancels
+that process's pending or active attempt; a separate `gjc config set` process applies on the next launch.
 
 ### Lifecycle: GJC creates, you delete
 
@@ -184,7 +184,7 @@ grep 'Paseo session announcement' ~/.gjc/logs/gjc.$(date +%F).log | tail -1
 ```
 
 The `reason` names the exact gate that stopped it: `no-paseo-config`, `no-provider`, `cli-missing`,
-`daemon-unreachable`, `daemon-auth-required`, or `session-not-live`.
+`daemon-unreachable`, `unsupported-daemon-target`, `daemon-auth-required`, or `session-not-live`.
 
 #### Password-protected daemons
 

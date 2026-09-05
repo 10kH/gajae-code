@@ -4317,6 +4317,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				.filter(entry => matchingKeys.has(entry.sdkRunToken))
 				.filter(entry => entry.kind !== "prompt" || !current.deadlineManager.isExpiring(entry.correlation));
 			current.pending.push(...pendingSnapshot.filter(entry => !matchingKeys.has(entry.sdkRunToken)));
+			const existingTokenBatch =
+				typeof startToken === "string" && startToken.length > 0
+					? lifecycleRunOwners.get(startToken)?.batch
+					: undefined;
 			if (drained.length > 0) {
 				const batch: LifecycleBatch = {
 					epoch: current.lifecycleEpoch,
@@ -4336,6 +4340,11 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				if (current.activeInvocation?.kind === "prompt") {
 					current.deadlineManager.onAccepted(current.activeInvocation.correlation);
 				}
+			} else if (existingTokenBatch && current.openLifecycleBatches.includes(existingTokenBatch)) {
+				// A continuation within the same SDK-owned run carries the same token
+				// but has no newly pending invocation. Preserve the established owner so
+				// later chunks and the final terminal remain directed to its submitters.
+				adoptLifecycleBatch(existingTokenBatch.invocations);
 			} else {
 				// An empty drain is an agent-initiated successor run. Clear the
 				// predecessor's SDK owner and active invocation so abort ownership and

@@ -384,6 +384,23 @@ describe("SDK host turn streaming", () => {
 		}
 	});
 
+	test("preserves stream ownership across a continuation start with the same token", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-stream-continuation-"));
+		const harness = await createHostHarness(SESSION_ID, cwd);
+		try {
+			const accepted = await harness.control("turn.prompt", { text: "continue" }, "owner-client");
+			const token = `${accepted.result?.commandId}:${accepted.result?.turnId}`;
+			await harness.emit("agent_start", { sdkRunToken: token });
+			await harness.emit("agent_start", { sdkRunToken: token });
+			harness.clearFrames();
+			await harness.emit("message_update", textDelta("still-owned"));
+			expect(harness.sent.map(frame => frame.connectionId)).toEqual(["owner-client"]);
+		} finally {
+			await harness.stop();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("publishes one failed terminal when accepted work resolves without lifecycle evidence", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-stream-no-start-"));
 		const harness = await createHostHarness(SESSION_ID, cwd, { settleSubmission: "resolve" });

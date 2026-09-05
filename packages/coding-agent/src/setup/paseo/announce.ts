@@ -58,6 +58,7 @@ export type PaseoAnnounceSkip =
 	| "no-provider"
 	| "cli-missing"
 	| "daemon-unreachable"
+	| "unsupported-daemon-target"
 	| "daemon-auth-required"
 	| "session-not-live";
 
@@ -187,9 +188,15 @@ async function resolveDaemonTargets(
 		configuredTarget?.kind === "tcp" && !(configuredTarget.host === "127.0.0.1" && configuredTarget.port === 6767)
 			? configuredTarget
 			: undefined;
-	const targets = [configuredIpc ?? pidIpc, configuredTcp, DEFAULT_DAEMON_TARGET].filter(
-		(target): target is PaseoDaemonTarget => target !== undefined,
-	);
+	const directIpc = deps.env.PASEO_LISTEN?.trim();
+	const directIpcTarget = directIpc ? parseDaemonListen(directIpc) : undefined;
+	const targets = [
+		directIpcTarget?.kind === "ipc" ? directIpcTarget : undefined,
+		pidIpc,
+		configuredIpc,
+		configuredTcp,
+		DEFAULT_DAEMON_TARGET,
+	].filter((target): target is PaseoDaemonTarget => target !== undefined);
 	return targets.filter((target, index) => JSON.stringify(targets[index - 1]) !== JSON.stringify(target));
 }
 
@@ -211,7 +218,7 @@ export function classifyImportFailure(providerKey: string, detail: string): Pase
 	if (/cannot connect to daemon[^\n]*password required/i.test(detail)) {
 		return { kind: "skipped", reason: "daemon-auth-required" };
 	}
-	return { kind: "failed", detail: detail.slice(0, 500) };
+	return { kind: "failed", detail: "paseo import failed; inspect the Paseo daemon log" };
 }
 
 /**
@@ -237,6 +244,8 @@ export async function announceSessionToPaseo(
 	if (!cli) return { kind: "skipped", reason: "cli-missing" };
 
 	const targets = await resolveDaemonTargets(config, deps);
+	if (deps.env.PASEO_HOST?.trim() && targets.length === 0)
+		return { kind: "skipped", reason: "unsupported-daemon-target" };
 	let reachable = false;
 	for (const target of targets) {
 		if (await deps.probeDaemon(target)) {
@@ -359,15 +368,24 @@ function isSessionLive(agentDir: string): (sessionId: string, cwd: string) => Pr
 			response => sessionListPageFromResponse(response),
 		);
 		for (const { sessions } of pages) {
-			for (const value of sessions) {
-				const session = asRecord(value);
-				if (session?.sessionId !== sessionId || session.live !== true) continue;
-				const repo = asRecord(session.locator)?.repo;
-				if (typeof repo === "string" && path.resolve(repo) === path.resolve(cwd)) return true;
-			}
+			if (sessionListContainsLiveSessionForTests(sessions, sessionId, cwd)) return true;
 		}
 		return false;
 	};
+}
+
+export function sessionListContainsLiveSessionForTests(
+	sessions: readonly unknown[],
+	sessionId: string,
+	cwd: string,
+): boolean {
+	for (const value of sessions) {
+		const session = asRecord(value);
+		if (session?.sessionId !== sessionId || session.live !== true) continue;
+		const locatorCwd = asRecord(session.locator)?.cwd;
+		if (typeof locatorCwd === "string" && path.resolve(locatorCwd) === path.resolve(cwd)) return true;
+	}
+	return false;
 }
 
 /**

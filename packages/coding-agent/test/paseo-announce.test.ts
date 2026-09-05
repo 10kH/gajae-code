@@ -15,6 +15,7 @@ import {
 	resolveDaemonTarget,
 	resolvePaseoHome,
 	selectProviderKey,
+	sessionListContainsLiveSessionForTests,
 	startPaseoAnnouncement,
 } from "../src/setup/paseo/announce";
 
@@ -185,6 +186,18 @@ describe("resolvePaseoHome", () => {
 	});
 });
 
+describe("broker live-session matching", () => {
+	test("uses the current locator.cwd shape", () => {
+		expect(
+			sessionListContainsLiveSessionForTests(
+				[{ sessionId: SESSION_ID, live: true, locator: { cwd: CWD, worktreeRoot: null, stateRoot: "/tmp/state" } }],
+				SESSION_ID,
+				CWD,
+			),
+		).toBe(true);
+	});
+});
+
 describe("announceSessionToPaseo", () => {
 	test("imports a live session under the selected provider", async () => {
 		const dependencies = deps();
@@ -235,7 +248,7 @@ describe("announceSessionToPaseo", () => {
 		const dependencies = deps({ env: { PASEO_HOST: "not-an-endpoint" } });
 		expect(await announceSessionToPaseo({ sessionId: SESSION_ID, cwd: CWD }, dependencies)).toEqual({
 			kind: "skipped",
-			reason: "daemon-unreachable",
+			reason: "unsupported-daemon-target",
 		});
 		expect(dependencies.recorder.probes).toHaveLength(0);
 		expect(dependencies.recorder.imports).toHaveLength(0);
@@ -290,21 +303,24 @@ describe("classifyImportFailure", () => {
 				"Error: Cannot connect to daemon at localhost:6767: Password required\nStart the daemon with: paseo daemon start",
 			),
 		).toEqual({ kind: "skipped", reason: "daemon-auth-required" });
-		expect(classifyImportFailure("gjc", "Unauthorized")).toEqual({ kind: "failed", detail: "Unauthorized" });
+		expect(classifyImportFailure("gjc", "Unauthorized")).toEqual({
+			kind: "failed",
+			detail: "paseo import failed; inspect the Paseo daemon log",
+		});
 		expect(classifyImportFailure("gjc", "authentication failed")).toEqual({
 			kind: "failed",
-			detail: "authentication failed",
+			detail: "paseo import failed; inspect the Paseo daemon log",
 		});
 	});
 
 	test("keeps a genuine failure and bounds its detail", () => {
 		expect(classifyImportFailure("gjc", "DAEMON_NOT_RUNNING")).toEqual({
 			kind: "failed",
-			detail: "DAEMON_NOT_RUNNING",
+			detail: "paseo import failed; inspect the Paseo daemon log",
 		});
 		const outcome = classifyImportFailure("gjc", "x".repeat(2000));
 		expect(outcome.kind).toBe("failed");
-		expect(outcome.kind === "failed" && outcome.detail.length).toBe(500);
+		expect(outcome.kind === "failed" && outcome.detail).toBe("paseo import failed; inspect the Paseo daemon log");
 	});
 });
 
@@ -404,7 +420,7 @@ describe("default dependencies", () => {
 		const cli = await fakeCli('echo "Failed to import agent: provider handshake failed" >&2\nexit 1');
 		const outcome = await dependencies.runImport(importInput(cli));
 		expect(outcome.kind).toBe("failed");
-		expect(outcome.kind === "failed" && outcome.detail).toContain("provider handshake failed");
+		expect(outcome).toEqual({ kind: "failed", detail: "paseo import failed; inspect the Paseo daemon log" });
 	});
 
 	test("passes the session's exported environment through to the CLI", async () => {

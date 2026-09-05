@@ -1777,7 +1777,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "interaction",
 			label: "Announce Sessions to Paseo",
 			description:
-				"Opt-in. When enabled, and only when a GJC ACP provider is already registered in Paseo and its daemon is already running, import each interactive session into Paseo so it can be driven from there. Never starts the Paseo daemon or removes imported entries; stale entries must be pruned in Paseo. Never runs when Paseo is absent.",
+				"Global-only operator opt-in. When enabled, and only when a GJC ACP provider is already registered in Paseo and its daemon is already running, import each interactive session into Paseo so it can be driven from there. Project settings cannot enable it. Never starts the Paseo daemon or removes imported entries; stale entries must be pruned in Paseo. Never runs when Paseo is absent.",
 		},
 	},
 
