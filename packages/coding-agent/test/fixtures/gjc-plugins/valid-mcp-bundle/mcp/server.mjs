@@ -2,14 +2,14 @@
 import * as readline from "node:readline";
 
 const rl = readline.createInterface({ input: process.stdin });
-const send = (msg: any): void => {
+const send = msg => {
 	process.stdout.write(`${JSON.stringify(msg)}\n`);
 };
 
 rl.on("line", line => {
 	const trimmed = line.trim();
 	if (!trimmed) return;
-	let req: any;
+	let req;
 	try {
 		req = JSON.parse(trimmed);
 	} catch {

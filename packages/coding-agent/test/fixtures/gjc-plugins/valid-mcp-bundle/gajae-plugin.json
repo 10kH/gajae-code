@@ -3,6 +3,6 @@
   "name": "valid-mcp-bundle",
   "version": "1.0.0",
   "mcps": [
-    { "name": "domain_docs", "transport": "stdio", "command": "bun", "args": ["mcp/server.ts"], "cwd": "." }
+    { "name": "domain_docs", "transport": "stdio", "command": "node", "args": ["mcp/server.mjs"], "cwd": "." }
   ]
 }
