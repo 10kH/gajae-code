@@ -7,6 +7,7 @@
 
 ### Fixed
 
+- Contribution-prep outbound artifacts now redact complete AWS credentials, including AKIA/ASIA access-key IDs and SecretAccessKey/SessionToken values in shell-style and escaped JSON forms, while preserving structured output and existing GitHub, Slack, authorization-header, and cookie redaction.
 - Perplexity web search now clamps upstream search breadth to the API's 3–100 contract, retries one structurally empty completion, rejects malformed or ungrounded success payloads through the provider fallback path, and preserves valid grounded responses.
 - Architect/task subagents now retry API-key lookup without the parent session id after a scoped miss, so broker OAuth that works for `gjc -p --no-session` is not thrown away as `Agent run failed` / 0 tokens (#5081 follow-up). Failures still throw `provider_unavailable` without leaking the token.
 - Python work that completes after strict session disposal now returns its result without attempting to append to the closed session transcript.
