@@ -194,7 +194,17 @@ async function readStableFile(target, label) {
 	try {
 		const before = await handle.stat();
 		if (!before.isFile()) throw new Error(label + " is not a regular file");
-		const bytes = await handle.readFile();
+		const chunks = [];
+		let offset = 0;
+		for (;;) {
+			const chunk = Buffer.allocUnsafe(Math.min(1024 * 1024, Math.max(1, before.size + 1 - offset)));
+			const { bytesRead } = await handle.read(chunk, 0, chunk.byteLength, offset);
+			if (bytesRead === 0) break;
+			chunks.push(chunk.subarray(0, bytesRead));
+			offset += bytesRead;
+			if (offset > before.size) throw new Error(label + " grew while reading");
+		}
+		const bytes = Buffer.concat(chunks, offset);
 		const after = await handle.stat();
 		if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs || bytes.byteLength !== after.size) {
 			throw new Error(label + " changed while reading");
@@ -304,7 +314,18 @@ async function readStableFile(
 		const before = await handle.stat();
 		if (!before.isFile()) throw new Error(`${label} is not a regular file`);
 		if (before.size > maxBytes) throw new Error(`${label} exceeds its byte limit`);
-		const bytes = await handle.readFile();
+		const chunks: Buffer[] = [];
+		let offset = 0;
+		for (;;) {
+			const remaining = maxBytes + 1 - offset;
+			if (remaining <= 0) throw new Error(`${label} exceeds its byte limit`);
+			const chunk = Buffer.allocUnsafe(Math.min(1024 * 1024, remaining));
+			const { bytesRead } = await handle.read(chunk, 0, chunk.byteLength, offset);
+			if (bytesRead === 0) break;
+			chunks.push(chunk.subarray(0, bytesRead));
+			offset += bytesRead;
+		}
+		const bytes = Buffer.concat(chunks, offset);
 		const after = await handle.stat();
 		if (
 			before.dev !== after.dev ||
@@ -403,19 +424,18 @@ async function resolveTrustedStdioLauncher(
 				!untrustedRoots.some(root => isWithin(root, lexicalCandidate)) &&
 				((await isRootControlledLauncherPath(lexicalCandidate)) ||
 					(await isInitialManagedNodeLauncherPath(lexicalCandidate)) ||
-					(await isUserManagedNodeLauncherPath(lexicalCandidate))) &&
-				(await supportsNodeRuntime(lexicalCandidate))
+					(await isUserManagedNodeLauncherPath(lexicalCandidate)))
 			) {
 				return lexicalCandidate;
 			}
 			const lexical = path.resolve(candidate);
 			if (untrustedRoots.some(root => isWithin(root, lexical))) continue;
-			if ((await isRootControlledLauncherPath(lexical)) && (await supportsNodeRuntime(lexical))) return lexical;
-			if ((await isInitialManagedNodeLauncherPath(lexical)) && (await supportsNodeRuntime(lexical))) return lexical;
-			if ((await isUserManagedNodeLauncherPath(lexical)) && (await supportsNodeRuntime(lexical))) return lexical;
+			if (await isRootControlledLauncherPath(lexical)) return lexical;
+			if (await isInitialManagedNodeLauncherPath(lexical)) return lexical;
+			if (await isUserManagedNodeLauncherPath(lexical)) return lexical;
 			const real = await fs.realpath(lexical);
 			if (untrustedRoots.some(root => isWithin(root, real))) continue;
-			if ((await isHostOwnedNodeExecutable(real)) && (await supportsNodeRuntime(real))) return real;
+			if (await isHostOwnedNodeExecutable(real)) return real;
 		} catch {
 			// A stale PATH entry is not launcher authority; try the next one.
 		}
@@ -438,16 +458,24 @@ async function isInitialManagedNodeLauncherPath(executablePath: string): Promise
 	for (const tempRoot of [os.tmpdir(), "/tmp", "/var/tmp"]) {
 		if (isWithin(path.resolve(tempRoot), authorityRoot)) return false;
 	}
-	const target = await fs.stat(executablePath);
-	return target.isFile();
-}
-
-async function supportsNodeRuntime(executablePath: string): Promise<boolean> {
-	const child = Bun.spawn([executablePath, "--version"], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
-	const [exitCode, stdout] = await Promise.all([child.exited, new Response(child.stdout).text()]);
-	if (exitCode !== 0) return false;
-	const major = Number.parseInt(/^v(\d+)\./u.exec(stdout.trim())?.[1] ?? "", 10);
-	return Number.isSafeInteger(major) && major >= 20;
+	const [rootReal, targetReal] = await Promise.all([fs.realpath(authorityRoot), fs.realpath(executablePath)]);
+	if (!isWithin(rootReal, targetReal)) return false;
+	const uid = process.getuid?.();
+	const gid = process.getgid?.();
+	if (uid === undefined || gid === undefined) return false;
+	const target = await fs.stat(targetReal);
+	if (!target.isFile() || (target.mode & 0o002) !== 0 || (target.uid !== 0 && target.uid !== uid)) return false;
+	let current = path.dirname(targetReal);
+	for (;;) {
+		const stat = await fs.stat(current);
+		const ownerAllowed = stat.uid === 0 || stat.uid === uid;
+		const groupWritableByOther = (stat.mode & 0o020) !== 0 && stat.gid !== gid;
+		if (!stat.isDirectory() || !ownerAllowed || (stat.mode & 0o002) !== 0 || groupWritableByOther) return false;
+		if (current === rootReal) return true;
+		const parent = path.dirname(current);
+		if (parent === current) return false;
+		current = parent;
+	}
 }
 
 async function isUserManagedNodeLauncherPath(executablePath: string): Promise<boolean> {
