@@ -156,7 +156,8 @@ describe("status line command segment", () => {
 				rightSegments: [],
 				segmentOptions: {},
 			});
-			await Bun.sleep(300);
+			const deadline = Date.now() + 3_000;
+			while (!(await Bun.file(marker).exists()) && Date.now() < deadline) await Bun.sleep(10);
 
 			expect(await Bun.file(marker).text()).toBe("preview-safe");
 		} finally {
