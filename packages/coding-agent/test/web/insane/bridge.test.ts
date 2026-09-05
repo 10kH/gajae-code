@@ -254,59 +254,52 @@ describe("runEngineSubprocess hardening", () => {
 		expect(out.aborted).toBe(true);
 	});
 
-	it.skipIf(process.platform === "win32")("reaps TERM-ignoring descendants after the group leader exits", async () => {
-		let groupLeaderPid: number | undefined;
-		let descendantPid: number | undefined;
+	it("coalesces overlapping abort and timeout teardown", async () => {
+		const child = new FakeChild();
+		const fakeSpawn = (() => child) as unknown as typeof import("node:child_process").spawn;
+		const controller = new AbortController();
+		const promise = runEngineSubprocess(
+			{ url: "https://example.com", timeoutMs: 1, signal: controller.signal },
+			{ spawnImpl: fakeSpawn },
+		);
+		controller.abort();
+		await Bun.sleep(20);
+		expect(child.killed).toEqual(["SIGTERM"]);
+		child.emit("close", null);
+		const out = await promise;
+		expect(out.aborted).toBe(true);
+		expect(out.timedOut).toBe(false);
+	});
+
+	it.skipIf(process.platform !== "linux")("reaps TERM-ignoring descendants after the group leader exits", async () => {
 		const childScript = `
 			const { spawn } = require("node:child_process");
-			const descendant = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);"], {
+			const descendant = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setTimeout(() => process.exit(0), 6000); setInterval(() => {}, 1000);"], {
 				stdio: "ignore",
 			});
 			console.log(descendant.pid);
 			setInterval(() => {}, 1000);
 		`;
 		const sacrificialSpawn = ((_command: string, _args: readonly string[], options: SpawnOptions) => {
-			const child = nodeSpawn(process.execPath, ["-e", childScript], options);
-			groupLeaderPid = child.pid;
-			return child;
+			return nodeSpawn(process.execPath, ["-e", childScript], options);
 		}) as unknown as typeof import("node:child_process").spawn;
-		const exists = (pid: number): boolean => {
+		const running = async (pid: number): Promise<boolean> => {
 			try {
-				process.kill(pid, 0);
-				return true;
+				const stat = await Bun.file(`/proc/${pid}/stat`).text();
+				const state = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0];
+				return state !== "Z" && state !== "X";
 			} catch {
 				return false;
 			}
 		};
-		try {
-			const out = await runEngineSubprocess(
-				{ url: "https://example.com", timeoutMs: 200 },
-				{ spawnImpl: sacrificialSpawn },
-			);
-			expect(out.timedOut).toBe(true);
-			descendantPid = Number.parseInt(out.stdout.trim(), 10);
-			expect(descendantPid).toBeGreaterThan(0);
-			expect(exists(descendantPid)).toBe(true);
-
-			const deadline = Date.now() + 3_000;
-			while (exists(descendantPid) && Date.now() < deadline) await Bun.sleep(25);
-			expect(exists(descendantPid)).toBe(false);
-		} finally {
-			if (groupLeaderPid) {
-				try {
-					process.kill(-groupLeaderPid, "SIGKILL");
-				} catch {
-					// Sacrificial group is already gone.
-				}
-			}
-			if (descendantPid && exists(descendantPid)) {
-				try {
-					process.kill(descendantPid, "SIGKILL");
-				} catch {
-					// Sacrificial descendant is already gone.
-				}
-			}
-		}
+		const out = await runEngineSubprocess(
+			{ url: "https://example.com", timeoutMs: 200 },
+			{ spawnImpl: sacrificialSpawn },
+		);
+		expect(out.timedOut).toBe(true);
+		const descendantPid = Number.parseInt(out.stdout.trim(), 10);
+		expect(descendantPid).toBeGreaterThan(0);
+		expect(await running(descendantPid)).toBe(false);
 	});
 
 	it("parses stdout from a completed child", async () => {
