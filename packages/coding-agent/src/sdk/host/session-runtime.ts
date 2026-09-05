@@ -4060,6 +4060,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					 * later must not receive content from before its attachment.
 					 */
 					startPublished: boolean;
+					/** Set once the hold bound dropped content for this batch; gates the single warning. */
+					heldContentDropped: boolean;
 					heldContent: Array<{
 						event: AgentSessionEvent;
 						recipients: Array<{ correlation: InvocationCorrelation; connectionId: string | undefined }>;
@@ -4276,18 +4278,19 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	/**
 	 * Upper bound on content events held for one batch while its correlated
 	 * agent_start is still being durably recorded. A start write normally settles
-	 * in milliseconds, so this is only reached when persistence is wedged; at
-	 * that point ordering yields to memory safety: held content is released and
-	 * the batch streams directly from then on, so a blocked filesystem can never
-	 * accumulate an entire response in memory.
+	 * in milliseconds, so this is only reached when persistence is wedged. Past
+	 * the bound the OLDEST held content is dropped (with one warning per batch):
+	 * content is never published before its start, so a wedged write degrades
+	 * to a gap in the stream, not an inverted start/content boundary, and it
+	 * can never accumulate an entire response in memory. The turn's terminal
+	 * result remains authoritative for anything a consumer did not see.
 	 */
 	const MAX_HELD_CONTENT_EVENTS = 256;
 	/**
 	 * Release content that arrived before the batch's correlated agent_start
 	 * reached the wire. Called once per batch, after the start frames are
 	 * published (or after the start publication path gave up), so SDK consumers
-	 * observe start before any content, in producer order. Also invoked by the
-	 * hold path when the bound above is reached.
+	 * observe start before any content, in producer order.
 	 */
 	const releaseHeldContent = (current: RuntimeState, batch: LifecycleBatch): void => {
 		if (batch.startPublished) return;
@@ -4402,6 +4405,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					invocations: drained,
 					attachedInvocations: [],
 					startPublished: false,
+					heldContentDropped: false,
 					heldContent: [],
 				};
 				current.openLifecycleBatches.push(batch);
@@ -5005,13 +5009,19 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		// sees turn content before the turn it belongs to.
 		if (batch && !batch.startPublished) {
 			batch.heldContent.push({ event: event as AgentSessionEvent, recipients: invocations });
-			if (batch.heldContent.length >= MAX_HELD_CONTENT_EVENTS) {
-				logger.warn("sdk: agent_start persistence still pending; releasing held turn content to bound memory", {
-					epoch: batch.epoch,
-					held: batch.heldContent.length,
-					invocations: batch.invocations.length,
-				});
-				releaseHeldContent(current, batch);
+			if (batch.heldContent.length > MAX_HELD_CONTENT_EVENTS) {
+				if (!batch.heldContentDropped) {
+					batch.heldContentDropped = true;
+					logger.warn(
+						"sdk: agent_start persistence still pending; dropping oldest held turn content to bound memory",
+						{
+							epoch: batch.epoch,
+							bound: MAX_HELD_CONTENT_EVENTS,
+							invocations: batch.invocations.length,
+						},
+					);
+				}
+				batch.heldContent.splice(0, batch.heldContent.length - MAX_HELD_CONTENT_EVENTS);
 			}
 			return;
 		}
@@ -5091,6 +5101,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				connectionId: string | undefined;
 			}>;
 			startPublished: boolean;
+			heldContentDropped: boolean;
 			heldContent: Array<{
 				event: AgentSessionEvent;
 				recipients: Array<{ correlation: InvocationCorrelation; connectionId: string | undefined }>;

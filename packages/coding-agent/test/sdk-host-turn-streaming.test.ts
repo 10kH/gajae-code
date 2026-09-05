@@ -527,10 +527,11 @@ describe("SDK host turn streaming", () => {
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
-	test("bounds held content when start persistence never settles", async () => {
+	test("bounds held content by dropping the oldest, never publishing before the start", async () => {
 		// A wedged reconciliation write must not let the host buffer an entire
-		// response. Past the bound, held content is released (still in order) and
-		// the batch streams directly; ordering yields to memory safety, once.
+		// response, and must not invert the start/content boundary either. Past the
+		// bound the oldest held content is dropped (one warning); nothing reaches
+		// the wire until the correlated agent_start does.
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-stream-held-bound-"));
 		const inner = createReconciliationStore({ sessionFile: path.join(cwd, "session.jsonl"), sessionId: SESSION_ID });
 		const startGate = Promise.withResolvers<void>();
@@ -549,8 +550,17 @@ describe("SDK host turn streaming", () => {
 		};
 		const warn = spyOn(logger, "warn").mockImplementation(() => {});
 		const releaseWarnings = () =>
-			warn.mock.calls.filter(call => String(call[0]).includes("releasing held turn content"));
+			warn.mock.calls.filter(call => String(call[0]).includes("dropping oldest held turn content"));
 		const harness = await createHostHarness(SESSION_ID, cwd, { reconciliationStore: slowStore });
+		const contentFrames = () => harness.sent.filter(entry => entry.frame.type === "event");
+		const deltas = () =>
+			harness.sent
+				.filter(entry => entry.frame.type === "event" && entry.frame.kind === "message_update")
+				.map(
+					entry =>
+						(entry.frame.payload as { event: { assistantMessageEvent: { delta: string } } }).event
+							.assistantMessageEvent.delta,
+				);
 		try {
 			await harness.control("turn.prompt", { text: "long answer" });
 			harness.clearFrames();
@@ -558,27 +568,24 @@ describe("SDK host turn streaming", () => {
 			const start = harness.emit("agent_start");
 			await startEntered.promise;
 			const bound = 256;
-			for (let index = 0; index < bound - 1; index++) await harness.emit("message_update", textDelta(`d${index}`));
-			expect(harness.sent.filter(entry => entry.frame.type === "event")).toHaveLength(0);
+			const overflow = 40;
+			for (let index = 0; index < bound; index++) await harness.emit("message_update", textDelta(`d${index}`));
+			expect(contentFrames()).toHaveLength(0);
 			expect(releaseWarnings()).toHaveLength(0);
-			await harness.emit("message_update", textDelta(`d${bound - 1}`));
-			const deltas = () =>
-				harness.sent
-					.filter(entry => entry.frame.type === "event" && entry.frame.kind === "message_update")
-					.map(
-						entry =>
-							(entry.frame.payload as { event: { assistantMessageEvent: { delta: string } } }).event
-								.assistantMessageEvent.delta,
-					);
-			expect(deltas()).toEqual(Array.from({ length: bound }, (_, index) => `d${index}`));
+			for (let index = bound; index < bound + overflow; index++)
+				await harness.emit("message_update", textDelta(`d${index}`));
+			// Still nothing on the wire: the start has not been published.
+			expect(contentFrames()).toHaveLength(0);
+			expect(harness.broadcasts.filter(frame => frame.kind === "agent_start")).toHaveLength(0);
 			expect(releaseWarnings()).toHaveLength(1);
-			// Subsequent content streams directly while the start is still pending.
-			await harness.emit("message_update", textDelta("direct"));
-			expect(deltas().at(-1)).toBe("direct");
-			expect(deltas()).toHaveLength(bound + 1);
 			startGate.resolve();
 			await start;
-			// Start publication does not replay anything that was already released.
+			expect(harness.broadcasts.filter(frame => frame.kind === "agent_start")).toHaveLength(1);
+			// Only the newest `bound` events survive, in producer order.
+			expect(deltas()).toEqual(Array.from({ length: bound }, (_, index) => `d${index + overflow}`));
+			// Content after the start streams directly.
+			await harness.emit("message_update", textDelta("direct"));
+			expect(deltas().at(-1)).toBe("direct");
 			expect(deltas()).toHaveLength(bound + 1);
 			expect(releaseWarnings()).toHaveLength(1);
 		} finally {
