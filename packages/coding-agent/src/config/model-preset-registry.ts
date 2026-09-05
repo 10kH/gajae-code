@@ -1,5 +1,6 @@
 import * as crypto from "node:crypto";
 import * as fsSync from "node:fs";
+import type { FileHandle } from "node:fs/promises";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { Api, Model } from "@gajae-code/ai/core";
@@ -1030,7 +1031,7 @@ async function readRegistryBytesBun(file: string): Promise<Buffer | undefined> {
 	}
 	if (!before.isFile() || before.isSymbolicLink()) throw new Error("Registry cache path is not a regular file.");
 	if (before.size > BigInt(MODEL_PRESET_REGISTRY_MAX_STATE_BYTES)) throw new Error("Registry cache is oversized.");
-	let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
+	let handle: FileHandle | undefined;
 	try {
 		handle = await fs.open(file, registryFileOpenFlags());
 		const opened = await handle.stat({ bigint: true });

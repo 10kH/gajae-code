@@ -100,7 +100,7 @@ describe("registry fingerprint admission", () => {
 		await makeOversized();
 		const statSpy = spyOn(fs, "lstat").mockResolvedValueOnce(staleStat);
 		const realOpen = fs.open;
-		let readSpy: ReturnType<typeof spyOn> | undefined;
+		let readSpy: { mock: { calls: readonly unknown[][] }; mockRestore(): void } | undefined;
 		const openSpy = spyOn(fs, "open").mockImplementation(async (...args) => {
 			const handle = await realOpen(...args);
 			if (String(args[0]) === control) readSpy = spyOn(handle, "read");
@@ -145,7 +145,7 @@ describe("registry fingerprint admission", () => {
 		await makeOversized();
 		const statSpy = spyOn(fs, "lstat").mockResolvedValueOnce(staleStat);
 		const realOpen = fs.open;
-		let readSpy: ReturnType<typeof spyOn> | undefined;
+		let readSpy: { mock: { calls: readonly unknown[][] }; mockRestore(): void } | undefined;
 		const openSpy = spyOn(fs, "open").mockImplementation(async (...args) => {
 			const handle = await realOpen(...args);
 			if (String(args[0]) === control) readSpy = spyOn(handle, "read");
