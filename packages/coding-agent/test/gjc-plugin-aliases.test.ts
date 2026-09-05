@@ -758,6 +758,9 @@ describe("issue #4287 acceptance 4: install lifecycle remains covered for alias 
 		const runtime = await buildPluginMcpConfigs({ cwd });
 		expect(Object.getPrototypeOf(runtime.configs)).toBeNull();
 		expect(Object.hasOwn(runtime.configs, "constructor")).toBe(true);
-		expect(runtime.configs.constructor).toMatchObject({ type: "stdio", command: Bun.which("bun") });
+		expect(runtime.configs.constructor).toMatchObject({
+			type: "stdio",
+			command: process.platform === "linux" ? "/proc/self/exe" : process.execPath,
+		});
 	});
 });
