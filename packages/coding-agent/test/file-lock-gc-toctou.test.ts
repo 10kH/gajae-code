@@ -12,7 +12,11 @@ import {
 } from "@gajae-code/coding-agent/config/file-lock";
 import { fileLocksGcAdapter } from "@gajae-code/coding-agent/config/file-lock-gc";
 import type { GcContext, GcPidProbe, GcRecord } from "@gajae-code/coding-agent/gjc-runtime/gc-runtime";
-import { snapshotDirectoryTree } from "@gajae-code/natives";
+import {
+	renameDirectoryNoReplacePathAsync,
+	renameNoReplacePathAsync,
+	snapshotDirectoryTree,
+} from "@gajae-code/natives";
 
 const DEAD_PID = 525_252;
 const LIVE_PID = 636_363;
@@ -732,6 +736,99 @@ describe("file lock cleanup failure handling (#2478)", () => {
 		expect(await fs.exists(lockDir)).toBe(false);
 		expect(denied).toBe(false);
 	});
+
+	test.skipIf(process.platform !== "linux")(
+		"rolls back a successor when its predecessor detaches between the transition check and publication",
+		async () => {
+			const base = await makeTemp();
+			const lockedFile = path.join(base, "state.json");
+			const lockDir = `${lockedFile}.lock`;
+			const canonicalLockDir = path.join(await fs.realpath(path.dirname(lockDir)), path.basename(lockDir));
+			const detachedPath = `${canonicalLockDir}.removing`;
+			const holderEntered = Promise.withResolvers<void>();
+			const releaseHolder = Promise.withResolvers<void>();
+			const contenderAtPublication = Promise.withResolvers<void>();
+			const allowContenderPublication = Promise.withResolvers<void>();
+			const predecessorCleanupEntered = Promise.withResolvers<void>();
+			const allowPredecessorCleanup = Promise.withResolvers<void>();
+			const firstContenderPublished = Promise.withResolvers<void>();
+			let holder = Promise.resolve();
+			let successor = Promise.resolve();
+			let successorEntered = false;
+			let blockPredecessorCleanup = true;
+			const realRm = fs.rm;
+			vi.spyOn(fs, "rm").mockImplementation((async (target, options) => {
+				if (blockPredecessorCleanup && String(target) === detachedPath) {
+					blockPredecessorCleanup = false;
+					predecessorCleanupEntered.resolve();
+					await allowPredecessorCleanup.promise;
+				}
+				return await realRm(target, options);
+			}) as typeof fs.rm);
+
+			try {
+				holder = withFileLock(lockedFile, async () => {
+					holderEntered.resolve();
+					await releaseHolder.promise;
+				});
+				await holderEntered.promise;
+				let gateFirstPublication = true;
+				FileLockTestHooks.nativePublicationBindings = () => ({
+					renameNoReplacePathAsync: async (source, destination) => {
+						if (gateFirstPublication && destination === canonicalLockDir) {
+							gateFirstPublication = false;
+							contenderAtPublication.resolve();
+							await allowContenderPublication.promise;
+							const result = await renameNoReplacePathAsync(source, destination);
+							if (result.ok) firstContenderPublished.resolve();
+							return result;
+						}
+						return await renameNoReplacePathAsync(source, destination);
+					},
+					renameDirectoryNoReplacePathAsync,
+				});
+				successor = withFileLock(
+					lockedFile,
+					async () => {
+						successorEntered = true;
+					},
+					{ retries: 100, retryDelayMs: 1 },
+				);
+
+				await contenderAtPublication.promise;
+				releaseHolder.resolve();
+				await predecessorCleanupEntered.promise;
+				const predecessorIdentity = await fs.stat(detachedPath, { bigint: true });
+				allowContenderPublication.resolve();
+				await firstContenderPublished.promise;
+				let rolledBack = false;
+				for (let attempt = 0; attempt < 1_000; attempt++) {
+					if (!(await fs.exists(canonicalLockDir))) {
+						rolledBack = true;
+						break;
+					}
+					await Bun.sleep(1);
+				}
+				expect(rolledBack).toBe(true);
+				expect(successorEntered).toBe(false);
+				const retainedPredecessor = await fs.stat(detachedPath, { bigint: true });
+				expect(retainedPredecessor.dev).toBe(predecessorIdentity.dev);
+				expect(retainedPredecessor.ino).toBe(predecessorIdentity.ino);
+
+				allowPredecessorCleanup.resolve();
+				await Promise.all([holder, successor]);
+				expect(successorEntered).toBe(true);
+				expect(await fs.exists(canonicalLockDir)).toBe(false);
+				expect(await fs.exists(detachedPath)).toBe(false);
+			} finally {
+				releaseHolder.resolve();
+				allowContenderPublication.resolve();
+				allowPredecessorCleanup.resolve();
+				await Promise.allSettled([holder, successor]);
+			}
+		},
+		10_000,
+	);
 
 	test("quarantines a self-owned lock when transient release denial persists", async () => {
 		const base = await makeTemp();
