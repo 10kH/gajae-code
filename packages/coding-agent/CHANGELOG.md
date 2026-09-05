@@ -9,6 +9,9 @@
 
 ### Fixed
 
+- Credential replacement lookups now propagate the owning request's cancellation through scoped and allowed unscoped retries, preventing aborted turns from continuing OAuth preparation or selecting another key.
+- Removing the committed status-line command segment or clearing its trusted command now cancels the running process and clears stale output; draft-only previews remain side-effect-free.
+- Slack inbound acknowledgment reactions now use bounded, abortable, tracked provider work that drains on shutdown or attachment retirement without delaying accepted turns; rejected or timed-out reactions emit sanitized diagnostics.
 - Task repository bindings now accept explicit `relativeSubdir: "."` as the already-bound worktree root, avoiding unnecessary launch retries while retaining traversal, absolute-path, symlink-escape, and sibling-repository rejection.
 - Blank optional task output schemas now inherit the configured agent/session schema instead of failing successful subagents at completion; malformed nonempty schemas and required-field validation remain fail-closed.
 - Model preset registry URL and disable overrides now resolve only from explicitly inherited or user-owned environment sources, so a checkout `.env` cannot suppress updates or redirect signed-registry polling while dependency injection, HTTPS validation, signatures, ETags, cache, and offline behavior remain unchanged (#5300).
