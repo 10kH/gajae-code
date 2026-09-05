@@ -19,7 +19,8 @@ describe("lookupSessionApiKey (#5081)", () => {
 			"parent-credential-scope",
 			{ provider: "anthropic" },
 		);
-		expect(key).toBe("model-scoped-token");
+		expect(key.apiKey).toBe("model-scoped-token");
+		expect(key.credentialSessionId).toBe("parent-credential-scope");
 		expect(calls).toEqual(["model:anthropic"]);
 	});
 
@@ -40,7 +41,7 @@ describe("lookupSessionApiKey (#5081)", () => {
 			"scope",
 			{ provider: "anthropic" },
 		);
-		expect(key).toBe("provider-token");
+		expect(key.apiKey).toBe("provider-token");
 		expect(calls).toEqual(["model:anthropic", "provider:anthropic"]);
 	});
 
@@ -58,7 +59,7 @@ describe("lookupSessionApiKey (#5081)", () => {
 			"scope",
 			undefined,
 		);
-		expect(key).toBe("provider-token");
+		expect(key.apiKey).toBe("provider-token");
 	});
 
 	it("throws provider_unavailable without leaking a token when both lookups miss", async () => {
@@ -84,11 +85,12 @@ describe("lookupSessionApiKey (#5081)", () => {
 		}
 	});
 
-	it("prefers the live model over the captured construction model", () => {
+	it("prefers the matching live model, then the matching captured model", () => {
 		const live = { provider: "anthropic", baseUrl: "https://live.example" };
 		const captured = { provider: "anthropic", baseUrl: "https://captured.example" };
-		expect(resolveLiveSessionApiKeyModel(live, captured)).toEqual(live);
-		expect(resolveLiveSessionApiKeyModel(undefined, captured)).toEqual(captured);
+		expect(resolveLiveSessionApiKeyModel(live, captured, "anthropic")).toEqual(live);
+		expect(resolveLiveSessionApiKeyModel({ provider: "openai" }, captured, "anthropic")).toEqual(captured);
+		expect(resolveLiveSessionApiKeyModel(live, captured, "google")).toBeUndefined();
 	});
 
 	it("retries without sessionId when the scoped lookups miss (architect child vs --no-session)", async () => {
@@ -108,11 +110,103 @@ describe("lookupSessionApiKey (#5081)", () => {
 			"parent-sid",
 			{ provider: "anthropic" },
 		);
-		expect(key).toBe("broker-oauth-token");
+		expect(key.apiKey).toBe("broker-oauth-token");
+		expect(key.credentialSessionId).toBeUndefined();
+		expect(calls).toEqual(["model:anthropic:parent-sid", "provider:anthropic:parent-sid", "model:anthropic:none"]);
+	});
+
+	it("keeps a mismatched live model out of both scoped and unscoped provider lookups", async () => {
+		const calls: string[] = [];
+		const key = await lookupSessionApiKey(
+			{
+				async getApiKey(model) {
+					calls.push(`model:${model.provider}`);
+					return "wrong-provider-token";
+				},
+				async getApiKeyForProvider(provider, sessionId, baseUrl) {
+					calls.push(`provider:${provider}:${sessionId ?? "none"}:${baseUrl ?? "default"}`);
+					return sessionId ? undefined : "anthropic-token";
+				},
+			},
+			"anthropic",
+			"parent-sid",
+			{ provider: "openai", baseUrl: "https://openai.example" },
+		);
+		expect(key.apiKey).toBe("anthropic-token");
+		expect(calls).toEqual(["provider:anthropic:parent-sid:default", "provider:anthropic:none:default"]);
+	});
+
+	it("preserves model baseUrl and completes the full unscoped fallback order", async () => {
+		const calls: string[] = [];
+		const key = await lookupSessionApiKey(
+			{
+				async getApiKey(model, sessionId) {
+					calls.push(`model:${sessionId ?? "none"}:${model.baseUrl}`);
+					return undefined;
+				},
+				async getApiKeyForProvider(provider, sessionId, baseUrl) {
+					calls.push(`provider:${provider}:${sessionId ?? "none"}:${baseUrl}`);
+					return sessionId ? undefined : "provider-token";
+				},
+			},
+			"anthropic",
+			"parent-sid",
+			{ provider: "anthropic", baseUrl: "https://gateway.example" },
+		);
+		expect(key.apiKey).toBe("provider-token");
 		expect(calls).toEqual([
-			"model:anthropic:parent-sid",
-			"provider:anthropic:parent-sid",
-			"model:anthropic:none",
+			"model:parent-sid:https://gateway.example",
+			"provider:anthropic:parent-sid:https://gateway.example",
+			"model:none:https://gateway.example",
+			"provider:anthropic:none:https://gateway.example",
 		]);
+	});
+
+	it("does not widen credential authority after a scoped lookup error", async () => {
+		const scopedError = Object.assign(new Error("pinned credential is unavailable"), {
+			code: "credential_unavailable",
+		});
+		const calls: string[] = [];
+		await expect(
+			lookupSessionApiKey(
+				{
+					async getApiKey(_model, sessionId) {
+						calls.push(`model:${sessionId ?? "none"}`);
+						throw scopedError;
+					},
+					async getApiKeyForProvider(_provider, sessionId) {
+						calls.push(`provider:${sessionId ?? "none"}`);
+						return "broader-token";
+					},
+				},
+				"anthropic",
+				"parent-sid",
+				{ provider: "anthropic" },
+			),
+		).rejects.toBe(scopedError);
+		expect(calls).toEqual(["model:parent-sid"]);
+	});
+
+	it("does not retry unscoped when the session has explicit credential policy", async () => {
+		const calls: string[] = [];
+		await expect(
+			lookupSessionApiKey(
+				{
+					async getApiKey(_model, sessionId) {
+						calls.push(`model:${sessionId ?? "none"}`);
+						return undefined;
+					},
+					async getApiKeyForProvider(_provider, sessionId) {
+						calls.push(`provider:${sessionId ?? "none"}`);
+						return sessionId ? undefined : "broader-token";
+					},
+				},
+				"anthropic",
+				"parent-sid",
+				{ provider: "anthropic" },
+				false,
+			),
+		).rejects.toMatchObject({ code: "provider_unavailable" });
+		expect(calls).toEqual(["model:parent-sid", "provider:parent-sid"]);
 	});
 });

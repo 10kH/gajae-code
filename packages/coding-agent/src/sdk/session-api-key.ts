@@ -14,11 +14,19 @@ export type SessionApiKeyRegistry = {
 	getApiKeyForProvider(provider: string, sessionId?: string, baseUrl?: string): Promise<string | undefined>;
 };
 
+export type SessionApiKeyResolution = {
+	apiKey: string;
+	credentialSessionId: string | undefined;
+};
+
 export function resolveLiveSessionApiKeyModel(
 	live: SessionApiKeyModel | undefined,
 	captured: SessionApiKeyModel | undefined,
+	provider: string,
 ): SessionApiKeyModel | undefined {
-	return live ?? captured;
+	if (live?.provider === provider) return live;
+	if (captured?.provider === provider) return captured;
+	return undefined;
 }
 
 async function lookupOnce(
@@ -27,9 +35,10 @@ async function lookupOnce(
 	sessionId: string | undefined,
 	model: SessionApiKeyModel | undefined,
 ): Promise<string | undefined> {
+	const matchingModel = model?.provider === provider ? model : undefined;
 	let key: string | undefined;
-	if (model && model.provider === provider) key = await registry.getApiKey(model, sessionId);
-	if (!key) key = await registry.getApiKeyForProvider(provider, sessionId, model?.baseUrl);
+	if (matchingModel) key = await registry.getApiKey(matchingModel, sessionId);
+	if (!key) key = await registry.getApiKeyForProvider(provider, sessionId, matchingModel?.baseUrl);
 	return key;
 }
 
@@ -38,16 +47,20 @@ export async function lookupSessionApiKey(
 	provider: string,
 	sessionId: string | undefined,
 	model: SessionApiKeyModel | undefined,
-): Promise<string> {
+	allowUnscopedRetry = true,
+): Promise<SessionApiKeyResolution> {
 	let key = await lookupOnce(registry, provider, sessionId, model);
 	// Architect children inherit the parent SID. Direct `-p --no-session` does
 	// not. Scoped miss then global/broker hit is the remaining 0-token death
 	// after #5105 (jsonl: Agent run failed / output 0).
-	if (!key && sessionId) key = await lookupOnce(registry, provider, undefined, model);
+	if (!key && sessionId && allowUnscopedRetry) {
+		key = await lookupOnce(registry, provider, undefined, model);
+		if (key) return { apiKey: key, credentialSessionId: undefined };
+	}
 	if (!key) {
 		throw Object.assign(new Error(`No API key found for provider "${provider}"`), {
 			code: "provider_unavailable",
 		});
 	}
-	return key;
+	return { apiKey: key, credentialSessionId: sessionId };
 }
