@@ -426,7 +426,11 @@ async function resolveTrustedStdioLauncher(
 async function isInitialManagedNodeLauncherPath(executablePath: string): Promise<boolean> {
 	if (process.platform !== "linux") return false;
 	const initialEnv = await initialProcessEnvironment;
-	const roots = [initialEnv.get("NVM_DIR"), initialEnv.get("RUNNER_TOOL_CACHE")]
+	const roots = [
+		initialEnv.get("NVM_DIR"),
+		initialEnv.get("RUNNER_TOOL_CACHE"),
+		initialEnv.get("AGENT_TOOLSDIRECTORY"),
+	]
 		.filter((root): root is string => typeof root === "string" && path.isAbsolute(root))
 		.map(root => path.resolve(root));
 	const authorityRoot = roots.find(root => isWithin(root, executablePath));
@@ -435,7 +439,7 @@ async function isInitialManagedNodeLauncherPath(executablePath: string): Promise
 		if (isWithin(path.resolve(tempRoot), authorityRoot)) return false;
 	}
 	const target = await fs.stat(executablePath);
-	return target.isFile() && (target.mode & 0o022) === 0;
+	return target.isFile();
 }
 
 async function supportsNodeRuntime(executablePath: string): Promise<boolean> {
