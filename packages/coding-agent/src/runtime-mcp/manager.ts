@@ -20,6 +20,7 @@ import {
 	listResources,
 	listResourceTemplates,
 	listTools,
+	MCPConnectionCleanupFailure,
 	readResource,
 	serverSupportsPrompts,
 	serverSupportsResources,
@@ -344,6 +345,7 @@ export class MCPManager {
 	#pendingConnections = new Map<string, Promise<MCPServerConnection>>();
 	#pendingConnectionControllers = new Map<string, AbortController>();
 	#pendingToolLoads = new Map<string, Promise<ToolLoadResult>>();
+	#pendingConnectionCleanups = new Map<string, MCPConnectionCleanupFailure>();
 	#sources = new Map<string, SourceMeta>();
 	#authStorage: AuthStorage | null = null;
 	#inputRequestHandler: MCPInputRequestHandler | null = null;
@@ -373,6 +375,28 @@ export class MCPManager {
 	#serverError(message: string): string {
 		return this.#toolsOnly ? "MCP server unavailable" : message;
 	}
+
+	#retainConnectionCleanupFailure(name: string, error: unknown): MCPConnectionCleanupFailure | undefined {
+		if (!(error instanceof MCPConnectionCleanupFailure)) return undefined;
+		this.#pendingConnectionCleanups.set(name, error);
+		return error;
+	}
+
+	async #closePendingConnectionCleanup(name: string): Promise<void> {
+		const cleanup = this.#pendingConnectionCleanups.get(name);
+		if (!cleanup) return;
+		try {
+			await cleanup.close();
+		} catch (error) {
+			const retained = error instanceof MCPConnectionCleanupFailure ? error : cleanup;
+			if (this.#pendingConnectionCleanups.get(name) === cleanup) {
+				this.#pendingConnectionCleanups.set(name, retained);
+			}
+			throw error;
+		}
+		if (this.#pendingConnectionCleanups.get(name) === cleanup) this.#pendingConnectionCleanups.delete(name);
+	}
+
 	#assertRawMCPAccessAllowed(): void {
 		if (this.#toolsOnly) throw new Error("Tools-only MCP manager does not allow raw MCP access");
 	}
@@ -413,6 +437,8 @@ export class MCPManager {
 		connectionAbort: AbortController,
 		trackManagerLease = true,
 	): Promise<MCPPoolLease> {
+		const pendingCleanup = this.#pendingConnectionCleanups.get(name);
+		if (pendingCleanup) throw pendingCleanup;
 		const sharedConfig = originalConfig.sharing === "shared";
 		const sharedEligible =
 			sharedConfig &&
@@ -958,6 +984,12 @@ export class MCPManager {
 		const connectionTasks: ConnectionTask[] = [];
 
 		for (const [name, config] of Object.entries(configs)) {
+			const pendingCleanup = this.#pendingConnectionCleanups.get(name);
+			if (pendingCleanup) {
+				errors.set(name, this.#serverError(pendingCleanup.message));
+				reportedErrors.add(name);
+				continue;
+			}
 			if (sources[name]) {
 				this.#sources.set(name, sources[name]);
 				const existing = this.#connections.get(name);
@@ -1136,6 +1168,7 @@ export class MCPManager {
 					if (!this.#toolsOnly) await this.#loadServerResourcesAndPrompts(name, connection);
 				})
 				.catch(error => {
+					this.#retainConnectionCleanupFailure(name, error);
 					if (this.#pendingToolLoads.get(name) !== toolsPromise) return;
 					this.#pendingToolLoads.delete(name);
 					if (!allowBackgroundLogging || reportedErrors.has(name) || this.#toolsOnly) return;
@@ -1270,6 +1303,7 @@ export class MCPManager {
 					}
 				} else if (task.tracked.status === "rejected") {
 					const reason = task.tracked.reason;
+					this.#retainConnectionCleanupFailure(name, reason);
 					const message = reason instanceof Error ? reason.message : String(reason);
 					errors.set(name, this.#serverError(message));
 					reportedErrors.add(name);
@@ -1582,6 +1616,7 @@ export class MCPManager {
 			});
 			result = await Promise.race([callbackPromise, abortPromise]);
 		} catch (error) {
+			this.#retainConnectionCleanupFailure(operation.name, error);
 			failed = true;
 			primaryError = error;
 		} finally {
@@ -1609,6 +1644,17 @@ export class MCPManager {
 	get retiredLeaseReleaseCountForTests(): number {
 		return this.#retiredLeaseReleases.size;
 	}
+
+	/** Read-only test seam for retained failed-connection cleanup owners. */
+	get pendingConnectionCleanupCountForTests(): number {
+		return this.#pendingConnectionCleanups.size;
+	}
+
+	/** Read-only test seam for retained failed-connection cleanup causes. */
+	getPendingConnectionCleanupFailureForTests(name: string): MCPConnectionCleanupFailure | undefined {
+		return this.#pendingConnectionCleanups.get(name);
+	}
+
 	/**
 	 * Get all connected server names.
 	 */
@@ -1621,7 +1667,12 @@ export class MCPManager {
 	 */
 	getAllServerNames(): string[] {
 		return Array.from(
-			new Set([...this.#sources.keys(), ...this.#connections.keys(), ...this.#pendingConnections.keys()]),
+			new Set([
+				...this.#sources.keys(),
+				...this.#connections.keys(),
+				...this.#pendingConnections.keys(),
+				...this.#pendingConnectionCleanups.keys(),
+			]),
 		);
 	}
 
@@ -1652,11 +1703,20 @@ export class MCPManager {
 		this.#subscribedResources.delete(name);
 
 		let closeError: unknown;
+		try {
+			await this.#closePendingConnectionCleanup(name);
+		} catch (error) {
+			closeError = error;
+		}
 		if (connection) {
 			try {
 				await this.#releaseLease(name);
 			} catch (error) {
-				closeError = this.#logLeaseReleaseFailure(name, connection, error);
+				const leaseError = this.#logLeaseReleaseFailure(name, connection, error);
+				closeError =
+					closeError !== undefined
+						? new AggregateError([closeError, leaseError], `MCP server cleanup failed: ${name}`)
+						: leaseError;
 			}
 			if (this.#connections.get(name) === connection) this.#connections.delete(name);
 		}
@@ -1672,7 +1732,7 @@ export class MCPManager {
 
 		// Notify prompt consumers so stale commands are cleared
 		if (connection?.prompts?.length) this.#onPromptsChanged?.(name);
-		if (closeError) throw closeError;
+		if (closeError !== undefined) throw closeError;
 	}
 
 	#abortConnectionTask(task: ConnectionTask): void {
@@ -1693,6 +1753,7 @@ export class MCPManager {
 
 	async #terminateConnectionTask(task: ConnectionTask): Promise<void> {
 		const connection = await task.connectionPromise.catch(async error => {
+			this.#retainConnectionCleanupFailure(task.name, error);
 			if (error instanceof MCPPoolAcquireAbortError && error.cleanup) {
 				await error.cleanup.catch(cleanupError => {
 					logger.error("MCP aborted acquire cleanup failed", { path: `mcp:${task.name}`, error: cleanupError });
@@ -1757,6 +1818,9 @@ export class MCPManager {
 			}
 			this.#reconnectBackoffs.clear();
 			this.#pendingReconnections.clear();
+			const pendingCleanupResults = await Promise.allSettled(
+				[...this.#pendingConnectionCleanups.keys()].map(name => this.#closePendingConnectionCleanup(name)),
+			);
 			const retiredReleaseFailures = await this.#drainRetiredLeaseReleases();
 			this.#deferredSharedRebinds.clear();
 			this.#pendingResourceRefresh.clear();
@@ -1768,6 +1832,9 @@ export class MCPManager {
 			const releaseFailures = [
 				...scopedReleaseFailures,
 				...releaseResults
+					.filter((result): result is PromiseRejectedResult => result.status === "rejected")
+					.map(result => result.reason),
+				...pendingCleanupResults
 					.filter((result): result is PromiseRejectedResult => result.status === "rejected")
 					.map(result => result.reason),
 				...retiredReleaseFailures,
@@ -1793,7 +1860,8 @@ export class MCPManager {
 	 * Tears down the stale connection, re-resolves auth, establishes a new
 	 * connection, reloads tools, and notifies consumers.
 	 * Concurrent calls for the same server share one reconnection attempt.
-	 * Returns the new connection, or null if reconnection failed.
+	 * Returns the new connection, or null if reconnection fails after cleanup.
+	 * Throws a retryable cleanup failure while the previous transport owner remains incomplete.
 	 */
 	async reconnectServer(name: string): Promise<MCPServerConnection | null> {
 		if (this.#connectionSetSealed) return null;
@@ -1801,6 +1869,14 @@ export class MCPManager {
 		const pending = this.#pendingReconnections.get(name);
 		if (pending) return pending;
 
+		const attempt = this.#closePendingConnectionCleanup(name).then(() => this.#startReconnect(name));
+		this.#pendingReconnections.set(name, attempt);
+		return attempt.finally(() => {
+			if (this.#pendingReconnections.get(name) === attempt) this.#pendingReconnections.delete(name);
+		});
+	}
+
+	#startReconnect(name: string): Promise<MCPServerConnection | null> {
 		const lease = this.#leases.get(name);
 		const sharedKey = lease?.sharingMode === "shared" ? lease.key : undefined;
 		let attempt: Promise<MCPServerConnection | null>;
@@ -1831,10 +1907,7 @@ export class MCPManager {
 					.finally(() => this.#pool.releaseRestart(sharedKey));
 			}
 		}
-		this.#pendingReconnections.set(name, attempt);
-		return attempt.finally(() => {
-			if (this.#pendingReconnections.get(name) === attempt) this.#pendingReconnections.delete(name);
-		});
+		return attempt;
 	}
 
 	async #doReconnect(name: string): Promise<MCPServerConnection | null> {
@@ -1905,6 +1978,7 @@ export class MCPManager {
 					logger.debug("MCP reconnected", { path: `mcp:${name}`, tools: connection.tools?.length ?? 0 });
 					return connection;
 				} catch (error) {
+					const cleanupFailure = this.#retainConnectionCleanupFailure(name, error);
 					if ((this.#disconnectEpochs.get(name) ?? 0) !== reconnectEpoch || backoffAbort.signal.aborted) {
 						logger.debug("MCP reconnect aborted after server disconnected", {
 							path: `mcp:${name}`,
@@ -1913,6 +1987,7 @@ export class MCPManager {
 						});
 						return null;
 					}
+					if (cleanupFailure) throw cleanupFailure;
 
 					const msg = error instanceof Error ? error.message : String(error);
 					if (attempt < delays.length) {
