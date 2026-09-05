@@ -7,6 +7,27 @@
  * keeps the provider's deterministic rejection wording in one place.
  */
 
+const OPENAI_CODEX_PRO_ENTITLED_PLAN_TYPES = new Set(["pro", "business", "enterprise", "team"]);
+const OPENAI_CODEX_PRO_DENIED_PLAN_TYPES = new Set(["free", "plus"]);
+
+export type OpenAICodexProEntitlement = "entitled" | "denied" | "unknown";
+
+/**
+ * Classify a ChatGPT `plan_type` for strict Pro-tier Codex models.
+ *
+ * The usage endpoint remains authoritative: only exact, documented tier names
+ * are classified. Known Free/Plus tiers can be rejected locally, while missing
+ * or unfamiliar values stay unknown and reach the provider instead of being
+ * guessed from a substring.
+ */
+export function classifyOpenAICodexProEntitlement(planType: string | undefined): OpenAICodexProEntitlement {
+	const normalized = planType?.trim().toLowerCase();
+	if (!normalized) return "unknown";
+	if (OPENAI_CODEX_PRO_ENTITLED_PLAN_TYPES.has(normalized)) return "entitled";
+	if (OPENAI_CODEX_PRO_DENIED_PLAN_TYPES.has(normalized)) return "denied";
+	return "unknown";
+}
+
 export function requiresOpenAICodexProModel(provider: string, modelId: string | undefined): boolean {
 	return (
 		provider === "openai-codex" &&
