@@ -714,6 +714,14 @@ describe("generated model policies", () => {
 				}),
 				applyPatchToolType: "freeform",
 			},
+			{
+				...createModel({
+					id: "gpt-7",
+					api: "openai-responses",
+					provider: "openai",
+				}),
+				applyPatchToolType: "freeform",
+			},
 		];
 
 		applyGeneratedModelPolicies(models);
@@ -722,6 +730,7 @@ describe("generated model policies", () => {
 		expect(models[1]?.applyPatchToolType).toBe("freeform");
 		expect(models[2]?.applyPatchToolType).toBeUndefined();
 		expect(models[3]?.applyPatchToolType).toBeUndefined();
+		expect(models[4]?.applyPatchToolType).toBeUndefined();
 	});
 
 	it("stores GPT-5.6 Sol/Terra/Luna effort metadata through max", () => {
@@ -778,9 +787,10 @@ describe("generated model policies", () => {
 			/Supported efforts: low, medium, high, xhigh, max/,
 		);
 
-		applyGeneratedModelPolicies([model]);
-		expect(model.contextWindow).toBe(272_000);
-		expect(model.applyPatchToolType).toBe("freeform");
+		const models = [model];
+		applyGeneratedModelPolicies(models);
+		expect(models[0]?.contextWindow).toBe(272_000);
+		expect(models[0]?.applyPatchToolType).toBe("freeform");
 	});
 
 	it("forces only Codex product GPT-5.6 tiers to the 372K prompt budget", () => {

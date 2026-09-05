@@ -666,9 +666,10 @@ function inferGeneratedApplyPatchToolType(
 	model: ApiModel<Api>,
 	parsedModel: ParsedModel,
 ): ApiModel<Api>["applyPatchToolType"] {
-	// GPT-5.x and GPT-6 (Astra) both advertise the freeform apply_patch tool on
-	// the first-party Responses and Codex product transports.
-	if (parsedModel.family !== "openai" || parsedModel.version.major < 5) {
+	if (
+		parsedModel.family !== "openai" ||
+		(parsedModel.version.major !== 5 && !(parsedModel.version.major === 6 && parsedModel.variant === "astra"))
+	) {
 		return undefined;
 	}
 	if (model.provider === "openai" && model.api === "openai-responses") {
