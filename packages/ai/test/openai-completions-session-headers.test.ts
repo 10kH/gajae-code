@@ -70,6 +70,18 @@ function relayModel(compat?: Model<"openai-completions">["compat"]): Model<"open
 	};
 }
 
+function openCodeGoModel(): Model<"openai-completions"> {
+	return getBundledModel("opencode-go", "kimi-k2.5") as Model<"openai-completions">;
+}
+
+function openCodeZenModel(): Model<"openai-completions"> {
+	return {
+		...openCodeGoModel(),
+		provider: "opencode-zen",
+		baseUrl: "https://opencode.ai/zen/v1",
+	};
+}
+
 // ── compat resolution ────────────────────────────────────────────────────────
 
 describe("sendSessionHeaders compat resolution", () => {
@@ -100,6 +112,117 @@ describe("sendSessionHeaders compat resolution", () => {
 // ── end-to-end wire transmission ─────────────────────────────────────────────
 
 describe("session headers on the wire (streamOpenAICompletions)", () => {
+	it("sends OpenCode Go's required conversation header without changing auth or user-agent", async () => {
+		const captured: CapturedRequest[] = [];
+		await streamOpenAICompletions(openCodeGoModel(), baseContext(), {
+			apiKey: "test-key",
+			sessionId: "01990dc9-e005-7000-8000-000000000001",
+			fetch: createCapturingFetch(captured),
+		}).result();
+
+		expect(captured).toHaveLength(1);
+		expect(captured[0].headers["x-opencode-session"]).toBe("01990dc9-e005-7000-8000-000000000001");
+		expect(captured[0].headers.authorization).toBe("Bearer test-key");
+		expect(captured[0].headers["user-agent"]).toBe("OpenAI/JS 6.49.0");
+	});
+
+	it("keeps the OpenCode Go session header stable across turns", async () => {
+		const captured: CapturedRequest[] = [];
+		const fetch = createCapturingFetch(captured);
+		const sessionId = "01990dc9-e005-7000-8000-000000000002";
+
+		await streamOpenAICompletions(openCodeGoModel(), baseContext(), {
+			apiKey: "first-credential",
+			sessionId,
+			fetch,
+		}).result();
+		await streamOpenAICompletions(
+			openCodeGoModel(),
+			{ messages: [{ role: "user", content: "different turn and prompt", timestamp: Date.now() }] },
+			{
+				apiKey: "rotated-credential",
+				sessionId,
+				fetch,
+			},
+		).result();
+
+		expect(captured.map(request => request.headers["x-opencode-session"])).toEqual([sessionId, sessionId]);
+	});
+
+	it("uses distinct OpenCode Go headers for distinct conversations", async () => {
+		const captured: CapturedRequest[] = [];
+		const fetch = createCapturingFetch(captured);
+		const firstSessionId = "01990dc9-e005-7000-8000-000000000003";
+		const secondSessionId = "01990dc9-e005-7000-8000-000000000004";
+
+		await streamOpenAICompletions(openCodeGoModel(), baseContext(), {
+			apiKey: "test-key",
+			sessionId: firstSessionId,
+			fetch,
+		}).result();
+		await streamOpenAICompletions(openCodeGoModel(), baseContext(), {
+			apiKey: "test-key",
+			sessionId: secondSessionId,
+			fetch,
+		}).result();
+
+		expect(captured.map(request => request.headers["x-opencode-session"])).toEqual([firstSessionId, secondSessionId]);
+		expect(firstSessionId).not.toBe(secondSessionId);
+	});
+
+	it("reuses the OpenCode Go session header for OpenAI SDK retries", async () => {
+		const captured: CapturedRequest[] = [];
+		let attempt = 0;
+		const retryingFetch = Object.assign(
+			async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+				const headers: Record<string, string> = {};
+				new Headers(input instanceof Request ? input.headers : undefined).forEach((value, key) => {
+					headers[key.toLowerCase()] = value;
+				});
+				new Headers(init?.headers).forEach((value, key) => {
+					headers[key.toLowerCase()] = value;
+				});
+				captured.push({ url: input instanceof Request ? input.url : String(input), headers });
+				attempt += 1;
+				if (attempt === 1) {
+					return Response.json({ error: { message: "retry", type: "server_error" } }, { status: 500 });
+				}
+				return createCapturingFetch([])(input, init);
+			},
+			{ preconnect: originalFetch.preconnect },
+		);
+		const sessionId = "01990dc9-e005-7000-8000-000000000005";
+
+		await streamOpenAICompletions(openCodeGoModel(), baseContext(), {
+			apiKey: "test-key",
+			sessionId,
+			requestMaxRetries: 1,
+			fetch: retryingFetch,
+		}).result();
+
+		expect(captured).toHaveLength(2);
+		expect(captured.map(request => request.headers["x-opencode-session"])).toEqual([sessionId, sessionId]);
+	});
+
+	it("does not send the OpenCode Go header to Zen or unrelated OpenAI-compatible endpoints", async () => {
+		const captured: CapturedRequest[] = [];
+		const fetch = createCapturingFetch(captured);
+
+		await streamOpenAICompletions(openCodeZenModel(), baseContext(), {
+			apiKey: "test-key",
+			sessionId: "01990dc9-e005-7000-8000-000000000006",
+			fetch,
+		}).result();
+		await streamOpenAICompletions(relayModel(), baseContext(), {
+			apiKey: "test-key",
+			sessionId: "01990dc9-e005-7000-8000-000000000007",
+			fetch,
+		}).result();
+
+		expect(captured).toHaveLength(2);
+		expect(captured.every(request => request.headers["x-opencode-session"] === undefined)).toBe(true);
+	});
+
 	it("transmits session_id + x-session-id when flag is ON and sessionId is present", async () => {
 		const captured: CapturedRequest[] = [];
 		await streamOpenAICompletions(relayModel({ sendSessionHeaders: true }), baseContext(), {

@@ -1301,6 +1301,12 @@ async function createClient(
 		headers["X-OpenRouter-Cache-TTL"] = "3600";
 	}
 	Object.assign(headers, extraHeaders);
+	if (model.provider === "opencode-go" && sessionId) {
+		// OpenCode Go requires one stable opaque identifier per logical conversation.
+		// The coding-agent already supplies its UUID-backed provider session id here,
+		// so reuse that lifecycle rather than minting request- or credential-scoped state.
+		headers["x-opencode-session"] = sessionId;
+	}
 	if (sessionId && resolveOpenAICompat(model).sendSessionHeaders) {
 		// Forward the agent session id as vendor-neutral session-identity headers so
 		// OpenAI-compatible proxies/relays can do session-affinity routing and reuse a
