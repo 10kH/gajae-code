@@ -361,6 +361,7 @@ async function isHostOwnedNodeExecutable(executablePath: string): Promise<boolea
 			path.join(home, ".volta", "tools", "image", "node"),
 			path.join(home, ".asdf", "installs", "nodejs"),
 			path.join(home, ".local", "share", "mise", "installs", "node"),
+			...(Bun.env.RUNNER_TOOL_CACHE ? [Bun.env.RUNNER_TOOL_CACHE] : []),
 			...(process.platform === "darwin" ? ["/opt/homebrew"] : []),
 		];
 		const portablePath = executablePath.replaceAll(path.sep, "/");
