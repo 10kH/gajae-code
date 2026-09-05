@@ -59,6 +59,37 @@ describe("contribution prep", () => {
 		);
 	});
 
+	it("redacts a complete AWS STS credential, not just the key id", () => {
+		// An STS response carries three fields. The key id is the least sensitive of
+		// them; `SecretAccessKey` and `SessionToken` are the credential itself, and
+		// neither canonical field name is matched by the `ENV_*=value` rule, which
+		// only sees the shell spelling `AWS_SECRET_ACCESS_KEY=`.
+		const accessKeyId = "ASIAIOSFODNN7EXAMPLE";
+		const longTermKeyId = "AKIAIOSFODNN7EXAMPLE";
+		const secretAccessKey = "wJalrXUtnFEMI7K7MDENGbPxRfiCYEXAMPLEKEY";
+		const sessionToken = "FwoGZXIvYXdzEBYaDEXAMPLESESSIONTOKENVALUE1234";
+		const text = [
+			`{"AccessKeyId":"${accessKeyId}","SecretAccessKey":"${secretAccessKey}","SessionToken":"${sessionToken}"}`,
+			`long-term ${longTermKeyId}`,
+		].join("\n");
+
+		const redacted = redactContributionPrepText(text, process.cwd());
+
+		expect(redacted).not.toContain(accessKeyId);
+		expect(redacted).not.toContain(longTermKeyId);
+		expect(redacted).not.toContain(secretAccessKey);
+		expect(redacted).not.toContain(sessionToken);
+		// Field names survive so the artifact still says which call was involved.
+		expect(redacted).toContain("SecretAccessKey");
+		expect(redacted).toContain("SessionToken");
+	});
+
+	it("leaves ordinary prose that merely resembles AWS credential names alone", () => {
+		const text = ["ASIAN markets rose", "AKIRA is a film", "the session token expired"].join("\n");
+
+		expect(redactContributionPrepText(text, process.cwd())).toBe(text);
+	});
+
 	it("writes a manifest with redacted file-pointer artifacts", async () => {
 		const tempDir = TempDir.createSync("@gjc-contribution-prep-");
 		try {

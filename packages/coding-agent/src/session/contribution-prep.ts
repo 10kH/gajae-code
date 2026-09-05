@@ -92,6 +92,19 @@ export function redactContributionPrepText(
 		state,
 		"tokens",
 	);
+	// AKIA is the long-term access key id, ASIA the temporary/STS one. The id is
+	// not the credential on its own: an STS payload carries `SecretAccessKey` and
+	// `SessionToken` beside it, and neither canonical field name is matched by the
+	// `ENV_*=value` rule below, which only sees shell-style `AWS_SECRET_ACCESS_KEY=`.
+	// The crash-log scrubber already covers both shapes; this is the outbound path.
+	redacted = replaceRegex(redacted, /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, "[REDACTED_AWS_KEY_ID]", state, "aws_keys");
+	redacted = replaceRegex(
+		redacted,
+		/(["']?(?:secret[_-]?access[_-]?key|session[_-]?token)["']?\s*[=:]\s*["']?)[^\s"',;}\]]{8,}/gi,
+		"$1[REDACTED_SECRET]",
+		state,
+		"aws_keys",
+	);
 	redacted = replaceRegex(
 		redacted,
 		/\b((?:ANTHROPIC|OPENAI|GITHUB|GOOGLE|GEMINI|KAGI|TAVILY|EXA|PERPLEXITY|ZAI|KIMI|BRAVE|SEARXNG|AWS)_[A-Z0-9_]*(?:KEY|TOKEN|SECRET|COOKIE|PASSWORD))\s*=\s*[^\s\n]+/gi,
