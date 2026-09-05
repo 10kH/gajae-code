@@ -151,6 +151,152 @@ describe("MCP stdio transport lifecycle", () => {
 		}
 	}, 10_000);
 
+	test("close before cleanup registration joins the attempt without declaring completion early", async () => {
+		const before = liveOwnedProcessCount();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const spawnMarker = `/tmp/gjc-mcp-stdio-close-before-register-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+		let closeSettled = false;
+		const transport = new StdioTransport({
+			command: process.execPath,
+			args: [
+				"-e",
+				`require("node:fs").writeFileSync(${JSON.stringify(spawnMarker)}, "spawned"); setInterval(() => {}, 1000);`,
+			],
+			prepareSpawn: async launch => {
+				entered.resolve();
+				await release.promise;
+				return launch;
+			},
+		});
+		const connectAttempt = transport.connect();
+		void connectAttempt.catch(() => {});
+		try {
+			await entered.promise;
+			const closeAttempt = transport.close().finally(() => {
+				closeSettled = true;
+			});
+			await Bun.sleep(0);
+			expect(closeSettled).toBe(false);
+			release.resolve();
+
+			await expect(connectAttempt).rejects.toThrow("MCP stdio connection attempt was closed");
+			await closeAttempt;
+			expect(transport.connected).toBe(false);
+			expect(await Bun.file(spawnMarker).exists()).toBe(false);
+			expect(liveOwnedProcessCount()).toBeLessThanOrEqual(before);
+		} finally {
+			release.resolve();
+			await transport.close().catch(() => {});
+		}
+	}, 10_000);
+
+	test.each([
+		["before cleanup registration", "before-registration", "abort"],
+		["during capsule allocation", "during-allocation", "timeout"],
+		["after guards and before process spawn", "before-spawn", "abort"],
+	] as const)(
+		"%s cancellation joins preparation, prevents spawn, and runs each owned cleanup once",
+		async (_label, phase, cancellation) => {
+			const before = liveOwnedProcessCount();
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const closeStarted = Promise.withResolvers<void>();
+			const cleanupOwners = new Set<number>();
+			const abortController = new AbortController();
+			const abortFailure = new Error(`synthetic ${phase} abort`);
+			const spawnMarker = `/tmp/gjc-mcp-stdio-late-spawn-${phase}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+			let cleanupAttempts = 0;
+			let guardAttempts = 0;
+			let outcomeSettled = false;
+			const originalClose = StdioTransport.prototype.close;
+			const closeSpy = vi.spyOn(StdioTransport.prototype, "close").mockImplementation(function (
+				this: StdioTransport,
+			) {
+				const closing = originalClose.call(this);
+				closeStarted.resolve();
+				return closing;
+			});
+
+			const cleanup = async () => {
+				cleanupAttempts++;
+				expect(cleanupOwners.delete(1)).toBe(true);
+			};
+			try {
+				const outcome = connectToServer(
+					`stdio-${phase}`,
+					{
+						type: "stdio",
+						command: process.execPath,
+						args: [
+							"-e",
+							`require("node:fs").writeFileSync(${JSON.stringify(spawnMarker)}, "spawned"); setInterval(() => {}, 1000);`,
+						],
+						timeout: cancellation === "timeout" ? 20 : 5_000,
+						prepareSpawn: async launch => {
+							if (!launch.registerCleanup) throw new Error("missing stdio cleanup registrar");
+							if (phase === "before-registration") {
+								entered.resolve();
+								await release.promise;
+								cleanupOwners.add(1);
+								launch.registerCleanup(cleanup);
+								return { ...launch, afterProcessExit: cleanup };
+							}
+							cleanupOwners.add(1);
+							launch.registerCleanup(cleanup);
+							if (phase === "during-allocation") {
+								entered.resolve();
+								await release.promise;
+							}
+							return { ...launch, afterProcessExit: cleanup };
+						},
+						spawnGuard: async () => {
+							guardAttempts++;
+						},
+						afterSpawnGuardForTest:
+							phase === "before-spawn"
+								? async () => {
+										entered.resolve();
+										await release.promise;
+									}
+								: undefined,
+					},
+					{ signal: abortController.signal },
+				).then(
+					() => ({ status: "resolved" as const, error: undefined }),
+					error => ({ status: "rejected" as const, error }),
+				);
+				void outcome.then(() => {
+					outcomeSettled = true;
+				});
+
+				await entered.promise;
+				if (cancellation === "abort") abortController.abort(abortFailure);
+				await closeStarted.promise;
+				const outcomeSettledBeforeRelease = outcomeSettled;
+				release.resolve();
+
+				const result = await outcome;
+				expect(outcomeSettledBeforeRelease).toBe(false);
+				expect(result.status).toBe("rejected");
+				expect(result.error).toBeInstanceOf(MCPExpectedFailure);
+				if (cancellation === "abort") expect((result.error as Error).cause).toBe(abortFailure);
+				else expect((result.error as Error).message).toContain("timed out after 20ms");
+				expect(guardAttempts).toBe(phase === "before-spawn" ? 1 : 0);
+				expect(cleanupAttempts).toBe(1);
+				expect([...cleanupOwners]).toEqual([]);
+				expect(await Bun.file(spawnMarker).exists()).toBe(false);
+				expect(liveOwnedProcessCount()).toBeLessThanOrEqual(before);
+			} finally {
+				abortController.abort(new Error(`stdio ${phase} test cleanup`));
+				release.resolve();
+				closeSpy.mockRestore();
+				await disposeAllOwnedProcesses();
+			}
+		},
+		10_000,
+	);
+
 	test("failed spawn keeps rejected cleanup owned, combines both errors, and fences reconnect", async () => {
 		const before = liveOwnedProcessCount();
 		const missingCommand = join(import.meta.dir, "fixtures", "missing-stdio-server");
