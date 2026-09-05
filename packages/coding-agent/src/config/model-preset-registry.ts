@@ -4,7 +4,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { Api, Model } from "@gajae-code/ai/core";
 import type { NativeExactFileIdentity, NativeExactUnlinkResult } from "@gajae-code/natives";
-import { getAgentDir, isEnoent } from "@gajae-code/utils";
+import { $credentialEnv, getAgentDir, isEnoent } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { splitSelectorThinkingSuffix } from "../thinking";
 import { withFileLock } from "./file-lock";
@@ -1444,10 +1444,12 @@ function effectiveTrustedKeys(
 	return getModelPresetRegistryTestTrustedKeys(agentDir) ?? MODEL_PRESET_REGISTRY_TRUSTED_KEYS;
 }
 function effectiveManifestUrl(dependencies: ModelPresetRegistryDependencies): string {
-	return dependencies.manifestUrl ?? process.env.GJC_MODEL_PRESET_REGISTRY_URL ?? DEFAULT_MODEL_PRESET_REGISTRY_URL;
+	return (
+		dependencies.manifestUrl ?? $credentialEnv("GJC_MODEL_PRESET_REGISTRY_URL") ?? DEFAULT_MODEL_PRESET_REGISTRY_URL
+	);
 }
 function environmentDisabled(): boolean {
-	return /^(?:1|true|yes|on)$/i.test(process.env.GJC_MODEL_PRESET_REGISTRY_DISABLED ?? "");
+	return /^(?:1|true|yes|on)$/i.test($credentialEnv("GJC_MODEL_PRESET_REGISTRY_DISABLED") ?? "");
 }
 function assertHttpsUrl(raw: string, description: string): URL {
 	let url: URL;
