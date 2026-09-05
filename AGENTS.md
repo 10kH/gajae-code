@@ -42,7 +42,7 @@ bun run stats               # gjc stats from source
 One-time / environment setup:
 
 ```sh
-bun run install:dev         # bun install + workspace links + dev:link + setup defaults
+bun run install:dev         # bun install + native build + workspace links + dev:link + setup defaults
 bun run dev:link            # symlink `gjc` on PATH to the source CLI (scripts/dev-link.ts)
 bun run dev:doctor          # verify PATH resolution of `gjc` points at this workspace
 bun run install:defaults    # (re)install bundled default definitions
