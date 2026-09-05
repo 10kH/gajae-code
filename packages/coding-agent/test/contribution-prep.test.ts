@@ -148,6 +148,16 @@ describe("contribution prep", () => {
 		expect(redactedOversized).not.toContain(SYNTHETIC_AWS_SECRET_ACCESS_KEY);
 	});
 
+	it("fails closed when redaction input or JSON token counts exceed their budgets", () => {
+		const manyFields = `{${Array.from(
+			{ length: 10001 },
+			(_, index) => `"field${index}":"${SYNTHETIC_AWS_ACCESS_KEY_ID}"`,
+		).join(",")}}`;
+
+		expect(redactContributionPrepText("x".repeat(1_000_001), process.cwd())).toBe("[REDACTED_OVERSIZED_CONTENT]");
+		expect(redactContributionPrepText(manyFields, process.cwd())).toBe("[REDACTED_OVERSIZED_CONTENT]");
+	});
+
 	it("handles AWS credential boundaries, label case, separators, and whitespace", () => {
 		const text = [
 			`long-term (${SYNTHETIC_AWS_ACCESS_KEY_ID})`,
@@ -159,6 +169,7 @@ describe("contribution prep", () => {
 			`SessionToken=$"${SYNTHETIC_AWS_SESSION_TOKEN}"`,
 			`SecretAccessKey=\`${SYNTHETIC_AWS_SECRET_ACCESS_KEY}\``,
 			`?SessionToken=${SYNTHETIC_AWS_SESSION_TOKEN}&status=active`,
+			`?X-Amz-Security-Token=${encodeURIComponent(SYNTHETIC_AWS_SESSION_TOKEN)}&X-Amz-Expires=900`,
 		].join("\n");
 
 		const redacted = redactContributionPrepText(text, process.cwd());
@@ -176,6 +187,7 @@ describe("contribution prep", () => {
 		expect(redacted).toContain('SessionToken=$"[REDACTED_SECRET]"');
 		expect(redacted).toContain("SecretAccessKey=`[REDACTED_SECRET]`");
 		expect(redacted).toContain("?SessionToken=[REDACTED_SECRET]&status=active");
+		expect(redacted).toContain("?X-Amz-Security-Token=[REDACTED_SECRET]&X-Amz-Expires=900");
 	});
 
 	it("redacts canonical AWS XML fields without changing the document structure", () => {
@@ -256,6 +268,19 @@ describe("contribution prep", () => {
 					timestamp: 1,
 				},
 				{
+					role: "toolResult",
+					toolCallId: "synthetic-aws-log",
+					toolName: "read",
+					content: [
+						{
+							type: "text",
+							text: `SecretAccessKey="${SYNTHETIC_AWS_SECRET_ACCESS_KEY}" X-Amz-Security-Token=${SYNTHETIC_AWS_SESSION_TOKEN}`,
+						},
+					],
+					isError: false,
+					timestamp: 3,
+				},
+				{
 					role: "assistant",
 					api: "anthropic-messages",
 					provider: "anthropic",
@@ -296,11 +321,14 @@ describe("contribution prep", () => {
 				recommended_output: string[];
 				worker_prompt_path: string;
 				changed_files: string[];
+				cwd: string;
 			};
 			const transcriptPath = manifest.artifacts.find(artifact => artifact.path.endsWith("transcript.md"))?.path;
 			expect(manifest.schema_version).toBe(1);
 			expect(manifest.source_session_id).toBe("session-[REDACTED_AWS_KEY_ID]");
-			expect(manifest.worker_prompt_path).toBe(result.workerPromptPath);
+			expect(manifest.worker_prompt_path).toBe("worker-prompt.md");
+			expect(manifest.cwd).toBe(path.basename(tempDir.path()));
+			expect(manifest.artifacts.every(artifact => !path.isAbsolute(artifact.path))).toBe(true);
 			expect(manifest.recommended_output).toContain("uncertainty / remaining risks");
 			expect(manifest.redactions).toContain("auth_headers");
 			expect(manifest.redactions).toContain("aws_keys");
@@ -310,19 +338,19 @@ describe("contribution prep", () => {
 			expect(manifest.changed_files).not.toContain(tokenFilename);
 			expect(manifest.changed_files).not.toContain(awsFilename);
 			expect(transcriptPath).toBeTruthy();
-			const transcript = await Bun.file(transcriptPath ?? "").text();
+			const transcript = await Bun.file(path.join(result.artifactDir, transcriptPath ?? "")).text();
 			expect(transcript).toContain("[REDACTED_AUTH_HEADER]");
 			expect(transcript).toContain("[REDACTED_PRIVATE_ENDPOINT]");
 			expect(transcript).not.toContain(transcriptToken);
 			expect(transcript).not.toContain(SYNTHETIC_AWS_SESSION_TOKEN);
 			const summaryPath = manifest.artifacts.find(artifact => artifact.path.endsWith("summary.md"))?.path;
 			expect(summaryPath).toBeTruthy();
-			const summary = await Bun.file(summaryPath ?? "").text();
+			const summary = await Bun.file(path.join(result.artifactDir, summaryPath ?? "")).text();
 			expect(summary).not.toContain(instructionsToken);
 			expect(summary).not.toContain(SYNTHETIC_AWS_SECRET_ACCESS_KEY);
 			const diffPath = manifest.artifacts.find(artifact => artifact.path.endsWith("git-diff.patch"))?.path;
 			expect(diffPath).toBeTruthy();
-			const gitDiff = await Bun.file(diffPath ?? "").text();
+			const gitDiff = await Bun.file(path.join(result.artifactDir, diffPath ?? "")).text();
 			expect(gitDiff).toContain("[REDACTED_TOKEN]");
 			expect(gitDiff).not.toContain("ghs_abcdefghijklmnopqrstuvwxyz123456");
 			expect(gitDiff).not.toContain("github_pat_11ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz1234567890");
@@ -331,7 +359,7 @@ describe("contribution prep", () => {
 			const outboundPaths = [
 				result.manifestPath,
 				result.workerPromptPath,
-				...manifest.artifacts.map(artifact => artifact.path),
+				...manifest.artifacts.map(artifact => path.join(result.artifactDir, artifact.path)),
 			];
 			for (const outboundPath of outboundPaths) {
 				const outboundText = await Bun.file(outboundPath).text();
@@ -343,6 +371,7 @@ describe("contribution prep", () => {
 				]) {
 					expect(outboundText).not.toContain(secret);
 				}
+				expect(outboundText).not.toContain(tempDir.path());
 			}
 		} finally {
 			tempDir.remove();
@@ -373,7 +402,8 @@ describe("contribution prep", () => {
 	it("worker prompt references the manifest instead of inlining transcript", () => {
 		const prompt = buildContributionPrepWorkerPrompt("/tmp/context/manifest.json");
 
-		expect(prompt).toContain("Manifest: /tmp/context/manifest.json");
+		expect(prompt).toContain("Manifest: manifest.json");
+		expect(prompt).not.toContain("/tmp/context");
 		expect(prompt).toContain("file pointers");
 		expect(prompt).toContain("Do not create GitHub issues");
 	});
@@ -399,7 +429,7 @@ describe("contribution prep", () => {
 			expect(spawns[0]?.args).toContain(`@${result.workerPromptPath}`);
 			expect(spawns[0]?.args).toContain("--no-skills");
 			expect(spawns[0]?.args[0]).toBeTruthy();
-			expect(spawns[0]?.cwd).toBe(tempDir.path());
+			expect(spawns[0]?.cwd).toBe(result.artifactDir);
 			expect(manifest.source_session_id).toBe("source-session");
 		} finally {
 			tempDir.remove();
