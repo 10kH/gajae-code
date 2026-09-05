@@ -216,15 +216,18 @@ const resolveInside = (root, relativePath, label) => {
 	if (!isWithin(root, target) || target === root) throw new Error(label + " escapes its authenticated root");
 	return target;
 };
-async function readStableFile(target, label) {
+async function readStableFile(target, label, maxBytes) {
 	const handle = await open(target, flags);
 	try {
 		const before = await handle.stat();
 		if (!before.isFile()) throw new Error(label + " is not a regular file");
+		if (!Number.isSafeInteger(maxBytes) || maxBytes < 0 || before.size > maxBytes) throw new Error(label + " exceeds its byte authority");
 		const chunks = [];
 		let offset = 0;
 		for (;;) {
-			const chunk = Buffer.allocUnsafe(Math.min(1024 * 1024, Math.max(1, before.size + 1 - offset)));
+			const remaining = maxBytes + 1 - offset;
+			if (remaining <= 0) throw new Error(label + " exceeds its byte authority");
+			const chunk = Buffer.allocUnsafe(Math.min(1024 * 1024, remaining));
 			const { bytesRead } = await handle.read(chunk, 0, chunk.byteLength, offset);
 			if (bytesRead === 0) break;
 			chunks.push(chunk.subarray(0, bytesRead));
@@ -246,7 +249,7 @@ const snapshotReal = await realpath(snapshotRoot);
 if (snapshotReal !== snapshotRoot || !isWithin(snapshotRoot, entrypointPath) || !isWithin(snapshotRoot, process.cwd())) {
 	throw new Error("verified plugin MCP snapshot authority drifted before execution");
 }
-const authorityBytes = await readStableFile(authorityPath, "plugin MCP snapshot authority");
+const authorityBytes = await readStableFile(authorityPath, "plugin MCP snapshot authority", 2 * 1024 * 1024);
 if (sha256(authorityBytes) !== expectedAuthorityHash) throw new Error("plugin MCP snapshot authority hash mismatch");
 const authority = JSON.parse(authorityBytes.toString("utf8"));
 if (!Array.isArray(authority.files) || authority.files.length === 0) throw new Error("plugin MCP snapshot files are missing");
@@ -256,7 +259,7 @@ for (const file of authority.files) {
 	const target = resolveInside(snapshotRoot, file.relativePath, "plugin MCP snapshot file");
 	if (expectedPaths.has(target)) throw new Error("plugin MCP snapshot path is duplicated");
 	expectedPaths.add(target);
-	const bytes = await readStableFile(target, "plugin MCP snapshot file");
+	const bytes = await readStableFile(target, "plugin MCP snapshot file", file.bytes);
 	if (bytes.byteLength !== file.bytes || sha256(bytes) !== file.sha256) throw new Error("plugin MCP snapshot file hash mismatch");
 }
 async function verifyTree(directory) {
@@ -270,10 +273,27 @@ await verifyTree(snapshotRoot);
 if (expectedPaths.size !== 0) throw new Error("plugin MCP snapshot is incomplete");
 
 if (process.versions.bun) {
+	try {
+		Object.defineProperty(globalThis, "require", { value: undefined, configurable: false, writable: false });
+	} catch {
+		throw new Error("plugin MCP CommonJS loader could not be disabled");
+	}
+	if (typeof process.getBuiltinModule === "function") {
+		const getBuiltinModule = process.getBuiltinModule.bind(process);
+		process.getBuiltinModule = name => {
+			if (name === "module" || name === "node:module") throw new Error("plugin MCP module loader access is not allowed");
+			return getBuiltinModule(name);
+		};
+	}
 	let resolving = false;
 	Bun.plugin({
 		name: "gjc:verified-plugin-mcp",
 		setup(build) {
+			for (const namespace of ["node", "file"]) {
+				build.onResolve({ filter: /^(?:node:)?module$/u, namespace }, () => {
+					throw new Error("plugin MCP module loader access is not allowed");
+				});
+			}
 			build.onResolve({ filter: /.*/ }, args => {
 				if (resolving) return undefined;
 				if (args.path === "module" || args.path === "node:module") throw new Error("plugin MCP module loader access is not allowed");

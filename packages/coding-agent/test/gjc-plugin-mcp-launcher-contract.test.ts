@@ -364,6 +364,29 @@ writeFileSync(${JSON.stringify(reportPath)}, JSON.stringify({ helperValue, entry
 		await expect(fs.readFile(marker, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
 	}, 30_000);
 
+	test("rejects Bun createRequire and direct require before external CommonJS runs", async () => {
+		const cwd = await tempDir("gjc-plugin-launcher-bun-require-project-");
+		const outside = await tempDir("gjc-plugin-launcher-bun-require-outside-");
+		for (const [name, expression] of [
+			["bun-create-require", 'import { createRequire } from "node:module"; createRequire(import.meta.url)'],
+			["bun-direct-require", "require"],
+		] as const) {
+			const source = await tempDir(`gjc-plugin-launcher-${name}-`);
+			const marker = path.join(outside, `${name}.txt`);
+			const commonJs = path.join(outside, `${name}.cjs`);
+			await fs.writeFile(commonJs, `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran");\n`);
+			await writeBundle(source, {
+				name,
+				command: "bun",
+				server: `${expression}(${JSON.stringify(commonJs)});\n${mcpServer()}`,
+			});
+			expect((await installGjcBundle({ cwd }, "project", source)).ok).toBe(true);
+			const connected = await connect(cwd, name);
+			expect(connected.errors.length).toBeGreaterThan(0);
+			await expect(fs.readFile(marker, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+		}
+	}, 30_000);
+
 	test("reaps a dead owner's bounded launch capsule before creating a new one", async () => {
 		const cwd = await tempDir("gjc-plugin-launcher-reap-project-");
 		const source = await tempDir("gjc-plugin-launcher-reap-source-");
