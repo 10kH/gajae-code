@@ -57,6 +57,15 @@ function buildMinimalStdioEnv(explicit?: Record<string, string>): Record<string,
 	return { ...env, ...explicit };
 }
 
+function combinedOperationAndCleanupFailure(operationError: unknown, cleanupError: unknown): MCPExpectedFailure {
+	return new MCPExpectedFailure(
+		new AggregateError(
+			[operationError, cleanupError],
+			"MCP stdio operation failed and subprocess cleanup also failed",
+		),
+	);
+}
+
 export class StdioTransport implements MCPTransport {
 	#process: OwnedProcess | null = null;
 	#pendingRequests = new Map<
@@ -70,6 +79,7 @@ export class StdioTransport implements MCPTransport {
 	#readLoop: Promise<void> | null = null;
 	#stderrLoop: Promise<void> | null = null;
 	#closePromise: Promise<void> | null = null;
+	/** Retained until the per-attempt cleanup resolves successfully. */
 	#afterProcessExit: (() => Promise<void>) | null = null;
 
 	onClose?: () => void;
@@ -87,12 +97,19 @@ export class StdioTransport implements MCPTransport {
 		return true;
 	}
 
+	#registerCleanup(cleanup: () => Promise<void>): void {
+		if (this.#afterProcessExit && this.#afterProcessExit !== cleanup) {
+			throw new Error("MCP stdio attempt registered conflicting cleanup owners");
+		}
+		this.#afterProcessExit = cleanup;
+	}
+
 	/**
 	 * Start the subprocess and begin reading.
 	 */
 	async connect(): Promise<void> {
 		if (this.#connected) return;
-		if (this.#closePromise || this.#process) {
+		if (this.#closePromise || this.#process || this.#afterProcessExit) {
 			throw new MCPExpectedFailure(new Error("MCP stdio child teardown is incomplete"));
 		}
 
@@ -100,6 +117,7 @@ export class StdioTransport implements MCPTransport {
 			command: this.config.command,
 			args: Object.freeze([...(this.config.args ?? [])]),
 			cwd: this.config.cwd ?? process.cwd(),
+			registerCleanup: cleanup => this.#registerCleanup(cleanup),
 		};
 		const env = this.config.noInheritEnv
 			? buildMinimalStdioEnv(this.config.env)
@@ -109,9 +127,12 @@ export class StdioTransport implements MCPTransport {
 				};
 		try {
 			if (this.config.prepareSpawn) launch = await this.config.prepareSpawn(launch);
+			if (launch.afterProcessExit) this.#registerCleanup(launch.afterProcessExit);
+			else if (!this.#afterProcessExit && this.config.afterProcessExit) {
+				this.#registerCleanup(this.config.afterProcessExit);
+			}
 			await this.config.spawnGuard?.(launch);
 			await this.config.afterSpawnGuardForTest?.();
-			this.#afterProcessExit = launch.afterProcessExit ?? this.config.afterProcessExit ?? null;
 			this.#process = spawnOwnedProcess([launch.command, ...launch.args], {
 				cwd: launch.cwd,
 				env,
@@ -120,8 +141,11 @@ export class StdioTransport implements MCPTransport {
 				name: `mcp-stdio:${launch.command}`,
 			});
 		} catch (error) {
-			await (launch.afterProcessExit ?? this.#afterProcessExit)?.().catch(() => {});
-			this.#afterProcessExit = null;
+			try {
+				await this.#runAfterProcessExit();
+			} catch (cleanupError) {
+				throw combinedOperationAndCleanupFailure(error, cleanupError);
+			}
 			throw new MCPExpectedFailure(error);
 		}
 
@@ -377,6 +401,13 @@ export class StdioTransport implements MCPTransport {
 		}
 	}
 
+	async #runAfterProcessExit(): Promise<void> {
+		const cleanup = this.#afterProcessExit;
+		if (!cleanup) return;
+		await cleanup();
+		if (this.#afterProcessExit === cleanup) this.#afterProcessExit = null;
+	}
+
 	async close(): Promise<void> {
 		await this.#closeInternal(false);
 	}
@@ -401,18 +432,25 @@ export class StdioTransport implements MCPTransport {
 		const stdin = this.#getStdin();
 		const process = this.#process;
 		if (process) {
-			stdin?.end();
-			const teardown = await process.dispose();
-			await process.awaitExit({ timeoutMs: CLOSE_WAIT_MS }).catch(() => ({ exited: false, code: null }));
-			if (teardown.status !== "terminated") {
-				throw new MCPExpectedFailure(new Error(`stdio child teardown ${teardown.status}`));
-			}
 			try {
-				await this.#afterProcessExit?.();
-			} finally {
-				this.#afterProcessExit = null;
+				stdin?.end();
+				const teardown = await process.dispose();
+				await process.awaitExit({ timeoutMs: CLOSE_WAIT_MS }).catch(() => ({ exited: false, code: null }));
+				if (teardown.status !== "terminated") {
+					throw new MCPExpectedFailure(new Error(`stdio child teardown ${teardown.status}`));
+				}
 				this.#process = null;
+			} catch (cleanupError) {
+				if (failure) throw combinedOperationAndCleanupFailure(failure, cleanupError);
+				throw cleanupError;
 			}
+		}
+
+		try {
+			await this.#runAfterProcessExit();
+		} catch (cleanupError) {
+			if (failure) throw combinedOperationAndCleanupFailure(failure, cleanupError);
+			throw cleanupError;
 		}
 
 		if (!fromReadLoop && this.#readLoop) {
@@ -427,13 +465,4 @@ export class StdioTransport implements MCPTransport {
 
 		if (wasConnected) this.onClose?.();
 	}
-}
-
-/**
- * Create and connect a stdio transport.
- */
-export async function createStdioTransport(config: MCPStdioServerConfig): Promise<StdioTransport> {
-	const transport = new StdioTransport(config);
-	await transport.connect();
-	return transport;
 }
