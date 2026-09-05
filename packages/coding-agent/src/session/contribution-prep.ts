@@ -92,7 +92,7 @@ function isAwsSecretField(value: string): boolean {
 	);
 }
 
-function redactAwsJsonStrings(text: string, state: RedactionState): string {
+function redactAwsJsonStrings(text: string, state: RedactionState, depth = 0): string {
 	const tokens = [...text.matchAll(/"(?:\\(?:["\\/bfnrt]|u[0-9A-Fa-f]{4})|[^"\\\r\n])*"/g)].map(match => ({
 		start: match.index,
 		end: match.index + match[0].length,
@@ -123,7 +123,11 @@ function redactAwsJsonStrings(text: string, state: RedactionState): string {
 			}
 		}
 
-		const redacted = decoded.replace(
+		const nestedRedacted =
+			depth < 3 && decoded.length <= MAX_GIT_OUTPUT_CHARS
+				? redactAwsJsonStrings(decoded, state, depth + 1)
+				: decoded;
+		const redacted = nestedRedacted.replace(
 			/(^|[^0-9A-Za-z])(?:AKIA|ASIA)[0-9A-Z]{16}(?![0-9A-Za-z])/g,
 			"$1[REDACTED_AWS_KEY_ID]",
 		);
@@ -139,6 +143,14 @@ function redactAwsJsonStrings(text: string, state: RedactionState): string {
 		redacted = `${redacted.slice(0, start)}${replacement.value}${redacted.slice(replacement.end)}`;
 	}
 	return redacted;
+}
+
+function assertSafeArtifactPath(artifactDir: string): void {
+	const state: RedactionState = { labels: new Set() };
+	redactContributionPrepText(artifactDir, path.join(artifactDir, "__gjc_path_probe__"), state);
+	if (["tokens", "aws_keys", "provider_keys", "auth_headers", "cookies"].some(label => state.labels.has(label))) {
+		throw new Error("Contribution prep artifact path contains credential-like material.");
+	}
 }
 
 export function redactContributionPrepText(
@@ -283,6 +295,7 @@ export async function prepareContributionPrep(
 		options.artifactRoot ?? path.join(context.cwd, ".gjc", "contribution-prep"),
 		safeTimestamp,
 	);
+	assertSafeArtifactPath(artifactDir);
 	await fs.mkdir(artifactDir, { recursive: true });
 
 	const redactions: RedactionState = { labels: new Set() };

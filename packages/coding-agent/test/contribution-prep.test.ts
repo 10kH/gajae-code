@@ -112,6 +112,22 @@ describe("contribution prep", () => {
 		expect(redacted).not.toContain(SYNTHETIC_AWS_TEMPORARY_KEY_ID.slice(1));
 	});
 
+	it("redacts AWS credentials inside nested serialized JSON", () => {
+		const inner = String.raw`{"Session\u0054oken":"${SYNTHETIC_AWS_SESSION_TOKEN}","AccessKeyId":"\u0041${SYNTHETIC_AWS_TEMPORARY_KEY_ID.slice(1)}"}`;
+		const text = JSON.stringify({ payload: inner });
+
+		const redacted = redactContributionPrepText(text, process.cwd());
+		const outer = JSON.parse(redacted) as { payload: string };
+		const payload = JSON.parse(outer.payload) as { SessionToken: string; AccessKeyId: string };
+
+		expect(payload).toEqual({
+			SessionToken: "[REDACTED_SECRET]",
+			AccessKeyId: "[REDACTED_AWS_KEY_ID]",
+		});
+		expect(redacted).not.toContain(SYNTHETIC_AWS_SESSION_TOKEN);
+		expect(redacted).not.toContain(SYNTHETIC_AWS_TEMPORARY_KEY_ID.slice(1));
+	});
+
 	it("handles AWS credential boundaries, label case, separators, and whitespace", () => {
 		const text = [
 			`long-term (${SYNTHETIC_AWS_ACCESS_KEY_ID})`,
@@ -191,7 +207,10 @@ describe("contribution prep", () => {
 			const messages: AgentMessage[] = [
 				{
 					role: "user",
-					content: `Failure uses Authorization: Bearer ghp_secretsecretsecret and SessionToken: ${SYNTHETIC_AWS_SESSION_TOKEN}`,
+					content: JSON.stringify({
+						log: `Failure uses Authorization: Bearer ghp_secretsecretsecret and SessionToken: ${SYNTHETIC_AWS_SESSION_TOKEN}`,
+						payload: JSON.stringify({ SecretAccessKey: SYNTHETIC_AWS_SECRET_ACCESS_KEY }),
+					}),
 					timestamp: 1,
 				},
 				{
@@ -283,6 +302,27 @@ describe("contribution prep", () => {
 					expect(outboundText).not.toContain(secret);
 				}
 			}
+		} finally {
+			tempDir.remove();
+		}
+	});
+
+	it("rejects credential-shaped artifact paths without echoing them", async () => {
+		const tempDir = TempDir.createSync("@gjc-contribution-prep-path-");
+		try {
+			const artifactRoot = path.join(tempDir.path(), `unsafe-${SYNTHETIC_AWS_ACCESS_KEY_ID}`);
+			let error: Error | undefined;
+			try {
+				await prepareContributionPrep(
+					{ sessionId: "source-session", cwd: tempDir.path(), messages: [] },
+					{ artifactRoot, now: new Date("2026-05-31T00:00:00.000Z") },
+				);
+			} catch (caught) {
+				error = caught instanceof Error ? caught : new Error(String(caught));
+			}
+
+			expect(error?.message).toBe("Contribution prep artifact path contains credential-like material.");
+			expect(error?.message).not.toContain(SYNTHETIC_AWS_ACCESS_KEY_ID);
 		} finally {
 			tempDir.remove();
 		}
