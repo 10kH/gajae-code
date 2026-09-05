@@ -1176,9 +1176,26 @@ export const READ_URL_CACHE_MAX_KEYS = 64;
 const readUrlCache = new Map<string, ReadUrlCacheEntry>();
 
 function getReadUrlCacheKey(session: ToolSession, requestedUrl: string, raw: boolean): string {
-	const scope = session.getSessionFile() ?? session.cwd;
+	const sessionFile = session.getSessionFile();
+	const sessionId = session.getSessionId?.();
+	const scope = sessionFile ? `file:${sessionFile}` : sessionId ? `session:${sessionId}` : `cwd:${session.cwd}`;
 	return `${scope}::${raw ? "raw" : "rendered"}::${normalizeUrl(requestedUrl)}`;
 }
+
+/** Test-only seam for deterministic module-global cache assertions. */
+export const readUrlCacheTestHooks = {
+	get size(): number {
+		return readUrlCache.size;
+	},
+	get retainedOutputChars(): number {
+		let total = 0;
+		for (const entry of new Set(readUrlCache.values())) total += entry.output.length;
+		return total;
+	},
+	reset(): void {
+		readUrlCache.clear();
+	},
+};
 
 async function readArtifactOutput(session: ToolSession, artifactId: string): Promise<string | null> {
 	const artifactsDir = session.getArtifactsDir?.();
