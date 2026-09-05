@@ -201,9 +201,41 @@ describe("openai-completions compatibility", () => {
 		]) {
 			expect(xaiCompat(id), id).toBe(false);
 		}
-		expect(xaiCompat("grok-4.6", "xai", "https://proxy.example.com/v1")).toBe(false);
-		expect(xaiCompat("grok-4.6", "xai", "http://localhost:4000/v1")).toBe(false);
-		expect(xaiCompat("grok-4.6", "xai", "https://api.x.ai.evil.example/v1")).toBe(false);
+		const acceptedOrigins = [
+			"https://api.x.ai",
+			"https://api.x.ai/",
+			"https://api.x.ai/v1",
+			"https://api.x.ai:443/v1",
+		];
+		for (const baseUrl of acceptedOrigins) {
+			expect(xaiCompat("grok-4.6", "xai", baseUrl), baseUrl).toBe(true);
+		}
+		const rejectedOrigins = [
+			"http://api.x.ai/v1",
+			"https://api.x.ai:/v1",
+			"https://api.x.ai:0443/v1",
+			"https://api.x.ai:444/v1",
+			"https://%61pi.x.ai/v1",
+			"https://@api.x.ai/v1",
+			"https://user@api.x.ai/v1",
+			"https://user:pass@api.x.ai/v1",
+			"https://api.x.ai/v1?",
+			"https://api.x.ai/v1?transport=direct",
+			"https://api.x.ai/v1#",
+			"https://api.x.ai/v1#direct",
+			" https://api.x.ai/v1",
+			"https://api.x.ai/v1 ",
+			"https:\n//api.x.ai/v1",
+			"https:\n//@api.x.ai/v1",
+			"https://api.x.ai/\t/v1",
+			"https://api.x.ai\\v1",
+			"https://proxy.example.com/v1",
+			"http://localhost:4000/v1",
+			"https://api.x.ai.evil.example/v1",
+		];
+		for (const baseUrl of rejectedOrigins) {
+			expect(xaiCompat("grok-4.6", "xai", baseUrl), baseUrl).toBe(false);
+		}
 		expect(xaiCompat("grok-4.6", "custom", "https://api.x.ai/v1")).toBe(false);
 		expect(xaiCompat("grok-4.6", "openai", "https://api.openai.com/v1")).toBe(false);
 		expect(xaiCompat("x-ai/grok-4.6", "openai", "https://api.openai.com/v1")).toBe(false);
@@ -214,6 +246,9 @@ describe("openai-completions compatibility", () => {
 		expect((await captureXaiPayload("grok-4.6", "xhigh", "https://proxy.example.com/v1")).reasoning_effort).toBe(
 			undefined,
 		);
+		for (const baseUrl of rejectedOrigins) {
+			expect((await captureXaiPayload("grok-4.6", "xhigh", baseUrl)).reasoning_effort, baseUrl).toBeUndefined();
+		}
 		expect(xaiCompat("x-ai/grok-4.6", "openrouter", "https://openrouter.ai/api/v1")).toBe(true);
 	});
 
