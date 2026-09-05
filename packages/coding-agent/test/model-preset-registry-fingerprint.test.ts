@@ -99,26 +99,26 @@ describe("registry fingerprint admission", () => {
 		const staleStat = await fs.lstat(control, { bigint: true });
 		await makeOversized();
 		const statSpy = spyOn(fs, "lstat").mockResolvedValueOnce(staleStat);
-		const realOpen = fs.open;
-		let readSpy: { mock: { calls: readonly unknown[][] }; mockRestore(): void } | undefined;
-		const openSpy = spyOn(fs, "open").mockImplementation(async (...args) => {
-			const handle = await realOpen(...args);
-			if (String(args[0]) === control) readSpy = spyOn(handle, "read");
-			return handle;
+		const realFile = Bun.file;
+		let sliceSpy: { mock: { calls: readonly unknown[][] }; mockRestore(): void } | undefined;
+		const fileSpy = spyOn(Bun, "file").mockImplementation((value, ...args) => {
+			const file = realFile(value as string, ...args);
+			if (typeof value === "number") sliceSpy = spyOn(file, "slice");
+			return file;
 		});
 		try {
 			expect((await loadAcceptedModelPresetRegistryAsync(root)).error).toBe(
 				"Registry primary cache state is unreadable.",
 			);
-			expect(readSpy).toBeDefined();
-			expect(readSpy!.mock.calls.length).toBeGreaterThan(0);
-			for (const call of readSpy!.mock.calls) {
-				expect((call as readonly unknown[])[2]).toBeLessThanOrEqual(64 * 1024);
+			expect(sliceSpy).toBeDefined();
+			expect(sliceSpy!.mock.calls.length).toBeGreaterThan(0);
+			for (const call of sliceSpy!.mock.calls) {
+				expect((call as readonly unknown[])[1]).toBeLessThanOrEqual(32 * 1024 * 1024 + 1);
 			}
 		} finally {
 			statSpy.mockRestore();
-			openSpy.mockRestore();
-			readSpy?.mockRestore();
+			fileSpy.mockRestore();
+			sliceSpy?.mockRestore();
 		}
 	});
 
@@ -144,27 +144,27 @@ describe("registry fingerprint admission", () => {
 		const staleStat = await fs.lstat(control, { bigint: true });
 		await makeOversized();
 		const statSpy = spyOn(fs, "lstat").mockResolvedValueOnce(staleStat);
-		const realOpen = fs.open;
-		let readSpy: { mock: { calls: readonly unknown[][] }; mockRestore(): void } | undefined;
-		const openSpy = spyOn(fs, "open").mockImplementation(async (...args) => {
-			const handle = await realOpen(...args);
-			if (String(args[0]) === control) readSpy = spyOn(handle, "read");
-			return handle;
+		const realFile = Bun.file;
+		let sliceSpy: { mock: { calls: readonly unknown[][] }; mockRestore(): void } | undefined;
+		const fileSpy = spyOn(Bun, "file").mockImplementation((value, ...args) => {
+			const file = realFile(value as string, ...args);
+			if (typeof value === "number") sliceSpy = spyOn(file, "slice");
+			return file;
 		});
 		try {
 			const result = await loadAcceptedModelPresetRegistryAsync(root, {
 				manifestUrl: "https://example.com/registry.json",
 			});
 			expect(result.error).toMatch(/oversized/i);
-			expect(readSpy).toBeDefined();
-			expect(readSpy!.mock.calls.length).toBeGreaterThan(0);
-			for (const call of readSpy!.mock.calls) {
-				expect((call as readonly unknown[])[2]).toBeLessThanOrEqual(64 * 1024);
+			expect(sliceSpy).toBeDefined();
+			expect(sliceSpy!.mock.calls.length).toBeGreaterThan(0);
+			for (const call of sliceSpy!.mock.calls) {
+				expect((call as readonly unknown[])[1]).toBeLessThanOrEqual(32 * 1024 * 1024 + 1);
 			}
 		} finally {
 			statSpy.mockRestore();
-			openSpy.mockRestore();
-			readSpy?.mockRestore();
+			fileSpy.mockRestore();
+			sliceSpy?.mockRestore();
 		}
 	});
 

@@ -1036,17 +1036,11 @@ async function readRegistryBytesBun(file: string): Promise<Buffer | undefined> {
 		handle = await fs.open(file, registryFileOpenFlags());
 		const opened = await handle.stat({ bigint: true });
 		if (!sameRegistryFileIdentity(before, opened)) throw new Error("Registry cache path changed while opening.");
-		const chunks: Buffer[] = [];
-		const buffer = Buffer.allocUnsafe(64 * 1024);
-		let total = 0;
-		for (;;) {
-			const length = Math.min(buffer.length, MODEL_PRESET_REGISTRY_MAX_STATE_BYTES + 1 - total);
-			const { bytesRead } = await handle.read(buffer, 0, length, null);
-			if (bytesRead === 0) break;
-			total += bytesRead;
-			chunks.push(Buffer.from(buffer.subarray(0, bytesRead)));
-			if (total > MODEL_PRESET_REGISTRY_MAX_STATE_BYTES) throw new Error("Registry cache is oversized.");
-		}
+		const bunFileFromDescriptor = (Bun.file as unknown as (descriptor: number) => Bun.BunFile)(handle.fd);
+		const bytes = Buffer.from(
+			await bunFileFromDescriptor.slice(0, MODEL_PRESET_REGISTRY_MAX_STATE_BYTES + 1).arrayBuffer(),
+		);
+		if (bytes.length > MODEL_PRESET_REGISTRY_MAX_STATE_BYTES) throw new Error("Registry cache is oversized.");
 		const finalOpened = await handle.stat({ bigint: true });
 		let after: fsSync.BigIntStats;
 		try {
@@ -1056,7 +1050,7 @@ async function readRegistryBytesBun(file: string): Promise<Buffer | undefined> {
 		}
 		if (!sameRegistryFileIdentity(opened, finalOpened) || !sameRegistryFileIdentity(opened, after))
 			throw new Error("Registry cache path changed while reading.");
-		return Buffer.concat(chunks, total);
+		return bytes;
 	} finally {
 		await handle?.close();
 	}
