@@ -98,6 +98,22 @@ const MCP_SNAPSHOT_MAX_FILES = 8_192;
 const MCP_SNAPSHOT_MAX_BYTES = 128 * 1024 * 1024;
 const MCP_LAUNCHER_MAX_BYTES = 512 * 1024 * 1024;
 const registryScopes: GjcPluginScope[] = ["user", "project"];
+const initialProcessEnvironment =
+	process.platform === "linux"
+		? fs.readFile("/proc/self/environ").then(
+				bytes =>
+					new Map(
+						bytes
+							.toString("utf8")
+							.split("\0")
+							.flatMap(entry => {
+								const separator = entry.indexOf("=");
+								return separator > 0 ? [[entry.slice(0, separator), entry.slice(separator + 1)] as const] : [];
+							}),
+					),
+				() => new Map<string, string>(),
+			)
+		: Promise.resolve(new Map<string, string>());
 
 async function snapshotExistingFile(filePath: string): Promise<FileSnapshot | null> {
 	try {
@@ -223,6 +239,7 @@ if (process.versions.bun) {
 		setup(build) {
 			build.onResolve({ filter: /.*/ }, args => {
 				if (resolving) return undefined;
+				if (args.path === "module" || args.path === "node:module") throw new Error("plugin MCP module loader access is not allowed");
 				if (args.path.startsWith("node:") || args.path.startsWith("bun:")) return undefined;
 				try {
 					resolving = true;
@@ -238,6 +255,13 @@ if (process.versions.bun) {
 		},
 	});
 } else {
+	if (typeof process.getBuiltinModule === "function") {
+		const getBuiltinModule = process.getBuiltinModule.bind(process);
+		process.getBuiltinModule = name => {
+			if (name === "module" || name === "node:module") throw new Error("plugin MCP module loader access is not allowed");
+			return getBuiltinModule(name);
+		};
+	}
 	const loader = [
 		'import { isAbsolute, relative } from "node:path";',
 		'import { fileURLToPath } from "node:url";',
@@ -245,6 +269,7 @@ if (process.versions.bun) {
 		'export function initialize(data) { root = data.snapshotRoot; }',
 		'const within = target => { const rel = relative(root, target); return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel)); };',
 		'export async function resolve(specifier, context, nextResolve) {',
+		'  if (specifier === "module" || specifier === "node:module") throw new Error("plugin MCP module loader access is not allowed");',
 		'  const result = await nextResolve(specifier, context);',
 		'  if (result.url.startsWith("node:")) return result;',
 		'  if (!result.url.startsWith("file:") || !within(fileURLToPath(result.url))) throw new Error("plugin MCP import escapes its authenticated snapshot: " + specifier);',
@@ -297,6 +322,47 @@ async function readStableFile(
 	}
 }
 
+const runningBunHandleAuthority =
+	process.platform === "darwin"
+		? fs.open(process.execPath, fs.constants.O_RDONLY).then(
+				handle => ({ handle, error: undefined }),
+				error => ({ handle: undefined, error }),
+			)
+		: null;
+
+async function readRunningBunExecutable(): Promise<Buffer> {
+	if (process.platform === "linux") {
+		return readStableFile("/proc/self/exe", "Running Bun executable", MCP_LAUNCHER_MAX_BYTES, true);
+	}
+	if (process.platform !== "darwin" || !runningBunHandleAuthority) {
+		throw new Error("Authenticated Bun executable capture is unavailable on this platform");
+	}
+	const authority = await runningBunHandleAuthority;
+	if (!authority.handle) throw authority.error;
+	const before = await authority.handle.stat();
+	if (!before.isFile() || before.size > MCP_LAUNCHER_MAX_BYTES) {
+		throw new Error("Running Bun executable is not a bounded regular file");
+	}
+	const bytes = Buffer.allocUnsafe(before.size);
+	let offset = 0;
+	while (offset < bytes.byteLength) {
+		const { bytesRead } = await authority.handle.read(bytes, offset, bytes.byteLength - offset, offset);
+		if (bytesRead === 0) throw new Error("Running Bun executable changed while reading");
+		offset += bytesRead;
+	}
+	const after = await authority.handle.stat();
+	if (
+		before.dev !== after.dev ||
+		before.ino !== after.ino ||
+		before.size !== after.size ||
+		before.mtimeMs !== after.mtimeMs ||
+		before.ctimeMs !== after.ctimeMs
+	) {
+		throw new Error("Running Bun executable changed while reading");
+	}
+	return bytes;
+}
+
 /**
  * Resolve host launchers through absolute PATH entries outside the workspace
  * and installed plugin. Relative entries such as `.` and absolute workspace
@@ -332,17 +398,66 @@ async function resolveTrustedStdioLauncher(
 		const candidate = Bun.which(launcher, { PATH: pathEntry });
 		if (!candidate || !path.isAbsolute(candidate)) continue;
 		try {
+			const lexicalCandidate = path.join(pathEntry, path.basename(candidate));
+			if (
+				!untrustedRoots.some(root => isWithin(root, lexicalCandidate)) &&
+				((await isRootControlledLauncherPath(lexicalCandidate)) ||
+					(await isUserManagedNodeLauncherPath(lexicalCandidate))) &&
+				(await supportsNodeRuntime(lexicalCandidate))
+			) {
+				return lexicalCandidate;
+			}
 			const lexical = path.resolve(candidate);
 			if (untrustedRoots.some(root => isWithin(root, lexical))) continue;
-			if (await isRootControlledLauncherPath(lexical)) return lexical;
+			if ((await isRootControlledLauncherPath(lexical)) && (await supportsNodeRuntime(lexical))) return lexical;
+			if ((await isUserManagedNodeLauncherPath(lexical)) && (await supportsNodeRuntime(lexical))) return lexical;
 			const real = await fs.realpath(lexical);
 			if (untrustedRoots.some(root => isWithin(root, real))) continue;
-			if (await isHostOwnedNodeExecutable(real)) return real;
+			if ((await isHostOwnedNodeExecutable(real)) && (await supportsNodeRuntime(real))) return real;
 		} catch {
 			// A stale PATH entry is not launcher authority; try the next one.
 		}
 	}
 	throw new Error(`Trusted stdio launcher is unavailable from absolute host PATH entries: ${launcher}`);
+}
+
+async function supportsNodeRuntime(executablePath: string): Promise<boolean> {
+	const child = Bun.spawn([executablePath, "--version"], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+	const [exitCode, stdout] = await Promise.all([child.exited, new Response(child.stdout).text()]);
+	if (exitCode !== 0) return false;
+	const major = Number.parseInt(/^v(\d+)\./u.exec(stdout.trim())?.[1] ?? "", 10);
+	return Number.isSafeInteger(major) && major >= 20;
+}
+
+async function isUserManagedNodeLauncherPath(executablePath: string): Promise<boolean> {
+	if (process.platform === "win32") return false;
+	const uid = process.getuid?.();
+	if (uid === undefined) return false;
+	const home = path.resolve(os.userInfo().homedir);
+	const initialEnv = await initialProcessEnvironment;
+	const roots = [
+		path.join(home, ".nvm"),
+		path.join(home, ".volta"),
+		path.join(home, ".asdf"),
+		path.join(home, ".local", "share", "mise"),
+		...(initialEnv.get("NVM_DIR") ? [path.resolve(initialEnv.get("NVM_DIR") as string)] : []),
+		...(initialEnv.get("RUNNER_TOOL_CACHE") ? [path.resolve(initialEnv.get("RUNNER_TOOL_CACHE") as string)] : []),
+	];
+	const ownershipRoot = roots.find(root => isWithin(root, executablePath));
+	if (!ownershipRoot) return false;
+	const target = await fs.stat(executablePath);
+	if (!target.isFile() || (target.mode & 0o022) !== 0) return false;
+	let current = path.dirname(executablePath);
+	for (;;) {
+		const stat = await fs.stat(current);
+		const ownerAllowed = stat.uid === 0 || stat.uid === uid;
+		const writableMask = stat.uid === 0 ? 0o022 : 0o002;
+		if (!stat.isDirectory() || !ownerAllowed || (stat.mode & writableMask) !== 0) return false;
+		if (current === ownershipRoot) return true;
+		const parent = path.dirname(current);
+		if (parent === current) return false;
+		current = parent;
+	}
 }
 
 async function isRootControlledLauncherPath(executablePath: string): Promise<boolean> {
@@ -374,43 +489,12 @@ async function isHostOwnedNodeExecutable(executablePath: string): Promise<boolea
 	if ((executable.mode & 0o022) !== 0) return false;
 	const uid = process.getuid?.();
 	if (uid === undefined) return false;
-	let ownershipRoot = path.parse(executablePath).root;
-	let managedOwnership = false;
-	const home = os.userInfo().homedir;
-	const managedRoots = [
-		path.join(home, ".nvm", "versions", "node"),
-		path.join(home, ".volta", "tools", "image", "node"),
-		path.join(home, ".asdf", "installs", "nodejs"),
-		path.join(home, ".local", "share", "mise", "installs", "node"),
-		...(Bun.env.RUNNER_TOOL_CACHE ? [Bun.env.RUNNER_TOOL_CACHE] : []),
-		...(process.platform === "darwin" ? ["/opt/homebrew"] : []),
-	];
-	const portablePath = executablePath.replaceAll(path.sep, "/");
-	for (const marker of ["/.nvm/versions/node/", "/.volta/tools/image/node/", "/.asdf/installs/nodejs/"]) {
-		const index = portablePath.indexOf(marker);
-		if (index >= 0) managedRoots.push(portablePath.slice(0, index + marker.length - 1));
-	}
-	const matchedRoot = managedRoots.find(root => isWithin(path.resolve(root), path.resolve(executablePath)));
-	if (matchedRoot) {
-		ownershipRoot = path.resolve(matchedRoot);
-		for (const tempRoot of [os.tmpdir(), "/tmp", "/var/tmp"]) {
-			if (isWithin(path.resolve(tempRoot), ownershipRoot)) return false;
-		}
-		const rootStat = await fs.stat(ownershipRoot);
-		if (!rootStat.isDirectory() || (rootStat.uid !== 0 && rootStat.uid !== uid) || (rootStat.mode & 0o002) !== 0) {
-			return false;
-		}
-		managedOwnership = true;
-		if (executable.uid !== 0 && executable.uid !== uid) return false;
-	} else if (executable.uid !== 0) {
-		return false;
-	}
+	if (executable.uid !== 0) return false;
+	const ownershipRoot = path.parse(executablePath).root;
 	let current = path.dirname(executablePath);
 	for (;;) {
 		const stat = await fs.stat(current);
-		const ownerAllowed = stat.uid === 0 || (managedOwnership && stat.uid === uid);
-		const writableMask = stat.uid === 0 ? 0o022 : 0o002;
-		if (!stat.isDirectory() || !ownerAllowed || (stat.mode & writableMask) !== 0) return false;
+		if (!stat.isDirectory() || stat.uid !== 0 || (stat.mode & 0o022) !== 0) return false;
 		if (current === ownershipRoot) return true;
 		const parent = path.dirname(current);
 		if (parent === current) return false;
@@ -449,7 +533,6 @@ async function resolveTrustedSnapshotBase(
 				}
 			}
 			const real = await fs.realpath(candidate);
-			if (real !== candidate) continue;
 			if (untrustedRoots.some(root => isWithin(root, real))) continue;
 			await reapStalePluginMcpCapsules(real);
 			return { baseReal: real, workspaceRootReal: realRoots[0] };
@@ -516,6 +599,9 @@ async function prepareVerifiedStdioLaunch(input: {
 	files: readonly GjcPluginRegistryEntry["copiedFiles"][number][];
 	serverArgs: readonly string[];
 }): Promise<MCPStdioPreparedLaunch> {
+	if (process.platform === "win32") {
+		throw new Error("Authenticated plugin MCP stdio launch capsules are unavailable on Windows");
+	}
 	if (input.files.length === 0 || input.files.length > MCP_SNAPSHOT_MAX_FILES) {
 		throw new Error(`Plugin MCP snapshot file count exceeds ${MCP_SNAPSHOT_MAX_FILES}`);
 	}
@@ -535,18 +621,16 @@ async function prepareVerifiedStdioLaunch(input: {
 	);
 	const snapshotRoot = path.join(capsuleRoot, "bundle");
 	const authorityPath = path.join(capsuleRoot, "authority.json");
-	const launcherPath = path.join(capsuleRoot, process.platform === "win32" ? `${input.launcher}.exe` : input.launcher);
+	const launcherPath = path.join(capsuleRoot, input.launcher);
 	try {
 		await fs.mkdir(capsuleRoot, { mode: 0o700 });
 		await fs.mkdir(snapshotRoot, { mode: 0o700 });
 		if ((await fs.realpath(capsuleRoot)) !== capsuleRoot) throw new Error("Plugin MCP launch capsule path drifted");
 
-		const launcherBytes = await readStableFile(
-			input.launcherPath,
-			"Plugin MCP interpreter",
-			MCP_LAUNCHER_MAX_BYTES,
-			true,
-		);
+		const launcherBytes =
+			input.launcher === "bun"
+				? await readRunningBunExecutable()
+				: await readStableFile(input.launcherPath, "Plugin MCP interpreter", MCP_LAUNCHER_MAX_BYTES, true);
 		await fs.writeFile(launcherPath, launcherBytes, { flag: "wx", mode: 0o500 });
 
 		for (const file of input.files) {

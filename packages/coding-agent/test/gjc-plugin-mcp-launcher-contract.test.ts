@@ -346,6 +346,24 @@ writeFileSync(${JSON.stringify(reportPath)}, JSON.stringify({ helperValue, entry
 		}
 	}, 30_000);
 
+	test("rejects createRequire before CommonJS can escape the authenticated snapshot", async () => {
+		const cwd = await tempDir("gjc-plugin-launcher-require-project-");
+		const source = await tempDir("gjc-plugin-launcher-require-source-");
+		const outside = await tempDir("gjc-plugin-launcher-require-outside-");
+		const marker = path.join(outside, "commonjs-ran.txt");
+		const commonJs = path.join(outside, "outside.cjs");
+		await fs.writeFile(commonJs, `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran");\n`);
+		await writeBundle(source, {
+			name: "outside-commonjs",
+			command: "node",
+			server: `import { createRequire } from "node:module"; createRequire(import.meta.url)(${JSON.stringify(commonJs)});\n${mcpServer()}`,
+		});
+		expect((await installGjcBundle({ cwd }, "project", source)).ok).toBe(true);
+		const connected = await connect(cwd, "outside-commonjs");
+		expect(connected.errors).toHaveLength(1);
+		await expect(fs.readFile(marker, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+	}, 30_000);
+
 	test("reaps a dead owner's bounded launch capsule before creating a new one", async () => {
 		const cwd = await tempDir("gjc-plugin-launcher-reap-project-");
 		const source = await tempDir("gjc-plugin-launcher-reap-source-");
@@ -543,7 +561,9 @@ await manager.disconnectAll();
 		expect((await installGjcBundle({ cwd }, "project", source)).ok).toBe(true);
 
 		const previousPath = process.env.PATH;
+		const previousNvmDir = process.env.NVM_DIR;
 		process.env.PATH = [launcherDir, previousPath].filter(Boolean).join(path.delimiter);
+		process.env.NVM_DIR = launcherDir;
 		try {
 			const runtime = await buildPluginMcpConfigs({ cwd });
 			const config = runtime.configs["interpreter-replacement"];
@@ -566,6 +586,8 @@ await manager.disconnectAll();
 		} finally {
 			if (previousPath === undefined) delete process.env.PATH;
 			else process.env.PATH = previousPath;
+			if (previousNvmDir === undefined) delete process.env.NVM_DIR;
+			else process.env.NVM_DIR = previousNvmDir;
 		}
 	}, 30_000);
 
