@@ -129,7 +129,8 @@ describe("session headers on the wire (streamOpenAICompletions)", () => {
 		const captured: CapturedRequest[] = [];
 		await streamOpenAICompletions(openCodeGoModel(), baseContext(), {
 			apiKey: "test-key",
-			sessionId: "01990dc9-e005-7000-8000-000000000001",
+			sessionId: "cache-affinity-must-not-win",
+			providerSessionId: "01990dc9-e005-7000-8000-000000000001",
 			fetch: createCapturingFetch(captured),
 		}).result();
 
@@ -146,7 +147,7 @@ describe("session headers on the wire (streamOpenAICompletions)", () => {
 
 		await streamOpenAICompletions(openCodeGoModel(), baseContext(), {
 			apiKey: "first-credential",
-			sessionId,
+			providerSessionId: sessionId,
 			fetch,
 		}).result();
 		await streamOpenAICompletions(
@@ -154,7 +155,7 @@ describe("session headers on the wire (streamOpenAICompletions)", () => {
 			{ messages: [{ role: "user", content: "different turn and prompt", timestamp: Date.now() }] },
 			{
 				apiKey: "rotated-credential",
-				sessionId,
+				providerSessionId: sessionId,
 				fetch,
 			},
 		).result();
@@ -174,7 +175,7 @@ describe("session headers on the wire (streamOpenAICompletions)", () => {
 
 		await streamOpenAICompletions(model, baseContext(), {
 			apiKey: "test-key",
-			sessionId,
+			providerSessionId: sessionId,
 			headers: { "X-OPENCODE-SESSION": "options-override" },
 			fetch: createCapturingFetch(captured),
 		}).result();
@@ -191,12 +192,12 @@ describe("session headers on the wire (streamOpenAICompletions)", () => {
 
 		await streamOpenAICompletions(openCodeGoModel(), baseContext(), {
 			apiKey: "test-key",
-			sessionId: firstSessionId,
+			providerSessionId: firstSessionId,
 			fetch,
 		}).result();
 		await streamOpenAICompletions(openCodeGoModel(), baseContext(), {
 			apiKey: "test-key",
-			sessionId: secondSessionId,
+			providerSessionId: secondSessionId,
 			fetch,
 		}).result();
 
@@ -229,7 +230,7 @@ describe("session headers on the wire (streamOpenAICompletions)", () => {
 
 		await streamOpenAICompletions(openCodeGoModel(), baseContext(), {
 			apiKey: "test-key",
-			sessionId,
+			providerSessionId: sessionId,
 			requestMaxRetries: 1,
 			fetch: retryingFetch,
 		}).result();
@@ -271,7 +272,7 @@ describe("session headers on the wire (streamOpenAICompletions)", () => {
 
 		await streamOpenAICompletions(openCodeGoModel(), baseContext(), {
 			apiKey: "test-key",
-			sessionId,
+			providerSessionId: sessionId,
 			requestMaxRetries: 0,
 			streamMaxRetries: 1,
 			providerRetryWait: async () => {},
@@ -282,30 +283,64 @@ describe("session headers on the wire (streamOpenAICompletions)", () => {
 		expect(captured.map(request => request.headers["x-opencode-session"])).toEqual([sessionId, sessionId]);
 	});
 
-	it("does not send the OpenCode Go header to Zen or unrelated OpenAI-compatible endpoints", async () => {
+	it("strips the reserved OpenCode Go header from every unauthorized route", async () => {
 		const captured: CapturedRequest[] = [];
 		const fetch = createCapturingFetch(captured);
+		const zen = openCodeZenModel();
+		const relay = relayModel();
 		const mislabeledRelay = openCodeGoModel();
 		mislabeledRelay.baseUrl = "https://api.relay.example.com/v1";
+		const sameOriginSuffix = openCodeGoModel();
+		sameOriginSuffix.baseUrl = "https://opencode.ai/zen/go/v1/relay";
+		for (const model of [zen, relay, mislabeledRelay, sameOriginSuffix]) {
+			model.headers = { "X-OpenCode-Session": "model-injection" };
+			model.requestTransform = { setHeaders: { "x-opencode-session": "transform-injection" } };
+		}
 
-		await streamOpenAICompletions(openCodeZenModel(), baseContext(), {
+		await streamOpenAICompletions(zen, baseContext(), {
 			apiKey: "test-key",
-			sessionId: "01990dc9-e005-7000-8000-000000000006",
+			providerSessionId: "01990dc9-e005-7000-8000-000000000006",
+			headers: { "X-OPENCODE-SESSION": "options-injection" },
 			fetch,
 		}).result();
-		await streamOpenAICompletions(relayModel(), baseContext(), {
+		await streamOpenAICompletions(relay, baseContext(), {
 			apiKey: "test-key",
-			sessionId: "01990dc9-e005-7000-8000-000000000007",
+			providerSessionId: "01990dc9-e005-7000-8000-000000000007",
+			headers: { "X-OPENCODE-SESSION": "options-injection" },
 			fetch,
 		}).result();
 		await streamOpenAICompletions(mislabeledRelay, baseContext(), {
 			apiKey: "test-key",
-			sessionId: "01990dc9-e005-7000-8000-000000000010",
+			providerSessionId: "01990dc9-e005-7000-8000-000000000010",
+			headers: { "X-OPENCODE-SESSION": "options-injection" },
+			fetch,
+		}).result();
+		await streamOpenAICompletions(sameOriginSuffix, baseContext(), {
+			apiKey: "test-key",
+			providerSessionId: "01990dc9-e005-7000-8000-000000000011",
+			headers: { "X-OPENCODE-SESSION": "options-injection" },
 			fetch,
 		}).result();
 
-		expect(captured).toHaveLength(3);
+		expect(captured).toHaveLength(4);
 		expect(captured.every(request => request.headers["x-opencode-session"] === undefined)).toBe(true);
+	});
+
+	it("does not treat a generic cache session ID as OpenCode Go conversation authority", async () => {
+		const captured: CapturedRequest[] = [];
+		const model = openCodeGoModel();
+		model.headers = { "X-OpenCode-Session": "model-injection" };
+		model.requestTransform = { setHeaders: { "x-opencode-session": "transform-injection" } };
+
+		await streamOpenAICompletions(model, baseContext(), {
+			apiKey: "test-key",
+			sessionId: "prompt-derived-cache-key",
+			headers: { "X-OPENCODE-SESSION": "options-injection" },
+			fetch: createCapturingFetch(captured),
+		}).result();
+
+		expect(captured).toHaveLength(1);
+		expect(captured[0].headers["x-opencode-session"]).toBeUndefined();
 	});
 
 	it("transmits session_id + x-session-id when flag is ON and sessionId is present", async () => {

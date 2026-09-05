@@ -139,7 +139,7 @@ function resolveOpenCodeGoSessionId(
 	try {
 		const url = new URL(baseUrl);
 		if (url.origin !== "https://opencode.ai") return undefined;
-		if (!/^\/zen\/go\/v1(?:\/|$)/u.test(url.pathname)) return undefined;
+		if (url.pathname.replace(/\/+$/u, "") !== "/zen/go/v1") return undefined;
 		return sessionId;
 	} catch {
 		return undefined;
@@ -147,16 +147,17 @@ function resolveOpenCodeGoSessionId(
 }
 
 function wrapFetchForOpenCodeGoSession(baseFetch: FetchImpl, sessionId: string | undefined): FetchImpl {
-	if (!sessionId) return baseFetch;
 	return Object.assign(
 		async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
 			if (input instanceof Request) {
 				const request = new Request(input, init);
-				request.headers.set("x-opencode-session", sessionId);
+				request.headers.delete("x-opencode-session");
+				if (sessionId) request.headers.set("x-opencode-session", sessionId);
 				return baseFetch(request);
 			}
 			const headers = new Headers(init?.headers);
-			headers.set("x-opencode-session", sessionId);
+			headers.delete("x-opencode-session");
+			if (sessionId) headers.set("x-opencode-session", sessionId);
 			return baseFetch(input, { ...init, headers });
 		},
 		baseFetch.preconnect ? { preconnect: baseFetch.preconnect } : {},
@@ -635,6 +636,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				options?.authCredentialType,
 				options?.requestMaxRetries,
 				options?.sessionId,
+				options?.providerSessionId,
 				options?.maxRetryDelayMs,
 				options?.attemptScope,
 			);
@@ -1292,6 +1294,7 @@ async function createClient(
 	authCredentialType?: OpenAICompletionsOptions["authCredentialType"],
 	requestMaxRetries?: number,
 	sessionId?: string,
+	providerSessionId?: string,
 	maxRetryDelayMs?: number,
 	attemptScope?: import("../types.js").AttemptScopeRef,
 ): Promise<{
@@ -1389,15 +1392,14 @@ async function createClient(
 	const endpointRequestQuery = endpointQuery;
 	const requestQuery =
 		[endpointRequestQuery, azureQuery].filter((query): query is string => query !== undefined).join("&") || undefined;
-	const openCodeGoSessionId = resolveOpenCodeGoSessionId(model, clientBaseUrl, sessionId);
-	if (openCodeGoSessionId) {
-		// OpenCode Go requires one stable opaque identifier per logical conversation.
-		// Normalize case variants and reuse the coding-agent's UUID-backed provider
-		// session lifecycle rather than minting request- or credential-scoped state.
-		const normalizedHeaders = new Headers(headers);
-		normalizedHeaders.set("x-opencode-session", openCodeGoSessionId);
-		headers = Object.fromEntries(normalizedHeaders.entries());
-	}
+	const openCodeGoSessionId = resolveOpenCodeGoSessionId(model, clientBaseUrl, providerSessionId);
+	// Reserve the provider-specific header on every OpenAI-compatible route. Caller,
+	// model, and transform values are removed unless the exact OpenCode Go endpoint
+	// has an opaque identity owned by the agent's conversation lifecycle.
+	const normalizedHeaders = new Headers(headers);
+	normalizedHeaders.delete("x-opencode-session");
+	if (openCodeGoSessionId) normalizedHeaders.set("x-opencode-session", openCodeGoSessionId);
+	headers = Object.fromEntries(normalizedHeaders.entries());
 	let capturedErrorResponse: CapturedHttpErrorResponse | undefined;
 	const baseFetch = fetchOverride ?? fetch;
 	const wrappedFetch = Object.assign(

@@ -4649,6 +4649,7 @@ async function streamAssistantResponse(
 						authCredentialType,
 						metadata: resolvedMetadata,
 						sessionId: config.providerSessionId ?? config.sessionId,
+						providerSessionId: config.providerSessionId,
 						toolChoice: effectiveToolChoice,
 						reasoning: effectiveReasoning,
 						temperature: effectiveTemperature,
