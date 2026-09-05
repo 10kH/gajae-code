@@ -130,6 +130,39 @@ function resolveOpenAIProviderBaseUrl(
 	return configuredBaseUrl || envBaseUrl || OPENAI_DEFAULT_BASE_URL;
 }
 
+function resolveOpenCodeGoSessionId(
+	model: Model<"openai-completions">,
+	baseUrl: string | undefined,
+	sessionId: string | undefined,
+): string | undefined {
+	if (model.provider !== "opencode-go" || !baseUrl || !sessionId) return undefined;
+	try {
+		const url = new URL(baseUrl);
+		if (url.origin !== "https://opencode.ai") return undefined;
+		if (!/^\/zen\/go\/v1(?:\/|$)/u.test(url.pathname)) return undefined;
+		return sessionId;
+	} catch {
+		return undefined;
+	}
+}
+
+function wrapFetchForOpenCodeGoSession(baseFetch: FetchImpl, sessionId: string | undefined): FetchImpl {
+	if (!sessionId) return baseFetch;
+	return Object.assign(
+		async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+			if (input instanceof Request) {
+				const request = new Request(input, init);
+				request.headers.set("x-opencode-session", sessionId);
+				return baseFetch(request);
+			}
+			const headers = new Headers(init?.headers);
+			headers.set("x-opencode-session", sessionId);
+			return baseFetch(input, { ...init, headers });
+		},
+		baseFetch.preconnect ? { preconnect: baseFetch.preconnect } : {},
+	);
+}
+
 /** Test seam: the provider base URL as resolved from trusted env. */
 export function resolveOpenAICompletionsBaseUrlForTest(
 	baseUrl: string | undefined,
@@ -1301,12 +1334,6 @@ async function createClient(
 		headers["X-OpenRouter-Cache-TTL"] = "3600";
 	}
 	Object.assign(headers, extraHeaders);
-	if (model.provider === "opencode-go" && sessionId) {
-		// OpenCode Go requires one stable opaque identifier per logical conversation.
-		// The coding-agent already supplies its UUID-backed provider session id here,
-		// so reuse that lifecycle rather than minting request- or credential-scoped state.
-		headers["x-opencode-session"] = sessionId;
-	}
 	if (sessionId && resolveOpenAICompat(model).sendSessionHeaders) {
 		// Forward the agent session id as vendor-neutral session-identity headers so
 		// OpenAI-compatible proxies/relays can do session-affinity routing and reuse a
@@ -1362,6 +1389,15 @@ async function createClient(
 	const endpointRequestQuery = endpointQuery;
 	const requestQuery =
 		[endpointRequestQuery, azureQuery].filter((query): query is string => query !== undefined).join("&") || undefined;
+	const openCodeGoSessionId = resolveOpenCodeGoSessionId(model, clientBaseUrl, sessionId);
+	if (openCodeGoSessionId) {
+		// OpenCode Go requires one stable opaque identifier per logical conversation.
+		// Normalize case variants and reuse the coding-agent's UUID-backed provider
+		// session lifecycle rather than minting request- or credential-scoped state.
+		const normalizedHeaders = new Headers(headers);
+		normalizedHeaders.set("x-opencode-session", openCodeGoSessionId);
+		headers = Object.fromEntries(normalizedHeaders.entries());
+	}
 	let capturedErrorResponse: CapturedHttpErrorResponse | undefined;
 	const baseFetch = fetchOverride ?? fetch;
 	const wrappedFetch = Object.assign(
@@ -1395,8 +1431,9 @@ async function createClient(
 		baseFetch.preconnect ? { preconnect: baseFetch.preconnect } : {},
 	);
 	const boundedFetch = wrapOpenAIFetchForBoundedRateLimits(wrappedFetch, maxRetryDelayMs);
+	const providerScopedFetch = wrapFetchForOpenCodeGoSession(boundedFetch, openCodeGoSessionId);
 	const transformedFetch = wrapFetchForOpenAIRequestTransform(
-		boundedFetch,
+		providerScopedFetch,
 		model.requestTransform,
 		`Gajae-Code/${packageJson.version}`,
 	);
