@@ -463,8 +463,8 @@ function scheduleBackgroundRefresh<T>(
 	const controller = new AbortController();
 	backgroundRefreshes.set(key, { generation, controller });
 	queueMicrotask(async () => {
+		const fetchPromise = Promise.resolve().then(() => fetchFresh(controller.signal));
 		try {
-			const fetchPromise = Promise.resolve().then(() => fetchFresh(controller.signal));
 			const timeoutPromise = Bun.sleep(BACKGROUND_REFRESH_TIMEOUT_MS).then(() => {
 				controller.abort();
 				throw new Error("background refresh timed out");
@@ -475,6 +475,7 @@ function scheduleBackgroundRefresh<T>(
 			}
 		} catch (err) {
 			controller.abort();
+			await fetchPromise.catch(() => undefined);
 			logger.debug("github cache: background refresh failed", {
 				err: String(err),
 				repo,
