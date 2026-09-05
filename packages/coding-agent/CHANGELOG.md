@@ -13,6 +13,10 @@
 - Status-line settings now include a draft-local spatial custom editor with exact-slot keyboard reordering, hidden-segment palette management, command text configuration, persisted Confirm/Exit semantics, live multi-row preview compatibility, narrow/Unicode rendering, and deterministic visual evidence.
 - Added opt-in `reasoningLanguage: english` guidance for technical work while preserving the user's requested response language; the default remains off.
 
+### Changed
+
+- Interactive assistant `text_delta` presentation now coalesces eligible updates into the latest message projection before the existing TUI frame while preserving ordered event processing, immediate non-text updates, and authoritative final output. Session/transcript replacement and disposal cancel stale presentation; temporary TUI stop/start rearms current live text before the first restarted frame without invalidating live historical image callbacks.
+
 ### Fixed
 
 - Credential replacement lookups now propagate the owning request's cancellation through scoped and allowed unscoped retries, preventing aborted turns from continuing OAuth preparation or selecting another key.
