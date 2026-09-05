@@ -12,6 +12,9 @@ export const CONTRIBUTION_PREP_SCHEMA_VERSION = 1;
 const MAX_TRANSCRIPT_MESSAGES = 20;
 const MAX_TEXT_CHARS = 12000;
 const MAX_GIT_OUTPUT_CHARS = 60000;
+const MAX_REDACTION_INPUT_CHARS = 1_000_000;
+const MAX_JSON_TOKENS = 20_000;
+const MAX_JSON_REPLACEMENTS = 10_000;
 
 export interface ContributionPrepArtifact {
 	path: string;
@@ -72,12 +75,140 @@ function replaceRegex(text: string, regex: RegExp, replacement: string, state: R
 	return text.replace(regex, replacement);
 }
 
+function redactAwsAccessKeyIds(text: string, state: RedactionState): string {
+	return replaceRegex(
+		text,
+		/(^|[^0-9A-Za-z])(?:AKIA|ASIA)[0-9A-Z]{16}(?![0-9A-Za-z])/g,
+		"$1[REDACTED_AWS_KEY_ID]",
+		state,
+		"aws_keys",
+	);
+}
+
+function isAwsSecretField(value: string): boolean {
+	const normalized = value.toLowerCase().replaceAll(/[_-]/g, "");
+	return (
+		normalized === "secretaccesskey" ||
+		normalized === "sessiontoken" ||
+		normalized === "awssecretaccesskey" ||
+		normalized === "awssessiontoken" ||
+		normalized === "xamzsecuritytoken"
+	);
+}
+
+function redactAwsLabeledValues(text: string, state: RedactionState): string {
+	let redacted = redactAwsAccessKeyIds(text, state);
+	redacted = replaceRegex(
+		redacted,
+		// STS XML responses are commonly pretty-printed, so the value sits on its own
+		// line between the tags. `[^<]` still refuses to cross into another element,
+		// while the call-wide input bound caps work without imposing a credential-size
+		// assumption. The lower bound leaves empty or whitespace-only bodies alone.
+		/(<((?:[A-Za-z_][\w.-]*:)?(?:SecretAccessKey|SessionToken))>)[^<]{8,1000000}(<\/\2>)/gi,
+		"$1[REDACTED_SECRET]$3",
+		state,
+		"aws_keys",
+	);
+	redacted = replaceRegex(
+		redacted,
+		/(^|[^A-Za-z0-9_-])(["']?(?:(?:aws[_-]?)?secret[_-]?access[_-]?key|(?:aws[_-]?)?session[_-]?token)["']?\s*[=:]\s*)(\$?)(["'`])([^"'`\r\n]{8,})\4/gi,
+		"$1$2$3$4[REDACTED_SECRET]$4",
+		state,
+		"aws_keys",
+	);
+	redacted = replaceRegex(
+		redacted,
+		/(^|[^A-Za-z0-9_-])(["']?(?:(?:aws[_-]?)?secret[_-]?access[_-]?key|(?:aws[_-]?)?session[_-]?token)["']?\s*[=:]\s*)[^\s"'`,;{}[\]()&<>#]{8,}/gi,
+		"$1$2[REDACTED_SECRET]",
+		state,
+		"aws_keys",
+	);
+	return replaceRegex(
+		redacted,
+		/(^|[?&;\s])(X-Amz-Security-Token)(\s*[=:]\s*)[^\s"'`,;&<>#]{8,}/gi,
+		"$1$2$3[REDACTED_SECRET]",
+		state,
+		"aws_keys",
+	);
+}
+
+function redactAwsJsonStrings(text: string, state: RedactionState, depth = 0): string {
+	const tokens = [...text.matchAll(/"(?:\\(?:["\\/bfnrt]|u[0-9A-Fa-f]{4})|[^"\\\r\n])*"/g)].map(match => ({
+		start: match.index,
+		end: match.index + match[0].length,
+		raw: match[0],
+	}));
+	if (tokens.length > MAX_JSON_TOKENS) {
+		state.labels.add("oversized_content");
+		return "[REDACTED_OVERSIZED_CONTENT]";
+	}
+	const replacements = new Map<number, { end: number; value: string }>();
+
+	for (const [index, token] of tokens.entries()) {
+		let decoded: string;
+		try {
+			decoded = JSON.parse(token.raw) as string;
+		} catch {
+			continue;
+		}
+
+		if (isAwsSecretField(decoded)) {
+			const separator = /^\s*:\s*/.exec(text.slice(token.end));
+			const valueToken = tokens[index + 1];
+			if (separator && valueToken?.start === token.end + separator[0].length) {
+				let value: string;
+				try {
+					value = JSON.parse(valueToken.raw) as string;
+				} catch {
+					value = "";
+				}
+				if (value.length >= 8)
+					replacements.set(valueToken.start, { end: valueToken.end, value: JSON.stringify("[REDACTED_SECRET]") });
+			}
+		}
+
+		const nestedRedacted = depth >= 3 ? "[REDACTED_NESTED_CONTENT]" : redactAwsJsonStrings(decoded, state, depth + 1);
+		const redacted = redactAwsLabeledValues(nestedRedacted, state);
+		if (redacted !== decoded && !replacements.has(token.start)) {
+			replacements.set(token.start, { end: token.end, value: JSON.stringify(redacted) });
+		}
+	}
+
+	if (replacements.size === 0) return text;
+	if (replacements.size > MAX_JSON_REPLACEMENTS) {
+		state.labels.add("oversized_content");
+		return "[REDACTED_OVERSIZED_CONTENT]";
+	}
+	state.labels.add("aws_keys");
+	const chunks: string[] = [];
+	let cursor = 0;
+	for (const [start, replacement] of [...replacements.entries()].sort(([left], [right]) => left - right)) {
+		chunks.push(text.slice(cursor, start), replacement.value);
+		cursor = replacement.end;
+	}
+	chunks.push(text.slice(cursor));
+	return chunks.join("");
+}
+
+function assertSafeArtifactPath(artifactDir: string): void {
+	const state: RedactionState = { labels: new Set() };
+	redactContributionPrepText(artifactDir, path.join(artifactDir, "__gjc_path_probe__"), state);
+	if (["tokens", "aws_keys", "provider_keys", "auth_headers", "cookies"].some(label => state.labels.has(label))) {
+		throw new Error("Contribution prep artifact path contains credential-like material.");
+	}
+}
+
 export function redactContributionPrepText(
 	text: string,
 	cwd: string,
 	state: RedactionState = { labels: new Set() },
 ): string {
-	let redacted = text;
+	if (text.length > MAX_REDACTION_INPUT_CHARS) {
+		state.labels.add("oversized_content");
+		return "[REDACTED_OVERSIZED_CONTENT]";
+	}
+	let redacted = redactAwsJsonStrings(text, state);
+	redacted = redactAwsLabeledValues(redacted, state);
 	redacted = replaceRegex(
 		redacted,
 		/\b(?:sk|pk|rk|xox[baprs])-[-_A-Za-z0-9]{12,}\b/g,
@@ -180,13 +311,21 @@ async function writeArtifact(
 }
 
 export function buildContributionPrepWorkerPrompt(manifestPath: string): string {
+	const manifestName = path.basename(manifestPath);
 	return [
 		"Prepare a maintainer-friendly contribution draft from the redacted context dump.",
-		"Read the manifest and referenced artifact file pointers. Do not assume transcript context was inlined here.",
-		`Manifest: ${manifestPath}`,
+		"Read the manifest beside this worker prompt and its relative artifact file pointers. Do not assume transcript context was inlined here.",
+		`Manifest: ${manifestName}`,
 		"Produce structured markdown with: title, problem summary, reproduction/context, proposed fix or implementation plan, affected files, tests to run, and uncertainty/remaining risks.",
 		"Do not create GitHub issues, open PRs, push branches, or perform remote writes unless the user explicitly confirms that action in this fresh session.",
 	].join("\n");
+}
+
+function safeWorkspaceLabel(cwd: string): string {
+	const resolved = path.resolve(cwd);
+	const home = os.homedir();
+	if (home && (resolved === home || resolved.startsWith(`${home}${path.sep}`))) return shortenPath(resolved);
+	return path.basename(resolved) || ".";
 }
 
 export async function prepareContributionPrep(
@@ -199,12 +338,14 @@ export async function prepareContributionPrep(
 		options.artifactRoot ?? path.join(context.cwd, ".gjc", "contribution-prep"),
 		safeTimestamp,
 	);
+	assertSafeArtifactPath(artifactDir);
 	await fs.mkdir(artifactDir, { recursive: true });
 
 	const redactions: RedactionState = { labels: new Set() };
 	const recentMessages = context.messages.slice(-MAX_TRANSCRIPT_MESSAGES);
 	const artifacts: ContributionPrepArtifact[] = [];
 	const redact = (text: string) => redactContributionPrepText(text, context.cwd, redactions);
+	const workspaceLabel = safeWorkspaceLabel(context.cwd);
 
 	artifacts.push(
 		await writeArtifact(
@@ -223,8 +364,8 @@ export async function prepareContributionPrep(
 				[
 					`# Contribution prep context`,
 					`Source session: ${context.sessionId}`,
-					`Session file: ${context.sessionFile ?? "(none)"}`,
-					`Working directory: ${context.cwd}`,
+					`Session file: ${context.sessionFile ? path.basename(context.sessionFile) : "(none)"}`,
+					`Working directory: ${workspaceLabel}`,
 					options.customInstructions || context.customInstructions
 						? `Custom instructions: ${options.customInstructions ?? context.customInstructions}`
 						: "Custom instructions: (none)",
@@ -253,7 +394,7 @@ export async function prepareContributionPrep(
 			"Redacted environment and reproduction metadata",
 			redact(
 				[
-					`cwd: ${context.cwd}`,
+					`cwd: ${workspaceLabel}`,
 					`git_head: ${gitHead ?? "unknown"}`,
 					`platform: ${process.platform}`,
 					`arch: ${process.arch}`,
@@ -266,15 +407,16 @@ export async function prepareContributionPrep(
 	const manifestPath = path.join(artifactDir, "manifest.json");
 	const workerPromptPath = path.join(artifactDir, "worker-prompt.md");
 	await Bun.write(workerPromptPath, `${buildContributionPrepWorkerPrompt(manifestPath)}\n`);
+	const manifestArtifacts = artifacts.map(artifact => ({ ...artifact, path: path.basename(artifact.path) }));
 
 	const manifest: ContributionPrepManifest = {
 		schema_version: CONTRIBUTION_PREP_SCHEMA_VERSION,
-		source_session_id: context.sessionId,
+		source_session_id: redact(context.sessionId),
 		created_at: createdAt,
-		cwd: redact(context.cwd),
+		cwd: redact(workspaceLabel),
 		git_head: gitHead,
 		changed_files: files.map(redact),
-		artifacts,
+		artifacts: manifestArtifacts,
 		redactions: [...redactions.labels].sort(),
 		recommended_output: [
 			"title",
@@ -285,7 +427,7 @@ export async function prepareContributionPrep(
 			"tests to run",
 			"uncertainty / remaining risks",
 		],
-		worker_prompt_path: workerPromptPath,
+		worker_prompt_path: path.basename(workerPromptPath),
 	};
 	await Bun.write(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
 
@@ -309,8 +451,8 @@ export async function prepareContributionPrep(
 			});
 		const command = resolveGjcCommand();
 		await spawn(
-			[command.cmd, ...command.args, "--no-skills", "--", `@${workerPromptPath}`],
-			context.cwd,
+			[command.cmd, ...command.args, "--no-skills", "--", `@${path.basename(workerPromptPath)}`],
+			artifactDir,
 			command.shell,
 		);
 		spawned = true;
