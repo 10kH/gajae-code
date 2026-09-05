@@ -4739,8 +4739,12 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const failureAlreadyPublished = failure === undefined || (hasExistingFailure && genericFailureKeys.length === 0);
 		const terminalEvidence = promptTerminalEvidenceFromAgentEnd(event);
 		const terminalOutcome =
-			event.stopReason === "cancelled"
-				? ({ kind: "stopped", reason: "cancelled", provenance: "client_cancel" } as const)
+			event.stopReason === "cancelled" ||
+			(event.stopReason === "maintenance" && event.maintenanceOutcome === "aborted")
+				? terminalStoppedOutcome(
+						event.stopReason,
+						event.stopReason === "maintenance" ? event.maintenanceOutcome : undefined,
+					)
 				: failure !== undefined
 					? canonicalFailedOutcome(failure)
 					: terminalEvidence.content?.text.trim() || terminalEvidence.hasActivity
