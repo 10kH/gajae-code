@@ -73,18 +73,14 @@ describe("renderer hot-path byte parity", () => {
 	it("reuses warm widths for duplicate, styled, fitting and over-width rows", async () => {
 		const term = new RecordingTerminal(12, 8);
 		const tui = new TUI(term);
-		const lines = ["界".repeat(10), "界".repeat(10), "👩🏽‍💻", "\x1b[31m界\x1b[0m"];
+		// Avoid ZWJ sequences: emulator geometry varies across platforms; CJK has stable width 2.
+		const lines = ["界".repeat(10), "界".repeat(10), "語", "\x1b[31m界\x1b[0m"];
 		tui.addChild({ render: () => [...lines], invalidate() {} });
 		try {
 			tui.start();
 			await settle(term);
 			const before = term.getViewport();
-			expect(before.slice(0, 4).map(line => line.trimEnd())).toEqual([
-				"界".repeat(6),
-				"界".repeat(6),
-				"👩🏽‍💻",
-				"界",
-			]);
+			expect(before.slice(0, 4).map(line => line.trimEnd())).toEqual(["界".repeat(6), "界".repeat(6), "語", "界"]);
 			__textHelperPerfCounters.reset();
 			tui.requestRender(true);
 			await settle(term);
@@ -92,12 +88,7 @@ describe("renderer hot-path byte parity", () => {
 			// interior blank rows must retain their positions across a forced repaint.
 			const after = term.getViewport();
 			assertSameGeometry(after, before);
-			expect(after.slice(0, 4).map(line => line.trimEnd())).toEqual([
-				"界".repeat(6),
-				"界".repeat(6),
-				"👩🏽‍💻",
-				"界",
-			]);
+			expect(after.slice(0, 4).map(line => line.trimEnd())).toEqual(["界".repeat(6), "界".repeat(6), "語", "界"]);
 			expect(__textHelperPerfCounters.visibleWidthsCalls).toBe(0);
 			expect(__textHelperPerfCounters.truncateLinesToWidthCalls).toBe(0);
 		} finally {
