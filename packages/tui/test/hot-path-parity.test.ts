@@ -20,6 +20,15 @@ async function settle(term: VirtualTerminal): Promise<void> {
 	await term.flush();
 }
 
+function assertSameGeometry(actual: string[], expected: string[]): void {
+	const normalize = (rows: string[]): string[] => {
+		const normalized = rows.map(row => row.trimEnd());
+		while (normalized.at(-1) === "") normalized.pop();
+		return normalized;
+	};
+	expect(normalize(actual)).toEqual(normalize(expected));
+}
+
 async function capture(line: string): Promise<string> {
 	const term = new RecordingTerminal(80, 8);
 	const tui = new TUI(term);
@@ -34,6 +43,12 @@ async function capture(line: string): Promise<string> {
 }
 
 describe("renderer hot-path byte parity", () => {
+	it("detects interior and leading blank-row displacement", () => {
+		expect(() => assertSameGeometry(["界", "", "X"], ["界", "X", ""])).toThrow();
+		expect(() => assertSameGeometry(["", "界", "X"], ["界", "X", ""])).toThrow();
+		assertSameGeometry(["界  ", "", "X", "", ""], ["界", "", "X"]);
+	});
+
 	it("preserves no-op text and complete non-erase CSI bytes", async () => {
 		const input = "plain 界 👩🏽‍💻 \x1b[31mred\x1b[0m";
 		expect(await capture(input)).toContain(input);
@@ -73,11 +88,16 @@ describe("renderer hot-path byte parity", () => {
 			__textHelperPerfCounters.reset();
 			tui.requestRender(true);
 			await settle(term);
-			// A forced repaint may materialize terminal-width padding and scroll the
-			// emulator when the initial frame was shorter than its viewport. Compare
-			// non-empty rendered content, not emulator cell history.
-			const content = (viewport: string[]): string[] => viewport.map(line => line.trimEnd()).filter(Boolean);
-			expect(content(term.getViewport())).toEqual(content(before));
+			// Ignore cell padding and trailing empty viewport rows only; leading and
+			// interior blank rows must retain their positions across a forced repaint.
+			const after = term.getViewport();
+			assertSameGeometry(after, before);
+			expect(after.slice(0, 4).map(line => line.trimEnd())).toEqual([
+				"界".repeat(6),
+				"界".repeat(6),
+				"👩🏽‍💻",
+				"界",
+			]);
 			expect(__textHelperPerfCounters.visibleWidthsCalls).toBe(0);
 			expect(__textHelperPerfCounters.truncateLinesToWidthCalls).toBe(0);
 		} finally {
