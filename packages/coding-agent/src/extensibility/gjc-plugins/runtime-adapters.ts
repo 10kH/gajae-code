@@ -353,7 +353,7 @@ async function isHostOwnedNodeExecutable(executablePath: string): Promise<boolea
 	const uid = process.getuid?.();
 	if (uid === undefined) return false;
 	let ownershipRoot = path.parse(executablePath).root;
-	let expectedUid = 0;
+	let managedOwnership = false;
 	const home = os.userInfo().homedir;
 	const managedRoots = [
 		path.join(home, ".nvm", "versions", "node"),
@@ -378,16 +378,17 @@ async function isHostOwnedNodeExecutable(executablePath: string): Promise<boolea
 		if (!rootStat.isDirectory() || (rootStat.uid !== 0 && rootStat.uid !== uid) || (rootStat.mode & 0o002) !== 0) {
 			return false;
 		}
-		expectedUid = rootStat.uid;
-		if (executable.uid !== expectedUid) return false;
+		managedOwnership = true;
+		if (executable.uid !== 0 && executable.uid !== uid) return false;
 	} else if (executable.uid !== 0) {
 		return false;
 	}
 	let current = path.dirname(executablePath);
 	for (;;) {
 		const stat = await fs.stat(current);
-		const writableMask = expectedUid === 0 ? 0o022 : 0o002;
-		if (!stat.isDirectory() || stat.uid !== expectedUid || (stat.mode & writableMask) !== 0) return false;
+		const ownerAllowed = stat.uid === 0 || (managedOwnership && stat.uid === uid);
+		const writableMask = stat.uid === 0 ? 0o022 : 0o002;
+		if (!stat.isDirectory() || !ownerAllowed || (stat.mode & writableMask) !== 0) return false;
 		if (current === ownershipRoot) return true;
 		const parent = path.dirname(current);
 		if (parent === current) return false;
