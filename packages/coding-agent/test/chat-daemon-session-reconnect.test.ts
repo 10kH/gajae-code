@@ -1833,7 +1833,7 @@ test("a rolled endpoint's first frame gets its own delivery budget, not the prev
 				await awaitReplayRequests(host, 3);
 				host.emit("new one");
 				await awaitRefusals(provider, 3);
-				await Bun.sleep(50);
+				await awaitFrameSettlement(GENERATION + 1, 1);
 				expect(warnings.filter(line => line.includes("conceded seq"))).toEqual([]);
 				expect(warnings).toContain(
 					`chat daemon replay barrier failed (publication failed at seq 1 (slack provider is unavailable)); rebuilding session ${SESSION_ID} at generation ${GENERATION + 1} from seq 0.`,

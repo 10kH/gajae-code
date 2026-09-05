@@ -12,6 +12,10 @@ import { SessionManager } from "../src/session/session-manager";
 
 const cliEntrypoint = path.resolve(import.meta.dir, "../src/cli.ts");
 
+// Live frames a fake host pushes only after it has answered a replay, so a tail
+// that exits on replayed history alone provably never observes them.
+const DEFERRED_LIVE_EVENT_DELAY_MS = 300;
+
 // The Router's attach-time replay calls the transport directly, while the CLI's
 // explicit tail replay goes through SessionRouter.request, which stamps
 // connectionId onto the wire frame. That difference is the fake host's only
@@ -266,7 +270,7 @@ describe("SDK session CLI", () => {
 						if (deferredLiveEvents.length > 0 && !deferredLiveDispatched) {
 							deferredLiveDispatched = true;
 							const pending = deferredLiveEvents;
-							void Bun.sleep(300).then(() => {
+							void Bun.sleep(DEFERRED_LIVE_EVENT_DELAY_MS).then(() => {
 								for (const event of pending)
 									for (const target of openSockets) {
 										try {
