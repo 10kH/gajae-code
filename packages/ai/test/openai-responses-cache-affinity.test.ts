@@ -15,10 +15,6 @@ function createSseResponse(events: unknown[]): Response {
 	});
 }
 
-function getHeader(headers: RequestInit["headers"], name: string): string | null {
-	return new Headers(headers).get(name);
-}
-
 async function captureOpenAIResponseHeaders(
 	options: OpenAIResponsesOptions,
 	modelOverride: Model<"openai-responses"> = model,
@@ -26,18 +22,28 @@ async function captureOpenAIResponseHeaders(
 ): Promise<{
 	sessionId: string | null;
 	clientRequestId: string | null;
+	openCodeSessionId: string | null;
+	url: string | null;
 	body: Record<string, unknown> | null;
 	message: AssistantMessage | null;
 }> {
 	const captured = {
 		sessionId: null as string | null,
 		clientRequestId: null as string | null,
+		openCodeSessionId: null as string | null,
+		url: null as string | null,
 		body: null as Record<string, unknown> | null,
 		message: null as AssistantMessage | null,
 	};
-	const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
-		captured.sessionId = getHeader(init?.headers, "session_id");
-		captured.clientRequestId = getHeader(init?.headers, "x-client-request-id");
+	const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+		const headers = new Headers(input instanceof Request ? input.headers : undefined);
+		new Headers(init?.headers).forEach((value, key) => {
+			headers.set(key, value);
+		});
+		captured.sessionId = headers.get("session_id");
+		captured.clientRequestId = headers.get("x-client-request-id");
+		captured.openCodeSessionId = headers.get("x-opencode-session");
+		captured.url = input instanceof Request ? input.url : String(input);
 		captured.body = typeof init?.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : null;
 		return createSseResponse([
 			{
@@ -76,7 +82,11 @@ async function captureOpenAIResponseHeaders(
 		systemPrompt: ["stable system", "stable durable context"],
 		messages: [{ role: "user", content: "hi", timestamp: Date.now() }],
 	};
-	const stream = streamOpenAIResponses(modelOverride, context, { apiKey: "test-key", ...options });
+	const stream = streamOpenAIResponses(modelOverride, context, {
+		apiKey: "test-key",
+		...(modelOverride.baseUrl === model.baseUrl ? { authCredentialType: "oauth" as const } : {}),
+		...options,
+	});
 
 	for await (const event of stream) {
 		if (event.type === "done") {
@@ -95,6 +105,37 @@ afterEach(() => {
 });
 
 describe("openai-responses cache affinity", () => {
+	it("sends the opaque provider identity for bundled OpenCode Go Responses models", async () => {
+		const openCodeModel = getBundledModel("opencode-go", "grok-4.6") as Model<"openai-responses">;
+		const captured = await captureOpenAIResponseHeaders(
+			{ sessionId: "generic-cache-key", providerSessionId: "opaque-provider-session" },
+			openCodeModel,
+		);
+
+		expect(captured.url).toBe("https://opencode.ai/zen/go/v1/responses");
+		expect(captured.openCodeSessionId).toBe("opaque-provider-session");
+		expect(captured.sessionId).toBeNull();
+		expect(captured.clientRequestId).toBeNull();
+	});
+
+	it("strips injected OpenCode headers from unauthorized Responses endpoints", async () => {
+		const openCodeModel = getBundledModel("opencode-go", "grok-4.6") as Model<"openai-responses">;
+		const captured = await captureOpenAIResponseHeaders(
+			{
+				providerSessionId: "opaque-provider-session",
+				headers: { "X-OpenCode-Session": "options-injection" },
+			},
+			{
+				...openCodeModel,
+				baseUrl: "https://relay.example.com/v1",
+				headers: { "X-OpenCode-Session": "model-injection" },
+				requestTransform: { setHeaders: { "x-opencode-session": "transform-injection" } },
+			},
+		);
+
+		expect(captured.openCodeSessionId).toBeNull();
+	});
+
 	it("sets session routing headers for the canonical official OpenAI Responses origin", async () => {
 		const captured = await captureOpenAIResponseHeaders({ sessionId: "session-123" });
 
@@ -450,12 +491,18 @@ describe("openai-responses cache affinity", () => {
 		const previous = Bun.env.OPENAI_BASE_URL;
 		try {
 			Bun.env.OPENAI_BASE_URL = "https://relay.example.com/v1";
-			const custom = await captureOpenAIResponseHeaders({ sessionId: "session-123" });
+			const custom = await captureOpenAIResponseHeaders({
+				sessionId: "session-123",
+				authCredentialType: "api_key",
+			});
 			expect(custom.sessionId).toBeNull();
 			expect(custom.clientRequestId).toBeNull();
 
 			Bun.env.OPENAI_BASE_URL = "http://api.openai.com/v1";
-			const http = await captureOpenAIResponseHeaders({ sessionId: "session-123" });
+			const http = await captureOpenAIResponseHeaders({
+				sessionId: "session-123",
+				authCredentialType: "api_key",
+			});
 			expect(http.sessionId).toBeNull();
 			expect(http.clientRequestId).toBeNull();
 		} finally {

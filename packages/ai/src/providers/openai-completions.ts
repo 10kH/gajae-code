@@ -100,6 +100,11 @@ import {
 	wrapFetchForOpenAIRequestTransform,
 } from "./openai-request-transform";
 import { createInitialResponsesAssistantMessage } from "./openai-responses-shared";
+import {
+	applyOpenCodeGoSessionHeader,
+	resolveOpenCodeGoSessionId,
+	wrapFetchForOpenCodeGoSession,
+} from "./opencode-go-session";
 import { transformMessages } from "./transform-messages";
 import { joinTextWithImagePlaceholder, NON_VISION_IMAGE_PLACEHOLDER } from "./vision-guard";
 
@@ -128,40 +133,6 @@ function resolveOpenAIProviderBaseUrl(
 		return envBaseUrl;
 	}
 	return configuredBaseUrl || envBaseUrl || OPENAI_DEFAULT_BASE_URL;
-}
-
-function resolveOpenCodeGoSessionId(
-	model: Model<"openai-completions">,
-	baseUrl: string | undefined,
-	sessionId: string | undefined,
-): string | undefined {
-	if (model.provider !== "opencode-go" || !baseUrl || !sessionId) return undefined;
-	try {
-		const url = new URL(baseUrl);
-		if (url.origin !== "https://opencode.ai") return undefined;
-		if (url.pathname.replace(/\/+$/u, "") !== "/zen/go/v1") return undefined;
-		return sessionId;
-	} catch {
-		return undefined;
-	}
-}
-
-function wrapFetchForOpenCodeGoSession(baseFetch: FetchImpl, sessionId: string | undefined): FetchImpl {
-	return Object.assign(
-		async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
-			if (input instanceof Request) {
-				const request = new Request(input, init);
-				request.headers.delete("x-opencode-session");
-				if (sessionId) request.headers.set("x-opencode-session", sessionId);
-				return baseFetch(request);
-			}
-			const headers = new Headers(init?.headers);
-			headers.delete("x-opencode-session");
-			if (sessionId) headers.set("x-opencode-session", sessionId);
-			return baseFetch(input, { ...init, headers });
-		},
-		baseFetch.preconnect ? { preconnect: baseFetch.preconnect } : {},
-	);
 }
 
 /** Test seam: the provider base URL as resolved from trusted env. */
@@ -1392,14 +1363,11 @@ async function createClient(
 	const endpointRequestQuery = endpointQuery;
 	const requestQuery =
 		[endpointRequestQuery, azureQuery].filter((query): query is string => query !== undefined).join("&") || undefined;
-	const openCodeGoSessionId = resolveOpenCodeGoSessionId(model, clientBaseUrl, providerSessionId);
+	const openCodeGoSessionId = resolveOpenCodeGoSessionId(model, clientBaseUrl, providerSessionId, "openai");
 	// Reserve the provider-specific header on every OpenAI-compatible route. Caller,
 	// model, and transform values are removed unless the exact OpenCode Go endpoint
 	// has an opaque identity owned by the agent's conversation lifecycle.
-	const normalizedHeaders = new Headers(headers);
-	normalizedHeaders.delete("x-opencode-session");
-	if (openCodeGoSessionId) normalizedHeaders.set("x-opencode-session", openCodeGoSessionId);
-	headers = Object.fromEntries(normalizedHeaders.entries());
+	headers = applyOpenCodeGoSessionHeader(headers, openCodeGoSessionId);
 	let capturedErrorResponse: CapturedHttpErrorResponse | undefined;
 	const baseFetch = fetchOverride ?? fetch;
 	const wrappedFetch = Object.assign(

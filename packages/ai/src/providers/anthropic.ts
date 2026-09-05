@@ -111,6 +111,11 @@ import {
 	hasCopilotVisionInput,
 	resolveGitHubCopilotBaseUrl,
 } from "./github-copilot-headers";
+import {
+	applyOpenCodeGoSessionHeader,
+	resolveOpenCodeGoSessionId,
+	wrapFetchForOpenCodeGoSession,
+} from "./opencode-go-session";
 import { hasAdjacentPrivateThinkingBlocks, transformMessages } from "./transform-messages";
 import { NON_VISION_IMAGE_PLACEHOLDER } from "./vision-guard";
 
@@ -1126,6 +1131,7 @@ export type AnthropicClientOptionsArgs = {
 	maxRetryDelayMs?: number;
 	streamFirstEventTimeoutMs?: number;
 	streamIdleTimeoutMs?: number;
+	providerSessionId?: string;
 };
 
 export type AnthropicClientOptionsResult = {
@@ -1940,6 +1946,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					maxRetryDelayMs: options?.maxRetryDelayMs,
 					streamFirstEventTimeoutMs: options?.streamFirstEventTimeoutMs,
 					streamIdleTimeoutMs: options?.streamIdleTimeoutMs,
+					providerSessionId: options?.providerSessionId,
 				});
 				client = created.client;
 				isOAuthToken = created.isOAuthToken;
@@ -3107,7 +3114,11 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 	const tlsFetchOptions = buildClaudeCodeTlsFetchOptions(model, baseUrl);
 	const baseFetch = args.fetch ?? fetch;
 	const boundedFetch = wrapAnthropicFetchForBoundedRateLimits(baseFetch, args.maxRetryDelayMs);
-	const debugFetch = onSseEvent ? wrapFetchForSseDebug(boundedFetch, event => onSseEvent(event, model)) : boundedFetch;
+	const openCodeGoSessionId = resolveOpenCodeGoSessionId(model, baseUrl, args.providerSessionId, "anthropic");
+	const providerScopedFetch = wrapFetchForOpenCodeGoSession(boundedFetch, openCodeGoSessionId);
+	const debugFetch = onSseEvent
+		? wrapFetchForSseDebug(providerScopedFetch, event => onSseEvent(event, model))
+		: providerScopedFetch;
 	// Bound the connect/headers phase. The first-event watchdog arms only after
 	// response headers arrive, so a request whose connection dies before headers
 	// was previously governed only by the Anthropic SDK's 10-minute default per
@@ -3124,16 +3135,19 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 		if (needsFineGrainedToolStreamingBeta) {
 			betaFeatures.push(fineGrainedToolStreamingBeta);
 		}
-		const defaultHeaders = mergeHeaders(
-			{
-				Accept: stream ? "text/event-stream" : "application/json",
-				"Anthropic-Dangerous-Direct-Browser-Access": "true",
-				Authorization: `Bearer ${copilotApiKey}`,
-				...(betaFeatures.length > 0 ? { "anthropic-beta": buildBetaHeader([], betaFeatures) } : {}),
-			},
-			model.headers,
-			dynamicHeaders,
-			headers,
+		const defaultHeaders = applyOpenCodeGoSessionHeader(
+			mergeHeaders(
+				{
+					Accept: stream ? "text/event-stream" : "application/json",
+					"Anthropic-Dangerous-Direct-Browser-Access": "true",
+					Authorization: `Bearer ${copilotApiKey}`,
+					...(betaFeatures.length > 0 ? { "anthropic-beta": buildBetaHeader([], betaFeatures) } : {}),
+				},
+				model.headers,
+				dynamicHeaders,
+				headers,
+			),
+			openCodeGoSessionId,
 		);
 
 		return {
@@ -3159,16 +3173,19 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 		betaFeatures.push(interleavedThinkingBeta);
 	}
 
-	const defaultHeaders = buildAnthropicHeaders({
-		apiKey,
-		baseUrl,
-		isOAuth: oauthToken,
-		extraBetas: betaFeatures,
-		stream,
-		modelHeaders: mergeHeaders(model.headers, foundryCustomHeaders, headers, dynamicHeaders),
-		isCloudflareAiGateway: model.provider === "cloudflare-ai-gateway",
-		zcodeSourceHeaders: model.provider === "glm-zcode",
-	});
+	const defaultHeaders = applyOpenCodeGoSessionHeader(
+		buildAnthropicHeaders({
+			apiKey,
+			baseUrl,
+			isOAuth: oauthToken,
+			extraBetas: betaFeatures,
+			stream,
+			modelHeaders: mergeHeaders(model.headers, foundryCustomHeaders, headers, dynamicHeaders),
+			isCloudflareAiGateway: model.provider === "cloudflare-ai-gateway",
+			zcodeSourceHeaders: model.provider === "glm-zcode",
+		}),
+		openCodeGoSessionId,
+	);
 
 	if (model.provider === "cloudflare-ai-gateway") {
 		return {
