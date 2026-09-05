@@ -263,9 +263,16 @@ process.argv = [process.execPath, entrypointPath, ...serverArgs];
 await import(pathToFileURL(entrypointPath).href);
 `;
 
-async function readStableFile(filePath: string, label: string, maxBytes: number): Promise<Buffer> {
+async function readStableFile(
+	filePath: string,
+	label: string,
+	maxBytes: number,
+	followSymlink = false,
+): Promise<Buffer> {
 	const noFollow =
-		filePath === "/proc/self/exe" || typeof fs.constants.O_NOFOLLOW !== "number" ? 0 : fs.constants.O_NOFOLLOW;
+		followSymlink || filePath === "/proc/self/exe" || typeof fs.constants.O_NOFOLLOW !== "number"
+			? 0
+			: fs.constants.O_NOFOLLOW;
 	const flags = fs.constants.O_RDONLY | noFollow;
 	const handle = await fs.open(filePath, flags);
 	try {
@@ -327,6 +334,7 @@ async function resolveTrustedStdioLauncher(
 		try {
 			const lexical = path.resolve(candidate);
 			if (untrustedRoots.some(root => isWithin(root, lexical))) continue;
+			if (await isRootControlledLauncherPath(lexical)) return lexical;
 			const real = await fs.realpath(lexical);
 			if (untrustedRoots.some(root => isWithin(root, real))) continue;
 			if (await isHostOwnedNodeExecutable(real)) return real;
@@ -335,6 +343,20 @@ async function resolveTrustedStdioLauncher(
 		}
 	}
 	throw new Error(`Trusted stdio launcher is unavailable from absolute host PATH entries: ${launcher}`);
+}
+
+async function isRootControlledLauncherPath(executablePath: string): Promise<boolean> {
+	if (process.platform === "win32") return false;
+	const target = await fs.stat(executablePath);
+	if (!target.isFile() || (target.mode & 0o022) !== 0) return false;
+	let current = path.dirname(executablePath);
+	for (;;) {
+		const stat = await fs.stat(current);
+		if (!stat.isDirectory() || stat.uid !== 0 || (stat.mode & 0o022) !== 0) return false;
+		const parent = path.dirname(current);
+		if (parent === current) return true;
+		current = parent;
+	}
 }
 
 async function isHostOwnedNodeExecutable(executablePath: string): Promise<boolean> {
@@ -519,7 +541,12 @@ async function prepareVerifiedStdioLaunch(input: {
 		await fs.mkdir(snapshotRoot, { mode: 0o700 });
 		if ((await fs.realpath(capsuleRoot)) !== capsuleRoot) throw new Error("Plugin MCP launch capsule path drifted");
 
-		const launcherBytes = await readStableFile(input.launcherPath, "Plugin MCP interpreter", MCP_LAUNCHER_MAX_BYTES);
+		const launcherBytes = await readStableFile(
+			input.launcherPath,
+			"Plugin MCP interpreter",
+			MCP_LAUNCHER_MAX_BYTES,
+			true,
+		);
 		await fs.writeFile(launcherPath, launcherBytes, { flag: "wx", mode: 0o500 });
 
 		for (const file of input.files) {
