@@ -6,6 +6,7 @@
 
 - Notification WebSocket admission now bounds incomplete handshakes to 16 concurrent tasks and expires them after two seconds without limiting authenticated clients.
 - Notification WebSocket admission now drains queued sockets through a reserved descriptor when the process reaches its file-descriptor limit, preventing cleanup starvation and restoring valid loopback upgrades after low-FD saturation.
+- Keep Windows-only status constants out of non-Windows test builds and mark the non-Linux atomic-rename rejection helper as constant, keeping native tests and strict Clippy checks warning-free.
 
 ## [0.16.3] - 2026-09-04
 
