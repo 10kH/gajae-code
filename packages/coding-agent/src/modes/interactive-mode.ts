@@ -1073,12 +1073,13 @@ export class InteractiveMode implements InteractiveModeContext {
 		// Make this session visible in Paseo. Interactive-only by construction: a
 		// `gjc acp` provider process never builds an InteractiveMode, so an imported
 		// session can never announce itself back into Paseo.
-		if (this.settings.get("paseo.autoImport")) {
+		if (this.settings.getGlobal("paseo.autoImport") === true) {
 			const sessionId = this.sessionManager.getSessionId();
 			const announcement = startPaseoAnnouncement(
 				{
 					sessionId,
 					cwd: this.sessionManager.getCwd(),
+					isEnabled: () => this.settings.getGlobal("paseo.autoImport") === true,
 					onOutcome: outcome => {
 						if (this.#stopped || outcome.kind === "skipped") return;
 						this.showStatus(
@@ -1091,7 +1092,13 @@ export class InteractiveMode implements InteractiveModeContext {
 				},
 				createDefaultPaseoAnnounceDependencies(getAgentDir()),
 			);
-			this.#stopListeners.add(() => announcement.cancel());
+			const stopWatchingSettings = this.settings.onChanged(path => {
+				if (path === "paseo.autoImport" && this.settings.getGlobal(path) !== true) announcement.cancel();
+			});
+			this.#stopListeners.add(() => {
+				stopWatchingSettings();
+				announcement.cancel();
+			});
 		}
 
 		if (starReminderGate.schedule) {

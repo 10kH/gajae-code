@@ -24,7 +24,7 @@ deepest integration GJC has with any external app.
 ### Install
 
 ```sh
-gjc setup paseo             # register GJC as an ACP provider in ~/.paseo/config.json
+gjc setup paseo             # register GJC in $PASEO_HOME/config.json (default ~/.paseo/config.json)
 paseo daemon restart        # Paseo caches config in a long-lived daemon
 paseo provider ls           # gjc must read `available`, not `error`
 ```
@@ -39,7 +39,8 @@ conservative:
 
 - a round-trip fidelity self-check refuses to touch a config GJC cannot reproduce byte-for-byte;
 - publication is guarded by a compare-and-swap, with a mode-0600 backup beside the original
-  (`~/.paseo/config.json` holds a credential, which never reaches stdout, stderr, `--json`, or a diff);
+  (`$PASEO_HOME/config.json`, default `~/.paseo/config.json`, holds a credential that never reaches
+  stdout, stderr, `--json`, or a diff);
 - a durable, credential-free intent record makes an interrupted run recoverable;
 - the Paseo daemon is never restarted for you.
 
@@ -85,25 +86,29 @@ gjc config set paseo.autoImport true    # or Settings → Interaction → "Annou
 ```
 
 Once enabled, when an interactive session starts, and only when a GJC provider is already registered
-in `~/.paseo/config.json` **and** the Paseo daemon is already listening, GJC runs the equivalent of:
+in `$PASEO_HOME/config.json` (default `~/.paseo/config.json`) **and** the Paseo daemon is already
+listening, GJC runs the equivalent of:
 
 ```sh
-paseo import --provider gjc --cwd /path/to/repo <session-id>
+paseo import --provider <provider-key> --cwd /path/to/repo <session-id>
 ```
 
-The order of checks is what keeps this free: an absent `~/.paseo/config.json`, no GJC provider entry,
+The base `gjc` provider is preferred. When it is absent, the first enabled `gjc-<preset>` provider is
+used instead. The order of checks is what keeps this free: an absent Paseo config, no valid GJC ACP provider entry,
 no `paseo` on PATH, or a daemon that is not listening each stop the announcement before anything is
 spawned. The daemon check is a plain socket probe, because the Paseo CLI blocks indefinitely when its
 daemon is down. A session that is not yet registered with the broker is never imported either, since
 that would make `session/load` resume a second host for a session that is already running. While the
-daemon is simply not up yet, GJC retries the probe on a slow cadence for a few minutes, so starting
-Paseo after your terminal still works.
+daemon is simply not up yet, GJC retries the probe every 30 seconds for approximately ten minutes, so
+starting Paseo after your terminal still works. Retry states are recorded at debug level; a genuine
+import failure is shown as a nonblocking status, while absent/configuration skip outcomes remain quiet.
 
 Re-importing an already-imported session is a no-op: Paseo refuses it and GJC reads that refusal as
 success. A daemon that requires a password is skipped in the same quiet way — the socket probe cannot
 see that, because the TCP connect succeeds, so it is recognized from the CLI's refusal; export
 `PASEO_PASSWORD` if you want announcements to reach a protected daemon. Set `paseo.autoImport` back to
-`false` to stop announcing again.
+`false` to stop announcing on future launches. An already-running process keeps its loaded setting;
+exit that session to cancel its pending or active announcement.
 
 ### Lifecycle: GJC creates, you delete
 
@@ -126,8 +131,9 @@ paseo delete <agent-id>
 ```
 
 If that bookkeeping is not worth it to you, leave `paseo.autoImport` off and import the sessions you
-actually want to drive by hand — `paseo import --provider gjc --cwd "$PWD" <session-id>` is exactly
-what the setting automates.
+actually want to drive by hand — `paseo import --provider <provider-key> --cwd "$PWD" <session-id>` is
+exactly what the setting automates. Use `gjc` when the base provider is enabled, or the selected
+`gjc-<preset>` key when only a preset provider is available.
 
 Nothing else about the integration depends on this setting: `paseo run --provider gjc` and manual
 `paseo import` work exactly the same whether it is on or off.
@@ -163,14 +169,15 @@ GJC owns, add to the provider's `env` entry and restart the Paseo daemon:
 | `gjc` reads `error` in `paseo provider ls` | daemon still holds the pre-install config | `paseo daemon restart` |
 | `gjc setup paseo --check` reports `stale` | config is correct, daemon has not reloaded | `paseo daemon restart` |
 | `gjc setup paseo --check` reports `drift` | the entry was edited by hand or by another tool | reconcile manually, or `--remove` then re-install |
-| `failed to create agent` in `~/.paseo/daemon.log` | `gjc` not resolvable from the daemon's PATH | re-run `gjc setup paseo` so the absolute path is rewritten |
+| `failed to create agent` in `$PASEO_HOME/daemon.log` (default `~/.paseo/daemon.log`) | `gjc` not resolvable from the daemon's PATH | re-run `gjc setup paseo` so the absolute path is rewritten |
 | Permission-gated tools never prompt | `GJC_ACP_PERMISSION_MODE` overridden | set it back to `prompt` in the provider `env` |
 | Nothing appears in Paseo after `gjc` | `paseo.autoImport` is off (the default) | `gjc config set paseo.autoImport true` |
 | Still nothing, and the log says `daemon-auth-required` | the daemon requires a password and `PASEO_PASSWORD` is not exported where `gjc` runs | export it, or leave it and import by hand |
 | Still nothing, and there is no announcement log line at all | the `gjc` on `PATH` predates the feature | rebuild/reinstall, then confirm with `gjc config get paseo.autoImport` |
 
-The announcement is best-effort and never interrupts a launch, so every failure is quiet by design.
-The outcome is always recorded once per session at debug level:
+The announcement is best-effort and never interrupts a launch. Configuration skips remain quiet,
+retries and the terminal outcome are recorded at debug level, and a genuine import failure appears as
+a nonblocking status message:
 
 ```sh
 grep 'Paseo session announcement' ~/.gjc/logs/gjc.$(date +%F).log | tail -1

@@ -79,21 +79,27 @@ interface ControlResponse {
 }
 
 interface HostHarness {
-	control(operation: string, input: Record<string, unknown>): Promise<ControlResponse>;
+	control(operation: string, input: Record<string, unknown>, connectionId?: string): Promise<ControlResponse>;
 	emit(event: string, payload?: unknown): Promise<void>;
+	setIdle(idle: boolean): void;
 	clearFrames(): void;
 	readonly sent: Array<{ connectionId: string; frame: SdkFrame }>;
 	readonly broadcasts: SdkFrame[];
 	stop(): Promise<void>;
 }
 
-async function createHostHarness(sessionId: string, cwd: string): Promise<HostHarness> {
+async function createHostHarness(
+	sessionId: string,
+	cwd: string,
+	harnessOptions: { settleSubmission?: "never" | "resolve" } = {},
+): Promise<HostHarness> {
 	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
 	const waiters = new Map<string, (frame: ControlResponse) => void>();
 	const sent: Array<{ connectionId: string; frame: SdkFrame }> = [];
 	const broadcasts: SdkFrame[] = [];
 	let receive: ((connectionId: string, frame: SdkFrame) => void) | undefined;
 	let nextId = 0;
+	let idle = true;
 	const api = {
 		on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
 			handlers.set(event, handler);
@@ -102,9 +108,14 @@ async function createHostHarness(sessionId: string, cwd: string): Promise<HostHa
 		// hold the submission open: these tests never end the turn.
 		sendUserMessage: async (
 			_content: unknown,
-			options?: { onPreflightAcceptCommit?: () => void | Promise<void> },
+			options?: {
+				onPreflightAcceptCommit?: () => void | Promise<void>;
+				onQueuedPromoted?: (promotion?: { startsOwnRun?: boolean; removed?: boolean }) => void;
+			},
 		) => {
 			await options?.onPreflightAcceptCommit?.();
+			if (!idle) options?.onQueuedPromoted?.({ startsOwnRun: false });
+			if (harnessOptions.settleSubmission === "resolve") return;
 			return await new Promise<never>(() => {});
 		},
 	} as unknown as ExtensionAPI;
@@ -137,7 +148,7 @@ async function createHostHarness(sessionId: string, cwd: string): Promise<HostHa
 		cwd,
 		workflowGate: undefined,
 		sdkBindings: () => [],
-		isIdle: () => true,
+		isIdle: () => idle,
 		abort: () => {},
 		sessionManager: {
 			getSessionId: () => sessionId,
@@ -148,11 +159,11 @@ async function createHostHarness(sessionId: string, cwd: string): Promise<HostHa
 	} as unknown as ExtensionContext;
 	await handlers.get("session_start")?.({}, ctx);
 	return {
-		control: (operation, input) => {
+		control: (operation, input, connectionId = "client") => {
 			const id = `frame-${nextId++}`;
 			const { promise, resolve } = Promise.withResolvers<ControlResponse>();
 			waiters.set(id, resolve);
-			receive?.("client", { type: "control_request", operation, input, id });
+			receive?.(connectionId, { type: "control_request", operation, input, id });
 			return promise;
 		},
 		emit: async (event, payload = {}) => {
@@ -161,6 +172,9 @@ async function createHostHarness(sessionId: string, cwd: string): Promise<HostHa
 		clearFrames: () => {
 			sent.length = 0;
 			broadcasts.length = 0;
+		},
+		setIdle: value => {
+			idle = value;
 		},
 		sent,
 		broadcasts,
@@ -288,6 +302,105 @@ describe("SDK host turn streaming", () => {
 
 			expect(harness.sent).toHaveLength(0);
 			expect(harness.broadcasts).toHaveLength(0);
+		} finally {
+			await harness.stop();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("streams a shared in-run prompt only to both submitting connections", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-stream-shared-"));
+		const harness = await createHostHarness(SESSION_ID, cwd);
+		try {
+			const root = await harness.control("turn.prompt", { text: "root" }, "root-client");
+			expect(root.ok).toBe(true);
+			await harness.emit("agent_start");
+			harness.setIdle(false);
+			const attached = await harness.control("turn.prompt", { text: "attached" }, "attached-client");
+			expect(attached.ok).toBe(true);
+			harness.clearFrames();
+
+			const event = textDelta("shared");
+			await harness.emit("message_update", event);
+
+			expect(harness.sent).toEqual([
+				{
+					connectionId: "root-client",
+					frame: expect.objectContaining({
+						kind: "message_update",
+						commandId: root.result?.commandId,
+						turnId: root.result?.turnId,
+					}),
+				},
+				{
+					connectionId: "attached-client",
+					frame: expect.objectContaining({
+						kind: "message_update",
+						commandId: attached.result?.commandId,
+						turnId: attached.result?.turnId,
+					}),
+				},
+			]);
+		} finally {
+			await harness.stop();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("keeps independently pending prompt streams bound to their own sdk run tokens", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-stream-token-isolation-"));
+		const harness = await createHostHarness(SESSION_ID, cwd);
+		try {
+			const first = await harness.control("turn.prompt", { text: "first" }, "first-client");
+			const second = await harness.control("turn.prompt", { text: "second" }, "second-client");
+			const firstToken = `${first.result?.commandId}:${first.result?.turnId}`;
+			const secondToken = `${second.result?.commandId}:${second.result?.turnId}`;
+
+			await harness.emit("agent_start", { sdkRunToken: firstToken });
+			harness.clearFrames();
+			await harness.emit("message_update", textDelta("first-only"));
+			expect(harness.sent.map(frame => frame.connectionId)).toEqual(["first-client"]);
+			await harness.emit("agent_end", { sdkRunToken: firstToken, stopReason: "completed" });
+			const firstTerminals = harness.broadcasts.filter(
+				frame =>
+					frame.kind === "agent_end" &&
+					(frame.payload as { commandId?: unknown } | undefined)?.commandId === first.result?.commandId,
+			);
+			expect(firstTerminals).toHaveLength(1);
+			expect((firstTerminals[0]?.payload as { outcome?: unknown } | undefined)?.outcome).toEqual({
+				kind: "stopped",
+				reason: "end_turn",
+				provenance: "agent",
+			});
+
+			await harness.emit("agent_start", { sdkRunToken: secondToken });
+			harness.clearFrames();
+			await harness.emit("message_update", textDelta("second-only"));
+			expect(harness.sent.map(frame => frame.connectionId)).toEqual(["second-client"]);
+			await harness.emit("agent_end", { sdkRunToken: secondToken, stopReason: "completed" });
+		} finally {
+			await harness.stop();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("publishes one failed terminal when accepted work resolves without lifecycle evidence", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-stream-no-start-"));
+		const harness = await createHostHarness(SESSION_ID, cwd, { settleSubmission: "resolve" });
+		try {
+			const accepted = await harness.control("turn.prompt", { text: "no lifecycle" });
+			expect(accepted.ok).toBe(true);
+			await Bun.sleep(50);
+			const terminals = harness.broadcasts.filter(
+				frame =>
+					frame.kind === "agent_end" &&
+					(frame.payload as { commandId?: unknown } | undefined)?.commandId === accepted.result?.commandId,
+			);
+			expect(terminals).toHaveLength(1);
+			expect((terminals[0]?.payload as { outcome?: unknown } | undefined)?.outcome).toMatchObject({
+				kind: "failed",
+				code: "prompt_failed",
+			});
 		} finally {
 			await harness.stop();
 			await rm(cwd, { recursive: true, force: true });

@@ -26,12 +26,13 @@
  * that never asked for it pays nothing at all.
  */
 import * as net from "node:net";
-import * as os from "node:os";
 import * as path from "node:path";
 import { $which, logger } from "@gajae-code/utils";
 import { AgentDirSessionLifecycleClient } from "../../sdk/lifecycle/broker-client";
 import { sessionListPageFromResponse, traverseSessionList } from "../../sdk/session-list";
-import { PROVIDER_KEY } from "./setup-deps";
+import { PROVIDER_EXTENDS, PROVIDER_KEY, resolvePaseoHome } from "./setup-deps";
+
+export { resolvePaseoHome } from "./setup-deps";
 
 /** Cheap liveness probe of the daemon socket. Only gates the expensive CLI spawn. */
 const DAEMON_PROBE_TIMEOUT_MS = 750;
@@ -45,7 +46,7 @@ const RETRY_INTERVAL_MS = 30_000;
 const MAX_ATTEMPTS = 20;
 
 /** Paseo's own default when nothing configures a listener. */
-const DEFAULT_DAEMON_TARGET: PaseoDaemonTarget = { kind: "tcp", host: "127.0.0.1", port: 6767 };
+const DEFAULT_DAEMON_TARGET: PaseoDaemonTarget = { kind: "tcp", host: "localhost", port: 6767 };
 
 export type PaseoDaemonTarget =
 	| { readonly kind: "ipc"; readonly socketPath: string }
@@ -84,16 +85,12 @@ export interface PaseoAnnounceDependencies {
 		readonly providerKey: string;
 		readonly cwd: string;
 		readonly sessionId: string;
+		readonly signal?: AbortSignal;
 	}): Promise<PaseoAnnounceOutcome>;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
 	return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
-}
-
-export function resolvePaseoHome(env: NodeJS.ProcessEnv = process.env, home: string = os.homedir()): string {
-	const configured = env.PASEO_HOME?.trim();
-	return configured ? path.resolve(configured) : path.join(home, ".paseo");
 }
 
 /**
@@ -109,7 +106,10 @@ export function selectProviderKey(config: unknown): string | undefined {
 	if (!providers) return undefined;
 	const usable = (key: string): boolean => {
 		const entry = asRecord(providers[key]);
-		return entry !== undefined && entry.enabled !== false;
+		if (entry === undefined || entry.enabled === false || entry.extends !== PROVIDER_EXTENDS) return false;
+		if (typeof entry.label !== "string" || !entry.label.startsWith("Gajae Code")) return false;
+		const command = entry.command;
+		return Array.isArray(command) && command.every(value => typeof value === "string") && command.includes("acp");
 	};
 	if (usable(PROVIDER_KEY)) return PROVIDER_KEY;
 	return Object.keys(providers)
@@ -135,7 +135,12 @@ export function parseDaemonListen(raw: string): PaseoDaemonTarget | undefined {
 		return socketPath ? { kind: "ipc", socketPath } : undefined;
 	}
 	if (trimmed.startsWith("/")) return { kind: "ipc", socketPath: trimmed };
-	if (/^\d+$/.test(trimmed)) return { kind: "tcp", host: "127.0.0.1", port: Number(trimmed) };
+	if (/^\d+$/.test(trimmed)) {
+		const port = Number(trimmed);
+		return Number.isSafeInteger(port) && port >= 1 && port <= 65_535
+			? { kind: "tcp", host: "127.0.0.1", port }
+			: undefined;
+	}
 	const authority = trimmed.startsWith("tcp://") ? trimmed.slice("tcp://".length) : trimmed;
 	const withoutQuery = authority.split("?")[0] ?? "";
 	const separator = withoutQuery.lastIndexOf(":");
@@ -155,19 +160,37 @@ export async function resolveDaemonTarget(
 	config: unknown,
 	deps: Pick<PaseoAnnounceDependencies, "env" | "paseoHome" | "readJson">,
 ): Promise<PaseoDaemonTarget> {
-	const fromEnv = deps.env.PASEO_HOST?.trim() || deps.env.PASEO_LISTEN?.trim();
-	const envTarget = fromEnv ? parseDaemonListen(fromEnv) : undefined;
-	if (envTarget) return envTarget;
+	return (await resolveDaemonTargets(config, deps))[0] ?? DEFAULT_DAEMON_TARGET;
+}
+
+async function resolveDaemonTargets(
+	config: unknown,
+	deps: Pick<PaseoAnnounceDependencies, "env" | "paseoHome" | "readJson">,
+): Promise<PaseoDaemonTarget[]> {
+	const explicitHost = deps.env.PASEO_HOST?.trim();
+	if (explicitHost) {
+		const explicitTarget = parseDaemonListen(explicitHost);
+		return explicitTarget ? [explicitTarget] : [];
+	}
 
 	const pidFile = asRecord(await deps.readJson(path.join(deps.paseoHome, "paseo.pid")));
 	const pidListen = typeof pidFile?.listen === "string" ? pidFile.listen : pidFile?.sockPath;
 	const pidTarget = typeof pidListen === "string" ? parseDaemonListen(pidListen) : undefined;
-	if (pidTarget) return pidTarget;
 
 	const parsed = asRecord(config);
 	const configured = asRecord(parsed?.daemon)?.listen ?? parsed?.listen;
-	const configuredTarget = typeof configured === "string" ? parseDaemonListen(configured) : undefined;
-	return configuredTarget ?? DEFAULT_DAEMON_TARGET;
+	const configuredRaw = deps.env.PASEO_LISTEN?.trim() || (typeof configured === "string" ? configured : undefined);
+	const configuredTarget = configuredRaw ? parseDaemonListen(configuredRaw) : undefined;
+	const configuredIpc = configuredTarget?.kind === "ipc" ? configuredTarget : undefined;
+	const pidIpc = pidTarget?.kind === "ipc" ? pidTarget : undefined;
+	const configuredTcp =
+		configuredTarget?.kind === "tcp" && !(configuredTarget.host === "127.0.0.1" && configuredTarget.port === 6767)
+			? configuredTarget
+			: undefined;
+	const targets = [configuredIpc ?? pidIpc, configuredTcp, DEFAULT_DAEMON_TARGET].filter(
+		(target): target is PaseoDaemonTarget => target !== undefined,
+	);
+	return targets.filter((target, index) => JSON.stringify(targets[index - 1]) !== JSON.stringify(target));
 }
 
 /**
@@ -185,7 +208,7 @@ export async function resolveDaemonTarget(
  */
 export function classifyImportFailure(providerKey: string, detail: string): PaseoAnnounceOutcome {
 	if (/already imported/i.test(detail)) return { kind: "already-imported", providerKey };
-	if (/password required|unauthorized|authentication (failed|required)|invalid password/i.test(detail)) {
+	if (/cannot connect to daemon[^\n]*password required/i.test(detail)) {
 		return { kind: "skipped", reason: "daemon-auth-required" };
 	}
 	return { kind: "failed", detail: detail.slice(0, 500) };
@@ -200,8 +223,11 @@ export function classifyImportFailure(providerKey: string, detail: string): Pase
 export async function announceSessionToPaseo(
 	input: { readonly sessionId: string; readonly cwd: string },
 	deps: PaseoAnnounceDependencies,
+	signal?: AbortSignal,
 ): Promise<PaseoAnnounceOutcome> {
+	if (signal?.aborted) return { kind: "failed", detail: "Paseo announcement cancelled" };
 	const config = await deps.readJson(deps.configJson);
+	if (signal?.aborted) return { kind: "failed", detail: "Paseo announcement cancelled" };
 	if (config === undefined) return { kind: "skipped", reason: "no-paseo-config" };
 
 	const providerKey = selectProviderKey(config);
@@ -210,14 +236,22 @@ export async function announceSessionToPaseo(
 	const cli = deps.resolveCli();
 	if (!cli) return { kind: "skipped", reason: "cli-missing" };
 
-	const target = await resolveDaemonTarget(config, deps);
-	if (!(await deps.probeDaemon(target))) return { kind: "skipped", reason: "daemon-unreachable" };
+	const targets = await resolveDaemonTargets(config, deps);
+	let reachable = false;
+	for (const target of targets) {
+		if (await deps.probeDaemon(target)) {
+			reachable = true;
+			break;
+		}
+	}
+	if (!reachable) return { kind: "skipped", reason: "daemon-unreachable" };
+	if (signal?.aborted) return { kind: "failed", detail: "Paseo announcement cancelled" };
 
 	// Importing a session the broker does not yet report as live would make ACP
 	// `session/load` resume a copy instead of attaching to the running host.
 	if (!(await deps.isSessionLive(input.sessionId, input.cwd))) return { kind: "skipped", reason: "session-not-live" };
 
-	return await deps.runImport({ cli, providerKey, cwd: input.cwd, sessionId: input.sessionId });
+	return await deps.runImport({ cli, providerKey, cwd: input.cwd, sessionId: input.sessionId, signal });
 }
 
 /** Only a daemon that is not up yet, or a registration that has not landed yet, is worth retrying. */
@@ -242,22 +276,24 @@ export function startPaseoAnnouncement(
 	input: {
 		readonly sessionId: string;
 		readonly cwd: string;
+		isEnabled?: () => boolean;
 		onOutcome?: (outcome: PaseoAnnounceOutcome) => void;
 	},
 	deps: PaseoAnnounceDependencies,
 ): PaseoAnnouncementHandle {
 	let cancelled = false;
 	let timer: ReturnType<typeof setTimeout> | undefined;
+	const controller = new AbortController();
 
 	const attempt = async (remaining: number): Promise<void> => {
-		if (cancelled) return;
+		if (cancelled || input.isEnabled?.() === false) return;
 		let outcome: PaseoAnnounceOutcome;
 		try {
-			outcome = await announceSessionToPaseo(input, deps);
+			outcome = await announceSessionToPaseo(input, deps, controller.signal);
 		} catch (error) {
 			outcome = { kind: "failed", detail: error instanceof Error ? error.message : String(error) };
 		}
-		if (cancelled) return;
+		if (cancelled || input.isEnabled?.() === false) return;
 		if (isRetryableOutcome(outcome) && remaining > 1) {
 			// Logged per attempt: a retried outcome is otherwise completely silent,
 			// which is the exact state a user reports as "it never showed up".
@@ -267,13 +303,20 @@ export function startPaseoAnnouncement(
 			return;
 		}
 		logger.debug("Paseo session announcement settled", { outcome });
-		input.onOutcome?.(outcome);
+		try {
+			input.onOutcome?.(outcome);
+		} catch (error) {
+			logger.debug("Paseo session announcement outcome handler failed", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
 	};
 
 	void attempt(MAX_ATTEMPTS);
 	return {
 		cancel(): void {
 			cancelled = true;
+			controller.abort();
 			if (timer) clearTimeout(timer);
 		},
 	};
@@ -341,16 +384,21 @@ function runImport(env: NodeJS.ProcessEnv) {
 		readonly providerKey: string;
 		readonly cwd: string;
 		readonly sessionId: string;
+		readonly signal?: AbortSignal;
 	}): Promise<PaseoAnnounceOutcome> => {
-		const controller = new AbortController();
-		const timer = setTimeout(() => controller.abort(), IMPORT_TIMEOUT_MS);
+		const timeoutController = new AbortController();
+		const signal = input.signal
+			? AbortSignal.any([input.signal, timeoutController.signal])
+			: timeoutController.signal;
+		const timer = setTimeout(() => timeoutController.abort(), IMPORT_TIMEOUT_MS);
 		try {
 			const child = Bun.spawn(
 				[input.cli, "import", "--provider", input.providerKey, "--cwd", input.cwd, input.sessionId],
-				{ stdout: "pipe", stderr: "pipe", signal: controller.signal, env },
+				{ stdout: "pipe", stderr: "pipe", signal, env },
 			);
 			const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
-			if (controller.signal.aborted)
+			if (input.signal?.aborted) return { kind: "failed", detail: "Paseo announcement cancelled" };
+			if (timeoutController.signal.aborted)
 				return { kind: "failed", detail: `paseo import timed out after ${IMPORT_TIMEOUT_MS}ms` };
 			if (exitCode === 0) return { kind: "imported", providerKey: input.providerKey };
 			return classifyImportFailure(input.providerKey, stderr.trim() || `paseo import exited with ${exitCode}`);

@@ -94,6 +94,12 @@ describe("selectProviderKey", () => {
 	test("does not treat a same-prefix foreign key as a preset provider", () => {
 		expect(selectProviderKey(config({ gjcx: providerEntry() }))).toBeUndefined();
 	});
+
+	test("rejects key-colliding entries that are not GJC ACP providers", () => {
+		expect(selectProviderKey(config({ gjc: providerEntry({ extends: "ssh" }) }))).toBeUndefined();
+		expect(selectProviderKey(config({ gjc: providerEntry({ label: "Foreign Agent" }) }))).toBeUndefined();
+		expect(selectProviderKey(config({ gjc: providerEntry({ command: ["/usr/bin/foreign"] }) }))).toBeUndefined();
+	});
 });
 
 describe("parseDaemonListen", () => {
@@ -115,6 +121,9 @@ describe("parseDaemonListen", () => {
 		expect(parseDaemonListen("host:70000")).toBeUndefined();
 		expect(parseDaemonListen("host:notaport")).toBeUndefined();
 		expect(parseDaemonListen(":6767")).toBeUndefined();
+		expect(parseDaemonListen("0")).toBeUndefined();
+		expect(parseDaemonListen("65536")).toBeUndefined();
+		expect(parseDaemonListen("999999999999999999999999")).toBeUndefined();
 	});
 });
 
@@ -146,21 +155,31 @@ describe("resolveDaemonTarget", () => {
 			host: "127.0.0.1",
 			port: 7777,
 		});
-		expect(await resolveDaemonTarget({ version: 1 }, base)).toEqual({ kind: "tcp", host: "127.0.0.1", port: 6767 });
+		expect(await resolveDaemonTarget({ version: 1 }, base)).toEqual({ kind: "tcp", host: "localhost", port: 6767 });
 	});
 
 	test("ignores an unparseable listener instead of failing the announcement", async () => {
 		expect(await resolveDaemonTarget(config({}, "not-an-endpoint"), base)).toEqual({
 			kind: "tcp",
-			host: "127.0.0.1",
+			host: "localhost",
 			port: 6767,
 		});
+	});
+
+	test("ignores TCP pid metadata just like the Paseo CLI", async () => {
+		expect(
+			await resolveDaemonTarget(config({}, "127.0.0.1:7777"), {
+				...base,
+				readJson: async () => ({ listen: "127.0.0.1:9999" }),
+			}),
+		).toEqual({ kind: "tcp", host: "127.0.0.1", port: 7777 });
 	});
 });
 
 describe("resolvePaseoHome", () => {
 	test("honors PASEO_HOME and otherwise uses the home directory", () => {
 		expect(resolvePaseoHome({ PASEO_HOME: "/srv/paseo" }, "/home/u")).toBe("/srv/paseo");
+		expect(resolvePaseoHome({ PASEO_HOME: "~/custom" }, "/home/u")).toBe("/home/u/custom");
 		expect(resolvePaseoHome({}, "/home/u")).toBe(path.join("/home/u", ".paseo"));
 		expect(resolvePaseoHome({ PASEO_HOME: "   " }, "/home/u")).toBe(path.join("/home/u", ".paseo"));
 	});
@@ -209,6 +228,16 @@ describe("announceSessionToPaseo", () => {
 			kind: "skipped",
 			reason: "daemon-unreachable",
 		});
+		expect(dependencies.recorder.imports).toHaveLength(0);
+	});
+
+	test("does not fall through from an invalid explicit PASEO_HOST", async () => {
+		const dependencies = deps({ env: { PASEO_HOST: "not-an-endpoint" } });
+		expect(await announceSessionToPaseo({ sessionId: SESSION_ID, cwd: CWD }, dependencies)).toEqual({
+			kind: "skipped",
+			reason: "daemon-unreachable",
+		});
+		expect(dependencies.recorder.probes).toHaveLength(0);
 		expect(dependencies.recorder.imports).toHaveLength(0);
 	});
 
@@ -261,10 +290,10 @@ describe("classifyImportFailure", () => {
 				"Error: Cannot connect to daemon at localhost:6767: Password required\nStart the daemon with: paseo daemon start",
 			),
 		).toEqual({ kind: "skipped", reason: "daemon-auth-required" });
-		expect(classifyImportFailure("gjc", "Unauthorized")).toEqual({ kind: "skipped", reason: "daemon-auth-required" });
+		expect(classifyImportFailure("gjc", "Unauthorized")).toEqual({ kind: "failed", detail: "Unauthorized" });
 		expect(classifyImportFailure("gjc", "authentication failed")).toEqual({
-			kind: "skipped",
-			reason: "daemon-auth-required",
+			kind: "failed",
+			detail: "authentication failed",
 		});
 	});
 
@@ -416,6 +445,18 @@ describe("default dependencies", () => {
 		const outcome = await dependencies.runImport(importInput(path.join(os.tmpdir(), "gjc-absent-paseo")));
 		expect(outcome.kind).toBe("failed");
 	});
+
+	test("cancels an in-flight import child promptly", async () => {
+		const dependencies = createDefaultPaseoAnnounceDependencies("/tmp/agent-dir", {});
+		const cli = await fakeCli("while true; do sleep 1; done");
+		const controller = new AbortController();
+		const started = Date.now();
+		const outcomePromise = dependencies.runImport({ ...importInput(cli), signal: controller.signal });
+		await Bun.sleep(25);
+		controller.abort();
+		expect(await outcomePromise).toEqual({ kind: "failed", detail: "Paseo announcement cancelled" });
+		expect(Date.now() - started).toBeLessThan(5_000);
+	});
 });
 
 describe("startPaseoAnnouncement", () => {
@@ -455,5 +496,40 @@ describe("startPaseoAnnouncement", () => {
 		await Bun.sleep(20);
 		handle.cancel();
 		expect(outcomes).toEqual([{ kind: "failed", detail: "broker is unavailable" }]);
+	});
+
+	test("does not settle or retry after opt-in is revoked during an attempt", async () => {
+		const outcomes: PaseoAnnounceOutcome[] = [];
+		const probe = Promise.withResolvers<boolean>();
+		let enabled = true;
+		const handle = startPaseoAnnouncement(
+			{
+				sessionId: SESSION_ID,
+				cwd: CWD,
+				isEnabled: () => enabled,
+				onOutcome: outcome => outcomes.push(outcome),
+			},
+			deps({ probeDaemon: async () => await probe.promise }),
+		);
+		enabled = false;
+		probe.resolve(false);
+		await Bun.sleep(20);
+		handle.cancel();
+		expect(outcomes).toEqual([]);
+	});
+
+	test("contains a throwing outcome callback", async () => {
+		const handle = startPaseoAnnouncement(
+			{
+				sessionId: SESSION_ID,
+				cwd: CWD,
+				onOutcome: () => {
+					throw new Error("callback failed");
+				},
+			},
+			deps(),
+		);
+		await Bun.sleep(20);
+		handle.cancel();
 	});
 });
