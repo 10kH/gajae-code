@@ -108,8 +108,8 @@ it("refreshes distinct cache identities independently", async () => {
 	}
 });
 
-for (const outcome of ["never", "resolve", "reject"] as const) {
-	it(`releases timed-out refreshes that ignore abort (${outcome})`, async () => {
+for (const outcome of ["never", "resolve", "reject", "cooperative abort"] as const) {
+	it(`releases timed-out refreshes (${outcome})`, async () => {
 		vi.useFakeTimers();
 		const now = Date.now();
 		const row = { repo: TEST_REPO, kind: "issue" as const, number: 80, includeComments: true };
@@ -119,6 +119,9 @@ for (const outcome of ["never", "resolve", "reject"] as const) {
 		let refreshSignal: AbortSignal | undefined;
 		const fetchFresh = vi.fn((signal?: AbortSignal) => {
 			refreshSignal = signal;
+			if (outcome === "cooperative abort") {
+				signal?.addEventListener("abort", () => gate.reject(signal.reason), { once: true });
+			}
 			return gate.promise;
 		});
 		await getOrFetchView({ ...row, settings, now, fetchFresh });
@@ -127,6 +130,9 @@ for (const outcome of ["never", "resolve", "reject"] as const) {
 		vi.advanceTimersByTime(30_001);
 		for (let index = 0; index < 6; index += 1) await Promise.resolve();
 		expect(refreshSignal?.aborted).toBe(true);
+		expect(refreshSignal?.reason).toBeInstanceOf(Error);
+		expect(refreshSignal?.reason.message).toBe("GitHub background refresh timed out");
+		expect(getCached(row.repo, row.kind, row.number, row.includeComments)?.rendered).toBe("old");
 		const retry = vi.fn(async () => ({ payload: "retry", rendered: "retry", sourceUrl: "url" }));
 		await getOrFetchView({ ...row, settings, now, fetchFresh: retry });
 		for (let index = 0; index < 6; index += 1) await Promise.resolve();
@@ -138,6 +144,33 @@ for (const outcome of ["never", "resolve", "reject"] as const) {
 		// Bun's test runner also fails this case on any unhandled rejection.
 	});
 }
+
+it("clears the deadline timer after a successful fast refresh", async () => {
+	vi.useFakeTimers();
+	const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+	const clearTimeoutSpy = vi.spyOn(globalThis, "clearTimeout");
+	const now = Date.now();
+	const row = { repo: TEST_REPO, kind: "issue" as const, number: 85, includeComments: true };
+	putCached({ ...row, payload: "old", rendered: "old", fetchedAt: now - 2_000 });
+	const settings = Settings.isolated({ "github.cache.softTtlSec": 1, "github.cache.hardTtlSec": 60 });
+	let refreshSignal: AbortSignal | undefined;
+	await getOrFetchView({
+		...row,
+		settings,
+		now,
+		fetchFresh: async signal => {
+			refreshSignal = signal;
+			return { payload: "new", rendered: "new", sourceUrl: "url" };
+		},
+	});
+	for (let index = 0; index < 6; index += 1) await Promise.resolve();
+	expect(getCached(row.repo, row.kind, row.number, row.includeComments)?.rendered).toBe("new");
+	expect(setTimeoutSpy).toHaveBeenCalledTimes(1);
+	expect(clearTimeoutSpy).toHaveBeenCalledTimes(1);
+	expect(clearTimeoutSpy).toHaveBeenCalledWith(setTimeoutSpy.mock.results[0].value);
+	vi.advanceTimersByTime(30_001);
+	expect(refreshSignal?.aborted).toBe(false);
+});
 
 it("releases the refresh marker after a synchronous fetch throw", async () => {
 	const now = Date.now();
