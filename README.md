@@ -22,7 +22,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/devswha/gajae-code-app"><strong>🖥️ Desktop app (experimental, community-built)</strong></a> — a third-party, community-built desktop interface for Gajae-Code. Not an official first-party app; use at your own discretion.
+  <a href="https://github.com/devswha/gajae-code-app"><kbd><strong>🖥️ Explore Gajae-Code App → Desktop &amp; self-hosted web GUI</strong></kbd></a>
+  <br/>
+  <sub>Experimental, community-built third-party project — not an official first-party Gajae-Code app.</sub>
 </p>
 
 <p align="center">
