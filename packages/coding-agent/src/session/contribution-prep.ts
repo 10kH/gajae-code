@@ -175,14 +175,21 @@ export function redactContributionPrepText(
 	redacted = redactAwsAccessKeyIds(redacted, state);
 	redacted = replaceRegex(
 		redacted,
-		/(^|[^A-Za-z0-9_-])(["']?(?:(?:aws[_-]?)?secret[_-]?access[_-]?key|(?:aws[_-]?)?session[_-]?token)["']?\s*[=:]\s*)(["'])([^"'\r\n]{8,})\3/gi,
-		"$1$2$3[REDACTED_SECRET]$3",
+		/(<((?:[A-Za-z_][\w.-]*:)?(?:SecretAccessKey|SessionToken))>)[^<\r\n]{8,}(<\/\2>)/gi,
+		"$1[REDACTED_SECRET]$3",
 		state,
 		"aws_keys",
 	);
 	redacted = replaceRegex(
 		redacted,
-		/(^|[^A-Za-z0-9_-])(["']?(?:(?:aws[_-]?)?secret[_-]?access[_-]?key|(?:aws[_-]?)?session[_-]?token)["']?\s*[=:]\s*)[^\s"',;{}[\]()]{8,}/gi,
+		/(^|[^A-Za-z0-9_-])(["']?(?:(?:aws[_-]?)?secret[_-]?access[_-]?key|(?:aws[_-]?)?session[_-]?token)["']?\s*[=:]\s*)(\$?)(["'`])([^"'`\r\n]{8,})\4/gi,
+		"$1$2$3$4[REDACTED_SECRET]$4",
+		state,
+		"aws_keys",
+	);
+	redacted = replaceRegex(
+		redacted,
+		/(^|[^A-Za-z0-9_-])(["']?(?:(?:aws[_-]?)?secret[_-]?access[_-]?key|(?:aws[_-]?)?session[_-]?token)["']?\s*[=:]\s*)[^\s"'`,;{}[\]()&<>#]{8,}/gi,
 		"$1$2[REDACTED_SECRET]",
 		state,
 		"aws_keys",
@@ -379,7 +386,7 @@ export async function prepareContributionPrep(
 
 	const manifest: ContributionPrepManifest = {
 		schema_version: CONTRIBUTION_PREP_SCHEMA_VERSION,
-		source_session_id: context.sessionId,
+		source_session_id: redact(context.sessionId),
 		created_at: createdAt,
 		cwd: redact(context.cwd),
 		git_head: gitHead,

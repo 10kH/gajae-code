@@ -155,6 +155,10 @@ describe("contribution prep", () => {
 			`'SESSION-TOKEN' = '${SYNTHETIC_AWS_SESSION_TOKEN}'`,
 			`AWS_SECRET_ACCESS_KEY = ${SYNTHETIC_AWS_SECRET_ACCESS_KEY}`,
 			`aws_session_token=${SYNTHETIC_AWS_SESSION_TOKEN}`,
+			`SecretAccessKey=$'${SYNTHETIC_AWS_SECRET_ACCESS_KEY}'`,
+			`SessionToken=$"${SYNTHETIC_AWS_SESSION_TOKEN}"`,
+			`SecretAccessKey=\`${SYNTHETIC_AWS_SECRET_ACCESS_KEY}\``,
+			`?SessionToken=${SYNTHETIC_AWS_SESSION_TOKEN}&status=active`,
 		].join("\n");
 
 		const redacted = redactContributionPrepText(text, process.cwd());
@@ -168,6 +172,20 @@ describe("contribution prep", () => {
 		}
 		expect(redacted).toContain(`"secret_access_key" \t: \t"[REDACTED_SECRET]"`);
 		expect(redacted).toContain(`'SESSION-TOKEN' = '[REDACTED_SECRET]'`);
+		expect(redacted).toContain("SecretAccessKey=$'[REDACTED_SECRET]'");
+		expect(redacted).toContain('SessionToken=$"[REDACTED_SECRET]"');
+		expect(redacted).toContain("SecretAccessKey=`[REDACTED_SECRET]`");
+		expect(redacted).toContain("?SessionToken=[REDACTED_SECRET]&status=active");
+	});
+
+	it("redacts canonical AWS XML fields without changing the document structure", () => {
+		const text = `<Credentials><AccessKeyId>${SYNTHETIC_AWS_TEMPORARY_KEY_ID}</AccessKeyId><SecretAccessKey>${SYNTHETIC_AWS_SECRET_ACCESS_KEY}</SecretAccessKey><sts:SessionToken>${SYNTHETIC_AWS_SESSION_TOKEN}</sts:SessionToken></Credentials>`;
+
+		const redacted = redactContributionPrepText(text, process.cwd());
+
+		expect(redacted).toBe(
+			"<Credentials><AccessKeyId>[REDACTED_AWS_KEY_ID]</AccessKeyId><SecretAccessKey>[REDACTED_SECRET]</SecretAccessKey><sts:SessionToken>[REDACTED_SECRET]</sts:SessionToken></Credentials>",
+		);
 	});
 
 	it("leaves AWS-like prose and key-id near-misses unchanged", () => {
@@ -258,7 +276,7 @@ describe("contribution prep", () => {
 
 			const result = await prepareContributionPrep(
 				{
-					sessionId: "session-123",
+					sessionId: `session-${SYNTHETIC_AWS_ACCESS_KEY_ID}`,
 					cwd: tempDir.path(),
 					messages,
 					sessionFile: path.join(tempDir.path(), "session.jsonl"),
@@ -281,7 +299,7 @@ describe("contribution prep", () => {
 			};
 			const transcriptPath = manifest.artifacts.find(artifact => artifact.path.endsWith("transcript.md"))?.path;
 			expect(manifest.schema_version).toBe(1);
-			expect(manifest.source_session_id).toBe("session-123");
+			expect(manifest.source_session_id).toBe("session-[REDACTED_AWS_KEY_ID]");
 			expect(manifest.worker_prompt_path).toBe(result.workerPromptPath);
 			expect(manifest.recommended_output).toContain("uncertainty / remaining risks");
 			expect(manifest.redactions).toContain("auth_headers");
