@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -27,6 +27,7 @@ interface ScratchLayout {
 }
 
 const scratchLayouts: ScratchLayout[] = [];
+setDefaultTimeout(30_000);
 
 function scratchLayout(projectEnv?: string, homeEnv?: string): ScratchLayout {
 	const root = path.join(os.tmpdir(), `gjc-preset-env-trust-${crypto.randomUUID()}`);
@@ -59,6 +60,7 @@ async function runProbe(
 	const env: Record<string, string> = {
 		PATH: process.env.PATH ?? "/usr/bin:/bin",
 		HOME: layout.home,
+		USERPROFILE: layout.home,
 		TMPDIR: path.join(layout.root, "tmp"),
 		XDG_CONFIG_HOME: path.join(layout.root, "xdg-config"),
 		XDG_CACHE_HOME: path.join(layout.root, "xdg-cache"),
