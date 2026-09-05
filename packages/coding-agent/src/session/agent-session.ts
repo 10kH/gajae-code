@@ -22429,7 +22429,10 @@ export class AgentSession {
 				onChunk,
 				signal: abortController.signal,
 			});
-			this.recordPythonResult(code, result, options);
+			// A retained kernel can finish after strict session close has fenced
+			// persistence. The caller still receives its completed result, but it
+			// must not reopen a closing session to append history.
+			if (!this.#evalExecutionDisposing) this.recordPythonResult(code, result, options);
 			return result;
 		})();
 		return await this.trackEvalExecution(execution, abortController);

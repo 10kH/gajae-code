@@ -25,7 +25,7 @@ const REQUEST_BLOCKED_MESSAGE_RE = /^\s*request blocked\b/i;
 
 export async function parseCodexError(response: Response): Promise<CodexErrorInfo> {
 	const raw = await response.text();
-	let message = raw || response.statusText || "Request failed";
+	let message = raw || response.statusText || `Codex request failed (HTTP ${response.status})`;
 	let friendlyMessage: string | undefined;
 	let rateLimits: CodexRateLimits | undefined;
 	let code: string | undefined;

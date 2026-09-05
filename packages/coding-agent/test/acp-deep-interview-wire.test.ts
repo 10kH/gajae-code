@@ -145,7 +145,13 @@ function isAcpCloseUncertainAfterSend(error: unknown, seen = new Set<object>()):
 	if (!error || typeof error !== "object") return false;
 	if (seen.has(error)) return false;
 	seen.add(error);
-	const detail = error as { code?: unknown; details?: unknown; cause?: unknown; data?: unknown };
+	const detail = error as { code?: unknown; message?: unknown; details?: unknown; cause?: unknown; data?: unknown };
+	if (
+		typeof detail.message === "string" &&
+		detail.message.includes("ACP session cleanup is uncertain") &&
+		detail.message.includes("broker request failed")
+	)
+		return true;
 	if (
 		detail.code === "terminal_uncertain" &&
 		typeof detail.details === "string" &&
@@ -1063,6 +1069,11 @@ describe("ACP deep-interview wire path", () => {
 			hostname: "127.0.0.1",
 			port: 0,
 			async fetch(request) {
+				const url = new URL(request.url);
+				if (request.method === "GET" && url.pathname === "/v1/models")
+					return Response.json({ data: [{ id: "fixture-model" }] });
+				if (request.method !== "POST" || url.pathname !== "/v1/chat/completions")
+					return new Response("Not found", { status: 404 });
 				const body = (await request.json()) as Record<string, unknown>;
 				requests.push(body);
 				if (requests.length === 1)

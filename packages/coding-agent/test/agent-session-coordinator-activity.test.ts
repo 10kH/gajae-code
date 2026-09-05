@@ -415,7 +415,7 @@ describe("AgentSession coordinator activity labels", () => {
 		expect(await activityAfterSeq(stateFile, 4)).toMatchObject({ tool: "bash" });
 	});
 
-	it("leaves no sidecar write in flight once dispose resolves", async () => {
+	it("fences queued sidecar writes once dispose starts", async () => {
 		const { session, stateFile, tools } = await newSession();
 
 		// Tool activity is enqueued, never awaited by its emitter, so only dispose can
@@ -424,13 +424,10 @@ describe("AgentSession coordinator activity labels", () => {
 		emitExternalStart(session, "call-drained", "bash", tools.bash);
 		await session.dispose();
 
-		// Read once, without polling: a still-queued write would not be here yet.
+		// Disposal invalidates events admitted before its generation fence. Read once,
+		// without polling: a still-queued write would appear after dispose returned.
 		const settled = await Bun.file(stateFile).text();
-		expect((JSON.parse(settled) as { activity: Record<string, unknown> }).activity).toMatchObject({
-			seq: 1,
-			tool: "bash",
-			phase: "started",
-		});
+		expect((JSON.parse(settled) as { activity?: Record<string, unknown> }).activity).toBeUndefined();
 
 		await Bun.sleep(50);
 		expect(await Bun.file(stateFile).text()).toBe(settled);

@@ -137,19 +137,32 @@ function parseArgs(argv: string[]): RestartSdkBrokerOptions {
 }
 
 if (import.meta.main) {
-	const result = await restartSdkBroker(parseArgs(process.argv.slice(2)), defaultDeps);
-	const transition = result.previousPid === undefined ? `started ${result.pid}` : `${result.previousPid} -> ${result.pid}`;
-	const closed = result.closedSessionIds?.length ?? 0;
-	const sessions = result.closedSessionIds ? ` (closed ${closed} session host${closed === 1 ? "" : "s"})` : "";
-	console.log(`SDK broker ${transition}${sessions}`);
-	const unclosed = result.unclosedSessionHosts ?? [];
-	if (unclosed.length > 0) {
-		// A surviving host keeps serving the source it started with, so reporting a
-		// clean restart here would recreate the stale-code failure this flag prevents.
-		console.error(
-			`warning: ${unclosed.length} session host${unclosed.length === 1 ? "" : "s"} did not close and may still serve older code:`,
-		);
-		for (const host of unclosed) console.error(`  ${host.sessionId}: ${host.reason}`);
+	try {
+		const result = await restartSdkBroker(parseArgs(process.argv.slice(2)), defaultDeps);
+		const transition =
+			result.previousPid === undefined ? `started ${result.pid}` : `${result.previousPid} -> ${result.pid}`;
+		const closed = result.closedSessionIds?.length ?? 0;
+		const sessions = result.closedSessionIds ? ` (closed ${closed} session host${closed === 1 ? "" : "s"})` : "";
+		console.log(`SDK broker ${transition}${sessions}`);
+		if (result.sessionHostDiscoveryError) {
+			console.error(
+				`warning: could not list session hosts before broker replacement; they may still serve older code: ${result.sessionHostDiscoveryError}`,
+			);
+			process.exitCode = 1;
+		}
+		const unclosed = result.unclosedSessionHosts ?? [];
+		if (unclosed.length > 0) {
+			// A surviving host keeps serving the source it started with, so reporting a
+			// clean restart here would recreate the stale-code failure this flag prevents.
+			console.error(
+				`warning: ${unclosed.length} session host${unclosed.length === 1 ? "" : "s"} did not close and may still serve older code:`,
+			);
+			for (const host of unclosed) console.error(`  ${host.sessionId}: ${host.reason}`);
+			process.exitCode = 1;
+		}
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		console.error(`Failed to restart SDK broker: ${message}`);
 		process.exitCode = 1;
 	}
 }

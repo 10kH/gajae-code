@@ -5,7 +5,7 @@ import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallb
 import type { GrepMatch, GrepResult, grep as grepFn } from "@gajae-code/natives";
 import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
-import { prompt, untilAborted } from "@gajae-code/utils";
+import { prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { getFileReadCache } from "../edit/file-read-cache";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
@@ -35,7 +35,7 @@ import {
 	PREVIEW_LIMITS,
 	splitGroupsByBlankLine,
 } from "./render-utils";
-import { ToolError } from "./tool-errors";
+import { ToolAbortError, ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 
 let searchNativesLoad:
@@ -71,6 +71,7 @@ const searchSchema = z
 			.number()
 			.optional()
 			.describe("files to skip before collecting results — use to paginate when the prior call hit the file limit"),
+		timeout: z.number().min(0.5).max(60).default(5).describe("timeout in seconds (0.5–60)").optional(),
 	})
 	.strict();
 
@@ -90,6 +91,9 @@ export const SINGLE_FILE_MATCHES = 200;
  * (DEFAULT_FILE_LIMIT files × MULTI_FILE_PER_FILE_MATCHES matches) plus
  * pagination headroom so the caller can see total file count. */
 const INTERNAL_TOTAL_CAP = 2000;
+const DEFAULT_SEARCH_TIMEOUT_MS = 5000;
+const MIN_SEARCH_TIMEOUT_MS = 500;
+const MAX_SEARCH_TIMEOUT_MS = 60_000;
 
 /**
  * Detect a `,` that is not inside a `{…}` brace expansion. Used to catch
@@ -130,6 +134,7 @@ function containsTopLevelComma(entry: string): boolean {
 async function resolveArchiveSearchPaths(
 	paths: string[],
 	cwd: string,
+	signal?: AbortSignal,
 ): Promise<{
 	resolvedPaths: string[];
 	displayMap: Map<string, string>;
@@ -143,64 +148,71 @@ async function resolveArchiveSearchPaths(
 	const unreadable: string[] = [];
 	let tempDir: string | undefined;
 	const archiveCache = new Map<string, ArchiveReader>();
+	const cleanup = async () => {
+		const directory = tempDir;
+		tempDir = undefined;
+		if (directory) await rm(directory, { recursive: true, force: true }).catch(() => {});
+	};
 
-	for (let idx = 0; idx < paths.length; idx++) {
-		const entry = paths[idx];
-		const candidates = parseArchivePathCandidates(entry);
-		// Longest archive prefix first; we want the one whose member portion is non-empty.
-		const member = candidates.find(c => c.subPath !== "" && c.archivePath !== entry);
-		if (!member) continue;
+	try {
+		for (let idx = 0; idx < paths.length; idx++) {
+			signal?.throwIfAborted();
+			const entry = paths[idx];
+			const candidates = parseArchivePathCandidates(entry);
+			// Longest archive prefix first; we want the one whose member portion is non-empty.
+			const member = candidates.find(c => c.subPath !== "" && c.archivePath !== entry);
+			if (!member) continue;
 
-		const archiveAbs = resolveReadPath(member.archivePath, cwd);
-		let archive = archiveCache.get(archiveAbs);
-		if (!archive) {
+			const archiveAbs = resolveReadPath(member.archivePath, cwd);
+			let archive = archiveCache.get(archiveAbs);
+			if (!archive) {
+				try {
+					archive = await openArchive(archiveAbs);
+				} catch (err) {
+					unreadable.push(`${entry} (cannot open archive: ${(err as Error).message})`);
+					continue;
+				}
+				archiveCache.set(archiveAbs, archive);
+			}
+
+			let extracted: ExtractedArchiveFile;
 			try {
-				archive = await openArchive(archiveAbs);
+				extracted = await archive.readFile(member.subPath);
 			} catch (err) {
-				unreadable.push(`${entry} (cannot open archive: ${(err as Error).message})`);
+				unreadable.push(`${entry} (${(err as Error).message})`);
 				continue;
 			}
-			archiveCache.set(archiveAbs, archive);
-		}
+			signal?.throwIfAborted();
+			// UTF-8 only — binary members would just produce noise through ripgrep.
+			if (extracted.bytes.some(byte => byte === 0)) {
+				unreadable.push(`${entry} (binary archive entry)`);
+				continue;
+			}
+			let text: string;
+			try {
+				text = new TextDecoder("utf-8", { fatal: true }).decode(extracted.bytes);
+			} catch {
+				unreadable.push(`${entry} (non-UTF-8 archive entry)`);
+				continue;
+			}
 
-		let extracted: ExtractedArchiveFile;
-		try {
-			extracted = await archive.readFile(member.subPath);
-		} catch (err) {
-			unreadable.push(`${entry} (${(err as Error).message})`);
-			continue;
+			if (!tempDir) {
+				tempDir = await mkdtemp(path.join(tmpdir(), "gjc-search-archive-"));
+			}
+			// Per-entry filename keeps the scratch path unique even when two selectors
+			// resolve to members with the same basename.
+			const safeBase = path.basename(member.subPath).replace(/[^\w.-]+/g, "_") || "entry";
+			const tempPath = path.join(tempDir, `${idx}-${safeBase}`);
+			await writeFile(tempPath, text);
+			resolvedPaths[idx] = tempPath;
+			displayMap.set(tempPath, entry);
+			displaySet.add(entry);
 		}
-		// UTF-8 only — binary members would just produce noise through ripgrep.
-		if (extracted.bytes.some(byte => byte === 0)) {
-			unreadable.push(`${entry} (binary archive entry)`);
-			continue;
-		}
-		let text: string;
-		try {
-			text = new TextDecoder("utf-8", { fatal: true }).decode(extracted.bytes);
-		} catch {
-			unreadable.push(`${entry} (non-UTF-8 archive entry)`);
-			continue;
-		}
-
-		if (!tempDir) {
-			tempDir = await mkdtemp(path.join(tmpdir(), "gjc-search-archive-"));
-		}
-		// Per-entry filename keeps the scratch path unique even when two selectors
-		// resolve to members with the same basename.
-		const safeBase = path.basename(member.subPath).replace(/[^\w.-]+/g, "_") || "entry";
-		const tempPath = path.join(tempDir, `${idx}-${safeBase}`);
-		await writeFile(tempPath, text);
-		resolvedPaths[idx] = tempPath;
-		displayMap.set(tempPath, entry);
-		displaySet.add(entry);
+	} catch (error) {
+		await cleanup();
+		throw error;
 	}
 
-	const cleanup = async () => {
-		if (tempDir) {
-			await rm(tempDir, { recursive: true, force: true }).catch(() => {});
-		}
-	};
 	return { resolvedPaths, displayMap, displaySet, unreadable, cleanup };
 }
 
@@ -235,6 +247,8 @@ export interface SearchToolOptions {
 	context?: number;
 	/** Per-call total match cap used by Cursor's native Pi grep frame. */
 	totalMatchLimit?: number;
+	/** Test or remote override for the native grep implementation. */
+	grep?: typeof grepFn;
 }
 
 type SearchParams = z.infer<typeof searchSchema>;
@@ -266,12 +280,23 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 		_onUpdate?: AgentToolUpdateCallback<SearchToolDetails>,
 		_toolContext?: AgentToolContext,
 	): Promise<AgentToolResult<SearchToolDetails>> {
-		const { pattern, i, gitignore, skip } = params;
+		const { pattern, i, gitignore, skip, timeout } = params;
 		// Recurring real-world failure mode: models omit `paths` for repo-wide
 		// searches. Default to the working directory instead of failing the call.
 		const paths = params.paths ?? ["."];
+		const requestedTimeoutMs = timeout != null ? Math.round(timeout * 1000) : DEFAULT_SEARCH_TIMEOUT_MS;
+		const timeoutMs = Math.min(MAX_SEARCH_TIMEOUT_MS, Math.max(MIN_SEARCH_TIMEOUT_MS, requestedTimeoutMs));
+		const deadlineAt = Date.now() + timeoutMs;
+		const timeoutSignal = AbortSignal.timeout(timeoutMs);
+		const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+		const throwIfSearchCancelled = (): void => {
+			signal?.throwIfAborted();
+			if (Date.now() >= deadlineAt) throw new Error("Aborted: Timeout");
+			combinedSignal.throwIfAborted();
+		};
 
-		return untilAborted(signal, async () => {
+		try {
+			throwIfSearchCancelled();
 			const normalizedPattern = pattern.trim();
 			if (!normalizedPattern) {
 				throw new ToolError("Pattern must not be empty");
@@ -292,8 +317,10 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 				displaySet: archiveDisplaySet,
 				unreadable: archiveUnreadable,
 				cleanup: cleanupArchiveScratch,
-			} = await resolveArchiveSearchPaths(paths, this.session.cwd);
+			} = await resolveArchiveSearchPaths(paths, this.session.cwd, combinedSignal);
+			let completedResult: AgentToolResult<SearchToolDetails> | undefined;
 			try {
+				throwIfSearchCancelled();
 				if (archiveUnreadable.length > 0 && resolvedPaths.length === archiveUnreadable.length) {
 					// All inputs were archive selectors we couldn't materialize; surface the
 					// reason instead of a downstream "path not found" from the scope resolver.
@@ -324,7 +351,9 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 					trackImmutableSources: true,
 					surfaceExactFilePaths: true,
 					multipathStatHint: " (`paths` entries must each exist relative to cwd)",
+					signal: combinedSignal,
 				});
+				throwIfSearchCancelled();
 				const { searchPath, isDirectory, multiTargets, exactFilePaths, missingPaths, immutableSourcePaths } = scope;
 				// When the only input was an archive selector, surface that selector instead
 				// of the temp scratch path the resolver substituted in.
@@ -345,7 +374,8 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 				const baseDisplayMode = resolveFileDisplayMode(this.session);
 				const immutableDisplayMode = resolveFileDisplayMode(this.session, { immutable: true });
 
-				const { GrepOutputMode, grep } = await searchNatives();
+				const { GrepOutputMode, grep: nativeGrep } = await searchNatives();
+				const grep = this.options.grep ?? nativeGrep;
 				const effectiveOutputMode = GrepOutputMode.Content;
 				// Multi-scope = more than one file may match. We fetch up to
 				// INTERNAL_TOTAL_CAP matches from native grep, then in JS group by
@@ -363,7 +393,10 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 						let totalMatches = 0;
 						let filesSearched = 0;
 						const targets = exactFilePaths
-							? exactFilePaths.map(filePath => ({ basePath: filePath, glob: undefined as string | undefined }))
+							? exactFilePaths.map(filePath => ({
+									basePath: filePath,
+									glob: undefined as string | undefined,
+								}))
 							: (multiTargets ?? []);
 						for (const target of targets) {
 							const targetResult = await grep(
@@ -381,9 +414,12 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 									contextAfter: normalizedContextAfter,
 									maxColumns: DEFAULT_MAX_COLUMN,
 									mode: effectiveOutputMode,
+									signal: combinedSignal,
+									timeoutMs,
 								},
 								undefined,
 							);
+							throwIfSearchCancelled();
 							limitReached = limitReached || Boolean(targetResult.limitReached);
 							totalMatches += targetResult.totalMatches;
 							filesSearched += targetResult.filesSearched;
@@ -416,9 +452,12 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 								contextAfter: normalizedContextAfter,
 								maxColumns: DEFAULT_MAX_COLUMN,
 								mode: effectiveOutputMode,
+								signal: combinedSignal,
+								timeoutMs,
 							},
 							undefined,
 						);
+						throwIfSearchCancelled();
 					}
 				} catch (err) {
 					if (err instanceof Error && err.message.startsWith("regex parse error")) {
@@ -518,7 +557,10 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 						missingPaths: missingPaths.length > 0 ? missingPaths : undefined,
 					};
 					const text = warningNote ? `No matches found\n${warningNote}` : "No matches found";
-					return toolResult(details).text(text).done();
+					const noMatchResult = toolResult(details).text(text).done();
+					await cleanupArchiveScratch();
+					throwIfSearchCancelled();
+					return noMatchResult;
 				}
 				const outputLines: string[] = [];
 				let linesTruncated = false;
@@ -644,11 +686,25 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 				if (truncation.truncated) {
 					resultBuilder.truncation(truncation, { direction: "head" });
 				}
-				return resultBuilder.done();
+				throwIfSearchCancelled();
+				completedResult = resultBuilder.done();
 			} finally {
 				await cleanupArchiveScratch();
 			}
-		});
+			throwIfSearchCancelled();
+			if (!completedResult) throw new Error("Search result assembly did not complete");
+			return completedResult;
+		} catch (error) {
+			const nativeTimedOut = error instanceof Error && error.message === "Aborted: Timeout";
+			if ((timeoutSignal.aborted || nativeTimedOut) && !signal?.aborted) {
+				const seconds = timeoutMs % 1000 === 0 ? `${timeoutMs / 1000}` : (timeoutMs / 1000).toFixed(1);
+				throw new ToolError(`Search timed out after ${seconds}s; increase timeout or narrow paths/pattern`);
+			}
+			if (combinedSignal.aborted || (error instanceof Error && error.name === "AbortError")) {
+				throw new ToolAbortError();
+			}
+			throw error;
+		}
 	}
 }
 
@@ -662,6 +718,7 @@ interface SearchRenderArgs {
 	i?: boolean;
 	gitignore?: boolean;
 	skip?: number;
+	timeout?: number;
 }
 
 const COLLAPSED_TEXT_LIMIT = PREVIEW_LIMITS.COLLAPSED_LINES * 2;
@@ -674,6 +731,7 @@ export const searchToolRenderer = {
 		if (args.i) meta.push("case:insensitive");
 		if (args.gitignore === false) meta.push("gitignore:false");
 		if (args.skip !== undefined && args.skip > 0) meta.push(`skip:${args.skip}`);
+		if (args.timeout !== undefined && args.timeout !== 5) meta.push(`timeout:${args.timeout}s`);
 
 		const text = renderStatusLine(
 			{ icon: "pending", title: "Search", description: args.pattern || "?", meta },
