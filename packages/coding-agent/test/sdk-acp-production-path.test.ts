@@ -1,10 +1,11 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, stat, utimes } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
+import packageJson from "../package.json" with { type: "json" };
 import { AcpAgent, acpSkillInvocation } from "../src/modes/acp/acp-agent";
-import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
+import { brokerProcessIncarnation, writeBrokerDiscovery } from "../src/sdk/broker/discovery";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 
 type TestServer = {
@@ -73,7 +74,7 @@ async function createSessionListBroker(
 	await writeBrokerDiscovery(agentDir, {
 		version: 1,
 		protocolVersion: 3,
-		packageGeneration: "test",
+		packageGeneration: packageJson.version,
 		ownerId: "test-owner",
 		pid: process.pid,
 		host: "127.0.0.1",
@@ -133,7 +134,7 @@ test("production ACP routes zero-session SDK globals through the broker adapter"
 	await writeBrokerDiscovery(agentDir, {
 		version: 1,
 		protocolVersion: 3,
-		packageGeneration: "test",
+		packageGeneration: packageJson.version,
 		ownerId: "test-owner",
 		pid: process.pid,
 		host: "127.0.0.1",
@@ -424,7 +425,16 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 					return;
 				}
 				if (frame.type === "event_replay") {
-					socket.send(JSON.stringify({ type: "event_replay_result", id: frame.id, events: [] }));
+					socket.send(
+						JSON.stringify({
+							type: "event_replay_result",
+							id: frame.id,
+							ok: true,
+							generation: 1,
+							lastSeq: 0,
+							events: [],
+						}),
+					);
 					return;
 				}
 				if (frame.type === "query_request") {
@@ -643,11 +653,14 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 			token,
 		}),
 	);
-	await utimes(endpointPath, 0.001, 0.001);
 	const endpointMtimeMs = (await stat(endpointPath)).mtimeMs;
+	const processIncarnation = brokerProcessIncarnation(process.pid);
+	if (!processIncarnation) throw new Error("Test process incarnation is unavailable.");
 	brokerSessions[0] = {
 		...brokerSessions[0],
 		pid: process.pid,
+		processIncarnation,
+		hostIncarnation: processIncarnation,
 		endpointMtimeMs,
 	};
 	const index = await new SessionIndex(agentDir).open();
@@ -657,15 +670,18 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		locator: { cwd: cwd, worktreeRoot: null, stateRoot: path.join(cwd, ".gjc", "state") },
 		endpointGeneration: 1,
 		pid: process.pid,
+		processIncarnation,
+		hostIncarnation: processIncarnation,
 		endpointMtimeMs,
 	});
 	await index.checkpointLiveHeartbeats();
 	await writeBrokerDiscovery(agentDir, {
 		version: 1,
 		protocolVersion: 3,
-		packageGeneration: "test",
+		packageGeneration: packageJson.version,
 		ownerId: "test-owner",
 		pid: process.pid,
+		incarnation: processIncarnation,
 		host: "127.0.0.1",
 		port: server.port!,
 		url: `ws://127.0.0.1:${server.port}`,
@@ -802,6 +818,8 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		() => closeSessionTransport !== undefined && providerRegistrations.length > 0,
 		"ACP provider registration",
 	);
+	await index.refresh();
+	expect(index.listSessions().sessions).toEqual([expect.objectContaining({ sessionId: "owned-session", live: true })]);
 	const initialProviderRegistrationCount = providerRegistrations.length;
 	reconnectingSessionTransport = true;
 	closeSessionTransport!();
@@ -809,6 +827,8 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		() => providerRegistrations.length > initialProviderRegistrationCount,
 		"ACP provider re-registration after transport reconnect",
 	);
+	await index.refresh();
+	expect(index.listSessions().sessions).toEqual([expect.objectContaining({ sessionId: "owned-session", live: true })]);
 	expect(providerRegistrations.slice(initialProviderRegistrationCount)).toEqual(
 		expect.arrayContaining([
 			expect.objectContaining({ connectionId: "acp-contract-reconnected", expectedLeaseId: "lease" }),

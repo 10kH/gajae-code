@@ -1069,8 +1069,11 @@ describe("ACP deep-interview wire path", () => {
 			hostname: "127.0.0.1",
 			port: 0,
 			async fetch(request) {
-				if (request.method === "GET" && new URL(request.url).pathname === "/v1/models")
-					return Response.json({ data: [] });
+				const url = new URL(request.url);
+				if (request.method === "GET" && url.pathname === "/v1/models")
+					return Response.json({ data: [{ id: "fixture-model" }] });
+				if (request.method !== "POST" || url.pathname !== "/v1/chat/completions")
+					return new Response("Not found", { status: 404 });
 				const body = (await request.json()) as Record<string, unknown>;
 				requests.push(body);
 				if (requests.length === 1)
