@@ -113,8 +113,9 @@ function redactAwsLabeledValues(text: string, state: RedactionState): string {
 		redacted,
 		// STS XML responses are commonly pretty-printed, so the value sits on its own
 		// line between the tags. `[^<]` still refuses to cross into another element,
-		// and the length bound keeps an empty or whitespace-only body from matching.
-		/(<((?:[A-Za-z_][\w.-]*:)?(?:SecretAccessKey|SessionToken))>)[^<]{8,4096}(<\/\2>)/gi,
+		// while the call-wide input bound caps work without imposing a credential-size
+		// assumption. The lower bound leaves empty or whitespace-only bodies alone.
+		/(<((?:[A-Za-z_][\w.-]*:)?(?:SecretAccessKey|SessionToken))>)[^<]{8,1000000}(<\/\2>)/gi,
 		"$1[REDACTED_SECRET]$3",
 		state,
 		"aws_keys",

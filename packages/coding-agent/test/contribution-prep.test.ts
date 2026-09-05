@@ -256,6 +256,26 @@ describe("contribution prep", () => {
 		expect(redacted).toContain("<Region>us-east-1</Region>");
 	});
 
+	it("redacts pretty-printed XML credentials beyond the historical 4096-character boundary", () => {
+		const exactBoundary = `SYNTHETIC_SESSION_TOKEN_${"4".repeat(4072)}`;
+		const overBoundary = `SYNTHETIC_SESSION_TOKEN_${"5".repeat(5000)}`;
+		const text = [
+			"<Credentials>",
+			`<SessionToken>\n${exactBoundary}\n</SessionToken>`,
+			`<sts:SessionToken>\n${overBoundary}\n</sts:SessionToken>`,
+			"<Region>us-east-1</Region>",
+			"</Credentials>",
+		].join("\n");
+
+		const redacted = redactContributionPrepText(text, process.cwd());
+
+		expect(redacted).not.toContain(exactBoundary);
+		expect(redacted).not.toContain(overBoundary);
+		expect(redacted).toContain("<SessionToken>[REDACTED_SECRET]</SessionToken>");
+		expect(redacted).toContain("<sts:SessionToken>[REDACTED_SECRET]</sts:SessionToken>");
+		expect(redacted).toContain("<Region>us-east-1</Region>");
+	});
+
 	it("leaves an empty or whitespace-only XML credential element unchanged", () => {
 		const text = ["<SecretAccessKey></SecretAccessKey>", "<sts:SessionToken>\n\n</sts:SessionToken>"].join("\n");
 
