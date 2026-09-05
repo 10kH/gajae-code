@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- An ACP client that declares no MCP servers no longer loses `session/new`, `session/load`, and `session/fork` to the broker's bare readiness default. Only the MCP branch asked for a readiness budget, so an MCP-less launch kept the 10s default while a host cold start measurably crosses it whenever a second host starts alongside the first: the broker then returned `terminal_uncertain` ("Lifecycle startup cleanup could not be proven"), which Paseo recorded as a failed provider snapshot and left the GJC provider reading `error` instead of `available`, so imported terminal sessions attached to nothing and showed no transcript. Every ACP launch now requests the same budget the MCP path already used, independent of whether the client declared servers.
 
 ## [0.16.4] - 2026-09-05
 ### Added
