@@ -166,6 +166,36 @@ describe("calculateCost", () => {
 		}
 	});
 
+	it("bundles GPT-6 Astra standard and long-context pricing", () => {
+		const model = getBundledModel("openai-codex", "gpt-6-astra");
+
+		expect(model.cost).toEqual({ input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 });
+		expect(model.longContextPricing).toEqual({
+			threshold: 272_000,
+			cost: { input: 20, output: 75, cacheRead: 2, cacheWrite: 25 },
+		});
+	});
+
+	it("switches GPT-6 Astra pricing only above 272K input tokens", () => {
+		const model = getBundledModel("openai-codex", "gpt-6-astra");
+		const usage = (cacheWrite: number): Usage => ({
+			input: 200_000,
+			output: 1_000,
+			cacheRead: 72_000,
+			cacheWrite,
+			totalTokens: 273_000 + cacheWrite,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		});
+		const threshold = usage(0);
+		const aboveThreshold = usage(1);
+
+		calculateCost(model, threshold);
+		calculateCost(model, aboveThreshold);
+
+		expect(threshold.cost.total).toBeCloseTo(2.122, 8);
+		expect(aboveThreshold.cost.total).toBeCloseTo(4.219025, 8);
+	});
+
 	it("keeps GPT-5.6 short-context pricing at exactly 272K input tokens", () => {
 		const model = getBundledModel("openai", "gpt-5.6-terra");
 		const usage: Usage = {

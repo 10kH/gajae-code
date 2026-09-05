@@ -15,8 +15,19 @@ const GPT_5_6_SOL_PRICING: TieredPricing = {
 	},
 };
 
+// GPT-6 Astra: $10/$50 standard, cache read $1, cache write $12.50; inputs past
+// 272K apply 2x to input/cache and 1.5x to output.
+const GPT_6_ASTRA_PRICING: TieredPricing = {
+	cost: { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 },
+	longContextPricing: {
+		threshold: LONG_CONTEXT_THRESHOLD,
+		cost: { input: 20, output: 75, cacheRead: 2, cacheWrite: 25 },
+	},
+};
+
 // OpenAI Standard pricing: https://developers.openai.com/api/docs/pricing
 const OPENAI_GPT_5_6_PRICING: ReadonlyMap<string, TieredPricing> = new Map([
+	["gpt-6-astra", GPT_6_ASTRA_PRICING],
 	["gpt-5.6", GPT_5_6_SOL_PRICING],
 	["gpt-5.6-sol", GPT_5_6_SOL_PRICING],
 	[

@@ -714,6 +714,14 @@ describe("generated model policies", () => {
 				}),
 				applyPatchToolType: "freeform",
 			},
+			{
+				...createModel({
+					id: "gpt-7",
+					api: "openai-responses",
+					provider: "openai",
+				}),
+				applyPatchToolType: "freeform",
+			},
 		];
 
 		applyGeneratedModelPolicies(models);
@@ -722,6 +730,7 @@ describe("generated model policies", () => {
 		expect(models[1]?.applyPatchToolType).toBe("freeform");
 		expect(models[2]?.applyPatchToolType).toBeUndefined();
 		expect(models[3]?.applyPatchToolType).toBeUndefined();
+		expect(models[4]?.applyPatchToolType).toBeUndefined();
 	});
 
 	it("stores GPT-5.6 Sol/Terra/Luna effort metadata through max", () => {
@@ -759,6 +768,29 @@ describe("generated model policies", () => {
 				/Supported efforts: low, medium, high, xhigh, max/,
 			);
 		}
+	});
+
+	it("stores GPT-6 Astra effort metadata through max without touching the GPT-5.6 context cap", () => {
+		const model: Model<Api> = {
+			...createModel({ id: "gpt-6-astra", api: "openai-codex-responses", provider: "openai-codex" }),
+			contextWindow: 272_000,
+			maxTokens: 128000,
+		};
+
+		expect(model.thinking).toEqual({
+			mode: "effort",
+			minLevel: Effort.Low,
+			maxLevel: Effort.Max,
+		});
+		expect(requireSupportedEffort(model, Effort.Max)).toBe(Effort.Max);
+		expect(() => requireSupportedEffort(model, Effort.Minimal)).toThrow(
+			/Supported efforts: low, medium, high, xhigh, max/,
+		);
+
+		const models = [model];
+		applyGeneratedModelPolicies(models);
+		expect(models[0]?.contextWindow).toBe(272_000);
+		expect(models[0]?.applyPatchToolType).toBe("freeform");
 	});
 
 	it("forces only Codex product GPT-5.6 tiers to the 372K prompt budget", () => {

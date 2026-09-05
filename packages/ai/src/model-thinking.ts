@@ -86,6 +86,7 @@ type SemVer = {
 type GeminiKind = "pro" | "flash";
 type AnthropicKind = "opus" | "sonnet" | "fable";
 type OpenAIVariant =
+	| "astra"
 	| "base"
 	| "codex"
 	| "codex-max"
@@ -665,7 +666,10 @@ function inferGeneratedApplyPatchToolType(
 	model: ApiModel<Api>,
 	parsedModel: ParsedModel,
 ): ApiModel<Api>["applyPatchToolType"] {
-	if (parsedModel.family !== "openai" || parsedModel.version.major !== 5) {
+	if (
+		parsedModel.family !== "openai" ||
+		(parsedModel.version.major !== 5 && !(parsedModel.version.major === 6 && parsedModel.variant === "astra"))
+	) {
 		return undefined;
 	}
 	if (model.provider === "openai" && model.api === "openai-responses") {
@@ -1014,7 +1018,7 @@ function parseAnthropicModel(modelId: string): AnthropicModel | null {
 
 function parseOpenAIModel(modelId: string): OpenAIModel | null {
 	const match =
-		/gpt-(\d+(?:\.\d+){0,2})(?:-(codex-spark|codex-mini|codex-max|codex|luna|mini|max|nano|sol|terra))?$/.exec(
+		/gpt-(\d+(?:\.\d+){0,2})(?:-(astra|codex-spark|codex-mini|codex-max|codex|luna|mini|max|nano|sol|terra))?$/.exec(
 			modelId,
 		);
 	if (!match) {
