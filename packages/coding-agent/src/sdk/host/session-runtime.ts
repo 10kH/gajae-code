@@ -4055,10 +4055,15 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					 * reached the wire. The synchronous session subscription can see a
 					 * message_update before emitLifecycle finishes awaiting durable start
 					 * persistence; holding them here keeps the producer's start/content
-					 * boundary for every SDK consumer.
+					 * boundary for every SDK consumer. Each entry carries the recipients
+					 * that owned the run when the event was produced: an owner attached
+					 * later must not receive content from before its attachment.
 					 */
 					startPublished: boolean;
-					heldContent: AgentSessionEvent[];
+					heldContent: Array<{
+						event: AgentSessionEvent;
+						recipients: Array<{ correlation: InvocationCorrelation; connectionId: string | undefined }>;
+					}>;
 				}>;
 				disposeGate?: () => void;
 				lifecycleActive: boolean;
@@ -4279,8 +4284,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		batch.startPublished = true;
 		const held = batch.heldContent;
 		batch.heldContent = [];
-		for (const event of held)
-			publishContentFrames(current, event, [...batch.invocations, ...batch.attachedInvocations]);
+		for (const { event, recipients } of held) publishContentFrames(current, event, recipients);
 	};
 	const emitLifecycle = async (
 		type: "agent_start" | "agent_end" | "agent_failed",
@@ -4990,7 +4994,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		// synchronous. Hold content until that start is on the wire so no consumer
 		// sees turn content before the turn it belongs to.
 		if (batch && !batch.startPublished) {
-			batch.heldContent.push(event as AgentSessionEvent);
+			batch.heldContent.push({ event: event as AgentSessionEvent, recipients: invocations });
 			return;
 		}
 		publishContentFrames(current, event as AgentSessionEvent, invocations);
@@ -5069,7 +5073,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				connectionId: string | undefined;
 			}>;
 			startPublished: boolean;
-			heldContent: AgentSessionEvent[];
+			heldContent: Array<{
+				event: AgentSessionEvent;
+				recipients: Array<{ correlation: InvocationCorrelation; connectionId: string | undefined }>;
+			}>;
 		}> = [];
 		const configRevision = { current: 0 };
 		let acceptingGateResolutions = true;

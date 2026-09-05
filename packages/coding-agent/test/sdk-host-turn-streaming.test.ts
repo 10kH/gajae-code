@@ -92,6 +92,8 @@ interface HostHarness {
 	control(operation: string, input: Record<string, unknown>, connectionId?: string): Promise<ControlResponse>;
 	emit(event: string, payload?: unknown): Promise<void>;
 	setIdle(idle: boolean): void;
+	/** Promote every queued (non-idle) submission whose promotion was deferred by `deferPromotion`. */
+	promoteQueued(): void;
 	clearFrames(): void;
 	readonly sent: Array<{ connectionId: string; frame: SdkFrame }>;
 	readonly broadcasts: SdkFrame[];
@@ -113,6 +115,8 @@ async function createHostHarness(
 		settleSubmission?: "never" | "resolve";
 		onSessionEvent?: ExtensionContext["onSessionEvent"];
 		reconciliationStore?: ReconciliationStore;
+		/** Hold `onQueuedPromoted` for non-idle submissions until `promoteQueued()` is called. */
+		deferPromotion?: boolean;
 	} = {},
 ): Promise<HostHarness> {
 	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
@@ -123,6 +127,7 @@ async function createHostHarness(
 	let receive: ((connectionId: string, frame: SdkFrame) => void) | undefined;
 	let nextId = 0;
 	let idle = true;
+	const deferredPromotions: Array<() => void> = [];
 	const api = {
 		on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
 			handlers.set(event, handler);
@@ -137,7 +142,11 @@ async function createHostHarness(
 			},
 		) => {
 			await options?.onPreflightAcceptCommit?.();
-			if (!idle) options?.onQueuedPromoted?.({ startsOwnRun: false });
+			if (!idle) {
+				const promote = () => options?.onQueuedPromoted?.({ startsOwnRun: false });
+				if (harnessOptions.deferPromotion) deferredPromotions.push(promote);
+				else promote();
+			}
 			if (harnessOptions.settleSubmission === "resolve") return;
 			return await new Promise<never>(() => {});
 		},
@@ -218,6 +227,9 @@ async function createHostHarness(
 		},
 		setIdle: value => {
 			idle = value;
+		},
+		promoteQueued: () => {
+			for (const promote of deferredPromotions.splice(0)) promote();
 		},
 		sent,
 		broadcasts,
@@ -447,6 +459,67 @@ describe("SDK host turn streaming", () => {
 							.assistantMessageEvent.delta,
 				);
 			expect(deltas).toEqual(["early", " late"]);
+		} finally {
+			startGate.resolve();
+			await harness.stop();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+	test("does not release pre-attachment content to an owner attached while the start was held", async () => {
+		// Recipients are snapshotted when content is held. A second SDK prompt
+		// attached during the slow start transaction owns the run from then on,
+		// but must not receive deltas produced before it attached.
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-stream-held-attach-"));
+		const inner = createReconciliationStore({ sessionFile: path.join(cwd, "session.jsonl"), sessionId: SESSION_ID });
+		const startGate = Promise.withResolvers<void>();
+		const startEntered = Promise.withResolvers<void>();
+		let holdNextTransact = false;
+		const slowStore: ReconciliationStore = {
+			...inner,
+			transact: async mutator => {
+				if (holdNextTransact) {
+					holdNextTransact = false;
+					startEntered.resolve();
+					await startGate.promise;
+				}
+				return inner.transact(mutator);
+			},
+		};
+		const harness = await createHostHarness(SESSION_ID, cwd, {
+			reconciliationStore: slowStore,
+			deferPromotion: true,
+		});
+		try {
+			const root = await harness.control("turn.prompt", { text: "root" }, "root-client");
+			expect(root.ok).toBe(true);
+			// A second prompt is accepted while the session is busy: it is queued as
+			// steering and only attaches to the run when the producer consumes it.
+			harness.setIdle(false);
+			const attached = await harness.control("turn.prompt", { text: "attached" }, "attached-client");
+			expect(attached.ok).toBe(true);
+			harness.clearFrames();
+			holdNextTransact = true;
+			const start = harness.emit("agent_start");
+			await startEntered.promise;
+			await harness.emit("message_update", textDelta("before-attach"));
+			// The queued prompt is consumed (attached) while the start is still held.
+			harness.promoteQueued();
+			await harness.emit("message_update", textDelta("after-attach"));
+			startGate.resolve();
+			await start;
+			const delivered = harness.sent
+				.filter(entry => entry.frame.type === "event" && entry.frame.kind === "message_update")
+				.map(entry => ({
+					to: entry.connectionId,
+					commandId: entry.frame.commandId,
+					delta: (entry.frame.payload as { event: { assistantMessageEvent: { delta: string } } }).event
+						.assistantMessageEvent.delta,
+				}));
+			expect(delivered).toEqual([
+				{ to: "root-client", commandId: root.result?.commandId, delta: "before-attach" },
+				{ to: "root-client", commandId: root.result?.commandId, delta: "after-attach" },
+				{ to: "attached-client", commandId: attached.result?.commandId, delta: "after-attach" },
+			]);
 		} finally {
 			startGate.resolve();
 			await harness.stop();
