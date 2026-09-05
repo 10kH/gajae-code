@@ -175,6 +175,22 @@ describe("resolveDaemonTarget", () => {
 			}),
 		).toEqual({ kind: "tcp", host: "127.0.0.1", port: 7777 });
 	});
+
+	test("does not use the default listener to prove a configured non-default daemon", async () => {
+		const dependencies = deps({
+			configValue: config({ gjc: providerEntry() }, "127.0.0.1:7777"),
+			probeDaemon: async target => {
+				dependencies.recorder.probes.push(target);
+				return target.kind === "tcp" && target.host === "localhost" && target.port === 6767;
+			},
+		});
+		expect(await announceSessionToPaseo({ sessionId: SESSION_ID, cwd: CWD }, dependencies)).toEqual({
+			kind: "skipped",
+			reason: "daemon-unreachable",
+		});
+		expect(dependencies.recorder.probes).toEqual([{ kind: "tcp", host: "127.0.0.1", port: 7777 }]);
+		expect(dependencies.recorder.imports).toHaveLength(0);
+	});
 });
 
 describe("resolvePaseoHome", () => {
@@ -195,6 +211,31 @@ describe("broker live-session matching", () => {
 				CWD,
 			),
 		).toBe(true);
+	});
+
+	test("accepts a realpath-canonical broker cwd for a symlinked launch cwd", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-paseo-cwd-"));
+		const real = path.join(root, "real");
+		const linked = path.join(root, "linked");
+		await fs.mkdir(real);
+		await fs.symlink(real, linked);
+		try {
+			expect(
+				sessionListContainsLiveSessionForTests(
+					[
+						{
+							sessionId: SESSION_ID,
+							live: true,
+							locator: { cwd: real, worktreeRoot: null, stateRoot: "/tmp/state" },
+						},
+					],
+					SESSION_ID,
+					await fs.realpath(linked),
+				),
+			).toBe(true);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
 	});
 });
 

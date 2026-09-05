@@ -4354,7 +4354,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			// Pair this agent_end with the oldest unmatched start. A delayed
 			// aborted-turn end that lands after a successor agent_start must
 			// terminalize the aborted invocation, never the successor.
-			const ended = current.openLifecycleBatches[0];
+			const ended = failureBatch ?? current.openLifecycleBatches[0];
 			const baseTransitions = ended
 				? ended.invocations.map(({ kind, correlation }) => ({ kind, correlation }))
 				: current.activeInvocation

@@ -383,6 +383,66 @@ describe("SDK host turn streaming", () => {
 		}
 	});
 
+	test("streams a tokenless shared batch to every accepted owner", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-stream-tokenless-"));
+		const harness = await createHostHarness(SESSION_ID, cwd);
+		try {
+			const first = await harness.control("turn.prompt", { text: "first" }, "first-client");
+			const second = await harness.control("turn.prompt", { text: "second" }, "second-client");
+			await harness.emit("agent_start");
+			harness.clearFrames();
+			await harness.emit("message_update", textDelta("shared"));
+			expect(harness.sent.map(frame => frame.connectionId)).toEqual(["first-client", "second-client"]);
+			await harness.emit("agent_end", { stopReason: "completed" });
+			for (const accepted of [first, second]) {
+				expect(
+					harness.broadcasts.some(
+						frame =>
+							frame.kind === "agent_end" &&
+							(frame.payload as { commandId?: unknown } | undefined)?.commandId === accepted.result?.commandId,
+					),
+				).toBe(true);
+			}
+		} finally {
+			await harness.stop();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("attributes an out-of-order token terminal to its matching batch", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-stream-out-of-order-"));
+		const harness = await createHostHarness(SESSION_ID, cwd);
+		try {
+			const first = await harness.control("turn.prompt", { text: "first" }, "first-client");
+			const second = await harness.control("turn.prompt", { text: "second" }, "second-client");
+			const firstToken = `${first.result?.commandId}:${first.result?.turnId}`;
+			const secondToken = `${second.result?.commandId}:${second.result?.turnId}`;
+			await harness.emit("agent_start", { sdkRunToken: firstToken });
+			await harness.emit("agent_start", { sdkRunToken: secondToken });
+			harness.clearFrames();
+
+			await harness.emit("agent_end", { sdkRunToken: secondToken, stopReason: "completed" });
+			expect(
+				harness.broadcasts.some(
+					frame =>
+						frame.kind === "agent_end" &&
+						(frame.payload as { commandId?: unknown } | undefined)?.commandId === second.result?.commandId,
+				),
+			).toBe(true);
+			expect(
+				harness.broadcasts.some(
+					frame =>
+						frame.kind === "agent_end" &&
+						(frame.payload as { commandId?: unknown } | undefined)?.commandId === first.result?.commandId,
+				),
+			).toBe(false);
+			await harness.emit("agent_end", { sdkRunToken: firstToken, stopReason: "completed" });
+		} finally {
+			await harness.stop();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("preserves stream ownership across a continuation start with the same token", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-stream-continuation-"));
 		const harness = await createHostHarness(SESSION_ID, cwd);

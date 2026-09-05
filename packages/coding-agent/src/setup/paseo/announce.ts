@@ -25,6 +25,7 @@
  * caller checks `paseo.autoImport` before any of this runs, so an installation
  * that never asked for it pays nothing at all.
  */
+import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import * as path from "node:path";
 import { $which, logger } from "@gajae-code/utils";
@@ -195,9 +196,8 @@ async function resolveDaemonTargets(
 		pidIpc,
 		configuredIpc,
 		configuredTcp,
-		DEFAULT_DAEMON_TARGET,
 	].filter((target): target is PaseoDaemonTarget => target !== undefined);
-	return targets.filter((target, index) => JSON.stringify(targets[index - 1]) !== JSON.stringify(target));
+	return targets.length > 0 ? [targets[0]!] : [DEFAULT_DAEMON_TARGET];
 }
 
 /**
@@ -361,6 +361,7 @@ function probeDaemon(target: PaseoDaemonTarget): Promise<boolean> {
 
 function isSessionLive(agentDir: string): (sessionId: string, cwd: string) => Promise<boolean> {
 	return async (sessionId, cwd) => {
+		const canonicalCwd = await fs.realpath(cwd).catch(() => path.resolve(cwd));
 		const client = new AgentDirSessionLifecycleClient(agentDir);
 		const pages = await traverseSessionList(
 			{},
@@ -368,7 +369,7 @@ function isSessionLive(agentDir: string): (sessionId: string, cwd: string) => Pr
 			response => sessionListPageFromResponse(response),
 		);
 		for (const { sessions } of pages) {
-			if (sessionListContainsLiveSessionForTests(sessions, sessionId, cwd)) return true;
+			if (sessionListContainsLiveSessionForTests(sessions, sessionId, canonicalCwd)) return true;
 		}
 		return false;
 	};
