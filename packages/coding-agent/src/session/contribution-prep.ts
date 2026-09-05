@@ -111,7 +111,10 @@ function redactAwsLabeledValues(text: string, state: RedactionState): string {
 	let redacted = redactAwsAccessKeyIds(text, state);
 	redacted = replaceRegex(
 		redacted,
-		/(<((?:[A-Za-z_][\w.-]*:)?(?:SecretAccessKey|SessionToken))>)[^<\r\n]{8,}(<\/\2>)/gi,
+		// STS XML responses are commonly pretty-printed, so the value sits on its own
+		// line between the tags. `[^<]` still refuses to cross into another element,
+		// and the length bound keeps an empty or whitespace-only body from matching.
+		/(<((?:[A-Za-z_][\w.-]*:)?(?:SecretAccessKey|SessionToken))>)[^<]{8,4096}(<\/\2>)/gi,
 		"$1[REDACTED_SECRET]$3",
 		state,
 		"aws_keys",

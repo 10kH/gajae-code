@@ -216,6 +216,52 @@ describe("contribution prep", () => {
 		);
 	});
 
+	it("redacts pretty-printed AWS XML whose value sits on its own line", () => {
+		// A real STS response is usually pretty-printed, so the value is separated
+		// from its tags by a newline and indentation. Matching only same-line bodies
+		// let the complete credential through while the compact form was redacted.
+		const text = [
+			"<Credentials>",
+			`  <AccessKeyId>${SYNTHETIC_AWS_TEMPORARY_KEY_ID}</AccessKeyId>`,
+			"  <SecretAccessKey>",
+			`    ${SYNTHETIC_AWS_SECRET_ACCESS_KEY}`,
+			"  </SecretAccessKey>",
+			"  <sts:SessionToken>",
+			`    ${SYNTHETIC_AWS_SESSION_TOKEN}`,
+			"  </sts:SessionToken>",
+			"</Credentials>",
+		].join("\n");
+
+		const redacted = redactContributionPrepText(text, process.cwd());
+
+		expect(redacted).not.toContain(SYNTHETIC_AWS_SECRET_ACCESS_KEY);
+		expect(redacted).not.toContain(SYNTHETIC_AWS_SESSION_TOKEN);
+		expect(redacted).not.toContain(SYNTHETIC_AWS_TEMPORARY_KEY_ID);
+		// The element names survive, so the artifact still records the shape.
+		expect(redacted).toContain("<SecretAccessKey>");
+		expect(redacted).toContain("</sts:SessionToken>");
+	});
+
+	it("does not let a multiline XML match swallow a following element", () => {
+		const text = [
+			"<SecretAccessKey>",
+			`  ${SYNTHETIC_AWS_SECRET_ACCESS_KEY}`,
+			"</SecretAccessKey>",
+			"<Region>us-east-1</Region>",
+		].join("\n");
+
+		const redacted = redactContributionPrepText(text, process.cwd());
+
+		expect(redacted).not.toContain(SYNTHETIC_AWS_SECRET_ACCESS_KEY);
+		expect(redacted).toContain("<Region>us-east-1</Region>");
+	});
+
+	it("leaves an empty or whitespace-only XML credential element unchanged", () => {
+		const text = ["<SecretAccessKey></SecretAccessKey>", "<sts:SessionToken>\n\n</sts:SessionToken>"].join("\n");
+
+		expect(redactContributionPrepText(text, process.cwd())).toBe(text);
+	});
+
 	it("leaves AWS-like prose and key-id near-misses unchanged", () => {
 		const text = [
 			"ASIAN markets rose",
