@@ -198,6 +198,11 @@ import { buildNamedToolChoice, buildNamedToolChoiceResult } from "../utils/tool-
 import type { WorkspaceTree } from "../workspace-tree";
 import { createSessionLifecycleService } from "./lifecycle/client";
 import {
+	isStableSessionApiKeyCredentialType,
+	lookupSessionApiKey,
+	resolveLiveSessionApiKeyModel,
+} from "./session-api-key";
+import {
 	attachLifecycleStartupCapability,
 	lifecycleMcpStartupTimeoutOption,
 	lifecycleStartupCapabilityOption,
@@ -4251,6 +4256,31 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			).seedNormalizedMessages(options.forkContextSeed.messages);
 		}
 
+		const resolvedCredentialScopes = new Map<string, string | undefined>();
+		const resolveAgentApiKey = async (provider: string): Promise<string> => {
+			const liveModel = resolveLiveSessionApiKeyModel(sessionAgent?.state.model, model, provider);
+			const hasExplicitScopePolicy =
+				modelRegistry.authStorage.hasSessionCredentialSelector(provider, credentialSessionId) ||
+				modelRegistry.authStorage.hasSessionCredentialAuto(provider, credentialSessionId);
+			const resolution = await lookupSessionApiKey(
+				modelRegistry,
+				provider,
+				credentialSessionId,
+				liveModel,
+				!hasExplicitScopePolicy,
+			);
+			resolvedCredentialScopes.set(provider, resolution.credentialSessionId);
+			return resolution.apiKey;
+		};
+		const resolvedCredentialType = (provider: string): "api_key" | "oauth" | undefined => {
+			const scope = resolvedCredentialScopes.has(provider)
+				? resolvedCredentialScopes.get(provider)
+				: credentialSessionId;
+			return modelRegistry.authStorage.getEffectiveCredentialType(provider, scope, {
+				owner: modelRegistry.getAuthStorageOwner(),
+			});
+		};
+
 		agent = new Agent({
 			initialState: {
 				systemPrompt,
@@ -4289,44 +4319,42 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			shouldPause: options.shouldPause,
 			preferWebsockets: preferOpenAICodexWebsockets,
 			getToolContext: tc => toolContextStore.getContext(tc),
-			getApiKey: async provider => {
+			getApiKey: provider => {
 				// AgentLoop asks by provider, but the active model carries the
 				// model-scoped credential selector. Read it at call time so model
 				// changes are honored after /new, fork, resume, or branch switches.
-				const liveModel = sessionAgent?.state.model ?? model;
-				const key =
-					liveModel?.provider === provider
-						? await modelRegistry.getApiKey(liveModel, credentialSessionId)
-						: undefined;
-				const providerKey = key ?? (await modelRegistry.getApiKeyForProvider(provider, credentialSessionId));
-				if (!providerKey) {
-					throw new Error(`No API key found for provider "${provider}"`);
-				}
-				return providerKey;
+				return resolveAgentApiKey(provider);
 			},
-			getAuthCredentialType: provider => modelRegistry.getSessionCredentialType(provider, credentialSessionId),
+			getAuthCredentialType: resolvedCredentialType,
 			streamFn: async (streamModel, context, streamOptions) => {
 				const requestStartedAt = performance.now();
 				let stream: Awaited<ReturnType<typeof streamSimple>>;
 				try {
-					const effectiveApiKey = await modelRegistry.getApiKey(streamModel, credentialSessionId);
 					stream = await streamSimple(streamModel, context, {
 						...streamOptions,
-						apiKey: effectiveApiKey,
-						authCredentialType: modelRegistry.getSessionCredentialType(streamModel.provider, credentialSessionId),
 						onAuthError: async (provider, oldKey, error) => {
+							const resolvedScope = resolvedCredentialScopes.has(provider)
+								? resolvedCredentialScopes.get(provider)
+								: credentialSessionId;
 							await modelRegistry.authStorage.invalidateCredentialMatching(provider, oldKey, {
 								signal: streamOptions?.signal,
-								sessionId: credentialSessionId,
+								sessionId: resolvedScope,
 								owner: modelRegistry.getAuthStorageOwner(),
 							});
 							logger.debug("Retrying provider request after credential invalidation", {
 								provider,
 								error: error instanceof Error ? error.message : String(error),
 							});
-							return modelRegistry.getApiKey(streamModel, credentialSessionId, {
-								signal: streamOptions?.signal,
-							});
+							const replacementApiKey = await resolveAgentApiKey(provider);
+							if (
+								!isStableSessionApiKeyCredentialType(
+									streamOptions?.authCredentialType,
+									resolvedCredentialType(provider),
+								)
+							) {
+								return undefined;
+							}
+							return replacementApiKey;
 						},
 					});
 				} catch (error) {
