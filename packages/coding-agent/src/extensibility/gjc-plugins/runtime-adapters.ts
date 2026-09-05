@@ -402,6 +402,7 @@ async function resolveTrustedStdioLauncher(
 			if (
 				!untrustedRoots.some(root => isWithin(root, lexicalCandidate)) &&
 				((await isRootControlledLauncherPath(lexicalCandidate)) ||
+					(await isInitialManagedNodeLauncherPath(lexicalCandidate)) ||
 					(await isUserManagedNodeLauncherPath(lexicalCandidate))) &&
 				(await supportsNodeRuntime(lexicalCandidate))
 			) {
@@ -410,6 +411,7 @@ async function resolveTrustedStdioLauncher(
 			const lexical = path.resolve(candidate);
 			if (untrustedRoots.some(root => isWithin(root, lexical))) continue;
 			if ((await isRootControlledLauncherPath(lexical)) && (await supportsNodeRuntime(lexical))) return lexical;
+			if ((await isInitialManagedNodeLauncherPath(lexical)) && (await supportsNodeRuntime(lexical))) return lexical;
 			if ((await isUserManagedNodeLauncherPath(lexical)) && (await supportsNodeRuntime(lexical))) return lexical;
 			const real = await fs.realpath(lexical);
 			if (untrustedRoots.some(root => isWithin(root, real))) continue;
@@ -419,6 +421,21 @@ async function resolveTrustedStdioLauncher(
 		}
 	}
 	throw new Error(`Trusted stdio launcher is unavailable from absolute host PATH entries: ${launcher}`);
+}
+
+async function isInitialManagedNodeLauncherPath(executablePath: string): Promise<boolean> {
+	if (process.platform !== "linux") return false;
+	const initialEnv = await initialProcessEnvironment;
+	const roots = [initialEnv.get("NVM_DIR"), initialEnv.get("RUNNER_TOOL_CACHE")]
+		.filter((root): root is string => typeof root === "string" && path.isAbsolute(root))
+		.map(root => path.resolve(root));
+	const authorityRoot = roots.find(root => isWithin(root, executablePath));
+	if (!authorityRoot) return false;
+	for (const tempRoot of [os.tmpdir(), "/tmp", "/var/tmp"]) {
+		if (isWithin(path.resolve(tempRoot), authorityRoot)) return false;
+	}
+	const target = await fs.stat(executablePath);
+	return target.isFile() && (target.mode & 0o022) === 0;
 }
 
 async function supportsNodeRuntime(executablePath: string): Promise<boolean> {
