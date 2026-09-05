@@ -1,3 +1,4 @@
+import { cleanReason } from "@gajae-code/ai/auth-broker/redact";
 import type { FallbackTriggerClass } from "@gajae-code/ai/utils/fallback-transport";
 
 /** Immutable configured fallback intent. Transient attempt state never belongs here. */
@@ -270,6 +271,11 @@ export interface CompactionCandidateFailure {
 	readonly message: string;
 }
 
+function sanitizeCompactionCandidateFailureMessage(message: string): string {
+	const cleaned = cleanReason(message) ?? "Compaction candidate failed.";
+	return cleaned.replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s<>'"]+/gi, "[redacted URL]");
+}
+
 /**
  * Error for an auto-compaction run whose every candidate failed.
  *
@@ -284,10 +290,15 @@ export function describeCompactionCandidateFailures(
 	failures: readonly CompactionCandidateFailure[],
 	lastError: unknown,
 ): Error {
+	if (failures.length === 0)
+		return new Error("Compaction failed: no candidate failure details available.", { cause: lastError });
 	const first = failures[0]!;
-	const lines = failures.map(failure => `  ${failure.model}: ${failure.message}`);
+	const firstMessage = sanitizeCompactionCandidateFailureMessage(first.message);
+	const lines = failures.map(
+		failure => `  ${failure.model}: ${sanitizeCompactionCandidateFailureMessage(failure.message)}`,
+	);
 	return new Error(
-		`${first.message} (${first.model}); ${failures.length} compaction candidates failed:\n${lines.join("\n")}`,
+		`${firstMessage} (${first.model}); ${failures.length} compaction candidates failed:\n${lines.join("\n")}`,
 		{ cause: lastError },
 	);
 }

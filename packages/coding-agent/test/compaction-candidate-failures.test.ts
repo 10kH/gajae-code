@@ -34,4 +34,22 @@ describe("describeCompactionCandidateFailures", () => {
 		const last = new Error("final");
 		expect(describeCompactionCandidateFailures(failures, last).cause).toBe(last);
 	});
+
+	it("redacts credentials and provider base URLs from every listed failure", () => {
+		const error = describeCompactionCandidateFailures(
+			[
+				{
+					model: "provider/first",
+					message: "Request failed at https://secret.example/v1?trace=private-id",
+				},
+				{ model: "provider/second", message: 'authorization: "Bearer secret-token"' },
+			],
+			new Error("final"),
+		);
+
+		expect(error.message).not.toContain("secret.example");
+		expect(error.message).not.toContain("secret-token");
+		expect(error.message).toContain("[redacted URL]");
+		expect(error.message).toContain("Credential diagnostic unavailable.");
+	});
 });
