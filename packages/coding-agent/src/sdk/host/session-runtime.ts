@@ -4308,9 +4308,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			const matchingPending =
 				typeof startToken === "string" && startToken.length > 0
 					? current.pending.filter(entry => entry.sdkRunToken === startToken)
-					: current.pending.length === 1
-						? current.pending.slice(0, 1)
-						: [];
+					: current.pending.slice();
 			const matchingKeys = new Set(matchingPending.map(entry => entry.sdkRunToken));
 			const pendingSnapshot = current.pending.splice(0);
 			const drained = pendingSnapshot
@@ -4743,12 +4741,14 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const terminalOutcome =
 			event.stopReason === "cancelled"
 				? ({ kind: "stopped", reason: "cancelled", provenance: "client_cancel" } as const)
-				: failure === undefined
-					? terminalStoppedOutcome(
-							event.stopReason,
-							event.stopReason === "maintenance" ? event.maintenanceOutcome : undefined,
-						)
-					: canonicalFailedOutcome(failure);
+				: failure !== undefined
+					? canonicalFailedOutcome(failure)
+					: terminalEvidence.content?.text.trim() || terminalEvidence.hasActivity
+						? terminalStoppedOutcome(
+								event.stopReason,
+								event.stopReason === "maintenance" ? event.maintenanceOutcome : undefined,
+							)
+						: canonicalFailedOutcome(EMPTY_PROMPT_FAILURE);
 		return trackLifecycle(async () => {
 			if (failure && !failureAlreadyPublished) {
 				for (const key of genericFailureKeys) owner?.failureDiagnosticKeys.delete(key);

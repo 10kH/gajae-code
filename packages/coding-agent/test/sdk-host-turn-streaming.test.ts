@@ -367,10 +367,9 @@ describe("SDK host turn streaming", () => {
 					(frame.payload as { commandId?: unknown } | undefined)?.commandId === first.result?.commandId,
 			);
 			expect(firstTerminals).toHaveLength(1);
-			expect((firstTerminals[0]?.payload as { outcome?: unknown } | undefined)?.outcome).toEqual({
-				kind: "stopped",
-				reason: "end_turn",
-				provenance: "agent",
+			expect((firstTerminals[0]?.payload as { outcome?: unknown } | undefined)?.outcome).toMatchObject({
+				kind: "failed",
+				code: "prompt_failed",
 			});
 
 			await harness.emit("agent_start", { sdkRunToken: secondToken });
