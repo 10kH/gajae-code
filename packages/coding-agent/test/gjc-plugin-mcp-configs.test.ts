@@ -38,22 +38,9 @@ describe("plugin MCP runtime config conversion", () => {
 		const installedRoot = path.join(cwd, ".gjc", "gjc-plugins", "valid-six-surface-bundle");
 		expect(docs.args).toEqual(["mcp/domain-docs.ts"]);
 		expect(path.resolve(docs.cwd)).toBe(path.resolve(installedRoot));
-		const prepared = await docs.prepareSpawn?.({ command: docs.command, args: docs.args, cwd: docs.cwd });
-		if (!prepared) throw new Error("missing prepared plugin MCP launch");
-		expect(prepared.args.slice(0, 5)).toEqual([
-			`--config=${os.devNull}`,
-			"--no-env-file",
-			"--no-install",
-			"--eval",
-			expect.any(String),
-		]);
-		const separator = prepared.args.indexOf("--");
-		expect(prepared.args[separator + 1]).not.toContain(installedRoot);
-		expect(prepared.args[separator + 2]).not.toContain(installedRoot);
-		expect(prepared.args[separator + 3]).not.toContain(installedRoot);
-		expect(prepared.args[separator + 4]).toMatch(/^[0-9a-f]{64}$/);
-		expect(prepared.cwd).not.toContain(installedRoot);
-		await prepared.afterProcessExit?.();
+		await expect(docs.prepareSpawn?.({ command: docs.command, args: docs.args, cwd: docs.cwd })).rejects.toThrow(
+			"Authenticated plugin MCP Bun launch capsules are unavailable",
+		);
 	});
 
 	test("empty when no plugins installed", async () => {

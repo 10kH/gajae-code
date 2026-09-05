@@ -225,7 +225,7 @@ describe("bundled plugin MCP launcher contract", () => {
 		const source = await tempDir("gjc-plugin-launcher-source-");
 		await writeBundle(source, {
 			name: "direct-entry",
-			command: "bun",
+			command: "node",
 			args: ["server.mjs", "--config=ordinary-server-arg"],
 			cwd: "mcp",
 			serverPath: "mcp/server.mjs",
@@ -249,7 +249,7 @@ describe("bundled plugin MCP launcher contract", () => {
 		await fs.mkdir(path.join(source, "empty-cwd"));
 		await writeBundle(source, {
 			name: "empty-cwd",
-			command: "bun",
+			command: "node",
 			args: ["../server.mjs"],
 			cwd: "empty-cwd",
 			serverPath: "server.mjs",
@@ -737,7 +737,7 @@ console.log("MARKER=" + await fs.readFile(marker, "utf8").catch(() => "missing")
 		}
 	});
 
-	test("neutralizes ambient Bun config, dotenv, and auto-install at the live spawn boundary", async () => {
+	test("fails Bun launch closed before ambient config, dotenv, or auto-install can run", async () => {
 		const cwd = await tempDir("gjc-plugin-launcher-project-");
 		const source = await tempDir("gjc-plugin-launcher-source-");
 		const outside = await tempDir("gjc-plugin-launcher-ambient-");
@@ -761,8 +761,8 @@ console.log("MARKER=" + await fs.readFile(marker, "utf8").catch(() => "missing")
 		);
 
 		const connected = await connect(cwd, "ambient-isolation");
-		expect(connected.errors).toEqual([]);
-		expect(await fs.readFile(serverReport, "utf8")).toBe('{"ambient":null}');
+		expect(connected.errors).toHaveLength(1);
+		await expect(fs.readFile(serverReport, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
 		await expect(fs.readFile(preloadMarker, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
 	}, 30_000);
 

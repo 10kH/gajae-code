@@ -390,47 +390,6 @@ async function readStableFile(
 	}
 }
 
-const runningBunHandleAuthority =
-	process.platform === "darwin"
-		? fs.open(process.execPath, fs.constants.O_RDONLY).then(
-				handle => ({ handle, error: undefined }),
-				error => ({ handle: undefined, error }),
-			)
-		: null;
-
-async function readRunningBunExecutable(): Promise<Buffer> {
-	if (process.platform === "linux") {
-		return readStableFile("/proc/self/exe", "Running Bun executable", MCP_LAUNCHER_MAX_BYTES, true);
-	}
-	if (process.platform !== "darwin" || !runningBunHandleAuthority) {
-		throw new Error("Authenticated Bun executable capture is unavailable on this platform");
-	}
-	const authority = await runningBunHandleAuthority;
-	if (!authority.handle) throw authority.error;
-	const before = await authority.handle.stat();
-	if (!before.isFile() || before.size > MCP_LAUNCHER_MAX_BYTES) {
-		throw new Error("Running Bun executable is not a bounded regular file");
-	}
-	const bytes = Buffer.allocUnsafe(before.size);
-	let offset = 0;
-	while (offset < bytes.byteLength) {
-		const { bytesRead } = await authority.handle.read(bytes, offset, bytes.byteLength - offset, offset);
-		if (bytesRead === 0) throw new Error("Running Bun executable changed while reading");
-		offset += bytesRead;
-	}
-	const after = await authority.handle.stat();
-	if (
-		before.dev !== after.dev ||
-		before.ino !== after.ino ||
-		before.size !== after.size ||
-		before.mtimeMs !== after.mtimeMs ||
-		before.ctimeMs !== after.ctimeMs
-	) {
-		throw new Error("Running Bun executable changed while reading");
-	}
-	return bytes;
-}
-
 /**
  * Resolve host launchers through absolute PATH entries outside the workspace
  * and installed plugin. Relative entries such as `.` and absolute workspace
@@ -602,6 +561,9 @@ async function prepareVerifiedStdioLaunch(input: {
 	if (process.platform === "win32") {
 		throw new Error("Authenticated plugin MCP stdio launch capsules are unavailable on Windows");
 	}
+	if (input.launcher === "bun") {
+		throw new Error("Authenticated plugin MCP Bun launch capsules are unavailable");
+	}
 	if (input.files.length === 0 || input.files.length > MCP_SNAPSHOT_MAX_FILES) {
 		throw new Error(`Plugin MCP snapshot file count exceeds ${MCP_SNAPSHOT_MAX_FILES}`);
 	}
@@ -627,16 +589,16 @@ async function prepareVerifiedStdioLaunch(input: {
 		await fs.mkdir(snapshotRoot, { mode: 0o700 });
 		if ((await fs.realpath(capsuleRoot)) !== capsuleRoot) throw new Error("Plugin MCP launch capsule path drifted");
 
-		const launcherBytes =
-			input.launcher === "bun"
-				? await readRunningBunExecutable()
-				: await readStableFile(input.launcherPath, "Plugin MCP interpreter", MCP_LAUNCHER_MAX_BYTES, true);
-		if (input.launcher === "node") {
-			const launcherReal = await fs.realpath(input.launcherPath);
-			const expectedLauncherHash = (await initialNodeAuthorities).get(launcherReal);
-			if (!expectedLauncherHash || sha256(launcherBytes) !== expectedLauncherHash) {
-				throw new Error("Plugin MCP Node interpreter drifted from startup authority");
-			}
+		const launcherBytes = await readStableFile(
+			input.launcherPath,
+			"Plugin MCP interpreter",
+			MCP_LAUNCHER_MAX_BYTES,
+			true,
+		);
+		const launcherReal = await fs.realpath(input.launcherPath);
+		const expectedLauncherHash = (await initialNodeAuthorities).get(launcherReal);
+		if (!expectedLauncherHash || sha256(launcherBytes) !== expectedLauncherHash) {
+			throw new Error("Plugin MCP Node interpreter drifted from startup authority");
 		}
 		await fs.writeFile(launcherPath, launcherBytes, { flag: "wx", mode: 0o500 });
 
