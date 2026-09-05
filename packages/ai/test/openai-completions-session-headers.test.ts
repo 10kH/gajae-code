@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { getBundledModel } from "../src/models";
 import { streamOpenAICompletions } from "../src/providers/openai-completions";
 import { detectOpenAICompat, resolveOpenAICompat } from "../src/providers/openai-completions-compat";
+import { completeSimple, streamSimple } from "../src/stream";
 import type { Context, Model } from "../src/types";
 
 const originalFetch = global.fetch;
@@ -125,6 +126,33 @@ describe("sendSessionHeaders compat resolution", () => {
 // ── end-to-end wire transmission ─────────────────────────────────────────────
 
 describe("session headers on the wire (streamOpenAICompletions)", () => {
+	it("preserves provider conversation authority through streamSimple dispatch", async () => {
+		const captured: CapturedRequest[] = [];
+		global.fetch = createCapturingFetch(captured);
+		await streamSimple(openCodeGoModel(), baseContext(), {
+			apiKey: "test-key",
+			sessionId: "generic-cache-key",
+			providerSessionId: "opaque-stream-session",
+		}).result();
+
+		expect(captured).toHaveLength(1);
+		expect(captured[0].headers["x-opencode-session"]).toBe("opaque-stream-session");
+	});
+
+	it("preserves provider conversation authority through completeSimple maintenance dispatch", async () => {
+		const captured: CapturedRequest[] = [];
+		global.fetch = createCapturingFetch(captured);
+		const result = await completeSimple(openCodeGoModel(), baseContext(), {
+			apiKey: "test-key",
+			sessionId: "generic-cache-key",
+			providerSessionId: "opaque-maintenance-session",
+		});
+
+		expect(result.stopReason).toBe("stop");
+		expect(captured).toHaveLength(1);
+		expect(captured[0].headers["x-opencode-session"]).toBe("opaque-maintenance-session");
+	});
+
 	it("sends OpenCode Go's required conversation header without changing auth or user-agent", async () => {
 		const captured: CapturedRequest[] = [];
 		await streamOpenAICompletions(openCodeGoModel(), baseContext(), {
