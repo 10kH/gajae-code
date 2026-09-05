@@ -7,24 +7,25 @@
  * keeps the provider's deterministic rejection wording in one place.
  */
 
-/**
- * ChatGPT plan types entitled to strict Pro-tier Codex models (e.g. GPT-5.6
- * Sol) whose reported `plan_type` does not contain the substring "pro".
- * Business/Enterprise/Team accounts carry the same Sol entitlement as Pro, so
- * the naive substring test would falsely reject them before dispatch even
- * though the backend accepts the request.
- */
-const OPENAI_CODEX_PRO_ENTITLED_PLAN_TYPES = new Set(["business", "enterprise", "team"]);
+const OPENAI_CODEX_PRO_ENTITLED_PLAN_TYPES = new Set(["pro", "business", "enterprise", "team"]);
+const OPENAI_CODEX_PRO_DENIED_PLAN_TYPES = new Set(["free", "plus"]);
+
+export type OpenAICodexProEntitlement = "entitled" | "denied" | "unknown";
 
 /**
- * Whether a ChatGPT `plan_type` is entitled to strict Pro-tier Codex models.
- * True for any "pro" tier plus the Business/Enterprise/Team tiers. The input is
- * lowercased defensively so callers may pass a raw or normalized plan type.
+ * Classify a ChatGPT `plan_type` for strict Pro-tier Codex models.
+ *
+ * The usage endpoint remains authoritative: only exact, documented tier names
+ * are classified. Known Free/Plus tiers can be rejected locally, while missing
+ * or unfamiliar values stay unknown and reach the provider instead of being
+ * guessed from a substring.
  */
-export function isOpenAICodexProEntitledPlanType(planType: string | undefined): boolean {
-	if (!planType) return false;
-	const normalized = planType.toLowerCase();
-	return normalized.includes("pro") || OPENAI_CODEX_PRO_ENTITLED_PLAN_TYPES.has(normalized);
+export function classifyOpenAICodexProEntitlement(planType: string | undefined): OpenAICodexProEntitlement {
+	const normalized = planType?.trim().toLowerCase();
+	if (!normalized) return "unknown";
+	if (OPENAI_CODEX_PRO_ENTITLED_PLAN_TYPES.has(normalized)) return "entitled";
+	if (OPENAI_CODEX_PRO_DENIED_PLAN_TYPES.has(normalized)) return "denied";
+	return "unknown";
 }
 
 export function requiresOpenAICodexProModel(provider: string, modelId: string | undefined): boolean {

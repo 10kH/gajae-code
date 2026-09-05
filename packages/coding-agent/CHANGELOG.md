@@ -30,7 +30,7 @@
 
 ### Fixed
 
-- Business/Enterprise/Team ChatGPT accounts can bind GPT-5.6 Sol again. The Codex entitlement preflight treated only `plan_type` values containing `"pro"` as eligible, so an `openai-codex` OAuth account on a Business/Enterprise/Team plan was rejected at model-binding/subagent setup time with a spurious entitlement error even though the backend accepts the request. Those tiers are now recognized as Pro-equivalent for Sol entitlement; Plus/Free remain rejected.
+- Business/Enterprise/Team ChatGPT accounts can bind GPT-5.6 Sol again. The Codex entitlement preflight treated only `plan_type` values containing `"pro"` as eligible, so an `openai-codex` OAuth account on a Business/Enterprise/Team plan was rejected at model-binding/subagent setup time with a spurious entitlement error even though the backend accepts the request. Exact Pro/Business/Enterprise/Team tiers are now recognized as entitled, Plus/Free remain rejected, and unfamiliar plan names are deferred to the provider rather than guessed locally.
 
 ## [0.16.3] - 2026-09-04
 

@@ -27,8 +27,8 @@ import type {
 } from "./usage";
 
 import {
+	classifyOpenAICodexProEntitlement,
 	formatOpenAICodexChatGPTEntitlementError,
-	isOpenAICodexProEntitledPlanType,
 	requiresOpenAICodexProModel,
 	requiresStrictOpenAICodexProModel,
 } from "./utils/codex-entitlement";
@@ -1154,13 +1154,18 @@ function getUsagePlanType(report: UsageReport | null): string | undefined {
 }
 
 function getOpenAICodexPlanPriority(report: UsageReport | null): number {
-	const planType = getUsagePlanType(report);
-	if (!planType) return 1;
-	return isOpenAICodexProEntitledPlanType(planType) ? 0 : 2;
+	const entitlement = classifyOpenAICodexProEntitlement(getUsagePlanType(report));
+	if (entitlement === "entitled") return 0;
+	if (entitlement === "denied") return 2;
+	return 1;
 }
 
 function hasOpenAICodexProPlan(report: UsageReport | null): boolean {
-	return isOpenAICodexProEntitledPlanType(getUsagePlanType(report));
+	return classifyOpenAICodexProEntitlement(getUsagePlanType(report)) === "entitled";
+}
+
+function hasKnownOpenAICodexNonProPlan(report: UsageReport | null): boolean {
+	return classifyOpenAICodexProEntitlement(getUsagePlanType(report)) === "denied";
 }
 
 function resolveDefaultRankingStrategy(provider: Provider): CredentialRankingStrategy | undefined {
@@ -4961,15 +4966,15 @@ export class AuthStorage {
 		const enforceProRequirement =
 			requiresProModel && candidates.some(candidate => hasOpenAICodexProPlan(candidate.usage));
 		// Spark retains its historical Plus fallback for grandfathered accounts.
-		// Sol is different: a confirmed non-Pro plan cannot call it, so reject the
+		// Sol is different: confirmed Free/Plus plans cannot call it, so reject the
 		// model before returning an OAuth bearer and letting the turn fail remotely.
+		// Unknown plan names still reach the provider because the usage endpoint is
+		// authoritative and future tiers must not be denied by a client-side guess.
 		const strictProRequirement = requiresStrictOpenAICodexProModel(provider, options?.modelId);
 		if (
 			strictProRequirement &&
 			candidates.length > 0 &&
-			candidates.every(
-				candidate => getUsagePlanType(candidate.usage) !== undefined && !hasOpenAICodexProPlan(candidate.usage),
-			)
+			candidates.every(candidate => hasKnownOpenAICodexNonProPlan(candidate.usage))
 		) {
 			throw new Error(formatOpenAICodexChatGPTEntitlementError(options?.modelId));
 		}
