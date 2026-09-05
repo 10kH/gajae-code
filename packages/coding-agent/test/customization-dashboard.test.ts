@@ -171,6 +171,12 @@ describe("ImportWizard", () => {
 		await fs.mkdir(path.join(projectDir, ".claude", "skills", "wiz-skill"), { recursive: true });
 		await fs.writeFile(path.join(projectDir, ".claude", "skills", "wiz-skill", "SKILL.md"), SKILL_MD);
 		const wizard = new ImportWizard(projectDir, "project", homeDir);
+		const previewReady = Promise.withResolvers<void>();
+		const applyFinished = Promise.withResolvers<void>();
+		wizard.onRequestRender = () => {
+			if (wizard.step === "preview") previewReady.resolve();
+			if (wizard.step === "result") applyFinished.resolve();
+		};
 		wizard.handleInput("\r"); // product: claude-code (first)
 		expect(wizard.step).toBe("sourceScope");
 		wizard.handleInput("\r"); // source scope: project (first)
@@ -178,12 +184,12 @@ describe("ImportWizard", () => {
 		wizard.handleInput("\r"); // surfaces: all
 		expect(wizard.step).toBe("collision");
 		wizard.handleInput("\r"); // policy: skip (first) → builds preview async
-		await Bun.sleep(80);
+		await previewReady.promise;
 		expect(wizard.step).toBe("preview");
 		expect(wizard.hasVisibleSelector).toBe(false);
 		expect(wizard.preview?.entries.some(e => e.surface === "skills" && e.destinationName === "wiz-skill")).toBe(true);
 		wizard.handleInput("\r"); // confirm apply
-		await Bun.sleep(80);
+		await applyFinished.promise;
 		expect(wizard.step).toBe("result");
 		expect(wizard.result?.ok).toBe(true);
 		await fs.stat(path.join(projectDir, ".gjc", "skills", "wiz-skill", "SKILL.md"));
