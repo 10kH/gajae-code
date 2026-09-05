@@ -152,6 +152,9 @@ function evictExpired(db: Database, hardTtlMs: number): void {
  */
 const SWEEP_INTERVAL_MS = 60_000;
 let lastSweepAt = 0;
+const backgroundRefreshes = new Map<string, { generation: number; controller: AbortController }>();
+let backgroundRefreshGeneration = 0;
+const BACKGROUND_REFRESH_TIMEOUT_MS = 30_000;
 
 function sweepIfDue(hardTtlMs: number): void {
 	const now = Date.now();
@@ -342,6 +345,9 @@ export function resetForTests(): void {
 	cachedDb = null;
 	openAttempted = false;
 	lastSweepAt = 0;
+	for (const { controller } of backgroundRefreshes.values()) controller.abort();
+	backgroundRefreshes.clear();
+	backgroundRefreshGeneration += 1;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -443,9 +449,6 @@ function storeResult<T>(
 	});
 }
 
-const backgroundRefreshes = new Set<string>();
-const BACKGROUND_REFRESH_TIMEOUT_MS = 30_000;
-
 function scheduleBackgroundRefresh<T>(
 	authKey: string,
 	repo: string,
@@ -456,21 +459,22 @@ function scheduleBackgroundRefresh<T>(
 ): void {
 	const key = JSON.stringify([authKey, normalizeRepo(repo), kind, number, includeComments]);
 	if (backgroundRefreshes.has(key)) return;
-	backgroundRefreshes.add(key);
+	const generation = backgroundRefreshGeneration;
+	const controller = new AbortController();
+	backgroundRefreshes.set(key, { generation, controller });
 	queueMicrotask(async () => {
-		const controller = new AbortController();
-		const fetchPromise = fetchFresh(controller.signal);
-		const { promise: timeoutPromise, reject: rejectTimeout } = Promise.withResolvers<never>();
-		const timeoutHandle = setTimeout(
-			() => rejectTimeout(new Error("background refresh timed out")),
-			BACKGROUND_REFRESH_TIMEOUT_MS,
-		);
 		try {
+			const fetchPromise = Promise.resolve().then(() => fetchFresh(controller.signal));
+			const timeoutPromise = Bun.sleep(BACKGROUND_REFRESH_TIMEOUT_MS).then(() => {
+				controller.abort();
+				throw new Error("background refresh timed out");
+			});
 			const fresh = await Promise.race([fetchPromise, timeoutPromise]);
-			storeResult(authKey, repo, kind, number, includeComments, fresh, Date.now());
+			if (backgroundRefreshGeneration === generation) {
+				storeResult(authKey, repo, kind, number, includeComments, fresh, Date.now());
+			}
 		} catch (err) {
 			controller.abort();
-			await fetchPromise.catch(() => undefined);
 			logger.debug("github cache: background refresh failed", {
 				err: String(err),
 				repo,
@@ -478,8 +482,7 @@ function scheduleBackgroundRefresh<T>(
 				number,
 			});
 		} finally {
-			clearTimeout(timeoutHandle);
-			backgroundRefreshes.delete(key);
+			if (backgroundRefreshes.get(key)?.generation === generation) backgroundRefreshes.delete(key);
 		}
 	});
 }
