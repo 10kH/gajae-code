@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
+import { spawn as nodeSpawn, type SpawnOptions } from "node:child_process";
 import { EventEmitter } from "node:events";
 import {
 	type EngineRawOutput,
@@ -215,6 +216,8 @@ class FakeChild extends EventEmitter {
 	stdout = new EventEmitter();
 	stderr = new EventEmitter();
 	pid?: number;
+	exitCode: number | null = null;
+	signalCode: NodeJS.Signals | null = null;
 	killed: string[] = [];
 	kill(signal?: string): boolean {
 		this.killed.push(signal ?? "SIGTERM");
@@ -251,24 +254,58 @@ describe("runEngineSubprocess hardening", () => {
 		expect(out.aborted).toBe(true);
 	});
 
-	it.skipIf(process.platform === "win32")("signals the child's process group, not just python3", async () => {
-		const child = new FakeChild();
-		child.pid = 4242;
-		const fakeSpawn = (() => child) as unknown as typeof import("node:child_process").spawn;
-		const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+	it.skipIf(process.platform === "win32")("reaps TERM-ignoring descendants after the group leader exits", async () => {
+		let groupLeaderPid: number | undefined;
+		let descendantPid: number | undefined;
+		const childScript = `
+			const { spawn } = require("node:child_process");
+			const descendant = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);"], {
+				stdio: "ignore",
+			});
+			console.log(descendant.pid);
+			setInterval(() => {}, 1000);
+		`;
+		const sacrificialSpawn = ((_command: string, _args: readonly string[], options: SpawnOptions) => {
+			const child = nodeSpawn(process.execPath, ["-e", childScript], options);
+			groupLeaderPid = child.pid;
+			return child;
+		}) as unknown as typeof import("node:child_process").spawn;
+		const exists = (pid: number): boolean => {
+			try {
+				process.kill(pid, 0);
+				return true;
+			} catch {
+				return false;
+			}
+		};
 		try {
-			const promise = runEngineSubprocess({ url: "https://example.com", timeoutMs: 1 }, { spawnImpl: fakeSpawn });
-			const { promise: tick, resolve } = Promise.withResolvers<void>();
-			setTimeout(resolve, 20);
-			await tick;
-			expect(killSpy).toHaveBeenCalledWith(-4242, "SIGTERM");
-			expect(child.killed).toBeEmpty();
-			child.emit("exit", null);
-			child.emit("close", null);
-			const out = await promise;
+			const out = await runEngineSubprocess(
+				{ url: "https://example.com", timeoutMs: 200 },
+				{ spawnImpl: sacrificialSpawn },
+			);
 			expect(out.timedOut).toBe(true);
+			descendantPid = Number.parseInt(out.stdout.trim(), 10);
+			expect(descendantPid).toBeGreaterThan(0);
+			expect(exists(descendantPid)).toBe(true);
+
+			const deadline = Date.now() + 3_000;
+			while (exists(descendantPid) && Date.now() < deadline) await Bun.sleep(25);
+			expect(exists(descendantPid)).toBe(false);
 		} finally {
-			killSpy.mockRestore();
+			if (groupLeaderPid) {
+				try {
+					process.kill(-groupLeaderPid, "SIGKILL");
+				} catch {
+					// Sacrificial group is already gone.
+				}
+			}
+			if (descendantPid && exists(descendantPid)) {
+				try {
+					process.kill(descendantPid, "SIGKILL");
+				} catch {
+					// Sacrificial descendant is already gone.
+				}
+			}
 		}
 	});
 

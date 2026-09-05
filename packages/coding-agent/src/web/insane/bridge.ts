@@ -131,7 +131,10 @@ function signalChildTree(child: ChildProcess, signal: "SIGTERM" | "SIGKILL"): vo
 			process.kill(-child.pid, signal);
 			return;
 		} catch {
-			// group already gone; fall through to the direct signal
+			// Fall back only while the direct child is still known to be live.
+			// Once it exits, its pid may be reused even though this ChildProcess
+			// handle still retains the numeric value.
+			if (child.exitCode !== null || child.signalCode !== null) return;
 		}
 	}
 	try {
@@ -146,7 +149,17 @@ function killChild(child: ChildProcess): void {
 	signalChildTree(child, "SIGTERM");
 	const timer = setTimeout(() => signalChildTree(child, "SIGKILL"), KILL_GRACE_MS);
 	timer.unref?.();
-	child.once("exit", () => clearTimeout(timer));
+	child.once("exit", () => {
+		if (process.platform === "win32" || !child.pid) {
+			clearTimeout(timer);
+			return;
+		}
+		try {
+			process.kill(-child.pid, 0);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ESRCH") clearTimeout(timer);
+		}
+	});
 }
 
 /** Real engine runner: `python3 -m engine "<url>" --json`. */
