@@ -4050,6 +4050,15 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						correlation: InvocationCorrelation;
 						connectionId: string | undefined;
 					}>;
+					/**
+					 * Content frames observed before this batch's correlated agent_start
+					 * reached the wire. The synchronous session subscription can see a
+					 * message_update before emitLifecycle finishes awaiting durable start
+					 * persistence; holding them here keeps the producer's start/content
+					 * boundary for every SDK consumer.
+					 */
+					startPublished: boolean;
+					heldContent: AgentSessionEvent[];
 				}>;
 				disposeGate?: () => void;
 				lifecycleActive: boolean;
@@ -4233,6 +4242,46 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		owner.lifecycleTasks.add(task);
 		return task;
 	};
+	/**
+	 * Publish one content frame per owning invocation, each carrying its own
+	 * correlation, so a shared run lets every submitter attribute the content to
+	 * its own prompt. Content is best-effort and bypasses the lifecycle replay
+	 * ring; the turn producing it is authoritative.
+	 */
+	const publishContentFrames = (
+		current: RuntimeState,
+		event: AgentSessionEvent,
+		invocations: ReadonlyArray<{ correlation: InvocationCorrelation; connectionId: string | undefined }>,
+	): void => {
+		try {
+			const payload = toAgentWireEventPayload(event);
+			for (const invocation of invocations) {
+				if (invocation.connectionId === undefined) continue;
+				current.runtime.sendFrameTo([invocation.connectionId], {
+					type: "event",
+					kind: event.type,
+					payload,
+					...invocation.correlation,
+				});
+			}
+		} catch {
+			// Streamed content is best-effort; the turn producing it is authoritative.
+		}
+	};
+	/**
+	 * Release content that arrived before the batch's correlated agent_start
+	 * reached the wire. Called exactly once per batch, after the start frames
+	 * are published (or after the start publication path gave up), so SDK
+	 * consumers observe start before any content, in producer order.
+	 */
+	const releaseHeldContent = (current: RuntimeState, batch: LifecycleBatch): void => {
+		if (batch.startPublished) return;
+		batch.startPublished = true;
+		const held = batch.heldContent;
+		batch.heldContent = [];
+		for (const event of held)
+			publishContentFrames(current, event, [...batch.invocations, ...batch.attachedInvocations]);
+	};
 	const emitLifecycle = async (
 		type: "agent_start" | "agent_end" | "agent_failed",
 		ctx: ExtensionContext,
@@ -4338,6 +4387,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					epoch: current.lifecycleEpoch,
 					invocations: drained,
 					attachedInvocations: [],
+					startPublished: false,
+					heldContent: [],
 				};
 				current.openLifecycleBatches.push(batch);
 				for (const entry of drained) {
@@ -4620,6 +4671,19 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						observed = false;
 					}
 				}
+				// The start frames are on the wire (or definitively failed); content
+				// that the synchronous session subscription observed meanwhile must
+				// follow them, never precede them.
+				const started = current.openLifecycleBatches.find(candidate =>
+					candidate.invocations.some(entry =>
+						transitions.some(
+							({ correlation }) =>
+								correlation.commandId === entry.correlation.commandId &&
+								correlation.turnId === entry.correlation.turnId,
+						),
+					),
+				);
+				if (started) releaseHeldContent(current, started);
 			} else if (type === "agent_end" && transitions.length > 0) {
 				// An invocation-owned terminal must carry the identity it was accepted
 				// under and the normalized outcome. A client that submitted this turn
@@ -4921,22 +4985,15 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		if (invocations.length === 0) return;
 		// Content bypasses the lifecycle replay ring and must never interrupt its producer.
 		if (!event || typeof event.type !== "string" || !STREAMED_TURN_EVENT_TYPES.has(event.type)) return;
-		try {
-			const payload = toAgentWireEventPayload(event as AgentSessionEvent);
-			// One frame per owning invocation, each carrying its own correlation, so a
-			// shared run lets every submitter attribute the content to its own prompt.
-			for (const invocation of invocations) {
-				if (invocation.connectionId === undefined) continue;
-				current.runtime.sendFrameTo([invocation.connectionId], {
-					type: "event",
-					kind: event.type,
-					payload,
-					...invocation.correlation,
-				});
-			}
-		} catch {
-			// Streamed content is best-effort; the turn producing it is authoritative.
+		// emitLifecycle("agent_start") awaits durable persistence before it
+		// publishes the correlated start frame, while this subscription is
+		// synchronous. Hold content until that start is on the wire so no consumer
+		// sees turn content before the turn it belongs to.
+		if (batch && !batch.startPublished) {
+			batch.heldContent.push(event as AgentSessionEvent);
+			return;
 		}
+		publishContentFrames(current, event as AgentSessionEvent, invocations);
 	};
 	api.on("tool_execution_start", async (_event, ctx) => {
 		renewAttributableProgress("tool_execution_start", ctx);
@@ -5011,6 +5068,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				correlation: InvocationCorrelation;
 				connectionId: string | undefined;
 			}>;
+			startPublished: boolean;
+			heldContent: AgentSessionEvent[];
 		}> = [];
 		const configRevision = { current: 0 };
 		let acceptingGateResolutions = true;

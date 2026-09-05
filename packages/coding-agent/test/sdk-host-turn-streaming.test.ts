@@ -11,6 +11,7 @@ import { ExtensionRuntime, loadExtensionFromFactory } from "../src/extensibility
 import { ExtensionRunner } from "../src/extensibility/extensions/runner";
 import { mapAgentWireEventPayloadToAcpSessionUpdates } from "../src/modes/acp/acp-event-mapper";
 import { toAgentWireEventPayload } from "../src/modes/shared/agent-wire/event-envelope";
+import { createReconciliationStore, type ReconciliationStore } from "../src/sdk/bus/reconciliation-store";
 import { createSdkSessionRuntimeExtension } from "../src/sdk/host/session-runtime";
 import type { SdkFrame } from "../src/sdk/host/types";
 import { AgentSession, type AgentSessionEvent } from "../src/session/agent-session";
@@ -108,7 +109,11 @@ async function waitFor(predicate: () => boolean, label: string, timeoutMs = 2_00
 async function createHostHarness(
 	sessionId: string,
 	cwd: string,
-	harnessOptions: { settleSubmission?: "never" | "resolve"; onSessionEvent?: ExtensionContext["onSessionEvent"] } = {},
+	harnessOptions: {
+		settleSubmission?: "never" | "resolve";
+		onSessionEvent?: ExtensionContext["onSessionEvent"];
+		reconciliationStore?: ReconciliationStore;
+	} = {},
 ): Promise<HostHarness> {
 	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
 	const listeners = new Set<(event: AgentSessionEvent) => void>();
@@ -139,6 +144,17 @@ async function createHostHarness(
 	} as unknown as ExtensionAPI;
 	createSdkSessionRuntimeExtension(api, {
 		agentDir: path.join(cwd, ".gjc", "agent"),
+		...(harnessOptions.reconciliationStore
+			? {
+					terminalAbortSeams: {
+						getReconciliationStore: () => harnessOptions.reconciliationStore,
+						getTerminalTurnEpoch: () => undefined,
+						getActivePromptHandle: () => undefined,
+						cancelPendingPreflightForTerminalAbort: () => {},
+						abortPromptAndWaitWithTerminal: async () => ({ status: "settled" }),
+					},
+				}
+			: {}),
 		createTransport: async ({ sessionId: id, stateRoot, token }) => ({
 			sessionId: id,
 			stateRoot,
@@ -379,6 +395,61 @@ describe("SDK host turn streaming", () => {
 			await harness.stop();
 			await session.dispose();
 			authStorage.close();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+	test("holds content observed before the correlated agent_start reaches the wire", async () => {
+		// The session subscription is synchronous while emitLifecycle("agent_start")
+		// awaits durable persistence before publishing the start frame. Content
+		// produced in that window must still follow the start on the wire.
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-stream-start-order-"));
+		const inner = createReconciliationStore({ sessionFile: path.join(cwd, "session.jsonl"), sessionId: SESSION_ID });
+		const startGate = Promise.withResolvers<void>();
+		const startEntered = Promise.withResolvers<void>();
+		let holdNextTransact = false;
+		const slowStore: ReconciliationStore = {
+			...inner,
+			transact: async mutator => {
+				if (holdNextTransact) {
+					holdNextTransact = false;
+					startEntered.resolve();
+					await startGate.promise;
+				}
+				return inner.transact(mutator);
+			},
+		};
+		const harness = await createHostHarness(SESSION_ID, cwd, { reconciliationStore: slowStore });
+		try {
+			await harness.control("turn.prompt", { text: "delayed start" });
+			harness.clearFrames();
+			holdNextTransact = true;
+			const start = harness.emit("agent_start");
+			await startEntered.promise;
+			// Producer emits content while the start transition is still persisting.
+			await harness.emit("message_update", textDelta("early"));
+			await harness.emit("tool_execution_start", toolStart());
+			const contentKinds = () =>
+				harness.sent.filter(entry => entry.frame.type === "event").map(entry => String(entry.frame.kind));
+			expect(contentKinds()).toEqual([]);
+			expect(harness.broadcasts.filter(frame => frame.kind === "agent_start")).toEqual([]);
+			startGate.resolve();
+			await start;
+			expect(harness.broadcasts.filter(frame => frame.kind === "agent_start")).toHaveLength(1);
+			expect(contentKinds()).toEqual(["message_update", "tool_execution_start"]);
+			// Content after the start is published immediately, in order.
+			await harness.emit("message_update", textDelta(" late"));
+			expect(contentKinds()).toEqual(["message_update", "tool_execution_start", "message_update"]);
+			const deltas = harness.sent
+				.filter(entry => entry.frame.type === "event" && entry.frame.kind === "message_update")
+				.map(
+					entry =>
+						(entry.frame.payload as { event: { assistantMessageEvent: { delta: string } } }).event
+							.assistantMessageEvent.delta,
+				);
+			expect(deltas).toEqual(["early", " late"]);
+		} finally {
+			startGate.resolve();
+			await harness.stop();
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
