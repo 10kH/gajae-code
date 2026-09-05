@@ -1,6 +1,8 @@
 # Changelog
 
 ## [Unreleased]
+
+## [0.16.4] - 2026-09-05
 ### Added
 
 - Added selectable `astra-lite`, `astra-default`, and `astra-heavy` CODEX presets with `ASTRA-` labels, plus `astra-fable` and `astra-fable-opus` cross-family review combinations. Existing presets and automatic provider recommendations remain unchanged.
