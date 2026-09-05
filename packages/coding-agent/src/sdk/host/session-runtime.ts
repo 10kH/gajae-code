@@ -4274,10 +4274,20 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		}
 	};
 	/**
+	 * Upper bound on content events held for one batch while its correlated
+	 * agent_start is still being durably recorded. A start write normally settles
+	 * in milliseconds, so this is only reached when persistence is wedged; at
+	 * that point ordering yields to memory safety: held content is released and
+	 * the batch streams directly from then on, so a blocked filesystem can never
+	 * accumulate an entire response in memory.
+	 */
+	const MAX_HELD_CONTENT_EVENTS = 256;
+	/**
 	 * Release content that arrived before the batch's correlated agent_start
-	 * reached the wire. Called exactly once per batch, after the start frames
-	 * are published (or after the start publication path gave up), so SDK
-	 * consumers observe start before any content, in producer order.
+	 * reached the wire. Called once per batch, after the start frames are
+	 * published (or after the start publication path gave up), so SDK consumers
+	 * observe start before any content, in producer order. Also invoked by the
+	 * hold path when the bound above is reached.
 	 */
 	const releaseHeldContent = (current: RuntimeState, batch: LifecycleBatch): void => {
 		if (batch.startPublished) return;
@@ -4995,6 +5005,14 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		// sees turn content before the turn it belongs to.
 		if (batch && !batch.startPublished) {
 			batch.heldContent.push({ event: event as AgentSessionEvent, recipients: invocations });
+			if (batch.heldContent.length >= MAX_HELD_CONTENT_EVENTS) {
+				logger.warn("sdk: agent_start persistence still pending; releasing held turn content to bound memory", {
+					epoch: batch.epoch,
+					held: batch.heldContent.length,
+					invocations: batch.invocations.length,
+				});
+				releaseHeldContent(current, batch);
+			}
 			return;
 		}
 		publishContentFrames(current, event as AgentSessionEvent, invocations);

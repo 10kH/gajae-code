@@ -1,9 +1,10 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
+import { logger } from "@gajae-code/utils";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import type { ExtensionAPI, ExtensionContext } from "../src/extensibility/extensions";
@@ -521,6 +522,67 @@ describe("SDK host turn streaming", () => {
 				{ to: "attached-client", commandId: attached.result?.commandId, delta: "after-attach" },
 			]);
 		} finally {
+			startGate.resolve();
+			await harness.stop();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+	test("bounds held content when start persistence never settles", async () => {
+		// A wedged reconciliation write must not let the host buffer an entire
+		// response. Past the bound, held content is released (still in order) and
+		// the batch streams directly; ordering yields to memory safety, once.
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-stream-held-bound-"));
+		const inner = createReconciliationStore({ sessionFile: path.join(cwd, "session.jsonl"), sessionId: SESSION_ID });
+		const startGate = Promise.withResolvers<void>();
+		const startEntered = Promise.withResolvers<void>();
+		let holdNextTransact = false;
+		const slowStore: ReconciliationStore = {
+			...inner,
+			transact: async mutator => {
+				if (holdNextTransact) {
+					holdNextTransact = false;
+					startEntered.resolve();
+					await startGate.promise;
+				}
+				return inner.transact(mutator);
+			},
+		};
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		const releaseWarnings = () =>
+			warn.mock.calls.filter(call => String(call[0]).includes("releasing held turn content"));
+		const harness = await createHostHarness(SESSION_ID, cwd, { reconciliationStore: slowStore });
+		try {
+			await harness.control("turn.prompt", { text: "long answer" });
+			harness.clearFrames();
+			holdNextTransact = true;
+			const start = harness.emit("agent_start");
+			await startEntered.promise;
+			const bound = 256;
+			for (let index = 0; index < bound - 1; index++) await harness.emit("message_update", textDelta(`d${index}`));
+			expect(harness.sent.filter(entry => entry.frame.type === "event")).toHaveLength(0);
+			expect(releaseWarnings()).toHaveLength(0);
+			await harness.emit("message_update", textDelta(`d${bound - 1}`));
+			const deltas = () =>
+				harness.sent
+					.filter(entry => entry.frame.type === "event" && entry.frame.kind === "message_update")
+					.map(
+						entry =>
+							(entry.frame.payload as { event: { assistantMessageEvent: { delta: string } } }).event
+								.assistantMessageEvent.delta,
+					);
+			expect(deltas()).toEqual(Array.from({ length: bound }, (_, index) => `d${index}`));
+			expect(releaseWarnings()).toHaveLength(1);
+			// Subsequent content streams directly while the start is still pending.
+			await harness.emit("message_update", textDelta("direct"));
+			expect(deltas().at(-1)).toBe("direct");
+			expect(deltas()).toHaveLength(bound + 1);
+			startGate.resolve();
+			await start;
+			// Start publication does not replay anything that was already released.
+			expect(deltas()).toHaveLength(bound + 1);
+			expect(releaseWarnings()).toHaveLength(1);
+		} finally {
+			warn.mockRestore();
 			startGate.resolve();
 			await harness.stop();
 			await rm(cwd, { recursive: true, force: true });
