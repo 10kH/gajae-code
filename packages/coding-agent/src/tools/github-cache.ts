@@ -442,6 +442,8 @@ function storeResult<T>(
 	});
 }
 
+const backgroundRefreshes = new Set<string>();
+
 function scheduleBackgroundRefresh<T>(
 	authKey: string,
 	repo: string,
@@ -450,20 +452,23 @@ function scheduleBackgroundRefresh<T>(
 	includeComments: boolean,
 	fetchFresh: () => Promise<FreshResult<T>>,
 ): void {
-	queueMicrotask(() => {
-		const promise = fetchFresh();
-		promise
-			.then(fresh => {
-				storeResult(authKey, repo, kind, number, includeComments, fresh, Date.now());
-			})
-			.catch(err => {
-				logger.debug("github cache: background refresh failed", {
-					err: String(err),
-					repo,
-					kind,
-					number,
-				});
+	const key = JSON.stringify([authKey, normalizeRepo(repo), kind, number, includeComments]);
+	if (backgroundRefreshes.has(key)) return;
+	backgroundRefreshes.add(key);
+	queueMicrotask(async () => {
+		try {
+			const fresh = await fetchFresh();
+			storeResult(authKey, repo, kind, number, includeComments, fresh, Date.now());
+		} catch (err) {
+			logger.debug("github cache: background refresh failed", {
+				err: String(err),
+				repo,
+				kind,
+				number,
 			});
+		} finally {
+			backgroundRefreshes.delete(key);
+		}
 	});
 }
 

@@ -45,6 +45,68 @@ afterEach(async () => {
 	await fs.rm(tempDir, { recursive: true, force: true });
 });
 
+it("coalesces stale background refreshes per row and releases failed refreshes", async () => {
+	const now = Date.now();
+	const row = { repo: TEST_REPO, kind: "issue" as const, number: 77, includeComments: true };
+	putCached({ ...row, payload: "old", rendered: "old", sourceUrl: "url", fetchedAt: now - 2_000 });
+	const settings = Settings.isolated({ "github.cache.softTtlSec": 1, "github.cache.hardTtlSec": 60 });
+	const gate = Promise.withResolvers<{ payload: string; rendered: string; sourceUrl: string }>();
+	const fetchFresh = vi.fn(() => gate.promise);
+	const hits = await Promise.all(
+		Array.from({ length: 20 }, (_, index) =>
+			getOrFetchView({ ...row, repo: index % 2 ? TEST_REPO.toUpperCase() : TEST_REPO, settings, now, fetchFresh }),
+		),
+	);
+	expect(hits.map(hit => hit.status)).toEqual(Array(20).fill("stale"));
+	expect(hits.every(hit => hit.rendered === "old")).toBe(true);
+	expect(fetchFresh).toHaveBeenCalledTimes(1);
+	gate.reject(new Error("offline"));
+	await Bun.sleep(0);
+	const retry = vi.fn(async () => ({ payload: "new", rendered: "new", sourceUrl: "url" }));
+	await getOrFetchView({ ...row, settings, now, fetchFresh: retry });
+	await Bun.sleep(0);
+	expect(retry).toHaveBeenCalledTimes(1);
+	expect(getCached(row.repo, row.kind, row.number, row.includeComments)?.rendered).toBe("new");
+	putCached({ ...row, payload: "old", rendered: "old", fetchedAt: now - 2_000 });
+	await getOrFetchView({ ...row, settings, now, fetchFresh: retry });
+	await Bun.sleep(0);
+	expect(retry).toHaveBeenCalledTimes(2);
+});
+
+it("refreshes distinct cache identities independently", async () => {
+	const now = Date.now();
+	const settings = Settings.isolated({ "github.cache.softTtlSec": 1, "github.cache.hardTtlSec": 60 });
+	const base = { authKey: "a", repo: TEST_REPO, kind: "issue" as const, number: 78, includeComments: true };
+	const rows = [
+		base,
+		{ ...base, authKey: "b" },
+		{ ...base, repo: "owner/another" },
+		{ ...base, kind: "pr" as const },
+		{ ...base, number: 79 },
+		{ ...base, includeComments: false },
+	];
+	const gate = Promise.withResolvers<void>();
+	const fetchFresh = vi.fn(async () => {
+		await gate.promise;
+		return { payload: "new", rendered: "new", sourceUrl: "url" };
+	});
+	for (const row of rows) {
+		putCached({ ...row, payload: "old", rendered: "old", fetchedAt: now - 2_000 });
+	}
+	try {
+		await Promise.all(
+			rows.flatMap(row => [
+				getOrFetchView({ ...row, settings, now, fetchFresh }),
+				getOrFetchView({ ...row, settings, now, fetchFresh }),
+			]),
+		);
+		expect(fetchFresh).toHaveBeenCalledTimes(rows.length);
+	} finally {
+		gate.resolve();
+		await Bun.sleep(0);
+	}
+});
+
 function issuePayload(number: number, body: string) {
 	return {
 		number,
