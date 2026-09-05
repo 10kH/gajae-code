@@ -147,12 +147,27 @@ describe("contribution prep", () => {
 
 		const redactedDeep = redactContributionPrepText(deeplyNested, process.cwd());
 		const redactedOversized = redactContributionPrepText(oversized, process.cwd());
+		const oversizedPayload = JSON.parse(redactedOversized) as { payload: string };
 
 		expect(JSON.parse(redactedDeep)).toBeDefined();
-		expect(JSON.parse(redactedOversized)).toEqual({ payload: "[REDACTED_NESTED_JSON]" });
-		expect(redactedDeep).toContain("[REDACTED_NESTED_JSON]");
+		expect(JSON.parse(oversizedPayload.payload)).toEqual({
+			padding: "x".repeat(60001),
+			SecretAccessKey: "[REDACTED_SECRET]",
+		});
+		expect(redactedDeep).toContain("[REDACTED_NESTED_CONTENT]");
 		expect(redactedDeep).not.toContain(SYNTHETIC_AWS_SESSION_TOKEN);
 		expect(redactedOversized).not.toContain(SYNTHETIC_AWS_SECRET_ACCESS_KEY);
+	});
+
+	it("redacts escaped AWS fields inside long prefixed and suffixed log strings", () => {
+		const longLog = `${"x".repeat(60001)} prefix ${String.raw`{"\u0053ecretAccessKey":"${SYNTHETIC_AWS_SECRET_ACCESS_KEY}"}`} suffix`;
+		const text = JSON.stringify([{ type: "text", text: longLog }]);
+
+		const redacted = redactContributionPrepText(text, process.cwd());
+
+		expect(JSON.parse(redacted)).toBeDefined();
+		expect(redacted).not.toContain(SYNTHETIC_AWS_SECRET_ACCESS_KEY);
+		expect(redacted).toContain("[REDACTED_SECRET]");
 	});
 
 	it("fails closed when redaction input or JSON token counts exceed their budgets", () => {
@@ -364,6 +379,19 @@ describe("contribution prep", () => {
 					],
 					isError: false,
 					timestamp: 3,
+				},
+				{
+					role: "toolResult",
+					toolCallId: "synthetic-long-aws-log",
+					toolName: "read",
+					content: [
+						{
+							type: "text",
+							text: `${"x".repeat(60001)} prefix ${String.raw`{"\u0053ecretAccessKey":"${SYNTHETIC_AWS_SECRET_ACCESS_KEY}"}`} suffix`,
+						},
+					],
+					isError: false,
+					timestamp: 4,
 				},
 				{
 					role: "assistant",

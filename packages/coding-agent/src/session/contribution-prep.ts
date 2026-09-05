@@ -96,17 +96,6 @@ function isAwsSecretField(value: string): boolean {
 	);
 }
 
-function isSerializedJson(value: string): boolean {
-	const first = value.trimStart()[0];
-	if (first !== '"' && first !== "{" && first !== "[") return false;
-	try {
-		JSON.parse(value);
-		return true;
-	} catch {
-		return false;
-	}
-}
-
 function redactAwsLabeledValues(text: string, state: RedactionState): string {
 	let redacted = redactAwsAccessKeyIds(text, state);
 	redacted = replaceRegex(
@@ -178,12 +167,7 @@ function redactAwsJsonStrings(text: string, state: RedactionState, depth = 0): s
 			}
 		}
 
-		const atScanLimit = depth >= 3 || decoded.length > MAX_GIT_OUTPUT_CHARS;
-		const nestedRedacted = atScanLimit
-			? isSerializedJson(decoded)
-				? "[REDACTED_NESTED_JSON]"
-				: decoded
-			: redactAwsJsonStrings(decoded, state, depth + 1);
+		const nestedRedacted = depth >= 3 ? "[REDACTED_NESTED_CONTENT]" : redactAwsJsonStrings(decoded, state, depth + 1);
 		const redacted = redactAwsLabeledValues(nestedRedacted, state);
 		if (redacted !== decoded && !replacements.has(token.start)) {
 			replacements.set(token.start, { end: token.end, value: JSON.stringify(redacted) });
