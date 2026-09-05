@@ -487,17 +487,25 @@ function scheduleBackgroundRefresh<T>(
 	const entry = { generation, controller };
 	backgroundRefreshes.set(key, entry);
 	queueMicrotask(async () => {
-		let fetchPromise: Promise<FreshResult<T>> | undefined;
-		const timeoutHandle = setTimeout(() => controller.abort(), BACKGROUND_REFRESH_TIMEOUT_MS);
+		const timeout = Promise.withResolvers<never>();
+		const timeoutHandle = setTimeout(
+			() => timeout.reject(new Error("GitHub background refresh timed out")),
+			BACKGROUND_REFRESH_TIMEOUT_MS,
+		);
 		try {
-			fetchPromise = Promise.resolve().then(() => fetchFresh(controller.signal));
-			const fresh = await fetchPromise;
-			if (backgroundRefreshes.get(key) === entry && backgroundRefreshGeneration === generation) {
+			const fetchPromise = fetchFresh(controller.signal);
+			// A timed-out fetch may ignore abort and reject later.
+			void fetchPromise.catch(() => undefined);
+			const fresh = await Promise.race([fetchPromise, timeout.promise]);
+			if (
+				!controller.signal.aborted &&
+				backgroundRefreshes.get(key) === entry &&
+				backgroundRefreshGeneration === generation
+			) {
 				storeResult(authKey, repo, kind, number, includeComments, fresh, Date.now());
 			}
 		} catch (err) {
 			controller.abort();
-			await fetchPromise?.catch(() => undefined);
 			logger.debug("github cache: background refresh failed", {
 				err: String(err),
 				repo,
