@@ -86,6 +86,7 @@ type SemVer = {
 type GeminiKind = "pro" | "flash";
 type AnthropicKind = "opus" | "sonnet" | "fable";
 type OpenAIVariant =
+	| "astra"
 	| "base"
 	| "codex"
 	| "codex-max"
@@ -665,7 +666,9 @@ function inferGeneratedApplyPatchToolType(
 	model: ApiModel<Api>,
 	parsedModel: ParsedModel,
 ): ApiModel<Api>["applyPatchToolType"] {
-	if (parsedModel.family !== "openai" || parsedModel.version.major !== 5) {
+	// GPT-5.x and GPT-6 (Astra) both advertise the freeform apply_patch tool on
+	// the first-party Responses and Codex product transports.
+	if (parsedModel.family !== "openai" || parsedModel.version.major < 5) {
 		return undefined;
 	}
 	if (model.provider === "openai" && model.api === "openai-responses") {
@@ -1014,7 +1017,7 @@ function parseAnthropicModel(modelId: string): AnthropicModel | null {
 
 function parseOpenAIModel(modelId: string): OpenAIModel | null {
 	const match =
-		/gpt-(\d+(?:\.\d+){0,2})(?:-(codex-spark|codex-mini|codex-max|codex|luna|mini|max|nano|sol|terra))?$/.exec(
+		/gpt-(\d+(?:\.\d+){0,2})(?:-(astra|codex-spark|codex-mini|codex-max|codex|luna|mini|max|nano|sol|terra))?$/.exec(
 			modelId,
 		);
 	if (!match) {

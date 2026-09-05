@@ -761,6 +761,28 @@ describe("generated model policies", () => {
 		}
 	});
 
+	it("stores GPT-6 Astra effort metadata through max without touching the GPT-5.6 context cap", () => {
+		const model: Model<Api> = {
+			...createModel({ id: "gpt-6-astra", api: "openai-codex-responses", provider: "openai-codex" }),
+			contextWindow: 272_000,
+			maxTokens: 128000,
+		};
+
+		expect(model.thinking).toEqual({
+			mode: "effort",
+			minLevel: Effort.Low,
+			maxLevel: Effort.Max,
+		});
+		expect(requireSupportedEffort(model, Effort.Max)).toBe(Effort.Max);
+		expect(() => requireSupportedEffort(model, Effort.Minimal)).toThrow(
+			/Supported efforts: low, medium, high, xhigh, max/,
+		);
+
+		applyGeneratedModelPolicies([model]);
+		expect(model.contextWindow).toBe(272_000);
+		expect(model.applyPatchToolType).toBe("freeform");
+	});
+
 	it("forces only Codex product GPT-5.6 tiers to the 372K prompt budget", () => {
 		const models: Model<Api>[] = [
 			{
