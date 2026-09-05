@@ -660,7 +660,7 @@ console.log("MARKER=" + await fs.readFile(marker, "utf8").catch(() => "missing")
 		expect(exitCode, stderr).toBe(0);
 		expect(stdout).toContain("MARKER=missing");
 		expect(stdout).toContain("ERRORS=0");
-		expect(stdout).toContain(`LAUNCHER=${trustedNodeReal}`);
+		expect(stdout).toContain(`LAUNCHER=${launcherLink}`);
 		await expect(fs.readFile(marker, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
 	}, 30_000);
 

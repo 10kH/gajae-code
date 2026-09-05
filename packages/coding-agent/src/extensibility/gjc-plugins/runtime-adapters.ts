@@ -114,6 +114,31 @@ const initialProcessEnvironment =
 				() => new Map<string, string>(),
 			)
 		: Promise.resolve(new Map<string, string>());
+const initialNodeAuthorities = initialProcessEnvironment.then(async environment => {
+	const authorities = new Map<string, string>();
+	const roots = [
+		environment.get("NVM_DIR"),
+		environment.get("RUNNER_TOOL_CACHE"),
+		environment.get("AGENT_TOOLSDIRECTORY"),
+	]
+		.filter((root): root is string => typeof root === "string" && path.isAbsolute(root))
+		.map(root => path.resolve(root));
+	for (const pathEntry of (environment.get("PATH") ?? "").split(path.delimiter).filter(path.isAbsolute)) {
+		const lexical = path.join(pathEntry, process.platform === "win32" ? "node.exe" : "node");
+		try {
+			const real = await fs.realpath(lexical);
+			const root = roots.find(candidate => isWithin(candidate, lexical) || isWithin(candidate, real));
+			if (!root) continue;
+			const rootReal = await fs.realpath(root);
+			if (!isWithin(rootReal, real)) continue;
+			const bytes = await readStableFile(real, "Initial Node executable", MCP_LAUNCHER_MAX_BYTES, true);
+			authorities.set(real, sha256(bytes));
+		} catch {
+			// Missing or unstable startup candidates do not become authority.
+		}
+	}
+	return authorities;
+});
 
 async function snapshotExistingFile(filePath: string): Promise<FileSnapshot | null> {
 	try {
@@ -445,37 +470,11 @@ async function resolveTrustedStdioLauncher(
 
 async function isInitialManagedNodeLauncherPath(executablePath: string): Promise<boolean> {
 	if (process.platform !== "linux") return false;
-	const initialEnv = await initialProcessEnvironment;
-	const roots = [
-		initialEnv.get("NVM_DIR"),
-		initialEnv.get("RUNNER_TOOL_CACHE"),
-		initialEnv.get("AGENT_TOOLSDIRECTORY"),
-	]
-		.filter((root): root is string => typeof root === "string" && path.isAbsolute(root))
-		.map(root => path.resolve(root));
-	const authorityRoot = roots.find(root => isWithin(root, executablePath));
-	if (!authorityRoot) return false;
-	for (const tempRoot of [os.tmpdir(), "/tmp", "/var/tmp"]) {
-		if (isWithin(path.resolve(tempRoot), authorityRoot)) return false;
-	}
-	const [rootReal, targetReal] = await Promise.all([fs.realpath(authorityRoot), fs.realpath(executablePath)]);
-	if (!isWithin(rootReal, targetReal)) return false;
-	const uid = process.getuid?.();
-	const gid = process.getgid?.();
-	if (uid === undefined || gid === undefined) return false;
-	const target = await fs.stat(targetReal);
-	if (!target.isFile() || (target.mode & 0o002) !== 0 || (target.uid !== 0 && target.uid !== uid)) return false;
-	let current = path.dirname(targetReal);
-	for (;;) {
-		const stat = await fs.stat(current);
-		const ownerAllowed = stat.uid === 0 || stat.uid === uid;
-		const groupWritableByOther = (stat.mode & 0o020) !== 0 && stat.gid !== gid;
-		if (!stat.isDirectory() || !ownerAllowed || (stat.mode & 0o002) !== 0 || groupWritableByOther) return false;
-		if (current === rootReal) return true;
-		const parent = path.dirname(current);
-		if (parent === current) return false;
-		current = parent;
-	}
+	const real = await fs.realpath(executablePath);
+	const expected = (await initialNodeAuthorities).get(real);
+	if (!expected) return false;
+	const bytes = await readStableFile(real, "Initial Node executable", MCP_LAUNCHER_MAX_BYTES, true);
+	return sha256(bytes) === expected;
 }
 
 async function isUserManagedNodeLauncherPath(executablePath: string): Promise<boolean> {
