@@ -326,7 +326,7 @@ const loader = [
 	'  if (!url.startsWith("file:") || !within(fileURLToPath(url))) throw new Error("plugin MCP module load escapes its authenticated snapshot: " + url);',
 	'  const source = sources.get(url);',
 	'  if (source === undefined) throw new Error("plugin MCP module load is not authenticated: " + url);',
-	'  return { format: authenticatedFormat(context.format), source, shortCircuit: true };',
+	'  return { format: authenticatedFormat(context.format), source: Uint8Array.from(source).buffer, shortCircuit: true };',
 	'}',
 ].join("\\n");
 register("data:text/javascript," + encodeURIComponent(loader), {
