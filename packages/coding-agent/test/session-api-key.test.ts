@@ -1,5 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import { lookupSessionApiKey, resolveLiveSessionApiKeyModel } from "../src/sdk/session-api-key";
+import {
+	assertStableSessionApiKeyCredentialType,
+	lookupSessionApiKey,
+	resolveLiveSessionApiKeyModel,
+} from "../src/sdk/session-api-key";
 
 describe("lookupSessionApiKey (#5081)", () => {
 	it("uses getApiKey(model) when the active model matches the provider, even if getApiKeyForProvider is empty", async () => {
@@ -208,5 +212,18 @@ describe("lookupSessionApiKey (#5081)", () => {
 			),
 		).rejects.toMatchObject({ code: "provider_unavailable" });
 		expect(calls).toEqual(["model:parent-sid", "provider:parent-sid"]);
+	});
+
+	it("fails closed when an authentication retry changes credential type", () => {
+		expect(() => assertStableSessionApiKeyCredentialType("api_key", "oauth")).toThrow(
+			"Credential type changed during authentication retry",
+		);
+		try {
+			assertStableSessionApiKeyCredentialType("oauth", "api_key");
+			throw new Error("expected throw");
+		} catch (error) {
+			expect((error as { code?: string }).code).toBe("provider_unavailable");
+		}
+		expect(() => assertStableSessionApiKeyCredentialType("oauth", "oauth")).not.toThrow();
 	});
 });

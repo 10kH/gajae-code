@@ -197,7 +197,11 @@ import { EventBus } from "../utils/event-bus";
 import { buildNamedToolChoice, buildNamedToolChoiceResult } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
 import { createSessionLifecycleService } from "./lifecycle/client";
-import { lookupSessionApiKey, resolveLiveSessionApiKeyModel } from "./session-api-key";
+import {
+	assertStableSessionApiKeyCredentialType,
+	lookupSessionApiKey,
+	resolveLiveSessionApiKeyModel,
+} from "./session-api-key";
 import {
 	attachLifecycleStartupCapability,
 	lifecycleMcpStartupTimeoutOption,
@@ -4341,7 +4345,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								provider,
 								error: error instanceof Error ? error.message : String(error),
 							});
-							return resolveAgentApiKey(provider);
+							const replacementApiKey = await resolveAgentApiKey(provider);
+							assertStableSessionApiKeyCredentialType(
+								streamOptions?.authCredentialType,
+								resolvedCredentialType(provider),
+							);
+							return replacementApiKey;
 						},
 					});
 				} catch (error) {
