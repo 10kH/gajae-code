@@ -93,25 +93,111 @@ describe("registry fingerprint admission", () => {
 		}
 	});
 
-	test("async fingerprint bounds its slice when a file grows after stat", async () => {
+	test("async fingerprint bounds its handle read when a file grows after stat", async () => {
 		control = path.join(root, "model-presets", "state.json");
 		await Bun.write(control, "{}");
 		const staleStat = await fs.lstat(control, { bigint: true });
 		await makeOversized();
-		const file = Bun.file(control);
 		const statSpy = spyOn(fs, "lstat").mockResolvedValueOnce(staleStat);
-		const fileSpy = spyOn(Bun, "file").mockReturnValue(file);
-		const sliceSpy = spyOn(file, "slice");
+		const realOpen = fs.open;
+		let readSpy: ReturnType<typeof spyOn> | undefined;
+		const openSpy = spyOn(fs, "open").mockImplementation(async (...args) => {
+			const handle = await realOpen(...args);
+			if (String(args[0]) === control) readSpy = spyOn(handle, "read");
+			return handle;
+		});
 		try {
 			expect((await loadAcceptedModelPresetRegistryAsync(root)).error).toBe(
 				"Registry primary cache state is unreadable.",
 			);
-			expect(sliceSpy).toHaveBeenCalledTimes(1);
-			expect(sliceSpy).toHaveBeenCalledWith(0, limit + 1);
+			expect(readSpy).toBeDefined();
+			expect(readSpy!.mock.calls.length).toBeGreaterThan(0);
+			for (const call of readSpy!.mock.calls) {
+				expect((call as readonly unknown[])[2]).toBeLessThanOrEqual(64 * 1024);
+			}
 		} finally {
 			statSpy.mockRestore();
-			fileSpy.mockRestore();
-			sliceSpy.mockRestore();
+			openSpy.mockRestore();
+			readSpy?.mockRestore();
+		}
+	});
+
+	test("sync payload reads remain bounded when a file grows after stat", async () => {
+		await Bun.write(control, "{}");
+		const staleStat = fsSync.lstatSync(control);
+		await makeOversized();
+		const statSpy = spyOn(fsSync, "lstatSync").mockReturnValueOnce(staleStat);
+		const readSpy = spyOn(fsSync, "readSync");
+		try {
+			const result = loadAcceptedModelPresetRegistry(root, { manifestUrl: "https://example.com/registry.json" });
+			expect(result.error).toMatch(/oversized/i);
+			expect(readSpy.mock.results.reduce((total, result) => total + Number(result.value), 0)).toBe(limit + 1);
+			for (const call of readSpy.mock.calls) expect((call as readonly unknown[])[3]).toBeLessThanOrEqual(64 * 1024);
+		} finally {
+			statSpy.mockRestore();
+			readSpy.mockRestore();
+		}
+	});
+
+	test("async payload reads remain bounded when a file grows after stat", async () => {
+		await Bun.write(control, "{}");
+		const staleStat = await fs.lstat(control, { bigint: true });
+		await makeOversized();
+		const statSpy = spyOn(fs, "lstat").mockResolvedValueOnce(staleStat);
+		const realOpen = fs.open;
+		let readSpy: ReturnType<typeof spyOn> | undefined;
+		const openSpy = spyOn(fs, "open").mockImplementation(async (...args) => {
+			const handle = await realOpen(...args);
+			if (String(args[0]) === control) readSpy = spyOn(handle, "read");
+			return handle;
+		});
+		try {
+			const result = await loadAcceptedModelPresetRegistryAsync(root, {
+				manifestUrl: "https://example.com/registry.json",
+			});
+			expect(result.error).toMatch(/oversized/i);
+			expect(readSpy).toBeDefined();
+			expect(readSpy!.mock.calls.length).toBeGreaterThan(0);
+			for (const call of readSpy!.mock.calls) {
+				expect((call as readonly unknown[])[2]).toBeLessThanOrEqual(64 * 1024);
+			}
+		} finally {
+			statSpy.mockRestore();
+			openSpy.mockRestore();
+			readSpy?.mockRestore();
+		}
+	});
+
+	test.each(["sync", "async"] as const)("rejects %s payload replacement after admission", async mode => {
+		await Bun.write(control, "{}");
+		const replacement = path.join(root, "replacement.json");
+		await Bun.write(replacement, "{}");
+		if (mode === "sync") {
+			const realOpen = fsSync.openSync;
+			const replacementFd = realOpen(replacement, "r");
+			const openSpy = spyOn(fsSync, "openSync").mockImplementation((file, flags, ...args) =>
+				String(file) === control ? replacementFd : realOpen(file, flags, ...args),
+			);
+			try {
+				const result = loadAcceptedModelPresetRegistry(root, { manifestUrl: "https://example.com/registry.json" });
+				expect(result.error).toMatch(/changed while opening/i);
+			} finally {
+				openSpy.mockRestore();
+			}
+			return;
+		}
+		const realOpen = fs.open;
+		const replacementHandle = await realOpen(replacement, "r");
+		const openSpy = spyOn(fs, "open").mockImplementation(async (file, ...args) =>
+			String(file) === control ? replacementHandle : realOpen(file, ...args),
+		);
+		try {
+			const result = await loadAcceptedModelPresetRegistryAsync(root, {
+				manifestUrl: "https://example.com/registry.json",
+			});
+			expect(result.error).toMatch(/changed while opening/i);
+		} finally {
+			openSpy.mockRestore();
 		}
 	});
 
