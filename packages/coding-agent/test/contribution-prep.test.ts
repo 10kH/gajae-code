@@ -74,12 +74,18 @@ describe("contribution prep", () => {
 				AccessKeyId: SYNTHETIC_AWS_TEMPORARY_KEY_ID,
 				SecretAccessKey: SYNTHETIC_AWS_SECRET_ACCESS_KEY,
 				SessionToken: SYNTHETIC_AWS_SESSION_TOKEN,
+				"X-Amz-Security-Token": SYNTHETIC_AWS_SESSION_TOKEN,
 			},
 		});
 
 		const redacted = redactContributionPrepText(text, process.cwd());
 		const parsed = JSON.parse(redacted) as {
-			Credentials: { AccessKeyId: string; SecretAccessKey: string; SessionToken: string };
+			Credentials: {
+				AccessKeyId: string;
+				SecretAccessKey: string;
+				SessionToken: string;
+				"X-Amz-Security-Token": string;
+			};
 		};
 
 		expect(redacted).not.toContain(SYNTHETIC_AWS_TEMPORARY_KEY_ID);
@@ -89,6 +95,7 @@ describe("contribution prep", () => {
 			AccessKeyId: "[REDACTED_AWS_KEY_ID]",
 			SecretAccessKey: "[REDACTED_SECRET]",
 			SessionToken: "[REDACTED_SECRET]",
+			"X-Amz-Security-Token": "[REDACTED_SECRET]",
 		});
 	});
 
@@ -153,9 +160,18 @@ describe("contribution prep", () => {
 			{ length: 10001 },
 			(_, index) => `"field${index}":"${SYNTHETIC_AWS_ACCESS_KEY_ID}"`,
 		).join(",")}}`;
+		const manyReplacements = JSON.stringify(
+			Array.from({ length: 10001 }, (_, index) => `${SYNTHETIC_AWS_ACCESS_KEY_ID}-${index}`),
+		);
+		const ordered = JSON.stringify([SYNTHETIC_AWS_ACCESS_KEY_ID, SYNTHETIC_AWS_TEMPORARY_KEY_ID]);
 
 		expect(redactContributionPrepText("x".repeat(1_000_001), process.cwd())).toBe("[REDACTED_OVERSIZED_CONTENT]");
 		expect(redactContributionPrepText(manyFields, process.cwd())).toBe("[REDACTED_OVERSIZED_CONTENT]");
+		expect(redactContributionPrepText(manyReplacements, process.cwd())).toBe("[REDACTED_OVERSIZED_CONTENT]");
+		expect(JSON.parse(redactContributionPrepText(ordered, process.cwd()))).toEqual([
+			"[REDACTED_AWS_KEY_ID]",
+			"[REDACTED_AWS_KEY_ID]",
+		]);
 	});
 
 	it("handles AWS credential boundaries, label case, separators, and whitespace", () => {
@@ -263,7 +279,10 @@ describe("contribution prep", () => {
 					role: "user",
 					content: JSON.stringify({
 						log: `Failure uses Authorization: Bearer ghp_secretsecretsecret and SessionToken: ${SYNTHETIC_AWS_SESSION_TOKEN}`,
-						payload: JSON.stringify({ SecretAccessKey: SYNTHETIC_AWS_SECRET_ACCESS_KEY }),
+						payload: JSON.stringify({
+							SecretAccessKey: SYNTHETIC_AWS_SECRET_ACCESS_KEY,
+							"X-Amz-Security-Token": SYNTHETIC_AWS_SESSION_TOKEN,
+						}),
 					}),
 					timestamp: 1,
 				},
@@ -426,7 +445,8 @@ describe("contribution prep", () => {
 
 			expect(result.spawned).toBe(true);
 			expect(spawns).toHaveLength(1);
-			expect(spawns[0]?.args).toContain(`@${result.workerPromptPath}`);
+			expect(spawns[0]?.args).toContain("@worker-prompt.md");
+			expect(spawns[0]?.args).not.toContain(`@${result.workerPromptPath}`);
 			expect(spawns[0]?.args).toContain("--no-skills");
 			expect(spawns[0]?.args[0]).toBeTruthy();
 			expect(spawns[0]?.cwd).toBe(result.artifactDir);

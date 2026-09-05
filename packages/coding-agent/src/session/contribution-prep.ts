@@ -91,7 +91,8 @@ function isAwsSecretField(value: string): boolean {
 		normalized === "secretaccesskey" ||
 		normalized === "sessiontoken" ||
 		normalized === "awssecretaccesskey" ||
-		normalized === "awssessiontoken"
+		normalized === "awssessiontoken" ||
+		normalized === "xamzsecuritytoken"
 	);
 }
 
@@ -462,7 +463,7 @@ export async function prepareContributionPrep(
 			});
 		const command = resolveGjcCommand();
 		await spawn(
-			[command.cmd, ...command.args, "--no-skills", "--", `@${workerPromptPath}`],
+			[command.cmd, ...command.args, "--no-skills", "--", `@${path.basename(workerPromptPath)}`],
 			artifactDir,
 			command.shell,
 		);
