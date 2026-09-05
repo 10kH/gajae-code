@@ -354,28 +354,32 @@ async function isHostOwnedNodeExecutable(executablePath: string): Promise<boolea
 	if (uid === undefined) return false;
 	let ownershipRoot = path.parse(executablePath).root;
 	let expectedUid = 0;
-	if (executable.uid === uid) {
-		const home = os.userInfo().homedir;
-		const userRoots = [
-			path.join(home, ".nvm", "versions", "node"),
-			path.join(home, ".volta", "tools", "image", "node"),
-			path.join(home, ".asdf", "installs", "nodejs"),
-			path.join(home, ".local", "share", "mise", "installs", "node"),
-			...(Bun.env.RUNNER_TOOL_CACHE ? [Bun.env.RUNNER_TOOL_CACHE] : []),
-			...(process.platform === "darwin" ? ["/opt/homebrew"] : []),
-		];
-		const portablePath = executablePath.replaceAll(path.sep, "/");
-		for (const marker of ["/.nvm/versions/node/", "/.volta/tools/image/node/", "/.asdf/installs/nodejs/"]) {
-			const index = portablePath.indexOf(marker);
-			if (index >= 0) userRoots.push(portablePath.slice(0, index + marker.length - 1));
-		}
-		const matchedRoot = userRoots.find(root => isWithin(path.resolve(root), path.resolve(executablePath)));
-		if (!matchedRoot) return false;
+	const home = os.userInfo().homedir;
+	const managedRoots = [
+		path.join(home, ".nvm", "versions", "node"),
+		path.join(home, ".volta", "tools", "image", "node"),
+		path.join(home, ".asdf", "installs", "nodejs"),
+		path.join(home, ".local", "share", "mise", "installs", "node"),
+		...(Bun.env.RUNNER_TOOL_CACHE ? [Bun.env.RUNNER_TOOL_CACHE] : []),
+		...(process.platform === "darwin" ? ["/opt/homebrew"] : []),
+	];
+	const portablePath = executablePath.replaceAll(path.sep, "/");
+	for (const marker of ["/.nvm/versions/node/", "/.volta/tools/image/node/", "/.asdf/installs/nodejs/"]) {
+		const index = portablePath.indexOf(marker);
+		if (index >= 0) managedRoots.push(portablePath.slice(0, index + marker.length - 1));
+	}
+	const matchedRoot = managedRoots.find(root => isWithin(path.resolve(root), path.resolve(executablePath)));
+	if (matchedRoot) {
 		ownershipRoot = path.resolve(matchedRoot);
 		for (const tempRoot of [os.tmpdir(), "/tmp", "/var/tmp"]) {
 			if (isWithin(path.resolve(tempRoot), ownershipRoot)) return false;
 		}
-		expectedUid = uid;
+		const rootStat = await fs.stat(ownershipRoot);
+		if (!rootStat.isDirectory() || (rootStat.uid !== 0 && rootStat.uid !== uid) || (rootStat.mode & 0o002) !== 0) {
+			return false;
+		}
+		expectedUid = rootStat.uid;
+		if (executable.uid !== expectedUid) return false;
 	} else if (executable.uid !== 0) {
 		return false;
 	}
