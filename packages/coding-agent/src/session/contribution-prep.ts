@@ -72,12 +72,96 @@ function replaceRegex(text: string, regex: RegExp, replacement: string, state: R
 	return text.replace(regex, replacement);
 }
 
+function redactAwsAccessKeyIds(text: string, state: RedactionState): string {
+	return replaceRegex(
+		text,
+		/(^|[^0-9A-Za-z])(?:AKIA|ASIA)[0-9A-Z]{16}(?![0-9A-Za-z])/g,
+		"$1[REDACTED_AWS_KEY_ID]",
+		state,
+		"aws_keys",
+	);
+}
+
+function isAwsSecretField(value: string): boolean {
+	const normalized = value.toLowerCase().replaceAll(/[_-]/g, "");
+	return (
+		normalized === "secretaccesskey" ||
+		normalized === "sessiontoken" ||
+		normalized === "awssecretaccesskey" ||
+		normalized === "awssessiontoken"
+	);
+}
+
+function redactAwsJsonStrings(text: string, state: RedactionState): string {
+	const tokens = [...text.matchAll(/"(?:\\(?:["\\/bfnrt]|u[0-9A-Fa-f]{4})|[^"\\\r\n])*"/g)].map(match => ({
+		start: match.index,
+		end: match.index + match[0].length,
+		raw: match[0],
+	}));
+	const replacements = new Map<number, { end: number; value: string }>();
+
+	for (const [index, token] of tokens.entries()) {
+		let decoded: string;
+		try {
+			decoded = JSON.parse(token.raw) as string;
+		} catch {
+			continue;
+		}
+
+		if (isAwsSecretField(decoded)) {
+			const separator = /^\s*:\s*/.exec(text.slice(token.end));
+			const valueToken = tokens[index + 1];
+			if (separator && valueToken?.start === token.end + separator[0].length) {
+				let value: string;
+				try {
+					value = JSON.parse(valueToken.raw) as string;
+				} catch {
+					value = "";
+				}
+				if (value.length >= 8)
+					replacements.set(valueToken.start, { end: valueToken.end, value: JSON.stringify("[REDACTED_SECRET]") });
+			}
+		}
+
+		const redacted = decoded.replace(
+			/(^|[^0-9A-Za-z])(?:AKIA|ASIA)[0-9A-Z]{16}(?![0-9A-Za-z])/g,
+			"$1[REDACTED_AWS_KEY_ID]",
+		);
+		if (redacted !== decoded && !replacements.has(token.start)) {
+			replacements.set(token.start, { end: token.end, value: JSON.stringify(redacted) });
+		}
+	}
+
+	if (replacements.size === 0) return text;
+	state.labels.add("aws_keys");
+	let redacted = text;
+	for (const [start, replacement] of [...replacements.entries()].sort(([left], [right]) => right - left)) {
+		redacted = `${redacted.slice(0, start)}${replacement.value}${redacted.slice(replacement.end)}`;
+	}
+	return redacted;
+}
+
 export function redactContributionPrepText(
 	text: string,
 	cwd: string,
 	state: RedactionState = { labels: new Set() },
 ): string {
-	let redacted = text;
+	let redacted = redactAwsJsonStrings(text, state);
+	redacted = redactAwsAccessKeyIds(redacted, state);
+	redacted = replaceRegex(
+		redacted,
+		/(^|[^A-Za-z0-9_])(["']?(?:(?:aws[_-]?)?secret[_-]?access[_-]?key|(?:aws[_-]?)?session[_-]?token)["']?\s*[=:]\s*)(["'])([^"'\r\n]{8,})\3/gi,
+		"$1$2$3[REDACTED_SECRET]$3",
+		state,
+		"aws_keys",
+	);
+	redacted = replaceRegex(
+		redacted,
+		/(^|[^A-Za-z0-9_])(["']?(?:(?:aws[_-]?)?secret[_-]?access[_-]?key|(?:aws[_-]?)?session[_-]?token)["']?\s*[=:]\s*)[^\s"',;{}[\]()]{8,}/gi,
+		"$1$2[REDACTED_SECRET]",
+		state,
+		"aws_keys",
+	);
 	redacted = replaceRegex(
 		redacted,
 		/\b(?:sk|pk|rk|xox[baprs])-[-_A-Za-z0-9]{12,}\b/g,
@@ -91,19 +175,6 @@ export function redactContributionPrepText(
 		"[REDACTED_TOKEN]",
 		state,
 		"tokens",
-	);
-	// AKIA is the long-term access key id, ASIA the temporary/STS one. The id is
-	// not the credential on its own: an STS payload carries `SecretAccessKey` and
-	// `SessionToken` beside it, and neither canonical field name is matched by the
-	// `ENV_*=value` rule below, which only sees shell-style `AWS_SECRET_ACCESS_KEY=`.
-	// The crash-log scrubber already covers both shapes; this is the outbound path.
-	redacted = replaceRegex(redacted, /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, "[REDACTED_AWS_KEY_ID]", state, "aws_keys");
-	redacted = replaceRegex(
-		redacted,
-		/(["']?(?:secret[_-]?access[_-]?key|session[_-]?token)["']?\s*[=:]\s*["']?)[^\s"',;}\]]{8,}/gi,
-		"$1[REDACTED_SECRET]",
-		state,
-		"aws_keys",
 	);
 	redacted = replaceRegex(
 		redacted,

@@ -10,6 +10,11 @@ import {
 } from "../src/session/contribution-prep";
 import { lookupBuiltinSlashCommand } from "../src/slash-commands/builtin-registry";
 
+const SYNTHETIC_AWS_ACCESS_KEY_ID = `AKIA${"0".repeat(16)}`;
+const SYNTHETIC_AWS_TEMPORARY_KEY_ID = `ASIA${"1".repeat(16)}`;
+const SYNTHETIC_AWS_SECRET_ACCESS_KEY = `SYNTHETIC_SECRET_ACCESS_KEY_${"2".repeat(20)}`;
+const SYNTHETIC_AWS_SESSION_TOKEN = `SYNTHETIC_SESSION_TOKEN_${"3".repeat(20)}+/=`;
+
 describe("contribution prep", () => {
 	it("redacts secrets, private endpoints, cookies, auth headers, and home paths", () => {
 		const text = [
@@ -64,30 +69,106 @@ describe("contribution prep", () => {
 		// them; `SecretAccessKey` and `SessionToken` are the credential itself, and
 		// neither canonical field name is matched by the `ENV_*=value` rule, which
 		// only sees the shell spelling `AWS_SECRET_ACCESS_KEY=`.
-		const accessKeyId = "ASIAIOSFODNN7EXAMPLE";
-		const longTermKeyId = "AKIAIOSFODNN7EXAMPLE";
-		const secretAccessKey = "wJalrXUtnFEMI7K7MDENGbPxRfiCYEXAMPLEKEY";
-		const sessionToken = "FwoGZXIvYXdzEBYaDEXAMPLESESSIONTOKENVALUE1234";
+		const text = JSON.stringify({
+			Credentials: {
+				AccessKeyId: SYNTHETIC_AWS_TEMPORARY_KEY_ID,
+				SecretAccessKey: SYNTHETIC_AWS_SECRET_ACCESS_KEY,
+				SessionToken: SYNTHETIC_AWS_SESSION_TOKEN,
+			},
+		});
+
+		const redacted = redactContributionPrepText(text, process.cwd());
+		const parsed = JSON.parse(redacted) as {
+			Credentials: { AccessKeyId: string; SecretAccessKey: string; SessionToken: string };
+		};
+
+		expect(redacted).not.toContain(SYNTHETIC_AWS_TEMPORARY_KEY_ID);
+		expect(redacted).not.toContain(SYNTHETIC_AWS_SECRET_ACCESS_KEY);
+		expect(redacted).not.toContain(SYNTHETIC_AWS_SESSION_TOKEN);
+		expect(parsed.Credentials).toEqual({
+			AccessKeyId: "[REDACTED_AWS_KEY_ID]",
+			SecretAccessKey: "[REDACTED_SECRET]",
+			SessionToken: "[REDACTED_SECRET]",
+		});
+	});
+
+	it("redacts escaped AWS JSON fields and key ids without invalidating JSON", () => {
+		const text = String.raw`{"\u0053ecretAccessKey":"${SYNTHETIC_AWS_SECRET_ACCESS_KEY}","Session\u0054oken":"${SYNTHETIC_AWS_SESSION_TOKEN}","AccessKeyId":"\u0041${SYNTHETIC_AWS_TEMPORARY_KEY_ID.slice(1)}"}`;
+
+		const redacted = redactContributionPrepText(text, process.cwd());
+		const parsed = JSON.parse(redacted) as {
+			SecretAccessKey: string;
+			SessionToken: string;
+			AccessKeyId: string;
+		};
+
+		expect(parsed).toEqual({
+			SecretAccessKey: "[REDACTED_SECRET]",
+			SessionToken: "[REDACTED_SECRET]",
+			AccessKeyId: "[REDACTED_AWS_KEY_ID]",
+		});
+		expect(redacted).not.toContain(SYNTHETIC_AWS_SECRET_ACCESS_KEY);
+		expect(redacted).not.toContain(SYNTHETIC_AWS_SESSION_TOKEN);
+		expect(redacted).not.toContain(SYNTHETIC_AWS_TEMPORARY_KEY_ID.slice(1));
+	});
+
+	it("handles AWS credential boundaries, label case, separators, and whitespace", () => {
 		const text = [
-			`{"AccessKeyId":"${accessKeyId}","SecretAccessKey":"${secretAccessKey}","SessionToken":"${sessionToken}"}`,
-			`long-term ${longTermKeyId}`,
+			`long-term (${SYNTHETIC_AWS_ACCESS_KEY_ID})`,
+			`"secret_access_key" \t: \t"${SYNTHETIC_AWS_SECRET_ACCESS_KEY}"`,
+			`'SESSION-TOKEN' = '${SYNTHETIC_AWS_SESSION_TOKEN}'`,
+			`AWS_SECRET_ACCESS_KEY = ${SYNTHETIC_AWS_SECRET_ACCESS_KEY}`,
+			`aws_session_token=${SYNTHETIC_AWS_SESSION_TOKEN}`,
 		].join("\n");
 
 		const redacted = redactContributionPrepText(text, process.cwd());
 
-		expect(redacted).not.toContain(accessKeyId);
-		expect(redacted).not.toContain(longTermKeyId);
-		expect(redacted).not.toContain(secretAccessKey);
-		expect(redacted).not.toContain(sessionToken);
-		// Field names survive so the artifact still says which call was involved.
-		expect(redacted).toContain("SecretAccessKey");
-		expect(redacted).toContain("SessionToken");
+		for (const secret of [
+			SYNTHETIC_AWS_ACCESS_KEY_ID,
+			SYNTHETIC_AWS_SECRET_ACCESS_KEY,
+			SYNTHETIC_AWS_SESSION_TOKEN,
+		]) {
+			expect(redacted).not.toContain(secret);
+		}
+		expect(redacted).toContain(`"secret_access_key" \t: \t"[REDACTED_SECRET]"`);
+		expect(redacted).toContain(`'SESSION-TOKEN' = '[REDACTED_SECRET]'`);
 	});
 
-	it("leaves ordinary prose that merely resembles AWS credential names alone", () => {
-		const text = ["ASIAN markets rose", "AKIRA is a film", "the session token expired"].join("\n");
+	it("leaves AWS-like prose and key-id near-misses unchanged", () => {
+		const text = [
+			"ASIAN markets rose",
+			"AKIRA is a film",
+			"the session token expired",
+			"rotate the secret access key tomorrow",
+			`prefix${SYNTHETIC_AWS_ACCESS_KEY_ID}`,
+			`${SYNTHETIC_AWS_ACCESS_KEY_ID}suffix`,
+		].join("\n");
 
 		expect(redactContributionPrepText(text, process.cwd())).toBe(text);
+	});
+
+	it("preserves delimiters and existing token redaction behavior around AWS fields", () => {
+		const githubToken = "ghs_abcdefghijklmnopqrstuvwxyz123456";
+		const slackToken = "xoxb-abcdefghijklmnopqrstuvwxyz123456";
+		const benignAssignment = "notSecretAccessKey=SYNTHETIC_PUBLIC_VALUE";
+		const text = [
+			`trace_${SYNTHETIC_AWS_ACCESS_KEY_ID}_suffix`,
+			`invoke(SessionToken=${SYNTHETIC_AWS_SESSION_TOKEN});`,
+			`SecretAccessKey=${githubToken}`,
+			`SessionToken=${slackToken}`,
+			benignAssignment,
+		].join("\n");
+
+		const redacted = redactContributionPrepText(text, process.cwd());
+
+		expect(redacted).toContain("trace_[REDACTED_AWS_KEY_ID]_suffix");
+		expect(redacted).toContain("invoke(SessionToken=[REDACTED_SECRET]);");
+		expect(redacted).toContain("SecretAccessKey=[REDACTED_SECRET]");
+		expect(redacted).toContain("SessionToken=[REDACTED_SECRET]");
+		expect(redacted).not.toContain("[REDACTED_SECRET]]");
+		expect(redacted).not.toContain(githubToken);
+		expect(redacted).not.toContain(slackToken);
+		expect(redacted).toContain(benignAssignment);
 	});
 
 	it("writes a manifest with redacted file-pointer artifacts", async () => {
@@ -98,15 +179,21 @@ describe("contribution prep", () => {
 			await $`git add tracked.txt`.cwd(tempDir.path()).quiet();
 			await $`git -c user.email=test@example.com -c user.name=Test commit -m initial`.cwd(tempDir.path()).quiet();
 			const tokenFilename = "ghs_abcdefghijklmnopqrstuvwxyz123456.txt";
+			const awsFilename = `aws-${SYNTHETIC_AWS_ACCESS_KEY_ID}.txt`;
 			const transcriptToken = "ghu_abcdefghijklmnopqrstuvwxyz123456";
 			const instructionsToken = "ghr_abcdefghijklmnopqrstuvwxyz123456";
 			await Bun.write(
 				path.join(tempDir.path(), "tracked.txt"),
-				"changed ghs_abcdefghijklmnopqrstuvwxyz123456 github_pat_11ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz1234567890\n",
+				`changed ghs_abcdefghijklmnopqrstuvwxyz123456 github_pat_11ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz1234567890 ${SYNTHETIC_AWS_TEMPORARY_KEY_ID} SecretAccessKey=${SYNTHETIC_AWS_SECRET_ACCESS_KEY}\n`,
 			);
 			await Bun.write(path.join(tempDir.path(), tokenFilename), "untracked");
+			await Bun.write(path.join(tempDir.path(), awsFilename), "untracked");
 			const messages: AgentMessage[] = [
-				{ role: "user", content: "Failure uses Authorization: Bearer ghp_secretsecretsecret", timestamp: 1 },
+				{
+					role: "user",
+					content: `Failure uses Authorization: Bearer ghp_secretsecretsecret and SessionToken: ${SYNTHETIC_AWS_SESSION_TOKEN}`,
+					timestamp: 1,
+				},
 				{
 					role: "assistant",
 					api: "anthropic-messages",
@@ -135,7 +222,7 @@ describe("contribution prep", () => {
 				},
 				{
 					artifactRoot: path.join(tempDir.path(), "artifacts"),
-					customInstructions: `Include ${instructionsToken}`,
+					customInstructions: `Include ${instructionsToken}; AWS_SECRET_ACCESS_KEY=${SYNTHETIC_AWS_SECRET_ACCESS_KEY}`,
 					now: new Date("2026-05-31T00:00:00.000Z"),
 				},
 			);
@@ -155,24 +242,47 @@ describe("contribution prep", () => {
 			expect(manifest.worker_prompt_path).toBe(result.workerPromptPath);
 			expect(manifest.recommended_output).toContain("uncertainty / remaining risks");
 			expect(manifest.redactions).toContain("auth_headers");
+			expect(manifest.redactions).toContain("aws_keys");
 			expect(manifest.redactions).toContain("private_endpoints");
 			expect(manifest.changed_files).toContain("[REDACTED_TOKEN].txt");
+			expect(manifest.changed_files).toContain("aws-[REDACTED_AWS_KEY_ID].txt");
 			expect(manifest.changed_files).not.toContain(tokenFilename);
+			expect(manifest.changed_files).not.toContain(awsFilename);
 			expect(transcriptPath).toBeTruthy();
 			const transcript = await Bun.file(transcriptPath ?? "").text();
 			expect(transcript).toContain("[REDACTED_AUTH_HEADER]");
 			expect(transcript).toContain("[REDACTED_PRIVATE_ENDPOINT]");
 			expect(transcript).not.toContain(transcriptToken);
+			expect(transcript).not.toContain(SYNTHETIC_AWS_SESSION_TOKEN);
 			const summaryPath = manifest.artifacts.find(artifact => artifact.path.endsWith("summary.md"))?.path;
 			expect(summaryPath).toBeTruthy();
 			const summary = await Bun.file(summaryPath ?? "").text();
 			expect(summary).not.toContain(instructionsToken);
+			expect(summary).not.toContain(SYNTHETIC_AWS_SECRET_ACCESS_KEY);
 			const diffPath = manifest.artifacts.find(artifact => artifact.path.endsWith("git-diff.patch"))?.path;
 			expect(diffPath).toBeTruthy();
 			const gitDiff = await Bun.file(diffPath ?? "").text();
 			expect(gitDiff).toContain("[REDACTED_TOKEN]");
 			expect(gitDiff).not.toContain("ghs_abcdefghijklmnopqrstuvwxyz123456");
 			expect(gitDiff).not.toContain("github_pat_11ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz1234567890");
+			expect(gitDiff).not.toContain(SYNTHETIC_AWS_TEMPORARY_KEY_ID);
+			expect(gitDiff).not.toContain(SYNTHETIC_AWS_SECRET_ACCESS_KEY);
+			const outboundPaths = [
+				result.manifestPath,
+				result.workerPromptPath,
+				...manifest.artifacts.map(artifact => artifact.path),
+			];
+			for (const outboundPath of outboundPaths) {
+				const outboundText = await Bun.file(outboundPath).text();
+				for (const secret of [
+					SYNTHETIC_AWS_ACCESS_KEY_ID,
+					SYNTHETIC_AWS_TEMPORARY_KEY_ID,
+					SYNTHETIC_AWS_SECRET_ACCESS_KEY,
+					SYNTHETIC_AWS_SESSION_TOKEN,
+				]) {
+					expect(outboundText).not.toContain(secret);
+				}
+			}
 		} finally {
 			tempDir.remove();
 		}
