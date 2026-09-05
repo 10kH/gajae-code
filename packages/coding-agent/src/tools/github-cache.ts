@@ -154,7 +154,23 @@ const SWEEP_INTERVAL_MS = 60_000;
 let lastSweepAt = 0;
 const backgroundRefreshes = new Map<string, { generation: number; controller: AbortController }>();
 let backgroundRefreshGeneration = 0;
+const cacheGenerations = new Map<string, number>();
+let cacheGenerationEpoch = 0;
 const BACKGROUND_REFRESH_TIMEOUT_MS = 30_000;
+
+function cacheIdentityKey(
+	authKey: string,
+	repo: string,
+	kind: CacheKind,
+	number: number,
+	includeComments: boolean,
+): string {
+	return JSON.stringify([authKey, normalizeRepo(repo), kind, number, includeComments]);
+}
+
+function advanceCacheGeneration(key: string): void {
+	cacheGenerations.set(key, (cacheGenerations.get(key) ?? 0) + 1);
+}
 
 function sweepIfDue(hardTtlMs: number): void {
 	const now = Date.now();
@@ -299,6 +315,12 @@ export function invalidate(
 	includeComments?: boolean,
 	authKey: string = DEFAULT_CACHE_AUTH_KEY,
 ): void {
+	if (includeComments === undefined) {
+		advanceCacheGeneration(cacheIdentityKey(authKey, repo, kind, number, false));
+		advanceCacheGeneration(cacheIdentityKey(authKey, repo, kind, number, true));
+	} else {
+		advanceCacheGeneration(cacheIdentityKey(authKey, repo, kind, number, includeComments));
+	}
 	const db = openDb();
 	if (!db) return;
 	try {
@@ -348,6 +370,8 @@ export function resetForTests(): void {
 	for (const { controller } of backgroundRefreshes.values()) controller.abort();
 	backgroundRefreshes.clear();
 	backgroundRefreshGeneration += 1;
+	cacheGenerations.clear();
+	cacheGenerationEpoch += 1;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -457,9 +481,11 @@ function scheduleBackgroundRefresh<T>(
 	includeComments: boolean,
 	fetchFresh: (signal?: AbortSignal) => Promise<FreshResult<T>>,
 ): void {
-	const key = JSON.stringify([authKey, normalizeRepo(repo), kind, number, includeComments]);
+	const key = cacheIdentityKey(authKey, repo, kind, number, includeComments);
 	if (backgroundRefreshes.has(key)) return;
 	const generation = backgroundRefreshGeneration;
+	const cacheEpoch = cacheGenerationEpoch;
+	const cacheGeneration = cacheGenerations.get(key) ?? 0;
 	const controller = new AbortController();
 	backgroundRefreshes.set(key, { generation, controller });
 	queueMicrotask(async () => {
@@ -470,7 +496,11 @@ function scheduleBackgroundRefresh<T>(
 				throw new Error("background refresh timed out");
 			});
 			const fresh = await Promise.race([fetchPromise, timeoutPromise]);
-			if (backgroundRefreshGeneration === generation) {
+			if (
+				backgroundRefreshGeneration === generation &&
+				cacheGenerationEpoch === cacheEpoch &&
+				(cacheGenerations.get(key) ?? 0) === cacheGeneration
+			) {
 				storeResult(authKey, repo, kind, number, includeComments, fresh, Date.now());
 			}
 		} catch (err) {
@@ -497,6 +527,7 @@ export async function getOrFetchView<T>(options: CacheLookupOptions<T>): Promise
 		const fresh = await options.fetchFresh(options.signal);
 		return { ...fresh, status: "disabled", fetchedAt: now };
 	}
+	const cacheKey = cacheIdentityKey(authKey, options.repo, options.kind, options.number, options.includeComments);
 
 	// Enforce the *configured* hard TTL against on-disk rows. This is what
 	// makes `github.cache.hardTtlSec` a real retention cap rather than a soft
@@ -517,6 +548,7 @@ export async function getOrFetchView<T>(options: CacheLookupOptions<T>): Promise
 			// Past hard TTL: drop the row eagerly so the on-disk exposure window
 			// is bounded even if `fetchFresh()` then fails (network down, gh
 			// auth lapse, etc.) and we never get to overwrite it.
+			advanceCacheGeneration(cacheKey);
 			invalidate(options.repo, options.kind, options.number, options.includeComments, authKey);
 		} else if (age <= ttl.softMs) {
 			return {
@@ -547,6 +579,7 @@ export async function getOrFetchView<T>(options: CacheLookupOptions<T>): Promise
 
 	const fresh = await options.fetchFresh(options.signal);
 	const fetchedAt = Date.now();
+	advanceCacheGeneration(cacheKey);
 	storeResult(authKey, options.repo, options.kind, options.number, options.includeComments, fresh, fetchedAt);
 	return { ...fresh, status: "miss", fetchedAt };
 }

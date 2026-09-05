@@ -139,6 +139,22 @@ it("releases a stale refresh marker when the fetch never settles", async () => {
 	expect(retry).toHaveBeenCalledTimes(1);
 });
 
+it("does not let a late stale refresh overwrite a newer hard-expiry fetch", async () => {
+	const now = Date.now();
+	const row = { repo: TEST_REPO, kind: "issue" as const, number: 81, includeComments: true };
+	putCached({ ...row, payload: "old", rendered: "old", sourceUrl: "url", fetchedAt: now - 2_000 });
+	const settings = Settings.isolated({ "github.cache.softTtlSec": 1, "github.cache.hardTtlSec": 60 });
+	const stale = Promise.withResolvers<{ payload: string; rendered: string; sourceUrl: string }>();
+	await getOrFetchView({ ...row, settings, now, fetchFresh: () => stale.promise });
+	await Promise.resolve();
+	const fresh = vi.fn(async () => ({ payload: "new", rendered: "new", sourceUrl: "url" }));
+	await getOrFetchView({ ...row, settings, now: now + 70_000, fetchFresh: fresh });
+	stale.resolve({ payload: "late", rendered: "late", sourceUrl: "url" });
+	for (let index = 0; index < 6; index += 1) await Promise.resolve();
+	expect(fresh).toHaveBeenCalledTimes(1);
+	expect(getCached(row.repo, row.kind, row.number, row.includeComments)?.rendered).toBe("new");
+});
+
 function issuePayload(number: number, body: string) {
 	return {
 		number,
