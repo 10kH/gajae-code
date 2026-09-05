@@ -114,13 +114,25 @@ const initialProcessEnvironment =
 				() => new Map<string, string>(),
 			)
 		: Promise.resolve(new Map<string, string>());
+const initialTemporaryRoots = initialProcessEnvironment.then(async environment => {
+	const candidates = [environment.get("TMPDIR"), environment.get("TEMP"), environment.get("TMP"), "/tmp", "/var/tmp"]
+		.filter((root): root is string => typeof root === "string" && path.isAbsolute(root))
+		.map(root => path.resolve(root));
+	const roots = new Set<string>();
+	for (const candidate of candidates) {
+		roots.add(candidate);
+		roots.add(await fs.realpath(candidate).catch(() => candidate));
+	}
+	return [...roots];
+});
 const initialNodeAuthorities = initialProcessEnvironment.then(async environment => {
 	const authorities = new Map<string, string>();
+	const temporaryRoots = await initialTemporaryRoots;
 	for (const pathEntry of (environment.get("PATH") ?? "").split(path.delimiter).filter(path.isAbsolute)) {
 		const lexical = path.join(pathEntry, process.platform === "win32" ? "node.exe" : "node");
 		try {
 			const real = await fs.realpath(lexical);
-			if ([os.tmpdir(), "/tmp", "/var/tmp"].some(root => isWithin(path.resolve(root), real))) continue;
+			if (temporaryRoots.some(root => isWithin(root, real))) continue;
 			const bytes = await readStableFile(real, "Initial Node executable", MCP_LAUNCHER_MAX_BYTES, true);
 			authorities.set(real, sha256(bytes));
 		} catch {
@@ -463,7 +475,7 @@ async function isInitialManagedNodeLauncherPath(
 	if (process.platform !== "linux") return false;
 	const real = await fs.realpath(executablePath);
 	if (untrustedRoots.some(root => isWithin(root, real))) return false;
-	if ([os.tmpdir(), "/tmp", "/var/tmp"].some(root => isWithin(path.resolve(root), real))) return false;
+	if ((await initialTemporaryRoots).some(root => isWithin(root, real))) return false;
 	const expected = (await initialNodeAuthorities).get(real);
 	if (!expected) return false;
 	const bytes = await readStableFile(real, "Initial Node executable", MCP_LAUNCHER_MAX_BYTES, true);
