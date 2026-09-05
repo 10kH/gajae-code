@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Tool hot paths avoid overlap-table allocations for equal/append-only ACP output, redundant UTF-8 tail previews, repeated diagnostics suffix scans, and duplicate background GitHub-cache refreshes. Job polling now releases watches and timers when a progress callback throws.
+
 ## [0.16.4] - 2026-09-05
 ### Added
 
@@ -21,7 +23,6 @@
 
 ### Fixed
 
-- Tool hot paths avoid overlap-table allocations for equal/append-only ACP output, redundant UTF-8 tail previews, repeated diagnostics suffix scans, and duplicate background GitHub-cache refreshes. Job polling now releases watches and timers when a progress callback throws.
 - Credential replacement lookups now propagate the owning request's cancellation through scoped and allowed unscoped retries, preventing aborted turns from continuing OAuth preparation or selecting another key.
 - Removing the committed status-line command segment or clearing its trusted command now cancels the running process and clears stale output; draft-only previews remain side-effect-free.
 - Slack inbound acknowledgment reactions now use bounded, abortable, tracked provider work that drains on shutdown or attachment retirement without delaying accepted turns; rejected or timed-out reactions emit sanitized diagnostics.
