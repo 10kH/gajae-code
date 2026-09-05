@@ -1632,7 +1632,7 @@ test("a conceded gap publishes the sequences live delivery already carried inste
 }, 20_000);
 
 test("a frame the surface refused stays above the cursor and is re-served by the next replay", async () => {
-	await withAttachedSessionRuntime(async ({ runtime, provider, warnings, reconcile }) => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, warnings, reconcile, reconcileSettled }) => {
 		await withSerializedFakeTransport(async () => {
 			const host = new FakeSessionHost();
 			const starting = runtime.start();
@@ -1653,6 +1653,7 @@ test("a frame the surface refused stays above the cursor and is re-served by the
 			host.drop();
 			reconcile();
 			host.accept(await awaitSocket(2));
+			await reconcileSettled();
 			await awaitReplayRequests(host, 2);
 			expect(host.replayRequests).toEqual([
 				{ sinceGeneration: GENERATION, sinceSeq: 0 },
@@ -1749,7 +1750,7 @@ test("an ambiguously acknowledged publication is not posted twice when reconcili
 	});
 }, 20_000);
 test("a surface that refuses a frame for good concedes it instead of wedging the stream", async () => {
-	await withAttachedSessionRuntime(async ({ runtime, provider, warnings, reconcile }) => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, warnings, reconcile, reconcileSettled }) => {
 		await withSerializedFakeTransport(async () => {
 			const host = new FakeSessionHost();
 			const starting = runtime.start();
@@ -1769,6 +1770,7 @@ test("a surface that refuses a frame for good concedes it instead of wedging the
 				await Bun.sleep(50);
 				reconcile();
 				host.accept(await awaitSocket(round));
+				await reconcileSettled();
 			}
 			await awaitRefusals(provider, 3);
 			await Bun.sleep(50);
@@ -1796,7 +1798,7 @@ test("a surface that refuses a frame for good concedes it instead of wedging the
 
 test("a rolled endpoint's first frame gets its own delivery budget, not the previous generation's", async () => {
 	await withAttachedSessionRuntime(
-		async ({ runtime, provider, warnings, reconcile, supersede, awaitFrameSettlement }) => {
+		async ({ runtime, provider, warnings, reconcile, reconcileSettled, supersede, awaitFrameSettlement }) => {
 			await withSerializedFakeTransport(async () => {
 				const host = new FakeSessionHost();
 				const starting = runtime.start();
@@ -1810,6 +1812,7 @@ test("a rolled endpoint's first frame gets its own delivery budget, not the prev
 				await Bun.sleep(50);
 				reconcile();
 				host.accept(await awaitSocket(2));
+				await reconcileSettled();
 				await awaitRefusals(provider, 2);
 				await awaitFrameSettlement(GENERATION, 1, 2);
 				await Bun.sleep(50);
@@ -1822,6 +1825,7 @@ test("a rolled endpoint's first frame gets its own delivery budget, not the prev
 				provider.failPosts = 1;
 				reconcile();
 				host.accept(await awaitSocket(3));
+				await reconcileSettled();
 				await awaitReplayRequests(host, 3);
 				host.emit("new one");
 				await awaitRefusals(provider, 3);
@@ -1834,6 +1838,7 @@ test("a rolled endpoint's first frame gets its own delivery budget, not the prev
 				// Refused once, so it still sits above the cursor and the rebuild re-serves it.
 				reconcile();
 				host.accept(await awaitSocket(4));
+				await reconcileSettled();
 				await awaitPosts(provider, 1);
 				await Bun.sleep(20);
 				expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\nnew one"]);

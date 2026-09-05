@@ -143,6 +143,15 @@ describe("CustomizationDashboard", () => {
 });
 
 describe("ImportWizard", () => {
+	function waitForStep(wizard: ImportWizard, step: ImportWizard["step"]): Promise<void> {
+		if (wizard.step === step) return Promise.resolve();
+		const ready = Promise.withResolvers<void>();
+		wizard.onRequestRender = () => {
+			if (wizard.step === step) ready.resolve();
+		};
+		return ready.promise;
+	}
+
 	test("selection lists are attached and visible at every choice step", async () => {
 		const wizard = new ImportWizard(projectDir, "project", homeDir);
 		expect(wizard.hasVisibleSelector).toBe(true);
@@ -177,13 +186,15 @@ describe("ImportWizard", () => {
 		expect(wizard.step).toBe("surfaces");
 		wizard.handleInput("\r"); // surfaces: all
 		expect(wizard.step).toBe("collision");
+		const previewReady = waitForStep(wizard, "preview");
 		wizard.handleInput("\r"); // policy: skip (first) → builds preview async
-		await Bun.sleep(80);
+		await previewReady;
 		expect(wizard.step).toBe("preview");
 		expect(wizard.hasVisibleSelector).toBe(false);
 		expect(wizard.preview?.entries.some(e => e.surface === "skills" && e.destinationName === "wiz-skill")).toBe(true);
+		const resultReady = waitForStep(wizard, "result");
 		wizard.handleInput("\r"); // confirm apply
-		await Bun.sleep(80);
+		await resultReady;
 		expect(wizard.step).toBe("result");
 		expect(wizard.result?.ok).toBe(true);
 		await fs.stat(path.join(projectDir, ".gjc", "skills", "wiz-skill", "SKILL.md"));
@@ -198,11 +209,14 @@ describe("ImportWizard", () => {
 		wizard.onClose = applied => {
 			closed.push(applied);
 		};
-		for (let i = 0; i < 4; i++) wizard.handleInput("\r");
-		await Bun.sleep(80);
+		for (let i = 0; i < 3; i++) wizard.handleInput("\r");
+		const previewReady = waitForStep(wizard, "preview");
+		wizard.handleInput("\r");
+		await previewReady;
 		expect(wizard.step).toBe("preview");
+		const resultReady = waitForStep(wizard, "result");
 		wizard.handleInput("\r"); // apply
-		await Bun.sleep(80);
+		await resultReady;
 		expect(wizard.step).toBe("result");
 		if (wizard.result?.ok === false) {
 			wizard.handleInput("\r"); // close
@@ -221,8 +235,10 @@ describe("ImportWizard", () => {
 			await fs.writeFile(path.join(projectDir, ".claude", "skills", `skill-${i}`, "SKILL.md"), SKILL_MD);
 		}
 		const wizard = new ImportWizard(projectDir, "project", homeDir);
-		for (let i = 0; i < 4; i++) wizard.handleInput("\r");
-		await Bun.sleep(80);
+		for (let i = 0; i < 3; i++) wizard.handleInput("\r");
+		const previewReady = waitForStep(wizard, "preview");
+		wizard.handleInput("\r");
+		await previewReady;
 		expect(wizard.step).toBe("preview");
 		const pageOne = wizard.render(80).join("\n");
 		expect(pageOne).toContain("page 1/");
