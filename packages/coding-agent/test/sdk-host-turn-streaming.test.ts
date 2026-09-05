@@ -88,6 +88,14 @@ interface HostHarness {
 	stop(): Promise<void>;
 }
 
+async function waitFor(predicate: () => boolean, label: string, timeoutMs = 2_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!predicate()) {
+		if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${label}`);
+		await Bun.sleep(10);
+	}
+}
+
 async function createHostHarness(
 	sessionId: string,
 	cwd: string,
@@ -466,7 +474,15 @@ describe("SDK host turn streaming", () => {
 		try {
 			const accepted = await harness.control("turn.prompt", { text: "no lifecycle" });
 			expect(accepted.ok).toBe(true);
-			await Bun.sleep(50);
+			await waitFor(
+				() =>
+					harness.broadcasts.some(
+						frame =>
+							frame.kind === "agent_end" &&
+							(frame.payload as { commandId?: unknown } | undefined)?.commandId === accepted.result?.commandId,
+					),
+				"synthetic failed terminal publication",
+			);
 			const terminals = harness.broadcasts.filter(
 				frame =>
 					frame.kind === "agent_end" &&
