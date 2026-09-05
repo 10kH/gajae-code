@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import { EventEmitter } from "node:events";
 import {
 	type EngineRawOutput,
@@ -214,6 +214,7 @@ describe("tryInsaneFetch concurrency cap", () => {
 class FakeChild extends EventEmitter {
 	stdout = new EventEmitter();
 	stderr = new EventEmitter();
+	pid?: number;
 	killed: string[] = [];
 	kill(signal?: string): boolean {
 		this.killed.push(signal ?? "SIGTERM");
@@ -248,6 +249,27 @@ describe("runEngineSubprocess hardening", () => {
 		child.emit("close", null);
 		const out = await promise;
 		expect(out.aborted).toBe(true);
+	});
+
+	it.skipIf(process.platform === "win32")("signals the child's process group, not just python3", async () => {
+		const child = new FakeChild();
+		child.pid = 4242;
+		const fakeSpawn = (() => child) as unknown as typeof import("node:child_process").spawn;
+		const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+		try {
+			const promise = runEngineSubprocess({ url: "https://example.com", timeoutMs: 1 }, { spawnImpl: fakeSpawn });
+			const { promise: tick, resolve } = Promise.withResolvers<void>();
+			setTimeout(resolve, 20);
+			await tick;
+			expect(killSpy).toHaveBeenCalledWith(-4242, "SIGTERM");
+			expect(child.killed).toBeEmpty();
+			child.emit("exit", null);
+			child.emit("close", null);
+			const out = await promise;
+			expect(out.timedOut).toBe(true);
+		} finally {
+			killSpy.mockRestore();
+		}
 	});
 
 	it("parses stdout from a completed child", async () => {

@@ -119,20 +119,32 @@ function appendCapped(buffer: string, chunk: string, cap: number): string {
 	return buffer + (chunk.length > remaining ? chunk.slice(0, remaining) : chunk);
 }
 
-/** Kill a child and its group, escalating to SIGKILL after a grace period. */
-function killChild(child: ChildProcess): void {
+/**
+ * Signal the child's whole process group on POSIX (the engine is spawned as a
+ * group leader, so its node/playwright grandchildren — including headless
+ * Chromium — are covered), falling back to the child alone on Windows or once
+ * the group is gone.
+ */
+function signalChildTree(child: ChildProcess, signal: "SIGTERM" | "SIGKILL"): void {
+	if (process.platform !== "win32" && child.pid) {
+		try {
+			process.kill(-child.pid, signal);
+			return;
+		} catch {
+			// group already gone; fall through to the direct signal
+		}
+	}
 	try {
-		child.kill("SIGTERM");
+		child.kill(signal);
 	} catch {
 		// already gone
 	}
-	const timer = setTimeout(() => {
-		try {
-			child.kill("SIGKILL");
-		} catch {
-			// already gone
-		}
-	}, KILL_GRACE_MS);
+}
+
+/** Kill a child and its group, escalating to SIGKILL after a grace period. */
+function killChild(child: ChildProcess): void {
+	signalChildTree(child, "SIGTERM");
+	const timer = setTimeout(() => signalChildTree(child, "SIGKILL"), KILL_GRACE_MS);
 	timer.unref?.();
 	child.once("exit", () => clearTimeout(timer));
 }
@@ -154,6 +166,9 @@ export function runEngineSubprocess(
 			cwd: INSANE_VENDOR_DIR,
 			env: { ...process.env, PYTHONPATH: INSANE_VENDOR_DIR },
 			stdio: ["ignore", "pipe", "pipe"],
+			// Own process group on POSIX so killChild can signal the engine's
+			// whole tree (python3 -> node -> headless Chromium) in one shot.
+			detached: process.platform !== "win32",
 		});
 
 		const finish = (code: number | null): void => {
