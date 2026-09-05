@@ -92,6 +92,17 @@ function isAwsSecretField(value: string): boolean {
 	);
 }
 
+function isSerializedJson(value: string): boolean {
+	const first = value.trimStart()[0];
+	if (first !== '"' && first !== "{" && first !== "[") return false;
+	try {
+		JSON.parse(value);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 function redactAwsJsonStrings(text: string, state: RedactionState, depth = 0): string {
 	const tokens = [...text.matchAll(/"(?:\\(?:["\\/bfnrt]|u[0-9A-Fa-f]{4})|[^"\\\r\n])*"/g)].map(match => ({
 		start: match.index,
@@ -123,10 +134,12 @@ function redactAwsJsonStrings(text: string, state: RedactionState, depth = 0): s
 			}
 		}
 
-		const nestedRedacted =
-			depth < 3 && decoded.length <= MAX_GIT_OUTPUT_CHARS
-				? redactAwsJsonStrings(decoded, state, depth + 1)
-				: decoded;
+		const atScanLimit = depth >= 3 || decoded.length > MAX_GIT_OUTPUT_CHARS;
+		const nestedRedacted = atScanLimit
+			? isSerializedJson(decoded)
+				? "[REDACTED_NESTED_JSON]"
+				: decoded
+			: redactAwsJsonStrings(decoded, state, depth + 1);
 		const redacted = nestedRedacted.replace(
 			/(^|[^0-9A-Za-z])(?:AKIA|ASIA)[0-9A-Z]{16}(?![0-9A-Za-z])/g,
 			"$1[REDACTED_AWS_KEY_ID]",
@@ -162,14 +175,14 @@ export function redactContributionPrepText(
 	redacted = redactAwsAccessKeyIds(redacted, state);
 	redacted = replaceRegex(
 		redacted,
-		/(^|[^A-Za-z0-9_])(["']?(?:(?:aws[_-]?)?secret[_-]?access[_-]?key|(?:aws[_-]?)?session[_-]?token)["']?\s*[=:]\s*)(["'])([^"'\r\n]{8,})\3/gi,
+		/(^|[^A-Za-z0-9_-])(["']?(?:(?:aws[_-]?)?secret[_-]?access[_-]?key|(?:aws[_-]?)?session[_-]?token)["']?\s*[=:]\s*)(["'])([^"'\r\n]{8,})\3/gi,
 		"$1$2$3[REDACTED_SECRET]$3",
 		state,
 		"aws_keys",
 	);
 	redacted = replaceRegex(
 		redacted,
-		/(^|[^A-Za-z0-9_])(["']?(?:(?:aws[_-]?)?secret[_-]?access[_-]?key|(?:aws[_-]?)?session[_-]?token)["']?\s*[=:]\s*)[^\s"',;{}[\]()]{8,}/gi,
+		/(^|[^A-Za-z0-9_-])(["']?(?:(?:aws[_-]?)?secret[_-]?access[_-]?key|(?:aws[_-]?)?session[_-]?token)["']?\s*[=:]\s*)[^\s"',;{}[\]()]{8,}/gi,
 		"$1$2[REDACTED_SECRET]",
 		state,
 		"aws_keys",

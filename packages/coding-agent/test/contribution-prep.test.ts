@@ -128,6 +128,26 @@ describe("contribution prep", () => {
 		expect(redacted).not.toContain(SYNTHETIC_AWS_TEMPORARY_KEY_ID.slice(1));
 	});
 
+	it("fails closed at nested JSON depth and size limits", () => {
+		let deeplyNested = JSON.stringify({ SessionToken: SYNTHETIC_AWS_SESSION_TOKEN });
+		for (let depth = 0; depth < 5; depth++) deeplyNested = JSON.stringify({ payload: deeplyNested });
+		const oversized = JSON.stringify({
+			payload: JSON.stringify({
+				padding: "x".repeat(60001),
+				SecretAccessKey: SYNTHETIC_AWS_SECRET_ACCESS_KEY,
+			}),
+		});
+
+		const redactedDeep = redactContributionPrepText(deeplyNested, process.cwd());
+		const redactedOversized = redactContributionPrepText(oversized, process.cwd());
+
+		expect(JSON.parse(redactedDeep)).toBeDefined();
+		expect(JSON.parse(redactedOversized)).toEqual({ payload: "[REDACTED_NESTED_JSON]" });
+		expect(redactedDeep).toContain("[REDACTED_NESTED_JSON]");
+		expect(redactedDeep).not.toContain(SYNTHETIC_AWS_SESSION_TOKEN);
+		expect(redactedOversized).not.toContain(SYNTHETIC_AWS_SECRET_ACCESS_KEY);
+	});
+
 	it("handles AWS credential boundaries, label case, separators, and whitespace", () => {
 		const text = [
 			`long-term (${SYNTHETIC_AWS_ACCESS_KEY_ID})`,
@@ -166,13 +186,17 @@ describe("contribution prep", () => {
 	it("preserves delimiters and existing token redaction behavior around AWS fields", () => {
 		const githubToken = "ghs_abcdefghijklmnopqrstuvwxyz123456";
 		const slackToken = "xoxb-abcdefghijklmnopqrstuvwxyz123456";
-		const benignAssignment = "notSecretAccessKey=SYNTHETIC_PUBLIC_VALUE";
+		const benignAssignments = [
+			"notSecretAccessKey=SYNTHETIC_PUBLIC_VALUE",
+			"not-SecretAccessKey=SYNTHETIC_PUBLIC_VALUE",
+			'"not-SecretAccessKey":"SYNTHETIC_PUBLIC_VALUE"',
+		];
 		const text = [
 			`trace_${SYNTHETIC_AWS_ACCESS_KEY_ID}_suffix`,
 			`invoke(SessionToken=${SYNTHETIC_AWS_SESSION_TOKEN});`,
 			`SecretAccessKey=${githubToken}`,
 			`SessionToken=${slackToken}`,
-			benignAssignment,
+			...benignAssignments,
 		].join("\n");
 
 		const redacted = redactContributionPrepText(text, process.cwd());
@@ -184,7 +208,7 @@ describe("contribution prep", () => {
 		expect(redacted).not.toContain("[REDACTED_SECRET]]");
 		expect(redacted).not.toContain(githubToken);
 		expect(redacted).not.toContain(slackToken);
-		expect(redacted).toContain(benignAssignment);
+		for (const benignAssignment of benignAssignments) expect(redacted).toContain(benignAssignment);
 	});
 
 	it("writes a manifest with redacted file-pointer artifacts", async () => {
