@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import type { ExtensionAPI, ExtensionContext } from "../src/extensibility/extensions";
 import { mapAgentWireEventPayloadToAcpSessionUpdates } from "../src/modes/acp/acp-event-mapper";
 import { toAgentWireEventPayload } from "../src/modes/shared/agent-wire/event-envelope";
+import { createSdkSessionRuntimeExtension } from "../src/sdk/host/session-runtime";
+import type { SdkFrame } from "../src/sdk/host/types";
 import type { AgentSessionEvent } from "../src/session/agent-session";
 
 /**
@@ -65,6 +71,103 @@ function toolEnd(): AgentSessionEvent {
 		result: { output: "hello" },
 		isError: false,
 	} as unknown as AgentSessionEvent;
+}
+
+interface ControlResponse {
+	ok?: boolean;
+	result?: { commandId?: string; turnId?: string };
+}
+
+interface HostHarness {
+	control(operation: string, input: Record<string, unknown>): Promise<ControlResponse>;
+	emit(event: string, payload?: unknown): Promise<void>;
+	clearFrames(): void;
+	readonly sent: Array<{ connectionId: string; frame: SdkFrame }>;
+	readonly broadcasts: SdkFrame[];
+	stop(): Promise<void>;
+}
+
+async function createHostHarness(sessionId: string, cwd: string): Promise<HostHarness> {
+	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
+	const waiters = new Map<string, (frame: ControlResponse) => void>();
+	const sent: Array<{ connectionId: string; frame: SdkFrame }> = [];
+	const broadcasts: SdkFrame[] = [];
+	let receive: ((connectionId: string, frame: SdkFrame) => void) | undefined;
+	let nextId = 0;
+	const api = {
+		on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
+			handlers.set(event, handler);
+		},
+		// Commit prompt preflight so `agent_start` owns the accepted correlation, then
+		// hold the submission open: these tests never end the turn.
+		sendUserMessage: async (
+			_content: unknown,
+			options?: { onPreflightAcceptCommit?: () => void | Promise<void> },
+		) => {
+			await options?.onPreflightAcceptCommit?.();
+			return await new Promise<never>(() => {});
+		},
+	} as unknown as ExtensionAPI;
+	createSdkSessionRuntimeExtension(api, {
+		agentDir: path.join(cwd, ".gjc", "agent"),
+		createTransport: async ({ sessionId: id, stateRoot, token }) => ({
+			sessionId: id,
+			stateRoot,
+			token,
+			onFrame(handler) {
+				receive = handler;
+				return () => {
+					if (receive === handler) receive = undefined;
+				};
+			},
+			sendFrame(connectionId, frame) {
+				sent.push({ connectionId, frame });
+				const response = frame as ControlResponse & { id?: unknown };
+				if (typeof response.id === "string") waiters.get(response.id)?.(response);
+				return "written" as const;
+			},
+			broadcastFrame(frame) {
+				broadcasts.push(frame);
+			},
+			start: async () => ({ url: "ws://127.0.0.1:1" }),
+			stop: async () => {},
+		}),
+	});
+	const ctx = {
+		cwd,
+		workflowGate: undefined,
+		sdkBindings: () => [],
+		isIdle: () => true,
+		abort: () => {},
+		sessionManager: {
+			getSessionId: () => sessionId,
+			getSessionFile: () => path.join(cwd, ".gjc", "state", `${sessionId}.jsonl`),
+			getSessionName: () => undefined,
+			getBranch: () => [],
+		},
+	} as unknown as ExtensionContext;
+	await handlers.get("session_start")?.({}, ctx);
+	return {
+		control: (operation, input) => {
+			const id = `frame-${nextId++}`;
+			const { promise, resolve } = Promise.withResolvers<ControlResponse>();
+			waiters.set(id, resolve);
+			receive?.("client", { type: "control_request", operation, input, id });
+			return promise;
+		},
+		emit: async (event, payload = {}) => {
+			await handlers.get(event)?.(payload, ctx);
+		},
+		clearFrames: () => {
+			sent.length = 0;
+			broadcasts.length = 0;
+		},
+		sent,
+		broadcasts,
+		stop: async () => {
+			await handlers.get("session_shutdown")?.({}, ctx);
+		},
+	};
 }
 
 describe("streamed turn frames", () => {
@@ -139,5 +242,74 @@ describe("streamed turn frames", () => {
 		expect(
 			mapAgentWireEventPayloadToAcpSessionUpdates(streamedFrame(userMessage, CORRELATION).payload, SESSION_ID),
 		).toHaveLength(0);
+	});
+});
+
+describe("SDK host turn streaming", () => {
+	test("sends one message update only to the accepted prompt owner", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-stream-owner-"));
+		const harness = await createHostHarness(SESSION_ID, cwd);
+		try {
+			const accepted = await harness.control("turn.prompt", { text: "stream this" });
+			expect(accepted.ok).toBe(true);
+			await harness.emit("agent_start");
+			harness.clearFrames();
+
+			const event = textDelta("delivered");
+			await harness.emit("message_update", event);
+
+			expect(harness.sent).toEqual([
+				{
+					connectionId: "client",
+					frame: {
+						type: "event",
+						kind: "message_update",
+						payload: { event_type: "message_update", event },
+						commandId: accepted.result?.commandId,
+						turnId: accepted.result?.turnId,
+					},
+				},
+			]);
+			expect(harness.broadcasts.filter(frame => frame.kind === "message_update")).toHaveLength(0);
+		} finally {
+			await harness.stop();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("does not stream an SDK-unowned turn", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-stream-unowned-"));
+		const harness = await createHostHarness(SESSION_ID, cwd);
+		try {
+			await harness.emit("agent_start");
+			harness.clearFrames();
+
+			await harness.emit("message_update", textDelta("private"));
+
+			expect(harness.sent).toHaveLength(0);
+			expect(harness.broadcasts).toHaveLength(0);
+		} finally {
+			await harness.stop();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("ignores malformed legacy tool progress", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-stream-malformed-"));
+		const harness = await createHostHarness(SESSION_ID, cwd);
+		try {
+			const accepted = await harness.control("turn.prompt", { text: "guard progress" });
+			expect(accepted.ok).toBe(true);
+			await harness.emit("agent_start");
+			harness.clearFrames();
+
+			await expect(harness.emit("tool_execution_start")).resolves.toBeUndefined();
+
+			expect(harness.sent).toHaveLength(0);
+			expect(harness.broadcasts).toHaveLength(0);
+		} finally {
+			await harness.stop();
+			await rm(cwd, { recursive: true, force: true });
+		}
 	});
 });

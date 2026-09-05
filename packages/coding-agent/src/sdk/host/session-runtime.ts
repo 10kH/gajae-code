@@ -4801,7 +4801,14 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	 * autonomous continuation, cron, monitor) has no owner connection and streams
 	 * nothing at all, so a session with no attached client pays one map lookup.
 	 */
-	const streamTurnEvent = (event: AgentSessionEvent, ctx: ExtensionContext): void => {
+	const STREAMED_TURN_EVENT_TYPES: ReadonlySet<string> = new Set([
+		"message_update",
+		"message_end",
+		"tool_execution_start",
+		"tool_execution_update",
+		"tool_execution_end",
+	]);
+	const streamTurnEvent = (event: { type?: unknown }, ctx: ExtensionContext): void => {
 		const current = lifecycleStateForContext(ctx, "agent_start");
 		const activeInvocation = current?.activeInvocation;
 		if (!current || !activeInvocation) return;
@@ -4813,35 +4820,42 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			),
 		);
 		if (!batch) return;
-		const payload = toAgentWireEventPayload(event);
-		// One frame per owning invocation, each carrying its own correlation, so a
-		// shared run lets every submitter attribute the content to its own prompt.
-		for (const invocation of batch.invocations) {
-			if (invocation.connectionId === undefined) continue;
-			current.runtime.sendFrameTo([invocation.connectionId], {
-				type: "event",
-				kind: event.type,
-				payload,
-				...invocation.correlation,
-			});
+		// The handlers below also renew prompt deadlines, so streaming must never
+		// throw out of them: a frame the wire producer does not recognize is dropped.
+		if (typeof event.type !== "string" || !STREAMED_TURN_EVENT_TYPES.has(event.type)) return;
+		try {
+			const payload = toAgentWireEventPayload(event as AgentSessionEvent);
+			// One frame per owning invocation, each carrying its own correlation, so a
+			// shared run lets every submitter attribute the content to its own prompt.
+			for (const invocation of batch.invocations) {
+				if (invocation.connectionId === undefined) continue;
+				current.runtime.sendFrameTo([invocation.connectionId], {
+					type: "event",
+					kind: event.type,
+					payload,
+					...invocation.correlation,
+				});
+			}
+		} catch {
+			// Streamed content is best-effort; the turn producing it is authoritative.
 		}
 	};
 	api.on("tool_execution_start", async (event, ctx) => {
 		renewAttributableProgress("tool_execution_start", ctx);
-		streamTurnEvent(event as unknown as AgentSessionEvent, ctx);
+		streamTurnEvent(event, ctx);
 	});
 	api.on("tool_execution_update", async (event, ctx) => {
-		streamTurnEvent(event as unknown as AgentSessionEvent, ctx);
+		streamTurnEvent(event, ctx);
 	});
 	api.on("tool_execution_end", async (event, ctx) => {
 		renewAttributableProgress("tool_execution_end", ctx);
-		streamTurnEvent(event as unknown as AgentSessionEvent, ctx);
+		streamTurnEvent(event, ctx);
 	});
 	api.on("message_update", async (event, ctx) => {
-		streamTurnEvent(event as unknown as AgentSessionEvent, ctx);
+		streamTurnEvent(event, ctx);
 	});
 	api.on("message_end", async (event, ctx) => {
-		streamTurnEvent(event as unknown as AgentSessionEvent, ctx);
+		streamTurnEvent(event, ctx);
 	});
 	const errorCode = (error: unknown): string | undefined =>
 		typeof error === "object" &&
