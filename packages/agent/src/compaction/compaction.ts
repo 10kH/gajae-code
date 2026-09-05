@@ -882,6 +882,8 @@ export interface SummaryOptions {
 	 * `providerSessionId ?? sessionId` the agent loop sends for normal turns).
 	 */
 	sessionId?: string;
+	/** Opaque provider conversation identity; never derived from compaction content. */
+	providerSessionId?: string;
 	/** Shared provider state map so maintenance calls reuse session-scoped transport/session caches. */
 	providerSessionState?: Map<string, ProviderSessionState>;
 	/** Hint that websocket transport should be preferred when supported by the provider implementation. */
@@ -1025,6 +1027,7 @@ export async function generateSummary(
 			initiatorOverride: options?.initiatorOverride,
 			metadata: options?.metadata,
 			sessionId: options?.sessionId,
+			providerSessionId: options?.providerSessionId,
 			providerSessionState: options?.providerSessionState,
 			preferWebsockets: options?.preferWebsockets,
 		},
@@ -1073,6 +1076,8 @@ export interface HandoffOptions {
 	 * reuses the live turn's provider/WebSocket session.
 	 */
 	sessionId?: string;
+	/** Opaque provider conversation identity; never derived from handoff content. */
+	providerSessionId?: string;
 	/** Shared provider state map so the handoff call reuses session-scoped transport/session caches. */
 	providerSessionState?: Map<string, ProviderSessionState>;
 	/** Hint that websocket transport should be preferred when supported by the provider implementation. */
@@ -1120,6 +1125,7 @@ export async function generateHandoff(
 			initiatorOverride: options.initiatorOverride,
 			metadata: options.metadata,
 			sessionId: options.sessionId,
+			providerSessionId: options.providerSessionId,
 			providerSessionState: options.providerSessionState,
 			preferWebsockets: options.preferWebsockets,
 		},
@@ -1378,6 +1384,7 @@ export async function compact(
 		convertToLlm: options?.convertToLlm,
 		telemetry: options?.telemetry,
 		sessionId: options?.sessionId,
+		providerSessionId: options?.providerSessionId,
 		providerSessionState: options?.providerSessionState,
 		preferWebsockets: options?.preferWebsockets,
 		remoteCompactionFallbackHealth: options?.remoteCompactionFallbackHealth,
@@ -1552,6 +1559,7 @@ async function generateTurnPrefixSummary(
 			initiatorOverride: options?.initiatorOverride,
 			metadata: options?.metadata,
 			sessionId: options?.sessionId,
+			providerSessionId: options?.providerSessionId,
 			providerSessionState: options?.providerSessionState,
 			preferWebsockets: options?.preferWebsockets,
 		},

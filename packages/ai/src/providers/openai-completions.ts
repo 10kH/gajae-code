@@ -100,6 +100,11 @@ import {
 	wrapFetchForOpenAIRequestTransform,
 } from "./openai-request-transform";
 import { createInitialResponsesAssistantMessage } from "./openai-responses-shared";
+import {
+	applyOpenCodeGoSessionHeader,
+	resolveOpenCodeGoSessionId,
+	wrapFetchForOpenCodeGoSession,
+} from "./opencode-go-session";
 import { transformMessages } from "./transform-messages";
 import { joinTextWithImagePlaceholder, NON_VISION_IMAGE_PLACEHOLDER } from "./vision-guard";
 
@@ -602,6 +607,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				options?.authCredentialType,
 				options?.requestMaxRetries,
 				options?.sessionId,
+				options?.providerSessionId,
 				options?.maxRetryDelayMs,
 				options?.attemptScope,
 			);
@@ -1259,6 +1265,7 @@ async function createClient(
 	authCredentialType?: OpenAICompletionsOptions["authCredentialType"],
 	requestMaxRetries?: number,
 	sessionId?: string,
+	providerSessionId?: string,
 	maxRetryDelayMs?: number,
 	attemptScope?: import("../types.js").AttemptScopeRef,
 ): Promise<{
@@ -1356,6 +1363,11 @@ async function createClient(
 	const endpointRequestQuery = endpointQuery;
 	const requestQuery =
 		[endpointRequestQuery, azureQuery].filter((query): query is string => query !== undefined).join("&") || undefined;
+	const openCodeGoSessionId = resolveOpenCodeGoSessionId(model, baseUrl, providerSessionId, "openai");
+	// Reserve the provider-specific header on every OpenAI-compatible route. Caller,
+	// model, and transform values are removed unless the exact OpenCode Go endpoint
+	// has an opaque identity owned by the agent's conversation lifecycle.
+	headers = applyOpenCodeGoSessionHeader(headers, openCodeGoSessionId);
 	let capturedErrorResponse: CapturedHttpErrorResponse | undefined;
 	const baseFetch = fetchOverride ?? fetch;
 	const wrappedFetch = Object.assign(
@@ -1389,8 +1401,9 @@ async function createClient(
 		baseFetch.preconnect ? { preconnect: baseFetch.preconnect } : {},
 	);
 	const boundedFetch = wrapOpenAIFetchForBoundedRateLimits(wrappedFetch, maxRetryDelayMs);
+	const providerScopedFetch = wrapFetchForOpenCodeGoSession(boundedFetch, openCodeGoSessionId);
 	const transformedFetch = wrapFetchForOpenAIRequestTransform(
-		boundedFetch,
+		providerScopedFetch,
 		model.requestTransform,
 		`Gajae-Code/${packageJson.version}`,
 	);

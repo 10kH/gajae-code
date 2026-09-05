@@ -93,6 +93,11 @@ import {
 	processResponsesStream,
 	repairOrphanResponsesToolOutputs,
 } from "./openai-responses-shared";
+import {
+	applyOpenCodeGoSessionHeader,
+	resolveOpenCodeGoSessionId,
+	wrapFetchForOpenCodeGoSession,
+} from "./opencode-go-session";
 import { transformMessages } from "./transform-messages";
 
 /**
@@ -378,6 +383,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 				options?.headers,
 				options?.initiatorOverride,
 				cacheSessionId,
+				options?.providerSessionId,
 				cacheRetention,
 				options?.onSseEvent,
 				options?.fetch,
@@ -556,6 +562,7 @@ function createClient(
 	extraHeaders?: Record<string, string>,
 	initiatorOverride?: MessageAttribution,
 	sessionId?: string,
+	providerSessionId?: string,
 	cacheRetention?: CacheRetention,
 	onSseEvent?: OpenAIResponsesOptions["onSseEvent"],
 	fetchOverride?: FetchImpl,
@@ -618,6 +625,8 @@ function createClient(
 	}
 	headers = applyOpenAIRequestTransformHeaders(headers, model.requestTransform, `Gajae-Code/${packageJson.version}`);
 	const { baseUrl: clientBaseUrl, query: endpointQuery } = splitBaseUrlQuery(baseUrl);
+	const openCodeGoSessionId = resolveOpenCodeGoSessionId(model, baseUrl, providerSessionId, "openai");
+	headers = applyOpenCodeGoSessionHeader(headers, openCodeGoSessionId);
 	const baseFetch = fetchOverride ?? fetch;
 	const queryFetch = Object.assign(
 		async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
@@ -626,8 +635,9 @@ function createClient(
 		baseFetch.preconnect ? { preconnect: baseFetch.preconnect } : {},
 	);
 	const boundedFetch = wrapOpenAIFetchForBoundedRateLimits(queryFetch, maxRetryDelayMs);
+	const providerScopedFetch = wrapFetchForOpenCodeGoSession(boundedFetch, openCodeGoSessionId);
 	const transformedFetch = wrapFetchForOpenAIRequestTransform(
-		boundedFetch,
+		providerScopedFetch,
 		model.requestTransform,
 		`Gajae-Code/${packageJson.version}`,
 	);

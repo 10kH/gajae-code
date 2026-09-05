@@ -469,6 +469,11 @@ function buildStreamOptions(parsed: ParsedFormatRequest, api: Api, signal: Abort
 	return opts;
 }
 
+/** Test seam for verifying translated gateway requests never acquire agent-owned provider identity. */
+export function buildAuthGatewayStreamOptionsForTest(parsed: ParsedFormatRequest, api: Api): SimpleStreamOptions {
+	return buildStreamOptions(parsed, api, new AbortController().signal);
+}
+
 /**
  * Classify an upstream / gateway-internal error into a status code and a
  * provider-style error type tag. Used by `handleFormatEndpoint` /
