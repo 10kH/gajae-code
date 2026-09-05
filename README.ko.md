@@ -22,6 +22,12 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/devswha/gajae-code-app"><kbd><strong>🖥️ Gajae-Code App 살펴보기 → 데스크톱·셀프 호스팅 웹 GUI</strong></kbd></a>
+  <br/>
+  <sub>커뮤니티가 만드는 실험적 서드파티 프로젝트이며, Gajae-Code의 공식 퍼스트파티 앱이 아닙니다.</sub>
+</p>
+
+<p align="center">
   <a href="#빠른-시작">빠른 시작</a> ·
   <a href="#왜-gajae-code인가">왜</a> ·
   <a href="#쓰던-코딩-플랜-그대로">코딩 플랜</a> ·

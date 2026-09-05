@@ -22,6 +22,12 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/devswha/gajae-code-app"><kbd><strong>🖥️ 探索 Gajae-Code App → 桌面端与自托管 Web GUI</strong></kbd></a>
+  <br/>
+  <sub>这是由社区构建的实验性第三方项目，并非 Gajae-Code 官方第一方应用。</sub>
+</p>
+
+<p align="center">
   <a href="#快速开始">快速开始</a> ·
   <a href="#为什么选-gajae-code">为什么</a> ·
   <a href="#带上你的编程订阅">编程订阅</a> ·
