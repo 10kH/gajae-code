@@ -601,6 +601,7 @@ async function prepareVerifiedStdioLaunch(input: {
 			throw new Error("Plugin MCP Node interpreter drifted from startup authority");
 		}
 		await fs.writeFile(launcherPath, launcherBytes, { flag: "wx", mode: 0o500 });
+		await assertCapturedNodeRuntime(launcherPath);
 
 		for (const file of input.files) {
 			const sourcePath = resolveWithinRoot(input.pluginRoot, file.relativePath);
@@ -647,11 +648,42 @@ async function prepareVerifiedStdioLaunch(input: {
 	}
 }
 
-async function hashFile(snapshot: FileSnapshot): Promise<string> {
+async function assertCapturedNodeRuntime(launcherPath: string): Promise<void> {
+	const child = Bun.spawn(
+		[
+			launcherPath,
+			"--input-type=module",
+			"--eval",
+			'if (process.versions.bun || process.release?.name !== "node") process.exit(42); process.stdout.write("gjc-node-authority\\n");',
+		],
+		{
+			stdin: "ignore",
+			stdout: "pipe",
+			stderr: "pipe",
+			env: { PATH: "", HOME: "", TMPDIR: path.dirname(launcherPath) },
+		},
+	);
+	const outcome = await Promise.race([
+		Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]),
+		Bun.sleep(2_000).then(() => null),
+	]);
+	if (!outcome) {
+		child.kill();
+		await child.exited.catch(() => {});
+		throw new Error("Plugin MCP Node interpreter identity check timed out");
+	}
+	const [exitCode, stdout] = outcome;
+	if (exitCode !== 0 || stdout !== "gjc-node-authority\n") {
+		throw new Error("Plugin MCP interpreter is not an authenticated Node runtime");
+	}
+}
+
+async function hashFile(snapshot: FileSnapshot, expectedBytes: number): Promise<string> {
 	const key = `${snapshot.path}:${snapshot.mtimeMs}:${snapshot.ctimeMs}:${snapshot.size}:${snapshot.ino}`;
 	const cached = hashCache.get(key);
 	if (cached) return cached;
-	const digest = sha256(await fs.readFile(snapshot.path));
+	if (snapshot.size !== expectedBytes) throw new Error(`Installed file byte drift: ${snapshot.path}`);
+	const digest = sha256(await readStableFile(snapshot.path, "Installed plugin file", expectedBytes));
 	if (hashCache.size >= HASH_CACHE_MAX_ENTRIES) {
 		// FIFO eviction is sufficient: the memo only avoids re-reads within a
 		// session; correctness never depends on a hit.
@@ -686,7 +718,19 @@ async function verifyEntryHashesCached(entry: GjcPluginRegistryEntry): Promise<S
 				message: `Installed file missing: ${file.relativePath}`,
 			};
 		}
-		if ((await hashFile(snapshot)) !== file.sha256) {
+		let digest: string;
+		try {
+			digest = await hashFile(snapshot, file.bytes);
+		} catch (error) {
+			return {
+				identity: bundleIdentity(entry.scope, entry.name),
+				plugin: entry.name,
+				surfaceId: `plugin:${entry.name}`,
+				code: "runtime_mismatch",
+				message: error instanceof Error ? error.message : String(error),
+			};
+		}
+		if (digest !== file.sha256) {
 			return {
 				identity: bundleIdentity(entry.scope, entry.name),
 				plugin: entry.name,
