@@ -145,9 +145,7 @@ test("broker session.list rejects a new cursor stream at capacity without evicti
 
 		// Exact inspection is not a paginated list. Even with all 32 cursor slots
 		// occupied it returns the one requested row without allocating a cursor.
-		expect(
-			await broker.handleRequest("session.list", { resolveSessionId: "session-2" }),
-		).toMatchObject({
+		expect(await broker.handleRequest("session.list", { resolveSessionId: "session-2" })).toMatchObject({
 			ok: true,
 			result: { sessions: [{ sessionId: "session-2" }] },
 		});
