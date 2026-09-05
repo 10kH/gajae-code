@@ -445,21 +445,24 @@ async function resolveTrustedStdioLauncher(
 		if (!candidate || !path.isAbsolute(candidate)) continue;
 		try {
 			const lexicalCandidate = path.join(pathEntry, path.basename(candidate));
-			if (
-				!untrustedRoots.some(root => isWithin(root, lexicalCandidate)) &&
-				((await isRootControlledLauncherPath(lexicalCandidate)) ||
-					(await isInitialManagedNodeLauncherPath(lexicalCandidate)) ||
-					(await isUserManagedNodeLauncherPath(lexicalCandidate)))
-			) {
-				return lexicalCandidate;
+			if (!untrustedRoots.some(root => isWithin(root, lexicalCandidate))) {
+				const realCandidate = await fs.realpath(lexicalCandidate);
+				if (
+					!untrustedRoots.some(root => isWithin(root, realCandidate)) &&
+					((await isRootControlledLauncherPath(lexicalCandidate)) ||
+						(await isInitialManagedNodeLauncherPath(lexicalCandidate, untrustedRoots)) ||
+						(await isUserManagedNodeLauncherPath(lexicalCandidate)))
+				) {
+					return realCandidate;
+				}
 			}
 			const lexical = path.resolve(candidate);
 			if (untrustedRoots.some(root => isWithin(root, lexical))) continue;
-			if (await isRootControlledLauncherPath(lexical)) return lexical;
-			if (await isInitialManagedNodeLauncherPath(lexical)) return lexical;
-			if (await isUserManagedNodeLauncherPath(lexical)) return lexical;
 			const real = await fs.realpath(lexical);
 			if (untrustedRoots.some(root => isWithin(root, real))) continue;
+			if (await isRootControlledLauncherPath(lexical)) return real;
+			if (await isInitialManagedNodeLauncherPath(lexical, untrustedRoots)) return real;
+			if (await isUserManagedNodeLauncherPath(lexical)) return real;
 			if (await isHostOwnedNodeExecutable(real)) return real;
 		} catch {
 			// A stale PATH entry is not launcher authority; try the next one.
@@ -468,9 +471,16 @@ async function resolveTrustedStdioLauncher(
 	throw new Error(`Trusted stdio launcher is unavailable from absolute host PATH entries: ${launcher}`);
 }
 
-async function isInitialManagedNodeLauncherPath(executablePath: string): Promise<boolean> {
+async function isInitialManagedNodeLauncherPath(
+	executablePath: string,
+	untrustedRoots: readonly string[],
+): Promise<boolean> {
 	if (process.platform !== "linux") return false;
 	const real = await fs.realpath(executablePath);
+	if (untrustedRoots.some(root => isWithin(root, real))) return false;
+	for (const tempRoot of [os.tmpdir(), "/tmp", "/var/tmp"]) {
+		if (isWithin(path.resolve(tempRoot), real)) return false;
+	}
 	const expected = (await initialNodeAuthorities).get(real);
 	if (!expected) return false;
 	const bytes = await readStableFile(real, "Initial Node executable", MCP_LAUNCHER_MAX_BYTES, true);
