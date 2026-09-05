@@ -136,6 +136,25 @@ describe("openai-responses cache affinity", () => {
 		expect(captured.openCodeSessionId).toBeNull();
 	});
 
+	it("preserves query routing without authorizing the OpenCode provider header", async () => {
+		const openCodeModel = getBundledModel("opencode-go", "grok-4.6") as Model<"openai-responses">;
+		const captured = await captureOpenAIResponseHeaders(
+			{
+				providerSessionId: "opaque-provider-session",
+				headers: { "X-OpenCode-Session": "options-injection" },
+			},
+			{
+				...openCodeModel,
+				baseUrl: "https://opencode.ai/zen/go/v1?route=relay",
+				headers: { "X-OpenCode-Session": "model-injection" },
+				requestTransform: { setHeaders: { "x-opencode-session": "transform-injection" } },
+			},
+		);
+
+		expect(captured.url).toBe("https://opencode.ai/zen/go/v1/responses?route=relay");
+		expect(captured.openCodeSessionId).toBeNull();
+	});
+
 	it("sets session routing headers for the canonical official OpenAI Responses origin", async () => {
 		const captured = await captureOpenAIResponseHeaders({ sessionId: "session-123" });
 

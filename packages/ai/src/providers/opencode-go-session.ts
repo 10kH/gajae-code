@@ -20,7 +20,7 @@ export function resolveOpenCodeGoSessionId(
 	try {
 		const url = new URL(baseUrl);
 		if (url.origin !== OPENCODE_GO_ORIGIN) return undefined;
-		if (url.username !== "" || url.password !== "" || url.hash !== "") return undefined;
+		if (url.username !== "" || url.password !== "" || url.search !== "" || url.hash !== "") return undefined;
 		if (url.pathname.replace(/\/+$/u, "") !== expectedBasePath(apiFamily)) return undefined;
 		return providerSessionId;
 	} catch {

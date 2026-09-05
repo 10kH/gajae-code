@@ -625,7 +625,7 @@ function createClient(
 	}
 	headers = applyOpenAIRequestTransformHeaders(headers, model.requestTransform, `Gajae-Code/${packageJson.version}`);
 	const { baseUrl: clientBaseUrl, query: endpointQuery } = splitBaseUrlQuery(baseUrl);
-	const openCodeGoSessionId = resolveOpenCodeGoSessionId(model, clientBaseUrl, providerSessionId, "openai");
+	const openCodeGoSessionId = resolveOpenCodeGoSessionId(model, baseUrl, providerSessionId, "openai");
 	headers = applyOpenCodeGoSessionHeader(headers, openCodeGoSessionId);
 	const baseFetch = fetchOverride ?? fetch;
 	const queryFetch = Object.assign(

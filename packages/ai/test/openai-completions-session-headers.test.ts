@@ -320,7 +320,9 @@ describe("session headers on the wire (streamOpenAICompletions)", () => {
 		mislabeledRelay.baseUrl = "https://api.relay.example.com/v1";
 		const sameOriginSuffix = openCodeGoModel();
 		sameOriginSuffix.baseUrl = "https://opencode.ai/zen/go/v1/relay";
-		for (const model of [zen, relay, mislabeledRelay, sameOriginSuffix]) {
+		const queryRouted = openCodeGoModel();
+		queryRouted.baseUrl = "https://opencode.ai/zen/go/v1?route=relay";
+		for (const model of [zen, relay, mislabeledRelay, sameOriginSuffix, queryRouted]) {
 			model.headers = { "X-OpenCode-Session": "model-injection" };
 			model.requestTransform = { setHeaders: { "x-opencode-session": "transform-injection" } };
 		}
@@ -349,9 +351,16 @@ describe("session headers on the wire (streamOpenAICompletions)", () => {
 			headers: { "X-OPENCODE-SESSION": "options-injection" },
 			fetch,
 		}).result();
+		await streamOpenAICompletions(queryRouted, baseContext(), {
+			apiKey: "test-key",
+			providerSessionId: "01990dc9-e005-7000-8000-000000000012",
+			headers: { "X-OPENCODE-SESSION": "options-injection" },
+			fetch,
+		}).result();
 
-		expect(captured).toHaveLength(4);
+		expect(captured).toHaveLength(5);
 		expect(captured.every(request => request.headers["x-opencode-session"] === undefined)).toBe(true);
+		expect(captured[4].url).toContain("route=relay");
 	});
 
 	it("does not treat a generic cache session ID as OpenCode Go conversation authority", async () => {

@@ -1363,7 +1363,7 @@ async function createClient(
 	const endpointRequestQuery = endpointQuery;
 	const requestQuery =
 		[endpointRequestQuery, azureQuery].filter((query): query is string => query !== undefined).join("&") || undefined;
-	const openCodeGoSessionId = resolveOpenCodeGoSessionId(model, clientBaseUrl, providerSessionId, "openai");
+	const openCodeGoSessionId = resolveOpenCodeGoSessionId(model, baseUrl, providerSessionId, "openai");
 	// Reserve the provider-specific header on every OpenAI-compatible route. Caller,
 	// model, and transform values are removed unless the exact OpenCode Go endpoint
 	// has an opaque identity owned by the agent's conversation lifecycle.

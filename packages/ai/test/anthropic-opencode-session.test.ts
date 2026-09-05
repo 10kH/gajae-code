@@ -70,4 +70,19 @@ describe("Anthropic-compatible OpenCode Go session header", () => {
 		expect(captured.headers.get("x-opencode-session")).toBeNull();
 		expect(new Headers(captured.defaultHeaders).get("x-opencode-session")).toBeNull();
 	});
+
+	it.each([
+		"https://opencode.ai/zen/go/relay",
+		"https://opencode.ai/zen/go?route=relay",
+	])("strips the reserved header from noncanonical same-origin base %s", async baseUrl => {
+		const model = openCodeModel();
+		model.baseUrl = baseUrl;
+		model.headers = { "X-OpenCode-Session": "model-injection" };
+		const captured = await captureWire(model, "opaque-provider-session", {
+			"X-OpenCode-Session": "options-injection",
+		});
+
+		expect(captured.headers.get("x-opencode-session")).toBeNull();
+		expect(new Headers(captured.defaultHeaders).get("x-opencode-session")).toBeNull();
+	});
 });
