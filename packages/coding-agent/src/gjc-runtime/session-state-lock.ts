@@ -162,8 +162,8 @@ async function joinLocalTransitionQueue(
 	if (!queue) return undefined;
 	const ready = Promise.withResolvers<void>();
 	const queuedAt = performance.now();
-	queue.waiters.push(ready.resolve);
 	SessionStateLockTestHooks.afterLocalTransitionQueued?.(transitionDir);
+	queue.waiters.push(ready.resolve);
 	await ready.promise;
 	if (retryBudget) retryBudget.startedAt += Math.max(0, performance.now() - queuedAt);
 	return queue;
