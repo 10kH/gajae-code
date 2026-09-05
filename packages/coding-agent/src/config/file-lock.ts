@@ -408,6 +408,28 @@ export interface FileLockOwnerToken {
  * another process may copy into a new lock generation.
  */
 const fileLockDirIdentities = new WeakMap<object, GenericFileLockDirIdentity>();
+const pendingDetachedLockCleanups = new WeakMap<object, { path: string; rootDev: string; rootIno: string }>();
+
+async function finishDetachedLockCleanup(owner: FileLockOwnerToken): Promise<boolean> {
+	const pending = pendingDetachedLockCleanups.get(owner);
+	if (!pending) return false;
+	try {
+		const current = await fs.lstat(pending.path, { bigint: true });
+		if (
+			!current.isDirectory() ||
+			current.isSymbolicLink() ||
+			current.dev.toString() !== pending.rootDev ||
+			current.ino.toString() !== pending.rootIno
+		) {
+			throw new Error("Detached file lock cleanup identity changed; refusing removal");
+		}
+		await fs.rm(pending.path, { recursive: true, force: true });
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+	}
+	pendingDetachedLockCleanups.delete(owner);
+	return true;
+}
 
 function getLockPath(filePath: string): string {
 	return `${filePath}.lock`;
@@ -796,17 +818,12 @@ export async function removeFileLockDirForGc(
 		removed.retainedPlaceholderPath === undefined &&
 		removed.retainedUnknownPath === undefined;
 	if (verifiedDetach && detachedPath !== undefined) {
-		// The security-critical phase is done: the verified tree was detached from
-		// the canonical name and durably parked under the no-replace quarantine
-		// name with no successor retained. Finish that replay deterministically by
-		// deleting the retained quarantine — the same completion contract gc-runtime
-		// applies to its own exact removals — then report the release as done.
-		try {
-			await fs.rm(detachedPath, { recursive: true, force: true });
-		} catch {
-			// The canonical pathname is free either way; a retained quarantine is
-			// recoverable debris, not a live lock.
-		}
+		pendingDetachedLockCleanups.set(expected, {
+			path: detachedPath,
+			rootDev: captured.snapshot.rootDev,
+			rootIno: captured.snapshot.rootIno,
+		});
+		await finishDetachedLockCleanup(expected);
 		return "removed";
 	}
 	if (removed.code === "not_found") return "removed";
@@ -1157,7 +1174,12 @@ async function quarantineReleasedLock(
 			return false;
 		} catch (error) {
 			if (isEnoent(error)) {
-				nativeFileLockBindings().exactRemoveDirectoryTree(removed.detachedPath, captured.snapshot);
+				pendingDetachedLockCleanups.set(owner, {
+					path: removed.detachedPath,
+					rootDev: captured.snapshot.rootDev,
+					rootIno: captured.snapshot.rootIno,
+				});
+				await finishDetachedLockCleanup(owner);
 				return true;
 			}
 			throw error;
@@ -1167,6 +1189,7 @@ async function quarantineReleasedLock(
 }
 
 async function releaseOwnedLock(lockPath: string, owner: FileLockOwnerToken): Promise<void> {
+	if (await finishDetachedLockCleanup(owner)) return;
 	let preVerdictIdentity: GenericFileLockDirIdentity | undefined;
 	try {
 		preVerdictIdentity = (await captureFileLockDirIdentity(lockPath)) ?? undefined;
@@ -1177,6 +1200,7 @@ async function releaseOwnedLock(lockPath: string, owner: FileLockOwnerToken): Pr
 	let lastTransientError: unknown;
 	for (let attempt = 0; attempt < FILE_LOCK_RELEASE_RETRY_ATTEMPTS; attempt++) {
 		try {
+			if (await finishDetachedLockCleanup(owner)) return;
 			const outcome = await removeFileLockDirForGc(lockPath, owner, preVerdictIdentity);
 			if (outcome === "removed" || outcome === "missing") {
 				if (outcome === "missing") throw new Error("Failed to release file lock: missing.");
@@ -1266,6 +1290,9 @@ async function releaseLock(lockPath: string, owner: FileLockOwnerToken, knownKey
  */
 async function lockHolderDescription(lockPath: string): Promise<string> {
 	try {
+		if (process.platform === "linux" && (await fileLockRemovalTransitionExists(lockPath))) {
+			return "blocked by retained removal transition; retry the owning process cleanup or inspect the exact orphan manually; unproven transition ownership is never removed";
+		}
 		const info = await readLockInfo(lockPath);
 		if (info) {
 			// A lock record carrying a foreign owner_host_id belongs to another
@@ -1322,6 +1349,11 @@ async function acquireLock(filePath: string, options: FileLockOptions = {}): Pro
 	for (let attempt = 0; attempt < opts.retries; attempt++) {
 		if (opts.signal?.aborted) throw opts.signal.reason ?? new Error("File lock acquisition aborted");
 		const localKey = await localLockKey(lockPath);
+		const priorRelease = localLockStates.get(localKey);
+		if (priorRelease && priorRelease.status !== "held" && pendingDetachedLockCleanups.has(priorRelease.owner)) {
+			await retryPendingLocalRelease(lockPath, localKey);
+			continue;
+		}
 		const owner = await tryAcquireLock(lockPath, opts.ownerHostId, ownerToken, opts.onAcquired);
 		if (owner) {
 			localLockStates.set(localKey, { owner, status: "held" });

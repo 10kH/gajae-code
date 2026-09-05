@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test, vi } from "bun:test";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -13,6 +13,7 @@ import {
 import { fileLocksGcAdapter } from "@gajae-code/coding-agent/config/file-lock-gc";
 import type { GcContext, GcPidProbe, GcRecord } from "@gajae-code/coding-agent/gjc-runtime/gc-runtime";
 import {
+	exactRemoveDirectoryTree,
 	renameDirectoryNoReplacePathAsync,
 	renameNoReplacePathAsync,
 	snapshotDirectoryTree,
@@ -857,8 +858,7 @@ describe("file lock cleanup failure handling (#2478)", () => {
 		FileLockTestHooks.nativeQuarantineBindings = () => ({
 			snapshotDirectoryTree,
 			exactRemoveDirectoryTree: target => {
-				rmSync(target, { recursive: true, force: true });
-				mkdirSync(`${target}.removing`);
+				renameSync(target, `${target}.removing`);
 				return {
 					ok: false,
 					code: "detached_failure",
@@ -980,22 +980,38 @@ describe("file lock cleanup failure handling (#2478)", () => {
 		expect(await fs.exists(lockDir)).toBe(true);
 	});
 
-	test("releases through a verified detach even when quarantine cleanup fails", async () => {
+	test("retains verified detached cleanup failure until the owning process retries", async () => {
 		const base = await makeTemp();
 		const lockedFile = path.join(base, "state.json");
 		const lockDir = `${lockedFile}.lock`;
-		const releaseError = Object.assign(new Error("lock removal denied"), { code: "EIO" });
-		let completed = false;
-
-		// The first rm is the quarantine completion after a verified native detach:
-		// the canonical lock name is already free, so a cleanup failure there is
-		// recoverable debris and must not fail the release (or re-leak the lock).
-		vi.spyOn(fs, "rm").mockRejectedValueOnce(releaseError);
-
-		await withFileLock(lockedFile, async () => {
-			completed = true;
+		const releaseError = Object.assign(new Error("detached lock removal denied"), { code: "EIO" });
+		const realRm = fs.rm;
+		let detachedPath: string | undefined;
+		let failCleanup = true;
+		FileLockTestHooks.nativeQuarantineBindings = () => ({
+			snapshotDirectoryTree,
+			exactRemoveDirectoryTree: (target, expected) => {
+				const result = exactRemoveDirectoryTree(target, expected);
+				if (result.detachedPath) detachedPath = result.detachedPath;
+				return result;
+			},
 		});
-		expect(completed).toBe(true);
+		vi.spyOn(fs, "rm").mockImplementation((async (target, options) => {
+			if (failCleanup && detachedPath && String(target) === detachedPath) throw releaseError;
+			return realRm(target, options);
+		}) as typeof fs.rm);
+		await expect(withFileLock(lockedFile, async () => {})).rejects.toBe(releaseError);
+		expect(detachedPath).toBeDefined();
+		expect(await fs.exists(lockDir)).toBe(false);
+		if (!detachedPath) throw new Error("Expected an owned detached transition");
+		expect(await fs.exists(detachedPath)).toBe(true);
+		failCleanup = false;
+		let entered = false;
+		await withFileLock(lockedFile, async () => {
+			entered = true;
+		});
+		expect(entered).toBe(true);
+		expect(await fs.exists(detachedPath)).toBe(false);
 		expect(await fs.exists(lockDir)).toBe(false);
 	});
 
