@@ -3,6 +3,7 @@
 ## [Unreleased]
 ### Added
 
+- Added selectable `astra-lite`, `astra-default`, and `astra-heavy` CODEX presets with `ASTRA-` labels, plus `astra-fable` and `astra-fable-opus` cross-family review combinations. Existing presets and automatic provider recommendations remain unchanged.
 - Status-line settings now include a draft-local spatial custom editor with exact-slot keyboard reordering, hidden-segment palette management, command text configuration, persisted Confirm/Exit semantics, live multi-row preview compatibility, narrow/Unicode rendering, and deterministic visual evidence.
 
 ### Fixed
