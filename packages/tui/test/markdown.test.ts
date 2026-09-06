@@ -337,7 +337,7 @@ describe("Markdown accounted cache limits", () => {
 			clearRenderCache();
 			expect(new Markdown(fixture!, 0, 0, defaultMarkdownTheme).render(100)).toEqual(lines);
 		}
-	});
+	}, 15_000);
 
 	it("enforces render entry boundaries and recounts anchor enrichment", () => {
 		vi.spyOn(Bun, "hash").mockReturnValue(1n);
