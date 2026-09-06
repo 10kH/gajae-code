@@ -158,7 +158,13 @@ export function __setMarkdownNowForTest(now: (() => number) | undefined): void {
 // prefix on every chunk. Bounded LRU; cleared on theme change via clearRenderCache().
 const HIGHLIGHT_CACHE_MAX = 512;
 const HIGHLIGHT_ENTRY_SIZE = 512 * 1024;
-const highlightCache = new LRUCache<string, string[]>({
+interface MarkdownHighlightCacheEntry {
+	lang: string;
+	code: string;
+	lines: string[];
+}
+
+const highlightCache = new LRUCache<string, MarkdownHighlightCacheEntry>({
 	max: HIGHLIGHT_CACHE_MAX,
 	maxSize: 4 * 1024 * 1024,
 	maxEntrySize: HIGHLIGHT_ENTRY_SIZE,
@@ -464,10 +470,10 @@ export class Markdown implements Component {
 		if (this.#exceedsHighlightCap(code)) return null;
 		const key = `${objectId(this.#theme)}\x00${lang}\x00${code}`;
 		const cached = highlightCache.get(key);
-		if (cached) return cached;
+		if (cached?.lang === lang && cached.code === code) return cached.lines;
 		highlightCallCount += 1;
 		const result = this.#theme.highlightCode(code, lang || undefined);
-		highlightCache.set(key, result);
+		highlightCache.set(key, { lang, code, lines: result });
 		return result;
 	}
 

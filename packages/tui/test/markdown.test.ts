@@ -393,13 +393,15 @@ describe("Markdown accounted cache limits", () => {
 		const source = "```txt\nx\n```";
 		new Markdown(source, 0, 0, theme).render(80);
 		const key = `${themeIdentity(theme)}\x00txt\x00x`;
-		const overhead = 64 + key.length * 2 + accountedPayload([""]);
+		const overhead = 64 + key.length * 2 + accountedPayload({ lang: "txt", code: "x", lines: [""] });
 		expect(getMarkdownCacheStats().highlight.accountedSize).toBe(overhead + 2);
 		const cap = getMarkdownCacheStats().highlight.maxEntrySize;
 		for (const target of [cap - 2, cap, cap + 2]) {
 			clearRenderCache();
 			outputLength = (target - overhead) / 2;
-			expect(64 + key.length * 2 + accountedPayload(["h".repeat(outputLength)])).toBe(target);
+			expect(
+				64 + key.length * 2 + accountedPayload({ lang: "txt", code: "x", lines: ["h".repeat(outputLength)] }),
+			).toBe(target);
 			const md = new Markdown(source, 0, 0, theme);
 			md.setStreaming(true);
 			const lines = md.render(100);
@@ -422,6 +424,26 @@ describe("Markdown accounted cache limits", () => {
 		expect(output).toContain("syntax highlighting skipped");
 		expect(output).not.toContain("CACHED BLOCK SENTINEL");
 		expect(theme.highlightCode).toHaveBeenCalledTimes(1);
+	});
+
+	it("verifies language and code on delimiter-colliding highlight keys", () => {
+		const calls: Array<{ code: string; lang?: string }> = [];
+		const theme = {
+			...defaultMarkdownTheme,
+			highlightCode: (code: string, lang?: string): string[] => {
+				calls.push({ code, lang });
+				return [`${lang ?? "none"}:${code}`];
+			},
+		};
+		const first = new Markdown(`\`\`\`a\nb\x00c\n\`\`\``, 0, 0, theme).render(80).join("\n");
+		const second = new Markdown(`\`\`\`a\x00b\nc\n\`\`\``, 0, 0, theme).render(80).join("\n");
+
+		expect(calls).toEqual([
+			{ code: "b\x00c", lang: "a" },
+			{ code: "c", lang: "a\x00b" },
+		]);
+		expect(first).toContain("a:b\x00c");
+		expect(second).toContain("a\x00b:c");
 	});
 
 	it("evicts by aggregate size before count, retains recent entries and reports the full sum", () => {
