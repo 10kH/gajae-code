@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Performance
+
+- Avoid copying unchanged terminal-control spans, reuse retained row widths, consume only the first grapheme for cursor operations, stop select-list width scans at their bounds, and avoid redundant background-row padding.
+
 ## [0.16.4] - 2026-09-05
 
 ### Added
