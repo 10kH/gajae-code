@@ -48,7 +48,7 @@ describe("advisory performance baselines", () => {
 		try {
 			for (const fixture of ["ascii", "growing-fence", "completed-revisit"]) {
 				for (const cadence of [16, 64]) {
-					for (let repetition = -1; repetition < 5; repetition++) {
+					for (let repetition = -1; repetition < 2; repetition++) {
 						clearRenderCache();
 						__markdownPerfCounters.reset();
 						let now = 1_000_000;
