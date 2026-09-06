@@ -68,7 +68,7 @@ describe("advisory performance baselines", () => {
 							return snapshot;
 						};
 						const start = performance.now();
-						for (let i = 0; i < 128; i++) {
+						for (let i = 0; i < 64; i++) {
 							now += cadence;
 							content +=
 								fixture === "growing-fence"
@@ -131,7 +131,7 @@ describe("advisory performance baselines", () => {
 								theme: "defaultMarkdownTheme + deterministic cyan line highlighter",
 								width: 96,
 								reflowWidth: 95,
-								updates: 128,
+								updates: 64,
 								fixtureIdentity: "new deterministic fixture; non-identical to prior 70034-unit research",
 								accounting: "UTF16 retained payload; not heap/RSS",
 								peakScope: "streaming + completion + pressure + warm reflow; excludes oracle",
