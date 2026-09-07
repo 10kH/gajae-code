@@ -1397,7 +1397,7 @@ export async function reapDeadLifecycleMarkers(
 	return reaped;
 }
 
-async function writeEffectMarker(root: string, id: string, marker: EffectMarker): Promise<void> {
+export async function writeEffectMarker(root: string, id: string, marker: EffectMarker): Promise<void> {
 	const directory = path.join(root, "sdk");
 	await fs.mkdir(directory, { recursive: true, mode: 0o700 });
 	const temporary = path.join(directory, `.${id}.lifecycle.${randomUUID()}.tmp`);
@@ -3016,7 +3016,7 @@ async function reconcileLifecycleCleanup(
 	return completion;
 }
 
-async function readSessionLifecycleFailure(
+export async function readSessionLifecycleFailure(
 	root: string,
 	id: string,
 	expected: EffectMarker,
