@@ -1863,6 +1863,14 @@ function b() {
 			AsyncJobManager.setInstance(manager);
 			try {
 				const controller = new AbortController();
+				const appendOutput = manager.appendOutput.bind(manager);
+				let output = "";
+				// Observe unthrottled process output, not the lossy UI preview or worker startup time.
+				vi.spyOn(manager, "appendOutput").mockImplementation((jobId, chunk) => {
+					appendOutput(jobId, chunk);
+					output += chunk;
+					if (output.includes("\nREADY\n")) controller.abort("test abort");
+				});
 				const promise = bashTool.execute(
 					"test-call-10-abort",
 					{
@@ -1871,15 +1879,12 @@ function b() {
 					},
 					controller.signal,
 				);
-				const abortTimer = setTimeout(() => controller.abort("test abort"), 100);
 
 				let caught: unknown;
 				try {
 					await promise;
 				} catch (error) {
 					caught = error;
-				} finally {
-					clearTimeout(abortTimer);
 				}
 				expect(caught).toBeInstanceOf(Error);
 				const message = caught instanceof Error ? caught.message : "";
