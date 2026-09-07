@@ -108,13 +108,13 @@ describe("effective fallback delay precedence", () => {
 		expect(cappedExponentialWithFullJitter(100, 10_000, 3, () => 0.5)).toBe(200);
 	});
 
-	it("Retry-After wins when larger and is never capped by maxDelayMs", () => {
-		// Retry-After (60s) far exceeds the capped exponential window (<=250ms).
-		expect(effectiveFallbackDelay(100, 250, 2, 60_000, () => 1)).toBe(60_000);
+	it("ignores Retry-After and keeps the capped exponential window", () => {
+		// Managed fallback never waits on provider hints; the configured cap applies.
+		expect(effectiveFallbackDelay(100, 250, 2, () => 1)).toBe(200);
 	});
 
-	it("jittered delay wins when it exceeds Retry-After", () => {
-		expect(effectiveFallbackDelay(1_000, 10_000, 3, 100, () => 1)).toBe(4_000);
+	it("uses attempt count for managed retry delay", () => {
+		expect(effectiveFallbackDelay(1_000, 10_000, 3, () => 1)).toBe(4_000);
 	});
 });
 

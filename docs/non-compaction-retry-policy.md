@@ -87,7 +87,7 @@ Flow (`#handleRetryableError`):
 3. Increment `#retryAttempt`.
 4. Create `#retryPromise` once (first attempt in a chain).
 5. In the legacy single-model path, ordinary transient errors retry without an attempt limit. Typed provider-overload replays, canonical idle-stream watchdog stalls, and unknown/no-code errors stop after `retry.maxRetries`. Managed fallback instead uses its controller's per-entry `fallback.maxAttempts` budget.
-6. Compute exponential full-jitter delay capped at `retry.maxDelayMs`; legacy parsed provider retry-after values override computed backoff and are capped at `retry.maxDelayMs`, while managed typed Retry-After values are intentionally uncapped.
+6. Compute exponential full-jitter delay capped at `retry.maxDelayMs`. Managed fallback ignores Retry-After when calculating retry delays and advances when its attempt budget is consumed. Legacy parsed provider retry-after values still override computed backoff and are capped at `retry.maxDelayMs`.
 7. For usage-limit errors, call auth storage (`markUsageLimitReached(...)`); if credential switching succeeds, force delay to `0`, otherwise use the applicable backoff.
 8. Eligible ordered role-array fallback chains advance on entry-budget exhaustion. A selected fallback entry remains sticky until the head selector's rate-limit cooldown expires, when `retry.fallbackRevertPolicy: cooldown-expiry` probes it again on a new turn.
 9. Emit `auto_retry_start`.
@@ -145,7 +145,7 @@ Backoff uses capped exponential full jitter. With default settings the maximum j
 - attempt 2: 4000 ms
 - attempt 3: 8000 ms
 
-`retry.maxDelayMs` caps every legacy session retry delay, including provider retry-after hints, which otherwise take precedence over computed backoff. Managed fallback intentionally does not cap typed Retry-After values because it retries within its separate per-entry `fallback.maxAttempts` budget. In the legacy single-model path, transient errors have unbounded attempts except canonical idle-stream watchdog stalls, which are bounded by `retry.maxRetries`; unknown/no-code errors use the same bound.
+Managed fallback uses capped exponential full jitter and `fallback.maxAttempts` (including the initial request), not Retry-After, to schedule attempts. Rate-limit selector cooldown is recorded when the entry advances or exhausts, rather than interrupting its remaining attempts. Credential rotation retains its existing policy. `retry.maxDelayMs` caps legacy retry delays including provider hints; zero retains the existing uncapped backoff setting. In the legacy single-model path, transient errors have unbounded attempts except canonical idle-stream watchdog stalls, which are bounded by `retry.maxRetries`; unknown/no-code errors use the same bound.
 
 ## Abort mechanics
 

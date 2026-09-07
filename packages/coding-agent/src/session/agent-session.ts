@@ -21774,6 +21774,15 @@ export class AgentSession {
 					? "retry"
 					: "exhausted";
 		}
+		if (
+			managedFallback &&
+			outcome !== "retry" &&
+			trigger.class === "rate_limit" &&
+			trigger.retryAfterMs !== undefined &&
+			failedSelector
+		) {
+			this.#modelRegistry.suppressSelector(failedSelector, Date.now() + trigger.retryAfterMs);
+		}
 		// Credential rotation is unbounded: a fresh credential is a different
 		// retry dimension from transient-error backoff, so it overrides maxRetries
 		// exhaustion and forces an immediate same-model retry.
@@ -21837,14 +21846,10 @@ export class AgentSession {
 			credentialRotated || outcome === "advance"
 				? 0
 				: managedFallback
-					? effectiveFallbackDelay(retrySettings.baseDelayMs, retrySettings.maxDelayMs, attemptsUsed, retryAfterMs)
+					? effectiveFallbackDelay(retrySettings.baseDelayMs, retrySettings.maxDelayMs, attemptsUsed)
 					: retryAfterMs !== undefined
 						? Math.min(retryAfterMs, retrySettings.maxDelayMs)
 						: cappedExponentialWithFullJitter(retrySettings.baseDelayMs, retrySettings.maxDelayMs, attemptsUsed);
-
-		if (managedFallback && trigger.class === "rate_limit" && trigger.retryAfterMs !== undefined && failedSelector) {
-			this.#modelRegistry.suppressSelector(failedSelector, Date.now() + trigger.retryAfterMs);
-		}
 
 		const retry = async (ownership?: ManagedAttemptContinuationOwnership): Promise<void> => {
 			const activePromptHandle = this.activePromptHandle;

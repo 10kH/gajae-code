@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from "bun:test";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
 import { Agent, type AgentOptions } from "@gajae-code/agent-core";
@@ -157,6 +157,7 @@ describe("AgentSession fallback upstream request counts", () => {
 	let authStorage: AuthStorage;
 	let modelRegistry: ModelRegistry;
 	let session: AgentSession | undefined;
+	let waitSpy: Mock<typeof scheduler.wait>;
 
 	beforeEach(async () => {
 		tempDir = TempDir.createSync("@fallback-upstream-count-");
@@ -165,7 +166,7 @@ describe("AgentSession fallback upstream request counts", () => {
 		authStorage.setRuntimeApiKey("openai", "openai-test-key");
 		authStorage.setRuntimeApiKey("alibaba-token-plan", "alibaba-token-plan-test-key");
 		modelRegistry = new ModelRegistry(authStorage);
-		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 	});
 
 	afterEach(async () => {
@@ -380,6 +381,91 @@ describe("AgentSession fallback upstream request counts", () => {
 		for (const call of calls) {
 			expect(call).toMatchObject({ fallbackManaged: true, fallbackAttempt: { attemptId: expect.any(String) } });
 		}
+	});
+
+	it("consumes three attempts before fallback despite an hours-long Retry-After", async () => {
+		const calls: string[] = [];
+		const events: AgentSessionEvent[] = [];
+		const { primary, fallback } = createSession(
+			3,
+			(model, _context, _options) => {
+				calls.push(selector(model));
+				return selector(model) === selector(primary)
+					? typedRateLimitStream(model, 8_259_000)
+					: successfulStream(model, "Recovered without waiting");
+			},
+			{ "retry.maxDelayMs": 1_000 },
+		);
+		session!.subscribe(event => events.push(event));
+
+		await session!.prompt("Advance past an hours-long Retry-After");
+		await session!.waitForIdle();
+
+		expect(calls).toEqual([selector(primary), selector(primary), selector(primary), selector(fallback)]);
+		expect(waitSpy.mock.calls.some(([delay]) => Number(delay) > 1_000)).toBe(false);
+		expect(events).toContainEqual(expect.objectContaining({ type: "auto_retry_start", delayMs: 0 }));
+		expect(session!.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
+	});
+
+	it("ignores even short Retry-After hints when scheduling same-model retries", async () => {
+		vi.spyOn(Math, "random").mockReturnValue(1);
+		const calls: string[] = [];
+		let primaryAttempts = 0;
+		const { primary, fallback } = createSession(
+			2,
+			(model, _context, _options) => {
+				calls.push(selector(model));
+				if (selector(model) === selector(primary)) {
+					primaryAttempts += 1;
+					return primaryAttempts === 1
+						? typedRateLimitStream(model, 50)
+						: successfulStream(model, "Recovered after bounded wait");
+				}
+				return successfulStream(fallback);
+			},
+			{ "retry.maxDelayMs": 1_000, "retry.baseDelayMs": 10 },
+		);
+
+		await session!.prompt("Retry within the configured delay ceiling");
+		await session!.waitForIdle();
+
+		expect(calls).toEqual([selector(primary), selector(primary)]);
+		const waits = waitSpy.mock.calls;
+		expect(waits).toHaveLength(1);
+		expect(waits[0]?.[0]).toBe(10);
+	});
+
+	it("terminates an exhausted chain without waiting on the last long Retry-After", async () => {
+		const calls: string[] = [];
+		const events: AgentSessionEvent[] = [];
+		const { primary, fallback } = createSession(
+			3,
+			model => {
+				calls.push(selector(model));
+				return typedRateLimitStream(model, 8_259_000);
+			},
+			{ "retry.maxDelayMs": 1_000 },
+		);
+		session!.subscribe(event => events.push(event));
+
+		await session!.prompt("Exhaust every unavailable fallback candidate");
+		await session!.waitForIdle();
+
+		expect(calls).toEqual([
+			selector(primary),
+			selector(primary),
+			selector(primary),
+			selector(fallback),
+			selector(fallback),
+			selector(fallback),
+		]);
+		expect(waitSpy.mock.calls.some(([delay]) => Number(delay) > 1_000)).toBe(false);
+		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
+		expect(session!.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			stopReason: "error",
+			errorMessage: expect.stringContaining("fallback chain exhausted"),
+		});
 	});
 
 	it("keeps an opaque typed overflow budget-neutral before one rate limit advances N=1", async () => {
