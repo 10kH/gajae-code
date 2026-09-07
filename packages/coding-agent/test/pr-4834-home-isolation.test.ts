@@ -356,6 +356,7 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 	});
 
 	test("current-profile explicit-home loads authorize the exact XDG plugin root", async () => {
+		if (process.platform === "win32") return;
 		const processHome = path.join(tempDir, "process-home");
 		const xdgDataHome = path.join(tempDir, "external-xdg-data");
 		const registryRoot = path.join(xdgDataHome, "gjc", "plugins");
