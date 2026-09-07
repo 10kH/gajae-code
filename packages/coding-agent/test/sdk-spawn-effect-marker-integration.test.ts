@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -156,17 +156,38 @@ for (const scenario of [
 	});
 }
 
-test("real session.spawn publishes lifecycle authority and registers a live child before accepting the seed", async () => {
+test("real session.spawn publishes lifecycle authority and registers a live child before seed delivery", async () => {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-spawn-real-marker-"));
 	const provider = createSpawnSubstrateProvider({ selectMultiplexer: () => "none" });
 	let launchedProof: SpawnSubstrateProof | undefined;
+	// Stop at the durable registration boundary, before Q26 turn admission. The
+	// master-mode test covers seed acceptance with its injected prompt layer.
+	const registered = Promise.withResolvers<string>();
+	const release = Promise.withResolvers<void>();
+	const persistTransition = SpawnAuthorityStore.prototype.persistTransition;
+	const transition = vi.spyOn(SpawnAuthorityStore.prototype, "persistTransition").mockImplementation(async function (
+		this: SpawnAuthorityStore,
+		identity,
+		input,
+	) {
+		const result = await persistTransition.call(this, identity, input);
+		if (input.to === "authority_active") {
+			registered.resolve(result.claim.childId!);
+			await release.promise;
+			throw new Error("Fixture stopped after proving real child registration");
+		}
+		return result;
+	});
 	const broker = new Broker({
 		agentDir: path.join(root, "agent"),
 		masterCapabilityVerifier: verifier,
 		spawnSubstrateProvider: {
 			...provider,
 			launch: async spec => {
-				const result = await provider.launch({ ...spec, inheritedEnv: { ...spec.inheritedEnv, HOME: root } });
+				const result = await provider.launch({
+					...spec,
+					inheritedEnv: { PATH: process.env.PATH ?? "", HOME: root },
+				});
 				if (result.ok) launchedProof = result.proof;
 				return result;
 			},
@@ -176,13 +197,14 @@ test("real session.spawn publishes lifecycle authority and registers a live chil
 		file: process.execPath,
 		args: ["run", path.resolve(import.meta.dir, "../src/cli.ts"), "sdk", "session-host-internal"],
 	}));
-	await broker.start();
+	let spawning: Promise<unknown> | undefined;
 	try {
+		await broker.start();
 		await attest(broker, root);
-		const response = await spawn(broker, root);
-		expect(response).toMatchObject({ ok: true, result: { code: "spawn_accepted", seed: { phase: "accepted" } } });
-		if (!response.ok) throw new Error(response.error.message);
-		const childId = (response.result as { sessionId: string }).sessionId;
+		spawning = spawn(broker, root).then(response => {
+			registered.reject(new Error(`Spawn ended before the registration checkpoint: ${JSON.stringify(response)}`));
+		});
+		const childId = await registered.promise;
 		const rows = await broker.handleRequest("session.list", { resolveSessionId: childId });
 		expect(rows).toMatchObject({ ok: true, result: { sessions: [{ sessionId: childId, live: true }] } });
 		if (!rows.ok) throw new Error(rows.error.message);
@@ -193,10 +215,18 @@ test("real session.spawn publishes lifecycle authority and registers a live chil
 		expect(marker).toMatchObject({ pid: launchedProof?.pid, incarnation: launchedProof?.processIncarnation });
 		const ledger = await Bun.file(path.join(broker.settings.agentDir, "sdk", "spawn-authority.jsonl")).text();
 		expect(ledger).toContain('"authority_active"');
-		expect(ledger).toContain('"accepted"');
+		expect(ledger).not.toContain('"dispatching"');
+		const store = new SpawnAuthorityStore(
+			broker.settings.agentDir,
+			await getBrokerIdentityKey(broker.settings.agentDir),
+		);
+		await store.open();
+		expect(store.claims().find(claim => claim.childId === childId)?.state).toBe("authority_active");
 		expect(ledger).not.toContain(task);
-		expect(await broker.handleRequest("session.close", { sessionId: childId })).toMatchObject({ ok: true });
 	} finally {
+		release.resolve();
+		await spawning;
+		transition.mockRestore();
 		if (launchedProof) await provider.close(launchedProof);
 		await broker.stop();
 		setLifecycleCommandResolverForTest(broker, undefined);
