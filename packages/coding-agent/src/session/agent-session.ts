@@ -9566,6 +9566,11 @@ export class AgentSession {
 		});
 	}
 
+	/** Test seam: await all currently admitted coordinator sidecar writes. */
+	async awaitCoordinatorRuntimeStatePersistenceForTests(): Promise<void> {
+		await this.#coordinatorPersistQueue;
+		await this.#drainUnbarrieredCoordinatorPersists();
+	}
 	queueCoordinatorRuntimeStatePersistForTests(event: AgentSessionEvent, gate: Promise<void>): Promise<void> {
 		this.#agentEventAdmission.set(event, {
 			persistGeneration: this.#coordinatorPersistGeneration,

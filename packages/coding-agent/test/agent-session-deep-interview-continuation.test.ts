@@ -742,5 +742,6 @@ describe("AgentSession deep-interview continuation", () => {
 			"public-steer",
 			"public-follow-up",
 		]);
+		await session.awaitCoordinatorRuntimeStatePersistenceForTests();
 	});
 });
