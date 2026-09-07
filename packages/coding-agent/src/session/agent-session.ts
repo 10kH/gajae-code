@@ -11886,6 +11886,11 @@ export class AgentSession {
 		const releaseStartupPromptWaiter = this.#reserveStartupPromptWaiter();
 		try {
 			await this.#promptInternal(text, options, releaseStartupPromptWaiter);
+			// Agent-core converts listener failures into an aborted response. Keep a
+			// rejected persistence fence typed at the public prompt boundary instead
+			// of reporting the misleading provider-level "Request was aborted".
+			const appendRejection = this.sessionManager.getAppendIdentityMismatch();
+			if (appendRejection) throw appendRejection;
 		} finally {
 			releaseStartupPromptWaiter();
 		}

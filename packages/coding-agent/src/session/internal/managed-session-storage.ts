@@ -52,6 +52,20 @@ const LOCK_LEASE_MS = 60_000;
 const LOCK_HEARTBEAT_MS = 10_000;
 const LOCK_WAIT_MS = 5_000;
 
+/** A pre-mutation append fence rejection: no bytes from this append were written. */
+export class ManagedAppendIdentityMismatchError extends Error {
+	readonly code = "managed_append_identity_mismatch";
+	readonly relativePath: string;
+	readonly operatorMessage =
+		"Session was resumed by another process; this resume did not run. Retry, or resume a different session.";
+
+	constructor(relativePath: string) {
+		super("managed_append_identity_mismatch");
+		this.name = "ManagedAppendIdentityMismatchError";
+		this.relativePath = relativePath;
+	}
+}
+
 export class ManagedPublishError extends Error {
 	readonly classification:
 		| "destination_conflict"
@@ -1806,7 +1820,7 @@ export class ManagedSessionDescendantStore {
 				current.size.toString() === expected.size &&
 				current.sha256 === expected.sha256;
 			if (!identityMatches) {
-				throw new Error("managed_append_identity_mismatch");
+				throw new ManagedAppendIdentityMismatchError(relativePath);
 			}
 			// mtime/ctime drift on the same file object is harmless. The append
 			// helper performs its own descriptor-bound mutation check.
@@ -1820,7 +1834,7 @@ export class ManagedSessionDescendantStore {
 			return managedAppendReceiptFromIdentity(appended);
 		}
 		const current = this.captureBoundedAppendExpectation(relativePath);
-		if (!current) throw new Error("managed_append_identity_mismatch");
+		if (!current) throw new ManagedAppendIdentityMismatchError(relativePath);
 		if (
 			current.dev !== expected.dev ||
 			current.ino !== expected.ino ||
@@ -1828,7 +1842,7 @@ export class ManagedSessionDescendantStore {
 			current.size !== expected.size ||
 			current.sha256 !== expected.sha256
 		)
-			throw new Error("managed_append_identity_mismatch");
+			throw new ManagedAppendIdentityMismatchError(relativePath);
 		const descriptorMatches =
 			current.dev === expected.dev &&
 			current.ino === expected.ino &&
@@ -1862,7 +1876,7 @@ export class ManagedSessionDescendantStore {
 		expected: ManagedFileIdentity,
 	): ManagedAppendReceipt {
 		const bounded = this.captureBoundedAppendExpectation(relativePath);
-		if (!bounded) throw new Error("managed_append_identity_mismatch");
+		if (!bounded) throw new ManagedAppendIdentityMismatchError(relativePath);
 		const descriptorMatches =
 			bounded.dev === expected.dev.toString() &&
 			bounded.ino === expected.ino.toString() &&
@@ -1882,7 +1896,7 @@ export class ManagedSessionDescendantStore {
 				bounded.size !== String(expected.size) ||
 				bounded.sha256 !== expected.sha256
 			)
-				throw new Error("managed_append_identity_mismatch");
+				throw new ManagedAppendIdentityMismatchError(relativePath);
 		}
 		return this.appendExpectedSync(relativePath, bytes, bounded);
 	}
