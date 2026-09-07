@@ -1756,7 +1756,11 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				}
 			};
 			const finishResponseAfterParsing = (): void => {
-				if (!responseEnded || processingPausedForExec || processingPausedForQueue) return;
+				if (processingPausedForExec || processingPausedForQueue) return;
+				if (!responseEnded) {
+					if (terminalBoundarySeen && pendingBuffer.length === 0) drainMessageQueue();
+					return;
+				}
 				if (terminalBoundarySeen) {
 					// A validated turnEnded makes every remaining byte transport tail,
 					// including an incomplete 1–4 byte frame header. Never turn tail

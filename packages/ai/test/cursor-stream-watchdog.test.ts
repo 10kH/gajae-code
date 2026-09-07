@@ -678,6 +678,64 @@ describe("Cursor raw transport watchdog", () => {
 		expect(events.filter(isTerminalEvent)).toHaveLength(1);
 	});
 
+	it("rearms bounded success after dropping a queue-bound late exec on an open response", async () => {
+		let executions = 0;
+		const baseUrl = await createCursorServer(stream => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			setTimeout(() => {
+				const frames: Buffer[] = [];
+				for (let index = 0; index < 255; index += 1) {
+					frames.push(
+						buildServerMessageFrame({
+							case: "interactionUpdate",
+							value: create(InteractionUpdateSchema, {
+								message: { case: "heartbeat", value: create(HeartbeatUpdateSchema, {}) },
+							}),
+						}),
+					);
+				}
+				frames.push(
+					buildServerMessageFrame({
+						case: "interactionUpdate",
+						value: create(InteractionUpdateSchema, {
+							message: { case: "turnEnded", value: create(TurnEndedUpdateSchema, {}) },
+						}),
+					}),
+					buildServerMessageFrame({
+						case: "execServerMessage",
+						value: create(ExecServerMessageSchema, {
+							id: 99,
+							message: { case: "piReadArgs", value: create(PiReadExecArgsSchema, { path: "/tmp/late" }) },
+						}),
+					}),
+				);
+				stream.write(Buffer.concat(frames));
+			}, 10);
+		});
+
+		const { events, result } = await collectTerminal(baseUrl, {
+			streamFirstEventTimeoutMs: 100,
+			streamIdleTimeoutMs: 100,
+			execHandlers: {
+				piRead: async () => {
+					executions += 1;
+					return {
+						role: "toolResult",
+						toolCallId: "late",
+						toolName: "read",
+						content: [],
+						isError: false,
+						timestamp: Date.now(),
+					};
+				},
+			},
+		});
+
+		expect(executions).toBe(0);
+		expect(result.stopReason).toBe("stop");
+		expect(events.filter(isTerminalEvent)).toHaveLength(1);
+	});
+
 	it("does not dispatch a coalesced exec frame after turnEnded", async () => {
 		let executions = 0;
 		const baseUrl = await createCursorServer(stream => {
