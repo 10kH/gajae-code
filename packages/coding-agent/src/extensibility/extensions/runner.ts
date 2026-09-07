@@ -1401,13 +1401,14 @@ export class ExtensionRunner {
 		scope?: AttemptScopeRef,
 	): Promise<RunnerEmitResult<TEvent>> {
 		const eventSignal = "signal" in event && event.signal instanceof AbortSignal ? event.signal : undefined;
-		const ctx = this.createContext();
+		let ctx: ExtensionContext | undefined;
 		let result: SessionBeforeEventResult | SessionCompactingResult | undefined;
 		const functionDispatch = await this.emitFunctionHooks(event, {
 			signal: eventSignal,
 			scope,
 			legacyHandler: async (indexed, currentEvent) => {
 				if (continueWhile && !continueWhile()) return { action: "return", value: result };
+				ctx ??= this.createContext();
 				const handlerResult = await this.#runHandlerWithTimeout(
 					indexed.handler,
 					currentEvent,
@@ -1439,13 +1440,14 @@ export class ExtensionRunner {
 		scope?: AttemptScopeRef,
 		options: { signal?: AbortSignal; correlationId?: string } = {},
 	): Promise<ToolResultEventResult | undefined> {
-		const ctx = this.createContext();
+		let ctx: ExtensionContext | undefined;
 		const functionDispatch = await this.emitFunctionHooks(
 			{ ...event },
 			{
 				...options,
 				scope,
 				legacyHandler: async (indexed, currentEvent) => {
+					ctx ??= this.createContext();
 					const result = (await this.#runHandlerWithTimeout(
 						indexed.handler,
 						currentEvent,
@@ -1561,7 +1563,7 @@ export class ExtensionRunner {
 		promptPaths: Array<{ path: string; extensionPath: string }>;
 		themePaths: Array<{ path: string; extensionPath: string }>;
 	}> {
-		const ctx = this.createContext();
+		let ctx: ExtensionContext | undefined;
 		const skillPaths: Array<{ path: string; extensionPath: string }> = [];
 		const promptPaths: Array<{ path: string; extensionPath: string }> = [];
 		const themePaths: Array<{ path: string; extensionPath: string }> = [];
@@ -1569,6 +1571,7 @@ export class ExtensionRunner {
 			{ type: "resources_discover", cwd, reason },
 			{
 				legacyHandler: async (indexed, currentEvent) => {
+					ctx ??= this.createContext();
 					const result = (await this.#runHandlerWithTimeout(
 						indexed.handler,
 						currentEvent,
