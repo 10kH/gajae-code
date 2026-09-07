@@ -31,6 +31,23 @@ export interface FileLockOptions {
 	previousOwnerHostIds?: readonly string[];
 }
 
+export class FileLockAcquireError extends Error {
+	readonly code = "acquire_timeout";
+
+	constructor(
+		readonly filePath: string,
+		readonly lockPath: string,
+		readonly attempts: number,
+		readonly holder: string,
+	) {
+		super(
+			`Failed to acquire lock for ${filePath} after ${attempts} attempts: ${holder} (${lockPath}); ` +
+				`a live owner is never displaced — if this is an SDK broker (gjc sdk status), it must finish or be stopped before retrying`,
+		);
+		this.name = "FileLockAcquireError";
+	}
+}
+
 const DEFAULT_OPTIONS: Required<
 	Omit<FileLockOptions, "ownerHostId" | "previousOwnerHostIds" | "signal" | "onAcquired">
 > = {
@@ -1439,10 +1456,7 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 			opts.signal.removeEventListener("abort", onAbort);
 		}
 	}
-	throw new Error(
-		`Failed to acquire lock for ${filePath} after ${opts.retries} attempts: ${await lockHolderDescription(lockPath)} (${lockPath}); ` +
-			`a live owner is never displaced — if this is an SDK broker (gjc sdk status), it must finish or be stopped before retrying`,
-	);
+	throw new FileLockAcquireError(filePath, lockPath, opts.retries, await lockHolderDescription(lockPath));
 }
 
 /**

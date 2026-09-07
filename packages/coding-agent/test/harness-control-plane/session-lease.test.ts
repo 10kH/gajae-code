@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
+import { FileLockTestHooks, withFileLock } from "../../src/config/file-lock";
 import {
 	acquireLease,
 	canWriteEvents,
@@ -29,6 +30,26 @@ afterEach(async () => {
 });
 
 describe("SessionLease", () => {
+	it("maps typed acquisition exhaustion to lease_lock_timeout", async () => {
+		const filePath = sessionPaths(root, SID).lease;
+		await withFileLock(filePath, async () => {
+			const attempt = releaseLease(root, SID, "owner-a");
+			await expect(attempt).rejects.toBeInstanceOf(LeaseError);
+			await expect(attempt).rejects.toMatchObject({ code: "lease_lock_timeout" });
+		});
+	});
+
+	it("propagates a non-lock failure unchanged even with a contention-like message", async () => {
+		const error = new Error("Failed to acquire lock for an unrelated operation");
+		FileLockTestHooks.afterParentMkdir = () => {
+			throw error;
+		};
+		try {
+			await expect(releaseLease(root, SID, "owner-a")).rejects.toBe(error);
+		} finally {
+			FileLockTestHooks.afterParentMkdir = undefined;
+		}
+	});
 	it("classifies lease status from expiry and injected pid status", () => {
 		const clock = () => 10_000;
 		const liveLease = {

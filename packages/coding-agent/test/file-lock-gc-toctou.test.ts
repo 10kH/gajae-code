@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	FileLockAcquireError,
 	FileLockTestHooks,
 	processStartTime,
 	readFileLockObservationForGc,
@@ -39,6 +40,21 @@ async function makeTemp(): Promise<string> {
 	tempDirs.push(dir);
 	return dir;
 }
+
+test("acquisition exhaustion reports typed context for a live in-process holder", async () => {
+	const filePath = path.join(await makeTemp(), "held.json");
+	await withFileLock(filePath, async () => {
+		const attempt = withFileLock(filePath, async () => undefined, { retries: 2, retryDelayMs: 1 });
+		await expect(attempt).rejects.toBeInstanceOf(FileLockAcquireError);
+		await expect(attempt).rejects.toMatchObject({
+			code: "acquire_timeout",
+			filePath,
+			lockPath: `${filePath}.lock`,
+			attempts: 2,
+			holder: expect.stringContaining(String(process.pid)),
+		});
+	});
+});
 
 async function writeInfo(
 	lockDir: string,
@@ -424,7 +440,7 @@ describe("withFileLock stale owner liveness (#652)", () => {
 
 		await expect(
 			withFileLock(lockedFile, async () => undefined, { staleMs: 1, retries: 2, retryDelayMs: 1 }),
-		).rejects.toThrow("Failed to acquire lock");
+		).rejects.toThrow(FileLockAcquireError);
 		expect(replaced).toBe(true);
 		expect(await fs.stat(lockDir)).toBeDefined();
 	});
@@ -478,7 +494,7 @@ describe("withFileLock stale owner liveness (#652)", () => {
 
 		await expect(
 			withFileLock(lockedFile, async () => {}, { staleMs: 1, retries: 2, retryDelayMs: 1 }),
-		).rejects.toThrow("Failed to acquire lock");
+		).rejects.toThrow(FileLockAcquireError);
 		expect(await fs.exists(lockDir)).toBe(true);
 	});
 
@@ -491,7 +507,7 @@ describe("withFileLock stale owner liveness (#652)", () => {
 		await fs.utimes(lockDir, old, old);
 
 		await expect(withFileLock(lockedFile, async () => undefined, { retries: 1, retryDelayMs: 1 })).rejects.toThrow(
-			"Failed to acquire lock",
+			FileLockAcquireError,
 		);
 
 		expect((await fs.lstat(lockDir)).isDirectory()).toBe(true);
@@ -510,7 +526,7 @@ describe("withFileLock stale owner liveness (#652)", () => {
 
 		await expect(
 			withFileLock(lockedFile, async () => {}, { staleMs: 1, retries: 2, retryDelayMs: 1 }),
-		).rejects.toThrow("Failed to acquire lock");
+		).rejects.toThrow(FileLockAcquireError);
 		expect(await fs.exists(lockDir)).toBe(true);
 	});
 
@@ -531,7 +547,7 @@ describe("withFileLock stale owner liveness (#652)", () => {
 
 			await expect(
 				withFileLock(lockedFile, async () => {}, { staleMs: 1, retries: 2, retryDelayMs: 1 }),
-			).rejects.toThrow("Failed to acquire lock");
+			).rejects.toThrow(FileLockAcquireError);
 			expect(await fs.exists(lockDir)).toBe(true);
 		}
 	});
@@ -545,7 +561,7 @@ describe("withFileLock stale owner liveness (#652)", () => {
 
 		await expect(
 			withFileLock(lockedFile, async () => {}, { staleMs: 1, retries: 2, retryDelayMs: 1 }),
-		).rejects.toThrow("Failed to acquire lock");
+		).rejects.toThrow(FileLockAcquireError);
 		expect((await fs.lstat(path.join(lockDir, "info"))).isSymbolicLink()).toBe(true);
 	});
 
@@ -560,7 +576,7 @@ describe("withFileLock stale owner liveness (#652)", () => {
 
 		await expect(
 			withFileLock(lockedFile, async () => {}, { staleMs: 1, retries: 2, retryDelayMs: 1 }),
-		).rejects.toThrow("Failed to acquire lock");
+		).rejects.toThrow(FileLockAcquireError);
 		expect(await fs.exists(lockDir)).toBe(true);
 	});
 
@@ -601,7 +617,7 @@ describe("withFileLock stale owner liveness (#652)", () => {
 
 		await expect(
 			withFileLock(lockedFile, async () => {}, { staleMs: 1, retries: 2, retryDelayMs: 1 }),
-		).rejects.toThrow("Failed to acquire lock");
+		).rejects.toThrow(FileLockAcquireError);
 		expect(await fs.exists(lockDir)).toBe(true);
 	});
 
@@ -617,7 +633,7 @@ describe("withFileLock stale owner liveness (#652)", () => {
 
 		await expect(
 			withFileLock(lockedFile, async () => {}, { staleMs: 1, retries: 2, retryDelayMs: 1 }),
-		).rejects.toThrow("Failed to acquire lock");
+		).rejects.toThrow(FileLockAcquireError);
 		expect(await fs.exists(lockDir)).toBe(true);
 	});
 
