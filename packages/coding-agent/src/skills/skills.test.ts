@@ -1,4 +1,5 @@
 import { describe, expect, test, vi } from "bun:test";
+import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { LoadContext } from "../capability/types";
@@ -24,13 +25,28 @@ describe("skill descriptors", () => {
 			);
 
 			// Discovery reads the validated descriptor rather than reopening with Bun.file.
-			// The prototype spy is process-wide, so unrelated FileHandle reads can interleave
-			// on a loaded CI runner; assert on the read shapes, not on a global call count.
-			const handle = await fs.open(path.join(skillDir, "SKILL.md"), "r");
-			const prototype = Object.getPrototypeOf(handle) as fs.FileHandle;
-			await handle.close();
-			const readSpy = vi.spyOn(prototype, "read");
-			const readFileSpy = vi.spyOn(prototype, "readFile");
+			// Observe only the handles this scan opens: a FileHandle prototype spy is
+			// process-wide, so unrelated reads from concurrently running tests
+			// interleave and make global counts flaky.
+			const reads: Array<unknown[]> = [];
+			const probe = await fs.open(path.join(skillDir, "SKILL.md"), "r");
+			const fileHandlePrototype = Object.getPrototypeOf(probe) as fs.FileHandle;
+			await probe.close();
+			const originalOpen = nodeFs.promises.open;
+			type OpenArgs = Parameters<typeof nodeFs.promises.open>;
+			const openSpy = vi.spyOn(nodeFs.promises, "open").mockImplementation((async (...args: OpenArgs) => {
+				const handle = await originalOpen(...args);
+				const skillPath = args[0];
+				if (typeof skillPath === "string" && skillPath.endsWith("SKILL.md")) {
+					const originalRead = handle.read.bind(handle);
+					handle.read = (async (...readArgs: never[]) => {
+						reads.push(readArgs as unknown[]);
+						return originalRead(...readArgs);
+					}) as typeof handle.read;
+				}
+				return handle;
+			}) as typeof nodeFs.promises.open);
+			const readFileSpy = vi.spyOn(fileHandlePrototype, "readFile");
 			try {
 				const result = await scanSkillDescriptorsFromDir(makeContext(root), {
 					dir: root,
@@ -40,17 +56,17 @@ describe("skill descriptors", () => {
 				expect(result.items).toHaveLength(1);
 				expect(Object.hasOwn(result.items[0]?.metadata ?? {}, "content")).toBe(false);
 				expect(JSON.stringify(result.items[0]?.metadata)).not.toContain(bodyMarker);
-				const boundedReads = readSpy.mock.calls.filter(
+				const boundedReads = reads.filter(
 					call => call[1] === 0 && call[2] === SKILL_FRONTMATTER_SCAN_BYTES && call[3] === 0,
 				);
 				expect(boundedReads).toHaveLength(1);
-				const oversizedReads = readSpy.mock.calls.filter(
+				const oversizedReads = reads.filter(
 					call => typeof call[2] === "number" && call[2] > SKILL_FRONTMATTER_SCAN_BYTES,
 				);
 				expect(oversizedReads).toHaveLength(0);
 				expect(readFileSpy).not.toHaveBeenCalled();
 			} finally {
-				readSpy.mockRestore();
+				openSpy.mockRestore();
 				readFileSpy.mockRestore();
 			}
 		} finally {
