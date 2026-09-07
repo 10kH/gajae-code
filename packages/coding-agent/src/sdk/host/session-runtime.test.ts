@@ -5109,6 +5109,49 @@ describe("post-acceptance invocation terminalization", () => {
 			}
 		}
 	});
+	test("preserves earlier complete tool activity before a trailing empty assistant", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-terminal-earlier-tool-activity-"));
+		try {
+			const harness = await invocationHarness("terminal-earlier-tool-activity", cwd, {
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await Promise.withResolvers<void>().promise;
+				},
+			});
+			const accepted = await harness.control("turn.prompt", { text: "hello" });
+			await harness.emit("agent_start");
+			await harness.emit("agent_end", {
+				messages: [
+					{
+						role: "assistant",
+						content: [{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "file.txt" } }],
+						usage: { totalTokens: 1 },
+					},
+					{
+						role: "toolResult",
+						toolCallId: "call-1",
+						toolName: "read",
+						content: [{ type: "text", text: "contents" }],
+					},
+					{
+						role: "assistant",
+						content: [{ type: "thinking", thinking: "" }],
+						usage: { totalTokens: 0 },
+					},
+				],
+			});
+			expect(
+				await settledStatus(harness, "turn.result", {
+					kind: "prompt",
+					commandId: accepted.result?.commandId,
+					turnId: accepted.result?.turnId,
+				}),
+			).toMatchObject({ status: "terminal_ok" });
+			await harness.stop();
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
 	test("fails closed without independent terminal evidence", async () => {
 		const cases = [
 			{ name: "usage-omitted", content: [{ type: "thinking", thinking: "" }], omitUsage: true },
