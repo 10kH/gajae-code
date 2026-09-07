@@ -127,4 +127,17 @@ describe("normalizeCursorDiscoveryModels context windows", () => {
 		});
 		expect(models[0]?.contextWindow).toBe(DEFAULT_CONTEXT_WINDOW);
 	});
+
+	it("drops control-bearing and overlong live model identities", () => {
+		const models = normalizeCursorDiscoveryModels(
+			[
+				{ modelId: "\u001b[31munsafe", displayName: "Unsafe" },
+				{ modelId: "x".repeat(513), displayName: "Oversized" },
+				{ modelId: "safe-model", displayName: "Safe" },
+			],
+			{ references: new Map() },
+		);
+
+		expect(models.map(model => model.id)).toEqual(["safe-model"]);
+	});
 });

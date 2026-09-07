@@ -4,6 +4,7 @@ import { create, toBinary } from "@bufbuild/protobuf";
 import {
 	createCursorMessageQueueForTest,
 	cursorExecDeadlineMsForTest,
+	isPlausibleCursorConnectProgressForTest,
 	waitForCursorWritesForTest,
 	writeCursorFrameForTest,
 } from "../src/providers/cursor";
@@ -1733,6 +1734,13 @@ describe("Cursor raw transport watchdog", () => {
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toContain("Connect error internal: fragmented failure");
 		expect(events.filter(isTerminalEvent)).toHaveLength(1);
+	});
+
+	it("does not accept fragmented unsupported flags as Connect progress", () => {
+		for (let bufferedLength = 1; bufferedLength < 5; bufferedLength += 1) {
+			expect(isPlausibleCursorConnectProgressForTest(bufferedLength, 0b100)).toBe(false);
+			expect(isPlausibleCursorConnectProgressForTest(bufferedLength, CONNECT_END_STREAM_FLAG)).toBe(true);
+		}
 	});
 
 	it("closes an unfinished response before publishing grace-window success", async () => {

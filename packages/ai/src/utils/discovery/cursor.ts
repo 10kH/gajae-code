@@ -5,6 +5,7 @@ import { getBundledModels } from "../../models";
 import { CURSOR_CLIENT_VERSION } from "../../providers/cursor/client-version";
 import { GetUsableModelsRequestSchema, GetUsableModelsResponseSchema } from "../../providers/cursor/gen/agent_pb";
 import type { Model } from "../../types";
+import { isSafeCatalogModelId } from "./openai-compatible";
 
 const CURSOR_DEFAULT_BASE_URL = "https://api2.cursor.sh";
 const CURSOR_GET_USABLE_MODELS_PATH = "/agent.v1.AgentService/GetUsableModels";
@@ -332,7 +333,7 @@ function normalizeCursorModel(
 
 	const details = parsedModel.data;
 	const id = details.modelId.trim();
-	if (!id) {
+	if (!isSafeCatalogModelId(id)) {
 		return null;
 	}
 

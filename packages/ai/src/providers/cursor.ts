@@ -336,6 +336,17 @@ const CURSOR_MAX_PENDING_SERVER_BYTES = CURSOR_MAX_GRPC_MESSAGE_LENGTH + 5;
 const CURSOR_MAX_BLOB_STORE_ENTRIES = 256;
 const CURSOR_MAX_BLOB_STORE_BYTES = 64 * 1024 * 1024;
 const CURSOR_BLOB_ID_BYTES = 32;
+
+/** Exported for deterministic validation of fragmented Connect progress. */
+export function isPlausibleCursorConnectProgressForTest(
+	bufferedLength: number,
+	flags: number,
+	messageLength?: number,
+): boolean {
+	if (bufferedLength <= 0 || (flags & ~0b11) !== 0) return false;
+	if (bufferedLength < 5) return true;
+	return messageLength !== undefined && messageLength <= CURSOR_MAX_GRPC_MESSAGE_LENGTH;
+}
 const CURSOR_MAX_GRPC_ERROR_MESSAGE_LENGTH = 4096;
 const CURSOR_EXEC_DEADLINE_MULTIPLIER = 4;
 const CURSOR_MIN_EXEC_DEADLINE_MS = 100;
@@ -1159,9 +1170,12 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			pendingBuffer.length >= 5 && pendingBuffer.length >= 5 + pendingBuffer.readUInt32BE(1);
 		const hasPlausibleBufferedFrameProgress = (): boolean => {
 			if (pendingBuffer.length === 0) return false;
-			if (pendingBuffer.length < 5) return true;
 			const flags = pendingBuffer.byteAt(0);
-			return (flags & ~0b11) === 0 && pendingBuffer.readUInt32BE(1) <= CURSOR_MAX_GRPC_MESSAGE_LENGTH;
+			return isPlausibleCursorConnectProgressForTest(
+				pendingBuffer.length,
+				flags,
+				pendingBuffer.length >= 5 ? pendingBuffer.readUInt32BE(1) : undefined,
+			);
 		};
 		const refreshPostTurnEndedGrace = (): void => {
 			if (!postTurnEndedCheckpointTimer || !hasPlausibleBufferedFrameProgress()) return;
