@@ -440,6 +440,7 @@ describe("import redaction", () => {
 			["https://alice:hunter2hunter2@example.com/repo.git", "hunter2hunter2"],
 			["postgres://svc:s3cr3tvalue@db.internal:5432/app", "s3cr3tvalue"],
 			["git+ssh://deploy:tokenvalue123@git.example.com/x.git", "tokenvalue123"],
+			["_https://deploy:underscore-secret@example.com/repo.git_", "underscore-secret"],
 		] as const;
 		for (const [input, secret] of cases) {
 			const result = redactImportedText(input);

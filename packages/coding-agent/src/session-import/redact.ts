@@ -63,7 +63,7 @@ const REDACTION_RULES: readonly RedactionRule[] = [
 	// literal `://` re-tries every prefix of a long alphabetic run before failing,
 	// which is quadratic in the input length: 200 KB of ordinary prose costs ~10s.
 	// IANA's longest registered scheme is well under 16 characters.
-	{ id: "url-credential", pattern: /\b([a-z][a-z0-9+.-]{0,15}:\/\/)[^/\s:@]{1,256}:[^/\s@]{1,256}@/gi },
+	{ id: "url-credential", pattern: /([a-z][a-z0-9+.-]{0,15}:\/\/)[^/\s:@]{1,256}:[^/\s@]{1,256}@/gi },
 	// Sensitive env/KEY assignments: OPENAI_API_KEY=..., token: ..., password = ...
 	// The name prefix is optional so a bare sensitive name (`password: …`) also matches.
 	{
