@@ -77,7 +77,7 @@ describe("GJC utility extensibility quarantine", () => {
 			'logger.time("discoverAndLoadExtensions"',
 			'logger.time("loadExtensions"',
 		]) {
-			expect((forbidden === 'logger.time("discoverSkills"' ? defaultSdk : sdk)).not.toContain(forbidden);
+			expect(forbidden === 'logger.time("discoverSkills"' ? defaultSdk : sdk).not.toContain(forbidden);
 		}
 		expect(sdk).toMatch(/\} else if \(settings\.get\("skills\.enabled"\)\) \{[\s\S]*logger\.time\("discoverSkills"/);
 		expect(main).not.toContain("MarketplaceManager");

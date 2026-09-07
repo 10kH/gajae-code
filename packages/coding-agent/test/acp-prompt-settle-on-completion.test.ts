@@ -7,8 +7,8 @@ import type {
 	PromptRequest,
 	SessionNotification,
 } from "@agentclientprotocol/sdk";
-import packageJson from "../package.json" with { type: "json" };
 import { TempDir } from "@gajae-code/utils";
+import packageJson from "../package.json" with { type: "json" };
 import { AcpAgent } from "../src/modes/acp/acp-agent";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
 import { SessionIndex } from "../src/sdk/broker/session-index";

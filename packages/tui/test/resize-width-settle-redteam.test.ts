@@ -469,7 +469,7 @@ describe("width-settle debounce red-team", () => {
 					firstResizeAt: number;
 					secondResizeAt: number;
 					elapsedBetweenResizes: number;
-				}
+			  }
 			| {
 					conclusive: true;
 					secondChangeDelayMs: number;
@@ -483,7 +483,7 @@ describe("width-settle debounce red-team", () => {
 					elapsedFromFirstResize: number;
 					afterExtendedDeadlineWrite: string;
 					redrawsAfterExtendedDeadline: number;
-				};
+			  };
 
 		async function runAttempt(secondChangeDelayMs: number): Promise<TimingBoundaryAttempt> {
 			delete process.env.TMUX;

@@ -1,8 +1,8 @@
 import { expect, setDefaultTimeout, test, vi } from "bun:test";
 import * as path from "node:path";
 import type { AgentSideConnection, PromptRequest, SessionNotification } from "@agentclientprotocol/sdk";
-import packageJson from "../package.json" with { type: "json" };
 import { logger, TempDir } from "@gajae-code/utils";
+import packageJson from "../package.json" with { type: "json" };
 import { AcpAgent } from "../src/modes/acp/acp-agent";
 import { AcpSdkAdapter } from "../src/sdk/acp/adapter";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
