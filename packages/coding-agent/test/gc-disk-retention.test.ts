@@ -4,6 +4,7 @@ import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getDefault } from "../src/config/settings-schema";
+import { collectEmptyDeleteReceipts, runEmptyDeleteGc } from "../src/gjc-runtime/empty-delete-gc";
 import {
 	collectGcDiskReport,
 	GC_DISK_POLICY_DEFAULTS,
@@ -1924,5 +1925,141 @@ describe("gc disk policy defaults", () => {
 			natives_keep_versions: 5,
 		});
 		expect(resolveGcDiskPolicy()).toEqual(GC_DISK_POLICY_DEFAULTS);
+	});
+});
+
+describe("empty artifact removal roots", () => {
+	const gcName = (index: number) =>
+		`.gjc-delete-gc-00000000-0000-0000-0000-${index.toString(16).padStart(12, "0")}-artifacts.removing`;
+	const managedName = `.gjc-delete-${"a".repeat(64)}-artifacts-1.removing`;
+
+	test("reports and prunes all 72 empty roots even without surviving transcripts", async () => {
+		const fixture = await makeTestRoot();
+		try {
+			const project = path.join(fixture.sessionsRoot, "deleted-project");
+			const names = [...Array.from({ length: 71 }, (_, index) => gcName(index)), managedName];
+			for (const name of names) await fsp.mkdir(path.join(project, name), { recursive: true });
+			const nonEmpty = path.join(project, gcName(100));
+			await Bun.write(path.join(nonEmpty, "payload"), "retain me");
+			const symlink = path.join(project, gcName(101));
+			await fsp.symlink(nonEmpty, symlink);
+			const ignored = [
+				".gjc-delete-test-artifacts-1.removing",
+				".gjc-delete-gc-invalid-artifacts.removing",
+				`${managedName}.extra`,
+				managedName.replace("-1.removing", ".removing"),
+				managedName.replace("-1.removing", "-0.removing"),
+				`${gcName(0).slice(0, -".removing".length)}-1.removing`,
+			];
+			for (const name of ignored) await fsp.mkdir(path.join(project, name));
+			const fileReceipt = path.join(
+				project,
+				".gjc-delete-session-state-lock-00000000-0000-0000-0000-000000000000.json",
+			);
+			await Bun.write(fileReceipt, "");
+
+			const dry = requireDisk(await runDisk(fixture, ["--disk", "--json"])).surfaces.artifacts;
+			expect(dry.records).toHaveLength(74);
+			expect(dry.records.filter(record => record.reason === "empty_artifact_removal_root")).toHaveLength(72);
+			expect(dry.records.every(record => record.action === "keep")).toBe(true);
+			expect(dry.records.find(record => record.path === nonEmpty)).toMatchObject({
+				withheld: true,
+				reason: "non_empty",
+			});
+			expect(dry.records.find(record => record.path === symlink)).toMatchObject({
+				withheld: true,
+				reason: "symlink",
+			});
+			for (const name of names) expect((await fsp.lstat(path.join(project, name))).isDirectory()).toBe(true);
+
+			const pruned = requireDisk(await runDisk(fixture, ["--disk", "--prune", "--json"])).surfaces.artifacts;
+			expect(pruned.records.filter(record => record.action === "reclaimed")).toHaveLength(72);
+			expect(pruned.records.filter(record => record.withheld)).toHaveLength(2);
+			expect(await fsp.readdir(project)).toEqual(
+				expect.arrayContaining([...ignored, gcName(100), gcName(101), path.basename(fileReceipt)]),
+			);
+			expect((await fsp.readdir(project)).length).toBe(ignored.length + 3);
+			expect(await Bun.file(path.join(nonEmpty, "payload")).text()).toBe("retain me");
+			expect((await fsp.lstat(symlink)).isSymbolicLink()).toBe(true);
+		} finally {
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	test("empty-delete receipts share directory summaries and fail closed on a late writer", async () => {
+		const fixture = await makeTestRoot();
+		try {
+			const target = path.join(fixture.root, gcName(0));
+			await fsp.mkdir(target);
+			const dry = await runEmptyDeleteGc({ roots: [fixture.root], prune: false });
+			expect(dry.would_remove).toBe(1);
+			expect(dry.records[0]).toMatchObject({ observationOnly: true, reason: "empty_artifact_removal_root" });
+			const raced = await runEmptyDeleteGc(
+				{ roots: [fixture.root], prune: true },
+				{
+					rmdir: async directory => {
+						await Bun.write(path.join(directory, "late"), "new payload");
+						await fsp.rmdir(directory);
+					},
+				},
+			);
+			expect(raced.removed).toBe(0);
+			expect(raced.kept).toBe(1);
+			expect(raced.errors).toHaveLength(1);
+			expect(raced.records[0].reason).toStartWith("entry_remove_failed:");
+			expect(await Bun.file(path.join(target, "late")).text()).toBe("new payload");
+			await fsp.unlink(path.join(target, "late"));
+			const pruned = await runEmptyDeleteGc({ roots: [fixture.root], prune: true });
+			expect(pruned.removed).toBe(1);
+			expect(pruned.errors).toEqual([]);
+			expect(await fsp.readdir(fixture.root)).not.toContain(gcName(0));
+		} finally {
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	test("revalidates collected directory and parent identities before pruning", async () => {
+		const fixture = await makeTestRoot();
+		try {
+			const target = path.join(fixture.root, managedName);
+			await fsp.mkdir(target);
+			const report = await runEmptyDeleteGc(
+				{ roots: [fixture.root], prune: true },
+				{
+					collect: async root => {
+						const records = await collectEmptyDeleteReceipts(root);
+						await fsp.rename(target, `${target}.old`);
+						await fsp.mkdir(target);
+						return records;
+					},
+				},
+			);
+			expect(report.removed).toBe(0);
+			expect(report.records[0]).toMatchObject({ action: "kept", reason: "identity_drift" });
+			expect((await fsp.lstat(target)).isDirectory()).toBe(true);
+			expect((await fsp.lstat(`${target}.old`)).isDirectory()).toBe(true);
+		} finally {
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	test("disk prune withholds rmdir failures instead of throwing", async () => {
+		const fixture = await makeTestRoot();
+		const target = path.join(fixture.sessionsRoot, "project", gcName(0));
+		await fsp.mkdir(target, { recursive: true });
+		const original = fsp.rmdir;
+		const removal = spyOn(fsp, "rmdir").mockImplementation(async directory => {
+			if (directory === target) await Bun.write(path.join(target, "late"), "late data");
+			return original(directory);
+		});
+		try {
+			const disk = requireDisk(await runDisk(fixture, ["--disk", "--prune", "--json"]));
+			expect(disk.surfaces.artifacts.records[0]).toMatchObject({ action: "reclaim_failed", withheld: true });
+			expect(disk.surfaces.artifacts.records[0].reason).toStartWith("entry_remove_failed:");
+			expect(await Bun.file(path.join(target, "late")).text()).toBe("late data");
+		} finally {
+			removal.mockRestore();
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
 	});
 });

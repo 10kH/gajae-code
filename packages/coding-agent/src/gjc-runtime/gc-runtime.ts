@@ -1704,6 +1704,35 @@ async function runGcDiskArtifacts(input: {
 	const sessionIndex = new SessionIndex(agentDir);
 	try {
 		await sessionIndex.withLocked(async () => {
+			// Quarantine roots can outlive every transcript, so enumerate project
+			// directories independently of survivors, under the same index lock.
+			let projects: Dirent[] = [];
+			try {
+				projects = await fsp.readdir(surface.root, { withFileTypes: true });
+			} catch (error) {
+				if (!isEnoent(error))
+					errors.push({ surface: "artifacts", scope: surface.root, message: gcDiskErrorText(error) });
+			}
+			for (const project of projects) {
+				if (!project.isDirectory() || project.isSymbolicLink()) continue;
+				const directory = path.join(surface.root, project.name);
+				const cleanup = await runEmptyDeleteGc({ roots: [directory], prune, artifactRootsOnly: true });
+				for (const message of cleanup.errors) errors.push({ surface: "artifacts", scope: directory, message });
+				for (const receipt of cleanup.records) {
+					const failed = receipt.reason.startsWith("entry_remove_failed:");
+					surface.records.push({
+						surface: "artifacts",
+						id: `${project.name}/${path.basename(receipt.path)}`,
+						path: receipt.path,
+						bytes: 0,
+						age_days: receipt.identity ? gcDiskAgeDays(now, Number(receipt.identity.mtimeNs / 1_000_000n)) : 0,
+						action: receipt.action === "removed" ? "reclaimed" : failed ? "reclaim_failed" : "keep",
+						reason: receipt.reason,
+						...(receipt.action === "kept" || receipt.action === "skipped" ? { withheld: true as const } : {}),
+						...(failed ? { error: receipt.reason } : {}),
+					});
+				}
+			}
 			// Recomputed over survivors: whichever transcript the sessions surface left
 			// newest in a project directory is the `--continue` target, and a resumed
 			// session still reads its own `artifact://` handles.
