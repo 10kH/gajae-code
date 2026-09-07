@@ -55,21 +55,18 @@ describe("routing adversarial contract probes", () => {
 		expect(classifyFallbackTrigger({ kind: "transport", status: 429 })).toEqual({ class: "rate_limit" });
 	});
 
-	test("keeps legacy backoff capped while managed retry-after remains intentionally uncapped", () => {
+	test("keeps legacy and managed backoff capped", () => {
 		expect(cappedExponentialWithFullJitter(100, 1_000, 10, () => 1)).toBe(1_000);
 		expect(Math.min(THREE_HOURS_MS, 1_000)).toBe(1_000);
-		expect(effectiveFallbackDelay(100, 1_000, 1, THREE_HOURS_MS, () => 1)).toBe(THREE_HOURS_MS);
+		expect(effectiveFallbackDelay(100, 1_000, 10, () => 1)).toBe(1_000);
 	});
 
-	// Mirror image of the contract above: auto-compaction recovers Retry-After by
-	// regex over provider error prose, so it is legacy and MUST stay capped.
-	// Managed fallback is uncapped only because it retries within its own
-	// per-entry budget; compaction has no such budget.
+	// Auto-compaction retains its legacy capped provider-hint policy.
 	test("caps legacy compaction retry-after at retry.maxDelayMs", () => {
 		// A hostile/misconfigured provider asking for 3h cannot outrun the cap.
 		expect(compactionRetryDelay(100, 1_000, 0, THREE_HOURS_MS)).toBe(1_000);
-		// Same hint, managed fallback path: still honoured verbatim.
-		expect(effectiveFallbackDelay(100, 1_000, 1, THREE_HOURS_MS, () => 1)).toBe(THREE_HOURS_MS);
+		// Managed fallback uses only attempt-based backoff.
+		expect(effectiveFallbackDelay(100, 1_000, 1, () => 1)).toBe(100);
 	});
 
 	test("compaction retry delay honours hints below the cap and keeps exponential growth", () => {

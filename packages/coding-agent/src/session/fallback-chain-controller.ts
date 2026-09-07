@@ -242,13 +242,11 @@ export function cappedExponentialWithFullJitter(
 /**
  * Legacy auto-compaction retry delay.
  *
- * Deliberately the mirror image of `effectiveFallbackDelay`: this path recovers
+ * Unlike managed fallback, this path recovers
  * Retry-After by regex over provider error prose (`#parseRetryAfterMsFromError`),
  * so it follows the documented legacy rule — `retry.maxDelayMs` caps every
  * legacy session retry delay, including provider retry-after hints. Managed
- * fallback stays uncapped because it retries within its own per-entry budget;
- * compaction has no such budget, so the final candidate would otherwise sleep
- * for the full server-suggested duration.
+ * fallback ignores these hints when scheduling its attempt-based retries.
  *
  * `maxDelayMs <= 0` means "no cap", matching `cappedExponentialWithFullJitter`.
  * A missing, NaN, or infinite hint collapses to "no usable hint".
@@ -303,13 +301,11 @@ export function describeCompactionCandidateFailures(
 	);
 }
 
-/** Retry-After is intentionally uncapped. */
 export function effectiveFallbackDelay(
 	baseDelayMs: number,
 	maxDelayMs: number,
 	attemptK: number,
-	retryAfterMs: number | undefined,
 	random: () => number = Math.random,
 ): number {
-	return Math.max(cappedExponentialWithFullJitter(baseDelayMs, maxDelayMs, attemptK, random), retryAfterMs ?? 0);
+	return cappedExponentialWithFullJitter(baseDelayMs, maxDelayMs, attemptK, random);
 }
