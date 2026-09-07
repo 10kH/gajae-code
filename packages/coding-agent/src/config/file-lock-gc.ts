@@ -17,7 +17,12 @@ import type {
 } from "../gjc-runtime/gc-runtime";
 import { gcPidStatusLabel } from "../gjc-runtime/gc-runtime";
 import { resolveReceiptSpoolDir } from "../harness-control-plane/receipt-spool";
-import { readFileLockObservationForGc, removeFileLockDirForGc } from "./file-lock";
+import {
+	fileLockStagingOwnerPid,
+	inspectFileLockStagingDir,
+	readFileLockObservationForGc,
+	removeFileLockDirForGc,
+} from "./file-lock";
 
 const MAX_WALK_DEPTH = 6;
 /** Default per-root walk budget. Truncation is a warning, not a hard error. */
@@ -67,7 +72,27 @@ function keptMalformedRecord(lockDir: string): GcRecord {
 	};
 }
 
+function stagingOwnerStatus(ctx: GcContext, pid: number): "alive" | "dead" | "unknown" {
+	const status = gcPidStatusLabel(ctx.probe(pid));
+	return status === "eperm" ? "unknown" : status;
+}
+
 async function collectLockRecord(lockDir: string, ctx: GcContext): Promise<GcRecord> {
+	if (fileLockStagingOwnerPid(path.basename(lockDir)) !== null) {
+		const staging = await inspectFileLockStagingDir(lockDir, pid => stagingOwnerStatus(ctx, pid));
+		return {
+			store: "file_locks",
+			id: lockDir,
+			path: lockDir,
+			pid: staging.pid,
+			pid_status: staging.status,
+			status: "file_lock_staging_orphan",
+			stale: staging.status === "dead",
+			removable: staging.status === "dead",
+			action: "none",
+			reason: staging.reason,
+		};
+	}
 	const observation = await readFileLockObservationForGc(lockDir);
 	const info = observation?.info;
 	if (!info) return keptMalformedRecord(lockDir);
@@ -131,7 +156,7 @@ async function walkForLockDirs(
 	state.entries++;
 	if (!stat.isDirectory() || stat.isSymbolicLink()) return;
 
-	if (path.basename(dir).endsWith(".lock")) {
+	if (path.basename(dir).endsWith(".lock") || fileLockStagingOwnerPid(path.basename(dir)) !== null) {
 		lockDirs.add(dir);
 		return;
 	}
@@ -151,6 +176,11 @@ async function walkForLockDirs(
 		if (state.entries >= maxWalkEntries) {
 			state.truncated = true;
 			return;
+		}
+		// Session index locks live directly in sessions/, but session payload trees remain pruned.
+		if (entry === "sessions") {
+			await walkForLockDirs(path.join(dir, entry), MAX_WALK_DEPTH - 1, state, lockDirs, errors, maxWalkEntries);
+			continue;
 		}
 		if (PRUNED_DIR_NAMES.has(entry)) continue;
 		await walkForLockDirs(path.join(dir, entry), depth + 1, state, lockDirs, errors, maxWalkEntries);
@@ -204,6 +234,14 @@ export const fileLocksGcAdapter: GcStoreAdapter = {
 	},
 	async prune(record: GcRecord, ctx: GcContext): Promise<GcPruneOutcome> {
 		const lockDir = record.path ?? record.id;
+		if (fileLockStagingOwnerPid(path.basename(lockDir)) !== null) {
+			try {
+				const staging = await inspectFileLockStagingDir(lockDir, pid => stagingOwnerStatus(ctx, pid), true);
+				return staging.removed ? { removed: true } : { removed: false, skipped: staging.reason };
+			} catch (error) {
+				return { removed: false, error: errorMessage(error) };
+			}
+		}
 		const observation = await readFileLockObservationForGc(lockDir);
 		const info = observation?.info;
 		if (!info) return { removed: false, skipped: "lock_no_longer_dead_or_missing" };
