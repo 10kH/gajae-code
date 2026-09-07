@@ -2149,6 +2149,7 @@ describe("FileSessionStorageWriter path security", () => {
 	};
 
 	afterEach(async () => {
+		vi.restoreAllMocks();
 		await fsp.rm(tempDir, { recursive: true, force: true });
 	});
 
@@ -2196,6 +2197,30 @@ describe("FileSessionStorageWriter path security", () => {
 		await expect(writer.fsync()).rejects.toThrow();
 		expect(await fsp.readFile(sessionPath, "utf8")).toBe("replacement\n");
 		await writer.close().catch(() => {});
+	});
+
+	it("rejects a replaced name before close and permits retry after restoring the original", async () => {
+		const sessionPath = path.join(tempDir, "close-replacement.jsonl");
+		const detachedPath = `${sessionPath}.detached`;
+		const close = vi.fn((fd: number) => fs.closeSync(fd));
+		const writer = storage.openWriter(sessionPath, managedOptions({ flags: "w", closeAdapter: { close } }));
+		writer.writeLineSync("authorized\n");
+		await fsp.rename(sessionPath, detachedPath);
+		try {
+			await Bun.write(sessionPath, "replacement\n");
+			await fsp.chmod(sessionPath, 0o600);
+			expect(() => writer.closeSync()).toThrow();
+			expect(writer.getCloseState()).toBe("close_failed_retryable");
+			expect(close).not.toHaveBeenCalled();
+			expect(await Bun.file(detachedPath).text()).toBe("authorized\n");
+			expect(await Bun.file(sessionPath).text()).toBe("replacement\n");
+		} finally {
+			await fsp.rename(detachedPath, sessionPath);
+			writer.closeSync();
+		}
+		expect(writer.getCloseState()).toBe("closed");
+		expect(close).toHaveBeenCalledTimes(1);
+		expect(await Bun.file(sessionPath).text()).toBe("authorized\n");
 	});
 
 	it("uses caller-fd security rather than pathname security for open writers", async () => {

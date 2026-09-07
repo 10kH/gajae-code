@@ -2330,8 +2330,8 @@ pub(crate) mod platform {
 
 	#[allow(clippy::result_large_err, reason = "preserves structured native security evidence")]
 	fn duplicate_cloexec(fd: libc::c_int) -> Result<File, NativeOwnerOnlySecurityResult> {
-		// SAFETY: fcntl only reads the supplied live descriptor and returns a new
-		// CLOEXEC descriptor.
+		// SAFETY: fcntl duplicates the descriptor or rejects an invalid fd without
+		// taking ownership of it; F_DUPFD_CLOEXEC sets close-on-exec atomically.
 		let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
 		if duplicate < 0 {
 			return Err(NativeOwnerOnlySecurityResult::failure(security_code(
@@ -2885,16 +2885,24 @@ pub(crate) mod platform {
 		}
 	}
 
-	#[cfg(all(test, target_os = "linux"))]
+	#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 	mod caller_fd_authority_tests {
 		use std::{
 			fs,
-			os::fd::{AsRawFd, IntoRawFd},
-			path::PathBuf,
+			io::Write,
+			os::{
+				fd::AsRawFd,
+				unix::fs::{MetadataExt, PermissionsExt, symlink},
+			},
+			path::{Path, PathBuf},
+			process::Command,
 			sync::atomic::{AtomicU64, Ordering},
 		};
 
-		use super::{checked_caller_file, checked_file, duplicate_cloexec, revalidate_authority};
+		use super::{
+			apply_authority, apply_owner_only_fd_security, checked_caller_file, checked_file,
+			duplicate_cloexec, revalidate_authority, verify_authority, verify_owner_only_fd_security,
+		};
 
 		static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -2917,6 +2925,233 @@ pub(crate) mod platform {
 		}
 
 		#[test]
+		fn caller_fd_security_repairs_modes_and_leaves_directory_and_writer_open() {
+			let root = TempDir::new();
+			fs::set_permissions(&root.0, fs::Permissions::from_mode(0o755))
+				.expect("set directory mode");
+			let directory = fs::File::open(&root.0).expect("open caller directory");
+			let before = verify_owner_only_fd_security(&root.0, "directory", directory.as_raw_fd());
+			assert!(!before.ok);
+			assert_eq!(before.code.as_deref(), Some("mode_mismatch"));
+			let applied = apply_owner_only_fd_security(&root.0, "directory", directory.as_raw_fd());
+			assert!(applied.ok, "{:?}", applied.code);
+			let verified = verify_owner_only_fd_security(&root.0, "directory", directory.as_raw_fd());
+			assert!(verified.ok, "{:?}", verified.code);
+			assert_eq!(directory.metadata().expect("directory still open").mode() & 0o777, 0o700);
+
+			let path = root.0.join("writer");
+			fs::write(&path, b"writer").expect("write caller file");
+			fs::set_permissions(&path, fs::Permissions::from_mode(0o664)).expect("set file mode");
+			let mut writer = fs::OpenOptions::new()
+				.append(true)
+				.open(&path)
+				.expect("open caller writer");
+			let initial = writer.metadata().expect("caller identity");
+			let before = verify_owner_only_fd_security(&path, "file", writer.as_raw_fd());
+			assert!(!before.ok);
+			assert_eq!(before.code.as_deref(), Some("mode_mismatch"));
+			let applied = apply_owner_only_fd_security(&path, "file", writer.as_raw_fd());
+			assert!(applied.ok, "{:?}", applied.code);
+			let verified = verify_owner_only_fd_security(&path, "file", writer.as_raw_fd());
+			assert!(verified.ok, "{:?}", verified.code);
+			let after = writer.metadata().expect("caller writer still open");
+			assert_eq!((after.dev(), after.ino()), (initial.dev(), initial.ino()));
+			assert_eq!(after.mode() & 0o777, 0o600);
+			writer
+				.write_all(b"-retained")
+				.expect("write through retained caller fd");
+			assert_eq!(fs::read(&path).expect("read caller file"), b"writer-retained");
+		}
+
+		#[test]
+		fn different_inode_path_replacement_is_rejected_without_mutating_either_file() {
+			let root = TempDir::new();
+			let path = root.0.join("target");
+			let retained = root.0.join("retained");
+			fs::write(&path, b"original").expect("write original");
+			fs::set_permissions(&path, fs::Permissions::from_mode(0o664)).expect("set original mode");
+			let caller = fs::File::open(&path).expect("open original caller");
+			fs::rename(&path, &retained).expect("retain original inode");
+			fs::write(&path, b"replacement").expect("write replacement");
+			fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+				.expect("set replacement mode");
+			assert_ne!(
+				caller.metadata().expect("original metadata").ino(),
+				fs::metadata(&path).expect("replacement metadata").ino()
+			);
+			for result in [
+				apply_owner_only_fd_security(&path, "file", caller.as_raw_fd()),
+				verify_owner_only_fd_security(&path, "file", caller.as_raw_fd()),
+			] {
+				assert!(!result.ok);
+				assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
+			}
+			assert_eq!(caller.metadata().expect("caller still open").mode() & 0o777, 0o664);
+			assert_eq!(fs::metadata(&path).expect("replacement unchanged").mode() & 0o777, 0o644);
+			assert_eq!(fs::read(&retained).expect("read original"), b"original");
+			assert_eq!(fs::read(&path).expect("read replacement"), b"replacement");
+		}
+
+		#[test]
+		fn invalid_fd_and_invalid_path_authority_fail_without_mutation() {
+			let root = TempDir::new();
+			let path = root.0.join("target");
+			fs::write(&path, b"unchanged").expect("write target");
+			fs::set_permissions(&path, fs::Permissions::from_mode(0o664)).expect("set target mode");
+			for result in [
+				apply_owner_only_fd_security(&path, "file", -1),
+				verify_owner_only_fd_security(&path, "file", -1),
+			] {
+				assert!(!result.ok);
+				assert_eq!(result.code.as_deref(), Some("io_error"));
+			}
+			let caller = fs::File::open(&path).expect("open caller");
+			let link = root.0.join("link");
+			let parent_link = root.0.join("parent-link");
+			symlink(&path, &link).expect("create target symlink");
+			symlink(&root.0, &parent_link).expect("create ancestor symlink");
+			for (candidate, kind, code) in [
+				(root.0.join("missing"), "file", "not_found"),
+				(path.clone(), "directory", "not_directory"),
+				(root.0.clone(), "file", "not_directory"),
+				(path.clone(), "invalid", "io_error"),
+				(link, "file", "reparse_point"),
+				(parent_link.join("target"), "file", "reparse_point"),
+				(root.0.join("missing/../target"), "file", "identity_unavailable"),
+			] {
+				for result in [
+					apply_owner_only_fd_security(&candidate, kind, caller.as_raw_fd()),
+					verify_owner_only_fd_security(&candidate, kind, caller.as_raw_fd()),
+				] {
+					assert!(!result.ok);
+					assert_eq!(result.code.as_deref(), Some(code), "{}", candidate.display());
+				}
+			}
+			assert_eq!(caller.metadata().expect("caller still open").mode() & 0o777, 0o664);
+			assert_eq!(fs::read(&path).expect("read unchanged target"), b"unchanged");
+		}
+
+		#[test]
+		fn closed_caller_fd_cannot_authorize_dot_directory() {
+			const CHILD_ENV: &str = "GJC_NATIVE_CLOSED_CALLER_FD_TEST_CHILD";
+			if std::env::var_os(CHILD_ENV).is_some() {
+				// The isolated child runs one test so no other test can allocate the
+				// deliberately closed positive fd before the security operation sees it.
+				for apply in [false, true] {
+					let caller = fs::File::open(".").expect("open caller directory");
+					let stale_fd = caller.as_raw_fd();
+					assert!(stale_fd >= 0);
+					drop(caller);
+					let result = if apply {
+						apply_owner_only_fd_security(Path::new("."), "directory", stale_fd)
+					} else {
+						verify_owner_only_fd_security(Path::new("."), "directory", stale_fd)
+					};
+					assert!(!result.ok);
+					assert_eq!(result.code.as_deref(), Some("io_error"));
+				}
+				fs::write("closed-fd-checked", b"checked").expect("record isolated test completion");
+				return;
+			}
+			let root = TempDir::new();
+			fs::set_permissions(&root.0, fs::Permissions::from_mode(0o755))
+				.expect("set directory mode");
+			let output = Command::new(std::env::current_exe().expect("native test executable"))
+				.arg("--exact")
+				.arg("path_identity::platform::caller_fd_authority_tests::closed_caller_fd_cannot_authorize_dot_directory")
+				.arg("--nocapture")
+				.arg("--test-threads=1")
+				.env(CHILD_ENV, "1")
+				.current_dir(&root.0)
+				.output()
+				.expect("run isolated closed-fd regression");
+			assert!(
+				output.status.success(),
+				"{}\n{}",
+				String::from_utf8_lossy(&output.stdout),
+				String::from_utf8_lossy(&output.stderr)
+			);
+			assert_eq!(
+				fs::read(root.0.join("closed-fd-checked")).expect("child ran the regression"),
+				b"checked"
+			);
+			assert_eq!(fs::metadata(&root.0).expect("directory unchanged").mode() & 0o777, 0o755);
+		}
+
+		#[test]
+		fn retained_caller_authority_rejects_target_and_ancestor_replacement_before_mutation() {
+			for replace_parent in [false, true] {
+				let root = TempDir::new();
+				let parent = root.0.join("parent");
+				fs::create_dir(&parent).expect("create parent");
+				let path = parent.join("target");
+				fs::write(&path, b"original").expect("write original");
+				fs::set_permissions(&path, fs::Permissions::from_mode(0o664))
+					.expect("set original mode");
+				let caller = fs::File::open(&path).expect("open caller");
+				let authority = checked_caller_file(&path, "file", caller.as_raw_fd())
+					.unwrap_or_else(|result| panic!("caller authority: {:?}", result.code));
+				let retained = if replace_parent {
+					let retained_parent = root.0.join("retained-parent");
+					fs::rename(&parent, &retained_parent).expect("retain original parent");
+					fs::create_dir(&parent).expect("replace parent");
+					retained_parent.join("target")
+				} else {
+					let retained = parent.join("retained");
+					fs::rename(&path, &retained).expect("retain original target");
+					retained
+				};
+				fs::write(&path, b"replacement").expect("write replacement");
+				fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+					.expect("set replacement mode");
+				for result in [verify_authority(&authority, "file"), apply_authority(authority, "file")]
+				{
+					assert!(!result.ok);
+					assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
+				}
+				assert_eq!(caller.metadata().expect("caller still open").mode() & 0o777, 0o664);
+				assert_eq!(fs::metadata(&path).expect("replacement unchanged").mode() & 0o777, 0o644);
+				assert_eq!(fs::read(&retained).expect("read original"), b"original");
+				assert_eq!(fs::read(&path).expect("read replacement"), b"replacement");
+			}
+		}
+
+		#[test]
+		fn retained_duplicate_cannot_be_redirected_by_caller_fd_reuse() {
+			let root = TempDir::new();
+			let path = root.0.join("original");
+			let replacement = root.0.join("replacement");
+			fs::write(&path, b"original").expect("write original");
+			fs::write(&replacement, b"replacement").expect("write replacement");
+			for candidate in [&path, &replacement] {
+				fs::set_permissions(candidate, fs::Permissions::from_mode(0o664))
+					.expect("set initial mode");
+			}
+			let caller = fs::File::open(&path).expect("open caller");
+			let authority = checked_caller_file(&path, "file", caller.as_raw_fd())
+				.unwrap_or_else(|result| panic!("caller authority: {:?}", result.code));
+			let replacement_file = fs::File::open(&replacement).expect("open replacement");
+			// SAFETY: both descriptors are owned here; the retained authority owns a
+			// separate duplicate, while caller continues to own its atomically reused fd.
+			assert_eq!(
+				unsafe { libc::dup2(replacement_file.as_raw_fd(), caller.as_raw_fd()) },
+				caller.as_raw_fd()
+			);
+			let result = apply_authority(authority, "file");
+			assert!(result.ok, "{:?}", result.code);
+			assert_eq!(fs::metadata(&path).expect("original secured").mode() & 0o777, 0o600);
+			assert_eq!(caller.metadata().expect("reused caller still open").mode() & 0o777, 0o664);
+			assert_eq!(
+				fs::metadata(&replacement)
+					.expect("replacement unchanged")
+					.mode() & 0o777,
+				0o664
+			);
+			assert_eq!(fs::read(&path).expect("read original"), b"original");
+			assert_eq!(fs::read(&replacement).expect("read replacement"), b"replacement");
+		}
+
+		#[test]
 		fn caller_fd_mismatch_and_reuse_are_rejected_and_duplicate_is_close_on_exec() {
 			let root = TempDir::new();
 			let expected = root.0.join("expected");
@@ -2924,27 +3159,138 @@ pub(crate) mod platform {
 			fs::write(&expected, b"expected").expect("write expected");
 			fs::write(&replacement, b"replacement").expect("write replacement");
 			let expected_file = fs::File::open(&expected).expect("open expected");
-			let reused_fd = expected_file.into_raw_fd();
-			assert_eq!(unsafe { libc::close(reused_fd) }, 0);
-			let replacement_fd = fs::File::open(&replacement)
-				.expect("open replacement")
-				.into_raw_fd();
-			assert_eq!(unsafe { libc::dup2(replacement_fd, reused_fd) }, reused_fd);
-			if replacement_fd != reused_fd {
-				assert_eq!(unsafe { libc::close(replacement_fd) }, 0);
-			}
+			let reused_fd = expected_file.as_raw_fd();
+			let replacement_file = fs::File::open(&replacement).expect("open replacement");
+			// SAFETY: both descriptors are owned here. Replacing the still-open target
+			// atomically avoids recycling another test's descriptor during a close/open
+			// gap.
+			assert_eq!(unsafe { libc::dup2(replacement_file.as_raw_fd(), reused_fd) }, reused_fd);
 			let result = checked_caller_file(&expected, "file", reused_fd);
-			assert!(result.is_err());
+			assert_eq!(
+				result.err().and_then(|failure| failure.code).as_deref(),
+				Some("identity_mismatch")
+			);
 			let duplicate = match duplicate_cloexec(reused_fd) {
 				Ok(file) => file,
 				Err(_) => panic!("duplicate caller fd"),
 			};
 			assert_ne!(duplicate.as_raw_fd(), reused_fd);
-			assert_ne!(
-				unsafe { libc::fcntl(duplicate.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
-				0
+			// SAFETY: duplicate owns a live descriptor and F_GETFD only reads its flags.
+			let flags = unsafe { libc::fcntl(duplicate.as_raw_fd(), libc::F_GETFD) };
+			assert!(flags >= 0);
+			assert_ne!(flags & libc::FD_CLOEXEC, 0);
+			drop(duplicate);
+			assert_eq!(
+				expected_file.metadata().expect("caller still open").ino(),
+				replacement_file
+					.metadata()
+					.expect("replacement metadata")
+					.ino()
 			);
-			assert_eq!(unsafe { libc::close(reused_fd) }, 0);
+		}
+
+		#[cfg(target_os = "macos")]
+		#[test]
+		fn macos_caller_fd_security_detects_and_clears_extended_acl() {
+			let root = TempDir::new();
+			for (name, kind, mode, acl) in [
+				("read-allow", "file", 0o600, "everyone allow read"),
+				("read-deny", "file", 0o600, "everyone deny read"),
+				("inherited", "directory", 0o700, "everyone allow read,file_inherit,directory_inherit"),
+			] {
+				let path = root.0.join(name);
+				let caller = if kind == "directory" {
+					fs::create_dir(&path).expect("create ACL directory");
+					fs::File::open(&path).expect("open caller directory")
+				} else {
+					fs::write(&path, b"acl-protected").expect("write ACL file");
+					fs::OpenOptions::new()
+						.append(true)
+						.open(&path)
+						.expect("open caller writer")
+				};
+				fs::set_permissions(&path, fs::Permissions::from_mode(mode))
+					.expect("set owner-only mode");
+				let added = Command::new("/bin/chmod")
+					.arg("+a")
+					.arg(acl)
+					.arg(&path)
+					.output()
+					.expect("install macOS extended ACL fixture");
+				assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+				let before = verify_owner_only_fd_security(&path, kind, caller.as_raw_fd());
+				assert!(!before.ok);
+				assert_eq!(before.code.as_deref(), Some("acl_verify_failed"));
+				let applied = apply_owner_only_fd_security(&path, kind, caller.as_raw_fd());
+				assert!(applied.ok, "{:?}", applied.code);
+				let verified = verify_owner_only_fd_security(&path, kind, caller.as_raw_fd());
+				assert!(verified.ok, "{:?}", verified.code);
+				assert_eq!(caller.metadata().expect("caller still open").mode() & 0o777, mode);
+				assert!(super::has_extended_acl(&caller).is_ok_and(|present| !present));
+				if kind == "file" {
+					assert_eq!(fs::read(&path).expect("read unchanged ACL file"), b"acl-protected");
+				}
+			}
+		}
+
+		#[cfg(target_os = "macos")]
+		#[test]
+		fn macos_caller_fd_security_revalidates_names_after_acl_query() {
+			for apply in [false, true] {
+				for replace_parent in [false, true] {
+					let root = TempDir::new();
+					let parent = root.0.join("parent");
+					fs::create_dir(&parent).expect("create parent");
+					let path = parent.join("target");
+					fs::write(&path, b"original").expect("write original");
+					let caller = fs::File::open(&path).expect("open caller");
+					let prepared = apply_owner_only_fd_security(&path, "file", caller.as_raw_fd());
+					assert!(prepared.ok, "{:?}", prepared.code);
+					let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+					let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+					let worker_path = path.clone();
+					let worker = std::thread::spawn(move || {
+						super::AFTER_OWNER_ONLY_ACL_QUERY_HOOK.with(|hook| {
+							*hook.borrow_mut() = Some((entered_tx, resume_rx));
+						});
+						let result = if apply {
+							apply_owner_only_fd_security(&worker_path, "file", caller.as_raw_fd())
+						} else {
+							verify_owner_only_fd_security(&worker_path, "file", caller.as_raw_fd())
+						};
+						assert!(caller.metadata().is_ok(), "caller remains open after the race");
+						result
+					});
+					entered_rx
+						.recv_timeout(std::time::Duration::from_secs(10))
+						.expect("pause after successful ACL query");
+					let retained = if replace_parent {
+						let retained_parent = root.0.join("retained-parent");
+						fs::rename(&parent, &retained_parent).expect("retain original parent");
+						fs::create_dir(&parent).expect("replace parent");
+						retained_parent.join("target")
+					} else {
+						let retained = parent.join("retained");
+						fs::rename(&path, &retained).expect("retain original target");
+						retained
+					};
+					fs::write(&path, b"replacement").expect("write replacement");
+					fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+						.expect("set replacement mode");
+					resume_tx
+						.send(())
+						.expect("resume final identity validation");
+					let result = worker.join().expect("join security operation");
+					assert!(!result.ok);
+					assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
+					assert_eq!(
+						fs::metadata(&path).expect("replacement unchanged").mode() & 0o777,
+						0o644
+					);
+					assert_eq!(fs::read(&retained).expect("read original"), b"original");
+					assert_eq!(fs::read(&path).expect("read replacement"), b"replacement");
+				}
+			}
 		}
 
 		#[test]
@@ -3064,6 +3410,26 @@ pub(crate) mod platform {
 		}
 	}
 
+	// Keep the pause local to the invoking test thread so unrelated security
+	// operations cannot consume the race hook.
+	#[cfg(all(test, target_os = "macos"))]
+	thread_local! {
+		static AFTER_OWNER_ONLY_ACL_QUERY_HOOK: std::cell::RefCell<
+			Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+		> = const { std::cell::RefCell::new(None) };
+	}
+
+	#[cfg(all(test, target_os = "macos"))]
+	fn pause_after_owner_only_acl_query_for_test() {
+		let hook = AFTER_OWNER_ONLY_ACL_QUERY_HOOK.with(|target| target.borrow_mut().take());
+		if let Some((entered, resume)) = hook {
+			entered
+				.send(())
+				.expect("owner-only ACL query hook receiver");
+			resume.recv().expect("owner-only ACL query hook resume");
+		}
+	}
+
 	fn verify_authority(
 		authority: &CheckedPathAuthority,
 		kind: &str,
@@ -3106,7 +3472,14 @@ pub(crate) mod platform {
 		}
 		#[cfg(target_os = "macos")]
 		match has_extended_acl(&authority.file) {
-			Ok(false) => NativeOwnerOnlySecurityResult::success(),
+			Ok(false) => {
+				#[cfg(test)]
+				pause_after_owner_only_acl_query_for_test();
+				match revalidate_authority(authority) {
+					Ok(_) => NativeOwnerOnlySecurityResult::success(),
+					Err(result) => result,
+				}
+			},
 			Ok(true) => NativeOwnerOnlySecurityResult::failure("acl_verify_failed"),
 			Err(result) => result,
 		}
@@ -3306,16 +3679,18 @@ pub(crate) mod platform {
 		verify_authority(&authority, kind)
 	}
 
-	#[cfg(target_os = "linux")]
+	#[cfg(any(target_os = "linux", target_os = "macos"))]
 	#[allow(clippy::result_large_err, reason = "preserves structured native security evidence")]
 	fn checked_caller_file(
 		path: &Path,
 		kind: &str,
 		caller_fd: libc::c_int,
 	) -> Result<CheckedPathAuthority, NativeOwnerOnlySecurityResult> {
-		let mut authority = checked_file(path, kind)?;
+		// Retain the caller before opening the path: an internal open must never
+		// recycle a stale caller fd and accidentally authorize itself.
 		let caller = duplicate_cloexec(caller_fd)?;
 		let caller_stat = fstat(caller.as_raw_fd())?;
+		let mut authority = checked_file(path, kind)?;
 		if !stat_same_object(&authority.initial, &caller_stat) {
 			return Err(NativeOwnerOnlySecurityResult::failure("identity_mismatch"));
 		}
@@ -3362,7 +3737,7 @@ pub(crate) mod platform {
 		NativeOwnerOnlySecurityResult::failure("acl_unavailable")
 	}
 
-	#[cfg(target_os = "linux")]
+	#[cfg(any(target_os = "linux", target_os = "macos"))]
 	pub(super) fn apply_owner_only_fd_security(
 		path: &Path,
 		kind: &str,
@@ -3374,7 +3749,7 @@ pub(crate) mod platform {
 		}
 	}
 
-	#[cfg(not(target_os = "linux"))]
+	#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 	pub(super) fn apply_owner_only_fd_security(
 		_: &Path,
 		_: &str,
@@ -3383,7 +3758,7 @@ pub(crate) mod platform {
 		NativeOwnerOnlySecurityResult::failure("acl_unavailable")
 	}
 
-	#[cfg(target_os = "linux")]
+	#[cfg(any(target_os = "linux", target_os = "macos"))]
 	pub(super) fn verify_owner_only_fd_security(
 		path: &Path,
 		kind: &str,
@@ -3395,7 +3770,7 @@ pub(crate) mod platform {
 		}
 	}
 
-	#[cfg(not(target_os = "linux"))]
+	#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 	pub(super) fn verify_owner_only_fd_security(
 		_: &Path,
 		_: &str,

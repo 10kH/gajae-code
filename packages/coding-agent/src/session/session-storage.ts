@@ -706,7 +706,7 @@ function secureOwnerOnlyFileDescriptor(
 				throw new Error("Managed writer descriptor escaped retained authority");
 		}
 	}
-	if (process.platform !== "linux" || !securityContext) {
+	if ((process.platform !== "linux" && process.platform !== "darwin") || !securityContext) {
 		if (operation === "apply") {
 			const applied = validateNativeSecurityResult(
 				nativeSessionStorage().applyOwnerOnlyPathSecurity(pathname, "file"),
