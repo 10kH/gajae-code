@@ -56,6 +56,8 @@ const LOCK_WAIT_MS = 5_000;
 export class ManagedAppendIdentityMismatchError extends Error {
 	readonly code = "managed_append_identity_mismatch";
 	readonly relativePath: string;
+	readonly operatorMessage =
+		"Session was resumed by another process; this resume did not run. Retry, or resume a different session.";
 
 	constructor(relativePath: string) {
 		super("managed_append_identity_mismatch");

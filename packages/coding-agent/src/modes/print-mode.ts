@@ -391,9 +391,7 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 	} catch (error) {
 		if (error instanceof ManagedAppendIdentityMismatchError) {
 			process.exitCode = 1;
-			await writeStderrAndQuiesce(
-				"Session was resumed by another process; this resume did not run. Retry, or resume a different session.\n",
-			);
+			await writeStderrAndQuiesce(`${error.operatorMessage}\n`);
 		} else failures.push(error);
 	} finally {
 		// The JSON subscriber remains live while disposal emits its final events.

@@ -3,17 +3,25 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { SessionManager } from "../src/session/session-manager";
 
-it("exits cleanly when a real print-mode resume loses its transcript identity", async () => {
+it.each(["startup", "user", "provider"])("reports a real resume rejection at %s", async phase => {
 	const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-parallel-resume-"));
 	const agentDir = path.join(root, "agent");
 	const cwd = path.join(root, "workspace");
 	await fs.mkdir(cwd);
 	let requests = 0;
+	let rotateDuringRequest: string | undefined;
 	const server = Bun.serve({
 		hostname: "127.0.0.1",
 		port: 0,
-		fetch() {
+		async fetch() {
 			requests++;
+			if (rotateDuringRequest) {
+				const file = rotateDuringRequest;
+				rotateDuringRequest = undefined;
+				await fs.copyFile(file, `${file}.before-rejection`);
+				await fs.copyFile(file, `${file}.test-successor`);
+				await fs.rename(`${file}.test-successor`, file);
+			}
 			const chunks = [
 				{ choices: [{ index: 0, delta: { role: "assistant", content: "WINNER" }, finish_reason: null }] },
 				{ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
@@ -46,7 +54,7 @@ it("exits cleanly when a real print-mode resume loses its transcript identity", 
 			const child = Bun.spawn(
 				[
 					process.execPath,
-					...(rotate
+					...(rotate && phase !== "provider"
 						? ["--preload", path.join(import.meta.dirname, "fixtures/parallel-resume-rotate-preload.ts")]
 						: []),
 					cli,
@@ -57,7 +65,13 @@ it("exits cleanly when a real print-mode resume loses its transcript identity", 
 					sid,
 					rotate ? "LOSER" : "WINNER",
 				],
-				{ cwd, env, stdout: "pipe", stderr: "pipe", stdin: "ignore" },
+				{
+					cwd,
+					env: { ...env, GJC_TEST_ROTATION_PHASE: phase },
+					stdout: "pipe",
+					stderr: "pipe",
+					stdin: "ignore",
+				},
 			);
 			const timer = setTimeout(() => child.kill(), 20_000);
 			try {
@@ -78,6 +92,7 @@ it("exits cleanly when a real print-mode resume loses its transcript identity", 
 		const crashFile = Bun.file(path.join(agentDir, "gjc-crash.log"));
 		const crashes = (await crashFile.exists()) ? await crashFile.text() : "";
 		const requestsBeforeLoser = requests;
+		if (phase === "provider") rotateDuringRequest = file;
 		const loser = await run(true);
 		expect(loser, JSON.stringify(loser)).toEqual({
 			code: 1,
@@ -85,15 +100,18 @@ it("exits cleanly when a real print-mode resume loses its transcript identity", 
 			stderr:
 				"Session was resumed by another process; this resume did not run. Retry, or resume a different session.\n",
 		});
-		expect(requests).toBe(requestsBeforeLoser);
+		expect(requests).toBe(requestsBeforeLoser + (phase === "provider" ? 1 : 0));
 		expect((await crashFile.exists()) ? await crashFile.text() : "").toBe(crashes);
 		const finalTranscript = await Bun.file(file).text();
 		expect(finalTranscript).toBe(await Bun.file(`${file}.before-rejection`).text());
 		expect(finalTranscript.startsWith(transcript)).toBe(true);
 		const entries = Bun.JSONL.parse(finalTranscript) as { id?: string; type: string }[];
-		expect(entries.filter(entry => entry.type === "message")).toEqual(
-			(Bun.JSONL.parse(transcript) as { type: string }[]).filter(entry => entry.type === "message"),
+		const winnerMessages = (Bun.JSONL.parse(transcript) as { type: string }[]).filter(
+			entry => entry.type === "message",
 		);
+		const messages = entries.filter(entry => entry.type === "message");
+		expect(messages.slice(0, winnerMessages.length)).toEqual(winnerMessages);
+		expect(messages.length).toBe(winnerMessages.length + (phase === "provider" ? 1 : 0));
 		const ids = entries.flatMap(entry => (entry.id ? [entry.id] : []));
 		expect(new Set(ids).size).toBe(ids.length);
 	} finally {

@@ -68,6 +68,7 @@ import {
 import { processIncarnation } from "./sdk/broker/process-incarnation";
 import { newMasterAttestationEpoch, resolveSessionLocator, SessionIndex } from "./sdk/broker/session-index";
 import type { AgentSession } from "./session/agent-session";
+import { ManagedAppendIdentityMismatchError } from "./session/internal/managed-session-storage";
 import { SessionMigrationBusyError } from "./session/internal/session-open-errors";
 import {
 	type ResumeSessionIdentity,
@@ -551,7 +552,11 @@ export async function applyStartupModelProfiles(args: StartupModelProfileArgs): 
 
 async function exitForStartupModelProfileError(args: StartupModelProfileArgs, error: unknown): Promise<never> {
 	const message = error instanceof Error ? error.message : String(error);
-	process.stderr.write(`${chalk.red(`Error: ${message}`)}\n`);
+	process.stderr.write(
+		error instanceof ManagedAppendIdentityMismatchError
+			? `${error.operatorMessage}\n`
+			: `${chalk.red(`Error: ${message}`)}\n`,
+	);
 	await args.session.dispose();
 	process.exit(1);
 }
