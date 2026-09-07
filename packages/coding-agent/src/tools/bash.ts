@@ -103,6 +103,7 @@ const BASH_ERROR_MAX_BYTES = 4096;
 const ARTIFACT_SAVE_DIAGNOSTIC_MAX_BYTES = 256;
 const BASH_ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const MASTER_CAPABILITY_ENV = "GJC_MASTER_CAPABILITY";
+const MASTER_OWNER_SESSION_ENV = "GJC_MASTER_OWNER_SESSION_ID";
 const DEFAULT_AUTO_BACKGROUND_THRESHOLD_MS = 60_000;
 const ACP_RELEASE_TIMEOUT_MS = 1_000;
 const READ_ONLY_BASH_ENV: Record<string, string> = {
@@ -725,7 +726,12 @@ export function masterCommandEnvOverrides(
 	directMasterSpawn: boolean,
 ): Record<string, string> {
 	if (directMasterSpawn) return {};
-	return Object.fromEntries(Object.entries(env ?? {}).filter(([key]) => key !== MASTER_CAPABILITY_ENV));
+	// The master capability is single-use spawn authority and the owner id is
+	// spawn-lineage identity: neither is ambient state for ordinary Bash or a
+	// chained/pipelined descendant (issue #5374).
+	return Object.fromEntries(
+		Object.entries(env ?? {}).filter(([key]) => key !== MASTER_CAPABILITY_ENV && key !== MASTER_OWNER_SESSION_ENV),
+	);
 }
 
 function escapeBashEnvValueForDisplay(value: string): string {
@@ -1445,7 +1451,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		// command that contained shell syntax into a privileged one.
 		const directMasterSpawn = isStrictDirectSdkSpawnCommand(rawCommand) && isStrictDirectSdkSpawnCommand(command);
 		const masterCapability = directMasterSpawn ? this.session.getMasterBashCapability?.() : undefined;
-		const masterOwnerSessionId = directMasterSpawn ? this.session.getMasterOwnerSessionId?.() : undefined;
+		// Master ownership is lineage identity, not session identity: it travels
+		// under its own variable on every bash env so a master-owned child can
+		// still read its OWN id from GJC_SESSION_ID (issue #5374).
+		const masterOwnerSessionId = this.session.getMasterOwnerSessionId?.();
 		const commandEnvOverrides = masterCommandEnvOverrides(expandedEnv, directMasterSpawn);
 		const resolvedEnv = {
 			...buildGjcRuntimeSessionEnv({
@@ -1458,7 +1467,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				: {}),
 			...commandEnvOverrides,
 			...(masterCapability ? { [MASTER_CAPABILITY_ENV]: masterCapability } : {}),
-			...(masterOwnerSessionId ? { GJC_MASTER_OWNER_SESSION_ID: masterOwnerSessionId } : {}),
+			...(masterOwnerSessionId ? { [MASTER_OWNER_SESSION_ENV]: masterOwnerSessionId } : {}),
 			...(this.session.bashRestrictionProfile === "read-only" ? READ_ONLY_BASH_ENV : {}),
 			...(allowedPrefixes && allowedPrefixes.length > 0 ? { [GJC_RESTRICTED_ROLE_AGENT_BASH_ENV]: "1" } : {}),
 		};
@@ -1510,8 +1519,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		resolvedEnv: Record<string, string> | undefined,
 	): Promise<BashResult> {
 		const masterCapability = resolvedEnv?.[MASTER_CAPABILITY_ENV];
+		const ownerSessionId = resolvedEnv?.[MASTER_OWNER_SESSION_ENV];
 		const sessionAgentDir = resolvedEnv?.GJC_CODING_AGENT_DIR;
-		if (masterCapability === undefined || sessionAgentDir === undefined)
+		if (masterCapability === undefined || ownerSessionId === undefined || sessionAgentDir === undefined)
 			throw new ToolError("Master spawn authority context is unavailable.");
 		const args = parseDirectSdkSpawnArgs(command);
 		args.agentDir = sessionAgentDir;
@@ -1519,8 +1529,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		const request = runSdkSpawn(args, {
 			env: {
 				...process.env,
-				GJC_MASTER_CAPABILITY: masterCapability,
-				GJC_SESSION_ID: resolvedEnv?.GJC_MASTER_OWNER_SESSION_ID ?? this.session.getSessionId?.() ?? undefined,
+				[MASTER_CAPABILITY_ENV]: masterCapability,
+				[MASTER_OWNER_SESSION_ENV]: ownerSessionId,
 				GJC_CODING_AGENT_DIR: sessionAgentDir,
 			},
 		});

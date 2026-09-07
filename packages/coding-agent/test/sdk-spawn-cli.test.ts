@@ -12,7 +12,7 @@ import { SdkClientError } from "../src/sdk/client/client";
 const task = "secret-task-fixture";
 const capability = "secret-capability-fixture";
 
-const masterEnv = { GJC_MASTER_CAPABILITY: capability, GJC_SESSION_ID: "master-cli-owner" };
+const masterEnv = { GJC_MASTER_CAPABILITY: capability, GJC_MASTER_OWNER_SESSION_ID: "master-cli-owner" };
 const epoch = async () => "epoch-cli";
 
 describe("gjc sdk spawn CLI", () => {
