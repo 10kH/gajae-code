@@ -34,14 +34,17 @@ export function redactCrashSecrets(text: string): string {
 	);
 	// Google API keys are a fixed 39-character shape that carries no label of its
 	// own, so the labeled-value rule below never sees one.
-	redacted = redacted.replace(/\bAIza[0-9A-Za-z_-]{35}\b/g, "«redacted-google-api-key»");
+	redacted = redacted.replace(
+		/(?<![A-Za-z0-9_-])AIza[0-9A-Za-z_-]{35}(?![A-Za-z0-9_-])/g,
+		"«redacted-google-api-key»",
+	);
 	// Basic-auth credentials embedded in a URL. Scheme and host stay readable
 	// because they are the diagnostic value; only the userinfo is dropped. The
 	// scheme repetition is bounded: an unbounded `[a-z0-9+.-]*` in front of the
 	// literal `://` re-tries every prefix of a long alphabetic run, which is
 	// quadratic in input length and costs ~10s on a 200 KB crash body.
 	redacted = redacted.replace(
-		/\b([a-z][a-z0-9+.-]{0,15}:\/\/)[^/\s:@]{1,256}:[^/\s@]{1,256}@/gi,
+		/(?<![A-Za-z0-9+.-])([a-z][a-z0-9+.-]{0,15}:\/\/)[^/\s:@]{1,256}:[^/\s@]{1,256}@/gi,
 		"$1«redacted-url-credential»@",
 	);
 	// AKIA is the long-term access key id; ASIA is the temporary/STS one, which is

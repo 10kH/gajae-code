@@ -40,7 +40,7 @@ const INVISIBLE_PATTERN = new RegExp(INVISIBLE_CLASS, "g");
 // residual scanner that silently alternates verdicts is worse than none.
 const CONTROL_PROBE = new RegExp(CONTROL_CLASS);
 const INVISIBLE_PROBE = new RegExp(INVISIBLE_CLASS);
-const URL_PATTERN = /\b[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^\s<>"'`)\]]+/g;
+const URL_PATTERN = /(?<![A-Za-z0-9+.-])[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^\s<>"'`)\]]+/g;
 /** Anything still matching these after sanitization means the scanner is not certain. */
 const RESIDUAL_PATTERNS: readonly RegExp[] = [
 	/\bsk-[A-Za-z0-9_-]{8,}/,

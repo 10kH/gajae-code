@@ -110,9 +110,13 @@ describe("sanitizeExternalCrashV1 — hostile inputs", () => {
 	});
 
 	it("keeps url userinfo out of outbound text without hiding the host", () => {
-		const output = sanitized("clone failed: https://deploy:s3cr3tvalue@git.example.com/x.git");
+		const output = sanitized(
+			"clone failed: https://deploy:s3cr3tvalue@git.example.com/x.git and _https://deploy:wrapped-s3cr3t@git.example.com/x.git_",
+		);
 		expect(output).not.toContain("s3cr3tvalue");
+		expect(output).not.toContain("wrapped-s3cr3t");
 		expect(output).toContain("clone failed");
+		expect(output).toContain("git.example.com");
 	});
 
 	it("scans a large credential-free body in linear time", () => {
