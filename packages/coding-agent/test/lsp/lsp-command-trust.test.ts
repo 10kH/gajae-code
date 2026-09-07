@@ -528,7 +528,7 @@ describe("LSP repository command trust", () => {
 	it("keeps HOME executables exempt from an ancestor cwd when HOME is a symlink, under either spelling", async () => {
 		if (process.platform === "win32") return;
 
-		using tempDir = TempDir.createSync("@gjc-lsp-home-alias-trust-");
+		using tempDir = TempDir.createSync("/var/tmp/gjc-lsp-home-alias-trust-");
 		const canonicalHome = path.join(tempDir.path(), "home");
 		const lexicalHome = path.join(tempDir.path(), "home-link");
 		const userBin = path.join(canonicalHome, ".gjc", "bin");

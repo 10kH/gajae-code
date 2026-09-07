@@ -132,6 +132,7 @@ export function isProjectControlledPath(candidate: string, cwd: string): boolean
 	const canonicalTrustRoot = findProjectTrustRoot(canonicalPath(cwd), stopPaths);
 	if (canonicalTrustRoot !== undefined) canonicalTrustRoots.add(canonicalPath(canonicalTrustRoot));
 	for (const trustRoot of canonicalTrustRoots) {
+		if (!isProjectMarkerRoot(trustRoot)) continue;
 		const trustRootIsHomeScoped = pathIsLexicallyWithin(canonicalHome, trustRoot);
 		const parentOwned =
 			pathIsLexicallyWithin(trustRoot, canonicalCandidateParent) && (!parentIsHomeScoped || trustRootIsHomeScoped);
