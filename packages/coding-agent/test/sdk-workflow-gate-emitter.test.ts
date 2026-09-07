@@ -49,7 +49,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 		const { session } = await createAgentSession({
 			cwd: tempDir,
 			agentDir: tempDir,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: SessionManager.inMemory(tempDir),
 			settings: Settings.isolated(),
 			model: getBundledModel("openai", "gpt-4o-mini"),
 			hasUI: true,
@@ -106,7 +106,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 		const { session } = await createAgentSession({
 			cwd: tempDir,
 			agentDir: tempDir,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: SessionManager.inMemory(tempDir),
 			settings: Settings.isolated(),
 			model: getBundledModel("openai", "gpt-4o-mini"),
 			hasUI: false,
@@ -166,7 +166,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 		const { session } = await createAgentSession({
 			cwd: tempDir,
 			agentDir: tempDir,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: SessionManager.inMemory(tempDir),
 			settings: Settings.isolated(),
 			model: getBundledModel("openai", "gpt-4o-mini"),
 			hasUI: false,
@@ -207,7 +207,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 		const { session } = await createAgentSession({
 			cwd: tempDir,
 			agentDir: tempDir,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: SessionManager.inMemory(tempDir),
 			settings: Settings.isolated(),
 			model: getBundledModel("openai", "gpt-4o-mini"),
 			hasUI: false,
@@ -239,7 +239,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 		const { session } = await createAgentSession({
 			cwd: tempDir,
 			agentDir: tempDir,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: SessionManager.inMemory(tempDir),
 			settings: Settings.isolated(),
 			model: getBundledModel("openai", "gpt-4o-mini"),
 			hasUI: false,
@@ -546,7 +546,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 		const { session } = await createAgentSession({
 			cwd: tempDir,
 			agentDir: tempDir,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: SessionManager.inMemory(tempDir),
 			settings: Settings.isolated(),
 			model: getBundledModel("openai", "gpt-4o-mini"),
 			hasUI: false,
@@ -573,7 +573,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 		const { session } = await createAgentSession({
 			cwd: tempDir,
 			agentDir: tempDir,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: SessionManager.inMemory(tempDir),
 			settings: Settings.isolated(),
 			model: getBundledModel("openai", "gpt-4o-mini"),
 			hasUI: false,
@@ -615,7 +615,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 		const { session } = await createAgentSession({
 			cwd: tempDir,
 			agentDir: tempDir,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: SessionManager.inMemory(tempDir),
 			settings: Settings.isolated(),
 			model: getBundledModel("openai", "gpt-4o-mini"),
 			hasUI: false,

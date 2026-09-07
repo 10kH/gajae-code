@@ -19,6 +19,7 @@ function escapeRegExp(text: string): string {
 describe("SYSTEM.md prompt assembly", () => {
 	let tempDir = "";
 	let tempHomeDir = "";
+	let agentDir = "";
 	let originalHome: string | undefined;
 
 	beforeEach(() => {
@@ -27,6 +28,8 @@ describe("SYSTEM.md prompt assembly", () => {
 		// host-level /home/bellman/AGENTS.md as a project file.
 		tempDir = fs.mkdtempSync(path.join(path.sep, "tmp", "gjc-system-prompt-"));
 		tempHomeDir = fs.mkdtempSync(path.join(path.sep, "tmp", "gjc-system-home-"));
+		// Native user scope follows the selected profile, not a later HOME mutation.
+		agentDir = path.join(tempHomeDir, ".gjc", "agent");
 		originalHome = process.env.HOME;
 		process.env.HOME = tempHomeDir;
 		vi.spyOn(os, "homedir").mockReturnValue(tempHomeDir);
@@ -72,7 +75,7 @@ describe("SYSTEM.md prompt assembly", () => {
 		fs.writeFileSync(path.join(tempHomeDir, ".gjc", "agent", "SYSTEM.md"), "User SYSTEM prompt");
 		fs.writeFileSync(path.join(projectDir, ".gjc", "SYSTEM.md"), "Project SYSTEM prompt");
 
-		await expect(loadSystemPromptFiles({ cwd: projectDir })).resolves.toBe("Project SYSTEM prompt");
+		await expect(loadSystemPromptFiles({ cwd: projectDir, agentDir })).resolves.toBe("Project SYSTEM prompt");
 	});
 	it("does not load user-home context or prompt files into project context", async () => {
 		const projectDir = path.join(tempDir, "project");
@@ -87,8 +90,8 @@ describe("SYSTEM.md prompt assembly", () => {
 		fs.writeFileSync(path.join(tempHomeDir, ".config", "opencode", "AGENTS.md"), "Home opencode instructions");
 		fs.writeFileSync(path.join(tempHomeDir, ".gemini", "GEMINI.md"), "Home Gemini instructions");
 
-		await expect(loadSystemPromptFiles({ cwd: projectDir })).resolves.toBeNull();
-		await expect(loadProjectContextFiles({ cwd: projectDir })).resolves.toEqual([]);
+		await expect(loadSystemPromptFiles({ cwd: projectDir, agentDir })).resolves.toBeNull();
+		await expect(loadProjectContextFiles({ cwd: projectDir, agentDir })).resolves.toEqual([]);
 	});
 
 	it("loads gjc's own user-global AGENTS.md before project context files", async () => {
@@ -99,7 +102,7 @@ describe("SYSTEM.md prompt assembly", () => {
 		fs.mkdirSync(path.dirname(userAgentsPath), { recursive: true });
 		fs.writeFileSync(userAgentsPath, "User-global instructions");
 
-		const files = await loadProjectContextFiles({ cwd: projectDir });
+		const files = await loadProjectContextFiles({ cwd: projectDir, agentDir });
 		const paths = files.map(file => file.path);
 
 		expect(paths[0]).toBe(userAgentsPath);
@@ -116,7 +119,7 @@ describe("SYSTEM.md prompt assembly", () => {
 		fs.mkdirSync(path.dirname(userAgentsPath), { recursive: true });
 		fs.writeFileSync(userAgentsPath, "User-global instructions");
 
-		const files = await loadProjectContextFiles({ cwd: projectDir });
+		const files = await loadProjectContextFiles({ cwd: projectDir, agentDir });
 
 		expect(files.map(file => file.path)).toEqual([userAgentsPath]);
 	});
@@ -127,7 +130,7 @@ describe("SYSTEM.md prompt assembly", () => {
 		fs.mkdirSync(geminiDir, { recursive: true });
 		fs.writeFileSync(path.join(geminiDir, "GEMINI.md"), "Project Gemini instructions");
 
-		await expect(loadProjectContextFiles({ cwd: projectDir })).resolves.toEqual([
+		await expect(loadProjectContextFiles({ cwd: projectDir, agentDir })).resolves.toEqual([
 			{
 				path: path.join(geminiDir, "GEMINI.md"),
 				content: "Project Gemini instructions",
@@ -142,6 +145,7 @@ describe("SYSTEM.md prompt assembly", () => {
 
 		const { systemPrompt } = await buildSystemPrompt({
 			cwd: tempDir,
+			agentDir,
 			customPrompt: "Base prompt",
 			contextFiles: [
 				{ path: farPath, content: sharedContent, depth: 2 },
@@ -168,7 +172,7 @@ describe("SYSTEM.md prompt assembly", () => {
 		fs.writeFileSync(path.join(projectDir, "AGENTS.md"), sharedContent);
 		fs.writeFileSync(path.join(appDir, "AGENTS.md"), sharedContent);
 
-		const contextFiles = await loadProjectContextFiles({ cwd: appDir });
+		const contextFiles = await loadProjectContextFiles({ cwd: appDir, agentDir });
 		const discoveredFiles = contextFiles.filter(file => file.path.startsWith(projectDir));
 
 		expect(discoveredFiles).toHaveLength(1);
@@ -181,6 +185,7 @@ describe("SYSTEM.md prompt assembly", () => {
 
 		const { systemPrompt } = await buildSystemPrompt({
 			cwd: tempDir,
+			agentDir,
 			customPrompt: "Base prompt",
 			contextFiles: [
 				{ path: farPath, content: "Root context instructions", depth: 2 },
@@ -202,6 +207,7 @@ describe("SYSTEM.md prompt assembly", () => {
 
 		const built = await buildSystemPrompt({
 			cwd: projectDir,
+			agentDir,
 			skills: [],
 			rules: [],
 			toolNames: [],
