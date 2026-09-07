@@ -250,6 +250,29 @@ describe("LSP repository command trust", () => {
 		expect(fs.existsSync(canaryPath)).toBe(false);
 	});
 
+	it("reports configured language servers before a client starts", async () => {
+		using tempDir = TempDir.createSync("@gjc-lsp-configured-status-");
+		const cwd = path.join(tempDir.path(), "repo");
+		const externalBinDir = path.join(os.homedir(), `.gjc-lsp-configured-status-${process.pid}-${Date.now()}`);
+		const rustAnalyzer = path.join(externalBinDir, "rust-analyzer");
+		const forgetExternalGrant = registerOwnedDeletionRoot(externalBinDir);
+		await fs.promises.mkdir(cwd, { recursive: true });
+		await fs.promises.mkdir(externalBinDir, { recursive: true });
+		try {
+			await Bun.write(path.join(cwd, "Cargo.toml"), "[package]\n");
+			await Bun.write(rustAnalyzer, "");
+			vi.spyOn(piUtils, "$which").mockImplementation(command => (command === "rust-analyzer" ? rustAnalyzer : null));
+
+			const tool = new LspTool({ cwd } as ToolSession);
+			const result = await tool.execute("configured-status", { action: "status" });
+
+			expect(result.content).toEqual([{ type: "text", text: "Configured language servers: rust-analyzer" }]);
+		} finally {
+			await safeRm(externalBinDir, { recursive: true, force: true });
+			forgetExternalGrant();
+		}
+	});
+
 	it("wraps supported servers with an external lspmux and honors both disable variables", async () => {
 		using tempDir = TempDir.createSync("@gjc-lspmux-external-");
 		const cwd = path.join(tempDir.path(), "repo");
