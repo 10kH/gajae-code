@@ -61,17 +61,21 @@ function substrateFake(counters: { launches: number; closes: number }) {
 
 function promptLayerFake(counters: { dispatches: number }) {
 	return {
-		awaitRegistration: async (input: { childId: string; cwd: string; stateRoot: string }) => ({
-			ok: true as const,
-			registration: {
-				sessionId: input.childId,
-				endpointGeneration: 1,
-				pid: 4321,
-				processIncarnation: "inc-4321",
-				cwd: input.cwd,
-				stateRoot: input.stateRoot,
-			},
-		}),
+		awaitRegistration: async (input: { childId: string; cwd: string; stateRoot: string }) => {
+			const marker = await Bun.file(path.join(input.stateRoot, "sdk", `${input.childId}.lifecycle.json`)).json();
+			expect(marker).toMatchObject({ pid: 4321, incarnation: "inc-4321", effectMarker: expect.any(String) });
+			return {
+				ok: true as const,
+				registration: {
+					sessionId: input.childId,
+					endpointGeneration: 1,
+					pid: 4321,
+					processIncarnation: "inc-4321",
+					cwd: input.cwd,
+					stateRoot: input.stateRoot,
+				},
+			};
+		},
 		dispatch: async () => {
 			counters.dispatches += 1;
 			return { kind: "accepted" as const, commandId: "cmd-e2e", turnId: "turn-e2e", acceptedAt: 11 };
@@ -91,7 +95,7 @@ describe("master mode end to end", () => {
 	it("attests, spawns once, replays, and closes through one broker", async () => {
 		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-master-e2e-"));
 		const stateRoot = path.join(agentDir, "host-state");
-		const locator = { cwd: process.cwd(), worktreeRoot: null, stateRoot };
+		const locator = { cwd: agentDir, worktreeRoot: null, stateRoot };
 		const attestation = {
 			version: 2 as const,
 			ownerSessionId: ownerId,
@@ -155,10 +159,7 @@ describe("master mode end to end", () => {
 					return await broker.handleRequest("session.spawn", payload, idempotencyKey);
 				},
 			};
-			const accepted = await runSdkSpawn(
-				{ cwd: process.cwd(), prompt: seedText, agentDir, idempotencyKey },
-				cliDeps,
-			);
+			const accepted = await runSdkSpawn({ cwd: agentDir, prompt: seedText, agentDir, idempotencyKey }, cliDeps);
 			expect(accepted.exitCode).toBe(0);
 			expect(accepted.rendered.code).toBe("spawn_accepted");
 			expect(accepted.rendered.substrateKind).toBe("headless");
@@ -176,7 +177,7 @@ describe("master mode end to end", () => {
 			await store.open();
 			const claim = store.claims().find(row => row.childId === childId);
 			expect(claim?.state).toBe("accepted");
-			const replay = await runSdkSpawn({ cwd: process.cwd(), prompt: seedText, agentDir, idempotencyKey }, cliDeps);
+			const replay = await runSdkSpawn({ cwd: agentDir, prompt: seedText, agentDir, idempotencyKey }, cliDeps);
 			expect(replay).toMatchObject({
 				exitCode: 0,
 				rendered: { code: "spawn_replayed", sessionId: childId },

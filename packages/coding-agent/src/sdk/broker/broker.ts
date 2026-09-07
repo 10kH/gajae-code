@@ -41,7 +41,9 @@ import {
 	executeLifecycle,
 	isCanonicalSessionId,
 	prepareSpawnChildHostLaunch,
+	readSessionLifecycleFailure,
 	validateBrokerModelPresetSync,
+	writeEffectMarker,
 } from "./lifecycle";
 import {
 	type LifecycleDurableEffectsReceipt,
@@ -1589,12 +1591,34 @@ export class Broker {
 					).claim;
 					return spawnFailureError(failure);
 				}
+				const { pid, processIncarnation: incarnation } = launched.proof;
+				if (pid === undefined || incarnation === undefined) {
+					const failure: SpawnSubstrateFailure = {
+						substrateKind: launched.proof.substrateKind,
+						code: "substrate_proof_failed",
+						message: "session.spawn substrate lacks lifecycle process authority",
+					};
+					await this.#releaseUnownedSubstrate(provider, launchedProof);
+					launchedProof = undefined;
+					current = (
+						await store.persistTransition(lifecycleIdentity, {
+							claimId: current.claimId,
+							from: "substrate_starting",
+							to: "pre_send_rejected",
+							failure,
+						})
+					).claim;
+					return spawnFailureError(failure);
+				}
+				const marker = { pid, incarnation, effectMarker: prep.effectMarker };
+				await writeEffectMarker(prep.stateRoot, prep.childId, marker);
 				const registration = await this.#spawnPromptLayer.awaitRegistration({
 					childId: prep.childId,
 					cwd: prep.cwd,
 					stateRoot: prep.stateRoot,
 				});
 				if (!registration.ok) {
+					const startupFailure = await readSessionLifecycleFailure(prep.stateRoot, prep.childId, marker);
 					await this.#releaseUnownedSubstrate(provider, launchedProof);
 					launchedProof = undefined;
 					current = (
@@ -1604,7 +1628,11 @@ export class Broker {
 							to: "uncertain",
 						})
 					).claim;
-					return error("terminal_uncertain", "session.spawn child registration is uncertain");
+					return error(
+						"terminal_uncertain",
+						"session.spawn child registration is uncertain" +
+							(startupFailure ? ` (${startupFailure.phase}/${startupFailure.reason})` : ""),
+					);
 				}
 				pinnedRegistration = registration.registration;
 				const now = Date.now();
