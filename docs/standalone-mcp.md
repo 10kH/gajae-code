@@ -23,7 +23,7 @@ A server is loaded at startup when all of the following hold:
 
 - the server is not marked `enabled: false`;
 - the server name is not in the `disabledServers` list of either native config scope (`<agent dir>/mcp.json` or `./.gjc/mcp.json`);
-- the server is not marked `autoload: false` (autoload defaults to true; `autoload: false` keeps a server configured for on-demand `/mcp` connection);
+- the server is not marked `autoload: false` (autoload defaults to true; `autoload: false` keeps a server stored but unloaded at startup — flip the flag and start a new session to load it);
 - project-scope servers load by default; setting `mcp.enableProjectConfig` explicitly to `false` in settings disables every project-scope source for that environment.
 
 Malformed or unparseable definitions are skipped fail-closed: they are never partially loaded, a warning is emitted, and the session continues with the remaining valid servers. A server that fails to connect reports an error entry and the session continues.

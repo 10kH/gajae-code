@@ -298,8 +298,8 @@ const TRUST_BY_KIND: Record<CustomizeSurfaceKind, string> = {
 
 /** Whether a restart/new session is required for changes to take effect. */
 function restartRequiredFor(kind: CustomizeSurfaceKind): boolean {
-	// MCP servers are connectable on demand inside a running session
-	// (`/mcp connect`); every other surface is fixed at session startup.
+	// MCP startup set is fixed when the session starts; every other surface is
+	// also fixed at session startup.
 	return kind !== "mcp";
 }
 
@@ -556,7 +556,7 @@ async function collectMcps(cwd: string, activeSettings: SettingsInstance): Promi
 	const disabledExts = disabledExtensionIds(activeSettings);
 	const disabledProviders = new Set(activeSettings.get("disabledProviders"));
 	// The startup projection: `loadAllMCPConfigs` is what a session uses when
-	// connecting MCP servers (`/mcp connect` or `--mcp-config`). A single
+	// connecting MCP servers at startup (`--mcp-config` names one exact file). A single
 	// policy-violating endpoint (for example userinfo in a URL) fails the whole
 	// projection closed at startup, so catch it and report instead of losing
 	// the surface.
@@ -644,8 +644,10 @@ async function collectMcps(cwd: string, activeSettings: SettingsInstance): Promi
 			base,
 			"stored-only",
 			"storage-only",
-			"Discovered but never auto-connected by standalone sessions. Connect it explicitly when you need it.",
-			["Run /mcp connect inside a session", `gjc --mcp-config ${entry.path} to load one exact config file`],
+			"Discovered but never auto-connected by standalone sessions at startup. Enable it for startup loading when you need it.",
+			[
+				`gjc --mcp-config ${entry.path} to load one exact config file (autoload: false servers stay unloaded; flip autoload and start a new session)`,
+			],
 			{ mcp: safeMcpSummary(server, connectable) },
 		);
 	});
@@ -1414,7 +1416,7 @@ function foreignMcpItem(
 		detail: `${desc.providerName} project convention (${desc.dirName}/) is not part of the GJC load path; sessions never discover this MCP server.`,
 		remediation: [
 			`Move the server definition to .gjc/mcp.json to make it discoverable`,
-			"or connect it explicitly via /mcp connect with an exact config file",
+			"then enable it for startup loading (autoload: false servers stay unloaded; flip autoload and start a new session)",
 		],
 		mcp: safeMcpSummary(server, false),
 	};
@@ -1598,7 +1600,7 @@ export async function runCustomizeDoctor(
 			skillScopeNotes,
 			disabledProviders: settings.get("disabledProviders"),
 			mcpNote:
-				"Standalone sessions never auto-connect MCP servers. Discovered servers are connectable on demand via /mcp connect, or with gjc --mcp-config <path>.",
+				"Standalone sessions never auto-connect undiscoverable MCP servers at startup. Discoverable servers load from GJC's own config scopes, or name one exact file with gjc --mcp-config <path> (autoload: false servers stay unloaded; flip autoload and start a new session).",
 			conventionsNotLoaded: foreignPolicyNote ? [foreignPolicyNote] : [],
 			globalImportCandidateDirs,
 			sourceClasses: SOURCE_CLASS_DESCRIPTIONS,
