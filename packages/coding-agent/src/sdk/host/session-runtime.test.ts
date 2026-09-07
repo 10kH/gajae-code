@@ -4955,7 +4955,7 @@ describe("post-acceptance invocation terminalization", () => {
 		const cases = [
 			{ name: "short", agent: "SDK_OK", expected: "SDK_OK", bytes: 6, truncated: false },
 			{ name: "max", agent: "x".repeat(16_384), expected: "x".repeat(16_384), bytes: 16_384, truncated: false },
-			{ name: "blank", agent: " ", expected: undefined, bytes: 0, truncated: false, status: "terminal_ok" },
+			{ name: "blank", agent: " ", expected: undefined, bytes: 0, truncated: false, status: "failed" },
 			{
 				name: "overflow",
 				agent: `${"😀".repeat(4_096)}tail`,
@@ -5071,16 +5071,6 @@ describe("post-acceptance invocation terminalization", () => {
 				usage: { totalTokens: 0 },
 			},
 			{
-				name: "usage-omitted",
-				content: [{ type: "thinking", thinking: "" }],
-				usage: undefined,
-			},
-			{
-				name: "usage-null",
-				content: [{ type: "thinking", thinking: "" }],
-				usage: null,
-			},
-			{
 				name: "positive-token-usage",
 				content: [{ type: "thinking", thinking: "" }],
 				usage: { totalTokens: 1 },
@@ -5119,8 +5109,10 @@ describe("post-acceptance invocation terminalization", () => {
 			}
 		}
 	});
-	test("fails closed for malformed usage and incomplete tool evidence", async () => {
+	test("fails closed without independent terminal evidence", async () => {
 		const cases = [
+			{ name: "usage-omitted", content: [{ type: "thinking", thinking: "" }], omitUsage: true },
+			{ name: "usage-null", content: [{ type: "thinking", thinking: "" }], usage: null },
 			{ name: "primitive-usage", content: [{ type: "thinking", thinking: "" }], usage: "bad" },
 			{ name: "array-usage", content: [{ type: "thinking", thinking: "" }], usage: [] },
 			{ name: "missing-total-tokens", content: [{ type: "thinking", thinking: "" }], usage: { input: 0 } },
@@ -5185,7 +5177,13 @@ describe("post-acceptance invocation terminalization", () => {
 				const accepted = await harness.control("turn.prompt", { text: "hello" });
 				await harness.emit("agent_start");
 				await harness.emit("agent_end", {
-					messages: [{ role: "assistant", content: testCase.content, usage: testCase.usage }],
+					messages: [
+						{
+							role: "assistant",
+							content: testCase.content,
+							...("omitUsage" in testCase ? {} : { usage: testCase.usage }),
+						},
+					],
 				});
 				expect(
 					await settledStatus(harness, "turn.result", {

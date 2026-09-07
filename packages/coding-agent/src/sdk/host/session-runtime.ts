@@ -2211,19 +2211,19 @@ function promptTerminalEvidenceFromAgentEnd(event: unknown): PromptTerminalEvide
 			);
 		if (!assistant || typeof assistant !== "object") return { hasActivity: false };
 		const content = (assistant as { content?: unknown }).content;
-		// Missing usage is not evidence of a zero-token turn: some compatible
-		// providers omit usage entirely or report null. Malformed non-null usage
-		// must not inherit that compatibility path and independently prove success.
+		// Accounting metadata cannot independently prove execution unless it reports
+		// a finite positive token count. Omitted, null, zero, or malformed usage must
+		// rely on meaningful content, a complete tool call, or explicit cancellation.
 		const hasUsage = Object.hasOwn(assistant, "usage");
 		const usage = hasUsage ? (assistant as { usage?: unknown }).usage : undefined;
 		const hasTokenActivity =
-			!hasUsage ||
-			usage === null ||
-			(typeof usage === "object" &&
-				!Array.isArray(usage) &&
-				typeof (usage as { totalTokens?: unknown }).totalTokens === "number" &&
-				Number.isFinite((usage as { totalTokens: number }).totalTokens) &&
-				(usage as { totalTokens: number }).totalTokens > 0);
+			hasUsage &&
+			usage !== null &&
+			typeof usage === "object" &&
+			!Array.isArray(usage) &&
+			typeof (usage as { totalTokens?: unknown }).totalTokens === "number" &&
+			Number.isFinite((usage as { totalTokens: number }).totalTokens) &&
+			(usage as { totalTokens: number }).totalTokens > 0;
 		if (typeof content === "string") {
 			const bounded = sanitizeTurnResultContent(content);
 			return { content: bounded, hasActivity: content.trim().length > 0 || hasTokenActivity };
