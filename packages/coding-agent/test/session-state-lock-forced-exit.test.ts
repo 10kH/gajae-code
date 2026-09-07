@@ -192,11 +192,7 @@ describe("session-state lock forced-exit recovery", () => {
 		const ownerFile = `${transitionDir}.owner`;
 		installLocalIdentityBindings();
 		let elapsedMs = 0;
-		vi.spyOn(performance, "now").mockImplementation(() => {
-			const current = elapsedMs;
-			elapsedMs += 1_000;
-			return current;
-		});
+		vi.spyOn(performance, "now").mockImplementation(() => elapsedMs);
 		let reclaims = 0;
 		setSessionStateLockNativeBindings(() => ({
 			...exactIdentityNativeBindings,
@@ -204,7 +200,9 @@ describe("session-state lock forced-exit recovery", () => {
 				const removed = exactIdentityNativeBindings.exactRemoveDirectoryTree(target, snapshot);
 				if (!removed.ok) return removed;
 				reclaims++;
-				if (reclaims >= 4) throw new Error("reclaim loop escaped its deadline");
+				// Each successful reclaim consumes one second of the five-second acquisition budget.
+				elapsedMs += 1_000;
+				if (reclaims >= 6) throw new Error("reclaim loop escaped its deadline");
 				fsSync.rmSync(ownerFile, { force: true });
 				fsSync.mkdirSync(transitionDir);
 				fsSync.writeFileSync(
@@ -227,7 +225,7 @@ describe("session-state lock forced-exit recovery", () => {
 			lockPath: transitionDir,
 			reason: "transition_claim_timeout",
 		});
-		expect(reclaims).toBeGreaterThan(1);
+		expect(reclaims).toBe(5);
 		expect(sleep).not.toHaveBeenCalled();
 	});
 

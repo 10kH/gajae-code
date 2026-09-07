@@ -1,12 +1,14 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
+import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import type { LoadContext } from "../capability/types";
 import { getEmbeddedDefaultGjcSkills } from "../defaults/gjc-defaults";
 import { buildSkillPromptMessage } from "../extensibility/skills";
 import { SKILL_FRONTMATTER_SCAN_BYTES, SKILL_FRONTMATTER_SCAN_TOTAL_BYTES, scanSkillDescriptorsFromDir } from "./index";
 
-function makeContext(): any {
-	return { cwd: process.cwd(), home: process.env.HOME ?? process.cwd(), repoRoot: null };
+function makeContext(root: string): LoadContext {
+	return { cwd: root, home: root, repoRoot: null };
 }
 
 describe("skill descriptors", () => {
@@ -22,22 +24,31 @@ describe("skill descriptors", () => {
 				`---\nname: bounded\ndescription: bounded scan\n---\n${body}`,
 			);
 
-			const originalFile = Bun.file;
-			const sliceEnds: number[] = [];
-			(Bun as any).file = (filePath: string) => {
-				const file = originalFile(filePath);
-				return new Proxy(file, {
-					get(target, property, receiver) {
-						if (property !== "slice") return Reflect.get(target, property, receiver);
-						return (start?: number, end?: number) => {
-							sliceEnds.push(end ?? -1);
-							return target.slice(start, end);
-						};
-					},
-				});
-			};
+			// Discovery reads the validated descriptor rather than reopening with Bun.file.
+			// Observe only the handles this scan opens: a FileHandle prototype spy is
+			// process-wide, so unrelated reads from concurrently running tests
+			// interleave and make global counts flaky.
+			const reads: Array<unknown[]> = [];
+			const probe = await fs.open(path.join(skillDir, "SKILL.md"), "r");
+			const fileHandlePrototype = Object.getPrototypeOf(probe) as fs.FileHandle;
+			await probe.close();
+			const originalOpen = nodeFs.promises.open;
+			type OpenArgs = Parameters<typeof nodeFs.promises.open>;
+			const openSpy = vi.spyOn(nodeFs.promises, "open").mockImplementation((async (...args: OpenArgs) => {
+				const handle = await originalOpen(...args);
+				const skillPath = args[0];
+				if (typeof skillPath === "string" && skillPath.endsWith("SKILL.md")) {
+					const originalRead = handle.read.bind(handle);
+					handle.read = (async (...readArgs: never[]) => {
+						reads.push(readArgs as unknown[]);
+						return originalRead(...readArgs);
+					}) as typeof handle.read;
+				}
+				return handle;
+			}) as typeof nodeFs.promises.open);
+			const readFileSpy = vi.spyOn(fileHandlePrototype, "readFile");
 			try {
-				const result = await scanSkillDescriptorsFromDir(makeContext(), {
+				const result = await scanSkillDescriptorsFromDir(makeContext(root), {
 					dir: root,
 					providerId: "test",
 					level: "project",
@@ -45,9 +56,18 @@ describe("skill descriptors", () => {
 				expect(result.items).toHaveLength(1);
 				expect(Object.hasOwn(result.items[0]?.metadata ?? {}, "content")).toBe(false);
 				expect(JSON.stringify(result.items[0]?.metadata)).not.toContain(bodyMarker);
-				expect(sliceEnds).toContain(SKILL_FRONTMATTER_SCAN_BYTES);
+				const boundedReads = reads.filter(
+					call => call[1] === 0 && call[2] === SKILL_FRONTMATTER_SCAN_BYTES && call[3] === 0,
+				);
+				expect(boundedReads).toHaveLength(1);
+				const oversizedReads = reads.filter(
+					call => typeof call[2] === "number" && call[2] > SKILL_FRONTMATTER_SCAN_BYTES,
+				);
+				expect(oversizedReads).toHaveLength(0);
+				expect(readFileSpy).not.toHaveBeenCalled();
 			} finally {
-				(Bun as any).file = originalFile;
+				openSpy.mockRestore();
+				readFileSpy.mockRestore();
 			}
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
@@ -63,7 +83,7 @@ describe("skill descriptors", () => {
 				path.join(skillDir, "SKILL.md"),
 				`---\nname: unterminated\ndescription: no closing delimiter\n${"x".repeat(SKILL_FRONTMATTER_SCAN_TOTAL_BYTES * 32)}`,
 			);
-			const result = await scanSkillDescriptorsFromDir(makeContext(), {
+			const result = await scanSkillDescriptorsFromDir(makeContext(root), {
 				dir: root,
 				providerId: "test",
 				level: "project",

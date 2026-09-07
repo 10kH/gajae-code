@@ -13,7 +13,11 @@ const automationSchema = z.object({
 	action: z.enum(["ping", "wait"]),
 });
 
-function externalTool(name: "browser" | "computer", calls: string[]): AgentTool<typeof automationSchema> {
+function externalTool(
+	name: "browser" | "computer",
+	calls: string[],
+	onWaitStarted?: (signal: AbortSignal | undefined) => void,
+): AgentTool<typeof automationSchema> {
 	return {
 		name,
 		label: `External ${name}`,
@@ -25,8 +29,12 @@ function externalTool(name: "browser" | "computer", calls: string[]): AgentTool<
 			if (signal?.aborted) throw new Error(`${name} transport aborted`);
 			if (params.action === "wait") {
 				const pending = Promise.withResolvers<void>();
-				const abort = () => pending.reject(new Error(`${name} transport aborted`));
+				const abort = () => {
+					calls.push(`${name}:aborted`);
+					pending.reject(new Error(`${name} transport aborted`));
+				};
 				signal?.addEventListener("abort", abort, { once: true });
+				onWaitStarted?.(signal);
 				try {
 					await pending.promise;
 				} finally {
@@ -67,7 +75,8 @@ describe("createAgentSession external automation tools", () => {
 
 	it("materializes host browser and computer backends as built-ins and forwards cancellation", async () => {
 		const calls: string[] = [];
-		const browser = externalTool("browser", calls);
+		const waitStarted = Promise.withResolvers<AbortSignal | undefined>();
+		const browser = externalTool("browser", calls, waitStarted.resolve);
 		const computer = externalTool("computer", calls);
 		const automationTools: AutomationTools = { browser, computer };
 		const { session } = await createAgentSession({
@@ -91,9 +100,10 @@ describe("createAgentSession external automation tools", () => {
 
 			const controller = new AbortController();
 			const pending = materializedBrowser!.execute("browser-wait", { action: "wait" }, controller.signal);
+			expect(await waitStarted.promise).toBe(controller.signal);
 			controller.abort();
-			await expect(pending).rejects.toThrow("browser transport aborted");
-			expect(calls).toEqual(["browser:ping", "computer:ping", "browser:wait"]);
+			await expect(pending).rejects.toBe(controller.signal.reason);
+			expect(calls).toEqual(["browser:ping", "computer:ping", "browser:wait", "browser:aborted"]);
 		} finally {
 			await session.dispose();
 		}
