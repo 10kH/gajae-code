@@ -2199,32 +2199,76 @@ interface PromptTerminalEvidence {
 	hasActivity: boolean;
 }
 
+function assistantMessageHasPromptActivity(assistant: object): boolean {
+	const hasUsage = Object.hasOwn(assistant, "usage");
+	const usage = hasUsage ? (assistant as { usage?: unknown }).usage : undefined;
+	const hasTokenActivity =
+		hasUsage &&
+		usage !== null &&
+		typeof usage === "object" &&
+		!Array.isArray(usage) &&
+		typeof (usage as { totalTokens?: unknown }).totalTokens === "number" &&
+		Number.isFinite((usage as { totalTokens: number }).totalTokens) &&
+		(usage as { totalTokens: number }).totalTokens > 0;
+	if (hasTokenActivity) return true;
+	const content = (assistant as { content?: unknown }).content;
+	if (typeof content === "string") return content.trim().length > 0;
+	if (!Array.isArray(content)) return false;
+	return content.some(block => {
+		if (block === null || typeof block !== "object") return false;
+		const type = (block as { type?: unknown }).type;
+		if (type === "text") {
+			const text = (block as { text?: unknown }).text;
+			return typeof text === "string" && text.trim().length > 0;
+		}
+		if (type === "thinking") {
+			const thinking = (block as { thinking?: unknown }).thinking;
+			return typeof thinking === "string" && thinking.trim().length > 0;
+		}
+		if (type === "redactedThinking") {
+			const data = (block as { data?: unknown }).data;
+			return typeof data === "string" && data.trim().length > 0;
+		}
+		if (type !== "toolCall") return false;
+		const toolCall = block as {
+			id?: unknown;
+			name?: unknown;
+			arguments?: unknown;
+			incompleteArguments?: unknown;
+			incompleteArgumentsReason?: unknown;
+		};
+		return (
+			typeof toolCall.id === "string" &&
+			toolCall.id.trim().length > 0 &&
+			typeof toolCall.name === "string" &&
+			toolCall.name.trim().length > 0 &&
+			toolCall.arguments !== null &&
+			typeof toolCall.arguments === "object" &&
+			!Array.isArray(toolCall.arguments) &&
+			(toolCall.incompleteArguments === undefined || toolCall.incompleteArguments === false) &&
+			toolCall.incompleteArgumentsReason === undefined
+		);
+	});
+}
+
 function promptTerminalEvidenceFromAgentEnd(event: unknown): PromptTerminalEvidence {
 	try {
 		if (!event || typeof event !== "object") return { hasActivity: false };
 		const messages = (event as { messages?: unknown }).messages;
 		if (!Array.isArray(messages)) return { hasActivity: false };
-		const assistant = [...messages]
-			.reverse()
-			.find(
-				message => message && typeof message === "object" && (message as { role?: unknown }).role === "assistant",
-			);
-		if (!assistant || typeof assistant !== "object") return { hasActivity: false };
+		const assistants = messages.filter(
+			(message): message is object =>
+				message !== null && typeof message === "object" && (message as { role?: unknown }).role === "assistant",
+		);
+		const assistant = assistants.at(-1);
+		if (!assistant) return { hasActivity: false };
+		const hasActivity = assistants.some(assistantMessageHasPromptActivity);
 		const content = (assistant as { content?: unknown }).content;
 		if (typeof content === "string") {
 			const bounded = sanitizeTurnResultContent(content);
-			return { content: bounded, hasActivity: content.trim().length > 0 };
+			return { content: bounded, hasActivity };
 		}
 		if (Array.isArray(content)) {
-			const hasActivity = content.some(block => {
-				if (block === null || typeof block !== "object") return false;
-				const type = (block as { type?: unknown }).type;
-				if (type === "text") {
-					const text = (block as { text?: unknown }).text;
-					return typeof text === "string" && text.trim().length > 0;
-				}
-				return typeof type === "string" && type.length > 0;
-			});
 			const text = content
 				.filter(
 					(block): block is { type: "text"; text: string } =>
@@ -2237,7 +2281,7 @@ function promptTerminalEvidenceFromAgentEnd(event: unknown): PromptTerminalEvide
 				.join("");
 			return { content: sanitizeTurnResultContent(text), hasActivity };
 		}
-		return { content: sanitizeTurnResultContent(""), hasActivity: false };
+		return { content: sanitizeTurnResultContent(""), hasActivity };
 	} catch {
 		return { hasActivity: false };
 	}
