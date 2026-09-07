@@ -15,7 +15,16 @@ import {
 	tryParseJson,
 } from "@gajae-code/utils";
 import type { ExtensionModule } from "../capability/extension-module";
-import { invalidate as invalidateFsCache, readDirEntries, readFile } from "../capability/fs";
+import {
+	capturePathIdentity,
+	type FileIdentity,
+	invalidate as invalidateFsCache,
+	isSingleLinkRegularFileAt,
+	type ReadFileOptions,
+	type ReadScope,
+	readDirEntries,
+	readFile,
+} from "../capability/fs";
 import { parseRuleConditionAndScope, type Rule, type RuleFrontmatter } from "../capability/rule";
 import type { Skill, SkillFrontmatter } from "../capability/skill";
 import type { LoadContext, LoadResult, SourceMeta } from "../capability/types";
@@ -52,7 +61,9 @@ export const SOURCE_PATHS = {
 		get userAgent() {
 			return `${getConfigDirName()}/agent`;
 		},
-		projectDir: CONFIG_DIR_NAME,
+		get projectDir() {
+			return CONFIG_DIR_NAME;
+		},
 	},
 	claude: {
 		userBase: ".claude",
@@ -188,6 +199,35 @@ export function getProjectPath(ctx: LoadContext, source: SourceId, subpath: stri
 	if (!paths.projectDir) return null;
 
 	return path.join(ctx.cwd, paths.projectDir, subpath);
+}
+
+/** Build the filesystem authority for a provider read. */
+export function getReadOptions(
+	ctx: Pick<LoadContext, "home" | "isolatedHome" | "userAgentDir" | "homeIdentity" | "userAgentIdentity">,
+	scope: ReadScope,
+): ReadFileOptions | undefined {
+	if (!ctx.isolatedHome) return undefined;
+	return {
+		isolatedHome: true,
+		home: ctx.home,
+		homeIdentity: ctx.homeIdentity,
+		userAgentDir: scope === "native" ? ctx.userAgentDir : undefined,
+		userAgentIdentity: scope === "native" ? ctx.userAgentIdentity : undefined,
+		scope,
+		bypassCache: true,
+	};
+}
+
+export async function getReadOptionsForContainment(
+	ctx: Pick<LoadContext, "home" | "isolatedHome" | "userAgentDir" | "homeIdentity" | "userAgentIdentity">,
+	scope: ReadScope,
+	containmentRoot?: string,
+): Promise<ReadFileOptions | undefined> {
+	const options = getReadOptions(ctx, scope);
+	if (!options || !containmentRoot) return options;
+	const containmentRootIdentity = await capturePathIdentity(containmentRoot);
+	if (!containmentRootIdentity) return undefined;
+	return { ...options, containmentRoot, containmentRootIdentity };
 }
 
 /**
@@ -413,6 +453,13 @@ async function globIf(
 	}
 }
 
+async function isAllowedIsolatedExtensionPath(
+	ctx: Pick<LoadContext, "isolatedHome">,
+	filePath: string,
+): Promise<boolean> {
+	return !ctx.isolatedHome || (await isSingleLinkRegularFileAt(filePath));
+}
+
 export interface ScanSkillsFromDirOptions {
 	dir: string;
 	/** Selected authority root whose own identity must not be a symlink. */
@@ -420,6 +467,10 @@ export interface ScanSkillsFromDirOptions {
 	providerId: string;
 	level: "user" | "project";
 	requireDescription?: boolean;
+	/** Optional physical root that every discovered skill must remain within. */
+	containmentRoot?: string;
+	/** Filesystem authority for explicit-home reads. */
+	scope?: ReadScope;
 }
 
 // Stable ordering used for skill lists in prompts: name (case-insensitive), then name, then path.
@@ -479,7 +530,12 @@ export async function scanSkillsFromDir(
 ): Promise<LoadResult<Skill>> {
 	const items: Skill[] = [];
 	const warnings: string[] = [];
-	const { dir, level, providerId, requireDescription = false } = options;
+	const { dir, level, providerId, requireDescription = false, containmentRoot } = options;
+	const scope = options.scope ?? (level === "user" ? "user" : "project");
+	const readOptions = await getReadOptionsForContainment(_ctx, scope, containmentRoot);
+	if (_ctx.isolatedHome && containmentRoot && !readOptions) return { items, warnings };
+	const scanDir = await canonicalizePathWithinHome(_ctx, dir, containmentRoot, scope);
+	if (!scanDir) return { items, warnings };
 
 	let entries: fs.Dirent[];
 	let realRoot: string;
@@ -504,21 +560,21 @@ export async function scanSkillsFromDir(
 				return { items, warnings };
 			}
 		}
-		const capturedScanRoot = await captureDirectoryIdentity(dir);
+		const capturedScanRoot = await captureDirectoryIdentity(scanDir);
 		if (!capturedScanRoot) {
 			warnings.push(`Refusing unsafe skills directory: ${dir}`);
 			return { items, warnings };
 		}
 		scanRootIdentity = capturedScanRoot;
 		realRoot = scanRootIdentity.realPath;
-		entries = await fs.promises.readdir(dir, { withFileTypes: true });
-		if (!(await directoryIdentityIsCurrent(dir, scanRootIdentity))) {
+		entries = await fs.promises.readdir(scanDir, { withFileTypes: true });
+		if (!(await directoryIdentityIsCurrent(scanDir, scanRootIdentity))) {
 			warnings.push(`Refusing changed skills directory: ${dir}`);
 			return { items, warnings };
 		}
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-			warnings.push(`Failed to read skills directory: ${dir} (${String(error)})`);
+			warnings.push(`Failed to read skills directory: ${scanDir} (${String(error)})`);
 		}
 		return { items, warnings };
 	}
@@ -528,7 +584,7 @@ export async function scanSkillsFromDir(
 	};
 	const openSkillFileSafely = async (skillPath: string): Promise<FileHandle> => {
 		if (
-			!(await directoryIdentityIsCurrent(dir, scanRootIdentity)) ||
+			!(await directoryIdentityIsCurrent(scanDir, scanRootIdentity)) ||
 			(options.authorityRoot &&
 				authorityIdentity &&
 				!(await directoryIdentityIsCurrent(options.authorityRoot, authorityIdentity)))
@@ -544,7 +600,7 @@ export async function scanSkillsFromDir(
 				handle.stat({ bigint: true }),
 				fs.promises.lstat(skillPath, { bigint: true }),
 				fs.promises.realpath(skillPath),
-				directoryIdentityIsCurrent(dir, scanRootIdentity),
+				directoryIdentityIsCurrent(scanDir, scanRootIdentity),
 				options.authorityRoot && authorityIdentity
 					? directoryIdentityIsCurrent(options.authorityRoot, authorityIdentity)
 					: true,
@@ -665,7 +721,13 @@ export async function scanSkillsFromDir(
 	for (const entry of entries) {
 		if (entry.name.startsWith(".")) continue;
 		if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
-		const skillPath = path.join(dir, entry.name, "SKILL.md");
+		const skillPath = await canonicalizePathWithinHome(
+			_ctx,
+			path.join(scanDir, entry.name, "SKILL.md"),
+			containmentRoot,
+			scope,
+		);
+		if (!skillPath) continue;
 		work.push(loadSkill(skillPath));
 	}
 	await Promise.all(work);
@@ -778,10 +840,19 @@ export async function loadFilesFromDir<T>(
 		transform: (name: string, content: string, path: string, source: SourceMeta) => T | null;
 		/** Whether to recurse into subdirectories (default: false) */
 		recursive?: boolean;
+		/** Optional physical root that every discovered file must remain within. */
+		containmentRoot?: string;
+		/** Filesystem authority for explicit-home reads. */
+		scope?: ReadScope;
 	},
 ): Promise<LoadResult<T>> {
 	const items: T[] = [];
 	const warnings: string[] = [];
+	const scope = options.scope ?? (level === "user" ? "user" : "project");
+	const readOptions = await getReadOptionsForContainment(_ctx, scope, options.containmentRoot);
+	if (_ctx.isolatedHome && options.containmentRoot && !readOptions) return { items, warnings };
+	const scanDir = await canonicalizePathWithinHome(_ctx, dir, options.containmentRoot, scope);
+	if (!scanDir) return { items, warnings };
 	// Build glob pattern based on extensions and recursion
 	const { extensions, recursive = false } = options;
 
@@ -799,7 +870,7 @@ export async function loadFilesFromDir<T>(
 		const { glob, FileType } = await discoveryNatives();
 		const result = await glob({
 			pattern,
-			path: dir,
+			path: scanDir,
 			gitignore: true,
 			hidden: false,
 			fileType: FileType.File,
@@ -813,13 +884,21 @@ export async function loadFilesFromDir<T>(
 	// Read all matching files in parallel
 	const fileResults = await Promise.all(
 		matches.map(async match => {
-			const filePath = path.join(dir, match.path);
-			const content = await readFile(filePath);
+			const filePath = await canonicalizePathWithinHome(
+				_ctx,
+				path.join(scanDir, match.path),
+				options.containmentRoot,
+				scope,
+			);
+			if (!filePath) return null;
+			const content = await readFile(filePath, readOptions);
 			return { filePath, content };
 		}),
 	);
 
-	for (const { filePath, content } of fileResults) {
+	for (const result of fileResults) {
+		if (!result) continue;
+		const { filePath, content } = result;
 		if (content === null) {
 			warnings.push(`Failed to read file: ${filePath}`);
 			continue;
@@ -858,8 +937,11 @@ interface ExtensionModuleManifest {
 async function readExtensionModuleManifest(
 	_ctx: LoadContext,
 	packageJsonPath: string,
+	scope: ReadScope,
 ): Promise<ExtensionModuleManifest | null> {
-	const content = await readFile(packageJsonPath);
+	const resolvedPackageJsonPath = await canonicalizePathWithinHome(_ctx, packageJsonPath, undefined, scope);
+	if (!resolvedPackageJsonPath) return null;
+	const content = await readFile(resolvedPackageJsonPath, getReadOptions(_ctx, scope));
 	if (!content) return null;
 
 	const pkg = tryParseJson<{ gjc?: ExtensionModuleManifest; pi?: ExtensionModuleManifest }>(content);
@@ -881,47 +963,66 @@ async function readExtensionModuleManifest(
  * No recursion beyond one level. Complex packages must use package.json manifest.
  * Uses native glob for fast filesystem scanning with gitignore support.
  */
-export async function discoverExtensionModulePaths(_ctx: LoadContext, dir: string): Promise<string[]> {
+export async function discoverExtensionModulePaths(
+	ctx: LoadContext,
+	dir: string,
+	options: { scope?: ReadScope } = {},
+): Promise<string[]> {
 	const discovered = new Set<string>();
+	const scope = options.scope ?? "project";
+	const readOptions = getReadOptions(ctx, scope);
+	const discoveryDir = await canonicalizePathWithinHome(ctx, dir, undefined, scope);
+	if (!discoveryDir) return [];
 	const { FileType } = await discoveryNatives();
 	// Find all candidate files in parallel using glob
 	const [directFiles, indexFiles, packageJsonFiles] = await Promise.all([
 		// 1. Direct *.ts or *.js files
-		globIf(dir, "*.{ts,js}", FileType.File, false),
+		globIf(discoveryDir, "*.{ts,js}", FileType.File, false),
 		// 2. Subdirectory index files
-		globIf(dir, "*/index.{ts,js}", FileType.File, false),
+		globIf(discoveryDir, "*/index.{ts,js}", FileType.File, false),
 		// 3. Subdirectory package.json files
-		globIf(dir, "*/package.json", FileType.File, false),
+		globIf(discoveryDir, "*/package.json", FileType.File, false),
 	]);
 
 	// Process direct files
 	for (const match of directFiles) {
 		if (match.path.includes("/")) continue;
-		discovered.add(path.join(dir, match.path));
+		const candidatePath = await canonicalizePathWithinHome(
+			ctx,
+			path.join(discoveryDir, match.path),
+			undefined,
+			scope,
+		);
+		if (candidatePath && (await isAllowedIsolatedExtensionPath(ctx, candidatePath))) discovered.add(candidatePath);
 	}
 	// Track which subdirectories have package.json manifests with declared extensions
 	const subdirsWithDeclaredExtensions = new Set<string>();
 	for (const match of packageJsonFiles) {
 		const subdir = path.dirname(match.path); // e.g., "my-extension"
-		const packageJsonPath = path.join(dir, match.path);
-		const manifest = await readExtensionModuleManifest(_ctx, packageJsonPath);
+		const packageJsonPath = path.join(discoveryDir, match.path);
+		const manifest = await readExtensionModuleManifest(ctx, packageJsonPath, scope);
 		const declaredExtensions =
 			manifest?.extensions?.filter((extPath): extPath is string => typeof extPath === "string") ?? [];
 		if (declaredExtensions.length === 0) continue;
 		subdirsWithDeclaredExtensions.add(subdir);
-		const subdirPath = path.join(dir, subdir);
+		const subdirPath = path.join(discoveryDir, subdir);
 		for (const extPath of declaredExtensions) {
-			let resolvedExtPath = path.resolve(subdirPath, extPath);
-			const entries = await readDirEntries(resolvedExtPath);
+			const configuredPath = path.resolve(subdirPath, extPath);
+			const resolvedConfiguredPath = await canonicalizePathWithinHome(ctx, configuredPath, undefined, scope);
+			if (!resolvedConfiguredPath) continue;
+			let resolvedExtPath = resolvedConfiguredPath;
+			const entries = await readDirEntries(resolvedExtPath, readOptions);
 			if (entries.length !== 0) {
 				const pluginFilePath = entries.find(
 					e => e.isFile() && (e.name === "index.ts" || e.name === "index.js"),
 				)?.name;
 				resolvedExtPath = pluginFilePath ? path.join(resolvedExtPath, pluginFilePath) : resolvedExtPath;
 			}
-			const content = await readFile(resolvedExtPath);
+			const canonicalExtPath = await canonicalizePathWithinHome(ctx, resolvedExtPath, undefined, scope);
+			if (!canonicalExtPath || !(await isAllowedIsolatedExtensionPath(ctx, canonicalExtPath))) continue;
+			const content = await readFile(canonicalExtPath, readOptions);
 			if (content !== null) {
-				discovered.add(resolvedExtPath);
+				discovered.add(canonicalExtPath);
 			}
 		}
 	}
@@ -936,7 +1037,13 @@ export async function discoverExtensionModulePaths(_ctx: LoadContext, dir: strin
 		}
 	}
 	for (const preferredPath of preferredIndexBySubdir.values()) {
-		discovered.add(path.join(dir, preferredPath));
+		const candidatePath = await canonicalizePathWithinHome(
+			ctx,
+			path.join(discoveryDir, preferredPath),
+			undefined,
+			scope,
+		);
+		if (candidatePath && (await isAllowedIsolatedExtensionPath(ctx, candidatePath))) discovered.add(candidatePath);
 	}
 	return [...discovered];
 }
@@ -1058,34 +1165,62 @@ export function parseClaudePluginsRegistry(content: string): ClaudePluginsRegist
  * This is the single source of truth for "active project root" used by install,
  * uninstall, list, upgrade, discovery, and doctor. Deterministic for a given `cwd`.
  */
-export async function resolveActiveProjectRegistryPath(cwd: string): Promise<string | null> {
+export async function resolveActiveProjectRegistryPath(
+	cwd: string,
+	homeDir?: string,
+	isolatedHome = false,
+): Promise<string | null> {
 	// Pass 1: walk up looking for an existing .gjc/ directory (nearest wins).
-	// Stop before the provenance-checked home — ~/.gjc/ is the user-level config dir, not a project root.
-	const homeDir = getTrustedHomeDir();
-	let dir = path.resolve(cwd);
-	while (dir !== homeDir) {
+	// Stop before the caller's authoritative home — its .gjc/ is the user-level
+	// config dir, not a project root. Explicit-home capability loading passes
+	// that supplied home instead of leaking the process-global trusted home.
+	const canonicalize = async (value: string): Promise<string> => {
 		try {
-			const stat = await fs.promises.stat(path.join(dir, getConfigDirName()));
+			return await fs.promises.realpath(value);
+		} catch {
+			return path.resolve(value);
+		}
+	};
+	const explicitHome = homeDir !== undefined;
+	const trustedHome = isolatedHome ? null : await canonicalize(getTrustedHomeDir()).catch(() => null);
+	homeDir = await canonicalize(homeDir ?? getTrustedHomeDir());
+	const canonicalCwd = await canonicalize(cwd);
+	const relativeHome = path.relative(homeDir, canonicalCwd);
+	const explicitBoundary = isolatedHome || (explicitHome && homeDir !== trustedHome);
+	const effectiveStop =
+		!explicitBoundary ||
+		relativeHome === "" ||
+		(relativeHome !== ".." && !relativeHome.startsWith(`..${path.sep}`) && !path.isAbsolute(relativeHome))
+			? homeDir
+			: canonicalCwd;
+	let dir = canonicalCwd;
+	while (true) {
+		if (dir === effectiveStop && effectiveStop === homeDir) break;
+		try {
+			const stat = await fs.promises.stat(path.join(dir, CONFIG_DIR_NAME));
 			if (stat.isDirectory()) {
-				return path.join(dir, getConfigDirName(), "plugins", "installed_plugins.json");
+				return path.join(dir, CONFIG_DIR_NAME, "plugins", "installed_plugins.json");
 			}
 		} catch {
 			// not found at this level — continue up
 		}
+		if (dir === effectiveStop) break;
 		const parent = path.dirname(dir);
 		if (parent === dir) break; // filesystem root
 		dir = parent;
 	}
 
 	// Pass 2: walk up looking for .git as a fallback anchor.
-	dir = path.resolve(cwd);
-	while (dir !== homeDir) {
+	dir = canonicalCwd;
+	while (true) {
+		if (dir === effectiveStop && effectiveStop === homeDir) break;
 		try {
 			await fs.promises.stat(path.join(dir, ".git"));
-			return path.join(dir, getConfigDirName(), "plugins", "installed_plugins.json");
+			return path.join(dir, CONFIG_DIR_NAME, "plugins", "installed_plugins.json");
 		} catch {
 			// not found at this level — continue up
 		}
+		if (dir === effectiveStop) break;
 		const parent = path.dirname(dir);
 		if (parent === dir) break; // filesystem root
 		dir = parent;
@@ -1111,46 +1246,154 @@ export async function resolveOrDefaultProjectRegistryPath(cwd: string): Promise<
 	// Home directory must not be treated as a project root: the fallback path would alias
 	// getInstalledPluginsRegistryPath(), causing MarketplaceManager to load the same file
 	// as both user and project registry and producing duplicates / disambiguation errors.
-	if (path.resolve(cwd) === getTrustedHomeDir()) return undefined;
-	return path.join(cwd, getConfigDirName(), "plugins", "installed_plugins.json");
+	const [canonicalCwd, canonicalHome] = await Promise.all([
+		fs.promises.realpath(cwd).catch(() => path.resolve(cwd)),
+		fs.promises.realpath(getTrustedHomeDir()).catch(() => path.resolve(getTrustedHomeDir())),
+	]);
+	if (canonicalCwd === canonicalHome) return undefined;
+	return path.join(cwd, CONFIG_DIR_NAME, "plugins", "installed_plugins.json");
 }
 
 const pluginRootsCache = new Map<string, { roots: ClaudePluginRoot[]; warnings: string[] }>();
 
 /** Invalidate the exact user/project registry pair and their resolved-root cache entry. */
-export async function invalidateClaudePluginRoots(home: string, cwd?: string): Promise<void> {
-	const resolvedProjectPath = cwd ? await resolveActiveProjectRegistryPath(cwd) : null;
-	invalidateFsCache(path.join(getPluginsDir(home), "installed_plugins.json"));
-	if (resolvedProjectPath) invalidateFsCache(resolvedProjectPath);
-	pluginRootsCache.delete(`${home}:${resolvedProjectPath ?? ""}`);
+export async function invalidateClaudePluginRoots(home: string, cwd?: string, isolatedHome = false): Promise<void> {
+	const resolvedProjectPath = cwd ? await resolveActiveProjectRegistryPath(cwd, home, isolatedHome) : null;
+	const canonicalHome = await canonicalizeThroughExistingAncestor(home);
+	const rawGjcRegistryPath = path.join(getPluginsDir(home), "installed_plugins.json");
+	const gjcRegistryPath = await canonicalizePluginRegistryPath(canonicalHome, rawGjcRegistryPath, isolatedHome);
+	const projectRegistryPath = resolvedProjectPath
+		? await canonicalizePluginRegistryPath(canonicalHome, resolvedProjectPath, isolatedHome)
+		: undefined;
+	for (const registryPath of new Set([
+		rawGjcRegistryPath,
+		gjcRegistryPath,
+		resolvedProjectPath,
+		projectRegistryPath,
+	])) {
+		if (registryPath) invalidateFsCache(registryPath);
+	}
+	pluginRootsCache.delete(`${canonicalHome}:${gjcRegistryPath ?? ""}:${projectRegistryPath ?? ""}`);
+}
+
+async function canonicalizeThroughExistingAncestor(target: string): Promise<string> {
+	const resolved = path.resolve(target);
+	const suffix: string[] = [];
+	let current = resolved;
+
+	while (true) {
+		try {
+			const real = await fs.promises.realpath(current);
+			return suffix.length > 0 ? path.join(real, ...suffix.reverse()) : real;
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+			const parent = path.dirname(current);
+			if (parent === current) return resolved;
+			suffix.push(path.basename(current));
+			current = parent;
+		}
+	}
+}
+
+function isWithinOrEqual(root: string, candidate: string): boolean {
+	const relative = path.relative(root, candidate);
+	return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+}
+
+async function canonicalizePluginRegistryPath(
+	home: string,
+	registryPath: string,
+	isolatedHome: boolean,
+): Promise<string | undefined> {
+	const canonical = await canonicalizeThroughExistingAncestor(registryPath);
+	if (isolatedHome) {
+		const canonicalHome = await canonicalizeThroughExistingAncestor(home);
+		if (!isWithinOrEqual(canonicalHome, canonical)) return undefined;
+	}
+	return canonical;
+}
+
+/**
+ * Resolve a configured path through existing symlinks when an explicit-home
+ * load is active. Ordinary discovery keeps its historical lexical path
+ * handling; isolated discovery must reject paths that leave the supplied
+ * physical home (or an explicitly selected agent directory), including paths
+ * that escape through an existing symlink. When provided, containmentRoot is
+ * an additional physical boundary, such as a plugin root.
+ */
+export async function canonicalizePathWithinHome(
+	ctx: Pick<LoadContext, "home" | "isolatedHome" | "userAgentDir" | "homeIdentity">,
+	target: string,
+	containmentRoot?: string,
+	scope: ReadScope = "project",
+): Promise<string | undefined> {
+	if (!ctx.isolatedHome) return target;
+	const roots = scope === "native" ? [ctx.home, ctx.userAgentDir] : [ctx.home];
+	const canonicalRoots = await Promise.all(
+		roots.filter((root): root is string => typeof root === "string").map(canonicalizeThroughExistingAncestor),
+	);
+	const canonicalTarget = await canonicalizeThroughExistingAncestor(target);
+	if (!canonicalRoots.some(root => isWithinOrEqual(root, canonicalTarget))) return undefined;
+	if (containmentRoot) {
+		const canonicalContainmentRoot = await canonicalizeThroughExistingAncestor(containmentRoot);
+		if (!isWithinOrEqual(canonicalContainmentRoot, canonicalTarget)) return undefined;
+	}
+	return canonicalTarget;
+}
+
+async function resolveIsolatedPluginPath(home: string, value: string): Promise<string | undefined> {
+	const canonicalHome = await canonicalizeThroughExistingAncestor(home);
+	const resolved = path.resolve(canonicalHome, value);
+	const canonical = await canonicalizeThroughExistingAncestor(resolved);
+	if (!isWithinOrEqual(canonicalHome, canonical)) return undefined;
+	return canonical;
 }
 
 /**
  * List installed GJC plugin roots from the GJC plugin registry and, when present,
  * the nearest project-scoped registry resolved from `cwd`.
  *
- * Results are cached per `home:resolvedProjectPath` key to avoid repeated parsing.
+ * Ordinary results are cached per `home:resolvedProjectPath` key to avoid
+ * repeated parsing. Isolated results intentionally bypass the shared cache:
+ * an ordinary load may contain external install roots that an isolated load
+ * must reject, and reusing that result would cross the home boundary.
  */
 
 export async function listClaudePluginRoots(
 	home: string,
 	cwd?: string,
+	isolatedHome = false,
+	homeIdentity?: FileIdentity,
 ): Promise<{ roots: ClaudePluginRoot[]; warnings: string[] }> {
-	const resolvedProjectPath = cwd ? await resolveActiveProjectRegistryPath(cwd) : null;
-	const cacheKey = `${home}:${resolvedProjectPath ?? ""}`;
-	const cached = pluginRootsCache.get(cacheKey);
-	if (cached) return cached;
+	const resolvedProjectPath = cwd ? await resolveActiveProjectRegistryPath(cwd, home, isolatedHome) : null;
+	const canonicalHome = await canonicalizeThroughExistingAncestor(home);
+	const rawGjcRegistryPath = path.join(getPluginsDir(home), "installed_plugins.json");
+	const gjcRegistryPath = await canonicalizePluginRegistryPath(canonicalHome, rawGjcRegistryPath, isolatedHome);
+	const projectRegistryPath = resolvedProjectPath
+		? await canonicalizePluginRegistryPath(canonicalHome, resolvedProjectPath, isolatedHome)
+		: undefined;
+	const cacheKey = `${canonicalHome}:${gjcRegistryPath ?? ""}:${projectRegistryPath ?? ""}`;
+	if (!isolatedHome) {
+		const cached = pluginRootsCache.get(cacheKey);
+		if (cached) return cached;
+	}
 
 	const roots: ClaudePluginRoot[] = [];
 	const warnings: string[] = [];
 	const projectRoots: ClaudePluginRoot[] = [];
+	const registryReadOptions: ReadFileOptions | undefined = isolatedHome
+		? { isolatedHome: true, home: canonicalHome, homeIdentity, scope: "project", bypassCache: true }
+		: undefined;
 
 	// ── GJC installed plugins registry ───────────────────────────────────────
 	// In production `home` is the provenance-checked home, so `getPluginsDir(home)` resolves to the
 	// same XDG-aware path the marketplace writer uses (reads and writes always agree).
 	// Tests pass a temp dir, which short-circuits the resolver for deterministic isolation.
-	const gjcRegistryPath = path.join(getPluginsDir(home), "installed_plugins.json");
-	const gjcContent = await readFile(gjcRegistryPath);
+	const gjcContent = gjcRegistryPath ? await readFile(gjcRegistryPath, registryReadOptions) : null;
+	if (isolatedHome && !gjcRegistryPath) {
+		warnings.push(`Ignoring GJC plugin registry outside the isolated home: ${rawGjcRegistryPath}`);
+	}
 	if (gjcContent) {
 		const gjcRegistry = parseClaudePluginsRegistry(gjcContent);
 		if (gjcRegistry) {
@@ -1166,20 +1409,33 @@ export async function listClaudePluginRoots(
 				const marketplace = pluginId.slice(atIndex + 1);
 
 				for (const entry of entries) {
-					if (!entry.installPath || typeof entry.installPath !== "string") {
+					if (
+						!entry ||
+						typeof entry !== "object" ||
+						Array.isArray(entry) ||
+						!entry.installPath ||
+						typeof entry.installPath !== "string"
+					) {
 						warnings.push(`Plugin ${pluginId} entry has no installPath`);
 						continue;
 					}
 					if (entry.enabled === false) continue;
+					const installPath = isolatedHome
+						? await resolveIsolatedPluginPath(home, entry.installPath)
+						: entry.installPath;
+					if (!installPath) {
+						warnings.push(`Plugin ${pluginId} installPath escapes the isolated home`);
+						continue;
+					}
 					// Deduplicate by installPath within same ID
-					if (roots.some(r => r.id === pluginId && r.path === entry.installPath)) continue;
+					if (roots.some(r => r.id === pluginId && r.path === installPath)) continue;
 
 					roots.push({
 						id: pluginId,
 						marketplace,
 						plugin: pluginName,
 						version: entry.version || "unknown",
-						path: entry.installPath,
+						path: installPath,
 						scope: entry.scope || "user",
 					});
 				}
@@ -1193,7 +1449,10 @@ export async function listClaudePluginRoots(
 	// Loaded from the nearest .gjc/plugins/installed_plugins.json relative to cwd.
 	// Project entries take precedence over user entries for the same plugin ID.
 	if (resolvedProjectPath) {
-		const projectContent = await readFile(resolvedProjectPath);
+		const projectContent = projectRegistryPath ? await readFile(projectRegistryPath, registryReadOptions) : null;
+		if (isolatedHome && !projectRegistryPath) {
+			warnings.push(`Ignoring project plugin registry outside the isolated home: ${resolvedProjectPath}`);
+		}
 		if (projectContent) {
 			const projectRegistry = parseClaudePluginsRegistry(projectContent);
 			if (projectRegistry) {
@@ -1207,23 +1466,36 @@ export async function listClaudePluginRoots(
 					const pluginName = pluginId.slice(0, atIndex);
 					const marketplace = pluginId.slice(atIndex + 1);
 					for (const entry of entries) {
-						if (!entry.installPath || typeof entry.installPath !== "string") {
+						if (
+							!entry ||
+							typeof entry !== "object" ||
+							Array.isArray(entry) ||
+							!entry.installPath ||
+							typeof entry.installPath !== "string"
+						) {
 							warnings.push(`Plugin ${pluginId} entry has no installPath`);
 							continue;
 						}
 						if (entry.enabled === false) continue;
+						const installPath = isolatedHome
+							? await resolveIsolatedPluginPath(home, entry.installPath)
+							: entry.installPath;
+						if (!installPath) {
+							warnings.push(`Plugin ${pluginId} installPath escapes the isolated home`);
+							continue;
+						}
 						projectRoots.push({
 							id: pluginId,
 							marketplace,
 							plugin: pluginName,
 							version: entry.version || "unknown",
-							path: entry.installPath,
+							path: installPath,
 							scope: "project",
 						});
 					}
 				}
 			} else {
-				warnings.push(`Failed to parse project plugin registry: ${resolvedProjectPath}`);
+				warnings.push(`Failed to parse project plugin registry: ${projectRegistryPath}`);
 			}
 		}
 	}
@@ -1237,7 +1509,7 @@ export async function listClaudePluginRoots(
 	}
 
 	const result = { roots, warnings };
-	pluginRootsCache.set(cacheKey, result);
+	if (!isolatedHome) pluginRootsCache.set(cacheKey, result);
 	return result;
 }
 

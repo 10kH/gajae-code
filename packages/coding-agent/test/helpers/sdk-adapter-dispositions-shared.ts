@@ -305,7 +305,7 @@ export function daemonCliLifecycleInput(host: AdapterFixture, operation: string)
 		case "session.resume":
 			return { cwd: host.repo, stateRoot: invalidStateRoot, sessionId: host.sessionId };
 		case "session.close":
-			return { sessionId: host.sessionId, unexpected: true };
+			return { sessionId: "missing-session", unexpected: true };
 		case "session.delete":
 			return { sessionId: "missing-session" };
 		case "session.reconcile_uncertain":
@@ -559,8 +559,11 @@ export async function assertDaemonCliRow(operation: Operation, secret: boolean):
 		};
 		const result = await runDaemonCli(args);
 		if (expected === "forwarded") {
-			if (action === "global") expectGlobalSemanticResult(operation, result.output);
-			else expectSemanticResult(operation, result.output);
+			if (action === "global") {
+				if (operation.sdkId === "session.close")
+					expect(result.output).toMatchObject({ ok: false, error: { code: "not_found" } });
+				else expectGlobalSemanticResult(operation, result.output);
+			} else expectSemanticResult(operation, result.output);
 		} else expect(result.output).toMatchObject({ ok: false, error: expect.any(Object) });
 		expectObservation(host, before, operation, expected);
 	} finally {
