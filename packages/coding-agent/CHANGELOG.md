@@ -2686,3 +2686,4 @@
 - Updated Tavily missing-credential feedback to prompt users to configure an API-key provider setting instead of referencing `agent.db` directly
 - Refreshed expired OpenAI code provider OAuth tokens during `web_search` execution and persisted the updated credentials so searches continue working after token expiry
 - Wired `/login`, `/logout`, `/model`, and `/provider` TUI slash commands through interactive provider/model selectors and existing OAuth flows.
+- SDK `turn.prompt` now fails closed when a provider returns structurally empty assistant output without independent activity evidence, including zero, omitted, null, or malformed usage, while preserving meaningful text or reasoning, complete tool calls, positive-token activity, and explicit cancellation. (#5015)
