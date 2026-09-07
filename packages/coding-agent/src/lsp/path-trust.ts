@@ -64,11 +64,12 @@ export function isProjectControlledPath(candidate: string, cwd: string): boolean
 	const canonicalHome = canonicalPath(home);
 	const stopPaths = new Set([path.resolve(home), canonicalHome].map(normalizePathForComparison));
 	const lexicalTrustRoot = findProjectTrustRoot(cwd, stopPaths);
-	// A user-owned executable under HOME (e.g. ~/.gjc/bin) is only exempt from a
-	// trust root that itself lives under HOME. Each check judges home scope on the
-	// same view of the path it inspects, without dereferencing the candidate:
-	// mixing views let a project link into HOME, or a HOME link into the project,
-	// escape rejection. HOME may itself be spelled lexically or canonically.
+	// A trust root outside HOME must not claim user executables inside HOME
+	// (e.g. ~/.gjc/bin); a root under HOME still owns what it contains. Each check
+	// judges home scope on the same view of the path it inspects, without
+	// dereferencing the candidate: mixing views let a project link into HOME, or a
+	// HOME link into the project, escape rejection. HOME may itself be spelled
+	// lexically or canonically.
 	const candidateIsLexicallyHomeScoped =
 		pathIsLexicallyWithin(home, candidate) || pathIsLexicallyWithin(canonicalHome, candidate);
 	if (
