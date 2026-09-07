@@ -1158,7 +1158,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		const settleH2WhenReady = (): void => {
 			if (terminalDrainMode) return;
 			if (!queueDrained) return;
-			if (pendingBuffer.length > 0) return;
+			if (pendingBuffer.length >= 5 && pendingBuffer.length >= 5 + pendingBuffer.readUInt32BE(1)) return;
 			if (endStreamError) {
 				settleBehindFence(() => settleH2(endStreamError));
 			} else if (sawTurnEnded && responseEnded) {
@@ -2021,6 +2021,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 										// earlier terminal closes admission. Do not leave parser state
 										// permanently paused while that dropped promise accounts down.
 										processingPausedForExec = false;
+										if (terminalBoundaryObserved || terminalBoundarySeen) h2Request!.resume();
 										processPendingBuffer?.();
 									}
 								}
