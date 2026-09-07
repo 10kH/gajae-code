@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.16.6] - 2026-09-07
+
 ## [0.16.5] - 2026-09-07
 
 - Documented `GJC_OPENAI_CODE_WEBSOCKET_V2` as a switch that enables a websocket v2 path. No code read it under that name, under the legacy `PI_CODEX_WEBSOCKET_V2`, or under the `PI_OPENAI_CODE_WEBSOCKET_V2` the historical entry records; the v2 beta header has been unconditional for websocket transport. The documentation row is removed rather than reintroducing a knob, and the test that claimed to gate on it no longer writes an environment variable nothing reads.
