@@ -525,6 +525,33 @@ describe("LSP repository command trust", () => {
 		expect(loadConfig(cwd).servers["rust-analyzer"]).toBeUndefined();
 	});
 
+	it("keeps HOME executables exempt from an ancestor cwd when HOME is a symlink, under either spelling", async () => {
+		if (process.platform === "win32") return;
+
+		using tempDir = TempDir.createSync("@gjc-lsp-home-alias-trust-");
+		const canonicalHome = path.join(tempDir.path(), "home");
+		const lexicalHome = path.join(tempDir.path(), "home-link");
+		const userBin = path.join(canonicalHome, ".gjc", "bin");
+		await fs.promises.mkdir(userBin, { recursive: true });
+		await fs.promises.symlink(canonicalHome, lexicalHome);
+		const server = path.join(userBin, "typescript-language-server");
+		await Bun.write(server, "");
+		vi.spyOn(os, "homedir").mockReturnValue(lexicalHome);
+
+		// cwd is HOME's parent: its fallback trust root contains HOME, so only the
+		// home exemption keeps user executables trusted.
+		const cwd = tempDir.path();
+		expect(isProjectControlledPath(path.join(lexicalHome, ".gjc", "bin", "typescript-language-server"), cwd)).toBe(
+			false,
+		);
+		expect(isProjectControlledPath(server, cwd)).toBe(false);
+
+		// A project file directly under that same ancestor cwd is still owned.
+		const projectFile = path.join(cwd, "typescript-language-server");
+		await Bun.write(projectFile, "");
+		expect(isProjectControlledPath(projectFile, cwd)).toBe(true);
+	});
+
 	it("rejects home-crossing symlinks in both directions when the repository is a sibling of HOME", async () => {
 		if (process.platform === "win32") return;
 
