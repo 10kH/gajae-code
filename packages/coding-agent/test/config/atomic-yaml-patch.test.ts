@@ -12,7 +12,7 @@ import {
 	atomicYamlPathHash,
 	withAtomicYamlConfigTransaction,
 } from "../../src/config/atomic-yaml-patch";
-import { FileLockTestHooks } from "../../src/config/file-lock";
+import { FileLockAcquireError, FileLockTestHooks } from "../../src/config/file-lock";
 
 const temporaryDirectories: string[] = [];
 
@@ -103,7 +103,7 @@ describe("atomic YAML patches", () => {
 
 			await expect(
 				applyAtomicYamlPatches(configPath, [{ path: "feature.enabled", op: "set", value: true }]),
-			).rejects.toThrow("Failed to acquire lock");
+			).rejects.toThrow(FileLockAcquireError);
 			expect(await fs.readFile(path.join(lockPath, "info"), "utf8")).toBe(
 				JSON.stringify({ pid: 0, timestamp: "invalid" }),
 			);

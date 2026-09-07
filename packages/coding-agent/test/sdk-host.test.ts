@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { FileLockAcquireError } from "../src/config/file-lock";
 import { SessionEventStream, SessionSdkHost, shouldHostSdk } from "../src/sdk/host";
 
 describe("session SDK event stream", () => {
@@ -159,12 +160,39 @@ describe("SessionSdkHost", () => {
 		await host.registerWithBroker({
 			register: () => {},
 			unregister: () => {
-				throw new Error("Failed to acquire lock for /tmp/index.jsonl after 600 attempts: held by pid 123 (live)");
+				const error = new FileLockAcquireError(
+					"/tmp/index.jsonl",
+					"/tmp/index.jsonl.lock",
+					600,
+					"held by pid 123 (live)",
+				);
+				error.message = "operator wording can change";
+				throw error;
 			},
 		});
 
 		await expect(host.stop({ allowLockContention: true })).resolves.toBe("stopped");
 		expect(host.started).toBe(false);
+	});
+
+	test("does not defer a non-lock error even when its message resembles contention", async () => {
+		const error = new Error("Failed to acquire lock for an unrelated operation");
+		const host = new SessionSdkHost({
+			sessionId: "non-lock-stop",
+			stateRoot: "/tmp/non-lock-stop",
+			token: "t",
+			sendFrame: () => "written",
+			onFrame: () => () => {},
+		});
+		await host.registerWithBroker({
+			register: () => {},
+			unregister: () => {
+				throw error;
+			},
+		});
+		await host.start();
+		await expect(host.stop({ allowLockContention: true })).rejects.toBe(error);
+		expect(host.started).toBe(true);
 	});
 
 	test("keeps lock contention retryable during session replacement", async () => {
@@ -181,14 +209,17 @@ describe("SessionSdkHost", () => {
 			unregister: () => {
 				unregisterAttempts++;
 				if (unregisterAttempts === 1)
-					throw new Error(
-						"Failed to acquire lock for /tmp/index.jsonl after 600 attempts: held by pid 123 (live)",
+					throw new FileLockAcquireError(
+						"/tmp/index.jsonl",
+						"/tmp/index.jsonl.lock",
+						600,
+						"held by pid 123 (live)",
 					);
 			},
 		});
 		await host.start();
 
-		await expect(host.stop()).rejects.toThrow("Failed to acquire lock");
+		await expect(host.stop()).rejects.toThrow(FileLockAcquireError);
 		expect(host.started).toBe(true);
 		expect(unregisterAttempts).toBe(1);
 		expect(await host.stop()).toBe("stopped");

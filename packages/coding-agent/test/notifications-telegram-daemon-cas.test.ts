@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { FileLockAcquireError } from "../src/config/file-lock";
 import {
 	FilesystemTopicRegistryCasAuthority,
 	loadInstallationHostId,
@@ -397,7 +398,7 @@ test("foreign-host locks with locally dead PIDs fail closed instead of permittin
 	);
 
 	await expect(registry.compareAndSet(0, { version: 2, registryGeneration: 1, topics: {} })).rejects.toThrow(
-		"Failed to acquire lock",
+		FileLockAcquireError,
 	);
 	expect(fs.existsSync(lockDir)).toBe(true);
 	expect(fs.existsSync(file)).toBe(false);
