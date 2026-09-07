@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import type { AssistantMessage, Message, ToolResultMessage } from "@gajae-code/ai";
 import { CONTEXT_OVERFLOW_EXIT_CODE, runPrintMode } from "../src/modes/print-mode";
 import type { AgentSession } from "../src/session/agent-session";
+import { ManagedAppendIdentityMismatchError } from "../src/session/internal/managed-session-storage";
 import { SILENT_ABORT_MARKER } from "../src/session/messages";
 
 function makeAssistantMessage(overrides: Partial<AssistantMessage> = {}): AssistantMessage {
@@ -183,6 +184,28 @@ describe("Print mode", () => {
 		process.exitCode = 0;
 	});
 
+	it("reports an append fence rejection once and disposes without throwing", async () => {
+		const output: string[] = [];
+		installImmediateStderrMock(output);
+		installImmediateStdoutMock();
+		const tracking = createPrintModeTrackingSession();
+		tracking.prompt.mockRejectedValue(new ManagedAppendIdentityMismatchError("session.jsonl"));
+		await runPrintMode(tracking.session, { mode: "text", initialMessage: "hello" });
+		expect(process.exitCode).toBe(1);
+		expect(output).toEqual([
+			"Session was resumed by another process; this resume did not run. Retry, or resume a different session.\n",
+		]);
+		expect(tracking.dispose).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not swallow unrelated disposal failures after an append fence rejection", async () => {
+		installImmediateStderrMock([]);
+		installImmediateStdoutMock();
+		const failure = new Error("uncertain close");
+		const tracking = createPrintModeTrackingSession({ disposeError: failure });
+		tracking.prompt.mockRejectedValue(new ManagedAppendIdentityMismatchError("session.jsonl"));
+		await expect(runPrintMode(tracking.session, { mode: "text", initialMessage: "hello" })).rejects.toBe(failure);
+	});
 	it("prints each session configuration warning to stderr once", async () => {
 		const stderrOutput: string[] = [];
 		installImmediateStderrMock(stderrOutput);

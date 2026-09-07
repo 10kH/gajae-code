@@ -112,6 +112,7 @@ import {
 	captureManagedFileNoFollow,
 	fsyncManagedArtifactTree,
 	MANAGED_ARTIFACT_MAX_FILE_BYTES,
+	ManagedAppendIdentityMismatchError,
 	type ManagedAppendReceipt,
 	type ManagedBoundedAppendExpectation,
 	ManagedCommittedMutationError,
@@ -11873,6 +11874,10 @@ export class SessionManager {
 		return false;
 	}
 
+	/** Ownership loss remains observable even when an agent event listener aborts the turn. */
+	getAppendIdentityMismatch(): ManagedAppendIdentityMismatchError | undefined {
+		return this.#persistError instanceof ManagedAppendIdentityMismatchError ? this.#persistError : undefined;
+	}
 	#recordPersistError(err: unknown): Error {
 		const normalized = toError(err);
 		if (!this.#persistError) this.#persistError = normalized;
@@ -16255,7 +16260,11 @@ export class SessionManager {
 			}
 		}
 		const outcome = await this.closeStrict();
-		return priorFlushError && outcome.kind === "closed" ? { kind: "close_unknown", error: priorFlushError } : outcome;
+		return priorFlushError &&
+			!(priorFlushError instanceof ManagedAppendIdentityMismatchError) &&
+			outcome.kind === "closed"
+			? { kind: "close_unknown", error: priorFlushError }
+			: outcome;
 	}
 
 	/**
@@ -16280,6 +16289,21 @@ export class SessionManager {
 			});
 		}
 		if (preparedCleanupError) return { kind: "close_failed_retryable", error: preparedCleanupError };
+		await this.#persistChain;
+		// Managed appends are synchronous and reject identity drift before writing.
+		// Disown the stale transcript, not an uncertain OS writer: never rewrite a
+		// successor owned by another process while disposing this rejected resume.
+		if (
+			this.destination.kind === "managed" &&
+			!this.#persistWriter &&
+			this.#persistError instanceof ManagedAppendIdentityMismatchError
+		) {
+			this.#needsFullRewriteOnNextPersist = false;
+			this.#strictResumeMutationPending = false;
+			this.#managedPersistExpectedIdentity = undefined;
+			this.#persistError = undefined;
+			this.#persistErrorReported = false;
+		}
 		let priorPersistError = this.#persistError;
 		if (this.#needsFullRewriteOnNextPersist && (!this.#readOnlyResume || this.#strictResumeMutationPending)) {
 			await this.#persistChain.catch(() => {});
@@ -17379,10 +17403,7 @@ export class SessionManager {
 					receipt = store.appendExpectedIdentitySync(relativePath, bytes, this.#managedPersistExpectedIdentity);
 				} catch (err) {
 					const predecessorMissing = store.descriptorExpected(relativePath) === null;
-					if (
-						!isEnoent(err) &&
-						(!(err instanceof Error) || err.message !== "managed_append_identity_mismatch" || !predecessorMissing)
-					)
+					if (!isEnoent(err) && (!(err instanceof ManagedAppendIdentityMismatchError) || !predecessorMissing))
 						throw err;
 					// Appending only the new records would create a truncated transcript.
 					// Recreate the missing file from the complete resident entry set instead.
@@ -17724,6 +17745,9 @@ export class SessionManager {
 			if (entry.type === "label") this.#labelRevision++;
 			if (sidecarAppendCharge > 0) activeRuntime?.accountant.release(sidecarAppendCharge);
 			if (sidecarTailCharge > 0) activeRuntime?.tailCache.release(sidecarTailCharge);
+			// The pre-write fence is an expected ownership loss, not an uncertain
+			// append. Preserve its type after rolling back the rejected entry.
+			if (error instanceof ManagedAppendIdentityMismatchError) throw error;
 			throw new SessionAppendPersistenceError(
 				priorPersistenceError ? "prior_failure" : "current_append",
 				residentEntry.id,

@@ -10,6 +10,7 @@ import { type AssistantMessage, type ImageContent, isContextOverflow } from "@ga
 import { isKnownSinkPeerClosedError, logger, sanitizeText } from "@gajae-code/utils";
 import { loadSlashCommands } from "../extensibility/slash-commands";
 import type { AgentSession } from "../session/agent-session";
+import { ManagedAppendIdentityMismatchError } from "../session/internal/managed-session-storage";
 import { isSilentAbort } from "../session/messages";
 import { resolveProviderSafetyStopHint } from "../session/provider-safety-stop-hint";
 import { executeLocalHeadlessBuiltinSlashCommand } from "../slash-commands/builtin-registry";
@@ -388,7 +389,12 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 		// Observe callback and stream errors from every preceding print-mode write.
 		await stdout.flush();
 	} catch (error) {
-		failures.push(error);
+		if (error instanceof ManagedAppendIdentityMismatchError) {
+			process.exitCode = 1;
+			await writeStderrAndQuiesce(
+				"Session was resumed by another process; this resume did not run. Retry, or resume a different session.\n",
+			);
+		} else failures.push(error);
 	} finally {
 		// The JSON subscriber remains live while disposal emits its final events.
 		try {

@@ -13,6 +13,7 @@ import {
 	GJC_COORDINATOR_SESSION_READINESS_FILE_ENV,
 	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
 } from "../src/gjc-runtime/session-state-sidecar";
+import { ManagedAppendIdentityMismatchError } from "../src/session/internal/managed-session-storage";
 
 function createInput(overrides: Partial<SubmittedUserInput> = {}): SubmittedUserInput {
 	return {
@@ -243,7 +244,7 @@ describe("submitInteractiveInput", () => {
 		};
 		const session = {
 			prompt: vi.fn(async () => {
-				throw new Error("managed_append_identity_mismatch");
+				throw new ManagedAppendIdentityMismatchError("session.jsonl");
 			}),
 			promptCustomMessage: vi.fn(async () => {}),
 		};
@@ -251,7 +252,7 @@ describe("submitInteractiveInput", () => {
 
 		await expect(submitInteractiveInput(mode, session, input)).resolves.toBeUndefined();
 
-		expect(mode.showError).toHaveBeenCalledWith("managed_append_identity_mismatch");
+		expect(mode.showError).toHaveBeenCalledWith(new ManagedAppendIdentityMismatchError("session.jsonl").message);
 		expect(mode.finishPendingSubmission).toHaveBeenCalledWith(input);
 		expect(mode.checkShutdownRequested).toHaveBeenCalledTimes(1);
 	});
