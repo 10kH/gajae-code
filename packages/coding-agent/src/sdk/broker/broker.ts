@@ -2559,6 +2559,11 @@ export class Broker {
 				startedAt: now,
 				heartbeatAt: now,
 			};
+			// Readiness must not be externally visible until the initial session
+			// checkpoint settles. The bootstrap watchdog owns this pre-publication
+			// interval; publishing first allowed it to kill an endpoint already handed
+			// to callers when a legitimate index-lock wait outlived the fence.
+			await this.#checkpointSessionHeartbeats();
 			this.#publication = await publishBrokerDiscovery(this.settings.agentDir, this.discovery);
 			this.#publicationState = "healthy-owned";
 			this.#publishedAt = process.hrtime.bigint();
@@ -2570,7 +2575,6 @@ export class Broker {
 				void this.#watchPublication();
 				void this.#reapSpawnOrphans();
 			}, cadenceMs);
-			await this.#checkpointSessionHeartbeats();
 			return this.discovery;
 		} catch (error) {
 			await this.#transport?.stop();

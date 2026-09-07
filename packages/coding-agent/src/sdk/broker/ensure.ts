@@ -55,16 +55,12 @@ async function brokerLockHostIdentity(agentDir: string): Promise<BrokerLockHostI
 	const coordinationRoot = path.resolve(agentDir, "sdk");
 	const pending =
 		brokerLockHostIdentityPromises.get(coordinationRoot) ??
-		Promise.all([
-			loadInstallationHostId({ configRootDir: coordinationRoot }),
-			loadInstallationHostId(),
-			loadLegacyInstallationHostId(),
-		]).then(([ownerHostId, installationHostId, legacyHostId]) => ({
-			ownerHostId,
-			previousOwnerHostIds: [...new Set([installationHostId, legacyHostId])].filter(
-				hostId => hostId !== ownerHostId,
-			),
-		}));
+		Promise.all([loadInstallationHostId({ configRootDir: coordinationRoot }), loadLegacyInstallationHostId()]).then(
+			([ownerHostId, legacyHostId]) => ({
+				ownerHostId,
+				previousOwnerHostIds: legacyHostId === ownerHostId ? [] : [legacyHostId],
+			}),
+		);
 	brokerLockHostIdentityPromises.set(coordinationRoot, pending);
 	try {
 		return await pending;

@@ -567,6 +567,8 @@ it("shared agent roots recover dead locks across config profiles despite a retai
 	const dead = spawnLockWorker(dir, ready, journal, "dead", 60_000, envA);
 	let brokerPid: number | undefined;
 	try {
+		await fs.mkdir(configB, { recursive: true });
+		await fs.writeFile(path.join(configB, "machine-identity.secret"), "malformed-default-profile-secret\n");
 		await waitForFile(ready);
 		const deadPid = dead.pid;
 		dead.kill("SIGKILL");
@@ -617,6 +619,9 @@ it("shared agent roots recover dead locks across config profiles despite a retai
 		expect(discovery!.pid).not.toBe(deadPid);
 		expect(await fs.readdir(sdk)).not.toContain("broker.spawn.lock");
 		expect(await fs.readFile(path.join(legacyTombstone, "owner.json"), "utf8")).toContain("older-dead-broker");
+		expect(await fs.readFile(path.join(configB, "machine-identity.secret"), "utf8")).toBe(
+			"malformed-default-profile-secret\n",
+		);
 	} finally {
 		dead.kill("SIGKILL");
 		if (brokerPid !== undefined)
