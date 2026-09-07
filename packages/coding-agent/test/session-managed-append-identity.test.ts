@@ -43,7 +43,10 @@ it("throws the typed pre-write rejection when the append expectation no longer m
 	}
 });
 
-it("disposes a rejected managed append without rewriting the winner or manufacturing close uncertainty", async () => {
+it.each([
+	false,
+	true,
+])("disposes a rejected append without rewriting the winner (flush first: %s)", async flushFirst => {
 	const root = await makeRoot();
 	const manager = SessionManager.create(root, SessionManager.managedDestination(root, path.join(root, "agent")));
 	const auth = await AuthStorage.create(path.join(root, "auth.db"));
@@ -64,6 +67,7 @@ it("disposes a rejected managed append without rewriting the winner or manufactu
 		expect(() => manager.appendMessage({ role: "user", content: "loser", timestamp: 2 })).toThrow(
 			ManagedAppendIdentityMismatchError,
 		);
+		if (flushFirst) expect(await manager.flushAndCloseStrict()).toEqual({ kind: "closed" });
 		await expect(session.dispose()).resolves.toBeUndefined();
 		expect(await manager.closeStrict()).toEqual({ kind: "closed" });
 		expect(await Bun.file(file).text()).toBe(winner);
