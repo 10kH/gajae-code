@@ -196,7 +196,7 @@ Same as `definition`, but sends `textDocument/implementation` and reports `imple
 - Calls `detectLspmux(session.cwd)` and appends status text when a trusted `lspmux` is installed for the session trust root.
 
 **Output text**
-- `Active language servers: ...` or `No language servers configured for this project`, optionally followed by `lspmux: active (multiplexing enabled)` or `lspmux: installed but server not running`.
+- `Configured language servers: ...` or `No language servers configured for this project`, optionally followed by `lspmux: active (multiplexing enabled)` or `lspmux: installed but server not running`.
 
 ### `reload`
 **Inputs**

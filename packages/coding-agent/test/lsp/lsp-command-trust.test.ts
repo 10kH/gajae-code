@@ -17,6 +17,20 @@ const ORIGINAL_DISABLE_LSPMUX = Bun.env.PI_DISABLE_LSPMUX;
 const ORIGINAL_GJC_DISABLE_LSPMUX = Bun.env.GJC_DISABLE_LSPMUX;
 const ORIGINAL_CONFIG_DIR = process.env.GJC_CONFIG_DIR;
 
+/** Ancestors of `start` (inclusive) carrying a `.git` or `.gjc` project marker. */
+function ancestorProjectMarkers(start: string): string[] {
+	const markers: string[] = [];
+	let current = path.resolve(start);
+	for (;;) {
+		for (const marker of [".git", ".gjc"]) {
+			if (fs.existsSync(path.join(current, marker))) markers.push(path.join(current, marker));
+		}
+		const parent = path.dirname(current);
+		if (parent === current) return markers;
+		current = parent;
+	}
+}
+
 async function writeCanaryLspServer(directory: string): Promise<string> {
 	const scriptPath = path.join(directory, "canary-lsp.ts");
 	await Bun.write(
@@ -250,6 +264,30 @@ describe("LSP repository command trust", () => {
 		expect(fs.existsSync(canaryPath)).toBe(false);
 	});
 
+	it("reports configured language servers before a client starts", async () => {
+		using tempDir = TempDir.createSync("@gjc-lsp-configured-status-");
+		const cwd = path.join(tempDir.path(), "repo");
+		const externalBinDir = path.join(os.homedir(), `.gjc-lsp-configured-status-${process.pid}-${Date.now()}`);
+		const rustAnalyzer = path.join(externalBinDir, "rust-analyzer");
+		const forgetExternalGrant = registerOwnedDeletionRoot(externalBinDir);
+		await fs.promises.mkdir(cwd, { recursive: true });
+		await fs.promises.mkdir(externalBinDir, { recursive: true });
+		try {
+			await Bun.write(path.join(cwd, "Cargo.toml"), "[package]\n");
+			await Bun.write(rustAnalyzer, "");
+			vi.spyOn(piUtils, "$which").mockImplementation(command => (command === "rust-analyzer" ? rustAnalyzer : null));
+
+			const tool = new LspTool({ cwd } as ToolSession);
+			const result = await tool.execute("configured-status", { action: "status" });
+
+			expect(result.content).toEqual([{ type: "text", text: "Configured language servers: rust-analyzer" }]);
+			expect(result.details?.success).toBe(true);
+		} finally {
+			await safeRm(externalBinDir, { recursive: true, force: true });
+			forgetExternalGrant();
+		}
+	});
+
 	it("wraps supported servers with an external lspmux and honors both disable variables", async () => {
 		using tempDir = TempDir.createSync("@gjc-lspmux-external-");
 		const cwd = path.join(tempDir.path(), "repo");
@@ -311,9 +349,7 @@ describe("LSP repository command trust", () => {
 		expect(loadConfig(repositoryRoot).servers["typescript-language-server"]).toBeUndefined();
 
 		which.mockImplementation(command => (command === "typescript-language-server" ? externalSymlink : null));
-		expect(loadConfig(repositoryRoot).servers["typescript-language-server"]?.resolvedCommand).toBe(
-			fs.realpathSync(externalServer),
-		);
+		expect(loadConfig(repositoryRoot).servers["typescript-language-server"]?.resolvedCommand).toBe(externalSymlink);
 	});
 
 	it("finds repository-root executables through a symlinked nested session cwd", async () => {
@@ -421,7 +457,7 @@ describe("LSP repository command trust", () => {
 			.mockImplementation(command => (command === "typescript-language-server" ? userServer : null));
 
 		expect(isProjectControlledPath(userServer, cwd)).toBe(false);
-		expect(loadConfig(cwd).servers["typescript-language-server"]?.resolvedCommand).toBe(fs.realpathSync(userServer));
+		expect(loadConfig(cwd).servers["typescript-language-server"]?.resolvedCommand).toBe(userServer);
 		resetLspmuxStateForTesting();
 		which.mockImplementation(command => (command === "lspmux" ? userLspmux : null));
 		expect((await detectLspmux(cwd)).available).toBe(true);
@@ -449,13 +485,167 @@ describe("LSP repository command trust", () => {
 		for (const cwd of [lexicalHome, canonicalHome]) {
 			expect(isProjectControlledPath(userServer, cwd)).toBe(false);
 			const server = loadConfig(cwd).servers["typescript-language-server"];
-			expect(server?.resolvedCommand).toBe(fs.realpathSync(userServer));
+			expect(server?.resolvedCommand).toBe(userServer);
 
 			resetLspmuxStateForTesting();
 			which.mockImplementation(command => (command === "lspmux" ? userLspmux : null));
 			expect((await detectLspmux(cwd)).available).toBe(true);
 			which.mockImplementation(command => (command === "typescript-language-server" ? userServer : null));
 		}
+	});
+
+	it("keeps the invocation path for a trusted symlinked launcher so rustup-style proxies see argv[0]", async () => {
+		if (process.platform === "win32") return;
+
+		using tempDir = TempDir.createSync("@gjc-lsp-symlink-launcher-");
+		const home = path.join(tempDir.path(), "home");
+		const cwd = path.join(home, "workspace");
+		const cargoBin = path.join(home, ".cargo", "bin");
+		const rustup = path.join(cargoBin, "rustup");
+		const rustAnalyzer = path.join(cargoBin, "rust-analyzer");
+		await fs.promises.mkdir(cargoBin, { recursive: true });
+		await fs.promises.mkdir(cwd, { recursive: true });
+		await Bun.write(path.join(cwd, "Cargo.toml"), "[package]\n");
+		await Bun.write(rustup, "#!/bin/sh\nexit 0\n");
+		await fs.promises.chmod(rustup, 0o755);
+		await fs.promises.symlink("rustup", rustAnalyzer);
+		vi.spyOn(os, "homedir").mockReturnValue(home);
+		vi.spyOn(piUtils, "$which").mockImplementation(command => (command === "rust-analyzer" ? rustAnalyzer : null));
+
+		const server = loadConfig(cwd).servers["rust-analyzer"];
+		expect(fs.realpathSync(rustAnalyzer)).toBe(rustup);
+		expect(server?.resolvedCommand).toBe(rustAnalyzer);
+	});
+
+	it("still rejects a symlinked launcher whose invocation path is project-controlled", async () => {
+		if (process.platform === "win32") return;
+
+		using tempDir = TempDir.createSync("@gjc-lsp-symlink-project-");
+		const home = path.join(tempDir.path(), "home");
+		const cwd = path.join(home, "workspace");
+		const cargoBin = path.join(home, ".cargo", "bin");
+		const rustup = path.join(cargoBin, "rustup");
+		const projectLink = path.join(cwd, "bin", "rust-analyzer");
+		await fs.promises.mkdir(cargoBin, { recursive: true });
+		await fs.promises.mkdir(path.join(cwd, "bin"), { recursive: true });
+		await fs.promises.mkdir(path.join(cwd, ".git"), { recursive: true });
+		await Bun.write(path.join(cwd, "Cargo.toml"), "[package]\n");
+		await Bun.write(rustup, "#!/bin/sh\nexit 0\n");
+		await fs.promises.chmod(rustup, 0o755);
+		await fs.promises.symlink(rustup, projectLink);
+		vi.spyOn(os, "homedir").mockReturnValue(home);
+		vi.spyOn(piUtils, "$which").mockImplementation(command => (command === "rust-analyzer" ? projectLink : null));
+
+		expect(loadConfig(cwd).servers["rust-analyzer"]).toBeUndefined();
+	});
+
+	it("keeps HOME executables exempt from an ancestor cwd when HOME is a symlink, under either spelling", async () => {
+		if (process.platform === "win32") return;
+
+		using tempDir = TempDir.createSync("@gjc-lsp-home-alias-trust-");
+		const canonicalHome = path.join(tempDir.path(), "home");
+		const lexicalHome = path.join(tempDir.path(), "home-link");
+		const userBin = path.join(canonicalHome, ".gjc", "bin");
+		await fs.promises.mkdir(userBin, { recursive: true });
+		await fs.promises.symlink(canonicalHome, lexicalHome);
+		const server = path.join(userBin, "typescript-language-server");
+		await Bun.write(server, "");
+		const lexicalServer = path.join(lexicalHome, ".gjc", "bin", "typescript-language-server");
+
+		// cwd is HOME's parent with no project marker: its fallback trust root
+		// contains HOME, so only the home exemption keeps user executables trusted.
+		// Both homedir spellings must accept both candidate spellings.
+		const cwd = tempDir.path();
+		expect(ancestorProjectMarkers(cwd)).toEqual([]);
+		const projectFile = path.join(cwd, "typescript-language-server");
+		await Bun.write(projectFile, "");
+		for (const homedir of [lexicalHome, canonicalHome]) {
+			vi.spyOn(os, "homedir").mockReturnValue(homedir);
+			expect(isProjectControlledPath(lexicalServer, cwd)).toBe(false);
+			expect(isProjectControlledPath(server, cwd)).toBe(false);
+			// A project file directly under that same ancestor cwd is still owned.
+			expect(isProjectControlledPath(projectFile, cwd)).toBe(true);
+		}
+	});
+
+	it("keeps owning a project directory that links into HOME from a canonically spelled cwd", async () => {
+		if (process.platform === "win32") return;
+
+		using tempDir = TempDir.createSync("@gjc-lsp-home-alias-project-link-");
+		const canonicalHome = path.join(tempDir.path(), "home");
+		const lexicalHome = path.join(tempDir.path(), "home-link");
+		const userBin = path.join(canonicalHome, ".gjc", "bin");
+		const repo = path.join(canonicalHome, "repo");
+		await fs.promises.mkdir(userBin, { recursive: true });
+		await fs.promises.mkdir(path.join(repo, ".git"), { recursive: true });
+		await fs.promises.symlink(canonicalHome, lexicalHome);
+		await Bun.write(path.join(userBin, "typescript-language-server"), "");
+		// repo/bin is a project-owned directory symlink into HOME.
+		await fs.promises.symlink(userBin, path.join(repo, "bin"));
+		const projectCandidate = path.join(repo, "bin", "typescript-language-server");
+
+		for (const homedir of [lexicalHome, canonicalHome]) {
+			vi.spyOn(os, "homedir").mockReturnValue(homedir);
+			for (const cwd of [repo, path.join(lexicalHome, "repo")]) {
+				expect(isProjectControlledPath(projectCandidate, cwd)).toBe(true);
+				expect(
+					isProjectControlledPath(path.join(lexicalHome, "repo", "bin", "typescript-language-server"), cwd),
+				).toBe(true);
+			}
+		}
+	});
+
+	it("rejects home-crossing symlinks in both directions when the repository is a sibling of HOME", async () => {
+		if (process.platform === "win32") return;
+
+		using tempDir = TempDir.createSync("@gjc-lsp-sibling-home-trust-");
+		const home = path.join(tempDir.path(), "home");
+		const repo = path.join(tempDir.path(), "repo");
+		const cargoBin = path.join(home, ".cargo", "bin");
+		const rustup = path.join(cargoBin, "rustup");
+		await fs.promises.mkdir(cargoBin, { recursive: true });
+		await fs.promises.mkdir(path.join(repo, ".git"), { recursive: true });
+		await fs.promises.mkdir(path.join(repo, "bin"), { recursive: true });
+		await Bun.write(path.join(repo, "Cargo.toml"), "[package]\n");
+		await Bun.write(rustup, "#!/bin/sh\nexit 0\n");
+		await fs.promises.chmod(rustup, 0o755);
+		vi.spyOn(os, "homedir").mockReturnValue(home);
+
+		// Project-owned link whose target is a trusted HOME executable: the link
+		// itself is project-writable, so it must be rejected.
+		const projectLink = path.join(repo, "bin", "rust-analyzer");
+		await fs.promises.symlink(rustup, projectLink);
+		expect(isProjectControlledPath(projectLink, repo)).toBe(true);
+		const which = vi
+			.spyOn(piUtils, "$which")
+			.mockImplementation(command => (command === "rust-analyzer" ? projectLink : null));
+		expect(loadConfig(repo).servers["rust-analyzer"]).toBeUndefined();
+
+		// HOME-owned link whose target is project content: the executable bytes
+		// are project-controlled, so it must be rejected as well.
+		const evilTarget = path.join(repo, "evil-rustup");
+		await Bun.write(evilTarget, "#!/bin/sh\nexit 0\n");
+		await fs.promises.chmod(evilTarget, 0o755);
+		const homeLink = path.join(home, ".local", "bin", "rust-analyzer");
+		await fs.promises.mkdir(path.dirname(homeLink), { recursive: true });
+		await fs.promises.symlink(evilTarget, homeLink);
+		expect(isProjectControlledPath(homeLink, repo)).toBe(true);
+		which.mockImplementation(command => (command === "rust-analyzer" ? homeLink : null));
+		expect(loadConfig(repo).servers["rust-analyzer"]).toBeUndefined();
+
+		// A genuinely external HOME link to a HOME target stays trusted.
+		const goodLink = path.join(home, ".local", "bin", "rust-analyzer-good");
+		await fs.promises.symlink(rustup, goodLink);
+		expect(isProjectControlledPath(goodLink, repo)).toBe(false);
+
+		// A project-owned directory alias to HOME itself is project content: the
+		// invocation path stays under the repository, so it is still owned.
+		const homeAlias = path.join(repo, "home-link");
+		await fs.promises.symlink(home, homeAlias);
+		const aliasedCandidate = path.join(homeAlias, ".cargo", "bin", "rustup");
+		expect(isProjectControlledPath(aliasedCandidate, repo)).toBe(true);
+		which.mockImplementation(command => (command === "rust-analyzer" ? aliasedCandidate : null));
+		expect(loadConfig(repo).servers["rust-analyzer"]).toBeUndefined();
 	});
 
 	it("treats a repository ..bin child as contained while preserving external executables", async () => {
