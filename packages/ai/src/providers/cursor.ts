@@ -1177,8 +1177,18 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					}
 					settleBehindFence(() => {
 						localTransportCloseRequested = true;
-						closeStalledCursorRequest(request);
-						settleH2();
+						let finished = false;
+						const finish = (): void => {
+							if (finished) return;
+							finished = true;
+							closeStalledCursorRequest(request);
+							settleH2();
+						};
+						const forceTimer = setTimeout(finish, 100);
+						request.end(() => {
+							clearTimeout(forceTimer);
+							finish();
+						});
 					});
 				}, 25);
 			} else if (responseEnded) {

@@ -1610,7 +1610,10 @@ describe("Cursor raw transport watchdog", () => {
 	});
 
 	it("closes an unfinished response before publishing grace-window success", async () => {
+		const requestEnded = Promise.withResolvers<void>();
 		const baseUrl = await createCursorServer(stream => {
+			stream.once("end", requestEnded.resolve);
+			stream.resume();
 			stream.respond({ ":status": 200, "content-type": "application/connect+proto" }, { waitForTrailers: true });
 			stream.on("wantTrailers", () => {
 				setTimeout(() => {
@@ -1632,6 +1635,7 @@ describe("Cursor raw transport watchdog", () => {
 			streamIdleTimeoutMs: 100,
 			streamFirstEventTimeoutMs: 500,
 		});
+		await requestEnded.promise;
 		expect(result.stopReason).toBe("stop");
 		expect(events.filter(isTerminalEvent)).toHaveLength(1);
 	});
