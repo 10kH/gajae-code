@@ -17,6 +17,20 @@ const ORIGINAL_DISABLE_LSPMUX = Bun.env.PI_DISABLE_LSPMUX;
 const ORIGINAL_GJC_DISABLE_LSPMUX = Bun.env.GJC_DISABLE_LSPMUX;
 const ORIGINAL_CONFIG_DIR = process.env.GJC_CONFIG_DIR;
 
+/** Ancestors of `start` (inclusive) carrying a `.git` or `.gjc` project marker. */
+function ancestorProjectMarkers(start: string): string[] {
+	const markers: string[] = [];
+	let current = path.resolve(start);
+	for (;;) {
+		for (const marker of [".git", ".gjc"]) {
+			if (fs.existsSync(path.join(current, marker))) markers.push(path.join(current, marker));
+		}
+		const parent = path.dirname(current);
+		if (parent === current) return markers;
+		current = parent;
+	}
+}
+
 async function writeCanaryLspServer(directory: string): Promise<string> {
 	const scriptPath = path.join(directory, "canary-lsp.ts");
 	await Bun.write(
@@ -528,7 +542,7 @@ describe("LSP repository command trust", () => {
 	it("keeps HOME executables exempt from an ancestor cwd when HOME is a symlink, under either spelling", async () => {
 		if (process.platform === "win32") return;
 
-		using tempDir = TempDir.createSync("/var/tmp/gjc-lsp-home-alias-trust-");
+		using tempDir = TempDir.createSync("@gjc-lsp-home-alias-trust-");
 		const canonicalHome = path.join(tempDir.path(), "home");
 		const lexicalHome = path.join(tempDir.path(), "home-link");
 		const userBin = path.join(canonicalHome, ".gjc", "bin");
@@ -538,10 +552,11 @@ describe("LSP repository command trust", () => {
 		await Bun.write(server, "");
 		const lexicalServer = path.join(lexicalHome, ".gjc", "bin", "typescript-language-server");
 
-		// cwd is HOME's parent: its fallback trust root contains HOME, so only the
-		// home exemption keeps user executables trusted. Both homedir spellings
-		// must accept both candidate spellings.
+		// cwd is HOME's parent with no project marker: its fallback trust root
+		// contains HOME, so only the home exemption keeps user executables trusted.
+		// Both homedir spellings must accept both candidate spellings.
 		const cwd = tempDir.path();
+		expect(ancestorProjectMarkers(cwd)).toEqual([]);
 		const projectFile = path.join(cwd, "typescript-language-server");
 		await Bun.write(projectFile, "");
 		for (const homedir of [lexicalHome, canonicalHome]) {
