@@ -585,6 +585,7 @@ describe("SkillDiscoveryTool", () => {
 
 	it("advertises project .claude/skills and .codex/skills as import candidates with zero configuration", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-convention-skills-"));
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-convention-skills-home-"));
 		await makeSkill(path.join(cwd, ".claude", "skills"), "claude-helper", "Claude convention helper");
 		await makeSkill(path.join(cwd, ".codex", "skills"), "codex-helper", "Codex convention helper");
 
@@ -592,7 +593,10 @@ describe("SkillDiscoveryTool", () => {
 		// normal session as import candidates — never as invokable candidates —
 		// and each diagnostic names the copy command that enables the skill.
 		const zeroConfig = Settings.isolated({ "skill.enabled": true });
-		const result = await new SkillDiscoveryTool(createSession(cwd, { settings: zeroConfig })).execute("call", {});
+		const result = await new SkillDiscoveryTool(createSession(cwd, { settings: zeroConfig, home })).execute(
+			"call",
+			{},
+		);
 		expect(result.details?.candidates).toEqual([]);
 		const diagnostics = result.details?.diagnostics ?? [];
 		expect(diagnostics.some(message => message.includes('"claude-helper"') && message.includes(".claude"))).toBe(
@@ -605,6 +609,25 @@ describe("SkillDiscoveryTool", () => {
 		expect(importDiagnostics.some(message => message.includes('"claude-helper"'))).toBe(true);
 		expect(importDiagnostics.some(message => message.includes('"codex-helper"'))).toBe(true);
 		expect(importDiagnostics.every(message => message.includes(".gjc/skills/"))).toBe(true);
+	});
+
+	it("reports project convention candidates before a populated user convention home", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-convention-budget-"));
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-convention-budget-home-"));
+		await makeSkill(path.join(cwd, ".codex", "skills"), "codex-helper", "Codex convention helper");
+		// A real operator home routinely holds far more convention skills than the
+		// bounded diagnostic budget; they must not hide the project's own skill.
+		for (let i = 0; i < 30; i++) {
+			await makeSkill(path.join(home, ".claude", "skills"), `home-helper-${i}`, `Home convention helper ${i}`);
+		}
+
+		const zeroConfig = Settings.isolated({ "skill.enabled": true });
+		const result = await new SkillDiscoveryTool(createSession(cwd, { settings: zeroConfig, home })).execute(
+			"call",
+			{},
+		);
+		const diagnostics = result.details?.diagnostics ?? [];
+		expect(diagnostics.some(message => message.includes('"codex-helper"') && message.includes(".codex"))).toBe(true);
 	});
 
 	it("applies runtime precedence: project .gjc beats user, convention copies stay import candidates", async () => {
