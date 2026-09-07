@@ -2920,7 +2920,10 @@ describe.serial("AgentSession resilient retry", () => {
 			await session.dispose();
 			session = undefined;
 		}
-	});
+		// Five full session lifecycles, one per near-miss phrasing. The
+		// single-scenario sibling below costs ~15s on CI hardware, so this loop
+		// legitimately needs several times the 30s default it used to inherit.
+	}, 150_000);
 
 	it("still fails closed on generic unknown errors under a bare default config", async () => {
 		// The fix is scoped to clearly-transient failures. Generic unknown
