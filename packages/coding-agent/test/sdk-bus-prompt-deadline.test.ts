@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { RunSettlementProof } from "@gajae-code/agent-core";
+import { markNonDispatchedToolEvent, type RunSettlementProof } from "@gajae-code/agent-core";
 import type { Settings } from "../src/config/settings";
 import type { ExtensionActions, ExtensionAPI } from "../src/extensibility/extensions/types";
 import { createNotificationsExtension } from "../src/sdk/bus";
@@ -634,6 +634,78 @@ test("current-run tool progress cannot renew a co-accepted follow-up correlation
 		expect(session.deadlineTerminals()).toHaveLength(0);
 	} finally {
 		clearInterval(progress);
+		await shutdown(session);
+	}
+}, 30_000);
+test("a deadline expiry attempt in flight is superseded by real progress during the durable claim", async () => {
+	// HIGH: the firing timer registers its attempt, then awaits the durable
+	// claim. Real tool progress arriving while that claim is blocked must
+	// supersede the attempt: no fencing, no deadline terminal, and the lease
+	// reschedules. The rename gate makes "during the claim" deterministic —
+	// no timing race between progress and claim resolution.
+	const leaseMs = 400;
+	const session = await acceptPrompt("supersede", leaseMs, 60_000);
+	const realRename = fsPromises.rename.bind(fsPromises);
+	const releaseClaim = Promise.withResolvers<void>();
+	let claimGated = false;
+	const renameSpy = spyOn(fsPromises, "rename").mockImplementation(async (from, to) => {
+		if (!claimGated && String(to).startsWith(session.cwd)) {
+			claimGated = true;
+			await releaseClaim.promise;
+		}
+		return await realRename(from, to);
+	});
+	try {
+		// The deadline (armed at acceptance) fires into the gated claim.
+		await waitFor(() => renameSpy.mock.calls.length > 0, "deadline claim to reach durable write");
+		expect(session.deadlineTerminals()).toHaveLength(0);
+		// Real attributable progress while the claim is blocked.
+		session.handlers.get("tool_execution_end")?.(
+			{ type: "tool_execution_end", toolCallId: "supersede-tool", toolName: "read", isError: false },
+			session.sessionContext,
+		);
+		await Bun.sleep(50);
+		releaseClaim.resolve();
+		// The superseded attempt must stay silent: no fencing, no terminal.
+		await Bun.sleep(300);
+		expect(session.terminals(session.correlation)).toHaveLength(0);
+		expect(session.deadlineTerminals()).toHaveLength(0);
+		// The lease rescheduled from the progress: the renewed deadline still
+		// terminalizes exactly once, proving backoff rather than a dropped timer.
+		await waitFor(() => session.deadlineTerminals().length > 0, "rescheduled deadline terminal");
+		expect(session.deadlineTerminals()).toHaveLength(1);
+		expect((session.deadlineTerminals()[0]?.error as { message?: string }).message).toBe("Prompt deadline exceeded.");
+	} finally {
+		releaseClaim.resolve();
+		renameSpy.mockRestore();
+		await shutdown(session);
+	}
+}, 30_000);
+
+test("pairing-only synthetic tool progress never renews the bus deadline", async () => {
+	// MEDIUM: a start/end pair the loop never dispatched proves pairing, not
+	// progress. Marked exactly like agent-loop's synthetic pairs, it must leave
+	// the acceptance-anchored deadline unchanged — the prompt still expires.
+	const session = await acceptPrompt("pairing", LEASE_MS, 60_000);
+	try {
+		await Bun.sleep(600);
+		const start = { type: "tool_execution_start", toolCallId: "pairing-tool", toolName: "read", args: {} };
+		const end = {
+			type: "tool_execution_end",
+			toolCallId: "pairing-tool",
+			toolName: "read",
+			result: { content: "synthetic" },
+			isError: false,
+		};
+		markNonDispatchedToolEvent(start);
+		markNonDispatchedToolEvent(end);
+		session.handlers.get("tool_execution_start")?.(start, session.sessionContext);
+		session.handlers.get("tool_execution_end")?.(end, session.sessionContext);
+		await waitFor(() => session.deadlineTerminals().length > 0, "unrenewed deadline terminal");
+		// Had the pairing-only events renewed, the terminal could not land this early.
+		expect(Date.now() - session.acceptedAt).toBeLessThan(600 + LEASE_MS);
+		expect(session.deadlineTerminals()).toHaveLength(1);
+	} finally {
 		await shutdown(session);
 	}
 }, 30_000);
