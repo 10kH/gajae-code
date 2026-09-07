@@ -1199,6 +1199,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		let transportWatchdogClosed = false;
 		let callerAbortError: Error | undefined;
 		let pendingNonAbortableExec: CursorNonAbortableSettlement | undefined;
+		let processingPausedForQueue = false;
 		let localTransportCloseRequested = false;
 		let transportTerminalized = false;
 		let terminalDrainMode = false;
@@ -1647,7 +1648,6 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			});
 
 			let processingPausedForExec = false;
-			let processingPausedForQueue = false;
 			// True while any exec server message handler is running; suppresses
 			// transport-watchdog refreshes for the duration (see refreshTransportWatchdog).
 			let execInFlight = false;
@@ -2045,12 +2045,13 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 						// 257th frame before any queued microtask can decrement pending.
 						if (!isExecServerMessage && messageQueue.pending() >= CURSOR_MAX_PENDING_SERVER_MESSAGES) {
 							processingPausedForQueue = true;
-							h2Request!.pause();
+							if (!terminalBoundaryObserved && !terminalBoundarySeen) h2Request!.pause();
 							const resumeAfterDrain = () => {
 								processingPausedForQueue = false;
 								if (processingPausedForExec || callerAbortError) return;
 								if (transportWatchdogClosed && !terminalBoundaryObserved && !terminalBoundarySeen) return;
-								if (terminalAdmissionMode !== "closed") h2Request!.resume();
+								if (terminalAdmissionMode !== "closed" || terminalBoundaryObserved || terminalBoundarySeen)
+									h2Request!.resume();
 								// A lookahead turnEnded closes admission before the validated
 								// prefix reaches the queue bound. Continue parsing that prefix
 								// without reopening transport or admitting tail execs.
