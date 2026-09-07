@@ -63,25 +63,32 @@ export function isProjectControlledPath(candidate: string, cwd: string): boolean
 	const home = os.homedir();
 	const stopPaths = new Set([path.resolve(home), canonicalPath(home)].map(normalizePathForComparison));
 	const lexicalTrustRoot = findProjectTrustRoot(cwd, stopPaths);
-	const candidateIsHomeScoped = pathIsLexicallyWithin(home, candidate) || pathIsWithin(home, candidate);
+	// A user-owned executable under HOME (e.g. ~/.gjc/bin) is only exempt from a
+	// trust root that itself lives under HOME. Each check judges home scope on the
+	// same view of the path it inspects (lexical vs canonical); mixing them let a
+	// project link into HOME, or a HOME link into the project, escape rejection.
+	const candidateIsLexicallyHomeScoped = pathIsLexicallyWithin(home, candidate);
 	if (
 		lexicalTrustRoot !== undefined &&
 		pathIsLexicallyWithin(lexicalTrustRoot, candidate) &&
-		(!candidateIsHomeScoped || pathIsLexicallyWithin(home, lexicalTrustRoot))
+		(!candidateIsLexicallyHomeScoped || pathIsLexicallyWithin(home, lexicalTrustRoot))
 	)
 		return true;
 
+	const canonicalCandidate = canonicalPath(candidate);
+	const canonicalCandidateParent = canonicalParentPath(candidate);
+	const parentIsHomeScoped = pathIsLexicallyWithin(home, canonicalCandidateParent);
+	const targetIsHomeScoped = pathIsWithin(home, canonicalCandidate);
 	const canonicalTrustRoots = new Set<string>();
 	if (lexicalTrustRoot !== undefined) canonicalTrustRoots.add(canonicalPath(lexicalTrustRoot));
 	const canonicalTrustRoot = findProjectTrustRoot(canonicalPath(cwd), stopPaths);
 	if (canonicalTrustRoot !== undefined) canonicalTrustRoots.add(canonicalPath(canonicalTrustRoot));
 	for (const trustRoot of canonicalTrustRoots) {
-		if (
-			(pathIsLexicallyWithin(trustRoot, canonicalParentPath(candidate)) ||
-				pathIsWithin(trustRoot, canonicalPath(candidate))) &&
-			(!candidateIsHomeScoped || pathIsLexicallyWithin(home, trustRoot) || pathIsWithin(home, trustRoot))
-		)
-			return true;
+		const trustRootIsHomeScoped = pathIsLexicallyWithin(home, trustRoot) || pathIsWithin(home, trustRoot);
+		const parentOwned =
+			pathIsLexicallyWithin(trustRoot, canonicalCandidateParent) && (!parentIsHomeScoped || trustRootIsHomeScoped);
+		const targetOwned = pathIsWithin(trustRoot, canonicalCandidate) && (!targetIsHomeScoped || trustRootIsHomeScoped);
+		if (parentOwned || targetOwned) return true;
 	}
 	return false;
 }

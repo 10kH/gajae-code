@@ -524,6 +524,50 @@ describe("LSP repository command trust", () => {
 		expect(loadConfig(cwd).servers["rust-analyzer"]).toBeUndefined();
 	});
 
+	it("rejects home-crossing symlinks in both directions when the repository is a sibling of HOME", async () => {
+		if (process.platform === "win32") return;
+
+		using tempDir = TempDir.createSync("@gjc-lsp-sibling-home-trust-");
+		const home = path.join(tempDir.path(), "home");
+		const repo = path.join(tempDir.path(), "repo");
+		const cargoBin = path.join(home, ".cargo", "bin");
+		const rustup = path.join(cargoBin, "rustup");
+		await fs.promises.mkdir(cargoBin, { recursive: true });
+		await fs.promises.mkdir(path.join(repo, ".git"), { recursive: true });
+		await fs.promises.mkdir(path.join(repo, "bin"), { recursive: true });
+		await Bun.write(path.join(repo, "Cargo.toml"), "[package]\n");
+		await Bun.write(rustup, "#!/bin/sh\nexit 0\n");
+		await fs.promises.chmod(rustup, 0o755);
+		vi.spyOn(os, "homedir").mockReturnValue(home);
+
+		// Project-owned link whose target is a trusted HOME executable: the link
+		// itself is project-writable, so it must be rejected.
+		const projectLink = path.join(repo, "bin", "rust-analyzer");
+		await fs.promises.symlink(rustup, projectLink);
+		expect(isProjectControlledPath(projectLink, repo)).toBe(true);
+		const which = vi
+			.spyOn(piUtils, "$which")
+			.mockImplementation(command => (command === "rust-analyzer" ? projectLink : null));
+		expect(loadConfig(repo).servers["rust-analyzer"]).toBeUndefined();
+
+		// HOME-owned link whose target is project content: the executable bytes
+		// are project-controlled, so it must be rejected as well.
+		const evilTarget = path.join(repo, "evil-rustup");
+		await Bun.write(evilTarget, "#!/bin/sh\nexit 0\n");
+		await fs.promises.chmod(evilTarget, 0o755);
+		const homeLink = path.join(home, ".local", "bin", "rust-analyzer");
+		await fs.promises.mkdir(path.dirname(homeLink), { recursive: true });
+		await fs.promises.symlink(evilTarget, homeLink);
+		expect(isProjectControlledPath(homeLink, repo)).toBe(true);
+		which.mockImplementation(command => (command === "rust-analyzer" ? homeLink : null));
+		expect(loadConfig(repo).servers["rust-analyzer"]).toBeUndefined();
+
+		// A genuinely external HOME link to a HOME target stays trusted.
+		const goodLink = path.join(home, ".local", "bin", "rust-analyzer-good");
+		await fs.promises.symlink(rustup, goodLink);
+		expect(isProjectControlledPath(goodLink, repo)).toBe(false);
+	});
+
 	it("treats a repository ..bin child as contained while preserving external executables", async () => {
 		if (process.platform === "win32") return;
 
