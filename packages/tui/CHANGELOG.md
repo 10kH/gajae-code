@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.16.5] - 2026-09-07
+
 ### Performance
 
 - Skip full-transcript resize-width scans on unchanged-width render frames while preserving the existing resize and forced-redraw checks.
