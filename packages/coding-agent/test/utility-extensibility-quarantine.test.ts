@@ -63,6 +63,9 @@ describe("GJC utility extensibility quarantine", () => {
 
 	it("does not default-discover skills, extensions, custom commands, custom tools, plugins, or marketplaces", async () => {
 		const sdk = await source("sdk", "session.ts");
+		const skillsEnabledGuard = '} else if (settings.get("skills.enabled")) {';
+		const defaultSdk = sdk.slice(0, sdk.indexOf(skillsEnabledGuard));
+
 		const main = await source("main.ts");
 		const settingsSchema = await source("config", "settings-schema.ts");
 
@@ -74,8 +77,9 @@ describe("GJC utility extensibility quarantine", () => {
 			'logger.time("discoverAndLoadExtensions"',
 			'logger.time("loadExtensions"',
 		]) {
-			expect(sdk).not.toContain(forbidden);
+			expect((forbidden === 'logger.time("discoverSkills"' ? defaultSdk : sdk)).not.toContain(forbidden);
 		}
+		expect(sdk).toMatch(/\} else if \(settings\.get\("skills\.enabled"\)\) \{[\s\S]*logger\.time\("discoverSkills"/);
 		expect(main).not.toContain("MarketplaceManager");
 		expect(main).not.toContain("preloadPluginRoots");
 		expect(settingsSchema).not.toContain("Marketplace Auto-Update");

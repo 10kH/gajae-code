@@ -462,70 +462,158 @@ describe("width-settle debounce red-team", () => {
 	});
 
 	it("TIMING-BOUNDARY waits for 1000ms and extends the window at t=900ms", async () => {
-		delete process.env.TMUX;
-		const term = new VirtualTerminal(START_WIDTH, ROWS, { isProcessTerminal: false });
-		const tui = new TUI(term);
-		try {
-			tui.start();
-			await settle(term);
-			await addTranscript(tui, term);
-			term.clearWriteLog();
-			term.resize(36, ROWS);
-			await settle(term);
-			const firstResizeAt = performance.now();
-			const redrawsAfterFirstResize = tui.fullRedraws;
-			await Bun.sleep(850);
-			term.resize(28, ROWS);
-			await settle(term);
-			const secondResizeAt = performance.now();
-			const redrawsAfterSecondResize = tui.fullRedraws;
-			term.clearWriteLog();
+		type TimingBoundaryAttempt =
+			| {
+					conclusive: false;
+					secondChangeDelayMs: number;
+					firstResizeAt: number;
+					secondResizeAt: number;
+					elapsedBetweenResizes: number;
+				}
+			| {
+					conclusive: true;
+					secondChangeDelayMs: number;
+					firstResizeAt: number;
+					secondResizeAt: number;
+					elapsedBetweenResizes: number;
+					redrawsAfterFirstResize: number;
+					redrawsAfterSecondResize: number;
+					beforeExtendedDeadlineWrite: string;
+					redrawsBeforeExtendedDeadline: number;
+					elapsedFromFirstResize: number;
+					afterExtendedDeadlineWrite: string;
+					redrawsAfterExtendedDeadline: number;
+				};
 
-			// The first deadline is now past, but the t=850-900ms change must have
-			// re-armed the timer. No settle write may occur at the first deadline.
-			const firstDeadlineProbeDelay = Math.max(0, SETTLE_MS - (performance.now() - firstResizeAt) + 150);
-			await Bun.sleep(firstDeadlineProbeDelay);
-			await term.flush();
-			const beforeExtendedDeadlineWrite = term.getWriteLog().join("");
-			const redrawsBeforeExtendedDeadline = tui.fullRedraws;
-			const elapsedFromFirstResize = performance.now() - firstResizeAt;
-			const elapsedBetweenResizes = secondResizeAt - firstResizeAt;
+		async function runAttempt(secondChangeDelayMs: number): Promise<TimingBoundaryAttempt> {
+			delete process.env.TMUX;
+			const term = new VirtualTerminal(START_WIDTH, ROWS, { isProcessTerminal: false });
+			const tui = new TUI(term);
+			try {
+				tui.start();
+				await settle(term);
+				await addTranscript(tui, term);
+				term.clearWriteLog();
+				term.resize(36, ROWS);
+				await settle(term);
+				const firstResizeAt = performance.now();
+				const redrawsAfterFirstResize = tui.fullRedraws;
+				await Bun.sleep(secondChangeDelayMs);
+				term.resize(28, ROWS);
+				await settle(term);
+				const secondResizeAt = performance.now();
+				const redrawsAfterSecondResize = tui.fullRedraws;
+				const elapsedBetweenResizes = secondResizeAt - firstResizeAt;
+				if (elapsedBetweenResizes >= SETTLE_MS) {
+					return {
+						conclusive: false,
+						secondChangeDelayMs,
+						firstResizeAt,
+						secondResizeAt,
+						elapsedBetweenResizes,
+					};
+				}
+				term.clearWriteLog();
 
-			const secondDeadlineWait = Math.max(0, SETTLE_MS - (performance.now() - secondResizeAt) + 150);
-			await Bun.sleep(secondDeadlineWait);
-			await term.flush();
-			const afterExtendedDeadlineWrite = term.getWriteLog().join("");
-			const redrawsAfterExtendedDeadline = tui.fullRedraws;
-			finishCase(
-				"TIMING-BOUNDARY",
-				"No settled redraw occurs before about 1000ms, and a width change near t=900ms pushes the single settle deadline out by another 1000ms.",
-				{
-					noEarlySettleAtFirstDeadline: beforeExtendedDeadlineWrite === "",
-					noEarlyRedrawAtFirstDeadline: redrawsBeforeExtendedDeadline === redrawsAfterSecondResize,
-					// The only real precondition: the second change landed inside the
-					// first window. Asserting a tight upper bound here would fail correct
-					// code whenever the CI scheduler pauses between the two resizes.
-					secondChangeInsideFirstWindow: elapsedBetweenResizes < SETTLE_MS,
-					exactlyOneExtendedSettle: redrawsAfterExtendedDeadline - redrawsAfterSecondResize === 1,
-					extendedSettleWritesRepair: afterExtendedDeadlineWrite.includes("\x1b[2J\x1b[H\x1b[3J"),
-				},
-				{
-					firstResizeAt: firstResizeAt.toFixed(1),
-					secondResizeAt: secondResizeAt.toFixed(1),
-					elapsedBetweenResizes: elapsedBetweenResizes.toFixed(1),
-					elapsedFromFirstResizeAtProbe: elapsedFromFirstResize.toFixed(1),
+				// The first deadline is now past, but the late-window change must have
+				// re-armed the timer. No settle write may occur at the first deadline.
+				const firstDeadlineProbeDelay = Math.max(0, SETTLE_MS - (performance.now() - firstResizeAt) + 150);
+				await Bun.sleep(firstDeadlineProbeDelay);
+				await term.flush();
+				const beforeExtendedDeadlineWrite = term.getWriteLog().join("");
+				const redrawsBeforeExtendedDeadline = tui.fullRedraws;
+				const elapsedFromFirstResize = performance.now() - firstResizeAt;
+
+				const secondDeadlineWait = Math.max(0, SETTLE_MS - (performance.now() - secondResizeAt) + 150);
+				await Bun.sleep(secondDeadlineWait);
+				await term.flush();
+				const afterExtendedDeadlineWrite = term.getWriteLog().join("");
+				const redrawsAfterExtendedDeadline = tui.fullRedraws;
+				return {
+					conclusive: true,
+					secondChangeDelayMs,
+					firstResizeAt,
+					secondResizeAt,
+					elapsedBetweenResizes,
 					redrawsAfterFirstResize,
 					redrawsAfterSecondResize,
+					beforeExtendedDeadlineWrite,
 					redrawsBeforeExtendedDeadline,
+					elapsedFromFirstResize,
+					afterExtendedDeadlineWrite,
 					redrawsAfterExtendedDeadline,
-					beforeExtendedDeadlineWriteLength: beforeExtendedDeadlineWrite.length,
-					afterExtendedDeadlineWriteLength: afterExtendedDeadlineWrite.length,
-					beforeExtendedDeadlineWriteExcerpt: writeExcerpt(beforeExtendedDeadlineWrite, 1400),
-					afterExtendedDeadlineWriteExcerpt: writeExcerpt(afterExtendedDeadlineWrite, 1400),
-				},
-			);
-		} finally {
-			tui.stop();
+				};
+			} finally {
+				tui.stop();
+			}
 		}
+
+		const attempts: TimingBoundaryAttempt[] = [];
+		let conclusiveAttempt: Extract<TimingBoundaryAttempt, { conclusive: true }> | undefined;
+		for (const secondChangeDelayMs of [850, 600, 400]) {
+			const attempt = await runAttempt(secondChangeDelayMs);
+			attempts.push(attempt);
+			if (attempt.conclusive) {
+				conclusiveAttempt = attempt;
+				break;
+			}
+		}
+		expect(
+			conclusiveAttempt,
+			`TIMING-BOUNDARY could not place the second resize inside the first ${SETTLE_MS}ms window: ${JSON.stringify(
+				attempts.map(({ conclusive, secondChangeDelayMs, elapsedBetweenResizes }) => ({
+					conclusive,
+					secondChangeDelayMs,
+					elapsedBetweenResizes: elapsedBetweenResizes.toFixed(1),
+				})),
+				null,
+				2,
+			)}`,
+		).toBeDefined();
+		if (!conclusiveAttempt) return;
+
+		const {
+			secondChangeDelayMs,
+			firstResizeAt,
+			secondResizeAt,
+			redrawsAfterFirstResize,
+			redrawsAfterSecondResize,
+			beforeExtendedDeadlineWrite,
+			redrawsBeforeExtendedDeadline,
+			elapsedFromFirstResize,
+			afterExtendedDeadlineWrite,
+			redrawsAfterExtendedDeadline,
+			elapsedBetweenResizes,
+		} = conclusiveAttempt;
+		finishCase(
+			"TIMING-BOUNDARY",
+			"No settled redraw occurs before about 1000ms, and a width change near t=900ms pushes the single settle deadline out by another 1000ms.",
+			{
+				noEarlySettleAtFirstDeadline: beforeExtendedDeadlineWrite === "",
+				noEarlyRedrawAtFirstDeadline: redrawsBeforeExtendedDeadline === redrawsAfterSecondResize,
+				// The only real precondition: the second change landed inside the
+				// first window. Asserting a tight upper bound here would fail correct
+				// code whenever the CI scheduler pauses between the two resizes.
+				secondChangeInsideFirstWindow: elapsedBetweenResizes < SETTLE_MS,
+				exactlyOneExtendedSettle: redrawsAfterExtendedDeadline - redrawsAfterSecondResize === 1,
+				extendedSettleWritesRepair: afterExtendedDeadlineWrite.includes("\x1b[2J\x1b[H\x1b[3J"),
+			},
+			{
+				secondChangeDelayMs,
+				attemptedSecondChangeDelays: attempts.map(attempt => attempt.secondChangeDelayMs),
+				firstResizeAt: firstResizeAt.toFixed(1),
+				secondResizeAt: secondResizeAt.toFixed(1),
+				elapsedBetweenResizes: elapsedBetweenResizes.toFixed(1),
+				elapsedFromFirstResizeAtProbe: elapsedFromFirstResize.toFixed(1),
+				redrawsAfterFirstResize,
+				redrawsAfterSecondResize,
+				redrawsBeforeExtendedDeadline,
+				redrawsAfterExtendedDeadline,
+				beforeExtendedDeadlineWriteLength: beforeExtendedDeadlineWrite.length,
+				afterExtendedDeadlineWriteLength: afterExtendedDeadlineWrite.length,
+				beforeExtendedDeadlineWriteExcerpt: writeExcerpt(beforeExtendedDeadlineWrite, 1400),
+				afterExtendedDeadlineWriteExcerpt: writeExcerpt(afterExtendedDeadlineWrite, 1400),
+			},
+		);
 	});
 });

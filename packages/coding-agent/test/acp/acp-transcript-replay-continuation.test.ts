@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, setDefaultTimeout } from "bun:test";
 import * as path from "node:path";
 import type { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
+import packageJson from "../../package.json" with { type: "json" };
 import { AcpAgent } from "@gajae-code/coding-agent/modes/acp/acp-agent";
 import { TempDir } from "@gajae-code/utils";
 import { writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
@@ -274,7 +275,7 @@ describe("ACP transcript replay continuation recovery", () => {
 		await writeBrokerDiscovery(agentDir, {
 			version: 1,
 			protocolVersion: 3,
-			packageGeneration: "test",
+			packageGeneration: packageJson.version,
 			ownerId: "test-owner",
 			pid: process.pid,
 			host: "127.0.0.1",
