@@ -267,6 +267,7 @@ describe("LSP repository command trust", () => {
 			const result = await tool.execute("configured-status", { action: "status" });
 
 			expect(result.content).toEqual([{ type: "text", text: "Configured language servers: rust-analyzer" }]);
+			expect(result.details?.success).toBe(true);
 		} finally {
 			await safeRm(externalBinDir, { recursive: true, force: true });
 			forgetExternalGrant();
