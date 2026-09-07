@@ -709,7 +709,7 @@ describe("Cursor raw transport watchdog", () => {
 						}),
 					}),
 				);
-				stream.write(Buffer.concat(frames));
+				stream.write(Buffer.concat([...frames, Buffer.from([0])]));
 			}, 10);
 		});
 

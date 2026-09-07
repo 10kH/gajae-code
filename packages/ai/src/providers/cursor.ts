@@ -1155,10 +1155,12 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				h2Completion.resolve();
 			}
 		};
+		const hasCompleteBufferedFrame = (): boolean =>
+			pendingBuffer.length >= 5 && pendingBuffer.length >= 5 + pendingBuffer.readUInt32BE(1);
 		const settleH2WhenReady = (): void => {
 			if (terminalDrainMode) return;
 			if (!queueDrained) return;
-			if (pendingBuffer.length >= 5 && pendingBuffer.length >= 5 + pendingBuffer.readUInt32BE(1)) return;
+			if (hasCompleteBufferedFrame()) return;
 			if (endStreamError) {
 				settleBehindFence(() => settleH2(endStreamError));
 			} else if (sawTurnEnded && responseEnded) {
@@ -1758,7 +1760,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			const finishResponseAfterParsing = (): void => {
 				if (processingPausedForExec || processingPausedForQueue) return;
 				if (!responseEnded) {
-					if (terminalBoundarySeen && pendingBuffer.length === 0) drainMessageQueue();
+					if (terminalBoundarySeen && !hasCompleteBufferedFrame()) drainMessageQueue();
 					return;
 				}
 				if (terminalBoundarySeen) {
