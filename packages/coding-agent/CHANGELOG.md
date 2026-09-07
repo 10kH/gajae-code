@@ -8,6 +8,7 @@
 ### Fixed
 
 - Runtime state persistence now identifies contradictory `ready_for_input`/`live` fields with their lifecycle state and expected value instead of reporting only a generic invalid/unreadable marker error. Invalid markers remain untouched; this does not migrate or repair old session state.
+- LSP auto-discovery now launches trusted executable symlinks through their discovered paths instead of canonicalizing them to their targets, preserving proxy invocation names such as `rust-analyzer` when installed through rustup. The LSP status action now labels these entries as configured rather than active, since a client has not necessarily started (#5354).
 - SDK snapshot pages now read and integrity-check one contiguous span instead of rereading chunks per row. Reverse-provider disconnects discard connection-scoped registration receipts; relay shutdown releases backpressure listeners without destroying caller-owned sinks, and fragmented request frames are assembled once per newline.
 
 - The TUI working spinner and tool intent remain visible when a run continues after automatic context compaction, a compaction-hook veto, or a successful managed model retry. Temporary status replacement no longer marks the foreground run as finished; actual completion and cancellation still clear it.
