@@ -35,6 +35,7 @@ REF=""
 TMP_FILES=""
 LOCK_FILE=""
 LOCK_NONCE=""
+LOCK_RECLAIM_CLAIM=""
 AUTH_HDR=""
 BACKUP_PATH=""
 DEST_PATH=""
@@ -87,6 +88,13 @@ cleanup() {
         read owner nonce < "$LOCK_FILE" || true
         if [ "$owner" = "$$" ] && [ -n "$LOCK_NONCE" ] && [ "$nonce" = "$LOCK_NONCE" ]; then
             rm -f "$LOCK_FILE"
+        fi
+    fi
+    if [ -n "$LOCK_RECLAIM_CLAIM" ] && [ -f "$LOCK_RECLAIM_CLAIM" ]; then
+        reclaim_owner=""
+        read reclaim_owner _ < "$LOCK_RECLAIM_CLAIM" || true
+        if [ "$reclaim_owner" = "$$" ]; then
+            rm -f "$LOCK_RECLAIM_CLAIM"
         fi
     fi
     if [ -n "$SOURCE_CLONE_DIR" ] && [ -d "$SOURCE_CLONE_DIR" ]; then
@@ -400,15 +408,73 @@ try_publish_lock_file() {
     ( set -C; umask 077; printf '%s %s\n' "$$" "$LOCK_NONCE" > "$lock" )
 }
 
+try_claim_lock_recovery() {
+    claim="$1"
+    stale_owner="$2"
+    stale_nonce="$3"
+    ( set -C; umask 077; printf '%s %s %s\n' "$$" "$stale_owner" "$stale_nonce" > "$claim" )
+}
+
+lock_owner_is_alive() {
+    owner="$1"
+    case "$owner" in
+        ''|0|*[!0-9]*) return 1 ;;
+    esac
+    if kill -0 "$owner" 2>/dev/null; then
+        return 0
+    fi
+    if ! command -v ps >/dev/null 2>&1; then
+        return 0
+    fi
+    if ps -p "$owner" >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
 acquire_lock() {
     lock="${INSTALL_DIR}/.gjc-install.lock"
+    reclaim_claim="${lock}.reclaim"
     mkdir -p "$INSTALL_DIR"
     LOCK_NONCE=$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
     [ -n "$LOCK_NONCE" ] || LOCK_NONCE="$$.$RANDOM"
+    if [ -e "$reclaim_claim" ]; then
+        die "Another GJC installer is already recovering the install lock in ${INSTALL_DIR} (claim: ${reclaim_claim}). Remove a leftover lock file only after confirming no installer is running."
+    fi
     if try_publish_lock_file "$lock" 2>/dev/null; then
         LOCK_FILE="$lock"
         return 0
     fi
+
+    owner=""
+    nonce=""
+    if [ -f "$lock" ]; then
+        read owner nonce < "$lock" || true
+    fi
+    case "$owner" in
+        ''|0|*[!0-9]*) ;;
+        *)
+            if [ -n "$nonce" ] && ! lock_owner_is_alive "$owner"; then
+                lock_contents="$owner $nonce"
+                current_contents=$(cat "$lock" 2>/dev/null || true)
+                if [ "$current_contents" = "$lock_contents" ]; then
+                    if try_claim_lock_recovery "$reclaim_claim" "$owner" "$nonce" 2>/dev/null; then
+                        LOCK_RECLAIM_CLAIM="$reclaim_claim"
+                        current_contents=$(cat "$lock" 2>/dev/null || true)
+                        if [ "$current_contents" = "$lock_contents" ] && rm -f "$lock" 2>/dev/null; then
+                            if try_publish_lock_file "$lock" 2>/dev/null; then
+                                LOCK_FILE="$lock"
+                                return 0
+                            fi
+                        fi
+                        rm -f "$LOCK_RECLAIM_CLAIM"
+                        LOCK_RECLAIM_CLAIM=""
+                    fi
+                fi
+            fi
+            ;;
+    esac
+
     die "Another GJC installer is already running in ${INSTALL_DIR} (lock: ${lock}). Remove a leftover lock file only after confirming no installer is running."
 }
 
