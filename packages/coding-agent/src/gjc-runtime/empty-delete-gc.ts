@@ -7,11 +7,15 @@ import { randomUUID } from "node:crypto";
 import type { BigIntStats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { exactUnlinkDirect, type NativeExactUnlinkResult } from "@gajae-code/natives";
+import { exactUnlinkDirect, type NativeExactUnlinkResult, snapshotDirectoryTree } from "@gajae-code/natives";
 
 export const EMPTY_DELETE_PREFIX = ".gjc-delete-";
 const EMPTY_DELETE_RECEIPT_PATTERN =
 	/^\.gjc-delete-session-state-lock-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/u;
+// session-storage uses a GC UUID; managed-session-scope uses stableOperationName's
+// SHA-256 plus a numbered attempt. Neither arbitrary labels nor other receipts qualify.
+const EMPTY_ARTIFACT_REMOVAL_ROOT_PATTERN =
+	/^\.gjc-delete-(?:gc-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-artifacts|[0-9a-f]{64}-artifacts-[1-9]\d*)\.removing$/u;
 const EMPTY_FILE_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 export interface EmptyDeleteIdentity {
@@ -22,7 +26,7 @@ export interface EmptyDeleteIdentity {
 	mtimeNs: bigint;
 	parentDev: bigint;
 	parentIno: bigint;
-	sha256: string;
+	sha256?: string;
 }
 
 export interface EmptyDeleteGcRecord {
@@ -51,12 +55,15 @@ export interface EmptyDeleteGcReport {
 export interface EmptyDeleteGcOptions {
 	roots: string[];
 	prune: boolean;
+	/** Disk artifact GC must not remove unrelated file receipts. */
+	artifactRootsOnly?: boolean;
 }
 
 export interface EmptyDeleteGcDependencies {
 	/** Internal seam for deterministic collect-to-prune race tests. */
 	collect?: (root: string) => Promise<EmptyDeleteGcRecord[]>;
 	exactUnlinkDirect?: typeof exactUnlinkDirect;
+	rmdir?: (directory: string) => Promise<void>;
 }
 
 function isUnsafeName(name: string): boolean {
@@ -98,6 +105,64 @@ function retainedPathsOf(
 
 function isEmptyDeleteReceiptName(name: string): boolean {
 	return EMPTY_DELETE_RECEIPT_PATTERN.test(name);
+}
+
+function isEmptyArtifactRemovalRootName(name: string): boolean {
+	return EMPTY_ARTIFACT_REMOVAL_ROOT_PATTERN.test(name);
+}
+
+function artifactRootReason(file: string, stat: BigIntStats): string {
+	if (!stat.isDirectory()) return "not_directory";
+	// The native snapshot opens every component with O_NOFOLLOW and enumerates
+	// with fdopendir/readdir on the retained directory handle. A root-only snapshot
+	// proves zero entries; pathname readdir alone cannot supply that authority.
+	const result = snapshotDirectoryTree(file);
+	if (!result.ok || !result.snapshot) return `entry_unverifiable: ${result.code ?? "unknown"}`;
+	const snapshot = result.snapshot;
+	if (snapshot.rootDev !== stat.dev.toString() || snapshot.rootIno !== stat.ino.toString()) return "identity_drift";
+	return snapshot.entries.length === 1 && snapshot.entries[0].relativePath === ""
+		? "empty_artifact_removal_root"
+		: "non_empty";
+}
+
+async function removeEmptyArtifactRoot(
+	record: EmptyDeleteGcRecord,
+	rmdir: (directory: string) => Promise<void>,
+): Promise<void> {
+	try {
+		const expected = record.identity;
+		if (!expected) {
+			record.action = "kept";
+			record.reason = "identity_missing";
+			return;
+		}
+		const parent = await fs.lstat(path.dirname(record.path), { bigint: true });
+		const stat = await fs.lstat(record.path, { bigint: true });
+		if (
+			!parent.isDirectory() ||
+			parent.dev !== expected.parentDev ||
+			parent.ino !== expected.parentIno ||
+			!stat.isDirectory() ||
+			stat.dev !== expected.dev ||
+			stat.ino !== expected.ino
+		) {
+			record.action = "kept";
+			record.reason = "identity_drift";
+			return;
+		}
+		const reason = artifactRootReason(record.path, stat);
+		if (reason !== "empty_artifact_removal_root") {
+			record.action = "kept";
+			record.reason = reason;
+			return;
+		}
+		// Never recursive: a writer winning after the empty check makes this fail closed.
+		await rmdir(record.path);
+		record.action = "removed";
+	} catch (error) {
+		record.action = "kept";
+		record.reason = `entry_remove_failed: ${error instanceof Error ? error.message : String(error)}`;
+	}
 }
 
 function sameRootIdentity(left: BigIntStats, right: BigIntStats): boolean {
@@ -150,7 +215,7 @@ export async function collectEmptyDeleteReceipts(
 		throw error;
 	}
 	for (const name of names) {
-		if (isUnsafeName(name) || !isEmptyDeleteReceiptName(name)) continue;
+		if (isUnsafeName(name) || (!isEmptyDeleteReceiptName(name) && !isEmptyArtifactRemovalRootName(name))) continue;
 		const file = path.join(resolvedRoot, name);
 		let stat: BigIntStats;
 		try {
@@ -167,6 +232,17 @@ export async function collectEmptyDeleteReceipts(
 		}
 		if (stat.isSymbolicLink()) {
 			records.push({ root, path: file, action: "kept", reason: "symlink" });
+			continue;
+		}
+		if (isEmptyArtifactRemovalRootName(name)) {
+			const reason = artifactRootReason(file, stat);
+			records.push({
+				root,
+				path: file,
+				action: reason === "empty_artifact_removal_root" ? "would_remove" : "kept",
+				reason,
+				identity: { ...identityOf(stat), parentDev: rootStat.dev, parentIno: rootStat.ino },
+			});
 			continue;
 		}
 		if (!stat.isFile()) {
@@ -232,6 +308,12 @@ export async function runEmptyDeleteGc(
 			continue;
 		}
 		for (const record of records) {
+			if (
+				options.artifactRootsOnly &&
+				record.path !== root &&
+				!isEmptyArtifactRemovalRootName(path.basename(record.path))
+			)
+				continue;
 			if (record.action === "would_remove" && !options.prune) record.observationOnly = true;
 			if (
 				record.action === "skipped" &&
@@ -244,7 +326,15 @@ export async function runEmptyDeleteGc(
 			) {
 				report.errors.push(`${record.path}: ${record.reason}`);
 			}
-			if (record.action === "would_remove" && options.prune) {
+			if (
+				record.action === "would_remove" &&
+				options.prune &&
+				isEmptyArtifactRemovalRootName(path.basename(record.path))
+			) {
+				await removeEmptyArtifactRoot(record, deps.rmdir ?? fs.rmdir);
+				if (record.reason.startsWith("entry_remove_failed:"))
+					report.errors.push(`${record.path}: ${record.reason}`);
+			} else if (record.action === "would_remove" && options.prune) {
 				try {
 					if (!record.identity) {
 						record.action = "kept";
