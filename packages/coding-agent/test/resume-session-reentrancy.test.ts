@@ -55,11 +55,11 @@ function createContext(session: { switchSession: (path: string, options?: unknow
 			getCwd: () => "/tmp",
 		},
 		resetIrcSidebarSession: vi.fn(),
+		resetAssistantTextPresentation: vi.fn(),
 		updateEditorBorderColor: vi.fn(),
 		rebuildInitialMessages: vi.fn(),
 		reloadTodos: vi.fn(async () => undefined),
 		showStatus: vi.fn(),
-		resetAssistantTextPresentation: vi.fn(),
 	} as unknown as InteractiveModeContext;
 
 	return { context, statusContainer, pendingMessagesContainer, ui };

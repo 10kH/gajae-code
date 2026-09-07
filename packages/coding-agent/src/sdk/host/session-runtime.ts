@@ -427,14 +427,12 @@ export class SessionSdkSessionRuntime {
 	 * asked for. Delivery failure is ignored: a disconnected consumer must never
 	 * disturb the turn producing the content.
 	 */
-	sendFrameTo(connectionIds: Iterable<string>, frame: SdkFrame): void {
-		for (const connectionId of connectionIds) {
-			try {
-				const result = this.transport.sendFrame(connectionId, frame);
-				if (result instanceof Promise) result.catch(() => undefined);
-			} catch {
-				// A dead connection is reaped by the transport's own close handling.
-			}
+	sendFrameTo(connectionId: string, frame: SdkFrame): void {
+		try {
+			const result = this.transport.sendFrame(connectionId, frame);
+			if (result instanceof Promise) result.catch(() => undefined);
+		} catch {
+			// A dead connection is reaped by the transport's own close handling.
 		}
 	}
 
@@ -4264,7 +4262,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			const payload = toAgentWireEventPayload(event);
 			for (const invocation of invocations) {
 				if (invocation.connectionId === undefined) continue;
-				current.runtime.sendFrameTo([invocation.connectionId], {
+				current.runtime.sendFrameTo(invocation.connectionId, {
 					type: "event",
 					kind: event.type,
 					payload,
@@ -4982,7 +4980,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		"tool_execution_update",
 		"tool_execution_end",
 	]);
-	const streamTurnEvent = (event: { type?: unknown } | null | undefined, ctx: ExtensionContext): void => {
+	const streamTurnEvent = (event: AgentSessionEvent | null | undefined, ctx: ExtensionContext): void => {
 		const current = lifecycleStateForContext(ctx, "agent_start");
 		const activeInvocation = current?.activeInvocation;
 		if (!current) return;
