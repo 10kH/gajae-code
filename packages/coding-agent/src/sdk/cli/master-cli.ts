@@ -15,7 +15,7 @@ import { SdkClientError } from "../client";
 import { dispatchSpawnGlobal } from "../lifecycle/broker-client";
 
 const MASTER_CAPABILITY_ENV = "GJC_MASTER_CAPABILITY";
-const MASTER_SESSION_ENV = "GJC_SESSION_ID";
+const MASTER_SESSION_ENV = "GJC_MASTER_OWNER_SESSION_ID";
 const SPAWN_TIMEOUT_MS = 120_000;
 
 export class SdkMasterCliError extends Error {

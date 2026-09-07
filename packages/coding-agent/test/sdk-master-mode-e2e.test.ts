@@ -148,7 +148,7 @@ describe("master mode end to end", () => {
 			const idempotencyKey = "shared-cli-spawn-key";
 
 			const cliDeps = {
-				env: { GJC_MASTER_CAPABILITY: grant, GJC_SESSION_ID: ownerId },
+				env: { GJC_MASTER_CAPABILITY: grant, GJC_MASTER_OWNER_SESSION_ID: ownerId },
 				dispatch: async (_dir: string, payload: Record<string, unknown>, idempotencyKey: string) => {
 					dispatched.push(payload);
 					dispatchedKeys.push(idempotencyKey);
