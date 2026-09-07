@@ -329,8 +329,14 @@ export async function smokeTestIsolatedShell(): Promise<void> {
 	const quotedRuntimePidFile = `'${runtimePidFile.replaceAll("'", "'\\''")}'`;
 	let descendantPid: number | undefined;
 	let runtimePid: number | undefined;
+	// Declared outside the try so the `finally` can retire the worker and settle
+	// the started run on EVERY exit path. A readiness failure used to escape with
+	// only the marker files removed, leaving the persistent worker alive and the
+	// run's rejection unobserved — and the deadlines below make that window long.
+	let signalled: IsolatedShell | undefined;
+	let runPromise: Promise<IsolatedShellRunResult> | undefined;
 	try {
-		const signalled = new IsolatedShell();
+		signalled = new IsolatedShell();
 		// The descendant marker is written with content: the in-shell wait loop
 		// below tests `-s` (non-empty), so an empty marker would never satisfy it
 		// and the command would always burn its whole timeout instead of parking
@@ -338,7 +344,7 @@ export async function smokeTestIsolatedShell(): Promise<void> {
 		// release smoke check on cold hosts (a first-boot Intel macOS runner
 		// needed longer than 5s just to start the worker/supervisor/runtime
 		// chain) — the smoke still kills the runtime long before it elapses.
-		const runPromise = signalled.run({
+		runPromise = signalled.run({
 			command: `echo $$ > ${quotedRuntimePidFile}; /bin/sh -c 'trap "" TERM; echo $$ > "$1"; echo ready > "$2"; sleep 5' sh ${quotedPidFile} ${quotedReadyFile} & while [ ! -s ${quotedReadyFile} ]; do sleep 0.01; done; sleep 30`,
 			timeoutMs: 60_000,
 		});
@@ -373,6 +379,17 @@ export async function smokeTestIsolatedShell(): Promise<void> {
 		}
 		if (!descendantGone) throw new Error(`isolated shell smoke left descendant ${descendantPid} alive`);
 	} finally {
+		// Observe the run BEFORE touching the worker: retiring it settles
+		// whatever is pending, and a handler attached afterwards would let that
+		// rejection surface unhandled and mask the real smoke error.
+		const settled = runPromise?.catch(() => {});
+		// `close()` alone is graceful — it waits for the worker to finish the
+		// command, which on the failure path still has its `sleep` ahead of it.
+		// Abort first so an abandoned probe is cut immediately, then retire the
+		// worker so nothing outlives this function on any exit path.
+		await signalled?.abort().catch(() => {});
+		await signalled?.close().catch(() => {});
+		await settled;
 		await Promise.all([
 			fs.rm(pidFile, { force: true }),
 			fs.rm(readyFile, { force: true }),
