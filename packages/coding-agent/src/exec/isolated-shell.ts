@@ -331,13 +331,21 @@ export async function smokeTestIsolatedShell(): Promise<void> {
 	let runtimePid: number | undefined;
 	try {
 		const signalled = new IsolatedShell();
+		// The descendant marker is written with content: the in-shell wait loop
+		// below tests `-s` (non-empty), so an empty marker would never satisfy it
+		// and the command would always burn its whole timeout instead of parking
+		// in the intended `sleep`. The budget is generous because this runs as a
+		// release smoke check on cold hosts (a first-boot Intel macOS runner
+		// needed longer than 5s just to start the worker/supervisor/runtime
+		// chain) — the smoke still kills the runtime long before it elapses.
 		const runPromise = signalled.run({
-			command: `echo $$ > ${quotedRuntimePidFile}; /bin/sh -c 'trap "" TERM; echo $$ > "$1"; : > "$2"; sleep 5' sh ${quotedPidFile} ${quotedReadyFile} & while [ ! -s ${quotedReadyFile} ]; do sleep 0.01; done; sleep 5`,
-			timeoutMs: 5_000,
+			command: `echo $$ > ${quotedRuntimePidFile}; /bin/sh -c 'trap "" TERM; echo $$ > "$1"; echo ready > "$2"; sleep 5' sh ${quotedPidFile} ${quotedReadyFile} & while [ ! -s ${quotedReadyFile} ]; do sleep 0.01; done; sleep 30`,
+			timeoutMs: 60_000,
 		});
-		for (let attempt = 0; attempt < 200 && !(await Bun.file(readyFile).exists()); attempt++) await Bun.sleep(25);
-		if (!(await Bun.file(readyFile).exists()))
-			throw new Error("isolated shell smoke descendant did not become ready");
+		const readyDeadline = Date.now() + 30_000;
+		const descendantReady = (): boolean => Bun.file(readyFile).size > 0;
+		while (Date.now() < readyDeadline && !descendantReady()) await Bun.sleep(25);
+		if (!descendantReady()) throw new Error("isolated shell smoke descendant did not become ready");
 		descendantPid = Number.parseInt(await Bun.file(pidFile).text(), 10);
 		runtimePid = Number.parseInt(await Bun.file(runtimePidFile).text(), 10);
 		const supervisorPid = signalled.supervisorPid();
@@ -350,7 +358,11 @@ export async function smokeTestIsolatedShell(): Promise<void> {
 			throw new Error(`isolated shell signal smoke failed: ${JSON.stringify(result)}`);
 		}
 		let descendantGone = false;
-		for (let attempt = 0; attempt < 40; attempt++) {
+		// Reaping an ignored-SIGTERM descendant goes through the supervisor's
+		// group escalation, which a loaded or cold host can take seconds to
+		// complete; a one-second window turned that latency into a failure.
+		const reapDeadline = Date.now() + 15_000;
+		while (Date.now() < reapDeadline) {
 			try {
 				process.kill(descendantPid, 0);
 				await Bun.sleep(25);

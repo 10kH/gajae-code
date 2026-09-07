@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- `gjc --smoke-test` no longer fails on a cold or loaded host. The isolated-shell smoke wrote its descendant marker empty while the in-shell wait loop tested for a non-empty file, so the probe command could never reach its parked `sleep` and always burned the full 5s budget, leaving the 5s readiness poll no slack; the 1s descendant-reap window was equally tight. The marker now carries content, readiness and reaping use explicit 30s/15s deadlines, and the probe gets a 60s budget it still never needs. This failed the darwin-x64 release binary check on v0.16.5, which published nothing.
 
 ## [0.16.5] - 2026-09-07
 ### Added
