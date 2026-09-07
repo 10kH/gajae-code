@@ -1158,6 +1158,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		const settleH2WhenReady = (): void => {
 			if (terminalDrainMode) return;
 			if (!queueDrained) return;
+			if (pendingBuffer.length > 0) return;
 			if (endStreamError) {
 				settleBehindFence(() => settleH2(endStreamError));
 			} else if (sawTurnEnded && responseEnded) {

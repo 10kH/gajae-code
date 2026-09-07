@@ -637,6 +637,47 @@ describe("Cursor raw transport watchdog", () => {
 		expect(events.filter(isTerminalEvent)).toHaveLength(1);
 	});
 
+	it("parses an authoritative Connect error buffered after a queue-bound turnEnded", async () => {
+		const baseUrl = await createCursorServer(stream => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			setTimeout(() => {
+				const frames: Buffer[] = [];
+				for (let index = 0; index < 255; index += 1) {
+					frames.push(
+						buildServerMessageFrame({
+							case: "interactionUpdate",
+							value: create(InteractionUpdateSchema, {
+								message: { case: "heartbeat", value: create(HeartbeatUpdateSchema, {}) },
+							}),
+						}),
+					);
+				}
+				frames.push(
+					buildServerMessageFrame({
+						case: "interactionUpdate",
+						value: create(InteractionUpdateSchema, {
+							message: { case: "turnEnded", value: create(TurnEndedUpdateSchema, {}) },
+						}),
+					}),
+					frameConnectMessage(
+						Buffer.from(JSON.stringify({ error: { code: "internal", message: "buffered terminal failure" } })),
+						CONNECT_END_STREAM_FLAG,
+					),
+				);
+				stream.end(Buffer.concat(frames));
+			}, 10);
+		});
+
+		const { events, result } = await collectTerminal(baseUrl, {
+			streamFirstEventTimeoutMs: 100,
+			streamIdleTimeoutMs: 100,
+		});
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("Connect error internal: buffered terminal failure");
+		expect(events.filter(isTerminalEvent)).toHaveLength(1);
+	});
+
 	it("does not dispatch a coalesced exec frame after turnEnded", async () => {
 		let executions = 0;
 		const baseUrl = await createCursorServer(stream => {
