@@ -1708,6 +1708,33 @@ describe("Cursor raw transport watchdog", () => {
 		expect(events.filter(isTerminalEvent)).toHaveLength(1);
 	});
 
+	it("refreshes post-turn grace for a fragmented Connect end-stream error", async () => {
+		const baseUrl = await createCursorServer(stream => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			setTimeout(() => {
+				sendInteractionUpdate(stream, {
+					case: "turnEnded",
+					value: create(TurnEndedUpdateSchema, {}),
+				});
+				const terminal = frameConnectMessage(
+					Buffer.from(JSON.stringify({ error: { code: "internal", message: "fragmented failure" } })),
+					CONNECT_END_STREAM_FLAG,
+				);
+				setTimeout(() => stream.write(terminal.subarray(0, 6)), 15);
+				setTimeout(() => stream.end(terminal.subarray(6)), 35);
+			}, 10);
+		});
+
+		const { events, result } = await collectTerminal(baseUrl, {
+			streamIdleTimeoutMs: 100,
+			streamFirstEventTimeoutMs: 500,
+		});
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("Connect error internal: fragmented failure");
+		expect(events.filter(isTerminalEvent)).toHaveLength(1);
+	});
+
 	it("closes an unfinished response before publishing grace-window success", async () => {
 		const requestEnded = Promise.withResolvers<void>();
 		const baseUrl = await createCursorServer(stream => {

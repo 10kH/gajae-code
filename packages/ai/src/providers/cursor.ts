@@ -1157,6 +1157,17 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		};
 		const hasCompleteBufferedFrame = (): boolean =>
 			pendingBuffer.length >= 5 && pendingBuffer.length >= 5 + pendingBuffer.readUInt32BE(1);
+		const hasPlausibleBufferedFrameProgress = (): boolean => {
+			if (pendingBuffer.length === 0) return false;
+			if (pendingBuffer.length < 5) return true;
+			const flags = pendingBuffer.byteAt(0);
+			return (flags & ~0b11) === 0 && pendingBuffer.readUInt32BE(1) <= CURSOR_MAX_GRPC_MESSAGE_LENGTH;
+		};
+		const refreshPostTurnEndedGrace = (): void => {
+			if (!postTurnEndedCheckpointTimer || !hasPlausibleBufferedFrameProgress()) return;
+			clearTimeout(postTurnEndedCheckpointTimer);
+			postTurnEndedCheckpointTimer = undefined;
+		};
 		const settleH2WhenReady = (): void => {
 			if (terminalDrainMode) return;
 			if (!queueDrained) return;
@@ -2126,6 +2137,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				if (terminalBoundarySeen) {
 					const remaining = CURSOR_MAX_PENDING_SERVER_BYTES - pendingBuffer.length;
 					if (remaining > 0) pendingBuffer.append(chunk.subarray(0, remaining));
+					refreshPostTurnEndedGrace();
 					processPendingBuffer?.();
 					return;
 				}
