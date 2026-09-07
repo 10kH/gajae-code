@@ -1004,9 +1004,13 @@ export function eventAffectsCoordinatorRuntimeState(event: RuntimeStateEvent): b
 }
 
 class PreviousRuntimeStateReadError extends Error {
-	constructor(cause?: unknown) {
+	constructor(cause?: unknown, detail?: string) {
 		const lockDetail = cause instanceof SessionStateLockUnavailableError ? ` ${cause.message}` : "";
-		super(`Existing runtime state marker is invalid or unreadable; refusing to overwrite.${lockDetail}`);
+		super(
+			detail
+				? `Existing runtime state marker violates the lifecycle contract: ${detail}; refusing to overwrite.`
+				: `Existing runtime state marker is invalid or unreadable; refusing to overwrite.${lockDetail}`,
+		);
 		this.name = "PreviousRuntimeStateReadError";
 		if (cause !== undefined) this.cause = cause;
 	}
@@ -1016,7 +1020,7 @@ class PreviousRuntimeStateReadError extends Error {
  * A readable, well-formed marker recorded against a different workspace path.
  *
  * Separate from {@link PreviousRuntimeStateReadError} because the two demand different
- * operator responses: an unreadable marker points at file damage, while a foreign marker
+ * operator responses: an invalid marker points at file damage or lifecycle contradictions, while a foreign marker
  * points at the same session directory being reachable from two checkouts.
  */
 class ForeignRuntimeStateError extends Error {
@@ -1084,11 +1088,29 @@ function isAbsentStateFileError(error: unknown): boolean {
 
 function parsePreviousPayload(raw: string): Record<string, unknown> {
 	const payload: unknown = JSON.parse(raw);
-	if (!validPreviousRuntimeStatePayload(payload)) throw new PreviousRuntimeStateReadError();
+	if (!validPreviousRuntimeStateShape(payload)) throw new PreviousRuntimeStateReadError();
+	// Structural validation above bounds every interpolated value to a known state
+	// or boolean; never include arbitrary marker contents in a terminal diagnostic.
+	if (payload.ready_for_input !== undefined) {
+		const expectedReady = payload.state === "ready_for_input";
+		if (payload.ready_for_input !== expectedReady)
+			throw new PreviousRuntimeStateReadError(
+				undefined,
+				`ready_for_input must be ${expectedReady} when state is ${payload.state} (received ${payload.ready_for_input})`,
+			);
+	}
+	if (payload.live !== undefined && payload.live !== null) {
+		const expectedLive = payload.state === "running";
+		if (payload.live !== expectedLive)
+			throw new PreviousRuntimeStateReadError(
+				undefined,
+				`live must be ${expectedLive} when state is ${payload.state} (received ${payload.live})`,
+			);
+	}
 	return payload;
 }
 
-function validPreviousRuntimeStatePayload(value: unknown): value is Record<string, unknown> {
+function validPreviousRuntimeStateShape(value: unknown): value is Record<string, unknown> {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
 	const payload = value as Record<string, unknown>;
 	if (
@@ -1124,12 +1146,6 @@ function validPreviousRuntimeStatePayload(value: unknown): value is Record<strin
 		payload.updated_at !== undefined &&
 		(typeof payload.updated_at !== "string" || !Number.isFinite(Date.parse(payload.updated_at)))
 	)
-		return false;
-	if (payload.ready_for_input !== undefined) {
-		const expectedReady = payload.state === "ready_for_input";
-		if (payload.ready_for_input !== expectedReady) return false;
-	}
-	if (payload.live !== undefined && payload.live !== null && payload.live !== (payload.state === "running"))
 		return false;
 	return true;
 }

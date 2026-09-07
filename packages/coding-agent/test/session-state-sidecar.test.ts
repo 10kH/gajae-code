@@ -680,6 +680,37 @@ describe("coordinator runtime state sidecar", () => {
 		expect(await Bun.file(stateFile).text()).toBe(evidence);
 	});
 
+	it.each([
+		"state",
+		"ready_for_input",
+		"live",
+	])("does not echo structurally invalid marker field %s into diagnostics", async field => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "invalid-field.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "invalid-field";
+		const evidence = JSON.stringify({
+			schema_version: 1,
+			session_id: "invalid-field",
+			state: "completed",
+			ready_for_input: true,
+			live: false,
+			[field]: "untrusted-marker-text\x1b[2J",
+		});
+		await Bun.write(stateFile, evidence);
+		const failure = await persistCoordinatorRuntimeStateFromEvent(assistantEnd("done"), {
+			sessionId: "invalid-field",
+			cwd: root,
+			sessionFile: null,
+		}).catch((error: unknown) => error);
+		expect(failure).toBeInstanceOf(Error);
+		expect(failure).toMatchObject({
+			name: "PreviousRuntimeStateReadError",
+			message: "Existing runtime state marker is invalid or unreadable; refusing to overwrite.",
+		});
+		expect(await Bun.file(stateFile).text()).toBe(evidence);
+	});
+
 	it("reports a live transition timeout without misclassifying or changing runtime state", async () => {
 		const root = await tempRoot();
 		const stateFile = path.join(root, "transition-timeout-state.json");
@@ -714,7 +745,7 @@ describe("coordinator runtime state sidecar", () => {
 			reason: "transition_claim_timeout",
 		});
 		expect(await Bun.file(stateFile).bytes()).toEqual(before);
-	});
+	}, 30000);
 
 	it("preserves directory runtime-state evidence and refuses event and postmortem writes", async () => {
 		const root = await tempRoot();
@@ -1393,9 +1424,8 @@ describe("coordinator runtime state sidecar", () => {
 		const sessionId = "foreign-session";
 		const foreign = "D:\\Users\\Operator\\Repo";
 
-		// Live or non-terminal markers may still have a running owner behind them. A live
-		// marker is refused as a foreign workspace; a non-terminal one is refused earlier, by
-		// the pre-existing non-terminal guard, so both messages are accepted here.
+		// Valid foreign markers report workspace ownership; contradictory lifecycle
+		// fields are diagnosed earlier, before adoption can be considered.
 		for (const marker of [
 			{ state: "running", live: true },
 			{ state: "completed" }, // `live` absent says nothing about the owner
@@ -1424,7 +1454,11 @@ describe("coordinator runtime state sidecar", () => {
 					{ type: "turn_start" },
 					{ sessionId, cwd: root, sessionFile: null },
 				),
-			).rejects.toThrow(/belongs to a different workspace|invalid or unreadable/);
+			).rejects.toThrow(
+				marker.live === false
+					? "live must be true when state is running (received false)"
+					: "belongs to a different workspace",
+			);
 			expect(await Bun.file(stateFile).text()).toBe(before);
 		}
 
@@ -3687,38 +3721,42 @@ describe("coordinator runtime state sidecar", () => {
 		expect(payload.live).toBe(false);
 	});
 
-	it("issue-4351: validation rejects a stale completed+ready_for_input:true marker", async () => {
+	it.each([
+		["completed", true, false, "ready_for_input must be false when state is completed (received true)"],
+		["ready_for_input", false, false, "ready_for_input must be true when state is ready_for_input (received false)"],
+		["running", false, false, "live must be true when state is running (received false)"],
+		["completed", false, true, "live must be false when state is completed (received true)"],
+	] as const)("diagnoses contradictory lifecycle fields: %s / ready=%s / live=%s", async (state, ready, live, detail) => {
 		const root = await tempRoot();
-		const stateFile = path.join(root, "issue-4351-stale.json");
+		const sessionId = "contradictory-marker";
+		const stateFile = path.join(sessionRuntimeDir(root, sessionId), "runtime-state.json");
 		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
-		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "issue-4351-stale";
-		// A pre-fix marker with the contradictory completed + ready_for_input: true.
-		await Bun.write(
-			stateFile,
-			`${JSON.stringify({
-				schema_version: 1,
-				session_id: "issue-4351-stale",
-				state: "completed",
-				ready_for_input: true,
-				cwd: root,
-				workdir: root,
-				session_file: null,
-				current_turn_id: null,
-				last_turn_id: null,
-				live: false,
-				updated_at: "2026-08-11T00:00:00.000Z",
-				reason: null,
-			})}\n`,
-		);
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = sessionId;
+		// Like a pre-4351 marker carried from Windows: a readable payload must still
+		// pass lifecycle validation before foreign-workspace adoption is considered.
+		const evidence = `${JSON.stringify({
+			schema_version: 1,
+			session_id: sessionId,
+			state,
+			ready_for_input: ready,
+			cwd: "D:\\work\\project",
+			workdir: "D:\\work\\project",
+			session_file: null,
+			live,
+			updated_at: "2026-08-11T00:00:00.000Z",
+		})}\n`;
+		await Bun.write(stateFile, evidence);
+		const context = { sessionId, cwd: root, sessionFile: null };
+		const message = `Existing runtime state marker violates the lifecycle contract: ${detail}; refusing to overwrite.`;
 
-		// The stale marker must be rejected; the runtime must not silently preserve it.
 		await expect(
-			persistCoordinatorRuntimeStateFromEvent(assistantEnd("re-assert completion"), {
-				sessionId: "issue-4351-stale",
-				cwd: root,
-				sessionFile: null,
-			}),
-		).rejects.toThrow();
+			persistCoordinatorRuntimeStateFromEvent(assistantEnd("re-assert completion"), context),
+		).rejects.toThrow(message);
+		expect(await Bun.file(stateFile).text()).toBe(evidence);
+		await expect(persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, context)).rejects.toThrow(
+			message,
+		);
+		expect(await Bun.file(stateFile).text()).toBe(evidence);
 	});
 });
 
