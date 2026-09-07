@@ -34,7 +34,6 @@ import {
 	getReadOptions,
 	getUserSkillScanDirs,
 	loadFilesFromDir,
-	readContainedFile,
 	SOURCE_PATHS,
 	scanSkillsFromDir,
 } from "./helpers";
@@ -45,8 +44,6 @@ const DESCRIPTION = "Native GJC configuration from ~/.gjc and .gjc/";
 const PRIORITY = 100;
 
 const PATHS = SOURCE_PATHS.native;
-
-
 
 /**
  * GJC's user-scope config directory.
@@ -118,8 +115,6 @@ async function getConfigDirs(ctx: LoadContext): Promise<Array<{ dir: string; lev
 
 	return result;
 }
-
-
 
 async function findNearestProjectConfigDir(ctx: LoadContext): Promise<{ dir: string; depth: number } | null> {
 	for (const ancestor of getAncestorDirs(ctx.cwd, getProjectStopDirectory(ctx))) {
@@ -300,7 +295,6 @@ async function loadSystemPrompt(ctx: LoadContext): Promise<LoadResult<SystemProm
 			level: "user",
 			_source: createSourceMeta(PROVIDER_ID, userPath, "user"),
 		});
-	}
 	}
 
 	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx);

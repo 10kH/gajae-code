@@ -24,8 +24,6 @@ import {
 	type ReadScope,
 	readDirEntries,
 	readFile,
-	readFileSize,
-	readFileSlice,
 } from "../capability/fs";
 import { parseRuleConditionAndScope, type Rule, type RuleFrontmatter } from "../capability/rule";
 import type { Skill, SkillFrontmatter } from "../capability/skill";
