@@ -269,7 +269,7 @@ describe("gjc mcp CLI helpers", () => {
 		expect(byName.denied.runtimeStatus).toBe("disabled");
 		expect(byName.lazy.runtimeStatus).toBe("autoload-off");
 		expect(byName.lazy.runtimeNote).toBe(
-			"Configured but not auto-loaded at startup (autoload: false). To load it, set autoload to true or remove the key in this config file, then start a new session; --mcp-config does not override the flag. It must also stay enabled and out of disabledServers.",
+			"Configured but not auto-loaded at startup (autoload: false). To load it at startup, set autoload to true or remove the key in this config file, then start a new session; --mcp-config does not override the flag. It must also stay enabled and out of disabledServers.",
 		);
 		expect(byName.alpha.scope).toBe("user");
 		expect(byName.alpha.path).toBe(configPath);
@@ -289,8 +289,9 @@ describe("gjc mcp CLI helpers", () => {
 		await runMCPCommand({ action: "list", flags: { json: true }, cwd: projectDir });
 
 		const note = JSON.parse(stdoutText(stdout)).servers[0].runtimeNote as string;
-		// `/mcp` is quarantined (see mcp-quarantine-surface.test.ts), so the note must
-		// not send an operator to it, and `--mcp-config` still enforces autoload.
+		// Startup loading never connects an opted-out server (ordinary startup skips
+		// it and `--mcp-config` sets `autoloadOnly`), so the note must not promise
+		// a startup path that ignores the flag.
 		expect(note).not.toContain("/mcp");
 		expect(note).not.toContain("on demand");
 		expect(note).toContain("autoload to true or remove the key");

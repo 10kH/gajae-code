@@ -94,12 +94,13 @@ function autoloadStatusNote(status: AutoloadStatus): string {
 		case "autoload":
 			return "Loaded by ordinary standalone gjc sessions at startup.";
 		case "autoload-off":
-			// Editing the stored flag is the only path: no in-session command connects
-			// an opted-out server, and exact-config loading (`--mcp-config`) sets
+			// Editing the stored flag is the startup path: ordinary startup
+			// (`discoverAndConnect` without `autoloadOnly`) skips opted-out
+			// servers, and exact-config loading (`--mcp-config`) sets
 			// `autoloadOnly`, so naming the file skips it too. Necessary, not
 			// sufficient — `enabled: false` and `disabledServers` block independently.
 			return (
-				"Configured but not auto-loaded at startup (autoload: false). To load it, set autoload to true or " +
+				"Configured but not auto-loaded at startup (autoload: false). To load it at startup, set autoload to true or " +
 				"remove the key in this config file, then start a new session; --mcp-config does not override the " +
 				"flag. It must also stay enabled and out of disabledServers."
 			);
