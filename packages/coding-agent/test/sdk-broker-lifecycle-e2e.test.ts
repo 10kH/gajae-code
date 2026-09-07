@@ -4957,7 +4957,7 @@ await Bun.sleep(150);
 	}
 }, 15_000);
 
-test("idempotent lifecycle replay refreshes authority after a broker restart", async () => {
+test("idempotent lifecycle replay refreshes unchanged authority after a broker restart", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-replay-authority-"));
 	const agentDir = path.join(root, "agent");
 	const stateRoot = path.join(root, ".gjc", "state");
@@ -4999,6 +4999,9 @@ test("idempotent lifecycle replay refreshes authority after a broker restart", a
 		const targetHash = createHash("sha256").update(canonicalJson({ sessionId })).digest("hex");
 		const identity = await deriveIdempotencyIdentity(agentDir, "session.resume", key, targetHash);
 		const input = { cwd: root, stateRoot, sessionId };
+		const endpointIncarnation = createHash("sha256")
+			.update(canonicalJson({ endpointGeneration: 2, endpointMtimeMs, pid: host.pid, sessionId }))
+			.digest("hex");
 		const requestHash = createHash("sha256")
 			.update(canonicalJson({ operation: "session.resume", input }))
 			.digest("hex");
@@ -5009,9 +5012,10 @@ test("idempotent lifecycle replay refreshes authority after a broker restart", a
 				result: {
 					sessionId,
 					cwd: root,
-					endpointGeneration: 1,
-					pid: host.pid + 1,
-					endpointMtimeMs: 1,
+					endpointGeneration: 2,
+					endpointIncarnation,
+					pid: host.pid,
+					endpointMtimeMs,
 					reused: true,
 				},
 			},
@@ -5026,6 +5030,7 @@ test("idempotent lifecycle replay refreshes authority after a broker restart", a
 				sessionId,
 				cwd: root,
 				endpointGeneration: 2,
+				endpointIncarnation,
 				pid: host.pid,
 				endpointMtimeMs,
 				reused: true,
