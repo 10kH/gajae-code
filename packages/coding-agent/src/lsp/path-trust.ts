@@ -59,6 +59,30 @@ function findProjectTrustRoot(start: string, stopPaths: ReadonlySet<string>): st
 	}
 }
 
+/**
+ * Spellings of `candidate` that differ only in how HOME is named: the path as
+ * given, plus the same path with any ancestor that is HOME under another name
+ * replaced by canonical HOME. Nothing beneath HOME is dereferenced, so a
+ * project directory that merely links *into* HOME never becomes an alias.
+ */
+function candidateSpellings(candidate: string, canonicalHome: string): string[] {
+	const resolved = path.resolve(candidate);
+	const spellings = [resolved];
+	const normalizedHome = normalizePathForComparison(canonicalHome);
+	let current = path.dirname(resolved);
+	for (;;) {
+		if (
+			normalizePathForComparison(current) !== normalizedHome &&
+			normalizePathForComparison(canonicalPath(current)) === normalizedHome
+		) {
+			spellings.push(path.join(canonicalHome, path.relative(current, resolved)));
+		}
+		const parent = path.dirname(current);
+		if (parent === current) return spellings;
+		current = parent;
+	}
+}
+
 export function isProjectControlledPath(candidate: string, cwd: string): boolean {
 	const home = os.homedir();
 	const canonicalHome = canonicalPath(home);
@@ -67,17 +91,26 @@ export function isProjectControlledPath(candidate: string, cwd: string): boolean
 	// A trust root outside HOME must not claim user executables inside HOME
 	// (e.g. ~/.gjc/bin); a root under HOME still owns what it contains. Each check
 	// judges home scope on the same view of the path it inspects, without
-	// dereferencing the candidate: mixing views let a project link into HOME, or a
-	// HOME link into the project, escape rejection. HOME may itself be spelled
-	// lexically or canonically.
-	const candidateIsLexicallyHomeScoped =
-		pathIsLexicallyWithin(home, candidate) || pathIsLexicallyWithin(canonicalHome, candidate);
-	if (
-		lexicalTrustRoot !== undefined &&
-		pathIsLexicallyWithin(lexicalTrustRoot, candidate) &&
-		(!candidateIsLexicallyHomeScoped || pathIsLexicallyWithin(home, lexicalTrustRoot))
-	)
-		return true;
+	// dereferencing the candidate's final component: mixing views let a project
+	// link into HOME, or a HOME link into the project, escape rejection. HOME may
+	// be spelled lexically or canonically on either side, so the lexical check
+	// runs over every HOME-alias spelling of both the candidate and the root.
+	if (lexicalTrustRoot !== undefined) {
+		const trustRootIsHomeScoped = pathIsWithin(canonicalHome, lexicalTrustRoot);
+		const rootSpellings = candidateSpellings(lexicalTrustRoot, canonicalHome);
+		const spellings = candidateSpellings(candidate, canonicalHome);
+		// Every spelling names the same location, so home scope is a property of
+		// the location: one spelling under HOME makes all of them HOME-scoped.
+		const candidateIsHomeScoped = spellings.some(
+			spelling => pathIsLexicallyWithin(home, spelling) || pathIsLexicallyWithin(canonicalHome, spelling),
+		);
+		if (
+			(!candidateIsHomeScoped || trustRootIsHomeScoped) &&
+			spellings.some(spelling => rootSpellings.some(root => pathIsLexicallyWithin(root, spelling)))
+		) {
+			return true;
+		}
+	}
 
 	const canonicalCandidate = canonicalPath(candidate);
 	const canonicalCandidateParent = canonicalParentPath(candidate);

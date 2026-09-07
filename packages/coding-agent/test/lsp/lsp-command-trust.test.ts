@@ -536,20 +536,48 @@ describe("LSP repository command trust", () => {
 		await fs.promises.symlink(canonicalHome, lexicalHome);
 		const server = path.join(userBin, "typescript-language-server");
 		await Bun.write(server, "");
-		vi.spyOn(os, "homedir").mockReturnValue(lexicalHome);
+		const lexicalServer = path.join(lexicalHome, ".gjc", "bin", "typescript-language-server");
 
 		// cwd is HOME's parent: its fallback trust root contains HOME, so only the
-		// home exemption keeps user executables trusted.
+		// home exemption keeps user executables trusted. Both homedir spellings
+		// must accept both candidate spellings.
 		const cwd = tempDir.path();
-		expect(isProjectControlledPath(path.join(lexicalHome, ".gjc", "bin", "typescript-language-server"), cwd)).toBe(
-			false,
-		);
-		expect(isProjectControlledPath(server, cwd)).toBe(false);
-
-		// A project file directly under that same ancestor cwd is still owned.
 		const projectFile = path.join(cwd, "typescript-language-server");
 		await Bun.write(projectFile, "");
-		expect(isProjectControlledPath(projectFile, cwd)).toBe(true);
+		for (const homedir of [lexicalHome, canonicalHome]) {
+			vi.spyOn(os, "homedir").mockReturnValue(homedir);
+			expect(isProjectControlledPath(lexicalServer, cwd)).toBe(false);
+			expect(isProjectControlledPath(server, cwd)).toBe(false);
+			// A project file directly under that same ancestor cwd is still owned.
+			expect(isProjectControlledPath(projectFile, cwd)).toBe(true);
+		}
+	});
+
+	it("keeps owning a project directory that links into HOME from a canonically spelled cwd", async () => {
+		if (process.platform === "win32") return;
+
+		using tempDir = TempDir.createSync("@gjc-lsp-home-alias-project-link-");
+		const canonicalHome = path.join(tempDir.path(), "home");
+		const lexicalHome = path.join(tempDir.path(), "home-link");
+		const userBin = path.join(canonicalHome, ".gjc", "bin");
+		const repo = path.join(canonicalHome, "repo");
+		await fs.promises.mkdir(userBin, { recursive: true });
+		await fs.promises.mkdir(path.join(repo, ".git"), { recursive: true });
+		await fs.promises.symlink(canonicalHome, lexicalHome);
+		await Bun.write(path.join(userBin, "typescript-language-server"), "");
+		// repo/bin is a project-owned directory symlink into HOME.
+		await fs.promises.symlink(userBin, path.join(repo, "bin"));
+		const projectCandidate = path.join(repo, "bin", "typescript-language-server");
+
+		for (const homedir of [lexicalHome, canonicalHome]) {
+			vi.spyOn(os, "homedir").mockReturnValue(homedir);
+			for (const cwd of [repo, path.join(lexicalHome, "repo")]) {
+				expect(isProjectControlledPath(projectCandidate, cwd)).toBe(true);
+				expect(
+					isProjectControlledPath(path.join(lexicalHome, "repo", "bin", "typescript-language-server"), cwd),
+				).toBe(true);
+			}
+		}
 	});
 
 	it("rejects home-crossing symlinks in both directions when the repository is a sibling of HOME", async () => {
