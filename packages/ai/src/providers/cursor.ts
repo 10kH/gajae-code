@@ -1897,6 +1897,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 						const isExecutable = isExecServerMessage && isMeaningful;
 						if (isExecutable) {
 							processingPausedForExec = true;
+							h2Request!.pause();
 							clearTransportWatchdog();
 							execQueuePrefix = messageQueue.drain();
 						}
@@ -2054,7 +2055,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 							// Consume both outcomes: `finally()` would create a second rejected
 							// promise when the boundary handler fails, even though the queue's
 							// normal error path already consumed the original rejection.
-							void queued.then(resumeAfterDrain, resumeAfterDrain);
+							void messageQueue.drain().then(resumeAfterDrain, resumeAfterDrain);
 							break;
 						}
 

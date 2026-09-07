@@ -1438,6 +1438,7 @@ describe("Cursor request lifecycle", () => {
 	it.each([
 		{
 			name: "non-zero trailers",
+			requiresResume: false,
 			terminate(stream: http2.ServerHttp2Stream) {
 				stream.end();
 			},
@@ -1451,6 +1452,7 @@ describe("Cursor request lifecycle", () => {
 		},
 		{
 			name: "Connect end-stream error",
+			requiresResume: true,
 			terminate(stream: http2.ServerHttp2Stream) {
 				stream.write(
 					frameConnectPayload(
@@ -1466,6 +1468,7 @@ describe("Cursor request lifecycle", () => {
 		},
 		{
 			name: "request/session failure",
+			requiresResume: false,
 			terminate(stream: http2.ServerHttp2Stream) {
 				stream.close(http2.constants.NGHTTP2_INTERNAL_ERROR);
 			},
@@ -1474,7 +1477,7 @@ describe("Cursor request lifecycle", () => {
 			},
 			error: "",
 		},
-	])("settles $name once while an exec handler is held", async ({ terminate, respond, error }) => {
+	])("settles $name once while an exec handler is held", async ({ terminate, respond, error, requiresResume }) => {
 		const { promise: releasePromise, resolve: releaseHandler } = Promise.withResolvers<void>();
 		const { promise: handlerStarted, resolve: markHandlerStarted } = Promise.withResolvers<void>();
 		const { promise: handlerFinished, resolve: markHandlerFinished } = Promise.withResolvers<void>();
@@ -1524,6 +1527,7 @@ describe("Cursor request lifecycle", () => {
 			await handlerStarted;
 			if (!request) throw new Error("Expected Cursor request stream");
 			terminate(request);
+			if (requiresResume) releaseHandler();
 			await consume;
 			const terminalEvents = events.filter(event => event.type === "done" || event.type === "error");
 			expect(terminalEvents).toHaveLength(1);
