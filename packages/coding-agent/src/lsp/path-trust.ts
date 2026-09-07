@@ -59,13 +59,18 @@ function findProjectTrustRoot(start: string, stopPaths: ReadonlySet<string>): st
 	}
 }
 
+function isProjectMarkerRoot(root: string): boolean {
+	return fs.existsSync(path.join(root, ".git")) || isDirectory(path.join(root, CONFIG_DIR_NAME));
+}
+
 /**
  * Spellings of `candidate` that differ only in how HOME is named: the path as
  * given, plus the same path with any ancestor that is HOME under another name
- * replaced by canonical HOME. Nothing beneath HOME is dereferenced, so a
- * project directory that merely links *into* HOME never becomes an alias.
+ * replaced by canonical HOME. The suffix beneath HOME is kept as spelled, and an
+ * alias that lives inside a project (`repo/home-link -> HOME`) is project
+ * content, not a HOME spelling, so it is never expanded.
  */
-function candidateSpellings(candidate: string, canonicalHome: string): string[] {
+function candidateSpellings(candidate: string, canonicalHome: string, projectRoot: string | undefined): string[] {
 	const resolved = path.resolve(candidate);
 	const spellings = [resolved];
 	const normalizedHome = normalizePathForComparison(canonicalHome);
@@ -73,6 +78,7 @@ function candidateSpellings(candidate: string, canonicalHome: string): string[] 
 	for (;;) {
 		if (
 			normalizePathForComparison(current) !== normalizedHome &&
+			(projectRoot === undefined || !pathIsLexicallyWithin(projectRoot, current)) &&
 			normalizePathForComparison(canonicalPath(current)) === normalizedHome
 		) {
 			spellings.push(path.join(canonicalHome, path.relative(current, resolved)));
@@ -97,8 +103,13 @@ export function isProjectControlledPath(candidate: string, cwd: string): boolean
 	// runs over every HOME-alias spelling of both the candidate and the root.
 	if (lexicalTrustRoot !== undefined) {
 		const trustRootIsHomeScoped = pathIsWithin(canonicalHome, lexicalTrustRoot);
-		const rootSpellings = candidateSpellings(lexicalTrustRoot, canonicalHome);
-		const spellings = candidateSpellings(candidate, canonicalHome);
+		// A root under HOME may legitimately be reached through a HOME alias, and a
+		// bare fallback root (no project marker) owns nothing on its own; a real
+		// project root outside HOME owns every alias directory it contains.
+		const aliasBoundary =
+			!trustRootIsHomeScoped && isProjectMarkerRoot(lexicalTrustRoot) ? lexicalTrustRoot : undefined;
+		const rootSpellings = candidateSpellings(lexicalTrustRoot, canonicalHome, undefined);
+		const spellings = candidateSpellings(candidate, canonicalHome, aliasBoundary);
 		// Every spelling names the same location, so home scope is a property of
 		// the location: one spelling under HOME makes all of them HOME-scoped.
 		const candidateIsHomeScoped = spellings.some(

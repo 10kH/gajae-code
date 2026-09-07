@@ -622,6 +622,15 @@ describe("LSP repository command trust", () => {
 		const goodLink = path.join(home, ".local", "bin", "rust-analyzer-good");
 		await fs.promises.symlink(rustup, goodLink);
 		expect(isProjectControlledPath(goodLink, repo)).toBe(false);
+
+		// A project-owned directory alias to HOME itself is project content: the
+		// invocation path stays under the repository, so it is still owned.
+		const homeAlias = path.join(repo, "home-link");
+		await fs.promises.symlink(home, homeAlias);
+		const aliasedCandidate = path.join(homeAlias, ".cargo", "bin", "rustup");
+		expect(isProjectControlledPath(aliasedCandidate, repo)).toBe(true);
+		which.mockImplementation(command => (command === "rust-analyzer" ? aliasedCandidate : null));
+		expect(loadConfig(repo).servers["rust-analyzer"]).toBeUndefined();
 	});
 
 	it("treats a repository ..bin child as contained while preserving external executables", async () => {
