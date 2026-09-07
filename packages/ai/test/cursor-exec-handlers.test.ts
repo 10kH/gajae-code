@@ -8,6 +8,7 @@ import {
 	buildCursorSystemPromptJsons,
 	createCursorMessageQueueForTest,
 	disposeCursorConversation,
+	endCursorRequestForTest,
 	resolveExecHandler,
 	storeCursorBlobForTest,
 	streamCursor,
@@ -702,6 +703,25 @@ describe("Cursor live checkpoint usage ordering", () => {
 });
 
 describe("Cursor request lifecycle", () => {
+	it("waits for request END_STREAM completion before successful teardown", async () => {
+		let endCallback: (() => void) | undefined;
+		const fakeRequest = {
+			end(callback?: () => void) {
+				endCallback = callback;
+				return fakeRequest;
+			},
+		} as unknown as Pick<http2.ClientHttp2Stream, "end">;
+		let settled = false;
+		const ending = endCursorRequestForTest(fakeRequest).then(result => {
+			settled = true;
+			return result;
+		});
+		await Bun.sleep(0);
+		expect(settled).toBe(false);
+		endCallback?.();
+		expect(await ending).toBe(true);
+	});
+
 	it("applies a checkpoint delivered after turnEnded before finalizing usage", async () => {
 		const server = http2.createServer();
 		server.on("stream", (stream: http2.ServerHttp2Stream) => {

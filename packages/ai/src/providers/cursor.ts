@@ -689,6 +689,29 @@ function closeStalledCursorRequest(request: http2.ClientHttp2Stream): void {
 	}
 }
 
+/** Await request-side END_STREAM under the same bounded teardown contract used by Cursor streams. */
+export async function endCursorRequestForTest(
+	request: Pick<http2.ClientHttp2Stream, "end">,
+	timeoutMs = 100,
+): Promise<boolean> {
+	const completion = Promise.withResolvers<boolean>();
+	let settled = false;
+	const settle = (value: boolean): void => {
+		if (settled) return;
+		settled = true;
+		completion.resolve(value);
+	};
+	const timer = setTimeout(() => settle(false), timeoutMs);
+	try {
+		request.end(() => settle(true));
+	} catch {
+		settle(false);
+	}
+	const completed = await completion.promise;
+	clearTimeout(timer);
+	return completed;
+}
+
 /** Wait until every frame accepted by a request has reached the HTTP/2 writer. */
 async function waitForCursorWrites(
 	request: http2.ClientHttp2Stream | null,
@@ -2329,12 +2352,15 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			// final exec response can be lost when close wins the writer race.
 			await waitForCursorWrites(h2Request, CURSOR_WRITE_DRAIN_TIMEOUT_MS, forceCloseTransport).catch(() => {});
 			if (completedSuccessfully) {
-				h2Request?.end();
+				const requestEnded = h2Request
+					? isClosedCursorRequest(h2Request) || (await endCursorRequestForTest(h2Request))
+					: true;
+				if (!requestEnded) forceCloseTransport();
 				h2Client?.close();
 				// A valid turnEnded can arrive before the peer closes its response half.
 				// Send END_STREAM first; only force cleanup after a bounded grace period
 				// when the peer leaves the completed stream open indefinitely.
-				if (h2Request && !h2Request.closed && !h2Request.destroyed) {
+				if (requestEnded && h2Request && !h2Request.closed && !h2Request.destroyed) {
 					const gracefulTeardownTimer = setTimeout(forceCloseTransport, 100);
 					h2Request.once("close", () => clearTimeout(gracefulTeardownTimer));
 				}
