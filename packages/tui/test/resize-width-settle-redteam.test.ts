@@ -19,6 +19,10 @@ const START_WIDTH = 44;
 const SETTLED_WIDTH = 22;
 const ROWS = 12;
 const SETTLE_MS = 1000;
+// Floor of the "late window" the boundary case must land in: a second change
+// this far into the 1000ms settle window still exercises deadline rearming near
+// the edge, which is the property TIMING-BOUNDARY exists to pin.
+const LATE_WINDOW_FLOOR_MS = 700;
 const FAKE_TMUX = "/tmp/fake-tmux,4242,0";
 
 type Capture = {
@@ -504,7 +508,12 @@ describe("width-settle debounce red-team", () => {
 				const secondResizeAt = performance.now();
 				const redrawsAfterSecondResize = tui.fullRedraws;
 				const elapsedBetweenResizes = secondResizeAt - firstResizeAt;
-				if (elapsedBetweenResizes >= SETTLE_MS) {
+				// An attempt only proves the LATE-window contract this case is named
+				// for if the second change landed inside the first window AND late in
+				// it. Retrying with an earlier target would silently downgrade this
+				// to an ordinary mid-window rearm test, so an attempt that drifts out
+				// of the late band is inconclusive and gets retried instead.
+				if (elapsedBetweenResizes >= SETTLE_MS || elapsedBetweenResizes < LATE_WINDOW_FLOOR_MS) {
 					return {
 						conclusive: false,
 						secondChangeDelayMs,
@@ -550,7 +559,9 @@ describe("width-settle debounce red-team", () => {
 
 		const attempts: TimingBoundaryAttempt[] = [];
 		let conclusiveAttempt: Extract<TimingBoundaryAttempt, { conclusive: true }> | undefined;
-		for (const secondChangeDelayMs of [850, 600, 400]) {
+		// Every target stays inside the late band: the retries absorb scheduler
+		// jitter without moving the scenario away from the boundary under test.
+		for (const secondChangeDelayMs of [850, 800, 760, 720, 700]) {
 			const attempt = await runAttempt(secondChangeDelayMs);
 			attempts.push(attempt);
 			if (attempt.conclusive) {
@@ -591,10 +602,12 @@ describe("width-settle debounce red-team", () => {
 			{
 				noEarlySettleAtFirstDeadline: beforeExtendedDeadlineWrite === "",
 				noEarlyRedrawAtFirstDeadline: redrawsBeforeExtendedDeadline === redrawsAfterSecondResize,
-				// The only real precondition: the second change landed inside the
-				// first window. Asserting a tight upper bound here would fail correct
-				// code whenever the CI scheduler pauses between the two resizes.
+				// Preconditions, both required: the second change landed inside the
+				// first window and late within it, which is the scenario this case
+				// is named for. A pass from an early-window change would not prove
+				// boundary rearming at all.
 				secondChangeInsideFirstWindow: elapsedBetweenResizes < SETTLE_MS,
+				secondChangeLateInFirstWindow: elapsedBetweenResizes >= LATE_WINDOW_FLOOR_MS,
 				exactlyOneExtendedSettle: redrawsAfterExtendedDeadline - redrawsAfterSecondResize === 1,
 				extendedSettleWritesRepair: afterExtendedDeadlineWrite.includes("\x1b[2J\x1b[H\x1b[3J"),
 			},
@@ -615,5 +628,7 @@ describe("width-settle debounce red-team", () => {
 				afterExtendedDeadlineWriteExcerpt: writeExcerpt(afterExtendedDeadlineWrite, 1400),
 			},
 		);
-	});
+		// Up to five late-window attempts, each spanning two settle windows plus
+		// transcript setup, so the budget is sized to the retry path it allows.
+	}, 60_000);
 });
