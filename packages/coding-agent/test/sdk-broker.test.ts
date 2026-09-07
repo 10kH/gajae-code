@@ -1539,6 +1539,30 @@ describe("SDK broker identity and discovery", () => {
 		const owner = (await import("../src/sdk/broker/ensure")).brokerOwnerForTest(dir);
 		await owner?.stop();
 	}, 15_000);
+	it("does not publish discovery until the initial session heartbeat checkpoint settles", async () => {
+		const dir = await temp();
+		const broker = new Broker({ agentDir: dir });
+		const checkpointEntered = Promise.withResolvers<void>();
+		const releaseCheckpoint = Promise.withResolvers<void>();
+		const heartbeat = vi.spyOn(broker, "heartbeatSessions").mockImplementation(async () => {
+			checkpointEntered.resolve();
+			await releaseCheckpoint.promise;
+			return 0;
+		});
+		try {
+			const start = broker.start();
+			await checkpointEntered.promise;
+			expect(await readBrokerDiscovery(dir)).toBeNull();
+			releaseCheckpoint.resolve();
+			const discovery = await start;
+			expect(await readBrokerDiscovery(dir)).toMatchObject({ pid: discovery.pid, ownerId: discovery.ownerId });
+		} finally {
+			releaseCheckpoint.resolve();
+			heartbeat.mockRestore();
+			await broker.stop();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
 	it("refuses concurrent launches when a live lock owner has not published discovery", async () => {
 		const dir = await temp();
 		const lock = path.join(dir, "sdk", "broker.lock");

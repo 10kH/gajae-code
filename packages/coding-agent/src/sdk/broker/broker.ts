@@ -2405,26 +2405,35 @@ export class Broker {
 		)
 			return;
 
-		// Snapshot validation and the deterministic instance suffix protect successor locks.
-		const tombstone = path.join(
-			path.dirname(this.#lock),
-			`.broker.lock.stale-${createHash("sha256").update(snapshot.lockIdentity).digest("hex")}`,
-		);
-		try {
-			await fs.rename(this.#lock, tombstone);
-		} catch (e) {
-			const code = (e as NodeJS.ErrnoException).code;
-			if (["ENOENT", "EEXIST", "ENOTEMPTY", "EISDIR", "ENOTDIR"].includes(code ?? "")) return;
-			if (code === "EPERM") {
-				try {
-					await fs.lstat(tombstone);
-					return;
-				} catch (statError) {
-					if ((statError as NodeJS.ErrnoException).code !== "ENOENT") throw statError;
+		// Give every reclaimed generation a fresh quarantine name. Older brokers
+		// used only the lock inode hash; if that tombstone survived a crash, the
+		// deterministic name collided forever and left the dead canonical lock in
+		// place. The random suffix preserves no-replace rename semantics without
+		// letting retained cleanup debris block takeover.
+		for (let attempt = 0; attempt < 8; attempt++) {
+			const tombstone = path.join(
+				path.dirname(this.#lock),
+				`.broker.lock.stale-${createHash("sha256").update(snapshot.lockIdentity).digest("hex")}-${randomBytes(8).toString("hex")}`,
+			);
+			try {
+				await fs.rename(this.#lock, tombstone);
+				return;
+			} catch (e) {
+				const code = (e as NodeJS.ErrnoException).code;
+				if (code === "EEXIST" || code === "ENOTEMPTY") continue;
+				if (["ENOENT", "EISDIR", "ENOTDIR"].includes(code ?? "")) return;
+				if (code === "EPERM") {
+					try {
+						await fs.lstat(tombstone);
+						continue;
+					} catch (statError) {
+						if ((statError as NodeJS.ErrnoException).code !== "ENOENT") throw statError;
+					}
 				}
+				throw e;
 			}
-			throw e;
 		}
+		throw new Error(`Broker lock quarantine namespace is saturated for ${this.#lock}`);
 	}
 	async #releaseOwnedLock(): Promise<void> {
 		try {
@@ -2550,6 +2559,11 @@ export class Broker {
 				startedAt: now,
 				heartbeatAt: now,
 			};
+			// Readiness must not be externally visible until the initial session
+			// checkpoint settles. The bootstrap watchdog owns this pre-publication
+			// interval; publishing first allowed it to kill an endpoint already handed
+			// to callers when a legitimate index-lock wait outlived the fence.
+			await this.#checkpointSessionHeartbeats();
 			this.#publication = await publishBrokerDiscovery(this.settings.agentDir, this.discovery);
 			this.#publicationState = "healthy-owned";
 			this.#publishedAt = process.hrtime.bigint();
@@ -2561,7 +2575,6 @@ export class Broker {
 				void this.#watchPublication();
 				void this.#reapSpawnOrphans();
 			}, cadenceMs);
-			await this.#checkpointSessionHeartbeats();
 			return this.discovery;
 		} catch (error) {
 			await this.#transport?.stop();
