@@ -402,7 +402,7 @@ describe("listClaudePluginRoots", () => {
 		const ordinary = await listClaudePluginRoots(profileHome);
 		expect(ordinary.roots.map(root => root.id)).toEqual(["poisoned@market"]);
 
-		await fs.rm(pluginsLink, { recursive: true, force: true });
+		await safeRm(pluginsLink, { recursive: true, force: true });
 		await fs.symlink(safeRegistryDir, pluginsLink, "dir");
 
 		const isolated = await listClaudePluginRoots(profileHome, undefined, true);
@@ -487,7 +487,7 @@ describe("listClaudePluginRoots", () => {
 		const isolated = await listClaudePluginRoots(profileHome, undefined, true);
 		expect(isolated.roots.map(root => root.id)).toEqual(["isolated-only@market"]);
 
-		await fs.rm(pluginsLink, { recursive: true, force: true });
+		await safeRm(pluginsLink, { recursive: true, force: true });
 		await fs.symlink(ordinaryRegistryDir, pluginsLink, "dir");
 
 		const ordinary = await listClaudePluginRoots(profileHome);
