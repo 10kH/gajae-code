@@ -16,6 +16,7 @@ import {
 import { AcpAgent, acpRequestFailure } from "@gajae-code/coding-agent/modes/acp/acp-agent";
 import { createAcpConnection } from "@gajae-code/coding-agent/modes/acp/acp-mode";
 import { TempDir } from "@gajae-code/utils";
+import packageJson from "../../package.json" with { type: "json" };
 import { AcpSdkAdapterError } from "../../src/sdk/acp";
 import { writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
 import { DEFAULT_READINESS_TIMEOUT_MS, MAX_READINESS_TIMEOUT_MS } from "../../src/sdk/broker/startup-budget";
@@ -192,7 +193,7 @@ describe("ACP production cancellation completion", () => {
 		await writeBrokerDiscovery(agentDir, {
 			version: 1,
 			protocolVersion: 3,
-			packageGeneration: "test",
+			packageGeneration: packageJson.version,
 			ownerId: "test-owner",
 			pid: process.pid,
 			host: "127.0.0.1",

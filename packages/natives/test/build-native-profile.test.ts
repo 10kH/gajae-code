@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -51,6 +51,18 @@ async function listNativeBuildDirs(): Promise<string[]> {
 }
 
 describe("native build Cargo profiles", () => {
+	beforeAll(async () => {
+		// A cold Cargo home needs registry/package downloads. Keep that setup out of
+		// each 30-second graph assertion and expose download errors in CI output.
+		const proc = Bun.spawn(["cargo", "fetch", "--locked"], {
+			cwd: repoRoot,
+			stdout: "inherit",
+			stderr: "inherit",
+			timeout: 150_000,
+		});
+		expect(await proc.exited).toBe(0);
+	}, 180_000);
+
 	it.each([
 		["x86_64-pc-windows-msvc", false],
 		["aarch64-pc-windows-msvc", false],
@@ -61,7 +73,7 @@ describe("native build Cargo profiles", () => {
 	] as const)(
 		"resolves the supported SHA backend for %s",
 		async (target, assemblyExpected) => {
-			const result = await $`cargo tree --locked -p pi-natives --target ${target} --prefix none --format "{p} {f}"`
+			const result = await $`cargo tree --frozen -p pi-natives --target ${target} --prefix none --format "{p} {f}"`
 				.cwd(repoRoot)
 				.quiet()
 				.nothrow();
