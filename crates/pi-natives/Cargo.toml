@@ -41,7 +41,7 @@ rayon.workspace = true
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2 = { workspace = true, features = ["asm"] }
+sha2.workspace = true
 similar.workspace = true
 smallvec.workspace = true
 syntect.workspace = true
@@ -55,6 +55,7 @@ xxhash-rust.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+sha2 = { workspace = true, features = ["asm"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg.workspace = true
