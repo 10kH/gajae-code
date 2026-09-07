@@ -7,6 +7,7 @@
 
 ### Fixed
 
+- Broker `session.list` pagination cursors now evict the oldest entry when the 32-cursor budget is full instead of failing new paginations with `cursor capacity is exhausted` (#5370). Abandoned or partial paginations degrade gracefully (the evicted cursor reports `cursor is expired or invalid` on next use) so unrelated session ops never fail once the index exceeds one page; the obsolete capacity-exhausted path is removed.
 - Runtime state persistence now identifies contradictory `ready_for_input`/`live` fields with their lifecycle state and expected value instead of reporting only a generic invalid/unreadable marker error. Invalid markers remain untouched; this does not migrate or repair old session state.
 - LSP auto-discovery now launches trusted executable symlinks through their discovered paths instead of canonicalizing them to their targets, preserving proxy invocation names such as `rust-analyzer` when installed through rustup. The LSP status action now labels these entries as configured rather than active, since a client has not necessarily started (#5354).
 - SDK snapshot pages now read and integrity-check one contiguous span instead of rereading chunks per row. Reverse-provider disconnects discard connection-scoped registration receipts; relay shutdown releases backpressure listeners without destroying caller-owned sinks, and fragmented request frames are assembled once per newline.

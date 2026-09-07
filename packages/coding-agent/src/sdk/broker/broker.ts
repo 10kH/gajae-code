@@ -3045,16 +3045,21 @@ export class Broker {
 			if (this.#chains.get(target) === chain) this.#chains.delete(target);
 		}
 	}
-	#storeSessionListCursor(cursor: SessionListCursor, replacingToken?: string): string | BrokerResponse {
+	#storeSessionListCursor(cursor: SessionListCursor, replacingToken?: string): string {
 		const now = Date.now();
 		for (const [token, stored] of this.#sessionListCursors) {
 			if (stored.expiresAt <= now) this.#sessionListCursors.delete(token);
 		}
-		const replacing = replacingToken !== undefined && this.#sessionListCursors.has(replacingToken);
-		if (!replacing && this.#sessionListCursors.size >= SESSION_LIST_MAX_CURSORS)
-			return error("invalid_input", "session.list cursor capacity is exhausted");
-		const token = randomBytes(24).toString("base64url");
 		if (replacingToken !== undefined) this.#sessionListCursors.delete(replacingToken);
+		// Pagination cursors are a paging convenience, not durable state (#5370).
+		// Evict the oldest cursor when the budget is full so abandoned or partial
+		// paginations degrade gracefully instead of failing unrelated session ops.
+		while (this.#sessionListCursors.size >= SESSION_LIST_MAX_CURSORS) {
+			const oldest = this.#sessionListCursors.keys().next();
+			if (oldest.done) break;
+			this.#sessionListCursors.delete(oldest.value);
+		}
+		const token = randomBytes(24).toString("base64url");
 		this.#sessionListCursors.set(token, cursor);
 		return token;
 	}
@@ -3125,7 +3130,6 @@ export class Broker {
 						{ ...snapshot, offset, expiresAt: Date.now() + SESSION_LIST_CURSOR_TTL_MS },
 						typeof cursor === "string" ? cursor : undefined,
 					);
-		if (isBrokerResponse(continuationCursor)) return continuationCursor;
 		return {
 			ok: true,
 			result: {

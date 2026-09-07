@@ -123,7 +123,7 @@ test("broker session.list keeps cursor warnings snapshot-stable", async () => {
 	}
 });
 
-test("broker session.list rejects a new cursor stream at capacity without evicting active cursors", async () => {
+test("broker session.list evicts the oldest cursor instead of failing new paginations", async () => {
 	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-cursor-capacity-"));
 	const stateRoot = path.join(agentDir, "state");
 	const broker = new Broker({ agentDir });
@@ -143,8 +143,8 @@ test("broker session.list rejects a new cursor stream at capacity without evicti
 			cursors.push(page.continuationCursor as string);
 		}
 
-		// Exact inspection is not a paginated list. Even with all 32 cursor slots
-		// occupied it returns the one requested row without allocating a cursor.
+		// Exact inspection is not a paginated list. It returns the one requested
+		// row without allocating a cursor.
 		expect(await broker.handleRequest("session.list", { resolveSessionId: "session-2" })).toMatchObject({
 			ok: true,
 			result: { sessions: [{ sessionId: "session-2" }] },
@@ -152,25 +152,73 @@ test("broker session.list rejects a new cursor stream at capacity without evicti
 		const exact = await broker.handleRequest("session.list", { resolveSessionId: "session-2" });
 		expect(exact.ok && (exact.result as { continuationCursor?: string }).continuationCursor).toBeUndefined();
 
-		expect(await broker.handleRequest("session.list", { limit: 1 })).toEqual({
-			ok: false,
-			error: { code: "invalid_input", message: "session.list cursor capacity is exhausted" },
-		});
+		// A new pagination stream evicts the oldest abandoned cursor instead of
+		// failing: abandoned/partial pagination must never make unrelated
+		// session ops fail (#5370).
+		const overflow = await broker.handleRequest("session.list", { limit: 1 });
+		expect(overflow.ok).toBe(true);
+		if (!overflow.ok) throw new Error(overflow.error.message);
+		expect((overflow.result as { continuationCursor?: string }).continuationCursor).toEqual(expect.any(String));
 
-		const continued = await broker.handleRequest("session.list", { cursor: cursors[0] });
-		expect(continued).toMatchObject({
-			ok: true,
-			result: { sessions: [{ sessionId: "session-2" }] },
-		});
-		if (!continued.ok) throw new Error(continued.error.message);
+		// The evicted oldest cursor no longer resolves.
 		expect(await broker.handleRequest("session.list", { cursor: cursors[0] })).toEqual({
 			ok: false,
 			error: { code: "invalid_input", message: "cursor is expired or invalid" },
 		});
-		expect(await broker.handleRequest("session.list", { limit: 1 })).toMatchObject({
-			ok: true,
-			result: { sessions: [{ sessionId: "session-1" }], continuationCursor: expect.any(String) },
+
+		// The most recently used cursor still continues its stream.
+		const continued = await broker.handleRequest("session.list", {
+			cursor: (overflow.result as { continuationCursor?: string }).continuationCursor,
 		});
+		expect(continued).toMatchObject({
+			ok: true,
+			result: { sessions: [{ sessionId: "session-2" }] },
+		});
+	} finally {
+		await broker.stop();
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("broker session.list with more than one page of sessions survives abandoned paginations", async () => {
+	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-cursor-overflow-"));
+	const stateRoot = path.join(agentDir, "state");
+	const broker = new Broker({ agentDir });
+	await broker.start();
+	try {
+		const busIndex = await new SessionIndex(agentDir).open();
+		for (let index = 0; index < 150; index += 1)
+			await busIndex.append(event("host_registered", `overflow-session-${index + 1}`, stateRoot));
+
+		// Abandon 3x the cursor budget worth of first-page reads without ever
+		// following the continuation cursor (the inspect/status/tail leak shape).
+		for (let index = 0; index < 96; index += 1) {
+			const abandoned = await broker.handleRequest("session.list", { limit: 100 });
+			expect(abandoned.ok).toBe(true);
+			if (!abandoned.ok) throw new Error(abandoned.error.message);
+			expect((abandoned.result as { continuationCursor?: string }).continuationCursor).toEqual(expect.any(String));
+		}
+
+		// Unrelated session ops still succeed: a fresh full traversal drains.
+		const first = await broker.handleRequest("session.list", { limit: 100 });
+		expect(first.ok).toBe(true);
+		if (!first.ok) throw new Error(first.error.message);
+		const firstPage = first.result as { continuationCursor?: string; sessions: unknown[] };
+		expect(firstPage.sessions).toHaveLength(100);
+		expect(firstPage.continuationCursor).toEqual(expect.any(String));
+		const second = await broker.handleRequest("session.list", { cursor: firstPage.continuationCursor });
+		expect(second.ok).toBe(true);
+		if (!second.ok) throw new Error(second.error.message);
+		expect((second.result as { sessions: unknown[] }).sessions).toHaveLength(50);
+		expect((second.result as { continuationCursor?: string }).continuationCursor).toBeUndefined();
+
+		// Exact id resolution never allocates a cursor and never fails.
+		const resolved = await broker.handleRequest("session.list", { resolveSessionId: "overflow-session-149" });
+		expect(resolved).toMatchObject({
+			ok: true,
+			result: { sessions: [{ sessionId: "overflow-session-149" }] },
+		});
+		expect(resolved.ok && (resolved.result as { continuationCursor?: string }).continuationCursor).toBeUndefined();
 	} finally {
 		await broker.stop();
 		await fs.rm(agentDir, { recursive: true, force: true });
