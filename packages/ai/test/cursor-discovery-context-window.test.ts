@@ -132,6 +132,8 @@ describe("normalizeCursorDiscoveryModels context windows", () => {
 		const models = normalizeCursorDiscoveryModels(
 			[
 				{ modelId: "\u001b[31munsafe", displayName: "Unsafe" },
+				{ modelId: "\nunsafe-leading-newline", displayName: "Unsafe newline" },
+				{ modelId: "unsafe-trailing-tab\t", displayName: "Unsafe tab" },
 				{ modelId: "x".repeat(513), displayName: "Oversized" },
 				{ modelId: "safe-model", displayName: "Safe" },
 			],

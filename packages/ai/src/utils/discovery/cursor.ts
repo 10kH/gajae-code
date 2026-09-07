@@ -332,10 +332,10 @@ function normalizeCursorModel(
 	}
 
 	const details = parsedModel.data;
-	const id = details.modelId.trim();
-	if (!isSafeCatalogModelId(id)) {
+	if (!isSafeCatalogModelId(details.modelId)) {
 		return null;
 	}
+	const id = details.modelId.trim();
 
 	const name = pickModelDisplayName(details, id);
 	const reference = references.get(id);

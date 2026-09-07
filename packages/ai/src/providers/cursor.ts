@@ -343,7 +343,7 @@ export function isPlausibleCursorConnectProgressForTest(
 	flags: number,
 	messageLength?: number,
 ): boolean {
-	if (bufferedLength <= 0 || (flags & ~0b11) !== 0) return false;
+	if (bufferedLength <= 0 || (flags & ~CONNECT_END_STREAM_FLAG) !== 0) return false;
 	if (bufferedLength < 5) return true;
 	return messageLength !== undefined && messageLength <= CURSOR_MAX_GRPC_MESSAGE_LENGTH;
 }

@@ -1739,6 +1739,9 @@ describe("Cursor raw transport watchdog", () => {
 	it("does not accept fragmented unsupported flags as Connect progress", () => {
 		for (let bufferedLength = 1; bufferedLength < 5; bufferedLength += 1) {
 			expect(isPlausibleCursorConnectProgressForTest(bufferedLength, 0b100)).toBe(false);
+			expect(isPlausibleCursorConnectProgressForTest(bufferedLength, 0b001)).toBe(false);
+			expect(isPlausibleCursorConnectProgressForTest(bufferedLength, 0b011)).toBe(false);
+			expect(isPlausibleCursorConnectProgressForTest(bufferedLength, 0)).toBe(true);
 			expect(isPlausibleCursorConnectProgressForTest(bufferedLength, CONNECT_END_STREAM_FLAG)).toBe(true);
 		}
 	});
