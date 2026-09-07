@@ -70,7 +70,27 @@ export function redactImageProviderText(value: unknown, activeApiKey?: string): 
 			/(?:\b|["'])(?:authorization|api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|token)["']?\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;}]+)/gi,
 			match => match.replace(/([:=]\s*).*/, `$1${REDACTED_PROVIDER_SECRET}`),
 		)
-		.replace(/\b(?:sk|rk|pk|sess|ghp|gho|github_pat|xox[baprs])-[-A-Za-z0-9._]{8,}\b/gi, REDACTED_PROVIDER_SECRET)
+		// A PEM block is redacted whole and runs before the narrower rules, which
+		// would otherwise consume its base64 body and leave a truncated key behind.
+		.replace(
+			/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g,
+			REDACTED_PROVIDER_SECRET,
+		)
+		.replace(/\b(?:sk|rk|pk|sess|xox[baprs])-[-A-Za-z0-9._]{8,}\b/gi, REDACTED_PROVIDER_SECRET)
+		// GitHub tokens separate with `_`, not the `-` the rule above requires, so
+		// listing `ghp`/`gho`/`github_pat` there never matched one. Short tokens
+		// then fell through the 40-character catch-all below entirely.
+		.replace(/\b(?:gh[opsur]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{12,})\b/g, REDACTED_PROVIDER_SECRET)
+		// AWS access-key ids are 20 characters, so the catch-all never reached them.
+		.replace(/\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b/g, REDACTED_PROVIDER_SECRET)
+		// A Google API key is exactly 39 characters — one short of the catch-all.
+		.replace(/\bAIza[0-9A-Za-z_-]{35}\b/g, REDACTED_PROVIDER_SECRET)
+		// Basic-auth credentials in a URL. The scheme repetition is bounded so a
+		// long alphabetic run cannot be re-tried at every prefix (#5346).
+		.replace(
+			/(?<![A-Za-z0-9+.-])([a-z][a-z0-9+.-]{0,15}:\/\/)[^/\s:@]{1,256}:[^/\s@]{1,256}@/gi,
+			`$1${REDACTED_PROVIDER_SECRET}@`,
+		)
 		.replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, REDACTED_PROVIDER_SECRET)
 		.replace(/\b[A-Za-z0-9+/_-]{40,}={0,2}\b/g, REDACTED_PROVIDER_SECRET);
 	return text.length > MAX_PROVIDER_TEXT_LENGTH ? `${text.slice(0, MAX_PROVIDER_TEXT_LENGTH - 1)}…` : text;

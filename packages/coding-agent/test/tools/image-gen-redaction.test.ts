@@ -82,4 +82,47 @@ describe("redactImageProviderText", () => {
 		const result = redactImageProviderText(text);
 		expect(result).toBe("Error  message");
 	});
+
+	it("redacts credential shapes that are shorter than the generic catch-all", () => {
+		// All synthetic. The trailing catch-all only fires at 40+ characters, so
+		// fixed-width credentials below it were never reached: AWS access-key ids
+		// are 20 characters and a Google API key is exactly 39.
+		const cases = {
+			awsLongTerm: "AKIAIOSFODNN7EXAMPLE",
+			awsTemporary: "ASIAIOSFODNN7EXAMPLE",
+			awsBearer: "ABIAIOSFODNN7EXAMPLE",
+			awsContext: "ACCAIOSFODNN7EXAMPLE",
+			googleApiKey: `AIza${"S".repeat(35)}`,
+		};
+		for (const value of Object.values(cases)) {
+			const result = redactImageProviderText(`provider returned ${value} in the body`);
+			expect(result).not.toContain(value);
+			expect(result).toContain("provider returned");
+		}
+	});
+
+	it("redacts GitHub tokens, which separate with an underscore", () => {
+		// The prefix rule lists `ghp`/`gho`/`github_pat` but requires a `-`
+		// separator, so it never matched a real token. Anything under the 40-char
+		// catch-all therefore survived.
+		for (const token of [`ghp_${"a".repeat(20)}`, `gho_${"b".repeat(20)}`, `ghs_${"c".repeat(20)}`]) {
+			const result = redactImageProviderText(`upload used ${token}`);
+			expect(result).not.toContain(token);
+			expect(result).toContain("upload used");
+		}
+	});
+
+	it("redacts PEM key material and URL userinfo", () => {
+		const pemBody = "MIIEowIBAAKCAQEAxGZ0000abcdefgHIJKLmnop";
+		const pem = redactImageProviderText(
+			`load failed -----BEGIN RSA PRIVATE KEY-----\n${pemBody}\n-----END RSA PRIVATE KEY----- here`,
+		);
+		expect(pem).not.toContain(pemBody);
+		expect(pem).toContain("load failed");
+
+		const url = redactImageProviderText("fetch https://deploy:s3cr3tvalue@assets.example.com/a.png failed");
+		expect(url).not.toContain("s3cr3tvalue");
+		// Scheme and host stay readable so the error still says which host failed.
+		expect(url).toContain("assets.example.com");
+	});
 });
