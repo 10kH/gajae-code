@@ -3,6 +3,7 @@
 ## [Unreleased]
 ### Fixed
 
+- File-lock acquisition now fences retained `.removing` transitions on macOS as well as Linux, preventing successor publication from racing predecessor cleanup and wedging session-index locking with `quarantine_collision`. Raced publications roll back only after exact-identity verification; unowned transitions remain untouched and produce bounded contention diagnostics.
 - A failing `gjc --smoke-test` no longer leaves its isolated-shell worker behind. The readiness bail-out ran a `finally` that only removed marker files, so the probe shell stayed alive and its abandoned run went unobserved; the wider readiness/run deadlines made that window long. Teardown now aborts the probe, retires the worker, and observes the run on every exit path — graceful close alone would have waited out the command’s own sleep.
 
 ## [0.16.6] - 2026-09-07
