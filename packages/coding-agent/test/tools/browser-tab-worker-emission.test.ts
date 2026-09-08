@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import type { Browser, CDPSession, Page } from "puppeteer-core";
+import { compileActionSteps } from "../../src/tools/browser/actions";
 import type { Transport, WorkerInbound, WorkerInitPayload, WorkerOutbound } from "../../src/tools/browser/tab-protocol";
 import { __setLoadPuppeteerInWorkerForTest, WorkerCore } from "../../src/tools/browser/tab-worker";
 
@@ -221,6 +222,59 @@ describe("browser tab worker selector validation", () => {
 			if (!recovered.ok) throw new Error(recovered.error.message);
 			expect(recovered.payload.returnValue).toBe("clicked");
 			expect(harness.calls).toEqual(["locator:#continue", "click"]);
+		} finally {
+			await harness.close();
+		}
+	});
+
+	it("rejects blank structured press selectors without key presses or later actions", async () => {
+		const harness = await createHarness();
+		try {
+			for (const selector of ["", " \t\n"]) {
+				const result = await harness.run(
+					compileActionSteps([
+						{ verb: "press", key: "Enter", selector },
+						{ verb: "press", key: "Tab" },
+					]),
+				);
+				expect(result.ok).toBe(false);
+				if (result.ok) throw new Error("expected structured selector rejection");
+				expect(result.error.isToolError).toBe(true);
+				expect(result.error.message).toContain("Selector must be a non-empty string");
+				expect(harness.calls).toEqual([]);
+			}
+		} finally {
+			await harness.close();
+		}
+	});
+
+	it("preserves omitted and valid structured press selectors through the worker", async () => {
+		const harness = await createHarness();
+		try {
+			const result = await harness.run(
+				compileActionSteps([
+					{ verb: "press", key: "Enter" },
+					{ verb: "press", key: "Tab", selector: undefined },
+					{ verb: "press", key: "Space", selector: "#continue" },
+					{ verb: "press", key: "Escape", selector: "p-aria/Cancel" },
+				]),
+			);
+			expect(result.ok).toBe(true);
+			if (!result.ok) throw new Error(result.error.message);
+			expect(result.payload.returnValue).toEqual([
+				{ verb: "press", key: "Enter" },
+				{ verb: "press", key: "Tab" },
+				{ verb: "press", key: "Space" },
+				{ verb: "press", key: "Escape" },
+			]);
+			expect(harness.calls).toEqual([
+				"press:Enter",
+				"press:Tab",
+				"focus:#continue",
+				"press:Space",
+				"focus:aria/Cancel",
+				"press:Escape",
+			]);
 		} finally {
 			await harness.close();
 		}

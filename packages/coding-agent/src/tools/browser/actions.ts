@@ -154,7 +154,7 @@ for (const s of __steps) {
 			__results.push({ verb: "select", selected: await tab.select(s.selector, ...(s.values || [])) });
 			break;
 		case "press":
-			await tab.press(s.key, s.selector ? { selector: s.selector } : undefined);
+			await tab.press(s.key, s.selector !== undefined ? { selector: s.selector } : undefined);
 			__results.push({ verb: "press", key: s.key });
 			break;
 		case "scroll":
