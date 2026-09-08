@@ -160,7 +160,17 @@ export function extractOAuthEndpoints(error: Error): OAuthEndpoints | null {
 		// Not JSON, continue with other detection methods
 	}
 
-	const challengeEntries = Array.from(errorMsg.matchAll(/([a-zA-Z_][a-zA-Z0-9_-]*)="([^"]+)"/g));
+	// The key repetition is bounded. Unbounded, the engine scans to the end of a
+	// long identifier run at every offset before failing to find `="`, which is
+	// quadratic in the length of the error text: 25k/50k/100k characters cost
+	// 498ms/1990ms/7959ms. `errorMsg` is the failure text a remote MCP server
+	// produced, so its length is not ours to assume.
+	//
+	// 64 is past every challenge key this function reads (the longest is
+	// `authorization_endpoint`, 22 characters). A key run of 64 or more characters
+	// is captured truncated, but a 64-character key matches none of the lookups
+	// below either way, so the parsed result is unchanged.
+	const challengeEntries = Array.from(errorMsg.matchAll(/([a-zA-Z_][a-zA-Z0-9_-]{0,63})="([^"]+)"/g));
 	if (challengeEntries.length > 0) {
 		const challengeValues = new Map<string, string>();
 		for (const [, rawKey, value] of challengeEntries) {
