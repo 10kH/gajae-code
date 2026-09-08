@@ -612,6 +612,48 @@ describe("executeBash", () => {
 		}
 	});
 
+	// The `--smoke-test` probe starts a long run, then bails out if its readiness
+	// marker never appears. That failure path must not leave the worker or the
+	// abandoned run behind, so pin the abort-then-close teardown it relies on:
+	// the run settles promptly, the supervisor is gone, and the command's own
+	// side effect never lands.
+	it("cuts and settles an in-flight isolated run when the smoke path abandons it", async () => {
+		if (process.platform === "win32") return;
+		const shell = new IsolatedShell();
+		const marker = path.join(tempDir, "abandoned-probe-side-effect");
+		const abandoned = shell.run({ command: `sleep 30; printf late > '${marker}'`, cwd: tempDir, timeoutMs: 60_000 });
+		// Attach the observer before teardown: retiring the worker settles the
+		// pending run, and a handler attached afterwards would see it unhandled.
+		const settled = abandoned.then(
+			() => "settled" as const,
+			() => "settled" as const,
+		);
+		await shell.ready();
+		const supervisorPid = shell.supervisorPid();
+
+		const startedAt = Date.now();
+		await shell.abort();
+		await shell.close();
+		expect(await settled).toBe("settled");
+		// Bounded: teardown must not wait out the command's own 30s sleep.
+		expect(Date.now() - startedAt).toBeLessThan(10_000);
+
+		if (supervisorPid !== undefined) {
+			let supervisorGone = false;
+			for (let attempt = 0; attempt < 400; attempt++) {
+				try {
+					process.kill(supervisorPid, 0);
+					await Bun.sleep(25);
+				} catch {
+					supervisorGone = true;
+					break;
+				}
+			}
+			expect(supervisorGone).toBe(true);
+		}
+		expect(fs.existsSync(marker)).toBe(false);
+	});
+
 	it("does not cancel the active executeBash call when a queued same-key call is aborted", async () => {
 		if (process.platform === "win32") return;
 		const sessionKey = "queued-executor-cancellation";

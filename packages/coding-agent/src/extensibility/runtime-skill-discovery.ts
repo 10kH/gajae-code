@@ -282,6 +282,7 @@ async function scanProjectOrUserDir(
 interface ConventionImportScan {
 	host: "Claude Code" | "Codex";
 	dir: string;
+	scope: RuntimeSkillDiscoverySource;
 	skills: CapabilitySkill[];
 }
 
@@ -304,20 +305,20 @@ async function collectConventionImportCandidates(
 	if ((source === "all" || source === "project") && sourceEnabled("project", policy)) {
 		jobs.push(
 			scanClaudeProjectSkills(ctx).then(result => {
-				scans.push({ host: "Claude Code", dir: ".claude/skills", skills: result.items });
+				scans.push({ host: "Claude Code", dir: ".claude/skills", scope: "project", skills: result.items });
 			}),
 			scanCodexProjectSkills(ctx).then(result => {
-				scans.push({ host: "Codex", dir: ".codex/skills", skills: result.items });
+				scans.push({ host: "Codex", dir: ".codex/skills", scope: "project", skills: result.items });
 			}),
 		);
 	}
 	if ((source === "all" || source === "user") && sourceEnabled("user", policy)) {
 		jobs.push(
 			scanClaudeUserSkills(ctx).then(result => {
-				scans.push({ host: "Claude Code", dir: "~/.claude/skills", skills: result.items });
+				scans.push({ host: "Claude Code", dir: "~/.claude/skills", scope: "user", skills: result.items });
 			}),
 			scanCodexUserSkills(ctx).then(result => {
-				scans.push({ host: "Codex", dir: "~/.codex/skills", skills: result.items });
+				scans.push({ host: "Codex", dir: "~/.codex/skills", scope: "user", skills: result.items });
 			}),
 		);
 	}
@@ -331,7 +332,13 @@ function reportConventionImportCandidates(
 	seenNames: Set<string>,
 	diagnostics: string[],
 ): void {
-	for (const scan of scans.sort((a, b) => a.host.localeCompare(b.host) || a.dir.localeCompare(b.dir))) {
+	// Project scope is reported first: the bounded diagnostic budget must not be
+	// spent on a populated user-home convention directory (hundreds of skills is
+	// ordinary) before a project convention skill is ever named.
+	const scopeRank = (scan: ConventionImportScan) => (scan.scope === "project" ? 0 : 1);
+	for (const scan of scans.sort(
+		(a, b) => scopeRank(a) - scopeRank(b) || a.host.localeCompare(b.host) || a.dir.localeCompare(b.dir),
+	)) {
 		for (const skill of scan.skills) {
 			const normalizedName = getSkillFilesystemIdentity(skill.name);
 			if (seenNames.has(normalizedName)) continue;

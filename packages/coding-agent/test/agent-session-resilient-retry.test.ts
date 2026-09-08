@@ -119,7 +119,16 @@ describe.serial("AgentSession resilient retry", () => {
 		const currentAuthStorage = authStorage;
 		const currentTempDir = tempDir;
 		session = undefined;
-		if (currentSession) await currentSession.dispose();
+		if (currentSession) {
+			// `waitForIdle()` does not cover the secondary coordinator sidecar
+			// write, so disposing straight after a turn races that flush and the
+			// bounded disposal deadline reports
+			// `SessionDisposalIncompleteError: ... waiting for coordinator
+			// persistence` instead of the behavior under test. Join the flush
+			// first; a failure here must not mask the case's own result.
+			await currentSession.awaitCoordinatorRuntimeStatePersistenceForTests().catch(() => {});
+			await currentSession.dispose();
+		}
 		currentAuthStorage.close();
 		currentTempDir.removeSync();
 		if (ORIGINAL_COORDINATOR_STATE_FILE === undefined) delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
@@ -2922,7 +2931,10 @@ describe.serial("AgentSession resilient retry", () => {
 			await session.dispose();
 			session = undefined;
 		}
-	});
+		// Five full session lifecycles, one per near-miss phrasing. The
+		// single-scenario sibling below costs ~15s on CI hardware, so this loop
+		// legitimately needs several times the 30s default it used to inherit.
+	}, 150_000);
 
 	it("still fails closed on generic unknown errors under a bare default config", async () => {
 		// The fix is scoped to clearly-transient failures. Generic unknown

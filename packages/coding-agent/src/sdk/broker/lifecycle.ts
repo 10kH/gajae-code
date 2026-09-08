@@ -4053,10 +4053,16 @@ async function currentReadyAuthority(
 			"alive"
 		)
 			return undefined;
+		// Every other field of this authority comes from the indexed record, and
+		// `matchesIndexedEndpointFile` above already proved the on-disk file is
+		// that record's endpoint. Re-deriving the mtime from a fresh `stat` made
+		// the tuple internally inconsistent: the float differed from the indexed
+		// value in its last digits (…272.1147 vs …272.1145), and replay hashing
+		// then read the same endpoint as replaced. Prefer the validated value.
 		return {
 			endpoint: endpoint as Record<string, unknown>,
 			endpointSource,
-			endpointMtimeMs: endpointFile.mtimeMs,
+			endpointMtimeMs: record.endpointMtimeMs ?? endpointFile.mtimeMs,
 			...(record.endpointFileId === undefined ? {} : { endpointFileId: record.endpointFileId }),
 			endpointGeneration: record.endpointGeneration,
 		};

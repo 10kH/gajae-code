@@ -2941,6 +2941,17 @@
 		}
 	},
 	{
+		"sourceId": "agent_session:awaitCoordinatorRuntimeStatePersistenceForTests",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "test-only coordinator persistence drain barrier, not a user-facing SDK control seam",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
 		"sourceId": "agent_session:queueCoordinatorRuntimeStatePersistForTests",
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",

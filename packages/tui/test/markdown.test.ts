@@ -446,6 +446,9 @@ describe("Markdown accounted cache limits", () => {
 		expect(second).toContain("a\x00b:c");
 	});
 
+	// 24 documents of ~70KB each, re-checked after every render: deterministic
+	// but genuinely expensive, and it outran Bun's 5s default deadline on CI
+	// hardware. The budget is explicit rather than assertion-weakening.
 	it("evicts by aggregate size before count, retains recent entries and reports the full sum", () => {
 		const sources = Array.from({ length: 24 }, (_, i) => `message ${i} ${"x".repeat(70_000)}`);
 		for (const source of sources) {
@@ -470,7 +473,7 @@ describe("Markdown accounted cache limits", () => {
 		expect(__markdownPerfCounters.lexerInvocations).toBe(calls);
 		clearRenderCache();
 		expect(getRenderCacheRetainedBytes()).toBe(0);
-	});
+	}, 30_000);
 
 	it("evicts render payloads by size with LRU touch before reaching the count cap", () => {
 		const sources = Array.from({ length: 20 }, (_, i) => `row-${String(i).padStart(2, "0")}`);

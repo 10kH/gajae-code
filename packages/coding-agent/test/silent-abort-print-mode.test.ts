@@ -226,6 +226,14 @@ describe("Print mode", () => {
 			initialMessage: "/import-session unsupported",
 		});
 
+		// `/import-session` is gated to Linux, where retained-descriptor authority exists; off
+		// Linux it is absent from the registry, so the same input is an ordinary prompt.
+		if (process.platform !== "linux") {
+			expect(tracking.prompt).toHaveBeenCalledTimes(1);
+			expect(stdoutOutput.join("")).toBe("");
+			return;
+		}
+
 		expect(tracking.prompt).not.toHaveBeenCalled();
 		const rows = stdoutOutput
 			.join("")

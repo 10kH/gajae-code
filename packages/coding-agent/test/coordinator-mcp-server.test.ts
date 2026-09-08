@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Model } from "@gajae-code/ai";
+import packageJson from "../package.json" with { type: "json" };
 import {
 	type CodexHandoffOriginV1,
 	readCodexHandoff,
@@ -240,7 +241,7 @@ function testBrokerDiscovery(): BrokerDiscovery {
 	return {
 		version: 1,
 		protocolVersion: 3,
-		packageGeneration: "test",
+		packageGeneration: packageJson.version,
 		ownerId: "test-owner",
 		pid: process.pid,
 		incarnation: brokerProcessIncarnation(process.pid) ?? "test-incarnation",
@@ -413,7 +414,13 @@ async function createSdkControlServer(
 		platform: serverOptions.platform,
 		services: {
 			getAgentDir: () => agentDir,
-			ensureBroker: serverOptions.ensureBroker ?? (async () => testBrokerDiscovery()),
+			ensureBroker:
+				serverOptions.ensureBroker ??
+				(async settings => {
+					const discovery = testBrokerDiscovery();
+					await writeBrokerDiscovery(settings.agentDir, discovery);
+					return discovery;
+				}),
 			resolveModelProfiles: () => new Map([["codex-eco", { name: "codex-eco" }]]),
 			...(serverOptions.modelResolver ? { resolveModelPin: serverOptions.modelResolver } : {}),
 			canonicalizePath: serverOptions.canonicalizePath,
@@ -562,7 +569,7 @@ async function createSdkControlServer(
 	await writeBrokerDiscovery(agentDir, {
 		version: 1,
 		protocolVersion: 3,
-		packageGeneration: "test",
+		packageGeneration: packageJson.version,
 		ownerId: "test",
 		pid: process.pid,
 		incarnation: brokerProcessIncarnation(process.pid) ?? "test-incarnation",
@@ -4792,7 +4799,11 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 					undefined,
 					undefined,
 					{
-						ensureBroker: async () => testBrokerDiscovery(),
+						ensureBroker: async settings => {
+							const discovery = testBrokerDiscovery();
+							await writeBrokerDiscovery(settings.agentDir, discovery);
+							return discovery;
+						},
 						preserveEndpointAuthority: authorityPrepared,
 						...hooks,
 					},

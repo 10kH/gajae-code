@@ -329,15 +329,29 @@ export async function smokeTestIsolatedShell(): Promise<void> {
 	const quotedRuntimePidFile = `'${runtimePidFile.replaceAll("'", "'\\''")}'`;
 	let descendantPid: number | undefined;
 	let runtimePid: number | undefined;
+	// Declared outside the try so the `finally` can retire the worker and settle
+	// the started run on EVERY exit path. A readiness failure used to escape with
+	// only the marker files removed, leaving the persistent worker alive and the
+	// run's rejection unobserved — and the deadlines below make that window long.
+	let signalled: IsolatedShell | undefined;
+	let runPromise: Promise<IsolatedShellRunResult> | undefined;
 	try {
-		const signalled = new IsolatedShell();
-		const runPromise = signalled.run({
-			command: `echo $$ > ${quotedRuntimePidFile}; /bin/sh -c 'trap "" TERM; echo $$ > "$1"; : > "$2"; sleep 5' sh ${quotedPidFile} ${quotedReadyFile} & while [ ! -s ${quotedReadyFile} ]; do sleep 0.01; done; sleep 5`,
-			timeoutMs: 5_000,
+		signalled = new IsolatedShell();
+		// The descendant marker is written with content: the in-shell wait loop
+		// below tests `-s` (non-empty), so an empty marker would never satisfy it
+		// and the command would always burn its whole timeout instead of parking
+		// in the intended `sleep`. The budget is generous because this runs as a
+		// release smoke check on cold hosts (a first-boot Intel macOS runner
+		// needed longer than 5s just to start the worker/supervisor/runtime
+		// chain) — the smoke still kills the runtime long before it elapses.
+		runPromise = signalled.run({
+			command: `echo $$ > ${quotedRuntimePidFile}; /bin/sh -c 'trap "" TERM; echo $$ > "$1"; echo ready > "$2"; sleep 5' sh ${quotedPidFile} ${quotedReadyFile} & while [ ! -s ${quotedReadyFile} ]; do sleep 0.01; done; sleep 30`,
+			timeoutMs: 60_000,
 		});
-		for (let attempt = 0; attempt < 200 && !(await Bun.file(readyFile).exists()); attempt++) await Bun.sleep(25);
-		if (!(await Bun.file(readyFile).exists()))
-			throw new Error("isolated shell smoke descendant did not become ready");
+		const readyDeadline = Date.now() + 30_000;
+		const descendantReady = (): boolean => Bun.file(readyFile).size > 0;
+		while (Date.now() < readyDeadline && !descendantReady()) await Bun.sleep(25);
+		if (!descendantReady()) throw new Error("isolated shell smoke descendant did not become ready");
 		descendantPid = Number.parseInt(await Bun.file(pidFile).text(), 10);
 		runtimePid = Number.parseInt(await Bun.file(runtimePidFile).text(), 10);
 		const supervisorPid = signalled.supervisorPid();
@@ -350,7 +364,11 @@ export async function smokeTestIsolatedShell(): Promise<void> {
 			throw new Error(`isolated shell signal smoke failed: ${JSON.stringify(result)}`);
 		}
 		let descendantGone = false;
-		for (let attempt = 0; attempt < 40; attempt++) {
+		// Reaping an ignored-SIGTERM descendant goes through the supervisor's
+		// group escalation, which a loaded or cold host can take seconds to
+		// complete; a one-second window turned that latency into a failure.
+		const reapDeadline = Date.now() + 15_000;
+		while (Date.now() < reapDeadline) {
 			try {
 				process.kill(descendantPid, 0);
 				await Bun.sleep(25);
@@ -361,6 +379,17 @@ export async function smokeTestIsolatedShell(): Promise<void> {
 		}
 		if (!descendantGone) throw new Error(`isolated shell smoke left descendant ${descendantPid} alive`);
 	} finally {
+		// Observe the run BEFORE touching the worker: retiring it settles
+		// whatever is pending, and a handler attached afterwards would let that
+		// rejection surface unhandled and mask the real smoke error.
+		const settled = runPromise?.catch(() => {});
+		// `close()` alone is graceful — it waits for the worker to finish the
+		// command, which on the failure path still has its `sleep` ahead of it.
+		// Abort first so an abandoned probe is cut immediately, then retire the
+		// worker so nothing outlives this function on any exit path.
+		await signalled?.abort().catch(() => {});
+		await signalled?.close().catch(() => {});
+		await settled;
 		await Promise.all([
 			fs.rm(pidFile, { force: true }),
 			fs.rm(readyFile, { force: true }),
