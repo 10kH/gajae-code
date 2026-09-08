@@ -28,9 +28,8 @@ import type {
 
 import {
 	classifyOpenAICodexProEntitlement,
-	formatOpenAICodexChatGPTEntitlementError,
 	requiresOpenAICodexProModel,
-	requiresStrictOpenAICodexProModel,
+	requiresOpenAICodexSparkModel,
 } from "./utils/codex-entitlement";
 import { getOAuthApiKey, getOAuthProvider, refreshOAuthToken, resolveOAuthStorageProvider } from "./utils/oauth";
 import { loginDeepInfra } from "./utils/oauth/deepinfra";
@@ -1162,10 +1161,6 @@ function getOpenAICodexPlanPriority(report: UsageReport | null): number {
 
 function hasOpenAICodexProPlan(report: UsageReport | null): boolean {
 	return classifyOpenAICodexProEntitlement(getUsagePlanType(report)) === "entitled";
-}
-
-function hasKnownOpenAICodexNonProPlan(report: UsageReport | null): boolean {
-	return classifyOpenAICodexProEntitlement(getUsagePlanType(report)) === "denied";
 }
 
 function resolveDefaultRankingStrategy(provider: Provider): CredentialRankingStrategy | undefined {
@@ -4961,23 +4956,14 @@ export class AuthStorage {
 			}),
 		);
 
-		// Skip the Pro-plan filter when no candidate is confirmed Pro, so users with only
-		// non-Pro accounts can still attempt Spark requests (e.g. trial/grandfathered access).
-		const enforceProRequirement =
-			requiresProModel && candidates.some(candidate => hasOpenAICodexProPlan(candidate.usage));
-		// Spark retains its historical Plus fallback for grandfathered accounts.
-		// Sol is different: confirmed Free/Plus plans cannot call it, so reject the
-		// model before returning an OAuth bearer and letting the turn fail remotely.
-		// Unknown plan names still reach the provider because the usage endpoint is
-		// authoritative and future tiers must not be denied by a client-side guess.
-		const strictProRequirement = requiresStrictOpenAICodexProModel(provider, options?.modelId);
-		if (
-			strictProRequirement &&
-			candidates.length > 0 &&
-			candidates.every(candidate => hasKnownOpenAICodexNonProPlan(candidate.usage))
-		) {
-			throw new Error(formatOpenAICodexChatGPTEntitlementError(options?.modelId));
-		}
+		// Plan metadata orders candidates (see `getOpenAICodexPlanPriority`). Spark keeps its
+		// historical confirmed-Pro filter, while Sol leaves entitlement to the provider:
+		// trial, grandfathered and experiment-enabled accounts can carry an ordinary label
+		// that the provider still accepts. Provider refusals are normalized by
+		// `openai-codex-responses` through `formatOpenAICodexChatGPTEntitlementError`.
+		const enforceSparkProRequirement =
+			requiresOpenAICodexSparkModel(provider, options?.modelId) &&
+			candidates.some(candidate => hasOpenAICodexProPlan(candidate.usage));
 
 		const fallback = candidates[0];
 
@@ -4993,7 +4979,7 @@ export class AuthStorage {
 					allowBlocked: false,
 					prefetchedUsage: candidate.usage,
 					usagePrechecked: candidate.usageChecked,
-					enforceProRequirement,
+					enforceSparkProRequirement,
 				},
 				reloadsUsed,
 			);
@@ -5012,7 +4998,7 @@ export class AuthStorage {
 					allowBlocked: true,
 					prefetchedUsage: fallback.usage,
 					usagePrechecked: fallback.usageChecked,
-					enforceProRequirement,
+					enforceSparkProRequirement,
 				},
 				reloadsUsed,
 			);
@@ -5298,7 +5284,7 @@ export class AuthStorage {
 			allowBlocked: boolean;
 			prefetchedUsage?: UsageReport | null;
 			usagePrechecked?: boolean;
-			enforceProRequirement?: boolean;
+			enforceSparkProRequirement?: boolean;
 		},
 		reloadsUsed = 0,
 	): Promise<OAuthResolutionResult | undefined> {
@@ -5307,7 +5293,7 @@ export class AuthStorage {
 			allowBlocked,
 			prefetchedUsage = null,
 			usagePrechecked = false,
-			enforceProRequirement,
+			enforceSparkProRequirement = false,
 		} = usageOptions;
 		if (!this.#reconcileOAuthCredentialSelection(provider, selection)) return undefined;
 		if (!allowBlocked && this.#isCredentialBlocked(providerKey, selection.index)) {
@@ -5319,7 +5305,6 @@ export class AuthStorage {
 		}
 
 		const requiresProModel = requiresOpenAICodexProModel(provider, options?.modelId);
-		const applyProFilter = enforceProRequirement ?? requiresProModel;
 		let usage: UsageReport | null = null;
 		let usageChecked = false;
 
@@ -5334,9 +5319,6 @@ export class AuthStorage {
 				});
 				usageChecked = true;
 			}
-			if (applyProFilter && !hasOpenAICodexProPlan(usage)) {
-				return undefined;
-			}
 			if (checkUsage && !allowBlocked && usage && this.#isUsageLimitReached(usage)) {
 				const resetAtMs = this.#getUsageResetAtMs(usage, Date.now());
 				this.#markCredentialBlocked(
@@ -5346,6 +5328,7 @@ export class AuthStorage {
 				);
 				return undefined;
 			}
+			if (enforceSparkProRequirement && !hasOpenAICodexProPlan(usage)) return undefined;
 		}
 
 		try {
@@ -5416,9 +5399,6 @@ export class AuthStorage {
 					});
 					usageChecked = true;
 				}
-				if (applyProFilter && !hasOpenAICodexProPlan(usage)) {
-					return undefined;
-				}
 				if (checkUsage && !allowBlocked && usage && this.#isUsageLimitReached(usage)) {
 					const resetAtMs = this.#getUsageResetAtMs(usage, Date.now());
 					this.#markCredentialBlocked(
@@ -5428,6 +5408,7 @@ export class AuthStorage {
 					);
 					return undefined;
 				}
+				if (enforceSparkProRequirement && !hasOpenAICodexProPlan(usage)) return undefined;
 			}
 			if (!this.#reconcileOAuthCredentialSelection(provider, selection)) return undefined;
 			if (!authCredentialEquals(selection.credential, updated)) return undefined;

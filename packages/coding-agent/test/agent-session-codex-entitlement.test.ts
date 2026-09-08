@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
-import type { Model, UsageProvider } from "@gajae-code/ai";
+import type { AssistantMessage, Model, UsageProvider } from "@gajae-code/ai";
 import * as oauth from "@gajae-code/ai/utils/oauth";
 import type { OAuthCredentials } from "@gajae-code/ai/utils/oauth/types";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
@@ -25,7 +25,7 @@ const initialModel: Model = {
 	maxTokens: 128_000,
 };
 
-const blockedModel: Model = {
+const solModel: Model = {
 	...initialModel,
 	id: "gpt-5.6-sol",
 	name: "GPT-5.6 Sol",
@@ -71,7 +71,10 @@ describe("AgentSession Codex model entitlement", () => {
 		});
 
 		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
-		const agent = new Agent({ initialState: { model: initialModel, systemPrompt: [], tools: [] } });
+		const agent = new Agent({
+			getApiKey: async provider => (provider === "openai-codex" ? "api-acct-plus" : undefined),
+			initialState: { model: initialModel, systemPrompt: [], tools: [] },
+		});
 		sessionManager = SessionManager.inMemory(tempDir);
 		session = new AgentSession({
 			agent,
@@ -88,14 +91,30 @@ describe("AgentSession Codex model entitlement", () => {
 		await fs.rm(tempDir, { recursive: true, force: true });
 	});
 
-	test("refuses a non-Pro Sol binding before changing the primary model", async () => {
-		const entriesBefore = sessionManager.getEntries();
+	test("binds Sol on a Plus-labelled account and leaves entitlement to the provider", async () => {
+		await session.setModel(solModel);
 
-		await expect(session.setModel(blockedModel)).rejects.toThrow(
-			'This ChatGPT Codex account cannot use model "gpt-5.6-sol"',
+		expect(session.model).toBe(solModel);
+	});
+
+	test("surfaces the provider Sol entitlement rejection after managed selection", async () => {
+		await session.setModel(solModel);
+		const providerMessage = "The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account.";
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+			new Response(JSON.stringify({ error: { code: "invalid_request_error", message: providerMessage } }), {
+				status: 400,
+				headers: { "content-type": "application/json" },
+			}),
 		);
 
-		expect(session.model).toBe(initialModel);
-		expect(sessionManager.getEntries()).toEqual(entriesBefore);
+		await session.prompt("Say hello");
+
+		const assistant = [...session.agent.state.messages]
+			.reverse()
+			.find((message): message is AssistantMessage => message.role === "assistant");
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+		expect(assistant?.stopReason).toBe("error");
+		expect(assistant?.errorMessage).toContain('cannot use model "gpt-5.6-sol"');
+		expect(assistant?.errorMessage).toContain("Select a model available to this ChatGPT account");
 	});
 });
