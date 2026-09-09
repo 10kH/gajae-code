@@ -1,8 +1,9 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as url from "node:url";
 import {
+	authenticatedApproval,
 	canonicalDiffSha256,
 	parseBodyRisk,
 	parseGhPrCreate,
@@ -20,6 +21,55 @@ const base = "a".repeat(40);
 const head = "b".repeat(40);
 const digest = "c".repeat(64);
 const approved = `gajae.pr-review-verdict.v1 merge-approved sha256:${digest} reviewer:architect reviewer-id:review-agent evidence:bun test scripts/verify-pr-verdict.test.ts`;
+
+describe("authenticated approval API evidence", () => {
+	const event = { repository: { full_name: "owner/repo" }, pull_request: { number: 5416 } };
+	const review = (state: string, commit = head) => ({ state, commit_id: commit, user: { login: "review-agent" } });
+
+	test.each([
+		{ name: "valid exact-head approval", reviews: [review("APPROVED")], permission: "write", approved: true },
+		{ name: "changes requested after approval", reviews: [review("APPROVED"), review("CHANGES_REQUESTED")], permission: "write", approved: false },
+		{ name: "dismissed approval", reviews: [review("APPROVED"), review("DISMISSED")], permission: "write", approved: false },
+		{ name: "revoked collaborator permission", reviews: [review("APPROVED")], permission: "read", approved: false },
+		{ name: "stale-head approval", reviews: [review("APPROVED", "d".repeat(40))], permission: "write", approved: false },
+	])("$name", async scenario => {
+		const requests: string[] = [];
+		const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+			const endpoint = String(input);
+			requests.push(endpoint);
+			expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer test-token");
+			if (endpoint === "https://api.github.com/repos/owner/repo/pulls/5416/reviews?per_page=100&page=1") return Response.json(scenario.reviews);
+			if (endpoint === "https://api.github.com/repos/owner/repo/collaborators/review-agent/permission") return Response.json({ permission: scenario.permission });
+			throw new Error(`Unexpected endpoint: ${endpoint}`);
+		});
+		try {
+			const approval = await authenticatedApproval(event, "review-agent", head, "test-token");
+			expect(approval).toEqual(scenario.approved ? { login: "review-agent", headSha: head } : {});
+			expect(validatePrContract(validInput({ authenticatedReviewerLogin: approval.login, authenticatedReviewHeadSha: approval.headSha })).ok).toBe(scenario.approved);
+			expect(requests.length).toBe(scenario.name === "valid exact-head approval" || scenario.name === "revoked collaborator permission" ? 2 : 1);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	test("unavailable and malformed review responses never provide authenticated approval", async () => {
+		for (const failure of ["network", "http", "invalid-json", "object", "null", "malformed-entry"]) {
+			const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+				if (failure === "network") throw new Error("Reviews network unavailable");
+				if (failure === "http") return new Response("unavailable", { status: 503 });
+				if (failure === "invalid-json") return new Response("{broken");
+				return Response.json(failure === "object" ? {} : failure === "null" ? null : [null]);
+			});
+			try {
+				if (failure === "http") expect(await authenticatedApproval(event, "review-agent", head, "test-token")).toEqual({});
+				else await expect(authenticatedApproval(event, "review-agent", head, "test-token")).rejects.toThrow();
+				expect(spy).toHaveBeenCalledTimes(1);
+			} finally {
+				spy.mockRestore();
+			}
+		}
+	});
+});
 
 function selfReviewComment(overrides: {
 	body?: string;

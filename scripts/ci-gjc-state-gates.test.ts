@@ -133,6 +133,33 @@ describe("GJC state gate relevance", () => {
 		expect(result.output).toBe("");
 	});
 
+	test.each(["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"])("rejects malformed %s before dependency normalization", async scope => {
+		const dir = await fixture();
+		const base = await commit(dir);
+		await Bun.write(path.join(dir, "docs/guide.md"), "documentation only\n");
+		await commit(dir);
+		for (const malformed of [[], null, "agent", { agent: null }, { agent: 42 }, { agent: [] }]) {
+			await Bun.write(path.join(dir, "packages/coding-agent/package.json"), JSON.stringify({
+				name: "coding-agent", dependencies: { agent: "workspace:*" }, [scope]: malformed,
+			}));
+			const result = await emitRelevance(dir, base);
+			expect(result.exitCode).not.toBe(0);
+			expect(result.stderr).toContain(`Invalid workspace dependency map ${scope}`);
+			expect(result.output).toBe("");
+		}
+	});
+
+	test("omitted dependency maps remain valid for an unrelated package", async () => {
+		const dir = await fixture();
+		const base = await commit(dir);
+		await Bun.write(path.join(dir, "packages/unrelated/package.json"), JSON.stringify({ name: "unrelated" }));
+		await Bun.write(path.join(dir, "packages/unrelated/src/index.ts"), "export const changed = true;\n");
+		await commit(dir);
+		const result = await emitRelevance(dir, base);
+		expect(result.exitCode).toBe(0);
+		expect(result.output).toBe("relevant=false\n");
+	});
+
 	test("diff preserves removed relevant paths and newline filenames", async () => {
 		const dir = await fixture();
 		const old = "packages/coding-agent/src/old.ts";

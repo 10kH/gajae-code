@@ -819,6 +819,15 @@ async function getWorkspaceDirs(): Promise<string[]> {
 async function readPackageManifest(filePath: string): Promise<PackageManifest | null> {
 	const value = await readJsonRecord(filePath);
 	if (!value) return null;
+	// Validate graph-bearing fields before readStringMap can discard malformed
+	// entries and make a real dependency disappear from relevance planning.
+	for (const scope of PACKAGE_SCOPES) {
+		const dependencies = value[scope];
+		if (dependencies === undefined) continue;
+		if (!isRecord(dependencies) || Object.values(dependencies).some(version => !isString(version))) {
+			throw new Error(`Invalid workspace dependency map ${scope} in ${filePath}`);
+		}
+	}
 	return {
 		name: isString(value.name) ? value.name : undefined,
 		scripts: readStringMap(value.scripts),

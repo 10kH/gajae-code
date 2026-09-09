@@ -401,10 +401,9 @@ function issueCommentToSelfReview(comment: IssueComment): AuthenticatedSelfRevie
 	return { login, authorAssociation: comment.author_association ?? "NONE", body: comment.body };
 }
 
-async function authenticatedApproval(event: PullRequestEvent, reviewerId: string, headSha: string): Promise<{ login?: string; headSha?: string }> {
+export async function authenticatedApproval(event: PullRequestEvent, reviewerId: string, headSha: string, token = Bun.env.GITHUB_TOKEN): Promise<{ login?: string; headSha?: string }> {
 	const repository = event.repository?.full_name;
 	const number = event.pull_request?.number;
-	const token = Bun.env.GITHUB_TOKEN;
 	if (!repository || !number || !token) return {};
 	const reviews: PullRequestReview[] = [];
 	for (let page = 1; ; page++) {
