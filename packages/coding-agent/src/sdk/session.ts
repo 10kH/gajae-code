@@ -160,6 +160,7 @@ import type { SecretObfuscator } from "../secrets";
 import { AgentSession, type ForkContextSeed, isSessionDisposalIncompleteError } from "../session/agent-session";
 import { AuthBrokerClient, AuthStorage, RemoteAuthCredentialStore } from "../session/auth-storage";
 import { type CustomMessage, convertToLlm } from "../session/messages";
+import { primaryControlSurfaceFor } from "../session/primary-control-surface";
 import { createReadonlySessionManager, SessionManager } from "../session/session-manager";
 import {
 	parsePersistedCredentialSelector,
@@ -1454,6 +1455,7 @@ function validateAutomationTools(options: CreateAgentSessionOptions): Automation
 
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
 	const automationTools = validateAutomationTools(options);
+	const primaryControlSurface = primaryControlSurfaceFor(options);
 	const masterModeContext = options.masterModeContext;
 	const lifecycleStartupCapability = (
 		options as CreateAgentSessionOptions & { [lifecycleStartupCapabilityOption]?: SdkStartupCapability }
@@ -3406,6 +3408,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						const createNotificationsExtension = await notificationAdapterService.get("session-extension");
 						createNotificationsExtension(api, {
 							settings,
+							primaryControlSurface,
 
 							controller: notificationSessionController,
 							spawnedByGjc,
@@ -3470,6 +3473,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							createTransport: input => createSdkWebSocketTransport(input),
 							settings,
 							configOverrides: new Map(),
+							primaryControlSurface,
 							...(masterModeContext
 								? {
 										masterCapability: masterModeContext.getCapability(),

@@ -283,6 +283,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	});
 	const skillInputs: Record<string, unknown>[] = [];
 	const controlOperations: string[] = [];
+	const controlInputs: Array<{ operation: string; input: Record<string, unknown> }> = [];
 	const abortFrames: Record<string, unknown>[] = [];
 	const updates: SessionNotification[] = [];
 	const providerRegistrations: Array<Record<string, unknown>> = [];
@@ -296,7 +297,9 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	const sessionCloseLedger = new Map<string, Record<string, unknown>>();
 	let makeNextSessionCloseUncertain = true;
 	let rejectNextSessionClose = false;
+	let reportNextSessionCloseGone = false;
 	let activeModelPreset = "test-preset";
+	let primaryControlSurface: "cli" | "sdk" | "invalid" | undefined = "sdk";
 	let completeNextPromptBeforeAck = false;
 	/** Queries `#sessionState` issues before `session/new` can answer. */
 	const SESSION_STATE_QUERIES = new Set(["config.list/get", "models.profiles.list", "providers.list/active"]);
@@ -396,6 +399,13 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 							socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ...response }));
 							return;
 						}
+						if (reportNextSessionCloseGone) {
+							reportNextSessionCloseGone = false;
+							const response = { ok: false, error: { code: "not_found", message: "session already gone" } };
+							sessionCloseLedger.set(idempotencyKey, response);
+							socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ...response }));
+							return;
+						}
 						if (makeNextSessionCloseUncertain) {
 							makeNextSessionCloseUncertain = false;
 							const response = {
@@ -444,7 +454,10 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 								type: "query_response",
 								id: frame.id,
 								ok: true,
-								result: { promptTerminalOutcomeVersion: 1 },
+								result: {
+									promptTerminalOutcomeVersion: 1,
+									...(primaryControlSurface === undefined ? {} : { primaryControlSurface }),
+								},
 							}),
 						);
 						return;
@@ -462,7 +475,14 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 					}
 					const items =
 						frame.query === "config.list/get"
-							? [{ mode: "default", model: "openai/gpt", modelPreset: activeModelPreset, thinking: "medium" }]
+							? [
+									{
+										mode: "default",
+										model: `gajae-code/${activeModelPreset}`,
+										modelPreset: activeModelPreset,
+										thinking: "medium",
+									},
+								]
 							: frame.query === "models.profiles.list"
 								? [
 										{ id: "codex-medium", displayName: "Codex Medium", source: "builtin", available: true },
@@ -539,6 +559,8 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 				}
 				if (frame.type === "control_request") {
 					if (typeof frame.operation === "string") controlOperations.push(frame.operation);
+					if (typeof frame.operation === "string" && frame.input && typeof frame.input === "object")
+						controlInputs.push({ operation: frame.operation, input: frame.input as Record<string, unknown> });
 					if (frame.operation === "turn.abort") abortFrames.push(frame);
 					if (frame.operation === "model.profile.set") {
 						const input = frame.input as Record<string, unknown>;
@@ -1285,6 +1307,187 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	).toHaveLength(0);
 	observerAbort.abort();
 
+	await agent.extMethod("session/set_model", {
+		sessionId: created.sessionId,
+		modelId: "test-preset",
+	});
+	expect(activeModelPreset).toBe("test-preset");
+
+	// A session this connection launched is owned before attachment reports a control
+	// surface, so discarding it after a failed attach tolerates an already-gone close
+	// and surfaces the real attach error instead of cleanup uncertainty.
+	primaryControlSurface = undefined;
+	reportNextSessionCloseGone = true;
+	const discardAbort = new AbortController();
+	const discardAgent = new AcpAgent(
+		{
+			sessionUpdate: async (update: SessionNotification) => updates.push(update),
+			signal: discardAbort.signal,
+			closed: Promise.withResolvers<void>().promise,
+		} as unknown as AgentSideConnection,
+		{ agentDir },
+	);
+	await expect(
+		bounded(discardAgent.newSession({ cwd, mcpServers: [] }), "attach failure discard"),
+	).rejects.toMatchObject({ code: "unavailable" });
+	discardAbort.abort();
+
+	primaryControlSurface = undefined;
+	const legacyCapabilityAbort = new AbortController();
+	const legacyCapabilityAgent = new AcpAgent(
+		{
+			sessionUpdate: async (update: SessionNotification) => updates.push(update),
+			signal: legacyCapabilityAbort.signal,
+			closed: Promise.withResolvers<void>().promise,
+		} as unknown as AgentSideConnection,
+		{ agentDir },
+	);
+	const registrationsBeforeLegacyCapability = providerRegistrations.length;
+	await expect(
+		bounded(
+			legacyCapabilityAgent.loadSession({ sessionId: created.sessionId, cwd, mcpServers: [] }),
+			"legacy capability rejection",
+		),
+	).rejects.toMatchObject({ code: "unavailable" });
+	expect(providerRegistrations).toHaveLength(registrationsBeforeLegacyCapability);
+	legacyCapabilityAbort.abort();
+
+	primaryControlSurface = "invalid";
+	const invalidCapabilityAbort = new AbortController();
+	const invalidCapabilityAgent = new AcpAgent(
+		{
+			sessionUpdate: async (update: SessionNotification) => updates.push(update),
+			signal: invalidCapabilityAbort.signal,
+			closed: Promise.withResolvers<void>().promise,
+		} as unknown as AgentSideConnection,
+		{ agentDir },
+	);
+	await expect(
+		bounded(
+			invalidCapabilityAgent.loadSession({ sessionId: created.sessionId, cwd, mcpServers: [] }),
+			"invalid capability rejection",
+		),
+	).rejects.toMatchObject({ code: "unavailable" });
+	expect(providerRegistrations).toHaveLength(registrationsBeforeLegacyCapability);
+	invalidCapabilityAbort.abort();
+
+	const baseProviderAbort = new AbortController();
+	primaryControlSurface = "cli";
+	const cliProviderRegistrationCount = providerRegistrations.length;
+	const cliPermissionModeCount = controlOperations.filter(operation => operation === "permission_mode.set").length;
+	const baseProviderAgent = new AcpAgent(
+		{
+			sessionUpdate: async (update: SessionNotification) => updates.push(update),
+			signal: baseProviderAbort.signal,
+			closed: Promise.withResolvers<void>().promise,
+		} as unknown as AgentSideConnection,
+		{ agentDir },
+	);
+	const attached = await bounded(
+		baseProviderAgent.loadSession({ sessionId: created.sessionId, cwd, mcpServers: [] }),
+		"base provider live preset attachment",
+	);
+	expect(providerRegistrations).toHaveLength(cliProviderRegistrationCount);
+	expect(controlOperations.filter(operation => operation === "permission_mode.set")).toHaveLength(
+		cliPermissionModeCount,
+	);
+	const cliPromptCount = promptInputs.length;
+	const cliPrompt = baseProviderAgent.prompt({
+		sessionId: created.sessionId,
+		prompt: [{ type: "text", text: "CLI primary remains terminal" }],
+	});
+	await waitFor(() => promptInputs.length === cliPromptCount + 1 && promptSocket !== undefined, "CLI-origin prompt");
+	promptSocket!.send(
+		JSON.stringify({
+			type: "agent_end",
+			sessionId: created.sessionId,
+			...currentPromptCorrelation(),
+			outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+		}),
+	);
+	await expect(bounded(cliPrompt, "CLI-origin prompt completion")).resolves.toMatchObject({ stopReason: "end_turn" });
+	await bounded(
+		baseProviderAgent.loadSession({ sessionId: created.sessionId, cwd, mcpServers: [] }),
+		"CLI-origin session reload",
+	);
+	expect(providerRegistrations).toHaveLength(cliProviderRegistrationCount);
+	expect(attached.configOptions).toEqual(
+		expect.arrayContaining([
+			expect.objectContaining({
+				id: "model",
+				name: "Preset",
+				currentValue: "test-preset",
+			}),
+		]),
+	);
+	await baseProviderAgent.setSessionConfigOption({
+		sessionId: created.sessionId,
+		configId: "model",
+		value: "codex-medium",
+	});
+	expect(controlInputs).toContainEqual({
+		operation: "model.profile.set",
+		input: { id: "codex-medium" },
+	});
+	const cliBrokerRequestCount = brokerRequests.length;
+	// A CLI-primary attachment never reaches broker lifecycle control, but closing it
+	// must still release the local attachment; a later prompt has no session to reach.
+	await expect(baseProviderAgent.deleteSession({ sessionId: created.sessionId })).rejects.toMatchObject({
+		code: "operation_prohibited",
+	});
+	// Closing mid-turn settles the waiting prompt as cancelled. Leaving the record in
+	// place would strand the client on a turn that can never complete.
+	const inflightPromptCount = promptInputs.length;
+	const inflightPrompt = baseProviderAgent.prompt({
+		sessionId: created.sessionId,
+		prompt: [{ type: "text", text: "CLI-primary turn interrupted by close" }],
+	});
+	await waitFor(() => promptInputs.length === inflightPromptCount + 1, "in-flight CLI-primary prompt");
+	await expect(baseProviderAgent.closeSession({ sessionId: created.sessionId })).resolves.toEqual({});
+	await expect(bounded(inflightPrompt, "in-flight prompt settles on close")).resolves.toMatchObject({
+		stopReason: "cancelled",
+	});
+	expect(brokerRequests).toHaveLength(cliBrokerRequestCount);
+	const cliPromptInputsAfterClose = promptInputs.length;
+	await expect(
+		bounded(
+			baseProviderAgent.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "after CLI-primary close" }],
+			}),
+			"prompt after CLI-primary close",
+		),
+	).rejects.toMatchObject({ code: "not_found" });
+	expect(promptInputs).toHaveLength(cliPromptInputsAfterClose);
+	await expect(baseProviderAgent.deleteSession({ sessionId: created.sessionId })).resolves.toEqual({});
+	expect(brokerRequests).toHaveLength(cliBrokerRequestCount);
+	baseProviderAbort.abort();
+
+	primaryControlSurface = "sdk";
+	const sdkReloadAbort = new AbortController();
+	const sdkReloadAgent = new AcpAgent(
+		{
+			sessionUpdate: async (update: SessionNotification) => updates.push(update),
+			signal: sdkReloadAbort.signal,
+			closed: Promise.withResolvers<void>().promise,
+		} as unknown as AgentSideConnection,
+		{ agentDir },
+	);
+	const sdkRegistrationsBeforeReload = providerRegistrations.length;
+	await bounded(
+		sdkReloadAgent.loadSession({ sessionId: created.sessionId, cwd, mcpServers: [] }),
+		"fresh SDK-primary reload",
+	);
+	await waitFor(
+		() => providerRegistrations.length > sdkRegistrationsBeforeReload,
+		"SDK-primary provider registration after fresh load",
+	);
+	await sdkReloadAgent.setSessionConfigOption({
+		sessionId: created.sessionId,
+		configId: "thinking",
+		value: "medium",
+	});
+	sdkReloadAbort.abort();
 	await bounded(agent.loadSession({ sessionId: created.sessionId, cwd, mcpServers: [] }), "owned session reload");
 	expect(updates).toEqual(
 		expect.arrayContaining([

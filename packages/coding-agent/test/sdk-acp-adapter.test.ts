@@ -155,7 +155,7 @@ test("an attachment without sendMaintenance is rejected at setup, leaving no lea
 		providers: [{ capability: "ui", definitions: [] }],
 		heartbeatMs: 5,
 	});
-	await expect(adapter.start()).rejects.toThrow(/sendMaintenance/);
+	await expect(adapter.start({ activateProviders: false })).rejects.toThrow(/sendMaintenance/);
 	try {
 		// No heartbeat may be emitted for an attachment that cannot renew.
 		const before = harness.maintenance.length;
@@ -210,6 +210,35 @@ test("a capability-less attachment is rejected on the handoff paths too (#4730 r
 		await sameObject.close();
 		// The supported attachment keeps renewing; the refusal did not wedge it.
 		await waitFor(() => harness.maintenance.length >= 1, "heartbeat still renewing after refusal");
+	} finally {
+		await adapter.close();
+	}
+});
+
+test("provider activation stays fail-closed until startup origin authorizes it", async () => {
+	const harness = createRouterHarness();
+	const adapter = new AcpSdkAdapter({
+		router: harness.router as never,
+		attachment: harness.attachment,
+		sessionId: harness.attachment.sessionId,
+		providers: [{ capability: "permission", definitions: [] }],
+		heartbeatMs: 5,
+	});
+	try {
+		await adapter.start({ activateProviders: false });
+		await adapter.start();
+		await adapter.ensureProviders();
+		await adapter.attachmentReady(harness.attachment);
+		expect(harness.requests.filter(frame => frame.type === "register_provider")).toHaveLength(0);
+
+		const replacement = { ...harness.attachment, connectionId: "router-connection-2" };
+		adapter.acceptAttachment(replacement);
+		await Bun.sleep(10);
+		expect(harness.requests.filter(frame => frame.type === "register_provider")).toHaveLength(0);
+
+		adapter.authorizeProviderActivation();
+		await adapter.ensureProviders();
+		expect(harness.requests.filter(frame => frame.type === "register_provider")).toHaveLength(1);
 	} finally {
 		await adapter.close();
 	}
