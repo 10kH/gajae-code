@@ -42,6 +42,7 @@ import {
 	type ManagedAttemptDecision,
 	type ManagedAttemptOutcome,
 	type MidRunMaintenanceOutcome,
+	markNonDispatchedToolEvent,
 	type RunCancellationDomain,
 	type RunCancellationDomainBridge,
 	type RunResourceProducerLease,
@@ -8789,6 +8790,7 @@ export class AgentSession {
 					args: event.args,
 					intent: event.intent,
 				};
+				if (isNonDispatchedToolEvent(event)) markNonDispatchedToolEvent(extensionEvent);
 				await this.#extensionRunner.emit(extensionEvent, undefined, deliveryScope);
 			} else if (event.type === "tool_execution_update") {
 				const extensionEvent: ToolExecutionUpdateEvent = {
@@ -8807,6 +8809,7 @@ export class AgentSession {
 					result: event.result,
 					isError: event.isError ?? false,
 				};
+				if (isNonDispatchedToolEvent(event)) markNonDispatchedToolEvent(extensionEvent);
 				await this.#extensionRunner.emit(extensionEvent, undefined, deliveryScope);
 			} else if (event.type === "auto_compaction_start") {
 				await this.#extensionRunner.emit(
