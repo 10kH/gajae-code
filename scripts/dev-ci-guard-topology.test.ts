@@ -25,7 +25,7 @@ interface WorkflowJob {
 
 interface WorkflowDocument {
 	on: { workflow_dispatch: { inputs: Record<string, unknown> } };
-	concurrency?: { group: string };
+	concurrency?: { group: string; "cancel-in-progress": string };
 	jobs: Record<string, WorkflowJob>;
 }
 
@@ -67,6 +67,58 @@ function requiredEnvValue(value: WorkflowJob | WorkflowStep, key: string): strin
 
 
 describe("dev-ci Telegram daemon generation guard topology", () => {
+	test("metadata event matrix isolates concurrency and skips the entire code DAG, not the contract", async () => {
+		const document = await workflow();
+		if (!document.concurrency) throw new Error("Missing workflow concurrency");
+		const body = { from: "old verdict" };
+		const title = { from: "old title" };
+		const base = { ref: { from: "main" }, sha: { from: "a".repeat(40) } };
+		for (const scenario of [
+			{ name: "body only", event: "pull_request", action: "edited", changes: { body }, skip: true },
+			{ name: "title only", event: "pull_request", action: "edited", changes: { title }, skip: true },
+			{ name: "body and title", event: "pull_request", action: "edited", changes: { body, title }, skip: true },
+			{ name: "base only", event: "pull_request", action: "edited", changes: { base }, skip: false },
+			{ name: "base and body", event: "pull_request", action: "edited", changes: { base, body }, skip: false },
+			{ name: "base and title", event: "pull_request", action: "edited", changes: { base, title }, skip: false },
+			{ name: "base and both", event: "pull_request", action: "edited", changes: { base, body, title }, skip: false },
+			{ name: "unknown edit", event: "pull_request", action: "edited", changes: {}, skip: false },
+			{ name: "source push", event: "pull_request", action: "synchronize", changes: {}, skip: false },
+			{ name: "branch push", event: "push", action: "", changes: {}, skip: false },
+		]) {
+			const github = { event_name: scenario.event, event: { action: scenario.action, changes: scenario.changes }, workflow: "Dev CI", ref: "refs/pull/5367/merge", run_id: 34300623114 };
+			const needs: Record<string, { result: string; outputs: Record<string, string> }> = {};
+			// Evaluate the actual checked-in boolean expressions, not a duplicate
+			// metadata predicate. This fixture uses only their JS-compatible subset.
+			const evaluate = (expression: string): unknown => {
+				const source = expression.trim().replace(/^\$\{\{\s*|\s*\}\}$/g, "")
+					.replace(/needs\.([a-z][a-z0-9-]*)/g, 'needs["$1"]');
+				return new Function("github", "inputs", "needs", "always", "contains", "format", `return (${source});`)(
+					github, { head_sha: "" }, needs, () => true,
+					(value: string = "", part: string) => value.includes(part),
+					(template: string, ...values: unknown[]) => template.replace(/\{(\d+)\}/g, (_, index: string) => String(values[Number(index)])),
+				);
+			};
+			expect({ scenario: scenario.name, group: evaluate(document.concurrency.group) }).toEqual({
+				scenario: scenario.name, group: `Dev CI-refs/pull/5367/merge${scenario.skip ? "-metadata-edit" : ""}`,
+			});
+			expect(Boolean(evaluate(document.concurrency["cancel-in-progress"]))).toBe(!scenario.skip);
+			const scheduled: string[] = [];
+			for (const [name, job] of Object.entries(document.jobs)) {
+				for (const dependency of job.needs ?? []) expect(needs[dependency]).toBeDefined();
+				const implicitSuccess = job.if?.includes("always()") || (job.needs ?? []).every(dependency => needs[dependency].result === "success");
+				const enabled = implicitSuccess && Boolean(evaluate(job.if ?? "true"));
+				if (enabled) scheduled.push(name);
+				needs[name] = { result: enabled ? "success" : "skipped", outputs: enabled ? { relevant: "true", has_native: "true", has_tasks: "true" } : {} };
+			}
+			if (scenario.skip) expect({ scenario: scenario.name, scheduled }).toEqual({ scenario: scenario.name, scheduled: ["pr-contract-bootstrap"] });
+			else {
+				expect(scheduled).toContain("affected-plan");
+				expect(scheduled).toContain("affected-shards");
+				expect(scheduled).toContain("gjc-state-gates-matrix");
+				if (scenario.event === "pull_request") expect(scheduled).toContain("pr-contract-bootstrap");
+			}
+		}
+	});
 	test("does not resurrect the removed Windows notification atomicity gate", async () => {
 		const raw = await Bun.file(".github/workflows/dev-ci.yml").text();
 		expect(raw).not.toMatch(/notification-atomic-windows/);
