@@ -248,6 +248,31 @@ describe("browser tab worker selector validation", () => {
 		}
 	});
 
+	it("rejects blank structured wait selectors without later actions", async () => {
+		const harness = await createHarness();
+		try {
+			for (const selector of ["", " \t\n"]) {
+				const result = await harness.run(
+					compileActionSteps([
+						{ verb: "wait", selector, ms: 1000 },
+						{ verb: "wait", ms: 1000 },
+					]),
+				);
+				expect(result.ok).toBe(false);
+				if (result.ok) throw new Error("expected structured wait selector rejection");
+				expect(result.error.isToolError).toBe(true);
+				expect(result.error.message).toContain("Selector must be a non-empty string");
+				expect(harness.calls).toEqual([]);
+			}
+			const timed = await harness.run(compileActionSteps([{ verb: "wait", ms: 1000 }]));
+			expect(timed.ok).toBe(true);
+			if (!timed.ok) throw new Error(timed.error.message);
+			expect(timed.payload.returnValue).toEqual([{ verb: "wait", selector: null, ms: 1000 }]);
+		} finally {
+			await harness.close();
+		}
+	});
+
 	it("preserves omitted and valid structured press selectors through the worker", async () => {
 		const harness = await createHarness();
 		try {
