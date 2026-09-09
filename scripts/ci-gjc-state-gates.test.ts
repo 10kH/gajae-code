@@ -101,7 +101,13 @@ describe("GJC state gate relevance", () => {
 		}
 	});
 
-	test.each(["docs/guide.md", "packages/unrelated/src/index.ts", "packages/utils/src/index.ts"])("emits relevance without installing dependencies or running gates: %s", async file => {
+	test.each([
+		["docs/guide.md", false],
+		["packages/unrelated/src/index.ts", false],
+		["packages/utils/src/index.ts", true],
+		["packages/agent/src/prompts/escaped-nonascii-recovery.md", true],
+		["packages/ai/src/prompts/turn-aborted-guidance.md", true],
+	] as const)("emits relevance without installing dependencies or running gates: %s", async (file, relevant) => {
 		const dir = await fixture();
 		const base = await commit(dir);
 		await Bun.write(path.join(dir, file), "changed\n");
@@ -109,7 +115,7 @@ describe("GJC state gate relevance", () => {
 		const result = await emitRelevance(dir, base);
 		expect(result.exitCode).toBe(0);
 		expect(result.stderr).toBe("");
-		expect(result.output).toBe(`relevant=${file.startsWith("packages/utils/")}\n`);
+		expect(result.output).toBe(`relevant=${relevant}\n`);
 		expect(result.stdout).not.toContain("running group");
 		expect(await Bun.file(path.join(dir, "node_modules")).exists()).toBe(false);
 	});
