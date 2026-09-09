@@ -152,7 +152,7 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(workflow).toContain("affected-evidence-producer:");
 		expect(workflow).toContain("name: Affected path validation / evidence producer");
 		expect(workflow).toContain(
-			"  affected:\n    name: Affected path validation\n    if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') && !(github.event_name == 'pull_request' && github.event.action == 'edited' && (github.event.changes.body != null || github.event.changes.title != null) && github.event.changes.base == null) }}",
+			"    name: ${{ ((github.event_name == 'workflow_dispatch' && inputs.head_sha != '') || (github.event_name == 'pull_request' && github.event.action == 'edited' && (github.event.changes.body != null || github.event.changes.title != null) && github.event.changes.base == null)) && 'Not code evidence - affected validation skipped' || 'Affected path validation' }}",
 		);
 		expect(workflow).toContain("needs: [affected-evidence-producer, affected-plan, affected-native, affected-shards, telegram-daemon-generation, windows-dev-doctor, windows-native-build-toolchain, windows-telegram-daemon-safety, affected-darwin-arm64-tab-worker-smoke]");
 		expect(workflow).toContain("artifact_id: ${{ steps.upload-evidence.outputs.artifact-id }}");

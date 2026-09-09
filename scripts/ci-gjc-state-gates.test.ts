@@ -214,7 +214,7 @@ describe("GJC state gate workflow dependency contract", () => {
 			expect(jobs[name].steps.find(step => step.uses?.startsWith("actions/checkout@"))?.with?.ref).toBe("${{ github.event.pull_request.head.sha || github.sha }}");
 		}
 		const aggregate = jobs["gjc-state-gates"];
-		expect(aggregate.name).toBe("gjc-state-gates");
+		expect(aggregate.name).toBe("${{ ((github.event_name == 'workflow_dispatch' && inputs.head_sha != '') || (github.event_name == 'pull_request' && github.event.action == 'edited' && (github.event.changes.body != null || github.event.changes.title != null) && github.event.changes.base == null)) && 'Not code evidence - state gates skipped' || 'gjc-state-gates' }}");
 		expect(aggregate.if).toContain("always()");
 		expect(aggregate.needs).toEqual(["gjc-state-gates-relevance", "gjc-state-gates-native", "gjc-state-gates-matrix"]);
 	});
