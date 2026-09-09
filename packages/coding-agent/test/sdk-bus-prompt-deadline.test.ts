@@ -58,7 +58,14 @@ function deadlineSettings(cwd: string, leaseMs: number, maxRuntimeMs: number): S
 	} as unknown as Settings;
 }
 
-function context(cwd: string, sessionId: string): Record<string, unknown> {
+function context(
+	cwd: string,
+	sessionId: string,
+	abortPromptAndWait: (handle: string, options: { graceMs: number }) => Promise<RunSettlementProof> = async () => ({
+		status: "settled",
+		terminalScope: {},
+	}),
+): Record<string, unknown> {
 	return {
 		cwd,
 		sessionMetadata: { kind: "main", taskDepth: 0 },
@@ -75,7 +82,7 @@ function context(cwd: string, sessionId: string): Record<string, unknown> {
 		// A bound execution handle plus a settled abort proof is what lets the
 		// deadline reach its real terminal instead of failing closed as uncertain.
 		getActivePromptHandle: () => "bus-deadline-run-handle",
-		abortPromptAndWait: async () => ({ status: "settled", terminalScope: {} }),
+		abortPromptAndWait,
 		getSystemPrompt: () => ["test"],
 		isIdle: () => true,
 		hasPendingMessages: () => false,
@@ -182,12 +189,17 @@ async function acceptPrompt(
 	label: string,
 	leaseMs: number,
 	maxRuntimeMs: number,
-	options: { startAgent?: boolean; extraPrompts?: string[]; captureSchedule?: boolean } = {},
+	options: {
+		startAgent?: boolean;
+		extraPrompts?: string[];
+		captureSchedule?: boolean;
+		abortPromptAndWait?: (handle: string, options: { graceMs: number }) => Promise<RunSettlementProof>;
+	} = {},
 ): Promise<BusSession> {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-sdk-bus-deadline-${label}-`));
 	dirs.push(cwd);
 	const sessionId = `sdk-bus-deadline-${label}-${Date.now()}`;
-	const sessionContext = context(cwd, sessionId);
+	const sessionContext = context(cwd, sessionId, options.abortPromptAndWait);
 	const acceptFailure: AcceptFailure = { armed: false };
 	const handlers = start(sessionContext, deadlineSettings(cwd, leaseMs, maxRuntimeMs), acceptFailure);
 	const scheduled: (() => void)[] = [];
@@ -678,6 +690,39 @@ test("a deadline expiry attempt in flight is superseded by real progress during 
 	} finally {
 		releaseClaim.resolve();
 		renameSpy.mockRestore();
+		await shutdown(session);
+	}
+}, 30_000);
+
+test("a deadline expiry attempt in flight is superseded by real progress during fencing", async () => {
+	// HIGH: after the durable claim, terminal fencing still awaits the run's
+	// settlement proof. Attributable progress in that window must renew the
+	// lease and prevent the deadline terminal from being published.
+	const fenceStarted = Promise.withResolvers<void>();
+	const releaseFence = Promise.withResolvers<void>();
+	const session = await acceptPrompt("fence-supersede", 400, 60_000, {
+		abortPromptAndWait: async () => {
+			fenceStarted.resolve();
+			await releaseFence.promise;
+			return { status: "settled", terminalScope: {} };
+		},
+	});
+	try {
+		await fenceStarted.promise;
+		expect(session.terminals(session.correlation)).toHaveLength(0);
+		session.handlers.get("tool_execution_end")?.(
+			{ type: "tool_execution_end", toolCallId: "fence-tool", toolName: "read", isError: false },
+			session.sessionContext,
+		);
+		await Bun.sleep(50);
+		releaseFence.resolve();
+		await Bun.sleep(300);
+		expect(session.terminals(session.correlation)).toHaveLength(0);
+		expect(session.deadlineTerminals()).toHaveLength(0);
+		await waitFor(() => session.deadlineTerminals().length > 0, "rescheduled fencing deadline terminal");
+		expect(session.deadlineTerminals()).toHaveLength(1);
+	} finally {
+		releaseFence.resolve();
 		await shutdown(session);
 	}
 }, 30_000);

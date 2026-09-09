@@ -5125,9 +5125,9 @@ export function createNotificationsExtension(
 			const submission = promptSubmissions.get(key);
 			if (!submission) return;
 			if (
-				submission.phase === "outcome_claimed" &&
 				submission.deadlineAttempt &&
-				submission.deadlineLease === submission.deadlineAttempt.lease
+				submission.deadlineLease === submission.deadlineAttempt.lease &&
+				(submission.phase === "outcome_claimed" || submission.phase === "terminalizing")
 			) {
 				recordAttributableProgress(submission.deadlineLease, Date.now());
 				return;
@@ -5243,6 +5243,7 @@ export function createNotificationsExtension(
 			code: string,
 			message: string,
 		) => {
+			submission.deadlineAttempt = undefined;
 			if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
 			if (!submission.terminal) {
 				submission.terminal = true;
@@ -5352,12 +5353,12 @@ export function createNotificationsExtension(
 			// instead of fencing and publishing a deadline terminal for a live
 			// prompt. A re-accepted or evicted submission is never touched.
 			const deadlineAttempt = submission.deadlineAttempt;
-			submission.deadlineAttempt = undefined;
 			if (deadlineAttempt) {
 				const key = promptSubmissionKey(correlation);
 				const status = deadlineAttemptStatus(key, submission, deadlineAttempt);
 				if (status === "stale") return;
 				if (status === "superseded") {
+					submission.deadlineAttempt = undefined;
 					submission.phase = "active";
 					armPromptDeadline(key, correlation);
 					return;
@@ -5440,25 +5441,50 @@ export function createNotificationsExtension(
 				const status = deadlineAttemptStatus(key, submission, deadlineAttempt);
 				if (status === "stale") return;
 				if (status === "superseded") {
+					submission.deadlineAttempt = undefined;
 					submission.phase = "active";
 					armPromptDeadline(key, correlation);
 					return;
 				}
 			}
 			try {
-				await kindReconciliation.finalizeOutcome(
-					submission.reconciliationKind,
-					correlation,
-					winner,
-					extra?.error,
-					extra?.finalText,
-				);
+				if (deadlineAttempt) {
+					await kindReconciliation.finalizeOutcome(
+						submission.reconciliationKind,
+						correlation,
+						winner,
+						() =>
+							deadlineAttemptStatus(promptSubmissionKey(correlation), submission, deadlineAttempt) === "current",
+						extra?.error,
+						extra?.finalText,
+					);
+				} else {
+					await kindReconciliation.finalizeOutcome(
+						submission.reconciliationKind,
+						correlation,
+						winner,
+						extra?.error,
+						extra?.finalText,
+					);
+				}
 			} catch (error) {
 				// The durable pending claim survives; publishing an unpersisted terminal
 				// would contradict it, so fail the endpoint closed instead.
 				logger.warn(`sdk: prompt terminal persistence failed: ${String(error)}`);
 				failPromptClosed(correlation, submission, "terminal_uncertain", "Prompt reconciliation is unavailable.");
 				return;
+			}
+			if (deadlineAttempt) {
+				const key = promptSubmissionKey(correlation);
+				const status = deadlineAttemptStatus(key, submission, deadlineAttempt);
+				if (status === "stale") return;
+				if (status === "superseded") {
+					submission.deadlineAttempt = undefined;
+					submission.phase = "active";
+					armPromptDeadline(key, correlation);
+					return;
+				}
+				submission.deadlineAttempt = undefined;
 			}
 			if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
 			if (!recordPromptTerminal(correlation)) return;
