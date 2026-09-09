@@ -277,7 +277,8 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		expect(verify.run).toContain("pi_natives.linux-x64-modern.node");
 		const upload = namedStep(native, "Upload state-gate native addon(s)");
 		expect(upload.with?.name).toBe("dev-state-gates-native-${{ github.run_id }}");
-		expect(matrix.needs).toEqual(["gjc-state-gates-native"]);
+		expect(native.needs).toEqual(["gjc-state-gates-relevance"]);
+		expect(matrix.needs).toEqual(["gjc-state-gates-relevance", "gjc-state-gates-native"]);
 		const download = namedStep(matrix, "Download state-gate native addon(s)");
 		expect(download.with?.name).toBe("dev-state-gates-native-${{ github.run_id }}");
 		expect(download.with?.path).toBe("packages/natives/native");

@@ -954,13 +954,34 @@ jobs:
           CI_DEV_AFFECTED_PLAN: ${{ runner.temp }}/ci-dev-affected-evidence/.ci-dev-affected-plan.json
         run: bun scripts/ci-dev-affected.ts --validate-aggregate
 
-  # State-gate tests import the package native entrypoint on the current dev head.
-  # Build both Linux x64 ISA variants once and publish them to every gate shard;
-  # this keeps the gate independent from affected-plan relevance and prevents a
-  # missing pi_natives.linux-x64-modern.node from failing before tests start.
+  # Resolve relevance without installing dependencies or provisioning natives.
+  gjc-state-gates-relevance:
+    name: gjc-state-gates / relevance
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') && !(github.event_name == 'pull_request' && github.event.action == 'edited' && github.event.changes.body != null && github.event.changes.title == null && github.event.changes.base == null) }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    outputs:
+      relevant: ${{ steps.relevance.outputs.relevant }}
+    env:
+      GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+      GITHUB_BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'workflow_dispatch' && inputs.base_sha || github.event.before }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: "1.4.0"
+      - name: Resolve GJC state gate relevance
+        id: relevance
+        run: bun scripts/ci-gjc-state-gates.ts --emit-relevance
+
+  # Relevant state-gate tests need both Linux x64 ISA variants on every shard.
   gjc-state-gates-native:
     name: gjc-state-gates / native addon
-    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') && !(github.event_name == 'pull_request' && github.event.action == 'edited' && github.event.changes.body != null && github.event.changes.title == null && github.event.changes.base == null) }}
+    if: ${{ needs.gjc-state-gates-relevance.result == 'success' && needs.gjc-state-gates-relevance.outputs.relevant == 'true' }}
+    needs: [gjc-state-gates-relevance]
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
@@ -1016,9 +1037,9 @@ jobs:
 
   gjc-state-gates-matrix:
     name: gjc-state-gates / ${{ matrix.group }}
-    # No `affected-plan` dependency, so this needs its own body-edit guard.
-    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') && !(github.event_name == 'pull_request' && github.event.action == 'edited' && github.event.changes.body != null && github.event.changes.title == null && github.event.changes.base == null) }}
-    needs: [gjc-state-gates-native]
+    # Inherit dispatch/body-edit filtering from the successful relevance job.
+    if: ${{ needs.gjc-state-gates-relevance.result == 'success' && needs.gjc-state-gates-relevance.outputs.relevant == 'true' }}
+    needs: [gjc-state-gates-relevance, gjc-state-gates-native]
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     strategy:
@@ -1031,6 +1052,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
         with:
@@ -1062,15 +1084,22 @@ jobs:
   gjc-state-gates:
     name: gjc-state-gates
     if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') && !(github.event_name == 'pull_request' && github.event.action == 'edited' && github.event.changes.body != null && github.event.changes.title == null && github.event.changes.base == null) }}
-    needs: [gjc-state-gates-matrix]
+    needs: [gjc-state-gates-relevance, gjc-state-gates-native, gjc-state-gates-matrix]
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     steps:
       - name: Aggregate GJC state gate shards
         run: |
-          result='${{ needs.gjc-state-gates-matrix.result }}'
-          echo "gjc-state-gates shard result: $result"
-          test "$result" = success
+          relevance_result='${{ needs.gjc-state-gates-relevance.result }}'
+          relevant='${{ needs.gjc-state-gates-relevance.outputs.relevant }}'
+          native='${{ needs.gjc-state-gates-native.result }}'
+          shards='${{ needs.gjc-state-gates-matrix.result }}'
+          test "$relevance_result" = success || exit 1
+          case "$relevant" in
+            true) test "$native" = success && test "$shards" = success ;;
+            false) test "$native" = skipped && test "$shards" = skipped ;;
+            *) echo "Missing or invalid GJC state gate relevance"; exit 1 ;;
+          esac
 
   # Stable pre-merge status: this runs for every PR after the protected affected
   # aggregate, then only materializes a virtual merge when the canonical planner

@@ -116,7 +116,7 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		// can be the first validation event for that head/base pair, so the guards
 		// must key on a body-only payload rather than on the action alone.
 		expect(workflow).not.toContain("github.event.action != 'edited'");
-		for (const root of ["affected-plan", "affected-evidence-producer", "affected", "gjc-state-gates", "gjc-state-gates-matrix"]) {
+		for (const root of ["affected-plan", "affected-evidence-producer", "affected", "gjc-state-gates", "gjc-state-gates-relevance"]) {
 			const start = workflow.indexOf(`\n  ${root}:\n`);
 			expect(start).toBeGreaterThan(0);
 			const guard = workflow.slice(start, workflow.indexOf("\n    runs-on:", start));
@@ -138,7 +138,7 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		// Roots need an explicit guard; the rest inherit it by depending on a
 		// skipped `affected-plan` (their conditions read its outputs) or on a
 		// skipped `affected` result.
-		for (const root of ["affected-plan", "affected-evidence-producer", "affected", "gjc-state-gates", "gjc-state-gates-matrix"]) {
+		for (const root of ["affected-plan", "affected-evidence-producer", "affected", "gjc-state-gates", "gjc-state-gates-relevance"]) {
 			const start = workflow.indexOf(`\n  ${root}:\n`);
 			expect(start).toBeGreaterThan(0);
 			const guard = workflow.slice(start, workflow.indexOf("\n    runs-on:", start));
@@ -670,6 +670,7 @@ describe("describeTasks matrix emission", () => {
 				"scripts/dev-ci-guard-topology.test.ts",
 				"scripts/ci-risk-canary-manifest.test.ts",
 				"scripts/ci-virtual-integration.test.ts",
+				"scripts/ci-gjc-state-gates.test.ts",
 			]);
 		}
 		const riskTasks = planTasks(["packages/coding-agent/src/session/session-manager.ts"], packages);
@@ -1559,6 +1560,7 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			"scripts/dev-ci-guard-topology.test.ts",
 			"scripts/ci-risk-canary-manifest.test.ts",
 			"scripts/ci-virtual-integration.test.ts",
+			"scripts/ci-gjc-state-gates.test.ts",
 		]);
 	});
 
