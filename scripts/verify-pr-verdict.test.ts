@@ -34,14 +34,16 @@ describe("authenticated approval API evidence", () => {
 		{ name: "stale-head approval", reviews: [review("APPROVED", "d".repeat(40))], permission: "write", approved: false },
 	])("$name", async scenario => {
 		const requests: string[] = [];
-		const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+		const originalFetch = globalThis.fetch;
+		const replacement: typeof fetch = Object.assign(async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
 			const endpoint = String(input);
 			requests.push(endpoint);
 			expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer test-token");
 			if (endpoint === "https://api.github.com/repos/owner/repo/pulls/5416/reviews?per_page=100&page=1") return Response.json(scenario.reviews);
 			if (endpoint === "https://api.github.com/repos/owner/repo/collaborators/review-agent/permission") return Response.json({ permission: scenario.permission });
 			throw new Error(`Unexpected endpoint: ${endpoint}`);
-		});
+		}, { preconnect: originalFetch.preconnect });
+		const spy = vi.spyOn(globalThis, "fetch").mockImplementation(replacement);
 		try {
 			const approval = await authenticatedApproval(event, "review-agent", head, "test-token");
 			expect(approval).toEqual(scenario.approved ? { login: "review-agent", headSha: head } : {});
@@ -54,12 +56,14 @@ describe("authenticated approval API evidence", () => {
 
 	test("unavailable and malformed review responses never provide authenticated approval", async () => {
 		for (const failure of ["network", "http", "invalid-json", "object", "null", "malformed-entry"]) {
-			const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+			const originalFetch = globalThis.fetch;
+			const replacement: typeof fetch = Object.assign(async () => {
 				if (failure === "network") throw new Error("Reviews network unavailable");
 				if (failure === "http") return new Response("unavailable", { status: 503 });
 				if (failure === "invalid-json") return new Response("{broken");
 				return Response.json(failure === "object" ? {} : failure === "null" ? null : [null]);
-			});
+			}, { preconnect: originalFetch.preconnect });
+			const spy = vi.spyOn(globalThis, "fetch").mockImplementation(replacement);
 			try {
 				if (failure === "http") expect(await authenticatedApproval(event, "review-agent", head, "test-token")).toEqual({});
 				else await expect(authenticatedApproval(event, "review-agent", head, "test-token")).rejects.toThrow();
