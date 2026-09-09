@@ -8,8 +8,9 @@ import type { WorkspacePackage } from "./ci-dev-affected";
 import { changedFiles, relevantStateGatePaths } from "./ci-gjc-state-gates";
 
 const packages: WorkspacePackage[] = [
-	{ name: "coding-agent", dir: "packages/coding-agent", manifest: { dependencies: { agent: "workspace:*" } } },
+	{ name: "coding-agent", dir: "packages/coding-agent", manifest: { dependencies: { agent: "workspace:*", ai: "workspace:*" } } },
 	{ name: "agent", dir: "packages/agent", manifest: { dependencies: { utils: "workspace:*" } } },
+	{ name: "ai", dir: "packages/ai", manifest: {} },
 	{ name: "utils", dir: "packages/utils", manifest: {} },
 	{ name: "unrelated", dir: "packages/unrelated", manifest: {} },
 ];
@@ -54,6 +55,8 @@ describe("GJC state gate relevance", () => {
 	test.each([
 		"packages/coding-agent/src/gjc-runtime/state-runtime.ts",
 		"packages/coding-agent/src/defaults/gjc/skills/ultragoal/SKILL.md",
+		"packages/agent/src/compaction/prompts/compaction-summary-context.md",
+		"packages/ai/src/prompts/turn-aborted-guidance.md",
 		"packages/agent/src/index.ts",
 		"packages/utils/src/index.ts",
 		"packages/agent/package.json",

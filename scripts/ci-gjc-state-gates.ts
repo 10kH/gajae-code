@@ -5,6 +5,12 @@ import * as fs from "node:fs/promises";
 import { expandWithDependents, getWorkspacePackages, isDocOrChangelogPath, isFullWorkspacePath, isRustPath, type WorkspacePackage } from "./ci-dev-affected";
 
 const repoRoot = path.join(import.meta.dir, "..");
+const runtimeMarkdownPrefixes = [
+	"packages/coding-agent/src/",
+	"packages/agent/src/",
+	"packages/ai/src/",
+] as const;
+
 // Used by both the lightweight relevance job and local/sharded gate execution.
 export function relevantStateGatePaths(files: readonly string[] | null, packages: readonly WorkspacePackage[]): string[] {
 	if (files === null) throw new Error("gjc-state-gates: changed paths are unresolved");
@@ -25,8 +31,8 @@ export function relevantStateGatePaths(files: readonly string[] | null, packages
 		if (!file || path.posix.isAbsolute(file) || file.split("/").includes("..")) {
 			throw new Error("gjc-state-gates: invalid changed path");
 		}
-		// Bundled prompts and skill definitions are runtime inputs, not docs.
-		if (isDocOrChangelogPath(file) && !file.startsWith("packages/coding-agent/src/")) return false;
+		// Markdown under runtime package source is bundled input, not documentation-only.
+		if (isDocOrChangelogPath(file) && !runtimeMarkdownPrefixes.some(prefix => file.startsWith(prefix))) return false;
 		if (isFullWorkspacePath(file) || isRustPath(file)) return true;
 		const touched = packages.filter(pkg => file === pkg.dir || file.startsWith(`${pkg.dir}/`));
 		// Unknown paths include lockfiles, CI harnesses and deleted packages. They
