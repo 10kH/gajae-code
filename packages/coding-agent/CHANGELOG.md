@@ -31,6 +31,8 @@
 - `gjc update` now distinguishes same-version package-manager migration from a version update and installed binaries from shell activation (#5432). Fresh and already-verified standalone targets share explicit launch and command-resolution guidance, including Bash `hash -r` / zsh `rehash` before conditional PATH advice; verified targets are reused without another binary download and Bun/npm shims remain untouched.
 - MCP OAuth discovery parses failed connection error text in linear time. The challenge-parameter scan no longer retries long identifier runs at every offset, malformed JSON framing uses bounded first/last-brace slicing, and the redundant greedy `realm`/`token_url` fallback is removed. Oversized keys remain ignored as whole runs, so their suffixes cannot be reinterpreted as OAuth parameters.
 
+- The default bash interceptor no longer rejects commands that never redirect to a file. Its `write` rule scanned the whole command string, so a redirection after `;`, `&&`, or `||` was attributed to a leading `echo`/`printf` and `2>/dev/null` was counted as a file write: `echo x; date 2>/dev/null` was blocked with "use the `write` tool" while the same two commands in the opposite order ran. A redirection must now belong to the leading command, fd redirections such as `2>/dev/null` are no longer treated as writes, and the heredoc spelling the rule exists for (`cat <<EOF > out.txt`, with no space after `<<`) is now detected instead of silently skipped.
+
 ## [0.16.6] - 2026-09-07
 ### Fixed
 
