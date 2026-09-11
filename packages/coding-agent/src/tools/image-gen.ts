@@ -80,6 +80,14 @@ export function redactImageProviderText(value: unknown, activeApiKey?: string): 
 		// listing `ghp`/`gho`/`github_pat` there never matched one. Short tokens
 		// then fell through the 40-character catch-all below entirely.
 		.replace(/\b(?:gh[opsur]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{12,})\b/g, REDACTED_PROVIDER_SECRET)
+		// The shapes `crash/upstream/envelope.ts` classifies as credential-like.
+		// A GitLab PAT and a Hugging Face token are both shorter than the 40-character
+		// catch-all below, and Stripe separates with `_` so the `sk|rk|pk`-hyphen rule
+		// above never matched one.
+		.replace(
+			/\b(?:npm_[A-Za-z0-9]{20,}|glpat-[A-Za-z0-9_-]{20,}|(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}|hf_[A-Za-z0-9]{20,})\b/g,
+			REDACTED_PROVIDER_SECRET,
+		)
 		// AWS access-key ids are 20 characters, so the catch-all never reached them.
 		.replace(/\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b/g, REDACTED_PROVIDER_SECRET)
 		// A Google API key is exactly 39 characters — one short of the catch-all.
