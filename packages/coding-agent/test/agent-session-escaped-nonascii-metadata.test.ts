@@ -97,7 +97,7 @@ describe("AgentSession escaped non-ASCII metadata fidelity", () => {
 		const agent = new Agent({
 			initialState: { model: mock.model, systemPrompt: ["test"], tools: [askTool()], messages: [] },
 			convertToLlm: identityConverter,
-			streamFn: mock.stream,
+			streamFn: terminalOnlyStream(mock.stream),
 		});
 		session = new AgentSession({
 			agent,
