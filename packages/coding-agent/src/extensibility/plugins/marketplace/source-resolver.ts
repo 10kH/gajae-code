@@ -113,13 +113,13 @@ async function resolveObjectSource(
 			// { source: "url", url: "https://github.com/owner/repo.git" }
 			// Despite the name, this is typically a git clone URL
 			const targetDir = path.join(context.tmpDir, `plugin-${crypto.randomUUID()}`);
-			await git.clone(source.url, targetDir, { ref: source.ref, sha: source.sha });
+			await git.clone(assertCloneUrl(source.url), targetDir, { ref: source.ref, sha: source.sha });
 			return { dir: targetDir, tempCloneRoot: targetDir };
 		}
 
 		case "github": {
 			// { source: "github", repo: "owner/repo" }
-			const url = `https://github.com/${source.repo}.git`;
+			const url = `https://github.com/${assertRepoSlug(source.repo)}.git`;
 			const targetDir = path.join(context.tmpDir, `plugin-${crypto.randomUUID()}`);
 			await git.clone(url, targetDir, { ref: source.ref, sha: source.sha });
 			return { dir: targetDir, tempCloneRoot: targetDir };
@@ -129,8 +129,9 @@ async function resolveObjectSource(
 			// { source: "git-subdir", url: "owner/repo" | "https://...", path: "plugins/foo" }
 			const url =
 				source.url.includes("://") || source.url.startsWith("git@")
-					? source.url
-					: `https://github.com/${source.url}.git`;
+					? assertCloneUrl(source.url)
+					: `https://github.com/${assertRepoSlug(source.url)}.git`;
+			assertSubdirPath(source.path);
 			const cloneDir = path.join(context.tmpDir, `plugin-repo-${crypto.randomUUID()}`);
 			await git.clone(url, cloneDir, { ref: source.ref, sha: source.sha });
 
@@ -159,6 +160,53 @@ async function resolveObjectSource(
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
+
+/** Network transports a plugin source may be fetched over. */
+const CLONE_URL_SCHEME = /^(?:https|http|git|ssh|file):\/\//;
+/** scp-like `user@host:path`, which git accepts without a scheme. */
+const SCP_LIKE_URL = /^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:/;
+/** `git-remote-<helper>` dispatch (`ext::sh -c ...`), i.e. arbitrary command execution. */
+const REMOTE_HELPER_URL = /^[A-Za-z0-9][A-Za-z0-9+.-]*::/;
+/** `owner/repo` as GitHub itself accepts it; no options, no path traversal, no separators. */
+const REPO_SLUG = /^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+/**
+ * A catalog is untrusted input, and its URL goes straight to `git clone`.
+ *
+ * Two shapes are dangerous on their own: a value starting with `-`, which git
+ * reads as an option (`--upload-pack=<cmd>` is command execution), and a
+ * remote-helper URL such as `ext::sh -c ...`, which git dispatches to
+ * `git-remote-ext` and which executes its argument by design. `git.clone` also
+ * passes `--` before the URL, but that only closes the first hole and only for
+ * callers that go through it, so both are refused here where the failure can
+ * name the offending catalog entry.
+ *
+ * Local absolute paths stay allowed: a privately hosted marketplace pointing at
+ * an on-disk repository is a supported layout.
+ */
+function assertCloneUrl(url: string): string {
+	const supported =
+		!url.startsWith("-") &&
+		!REMOTE_HELPER_URL.test(url) &&
+		(CLONE_URL_SCHEME.test(url) || SCP_LIKE_URL.test(url) || path.isAbsolute(url));
+	if (!supported)
+		throw new Error(
+			`Plugin source URL must be an https/http/git/ssh/file URL, a user@host:path remote, or an absolute local path — got: "${url}"`,
+		);
+	return url;
+}
+
+function assertRepoSlug(repo: string): string {
+	if (!REPO_SLUG.test(repo)) throw new Error(`Plugin source repository must be "owner/repo" — got: "${repo}"`);
+	return repo;
+}
+
+/** The subdir is joined into a clone path, so it must be a plain relative path. */
+function assertSubdirPath(subdir: string): string {
+	if (subdir.startsWith("-") || path.isAbsolute(subdir) || path.win32.isAbsolute(subdir))
+		throw new Error(`git-subdir path must be a relative path — got: "${subdir}"`);
+	return subdir;
+}
 
 /**
  * Decide containment on canonical paths, and fail closed when they cannot be

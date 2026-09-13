@@ -139,6 +139,58 @@ describe("resolvePluginSource", () => {
 		expect(resolved.dir).toBe(path.resolve(marketplace, "plugins/linked"));
 	});
 
+	describe("hostile catalog-controlled git arguments", () => {
+		// Every case below must be refused before git is invoked; a resolution that
+		// reached git.clone would report a clone/network failure instead.
+		it.each([
+			["option-looking url", "--upload-pack=touch /tmp/pwned"],
+			["short option url", "-u"],
+			["config-injecting url", "--config=core.sshCommand=touch"],
+			["ext remote helper", "ext::sh -c touch% /tmp/pwned"],
+			["transport helper", "transport::whatever"],
+			["bare relative path", "../../etc"],
+			["empty", ""],
+		])("rejects a url source with a %s", async (_label, url) => {
+			const entry = makeEntry({ source: "url", url });
+			await expect(resolvePluginSource(entry, { tmpDir })).rejects.toThrow(/Plugin source URL must be/);
+		});
+
+		it.each([
+			["option-looking repo", "--upload-pack=touch"],
+			["traversal repo", "../../etc/passwd"],
+			["repo with a space", "owner/repo extra"],
+			["repo without an owner", "repo"],
+		])("rejects a github source with a %s", async (_label, repo) => {
+			const entry = makeEntry({ source: "github", repo });
+			await expect(resolvePluginSource(entry, { tmpDir })).rejects.toThrow(/must be "owner\/repo"/);
+		});
+
+		it("rejects a git-subdir shorthand url that looks like an option", async () => {
+			const entry = makeEntry({ source: "git-subdir", url: "--upload-pack=touch", path: "plugins/foo" });
+			await expect(resolvePluginSource(entry, { tmpDir })).rejects.toThrow(/must be "owner\/repo"/);
+		});
+
+		it("rejects a git-subdir explicit url with an unsupported scheme", async () => {
+			const entry = makeEntry({ source: "git-subdir", url: "ftp://evil.example/repo.git", path: "plugins/foo" });
+			await expect(resolvePluginSource(entry, { tmpDir })).rejects.toThrow(/Plugin source URL must be/);
+		});
+
+		it("rejects a git-subdir remote-helper url that carries no scheme separator", async () => {
+			// "ext::sh -c ..." has no "://", so it takes the owner/repo shorthand branch
+			// and must be refused there rather than being pasted into a GitHub URL.
+			const entry = makeEntry({ source: "git-subdir", url: "ext::sh -c touch% /tmp/pwned", path: "plugins/foo" });
+			await expect(resolvePluginSource(entry, { tmpDir })).rejects.toThrow(/must be "owner\/repo"/);
+		});
+
+		it.each([
+			["option-looking subdir", "--output=/tmp/pwned"],
+			["absolute subdir", "/etc"],
+		])("rejects a git-subdir source with an %s before cloning", async (_label, subdir) => {
+			const entry = makeEntry({ source: "git-subdir", url: "owner/repo", path: subdir });
+			await expect(resolvePluginSource(entry, { tmpDir })).rejects.toThrow(/must be a relative path/);
+		});
+	});
+
 	it("throws when resolved directory does not exist", async () => {
 		const entry = makeEntry("./plugins/nonexistent-plugin");
 		await expect(resolvePluginSource(entry, { marketplaceClonePath: FIXTURE_DIR, tmpDir })).rejects.toThrow(
