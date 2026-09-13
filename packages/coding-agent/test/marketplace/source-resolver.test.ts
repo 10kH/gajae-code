@@ -81,6 +81,64 @@ describe("resolvePluginSource", () => {
 		);
 	});
 
+	it("rejects a relative source whose directory is a symlink out of the marketplace root", async () => {
+		// A catalog controls the tree it ships; a lexical containment check passes for
+		// "./plugins/escaped" while the kernel resolves it to an unrelated directory.
+		const marketplace = path.join(tmpDir, "marketplace");
+		const outside = path.join(tmpDir, "outside", "secret-plugin");
+		fs.mkdirSync(path.join(marketplace, "plugins"), { recursive: true });
+		fs.mkdirSync(outside, { recursive: true });
+		fs.symlinkSync(outside, path.join(marketplace, "plugins", "escaped"), "dir");
+
+		const entry = makeEntry("./plugins/escaped");
+		await expect(resolvePluginSource(entry, { marketplaceClonePath: marketplace, tmpDir })).rejects.toThrow(
+			/outside marketplace root/,
+		);
+	});
+
+	it("rejects a symlinked source reached through catalogMetadata.pluginRoot", async () => {
+		const marketplace = path.join(tmpDir, "marketplace-root");
+		const outside = path.join(tmpDir, "outside-root", "secret-plugin");
+		fs.mkdirSync(path.join(marketplace, "plugins"), { recursive: true });
+		fs.mkdirSync(outside, { recursive: true });
+		fs.symlinkSync(outside, path.join(marketplace, "plugins", "escaped"), "dir");
+
+		const entry = makeEntry("./escaped");
+		await expect(
+			resolvePluginSource(entry, {
+				marketplaceClonePath: marketplace,
+				catalogMetadata: { pluginRoot: "plugins" },
+				tmpDir,
+			}),
+		).rejects.toThrow(/outside marketplace root/);
+	});
+
+	it("rejects a symlink that escapes the root but cannot be canonicalized at check time", async () => {
+		// TOCTOU-shaped case: the link target does not exist when containment is
+		// decided, so realpath fails and a lexical fallback would admit the path.
+		// The target can be materialized before the directory probe follows the link.
+		const marketplace = path.join(tmpDir, "marketplace-dangling");
+		const outside = path.join(tmpDir, "outside-dangling", "secret-plugin");
+		fs.mkdirSync(path.join(marketplace, "plugins"), { recursive: true });
+		fs.symlinkSync(outside, path.join(marketplace, "plugins", "escaped"), "dir");
+
+		const entry = makeEntry("./plugins/escaped");
+		await expect(resolvePluginSource(entry, { marketplaceClonePath: marketplace, tmpDir })).rejects.toThrow(
+			/outside marketplace root/,
+		);
+	});
+
+	it("accepts a symlink that stays inside the marketplace root", async () => {
+		const marketplace = path.join(tmpDir, "marketplace-inner");
+		fs.mkdirSync(path.join(marketplace, "real", "hello-plugin"), { recursive: true });
+		fs.mkdirSync(path.join(marketplace, "plugins"), { recursive: true });
+		fs.symlinkSync(path.join(marketplace, "real", "hello-plugin"), path.join(marketplace, "plugins", "linked"), "dir");
+
+		const entry = makeEntry("./plugins/linked");
+		const resolved = await resolvePluginSource(entry, { marketplaceClonePath: marketplace, tmpDir });
+		expect(resolved.dir).toBe(path.resolve(marketplace, "plugins/linked"));
+	});
+
 	it("throws when resolved directory does not exist", async () => {
 		const entry = makeEntry("./plugins/nonexistent-plugin");
 		await expect(resolvePluginSource(entry, { marketplaceClonePath: FIXTURE_DIR, tmpDir })).rejects.toThrow(

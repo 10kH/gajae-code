@@ -93,12 +93,10 @@ async function resolveRelativeSource(
 
 	// Resolve against marketplace root (not the .Anthropic model-plugin/ catalog subdirectory)
 	const resolved = path.resolve(context.marketplaceClonePath, relativePath);
+	const outsideRoot = `Plugin source "${source}" resolves outside marketplace root ("${context.marketplaceClonePath}")`;
 
-	if (!pathIsWithin(context.marketplaceClonePath, resolved)) {
-		throw new Error(
-			`Plugin source "${source}" resolves outside marketplace root ("${context.marketplaceClonePath}")`,
-		);
-	}
+	if (!pathIsWithin(context.marketplaceClonePath, resolved)) throw new Error(outsideRoot);
+	await assertCanonicalContainment(context.marketplaceClonePath, resolved, outsideRoot);
 
 	await verifyDirExists(resolved, `Plugin source directory does not exist: "${resolved}"`);
 	return { dir: resolved };
@@ -137,11 +135,13 @@ async function resolveObjectSource(
 			await git.clone(url, cloneDir, { ref: source.ref, sha: source.sha });
 
 			const subdirPath = path.resolve(cloneDir, source.path);
+			const escapes = `git-subdir path "${source.path}" escapes the cloned repository`;
 			if (!pathIsWithin(cloneDir, subdirPath)) {
 				await fs.rm(cloneDir, { recursive: true, force: true });
-				throw new Error(`git-subdir path "${source.path}" escapes the cloned repository`);
+				throw new Error(escapes);
 			}
 			try {
+				await assertCanonicalContainment(cloneDir, subdirPath, escapes);
 				await verifyDirExists(subdirPath, `git-subdir path "${source.path}" does not exist in cloned repository`);
 			} catch (err) {
 				await fs.rm(cloneDir, { recursive: true, force: true });
@@ -159,6 +159,36 @@ async function resolveObjectSource(
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
+
+/**
+ * Decide containment on canonical paths, and fail closed when they cannot be
+ * derived.
+ *
+ * A catalog is untrusted input and controls the tree it ships, so the plugin
+ * directory it names can be a symlink pointing out of the marketplace root.
+ * `pathIsWithin` does resolve symlinks, but it silently degrades to a lexical
+ * comparison whenever `realpath` fails — a dangling or looping link therefore
+ * passes the containment gate and is only rejected later (or not at all) by the
+ * existence probe, which follows symlinks itself. Here both sides must
+ * canonicalize successfully. A candidate that exists as a directory entry but
+ * cannot be canonicalized (dangling or looping link) is classified as an
+ * untrusted source; a path that is simply absent is left to the existence probe
+ * so a missing plugin still reports as missing.
+ */
+async function assertCanonicalContainment(root: string, candidate: string, errorMessage: string): Promise<void> {
+	const canonicalRoot = await fs.realpath(root).catch(() => undefined);
+	if (canonicalRoot === undefined) throw new Error(errorMessage);
+	const canonicalCandidate = await fs.realpath(candidate).catch(() => undefined);
+	if (canonicalCandidate === undefined) {
+		const entryExists = await fs
+			.lstat(candidate)
+			.then(() => true)
+			.catch(() => false);
+		if (entryExists) throw new Error(errorMessage);
+		return;
+	}
+	if (!pathIsWithin(canonicalRoot, canonicalCandidate)) throw new Error(errorMessage);
+}
 
 async function verifyDirExists(dirPath: string, errorMessage: string): Promise<void> {
 	try {
