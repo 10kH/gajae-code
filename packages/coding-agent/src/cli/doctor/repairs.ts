@@ -12,7 +12,7 @@ import {
 } from "../../extensibility/plugins/marketplace/manager";
 import { restartBrokerForDoctor } from "../../sdk/broker/doctor-restart";
 import { restartDaemonForDoctor } from "../../sdk/bus/doctor-daemon-restart-client";
-import type { DoctorAction, DoctorConfirmationResult } from "./args";
+import { type DoctorAction, type DoctorConfirmationResult, isDoctorAction } from "./args";
 import type { DoctorConfigRepairRequest, DoctorConfigRepairResult } from "./config-repairs";
 import type { DoctorContext, DoctorPluginTarget } from "./context";
 import { repairStandaloneBinary } from "./install-repairs";
@@ -59,6 +59,35 @@ function risksForAction(action: DoctorAction): DoctorRiskClass[] {
 	}
 }
 
+/**
+ * Actions whose apply path is fenced by the crash-recovery journal.
+ *
+ * The journal's durability primitives (`O_NOFOLLOW`/`flock`-class locking plus
+ * fsync of the file and its directory) exist only in the Rust `#[cfg(unix)]`
+ * branch; `DoctorJournalAuthority::createExact` answers `unsupported_platform`
+ * everywhere else. Without the journal there is no record that survives a crash
+ * mid-apply, so these repairs are refused up front on Windows rather than
+ * failing after the operator has already authorized a risk class. Diagnosis and
+ * `--dry-run` are unaffected — they never open a journal.
+ *
+ * `install.restore-binary`, `plugin.restore-known-artifact`, and
+ * `service.restart-owned` are deliberately absent: they are fenced by their own
+ * activation/ownership protocols, not by the journal.
+ */
+const JOURNAL_BACKED_ACTIONS = new Set<DoctorAction>([
+	"config.set-validated",
+	"mcp.set-startup-policy",
+	"permissions.restrict-owned-config",
+	"install.repair-managed-link",
+	"plugin.quarantine-selected",
+	"service.detach-owned-stale-artifact",
+]);
+
+/** Whether this host can run the journal-fenced repair lanes at all. */
+export function journalRepairSupported(action: DoctorAction, platform: NodeJS.Platform = process.platform): boolean {
+	return platform !== "win32" || !JOURNAL_BACKED_ACTIONS.has(action);
+}
+
 /** Plan data is descriptive only; no domain module, lock, journal, or candidate is materialized here. */
 export function planSelectedDoctorRepair(
 	context: DoctorContext,
@@ -69,6 +98,25 @@ export function planSelectedDoctorRepair(
 	const riskClasses = [...risksForAction(action)];
 	const readiness: ReadinessFactCode[] = ["identity_recheck_required"];
 	let reasonCode: string | undefined;
+	if (!journalRepairSupported(action)) {
+		return {
+			id: action,
+			targetId,
+			riskClasses,
+			authorization: [...context.options.allowRisks],
+			readiness: ["unsupported"],
+			candidates: [],
+			preconditions: ["journal-backed crash recovery"],
+			state: "blocked",
+			reasonCode: "unsupported_platform",
+			sideEffectStarted: false,
+			beforeCheckIds: before.filter(check => check.targetId === targetId).map(check => check.id),
+			afterCheckIds: [],
+			restartRequired: false,
+			restartScope: "none",
+			nonrollbackableEffects: [],
+		};
+	}
 	if (
 		action === "config.set-validated" ||
 		action === "mcp.set-startup-policy" ||
@@ -413,6 +461,16 @@ export async function executeSelectedDoctorRepair(
 			...(plan.reasonCode === "unknown_target" || plan.reasonCode === "action_target_mismatch"
 				? { invocationError: plan.reasonCode }
 				: {}),
+		};
+	if (isDoctorAction(plan.id) && !journalRepairSupported(plan.id))
+		return {
+			repair: {
+				...plan,
+				state: "blocked",
+				reasonCode: "unsupported_platform",
+				readiness: ["unsupported"],
+				sideEffectStarted: false,
+			},
 		};
 	if (context.options.signal?.aborted) return { repair: { ...plan, state: "blocked", reasonCode: "cancelled" } };
 	if (performance.now() >= context.deadline)
