@@ -195,6 +195,56 @@ function isPlausibleDoctorReport(value: unknown): value is DoctorReport {
 	);
 }
 
+/**
+ * Write side of the parent→worker protocol.
+ *
+ * The channel is a one-way latch: once the worker has settled (exit, close, or
+ * a pipe error) no further byte is written to its stdin. A confirmation prompt
+ * can resolve arbitrarily late — after the deadline fired, after SIGINT, after
+ * the worker crashed — and its callback would otherwise write to a closed pipe,
+ * surfacing as an EPIPE / ERR_STREAM_DESTROYED that crashes the parent. The
+ * latch check and the write happen in one synchronous step, so no stream event
+ * can interleave between them, and any residual race is contained: it becomes a
+ * worker-failure outcome instead of an exception.
+ */
+export interface SupervisorChannel {
+	readonly settled: boolean;
+	/** Latch the channel closed without reporting a failure (normal termination). */
+	settle(): void;
+	send(message: SupervisorToWorkerMessage): void;
+}
+
+export function createSupervisorChannel(stdin: Writable, onChannelClosed: () => void): SupervisorChannel {
+	let settled = false;
+	const fail = (): void => {
+		settled = true;
+		onChannelClosed();
+	};
+	// An asynchronous pipe teardown arrives as a stream `error` event, not as a
+	// throw from `write`; without this listener the stream emits an unhandled
+	// 'error' and terminates the parent process.
+	stdin.on("error", fail);
+	return {
+		get settled() {
+			return settled;
+		},
+		settle() {
+			settled = true;
+		},
+		send(message) {
+			if (settled || stdin.destroyed || !stdin.writable) {
+				fail();
+				return;
+			}
+			try {
+				stdin.write(`${JSON.stringify(message)}\n`);
+			} catch {
+				fail();
+			}
+		},
+	};
+}
+
 function synthesizedReport(input: {
 	readonly options: DoctorOptions;
 	readonly runId: string;
@@ -299,9 +349,26 @@ export async function runSupervisedDoctor(input: SupervisedDoctorInput): Promise
 	// never cleared afterward regardless of any later cancel/timeout/signal.
 	let admitted = false;
 	let childExited = false;
+	let settled = false;
+	let finalReport: DoctorReport | undefined;
+	let abnormalReasonCode: string | undefined;
+	const outcome = Promise.withResolvers<void>();
+
+	const finishOnce = (report: DoctorReport | undefined, reasonCode: string | undefined): void => {
+		if (settled) return;
+		settled = true;
+		finalReport = report;
+		abnormalReasonCode = reasonCode;
+		outcome.resolve();
+	};
+
+	const channel = createSupervisorChannel(child.stdin, () => finishOnce(undefined, "worker_channel_closed"));
+	const send = channel.send;
+
 	const exitEvent = Promise.withResolvers<void>();
 	child.once("exit", () => {
 		childExited = true;
+		channel.settle();
 		exitEvent.resolve();
 	});
 	const waitForExit = async (milliseconds: number): Promise<boolean> => {
@@ -313,22 +380,6 @@ export async function runSupervisedDoctor(input: SupervisedDoctorInput): Promise
 		} finally {
 			clearTimeout(timer);
 		}
-	};
-	let settled = false;
-	let finalReport: DoctorReport | undefined;
-	let abnormalReasonCode: string | undefined;
-	const outcome = Promise.withResolvers<void>();
-
-	const send = (message: SupervisorToWorkerMessage): void => {
-		if (child.stdin.writable) child.stdin.write(`${JSON.stringify(message)}\n`);
-	};
-
-	const finishOnce = (report: DoctorReport | undefined, reasonCode: string | undefined): void => {
-		if (settled) return;
-		settled = true;
-		finalReport = report;
-		abnormalReasonCode = reasonCode;
-		outcome.resolve();
 	};
 
 	const sigintController = new AbortController();
@@ -408,6 +459,7 @@ export async function runSupervisedDoctor(input: SupervisedDoctorInput): Promise
 	// line reader above BEFORE this fallback can fire (matches the bash-shell
 	// supervisor's own close-vs-exit ordering rationale).
 	child.once("close", () => {
+		channel.settle();
 		finishOnce(undefined, "worker_exited_without_report");
 	});
 	child.once("error", () => {
