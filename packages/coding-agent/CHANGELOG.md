@@ -3,6 +3,9 @@
 ## [Unreleased]
 ### Changed
 
+## [0.16.7] - 2026-09-13
+### Fixed
+
 - Interactive launches no longer wait for conventional MCP servers to handshake before the TUI paints. With `--mcp-config` or `.gjc/mcp.json` autoload servers configured, session creation returns immediately, the deferred starter connects after first paint (status: "Connecting MCP tools…"), and a startup turn barrier keeps the first prompt from racing tool registration. Sessions with plugin-bundle MCP servers still connect eagerly, because plugin connect evidence feeds the GJC runtime snapshot published during creation and a late failure would present a partial pass as a clear one. Persisted conventional MCP tool selections are preserved while the deferred catalog is pending, and a failed deferred connect releases the startup turn barrier instead of leaving the session unusable. ACP, print, and SDK sessions are unchanged.
 - The embedded changelog is parsed once per process instead of on every lookup. Startup and each `/changelog` invocation re-split and re-scanned the full 710 KB embedded text; the text is immutable, so the first parse is now reused.
 - The macOS file-descriptor preflight reads the inherited soft limit with a plain `sh -c` instead of a login shell, so launching no longer sources the user's shell profile on every start. The inherited limit is also the value the warning actually describes — a login-shell value could disagree with what the process is really running under.
