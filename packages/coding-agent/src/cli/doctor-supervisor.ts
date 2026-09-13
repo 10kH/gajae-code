@@ -41,7 +41,7 @@ import { fileURLToPath } from "node:url";
 import { VERSION } from "@gajae-code/utils/dirs";
 import type { DoctorAction, DoctorConfirmationResult, DoctorOptions } from "./doctor/args";
 import { DOCTOR_EXIT_CODES, finalizeReport } from "./doctor/report";
-import type { DoctorRepair, DoctorReport } from "./doctor/types";
+import type { DoctorMode, DoctorRepair, DoctorReport } from "./doctor/types";
 
 /** Re-entrant argv marker for the isolated doctor worker. Wiring into `cli.ts`'s admission chain is a coordinated follow-up. */
 export const DOCTOR_WORKER_ARG = "--internal-doctor-worker";
@@ -179,20 +179,52 @@ function tokenMatches(received: string, expected: string): boolean {
 	return receivedBuffer.length === expectedBuffer.length && timingSafeEqual(receivedBuffer, expectedBuffer);
 }
 
+/**
+ * Structural gate for everything the supervisor dereferences afterwards. The
+ * `selection` envelope is validated here rather than at the use site because
+ * the readline handler reads `selection.repair`/`selection.targetId` directly:
+ * a worker that emits a report without a well-formed selection must be
+ * classified `worker_report_invalid`, never throw inside the `line` listener
+ * (which would escape the protocol and take the parent down).
+ */
 function isPlausibleDoctorReport(value: unknown): value is DoctorReport {
 	if (!value || typeof value !== "object") return false;
 	const report = value as Partial<DoctorReport>;
 	const summary = report.summary as { exitCode?: unknown } | undefined;
+	const selection = report.selection as { checks?: unknown; repair?: unknown; targetId?: unknown } | undefined;
 	return (
 		report.schemaVersion === 1 &&
 		report.command === "doctor" &&
 		typeof report.runId === "string" &&
+		typeof report.mode === "string" &&
 		typeof summary === "object" &&
 		summary !== null &&
 		typeof summary.exitCode === "number" &&
+		typeof selection === "object" &&
+		selection !== null &&
+		!Array.isArray(selection) &&
+		Array.isArray(selection.checks) &&
+		(selection.repair === undefined || typeof selection.repair === "string") &&
+		(selection.targetId === undefined || typeof selection.targetId === "string") &&
 		Array.isArray(report.checks) &&
 		Array.isArray(report.repairs)
 	);
+}
+
+/**
+ * Accept a worker `report` message only when it is both structurally complete
+ * and bound to this exact run. Returns the report on success so callers never
+ * re-narrow it, and `undefined` for every rejected shape — including a missing
+ * or malformed `selection`, which used to throw at the dereference.
+ */
+export function acceptWorkerReport(
+	value: unknown,
+	expected: { readonly runId: string; readonly mode: DoctorMode; readonly repair?: string; readonly targetId?: string },
+): DoctorReport | undefined {
+	if (!isPlausibleDoctorReport(value)) return undefined;
+	if (value.runId !== expected.runId || value.mode !== expected.mode) return undefined;
+	if (value.selection.repair !== expected.repair || value.selection.targetId !== expected.targetId) return undefined;
+	return value;
 }
 
 /**
@@ -425,17 +457,17 @@ export async function runSupervisedDoctor(input: SupervisedDoctorInput): Promise
 			return;
 		}
 		if (message.type === "report") {
-			if (
-				!isPlausibleDoctorReport(message.report) ||
-				message.report.runId !== runId ||
-				message.report.mode !== options.mode ||
-				message.report.selection.repair !== options.repair ||
-				message.report.selection.targetId !== options.targetId
-			) {
+			const accepted = acceptWorkerReport(message.report, {
+				runId,
+				mode: options.mode,
+				repair: options.repair,
+				targetId: options.targetId,
+			});
+			if (!accepted) {
 				finishOnce(undefined, "worker_report_invalid");
 				return;
 			}
-			finishOnce(message.report, undefined);
+			finishOnce(accepted, undefined);
 			return;
 		}
 		if (message.type === "error") {

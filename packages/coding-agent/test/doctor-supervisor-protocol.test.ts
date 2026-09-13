@@ -1,6 +1,28 @@
 import { describe, expect, test } from "bun:test";
 import { PassThrough, Writable } from "node:stream";
-import { createSupervisorChannel } from "../src/cli/doctor-supervisor";
+import { acceptWorkerReport, createSupervisorChannel } from "../src/cli/doctor-supervisor";
+import type { DoctorReport } from "../src/cli/doctor/types";
+
+const RUN_ID = "run-1";
+
+function workerReport(overrides: Record<string, unknown> = {}): unknown {
+	const report: DoctorReport = {
+		schemaVersion: 1,
+		command: "doctor",
+		runId: RUN_ID,
+		mode: "diagnose",
+		generatedAt: new Date(0).toISOString(),
+		durationMs: 1,
+		subject: { gjcVersion: "v", platform: "p", arch: "a", channel: "source", rootIds: [] },
+		selection: { checks: [] },
+		coverage: { requested: 0, expanded: 0, attempted: 0, completed: 0, blocked: 0, timedOut: 0, unsupported: 0 },
+		summary: { verdict: "healthy", exitCode: 0 },
+		checks: [],
+		repairs: [],
+		limits: {},
+	};
+	return { ...report, ...overrides };
+}
 
 const initMessage = {
 	type: "init",
@@ -12,6 +34,44 @@ const initMessage = {
 	timeoutMs: 1,
 	deadlineAt: 1,
 } as const;
+
+describe("supervisor worker-report acceptance", () => {
+	test("accepts a report bound to this run", () => {
+		expect(acceptWorkerReport(workerReport(), { runId: RUN_ID, mode: "diagnose" })).toBeDefined();
+	});
+
+	test.each([
+		["missing selection", { selection: undefined }],
+		["null selection", { selection: null }],
+		["array selection", { selection: [] }],
+		["string selection", { selection: "config.set-validated" }],
+		["selection without a checks array", { selection: { repair: "config.set-validated" } }],
+		["non-string repair", { selection: { checks: [], repair: 7 } }],
+		["non-string targetId", { selection: { checks: [], targetId: { id: 1 } } }],
+		["missing mode", { mode: undefined }],
+	])("rejects a malformed report (%s) instead of throwing", (_label, overrides) => {
+		let accepted: DoctorReport | undefined;
+		expect(() => {
+			accepted = acceptWorkerReport(workerReport(overrides), { runId: RUN_ID, mode: "diagnose" });
+		}).not.toThrow();
+		expect(accepted).toBeUndefined();
+	});
+
+	test("rejects a report whose selection does not match the requested repair", () => {
+		const report = workerReport({
+			mode: "fix",
+			selection: { checks: [], repair: "mcp.set-startup-policy", targetId: "t1" },
+		});
+		expect(
+			acceptWorkerReport(report, { runId: RUN_ID, mode: "fix", repair: "config.set-validated", targetId: "t1" }),
+		).toBeUndefined();
+	});
+
+	test("rejects a report from a foreign run id or mode", () => {
+		expect(acceptWorkerReport(workerReport(), { runId: "other", mode: "diagnose" })).toBeUndefined();
+		expect(acceptWorkerReport(workerReport(), { runId: RUN_ID, mode: "fix" })).toBeUndefined();
+	});
+});
 
 describe("supervisor protocol channel", () => {
 	test("writes protocol lines while the worker is live", () => {
