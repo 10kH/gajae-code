@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { PassThrough, Writable } from "node:stream";
-import { acceptWorkerReport, createSupervisorChannel } from "../src/cli/doctor-supervisor";
 import type { DoctorReport } from "../src/cli/doctor/types";
+import { acceptWorkerReport, createSupervisorChannel } from "../src/cli/doctor-supervisor";
 
 const RUN_ID = "run-1";
 

@@ -132,7 +132,11 @@ describe("resolvePluginSource", () => {
 		const marketplace = path.join(tmpDir, "marketplace-inner");
 		fs.mkdirSync(path.join(marketplace, "real", "hello-plugin"), { recursive: true });
 		fs.mkdirSync(path.join(marketplace, "plugins"), { recursive: true });
-		fs.symlinkSync(path.join(marketplace, "real", "hello-plugin"), path.join(marketplace, "plugins", "linked"), "dir");
+		fs.symlinkSync(
+			path.join(marketplace, "real", "hello-plugin"),
+			path.join(marketplace, "plugins", "linked"),
+			"dir",
+		);
 
 		const entry = makeEntry("./plugins/linked");
 		const resolved = await resolvePluginSource(entry, { marketplaceClonePath: marketplace, tmpDir });

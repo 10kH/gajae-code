@@ -219,7 +219,12 @@ function isPlausibleDoctorReport(value: unknown): value is DoctorReport {
  */
 export function acceptWorkerReport(
 	value: unknown,
-	expected: { readonly runId: string; readonly mode: DoctorMode; readonly repair?: string; readonly targetId?: string },
+	expected: {
+		readonly runId: string;
+		readonly mode: DoctorMode;
+		readonly repair?: string;
+		readonly targetId?: string;
+	},
 ): DoctorReport | undefined {
 	if (!isPlausibleDoctorReport(value)) return undefined;
 	if (value.runId !== expected.runId || value.mode !== expected.mode) return undefined;
