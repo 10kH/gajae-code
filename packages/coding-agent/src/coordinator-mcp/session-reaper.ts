@@ -22,6 +22,8 @@ export const DEFAULT_SESSION_IDLE_TTL_MS = 30 * 60_000; // 30 min idle → reap
 export const DEFAULT_SESSION_SWEEP_INTERVAL_MS = 5 * 60_000; // sweep every 5 min
 export const MIN_SESSION_IDLE_TTL_MS = 60_000; // never reap a <1min-idle session
 export const MIN_SESSION_SWEEP_INTERVAL_MS = 30_000;
+/** After this many consecutive reap failures the session is force-evicted from the index. */
+export const MAX_REAP_FAILURES = 3;
 
 /** Minimal projection of a coordinator session the reaper needs to decide. */
 export interface ReapableSession {
@@ -56,6 +58,13 @@ export function selectReapableSessions(
 export interface SessionReaperDeps {
 	listSessions: () => Promise<ReapableSession[]>;
 	reapSession: (sessionId: string) => Promise<void>;
+	/**
+	 * Force-evict a session from the coordinator index when it has exceeded the
+	 * consecutive-failure limit and cannot be reaped normally (e.g. endpoint_stale).
+	 * Called exactly once per session-id at the eviction boundary; the session must
+	 * not appear in future listSessions() results after this resolves.
+	 */
+	markSessionDead: (sessionId: string) => Promise<void>;
 	now: () => number;
 }
 
@@ -73,6 +82,8 @@ export function createSessionReaper(deps: SessionReaperDeps, policy: SessionReap
 	let timer: ReturnType<typeof setTimeout> | null = null;
 	let generation = 0;
 	let inProgress = false;
+	/** Consecutive reap-failure count per session-id. Cleared on success or eviction. */
+	const failureCounts = new Map<string, number>();
 
 	async function sweepOnce(): Promise<number> {
 		if (inProgress) return 0; // never overlap sweeps
@@ -84,12 +95,37 @@ export function createSessionReaper(deps: SessionReaperDeps, policy: SessionReap
 			for (const session of targets) {
 				try {
 					await deps.reapSession(session.sessionId);
+					// Success — clear any accumulated failure count.
+					failureCounts.delete(session.sessionId);
 					reaped += 1;
 				} catch (err) {
 					// One wedged session must not abort the rest of the sweep.
-					logger.warn(
-						`session-reaper: failed to reap ${session.sessionId}: ${err instanceof Error ? err.message : String(err)}`,
-					);
+					const msg = err instanceof Error ? err.message : String(err);
+					const prev = failureCounts.get(session.sessionId) ?? 0;
+					const count = prev + 1;
+					if (count < MAX_REAP_FAILURES) {
+						// First failure(s): log at warn and keep retrying next sweep.
+						logger.warn(
+							`session-reaper: failed to reap ${session.sessionId}: ${msg}`,
+						);
+						failureCounts.set(session.sessionId, count);
+					} else {
+						// Hit the limit — evict unconditionally and silence future attempts.
+						logger.warn(
+							`session-reaper: session ${session.sessionId} evicted after ${count} consecutive failures (${msg})`,
+						);
+						failureCounts.delete(session.sessionId);
+						try {
+							await deps.markSessionDead(session.sessionId);
+						} catch (evictErr) {
+							// Eviction failure is non-fatal; the session will be retried next
+							// sweep and the counter has been cleared, so it will get MAX_REAP_FAILURES
+							// fresh chances before the next eviction attempt.
+							logger.warn(
+								`session-reaper: markSessionDead failed for ${session.sessionId}: ${evictErr instanceof Error ? evictErr.message : String(evictErr)}`,
+							);
+						}
+					}
 				}
 			}
 			return reaped;

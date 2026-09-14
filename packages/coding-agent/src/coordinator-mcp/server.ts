@@ -6344,6 +6344,13 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				const result = await reapSession(sessionId, { reason: "idle_reaper" });
 				if (!result.ok) throw new Error(result.reason ?? "session_reap_failed");
 			},
+			markSessionDead: async (sessionId: string): Promise<void> => {
+				// Force-evict a session that cannot be reaped normally (e.g. endpoint_stale repeated
+				// MAX_REAP_FAILURES times). Remove its projection files so listSessions() will no
+				// longer return it. This is best-effort: we skip WAL/delivery cleanup because the
+				// session endpoint is already gone and there is no live broker to drain.
+				await removeReapedProjection(sessionId, [], []);
+			},
 			now: () => Date.now(),
 		},
 		{ idleTtlMs: config.sessionIdleTtlMs, sweepIntervalMs: config.sessionSweepIntervalMs },
