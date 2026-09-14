@@ -3092,14 +3092,16 @@ export class AcpAgent implements Agent {
 				return;
 			}
 			// Once the host acknowledges a client cancel, a trailing stopped terminal may
-			// still carry the normal `end_turn` reason (especially while a streamed model
-			// response is in flight). The client's cancellation is the authoritative cause
-			// for that terminal; preserve terminals that arrived before the acknowledgement.
+			// still carry the normal `end_turn` reason (the model finished its response as
+			// the cancel arrived mid-stream). The client's cancellation is the authoritative
+			// cause; remap only `end_turn` — deliberate host reasons (e.g. `refusal`,
+			// `max_tokens`) remain authoritative and must NOT be overridden. Preserve
+			// terminals that arrived before the cancel was acknowledged.
 			const settledOutcome =
 				record.cancelRequested &&
 				activePrompt.cancelAcknowledged &&
 				outcome.kind === "stopped" &&
-				outcome.reason !== "cancelled"
+				outcome.reason === "end_turn"
 					? { ...outcome, reason: "cancelled" as const, provenance: "client_cancel" as const }
 					: outcome;
 			activePrompt.terminal = { outcome: settledOutcome, correlation };
