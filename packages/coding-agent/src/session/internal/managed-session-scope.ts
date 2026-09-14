@@ -1000,29 +1000,61 @@ function assertOwnerOnlyApplied(pathname: string, kind: "directory" | "file"): v
 }
 
 /**
+ * Bound the mode-only self-heal walk so `session/new` latency stays independent
+ * of the on-disk size of a scope's `v2-<cwd>` tree. A heavily used scope holds
+ * every past session's transcripts plus resident-cache blobs, and an unbounded
+ * `lstat` walk on every prepare made `session/new` take ~16s on a 12 GB `~/.gjc`
+ * (#5565). This is a defense-in-depth mode self-heal, not the primary
+ * owner-only-on-write guarantee, so a budget mirrors the resident-cache GC
+ * (`blob-store.ts`): truncating detection only defers opportunistic drift repair
+ * to a later launch — it never lets a fresh managed write become group/other
+ * readable. Detection walks entries in `readdir` order (freshest writes land
+ * near the top on most filesystems), so the common drift source is still caught.
+ */
+export const OWNER_ONLY_SELF_HEAL_MAX_ENTRIES = 8192;
+export const OWNER_ONLY_SELF_HEAL_MAX_DURATION_MS = 500;
+
+interface OwnerOnlySelfHealBudget {
+	deadline: number;
+	remaining: number;
+}
+
+/**
  * Mode-only walk for managed-scope prepare self-heal.
  * Throws `mode_mismatch` when any non-symlink descendant has group/other bits.
  * Avoids snapshotManagedTree("") which races concurrent session writers (#3906).
+ *
+ * Returns `false` when the entry/time budget was exhausted before the walk
+ * finished: "no drift found" then means "none found within budget", not a proven
+ * owner-only tree. The caller treats a completed clean walk and a truncated walk
+ * identically for launch (neither blocks), but the distinction is logged.
  */
-function assertOwnerOnlyModesRecursive(directory: string): void {
+function assertOwnerOnlyModesRecursive(directory: string, budget?: OwnerOnlySelfHealBudget): boolean {
+	const active: OwnerOnlySelfHealBudget = budget ?? {
+		deadline: Date.now() + OWNER_ONLY_SELF_HEAL_MAX_DURATION_MS,
+		remaining: OWNER_ONLY_SELF_HEAL_MAX_ENTRIES,
+	};
 	let stat: fs.Stats;
 	try {
 		stat = fs.lstatSync(directory);
 	} catch {
-		return;
+		return true;
 	}
-	if (stat.isSymbolicLink()) return;
+	if (stat.isSymbolicLink()) return true;
 	if ((stat.mode & 0o077) !== 0) throw new Error("mode_mismatch");
-	if (!stat.isDirectory()) return;
+	if (!stat.isDirectory()) return true;
 	let entries: fs.Dirent[];
 	try {
 		entries = fs.readdirSync(directory, { withFileTypes: true });
 	} catch {
-		return;
+		return true;
 	}
 	for (const entry of entries) {
-		assertOwnerOnlyModesRecursive(path.join(directory, entry.name));
+		if (active.remaining <= 0 || Date.now() >= active.deadline) return false;
+		active.remaining -= 1;
+		if (!assertOwnerOnlyModesRecursive(path.join(directory, entry.name), active)) return false;
 	}
+	return true;
 }
 
 /**
@@ -1103,7 +1135,17 @@ export function prepareManagedSessionScopeForWriteSync(
 			// call snapshotManagedTree("") here: that reintroduces concurrent-writer
 			// identity_mismatch races (#3906) that break SessionManager.moveTo /move.
 			if (retainedAuthority) {
-				assertOwnerOnlyModesRecursive(scope.directoryPath);
+				const startedAt = Date.now();
+				const complete = assertOwnerOnlyModesRecursive(scope.directoryPath);
+				const elapsedMs = Date.now() - startedAt;
+				if (!complete || elapsedMs >= OWNER_ONLY_SELF_HEAL_MAX_DURATION_MS)
+					logger.debug("Managed scope owner-only self-heal walk was truncated by its budget", {
+						directory: scope.directoryPath,
+						elapsedMs,
+						complete,
+						maxDurationMs: OWNER_ONLY_SELF_HEAL_MAX_DURATION_MS,
+						maxEntries: OWNER_ONLY_SELF_HEAL_MAX_ENTRIES,
+					});
 			}
 			return next;
 		};
