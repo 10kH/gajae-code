@@ -17,20 +17,29 @@ const JOURNAL_FREE: DoctorAction[] = [
 ];
 
 describe("journal-backed repair platform gate", () => {
-	// The Rust journal authority only implements its durability primitives under
-	// #[cfg(unix)]; on win32 createExact answers unsupported_platform, so these
-	// lanes must be refused before any mutation rather than after authorization.
-	test.each(JOURNAL_BACKED)("%s is unsupported on win32", action => {
-		expect(journalRepairSupported(action, "win32")).toBe(false);
+	// The Rust journal authority only implements its durability primitives for
+	// Linux and macOS; createExact answers unsupported_platform on every other
+	// host, so these lanes must be refused before any mutation rather than after
+	// authorization.
+	test.each(JOURNAL_BACKED)("%s stays supported only on linux and darwin", action => {
+		expect(journalRepairSupported(action, "linux")).toBe(true);
+		expect(journalRepairSupported(action, "darwin")).toBe(true);
 	});
 
-	test.each(JOURNAL_BACKED)("%s stays supported on posix hosts", action => {
-		expect(journalRepairSupported(action, "darwin")).toBe(true);
-		expect(journalRepairSupported(action, "linux")).toBe(true);
+	// win32 and the other Unix platforms lack the native journal implementation,
+	// so a journal-backed repair must be refused up front on all of them.
+	test.each(JOURNAL_BACKED)("%s is unsupported off linux/darwin", action => {
+		expect(journalRepairSupported(action, "win32")).toBe(false);
+		expect(journalRepairSupported(action, "freebsd")).toBe(false);
+		expect(journalRepairSupported(action, "openbsd")).toBe(false);
 	});
 
 	test.each(JOURNAL_FREE)("%s is not gated: it is fenced by its own protocol", action => {
 		expect(journalRepairSupported(action, "win32")).toBe(true);
+		expect(journalRepairSupported(action, "freebsd")).toBe(true);
+		expect(journalRepairSupported(action, "openbsd")).toBe(true);
+		expect(journalRepairSupported(action, "linux")).toBe(true);
+		expect(journalRepairSupported(action, "darwin")).toBe(true);
 	});
 });
 

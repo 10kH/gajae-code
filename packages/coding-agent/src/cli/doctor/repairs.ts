@@ -63,12 +63,14 @@ function risksForAction(action: DoctorAction): DoctorRiskClass[] {
  * Actions whose apply path is fenced by the crash-recovery journal.
  *
  * The journal's durability primitives (`O_NOFOLLOW`/`flock`-class locking plus
- * fsync of the file and its directory) exist only in the Rust `#[cfg(unix)]`
- * branch; `DoctorJournalAuthority::createExact` answers `unsupported_platform`
- * everywhere else. Without the journal there is no record that survives a crash
- * mid-apply, so these repairs are refused up front on Windows rather than
- * failing after the operator has already authorized a risk class. Diagnosis and
- * `--dry-run` are unaffected — they never open a journal.
+ * fsync of the file and its directory) are only implemented and exercised for
+ * Linux and macOS; `DoctorJournalAuthority::createExact` answers
+ * `unsupported_platform` on every other host — Windows and the other Unix
+ * platforms (FreeBSD, OpenBSD, …) alike. Without the journal there is no record
+ * that survives a crash mid-apply, so these repairs are refused up front on
+ * unsupported hosts rather than failing after the operator has already
+ * authorized a risk class. Diagnosis and `--dry-run` are unaffected — they never
+ * open a journal.
  *
  * `install.restore-binary`, `plugin.restore-known-artifact`, and
  * `service.restart-owned` are deliberately absent: they are fenced by their own
@@ -83,9 +85,14 @@ const JOURNAL_BACKED_ACTIONS = new Set<DoctorAction>([
 	"service.detach-owned-stale-artifact",
 ]);
 
-/** Whether this host can run the journal-fenced repair lanes at all. */
+/**
+ * Whether this host can run the journal-fenced repair lanes at all. Only Linux
+ * and macOS carry the native journal implementation, so a journal-backed action
+ * is refused before planning/effect on every other platform.
+ */
 export function journalRepairSupported(action: DoctorAction, platform: NodeJS.Platform = process.platform): boolean {
-	return platform !== "win32" || !JOURNAL_BACKED_ACTIONS.has(action);
+	if (!JOURNAL_BACKED_ACTIONS.has(action)) return true;
+	return platform === "linux" || platform === "darwin";
 }
 
 /** A refusal describing only what was requested; no live target, lock, journal, or candidate is read. */
