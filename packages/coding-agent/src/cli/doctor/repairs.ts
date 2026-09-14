@@ -88,6 +88,62 @@ export function journalRepairSupported(action: DoctorAction, platform: NodeJS.Pl
 	return platform !== "win32" || !JOURNAL_BACKED_ACTIONS.has(action);
 }
 
+/** A refusal describing only what was requested; no live target, lock, journal, or candidate is read. */
+function refusedRepair(
+	context: DoctorContext,
+	before: readonly DoctorCheck[],
+	action: DoctorAction,
+	targetId: string,
+	reasonCode: string,
+	readiness: readonly ReadinessFactCode[],
+	preconditions: readonly string[],
+): DoctorRepair {
+	return {
+		id: action,
+		targetId,
+		riskClasses: risksForAction(action),
+		authorization: [...context.options.allowRisks],
+		readiness: [...readiness],
+		candidates: [],
+		preconditions: [...preconditions],
+		state: "blocked",
+		reasonCode,
+		sideEffectStarted: false,
+		beforeCheckIds: before.filter(check => check.targetId === targetId).map(check => check.id),
+		afterCheckIds: [],
+		restartRequired: false,
+		restartScope: "none",
+		nonrollbackableEffects: [],
+	};
+}
+
+/**
+ * Refuse the selected action because the diagnosis it would be planned against
+ * never settled.
+ *
+ * A collector that lost its timeout race is not stopped — it keeps running and
+ * keeps writing into the shared {@link DoctorContext}. Planning there would read
+ * a half-populated target map, so the action is refused before
+ * {@link planSelectedDoctorRepair} ever touches that state. Diagnosis output is
+ * unaffected: it still reports everything that was collected.
+ */
+export function refuseUnsettledDoctorRepair(
+	context: DoctorContext,
+	before: readonly DoctorCheck[],
+): DoctorRepair | undefined {
+	const { repair: action, targetId } = context.options;
+	if (!action || !targetId) return undefined;
+	return refusedRepair(
+		context,
+		before,
+		action,
+		targetId,
+		"incomplete_diagnostics",
+		["target_resolution_incomplete"],
+		["settled diagnosis for every selected collector"],
+	);
+}
+
 /** Plan data is descriptive only; no domain module, lock, journal, or candidate is materialized here. */
 export function planSelectedDoctorRepair(
 	context: DoctorContext,
@@ -98,25 +154,16 @@ export function planSelectedDoctorRepair(
 	const riskClasses = [...risksForAction(action)];
 	const readiness: ReadinessFactCode[] = ["identity_recheck_required"];
 	let reasonCode: string | undefined;
-	if (!journalRepairSupported(action)) {
-		return {
-			id: action,
+	if (!journalRepairSupported(action))
+		return refusedRepair(
+			context,
+			before,
+			action,
 			targetId,
-			riskClasses,
-			authorization: [...context.options.allowRisks],
-			readiness: ["unsupported"],
-			candidates: [],
-			preconditions: ["journal-backed crash recovery"],
-			state: "blocked",
-			reasonCode: "unsupported_platform",
-			sideEffectStarted: false,
-			beforeCheckIds: before.filter(check => check.targetId === targetId).map(check => check.id),
-			afterCheckIds: [],
-			restartRequired: false,
-			restartScope: "none",
-			nonrollbackableEffects: [],
-		};
-	}
+			"unsupported_platform",
+			["unsupported"],
+			["journal-backed crash recovery"],
+		);
 	if (
 		action === "config.set-validated" ||
 		action === "mcp.set-startup-policy" ||

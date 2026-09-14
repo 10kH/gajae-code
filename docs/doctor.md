@@ -158,6 +158,13 @@ A detected race on the target or its parent surfaces as `blocked` with reason
 `confirmation_required`, `pin_missing`, `candidate_selection_missing`,
 `unsupported`, …), and `reasonCode` names the exact stage a refusal stopped at.
 
+A repair is only ever planned against a settled diagnosis. If any selected check
+timed out or was cancelled — leaving its collector still running against shared
+state — the action is refused with reason `incomplete_diagnostics` and exit 3
+before any target is resolved. The diagnosis still reports what it collected, so
+rerun with a larger `--timeout-ms` or a narrower `--check` selection to get a
+repairable run.
+
 ## Safety properties
 
 - Diagnosis and `--dry-run` perform no writes, fetches, plugin execution, or

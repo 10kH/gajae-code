@@ -5,7 +5,7 @@ import { BASIC_DOCTOR_COLLECTORS, type DoctorCollector, doctorCheck } from "./ch
 import { createDoctorContext, type DoctorContext } from "./context";
 import { collectPluginTargets } from "./plugin-targets";
 import { collectDoctorProbe } from "./probe-client";
-import { executeSelectedDoctorRepair, planSelectedDoctorRepair } from "./repairs";
+import { executeSelectedDoctorRepair, planSelectedDoctorRepair, refuseUnsettledDoctorRepair } from "./repairs";
 import { finalizeReport } from "./report";
 import { collectServiceTargets } from "./service-targets";
 import type { DoctorCheck, DoctorCoverage, DoctorRepair, DoctorReport } from "./types";
@@ -99,22 +99,52 @@ function collectFailure(
 	];
 }
 
-async function runCollector(context: DoctorContext, collector: DoctorCollector): Promise<DoctorCheck[]> {
-	if (context.options.signal?.aborted) return collectFailure(context, collector, "cancelled", "cancelled");
+/**
+ * One collector run plus whether its own work is over.
+ *
+ * `settled: false` means the collector never finished: it either lost the
+ * timeout race and is still running against the shared {@link DoctorContext},
+ * or it was refused before it could observe anything. Nothing here can stop an
+ * in-flight collector — a plain `collect(context)` promise is not cancellable —
+ * so the fact is carried out instead and repair planning refuses on it.
+ */
+interface CollectorRun {
+	readonly checks: DoctorCheck[];
+	readonly settled: boolean;
+}
+
+async function runCollector(context: DoctorContext, collector: DoctorCollector): Promise<CollectorRun> {
+	if (context.options.signal?.aborted)
+		return { checks: collectFailure(context, collector, "cancelled", "cancelled"), settled: false };
 	const started = performance.now();
 	const remaining = Math.min(collector.timeoutMs, context.deadline - started);
-	if (remaining <= 0) return collectFailure(context, collector, "timeout", "deadline_exceeded");
-	const expired = Promise.withResolvers<DoctorCheck[]>();
+	if (remaining <= 0)
+		return { checks: collectFailure(context, collector, "timeout", "deadline_exceeded"), settled: false };
+	const expired = Promise.withResolvers<{ checks: DoctorCheck[]; settled: false }>();
 	const timer = setTimeout(
-		() => expired.resolve(collectFailure(context, collector, "timeout", "collector_timeout")),
+		() =>
+			expired.resolve({
+				checks: collectFailure(context, collector, "timeout", "collector_timeout"),
+				settled: false,
+			}),
 		remaining,
 	);
 	try {
-		const checks = await Promise.race([
-			collector.collect(context).catch(() => collectFailure(context, collector, "blocked", "collector_failed")),
+		const run = await Promise.race([
+			collector
+				.collect(context)
+				.then(checks => ({ checks, settled: true }))
+				// A rejection is still a finished collector: it is no longer writing to the context.
+				.catch(() => ({
+					checks: collectFailure(context, collector, "blocked", "collector_failed"),
+					settled: true,
+				})),
 			expired.promise,
 		]);
-		return checks.map(check => ({ ...check, durationMs: Math.round(performance.now() - started) }));
+		return {
+			checks: run.checks.map(check => ({ ...check, durationMs: Math.round(performance.now() - started) })),
+			settled: run.settled,
+		};
 	} finally {
 		clearTimeout(timer);
 	}
@@ -152,12 +182,15 @@ interface CollectedSelection {
 	readonly checks: DoctorCheck[];
 	readonly acceptedSelectors: string[];
 	readonly invocationError?: string;
+	/** False when a selected collector timed out, was cancelled, or is still running against the context. */
+	readonly settled: boolean;
 }
 
 async function collectSelectedChecks(context: DoctorContext): Promise<CollectedSelection> {
 	const options = context.options;
 	const selected = selectedCollectors(options);
 	const results = new Map<string, DoctorCheck[]>();
+	let settled = true;
 	const pending = [...selected.collectors];
 	while (pending.length > 0) {
 		const available = pending.filter(collector => collector.dependsOn.every(dependency => results.has(dependency)));
@@ -173,10 +206,13 @@ async function collectSelectedChecks(context: DoctorContext): Promise<CollectedS
 				const failedDependency = collector.dependsOn.some(dependency =>
 					results.get(dependency)?.some(check => check.execution !== "completed" || check.health === "error"),
 				);
-				const checks = failedDependency
-					? collectFailure(context, collector, "blocked", "dependency_failed")
-					: await runCollector(context, collector);
-				results.set(collector.id, checks);
+				if (failedDependency) {
+					results.set(collector.id, collectFailure(context, collector, "blocked", "dependency_failed"));
+					return;
+				}
+				const run = await runCollector(context, collector);
+				if (!run.settled) settled = false;
+				results.set(collector.id, run.checks);
 			}),
 		);
 	}
@@ -205,7 +241,7 @@ async function collectSelectedChecks(context: DoctorContext): Promise<CollectedS
 							(unresolvedInspection && check.execution !== "completed"),
 					);
 				});
-	return { checks, acceptedSelectors, invocationError };
+	return { checks, acceptedSelectors, invocationError, settled };
 }
 
 /** Diagnose first; only a resolved, authorized single action can enter its domain transaction. */
@@ -219,7 +255,15 @@ export async function collectDoctorReport(options: DoctorOptions): Promise<Docto
 	let currentChecks = checks;
 	let invocationError = before.invocationError;
 	const repairs: DoctorRepair[] = [];
-	const plan = planSelectedDoctorRepair(context, checks);
+	// A collector that lost its timeout race is still running and still writing
+	// into this context's target map. Planning a repair against that state would
+	// bind the action to a partially-populated snapshot, so the whole repair lane
+	// is refused here; the diagnosis above still reports what was collected.
+	// `invocationError` stays untouched: this is not a usage error, so the run
+	// reports incomplete (exit 3) rather than exit 2.
+	const unsettled = before.settled ? undefined : refuseUnsettledDoctorRepair(context, checks);
+	if (unsettled) repairs.push(unsettled);
+	const plan = unsettled ? undefined : planSelectedDoctorRepair(context, checks);
 	if (plan && !invocationError) {
 		if (plan.readiness.includes("target_resolution_incomplete")) {
 			checks = [
