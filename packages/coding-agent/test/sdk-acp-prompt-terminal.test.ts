@@ -583,6 +583,76 @@ test("ACP prompt rejects prompt_failed terminal outcomes with their code", async
 	}
 });
 
+test("ACP retries a first-turn prompt_failed after the turn started, then recovers (issue #5574)", async () => {
+	const fixture = await createFixture();
+	try {
+		const pending = prompt(fixture, "first turn readiness race");
+		await bounded(fixture.promptDelivered, "first prompt delivery");
+		// The turn started and produced a frame (agent_start) — the readiness-race
+		// fingerprint the retry gate keys on — then failed as prompt_failed. A fresh
+		// session's first turn is re-submitted rather than surfaced as an opaque -32603.
+		fixture.sendTerminal({
+			type: "agent_start",
+			sessionId: "prompt-terminal-session",
+			commandId: "prompt-terminal-command",
+			turnId: "prompt-terminal-turn",
+		});
+		fixture.sendFailed("prompt_failed");
+		// The first prompt is re-submitted to the host as a distinct second delivery.
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "first-turn retry delivery");
+		// The retry lands on a host that has finished coming up and completes normally.
+		fixture.sendStopped("end_turn");
+		expect(await bounded(pending, "first-turn retry recovery")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP does not retry a first-turn prompt_failed that never started the turn", async () => {
+	const fixture = await createFixture();
+	try {
+		const pending = prompt(fixture, "immediate first-turn failure");
+		await bounded(fixture.promptDelivered, "first prompt delivery");
+		// No progress frame: the turn was rejected before it started, so it is a genuine
+		// failure surfaced with its code, never re-submitted.
+		fixture.sendFailed("prompt_failed");
+		await expect(bounded(pending, "immediate failure settlement")).rejects.toMatchObject({
+			code: "prompt_failed",
+		});
+		expect(fixture.promptDeliveryCount()).toBe(1);
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP does not retry a prompt_failed on a later turn even after activity", async () => {
+	const fixture = await createFixture();
+	try {
+		// First turn completes normally, consuming the one-shot first-turn retry budget.
+		const first = prompt(fixture, "first turn ok");
+		await bounded(fixture.promptDelivered, "first prompt delivery");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(first, "first turn settlement")).toEqual({ stopReason: "end_turn" });
+
+		// A second turn that starts and then fails is surfaced, not retried.
+		const second = prompt(fixture, "second turn fails after starting");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "second prompt delivery");
+		fixture.sendTerminal({
+			type: "agent_start",
+			sessionId: "prompt-terminal-session",
+			commandId: "prompt-terminal-command-2",
+			turnId: "prompt-terminal-turn-2",
+		});
+		fixture.sendFailed("prompt_failed");
+		await expect(bounded(second, "second turn failure settlement")).rejects.toMatchObject({
+			code: "prompt_failed",
+		});
+		expect(fixture.promptDeliveryCount()).toBe(2);
+	} finally {
+		fixture.dispose();
+	}
+});
+
 test("ACP publishes final text from an explicit failure-only terminal", async () => {
 	const fixture = await createFixture();
 	try {
