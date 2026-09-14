@@ -510,6 +510,74 @@ export function planLaunchWorktree(
 	return { enabled: true, repoRoot, worktreePath, detached: mode.detached, baseRef, branchName };
 }
 
+/**
+ * Config subdirectory a launcher (e.g. paseo, #5570) may seed into the worktree target
+ * before handing the path to gjc. `git worktree add` refuses any non-empty target, so
+ * this artifact is evacuated and restored around the add rather than treated as a conflict.
+ */
+const PRE_WORKTREE_GJC_DIR = ".gjc";
+
+/**
+ * Whether an existing worktree target can be materialized in place. An empty directory,
+ * or one holding nothing but a pre-seeded {@link PRE_WORKTREE_GJC_DIR}, is safe to replace;
+ * anything else is a genuine `worktree_path_conflict`. A missing path is trivially usable.
+ */
+function isReplaceableWorktreeTarget(worktreePath: string): boolean {
+	let entries: string[];
+	try {
+		entries = fs.readdirSync(worktreePath);
+	} catch (error) {
+		if (fileSystemErrorCode(error) === "ENOENT") return true;
+		throw error;
+	}
+	return entries.every(entry => entry === PRE_WORKTREE_GJC_DIR);
+}
+
+/**
+ * Clear a {@link isReplaceableWorktreeTarget replaceable} target so `git worktree add` can
+ * create it, moving any pre-seeded `.gjc/` to a sibling stash. Returns a hook that restores
+ * `.gjc/` into the freshly created worktree; a no-op when there was nothing to preserve.
+ */
+function evacuatePreWorktreeTarget(worktreePath: string): () => void {
+	if (!fs.existsSync(worktreePath)) return () => {};
+	const gjcSource = path.join(worktreePath, PRE_WORKTREE_GJC_DIR);
+	const hasGjc = fs.existsSync(gjcSource);
+	if (!hasGjc) {
+		fs.rmdirSync(worktreePath);
+		return () => {};
+	}
+	const gjcStash = path.join(path.dirname(worktreePath), `.gjc-pre-wt-${path.basename(worktreePath)}`);
+	fs.rmSync(gjcStash, { recursive: true, force: true });
+	fs.renameSync(gjcSource, gjcStash);
+	fs.rmdirSync(worktreePath);
+	return () => {
+		fs.mkdirSync(worktreePath, { recursive: true });
+		fs.renameSync(gjcStash, path.join(worktreePath, PRE_WORKTREE_GJC_DIR));
+	};
+}
+
+/** Best-effort restore that never masks the failure that triggered it. */
+function tryRestore(restore: () => void): void {
+	try {
+		restore();
+	} catch {
+		// The original worktree-add failure is the actionable one; leave restore best-effort.
+	}
+}
+
+function buildWorktreeAddArgs(plan: GjcLaunchWorktreePlan, branchAlreadyExisted: boolean): string[] {
+	const args = ["worktree", "add"];
+	if (plan.detached) args.push("--detach", plan.worktreePath, plan.baseRef);
+	else if (branchAlreadyExisted) args.push(plan.worktreePath, plan.branchName ?? "");
+	else args.push("-b", plan.branchName ?? "", plan.worktreePath, plan.baseRef);
+	return args;
+}
+
+function classifyWorktreeAddFailure(plan: GjcLaunchWorktreePlan, args: string[], stderr: string): Error {
+	if (plan.branchName && BRANCH_IN_USE_PATTERN.test(stderr)) return new Error(`branch_in_use:${plan.branchName}`);
+	return new Error(stderr || `worktree_add_failed:${args.join(" ")}`);
+}
+
 export function ensureLaunchWorktree(
 	plan: GjcLaunchWorktreePlan | { enabled: false },
 	options?: LaunchWorktreeAbortOptions,
@@ -573,24 +641,25 @@ function ensureLaunchWorktreeSync(
 		};
 	}
 
-	if (fs.existsSync(plan.worktreePath)) throw new Error(`worktree_path_conflict:${plan.worktreePath}`);
+	if (!isReplaceableWorktreeTarget(plan.worktreePath)) throw new Error(`worktree_path_conflict:${plan.worktreePath}`);
 	if (plan.branchName && hasBranchInUse(allWorktrees, plan.branchName, plan.worktreePath)) {
 		throw new Error(`branch_in_use:${plan.branchName}`);
 	}
 
 	ensureBucketDirUsable(path.dirname(plan.worktreePath));
 	const branchAlreadyExisted = plan.branchName ? branchExists(plan.repoRoot, plan.branchName) : false;
-	const args = ["worktree", "add"];
-	if (plan.detached) args.push("--detach", plan.worktreePath, plan.baseRef);
-	else if (branchAlreadyExisted) args.push(plan.worktreePath, plan.branchName ?? "");
-	else args.push("-b", plan.branchName ?? "", plan.worktreePath, plan.baseRef);
-
-	const result = Bun.spawnSync(["git", ...args], { cwd: plan.repoRoot, stdout: "pipe", stderr: "pipe" });
-	if (result.exitCode !== 0) {
-		const stderr = sanitizeWorktreeDiagnostic(result.stderr.toString().trim());
-		if (plan.branchName && BRANCH_IN_USE_PATTERN.test(stderr)) throw new Error(`branch_in_use:${plan.branchName}`);
-		throw new Error(stderr || `worktree_add_failed:${args.join(" ")}`);
+	const args = buildWorktreeAddArgs(plan, branchAlreadyExisted);
+	const restoreGjc = evacuatePreWorktreeTarget(plan.worktreePath);
+	try {
+		const result = Bun.spawnSync(["git", ...args], { cwd: plan.repoRoot, stdout: "pipe", stderr: "pipe" });
+		if (result.exitCode !== 0) {
+			throw classifyWorktreeAddFailure(plan, args, sanitizeWorktreeDiagnostic(result.stderr.toString().trim()));
+		}
+	} catch (error) {
+		tryRestore(restoreGjc);
+		throw error;
 	}
+	restoreGjc();
 
 	return {
 		...plan,
@@ -658,7 +727,7 @@ export async function ensureLaunchWorktreeCancellable(
 		};
 	}
 
-	if (fs.existsSync(plan.worktreePath)) throw new Error(`worktree_path_conflict:${plan.worktreePath}`);
+	if (!isReplaceableWorktreeTarget(plan.worktreePath)) throw new Error(`worktree_path_conflict:${plan.worktreePath}`);
 	if (plan.branchName && hasBranchInUse(allWorktrees, plan.branchName, plan.worktreePath)) {
 		throw new Error(`branch_in_use:${plan.branchName}`);
 	}
@@ -666,17 +735,18 @@ export async function ensureLaunchWorktreeCancellable(
 	ensureBucketDirUsable(path.dirname(plan.worktreePath));
 	throwIfAborted(options, timeout);
 	const branchAlreadyExisted = plan.branchName ? branchExists(plan.repoRoot, plan.branchName) : false;
-	const args = ["worktree", "add"];
-	if (plan.detached) args.push("--detach", plan.worktreePath, plan.baseRef);
-	else if (branchAlreadyExisted) args.push(plan.worktreePath, plan.branchName ?? "");
-	else args.push("-b", plan.branchName ?? "", plan.worktreePath, plan.baseRef);
-
-	const result = await spawnProcessGroup(["git", ...args], plan.repoRoot, options, timeout);
-	if (result.exitCode !== 0) {
-		const stderr = sanitizeWorktreeDiagnostic(result.stderr.trim());
-		if (plan.branchName && BRANCH_IN_USE_PATTERN.test(stderr)) throw new Error(`branch_in_use:${plan.branchName}`);
-		throw new Error(stderr || `worktree_add_failed:${args.join(" ")}`);
+	const args = buildWorktreeAddArgs(plan, branchAlreadyExisted);
+	const restoreGjc = evacuatePreWorktreeTarget(plan.worktreePath);
+	try {
+		const result = await spawnProcessGroup(["git", ...args], plan.repoRoot, options, timeout);
+		if (result.exitCode !== 0) {
+			throw classifyWorktreeAddFailure(plan, args, sanitizeWorktreeDiagnostic(result.stderr.trim()));
+		}
+	} catch (error) {
+		tryRestore(restoreGjc);
+		throw error;
 	}
+	restoreGjc();
 
 	return {
 		...plan,
