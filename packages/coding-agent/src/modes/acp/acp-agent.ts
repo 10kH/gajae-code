@@ -113,6 +113,20 @@ const PROMPT_FRAME_ID_PLACEHOLDER = "00000000-0000-4000-8000-000000000000";
  */
 const ACP_SESSION_READINESS_TIMEOUT_MS = ACP_MCP_LIFECYCLE_TIMEOUT_MS;
 
+/**
+ * A freshly created session host can accept the first turn before it has finished
+ * coming up (provider stream, tool registry, MCP wiring), so the very first prompt
+ * can terminalize as `prompt_failed` — surfaced to an ACP client as an opaque
+ * `-32603` with no usable result (issue #5574). The failed turn produced no answer,
+ * so re-submitting the same first prompt a bounded number of times recovers the
+ * startup race instead of ending the session on its first turn. Only the first
+ * logical prompt of a session retries, and only an `agent_failed` `prompt_failed`
+ * terminal (never a deadline, a client cancel, or a clean stop) is retried.
+ */
+const ACP_FIRST_PROMPT_MAX_RETRIES = 2;
+/** Backoff before each first-prompt retry, scaled by attempt (250ms, then 500ms). */
+const ACP_FIRST_PROMPT_RETRY_BASE_DELAY_MS = 250;
+
 type JsonObject = Record<string, unknown>;
 interface PromptWaiter {
 	acknowledged: boolean;
@@ -144,6 +158,8 @@ interface PromptWaiter {
 	cancelWatchdog?: () => void;
 	/** What the host is observably doing — a tool running, a model call unanswered — and the bound that follows from it. */
 	activity: PromptActivity;
+	/** True once a prompt-owned progress frame (agent_start / message / tool) was observed; gates first-turn retries. */
+	observedTurnActivity: boolean;
 	/** Coordinates a prompt-control rejection racing an acknowledged ACP cancellation. */
 	cancelAttempt?: Promise<boolean>;
 	/** Whether ANY overlapping cancel attempt for this prompt was acknowledged:
@@ -200,7 +216,31 @@ type SessionRecord = {
 	activePrompt?: PromptWaiter;
 	/** Set by `session/cancel` so an in-flight prompt settles as `cancelled`, never as an error. */
 	cancelRequested?: boolean;
+	/** True once the session's first logical prompt has settled; gates first-turn readiness retries. */
+	firstPromptDone?: boolean;
+	/** Whether the current prompt attempt was observed doing work; reset per attempt, read by the first-turn retry gate. */
+	promptObservedActivity?: boolean;
 };
+
+/**
+ * Prompt-owned frame types that prove the turn is underway (as opposed to a
+ * terminal or a bare failure diagnostic). Observing one is the first-turn
+ * readiness-race fingerprint the retry gate keys on.
+ */
+function isTurnProgressEventType(type: string | undefined): boolean {
+	switch (type) {
+		case "agent_start":
+		case "message_start":
+		case "message_update":
+		case "message_end":
+		case "tool_execution_start":
+		case "tool_execution_update":
+		case "tool_execution_end":
+			return true;
+		default:
+			return false;
+	}
+}
 
 function promptWaiterRetired(record: SessionRecord, waiter: PromptWaiter): boolean {
 	return waiter.settled || record.activePrompt !== waiter;
@@ -1656,6 +1696,65 @@ export class AcpAgent implements Agent {
 
 	async prompt(params: PromptRequest): Promise<PromptResponse> {
 		const record = this.#sessions.get(params.sessionId);
+		// An unknown session must still report not_found; the retry loop only guards a
+		// live session's first turn against a startup readiness race (issue #5574).
+		if (!record) return await this.#submitPrompt(params, true);
+		try {
+			let echoUserMessage = true;
+			for (let attempt = 0; ; attempt++) {
+				try {
+					return await this.#submitPrompt(params, echoUserMessage);
+				} catch (error) {
+					if (!this.#shouldRetryFirstPrompt(record, error, attempt)) throw error;
+					// The user's message was already echoed on the first attempt; re-echoing
+					// would duplicate it in the client transcript.
+					echoUserMessage = false;
+					logger.warn("ACP first-turn prompt failed; retrying after readiness backoff", {
+						sessionId: params.sessionId,
+						attempt: attempt + 1,
+						maxRetries: ACP_FIRST_PROMPT_MAX_RETRIES,
+					});
+					await this.#delayFirstPromptRetry(attempt);
+				}
+			}
+		} finally {
+			record.firstPromptDone = true;
+		}
+	}
+
+	/**
+	 * The readiness-race signature (issue #5574): the session's first turn was accepted
+	 * and started producing frames (an `agent_start`, a tool call — the reported log shows
+	 * `todo_write`), then failed as `prompt_failed` before ever completing. Re-submitting
+	 * the same first prompt a bounded number of times lets a host that has since finished
+	 * coming up answer it, instead of ending the session on its first turn.
+	 *
+	 * Every gate is deliberately narrow so a genuine failure is still surfaced:
+	 * - only the first logical prompt of the session (`!firstPromptDone`);
+	 * - only an `agent_failed` `prompt_failed` terminal — never a client cancel, a
+	 *   `prompt_deadline_exceeded`, a transport error, or a preflight rejection;
+	 * - only after the turn was observed doing work (`promptObservedActivity`), which is
+	 *   the race's fingerprint and which a turn rejected before it ever started never has;
+	 * - never once the client has asked to cancel.
+	 */
+	#shouldRetryFirstPrompt(record: SessionRecord, error: unknown, attempt: number): boolean {
+		if (attempt >= ACP_FIRST_PROMPT_MAX_RETRIES) return false;
+		if (record.firstPromptDone) return false;
+		if (record.cancelRequested) return false;
+		if (!record.promptObservedActivity) return false;
+		return error instanceof AcpSdkAdapterError && error.code === "prompt_failed";
+	}
+
+	/** Backoff between first-prompt retries, on the injectable watchdog clock so tests can advance it. */
+	#delayFirstPromptRetry(attempt: number): Promise<void> {
+		const delayMs = ACP_FIRST_PROMPT_RETRY_BASE_DELAY_MS * (attempt + 1);
+		return new Promise<void>(resolve => {
+			this.#promptWatchdogClock.schedule(resolve, delayMs);
+		});
+	}
+
+	async #submitPrompt(params: PromptRequest, echoUserMessage: boolean): Promise<PromptResponse> {
+		const record = this.#sessions.get(params.sessionId);
 		if (!record) throw new AcpSdkAdapterError("not_found", `Unknown session, not found: ${params.sessionId}`);
 		if (record.activePrompt) throw new AcpSdkAdapterError("conflict", "ACP session already has an active prompt.");
 		if (record.authFailure) throw new AcpSdkAdapterError("authentication_failed", record.authFailure);
@@ -1725,6 +1824,9 @@ export class AcpAgent implements Agent {
 				)} KiB transport limit. Attach a smaller or more compressed image.`,
 			);
 		record.publicationGeneration++;
+		// Reset per attempt: a first-turn readiness retry keys on whether THIS attempt was
+		// observed doing work, never a prior attempt's activity.
+		record.promptObservedActivity = false;
 		const { promise: response, resolve, reject } = Promise.withResolvers<PromptResponse>();
 		const waiter: PromptWaiter = {
 			acknowledged: false,
@@ -1741,6 +1843,7 @@ export class AcpAgent implements Agent {
 			lastFrameAt: this.#promptWatchdogClock.now(),
 			lastFrameType: "prompt_dispatch",
 			activity: new PromptActivity(),
+			observedTurnActivity: false,
 			resolve,
 			reject,
 		};
@@ -1787,18 +1890,21 @@ export class AcpAgent implements Agent {
 		// image never appear in the client UI — only the agent's reply does. Replay
 		// (session/load) already emits these; a live turn must too, and the image blocks
 		// must be published verbatim so attachments are visible, not just fed to the model.
-		for (const block of params.prompt) {
-			if (block.type !== "text" && block.type !== "image") continue;
-			if (block.type === "text" && block.text.length === 0) continue;
-			await this.#publishSessionUpdate(
-				params.sessionId,
-				{
-					sessionId: params.sessionId,
-					update: { sessionUpdate: "user_message_chunk", content: block },
-				},
-				record.adapter,
-			);
-		}
+		// A first-turn readiness retry (issue #5574) skips the echo: the message was already
+		// published on the first attempt and re-echoing would duplicate it in the transcript.
+		if (echoUserMessage)
+			for (const block of params.prompt) {
+				if (block.type !== "text" && block.type !== "image") continue;
+				if (block.type === "text" && block.text.length === 0) continue;
+				await this.#publishSessionUpdate(
+					params.sessionId,
+					{
+						sessionId: params.sessionId,
+						update: { sessionUpdate: "user_message_chunk", content: block },
+					},
+					record.adapter,
+				);
+			}
 		waiter.dispatched = true;
 		if (waiter.settled || record.activePrompt !== waiter) {
 			return await response;
@@ -1884,6 +1990,7 @@ export class AcpAgent implements Agent {
 				}
 				if (matchesWaiter) {
 					this.#observePromptActivity(waiter, deferredFrame);
+					if (waiter.observedTurnActivity) record.promptObservedActivity = true;
 					observedDeferredActivity = true;
 				}
 			}
@@ -2869,6 +2976,7 @@ export class AcpAgent implements Agent {
 		}
 		if (!correlationsExactlyMatch(waiter.correlation, correlation)) return;
 		this.#observePromptActivity(waiter, frame);
+		if (waiter.observedTurnActivity) record.promptObservedActivity = true;
 		this.#armPromptWatchdog(id, record, waiter);
 	}
 
@@ -2877,6 +2985,8 @@ export class AcpAgent implements Agent {
 		waiter.lastFrameAt = this.#promptWatchdogClock.now();
 		waiter.lastFrameType =
 			typeof event?.type === "string" ? event.type : typeof frame.type === "string" ? frame.type : "unknown";
+		if (isTurnProgressEventType(typeof event?.type === "string" ? event.type : undefined))
+			waiter.observedTurnActivity = true;
 		waiter.activity.observe(
 			typeof event?.type === "string" ? event.type : undefined,
 			typeof event?.toolCallId === "string" ? event.toolCallId : undefined,
