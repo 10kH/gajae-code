@@ -3091,7 +3091,18 @@ export class AcpAgent implements Agent {
 				);
 				return;
 			}
-			activePrompt.terminal = { outcome, correlation };
+			// Once the host acknowledges a client cancel, a trailing stopped terminal may
+			// still carry the normal `end_turn` reason (especially while a streamed model
+			// response is in flight). The client's cancellation is the authoritative cause
+			// for that terminal; preserve terminals that arrived before the acknowledgement.
+			const settledOutcome =
+				record.cancelRequested &&
+				activePrompt.cancelAcknowledged &&
+				outcome.kind === "stopped" &&
+				outcome.reason !== "cancelled"
+					? { ...outcome, reason: "cancelled" as const, provenance: "client_cancel" as const }
+					: outcome;
+			activePrompt.terminal = { outcome: settledOutcome, correlation };
 			// Failure diagnostics are useful but advisory. Settle before any mapped
 			// session update can await a backpressured client transport; otherwise an
 			// already-decided failure can still lose to the inactivity watchdog.
