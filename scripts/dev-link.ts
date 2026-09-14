@@ -436,31 +436,33 @@ function link(binary: boolean): never {
 	const linkSourceReal = realpath(linkSource) ?? linkSource;
 	fs.mkdirSync(targetDir, { recursive: true });
 	const target = path.join(targetDir, "gjc");
-	if (lexists(target)) {
-		const existing = realpath(target);
-		if (!hasTrustedOwnershipReceipt(target, repoRoot, "gjc") || !existing || (existing !== cliSourceReal && existing !== realpath(binarySource))) {
-			console.error(`✗ Refusing to replace foreign or unknown ${target}`);
-			process.exit(1);
-		}
-		fs.rmSync(target, { force: true });
-		if (lexists(`${target}.gjc-managed.json`)) fs.rmSync(`${target}.gjc-managed.json`, { force: true });
-	}
-	fs.symlinkSync(linkSource, target);
-	writeOwnershipReceipt(target, repoRoot, "gjc", linkSourceReal);
-	console.log(`✓ Linked ${target} -> ${linkSource}`);
 	const aliasTarget = path.join(targetDir, "가재씨");
-	if (lexists(aliasTarget)) {
-		const existing = realpath(aliasTarget);
-		if (!hasTrustedOwnershipReceipt(aliasTarget, repoRoot, "가재씨") || !existing || (existing !== cliSourceReal && existing !== realpath(binarySource))) {
-			console.error(`✗ Refusing to replace foreign or unknown ${aliasTarget}`);
+	// Preflight BOTH managed links before mutating either. A foreign or stale
+	// alias must abort the whole command up front: if it were validated only
+	// after the primary `gjc` link was already replaced, a failing alias would
+	// leave the installation half-updated.
+	const assertReplaceable = (linkPath: string, name: string): void => {
+		if (!lexists(linkPath)) return;
+		const existing = realpath(linkPath);
+		if (!hasTrustedOwnershipReceipt(linkPath, repoRoot, name) || !existing || (existing !== cliSourceReal && existing !== realpath(binarySource))) {
+			console.error(`✗ Refusing to replace foreign or unknown ${linkPath}`);
 			process.exit(1);
 		}
-		fs.rmSync(aliasTarget, { force: true });
-		if (lexists(`${aliasTarget}.gjc-managed.json`)) fs.rmSync(`${aliasTarget}.gjc-managed.json`, { force: true });
-	}
-	fs.symlinkSync(linkSource, aliasTarget);
-	writeOwnershipReceipt(aliasTarget, repoRoot, "가재씨", linkSourceReal);
-	console.log(`✓ Linked ${aliasTarget} -> ${linkSource}`);
+	};
+	assertReplaceable(target, "gjc");
+	assertReplaceable(aliasTarget, "가재씨");
+
+	const installLink = (linkPath: string, name: string): void => {
+		if (lexists(linkPath)) {
+			fs.rmSync(linkPath, { force: true });
+			if (lexists(`${linkPath}.gjc-managed.json`)) fs.rmSync(`${linkPath}.gjc-managed.json`, { force: true });
+		}
+		fs.symlinkSync(linkSource, linkPath);
+		writeOwnershipReceipt(linkPath, repoRoot, name, linkSourceReal);
+		console.log(`✓ Linked ${linkPath} -> ${linkSource}`);
+	};
+	installLink(target, "gjc");
+	installLink(aliasTarget, "가재씨");
 	if (!isOnPath(targetDir)) {
 		console.warn(`! ${targetDir} is not on your PATH — add it so \`gjc\` resolves:`);
 		console.warn(`    export PATH="${targetDir}:$PATH"`);
