@@ -208,8 +208,7 @@ describe("createSessionReaper.sweepOnce — bounded failure eviction", () => {
 		const evicted = new Set<string>();
 		const reaper = createSessionReaper(
 			{
-				listSessions: async () =>
-					evicted.has("stale") ? [] : [sess("stale")],
+				listSessions: async () => (evicted.has("stale") ? [] : [sess("stale")]),
 				reapSession: async () => {
 					throw new Error("endpoint_stale");
 				},

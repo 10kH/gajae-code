@@ -105,9 +105,7 @@ export function createSessionReaper(deps: SessionReaperDeps, policy: SessionReap
 					const count = prev + 1;
 					if (count < MAX_REAP_FAILURES) {
 						// First failure(s): log at warn and keep retrying next sweep.
-						logger.warn(
-							`session-reaper: failed to reap ${session.sessionId}: ${msg}`,
-						);
+						logger.warn(`session-reaper: failed to reap ${session.sessionId}: ${msg}`);
 						failureCounts.set(session.sessionId, count);
 					} else {
 						// Hit the limit — evict unconditionally and silence future attempts.
