@@ -7,6 +7,7 @@ import type { NativeExactUnlinkResult } from "@gajae-code/natives";
 import { processStartTime, removeFileLockDirForGc } from "../src/config/file-lock";
 import * as sessionStateLock from "../src/gjc-runtime/session-state-lock";
 import {
+	isRetryableSessionStateLockContention,
 	reclaimStaleSessionStateLock,
 	resetPersistFailureWarnWindows,
 	SessionStateLockTestHooks,
@@ -2903,6 +2904,39 @@ describe("session state lock failure diagnostics", () => {
 			reason: "transition_claim_timeout",
 			lockPath: "/tmp/runtime-state.json.lock.transition",
 		});
+	});
+
+	it("treats only pure-contention refusals as worth retrying", () => {
+		const refusal = (reason: string) => new SessionStateLockUnavailableError({ lockPath: "/tmp/a.lock", reason });
+
+		// Contention verdicts learn nothing about the document, so the same write can
+		// still succeed later.
+		expect(isRetryableSessionStateLockContention(refusal("acquire_timeout"))).toBe(true);
+		expect(isRetryableSessionStateLockContention(refusal("lock_owner_live_or_unverifiable"))).toBe(true);
+		expect(isRetryableSessionStateLockContention(refusal("lock_owner_record_fresh"))).toBe(true);
+		expect(isRetryableSessionStateLockContention(refusal("transition_claim_timeout"))).toBe(true);
+
+		// Standing conditions a retry would only repeat.
+		expect(isRetryableSessionStateLockContention(refusal("unsafe_lock_path_type"))).toBe(false);
+		expect(isRetryableSessionStateLockContention(refusal("lock_owner_record_unprovenanced"))).toBe(false);
+		expect(isRetryableSessionStateLockContention(refusal("legacy_directory_owner_unprovenanced"))).toBe(false);
+		expect(isRetryableSessionStateLockContention(refusal("lock_initialization_failed"))).toBe(false);
+		expect(isRetryableSessionStateLockContention(refusal("lock_inspection_failed"))).toBe(false);
+		expect(isRetryableSessionStateLockContention(refusal("lock_release_failed"))).toBe(false);
+
+		// Non-lock failures carry no contention verdict at all.
+		expect(isRetryableSessionStateLockContention(new Error("disk full"))).toBe(false);
+		expect(isRetryableSessionStateLockContention(undefined)).toBe(false);
+
+		// A refusal buried under wrapping errors is still the same verdict.
+		expect(
+			isRetryableSessionStateLockContention(
+				new AggregateError([
+					new Error("unrelated"),
+					new Error("wrapped", { cause: refusal("transition_claim_timeout") }),
+				]),
+			),
+		).toBe(true);
 	});
 
 	it("partitions warn windows by document and stable failure class", () => {
