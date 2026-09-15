@@ -518,18 +518,37 @@ export function planLaunchWorktree(
 const PRE_WORKTREE_GJC_DIR = ".gjc";
 
 /**
+ * Assert that `target` resolves to a location contained within `parent`.
+ *
+ * Both paths are resolved through {@link fs.realpathSync} so a symlink anywhere along the
+ * chain cannot smuggle a write outside the worktree bucket. Throws `worktree_path_conflict`
+ * when the resolved target escapes the resolved parent.
+ */
+function assertRealpathContained(target: string, parent: string): void {
+	const realParent = fs.realpathSync(parent);
+	const realTarget = fs.realpathSync(target);
+	if (realTarget === realParent || realTarget.startsWith(realParent + path.sep)) return;
+	throw new Error(`worktree_path_conflict:${target}`);
+}
+
+/**
  * Whether an existing worktree target can be materialized in place. An empty directory,
  * or one holding nothing but a pre-seeded {@link PRE_WORKTREE_GJC_DIR}, is safe to replace;
  * anything else is a genuine `worktree_path_conflict`. A missing path is trivially usable.
+ *
+ * A symlinked target is never replaceable: evacuation and overlay writes would follow the
+ * link out of the worktree bucket, so it is reported as a conflict instead.
  */
-function isReplaceableWorktreeTarget(worktreePath: string): boolean {
-	let entries: string[];
+export function isReplaceableWorktreeTarget(worktreePath: string): boolean {
+	let stat: fs.Stats;
 	try {
-		entries = fs.readdirSync(worktreePath);
+		stat = fs.lstatSync(worktreePath);
 	} catch (error) {
 		if (fileSystemErrorCode(error) === "ENOENT") return true;
 		throw error;
 	}
+	if (stat.isSymbolicLink() || !stat.isDirectory()) return false;
+	const entries = fs.readdirSync(worktreePath);
 	return entries.every(entry => entry === PRE_WORKTREE_GJC_DIR);
 }
 
@@ -542,10 +561,22 @@ function isReplaceableWorktreeTarget(worktreePath: string): boolean {
  * collision, tracked-only entries survive — and the stash is removed. When it does not exist
  * (the untracked case, or a rolled-back add that never checked out), the stash is renamed in.
  */
-function restorePreWorktreeGjc(gjcStash: string, worktreePath: string): void {
+export function restorePreWorktreeGjc(gjcStash: string, worktreePath: string): void {
 	fs.mkdirSync(worktreePath, { recursive: true });
 	const target = path.join(worktreePath, PRE_WORKTREE_GJC_DIR);
-	if (fs.existsSync(target)) {
+	let targetStat: fs.Stats | null;
+	try {
+		targetStat = fs.lstatSync(target);
+	} catch (error) {
+		if (fileSystemErrorCode(error) === "ENOENT") targetStat = null;
+		else throw error;
+	}
+	if (targetStat) {
+		// `git worktree add` may have checked out a tracked `.gjc` symlink pointing outside the
+		// worktree; a recursive cpSync into it would redirect the overlay off-tree. Reject it and
+		// require the resolved destination to stay inside the worktree.
+		if (targetStat.isSymbolicLink()) throw new Error(`worktree_path_conflict:${target}`);
+		assertRealpathContained(target, worktreePath);
 		fs.cpSync(gjcStash, target, { recursive: true, force: true });
 		fs.rmSync(gjcStash, { recursive: true, force: true });
 		return;
@@ -558,14 +589,24 @@ function restorePreWorktreeGjc(gjcStash: string, worktreePath: string): void {
  * create it, moving any pre-seeded `.gjc/` to a sibling stash. Returns a hook that restores
  * `.gjc/` into the freshly created worktree; a no-op when there was nothing to preserve.
  */
-function evacuatePreWorktreeTarget(worktreePath: string): () => void {
+export function evacuatePreWorktreeTarget(worktreePath: string): () => void {
 	if (!fs.existsSync(worktreePath)) return () => {};
 	const gjcSource = path.join(worktreePath, PRE_WORKTREE_GJC_DIR);
-	const hasGjc = fs.existsSync(gjcSource);
-	if (!hasGjc) {
+	let gjcStat: fs.Stats | null;
+	try {
+		gjcStat = fs.lstatSync(gjcSource);
+	} catch (error) {
+		if (fileSystemErrorCode(error) === "ENOENT") gjcStat = null;
+		else throw error;
+	}
+	if (!gjcStat) {
 		fs.rmdirSync(worktreePath);
 		return () => {};
 	}
+	// A symlinked `.gjc` would let the rename below (and the later overlay) escape the worktree
+	// bucket. Refuse it as a path conflict rather than following the link off-tree.
+	if (gjcStat.isSymbolicLink()) throw new Error(`worktree_path_conflict:${gjcSource}`);
+	assertRealpathContained(gjcSource, worktreePath);
 	const gjcStash = path.join(path.dirname(worktreePath), `.gjc-pre-wt-${path.basename(worktreePath)}`);
 	// A lingering stash means a prior evacuation was interrupted before its restore ran, or the
 	// path holds unrelated user data. Either way it is not ours to destroy: fail closed so the
