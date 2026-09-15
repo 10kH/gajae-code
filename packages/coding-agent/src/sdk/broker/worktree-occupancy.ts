@@ -67,6 +67,17 @@ export function observeProcess(
  * `uncertain` counts as occupied: refusing a launch is recoverable by picking
  * another worktree name, whereas two live sessions sharing a checkout corrupts
  * work already done.
+ *
+ * A `terminalUncertain` row is the one exception. That flag is never set by a
+ * merely-unprobeable healthy session; it is written only when the broker has
+ * recorded a deliberate terminal claim for the session — a forced stop of a
+ * stale-endpoint session, or the fail-closed tail of a signal-escalated
+ * teardown after SIGKILL. Such a session is being torn down on the caller's
+ * explicit request, so parking its worktree until an OS probe happens to prove
+ * exit would leave the checkout locked indefinitely (#5581) exactly when the
+ * probe returns `uncertain`. It is released regardless of the process
+ * observation; the strict "only definitive exit releases" rule still governs
+ * every ordinary retained row.
  */
 export function worktreeOccupant(
 	sessions: readonly IndexedSession[],
@@ -79,7 +90,13 @@ export function worktreeOccupant(
 	const target = resolveEquivalentPath(worktreePath);
 	for (const session of sessions) {
 		const sessionWorktreeRoot = session.locator.worktreeRoot;
-		if (session.terminal || typeof sessionWorktreeRoot !== "string" || sessionWorktreeRoot.length === 0) continue;
+		if (
+			session.terminal ||
+			session.terminalUncertain === true ||
+			typeof sessionWorktreeRoot !== "string" ||
+			sessionWorktreeRoot.length === 0
+		)
+			continue;
 		if (resolveEquivalentPath(sessionWorktreeRoot) !== target) continue;
 		// `live` is heartbeat-derived and can be stale. Only positive process-exit
 		// evidence releases a matching retained session's worktree.

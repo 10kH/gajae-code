@@ -160,6 +160,28 @@ describe("worktree occupancy", () => {
 		expect(worktreeOccupantForTest(sessions, WORKTREE, alive)).toBeNull();
 	});
 
+	it("releases a force-stopped stale-endpoint session even while its process is unverifiable", () => {
+		// #5581: `stop_session(force=true)` on an endpoint_stale session records a
+		// terminal_uncertain claim. The owning process is often unprovable (pid
+		// reuse), so an OS probe returns `uncertain` forever. The forced terminal
+		// claim must release the worktree anyway, or a follow-up delegate launch
+		// into the same checkout is refused with worktree_in_use indefinitely.
+		const sessions = [session({ sessionId: "force-stopped", repo: WORKTREE, terminalUncertain: true, live: false })];
+
+		expect(worktreeOccupantForTest(sessions, WORKTREE, uncertain)).toBeNull();
+	});
+
+	it("keeps an ordinary unprobeable session occupied when only a sibling is terminal_uncertain", () => {
+		// The release is scoped to the terminal_uncertain row: a healthy retained
+		// session whose process merely cannot be probed still holds the worktree.
+		const sessions = [
+			session({ sessionId: "force-stopped", repo: WORKTREE, terminalUncertain: true, live: false }),
+			session({ sessionId: "unverifiable", repo: WORKTREE, pid: 4343 }),
+		];
+
+		expect(worktreeOccupantForTest(sessions, WORKTREE, uncertain)).toBe("unverifiable");
+	});
+
 	it("finds the holder after positively exited stale rows", () => {
 		const sessions = [
 			session({ sessionId: "stale-1", repo: WORKTREE, live: false }),
