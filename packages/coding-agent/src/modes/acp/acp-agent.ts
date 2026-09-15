@@ -53,7 +53,7 @@ import { canonicalSessionCwd } from "../../sdk/broker/session-index";
 import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../../sdk/client";
 import type { AbortScope } from "../../sdk/host/control/operations";
 import { SYNTHETIC_PROVIDER_ID } from "../../sdk/model-profile-namespace";
-import { failedPromptOutcome, isSdkPromptFailurePhase } from "../../sdk/prompt-failure";
+import { failedPromptOutcome, isSdkPromptFailurePhase, rephaseFailedOutcome } from "../../sdk/prompt-failure";
 import type { SdkPromptTerminalOutcome } from "../../sdk/prompt-status";
 import { PromptActivity, type PromptWatchdogClock, systemPromptWatchdogClock } from "../../sdk/prompt-watchdog";
 import { validateRequiredPromptText } from "../../sdk/protocol/adapter-validation";
@@ -584,6 +584,45 @@ function logDroppedPromptTerminal(
 		...(expected?.commandId ? { expectedCommandId: expected.commandId } : {}),
 		...(expected?.turnId ? { expectedTurnId: expected.turnId } : {}),
 	});
+}
+
+type SdkPromptFailedOutcome = Extract<SdkPromptTerminalOutcome, { kind: "failed" }>;
+
+/**
+ * A prompt rejection that still carries the terminal's structured failure classification.
+ * The ACP client sees only the code and message, but the first-turn retry gate must decide on
+ * what the terminal actually proved — the failure's execution phase and its bounded origin
+ * category — so settlement carries that classification instead of discarding it into a bare
+ * `AcpSdkAdapterError` (review P1, issue #5574).
+ */
+class AcpPromptFailureError extends AcpSdkAdapterError {
+	readonly failure: SdkPromptFailedOutcome;
+	constructor(failure: SdkPromptFailedOutcome) {
+		super(failure.code, failure.message);
+		this.failure = failure;
+	}
+}
+
+/**
+ * The startup-readiness failure class (issue #5574): the turn failed AFTER it started, with a
+ * bounded provider/transport classifier — the signature of a host that accepted the turn before
+ * its provider stream had finished coming up.
+ *
+ * Every other failure a `prompt_failed` terminal can carry is a genuine failure of this turn and
+ * is surfaced rather than re-submitted, even when it happened to publish nothing: a provider
+ * rejection (quota, refusal, 4xx), an agent runtime failure, a submission-phase rejection, or a
+ * deadline. Without this class check, "started, no output" alone authorized a retry, so any such
+ * rejection was silently re-run as a second turn (review P1).
+ */
+function isStartupReadinessFailure(error: unknown): boolean {
+	if (!(error instanceof AcpPromptFailureError)) return false;
+	const { failure } = error;
+	return (
+		failure.code === "prompt_failed" &&
+		failure.provenance === "agent_failed" &&
+		failure.phase === "post_start" &&
+		failure.category === "provider_transport"
+	);
 }
 
 function terminalOutcome(event: JsonObject): SdkPromptTerminalOutcome | undefined {
@@ -1821,8 +1860,11 @@ export class AcpAgent implements Agent {
 	 *
 	 * Every gate is deliberately narrow so a genuine failure is still surfaced:
 	 * - only the first logical prompt of the session (`!firstPromptDone`);
-	 * - only an `agent_failed` `prompt_failed` terminal — never a client cancel, a
-	 *   `prompt_deadline_exceeded`, a transport error, or a preflight rejection;
+	 * - only the startup-readiness failure class the terminal itself classified
+	 *   (`isStartupReadinessFailure`): a post-start `agent_failed` `prompt_failed` with a
+	 *   provider/transport classifier — never a client cancel, a `prompt_deadline_exceeded`,
+	 *   a provider rejection, an agent runtime failure, a transport error, or a preflight
+	 *   rejection, however little output they happened to produce;
 	 * - only after the turn was observed starting (`promptObservedActivity`), the race's
 	 *   fingerprint, which a turn rejected before it ever started never has;
 	 * - but NEVER once the turn executed a tool (`promptObservedToolExecution`), so a
@@ -1835,6 +1877,10 @@ export class AcpAgent implements Agent {
 	 */
 	#shouldRetryFirstPrompt(record: SessionRecord, error: unknown, attempt: number): boolean {
 		if (attempt >= ACP_FIRST_PROMPT_MAX_RETRIES) return false;
+		// The primary gate: only the failure class the terminal classified as a startup
+		// readiness race is recoverable. The activity/tool/output gates below stay as secondary
+		// safety checks on top of it — they bound what may be re-run, not what is worth re-running.
+		if (!isStartupReadinessFailure(error)) return false;
 		if (record.firstPromptDone) return false;
 		if (record.cancelRequested) return false;
 		if (!record.promptObservedActivity) return false;
@@ -1847,7 +1893,7 @@ export class AcpAgent implements Agent {
 		// output would be delivered to ACP consumers on top of the failed attempt's chunks or
 		// its terminal's final text, duplicating or corrupting the assistant stream.
 		if (record.promptObservedAssistantOutput) return false;
-		return error instanceof AcpSdkAdapterError && error.code === "prompt_failed";
+		return true;
 	}
 
 	/** Backoff between first-prompt retries, on the injectable watchdog clock so tests can advance it. */
@@ -3683,7 +3729,16 @@ export class AcpAgent implements Agent {
 			waiter.resolve({ stopReason: outcome.reason });
 			return;
 		}
-		waiter.reject(new AcpSdkAdapterError(outcome.code, outcome.message));
+		// `phase` is the host's own claim, and a host that omits it leaves `terminalOutcome`
+		// deriving the phase with no evidence at all — `submission`, even for a turn this
+		// connection watched start. Upgrade it from the frames this prompt actually owned, never
+		// downgrade a terminal that already reported `post_start`, and carry the whole
+		// classification on the rejection so the first-turn retry gate can read it (review P1).
+		const failure =
+			outcome.phase === "post_start"
+				? outcome
+				: (rephaseFailedOutcome(outcome, { hasActivity: waiter.observedTurnActivity }) as SdkPromptFailedOutcome);
+		waiter.reject(new AcpPromptFailureError(failure));
 	}
 
 	async #emitEndOfTurnUpdates(id: string, adapter: AcpSdkAdapter, publicationGeneration: number): Promise<void> {

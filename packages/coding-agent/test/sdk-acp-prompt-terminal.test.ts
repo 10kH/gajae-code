@@ -35,7 +35,13 @@ type Fixture = {
 	fireRetryBackoff(): void;
 	promptDeliveryCount(): number;
 	sendStopped(reason: StoppedReason): void;
-	sendFailed(code: FailedCode, finalText?: string): void;
+	sendFailed(code: FailedCode, finalText?: string, providerCode?: string): void;
+	/**
+	 * A `prompt_failed` terminal in the startup-readiness class (issue #5574): a provider/transport
+	 * classifier, which the agent pairs with the observed `agent_start` to classify the failure as
+	 * post-start. Only this class is first-turn retryable.
+	 */
+	sendReadinessFailure(finalText?: string): void;
 	sendDiagnostic(): void;
 	sendAssistantMessage(text: string): void;
 	sendIdle(): void;
@@ -160,13 +166,14 @@ async function createFixture(
 			error: { code: "provider_unavailable", message: "diagnostic from fixture" },
 		});
 	};
-	const sendFailed = (code: FailedCode, finalText?: string): void => {
+	const sendFailed = (code: FailedCode, finalText?: string, providerCode?: string): void => {
 		const correlation = activeCorrelation();
 		const outcome = {
 			kind: "failed" as const,
 			code,
 			message: `${code} from fixture`,
 			provenance: code === "prompt_failed" ? ("agent_failed" as const) : ("deadline" as const),
+			...(providerCode === undefined ? {} : { providerCode }),
 		};
 		send({
 			type: "agent_failed",
@@ -182,6 +189,8 @@ async function createFixture(
 			outcome,
 		});
 	};
+	const sendReadinessFailure = (finalText?: string): void =>
+		sendFailed("prompt_failed", finalText, "provider_unavailable");
 	const sendAssistantMessage = (text: string): void => {
 		send({
 			type: "event",
@@ -514,6 +523,7 @@ async function createFixture(
 		promptDeliveryCount: () => promptDeliveries,
 		sendStopped,
 		sendFailed,
+		sendReadinessFailure,
 		sendDiagnostic,
 		sendAssistantMessage,
 		sendIdle,
@@ -647,7 +657,7 @@ test("ACP retries a first-turn prompt_failed after the turn started, then recove
 			commandId: "prompt-terminal-command",
 			turnId: "prompt-terminal-turn",
 		});
-		fixture.sendFailed("prompt_failed");
+		fixture.sendReadinessFailure();
 		// The first prompt is re-submitted to the host as a distinct second delivery.
 		await waitFor(() => fixture.promptDeliveryCount() === 2, "first-turn retry delivery");
 		// The retry lands on a host that has finished coming up and completes normally.
@@ -671,7 +681,7 @@ test("ACP rejects a concurrent prompt during the first-turn retry backoff window
 			commandId: "prompt-terminal-command",
 			turnId: "prompt-terminal-turn",
 		});
-		fixture.sendFailed("prompt_failed");
+		fixture.sendReadinessFailure();
 		// The controlled clock captures the backoff without firing it, holding the exact gap
 		// the fix must cover: `activePrompt` is already cleared, but the retry has not resubmitted.
 		await bounded(fixture.retryBackoffScheduled, "first-turn retry backoff scheduled");
@@ -704,7 +714,7 @@ test("ACP admits a prompt after the first-turn retry completes (reservation rele
 			commandId: "prompt-terminal-command",
 			turnId: "prompt-terminal-turn",
 		});
-		fixture.sendFailed("prompt_failed");
+		fixture.sendReadinessFailure();
 		// The retry resubmits and recovers, releasing the reservation on success.
 		await waitFor(() => fixture.promptDeliveryCount() === 2, "first-turn retry delivery");
 		fixture.sendStopped("end_turn");
@@ -731,7 +741,7 @@ test("ACP releases the first-turn retry reservation when the retry fails (no lea
 			commandId: "prompt-terminal-command",
 			turnId: "prompt-terminal-turn",
 		});
-		fixture.sendFailed("prompt_failed");
+		fixture.sendReadinessFailure();
 		await waitFor(() => fixture.promptDeliveryCount() === 2, "first-turn retry delivery");
 		// The retry attempt fails before ever starting the turn, so it is surfaced (not retried
 		// again) and the reservation must be released as the caller rejects.
@@ -762,7 +772,7 @@ test("ACP settles the first-turn retry as cancelled when a cancel arrives during
 			commandId: "prompt-terminal-command",
 			turnId: "prompt-terminal-turn",
 		});
-		fixture.sendFailed("prompt_failed");
+		fixture.sendReadinessFailure();
 		await bounded(fixture.retryBackoffScheduled, "first-turn retry backoff scheduled");
 		// The client cancels while the retry is parked in its backoff gap. The adapter cancel
 		// is acknowledged (no active turn to stop), so the cancel intent is retained for the
@@ -794,7 +804,7 @@ test("ACP settles the first-turn retry as cancelled even when the adapter cancel
 			commandId: "prompt-terminal-command",
 			turnId: "prompt-terminal-turn",
 		});
-		fixture.sendFailed("prompt_failed");
+		fixture.sendReadinessFailure();
 		await bounded(fixture.retryBackoffScheduled, "first-turn retry backoff scheduled");
 		// The cancel is rejected by the adapter, but the reservation keeps the intent so the
 		// prior fix's clear-on-no-waiter does not erase it while the retry is still pending.
@@ -826,6 +836,34 @@ test("ACP does not retry a first-turn prompt_failed that never started the turn"
 	}
 });
 
+for (const { label, providerCode } of [
+	{ label: "provider rejection", providerCode: "provider_http_429" },
+	{ label: "agent runtime failure", providerCode: "internal" },
+] as const) {
+	test(`ACP does not retry a first-turn ${label} that started the turn but published nothing (review P1)`, async () => {
+		const fixture = await createFixture();
+		try {
+			const pending = prompt(fixture, `first turn ${label} after starting`);
+			await bounded(fixture.promptDelivered, "first prompt delivery");
+			// The turn started (agent_start) and published no tool call and no assistant output —
+			// the shape that used to be enough to authorize a retry on its own. Its terminal is
+			// classified as a genuine failure of this turn, not the startup-readiness race, so it
+			// is surfaced with its code instead of being silently re-run as a second turn.
+			fixture.sendTerminal({
+				type: "agent_start",
+				sessionId: "prompt-terminal-session",
+				commandId: "prompt-terminal-command",
+				turnId: "prompt-terminal-turn",
+			});
+			fixture.sendFailed("prompt_failed", undefined, providerCode);
+			await expect(bounded(pending, `${label} settlement`)).rejects.toMatchObject({ code: "prompt_failed" });
+			expect(fixture.promptDeliveryCount()).toBe(1);
+		} finally {
+			fixture.dispose();
+		}
+	});
+}
+
 test("ACP retries a valid first prompt even after an earlier preflight rejection (review P2)", async () => {
 	const fixture = await createFixture();
 	try {
@@ -854,7 +892,7 @@ test("ACP retries a valid first prompt even after an earlier preflight rejection
 			commandId: "prompt-terminal-command",
 			turnId: "prompt-terminal-turn",
 		});
-		fixture.sendFailed("prompt_failed");
+		fixture.sendReadinessFailure();
 		await waitFor(() => fixture.promptDeliveryCount() === 2, "first-turn retry delivery");
 		fixture.sendStopped("end_turn");
 		expect(await bounded(pending, "first-turn retry recovery")).toEqual({ stopReason: "end_turn" });
@@ -881,7 +919,7 @@ test("ACP does not retry a prompt_failed on a later turn even after activity", a
 			commandId: "prompt-terminal-command-2",
 			turnId: "prompt-terminal-turn-2",
 		});
-		fixture.sendFailed("prompt_failed");
+		fixture.sendReadinessFailure();
 		await expect(bounded(second, "second turn failure settlement")).rejects.toMatchObject({
 			code: "prompt_failed",
 		});
@@ -919,7 +957,7 @@ test("ACP does not retry a first-turn prompt_failed once the turn executed a too
 				},
 			},
 		});
-		fixture.sendFailed("prompt_failed");
+		fixture.sendReadinessFailure();
 		await expect(bounded(pending, "tool-progressed failure settlement")).rejects.toMatchObject({
 			code: "prompt_failed",
 		});
@@ -962,7 +1000,7 @@ test("ACP does not retry a first-turn prompt_failed once the turn published assi
 				),
 			"assistant chunk publication",
 		);
-		fixture.sendFailed("prompt_failed");
+		fixture.sendReadinessFailure();
 		await expect(bounded(pending, "assistant-output failure settlement")).rejects.toMatchObject({
 			code: "prompt_failed",
 		});
@@ -997,7 +1035,7 @@ test("ACP does not retry a first-turn prompt_failed whose terminal carries final
 			commandId: "prompt-terminal-command",
 			turnId: "prompt-terminal-turn",
 		});
-		fixture.sendFailed("prompt_failed", "the whole answer, delivered only as final text");
+		fixture.sendReadinessFailure("the whole answer, delivered only as final text");
 		await expect(bounded(pending, "final-text failure settlement")).rejects.toMatchObject({
 			code: "prompt_failed",
 		});
@@ -1034,7 +1072,7 @@ test("ACP settles the first-turn retry as cancelled when a close tears the sessi
 			commandId: "prompt-terminal-command",
 			turnId: "prompt-terminal-turn",
 		});
-		fixture.sendFailed("prompt_failed");
+		fixture.sendReadinessFailure();
 		await bounded(fixture.retryBackoffScheduled, "first-turn retry backoff scheduled");
 		// `session/close` wins the gap and removes the session record.
 		expect(
@@ -1083,7 +1121,7 @@ test("ACP does not retry a first-turn readiness race after reattaching a session
 			commandId: "prompt-terminal-command-2",
 			turnId: "prompt-terminal-turn-2",
 		});
-		fixture.sendFailed("prompt_failed");
+		fixture.sendReadinessFailure();
 		await expect(bounded(second, "reattached failure settlement")).rejects.toMatchObject({
 			code: "prompt_failed",
 		});
@@ -1118,7 +1156,7 @@ test("ACP does not retry a first-turn readiness race on a loaded session with pr
 			commandId: "prompt-terminal-command",
 			turnId: "prompt-terminal-turn",
 		});
-		fixture.sendFailed("prompt_failed");
+		fixture.sendReadinessFailure();
 		await expect(bounded(pending, "loaded failure settlement")).rejects.toMatchObject({
 			code: "prompt_failed",
 		});
