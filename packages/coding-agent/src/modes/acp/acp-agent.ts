@@ -1809,6 +1809,14 @@ export class AcpAgent implements Agent {
 						maxRetries: ACP_FIRST_PROMPT_MAX_RETRIES,
 					});
 					await this.#delayFirstPromptRetry(attempt);
+					// The failed attempt publishes its final text and its failure diagnostic on async
+					// tails, and `#submitPrompt` rejects any prompt while one of them is still in
+					// flight. A slow or backpressured ACP client keeps a tail running well past a
+					// 250/500ms backoff, so an authorized retry would lose its own turn to a
+					// `conflict` raised by its own predecessor's publications. Wait the tails out
+					// here instead of weakening those guards, which still have to reject prompts
+					// racing in from other callers (review P1).
+					await this.#drainPromptPublicationTails(params.sessionId);
 					// A session/close or session/delete that won the backoff gap tore the record
 					// down without a waiter to settle, leaving its outcome on this reservation.
 					// Honor it here: resubmitting would only reach `#submitPrompt`'s not_found,
@@ -1894,6 +1902,26 @@ export class AcpAgent implements Agent {
 		// its terminal's final text, duplicating or corrupting the assistant stream.
 		if (record.promptObservedAssistantOutput) return false;
 		return true;
+	}
+
+	/**
+	 * Settles the publication tails a finished turn left running: its terminal's final text, its
+	 * end-of-turn metadata, and its failure diagnostic. Each tail owns one of `#submitPrompt`'s
+	 * conflict guards, and a tail can start another (the failure diagnostic awaits the final text),
+	 * so this drains until none is left rather than sampling once.
+	 */
+	async #drainPromptPublicationTails(id: string): Promise<void> {
+		for (;;) {
+			const tails = [
+				this.#finalTextTails.get(id),
+				this.#terminalMetadataTails.get(id),
+				this.#failureDiagnosticTails.get(id),
+			].filter((tail): tail is Promise<void> => tail !== undefined);
+			if (tails.length === 0) return;
+			// A publication failure is the tail's own business; it is logged where it happens and
+			// must not decide the retry.
+			await Promise.allSettled(tails);
+		}
 	}
 
 	/** Backoff between first-prompt retries, on the injectable watchdog clock so tests can advance it. */

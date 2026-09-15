@@ -703,6 +703,40 @@ test("ACP rejects a concurrent prompt during the first-turn retry backoff window
 	}
 });
 
+test("ACP first-turn retry waits out a failure diagnostic still publishing after the backoff (review P1)", async () => {
+	const fixture = await createFixture({ controlledRetryBackoff: true, blockFailureDiagnosticUpdate: true });
+	try {
+		const pending = prompt(fixture, "first turn readiness race");
+		await bounded(fixture.promptDelivered, "first prompt delivery");
+		fixture.sendTerminal({
+			type: "agent_start",
+			sessionId: "prompt-terminal-session",
+			commandId: "prompt-terminal-command",
+			turnId: "prompt-terminal-turn",
+		});
+		// The failed turn leaves a failure diagnostic publishing on an async tail, held here by a
+		// client that is slow to accept the update — exactly what a backpressured ACP client does.
+		fixture.sendDiagnostic();
+		fixture.sendReadinessFailure();
+		await bounded(fixture.failureDiagnosticEntered, "blocked failure diagnostic publication");
+		await bounded(fixture.retryBackoffScheduled, "first-turn retry backoff scheduled");
+		// The backoff expires while that tail is still in flight. The retry must wait for it rather
+		// than dispatch into `#submitPrompt`, whose conflict guard would reject the authorized retry
+		// with the previous attempt's own publication as the reason.
+		fixture.fireRetryBackoff();
+		await Bun.sleep(50);
+		expect(fixture.promptDeliveryCount()).toBe(1);
+		// Once the client accepts the diagnostic, the retry resubmits and recovers normally.
+		fixture.releaseFailureDiagnostic();
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "first-turn retry delivery");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(pending, "first-turn retry recovery")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		fixture.releaseFailureDiagnostic();
+		fixture.dispose();
+	}
+});
+
 test("ACP admits a prompt after the first-turn retry completes (reservation released)", async () => {
 	const fixture = await createFixture();
 	try {
