@@ -160,6 +160,8 @@ interface PromptWaiter {
 	activity: PromptActivity;
 	/** True once a prompt-owned progress frame (agent_start / message / tool) was observed; gates first-turn retries. */
 	observedTurnActivity: boolean;
+	/** True once a prompt-owned tool execution frame was observed; vetoes a first-turn retry that would re-run it. */
+	observedToolExecution: boolean;
 	/** Coordinates a prompt-control rejection racing an acknowledged ACP cancellation. */
 	cancelAttempt?: Promise<boolean>;
 	/** Whether ANY overlapping cancel attempt for this prompt was acknowledged:
@@ -220,6 +222,8 @@ type SessionRecord = {
 	firstPromptDone?: boolean;
 	/** Whether the current prompt attempt was observed doing work; reset per attempt, read by the first-turn retry gate. */
 	promptObservedActivity?: boolean;
+	/** Whether the current prompt attempt executed a tool; reset per attempt, vetoes a first-turn retry that would re-run it. */
+	promptObservedToolExecution?: boolean;
 };
 
 /**
@@ -233,6 +237,22 @@ function isTurnProgressEventType(type: string | undefined): boolean {
 		case "message_start":
 		case "message_update":
 		case "message_end":
+		case "tool_execution_start":
+		case "tool_execution_update":
+		case "tool_execution_end":
+			return true;
+		default:
+			return false;
+	}
+}
+
+/**
+ * Prompt-owned frame types that prove a tool actually executed. A turn that ran a tool did
+ * side-effecting work, so it must never be re-run by the first-turn readiness retry (issue
+ * #5574 / review P1): a re-submit is an independent turn that would repeat those side effects.
+ */
+function isTurnToolExecutionEventType(type: string | undefined): boolean {
+	switch (type) {
 		case "tool_execution_start":
 		case "tool_execution_update":
 		case "tool_execution_end":
@@ -1724,17 +1744,26 @@ export class AcpAgent implements Agent {
 
 	/**
 	 * The readiness-race signature (issue #5574): the session's first turn was accepted
-	 * and started producing frames (an `agent_start`, a tool call — the reported log shows
-	 * `todo_write`), then failed as `prompt_failed` before ever completing. Re-submitting
-	 * the same first prompt a bounded number of times lets a host that has since finished
-	 * coming up answer it, instead of ending the session on its first turn.
+	 * and started producing frames (an `agent_start`), then failed as `prompt_failed` before
+	 * ever completing. Re-submitting the same first prompt a bounded number of times lets a
+	 * host that has since finished coming up answer it, instead of ending the session on its
+	 * first turn.
+	 *
+	 * A retry re-submits the prompt as a fresh, INDEPENDENT `turn.prompt` — `AcpSdkAdapter`
+	 * assigns a new request id per call — so it must never re-run a turn that already did
+	 * side-effecting work. If the failed turn executed a tool, re-submitting would run the
+	 * user's instruction, and its side effects, a second time (review P1). A turn that only
+	 * started (agent_start / streamed text) but ran no tool produced no external effect, so
+	 * recovering it is safe.
 	 *
 	 * Every gate is deliberately narrow so a genuine failure is still surfaced:
 	 * - only the first logical prompt of the session (`!firstPromptDone`);
 	 * - only an `agent_failed` `prompt_failed` terminal — never a client cancel, a
 	 *   `prompt_deadline_exceeded`, a transport error, or a preflight rejection;
-	 * - only after the turn was observed doing work (`promptObservedActivity`), which is
-	 *   the race's fingerprint and which a turn rejected before it ever started never has;
+	 * - only after the turn was observed starting (`promptObservedActivity`), the race's
+	 *   fingerprint, which a turn rejected before it ever started never has;
+	 * - but NEVER once the turn executed a tool (`promptObservedToolExecution`), so a
+	 *   progressed, side-effecting turn is never re-run as a second turn;
 	 * - never once the client has asked to cancel.
 	 */
 	#shouldRetryFirstPrompt(record: SessionRecord, error: unknown, attempt: number): boolean {
@@ -1742,6 +1771,10 @@ export class AcpAgent implements Agent {
 		if (record.firstPromptDone) return false;
 		if (record.cancelRequested) return false;
 		if (!record.promptObservedActivity) return false;
+		// Never re-run a turn that already executed a tool: a re-submit is a new, independent
+		// turn.prompt, so repeating a tool-executing turn would run the user's instruction and
+		// its side effects a second time (review P1).
+		if (record.promptObservedToolExecution) return false;
 		return error instanceof AcpSdkAdapterError && error.code === "prompt_failed";
 	}
 
@@ -1827,6 +1860,7 @@ export class AcpAgent implements Agent {
 		// Reset per attempt: a first-turn readiness retry keys on whether THIS attempt was
 		// observed doing work, never a prior attempt's activity.
 		record.promptObservedActivity = false;
+		record.promptObservedToolExecution = false;
 		const { promise: response, resolve, reject } = Promise.withResolvers<PromptResponse>();
 		const waiter: PromptWaiter = {
 			acknowledged: false,
@@ -1844,6 +1878,7 @@ export class AcpAgent implements Agent {
 			lastFrameType: "prompt_dispatch",
 			activity: new PromptActivity(),
 			observedTurnActivity: false,
+			observedToolExecution: false,
 			resolve,
 			reject,
 		};
@@ -1991,6 +2026,7 @@ export class AcpAgent implements Agent {
 				if (matchesWaiter) {
 					this.#observePromptActivity(waiter, deferredFrame);
 					if (waiter.observedTurnActivity) record.promptObservedActivity = true;
+					if (waiter.observedToolExecution) record.promptObservedToolExecution = true;
 					observedDeferredActivity = true;
 				}
 			}
@@ -2567,6 +2603,12 @@ export class AcpAgent implements Agent {
 				backgroundCorrelations: [],
 				toolArgs: new Map(),
 			};
+			// Preserve first-turn state across reattachment (issue #5574). The startup-readiness
+			// retry only guards a session's very first logical prompt; a fresh record built on
+			// reconnect/reattach would otherwise reset that guard and let a later prompt take the
+			// retry — and re-run — path. Reattachment retains the session's settled prompt
+			// correlations, so a non-empty set proves at least one prompt has already completed.
+			if (record.settledPromptCorrelations.length > 0) record.firstPromptDone = true;
 			record.unsubscribe = adapter.onFrame(frame => this.#enqueueSdkFrame(id, adapter!, frame));
 			record.reconnectUnsubscribe = adapter.onReconnectFailed(error =>
 				this.#recoverSessionAfterTransportFailure(id, adapter!, error),
@@ -2977,6 +3019,7 @@ export class AcpAgent implements Agent {
 		if (!correlationsExactlyMatch(waiter.correlation, correlation)) return;
 		this.#observePromptActivity(waiter, frame);
 		if (waiter.observedTurnActivity) record.promptObservedActivity = true;
+		if (waiter.observedToolExecution) record.promptObservedToolExecution = true;
 		this.#armPromptWatchdog(id, record, waiter);
 	}
 
@@ -2987,6 +3030,8 @@ export class AcpAgent implements Agent {
 			typeof event?.type === "string" ? event.type : typeof frame.type === "string" ? frame.type : "unknown";
 		if (isTurnProgressEventType(typeof event?.type === "string" ? event.type : undefined))
 			waiter.observedTurnActivity = true;
+		if (isTurnToolExecutionEventType(typeof event?.type === "string" ? event.type : undefined))
+			waiter.observedToolExecution = true;
 		waiter.activity.observe(
 			typeof event?.type === "string" ? event.type : undefined,
 			typeof event?.toolCallId === "string" ? event.toolCallId : undefined,
@@ -3952,6 +3997,10 @@ export class AcpAgent implements Agent {
 					);
 				}
 				const messageId = typeof message.id === "string" ? message.id : undefined;
+				// A replayed user turn is proof the loaded session already had a prompt, so the
+				// next live prompt is not its first — keep the first-turn readiness retry (issue
+				// #5574) off for a resumed/loaded session that has prior history.
+				if (message.role === "user") record.firstPromptDone = true;
 				const richContent = Array.isArray(message.content) ? message.content : undefined;
 				if ((message.role === "user" || message.role === "assistant") && richContent) {
 					for (const rawBlock of richContent) {
