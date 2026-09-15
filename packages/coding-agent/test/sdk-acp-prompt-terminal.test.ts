@@ -748,6 +748,66 @@ test("ACP releases the first-turn retry reservation when the retry fails (no lea
 	}
 });
 
+test("ACP settles the first-turn retry as cancelled when a cancel arrives during the backoff (review P1)", async () => {
+	const fixture = await createFixture({ controlledRetryBackoff: true });
+	try {
+		const pending = prompt(fixture, "first turn readiness race");
+		await bounded(fixture.promptDelivered, "first prompt delivery");
+		// The turn started (agent_start) then failed prompt_failed — the readiness-race
+		// fingerprint. The retry reserves the session and waits on the captured backoff.
+		fixture.sendTerminal({
+			type: "agent_start",
+			sessionId: "prompt-terminal-session",
+			commandId: "prompt-terminal-command",
+			turnId: "prompt-terminal-turn",
+		});
+		fixture.sendFailed("prompt_failed");
+		await bounded(fixture.retryBackoffScheduled, "first-turn retry backoff scheduled");
+		// The client cancels while the retry is parked in its backoff gap. The adapter cancel
+		// is acknowledged (no active turn to stop), so the cancel intent is retained for the
+		// retry owner to observe.
+		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "backoff cancel acknowledgement");
+		// Firing the backoff must NOT resubmit a fresh turn: the retry observes the cancel and
+		// settles as cancelled instead.
+		fixture.fireRetryBackoff();
+		expect(await bounded(pending, "cancelled first-turn retry")).toEqual({ stopReason: "cancelled" });
+		expect(fixture.promptDeliveryCount()).toBe(1);
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP settles the first-turn retry as cancelled even when the adapter cancel is unacknowledged (review P1)", async () => {
+	const fixture = await createFixture({
+		controlledRetryBackoff: true,
+		// The adapter answers the backoff-gap cancel with an unacknowledged disposition, so
+		// `cancel()` itself rejects. The cancel intent must still survive for the retry owner.
+		abortAcknowledgement: { ok: true, result: {} },
+	});
+	try {
+		const pending = prompt(fixture, "first turn readiness race");
+		await bounded(fixture.promptDelivered, "first prompt delivery");
+		fixture.sendTerminal({
+			type: "agent_start",
+			sessionId: "prompt-terminal-session",
+			commandId: "prompt-terminal-command",
+			turnId: "prompt-terminal-turn",
+		});
+		fixture.sendFailed("prompt_failed");
+		await bounded(fixture.retryBackoffScheduled, "first-turn retry backoff scheduled");
+		// The cancel is rejected by the adapter, but the reservation keeps the intent so the
+		// prior fix's clear-on-no-waiter does not erase it while the retry is still pending.
+		await expect(
+			bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "unacknowledged backoff cancel"),
+		).rejects.toThrow("SDK did not acknowledge cancellation");
+		fixture.fireRetryBackoff();
+		expect(await bounded(pending, "cancelled first-turn retry")).toEqual({ stopReason: "cancelled" });
+		expect(fixture.promptDeliveryCount()).toBe(1);
+	} finally {
+		fixture.dispose();
+	}
+});
+
 test("ACP does not retry a first-turn prompt_failed that never started the turn", async () => {
 	const fixture = await createFixture();
 	try {

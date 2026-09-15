@@ -1752,6 +1752,16 @@ export class AcpAgent implements Agent {
 						maxRetries: ACP_FIRST_PROMPT_MAX_RETRIES,
 					});
 					await this.#delayFirstPromptRetry(attempt);
+					// A session/cancel that arrived during the backoff gap (activePrompt already
+					// cleared by the failed attempt, retry not yet resubmitted) must settle the
+					// retry as `cancelled` instead of dispatching a fresh turn the client no
+					// longer wants. The check lives here, before resubmission, because
+					// `#submitPrompt` unconditionally clears `cancelRequested` for the new turn
+					// it is about to start, so a later check would miss it (review P1).
+					if (record.cancelRequested) {
+						record.cancelRequested = false;
+						return { stopReason: "cancelled" };
+					}
 				}
 			}
 		} finally {
@@ -2242,7 +2252,11 @@ export class AcpAgent implements Agent {
 			}
 			waiter?.cancelAttemptResolve?.(true);
 		} catch (error) {
-			if (!waiter) record.cancelRequested = false;
+			// With no active prompt the cancel intent normally clears — except when a first-turn
+			// retry is reserved across its backoff gap. That reservation owner has not yet observed
+			// the cancel; clearing it here would let the retry resubmit a turn the client cancelled
+			// (review P1). Leave the flag for the retry's post-backoff check to settle as cancelled.
+			if (!waiter && !record.pendingFirstPromptRetry) record.cancelRequested = false;
 			// Only the LAST in-flight attempt resolves the shared promise false;
 			// an earlier attempt may still acknowledge (review thread P2). After
 			// every attempt of this wave failed, RE-ARM the aggregate: a later
