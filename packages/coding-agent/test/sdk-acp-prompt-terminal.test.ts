@@ -825,6 +825,43 @@ test("ACP does not retry a first-turn prompt_failed that never started the turn"
 	}
 });
 
+test("ACP retries a valid first prompt even after an earlier preflight rejection (review P2)", async () => {
+	const fixture = await createFixture();
+	try {
+		// A malformed request (empty prompt) is rejected in preflight, before any turn is
+		// dispatched. It must NOT consume the session's one-shot first-turn retry budget.
+		await expect(
+			bounded(
+				fixture.agent.prompt({
+					sessionId: fixture.sessionId,
+					messageId: "00000000-0000-4000-8000-000000000002",
+					prompt: [{ type: "text", text: "" }],
+				} as PromptRequest),
+				"preflight rejection",
+			),
+		).rejects.toMatchObject({ code: "invalid_input" });
+		// The rejection never dispatched a turn.
+		expect(fixture.promptDeliveryCount()).toBe(0);
+		// The first VALID prompt hits the startup readiness race: the turn starts (agent_start)
+		// then fails prompt_failed. Because the earlier rejection never settled the first turn,
+		// this prompt is still first-turn-retry eligible and recovers.
+		const pending = prompt(fixture, "first turn readiness race");
+		await bounded(fixture.promptDelivered, "first prompt delivery");
+		fixture.sendTerminal({
+			type: "agent_start",
+			sessionId: "prompt-terminal-session",
+			commandId: "prompt-terminal-command",
+			turnId: "prompt-terminal-turn",
+		});
+		fixture.sendFailed("prompt_failed");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "first-turn retry delivery");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(pending, "first-turn retry recovery")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
 test("ACP does not retry a prompt_failed on a later turn even after activity", async () => {
 	const fixture = await createFixture();
 	try {

@@ -234,7 +234,15 @@ type SessionRecord = {
  * request cannot slip into the gap between `#settlePrompt` clearing `activePrompt` on the failed
  * first attempt and the retry resubmitting after its backoff (review P1, issue #5574).
  */
-type FirstPromptRetryReservation = { readonly firstPromptRetry: true };
+type FirstPromptRetryReservation = {
+	readonly firstPromptRetry: true;
+	/**
+	 * Set once `#submitPrompt` dispatched a turn for this prompt. Distinguishes a prompt that
+	 * genuinely owned the session's first turn from a preflight rejection, so only the former
+	 * settles `firstPromptDone` (review P2).
+	 */
+	admitted?: boolean;
+};
 
 /**
  * Prompt-owned frame types that prove the turn is underway (as opposed to a
@@ -1768,7 +1776,13 @@ export class AcpAgent implements Agent {
 			// Release the reservation on retry completion (success), cancellation, or final
 			// failure. Guarded so a later prompt that took ownership is never cleared by this caller.
 			if (record.pendingFirstPromptRetry === retryReservation) record.pendingFirstPromptRetry = undefined;
-			record.firstPromptDone = true;
+			// Only a turn that was actually admitted (dispatched to the host) settles the
+			// session's first prompt. A preflight rejection — validation, auth/preflight, a
+			// stale-state conflict, an oversize frame, or an ensureProviders() failure — never
+			// owned a turn, so it must not consume the one-shot first-turn retry budget: a later
+			// valid first prompt that hits the startup readiness race must still be retryable
+			// (review P2).
+			if (retryReservation.admitted) record.firstPromptDone = true;
 		}
 	}
 
@@ -1980,6 +1994,10 @@ export class AcpAgent implements Agent {
 				);
 			}
 		waiter.dispatched = true;
+		// The turn is now dispatched to the host: this prompt owned the session's first turn,
+		// so it — not a preflight rejection that threw before this point — is what settles
+		// `firstPromptDone` in `prompt()` (review P2).
+		if (retryReservation) retryReservation.admitted = true;
 		if (waiter.settled || record.activePrompt !== waiter) {
 			return await response;
 		}
