@@ -35,7 +35,7 @@ type Fixture = {
 	fireRetryBackoff(): void;
 	promptDeliveryCount(): number;
 	sendStopped(reason: StoppedReason): void;
-	sendFailed(code: FailedCode): void;
+	sendFailed(code: FailedCode, finalText?: string): void;
 	sendDiagnostic(): void;
 	sendAssistantMessage(text: string): void;
 	sendIdle(): void;
@@ -160,7 +160,7 @@ async function createFixture(
 			error: { code: "provider_unavailable", message: "diagnostic from fixture" },
 		});
 	};
-	const sendFailed = (code: FailedCode): void => {
+	const sendFailed = (code: FailedCode, finalText?: string): void => {
 		const correlation = activeCorrelation();
 		const outcome = {
 			kind: "failed" as const,
@@ -173,6 +173,7 @@ async function createFixture(
 			sessionId,
 			...correlation,
 			outcome,
+			...(finalText === undefined ? {} : { finalText }),
 		});
 		send({
 			type: "agent_end",
@@ -975,6 +976,46 @@ test("ACP does not retry a first-turn prompt_failed once the turn published assi
 					(update.update as { content: { text: string } }).content.text === "partial answer before failure",
 			),
 		).toHaveLength(1);
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP does not retry a first-turn prompt_failed whose terminal carries final text (review P1)", async () => {
+	const fixture = await createFixture();
+	try {
+		const pending = prompt(fixture, "first turn answers via final text then fails");
+		await bounded(fixture.promptDelivered, "first prompt delivery");
+		// The turn started, streamed NO chunks, and then failed with a terminal carrying the
+		// whole answer as finalText. That text is published to ACP consumers on an async tail
+		// that runs after the rejection settles, so the retry gate must already treat it as
+		// assistant output — otherwise it sees "started, no output", resubmits, and both this
+		// answer and the retry's answer reach the client.
+		fixture.sendTerminal({
+			type: "agent_start",
+			sessionId: "prompt-terminal-session",
+			commandId: "prompt-terminal-command",
+			turnId: "prompt-terminal-turn",
+		});
+		fixture.sendFailed("prompt_failed", "the whole answer, delivered only as final text");
+		await expect(bounded(pending, "final-text failure settlement")).rejects.toMatchObject({
+			code: "prompt_failed",
+		});
+		// No retry: the prompt was delivered exactly once.
+		expect(fixture.promptDeliveryCount()).toBe(1);
+		// The terminal's final text reached consumers exactly once, never alongside a second
+		// attempt's output.
+		await waitFor(
+			() =>
+				fixture.updates.some(
+					update =>
+						update.update.sessionUpdate === "agent_message_chunk" &&
+						(update.update as { content: { text: string } }).content.text ===
+							"the whole answer, delivered only as final text",
+				),
+			"final text publication",
+		);
+		expect(fixture.updates.filter(update => update.update.sessionUpdate === "agent_message_chunk")).toHaveLength(1);
 	} finally {
 		fixture.dispose();
 	}

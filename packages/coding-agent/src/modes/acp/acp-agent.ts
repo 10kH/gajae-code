@@ -1812,7 +1812,8 @@ export class AcpAgent implements Agent {
 	 *   progressed, side-effecting turn is never re-run as a second turn;
 	 * - but NEVER once the turn published assistant text/thought output
 	 *   (`promptObservedAssistantOutput`), so a re-submit cannot expose duplicated output
-	 *   from both attempts to the live ACP update stream;
+	 *   from both attempts to the live ACP update stream — including a failed terminal's own
+	 *   `finalText`, which is published on an async tail after this gate runs;
 	 * - never once the client has asked to cancel.
 	 */
 	#shouldRetryFirstPrompt(record: SessionRecord, error: unknown, attempt: number): boolean {
@@ -1824,9 +1825,10 @@ export class AcpAgent implements Agent {
 		// turn.prompt, so repeating a tool-executing turn would run the user's instruction and
 		// its side effects a second time (review P1).
 		if (record.promptObservedToolExecution) return false;
-		// Never re-run a turn that already published assistant text/thought output: a re-submit
-		// is a new, independent turn.prompt whose output would be delivered to ACP consumers on
-		// top of the failed attempt's chunks, duplicating or corrupting the assistant stream.
+		// Never re-run a turn that already published — or has committed to publishing —
+		// assistant text/thought output: a re-submit is a new, independent turn.prompt whose
+		// output would be delivered to ACP consumers on top of the failed attempt's chunks or
+		// its terminal's final text, duplicating or corrupting the assistant stream.
 		if (record.promptObservedAssistantOutput) return false;
 		return error instanceof AcpSdkAdapterError && error.code === "prompt_failed";
 	}
@@ -3318,6 +3320,13 @@ export class AcpAgent implements Agent {
 				return;
 			}
 			activePrompt.terminal = { outcome, correlation };
+			// A terminal carrying final text still publishes it as an assistant chunk, on the
+			// async tail `#scheduleTerminalUpdates` starts below. A failed terminal can carry it
+			// with no preceding stream chunks at all, so the streamed-chunk flag stays false and
+			// the first-turn retry gate — which the settlement below releases — would see
+			// "started, no output", resubmit, and let BOTH this terminal's final text and the
+			// retry's answer reach ACP consumers. Record the output before settling (review P1).
+			if (typeof event.finalText === "string" && event.finalText) record.promptObservedAssistantOutput = true;
 			// Failure diagnostics are useful but advisory. Settle before any mapped
 			// session update can await a backpressured client transport; otherwise an
 			// already-decided failure can still lose to the inactivity watchdog.
