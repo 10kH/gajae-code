@@ -526,6 +526,75 @@ describe("AuthStorage OAuth refresh race", () => {
 		});
 	}
 
+	test("a cancelled MCP-bound refresh does not poison the failure memo or block the credential", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+
+		// The bound token endpoint hangs on the first (cancelled) attempt so the
+		// caller aborts mid-refresh, then succeeds for the later request. Before the
+		// fix, the aborted attempt was recorded in the replay-guard memo, which
+		// re-threw on the next request and temp-blocked a healthy credential.
+		const gotFirstRequest = Promise.withResolvers<void>();
+		const releaseHang = Promise.withResolvers<void>();
+		let firstRequest = true;
+		const server = Bun.serve({
+			port: 0,
+			fetch: async () => {
+				if (firstRequest) {
+					firstRequest = false;
+					gotFirstRequest.resolve();
+					await releaseHang.promise; // hang until the caller aborts / cleanup
+					return new Response("aborted", { status: 500 });
+				}
+				return Response.json({ access_token: "fresh-access", refresh_token: "fresh-refresh", expires_in: 3600 });
+			},
+		});
+		try {
+			const origin = `http://localhost:${server.port}`;
+			const binding = { resourceOrigin: origin, tokenEndpoint: `${origin}/token` };
+			await authStorage.set("anthropic", [
+				{
+					type: "oauth",
+					access: "expired-access",
+					refresh: "bound-refresh",
+					expires: Date.now() - 60_000,
+					mcpBinding: binding,
+				},
+			]);
+			const credentialId = store.listAuthCredentials("anthropic")[0]!.id;
+
+			vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, creds) => {
+				const credential = creds[provider];
+				if (!credential) return null;
+				return { newCredentials: credential, apiKey: credential.access };
+			});
+
+			const controller = new AbortController();
+			const cancelled = authStorage.refreshCredentialById(credentialId, controller.signal).then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			await gotFirstRequest.promise;
+			controller.abort();
+			const outcome = await cancelled;
+
+			// Cancellation propagates as an error, but must not disable or temp-block
+			// the credential.
+			expect(outcome).toBeInstanceOf(Error);
+			expect(events).toHaveLength(0);
+			expect(authStorage.getEarliestUnblockAt("anthropic")).toBeUndefined();
+
+			// A later normal request must NOT be re-thrown from a poisoned memo: the
+			// endpoint now succeeds, so the credential refreshes cleanly.
+			await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+				expect(await authStorage!.getApiKey("anthropic", "after-cancel")).toBe("fresh-access");
+			});
+			expect(events).toHaveLength(0);
+		} finally {
+			releaseHang.resolve();
+			server.stop(true);
+		}
+	});
+
 	test("invalidating a session-sticky OAuth credential rotates the retry to another active credential", async () => {
 		if (!authStorage) throw new Error("test setup failed");
 

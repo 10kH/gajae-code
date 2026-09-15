@@ -5395,6 +5395,11 @@ export class AuthStorage {
 			}
 			return authority;
 		} catch (error) {
+			// A caller cancellation is not a refresh failure. Rethrow before any
+			// failure classification so an aborted attempt never poisons the replay
+			// guard (which would temp-block the credential on the next request) or
+			// otherwise mutate its health state.
+			if (signal?.aborted) throw error;
 			if (localDial && credentialId !== undefined) {
 				for (const [key, entry] of this.#recentOAuthRefreshFailures) {
 					if (entry.expiresAt <= Date.now()) this.#recentOAuthRefreshFailures.delete(key);
