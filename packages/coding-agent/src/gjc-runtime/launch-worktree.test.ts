@@ -2,7 +2,13 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { evacuatePreWorktreeTarget, isReplaceableWorktreeTarget, restorePreWorktreeGjc } from "./launch-worktree";
+import type { EvacuationHandle, GjcLaunchWorktreePlan } from "./launch-worktree";
+import {
+	commitPreWorktreeRestore,
+	evacuatePreWorktreeTarget,
+	isReplaceableWorktreeTarget,
+	restorePreWorktreeGjc,
+} from "./launch-worktree";
 
 const tempDirs: string[] = [];
 
@@ -10,6 +16,27 @@ function makeTempDir(prefix: string): string {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 	tempDirs.push(dir);
 	return dir;
+}
+
+function git(cwd: string, args: string[]): void {
+	const result = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+	if (result.exitCode !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr.toString().trim()}`);
+}
+
+function initRepo(prefix: string): string {
+	const repo = makeTempDir(prefix);
+	git(repo, ["init", "-q"]);
+	git(repo, ["config", "user.email", "test@example.com"]);
+	git(repo, ["config", "user.name", "Test"]);
+	fs.writeFileSync(path.join(repo, "README.md"), "seed");
+	git(repo, ["add", "."]);
+	git(repo, ["commit", "-q", "-m", "init"]);
+	return repo;
+}
+
+function countRegisteredWorktrees(repo: string): number {
+	const raw = Bun.spawnSync(["git", "worktree", "list", "--porcelain"], { cwd: repo }).stdout.toString();
+	return raw.split(/\r?\n/).filter(line => line.startsWith("worktree ")).length;
 }
 
 afterEach(() => {
@@ -77,5 +104,87 @@ describe("restorePreWorktreeGjc", () => {
 		expect(() => restorePreWorktreeGjc(stash, worktree)).toThrow(/worktree_path_conflict/);
 		// The overlay must not have leaked into the symlink target.
 		expect(fs.existsSync(path.join(outside, "seed.txt"))).toBe(false);
+	});
+});
+
+describe("commitPreWorktreeRestore", () => {
+	test("rolls back the created worktree, preserves the stash, and refuses to report success", () => {
+		const repo = initRepo("gjc-tx-repo-");
+		const bucket = makeTempDir("gjc-tx-bucket-");
+		const worktreePath = path.join(bucket, "wt");
+		git(repo, ["worktree", "add", "-q", "--detach", worktreePath, "HEAD"]);
+		expect(fs.existsSync(path.join(worktreePath, ".git"))).toBe(true);
+		expect(countRegisteredWorktrees(repo)).toBe(2);
+
+		// A stash that the (failing) restore left behind for recovery.
+		const stashPath = path.join(bucket, ".gjc-pre-wt-wt");
+		fs.mkdirSync(stashPath, { recursive: true });
+		fs.writeFileSync(path.join(stashPath, "launcher.txt"), "config");
+
+		const plan: GjcLaunchWorktreePlan = {
+			enabled: true,
+			repoRoot: repo,
+			worktreePath,
+			detached: true,
+			baseRef: "HEAD",
+			branchName: null,
+		};
+		const handle: EvacuationHandle = {
+			restore: () => {
+				throw new Error("overlay exploded");
+			},
+			stashPath,
+		};
+
+		let message = "";
+		try {
+			commitPreWorktreeRestore(handle, plan);
+			throw new Error("expected commitPreWorktreeRestore to throw");
+		} catch (error) {
+			message = error instanceof Error ? error.message : String(error);
+		}
+		expect(message).toMatch(/worktree_gjc_restore_failed/);
+		// Stash location is surfaced for manual recovery.
+		expect(message).toContain(stashPath);
+
+		// The worktree was rolled back: its directory is gone and Git no longer registers it.
+		expect(fs.existsSync(worktreePath)).toBe(false);
+		expect(countRegisteredWorktrees(repo)).toBe(1);
+		// The stash survives so the pre-seeded launcher config can be recovered.
+		expect(fs.existsSync(path.join(stashPath, "launcher.txt"))).toBe(true);
+
+		// A subsequent retry starts from a clean slate.
+		git(repo, ["worktree", "add", "-q", "--detach", worktreePath, "HEAD"]);
+		expect(fs.existsSync(path.join(worktreePath, ".git"))).toBe(true);
+	});
+
+	test("removes the stash and reports success when restore completes", () => {
+		const repo = initRepo("gjc-tx-repo-");
+		const bucket = makeTempDir("gjc-tx-bucket-");
+		const worktreePath = path.join(bucket, "wt");
+		git(repo, ["worktree", "add", "-q", "--detach", worktreePath, "HEAD"]);
+
+		const stashPath = path.join(bucket, ".gjc-pre-wt-wt");
+		fs.mkdirSync(stashPath, { recursive: true });
+		fs.writeFileSync(path.join(stashPath, "launcher.txt"), "config");
+
+		const plan: GjcLaunchWorktreePlan = {
+			enabled: true,
+			repoRoot: repo,
+			worktreePath,
+			detached: true,
+			baseRef: "HEAD",
+			branchName: null,
+		};
+		const handle: EvacuationHandle = {
+			restore: () => restorePreWorktreeGjc(stashPath, worktreePath),
+			stashPath,
+		};
+
+		expect(() => commitPreWorktreeRestore(handle, plan)).not.toThrow();
+		// Overlay landed inside the worktree and the stash was consumed.
+		expect(fs.existsSync(path.join(worktreePath, ".gjc", "launcher.txt"))).toBe(true);
+		expect(fs.existsSync(stashPath)).toBe(false);
+		expect(countRegisteredWorktrees(repo)).toBe(2);
 	});
 });

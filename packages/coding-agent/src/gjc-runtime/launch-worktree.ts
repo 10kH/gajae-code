@@ -585,12 +585,23 @@ export function restorePreWorktreeGjc(gjcStash: string, worktreePath: string): v
 }
 
 /**
+ * Handle returned by {@link evacuatePreWorktreeTarget}: a hook that restores the pre-seeded
+ * `.gjc/` into the freshly created worktree, plus the sibling stash path it was moved to
+ * (`null` when there was nothing to preserve). The stash path lets a failed restore report
+ * where the pre-seeded config can be recovered by hand.
+ */
+export interface EvacuationHandle {
+	restore: () => void;
+	stashPath: string | null;
+}
+
+/**
  * Clear a {@link isReplaceableWorktreeTarget replaceable} target so `git worktree add` can
  * create it, moving any pre-seeded `.gjc/` to a sibling stash. Returns a hook that restores
  * `.gjc/` into the freshly created worktree; a no-op when there was nothing to preserve.
  */
-export function evacuatePreWorktreeTarget(worktreePath: string): () => void {
-	if (!fs.existsSync(worktreePath)) return () => {};
+export function evacuatePreWorktreeTarget(worktreePath: string): EvacuationHandle {
+	if (!fs.existsSync(worktreePath)) return { restore: () => {}, stashPath: null };
 	const gjcSource = path.join(worktreePath, PRE_WORKTREE_GJC_DIR);
 	let gjcStat: fs.Stats | null;
 	try {
@@ -601,7 +612,7 @@ export function evacuatePreWorktreeTarget(worktreePath: string): () => void {
 	}
 	if (!gjcStat) {
 		fs.rmdirSync(worktreePath);
-		return () => {};
+		return { restore: () => {}, stashPath: null };
 	}
 	// A symlinked `.gjc` would let the rename below (and the later overlay) escape the worktree
 	// bucket. Refuse it as a path conflict rather than following the link off-tree.
@@ -616,7 +627,7 @@ export function evacuatePreWorktreeTarget(worktreePath: string): () => void {
 	}
 	fs.renameSync(gjcSource, gjcStash);
 	fs.rmdirSync(worktreePath);
-	return () => restorePreWorktreeGjc(gjcStash, worktreePath);
+	return { restore: () => restorePreWorktreeGjc(gjcStash, worktreePath), stashPath: gjcStash };
 }
 
 /** Best-effort restore that never masks the failure that triggered it. */
@@ -625,6 +636,48 @@ function tryRestore(restore: () => void): void {
 		restore();
 	} catch {
 		// The original worktree-add failure is the actionable one; leave restore best-effort.
+	}
+}
+
+/** Best-effort removal of a worktree GJC just created, used when a later step must roll it back. */
+function rollbackCreatedWorktree(plan: GjcLaunchWorktreePlan): void {
+	try {
+		runGit(plan.repoRoot, ["worktree", "remove", "--force", plan.worktreePath]);
+	} catch {
+		try {
+			runGit(plan.repoRoot, ["worktree", "prune"]);
+		} catch {
+			// Best-effort rollback; the restore failure below is the actionable error.
+		}
+	}
+}
+
+/**
+ * Finalize the pre-seeded `.gjc/` overlay after a successful `git worktree add`, transactionally.
+ *
+ * `git worktree add` has already registered and materialized the worktree by the time this runs,
+ * so a restore/overlay failure cannot simply propagate: the half-prepared worktree would be
+ * reused verbatim on the next launch (never restored, stash stranded). On failure this rolls the
+ * newly created worktree back so a retry starts clean, preserves the stash for manual recovery,
+ * and throws — success is never reported when restoration did not complete.
+ */
+export function commitPreWorktreeRestore(handle: EvacuationHandle, plan: GjcLaunchWorktreePlan): void {
+	try {
+		handle.restore();
+	} catch (error) {
+		rollbackCreatedWorktree(plan);
+		const detail = error instanceof Error ? error.message : String(error);
+		const recovery = handle.stashPath
+			? `The stashed launcher .gjc was preserved at ${handle.stashPath} for manual recovery.`
+			: "No launcher .gjc stash was created.";
+		throw new Error(
+			[
+				`worktree_gjc_restore_failed:${plan.worktreePath}`,
+				`GJC created the worktree but could not restore the pre-seeded .gjc overlay: ${detail}`,
+				recovery,
+				"The newly created worktree was rolled back; resolve the obstruction and relaunch.",
+			].join("\n"),
+		);
 	}
 }
 
@@ -712,17 +765,17 @@ function ensureLaunchWorktreeSync(
 	ensureBucketDirUsable(path.dirname(plan.worktreePath));
 	const branchAlreadyExisted = plan.branchName ? branchExists(plan.repoRoot, plan.branchName) : false;
 	const args = buildWorktreeAddArgs(plan, branchAlreadyExisted);
-	const restoreGjc = evacuatePreWorktreeTarget(plan.worktreePath);
+	const evacuation = evacuatePreWorktreeTarget(plan.worktreePath);
 	try {
 		const result = Bun.spawnSync(["git", ...args], { cwd: plan.repoRoot, stdout: "pipe", stderr: "pipe" });
 		if (result.exitCode !== 0) {
 			throw classifyWorktreeAddFailure(plan, args, sanitizeWorktreeDiagnostic(result.stderr.toString().trim()));
 		}
 	} catch (error) {
-		tryRestore(restoreGjc);
+		tryRestore(evacuation.restore);
 		throw error;
 	}
-	restoreGjc();
+	commitPreWorktreeRestore(evacuation, plan);
 
 	return {
 		...plan,
@@ -799,17 +852,17 @@ export async function ensureLaunchWorktreeCancellable(
 	throwIfAborted(options, timeout);
 	const branchAlreadyExisted = plan.branchName ? branchExists(plan.repoRoot, plan.branchName) : false;
 	const args = buildWorktreeAddArgs(plan, branchAlreadyExisted);
-	const restoreGjc = evacuatePreWorktreeTarget(plan.worktreePath);
+	const evacuation = evacuatePreWorktreeTarget(plan.worktreePath);
 	try {
 		const result = await spawnProcessGroup(["git", ...args], plan.repoRoot, options, timeout);
 		if (result.exitCode !== 0) {
 			throw classifyWorktreeAddFailure(plan, args, sanitizeWorktreeDiagnostic(result.stderr.trim()));
 		}
 	} catch (error) {
-		tryRestore(restoreGjc);
+		tryRestore(evacuation.restore);
 		throw error;
 	}
-	restoreGjc();
+	commitPreWorktreeRestore(evacuation, plan);
 
 	return {
 		...plan,
