@@ -1122,6 +1122,33 @@ test("ACP settles the first-turn retry as cancelled when a close tears the sessi
 	}
 });
 
+test("ACP settles the first-turn retry as cancelled when a delete tears the session down during the backoff (review P1)", async () => {
+	const fixture = await createFixture({ controlledRetryBackoff: true });
+	try {
+		const pending = prompt(fixture, "first turn readiness race");
+		await bounded(fixture.promptDelivered, "first prompt delivery");
+		fixture.sendTerminal({
+			type: "agent_start",
+			sessionId: "prompt-terminal-session",
+			commandId: "prompt-terminal-command",
+			turnId: "prompt-terminal-turn",
+		});
+		fixture.sendReadinessFailure();
+		await bounded(fixture.retryBackoffScheduled, "first-turn retry backoff scheduled");
+		// `session/delete` wins the backoff gap. It tears the session down under its own reason,
+		// which is as client-driven as a close: the parked retry owes the caller `cancelled`, not
+		// the `connection_closed` rejection an involuntary transport loss earns.
+		expect(
+			await bounded(fixture.agent.deleteSession({ sessionId: fixture.sessionId }), "delete during backoff"),
+		).toEqual({});
+		fixture.fireRetryBackoff();
+		expect(await bounded(pending, "deleted first-turn retry")).toEqual({ stopReason: "cancelled" });
+		expect(fixture.promptDeliveryCount()).toBe(1);
+	} finally {
+		fixture.dispose();
+	}
+});
+
 test("ACP does not retry a first-turn readiness race after reattaching a session with a prior prompt (issue #5574)", async () => {
 	const fixture = await createFixture({ failBrokerSessionClose: true });
 	try {

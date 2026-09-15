@@ -2959,11 +2959,11 @@ export class AcpAgent implements Agent {
 				record.unsubscribe();
 				record.reconnectUnsubscribe();
 				record.activePrompt = undefined;
-				const voluntary = reason === "closed" || reason === "discarded";
-				// `session/close` is the client asking to end its own work, so the pending turn
-				// settles as `cancelled` rather than surfacing a spurious error. ACP: "Agents
-				// MUST catch these errors and return the semantically meaningful `cancelled`
-				// stop reason." Involuntary teardown (transport loss) still rejects.
+				const voluntary = reason === "closed" || reason === "discarded" || reason === "deleted";
+				// `session/close` and `session/delete` are the client asking to end its own work, so
+				// the pending turn settles as `cancelled` rather than surfacing a spurious error.
+				// ACP: "Agents MUST catch these errors and return the semantically meaningful
+				// `cancelled` stop reason." Involuntary teardown (transport loss) still rejects.
 				if (waiter && !waiter.settled) {
 					clearPromptWatchdog(waiter);
 					if (voluntary) {
