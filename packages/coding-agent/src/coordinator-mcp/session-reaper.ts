@@ -54,6 +54,18 @@ export function selectReapableSessions(
 	return sessions.filter(s => s.ephemeral && !s.hasActiveTurn && now - s.lastActivityMs >= ttl);
 }
 
+/**
+ * Only a stale/absent endpoint makes a session permanently unreapable, so it is
+ * the sole failure that advances the force-eviction counter. Every other reap
+ * failure (close_failed, broker unavailability, filesystem errors) is transient
+ * and must keep retrying without ever escalating to force eviction. The server
+ * wires `reapSession` to throw `new Error(reason)`, so the reason code is the
+ * error message here.
+ */
+function isEndpointStaleReapError(err: unknown): boolean {
+	return (err instanceof Error ? err.message : String(err)) === "endpoint_stale";
+}
+
 /** Injectable side-effects so the controller runs in tests without tmux/fs/real time. */
 export interface SessionReaperDeps {
 	listSessions: () => Promise<ReapableSession[]>;
@@ -101,6 +113,13 @@ export function createSessionReaper(deps: SessionReaperDeps, policy: SessionReap
 				} catch (err) {
 					// One wedged session must not abort the rest of the sweep.
 					const msg = err instanceof Error ? err.message : String(err);
+					if (!isEndpointStaleReapError(err)) {
+						// Transient failure (close_failed, broker/filesystem error): log and
+						// retry on the next sweep, but never advance the staleness counter, so
+						// only a genuinely stale endpoint can trigger force eviction.
+						logger.warn(`session-reaper: failed to reap ${session.sessionId}: ${msg}`);
+						continue;
+					}
 					const prev = failureCounts.get(session.sessionId) ?? 0;
 					const count = prev + 1;
 					if (count < MAX_REAP_FAILURES) {

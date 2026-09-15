@@ -240,6 +240,73 @@ describe("createSessionReaper.sweepOnce — bounded failure eviction", () => {
 		warning.mockRestore();
 	});
 
+	it("F1: a non-endpoint_stale failure retries forever and is never force-evicted", async () => {
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const deadSessions: string[] = [];
+		let reapAttempts = 0;
+		const reaper = createSessionReaper(
+			{
+				listSessions: async () => [sess("wedged")],
+				reapSession: async () => {
+					reapAttempts += 1;
+					// close_failed / broker / filesystem errors are transient, not stale.
+					throw new Error("close_failed");
+				},
+				markSessionDead: async id => {
+					deadSessions.push(id);
+				},
+				now: () => NOW,
+			},
+			{ idleTtlMs: TTL, sweepIntervalMs: 60_000 },
+		);
+
+		// Far more sweeps than MAX_REAP_FAILURES: a transient failure must keep
+		// retrying and never escalate to force eviction.
+		for (let i = 0; i < MAX_REAP_FAILURES + 5; i++) {
+			await reaper.sweepOnce();
+		}
+		expect(reapAttempts).toBe(MAX_REAP_FAILURES + 5);
+		expect(deadSessions).toHaveLength(0);
+		// Only the retry warn fires — never the "evicted after" warn.
+		expect(warning.mock.calls.some(([msg]) => String(msg).includes("evicted after"))).toBe(false);
+
+		warning.mockRestore();
+	});
+
+	it("F1: a stale streak interrupted by a non-stale failure does not reach eviction on the non-stale path", async () => {
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const deadSessions: string[] = [];
+		let mode: "stale" | "other" = "stale";
+		const reaper = createSessionReaper(
+			{
+				listSessions: async () => [sess("mixed")],
+				reapSession: async () => {
+					throw new Error(mode === "stale" ? "endpoint_stale" : "close_failed");
+				},
+				markSessionDead: async id => {
+					deadSessions.push(id);
+				},
+				now: () => NOW,
+			},
+			{ idleTtlMs: TTL, sweepIntervalMs: 60_000 },
+		);
+
+		// Accumulate stale failures right up to the threshold boundary.
+		for (let i = 0; i < MAX_REAP_FAILURES - 1; i++) await reaper.sweepOnce();
+		expect(deadSessions).toHaveLength(0);
+		// A non-stale failure must NOT be the one that crosses the threshold.
+		mode = "other";
+		await reaper.sweepOnce();
+		expect(deadSessions).toHaveLength(0);
+		// The stale counter was preserved (not incremented by the non-stale failure):
+		// a single further stale failure now crosses the threshold and evicts.
+		mode = "stale";
+		await reaper.sweepOnce();
+		expect(deadSessions).toEqual(["mixed"]);
+
+		warning.mockRestore();
+	});
+
 	it("AC-2: success resets the failure counter so the session gets MAX_REAP_FAILURES fresh chances", async () => {
 		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		let shouldFail = true;
