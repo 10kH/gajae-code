@@ -244,6 +244,14 @@ type FirstPromptRetryReservation = {
 	 * settles `firstPromptDone` (review P2).
 	 */
 	admitted?: boolean;
+	/**
+	 * Terminal settlement recorded by a teardown that won the backoff gap. The failed attempt
+	 * already cleared `activePrompt`, so `#teardownSession` has no waiter to settle for this
+	 * caller and nothing else carries the outcome across the sleep. Without it the retry wakes
+	 * to a deleted record and resubmits into `not_found`, where a client-driven close/delete
+	 * owes the ACP `cancelled` stop reason (review P1).
+	 */
+	settlement?: { kind: "cancelled" } | { kind: "rejected"; error: AcpSdkAdapterError };
 };
 
 /**
@@ -1762,6 +1770,15 @@ export class AcpAgent implements Agent {
 						maxRetries: ACP_FIRST_PROMPT_MAX_RETRIES,
 					});
 					await this.#delayFirstPromptRetry(attempt);
+					// A session/close or session/delete that won the backoff gap tore the record
+					// down without a waiter to settle, leaving its outcome on this reservation.
+					// Honor it here: resubmitting would only reach `#submitPrompt`'s not_found,
+					// which is not what a client-driven teardown owes the caller (review P1).
+					const settlement = retryReservation.settlement;
+					if (settlement) {
+						if (settlement.kind === "cancelled") return { stopReason: "cancelled" };
+						throw settlement.error;
+					}
 					// A session/cancel that arrived during the backoff gap (activePrompt already
 					// cleared by the failed attempt, retry not yet resubmitted) must settle the
 					// retry as `cancelled` instead of dispatching a fresh turn the client no
@@ -2868,18 +2885,35 @@ export class AcpAgent implements Agent {
 				record.unsubscribe();
 				record.reconnectUnsubscribe();
 				record.activePrompt = undefined;
+				const voluntary = reason === "closed" || reason === "discarded";
 				// `session/close` is the client asking to end its own work, so the pending turn
 				// settles as `cancelled` rather than surfacing a spurious error. ACP: "Agents
 				// MUST catch these errors and return the semantically meaningful `cancelled`
 				// stop reason." Involuntary teardown (transport loss) still rejects.
 				if (waiter && !waiter.settled) {
 					clearPromptWatchdog(waiter);
-					if (reason === "closed" || reason === "discarded") {
+					if (voluntary) {
 						waiter.settled = true;
 						waiter.resolve({ stopReason: "cancelled" });
 					} else {
 						waiter.reject(new AcpSdkAdapterError("connection_closed", `ACP session was ${reason}.`));
 					}
+				}
+				// A first-turn retry sleeping out its backoff owns no waiter — its failed attempt
+				// already cleared `activePrompt` — so the settlement above cannot reach it. Record
+				// the teardown on its reservation instead, with the same voluntary/involuntary
+				// split, and release the reservation: otherwise the retry wakes to a deleted
+				// record and resubmits, surfacing `not_found` where the client's close/delete owes
+				// `cancelled` (review P1).
+				const reservation = record.pendingFirstPromptRetry;
+				if (reservation) {
+					reservation.settlement ??= voluntary
+						? { kind: "cancelled" }
+						: {
+								kind: "rejected",
+								error: new AcpSdkAdapterError("connection_closed", `ACP session was ${reason}.`),
+							};
+					record.pendingFirstPromptRetry = undefined;
 				}
 			}
 
