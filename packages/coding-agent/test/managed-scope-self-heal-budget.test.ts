@@ -229,7 +229,7 @@ describe.skipIf(process.platform === "win32")("managed scope owner-only self-hea
 	// directory; the walk must revalidate identity (dev+ino) before enumerating and
 	// stop on any mismatch, so its owner-only repair can never follow the
 	// replacement into descendants outside the retained managed scope.
-	it("does not enumerate a queued scope directory whose identity changed before it was opened", () => {
+	it("does not enumerate a queued scope directory whose identity changed before it was opened", async () => {
 		const root = tempTree();
 		const sub = path.join(root, "sub");
 		fs.mkdirSync(sub, { mode: 0o700 });
@@ -264,9 +264,19 @@ describe.skipIf(process.platform === "win32")("managed scope owner-only self-hea
 		selfHealOwnerOnlyModeDrift(root, "default");
 
 		// The identity mismatch stopped the walk at `sub`: the drifted file inside the
-		// "replaced" directory was never opened or repaired, and nothing was deferred.
+		// "replaced" directory was never opened or repaired. The subtree under `sub`
+		// was therefore left uninspected, so the scan is incomplete and a deferred walk
+		// is scheduled rather than the tree being reported clean — it just never
+		// enumerates the replacement.
 		expect(isOwnerOnly(inner)).toBe(false);
-		expect(pendingDeferredOwnerOnlySelfHealCount()).toBe(0);
+		expect(pendingDeferredOwnerOnlySelfHealCount()).toBeGreaterThan(0);
+
+		// Draining with the transient mismatch cleared lets the scheduled deferred walk
+		// traverse `sub` for real and repair the descendant, so the case leaves no
+		// module-level traversal-failure marker behind for later tests.
+		vi.restoreAllMocks();
+		await drainDeferredOwnerOnlySelfHeals();
+		expect(isOwnerOnly(inner)).toBe(true);
 	});
 
 	// Second review — Finding 2: for a descendant past the synchronous budget the
@@ -446,9 +456,95 @@ describe.skipIf(process.platform === "win32")("managed scope owner-only self-hea
 		selfHealOwnerOnlyModeDrift(root, "default");
 
 		// The no-follow open refused the symlink, so the walk never enumerated
-		// `outside` through `sub`: its drifted file was neither read nor repaired, and
-		// nothing was deferred.
+		// `outside` through `sub`: its drifted file was neither read nor repaired. That
+		// refusal left `sub`'s subtree uninspected, so the scan is incomplete and a
+		// deferred walk is scheduled — one that likewise never follows the symlink into
+		// `outside`.
 		expect(isOwnerOnly(leaked)).toBe(false);
-		expect(pendingDeferredOwnerOnlySelfHealCount()).toBe(0);
+		expect(pendingDeferredOwnerOnlySelfHealCount()).toBeGreaterThan(0);
+	});
+
+	// Round 4 — Finding 1: a directory the walk queued but then cannot open (its
+	// no-follow open fails) leaves that subtree uninspected. The synchronous scan
+	// must report incomplete — scheduling the deferred tail walk — rather than
+	// skipping the directory and finishing as if the whole tree were owner-only.
+	it("treats a sync-walk open failure as incomplete and schedules a deferred walk", async () => {
+		const root = tempTree();
+		const sub = path.join(root, "sub");
+		fs.mkdirSync(sub, { mode: 0o700 });
+		const inner = path.join(sub, "leaked.bin");
+		fs.writeFileSync(inner, "secret", { mode: 0o600 });
+		fs.chmodSync(inner, 0o644);
+		expect(isOwnerOnly(inner)).toBe(false);
+
+		// Make `opendirIfUnchanged(sub)` fail its no-follow open so `sub`'s subtree is
+		// never enumerated by the synchronous walk (root itself still opens normally).
+		const resolvedSub = path.resolve(sub);
+		const realOpen = fs.openSync.bind(fs) as (...args: Parameters<typeof fs.openSync>) => number;
+		const open = vi.spyOn(fs, "openSync").mockImplementation(((...args: Parameters<typeof fs.openSync>) => {
+			if (path.resolve(String(args[0])) === resolvedSub)
+				throw Object.assign(new Error("EACCES: permission denied, open"), { code: "EACCES" });
+			return realOpen(...args);
+		}) as typeof fs.openSync);
+
+		selfHealOwnerOnlyModeDrift(root, "default");
+
+		// The open failure left `sub` uninspected: the scan is incomplete, so a deferred
+		// walk was scheduled and the drifted descendant inside the unvisited directory
+		// was NOT treated as verified (still readable, not repaired synchronously).
+		expect(isOwnerOnly(inner)).toBe(false);
+		expect(pendingDeferredOwnerOnlySelfHealCount()).toBeGreaterThan(0);
+
+		// Once the open failure clears, the deferred walk reaches the tail and repairs
+		// it — confirming the scheduled walk really does finish the uninspected subtree.
+		open.mockRestore();
+		await drainDeferredOwnerOnlySelfHeals();
+		expect(isOwnerOnly(inner)).toBe(true);
+	});
+
+	// Round 4 — Finding 1 (deferred side): a null open in the background walk leaves
+	// the tail it exists to enforce unvisited. It must abort as a traversal failure
+	// (never a completed walk), so the next truncated prepare fails closed over that
+	// uninspected tail instead of reporting success.
+	it("records a traversal failure when the deferred walk cannot open a queued directory", async () => {
+		const root = tempTree();
+
+		// >budget direct children guarantee the synchronous scan truncates before it
+		// descends into `tail/`, so the tail is only reachable by the deferred walk.
+		for (let i = 0; i < OWNER_ONLY_SELF_HEAL_MAX_ENTRIES + 2000; i += 1) {
+			fs.writeFileSync(path.join(root, `pad-${i}.bin`), "", { mode: 0o600 });
+		}
+		const tail = path.join(root, "tail");
+		fs.mkdirSync(tail, { mode: 0o700 });
+		const driftedFile = path.join(tail, "leaked.bin");
+		fs.writeFileSync(driftedFile, "secret", { mode: 0o600 });
+		fs.chmodSync(driftedFile, 0o644);
+
+		// The synchronous scan truncates and schedules the deferred tail walk; only then
+		// is the open failure installed, so it hits that deferred walk alone.
+		selfHealOwnerOnlyModeDrift(root, "default");
+		expect(pendingDeferredOwnerOnlySelfHealCount()).toBeGreaterThan(0);
+		const resolvedTail = path.resolve(tail);
+		const realOpen = fs.openSync.bind(fs) as (...args: Parameters<typeof fs.openSync>) => number;
+		const open = vi.spyOn(fs, "openSync").mockImplementation(((...args: Parameters<typeof fs.openSync>) => {
+			if (path.resolve(String(args[0])) === resolvedTail)
+				throw Object.assign(new Error("EACCES: permission denied, open"), { code: "EACCES" });
+			return realOpen(...args);
+		}) as typeof fs.openSync);
+		await drainDeferredOwnerOnlySelfHeals();
+		open.mockRestore();
+
+		// The null open aborted the walk before the tail: the drift is untouched and the
+		// scope is recorded as un-traversed rather than as a completed walk.
+		expect(isOwnerOnly(driftedFile)).toBe(false);
+		expect(pendingDeferredOwnerOnlyTraversalFailureCount()).toBeGreaterThan(0);
+
+		// The next prepare truncates on the pads too and, with a prior aborted traversal
+		// recorded, fails closed over the uninspected tail while scheduling a fresh walk
+		// that can clear the failure.
+		expect(() => selfHealOwnerOnlyModeDrift(root, "default")).toThrow("mode_mismatch");
+		await drainDeferredOwnerOnlySelfHeals();
+		expect(isOwnerOnly(driftedFile)).toBe(true);
+		expect(pendingDeferredOwnerOnlyTraversalFailureCount()).toBe(0);
 	});
 });

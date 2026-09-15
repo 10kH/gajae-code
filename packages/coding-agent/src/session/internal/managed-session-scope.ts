@@ -1163,7 +1163,13 @@ function collectOwnerOnlyModeDrift(
 	while (stack.length > 0) {
 		const ref = stack.pop() as OwnerOnlyDirRef;
 		const dir = opendirIfUnchanged(ref);
-		if (dir === null) continue;
+		// A null open means this queued directory was replaced, became a symlink, or
+		// grew inaccessible between classification and open: its subtree was never
+		// enumerated, so this scan did NOT cover the tree. Report incomplete — rather
+		// than skipping it as if clean — so the caller schedules the deferred tail
+		// walk and the descendants under `ref` stay unverified until a walk actually
+		// reaches them.
+		if (dir === null) return { drifted, complete: false };
 		try {
 			let entry = dir.readSync();
 			while (entry !== null) {
@@ -1238,7 +1244,16 @@ async function runDeferredOwnerOnlySelfHeal(root: string, failures: string[]): P
 	while (stack.length > 0) {
 		const ref = stack.pop() as OwnerOnlyDirRef;
 		const dir = opendirIfUnchanged(ref);
-		if (dir === null) continue;
+		// A null open leaves this directory's descendants unvisited, so the tail this
+		// walk exists to enforce was not fully traversed. Throw — like a `Dir.readSync`
+		// failure below — so the scheduler's `.catch` records a traversal failure
+		// (`traversed = false`) instead of the walk finishing as if the tree were
+		// fully covered.
+		if (dir === null)
+			throw Object.assign(
+				new Error("opendir_null: directory identity changed or became inaccessible during traversal"),
+				{ code: "ENOENT" },
+			);
 		try {
 			let entry = dir.readSync();
 			while (entry !== null) {
