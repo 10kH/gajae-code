@@ -224,7 +224,17 @@ type SessionRecord = {
 	promptObservedActivity?: boolean;
 	/** Whether the current prompt attempt executed a tool; reset per attempt, vetoes a first-turn retry that would re-run it. */
 	promptObservedToolExecution?: boolean;
+	/** Owner token held across the first-turn retry backoff; a non-owner prompt is rejected as a conflict (review P1). */
+	pendingFirstPromptRetry?: FirstPromptRetryReservation;
 };
+
+/**
+ * Identity token proving a caller owns an in-progress first-turn retry. While it is held on the
+ * session record, `#submitPrompt` rejects any prompt that is not this owner, so a concurrent
+ * request cannot slip into the gap between `#settlePrompt` clearing `activePrompt` on the failed
+ * first attempt and the retry resubmitting after its backoff (review P1, issue #5574).
+ */
+type FirstPromptRetryReservation = { readonly firstPromptRetry: true };
 
 /**
  * Prompt-owned frame types that prove the turn is underway (as opposed to a
@@ -1719,16 +1729,23 @@ export class AcpAgent implements Agent {
 		// An unknown session must still report not_found; the retry loop only guards a
 		// live session's first turn against a startup readiness race (issue #5574).
 		if (!record) return await this.#submitPrompt(params, true);
+		// Identity of THIS caller's first-turn retry. Held on the record across the backoff so a
+		// concurrent prompt racing the gap is rejected as a conflict rather than admitted (review P1).
+		const retryReservation: FirstPromptRetryReservation = { firstPromptRetry: true };
 		try {
 			let echoUserMessage = true;
 			for (let attempt = 0; ; attempt++) {
 				try {
-					return await this.#submitPrompt(params, echoUserMessage);
+					return await this.#submitPrompt(params, echoUserMessage, retryReservation);
 				} catch (error) {
 					if (!this.#shouldRetryFirstPrompt(record, error, attempt)) throw error;
 					// The user's message was already echoed on the first attempt; re-echoing
 					// would duplicate it in the client transcript.
 					echoUserMessage = false;
+					// Reserve the session BEFORE the backoff sleep. `#settlePrompt` already cleared
+					// `activePrompt` when it rejected this attempt, so without the reservation the
+					// backoff gap admits a competing prompt that steals the first turn (review P1).
+					record.pendingFirstPromptRetry = retryReservation;
 					logger.warn("ACP first-turn prompt failed; retrying after readiness backoff", {
 						sessionId: params.sessionId,
 						attempt: attempt + 1,
@@ -1738,6 +1755,9 @@ export class AcpAgent implements Agent {
 				}
 			}
 		} finally {
+			// Release the reservation on retry completion (success), cancellation, or final
+			// failure. Guarded so a later prompt that took ownership is never cleared by this caller.
+			if (record.pendingFirstPromptRetry === retryReservation) record.pendingFirstPromptRetry = undefined;
 			record.firstPromptDone = true;
 		}
 	}
@@ -1786,9 +1806,18 @@ export class AcpAgent implements Agent {
 		});
 	}
 
-	async #submitPrompt(params: PromptRequest, echoUserMessage: boolean): Promise<PromptResponse> {
+	async #submitPrompt(
+		params: PromptRequest,
+		echoUserMessage: boolean,
+		retryReservation?: FirstPromptRetryReservation,
+	): Promise<PromptResponse> {
 		const record = this.#sessions.get(params.sessionId);
 		if (!record) throw new AcpSdkAdapterError("not_found", `Unknown session, not found: ${params.sessionId}`);
+		// A first-turn retry holds the session across its backoff gap. Any prompt that is not the
+		// retry owner is rejected here, before any state mutation or dispatch, so it cannot steal
+		// the first turn while the authorized retry is still pending (review P1, issue #5574).
+		if (record.pendingFirstPromptRetry && record.pendingFirstPromptRetry !== retryReservation)
+			throw new AcpSdkAdapterError("conflict", "ACP session is retrying its first prompt.");
 		if (record.activePrompt) throw new AcpSdkAdapterError("conflict", "ACP session already has an active prompt.");
 		if (record.authFailure) throw new AcpSdkAdapterError("authentication_failed", record.authFailure);
 		if (this.#retiredPromptAcknowledgements.has(params.sessionId))

@@ -31,6 +31,8 @@ type Fixture = {
 	agentMessageUpdateEntered: Promise<void>;
 	failureDiagnosticEntered: Promise<void>;
 	terminalReservationEntered: Promise<void>;
+	retryBackoffScheduled: Promise<void>;
+	fireRetryBackoff(): void;
 	promptDeliveryCount(): number;
 	sendStopped(reason: StoppedReason): void;
 	sendFailed(code: FailedCode): void;
@@ -96,6 +98,7 @@ async function createFixture(
 		reusePromptCorrelationOnSecond?: boolean;
 		failBrokerSessionClose?: boolean;
 		observeTerminalReservation?: boolean;
+		controlledRetryBackoff?: boolean;
 		priorTranscriptUserTurn?: boolean;
 	} = {},
 ): Promise<Fixture> {
@@ -118,6 +121,8 @@ async function createFixture(
 	const failureDiagnosticRelease = Promise.withResolvers<void>();
 	const failureDiagnosticEntered = Promise.withResolvers<void>();
 	const terminalReservationEntered = Promise.withResolvers<void>();
+	const retryBackoffScheduled = Promise.withResolvers<void>();
+	const retryBackoffHandlers: Array<() => void> = [];
 	let blockNextIdleUpdate = false;
 	let blockNextWorkingUpdate = options.blockInitialWorkingUpdate === true;
 	const delivered = Promise.withResolvers<void>();
@@ -450,6 +455,30 @@ async function createFixture(
 			...(options.cancelSettlementGraceMs === undefined
 				? {}
 				: { cancelSettlementGraceMs: options.cancelSettlementGraceMs }),
+			...(options.controlledRetryBackoff
+				? {
+						promptWatchdogClock: {
+							now: () => Date.now(),
+							schedule: (handler: () => void, delayMs: number) => {
+								// The first-turn retry backoff schedules a short delay (<= 500ms); the
+								// prompt watchdog schedules minutes. Capture only the backoff so the test
+								// can hold the window open and fire it deterministically, while watchdog
+								// timers still run for real.
+								if (delayMs <= 1000) {
+									retryBackoffHandlers.push(handler);
+									retryBackoffScheduled.resolve();
+									return () => {
+										const index = retryBackoffHandlers.indexOf(handler);
+										if (index >= 0) retryBackoffHandlers.splice(index, 1);
+									};
+								}
+								const timer = setTimeout(handler, delayMs);
+								timer.unref?.();
+								return () => clearTimeout(timer);
+							},
+						},
+					}
+				: {}),
 		},
 	);
 	const created = await bounded(agent.newSession({ cwd, mcpServers: [] }), "new session");
@@ -476,6 +505,11 @@ async function createFixture(
 		agentMessageUpdateEntered: agentMessageUpdateEntered.promise,
 		failureDiagnosticEntered: failureDiagnosticEntered.promise,
 		terminalReservationEntered: terminalReservationEntered.promise,
+		retryBackoffScheduled: retryBackoffScheduled.promise,
+		fireRetryBackoff: () => {
+			const handler = retryBackoffHandlers.shift();
+			handler?.();
+		},
 		promptDeliveryCount: () => promptDeliveries,
 		sendStopped,
 		sendFailed,
@@ -618,6 +652,97 @@ test("ACP retries a first-turn prompt_failed after the turn started, then recove
 		// The retry lands on a host that has finished coming up and completes normally.
 		fixture.sendStopped("end_turn");
 		expect(await bounded(pending, "first-turn retry recovery")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP rejects a concurrent prompt during the first-turn retry backoff window (review P1)", async () => {
+	const fixture = await createFixture({ controlledRetryBackoff: true });
+	try {
+		const pending = prompt(fixture, "first turn readiness race");
+		await bounded(fixture.promptDelivered, "first prompt delivery");
+		// The turn started (agent_start) then failed prompt_failed — the readiness-race
+		// fingerprint. The retry path reserves the session and then waits on the backoff.
+		fixture.sendTerminal({
+			type: "agent_start",
+			sessionId: "prompt-terminal-session",
+			commandId: "prompt-terminal-command",
+			turnId: "prompt-terminal-turn",
+		});
+		fixture.sendFailed("prompt_failed");
+		// The controlled clock captures the backoff without firing it, holding the exact gap
+		// the fix must cover: `activePrompt` is already cleared, but the retry has not resubmitted.
+		await bounded(fixture.retryBackoffScheduled, "first-turn retry backoff scheduled");
+		// A concurrent request that is not the retry owner is rejected deterministically, and
+		// specifically by the reservation (not the active-prompt guard, which is already clear).
+		await expect(bounded(prompt(fixture, "competing prompt"), "competing prompt rejection")).rejects.toMatchObject({
+			code: "conflict",
+			message: "ACP session is retrying its first prompt.",
+		});
+		// The competing prompt must not have been dispatched to the host.
+		expect(fixture.promptDeliveryCount()).toBe(1);
+		// Releasing the backoff lets the authorized retry resubmit and recover normally.
+		fixture.fireRetryBackoff();
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "first-turn retry delivery");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(pending, "first-turn retry recovery")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP admits a prompt after the first-turn retry completes (reservation released)", async () => {
+	const fixture = await createFixture();
+	try {
+		const pending = prompt(fixture, "first turn readiness race");
+		await bounded(fixture.promptDelivered, "first prompt delivery");
+		fixture.sendTerminal({
+			type: "agent_start",
+			sessionId: "prompt-terminal-session",
+			commandId: "prompt-terminal-command",
+			turnId: "prompt-terminal-turn",
+		});
+		fixture.sendFailed("prompt_failed");
+		// The retry resubmits and recovers, releasing the reservation on success.
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "first-turn retry delivery");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(pending, "first-turn retry recovery")).toEqual({ stopReason: "end_turn" });
+		// A subsequent prompt is admitted rather than rejected as a lingering retry conflict.
+		const next = prompt(fixture, "post-retry prompt");
+		await waitFor(() => fixture.promptDeliveryCount() === 3, "post-retry prompt delivery");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(next, "post-retry prompt completion")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP releases the first-turn retry reservation when the retry fails (no leak)", async () => {
+	const fixture = await createFixture();
+	try {
+		const pending = prompt(fixture, "first turn readiness race");
+		await bounded(fixture.promptDelivered, "first prompt delivery");
+		// First attempt starts then fails, so the retry path takes ownership and resubmits.
+		fixture.sendTerminal({
+			type: "agent_start",
+			sessionId: "prompt-terminal-session",
+			commandId: "prompt-terminal-command",
+			turnId: "prompt-terminal-turn",
+		});
+		fixture.sendFailed("prompt_failed");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "first-turn retry delivery");
+		// The retry attempt fails before ever starting the turn, so it is surfaced (not retried
+		// again) and the reservation must be released as the caller rejects.
+		fixture.sendFailed("prompt_failed");
+		await expect(bounded(pending, "first-turn retry final failure")).rejects.toMatchObject({
+			code: "prompt_failed",
+		});
+		// The reservation did not leak: a fresh prompt is admitted and completes.
+		const next = prompt(fixture, "post-failure prompt");
+		await waitFor(() => fixture.promptDeliveryCount() === 3, "post-failure prompt delivery");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(next, "post-failure prompt completion")).toEqual({ stopReason: "end_turn" });
 	} finally {
 		fixture.dispose();
 	}
