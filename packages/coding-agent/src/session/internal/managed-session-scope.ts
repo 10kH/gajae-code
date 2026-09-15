@@ -1021,17 +1021,57 @@ interface OwnerOnlySelfHealBudget {
 	remaining: number;
 }
 
-/** Classify a managed descendant, recording group/other-readable drift. */
-function classifyOwnerOnlyEntry(pathname: string, drifted: string[]): "descend" | "leaf" | "skip" {
-	let stat: fs.Stats;
+/** A managed directory queued for enumeration, tagged with the identity that classified it. */
+interface OwnerOnlyDirRef {
+	pathname: string;
+	dev: bigint;
+	ino: bigint;
+}
+
+type OwnerOnlyClassification = { kind: "descend"; dev: bigint; ino: bigint } | { kind: "leaf" } | { kind: "skip" };
+
+/**
+ * Classify a managed descendant, recording group/other-readable drift. For a
+ * directory it also returns the (dev, ino) identity from the same `lstat`, so a
+ * later no-follow re-open can prove the directory was not replaced out from under
+ * the walk before it is enumerated (see `opendirIfUnchanged`).
+ */
+function classifyOwnerOnlyEntry(pathname: string, drifted: string[]): OwnerOnlyClassification {
+	let stat: fs.BigIntStats;
 	try {
-		stat = fs.lstatSync(pathname);
+		stat = fs.lstatSync(pathname, { bigint: true });
 	} catch {
-		return "skip";
+		return { kind: "skip" };
 	}
-	if (stat.isSymbolicLink()) return "skip";
-	if ((stat.mode & 0o077) !== 0) drifted.push(pathname);
-	return stat.isDirectory() ? "descend" : "leaf";
+	if (stat.isSymbolicLink()) return { kind: "skip" };
+	if ((stat.mode & 0o077n) !== 0n) drifted.push(pathname);
+	return stat.isDirectory() ? { kind: "descend", dev: stat.dev, ino: stat.ino } : { kind: "leaf" };
+}
+
+/**
+ * Open a queued managed directory for enumeration only if it is still the exact
+ * directory the walk classified. A managed scope is same-user writable, so a
+ * concurrent process can replace a queued directory with a symlink (or a
+ * different directory) between the classifying `lstat` and this open — and both
+ * walks pop/yield across that window. Re-`lstat` and require the same
+ * non-symlink directory identity (dev+ino) before `opendirSync`, so neither the
+ * walk nor the owner-only repair it drives can follow a replacement and
+ * enumerate or modify descendants outside the retained managed scope. Returns
+ * `null` on any mismatch or error; the caller skips that subtree.
+ */
+function opendirIfUnchanged(ref: OwnerOnlyDirRef): fs.Dir | null {
+	let stat: fs.BigIntStats;
+	try {
+		stat = fs.lstatSync(ref.pathname, { bigint: true });
+	} catch {
+		return null;
+	}
+	if (stat.isSymbolicLink() || !stat.isDirectory() || stat.dev !== ref.dev || stat.ino !== ref.ino) return null;
+	try {
+		return fs.opendirSync(ref.pathname);
+	} catch {
+		return null;
+	}
 }
 
 /**
@@ -1054,25 +1094,26 @@ function collectOwnerOnlyModeDrift(
 	budget: OwnerOnlySelfHealBudget,
 ): { drifted: string[]; complete: boolean } {
 	const drifted: string[] = [];
-	if (classifyOwnerOnlyEntry(root, drifted) !== "descend") return { drifted, complete: true };
-	// Explicit DFS stack of directory paths; only one directory iterator is open
-	// at a time and it is closed before the next is opened.
-	const stack: string[] = [root];
+	const rootClass = classifyOwnerOnlyEntry(root, drifted);
+	if (rootClass.kind !== "descend") return { drifted, complete: true };
+	// Explicit DFS stack of directory refs; only one directory iterator is open at
+	// a time and it is closed before the next is opened. Each ref carries the
+	// identity captured when the directory was classified so `opendirIfUnchanged`
+	// can refuse to follow a concurrent replacement.
+	const stack: OwnerOnlyDirRef[] = [{ pathname: root, dev: rootClass.dev, ino: rootClass.ino }];
 	while (stack.length > 0) {
-		const directory = stack.pop() as string;
-		let dir: fs.Dir;
-		try {
-			dir = fs.opendirSync(directory);
-		} catch {
-			continue;
-		}
+		const ref = stack.pop() as OwnerOnlyDirRef;
+		const dir = opendirIfUnchanged(ref);
+		if (dir === null) continue;
 		try {
 			let entry = dir.readSync();
 			while (entry !== null) {
 				if (budget.remaining <= 0 || Date.now() >= budget.deadline) return { drifted, complete: false };
 				budget.remaining -= 1;
-				const child = path.join(directory, entry.name);
-				if (classifyOwnerOnlyEntry(child, drifted) === "descend") stack.push(child);
+				const child = path.join(ref.pathname, entry.name);
+				const childClass = classifyOwnerOnlyEntry(child, drifted);
+				if (childClass.kind === "descend")
+					stack.push({ pathname: child, dev: childClass.dev, ino: childClass.ino });
 				entry = dir.readSync();
 			}
 		} finally {
@@ -1094,12 +1135,20 @@ function resecureOwnerOnlyPath(pathname: string): void {
 	assertOwnerOnlyApplied(pathname, stat.isDirectory() ? "directory" : "file");
 }
 
-/** Best-effort variant for the background walk: a concurrent writer must not crash it. */
-function resecureOwnerOnlyPathQuietly(pathname: string): void {
+/**
+ * Best-effort variant for the background walk: a concurrent writer must not crash
+ * it, but a genuine repair failure must not be silently dropped either. For a
+ * descendant past the synchronous budget, this deferred tail is the ONLY
+ * enforcement step, so a failed repair is recorded in `failures` — the next
+ * prepare observes it, retries, and fails closed rather than reporting success
+ * over a descendant that is still group/other-readable.
+ */
+function resecureOwnerOnlyPathQuietly(pathname: string, failures: string[]): void {
 	try {
 		resecureOwnerOnlyPath(pathname);
 	} catch (error) {
-		logger.debug("Deferred managed-scope owner-only repair skipped a path", {
+		failures.push(pathname);
+		logger.debug("Deferred managed-scope owner-only repair failed; will retry on next prepare", {
 			pathname,
 			error: error instanceof Error ? error.message : String(error),
 		});
@@ -1117,32 +1166,29 @@ const OWNER_ONLY_DEFERRED_SELF_HEAL_SLICE = OWNER_ONLY_SELF_HEAL_MAX_ENTRIES;
  * as it is found, and yields to the event loop every slice so it never blocks
  * `session/new` or the ACP server the way the original unbounded walk did.
  */
-async function runDeferredOwnerOnlySelfHeal(root: string): Promise<void> {
+async function runDeferredOwnerOnlySelfHeal(root: string, failures: string[]): Promise<void> {
 	// Yield before touching the tree so scheduling never runs a walk slice on the
 	// `session/new` tick — the whole tail repair stays off the critical path.
 	await new Promise<void>(resolve => setImmediate(resolve));
 	const rootDrift: string[] = [];
-	const rootKind = classifyOwnerOnlyEntry(root, rootDrift);
-	for (const pathname of rootDrift) resecureOwnerOnlyPathQuietly(pathname);
-	if (rootKind !== "descend") return;
-	const stack: string[] = [root];
+	const rootClass = classifyOwnerOnlyEntry(root, rootDrift);
+	for (const pathname of rootDrift) resecureOwnerOnlyPathQuietly(pathname, failures);
+	if (rootClass.kind !== "descend") return;
+	const stack: OwnerOnlyDirRef[] = [{ pathname: root, dev: rootClass.dev, ino: rootClass.ino }];
 	let sliceRemaining = OWNER_ONLY_DEFERRED_SELF_HEAL_SLICE;
 	while (stack.length > 0) {
-		const directory = stack.pop() as string;
-		let dir: fs.Dir;
-		try {
-			dir = fs.opendirSync(directory);
-		} catch {
-			continue;
-		}
+		const ref = stack.pop() as OwnerOnlyDirRef;
+		const dir = opendirIfUnchanged(ref);
+		if (dir === null) continue;
 		try {
 			let entry = dir.readSync();
 			while (entry !== null) {
-				const child = path.join(directory, entry.name);
+				const child = path.join(ref.pathname, entry.name);
 				const childDrift: string[] = [];
-				const kind = classifyOwnerOnlyEntry(child, childDrift);
-				for (const pathname of childDrift) resecureOwnerOnlyPathQuietly(pathname);
-				if (kind === "descend") stack.push(child);
+				const childClass = classifyOwnerOnlyEntry(child, childDrift);
+				for (const pathname of childDrift) resecureOwnerOnlyPathQuietly(pathname, failures);
+				if (childClass.kind === "descend")
+					stack.push({ pathname: child, dev: childClass.dev, ino: childClass.ino });
 				if (--sliceRemaining <= 0) {
 					await new Promise<void>(resolve => setImmediate(resolve));
 					sliceRemaining = OWNER_ONLY_DEFERRED_SELF_HEAL_SLICE;
@@ -1158,11 +1204,38 @@ async function runDeferredOwnerOnlySelfHeal(root: string): Promise<void> {
 /** In-flight deferred self-heals, keyed by resolved scope directory to dedupe. */
 const pendingDeferredOwnerOnlySelfHeals = new Map<string, Promise<void>>();
 
+/**
+ * Scopes whose most recent deferred self-heal left at least one descendant it
+ * could not re-secure (resolved scope directory → the still-drifted paths). This
+ * deferred tail is the sole enforcement for descendants past the synchronous
+ * budget, so a failure here must not be discarded: the next prepare for the scope
+ * retries these paths and fails closed if they still cannot be made owner-only.
+ */
+const pendingDeferredOwnerOnlyRepairFailures = new Map<string, string[]>();
+
+/** Last completed deferred self-heal per scope (resolved directory → epoch ms) for the re-scan cooldown. */
+const lastDeferredOwnerOnlySelfHealCompletedAt = new Map<string, number>();
+
+/**
+ * Minimum gap between deferred self-heal walks of the same scope. A completed
+ * walk has already repaired the entire tree, so re-launching a full traversal the
+ * instant the previous one settles — which repeated prepares on a large unchanged
+ * scope would otherwise do — only recreates sustained disk/CPU contention and
+ * undermines the bounded-resource objective. Re-scheduling is suppressed within
+ * this window of the last completion; genuinely new drift is still caught on the
+ * first prepare after the cooldown lapses.
+ */
+export const OWNER_ONLY_DEFERRED_SELF_HEAL_COOLDOWN_MS = 30_000;
+
 /** Schedule (at most one per scope) a background self-heal of the tail the budget skipped. */
 function scheduleDeferredOwnerOnlySelfHeal(directory: string): void {
 	const key = path.resolve(directory);
 	if (pendingDeferredOwnerOnlySelfHeals.has(key)) return;
-	const task = runDeferredOwnerOnlySelfHeal(directory).catch(error => {
+	// Do not re-walk an unchanged scope that a recent walk already fully repaired.
+	const completedAt = lastDeferredOwnerOnlySelfHealCompletedAt.get(key);
+	if (completedAt !== undefined && Date.now() - completedAt < OWNER_ONLY_DEFERRED_SELF_HEAL_COOLDOWN_MS) return;
+	const failures: string[] = [];
+	const task = runDeferredOwnerOnlySelfHeal(directory, failures).catch(error => {
 		logger.debug("Deferred managed-scope owner-only self-heal failed", {
 			directory,
 			error: error instanceof Error ? error.message : String(error),
@@ -1170,6 +1243,11 @@ function scheduleDeferredOwnerOnlySelfHeal(directory: string): void {
 	});
 	pendingDeferredOwnerOnlySelfHeals.set(key, task);
 	void task.finally(() => {
+		lastDeferredOwnerOnlySelfHealCompletedAt.set(key, Date.now());
+		// Preserve an unrepairable tail so the next prepare fails closed; clear any
+		// prior failure once a later walk has fully re-secured the scope.
+		if (failures.length > 0) pendingDeferredOwnerOnlyRepairFailures.set(key, failures);
+		else pendingDeferredOwnerOnlyRepairFailures.delete(key);
 		if (pendingDeferredOwnerOnlySelfHeals.get(key) === task) pendingDeferredOwnerOnlySelfHeals.delete(key);
 	});
 }
@@ -1177,6 +1255,11 @@ function scheduleDeferredOwnerOnlySelfHeal(directory: string): void {
 /** Number of scopes with an in-flight deferred owner-only self-heal (test/shutdown observability). */
 export function pendingDeferredOwnerOnlySelfHealCount(): number {
 	return pendingDeferredOwnerOnlySelfHeals.size;
+}
+
+/** Number of scopes with a recorded deferred owner-only repair failure (test/shutdown observability). */
+export function pendingDeferredOwnerOnlyRepairFailureCount(): number {
+	return pendingDeferredOwnerOnlyRepairFailures.size;
 }
 
 /** Await every in-flight deferred owner-only self-heal (deterministic teardown/shutdown). */
@@ -1197,6 +1280,30 @@ export async function drainDeferredOwnerOnlySelfHeals(): Promise<void> {
  * rather than silently accepted as owner-only.
  */
 export function selfHealOwnerOnlyModeDrift(directory: string, policy: ManagedSessionSecurityPolicy): void {
+	const key = path.resolve(directory);
+	// A prior deferred repair that could not restore owner-only mode is the only
+	// enforcement for its descendants. Retry it before this writer proceeds and
+	// fail closed if it still cannot be secured, so a discarded background repair
+	// never surfaces as an apparently successful prepare (the base implementation
+	// likewise failed closed rather than accepting a group/other-readable tree).
+	const priorFailures = pendingDeferredOwnerOnlyRepairFailures.get(key);
+	if (priorFailures !== undefined) {
+		const stillDrifted: string[] = [];
+		let firstError: unknown;
+		for (const pathname of priorFailures) {
+			try {
+				resecureOwnerOnlyPath(pathname);
+			} catch (error) {
+				stillDrifted.push(pathname);
+				firstError ??= error;
+			}
+		}
+		if (stillDrifted.length > 0) {
+			pendingDeferredOwnerOnlyRepairFailures.set(key, stillDrifted);
+			throw firstError instanceof Error ? firstError : new Error("mode_mismatch");
+		}
+		pendingDeferredOwnerOnlyRepairFailures.delete(key);
+	}
 	const budget: OwnerOnlySelfHealBudget = {
 		deadline: Date.now() + OWNER_ONLY_SELF_HEAL_MAX_DURATION_MS,
 		remaining: OWNER_ONLY_SELF_HEAL_MAX_ENTRIES,

@@ -2,9 +2,11 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as native from "@gajae-code/natives";
 import {
 	drainDeferredOwnerOnlySelfHeals,
 	OWNER_ONLY_SELF_HEAL_MAX_ENTRIES,
+	pendingDeferredOwnerOnlyRepairFailureCount,
 	pendingDeferredOwnerOnlySelfHealCount,
 	prepareManagedSessionScopeForWriteSync,
 	resolveManagedScope,
@@ -217,6 +219,130 @@ describe.skipIf(process.platform === "win32")("managed scope owner-only self-hea
 		// (targeted repair, not a full re-secure of the entire scope), and no
 		// unbounded tail work was deferred.
 		for (const pathname of clean) expect(lstatCounts.get(path.resolve(pathname))).toBe(1);
+		expect(pendingDeferredOwnerOnlySelfHealCount()).toBe(0);
+	});
+
+	// Second review — Finding 1: the walk queues a directory after an `lstat`, then
+	// opens it later (after popping/yielding). A same-user concurrent replacement in
+	// that window can turn the queued directory into a symlink or a different
+	// directory; the walk must revalidate identity (dev+ino) before enumerating and
+	// stop on any mismatch, so its owner-only repair can never follow the
+	// replacement into descendants outside the retained managed scope.
+	it("does not enumerate a queued scope directory whose identity changed before it was opened", () => {
+		const root = tempTree();
+		const sub = path.join(root, "sub");
+		fs.mkdirSync(sub, { mode: 0o700 });
+		const inner = path.join(sub, "leaked.bin");
+		fs.writeFileSync(inner, "secret", { mode: 0o600 });
+		fs.chmodSync(inner, 0o644);
+		expect(isOwnerOnly(inner)).toBe(false);
+
+		// Report a different inode for `sub` on the *revalidating* lstat (the second
+		// stat of `sub`, done right before `opendir`) to mimic a concurrent
+		// replacement between queueing and opening. The first stat (classification)
+		// captures the real identity the revalidation is then compared against.
+		const resolvedSub = path.resolve(sub);
+		let subLstats = 0;
+		const realLstat = fs.lstatSync.bind(fs) as (...args: Parameters<typeof fs.lstatSync>) => fs.Stats;
+		vi.spyOn(fs, "lstatSync").mockImplementation(((...args: Parameters<typeof fs.lstatSync>) => {
+			const stat = realLstat(...args);
+			if (path.resolve(String(args[0])) === resolvedSub) {
+				subLstats += 1;
+				if (subLstats >= 2) {
+					const swapped = Object.create(stat);
+					Object.defineProperty(swapped, "ino", {
+						value: typeof stat.ino === "bigint" ? stat.ino + 1n : stat.ino + 1,
+						enumerable: true,
+					});
+					return swapped;
+				}
+			}
+			return stat;
+		}) as typeof fs.lstatSync);
+
+		selfHealOwnerOnlyModeDrift(root, "default");
+
+		// The identity mismatch stopped the walk at `sub`: the drifted file inside the
+		// "replaced" directory was never opened or repaired, and nothing was deferred.
+		expect(isOwnerOnly(inner)).toBe(false);
+		expect(pendingDeferredOwnerOnlySelfHealCount()).toBe(0);
+	});
+
+	// Second review — Finding 2: for a descendant past the synchronous budget the
+	// deferred tail is the ONLY enforcement step. A repair failure there must not be
+	// swallowed while prepare reports success; it is recorded, and the next prepare
+	// retries and fails closed until the descendant can actually be secured.
+	it("preserves a failed deferred repair and fails closed on the next prepare until it can succeed", async () => {
+		const root = tempTree();
+
+		// >budget direct children guarantee the synchronous scan truncates before it
+		// ever descends into `tail/`, so the drifted file is only reachable by the
+		// deferred background walk.
+		for (let i = 0; i < OWNER_ONLY_SELF_HEAL_MAX_ENTRIES + 2000; i += 1) {
+			fs.writeFileSync(path.join(root, `pad-${i}.bin`), "", { mode: 0o600 });
+		}
+		const tail = path.join(root, "tail");
+		fs.mkdirSync(tail, { mode: 0o700 });
+		const driftedFile = path.join(tail, "leaked.bin");
+		fs.writeFileSync(driftedFile, "secret", { mode: 0o600 });
+		fs.chmodSync(driftedFile, 0o644);
+		const resolvedDrift = path.resolve(driftedFile);
+
+		// Force the owner-only repair of the drifted tail file to fail, as an
+		// ownership/ACL problem the self-heal cannot fix would.
+		const realApply = native.applyOwnerOnlyPathSecurity.bind(native);
+		const apply = vi.spyOn(native, "applyOwnerOnlyPathSecurity").mockImplementation(((
+			pathname: string,
+			kind: "directory" | "file",
+		) => {
+			if (path.resolve(pathname) === resolvedDrift) return { ok: false, code: "mode_mismatch" };
+			return realApply(pathname, kind);
+		}) as typeof native.applyOwnerOnlyPathSecurity);
+
+		// Synchronous scan truncates on the pad entries and schedules the deferred tail.
+		selfHealOwnerOnlyModeDrift(root, "default");
+		await drainDeferredOwnerOnlySelfHeals();
+
+		// The deferred repair failed: the file is still readable and the failure was
+		// recorded rather than discarded behind a successful-looking prepare.
+		expect(isOwnerOnly(driftedFile)).toBe(false);
+		expect(apply).toHaveBeenCalled();
+		expect(pendingDeferredOwnerOnlyRepairFailureCount()).toBeGreaterThan(0);
+
+		// The next prepare observes the recorded failure, retries it, and — since the
+		// repair still cannot succeed — fails closed instead of reporting success.
+		expect(() => selfHealOwnerOnlyModeDrift(root, "default")).toThrow("mode_mismatch");
+		expect(pendingDeferredOwnerOnlyRepairFailureCount()).toBeGreaterThan(0);
+
+		// Once the underlying cause clears, the retry succeeds, the record clears, and
+		// prepare no longer fails closed.
+		apply.mockRestore();
+		expect(() => selfHealOwnerOnlyModeDrift(root, "default")).not.toThrow();
+		expect(isOwnerOnly(driftedFile)).toBe(true);
+		expect(pendingDeferredOwnerOnlyRepairFailureCount()).toBe(0);
+	});
+
+	// Second review — Finding 3: a completed deferred walk has already repaired the
+	// whole tree, so repeated prepares on a large unchanged scope must not each
+	// launch another full traversal the instant the previous one settles. A
+	// completion cooldown suppresses re-scheduling for a window after the last walk.
+	it("does not re-schedule a full deferred walk immediately after one completes (cooldown)", async () => {
+		const root = tempTree();
+
+		// >budget children so the synchronous scan always truncates and would, absent
+		// a cooldown, schedule a fresh deferred walk on every prepare.
+		for (let i = 0; i < OWNER_ONLY_SELF_HEAL_MAX_ENTRIES + 2000; i += 1) {
+			fs.writeFileSync(path.join(root, `pad-${i}.bin`), "", { mode: 0o600 });
+		}
+
+		// First prepare truncates and schedules the deferred tail walk.
+		selfHealOwnerOnlyModeDrift(root, "default");
+		expect(pendingDeferredOwnerOnlySelfHealCount()).toBeGreaterThan(0);
+		await drainDeferredOwnerOnlySelfHeals();
+
+		// A second prepare immediately after (well within the cooldown window) also
+		// truncates, but must NOT launch another full walk of the unchanged scope.
+		selfHealOwnerOnlyModeDrift(root, "default");
 		expect(pendingDeferredOwnerOnlySelfHealCount()).toBe(0);
 	});
 });
