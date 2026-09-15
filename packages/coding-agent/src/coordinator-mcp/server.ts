@@ -6358,15 +6358,37 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	 * id (selected by session_id, not deletion_id) resumes and completes it.
 	 */
 	async function forceEvictStaleSession(sessionId: string, session: Record<string, unknown> | null): Promise<void> {
-		const persistedIncarnation = session ? optionalString(session.endpoint_incarnation) : null;
-		if (!persistedIncarnation) {
-			// No incarnation authority (malformed/absent projection): there is no WAL
-			// identity to clean, so best-effort projection removal is all that remains.
+		await ensureQuestionStateReady();
+		// Recover the session by id from the canonical WAL — not just the projection.
+		// A crash/partial-write, or a malformed/legacy projection, can leave canonical
+		// state committed while the projection has lost its endpoint_incarnation.
+		// Keying force eviction off the projection alone would then retire only the
+		// projection files and orphan the WAL, retained public-delivery claims,
+		// registry (roster/retained) hints, and scheduler markers indefinitely: after
+		// three stale sweeps the projection disappears and the normal
+		// deletion-intent/completeDeletionCleanup path can no longer select the id.
+		const canonicalTransaction = await readSessionTransaction(questionPaths, sessionId);
+		if (!canonicalTransaction) {
+			// Canonical state confirmed absent (this also covers the malformed/absent
+			// projection case): the only durable footprint left is the projection, so
+			// best-effort projection removal is all that remains.
 			await removeReapedProjection(sessionId, [], []);
 			return;
 		}
-		await ensureQuestionStateReady();
-		const canonicalTransaction = await readSessionTransaction(questionPaths, sessionId);
+		// Endpoint authority for the durable retirement: prefer the projection, but
+		// fall back to the WAL's own incarnation when the projection dropped it.
+		// removeSessionTransaction fences the delete on this exact incarnation, and
+		// the value read from the WAL always matches that fence.
+		const persistedIncarnation =
+			(session ? optionalString(session.endpoint_incarnation) : null) ??
+			optionalString(canonicalTransaction.endpoint?.incarnation);
+		if (!persistedIncarnation) {
+			// The WAL exists but never observed an endpoint incarnation, so there is
+			// no authority to fence a durable retirement against. Leave the state for
+			// the normal reap path rather than orphaning the WAL with a
+			// projection-only delete.
+			return;
+		}
 		const deletionId = `force-evict:${sessionId}:${persistedIncarnation}`;
 		const deletionKey = createHash("sha256").update(deletionId).digest("hex");
 		const now = new Date().toISOString();
