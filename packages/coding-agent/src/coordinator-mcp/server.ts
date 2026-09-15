@@ -6239,6 +6239,15 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					});
 				}
 			} catch (error) {
+				// #5581: a forced stop can clear the second authority check yet lose the
+				// endpoint before `session.close` reaches the broker, so the close throws
+				// a stale/absent code. The deletion is already admitted as remote_started
+				// but never proven closed, leaving the indexed row holding its worktree.
+				// Record the same identity-bound terminal-uncertain claim before surfacing
+				// the unproven close. Only stale/absent codes qualify: a live endpoint
+				// failing transiently must keep its checkout.
+				if (error instanceof SdkClientError && (error.code === "endpoint_stale" || error.code === "not_found"))
+					await releaseStaleWorktreeOnForce();
 				return {
 					ok: false,
 					reason: "close_failed",

@@ -283,6 +283,57 @@ describe("gjc_coordinator_stop_session SDK lifecycle", () => {
 		expect(controls.filter(control => control.operation === "session.close")).toEqual([]);
 	});
 
+	it("releases the worktree when a force-stop passes the authority check but the broker close throws endpoint_stale (#5581)", async () => {
+		const root = await tempRoot();
+		// The row is still indexed at the persisted authority, so both the preflight
+		// and the second authority check pass. The endpoint then vanishes before the
+		// reap `session.close` reaches the broker, which throws endpoint_stale. Before
+		// this fix the broad catch returned close_failed without recording a
+		// terminal-uncertain claim, so the non-terminal row kept holding its checkout.
+		const { server, controls, sessionFile } = await createServer(root, {
+			forceStop: true,
+			closeHandler: async input => {
+				// The advisory release close carries forceReleaseStaleWorktree; only the
+				// reap close is made to lose its endpoint mid-flight.
+				if (input.forceReleaseStaleWorktree === true) return { ok: true, result: { sessionId: input.sessionId } };
+				return { ok: false, error: { code: "endpoint_stale", message: "endpoint vanished mid-close" } };
+			},
+		});
+		await writeSession(sessionFile("stale-close"), root, "stale-close");
+
+		expect(
+			await server.callTool("gjc_coordinator_stop_session", {
+				session_id: "stale-close",
+				force: true,
+				allow_mutation: true,
+			}),
+		).toMatchObject({ ok: false, reason: "close_failed", detail: "endpoint_stale", closed: false });
+		const closes = controls.filter(control => control.operation === "session.close");
+		// The reap close was attempted at the exact persisted authority...
+		expect(closes[0]).toEqual(
+			expect.objectContaining({
+				input: expect.objectContaining({
+					sessionId: "stale-close",
+					endpointGeneration: ENDPOINT_GENERATION,
+					endpointIncarnation: endpointIncarnation("stale-close"),
+				}),
+			}),
+		);
+		// ...and its endpoint_stale failure drives the identity-bound release.
+		expect(closes).toContainEqual(
+			expect.objectContaining({
+				input: expect.objectContaining({
+					sessionId: "stale-close",
+					endpointGeneration: ENDPOINT_GENERATION,
+					endpointIncarnation: endpointIncarnation("stale-close"),
+					forceReleaseStaleWorktree: true,
+				}),
+			}),
+		);
+		// The unproven close leaves the projection readable for inspect/tail.
+		expect(await Bun.file(sessionFile("stale-close")).exists()).toBe(true);
+	});
+
 	it("closes an idle ephemeral session through the SDK broker and removes only coordinator metadata", async () => {
 		const root = await tempRoot();
 		const { server, controls, registryFile, sessionFile } = await createServer(root);
