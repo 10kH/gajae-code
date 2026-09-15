@@ -5931,6 +5931,41 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		);
 		return true;
 	}
+	/**
+	 * True when the broker row for this session is the terminal-uncertain claim a
+	 * forced stale-worktree release recorded against exactly this authority. The
+	 * claim is only accepted as close proof while the row is still that identity:
+	 * a rotated successor, an ambiguous row, or an unreadable listing all fall
+	 * back to the ordinary close.
+	 */
+	async function forcedStaleReleaseProven(
+		sessionId: string,
+		workspace: string | null,
+		endpointGeneration: number,
+		endpointIncarnation: string,
+	): Promise<boolean> {
+		if (!workspace) return false;
+		let matches: Array<Record<string, unknown>>;
+		try {
+			const canonicalWorkspace = await canonicalBrokerWorkspace(workspace);
+			const listing = await paginatedBrokerSessionList(canonicalWorkspace, { cwd: canonicalWorkspace });
+			matches = jsonRecords(Array.isArray(listing.sessions) ? listing.sessions : []).filter(
+				row => brokerSessionId(row) === sessionId,
+			);
+		} catch {
+			return false;
+		}
+		if (matches.length !== 1) return false;
+		const row = matches[0]!;
+		return (
+			row.ambiguous !== true &&
+			(row.terminalUncertain === true || row.terminal_uncertain === true) &&
+			(row.forcedStaleRelease === true || row.forced_stale_release === true) &&
+			brokerEndpointGeneration(row) === endpointGeneration &&
+			brokerEndpointIncarnation(row, sessionId) === endpointIncarnation
+		);
+	}
+
 	async function recoverIntentDeletion(entry: NamespaceDeletionEntryV1): Promise<void> {
 		const session = asRecord(await readJsonFile(sessionFile(entry.session_id)));
 		if (!session) throw new SdkClientError("state_corrupt", "Close intent has no session authority record.");
@@ -5943,19 +5978,33 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				: null;
 		if (!cwd || endpointGeneration === null)
 			throw new SdkClientError("state_corrupt", "Close intent authority is incomplete.");
-		strictBrokerSessionClose(
-			await brokerSession(
-				cwd,
-				"session.close",
-				{
-					sessionId: entry.session_id,
-					endpointGeneration,
-					endpointIncarnation: entry.endpoint_incarnation,
-				},
-				`coordinator-reap:${entry.session_id}:${entry.endpoint_incarnation}`,
-			),
-			entry.session_id,
-		);
+		// #5581: a forced stop that admitted this deletion and then lost its endpoint
+		// already released the worktree by recording a terminal-uncertain claim bound
+		// to this exact authority. The broker refuses an ordinary `session.close`
+		// against such a row (`terminal_uncertain`), so retrying one here would park
+		// the manifest at `intent` forever. The claim is itself the teardown proof:
+		// advance on it instead, exactly as the success path does.
+		if (
+			!(await forcedStaleReleaseProven(
+				entry.session_id,
+				optionalString(session.broker_workspace),
+				endpointGeneration,
+				entry.endpoint_incarnation,
+			))
+		)
+			strictBrokerSessionClose(
+				await brokerSession(
+					cwd,
+					"session.close",
+					{
+						sessionId: entry.session_id,
+						endpointGeneration,
+						endpointIncarnation: entry.endpoint_incarnation,
+					},
+					`coordinator-reap:${entry.session_id}:${entry.endpoint_incarnation}`,
+				),
+				entry.session_id,
+			);
 		await advanceDeletion(questionPaths, entry.deletion_id, "broker_closed", undefined, {
 			ok: true,
 			closed: true,

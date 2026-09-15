@@ -334,6 +334,54 @@ describe("gjc_coordinator_stop_session SDK lifecycle", () => {
 		expect(await Bun.file(sessionFile("stale-close")).exists()).toBe(true);
 	});
 
+	it("advances an admitted deletion on the forced release claim instead of re-closing (#5581)", async () => {
+		const root = await tempRoot();
+		// The retry after the previous scenario: the deletion is admitted at `intent`
+		// and the forced release already marked the row terminal-uncertain. An ordinary
+		// `session.close` against that row is refused with terminal_uncertain, so
+		// retrying one would park the manifest at `intent` forever. The forced claim is
+		// itself the teardown proof, so the retry advances to broker_closed on it.
+		const rows = fixtureBrokerRows(root, "recovered");
+		let released = false;
+		const { server, controls, sessionFile } = await createServer(root, {
+			forceStop: true,
+			brokerSessionsOverride: async () => [
+				released ? { ...rows.live, live: false, terminalUncertain: true, forcedStaleRelease: true } : rows.live,
+			],
+			closeHandler: async input => {
+				if (input.forceReleaseStaleWorktree === true) {
+					released = true;
+					return { ok: true, result: { sessionId: input.sessionId } };
+				}
+				// Mirrors the broker: once the row carries the terminal-uncertain claim,
+				// every ordinary close is refused with terminal_uncertain.
+				if (released) return { ok: false, error: { code: "terminal_uncertain", message: "ownership uncertain" } };
+				return { ok: false, error: { code: "endpoint_stale", message: "endpoint vanished mid-close" } };
+			},
+		});
+		await writeSession(sessionFile("recovered"), root, "recovered");
+
+		expect(
+			await server.callTool("gjc_coordinator_stop_session", {
+				session_id: "recovered",
+				force: true,
+				allow_mutation: true,
+			}),
+		).toMatchObject({ ok: false, reason: "close_failed", detail: "endpoint_stale", closed: false });
+		const closesAfterFirstStop = controls.filter(control => control.operation === "session.close").length;
+
+		expect(
+			await server.callTool("gjc_coordinator_stop_session", {
+				session_id: "recovered",
+				force: true,
+				allow_mutation: true,
+			}),
+		).toMatchObject({ ok: true, closed: true });
+		// The recovery issued no further close: the forced claim carried the proof.
+		expect(controls.filter(control => control.operation === "session.close")).toHaveLength(closesAfterFirstStop);
+		expect(await Bun.file(sessionFile("recovered")).exists()).toBe(false);
+	});
+
 	it("closes an idle ephemeral session through the SDK broker and removes only coordinator metadata", async () => {
 		const root = await tempRoot();
 		const { server, controls, registryFile, sessionFile } = await createServer(root);
