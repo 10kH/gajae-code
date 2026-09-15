@@ -5541,6 +5541,14 @@ async function executeLifecycleResponse(
 	let record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
 	if (operation === "session.close") {
 		if (!record) return fail("not_found", "session is not indexed");
+		// A forced stop of a session whose endpoint is already stale (its coordinator
+		// service went away mid-run) cannot reach the runtime to prove teardown. The
+		// caller has explicitly requested force, so when the endpoint proves stale
+		// below and the owning process is no longer observably alive, record a
+		// terminal-uncertain claim before surfacing endpoint_stale — otherwise the
+		// row keeps holding its worktree forever, since an OS probe of a reused pid
+		// returns `uncertain` and never `exited` (#5581).
+		const forceReleaseStaleWorktree = input.forceReleaseStaleWorktree === true;
 		if (record.terminalUncertain)
 			return fail("terminal_uncertain", "Session ownership is uncertain and cannot be closed safely.");
 		if (!isSessionAuthorityEligible(record))
@@ -5585,7 +5593,20 @@ async function executeLifecycleResponse(
 			}
 		}
 		if (!endpointResult.ok) {
-			if (endpointResult.error.code === "endpoint_stale") return endpointResult;
+			if (endpointResult.error.code === "endpoint_stale") {
+				// The forced-release contract: release the worktree only when the
+				// process is not observably alive. An alive process still owns its
+				// checkout, so it stays occupied even under force; `uncertain`
+				// (the pid-reuse case this fix targets) and `exited` are released.
+				if (
+					forceReleaseStaleWorktree &&
+					observeProcess(record.pid, record.hostIncarnation ?? record.processIncarnation, value =>
+						processIncarnationForBroker(broker, value),
+					) !== "alive"
+				)
+					await recordTerminalUncertain(broker, id, record.locator.stateRoot, record.pid);
+				return endpointResult;
+			}
 			if (endpointResult.error.code !== "resource_gone") return endpointResult;
 			usedSignalFallback = true;
 		} else {

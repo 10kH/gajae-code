@@ -230,6 +230,59 @@ describe("gjc_coordinator_stop_session SDK lifecycle", () => {
 		expect(controls.filter(control => control.operation === "session.close")).toEqual([]);
 	});
 
+	it("releases the worktree of a force-stopped endpoint_stale session before returning endpoint_stale (#5581)", async () => {
+		const root = await tempRoot();
+		// The broker still indexes the session, but at a rotated endpoint authority:
+		// the coordinator's persisted incarnation no longer matches, so the preflight
+		// resolves endpoint_stale. Before #5581 this returned without releasing the
+		// worktree, and the row (still non-terminal in the index) parked the checkout
+		// forever because an OS probe of the reused pid reads `uncertain`.
+		const rows = fixtureBrokerRows(root, "stale");
+		const { server, controls, sessionFile } = await createServer(root, {
+			forceStop: true,
+			brokerSessionsOverride: async () => [{ ...rows.live, endpointGeneration: ENDPOINT_GENERATION + 1 }],
+		});
+		await writeSession(sessionFile("stale"), root, "stale");
+
+		expect(
+			await server.callTool("gjc_coordinator_stop_session", {
+				session_id: "stale",
+				force: true,
+				allow_mutation: true,
+			}),
+		).toMatchObject({ ok: false, reason: "endpoint_stale", closed: false });
+		// The forced release drives a session.close carrying forceReleaseStaleWorktree,
+		// bound to the exact persisted authority so a live successor is never touched.
+		expect(controls.filter(control => control.operation === "session.close")).toEqual([
+			expect.objectContaining({
+				input: expect.objectContaining({
+					sessionId: "stale",
+					endpointGeneration: ENDPOINT_GENERATION,
+					endpointIncarnation: endpointIncarnation("stale"),
+					forceReleaseStaleWorktree: true,
+				}),
+			}),
+		]);
+		// DR-1: the session projection stays readable for inspect/tail after force-stop.
+		expect(await Bun.file(sessionFile("stale")).exists()).toBe(true);
+	});
+
+	it("does not attempt a worktree release when a non-forced stop hits endpoint_stale", async () => {
+		const root = await tempRoot();
+		const rows = fixtureBrokerRows(root, "unforced");
+		const { server, controls, sessionFile } = await createServer(root, {
+			brokerSessionsOverride: async () => [{ ...rows.live, endpointGeneration: ENDPOINT_GENERATION + 1 }],
+		});
+		await writeSession(sessionFile("unforced"), root, "unforced", { ephemeral: true });
+
+		expect(
+			await server.callTool("gjc_coordinator_stop_session", { session_id: "unforced", allow_mutation: true }),
+		).toMatchObject({ ok: false, reason: "endpoint_stale", closed: false });
+		// The uncertain-counts-as-occupied guarantee is preserved for non-forced
+		// stops: no session.close is issued, so nothing releases the worktree.
+		expect(controls.filter(control => control.operation === "session.close")).toEqual([]);
+	});
+
 	it("closes an idle ephemeral session through the SDK broker and removes only coordinator metadata", async () => {
 		const root = await tempRoot();
 		const { server, controls, registryFile, sessionFile } = await createServer(root);

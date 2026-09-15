@@ -6052,6 +6052,29 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			const persistedIncarnation = optionalString(session.endpoint_incarnation);
 			if (!cwd || !persistedWorkspace || persistedGeneration === null || !persistedIncarnation)
 				return { ok: false, reason: "endpoint_stale", closed: false };
+			// #5581: a forced stop of a session whose endpoint has gone stale (its
+			// coordinator service vanished mid-run) cannot prove teardown, so it
+			// returns endpoint_stale below. The worktree release must still happen
+			// first: ask the broker to record a terminal-uncertain claim so the row
+			// stops holding its checkout. Best-effort — the endpoint_stale signal the
+			// caller depends on is returned regardless of whether release succeeds.
+			// The persisted endpoint authority is passed so the broker acts on exactly
+			// this stale identity: a live successor incarnation fails the close
+			// authority check and is never touched, so a legitimately re-held worktree
+			// stays occupied.
+			const releaseStaleWorktreeOnForce = async (): Promise<void> => {
+				if (opts.force !== true) return;
+				try {
+					await brokerSession(cwd, "session.close", {
+						sessionId: id,
+						endpointGeneration: persistedGeneration,
+						endpointIncarnation: persistedIncarnation,
+						forceReleaseStaleWorktree: true,
+					});
+				} catch {
+					// Advisory release; a later launch simply re-observes the row and retries.
+				}
+			};
 			// Endpoint identity is the authority for any lifecycle mutation. Check it
 			// before consulting a possibly stale active-turn projection so a successor
 			// incarnation cannot be blocked by old local state.
@@ -6063,11 +6086,15 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					!sameCanonicalPath(authority.workspace, persistedWorkspace, platform) ||
 					authority.endpointGeneration !== persistedGeneration ||
 					authority.endpointIncarnation !== persistedIncarnation
-				)
+				) {
+					await releaseStaleWorktreeOnForce();
 					return { ok: false, reason: "endpoint_stale", closed: false };
+				}
 			} catch (error) {
-				if (error instanceof SdkClientError && (error.code === "not_found" || error.code === "endpoint_stale"))
+				if (error instanceof SdkClientError && (error.code === "not_found" || error.code === "endpoint_stale")) {
+					await releaseStaleWorktreeOnForce();
 					return { ok: false, reason: "endpoint_stale", closed: false };
+				}
 				throw error;
 			}
 			if (session.ephemeral !== true && opts.force !== true)
@@ -6169,8 +6196,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						!sameCanonicalPath(authority.workspace, persistedWorkspace, platform) ||
 						authority.endpointGeneration !== persistedGeneration ||
 						authority.endpointIncarnation !== persistedIncarnation
-					)
+					) {
+						await releaseStaleWorktreeOnForce();
 						return { ok: false, reason: "endpoint_stale", closed: false };
+					}
 				}
 				await ensureQuestionStateReady();
 				await ensureQuestionTransaction(id);
