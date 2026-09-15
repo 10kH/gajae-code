@@ -5669,7 +5669,19 @@ async function executeLifecycleResponse(
 				// stale identity the forced stop targeted — never a live successor, which
 				// would have failed that authority check. Release its worktree bound to
 				// that identity so a rotated successor is left untouched (#5581).
-				if (forceReleaseStaleWorktree) await releaseForcedStaleWorktree(broker, id, record);
+				// Best-effort: the endpoint_stale outcome is already proven and must be
+				// returned. A release failure (index/broker write error) must not mask it;
+				// the stale-endpoint recovery paths retry the release later.
+				if (forceReleaseStaleWorktree) {
+					try {
+						await releaseForcedStaleWorktree(broker, id, record);
+					} catch (error) {
+						logger.warn("sdk broker forced stale-worktree release failed; returning endpoint_stale", {
+							sessionId: id,
+							error: String(error),
+						});
+					}
+				}
 				return endpointResult;
 			}
 			if (endpointResult.error.code !== "resource_gone") return endpointResult;
