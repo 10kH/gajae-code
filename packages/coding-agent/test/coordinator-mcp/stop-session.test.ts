@@ -2,8 +2,14 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { buildCoordinatorMcpConfig } from "../../src/coordinator-mcp/policy";
-import { coordinatorStatePaths, readSessionTransaction } from "../../src/coordinator-mcp/question-state";
+import {
+	type CoordinatorSessionTransactionV1,
+	coordinatorStatePaths,
+	readSessionTransaction,
+	withSessionTransaction,
+} from "../../src/coordinator-mcp/question-state";
 import { createCoordinatorMcpServer } from "../../src/coordinator-mcp/server";
+import { MAX_REAP_FAILURES } from "../../src/coordinator-mcp/session-reaper";
 import { type BrokerDiscovery, brokerProcessIncarnation, writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
 import type { SdkClient } from "../../src/sdk/client/client";
 import {
@@ -428,6 +434,76 @@ describe("gjc_coordinator_stop_session SDK lifecycle", () => {
 			expect(sawClose).toBe(true);
 			expect(await Bun.file(sessionFile("still-live")).exists()).toBe(true);
 		});
+	});
+
+	it("F2: revalidates active-turn state under the lock and skips force eviction when a turn started after selection", async () => {
+		const root = await tempRoot();
+		const sessionId = "stale-then-active";
+		let goActive = false;
+		let injected = false;
+		// The broker index never carries a row for the session, so every reap
+		// preflight fails endpoint_stale — the force-eviction trigger. On the sweep
+		// that crosses MAX_REAP_FAILURES we simulate a turn starting AFTER the
+		// reaper selected the (turn-less) candidate but before eviction runs.
+		const { server } = await createServer(root, {
+			brokerSessionsOverride: async () => {
+				if (goActive && !injected) {
+					injected = true;
+					await withSessionTransaction(fixture.paths, sessionId, async (t: CoordinatorSessionTransactionV1) => {
+						const turnId = "turn-00000000-0000-4000-8000-0000000000aa";
+						const at = new Date().toISOString();
+						t.canonical.turns[turnId] = {
+							schema_version: 1,
+							turn_id: turnId,
+							session_id: sessionId,
+							namespace_id: t.canonical.session.namespace_id,
+							status: "active",
+							prompt: { text: "reactivated mid-reap", created_at: at, source: "coordinator" },
+							delivery: { delivered: false, queued: false, target: null, attempts: [] },
+							runtime_provenance: null,
+							question_ids: [],
+							final_response: { text: null, format: "markdown", source: null, artifact_path: null, truncated: false },
+							evidence: [],
+							error: null,
+							liveness: {},
+							created_at: at,
+							updated_at: at,
+							started_at: at,
+							completed_at: null,
+							terminal_fence: null,
+						};
+						t.canonical.queue.active_turn_id = turnId;
+					});
+				}
+				return [];
+			},
+		});
+		const fixture = await writeDurableCoordinatorSession({
+			sessionId,
+			cwd: root,
+			env: {
+				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+				GJC_COORDINATOR_MCP_STATE_ROOT: path.join(root, ".gjc", "coordinator-state"),
+				GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
+				GJC_COORDINATOR_MCP_PROFILE: "local",
+				GJC_COORDINATOR_MCP_REPO: "repo",
+			},
+			overrides: { ephemeral: true },
+		});
+
+		// Accumulate stale failures right up to the eviction boundary.
+		for (let i = 0; i < MAX_REAP_FAILURES - 1; i++) expect(await server.sessionReaper.sweepOnce()).toBe(0);
+		expect(await Bun.file(fixture.sessionFile).exists()).toBe(true);
+
+		// This sweep hits MAX_REAP_FAILURES and would force-evict — but the
+		// under-lock revalidation must see the freshly-active turn and abort.
+		goActive = true;
+		expect(await server.sessionReaper.sweepOnce()).toBe(0);
+		expect(injected).toBe(true);
+
+		// Neither the projection row nor the canonical WAL was removed.
+		expect(await Bun.file(fixture.sessionFile).exists()).toBe(true);
+		expect(await readSessionTransaction(fixture.paths, sessionId)).not.toBeNull();
 	});
 
 	it("reuses the close idempotency key when the idle reaper retries", async () => {

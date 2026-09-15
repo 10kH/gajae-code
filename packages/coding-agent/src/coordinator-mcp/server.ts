@@ -6294,6 +6294,56 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		});
 	}
 
+	/**
+	 * True when the session's persisted endpoint authority can no longer be
+	 * proven current (missing identity fields, rotated generation/incarnation, or
+	 * an absent broker row). Mirrors the reap preflight so force eviction only
+	 * fires against a genuinely stale endpoint. A transient authority-read failure
+	 * returns false: we cannot prove the endpoint recovered, but we also must not
+	 * force-evict on a flake — the normal reap path will retry.
+	 */
+	async function isSessionEndpointStale(session: Record<string, unknown>, id: string): Promise<boolean> {
+		const persistedWorkspace = optionalString(session.broker_workspace);
+		const persistedGeneration =
+			typeof session.endpoint_generation === "number" &&
+			Number.isSafeInteger(session.endpoint_generation) &&
+			session.endpoint_generation > 0
+				? session.endpoint_generation
+				: null;
+		const persistedIncarnation = optionalString(session.endpoint_incarnation);
+		if (!persistedWorkspace || persistedGeneration === null || !persistedIncarnation) return true;
+		try {
+			const workspace = await canonicalBrokerWorkspace(persistedWorkspace);
+			const authority = await exactBrokerSessionAuthority(id, workspace);
+			return (
+				!sameCanonicalPath(authority.workspace, persistedWorkspace, platform) ||
+				authority.endpointGeneration !== persistedGeneration ||
+				authority.endpointIncarnation !== persistedIncarnation
+			);
+		} catch (error) {
+			if (error instanceof SdkClientError && (error.code === "not_found" || error.code === "endpoint_stale"))
+				return true;
+			return false;
+		}
+	}
+
+	/**
+	 * Confirm no turn is active for the session, reading the durable authority
+	 * (canonical WAL) and the legacy active-turn projection. `listSessions`
+	 * captures reap candidates before the per-session transition lock is held, so
+	 * a turn can begin in the gap before eviction — this must be re-checked under
+	 * the lock immediately before any irreversible removal.
+	 */
+	async function sessionHasActiveTurn(id: string): Promise<boolean> {
+		const canonicalTransaction = await readSessionTransaction(questionPaths, id);
+		const canonicalActiveTurn = canonicalTransaction
+			? Object.values(canonicalTransaction.canonical.turns).some(turn =>
+					ACTIVE_TURN_STATUSES.has(turn.status as TurnStatus),
+				)
+			: false;
+		return canonicalActiveTurn || (await readActiveTurn(namespaceDir, id)) !== null;
+	}
+
 	const sessionReaper: SessionReaper = createSessionReaper(
 		{
 			listSessions: async (): Promise<ReapableSession[]> => {
@@ -6345,11 +6395,17 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				if (!result.ok) throw new Error(result.reason ?? "session_reap_failed");
 			},
 			markSessionDead: async (sessionId: string): Promise<void> => {
-				// Force-evict a session that cannot be reaped normally (e.g. endpoint_stale repeated
-				// MAX_REAP_FAILURES times). Remove its projection files so listSessions() will no
-				// longer return it. This is best-effort: we skip WAL/delivery cleanup because the
-				// session endpoint is already gone and there is no live broker to drain.
-				await removeReapedProjection(sessionId, [], []);
+				// Force-evict a session that cannot be reaped normally (endpoint_stale
+				// repeated MAX_REAP_FAILURES times). The candidate was selected before
+				// this transition acquired its per-session lock, so revalidate the
+				// durable authority under the lock: a turn may have started, or the
+				// endpoint may have recovered, since listSessions() ran.
+				await withSessionTransition(sessionId, async () => {
+					if (await sessionHasActiveTurn(sessionId)) return;
+					const session = asRecord(await readJsonFile(sessionFile(sessionId)));
+					if (session && !(await isSessionEndpointStale(session, sessionId))) return;
+					await removeReapedProjection(sessionId, [], []);
+				});
 			},
 			now: () => Date.now(),
 		},
