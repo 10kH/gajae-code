@@ -115,6 +115,7 @@ import {
 	isContextOverflow,
 	isFastModeEffectiveForProvider,
 	isUsageLimitError,
+	modelSupportsMaintenanceCalls,
 	modelSupportsServiceTier,
 	modelsAreEqual,
 	streamSimple,
@@ -20006,6 +20007,35 @@ export class AgentSession {
 		// disabled/off settings so a resource-floor breach still compacts before OOM.
 		if (!options?.force && compactionSettings.strategy === "off") return { kind: "skipped" };
 		if (!options?.force && reason !== "idle" && !compactionSettings.enabled) return { kind: "skipped" };
+		// Agent-level providers (e.g. Devin over ACP) own conversation history and
+		// refuse GJC maintenance calls by contract. Context-full maintenance walks
+		// the candidate chain while handoff generation calls the session model
+		// directly, so when every model the selected action can reach is
+		// agent-level the attempt can only report a guaranteed refusal on every
+		// threshold crossing — treat it as a benign skip like maintenance being off.
+		// A session_before_compact hook can still serve context-full maintenance
+		// without a model call, so it keeps the session eligible.
+		const handoffSelected = compactionSettings.strategy === "handoff" && reason !== "overflow";
+		const reachableModels =
+			handoffSelected && this.model
+				? [this.model]
+				: this.#getCompactionModelCandidates(this.#modelRegistry.getAvailable());
+		const hookServesMaintenance =
+			!handoffSelected && this.#extensionRunner?.hasHandlers("session_before_compact") === true;
+		if (
+			reachableModels.length > 0 &&
+			!reachableModels.some(modelSupportsMaintenanceCalls) &&
+			!hookServesMaintenance
+		) {
+			logger.debug(
+				"Auto-compaction skipped: every reachable model is an agent-level provider that refuses maintenance calls",
+				{
+					reason,
+					provider: this.model?.provider,
+				},
+			);
+			return { kind: "skipped" };
+		}
 		const generation = this.#promptGeneration;
 		if (
 			options?.deferHandoffMaintenance !== false &&
@@ -20263,7 +20293,24 @@ export class AgentSession {
 				details = compactionPrep.details;
 				preserveData = compactionPrep.preserveData;
 			} else {
-				const candidates = this.#getCompactionModelCandidates(availableModels);
+				// Agent-level providers refuse maintenance calls by contract, so they
+				// can only add a guaranteed refusal to the failure list — never spend a
+				// call on one while a text-model candidate exists. The pre-flight
+				// reachability check normally catches the all-agent-level case; this
+				// covers a mid-flight model swap landing here.
+				const candidates =
+					this.#getCompactionModelCandidates(availableModels).filter(modelSupportsMaintenanceCalls);
+				if (candidates.length === 0) {
+					await this.#emitSessionEvent({
+						type: "auto_compaction_end",
+						action,
+						result: undefined,
+						aborted: false,
+						willRetry: false,
+						skipped: true,
+					});
+					return { kind: "skipped" };
+				}
 				maintenanceAttemptSignature = this.#buildAutoMaintenanceAttemptSignature(
 					action,
 					preparation,
