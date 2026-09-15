@@ -1010,8 +1010,17 @@ function assertOwnerOnlyApplied(pathname: string, kind: "directory" | "file"): v
  * (freshest writes land near the top on most filesystems), so the common drift
  * source is caught in-budget. Anything past the budget is NOT assumed
  * owner-only — a bounded, streaming background self-heal
- * (`runDeferredOwnerOnlySelfHeal`) finishes the tail off the critical path so the
- * owner-only contract still holds for a drifted file at, say, entry 9,001.
+ * (`runDeferredOwnerOnlySelfHeal`) finishes the tail off the critical path.
+ *
+ * The owner-only *guarantee* for managed content is not this walk: it is enforced
+ * per-write by the secured storage helpers (see `openManagedStore`). This walk is
+ * best-effort repair of drift introduced by non-managed writers. Because the tail
+ * repair is asynchronous, a truncated scan does not itself prove the tail is
+ * owner-only; the contract it upholds is that the tail is eventually repaired and
+ * that a *provable* failure of that repair — an unrepairable path
+ * (`pendingDeferredOwnerOnlyRepairFailures`) or an aborted traversal
+ * (`deferredOwnerOnlySelfHealTraversalFailures`) — fails the next prepare closed
+ * rather than reporting success over an uninspected or still-drifted tail.
  */
 export const OWNER_ONLY_SELF_HEAL_MAX_ENTRIES = 8192;
 export const OWNER_ONLY_SELF_HEAL_MAX_DURATION_MS = 500;
@@ -1053,13 +1062,63 @@ function classifyOwnerOnlyEntry(pathname: string, drifted: string[]): OwnerOnlyC
  * directory the walk classified. A managed scope is same-user writable, so a
  * concurrent process can replace a queued directory with a symlink (or a
  * different directory) between the classifying `lstat` and this open — and both
- * walks pop/yield across that window. Re-`lstat` and require the same
- * non-symlink directory identity (dev+ino) before `opendirSync`, so neither the
- * walk nor the owner-only repair it drives can follow a replacement and
- * enumerate or modify descendants outside the retained managed scope. Returns
- * `null` on any mismatch or error; the caller skips that subtree.
+ * walks pop/yield across that window.
+ *
+ * A bare `lstat(path)` check followed by `opendirSync(path)` is a check-then-use
+ * race: `opendirSync` *follows* a symlink final component, so a pathname swapped
+ * to a symlink after the check enumerates outside the retained scope. Instead,
+ * bind the identity to the descriptor we actually open: `O_NOFOLLOW` refuses a
+ * symlinked final component outright, `O_DIRECTORY` refuses a non-directory, and
+ * the `fstat` on that descriptor (not on a pathname that may already have been
+ * swapped) proves it is the exact directory the walk classified before any entry
+ * is read. Returns `null` on any mismatch or error; the caller skips that
+ * subtree. Windows lacks `O_NOFOLLOW`/`O_DIRECTORY` and reaches this walk only
+ * under the fail-closed verify-first policy, so it keeps the pathname check.
  */
 function opendirIfUnchanged(ref: OwnerOnlyDirRef): fs.Dir | null {
+	if (process.platform === "win32") return opendirIfUnchangedByPath(ref);
+	// Prove the opened descriptor's identity no-follow, so a symlink or
+	// different-directory swap of the pathname cannot be opened or enumerated.
+	let fd: number;
+	try {
+		fd = fs.openSync(ref.pathname, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+	} catch {
+		return null;
+	}
+	try {
+		const stat = fs.fstatSync(fd, { bigint: true });
+		if (stat.isSymbolicLink() || !stat.isDirectory() || stat.dev !== ref.dev || stat.ino !== ref.ino) return null;
+	} catch {
+		return null;
+	} finally {
+		fs.closeSync(fd);
+	}
+	// The descriptor proved identity a moment ago; open the enumeration stream and
+	// re-verify no-follow that the pathname still resolves to that same inode, so a
+	// swap in the narrow reopen gap is caught before any entry is enumerated. Entry
+	// names are always rejoined to `ref.pathname` (never a stream-resolved path) by
+	// the caller, so even a transient swap cannot escape the classified directory.
+	let dir: fs.Dir;
+	try {
+		dir = fs.opendirSync(ref.pathname);
+	} catch {
+		return null;
+	}
+	try {
+		const recheck = fs.lstatSync(ref.pathname, { bigint: true });
+		if (recheck.isSymbolicLink() || !recheck.isDirectory() || recheck.dev !== ref.dev || recheck.ino !== ref.ino) {
+			dir.closeSync();
+			return null;
+		}
+	} catch {
+		dir.closeSync();
+		return null;
+	}
+	return dir;
+}
+
+/** Windows check-then-open fallback (no `O_NOFOLLOW`/`O_DIRECTORY`); reached only under fail-closed verify-first. */
+function opendirIfUnchangedByPath(ref: OwnerOnlyDirRef): fs.Dir | null {
 	let stat: fs.BigIntStats;
 	try {
 		stat = fs.lstatSync(ref.pathname, { bigint: true });
@@ -1324,6 +1383,13 @@ export function selfHealOwnerOnlyModeDrift(directory: string, policy: ManagedSes
 		}
 		pendingDeferredOwnerOnlyRepairFailures.delete(key);
 	}
+	// A prior deferred walk that aborted mid-traversal left the tail past the
+	// synchronous budget uninspected — unverified state, not a proven owner-only
+	// tree. Consult it alongside the repair-failure record above: if this prepare's
+	// own synchronous scan also cannot reach the end of the tree (below), reporting
+	// success would accept that uninspected tail. The marker is cleared only by a
+	// walk — synchronous or deferred — that actually traverses to the end.
+	const priorTraversalFailure = deferredOwnerOnlySelfHealTraversalFailures.has(key);
 	const budget: OwnerOnlySelfHealBudget = {
 		deadline: Date.now() + OWNER_ONLY_SELF_HEAL_MAX_DURATION_MS,
 		remaining: OWNER_ONLY_SELF_HEAL_MAX_ENTRIES,
@@ -1346,6 +1412,12 @@ export function selfHealOwnerOnlyModeDrift(directory: string, policy: ManagedSes
 			maxDurationMs: OWNER_ONLY_SELF_HEAL_MAX_DURATION_MS,
 			maxEntries: OWNER_ONLY_SELF_HEAL_MAX_ENTRIES,
 		});
+		// The tail is still unverified: a prior deferred walk aborted before reaching
+		// it and this synchronous scan truncated short of it too. Fail closed rather
+		// than report success over an uninspected tail; the deferred walk scheduled
+		// just above will clear the traversal-failure marker once it completes, so a
+		// later prepare recovers on its own.
+		if (priorTraversalFailure) throw new Error("mode_mismatch");
 		return;
 	}
 	// This scan reached the end of the tree, so the tail an earlier aborted deferred
@@ -1430,9 +1502,19 @@ export function prepareManagedSessionScopeForWriteSync(
 			// Detect and repair group/other-readable descendants with a bounded,
 			// streaming mode-only walk — do NOT call snapshotManagedTree("") here:
 			// that reintroduces concurrent-writer identity_mismatch races (#3906)
-			// that break SessionManager.moveTo / move. Repair is targeted and any
-			// tail the budget skipped is finished by a background self-heal, so a
-			// drifted descendant beyond the scan prefix is never accepted as owner-only.
+			// that break SessionManager.moveTo / move.
+			//
+			// This walk is bounded best-effort defense-in-depth, NOT the owner-only
+			// guarantee itself: every managed write below goes through the secured
+			// storage helpers (`ensureManagedDirectory`, `store.publish*`), which
+			// apply and verify owner-only mode on each object they create, so managed
+			// writes are owner-only at the write boundary regardless of the walk. The
+			// walk only heals drift left by non-managed writers (e.g. the resident
+			// cache) into the scope. A completed synchronous scan holds this prepare
+			// until the whole tree is inspected; a truncated scan hands the tail to a
+			// bounded background self-heal, and a *provable* failure of that deferred
+			// enforcement (an unrepairable path or an aborted traversal) fails the
+			// next prepare closed rather than silently accepting a drifted tail.
 			if (retainedAuthority) selfHealOwnerOnlyModeDrift(scope.directoryPath, policy);
 			return next;
 		};

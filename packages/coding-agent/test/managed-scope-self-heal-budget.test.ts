@@ -394,12 +394,61 @@ describe.skipIf(process.platform === "win32")("managed scope owner-only self-hea
 		expect(isOwnerOnly(driftedFile)).toBe(false);
 		expect(pendingDeferredOwnerOnlyTraversalFailureCount()).toBeGreaterThan(0);
 
-		// Retries are not suppressed: the next prepare schedules another walk, which
-		// now traverses cleanly, repairs the tail, and clears the traversal failure.
-		selfHealOwnerOnlyModeDrift(root, "default");
+		// The next prepare must not report success over that uninspected tail. Its own
+		// synchronous scan truncates on the pads too, so — with a prior aborted
+		// traversal recorded — it fails closed instead of accepting the tail, while
+		// still scheduling a fresh walk that can clear the failure.
+		expect(() => selfHealOwnerOnlyModeDrift(root, "default")).toThrow("mode_mismatch");
 		expect(pendingDeferredOwnerOnlySelfHealCount()).toBeGreaterThan(0);
+
+		// That scheduled walk now traverses cleanly, repairs the tail, and clears the
+		// traversal failure, so a later prepare no longer fails closed.
 		await drainDeferredOwnerOnlySelfHeals();
 		expect(isOwnerOnly(driftedFile)).toBe(true);
 		expect(pendingDeferredOwnerOnlyTraversalFailureCount()).toBe(0);
+		expect(() => selfHealOwnerOnlyModeDrift(root, "default")).not.toThrow();
+	});
+
+	// Third review — Finding 3: `opendirIfUnchanged` classifies a directory by
+	// `lstat`, queues it, and opens it later. A same-user process can replace the
+	// queued pathname with a symlink in that window; a check-then-`opendirSync`
+	// would follow it and enumerate/repair outside the retained scope. The
+	// descriptor-bound no-follow open must refuse the replacement.
+	it("refuses to enumerate a queued scope directory swapped to a symlink before it is opened", () => {
+		const root = tempTree();
+		const sub = path.join(root, "sub");
+		fs.mkdirSync(sub, { mode: 0o700 });
+		fs.writeFileSync(path.join(sub, "inner.bin"), "clean", { mode: 0o600 });
+
+		// A drifted file entirely outside `root`, reachable only by following a
+		// symlink planted at `sub` — the walk over `root` never reaches it otherwise.
+		const outside = tempTree();
+		const leaked = path.join(outside, "leaked.bin");
+		fs.writeFileSync(leaked, "secret", { mode: 0o600 });
+		fs.chmodSync(leaked, 0o644);
+		expect(isOwnerOnly(leaked)).toBe(false);
+
+		// Swap `sub` (already classified as a real directory) for a symlink to
+		// `outside` at the instant the walk opens it, mimicking a concurrent
+		// replacement between the classifying stat and the open.
+		const resolvedSub = path.resolve(sub);
+		let swapped = false;
+		const realOpen = fs.openSync.bind(fs) as (...args: Parameters<typeof fs.openSync>) => number;
+		vi.spyOn(fs, "openSync").mockImplementation(((...args: Parameters<typeof fs.openSync>) => {
+			if (!swapped && path.resolve(String(args[0])) === resolvedSub) {
+				swapped = true;
+				fs.renameSync(sub, `${sub}.moved`);
+				fs.symlinkSync(outside, sub);
+			}
+			return realOpen(...args);
+		}) as typeof fs.openSync);
+
+		selfHealOwnerOnlyModeDrift(root, "default");
+
+		// The no-follow open refused the symlink, so the walk never enumerated
+		// `outside` through `sub`: its drifted file was neither read nor repaired, and
+		// nothing was deferred.
+		expect(isOwnerOnly(leaked)).toBe(false);
+		expect(pendingDeferredOwnerOnlySelfHealCount()).toBe(0);
 	});
 });
