@@ -1214,6 +1214,18 @@ const pendingDeferredOwnerOnlySelfHeals = new Map<string, Promise<void>>();
 const pendingDeferredOwnerOnlyRepairFailures = new Map<string, string[]>();
 
 /**
+ * Scopes whose most recent deferred self-heal aborted on a *traversal*-level
+ * filesystem failure — a `Dir.readSync`/iterator or close error, as opposed to
+ * one path's repair, which `resecureOwnerOnlyPathQuietly` records separately. The
+ * walk then stopped mid-tree, so the tail past the synchronous budget was never
+ * inspected and the traversal must not be recorded as having completed. The scope
+ * stays marked here until a later walk reaches the end of the tree (or a
+ * synchronous scan covers it in full), which also keeps a partial walk from
+ * clearing repair failures it never got far enough to re-examine.
+ */
+const deferredOwnerOnlySelfHealTraversalFailures = new Set<string>();
+
+/**
  * Schedule (at most one per scope) a background self-heal of the tail the budget
  * skipped.
  *
@@ -1231,7 +1243,13 @@ function scheduleDeferredOwnerOnlySelfHeal(directory: string): void {
 	const key = path.resolve(directory);
 	if (pendingDeferredOwnerOnlySelfHeals.has(key)) return;
 	const failures: string[] = [];
+	let traversed = true;
 	const task = runDeferredOwnerOnlySelfHeal(directory, failures).catch(error => {
+		// The walk stopped mid-tree, so the tail it exists to enforce was never
+		// inspected. Recording this as a completed traversal would both discard that
+		// fact and let the empty `failures` list clear repair failures the aborted
+		// walk never reached.
+		traversed = false;
 		logger.debug("Deferred managed-scope owner-only self-heal failed", {
 			directory,
 			error: error instanceof Error ? error.message : String(error),
@@ -1240,9 +1258,11 @@ function scheduleDeferredOwnerOnlySelfHeal(directory: string): void {
 	pendingDeferredOwnerOnlySelfHeals.set(key, task);
 	void task.finally(() => {
 		// Preserve an unrepairable tail so the next prepare fails closed; clear any
-		// prior failure once a later walk has fully re-secured the scope.
+		// prior failure only once a walk has actually traversed the whole scope.
 		if (failures.length > 0) pendingDeferredOwnerOnlyRepairFailures.set(key, failures);
-		else pendingDeferredOwnerOnlyRepairFailures.delete(key);
+		else if (traversed) pendingDeferredOwnerOnlyRepairFailures.delete(key);
+		if (traversed) deferredOwnerOnlySelfHealTraversalFailures.delete(key);
+		else deferredOwnerOnlySelfHealTraversalFailures.add(key);
 		if (pendingDeferredOwnerOnlySelfHeals.get(key) === task) pendingDeferredOwnerOnlySelfHeals.delete(key);
 	});
 }
@@ -1255,6 +1275,11 @@ export function pendingDeferredOwnerOnlySelfHealCount(): number {
 /** Number of scopes with a recorded deferred owner-only repair failure (test/shutdown observability). */
 export function pendingDeferredOwnerOnlyRepairFailureCount(): number {
 	return pendingDeferredOwnerOnlyRepairFailures.size;
+}
+
+/** Number of scopes whose deferred walk aborted before traversing the tree (test/shutdown observability). */
+export function pendingDeferredOwnerOnlyTraversalFailureCount(): number {
+	return deferredOwnerOnlySelfHealTraversalFailures.size;
 }
 
 /** Await every in-flight deferred owner-only self-heal (deterministic teardown/shutdown). */
@@ -1321,7 +1346,11 @@ export function selfHealOwnerOnlyModeDrift(directory: string, policy: ManagedSes
 			maxDurationMs: OWNER_ONLY_SELF_HEAL_MAX_DURATION_MS,
 			maxEntries: OWNER_ONLY_SELF_HEAL_MAX_ENTRIES,
 		});
+		return;
 	}
+	// This scan reached the end of the tree, so the tail an earlier aborted deferred
+	// walk left uninspected has now been inspected and repaired synchronously.
+	deferredOwnerOnlySelfHealTraversalFailures.delete(key);
 }
 
 /**

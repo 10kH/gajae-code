@@ -8,6 +8,7 @@ import {
 	OWNER_ONLY_SELF_HEAL_MAX_ENTRIES,
 	pendingDeferredOwnerOnlyRepairFailureCount,
 	pendingDeferredOwnerOnlySelfHealCount,
+	pendingDeferredOwnerOnlyTraversalFailureCount,
 	prepareManagedSessionScopeForWriteSync,
 	resolveManagedScope,
 	selfHealOwnerOnlyModeDrift,
@@ -355,5 +356,50 @@ describe.skipIf(process.platform === "win32")("managed scope owner-only self-hea
 		expect(pendingDeferredOwnerOnlySelfHealCount()).toBeGreaterThan(0);
 		await drainDeferredOwnerOnlySelfHeals();
 		expect(isOwnerOnly(driftedFile)).toBe(true);
+	});
+
+	// Third review — Finding 2: a walk-level filesystem failure (a failing
+	// `Dir.readSync`, not one path's repair) leaves the tail uninspected. It must
+	// not be recorded as a completed traversal: that would suppress the retry and
+	// let the next prepare report success over a tree the walk never reached.
+	it("does not mark the deferred walk complete when the traversal itself fails", async () => {
+		const root = tempTree();
+
+		// >budget direct children guarantee the synchronous scan truncates before it
+		// descends into `tail/`, so the drift is only reachable by the deferred walk.
+		for (let i = 0; i < OWNER_ONLY_SELF_HEAL_MAX_ENTRIES + 2000; i += 1) {
+			fs.writeFileSync(path.join(root, `pad-${i}.bin`), "", { mode: 0o600 });
+		}
+		const tail = path.join(root, "tail");
+		fs.mkdirSync(tail, { mode: 0o700 });
+		const driftedFile = path.join(tail, "leaked.bin");
+		fs.writeFileSync(driftedFile, "secret", { mode: 0o600 });
+		fs.chmodSync(driftedFile, 0o644);
+
+		// The synchronous scan truncates and schedules the deferred tail walk; only
+		// then is the enumeration failure installed, so it hits that walk alone.
+		selfHealOwnerOnlyModeDrift(root, "default");
+		expect(pendingDeferredOwnerOnlySelfHealCount()).toBeGreaterThan(0);
+		const opendir = vi.spyOn(fs, "opendirSync").mockImplementation((() => ({
+			readSync: () => {
+				throw Object.assign(new Error("EIO: i/o error, read"), { code: "EIO" });
+			},
+			closeSync: () => {},
+		})) as unknown as typeof fs.opendirSync);
+		await drainDeferredOwnerOnlySelfHeals();
+		opendir.mockRestore();
+
+		// The walk aborted before traversing the tail: the drift is untouched and the
+		// scope is recorded as un-traversed rather than as a completed walk.
+		expect(isOwnerOnly(driftedFile)).toBe(false);
+		expect(pendingDeferredOwnerOnlyTraversalFailureCount()).toBeGreaterThan(0);
+
+		// Retries are not suppressed: the next prepare schedules another walk, which
+		// now traverses cleanly, repairs the tail, and clears the traversal failure.
+		selfHealOwnerOnlyModeDrift(root, "default");
+		expect(pendingDeferredOwnerOnlySelfHealCount()).toBeGreaterThan(0);
+		await drainDeferredOwnerOnlySelfHeals();
+		expect(isOwnerOnly(driftedFile)).toBe(true);
+		expect(pendingDeferredOwnerOnlyTraversalFailureCount()).toBe(0);
 	});
 });
