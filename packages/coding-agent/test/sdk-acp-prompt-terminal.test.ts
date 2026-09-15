@@ -96,6 +96,7 @@ async function createFixture(
 		reusePromptCorrelationOnSecond?: boolean;
 		failBrokerSessionClose?: boolean;
 		observeTerminalReservation?: boolean;
+		priorTranscriptUserTurn?: boolean;
 	} = {},
 ): Promise<Fixture> {
 	const tempDir = TempDir.createSync("@sdk-acp-prompt-terminal-");
@@ -277,7 +278,21 @@ async function createFixture(
 							? { promptTerminalOutcomeVersion: 1, primaryControlSurface: "sdk" }
 							: frame.query === "context.get"
 								? { usage: { tokens: 0, contextWindow: 200_000, percent: 0, source: "test" } }
-								: { page: { items, complete: true } };
+								: frame.query === "transcript.list" && options.priorTranscriptUserTurn
+									? {
+											page: {
+												items: [
+													{
+														id: "transcript-user-1",
+														role: "user",
+														body: "prior user turn",
+														content: [{ type: "text", text: "prior user turn" }],
+													},
+												],
+												complete: true,
+											},
+										}
+									: { page: { items, complete: true } };
 					if (
 						blockAdvisoryQuery &&
 						frame.query === options.blockedAdvisoryQuery &&
@@ -649,6 +664,123 @@ test("ACP does not retry a prompt_failed on a later turn even after activity", a
 		});
 		expect(fixture.promptDeliveryCount()).toBe(2);
 	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP does not retry a first-turn prompt_failed once the turn executed a tool (review P1)", async () => {
+	const fixture = await createFixture();
+	try {
+		const pending = prompt(fixture, "first turn runs a tool then fails");
+		await bounded(fixture.promptDelivered, "first prompt delivery");
+		// The turn started AND executed a tool before failing. Re-submitting is a new, independent
+		// turn.prompt, so re-running it would run the user's instruction — and that tool's side
+		// effects — a second time. It is surfaced with its code, not retried.
+		fixture.sendTerminal({
+			type: "agent_start",
+			sessionId: "prompt-terminal-session",
+			commandId: "prompt-terminal-command",
+			turnId: "prompt-terminal-turn",
+		});
+		fixture.sendTerminal({
+			type: "event",
+			sessionId: "prompt-terminal-session",
+			commandId: "prompt-terminal-command",
+			turnId: "prompt-terminal-turn",
+			payload: {
+				event: {
+					type: "tool_execution_start",
+					toolCallId: "prompt-terminal-tool",
+					toolName: "todo_write",
+					args: {},
+				},
+			},
+		});
+		fixture.sendFailed("prompt_failed");
+		await expect(bounded(pending, "tool-progressed failure settlement")).rejects.toMatchObject({
+			code: "prompt_failed",
+		});
+		expect(fixture.promptDeliveryCount()).toBe(1);
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP does not retry a first-turn readiness race after reattaching a session with a prior prompt (issue #5574)", async () => {
+	const fixture = await createFixture({ failBrokerSessionClose: true });
+	try {
+		// A first prompt completes normally, so the session already has a settled prompt and is no
+		// longer on its first logical turn.
+		const first = prompt(fixture, "first turn ok before reattach");
+		await bounded(fixture.promptDelivered, "first prompt delivery");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(first, "first turn settlement")).toEqual({ stopReason: "end_turn" });
+
+		// Tear the live record down and reattach to the same session id, rebuilding a fresh
+		// SessionRecord. `firstPromptDone` must be derived from the session's retained settled
+		// prompt correlations rather than reset, or the reattached record would treat the next
+		// prompt as a first prompt and take the retry path.
+		await expect(fixture.agent.closeSession({ sessionId: fixture.sessionId })).rejects.toMatchObject({
+			code: "terminal_uncertain",
+		});
+		await bounded(
+			fixture.agent.loadSession({ sessionId: fixture.sessionId, cwd: fixture.cwd, mcpServers: [] }),
+			"same-id reattachment",
+		);
+
+		// A turn that starts (agent_start) then fails prompt_failed is the readiness-race signature
+		// that WOULD be retried on a true first turn. Because the reattached session is not on its
+		// first prompt, it is surfaced, not retried.
+		const second = prompt(fixture, "readiness race after reattach");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "second prompt delivery");
+		fixture.sendTerminal({
+			type: "agent_start",
+			sessionId: "prompt-terminal-session",
+			commandId: "prompt-terminal-command-2",
+			turnId: "prompt-terminal-turn-2",
+		});
+		fixture.sendFailed("prompt_failed");
+		await expect(bounded(second, "reattached failure settlement")).rejects.toMatchObject({
+			code: "prompt_failed",
+		});
+		expect(fixture.promptDeliveryCount()).toBe(2);
+	} finally {
+		fixture.releaseBlockedAdvisoryQueries();
+		fixture.dispose();
+	}
+});
+
+test("ACP does not retry a first-turn readiness race on a loaded session with prior transcript history (issue #5574)", async () => {
+	const fixture = await createFixture({ failBrokerSessionClose: true, priorTranscriptUserTurn: true });
+	try {
+		// No prompt runs in-process, so there is no retained settled correlation: the only proof of
+		// prior activity is the transcript replayed on load. Tear the live record down, then load
+		// the same session so it is rebuilt and its transcript (a prior user turn) is replayed.
+		await expect(fixture.agent.closeSession({ sessionId: fixture.sessionId })).rejects.toMatchObject({
+			code: "terminal_uncertain",
+		});
+		await bounded(
+			fixture.agent.loadSession({ sessionId: fixture.sessionId, cwd: fixture.cwd, mcpServers: [] }),
+			"transcript-history reattachment",
+		);
+
+		// A replayed user turn proves the loaded session already had a prompt, so a turn that starts
+		// then fails prompt_failed is surfaced, not retried, even though no prompt ran in this process.
+		const pending = prompt(fixture, "readiness race after load");
+		await waitFor(() => fixture.promptDeliveryCount() === 1, "loaded prompt delivery");
+		fixture.sendTerminal({
+			type: "agent_start",
+			sessionId: "prompt-terminal-session",
+			commandId: "prompt-terminal-command",
+			turnId: "prompt-terminal-turn",
+		});
+		fixture.sendFailed("prompt_failed");
+		await expect(bounded(pending, "loaded failure settlement")).rejects.toMatchObject({
+			code: "prompt_failed",
+		});
+		expect(fixture.promptDeliveryCount()).toBe(1);
+	} finally {
+		fixture.releaseBlockedAdvisoryQueries();
 		fixture.dispose();
 	}
 });
