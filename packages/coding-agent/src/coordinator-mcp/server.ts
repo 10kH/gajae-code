@@ -140,6 +140,7 @@ import {
 	reconcileCreationRemoteVerifier,
 	recordCreationRetirementBrokerProof,
 	recordCreationRetirementIntent,
+	recordDeletionIntent,
 	recoverExpiredPublicDelivery,
 	releasePublicDeliveryClaim,
 	removeSessionTransaction,
@@ -6344,6 +6345,57 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		return canonicalActiveTurn || (await readActiveTurn(namespaceDir, id)) !== null;
 	}
 
+	/**
+	 * Recovery-safe force eviction for a session whose endpoint is stale. A stale
+	 * endpoint has no live broker to close against, but the session's durable
+	 * footprint must not be orphaned: removing only the projection rows would leak
+	 * the canonical WAL, retained public-delivery claims, and the scheduler/index
+	 * registry hints. We instead write a durable deletion (retirement) record and
+	 * run the same cleanup the normal reap path uses — drain retained deliveries,
+	 * remove the WAL (which also deregisters roster/retained scheduler hints),
+	 * remove projections, and emit the reaped event. If any step cannot finish yet
+	 * the record stays in `cleanup_pending`, so a subsequent reapSession() for this
+	 * id (selected by session_id, not deletion_id) resumes and completes it.
+	 */
+	async function forceEvictStaleSession(sessionId: string, session: Record<string, unknown> | null): Promise<void> {
+		const persistedIncarnation = session ? optionalString(session.endpoint_incarnation) : null;
+		if (!persistedIncarnation) {
+			// No incarnation authority (malformed/absent projection): there is no WAL
+			// identity to clean, so best-effort projection removal is all that remains.
+			await removeReapedProjection(sessionId, [], []);
+			return;
+		}
+		await ensureQuestionStateReady();
+		const canonicalTransaction = await readSessionTransaction(questionPaths, sessionId);
+		const deletionId = `force-evict:${sessionId}:${persistedIncarnation}`;
+		const deletionKey = createHash("sha256").update(deletionId).digest("hex");
+		const now = new Date().toISOString();
+		const entry: NamespaceDeletionEntryV1 = {
+			deletion_id: deletionId,
+			session_id: sessionId,
+			endpoint_incarnation: persistedIncarnation,
+			operation_id: deletionId,
+			key_digest: deletionKey,
+			request_digest: deletionKey,
+			close_key: deletionId,
+			phase: "cleanup_pending",
+			cleanup: {
+				wal: false,
+				turns: false,
+				reports: false,
+				session: false,
+				events: false,
+				turn_ids: canonicalTransaction ? Object.keys(canonicalTransaction.canonical.turns) : [],
+				report_ids: canonicalTransaction ? Object.keys(canonicalTransaction.canonical.reports) : [],
+			},
+			authority_digest: deletionKey,
+			created_at: now,
+			updated_at: now,
+		};
+		await recordDeletionIntent(questionPaths, entry);
+		await completeDeletionCleanup(entry, "idle_reaper_force_evict", true);
+	}
+
 	const sessionReaper: SessionReaper = createSessionReaper(
 		{
 			listSessions: async (): Promise<ReapableSession[]> => {
@@ -6404,7 +6456,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					if (await sessionHasActiveTurn(sessionId)) return;
 					const session = asRecord(await readJsonFile(sessionFile(sessionId)));
 					if (session && !(await isSessionEndpointStale(session, sessionId))) return;
-					await removeReapedProjection(sessionId, [], []);
+					await forceEvictStaleSession(sessionId, session);
 				});
 			},
 			now: () => Date.now(),

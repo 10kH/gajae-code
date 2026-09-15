@@ -462,7 +462,13 @@ describe("gjc_coordinator_stop_session SDK lifecycle", () => {
 							delivery: { delivered: false, queued: false, target: null, attempts: [] },
 							runtime_provenance: null,
 							question_ids: [],
-							final_response: { text: null, format: "markdown", source: null, artifact_path: null, truncated: false },
+							final_response: {
+								text: null,
+								format: "markdown",
+								source: null,
+								artifact_path: null,
+								truncated: false,
+							},
 							evidence: [],
 							error: null,
 							liveness: {},
@@ -504,6 +510,49 @@ describe("gjc_coordinator_stop_session SDK lifecycle", () => {
 		// Neither the projection row nor the canonical WAL was removed.
 		expect(await Bun.file(fixture.sessionFile).exists()).toBe(true);
 		expect(await readSessionTransaction(fixture.paths, sessionId)).not.toBeNull();
+	});
+
+	it("F3: force eviction performs recovery-safe cleanup instead of orphaning the WAL and delivery state", async () => {
+		const root = await tempRoot();
+		const sessionId = "stale-evicted";
+		// Endpoint is permanently stale (no broker row) so every reap fails
+		// endpoint_stale and the session is force-evicted after MAX_REAP_FAILURES.
+		const { server, registryFile } = await createServer(root, {
+			brokerSessionsOverride: async () => [],
+		});
+		const fixture = await writeDurableCoordinatorSession({
+			sessionId,
+			cwd: root,
+			env: {
+				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+				GJC_COORDINATOR_MCP_STATE_ROOT: path.join(root, ".gjc", "coordinator-state"),
+				GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
+				GJC_COORDINATOR_MCP_PROFILE: "local",
+				GJC_COORDINATOR_MCP_REPO: "repo",
+			},
+			overrides: { ephemeral: true },
+		});
+
+		// The canonical WAL exists before eviction.
+		expect(await readSessionTransaction(fixture.paths, sessionId)).not.toBeNull();
+
+		for (let i = 0; i < MAX_REAP_FAILURES; i++) await server.sessionReaper.sweepOnce();
+
+		// Projection removed AND the canonical WAL drained/removed — not orphaned.
+		expect(await Bun.file(fixture.sessionFile).exists()).toBe(false);
+		expect(await readSessionTransaction(fixture.paths, sessionId)).toBeNull();
+
+		// A durable retirement record was written and completed, guaranteeing full
+		// cleanup (WAL, deliveries, projections, events) is recorded.
+		const registry = JSON.parse(await fs.readFile(registryFile, "utf8")) as {
+			deletions: Record<string, { session_id: string; phase: string; cleanup: Record<string, unknown> }>;
+		};
+		const retirement = Object.values(registry.deletions).find(entry => entry.session_id === sessionId);
+		expect(retirement?.phase).toBe("completed");
+		expect(retirement?.cleanup).toMatchObject({ wal: true, session: true, events: true });
+
+		// The evicted session no longer appears to the reaper.
+		expect(await server.sessionReaper.sweepOnce()).toBe(0);
 	});
 
 	it("reuses the close idempotency key when the idle reaper retries", async () => {
