@@ -3554,16 +3554,26 @@ async function releaseForcedStaleWorktree(broker: Broker, id: string, expected: 
 			(expected.hostIncarnation ?? expected.processIncarnation)
 	)
 		return;
-	// The forced-release contract: release the worktree only when the process is not
-	// observably alive. An alive process still owns its checkout, so it stays
-	// occupied even under force; `uncertain` (the pid-reuse case this fix targets)
-	// and `exited` are released.
-	if (
-		observeProcess(current.pid, current.hostIncarnation ?? current.processIncarnation, value =>
-			processIncarnationForBroker(broker, value),
-		) === "alive"
-	)
+	// The forced-release contract fails closed: release the worktree only on
+	// definitive `exited` evidence. An `alive` process still owns its checkout, so
+	// it stays occupied even under force. `uncertain` (the pid-reuse case) cannot
+	// prove the owner is gone — recording a terminal-uncertain claim then would let
+	// `worktree-occupancy` (which skips terminalUncertain rows) admit a concurrent
+	// checkout while the process may still be running and corrupt in-flight work.
+	// Leave the row occupied and let the stale-endpoint retry/recovery paths reclaim
+	// it once exit becomes provable.
+	const observation = observeProcess(current.pid, current.hostIncarnation ?? current.processIncarnation, value =>
+		processIncarnationForBroker(broker, value),
+	);
+	if (observation !== "exited") {
+		if (observation === "uncertain")
+			logger.warn("sdk broker withheld forced stale-worktree release: owner process state is uncertain", {
+				sessionId: id,
+				pid: current.pid,
+				endpointGeneration: current.endpointGeneration,
+			});
 		return;
+	}
 	await broker.index.append({
 		type: "lifecycle_terminal",
 		sessionId: id,

@@ -59,11 +59,12 @@ afterEach(async () => {
 });
 
 describe("forced stale-endpoint worktree release", () => {
-	it("releases the worktree when the captured stale identity is still current and unprovable", async () => {
-		// #5581: pid reuse makes the stale process read `uncertain` forever, so the
-		// forced claim must release the worktree even without a definitive exit.
+	it("releases the worktree only when the captured stale identity is definitively exited", async () => {
+		// The forced release fails closed on everything but a proven exit. A readable,
+		// changed incarnation for the still-live pid resolves `exited`, so the terminal
+		// claim is recorded and the worktree is freed.
 		const { index, stateRoot } = await scenario();
-		const broker = fakeBroker(index, () => undefined);
+		const broker = fakeBroker(index, () => "rotated-incarnation");
 		brokers.push(broker);
 		await index.append(
 			registration("stale", stateRoot, {
@@ -80,6 +81,32 @@ describe("forced stale-endpoint worktree release", () => {
 		const released = index.listSessions().sessions.find(session => session.sessionId === "stale");
 		expect(released?.terminalUncertain).toBe(true);
 		expect(worktreeOccupantForTest(index.listSessions().sessions, WORKTREE, uncertain)).toBeNull();
+	});
+
+	it("does NOT release the worktree when the stale process state is uncertain (fail-closed, #5581 review)", async () => {
+		// pid reuse makes the stale process read `uncertain` forever. Releasing then
+		// would let `worktree-occupancy` (which skips terminalUncertain rows) admit a
+		// concurrent checkout while the owner may still be running. Fail closed: leave
+		// the row occupied and record no terminal claim.
+		const { index, stateRoot } = await scenario();
+		const broker = fakeBroker(index, () => undefined);
+		brokers.push(broker);
+		await index.append(
+			registration("uncertain", stateRoot, {
+				endpointGeneration: 7,
+				pid: process.pid,
+				incarnation: "stale-incarnation",
+			}),
+		);
+		const expected = index
+			.listSessions()
+			.sessions.find(session => session.sessionId === "uncertain") as IndexedSession;
+
+		await releaseForcedStaleWorktreeForTest(broker, "uncertain", expected);
+
+		const retained = index.listSessions().sessions.find(session => session.sessionId === "uncertain");
+		expect(retained?.terminalUncertain).toBeFalsy();
+		expect(worktreeOccupantForTest(index.listSessions().sessions, WORKTREE, uncertain)).toBe("uncertain");
 	});
 
 	it("does not claim terminal state when a successor rotated in under the same id", async () => {
