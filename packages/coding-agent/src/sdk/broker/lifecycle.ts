@@ -3554,26 +3554,24 @@ async function releaseForcedStaleWorktree(broker: Broker, id: string, expected: 
 			(expected.hostIncarnation ?? expected.processIncarnation)
 	)
 		return;
-	// The forced-release contract fails closed: release the worktree only on
-	// definitive `exited` evidence. An `alive` process still owns its checkout, so
-	// it stays occupied even under force. `uncertain` (the pid-reuse case) cannot
-	// prove the owner is gone — recording a terminal-uncertain claim then would let
-	// `worktree-occupancy` (which skips terminalUncertain rows) admit a concurrent
-	// checkout while the process may still be running and corrupt in-flight work.
-	// Leave the row occupied and let the stale-endpoint retry/recovery paths reclaim
-	// it once exit becomes provable.
+	// For a force-stopped stale-endpoint session, release the worktree unless the
+	// owning process is provably alive. An `alive` process still owns its checkout,
+	// so it stays occupied even under force. Both `exited` (proven gone) and
+	// `uncertain` (the pid-reuse case, which can never be proven exited) are treated
+	// as terminal here: otherwise the row stays occupied forever and follow-up
+	// delegate launches into the same checkout are refused with worktree_in_use
+	// indefinitely. The identity guards above (generation/PID/incarnation) already
+	// ensure a live successor that rotated in under the same id is never released.
 	const observation = observeProcess(current.pid, current.hostIncarnation ?? current.processIncarnation, value =>
 		processIncarnationForBroker(broker, value),
 	);
-	if (observation !== "exited") {
-		if (observation === "uncertain")
-			logger.warn("sdk broker withheld forced stale-worktree release: owner process state is uncertain", {
-				sessionId: id,
-				pid: current.pid,
-				endpointGeneration: current.endpointGeneration,
-			});
-		return;
-	}
+	if (observation === "alive") return;
+	if (observation === "uncertain")
+		logger.warn("sdk broker recording forced stale-worktree release under uncertain process state", {
+			sessionId: id,
+			pid: current.pid,
+			endpointGeneration: current.endpointGeneration,
+		});
 	await broker.index.append({
 		type: "lifecycle_terminal",
 		sessionId: id,

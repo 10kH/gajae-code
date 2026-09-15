@@ -83,11 +83,12 @@ describe("forced stale-endpoint worktree release", () => {
 		expect(worktreeOccupantForTest(index.listSessions().sessions, WORKTREE, uncertain)).toBeNull();
 	});
 
-	it("does NOT release the worktree when the stale process state is uncertain (fail-closed, #5581 review)", async () => {
-		// pid reuse makes the stale process read `uncertain` forever. Releasing then
-		// would let `worktree-occupancy` (which skips terminalUncertain rows) admit a
-		// concurrent checkout while the owner may still be running. Fail closed: leave
-		// the row occupied and record no terminal claim.
+	it("releases the worktree when the forced stale process state is uncertain (#5581)", async () => {
+		// pid reuse makes the stale process read `uncertain` forever, so it can never be
+		// proven exited. For a force-stopped stale endpoint, withholding the release then
+		// leaves the row occupied indefinitely and refuses every follow-up delegate launch
+		// into the same checkout. Record the terminal-uncertain claim and free the worktree;
+		// the captured-identity guards keep a live successor from being caught by this.
 		const { index, stateRoot } = await scenario();
 		const broker = fakeBroker(index, () => undefined);
 		brokers.push(broker);
@@ -104,9 +105,9 @@ describe("forced stale-endpoint worktree release", () => {
 
 		await releaseForcedStaleWorktreeForTest(broker, "uncertain", expected);
 
-		const retained = index.listSessions().sessions.find(session => session.sessionId === "uncertain");
-		expect(retained?.terminalUncertain).toBeFalsy();
-		expect(worktreeOccupantForTest(index.listSessions().sessions, WORKTREE, uncertain)).toBe("uncertain");
+		const released = index.listSessions().sessions.find(session => session.sessionId === "uncertain");
+		expect(released?.terminalUncertain).toBe(true);
+		expect(worktreeOccupantForTest(index.listSessions().sessions, WORKTREE, uncertain)).toBeNull();
 	});
 
 	it("does not claim terminal state when a successor rotated in under the same id", async () => {
