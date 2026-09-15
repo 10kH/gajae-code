@@ -1099,6 +1099,107 @@ describe("workflow mutation guard", () => {
 	});
 });
 
+describe("bash scanner command substitutions", () => {
+	function decideBash(cwd: string, command: string) {
+		return getWorkflowMutationDecision({ cwd, sessionId: "session-a", tool: tool("bash"), args: { command } });
+	}
+
+	it("scans command substitutions as the live code they are", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "autoresearch", "research");
+
+		// A substitution executes even inside a double-quoted span, so its body is
+		// a nested command list and must be scanned like an `sh -c` payload.
+		for (const command of [
+			'echo "$(rm -rf src/product.ts)"',
+			'echo "`rm -rf src/product.ts`"',
+			"echo $(printf x > src/product.ts)",
+			'echo "$(echo "$(rm -rf src/product.ts)")"',
+		]) {
+			expect((await decideBash(cwd, command)).blocked, command).toBe(true);
+		}
+
+		// Single quotes suppress substitution entirely, so this one is inert text.
+		expect((await decideBash(cwd, `gjc autoresearch verdict --evidence '$(echo inert)' --evaluator r`)).blocked).toBe(
+			false,
+		);
+	});
+
+	it("tracks quotes the way the shell does while locating substitutions", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "autoresearch", "research");
+
+		for (const command of [
+			// An apostrophe inside a double-quoted word is data, not a single-quote
+			// opener; the substitution after it is still live.
+			`echo "it's $(rm -rf src/product.ts)"`,
+			// A `)` inside a quoted argument does not close the body; the trailing
+			// command is still part of the substitution.
+			`echo "$(printf ')'; rm -rf src/product.ts)"`,
+			`echo "$(printf ")"; rm -rf src/product.ts)"`,
+			// Backtick body with an escaped backtick inside.
+			'echo "`printf \\`; rm -rf src/product.ts`"',
+		]) {
+			expect((await decideBash(cwd, command)).blocked, command).toBe(true);
+		}
+	});
+
+	it("fails closed on an unbalanced substitution", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "deep-interview", "interviewing");
+		for (const command of ['echo "$(rm -rf src/product.ts"', 'echo "`rm -rf src/product.ts"']) {
+			const decision = await decideBash(cwd, command);
+			expect(decision.blocked, command).toBe(true);
+			expect(decision.reason).toBe("unknown-target");
+		}
+	});
+
+	it("fails closed when substitution parser frames exceed their nesting bound", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "deep-interview", "interviewing");
+		const nested = `${"$(".repeat(128)}rm -rf src/product.ts${")".repeat(128)}`;
+		const decision = await decideBash(cwd, `printf "%s" "${nested}"`);
+		expect(decision.blocked).toBe(true);
+		expect(decision.reason).toBe("unknown-target");
+	});
+
+	it("ignores substitutions in literal data heredocs and shell comments", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "deep-interview", "interviewing");
+
+		for (const command of [
+			"cat <<'EOF' > /tmp/spec.md\n$(rm -rf src/product.ts)\nEOF",
+			"cat <<'EOF' > /tmp/spec.md\n`rm -rf src/product.ts`\nEOF",
+			"# $(rm -rf src/product.ts) and an 'unterminated quote\ncat <<'EOF' > /tmp/spec.md\nsafe\nEOF",
+			"printf '%s' safe # `rm -rf src/product.ts` and an 'unterminated quote\ncat <<'EOF' > /tmp/spec.md\nsafe\nEOF",
+			"printf '%s' safe # $(rm -rf src/product.ts)\ncat <<'EOF' > /tmp/spec.md\nsafe\nEOF",
+		]) {
+			const decision = await decideBash(cwd, command);
+			expect(decision.blocked, command).toBe(false);
+		}
+	});
+
+	it("keeps live substitutions and executable or expanding heredocs blocked", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "deep-interview", "interviewing");
+
+		for (const command of [
+			'printf "%s" "$(rm -rf src/product.ts)"',
+			'printf "%s" "$(printf "#"; rm -rf src/product.ts)"',
+			'printf "%s" "$(printf ")"; rm -rf src/product.ts)"',
+			'printf "%s" "# $(rm -rf src/product.ts)"',
+			"printf '%s' foo\\# $(rm -rf src/product.ts)",
+			"printf '%s' foo# $(rm -rf src/product.ts)",
+			"bash <<'EOF'\nrm src/product.ts\nEOF",
+			"cat <<'EOF' | bash\nrm src/product.ts\nEOF",
+			"cat <<EOF > /tmp/spec.md\n$(rm src/product.ts)\nEOF",
+		]) {
+			const decision = await decideBash(cwd, command);
+			expect(decision.blocked, command).toBe(true);
+		}
+	});
+});
+
 describe("autoresearch research-only allowance", () => {
 	function decideBash(cwd: string, command: string) {
 		return getWorkflowMutationDecision({ cwd, sessionId: "session-a", tool: tool("bash"), args: { command } });

@@ -905,6 +905,226 @@ function maskHeredocBodiesPass(
 	};
 }
 
+/**
+ * A command-substitution body and whether its delimiters were balanced. An
+ * unbalanced body is an unreliable parse and the caller fails closed on it.
+ */
+interface SubstitutionBody {
+	body: string;
+	balanced: boolean;
+}
+
+/** Keep parser-frame recursion bounded before extractBashTargets' semantic depth guard. */
+const SUBSTITUTION_PARSER_MAX_DEPTH = 64;
+
+/**
+ * Scan a `$(` body starting just after the opening paren. Quotes inside the
+ * body are honoured: a `)` inside `'...'` or `"..."` is data, not the closer.
+ * Nested substitutions are scanned with their own quote/comment frame, so a
+ * `#` or quote inside `$(...)` nested in a double-quoted outer substitution
+ * cannot desynchronise this frame. Returns the body and the index just past
+ * its closing paren, or `end === command.length` with `balanced: false`.
+ */
+function scanDollarParenBody(command: string, start: number, parserDepth = 0): SubstitutionBody & { end: number } {
+	let depth = 1;
+	let inSingle = false;
+	let inDouble = false;
+	let inComment = false;
+	let previous = "";
+	for (let cursor = start; cursor < command.length; cursor += 1) {
+		const character = command[cursor];
+		if (inComment) {
+			if (character === "\n") {
+				inComment = false;
+				previous = character;
+			}
+			continue;
+		}
+		if (character === "\\" && !inSingle) {
+			cursor += 1;
+			previous = "x";
+			continue;
+		}
+		if (character === "'" && !inDouble) {
+			inSingle = !inSingle;
+			previous = character;
+			continue;
+		}
+		if (character === '"' && !inSingle) {
+			inDouble = !inDouble;
+			previous = character;
+			continue;
+		}
+		if (inSingle) continue;
+		if (character === "$" && command[cursor + 1] === "(") {
+			if (parserDepth >= SUBSTITUTION_PARSER_MAX_DEPTH) {
+				return { body: command.slice(start), balanced: false, end: command.length };
+			}
+			const nested = scanDollarParenBody(command, cursor + 2, parserDepth + 1);
+			if (!nested.balanced) {
+				return { body: command.slice(start), balanced: false, end: command.length };
+			}
+			cursor = nested.end - 1;
+			previous = "x";
+			continue;
+		}
+		if (character === "`") {
+			if (parserDepth >= SUBSTITUTION_PARSER_MAX_DEPTH) {
+				return { body: command.slice(start), balanced: false, end: command.length };
+			}
+			const nested = scanBacktickBody(command, cursor + 1, parserDepth + 1);
+			if (!nested.balanced) {
+				return { body: command.slice(start), balanced: false, end: command.length };
+			}
+			cursor = nested.end - 1;
+			previous = "x";
+			continue;
+		}
+		if (!inDouble && character === "#" && (previous === "" || /\s/.test(previous) || ";|&()".includes(previous))) {
+			inComment = true;
+			continue;
+		}
+		if (!inDouble && character === "(") depth += 1;
+		else if (!inDouble && character === ")") {
+			depth -= 1;
+			if (depth === 0) {
+				return { body: command.slice(start, cursor), balanced: true, end: cursor + 1 };
+			}
+			previous = ")";
+			continue;
+		}
+		previous = character;
+	}
+	return { body: command.slice(start), balanced: false, end: command.length };
+}
+
+/**
+ * Scan a backtick command substitution with the same quote/comment rules as
+ * `scanDollarParenBody`. Nested `$()` frames are skipped with their own
+ * parser so backticks in those frames cannot close this one.
+ */
+function scanBacktickBody(command: string, start: number, parserDepth = 0): SubstitutionBody & { end: number } {
+	let inSingle = false;
+	let inDouble = false;
+	let inComment = false;
+	let previous = "";
+	for (let cursor = start; cursor < command.length; cursor += 1) {
+		const character = command[cursor];
+		if (inComment) {
+			if (character === "\n") {
+				inComment = false;
+				previous = character;
+			}
+			continue;
+		}
+		if (character === "\\" && !inSingle) {
+			cursor += 1;
+			previous = "x";
+			continue;
+		}
+		if (character === "'" && !inDouble) {
+			inSingle = !inSingle;
+			previous = character;
+			continue;
+		}
+		if (character === '"' && !inSingle) {
+			inDouble = !inDouble;
+			previous = character;
+			continue;
+		}
+		if (inSingle) continue;
+		if (character === "$" && command[cursor + 1] === "(") {
+			if (parserDepth >= SUBSTITUTION_PARSER_MAX_DEPTH) {
+				return { body: command.slice(start), balanced: false, end: command.length };
+			}
+			const nested = scanDollarParenBody(command, cursor + 2, parserDepth + 1);
+			if (!nested.balanced) {
+				return { body: command.slice(start), balanced: false, end: command.length };
+			}
+			cursor = nested.end - 1;
+			previous = "x";
+			continue;
+		}
+		if (character === "`") {
+			return { body: command.slice(start, cursor), balanced: true, end: cursor + 1 };
+		}
+		if (!inDouble && character === "#" && (previous === "" || /\s/.test(previous) || ";|&()".includes(previous))) {
+			inComment = true;
+			continue;
+		}
+		previous = character;
+	}
+	return { body: command.slice(start), balanced: false, end: command.length };
+}
+
+/**
+ * Collect the bodies of `$(...)` and backtick command substitutions. Their
+ * contents are a live command list wherever they appear -- including inside a
+ * double-quoted span -- so the caller rescans each one as its own script.
+ *
+ * Quote state is tracked the way the shell does it: an apostrophe inside a
+ * double-quoted word is data, not a single-quote opener, so `"it's $(rm x)"`
+ * still yields the substitution; a `)` inside a quoted argument does not close
+ * the body, so `$(printf ')'; rm x)` yields the whole body. Single-quoted spans
+ * are skipped because they suppress substitution entirely. Shell comments are
+ * skipped only at word boundaries, and their quote-like text cannot poison the
+ * surrounding frame. A body whose delimiters never balance is reported as such
+ * so the caller fails closed.
+ */
+function extractSubstitutionBodies(command: string): SubstitutionBody[] {
+	const bodies: SubstitutionBody[] = [];
+	let inSingle = false;
+	let inDouble = false;
+	let inComment = false;
+	let previous = "";
+	for (let index = 0; index < command.length; index += 1) {
+		const character = command[index];
+		if (inComment) {
+			if (character === "\n") {
+				inComment = false;
+				previous = character;
+			}
+			continue;
+		}
+		if (character === "\\" && !inSingle) {
+			index += 1;
+			previous = "x";
+			continue;
+		}
+		if (character === "'" && !inDouble) {
+			inSingle = !inSingle;
+			previous = character;
+			continue;
+		}
+		if (character === '"' && !inSingle) {
+			inDouble = !inDouble;
+			previous = character;
+			continue;
+		}
+		if (inSingle) continue;
+		if (character === "$" && command[index + 1] === "(") {
+			const scanned = scanDollarParenBody(command, index + 2);
+			bodies.push({ body: scanned.body, balanced: scanned.balanced });
+			index = scanned.end - 1;
+			previous = "x";
+			continue;
+		}
+		if (character === "`") {
+			const scanned = scanBacktickBody(command, index + 1);
+			bodies.push({ body: scanned.body, balanced: scanned.balanced });
+			index = scanned.end - 1;
+			previous = "x";
+			continue;
+		}
+		if (!inDouble && character === "#" && (previous === "" || /\s/.test(previous) || ";|&()".includes(previous))) {
+			inComment = true;
+			continue;
+		}
+		previous = character;
+	}
+	return bodies;
+}
+
 function extractBashTargets(args: unknown, depth = 0): ExtractedTargets {
 	const record = getRecord(args);
 	const command = safeString(record?.command);
@@ -927,10 +1147,26 @@ function extractBashTargets(args: unknown, depth = 0): ExtractedTargets {
 		if (nested.unknown) targets.unknown = true;
 		if (nested.explicitMutation) targets.explicitMutation = true;
 	}
+	// `$(...)` / backticks are a nested command list, exactly like `sh -c`: the
+	// statement anchors below (`^`, `;`, `&`, `|`, newline) never see inside one,
+	// so `echo "$(rm -rf src/x.ts)"` would otherwise scan clean. Heredoc masking
+	// removes literal data-consumer bodies first; the extractor then ignores
+	// inert `#` tails without touching quote/escape bytes needed by extraction.
+	const heredoc = maskHeredocBodies(command);
+	for (const substitution of extractSubstitutionBodies(heredoc.masked)) {
+		if (depth >= 2 || !substitution.balanced) {
+			targets.explicitMutation = true;
+			targets.unknown = true;
+			break;
+		}
+		const nested = extractBashTargets({ command: substitution.body }, depth + 1);
+		for (const nestedPath of nested.paths) addPath(targets, nestedPath);
+		if (nested.unknown) targets.unknown = true;
+		if (nested.explicitMutation) targets.explicitMutation = true;
+	}
 	// Heredoc bodies fed to data consumers are inert document payloads; mask them
 	// so spec/plan text cannot fake redirections. Script-consumer bodies survive
 	// the mask and are still scanned as live code below.
-	const heredoc = maskHeredocBodies(command);
 	if (heredoc.opaqueExpansion || heredoc.mutatingConsumer) {
 		targets.explicitMutation = true;
 		targets.unknown = true;
