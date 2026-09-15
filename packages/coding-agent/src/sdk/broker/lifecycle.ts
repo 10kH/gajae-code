@@ -3526,6 +3526,58 @@ async function recordTerminalUncertain(
 		});
 }
 
+/**
+ * Release the worktree held by a forced stop of a stale-endpoint session, bound to
+ * the exact stale identity the caller already validated against the requested close
+ * authority. A successor incarnation can re-register under this session id in the
+ * window between that authority check and this claim, so refresh once and append a
+ * terminal-uncertain marker ONLY when the current row is still that captured
+ * identity and its owning process is not observably alive. A rotated successor no
+ * longer matches, so it is left untouched and nothing is released — the strict
+ * "uncertain counts as occupied" rule keeps protecting it.
+ *
+ * Unlike `recordTerminalUncertain`, the compare and the append share one refresh
+ * boundary and the marker is keyed to the captured generation/pid/incarnation
+ * rather than to whatever row a second refresh happens to read. A successor that
+ * rotates in while the append is in flight therefore cannot be marked terminal:
+ * the claim targets the old generation, whose row never outranks the successor's
+ * higher generation in the projection (#5581).
+ */
+async function releaseForcedStaleWorktree(broker: Broker, id: string, expected: IndexedSession): Promise<void> {
+	await broker.index.refresh();
+	const current = broker.index.listSessions().sessions.find(session => session.sessionId === id);
+	if (
+		!current ||
+		current.endpointGeneration !== expected.endpointGeneration ||
+		current.pid !== expected.pid ||
+		(current.hostIncarnation ?? current.processIncarnation) !==
+			(expected.hostIncarnation ?? expected.processIncarnation)
+	)
+		return;
+	// The forced-release contract: release the worktree only when the process is not
+	// observably alive. An alive process still owns its checkout, so it stays
+	// occupied even under force; `uncertain` (the pid-reuse case this fix targets)
+	// and `exited` are released.
+	if (
+		observeProcess(current.pid, current.hostIncarnation ?? current.processIncarnation, value =>
+			processIncarnationForBroker(broker, value),
+		) === "alive"
+	)
+		return;
+	await broker.index.append({
+		type: "lifecycle_terminal",
+		sessionId: id,
+		locator: current.locator,
+		endpointGeneration: current.endpointGeneration,
+		pid: current.pid,
+		...(current.processIncarnation === undefined ? {} : { processIncarnation: current.processIncarnation }),
+		...(current.hostIncarnation === undefined ? {} : { hostIncarnation: current.hostIncarnation }),
+		...(current.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: current.endpointMtimeMs }),
+		...(current.lifecycleRequestId === undefined ? {} : { lifecycleRequestId: current.lifecycleRequestId }),
+		terminalUncertain: true,
+	});
+}
+
 async function waitUntil(timing: LifecycleTiming, deadline: number): Promise<void> {
 	while (timing.now() < deadline) await timing.sleep(Math.max(0, Math.min(POLL_MS, deadline - timing.now())));
 }
@@ -4227,6 +4279,15 @@ export function worktreeOccupantForTest(
 	observe: (pid: number, expectedIncarnation: string | undefined) => ProcessObservation = observeProcess,
 ): string | null {
 	return worktreeOccupant(sessions, worktreePath, observe);
+}
+
+/** Test seam for the forced stale-worktree release boundary. */
+export async function releaseForcedStaleWorktreeForTest(
+	broker: Broker,
+	id: string,
+	expected: IndexedSession,
+): Promise<void> {
+	await releaseForcedStaleWorktree(broker, id, expected);
 }
 
 async function preparePlannedWorktree(
@@ -5594,17 +5655,11 @@ async function executeLifecycleResponse(
 		}
 		if (!endpointResult.ok) {
 			if (endpointResult.error.code === "endpoint_stale") {
-				// The forced-release contract: release the worktree only when the
-				// process is not observably alive. An alive process still owns its
-				// checkout, so it stays occupied even under force; `uncertain`
-				// (the pid-reuse case this fix targets) and `exited` are released.
-				if (
-					forceReleaseStaleWorktree &&
-					observeProcess(record.pid, record.hostIncarnation ?? record.processIncarnation, value =>
-						processIncarnationForBroker(broker, value),
-					) !== "alive"
-				)
-					await recordTerminalUncertain(broker, id, record.locator.stateRoot, record.pid);
+				// `record` matched the requested close authority above, so it is the exact
+				// stale identity the forced stop targeted — never a live successor, which
+				// would have failed that authority check. Release its worktree bound to
+				// that identity so a rotated successor is left untouched (#5581).
+				if (forceReleaseStaleWorktree) await releaseForcedStaleWorktree(broker, id, record);
 				return endpointResult;
 			}
 			if (endpointResult.error.code !== "resource_gone") return endpointResult;
