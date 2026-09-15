@@ -114,10 +114,12 @@ export function createSessionReaper(deps: SessionReaperDeps, policy: SessionReap
 					// One wedged session must not abort the rest of the sweep.
 					const msg = err instanceof Error ? err.message : String(err);
 					if (!isEndpointStaleReapError(err)) {
-						// Transient failure (close_failed, broker/filesystem error): log and
-						// retry on the next sweep, but never advance the staleness counter, so
-						// only a genuinely stale endpoint can trigger force eviction.
+						// Transient failure (close_failed, broker/filesystem error): a non-stale
+						// outcome breaks the consecutive-stale streak, so clear the counter and
+						// retry on the next sweep. Only genuinely consecutive endpoint_stale
+						// failures may accumulate toward force eviction.
 						logger.warn(`session-reaper: failed to reap ${session.sessionId}: ${msg}`);
+						failureCounts.delete(session.sessionId);
 						continue;
 					}
 					const prev = failureCounts.get(session.sessionId) ?? 0;

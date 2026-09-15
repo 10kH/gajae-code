@@ -273,7 +273,7 @@ describe("createSessionReaper.sweepOnce — bounded failure eviction", () => {
 		warning.mockRestore();
 	});
 
-	it("F1: a stale streak interrupted by a non-stale failure does not reach eviction on the non-stale path", async () => {
+	it("F1: a non-stale failure resets the stale streak (consecutive contract)", async () => {
 		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		const deadSessions: string[] = [];
 		let mode: "stale" | "other" = "stale";
@@ -294,14 +294,17 @@ describe("createSessionReaper.sweepOnce — bounded failure eviction", () => {
 		// Accumulate stale failures right up to the threshold boundary.
 		for (let i = 0; i < MAX_REAP_FAILURES - 1; i++) await reaper.sweepOnce();
 		expect(deadSessions).toHaveLength(0);
-		// A non-stale failure must NOT be the one that crosses the threshold.
+		// A non-stale failure breaks the consecutive streak and resets the counter.
 		mode = "other";
 		await reaper.sweepOnce();
 		expect(deadSessions).toHaveLength(0);
-		// The stale counter was preserved (not incremented by the non-stale failure):
-		// a single further stale failure now crosses the threshold and evicts.
+		// The counter was reset: a single further stale failure is only count=1, so it
+		// must NOT cross the threshold — the previous streak no longer counts.
 		mode = "stale";
 		await reaper.sweepOnce();
+		expect(deadSessions).toHaveLength(0);
+		// Only a fresh, fully-consecutive stale streak reaches eviction.
+		for (let i = 0; i < MAX_REAP_FAILURES - 1; i++) await reaper.sweepOnce();
 		expect(deadSessions).toEqual(["mixed"]);
 
 		warning.mockRestore();
