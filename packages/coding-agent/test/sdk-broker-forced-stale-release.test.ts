@@ -80,6 +80,7 @@ describe("forced stale-endpoint worktree release", () => {
 
 		const released = index.listSessions().sessions.find(session => session.sessionId === "stale");
 		expect(released?.terminalUncertain).toBe(true);
+		expect(released?.forcedStaleRelease).toBe(true);
 		expect(worktreeOccupantForTest(index.listSessions().sessions, WORKTREE, uncertain)).toBeNull();
 	});
 
@@ -107,7 +108,38 @@ describe("forced stale-endpoint worktree release", () => {
 
 		const released = index.listSessions().sessions.find(session => session.sessionId === "uncertain");
 		expect(released?.terminalUncertain).toBe(true);
+		expect(released?.forcedStaleRelease).toBe(true);
 		expect(worktreeOccupantForTest(index.listSessions().sessions, WORKTREE, uncertain)).toBeNull();
+	});
+
+	it("keeps the worktree occupied for a fail-closed teardown that never proved the child gone", async () => {
+		// `recordTerminalUncertain` writes the same lifecycle_terminal row shape at the
+		// tail of an ordinary signal-escalated teardown, without the forced marker. That
+		// process was SIGKILLed but never proven gone, so it may still be writing in the
+		// checkout: only the forced stale release frees a worktree.
+		const { index, stateRoot } = await scenario();
+		await index.append(
+			registration("fail-closed", stateRoot, {
+				endpointGeneration: 4,
+				pid: process.pid,
+				incarnation: "teardown-incarnation",
+			}),
+		);
+		await index.append({
+			type: "lifecycle_terminal" as const,
+			sessionId: "fail-closed",
+			locator: { cwd: WORKTREE, worktreeRoot: WORKTREE, stateRoot },
+			endpointGeneration: 4,
+			pid: process.pid,
+			processIncarnation: "teardown-incarnation",
+			hostIncarnation: "teardown-incarnation",
+			terminalUncertain: true,
+		});
+
+		const row = index.listSessions().sessions.find(session => session.sessionId === "fail-closed");
+		expect(row?.terminalUncertain).toBe(true);
+		expect(row?.forcedStaleRelease).toBeUndefined();
+		expect(worktreeOccupantForTest(index.listSessions().sessions, WORKTREE, uncertain)).toBe("fail-closed");
 	});
 
 	it("does not claim terminal state when a successor rotated in under the same id", async () => {

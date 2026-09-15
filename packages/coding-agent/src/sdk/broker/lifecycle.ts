@@ -3583,6 +3583,10 @@ async function releaseForcedStaleWorktree(broker: Broker, id: string, expected: 
 		...(current.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: current.endpointMtimeMs }),
 		...(current.lifecycleRequestId === undefined ? {} : { lifecycleRequestId: current.lifecycleRequestId }),
 		terminalUncertain: true,
+		// Marks this claim as the forced release, which is the only terminal-uncertain
+		// claim that frees the worktree. The fail-closed teardown tail writes
+		// `terminalUncertain` without it and keeps its checkout (see `worktreeOccupant`).
+		forcedStaleRelease: true,
 	});
 }
 
