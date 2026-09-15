@@ -1182,6 +1182,25 @@ function raceUsageWithSignal<T>(promise: Promise<T>, signal: AbortSignal | undef
 	});
 }
 
+/**
+ * Distinguish an internal deadline from a caller-owned cancellation.
+ *
+ * `AbortSignal.timeout(...)` (and `AbortSignal.any([...])` when the timeout leg
+ * fires) aborts with a `TimeoutError` reason, whereas a caller's
+ * `AbortController.abort()` surfaces an `AbortError` (or a custom reason). The
+ * probe callers (`#checkCredentialHealth`, `#fetchUsageUncached`) pass a
+ * timeout-derived signal: a refresh cut short by that internal deadline is a
+ * genuine failure — the rotating refresh token may already have been consumed
+ * upstream — and MUST update the replay guard. Only a true caller cancellation
+ * may skip the guard update.
+ */
+function isTimeoutAbort(signal: AbortSignal): boolean {
+	const reason: unknown = signal.reason;
+	return (
+		typeof reason === "object" && reason !== null && "name" in reason && (reason as { name?: unknown }).name === "TimeoutError"
+	);
+}
+
 function raceCredentialRefreshWithSignal<T>(
 	promise: Promise<T>,
 	signal: AbortSignal | undefined,
@@ -5395,11 +5414,18 @@ export class AuthStorage {
 			}
 			return authority;
 		} catch (error) {
-			// A caller cancellation is not a refresh failure. Rethrow before any
-			// failure classification so an aborted attempt never poisons the replay
-			// guard (which would temp-block the credential on the next request) or
-			// otherwise mutate its health state.
-			if (signal?.aborted) throw error;
+			// A genuine caller cancellation (e.g. the agent's ESC) is not a refresh
+			// failure. Rethrow before any failure classification so it never poisons
+			// the replay guard (which would temp-block the credential on the next
+			// request) or otherwise mutate its health state. But an INTERNAL deadline
+			// is a real failure: an `AbortSignal.timeout(...)` from an internal probe
+			// (`#checkCredentialHealth` / `#fetchUsageUncached`) may have cut short a
+			// dial that already consumed the rotating refresh token upstream, so its
+			// failure must still be memoized — otherwise the same (credential, token)
+			// pair is immediately eligible for a second refresh, replaying the token
+			// and tripping provider reuse detection. Skip the guard update only for a
+			// caller-owned abort, never for an internal timeout.
+			if (signal?.aborted && !isTimeoutAbort(signal)) throw error;
 			if (localDial && credentialId !== undefined) {
 				for (const [key, entry] of this.#recentOAuthRefreshFailures) {
 					if (entry.expiresAt <= Date.now()) this.#recentOAuthRefreshFailures.delete(key);
