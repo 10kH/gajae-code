@@ -6296,23 +6296,19 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	}
 
 	/**
-	 * True when the session's persisted endpoint authority can no longer be
-	 * proven current (missing identity fields, rotated generation/incarnation, or
-	 * an absent broker row). Mirrors the reap preflight so force eviction only
-	 * fires against a genuinely stale endpoint. A transient authority-read failure
+	 * Prove a stored endpoint identity (workspace + generation + incarnation) is no
+	 * longer current against the live broker index. Returns true only when the
+	 * broker row is absent (not_found) or its generation/incarnation/workspace has
+	 * rotated away from the stored triple. A transient authority-read failure
 	 * returns false: we cannot prove the endpoint recovered, but we also must not
 	 * force-evict on a flake — the normal reap path will retry.
 	 */
-	async function isSessionEndpointStale(session: Record<string, unknown>, id: string): Promise<boolean> {
-		const persistedWorkspace = optionalString(session.broker_workspace);
-		const persistedGeneration =
-			typeof session.endpoint_generation === "number" &&
-			Number.isSafeInteger(session.endpoint_generation) &&
-			session.endpoint_generation > 0
-				? session.endpoint_generation
-				: null;
-		const persistedIncarnation = optionalString(session.endpoint_incarnation);
-		if (!persistedWorkspace || persistedGeneration === null || !persistedIncarnation) return true;
+	async function brokerEndpointIdentityStale(
+		id: string,
+		persistedWorkspace: string,
+		persistedGeneration: number,
+		persistedIncarnation: string,
+	): Promise<boolean> {
 		try {
 			const workspace = await canonicalBrokerWorkspace(persistedWorkspace);
 			const authority = await exactBrokerSessionAuthority(id, workspace);
@@ -6326,6 +6322,45 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				return true;
 			return false;
 		}
+	}
+
+	/**
+	 * True when the session's endpoint authority can no longer be proven current.
+	 * Mirrors the reap preflight so force eviction only fires against a genuinely
+	 * stale endpoint. When the projection carries a full endpoint identity we prove
+	 * staleness against it directly. When the projection identity is missing/corrupt
+	 * (or the projection is absent), an absent field is NOT itself proof of a stale
+	 * endpoint: a partial write can drop `endpoint_incarnation` while the broker
+	 * session is still live. We therefore recover the canonical WAL's own broker
+	 * identity and prove absence/mismatch against that authority instead. If neither
+	 * the projection nor the WAL yields a usable identity, we return false and leave
+	 * the state for the safe repair path rather than destructively evicting a
+	 * possibly-live session.
+	 */
+	async function isSessionEndpointStale(session: Record<string, unknown> | null, id: string): Promise<boolean> {
+		const persistedWorkspace = optionalString(session?.broker_workspace);
+		const persistedGeneration =
+			typeof session?.endpoint_generation === "number" &&
+			Number.isSafeInteger(session.endpoint_generation) &&
+			session.endpoint_generation > 0
+				? session.endpoint_generation
+				: null;
+		const persistedIncarnation = optionalString(session?.endpoint_incarnation);
+		if (persistedWorkspace && persistedGeneration !== null && persistedIncarnation)
+			return await brokerEndpointIdentityStale(id, persistedWorkspace, persistedGeneration, persistedIncarnation);
+		// Projection identity is missing — fall back to the canonical WAL authority.
+		const canonicalTransaction = await readSessionTransaction(questionPaths, id);
+		const broker = canonicalTransaction?.canonical.session.broker;
+		const walWorkspace = optionalString(broker?.workspace);
+		const walGeneration =
+			typeof broker?.endpoint_generation === "number" &&
+			Number.isSafeInteger(broker.endpoint_generation) &&
+			broker.endpoint_generation > 0
+				? broker.endpoint_generation
+				: null;
+		const walIncarnation = optionalString(broker?.endpoint_incarnation);
+		if (!walWorkspace || walGeneration === null || !walIncarnation) return false;
+		return await brokerEndpointIdentityStale(id, walWorkspace, walGeneration, walIncarnation);
 	}
 
 	/**
@@ -6357,7 +6392,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	 * the record stays in `cleanup_pending`, so a subsequent reapSession() for this
 	 * id (selected by session_id, not deletion_id) resumes and completes it.
 	 */
-	async function forceEvictStaleSession(sessionId: string, session: Record<string, unknown> | null): Promise<void> {
+	async function forceEvictStaleSession(sessionId: string): Promise<void> {
 		await ensureQuestionStateReady();
 		// Recover the session by id from the canonical WAL — not just the projection.
 		// A crash/partial-write, or a malformed/legacy projection, can leave canonical
@@ -6375,13 +6410,13 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			await removeReapedProjection(sessionId, [], []);
 			return;
 		}
-		// Endpoint authority for the durable retirement: prefer the projection, but
-		// fall back to the WAL's own incarnation when the projection dropped it.
-		// removeSessionTransaction fences the delete on this exact incarnation, and
-		// the value read from the WAL always matches that fence.
-		const persistedIncarnation =
-			(session ? optionalString(session.endpoint_incarnation) : null) ??
-			optionalString(canonicalTransaction.endpoint?.incarnation);
+		// Endpoint authority for the durable retirement comes from the canonical WAL,
+		// never the projection: removeSessionTransaction fences the delete on
+		// `canonicalTransaction.endpoint.incarnation`, so a present-but-stale
+		// projection incarnation would make cleanup fail with endpoint_stale and
+		// orphan the WAL, retained deliveries, and registry state. Using the WAL's
+		// own incarnation guarantees the fence matches.
+		const persistedIncarnation = optionalString(canonicalTransaction.endpoint?.incarnation);
 		if (!persistedIncarnation) {
 			// The WAL exists but never observed an endpoint incarnation, so there is
 			// no authority to fence a durable retirement against. Leave the state for
@@ -6477,8 +6512,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				await withSessionTransition(sessionId, async () => {
 					if (await sessionHasActiveTurn(sessionId)) return;
 					const session = asRecord(await readJsonFile(sessionFile(sessionId)));
-					if (session && !(await isSessionEndpointStale(session, sessionId))) return;
-					await forceEvictStaleSession(sessionId, session);
+					// Prove endpoint staleness before any destructive eviction, even when the
+					// projection is absent: isSessionEndpointStale falls back to the canonical
+					// WAL authority to confirm broker absence/mismatch, so a missing or
+					// partially-written projection can no longer force-evict a live broker.
+					if (!(await isSessionEndpointStale(session, sessionId))) return;
+					await forceEvictStaleSession(sessionId);
 				});
 			},
 			now: () => Date.now(),

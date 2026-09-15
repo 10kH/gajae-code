@@ -7179,7 +7179,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		expect(await Bun.file(path.join(sessionsDir, "registered-session.json")).exists()).toBe(true);
 	});
 
-	it("force-evicts a stale session whose projection lost its endpoint incarnation, retiring WAL, registry, retained deliveries, and projections", async () => {
+	it("force-evicts a session whose projection lost its endpoint incarnation once the broker endpoint has rotated away, retiring WAL, registry, retained deliveries, and projections", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
 		const brokerSessions = [
@@ -7237,6 +7237,13 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const { endpoint_incarnation: _dropped, ...withoutIncarnation } = idle;
 		await Bun.write(sessionFile, JSON.stringify({ ...withoutIncarnation, ephemeral: true, created_at: staleAt }));
 
+		// The broker endpoint has genuinely rotated away: the live row now advertises a
+		// newer generation than the canonical WAL recorded, so recovering the WAL
+		// authority proves the stored endpoint is stale. Force eviction must PROVE
+		// absence/mismatch against the WAL authority before any destructive cleanup —
+		// a missing projection field alone is not proof (see the live-broker guard test).
+		brokerSessions[0]!.endpointGeneration = 2;
+
 		// Preconditions: WAL carries the recoverable incarnation, and the retained
 		// delivery hint is present.
 		const before = await readSessionTransaction(paths, "orphan-session");
@@ -7277,6 +7284,73 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		await expect(Bun.file(sessionFile).exists()).resolves.toBe(false);
 		await expect(Bun.file(path.join(nsDir, "session-states", "orphan-session.json")).exists()).resolves.toBe(false);
 		await expect(Bun.file(path.join(nsDir, "active-turns", "orphan-session.json")).exists()).resolves.toBe(false);
+	});
+
+	it("does NOT force-evict a session with a missing projection incarnation while the broker endpoint is still live, leaving durable state for safe repair", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const brokerSessions = [
+			{
+				sessionId: "live-orphan",
+				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				live: true,
+				endpointGeneration: 1,
+				pid: 303,
+				endpointMtimeMs: 3,
+			},
+		];
+		const server = await createSdkControlServer(root, controls, undefined, undefined, brokerSessions);
+		await expect(
+			server.callTool("gjc_coordinator_register_session", {
+				session_id: "live-orphan",
+				cwd: root,
+				idempotency_key: "register-live-orphan",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true });
+
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const nsDir = coordinatorNamespace(root);
+		const sessionsDir = path.join(nsDir, "sessions");
+		const sessionFile = path.join(sessionsDir, "live-orphan.json");
+
+		// Make the session idle + ephemeral so the reaper selects it, and keep the
+		// projection revisions ahead of the WAL so projection repair never runs.
+		const staleAt = new Date(Date.now() - 31 * 60_000).toISOString();
+		await withSessionTransaction(paths, "live-orphan", async transaction => {
+			const nextRevision = transaction.revision + 1;
+			transaction.canonical.session.ephemeral = true;
+			transaction.canonical.session.created_at = staleAt;
+			transaction.canonical.session.updated_at = staleAt;
+			transaction.projection.applied_turns_revision = nextRevision;
+			transaction.projection.applied_reports_revision = nextRevision;
+			transaction.projection.applied_session_revision = nextRevision;
+			transaction.projection.applied_active_revision = nextRevision;
+			transaction.projection.applied_events_revision = nextRevision;
+		});
+
+		// Partial-write corruption dropped endpoint_incarnation from the projection,
+		// but the broker session (generation 1) is still live and matches the WAL.
+		const idle = JSON.parse(await fs.readFile(sessionFile, "utf8")) as Record<string, unknown>;
+		const { endpoint_incarnation: _dropped, ...withoutIncarnation } = idle;
+		await Bun.write(sessionFile, JSON.stringify({ ...withoutIncarnation, ephemeral: true, created_at: staleAt }));
+
+		// Every sweep fails endpoint_stale (stripped projection incarnation), so the
+		// counter reaches the eviction boundary repeatedly — but the WAL-authority
+		// guard proves the broker is still live/matching, so nothing is retired.
+		for (let i = 0; i < MAX_REAP_FAILURES + 2; i++) {
+			expect(await server.sessionReaper.sweepOnce()).toBe(0);
+		}
+
+		// Durable state is preserved for the safe repair path: the WAL and projection
+		// both remain, and no force-evict deletion was recorded against the session.
+		expect(await readSessionTransaction(paths, "live-orphan")).not.toBeNull();
+		await expect(Bun.file(transactionPath(paths, "live-orphan")).exists()).resolves.toBe(true);
+		const registry = (await withNamespaceRegistry(paths, async r => JSON.parse(JSON.stringify(r)))) as {
+			deletions?: Record<string, unknown>;
+		};
+		expect(Object.keys(registry.deletions ?? {}).some(id => id.startsWith("force-evict:live-orphan:"))).toBe(false);
+		await expect(Bun.file(sessionFile).exists()).resolves.toBe(true);
 	});
 	describe("Coordinator MCP real broker lifecycle", () => {
 		for (const discoveryState of [
