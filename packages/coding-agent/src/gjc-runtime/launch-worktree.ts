@@ -547,7 +547,12 @@ function evacuatePreWorktreeTarget(worktreePath: string): () => void {
 		return () => {};
 	}
 	const gjcStash = path.join(path.dirname(worktreePath), `.gjc-pre-wt-${path.basename(worktreePath)}`);
-	fs.rmSync(gjcStash, { recursive: true, force: true });
+	// A lingering stash means a prior evacuation was interrupted before its restore ran, or the
+	// path holds unrelated user data. Either way it is not ours to destroy: fail closed so the
+	// operator can inspect and remove it, rather than overwriting it before the worktree add.
+	if (fs.existsSync(gjcStash)) {
+		throw new Error(`stash path already occupied: ${gjcStash} — remove it manually before retrying`);
+	}
 	fs.renameSync(gjcSource, gjcStash);
 	fs.rmdirSync(worktreePath);
 	return () => {

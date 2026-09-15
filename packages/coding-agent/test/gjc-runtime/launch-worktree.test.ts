@@ -495,6 +495,24 @@ describe("default launch worktrees", () => {
 		expect(await Bun.file(path.join(planned.worktreePath, "notes.txt")).exists()).toBe(true);
 	});
 
+	it("refuses to evacuate .gjc when the sibling stash path is already occupied", async () => {
+		const repo = await createRepo("gjc-launch-preseeded-stash-collision-");
+		const planned = planLaunchWorktree(repo, { enabled: true, detached: false, name: "feature/demo" });
+		if (!planned.enabled) throw new Error("expected enabled worktree plan");
+		// The launcher pre-seeds the target with only its gjc config: the evacuation case.
+		await fs.mkdir(path.join(planned.worktreePath, ".gjc"), { recursive: true });
+		await Bun.write(path.join(planned.worktreePath, ".gjc", "config.json"), '{"session":"demo"}\n');
+		// A prior interrupted run (or unrelated user data) already occupies the sibling stash path.
+		const stashPath = path.join(repo, ".worktrees", `.gjc-pre-wt-${testSlug("feature/demo")}`);
+		await fs.mkdir(stashPath, { recursive: true });
+		await Bun.write(path.join(stashPath, "collision-marker.txt"), "precious\n");
+
+		expect(() => ensureLaunchWorktree(planned)).toThrow(/stash path already occupied/);
+		// The occupied stash must be preserved untouched, not overwritten by the evacuation.
+		expect(fsSync.existsSync(stashPath)).toBe(true);
+		expect(await Bun.file(path.join(stashPath, "collision-marker.txt")).text()).toBe("precious\n");
+	});
+
 	it("rejects a missing locked worktree instead of running status in its absent path", async () => {
 		const repo = await createRepo("gjc-launch-locked-worktree-");
 		const planned = planLaunchWorktree(repo, { enabled: true, detached: false, name: "feature/demo" });
