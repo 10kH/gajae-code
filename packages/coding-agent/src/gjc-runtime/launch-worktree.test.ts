@@ -4,7 +4,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { EvacuationHandle, GjcLaunchWorktreePlan } from "./launch-worktree";
 import {
+	acquireTargetLock,
 	commitPreWorktreeRestore,
+	ensureLaunchWorktree,
 	evacuatePreWorktreeTarget,
 	isReplaceableWorktreeTarget,
 	restorePreWorktreeGjc,
@@ -186,5 +188,61 @@ describe("commitPreWorktreeRestore", () => {
 		expect(fs.existsSync(path.join(worktreePath, ".gjc", "launcher.txt"))).toBe(true);
 		expect(fs.existsSync(stashPath)).toBe(false);
 		expect(countRegisteredWorktrees(repo)).toBe(2);
+	});
+});
+
+describe("acquireTargetLock", () => {
+	test("a second concurrent acquire fails while the first holds the lock", () => {
+		const bucket = makeTempDir("gjc-lock-");
+		const worktreePath = path.join(bucket, "wt");
+		fs.mkdirSync(path.join(worktreePath, ".gjc"), { recursive: true });
+
+		const release = acquireTargetLock(worktreePath);
+		expect(() => acquireTargetLock(worktreePath)).toThrow(/worktree_target_locked/);
+		// The contended target is left intact — the loser touched nothing.
+		expect(fs.readdirSync(worktreePath)).toEqual([".gjc"]);
+
+		release();
+		// After release the lockfile is gone and the lock is reusable.
+		expect(fs.existsSync(path.join(bucket, ".gjc-lock-wt"))).toBe(false);
+		acquireTargetLock(worktreePath)();
+	});
+
+	test("release is idempotent", () => {
+		const bucket = makeTempDir("gjc-lock-");
+		const worktreePath = path.join(bucket, "wt");
+		fs.mkdirSync(worktreePath, { recursive: true });
+		const release = acquireTargetLock(worktreePath);
+		release();
+		expect(() => release()).not.toThrow();
+	});
+
+	test("ensureLaunchWorktree refuses a target already locked by another launcher", () => {
+		const repo = initRepo("gjc-lock-repo-");
+		const bucket = makeTempDir("gjc-lock-bucket-");
+		const worktreePath = path.join(bucket, "wt");
+		const plan: GjcLaunchWorktreePlan = {
+			enabled: true,
+			repoRoot: repo,
+			worktreePath,
+			detached: true,
+			baseRef: "HEAD",
+			branchName: null,
+		};
+
+		const release = acquireTargetLock(worktreePath);
+		try {
+			expect(() => ensureLaunchWorktree(plan)).toThrow(/worktree_target_locked/);
+			// The losing launcher never created the worktree.
+			expect(fs.existsSync(worktreePath)).toBe(false);
+			expect(countRegisteredWorktrees(repo)).toBe(1);
+		} finally {
+			release();
+		}
+
+		// Once the lock is released the same launch succeeds cleanly.
+		const result = ensureLaunchWorktree(plan);
+		expect(result.enabled).toBe(true);
+		expect(fs.existsSync(path.join(worktreePath, ".git"))).toBe(true);
 	});
 });

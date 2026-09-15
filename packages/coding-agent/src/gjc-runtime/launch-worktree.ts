@@ -681,6 +681,37 @@ export function commitPreWorktreeRestore(handle: EvacuationHandle, plan: GjcLaun
 	}
 }
 
+/**
+ * Acquire a per-target filesystem lock so the replaceability check, evacuation, `git worktree
+ * add`, and restore run as one critical section. Without it a second launcher racing on the same
+ * target could add files between the scan and the evacuation, or move `.gjc` first and strand the
+ * partially modified target. The lock is an atomic `O_EXCL` lockfile beside the target (inside the
+ * git-ignored bucket); a concurrent holder fails fast with `worktree_target_locked`.
+ */
+export function acquireTargetLock(worktreePath: string): () => void {
+	const lockPath = path.join(path.dirname(worktreePath), `.gjc-lock-${path.basename(worktreePath)}`);
+	try {
+		fs.closeSync(fs.openSync(lockPath, "wx"));
+	} catch (error) {
+		if (fileSystemErrorCode(error) === "EEXIST") {
+			throw new Error(
+				`worktree_target_locked:${worktreePath} — another launch is preparing this worktree (lock: ${lockPath})`,
+			);
+		}
+		throw error;
+	}
+	let released = false;
+	return () => {
+		if (released) return;
+		released = true;
+		try {
+			fs.rmSync(lockPath, { force: true });
+		} catch {
+			// Best-effort release; a stranded lockfile is surfaced as worktree_target_locked next time.
+		}
+	};
+}
+
 function buildWorktreeAddArgs(plan: GjcLaunchWorktreePlan, branchAlreadyExisted: boolean): string[] {
 	const args = ["worktree", "add"];
 	if (plan.detached) args.push("--detach", plan.worktreePath, plan.baseRef);
@@ -763,27 +794,37 @@ function ensureLaunchWorktreeSync(
 	}
 
 	ensureBucketDirUsable(path.dirname(plan.worktreePath));
-	const branchAlreadyExisted = plan.branchName ? branchExists(plan.repoRoot, plan.branchName) : false;
-	const args = buildWorktreeAddArgs(plan, branchAlreadyExisted);
-	const evacuation = evacuatePreWorktreeTarget(plan.worktreePath);
+	const releaseLock = acquireTargetLock(plan.worktreePath);
 	try {
-		const result = Bun.spawnSync(["git", ...args], { cwd: plan.repoRoot, stdout: "pipe", stderr: "pipe" });
-		if (result.exitCode !== 0) {
-			throw classifyWorktreeAddFailure(plan, args, sanitizeWorktreeDiagnostic(result.stderr.toString().trim()));
+		// Re-check under the lock: a concurrent launcher may have populated the target between the
+		// scan above and now. From here the check, evacuation, add, and restore are serialized.
+		if (!isReplaceableWorktreeTarget(plan.worktreePath)) {
+			throw new Error(`worktree_path_conflict:${plan.worktreePath}`);
 		}
-	} catch (error) {
-		tryRestore(evacuation.restore);
-		throw error;
-	}
-	commitPreWorktreeRestore(evacuation, plan);
+		const branchAlreadyExisted = plan.branchName ? branchExists(plan.repoRoot, plan.branchName) : false;
+		const args = buildWorktreeAddArgs(plan, branchAlreadyExisted);
+		const evacuation = evacuatePreWorktreeTarget(plan.worktreePath);
+		try {
+			const result = Bun.spawnSync(["git", ...args], { cwd: plan.repoRoot, stdout: "pipe", stderr: "pipe" });
+			if (result.exitCode !== 0) {
+				throw classifyWorktreeAddFailure(plan, args, sanitizeWorktreeDiagnostic(result.stderr.toString().trim()));
+			}
+		} catch (error) {
+			tryRestore(evacuation.restore);
+			throw error;
+		}
+		commitPreWorktreeRestore(evacuation, plan);
 
-	return {
-		...plan,
-		worktreePath: path.resolve(plan.worktreePath),
-		created: true,
-		reused: false,
-		createdBranch: Boolean(plan.branchName && !branchAlreadyExisted),
-	};
+		return {
+			...plan,
+			worktreePath: path.resolve(plan.worktreePath),
+			created: true,
+			reused: false,
+			createdBranch: Boolean(plan.branchName && !branchAlreadyExisted),
+		};
+	} finally {
+		releaseLock();
+	}
 }
 
 export async function ensureLaunchWorktreeCancellable(
@@ -850,27 +891,37 @@ export async function ensureLaunchWorktreeCancellable(
 
 	ensureBucketDirUsable(path.dirname(plan.worktreePath));
 	throwIfAborted(options, timeout);
-	const branchAlreadyExisted = plan.branchName ? branchExists(plan.repoRoot, plan.branchName) : false;
-	const args = buildWorktreeAddArgs(plan, branchAlreadyExisted);
-	const evacuation = evacuatePreWorktreeTarget(plan.worktreePath);
+	const releaseLock = acquireTargetLock(plan.worktreePath);
 	try {
-		const result = await spawnProcessGroup(["git", ...args], plan.repoRoot, options, timeout);
-		if (result.exitCode !== 0) {
-			throw classifyWorktreeAddFailure(plan, args, sanitizeWorktreeDiagnostic(result.stderr.trim()));
+		// Re-check under the lock: a concurrent launcher may have populated the target between the
+		// scan above and now. From here the check, evacuation, add, and restore are serialized.
+		if (!isReplaceableWorktreeTarget(plan.worktreePath)) {
+			throw new Error(`worktree_path_conflict:${plan.worktreePath}`);
 		}
-	} catch (error) {
-		tryRestore(evacuation.restore);
-		throw error;
-	}
-	commitPreWorktreeRestore(evacuation, plan);
+		const branchAlreadyExisted = plan.branchName ? branchExists(plan.repoRoot, plan.branchName) : false;
+		const args = buildWorktreeAddArgs(plan, branchAlreadyExisted);
+		const evacuation = evacuatePreWorktreeTarget(plan.worktreePath);
+		try {
+			const result = await spawnProcessGroup(["git", ...args], plan.repoRoot, options, timeout);
+			if (result.exitCode !== 0) {
+				throw classifyWorktreeAddFailure(plan, args, sanitizeWorktreeDiagnostic(result.stderr.trim()));
+			}
+		} catch (error) {
+			tryRestore(evacuation.restore);
+			throw error;
+		}
+		commitPreWorktreeRestore(evacuation, plan);
 
-	return {
-		...plan,
-		worktreePath: path.resolve(plan.worktreePath),
-		created: true,
-		reused: false,
-		createdBranch: Boolean(plan.branchName && !branchAlreadyExisted),
-	};
+		return {
+			...plan,
+			worktreePath: path.resolve(plan.worktreePath),
+			created: true,
+			reused: false,
+			createdBranch: Boolean(plan.branchName && !branchAlreadyExisted),
+		};
+	} finally {
+		releaseLock();
+	}
 }
 
 interface WorkspacePackageManifest {
