@@ -1213,27 +1213,23 @@ const pendingDeferredOwnerOnlySelfHeals = new Map<string, Promise<void>>();
  */
 const pendingDeferredOwnerOnlyRepairFailures = new Map<string, string[]>();
 
-/** Last completed deferred self-heal per scope (resolved directory → epoch ms) for the re-scan cooldown. */
-const lastDeferredOwnerOnlySelfHealCompletedAt = new Map<string, number>();
-
 /**
- * Minimum gap between deferred self-heal walks of the same scope. A completed
- * walk has already repaired the entire tree, so re-launching a full traversal the
- * instant the previous one settles — which repeated prepares on a large unchanged
- * scope would otherwise do — only recreates sustained disk/CPU contention and
- * undermines the bounded-resource objective. Re-scheduling is suppressed within
- * this window of the last completion; genuinely new drift is still caught on the
- * first prepare after the cooldown lapses.
+ * Schedule (at most one per scope) a background self-heal of the tail the budget
+ * skipped.
+ *
+ * Scheduling is deliberately NOT suppressed by a time-based cooldown on the last
+ * completed walk. This is only reached when the synchronous scan truncated, and a
+ * truncated scan is fresh evidence that the tail is unverified *now*: a managed
+ * scope is same-user writable, so a new group/other-readable descendant can land
+ * past the scan prefix moments after a walk completes. Suppressing on elapsed
+ * time alone would let that prepare return success over a tree nobody inspected,
+ * and there is no cheap unchanged-tree signal at the scan boundary that could
+ * prove otherwise — verifying the tail *is* the walk. The in-flight dedupe above
+ * still bounds this to one concurrent traversal per scope.
  */
-export const OWNER_ONLY_DEFERRED_SELF_HEAL_COOLDOWN_MS = 30_000;
-
-/** Schedule (at most one per scope) a background self-heal of the tail the budget skipped. */
 function scheduleDeferredOwnerOnlySelfHeal(directory: string): void {
 	const key = path.resolve(directory);
 	if (pendingDeferredOwnerOnlySelfHeals.has(key)) return;
-	// Do not re-walk an unchanged scope that a recent walk already fully repaired.
-	const completedAt = lastDeferredOwnerOnlySelfHealCompletedAt.get(key);
-	if (completedAt !== undefined && Date.now() - completedAt < OWNER_ONLY_DEFERRED_SELF_HEAL_COOLDOWN_MS) return;
 	const failures: string[] = [];
 	const task = runDeferredOwnerOnlySelfHeal(directory, failures).catch(error => {
 		logger.debug("Deferred managed-scope owner-only self-heal failed", {
@@ -1243,7 +1239,6 @@ function scheduleDeferredOwnerOnlySelfHeal(directory: string): void {
 	});
 	pendingDeferredOwnerOnlySelfHeals.set(key, task);
 	void task.finally(() => {
-		lastDeferredOwnerOnlySelfHealCompletedAt.set(key, Date.now());
 		// Preserve an unrepairable tail so the next prepare fails closed; clear any
 		// prior failure once a later walk has fully re-secured the scope.
 		if (failures.length > 0) pendingDeferredOwnerOnlyRepairFailures.set(key, failures);

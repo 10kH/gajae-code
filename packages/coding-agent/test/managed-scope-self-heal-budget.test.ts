@@ -322,27 +322,38 @@ describe.skipIf(process.platform === "win32")("managed scope owner-only self-hea
 		expect(pendingDeferredOwnerOnlyRepairFailureCount()).toBe(0);
 	});
 
-	// Second review — Finding 3: a completed deferred walk has already repaired the
-	// whole tree, so repeated prepares on a large unchanged scope must not each
-	// launch another full traversal the instant the previous one settles. A
-	// completion cooldown suppresses re-scheduling for a window after the last walk.
-	it("does not re-schedule a full deferred walk immediately after one completes (cooldown)", async () => {
+	// Third review — Finding 1: a completed deferred walk only proves what the tree
+	// looked like when it ran. A managed scope is same-user writable, so new drift
+	// can land past the synchronous scan prefix immediately afterwards. A truncated
+	// scan must therefore always schedule a fresh walk — suppressing it on elapsed
+	// time alone would let prepare report success over an uninspected tail.
+	it("detects a tail that drifted right after a completed deferred walk", async () => {
 		const root = tempTree();
 
-		// >budget children so the synchronous scan always truncates and would, absent
-		// a cooldown, schedule a fresh deferred walk on every prepare.
+		// >budget direct children guarantee every synchronous scan truncates before it
+		// descends into `tail/`, so the tail is only ever reachable by a deferred walk.
 		for (let i = 0; i < OWNER_ONLY_SELF_HEAL_MAX_ENTRIES + 2000; i += 1) {
 			fs.writeFileSync(path.join(root, `pad-${i}.bin`), "", { mode: 0o600 });
 		}
+		const tail = path.join(root, "tail");
+		fs.mkdirSync(tail, { mode: 0o700 });
 
-		// First prepare truncates and schedules the deferred tail walk.
+		// First prepare truncates, defers, and the walk completes over a clean tail.
 		selfHealOwnerOnlyModeDrift(root, "default");
 		expect(pendingDeferredOwnerOnlySelfHealCount()).toBeGreaterThan(0);
 		await drainDeferredOwnerOnlySelfHeals();
 
-		// A second prepare immediately after (well within the cooldown window) also
-		// truncates, but must NOT launch another full walk of the unchanged scope.
+		// Drift is introduced beyond the scan prefix right after that completion.
+		const driftedFile = path.join(tail, "leaked.bin");
+		fs.writeFileSync(driftedFile, "secret", { mode: 0o600 });
+		fs.chmodSync(driftedFile, 0o644);
+		expect(isOwnerOnly(driftedFile)).toBe(false);
+
+		// The next prepare also truncates, so it must walk the tail again rather than
+		// trust the earlier completion over a tree that has since changed.
 		selfHealOwnerOnlyModeDrift(root, "default");
-		expect(pendingDeferredOwnerOnlySelfHealCount()).toBe(0);
+		expect(pendingDeferredOwnerOnlySelfHealCount()).toBeGreaterThan(0);
+		await drainDeferredOwnerOnlySelfHeals();
+		expect(isOwnerOnly(driftedFile)).toBe(true);
 	});
 });
