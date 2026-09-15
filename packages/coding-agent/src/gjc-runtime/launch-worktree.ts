@@ -534,6 +534,26 @@ function isReplaceableWorktreeTarget(worktreePath: string): boolean {
 }
 
 /**
+ * Restore a stashed pre-seeded `.gjc/` into `worktreePath`.
+ *
+ * `git worktree add` materializes any tracked `.gjc/**` content (e.g. `.gjc/qa/**`) into the
+ * fresh worktree before this runs, so a bare rename would collide with EEXIST. When the target
+ * already exists, the stashed launcher config is overlaid onto it — stash entries win on name
+ * collision, tracked-only entries survive — and the stash is removed. When it does not exist
+ * (the untracked case, or a rolled-back add that never checked out), the stash is renamed in.
+ */
+function restorePreWorktreeGjc(gjcStash: string, worktreePath: string): void {
+	fs.mkdirSync(worktreePath, { recursive: true });
+	const target = path.join(worktreePath, PRE_WORKTREE_GJC_DIR);
+	if (fs.existsSync(target)) {
+		fs.cpSync(gjcStash, target, { recursive: true, force: true });
+		fs.rmSync(gjcStash, { recursive: true, force: true });
+		return;
+	}
+	fs.renameSync(gjcStash, target);
+}
+
+/**
  * Clear a {@link isReplaceableWorktreeTarget replaceable} target so `git worktree add` can
  * create it, moving any pre-seeded `.gjc/` to a sibling stash. Returns a hook that restores
  * `.gjc/` into the freshly created worktree; a no-op when there was nothing to preserve.
@@ -555,10 +575,7 @@ function evacuatePreWorktreeTarget(worktreePath: string): () => void {
 	}
 	fs.renameSync(gjcSource, gjcStash);
 	fs.rmdirSync(worktreePath);
-	return () => {
-		fs.mkdirSync(worktreePath, { recursive: true });
-		fs.renameSync(gjcStash, path.join(worktreePath, PRE_WORKTREE_GJC_DIR));
-	};
+	return () => restorePreWorktreeGjc(gjcStash, worktreePath);
 }
 
 /** Best-effort restore that never masks the failure that triggered it. */
