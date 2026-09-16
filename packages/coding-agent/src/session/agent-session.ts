@@ -320,7 +320,11 @@ import {
 	sessionRuntimeStatePath,
 	sessionStateDir,
 } from "../gjc-runtime/session-layout";
-import { sessionStateLockFailureFields, shouldWarnPersistFailure } from "../gjc-runtime/session-state-lock";
+import {
+	isRetryableSessionStateLockContention,
+	sessionStateLockFailureFields,
+	shouldWarnPersistFailure,
+} from "../gjc-runtime/session-state-lock";
 import {
 	type CoordinatorToolObservation,
 	clearCoordinatorRuntimeStateRescope,
@@ -2030,6 +2034,20 @@ export type BeforeAgentStartContributor = (event: {
 
 const AGENT_END_WORKER_INTEGRATION_TIMEOUT_MS = 5_000;
 const POST_PUBLICATION_ERROR_MAX_BYTES = 512;
+
+/**
+ * Bounded repair for a coordinator runtime-state update that lost its lock outright.
+ *
+ * The lock itself already waits out a busy peer, so reaching this path means a whole
+ * acquisition budget elapsed without the lock ever moving. Retrying covers the remaining
+ * case that budget cannot: a holder whose single critical section legitimately outlives
+ * it. The delay is far longer than the lock's own backoff because the contention being
+ * waited out is a whole foreign write, not a scheduling hiccup, and the retries stay small
+ * so a persistently wedged lock is still reported promptly instead of stalling the
+ * session's persist queue.
+ */
+const COORDINATOR_PERSIST_CONTENTION_RETRIES = 3;
+const COORDINATOR_PERSIST_RETRY_DELAY_MS = 2_000;
 
 export type WorkerIntegrationOutcome =
 	| { status: "completed" }
@@ -6242,17 +6260,30 @@ export class AgentSession {
 		observation: CoordinatorToolObservation | undefined,
 		propagateFailure: boolean,
 	): Promise<void> {
-		try {
-			await persistCoordinatorRuntimeStateFromEvent(event, context, observation);
-		} catch (error) {
-			this.#warnPersistFailure(
-				"Failed to persist coordinator runtime state",
-				error,
-				context.stateFile,
-				context.sessionId,
-				{ event: event.type },
-			);
-			if (propagateFailure) throw error;
+		for (let attempt = 0; ; attempt++) {
+			try {
+				await persistCoordinatorRuntimeStateFromEvent(event, context, observation);
+				return;
+			} catch (error) {
+				// Losing the lock drops this update permanently: nothing re-derives the
+				// snapshot afterwards, so the coordinator keeps reporting stale lifecycle
+				// and tool activity for this session until an unrelated event happens to
+				// win. A pure-contention refusal is therefore retried before it is
+				// reported; every other failure is a standing condition, reported at once.
+				if (attempt < COORDINATOR_PERSIST_CONTENTION_RETRIES && isRetryableSessionStateLockContention(error)) {
+					await Bun.sleep(COORDINATOR_PERSIST_RETRY_DELAY_MS);
+					continue;
+				}
+				this.#warnPersistFailure(
+					"Failed to persist coordinator runtime state",
+					error,
+					context.stateFile,
+					context.sessionId,
+					{ event: event.type, ...(attempt > 0 ? { retries: attempt } : {}) },
+				);
+				if (propagateFailure) throw error;
+				return;
+			}
 		}
 	}
 
