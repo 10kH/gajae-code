@@ -236,6 +236,158 @@ describe("gjc_coordinator_stop_session SDK lifecycle", () => {
 		expect(controls.filter(control => control.operation === "session.close")).toEqual([]);
 	});
 
+	it("releases the worktree of a force-stopped endpoint_stale session before returning endpoint_stale (#5581)", async () => {
+		const root = await tempRoot();
+		// The broker still indexes the session, but at a rotated endpoint authority:
+		// the coordinator's persisted incarnation no longer matches, so the preflight
+		// resolves endpoint_stale. Before #5581 this returned without releasing the
+		// worktree, and the row (still non-terminal in the index) parked the checkout
+		// forever because an OS probe of the reused pid reads `uncertain`.
+		const rows = fixtureBrokerRows(root, "stale");
+		const { server, controls, sessionFile } = await createServer(root, {
+			forceStop: true,
+			brokerSessionsOverride: async () => [{ ...rows.live, endpointGeneration: ENDPOINT_GENERATION + 1 }],
+		});
+		await writeSession(sessionFile("stale"), root, "stale");
+
+		expect(
+			await server.callTool("gjc_coordinator_stop_session", {
+				session_id: "stale",
+				force: true,
+				allow_mutation: true,
+			}),
+		).toMatchObject({ ok: false, reason: "endpoint_stale", closed: false });
+		// The forced release drives a session.close carrying forceReleaseStaleWorktree,
+		// bound to the exact persisted authority so a live successor is never touched.
+		expect(controls.filter(control => control.operation === "session.close")).toEqual([
+			expect.objectContaining({
+				input: expect.objectContaining({
+					sessionId: "stale",
+					endpointGeneration: ENDPOINT_GENERATION,
+					endpointIncarnation: endpointIncarnation("stale"),
+					forceReleaseStaleWorktree: true,
+				}),
+			}),
+		]);
+		// DR-1: the session projection stays readable for inspect/tail after force-stop.
+		expect(await Bun.file(sessionFile("stale")).exists()).toBe(true);
+	});
+
+	it("does not attempt a worktree release when a non-forced stop hits endpoint_stale", async () => {
+		const root = await tempRoot();
+		const rows = fixtureBrokerRows(root, "unforced");
+		const { server, controls, sessionFile } = await createServer(root, {
+			brokerSessionsOverride: async () => [{ ...rows.live, endpointGeneration: ENDPOINT_GENERATION + 1 }],
+		});
+		await writeSession(sessionFile("unforced"), root, "unforced", { ephemeral: true });
+
+		expect(
+			await server.callTool("gjc_coordinator_stop_session", { session_id: "unforced", allow_mutation: true }),
+		).toMatchObject({ ok: false, reason: "endpoint_stale", closed: false });
+		// The uncertain-counts-as-occupied guarantee is preserved for non-forced
+		// stops: no session.close is issued, so nothing releases the worktree.
+		expect(controls.filter(control => control.operation === "session.close")).toEqual([]);
+	});
+
+	it("releases the worktree when a force-stop passes the authority check but the broker close throws endpoint_stale (#5581)", async () => {
+		const root = await tempRoot();
+		// The row is still indexed at the persisted authority, so both the preflight
+		// and the second authority check pass. The endpoint then vanishes before the
+		// reap `session.close` reaches the broker, which throws endpoint_stale. Before
+		// this fix the broad catch returned close_failed without recording a
+		// terminal-uncertain claim, so the non-terminal row kept holding its checkout.
+		const { server, controls, sessionFile } = await createServer(root, {
+			forceStop: true,
+			closeHandler: async input => {
+				// The advisory release close carries forceReleaseStaleWorktree; only the
+				// reap close is made to lose its endpoint mid-flight.
+				if (input.forceReleaseStaleWorktree === true) return { ok: true, result: { sessionId: input.sessionId } };
+				return { ok: false, error: { code: "endpoint_stale", message: "endpoint vanished mid-close" } };
+			},
+		});
+		await writeSession(sessionFile("stale-close"), root, "stale-close");
+
+		expect(
+			await server.callTool("gjc_coordinator_stop_session", {
+				session_id: "stale-close",
+				force: true,
+				allow_mutation: true,
+			}),
+		).toMatchObject({ ok: false, reason: "close_failed", detail: "endpoint_stale", closed: false });
+		const closes = controls.filter(control => control.operation === "session.close");
+		// The reap close was attempted at the exact persisted authority...
+		expect(closes[0]).toEqual(
+			expect.objectContaining({
+				input: expect.objectContaining({
+					sessionId: "stale-close",
+					endpointGeneration: ENDPOINT_GENERATION,
+					endpointIncarnation: endpointIncarnation("stale-close"),
+				}),
+			}),
+		);
+		// ...and its endpoint_stale failure drives the identity-bound release.
+		expect(closes).toContainEqual(
+			expect.objectContaining({
+				input: expect.objectContaining({
+					sessionId: "stale-close",
+					endpointGeneration: ENDPOINT_GENERATION,
+					endpointIncarnation: endpointIncarnation("stale-close"),
+					forceReleaseStaleWorktree: true,
+				}),
+			}),
+		);
+		// The unproven close leaves the projection readable for inspect/tail.
+		expect(await Bun.file(sessionFile("stale-close")).exists()).toBe(true);
+	});
+
+	it("advances an admitted deletion on the forced release claim instead of re-closing (#5581)", async () => {
+		const root = await tempRoot();
+		// The retry after the previous scenario: the deletion is admitted at `intent`
+		// and the forced release already marked the row terminal-uncertain. An ordinary
+		// `session.close` against that row is refused with terminal_uncertain, so
+		// retrying one would park the manifest at `intent` forever. The forced claim is
+		// itself the teardown proof, so the retry advances to broker_closed on it.
+		const rows = fixtureBrokerRows(root, "recovered");
+		let released = false;
+		const { server, controls, sessionFile } = await createServer(root, {
+			forceStop: true,
+			brokerSessionsOverride: async () => [
+				released ? { ...rows.live, live: false, terminalUncertain: true, forcedStaleRelease: true } : rows.live,
+			],
+			closeHandler: async input => {
+				if (input.forceReleaseStaleWorktree === true) {
+					released = true;
+					return { ok: true, result: { sessionId: input.sessionId } };
+				}
+				// Mirrors the broker: once the row carries the terminal-uncertain claim,
+				// every ordinary close is refused with terminal_uncertain.
+				if (released) return { ok: false, error: { code: "terminal_uncertain", message: "ownership uncertain" } };
+				return { ok: false, error: { code: "endpoint_stale", message: "endpoint vanished mid-close" } };
+			},
+		});
+		await writeSession(sessionFile("recovered"), root, "recovered");
+
+		expect(
+			await server.callTool("gjc_coordinator_stop_session", {
+				session_id: "recovered",
+				force: true,
+				allow_mutation: true,
+			}),
+		).toMatchObject({ ok: false, reason: "close_failed", detail: "endpoint_stale", closed: false });
+		const closesAfterFirstStop = controls.filter(control => control.operation === "session.close").length;
+
+		expect(
+			await server.callTool("gjc_coordinator_stop_session", {
+				session_id: "recovered",
+				force: true,
+				allow_mutation: true,
+			}),
+		).toMatchObject({ ok: true, closed: true });
+		// The recovery issued no further close: the forced claim carried the proof.
+		expect(controls.filter(control => control.operation === "session.close")).toHaveLength(closesAfterFirstStop);
+		expect(await Bun.file(sessionFile("recovered")).exists()).toBe(false);
+	});
+
 	it("closes an idle ephemeral session through the SDK broker and removes only coordinator metadata", async () => {
 		const root = await tempRoot();
 		const { server, controls, registryFile, sessionFile } = await createServer(root);

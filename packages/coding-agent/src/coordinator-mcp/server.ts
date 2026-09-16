@@ -5932,6 +5932,41 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		);
 		return true;
 	}
+	/**
+	 * True when the broker row for this session is the terminal-uncertain claim a
+	 * forced stale-worktree release recorded against exactly this authority. The
+	 * claim is only accepted as close proof while the row is still that identity:
+	 * a rotated successor, an ambiguous row, or an unreadable listing all fall
+	 * back to the ordinary close.
+	 */
+	async function forcedStaleReleaseProven(
+		sessionId: string,
+		workspace: string | null,
+		endpointGeneration: number,
+		endpointIncarnation: string,
+	): Promise<boolean> {
+		if (!workspace) return false;
+		let matches: Array<Record<string, unknown>>;
+		try {
+			const canonicalWorkspace = await canonicalBrokerWorkspace(workspace);
+			const listing = await paginatedBrokerSessionList(canonicalWorkspace, { cwd: canonicalWorkspace });
+			matches = jsonRecords(Array.isArray(listing.sessions) ? listing.sessions : []).filter(
+				row => brokerSessionId(row) === sessionId,
+			);
+		} catch {
+			return false;
+		}
+		if (matches.length !== 1) return false;
+		const row = matches[0]!;
+		return (
+			row.ambiguous !== true &&
+			(row.terminalUncertain === true || row.terminal_uncertain === true) &&
+			(row.forcedStaleRelease === true || row.forced_stale_release === true) &&
+			brokerEndpointGeneration(row) === endpointGeneration &&
+			brokerEndpointIncarnation(row, sessionId) === endpointIncarnation
+		);
+	}
+
 	async function recoverIntentDeletion(entry: NamespaceDeletionEntryV1): Promise<void> {
 		const session = asRecord(await readJsonFile(sessionFile(entry.session_id)));
 		if (!session) throw new SdkClientError("state_corrupt", "Close intent has no session authority record.");
@@ -5944,19 +5979,33 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				: null;
 		if (!cwd || endpointGeneration === null)
 			throw new SdkClientError("state_corrupt", "Close intent authority is incomplete.");
-		strictBrokerSessionClose(
-			await brokerSession(
-				cwd,
-				"session.close",
-				{
-					sessionId: entry.session_id,
-					endpointGeneration,
-					endpointIncarnation: entry.endpoint_incarnation,
-				},
-				`coordinator-reap:${entry.session_id}:${entry.endpoint_incarnation}`,
-			),
-			entry.session_id,
-		);
+		// #5581: a forced stop that admitted this deletion and then lost its endpoint
+		// already released the worktree by recording a terminal-uncertain claim bound
+		// to this exact authority. The broker refuses an ordinary `session.close`
+		// against such a row (`terminal_uncertain`), so retrying one here would park
+		// the manifest at `intent` forever. The claim is itself the teardown proof:
+		// advance on it instead, exactly as the success path does.
+		if (
+			!(await forcedStaleReleaseProven(
+				entry.session_id,
+				optionalString(session.broker_workspace),
+				endpointGeneration,
+				entry.endpoint_incarnation,
+			))
+		)
+			strictBrokerSessionClose(
+				await brokerSession(
+					cwd,
+					"session.close",
+					{
+						sessionId: entry.session_id,
+						endpointGeneration,
+						endpointIncarnation: entry.endpoint_incarnation,
+					},
+					`coordinator-reap:${entry.session_id}:${entry.endpoint_incarnation}`,
+				),
+				entry.session_id,
+			);
 		await advanceDeletion(questionPaths, entry.deletion_id, "broker_closed", undefined, {
 			ok: true,
 			closed: true,
@@ -6053,6 +6102,29 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			const persistedIncarnation = optionalString(session.endpoint_incarnation);
 			if (!cwd || !persistedWorkspace || persistedGeneration === null || !persistedIncarnation)
 				return { ok: false, reason: "endpoint_stale", closed: false };
+			// #5581: a forced stop of a session whose endpoint has gone stale (its
+			// coordinator service vanished mid-run) cannot prove teardown, so it
+			// returns endpoint_stale below. The worktree release must still happen
+			// first: ask the broker to record a terminal-uncertain claim so the row
+			// stops holding its checkout. Best-effort — the endpoint_stale signal the
+			// caller depends on is returned regardless of whether release succeeds.
+			// The persisted endpoint authority is passed so the broker acts on exactly
+			// this stale identity: a live successor incarnation fails the close
+			// authority check and is never touched, so a legitimately re-held worktree
+			// stays occupied.
+			const releaseStaleWorktreeOnForce = async (): Promise<void> => {
+				if (opts.force !== true) return;
+				try {
+					await brokerSession(cwd, "session.close", {
+						sessionId: id,
+						endpointGeneration: persistedGeneration,
+						endpointIncarnation: persistedIncarnation,
+						forceReleaseStaleWorktree: true,
+					});
+				} catch {
+					// Advisory release; a later launch simply re-observes the row and retries.
+				}
+			};
 			// Endpoint identity is the authority for any lifecycle mutation. Check it
 			// before consulting a possibly stale active-turn projection so a successor
 			// incarnation cannot be blocked by old local state.
@@ -6064,11 +6136,15 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					!sameCanonicalPath(authority.workspace, persistedWorkspace, platform) ||
 					authority.endpointGeneration !== persistedGeneration ||
 					authority.endpointIncarnation !== persistedIncarnation
-				)
+				) {
+					await releaseStaleWorktreeOnForce();
 					return { ok: false, reason: "endpoint_stale", closed: false };
+				}
 			} catch (error) {
-				if (error instanceof SdkClientError && (error.code === "not_found" || error.code === "endpoint_stale"))
+				if (error instanceof SdkClientError && (error.code === "not_found" || error.code === "endpoint_stale")) {
+					await releaseStaleWorktreeOnForce();
 					return { ok: false, reason: "endpoint_stale", closed: false };
+				}
 				throw error;
 			}
 			if (session.ephemeral !== true && opts.force !== true)
@@ -6170,8 +6246,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						!sameCanonicalPath(authority.workspace, persistedWorkspace, platform) ||
 						authority.endpointGeneration !== persistedGeneration ||
 						authority.endpointIncarnation !== persistedIncarnation
-					)
+					) {
+						await releaseStaleWorktreeOnForce();
 						return { ok: false, reason: "endpoint_stale", closed: false };
+					}
 				}
 				await ensureQuestionStateReady();
 				await ensureQuestionTransaction(id);
@@ -6211,6 +6289,15 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					});
 				}
 			} catch (error) {
+				// #5581: a forced stop can clear the second authority check yet lose the
+				// endpoint before `session.close` reaches the broker, so the close throws
+				// a stale/absent code. The deletion is already admitted as remote_started
+				// but never proven closed, leaving the indexed row holding its worktree.
+				// Record the same identity-bound terminal-uncertain claim before surfacing
+				// the unproven close. Only stale/absent codes qualify: a live endpoint
+				// failing transiently must keep its checkout.
+				if (error instanceof SdkClientError && (error.code === "endpoint_stale" || error.code === "not_found"))
+					await releaseStaleWorktreeOnForce();
 				return {
 					ok: false,
 					reason: "close_failed",
