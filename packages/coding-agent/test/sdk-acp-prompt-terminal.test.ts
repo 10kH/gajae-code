@@ -1160,6 +1160,37 @@ test("ACP does not retry a first-turn prompt_failed whose terminal carries final
 	}
 });
 
+test("ACP retries a first-turn prompt_failed whose terminal carries only whitespace final text (review P2)", async () => {
+	const fixture = await createFixture();
+	try {
+		const pending = prompt(fixture, "first turn carries whitespace final text then recovers");
+		void pending.catch(() => undefined);
+		await bounded(fixture.promptDelivered, "first prompt delivery");
+		// The retry veto and prompt reconciliation must share trimmed presence semantics:
+		// whitespace carries no assistant content and is already treated as missing there.
+		fixture.sendTerminal({
+			type: "agent_start",
+			sessionId: "prompt-terminal-session",
+			commandId: "prompt-terminal-command",
+			turnId: "prompt-terminal-turn",
+		});
+		const idleBefore = idlePhaseUpdates(fixture.updates);
+		fixture.sendReadinessFailure("   \n  ");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "first-turn retry delivery");
+		// The failed terminal publishes its idle phase on `decorationStart` — the very tail a
+		// final-text publication would occupy — so waiting for that idle update orders the assertion
+		// strictly after any whitespace chunk would have been emitted. Without this wait the check
+		// could pass simply because the async tail had not run yet.
+		await waitFor(() => idlePhaseUpdates(fixture.updates) > idleBefore, "failed-terminal idle phase");
+		expect(fixture.updates.filter(update => update.update.sessionUpdate === "agent_message_chunk")).toHaveLength(0);
+		fixture.sendStopped("end_turn");
+		expect(await bounded(pending, "whitespace final-text retry recovery")).toEqual({ stopReason: "end_turn" });
+		expect(fixture.updates.filter(update => update.update.sessionUpdate === "agent_message_chunk")).toHaveLength(0);
+	} finally {
+		fixture.dispose();
+	}
+});
+
 test("ACP settles the first-turn retry as cancelled when a close tears the session down during the backoff (review P1)", async () => {
 	const fixture = await createFixture({ controlledRetryBackoff: true });
 	try {
