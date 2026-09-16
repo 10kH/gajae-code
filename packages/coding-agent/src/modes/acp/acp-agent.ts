@@ -47,7 +47,7 @@ import {
 	acpMcpLaunchFailure,
 } from "../../sdk/acp";
 import { resolveAcpFinalText } from "../../sdk/acp/final-text";
-import { ACP_MCP_LIFECYCLE_TIMEOUT_MS, type SessionLifecycleMcpServer } from "../../sdk/acp/mcp";
+import type { SessionLifecycleMcpServer } from "../../sdk/acp/mcp";
 import { ensureBroker } from "../../sdk/broker/ensure";
 import { canonicalSessionCwd } from "../../sdk/broker/session-index";
 import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../../sdk/client";
@@ -103,15 +103,38 @@ const MAX_PROMPT_FRAME_BYTES = 256 * 1024;
  */
 const PROMPT_FRAME_ID_PLACEHOLDER = "00000000-0000-4000-8000-000000000000";
 /**
+ * Wall-clock ceiling an external ACP client grants a `session/new` before it
+ * abandons the connection (paseo's daemon uses 60s). gjc must return a
+ * `session.create` response — a launched session or a terminal launch error —
+ * inside this window, or the client reports a dead provider while gjc is still
+ * healthily spawning the host. See issue #5565.
+ */
+export const ACP_EXTERNAL_CONNECT_TIMEOUT_MS = 60_000;
+/**
  * Readiness budget every ACP session launch requests, independent of MCP.
  *
- * Host cold start costs the same whether or not the client declared MCP servers,
- * so leaving the MCP-less path on the broker's 10s default made it the only ACP
- * launch that fails under ordinary concurrency: a second host starting beside the
- * first measurably crosses that deadline, and the broker then reports the launch
- * as `terminal_uncertain`, which an external client surfaces as a dead provider.
+ * Two constraints bound this value:
+ *
+ * 1. Floor — host cold start costs the same whether or not the client declared
+ *    MCP servers, so leaving the MCP-less path on the broker's 10s default made
+ *    it the only ACP launch that failed under ordinary concurrency: a second
+ *    host starting beside the first measurably crosses that deadline, the broker
+ *    reports the launch as `terminal_uncertain`, and an external client surfaces
+ *    a dead provider.
+ * 2. Ceiling — the broker may park a startup in its admission queue for a whole
+ *    readiness budget before the readiness clock even starts, so the ACP adapter
+ *    sizes its client-side wait at `lifecycleStartupBudgetMs(R)` = queue wait +
+ *    readiness = `2·R`, plus caller slack. With R = 30.5s that wait reached ~62s
+ *    — past paseo's 60s connect timeout — so a queued or slow-cold-start launch
+ *    let paseo abandon the connection before gjc could answer `session/new` at
+ *    all (#5565). R must keep `2·R + slack` safely under
+ *    {@link ACP_EXTERNAL_CONNECT_TIMEOUT_MS}.
+ *
+ * 22s satisfies both: comfortably above the ~16s cold starts observed on slow
+ * hosts (and the 10s concurrency floor) while holding the client-side lifecycle
+ * budget near 45s — a ~15s margin under the 60s ceiling.
  */
-const ACP_SESSION_READINESS_TIMEOUT_MS = ACP_MCP_LIFECYCLE_TIMEOUT_MS;
+export const ACP_SESSION_READINESS_TIMEOUT_MS = 22_000;
 
 type JsonObject = Record<string, unknown>;
 interface PromptWaiter {
