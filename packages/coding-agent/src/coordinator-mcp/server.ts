@@ -4457,6 +4457,16 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					const liveTurn = admission.active_turn_id
 						? transaction.canonical.turns[admission.active_turn_id]
 						: undefined;
+					// The Q12 query runs outside this transaction. Re-check the turn that
+					// admission observed so cancellation or terminal reconciliation cannot
+					// make an in-flight empty snapshot look like a healthy running result.
+					if (
+						admission.active_turn_id &&
+						(!liveTurn || TERMINAL_TURN_STATUSES.has(liveTurn.status as TurnStatus))
+					) {
+						q12Admitted = false;
+						return;
+					}
 					// A headless ask opens a durable Q12 gate before the runtime has a
 					// distinct needs_user_input lifecycle marker. Admit that narrow,
 					// observable in-flight state only when the sidecar, active turn, and
@@ -4768,7 +4778,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				},
 				options,
 			);
-			if (!q12Admitted || (liveInFlightCandidate && !liveInFlightAskAdmitted))
+			// A complete empty Q12 snapshot proves no pending gate at this revision,
+			// even while an authenticated, acknowledged turn is still running.
+			// Nonempty snapshots still require an admitted ask; all writer, waiting
+			// token and terminal fences above remain authoritative.
+			if (!q12Admitted || (liveInFlightCandidate && items.length > 0 && !liveInFlightAskAdmitted))
 				return {
 					ok: true,
 					schema_version: 1,
