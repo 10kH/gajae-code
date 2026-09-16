@@ -3450,7 +3450,7 @@ export class AcpAgent implements Agent {
 				);
 				return;
 			}
-// When a client cancel has been requested, a trailing stopped terminal may
+			// When a client cancel has been requested, a trailing stopped terminal may
 			// still carry the normal `end_turn` reason (the model finished its response as
 			// the cancel arrived mid-stream, or the cancel was processed before the prompt
 			// was acknowledged). The client's cancellation is the authoritative cause;

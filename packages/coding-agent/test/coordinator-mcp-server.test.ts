@@ -7212,7 +7212,12 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		// state that projection-only removal would orphan.
 		const beforeSeed = await readSessionTransaction(paths, "orphan-session");
 		expect(beforeSeed).not.toBeNull();
-		await injectPendingDeliveryForTest(server, "orphan-session", "orphan-retained-1", (beforeSeed?.revision ?? 1) + 1);
+		await injectPendingDeliveryForTest(
+			server,
+			"orphan-session",
+			"orphan-retained-1",
+			(beforeSeed?.revision ?? 1) + 1,
+		);
 
 		// Make the session idle + ephemeral so the reaper selects it. Keep the
 		// projection's applied revisions ahead of the WAL revision so projection
