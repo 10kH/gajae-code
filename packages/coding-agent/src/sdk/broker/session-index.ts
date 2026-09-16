@@ -142,6 +142,13 @@ export interface SessionIndexEvent {
 	endpointFileId?: string;
 	lifecycleRequestId?: string;
 	terminalUncertain?: boolean;
+	/**
+	 * Distinguishes the terminal-uncertain claim written by a forced stop of a
+	 * stale-endpoint session from the one written by the fail-closed tail of an
+	 * ordinary teardown. Only the forced claim releases the session's worktree;
+	 * see `worktreeOccupant`.
+	 */
+	forcedStaleRelease?: boolean;
 	/** OS process incarnation (C1); absent on legacy v1/v2 events. */
 	hostIncarnation?: string;
 	/** Present on host_heartbeat checkpoints (C2). */
@@ -164,6 +171,8 @@ export interface IndexedSession {
 	indexSeq: number;
 	lifecycleRequestId?: string;
 	terminalUncertain?: boolean;
+	/** True only for a terminal-uncertain claim written by a forced stale-worktree release. */
+	forcedStaleRelease?: boolean;
 	hostIncarnation?: string;
 	identityProvenance: SessionIdentityProvenance;
 	activity?: SessionActivity;
@@ -598,6 +607,7 @@ function projectIdentity(
 		endpointFileId: latest.endpointFileId,
 		lifecycleRequestId: latest.lifecycleRequestId,
 		terminalUncertain,
+		...(latest.forcedStaleRelease === true ? { forcedStaleRelease: true } : {}),
 		indexSeq: latest.indexSeq,
 		hostIncarnation: latest.hostIncarnation,
 		masterRole: latest.masterRole,

@@ -3526,6 +3526,70 @@ async function recordTerminalUncertain(
 		});
 }
 
+/**
+ * Release the worktree held by a forced stop of a stale-endpoint session, bound to
+ * the exact stale identity the caller already validated against the requested close
+ * authority. A successor incarnation can re-register under this session id in the
+ * window between that authority check and this claim, so refresh once and append a
+ * terminal-uncertain marker ONLY when the current row is still that captured
+ * identity and its owning process is not observably alive. A rotated successor no
+ * longer matches, so it is left untouched and nothing is released — the strict
+ * "uncertain counts as occupied" rule keeps protecting it.
+ *
+ * Unlike `recordTerminalUncertain`, the compare and the append share one refresh
+ * boundary and the marker is keyed to the captured generation/pid/incarnation
+ * rather than to whatever row a second refresh happens to read. A successor that
+ * rotates in while the append is in flight therefore cannot be marked terminal:
+ * the claim targets the old generation, whose row never outranks the successor's
+ * higher generation in the projection (#5581).
+ */
+async function releaseForcedStaleWorktree(broker: Broker, id: string, expected: IndexedSession): Promise<void> {
+	await broker.index.refresh();
+	const current = broker.index.listSessions().sessions.find(session => session.sessionId === id);
+	if (
+		!current ||
+		current.endpointGeneration !== expected.endpointGeneration ||
+		current.pid !== expected.pid ||
+		(current.hostIncarnation ?? current.processIncarnation) !==
+			(expected.hostIncarnation ?? expected.processIncarnation)
+	)
+		return;
+	// For a force-stopped stale-endpoint session, release the worktree unless the
+	// owning process is provably alive. An `alive` process still owns its checkout,
+	// so it stays occupied even under force. Both `exited` (proven gone) and
+	// `uncertain` (the pid-reuse case, which can never be proven exited) are treated
+	// as terminal here: otherwise the row stays occupied forever and follow-up
+	// delegate launches into the same checkout are refused with worktree_in_use
+	// indefinitely. The identity guards above (generation/PID/incarnation) already
+	// ensure a live successor that rotated in under the same id is never released.
+	const observation = observeProcess(current.pid, current.hostIncarnation ?? current.processIncarnation, value =>
+		processIncarnationForBroker(broker, value),
+	);
+	if (observation === "alive") return;
+	if (observation === "uncertain")
+		logger.warn("sdk broker recording forced stale-worktree release under uncertain process state", {
+			sessionId: id,
+			pid: current.pid,
+			endpointGeneration: current.endpointGeneration,
+		});
+	await broker.index.append({
+		type: "lifecycle_terminal",
+		sessionId: id,
+		locator: current.locator,
+		endpointGeneration: current.endpointGeneration,
+		pid: current.pid,
+		...(current.processIncarnation === undefined ? {} : { processIncarnation: current.processIncarnation }),
+		...(current.hostIncarnation === undefined ? {} : { hostIncarnation: current.hostIncarnation }),
+		...(current.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: current.endpointMtimeMs }),
+		...(current.lifecycleRequestId === undefined ? {} : { lifecycleRequestId: current.lifecycleRequestId }),
+		terminalUncertain: true,
+		// Marks this claim as the forced release, which is the only terminal-uncertain
+		// claim that frees the worktree. The fail-closed teardown tail writes
+		// `terminalUncertain` without it and keeps its checkout (see `worktreeOccupant`).
+		forcedStaleRelease: true,
+	});
+}
+
 async function waitUntil(timing: LifecycleTiming, deadline: number): Promise<void> {
 	while (timing.now() < deadline) await timing.sleep(Math.max(0, Math.min(POLL_MS, deadline - timing.now())));
 }
@@ -4227,6 +4291,15 @@ export function worktreeOccupantForTest(
 	observe: (pid: number, expectedIncarnation: string | undefined) => ProcessObservation = observeProcess,
 ): string | null {
 	return worktreeOccupant(sessions, worktreePath, observe);
+}
+
+/** Test seam for the forced stale-worktree release boundary. */
+export async function releaseForcedStaleWorktreeForTest(
+	broker: Broker,
+	id: string,
+	expected: IndexedSession,
+): Promise<void> {
+	await releaseForcedStaleWorktree(broker, id, expected);
 }
 
 async function preparePlannedWorktree(
@@ -5541,6 +5614,14 @@ async function executeLifecycleResponse(
 	let record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
 	if (operation === "session.close") {
 		if (!record) return fail("not_found", "session is not indexed");
+		// A forced stop of a session whose endpoint is already stale (its coordinator
+		// service went away mid-run) cannot reach the runtime to prove teardown. The
+		// caller has explicitly requested force, so when the endpoint proves stale
+		// below and the owning process is no longer observably alive, record a
+		// terminal-uncertain claim before surfacing endpoint_stale — otherwise the
+		// row keeps holding its worktree forever, since an OS probe of a reused pid
+		// returns `uncertain` and never `exited` (#5581).
+		const forceReleaseStaleWorktree = input.forceReleaseStaleWorktree === true;
 		if (record.terminalUncertain)
 			return fail("terminal_uncertain", "Session ownership is uncertain and cannot be closed safely.");
 		if (!isSessionAuthorityEligible(record))
@@ -5585,7 +5666,26 @@ async function executeLifecycleResponse(
 			}
 		}
 		if (!endpointResult.ok) {
-			if (endpointResult.error.code === "endpoint_stale") return endpointResult;
+			if (endpointResult.error.code === "endpoint_stale") {
+				// `record` matched the requested close authority above, so it is the exact
+				// stale identity the forced stop targeted — never a live successor, which
+				// would have failed that authority check. Release its worktree bound to
+				// that identity so a rotated successor is left untouched (#5581).
+				// Best-effort: the endpoint_stale outcome is already proven and must be
+				// returned. A release failure (index/broker write error) must not mask it;
+				// the stale-endpoint recovery paths retry the release later.
+				if (forceReleaseStaleWorktree) {
+					try {
+						await releaseForcedStaleWorktree(broker, id, record);
+					} catch (error) {
+						logger.warn("sdk broker forced stale-worktree release failed; returning endpoint_stale", {
+							sessionId: id,
+							error: String(error),
+						});
+					}
+				}
+				return endpointResult;
+			}
 			if (endpointResult.error.code !== "resource_gone") return endpointResult;
 			usedSignalFallback = true;
 		} else {
