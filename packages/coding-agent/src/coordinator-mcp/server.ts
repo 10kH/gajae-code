@@ -140,6 +140,7 @@ import {
 	reconcileCreationRemoteVerifier,
 	recordCreationRetirementBrokerProof,
 	recordCreationRetirementIntent,
+	recordDeletionIntent,
 	recoverExpiredPublicDelivery,
 	releasePublicDeliveryClaim,
 	removeSessionTransaction,
@@ -6381,6 +6382,164 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		});
 	}
 
+	/**
+	 * Prove a stored endpoint identity (workspace + generation + incarnation) is no
+	 * longer current against the live broker index. Returns true only when the
+	 * broker row is absent (not_found) or its generation/incarnation/workspace has
+	 * rotated away from the stored triple. A transient authority-read failure
+	 * returns false: we cannot prove the endpoint recovered, but we also must not
+	 * force-evict on a flake — the normal reap path will retry.
+	 */
+	async function brokerEndpointIdentityStale(
+		id: string,
+		persistedWorkspace: string,
+		persistedGeneration: number,
+		persistedIncarnation: string,
+	): Promise<boolean> {
+		try {
+			const workspace = await canonicalBrokerWorkspace(persistedWorkspace);
+			const authority = await exactBrokerSessionAuthority(id, workspace);
+			return (
+				!sameCanonicalPath(authority.workspace, persistedWorkspace, platform) ||
+				authority.endpointGeneration !== persistedGeneration ||
+				authority.endpointIncarnation !== persistedIncarnation
+			);
+		} catch (error) {
+			if (error instanceof SdkClientError && (error.code === "not_found" || error.code === "endpoint_stale"))
+				return true;
+			return false;
+		}
+	}
+
+	/**
+	 * True when the session's endpoint authority can no longer be proven current.
+	 * Mirrors the reap preflight so force eviction only fires against a genuinely
+	 * stale endpoint. When the projection carries a full endpoint identity we prove
+	 * staleness against it directly. When the projection identity is missing/corrupt
+	 * (or the projection is absent), an absent field is NOT itself proof of a stale
+	 * endpoint: a partial write can drop `endpoint_incarnation` while the broker
+	 * session is still live. We therefore recover the canonical WAL's own broker
+	 * identity and prove absence/mismatch against that authority instead. If neither
+	 * the projection nor the WAL yields a usable identity, we return false and leave
+	 * the state for the safe repair path rather than destructively evicting a
+	 * possibly-live session.
+	 */
+	async function isSessionEndpointStale(session: Record<string, unknown> | null, id: string): Promise<boolean> {
+		const persistedWorkspace = optionalString(session?.broker_workspace);
+		const persistedGeneration =
+			typeof session?.endpoint_generation === "number" &&
+			Number.isSafeInteger(session.endpoint_generation) &&
+			session.endpoint_generation > 0
+				? session.endpoint_generation
+				: null;
+		const persistedIncarnation = optionalString(session?.endpoint_incarnation);
+		if (persistedWorkspace && persistedGeneration !== null && persistedIncarnation)
+			return await brokerEndpointIdentityStale(id, persistedWorkspace, persistedGeneration, persistedIncarnation);
+		// Projection identity is missing — fall back to the canonical WAL authority.
+		const canonicalTransaction = await readSessionTransaction(questionPaths, id);
+		const broker = canonicalTransaction?.canonical.session.broker;
+		const walWorkspace = optionalString(broker?.workspace);
+		const walGeneration =
+			typeof broker?.endpoint_generation === "number" &&
+			Number.isSafeInteger(broker.endpoint_generation) &&
+			broker.endpoint_generation > 0
+				? broker.endpoint_generation
+				: null;
+		const walIncarnation = optionalString(broker?.endpoint_incarnation);
+		if (!walWorkspace || walGeneration === null || !walIncarnation) return false;
+		return await brokerEndpointIdentityStale(id, walWorkspace, walGeneration, walIncarnation);
+	}
+
+	/**
+	 * Confirm no turn is active for the session, reading the durable authority
+	 * (canonical WAL) and the legacy active-turn projection. `listSessions`
+	 * captures reap candidates before the per-session transition lock is held, so
+	 * a turn can begin in the gap before eviction — this must be re-checked under
+	 * the lock immediately before any irreversible removal.
+	 */
+	async function sessionHasActiveTurn(id: string): Promise<boolean> {
+		const canonicalTransaction = await readSessionTransaction(questionPaths, id);
+		const canonicalActiveTurn = canonicalTransaction
+			? Object.values(canonicalTransaction.canonical.turns).some(turn =>
+					ACTIVE_TURN_STATUSES.has(turn.status as TurnStatus),
+				)
+			: false;
+		return canonicalActiveTurn || (await readActiveTurn(namespaceDir, id)) !== null;
+	}
+
+	/**
+	 * Recovery-safe force eviction for a session whose endpoint is stale. A stale
+	 * endpoint has no live broker to close against, but the session's durable
+	 * footprint must not be orphaned: removing only the projection rows would leak
+	 * the canonical WAL, retained public-delivery claims, and the scheduler/index
+	 * registry hints. We instead write a durable deletion (retirement) record and
+	 * run the same cleanup the normal reap path uses — drain retained deliveries,
+	 * remove the WAL (which also deregisters roster/retained scheduler hints),
+	 * remove projections, and emit the reaped event. If any step cannot finish yet
+	 * the record stays in `cleanup_pending`, so a subsequent reapSession() for this
+	 * id (selected by session_id, not deletion_id) resumes and completes it.
+	 */
+	async function forceEvictStaleSession(sessionId: string): Promise<void> {
+		await ensureQuestionStateReady();
+		// Recover the session by id from the canonical WAL — not just the projection.
+		// A crash/partial-write, or a malformed/legacy projection, can leave canonical
+		// state committed while the projection has lost its endpoint_incarnation.
+		// Keying force eviction off the projection alone would then retire only the
+		// projection files and orphan the WAL, retained public-delivery claims,
+		// registry (roster/retained) hints, and scheduler markers indefinitely: after
+		// three stale sweeps the projection disappears and the normal
+		// deletion-intent/completeDeletionCleanup path can no longer select the id.
+		const canonicalTransaction = await readSessionTransaction(questionPaths, sessionId);
+		if (!canonicalTransaction) {
+			// Canonical state confirmed absent (this also covers the malformed/absent
+			// projection case): the only durable footprint left is the projection, so
+			// best-effort projection removal is all that remains.
+			await removeReapedProjection(sessionId, [], []);
+			return;
+		}
+		// Endpoint authority for the durable retirement comes from the canonical WAL,
+		// never the projection: removeSessionTransaction fences the delete on
+		// `canonicalTransaction.endpoint.incarnation`, so a present-but-stale
+		// projection incarnation would make cleanup fail with endpoint_stale and
+		// orphan the WAL, retained deliveries, and registry state. Using the WAL's
+		// own incarnation guarantees the fence matches.
+		const persistedIncarnation = optionalString(canonicalTransaction.endpoint?.incarnation);
+		if (!persistedIncarnation) {
+			// The WAL exists but never observed an endpoint incarnation, so there is
+			// no authority to fence a durable retirement against. Leave the state for
+			// the normal reap path rather than orphaning the WAL with a
+			// projection-only delete.
+			return;
+		}
+		const deletionId = `force-evict:${sessionId}:${persistedIncarnation}`;
+		const deletionKey = createHash("sha256").update(deletionId).digest("hex");
+		const now = new Date().toISOString();
+		const entry: NamespaceDeletionEntryV1 = {
+			deletion_id: deletionId,
+			session_id: sessionId,
+			endpoint_incarnation: persistedIncarnation,
+			operation_id: deletionId,
+			key_digest: deletionKey,
+			request_digest: deletionKey,
+			close_key: deletionId,
+			phase: "cleanup_pending",
+			cleanup: {
+				wal: false,
+				turns: false,
+				reports: false,
+				session: false,
+				events: false,
+				turn_ids: canonicalTransaction ? Object.keys(canonicalTransaction.canonical.turns) : [],
+				report_ids: canonicalTransaction ? Object.keys(canonicalTransaction.canonical.reports) : [],
+			},
+			authority_digest: deletionKey,
+			created_at: now,
+			updated_at: now,
+		};
+		await recordDeletionIntent(questionPaths, entry);
+		await completeDeletionCleanup(entry, "idle_reaper_force_evict", true);
+	}
+
 	const sessionReaper: SessionReaper = createSessionReaper(
 		{
 			listSessions: async (): Promise<ReapableSession[]> => {
@@ -6430,6 +6589,23 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			reapSession: async (sessionId: string): Promise<void> => {
 				const result = await reapSession(sessionId, { reason: "idle_reaper" });
 				if (!result.ok) throw new Error(result.reason ?? "session_reap_failed");
+			},
+			markSessionDead: async (sessionId: string): Promise<void> => {
+				// Force-evict a session that cannot be reaped normally (endpoint_stale
+				// repeated MAX_REAP_FAILURES times). The candidate was selected before
+				// this transition acquired its per-session lock, so revalidate the
+				// durable authority under the lock: a turn may have started, or the
+				// endpoint may have recovered, since listSessions() ran.
+				await withSessionTransition(sessionId, async () => {
+					if (await sessionHasActiveTurn(sessionId)) return;
+					const session = asRecord(await readJsonFile(sessionFile(sessionId)));
+					// Prove endpoint staleness before any destructive eviction, even when the
+					// projection is absent: isSessionEndpointStale falls back to the canonical
+					// WAL authority to confirm broker absence/mismatch, so a missing or
+					// partially-written projection can no longer force-evict a live broker.
+					if (!(await isSessionEndpointStale(session, sessionId))) return;
+					await forceEvictStaleSession(sessionId);
+				});
 			},
 			now: () => Date.now(),
 		},
