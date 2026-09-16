@@ -5169,6 +5169,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	api.on("tool_execution_start", async (_event, ctx) => {
 		renewAttributableProgress("tool_execution_start", ctx);
 	});
+	api.on("tool_execution_update", async (_event, ctx) => {
+		renewAttributableProgress("tool_execution_update", ctx);
+	});
 	api.on("tool_execution_end", async (_event, ctx) => {
 		renewAttributableProgress("tool_execution_end", ctx);
 	});

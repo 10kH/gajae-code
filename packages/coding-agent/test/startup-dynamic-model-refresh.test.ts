@@ -1,6 +1,6 @@
 import { describe, expect, test, vi } from "bun:test";
 import * as path from "node:path";
-import { PROVIDER_DESCRIPTORS, type Model } from "@gajae-code/ai";
+import { type Model, PROVIDER_DESCRIPTORS } from "@gajae-code/ai";
 import { TempDir } from "@gajae-code/utils";
 import { ModelRegistry } from "../src/config/model-registry";
 import {
