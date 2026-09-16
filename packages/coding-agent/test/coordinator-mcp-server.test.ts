@@ -3914,6 +3914,131 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		).toMatchObject({ ok: false, error: { code: "idempotency_conflict" } });
 	});
 
+	it("admits a complete empty Q12 snapshot for an authenticated running turn", async () => {
+		const root = await tempRoot();
+		const queries: string[] = [];
+		const server = await createSdkControlServer(root, [], queries, () => ({
+			ok: true,
+			page: { items: [], complete: true, revision: "1" },
+		}));
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "continue working",
+			idempotency_key: "empty-live-q12",
+			allow_mutation: true,
+		});
+		await patchSessionState(server, root, "visible-session", {
+			state: "running",
+			ready_for_input: false,
+			current_turn_id: sent.turn_id,
+			last_turn_id: sent.turn_id,
+			source: "agent_session_event",
+			live: true,
+		});
+		await expect(
+			server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" }),
+		).resolves.toMatchObject({
+			ok: true,
+			questions: [],
+			diagnostics: [],
+			reconciliation: { attempted: true, complete: true, revision: "1", reason: null },
+		});
+		expect(queries).toContain("Q12");
+		await expect(
+			server.callTool("gjc_coordinator_read_turn", { session_id: "visible-session", turn_id: sent.turn_id }),
+		).resolves.toMatchObject({
+			turn: { status: "active" },
+		});
+	});
+
+	it("does not admit an empty Q12 snapshot when cancellation races the query", async () => {
+		const root = await tempRoot();
+		const queryStarted = Promise.withResolvers<void>();
+		const releaseQuery = Promise.withResolvers<void>();
+		const server = await createSdkControlServer(root, [], [], async () => {
+			queryStarted.resolve();
+			await releaseQuery.promise;
+			return { ok: true, page: { items: [], complete: true, revision: "empty-after-cancel" } };
+		});
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "empty cancellation race",
+			idempotency_key: "empty-cancel-race-prompt",
+			allow_mutation: true,
+		});
+		await patchSessionState(server, root, "visible-session", {
+			state: "running",
+			ready_for_input: false,
+			current_turn_id: sent.turn_id,
+			last_turn_id: sent.turn_id,
+			source: "agent_session_event",
+			live: true,
+		});
+
+		const listed = server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
+		await queryStarted.promise;
+		await expect(
+			server.callTool("gjc_coordinator_report_status", {
+				session_id: "visible-session",
+				turn_id: sent.turn_id,
+				status: "cancelled",
+				summary: "cancelled while Q12 was in flight",
+				idempotency_key: "empty-cancel-race-report",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true, turn: { status: "cancelled" } });
+		releaseQuery.resolve();
+		await expect(listed).resolves.toMatchObject({
+			questions: [],
+			reconciliation: { attempted: false, complete: false, reason: "terminal_uncertain" },
+		});
+		await expect(
+			server.callTool("gjc_coordinator_read_turn", { session_id: "visible-session", turn_id: sent.turn_id }),
+		).resolves.toMatchObject({ turn: { status: "cancelled" } });
+	});
+
+	it.each([
+		["stale writer receipt", { stripWriterIdentity: true, currentTurnId: null }],
+		["replayed turn association", { stripWriterIdentity: false, currentTurnId: "replayed-turn" }],
+	] as const)("keeps an empty Q12 snapshot fail-closed for a %s", async (_name, mutation) => {
+		const root = await tempRoot();
+		const server = await createSdkControlServer(root, [], [], () => ({
+			ok: true,
+			page: { items: [], complete: true, revision: "empty-stale-or-replay" },
+		}));
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "empty stale or replay control",
+			idempotency_key: `empty-${mutation.stripWriterIdentity ? "stale" : "replay"}`,
+			allow_mutation: true,
+		});
+		await patchSessionState(server, root, "visible-session", {
+			state: "running",
+			ready_for_input: false,
+			current_turn_id: mutation.currentTurnId ?? sent.turn_id,
+			last_turn_id: sent.turn_id,
+			source: "agent_session_event",
+			live: true,
+		});
+		if (mutation.stripWriterIdentity) {
+			const stateFile = coordinatorSessionStatePath(root, "visible-session");
+			const state = JSON.parse(await fs.readFile(stateFile, "utf8")) as Record<string, unknown>;
+			delete state.sidecar_key_id;
+			delete state.sidecar_signature;
+			await fs.writeFile(stateFile, JSON.stringify(state));
+		}
+
+		await expect(
+			server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" }),
+		).resolves.toMatchObject({
+			questions: [],
+			reconciliation: { attempted: false, complete: false, reason: "terminal_uncertain" },
+		});
+	});
+
 	it("admits a live ask while the agent-session sidecar is still running", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
@@ -4003,7 +4128,10 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		});
 	});
 
-	it("does not admit a forged live running sidecar without exact writer identity", async () => {
+	it.each([
+		false,
+		true,
+	])("does not admit a forged live running sidecar without exact writer identity (empty=%s)", async empty => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
 		let runtimeTurnId = "unbound";
@@ -4012,7 +4140,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 				? {
 						ok: true,
 						page: {
-							items: [sharedAskGate("forged-live-ask", runtimeTurnId)],
+							items: empty ? [] : [sharedAskGate("forged-live-ask", runtimeTurnId)],
 							complete: true,
 							revision: "forged-live-ask",
 						},
@@ -4198,7 +4326,10 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		expect(controls.filter(control => control.operation === "workflow.gate_answer")).toHaveLength(0);
 	});
 
-	it("keeps an uncertain terminal boundary fail-closed despite a pending gate row", async () => {
+	it.each([
+		false,
+		true,
+	])("keeps an uncertain terminal boundary fail-closed despite a Q12 snapshot (empty=%s)", async empty => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
 		let runtimeTurnId = "unbound";
@@ -4207,7 +4338,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 				? {
 						ok: true,
 						page: {
-							items: [sharedAskGate("uncertain-terminal-ask", runtimeTurnId)],
+							items: empty ? [] : [sharedAskGate("uncertain-terminal-ask", runtimeTurnId)],
 							complete: true,
 							revision: "uncertain-terminal",
 						},
