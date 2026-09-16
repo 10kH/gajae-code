@@ -1267,7 +1267,7 @@ describe("bash scanner quoting model", () => {
 			'echo "harmless -> prose" > src/product.ts',
 			'echo "a > b" > src/product.ts && echo "c -> d"',
 			'echo "metric -> value" | tee src/product.ts',
-			'echo "he said \\\"hi\\\"" > src/product.ts',
+			'echo "he said \\"hi\\"" > src/product.ts',
 			"echo pwned > src/product.ts",
 			"rm -rf src/product.ts",
 		]) {
