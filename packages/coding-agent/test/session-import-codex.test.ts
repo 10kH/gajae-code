@@ -836,4 +836,37 @@ describe.skipIf(process.platform !== "linux")("Codex session import", () => {
 			expect(value).toContain(input.slice(0, input.indexOf("://") + 3));
 		}
 	});
+	it("recognizes the same credential shapes as the sibling import scrubber", () => {
+		// `session-import/redact.ts` reads the same class of external transcript and
+		// already covers all of these. This importer's SECRET_VALUE listed only
+		// `ghp_` of the five GitHub prefixes and only `AKIA` of the four AWS
+		// access-key id prefixes, and knew none of the vendor shapes
+		// `crash/upstream/envelope.ts` refuses to transmit. Fixtures are assembled
+		// at runtime so no literal of this shape is committed.
+		const cases = {
+			githubOauth: ["gho", "a".repeat(36)].join("_"),
+			githubServer: ["ghs", "b".repeat(36)].join("_"),
+			githubUser: ["ghu", "c".repeat(36)].join("_"),
+			githubRefresh: ["ghr", "d".repeat(36)].join("_"),
+			awsTemporary: "ASIAIOSFODNN7EXAMPLE",
+			awsBearer: "ABIAIOSFODNN7EXAMPLE",
+			awsContext: "ACCAIOSFODNN7EXAMPLE",
+			google: `AIza${"S".repeat(35)}`,
+			slack: ["xoxb", "0".repeat(11), "0".repeat(11), "abcdefghijklmnop"].join("-"),
+			npm: ["npm", "e".repeat(36)].join("_"),
+			gitlab: ["glpat", "f".repeat(24)].join("-"),
+			huggingface: ["hf", "g".repeat(34)].join("_"),
+		};
+		for (const value of Object.values(cases)) {
+			const { value: out } = sanitizeImportedString(`observed ${value} in the transcript`);
+			expect(out).not.toContain(value);
+			expect(out).toContain("observed");
+		}
+	});
+
+	it("keeps credential prefix lookalikes that are too short to be tokens", () => {
+		for (const benign of ["npm install express", "the hf_ prefix", "glpat-short", "ghp_short"]) {
+			expect(sanitizeImportedString(benign)).toEqual({ value: benign, redacted: 0 });
+		}
+	});
 });
