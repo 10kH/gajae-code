@@ -534,6 +534,14 @@ function rewriteBindingsProviders(
 		),
 	};
 }
+export function isModelProfileProxyConfigured(
+	provider: string,
+	configuredProviders: readonly string[] | undefined,
+	credentialless: boolean,
+): boolean {
+	return configuredProviders?.includes(provider) === true || (provider === "opencodex" && credentialless);
+}
+
 /**
  * Resolve the explicitly configured OpenAI-compatible proxy provider id for a
  * preset. Returns undefined when unset or empty. Passwords/labels are never
@@ -620,9 +628,13 @@ export function rewriteSelectorForProxy(
 	const baseSelector = suffix.selector;
 	const slash = baseSelector.indexOf("/");
 	const proxyModels = allModels.filter(model => model.provider === proxyProvider);
+	const matchingProxyModels = (id: string): Model<Api>[] => {
+		const publicMatches = proxyModels.filter(model => model.id === id);
+		return publicMatches.length > 0 ? publicMatches : proxyModels.filter(model => model.wireModelId === id);
+	};
 	if (slash < 0) {
 		if (proxyMode === "fallback") return selector;
-		const exactMatches = proxyModels.filter(model => model.id === baseSelector);
+		const exactMatches = matchingProxyModels(baseSelector);
 		const finalSegmentMatches = proxyModels.filter(model => model.id.split("/").at(-1) === baseSelector);
 		const matches = exactMatches.length > 0 ? exactMatches : finalSegmentMatches;
 		if (matches.length !== 1) {
@@ -640,8 +652,8 @@ export function rewriteSelectorForProxy(
 		throw new Error(`Configured proxy "${proxyProvider}" cannot route its own direct selector "${baseSelector}"`);
 	}
 	const directModelId = baseSelector.substring(slash + 1);
-	const exactMatches = proxyModels.filter(model => model.id === `${directProvider}/${directModelId}`);
-	const flatMatches = proxyModels.filter(model => model.id === directModelId);
+	const exactMatches = matchingProxyModels(`${directProvider}/${directModelId}`);
+	const flatMatches = matchingProxyModels(directModelId);
 	const matches = exactMatches.length > 0 ? exactMatches : flatMatches;
 	if (matches.length === 0) {
 		throw new Error(`Configured proxy "${proxyProvider}" does not expose a model for "${baseSelector}"`);
@@ -995,18 +1007,18 @@ export async function prepareModelProfileActivation(
 		if (proxyMode === "always" && proxyProvider === undefined) {
 			throw new Error('modelProfile.proxyMode "always" requires modelProfile.proxyProvider');
 		}
+		const proxyApiKey =
+			proxyProvider === undefined
+				? undefined
+				: await options.modelRegistry.getApiKeyForProvider(proxyProvider, credentialSessionId);
 		if (proxyProvider !== undefined) {
 			const configuredProxyProviders = options.modelRegistry.getConfiguredProviderIds?.();
-			if (!configuredProxyProviders?.includes(proxyProvider)) {
+			if (!isModelProfileProxyConfigured(proxyProvider, configuredProxyProviders, proxyApiKey === kNoAuth)) {
 				throw new Error(
 					`modelProfile.proxyProvider "${proxyProvider}" is not configured. Configure it with \`gjc setup provider\` before activating a preset.`,
 				);
 			}
 		}
-		const proxyApiKey =
-			proxyProvider === undefined
-				? undefined
-				: await options.modelRegistry.getApiKeyForProvider(proxyProvider, credentialSessionId);
 		const proxyAuthenticated =
 			proxyProvider !== undefined &&
 			proxyApiKey !== undefined &&
