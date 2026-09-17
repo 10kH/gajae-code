@@ -94,6 +94,7 @@ function applyTransports(
 	modules: { winston: WinstonModule; DailyRotateFile: DailyRotateFileCtor },
 ): void {
 	logger.clear();
+	logger.silent = !transportOptions.console && !transportOptions.file;
 	if (transportOptions.file) {
 		logger.add(
 			makeFileTransport(
