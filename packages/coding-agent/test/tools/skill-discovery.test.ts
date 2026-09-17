@@ -446,15 +446,38 @@ describe("SkillDiscoveryTool", () => {
 
 		expect(filtered.details?.notice).toContain("conjunctive substring");
 
-		// Fully enabled policy with no candidates and scan diagnostics: the notice
-		// explains that observed entries were skipped or filtered.
-		const emptyCwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-skills-notice-empty-"));
-		const genuine = await new SkillDiscoveryTool(createSession(emptyCwd, { settings: enabled })).execute("call", {
+		// Genuine emptiness stays silent: an explicit user-scope request in an
+		// empty environment excludes the bundled workflow skills (they are
+		// neither project nor user scope), scans nothing, and produces no
+		// diagnostics, so there is nothing to explain. This is the one case the
+		// tool prompt defines as "no skills in the searched scopes".
+		// The home is pinned to an empty directory: the developer's real
+		// ~/.claude/skills would otherwise contribute convention-import
+		// diagnostics and make this case pass or fail per machine.
+		const emptyRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-skills-notice-empty-"));
+		const emptyCwd = path.join(emptyRoot, "cwd");
+		const emptyHome = path.join(emptyRoot, "home");
+		await fs.mkdir(emptyCwd);
+		await fs.mkdir(emptyHome);
+		const genuine = await new SkillDiscoveryTool(
+			createSession(emptyCwd, { settings: enabled, home: emptyHome }),
+		).execute("call", {
 			query: "no-such-skill-anywhere",
 			source: "user",
 		});
 		expect(genuine.details?.candidates).toEqual([]);
-		expect(genuine.details?.notice).toBeString();
+		expect(genuine.details?.notice).toBeUndefined();
+
+		// The same empty environment under source "all" is NOT genuine emptiness:
+		// the bundled workflow skills are always scanned, so the query filter is
+		// what emptied the result and the notice must say so.
+		const genuineAll = await new SkillDiscoveryTool(
+			createSession(emptyCwd, { settings: enabled, home: emptyHome }),
+		).execute("call", {
+			query: "no-such-skill-anywhere",
+		});
+		expect(genuineAll.details?.candidates).toEqual([]);
+		expect(genuineAll.details?.notice).toContain("No skill matched every query term (4 skills scanned)");
 
 		// Found results never carry a notice.
 		const found = await new SkillDiscoveryTool(createSession(cwd, { settings: enabled })).execute("call", {
