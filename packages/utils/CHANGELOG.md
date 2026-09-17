@@ -1,6 +1,11 @@
 # Changelog
 
 ## [Unreleased]
+
+## [0.17.1] - 2026-09-17
+
+## [0.17.0] - 2026-09-17
+
 ### Changed
 
 - The startup timing tree drops the unused module-load span machinery (`recordModuleLoadSpan` and the `(modules)` summary renderer) that had no producer since the module-timer hook was removed, and any span still open at print time — such as a dispatch span wrapping the very run that prints — now reports elapsed-at-print instead of a misleading `0.00ms`.
@@ -9,6 +14,8 @@
 ### Fixed
 
 - `redactCrashSecrets` now recognizes the five vendor token shapes `crash/upstream/envelope.ts` already classifies as credential-like: npm, GitLab PAT, Stripe live/test keys, and Hugging Face tokens. That classification only guards the Sentry frame fields it wraps; the crash log this module persists and the `gjc crash report` body a user files as a public issue both reach egress through this function alone, so four of the five survived verbatim on both paths. Stripe and Hugging Face separate with `_`, which is why the existing `sk-` rule never matched them.
+
+- Silence Winston when both logger transports are disabled so suppressed records do not leak warnings to stdout or stderr.
 
 ## [0.16.7] - 2026-09-13
 
