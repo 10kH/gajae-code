@@ -1,3 +1,0 @@
-### Fixed
-
-- The `pi-shell` owned-child absence test releases its child handle before asserting that a killed and reaped child observes as positively absent. `std::process::Child` closes the underlying handle only on drop, and Windows keeps a process object — with the creation-time identity `OpenProcess` and `from_pid` both read — alive for as long as any handle to it is open, so holding the child past the reap pinned the exact incarnation the test waits to see disappear and failed the Windows native CI job (`Present { incarnation: "windows:…" }` for the whole 2s poll budget). The assertion still demands a positive `Absent`, so this removes a fixture artifact rather than weakening the observation contract.
