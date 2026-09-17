@@ -44,7 +44,7 @@ import {
 	type SdkStartupRollbackResult,
 	SdkStartupRollbackTracker,
 } from "../sdk/startup-capability";
-import { runSdkServe } from "../sdk/transport/serve-cli";
+import { runSdkServe, SdkServeError } from "../sdk/transport/serve-cli";
 import { isSessionDisposalIncompleteError } from "../session/agent-session";
 import {
 	type CapturedSessionTranscriptSnapshot,
@@ -1157,7 +1157,29 @@ export default class Sdk extends Command {
 			return;
 		}
 		if (action === "serve") {
-			await runSdkServe(this.argv.slice(1));
+			try {
+				await runSdkServe(this.argv.slice(1));
+			} catch (error) {
+				if (!(error instanceof SdkServeError)) throw error;
+				// stdout is the frame channel in --stdio mode, so the envelope goes to
+				// stderr; returning instead of rethrowing is what keeps a session-selection
+				// failure from reaching the embedder as an uncaught exception.
+				process.stderr.write(
+					`${JSON.stringify({
+						ok: false,
+						error: {
+							code: error.code,
+							message: error.message,
+							...(error.details === undefined ? {} : { details: error.details }),
+							// A broker teardown that failed alongside the primary failure is
+							// recorded on the error; dropping it here would hide from the
+							// embedder that the session may not have been released cleanly.
+							...(error.cleanupError === undefined ? {} : { cleanupError: error.cleanupError }),
+						},
+					})}\n`,
+				);
+				process.exitCode = error.exitCode;
+			}
 			return;
 		}
 		if (action !== "broker-internal" && action !== "session-host-internal")
