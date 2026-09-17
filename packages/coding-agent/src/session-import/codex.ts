@@ -28,12 +28,15 @@ const CODEX_SESSION_ID = /^[A-Za-z0-9-]{1,128}$/u;
 // Kept in step with the shape catalogue the sibling importer scrubber carries
 // (`./redact.ts`). Both read the same class of external transcript, so a shape
 // either importer recognizes has to be recognized by the other.
+// Stripe restricted keys use `rk_`, which no other alternative reaches: the
+// generic `sk[-_]` branch covers `sk_live_`/`sk_test_` only because they share
+// the `sk` prefix. The sibling lists `(?:sk|rk)_(?:live|test)_` explicitly.
 const SECRET_VALUE =
-	/(?:Bearer\s+[A-Za-z0-9._~+/=-]{8,}|\b(?:sk[-_]|gh[opsur]_|github_pat_)[A-Za-z0-9_-]{12,}|\b(?:AKIA|ASIA|ABIA|ACCA)[A-Z0-9]{16}\b|\bAIza[0-9A-Za-z_-]{35}\b|\bxox[baprs]-[A-Za-z0-9-]{10,}|\bnpm_[A-Za-z0-9]{20,}\b|\bglpat-[A-Za-z0-9_-]{20,}|\bhf_[A-Za-z0-9]{20,}\b)/giu;
+	/(?:Bearer\s+[A-Za-z0-9._~+/=-]{8,}|\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b|\b(?:sk[-_]|gh[opsur]_|github_pat_)[A-Za-z0-9_-]{12,}|\b(?:AKIA|ASIA|ABIA|ACCA)[A-Z0-9]{16}\b|\bAIza[0-9A-Za-z_-]{35}\b|\bxox[baprs]-[A-Za-z0-9-]{10,}|\bnpm_[A-Za-z0-9]{20,}\b|\bglpat-[A-Za-z0-9_-]{20,}|\bhf_[A-Za-z0-9]{20,}\b)/giu;
 // Cheap pre-check that gates the scan above. It must stay a superset of
 // SECRET_VALUE's prefixes or a widened pattern would never run.
 const SECRET_VALUE_HINT =
-	/(?:Bearer\s|sk[-_]|gh[opsur]_|github_pat_|AKIA|ASIA|ABIA|ACCA|AIza|xox[baprs]-|npm_|glpat-|hf_)/iu;
+	/(?:Bearer\s|sk[-_]|rk_(?:live|test)_|gh[opsur]_|github_pat_|AKIA|ASIA|ABIA|ACCA|AIza|xox[baprs]-|npm_|glpat-|hf_)/iu;
 const JWT_VALUE = /\b[A-Za-z0-9_-]{8,2048}\.[A-Za-z0-9_-]{8,8192}\.[A-Za-z0-9_-]{8,2048}\b/gu;
 const SECRET_ASSIGNMENT =
 	/(\b(?:password|passwd|secret|token|api[-_]?key|access[-_]?key)\b\s*[:=]\s*)(?:"[^"\r\n]{4,4096}"|'[^'\r\n]{4,4096}'|[^\s,;]{4,4096})/giu;
