@@ -1,0 +1,3 @@
+### Fixed
+
+- Codex session import now recognizes the same credential shapes as its sibling import scrubber. `session-import/codex.ts` listed only `ghp_` of the five GitHub token prefixes and only `AKIA` of the four AWS access-key id prefixes, and knew none of the Google, Slack, npm, GitLab, or Hugging Face shapes that `session-import/redact.ts` already covers — reaching a new session transcript verbatim from an imported Codex file. Stripe restricted keys (`rk_live_`/`rk_test_`) are included: the generic `sk` branch reached the secret-key forms only because they share that prefix. The cheap pre-check that gates the scan is widened with it so the added shapes are actually reached.
