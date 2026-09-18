@@ -646,5 +646,14 @@ describe("WorkflowGateBroker", () => {
 		const afterRestart = new WorkflowGateBroker("run-5599", new FileGateStore(file), { advance: () => {} });
 		expect(afterRestart.listPendingGates()).toEqual([]);
 		expect(new FileGateStore(file).get(gate.gate_id)).toMatchObject({ status: "accepted", advanced: true });
+
+		// 4. And the downgrade must survive a restart. The loss cannot be persisted
+		//    (an `accepted` record may not carry a `lifecycle`; a `quarantined` one
+		//    must be `advanced:false`), and the in-memory set is empty in the new
+		//    runtime — so without the prior-runtime check this returned `completed`
+		//    again and handed back the same false success on a cross-restart
+		//    idempotent retry. Asserting it here is what makes the fix durable
+		//    rather than same-process only (#5599 review).
+		expect(afterRestart.lookupCompletedResolution(response).kind).toBe("accepted_incomplete");
 	});
 });

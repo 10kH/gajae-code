@@ -1300,9 +1300,24 @@ export class WorkflowGateBroker {
 			//
 			// Downgrading to `accepted_incomplete` routes it through the existing
 			// recover-then-recheck branch and, when that cannot resolve it, surfaces the
-			// documented `terminal_uncertain` instead of a false success. In-memory only:
-			// the durable record shape and its validators are untouched.
+			// documented `terminal_uncertain` instead of a false success.
+			//
+			// TWO conditions, because the loss cannot be persisted: an `accepted` record
+			// may not carry a `lifecycle` and a `quarantined` one must be `advanced:false`,
+			// so the durable shape has nowhere to record it.
+			//
+			// 1. This runtime saw the hook throw.
 			if (this.#continuationLost.has(response.gate_id)) return { kind: "accepted_incomplete" };
+			// 2. The record belongs to a PREVIOUS runtime. A continuation waiter is
+			//    process-local and cannot survive a restart, so this process can never
+			//    prove the prior turn was resolved — and the in-memory set above is empty
+			//    after a restart, which is exactly how the first fix still handed back a
+			//    false `completed` on a cross-restart idempotent retry (#5599 review).
+			//    Fail closed instead. The cost is telling a retry "uncertain" about a gate
+			//    that did complete under the dead runtime; that is the honest answer
+			//    regardless, because the turn it belonged to died with that process and no
+			//    retry can continue it.
+			if (record.ownerInstanceId !== this.instanceId) return { kind: "accepted_incomplete" };
 			if (record.terminalized === true && record.advanced === true && record.resolution)
 				return { kind: "completed", resolution: record.resolution };
 			return { kind: "accepted_incomplete" };
