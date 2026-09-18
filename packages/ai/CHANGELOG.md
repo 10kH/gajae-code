@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+## [0.17.2] - 2026-09-18
+
+### Added
+
+- Union Alpha Free on OpenCode Go and Zen with Anthropic Messages routing, image input, reasoning, and the published free-tier limits.
+
+### Fixed
+
+- Share Cursor HTTP/2 write error and close listeners across pending frames to avoid listener-limit warnings during write bursts while preserving write-failure and drain-timeout handling.
+
+- Discover local OpenCodex models through the public `/v1/models` endpoint instead of the admin-only management API, preserving public context, input, and reasoning capabilities.
+
+- Preserve OpenCode protocol-specific base URLs during model discovery and recover reviewed Union Alpha limits from pre-catalogue discovery caches.
+
 ## [0.17.1] - 2026-09-17
 
 ## [0.17.0] - 2026-09-17
