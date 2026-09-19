@@ -2222,6 +2222,51 @@ export class SessionNearLimitAppendError extends Error {
 	}
 }
 
+/**
+ * Typed near-limit rewrite outcome (follow-up to #4566).
+ *
+ * A managed atomic rewrite (`#writeEntriesAtomicallySync`) whose serialized
+ * transcript crosses the per-file cap cannot be published: the managed store
+ * rejects the bytes with `content_too_large`. Unlike the append path there is
+ * no appended entry here — the whole live transcript is the payload — so this
+ * error carries the rejected rewrite size and the cap instead of append
+ * fields, and every rewrite/flush/close caller can point at compaction or
+ * export as the continuation path.
+ */
+export class SessionNearLimitRewriteError extends Error {
+	readonly code = "near_limit_rewrite" as const;
+	/** Serialized transcript size (bytes) rejected by the managed store. */
+	readonly transcriptBytes: number;
+	/** Managed per-file cap in force when the rewrite was rejected. */
+	readonly capBytes: number;
+
+	constructor(details: { transcriptBytes: number; capBytes: number }) {
+		super(
+			[
+				`near_limit_rewrite: live transcript (${details.transcriptBytes} B) exceeds the managed per-file limit (${details.capBytes} B).`,
+				"The rewrite was rejected and the resident entries are retained in memory; the transcript persists again after compacting the session (`/compact`) or exporting to a fresh session (`gjc export <session-file>`).",
+			].join(" "),
+		);
+		this.name = "SessionNearLimitRewriteError";
+		this.transcriptBytes = details.transcriptBytes;
+		this.capBytes = details.capBytes;
+	}
+}
+
+/**
+ * Near-limit rejection from the managed transcript store.
+ *
+ * The store raises a bare `content_too_large` for any payload above the per-file
+ * cap, and `#writeEntriesAtomicallySync` converts that same condition on the
+ * rewrite lane into `SessionNearLimitRewriteError`. Both shapes mean the live
+ * transcript crossed the cap and share one recovery path in `_persist`.
+ */
+function isManagedNearLimitFailure(error: unknown): boolean {
+	return (
+		(error instanceof Error && error.message === "content_too_large") || error instanceof SessionNearLimitRewriteError
+	);
+}
+
 export class SessionManagedStorageError extends Error {
 	readonly code = "managed_storage_unsupported";
 
@@ -15615,18 +15660,34 @@ export class SessionManager {
 				const bytes = Buffer.from(`${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`, "utf8");
 				const store = this.#managedTranscriptStore(sessionFile);
 				const relativePath = path.basename(sessionFile);
-				if (this.#managedPersistExpectedIdentity) {
-					try {
-						store.replaceExpectedIdentitySync(relativePath, bytes, this.#managedPersistExpectedIdentity);
-					} catch (err) {
-						// A confirmed missing predecessor can be recreated from the complete
-						// resident transcript. Any present-but-different identity still fails
-						// closed so a concurrent successor is never overwritten.
-						if (!isEnoent(err)) throw err;
-						this.#managedPersistExpectedIdentity = undefined;
-						store.replaceSync(relativePath, bytes);
+				try {
+					if (this.#managedPersistExpectedIdentity) {
+						try {
+							store.replaceExpectedIdentitySync(relativePath, bytes, this.#managedPersistExpectedIdentity);
+						} catch (err) {
+							// A confirmed missing predecessor can be recreated from the complete
+							// resident transcript. Any present-but-different identity still fails
+							// closed so a concurrent successor is never overwritten.
+							if (!isEnoent(err)) throw err;
+							this.#managedPersistExpectedIdentity = undefined;
+							store.replaceSync(relativePath, bytes);
+						}
+					} else store.replaceSync(relativePath, bytes);
+				} catch (err) {
+					// A live transcript that no longer fits the managed per-file cap is
+					// a typed near-limit outcome, not an unclassified abort: surface a
+					// rewrite-scoped error instead of leaking a raw `content_too_large`
+					// rejection to callers with no entry context. Resident entries stay
+					// in memory, so the transcript persists again after `/compact` or
+					// export.
+					if (err instanceof Error && err.message === "content_too_large") {
+						throw new SessionNearLimitRewriteError({
+							transcriptBytes: bytes.byteLength,
+							capBytes: MANAGED_ARTIFACT_MAX_FILE_BYTES,
+						});
 					}
-				} else store.replaceSync(relativePath, bytes);
+					throw err;
+				}
 				const descriptor = store.descriptorExpected(relativePath);
 				if (!descriptor) throw new Error("managed_replace_identity_unavailable");
 				this.#managedPersistExpectedIdentity = this.#captureManagedPersistIdentity(sessionFile);
@@ -17558,21 +17619,24 @@ export class SessionManager {
 			if (publishResumeBreadcrumb && persisted) writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
 			if (persisted) this.#readOnlyResume = false;
 		} catch (err) {
-			// content_too_large on the managed append hot path means the append-only
-			// transcript file has reached the per-file storage limit (64 MiB). The
-			// on-disk file is append-only and grew past the limit even though the
-			// in-memory entry list may be much smaller (compaction evicts old
-			// content but the append-only file never shrinks until a full rewrite).
-			// Fall back to a full rewrite (replaceSync) which writes only the live
-			// in-memory entries, shrinking the file below the limit. The entry has
-			// already been added to #fileEntries by #appendEntryWithinPersistenceFence.
-			if (err instanceof Error && err.message === "content_too_large") {
-				// Typed near-limit contract (#4566): recover by rewriting only the
-				// live in-memory entries, then verify the recovered file actually
-				// holds the just-appended entry. When even the rewrite cannot fit
-				// the entry (live content alone is at the cap), surface the typed
-				// near-limit outcome instead of silently succeeding without the
-				// receipt for an effect that already committed (e.g. a source edit).
+			// Near-limit failure on the managed append hot path. Two shapes reach here,
+			// both meaning the managed transcript can no longer grow at its per-file cap:
+			//  - the appended bytes alone exceed the cap (`content_too_large` from the
+			//    store's append, #4566); or
+			//  - the ENOENT / missing-predecessor recovery rewrite inside
+			//    #appendManagedRecordsSync raised SessionNearLimitRewriteError because the
+			//    resident transcript itself no longer fits.
+			// Recovery is the same for both: rewrite only the live in-memory entries (the
+			// append-only file grew past the limit even though the in-memory entry list
+			// may be much smaller, since compaction evicts old content but the file never
+			// shrinks until a full rewrite) and verify the just-appended entry is actually
+			// durable. The entry has already been added to #fileEntries by
+			// #appendEntryWithinPersistenceFence.
+			if (isManagedNearLimitFailure(err)) {
+				// Typed near-limit contract (#4566): when even the rewrite cannot fit the
+				// entry (live content alone is at the cap), surface the typed near-limit
+				// outcome instead of silently succeeding without the receipt for an effect
+				// that already committed (e.g. a source edit).
 				const entryBytes = (() => {
 					try {
 						const materialized = materializeResidentEntryForPersistenceSync(
@@ -17588,7 +17652,23 @@ export class SessionManager {
 						return 0;
 					}
 				})();
-				const liveBytesBefore = this.getTranscriptFileBytes();
+				const nearLimit = (liveBytes: number) =>
+					new SessionNearLimitAppendError({
+						entryBytes,
+						liveBytes,
+						capBytes: MANAGED_ARTIFACT_MAX_FILE_BYTES,
+						entryRetained: this.#byId.has(entry.id),
+					});
+				// A rewrite-scoped overflow reports the rejected live-transcript size and
+				// proves the rewrite already ran and failed, so it is not repeated: the
+				// on-disk size is authoritative only for a rejected append, where the
+				// recovery rewrite has not run yet.
+				const liveBytesBefore =
+					err instanceof SessionNearLimitRewriteError ? err.transcriptBytes : this.getTranscriptFileBytes();
+				if (err instanceof SessionNearLimitRewriteError) {
+					this.#needsFullRewriteOnNextPersist = true;
+					throw nearLimit(liveBytesBefore);
+				}
 				try {
 					this.#rewriteFileSync();
 				} catch (rewriteError) {
@@ -17596,14 +17676,9 @@ export class SessionManager {
 					// the resident list (its effect, including any committed source
 					// edit, is not lost), but the receipt is not durable yet: report
 					// the typed near-limit outcome instead of an unclassified abort.
-					if (rewriteError instanceof Error && rewriteError.message === "content_too_large") {
+					if (rewriteError instanceof SessionNearLimitRewriteError) {
 						this.#needsFullRewriteOnNextPersist = true;
-						throw new SessionNearLimitAppendError({
-							entryBytes,
-							liveBytes: liveBytesBefore,
-							capBytes: MANAGED_ARTIFACT_MAX_FILE_BYTES,
-							entryRetained: this.#byId.has(entry.id),
-						});
+						throw nearLimit(liveBytesBefore);
 					}
 					throw rewriteError;
 				}
@@ -17616,12 +17691,7 @@ export class SessionManager {
 				const entryRetained = liveBytesAfter <= MANAGED_ARTIFACT_MAX_FILE_BYTES && this.#byId.has(entry.id);
 				if (!entryRetained) {
 					this.#needsFullRewriteOnNextPersist = true;
-					throw new SessionNearLimitAppendError({
-						entryBytes,
-						liveBytes: liveBytesAfter || liveBytesBefore,
-						capBytes: MANAGED_ARTIFACT_MAX_FILE_BYTES,
-						entryRetained: this.#byId.has(entry.id),
-					});
+					throw nearLimit(liveBytesAfter || liveBytesBefore);
 				}
 				return;
 			}
