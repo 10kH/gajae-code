@@ -1704,17 +1704,36 @@ test("comment-triggered validation publishes a head-bound check run under the re
 	expect(workflow).toContain('approval_summary="$summary"');
 
 	// The approval authority must be REVOKED before any fallible work, then raised only
-	// after the contract publication succeeds. Publishing contract-then-approval left a
-	// window where a cancelled job or a failed second API call kept a previously-green
-	// "Merge approval" authoritative while the contract had already gone red (#5692
-	// review). Assert the ORDER, since a comment claiming it proves nothing.
-	const revokeFirst = workflow.indexOf('-f "output[summary]=re-validation in progress;');
+	// after the contract publication succeeds.
+	//
+	// Assert JOB TOPOLOGY, not position within one step. Revoking inside the publication
+	// step still left the entire validation phase uncovered: a failure during checkout,
+	// Bun setup, or the validator never reached the revocation, so a previously-green
+	// "Merge approval" survived as the authoritative required check (#5692 review).
+	const stepOf = (needle: string): number => {
+		const at = workflow.indexOf(needle);
+		expect({ needle, found: at > -1 }).toEqual({ needle, found: true });
+		return workflow.lastIndexOf("      - ", at);
+	};
+	const resolvePr = stepOf("name: Resolve PR head/base from the event or the comment's PR");
+	const revoke = stepOf("name: Revoke any prior approval for this head before re-validating");
+	const checkout = stepOf("uses: actions/checkout@");
+	const setupBun = stepOf("uses: oven-sh/setup-bun@");
+	const validate = stepOf("name: Validate body, exact head, immutable base, reviewer, and fast gate");
+	const publish = stepOf("name: Publish head-bound check results for comment-triggered validation");
+	// Resolution may precede the revoke because the head SHA is needed to address the
+	// check run. Nothing fallible may.
+	expect(resolvePr).toBeLessThan(revoke);
+	for (const [label, at] of [["checkout", checkout], ["setup-bun", setupBun], ["validate", validate], ["publish", publish]] as const) {
+		expect({ step: label, afterRevoke: at > revoke }).toEqual({ step: label, afterRevoke: true });
+	}
+	// Within the publication step the contract result is written before the approval is
+	// raised, so a failed contract write cannot leave a green approval.
 	const publishContract = workflow.indexOf('"output[summary]=$summary"');
 	const raiseApproval = workflow.indexOf('-f "output[summary]=$approval_summary"');
-	expect(revokeFirst).toBeGreaterThan(-1);
-	expect(revokeFirst).toBeLessThan(publishContract);
 	expect(publishContract).toBeLessThan(raiseApproval);
-	// The revoking write must be a hard failure, never neutral or skipped.
+	// The revoking write must be a hard failure: a neutral conclusion is not blocking,
+	// so it would replace a stale green with something that still permits the merge.
 	expect(workflow).toContain('-f conclusion="failure" \\\n            -f \'output[title]="Merge approval (re-validating)"\'');
 });
 
