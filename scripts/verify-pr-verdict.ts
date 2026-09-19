@@ -735,7 +735,7 @@ async function fetchPushPreflightIndependentReviewer(repo: string, number: numbe
 	const headDate = await git(["show", "-s", "--format=%cI", headSha], cwd);
 	const committedAt = headDate.exitCode === 0 ? Buffer.from(headDate.stdout).toString().trim() || undefined : undefined;
 	const forcePushedAt = await gh(
-		["api", "--paginate", `repos/${repo}/issues/${number}/timeline`, "--jq", 'select(.event=="head_ref_force_pushed") | (.created_at // "unreadable")'],
+		["api", "--paginate", `repos/${repo}/issues/${number}/timeline`, "--jq", '.[] | select(.event=="head_ref_force_pushed") | (.created_at // "unreadable")'],
 		cwd,
 	);
 	if (forcePushedAt.exitCode !== 0)
