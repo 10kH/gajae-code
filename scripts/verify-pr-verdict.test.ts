@@ -1929,7 +1929,14 @@ test("no untrusted event field is interpolated into a workflow run block (#5740 
 		"github.event.pull_request.head.repo.full_name",
 		"github.event.issue.number",
 	]);
-	for (const file of ["../.github/workflows/pr-validation.yml", "../.github/workflows/dev-ci.yml", "../.github/workflows/ci.yml"]) {
+	// Composite actions run with the same event context, so they are in scope too.
+	const surfaces = [
+		"../.github/workflows/pr-validation.yml",
+		"../.github/workflows/dev-ci.yml",
+		"../.github/workflows/ci.yml",
+		"../.github/actions/build-native/action.yml",
+	];
+	for (const file of surfaces) {
 		const lines = (await Bun.file(new URL(file, import.meta.url)).text()).split("\n");
 		let inRun = false;
 		let indent = 0;
