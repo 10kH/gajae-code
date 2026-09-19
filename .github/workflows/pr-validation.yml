@@ -98,8 +98,11 @@ jobs:
           # that removed the marker; the marker alone is checked here, and the validator
           # still does the real authentication and signature work.
           # Read through the environment, NEVER by interpolating the comment into the
-          # script: `${{ github.event.comment.body }}` inline is shell injection from an
-          # untrusted author, which is precisely what this workflow exists to avoid.
+          # script. An inline expression referencing the comment body is shell injection
+          # from an untrusted author, and it is unsafe even inside a shell comment:
+          # GitHub expands the expression before bash ever sees the script, so a
+          # multiline body injects a new executable line. The literal form is therefore
+          # not written anywhere in this run block, including in prose.
           # The marker alone is not enough: anyone may write it, so gating on the string
           # only would let a third party force revocation and, with cancel-in-progress,
           # reinstate the denial of service behind one extra step. A self-review record is

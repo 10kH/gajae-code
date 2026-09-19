@@ -1914,10 +1914,14 @@ test("the stale-base markers survive comment stripping but not code removal (#56
 	}
 });
 
-test("no untrusted event field is interpolated into a workflow run block (#5740 review)", async () => {
+test("no untrusted event field appears anywhere in a workflow run scalar (#5740 review)", async () => {
 	// Author-controlled text expanded into a `run:` body is shell injection. I introduced
-	// exactly that with `${{ github.event.comment.body }}` while fixing something else, so
-	// checking once is not enough — this makes the class impossible to reintroduce.
+	// exactly that while fixing something else, so this makes the class impossible.
+	//
+	// SHELL COMMENTS ARE NOT EXEMPT. GitHub expands `${{ ... }}` before bash sees the
+	// script, so a multiline comment body injects a new executable line even when the
+	// expression sits behind a `#`. My first version of this guard skipped comment lines
+	// and therefore passed the very vector it was written for (#5740 review).
 	//
 	// The allowlist is fields GitHub constrains to characters that cannot break out of a
 	// shell word: integers it assigns, hex SHAs it computes, and repository names limited
@@ -1936,6 +1940,7 @@ test("no untrusted event field is interpolated into a workflow run block (#5740 
 		"../.github/workflows/ci.yml",
 		"../.github/actions/build-native/action.yml",
 	];
+	let scanned = 0;
 	for (const file of surfaces) {
 		const lines = (await Bun.file(new URL(file, import.meta.url)).text()).split("\n");
 		let inRun = false;
@@ -1945,11 +1950,11 @@ test("no untrusted event field is interpolated into a workflow run block (#5740 
 			if (opener) {
 				inRun = true;
 				indent = opener[1]?.length ?? 0;
+				scanned++;
 				continue;
 			}
 			if (inRun && line.trim() !== "" && line.search(/\S/) <= indent) inRun = false;
-			// Comments inside a run block are prose, not expanded shell.
-			if (!inRun || line.trimStart().startsWith("#")) continue;
+			if (!inRun) continue;
 			for (const match of line.matchAll(/\$\{\{\s*(github\.event\.[A-Za-z0-9_.]+)\s*\}\}/g)) {
 				const field = match[1] ?? "";
 				expect({ file, line: index + 1, field, allowed: safe.has(field) }).toEqual({
@@ -1961,6 +1966,8 @@ test("no untrusted event field is interpolated into a workflow run block (#5740 
 			}
 		}
 	}
+	// A guard that scanned nothing would pass silently.
+	expect(scanned).toBeGreaterThan(5);
 });
 
 test("issue_comment events cannot launch or cancel the affected Dev CI pipeline", async () => {
