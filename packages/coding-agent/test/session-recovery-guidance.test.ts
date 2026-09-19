@@ -180,6 +180,27 @@ describe("session recovery guidance references runnable commands", () => {
 		}
 	});
 
+	test("every gjc command advised anywhere in session source is registered (#5732)", async () => {
+		// The two checks above are still name-shaped: they key off `NearLimit` in an
+		// identifier. `SessionTranscriptOversizedError` and `SessionContextTooLargeError`
+		// do not match that pattern, and a class added tomorrow need not either. The
+		// residual gap is an error that advises some OTHER nonexistent command.
+		//
+		// This closes the defect CLASS instead of the classes: whatever the surrounding
+		// code is called, a `gjc <verb>` named in session source must resolve to a real
+		// registered command. That is the invariant #5621 actually violated.
+		for (const [name, source] of await sessionSurfaceSources()) {
+			const advised = [...withoutComments(source).matchAll(/`gjc ([a-z][a-z0-9-]*)/g)].map(match => match[1]);
+			for (const verb of new Set(advised)) {
+				expect({ file: name, verb, registered: cliCommandNames.has(verb) }).toEqual({
+					file: name,
+					verb,
+					registered: true,
+				});
+			}
+		}
+	});
+
 	test("the slash detector catches un-backticked mentions", () => {
 		expect(referencedSlashCommands("Run /compact or `/clear` to continue.")).toEqual(["compact", "clear"]);
 	});
