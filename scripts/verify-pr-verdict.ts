@@ -157,11 +157,22 @@ function latestKnownHeadTime(
 	const present = serverObserved.map(value => value?.trim()).filter(value => value !== undefined && value.length > 0);
 	if (present.length !== serverObserved.length) return undefined;
 	if (present.some(value => !Number.isFinite(Date.parse(value as string)))) return undefined;
-	const candidates = [committedAt?.trim(), ...present].filter(
-		(value): value is string => value !== undefined && value.length > 0 && Number.isFinite(Date.parse(value)),
-	);
-	if (candidates.length === 0) return undefined;
-	return candidates.reduce((latest, value) => (Date.parse(value) > Date.parse(latest) ? value : latest));
+	// Server-observed evidence WINS OUTRIGHT; the committer date is not blended into it.
+	//
+	// Taking the latest of both let a contributor set `GIT_COMMITTER_DATE` into the future
+	// and raise the floor above what GitHub actually observed, refusing every legitimate
+	// approval on their own PR. Backdating was the original hole; forward-dating is the
+	// same control used the other way. When a force-push is on record, the moment it
+	// happened is when this head appeared, and the commit's self-reported date adds
+	// nothing (#5692 review).
+	if (present.length > 0) {
+		return (present as string[]).reduce((latest, value) => (Date.parse(value) > Date.parse(latest) ? value : latest));
+	}
+	// No force-push on record, so nothing re-bound `commit_id` and the committer date is
+	// an adequate floor.
+	const committed = committedAt?.trim();
+	if (committed === undefined || committed.length === 0 || !Number.isFinite(Date.parse(committed))) return undefined;
+	return committed;
 }
 
 /**

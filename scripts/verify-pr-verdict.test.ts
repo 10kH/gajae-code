@@ -1316,6 +1316,25 @@ describe("push preflight independent-review evidence (issue #5483 review)", () =
 		expect(result.stderr).toContain("submitted BEFORE that head commit existed");
 	});
 
+	test("a future-dated commit cannot override server-observed force-push evidence (#5692 review)", async () => {
+		// `GIT_COMMITTER_DATE` is contributor-controlled in BOTH directions. Backdating was
+		// the original hole; forward-dating raised the freshness floor above what GitHub
+		// observed and refused every legitimate approval on the author's own PR.
+		//
+		// The harness commits with a real date, so the force-push below is the server
+		// evidence and the approval postdates it. A blended max would still have admitted
+		// this one; the case that matters is that the SERVER value is what decides.
+		const result = await runSelfReviewPushPreflight({
+			body: riskClassifiedBody,
+			comments: riskClassifiedComments,
+			reviews: context => reviewerApproval(context, "APPROVED", "2030-01-02T00:00:00Z"),
+			forcePushedAt: "2030-01-01T00:00:00Z\n",
+			permission: "write",
+		});
+		expect(result.stderr).not.toContain("submitted BEFORE that head commit existed");
+		expect(result.stdout).not.toContain("gjc-merge-authorized=false");
+	});
+
 	test("a genuine approval still authorizes when the PR was never force-pushed (#5692 review)", async () => {
 		// The freshness checks are only useful if they still let real approvals through.
 		// With no force-push there is nothing that could have re-bound `commit_id`, so the

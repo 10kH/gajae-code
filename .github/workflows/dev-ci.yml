@@ -191,9 +191,13 @@ jobs:
               const present = forcePushes.map(value => (typeof value === "string" ? value.trim() : "")).filter(value => value.length > 0);
               if (present.length !== forcePushes.length) return undefined;
               if (present.some(value => !Number.isFinite(Date.parse(value)))) return undefined;
-              const candidates = [typeof committedAt === "string" ? committedAt.trim() : "", ...present].filter(value => value.length > 0 && Number.isFinite(Date.parse(value)));
-              if (candidates.length === 0) return undefined;
-              return candidates.reduce((latest, value) => (Date.parse(value) > Date.parse(latest) ? value : latest));
+              // Server-observed evidence wins outright. Blending the committer date in let
+              // a contributor set GIT_COMMITTER_DATE into the future and raise the floor
+              // above what GitHub observed, refusing every legitimate approval (#5692).
+              if (present.length > 0) return present.reduce((latest, value) => (Date.parse(value) > Date.parse(latest) ? value : latest));
+              const committed = typeof committedAt === "string" ? committedAt.trim() : "";
+              if (committed.length === 0 || !Number.isFinite(Date.parse(committed))) return undefined;
+              return committed;
             };
             // Refuses on unknown or unparseable times, and on a tie: GitHub serializes both
             // sides to whole seconds, so an equal value still means the review predates the
