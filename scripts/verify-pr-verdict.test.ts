@@ -1535,7 +1535,14 @@ describe("server independent-reviewer evidence (issue #5483 review)", () => {
 		}
 	});
 
-	test("a force-push event with an unreadable time refuses, not falls back (#5692 review)", async () => {
+	test.each([
+		{ name: "unparseable string", createdAt: "not-a-date" },
+		// `created_at: null` was silently DROPPED rather than refused, so the backdated
+		// committer date survived as the answer — the same fail-open through a different
+		// input shape (#5692 review).
+		{ name: "null", createdAt: null },
+		{ name: "absent", createdAt: undefined },
+	])("a force-push event with an unreadable time refuses, not falls back: $name (#5692 review)", async scenario => {
 		// A force-push DID happen; we simply cannot read when. Dropping it and using the
 		// contributor's committer date would reinstate the backdate hole, so "could not
 		// read the authority" must not collapse into "no authority exists".
@@ -1549,7 +1556,7 @@ describe("server independent-reviewer evidence (issue #5483 review)", () => {
 			if (endpoint === `https://api.github.com/repos/owner/repo/commits/${head}`)
 				return Response.json({ commit: { committer: { date: headCommittedAt } } });
 			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/issues/5416/timeline"))
-				return Response.json([{ event: "head_ref_force_pushed", created_at: "not-a-date" }]);
+				return Response.json([{ event: "head_ref_force_pushed", created_at: scenario.createdAt }]);
 			if (endpoint === "https://api.github.com/repos/owner/repo/collaborators/review-bot/permission")
 				return Response.json({ permission: "write" });
 			throw new Error(`Unexpected endpoint: ${endpoint}`);

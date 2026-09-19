@@ -149,7 +149,13 @@ function latestKnownHeadTime(
 	committedAt: string | undefined,
 	serverObserved: Array<string | undefined>,
 ): string | undefined {
+	// An entry that is absent or blank is just as unreadable as one that will not parse:
+	// the force-push happened, we simply cannot read when. Filtering those out first and
+	// only then checking parseability silently discarded them and fell back to the
+	// contributor's committer date — the same fail-open, reached through `created_at: null`
+	// instead of a malformed string. Count before filtering (#5692 review).
 	const present = serverObserved.map(value => value?.trim()).filter(value => value !== undefined && value.length > 0);
+	if (present.length !== serverObserved.length) return undefined;
 	if (present.some(value => !Number.isFinite(Date.parse(value as string)))) return undefined;
 	const candidates = [committedAt?.trim(), ...present].filter(
 		(value): value is string => value !== undefined && value.length > 0 && Number.isFinite(Date.parse(value)),
@@ -742,7 +748,13 @@ async function fetchPushPreflightIndependentReviewer(repo: string, number: numbe
 		return { evidence: null, error: forcePushedAt.stderr || `gh exited ${forcePushedAt.exitCode}` };
 	// The projection emits a literal "unreadable" for an event with no `created_at`, so a
 	// present-but-unusable force-push cannot masquerade as an empty line (#5692 review).
-	const headKnownAt = latestKnownHeadTime(committedAt, forcePushedAt.stdout.split("\n"));
+	// Drop line-splitting artifacts only. A genuinely absent `created_at` already arrives
+	// as the literal "unreadable" from the projection, so blank lines here are never
+	// missing data and must not be mistaken for it.
+	const headKnownAt = latestKnownHeadTime(
+		committedAt,
+		forcePushedAt.stdout.split("\n").filter(line => line.trim().length > 0),
+	);
 	const approvedHead = effectiveExactHeadReview(normalized, login, headSha, headKnownAt)?.state === "APPROVED";
 	const permission = await gh(["api", `repos/${repo}/collaborators/${encodeURIComponent(login)}/permission`, "--jq", ".permission"], cwd);
 	if (permission.exitCode !== 0) return { evidence: null, error: permission.stderr || `gh exited ${permission.exitCode}` };
