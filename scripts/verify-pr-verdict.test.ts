@@ -1093,13 +1093,21 @@ async function runSelfReviewPushPreflight(options: {
 		const permissionPath = path.join(temp, "permission.txt");
 		const callsPath = path.join(temp, "gh-calls.log");
 		await Bun.write(pullsPath, JSON.stringify([{ number: 123, body, base: { ref: "dev" }, user: { login: "owner" }, head: { ref: "feature", repo: { owner: { login: "owner" } } } }]));
-		const commentsJsonl = comments.map(comment => JSON.stringify(comment)).join("\n");
-		await Bun.write(commentsPath, options.commentsTruncated ? `${commentsJsonl}\n{"user":{"login":"owner"` : commentsJsonl);
-		await Bun.write(reviewsPath, reviews.map(review => JSON.stringify(review)).join("\n"));
+		// RAW array-shaped payloads, exactly as the endpoints return them, so the stub can
+		// run the real `--jq` instead of echoing an already-projected string. A canned
+		// projection validates nothing about the query that produced it (#5692 review).
+		const commentsJson = JSON.stringify(comments);
+		await Bun.write(
+			commentsPath,
+			// Truncation must corrupt the RAW payload now, so `jq` fails on the array the
+			// way a cut-short HTTP response would, not on an already-projected line.
+			options.commentsTruncated ? commentsJson.slice(0, Math.max(1, commentsJson.length - 12)) : commentsJson,
+		);
+		await Bun.write(reviewsPath, JSON.stringify(reviews));
 		await Bun.write(permissionPath, `${options.permission ?? "write"}\n`);
 		await Bun.write(callsPath, "");
 		const ghPath = path.join(bin, "gh");
-		await Bun.write(ghPath, `#!/usr/bin/env bash\nset -euo pipefail\nargs="$*"\nprintf '%s\\n' "$args" >> "$GH_CALLS"\nif [[ "$args" == "repo view owner/repo --json isFork,parent" ]]; then\n  printf '{"isFork":false}\\n'\nelif [[ "$args" == *"/pulls?state=open"* ]]; then\n  cat "$GH_PULLS"\nelif [[ "$args" == *"/pulls/123/reviews"* ]]; then\n  [[ "$args" == *"--paginate"* ]] || { echo "gh reviews read is missing --paginate" >&2; exit 1; }\n  [[ "$args" == *"commit_id"* ]] || { echo "gh reviews read lost its --jq projection" >&2; exit 1; }\n  if [[ -n "\${GH_REVIEWS_UNAVAILABLE:-}" ]]; then\n    echo "HTTP 503: reviews unavailable" >&2\n    exit 1\n  fi\n  cat "$GH_REVIEWS"\nelif [[ "$args" == *"/issues/123/timeline"* ]]; then\n  jq_filter="\${args#*--jq }"\n  jq -r "$jq_filter" "$GH_TIMELINE_RAW"\nelif [[ "$args" == *"/collaborators/"* ]]; then\n  [[ "$args" == *"--jq .permission"* ]] || { echo "gh permission read lost its --jq projection" >&2; exit 1; }\n  if [[ -n "\${GH_PERMISSION_UNAVAILABLE:-}" ]]; then\n    echo "HTTP 404: Not Found" >&2\n    exit 1\n  fi\n  cat "$GH_PERMISSION"\nelif [[ "$args" == *"/issues/123/comments"* ]]; then\n  [[ "$args" == *"--paginate"* ]] || { echo "gh comments read is missing --paginate" >&2; exit 1; }\n  [[ "$args" == *"author_association"* ]] || { echo "gh comments read lost its --jq projection" >&2; exit 1; }\n  if [[ -n "\${GH_COMMENTS_UNAVAILABLE:-}" ]]; then\n    echo "HTTP 503: service unavailable" >&2\n    exit 1\n  fi\n  cat "$GH_COMMENTS"\nelse\n  echo "unexpected gh invocation: $args" >&2\n  exit 1\nfi\n`);
+		await Bun.write(ghPath, `#!/usr/bin/env bash\nset -euo pipefail\nargs="$*"\nprintf '%s\\n' "$args" >> "$GH_CALLS"\nif [[ "$args" == "repo view owner/repo --json isFork,parent" ]]; then\n  printf '{"isFork":false}\\n'\nelif [[ "$args" == *"/pulls?state=open"* ]]; then\n  cat "$GH_PULLS"\nelif [[ "$args" == *"/pulls/123/reviews"* ]]; then\n  [[ "$args" == *"--paginate"* ]] || { echo "gh reviews read is missing --paginate" >&2; exit 1; }\n  [[ "$args" == *"commit_id"* ]] || { echo "gh reviews read lost its --jq projection" >&2; exit 1; }\n  if [[ -n "\${GH_REVIEWS_UNAVAILABLE:-}" ]]; then\n    echo "HTTP 503: reviews unavailable" >&2\n    exit 1\n  fi\n  jq -c "\${args#*--jq }" "$GH_REVIEWS"\nelif [[ "$args" == *"/issues/123/timeline"* ]]; then\n  jq_filter="\${args#*--jq }"\n  jq -r "$jq_filter" "$GH_TIMELINE_RAW"\nelif [[ "$args" == *"/collaborators/"* ]]; then\n  [[ "$args" == *"--jq .permission"* ]] || { echo "gh permission read lost its --jq projection" >&2; exit 1; }\n  if [[ -n "\${GH_PERMISSION_UNAVAILABLE:-}" ]]; then\n    echo "HTTP 404: Not Found" >&2\n    exit 1\n  fi\n  cat "$GH_PERMISSION"\nelif [[ "$args" == *"/issues/123/comments"* ]]; then\n  [[ "$args" == *"--paginate"* ]] || { echo "gh comments read is missing --paginate" >&2; exit 1; }\n  [[ "$args" == *"author_association"* ]] || { echo "gh comments read lost its --jq projection" >&2; exit 1; }\n  if [[ -n "\${GH_COMMENTS_UNAVAILABLE:-}" ]]; then\n    echo "HTTP 503: service unavailable" >&2\n    exit 1\n  fi\n  jq -c "\${args#*--jq }" "$GH_COMMENTS"\nelse\n  echo "unexpected gh invocation: $args" >&2\n  exit 1\nfi\n`);
 		await fs.chmod(ghPath, 0o755);
 		const child = Bun.spawn([process.execPath, script, "--push-preflight", "feature", headSha, "--push-url", "https://github.com/owner/repo.git", "--repo", work, "--trusted-root", repoRoot], {
 			cwd: work,
@@ -1202,7 +1210,10 @@ describe("push preflight independent-review evidence (issue #5483 review)", () =
 		context: PushPreflightContext,
 		state = "APPROVED",
 		submittedAt = "2099-01-01T00:00:00Z",
-	) => [{ author: { login: "review-bot" }, state, commit: { oid: context.headSha }, submittedAt }];
+		// RAW API shape — the stub now runs the real `--jq`, so the fixture must look like
+		// what GitHub returns, not like the projection. Writing the projected shape here is
+		// precisely the mistake that let a broken query pass every test (#5692 review).
+	) => [{ user: { login: "review-bot" }, state, commit_id: context.headSha, submitted_at: submittedAt }];
 
 	test("a risk-classified record is authorized by the named reviewer's exact-head approval and permission", async () => {
 		const result = await runSelfReviewPushPreflight({
