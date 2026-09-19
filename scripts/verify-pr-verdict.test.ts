@@ -1075,6 +1075,20 @@ async function runSelfReviewPushPreflight(options: {
 		const reviews = options.reviews?.(context) ?? [];
 		const pullsPath = path.join(temp, "pulls.json");
 		const commentsPath = path.join(temp, "comments.jsonl");
+		// Raw ARRAY-shaped page data, exactly as the timeline endpoint returns it, so the
+		// stub evaluates the real `--jq` against the real shape. Injecting already-projected
+		// stdout is what let a filter missing its `.[]` iterator pass every test (#5692).
+		const timelinePath = path.join(temp, "timeline.json");
+		await Bun.write(
+			timelinePath,
+			JSON.stringify(
+				(options.forcePushedAt ?? "")
+					.split("\n")
+					.map(line => line.trim())
+					.filter(line => line.length > 0)
+					.map(created_at => ({ event: "head_ref_force_pushed", created_at: created_at === "null" ? null : created_at })),
+			),
+		);
 		const reviewsPath = path.join(temp, "reviews.jsonl");
 		const permissionPath = path.join(temp, "permission.txt");
 		const callsPath = path.join(temp, "gh-calls.log");
@@ -1085,7 +1099,7 @@ async function runSelfReviewPushPreflight(options: {
 		await Bun.write(permissionPath, `${options.permission ?? "write"}\n`);
 		await Bun.write(callsPath, "");
 		const ghPath = path.join(bin, "gh");
-		await Bun.write(ghPath, `#!/usr/bin/env bash\nset -euo pipefail\nargs="$*"\nprintf '%s\\n' "$args" >> "$GH_CALLS"\nif [[ "$args" == "repo view owner/repo --json isFork,parent" ]]; then\n  printf '{"isFork":false}\\n'\nelif [[ "$args" == *"/pulls?state=open"* ]]; then\n  cat "$GH_PULLS"\nelif [[ "$args" == *"/pulls/123/reviews"* ]]; then\n  [[ "$args" == *"--paginate"* ]] || { echo "gh reviews read is missing --paginate" >&2; exit 1; }\n  [[ "$args" == *"commit_id"* ]] || { echo "gh reviews read lost its --jq projection" >&2; exit 1; }\n  if [[ -n "\${GH_REVIEWS_UNAVAILABLE:-}" ]]; then\n    echo "HTTP 503: reviews unavailable" >&2\n    exit 1\n  fi\n  cat "$GH_REVIEWS"\nelif [[ "$args" == *"/issues/123/timeline"* ]]; then\n  [[ "$args" == *".[] | select("* ]] || { echo "gh timeline read lost its .[] iterator; the endpoint returns an array" >&2; exit 1; }\n  printf '%s' "\${GH_TIMELINE:-}"\nelif [[ "$args" == *"/collaborators/"* ]]; then\n  [[ "$args" == *"--jq .permission"* ]] || { echo "gh permission read lost its --jq projection" >&2; exit 1; }\n  if [[ -n "\${GH_PERMISSION_UNAVAILABLE:-}" ]]; then\n    echo "HTTP 404: Not Found" >&2\n    exit 1\n  fi\n  cat "$GH_PERMISSION"\nelif [[ "$args" == *"/issues/123/comments"* ]]; then\n  [[ "$args" == *"--paginate"* ]] || { echo "gh comments read is missing --paginate" >&2; exit 1; }\n  [[ "$args" == *"author_association"* ]] || { echo "gh comments read lost its --jq projection" >&2; exit 1; }\n  if [[ -n "\${GH_COMMENTS_UNAVAILABLE:-}" ]]; then\n    echo "HTTP 503: service unavailable" >&2\n    exit 1\n  fi\n  cat "$GH_COMMENTS"\nelse\n  echo "unexpected gh invocation: $args" >&2\n  exit 1\nfi\n`);
+		await Bun.write(ghPath, `#!/usr/bin/env bash\nset -euo pipefail\nargs="$*"\nprintf '%s\\n' "$args" >> "$GH_CALLS"\nif [[ "$args" == "repo view owner/repo --json isFork,parent" ]]; then\n  printf '{"isFork":false}\\n'\nelif [[ "$args" == *"/pulls?state=open"* ]]; then\n  cat "$GH_PULLS"\nelif [[ "$args" == *"/pulls/123/reviews"* ]]; then\n  [[ "$args" == *"--paginate"* ]] || { echo "gh reviews read is missing --paginate" >&2; exit 1; }\n  [[ "$args" == *"commit_id"* ]] || { echo "gh reviews read lost its --jq projection" >&2; exit 1; }\n  if [[ -n "\${GH_REVIEWS_UNAVAILABLE:-}" ]]; then\n    echo "HTTP 503: reviews unavailable" >&2\n    exit 1\n  fi\n  cat "$GH_REVIEWS"\nelif [[ "$args" == *"/issues/123/timeline"* ]]; then\n  jq_filter="\${args#*--jq }"\n  jq -r "$jq_filter" "$GH_TIMELINE_RAW"\nelif [[ "$args" == *"/collaborators/"* ]]; then\n  [[ "$args" == *"--jq .permission"* ]] || { echo "gh permission read lost its --jq projection" >&2; exit 1; }\n  if [[ -n "\${GH_PERMISSION_UNAVAILABLE:-}" ]]; then\n    echo "HTTP 404: Not Found" >&2\n    exit 1\n  fi\n  cat "$GH_PERMISSION"\nelif [[ "$args" == *"/issues/123/comments"* ]]; then\n  [[ "$args" == *"--paginate"* ]] || { echo "gh comments read is missing --paginate" >&2; exit 1; }\n  [[ "$args" == *"author_association"* ]] || { echo "gh comments read lost its --jq projection" >&2; exit 1; }\n  if [[ -n "\${GH_COMMENTS_UNAVAILABLE:-}" ]]; then\n    echo "HTTP 503: service unavailable" >&2\n    exit 1\n  fi\n  cat "$GH_COMMENTS"\nelse\n  echo "unexpected gh invocation: $args" >&2\n  exit 1\nfi\n`);
 		await fs.chmod(ghPath, 0o755);
 		const child = Bun.spawn([process.execPath, script, "--push-preflight", "feature", headSha, "--push-url", "https://github.com/owner/repo.git", "--repo", work, "--trusted-root", repoRoot], {
 			cwd: work,
@@ -1096,7 +1110,7 @@ async function runSelfReviewPushPreflight(options: {
 				GH_PULLS: pullsPath,
 				GH_COMMENTS: commentsPath,
 				GH_REVIEWS: reviewsPath,
-				GH_TIMELINE: options.forcePushedAt ?? "",
+				GH_TIMELINE_RAW: timelinePath,
 				GH_PERMISSION: permissionPath,
 				...options.commentsUnavailable ? { GH_COMMENTS_UNAVAILABLE: "1" } : {},
 				...options.reviewsUnavailable ? { GH_REVIEWS_UNAVAILABLE: "1" } : {},
@@ -1305,6 +1319,21 @@ describe("push preflight independent-review evidence (issue #5483 review)", () =
 		});
 		expect(result.stderr).not.toContain("is not satisfied");
 		expect(result.stderr).not.toContain("submitted BEFORE that head commit existed");
+	});
+
+	test("a force-push event with a null created_at refuses in the preflight too (#5692 review)", async () => {
+		// The projection's `// "unreadable"` fallback only matters if the harness actually
+		// evaluates it. Now that the stub runs the real jq over array-shaped page data, a
+		// null timestamp reaches `latestKnownHeadTime` as an unparseable entry and must
+		// refuse rather than collapsing into "no force-push happened".
+		const result = await runSelfReviewPushPreflight({
+			body: riskClassifiedBody,
+			comments: riskClassifiedComments,
+			reviews: context => reviewerApproval(context, "APPROVED", "2099-01-01T00:00:00Z"),
+			forcePushedAt: "null\n",
+			permission: "write",
+		});
+		expect(result.exitCode).toBe(1);
 	});
 	test("unreadable independent-review evidence is reported as unread, not as unauthorized", async () => {
 		const result = await runSelfReviewPushPreflight({
