@@ -2163,8 +2163,42 @@ export const RESUME_TRANSCRIPT_MAX_BYTES = MANAGED_ARTIFACT_MAX_FILE_BYTES;
 export const BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES = 2 * 1024 * 1024 * 1024 + 1024 * 1024;
 const EAGER_RESUME_TRANSCRIPT_MAX_BYTES = MANAGED_ARTIFACT_MAX_FILE_BYTES;
 
+/**
+ * Recovery actions offered when a live transcript is at or past the managed
+ * per-file cap.
+ *
+ * Constrained three ways, and every command named here satisfies all three:
+ *
+ * 1. **It must exist.** `gjc export <session-file>` was advised for both limits
+ *    and is not a subcommand, so following it literally started a fresh agent
+ *    that read "export" as a prompt while the session stayed unwritable. (The
+ *    root `--export` flag renders HTML and exits; it yields no resumable
+ *    session.)
+ * 2. **It must be reachable on every surface that renders the message.** These
+ *    strings reach ACP/text consumers through `AgentSession`, and the ACP
+ *    registry is filtered to definitions carrying `handle`
+ *    (`slash-commands/acp-builtins.ts`), so a `handleTui`-only command such as
+ *    `/new` is a different dead end rather than a fix.
+ * 3. **It must not drop the retained near-limit entry.** The failed append is
+ *    kept in memory with a full rewrite armed, and the message promises it
+ *    persists on the next successful write. `/compact` and `/clear` keep the
+ *    manager — and therefore that pending debt — alive; a session switch closes
+ *    the writer without paying it.
+ *
+ * `session-recovery-guidance.test.ts` pins all three against the CLI, builtin,
+ * and ACP registries.
+ */
+export const SESSION_LIMIT_RECOVERY_ACTIONS =
+	"compact the session (`/compact`), or clear its context (`/clear`) if compaction cannot reclaim enough";
+
+/**
+ * Oversized-resume guidance. This surface is reached *before* a session is
+ * opened, so it deliberately does not reuse {@link SESSION_LIMIT_RECOVERY_ACTIONS}:
+ * an in-session command there would act on whichever session the user resumes
+ * next, never on the transcript that was just rejected.
+ */
 export const SESSION_OVERSIZED_RECOVERY_MESSAGE =
-	"The selected session transcript is too large to resume safely. Use `gjc export <session-file>` to export its content into a new session, or remove/archive it after confirming its content is no longer needed.";
+	"The selected session transcript is too large to resume safely. Resume a different session, or remove/archive this transcript after confirming its content is no longer needed.";
 
 export class SessionAppendPersistenceError extends Error {
 	readonly phase: SessionAppendPersistenceFailurePhase;
@@ -2211,8 +2245,8 @@ export class SessionNearLimitAppendError extends Error {
 			[
 				`near_limit_append: entry (${details.entryBytes} B) plus live transcript (${details.liveBytes} B) exceeds the managed per-file limit (${details.capBytes} B).`,
 				details.entryRetained
-					? "The appended entry is retained in memory; its effect (including any committed source edit) is recorded and will persist on the next successful write. Compact the session (`/compact`) or export to a fresh session (`gjc export <session-file>`) before continuing."
-					: "The appended entry was rolled back from memory; re-issue it after compacting the session (`/compact`) or exporting to a fresh session (`gjc export <session-file>`).",
+					? `The appended entry is retained in memory; its effect (including any committed source edit) is recorded and will persist on the next successful write. To continue, ${SESSION_LIMIT_RECOVERY_ACTIONS}.`
+					: `The appended entry was rolled back from memory; ${SESSION_LIMIT_RECOVERY_ACTIONS}, then re-issue it.`,
 			].join(" "),
 		);
 		this.name = "SessionNearLimitAppendError";

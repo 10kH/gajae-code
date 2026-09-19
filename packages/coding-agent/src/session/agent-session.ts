@@ -510,6 +510,7 @@ import {
 	getLatestCompactionEntry,
 	getSessionMessageEntryId,
 	getSessionMessageObservationId,
+	SESSION_LIMIT_RECOVERY_ACTIONS,
 	SessionAppendPersistenceError,
 	SessionContextTooLargeError,
 	SessionManager,
@@ -6703,7 +6704,7 @@ export class AgentSession {
 									text: [
 										"Session transcript reached the managed per-file limit; this result could not be recorded durably.",
 										committed,
-										"Continue by compacting the session (`/compact`) or exporting to a fresh session (`gjc export <session-file>`); re-verify the edited file before relying on it.",
+										`To continue, ${SESSION_LIMIT_RECOVERY_ACTIONS}; re-verify the edited file before relying on it.`,
 									].join("\n"),
 								},
 							];
