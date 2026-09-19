@@ -1914,6 +1914,35 @@ test("the stale-base markers survive comment stripping but not code removal (#56
 	}
 });
 
+test("malformed-record diagnostics advertise only grammar the parser accepts (#5740 review)", async () => {
+	// The verdict diagnostic omitted `merge-self-approved` and the self-review one both
+	// omitted it and advertised `extra:gpt-heavy`, which the regex rejects — an
+	// unreachable remedy handed to someone already stuck on malformed input.
+	//
+	// Assert the OVERLAP rather than the wording: every alternative the messages offer
+	// must be one the parser takes, so the two cannot drift apart again.
+	const source = await Bun.file(new URL("./verify-pr-verdict.ts", import.meta.url)).text();
+	const alternatives = (haystack: string, label: string): string[] => {
+		const found = haystack.match(new RegExp(`${label}<([^>]*)>`))?.[1];
+		expect({ label, found: found !== undefined }).toEqual({ label, found: true });
+		return (found ?? "").split("|");
+	};
+	// Verdict verbs the diagnostic offers must all appear in the verdict regex.
+	const verdictRegex = source.match(/\(merge-approved\|merge-self-approved\|merge-blocked[^)]*\)/)?.[0] ?? "";
+	expect(verdictRegex).not.toBe("");
+	for (const verb of alternatives(source, "verdict:")) {
+		if (verb === "needs-human") continue; // carried by the verdict line, not the record
+		expect({ verb, acceptedByParser: verdictRegex.includes(verb) }).toEqual({ verb, acceptedByParser: true });
+	}
+	// And every `extra:` alternative offered must be accepted too.
+	const extraRegex = source.match(/extra:\(([^)]*)\)/)?.[1] ?? "";
+	expect(extraRegex).not.toBe("");
+	for (const option of alternatives(source, "extra:")) {
+		const head = option.split(":")[0] ?? option;
+		expect({ option, acceptedByParser: extraRegex.includes(head) }).toEqual({ option, acceptedByParser: true });
+	}
+});
+
 test("no untrusted event field appears anywhere in a workflow run scalar (#5740 review)", async () => {
 	// Author-controlled text expanded into a `run:` body is shell injection. I introduced
 	// exactly that while fixing something else, so this makes the class impossible.
