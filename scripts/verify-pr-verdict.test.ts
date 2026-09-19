@@ -1345,6 +1345,11 @@ describe("push preflight independent-review evidence (issue #5483 review)", () =
 			permission: "write",
 		});
 		expect(result.exitCode).toBe(1);
+		// Prove the thing CI actually consumes, not just the internal decision: both
+		// `pr-validation.yml` and `dev-ci.yml` gate on this printed line, so a correct
+		// refusal that still printed `true` would authorize the merge anyway.
+		expect(result.stdout).toContain("gjc-merge-authorized=false");
+		expect(result.stdout).not.toContain("gjc-merge-authorized=true");
 	});
 	test("unreadable independent-review evidence is reported as unread, not as unauthorized", async () => {
 		const result = await runSelfReviewPushPreflight({
@@ -1492,8 +1497,10 @@ describe("server independent-reviewer evidence (issue #5483 review)", () => {
 		const spy = vi.spyOn(globalThis, "fetch").mockImplementation(replacement);
 		try {
 			const evidence = await fetchIndependentReviewerEvidence(event, "review-bot", head);
-			expect(evidence.approvedHead).toBe(false);
-			expect(evidence.refusedApproval).toBe("unreadable");
+			expect({ approvedHead: evidence.approvedHead, refusedApproval: evidence.refusedApproval }).toEqual({
+				approvedHead: false,
+				refusedApproval: "unreadable",
+			});
 		} finally {
 			spy.mockRestore();
 			if (previousToken === undefined) delete Bun.env.GITHUB_TOKEN;
@@ -1542,6 +1549,7 @@ describe("server independent-reviewer evidence (issue #5483 review)", () => {
 		// input shape (#5692 review).
 		{ name: "null", createdAt: null },
 		{ name: "absent", createdAt: undefined },
+		{ name: "blank", createdAt: "   " },
 	])("a force-push event with an unreadable time refuses, not falls back: $name (#5692 review)", async scenario => {
 		// A force-push DID happen; we simply cannot read when. Dropping it and using the
 		// contributor's committer date would reinstate the backdate hole, so "could not
