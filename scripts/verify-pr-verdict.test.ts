@@ -1,4 +1,5 @@
 import { describe, expect, test, vi } from "bun:test";
+import { Glob } from "bun";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as url from "node:url";
@@ -1914,89 +1915,154 @@ test("the stale-base markers survive comment stripping but not code removal (#56
 	}
 });
 
-test("malformed-record diagnostics advertise only grammar the parser accepts (#5740 review)", async () => {
-	// The verdict diagnostic omitted `merge-self-approved` and the self-review one both
-	// omitted it and advertised `extra:gpt-heavy`, which the regex rejects — an
+test("every malformed-record diagnostic matches its parser field for field (#5740 review)", async () => {
+	// Both messages described grammar the regexes reject: the verdict one omitted
+	// `merge-self-approved`, and the self-review one omitted it AND offered
+	// `extra:gpt-heavy`. Follow either exactly and the record still fails to parse — an
 	// unreachable remedy handed to someone already stuck on malformed input.
 	//
-	// Assert the OVERLAP rather than the wording: every alternative the messages offer
-	// must be one the parser takes, so the two cannot drift apart again.
+	// My first guard here was itself too narrow: it looked for `verdict:<...>`, which
+	// only the self-review message has, so the ordinary verdict diagnostic was never
+	// inspected and dropping `merge-self-approved` from it still passed (#5740 review).
+	//
+	// This asserts SET EQUALITY per field, in both directions. Advertising something the
+	// parser rejects fails, and so does quietly accepting something never advertised.
 	const source = await Bun.file(new URL("./verify-pr-verdict.ts", import.meta.url)).text();
-	const alternatives = (haystack: string, label: string): string[] => {
-		const found = haystack.match(new RegExp(`${label}<([^>]*)>`))?.[1];
-		expect({ label, found: found !== undefined }).toEqual({ label, found: true });
-		return (found ?? "").split("|");
+	const line = (needle: string): string => {
+		const found = source.split("\n").find((candidate) => candidate.includes(needle));
+		expect({ needle, found: found !== undefined }).toEqual({ needle, found: true });
+		return found ?? "";
 	};
-	// Verdict verbs the diagnostic offers must all appear in the verdict regex.
-	const verdictRegex = source.match(/\(merge-approved\|merge-self-approved\|merge-blocked[^)]*\)/)?.[0] ?? "";
-	expect(verdictRegex).not.toBe("");
-	for (const verb of alternatives(source, "verdict:")) {
-		if (verb === "needs-human") continue; // carried by the verdict line, not the record
-		expect({ verb, acceptedByParser: verdictRegex.includes(verb) }).toEqual({ verb, acceptedByParser: true });
-	}
-	// And every `extra:` alternative offered must be accepted too.
-	const extraRegex = source.match(/extra:\(([^)]*)\)/)?.[1] ?? "";
-	expect(extraRegex).not.toBe("");
-	for (const option of alternatives(source, "extra:")) {
-		const head = option.split(":")[0] ?? option;
-		expect({ option, acceptedByParser: extraRegex.includes(head) }).toEqual({ option, acceptedByParser: true });
-	}
+	// `independent:[^\s]+` and `independent:login` are the same alternative with a
+	// different placeholder, so compare on the head of a parameterised value.
+	const head = (alternative: string): string => alternative.split(":")[0] ?? alternative;
+	const set = (raw: string): string[] => [...new Set(raw.split("|").map(head))].sort();
+	const compare = (field: string, pattern: string, message: string, accepted: string, advertised: string): void => {
+		const acceptedSet = set(source.match(new RegExp(`${pattern}[^\n]*?${accepted}\\(([^)]*)\\)`))?.[1] ?? "");
+		const advertisedSet = set(line(message).match(new RegExp(`${advertised}<([^>]*)>`))?.[1] ?? "");
+		expect(acceptedSet.length).toBeGreaterThan(0);
+		expect({ field, advertised: advertisedSet }).toEqual({ field, advertised: acceptedSet });
+	};
+	// Domain 1 — the ordinary verdict line. This is the message my previous guard missed.
+	compare("verdict verb", "VERDICT_PATTERN", "Malformed ${VERDICT_PREFIX} line", "v1 ", "VERDICT_PREFIX} ");
+	compare("verdict reviewer", "VERDICT_PATTERN", "Malformed ${VERDICT_PREFIX} line", "reviewer:", "reviewer:");
+	// Domain 2 — the self-review record, every enumerated field of it.
+	const selfReview = "Malformed ${SELF_REVIEW_PREFIX} line";
+	compare("self-review verb", "SELF_REVIEW_PATTERN", selfReview, "verdict:", "verdict:");
+	compare("self-review risk", "SELF_REVIEW_PATTERN", selfReview, "risk:", "risk:");
+	compare("self-review extra", "SELF_REVIEW_PATTERN", selfReview, "extra:", "extra:");
 });
 
-test("no untrusted event field appears anywhere in a workflow run scalar (#5740 review)", async () => {
+test("every expression expanded into a workflow run scalar is explicitly justified (#5740 review)", async () => {
 	// Author-controlled text expanded into a `run:` body is shell injection. I introduced
-	// exactly that while fixing something else, so this makes the class impossible.
+	// exactly that while fixing something else, so this guard exists to make the CLASS
+	// impossible rather than the one instance I happened to hit.
 	//
-	// SHELL COMMENTS ARE NOT EXEMPT. GitHub expands `${{ ... }}` before bash sees the
-	// script, so a multiline comment body injects a new executable line even when the
-	// expression sits behind a `#`. My first version of this guard skipped comment lines
-	// and therefore passed the very vector it was written for (#5740 review).
+	// Two earlier versions of this guard were too narrow and each passed a live vector:
+	//   1. it skipped shell comment lines — but GitHub expands `${{ }}` before bash sees
+	//      the script, so a multiline body injects an executable line from behind a `#`;
+	//   2. it matched only `run: |` block scalars, only `github.event.*`, and a hardcoded
+	//      file list — so a single-line `run: echo "${{ github.event.comment.body }}"`,
+	//      a folded `>` scalar, an `inputs.*` fed from PR text, or a brand new composite
+	//      action all slipped through (#5740 review).
 	//
-	// The allowlist is fields GitHub constrains to characters that cannot break out of a
-	// shell word: integers it assigns, hex SHAs it computes, and repository names limited
-	// to [A-Za-z0-9._-]. Anything else must reach the script through `env:`.
-	const safe = new Set([
-		"github.event.pull_request.number",
-		"github.event.pull_request.head.sha",
-		"github.event.pull_request.base.sha",
-		"github.event.pull_request.head.repo.full_name",
-		"github.event.issue.number",
+	// So: enumerate EVERY workflow and composite action, parse EVERY scalar form, and
+	// require each expression to appear below with a reason. A new interpolation fails
+	// until someone writes down why it cannot carry a shell metacharacter. That is
+	// deliberately louder than a namespace rule — the namespace rules are what broke.
+	const justified = new Map<string, string>([
+		// GitHub-assigned integers.
+		["github.event.pull_request.number", "integer assigned by GitHub"],
+		["github.event.issue.number", "integer assigned by GitHub"],
+		// Hex object names computed by the server, never author text.
+		["github.event.pull_request.head.sha", "40-hex, server-computed"],
+		["github.event.pull_request.base.sha", "40-hex, server-computed"],
+		["github.sha", "40-hex, server-computed"],
+		["steps.pr.outputs.head_sha", "from the event or the API, both 40-hex"],
+		["steps.pr.outputs.base_sha", "from the event or the API, both 40-hex"],
+		// Names GitHub restricts to [A-Za-z0-9._-/].
+		["github.event.pull_request.head.repo.full_name", "repo name charset"],
+		["github.repository", "repo name charset"],
+		["github.server_url", "fixed origin"],
+		["github.run_id", "integer assigned by GitHub"],
+		// Creating a ref requires push access, and this use is on the release path only.
+		["github.ref", "ref name; writing one requires push access to a protected path"],
+		// Closed enums GitHub writes.
+		["steps.validate.outcome", "success|failure|cancelled|skipped"],
+		["needs.check.result", "closed result enum"],
+		["needs.test.result", "closed result enum"],
+		["needs.main_plan.result", "closed result enum"],
+		["needs.main_native.result", "closed result enum"],
+		["needs.main_shards.result", "closed result enum"],
+		["needs.acp_conformance.result", "closed result enum"],
+		["needs.affected-plan.result", "closed result enum"],
+		["needs.affected-evidence-producer.result", "closed result enum"],
+		["needs.gjc-state-gates-relevance.result", "closed result enum"],
+		["needs.gjc-state-gates-native.result", "closed result enum"],
+		["needs.gjc-state-gates-matrix.result", "closed result enum"],
+		// Values written by trusted steps in this repository, not by a contributor.
+		["steps.validate.outputs.merge_authorized", "literal true|false written by the step"],
+		["needs.gjc-state-gates-relevance.outputs.relevant", "literal true|false"],
+		["needs.affected-evidence-producer.outputs.artifact_id", "digest/id written by a trusted job"],
+		["needs.affected-evidence-producer.outputs.artifact_digest", "digest written by a trusted job"],
+		["needs.release_metadata.outputs.nightly_version", "generated by scripts/nightly-release.ts"],
+		["inputs.nightly_version", "same generated version, passed by ci.yml only"],
+		["inputs.hash", "hex digest computed in-workflow"],
+		// Matrix values are literals in the workflow file itself.
+		["matrix.binary_path", "workflow-fixed matrix literal"],
+		["matrix.group", "workflow-fixed matrix literal"],
 	]);
-	// Composite actions run with the same event context, so they are in scope too.
-	const surfaces = [
-		"../.github/workflows/pr-validation.yml",
-		"../.github/workflows/dev-ci.yml",
-		"../.github/workflows/ci.yml",
-		"../.github/actions/build-native/action.yml",
-	];
-	let scanned = 0;
-	for (const file of surfaces) {
-		const lines = (await Bun.file(new URL(file, import.meta.url)).text()).split("\n");
-		let inRun = false;
-		let indent = 0;
-		for (const [index, line] of lines.entries()) {
-			const opener = line.match(/^(\s*)(?:run|script):\s*\|/);
-			if (opener) {
-				inRun = true;
-				indent = opener[1]?.length ?? 0;
-				scanned++;
-				continue;
+	const files: string[] = [];
+	for (const dir of ["../.github/workflows", "../.github/actions"]) {
+		const root = new URL(dir, import.meta.url).pathname;
+		if (!(await fs.stat(root).then(() => true).catch(() => false))) continue;
+		for await (const found of new Glob("**/*.{yml,yaml}").scan({ cwd: root, absolute: true })) files.push(found);
+	}
+	files.sort();
+	let scalars = 0;
+	for (const file of files) {
+		const lines = (await Bun.file(file).text()).split("\n");
+		for (let i = 0; i < lines.length; i++) {
+			// Every scalar form: `run:`/`script:`, plain or as a list item.
+			const opener = (lines[i] ?? "").match(/^(\s*)(?:-\s+)?(?:run|script):\s*(.*)$/);
+			if (!opener) continue;
+			const indent = (opener[1] ?? "").length;
+			const rest = (opener[2] ?? "").trim();
+			scalars++;
+			let body = "";
+			if (/^[|>][-+]?\d*$/.test(rest)) {
+				// Literal or folded block, with any chomping or explicit-indent indicator.
+				for (let j = i + 1; j < lines.length; j++) {
+					const next = lines[j] ?? "";
+					if (next.trim() !== "" && next.search(/\S/) <= indent) break;
+					body += `${next}\n`;
+					i = j;
+				}
+			} else {
+				// Single-line scalar, plus any plain-scalar continuation lines.
+				body = rest;
+				for (let j = i + 1; j < lines.length; j++) {
+					const next = lines[j] ?? "";
+					if (next.trim() === "" || next.search(/\S/) <= indent) break;
+					body += `\n${next}`;
+					i = j;
+				}
 			}
-			if (inRun && line.trim() !== "" && line.search(/\S/) <= indent) inRun = false;
-			if (!inRun) continue;
-			for (const match of line.matchAll(/\$\{\{\s*(github\.event\.[A-Za-z0-9_.]+)\s*\}\}/g)) {
-				const field = match[1] ?? "";
-				expect({ file, line: index + 1, field, allowed: safe.has(field) }).toEqual({
-					file,
-					line: index + 1,
-					field,
-					allowed: true,
+			// Comments are NOT skipped: the expansion happens before bash parses them.
+			for (const match of body.matchAll(/\$\{\{\s*([^}]+?)\s*\}\}/g)) {
+				const expression = (match[1] ?? "").trim();
+				const relative = file.slice(file.indexOf("/.github/") + 1);
+				expect({ file: relative, expression, justified: justified.has(expression) }).toEqual({
+					file: relative,
+					expression,
+					justified: true,
 				});
 			}
 		}
 	}
-	// A guard that scanned nothing would pass silently.
-	expect(scanned).toBeGreaterThan(5);
+	// A scanner that silently matched nothing would pass. Pin both dimensions to the
+	// real surface so shrinking coverage fails instead of going quiet.
+	expect({ files: files.length >= 6, scalars: scalars >= 100 }).toEqual({ files: true, scalars: true });
 });
 
 test("issue_comment events cannot launch or cancel the affected Dev CI pipeline", async () => {
