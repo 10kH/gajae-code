@@ -2065,6 +2065,83 @@ test("every expression expanded into a workflow run scalar is explicitly justifi
 	expect({ files: files.length >= 6, scalars: scalars >= 100 }).toEqual({ files: true, scalars: true });
 });
 
+test("author-controlled env values are only ever read as a quoted word (#5740 review)", async () => {
+	// The injection guard forces untrusted text out of the expression layer and into
+	// `env:`. That is only half of the rule. A shell that reads $PR_BODY unquoted, or
+	// evals it, re-opens the identical class one layer down — the value is now a shell
+	// word rather than shell source, but word splitting and globbing still act on it,
+	// and `eval` promotes it straight back to source.
+	//
+	// Nothing enforced the second half, so this closes the class rather than the
+	// instance. Today every use is already quoted; this keeps it that way.
+	const files: string[] = [];
+	for (const dir of ["../.github/workflows", "../.github/actions"]) {
+		const root = new URL(dir, import.meta.url).pathname;
+		if (!(await fs.stat(root).then(() => true).catch(() => false))) continue;
+		for await (const found of new Glob("**/*.{yml,yaml}").scan({ cwd: root, absolute: true })) files.push(found);
+	}
+	files.sort();
+	// Names bound from free text or from refs a contributor chooses, as opposed to the
+	// integers and hex object names GitHub computes.
+	const authorControlled = /comment\.body|changes\.body|pull_request\.body|pull_request\.title|\.base\.ref|\.head\.ref|user\.login/;
+	const names = new Set<string>();
+	for (const file of files) {
+		const text = await Bun.file(file).text();
+		for (const match of text.matchAll(/^\s+([A-Z_][A-Z0-9_]*):\s*\$\{\{\s*([^}]+?)\s*\}\}/gm)) {
+			if (authorControlled.test(match[2] ?? "")) names.add(match[1] ?? "");
+		}
+	}
+	// If this ever empties, the scan broke rather than the risk disappearing.
+	expect(names.size).toBeGreaterThanOrEqual(5);
+	let inspected = 0;
+	for (const file of files) {
+		const relative = file.slice(file.indexOf("/.github/") + 1);
+		const lines = (await Bun.file(file).text()).split("\n");
+		for (const [index, line] of lines.entries()) {
+			for (const name of names) {
+				if (new RegExp(`^\\s+${name}:`).test(line)) continue; // the binding itself
+				for (const use of line.matchAll(new RegExp(`\\$\\{?${name}\\b`, "g"))) {
+					inspected++;
+					// Counting quotes on the line is not enough: `x="$(cmd "arg")"` resets
+					// quoting inside the command substitution, and my first version
+					// reported two real, correctly quoted uses as bare. A guard that
+					// cries wolf gets deleted, so walk the shell contexts properly.
+					const evaluated = /\beval\b/.test(line);
+					const quoted = ((): boolean => {
+						const stack: { double: boolean; single: boolean }[] = [{ double: false, single: false }];
+						for (let at = 0; at < (use.index ?? 0); at++) {
+							const top = stack[stack.length - 1];
+							if (top === undefined) break;
+							const character = line[at];
+							if (character === "\\" && top.double) {
+								at++;
+								continue;
+							}
+							if (character === "'" && !top.double) top.single = !top.single;
+							else if (character === '"' && !top.single) top.double = !top.double;
+							else if (!top.single && character === "$" && line[at + 1] === "(") {
+								stack.push({ double: false, single: false });
+								at++;
+							} else if (!top.single && character === ")" && stack.length > 1) stack.pop();
+						}
+						const top = stack[stack.length - 1];
+						// Single quotes suppress expansion entirely, so they are safe too.
+						return top !== undefined && (top.double || top.single);
+					})();
+					expect({ file: relative, line: index + 1, name, quoted, evaluated }).toEqual({
+						file: relative,
+						line: index + 1,
+						name,
+						quoted: true,
+						evaluated: false,
+					});
+				}
+			}
+		}
+	}
+	expect(inspected).toBeGreaterThan(0);
+});
+
 test("issue_comment events cannot launch or cancel the affected Dev CI pipeline", async () => {
 	const devCi = await Bun.file(new URL("../.github/workflows/dev-ci.yml", import.meta.url)).text();
 	expect(devCi).not.toContain("issue_comment:");
