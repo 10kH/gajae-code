@@ -2186,15 +2186,25 @@ test("every env value bound from an expression is read as a quoted word (#5740 r
 	expect(inspected).toBeGreaterThan(0);
 });
 
-test("every bash run scalar is syntactically valid bash (#5740 review)", async () => {
+test("every run scalar is checked by the interpreter that will actually run it (#5740 review)", async () => {
 	// YAML validity and TypeScript tests both passed while the Dev CI PR contract
 	// bootstrap could not be parsed by bash at all. Two of my own prose comments
 	// ("timeline's", "bootstrap's") sat inside a single-quoted `bun -e '...'`
 	// argument; the apostrophe closed the quote and handed the rest of the JavaScript
 	// to the shell. Every PR targeting dev failed that required job, and it stayed
-	// hidden because pushing straight to dev never runs it.
+	// hidden because pushing straight to dev never runs it. Nothing I had was capable
+	// of noticing, because nothing asked bash. So ask bash.
 	//
-	// Nothing I had was capable of noticing, because nothing asked bash. So ask bash.
+	// Getting to "which steps are bash" took three tries, each one assuming away a
+	// case: first any non-`bash` shell string was silently skipped, then omitted was
+	// taken to mean bash regardless of `defaults.run.shell`, and then regardless of
+	// the RUNNER — but GitHub defaults an omitted shell to pwsh on Windows, and four
+	// live jobs rely on that. bash -n was validating PowerShell and reporting success
+	// (#5740 review).
+	//
+	// So the shell is now RESOLVED: step override, then nearest declared default,
+	// then the platform default of each runner the job can expand to. Anything that
+	// cannot be resolved fails rather than being assumed.
 	const files: string[] = [];
 	for (const dir of ["../.github/workflows", "../.github/actions"]) {
 		const root = new URL(dir, import.meta.url).pathname;
@@ -2202,70 +2212,88 @@ test("every bash run scalar is syntactically valid bash (#5740 review)", async (
 		for await (const found of new Glob("**/*.{yml,yaml}").scan({ cwd: root, absolute: true })) files.push(found);
 	}
 	files.sort();
-	type ShellStep = { name?: string; run?: string; shell?: string };
-	const steps = (node: unknown, sink: ShellStep[]): void => {
-		if (Array.isArray(node)) {
-			for (const item of node) steps(item, sink);
-			return;
-		}
-		if (node === null || typeof node !== "object") return;
-		const candidate = node as ShellStep;
-		if (typeof candidate.run === "string") sink.push(candidate);
-		for (const value of Object.values(node)) steps(value, sink);
+	type Step = { name?: string; run?: unknown; shell?: unknown };
+	type Job = {
+		"runs-on"?: unknown;
+		strategy?: { matrix?: Record<string, unknown> };
+		defaults?: { run?: { shell?: unknown } };
+		steps?: unknown;
 	};
-	// `defaults.run.shell` changes what an unset step shell MEANS, at workflow or job
-	// level. Assuming omitted == bash without checking would be the same silent
-	// assumption the skip was (#5740 review). Any non-bash default is refused outright.
-	const defaultShells = (node: unknown, key?: string): string[] => {
-		if (key === "defaults" && node !== null && typeof node === "object" && !Array.isArray(node)) {
-			const run = (node as { run?: { shell?: unknown } }).run;
-			return typeof run?.shell === "string" ? [run.shell] : [];
-		}
-		if (Array.isArray(node)) return node.flatMap((item) => defaultShells(item, key));
-		if (node !== null && typeof node === "object") {
-			return Object.entries(node).flatMap(([childKey, value]) => defaultShells(value, childKey));
-		}
-		return [];
+	type Doc = { jobs?: Record<string, Job>; runs?: { steps?: unknown }; defaults?: { run?: { shell?: unknown } } };
+	// Every runner label a job can expand to, or [] when that cannot be decided here.
+	const runners = (job: Job): string[] => {
+		const declared = job["runs-on"];
+		const labels = typeof declared === "string" ? [declared] : Array.isArray(declared) ? declared : [];
+		const concrete = labels.filter((label): label is string => typeof label === "string" && !label.includes("${{"));
+		if (concrete.length > 0) return concrete;
+		// `runs-on: ${{ matrix.os }}` — take the values the matrix actually declares.
+		const matrix = job.strategy?.matrix ?? {};
+		const direct = Array.isArray(matrix.os) ? matrix.os : [];
+		const included = Array.isArray(matrix.include)
+			? matrix.include.map((entry) => (entry as { os?: unknown }).os)
+			: [];
+		return [...direct, ...included].filter((value): value is string => typeof value === "string");
+	};
+	const platformShell = (runner: string): string => (/windows/i.test(runner) ? "pwsh" : "bash");
+	const stepsOf = (node: unknown): Step[] => {
+		if (!Array.isArray(node)) return [];
+		return node.filter((entry): entry is Step => entry !== null && typeof entry === "object");
 	};
 	let checked = 0;
+	let skippedPwsh = 0;
 	for (const file of files) {
-		const document = parse(await Bun.file(file).text());
-		for (const declared of defaultShells(document)) {
-			expect({ file: file.slice(file.indexOf("/.github/") + 1), defaultShell: declared }).toEqual({
-				file: file.slice(file.indexOf("/.github/") + 1),
-				defaultShell: "bash",
+		const relative = file.slice(file.indexOf("/.github/") + 1);
+		const document = parse(await Bun.file(file).text()) as Doc;
+		const workflowDefault = document.defaults?.run?.shell;
+		const units: { label: string; steps: Step[]; shells: string[] }[] = [];
+		for (const [jobName, job] of Object.entries(document.jobs ?? {})) {
+			const resolved = runners(job);
+			// An unresolvable runner is a failure, not an assumption.
+			expect({ file: relative, job: jobName, runnerResolved: resolved.length > 0 }).toEqual({
+				file: relative,
+				job: jobName,
+				runnerResolved: true,
 			});
+			const declaredDefault = job.defaults?.run?.shell ?? workflowDefault;
+			const shells =
+				declaredDefault === undefined
+					? [...new Set(resolved.map(platformShell))]
+					: [String(declaredDefault)];
+			units.push({ label: `job ${jobName}`, steps: stepsOf(job.steps), shells });
 		}
-		const found: ShellStep[] = [];
-		steps(document, found);
-		for (const step of found) {
-			// An unset shell means bash on every runner this repo uses. `pwsh` is a
-			// different grammar and bash -n would reject it wrongly.
-			//
-			// Anything ELSE is refused rather than skipped. A silent skip is how a step
-			// escapes: `shell: sh`, or the `bash -e {0}` custom form, would have passed
-			// this guard by not being checked at all (#5740 review).
-			const shell = step.shell ?? "bash";
-			if (shell === "pwsh" || shell === "powershell") continue;
-			expect({ shell, recognised: shell === "bash" }).toEqual({ shell, recognised: true });
-			checked++;
-			const parsed = Bun.spawnSync(["bash", "-n"], { stdin: Buffer.from(step.run ?? ""), stderr: "pipe" });
-			const diagnostic = new TextDecoder().decode(parsed.stderr).trim().split("\n")[0] ?? "";
-			expect({
-				file: file.slice(file.indexOf("/.github/") + 1),
-				step: step.name ?? "(unnamed)",
-				parses: parsed.exitCode === 0,
-				diagnostic: parsed.exitCode === 0 ? "" : diagnostic,
-			}).toEqual({
-				file: file.slice(file.indexOf("/.github/") + 1),
-				step: step.name ?? "(unnamed)",
-				parses: true,
-				diagnostic: "",
-			});
+		// A composite action has no runner context; GitHub requires an explicit shell
+		// on every run step, so an omission there is itself the defect.
+		if (document.runs?.steps !== undefined) units.push({ label: "composite", steps: stepsOf(document.runs.steps), shells: [] });
+		for (const unit of units) {
+			for (const step of unit.steps) {
+				if (typeof step.run !== "string") continue;
+				const where = { file: relative, unit: unit.label, step: step.name ?? "(unnamed)" };
+				const effective =
+					step.shell === undefined ? unit.shells : [typeof step.shell === "string" ? step.shell : JSON.stringify(step.shell)];
+				expect({ ...where, shellResolved: effective.length > 0 }).toEqual({ ...where, shellResolved: true });
+				for (const shell of effective) {
+					if (shell === "pwsh" || shell === "powershell") {
+						skippedPwsh++;
+						continue;
+					}
+					// Anything unrecognised is refused rather than skipped: a silent skip
+					// is indistinguishable from approval.
+					expect({ ...where, shell, recognised: shell === "bash" }).toEqual({ ...where, shell, recognised: true });
+					checked++;
+					const parsed = Bun.spawnSync(["bash", "-n"], { stdin: Buffer.from(step.run), stderr: "pipe" });
+					const diagnostic = new TextDecoder().decode(parsed.stderr).trim().split("\n")[0] ?? "";
+					expect({ ...where, parses: parsed.exitCode === 0, diagnostic: parsed.exitCode === 0 ? "" : diagnostic }).toEqual({
+						...where,
+						parses: true,
+						diagnostic: "",
+					});
+				}
+			}
 		}
 	}
-	// 115 bash steps today; a collapse to a handful means the traversal broke.
-	expect(checked).toBeGreaterThanOrEqual(100);
+	// Both dimensions pinned: a collapse in either means the resolver broke rather
+	// than the workflows getting safer.
+	expect({ bash: checked >= 95, pwsh: skippedPwsh >= 20 }).toEqual({ bash: true, pwsh: true });
 });
 
 test("issue_comment events cannot launch or cancel the affected Dev CI pipeline", async () => {
