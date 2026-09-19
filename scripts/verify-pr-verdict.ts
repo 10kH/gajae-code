@@ -179,19 +179,35 @@ function latestKnownHeadTime(
  * reviewer had withdrawn. A withdrawal whose time cannot be read must refuse, never vanish
  * (#5692 review).
  */
-function effectiveExactHeadReview(
+/**
+ * The identity's last word on the exact head, before any freshness judgement.
+ *
+ * Single-sourced because `effectiveExactHeadReview` and `refusedApprovalKind` must never
+ * disagree about which review counts. They each had their own copy of this filter, and when
+ * only one was reordered to select before judging freshness the two diverged — the same
+ * class of split that produced #5483 (#5692 review).
+ */
+function lastExactHeadReview(
 	reviews: EffectiveReview[],
 	login: string,
 	headSha: string,
-	headKnownAt: string | undefined,
 ): EffectiveReview | undefined {
-	const lastOnHead = reviews
+	return reviews
 		.filter(review =>
 			review.login?.toLowerCase() === login.toLowerCase()
 			&& review.state !== "COMMENTED"
 			&& review.oid === headSha,
 		)
 		.at(-1);
+}
+
+function effectiveExactHeadReview(
+	reviews: EffectiveReview[],
+	login: string,
+	headSha: string,
+	headKnownAt: string | undefined,
+): EffectiveReview | undefined {
+	const lastOnHead = lastExactHeadReview(reviews, login, headSha);
 	if (lastOnHead === undefined) return undefined;
 	return reviewPrecedesHead(lastOnHead.submittedAt, headKnownAt) ? undefined : lastOnHead;
 }
@@ -210,28 +226,21 @@ function refusedApprovalKind(
 	reviews: EffectiveReview[],
 	login: string,
 	headSha: string,
-	headCommittedAt: string | undefined,
+	headKnownAt: string | undefined,
 ): RefusedApprovalKind {
-	// Only reviews that are still the identity's LAST word count. A later
-	// CHANGES_REQUESTED on the same head is an ordinary withdrawal, not a freshness
-	// problem, and must keep reporting as "no approval" rather than as a refusal.
-	const lastOnHead = reviews
-		.filter(review =>
-			review.login?.toLowerCase() === login.toLowerCase()
-			&& review.state !== "COMMENTED"
-			&& review.oid === headSha,
-		)
-		.at(-1);
+	// Shares `lastExactHeadReview` with `effectiveExactHeadReview` so the two can never
+	// disagree about which review counts. Duplicating the selection here is exactly the
+	// divergence that produced #5483, and it reappeared once already when only one of the
+	// two was reordered to select before judging freshness (#5692 review).
+	const lastOnHead = lastExactHeadReview(reviews, login, headSha);
+	// A later CHANGES_REQUESTED is an ordinary withdrawal, not a freshness problem, and
+	// must keep reporting as "no approval" rather than as a refusal.
 	if (lastOnHead?.state !== "APPROVED") return undefined;
-	const bound = [lastOnHead];
-	const headMs = headCommittedAt === undefined ? Number.NaN : Date.parse(headCommittedAt);
+	const headMs = headKnownAt === undefined ? Number.NaN : Date.parse(headKnownAt);
 	if (!Number.isFinite(headMs)) return "unreadable";
-	if (bound.some(review => {
-		const submitted = review.submittedAt === undefined ? Number.NaN : Date.parse(review.submittedAt);
-		return Number.isFinite(submitted) && submitted <= headMs;
-	}))
-		return "rebound";
-	return "unreadable";
+	const submitted = lastOnHead.submittedAt === undefined ? Number.NaN : Date.parse(lastOnHead.submittedAt);
+	if (!Number.isFinite(submitted)) return "unreadable";
+	return submitted <= headMs ? "rebound" : "unreadable";
 }
 
 /** Spreadable `refusedApproval` field, omitted entirely when there is nothing to report. */

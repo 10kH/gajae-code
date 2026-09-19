@@ -1525,6 +1525,48 @@ describe("server independent-reviewer evidence (issue #5483 review)", () => {
 			else Bun.env.GITHUB_TOKEN = previousToken;
 		}
 	});
+
+	test("the refusal reason and the approval decision agree on which review counts (#5483, #5692)", async () => {
+		// The two functions kept their own copies of the selection, and when only one was
+		// reordered to select before judging freshness they diverged: the approval path
+		// correctly refused a withdrawn review while the reason path still described the
+		// earlier approval. They now share `lastExactHeadReview`; this pins that they cannot
+		// disagree again by asserting the pair, not either half alone.
+		const originalFetch = globalThis.fetch;
+		const previousToken = Bun.env.GITHUB_TOKEN;
+		Bun.env.GITHUB_TOKEN = "test-token";
+		const replacement: typeof fetch = Object.assign(async (input: Parameters<typeof fetch>[0]) => {
+			const endpoint = String(input);
+			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/pulls/5416/reviews"))
+				return Response.json([
+					// A re-bound approval, then a valid later withdrawal on the same head.
+					review("review-bot", "APPROVED", head, beforeHead),
+					review("review-bot", "CHANGES_REQUESTED"),
+				]);
+			if (endpoint === `https://api.github.com/repos/owner/repo/commits/${head}`)
+				return Response.json({ commit: { committer: { date: headCommittedAt } } });
+			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/issues/5416/timeline"))
+				return Response.json([]);
+			if (endpoint === "https://api.github.com/repos/owner/repo/collaborators/review-bot/permission")
+				return Response.json({ permission: "write" });
+			throw new Error(`Unexpected endpoint: ${endpoint}`);
+		}, { preconnect: originalFetch.preconnect });
+		const spy = vi.spyOn(globalThis, "fetch").mockImplementation(replacement);
+		try {
+			const evidence = await fetchIndependentReviewerEvidence(event, "review-bot", head);
+			// The withdrawal is the last word, so there is no approval AND no re-bound
+			// approval to describe — reporting "rebound" here would point the author at the
+			// wrong remedy.
+			expect({ approvedHead: evidence.approvedHead, refusedApproval: evidence.refusedApproval }).toEqual({
+				approvedHead: false,
+				refusedApproval: undefined,
+			});
+		} finally {
+			spy.mockRestore();
+			if (previousToken === undefined) delete Bun.env.GITHUB_TOKEN;
+			else Bun.env.GITHUB_TOKEN = previousToken;
+		}
+	});
 });
 
 test("workflow is trusted-default-branch-controlled, read-only, exact-head, and invokes only base code", async () => {
