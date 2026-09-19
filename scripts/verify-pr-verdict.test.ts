@@ -1694,13 +1694,47 @@ test("comment-triggered validation publishes a head-bound check run under the re
 	// reported the base as current (#5692 review).
 	expect(workflow).toContain('|| stale_base="self-review validation"');
 	expect(workflow).toContain('|| stale_base="${stale_base:+$stale_base and }approval freshness binding"');
-	// The freshness marker must be a code-only token: `head_ref_force_pushed` also
-	// appears in a doc comment, so a base keeping the prose while losing the
-	// implementation would have passed.
+	// BOTH markers must be code-only tokens. `gajae.pr-self-review.v1` and
+	// `head_ref_force_pushed` each also appear in prose, so a base that kept the
+	// comments while losing the implementation would have passed.
+	expect(workflow).toContain('grep -q "selfReviewSatisfiesPolicy("');
 	expect(workflow).toContain('grep -q "reviewPrecedesHead("');
 	expect(workflow).toContain('if [[ -n "$stale_base" ]]; then');
 	// Both published names must go red together, never just the contract one.
 	expect(workflow).toContain('approval_summary="$summary"');
+});
+
+test("the stale-base markers survive comment stripping but not code removal (#5692 review)", async () => {
+	// The guard's whole job is to prove BEHAVIOUR exists in the trusted base. A marker
+	// a comment can satisfy proves only that someone once wrote about the behaviour.
+	//
+	// Simulate the two drift directions against the real validator source rather than a
+	// hand-written fixture: strip every comment (behaviour intact -> must still pass),
+	// then strip executable code while KEEPING the comments (behaviour gone -> must fail).
+	const source = await Bun.file(new URL("../scripts/verify-pr-verdict.ts", import.meta.url)).text();
+	const markers = ["selfReviewSatisfiesPolicy(", "reviewPrecedesHead("];
+
+	const codeOnly = source
+		.replaceAll(/\/\*[\s\S]*?\*\//g, "")
+		.split("\n")
+		.filter(line => !line.trimStart().startsWith("//"))
+		.join("\n");
+	for (const marker of markers) {
+		expect({ marker, presentInCode: codeOnly.includes(marker) }).toEqual({ marker, presentInCode: true });
+	}
+
+	// Comments and string literals only: what a base would look like if the
+	// implementation were reverted but the documentation left behind.
+	const proseOnly = [
+		...(source.match(/\/\*[\s\S]*?\*\//g) ?? []),
+		...source.split("\n").filter(line => line.trimStart().startsWith("//")),
+	].join("\n");
+	for (const marker of markers) {
+		expect({ marker, satisfiableByProse: proseOnly.includes(marker) }).toEqual({
+			marker,
+			satisfiableByProse: false,
+		});
+	}
 });
 
 test("issue_comment events cannot launch or cancel the affected Dev CI pipeline", async () => {

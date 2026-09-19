@@ -185,12 +185,12 @@ jobs:
             # reported the base as current (#5692 review).
             stale_base=""
             if [[ -f "$trusted_root/scripts/verify-pr-verdict.ts" ]]; then
-              grep -q "gajae.pr-self-review.v1" "$trusted_root/scripts/verify-pr-verdict.ts" \
+              # Both markers must be CODE-ONLY tokens. `gajae.pr-self-review.v1` and
+              # `head_ref_force_pushed` each also appear in prose, so a base that kept
+              # the comments while losing the implementation would pass the guard — the
+              # same shape as the bug the guard exists to catch (#5692 review).
+              grep -q "selfReviewSatisfiesPolicy(" "$trusted_root/scripts/verify-pr-verdict.ts" \
                 || stale_base="self-review validation"
-              # Match a CODE-ONLY token. `head_ref_force_pushed` also appears in a doc
-              # comment, so a base that kept the prose while losing the implementation
-              # would pass. `reviewPrecedesHead(` exists only as a declaration and a
-              # call site.
               grep -q "reviewPrecedesHead(" "$trusted_root/scripts/verify-pr-verdict.ts" \
                 || stale_base="${stale_base:+$stale_base and }approval freshness binding"
             fi
