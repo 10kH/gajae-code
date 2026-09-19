@@ -1694,6 +1694,10 @@ test("comment-triggered validation publishes a head-bound check run under the re
 	// reported the base as current (#5692 review).
 	expect(workflow).toContain('|| stale_base="self-review validation"');
 	expect(workflow).toContain('|| stale_base="${stale_base:+$stale_base and }approval freshness binding"');
+	// The freshness marker must be a code-only token: `head_ref_force_pushed` also
+	// appears in a doc comment, so a base keeping the prose while losing the
+	// implementation would have passed.
+	expect(workflow).toContain('grep -q "reviewPrecedesHead("');
 	expect(workflow).toContain('if [[ -n "$stale_base" ]]; then');
 	// Both published names must go red together, never just the contract one.
 	expect(workflow).toContain('approval_summary="$summary"');

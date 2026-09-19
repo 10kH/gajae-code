@@ -187,7 +187,11 @@ jobs:
             if [[ -f "$trusted_root/scripts/verify-pr-verdict.ts" ]]; then
               grep -q "gajae.pr-self-review.v1" "$trusted_root/scripts/verify-pr-verdict.ts" \
                 || stale_base="self-review validation"
-              grep -q "head_ref_force_pushed" "$trusted_root/scripts/verify-pr-verdict.ts" \
+              # Match a CODE-ONLY token. `head_ref_force_pushed` also appears in a doc
+              # comment, so a base that kept the prose while losing the implementation
+              # would pass. `reviewPrecedesHead(` exists only as a declaration and a
+              # call site.
+              grep -q "reviewPrecedesHead(" "$trusted_root/scripts/verify-pr-verdict.ts" \
                 || stale_base="${stale_base:+$stale_base and }approval freshness binding"
             fi
             if [[ -n "$stale_base" ]]; then
