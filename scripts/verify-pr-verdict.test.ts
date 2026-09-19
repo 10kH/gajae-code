@@ -1717,16 +1717,38 @@ test("comment-triggered validation publishes a head-bound check run under the re
 	};
 	const resolvePr = stepOf("name: Resolve PR head/base from the event or the comment's PR");
 	const revoke = stepOf("name: Revoke any prior approval for this head before re-validating");
-	const checkout = stepOf("uses: actions/checkout@");
-	const setupBun = stepOf("uses: oven-sh/setup-bun@");
-	const validate = stepOf("name: Validate body, exact head, immutable base, reviewer, and fast gate");
-	const publish = stepOf("name: Publish head-bound check results for comment-triggered validation");
+	// EVERY fallible step must follow the revoke, not just the first of each kind. The
+	// job has two checkouts; asserting only the first would miss a second one inserted
+	// ahead of the revoke. Same instances-versus-property mistake as the earlier pins.
+	const allStepsMatching = (needle: string): number[] => {
+		const found: number[] = [];
+		for (let at = workflow.indexOf(needle); at > -1; at = workflow.indexOf(needle, at + 1)) {
+			found.push(workflow.lastIndexOf("      - ", at));
+		}
+		expect({ needle, count: found.length }).toEqual({ needle, count: found.length });
+		expect(found.length).toBeGreaterThan(0);
+		return found;
+	};
+	const fallible: Array<[string, number[]]> = [
+		["checkout", allStepsMatching("uses: actions/checkout@")],
+		["setup-bun", allStepsMatching("uses: oven-sh/setup-bun@")],
+		["validate", allStepsMatching("name: Validate body, exact head, immutable base, reviewer, and fast gate")],
+		["publish", allStepsMatching("name: Publish head-bound check results for comment-triggered validation")],
+	];
 	// Resolution may precede the revoke because the head SHA is needed to address the
-	// check run. Nothing fallible may.
+	// check run, and it needs no checkout. Nothing fallible may.
 	expect(resolvePr).toBeLessThan(revoke);
-	for (const [label, at] of [["checkout", checkout], ["setup-bun", setupBun], ["validate", validate], ["publish", publish]] as const) {
-		expect({ step: label, afterRevoke: at > revoke }).toEqual({ step: label, afterRevoke: true });
+	for (const [label, positions] of fallible) {
+		for (const [index, at] of positions.entries()) {
+			expect({ step: `${label}[${index}]`, afterRevoke: at > revoke }).toEqual({
+				step: `${label}[${index}]`,
+				afterRevoke: true,
+			});
+		}
 	}
+	// The job has exactly two checkouts today; if that changes, the loop above still
+	// covers the new one, but pin the count so a silent restructure is visible.
+	expect(fallible[0]?.[1].length).toBe(2);
 	// Within the publication step the contract result is written before the approval is
 	// raised, so a failed contract write cannot leave a green approval.
 	const publishContract = workflow.indexOf('"output[summary]=$summary"');
