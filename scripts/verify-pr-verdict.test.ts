@@ -2051,12 +2051,13 @@ test("every expression expanded into a workflow run scalar is explicitly justifi
 		}
 		return [];
 	};
-	let scalars = 0;
+	const counts = new Map<string, number>();
 	for (const file of files) {
 		const relative = file.slice(file.indexOf("/.github/") + 1);
 		const document = parse(await Bun.file(file).text()) as unknown;
-		for (const scalar of shellScalars(document)) {
-			scalars++;
+		const found = shellScalars(document);
+		counts.set(relative, found.length);
+		for (const scalar of found) {
 			const { found, unterminated } = expressionsIn(scalar);
 			expect({ file: relative, unterminated }).toEqual({ file: relative, unterminated: false });
 			for (const expression of found) {
@@ -2069,9 +2070,24 @@ test("every expression expanded into a workflow run scalar is explicitly justifi
 			}
 		}
 	}
-	// A scanner that silently matched nothing would pass. Pin both dimensions to the
-	// real surface so shrinking coverage fails instead of going quiet.
-	expect({ files: files.length >= 6, scalars: scalars >= 100 }).toEqual({ files: true, scalars: true });
+	// An AGGREGATE floor does not notice one file going silent: renaming every `run:`
+	// key in pr-validation.yml — the file with `checks: write` — made it contribute
+	// zero scalars while dev-ci.yml alone still cleared 100, and the guard stayed
+	// green. So the floor is per file, and every known file must still be there.
+	const expected = new Map<string, number>([
+		[".github/actions/build-native/action.yml", 7],
+		[".github/workflows/ci.yml", 33],
+		[".github/workflows/dev-ci.yml", 73],
+		[".github/workflows/pr-validation.yml", 7],
+		[".github/workflows/public-site-sync.yml", 4],
+		[".github/workflows/spoofed-version-sync.yml", 2],
+	]);
+	const missing = [...expected.keys()].filter((name) => !counts.has(name));
+	expect({ missing }).toEqual({ missing: [] });
+	for (const [name, minimum] of expected) {
+		const seen = counts.get(name) ?? 0;
+		expect({ name, atLeast: minimum, seen: seen >= minimum }).toEqual({ name, atLeast: minimum, seen: true });
+	}
 });
 
 test("every env value bound from an expression is read as a quoted word (#5740 review)", async () => {
