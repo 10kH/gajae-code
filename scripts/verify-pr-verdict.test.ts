@@ -2,6 +2,7 @@ import { describe, expect, test, vi } from "bun:test";
 import { Glob } from "bun";
 import { parse } from "yaml";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import * as url from "node:url";
 import {
@@ -2186,6 +2187,23 @@ test("every env value bound from an expression is read as a quoted word (#5740 r
 	expect(inspected).toBeGreaterThan(0);
 });
 
+// Parse a PowerShell body with PowerShell's own AST parser, without executing it.
+// Returns "" when clean, or the parser's diagnostics. Mirrors the established pattern
+// in scripts/install-tests/install-ps1-compat.test.ts.
+const parsePowerShell = async (pwshPath: string, body: string): Promise<string> => {
+	const file = path.join(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-pwsh-parse-")), "step.ps1");
+	await Bun.write(file, body);
+	const script = [
+		"$errors = $null",
+		`[System.Management.Automation.Language.Parser]::ParseFile('${file}', [ref]$null, [ref]$errors) | Out-Null`,
+		"if ($errors -and $errors.Count -gt 0) { $errors | ForEach-Object { Write-Output $_.Message }; exit 1 }",
+		"exit 0",
+	].join("; ");
+	const proc = Bun.spawn([pwshPath, "-NoProfile", "-Command", script], { stdout: "pipe", stderr: "pipe" });
+	const [exitCode, stdout] = await Promise.all([proc.exited, new Response(proc.stdout).text()]);
+	return exitCode === 0 ? "" : stdout.trim() || `PowerShell parser exited ${exitCode}`;
+};
+
 test("every run scalar is checked by the interpreter that will actually run it (#5740 review)", async () => {
 	// YAML validity and TypeScript tests both passed while the Dev CI PR contract
 	// bootstrap could not be parsed by bash at all. Two of my own prose comments
@@ -2240,7 +2258,7 @@ test("every run scalar is checked by the interpreter that will actually run it (
 		return node.filter((entry): entry is Step => entry !== null && typeof entry === "object");
 	};
 	let checked = 0;
-	let skippedPwsh = 0;
+	const powershell: { file: string; unit: string; step: string; body: string }[] = [];
 	for (const file of files) {
 		const relative = file.slice(file.indexOf("/.github/") + 1);
 		const document = parse(await Bun.file(file).text()) as Doc;
@@ -2273,7 +2291,11 @@ test("every run scalar is checked by the interpreter that will actually run it (
 				expect({ ...where, shellResolved: effective.length > 0 }).toEqual({ ...where, shellResolved: true });
 				for (const shell of effective) {
 					if (shell === "pwsh" || shell === "powershell") {
-						skippedPwsh++;
+						// Recognising pwsh is not validating it. The previous version counted
+						// these and moved on, so the test's own name was false for eleven live
+						// steps and a malformed PowerShell body kept both floors satisfied
+						// (#5740 review). Parse them with PowerShell's own AST parser.
+						powershell.push({ ...where, body: step.run });
 						continue;
 					}
 					// Anything unrecognised is refused rather than skipped: a silent skip
@@ -2293,7 +2315,55 @@ test("every run scalar is checked by the interpreter that will actually run it (
 	}
 	// Both dimensions pinned: a collapse in either means the resolver broke rather
 	// than the workflows getting safer.
-	expect({ bash: checked >= 95, pwsh: skippedPwsh >= 20 }).toEqual({ bash: true, pwsh: true });
+	expect({ bash: checked >= 95, pwsh: powershell.length >= 20 }).toEqual({ bash: true, pwsh: true });
+
+	// PowerShell bodies are parsed by PowerShell. When pwsh is absent the guard says
+	// so out loud rather than reporting success it did not earn -- GitHub's Linux
+	// runners ship pwsh, so CI exercises this even though a mac dev box may not.
+	const pwshPath = Bun.which("pwsh");
+	if (pwshPath === null) {
+		console.warn(`pwsh not installed: ${powershell.length} PowerShell run scalars were NOT syntax-checked`);
+		return;
+	}
+	for (const candidate of powershell) {
+		const diagnostics = await parsePowerShell(pwshPath, candidate.body);
+		expect({ file: candidate.file, step: candidate.step, diagnostics }).toEqual({
+			file: candidate.file,
+			step: candidate.step,
+			diagnostics: "",
+		});
+	}
+});
+
+test("the PowerShell parse helper surfaces diagnostics rather than swallowing them (#5740 review)", async () => {
+	// pwsh is absent on this mac dev box, so the guard above skips its 23 bodies and
+	// says so. That skip must not also hide a broken helper: if the plumbing were
+	// wrong, the check would silently pass on CI too, where pwsh IS present.
+	//
+	// So exercise the helper against stub parsers with the real contract -- write the
+	// body to a file, invoke the binary, map exit code and stdout -- and prove both
+	// directions without needing PowerShell here.
+	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-pwsh-stub-"));
+	const write = async (name: string, script: string): Promise<string> => {
+		const file = path.join(directory, name);
+		await Bun.write(file, script);
+		await fs.chmod(file, 0o755);
+		return file;
+	};
+	const clean = await write("clean", "#!/bin/sh\nexit 0\n");
+	expect(await parsePowerShell(clean, "Write-Host 'ok'")).toBe("");
+
+	const broken = await write("broken", "#!/bin/sh\necho 'Missing closing } in statement block.'\nexit 1\n");
+	expect(await parsePowerShell(broken, "if ($x) { Write-Host 'x'")).toBe("Missing closing } in statement block.");
+
+	// A parser that fails without printing must still be reported, not read as clean.
+	const silent = await write("silent", "#!/bin/sh\nexit 7\n");
+	expect(await parsePowerShell(silent, "whatever")).toBe("PowerShell parser exited 7");
+
+	// And the body must actually reach the parser as a file it can read.
+	const echoes = await write("echoes", "#!/bin/sh\nsed -n '2p' \"$(ls -t \"${TMPDIR:-/tmp}\"/gjc-pwsh-parse-*/step.ps1 | head -1)\"\nexit 1\n");
+	expect(await parsePowerShell(echoes, "line one\nline two")).toBe("line two");
+	await fs.rm(directory, { recursive: true, force: true });
 });
 
 test("issue_comment events cannot launch or cancel the affected Dev CI pipeline", async () => {
