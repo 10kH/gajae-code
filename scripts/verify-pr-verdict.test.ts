@@ -1687,8 +1687,16 @@ test("comment-triggered validation publishes a head-bound check run under the re
 	// Ordinary issues are not pull requests: the resolve step must skip cleanly
 	// instead of failing the job on the 404.
 	expect(workflow).toContain('if ! pr_json="$(gh api "repos/${{ github.repository }}/pulls/${number}" 2>/dev/null)"; then');
-	// A trusted base that predates self-review validation can never authorize.
-	expect(workflow).toContain("predates self-review validation");
+	// A trusted base missing ANY required validator capability can never authorize.
+	// One marker was not enough: `main` carried the self-review validator but not the
+	// approval freshness rule, so a comment-triggered re-validation ran the old
+	// `commit_id`-only logic and published a green "Merge approval" behind a guard that
+	// reported the base as current (#5692 review).
+	expect(workflow).toContain('|| stale_base="self-review validation"');
+	expect(workflow).toContain('|| stale_base="${stale_base:+$stale_base and }approval freshness binding"');
+	expect(workflow).toContain('if [[ -n "$stale_base" ]]; then');
+	// Both published names must go red together, never just the contract one.
+	expect(workflow).toContain('approval_summary="$summary"');
 });
 
 test("issue_comment events cannot launch or cancel the affected Dev CI pipeline", async () => {

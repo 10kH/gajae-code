@@ -174,12 +174,25 @@ jobs:
             else
               approval_summary="merge not authorized at exact head; the PR contract itself is valid"
             fi
-            # A trusted base that predates the self-review-aware validator cannot
+            # A trusted base that predates a required validator capability cannot
             # authorize anything; never publish success for that case, under EITHER name.
-            if [[ -f "$trusted_root/scripts/verify-pr-verdict.ts" ]] \
-              && ! grep -q "gajae.pr-self-review.v1" "$trusted_root/scripts/verify-pr-verdict.ts"; then
+            #
+            # Each capability needs its OWN marker. The self-review check alone was not
+            # enough: `main` carries the self-review validator but not the approval
+            # freshness rule, so a comment-triggered re-validation ran the old
+            # `commit_id`-only logic and published a GREEN "Merge approval" on the exact
+            # head — the #5692 hole, live on a required context, behind a guard that
+            # reported the base as current (#5692 review).
+            stale_base=""
+            if [[ -f "$trusted_root/scripts/verify-pr-verdict.ts" ]]; then
+              grep -q "gajae.pr-self-review.v1" "$trusted_root/scripts/verify-pr-verdict.ts" \
+                || stale_base="self-review validation"
+              grep -q "head_ref_force_pushed" "$trusted_root/scripts/verify-pr-verdict.ts" \
+                || stale_base="${stale_base:+$stale_base and }approval freshness binding"
+            fi
+            if [[ -n "$stale_base" ]]; then
               conclusion="failure"
-              summary="trusted base ${base_sha:0:10} predates self-review validation; bootstrap remains authoritative"
+              summary="trusted base ${base_sha:0:10} predates $stale_base; bootstrap remains authoritative"
               approval_conclusion="failure"
               approval_summary="$summary"
             fi
