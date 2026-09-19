@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { commands } from "../src/cli-main";
 import {
 	SESSION_LIMIT_RECOVERY_ACTIONS,
@@ -118,14 +119,21 @@ describe("session recovery guidance references runnable commands", () => {
 	/**
 	 * Every file that can render session-limit guidance, not just the one that regressed.
 	 *
-	 * Scoped by directory rather than by a hand-listed set so a new file under
-	 * `src/session/` is covered the day it is added.
+	 * Discovered RECURSIVELY: `src/session/internal/` exists, and a non-recursive read
+	 * silently excluded it, so a class placed there was unguarded by construction — the
+	 * same instances-not-family mistake one directory level down (#5732).
 	 */
 	async function sessionSurfaceSources(): Promise<Array<[string, string]>> {
-		const dir = new URL("../src/session/", import.meta.url);
-		const names = (await fs.readdir(dir)).filter(name => name.endsWith(".ts") && !name.endsWith(".test.ts"));
+		const root = new URL("../src/session/", import.meta.url);
+		const entries = await fs.readdir(root, { recursive: true, withFileTypes: true });
+		const files = entries.filter(
+			entry => entry.isFile() && entry.name.endsWith(".ts") && !entry.name.endsWith(".test.ts"),
+		);
 		return Promise.all(
-			names.map(async name => [name, await Bun.file(new URL(name, dir)).text()] as [string, string]),
+			files.map(async entry => {
+				const full = path.join(entry.parentPath, entry.name);
+				return [path.relative(new URL(".", root).pathname, full), await Bun.file(full).text()] as [string, string];
+			}),
 		);
 	}
 
@@ -196,6 +204,22 @@ describe("session recovery guidance references runnable commands", () => {
 					file: name,
 					verb,
 					registered: true,
+				});
+			}
+		}
+	});
+
+	test("every slash command advised in session source is ACP-dispatchable (#5732)", async () => {
+		// `gjc <verb>` was only half the surface. The original #5621 fix also had to reject
+		// `/new`, which is a real builtin but not ACP-dispatchable, so guidance naming it is
+		// a dead end for ACP/text consumers. Same invariant, other command namespace.
+		for (const [name, source] of await sessionSurfaceSources()) {
+			const advised = [...withoutComments(source).matchAll(/`\/([a-z][a-z0-9-]*)`/g)].map(match => match[1]);
+			for (const slash of new Set(advised)) {
+				expect({ file: name, slash, dispatchable: acpSlashNames.has(slash) }).toEqual({
+					file: name,
+					slash,
+					dispatchable: true,
 				});
 			}
 		}
