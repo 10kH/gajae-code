@@ -2213,10 +2213,31 @@ test("every bash run scalar is syntactically valid bash (#5740 review)", async (
 		if (typeof candidate.run === "string") sink.push(candidate);
 		for (const value of Object.values(node)) steps(value, sink);
 	};
+	// `defaults.run.shell` changes what an unset step shell MEANS, at workflow or job
+	// level. Assuming omitted == bash without checking would be the same silent
+	// assumption the skip was (#5740 review). Any non-bash default is refused outright.
+	const defaultShells = (node: unknown, key?: string): string[] => {
+		if (key === "defaults" && node !== null && typeof node === "object" && !Array.isArray(node)) {
+			const run = (node as { run?: { shell?: unknown } }).run;
+			return typeof run?.shell === "string" ? [run.shell] : [];
+		}
+		if (Array.isArray(node)) return node.flatMap((item) => defaultShells(item, key));
+		if (node !== null && typeof node === "object") {
+			return Object.entries(node).flatMap(([childKey, value]) => defaultShells(value, childKey));
+		}
+		return [];
+	};
 	let checked = 0;
 	for (const file of files) {
+		const document = parse(await Bun.file(file).text());
+		for (const declared of defaultShells(document)) {
+			expect({ file: file.slice(file.indexOf("/.github/") + 1), defaultShell: declared }).toEqual({
+				file: file.slice(file.indexOf("/.github/") + 1),
+				defaultShell: "bash",
+			});
+		}
 		const found: ShellStep[] = [];
-		steps(parse(await Bun.file(file).text()), found);
+		steps(document, found);
 		for (const step of found) {
 			// An unset shell means bash on every runner this repo uses. `pwsh` is a
 			// different grammar and bash -n would reject it wrongly.
