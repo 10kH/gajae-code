@@ -2074,7 +2074,7 @@ test("every expression expanded into a workflow run scalar is explicitly justifi
 	expect({ files: files.length >= 6, scalars: scalars >= 100 }).toEqual({ files: true, scalars: true });
 });
 
-test("author-controlled env values are only ever read as a quoted word (#5740 review)", async () => {
+test("every env value bound from an expression is read as a quoted word (#5740 review)", async () => {
 	// The injection guard forces untrusted text out of the expression layer and into
 	// `env:`. That is only half of the rule. A shell that reads $PR_BODY unquoted, or
 	// evals it, re-opens the identical class one layer down — the value is now a shell
@@ -2090,18 +2090,22 @@ test("author-controlled env values are only ever read as a quoted word (#5740 re
 		for await (const found of new Glob("**/*.{yml,yaml}").scan({ cwd: root, absolute: true })) files.push(found);
 	}
 	files.sort();
-	// Names bound from free text or from refs a contributor chooses, as opposed to the
-	// integers and hex object names GitHub computes.
-	const authorControlled = /comment\.body|changes\.body|pull_request\.body|pull_request\.title|\.base\.ref|\.head\.ref|user\.login/;
+	// Originally this classified which bindings were "author-controlled" by pattern.
+	// That classification MISSED one: CI_DEV_CHANGED_PATHS carries the PR's own changed
+	// file paths, which a contributor picks by adding a file. A rule that depends on me
+	// correctly enumerating untrusted sources fails the moment I miss one, and I did.
+	//
+	// So there is no classification. EVERY env value bound from an expression must be
+	// read as a quoted word. Nothing legitimately needs word splitting on one of these,
+	// the rule has no judgement calls in it, and it cannot be defeated by a source shape
+	// I failed to anticipate. Measured: 79 names, 116 uses, all already quoted.
 	const names = new Set<string>();
 	for (const file of files) {
 		const text = await Bun.file(file).text();
-		for (const match of text.matchAll(/^\s+([A-Z_][A-Z0-9_]*):\s*\$\{\{\s*([^}]+?)\s*\}\}/gm)) {
-			if (authorControlled.test(match[2] ?? "")) names.add(match[1] ?? "");
-		}
+		for (const match of text.matchAll(/^\s+([A-Z_][A-Z0-9_]*):\s*\$\{\{/gm)) names.add(match[1] ?? "");
 	}
 	// If this ever empties, the scan broke rather than the risk disappearing.
-	expect(names.size).toBeGreaterThanOrEqual(5);
+	expect(names.size).toBeGreaterThanOrEqual(70);
 	let inspected = 0;
 	for (const file of files) {
 		const relative = file.slice(file.indexOf("/.github/") + 1);
