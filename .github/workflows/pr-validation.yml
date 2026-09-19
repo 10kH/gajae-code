@@ -161,6 +161,33 @@ jobs:
           fi
           echo "merge_authorized=$authorized" >> "$GITHUB_OUTPUT"
           exit "$status"
+      - name: Keep the approval revoked when revalidation does not complete
+        # Covers the window the dedicated revoke step cannot: a failure AFTER the head
+        # SHA is known but BEFORE the publication step raises the approval. Without this
+        # a failed checkout, Bun setup, or validator leaves whatever the dedicated step
+        # wrote — which is correct — but a failure in the RESOLVE step itself skips the
+        # dedicated step entirely, and any partial SHA we do have should still be used.
+        #
+        # RESIDUAL, deliberately not claimed as closed: if resolution fails before
+        # emitting `head_sha`, or the runner is hard-cancelled, no step runs and a
+        # previously-green check survives. A workflow cannot close that; it needs branch
+        # protection to require a check bound to the current run rather than any green
+        # one (#5692 review).
+        if: ${{ failure() && github.event_name == 'issue_comment' && steps.pr.outputs.head_sha != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api --method POST "repos/${{ github.repository }}/check-runs" \
+            -H "Accept: application/vnd.github+json" \
+            -f name="Merge approval" \
+            -f head_sha="${{ steps.pr.outputs.head_sha }}" \
+            -f status="completed" \
+            -f conclusion="failure" \
+            -f 'output[title]="Merge approval (re-validation failed)"' \
+            -f "output[summary]=re-validation did not complete; any prior approval for this head remains revoked" \
+            -f "details_url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
       - name: Publish head-bound check results for comment-triggered validation
         # issue_comment runs are associated with the default-branch SHA, not the PR
         # head. Create/update a CHECK RUN on the resolved exact head with the exact

@@ -1768,6 +1768,11 @@ test("comment-triggered validation publishes a head-bound check run under the re
 	// The job has exactly two checkouts today; if that changes, the loop above still
 	// covers the new one, but pin the count so a silent restructure is visible.
 	expect(fallible[0]?.[1].length).toBe(2);
+	// A failure after the head SHA is known but before the approval is raised must still
+	// leave the approval revoked. Gated on failure() so it cannot fire on the happy path.
+	expect(workflow).toContain("name: Keep the approval revoked when revalidation does not complete");
+	expect(workflow).toContain("if: ${{ failure() && github.event_name == 'issue_comment' && steps.pr.outputs.head_sha != '' }}");
+	expect(workflow).toContain('-f \'output[title]="Merge approval (re-validation failed)"\'');
 	// Within the publication step the contract result is written before the approval is
 	// raised, so a failed contract write cannot leave a green approval.
 	const publishContract = workflow.indexOf('"output[summary]=$summary"');
