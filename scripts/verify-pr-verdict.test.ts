@@ -1,5 +1,6 @@
 import { describe, expect, test, vi } from "bun:test";
 import { Glob } from "bun";
+import { parse } from "yaml";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as url from "node:url";
@@ -1958,18 +1959,20 @@ test("every expression expanded into a workflow run scalar is explicitly justifi
 	// exactly that while fixing something else, so this guard exists to make the CLASS
 	// impossible rather than the one instance I happened to hit.
 	//
-	// Two earlier versions of this guard were too narrow and each passed a live vector:
+	// THREE earlier versions were each too narrow and each passed a live vector:
 	//   1. it skipped shell comment lines — but GitHub expands `${{ }}` before bash sees
 	//      the script, so a multiline body injects an executable line from behind a `#`;
 	//   2. it matched only `run: |` block scalars, only `github.event.*`, and a hardcoded
-	//      file list — so a single-line `run: echo "${{ github.event.comment.body }}"`,
-	//      a folded `>` scalar, an `inputs.*` fed from PR text, or a brand new composite
-	//      action all slipped through (#5740 review).
+	//      file list;
+	//   3. it hand-parsed YAML line by line, which cannot see a flow-style or quoted key
+	//      (`- { "run": ... }`), an aliased scalar (`run: *anchor`), or the valid `|2-`
+	//      indicator order — and its `[^}]+?` matcher could not cross an ordinary brace,
+	//      so `${{ format('{0}', github.event.comment.body) }}` was INVISIBLE to it.
 	//
-	// So: enumerate EVERY workflow and composite action, parse EVERY scalar form, and
-	// require each expression to appear below with a reason. A new interpolation fails
-	// until someone writes down why it cannot carry a shell metacharacter. That is
-	// deliberately louder than a namespace rule — the namespace rules are what broke.
+	// Hand-parsing the YAML was the root mistake, so this parses it. Traversal is
+	// semantic: any string under a `run` or `script` key, wherever it appears, with
+	// aliases already resolved by the parser. Expression extraction is terminator-aware
+	// and fails closed on anything it cannot classify.
 	const justified = new Map<string, string>([
 		// GitHub-assigned integers.
 		["github.event.pull_request.number", "integer assigned by GitHub"],
@@ -2019,39 +2022,47 @@ test("every expression expanded into a workflow run scalar is explicitly justifi
 		for await (const found of new Glob("**/*.{yml,yaml}").scan({ cwd: root, absolute: true })) files.push(found);
 	}
 	files.sort();
+	// A GHA expression contains `{` only inside a single-quoted literal, so skip those
+	// and take the first `}}` outside a string. Anything unterminated is a failure, not
+	// a skip — that is precisely how the brace bypass hid.
+	const expressionsIn = (scalar: string): { found: string[]; unterminated: boolean } => {
+		const found: string[] = [];
+		for (let at = scalar.indexOf("${{"); at !== -1; at = scalar.indexOf("${{", at)) {
+			let cursor = at + 3;
+			let quoted = false;
+			let end = -1;
+			while (cursor < scalar.length) {
+				const character = scalar[cursor];
+				if (character === "'") quoted = !quoted;
+				else if (!quoted && character === "}" && scalar[cursor + 1] === "}") {
+					end = cursor;
+					break;
+				}
+				cursor++;
+			}
+			if (end === -1) return { found, unterminated: true };
+			found.push(scalar.slice(at + 3, end).trim());
+			at = end + 2;
+		}
+		return { found, unterminated: false };
+	};
+	const shellScalars = (node: unknown, key?: string): string[] => {
+		if (typeof node === "string") return key === "run" || key === "script" ? [node] : [];
+		if (Array.isArray(node)) return node.flatMap((item) => shellScalars(item, key));
+		if (node !== null && typeof node === "object") {
+			return Object.entries(node).flatMap(([childKey, value]) => shellScalars(value, childKey));
+		}
+		return [];
+	};
 	let scalars = 0;
 	for (const file of files) {
-		const lines = (await Bun.file(file).text()).split("\n");
-		for (let i = 0; i < lines.length; i++) {
-			// Every scalar form: `run:`/`script:`, plain or as a list item.
-			const opener = (lines[i] ?? "").match(/^(\s*)(?:-\s+)?(?:run|script):\s*(.*)$/);
-			if (!opener) continue;
-			const indent = (opener[1] ?? "").length;
-			const rest = (opener[2] ?? "").trim();
+		const relative = file.slice(file.indexOf("/.github/") + 1);
+		const document = parse(await Bun.file(file).text()) as unknown;
+		for (const scalar of shellScalars(document)) {
 			scalars++;
-			let body = "";
-			if (/^[|>][-+]?\d*$/.test(rest)) {
-				// Literal or folded block, with any chomping or explicit-indent indicator.
-				for (let j = i + 1; j < lines.length; j++) {
-					const next = lines[j] ?? "";
-					if (next.trim() !== "" && next.search(/\S/) <= indent) break;
-					body += `${next}\n`;
-					i = j;
-				}
-			} else {
-				// Single-line scalar, plus any plain-scalar continuation lines.
-				body = rest;
-				for (let j = i + 1; j < lines.length; j++) {
-					const next = lines[j] ?? "";
-					if (next.trim() === "" || next.search(/\S/) <= indent) break;
-					body += `\n${next}`;
-					i = j;
-				}
-			}
-			// Comments are NOT skipped: the expansion happens before bash parses them.
-			for (const match of body.matchAll(/\$\{\{\s*([^}]+?)\s*\}\}/g)) {
-				const expression = (match[1] ?? "").trim();
-				const relative = file.slice(file.indexOf("/.github/") + 1);
+			const { found, unterminated } = expressionsIn(scalar);
+			expect({ file: relative, unterminated }).toEqual({ file: relative, unterminated: false });
+			for (const expression of found) {
 				expect({ file: relative, expression, justified: justified.has(expression) }).toEqual({
 					file: relative,
 					expression,
