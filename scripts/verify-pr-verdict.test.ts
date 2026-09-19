@@ -1861,6 +1861,12 @@ test("comment-triggered validation publishes a head-bound check run under the re
 	// untrusted author — the exact thing this workflow exists to avoid.
 	expect(workflow).toContain("COMMENT_BODY: ${{ github.event.comment.body }}");
 	expect(workflow).toContain('"${COMMENT_BODY:-}" == *"$record_marker"*');
+	// The marker alone is not enough: anyone can write it, so gating on the string only
+	// would let a third party force revocation and reinstate the denial of service behind
+	// one extra step. A self-review record is author-owned by definition.
+	expect(workflow).toContain('"${COMMENT_AUTHOR:-}" == "${PR_AUTHOR:-}"');
+	expect(workflow).toContain("COMMENT_AUTHOR: ${{ github.event.comment.user.login }}");
+	expect(workflow).toContain("PR_AUTHOR: ${{ github.event.issue.user.login }}");
 	expect(workflow).not.toContain('comment_body="${{ github.event.comment.body }}"');
 	expect(workflow).toContain("name: Keep the approval revoked when revalidation does not complete");
 	expect(workflow).toContain("if: ${{ failure() && github.event_name == 'issue_comment' && steps.pr.outputs.self_review_event == 'true' && steps.pr.outputs.head_sha != '' }}");
