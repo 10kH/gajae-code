@@ -2113,12 +2113,27 @@ test("every env value bound from an expression is read as a quoted word (#5740 r
 	//
 	// So there is no classification. EVERY env value bound from an expression must be
 	// read as a quoted word. Nothing legitimately needs word splitting on one of these,
-	// the rule has no judgement calls in it, and it cannot be defeated by a source shape
-	// I failed to anticipate. Measured: 79 names, 116 uses, all already quoted.
+	// and the rule cannot be defeated by a source shape I failed to anticipate.
+	//
+	// Discovery was ALSO lexical — a raw-text regex that only matched `NAME: ${{ ... }}`
+	// at the start of a line. `env:` with a quoted key (`"NAME": ${{ ... }}`), a flow
+	// mapping, or an alias was invisible, so a later `eval "$NAME"` was invisible too
+	// (#5740 review). It now reads the same parsed YAML graph as the run-scalar guard.
+	const envNames = (node: unknown, key?: string): string[] => {
+		if (key === "env" && node !== null && typeof node === "object" && !Array.isArray(node)) {
+			return Object.entries(node)
+				.filter(([, value]) => typeof value === "string" && value.includes("${{"))
+				.map(([name]) => name);
+		}
+		if (Array.isArray(node)) return node.flatMap((item) => envNames(item, key));
+		if (node !== null && typeof node === "object") {
+			return Object.entries(node).flatMap(([childKey, value]) => envNames(value, childKey));
+		}
+		return [];
+	};
 	const names = new Set<string>();
 	for (const file of files) {
-		const text = await Bun.file(file).text();
-		for (const match of text.matchAll(/^\s+([A-Z_][A-Z0-9_]*):\s*\$\{\{/gm)) names.add(match[1] ?? "");
+		for (const name of envNames(parse(await Bun.file(file).text()))) names.add(name);
 	}
 	// If this ever empties, the scan broke rather than the risk disappearing.
 	expect(names.size).toBeGreaterThanOrEqual(70);
