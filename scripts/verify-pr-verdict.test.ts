@@ -1275,6 +1275,21 @@ describe("push preflight independent-review evidence (issue #5483 review)", () =
 		expect(result.exitCode).toBe(1);
 		expect(result.stderr).toContain("submitted BEFORE that head commit existed");
 	});
+
+	test("a same-second approval is refused, not admitted on a tie (#5692 review)", async () => {
+		// GitHub serializes both values at second granularity, so a review submitted at
+		// 12:00:00.9 and a force-push recorded at 12:00:00.1 arrive identical. The review
+		// predates the head it claims, and a strict `<` would have let it through.
+		const result = await runSelfReviewPushPreflight({
+			body: riskClassifiedBody,
+			comments: riskClassifiedComments,
+			reviews: context => reviewerApproval(context, "APPROVED", "2030-01-01T00:00:00Z"),
+			forcePushedAt: "2030-01-01T00:00:00Z\n",
+			permission: "write",
+		});
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("submitted BEFORE that head commit existed");
+	});
 	test("unreadable independent-review evidence is reported as unread, not as unauthorized", async () => {
 		const result = await runSelfReviewPushPreflight({
 			body: riskClassifiedBody,
