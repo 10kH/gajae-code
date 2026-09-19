@@ -2218,8 +2218,15 @@ test("every bash run scalar is syntactically valid bash (#5740 review)", async (
 		const found: ShellStep[] = [];
 		steps(parse(await Bun.file(file).text()), found);
 		for (const step of found) {
-			// pwsh steps are a different grammar; bash -n would reject them wrongly.
-			if (step.shell !== undefined && step.shell !== "bash") continue;
+			// An unset shell means bash on every runner this repo uses. `pwsh` is a
+			// different grammar and bash -n would reject it wrongly.
+			//
+			// Anything ELSE is refused rather than skipped. A silent skip is how a step
+			// escapes: `shell: sh`, or the `bash -e {0}` custom form, would have passed
+			// this guard by not being checked at all (#5740 review).
+			const shell = step.shell ?? "bash";
+			if (shell === "pwsh" || shell === "powershell") continue;
+			expect({ shell, recognised: shell === "bash" }).toEqual({ shell, recognised: true });
 			checked++;
 			const parsed = Bun.spawnSync(["bash", "-n"], { stdin: Buffer.from(step.run ?? ""), stderr: "pipe" });
 			const diagnostic = new TextDecoder().decode(parsed.stderr).trim().split("\n")[0] ?? "";
