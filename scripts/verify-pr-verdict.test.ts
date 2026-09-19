@@ -1500,6 +1500,47 @@ describe("server independent-reviewer evidence (issue #5483 review)", () => {
 		}
 	});
 
+	test("unreadable timeline evidence is diagnosed as a read failure, not a stale approval (#5692 review)", async () => {
+		// The remedies differ. A stale approval needs a new review; a read failure needs a
+		// re-run. The message said "the head commit date" after the commit date stopped
+		// being consulted at all, and recommended a new review, which would not clear it.
+		const originalFetch = globalThis.fetch;
+		const previousToken = Bun.env.GITHUB_TOKEN;
+		Bun.env.GITHUB_TOKEN = "test-token";
+		const replacement: typeof fetch = Object.assign(async (input: Parameters<typeof fetch>[0]) => {
+			const endpoint = String(input);
+			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/pulls/5416/reviews"))
+				return Response.json([review("review-bot", "APPROVED")]);
+			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/issues/5416/timeline"))
+				return new Response("unavailable", { status: 503 });
+			if (endpoint === "https://api.github.com/repos/owner/repo/collaborators/review-bot/permission")
+				return Response.json({ permission: "write" });
+			throw new Error(`Unexpected endpoint: ${endpoint}`);
+		}, { preconnect: originalFetch.preconnect });
+		const spy = vi.spyOn(globalThis, "fetch").mockImplementation(replacement);
+		try {
+			const evidence = await fetchIndependentReviewerEvidence(event, "review-bot", head);
+			// The evidence must classify the refusal as unreadable, which is what selects
+			// the read-failure diagnostic over the stale-approval one.
+			expect({ approvedHead: evidence.approvedHead, refusedApproval: evidence.refusedApproval }).toEqual({
+				approvedHead: false,
+				refusedApproval: "unreadable",
+			});
+			// And the message that classification selects must name the real blocker and
+			// the real remedy: no commit-date language, no "get a new review".
+			const source = await Bun.file(new URL("./verify-pr-verdict.ts", import.meta.url)).text();
+			const unreadableBranch = source.slice(source.indexOf('refused === "unreadable"'), source.indexOf("} else {", source.indexOf('refused === "unreadable"')));
+			expect(unreadableBranch).toContain("force-push evidence could not be read");
+			expect(unreadableBranch).toContain("Re-run once the timeline is readable");
+			expect(unreadableBranch).not.toContain("head commit date");
+			expect(unreadableBranch).not.toContain("a review submitted after the current head is required");
+		} finally {
+			spy.mockRestore();
+			if (previousToken === undefined) delete Bun.env.GITHUB_TOKEN;
+			else Bun.env.GITHUB_TOKEN = previousToken;
+		}
+	});
+
 	test("a future-dated commit cannot block a genuine approval when no force-push occurred (#5692 review)", async () => {
 		// The no-force-push branch previously used the committer date as the floor, so an
 		// author could forward-date their commit and refuse every legitimate approval on

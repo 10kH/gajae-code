@@ -259,7 +259,13 @@ jobs:
               const latest = (await fetchReviews()).filter(review => review.user?.login?.toLowerCase() === reviewerId.toLowerCase() && review.state !== "COMMENTED" && review.commit_id === head).at(-1);
               if (latest?.state !== "APPROVED") throw new Error(`Reviewer ${reviewerId} lacks an effective exact-head approval.`);
               const headKnownAt = await fetchHeadKnownAt();
-              if (reviewPrecedesHead(latest.submitted_at, headKnownAt)) throw new Error(`Reviewer ${reviewerId}'s APPROVED review reports this exact head but cannot be shown to postdate it. GitHub re-points commit_id onto the new tip after a force-push, so a review submitted before the head existed is not an approval of this code; obtain a review submitted after the current head.`);
+              // Distinguish a PROVEN stale approval from unreadable evidence: the remedies
+              // differ and conflating them sends the author after a new review that would
+              // not clear a read failure (#5692 review).
+              if (reviewPrecedesHead(latest.submitted_at, headKnownAt)) {
+                if (headKnownAt.kind === "unreadable") throw new Error(`Reviewer ${reviewerId} has an APPROVED review on this exact head, but the PR timeline's force-push evidence could not be read, so its freshness cannot be established. This is a read failure, not a missing or stale approval; re-run once the timeline is readable. A new review will not clear it.`);
+                throw new Error(`Reviewer ${reviewerId}'s APPROVED review reports this exact head but was submitted before the head appeared. GitHub has been observed to re-point stale approvals after a force-push, so this is not evidence of an approval of this code; obtain a review submitted after the current head.`);
+              }
               const permission = await reviewPermission(reviewerId);
               if (!["admin", "maintain", "write"].includes(permission)) throw new Error(`Reviewer ${reviewerId} lacks repository review authority.`);
               mergeAuthorized = true;

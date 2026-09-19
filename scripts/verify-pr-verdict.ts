@@ -579,7 +579,12 @@ function evaluateSelfReviewComment(input: PrValidationInput): { ok: boolean; rev
 		if (refused === "rebound") {
 			diagnostics.push(`Self-review risk ${review.risk} names extra:independent:${named}, whose APPROVED review reports this exact head but was submitted BEFORE that head commit existed. GitHub has been observed to re-point stale approvals after a force-push, so this is not evidence of an approval of this code; a review submitted after the current head is required.`);
 		} else if (refused === "unreadable") {
-			diagnostics.push(`Self-review risk ${review.risk} names extra:independent:${named}, who has an APPROVED review bound to this head, but its freshness could not be established: the head commit date or the review submission time was unreadable. The approval is refused rather than assumed valid; re-run once the head commit is readable, or obtain a review submitted after the current head.`);
+			// Name the ACTUAL evidence that could not be read. This said "the head commit
+			// date" after the commit date stopped being consulted at all, and recommended
+			// obtaining a new review — which fixes nothing, because the blocker is
+			// unreadable force-push evidence rather than a missing or stale approval
+			// (#5692 review).
+			diagnostics.push(`Self-review risk ${review.risk} names extra:independent:${named}, who has an APPROVED review bound to this head, but the PR timeline's force-push evidence could not be read, so the approval's freshness cannot be established. This is a read failure, not a missing or stale approval: the review may be perfectly valid. Re-run once the timeline is readable; a new review will not clear it.`);
 		} else {
 			const required = "an authenticated exact-head approval from a distinct independent reviewer (extra:independent:<login>)";
 			diagnostics.push(`Self-review risk ${review.risk} requires ${required} (extra:${named}); the risk-classified gate is not satisfied.`);
