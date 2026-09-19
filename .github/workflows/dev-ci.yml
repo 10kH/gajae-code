@@ -142,7 +142,14 @@ jobs:
           unset BUN_OPTIONS
           empty_bunfig="$RUNNER_TEMP/gjc-pr-contract-empty-bunfig.toml"
           printf '# trusted empty Bun configuration\n' > "$empty_bunfig"
-          bun --no-env-file --config="$empty_bunfig" -e '
+          # The program is materialised through a QUOTED heredoc rather than passed as a
+          # single-quoted `bun -e` argument. An apostrophe anywhere in the JavaScript --
+          # including in a prose comment -- closes that quote and hands the rest of the
+          # program to bash. That is exactly what happened here: two of my own comments
+          # ("timeline's", "bootstrap's") broke this job for every PR targeting dev, and
+          # it stayed hidden because pushes straight to dev never run it (#5740 review).
+          program="$RUNNER_TEMP/gjc-pr-contract-bootstrap.mjs"
+          cat > "$program" <<'GJC_BOOTSTRAP_PROGRAM'
             const pattern = /^gajae\.pr-review-verdict\.v1 (merge-approved|merge-self-approved|merge-blocked|needs-human) sha256:([0-9a-f]{64}) reviewer:(architect|critic|human) reviewer-id:([^\s]+) evidence:(.+)$/;
             const lines = (Bun.env.PR_BODY ?? "").split(/\r?\n/).map(line => line.trim()).filter(line => line.startsWith("gajae.pr-review-verdict.v1"));
             if (lines.length !== 1) throw new Error(`Expected exactly one verdict line; found ${lines.length}.`);
@@ -280,7 +287,8 @@ jobs:
             const { appendFileSync } = await import("node:fs");
             appendFileSync(Bun.env.GITHUB_OUTPUT, `gjc-merge-authorized=${mergeAuthorized}\n`);
             console.log(`Bootstrap PR contract valid: ${digest}${selfAuthorized ? " (SELF-AUTHORIZED: merge-self-approved, no independent human review)" : ""}${mergeAuthorized ? "" : " (merge NOT authorized yet)"}`);
-          '
+          GJC_BOOTSTRAP_PROGRAM
+          bun --no-env-file --config="$empty_bunfig" "$program"
       - name: Run bootstrap G1 writer gate
         run: bun scripts/verify-gjc-state-writers.ts --fail --root .
 

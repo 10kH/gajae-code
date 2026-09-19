@@ -2171,6 +2171,60 @@ test("every env value bound from an expression is read as a quoted word (#5740 r
 	expect(inspected).toBeGreaterThan(0);
 });
 
+test("every bash run scalar is syntactically valid bash (#5740 review)", async () => {
+	// YAML validity and TypeScript tests both passed while the Dev CI PR contract
+	// bootstrap could not be parsed by bash at all. Two of my own prose comments
+	// ("timeline's", "bootstrap's") sat inside a single-quoted `bun -e '...'`
+	// argument; the apostrophe closed the quote and handed the rest of the JavaScript
+	// to the shell. Every PR targeting dev failed that required job, and it stayed
+	// hidden because pushing straight to dev never runs it.
+	//
+	// Nothing I had was capable of noticing, because nothing asked bash. So ask bash.
+	const files: string[] = [];
+	for (const dir of ["../.github/workflows", "../.github/actions"]) {
+		const root = new URL(dir, import.meta.url).pathname;
+		if (!(await fs.stat(root).then(() => true).catch(() => false))) continue;
+		for await (const found of new Glob("**/*.{yml,yaml}").scan({ cwd: root, absolute: true })) files.push(found);
+	}
+	files.sort();
+	type ShellStep = { name?: string; run?: string; shell?: string };
+	const steps = (node: unknown, sink: ShellStep[]): void => {
+		if (Array.isArray(node)) {
+			for (const item of node) steps(item, sink);
+			return;
+		}
+		if (node === null || typeof node !== "object") return;
+		const candidate = node as ShellStep;
+		if (typeof candidate.run === "string") sink.push(candidate);
+		for (const value of Object.values(node)) steps(value, sink);
+	};
+	let checked = 0;
+	for (const file of files) {
+		const found: ShellStep[] = [];
+		steps(parse(await Bun.file(file).text()), found);
+		for (const step of found) {
+			// pwsh steps are a different grammar; bash -n would reject them wrongly.
+			if (step.shell !== undefined && step.shell !== "bash") continue;
+			checked++;
+			const parsed = Bun.spawnSync(["bash", "-n"], { stdin: Buffer.from(step.run ?? ""), stderr: "pipe" });
+			const diagnostic = new TextDecoder().decode(parsed.stderr).trim().split("\n")[0] ?? "";
+			expect({
+				file: file.slice(file.indexOf("/.github/") + 1),
+				step: step.name ?? "(unnamed)",
+				parses: parsed.exitCode === 0,
+				diagnostic: parsed.exitCode === 0 ? "" : diagnostic,
+			}).toEqual({
+				file: file.slice(file.indexOf("/.github/") + 1),
+				step: step.name ?? "(unnamed)",
+				parses: true,
+				diagnostic: "",
+			});
+		}
+	}
+	// 115 bash steps today; a collapse to a handful means the traversal broke.
+	expect(checked).toBeGreaterThanOrEqual(100);
+});
+
 test("issue_comment events cannot launch or cancel the affected Dev CI pipeline", async () => {
 	const devCi = await Bun.file(new URL("../.github/workflows/dev-ci.yml", import.meta.url)).text();
 	expect(devCi).not.toContain("issue_comment:");
@@ -2237,7 +2291,14 @@ test("dev CI carries immutable inline first-landing bootstrap validation", async
 	expect(workflow).toContain("name: PR contract bootstrap");
 	expect(workflow).not.toContain("pull_request_review:");
 	expect(workflow).toContain("if: ${{ github.event_name == 'pull_request' }}");
-	expect(workflow).toContain("bun --no-env-file --config=\"$empty_bunfig\" -e '");
+	// This pinned the MECHANISM (`-e '<program>'`) rather than the property. That exact
+	// mechanism was the defect: an apostrophe in the JavaScript closed the shell quote
+	// and broke the job for every PR to dev. The property that matters is that the
+	// trusted program runs with the contributor's environment and bunfig neutralised.
+	expect(workflow).toContain("bun --no-env-file --config=\"$empty_bunfig\"");
+	// A quoted heredoc keeps the shell and JavaScript grammars apart; an unquoted one
+	// would expand `$` and backticks out of the program before Bun ever saw it.
+	expect(workflow).toContain("cat > \"$program\" <<'GJC_BOOTSTRAP_PROGRAM'");
 	expect(workflow).toContain("repository: ${{ github.event.pull_request.head.repo.full_name }}");
 	expect(workflow).toContain("bun scripts/verify-gjc-state-writers.ts --fail --root .");
 	expect(workflow).toContain("Expected exactly one verdict line");
