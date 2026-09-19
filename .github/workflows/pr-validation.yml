@@ -202,6 +202,27 @@ jobs:
             fi
           fi
           details_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          # INVALIDATE THE APPROVAL AUTHORITY FIRST, before anything that can fail.
+          #
+          # Publishing the contract name first and the approval name second leaves a
+          # window: if this job dies, is cancelled, or the second API call fails, a
+          # previously-green "Merge approval" survives as the authoritative required
+          # check while the contract name has already gone red. Revoking a self-review
+          # comment would then red the contract and leave the approval green — the exact
+          # outcome the republish was added to prevent (#5692 review).
+          #
+          # Writing failure here first means every interruption from this point on leaves
+          # the approval RED. It is upgraded to success at the end, only once the contract
+          # publication has also succeeded.
+          gh api --method POST "repos/${{ github.repository }}/check-runs" \
+            -H "Accept: application/vnd.github+json" \
+            -f name="Merge approval" \
+            -f head_sha="$head_sha" \
+            -f status="completed" \
+            -f conclusion="failure" \
+            -f 'output[title]="Merge approval (re-validating)"' \
+            -f "output[summary]=re-validation in progress; any prior approval for this head is revoked until it completes" \
+            -f "details_url=$details_url"
           gh api --method POST "repos/${{ github.repository }}/check-runs" \
             -H "Accept: application/vnd.github+json" \
             -f name="Validate exact-head PR contract" \
@@ -211,9 +232,8 @@ jobs:
             -f 'output[title]="PR contract (comment-triggered exact-head re-validation)"' \
             -f "output[summary]=$summary" \
             -f "details_url=$details_url"
-          # The approval authority must be republished too: revoking a self-review
-          # comment while only refreshing the contract name would leave a stale green
-          # "Merge approval" check behind it.
+          # Only now may the approval authority be raised to its computed value. Reaching
+          # this line means the contract publication above succeeded.
           gh api --method POST "repos/${{ github.repository }}/check-runs" \
             -H "Accept: application/vnd.github+json" \
             -f name="Merge approval" \

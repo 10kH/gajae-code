@@ -1702,6 +1702,20 @@ test("comment-triggered validation publishes a head-bound check run under the re
 	expect(workflow).toContain('if [[ -n "$stale_base" ]]; then');
 	// Both published names must go red together, never just the contract one.
 	expect(workflow).toContain('approval_summary="$summary"');
+
+	// The approval authority must be REVOKED before any fallible work, then raised only
+	// after the contract publication succeeds. Publishing contract-then-approval left a
+	// window where a cancelled job or a failed second API call kept a previously-green
+	// "Merge approval" authoritative while the contract had already gone red (#5692
+	// review). Assert the ORDER, since a comment claiming it proves nothing.
+	const revokeFirst = workflow.indexOf('-f "output[summary]=re-validation in progress;');
+	const publishContract = workflow.indexOf('"output[summary]=$summary"');
+	const raiseApproval = workflow.indexOf('-f "output[summary]=$approval_summary"');
+	expect(revokeFirst).toBeGreaterThan(-1);
+	expect(revokeFirst).toBeLessThan(publishContract);
+	expect(publishContract).toBeLessThan(raiseApproval);
+	// The revoking write must be a hard failure, never neutral or skipped.
+	expect(workflow).toContain('-f conclusion="failure" \\\n            -f \'output[title]="Merge approval (re-validating)"\'');
 });
 
 test("the stale-base markers survive comment stripping but not code removal (#5692 review)", async () => {
