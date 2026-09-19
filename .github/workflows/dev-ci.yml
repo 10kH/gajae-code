@@ -178,34 +178,34 @@ jobs:
             // three rounds of fixes to the script alone. Repaired in place rather than
             // restructured because CI wiring cannot be exercised from a dev machine.
             const fetchHeadKnownAt = async () => {
-              const commitResponse = await fetch(`https://api.github.com/repos/${Bun.env.GITHUB_REPOSITORY}/commits/${head}`, { headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${Bun.env.GITHUB_TOKEN}`, "X-GitHub-Api-Version": "2022-11-28" } });
-              const committedAt = commitResponse.ok ? (await commitResponse.json())?.commit?.committer?.date : undefined;
               const forcePushes = [];
               for (let page = 1; ; page++) {
                 const response = await fetch(`https://api.github.com/repos/${Bun.env.GITHUB_REPOSITORY}/issues/${Bun.env.PR_NUMBER}/timeline?per_page=100&page=${page}`, { headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${Bun.env.GITHUB_TOKEN}`, "X-GitHub-Api-Version": "2022-11-28" } });
-                if (!response.ok) return undefined;
+                if (!response.ok) return { kind: "unreadable" };
                 const batch = await response.json();
                 for (const entry of batch) if (entry?.event === "head_ref_force_pushed") forcePushes.push(entry?.created_at);
                 if (batch.length < 100) break;
               }
               const present = forcePushes.map(value => (typeof value === "string" ? value.trim() : "")).filter(value => value.length > 0);
-              if (present.length !== forcePushes.length) return undefined;
-              if (present.some(value => !Number.isFinite(Date.parse(value)))) return undefined;
-              // Server-observed evidence wins outright. Blending the committer date in let
-              // a contributor set GIT_COMMITTER_DATE into the future and raise the floor
-              // above what GitHub observed, refusing every legitimate approval (#5692).
-              if (present.length > 0) return present.reduce((latest, value) => (Date.parse(value) > Date.parse(latest) ? value : latest));
-              const committed = typeof committedAt === "string" ? committedAt.trim() : "";
-              if (committed.length === 0 || !Number.isFinite(Date.parse(committed))) return undefined;
-              return committed;
+              if (present.length !== forcePushes.length) return { kind: "unreadable" };
+              if (present.some(value => !Number.isFinite(Date.parse(value)))) return { kind: "unreadable" };
+              // Server-observed evidence is the ONLY authority. The committer date is
+              // contributor-controlled in both directions: backdating was the original
+              // hole and forward-dating blocked legitimate approvals, so it is not a
+              // floor at all. "unconstrained" means no force-push on record, hence no
+              // re-binding vector and nothing to disprove (#5692).
+              if (present.length > 0) return { kind: "bound", at: present.reduce((latest, value) => (Date.parse(value) > Date.parse(latest) ? value : latest)) };
+              return { kind: "unconstrained" };
             };
             // Refuses on unknown or unparseable times, and on a tie: GitHub serializes both
             // sides to whole seconds, so an equal value still means the review predates the
             // head it claims.
-            const reviewPrecedesHead = (submittedAt, headKnownAt) => {
-              if (typeof submittedAt !== "string" || typeof headKnownAt !== "string") return true;
+            const reviewPrecedesHead = (submittedAt, appearance) => {
+              if (appearance.kind === "unconstrained") return false;
+              if (appearance.kind === "unreadable") return true;
+              if (typeof submittedAt !== "string") return true;
               const submitted = Date.parse(submittedAt);
-              const known = Date.parse(headKnownAt);
+              const known = Date.parse(appearance.at);
               if (!Number.isFinite(submitted) || !Number.isFinite(known)) return true;
               return submitted <= known;
             };

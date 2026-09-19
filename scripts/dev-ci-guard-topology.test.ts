@@ -409,9 +409,13 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		expect(source).toContain("head_ref_force_pushed");
 		// Ties refuse: GitHub serializes both sides to whole seconds.
 		expect(source).toContain("return submitted <= known;");
+		// No force-push on record means no re-binding vector, so the check must not fall
+		// back to the contributor-settable committer date in either direction (#5692).
+		expect(source).toContain('if (appearance.kind === "unconstrained") return false;');
+		expect(source).toContain('return { kind: "unconstrained" };');
 		// A present-but-unparseable force-push time refuses rather than falling back to the
 		// contributor-settable committer date.
-		expect(source).toContain("if (present.some(value => !Number.isFinite(Date.parse(value)))) return undefined;");
+		expect(source).toContain('if (present.some(value => !Number.isFinite(Date.parse(value)))) return { kind: "unreadable" };');
 		// Selection precedes freshness, so an unreadable later withdrawal cannot be filtered
 		// out and let an earlier approval become the reviewer's last word.
 		const decision = source.slice(source.indexOf('} else if (verdict === "merge-approved")'));

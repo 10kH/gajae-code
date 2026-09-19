@@ -55,7 +55,7 @@ describe("authenticated approval API evidence", () => {
 			if (endpoint === `https://api.github.com/repos/owner/repo/commits/${head}`)
 				return Response.json({ commit: { committer: { date: headCommittedAt } } });
 			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/issues/5416/timeline"))
-				return Response.json([]);
+				return Response.json([{ event: "head_ref_force_pushed", created_at: headCommittedAt }]);
 			if (endpoint === "https://api.github.com/repos/owner/repo/collaborators/review-agent/permission") return Response.json({ permission: scenario.permission });
 			throw new Error(`Unexpected endpoint: ${endpoint}`);
 		}, { preconnect: originalFetch.preconnect });
@@ -64,11 +64,12 @@ describe("authenticated approval API evidence", () => {
 			const approval = await authenticatedApproval(event, "review-agent", head, "test-token");
 			expect(approval).toEqual(scenario.approved ? { login: "review-agent", headSha: head } : {});
 			expect(validatePrContract(validInput({ authenticatedReviewerLogin: approval.login, authenticatedReviewHeadSha: approval.headSha })).ok).toBe(scenario.approved);
-			// Reviews, then the head commit, then the PR timeline whose force-push events
-			// are the server-observed freshness authority; the permission call only
-			// follows a surviving approval.
+			// Reviews, then the PR timeline whose force-push events are the only
+			// server-observed freshness authority. The commit is no longer fetched at all,
+			// because its committer date is contributor-controlled in both directions and
+			// therefore cannot be a floor. The permission call follows a surviving approval.
 			const expectsPermission = scenario.name === "valid exact-head approval" || scenario.name === "revoked collaborator permission";
-			expect(requests.length).toBe(expectsPermission ? 4 : 3);
+			expect(requests.length).toBe(expectsPermission ? 3 : 2);
 		} finally {
 			spy.mockRestore();
 		}
@@ -1274,6 +1275,9 @@ describe("push preflight independent-review evidence (issue #5483 review)", () =
 			body: riskClassifiedBody,
 			comments: riskClassifiedComments,
 			reviews: context => reviewerApproval(context, "APPROVED", "1970-01-01T00:00:00Z"),
+			// A force-push is what re-binds `commit_id`; without one on record there is no
+			// re-binding vector and nothing to refuse.
+			forcePushedAt: "2020-01-01T00:00:00Z\n",
 			permission: "write",
 		});
 		expect(result.exitCode).toBe(1);
@@ -1441,7 +1445,9 @@ describe("server independent-reviewer evidence (issue #5483 review)", () => {
 			if (endpoint === `https://api.github.com/repos/owner/repo/commits/${head}`)
 				return Response.json({ commit: { committer: { date: headCommittedAt } } });
 			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/issues/5416/timeline"))
-				return Response.json([]);
+				// The head appeared at a force-push; the committer date is no longer a
+				// freshness floor because a contributor can set it in either direction.
+				return Response.json([{ event: "head_ref_force_pushed", created_at: headCommittedAt }]);
 			if (endpoint === "https://api.github.com/repos/owner/repo/collaborators/review-bot/permission") return Response.json({ permission: "write" });
 			throw new Error(`Unexpected endpoint: ${endpoint}`);
 		}, { preconnect: originalFetch.preconnect });
@@ -1461,13 +1467,13 @@ describe("server independent-reviewer evidence (issue #5483 review)", () => {
 	});
 
 	test.each([
-		{ name: "commits API failure", commits: () => new Response("nope", { status: 500 }) },
-		{ name: "missing committer date", commits: () => Response.json({ commit: { committer: {} } }) },
-		{ name: "unparseable committer date", commits: () => Response.json({ commit: { committer: { date: "not-a-date" } } }) },
-	])("an unreadable head commit date refuses the approval rather than admitting it: $name", async scenario => {
-		// The first cut of #5692 skipped the precedence test entirely when the head date was
-		// absent, so a failed commit lookup ADMITTED the approval — a fail-open in the guard
-		// that exists to fail closed (#5692 review).
+		// The committer date is no longer a freshness floor in either direction, so an
+		// unreadable COMMIT is irrelevant. What must refuse is an unreadable force-push,
+		// because a force-push on record is the only re-binding vector (#5692 review).
+		{ name: "timeline read failure", timeline: () => new Response("nope", { status: 503 }) },
+		{ name: "force-push with a null time", timeline: () => Response.json([{ event: "head_ref_force_pushed", created_at: null }]) },
+		{ name: "force-push with an unparseable time", timeline: () => Response.json([{ event: "head_ref_force_pushed", created_at: "not-a-date" }]) },
+	])("unreadable server force-push evidence refuses the approval: $name", async scenario => {
 		const originalFetch = globalThis.fetch;
 		const previousToken = Bun.env.GITHUB_TOKEN;
 		Bun.env.GITHUB_TOKEN = "test-token";
@@ -1475,7 +1481,38 @@ describe("server independent-reviewer evidence (issue #5483 review)", () => {
 			const endpoint = String(input);
 			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/pulls/5416/reviews"))
 				return Response.json([review("review-bot", "APPROVED")]);
-			if (endpoint === `https://api.github.com/repos/owner/repo/commits/${head}`) return scenario.commits();
+			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/issues/5416/timeline")) return scenario.timeline();
+			if (endpoint === "https://api.github.com/repos/owner/repo/collaborators/review-bot/permission")
+				return Response.json({ permission: "write" });
+			throw new Error(`Unexpected endpoint: ${endpoint}`);
+		}, { preconnect: originalFetch.preconnect });
+		const spy = vi.spyOn(globalThis, "fetch").mockImplementation(replacement);
+		try {
+			const evidence = await fetchIndependentReviewerEvidence(event, "review-bot", head);
+			expect({ approvedHead: evidence.approvedHead, refusedApproval: evidence.refusedApproval }).toEqual({
+				approvedHead: false,
+				refusedApproval: "unreadable",
+			});
+		} finally {
+			spy.mockRestore();
+			if (previousToken === undefined) delete Bun.env.GITHUB_TOKEN;
+			else Bun.env.GITHUB_TOKEN = previousToken;
+		}
+	});
+
+	test("a future-dated commit cannot block a genuine approval when no force-push occurred (#5692 review)", async () => {
+		// The no-force-push branch previously used the committer date as the floor, so an
+		// author could forward-date their commit and refuse every legitimate approval on
+		// their own PR. With no force-push there is no re-binding vector at all.
+		const originalFetch = globalThis.fetch;
+		const previousToken = Bun.env.GITHUB_TOKEN;
+		Bun.env.GITHUB_TOKEN = "test-token";
+		const replacement: typeof fetch = Object.assign(async (input: Parameters<typeof fetch>[0]) => {
+			const endpoint = String(input);
+			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/pulls/5416/reviews"))
+				return Response.json([review("review-bot", "APPROVED")]);
+			if (endpoint === `https://api.github.com/repos/owner/repo/commits/${head}`)
+				return Response.json({ commit: { committer: { date: "2099-01-01T00:00:00Z" } } });
 			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/issues/5416/timeline"))
 				return Response.json([]);
 			if (endpoint === "https://api.github.com/repos/owner/repo/collaborators/review-bot/permission")
@@ -1485,12 +1522,14 @@ describe("server independent-reviewer evidence (issue #5483 review)", () => {
 		const spy = vi.spyOn(globalThis, "fetch").mockImplementation(replacement);
 		try {
 			const evidence = await fetchIndependentReviewerEvidence(event, "review-bot", head);
-			expect(evidence.approvedHead).toBe(false);
-			// Refused, but NOT claimed re-bound: precedence was never proven.
-			expect(evidence.refusedApproval).toBe("unreadable");
+			expect({ approvedHead: evidence.approvedHead, refusedApproval: evidence.refusedApproval }).toEqual({
+				approvedHead: true,
+				refusedApproval: undefined,
+			});
 		} finally {
 			spy.mockRestore();
-			if (previousToken === undefined) delete Bun.env.GITHUB_TOKEN; else Bun.env.GITHUB_TOKEN = previousToken;
+			if (previousToken === undefined) delete Bun.env.GITHUB_TOKEN;
+			else Bun.env.GITHUB_TOKEN = previousToken;
 		}
 	});
 
