@@ -144,10 +144,21 @@ function reviewPrecedesHead(submittedAt: string | undefined, appearance: HeadApp
  *   Refuse: "cannot read the authority" is not "no authority exists".
  * - `{ kind: "unconstrained" }` — no force-push at all.
  *
- * `unconstrained` is not a weakening. GitHub re-points `review.commit_id` onto a new tip
- * only on force-push; an ordinary push leaves the review bound to its old commit, so
- * `commit_id === headSha` fails naturally. With no force-push in the timeline there is no
- * re-binding vector, and the commit-id binding is trustworthy on its own.
+ * `unconstrained` means "no additional constraint available", NOT "proven unconstrained".
+ *
+ * What is established: GitHub has empirically re-pointed APPROVED reviews onto a new tip
+ * after a force-push (#5627 and #5622 both carry an approval whose `submitted_at` precedes
+ * the committer date of the commit it names, which is impossible without re-pointing). The
+ * exact conditions are undocumented — #5447 shows COMMENTED and CHANGES_REQUESTED reviews
+ * staying on their original SHAs across four head changes including a force-push, so the
+ * behaviour appears to be state-conditional rather than universal.
+ *
+ * What follows: an ordinary push leaves `commit_id` mismatched and fails naturally, a
+ * recorded force-push gets a server-time constraint, and unreadable evidence refuses. When
+ * no force-push is recorded we fall back to the plain exact-head binding, which is the
+ * pre-#5692 behaviour — never weaker, and stronger wherever the event exists. Note that a
+ * force-push is not always recorded as `head_ref_force_pushed`: one performed during this
+ * work does not appear in #5447's timeline.
  *
  * The committer date is therefore not used as a floor at all. It is contributor-controlled
  * in both directions: backdating was the original hole, and forward-dating let an author
@@ -178,7 +189,8 @@ function headAppearance(serverObserved: Array<string | undefined>): HeadAppearan
  * and later the withdrawn-approval gap the QA lane found.
  *
  * `headKnownAt` also discards reviews that predate the head they claim, which is how a
- * force-push silently re-binds a stale approval onto new code (#5692).
+ * a force-push has been observed to silently re-bind a stale APPROVED review onto new
+ * code (#5692); the conditions under which GitHub does this are undocumented.
  *
  * It is REQUIRED, and `undefined` rejects rather than admitting. An earlier version made
  * the precedence test conditional on having a head date, which meant a failed commit
@@ -565,7 +577,7 @@ function evaluateSelfReviewComment(input: PrValidationInput): { ok: boolean; rev
 		const named = review.extra.kind === "independent" ? review.extra.login : review.extra.kind;
 		const refused = input.independentReviewer?.refusedApproval;
 		if (refused === "rebound") {
-			diagnostics.push(`Self-review risk ${review.risk} names extra:independent:${named}, whose APPROVED review reports this exact head but was submitted BEFORE that head commit existed. GitHub re-pointed a stale review after a force-push, so it is not an approval of this code; a review submitted after the current head is required.`);
+			diagnostics.push(`Self-review risk ${review.risk} names extra:independent:${named}, whose APPROVED review reports this exact head but was submitted BEFORE that head commit existed. GitHub has been observed to re-point stale approvals after a force-push, so this is not evidence of an approval of this code; a review submitted after the current head is required.`);
 		} else if (refused === "unreadable") {
 			diagnostics.push(`Self-review risk ${review.risk} names extra:independent:${named}, who has an APPROVED review bound to this head, but its freshness could not be established: the head commit date or the review submission time was unreadable. The approval is refused rather than assumed valid; re-run once the head commit is readable, or obtain a review submitted after the current head.`);
 		} else {

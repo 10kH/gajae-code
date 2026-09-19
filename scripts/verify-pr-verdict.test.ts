@@ -1283,7 +1283,7 @@ describe("push preflight independent-review evidence (issue #5483 review)", () =
 		expect(result.exitCode).toBe(1);
 		// Must read as a re-bound stale approval, NOT as a missing one: the remedies differ.
 		expect(result.stderr).toContain("submitted BEFORE that head commit existed");
-		expect(result.stderr).toContain("re-pointed a stale review after a force-push");
+		expect(result.stderr).toContain("observed to re-point stale approvals after a force-push");
 	});
 
 	test("a backdated head commit cannot revive a stale approval (#5692 review)", async () => {
