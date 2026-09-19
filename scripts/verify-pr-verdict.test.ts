@@ -1914,6 +1914,48 @@ test("the stale-base markers survive comment stripping but not code removal (#56
 	}
 });
 
+test("no untrusted event field is interpolated into a workflow run block (#5740 review)", async () => {
+	// Author-controlled text expanded into a `run:` body is shell injection. I introduced
+	// exactly that with `${{ github.event.comment.body }}` while fixing something else, so
+	// checking once is not enough — this makes the class impossible to reintroduce.
+	//
+	// The allowlist is fields GitHub constrains to characters that cannot break out of a
+	// shell word: integers it assigns, hex SHAs it computes, and repository names limited
+	// to [A-Za-z0-9._-]. Anything else must reach the script through `env:`.
+	const safe = new Set([
+		"github.event.pull_request.number",
+		"github.event.pull_request.head.sha",
+		"github.event.pull_request.base.sha",
+		"github.event.pull_request.head.repo.full_name",
+		"github.event.issue.number",
+	]);
+	for (const file of ["../.github/workflows/pr-validation.yml", "../.github/workflows/dev-ci.yml", "../.github/workflows/ci.yml"]) {
+		const lines = (await Bun.file(new URL(file, import.meta.url)).text()).split("\n");
+		let inRun = false;
+		let indent = 0;
+		for (const [index, line] of lines.entries()) {
+			const opener = line.match(/^(\s*)(?:run|script):\s*\|/);
+			if (opener) {
+				inRun = true;
+				indent = opener[1]?.length ?? 0;
+				continue;
+			}
+			if (inRun && line.trim() !== "" && line.search(/\S/) <= indent) inRun = false;
+			// Comments inside a run block are prose, not expanded shell.
+			if (!inRun || line.trimStart().startsWith("#")) continue;
+			for (const match of line.matchAll(/\$\{\{\s*(github\.event\.[A-Za-z0-9_.]+)\s*\}\}/g)) {
+				const field = match[1] ?? "";
+				expect({ file, line: index + 1, field, allowed: safe.has(field) }).toEqual({
+					file,
+					line: index + 1,
+					field,
+					allowed: true,
+				});
+			}
+		}
+	}
+});
+
 test("issue_comment events cannot launch or cancel the affected Dev CI pipeline", async () => {
 	const devCi = await Bun.file(new URL("../.github/workflows/dev-ci.yml", import.meta.url)).text();
 	expect(devCi).not.toContain("issue_comment:");
