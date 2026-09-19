@@ -1850,8 +1850,20 @@ test("comment-triggered validation publishes a head-bound check run under the re
 	expect(fallible[0]?.[1].length).toBe(2);
 	// A failure after the head SHA is known but before the approval is raised must still
 	// leave the approval revoked. Gated on failure() so it cannot fire on the happy path.
+	// Revocation must be restricted to self-review comment events. `issue_comment` fires
+	// for every comment by anyone, so revoking on all of them let any commenter red the
+	// exact-head approval and, with `cancel-in-progress`, keep an authorized PR blocked
+	// indefinitely without changing any authorization evidence (#5740 review).
+	expect(workflow).toContain("steps.pr.outputs.self_review_event == 'true'");
+	expect(workflow.match(/self_review_event == 'true'/g)).toHaveLength(2);
+	// The untrusted comment body must reach the script through the environment. Inline
+	// `${{ github.event.comment.body }}` in a `run:` block is shell injection from an
+	// untrusted author — the exact thing this workflow exists to avoid.
+	expect(workflow).toContain("COMMENT_BODY: ${{ github.event.comment.body }}");
+	expect(workflow).toContain('"${COMMENT_BODY:-}" == *"$record_marker"*');
+	expect(workflow).not.toContain('comment_body="${{ github.event.comment.body }}"');
 	expect(workflow).toContain("name: Keep the approval revoked when revalidation does not complete");
-	expect(workflow).toContain("if: ${{ failure() && github.event_name == 'issue_comment' && steps.pr.outputs.head_sha != '' }}");
+	expect(workflow).toContain("if: ${{ failure() && github.event_name == 'issue_comment' && steps.pr.outputs.self_review_event == 'true' && steps.pr.outputs.head_sha != '' }}");
 	expect(workflow).toContain('-f \'output[title]="Merge approval (re-validation failed)"\'');
 	// Within the publication step the contract result is written before the approval is
 	// raised, so a failed contract write cannot leave a green approval.

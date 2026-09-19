@@ -50,6 +50,10 @@ jobs:
         id: pr
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          # Untrusted author-controlled text: passed through the environment so it is
+          # never expanded into the script body.
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_PREVIOUS_BODY: ${{ github.event.changes.body.from }}
         shell: bash
         run: |
           set -euo pipefail
@@ -79,6 +83,27 @@ jobs:
           echo "head_repo=$(printf '%s' "$pr_json" | jq -r '.head.repo.full_name')" >> "$GITHUB_OUTPUT"
           echo "head_sha=$(printf '%s' "$pr_json" | jq -r '.head.sha')" >> "$GITHUB_OUTPUT"
           echo "base_sha=$(printf '%s' "$pr_json" | jq -r '.base.sha')" >> "$GITHUB_OUTPUT"
+          # Does the TRIGGERING comment even look like a self-review record?
+          #
+          # `issue_comment` fires for every created, edited or deleted comment by anyone.
+          # Revoking on all of them let any commenter red the exact-head `Merge approval`
+          # and then, because `cancel-in-progress` kills the in-flight revalidation, keep
+          # an authorized PR blocked indefinitely by commenting repeatedly — a denial of
+          # service that changes no authorization evidence (#5740 review, Codex P2).
+          #
+          # Only a comment that is, or just stopped being, a candidate record can change
+          # the answer, so only those justify revoking. `changes.body.from` covers an edit
+          # that removed the marker; the marker alone is checked here, and the validator
+          # still does the real authentication and signature work.
+          # Read through the environment, NEVER by interpolating the comment into the
+          # script: `${{ github.event.comment.body }}` inline is shell injection from an
+          # untrusted author, which is precisely what this workflow exists to avoid.
+          record_marker="gajae.pr-self-review.v1"
+          if [[ "${COMMENT_BODY:-}" == *"$record_marker"* || "${COMMENT_PREVIOUS_BODY:-}" == *"$record_marker"* ]]; then
+            echo "self_review_event=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "self_review_event=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Skip non-dev comments
         if: ${{ steps.pr.outputs.skip == 'true' }}
         run: echo "::notice::no dev-based PR to validate; contract check skipped"
@@ -91,7 +116,10 @@ jobs:
         # revocation, so a previously-green "Merge approval" survived as the
         # authoritative required check. Writing the red here means any failure from
         # this point on leaves the merge blocked (#5692 review).
-        if: ${{ steps.pr.outputs.skip != 'true' && github.event_name == 'issue_comment' }}
+        # Only a comment that is, or just stopped being, a candidate self-review record
+        # can change the authorization answer. Revoking on every comment let any
+        # commenter block an authorized PR indefinitely (#5740 review, Codex P2).
+        if: ${{ steps.pr.outputs.skip != 'true' && github.event_name == 'issue_comment' && steps.pr.outputs.self_review_event == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -173,7 +201,7 @@ jobs:
         # previously-green check survives. A workflow cannot close that; it needs branch
         # protection to require a check bound to the current run rather than any green
         # one (#5692 review).
-        if: ${{ failure() && github.event_name == 'issue_comment' && steps.pr.outputs.head_sha != '' }}
+        if: ${{ failure() && github.event_name == 'issue_comment' && steps.pr.outputs.self_review_event == 'true' && steps.pr.outputs.head_sha != '' }}
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
