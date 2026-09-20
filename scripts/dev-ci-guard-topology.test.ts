@@ -107,7 +107,18 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 			expect({ scenario: scenario.name, group: evaluate(document.concurrency.group) }).toEqual({
 				scenario: scenario.name, group: headOnlyDispatch ? "dev-ci-dispatch-34300623114" : `Dev CI-refs/pull/5367/merge${scenario.skip ? "-metadata-edit" : ""}`,
 			});
-			expect(Boolean(evaluate(document.concurrency["cancel-in-progress"]))).toBe(!scenario.skip && !headOnlyDispatch);
+			// Only a superseding pull_request run may cancel its predecessor: a new
+			// push to the same PR head supersedes the previous validation of that
+			// head. A `push` to `dev` is a distinct integration state, not a
+			// superseded one, and `dev` has a single ref, so cancelling there meant
+			// every push run killed its predecessor and `dev` was never verified as
+			// a whole (#5709). An ordinary `workflow_dispatch` is likewise removed
+			// from the cancelling set so a manual validation cannot kill the
+			// integration run already in flight.
+			expect({ scenario: scenario.name, cancel: Boolean(evaluate(document.concurrency["cancel-in-progress"])) }).toEqual({
+				scenario: scenario.name,
+				cancel: scenario.event === "pull_request" && !scenario.skip,
+			});
 			// GitHub publishes contexts even for skipped jobs: evaluate their names
 			// independently of scheduling so metadata cannot forge code evidence.
 			for (const [id, canonical, nonCode] of [

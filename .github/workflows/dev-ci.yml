@@ -45,6 +45,15 @@ permissions:
 # guard is evaluated, leaving the SHA with no completed validation while skipped
 # required jobs still report success. Such runs get their own group and never
 # cancel anything. Base changes remain validation events even with metadata edits.
+#
+# Only a superseding `pull_request` run may cancel its predecessor, because a new
+# push to the same PR head supersedes the previous validation of that head. A
+# `push` to `dev` is a distinct integration state, not a superseded one, and `dev`
+# has a single ref: cancelling there meant that when merges arrived faster than a
+# run finished, every push run killed its predecessor and `dev` was never verified
+# as a whole (#5709). The same reasoning removes the ordinary `workflow_dispatch`
+# from the cancelling set -- a manual validation of `dev` must not kill the
+# integration run already in flight.
 concurrency:
   group: >-
     ${{ github.event_name == 'workflow_dispatch' && inputs.head_sha != '' && format('dev-ci-dispatch-{0}', github.run_id)
@@ -52,8 +61,8 @@ concurrency:
     && format('{0}-{1}-metadata-edit', github.workflow, github.ref)
     || format('{0}-{1}', github.workflow, github.ref) }}
   cancel-in-progress: >-
-    ${{ !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '')
-    && !(github.event_name == 'pull_request' && github.event.action == 'edited' && (github.event.changes.body != null || github.event.changes.title != null) && github.event.changes.base == null) }}
+    ${{ github.event_name == 'pull_request'
+    && !(github.event.action == 'edited' && (github.event.changes.body != null || github.event.changes.title != null) && github.event.changes.base == null) }}
 
 jobs:
   wsl-drvfs-qualification:
