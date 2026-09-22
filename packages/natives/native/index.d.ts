@@ -51,6 +51,7 @@ export declare class ComputerController {
   keypress(expectedEpoch: number | undefined | null, keys: Array<string>): void
   wait(expectedEpoch: number | undefined | null, ms: number): void
 }
+
 export declare class DoctorJournalAuthority {
   static createExact(root: string, runId: string): DoctorJournalCreateResult
   append(record: string): void
@@ -582,7 +583,7 @@ export declare function __piNativesPublishOutcomeV1(): void
  * `packages/natives/native/index.js` (which derives the name from
  * `package.json#version`).
  */
-export declare function __piNativesV0_17_2(): void
+export declare function __piNativesV0_17_3(): void
 
 /**
  * Apply conservative pre-execution rewrites to a bash command.
