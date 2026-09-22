@@ -5250,8 +5250,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							const result = await exact.manager.discoverAndConnect({ configPath: exact.configPath });
 							// A slash control may commit while the deferred startup flight is
 							// loading. Re-read the manager's fenced publication rather than
-							// replaying the stale startup snapshot into the session registry.
-							const resultTools = exact.manager.getTools() as CustomTool[];
+							// replaying the stale startup snapshot into the session registry. A
+							// deferred manager can still be waiting to publish its first catalog,
+							// though; only that explicit unpublished state may use the discovery
+							// result. Empty published/fenced catalogs are authoritative and must
+							// not replay stale tools across an exact control.
+							const catalog = exact.manager.getToolCatalogSnapshot();
+							const resultTools =
+								catalog.publication === "unpublished"
+									? (result.tools as CustomTool[])
+									: (catalog.tools as CustomTool[]);
 							const toolNames = resultTools.map(tool => tool.name);
 							const collidingToolNames = findDeferredExactMcpToolNameCollisions(
 								toolNames,
