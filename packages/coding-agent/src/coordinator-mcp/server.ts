@@ -27,6 +27,7 @@ import type { WorkflowGate, WorkflowGateQueryRecord } from "../modes/shared/agen
 import type { BrokerDiscovery } from "../sdk/broker/discovery";
 import { endpointIncarnation } from "../sdk/broker/endpoint-authority";
 import { type EnsureBrokerSettings, ensureBroker } from "../sdk/broker/ensure";
+import { DEAD_HOST_HEARTBEAT_SILENCE_MS } from "../sdk/broker/session-index";
 import { lifecycleRequestTimeoutMs } from "../sdk/broker/startup-budget";
 import { UnsupportedStateVersionError } from "../sdk/broker/state-version";
 import { SdkClient, SdkClientError } from "../sdk/client/client";
@@ -527,6 +528,26 @@ const Q12_SNAPSHOT_BUDGET_MS = 5_000;
 const MAX_RUNTIME_SESSIONS_PER_WATCH_PASS = 4;
 const MAX_Q12_ATTEMPTS_PER_WATCH_PASS = 2;
 const MAX_RUNTIME_PROMPT_ACK_TIMEOUT_MS = 5 * 60 * 1000;
+/**
+ * A delete intent is superseded once another deletion for the same session and
+ * endpoint incarnation has completed: force eviction retires a stale endpoint under
+ * its own record and leaves behind the intent an earlier idle reap admitted.
+ */
+function isSupersededDeletionIntent(
+	entry: NamespaceDeletionEntryV1,
+	deletions: readonly NamespaceDeletionEntryV1[],
+): boolean {
+	return (
+		entry.phase === "intent" &&
+		deletions.some(
+			other =>
+				other !== entry &&
+				other.session_id === entry.session_id &&
+				other.endpoint_incarnation === entry.endpoint_incarnation &&
+				other.phase === "completed",
+		)
+	);
+}
 const ACTIVE_TURN_STATUSES = new Set<TurnStatus>(["delivering", "active", "waiting_for_answer", "completing"]);
 const TERMINAL_TURN_STATUSES = new Set<TurnStatus>(["completed", "failed", "cancelled", "superseded"]);
 const TURN_ID_PATTERN = /^turn-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -5768,6 +5789,16 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		workspace: string;
 		endpointGeneration: number;
 		endpointIncarnation: string;
+		/** Host liveness the broker reports for the indexed row; absent when unreported. */
+		live?: boolean;
+		/** Last host heartbeat the broker recorded for the row (epoch ms); absent when unreported. */
+		lastHeartbeatAt?: number;
+		/** True when more than one unresolved state-root authority claims this session. */
+		ambiguous?: boolean;
+		/** True when teardown ownership is unresolved and must not be force-retired. */
+		terminalUncertain?: boolean;
+		/** True when the exact broker row is already terminal. */
+		terminal?: boolean;
 	};
 
 	async function exactBrokerSessionAuthority(sessionId: string, workspace: string): Promise<BrokerSessionAuthority> {
@@ -5787,17 +5818,35 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			if (sameCanonicalPath(canonicalWorkspace, workspace, platform))
 				matches.push({ session, workspace: canonicalWorkspace });
 		}
-		if (matches.length !== 1)
+		if (matches.length === 0)
 			throw new SdkClientError(
 				"not_found",
 				"Session is not uniquely indexed in the requested coordinator workspace.",
+			);
+		if (matches.length !== 1)
+			throw new SdkClientError(
+				"ambiguous",
+				"Session has multiple broker authority rows in the requested coordinator workspace.",
 			);
 		const match = matches[0]!;
 		const endpointGeneration = brokerEndpointGeneration(match.session);
 		const endpointIncarnation = brokerEndpointIncarnation(match.session, sessionId);
 		if (endpointGeneration === null || endpointIncarnation === null)
 			throw new SdkClientError("endpoint_stale", "Broker session has no usable endpoint incarnation.");
-		return { workspace: match.workspace, endpointGeneration, endpointIncarnation };
+		return {
+			workspace: match.workspace,
+			endpointGeneration,
+			endpointIncarnation,
+			...(typeof match.session.live === "boolean" ? { live: match.session.live } : {}),
+			...(typeof match.session.lastHeartbeatAt === "number"
+				? { lastHeartbeatAt: match.session.lastHeartbeatAt }
+				: {}),
+			...(typeof match.session.ambiguous === "boolean" ? { ambiguous: match.session.ambiguous } : {}),
+			...(typeof match.session.terminalUncertain === "boolean"
+				? { terminalUncertain: match.session.terminalUncertain }
+				: {}),
+			...(typeof match.session.terminal === "boolean" ? { terminal: match.session.terminal } : {}),
+		};
 	}
 
 	async function exactBrokerSessionBinding(sessionId: string, workspace: string): Promise<BrokerSessionAuthority> {
@@ -6082,19 +6131,21 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			// manifest first, even while the session projection remains readable, so a
 			// verification-uncertain retry never reaches broker close again.
 			await ensureQuestionStateReady();
-			let pendingDeletion = await withNamespaceRegistry(
-				questionPaths,
-				async registry =>
-					Object.values(registry.deletions)
+			let pendingDeletion = await withNamespaceRegistry(questionPaths, async registry => {
+				const deletions = Object.values(registry.deletions);
+				return (
+					deletions
 						.filter(
 							entry =>
 								entry.session_id === id &&
 								(entry.phase === "intent" ||
 									entry.phase === "broker_closed" ||
-									entry.phase === "cleanup_pending"),
+									entry.phase === "cleanup_pending") &&
+								!isSupersededDeletionIntent(entry, deletions),
 						)
-						.sort((left, right) => right.updated_at.localeCompare(left.updated_at))[0] ?? null,
-			);
+						.sort((left, right) => right.updated_at.localeCompare(left.updated_at))[0] ?? null
+				);
+			});
 			if (pendingDeletion?.phase === "intent") {
 				try {
 					await recoverIntentDeletion(pendingDeletion);
@@ -6122,7 +6173,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				const deletion = await withNamespaceRegistry(questionPaths, async registry => {
 					const matching = Object.values(registry.deletions).filter(entry => entry.session_id === id);
 					return (
-						matching.find(entry => entry.phase !== "completed") ??
+						matching.find(entry => entry.phase !== "completed" && !isSupersededDeletionIntent(entry, matching)) ??
 						matching.find(entry => entry.safe_response !== undefined) ??
 						null
 					);
@@ -6445,8 +6496,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	/**
 	 * Prove a stored endpoint identity (workspace + generation + incarnation) is no
 	 * longer current against the live broker index. Returns true only when the
-	 * broker row is absent (not_found) or its generation/incarnation/workspace has
-	 * rotated away from the stored triple. A transient authority-read failure
+	 * broker row is absent (not_found), its generation/incarnation/workspace has
+	 * rotated away from the stored triple, or the broker reports the row not live
+	 * and its host has been silent for DEAD_HOST_HEARTBEAT_SILENCE_MS. A transient
+	 * authority-read failure
 	 * returns false: we cannot prove the endpoint recovered, but we also must not
 	 * force-evict on a flake — the normal reap path will retry.
 	 */
@@ -6460,6 +6513,17 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			const workspace = await canonicalBrokerWorkspace(persistedWorkspace);
 			const authority = await exactBrokerSessionAuthority(id, workspace);
 			return (
+				// The broker can keep indexing a session's exact identity after its host is
+				// gone; it then reports the row as not live and answers close with
+				// endpoint_stale, so an identity match alone does not prove a live endpoint.
+				// `live` alone is heartbeat-derived and flips after a short gap, so also
+				// require the host to have been silent far beyond the broker's freshness
+				// window before treating the row as dead.
+				(authority.ambiguous !== true &&
+					authority.terminalUncertain !== true &&
+					authority.live === false &&
+					authority.lastHeartbeatAt !== undefined &&
+					Date.now() - authority.lastHeartbeatAt >= DEAD_HOST_HEARTBEAT_SILENCE_MS) ||
 				!sameCanonicalPath(authority.workspace, persistedWorkspace, platform) ||
 				authority.endpointGeneration !== persistedGeneration ||
 				authority.endpointIncarnation !== persistedIncarnation
@@ -6571,6 +6635,45 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			// projection-only delete.
 			return;
 		}
+		const brokerSessionSnapshot = canonicalTransaction.canonical.session.broker;
+		const brokerWorkspace = optionalString(brokerSessionSnapshot.workspace);
+		const brokerGeneration =
+			typeof brokerSessionSnapshot.endpoint_generation === "number" &&
+			Number.isSafeInteger(brokerSessionSnapshot.endpoint_generation) &&
+			brokerSessionSnapshot.endpoint_generation > 0
+				? brokerSessionSnapshot.endpoint_generation
+				: null;
+		if (
+			!brokerWorkspace ||
+			brokerGeneration === null ||
+			brokerSessionSnapshot.endpoint_incarnation !== persistedIncarnation
+		)
+			return;
+		// The stale proof above is a read. Before deleting coordinator state, ask the
+		// broker to atomically fence the exact generation/incarnation under its index
+		// lock. A successor, fresh heartbeat, ambiguous row, or terminal-uncertain
+		// authority refuses this request. A missing row is already fenced and is safe
+		// to treat as retired: the preceding reap close observed the same endpoint.
+		try {
+			const fence = strictBrokerSessionClose(
+				await brokerSession(
+					brokerWorkspace,
+					"session.close",
+					{
+						cwd: brokerWorkspace,
+						sessionId,
+						endpointGeneration: brokerGeneration,
+						endpointIncarnation: persistedIncarnation,
+						forceRetireStale: true,
+					},
+					`coordinator-reaper-fence:${sessionId}:${persistedIncarnation}`,
+				),
+				sessionId,
+			);
+			if (fence.retired !== true) return;
+		} catch (error) {
+			if (!(error instanceof SdkClientError) || error.code !== "not_found") return;
+		}
 		const deletionId = `force-evict:${sessionId}:${persistedIncarnation}`;
 		const deletionKey = createHash("sha256").update(deletionId).digest("hex");
 		const now = new Date().toISOString();
@@ -6666,7 +6769,15 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			},
 			reapSession: async (sessionId: string): Promise<void> => {
 				const result = await reapSession(sessionId, { reason: "idle_reaper" });
-				if (!result.ok) throw new Error(result.reason ?? "session_reap_failed");
+				if (result.ok) return;
+				// reapSession reports a broker close the endpoint could not serve as
+				// close_failed with the broker code in `detail`. The reaper only counts
+				// endpoint_stale toward force eviction, so pass that code through;
+				// markSessionDead still re-proves staleness under the session lock.
+				const staleClose =
+					result.reason === "close_failed" &&
+					(result.detail === "endpoint_stale" || result.detail === "not_found");
+				throw new Error(staleClose ? "endpoint_stale" : (result.reason ?? "session_reap_failed"));
 			},
 			markSessionDead: async (sessionId: string): Promise<void> => {
 				// Force-evict a session that cannot be reaped normally (endpoint_stale
