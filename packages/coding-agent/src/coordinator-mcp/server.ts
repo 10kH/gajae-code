@@ -4,7 +4,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getAgentDir, isKnownSinkPeerClosedError, logger } from "@gajae-code/utils";
 import { normalizePathForComparison, VERSION } from "@gajae-code/utils/dirs";
-import { withFileLock } from "../config/file-lock";
+import { isFileLockAcquireTimeout, withFileLock } from "../config/file-lock";
 import {
 	COORDINATOR_MCP_PROTOCOL_VERSION,
 	COORDINATOR_MCP_SERVER_NAME,
@@ -146,6 +146,7 @@ import {
 	recoverExpiredPublicDelivery,
 	releasePublicDeliveryClaim,
 	removeSessionTransaction,
+	repairLegacyReportIds,
 	repairProjections,
 	replaceCreationRetirementIntent,
 	rotateClaimedCreationVerifier,
@@ -3900,7 +3901,25 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	): Promise<Map<string, string>> {
 		const authorized = new Map<string, string>();
 		for (const sessionId of new Set(sessionIds)) {
-			const transaction = await readSessionTransaction(questionPaths, sessionId);
+			// A corrupt or unreadable peer session must never abort authorization for
+			// every other session. Only the explicitly scoped session may propagate,
+			// otherwise one bad WAL record makes namespace-wide reads permanently
+			// unavailable instead of degrading to the sessions that are still sound.
+			let transaction: CoordinatorSessionTransactionV1 | null;
+			try {
+				transaction = await readSessionTransaction(questionPaths, sessionId);
+			} catch (error) {
+				logger.warn("Coordinator authorization skipped unreadable session", {
+					sessionId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+				// Only a structurally corrupt WAL is degradable for an unscoped
+				// namespace sweep. Cancellation, I/O, and unexpected invariant errors
+				// must remain visible instead of silently shrinking authorization.
+				if (scopedSessionId === sessionId || !(error instanceof Error && error.message === "state_corrupt"))
+					throw error;
+				continue;
+			}
 			if (!transaction) {
 				if (scopedSessionId === sessionId && !allowMissingSessionIds.has(sessionId))
 					throw new Error("resource_gone");
@@ -5983,13 +6002,49 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		const sessionId = brokerSessionId(session);
 		return sessionId !== null && registered.has(sessionId);
 	}
+	async function reportProjectionFilesForSession(sessionId: string): Promise<string[]> {
+		const reportsDirectory = path.join(namespaceDir, "reports");
+		const entries = await fs.readdir(reportsDirectory, { withFileTypes: true }).catch(error => {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+			throw error;
+		});
+		const files: string[] = [];
+		for (const entry of entries) {
+			if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+			const file = path.join(reportsDirectory, entry.name);
+			try {
+				const report = asRecord(await readJsonFile(file));
+				if (report?.session_id === sessionId) files.push(file);
+			} catch (error) {
+				logger.warn("Coordinator report projection scan skipped unreadable file", {
+					file,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
+		return files;
+	}
+	async function removeStaleReportProjections(
+		sessionId: string,
+		retainedReportIds: ReadonlySet<string>,
+	): Promise<void> {
+		for (const file of await reportProjectionFilesForSession(sessionId)) {
+			const reportId = path.basename(file, ".json");
+			if (retainedReportIds.has(reportId)) continue;
+			await fs.rm(file, { force: true });
+		}
+	}
 	async function removeReapedProjection(
 		sessionId: string,
 		turnIds: readonly string[],
 		reportIds: readonly string[],
 	): Promise<void> {
 		for (const turnId of turnIds) await fs.rm(turnFile(namespaceDir, turnId), { force: true });
-		for (const reportId of reportIds) await fs.rm(reportProjectionFile(namespaceDir, reportId), { force: true });
+		for (const reportId of reportIds) {
+			if (COORDINATOR_REPORT_ID_PATTERN.test(reportId))
+				await fs.rm(reportProjectionFile(namespaceDir, reportId), { force: true });
+		}
+		for (const file of await reportProjectionFilesForSession(sessionId)) await fs.rm(file, { force: true });
 		await fs.rm(sessionFile(sessionId), { force: true });
 		await fs.rm(sessionStateFile(namespaceDir, sessionId), { force: true });
 		await fs.rm(activeTurnFile(namespaceDir, sessionId), { force: true });
@@ -6350,6 +6405,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			}
 			const deletionId = `delete:${id}:${persistedIncarnation}`;
 			const deletionKey = createHash("sha256").update(deletionId).digest("hex");
+			const projectedReportIds = (await reportProjectionFilesForSession(id)).map(file =>
+				path.basename(file, ".json"),
+			);
 			const deletionEntry = {
 				deletion_id: deletionId,
 				session_id: id,
@@ -6366,7 +6424,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					session: false,
 					events: false,
 					turn_ids: canonicalTransaction ? Object.keys(canonicalTransaction.canonical.turns) : [],
-					report_ids: canonicalTransaction ? Object.keys(canonicalTransaction.canonical.reports) : [],
+					report_ids: [
+						...new Set([
+							...(canonicalTransaction ? Object.keys(canonicalTransaction.canonical.reports) : []),
+							...projectedReportIds,
+						]),
+					],
 				},
 				authority_digest: deletionKey,
 				created_at: new Date().toISOString(),
@@ -6387,7 +6450,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			}
 			const projectionIds = {
 				turnIds: Object.keys(admitted.canonical.turns),
-				reportIds: Object.keys(admitted.canonical.reports),
+				reportIds: [
+					...new Set([
+						...Object.keys(admitted.canonical.reports),
+						...(await reportProjectionFilesForSession(id)).map(file => path.basename(file, ".json")),
+					]),
+				],
 			};
 			await ensureQuestionStateReady();
 			const deletionPhase = await withNamespaceRegistry(
@@ -6724,6 +6792,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		}
 		const deletionId = `force-evict:${sessionId}:${persistedIncarnation}`;
 		const deletionKey = createHash("sha256").update(deletionId).digest("hex");
+		const projectedReportIds = (await reportProjectionFilesForSession(sessionId)).map(file =>
+			path.basename(file, ".json"),
+		);
 		const now = new Date().toISOString();
 		const entry: NamespaceDeletionEntryV1 = {
 			deletion_id: deletionId,
@@ -6741,7 +6812,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				session: false,
 				events: false,
 				turn_ids: canonicalTransaction ? Object.keys(canonicalTransaction.canonical.turns) : [],
-				report_ids: canonicalTransaction ? Object.keys(canonicalTransaction.canonical.reports) : [],
+				report_ids: [
+					...new Set([
+						...(canonicalTransaction ? Object.keys(canonicalTransaction.canonical.reports) : []),
+						...projectedReportIds,
+					]),
+				],
 			},
 			authority_digest: deletionKey,
 			created_at: now,
@@ -7625,6 +7701,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					await writeTurnRecord(namespaceDir, turnFromCanonical(turn));
 				for (const report of Object.values(canonical.reports))
 					await writeJsonFile(reportProjectionFile(namespaceDir, report.report_id), report);
+				await removeStaleReportProjections(sessionId, new Set(Object.keys(canonical.reports)));
 				const activeId = canonical.queue.selected_promotion?.to_turn_id ?? canonical.queue.active_turn_id;
 				const active = activeId ? canonical.turns[activeId] : null;
 				if (active) await writeActiveTurn(namespaceDir, turnFromCanonical(active));
@@ -7703,8 +7780,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		await exportRetainedDeliveries(32, options.signal);
 	}
 
-	async function recoverCanonicalSessionProjection(sessionId: string): Promise<void> {
-		const transaction = await readSessionTransaction(questionPaths, sessionId);
+	async function recoverCanonicalSessionProjection(
+		sessionId: string,
+		options: { signal?: AbortSignal } = {},
+	): Promise<void> {
+		const transaction = await repairLegacyReportIds(questionPaths, sessionId, options);
 		if (!transaction) return;
 		const applied = Math.min(
 			transaction.projection.applied_turns_revision,
@@ -7713,10 +7793,13 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			transaction.projection.applied_active_revision,
 			transaction.projection.applied_events_revision,
 		);
-		if (applied < transaction.revision) await repairCanonicalProjections(sessionId);
+		if (applied < transaction.revision) await repairCanonicalProjections(sessionId, options);
 	}
 
-	async function recoverCanonicalNamespaceProjections(scopedSessionId: string | null = null): Promise<void> {
+	async function recoverCanonicalNamespaceProjections(
+		scopedSessionId: string | null = null,
+		options: { signal?: AbortSignal } = {},
+	): Promise<void> {
 		await ensureQuestionStateReady();
 		const roster = await readSchedulerRoster(questionPaths);
 		const persisted = await fs.readdir(questionPaths.sessions).catch(() => []);
@@ -7731,13 +7814,21 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				const transaction = await readSessionTransaction(questionPaths, sessionId);
 				if (!transaction) continue;
 				await assertPersistedSessionAuthority(transaction.canonical.session);
-				await recoverCanonicalSessionProjection(sessionId);
+				await recoverCanonicalSessionProjection(sessionId, options);
 			} catch (error) {
-				if (
-					!(error instanceof Error) ||
-					(error.message !== "state_corrupt" && (scopedSessionId !== null || !isSessionAuthorityError(error)))
-				)
-					throw error;
+				// Degrade per session instead of aborting the namespace sweep: one
+				// unreadable record must not make every coordination read fail.
+				// Log before classifying so the skipped session is always nameable
+				// from the outside — state_corrupt is precisely the shape the two
+				// WAL defects surface as, and silencing it hides the cause.
+				logger.warn("Coordinator projection recovery skipped session", {
+					sessionId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+				const isCorruptWal = error instanceof Error && error.message === "state_corrupt";
+				const isAuthorityFailure = isSessionAuthorityError(error);
+				if (!isCorruptWal && !isAuthorityFailure && !isFileLockAcquireTimeout(error)) throw error;
+				if (scopedSessionId === sessionId && !isCorruptWal) throw error;
 			}
 		}
 	}
@@ -8059,12 +8150,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			try {
 				await reconcileSessionRuntime(entry.session_id, options);
 			} catch (error) {
-				if (
-					!(error instanceof Error) ||
-					(error.message !== "resource_gone" &&
-						(prioritySessionId !== undefined || !isSessionAuthorityError(error)))
-				)
-					throw error;
+				const degradable =
+					error instanceof Error &&
+					(error.message === "resource_gone" ||
+						isSessionAuthorityError(error) ||
+						(error.message === "state_corrupt" && prioritySessionId === undefined));
+				if (!degradable) throw error;
 			}
 		}
 		if (processedCursor && !options.signal?.aborted)
@@ -8093,7 +8184,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				await reconcileSessionRuntime(sessionId, options);
 				await reconcileQuestions(sessionId, options);
 			} catch (error) {
-				if (!(error instanceof Error) || (error.message !== "resource_gone" && !isSessionAuthorityError(error)))
+				if (
+					!(error instanceof Error) ||
+					(error.message !== "resource_gone" &&
+						error.message !== "state_corrupt" &&
+						!isSessionAuthorityError(error))
+				)
 					throw error;
 			}
 		}
@@ -8127,12 +8223,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			try {
 				await reconcileQuestions(entry.session_id, options);
 			} catch (error) {
-				if (
-					!(error instanceof Error) ||
-					(error.message !== "resource_gone" &&
-						(prioritySessionId !== undefined || !isSessionAuthorityError(error)))
-				)
-					throw error;
+				const degradable =
+					error instanceof Error &&
+					(error.message === "resource_gone" ||
+						isSessionAuthorityError(error) ||
+						(error.message === "state_corrupt" && prioritySessionId === undefined));
+				if (!degradable) throw error;
 			}
 		}
 		if (processedCursor && !options.signal?.aborted)
@@ -8172,14 +8268,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				await assertPersistedSessionAuthority(transaction.canonical.session);
 				turn = await readActiveTurn(namespaceDir, entry.session_id);
 			} catch (error) {
-				if (
-					!(error instanceof Error) ||
-					(error.message !== "resource_gone" &&
-						error.message !== "coordinator_workdir_outside_allowed_roots" &&
-						error.message !== "coordinator_workdir_roots_required" &&
-						error.message !== "coordinator_workspace_required")
-				)
-					throw error;
+				const degradable =
+					error instanceof Error &&
+					(error.message === "resource_gone" ||
+						isSessionAuthorityError(error) ||
+						(error.message === "state_corrupt" && prioritySessionId === undefined));
+				if (!degradable) throw error;
 			}
 			processedCursor = entry.session_id;
 			if (!turn) continue;
@@ -8795,14 +8889,14 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						// repair. The fresh journal snapshot below is the first public read after
 						// that repair/export sequence, so events are visible after the caller's
 						// cursor without allowing recovery to erase a terminal observation.
-						await recoverCanonicalNamespaceProjections(prioritySessionId ?? null);
+						await recoverCanonicalNamespaceProjections(prioritySessionId ?? null, reconcileOptions);
 						await exportRetainedDeliveries(32);
 					} catch (error) {
 						if (!(error instanceof Error && error.message === "resource_gone")) throw error;
 					}
 				} else if (!watchController.signal.aborted && Date.now() < absoluteDeadline) {
-					await recoverCanonicalNamespaceProjections(prioritySessionId ?? null);
 					try {
+						await recoverCanonicalNamespaceProjections(prioritySessionId ?? null, reconcileOptions);
 						await exportRetainedDeliveries(32, watchController.signal);
 						await reconcileWatchAdmissions(prioritySessionId, reconcileOptions);
 						await reconcileActiveTurnAcknowledgements(
