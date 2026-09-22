@@ -452,6 +452,7 @@ import {
 	effectiveFallbackDelay,
 	FallbackChainController,
 	type FallbackChainRuntimeState,
+	sanitizeCompactionCandidateFailureMessage,
 } from "./fallback-chain-controller";
 
 export { DefaultModelSelectionRecoveryError } from "./default-model-selection";
@@ -20318,33 +20319,79 @@ export class AgentSession {
 			addCandidate(this.#resolveRoleModelFull(role, availableModels, currentModel).model);
 		}
 
-		// Last-resort fallback: the largest-context model that shares the ACTIVE
-		// model's provider. Scoping this to the current provider keeps auto-
-		// compaction on the user's configured/custom route instead of silently
-		// defaulting to an unrelated provider (e.g. a stray OpenAI credential
-		// with no remaining credit) just because it happens to be in the bundled
-		// catalog. Cross-provider compaction stays possible, but only when the
-		// user opts in explicitly via modelRoles (handled by the loop above).
-		const fallbackProvider = currentModel?.provider;
-		const sortedByContext = [...availableModels]
-			.filter(model => fallbackProvider === undefined || model.provider === fallbackProvider)
-			.sort((a, b) => b.contextWindow - a.contextWindow);
-		for (const model of sortedByContext) {
-			if (!seen.has(this.#getModelKey(model))) {
-				addCandidate(model);
-				break;
-			}
-		}
-
 		return candidates;
+	}
+	#compactionCandidateSource(candidate: Model): string {
+		const currentModel = this.model;
+		if (currentModel && modelsAreEqual(candidate, currentModel)) return "active session model";
+		for (const role of MODEL_ROLE_IDS) {
+			const roleModel = this.#resolveRoleModelFull(role, this.#modelRegistry.getAvailable(), currentModel).model;
+			if (roleModel && modelsAreEqual(candidate, roleModel)) return `modelRoles.${role}`;
+		}
+		return "configured compaction fallback";
+	}
+	#compactionFailureReason(error: unknown): string {
+		const message = sanitizeCompactionCandidateFailureMessage(error instanceof Error ? error.message : String(error));
+		if (/stream stalled while waiting for the next event/i.test(message)) {
+			return "SSE stream stalled while waiting for the next event";
+		}
+		if (/timed? out while waiting for the first event/i.test(message)) {
+			return "SSE stream timed out while waiting for the first event";
+		}
+		if (/auth_unavailable|no auth available|credential/i.test(message)) {
+			return "candidate credentials unavailable";
+		}
+		return message.length > 160 ? `${message.slice(0, 157)}...` : message;
+	}
+	async #emitCompactionModelSubstitution(from: Model, to: Model, reason: string): Promise<void> {
+		const fromKey = this.#getModelKey(from);
+		const toKey = this.#getModelKey(to);
+		const source = this.#compactionCandidateSource(to);
+		try {
+			await this.#emitSessionEvent({
+				type: "notice",
+				level: "warning",
+				source: "compaction-recovery",
+				message: `Compaction recovery switched model from ${fromKey} to ${toKey} (${source}) after ${reason}.`,
+			});
+		} catch (error) {
+			logger.warn("Failed to publish compaction model substitution", {
+				from: fromKey,
+				to: toKey,
+				error: String(error),
+			});
+		}
+	}
+	async #resolveCompactionCandidate(
+		candidate: Model,
+		previousCandidate: Model | undefined,
+		previousFailure: unknown,
+	): Promise<{ apiKey: string; authError?: undefined } | { apiKey: undefined; authError: Error }> {
+		const apiKey = await this.#modelRegistry.getApiKey(candidate, this.credentialSessionId);
+		if (!apiKey) return { apiKey: undefined, authError: this.#buildCompactionAuthError(candidate) };
+		if (previousCandidate) {
+			await this.#emitCompactionModelSubstitution(
+				previousCandidate,
+				candidate,
+				this.#compactionFailureReason(previousFailure),
+			);
+		}
+		return { apiKey, authError: undefined };
 	}
 	#isCompactionAuthFailure(error: unknown): boolean {
 		if (!(error instanceof Error)) return false;
+		if (
+			/stream stalled while waiting for the next event|timed? out while waiting for the first event/i.test(
+				error.message,
+			)
+		) {
+			return false;
+		}
 		return /auth_unavailable|no auth available/i.test(error.message);
 	}
 
-	#buildCompactionAuthError(): Error {
-		const currentModel = this.model;
+	#buildCompactionAuthError(candidate?: Model): Error {
+		const currentModel = candidate ?? this.model;
 		if (!currentModel) {
 			return new Error(
 				"Compaction requires a model with usable credentials, but no authenticated compaction model is available.",
@@ -20394,10 +20441,20 @@ export class AgentSession {
 	): Promise<CompactionResult> {
 		const candidates = this.#getCompactionModelCandidates(this.#modelRegistry.getAvailable());
 		const telemetry = resolveTelemetry(this.agent.telemetry, this.sessionId);
+		let previousCandidate: Model | undefined;
+		let previousFailure: unknown;
 
 		for (const candidate of candidates) {
-			const apiKey = await this.#modelRegistry.getApiKey(candidate, this.credentialSessionId);
-			if (!apiKey) continue;
+			const { apiKey, authError } = await this.#resolveCompactionCandidate(
+				candidate,
+				previousCandidate,
+				previousFailure,
+			);
+			if (apiKey === undefined) {
+				previousCandidate = candidate;
+				previousFailure = authError;
+				continue;
+			}
 
 			try {
 				return await compact(preparation, candidate, apiKey, customInstructions, signal, {
@@ -20415,10 +20472,12 @@ export class AgentSession {
 				if (!this.#isCompactionAuthFailure(error)) {
 					throw error;
 				}
+				previousCandidate = candidate;
+				previousFailure = this.#buildCompactionAuthError(candidate);
 			}
 		}
 
-		throw this.#buildCompactionAuthError();
+		throw previousFailure instanceof Error ? previousFailure : this.#buildCompactionAuthError();
 	}
 
 	async #prepareCompactionFromHooks(
@@ -20661,30 +20720,14 @@ export class AgentSession {
 			}
 
 			if (!this.model) {
-				await this.#emitSessionEvent({
-					type: "auto_compaction_end",
-					action,
-					result: undefined,
-					aborted: false,
-					willRetry: false,
-					skipped: true,
-				});
 				await compactionStateSnapshotPromise;
-				return { kind: "skipped" };
+				throw new Error("No model selected");
 			}
 
 			const availableModels = this.#modelRegistry.getAvailable();
 			if (availableModels.length === 0) {
-				await this.#emitSessionEvent({
-					type: "auto_compaction_end",
-					action,
-					result: undefined,
-					aborted: false,
-					willRetry: false,
-					skipped: true,
-				});
 				await compactionStateSnapshotPromise;
-				return { kind: "skipped" };
+				throw this.#buildCompactionAuthError(this.model);
 			}
 
 			if (autoCompactionSignal.aborted) return await emitAborted();
@@ -20872,14 +20915,29 @@ export class AgentSession {
 				const telemetry = resolveTelemetry(this.agent.telemetry, this.sessionId);
 				let compactResult: CompactionResult | undefined;
 				let lastError: unknown;
-				// Every candidate that was tried and failed, in order. Only the last failure
-				// used to reach the user, which named whichever same-provider fallback the
-				// chain ended on and hid that the session model itself had already failed.
+				// Every candidate that was tried and failed, in order. Keep the first
+				// failure visible, and retain candidate-specific diagnostics for explicit
+				// role fallbacks instead of collapsing the chain to its final error.
 				const candidateFailures: Array<{ model: string; message: string }> = [];
+				let previousCandidate: Model | undefined;
+				let previousFailure: unknown;
 
 				for (const candidate of candidates) {
-					const apiKey = await this.#modelRegistry.getApiKey(candidate, this.credentialSessionId);
-					if (!apiKey) continue;
+					const { apiKey, authError } = await this.#resolveCompactionCandidate(
+						candidate,
+						previousCandidate,
+						previousFailure,
+					);
+					if (apiKey === undefined) {
+						lastError = authError;
+						previousCandidate = candidate;
+						previousFailure = authError;
+						candidateFailures.push({
+							model: `${candidate.provider}/${candidate.id}`,
+							message: authError.message,
+						});
+						continue;
+					}
 
 					let attempt = 0;
 					while (true) {
@@ -20908,8 +20966,14 @@ export class AgentSession {
 
 							const message = error instanceof Error ? error.message : String(error);
 							if (this.#isCompactionAuthFailure(error)) {
-								lastError = this.#buildCompactionAuthError();
-								candidateFailures.push({ model: `${candidate.provider}/${candidate.id}`, message });
+								const authError = this.#buildCompactionAuthError(candidate);
+								lastError = authError;
+								previousCandidate = candidate;
+								previousFailure = authError;
+								candidateFailures.push({
+									model: `${candidate.provider}/${candidate.id}`,
+									message: authError.message,
+								});
 								break;
 							}
 							const retryAfterMs = this.#parseRetryAfterMsFromError(message);
@@ -20922,6 +20986,8 @@ export class AgentSession {
 									isUsageLimitError(message));
 							if (!shouldRetry) {
 								lastError = error;
+								previousCandidate = candidate;
+								previousFailure = error;
 								candidateFailures.push({ model: `${candidate.provider}/${candidate.id}`, message });
 								break;
 							}
@@ -20947,6 +21013,8 @@ export class AgentSession {
 										model: `${candidate.provider}/${candidate.id}`,
 									});
 									lastError = error;
+									previousCandidate = candidate;
+									previousFailure = error;
 									candidateFailures.push({ model: `${candidate.provider}/${candidate.id}`, message });
 									break; // Exit retry loop, continue to next candidate
 								}
