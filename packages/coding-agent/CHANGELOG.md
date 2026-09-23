@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [0.17.4] - 2026-09-23
+
+### Changed
+
+- The newly bundled `gpt-6-sol` and `gpt-6-luna` Codex rows are declared in the autorouting tier-map skip list, exactly as `gpt-6-astra` already is, so `check:autorouting-map` and its CI gate keep passing and the two new keys do not silently shift role routing before they are curated.
+
+### Fixed
+
+- ACP startup capability-query failures now report only a bounded safe category from known failure codes, or a fixed generic label, instead of exposing host-supplied error details. A host that does not answer the query remains distinct from a live outdated host, which still receives guidance to stop and reopen the session.
+
+- Release binaries now embed MuPDF WebAssembly only after a pinned upstream source rebuild matches the installed npm artifact byte-for-byte. The matching source archive, build recipe, notices, and provenance are published alongside the binaries instead of relying on an unavailable local release-material bundle.
+
 ## [0.17.3] - 2026-09-22
 
 ### Added
