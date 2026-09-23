@@ -4874,6 +4874,8 @@ export function createNotificationsExtension(
 		const gatePresentations = new PresentationArbiter(server, () => runtime?.redact ?? true);
 		gatePresentations.setPublicationSuspended(true);
 		let inboundSdkFrame: ((connectionId: string, frame: Record<string, unknown>) => void) | undefined;
+		let negotiatedCapabilitiesHandler: ((connectionId: string, capabilities: readonly string[]) => void) | undefined;
+		let connectionCloseHandler: ((connectionId: string) => void) | undefined;
 		const inFlightGateResolutions = new Set<Promise<void>>();
 		const trackGateResolution = <T>(resolution: Promise<T>): Promise<T> => {
 			const quiesced = resolution.then(
@@ -7402,6 +7404,18 @@ export function createNotificationsExtension(
 				start: async () => await server.start(),
 				stop: async () => await server.stopAndWait(),
 				broadcastFrame: frame => broadcastEventFrame(frame),
+				onConnectionClose(handler) {
+					connectionCloseHandler = handler;
+					return () => {
+						if (connectionCloseHandler === handler) connectionCloseHandler = undefined;
+					};
+				},
+				onNegotiatedCapabilities(handler) {
+					negotiatedCapabilitiesHandler = handler;
+					return () => {
+						if (negotiatedCapabilitiesHandler === handler) negotiatedCapabilitiesHandler = undefined;
+					};
+				},
 			},
 			...(preparesExistingThread ? { readiness: "deferred" as const } : {}),
 			...(activationGate ? { activationGate } : {}),
@@ -7985,19 +7999,20 @@ export function createNotificationsExtension(
 				const tuple = Array.isArray(connectionId) ? (connectionId as unknown[]) : undefined;
 				const id = tuple?.[0] ?? connectionId;
 				const negotiated = tuple?.[1] ?? capabilities;
-				if (typeof id === "string" && Array.isArray(negotiated))
-					rememberHostCapabilities(
-						id,
-						negotiated.filter((capability): capability is string => typeof capability === "string"),
-					);
+				if (typeof id !== "string" || !Array.isArray(negotiated)) return;
+				const normalized = negotiated.filter((capability): capability is string => typeof capability === "string");
+				rememberHostCapabilities(id, normalized);
+				if (liveHostCapabilities(id) === undefined) return;
+				hostAttachedConnections.add(id);
+				negotiatedCapabilitiesHandler?.(id, normalized);
 			});
 			server.onConnectionClose((_err, connectionId) => {
 				if (!connectionId) return;
 				closeHostConnection(connectionId);
+				connectionCloseHandler?.(connectionId);
 				void controlSurface
 					.cancelPendingPreflightsForConnection(connectionId)
 					.catch(error => logger.warn(`sdk: failed to cancel disconnected preflight: ${String(error)}`));
-				host.handleDisconnect(connectionId);
 				// The socket is gone, so its fence has nothing left to refuse. Dropping the
 				// entry keeps the set bounded by live connections instead of growing forever.
 				fencedConnections.delete(connectionId);

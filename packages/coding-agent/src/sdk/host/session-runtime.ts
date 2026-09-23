@@ -437,6 +437,7 @@ export class SessionSdkSessionRuntime {
 			this.host.handleDisconnect(connectionId);
 		});
 		this.#capabilitiesDisposer = options.transport.onNegotiatedCapabilities?.((connectionId, negotiated) => {
+			if (options.connectionCapabilities && this.#connectionCapabilitiesProvider(connectionId) === undefined) return;
 			this.#connectionIds.add(connectionId);
 			this.#connectionCapabilities.set(connectionId, new Set(negotiated));
 		});
@@ -500,7 +501,6 @@ export class SessionSdkSessionRuntime {
 				: [];
 		});
 	}
-
 	/** Deliver a non-replayable frame to connections with an explicit capability intersection. */
 	sendFrameToCapabilities(
 		required: readonly string[],
@@ -4535,10 +4535,12 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		return task;
 	};
 	/**
-	 * Publish one content frame per owning invocation, each carrying its own
-	 * correlation, so a shared run lets every submitter attribute the content to
-	 * its own prompt. Content is best-effort and bypasses the lifecycle replay
-	 * ring; the turn producing it is authoritative.
+	 * Publish one correlated content frame per owning invocation, plus one
+	 * unpositioned copy for connections that explicitly negotiated observer
+	 * streaming. A shared run therefore lets every submitter attribute the content
+	 * to its own prompt without exposing it to ordinary attached clients.
+	 * Content is best-effort and bypasses the lifecycle replay ring; the turn
+	 * producing it is authoritative.
 	 */
 	const publishContentFrames = (
 		current: RuntimeState,
