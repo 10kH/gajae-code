@@ -498,10 +498,19 @@ catch (error) { console.log(JSON.stringify({ buffer: { ok: false, content: "", e
 	});
 
 	it("still redacts path-bearing fields after the boundary anchor", () => {
-		expect(sanitizeMuPdfDiagnostic("error opening /usr/local/share/x.pdf")).toBe("error opening [path redacted]");
-		expect(sanitizeMuPdfDiagnostic('cannot load "/Users/alice/My Docs/a.pdf"')).toBe('cannot load "[path redacted]"');
-		expect(sanitizeMuPdfDiagnostic("failed C:\\Users\\bob\\x.pdf")).toBe("failed [path redacted]");
-		expect(sanitizeMuPdfDiagnostic("url %2fetc%2fpasswd")).toBe("url [path redacted]");
+		for (const [input, expected] of [
+			["error opening /usr/local/share/x.pdf", "error opening [path redacted]"],
+			["error opening ./relative path/x.pdf", "error opening [path redacted]"],
+			["failed C:\\Users\\bob\\x.pdf", "failed [path redacted]"],
+			["url %2fetc%2fpasswd", "url [path redacted]"],
+			["url %5cUsers%5cbob%5cx.pdf", "url [path redacted]"],
+			['cannot load "/Users/alice/My Docs/a.pdf"', 'cannot load "[path redacted]"'],
+			["cannot load '/tmp/a.pdf'", "cannot load '[path redacted]'"],
+			["cannot load `/tmp/a.pdf`", "cannot load `[path redacted]`"],
+			["error opening /var/cache/mupdf", "error opening [path redacted]"],
+		]) {
+			expect(sanitizeMuPdfDiagnostic(input)).toBe(expected);
+		}
 		// A message with no separator is untouched.
 		expect(sanitizeMuPdfDiagnostic("CompileError: invalid WASM")).toBe("CompileError: invalid WASM");
 	});
