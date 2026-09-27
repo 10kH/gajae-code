@@ -45,6 +45,7 @@ jobs:
     outputs:
       # Fail closed: absent means the validator never reported an authorized merge.
       merge_authorized: ${{ steps.validate.outputs.merge_authorized }}
+      authorization_pending: ${{ steps.validate.outputs.authorization_pending }}
     steps:
       - name: Resolve PR head/base from the event or the comment's PR
         id: pr
@@ -199,6 +200,7 @@ jobs:
           if [[ ! -f "$trusted_root/scripts/verify-pr-verdict.ts" ]]; then
             echo "::notice::immutable base ${{ steps.pr.outputs.base_sha }} predates the trusted validator; Dev CI PR contract bootstrap remains authoritative"
             echo "merge_authorized=false" >> "$GITHUB_OUTPUT"
+            echo "authorization_pending=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           empty_bunfig="$RUNNER_TEMP/gjc-pr-contract-empty-bunfig.toml"
@@ -214,6 +216,11 @@ jobs:
             authorized=true
           fi
           echo "merge_authorized=$authorized" >> "$GITHUB_OUTPUT"
+          authorization_pending=false
+          if grep -qxF 'gjc-authorization-pending=true' "$log"; then
+            authorization_pending=true
+          fi
+          echo "authorization_pending=$authorization_pending" >> "$GITHUB_OUTPUT"
           exit "$status"
       - name: Keep the approval revoked when revalidation does not complete
         # Covers the window the dedicated revoke step cannot: a failure AFTER the head
@@ -273,7 +280,9 @@ jobs:
           if [[ "${{ steps.validate.outcome }}" == "success" ]]; then
             conclusion="success"
             summary="PR contract valid at exact head (comment-triggered re-validation)"
-            if [[ "${{ steps.validate.outputs.merge_authorized }}" == "true" ]]; then
+            if [[ "${{ steps.validate.outputs.authorization_pending }}" == "true" ]]; then
+              approval_summary="Waiting for approval on this exact head"
+            elif [[ "${{ steps.validate.outputs.merge_authorized }}" == "true" ]]; then
               approval_conclusion="success"
               approval_summary="merge authorized at exact head (comment-triggered re-validation)"
             else
@@ -305,6 +314,9 @@ jobs:
               approval_conclusion="failure"
               approval_summary="$summary"
             fi
+          fi
+          if [[ "$conclusion" == "success" && "${{ steps.validate.outputs.authorization_pending }}" == "true" ]]; then
+            echo "::notice::$approval_summary"
           fi
           details_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           # The approval authority was already revoked in its own step, before checkout
@@ -357,6 +369,7 @@ jobs:
         env:
           CONTRACT_RESULT: ${{ needs.validate.result }}
           MERGE_AUTHORIZED: ${{ needs.validate.outputs.merge_authorized }}
+          AUTHORIZATION_PENDING: ${{ needs.validate.outputs.authorization_pending }}
         shell: bash
         run: |
           set -euo pipefail
@@ -364,6 +377,10 @@ jobs:
           # Fail closed on anything that is not an explicit success + explicit true.
           if [[ "${CONTRACT_RESULT:-}" != "success" ]]; then
             echo "::error::PR contract validation did not succeed (${CONTRACT_RESULT:-unknown}); no merge authorization can be reported."
+            exit 1
+          fi
+          if [[ "${AUTHORIZATION_PENDING:-}" == "true" ]]; then
+            echo "::notice::Waiting for approval on this exact head"
             exit 1
           fi
           if [[ "${MERGE_AUTHORIZED:-}" != "true" ]]; then

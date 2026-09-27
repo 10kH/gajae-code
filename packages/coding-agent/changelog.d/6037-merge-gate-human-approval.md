@@ -1,4 +1,8 @@
-### Merge gate improvements
+### Bug fixes
 
-- **Option 1**: Pending approval is now clearly labeled as a pending state, not a contract failure. Fresh PRs without a verdict line and without approval show as pending rather than failing the contract check.
-- **Option 4**: Human-reviewed PRs with a non-author GitHub APPROVED review on the exact current head SHA, with no later CHANGES_REQUESTED, are now sufficient on their own without requiring a body verdict line. The verdict body line remains required only for agent-reviewer approvals (architect/critic) and the owner merge-self-approved path. This enables faster human reviews without manual verdict line generation (issue #6037).
+- Fixed: Human approval now works when a PR has no verdict line in its body. GJC checks GitHub reviews for human approval on the current head instead.
+- Fixed: A valid PR contract with no approval yet now shows a "Waiting for approval" notice instead of an error.
+
+### Documentation
+
+- Updated: Clarified that human reviewers only need to approve the current head on GitHub; body verdict lines are required only for agent reviewers and owner self-approval.

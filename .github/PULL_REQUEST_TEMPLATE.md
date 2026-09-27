@@ -20,7 +20,7 @@
 
 ## GJC verdict
 
-<!-- Paste one exact-head verdict. reviewer-id is the reviewer's GitHub login. merge-approved requires an authenticated exact-head APPROVED review from an identity distinct from the PR author — the author can never reach it. The repository owner may instead use merge-self-approved, the explicitly named solo force path for a low-risk change with a valid risk-record comment; its name records that no independent human reviewed. Otherwise write needs-human and stop. -->
+<!-- Only agent reviewers (architect/critic) and the owner's merge-self-approved path need to fill in exactly one verdict line below. Human reviewers do NOT need a body verdict line: an authenticated GitHub APPROVED review on the exact current head from a reviewer other than the PR author is sufficient, subject to the risk-classified review policy. For human-only review, remove the entire example code block below rather than leaving its placeholder line. reviewer-id is the reviewer's GitHub login. An agent merge-approved verdict still requires an authenticated exact-head APPROVED review from an identity distinct from the PR author. The repository owner may use merge-self-approved only for a low-risk change with a valid exact-head risk-record comment; its name records that no independent human reviewed. Agent reviewers who cannot approve must use needs-human or merge-blocked. -->
 
 ```text
 gajae.pr-review-verdict.v1 <merge-approved|merge-self-approved|merge-blocked|needs-human> sha256:<exact-base...head-diff-hash> reviewer:<architect|critic|human> reviewer-id:<identity> evidence:<ci-run-url-or-local-command>
@@ -32,5 +32,5 @@ gajae.pr-review-verdict.v1 <merge-approved|merge-self-approved|merge-blocked|nee
 - [ ] `bun check` passes
 - [ ] Tested locally
 - [ ] Changelog fragment added under `packages/<pkg>/changelog.d/` (if user-facing)
-- [ ] Verdict above matches the exact PR head, not an earlier commit
+- [ ] Human approval or the required agent/owner verdict matches the exact PR head, not an earlier commit
 - [ ] Risk classification above matches the actual review path taken

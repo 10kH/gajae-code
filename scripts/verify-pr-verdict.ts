@@ -169,7 +169,7 @@ type HeadAppearance =
 	| { readonly kind: "unreadable" }
 	| { readonly kind: "unconstrained" };
 
-function headAppearance(serverObserved: Array<string | undefined>): HeadAppearance {
+export function headAppearance(serverObserved: Array<string | undefined>): HeadAppearance {
 	// An absent or blank entry is as unreadable as one that will not parse: the force-push
 	// happened, we simply cannot read when. Count before filtering, or `created_at: null`
 	// is silently discarded.
@@ -491,7 +491,7 @@ export function validatePrContract(input: PrValidationInput): PrValidationResult
 
 	// If there's no verdict line in the body and body is not empty:
 	// - If there's a valid human approval on exact head, allow it to stand alone
-	// - Otherwise, treat missing verdict as a contract defect, not pending
+	// - Otherwise, defer to the pending authorization check below
 	if (!parsed.verdict && !hasVerdictLineAttempt && !bodyIsEmpty) {
 		if (humanApprovalOnHead && input.requireMergeApproved && input.authenticatedReviewerLogin) {
 			// Synthesize a merge-approved verdict for reporting purposes (Option 4)
@@ -510,12 +510,20 @@ export function validatePrContract(input: PrValidationInput): PrValidationResult
 			parsed.diagnostics = [];
 			diagnostics.length = 0;
 		}
-		// Otherwise: no human approval, so the missing verdict is still a contract defect
-		// diagnostics are kept as-is from parsePrVerdict
 	} else if (!parsed.verdict && !hasVerdictLineAttempt && bodyIsEmpty && !input.requireMergeApproved) {
 		// For local preflight with empty body, allow it
 		parsed.diagnostics = [];
 		diagnostics.length = 0;
+	}
+
+	if (!parsed.verdict && !hasVerdictLineAttempt && input.authenticatedReviewerLogin === undefined && input.requireMergeApproved) {
+		authorizationPending = true;
+		// Remove only the absent-verdict diagnostic; unrelated contract defects still fail.
+		for (const diagnostic of parsed.diagnostics) {
+			const index = diagnostics.indexOf(diagnostic);
+			if (index !== -1) diagnostics.splice(index, 1);
+		}
+		authorizationDiagnostics.push("Waiting for approval: obtain a non-author GitHub APPROVED review on the exact PR head or supply an authorized verdict.");
 	}
 
 	if (parsed.verdict) {
@@ -841,7 +849,24 @@ async function fetchPushPreflightIndependentReviewer(repo: string, number: numbe
 	};
 }
 
-export async function authenticatedApproval(event: PullRequestEvent, reviewerId: string, headSha: string, token = Bun.env.GITHUB_TOKEN): Promise<{ login?: string; headSha?: string }> {
+export function selectHumanApprover(
+	reviews: EffectiveReview[],
+	headSha: string,
+	authorLogin: string,
+	appearance: HeadAppearance,
+): { login: string; headSha: string } | null {
+	for (const candidate of reviews) {
+		const login = candidate.login;
+		if (!login || candidate.state !== "APPROVED" || login.toLowerCase() === authorLogin.toLowerCase()) continue;
+		const review = effectiveExactHeadReview(reviews, login, headSha, appearance);
+		if (review?.state === "APPROVED") {
+			return { login, headSha: review.oid ?? headSha };
+		}
+	}
+	return null;
+}
+
+export async function authenticatedApproval(event: PullRequestEvent, reviewerId: string | undefined, headSha: string, token = Bun.env.GITHUB_TOKEN): Promise<{ login?: string; headSha?: string }> {
 	const repository = event.repository?.full_name;
 	const number = event.pull_request?.number;
 	if (!repository || !number || !token) return {};
@@ -873,6 +898,9 @@ export async function authenticatedApproval(event: PullRequestEvent, reviewerId:
 		"X-GitHub-Api-Version": "2022-11-28",
 	};
 	const headKnownAt = await fetchHeadKnownAt(repository, number, headSha, headers);
+	if (reviewerId === undefined) {
+		return selectHumanApprover(normalized, headSha, event.pull_request?.user?.login ?? "", headKnownAt) ?? {};
+	}
 	const approval = effectiveExactHeadReview(normalized, reviewerId, headSha, headKnownAt);
 	if (approval?.state !== "APPROVED") return {};
 	const permissionResponse = await fetch(`https://api.github.com/repos/${repository}/collaborators/${encodeURIComponent(reviewerId)}/permission`, {
@@ -1124,7 +1152,9 @@ async function validateEvent(eventPath: string, cwd: string, trustedRoot: string
 	const parsed = parsePrVerdict(body);
 	const approval = parsed.verdict?.verdict === "merge-approved"
 		? await authenticatedApproval(event, parsed.verdict.reviewerId, headSha)
-		: {};
+		: !parsed.verdict
+			? await authenticatedApproval(event, undefined, headSha)
+			: {};
 	// The self-review record is fetched whenever the verdict names the author (the
 	// merge-self-approved solo path) or the body verdict is merge-approved with a
 	// self-review record expected to carry the risk classification.

@@ -10,17 +10,19 @@ import {
 	canonicalDiffSha256,
 	fetchIndependentReviewerEvidence,
 	gateExitCode,
+	headAppearance,
 	parseBodyRisk,
 	parseGhPrCreate,
 	parsePrVerdict,
 	parseSelfReview,
 	resolvePullRequestEvent,
+	selectHumanApprover,
 	selfReviewSatisfiesPolicy,
 	selfReviewSignature,
 	selfReviewSignedPayload,
 	validatePrContract,
 } from "./verify-pr-verdict";
-import type { IndependentReviewerEvidence } from "./verify-pr-verdict";
+import type { EffectiveReview, IndependentReviewerEvidence } from "./verify-pr-verdict";
 
 const base = "a".repeat(40);
 const head = "b".repeat(40);
@@ -28,6 +30,47 @@ const digest = "c".repeat(64);
 const approved = `gajae.pr-review-verdict.v1 merge-approved sha256:${digest} reviewer:architect reviewer-id:review-agent evidence:bun test scripts/verify-pr-verdict.test.ts`;
 
 describe("authenticated approval API evidence", () => {
+	describe("selectHumanApprover for human GitHub reviews", () => {
+		const serverObserved = ["2026-09-18T05:00:00Z", "2026-09-18T06:00:00Z"];
+
+		test("approves reviewer with APPROVED on exact head", () => {
+			const reviews: EffectiveReview[] = [
+				{ login: "reviewer1", state: "APPROVED", oid: head, submittedAt: "2026-09-18T07:00:00Z" },
+			];
+			expect(selectHumanApprover(reviews, head, "author", headAppearance(serverObserved))).toEqual({ login: "reviewer1", headSha: head });
+		});
+
+		test("rejects approval on old head", () => {
+			const reviews: EffectiveReview[] = [
+				{ login: "reviewer1", state: "APPROVED", oid: "d".repeat(40), submittedAt: "2026-09-18T07:00:00Z" },
+			];
+			expect(selectHumanApprover(reviews, head, "author", headAppearance(serverObserved))).toBeNull();
+		});
+
+		test("rejects author self-approval", () => {
+			const reviews: EffectiveReview[] = [
+				{ login: "author", state: "APPROVED", oid: head, submittedAt: "2026-09-18T07:00:00Z" },
+			];
+			expect(selectHumanApprover(reviews, head, "author", headAppearance(serverObserved))).toBeNull();
+		});
+
+		test("rejects APPROVED superseded by CHANGES_REQUESTED", () => {
+			const reviews: EffectiveReview[] = [
+				{ login: "reviewer1", state: "APPROVED", oid: head, submittedAt: "2026-09-18T07:00:00Z" },
+				{ login: "reviewer1", state: "CHANGES_REQUESTED", oid: head, submittedAt: "2026-09-18T08:00:00Z" },
+			];
+			expect(selectHumanApprover(reviews, head, "author", headAppearance(serverObserved))).toBeNull();
+		});
+
+		test("rejects APPROVED superseded by DISMISSED", () => {
+			const reviews: EffectiveReview[] = [
+				{ login: "reviewer2", state: "APPROVED", oid: head, submittedAt: "2026-09-18T07:00:00Z" },
+				{ login: "reviewer2", state: "DISMISSED", oid: head, submittedAt: "2026-09-18T08:00:00Z" },
+			];
+			expect(selectHumanApprover(reviews, head, "author", headAppearance(serverObserved))).toBeNull();
+		});
+	});
+
 	const event = { repository: { full_name: "owner/repo" }, pull_request: { number: 5416 } };
 	// Reviews are submitted after the head commit; a submission that predates the head is a
 	// force-push re-bind and is covered by its own case below (#5692).
@@ -414,17 +457,6 @@ describe("merge authorization reported separately from contract validity", () =>
 		expect(result.diagnostics.join("\n")).toContain("must contain exactly one");
 	});
 
-	test("human approval on old head with no body verdict line fails (not exact head)", () => {
-		const result = validatePrContract(validInput({
-			body: "## No verdict line\n",
-			authenticatedReviewerLogin: "human-reviewer",
-			authenticatedReviewHeadSha: "0".repeat(40),
-		}));
-		expect(result.ok).toBe(false);
-		expect(result.mergeAuthorized).toBe(false);
-		expect(result.diagnostics.join("\n")).toContain("must contain exactly one");
-	});
-
 	test("author self-approval (human approval from same identity) fails", () => {
 		const result = validatePrContract(validInput({
 			body: "## No verdict line\n",
@@ -438,15 +470,15 @@ describe("merge authorization reported separately from contract validity", () =>
 
 	test("changes-requested after approval blocks merge (no authenticated approval)", () => {
 		// When effectiveExactHeadReview finds a CHANGES_REQUESTED as the last review, it returns undefined
-		// So authenticatedReviewerLogin would be undefined.
+		// So authenticatedReviewerLogin would be undefined. This is authorization-pending, not a contract defect.
 		const result = validatePrContract(validInput({
 			body: "## No verdict line\n",
 			authenticatedReviewerLogin: undefined,
 			authenticatedReviewHeadSha: undefined,
 		}));
-		expect(result.ok).toBe(false);
+		expect(result.ok).toBe(true);
+		expect(result.authorizationPending).toBe(true);
 		expect(result.mergeAuthorized).toBe(false);
-		expect(result.diagnostics.join("\n")).toContain("must contain exactly one");
 	});
 
 	test("empty body is not treated as having no verdict line - requires verdict", () => {
@@ -2047,7 +2079,7 @@ test("issue_comment events never run the default-SHA merge-approval job", async 
 	// approval" on `main` (#5694, Codex P1/P2). The exclusion must therefore be by
 	// event name, with nothing left for the resolver to opt into.
 	expect(mergeApproval?.if).toBe("${{ always() && github.event_name != 'issue_comment' }}");
-	expect(validate?.outputs).toEqual({ merge_authorized: "${{ steps.validate.outputs.merge_authorized }}" });
+	expect(validate?.outputs).toEqual({ merge_authorized: "${{ steps.validate.outputs.merge_authorized }}", authorization_pending: "${{ steps.validate.outputs.authorization_pending }}" });
 	// The exact-head verdict for comment events comes from the head-bound check-run
 	// publication in the validate job, which is the only path that names the PR head.
 	const publish = validate?.steps?.find(step => step.name === "Publish head-bound check results for comment-triggered validation");
@@ -2186,6 +2218,8 @@ test("every expression expanded into a workflow run scalar is explicitly justifi
 		[".github/workflows/pr-validation.yml\tsteps.pr.outputs.head_sha", "from the event or the API, both 40-hex"],
 		[".github/workflows/pr-validation.yml\tsteps.validate.outcome", "success|failure|cancelled|skipped"],
 		[".github/workflows/pr-validation.yml\tsteps.validate.outputs.merge_authorized", "literal true|false written by the step above"],
+		[".github/workflows/pr-validation.yml\tsteps.validate.outputs.authorization_pending", "literal true|false written by the step above"],
+		[".github/workflows/pr-validation.yml\tneeds.validate.outputs.authorization_pending", "authorization_pending output from validate job"],
 	]);
 	const files: string[] = [];
 	for (const dir of ["../.github/workflows", "../.github/actions"]) {
