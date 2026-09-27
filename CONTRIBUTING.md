@@ -85,7 +85,9 @@ The `CI` workflow publishes a scheduled nightly prerelease from `main` at 04:23 
 
 ## Exact-head PR verdict gate
 
-Every pull request to `dev` must keep exactly one `gajae.pr-review-verdict.v1` line from the pull request template. The `PR contract / Validate exact-head PR contract` status is produced by a narrowly scoped `pull_request_target` workflow loaded from the trusted default branch. It has read-only permissions, receives no secrets, consumes no caches or artifacts, and executes only the base-owned validator while inspecting the event's immutable base and exact head. The validator recomputes the binary diff digest, requires the head to contain the base, runs the fast GJC state-writer scan against the PR-head bytes, and rejects `merge-approved` verdicts whose reviewer-id matches the PR author — no exception. The repository owner's solo path is the separately named `merge-self-approved` verdict (below). `needs-human` and `merge-blocked` are valid review states but intentionally keep the status red until an independent reviewer records `merge-approved` for the current head.
+Pull requests to `dev` use exactly one `gajae.pr-review-verdict.v1` body line for agent reviewers (`architect`/`critic`) or owner self-approval (`merge-self-approved`). Human reviewers do **not** need a body verdict line: an authenticated GitHub `APPROVED` review on the exact current head from a reviewer other than the PR author is sufficient, subject to the risk-classified review policy below. For human-only review, leave the template's verdict section empty. Contract validation accepts exactly one valid verdict line **or** an eligible human approval on the exact head; a human approval does not excuse a malformed, stale, or duplicate body verdict.
+
+The `PR contract / Validate exact-head PR contract` status is produced by a narrowly scoped `pull_request_target` workflow loaded from the trusted default branch. It has read-only permissions, receives no secrets, consumes no caches or artifacts, and executes only the base-owned validator while inspecting the event's immutable base and exact head. The validator recomputes the binary diff digest, requires the head to contain the base, runs the fast GJC state-writer scan against the PR-head bytes, and rejects `merge-approved` verdicts whose reviewer-id matches the PR author — no exception. The repository owner's solo path is the separately named `merge-self-approved` verdict (below). A PR awaiting approval without a verdict line is authorization-pending, not merge-authorized. `needs-human` and `merge-blocked` remain valid review states that do not authorize merge; an independent human approval does not override an explicit blocking verdict.
 
 ### Risk-classified review policy (issue #4703, post-review semantics)
 
@@ -123,7 +125,7 @@ Comment-triggered validation publishes to the **same required authority**: `issu
 
 The first PR that introduces this workflow uses a trusted two-phase bootstrap. Phase 1 landed `Dev CI / PR contract bootstrap` directly on `dev`, so its inline validation exists in the immutable event base before the implementation PR is evaluated. Phase 2 enables the isolated `PR contract` consumer in this implementation PR. Review events run only that cheap, read-only contract workflow; they never launch or cancel the affected Dev CI pipeline. The validator still executes exclusively from the immutable event-base checkout and treats PR-head bytes as data. The same bootstrap ordering applies to the solo path: a PR whose immutable base predates the `merge-self-approved`-aware validator cannot use it on that base; the introducing PR relies on the Dev CI bootstrap job and merges before the comment path becomes active for later PRs.
 
-After the final commit and rebase, compute the digest with:
+For an agent verdict or owner self-approval, compute the digest after the final commit and rebase with:
 
 ```sh
 git fetch origin dev
@@ -132,10 +134,10 @@ git diff --binary --full-index --no-ext-diff origin/dev...HEAD | sha256sum
 bun scripts/verify-gjc-state-writers.ts --fail
 ```
 
-The verdict line must use the resulting lowercase digest and name the GitHub reviewer whose effective `APPROVED` review targets the exact PR head — never the PR author. The owner's low-risk solo alternative is the explicitly named `merge-self-approved`:
+An agent `merge-approved` verdict must use the resulting lowercase digest and name the GitHub reviewer whose effective `APPROVED` review targets the exact PR head — never the PR author. Human reviewers only submit that GitHub approval; they do not need to compute or paste a body verdict. The owner's low-risk solo alternative still requires an explicitly named `merge-self-approved` body verdict and its exact-head risk-record comment:
 
 ```text
-gajae.pr-review-verdict.v1 merge-approved sha256:<64-hex-digest> reviewer:<architect|critic|human> reviewer-id:<identity> evidence:<review-or-CI-reference>
+gajae.pr-review-verdict.v1 merge-approved sha256:<64-hex-digest> reviewer:<architect|critic> reviewer-id:<identity> evidence:<review-or-CI-reference>
 ```
 
 GJC users can opt into fast feedback before `gh pr create` by copying `docs/examples/gjc-hooks/pre/bash.ts` to this checkout's `.gjc/hooks/pre/bash.ts`. Keep the hook project-local: installing it under `~/.gjc/agent` would incorrectly impose this repository's policy on unrelated repositories. The local hook is advisory and bypassable; the server-side status check is authoritative and covers humans and other runtimes.

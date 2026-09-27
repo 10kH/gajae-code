@@ -14,6 +14,7 @@ const SELF_REVIEW_SIGNATURE_PATTERN = /^self-review-signature: sha256:([0-9a-f]{
 const SELF_REVIEW_FOOTER = "Signed-off-by: gaebal-gajae (clawdbot) 🦞";
 
 export type PrVerdict = "merge-approved" | "merge-self-approved" | "merge-blocked" | "needs-human";
+export const AUTHORIZATION_PENDING_OUTPUT = "gjc-authorization-pending";
 export type ReviewerRole = "architect" | "critic" | "human";
 export type SelfReviewRisk = "low-risk" | "regression-risk" | "high-risk";
 export type SelfReviewExtra = { kind: "none" } | { kind: "independent"; login: string };
@@ -169,7 +170,7 @@ type HeadAppearance =
 	| { readonly kind: "unreadable" }
 	| { readonly kind: "unconstrained" };
 
-function headAppearance(serverObserved: Array<string | undefined>): HeadAppearance {
+export function headAppearance(serverObserved: Array<string | undefined>): HeadAppearance {
 	// An absent or blank entry is as unreadable as one that will not parse: the force-push
 	// happened, we simply cannot read when. Count before filtering, or `created_at: null`
 	// is silently discarded.
@@ -299,6 +300,12 @@ export interface PrValidationResult {
 	mergeAuthorized: boolean;
 	/** Why the merge is not authorized yet. Never contract defects, never forgery claims. */
 	authorizationDiagnostics: string[];
+	/**
+	 * True when authorization is pending (no verdict line and no human approval yet, or other
+	 * non-defective reasons to wait). Reported separately from ok/mergeAuthorized so pending
+	 * PRs are not shown as failures.
+	 */
+	authorizationPending?: boolean;
 }
 
 /**
@@ -456,6 +463,7 @@ export function validatePrContract(input: PrValidationInput): PrValidationResult
 	// diagnostic reported here; every false claim (self-approval, an unbacked reviewer-id, a
 	// stale digest) stays a CONTRACT defect.
 	const authorizationDiagnostics: string[] = [];
+	let authorizationPending = false;
 	if (input.baseRef !== "dev") diagnostics.push(`PR base must be dev, not ${JSON.stringify(input.baseRef)}. Retarget the PR to dev.`);
 	if (!SHA40.test(input.baseSha)) diagnostics.push("Immutable PR event base SHA must be a lowercase 40-hex commit.");
 	if (!SHA40.test(input.headSha)) diagnostics.push("Exact PR head SHA must be a lowercase 40-hex commit.");
@@ -467,6 +475,29 @@ export function validatePrContract(input: PrValidationInput): PrValidationResult
 		diagnostics.push("Repository fast gate failed. Run: bun scripts/verify-gjc-state-writers.ts --fail");
 	}
 	const selfReview = evaluateSelfReviewComment(input);
+
+	// A PR body with no verdict line is the human-review path (#6037): a GitHub APPROVED
+	// review from a distinct identity on the exact head authorizes the merge on its own,
+	// and without one the merge is merely waiting for approval. Only the absent-verdict
+	// diagnostic is waived; every other contract defect above still fails. A malformed or
+	// duplicated verdict line is not absent and stays a contract defect.
+	const verdictLineAbsent = !parsed.verdict && !input.body.split(/\r?\n/u).some(line => line.trim().startsWith(VERDICT_PREFIX));
+	if (verdictLineAbsent) {
+		for (const diagnostic of parsed.diagnostics) {
+			const index = diagnostics.indexOf(diagnostic);
+			if (index !== -1) diagnostics.splice(index, 1);
+		}
+	}
+	if (verdictLineAbsent && input.requireMergeApproved) {
+		const humanApprovalOnHead = input.authenticatedReviewerLogin !== undefined
+			&& input.authenticatedReviewHeadSha === input.headSha
+			&& input.authenticatedReviewerLogin.toLowerCase() !== input.authorLogin.toLowerCase();
+		if (!humanApprovalOnHead) {
+			authorizationPending = true;
+			authorizationDiagnostics.push("Waiting for approval: a non-author reviewer with write access must approve this exact PR head on GitHub.");
+		}
+	}
+
 	if (parsed.verdict) {
 		if (parsed.verdict.diffSha256 !== input.computedDiffSha256) {
 			diagnostics.push(
@@ -478,6 +509,10 @@ export function validatePrContract(input: PrValidationInput): PrValidationResult
 		// reach it through any comment of their own (universal invariant).
 		if (parsed.verdict.verdict === "merge-approved" && parsed.verdict.reviewerId.toLowerCase() === input.authorLogin.toLowerCase()) {
 			diagnostics.push(`merge-approved cannot be self-approved: reviewer-id ${parsed.verdict.reviewerId} matches PR author ${input.authorLogin}. A solo merge is only available as the explicitly named merge-self-approved verdict for a low-risk owner change.`);
+		}
+		if (parsed.verdict.verdict === "needs-human" && input.requireMergeApproved) {
+			authorizationPending = true;
+			authorizationDiagnostics.push(`Verdict ${parsed.verdict.verdict} intentionally blocks merge. Obtain independent review (merge-approved) or, for a low-risk owner change, the explicit merge-self-approved path.`);
 		}
 		if (input.requireMergeApproved && parsed.verdict.verdict === "merge-approved") {
 			if (!input.authenticatedReviewerLogin || input.authenticatedReviewerLogin.toLowerCase() !== parsed.verdict.reviewerId.toLowerCase()) {
@@ -502,14 +537,16 @@ export function validatePrContract(input: PrValidationInput): PrValidationResult
 				diagnostics.push(`merge-self-approved requires the risk record to classify this change low-risk with verdict:merge-self-approved; record says risk:${selfReview.risk} verdict:${selfReview.verdict}. Higher risk classes must use independent review (merge-approved).`);
 			}
 		}
-		if (input.requireMergeApproved && parsed.verdict.verdict !== "merge-approved" && parsed.verdict.verdict !== "merge-self-approved") {
+		if (input.requireMergeApproved && parsed.verdict.verdict !== "merge-approved" && parsed.verdict.verdict !== "merge-self-approved" && parsed.verdict.verdict !== "needs-human") {
 			authorizationDiagnostics.push(`Verdict ${parsed.verdict.verdict} intentionally blocks merge. Obtain independent review (merge-approved) or, for a low-risk owner change, the explicit merge-self-approved path.`);
 		}
 	}
 	diagnostics.push(...selfReview.diagnostics);
 	const ok = diagnostics.length === 0;
 	// Invariant: a malformed contract can never report an authorized merge.
-	return { ok, verdict: parsed.verdict, diagnostics, mergeAuthorized: ok && authorizationDiagnostics.length === 0, authorizationDiagnostics };
+	const result: PrValidationResult = { ok, verdict: parsed.verdict, diagnostics, mergeAuthorized: ok && authorizationDiagnostics.length === 0, authorizationDiagnostics };
+	if (authorizationPending) result.authorizationPending = true;
+	return result;
 }
 
 /**
@@ -788,7 +825,31 @@ async function fetchPushPreflightIndependentReviewer(repo: string, number: numbe
 	};
 }
 
-export async function authenticatedApproval(event: PullRequestEvent, reviewerId: string, headSha: string, token = Bun.env.GITHUB_TOKEN): Promise<{ login?: string; headSha?: string }> {
+/**
+ * Every distinct non-author reviewer whose effective review is a fresh APPROVED on the
+ * exact head, in review order. Repository authority is checked by the caller, so an
+ * unprivileged approver never hides a privileged one (#6037).
+ */
+export function humanApprovers(
+	reviews: EffectiveReview[],
+	headSha: string,
+	authorLogin: string,
+	appearance: HeadAppearance,
+): Array<{ login: string; headSha: string }> {
+	const approvers: Array<{ login: string; headSha: string }> = [];
+	const seen = new Set<string>();
+	for (const candidate of reviews) {
+		const login = candidate.login;
+		if (!login || candidate.state !== "APPROVED" || login.toLowerCase() === authorLogin.toLowerCase()) continue;
+		if (seen.has(login.toLowerCase())) continue;
+		seen.add(login.toLowerCase());
+		const review = effectiveExactHeadReview(reviews, login, headSha, appearance);
+		if (review?.state === "APPROVED" && review.oid === headSha) approvers.push({ login, headSha: review.oid });
+	}
+	return approvers;
+}
+
+export async function authenticatedApproval(event: PullRequestEvent, reviewerId: string | undefined, headSha: string, token = Bun.env.GITHUB_TOKEN): Promise<{ login?: string; headSha?: string }> {
 	const repository = event.repository?.full_name;
 	const number = event.pull_request?.number;
 	if (!repository || !number || !token) return {};
@@ -820,6 +881,17 @@ export async function authenticatedApproval(event: PullRequestEvent, reviewerId:
 		"X-GitHub-Api-Version": "2022-11-28",
 	};
 	const headKnownAt = await fetchHeadKnownAt(repository, number, headSha, headers);
+	if (reviewerId === undefined) {
+		const authorLogin = event.pull_request?.user?.login;
+		if (!authorLogin) return {};
+		for (const approver of humanApprovers(normalized, headSha, authorLogin, headKnownAt)) {
+			const permissionResponse = await fetch(`https://api.github.com/repos/${repository}/collaborators/${encodeURIComponent(approver.login)}/permission`, { headers });
+			if (!permissionResponse.ok) continue;
+			const collaborator = await permissionResponse.json() as CollaboratorPermission;
+			if (new Set(["admin", "maintain", "write"]).has(collaborator.permission ?? "")) return approver;
+		}
+		return {};
+	}
 	const approval = effectiveExactHeadReview(normalized, reviewerId, headSha, headKnownAt);
 	if (approval?.state !== "APPROVED") return {};
 	const permissionResponse = await fetch(`https://api.github.com/repos/${repository}/collaborators/${encodeURIComponent(reviewerId)}/permission`, {
@@ -1071,7 +1143,9 @@ async function validateEvent(eventPath: string, cwd: string, trustedRoot: string
 	const parsed = parsePrVerdict(body);
 	const approval = parsed.verdict?.verdict === "merge-approved"
 		? await authenticatedApproval(event, parsed.verdict.reviewerId, headSha)
-		: {};
+		: !parsed.verdict
+			? await authenticatedApproval(event, undefined, headSha)
+			: {};
 	// The self-review record is fetched whenever the verdict names the author (the
 	// merge-self-approved solo path) or the body verdict is merge-approved with a
 	// self-review record expected to carry the risk classification.
@@ -1434,13 +1508,15 @@ export async function main(argv: string[]): Promise<number> {
 				: contractResult(false, ["Usage: bun scripts/verify-pr-verdict.ts --event <github-event.json> | --preflight-command <command> | --push-preflight <branch> <head-sha> [--push-remote <remote>] [--push-url <destination-url>] | --self-review-sign <verdict> <base> <head> <digest> <reviewer-id> <risk> <extra> <evidence>; add --gate <contract|approval> to report only one half of the verdict"]);
 	for (const diagnostic of result.diagnostics) console.error(`::error::${diagnostic}`);
 	for (const diagnostic of result.authorizationDiagnostics) {
-		// Under --gate contract the pending approval is not this check's verdict, so it is
-		// reported as a notice: the log still explains why the merge has not happened.
-		if (gate === "contract") console.log(`::notice::${diagnostic}`);
+		// Pending approval is not an error; report as notice so the log explains why but
+		// doesn't fail the check. Under --gate contract any pending is not this check's
+		// verdict, so it is also reported as a notice.
+		if (result.authorizationPending || gate === "contract") console.log(`::notice::${diagnostic}`);
 		else console.error(`::error::${diagnostic}`);
 	}
 	// Machine-readable so a workflow can fan the two verdicts out into two check names.
 	console.log(`${MERGE_AUTHORIZED_OUTPUT}=${result.mergeAuthorized}`);
+	console.log(`${AUTHORIZATION_PENDING_OUTPUT}=${Boolean(result.authorizationPending)}`);
 	if (result.ok && result.verdict) console.log(`PR contract valid: ${result.verdict.verdict} ${result.verdict.diffSha256}`);
 	return gateExitCode(gate, result);
 }

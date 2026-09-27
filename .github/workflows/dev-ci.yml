@@ -125,6 +125,7 @@ jobs:
     outputs:
       # Fail closed: absent means the bootstrap never reported an authorized merge.
       merge_authorized: ${{ steps.contract.outputs['gjc-merge-authorized'] }}
+      authorization_pending: ${{ steps.contract.outputs['gjc-authorization-pending'] }}
     env:
       PR_BODY: ${{ github.event.pull_request.body }}
       PR_AUTHOR: ${{ github.event.pull_request.user.login }}
@@ -161,11 +162,14 @@ jobs:
           cat > "$program" <<'GJC_BOOTSTRAP_PROGRAM'
             const pattern = /^gajae\.pr-review-verdict\.v1 (merge-approved|merge-self-approved|merge-blocked|needs-human) sha256:([0-9a-f]{64}) reviewer:(architect|critic|human) reviewer-id:([^\s]+) evidence:(.+)$/;
             const lines = (Bun.env.PR_BODY ?? "").split(/\r?\n/).map(line => line.trim()).filter(line => line.startsWith("gajae.pr-review-verdict.v1"));
-            if (lines.length !== 1) throw new Error(`Expected exactly one verdict line; found ${lines.length}.`);
-            const match = pattern.exec(lines[0]);
-            if (!match) throw new Error("Malformed gajae.pr-review-verdict.v1 line.");
+            // No verdict line is the human-review path (#6037): a fresh exact-head APPROVED
+            // review from a distinct reviewer with write access authorizes the merge on its
+            // own. More than one line, or a malformed one, stays a contract defect.
+            if (lines.length > 1) throw new Error(`Expected at most one verdict line; found ${lines.length}.`);
+            const match = lines.length === 1 ? pattern.exec(lines[0]) : null;
+            if (lines.length === 1 && !match) throw new Error("Malformed gajae.pr-review-verdict.v1 line.");
             if (Bun.env.PR_BASE_REF !== "dev") throw new Error(`PR base must be dev, not ${Bun.env.PR_BASE_REF}.`);
-            const [verdict, declaredDigest, , reviewerId] = match.slice(1);
+            const [verdict, declaredDigest, , reviewerId] = match ? match.slice(1) : ["human-review", null, null, null];
             const run = async argv => { const child = Bun.spawn(argv, { stdout: "pipe", stderr: "pipe" }); const [stdout, stderr, exitCode] = await Promise.all([new Response(child.stdout).bytes(), new Response(child.stderr).text(), child.exited]); if (exitCode !== 0) throw new Error(`${argv.join(" ")} failed: ${stderr}`); return stdout; };
             const head = new TextDecoder().decode(await run(["git", "rev-parse", "HEAD"])).trim();
             if (head !== Bun.env.PR_HEAD_SHA) throw new Error(`Checked-out head ${head} != event head ${Bun.env.PR_HEAD_SHA}.`);
@@ -173,7 +177,7 @@ jobs:
             await run(["git", "merge-base", "--is-ancestor", Bun.env.PR_BASE_SHA, head]);
             const diff = await run(["git", "diff", "--binary", "--full-index", "--no-ext-diff", `${Bun.env.PR_BASE_SHA}...${head}`]);
             const digest = new Bun.CryptoHasher("sha256").update(diff).digest("hex");
-            if (digest !== declaredDigest) throw new Error(`Stale verdict digest ${declaredDigest}; exact digest is ${digest}.`);
+            if (declaredDigest !== null && digest !== declaredDigest) throw new Error(`Stale verdict digest ${declaredDigest}; exact digest is ${digest}.`);
             // Exactly one risk classification is mandatory (review finding 3): a missing
             // classification must never waive the stricter review tiers.
             const bodyRiskLines = (Bun.env.PR_BODY ?? "").split(/\r?\n/).map(line => line.trim()).filter(line => /^-\s*\[(x|X)\]\s*`(low-risk|regression-risk|high-risk)`/.test(line));
@@ -285,16 +289,38 @@ jobs:
               const permission = await reviewPermission(reviewerId);
               if (!["admin", "maintain", "write"].includes(permission)) throw new Error(`Reviewer ${reviewerId} lacks repository review authority.`);
               mergeAuthorized = true;
+            } else if (verdict === "human-review") {
+              // Same last-word and freshness rules as merge-approved, applied to every
+              // distinct non-author reviewer; an unprivileged approver never hides a
+              // privileged one.
+              const reviews = await fetchReviews();
+              const author = (Bun.env.PR_AUTHOR ?? "").toLowerCase();
+              const logins = [...new Set(reviews.map(review => review.user?.login).filter(login => login && login.toLowerCase() !== author))];
+              let headKnownAt = null;
+              for (const login of logins) {
+                const latest = reviews.filter(review => review.user?.login === login && review.state !== "COMMENTED" && review.commit_id === head).at(-1);
+                if (latest?.state !== "APPROVED") continue;
+                headKnownAt ??= await fetchHeadKnownAt();
+                if (reviewPrecedesHead(latest.submitted_at, headKnownAt)) continue;
+                if (!["admin", "maintain", "write"].includes(await reviewPermission(login))) continue;
+                mergeAuthorized = true;
+                console.log(`Human review: ${login} approved this exact head.`);
+                break;
+              }
             } else {
               // Waiting for a reviewer is a PENDING AUTHORIZATION, not a contract defect.
-              // The separate "Merge approval bootstrap" job turns this into its own red
-              // check, so this check keeps reporting contract validity alone. Every other
-              // failure above remains a throw and still fails THIS check.
+              // The separate "Merge approval bootstrap" job turns this into its own
+              // non-green check, so this check keeps reporting contract validity alone.
+              // Every other failure above remains a throw and still fails THIS check.
               console.log(`::notice::Verdict ${verdict} intentionally blocks merge. Obtain independent review (merge-approved) or, for a low-risk owner change, the explicit merge-self-approved path.`);
             }
             mergeAuthorized ||= selfAuthorized;
+            // Pending means "nobody has approved yet": the human-review path or needs-human
+            // without an authorization. merge-blocked is a deliberate block, not a wait.
+            const authorizationPending = !mergeAuthorized && (verdict === "human-review" || verdict === "needs-human");
             const { appendFileSync } = await import("node:fs");
             appendFileSync(Bun.env.GITHUB_OUTPUT, `gjc-merge-authorized=${mergeAuthorized}\n`);
+            appendFileSync(Bun.env.GITHUB_OUTPUT, `gjc-authorization-pending=${authorizationPending}\n`);
             console.log(`Bootstrap PR contract valid: ${digest}${selfAuthorized ? " (SELF-AUTHORIZED: merge-self-approved, no independent human review)" : ""}${mergeAuthorized ? "" : " (merge NOT authorized yet)"}`);
           GJC_BOOTSTRAP_PROGRAM
           bun --no-env-file --config="$empty_bunfig" "$program"
@@ -321,14 +347,19 @@ jobs:
         env:
           CONTRACT_RESULT: ${{ needs.pr-contract-bootstrap.result }}
           MERGE_AUTHORIZED: ${{ needs.pr-contract-bootstrap.outputs.merge_authorized }}
+          AUTHORIZATION_PENDING: ${{ needs.pr-contract-bootstrap.outputs.authorization_pending }}
         shell: bash
         run: |
           set -euo pipefail
-          echo "contract job result: ${CONTRACT_RESULT:-unknown}; merge authorized: ${MERGE_AUTHORIZED:-false}"
+          echo "contract job result: ${CONTRACT_RESULT:-unknown}; merge authorized: ${MERGE_AUTHORIZED:-false}; authorization pending: ${AUTHORIZATION_PENDING:-false}"
           # Fail closed on anything that is not an explicit success + explicit true, so a
           # skipped, cancelled, or failed bootstrap can never read as an authorized merge.
           if [[ "${CONTRACT_RESULT:-}" != "success" ]]; then
             echo "::error::PR contract bootstrap did not succeed (${CONTRACT_RESULT:-unknown}); no merge authorization can be reported."
+            exit 1
+          fi
+          if [[ "${AUTHORIZATION_PENDING:-}" == "true" ]]; then
+            echo "::notice::Waiting for approval on this exact head"
             exit 1
           fi
           if [[ "${MERGE_AUTHORIZED:-}" != "true" ]]; then
