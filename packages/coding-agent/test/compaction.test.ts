@@ -6,6 +6,7 @@ import {
 	calculateContextTokens,
 	compact,
 	DEFAULT_COMPACTION_SETTINGS,
+	effectiveReserveTokens,
 	estimateEntryTokens,
 	findCutPoint,
 	getLastAssistantUsage,
@@ -236,6 +237,32 @@ describe("getLastAssistantUsage", () => {
 	it("should return undefined if no assistant messages", () => {
 		const entries: SessionEntry[] = [createMessageEntry(createUserMessage("Hello"))];
 		expect(getLastAssistantUsage(entries)).toBeUndefined();
+	});
+});
+
+describe("default compaction threshold ceiling", () => {
+	it("caps only the non-adaptive default sentinel", () => {
+		const settings = { ...DEFAULT_COMPACTION_SETTINGS };
+
+		expect(resolveThresholdTokens(1_000_000, settings)).toBe(300_000);
+		expect(resolveThresholdTokens(400_000, settings)).toBe(300_000);
+		expect(resolveThresholdTokens(200_000, settings)).toBe(170_000);
+		expect(resolveThresholdTokens(1_000_000, { ...settings, thresholdTokens: 800_000 })).toBe(800_000);
+		expect(resolveThresholdTokens(1_000_000, { ...settings, thresholdPercent: 90 })).toBe(900_000);
+	});
+
+	it("bounds the 1M-window keep window below the capped threshold", () => {
+		const settings = { ...DEFAULT_COMPACTION_SETTINGS, remoteEnabled: false };
+		const entries: SessionEntry[] = Array.from({ length: 80 }, (_, index) =>
+			createMessageEntry(createUserMessage(`turn ${index} ${"recent context ".repeat(1_000)}`)),
+		);
+		const preparation = prepareCompaction(entries, settings, { contextWindow: 1_000_000 });
+		if (!preparation) throw new Error("Expected compaction preparation for a large history");
+
+		const thresholdSafeKeepTokens =
+			resolveThresholdTokens(1_000_000, settings) - effectiveReserveTokens(1_000_000, settings);
+		expect(preparation.tokenCorrection.keepRecentTokensCorrected).toBeLessThanOrEqual(thresholdSafeKeepTokens);
+		expect(preparation.tokenCorrection.keepRecentTokensCorrected).toBeGreaterThanOrEqual(settings.keepRecentTokens);
 	});
 });
 

@@ -241,6 +241,25 @@ describe("context usage SSOT red-team probes", () => {
 		component.dispose();
 	});
 
+	it("shows a 700K default auto-compaction buffer for a 1M model", () => {
+		const largeContextWindow = 1_000_000;
+		const model: Model = { ...testModel, contextWindow: largeContextWindow };
+		const breakdown = computeContextBreakdown(
+			createDisplaySession(
+				{
+					tokens: 100_000,
+					contextWindow: largeContextWindow,
+					percent: 10,
+					source: "provider_anchor",
+				},
+				model,
+			),
+		);
+
+		expect(breakdown.autoCompactBufferTokens).toBe(700_000);
+		expect(breakdown.freeTokens).toBeGreaterThanOrEqual(0);
+	});
+
 	it("renders unknown context usage without a model", () => {
 		const session = createDisplaySession(undefined, null);
 		const component = new StatusLineComponent(session);

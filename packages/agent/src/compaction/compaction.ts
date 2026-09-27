@@ -158,6 +158,8 @@ function isAbortError(error: unknown): boolean {
 	return error instanceof Error && error.name === "AbortError";
 }
 
+export const DEFAULT_AUTO_THRESHOLD_CEILING_TOKENS = 300_000;
+
 export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	enabled: true,
 	strategy: "context-full",
@@ -431,7 +433,10 @@ export function resolveThresholdTokens(
 	const thresholdPercent = settings.thresholdPercent;
 	if (typeof thresholdPercent !== "number" || !Number.isFinite(thresholdPercent) || thresholdPercent <= 0) {
 		if (!settings.adaptive?.enabled) {
-			return contextWindow - effectiveReserveTokens(contextWindow, settings, maxOutputTokens);
+			return Math.min(
+				contextWindow - effectiveReserveTokens(contextWindow, settings, maxOutputTokens),
+				DEFAULT_AUTO_THRESHOLD_CEILING_TOKENS,
+			);
 		}
 		const adaptiveBasePercent = Number.isFinite(settings.adaptive.baseThresholdPercent)
 			? Math.min(99, Math.max(1, settings.adaptive.baseThresholdPercent))

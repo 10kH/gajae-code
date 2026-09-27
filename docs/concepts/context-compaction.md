@@ -17,7 +17,7 @@ compaction:
   thresholdPercent: 70
 ```
 
-`compaction.thresholdTokens` takes priority over percentage settings when it is greater than zero. With adaptive mode disabled, the default percentage sentinel `-1` uses the legacy reserve-based threshold: roughly `contextWindow - reserve`, commonly near 85% of the model context window. With adaptive mode enabled, `compaction.adaptive.baseThresholdPercent` is the adaptive base, including when `thresholdPercent` remains at its `-1` sentinel; the adaptive base is then lowered only when its context and call-rate conditions are met.
+`compaction.thresholdTokens` takes priority over percentage settings when it is greater than zero. With adaptive mode disabled, the default percentage sentinel `-1` uses a reserve-based threshold capped at 300,000 tokens: `min(contextWindow - effective reserve, 300,000)`. The effective reserve is the largest of 15% of the context window, `compaction.reserveTokens`, and the model's max-output reserve. Explicit token and percentage thresholds are not capped. With adaptive mode enabled, `compaction.adaptive.baseThresholdPercent` is the adaptive base, including when `thresholdPercent` remains at its `-1` sentinel; the adaptive base is then lowered only when its context and call-rate conditions are met and is not capped at 300,000 tokens.
 
 ## Adaptive Compaction
 
