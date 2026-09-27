@@ -20,11 +20,13 @@
 
 ## GJC verdict
 
-<!-- Only agent reviewers (architect/critic) and the owner's merge-self-approved path need to fill in exactly one verdict line below. Human reviewers do NOT need a body verdict line: an authenticated GitHub APPROVED review on the exact current head from a reviewer other than the PR author is sufficient, subject to the risk-classified review policy. For human-only review, remove the entire example code block below rather than leaving its placeholder line. reviewer-id is the reviewer's GitHub login. An agent merge-approved verdict still requires an authenticated exact-head APPROVED review from an identity distinct from the PR author. The repository owner may use merge-self-approved only for a low-risk change with a valid exact-head risk-record comment; its name records that no independent human reviewed. Agent reviewers who cannot approve must use needs-human or merge-blocked. -->
+<!--
+Human review: leave this section empty. A GitHub APPROVED review on the exact current head, from a reviewer with write access who is not the PR author, authorizes the merge on its own; until then the "Merge approval" check shows "Waiting for approval".
 
-```text
-gajae.pr-review-verdict.v1 <merge-approved|merge-self-approved|merge-blocked|needs-human> sha256:<exact-base...head-diff-hash> reviewer:<architect|critic|human> reviewer-id:<identity> evidence:<ci-run-url-or-local-command>
-```
+Agent review (architect/critic) and the owner's low-risk solo path: add exactly one line below this comment, on its own line, starting with the verdict prefix. reviewer-id is the reviewer's GitHub login. An agent merge-approved verdict still requires an authenticated exact-head APPROVED review from an identity distinct from the PR author. merge-self-approved is only for the repository owner on a low-risk change with a valid exact-head risk-record comment; its name records that no independent human reviewed. merge-blocked and needs-human hold the merge.
+
+Format (kept mid-line so it is never read as a verdict): gajae.pr-review-verdict.v1 <merge-approved|merge-self-approved|merge-blocked|needs-human> sha256:<exact-base...head-diff-hash> reviewer:<architect|critic|human> reviewer-id:<identity> evidence:<ci-run-url-or-local-command>
+-->
 
 ---
 

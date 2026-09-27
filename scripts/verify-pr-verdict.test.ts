@@ -16,7 +16,7 @@ import {
 	parsePrVerdict,
 	parseSelfReview,
 	resolvePullRequestEvent,
-	selectHumanApprover,
+	humanApprovers,
 	selfReviewSatisfiesPolicy,
 	selfReviewSignature,
 	selfReviewSignedPayload,
@@ -30,44 +30,37 @@ const digest = "c".repeat(64);
 const approved = `gajae.pr-review-verdict.v1 merge-approved sha256:${digest} reviewer:architect reviewer-id:review-agent evidence:bun test scripts/verify-pr-verdict.test.ts`;
 
 describe("authenticated approval API evidence", () => {
-	describe("selectHumanApprover for human GitHub reviews", () => {
-		const serverObserved = ["2026-09-18T05:00:00Z", "2026-09-18T06:00:00Z"];
+	describe("humanApprovers for GitHub reviews without a verdict line (#6037)", () => {
+		const appearance = headAppearance(["2026-09-18T06:00:00Z"]);
+		const at = (login: string, state: string, oid = head, submittedAt = "2026-09-18T07:00:00Z"): EffectiveReview => ({ login, state, oid, submittedAt });
 
-		test("approves reviewer with APPROVED on exact head", () => {
-			const reviews: EffectiveReview[] = [
-				{ login: "reviewer1", state: "APPROVED", oid: head, submittedAt: "2026-09-18T07:00:00Z" },
-			];
-			expect(selectHumanApprover(reviews, head, "author", headAppearance(serverObserved))).toEqual({ login: "reviewer1", headSha: head });
+		test("returns a distinct reviewer approving the exact head", () => {
+			expect(humanApprovers([at("reviewer1", "APPROVED")], head, "author", appearance)).toEqual([{ login: "reviewer1", headSha: head }]);
 		});
 
-		test("rejects approval on old head", () => {
-			const reviews: EffectiveReview[] = [
-				{ login: "reviewer1", state: "APPROVED", oid: "d".repeat(40), submittedAt: "2026-09-18T07:00:00Z" },
-			];
-			expect(selectHumanApprover(reviews, head, "author", headAppearance(serverObserved))).toBeNull();
+		test("rejects an approval of an older head", () => {
+			expect(humanApprovers([at("reviewer1", "APPROVED", "d".repeat(40))], head, "author", appearance)).toEqual([]);
 		});
 
-		test("rejects author self-approval", () => {
-			const reviews: EffectiveReview[] = [
-				{ login: "author", state: "APPROVED", oid: head, submittedAt: "2026-09-18T07:00:00Z" },
-			];
-			expect(selectHumanApprover(reviews, head, "author", headAppearance(serverObserved))).toBeNull();
+		test("rejects the author approving their own PR, case-insensitively", () => {
+			expect(humanApprovers([at("Author", "APPROVED")], head, "author", appearance)).toEqual([]);
 		});
 
-		test("rejects APPROVED superseded by CHANGES_REQUESTED", () => {
-			const reviews: EffectiveReview[] = [
-				{ login: "reviewer1", state: "APPROVED", oid: head, submittedAt: "2026-09-18T07:00:00Z" },
-				{ login: "reviewer1", state: "CHANGES_REQUESTED", oid: head, submittedAt: "2026-09-18T08:00:00Z" },
-			];
-			expect(selectHumanApprover(reviews, head, "author", headAppearance(serverObserved))).toBeNull();
+		test("a later CHANGES_REQUESTED withdraws the approval", () => {
+			expect(humanApprovers([at("reviewer1", "APPROVED"), at("reviewer1", "CHANGES_REQUESTED", head, "2026-09-18T08:00:00Z")], head, "author", appearance)).toEqual([]);
 		});
 
-		test("rejects APPROVED superseded by DISMISSED", () => {
-			const reviews: EffectiveReview[] = [
-				{ login: "reviewer2", state: "APPROVED", oid: head, submittedAt: "2026-09-18T07:00:00Z" },
-				{ login: "reviewer2", state: "DISMISSED", oid: head, submittedAt: "2026-09-18T08:00:00Z" },
-			];
-			expect(selectHumanApprover(reviews, head, "author", headAppearance(serverObserved))).toBeNull();
+		test("a later DISMISSED withdraws the approval", () => {
+			expect(humanApprovers([at("reviewer1", "APPROVED"), at("reviewer1", "DISMISSED", head, "2026-09-18T08:00:00Z")], head, "author", appearance)).toEqual([]);
+		});
+
+		test("an approval submitted before a force-pushed head appeared is stale", () => {
+			expect(humanApprovers([at("reviewer1", "APPROVED", head, "2026-09-18T05:00:00Z")], head, "author", appearance)).toEqual([]);
+		});
+
+		test("returns every qualifying reviewer once, so authority is checked per reviewer", () => {
+			const reviews = [at("outsider", "APPROVED"), at("maintainer", "APPROVED"), at("outsider", "APPROVED", head, "2026-09-18T08:00:00Z")];
+			expect(humanApprovers(reviews, head, "author", appearance).map(approver => approver.login)).toEqual(["outsider", "maintainer"]);
 		});
 	});
 
@@ -118,6 +111,38 @@ describe("authenticated approval API evidence", () => {
 			expect(requests.length).toBe(expectsPermission ? 3 : 2);
 		} finally {
 			spy.mockRestore();
+		}
+	});
+
+	test("without a verdict line, only a reviewer with write access authorizes, and an outsider never hides one (#6037)", async () => {
+		const prEvent = { ...event, pull_request: { ...event.pull_request, user: { login: "author" } } };
+		const by = (login: string) => ({ ...review("APPROVED"), user: { login } });
+		for (const scenario of [
+			{ reviews: [by("outsider"), by("maintainer")], expected: { login: "maintainer", headSha: head } },
+			{ reviews: [by("outsider")], expected: {} },
+			{ reviews: [by("author")], expected: {} },
+		]) {
+			const permissionLookups: string[] = [];
+			const originalFetch = globalThis.fetch;
+			const replacement: typeof fetch = Object.assign(async (input: Parameters<typeof fetch>[0]) => {
+				const endpoint = String(input);
+				if (endpoint === "https://api.github.com/repos/owner/repo/pulls/5416/reviews?per_page=100&page=1") return Response.json(scenario.reviews);
+				if (endpoint.startsWith("https://api.github.com/repos/owner/repo/issues/5416/timeline"))
+					return Response.json([{ event: "head_ref_force_pushed", created_at: headCommittedAt }]);
+				const permission = /\/collaborators\/([^/]+)\/permission$/u.exec(endpoint);
+				if (permission) {
+					permissionLookups.push(permission[1]!);
+					return Response.json({ permission: permission[1] === "maintainer" ? "write" : "read" });
+				}
+				throw new Error(`Unexpected endpoint: ${endpoint}`);
+			}, { preconnect: originalFetch.preconnect });
+			const spy = vi.spyOn(globalThis, "fetch").mockImplementation(replacement);
+			try {
+				expect(await authenticatedApproval(prEvent, undefined, head, "test-token")).toEqual(scenario.expected);
+				expect(permissionLookups).not.toContain("author");
+			} finally {
+				spy.mockRestore();
+			}
 		}
 	});
 
@@ -233,10 +258,12 @@ describe("review-event mutable PR body refresh", () => {
 		const body = verdict ? approved.replace("merge-approved", verdict) : verdict;
 		const resolved = await resolvePullRequestEvent(event, "pull_request_review", "token", async () => Response.json({ ...event.pull_request, body }));
 		expect(resolved.pull_request?.body).toBe(body);
-		// A revoked or empty body can never merge. A blocking verdict is now a withheld
-		// authorization rather than a contract defect, so the invariant is stated on
-		// mergeAuthorized, which covers both halves.
-		expect(validatePrContract(validInput({ body: resolved.pull_request?.body ?? "" })).mergeAuthorized).toBe(false);
+		// A revoked or empty body can never reuse the approval captured for the old
+		// verdict. A blocking verdict withholds authorization outright; a body with no
+		// verdict line falls to the human-review path, whose approval is looked up afresh
+		// (#6037), so with none on record it is only pending.
+		const lookedUp = verdict ? {} : { authenticatedReviewerLogin: undefined, authenticatedReviewHeadSha: undefined };
+		expect(validatePrContract(validInput({ body: resolved.pull_request?.body ?? "", ...lookedUp })).mergeAuthorized).toBe(false);
 	});
 
 	test("rejects every live authority drift rather than replacing the captured target", async () => {
@@ -433,74 +460,65 @@ describe("merge authorization reported separately from contract validity", () =>
 		expect(gateExitCode("approval", result)).toBe(1);
 	});
 
-	// Option 4: Human approval on exact head is sufficient without body verdict line
-	test("human approval on exact head with no body verdict line passes (option 4)", () => {
-		const result = validatePrContract(validInput({
-			body: "## No verdict line, just content\n",
-			authenticatedReviewerLogin: "human-reviewer",
-			authenticatedReviewHeadSha: head,
-		}));
+	const noVerdict = "## Summary\n\nHuman-reviewed change with no verdict line.\n";
+
+	test("human approval on the exact head authorizes a PR with no verdict line (#6037)", () => {
+		const result = validatePrContract(validInput({ body: noVerdict, authenticatedReviewerLogin: "human-reviewer", authenticatedReviewHeadSha: head }));
 		expect(result.ok).toBe(true);
 		expect(result.mergeAuthorized).toBe(true);
-		expect(result.verdict).toMatchObject({ verdict: "merge-approved", reviewerRole: "human" });
+		expect(result.authorizationPending).toBeUndefined();
 	});
 
-	test("human approval on old head with no body verdict line fails (not exact head)", () => {
-		const result = validatePrContract(validInput({
-			body: "## No verdict line\n",
-			authenticatedReviewerLogin: "human-reviewer",
-			authenticatedReviewHeadSha: "0".repeat(40),
-		}));
-		expect(result.ok).toBe(false);
-		expect(result.mergeAuthorized).toBe(false);
-		// Still a contract defect: missing verdict line takes precedence over stale approval
-		expect(result.diagnostics.join("\n")).toContain("must contain exactly one");
-	});
-
-	test("author self-approval (human approval from same identity) fails", () => {
-		const result = validatePrContract(validInput({
-			body: "## No verdict line\n",
-			authenticatedReviewerLogin: "author",
-			authenticatedReviewHeadSha: head,
-		}));
-		expect(result.ok).toBe(false);
-		expect(result.mergeAuthorized).toBe(false);
-		expect(result.diagnostics.join("\n")).toContain("must contain exactly one");
-	});
-
-	test("changes-requested after approval blocks merge (no authenticated approval)", () => {
-		// When effectiveExactHeadReview finds a CHANGES_REQUESTED as the last review, it returns undefined
-		// So authenticatedReviewerLogin would be undefined. This is authorization-pending, not a contract defect.
-		const result = validatePrContract(validInput({
-			body: "## No verdict line\n",
-			authenticatedReviewerLogin: undefined,
-			authenticatedReviewHeadSha: undefined,
-		}));
+	test("no verdict line and no approval is pending, not a contract defect", () => {
+		const result = validatePrContract(validInput({ body: noVerdict, authenticatedReviewerLogin: undefined, authenticatedReviewHeadSha: undefined }));
 		expect(result.ok).toBe(true);
+		expect(result.mergeAuthorized).toBe(false);
 		expect(result.authorizationPending).toBe(true);
-		expect(result.mergeAuthorized).toBe(false);
+		expect(gateExitCode("contract", result)).toBe(0);
+		expect(gateExitCode("approval", result)).toBe(1);
 	});
 
-	test("empty body is not treated as having no verdict line - requires verdict", () => {
-		const result = validatePrContract(validInput({
-			body: "",
-			authenticatedReviewerLogin: "human-reviewer",
-			authenticatedReviewHeadSha: head,
-		}));
+	test("an approval bound to an older head leaves the PR pending", () => {
+		const result = validatePrContract(validInput({ body: noVerdict, authenticatedReviewerLogin: "human-reviewer", authenticatedReviewHeadSha: "0".repeat(40) }));
+		expect(result.mergeAuthorized).toBe(false);
+		expect(result.authorizationPending).toBe(true);
+	});
+
+	test("the author approving their own PR leaves it pending", () => {
+		const result = validatePrContract(validInput({ body: noVerdict, authenticatedReviewerLogin: "AUTHOR", authenticatedReviewHeadSha: head }));
+		expect(result.mergeAuthorized).toBe(false);
+		expect(result.authorizationPending).toBe(true);
+	});
+
+	test("human approval never waives unrelated contract defects", () => {
+		const result = validatePrContract(validInput({ body: noVerdict, authenticatedReviewerLogin: "human-reviewer", authenticatedReviewHeadSha: head, baseRef: "main" }));
 		expect(result.ok).toBe(false);
 		expect(result.mergeAuthorized).toBe(false);
-		expect(result.diagnostics.join("\n")).toContain("must contain exactly one");
+		expect(result.diagnostics.join("\n")).toContain("PR base must be dev, not");
+		expect(result.diagnostics.join("\n")).not.toContain("must contain exactly one");
 	});
 
-	test("local preflight allows missing verdict line without human approval", () => {
-		const result = validatePrContract(validInput({
-			body: "## Some description but no verdict line\n",
-			authenticatedReviewerLogin: undefined,
-			authenticatedReviewHeadSha: undefined,
-			requireMergeApproved: false,
-		}));
-		expect(result.ok).toBe(true);
-		expect(result.mergeAuthorized).toBe(true);
+	test("a malformed verdict line stays a contract defect even with human approval", () => {
+		const result = validatePrContract(validInput({ body: "gajae.pr-review-verdict.v1 merge-approved oops\n", authenticatedReviewerLogin: "human-reviewer", authenticatedReviewHeadSha: head }));
+		expect(result.ok).toBe(false);
+		expect(result.diagnostics.join("\n")).toContain("Malformed");
+	});
+
+	test("local preflight accepts the human-review path but still checks everything else", () => {
+		expect(validatePrContract(validInput({ body: noVerdict, requireMergeApproved: false })).ok).toBe(true);
+		const unrebased = validatePrContract(validInput({ body: noVerdict, requireMergeApproved: false, baseIsAncestor: false }));
+		expect(unrebased.ok).toBe(false);
+		expect(unrebased.diagnostics.join("\n")).not.toContain("must contain exactly one");
+	});
+
+	test("needs-human is pending while merge-blocked is a deliberate block", () => {
+		const pending = validatePrContract(validInput({ body: approved.replace("merge-approved", "needs-human") }));
+		expect(pending.ok).toBe(true);
+		expect(pending.authorizationPending).toBe(true);
+		const held = validatePrContract(validInput({ body: approved.replace("merge-approved", "merge-blocked") }));
+		expect(held.ok).toBe(true);
+		expect(held.mergeAuthorized).toBe(false);
+		expect(held.authorizationPending).toBeUndefined();
 	});
 });
 
@@ -1057,6 +1075,11 @@ process.exit(result.exitCode);
 			await fs.rm(temp, { recursive: true, force: true });
 		}
 	}
+
+	test("main() outputs the authorization_pending line", async () => {
+		const result = await exactTreePreflight("needs-human");
+		expect(result.stdout).toMatch(/gjc-authorization-pending=(true|false)/);
+	});
 
 	for (const kind of ["needs-human", "merge-blocked", "merge-approved"] as const) {
 		test(`CLI permits valid ${kind} without local approval queries and ignores dirty checkout gate failures`, async () => {
@@ -2693,6 +2716,11 @@ test("template pins reviewer identity, exact diff digest, exactly-one risk class
 	expect(template).toContain("merge-self-approved");
 	// The unauthenticated gpt-heavy token is gone from the template.
 	expect(template).not.toContain("extra:gpt-heavy");
+	// An untouched template is the human-review path: waiting for approval, never a
+	// contract failure from its own placeholder (#6037).
+	const untouched = validatePrContract(validInput({ body: template, authenticatedReviewerLogin: undefined, authenticatedReviewHeadSha: undefined }));
+	expect(untouched.ok).toBe(true);
+	expect(untouched.authorizationPending).toBe(true);
 });
 
 test("dev CI carries immutable inline first-landing bootstrap validation", async () => {
@@ -2711,7 +2739,7 @@ test("dev CI carries immutable inline first-landing bootstrap validation", async
 	expect(workflow).toContain("cat > \"$program\" <<'GJC_BOOTSTRAP_PROGRAM'");
 	expect(workflow).toContain("repository: ${{ github.event.pull_request.head.repo.full_name }}");
 	expect(workflow).toContain("bun scripts/verify-gjc-state-writers.ts --fail --root .");
-	expect(workflow).toContain("Expected exactly one verdict line");
+	expect(workflow).toContain("Expected at most one verdict line");
 	expect(workflow).toContain("effective exact-head approval");
 	expect(workflow).toContain("lacks repository review authority");
 	expect(workflow).toContain("reviewPermission(reviewerId)");
