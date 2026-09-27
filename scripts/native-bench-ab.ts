@@ -61,7 +61,7 @@ const SUITES: Record<string, { adapter: string; actualSuite: string; cases: stri
 	"shell": { adapter: "packages/natives/bench/shell.ts", actualSuite: "shell", cases: ["S01"] },
 	"startup": { adapter: "packages/natives/bench/startup.ts", actualSuite: "startup", cases: ["S01", "S02", "S03"] },
 	"tools": { adapter: "packages/natives/bench/tools.ts", actualSuite: "tools", cases: ["F01", "W01"] },
-	"tools:ast_grep": { adapter: "packages/natives/bench/tools-ast-grep.ts", actualSuite: "tools:ast_grep", cases: ["A01"] },
+	"tools:ast_grep": { adapter: "packages/natives/bench/tools-ast-grep.ts", actualSuite: "tools:ast_grep", cases: ["A01", "A02"] },
 	"tools:bash": { adapter: "packages/natives/bench/tools-bash.ts", actualSuite: "tools:bash", cases: ["B01"] },
 	"tools:glob": { adapter: "packages/natives/bench/tools-glob.ts", actualSuite: "tools:glob", cases: ["G01"] },
 	"tui-input-write": { adapter: "packages/natives/bench/tui-input-write.ts", actualSuite: "tui-input-write", cases: ["I01"] },
