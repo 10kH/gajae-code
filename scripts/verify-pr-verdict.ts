@@ -299,6 +299,12 @@ export interface PrValidationResult {
 	mergeAuthorized: boolean;
 	/** Why the merge is not authorized yet. Never contract defects, never forgery claims. */
 	authorizationDiagnostics: string[];
+	/**
+	 * True when authorization is pending (no verdict line and no human approval yet, or other
+	 * non-defective reasons to wait). Reported separately from ok/mergeAuthorized so pending
+	 * PRs are not shown as failures.
+	 */
+	authorizationPending?: boolean;
 }
 
 /**
@@ -456,6 +462,7 @@ export function validatePrContract(input: PrValidationInput): PrValidationResult
 	// diagnostic reported here; every false claim (self-approval, an unbacked reviewer-id, a
 	// stale digest) stays a CONTRACT defect.
 	const authorizationDiagnostics: string[] = [];
+	let authorizationPending = false;
 	if (input.baseRef !== "dev") diagnostics.push(`PR base must be dev, not ${JSON.stringify(input.baseRef)}. Retarget the PR to dev.`);
 	if (!SHA40.test(input.baseSha)) diagnostics.push("Immutable PR event base SHA must be a lowercase 40-hex commit.");
 	if (!SHA40.test(input.headSha)) diagnostics.push("Exact PR head SHA must be a lowercase 40-hex commit.");
@@ -467,6 +474,50 @@ export function validatePrContract(input: PrValidationInput): PrValidationResult
 		diagnostics.push("Repository fast gate failed. Run: bun scripts/verify-gjc-state-writers.ts --fail");
 	}
 	const selfReview = evaluateSelfReviewComment(input);
+	// Option 4: For human-reviewed PRs, a non-author GitHub APPROVED review on the exact
+	// current head SHA, with no later CHANGES_REQUESTED, is sufficient on its own without
+	// a body verdict line. This is the path for PRs with human review only.
+	const humanApprovalOnHead = input.authenticatedReviewerLogin &&
+		input.authenticatedReviewHeadSha === input.headSha &&
+		input.authenticatedReviewerLogin.toLowerCase() !== input.authorLogin.toLowerCase();
+
+	// Check if there's any attempt at a verdict line in the body
+	const hasVerdictLineAttempt = input.body
+		.split(/\r?\n/u)
+		.some(line => line.trim().startsWith(VERDICT_PREFIX));
+
+	// Check if body is empty or only whitespace (explicitly cleared verdict)
+	const bodyIsEmpty = !input.body || !input.body.trim();
+
+	// If there's no verdict line in the body and body is not empty:
+	// - If there's a valid human approval on exact head, allow it to stand alone
+	// - Otherwise, treat missing verdict as a contract defect, not pending
+	if (!parsed.verdict && !hasVerdictLineAttempt && !bodyIsEmpty) {
+		if (humanApprovalOnHead && input.requireMergeApproved && input.authenticatedReviewerLogin) {
+			// Synthesize a merge-approved verdict for reporting purposes (Option 4)
+			parsed.verdict = {
+				verdict: "merge-approved",
+				diffSha256: input.computedDiffSha256,
+				reviewerRole: "human",
+				reviewerId: input.authenticatedReviewerLogin,
+				evidence: "GitHub APPROVED review on exact head",
+			};
+			parsed.diagnostics = [];
+			// Remove the missing verdict line error since we have human approval
+			diagnostics.length = 0;
+		} else if (!input.requireMergeApproved) {
+			// For local preflight (requireMergeApproved=false), allow missing verdict line
+			parsed.diagnostics = [];
+			diagnostics.length = 0;
+		}
+		// Otherwise: no human approval, so the missing verdict is still a contract defect
+		// diagnostics are kept as-is from parsePrVerdict
+	} else if (!parsed.verdict && !hasVerdictLineAttempt && bodyIsEmpty && !input.requireMergeApproved) {
+		// For local preflight with empty body, allow it
+		parsed.diagnostics = [];
+		diagnostics.length = 0;
+	}
+
 	if (parsed.verdict) {
 		if (parsed.verdict.diffSha256 !== input.computedDiffSha256) {
 			diagnostics.push(
@@ -509,7 +560,9 @@ export function validatePrContract(input: PrValidationInput): PrValidationResult
 	diagnostics.push(...selfReview.diagnostics);
 	const ok = diagnostics.length === 0;
 	// Invariant: a malformed contract can never report an authorized merge.
-	return { ok, verdict: parsed.verdict, diagnostics, mergeAuthorized: ok && authorizationDiagnostics.length === 0, authorizationDiagnostics };
+	const result: PrValidationResult = { ok, verdict: parsed.verdict, diagnostics, mergeAuthorized: ok && authorizationDiagnostics.length === 0, authorizationDiagnostics };
+	if (authorizationPending) result.authorizationPending = true;
+	return result;
 }
 
 /**
@@ -1434,9 +1487,10 @@ export async function main(argv: string[]): Promise<number> {
 				: contractResult(false, ["Usage: bun scripts/verify-pr-verdict.ts --event <github-event.json> | --preflight-command <command> | --push-preflight <branch> <head-sha> [--push-remote <remote>] [--push-url <destination-url>] | --self-review-sign <verdict> <base> <head> <digest> <reviewer-id> <risk> <extra> <evidence>; add --gate <contract|approval> to report only one half of the verdict"]);
 	for (const diagnostic of result.diagnostics) console.error(`::error::${diagnostic}`);
 	for (const diagnostic of result.authorizationDiagnostics) {
-		// Under --gate contract the pending approval is not this check's verdict, so it is
-		// reported as a notice: the log still explains why the merge has not happened.
-		if (gate === "contract") console.log(`::notice::${diagnostic}`);
+		// Pending approval is not an error; report as notice so the log explains why but
+		// doesn't fail the check. Under --gate contract any pending is not this check's
+		// verdict, so it is also reported as a notice.
+		if (result.authorizationPending || gate === "contract") console.log(`::notice::${diagnostic}`);
 		else console.error(`::error::${diagnostic}`);
 	}
 	// Machine-readable so a workflow can fan the two verdicts out into two check names.

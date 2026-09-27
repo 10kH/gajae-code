@@ -389,6 +389,87 @@ describe("merge authorization reported separately from contract validity", () =>
 		expect(gateExitCode("contract", result)).toBe(0);
 		expect(gateExitCode("approval", result)).toBe(1);
 	});
+
+	// Option 4: Human approval on exact head is sufficient without body verdict line
+	test("human approval on exact head with no body verdict line passes (option 4)", () => {
+		const result = validatePrContract(validInput({
+			body: "## No verdict line, just content\n",
+			authenticatedReviewerLogin: "human-reviewer",
+			authenticatedReviewHeadSha: head,
+		}));
+		expect(result.ok).toBe(true);
+		expect(result.mergeAuthorized).toBe(true);
+		expect(result.verdict).toMatchObject({ verdict: "merge-approved", reviewerRole: "human" });
+	});
+
+	test("human approval on old head with no body verdict line fails (not exact head)", () => {
+		const result = validatePrContract(validInput({
+			body: "## No verdict line\n",
+			authenticatedReviewerLogin: "human-reviewer",
+			authenticatedReviewHeadSha: "0".repeat(40),
+		}));
+		expect(result.ok).toBe(false);
+		expect(result.mergeAuthorized).toBe(false);
+		// Still a contract defect: missing verdict line takes precedence over stale approval
+		expect(result.diagnostics.join("\n")).toContain("must contain exactly one");
+	});
+
+	test("human approval on old head with no body verdict line fails (not exact head)", () => {
+		const result = validatePrContract(validInput({
+			body: "## No verdict line\n",
+			authenticatedReviewerLogin: "human-reviewer",
+			authenticatedReviewHeadSha: "0".repeat(40),
+		}));
+		expect(result.ok).toBe(false);
+		expect(result.mergeAuthorized).toBe(false);
+		expect(result.diagnostics.join("\n")).toContain("must contain exactly one");
+	});
+
+	test("author self-approval (human approval from same identity) fails", () => {
+		const result = validatePrContract(validInput({
+			body: "## No verdict line\n",
+			authenticatedReviewerLogin: "author",
+			authenticatedReviewHeadSha: head,
+		}));
+		expect(result.ok).toBe(false);
+		expect(result.mergeAuthorized).toBe(false);
+		expect(result.diagnostics.join("\n")).toContain("must contain exactly one");
+	});
+
+	test("changes-requested after approval blocks merge (no authenticated approval)", () => {
+		// When effectiveExactHeadReview finds a CHANGES_REQUESTED as the last review, it returns undefined
+		// So authenticatedReviewerLogin would be undefined.
+		const result = validatePrContract(validInput({
+			body: "## No verdict line\n",
+			authenticatedReviewerLogin: undefined,
+			authenticatedReviewHeadSha: undefined,
+		}));
+		expect(result.ok).toBe(false);
+		expect(result.mergeAuthorized).toBe(false);
+		expect(result.diagnostics.join("\n")).toContain("must contain exactly one");
+	});
+
+	test("empty body is not treated as having no verdict line - requires verdict", () => {
+		const result = validatePrContract(validInput({
+			body: "",
+			authenticatedReviewerLogin: "human-reviewer",
+			authenticatedReviewHeadSha: head,
+		}));
+		expect(result.ok).toBe(false);
+		expect(result.mergeAuthorized).toBe(false);
+		expect(result.diagnostics.join("\n")).toContain("must contain exactly one");
+	});
+
+	test("local preflight allows missing verdict line without human approval", () => {
+		const result = validatePrContract(validInput({
+			body: "## Some description but no verdict line\n",
+			authenticatedReviewerLogin: undefined,
+			authenticatedReviewHeadSha: undefined,
+			requireMergeApproved: false,
+		}));
+		expect(result.ok).toBe(true);
+		expect(result.mergeAuthorized).toBe(true);
+	});
 });
 
 describe("parseGhPrCreate", () => {
