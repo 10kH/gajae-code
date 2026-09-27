@@ -85,6 +85,69 @@ The web dashboard provides:
 - Per-folder breakdown table
 - Auto-refresh every 30 seconds
 
+## Tips & Common Patterns
+
+### Sync and print a summary
+
+Every `gjc stats` invocation syncs session files before it does anything else, so there is no separate sync flag.
+
+```bash
+gjc stats --summary
+```
+
+### JSON output for scripting
+
+`gjc stats --json` prints a `Synced N new entries ...` status line and a blank line on stdout before the JSON object (sync progress goes to stderr). Skip to the first line that opens the object before piping into `jq`:
+
+```bash
+gjc stats --json | sed -n '/^{/,$p' | jq '.overall.totalCost'
+```
+
+### Dashboard on a custom port
+
+```bash
+gjc stats --port 3000
+```
+
+`--summary` and `--json` print and exit without starting the server, so `--port` has no effect when combined with them.
+
+### Programmatic: highest-cost folder
+
+```typescript
+import { getDashboardStats, syncAllSessions } from "@gajae-code/stats";
+
+await syncAllSessions();
+const stats = await getDashboardStats();
+
+const [first, ...rest] = stats.byFolder;
+if (first) {
+  const topFolder = rest.reduce((a, b) => (b.totalCost > a.totalCost ? b : a), first);
+  console.log(`Highest cost folder: ${topFolder.folder} ($${topFolder.totalCost.toFixed(2)})`);
+} else {
+  console.log("No folder data available");
+}
+```
+
+### Programmatic: most-requested model
+
+```typescript
+import { getDashboardStats, syncAllSessions } from "@gajae-code/stats";
+
+await syncAllSessions();
+const stats = await getDashboardStats();
+
+// byModel is ordered by request count, highest first.
+const topModel = stats.byModel[0];
+if (topModel) {
+  console.log(`Most requested model: ${topModel.model} (${topModel.totalRequests} requests)`);
+}
+```
+
+### Troubleshooting
+
+- **No data shown?** Check that session logs exist under `~/.gjc/agent/sessions/`.
+- **Dashboard not starting?** Check that port 3847 (or the port passed to `--port`) is free.
+
 ## License
 
 MIT
