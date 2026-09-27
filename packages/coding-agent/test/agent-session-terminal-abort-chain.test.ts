@@ -30,6 +30,7 @@ import { MonitorTool } from "@gajae-code/coding-agent/tools/monitor";
 import { SubagentTool } from "@gajae-code/coding-agent/tools/subagent";
 import { Snowflake } from "@gajae-code/utils";
 import { AsyncJobManager } from "../src/async";
+import { __sessionStateSidecarTestHooks } from "../src/gjc-runtime/session-state-sidecar";
 import { createTempDirRegistry, reapStaleTempDirs, sweepAfterSettle } from "./helpers/temp-dir-registry";
 
 const TEST_ABORT_GRACE_MS = 50;
@@ -115,6 +116,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 	// before this suite grew its own sweep. Age-gated so a shard running
 	// concurrently on this host is never touched.
 	beforeAll(() => {
+		__sessionStateSidecarTestHooks.disableCoordinatorFileSyncForTests = true;
 		reapStaleTempDirs(TEMP_DIR_PREFIX);
 	});
 
@@ -123,6 +125,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 	// `finally`, and a writer that outlives teardown can recreate a root the
 	// `finally` already removed. `afterAll` still runs in both cases.
 	afterAll(async () => {
+		__sessionStateSidecarTestHooks.disableCoordinatorFileSyncForTests = false;
 		await sweepAfterSettle(tempDirRegistry);
 	});
 
