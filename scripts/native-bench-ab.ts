@@ -51,6 +51,20 @@ const SUITES: Record<string, { adapter: string; actualSuite: string; cases: stri
 	"edit-hotspots": { adapter: "packages/natives/bench/edit-hotspots.ts", actualSuite: "edit-hotspots", cases: ["H01", "H02", "H03", "H06"] },
 	grep: { adapter: "packages/natives/bench/grep.ts", actualSuite: "grep", cases: ["G01", "G02", "G03", "G04", "G05", "G06", "G07", "G08"] },
 	"natives-grep": { adapter: "packages/natives/bench/grep.ts", actualSuite: "grep", cases: ["G01", "G02", "G03", "G04", "G05", "G06", "G07", "G08"] },
+	"render-transcript": { adapter: "packages/natives/bench/render-transcript.ts", actualSuite: "render-transcript", cases: ["R01", "R02", "R03"] },
+	"tui-render-frame": { adapter: "packages/natives/bench/tui-render-frame.ts", actualSuite: "tui-render-frame", cases: ["F01", "F02"] },
+	"keystroke": { adapter: "packages/natives/bench/keystroke.ts", actualSuite: "keystroke", cases: ["K01", "K02", "K03", "K04", "K05"] },
+	"mermaid-render": { adapter: "packages/natives/bench/mermaid-render.ts", actualSuite: "mermaid-render", cases: ["M01", "M02"] },
+	"read-html": { adapter: "packages/natives/bench/read-html.ts", actualSuite: "read-html", cases: ["H01", "H02"] },
+	"read-image": { adapter: "packages/natives/bench/read-image.ts", actualSuite: "read-image", cases: ["I01"] },
+	"read-pdf": { adapter: "packages/natives/bench/read-pdf.ts", actualSuite: "read-pdf", cases: ["P01"] },
+	"shell": { adapter: "packages/natives/bench/shell.ts", actualSuite: "shell", cases: ["S01"] },
+	"startup": { adapter: "packages/natives/bench/startup.ts", actualSuite: "startup", cases: ["S01", "S02", "S03"] },
+	"tools": { adapter: "packages/natives/bench/tools.ts", actualSuite: "tools", cases: ["F01", "W01"] },
+	"tools:ast_grep": { adapter: "packages/natives/bench/tools-ast-grep.ts", actualSuite: "tools:ast_grep", cases: ["A01"] },
+	"tools:bash": { adapter: "packages/natives/bench/tools-bash.ts", actualSuite: "tools:bash", cases: ["B01"] },
+	"tools:glob": { adapter: "packages/natives/bench/tools-glob.ts", actualSuite: "tools:glob", cases: ["G01"] },
+	"tui-input-write": { adapter: "packages/natives/bench/tui-input-write.ts", actualSuite: "tui-input-write", cases: ["I01"] },
 	rss: { adapter: "", actualSuite: "rss", cases: [] },
 };
 
@@ -652,15 +666,25 @@ export async function runNativeBenchAb(repoRoot: string, options: ParsedOptions)
 	});
 }
 
+/** Shared adapter driver installed next to every adapter on the base side. */
+export const AB_ADAPTER_SUPPORT = "packages/natives/bench/ab-adapter.ts";
+
 /**
- * Copy the head adapter into the base worktree so both sides time identical
- * fixtures through the same public entrypoints. Only the implementation behind
- * those entrypoints differs between sides.
+ * Copy the head adapter (and its shared driver) into the base worktree so both
+ * sides time identical fixtures through the same public entrypoints. Only the
+ * implementation behind those entrypoints differs between sides. Returns the
+ * digest of the installed bytes, adapter first.
  */
 export async function installHeadAdapter(headRoot: string, baseRoot: string, adapter: string): Promise<string> {
-	const bytes = await Bun.file(path.join(headRoot, adapter)).bytes();
-	await Bun.write(path.join(baseRoot, adapter), bytes);
-	return new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
+	const hasher = new Bun.CryptoHasher("sha256");
+	const support = Bun.file(path.join(headRoot, AB_ADAPTER_SUPPORT));
+	const files = (await support.exists()) && adapter !== AB_ADAPTER_SUPPORT ? [adapter, AB_ADAPTER_SUPPORT] : [adapter];
+	for (const file of files) {
+		const bytes = await Bun.file(path.join(headRoot, file)).bytes();
+		await Bun.write(path.join(baseRoot, file), bytes);
+		hasher.update(bytes);
+	}
+	return hasher.digest("hex");
 }
 
 export function formatBenchError(error: unknown): { schema: string; verdict: "FAIL" | "ERROR" | "HostTooNoisy"; error: string; message: string } {
