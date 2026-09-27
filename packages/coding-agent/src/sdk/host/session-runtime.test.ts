@@ -4189,6 +4189,12 @@ async function invocationHarness(
 		onLifecycleDrainTimeout?: () => void;
 		onFailureDiagnosticKeyCount?: (count: number) => void;
 		agentFailedWriteFailures?: number;
+		onDurableAttempt?: (attempt: {
+			type: string | undefined;
+			commandId?: string;
+			turnId?: string;
+			outcome: "rejected" | "committed";
+		}) => void;
 		branch?: unknown[];
 		onInvocationCompletionReconciled?: (kind: string, correlation: { commandId: string; turnId: string }) => void;
 		/** Override/extend the INTERNAL terminal-abort seams the runtime is threaded. */
@@ -4216,6 +4222,7 @@ async function invocationHarness(
 				hooks.persistInterceptor,
 				hooks.agentFailedWriteFailures,
 				hooks.persistHolds ?? (hooks.persistHold ? [hooks.persistHold] : undefined),
+				hooks.onDurableAttempt,
 			)
 		: undefined;
 	createSdkSessionRuntimeExtension(api, {
@@ -4350,6 +4357,17 @@ function createInterceptorReconciliationStore(
 	interceptor: (transition: { type: string }) => void,
 	agentFailedWriteFailures = 1,
 	persistHolds?: Array<{ type: string; onEntered: () => void; release: Promise<void> }>,
+	// TEST-ONLY observability. `interceptor` fires only on REJECTED agent_failed
+	// writes, so a successful recovery write is invisible to it. This observer sees
+	// EVERY durable attempt with its correlation and whether it committed, so a
+	// branch test can assert the third attempt actually happened instead of
+	// inferring it from a missing callback.
+	onDurableAttempt?: (attempt: {
+		type: string | undefined;
+		commandId?: string;
+		turnId?: string;
+		outcome: "rejected" | "committed";
+	}) => void,
 ): SdkOnlyReconciliationStore {
 	const failureCounts = new Map<string, number>();
 	let nextHold = 0;
@@ -4381,6 +4399,12 @@ function createInterceptorReconciliationStore(
 					transitionType = "agent_failed";
 					failureCounts.set(identity, failureCount + 1);
 					interceptor({ type: "agent_failed" });
+					onDurableAttempt?.({
+						type: "agent_failed",
+						commandId: record?.commandId,
+						turnId: (record as { turnId?: string }).turnId,
+						outcome: "rejected",
+					});
 					throw Object.assign(new Error("injected persistence failure"), { code: "io_error" });
 				}
 				const previous = backing.records.find(candidate => candidate.commandId === record.commandId);
@@ -4413,6 +4437,13 @@ function createInterceptorReconciliationStore(
 				hold.onEntered();
 				await hold.release;
 			}
+			for (const record of records as Array<{ commandId?: string; turnId?: string }>)
+				onDurableAttempt?.({
+					type: transitionType,
+					commandId: record?.commandId,
+					turnId: record?.turnId,
+					outcome: "committed",
+				});
 			backing.records = records;
 		},
 		snapshotTerminalScopes: () => [],
@@ -7964,6 +7995,320 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		}
 	});
 
+	test("F3 the deadline compound recovery replays the diagnostic after a true expiry", async () => {
+		// The prompt sibling of the skill recovery: when a prompt settlement's durable
+		// writes fail, ownership goes to the deadline lease instead of the skill loop, and
+		// its expiry replays the cached reason before the boundary. A real 25ms lease is
+		// armed so the replay is driven by an actual matched expiry, not by calling the
+		// replay directly. Every durable attempt is observed with its correlation.
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-deadline-compound-diagnostic-"));
+		const attempts: Array<{ type: string | undefined; commandId?: string; turnId?: string; outcome: string }> = [];
+		try {
+			const harness = await invocationHarness("deadline-compound-diagnostic", cwd, {
+				settings: {
+					get: (key: string) =>
+						key === "sdk.promptDeadlineMs" ? 25 : key === "sdk.promptMaxRuntimeMs" ? 60_000 : undefined,
+				} as unknown as Settings,
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await neverSettlingPromise();
+				},
+				persistInterceptor: () => {},
+				agentFailedWriteFailures: 2,
+				onDurableAttempt: attempt => attempts.push(attempt),
+			});
+			const submitted = await harness.control("turn.prompt", {
+				text: "deadline compound carrier",
+				clientRef: "deadline-compound-ref",
+			});
+			expect(submitted.ok).toBe(true);
+			const commandId = (submitted.result as { commandId?: string } | undefined)?.commandId;
+			const turnId = (submitted.result as { turnId?: string } | undefined)?.turnId;
+			await harness.emit("agent_start");
+			await harness.emit("agent_failed", {
+				error: Object.assign(new Error("provider exploded sk-ant-secret-DEADLINE"), {
+					code: "provider_unavailable",
+					providerDiagnostic: {
+						category: "provider_unavailable",
+						httpStatus: 503,
+						code: "overloaded_error",
+						evidence: "structured_code",
+					},
+				}),
+			});
+			await harness.emit("agent_end");
+			const settled = await settledStatus(harness, "turn.prompt_status", { clientRef: "deadline-compound-ref" });
+
+			const correlated = attempts.filter(attempt => attempt.commandId === commandId && attempt.turnId === turnId);
+			expect(
+				correlated.filter(attempt => attempt.type === "agent_failed" && attempt.outcome === "rejected"),
+			).toHaveLength(2);
+			expect(correlated.some(attempt => attempt.type === "agent_failed" && attempt.outcome === "committed")).toBe(
+				true,
+			);
+
+			expect(settled.status).toBe("failed");
+			expect(settled.error?.code).toBe("provider_unavailable");
+			expect((settled as { outcome?: { providerDiagnostic?: unknown } }).outcome?.providerDiagnostic).toEqual({
+				category: "provider_unavailable",
+				httpStatus: 503,
+				code: "overloaded_error",
+				evidence: "structured_code",
+			});
+			expect(JSON.stringify(settled)).not.toContain("sk-ant-secret-DEADLINE");
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("F3 the cached lifecycle path records the diagnostic on the third durable attempt", async () => {
+		// The ORIGINAL lifecycle route: agent_failed durable write fails, the agent_end
+		// inline re-record of the cached reason fails too, and scheduleSkillTerminalRecovery
+		// replays it. `agentFailedWriteFailures: 2` is explicit because the fixture store
+		// only rejects while its budget lasts. Every durable attempt is observed with its
+		// correlation, so the third (successful) write is asserted, never inferred from a
+		// missing callback.
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-skill-cached-lifecycle-"));
+		const attempts: Array<{ type: string | undefined; commandId?: string; turnId?: string; outcome: string }> = [];
+		try {
+			const harness = await invocationHarness("skill-cached-lifecycle", cwd, {
+				invokeSkill: async (_name, _args, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await neverSettlingPromise();
+				},
+				persistInterceptor: () => {},
+				agentFailedWriteFailures: 2,
+				onDurableAttempt: attempt => attempts.push(attempt),
+			});
+			const submitted = await harness.control("skill.invoke", {
+				name: "cached-lifecycle-hang",
+				args: "",
+				clientRef: "skill-cached-lifecycle-ref",
+			});
+			expect(submitted.ok).toBe(true);
+			const commandId = (submitted.result as { commandId?: string } | undefined)?.commandId;
+			const turnId = (submitted.result as { turnId?: string } | undefined)?.turnId;
+			expect(typeof commandId).toBe("string");
+			await harness.emit("agent_start");
+			await harness.emit("agent_failed", {
+				error: Object.assign(new Error("provider rejected sk-ant-secret-CACHED"), {
+					code: "provider_rejected",
+					providerDiagnostic: {
+						category: "auth",
+						httpStatus: 401,
+						code: "authentication_error",
+						evidence: "structured_code",
+					},
+				}),
+			});
+			await harness.emit("agent_end");
+			let settled:
+				| { status?: string; receiptState?: string; error?: { code?: string }; outcome?: Record<string, unknown> }
+				| undefined;
+			for (let attempt = 0; attempt < 600 && settled === undefined; attempt += 1) {
+				const frame = await harness.query("skill.invoke_status", { clientRef: "skill-cached-lifecycle-ref" });
+				const result = frame.result as
+					| {
+							status?: string;
+							receiptState?: string;
+							error?: { code?: string };
+							outcome?: Record<string, unknown>;
+					  }
+					| undefined;
+				if (result?.status === "failed" || result?.status === "terminal_ok") settled = result;
+				else await Bun.sleep(10);
+			}
+			if (settled === undefined) throw new Error("cached lifecycle recovery never converged on a terminal status");
+
+			// Branch execution, correlated to the public submission IDs.
+			const correlated = attempts.filter(attempt => attempt.commandId === commandId && attempt.turnId === turnId);
+			const rejectedFailureWrites = correlated.filter(
+				attempt => attempt.type === "agent_failed" && attempt.outcome === "rejected",
+			);
+			const committedFailureWrites = correlated.filter(
+				attempt => attempt.type === "agent_failed" && attempt.outcome === "committed",
+			);
+			// Two rejections: the initial agent_failed write and the agent_end inline
+			// re-record of the cached reason.
+			expect(rejectedFailureWrites).toHaveLength(2);
+			// The third attempt actually committed; it is observed, not inferred.
+			expect(committedFailureWrites.length).toBeGreaterThanOrEqual(1);
+			expect(correlated.some(attempt => attempt.type === "agent_end" && attempt.outcome === "committed")).toBe(true);
+
+			// Public durable receipt keeps the cached carrier and every legacy field.
+			expect(settled.status).toBe("failed");
+			expect(settled.error?.code).toBe("provider_rejected");
+			expect((settled.outcome as { providerCode?: string } | undefined)?.providerCode).toBe("provider_rejected");
+			expect((settled.outcome as { providerDiagnostic?: unknown } | undefined)?.providerDiagnostic).toEqual({
+				category: "auth",
+				httpStatus: 401,
+				code: "authentication_error",
+				evidence: "structured_code",
+			});
+			expect(JSON.stringify(settled)).not.toContain("sk-ant-secret-CACHED");
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("F3 the skill rejection recovery replays the diagnostic after the initial and first recovery writes fail", async () => {
+		// Entry fault: an accepted skill.invoke rejects after preflight commit, so no
+		// lifecycle agent_start/agent_end is emitted at all. The rejected settlement
+		// writes its own agent_failed, that write fails, ownership moves to the
+		// rejection recovery intent and scheduleSkillRecovery becomes the owner. With
+		// `agentFailedWriteFailures: 2` the FIRST scheduleSkillRecovery write also
+		// fails, so only its next attempt can record the reason. This is NOT the
+		// lifecycle agent_end inline re-record path, which is covered separately.
+		// Observability is fixture-only.
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-skill-scheduled-diagnostic-"));
+		let agentFailedWriteAttempts = 0;
+		try {
+			const harness = await invocationHarness("skill-scheduled-diagnostic", cwd, {
+				invokeSkill: async (_name, _args, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					throw Object.assign(new Error("provider rejected sk-ant-secret-SCHEDULED"), {
+						code: "provider_rejected",
+						providerDiagnostic: {
+							category: "auth",
+							httpStatus: 401,
+							code: "authentication_error",
+							evidence: "structured_code",
+						},
+					});
+				},
+				persistInterceptor: transition => {
+					if (transition.type === "agent_failed") agentFailedWriteAttempts += 1;
+				},
+				agentFailedWriteFailures: 2,
+			});
+			const submitted = await harness.control("skill.invoke", {
+				name: "explode-with-diagnostic",
+				args: "",
+				clientRef: "skill-scheduled-diagnostic-ref",
+			});
+			expect(submitted.ok).toBe(true);
+			let settled:
+				| { status?: string; receiptState?: string; error?: { code?: string }; outcome?: Record<string, unknown> }
+				| undefined;
+			for (let attempt = 0; attempt < 600 && settled === undefined; attempt += 1) {
+				const frame = await harness.query("skill.invoke_status", {
+					clientRef: "skill-scheduled-diagnostic-ref",
+				});
+				const result = frame.result as
+					| {
+							status?: string;
+							receiptState?: string;
+							error?: { code?: string };
+							outcome?: Record<string, unknown>;
+					  }
+					| undefined;
+				if (result?.status === "failed" || result?.status === "terminal_ok") settled = result;
+				else await Bun.sleep(10);
+			}
+			if (settled === undefined) throw new Error("scheduled skill recovery never converged on a terminal status");
+			// Branch reachability: the fixture store counts only REJECTED agent_failed
+			// writes, so exactly two means the initial rejection write and the first
+			// scheduleSkillRecovery write both failed. The terminal below therefore came
+			// from a later recovery attempt, not from either of those two writes.
+			expect(agentFailedWriteAttempts).toBe(2);
+			// Legacy skill terminal semantics are unchanged by the replay.
+			expect(settled.status).toBe("failed");
+			expect(settled.error?.code).toBe("provider_rejected");
+			expect((settled.outcome as { providerCode?: string } | undefined)?.providerCode).toBe("provider_rejected");
+			expect((settled.outcome as { providerDiagnostic?: unknown } | undefined)?.providerDiagnostic).toEqual({
+				category: "auth",
+				httpStatus: 401,
+				code: "authentication_error",
+				evidence: "structured_code",
+			});
+			expect(JSON.stringify(settled)).not.toContain("sk-ant-secret-SCHEDULED");
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("F3 skill terminal recovery preserves the provider diagnostic after a failed durable failure write", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-skill-diagnostic-recovery-"));
+		let failedFailureWrites = 0;
+		try {
+			const harness = await invocationHarness("skill-diagnostic-recovery", cwd, {
+				invokeSkill: async (_name, _args, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await neverSettlingPromise();
+				},
+				persistInterceptor: transition => {
+					// The first durable agent_failed write fails, so the reason survives only
+					// in the in-memory cache and must be replayed with its carrier intact.
+					// This guards the recovery replay reachable from this route; the
+					// double-failure scheduled-recovery branch is not reached by this input
+					// and is reported as unverified rather than claimed.
+					if (transition.type === "agent_failed" && failedFailureWrites < 2) {
+						failedFailureWrites += 1;
+						throw Object.assign(new Error("injected diagnostic persistence failure"), { code: "io_error" });
+					}
+				},
+			});
+			const submitted = await harness.control("skill.invoke", {
+				name: "diagnostic-hang",
+				args: "",
+				clientRef: "skill-diagnostic-recovery-ref",
+			});
+			expect(submitted.ok).toBe(true);
+			await harness.emit("agent_start");
+			await harness.emit("agent_failed", {
+				error: Object.assign(new Error("provider rejected sk-ant-secret-SKILL"), {
+					code: "provider_rejected",
+					providerDiagnostic: {
+						category: "auth",
+						httpStatus: 401,
+						code: "authentication_error",
+						evidence: "structured_code",
+					},
+				}),
+			});
+			await harness.emit("agent_end");
+			let settled:
+				| { status?: string; receiptState?: string; error?: { code?: string }; outcome?: Record<string, unknown> }
+				| undefined;
+			for (let attempt = 0; attempt < 600 && settled === undefined; attempt += 1) {
+				const frame = await harness.query("skill.invoke_status", { clientRef: "skill-diagnostic-recovery-ref" });
+				const result = frame.result as
+					| {
+							status?: string;
+							receiptState?: string;
+							error?: { code?: string };
+							outcome?: Record<string, unknown>;
+					  }
+					| undefined;
+				if (result?.status === "failed" || result?.status === "terminal_ok") settled = result;
+				else await Bun.sleep(10);
+			}
+			if (settled === undefined) throw new Error("skill diagnostic recovery never converged on a terminal status");
+			expect(failedFailureWrites).toBeGreaterThan(0);
+			// Legacy skill terminal semantics are untouched by the replay.
+			expect(settled.status).toBe("failed");
+			expect(settled.error?.code).toBe("provider_rejected");
+			expect(settled.receiptState).toBe("missing");
+			expect((settled.outcome as { providerDiagnostic?: unknown } | undefined)?.providerDiagnostic).toEqual({
+				category: "auth",
+				httpStatus: 401,
+				code: "authentication_error",
+				evidence: "structured_code",
+			});
+			expect(JSON.stringify(settled)).not.toContain("sk-ant-secret-SKILL");
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("retains skill terminal recovery across session replacement", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-skill-terminal-replacement-"));
 		let failFirstTerminalWrite = true;
@@ -8114,6 +8459,176 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				status: "failed",
 				error: { code: "provider_unavailable" },
 			});
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("publishes the provider diagnostic on the real agent_failed frame", async () => {
+		// R4: the wire frame is built by the publisher, not by the reconciler, and
+		// it used the code/message-only sanitizer. A client therefore never saw the
+		// classification the adapter produced, however well the durable row kept it.
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-diagnostic-publish-"));
+		try {
+			const harness = await invocationHarness("diagnostic-publish", cwd, {
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await neverSettlingPromise();
+				},
+			});
+			const submitted = await harness.control("turn.prompt", { text: "failing", clientRef: "publish-ref" });
+			expect(submitted.ok).toBe(true);
+			const ids = { commandId: submitted.result?.commandId, turnId: submitted.result?.turnId };
+			await harness.emit("agent_start");
+			await harness.emit("agent_failed", {
+				error: Object.assign(new Error("provider rejected sk-ant-secret-PUBLISH"), {
+					code: "provider_rejected",
+					providerDiagnostic: {
+						category: "auth",
+						httpStatus: 401,
+						code: "authentication_error",
+						evidence: "structured_code",
+					},
+				}),
+			});
+
+			const frames = harness.broadcasts.filter(frame => frame.kind === "agent_failed");
+			expect(frames).toHaveLength(1);
+			expect(frames[0]).toMatchObject({
+				kind: "agent_failed",
+				payload: {
+					type: "agent_failed",
+					sessionId: "diagnostic-publish",
+					...ids,
+					error: {
+						code: "provider_rejected",
+						message: "Prompt submission failed.",
+						providerDiagnostic: {
+							category: "auth",
+							httpStatus: 401,
+							code: "authentication_error",
+							evidence: "structured_code",
+						},
+					},
+				},
+			});
+			// The published frame carries the bounded classification and nothing else.
+			expect(JSON.stringify(frames[0])).not.toContain("sk-ant-secret-PUBLISH");
+			expect(JSON.stringify(frames[0])).not.toContain("provider rejected");
+
+			await harness.emit("agent_end");
+			const settled = await settledStatus(harness, "turn.prompt_status", { clientRef: "publish-ref" });
+			expect(settled.status).toBe("failed");
+			expect(settled.error?.code).toBe("provider_rejected");
+			expect(
+				(settled as { outcome?: { providerDiagnostic?: Record<string, unknown> } }).outcome?.providerDiagnostic,
+			).toEqual({
+				category: "auth",
+				httpStatus: 401,
+				code: "authentication_error",
+				evidence: "structured_code",
+			});
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("keeps the provider diagnostic through failed-write recovery and rejects a forged one", async () => {
+		// R4: when the first agent_failed write fails, the reason is replayed from
+		// an in-memory record before the boundary. That replay rebuilt a bare Error
+		// from code/message, so the diagnostic was lost exactly when durability was
+		// already in doubt.
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-diagnostic-recovery-"));
+		let failedWrites = 0;
+		try {
+			const harness = await invocationHarness("diagnostic-recovery", cwd, {
+				settings: {
+					get: (key: string) =>
+						key === "sdk.promptDeadlineMs" ? 25 : key === "sdk.promptMaxRuntimeMs" ? 60_000 : undefined,
+				} as unknown as Settings,
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await neverSettlingPromise();
+				},
+				persistInterceptor: transition => {
+					if (transition.type === "agent_failed") {
+						failedWrites += 1;
+						throw Object.assign(new Error("injected persistence failure"), { code: "io_error" });
+					}
+				},
+				agentFailedWriteFailures: 1,
+			});
+			const submitted = await harness.control("turn.prompt", { text: "run", clientRef: "recovery-ref" });
+			expect(submitted.ok).toBe(true);
+			await harness.emit("agent_start");
+			await harness.emit("agent_failed", {
+				error: Object.assign(new Error("provider exploded"), {
+					code: "provider_unavailable",
+					providerDiagnostic: {
+						category: "provider_unavailable",
+						httpStatus: 503,
+						code: "overloaded_error",
+						evidence: "structured_code",
+					},
+				}),
+			});
+			await harness.emit("agent_end");
+
+			const settled = await settledStatus(harness, "turn.prompt_status", { clientRef: "recovery-ref" });
+			expect(failedWrites).toBeGreaterThan(0);
+			expect(settled.status).toBe("failed");
+			expect(settled.error?.code).toBe("provider_unavailable");
+			expect(
+				(settled as { outcome?: { providerDiagnostic?: Record<string, unknown> } }).outcome?.providerDiagnostic,
+			).toEqual({
+				category: "provider_unavailable",
+				httpStatus: 503,
+				code: "overloaded_error",
+				evidence: "structured_code",
+			});
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("never publishes a malformed or forged diagnostic from a failure cause", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-diagnostic-forged-"));
+		try {
+			const harness = await invocationHarness("diagnostic-forged", cwd, {
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await neverSettlingPromise();
+				},
+			});
+			const submitted = await harness.control("turn.prompt", { text: "failing", clientRef: "forged-ref" });
+			expect(submitted.ok).toBe(true);
+			await harness.emit("agent_start");
+			await harness.emit("agent_failed", {
+				error: Object.assign(new Error("provider rejected"), {
+					code: "provider_rejected",
+					providerDiagnostic: {
+						category: "quota",
+						evidence: "message_text",
+						detail: "sk-ant-secret-FORGED",
+						requestId: "req_leak",
+					},
+				}),
+			});
+
+			const frames = harness.broadcasts.filter(frame => frame.kind === "agent_failed");
+			expect(frames).toHaveLength(1);
+			expect((frames[0]?.payload as { error?: Record<string, unknown> })?.error).toEqual({
+				code: "provider_rejected",
+				message: "Prompt submission failed.",
+			});
+			expect(JSON.stringify(frames[0])).not.toContain("sk-ant-secret-FORGED");
+			expect(JSON.stringify(frames[0])).not.toContain("req_leak");
 			await harness.stop();
 		} finally {
 			await Bun.sleep(50);
