@@ -4,16 +4,20 @@ on:
   workflow_dispatch:
     inputs:
       suite:
-        description: Benchmark suite to compare
+        description: "Benchmark suite to compare (any SUITES key in scripts/native-bench-ab.ts, or profile-stability)"
         required: true
-        type: choice
+        type: string
         default: rss
-        options: [rss, edit-hotspots, grep, profile-stability]
       base:
         description: Git ref to use as the baseline
         required: true
         type: string
         default: origin/main
+      iterations:
+        description: Optional per-block iteration count passed to the adapter (empty keeps its default)
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -78,7 +82,12 @@ jobs:
         env:
           SUITE: ${{ inputs.suite }}
           BASE: ${{ inputs.base }}
-        run: bun scripts/native-bench-ab.ts --suite "$SUITE" --base "$BASE" --allow-baseline-drift --json > native-bench-ab.json
+          ITERATIONS: ${{ inputs.iterations }}
+        run: |
+          set -euo pipefail
+          extra=()
+          if [ -n "$ITERATIONS" ]; then extra=(--iterations "$ITERATIONS"); fi
+          bun scripts/native-bench-ab.ts --suite "$SUITE" --base "$BASE" --allow-baseline-drift --json "${extra[@]}" > native-bench-ab.json
       - name: Upload benchmark JSON
         if: ${{ always() && inputs.suite != 'profile-stability' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
