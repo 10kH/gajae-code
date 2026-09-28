@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import path from "node:path";
 import { type SettingPath, Settings } from "@gajae-code/coding-agent/config/settings";
 import { BUILTIN_TOOL_DESCRIPTORS, LazyAgentTool, type ToolSession } from "@gajae-code/coding-agent/tools";
 
@@ -19,21 +22,26 @@ afterEach(() => {
 	}
 });
 
-function session(overrides: Partial<Record<SettingPath, unknown>> = {}): ToolSession {
+function session(
+	overrides: Partial<Record<SettingPath, unknown>> = {},
+	sessionOverrides: Partial<ToolSession> = {},
+): ToolSession {
 	return {
-		cwd: "/tmp/test",
+		cwd: os.tmpdir(),
 		hasUI: false,
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
 		settings: Settings.isolated(overrides),
+		...sessionOverrides,
 	};
 }
 
-async function descriptionBeforeAndAfterLoad(name: string, toolSession: ToolSession) {
+async function descriptionBeforeAndAfterLoad(name: string, toolSession: ToolSession, beforeLoad?: () => void) {
 	const descriptor = BUILTIN_TOOL_DESCRIPTORS[name];
 	if (!descriptor) throw new Error(`no descriptor for ${name}`);
 	const facade = new LazyAgentTool(descriptor, undefined, () => descriptor.load(toolSession), toolSession);
 	const before = facade.description;
+	beforeLoad?.();
 	try {
 		await facade.materializeForTests();
 	} catch {
@@ -57,8 +65,44 @@ describe("discoverable tool descriptions are stable across first load (#5992)", 
 		const observed = await descriptionBeforeAndAfterLoad(name, toolSession);
 
 		// then
-		if (observed === undefined) return;
+		if (observed === undefined) {
+			expect(name).not.toBe("task");
+			return;
+		}
 		expect(observed.before).toBe(observed.after);
+	});
+	it("keeps task description stable when a project agent is discovered", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-task-description-agent-"));
+		try {
+			const agentsDir = path.join(cwd, ".gjc", "agents");
+			await fs.mkdir(agentsDir, { recursive: true });
+			await fs.writeFile(
+				path.join(agentsDir, "reviewer-lite.md"),
+				"---\nname: reviewer-lite\ndescription: Lightweight project reviewer\n---\nYou review code.\n",
+			);
+			const observed = await descriptionBeforeAndAfterLoad("task", session({}, { cwd }));
+
+			expect(observed).toBeDefined();
+			expect(observed?.before).toBe(observed?.after);
+		} finally {
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps task description stable when irc becomes available", async () => {
+		let ircAvailable = false;
+		const toolSession = session(
+			{ "irc.enabled": true },
+			{
+				getToolByName: name => (name === "irc" && ircAvailable ? ({ name: "irc" } as never) : undefined),
+			},
+		);
+		const observed = await descriptionBeforeAndAfterLoad("task", toolSession, () => {
+			ircAvailable = true;
+		});
+
+		expect(observed).toBeDefined();
+		expect(observed?.before).toBe(observed?.after);
 	});
 
 	it.each([

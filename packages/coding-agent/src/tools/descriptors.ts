@@ -11,7 +11,11 @@ import {
 	validateDeferredAskArguments,
 	validateDeferredTodoArguments,
 } from "./descriptor-validation";
-import { evalToolDescriptionForSession, searchToolDescriptionForSession } from "./session-descriptions";
+import {
+	evalToolDescriptionForSession,
+	renderTaskDescription,
+	searchToolDescriptionForSession,
+} from "./session-descriptions";
 import { TOOL_CATALOG, type ToolCatalogEntry } from "./tool-catalog.generated";
 import { ToolError } from "./tool-errors";
 
@@ -475,8 +479,9 @@ const names: Array<[name: string, label: string, summary: string | undefined, lo
 	];
 
 const sessionDescriptions: Readonly<Record<string, ToolDescriptorMetadata["descriptionForSession"]>> = {
-	search: searchToolDescriptionForSession,
 	eval: evalToolDescriptionForSession,
+	search: searchToolDescriptionForSession,
+	task: renderTaskDescription,
 };
 
 const descriptorRawArgumentValidations: Readonly<Record<string, ToolDescriptorMetadata["rawArgumentValidation"]>> = {
