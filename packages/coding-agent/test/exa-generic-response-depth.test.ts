@@ -41,6 +41,18 @@ describe("formatGenericResponse nesting depth", () => {
 		expect(formatGenericResponse([{ title: "t", body: { a: 1 } }])).toBe('\n### t\n- **body:** {"a":1}');
 	});
 
+	it("bounds a deeply nested title, name, or id on an array item", () => {
+		// Template interpolation of a non-string title coerces arrays recursively and
+		// throws RangeError past the engine's limit.
+		let deepArray: unknown = ["x"];
+		for (let i = 0; i < 20_000; i += 1) deepArray = [deepArray];
+		for (const key of ["title", "name", "id"]) {
+			const output = formatGenericResponse([{ [key]: deepArray }]);
+			expect(output).toContain("[depth-limit]");
+		}
+		expect(formatGenericResponse([{ title: "T" }, { id: 7 }, {}])).toBe("\n### T\n\n### 7\n\n### Item 3");
+	});
+
 	it("keeps own __proto__ keys from a parsed payload when serializing values", () => {
 		const payload = JSON.parse('[{"meta":{"__proto__":{"x":1},"y":2}},{"__proto__":5}]');
 		expect(formatGenericResponse(payload)).toBe(

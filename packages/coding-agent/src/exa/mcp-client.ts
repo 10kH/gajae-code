@@ -208,7 +208,15 @@ export function formatGenericResponse(data: unknown, depth = 0): string {
 			const item = data[i];
 			if (typeof item === "object" && item !== null) {
 				const record = item as Record<string, unknown>;
-				const title = (record.title ?? record.name ?? record.id ?? `Item ${i + 1}`) as string;
+				const rawTitle = record.title ?? record.name ?? record.id;
+				// A remote title is unvalidated JSON: stringify non-strings through the
+				// depth-bounded path instead of template coercion, which recurses unbounded.
+				const title =
+					rawTitle === undefined || rawTitle === null
+						? `Item ${i + 1}`
+						: typeof rawTitle === "string"
+							? rawTitle
+							: formatValue(rawTitle, depth + 2);
 				parts.push(`\n### ${title}`);
 				for (const [k, v] of Object.entries(record)) {
 					if (["title", "name", "id"].includes(k)) continue;
