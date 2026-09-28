@@ -181,6 +181,22 @@ describe("task.simple", () => {
 			'REQUIRED when the user explicitly requests a worktree (for example, "use worktree")',
 		);
 	});
+	it("filters the bundled task roster by disabled agents and spawn permissions", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: TEST_AGENTS,
+			projectAgentsDir: null,
+		});
+
+		const tool = await TaskTool.create(
+			createSession({ "task.disabledAgents": ["critic"] }, { getSessionSpawns: () => "executor,planner" }),
+		);
+		const description = tool.description;
+
+		expect(description).toContain("# executor");
+		expect(description).toContain("# planner");
+		expect(description).not.toContain("# architect");
+		expect(description).not.toContain("# critic");
+	});
 	it("keeps IRC guidance stable when the IRC tool becomes available", async () => {
 		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
 			agents: TEST_AGENTS,

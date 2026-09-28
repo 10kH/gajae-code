@@ -60,11 +60,15 @@ describe("task agent visibility", () => {
 		});
 
 		const tool = await TaskTool.create(createSession());
-		expect(tool.description).toContain(
+		const description = tool.description;
+		expect(description).toContain(
 			"Other configured agents (project, user, plugin) are also available; calling with an unknown `agent` returns the full list of available agents.",
 		);
-		expect(tool.description).not.toContain("public_agent");
-		expect(tool.description).not.toContain("support_agent");
+		for (const agent of loadBundledAgents()) {
+			expect(description).toContain(`# ${agent.name}\n${agent.description}`);
+		}
+		expect(description).not.toContain("public_agent");
+		expect(description).not.toContain("support_agent");
 
 		const unknownResult = await tool.execute("tool-call", {
 			agent: "missing_agent",

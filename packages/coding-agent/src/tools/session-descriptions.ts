@@ -6,7 +6,11 @@
  * loaded tool reports afterwards, and the provider-visible `tools` block (and with it the
  * prompt-cache prefix) does not change when the implementation loads (#5992).
  */
-import { prompt } from "@gajae-code/utils";
+import { parseFrontmatter, prompt } from "@gajae-code/utils";
+import architectAgent from "../prompts/agents/architect.md" with { type: "text" };
+import criticAgent from "../prompts/agents/critic.md" with { type: "text" };
+import executorAgent from "../prompts/agents/executor.md" with { type: "text" };
+import plannerAgent from "../prompts/agents/planner.md" with { type: "text" };
 import evalDescription from "../prompts/tools/eval.md" with { type: "text" };
 import searchDescription from "../prompts/tools/search.md" with { type: "text" };
 import taskDescription from "../prompts/tools/task.md" with { type: "text" };
@@ -20,6 +24,7 @@ interface DescriptionSettings {
 			| "task.maxConcurrency"
 			| "task.isolation.mode"
 			| "task.simple"
+			| "task.disabledAgents"
 			| "eval.py"
 			| "eval.js"
 			| "readLineNumbers"
@@ -34,6 +39,29 @@ interface DescriptionSession {
 	getSessionSpawns?: () => string | null;
 	hasEditTool?: boolean;
 }
+
+interface BundledAgentDescription {
+	name: string;
+	description: string;
+	hide?: boolean;
+}
+
+function parseBundledAgentDescription(markdown: string): BundledAgentDescription {
+	const { frontmatter } = parseFrontmatter(markdown, { level: "fatal" });
+	const { name, description, hide } = frontmatter;
+	if (typeof name !== "string" || typeof description !== "string") {
+		throw new Error("Bundled task agent frontmatter must include a name and description");
+	}
+	return { name, description, hide: hide === true };
+}
+
+// Read only each role's frontmatter; importing task/agents would also load and render the full prompts.
+const BUNDLED_AGENT_DESCRIPTIONS = [
+	parseBundledAgentDescription(executorAgent),
+	parseBundledAgentDescription(architectAgent),
+	parseBundledAgentDescription(plannerAgent),
+	parseBundledAgentDescription(criticAgent),
+];
 
 export interface EvalToolDescriptionOptions {
 	py?: boolean;
@@ -64,8 +92,29 @@ export function renderTaskDescription(session: DescriptionSession): string {
 	const simpleMode = session.settings.get("task.simple") as TaskSimpleMode;
 	const { contextEnabled, customSchemaEnabled } = getTaskSimpleModeCapabilities(simpleMode);
 	const isolationMode = session.settings.get("task.isolation.mode");
-	const spawningDisabled = (session.getSessionSpawns?.() ?? "*") === "";
+	const parentSpawns = session.getSessionSpawns?.() ?? "*";
+	const spawningDisabled = parentSpawns === "";
+	const disabledSetting = session.settings.get("task.disabledAgents");
+	const disabledAgents = Array.isArray(disabledSetting)
+		? disabledSetting.filter((agent): agent is string => typeof agent === "string")
+		: [];
+	const allowedSpawns =
+		parentSpawns === "*"
+			? undefined
+			: new Set(
+					parentSpawns
+						.split(",")
+						.map(agent => agent.trim())
+						.filter(Boolean),
+				);
+	const agents = BUNDLED_AGENT_DESCRIPTIONS.filter(
+		agent =>
+			agent.hide !== true &&
+			!disabledAgents.includes(agent.name) &&
+			(allowedSpawns === undefined || allowedSpawns.has(agent.name)),
+	);
 	return prompt.render(taskDescription, {
+		agents,
 		spawningDisabled,
 		MAX_CONCURRENCY: session.settings.get("task.maxConcurrency"),
 		isolationEnabled: isolationMode !== "none",

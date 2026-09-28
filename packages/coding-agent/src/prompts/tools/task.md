@@ -60,6 +60,10 @@ Parallel when tasks touch disjoint files, are independent refactors/tests, or ne
 {{#if spawningDisabled}}
 Agent spawning is disabled for this context.
 {{else}}
+{{#list agents join="\n"}}
+# {{name}}
+{{description}}
+{{/list}}
 Other configured agents (project, user, plugin) are also available; calling with an unknown `agent` returns the full list of available agents.
 {{/if}}
 </agents>

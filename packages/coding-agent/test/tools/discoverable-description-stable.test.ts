@@ -84,6 +84,10 @@ describe("discoverable tool descriptions are stable across first load (#5992)", 
 
 			expect(observed).toBeDefined();
 			expect(observed?.before).toBe(observed?.after);
+			for (const name of ["executor", "architect", "planner", "critic"]) {
+				expect(observed?.before).toContain(name);
+			}
+			expect(observed?.before).not.toContain("reviewer-lite");
 		} finally {
 			await fs.rm(cwd, { recursive: true, force: true });
 		}
