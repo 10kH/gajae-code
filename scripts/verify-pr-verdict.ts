@@ -90,7 +90,7 @@ export interface IndependentReviewerEvidence {
 }
 
 /** A review normalized from either API shape so one rule can decide the effective one. */
-interface EffectiveReview {
+export interface EffectiveReview {
 	login?: string;
 	state?: string;
 	oid?: string;
