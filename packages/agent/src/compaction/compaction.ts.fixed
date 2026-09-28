@@ -1258,17 +1258,14 @@ export function prepareCompaction(
 			? (() => {
 					const cappedThreshold = resolveThresholdTokens(contextWindow, settings);
 					const uncappedReserve = effectiveReserveTokens(contextWindow, settings, 0);
-					// When threshold hits the 300k auto-ceiling, cap the reserve proportionally to the
-					// capped threshold so keep-recent window stays sane (Finding from PR #6060).
-					const shouldCapReserve =
-						cappedThreshold === DEFAULT_AUTO_THRESHOLD_CEILING_TOKENS && uncappedReserve > cappedThreshold * 0.3;
-					const cappedReserve = shouldCapReserve
-						? Math.min(uncappedReserve, Math.ceil(cappedThreshold * 0.15))
-						: uncappedReserve;
-					// Ensure result is never below configured minimum when reserve was capped
-					const result = cappedThreshold - cappedReserve;
-					return Math.max(shouldCapReserve ? configuredKeepRecentTokens : 1, result);
-				})()
+					// When threshold is capped at 300k, cap the reserve proportionally to the capped
+					// threshold so keep-recent window stays sane. Otherwise use the full reserve.
+					const cappedReserve =
+						cappedThreshold < Math.max(100_000, contextWindow * 0.8)
+							? Math.min(uncappedReserve, Math.ceil(cappedThreshold * 0.15))
+							: uncappedReserve;
+					return Math.max(configuredKeepRecentTokens, cappedThreshold - cappedReserve);
+			  })()
 			: configuredKeepRecentTokens;
 	const keepRecentTokens = Math.min(configuredKeepRecentTokens, thresholdSafeKeepRecentTokens);
 	// Preserve the legacy fixed window for smaller models. At 66k and above,
