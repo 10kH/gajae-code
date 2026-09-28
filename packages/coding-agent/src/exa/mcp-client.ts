@@ -187,7 +187,16 @@ export function formatSearchResults(data: ExaSearchResponse): string {
  * Format a non-search MCP response as human-readable text.
  * Handles objects, arrays, primitives, and common MCP response shapes.
  */
-export function formatGenericResponse(data: unknown): string {
+// Nesting depth is bounded. Each object level re-indents the entire formatted
+// subtree, so cost grows super-linearly with depth: 500/1000/2000/4000/8000
+// levels cost 60ms/227ms/730ms/5.9s/94s. A tool-call payload is whatever the
+// remote MCP server returned, and `MCP_MAX_CONTENT_BYTES` does not bound depth
+// — 8000 levels of `{"a":` is under 47 KB. The limit matches the one the
+// session-import walker already applies (`sanitizeImportedValue`, depth > 64).
+const MAX_GENERIC_RESPONSE_DEPTH = 64;
+
+export function formatGenericResponse(data: unknown, depth = 0): string {
+	if (depth > MAX_GENERIC_RESPONSE_DEPTH) return "[depth-limit]";
 	if (data === null || data === undefined) return "No result.";
 	if (typeof data === "string") return data;
 	if (typeof data === "number" || typeof data === "boolean") return String(data);
@@ -231,7 +240,7 @@ export function formatGenericResponse(data: unknown): string {
 			if (k === "content") continue; // handled above
 			if (v === null || v === undefined) continue;
 			if (typeof v === "object") {
-				const formatted = formatGenericResponse(v);
+				const formatted = formatGenericResponse(v, depth + 1);
 				if (formatted) lines.push(`- **${k}:**\n${indent(formatted, 2)}`);
 			} else {
 				lines.push(`- **${k}:** ${formatValue(v)}`);
