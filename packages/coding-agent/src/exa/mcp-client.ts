@@ -267,7 +267,9 @@ function truncateDepth(value: unknown, depth: number): unknown {
 	if (value === null || typeof value !== "object") return value;
 	if (depth > MAX_GENERIC_RESPONSE_DEPTH) return "[depth-limit]";
 	if (Array.isArray(value)) return value.map(item => truncateDepth(item, depth + 1));
-	const copy: Record<string, unknown> = {};
+	// Null prototype: an own "__proto__" key from a parsed payload must stay an
+	// own data property instead of hitting the Object.prototype setter.
+	const copy: Record<string, unknown> = Object.create(null);
 	for (const [key, child] of Object.entries(value)) copy[key] = truncateDepth(child, depth + 1);
 	return copy;
 }

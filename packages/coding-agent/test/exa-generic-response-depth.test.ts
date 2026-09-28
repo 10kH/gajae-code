@@ -41,6 +41,13 @@ describe("formatGenericResponse nesting depth", () => {
 		expect(formatGenericResponse([{ title: "t", body: { a: 1 } }])).toBe('\n### t\n- **body:** {"a":1}');
 	});
 
+	it("keeps own __proto__ keys from a parsed payload when serializing values", () => {
+		const payload = JSON.parse('[{"meta":{"__proto__":{"x":1},"y":2}},{"__proto__":5}]');
+		expect(formatGenericResponse(payload)).toBe(
+			'\n### Item 1\n- **meta:** {"__proto__":{"x":1},"y":2}\n\n### Item 2\n- **__proto__:** 5',
+		);
+	});
+
 	it("leaves payloads within the limit formatted exactly as before", () => {
 		expect(formatGenericResponse({ a: 1, b: "x" })).toBe("- **a:** 1\n- **b:** x");
 		expect(formatGenericResponse([1, 2, 3])).toBe("- 1\n- 2\n- 3");
