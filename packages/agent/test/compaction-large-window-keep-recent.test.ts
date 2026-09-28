@@ -74,4 +74,23 @@ describe("compaction large-window keep-recent", () => {
 			}
 		}
 	});
+
+	it("keeps a reserve's worth of headroom below the ceiling on windows whose reserve reaches it", () => {
+		const settings = { ...DEFAULT_COMPACTION_SETTINGS, remoteEnabled: false };
+		const history = createLongHistory();
+		for (const contextWindow of [1_000_000, 2_000_000, 10_000_000, 20_000_000]) {
+			const preparation = prepareCompaction(history, settings, { contextWindow });
+			if (!preparation) throw new Error(`Expected compaction preparation for a ${contextWindow}-token window`);
+			expect(preparation.tokenCorrection.keepRecentTokensCorrected).toBe(150_000);
+		}
+	});
+
+	it("bounds a configured keep floor above the ceiling-safe window so threshold compaction still reduces", () => {
+		const settings = { ...DEFAULT_COMPACTION_SETTINGS, remoteEnabled: false, keepRecentTokens: 400_000 };
+		const history = createLongHistory();
+		const preparation = prepareCompaction(history, settings, { contextWindow: 1_000_000 });
+		if (!preparation) throw new Error("Expected compaction preparation with an oversized keep floor");
+		expect(preparation.tokenCorrection.keepRecentTokensCorrected).toBe(150_000);
+		expect(preparation.messagesToSummarize.length).toBeGreaterThan(0);
+	});
 });

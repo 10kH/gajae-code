@@ -1232,20 +1232,16 @@ export interface PrepareCompactionOptions {
 	contextWindow?: number;
 }
 
-function resolveThresholdSafeKeepRecentTokens(
-	contextWindow: number,
-	settings: CompactionSettings,
-	configuredKeepRecentTokens: number,
-): number {
-	const cappedThreshold = resolveThresholdTokens(contextWindow, settings);
-	const uncappedReserve = effectiveReserveTokens(contextWindow, settings, 0);
-	const shouldCapReserve =
-		isDefaultAutoThresholdCeilingApplied(contextWindow, settings) && uncappedReserve > cappedThreshold * 0.3;
-	const cappedReserve = shouldCapReserve
-		? Math.min(uncappedReserve, Math.ceil(cappedThreshold * 0.15))
-		: uncappedReserve;
-	const thresholdSafeKeepRecentTokens = cappedThreshold - cappedReserve;
-	return Math.max(shouldCapReserve ? configuredKeepRecentTokens : 1, thresholdSafeKeepRecentTokens);
+function resolveThresholdSafeKeepRecentTokens(contextWindow: number, settings: CompactionSettings): number {
+	const thresholdTokens = resolveThresholdTokens(contextWindow, settings);
+	const reserveTokens = effectiveReserveTokens(contextWindow, settings, 0);
+	// Under the default ceiling the window-scaled reserve can reach or exceed the
+	// threshold itself (15% of 2M = 300K). Bound the headroom to half the threshold
+	// so the kept history still leaves a reserve's worth of room below the trigger.
+	const headroomTokens = isDefaultAutoThresholdCeilingApplied(contextWindow, settings)
+		? Math.min(reserveTokens, Math.floor(thresholdTokens * 0.5))
+		: reserveTokens;
+	return Math.max(1, thresholdTokens - headroomTokens);
 }
 
 export function prepareCompaction(
@@ -1280,7 +1276,7 @@ export function prepareCompaction(
 	const contextWindow = options.contextWindow;
 	const thresholdSafeKeepRecentTokens =
 		contextWindow !== undefined && Number.isFinite(contextWindow) && contextWindow > 1
-			? resolveThresholdSafeKeepRecentTokens(contextWindow, settings, configuredKeepRecentTokens)
+			? resolveThresholdSafeKeepRecentTokens(contextWindow, settings)
 			: configuredKeepRecentTokens;
 
 	const keepRecentTokens = Math.min(configuredKeepRecentTokens, thresholdSafeKeepRecentTokens);
@@ -1303,9 +1299,16 @@ export function prepareCompaction(
 	const historyTokens = pathEntries
 		.slice(boundaryStart, boundaryEnd)
 		.reduce((tokens, entry) => tokens + estimateEntryTokens(entry), 0);
+	// Under the default ceiling a configured floor above the threshold-safe window
+	// would keep more than the trigger allows (or skip compaction entirely), so the
+	// floor is bounded by that window there.
+	const keepFloorTokens =
+		contextWindow !== undefined && isDefaultAutoThresholdCeilingApplied(contextWindow, settings)
+			? keepRecentTokens
+			: configuredKeepRecentTokens;
 	const effectiveKeepRecentTokens =
-		configuredKeepRecentTokens > historyTokens
-			? configuredKeepRecentTokens
+		keepFloorTokens > historyTokens
+			? keepFloorTokens
 			: scaledKeepRecentTokens > keepRecentTokens && scaledKeepRecentTokens > historyTokens
 				? keepRecentTokens
 				: scaledKeepRecentTokens;
