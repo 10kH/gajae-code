@@ -19,6 +19,7 @@ import { ModelRegistry } from "../../src/config/model-registry";
 import type { PerfCorpusReport } from "../perf-corpus-schema";
 
 import { startCpuProfile } from "../../src/debug/profiler";
+import { disposeAllShellSessions } from "../../src/exec/bash-executor";
 const compactionSummaryText = "Compacted summary of the recorded sanitized session.";
 
 const streamCompactionSummary: CustomStreamSimpleFn = model => {
@@ -768,6 +769,9 @@ async function runToolScenario(originMs: number): Promise<HarnessMark[]> {
 		}
 		return marks;
 	} finally {
+		// BashTool keeps a persistent shell worker/supervisor alive; without this
+		// its sockets hold the event loop open and the process never exits.
+		await disposeAllShellSessions();
 		await fs.rm(tempRoot, { recursive: true, force: true });
 	}
 }
