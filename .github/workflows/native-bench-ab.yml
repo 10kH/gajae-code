@@ -46,7 +46,17 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p .gjc/profiles/profile-stability
+          # The native build leaves the runner saturated; profile only once the
+          # 1-minute load settles below half the cores (AC1a.3 needs a quiet host).
+          cores=$(sysctl -n hw.ncpu)
+          for _ in $(seq 1 90); do
+            load=$(sysctl -n vm.loadavg | awk '{print $2}')
+            awk -v l="$load" -v c="$cores" 'BEGIN { exit !(l < c / 2) }' && break
+            sleep 10
+          done
           uptime | tee .gjc/profiles/profile-stability/load-before.txt
+          # Warm module, transpiler and fixture caches so both measured runs start alike.
+          bun run bench:profile -- --scenario all --out .gjc/profiles/profile-stability/warmup > /dev/null
           bun run bench:profile -- --scenario all --out .gjc/profiles/profile-stability/run1 | tee .gjc/profiles/profile-stability/run1.log
           bun run bench:profile -- --scenario all --out .gjc/profiles/profile-stability/run2 --compare .gjc/profiles/profile-stability/run1/report.json | tee .gjc/profiles/profile-stability/run2.log
           uptime | tee .gjc/profiles/profile-stability/load-after.txt
