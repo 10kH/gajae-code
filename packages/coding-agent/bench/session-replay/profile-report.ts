@@ -165,6 +165,12 @@ function profileFunctionSymbol(node: CpuProfileNode): { symbol: string; function
  * idle (awaiting I/O, a child process, a timer) rather than executing the
  * sampled frame. Crediting the whole gap to that frame turns one-second waits
  * into "hot" functions and makes top-self-time lists unstable across runs.
+ *
+ * On-CPU work keeps being sampled at the configured interval, including long
+ * synchronous native calls: a 124ms `Bun.hash` and 200ms of JS spinning
+ * produced no gap over 2ms, while a 250ms `await Bun.sleep` produced one
+ * 250ms gap. In the replay corpus the long gaps land on `kill`, `rm`,
+ * `spawn`, `close` and stream callbacks.
  */
 const MAX_SAMPLE_INTERVALS = 10;
 
