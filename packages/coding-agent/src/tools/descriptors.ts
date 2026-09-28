@@ -15,6 +15,7 @@ import {
 	evalToolDescriptionForSession,
 	renderTaskDescription,
 	searchToolDescriptionForSession,
+	taskParametersForSession,
 } from "./session-descriptions";
 import { TOOL_CATALOG, type ToolCatalogEntry } from "./tool-catalog.generated";
 import { ToolError } from "./tool-errors";
@@ -484,6 +485,9 @@ const sessionDescriptions: Readonly<Record<string, ToolDescriptorMetadata["descr
 	task: renderTaskDescription,
 };
 
+const sessionParameters: Readonly<Record<string, ToolDescriptorMetadata["parametersForSession"]>> = {
+	task: taskParametersForSession,
+};
 const descriptorRawArgumentValidations: Readonly<Record<string, ToolDescriptorMetadata["rawArgumentValidation"]>> = {
 	ask: validateDeferredAskArguments,
 	todo_write: validateDeferredTodoArguments,
@@ -506,7 +510,9 @@ const builtins = names
 					: undefined,
 			parameters: name === "ask" ? deferredAskParameters : undefined,
 			parametersForSession:
-				name === "ask" ? session => selectAskParameters(session?.getDeepInterviewAskStage?.()) : undefined,
+				name === "ask"
+					? session => selectAskParameters(session?.getDeepInterviewAskStage?.())
+					: sessionParameters[name],
 			descriptionForSession: sessionDescriptions[name],
 			rawArgumentValidation: descriptorRawArgumentValidations[name],
 			intent: deferredIntentPolicies[name],

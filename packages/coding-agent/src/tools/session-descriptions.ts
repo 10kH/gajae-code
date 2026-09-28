@@ -15,6 +15,7 @@ import evalDescription from "../prompts/tools/eval.md" with { type: "text" };
 import searchDescription from "../prompts/tools/search.md" with { type: "text" };
 import taskDescription from "../prompts/tools/task.md" with { type: "text" };
 import { getTaskSimpleModeCapabilities, type TaskSimpleMode } from "../task/simple-mode";
+import { getTaskSchema, type TaskToolSchemaInstance } from "../task/types";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import { resolveEvalBackends } from "./eval-backends";
 
@@ -126,4 +127,10 @@ export function renderTaskDescription(session: DescriptionSession): string {
 		independentMode: simpleMode === "independent",
 		autoroutingActive: session.settings.getEffectiveAutorouting().active,
 	});
+}
+
+export function taskParametersForSession(session?: DescriptionSession): TaskToolSchemaInstance {
+	const simpleMode = session ? (session.settings.get("task.simple") as TaskSimpleMode) : "default";
+	const isolationMode = session?.settings.get("task.isolation.mode");
+	return getTaskSchema({ isolationEnabled: session !== undefined && isolationMode !== "none", simpleMode });
 }

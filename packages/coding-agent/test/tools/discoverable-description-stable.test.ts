@@ -41,13 +41,19 @@ async function descriptionBeforeAndAfterLoad(name: string, toolSession: ToolSess
 	if (!descriptor) throw new Error(`no descriptor for ${name}`);
 	const facade = new LazyAgentTool(descriptor, undefined, () => descriptor.load(toolSession), toolSession);
 	const before = facade.description;
+	const parametersBefore = name === "task" ? JSON.stringify(facade.parameters) : undefined;
 	beforeLoad?.();
 	try {
 		await facade.materializeForTests();
 	} catch {
 		return undefined;
 	}
-	return { before, after: facade.description };
+	return {
+		before,
+		after: facade.description,
+		parametersBefore,
+		parametersAfter: name === "task" ? JSON.stringify(facade.parameters) : undefined,
+	};
 }
 
 const discoverable = Object.values(BUILTIN_TOOL_DESCRIPTORS)
@@ -70,6 +76,24 @@ describe("discoverable tool descriptions are stable across first load (#5992)", 
 			return;
 		}
 		expect(observed.before).toBe(observed.after);
+		if (name === "task") {
+			expect(observed.parametersBefore).toBeDefined();
+			expect(observed.parametersBefore).toBe(observed.parametersAfter);
+		}
+	});
+	it.each([
+		["isolation enabled", { "task.isolation.mode": "auto" }, true],
+		["schema-free mode", { "task.simple": "schema-free" }, false],
+		["independent mode", { "task.simple": "independent" }, false],
+	] as const)("keeps task parameters stable for %s", async (_label, overrides, isolationEnabled) => {
+		const observed = await descriptionBeforeAndAfterLoad("task", session(overrides));
+
+		expect(observed).toBeDefined();
+		expect(observed?.before).toBe(observed?.after);
+		expect(observed?.parametersBefore).toBeDefined();
+		expect(observed?.parametersBefore).toBe(observed?.parametersAfter);
+		if (isolationEnabled) expect(observed?.parametersBefore).toContain('"isolated"');
+		else expect(observed?.parametersBefore).not.toContain('"isolated"');
 	});
 	it("keeps task description stable when a project agent is discovered", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-task-description-agent-"));
