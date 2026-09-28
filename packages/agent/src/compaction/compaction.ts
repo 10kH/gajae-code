@@ -1232,12 +1232,16 @@ export interface PrepareCompactionOptions {
 	contextWindow?: number;
 }
 
+/**
+ * Leave reserve headroom below the compaction trigger for the kept history.
+ * When the default 300K ceiling applies, cap that headroom to half the threshold
+ * so large context windows do not reduce the safe keep window to zero. The caller
+ * separately clamps an oversized configured keep floor and corrected budget below
+ * the threshold so they cannot prevent an actual compaction.
+ */
 function resolveThresholdSafeKeepRecentTokens(contextWindow: number, settings: CompactionSettings): number {
 	const thresholdTokens = resolveThresholdTokens(contextWindow, settings);
 	const reserveTokens = effectiveReserveTokens(contextWindow, settings, 0);
-	// Under the default ceiling the window-scaled reserve can reach or exceed the
-	// threshold itself (15% of 2M = 300K). Bound the headroom to half the threshold
-	// so the kept history still leaves a reserve's worth of room below the trigger.
 	const headroomTokens = isDefaultAutoThresholdCeilingApplied(contextWindow, settings)
 		? Math.min(reserveTokens, Math.floor(thresholdTokens * 0.5))
 		: reserveTokens;
@@ -1312,7 +1316,13 @@ export function prepareCompaction(
 			: scaledKeepRecentTokens > keepRecentTokens && scaledKeepRecentTokens > historyTokens
 				? keepRecentTokens
 				: scaledKeepRecentTokens;
-	const keepRecentTokensCorrected = Math.max(1, Math.round(effectiveKeepRecentTokens / appliedRatio));
+	const correctedKeepRecentTokens = Math.max(1, Math.round(effectiveKeepRecentTokens / appliedRatio));
+	const keepRecentTokensCorrected =
+		contextWindow !== undefined &&
+		Number.isFinite(contextWindow) &&
+		isDefaultAutoThresholdCeilingApplied(contextWindow, settings)
+			? Math.min(correctedKeepRecentTokens, resolveThresholdTokens(contextWindow, settings) - 1)
+			: correctedKeepRecentTokens;
 
 	const cutPoint = findCutPoint(pathEntries, boundaryStart, boundaryEnd, keepRecentTokensCorrected);
 

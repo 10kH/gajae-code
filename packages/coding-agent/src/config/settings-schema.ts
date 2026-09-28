@@ -2051,12 +2051,13 @@ export const SETTINGS_SCHEMA = {
 			tab: "context",
 			label: "Compaction Threshold",
 			description:
-				"Percent threshold for context maintenance; Default caps at 300,000 tokens except while context promotion is active",
+				"Percent threshold for context maintenance; the 300,000-token default cap applies only with adaptive mode disabled (except during context promotion)",
 			options: [
 				{
 					value: "default",
 					label: "Default",
-					description: "Default threshold caps at 300,000 tokens except while context promotion is active",
+					description:
+						"300,000-token default cap applies only with adaptive mode disabled (except during context promotion)",
 				},
 				{ value: "10", label: "10%", description: "Extremely early maintenance" },
 				{ value: "20", label: "20%", description: "Very early maintenance" },

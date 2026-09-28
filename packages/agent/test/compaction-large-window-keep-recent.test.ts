@@ -85,12 +85,25 @@ describe("compaction large-window keep-recent", () => {
 		}
 	});
 
-	it("bounds a configured keep floor above the ceiling-safe window so threshold compaction still reduces", () => {
+	it("bounds configured keep floors above the ceiling below the threshold on 1M and 2M windows", () => {
 		const settings = { ...DEFAULT_COMPACTION_SETTINGS, remoteEnabled: false, keepRecentTokens: 400_000 };
 		const history = createLongHistory();
-		const preparation = prepareCompaction(history, settings, { contextWindow: 1_000_000 });
-		if (!preparation) throw new Error("Expected compaction preparation with an oversized keep floor");
-		expect(preparation.tokenCorrection.keepRecentTokensCorrected).toBe(150_000);
-		expect(preparation.messagesToSummarize.length).toBeGreaterThan(0);
+		for (const contextWindow of [1_000_000, 2_000_000]) {
+			const preparation = prepareCompaction(history, settings, { contextWindow });
+			if (!preparation) throw new Error(`Expected compaction preparation for a ${contextWindow}-token window`);
+
+			const keepRecentTokens = preparation.tokenCorrection.keepRecentTokensCorrected;
+			const threshold = resolveThresholdTokens(contextWindow, settings);
+			expect(keepRecentTokens).toBeLessThanOrEqual(threshold);
+			expect(keepRecentTokens).toBeLessThan(threshold);
+			const expandedCorrection = prepareCompaction(history, settings, {
+				contextWindow,
+				tokenCorrectionRatio: 0.5,
+			});
+			if (!expandedCorrection)
+				throw new Error(`Expected correction preparation for a ${contextWindow}-token window`);
+			expect(expandedCorrection.tokenCorrection.keepRecentTokensCorrected).toBeLessThan(threshold);
+			expect(preparation.messagesToSummarize.length).toBeGreaterThan(0);
+		}
 	});
 });
