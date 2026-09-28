@@ -66,6 +66,13 @@ const SUITES: Record<string, { adapter: string; actualSuite: string; cases: stri
 	"tools:glob": { adapter: "packages/natives/bench/tools-glob.ts", actualSuite: "tools:glob", cases: ["G01"] },
 	"tui-input-write": { adapter: "packages/natives/bench/tui-input-write.ts", actualSuite: "tui-input-write", cases: ["I01"] },
 	"tty-write": { adapter: "packages/natives/bench/tty-write.ts", actualSuite: "tty-write", cases: ["W01", "W02"], support: ["packages/natives/bench/tty-write-child.ts"] },
+	pty: { adapter: "packages/natives/bench/pty.ts", actualSuite: "pty", cases: ["P01", "P02"] },
+	power: { adapter: "packages/natives/bench/power.ts", actualSuite: "power", cases: ["W01"] },
+	appearance: { adapter: "packages/natives/bench/appearance.ts", actualSuite: "appearance", cases: ["A01"] },
+	prof: { adapter: "packages/natives/bench/prof.ts", actualSuite: "prof", cases: ["R01", "R02"] },
+	iso: { adapter: "packages/natives/bench/iso.ts", actualSuite: "iso", cases: ["I01", "I02", "I03"] },
+	crash: { adapter: "packages/natives/bench/crash.ts", actualSuite: "crash", cases: ["C01", "C02"] },
+	builtins: { adapter: "packages/natives/bench/builtins.ts", actualSuite: "builtins", cases: ["B01", "B02", "B03", "B04", "B05", "B06", "B07", "B08"] },
 	rss: { adapter: "", actualSuite: "rss", cases: [] },
 };
 
