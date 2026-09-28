@@ -135,7 +135,9 @@ export function computeContextBreakdown(
 	if (contextWindow > 0) {
 		const compactionSettings = session.settings.getGroup("compaction") as CompactionSettings;
 		if (compactionSettings.enabled && compactionSettings.strategy !== "off") {
-			const threshold = resolveThresholdTokens(contextWindow, compactionSettings);
+			const threshold =
+				session.getAutoCompactionThresholdTokens?.(tokensForFreeSpace) ??
+				resolveThresholdTokens(contextWindow, compactionSettings);
 			autoCompactBufferTokens = Math.max(0, contextWindow - threshold);
 		} else {
 			autoCompactBufferTokens = 0;

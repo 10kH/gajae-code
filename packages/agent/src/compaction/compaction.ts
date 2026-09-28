@@ -160,6 +160,15 @@ function isAbortError(error: unknown): boolean {
 
 export const DEFAULT_AUTO_THRESHOLD_CEILING_TOKENS = 300_000;
 
+export function isDefaultAutoThresholdCeilingApplied(contextWindow: number, settings: CompactionSettings): boolean {
+	const thresholdTokens = settings.thresholdTokens;
+	if (typeof thresholdTokens === "number" && Number.isFinite(thresholdTokens) && thresholdTokens > 0) return false;
+	const thresholdPercent = settings.thresholdPercent;
+	if (typeof thresholdPercent === "number" && Number.isFinite(thresholdPercent) && thresholdPercent > 0) return false;
+	if (settings.adaptive?.enabled) return false;
+	return contextWindow - effectiveReserveTokens(contextWindow, settings) > DEFAULT_AUTO_THRESHOLD_CEILING_TOKENS;
+}
+
 export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	enabled: true,
 	strategy: "context-full",
@@ -1223,6 +1232,22 @@ export interface PrepareCompactionOptions {
 	contextWindow?: number;
 }
 
+function resolveThresholdSafeKeepRecentTokens(
+	contextWindow: number,
+	settings: CompactionSettings,
+	configuredKeepRecentTokens: number,
+): number {
+	const cappedThreshold = resolveThresholdTokens(contextWindow, settings);
+	const uncappedReserve = effectiveReserveTokens(contextWindow, settings, 0);
+	const shouldCapReserve =
+		isDefaultAutoThresholdCeilingApplied(contextWindow, settings) && uncappedReserve > cappedThreshold * 0.3;
+	const cappedReserve = shouldCapReserve
+		? Math.min(uncappedReserve, Math.ceil(cappedThreshold * 0.15))
+		: uncappedReserve;
+	const thresholdSafeKeepRecentTokens = cappedThreshold - cappedReserve;
+	return Math.max(shouldCapReserve ? configuredKeepRecentTokens : 1, thresholdSafeKeepRecentTokens);
+}
+
 export function prepareCompaction(
 	pathEntries: SessionEntry[],
 	settings: CompactionSettings,
@@ -1255,21 +1280,9 @@ export function prepareCompaction(
 	const contextWindow = options.contextWindow;
 	const thresholdSafeKeepRecentTokens =
 		contextWindow !== undefined && Number.isFinite(contextWindow) && contextWindow > 1
-			? (() => {
-					const cappedThreshold = resolveThresholdTokens(contextWindow, settings);
-					const uncappedReserve = effectiveReserveTokens(contextWindow, settings, 0);
-					// When threshold hits the 300k auto-ceiling, cap the reserve proportionally to the
-					// capped threshold so keep-recent window stays sane (Finding from PR #6060).
-					const shouldCapReserve =
-						cappedThreshold === DEFAULT_AUTO_THRESHOLD_CEILING_TOKENS && uncappedReserve > cappedThreshold * 0.3;
-					const cappedReserve = shouldCapReserve
-						? Math.min(uncappedReserve, Math.ceil(cappedThreshold * 0.15))
-						: uncappedReserve;
-					// Ensure result is never below configured minimum when reserve was capped
-					const result = cappedThreshold - cappedReserve;
-					return Math.max(shouldCapReserve ? configuredKeepRecentTokens : 1, result);
-				})()
+			? resolveThresholdSafeKeepRecentTokens(contextWindow, settings, configuredKeepRecentTokens)
 			: configuredKeepRecentTokens;
+
 	const keepRecentTokens = Math.min(configuredKeepRecentTokens, thresholdSafeKeepRecentTokens);
 	// Preserve the legacy fixed window for smaller models. At 66k and above,
 	// retain up to 30% of the model context, but never enough to leave the

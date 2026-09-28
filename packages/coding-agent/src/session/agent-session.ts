@@ -58,23 +58,28 @@ import {
 	CompactionCancelledError,
 	type CompactionPreparation,
 	type CompactionResult,
+	type CompactionSettings,
 	calculateContextTokens,
 	calculatePromptTokens,
 	collectEntriesForBranchSummary,
 	compact,
 	type EmergencyCompactionSample,
+	effectiveReserveTokens,
 	emergencyCompactionReason,
 	estimateMessageTokensHeuristic,
 	estimateTextTokensHeuristic,
 	generateBranchSummary,
 	generateHandoff,
 	IMAGE_TOKEN_ESTIMATE,
+	isDefaultAutoThresholdCeilingApplied,
 	prepareCompaction,
 	type RemoteCompactionFallbackHealthEvent,
 	type RemoteCompactionFallbackHealthHooks,
+	resolveThresholdTokens,
 	type SummaryOptions,
 	shouldCompact,
 } from "@gajae-code/agent-core/compaction";
+
 import {
 	commitToolOutputPrune,
 	createPrunedNotice,
@@ -19954,10 +19959,15 @@ export class AgentSession {
 				const compactionSettings = this.settings.getGroup("compaction");
 				const pathEntries = this.#withoutEphemeralCustomMessageEntries(this.sessionManager.getBranch());
 
-				const preparation = prepareCompaction(pathEntries, compactionSettings, {
-					contextWindow: this.model.contextWindow,
-					tokenCorrectionRatio: this.#computeCompactionTokenCorrectionRatio(),
-				});
+				const preparation = prepareCompaction(
+					pathEntries,
+					this.#compactionSettingsForContextPromotion(compactionSettings),
+					{
+						contextWindow: this.model.contextWindow,
+						tokenCorrectionRatio: this.#computeCompactionTokenCorrectionRatio(),
+					},
+				);
+
 				if (!preparation) {
 					// Check why we can't compact
 					const lastEntry = pathEntries[pathEntries.length - 1];
@@ -20974,12 +20984,12 @@ export class AgentSession {
 		}
 	}
 
-	#recordAdaptiveCompactionCall<T extends { adaptive?: { enabled: boolean; turnWindow: number } }>(
+	#recordAdaptiveCompactionCall(
 		contextTokens: number,
-		settings: T,
+		settings: CompactionSettings,
 		assistantMessage: AssistantMessage,
-	): T {
-		if (!settings.adaptive?.enabled) return settings;
+	): CompactionSettings {
+		if (!settings.adaptive?.enabled) return this.#compactionSettingsWithAdaptiveState(settings);
 		this.#adaptiveCompactionTracker.setWindowMs(settings.adaptive.turnWindow * 60_000);
 		const messageKey = this.#adaptiveCompactionMessageKey(assistantMessage);
 		if (this.#adaptiveCompactionRecordedMessageKey === messageKey) {
@@ -20994,11 +21004,31 @@ export class AgentSession {
 		return `${message.provider}\u0000${message.model}\u0000${message.timestamp}\u0000${message.usage?.totalTokens ?? ""}`;
 	}
 
-	#compactionSettingsWithAdaptiveState<T extends { adaptive?: { enabled: boolean } }>(settings: T): T {
-		if (!settings.adaptive?.enabled) return settings;
+	#compactionSettingsWithAdaptiveState(settings: CompactionSettings): CompactionSettings {
+		const adaptiveSettings = settings.adaptive?.enabled
+			? { ...settings, adaptiveState: this.#adaptiveCompactionTracker.decisionState() }
+			: settings;
+		return this.#compactionSettingsForContextPromotion(adaptiveSettings);
+	}
+
+	#compactionSettingsForContextPromotion(settings: CompactionSettings): CompactionSettings {
+		const contextWindow = this.model?.contextWindow ?? 0;
+		const isContextPromoted = this.#temporaryProviderSessionScopes.some(
+			scope => scope.token.reason === "context-promotion",
+		);
+		if (
+			!isContextPromoted ||
+			!isDefaultAutoThresholdCeilingApplied(contextWindow, settings)
+		) {
+			return settings;
+		}
+
+		// Context promotion is opt-in and exists to use the larger model's headroom.
+		// Keep the reserve-based default on the promoted model instead of immediately
+		// compacting at the same 300K ceiling that triggered promotion.
 		return {
 			...settings,
-			adaptiveState: this.#adaptiveCompactionTracker.decisionState(),
+			thresholdTokens: contextWindow - effectiveReserveTokens(contextWindow, settings),
 		};
 	}
 
@@ -22304,10 +22334,15 @@ export class AgentSession {
 			// correction only when it SHRINKS the keep window (ratio >= 1), never when
 			// it would grow it, so recovery cannot re-overflow the provider window.
 			const overflowRatio = this.#computeCompactionTokenCorrectionRatio();
-			const preparation = prepareCompaction(pathEntries, compactionSettings, {
-				contextWindow: this.model?.contextWindow,
-				tokenCorrectionRatio: overflowRatio !== undefined ? Math.max(1, overflowRatio) : undefined,
-			});
+			const preparation = prepareCompaction(
+				pathEntries,
+				this.#compactionSettingsForContextPromotion(compactionSettings),
+				{
+					contextWindow: this.model?.contextWindow,
+					tokenCorrectionRatio: overflowRatio !== undefined ? Math.max(1, overflowRatio) : undefined,
+				},
+			);
+
 			if (autoCompactionSignal.aborted) return await emitAborted();
 
 			if (!preparation) {
@@ -27182,6 +27217,21 @@ export class AgentSession {
 			premiumRequests: totalPremiumRequests,
 			sessionMemory: this.sessionManager.getSessionMemoryStats(),
 		};
+	}
+
+	/** Current auto-compaction threshold, including active model-promotion policy. */
+	getAutoCompactionThresholdTokens(contextTokens?: number): number {
+		const model = this.model;
+		if (!model) return 0;
+		const contextWindow = model.contextWindow ?? 0;
+		if (contextWindow <= 0) return 0;
+		const settings = this.settings.getGroup("compaction") as CompactionSettings;
+		return resolveThresholdTokens(
+			contextWindow,
+			this.#compactionSettingsWithAdaptiveState(settings),
+			0,
+			contextTokens,
+		);
 	}
 
 	/**

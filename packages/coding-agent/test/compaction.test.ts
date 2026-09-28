@@ -6,7 +6,6 @@ import {
 	calculateContextTokens,
 	compact,
 	DEFAULT_COMPACTION_SETTINGS,
-	effectiveReserveTokens,
 	estimateEntryTokens,
 	findCutPoint,
 	getLastAssistantUsage,
@@ -259,10 +258,27 @@ describe("default compaction threshold ceiling", () => {
 		const preparation = prepareCompaction(entries, settings, { contextWindow: 1_000_000 });
 		if (!preparation) throw new Error("Expected compaction preparation for a large history");
 
-		const thresholdSafeKeepTokens =
-			resolveThresholdTokens(1_000_000, settings) - effectiveReserveTokens(1_000_000, settings);
-		expect(preparation.tokenCorrection.keepRecentTokensCorrected).toBeLessThanOrEqual(thresholdSafeKeepTokens);
-		expect(preparation.tokenCorrection.keepRecentTokensCorrected).toBeGreaterThanOrEqual(settings.keepRecentTokens);
+		const keepRecentTokens = preparation.tokenCorrection.keepRecentTokensCorrected;
+		expect(keepRecentTokens).toBeGreaterThanOrEqual(settings.keepRecentTokens);
+		expect(keepRecentTokens).toBeLessThanOrEqual(resolveThresholdTokens(1_000_000, settings));
+	});
+
+	it("does not apply the reserve cap to explicit 300K token or percent thresholds", () => {
+		const entries: SessionEntry[] = Array.from({ length: 80 }, (_, index) =>
+			createMessageEntry(createUserMessage(`turn ${index} ${"recent context ".repeat(1_000)}`)),
+		);
+		const thresholdOverrides: Array<Partial<Pick<CompactionSettings, "thresholdTokens" | "thresholdPercent">>> = [
+			{ thresholdTokens: 300_000 },
+			{ thresholdPercent: 30 },
+		];
+
+		for (const thresholdOverride of thresholdOverrides) {
+			const settings = { ...DEFAULT_COMPACTION_SETTINGS, remoteEnabled: false, ...thresholdOverride };
+			const preparation = prepareCompaction(entries, settings, { contextWindow: 1_000_000 });
+			if (!preparation) throw new Error("Expected compaction preparation for a large history");
+
+			expect(preparation.tokenCorrection.keepRecentTokensCorrected).toBe(150_000);
+		}
 	});
 });
 
