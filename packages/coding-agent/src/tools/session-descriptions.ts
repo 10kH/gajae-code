@@ -41,27 +41,26 @@ interface DescriptionSession {
 	hasEditTool?: boolean;
 }
 
-interface BundledAgentDescription {
+interface BundledAgentName {
 	name: string;
-	description: string;
 	hide?: boolean;
 }
 
-function parseBundledAgentDescription(markdown: string): BundledAgentDescription {
+function parseBundledAgentName(markdown: string): BundledAgentName {
 	const { frontmatter } = parseFrontmatter(markdown, { level: "fatal" });
-	const { name, description, hide } = frontmatter;
-	if (typeof name !== "string" || typeof description !== "string") {
-		throw new Error("Bundled task agent frontmatter must include a name and description");
+	const { name, hide } = frontmatter;
+	if (typeof name !== "string") {
+		throw new Error("Bundled task agent frontmatter must include a name");
 	}
-	return { name, description, hide: hide === true };
+	return { name, hide: hide === true };
 }
 
 // Read only each role's frontmatter; importing task/agents would also load and render the full prompts.
-const BUNDLED_AGENT_DESCRIPTIONS = [
-	parseBundledAgentDescription(executorAgent),
-	parseBundledAgentDescription(architectAgent),
-	parseBundledAgentDescription(plannerAgent),
-	parseBundledAgentDescription(criticAgent),
+const BUNDLED_AGENT_NAMES = [
+	parseBundledAgentName(executorAgent),
+	parseBundledAgentName(architectAgent),
+	parseBundledAgentName(plannerAgent),
+	parseBundledAgentName(criticAgent),
 ];
 
 export interface EvalToolDescriptionOptions {
@@ -108,14 +107,14 @@ export function renderTaskDescription(session: DescriptionSession): string {
 						.map(agent => agent.trim())
 						.filter(Boolean),
 				);
-	const agents = BUNDLED_AGENT_DESCRIPTIONS.filter(
+	const agents = BUNDLED_AGENT_NAMES.filter(
 		agent =>
 			agent.hide !== true &&
 			!disabledAgents.includes(agent.name) &&
 			(allowedSpawns === undefined || allowedSpawns.has(agent.name)),
 	);
 	return prompt.render(taskDescription, {
-		agents,
+		agents: agents.map(({ name }) => ({ name })),
 		spawningDisabled,
 		MAX_CONCURRENCY: session.settings.get("task.maxConcurrency"),
 		isolationEnabled: isolationMode !== "none",

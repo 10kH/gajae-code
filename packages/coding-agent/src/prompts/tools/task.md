@@ -60,11 +60,8 @@ Parallel when tasks touch disjoint files, are independent refactors/tests, or ne
 {{#if spawningDisabled}}
 Agent spawning is disabled for this context.
 {{else}}
-{{#list agents join="\n"}}
-# {{name}}
-{{description}}
-{{/list}}
-Other configured agents (project, user, plugin) are also available; calling with an unknown `agent` returns the full list of available agents.
+Bundled role names: {{#list agents join=", "}}{{name}}{{/list}}. A configured agent may override a bundled role name and takes precedence.
+Other configured agents (project, user, plugin) may also be available; calling with an unknown `agent` lists the agents callable in this session.
 {{/if}}
 </agents>
 

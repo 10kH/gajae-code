@@ -320,6 +320,23 @@ export {
 function hasAvailableIrcTool(session: ToolSession): boolean {
 	return session.settings.get("irc.enabled") === true && session.getToolByName?.("irc") !== undefined;
 }
+
+function callableAgents(agents: readonly AgentDefinition[], session: ToolSession): AgentDefinition[] {
+	const disabledAgents = new Set(session.settings.get("task.disabledAgents"));
+	const parentSpawns = session.getSessionSpawns() ?? "*";
+	const allowedSpawns =
+		parentSpawns === "*"
+			? undefined
+			: new Set(
+					parentSpawns
+						.split(",")
+						.map(agent => agent.trim())
+						.filter(Boolean),
+				);
+	return filterVisibleAgents(agents).filter(
+		agent => !disabledAgents.has(agent.name) && (allowedSpawns === undefined || allowedSpawns.has(agent.name)),
+	);
+}
 function createTaskModeError(text: string): AgentToolResult<TaskToolDetails> {
 	return {
 		content: [{ type: "text", text }],
@@ -883,8 +900,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const agent = getAgent(this.#discoveredAgents, params.agent);
 		if (!agent) {
 			const available =
-				filterVisibleAgents(this.#discoveredAgents)
-					.map(a => a.name)
+				callableAgents(this.#discoveredAgents, this.session)
+					.map(agent => agent.name)
 					.join(", ") || "none";
 			return {
 				content: [{ type: "text", text: `Unknown agent "${params.agent}". Available: ${available}` }],
@@ -1652,8 +1669,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const agent = getAgent(agents, agentName);
 		if (!agent) {
 			const available =
-				filterVisibleAgents(agents)
-					.map(a => a.name)
+				callableAgents(agents, this.session)
+					.map(agent => agent.name)
 					.join(", ") || "none";
 			return {
 				content: [

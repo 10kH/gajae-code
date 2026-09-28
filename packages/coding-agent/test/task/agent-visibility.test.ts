@@ -9,16 +9,21 @@ import * as discoveryModule from "../../src/task/discovery";
 import type { AgentDefinition, TaskParams } from "../../src/task/types";
 import type { ToolSession } from "../../src/tools";
 
-function createSession(cwd = "/tmp"): ToolSession {
+function createSession(
+	cwd = "/tmp",
+	settingsOverrides: Record<string, unknown> = {},
+	spawns: string | null = "*",
+): ToolSession {
 	return {
 		cwd,
 		hasUI: false,
 		settings: Settings.isolated({
 			"async.enabled": false,
 			"task.isolation.mode": "none",
+			...settingsOverrides,
 		}),
 		getSessionFile: () => null,
-		getSessionSpawns: () => "*",
+		getSessionSpawns: () => spawns,
 	} as unknown as ToolSession;
 }
 
@@ -62,10 +67,12 @@ describe("task agent visibility", () => {
 		const tool = await TaskTool.create(createSession());
 		const description = tool.description;
 		expect(description).toContain(
-			"Other configured agents (project, user, plugin) are also available; calling with an unknown `agent` returns the full list of available agents.",
+			"Other configured agents (project, user, plugin) may also be available; calling with an unknown `agent` lists the agents callable in this session.",
 		);
+		expect(description).toContain("Bundled role names: executor, architect, planner, critic.");
+		expect(description).toContain("A configured agent may override a bundled role name and takes precedence.");
 		for (const agent of loadBundledAgents()) {
-			expect(description).toContain(`# ${agent.name}\n${agent.description}`);
+			expect(description).not.toContain(agent.description);
 		}
 		expect(description).not.toContain("public_agent");
 		expect(description).not.toContain("support_agent");
@@ -90,7 +97,7 @@ describe("task agent visibility", () => {
 			const tool = await TaskTool.create(createSession(cwd));
 			const description = tool.description;
 			expect(description).toContain(
-				"Other configured agents (project, user, plugin) are also available; calling with an unknown `agent` returns the full list of available agents.",
+				"Other configured agents (project, user, plugin) may also be available; calling with an unknown `agent` lists the agents callable in this session.",
 			);
 			expect(description).not.toContain("reviewer-lite");
 
@@ -109,6 +116,37 @@ describe("task agent visibility", () => {
 		}
 	});
 
+	it("excludes disabled and non-allowlisted agents from unknown-agent hints", async () => {
+		const projectAgent: AgentDefinition = {
+			name: "project_agent",
+			description: "Project agent",
+			systemPrompt: "project",
+			source: "project",
+		};
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: [...loadBundledAgents(), projectAgent],
+			projectAgentsDir: null,
+		});
+
+		const tool = await TaskTool.create(
+			createSession("/tmp", { "task.disabledAgents": ["critic"] }, "executor,project_agent"),
+		);
+		const result = await tool.execute("tool-callable-agents", {
+			agent: "missing_agent",
+			tasks: [{ id: "One", description: "one", assignment: "Do it." }],
+		} as TaskParams);
+		const unknownText = getFirstText(result);
+
+		const syncResult = await tool.execute("tool-callable-agents-sync", {
+			agent: "missing_agent",
+			tasks: [],
+		} as TaskParams);
+		expect(getFirstText(syncResult)).toContain("Available: executor, project_agent");
+		expect(unknownText).toContain("Available: executor, project_agent");
+		for (const name of ["critic", "architect", "planner"]) {
+			expect(unknownText).not.toContain(name);
+		}
+	});
 	it("keeps hidden agents resolvable for direct task invocations", async () => {
 		const hidden: AgentDefinition = {
 			name: "support_agent",

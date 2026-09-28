@@ -192,10 +192,7 @@ describe("task.simple", () => {
 		);
 		const description = tool.description;
 
-		expect(description).toContain("# executor");
-		expect(description).toContain("# planner");
-		expect(description).not.toContain("# architect");
-		expect(description).not.toContain("# critic");
+		expect(description.match(/Bundled role names: ([^.]+)\./)?.[1].split(", ")).toEqual(["executor", "planner"]);
 	});
 	it("keeps IRC guidance stable when the IRC tool becomes available", async () => {
 		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({

@@ -117,6 +117,28 @@ describe("discoverable tool descriptions are stable across first load (#5992)", 
 		}
 	});
 
+	it("keeps parity when a project agent overrides a bundled role name", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-task-description-override-"));
+		try {
+			const agentsDir = path.join(cwd, ".gjc", "agents");
+			await fs.mkdir(agentsDir, { recursive: true });
+			await fs.writeFile(
+				path.join(agentsDir, "executor.md"),
+				"---\nname: executor\ndescription: Project-specific executor policy\n---\nYou handle project tasks.\n",
+			);
+			const observed = await descriptionBeforeAndAfterLoad("task", session({}, { cwd }));
+
+			expect(observed).toBeDefined();
+			expect(observed?.before).toBe(observed?.after);
+			expect(observed?.before).toContain("Bundled role names: executor, architect, planner, critic.");
+			expect(observed?.before).toContain(
+				"A configured agent may override a bundled role name and takes precedence.",
+			);
+			expect(observed?.before).not.toContain("Autonomous implementation agent for bounded code changes");
+		} finally {
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	});
 	it("keeps task description stable when irc becomes available", async () => {
 		let ircAvailable = false;
 		const toolSession = session(
