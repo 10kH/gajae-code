@@ -30,6 +30,17 @@ describe("formatGenericResponse nesting depth", () => {
 		}
 	});
 
+	it("bounds deep values reached through array items and leaf serialization", () => {
+		// Array item fields and scalar-position objects are serialized with
+		// JSON.stringify; 20000 levels exceed its recursion limit if unbounded.
+		const deep = nest(20_000);
+		for (const payload of [[{ title: "t", body: deep }], [deep], [[deep]]]) {
+			const output = formatGenericResponse(payload);
+			expect(output).toContain("[depth-limit]");
+		}
+		expect(formatGenericResponse([{ title: "t", body: { a: 1 } }])).toBe('\n### t\n- **body:** {"a":1}');
+	});
+
 	it("leaves payloads within the limit formatted exactly as before", () => {
 		expect(formatGenericResponse({ a: 1, b: "x" })).toBe("- **a:** 1\n- **b:** x");
 		expect(formatGenericResponse([1, 2, 3])).toBe("- 1\n- 2\n- 3");

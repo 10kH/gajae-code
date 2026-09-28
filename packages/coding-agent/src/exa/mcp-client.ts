@@ -212,10 +212,10 @@ export function formatGenericResponse(data: unknown, depth = 0): string {
 				parts.push(`\n### ${title}`);
 				for (const [k, v] of Object.entries(record)) {
 					if (["title", "name", "id"].includes(k)) continue;
-					parts.push(`- **${k}:** ${formatValue(v)}`);
+					parts.push(`- **${k}:** ${formatValue(v, depth + 2)}`);
 				}
 			} else {
-				parts.push(`- ${formatValue(item)}`);
+				parts.push(`- ${formatValue(item, depth + 1)}`);
 			}
 		}
 		return parts.join("\n");
@@ -243,7 +243,7 @@ export function formatGenericResponse(data: unknown, depth = 0): string {
 				const formatted = formatGenericResponse(v, depth + 1);
 				if (formatted) lines.push(`- **${k}:**\n${indent(formatted, 2)}`);
 			} else {
-				lines.push(`- **${k}:** ${formatValue(v)}`);
+				lines.push(`- **${k}:** ${formatValue(v, depth + 1)}`);
 			}
 		}
 		return lines.join("\n") || "(empty)";
@@ -252,10 +252,24 @@ export function formatGenericResponse(data: unknown, depth = 0): string {
 	return String(data);
 }
 
-function formatValue(v: unknown): string {
+function formatValue(v: unknown, depth: number): string {
 	if (v === null || v === undefined) return "—";
-	if (typeof v === "object") return JSON.stringify(v);
+	if (typeof v === "object") return JSON.stringify(truncateDepth(v, depth));
 	return String(v);
+}
+
+/**
+ * Copies a value, replacing anything nested past MAX_GENERIC_RESPONSE_DEPTH with
+ * "[depth-limit]", so JSON.stringify never recurses through a remote payload's
+ * unbounded structure.
+ */
+function truncateDepth(value: unknown, depth: number): unknown {
+	if (value === null || typeof value !== "object") return value;
+	if (depth > MAX_GENERIC_RESPONSE_DEPTH) return "[depth-limit]";
+	if (Array.isArray(value)) return value.map(item => truncateDepth(item, depth + 1));
+	const copy: Record<string, unknown> = {};
+	for (const [key, child] of Object.entries(value)) copy[key] = truncateDepth(child, depth + 1);
+	return copy;
 }
 
 function indent(text: string, spaces: number): string {
