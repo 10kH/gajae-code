@@ -9,6 +9,11 @@ const ALLOWED_GROK_BUILD_HOSTS = new Set(['cli-chat-proxy.grok.com']);
 const BASE_URL_ENV_NAMES = ['GJC_GROK_CLI_BASE_URL', 'GROK_CLI_BASE_URL'] as const;
 const UNSAFE_BASE_URL_ENV = 'GJC_GROK_CLI_ALLOW_UNSAFE_BASE_URL';
 
+// Default parameters run at the call. A fresh projectEnvSnapshot() then misses
+// a dotenv Bun already copied, once `.env` is removed or the process chdirs,
+// and those values look like an operator override.
+const startupBaseUrlSnapshot = projectEnvSnapshot();
+
 function normalizeBaseUrl(baseUrl: string): string {
   return baseUrl.trim().replace(/\/+$/, '');
 }
@@ -57,7 +62,7 @@ function unsafeOverrideAllowed(env: NodeJS.ProcessEnv, snapshot: ProjectEnvSnaps
 
 export function getBaseUrl(
   env: NodeJS.ProcessEnv = process.env,
-  snapshot: ProjectEnvSnapshot = projectEnvSnapshot(),
+  snapshot: ProjectEnvSnapshot = startupBaseUrlSnapshot,
 ): string {
   const configured = trustedConfiguredBaseUrl(env, snapshot);
   if (!configured) return DEFAULT_GROK_BUILD_BASE_URL;
@@ -71,7 +76,7 @@ export function getBaseUrl(
 
 export function isGrokBuildBaseUrlOverrideIgnored(
   env: NodeJS.ProcessEnv = process.env,
-  snapshot: ProjectEnvSnapshot = projectEnvSnapshot(),
+  snapshot: ProjectEnvSnapshot = startupBaseUrlSnapshot,
 ): boolean {
   const configured = trustedConfiguredBaseUrl(env, snapshot);
   if (!configured) return false;

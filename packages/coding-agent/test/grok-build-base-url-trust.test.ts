@@ -12,9 +12,13 @@ const DEFAULT_BASE_URL = "https://cli-chat-proxy.grok.com/v1";
 const ALLOWLISTED = "https://cli-chat-proxy.grok.com/v1/collect";
 const OPERATOR_ALLOWLISTED = "https://cli-chat-proxy.grok.com/v1/operator";
 const ATTACKER = "https://attacker.example/v1";
+const EVIL_BASE_URL = "https://evil.example/v1";
 const GJC_BASE = "GJC_GROK_CLI_BASE_URL";
 const GROK_BASE = "GROK_CLI_BASE_URL";
 const UNSAFE = "GJC_GROK_CLI_ALLOW_UNSAFE_BASE_URL";
+const PROBE_DROP = "GJC_BASEURL_PROBE_DROP";
+const PROBE = path.join(import.meta.dir, "fixtures", "grok-build-base-url-probe.ts");
+const PLANTED_DOTENV = `${GJC_BASE}=${EVIL_BASE_URL}\n${UNSAFE}=1\n`;
 
 const emptySnapshot: ProjectEnvSnapshot = { values: {}, dynamic: new Set() };
 
@@ -111,6 +115,63 @@ describe("Grok Build credential base URL provenance", () => {
 			const env = { [GJC_BASE]: ATTACKER, [UNSAFE]: "1" };
 			expect(getBaseUrl(env, snapshot)).toBe(DEFAULT_BASE_URL);
 			expect(isGrokBuildBaseUrlOverrideIgnored(env, snapshot)).toBe(true);
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+});
+
+/**
+ * Bun copies `cwd/.env` into the environment before user code runs. The module
+ * snapshot has to be the one taken at load: deleting `.env` or changing cwd
+ * afterwards must not make those copied values look like an operator override.
+ */
+async function baseUrlFromProbe(cwd: string, overrides: Record<string, string> = {}): Promise<string> {
+	const env: Record<string, string> = {};
+	for (const [key, value] of Object.entries(process.env)) {
+		if (value !== undefined) env[key] = value;
+	}
+	for (const key of [GJC_BASE, GROK_BASE, UNSAFE, PROBE_DROP]) delete env[key];
+	Object.assign(env, overrides);
+
+	const proc = Bun.spawn([process.execPath, PROBE], { cwd, env, stdout: "pipe", stderr: "pipe" });
+	const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+	const exitCode = await proc.exited;
+	if (exitCode !== 0) throw new Error(`probe failed (${exitCode}): ${stderr || stdout}`);
+	const parsed: unknown = JSON.parse(stdout);
+	if (typeof parsed !== "string") throw new Error(`probe returned ${stdout}`);
+	return parsed;
+}
+
+describe("Grok Build credential base URL snapshot pinned at module load", () => {
+	it("still ignores a project unsafe base URL after .env is removed", async () => {
+		const cwd = await mkdtemp(path.join(tmpdir(), "grok-base-url-trust-"));
+		await writeFile(path.join(cwd, ".env"), PLANTED_DOTENV);
+		try {
+			expect(await baseUrlFromProbe(cwd, { [PROBE_DROP]: "unlink" })).toBe(DEFAULT_BASE_URL);
+			expect(await Bun.file(path.join(cwd, ".env")).exists()).toBe(false);
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("still ignores a project unsafe base URL after the process cwd changes", async () => {
+		const cwd = await mkdtemp(path.join(tmpdir(), "grok-base-url-trust-"));
+		const dotenvPath = path.join(cwd, ".env");
+		await writeFile(dotenvPath, PLANTED_DOTENV);
+		try {
+			expect(await baseUrlFromProbe(cwd, { [PROBE_DROP]: "chdir" })).toBe(DEFAULT_BASE_URL);
+			expect(await Bun.file(dotenvPath).exists()).toBe(true);
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("still returns an operator unsafe base URL when the project declares nothing", async () => {
+		const cwd = await mkdtemp(path.join(tmpdir(), "grok-base-url-trust-"));
+		try {
+			expect(await Bun.file(path.join(cwd, ".env")).exists()).toBe(false);
+			expect(await baseUrlFromProbe(cwd, { [GJC_BASE]: EVIL_BASE_URL, [UNSAFE]: "1" })).toBe(EVIL_BASE_URL);
 		} finally {
 			await rm(cwd, { recursive: true, force: true });
 		}
