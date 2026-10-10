@@ -2,8 +2,10 @@ import { Buffer } from "node:buffer";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { canonicalEnvKey, projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import type { ManagedOwnerBinding, ManagedOwnerSigabrtReceipt } from "./managed-owner-supervisor";
 import { assertSafePathComponent } from "./session-layout";
+import { trustedCoordinatorEnv } from "./sidecar-bootstrap-env";
 import { lifecyclePaths } from "./tmux-owner-isolation";
 import {
 	persistUltragoalRecoveryDecision,
@@ -23,6 +25,38 @@ export const MANAGED_OWNER_PREDECESSOR_GENERATION_ENV = "GJC_MANAGED_OWNER_PREDE
 export const MANAGED_OWNER_PREDECESSOR_RUN_ID_ENV = "GJC_MANAGED_OWNER_PREDECESSOR_RUN_ID";
 export const MANAGED_OWNER_PREDECESSOR_INCARNATION_ENV = "GJC_MANAGED_OWNER_PREDECESSOR_INCARNATION";
 export const MANAGED_OWNER_TRANSCRIPT_PATH_ENV = "GJC_MANAGED_OWNER_TRANSCRIPT_PATH";
+const MANAGED_OWNER_SESSION_FILE_ENV = "GJC_SESSION_FILE";
+
+/**
+ * Operator environment only. A project dotenv value, including a dynamic
+ * declaration, must not choose the recovery transcript. A static
+ * `GJC_SESSION_FILE` declaration is the same source: the launcher copies it
+ * into the transcript variable.
+ */
+export function trustedManagedOwnerTranscriptPath(env: NodeJS.ProcessEnv = process.env, cwd = process.cwd()): string {
+	const snapshot = projectEnvSnapshot(cwd);
+	const trusted = trustedCoordinatorEnv(MANAGED_OWNER_TRANSCRIPT_PATH_ENV, env, snapshot);
+	if (!trusted) return "";
+	const sessionKey = canonicalEnvKey(MANAGED_OWNER_SESSION_FILE_ENV);
+	if (snapshot.dynamic.has(sessionKey)) return trusted;
+	const declared = snapshot.values[sessionKey];
+	if (declared !== undefined && (trusted === declared || env[MANAGED_OWNER_TRANSCRIPT_PATH_ENV] === declared))
+		return "";
+	return trusted;
+}
+
+/** Session file forwarded to a replacement child. Same provenance rule. */
+export function trustedManagedOwnerLaunchSessionFile(env: NodeJS.ProcessEnv, cwd: string): string {
+	const raw = env[MANAGED_OWNER_SESSION_FILE_ENV];
+	if (!raw) return "";
+	return (
+		trustedCoordinatorEnv(
+			MANAGED_OWNER_SESSION_FILE_ENV,
+			{ [MANAGED_OWNER_SESSION_FILE_ENV]: raw },
+			projectEnvSnapshot(cwd),
+		) ?? ""
+	);
+}
 
 export interface ManagedOwnerRecoveryContext {
 	root: string;
@@ -295,7 +329,7 @@ export async function admitManagedOwnerBeforeCli(): Promise<ManagedOwnerAdmissio
 		},
 		receipt,
 		admission,
-		transcriptPath: process.env[MANAGED_OWNER_TRANSCRIPT_PATH_ENV] ?? "",
+		transcriptPath: trustedManagedOwnerTranscriptPath(),
 	});
 	await persistUltragoalRecoveryDecision({
 		cwd: process.cwd(),
@@ -330,7 +364,7 @@ export async function completeManagedOwnerRecovery(
 		binding: recoveryBinding,
 		receipt: context.receipt,
 		admission: context.admission,
-		transcriptPath: process.env[MANAGED_OWNER_TRANSCRIPT_PATH_ENV] ?? "",
+		transcriptPath: trustedManagedOwnerTranscriptPath(),
 		protectedPaths: context.decision.snapshot?.protectedPaths,
 		sanctionedDeltas: context.decision.snapshot?.sanctionedDeltas,
 		absentArtifacts: context.decision.snapshot?.absentArtifacts,
