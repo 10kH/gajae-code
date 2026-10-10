@@ -9003,8 +9003,11 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			expect(await harness.query("turn.prompt_status", queuedIds)).toMatchObject({ result: { status: "accepted" } });
 			expect(abortCalls).toBe(0);
 			expect(correlatedFrames(harness, queuedIds).filter(frame => frame.kind === "agent_failed")).toHaveLength(0);
-			promoted?.({ startsOwnRun: true });
+			// The lease is captured when the follow-up is promoted, not when the
+			// setting later changes. Restore the long deadline first so this run
+			// does not inherit the 100ms queue probe and expire under settledStatus.
 			promptDeadlineMs = 600_000;
+			promoted?.({ startsOwnRun: true });
 			await Bun.sleep(150);
 			expect((await harness.query("turn.prompt_status", queuedIds)).result?.status).toMatch(/accepted|in_flight/);
 			expect(await harness.query("turn.prompt_status", activeIds)).toMatchObject({
