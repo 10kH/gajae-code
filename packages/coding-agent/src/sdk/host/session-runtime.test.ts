@@ -8538,7 +8538,18 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		const sessionId = "deadline-captured-uncertain";
 		const sessionFile = path.join(cwd, ".gjc", "state", `${sessionId}.jsonl`);
 		await Bun.write(sessionFile, "");
-		const store = createReconciliationStore({ sessionFile, sessionId });
+		// Chain-level evidence for the CI-only hang: every serialized store op
+		// (including the terminal variants the runtime persistence log cannot see).
+		const storeLog: string[] = [];
+		const store = createReconciliationStore({
+			sessionFile,
+			sessionId,
+			onInstrumentationForTests: event => {
+				storeLog.push(
+					`${event.at}:${event.phase}:${event.operation ?? ""}:${event.substep ?? ""}:${event.detail ?? ""}${event.error ? `:${event.error}` : ""}`,
+				);
+			},
+		});
 		const activeTools = new Set(["unfenced-tool"]);
 		const toolDrainObserved = Promise.withResolvers<void>();
 		const recoveryCheckpoints: SdkOnlyDeadlineRecoveryCheckpoint[] = [];
@@ -8634,7 +8645,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 					  })
 					| undefined;
 				throw new Error(
-					`${error instanceof Error ? error.message : String(error)}; persistence_log=${JSON.stringify(persistenceLog)}; deadline checkpoints=${JSON.stringify(recoveryCheckpoints)}; durable=${JSON.stringify(
+					`${error instanceof Error ? error.message : String(error)}; persistence_log=${JSON.stringify(persistenceLog)}; store_log=${JSON.stringify(storeLog)}; deadline checkpoints=${JSON.stringify(recoveryCheckpoints)}; durable=${JSON.stringify(
 						{
 							status: finalRecord?.status,
 							terminalAt: finalRecord?.terminalAt,
