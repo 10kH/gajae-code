@@ -1,11 +1,11 @@
-// Prints the base URL `registerGrokCli` stores on the grok-build provider.
-// Spawned with a controlled cwd so a planted project `.env` is what Bun loads.
-// Import first so the module snapshot is taken before `.env` is removed or the
-// process changes directory. Registration is the production entry: `register.ts`
-// and `billing.ts` both call `getBaseUrl()` with no arguments.
+// Prints the base URL registered for grok-build, and whether an unsafe override
+// was ignored. Import first so `$credentialEnv` snapshots cwd dotenv before
+// `.env` is removed or the process changes directory. `register.ts` and
+// `billing.ts` both call `getBaseUrl()` with no arguments.
 import * as fs from "node:fs";
 import * as os from "node:os";
 import registerGrokCli from "../../src/defaults/gjc/extensions/grok-cli-vendor/src/provider/register";
+import { isGrokBuildBaseUrlOverrideIgnored } from "../../src/defaults/gjc/extensions/grok-cli-vendor/src/shared/base-url";
 
 const drop = process.env.GJC_BASEURL_PROBE_DROP;
 if (drop === "unlink") {
@@ -23,4 +23,4 @@ registerGrokCli({
 	on() {},
 } as never);
 
-console.log(JSON.stringify(registeredBaseUrl));
+console.log(JSON.stringify({ baseUrl: registeredBaseUrl, ignored: isGrokBuildBaseUrlOverrideIgnored() }));
