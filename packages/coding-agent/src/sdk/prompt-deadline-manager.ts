@@ -869,6 +869,7 @@ export class PromptDeadlineManager {
 		this.#terminalPublicationPending.delete(key);
 		this.#pendingTerminalFailureReasons.delete(key);
 		this.#pendingTerminalEvidence.delete(key);
+		this.#toolsStillPendingOnLastCheck.delete(key);
 	}
 
 	clearAll(): void {
@@ -891,6 +892,7 @@ export class PromptDeadlineManager {
 		this.#terminalPublicationPending.clear();
 		this.#pendingTerminalFailureReasons.clear();
 		this.#pendingTerminalEvidence.clear();
+		this.#toolsStillPendingOnLastCheck.clear();
 	}
 
 	/** For tests: current deadline or undefined if no lease. */
