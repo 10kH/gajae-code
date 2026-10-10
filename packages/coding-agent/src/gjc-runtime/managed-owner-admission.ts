@@ -2,7 +2,7 @@ import { Buffer } from "node:buffer";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { canonicalEnvKey, projectEnvSnapshot } from "@gajae-code/utils/env-file";
+import { canonicalEnvKey, type ProjectEnvSnapshot, projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import type { ManagedOwnerBinding, ManagedOwnerSigabrtReceipt } from "./managed-owner-supervisor";
 import { assertSafePathComponent } from "./session-layout";
 import { trustedCoordinatorEnv } from "./sidecar-bootstrap-env";
@@ -31,30 +31,40 @@ const MANAGED_OWNER_SESSION_FILE_ENV = "GJC_SESSION_FILE";
  * Operator environment only. A project dotenv value, including a dynamic
  * declaration, must not choose the recovery transcript. A static
  * `GJC_SESSION_FILE` declaration is the same source: the launcher copies it
- * into the transcript variable.
+ * into the transcript variable. The operator bytes are kept, including
+ * surrounding whitespace; provenance is not path normalization.
  */
+function operatorOwnedEnvValue(name: string, raw: string | undefined, snapshot: ProjectEnvSnapshot): string {
+	if (!raw) return "";
+	const key = canonicalEnvKey(name);
+	const declared = snapshot.values[key];
+	if (declared !== undefined && (snapshot.dynamic.has(key) || declared === raw)) return "";
+	const verdict = trustedCoordinatorEnv(name, { [name]: raw }, snapshot);
+	if (verdict === undefined && raw.trim().length > 0) return "";
+	return raw;
+}
+
 export function trustedManagedOwnerTranscriptPath(env: NodeJS.ProcessEnv = process.env, cwd = process.cwd()): string {
 	const snapshot = projectEnvSnapshot(cwd);
-	const trusted = trustedCoordinatorEnv(MANAGED_OWNER_TRANSCRIPT_PATH_ENV, env, snapshot);
-	if (!trusted) return "";
+	const raw = operatorOwnedEnvValue(
+		MANAGED_OWNER_TRANSCRIPT_PATH_ENV,
+		env[MANAGED_OWNER_TRANSCRIPT_PATH_ENV],
+		snapshot,
+	);
+	if (!raw) return "";
 	const sessionKey = canonicalEnvKey(MANAGED_OWNER_SESSION_FILE_ENV);
-	if (snapshot.dynamic.has(sessionKey)) return trusted;
+	if (snapshot.dynamic.has(sessionKey)) return raw;
 	const declared = snapshot.values[sessionKey];
-	if (declared !== undefined && (trusted === declared || env[MANAGED_OWNER_TRANSCRIPT_PATH_ENV] === declared))
-		return "";
-	return trusted;
+	if (declared !== undefined && raw === declared) return "";
+	return raw;
 }
 
 /** Session file forwarded to a replacement child. Same provenance rule. */
 export function trustedManagedOwnerLaunchSessionFile(env: NodeJS.ProcessEnv, cwd: string): string {
-	const raw = env[MANAGED_OWNER_SESSION_FILE_ENV];
-	if (!raw) return "";
-	return (
-		trustedCoordinatorEnv(
-			MANAGED_OWNER_SESSION_FILE_ENV,
-			{ [MANAGED_OWNER_SESSION_FILE_ENV]: raw },
-			projectEnvSnapshot(cwd),
-		) ?? ""
+	return operatorOwnedEnvValue(
+		MANAGED_OWNER_SESSION_FILE_ENV,
+		env[MANAGED_OWNER_SESSION_FILE_ENV],
+		projectEnvSnapshot(cwd),
 	);
 }
 

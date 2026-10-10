@@ -11,7 +11,10 @@ import {
 	trustedManagedOwnerTranscriptPath,
 } from "@gajae-code/coding-agent/gjc-runtime/managed-owner-admission";
 import { sessionStateDir, sessionUltragoalDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
-import { lifecyclePaths } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
+import {
+	lifecyclePaths,
+	type OwnerIsolationProbeSync,
+} from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
 
 const recoveryReads = process.platform === "linux";
 const sessionId = "session-2681";
@@ -40,6 +43,12 @@ describe("managed owner transcript provenance", () => {
 			);
 			expect(trustedManagedOwnerLaunchSessionFile({ GJC_SESSION_FILE: "operator.jsonl" }, cwd)).toBe(
 				"operator.jsonl",
+			);
+			expect(trustedManagedOwnerTranscriptPath({ GJC_MANAGED_OWNER_TRANSCRIPT_PATH: "operator.jsonl " }, cwd)).toBe(
+				"operator.jsonl ",
+			);
+			expect(trustedManagedOwnerLaunchSessionFile({ GJC_SESSION_FILE: "operator.jsonl " }, cwd)).toBe(
+				"operator.jsonl ",
 			);
 		} finally {
 			await fsp.rm(cwd, { recursive: true, force: true });
@@ -249,6 +258,26 @@ async function admit(
 	};
 }
 
+function absentThenSafeOwnerProbe(): OwnerIsolationProbeSync {
+	let serverCreated = false;
+	return {
+		readCallerCgroup: () => "0::/user.slice/user-1000.slice/user@1000.service/app.slice/gjc.scope\n",
+		probeServer: () => {
+			if (!serverCreated) {
+				serverCreated = true;
+				return { state: "absent" };
+			}
+			return {
+				state: "safe",
+				pid: 123,
+				startTime: "42",
+				cgroup: { classification: "safe" },
+			};
+		},
+		recordAttempt: () => {},
+	};
+}
+
 function launchReplacement(root: string, sessionEnv: Record<string, string>): string {
 	const sessionName = "replacement-session";
 	fs.rmSync(path.join(root, sessionName), { recursive: true, force: true });
@@ -295,6 +324,7 @@ function launchReplacement(root: string, sessionEnv: Record<string, string>): st
 		tty: { stdin: true, stdout: true },
 		tmuxAvailable: true,
 		existingBranchSessionName: null,
+		ownerIsolationProbe: absentThenSafeOwnerProbe(),
 		spawnSync: (_command, spawnArgs) => {
 			calls.push(spawnArgs);
 			return { exitCode: 0, stdout: "$0" };
