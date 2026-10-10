@@ -37,6 +37,7 @@ import {
 	type ToolChoice,
 	type Usage,
 } from "@gajae-code/ai";
+import { $credentialEnv } from "@gajae-code/utils";
 import { isDesignedError } from "@gajae-code/utils/error-classification";
 import { recordHandledError } from "@gajae-code/utils/postmortem";
 import {
@@ -345,9 +346,11 @@ export interface AgentTelemetryConfig {
 	 * truncated to bounded snippets, not removed. `"full"` emits both summaries
 	 * and full OTEL message payloads.
 	 *
-	 * Defaults to the value of the `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT`
-	 * env var (`true`/`1`/`yes` => `"summary"`, `"summary"` => `"summary"`,
-	 * `"full"` => `"full"`). Env-driven `"full"` capture emits a
+	 * Defaults to the trusted value of
+	 * `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT`
+	 * (`true`/`1`/`yes` => `"summary"`, `"summary"` => `"summary"`,
+	 * `"full"` => `"full"`). A project `.env` cannot select this default.
+	 * Env-driven `"full"` capture emits a
 	 * `full_content_capture_env_active` telemetry warning once per process.
 	 */
 	readonly captureMessageContent?: TelemetryContentCapture;
@@ -459,7 +462,10 @@ let contentCaptureEnvCache: ResolvedTelemetryContentCapture | undefined;
 let hasWarnedFullContentCaptureEnv = false;
 function readContentCaptureEnv(): ResolvedTelemetryContentCapture {
 	if (contentCaptureEnvCache !== undefined) return contentCaptureEnvCache;
-	const raw = process.env[CONTENT_CAPTURE_ENV];
+	// `$credentialEnv` ignores a cwd `.env` value, including one Bun or the
+	// product env merge already copied into the process environment. An
+	// operator value the project does not declare still applies.
+	const raw = $credentialEnv(CONTENT_CAPTURE_ENV);
 	if (!raw) {
 		contentCaptureEnvCache = "none";
 		return "none";
