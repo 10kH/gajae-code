@@ -676,6 +676,8 @@ export interface ReconciliationStoreInstrumentationEvent {
 	operation?: string;
 	substep?: string;
 	error?: string;
+	/** Detailed information about lock acquisition, promise identity, db state, etc. */
+	detail?: string;
 }
 
 export function createReconciliationStore(options: {
@@ -843,12 +845,25 @@ export function createReconciliationStore(options: {
 	const transact = async (
 		mutator: (records: DurableReconciliationRecord[]) => DurableReconciliationRecord[],
 	): Promise<void> => {
+		const promiseId = `reconcil-transact-${randomUUID().slice(0, 8)}`;
+		const enqueueTime = Date.now();
 		const run = async () => {
+			const lockWaitMs = Date.now() - enqueueTime;
 			try {
-				options.onInstrumentationForTests?.({ at: Date.now(), phase: "enqueued", operation: "transact" });
+				options.onInstrumentationForTests?.({
+					at: enqueueTime,
+					phase: "enqueued",
+					operation: "transact",
+					detail: `promise=${promiseId}`,
+				});
 			} catch {}
 			try {
-				options.onInstrumentationForTests?.({ at: Date.now(), phase: "started", operation: "transact" });
+				options.onInstrumentationForTests?.({
+					at: Date.now(),
+					phase: "started",
+					operation: "transact",
+					detail: `promise=${promiseId} lock-wait=${lockWaitMs}ms`,
+				});
 			} catch {}
 			const next = mutator(memory.map(r => ({ ...r })));
 			await writeAtomic({
@@ -860,7 +875,12 @@ export function createReconciliationStore(options: {
 			});
 			memory = next;
 			try {
-				options.onInstrumentationForTests?.({ at: Date.now(), phase: "completed", operation: "transact" });
+				options.onInstrumentationForTests?.({
+					at: Date.now(),
+					phase: "completed",
+					operation: "transact",
+					detail: `promise=${promiseId}`,
+				});
 			} catch {}
 		};
 		const pending = chain.then(run, run);
@@ -877,6 +897,7 @@ export function createReconciliationStore(options: {
 					at: Date.now(),
 					phase: "failed",
 					operation: "transact",
+					detail: `promise=${promiseId} lock-wait=${Date.now() - enqueueTime}ms`,
 					error: error instanceof Error ? error.message : String(error),
 				});
 			} catch {}

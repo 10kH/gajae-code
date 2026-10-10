@@ -103,6 +103,7 @@ import {
 	createKindAwareReconciliation,
 	createReconciliationStore,
 	type KindAwareReconciliation,
+	type ReconciliationStoreInstrumentationEvent,
 	resolveReconciliationSessionFile,
 } from "../reconciliation-extensions";
 import {
@@ -1060,6 +1061,10 @@ export interface PersistenceInstrumentationEvent {
 	operation?: string;
 	substep?: string;
 	error?: string;
+	/** Detailed information about lock acquisition, promise identity, db state, etc. */
+	detail?: string;
+	/** Time spent waiting (ms) before the operation started. */
+	waitMs?: number;
 }
 
 export function createInvocationReconciliation(
@@ -1150,22 +1155,40 @@ export function createInvocationReconciliation(
 			// map has already converged.
 			const snapshot = [...records.values()].map(record => ({ ...record }));
 			if (store) {
+				const promiseId = `transact-${crypto.randomUUID().slice(0, 8)}`;
+				const lockWaitStart = Date.now();
 				try {
 					options.onPersistenceInstrumentationForTests?.({
-						at: Date.now(),
+						at: lockWaitStart,
 						phase: "started",
 						operation: "store.transact",
+						detail: `promise=${promiseId} awaiting-lock`,
 					});
 				} catch {}
-				await store.transact(current => [
-					...current.filter(record => record.kind !== "prompt" && record.kind !== "skill"),
-					...snapshot.map(record => ({ ...record })),
-				]);
+				const lockAcquiredTime = Date.now();
+				try {
+					await store.transact(current => [
+						...current.filter(record => record.kind !== "prompt" && record.kind !== "skill"),
+						...snapshot.map(record => ({ ...record })),
+					]);
+				} catch (error) {
+					try {
+						options.onPersistenceInstrumentationForTests?.({
+							at: Date.now(),
+							phase: "failed",
+							operation: "store.transact",
+							detail: `promise=${promiseId} lock-wait=${Date.now() - lockWaitStart}ms`,
+							error: error instanceof Error ? error.message : String(error),
+						});
+					} catch {}
+					throw error;
+				}
 				try {
 					options.onPersistenceInstrumentationForTests?.({
 						at: Date.now(),
 						phase: "completed",
 						operation: "store.transact",
+						detail: `promise=${promiseId} lock-acquire=${lockAcquiredTime - lockWaitStart}ms`,
 					});
 				} catch {}
 				return;
@@ -6583,9 +6606,20 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			(typeof ctx.sessionManager.getSessionFile === "function" ? ctx.sessionManager.getSessionFile() : undefined) ??
 			resolveReconciliationSessionFile(undefined, stateRoot, sessionId);
 		const sessionIdentity = `${sessionId}\u0000${sessionFile}`;
+		const reconciliationInstrumentation = options.terminalAbortSeams?.onPersistenceInstrumentationForTests
+			? (event: ReconciliationStoreInstrumentationEvent) => {
+					try {
+						options.terminalAbortSeams?.onPersistenceInstrumentationForTests?.(event as never);
+					} catch {}
+				}
+			: undefined;
 		const reconciliationStore =
 			options.terminalAbortSeams?.getReconciliationStore?.() ??
-			createReconciliationStore({ sessionFile, sessionId });
+			createReconciliationStore({
+				sessionFile,
+				sessionId,
+				onInstrumentationForTests: reconciliationInstrumentation,
+			});
 		const reconciliation = createInvocationReconciliation({
 			store: reconciliationStore,
 			onDeadlineRecoveryCheckpointForTests: options.terminalAbortSeams?.onDeadlineRecoveryCheckpointForTests,
