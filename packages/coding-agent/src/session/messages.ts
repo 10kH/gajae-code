@@ -234,11 +234,11 @@ export function createPreAdmissionArtifactSpillPreview(
 ): string {
 	const source = redact ? redact(fullText) : fullText;
 	const totalBytes = Buffer.byteLength(source, "utf-8");
-	const retained = retainStraddlingPlaceholders(
-		source,
-		utf8Prefix(source, PRE_ADMISSION_ARTIFACT_SPILL_HEAD_BYTES),
-		utf8Suffix(source, PRE_ADMISSION_ARTIFACT_SPILL_TAIL_BYTES),
-	);
+	const head = utf8Prefix(source, PRE_ADMISSION_ARTIFACT_SPILL_HEAD_BYTES);
+	const tail = utf8Suffix(source, PRE_ADMISSION_ARTIFACT_SPILL_TAIL_BYTES);
+	// Without redaction the cut stays on the historical byte limits, including
+	// when the tool text itself contains a placeholder-shaped string.
+	const retained = redact ? retainStraddlingPlaceholders(source, head, tail) : { head, tail };
 	const retainedBytes = Buffer.byteLength(retained.head, "utf-8") + Buffer.byteLength(retained.tail, "utf-8");
 	const omittedBytes = Math.max(0, totalBytes - retainedBytes);
 	const receipt = `[${omittedBytes} bytes omitted; sha256:${digest}; full output: artifact://${artifactId}]`;

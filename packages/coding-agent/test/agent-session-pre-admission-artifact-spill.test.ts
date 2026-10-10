@@ -529,4 +529,91 @@ describe("AgentSession pre-admission artifact spill", () => {
 		},
 		{ timeout: 60_000 },
 	);
+
+	it(
+		"keeps the 4096-byte spill cut when secrets are off and the text contains a placeholder",
+		async () => {
+			const token = `#GJC1_${"A".repeat(22)}#`;
+			const bodyBytes = 65_536;
+			const offset = 4096 - 6;
+			if (offset + token.length > bodyBytes) throw new Error("placeholder does not fit in the tool result");
+			const fullText = `${"x".repeat(offset)}${token}${"x".repeat(bodyBytes - offset - token.length)}`;
+			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+			if (!model) throw new Error("Expected bundled Anthropic model");
+
+			tempDir = TempDir.createSync("@gjc-spill-no-secret-placeholder-");
+			authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+			authStorage.setRuntimeApiKey("anthropic", "test-key");
+			let providerContext: Context | undefined;
+			let sessionRef: AgentSession | undefined;
+			const agent = new Agent({
+				initialState: {
+					model: { ...model, contextWindow: 200_000, maxTokens: 128_000 },
+					systemPrompt: ["Test"],
+					tools: [],
+					messages: [],
+				},
+				transformContext: async messages => {
+					await sessionRef?.awaitPendingContextTransformations();
+					return messages;
+				},
+				streamFn: (_model, context) => {
+					providerContext = context;
+					const stream = new AssistantMessageEventStream();
+					queueMicrotask(() => {
+						const message: AssistantMessage = {
+							role: "assistant",
+							content: [{ type: "text", text: "done" }],
+							api: "anthropic-messages",
+							provider: "anthropic",
+							model: "claude-sonnet-4-5",
+							stopReason: "stop",
+							usage: {
+								input: 0,
+								output: 0,
+								cacheRead: 0,
+								cacheWrite: 0,
+								totalTokens: 0,
+								cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+							},
+							timestamp: Date.now(),
+						};
+						stream.push({ type: "start", partial: message });
+						stream.push({ type: "done", reason: "stop", message });
+					});
+					return stream;
+				},
+			});
+			const sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
+			sessionManager.appendMessage({ role: "user", content: "seed", timestamp: Date.now() });
+			session = new AgentSession({
+				agent,
+				sessionManager,
+				settings: Settings.isolated({ "tools.preAdmissionArtifactSpill": true }),
+				modelRegistry: new ModelRegistry(authStorage),
+			});
+			sessionRef = session;
+			agent.emitExternalEvent({
+				type: "message_end",
+				message: {
+					role: "toolResult",
+					toolCallId: "placeholder-shaped",
+					toolName: "read",
+					content: [{ type: "text", text: fullText }],
+					isError: false,
+					timestamp: Date.now(),
+				},
+			});
+			await withTimeout(session.prompt("continue"), 5_000, "placeholder-shaped spill did not reach the provider");
+			if (!providerContext) throw new Error("placeholder-shaped spill did not capture a provider context");
+			const request = JSON.stringify(providerContext.messages);
+			const receiptAt = request.indexOf("\\n\\n[");
+			if (receiptAt < 0) throw new Error("spill receipt is missing from the provider context");
+			const head = request.slice(receiptAt - 4096, receiptAt);
+			expect(head).toBe(fullText.slice(0, 4096));
+			expect(request).toContain("57344 bytes omitted");
+			expect(request).not.toContain(token);
+		},
+		{ timeout: 30_000 },
+	);
 });
