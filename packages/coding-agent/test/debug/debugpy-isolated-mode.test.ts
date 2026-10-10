@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import * as piUtils from "@gajae-code/utils";
 import { TempDir } from "@gajae-code/utils";
@@ -19,6 +20,33 @@ function sessionFor(cwd: string): ToolSession {
 		getSessionSpawns: () => "*",
 		settings: Settings.isolated({ "debug.enabled": true }),
 	};
+}
+
+async function exitCode(command: string[], cwd?: string): Promise<number> {
+	const child = Bun.spawn(command, { cwd, stdout: "ignore", stderr: "pipe" });
+	return child.exited;
+}
+
+async function interpreterWithDebugpy(python3: string): Promise<string | null> {
+	if ((await exitCode([python3, "-I", "-c", "import debugpy"])) === 0) return python3;
+	const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "debugpy-site-"));
+	const venv = path.join(root, "venv");
+	if ((await exitCode([python3, "-m", "venv", venv])) !== 0) return null;
+	const python = path.join(venv, "bin", "python");
+	if ((await exitCode([python, "-m", "pip", "install", "--disable-pip-version-check", "debugpy"])) !== 0) {
+		return null;
+	}
+	if ((await exitCode([python, "-I", "-c", "import debugpy"])) !== 0) return null;
+	return python;
+}
+
+const DEBUGPY_PYTHON = PYTHON3 ? await interpreterWithDebugpy(PYTHON3) : null;
+
+function resultText(result: { content?: Array<{ type?: string; text?: string }> }): string {
+	return (result.content ?? [])
+		.filter(part => part.type === "text" && typeof part.text === "string")
+		.map(part => part.text)
+		.join("\n");
 }
 
 afterEach(async () => {
@@ -48,8 +76,8 @@ describe("debugpy adapter isolated mode", () => {
 			const tool = new DebugTool(sessionFor(repo));
 			const selected = selectLaunchAdapter(path.join(repo, "app.py"), repo, "debugpy");
 			expect(selected?.resolvedCommand).toBe(python3);
-			expect(selected?.args.slice(0, 3)).toEqual(["-I", "-m", "debugpy.adapter"]);
 
+			let launchError: unknown;
 			try {
 				await tool.execute("call-debugpy-module", {
 					action: "launch",
@@ -58,11 +86,43 @@ describe("debugpy adapter isolated mode", () => {
 					timeout: 5,
 				});
 			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
-				expect(message).not.toMatch(/No debugger adapter available/);
+				launchError = error;
 			}
 			expect(fs.existsSync(marker)).toBe(false);
+			if (launchError) {
+				const message = launchError instanceof Error ? launchError.message : String(launchError);
+				expect(message).not.toMatch(/No debugger adapter available/);
+			}
+			expect(selected?.args.slice(0, 3)).toEqual(["-I", "-m", "debugpy.adapter"]);
 		},
 		20_000,
+	);
+
+	it.skipIf(!DEBUGPY_PYTHON)(
+		"still launches an interpreter-installed debugpy when the project has no debugpy package (skipped when that interpreter cannot be prepared)",
+		async () => {
+			if (!DEBUGPY_PYTHON) throw new Error("debugpy interpreter is absent");
+			const python = DEBUGPY_PYTHON;
+			using tempDir = TempDir.createSync("@gjc-dap-debugpy-installed-");
+			const repo = path.join(tempDir.path(), "repo");
+			await fs.promises.mkdir(path.join(repo, ".git"), { recursive: true });
+			await Bun.write(path.join(repo, "pyproject.toml"), "[project]\nname = 'example'\n");
+			await Bun.write(path.join(repo, "app.py"), "print(1)\n");
+			vi.spyOn(piUtils, "$which").mockImplementation(command => (command === "python" ? python : null));
+			const tool = new DebugTool(sessionFor(repo));
+			const selected = selectLaunchAdapter(path.join(repo, "app.py"), repo, "debugpy");
+			expect(selected?.resolvedCommand).toBe(python);
+
+			const launched = await tool.execute("call-debugpy-installed", {
+				action: "launch",
+				program: "app.py",
+				adapter: "debugpy",
+				timeout: 20,
+			});
+			const text = resultText(launched);
+			expect(text).toContain("Adapter: debugpy");
+			expect(text).toMatch(/Status: (stopped|running|configuring)/);
+		},
+		30_000,
 	);
 });
