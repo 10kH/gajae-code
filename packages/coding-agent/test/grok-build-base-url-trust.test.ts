@@ -208,4 +208,24 @@ describe("Grok Build credential base URL snapshot pinned at module load", () => 
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
+
+	it("ignores a quoted project URL and unsafe opt-in when text follows the closing quote", async () => {
+		const cwd = await mkdtemp(path.join(tmpdir(), "grok-base-url-trust-"));
+		await writeFile(path.join(cwd, ".env"), `${GJC_BASE}="${EVIL_BASE_URL}" ignored\n${UNSAFE}="1" ignored\n`);
+		try {
+			expect(await baseUrlFromProbe(cwd)).toBe(DEFAULT_BASE_URL);
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("ignores an allowlisted project URL whose double-quoted escapes keep a backslash pair", async () => {
+		const cwd = await mkdtemp(path.join(tmpdir(), "grok-base-url-trust-"));
+		await writeFile(path.join(cwd, ".env"), `${GJC_BASE}="${ALLOWLISTED}\\\\n\\n"\n`);
+		try {
+			expect(await baseUrlFromProbe(cwd)).toBe(DEFAULT_BASE_URL);
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
 });
