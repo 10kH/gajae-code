@@ -119,6 +119,18 @@ describe("Grok Build credential base URL provenance", () => {
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
+
+	it("ignores a double-quoted project URL whose escapes Bun already decoded", async () => {
+		const { cwd, snapshot } = await snapshotFromEnv(`${GJC_BASE}="${ALLOWLISTED}\\n"\n`);
+		try {
+			expect(snapshot.values[GJC_BASE]).toBe(`${ALLOWLISTED}\\n`);
+			const decoded = `${ALLOWLISTED}\n`;
+			expect(getBaseUrl({ [GJC_BASE]: decoded }, snapshot)).toBe(DEFAULT_BASE_URL);
+			expect(isGrokBuildBaseUrlOverrideIgnored({ [GJC_BASE]: decoded }, snapshot)).toBe(false);
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
 });
 
 /**
@@ -172,6 +184,26 @@ describe("Grok Build credential base URL snapshot pinned at module load", () => 
 		try {
 			expect(await Bun.file(path.join(cwd, ".env")).exists()).toBe(false);
 			expect(await baseUrlFromProbe(cwd, { [GJC_BASE]: EVIL_BASE_URL, [UNSAFE]: "1" })).toBe(EVIL_BASE_URL);
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("ignores a double-quoted allowlisted project URL after Bun decodes the escape", async () => {
+		const cwd = await mkdtemp(path.join(tmpdir(), "grok-base-url-trust-"));
+		await writeFile(path.join(cwd, ".env"), `${GJC_BASE}="${ALLOWLISTED}\\n"\n`);
+		try {
+			expect(await baseUrlFromProbe(cwd)).toBe(DEFAULT_BASE_URL);
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("ignores an attacker base URL declared only in .env.local", async () => {
+		const cwd = await mkdtemp(path.join(tmpdir(), "grok-base-url-trust-"));
+		await writeFile(path.join(cwd, ".env.local"), PLANTED_DOTENV);
+		try {
+			expect(await baseUrlFromProbe(cwd, { NODE_ENV: "production" })).toBe(DEFAULT_BASE_URL);
 		} finally {
 			await rm(cwd, { recursive: true, force: true });
 		}

@@ -28,9 +28,37 @@ function isAllowedCredentialHost(baseUrl: string): boolean {
 }
 
 /**
+ * Bun turns `\n` and `\r` inside double-quoted dotenv values into control
+ * characters before they reach `process.env`. The project snapshot keeps the
+ * source text, so a literal compare misses that rewrite. `normalizeBaseUrl`
+ * then trims the decoded newline and can accept the project URL as an
+ * operator override on the allowlisted host.
+ */
+function unescapeProjectDotenvControls(value: string): string {
+  let decoded = '';
+  for (let index = 0; index < value.length; index++) {
+    const current = value[index];
+    const next = value[index + 1];
+    if (current === '\\' && next === 'n') {
+      decoded += '\n';
+      index++;
+      continue;
+    }
+    if (current === '\\' && next === 'r') {
+      decoded += '\r';
+      index++;
+      continue;
+    }
+    decoded += current ?? '';
+  }
+  return decoded;
+}
+
+/**
  * A cwd dotenv value is not an operator override. Matching declarations are
- * ambiguous with Bun's overlay, and dynamic declarations are refused outright
- * because expansion can hide the text the project file supplied.
+ * ambiguous with Bun's overlay, including the control characters Bun decodes
+ * from double quotes. Dynamic declarations are refused outright because
+ * expansion can hide the text the project file supplied.
  */
 function trustedEnvValue(
   name: string,
@@ -41,7 +69,14 @@ function trustedEnvValue(
   if (!raw) return undefined;
   const key = canonicalEnvKey(name);
   const declared = snapshot.values[key];
-  if (declared !== undefined && (snapshot.dynamic.has(key) || declared === raw)) return undefined;
+  if (
+    declared !== undefined &&
+    (snapshot.dynamic.has(key) ||
+      declared === raw ||
+      unescapeProjectDotenvControls(declared) === raw)
+  ) {
+    return undefined;
+  }
   return raw;
 }
 
