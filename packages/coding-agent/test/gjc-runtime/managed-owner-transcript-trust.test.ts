@@ -134,6 +134,30 @@ describe.skipIf(!recoveryReads)("managed owner transcript provenance through adm
 		}
 	});
 
+	it("completeManagedOwnerRecovery rejects a transcript declared after admission and still accepts an operator path", async () => {
+		const stateDir = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-owner-complete-"));
+		const cwd = await tempProject();
+		try {
+			await writePredecessor(stateDir);
+			await writeTerminal(cwd);
+			const changed = await admit(stateDir, cwd, { GJC_MANAGED_OWNER_TRANSCRIPT_PATH: "predecessor.jsonl" }, true);
+			expect(changed.result).toEqual({ kind: "handoff", exitCode: 75 });
+			expect(changed.handoffs).toContainEqual(
+				expect.objectContaining({ reason: "recovery_authority_changed:transcript_path_untrusted" }),
+			);
+			await fsp.rm(path.join(cwd, ".env"), { force: true });
+			await removeJournal(cwd);
+			const operator = await admit(stateDir, cwd, { GJC_MANAGED_OWNER_TRANSCRIPT_PATH: "predecessor.jsonl" });
+			expect(operator.result).toEqual({ kind: "handoff", exitCode: 75 });
+			expect(operator.handoffs).toContainEqual(
+				expect.objectContaining({ reason: "safe_session_resume_seam_unavailable" }),
+			);
+		} finally {
+			await fsp.rm(stateDir, { recursive: true, force: true });
+			await fsp.rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	it("launchDefaultTmuxIfNeeded does not forward a project session file and still forwards an operator file", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-owner-launch-"));
 		try {
@@ -213,8 +237,9 @@ async function admit(
 	stateDir: string,
 	cwd: string,
 	extra: Record<string, string>,
+	declareTranscriptBeforeComplete = false,
 ): Promise<{ result: { kind: string; exitCode: number }; stderr: string; handoffs: Record<string, unknown>[] }> {
-	const script = `import { admitManagedOwnerBeforeCli, completeManagedOwnerRecovery } from ${JSON.stringify(admissionModule)}; const admission = await admitManagedOwnerBeforeCli(); const terminal = admission.kind === "recovery" ? await completeManagedOwnerRecovery(admission.context) : admission; console.log(JSON.stringify({ kind: terminal.kind, exitCode: process.exitCode ?? 0 }));`;
+	const script = `import { writeFile } from "node:fs/promises"; import { admitManagedOwnerBeforeCli, completeManagedOwnerRecovery } from ${JSON.stringify(admissionModule)}; const admission = await admitManagedOwnerBeforeCli(); if (${declareTranscriptBeforeComplete} && admission.kind === "recovery") await writeFile(".env", "GJC_MANAGED_OWNER_TRANSCRIPT_PATH=predecessor.jsonl\\n"); const terminal = admission.kind === "recovery" ? await completeManagedOwnerRecovery(admission.context) : admission; console.log(JSON.stringify({ kind: terminal.kind, exitCode: process.exitCode ?? 0 }));`;
 	const env: NodeJS.ProcessEnv = { ...process.env };
 	delete env.GJC_SESSION_FILE;
 	delete env.GJC_MANAGED_OWNER_TRANSCRIPT_PATH;
