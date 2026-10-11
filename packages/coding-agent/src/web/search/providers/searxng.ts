@@ -215,17 +215,21 @@ function hasControlCharacters(value: string): boolean {
  * precedence over bearer tokens.
  *
  * When `endpoint` came from the project settings layer, environment credentials
- * are omitted. A token or basic-auth pair set in settings is still used, including
- * one the project file set itself.
+ * are omitted. A complete basic-auth pair or token set in settings is still used,
+ * including one the project file set itself. An incomplete basic-auth pair is not
+ * filled from the environment: the search continues with a project token, or with
+ * no Authorization header, instead of failing closed on the missing half.
  */
 function findAuth(activeSettings?: Settings, endpoint?: string | null): SearXNGAuth | null {
 	const resolvedEndpoint = endpoint === undefined ? findEndpoint(activeSettings) : endpoint;
 	const allowEnvironment = !endpointComesFromProjectLayer(activeSettings, resolvedEndpoint);
-	return resolveBasicOrBearerAuth(
-		findBasicUsername(activeSettings, allowEnvironment),
-		findBasicPassword(activeSettings, allowEnvironment),
-		findToken(activeSettings, allowEnvironment),
-	);
+	const username = findBasicUsername(activeSettings, allowEnvironment);
+	const password = findBasicPassword(activeSettings, allowEnvironment);
+	const token = findToken(activeSettings, allowEnvironment);
+	if (!allowEnvironment && (username === null) !== (password === null)) {
+		return token ? { type: "bearer", value: token } : null;
+	}
+	return resolveBasicOrBearerAuth(username, password, token);
 }
 
 function resolveBasicOrBearerAuth(
