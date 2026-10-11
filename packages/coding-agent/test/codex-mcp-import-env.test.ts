@@ -164,4 +164,40 @@ describe("Codex MCP import env indirection", () => {
 		expect(parsed.mcpServers.bad?.command).toBe("bin");
 		expect(parsed.mcpServers.pasted?.headers).toBeUndefined();
 	});
+
+	test("keeps static env and a static header without reading the environment", async () => {
+		const toml = `
+[mcp_servers.plain]
+command = "codex-bin"
+
+[mcp_servers.plain.env]
+LOG_LEVEL = "info"
+
+[mcp_servers.web]
+url = "https://codex.example.test/mcp"
+
+[mcp_servers.web.http_headers]
+X-Client = "codex-client"
+`;
+		await fs.mkdir(path.join(projectDir, ".codex"), { recursive: true });
+		await fs.writeFile(path.join(projectDir, ".codex", "config.toml"), toml, "utf-8");
+		const plan = await buildImportPreview({
+			product: "codex",
+			sourceScope: "project",
+			destinationScope: "project",
+			surfaces: ["mcps"],
+			collisionPolicy: "skip",
+			cwd: projectDir,
+			homeDir,
+		});
+		const result = await applyImport(plan, { cwd: projectDir });
+		expect(result.ok).toBe(true);
+		const raw = await fs.readFile(path.join(projectDir, ".gjc", "mcp.json"), "utf-8");
+		expect(raw).not.toContain(SECRET);
+		const parsed = JSON.parse(raw) as {
+			mcpServers: Record<string, { env?: Record<string, string>; headers?: Record<string, string> }>;
+		};
+		expect(parsed.mcpServers.plain?.env).toEqual({ LOG_LEVEL: "info" });
+		expect(parsed.mcpServers.web?.headers).toEqual({ "X-Client": "codex-client" });
+	});
 });
