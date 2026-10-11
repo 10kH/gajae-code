@@ -172,6 +172,8 @@ const initialNodeIdentities = initialProcessEnvironment.then(async environment =
 		const lexical = path.join(pathEntry, process.platform === "win32" ? "node.exe" : "node");
 		try {
 			const real = await fs.realpath(lexical);
+			// A temporary root is writable by other local users and by checkouts the user
+			// never vetted, so a `node` resolved there never becomes launch authority.
 			if (temporaryRoots.some(root => isWithin(root, real))) continue;
 			if (identities.has(real)) continue;
 			const stat = await fs.stat(real);
@@ -189,7 +191,11 @@ const initialNodeIdentities = initialProcessEnvironment.then(async environment =
 	return identities;
 });
 
-/** First-use digests of startup Node candidates, keyed by realpath; failures are cached as `undefined`. */
+/**
+ * First-use digests of startup Node candidates, keyed by realpath. Successful and
+ * in-flight digests stay memoized; a failed attempt is evicted so a transient error
+ * (e.g. EMFILE) can be retried against the same startup identity.
+ */
 const initialNodeHashes = new Map<string, Promise<string | undefined>>();
 
 /**
@@ -197,20 +203,26 @@ const initialNodeHashes = new Map<string, Promise<string | undefined>>();
  * was not a startup candidate or no longer is the startup file object.
  */
 export function getInitialNodeHash(realPath: string): Promise<string | undefined> {
-	let digest = initialNodeHashes.get(realPath);
-	if (!digest) {
-		digest = initialNodeIdentities.then(async identities => {
-			const identity = identities.get(realPath);
-			if (!identity) return undefined;
-			try {
-				return await hashStableFile(realPath, "Initial Node executable", MCP_LAUNCHER_MAX_BYTES, identity);
-			} catch {
-				return undefined;
-			}
-		});
-		initialNodeHashes.set(realPath, digest);
-	}
-	return digest;
+	const cached = initialNodeHashes.get(realPath);
+	if (cached) return cached;
+
+	const attempt = initialNodeIdentities.then(async identities => {
+		const identity = identities.get(realPath);
+		if (!identity) return undefined;
+		try {
+			return await hashStableFile(realPath, "Initial Node executable", MCP_LAUNCHER_MAX_BYTES, identity);
+		} catch {
+			// Do not memoize failed attempts to allow retries on transient errors
+			// (e.g., EMFILE on file open/read). Remove the pending entry so the next
+			// call can retry the operation with the same startup identity.
+			initialNodeHashes.delete(realPath);
+			return undefined;
+		}
+	});
+	// Memoize the in-flight attempt so only one concurrent operation runs, but
+	// the entry may be deleted if the operation fails (to allow retry).
+	initialNodeHashes.set(realPath, attempt);
+	return attempt;
 }
 
 async function snapshotExistingFile(filePath: string): Promise<FileSnapshot | null> {
