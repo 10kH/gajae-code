@@ -80,6 +80,7 @@ import {
 	projectActiveProviderDescriptors,
 } from "../sdk/providers";
 import type { AuthStorage, OAuthCredential } from "../session/auth-storage";
+import { writeExplicitOwnerOnlyTextSync } from "../session/session-storage";
 import type { ActiveSearchModelContext, WebSearchMode } from "../web/search/types";
 import { type BillingPath, deriveBillingPath } from "./billing-path";
 import { ConfigError, ConfigFile, type LoadResult } from "./config-file";
@@ -4070,7 +4071,7 @@ export class ModelRegistry {
 
 	async #writeCheckedModelsConfig(config: ModelsConfig): Promise<void> {
 		await fs.mkdir(path.dirname(this.#modelsConfigFile.path()), { recursive: true });
-		await Bun.write(this.#modelsConfigFile.path(), Bun.YAML.stringify(config, null, 2));
+		writeExplicitOwnerOnlyTextSync(this.#modelsConfigFile.path(), Bun.YAML.stringify(config, null, 2));
 		this.#modelsConfigFile.invalidate();
 		this.#reloadStaticModels();
 	}
