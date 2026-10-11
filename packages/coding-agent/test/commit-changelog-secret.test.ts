@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, mock } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -8,17 +8,9 @@ import * as aiCore from "@gajae-code/ai/core";
 const SECRET = "sk-ant-GJCCANARY-changelog-0123456789abcdef";
 const PLAIN_ENTRY = "document the config loader";
 
-const scripted = {
-	entries: {} as Record<string, string[]>,
-};
-
-mock.module("@gajae-code/ai/core", () => ({
-	...aiCore,
-	completeSimple: async () => assistantMessage(scripted.entries),
-}));
-
 const model = { id: "test", api: "openai-responses", provider: "openai" } as Model<Api>;
 const tempDirs: string[] = [];
+let completeSimpleSpy: { mockRestore(): void } | undefined;
 
 function assistantMessage(entries: Record<string, string[]>): AssistantMessage {
 	return {
@@ -45,6 +37,10 @@ function assistantMessage(entries: Record<string, string[]>): AssistantMessage {
 		stopReason: "toolUse",
 		timestamp: 0,
 	};
+}
+
+function scriptCompleteSimple(entries: Record<string, string[]>): void {
+	completeSimpleSpy = vi.spyOn(aiCore, "completeSimple").mockImplementation(async () => assistantMessage(entries));
 }
 
 async function runGit(cwd: string, args: string[]): Promise<void> {
@@ -84,12 +80,14 @@ async function runFlow(cwd: string): Promise<string> {
 }
 
 afterEach(async () => {
+	completeSimpleSpy?.mockRestore();
+	completeSimpleSpy = undefined;
 	await Promise.all(tempDirs.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
 
 describe("runChangelogFlow changelog persistence", () => {
 	it("writes a plain generated entry and keeps the existing line", async () => {
-		scripted.entries = { Added: [PLAIN_ENTRY] };
+		scriptCompleteSimple({ Added: [PLAIN_ENTRY] });
 		const changelog = await runFlow(await initRepo());
 
 		expect(changelog).toContain(`- ${PLAIN_ENTRY}`);
@@ -98,7 +96,7 @@ describe("runChangelogFlow changelog persistence", () => {
 	});
 
 	it("does not persist a model-echoed token into CHANGELOG.md", async () => {
-		scripted.entries = { Added: [`document key ${SECRET}`] };
+		scriptCompleteSimple({ Added: [`document key ${SECRET}`] });
 		const changelog = await runFlow(await initRepo());
 
 		expect(changelog).not.toContain(SECRET);
