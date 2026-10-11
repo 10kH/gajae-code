@@ -74,6 +74,12 @@ async function connectedTool(onCall: (name: string) => { content: MCPContent[]; 
 	return { connection, tool };
 }
 
+function textBlock(content: ReadonlyArray<{ type: string; text?: string }> | undefined): string {
+	const block = content?.[0];
+	if (block?.type !== "text" || block.text === undefined) throw new Error("expected a text tool result");
+	return block.text;
+}
+
 const displayTheme = {
 	fg: (_color: string, text: string) => text,
 	styledSymbol: () => "",
@@ -95,19 +101,19 @@ describe("MCP tool result untrusted marker", () => {
 		);
 		try {
 			const result = await tool.execute("call-1", {}, undefined, {} as never);
-			const text = result.content[0]?.text ?? "";
+			const text = textBlock(result.content);
 			expect(text).toBe(wrapUntrustedContent(visible));
 			expect(text.slice(0, -"</untrusted-content>".length)).not.toContain("</untrusted-content>");
 			expect(result.details?.rawContent).toEqual(content);
 
 			const deferred = new DeferredMCPTool("fixture", probe, async () => connection);
 			const deferredResult = await deferred.execute("call-2", {}, undefined, {} as never);
-			expect(deferredResult.content[0]?.text).toBe(wrapUntrustedContent(visible));
+			expect(textBlock(deferredResult.content)).toBe(wrapUntrustedContent(visible));
 
 			const errorTool = MCPTool.fromTools(connection, [{ name: "bad", inputSchema: { type: "object" } }])[0];
 			if (!errorTool) throw new Error("missing error tool");
 			const errorResult = await errorTool.execute("call-3", {}, undefined, {} as never);
-			expect(errorResult.content[0]?.text).toBe(wrapUntrustedContent(`Error: ${hostileText}`));
+			expect(textBlock(errorResult.content)).toBe(wrapUntrustedContent(`Error: ${hostileText}`));
 		} finally {
 			await disconnectServer(connection);
 		}
@@ -122,7 +128,7 @@ describe("MCP tool result untrusted marker", () => {
 		const { connection, tool } = await connectedTool(() => ({ content }));
 		try {
 			const result = await tool.execute("call-1", {}, undefined, {} as never, new AbortController().signal);
-			const text = result.content[0]?.text ?? "";
+			const text = textBlock(result.content);
 			expect(text).toContain(plain);
 			expect(text).toContain("[Image: image/png]");
 			expect(result.details?.rawContent).toEqual(content);
@@ -138,7 +144,7 @@ describe("MCP tool result untrusted marker", () => {
 		const { connection, tool } = await connectedTool(() => ({ content }));
 		try {
 			const result = await tool.execute("call-1", {}, undefined, {} as never);
-			expect(result.content[0]?.text ?? "").toContain(json);
+			expect(textBlock(result.content)).toContain(json);
 			const rendered = tool.renderResult(result, { expanded: true, isPartial: false }, displayTheme);
 			expect(rendered).toBeInstanceOf(Text);
 			const shown = (rendered as Text).getText();
