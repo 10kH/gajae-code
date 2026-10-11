@@ -49,6 +49,7 @@ async function withFixture(seed: Seed, assert: (archivePath: string) => Promise<
 	const originalLogDir = process.env.GJC_LOG_DIR;
 	const originalNotes = process.env.GJC_NOTES;
 	const originalColor = process.env.GJC_COLOR;
+	const originalEmpty = process.env.GJC_EMPTY;
 	const originalAgentDir = getAgentDir();
 
 	const homeRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-report-home-"));
@@ -63,6 +64,7 @@ async function withFixture(seed: Seed, assert: (archivePath: string) => Promise<
 	process.env.GJC_LOG_DIR = logRoot;
 	process.env.GJC_NOTES = seed.notes;
 	process.env.GJC_COLOR = "blue";
+	process.env.GJC_EMPTY = "";
 
 	try {
 		const exclusiveRoot = path.join(homeRoot, configName);
@@ -94,6 +96,7 @@ async function withFixture(seed: Seed, assert: (archivePath: string) => Promise<
 		}
 		await assert(result.path);
 	} finally {
+		restoreVar("GJC_EMPTY", originalEmpty);
 		restoreVar("GJC_COLOR", originalColor);
 		restoreVar("GJC_NOTES", originalNotes);
 		restoreVar("PI_CONFIG_DIR", originalPiConfigDir);
@@ -149,7 +152,7 @@ describe.serial("createReportBundle", () => {
 	test("keeps ordinary session, log, artifact, and env text", async () => {
 		await withFixture(
 			{
-				session: "ordinary session line\n",
+				session: "ordinary session line\npath /var/log/app.log\nalready «redacted-api-key»\n",
 				log: "ordinary log line\n",
 				artifact: "ordinary artifact note\n",
 				subagent: "ordinary subagent note\n",
@@ -157,7 +160,10 @@ describe.serial("createReportBundle", () => {
 				notes: "ordinary-note",
 			},
 			async archivePath => {
-				expect(await entryText(archivePath, "session.jsonl")).toContain("ordinary session line");
+				const session = await entryText(archivePath, "session.jsonl");
+				expect(session).toContain("ordinary session line");
+				expect(session).toContain("path /var/log/app.log");
+				expect(session).toContain("already «redacted-api-key»");
 				expect(await entryText(archivePath, "logs.txt")).toContain("ordinary log line");
 				expect(await entryText(archivePath, "artifacts/note.txt")).toContain("ordinary artifact note");
 				expect(await entryText(archivePath, `subagents/${CHILD_NAME}`)).toContain("ordinary subagent note");
@@ -167,6 +173,7 @@ describe.serial("createReportBundle", () => {
 				const env = await entryText(archivePath, "env.json");
 				expect(env).toContain('"GJC_NOTES": "ordinary-note"');
 				expect(env).toContain('"GJC_COLOR": "blue"');
+				expect(env).toContain('"GJC_EMPTY": ""');
 			},
 		);
 	});
