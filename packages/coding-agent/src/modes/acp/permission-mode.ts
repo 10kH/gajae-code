@@ -1,5 +1,6 @@
 import type { ClientCapabilities } from "@agentclientprotocol/sdk";
-import { $credentialEnv } from "@gajae-code/utils/env";
+import { startupProjectEnvSnapshot } from "@gajae-code/utils/env";
+import { canonicalEnvKey } from "@gajae-code/utils/env-file";
 
 export type AcpPermissionMode = "auto" | "prompt" | "always-allow";
 
@@ -11,15 +12,17 @@ function parseAcpPermissionMode(value: unknown): AcpPermissionMode {
 }
 
 /**
- * The default process environment includes the cwd `.env` merge. `$credentialEnv`
- * is unset for that overlay, so a repository cannot select `auto` or `always-allow`.
- * An explicit env map is the caller's value. A trusted source keeps the raw text
- * so surrounding spaces still fail safe to `prompt`.
+ * The default process environment includes the cwd `.env` merge. A live value
+ * equal to that startup declaration is the overlay and fails safe. A different
+ * live value is the launching environment, including when the declaration is
+ * dynamic (`$` or backticks) and is not that value. An explicit env map is
+ * the caller's value. The raw string is parsed so padding still fails safe.
  */
 function permissionModeFromEnv(env: NodeJS.ProcessEnv): unknown {
 	const raw = env[ACP_PERMISSION_MODE_ENV];
-	if (env !== process.env) return raw;
-	if ($credentialEnv(ACP_PERMISSION_MODE_ENV) === undefined) return undefined;
+	if (env !== process.env || typeof raw !== "string") return raw;
+	const declared = startupProjectEnvSnapshot().values[canonicalEnvKey(ACP_PERMISSION_MODE_ENV)];
+	if (declared !== undefined && raw.trim() === declared.trim()) return undefined;
 	return raw;
 }
 

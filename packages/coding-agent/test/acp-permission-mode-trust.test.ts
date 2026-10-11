@@ -73,4 +73,11 @@ describe("ACP permission mode trust boundary", () => {
 		expect(resolved.mode).toBe("allow");
 		expect(resolved.requestPermission).toBe(false);
 	}, 60_000);
+
+	it("keeps a launching-shell always-allow when the project declaration is dynamic", async () => {
+		const cwd = tempDir("GJC_ACP_PERMISSION_MODE=$OTHER_MODE\n");
+		const resolved = await resolveModeIn(cwd, { GJC_ACP_PERMISSION_MODE: "always-allow" });
+		expect(resolved.mode).toBe("allow");
+		expect(resolved.requestPermission).toBe(false);
+	}, 60_000);
 });
