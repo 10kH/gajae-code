@@ -1699,7 +1699,9 @@ export class InteractiveMode implements InteractiveModeContext {
 	async #startConfigHotReload(): Promise<void> {
 		const paths = this.session.getConfigurationPaths();
 		if (!paths) return;
-		if (!(await isConfigHotReloadTrusted(paths))) {
+		const trusted = await isConfigHotReloadTrusted(paths);
+		if (this.#stopped || this.#isShuttingDown) return;
+		if (!trusted) {
 			this.showWarning(
 				"Configuration watching could not start because directory ownership and privacy could not be verified.",
 			);
@@ -1717,7 +1719,9 @@ export class InteractiveMode implements InteractiveModeContext {
 				await this.session.validateConfiguration(candidate);
 			},
 			onCandidate: async (candidate, signal) => {
+				if (signal.aborted || this.#stopped || this.#isShuttingDown) return;
 				await assertTrustedPaths();
+				if (signal.aborted || this.#stopped || this.#isShuttingDown) return;
 				const result = await this.session.reloadConfiguration(candidate, signal);
 				if (signal.aborted || this.#stopped || this.#isShuttingDown || !result.applied) return;
 				this.#selectorController.refreshConfiguration();

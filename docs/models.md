@@ -26,10 +26,14 @@ Legacy behavior still present:
 
 ## Editing configuration in an open session
 
-Foreground interactive sessions watch the resolved user `config.yml` and
+On Linux, foreground interactive sessions watch the resolved user `config.yml` and
 `models.yml` paths. Saving either file schedules a validated reload; no restart,
 provider discovery request, or explicit preset reselection is required. Atomic
 editor saves are supported.
+
+Automatic reload requires verified private directory ownership and permissions.
+macOS and Windows do not yet have equivalent permission verification, so automatic
+reload is disabled on those platforms. Restart the session after editing either file.
 
 Changes apply between requests, not during a streamed response. The active
 preset's new mappings apply to subsequent requests and delegated work; explicit
