@@ -191,7 +191,7 @@ describe("task fork-context provider identity", () => {
 		const entries = await fsPromises.readdir(dir, { withFileTypes: true });
 		const paths: string[] = [];
 		for (const entry of entries) {
-			const relativePath = prefix ? `${prefix}/${entry.name}` : entry.name;
+			const relativePath = path.join(prefix, entry.name);
 			if (entry.isDirectory() && !entry.isSymbolicLink()) {
 				paths.push(`${relativePath}/`, ...(await listTempTree(path.join(dir, entry.name), relativePath)));
 			} else {

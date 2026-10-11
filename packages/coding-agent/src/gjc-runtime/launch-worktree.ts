@@ -2,6 +2,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { canonicalEnvKey, projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import { shortenPath } from "../tools/render-utils";
 
 export type GjcLaunchWorktreeMode =
@@ -175,6 +176,8 @@ function sanitizePathToken(value: string): string {
  * beside the first.
  */
 const WORKTREE_BUCKET_ENV = "GJC_WORKTREE_DIR";
+/** Captured when this module loads, before a later `chdir` or dotenv delete. */
+const startupWorktreeBucketSnapshot = projectEnvSnapshot();
 /**
  * Expands to the repository directory name.
  *
@@ -211,14 +214,34 @@ export function resolveWorktreeBucketForPath(
 }
 
 /**
+ * Operator override only. Bun has already copied the project dotenv into the
+ * environment, so a value that matches `projectEnvSnapshot` — a static hit or
+ * a dynamic declaration — must not select the bucket. An operator value the
+ * project does not declare is kept.
+ */
+function trustedWorktreeBucketEnv(env: NodeJS.ProcessEnv): string | undefined {
+	const raw = env[WORKTREE_BUCKET_ENV];
+	if (!raw) return undefined;
+	const snapshot = startupWorktreeBucketSnapshot;
+	const key = canonicalEnvKey(WORKTREE_BUCKET_ENV);
+	const declared = snapshot.values[key];
+	const trimmed = raw.trim();
+	if (declared !== undefined && (snapshot.dynamic.has(key) || declared === raw || declared === trimmed)) {
+		return undefined;
+	}
+	return trimmed.length > 0 ? trimmed : undefined;
+}
+
+/**
  * Directory that holds this repository's launch worktrees.
  *
  * A relative override resolves against the repository's parent directory. The default
  * `{repo}/.worktrees` template places managed worktrees inside the repository, while
  * `{repo}.worktrees` adopts an existing sibling bucket. An absolute override is used verbatim.
+ * A project dotenv value is ignored; an operator value the project does not declare is kept.
  */
 function resolveWorktreeBucket(repoRoot: string): string {
-	return resolveWorktreeBucketForPath(repoRoot, process.env[WORKTREE_BUCKET_ENV], os.homedir(), path);
+	return resolveWorktreeBucketForPath(repoRoot, trustedWorktreeBucketEnv(process.env), os.homedir(), path);
 }
 
 function ensureRepositoryBucketIgnored(repoRoot: string, bucketPath: string): void {
