@@ -42,13 +42,14 @@ const WRAPPER_LONG_OPTIONS: Record<string, Record<string, boolean>> = {
 	env: {
 		"--unset": true, // env --unset=VAR or --unset VAR
 		"--chdir": true, // env --chdir=DIR (takes directory)
-		"--split-string": false, // env -S/--split-string (flag-only)
+		"--split-string": true, // env -S/--split-string (takes command string)
 	},
 	timeout: {
 		"--signal": true, // timeout --signal=SIGNAL (takes signal name)
 		"--kill-after": true, // timeout --kill-after=TIME
 		"--preserve-status": false, // timeout --preserve-status (flag-only)
 		"--verbose": false, // timeout --verbose (flag-only)
+		"--foreground": false, // timeout --foreground (flag-only)
 	},
 	nice: {
 		"--adjustment": true, // nice --adjustment=N (takes adjustment value)
@@ -74,6 +75,7 @@ const WRAPPER_LONG_OPTIONS: Record<string, Record<string, boolean>> = {
 		"--no-run-if-empty": false, // xargs --no-run-if-empty (flag-only)
 		"--exit": false, // xargs --exit (flag-only)
 		"--null-input": false, // xargs --null-input (flag-only, same as -0)
+		"--replace": false, // xargs --replace (flag-only, same as -I)
 	},
 };
 
@@ -618,10 +620,12 @@ function collectShellPayloads(tokens: Token[]): string[] {
 				continue;
 			}
 
-			// Check for -c option (standalone or bundled like -ce, -ec, etc.)
-			if (word === "-c" || (word.startsWith("-") && word.includes("c"))) {
-				// Found a -c option (or an option containing c)
-				// The command string is the first non-option word after -c, regardless of quoting
+			// Check for exact -c option or bundled forms like -ce, -ec
+			const isStandaloneC = word === "-c";
+			const isBundledC = word.startsWith("-") && !word.startsWith("--") && word.length > 2 && word.includes("c");
+			if (isStandaloneC || isBundledC) {
+				// Found a -c option (standalone or bundled)
+				// The command string is the first non-option word after -c
 				for (
 					let payloadCursor = cursor + 1;
 					payloadCursor < tokens.length && !tokens[payloadCursor].commandStart;
@@ -648,7 +652,7 @@ function collectShellPayloads(tokens: Token[]): string[] {
 					}
 
 					// Found the first non-option word after -c; this is the actual command string
-					// Add it regardless of quoting, because bash will execute it as the command
+					// Add it regardless of quoted status, because bash will execute it as the command
 					payloads.push(payloadWord);
 					break; // Only take the first payload for this -c
 				}
@@ -898,13 +902,27 @@ function assignedTmuxSocket(tokens: Token[], commandIndex: number): string | und
 								: tokens[wrapIdx].text;
 							const wrapper = COMMAND_WRAPPERS_WITH_ARGS[baseName];
 							if (wrapper) {
-								// Extract short option without dash
-								const optChar = optText.length > 1 ? optText[1] : "";
-								const shortOpt = `-${optChar}`;
+								// Check for short options
+								if (optText.startsWith("-") && !optText.startsWith("--")) {
+									const optChar = optText.length > 1 ? optText[1] : "";
+									const shortOpt = `-${optChar}`;
 
-								// Check if this wrapper's options would consume the next argument
-								if (wrapper.optionsWithArg.has(shortOpt) && !wrapper.flagOnlyOptions?.has(shortOpt)) {
-									optionTakesArg = true;
+									// Check if this wrapper's options would consume the next argument
+									if (wrapper.optionsWithArg.has(shortOpt) && !wrapper.flagOnlyOptions?.has(shortOpt)) {
+										optionTakesArg = true;
+									}
+								} else if (optText.startsWith("--")) {
+									// Check for long options (handle both --option and --option=value forms)
+									const longOptName = optText.includes("=") ? optText.split("=")[0] : optText;
+								
+									// Check wrapper-specific long options
+									const wrapperLongOpts = WRAPPER_LONG_OPTIONS[baseName];
+									if (wrapperLongOpts && longOptName in wrapperLongOpts) {
+										const takesArg = wrapperLongOpts[longOptName];
+										if (takesArg && !optText.includes("=")) {
+											optionTakesArg = true;
+										}
+									}
 								}
 							}
 							break;
