@@ -420,7 +420,7 @@ import { attachExactMcpControls, getExactMcpControls, revokeExactMcpControls } f
 import type { NotificationSessionController } from "../sdk/bus/session-control";
 import { buildSyntheticModelId, syntheticNamespaceCollision } from "../sdk/model-profile-model";
 import { sanitizePromptFailure } from "../sdk/prompt-failure";
-import type { SecretObfuscator } from "../secrets/obfuscator";
+import { obfuscateMessages, type SecretObfuscator } from "../secrets/obfuscator";
 import { formatNoCredentialOnboardingError, NoModelSelectedError } from "../setup/model-onboarding-guidance";
 import {
 	isCanonicalGjcWorkflowSkill,
@@ -20493,7 +20493,7 @@ export class AgentSession {
 								promptOverride: compactionPrep.hookPrompt,
 								extraContext: compactionPrep.hookContext,
 								remoteInstructions: this.#baseSystemPrompt.join("\n\n"),
-								convertToLlm,
+								convertToLlm: (messages) => this.#summaryConvertToLlm(messages),
 							},
 						);
 						summary = result.summary;
@@ -20744,7 +20744,7 @@ export class AgentSession {
 					tools: this.agent.state.tools,
 					customInstructions,
 					promptExtension: this.settings.get("compaction.handoffPromptExtension") || undefined,
-					convertToLlm,
+					convertToLlm: (messages) => this.#summaryConvertToLlm(messages),
 					initiatorOverride: "agent",
 					metadata: this.agent.metadataForProvider(model.provider),
 					telemetry: resolveTelemetry(this.agent.telemetry, this.sessionId),
@@ -22504,6 +22504,18 @@ export class AgentSession {
 		};
 	}
 
+	/**
+	 * Manual compact, auto compact, handoff, and branch summary keep the
+	 * existing conversion and obfuscate with the session registry prompt turns
+	 * already use.
+	 */
+	#summaryConvertToLlm(messages: AgentMessage[]): Message[] {
+		const converted = convertToLlm(messages);
+		const obfuscator = this.#obfuscator;
+		if (!obfuscator?.hasSecrets()) return converted;
+		return obfuscateMessages(obfuscator, converted);
+	}
+
 	async #compactWithFallbackModel(
 		preparation: CompactionPreparation,
 		customInstructions: string | undefined,
@@ -22532,7 +22544,7 @@ export class AgentSession {
 					...options,
 					...this.#maintenanceProviderTransport(),
 					metadata: this.agent.metadataForProvider(candidate.provider),
-					convertToLlm,
+					convertToLlm: (messages) => this.#summaryConvertToLlm(messages),
 					telemetry,
 					authCredentialType: this.#modelRegistry.getSessionCredentialType(
 						candidate.provider,
@@ -23057,7 +23069,7 @@ export class AgentSession {
 								remoteInstructions: this.#baseSystemPrompt.join("\n\n"),
 								metadata: this.agent.metadataForProvider(candidate.provider),
 								initiatorOverride: "agent",
-								convertToLlm,
+								convertToLlm: (messages) => this.#summaryConvertToLlm(messages),
 								telemetry,
 								authCredentialType: this.#modelRegistry.getSessionCredentialType(
 									candidate.provider,
@@ -27545,7 +27557,7 @@ export class AgentSession {
 					customInstructions: options.customInstructions,
 					reserveTokens: branchSummarySettings.reserveTokens,
 					metadata: this.agent.metadataForProvider(model.provider),
-					convertToLlm,
+					convertToLlm: (messages) => this.#summaryConvertToLlm(messages),
 					telemetry: resolveTelemetry(this.agent.telemetry, this.sessionId),
 				});
 				this.#branchSummaryAbortController = undefined;
