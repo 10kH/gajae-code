@@ -1,8 +1,8 @@
 import { expect, test, vi } from "bun:test";
 import { rm } from "node:fs/promises";
 import { legacyMcpMethodNotFound } from "../../test/mcp-test-utils";
-import { wrapUntrustedContent } from "../tools/fetch";
 import * as configValue from "../config/resolve-config-value";
+import { wrapUntrustedContent } from "../tools/fetch";
 import { MCPManager } from "./manager";
 import { MCPConnectionPool } from "./pool";
 import { computeMCPPoolKey } from "./pool-key";
