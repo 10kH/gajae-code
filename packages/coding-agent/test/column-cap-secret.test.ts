@@ -125,6 +125,99 @@ describe("column cap plain-secret cut", () => {
 		}
 	});
 
+	test("a secret split across two chunks does not emit its prefix when the first chunk overflows", async () => {
+		const { settings, root } = await loadSettings(true);
+		try {
+			const chunks = [
+				`${FILLER.repeat(KEPT_COLUMNS - 24)}${CANARY.slice(0, 30)}`,
+				`${CANARY.slice(30)}${FILLER.repeat(2000)}\nfooter`,
+			];
+			const output = await executeSink(settings, chunks);
+			expect(output.includes(CANARY)).toBe(false);
+			expect(output.includes(CANARY.slice(0, 8))).toBe(false);
+			expect(output.endsWith("…\nfooter")).toBe(true);
+		} finally {
+			await settings.close();
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("a prefix kept before the overflow is absent once a later chunk would finish the secret", async () => {
+		const { settings, root } = await loadSettings(true);
+		try {
+			const chunks = [
+				`${FILLER.repeat(KEPT_COLUMNS - 24)}${CANARY.slice(0, 20)}`,
+				CANARY.slice(20, 30),
+				`${CANARY.slice(30)}${FILLER.repeat(80)}\nfooter`,
+			];
+			const output = await executeSink(settings, chunks, undefined, undefined, 1);
+			expect(output.includes(CANARY)).toBe(false);
+			expect(output.includes(CANARY.slice(0, 8))).toBe(false);
+			expect(output.endsWith("…\nfooter")).toBe(true);
+		} finally {
+			await settings.close();
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("secrets disabled stays byte-identical when the first chunk overflows on a secret prefix", async () => {
+		const { settings, root } = await loadSettings(false);
+		try {
+			const chunks = [
+				`${FILLER.repeat(KEPT_COLUMNS - 24)}${CANARY.slice(0, 30)}`,
+				`${CANARY.slice(30)}${FILLER.repeat(2000)}\nfooter`,
+			];
+			const output = await executeSink(settings, chunks);
+			expect(output).toBe(await baseCut(chunks));
+			expect(output.includes(CANARY.slice(0, 8))).toBe(true);
+		} finally {
+			await settings.close();
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("a contradicted secret prefix at the cap matches the base cut", async () => {
+		const { settings, root } = await loadSettings(true);
+		try {
+			const chunks = [`${FILLER.repeat(KEPT_COLUMNS - 24)}${CANARY.slice(0, 24)}`, `NOT${FILLER.repeat(2000)}`];
+			const output = await executeSink(settings, chunks);
+			expect(output).toBe(await baseCut(chunks));
+			expect(output.includes(CANARY.slice(0, 8))).toBe(true);
+		} finally {
+			await settings.close();
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("an open secret prefix is omitted when a later chunk does not finish the secret", async () => {
+		const { settings, root } = await loadSettings(true);
+		try {
+			const chunks = [
+				`${FILLER.repeat(KEPT_COLUMNS - 24)}${CANARY.slice(0, 30)}`,
+				`NOT${FILLER.repeat(2000)}\nfooter`,
+			];
+			const output = await executeSink(settings, chunks);
+			expect(output.includes(CANARY.slice(0, 8))).toBe(false);
+			expect(output.endsWith("…\nfooter")).toBe(true);
+		} finally {
+			await settings.close();
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("a secret that ends on the column cut matches the base cut", async () => {
+		const { settings, root } = await loadSettings(true);
+		try {
+			const chunks = chunksOf(`${FILLER.repeat(KEPT_COLUMNS - CANARY.length)}${CANARY}${FILLER.repeat(2000)}`, 100);
+			const output = await executeSink(settings, chunks);
+			expect(output).toBe(await baseCut(chunks));
+			expect(output.includes(CANARY)).toBe(true);
+		} finally {
+			await settings.close();
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	test("a canary finished after a nonterminal dump is not sent in plaintext", async () => {
 		const { settings, root } = await loadSettings(true);
 		try {

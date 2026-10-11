@@ -69,6 +69,35 @@ function columnHeadEndOutsideSecrets(segment: string, end: number, secrets: read
 	return cut;
 }
 
+/**
+ * Pull a column-cap end off a proper prefix of a plain secret.
+ * A secret that already ends on the cut stays. Bytes already in `text`
+ * that contradict the secret leave the cut alone.
+ */
+function columnHeadEndBeforeOpenPrefix(text: string, end: number, secrets: readonly string[]): number {
+	let cut = end;
+	const after = text.slice(end);
+	for (const secret of secrets) {
+		const secretChars = secret.length;
+		if (secretChars < 2 || end < 1) continue;
+		if (end >= secretChars && text.slice(end - secretChars, end) === secret) continue;
+		const maxPrefix = Math.min(secretChars - 1, end);
+		let matched = 0;
+		for (let k = maxPrefix; k >= 1; k--) {
+			if (text.slice(end - k, end) !== secret.slice(0, k)) continue;
+			matched = k;
+			break;
+		}
+		if (matched === 0) continue;
+		const rest = secret.slice(matched);
+		const have = Math.min(after.length, rest.length);
+		if (have === rest.length) continue;
+		if (after.slice(0, have) !== rest.slice(0, have)) continue;
+		cut = Math.min(cut, end - matched);
+	}
+	return cut;
+}
+
 const ARTIFACT_WRITER_DIAGNOSTIC_MAX_BYTES = 256;
 
 /**
@@ -1214,8 +1243,9 @@ export class OutputSink {
 						if (this.#plainSecrets) this.#columnLine += segment;
 					} else {
 						// First overflow on this line: keep what fits, append ellipsis,
-						// arm the skip-until-newline flag. With secrets, do not end
-						// inside a plain secret the whole-string obfuscator must see whole.
+						// arm the skip-until-newline flag. With secrets, do not emit a
+						// kept-head suffix that is still a prefix of a plain secret, and
+						// do not end inside one the whole-string obfuscator must see whole.
 						const ellipsisBytes = 3; // "…" in UTF-8
 						const headRoom = Math.max(0, remaining - ellipsisBytes);
 						let keptBytes = 0;
@@ -1229,8 +1259,17 @@ export class OutputSink {
 						let lineBytesReset = false;
 						if (secrets && segment.startsWith(keptText)) {
 							const prior = this.#columnLine;
+							const text = prior + segment;
 							const cut = prior.length + keptText.length;
-							const end = columnHeadEndOutsideSecrets(prior + segment, cut, secrets);
+							let end = cut;
+							while (end > 0) {
+								const next = Math.min(
+									columnHeadEndOutsideSecrets(text, end, secrets),
+									columnHeadEndBeforeOpenPrefix(text, end, secrets),
+								);
+								if (next >= end) break;
+								end = next;
+							}
 							if (end < cut) {
 								if (end < prior.length) {
 									this.#retractColumnSuffix(prior.slice(end));
