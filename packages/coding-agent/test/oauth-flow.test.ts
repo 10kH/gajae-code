@@ -1514,4 +1514,131 @@ describe("pinned public OAuth fetches", () => {
 		expect(new URL(url).pathname).toBe("/authorize");
 		expect(followed).toBe(0);
 	});
+
+	const PROXY_ENV_KEYS = ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] as const;
+
+	async function withProxyEnv(values: Record<string, string | undefined>, run: () => Promise<void>): Promise<void> {
+		const previous = new Map<string, string | undefined>();
+		for (const key of PROXY_ENV_KEYS) {
+			previous.set(key, process.env[key]);
+			const next = values[key];
+			if (next === undefined) delete process.env[key];
+			else process.env[key] = next;
+		}
+		try {
+			await run();
+		} finally {
+			for (const key of PROXY_ENV_KEYS) {
+				const prior = previous.get(key);
+				if (prior === undefined) delete process.env[key];
+				else process.env[key] = prior;
+			}
+		}
+	}
+
+	function onlyProxy(key: (typeof PROXY_ENV_KEYS)[number]): Record<string, string | undefined> {
+		const values: Record<string, string | undefined> = {};
+		for (const name of PROXY_ENV_KEYS) values[name] = name === key ? "http://127.0.0.1:9" : undefined;
+		return values;
+	}
+
+	async function expectPublicExchangeAndRegistration(): Promise<void> {
+		let registered = false;
+		let tokenCalls = 0;
+		using _hook = hookFetch((input, init) => {
+			const url = observedUrl(input, init);
+			if (url.origin === "https://provider.example" && url.pathname === "/.well-known/oauth-authorization-server") {
+				return Response.json({ registration_endpoint: "https://provider.example/register" });
+			}
+			if (url.origin === "https://provider.example" && url.pathname === "/register") {
+				registered = true;
+				return Response.json({ client_id: "registered-client", client_secret: "registered-secret" });
+			}
+			if (url.origin === "https://provider.example" && url.pathname === "/authorize") {
+				return new Response("ok", { status: 200 });
+			}
+			if (url.origin === "https://provider.example" && url.pathname === "/token") {
+				tokenCalls += 1;
+				expect(new URLSearchParams(String(init?.body ?? "")).get("client_secret")).toBe("client-secret");
+				return Response.json({ access_token: "access-token", refresh_token: "refresh-token", expires_in: 60 });
+			}
+			throw new Error(`Unexpected fetch: ${url.href}`);
+		});
+		const registration = new MCPOAuthFlow(
+			{
+				authorizationUrl: "https://provider.example/authorize",
+				tokenUrl: "https://provider.example/token",
+			},
+			{},
+		);
+		const auth = await registration.generateAuthUrl("state", "https://client.example/oauth/callback");
+		expect(new URL(auth.url).searchParams.get("client_id")).toBe("registered-client");
+		expect(registration.resolvedClientId).toBe("registered-client");
+		expect(registered).toBe(true);
+
+		const token = new MCPOAuthFlow(
+			{
+				authorizationUrl: "https://provider.example/authorize",
+				tokenUrl: "https://provider.example/token",
+				clientId: "client-id",
+				clientSecret: "client-secret",
+			},
+			{},
+		);
+		const credentials = await token.exchangeToken(
+			"authorization-code",
+			"state",
+			"https://client.example/oauth/callback",
+		);
+		expect(credentials.access).toBe("access-token");
+		expect(tokenCalls).toBe(1);
+	}
+
+	for (const key of PROXY_ENV_KEYS) {
+		it(`refuses the authorization-code exchange and skips registration when ${key} is set`, async () => {
+			let fetches = 0;
+			using _hook = hookFetch(() => {
+				fetches += 1;
+				return Response.json({ access_token: "should-not-issue", client_id: "should-not-register" });
+			});
+			await withProxyEnv(onlyProxy(key), async () => {
+				const token = new MCPOAuthFlow(
+					{
+						authorizationUrl: "https://provider.example/authorize",
+						tokenUrl: "https://provider.example/token",
+						clientId: "client-id",
+						clientSecret: "client-secret",
+					},
+					{},
+				);
+				await expect(
+					token.exchangeToken("authorization-code", "state", "https://client.example/oauth/callback"),
+				).rejects.toThrow(/Refusing non-public OAuth endpoint: proxy/);
+				const registration = new MCPOAuthFlow(
+					{
+						authorizationUrl: "https://provider.example/authorize",
+						tokenUrl: "https://provider.example/token",
+					},
+					{},
+				);
+				const auth = await registration.generateAuthUrl("state", "https://client.example/oauth/callback");
+				expect(registration.resolvedClientId).toBeUndefined();
+				expect(registration.registeredClientSecret).toBeUndefined();
+				expect(new URL(auth.url).searchParams.get("client_id")).toBeNull();
+			});
+			expect(fetches).toBe(0);
+		});
+	}
+
+	it("exchanges and registers when no proxy variable is set", async () => {
+		const values: Record<string, string | undefined> = {};
+		for (const key of PROXY_ENV_KEYS) values[key] = undefined;
+		await withProxyEnv(values, () => expectPublicExchangeAndRegistration());
+	});
+
+	it("exchanges and registers when proxy variables are empty", async () => {
+		const values: Record<string, string | undefined> = {};
+		for (const key of PROXY_ENV_KEYS) values[key] = "";
+		await withProxyEnv(values, () => expectPublicExchangeAndRegistration());
+	});
 });
