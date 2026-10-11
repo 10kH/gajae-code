@@ -198,6 +198,7 @@ function redactChangelogEntry(text: string): string {
 		"$1$2[REDACTED_SECRET]",
 	);
 	redacted = redacted.replace(/\b(?:sk|pk|rk|xox[baprs])-[-_A-Za-z0-9]{12,}\b/g, "[REDACTED_TOKEN]");
+	redacted = redacted.replace(/(?<![A-Za-z0-9_-])AIza[0-9A-Za-z_-]{35}(?![A-Za-z0-9_-])/g, "[REDACTED_TOKEN]");
 	redacted = redacted.replace(/\b(?:gh[opsur]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{12,})\b/g, "[REDACTED_TOKEN]");
 	redacted = redacted.replace(
 		/\b((?:ANTHROPIC|OPENAI|GITHUB|GOOGLE|GEMINI|KAGI|TAVILY|EXA|PERPLEXITY|ZAI|KIMI|BRAVE|SEARXNG|AWS)_[A-Z0-9_]*(?:KEY|TOKEN|SECRET|COOKIE|PASSWORD))\s*=\s*[^\s\n]+/gi,

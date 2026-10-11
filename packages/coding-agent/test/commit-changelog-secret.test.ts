@@ -6,6 +6,7 @@ import type { Api, AssistantMessage, Model } from "@gajae-code/ai/core";
 import * as aiCore from "@gajae-code/ai/core";
 
 const SECRET = "sk-ant-GJCCANARY-changelog-0123456789abcdef";
+const GOOGLE_KEY = `AIza${"S".repeat(35)}`;
 const PLAIN_ENTRY = "document the config loader";
 
 const model = { id: "test", api: "openai-responses", provider: "openai" } as Model<Api>;
@@ -66,6 +67,16 @@ async function initRepo(): Promise<string> {
 	return dir;
 }
 
+async function stagedChangelog(cwd: string): Promise<string> {
+	const proc = Bun.spawn(["git", "show", ":CHANGELOG.md"], { cwd, stdout: "pipe", stderr: "pipe" });
+	const exitCode = await proc.exited;
+	if (exitCode !== 0) {
+		const stderr = await new Response(proc.stderr).text();
+		throw new Error(`git show :CHANGELOG.md exited ${exitCode}: ${stderr}`);
+	}
+	return new Response(proc.stdout).text();
+}
+
 async function runFlow(cwd: string): Promise<string> {
 	const { runChangelogFlow } = await import("../src/commit/changelog/index");
 	const updated = await runChangelogFlow({
@@ -101,6 +112,19 @@ describe("runChangelogFlow changelog persistence", () => {
 
 		expect(changelog).not.toContain(SECRET);
 		expect(changelog).toContain("- document key [REDACTED_TOKEN]");
+		expect(changelog).toContain("- existing safe entry");
+	});
+
+	it("does not persist a bare Google API key into CHANGELOG.md", async () => {
+		scriptCompleteSimple({ Added: [`document loader ${GOOGLE_KEY}`] });
+		const cwd = await initRepo();
+		const changelog = await runFlow(cwd);
+		const staged = await stagedChangelog(cwd);
+
+		expect(changelog).not.toContain(GOOGLE_KEY);
+		expect(staged).not.toContain(GOOGLE_KEY);
+		expect(changelog).toContain("- document loader [REDACTED_TOKEN]");
+		expect(staged).toContain("- document loader [REDACTED_TOKEN]");
 		expect(changelog).toContain("- existing safe entry");
 	});
 });
