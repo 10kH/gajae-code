@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { AgentToolUpdateCallback } from "@gajae-code/agent-core";
 
 import { sanitizeText } from "@gajae-code/utils";
@@ -27,6 +28,46 @@ export const DEFAULT_ARTIFACT_MAX_BYTES = 10 * 1024 * 1024; // 10MB
 const NL = "\n";
 
 const ELLIPSIS = "…";
+
+const outputPlainSecrets = new AsyncLocalStorage<readonly string[]>();
+
+/** Run `fn` while column caps can see these plain secrets. */
+export function runWithOutputRedaction<T>(plainSecrets: readonly string[], fn: () => T): T {
+	return outputPlainSecrets.run(plainSecrets, fn);
+}
+
+function activePlainSecrets(): readonly string[] | undefined {
+	const secrets = outputPlainSecrets.getStore();
+	return secrets && secrets.length > 0 ? secrets : undefined;
+}
+
+/**
+ * Pull a column-cap end back to the start of any plain secret that crosses it.
+ * A secret that ends on the cut stays, so a later whole-string obfuscator can match it.
+ */
+function columnHeadEndOutsideSecrets(segment: string, end: number, secrets: readonly string[]): number {
+	let cut = end;
+	while (cut > 0) {
+		let earliest = cut;
+		for (const secret of secrets) {
+			const secretChars = secret.length;
+			if (secretChars === 0) continue;
+			const windowStart = Math.max(0, cut - secretChars);
+			const window = segment.slice(windowStart, Math.min(segment.length, cut + secretChars));
+			const limit = cut - windowStart;
+			let from = 0;
+			while (from < limit) {
+				const rel = window.indexOf(secret, from);
+				if (rel === -1 || rel >= limit) break;
+				if (rel + secretChars > limit) earliest = Math.min(earliest, windowStart + rel);
+				from = rel + 1;
+			}
+		}
+		if (earliest === cut) break;
+		cut = earliest;
+	}
+	return cut;
+}
 
 const ARTIFACT_WRITER_DIAGNOSTIC_MAX_BYTES = 256;
 
@@ -952,6 +993,10 @@ export class OutputSink {
 	#columnEllipsisAdded = false;
 	#columnDroppedBytes = 0;
 	#columnTruncatedLines = 0;
+	/** Plain secrets captured when this sink is built inside an active redaction scope. */
+	readonly #plainSecrets?: readonly string[];
+	/** Text already retained for the open line. A later chunk may shorten it. */
+	#columnLine = "";
 	#file?: {
 		path: string;
 		artifactId?: string;
@@ -1010,6 +1055,7 @@ export class OutputSink {
 		this.#artifactMaxBytes = Math.max(0, artifactMaxBytes);
 		this.#artifactPublisher = artifactPublisher;
 		this.#coalesceSanitize = coalesceSanitize;
+		this.#plainSecrets = activePlainSecrets();
 	}
 
 	#headText(): string {
@@ -1108,6 +1154,10 @@ export class OutputSink {
 		if (this.#artifactPath && this.#maxColumns > 0) this.#enqueueFileWrite(rawChunk, rawBytes);
 		else if (this.#artifactPublisher && this.#maxColumns > 0) this.#enqueueTerminalArtifactChunk(rawChunk, rawBytes);
 		if (this.#columnDroppedBytes > 0) this.#createFileSink();
+		this.#retainVisible(visibleChunk);
+	}
+
+	#retainVisible(visibleChunk: string): void {
 		const visibleBytes = Buffer.byteLength(visibleChunk, "utf-8");
 		if (visibleChunk.length > 0) {
 			this.#processedBytes += visibleBytes;
@@ -1161,21 +1211,49 @@ export class OutputSink {
 					if (segBytes <= remaining) {
 						parts.push(segment);
 						this.#currentLineBytes += segBytes;
+						if (this.#plainSecrets) this.#columnLine += segment;
 					} else {
 						// First overflow on this line: keep what fits, append ellipsis,
-						// arm the skip-until-newline flag.
+						// arm the skip-until-newline flag. With secrets, do not end
+						// inside a plain secret the whole-string obfuscator must see whole.
 						const ellipsisBytes = 3; // "…" in UTF-8
 						const headRoom = Math.max(0, remaining - ellipsisBytes);
 						let keptBytes = 0;
+						let keptText = "";
 						if (headRoom > 0) {
 							const sliced = truncateHeadBytes(segment, headRoom);
+							keptText = sliced.text;
 							keptBytes = sliced.bytes;
-							parts.push(sliced.text);
 						}
+						const secrets = this.#plainSecrets;
+						let lineBytesReset = false;
+						if (secrets && segment.startsWith(keptText)) {
+							const prior = this.#columnLine;
+							const cut = prior.length + keptText.length;
+							const end = columnHeadEndOutsideSecrets(prior + segment, cut, secrets);
+							if (end < cut) {
+								if (end < prior.length) {
+									this.#retractColumnSuffix(prior.slice(end));
+									this.#columnLine = prior.slice(0, end);
+									keptText = "";
+									keptBytes = 0;
+								} else {
+									keptText = segment.slice(0, end - prior.length);
+									keptBytes = Buffer.byteLength(keptText, "utf-8");
+									this.#columnLine = prior + keptText;
+								}
+								// columnLine already includes the bytes kept from this segment.
+								this.#currentLineBytes = Buffer.byteLength(this.#columnLine, "utf-8");
+								lineBytesReset = true;
+							} else {
+								this.#columnLine = prior + keptText;
+							}
+						}
+						if (keptText.length > 0) parts.push(keptText);
 						parts.push(ELLIPSIS);
 						this.#columnDroppedBytes += segBytes - keptBytes;
 						this.#columnTruncatedLines++;
-						this.#currentLineBytes += keptBytes + ellipsisBytes;
+						this.#currentLineBytes += (lineBytesReset ? 0 : keptBytes) + ellipsisBytes;
 						this.#columnEllipsisAdded = true;
 					}
 				}
@@ -1184,9 +1262,31 @@ export class OutputSink {
 			parts.push(NL);
 			this.#currentLineBytes = 0;
 			this.#columnEllipsisAdded = false;
+			this.#columnLine = "";
 			cursor = nlIdx + 1;
 		}
 		return parts.join("");
+	}
+
+	/** Drop a suffix of the open line that was already retained, without reordering. */
+	#retractColumnSuffix(suffix: string): void {
+		if (suffix.length === 0) return;
+		const bytes = Buffer.byteLength(suffix, "utf-8");
+		const tail = this.#buffer;
+		if (tail.endsWith(suffix)) {
+			const next = tail.slice(0, tail.length - suffix.length);
+			this.#setTail(next, Buffer.byteLength(next, "utf-8"));
+		} else if (suffix.endsWith(tail) && this.#head.endsWith(suffix.slice(0, suffix.length - tail.length))) {
+			const headSuffix = suffix.slice(0, suffix.length - tail.length);
+			const nextHead = this.#head.slice(0, this.#head.length - headSuffix.length);
+			this.#head = nextHead;
+			this.#headBytes = Buffer.byteLength(nextHead, "utf-8");
+			this.#setTail("", 0);
+		} else {
+			return;
+		}
+		this.#processedBytes = Math.max(0, this.#processedBytes - bytes);
+		this.#columnDroppedBytes += bytes;
 	}
 
 	#retainedSummary(text: string): { text: string; bytes: number; lines: number } {
@@ -1458,6 +1558,7 @@ export class OutputSink {
 	 */
 	replace(text: string): void {
 		this.#coalesceBuf = "";
+		this.#columnLine = "";
 		const replacementBytes = Buffer.byteLength(text, "utf-8");
 		this.#head = "";
 		this.#headBytes = 0;
