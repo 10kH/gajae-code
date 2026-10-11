@@ -12,6 +12,7 @@ import { SessionManager } from "../src/session/session-manager";
 
 const CANARY = "GJCCANARY7f3a9d2e-SECRETVALUE-DO-NOT-LEAK";
 const ORDINARY = "ORDINARY-NOTE-7c2e-keep";
+const STORED_ORDINARY = "STORED-NOTE-7c2e-keep";
 const PLACEHOLDER = /#GJC1_[A-Za-z0-9_-]{22}#/;
 const SECRET_ENV_PATTERNS = /(?:KEY|SECRET|TOKEN|PASSWORD|PASS|AUTH|CREDENTIAL|PRIVATE|OAUTH)(?:_|$)/i;
 
@@ -102,11 +103,12 @@ describe("summary requests obfuscate registered secrets", () => {
 		authStorage.setRuntimeApiKey("github-copilot", "test-key");
 
 		const sessionManager = SessionManager.inMemory();
-		sessionManager.appendMessage({
+		const firstId = sessionManager.appendMessage({
 			role: "user",
 			content: [{ type: "text", text: `Initial request ${CANARY} ${ORDINARY}` }],
 			timestamp: Date.now() - 3,
 		});
+		sessionManager.appendCompaction(`Stored summary ${CANARY} ${STORED_ORDINARY}`, undefined, firstId, 1_000);
 		sessionManager.appendMessage({
 			role: "assistant",
 			content: [{ type: "text", text: `Initial response ${CANARY} ${ORDINARY}` }],
@@ -177,6 +179,7 @@ describe("summary requests obfuscate registered secrets", () => {
 			const session = await createSession();
 			await session.compact();
 			const text = summaryText(captured);
+			expect(text).toContain("<previous-summary>");
 			expect(text).not.toContain(CANARY);
 			expect(text).toMatch(PLACEHOLDER);
 		});
@@ -187,7 +190,9 @@ describe("summary requests obfuscate registered secrets", () => {
 			const captured = captureSummaryContexts();
 			const session = await createSession();
 			await session.compact();
-			expect(summaryText(captured)).toContain(ORDINARY);
+			const text = summaryText(captured);
+			expect(text).toContain(ORDINARY);
+			expect(text).toContain(STORED_ORDINARY);
 		});
 	});
 });
