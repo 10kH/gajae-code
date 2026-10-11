@@ -75,7 +75,6 @@ const WRAPPER_LONG_OPTIONS: Record<string, Record<string, boolean>> = {
 		"--no-run-if-empty": false, // xargs --no-run-if-empty (flag-only)
 		"--exit": false, // xargs --exit (flag-only)
 		"--null-input": false, // xargs --null-input (flag-only, same as -0)
-		"--replace": false, // xargs --replace (flag-only, same as -I)
 	},
 };
 
@@ -914,7 +913,7 @@ function assignedTmuxSocket(tokens: Token[], commandIndex: number): string | und
 								} else if (optText.startsWith("--")) {
 									// Check for long options (handle both --option and --option=value forms)
 									const longOptName = optText.includes("=") ? optText.split("=")[0] : optText;
-								
+
 									// Check wrapper-specific long options
 									const wrapperLongOpts = WRAPPER_LONG_OPTIONS[baseName];
 									if (wrapperLongOpts && longOptName in wrapperLongOpts) {
