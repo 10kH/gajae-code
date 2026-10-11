@@ -22,6 +22,11 @@
  *   SEARXNG_BASIC_USERNAME - Optional RFC 7617 Basic auth username
  *   SEARXNG_BASIC_PASSWORD - Optional RFC 7617 Basic auth password
  *
+ * A project settings endpoint must not receive a credential that exists only in
+ * the operator environment. The project file can still authenticate with a
+ * credential it sets itself, and an operator endpoint still receives an
+ * operator environment credential.
+ *
  * Reference: https://docs.searxng.org/dev/search_api.html
  */
 
@@ -80,7 +85,6 @@ interface SearXNGAuth {
 	value: string;
 }
 
-/** Find SearXNG endpoint from settings or environment. */
 /**
  * SearXNG environment value, from trusted sources only, preserving an
  * intentionally empty setting.
@@ -122,6 +126,7 @@ export function resolveSearxngConfigForTest(): {
 	};
 }
 
+/** Find SearXNG endpoint from settings or environment. */
 function findEndpoint(activeSettings?: Settings): string | null {
 	try {
 		const endpoint = (activeSettings ?? settings).get("searxng.endpoint");
@@ -132,36 +137,66 @@ function findEndpoint(activeSettings?: Settings): string | null {
 	return trustedSearxngEnv("SEARXNG_ENDPOINT");
 }
 
+/**
+ * True when `endpoint` is the value supplied by the project settings layer.
+ *
+ * `get` is global, then project, then runtime override. `getOverride` and
+ * `getGlobal` are the layers a project file cannot write, so a value that is
+ * present, not overridden, and different from the global layer came from the
+ * project file. An equal global value is the operator endpoint even if the
+ * project file repeats it.
+ */
+function endpointComesFromProjectLayer(activeSettings: Settings | undefined, endpoint: string | null): boolean {
+	if (!endpoint) return false;
+	try {
+		const active = activeSettings ?? settings;
+		if (active.getOverride("searxng.endpoint") !== undefined) return false;
+		if (!active.has("searxng.endpoint")) return false;
+		const effective = active.get("searxng.endpoint");
+		if (effective !== endpoint) return false;
+		const globalValue = active.getGlobal("searxng.endpoint");
+		return globalValue === undefined || globalValue !== effective;
+	} catch {
+		return false;
+	}
+}
+
 /** Find SearXNG bearer token from settings or environment. */
-function findToken(activeSettings?: Settings): string | null {
+function findToken(activeSettings?: Settings, allowEnvironment = true): string | null {
 	try {
 		const token = (activeSettings ?? settings).get("searxng.token");
 		if (token) return token;
 	} catch {
 		// Settings not initialized yet
+		return allowEnvironment ? trustedSearxngEnv("SEARXNG_TOKEN") : null;
 	}
+	if (!allowEnvironment) return null;
 	return trustedSearxngEnv("SEARXNG_TOKEN");
 }
 
 /** Find SearXNG Basic auth username from settings or environment. */
-function findBasicUsername(activeSettings?: Settings): string | null {
+function findBasicUsername(activeSettings?: Settings, allowEnvironment = true): string | null {
 	try {
 		const username = (activeSettings ?? settings).get("searxng.basicUsername");
 		if (username !== undefined) return username;
 	} catch {
 		// Settings not initialized yet
+		return allowEnvironment ? trustedSearxngEnv("SEARXNG_BASIC_USERNAME") : null;
 	}
+	if (!allowEnvironment) return null;
 	return trustedSearxngEnv("SEARXNG_BASIC_USERNAME");
 }
 
 /** Find SearXNG Basic auth password from settings or environment. */
-function findBasicPassword(activeSettings?: Settings): string | null {
+function findBasicPassword(activeSettings?: Settings, allowEnvironment = true): string | null {
 	try {
 		const password = (activeSettings ?? settings).get("searxng.basicPassword");
 		if (password !== undefined) return password;
 	} catch {
 		// Settings not initialized yet
+		return allowEnvironment ? trustedSearxngEnv("SEARXNG_BASIC_PASSWORD") : null;
 	}
+	if (!allowEnvironment) return null;
 	return trustedSearxngEnv("SEARXNG_BASIC_PASSWORD");
 }
 
@@ -175,11 +210,22 @@ function hasControlCharacters(value: string): boolean {
 	return /[\u0000-\u001F\u007F-\u009F]/u.test(value);
 }
 
-/** Find SearXNG authentication from settings or environment. Basic auth takes precedence over bearer tokens. */
-function findAuth(activeSettings?: Settings): SearXNGAuth | null {
-	const basicUsername = findBasicUsername(activeSettings);
-	const basicPassword = findBasicPassword(activeSettings);
-	return resolveBasicOrBearerAuth(basicUsername, basicPassword, findToken(activeSettings));
+/**
+ * Find SearXNG authentication from settings or environment. Basic auth takes
+ * precedence over bearer tokens.
+ *
+ * When `endpoint` came from the project settings layer, environment credentials
+ * are omitted. A token or basic-auth pair set in settings is still used, including
+ * one the project file set itself.
+ */
+function findAuth(activeSettings?: Settings, endpoint?: string | null): SearXNGAuth | null {
+	const resolvedEndpoint = endpoint === undefined ? findEndpoint(activeSettings) : endpoint;
+	const allowEnvironment = !endpointComesFromProjectLayer(activeSettings, resolvedEndpoint);
+	return resolveBasicOrBearerAuth(
+		findBasicUsername(activeSettings, allowEnvironment),
+		findBasicPassword(activeSettings, allowEnvironment),
+		findToken(activeSettings, allowEnvironment),
+	);
 }
 
 function resolveBasicOrBearerAuth(
@@ -322,7 +368,9 @@ export async function searchSearXNG(params: {
 		);
 	}
 
-	const auth = params.authStorage ? await findAuthFromStorage(params.authStorage) : findAuth(params.settings);
+	const auth = params.authStorage
+		? await findAuthFromStorage(params.authStorage)
+		: findAuth(params.settings, endpoint);
 
 	let categories: string | undefined;
 	let language: string | undefined;
