@@ -4,7 +4,14 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { performance } from "node:perf_hooks";
-import { $flag, $pickflag, getDebugLogPath, logger, onDefaultTabWidthChange } from "@gajae-code/utils";
+import {
+	$flag,
+	$pickflag,
+	getDebugLogPath,
+	logger,
+	onDefaultTabWidthChange,
+	redactCrashSecrets,
+} from "@gajae-code/utils";
 import { getKeybindings } from "./keybindings";
 import { isKeyRelease } from "./keys";
 import { renderMetrics } from "./metrics";
@@ -1272,6 +1279,28 @@ export class TUI extends Container {
 	#appendDebugRedrawLog(message: string): void {
 		TUI.#renderCounters.debugRedrawAppendWrites += 1;
 		fs.appendFileSync(getDebugLogPath(), message);
+	}
+
+	// Sibling of the debug log, not /tmp/tui. Create the parent only when it is
+	// missing, and keep both the directory and the frame owner-only.
+	#writeRenderDebugDump(debugData: string): void {
+		const debugDir = path.dirname(getDebugLogPath());
+		if (!fs.existsSync(debugDir)) {
+			fs.mkdirSync(debugDir, { recursive: true, mode: 0o700 });
+			fs.chmodSync(debugDir, 0o700);
+		}
+		const debugPath = path.join(debugDir, `render-${Date.now()}-${Math.random().toString(36).slice(2)}.log`);
+		// A CSI final is a letter, including after JSON.stringify encodes ESC as
+		// "\\u001b". redactCrashSecrets then misses a line-leading "Bearer".
+		const separateCsiFinal = (match: string) => `${match}\u0000`;
+		const separated = debugData
+			.replace(/\u001b\[[0-9;?]*[A-Za-z]/g, separateCsiFinal)
+			.replace(/\\u001[bB]\[[0-9;?]*[A-Za-z]/g, separateCsiFinal);
+		const redacted = redactCrashSecrets(separated)
+			.replace(/\u001b\[[0-9;?]*[A-Za-z]\u0000/g, match => match.slice(0, -1))
+			.replace(/\\u001[bB]\[[0-9;?]*[A-Za-z]\u0000/g, match => match.slice(0, -1));
+		fs.writeFileSync(debugPath, redacted, { mode: 0o600 });
+		fs.chmodSync(debugPath, 0o600);
 	}
 
 	#visibleWidthForDifferentialGuard(line: string): number {
@@ -6334,9 +6363,6 @@ export class TUI extends Container {
 		buffer = this.#frameSynchronizedOutput(buffer);
 
 		if ($pickflag("GJC_TUI_DEBUG", "PI_TUI_DEBUG")) {
-			const debugDir = "/tmp/tui";
-			fs.mkdirSync(debugDir, { recursive: true });
-			const debugPath = path.join(debugDir, `render-${Date.now()}-${Math.random().toString(36).slice(2)}.log`);
 			const debugData = [
 				`firstChanged: ${firstChanged}`,
 				`viewportTop: ${viewportTop}`,
@@ -6360,7 +6386,7 @@ export class TUI extends Container {
 				"=== buffer ===",
 				JSON.stringify(buffer),
 			].join("\n");
-			fs.writeFileSync(debugPath, debugData);
+			this.#writeRenderDebugDump(debugData);
 		}
 
 		// Write entire buffer at once. Once those bytes are accepted, the painted
