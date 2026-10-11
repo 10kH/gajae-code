@@ -565,35 +565,37 @@ describe("file tool atomicity and read-after-write (#4734)", () => {
 		}
 	});
 
-	it("refuses a symlink inside an explicit local root after it is retargeted outside", async () => {
-		if (process.platform === "win32") return;
-		const artifacts = path.join(tmpDir, "artifacts");
-		const localRoot = path.join(artifacts, "local");
-		const inside = path.join(localRoot, "inside.ts");
-		const outside = path.join(tmpDir, "outside-secret.ts");
-		const link = path.join(localRoot, "alias.ts");
-		await fs.mkdir(localRoot, { recursive: true });
-		await fs.writeFile(inside, "inside\n");
-		await fs.writeFile(outside, "outside\n");
-		await fs.symlink(inside, link);
-		await fs.unlink(link);
-		await fs.symlink(outside, link);
-		LocalProtocolHandler.setOverride({
-			getArtifactsDir: () => artifacts,
-			getSessionId: () => "explicit-local-trust",
-		});
-		try {
-			await expect(writeFileAtomically(link, "must-not-write\n")).rejects.toThrow(/outside trust boundary/);
-			expect(await fs.readFile(outside, "utf8")).toBe("outside\n");
-			expect(await fs.readFile(inside, "utf8")).toBe("inside\n");
-			expect(await fs.readlink(link)).toBe(outside);
-			const kept = path.join(localRoot, "kept.ts");
-			await writeFileAtomically(kept, "kept\n");
-			expect(await fs.readFile(kept, "utf8")).toBe("kept\n");
-		} finally {
-			LocalProtocolHandler.setOverride(undefined);
-		}
-	});
+	it.skipIf(process.platform === "win32")(
+		"refuses a symlink inside an explicit local root after it is retargeted outside",
+		async () => {
+			const artifacts = path.join(tmpDir, "artifacts");
+			const localRoot = path.join(artifacts, "local");
+			const inside = path.join(localRoot, "inside.ts");
+			const outside = path.join(tmpDir, "outside-secret.ts");
+			const link = path.join(localRoot, "alias.ts");
+			await fs.mkdir(localRoot, { recursive: true });
+			await fs.writeFile(inside, "inside\n");
+			await fs.writeFile(outside, "outside\n");
+			await fs.symlink(inside, link);
+			await fs.unlink(link);
+			await fs.symlink(outside, link);
+			LocalProtocolHandler.setOverride({
+				getArtifactsDir: () => artifacts,
+				getSessionId: () => "explicit-local-trust",
+			});
+			try {
+				await expect(writeFileAtomically(link, "must-not-write\n")).rejects.toThrow(/outside trust boundary/);
+				expect(await fs.readFile(outside, "utf8")).toBe("outside\n");
+				expect(await fs.readFile(inside, "utf8")).toBe("inside\n");
+				expect(await fs.readlink(link)).toBe(outside);
+				const kept = path.join(localRoot, "kept.ts");
+				await writeFileAtomically(kept, "kept\n");
+				expect(await fs.readFile(kept, "utf8")).toBe("kept\n");
+			} finally {
+				LocalProtocolHandler.setOverride(undefined);
+			}
+		},
+	);
 
 	it("rejects a symlink escape from the session-scoped gjc-local root", async () => {
 		if (process.platform === "win32") return;
