@@ -173,11 +173,20 @@ function pathIsWithin(target: string, root: string): boolean {
 }
 
 async function realpathOrSelf(p: string): Promise<string> {
-	try {
-		return await fs.realpath(p);
-	} catch (error) {
-		if (!isEnoent(error)) throw error;
-		return path.resolve(p);
+	const resolved = path.resolve(p);
+	const missing: string[] = [];
+	let cursor = resolved;
+	for (;;) {
+		try {
+			const real = await fs.realpath(cursor);
+			return missing.length === 0 ? real : path.join(real, ...missing.reverse());
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+			const parent = path.dirname(cursor);
+			if (parent === cursor) return resolved;
+			missing.push(path.basename(cursor));
+			cursor = parent;
+		}
 	}
 }
 
@@ -223,8 +232,8 @@ function trustBoundaryForDestination(lexicalDest: string): string | undefined {
  * This must run before any directory is created. A dangling symlink inside a
  * trusted root resolves to a path outside it, so creating parents first would
  * let an attacker-selected directory tree be materialized outside the sandbox
- * before publication is refused. Missing ancestors therefore resolve
- * lexically (`realpathOrSelf` tolerates ENOENT) and are still boundary-checked.
+ * before publication is refused. A missing path is resolved through the
+ * nearest existing ancestor's realpath, then the missing suffix is appended.
  */
 async function assertWithinTrustBoundary(publishPath: string, trustBoundary: string): Promise<void> {
 	const boundary = path.resolve(trustBoundary);

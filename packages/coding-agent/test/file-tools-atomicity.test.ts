@@ -597,6 +597,28 @@ describe("file tool atomicity and read-after-write (#4734)", () => {
 		},
 	);
 
+	it.skipIf(process.platform === "win32")(
+		"writes a new nested file under an explicit root reached through a symlink",
+		async () => {
+			const real = path.join(tmpDir, "real");
+			const alias = path.join(tmpDir, "alias");
+			const localRoot = path.join(real, "artifacts", "local");
+			await fs.mkdir(localRoot, { recursive: true });
+			await fs.symlink(real, alias);
+			LocalProtocolHandler.setOverride({
+				getArtifactsDir: () => path.join(alias, "artifacts"),
+				getSessionId: () => "explicit-local-trust",
+			});
+			try {
+				const dest = path.join(alias, "artifacts", "local", "nested", "kept.ts");
+				await writeFileAtomically(dest, "kept\n");
+				expect(await fs.readFile(path.join(localRoot, "nested", "kept.ts"), "utf8")).toBe("kept\n");
+			} finally {
+				LocalProtocolHandler.setOverride(undefined);
+			}
+		},
+	);
+
 	it("rejects a symlink escape from the session-scoped gjc-local root", async () => {
 		if (process.platform === "win32") return;
 		const sessionRoot = path.join(os.tmpdir(), "gjc-local", "atomic-trust-test");
