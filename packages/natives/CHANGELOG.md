@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [0.18.9] - 2026-10-11
+
+### Added
+
+- Export a Windows ordinal case-folding primitive for filesystem-aware path identity.
+
+### Fixed
+
+- Use volume capabilities as a conservative fallback when per-directory case flags are unsupported.
+
 ## [0.18.8] - 2026-10-08
 
 ### Added
