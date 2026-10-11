@@ -67,7 +67,7 @@ async function withClearedSecretEnv<T>(run: () => Promise<T>): Promise<T> {
 	}
 }
 
-describe("summary requests use the session converter", () => {
+describe("summary requests obfuscate registered secrets", () => {
 	let tempDir: TempDir;
 	const sessions: Array<{ dispose: () => Promise<void> }> = [];
 	const authStorages: AuthStorage[] = [];
