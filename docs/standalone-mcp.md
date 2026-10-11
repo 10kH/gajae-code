@@ -94,6 +94,28 @@ There is no public MCP config reload while the session runs; edit the config and
 | Editor/ACP client owns MCP servers | ACP via `gjc --mode acp` or `gjc acp` | ACP remains a stdio editor protocol. |
 | Codex / Claude Code delegation plugin | [Canonical gajae-code plugin](./hermes-mcp-bridge.md) | Installs Coordinator MCP plus GJC delegation commands. |
 
+## Example: free web search with Parallel
+
+[Parallel Search MCP](https://docs.parallel.ai/integrations/mcp/search-mcp) provides web search and page fetching over Streamable HTTP without an account or API key. Anonymous searches use Fast mode and have lower rate limits intended for exploration and light use.
+
+From the project where you want the tools, register the server:
+
+```bash
+gjc mcp add parallel-search --project \
+  --type http --url https://search.parallel.ai/mcp \
+  --header 'User-Agent=gajae-code/parallel-search-mcp' \
+  --timeout 30000
+gjc mcp list --project
+```
+
+The registration is stored in `./.gjc/mcp.json`. `list` confirms the stored definition and autoload eligibility; it does not test the remote connection. Start a new `gjc` session in that project to load the server. The two tools are exposed as `mcp__parallel_search_web_search` and `mcp__parallel_search_web_fetch`. Use search for current information and fetch for a specific page that needs closer reading. Reuse one `session_id` across related calls in a conversation when supplying that optional argument.
+
+This adds MCP tools alongside the built-in `web_search` tool; it does not select or configure the built-in Parallel API provider. Existing registrations are preserved, and an existing `parallel-search` entry is not overwritten unless you explicitly pass `--force`. Keep the positive timeout so remote discovery can complete in the background after the bounded startup wait described above. To remove the project registration:
+
+```bash
+gjc mcp remove parallel-search --project
+```
+
 ## Boundary
 
 Standalone GJC does not inherit user-home MCP configurations from Claude Code, Codex, OpenCode, or other tools (`~/.claude`, `~/.codex`, and similar user-global configs are never read). MCP servers often carry credentials, filesystem reach, browser state, approval semantics, and lifecycle that belong to the configuring host. Claude/Codex MCP files are normalized only through the bounded compatibility layer on explicit import, and the only MCP config read from the user's home directory at session startup is GJC's own `~/.gjc/agent/mcp.json` (or the active agent directory when a profile overrides it).
