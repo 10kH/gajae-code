@@ -25,10 +25,11 @@
  *
  * Destination symlinks are followed: the referent is replaced, the link stays.
  * The referent is re-resolved immediately before publication so a retargeted
- * link cannot silently repoint the write, and when the lexical destination
- * sits inside a session-scoped `gjc-local` root the resolved referent and its
- * parent must remain inside that root (a link there must not redirect the
- * write out of the trust boundary).
+ * link cannot silently repoint the write. When the lexical destination sits
+ * inside the active explicit artifacts local root (`<artifacts>/local`) or a
+ * session-scoped `gjc-local` root, the resolved referent and its parent must
+ * remain inside that root (a link there must not redirect the write out of
+ * the trust boundary).
  *
  * Staging uses exclusive create (`wx`) so a colliding leftover temp is never
  * truncated or unlinked; only the temp this call created is cleaned on failure.
@@ -44,6 +45,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { hasFsCode, isEacces, isEisdir, isEnoent, isFsError } from "@gajae-code/utils";
+import { LocalProtocolHandler } from "../internal-urls/local-protocol";
 
 const TEMP_CREATE_ATTEMPTS = 8;
 const DEFAULT_FILE_MODE = 0o666;
@@ -111,9 +113,10 @@ export function formatFileWriteError(error: unknown, dest: string, options: { de
 export interface WriteFileAtomicallyOptions {
 	/**
 	 * Trusted root that a resolved symlink referent and its parent must not
-	 * leave. When omitted, the helper still enforces the session-scoped
-	 * `gjc-local` boundary implied by a lexical destination under
-	 * `<tmpdir>/gjc-local/<session-id>`.
+	 * leave. When omitted, a destination inside the active explicit artifacts
+	 * local root (`<artifacts>/local`) uses that root. Otherwise the helper
+	 * still enforces the session-scoped `gjc-local` boundary implied by a
+	 * lexical destination under `<tmpdir>/gjc-local/<session-id>`.
 	 */
 	trustBoundary?: string;
 	/** Platform override used by deterministic retry tests. */
@@ -191,6 +194,25 @@ function sessionLocalRootFor(lexicalDest: string): string | undefined {
 	const sessionSegment = rest.split(path.sep, 1)[0] ?? "";
 	if (sessionSegment.length === 0) return undefined;
 	return path.join(localParent, sessionSegment);
+}
+
+/**
+ * Active explicit artifacts root (`<artifacts>/local`) when `lexicalDest` is
+ * inside it. That root is not under `<tmpdir>/gjc-local`, so the tmp helper
+ * above would leave the write unbounded. Managed sessions keep the tmp root.
+ */
+function explicitLocalRootFor(lexicalDest: string): string | undefined {
+	const options = LocalProtocolHandler.resolveOptions();
+	if (!options || options.isManagedDestination?.()) return undefined;
+	const artifactsDir = options.getArtifactsDir?.();
+	if (!artifactsDir) return undefined;
+	const root = path.resolve(artifactsDir, "local");
+	if (!pathIsWithin(path.resolve(lexicalDest), root)) return undefined;
+	return root;
+}
+
+function trustBoundaryForDestination(lexicalDest: string): string | undefined {
+	return explicitLocalRootFor(lexicalDest) ?? sessionLocalRootFor(lexicalDest);
 }
 
 /**
@@ -502,7 +524,7 @@ export async function writeFileAtomically(
 	try {
 		const platform = options.platform ?? process.platform;
 		const sleep = options.sleep ?? (async (delayMs: number): Promise<void> => await Bun.sleep(delayMs));
-		const trustBoundary = options.trustBoundary ?? sessionLocalRootFor(dest);
+		const trustBoundary = options.trustBoundary ?? trustBoundaryForDestination(dest);
 		const resolved = await resolvePublishPath(dest);
 		publishPath = resolved.publishPath;
 		// Boundary first, then create parents. A dangling symlink inside a trusted
