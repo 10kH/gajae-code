@@ -162,11 +162,6 @@ import {
 } from "../runtime-mcp";
 import { createMCPFormInputHandler } from "../runtime-mcp/elicitation";
 import type { MCPLoadResult } from "../runtime-mcp/manager";
-import {
-	omitPluginMcpNameShadows,
-	retainPluginMcpMandatoryNames,
-	survivingPluginMcpToolNames,
-} from "../runtime-mcp/plugin-mcp-name-filter";
 import { MCP_STARTUP_WAIT_GRACE_MS } from "../runtime-mcp/startup-policy";
 import type { MCPServerConfig } from "../runtime-mcp/types";
 import {
@@ -2819,9 +2814,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						for (const tool of result.tools) {
 							const serverName = tool.mcpServerName;
 							if (serverName === undefined) continue;
-							if (!pluginNames.has(serverName)) conventionalMcpToolNames.push(tool.name);
+							if (pluginNames.has(serverName)) pluginMcpToolNames.push(tool.name);
+							else conventionalMcpToolNames.push(tool.name);
 						}
-						pluginMcpToolNames.push(...survivingPluginMcpToolNames(result.tools as CustomTool[]));
 					}
 				} catch (error) {
 					logger.warn("Failed to recreate MCP authority after session rescope", {
@@ -3945,7 +3940,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const inlineExtensions: ExtensionFactory[] = [...(options.extensions ?? [])];
 		const discoveredHookExtensions: Array<{ factory: ExtensionFactory; name: string }> = [];
 		if (customTools.length > 0) {
-			inlineExtensions.push(createCustomToolsExtension(omitPluginMcpNameShadows(customTools)));
+			inlineExtensions.push(createCustomToolsExtension(customTools));
 		}
 		if (!options.disableExtensionDiscovery) {
 			try {
@@ -4924,9 +4919,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				}
 			}
 		}
-		// Mandatory names follow the plugin tools that survived registration.
-		// A colliding user tool keeps the normalized name and must stay selectable.
-		pluginMcpToolNames.splice(0, pluginMcpToolNames.length, ...survivingPluginMcpToolNames(customTools));
 		const mandatoryMCPToolNameSet = new Set(pluginMcpToolNames);
 		const selectableExplicitMCPToolNames = explicitlyRequestedMCPToolNames.filter(
 			name => !mandatoryMCPToolNameSet.has(name),
@@ -5753,14 +5745,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						const previousNames = ownedMcpManagerToolNames;
 						const nextToolNames = nextTools.map(tool => tool.name);
 						const previousSet = new Set(previousNames);
-						const nextPluginToolNames = survivingPluginMcpToolNames(nextTools);
+						const nextPluginToolNames = nextTools
+							.filter(tool => tool.mcpServerName && pluginServerNames.has(tool.mcpServerName))
+							.map(tool => tool.name);
 						const nextConventionalToolNames = nextTools
 							.filter(tool => tool.mcpServerName && conventionalServerNames.has(tool.mcpServerName))
 							.map(tool => tool.name);
 						const nextMandatoryMcpToolNames = [
-							...retainPluginMcpMandatoryNames(nextTools, pluginMcpToolNames).filter(
-								name => !previousSet.has(name),
-							),
+							...pluginMcpToolNames.filter(name => !previousSet.has(name)),
 							...nextPluginToolNames,
 						];
 						const nextConventionalMcpToolNames = [
@@ -5873,10 +5865,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						const previousNames = inheritedMcpManagerToolNames;
 						const nextNames = snapshot.map(tool => tool.name);
 						const classifiedTools = classifyInheritedMcpToolNames(manager, snapshot);
-						const mandatoryPluginToolNames = survivingPluginMcpToolNames(snapshot);
 						try {
 							await session.replaceNamedCustomTools(previousNames, snapshot, {
-								mandatoryMCPToolNames: mandatoryPluginToolNames,
+								mandatoryMCPToolNames: classifiedTools.pluginMcpToolNames,
 								activateNewTools: false,
 							});
 						} catch (error) {
@@ -5884,7 +5875,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							throw error;
 						}
 						inheritedMcpManagerToolNames = nextNames;
-						pluginMcpToolNames.splice(0, pluginMcpToolNames.length, ...mandatoryPluginToolNames);
+						pluginMcpToolNames.splice(0, pluginMcpToolNames.length, ...classifiedTools.pluginMcpToolNames);
 						conventionalMcpToolNames.splice(
 							0,
 							conventionalMcpToolNames.length,
