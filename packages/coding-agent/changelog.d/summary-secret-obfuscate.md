@@ -1,3 +1,3 @@
 ### Fixed
 
-- Compaction, handoff, and branch-summary requests use the session message converter, so a registered secret is obfuscated before the summary is sent to the provider.
+- Compaction, handoff, and branch-summary requests obfuscate registered secrets with the session registry before the summary is sent to the provider.

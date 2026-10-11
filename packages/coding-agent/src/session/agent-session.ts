@@ -420,7 +420,7 @@ import { attachExactMcpControls, getExactMcpControls, revokeExactMcpControls } f
 import type { NotificationSessionController } from "../sdk/bus/session-control";
 import { buildSyntheticModelId, syntheticNamespaceCollision } from "../sdk/model-profile-model";
 import { sanitizePromptFailure } from "../sdk/prompt-failure";
-import type { SecretObfuscator } from "../secrets/obfuscator";
+import { obfuscateMessages, type SecretObfuscator } from "../secrets/obfuscator";
 import { formatNoCredentialOnboardingError, NoModelSelectedError } from "../setup/model-onboarding-guidance";
 import {
 	isCanonicalGjcWorkflowSkill,
@@ -22505,17 +22505,15 @@ export class AgentSession {
 	}
 
 	/**
-	 * Manual compact, auto compact, handoff, and branch summary must send the
-	 * same converter prompt turns already use. Compaction accepts only a
-	 * synchronous converter; an async custom converter keeps the previous raw
-	 * conversion so a summary that completed before still completes.
+	 * Manual compact, auto compact, handoff, and branch summary keep the
+	 * existing conversion and obfuscate with the session registry prompt turns
+	 * already use.
 	 */
 	#summaryConvertToLlm(messages: AgentMessage[]): Message[] {
-		const converted = this.#convertToLlm(messages);
-		if (converted instanceof Promise) {
-			return convertToLlm(messages);
-		}
-		return converted;
+		const converted = convertToLlm(messages);
+		const obfuscator = this.#obfuscator;
+		if (!obfuscator?.hasSecrets()) return converted;
+		return obfuscateMessages(obfuscator, converted);
 	}
 
 	async #compactWithFallbackModel(
