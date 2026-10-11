@@ -184,7 +184,7 @@ function redactPersistedEntries(entries: Record<string, string[]>): Record<strin
 const AWS_LABELED_KEY =
 	"(?:(?:aws[_-]?)?secret[_-]?access[_-]?key|(?:aws[_-]?)?session[_-]?token|x[_-]?amz[_-]?security[_-]?token)";
 
-function redactChangelogEntry(text: string): string {
+export function redactChangelogEntry(text: string): string {
 	let redacted = text.replace(/(^|[^0-9A-Za-z])(?:AKIA|ASIA)[0-9A-Z]{16}(?![0-9A-Za-z])/g, "$1[REDACTED_AWS_KEY_ID]");
 	redacted = redacted.replace(
 		new RegExp(
