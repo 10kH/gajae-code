@@ -6,6 +6,7 @@ import type { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Api, Model } from "@gajae-code/ai/core";
 import { completeSimple } from "@gajae-code/ai/core";
 import { logger, prompt } from "@gajae-code/utils";
+import { redactChangelogEntry } from "../commit/changelog";
 import type { ModelRegistry } from "../config/model-registry";
 import { resolveModelRoleValue } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
@@ -87,7 +88,7 @@ export async function generateCommitMessage(
 		logger.debug("commit-msg-generator: diff is empty after noise filtering");
 		return null;
 	}
-	const userMessage = `<diff>\n${truncatedDiff}\n</diff>`;
+	const userMessage = `<diff>\n${redactChangelogEntry(truncatedDiff)}\n</diff>`;
 
 	for (const candidate of candidates) {
 		const apiKey = await registry.getApiKey(candidate.model, sessionId);
@@ -120,6 +121,7 @@ export async function generateCommitMessage(
 
 			// Clean up: remove wrapping quotes, backticks, trailing period
 			msg = msg.replace(/^[`"']|[`"']$/g, "").replace(/\.$/, "");
+			msg = redactChangelogEntry(msg);
 
 			logger.debug("commit-msg-generator: generated", { model: candidate.model.id, msg });
 			return msg;
