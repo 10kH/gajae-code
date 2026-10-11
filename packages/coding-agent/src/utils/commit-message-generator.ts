@@ -36,9 +36,9 @@ function filterDiffNoise(diff: string): string {
 	return filtered.join("\n");
 }
 
-/** Keep changelog patterns, then scrub only the npm token family the crash scrubber already names. */
+/** Keep changelog patterns, then scrub known credential shapes on the whole string. */
 function redactCommitMessageText(text: string): string {
-	return redactChangelogEntry(text).replace(/\bnpm_[A-Za-z0-9]{20,}\b/g, token => redactCrashSecrets(token));
+	return redactCrashSecrets(redactChangelogEntry(text));
 }
 
 function getModelCandidates(
