@@ -155,6 +155,23 @@ describe("MCP tool result untrusted marker", () => {
 		}
 	});
 
+	it("keeps an empty server result as no output", async () => {
+		const content: MCPContent[] = [];
+		const { connection, tool } = await connectedTool(() => ({ content }));
+		try {
+			const result = await tool.execute("call-1", {}, undefined, {} as never);
+			expect(result.details?.rawContent).toEqual([]);
+			expect(result.details?.isError).toBeUndefined();
+			const rendered = tool.renderResult(result, { expanded: false, isPartial: false }, displayTheme);
+			expect(rendered).toBeInstanceOf(Text);
+			const shown = (rendered as Text).getText();
+			expect(shown).toContain("(no output)");
+			expect(shown).not.toContain("<untrusted-content>");
+		} finally {
+			await disconnectServer(connection);
+		}
+	});
+
 	it("keeps a suspended server message", async () => {
 		const connection = { name: "fixture" } as MCPServerConnection;
 		const tool = new MCPTool(connection, probe, undefined, { isAvailable: () => false });
