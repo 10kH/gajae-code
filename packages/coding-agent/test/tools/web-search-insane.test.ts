@@ -420,6 +420,44 @@ describe("Insane public-route provider", () => {
 		}
 	});
 
+	it("follows a public redirect to the same feed result", async () => {
+		using _hook = hookFetch((input, init) => {
+			const url = interceptedUrl(input, init);
+			if (url === "https://www.reddit.com/r/test/.rss") {
+				return new Response(null, { status: 301, headers: { location: "/r/test.rss" } });
+			}
+			if (url === "https://www.reddit.com/r/test.rss") return new Response(REDDIT_FEED, { status: 200 });
+			return new Response("", { status: 404 });
+		});
+
+		const result = await routeInsanePublicUrl("https://www.reddit.com/r/test");
+		if (!result || !("sources" in result)) throw new Error("expected route success");
+		expect(result.sources[0]?.title).toBe("Reddit Post");
+	});
+
+	it("rejects a public feed when a proxy environment variable is set", async () => {
+		const previousProxy = process.env.HTTPS_PROXY;
+		const previousNoProxy = process.env.NO_PROXY;
+		process.env.HTTPS_PROXY = "http://127.0.0.1:9";
+		process.env.NO_PROXY = "www.reddit.com";
+		let fetches = 0;
+		try {
+			using _hook = hookFetch(() => {
+				fetches++;
+				return new Response(REDDIT_FEED, { status: 200 });
+			});
+			const result = await routeInsanePublicUrl("https://www.reddit.com/r/test");
+			expect(fetches).toBe(0);
+			if (!result || !("attempts" in result) || "sources" in result) throw new Error("expected a refused route");
+			expect(result.attempts.every(item => item.note === "public_url_rejected")).toBe(true);
+		} finally {
+			if (previousProxy === undefined) delete process.env.HTTPS_PROXY;
+			else process.env.HTTPS_PROXY = previousProxy;
+			if (previousNoProxy === undefined) delete process.env.NO_PROXY;
+			else process.env.NO_PROXY = previousNoProxy;
+		}
+	});
+
 	it("follows a public redirect after validating the next hop", async () => {
 		let fetches = 0;
 		using _hook = hookFetch((input, init) => {
