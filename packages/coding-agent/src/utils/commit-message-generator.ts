@@ -5,7 +5,7 @@
 import type { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Api, Model } from "@gajae-code/ai/core";
 import { completeSimple } from "@gajae-code/ai/core";
-import { logger, prompt } from "@gajae-code/utils";
+import { logger, prompt, redactCrashSecrets } from "@gajae-code/utils";
 import { redactChangelogEntry } from "../commit/changelog";
 import type { ModelRegistry } from "../config/model-registry";
 import { resolveModelRoleValue } from "../config/model-resolver";
@@ -34,6 +34,11 @@ function filterDiffNoise(diff: string): string {
 		if (!skip) filtered.push(line);
 	}
 	return filtered.join("\n");
+}
+
+/** Keep changelog patterns, then scrub only the npm token family the crash scrubber already names. */
+function redactCommitMessageText(text: string): string {
+	return redactChangelogEntry(text).replace(/\bnpm_[A-Za-z0-9]{20,}\b/g, token => redactCrashSecrets(token));
 }
 
 function getModelCandidates(
@@ -88,7 +93,7 @@ export async function generateCommitMessage(
 		logger.debug("commit-msg-generator: diff is empty after noise filtering");
 		return null;
 	}
-	const userMessage = `<diff>\n${redactChangelogEntry(truncatedDiff)}\n</diff>`;
+	const userMessage = `<diff>\n${redactCommitMessageText(truncatedDiff)}\n</diff>`;
 
 	for (const candidate of candidates) {
 		const apiKey = await registry.getApiKey(candidate.model, sessionId);
@@ -121,7 +126,7 @@ export async function generateCommitMessage(
 
 			// Clean up: remove wrapping quotes, backticks, trailing period
 			msg = msg.replace(/^[`"']|[`"']$/g, "").replace(/\.$/, "");
-			msg = redactChangelogEntry(msg);
+			msg = redactCommitMessageText(msg);
 
 			logger.debug("commit-msg-generator: generated", { model: candidate.model.id, msg });
 			return msg;
