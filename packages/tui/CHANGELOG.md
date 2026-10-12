@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.18.10] - 2026-10-12
+
+### Fixed
+
+- TUI no longer goes blank after stop/restart cycles: `#hardwareCursorRow` is now properly reset during `stop()` to prevent stale cursor position state from corrupting viewport calculations on the next `start()`.
+
+- With `clearOnShrink` enabled, a live block that shrinks after the transcript has scrolled into history no longer leaves blank spacer rows above the pinned composer until the next resize. The contraction now clears the screen and history and replays the frame, so the viewport is filled again and no row appears twice in history.
+
 ## [0.18.9] - 2026-10-11
 
 ### Added
