@@ -296,6 +296,8 @@ export async function preflightPatchMkdir(input: PatchInput, options: ApplyPatch
 	if (input.rename) {
 		const destPath = resolvePath(input.rename);
 		if (destPath !== absolutePath) {
+			// The source is locked too. Check it before that lock can mkdir through a symlink.
+			await rejectPatchMkdirEscape(options.cwd, absolutePath, options.localRoot, input.path, options.signal);
 			await rejectPatchMkdirEscape(options.cwd, destPath, options.localRoot, input.rename, options.signal);
 		}
 	}

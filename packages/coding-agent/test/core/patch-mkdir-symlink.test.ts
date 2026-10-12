@@ -276,6 +276,21 @@ describe("patch mkdir symlink", () => {
 		expect(await fs.readFile(dest, "utf8")).toBe("moved\n");
 	});
 
+	test.skipIf(process.platform === "win32")("refuses to move a file whose parent symlink leaves cwd", async () => {
+		const root = track(await fs.mkdtemp(path.join(os.tmpdir(), "patch-mkdir-move-src-esc-")));
+		const cwd = path.join(root, "workspace");
+		const outside = path.join(root, "outside");
+		await fs.mkdir(cwd);
+		await fs.mkdir(outside);
+		const secret = path.join(outside, "secret.txt");
+		await fs.writeFile(secret, "line\n");
+		await fs.symlink(outside, path.join(cwd, "link"), "dir");
+
+		await expect(moveThrough(makeSession(cwd), "link/secret.txt", "nested/dst.txt")).rejects.toThrow(ApplyPatchError);
+		expect(await fs.readFile(secret, "utf8")).toBe("line\n");
+		await expect(fs.stat(path.join(cwd, "nested", "dst.txt"))).rejects.toThrow();
+	});
+
 	test.skipIf(process.platform === "win32")(
 		"refuses to move through a directory symlink that leaves cwd",
 		async () => {
