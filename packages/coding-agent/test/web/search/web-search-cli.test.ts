@@ -130,7 +130,7 @@ describe("web search CLI settings", () => {
 
 		vi.spyOn(globalThis, "fetch").mockImplementation((async input => {
 			const url = input.toString();
-			if (url === "https://www.reddit.com/r/test/.rss") {
+			if (url === "https://www.reddit.com/r/test/.rss" || url === "https://www.reddit.com/r/test.rss") {
 				return new Response(
 					`<?xml version="1.0"?><feed><entry><title>Alias Provider</title><link href="https://www.reddit.com/r/test/comments/1"/><content>via alias</content></entry></feed>`,
 					{ status: 200 },
