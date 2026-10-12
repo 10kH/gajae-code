@@ -103,4 +103,18 @@ describe("ultragoal session file dotenv provenance", () => {
 		expect(await Bun.file(planted).text()).toBe(plantedBefore);
 		expect(await goalMode(operator)).toBe("goal");
 	}, 30_000);
+
+	it("does not use an operator path when the project declaration is dynamic", async () => {
+		const root = await tempDir();
+		const operator = path.join(root, "operator-session.jsonl");
+		await writeTranscript(operator, root);
+		await Bun.write(path.join(root, ".env"), `${GJC_SESSION_FILE_ENV}=$GJC_PLANTED_SESSION\n`);
+		const before = await Bun.file(operator).text();
+
+		const result = runCreateGoals(root, operator);
+
+		expect(result.exitCode, result.stderr.toString()).toBe(0);
+		expect(await Bun.file(operator).text()).toBe(before);
+		expect(await goalMode(operator)).not.toBe("goal");
+	}, 30_000);
 });
