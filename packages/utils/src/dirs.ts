@@ -564,6 +564,15 @@ const trustedAgentOverride =
 	trustedValue("PI_CODING_AGENT_DIR", INITIAL_PROJECT_SNAPSHOT);
 let dirs = new DirResolver(trustedAgentOverride, INITIAL_PROJECT_SNAPSHOT);
 
+/**
+ * Project dotenv as captured when this module loaded.
+ * A later edit or delete of those files does not change the returned provenance.
+ */
+export function loadedProjectEnvSnapshot(): ProjectEnvSnapshot {
+	const snapshot = dirs.trustSnapshot;
+	return { values: { ...snapshot.values }, dynamic: new Set(snapshot.dynamic) };
+}
+
 // =============================================================================
 // Root directories
 // =============================================================================
