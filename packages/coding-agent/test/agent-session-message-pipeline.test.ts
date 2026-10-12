@@ -20,7 +20,11 @@ function eventDelta(event: AgentSessionEvent): string {
 	return ame.delta ?? "";
 }
 
-const testModelRegistry = { getApiKey: async () => "test-key", getAuthStorageOwner: () => undefined };
+const testModelRegistry = {
+	getApiKey: async () => "test-key",
+	getAuthStorageOwner: () => undefined,
+	withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+};
 
 function createAgent(): Agent {
 	return new Agent({
