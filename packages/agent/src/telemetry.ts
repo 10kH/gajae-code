@@ -472,13 +472,16 @@ function contentCaptureRank(raw: string | undefined): 0 | 1 | 2 {
 
 function readContentCaptureEnv(): ResolvedTelemetryContentCapture {
 	if (contentCaptureEnvCache !== undefined) return contentCaptureEnvCache;
-	// `$credentialEnv` ignores a cwd `.env` value, including one already copied
-	// into the process environment, but pins an inherited value at import.
-	// A project declaration still cannot select capture. An operator downgrade
-	// before the first read uses the current value instead of that pin.
+	// `$credentialEnv` ignores a project `.env`, pins an inherited value, and
+	// falls back to trusted files. A missing current key is off, so that
+	// fallback cannot restore a deleted value. A lower live rank is a downgrade.
+	// A present higher rank cannot raise the pin.
 	const trusted = $credentialEnv(CONTENT_CAPTURE_ENV);
 	const live = Bun.env[CONTENT_CAPTURE_ENV];
-	const raw = live !== undefined && contentCaptureRank(live) < contentCaptureRank(trusted) ? live : trusted;
+	let raw: string | undefined;
+	if (live === undefined) raw = undefined;
+	else if (contentCaptureRank(live) < contentCaptureRank(trusted)) raw = live;
+	else raw = trusted;
 	if (!raw) {
 		contentCaptureEnvCache = "none";
 		return "none";

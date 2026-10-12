@@ -21,7 +21,9 @@ function identityConverter(messages: AgentMessage[]): Message[] {
 
 async function main(): Promise<void> {
 	const beforeLoop = process.env.OTEL_CAPTURE_TRUST_BEFORE_LOOP;
-	if (beforeLoop !== undefined) process.env[ENV_NAME] = beforeLoop;
+	// "delete" removes the key after import and before the first loop.
+	if (beforeLoop === "delete") delete process.env[ENV_NAME];
+	else if (beforeLoop !== undefined) process.env[ENV_NAME] = beforeLoop;
 	trace.disable();
 	context.disable();
 	const contextManager = new AsyncLocalStorageContextManager().enable();
@@ -56,13 +58,19 @@ async function main(): Promise<void> {
 	const chat = exporter.getFinishedSpans().find(span => span.name === "chat mock-model");
 	if (!chat) throw new Error("chat span missing");
 	const input = chat.attributes[GenAIAttr.InputMessages];
+	const output = chat.attributes[GenAIAttr.OutputMessages];
+	const system = chat.attributes[GenAIAttr.SystemInstructions];
 	const request = chat.attributes[PiGenAIAttr.RequestMessages];
+	const response = chat.attributes[PiGenAIAttr.ResponseText];
 	console.log(
 		JSON.stringify({
 			spanFound: true,
 			envValue: process.env[ENV_NAME] ?? null,
 			inputMessages: typeof input === "string" ? input : null,
+			outputMessages: typeof output === "string" ? output : null,
+			systemInstructions: typeof system === "string" ? system : null,
 			requestMessages: typeof request === "string" ? request : null,
+			responseText: typeof response === "string" ? response : null,
 			warnings,
 		}),
 	);

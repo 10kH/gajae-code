@@ -32,7 +32,10 @@ interface CaptureProbe {
 	spanFound: boolean;
 	envValue: string | null;
 	inputMessages: string | null;
+	outputMessages: string | null;
+	systemInstructions: string | null;
 	requestMessages: string | null;
+	responseText: string | null;
 	warnings: string[];
 }
 
@@ -40,6 +43,7 @@ async function captureIn(
 	cwd: string,
 	dotenv: string | undefined,
 	overrides: Record<string, string> = {},
+	agentDotenv?: string,
 ): Promise<CaptureProbe> {
 	if (dotenv !== undefined) fs.writeFileSync(path.join(cwd, ".env"), dotenv);
 	const env: Record<string, string> = {};
@@ -48,9 +52,11 @@ async function captureIn(
 	}
 	delete env[ENV_NAME];
 	// Trusted file sources must not supply the switch from the developer machine.
+	const agentDir = tempDir();
+	if (agentDotenv !== undefined) fs.writeFileSync(path.join(agentDir, ".env"), agentDotenv);
 	env.HOME = tempDir();
-	env.GJC_CODING_AGENT_DIR = tempDir();
-	env.PI_CODING_AGENT_DIR = env.GJC_CODING_AGENT_DIR;
+	env.GJC_CODING_AGENT_DIR = agentDir;
+	env.PI_CODING_AGENT_DIR = agentDir;
 	Object.assign(env, overrides);
 
 	const proc = Bun.spawn([process.execPath, PROBE], { cwd, env, stdout: "pipe", stderr: "pipe" });
@@ -119,5 +125,26 @@ describe("GenAI content capture project dotenv trust", () => {
 		expect(captured.envValue).toBe("summary");
 		expect(captured.inputMessages).toBeNull();
 		expect(captured.requestMessages).toContain(CANARY);
+	});
+
+	it("keeps capture off when the key is removed before the first read and a trusted agent env says full", async () => {
+		const cwd = tempDir();
+		const captured = await captureIn(
+			cwd,
+			"OTHER=1\n",
+			{
+				[ENV_NAME]: "full",
+				OTEL_CAPTURE_TRUST_BEFORE_LOOP: "delete",
+			},
+			`${ENV_NAME}=full\n`,
+		);
+		expect(captured.spanFound).toBe(true);
+		expect(captured.envValue).toBeNull();
+		expect(captured.inputMessages).toBeNull();
+		expect(captured.outputMessages).toBeNull();
+		expect(captured.systemInstructions).toBeNull();
+		expect(captured.requestMessages).toBeNull();
+		expect(captured.responseText).toBeNull();
+		expect(captured.warnings).not.toContain("full_content_capture_env_active");
 	});
 });
