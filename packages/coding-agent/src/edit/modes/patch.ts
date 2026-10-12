@@ -201,13 +201,9 @@ async function resolvePatchMkdirPath(
 	const boundary = path.resolve(boundaryForPatchDelete(cwd, absolutePath, localRoot));
 	const lexicalParent = path.resolve(parentDir);
 	if (!pathIsWithin(lexicalParent, boundary)) return parentDir;
-	let realRoot: string;
-	try {
-		realRoot = await fs.promises.realpath(boundary);
-	} catch (error) {
-		if (isEnoent(error)) throw new ApplyPatchError(`Parent directory resolves outside its root: ${displayPath}`);
-		throw error;
-	}
+	// A root that does not exist yet is not an escape. Keep the missing suffix
+	// under its real ancestor, which is what mkdir did before this check.
+	const realRoot = await realpathThroughExistingAncestor(boundary, signal);
 	signal?.throwIfAborted();
 	const realParent = await realpathThroughExistingAncestor(lexicalParent, signal);
 	signal?.throwIfAborted();
@@ -275,26 +271,34 @@ export async function applyPatch(input: PatchInput, options: ApplyPatchOptions):
 	const resolvePath = (p: string): string => resolveToCwd(p, options.cwd);
 	const absolutePath = resolvePath(input.path);
 	const mutationPaths = [absolutePath];
-	const op = input.op ?? "update";
+	if (input.rename) {
+		const destPath = resolvePath(input.rename);
+		if (destPath !== absolutePath) mutationPaths.push(destPath);
+	}
 	// The cross-process lock creates missing parent directories for `<path>.lock`.
-	// Refuse a symlinked create/move parent before that mkdir.
+	// Check every locked create/move path, including a rename on create, first.
+	await preflightPatchMkdir(input, options);
+	const usingDefaultFs = options.fs === undefined || options.fs === defaultFileSystem;
+	// dryRun/preview must stay read-only: never create durable `<path>.lock` dirs
+	// (would fail on read-only parents and mutate the FS during preview) (#2900 review).
+	const crossProcess = options.dryRun === true ? false : (options.crossProcessLock ?? usingDefaultFs);
+	return withEditPathMutation(mutationPaths, () => applyNormalizedPatch(input, options), { crossProcess });
+}
+
+/** Read-only mkdir check for one patch hunk. Does not create directories. */
+export async function preflightPatchMkdir(input: PatchInput, options: ApplyPatchOptions): Promise<void> {
+	const resolvePath = (p: string): string => resolveToCwd(p, options.cwd);
+	const absolutePath = resolvePath(input.path);
+	const op = input.op ?? "update";
 	if (op === "create") {
 		await rejectPatchMkdirEscape(options.cwd, absolutePath, options.localRoot, input.path, options.signal);
 	}
 	if (input.rename) {
 		const destPath = resolvePath(input.rename);
 		if (destPath !== absolutePath) {
-			mutationPaths.push(destPath);
-			if (op !== "create") {
-				await rejectPatchMkdirEscape(options.cwd, destPath, options.localRoot, input.rename, options.signal);
-			}
+			await rejectPatchMkdirEscape(options.cwd, destPath, options.localRoot, input.rename, options.signal);
 		}
 	}
-	const usingDefaultFs = options.fs === undefined || options.fs === defaultFileSystem;
-	// dryRun/preview must stay read-only: never create durable `<path>.lock` dirs
-	// (would fail on read-only parents and mutate the FS during preview) (#2900 review).
-	const crossProcess = options.dryRun === true ? false : (options.crossProcessLock ?? usingDefaultFs);
-	return withEditPathMutation(mutationPaths, () => applyNormalizedPatch(input, options), { crossProcess });
 }
 
 async function rejectPatchMkdirEscape(

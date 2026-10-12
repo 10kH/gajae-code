@@ -4,7 +4,12 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { ApplyPatchError, DEFAULT_FUZZY_THRESHOLD, executePatchSingle } from "@gajae-code/coding-agent/edit";
+import {
+	ApplyPatchError,
+	applyCodexPatch,
+	DEFAULT_FUZZY_THRESHOLD,
+	executePatchSingle,
+} from "@gajae-code/coding-agent/edit";
 import { writethroughNoop } from "@gajae-code/coding-agent/lsp";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 
@@ -305,4 +310,106 @@ describe("patch mkdir symlink", () => {
 		await expect(createThrough(makeSession(cwd), "note.txt", AbortSignal.abort())).rejects.toThrow();
 		await expect(fs.stat(file)).rejects.toThrow();
 	});
+
+	test("still allows creating a file under an explicit local root that does not exist yet", async () => {
+		const root = track(await fs.mkdtemp(path.join(os.tmpdir(), "patch-mkdir-missing-root-")));
+		const cwd = path.join(root, "workspace");
+		const artifacts = path.join(root, "artifacts");
+		await fs.mkdir(cwd);
+		await fs.mkdir(artifacts);
+		const file = path.join(artifacts, "local", "new", "note.txt");
+
+		await createThrough(makeSession(cwd, { artifactsDir: artifacts, sessionId: "explicit", managed: false }), file);
+
+		expect(await fs.readFile(file, "utf8")).toBe("ok\n");
+	});
+
+	test("still allows moving a file into an explicit local root that does not exist yet", async () => {
+		const root = track(await fs.mkdtemp(path.join(os.tmpdir(), "patch-mkdir-missing-move-")));
+		const cwd = path.join(root, "workspace");
+		const artifacts = path.join(root, "artifacts");
+		await fs.mkdir(cwd);
+		await fs.mkdir(artifacts);
+		const source = path.join(cwd, "src.txt");
+		const dest = path.join(artifacts, "local", "new", "dst.txt");
+		await fs.writeFile(source, "line\n");
+
+		await moveThrough(
+			makeSession(cwd, { artifactsDir: artifacts, sessionId: "explicit", managed: false }),
+			"src.txt",
+			dest,
+		);
+
+		expect(await fs.readFile(dest, "utf8")).toBe("moved\n");
+	});
+
+	test("still allows creating a file when rename stays inside cwd", async () => {
+		const cwd = track(await fs.mkdtemp(path.join(os.tmpdir(), "patch-mkdir-create-rename-ok-")));
+		const result = await executePatchSingle({
+			session: makeSession(cwd),
+			path: "note.txt",
+			params: { op: "create", diff: "ok\n", rename: "nested/other.txt" },
+			allowFuzzy: true,
+			fuzzyThreshold: DEFAULT_FUZZY_THRESHOLD,
+			writethrough: writethroughNoop,
+			beginDeferredDiagnosticsForPath: noopBeginDeferred,
+		});
+
+		expect(result.details?.op).toBe("create");
+		expect(await fs.readFile(path.join(cwd, "note.txt"), "utf8")).toBe("ok\n");
+	});
+
+	test.skipIf(process.platform === "win32")(
+		"refuses to create when rename follows a directory symlink out of cwd",
+		async () => {
+			const root = track(await fs.mkdtemp(path.join(os.tmpdir(), "patch-mkdir-create-rename-esc-")));
+			const cwd = path.join(root, "workspace");
+			const outside = path.join(root, "outside");
+			await fs.mkdir(cwd);
+			await fs.mkdir(outside);
+			await fs.symlink(outside, path.join(cwd, "link"), "dir");
+
+			await expect(
+				executePatchSingle({
+					session: makeSession(cwd),
+					path: "note.txt",
+					params: { op: "create", diff: "ok\n", rename: "link/newsub/dst.txt" },
+					allowFuzzy: true,
+					fuzzyThreshold: DEFAULT_FUZZY_THRESHOLD,
+					writethrough: writethroughNoop,
+					beginDeferredDiagnosticsForPath: noopBeginDeferred,
+				}),
+			).rejects.toThrow(ApplyPatchError);
+			await expect(fs.stat(path.join(cwd, "note.txt"))).rejects.toThrow();
+			await expect(fs.stat(path.join(outside, "newsub"))).rejects.toThrow();
+		},
+	);
+
+	test("still allows applying two in-workspace creates", async () => {
+		const cwd = track(await fs.mkdtemp(path.join(os.tmpdir(), "patch-mkdir-batch-ok-")));
+		const patch = "*** Begin Patch\n*** Add File: good.txt\n+ok\n*** Add File: nested/also.txt\n+ok\n*** End Patch";
+
+		await applyCodexPatch(patch, { cwd });
+
+		expect(await fs.readFile(path.join(cwd, "good.txt"), "utf8")).toBe("ok\n");
+		expect(await fs.readFile(path.join(cwd, "nested", "also.txt"), "utf8")).toBe("ok\n");
+	});
+
+	test.skipIf(process.platform === "win32")(
+		"refuses a later create through a directory symlink before writing earlier files",
+		async () => {
+			const root = track(await fs.mkdtemp(path.join(os.tmpdir(), "patch-mkdir-batch-esc-")));
+			const cwd = path.join(root, "workspace");
+			const outside = path.join(root, "outside");
+			await fs.mkdir(cwd);
+			await fs.mkdir(outside);
+			await fs.symlink(outside, path.join(cwd, "link"), "dir");
+			const patch =
+				"*** Begin Patch\n*** Add File: good.txt\n+ok\n*** Add File: link/newsub/bad.txt\n+ok\n*** End Patch";
+
+			await expect(applyCodexPatch(patch, { cwd })).rejects.toThrow(ApplyPatchError);
+			await expect(fs.stat(path.join(cwd, "good.txt"))).rejects.toThrow();
+			await expect(fs.stat(path.join(outside, "newsub"))).rejects.toThrow();
+		},
+	);
 });
