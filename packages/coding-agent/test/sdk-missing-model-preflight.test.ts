@@ -71,7 +71,11 @@ function sessionWithoutModel(): Harness {
 		agent,
 		sessionManager,
 		settings: Settings.isolated({ "compaction.enabled": false }),
-		modelRegistry: { getApiKey: async () => "registry-api-key", getAvailable: () => [] } as never,
+		modelRegistry: {
+			getApiKey: async () => "registry-api-key",
+			getAvailable: () => [],
+			withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+		} as never,
 	});
 	sessions.push(session);
 	return { session, sessionManager, streamCalls: () => streamCalls };
@@ -94,7 +98,11 @@ function sessionWithModel(getApiKey: () => Promise<string | undefined>): Harness
 		agent,
 		sessionManager,
 		settings: Settings.isolated({ "compaction.enabled": false }),
-		modelRegistry: { getApiKey, getAvailable: () => [mock.model] } as never,
+		modelRegistry: {
+			getApiKey,
+			getAvailable: () => [mock.model],
+			withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+		} as never,
 	});
 	sessions.push(session);
 	return { session, sessionManager, streamCalls: () => streamCalls };

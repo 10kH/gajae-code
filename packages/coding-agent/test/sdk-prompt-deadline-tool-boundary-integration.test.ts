@@ -116,7 +116,11 @@ describe("prompt deadline tool boundary on a live AgentSession", () => {
 			// `#modelRegistry.getAvailable()`. That floor only trips under memory
 			// pressure, so a stub without it passes alone and throws inside
 			// `prompt()` under a full-suite run — taking every assertion below with it.
-			modelRegistry: { getApiKey: async () => "test-key", getAvailable: () => [mock.model] } as never,
+			modelRegistry: {
+				getApiKey: async () => "test-key",
+				getAvailable: () => [mock.model],
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+			} as never,
 		});
 		session = live;
 		// `activePromptHandle` goes undefined once the run is terminal, so the
