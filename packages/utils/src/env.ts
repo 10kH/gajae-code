@@ -6,7 +6,7 @@ import { isSafeEnvName, isSafeEnvValue } from "./spawn-env";
 
 export { filterProcessEnv, isSafeEnvName, isSafeEnvValue } from "./spawn-env";
 
-import { parseEnvFile, parseEnvFileContent, parseShellEnvFile } from "./env-file";
+import { parseEnvFile, parseEnvFileContent, parseShellEnvFile, projectEnvLayerFiles } from "./env-file";
 
 // Re-exported so the public surface of this module is unchanged.
 export { isValidEnvName, parseEnvFile, parseShellEnvFile } from "./env-file";
@@ -14,17 +14,8 @@ export { isValidEnvName, parseEnvFile, parseShellEnvFile } from "./env-file";
 function loadProjectEnv(): { values: Record<string, string>; dynamic: Set<string> } {
 	const cwd = process.cwd();
 	const nodeEnv = process.env.NODE_ENV || Bun.env.NODE_ENV;
-	// Match Bun's dotenv precedence. Validate before interpolation so a hostile
-	// NODE_ENV cannot introduce separators or `..` path segments. Unset NODE_ENV
-	// selects the development layer Bun already loaded.
-	const validNodeEnv = nodeEnv && /^[A-Za-z0-9_-]+$/.test(nodeEnv) ? nodeEnv : undefined;
-	const layer = validNodeEnv ?? (nodeEnv ? undefined : "development");
-	const files = [
-		".env",
-		...(layer ? [`.env.${layer}`] : []),
-		...(layer !== "test" ? [".env.local"] : []),
-		...(layer ? [`.env.${layer}.local`] : []),
-	];
+	// Same file list as projectEnvSnapshot, so a loaded value stays project-controlled.
+	const files = projectEnvLayerFiles(nodeEnv);
 	const values: Record<string, string> = {};
 	const dynamic = new Set<string>();
 	for (const file of files) {

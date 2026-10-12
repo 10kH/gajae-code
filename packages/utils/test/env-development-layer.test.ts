@@ -13,6 +13,7 @@ import { safeRmSync } from "../../../scripts/safe-cleanup";
 
 const tempDirs: string[] = [];
 const envSourceUrl = pathToFileURL(path.resolve(import.meta.dir, "../src/env.ts")).href;
+const envFileSourceUrl = pathToFileURL(path.resolve(import.meta.dir, "../src/env-file.ts")).href;
 
 afterEach(() => {
 	for (const dir of tempDirs.splice(0)) safeRmSync(dir, { force: true, recursive: true });
@@ -62,6 +63,24 @@ describe("development dotenv layer when NODE_ENV is unset", () => {
 import { $env } from ${JSON.stringify(envSourceUrl)};
 if ($env.NODE_TLS_REJECT_UNAUTHORIZED !== undefined) {
 	throw new Error("development TLS switch reached the live environment: " + $env.NODE_TLS_REJECT_UNAUTHORIZED);
+}
+`,
+		);
+	});
+
+	it("classifies a development-layer worktree directory as project-controlled when NODE_ENV is unset", () => {
+		const outside = tempDir();
+		const cwd = writeProject({ ".env.development": `GJC_WORKTREE_DIR=${outside}\n` });
+		runIsolated(
+			cwd,
+			`
+import { projectEnvSnapshot } from ${JSON.stringify(envFileSourceUrl)};
+const snapshot = projectEnvSnapshot(${JSON.stringify(cwd)});
+if (snapshot.values.GJC_WORKTREE_DIR !== ${JSON.stringify(outside)}) {
+	throw new Error("development worktree directory was not project-controlled: " + snapshot.values.GJC_WORKTREE_DIR);
+}
+if (!snapshot.dynamic || snapshot.values.OTHER_OPERATOR !== undefined) {
+	throw new Error("snapshot included an operator name the project did not declare");
 }
 `,
 		);
