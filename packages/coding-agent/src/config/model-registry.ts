@@ -4070,8 +4070,15 @@ export class ModelRegistry {
 	}
 
 	async #writeCheckedModelsConfig(config: ModelsConfig): Promise<void> {
-		await fs.mkdir(path.dirname(this.#modelsConfigFile.path()), { recursive: true, mode: 0o700 });
-		writeExplicitOwnerOnlyTextSync(this.#modelsConfigFile.path(), Bun.YAML.stringify(config, null, 2));
+		const configPath = this.#modelsConfigFile.path();
+		const parentPath = path.dirname(configPath);
+		await fs.mkdir(parentPath, { recursive: true, mode: 0o700 });
+		// The owner-only writer rejects a symlink in any path component and rejects
+		// "..". Resolve only the parent so an alias directory and a lexical ".."
+		// still reach the same file. The final name stays lexical, so a symlink
+		// at models.yml is still opened with O_NOFOLLOW.
+		const parent = await fs.realpath(parentPath);
+		writeExplicitOwnerOnlyTextSync(path.join(parent, path.basename(configPath)), Bun.YAML.stringify(config, null, 2));
 		this.#modelsConfigFile.invalidate();
 		this.#reloadStaticModels();
 	}

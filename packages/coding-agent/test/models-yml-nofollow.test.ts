@@ -48,6 +48,40 @@ describe("models.yml owner-only write", () => {
 		expect(registry.getModelProfile("second")?.displayName).toBe("second");
 	});
 
+	it.skipIf(process.platform === "win32")("still allows a save when the parent directory is a symlink", async () => {
+		const realDir = path.join(tempDir, "real");
+		const alias = path.join(tempDir, "alias");
+		await fs.mkdir(realDir);
+		await fs.symlink(realDir, alias);
+		const modelsPath = path.join(alias, "models.yml");
+		const registry = new ModelRegistry(authStorage, modelsPath);
+
+		await registry.saveCustomModelProfile("my-fast", preset("my-fast", "my-oai"));
+
+		expect(registry.getModelProfile("my-fast")?.displayName).toBe("my-fast");
+		expect((await fs.lstat(alias)).isSymbolicLink()).toBe(true);
+		expect((await fs.lstat(modelsPath)).isSymbolicLink()).toBe(false);
+		const saved = YAML.parse(await Bun.file(path.join(realDir, "models.yml")).text()) as {
+			profiles: Record<string, { display_name?: string }>;
+		};
+		expect(saved.profiles["my-fast"]?.display_name).toBe("my-fast");
+	});
+
+	it("still allows a save through an existing dotdot parent", async () => {
+		const sub = path.join(tempDir, "sub");
+		await fs.mkdir(sub);
+		const modelsPath = `${sub}${path.sep}..${path.sep}models.yml`;
+		const registry = new ModelRegistry(authStorage, modelsPath);
+
+		await registry.saveCustomModelProfile("my-fast", preset("my-fast", "my-oai"));
+
+		expect(registry.getModelProfile("my-fast")?.displayName).toBe("my-fast");
+		const saved = YAML.parse(await Bun.file(path.join(tempDir, "models.yml")).text()) as {
+			profiles: Record<string, { display_name?: string }>;
+		};
+		expect(saved.profiles["my-fast"]?.display_name).toBe("my-fast");
+	});
+
 	it("still allows a save when the parent directory is mode 0755", async () => {
 		await fs.chmod(tempDir, 0o755);
 		const modelsPath = path.join(tempDir, "models.yml");
