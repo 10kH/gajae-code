@@ -490,7 +490,7 @@ describe("default launch worktrees", () => {
 		expect((await fs.lstat(bucket)).isSymbolicLink()).toBe(true);
 	});
 
-	it("creates a launch worktree in an ordinary ignored in-repo directory bucket", async () => {
+	it("allows an ordinary ignored in-repo directory bucket", async () => {
 		const repo = await createRepo("gjc-launch-bucket-ignored-directory-");
 		const bucket = path.join(repo, ".worktrees");
 		await fs.mkdir(bucket);
