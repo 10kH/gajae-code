@@ -5292,7 +5292,9 @@ export class TUI extends Container {
 				// Padding to the committed frontier keeps scrollback rows from being
 				// repainted, but when the contraction ends the transcript at or above that
 				// frontier the padded viewport holds nothing but spacer rows. Replay the
-				// frame instead of leaving a blank screen above the pinned component.
+				// frame instead of leaving a blank screen above the pinned component. A
+				// pinned suffix that already fills the viewport hides the spacers, so it
+				// keeps the frontier and its scrollback.
 				strandedContractionReplay =
 					preserveLiveFrontier &&
 					!heightChanged &&
@@ -5301,7 +5303,8 @@ export class TUI extends Container {
 					prevViewportTop > 0 &&
 					sourceTranscriptLineCount > 0 &&
 					sourceTranscriptLineCount <= prevViewportTop &&
-					newLines.length < prevViewportTop + height;
+					newLines.length < prevViewportTop + height &&
+					newLines.length - sourceTranscriptLineCount < height;
 				const minimumLineCount =
 					preserveLiveFrontier && !strandedContractionReplay ? prevViewportTop + height : height;
 				const padded = this.#padBeforeBottomPinnedComponent(
