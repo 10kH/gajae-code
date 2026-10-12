@@ -614,6 +614,7 @@ describe("model profile activation", () => {
 			modelRegistry: {
 				...baseRegistry,
 				getAvailable: () => available,
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 			} as unknown as ModelRegistry,
 			settings: Settings.isolated(),
 			profileName: "claude-opus",
@@ -2207,6 +2208,7 @@ describe("model profile activation", () => {
 					getAvailable: () => [head, fallback],
 					getApiKey: async () => kNoAuth,
 					isSelectorCircuitOpen: () => false,
+					withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 				} as unknown as ModelRegistry,
 			});
 			configuringSession.setConfiguredModelChain(
@@ -2230,6 +2232,7 @@ describe("model profile activation", () => {
 					getAvailable: () => [head, fallback],
 					getApiKey: async () => kNoAuth,
 					isSelectorCircuitOpen: () => false,
+					withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 				} as unknown as ModelRegistry,
 			});
 			try {
@@ -3386,6 +3389,7 @@ describe("preset-equivalent profile activation", () => {
 					getCanonicalId,
 					seedCanonicalVariant,
 					clearCanonicalVariant,
+					withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 				} as unknown as ModelRegistry,
 			});
 			try {
@@ -4073,6 +4077,7 @@ describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
 			modelRegistry: {
 				...registry,
 				getAll: () => [...registry.getAll(), proxyModel("grok-4.3")],
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 			} as unknown as ModelRegistry,
 			settings: Settings.isolated({ "modelProfile.proxyProvider": "litellm", "modelProfile.proxyMode": "always" }),
 			profileName: profile.name,
@@ -4120,6 +4125,7 @@ describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
 						proxyModel("meta/muse-spark-1.2"),
 						proxyModel("other/muse-spark-1.2"),
 					],
+					withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 				} as unknown as ModelRegistry,
 				settings: Settings.isolated({
 					"modelProfile.proxyProvider": "litellm",
@@ -4309,6 +4315,7 @@ describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
 			modelRegistry: {
 				...registry,
 				getAll: () => [...registry.getAll(), proxyModel("other/grok-4.3")],
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 			} as unknown as ModelRegistry,
 			settings: Settings.isolated({ "modelProfile.proxyProvider": "litellm" }),
 			profileName: profile.name,
@@ -4328,6 +4335,7 @@ describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
 				modelRegistry: {
 					...registry,
 					getAll: () => [...registry.getAll(), proxyModel("foo/grok-4.4"), proxyModel("bar/grok-4.4")],
+					withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 				} as unknown as ModelRegistry,
 				settings: Settings.isolated({ "modelProfile.proxyProvider": "litellm" }),
 				profileName: profile.name,

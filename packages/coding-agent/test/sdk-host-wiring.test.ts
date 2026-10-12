@@ -6424,7 +6424,7 @@ test("ACP permission attachment normalizes decisions through the registered prov
 		}),
 		sessionManager,
 		settings: Settings.isolated({ "compaction.enabled": false }),
-		modelRegistry: {} as never,
+		modelRegistry: { withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body() } as never,
 		toolRegistry: new Map([[bashTool.name, bashTool]]),
 	});
 	agentSession.setSdkPermissionMode("prompt");
