@@ -1152,6 +1152,7 @@ export class TUI extends Container {
 	#fullRedrawCount = 0;
 	#stopped = false;
 	#terminalUnavailable = false;
+	#restartNeedsClear = false; // Set when stop() resets viewport state
 	#bottomPinnedComponent: Component | null = null;
 	#pendingTerminalCleanup: Array<{ payload: string; onDelivered?: () => void }> = [];
 	#mouseSelectionStart: MouseSelectionPoint | null = null;
@@ -2986,6 +2987,12 @@ export class TUI extends Container {
 		this.#lineEmitWidthCache.clear();
 		this.#previousWidth = 0;
 		this.#previousHeight = 0;
+		this.#cursorRow = 0;
+		this.#hardwareCursorRow = 0;
+		this.#viewportTopRow = 0;
+		this.#maxLinesRendered = 0;
+		// Mark that the next initial render needs to clear the screen after terminal reset
+		this.#restartNeedsClear = true;
 		this.#forcedRenderPreviousWidth = 0;
 		this.#forcedRenderPreviousHeight = 0;
 		this.#transcriptRebuildPending = false;
@@ -5796,9 +5803,12 @@ export class TUI extends Container {
 			return;
 		}
 		// First render - just output everything without clearing (assumes clean screen)
+		// unless we're restarting after a stop() which leaves stale content
 		if (initialRender) {
 			logRedraw("first render");
-			fullRender(false, "first render");
+			const shouldClear = this.#restartNeedsClear;
+			this.#restartNeedsClear = false;
+			fullRender(shouldClear, "first render");
 			return;
 		}
 
