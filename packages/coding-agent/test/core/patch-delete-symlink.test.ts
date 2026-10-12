@@ -50,11 +50,12 @@ const noopBeginDeferred = (_p: string) => ({
 	finalize: () => {},
 });
 
-function deleteThrough(session: ToolSession, targetPath: string) {
+function deleteThrough(session: ToolSession, targetPath: string, signal?: AbortSignal) {
 	return executePatchSingle({
 		session,
 		path: targetPath,
 		params: { op: "delete" },
+		signal,
 		allowFuzzy: true,
 		fuzzyThreshold: DEFAULT_FUZZY_THRESHOLD,
 		writethrough: writethroughNoop,
@@ -180,19 +181,10 @@ describe("patch delete symlink", () => {
 			await fs.mkdir(localRoot, { recursive: true });
 			const file = path.join(localRoot, "note.txt");
 			await fs.writeFile(file, "ok");
-			const dispose = LocalProtocolHandler.installOverride({
-				getArtifactsDir: () => artifacts,
-				isManagedDestination: () => false,
-				getSessionId: () => "explicit",
-			});
-			try {
-				await deleteThrough(
-					makeSession(cwd, { artifactsDir: artifacts, sessionId: "explicit", managed: false }),
-					"local://note.txt",
-				);
-			} finally {
-				dispose();
-			}
+			await deleteThrough(
+				makeSession(cwd, { artifactsDir: artifacts, sessionId: "explicit", managed: false }),
+				"local://note.txt",
+			);
 
 			await expect(fs.stat(file)).rejects.toThrow();
 		},
@@ -210,23 +202,82 @@ describe("patch delete symlink", () => {
 			const secret = path.join(outside, "secret.txt");
 			await fs.writeFile(secret, "secret");
 			await fs.symlink(outside, path.join(localRoot, "planted"), "dir");
-			const dispose = LocalProtocolHandler.installOverride({
-				getArtifactsDir: () => artifacts,
-				isManagedDestination: () => false,
-				getSessionId: () => "explicit",
-			});
-			try {
-				await expect(
-					deleteThrough(
-						makeSession(root, { artifactsDir: artifacts, sessionId: "explicit", managed: false }),
-						"local://planted/secret.txt",
-					),
-				).rejects.toThrow(ApplyPatchError);
-			} finally {
-				dispose();
-			}
+			await expect(
+				deleteThrough(
+					makeSession(root, { artifactsDir: artifacts, sessionId: "explicit", managed: false }),
+					"local://planted/secret.txt",
+				),
+			).rejects.toThrow(ApplyPatchError);
 
 			expect(await fs.readFile(secret, "utf8")).toBe("secret");
 		},
 	);
+
+	test.skipIf(process.platform === "win32")(
+		"still allows deleting an explicit local file when the handler root differs",
+		async () => {
+			const root = track(await fs.mkdtemp(path.join(os.tmpdir(), "patch-delete-handler-ok-")));
+			const cwd = path.join(root, "workspace");
+			const artifacts = path.join(root, "artifacts");
+			const other = path.join(root, "other");
+			const localRoot = path.join(artifacts, "local");
+			await fs.mkdir(cwd);
+			await fs.mkdir(localRoot, { recursive: true });
+			await fs.mkdir(path.join(other, "local"), { recursive: true });
+			const file = path.join(localRoot, "note.txt");
+			await fs.writeFile(file, "ok");
+			const dispose = LocalProtocolHandler.installOverride({
+				getArtifactsDir: () => other,
+				isManagedDestination: () => false,
+				getSessionId: () => "other",
+			});
+			try {
+				await deleteThrough(
+					makeSession(cwd, { artifactsDir: artifacts, sessionId: "explicit", managed: false }),
+					"local://note.txt",
+				);
+			} finally {
+				dispose();
+			}
+			await expect(fs.stat(file)).rejects.toThrow();
+		},
+	);
+
+	test("still allows deleting a file when cwd is the filesystem root", async () => {
+		const dir = track(await fs.mkdtemp(path.join(os.tmpdir(), "patch-delete-fsroot-")));
+		const file = path.join(dir, "note.txt");
+		const previewFile = path.join(dir, "preview.txt");
+		await fs.writeFile(file, "ok");
+		await fs.writeFile(previewFile, "ok");
+		const preview = await previewPatch({ path: previewFile, op: "delete" }, { cwd: "/" });
+		expect(preview.change.type).toBe("delete");
+		expect(await fs.readFile(previewFile, "utf8")).toBe("ok");
+		await deleteThrough(makeSession("/"), file);
+		await expect(fs.stat(file)).rejects.toThrow();
+	});
+
+	test.skipIf(process.platform !== "win32")("still allows deleting a file when cwd is a drive root", async () => {
+		const drive = path.parse(process.cwd()).root;
+		const dir = track(await fs.mkdtemp(path.join(os.tmpdir(), "patch-delete-drive-")));
+		const file = path.join(dir, "note.txt");
+		await fs.writeFile(file, "ok");
+		await deleteThrough(makeSession(drive), file);
+		await expect(fs.stat(file)).rejects.toThrow();
+	});
+
+	test("still allows deleting a file when the call signal is not aborted", async () => {
+		const cwd = track(await fs.mkdtemp(path.join(os.tmpdir(), "patch-delete-signal-ok-")));
+		const file = path.join(cwd, "note.txt");
+		await fs.writeFile(file, "ok");
+		await deleteThrough(makeSession(cwd), "note.txt", new AbortController().signal);
+		await expect(fs.stat(file)).rejects.toThrow();
+	});
+
+	test("refuses to delete when the call signal is already aborted", async () => {
+		const cwd = track(await fs.mkdtemp(path.join(os.tmpdir(), "patch-delete-signal-abort-")));
+		const file = path.join(cwd, "note.txt");
+		await fs.writeFile(file, "secret");
+		await expect(deleteThrough(makeSession(cwd), "note.txt", AbortSignal.abort())).rejects.toThrow();
+		expect(await fs.readFile(file, "utf8")).toBe("secret");
+	});
 });
