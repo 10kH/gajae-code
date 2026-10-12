@@ -5296,6 +5296,7 @@ export class TUI extends Container {
 		let usedWindowNormalize = false;
 		let stitched = false;
 		let frontierSpacerLineCount = 0;
+		let strandedContractionReplay = false;
 		if (reusedAnchor !== null && layoutPrefixEligible && !layoutPrefixBlocked) {
 			const reused = this.#reuseCachedLayoutPrefix(
 				width,
@@ -5344,7 +5345,24 @@ export class TUI extends Container {
 					!transcriptRebuildPending &&
 					frontierPreviousWidth === width &&
 					(frontierPreviousHeight === height || this.#viewportRepaintHost());
-				const minimumLineCount = preserveLiveFrontier ? prevViewportTop + height : height;
+				// Padding to the committed frontier keeps scrollback rows from being
+				// repainted, but when the contraction ends the transcript at or above that
+				// frontier the padded viewport holds nothing but spacer rows. Replay the
+				// frame instead of leaving a blank screen above the pinned component. A
+				// pinned suffix that already fills the viewport hides the spacers, so it
+				// keeps the frontier and its scrollback.
+				strandedContractionReplay =
+					preserveLiveFrontier &&
+					!heightChanged &&
+					frontierPreviousHeight === height &&
+					this.overlayStack.length === 0 &&
+					prevViewportTop > 0 &&
+					sourceTranscriptLineCount > 0 &&
+					sourceTranscriptLineCount <= prevViewportTop &&
+					newLines.length < prevViewportTop + height &&
+					newLines.length - sourceTranscriptLineCount < height;
+				const minimumLineCount =
+					preserveLiveFrontier && !strandedContractionReplay ? prevViewportTop + height : height;
 				const padded = this.#padBeforeBottomPinnedComponent(
 					newLines,
 					minimumLineCount,
@@ -5927,6 +5945,14 @@ export class TUI extends Container {
 		if (this.#clearOnShrinkReplays() && newLines.length < this.#previousLines.length) {
 			logRedraw(`clearOnShrink (prev=${this.#previousLines.length}, new=${newLines.length})`);
 			fullRender(true, "clearOnShrink", true);
+			return;
+		}
+		// Default (clearOnShrink off) still replays when frontier padding would leave the
+		// viewport with no transcript row, e.g. a tall live block collapsing back into
+		// history. Same scrollback erase as above, for the same duplication reason.
+		if (strandedContractionReplay) {
+			logRedraw(`stranded contraction (prev=${this.#previousLines.length}, new=${newLines.length})`);
+			fullRender(true, "stranded contraction", true);
 			return;
 		}
 
