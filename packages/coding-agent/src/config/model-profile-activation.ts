@@ -1713,10 +1713,23 @@ export async function prepareModelProfileActivation(
 			if (value === undefined) delete baseModelRoles[role];
 			else baseModelRoles[role] = value;
 		}
+		const configuredBindings = options.modelRegistry?.getConfiguredModelBindings?.();
 		for (const [role, value] of installedState?.agentModelOverrides ?? []) {
 			if (manualAgentModelOverrides.has(role)) continue;
-			if (value === undefined) delete baseAgentModelOverrides[role];
-			else baseAgentModelOverrides[role] = value;
+			// Do not restore baseline values that match configured model bindings.
+			// Configured bindings are applied separately and should not be part of
+			// the profile's baseline, even if they were the value before a profile
+			// was activated.
+			if (
+				configuredBindings?.agentModelOverrides?.[role] !== undefined &&
+				selectorValuesEqual(value, configuredBindings.agentModelOverrides[role])
+			) {
+				delete baseAgentModelOverrides[role];
+			} else if (value === undefined) {
+				delete baseAgentModelOverrides[role];
+			} else {
+				baseAgentModelOverrides[role] = value;
+			}
 		}
 		const preparedDefaultModelSelection =
 			options.prepareSessionModelSelection && defaultModel
