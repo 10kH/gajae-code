@@ -273,10 +273,10 @@ const CREDENTIAL_JSON_KEY =
 	/^(?:api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?id|session[_-]?token|client[_-]?secret|secret[_-]?key|aws[_-]?secret[_-]?access[_-]?key|secret[_-]?access[_-]?key|password|passwd|authorization)$/i;
 
 function redactKeyedValue(key: string, value: unknown): unknown {
+	// A recognized key is authoritative for every JSON type, including a short
+	// string, a number, an array, or a nested object.
+	if (CREDENTIAL_JSON_KEY.test(key)) return "«redacted»";
 	if (typeof value !== "string") return redactJsonValue(value);
-	// A quote inside a credential field can sit before the labeled-value rule's
-	// eight-character run, leaving the serialized JSON valid and the secret intact.
-	if (CREDENTIAL_JSON_KEY.test(key) && /["']/.test(value)) return "«redacted»";
 	const encoded = JSON.stringify({ [key]: value });
 	try {
 		const parsed = JSON.parse(redactCrashSecrets(encoded)) as Record<string, unknown>;

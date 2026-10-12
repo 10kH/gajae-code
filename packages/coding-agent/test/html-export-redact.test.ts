@@ -111,6 +111,77 @@ describe("session HTML export embed", () => {
 		}
 	});
 
+	it("scrubs a short value under a password key", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-html-export-key-short-"));
+		let session: SessionManager | undefined;
+		try {
+			session = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+			session.appendMessage({
+				role: "assistant",
+				content: [
+					{
+						type: "toolCall",
+						id: "call-short",
+						name: "echo",
+						arguments: { password: "abc123", note: ORDINARY_SENTENCE },
+					},
+				],
+				timestamp: 1,
+			} as unknown as Parameters<SessionManager["appendMessage"]>[0]);
+			const outputPath = path.join(tempDir, "export.html");
+			await exportSessionToHtml(session, undefined, { outputPath });
+			const embedded = embeddedSessionText(await Bun.file(outputPath).text());
+			expect(embedded).not.toContain("abc123");
+			expect(embedded).toContain("«redacted»");
+			expect(embedded).toContain(ORDINARY_SENTENCE);
+		} finally {
+			await session?.close();
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("masks a password field that is not a string", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-html-export-key-typed-"));
+		let session: SessionManager | undefined;
+		try {
+			session = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+			session.appendMessage({
+				role: "assistant",
+				content: [
+					{
+						type: "toolCall",
+						id: "call-typed",
+						name: "echo",
+						arguments: {
+							password: 123456,
+							wrapped: { password: ["abc123"] },
+							count: 7,
+							tags: ["public"],
+							meta: { visible: true },
+						},
+					},
+				],
+				timestamp: 1,
+			} as unknown as Parameters<SessionManager["appendMessage"]>[0]);
+			const outputPath = path.join(tempDir, "export.html");
+			await exportSessionToHtml(session, undefined, { outputPath });
+			const embedded = embeddedSessionText(await Bun.file(outputPath).text());
+			const parsed = JSON.parse(embedded) as {
+				entries: Array<{ message?: { content?: Array<{ arguments?: Record<string, unknown> }> } }>;
+			};
+			const args = parsed.entries[0]?.message?.content?.[0]?.arguments;
+			expect(embedded).not.toContain("123456");
+			expect(embedded).not.toContain("abc123");
+			expect(args?.password).toBe("«redacted»");
+			expect(args?.count).toBe(7);
+			expect(args?.tags).toEqual(["public"]);
+			expect(args?.meta).toEqual({ visible: true });
+		} finally {
+			await session?.close();
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("scrubs a nested password field that contains a quotation mark", async () => {
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-html-export-key-quote-"));
 		let session: SessionManager | undefined;
