@@ -743,7 +743,7 @@ describe("coordinator session state lock", () => {
 		let heldBytes = "";
 		SessionStateLockTestHooks.afterCurrentOwnerValidation = async file => {
 			// Runs with the held record still on disk, immediately before the rewrite.
-			if (file === lockFile) heldBytes = fsSync.readFileSync(file, "utf8");
+			if (file === lockFile) heldBytes = await Bun.file(file).text();
 		};
 		try {
 			await writeToolActivity(root, "call-1", "2026-03-01T00:00:05.000Z");
