@@ -19,6 +19,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { exactRemoveDirectoryTree, exactUnlink, snapshotDirectoryTree } from "@gajae-code/natives";
 import { getAgentDir, getBlobsDir, getSessionsDir, isEnoent, VERSION } from "@gajae-code/utils";
+import { projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import { getDefault } from "../config/settings-schema";
 import { listHarnessRootRegistriesForGc } from "../harness-control-plane/storage";
 import { SessionIndex } from "../sdk/broker/session-index";
@@ -54,6 +55,7 @@ import {
 } from "./empty-delete-gc";
 import { buildGcReportText } from "./gc-render";
 import { collectSessionScopeUsage, type GcSessionScopeUsage, shouldReportSessionScope } from "./gc-session-scope";
+import { trustedCoordinatorEnv } from "./sidecar-bootstrap-env";
 
 export type GcStore = "harness_leases" | "file_locks" | "tmux_sessions" | "registry_entries" | "local_roots";
 
@@ -456,8 +458,18 @@ export function computeExitCode(report: GcReport): number {
 	return 0;
 }
 
-function resolveGcAgentDir(env: NodeJS.ProcessEnv): string {
-	return env.GJC_CODING_AGENT_DIR?.trim() || env.PI_CODING_AGENT_DIR?.trim() || getAgentDir();
+/**
+ * Operator override only. Same project-dotenv rule as `getAgentDir()`: a value
+ * the checkout declares is ignored, and an operator value it does not declare
+ * is kept. A repository `.env` must not choose the tree `gjc gc` reclaims.
+ */
+function resolveGcAgentDir(env: NodeJS.ProcessEnv, cwd: string): string {
+	const snapshot = projectEnvSnapshot(cwd);
+	return (
+		trustedCoordinatorEnv("GJC_CODING_AGENT_DIR", env, snapshot) ||
+		trustedCoordinatorEnv("PI_CODING_AGENT_DIR", env, snapshot) ||
+		getAgentDir()
+	);
 }
 
 /**
@@ -656,17 +668,18 @@ export async function runGjcGcCommand(
 	const ordinaryPrune = parsed.prune && (emptyDeleteReceipts?.errors.length ?? 0) === 0;
 	const report = await collectGcReport(resolvedAdapters, ctx, ordinaryPrune);
 	report.operation = parsed.repairSessionIndex ? "repair_session_index" : parsed.prune ? "prune" : "dry_run";
-	report.session_index = await collectSessionIndexHealth(parsed.repairSessionIndex, resolveGcAgentDir(env));
+	const agentDir = resolveGcAgentDir(env, cwd);
+	report.session_index = await collectSessionIndexHealth(parsed.repairSessionIndex, agentDir);
 	if (parsed.disk) {
 		report.disk = await collectGcDiskReport({
-			agentDir: resolveGcAgentDir(env),
+			agentDir,
 			env,
 			policy: resolveGcDiskPolicy(diskPolicy),
 			prune: ordinaryPrune,
 		});
 	}
 	if (emptyDeleteReceipts) report.empty_delete_receipts = emptyDeleteReceipts;
-	const scopeUsage = await collectGcSessionScope(cwd, resolveGcAgentDir(env));
+	const scopeUsage = await collectGcSessionScope(cwd, agentDir);
 	if (scopeUsage && shouldReportSessionScope(scopeUsage)) report.session_scope = scopeUsage;
 	const sessionIndexFailed =
 		report.session_index?.status === "corrupt" ||
