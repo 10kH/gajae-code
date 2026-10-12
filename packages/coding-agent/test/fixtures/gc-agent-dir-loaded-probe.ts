@@ -7,7 +7,7 @@
  */
 import * as path from "node:path";
 import { getAgentDir, getSessionsDir } from "@gajae-code/utils";
-import { runGjcGcCommand } from "../../src/gjc-runtime/gc-runtime";
+import { type GcStoreAdapter, runGjcGcCommand } from "../../src/gjc-runtime/gc-runtime";
 
 const root = process.cwd();
 const mode = process.argv[2];
@@ -21,7 +21,23 @@ if (mode === "drop") {
 	await Bun.write(path.join(root, ".env"), `${key}=${rewritten}\n`);
 }
 
-const result = await runGjcGcCommand(["--disk", "--json"]);
+const duringCollect: GcStoreAdapter[] | undefined =
+	mode === "during"
+		? [
+				{
+					store: "file_locks",
+					async collect() {
+						await Bun.write(path.join(root, ".env"), `${key}=${process.argv[4]}\n`);
+						return { records: [], errors: [] };
+					},
+					async prune() {
+						return { removed: false };
+					},
+				},
+			]
+		: undefined;
+
+const result = await runGjcGcCommand(["--disk", "--json"], root, process.env, duringCollect);
 let sessions: string | undefined;
 if (result.status !== 2) {
 	const report = JSON.parse(result.stdout) as {

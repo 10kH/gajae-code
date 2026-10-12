@@ -2,8 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getAgentDir, getSessionsDir } from "@gajae-code/utils";
-import { type GcStoreAdapter, runGjcGcCommand } from "../src/gjc-runtime/gc-runtime";
+import { getSessionsDir } from "@gajae-code/utils";
 
 const LOADED_PROBE = path.join(import.meta.dir, "fixtures", "gc-agent-dir-loaded-probe.ts");
 
@@ -29,13 +28,42 @@ function gcEnv(root: string, agentDir: string, key: "GJC_CODING_AGENT_DIR" | "PI
 	};
 }
 
-async function diskSessionsRoot(root: string, env: NodeJS.ProcessEnv): Promise<string> {
-	const result = await runGjcGcCommand(["--disk", "--json"], root, env, []);
-	expect(result.status).not.toBe(2);
-	const report = JSON.parse(result.stdout) as {
-		disk: { surfaces: { sessions: { root: string }; backups: { root: string }; natives: { root: string } } };
-	};
-	return report.disk.surfaces.sessions.root;
+async function diskSessionsRoot(
+	root: string,
+	env: NodeJS.ProcessEnv,
+): Promise<{ sessions: string; fallback: string; home: string }> {
+	const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-gc-agent-home-"));
+	tempDirs.push(home);
+	const childEnv: Record<string, string> = {};
+	for (const [name, value] of Object.entries(process.env)) {
+		if (value !== undefined) childEnv[name] = value;
+	}
+	delete childEnv.GJC_CODING_AGENT_DIR;
+	delete childEnv.PI_CODING_AGENT_DIR;
+	delete childEnv.GJC_CONFIG_DIR;
+	delete childEnv.PI_CONFIG_DIR;
+	delete childEnv.XDG_CONFIG_HOME;
+	delete childEnv.XDG_DATA_HOME;
+	delete childEnv.XDG_STATE_HOME;
+	delete childEnv.XDG_CACHE_HOME;
+	childEnv.HOME = home;
+	childEnv.USERPROFILE = home;
+	for (const [name, value] of Object.entries(env)) {
+		if (typeof value === "string") childEnv[name] = value;
+	}
+	const proc = Bun.spawn([process.execPath, LOADED_PROBE], {
+		cwd: root,
+		env: childEnv,
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+	const exitCode = await proc.exited;
+	if (exitCode !== 0) throw new Error(`disk probe failed (${exitCode}): ${stderr}`);
+	const report = JSON.parse(stdout) as { status: number; sessions: string | null; fallback: string };
+	expect(report.status).not.toBe(2);
+	if (!report.sessions) throw new Error(`disk probe returned no sessions root: ${stderr}`);
+	return { sessions: report.sessions, fallback: report.fallback, home };
 }
 
 describe("gjc gc agent dir provenance", () => {
@@ -45,9 +73,10 @@ describe("gjc gc agent dir provenance", () => {
 		await fs.mkdir(attacker, { recursive: true });
 		await Bun.write(path.join(root, ".env"), `GJC_CODING_AGENT_DIR=${attacker}\n`);
 
-		const sessions = await diskSessionsRoot(root, gcEnv(root, attacker, "GJC_CODING_AGENT_DIR"));
-		expect(sessions.startsWith(attacker)).toBe(false);
-		expect(sessions).toBe(getSessionsDir(getAgentDir()));
+		const report = await diskSessionsRoot(root, gcEnv(root, attacker, "GJC_CODING_AGENT_DIR"));
+		expect(report.sessions.startsWith(attacker)).toBe(false);
+		expect(report.sessions).toBe(report.fallback);
+		expect(report.fallback.startsWith(report.home)).toBe(true);
 	});
 
 	test("refuses a project dotenv PI_CODING_AGENT_DIR", async () => {
@@ -56,9 +85,10 @@ describe("gjc gc agent dir provenance", () => {
 		await fs.mkdir(attacker, { recursive: true });
 		await Bun.write(path.join(root, ".env"), `PI_CODING_AGENT_DIR=${attacker}\n`);
 
-		const sessions = await diskSessionsRoot(root, gcEnv(root, attacker, "PI_CODING_AGENT_DIR"));
-		expect(sessions.startsWith(attacker)).toBe(false);
-		expect(sessions).toBe(getSessionsDir(getAgentDir()));
+		const report = await diskSessionsRoot(root, gcEnv(root, attacker, "PI_CODING_AGENT_DIR"));
+		expect(report.sessions.startsWith(attacker)).toBe(false);
+		expect(report.sessions).toBe(report.fallback);
+		expect(report.fallback.startsWith(report.home)).toBe(true);
 	});
 
 	test("refuses a dynamic project dotenv GJC_CODING_AGENT_DIR", async () => {
@@ -67,9 +97,10 @@ describe("gjc gc agent dir provenance", () => {
 		await fs.mkdir(attacker, { recursive: true });
 		await Bun.write(path.join(root, ".env"), "GJC_CODING_AGENT_DIR=$HOME/planted\n");
 
-		const sessions = await diskSessionsRoot(root, gcEnv(root, attacker, "GJC_CODING_AGENT_DIR"));
-		expect(sessions.startsWith(attacker)).toBe(false);
-		expect(sessions).toBe(getSessionsDir(getAgentDir()));
+		const report = await diskSessionsRoot(root, gcEnv(root, attacker, "GJC_CODING_AGENT_DIR"));
+		expect(report.sessions.startsWith(attacker)).toBe(false);
+		expect(report.sessions).toBe(report.fallback);
+		expect(report.fallback.startsWith(report.home)).toBe(true);
 	});
 
 	test("keeps an operator agent dir the project does not declare", async () => {
@@ -78,8 +109,8 @@ describe("gjc gc agent dir provenance", () => {
 		await fs.mkdir(operator, { recursive: true });
 		await Bun.write(path.join(root, ".env"), "UNRELATED=1\n");
 
-		const sessions = await diskSessionsRoot(root, gcEnv(root, operator, "GJC_CODING_AGENT_DIR"));
-		expect(sessions).toBe(getSessionsDir(operator));
+		const report = await diskSessionsRoot(root, gcEnv(root, operator, "GJC_CODING_AGENT_DIR"));
+		expect(report.sessions).toBe(getSessionsDir(operator));
 	});
 
 	test("keeps an operator agent dir that differs from the project dotenv", async () => {
@@ -90,8 +121,8 @@ describe("gjc gc agent dir provenance", () => {
 		await fs.mkdir(operator, { recursive: true });
 		await Bun.write(path.join(root, ".env"), `GJC_CODING_AGENT_DIR=${attacker}\n`);
 
-		const sessions = await diskSessionsRoot(root, gcEnv(root, operator, "GJC_CODING_AGENT_DIR"));
-		expect(sessions).toBe(getSessionsDir(operator));
+		const report = await diskSessionsRoot(root, gcEnv(root, operator, "GJC_CODING_AGENT_DIR"));
+		expect(report.sessions).toBe(getSessionsDir(operator));
 	});
 
 	test("keeps an operator PI_CODING_AGENT_DIR the project does not declare", async () => {
@@ -100,8 +131,8 @@ describe("gjc gc agent dir provenance", () => {
 		await fs.mkdir(operator, { recursive: true });
 		await Bun.write(path.join(root, ".env"), "UNRELATED=1\n");
 
-		const sessions = await diskSessionsRoot(root, gcEnv(root, operator, "PI_CODING_AGENT_DIR"));
-		expect(sessions).toBe(getSessionsDir(operator));
+		const report = await diskSessionsRoot(root, gcEnv(root, operator, "PI_CODING_AGENT_DIR"));
+		expect(report.sessions).toBe(getSessionsDir(operator));
 	});
 
 	test("rejects a project-loaded agent dir after its dotenv declaration changes", async () => {
@@ -110,29 +141,15 @@ describe("gjc gc agent dir provenance", () => {
 		const rewritten = path.join(root, "rewritten", "agent");
 		await fs.mkdir(attacker, { recursive: true });
 		await Bun.write(path.join(root, ".env"), `GJC_CODING_AGENT_DIR=${attacker}\n`);
-		const adapter: GcStoreAdapter = {
-			store: "file_locks",
-			async collect() {
-				await Bun.write(path.join(root, ".env"), `GJC_CODING_AGENT_DIR=${rewritten}\n`);
-				return { records: [], errors: [] };
-			},
-			async prune() {
-				return { removed: false };
-			},
-		};
-
-		const result = await runGjcGcCommand(["--disk", "--json"], root, gcEnv(root, attacker, "GJC_CODING_AGENT_DIR"), [
-			adapter,
-		]);
-		expect(result.status).not.toBe(2);
-		const report = JSON.parse(result.stdout) as {
-			disk: { surfaces: Record<string, { root: string }> };
-		};
-		for (const surface of Object.values(report.disk.surfaces)) {
-			expect(surface.root.startsWith(attacker)).toBe(false);
-			expect(surface.root.startsWith(rewritten)).toBe(false);
-		}
-		expect(report.disk.surfaces.sessions?.root).toBe(getSessionsDir(getAgentDir()));
+		const report = await runLoadedProbe(root, ["during", "GJC_CODING_AGENT_DIR", rewritten], {
+			GJC_CODING_AGENT_DIR: attacker,
+			GJC_HARNESS_ROOT_REGISTRY_DIR: path.join(root, "harness-roots"),
+			TMPDIR: path.join(root, "tmp"),
+		});
+		expect(report.sessions?.startsWith(attacker)).toBe(false);
+		expect(report.sessions?.startsWith(rewritten)).toBe(false);
+		expect(report.sessions).toBe(report.fallback);
+		expect(report.fallback?.startsWith(os.homedir())).toBe(false);
 	});
 
 	test("rejects a project-loaded agent dir after the declaration changes before gc", async () => {
