@@ -1,3 +1,3 @@
 ### Fixed
 
-- Launch worktree cleanup no longer follows a symlink into `git worktree remove --force`, so a copied `.git` file cannot make that cleanup delete another directory.
+- Launch worktree cleanup no longer deletes through a symlinked worktree path, or through an in-repo bucket path that resolves outside the repository.

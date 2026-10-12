@@ -317,6 +317,28 @@ describe("removeOwnedLaunchWorktree", () => {
 		expect(fs.existsSync(worktreePath)).toBe(false);
 	});
 
+	test("still leaves an outside symlink when an in-repo bucket is retargeted", () => {
+		const repo = initRepo("gjc-rm-outlink-repo-");
+		const bucket = path.join(repo, ".worktrees");
+		fs.mkdirSync(bucket);
+		const worktreePath = path.join(bucket, "wt");
+		git(repo, ["worktree", "add", "-q", "--detach", worktreePath, "HEAD"]);
+		fs.rmSync(bucket, { recursive: true, force: true });
+		const outside = makeTempDir("gjc-rm-outlink-outside-");
+		const vault = makeTempDir("gjc-rm-outlink-vault-");
+		fs.writeFileSync(path.join(vault, "needle.txt"), "KEEP-NEEDLE\n");
+		const outsideLink = path.join(outside, "wt");
+		fs.symlinkSync(vault, outsideLink, "dir");
+		fs.symlinkSync(outside, bucket, "dir");
+
+		removeOwnedLaunchWorktree(detachedPlan(repo, worktreePath), ownedReceipt());
+
+		expect(fs.lstatSync(outsideLink).isSymbolicLink()).toBe(true);
+		expect(fs.readlinkSync(outsideLink)).toBe(vault);
+		expect(fs.readFileSync(path.join(vault, "needle.txt"), "utf8")).toBe("KEEP-NEEDLE\n");
+		expect(fs.lstatSync(bucket).isSymbolicLink()).toBe(true);
+	});
+
 	test("does not delete a directory outside the repo when an in-repo bucket symlink is retargeted", () => {
 		const repo = initRepo("gjc-rm-retarget-repo-");
 		const bucket = path.join(repo, ".worktrees");

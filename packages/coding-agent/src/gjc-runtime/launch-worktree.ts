@@ -757,9 +757,10 @@ function pruneWorktreeRegistration(repoRoot: string): void {
  * Remove a launch worktree this process just created.
  *
  * `git worktree remove --force` follows a symlink and deletes the referent when a
- * copied `.git` gitdir file passes validation. Drop only the link in that case.
- * A directory that resolves outside the repository is left untouched. A real
- * directory is still removed with `--force`.
+ * copied `.git` gitdir file passes validation. Unlink that link only when its
+ * parent stays inside the repository, or when the path is an explicit external
+ * worktree. An in-repo path whose parent resolves outside the repository is
+ * left untouched. A real directory is still removed with `--force`.
  */
 function removeCreatedWorktree(repoRoot: string, worktreePath: string): void {
 	let stat: fs.Stats | undefined;
@@ -770,6 +771,15 @@ function removeCreatedWorktree(repoRoot: string, worktreePath: string): void {
 			pruneWorktreeRegistration(repoRoot);
 			return;
 		}
+	}
+	// A retargeted in-repo bucket can place this path's parent outside the repository.
+	// Do not unlink that outside entry. An explicit external worktree is not this case.
+	if (
+		lexicalPathInsideRepository(repoRoot, worktreePath) &&
+		realpathEscapesRepository(repoRoot, path.dirname(worktreePath))
+	) {
+		pruneWorktreeRegistration(repoRoot);
+		return;
 	}
 	if (stat?.isSymbolicLink()) {
 		try {
