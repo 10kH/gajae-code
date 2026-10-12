@@ -1152,6 +1152,7 @@ export class TUI extends Container {
 	#fullRedrawCount = 0;
 	#stopped = false;
 	#terminalUnavailable = false;
+	#restartNeedsClear = false; // Set when stop() resets viewport state
 	#bottomPinnedComponent: Component | null = null;
 	#pendingTerminalCleanup: Array<{ payload: string; onDelivered?: () => void }> = [];
 	#mouseSelectionStart: MouseSelectionPoint | null = null;
@@ -1430,6 +1431,11 @@ export class TUI extends Container {
 
 	setClearOnShrink(enabled: boolean): void {
 		this.#clearOnShrink = enabled;
+	}
+
+	/** Overlays rely on padded rows, so contraction replays only without them. */
+	#clearOnShrinkReplays(): boolean {
+		return this.#clearOnShrink && this.overlayStack.length === 0;
 	}
 
 	setFocus(component: Component | null): void {
@@ -2981,6 +2987,12 @@ export class TUI extends Container {
 		this.#lineEmitWidthCache.clear();
 		this.#previousWidth = 0;
 		this.#previousHeight = 0;
+		this.#cursorRow = 0;
+		this.#hardwareCursorRow = 0;
+		this.#viewportTopRow = 0;
+		this.#maxLinesRendered = 0;
+		// Mark that the next initial render needs to clear the screen after terminal reset
+		this.#restartNeedsClear = true;
 		this.#forcedRenderPreviousWidth = 0;
 		this.#forcedRenderPreviousHeight = 0;
 		this.#transcriptRebuildPending = false;
@@ -5268,7 +5280,10 @@ export class TUI extends Container {
 			if (hasStickySuffix && height > 0 && this.#manualViewportTop === undefined) {
 				// Rebuilds start at their new transcript frontier. Forced redraws use the
 				// captured rendered dimensions rather than their -1 invalidation sentinels.
+				// clearOnShrink replays the whole frame on contraction instead; spacer rows
+				// would otherwise stay on screen as a blank gap above the pinned component.
 				const preserveLiveFrontier =
+					!this.#clearOnShrinkReplays() &&
 					!transcriptIdentityReplaced &&
 					!transcriptRebuildPending &&
 					frontierPreviousWidth === width &&
@@ -5788,9 +5803,12 @@ export class TUI extends Container {
 			return;
 		}
 		// First render - just output everything without clearing (assumes clean screen)
+		// unless we're restarting after a stop() which leaves stale content
 		if (initialRender) {
 			logRedraw("first render");
-			fullRender(false, "first render");
+			const shouldClear = this.#restartNeedsClear;
+			this.#restartNeedsClear = false;
+			fullRender(shouldClear, "first render");
 			return;
 		}
 
@@ -5848,13 +5866,11 @@ export class TUI extends Container {
 		// Content shrunk below the previous render and no overlays - re-render to clear empty rows
 		// (overlays need the padding, so only do this when no overlays are active)
 		// Configurable via setClearOnShrink() or GJC_CLEAR_ON_SHRINK=0 env var
-		if (this.#clearOnShrink && newLines.length < this.#previousLines.length && this.overlayStack.length === 0) {
+		// Erase native scrollback too: scrolled-off rows cannot be pulled back into the
+		// viewport, and repainting them on screen would duplicate them in history.
+		if (this.#clearOnShrinkReplays() && newLines.length < this.#previousLines.length) {
 			logRedraw(`clearOnShrink (prev=${this.#previousLines.length}, new=${newLines.length})`);
-			if (useViewportRepaintPath) {
-				viewportRepaint(`clearOnShrink (prev=${this.#previousLines.length}, new=${newLines.length})`);
-			} else {
-				fullRender(true, "clearOnShrink");
-			}
+			fullRender(true, "clearOnShrink", true);
 			return;
 		}
 
