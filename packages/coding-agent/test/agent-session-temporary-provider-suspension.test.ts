@@ -14,7 +14,11 @@ function createSession(streamFn?: AgentOptions["streamFn"], models: readonly Mod
 		agent,
 		sessionManager: SessionManager.inMemory(),
 		settings: Settings.isolated(),
-		modelRegistry: { getAvailable: () => models, getApiKey: async () => "key" } as never,
+		modelRegistry: {
+			getAvailable: () => models,
+			getApiKey: async () => "key",
+			withConsumerLease: async (body: () => any) => await body(),
+		} as never,
 	});
 }
 

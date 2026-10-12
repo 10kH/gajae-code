@@ -614,7 +614,7 @@ describe("model profile activation", () => {
 			modelRegistry: {
 				...baseRegistry,
 				getAvailable: () => available,
-			} as unknown as ModelRegistry,
+			, withConsumerLease: async (body: () => any) => await body()} as unknown as ModelRegistry,
 			settings: Settings.isolated(),
 			profileName: "claude-opus",
 		});
@@ -2207,7 +2207,7 @@ describe("model profile activation", () => {
 					getAvailable: () => [head, fallback],
 					getApiKey: async () => kNoAuth,
 					isSelectorCircuitOpen: () => false,
-				} as unknown as ModelRegistry,
+				, withConsumerLease: async (body: () => any) => await body()} as unknown as ModelRegistry,
 			});
 			configuringSession.setConfiguredModelChain(
 				"default",
@@ -2230,7 +2230,7 @@ describe("model profile activation", () => {
 					getAvailable: () => [head, fallback],
 					getApiKey: async () => kNoAuth,
 					isSelectorCircuitOpen: () => false,
-				} as unknown as ModelRegistry,
+				, withConsumerLease: async (body: () => any) => await body()} as unknown as ModelRegistry,
 			});
 			try {
 				expect(await session.switchSession(sessionFile)).toBe(true);
@@ -3386,7 +3386,7 @@ describe("preset-equivalent profile activation", () => {
 					getCanonicalId,
 					seedCanonicalVariant,
 					clearCanonicalVariant,
-				} as unknown as ModelRegistry,
+				, withConsumerLease: async (body: () => any) => await body()} as unknown as ModelRegistry,
 			});
 			try {
 				// The old provider-a model has no canonical identity, so an explicit
@@ -4073,7 +4073,7 @@ describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
 			modelRegistry: {
 				...registry,
 				getAll: () => [...registry.getAll(), proxyModel("grok-4.3")],
-			} as unknown as ModelRegistry,
+			, withConsumerLease: async (body: () => any) => await body()} as unknown as ModelRegistry,
 			settings: Settings.isolated({ "modelProfile.proxyProvider": "litellm", "modelProfile.proxyMode": "always" }),
 			profileName: profile.name,
 		});
@@ -4120,7 +4120,7 @@ describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
 						proxyModel("meta/muse-spark-1.2"),
 						proxyModel("other/muse-spark-1.2"),
 					],
-				} as unknown as ModelRegistry,
+				, withConsumerLease: async (body: () => any) => await body()} as unknown as ModelRegistry,
 				settings: Settings.isolated({
 					"modelProfile.proxyProvider": "litellm",
 					"modelProfile.proxyMode": "always",
@@ -4309,7 +4309,7 @@ describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
 			modelRegistry: {
 				...registry,
 				getAll: () => [...registry.getAll(), proxyModel("other/grok-4.3")],
-			} as unknown as ModelRegistry,
+			, withConsumerLease: async (body: () => any) => await body()} as unknown as ModelRegistry,
 			settings: Settings.isolated({ "modelProfile.proxyProvider": "litellm" }),
 			profileName: profile.name,
 		});
@@ -4328,7 +4328,7 @@ describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
 				modelRegistry: {
 					...registry,
 					getAll: () => [...registry.getAll(), proxyModel("foo/grok-4.4"), proxyModel("bar/grok-4.4")],
-				} as unknown as ModelRegistry,
+				, withConsumerLease: async (body: () => any) => await body()} as unknown as ModelRegistry,
 				settings: Settings.isolated({ "modelProfile.proxyProvider": "litellm" }),
 				profileName: profile.name,
 			}),

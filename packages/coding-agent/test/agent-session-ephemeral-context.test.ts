@@ -93,7 +93,11 @@ function createHarness(
 		agent,
 		sessionManager: SessionManager.inMemory(),
 		settings: Settings.isolated({ "compaction.enabled": false }),
-		modelRegistry: { getApiKey: async () => "test-key", getAvailable: () => [model] } as never,
+		modelRegistry: {
+			getApiKey: async () => "test-key",
+			getAvailable: () => [model],
+			withConsumerLease: async (body: () => any) => await body(),
+		} as never,
 		agentId: "0-Main",
 		agentRegistry: registry,
 		convertToLlm: async messages => {

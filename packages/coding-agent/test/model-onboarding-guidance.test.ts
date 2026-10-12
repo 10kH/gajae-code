@@ -193,7 +193,7 @@ describe("model onboarding guidance", () => {
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry: {
 				getApiKey: async () => undefined,
-			} as never,
+			, withConsumerLease: async (body: () => any) => await body()} as never,
 		});
 		try {
 			let noCredentialMessage: string | undefined;

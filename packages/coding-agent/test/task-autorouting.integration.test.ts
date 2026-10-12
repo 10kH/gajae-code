@@ -33,7 +33,7 @@ function session(settingsOverrides: Record<string, unknown> = {}, overrides: Par
 		settings: Settings.isolated(settingsOverrides),
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
-		modelRegistry: { getAvailable: () => [] } as never,
+		modelRegistry: { getAvailable: () => [], withConsumerLease: async (body: () => any) => await body() } as never,
 		...overrides,
 	} as unknown as ToolSession;
 }
@@ -105,7 +105,11 @@ describe("TaskTool autorouting integration surfaces", () => {
 		const tool = await TaskTool.create(
 			session({}, {
 				settings,
-				modelRegistry: { getAvailable: () => [], getModelProfile: () => profile } as never,
+				modelRegistry: {
+					getAvailable: () => [],
+					getModelProfile: () => profile,
+					withConsumerLease: async (body: () => any) => await body(),
+				} as never,
 				getActiveModelProfile: () => profile.name,
 				getActiveModelString: () => "kimi-k3:high",
 			} as never),
@@ -203,7 +207,16 @@ describe("TaskTool autorouting integration surfaces", () => {
 			"task.agentModelOverrides": { task: ["manual/one", "manual/two"] },
 		});
 		const tool = await TaskTool.create(
-			session({}, { settings, modelRegistry: { getAvailable: () => registryModels } as never }),
+			session(
+				{},
+				{
+					settings,
+					modelRegistry: {
+						getAvailable: () => registryModels,
+						withConsumerLease: async (body: () => any) => await body(),
+					} as never,
+				},
+			),
 			{ runSubprocess: stub },
 		);
 		await tool.execute("mixed", {
@@ -251,7 +264,16 @@ describe("TaskTool autorouting integration surfaces", () => {
 			"task.agentModelOverrides": { task: manual },
 		});
 		const tool = await TaskTool.create(
-			session({}, { settings, modelRegistry: { getAvailable: () => registryModels } as never }),
+			session(
+				{},
+				{
+					settings,
+					modelRegistry: {
+						getAvailable: () => registryModels,
+						withConsumerLease: async (body: () => any) => await body(),
+					} as never,
+				},
+			),
 			{ runSubprocess: stub },
 		);
 		await tool.execute("fallback", {
@@ -298,7 +320,16 @@ describe("TaskTool autorouting integration surfaces", () => {
 			"task.agentModelOverrides": { task: manual },
 		});
 		const tool = await TaskTool.create(
-			session({}, { settings, modelRegistry: { getAvailable: () => registryModels } as never }),
+			session(
+				{},
+				{
+					settings,
+					modelRegistry: {
+						getAvailable: () => registryModels,
+						withConsumerLease: async (body: () => any) => await body(),
+					} as never,
+				},
+			),
 			{ runSubprocess: stub },
 		);
 		await tool.execute("bounded-fallback", {
@@ -337,7 +368,16 @@ describe("TaskTool autorouting integration surfaces", () => {
 		};
 		const settings = Settings.isolated({ "task.agentModelOverrides": { task: manual } });
 		const tool = await TaskTool.create(
-			session({}, { settings, modelRegistry: { getAvailable: () => registryModels } as never }),
+			session(
+				{},
+				{
+					settings,
+					modelRegistry: {
+						getAvailable: () => registryModels,
+						withConsumerLease: async (body: () => any) => await body(),
+					} as never,
+				},
+			),
 			{ runSubprocess: stub },
 		);
 		const result = await tool.execute("disabled", {
@@ -383,7 +423,16 @@ describe("TaskTool autorouting integration surfaces", () => {
 			} as SingleResult;
 		};
 		const tool = await TaskTool.create(
-			session({}, { settings, modelRegistry: { getAvailable: () => registryModels } as never }),
+			session(
+				{},
+				{
+					settings,
+					modelRegistry: {
+						getAvailable: () => registryModels,
+						withConsumerLease: async (body: () => any) => await body(),
+					} as never,
+				},
+			),
 			{ runSubprocess: stub },
 		);
 		await tool.execute("resume-seed", {

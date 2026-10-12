@@ -93,7 +93,7 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: {} as never,
+			modelRegistry: { withConsumerLease: async (body: () => any) => await body() } as never,
 			toolRegistry,
 			rebuildSystemPrompt: async (toolNames, _tools) => ({
 				systemPrompt: [await rebuildSystemPrompt(toolNames)],

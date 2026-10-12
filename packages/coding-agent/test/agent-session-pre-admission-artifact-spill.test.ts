@@ -162,7 +162,7 @@ describe("AgentSession pre-admission artifact spill", () => {
 			agent,
 			sessionManager,
 			settings: Settings.isolated(),
-			modelRegistry: {} as never,
+			modelRegistry: { withConsumerLease: async (body: () => any) => await body() } as never,
 		});
 		const toolResult: ToolResultMessage = {
 			role: "toolResult",
@@ -214,7 +214,7 @@ describe("AgentSession pre-admission artifact spill", () => {
 			agent,
 			sessionManager,
 			settings: Settings.isolated({ "tools.preAdmissionArtifactSpill": true }),
-			modelRegistry: {} as never,
+			modelRegistry: { withConsumerLease: async (body: () => any) => await body() } as never,
 		});
 		const fullText = "💥".repeat(30_000);
 		const toolResult: ToolResultMessage = {
@@ -299,7 +299,7 @@ describe("AgentSession pre-admission artifact spill", () => {
 			agent,
 			sessionManager,
 			settings: Settings.isolated({ "tools.preAdmissionArtifactSpill": true }),
-			modelRegistry: {} as never,
+			modelRegistry: { withConsumerLease: async (body: () => any) => await body() } as never,
 		});
 
 		// An uncontended message_end (predecessor already released) must not cost

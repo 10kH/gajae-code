@@ -864,7 +864,7 @@ describe("resolveCliModel", () => {
 			modelRegistry: {
 				...canonicalRegistry,
 				getAll: () => canonicalVariantModels,
-			} as unknown as Parameters<typeof resolveCliModel>[0]["modelRegistry"],
+			, withConsumerLease: async (body: () => any) => await body()} as unknown as Parameters<typeof resolveCliModel>[0]["modelRegistry"],
 		});
 
 		expect(result.error).toBeUndefined();

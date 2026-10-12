@@ -72,7 +72,11 @@ async function startRuntimeHarness(): Promise<RuntimeHarness> {
 		agent,
 		sessionManager,
 		settings: Settings.isolated({ "compaction.enabled": false }),
-		modelRegistry: { getApiKey: async () => "registry-api-key", getAvailable: () => [] } as never,
+		modelRegistry: {
+			getApiKey: async () => "registry-api-key",
+			getAvailable: () => [],
+			withConsumerLease: async (body: () => any) => await body(),
+		} as never,
 	});
 	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
 	const waiters = new Map<string, (frame: ControlResponse) => void>();

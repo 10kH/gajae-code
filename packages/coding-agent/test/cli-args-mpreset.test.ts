@@ -1568,7 +1568,11 @@ test("registry errors are not mistaken for a stale default", async () => {
 			applyStartupModelProfilesForRoot({
 				session: fakeSession(),
 				settings: Settings.isolated({ "modelProfile.default": "deleted-profile" }),
-				modelRegistry: { ...fakeRegistry([]), getError: () => new Error("invalid models.yml") } as never,
+				modelRegistry: {
+					...fakeRegistry([]),
+					getError: () => new Error("invalid models.yml"),
+					withConsumerLease: async (body: () => any) => await body(),
+				} as never,
 				parsedArgs: {},
 				isInteractive: true,
 				hasInteractiveTerminal: true,

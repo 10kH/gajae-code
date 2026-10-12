@@ -111,7 +111,7 @@ async function createSession(
 		agent,
 		sessionManager,
 		settings,
-		modelRegistry: {} as never,
+		modelRegistry: { withConsumerLease: async (body: () => any) => await body() } as never,
 		toolRegistry: new Map(tools.map(t => [t.name, t])),
 		extensionRunner,
 	});
@@ -146,7 +146,10 @@ async function createSessionWithMockModel(
 		agent,
 		sessionManager,
 		settings,
-		modelRegistry: { getApiKey: () => "test-key" } as never,
+		modelRegistry: {
+			getApiKey: () => "test-key",
+			withConsumerLease: async (body: () => any) => await body(),
+		} as never,
 		toolRegistry: new Map(tools.map(t => [t.name, t])),
 	});
 	sess.setSdkPermissionMode("prompt");
