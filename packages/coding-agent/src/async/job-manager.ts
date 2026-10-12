@@ -1675,9 +1675,12 @@ export class AsyncJobManager {
 		for (const target of lease.targets) {
 			const executions = state.backingExecutions.get(target.subagentId) ?? [];
 			const capture = state.records.get(target.subagentId);
-			// Cancel queued records that are still queued at the time of proof collection.
-			// This prevents fenced queued subagents from remaining in the queue indefinitely.
-			if (target.source === "record" && capture && capture.record?.status === "queued") {
+			if (
+				target.source === "record" &&
+				capture &&
+				this.#subagentRecords.get(target.subagentId) === capture.record &&
+				capture.record.status === "queued"
+			) {
 				this.cancelSubagent(target.subagentId, { ownerId: lease.ownerId });
 			}
 			for (const execution of executions) {
@@ -1732,28 +1735,33 @@ export class AsyncJobManager {
 		ownerId: string,
 		state: OwnerSubagentShutdownLeaseState,
 	): boolean {
-		const currentRecord = this.#subagentRecords.get(target.subagentId);
 		const capture = state.records.get(target.subagentId);
+		const record = capture?.record;
 
-		// If record doesn't exist and wasn't captured, it's terminal.
-		if (!currentRecord && !capture) return true;
-
-		// Record must be owned by the shutting-down owner.
-		const recordOwner = currentRecord?.ownerId ?? capture?.record?.ownerId;
-		if (recordOwner !== ownerId) return false;
-
-		// For queued records (captured with jobId=null), a queued status is terminal
-		// evidence because the owner is fenced and the record can never resume.
-		if (target.jobId === null && currentRecord?.status === "queued") {
-			return true;
+		// Special case: queued records (target.jobId === null) are terminal for a shutting-down owner
+		// because the owner is fenced and will never let them resume. Any queued record that belonged
+		// to this owner is terminal, whether it's still queued or was cancelled during proving.
+		if (target.jobId === null) {
+			const currentRecord = this.#subagentRecords.get(target.subagentId);
+			const recordOwner = currentRecord?.ownerId ?? record?.ownerId;
+			if (recordOwner === ownerId) {
+				return true;
+			}
 		}
 
-		// For other records, require terminal status and settled executions.
-		const record = currentRecord ?? capture?.record;
-		if (!record || !this.#isTerminalSubagentStatus(record.status)) {
+		// Standard terminal validation for non-queued records
+		if (
+			!record ||
+			this.#subagentRecords.get(target.subagentId) !== record ||
+			record.ownerId !== ownerId ||
+			record.currentJobId !== capture.currentJobId ||
+			record.currentJobGeneration !== capture.currentJobGeneration
+		) {
 			return false;
 		}
-
+		if (!this.#isTerminalSubagentStatus(record.status)) {
+			return false;
+		}
 		return (state.backingExecutions.get(target.subagentId) ?? []).every(
 			execution => execution.job.ownerId === ownerId && execution.physicallySettled,
 		);
