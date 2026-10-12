@@ -253,15 +253,40 @@ async function writeSessionHtml(
 	}
 }
 
-/** Own `__proto__` stays a data property; a normal object would turn that assignment into the prototype. */
+/**
+ * Own `__proto__` stays a data property; a normal object would turn that assignment into the prototype.
+ * Each field is redacted together with its key. A detached leaf such as `abcdefgh1234` under `password`
+ * would otherwise miss the key-aware rule. If that serialized field does not parse, the value is
+ * redacted on its own so a quotation mark inside a labeled secret cannot break the export.
+ */
 function redactJsonValue(value: unknown): unknown {
 	if (typeof value === "string") return redactCrashSecrets(value);
 	if (Array.isArray(value)) return value.map(item => redactJsonValue(item));
 	if (value === null || typeof value !== "object") return value;
 	const source = value as Record<string, unknown>;
 	const redacted = Object.create(null) as Record<string, unknown>;
-	for (const key of Object.keys(source)) redacted[key] = redactJsonValue(source[key]);
+	for (const key of Object.keys(source)) redacted[key] = redactKeyedValue(key, source[key]);
 	return redacted;
+}
+
+const CREDENTIAL_JSON_KEY =
+	/^(?:api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?id|session[_-]?token|client[_-]?secret|secret[_-]?key|aws[_-]?secret[_-]?access[_-]?key|secret[_-]?access[_-]?key|password|passwd|authorization)$/i;
+
+function redactKeyedValue(key: string, value: unknown): unknown {
+	if (typeof value !== "string") return redactJsonValue(value);
+	// A quote inside a credential field can sit before the labeled-value rule's
+	// eight-character run, leaving the serialized JSON valid and the secret intact.
+	if (CREDENTIAL_JSON_KEY.test(key) && /["']/.test(value)) return "«redacted»";
+	const encoded = JSON.stringify({ [key]: value });
+	try {
+		const parsed = JSON.parse(redactCrashSecrets(encoded)) as Record<string, unknown>;
+		if (parsed !== null && typeof parsed === "object" && Object.hasOwn(parsed, key)) return parsed[key];
+	} catch {
+		// A quote inside a credential field can make the redacted JSON invalid.
+		// Mask that field instead of exporting the raw value without its key.
+		if (CREDENTIAL_JSON_KEY.test(key)) return "«redacted»";
+	}
+	return redactCrashSecrets(value);
 }
 
 function sessionEmbedJson(value: unknown): string {

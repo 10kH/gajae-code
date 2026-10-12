@@ -82,6 +82,97 @@ describe("session HTML export embed", () => {
 		}
 	});
 
+	it("scrubs a nested password field in a tool-call argument", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-html-export-key-"));
+		let session: SessionManager | undefined;
+		try {
+			session = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+			session.appendMessage({
+				role: "assistant",
+				content: [
+					{
+						type: "toolCall",
+						id: "call-1",
+						name: "echo",
+						arguments: { password: "abcdefgh1234", note: ORDINARY_SENTENCE },
+					},
+				],
+				timestamp: 1,
+			} as unknown as Parameters<SessionManager["appendMessage"]>[0]);
+			const outputPath = path.join(tempDir, "export.html");
+			await exportSessionToHtml(session, undefined, { outputPath });
+			const embedded = embeddedSessionText(await Bun.file(outputPath).text());
+			expect(embedded).not.toContain("abcdefgh1234");
+			expect(embedded).toContain("«redacted»");
+			expect(embedded).toContain(ORDINARY_SENTENCE);
+		} finally {
+			await session?.close();
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("scrubs a nested password field that contains a quotation mark", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-html-export-key-quote-"));
+		let session: SessionManager | undefined;
+		try {
+			session = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+			session.appendMessage({
+				role: "assistant",
+				content: [
+					{
+						type: "toolCall",
+						id: "call-2",
+						name: "echo",
+						arguments: { password: 'abcdefgh"suffix', note: QUOTED_SENTENCE },
+					},
+				],
+				timestamp: 1,
+			} as unknown as Parameters<SessionManager["appendMessage"]>[0]);
+			const outputPath = path.join(tempDir, "export.html");
+			await exportSessionToHtml(session, undefined, { outputPath });
+			const embedded = embeddedSessionText(await Bun.file(outputPath).text());
+			const parsed = JSON.parse(embedded) as { entries: unknown[] };
+			expect(embedded).not.toContain("abcdefgh");
+			expect(embedded).toContain("«redacted»");
+			expect(parsed.entries.length).toBeGreaterThan(0);
+		} finally {
+			await session?.close();
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("masks a password field when the quotation mark is early", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-html-export-key-early-"));
+		let session: SessionManager | undefined;
+		try {
+			session = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+			session.appendMessage({
+				role: "assistant",
+				content: [
+					{
+						type: "toolCall",
+						id: "call-3",
+						name: "echo",
+						arguments: { password: 'abc"defghijkl1234', note: QUOTED_SENTENCE },
+					},
+				],
+				timestamp: 1,
+			} as unknown as Parameters<SessionManager["appendMessage"]>[0]);
+			const outputPath = path.join(tempDir, "export.html");
+			await exportSessionToHtml(session, undefined, { outputPath });
+			const embedded = embeddedSessionText(await Bun.file(outputPath).text());
+			const parsed = JSON.parse(embedded) as {
+				entries: Array<{ message?: { content?: Array<{ arguments?: { note?: string } }> } }>;
+			};
+			expect(embedded).not.toContain("defghijkl1234");
+			expect(embedded).toContain("«redacted»");
+			expect(parsed.entries[0]?.message?.content?.[0]?.arguments?.note).toBe(QUOTED_SENTENCE);
+		} finally {
+			await session?.close();
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("keeps an ordinary message that contains a quotation mark", async () => {
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-html-export-plain-"));
 		let session: SessionManager | undefined;
