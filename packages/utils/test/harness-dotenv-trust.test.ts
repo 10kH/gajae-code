@@ -75,5 +75,17 @@ describe.each([
 			const inherited = `/operator/${key}`;
 			expect(await resolveIn(tempDir(`${key}=/attacker/${key}\n`), key, { autoload, inherited })).toBe(inherited);
 		});
+
+		it("drops an inherited value equal to the project declaration", async () => {
+			const inherited = `/operator/${key}`;
+			expect(await resolveIn(tempDir(`${key}=${inherited}\n`), key, { autoload, inherited })).toBeNull();
+		});
+
+		it("drops an inherited value when the project declaration is dynamic", async () => {
+			const inherited = `/operator/${key}`;
+			expect(
+				await resolveIn(tempDir(`ATTACK=/other/${key}\n${key}=$ATTACK\n`), key, { autoload, inherited }),
+			).toBeNull();
+		});
 	});
 });
