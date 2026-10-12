@@ -20,6 +20,8 @@ function identityConverter(messages: AgentMessage[]): Message[] {
 }
 
 async function main(): Promise<void> {
+	const beforeLoop = process.env.OTEL_CAPTURE_TRUST_BEFORE_LOOP;
+	if (beforeLoop !== undefined) process.env[ENV_NAME] = beforeLoop;
 	trace.disable();
 	context.disable();
 	const contextManager = new AsyncLocalStorageContextManager().enable();
@@ -52,10 +54,12 @@ async function main(): Promise<void> {
 	}
 
 	const chat = exporter.getFinishedSpans().find(span => span.name === "chat mock-model");
-	const input = chat?.attributes[GenAIAttr.InputMessages];
-	const request = chat?.attributes[PiGenAIAttr.RequestMessages];
+	if (!chat) throw new Error("chat span missing");
+	const input = chat.attributes[GenAIAttr.InputMessages];
+	const request = chat.attributes[PiGenAIAttr.RequestMessages];
 	console.log(
 		JSON.stringify({
+			spanFound: true,
 			envValue: process.env[ENV_NAME] ?? null,
 			inputMessages: typeof input === "string" ? input : null,
 			requestMessages: typeof request === "string" ? request : null,

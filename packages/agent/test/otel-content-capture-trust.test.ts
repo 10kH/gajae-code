@@ -29,6 +29,7 @@ function tempDir(): string {
 }
 
 interface CaptureProbe {
+	spanFound: boolean;
 	envValue: string | null;
 	inputMessages: string | null;
 	requestMessages: string | null;
@@ -53,16 +54,25 @@ async function captureIn(
 	Object.assign(env, overrides);
 
 	const proc = Bun.spawn([process.execPath, PROBE], { cwd, env, stdout: "pipe", stderr: "pipe" });
-	const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
-	const exitCode = await proc.exited;
-	if (exitCode !== 0) throw new Error(`probe failed (${exitCode}): ${stderr}`);
-	return JSON.parse(stdout.trim()) as CaptureProbe;
+	const killer = setTimeout(() => {
+		proc.kill();
+	}, 20_000);
+	try {
+		const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+		const exitCode = await proc.exited;
+		if (exitCode !== 0) throw new Error(`probe failed (${exitCode}): ${stderr}`);
+		return JSON.parse(stdout.trim()) as CaptureProbe;
+	} finally {
+		clearTimeout(killer);
+		if (proc.exitCode === null) proc.kill();
+	}
 }
 
 describe("GenAI content capture project dotenv trust", () => {
 	it("ignores a project .env that turns message content capture on", async () => {
 		const cwd = tempDir();
 		const captured = await captureIn(cwd, `${ENV_NAME}=full\n`);
+		expect(captured.spanFound).toBe(true);
 		expect(captured.envValue).toBe("full");
 		expect(captured.inputMessages).toBeNull();
 		expect(captured.requestMessages).toBeNull();
@@ -71,6 +81,7 @@ describe("GenAI content capture project dotenv trust", () => {
 	it("still captures full message content when the operator sets the env and the project does not", async () => {
 		const cwd = tempDir();
 		const captured = await captureIn(cwd, "OTHER=1\n", { [ENV_NAME]: "full" });
+		expect(captured.spanFound).toBe(true);
 		expect(captured.envValue).toBe("full");
 		expect(captured.inputMessages).toContain(CANARY);
 		expect(captured.warnings).toContain("full_content_capture_env_active");
@@ -79,6 +90,32 @@ describe("GenAI content capture project dotenv trust", () => {
 	it("keeps an operator summary when the project .env asks for full capture", async () => {
 		const cwd = tempDir();
 		const captured = await captureIn(cwd, `${ENV_NAME}=full\n`, { [ENV_NAME]: "summary" });
+		expect(captured.spanFound).toBe(true);
+		expect(captured.envValue).toBe("summary");
+		expect(captured.inputMessages).toBeNull();
+		expect(captured.requestMessages).toContain(CANARY);
+	});
+
+	it("honors an operator downgrade to false before the first capture read", async () => {
+		const cwd = tempDir();
+		const captured = await captureIn(cwd, "OTHER=1\n", {
+			[ENV_NAME]: "full",
+			OTEL_CAPTURE_TRUST_BEFORE_LOOP: "false",
+		});
+		expect(captured.spanFound).toBe(true);
+		expect(captured.envValue).toBe("false");
+		expect(captured.inputMessages).toBeNull();
+		expect(captured.requestMessages).toBeNull();
+		expect(captured.warnings).not.toContain("full_content_capture_env_active");
+	});
+
+	it("honors an operator downgrade to summary before the first capture read", async () => {
+		const cwd = tempDir();
+		const captured = await captureIn(cwd, "OTHER=1\n", {
+			[ENV_NAME]: "full",
+			OTEL_CAPTURE_TRUST_BEFORE_LOOP: "summary",
+		});
+		expect(captured.spanFound).toBe(true);
 		expect(captured.envValue).toBe("summary");
 		expect(captured.inputMessages).toBeNull();
 		expect(captured.requestMessages).toContain(CANARY);

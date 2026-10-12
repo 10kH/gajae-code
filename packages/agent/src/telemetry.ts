@@ -460,12 +460,25 @@ export function resolveTelemetry(
 
 let contentCaptureEnvCache: ResolvedTelemetryContentCapture | undefined;
 let hasWarnedFullContentCaptureEnv = false;
+
+/** `full` > `summary` > anything else. Matches the parser below. */
+function contentCaptureRank(raw: string | undefined): 0 | 1 | 2 {
+	if (!raw) return 0;
+	const normalized = raw.trim().toLowerCase();
+	if (normalized === "full") return 2;
+	if (normalized === "summary" || normalized === "true" || normalized === "1" || normalized === "yes") return 1;
+	return 0;
+}
+
 function readContentCaptureEnv(): ResolvedTelemetryContentCapture {
 	if (contentCaptureEnvCache !== undefined) return contentCaptureEnvCache;
-	// `$credentialEnv` ignores a cwd `.env` value, including one Bun or the
-	// product env merge already copied into the process environment. An
-	// operator value the project does not declare still applies.
-	const raw = $credentialEnv(CONTENT_CAPTURE_ENV);
+	// `$credentialEnv` ignores a cwd `.env` value, including one already copied
+	// into the process environment, but pins an inherited value at import.
+	// A project declaration still cannot select capture. An operator downgrade
+	// before the first read uses the current value instead of that pin.
+	const trusted = $credentialEnv(CONTENT_CAPTURE_ENV);
+	const live = Bun.env[CONTENT_CAPTURE_ENV];
+	const raw = live !== undefined && contentCaptureRank(live) < contentCaptureRank(trusted) ? live : trusted;
 	if (!raw) {
 		contentCaptureEnvCache = "none";
 		return "none";
