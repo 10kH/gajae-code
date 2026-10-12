@@ -9,7 +9,9 @@ import { runInteractiveBashPty } from "@gajae-code/coding-agent/tools/bash-inter
 const mode = process.argv[2];
 const cwd = process.cwd();
 const command = "git status --short >/dev/null 2>&1; echo probe-done";
-const settings = await Settings.init({ inMemory: true, cwd });
+// `shellPath` is read from global settings only, so set it there.
+const shellPath = process.env.GJC_TEST_SHELL_PATH;
+const settings = shellPath ? Settings.isolated({ shellPath }) : await Settings.init({ inMemory: true, cwd });
 
 function headlessUi(): NonNullable<AgentToolContext["ui"]> {
 	return {

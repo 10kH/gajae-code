@@ -16,6 +16,7 @@ import * as path from "node:path";
 const PROBE = path.join(import.meta.dir, "fixtures", "bash-project-hook-probe.ts");
 const HOOK_KEYS = [
 	"BASH_ENV",
+	"ZDOTDIR",
 	"ENV",
 	"XDG_CONFIG_HOME",
 	"GIT_DIR",
@@ -69,6 +70,8 @@ async function runProbe(
 	env.HOME = tempDir();
 	env.GJC_CODING_AGENT_DIR = tempDir();
 	Object.assign(env, inherited);
+	// An empty override means "the launcher does not export this variable".
+	for (const [key, value] of Object.entries(inherited)) if (value === "") delete env[key];
 
 	fs.rmSync(target.marker, { force: true });
 	const proc = Bun.spawn([process.execPath, PROBE, mode], { cwd: target.cwd, env, stdout: "pipe", stderr: "pipe" });
@@ -95,6 +98,12 @@ const VECTORS: Record<string, (project: Project) => string> = {
 		return `GIT_DIR=${evil}\n`;
 	},
 	BASH_ENV: ({ hook }) => `BASH_ENV=${hook}\n`,
+	HOME: ({ cwd, hook }) => {
+		const home = path.join(cwd, "planted-home");
+		fs.mkdirSync(home, { recursive: true });
+		fs.writeFileSync(path.join(home, ".gitconfig"), `[core]\n\tfsmonitor = ${hook}\n`);
+		return `HOME=${home}\n`;
+	},
 };
 
 /** Values a parent GJC forwards to a child session match the child's project `.env`. */
@@ -111,9 +120,11 @@ describe.skipIf(process.platform === "win32")("bash tool ignores project .env ho
 	// The isolated worker chain is Bun processes that each reload `cwd/.env`,
 	// and the native shell imports the worker environment wholesale. (It already
 	// skips BASH_ENV/ENV itself, so only git vectors reach this path.)
-	for (const name of ["GIT_CONFIG_", "XDG_CONFIG_HOME", "GIT_DIR"]) {
+	for (const name of ["GIT_CONFIG_", "XDG_CONFIG_HOME", "GIT_DIR", "HOME"]) {
 		it(`does not run a ${name} hook from the project .env (isolated worker)`, async () => {
-			expect(await runProbe(project(VECTORS[name]!), "worker")).toBe(false);
+			// HOME only reaches the shell from the project when the launcher has none.
+			const inherited: Record<string, string> = name === "HOME" ? { HOME: "" } : {};
+			expect(await runProbe(project(VECTORS[name]!), "worker", inherited)).toBe(false);
 		});
 	}
 
@@ -135,5 +146,23 @@ describe.skipIf(process.platform === "win32")("bash tool ignores project .env ho
 		fs.writeFileSync(path.join(xdg, "git", "config"), `[core]\n\tfsmonitor = ${target.hook}\n`);
 		expect(await runProbe(target, "worker", { XDG_CONFIG_HOME: xdg })).toBe(true);
 		expect(await runProbe(target, "pty", { XDG_CONFIG_HOME: xdg })).toBe(true);
+	});
+});
+
+/**
+ * zsh sources `$ZDOTDIR/.zshenv` before `-c` commands. Only the PTY path runs the
+ * configured shell binary (the non-PTY path is the built-in bash emulator), so
+ * this is exercised when a zsh is available.
+ */
+const ZSH = Bun.which("zsh");
+describe.skipIf(process.platform === "win32" || !ZSH)("interactive PTY ignores a project ZDOTDIR", () => {
+	it("does not source a forwarded project ZDOTDIR/.zshenv", async () => {
+		const target = project(({ cwd, hook }) => {
+			const zdot = path.join(cwd, "zdot");
+			fs.mkdirSync(zdot, { recursive: true });
+			fs.writeFileSync(path.join(zdot, ".zshenv"), `${hook}\n`);
+			return `ZDOTDIR=${zdot}\n`;
+		});
+		expect(await runProbe(target, "pty", { ...forwarded(target), GJC_TEST_SHELL_PATH: ZSH! })).toBe(false);
 	});
 });

@@ -12,6 +12,7 @@ import type {
 	ShellRunResult,
 } from "@gajae-code/natives";
 import { postmortem } from "@gajae-code/utils";
+import { stripProjectSpawnHooks } from "@gajae-code/utils/shell-config";
 import { Settings, type ShellMinimizerSettings } from "../config/settings";
 import { formatCrashDiagnosticNotice, writeCrashReport } from "../debug/crash-diagnostics";
 import {
@@ -429,7 +430,11 @@ export function buildMinimizerOptions(group: ShellMinimizerSettings): MinimizerO
 
 export async function executeBash(command: string, options?: BashExecutorOptions): Promise<BashResult> {
 	const settings = options?.settings ?? (await Settings.init());
-	const { shell, env: shellEnv, prefix } = settings.getShellConfig();
+	const { shell, env: configEnv, prefix } = settings.getShellConfig();
+	// The shell config env is shared with other consumers (Python kernels keep
+	// their own documented allowlist). Only the bash tool's shell must not see
+	// project hook variables such as BASH_ENV or GIT_CONFIG_*.
+	const shellEnv = stripProjectSpawnHooks({ ...configEnv });
 	const configuredPrefix = options?.ignoreShellPrefix ? undefined : prefix;
 	const snapshotPath =
 		!options?.disableShellSnapshot && shell.includes("bash") ? await getOrCreateSnapshot(shell, shellEnv) : null;

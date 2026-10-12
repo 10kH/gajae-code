@@ -16,6 +16,7 @@ import * as path from "node:path";
 const PROBE = path.join(import.meta.dir, "fixtures", "shell-spawn-env-probe.ts");
 const HOOK_KEYS = [
 	"BASH_ENV",
+	"ZDOTDIR",
 	"ENV",
 	"XDG_CONFIG_HOME",
 	"GIT_DIR",
@@ -28,7 +29,7 @@ const HOOK_KEYS = [
 	"GIT_CONFIG_PARAMETERS",
 	"UNRELATED_PROJECT_VAR",
 ] as const;
-type Probe = Record<(typeof HOOK_KEYS)[number], string | null>;
+type Probe = Record<(typeof HOOK_KEYS)[number] | "SHARED_XDG_CONFIG_HOME", string | null>;
 
 const tempDirs: string[] = [];
 
@@ -64,6 +65,7 @@ async function probeIn(cwd: string, autoload: boolean, inherited: Record<string,
 
 const PLANTED = [
 	"BASH_ENV=./hook.sh",
+	"ZDOTDIR=./zdot",
 	"ENV=./hook.sh",
 	"XDG_CONFIG_HOME=./xdg",
 	"GIT_DIR=./evil-git",
@@ -86,6 +88,7 @@ describe.each([
 		const probe = await probeIn(tempDir(PLANTED), autoload);
 		expect(probe).toEqual({
 			BASH_ENV: null,
+			ZDOTDIR: null,
 			ENV: null,
 			XDG_CONFIG_HOME: null,
 			GIT_DIR: null,
@@ -98,6 +101,8 @@ describe.each([
 			GIT_CONFIG_PARAMETERS: null,
 			// Ordinary project variables still reach commands.
 			UNRELATED_PROJECT_VAR: "kept",
+			// The shared shell-config env (Python kernels) keeps documented XDG values.
+			SHARED_XDG_CONFIG_HOME: "./xdg",
 		});
 	});
 

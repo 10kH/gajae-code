@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { canonicalEnvKey } from "./dirs";
+import { canonicalEnvKey, getTrustedHomeDir } from "./dirs";
 import {
 	$credentialEnv,
 	$inheritedEnv,
@@ -54,16 +54,16 @@ function isExecutable(path: string): boolean {
  */
 /**
  * Variables that make the shell or git run code on their own. bash sources
- * `BASH_ENV` (sh: `ENV`) before every non-interactive command. git applies
- * `GIT_CONFIG_*`, reads config from `GIT_DIR`/`GIT_COMMON_DIR` and from
- * `$XDG_CONFIG_HOME/git/config`, and so runs e.g. `core.fsmonitor` during
- * `git status`; it also runs `GIT_EXTERNAL_DIFF` and `GIT_SSH(_COMMAND)`.
- * A repository `.env` must not be able to set them, or every bash tool command
- * — including a restricted role agent's allowlisted `git status` — would execute
- * repository code.
+ * `BASH_ENV` (sh: `ENV`) before every non-interactive command, and zsh sources
+ * `$ZDOTDIR/.zshenv`. git applies `GIT_CONFIG_*`, reads config from
+ * `GIT_DIR`/`GIT_COMMON_DIR`, `$XDG_CONFIG_HOME/git/config` and `$HOME/.gitconfig`,
+ * and so runs e.g. `core.fsmonitor` during `git status`; it also runs
+ * `GIT_EXTERNAL_DIFF` and `GIT_SSH(_COMMAND)`. A repository `.env` must not be
+ * able to set them, or every bash tool command — including a restricted role
+ * agent's allowlisted `git status` — would execute repository code.
  */
 const PROJECT_DENIED_SPAWN_ENV =
-	/^(?:BASH_ENV|ENV|XDG_CONFIG_HOME|GIT_DIR|GIT_COMMON_DIR|GIT_EXTERNAL_DIFF|GIT_SSH|GIT_SSH_COMMAND|GIT_CONFIG_(?:COUNT|PARAMETERS|GLOBAL|SYSTEM|KEY_\d+|VALUE_\d+))$/;
+	/^(?:BASH_ENV|ENV|ZDOTDIR|HOME|XDG_CONFIG_HOME|GIT_DIR|GIT_COMMON_DIR|GIT_EXTERNAL_DIFF|GIT_SSH|GIT_SSH_COMMAND|GIT_CONFIG_(?:COUNT|PARAMETERS|GLOBAL|SYSTEM|KEY_\d+|VALUE_\d+))$/;
 
 /**
  * Names of hook-capable variables whose live value came from the project `.env`.
@@ -86,19 +86,40 @@ export function projectDeclaredSpawnHookNames(env: Record<string, string | undef
 	return names;
 }
 
+/** The account home GJC trusts, or undefined when none is trustworthy. */
+function trustedHome(): string | undefined {
+	try {
+		return getTrustedHomeDir();
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Remove project-declared hook variables from a spawn environment in place.
+ * Shells and git need a home, so a project-declared `HOME` is replaced by the
+ * trusted account home when one exists rather than left unset.
+ */
+export function stripProjectSpawnHooks(env: Record<string, string>): Record<string, string> {
+	for (const name of projectDeclaredSpawnHookNames(env)) delete env[name];
+	if (env.HOME === undefined && process.platform !== "win32") {
+		const home = trustedHome();
+		if (home !== undefined) env.HOME = home;
+	}
+	return env;
+}
+
 /**
  * The process environment without project-declared hook variables, for spawning
- * the bash tool's shell processes (non-PTY worker and PTY sessions alike).
+ * the bash tool's shell processes (isolated worker chain and PTY sessions).
  */
 export function projectSafeSpawnEnv(): Record<string, string> {
-	const env = filterProcessEnv(Bun.env);
-	for (const name of projectDeclaredSpawnHookNames(env)) delete env[name];
-	return env;
+	return stripProjectSpawnHooks(filterProcessEnv(Bun.env));
 }
 
 function buildSpawnEnv(shell: string): Record<string, string> {
 	const noCI = $pickflag("GJC_BASH_NO_CI", "PI_BASH_NO_CI", "CLAUDE_BASH_NO_CI");
-	const inherited = projectSafeSpawnEnv();
+	const inherited = filterProcessEnv(Bun.env);
 	delete inherited.GJC_SESSION_FILE;
 	delete inherited.GJC_MANAGED_OWNER_TRANSCRIPT_PATH;
 	return {
