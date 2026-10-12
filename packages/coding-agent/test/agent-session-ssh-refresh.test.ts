@@ -70,7 +70,9 @@ describe("AgentSession SSH tool refresh", () => {
 			agent,
 			sessionManager,
 			settings,
-			modelRegistry: { withConsumerLease: async (body: () => any) => await body() } as never,
+			modelRegistry: {
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+			} as never,
 			toolRegistry,
 			reloadSshTool:
 				options?.reloadSshTool ?? (async () => (await loadSshTool(toolSession)) as unknown as AgentTool | null),

@@ -55,7 +55,8 @@ function createHarness(
 		modelRegistry: {
 			getApiKey: options.getApiKey ?? (async () => "test-key"),
 			getAvailable: () => [model],
-		, withConsumerLease: async (body: () => any) => await body()} as never,
+			withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+		} as never,
 		agentId: options.agentId ?? "1-Worker",
 		agentRegistry: registry,
 		convertToLlm:

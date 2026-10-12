@@ -17,7 +17,7 @@ function createSession(streamFn?: AgentOptions["streamFn"], models: readonly Mod
 		modelRegistry: {
 			getAvailable: () => models,
 			getApiKey: async () => "key",
-			withConsumerLease: async (body: () => any) => await body(),
+			withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 		} as never,
 	});
 }

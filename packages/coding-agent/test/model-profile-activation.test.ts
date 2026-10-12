@@ -614,7 +614,8 @@ describe("model profile activation", () => {
 			modelRegistry: {
 				...baseRegistry,
 				getAvailable: () => available,
-			, withConsumerLease: async (body: () => any) => await body()} as unknown as ModelRegistry,
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+			} as unknown as ModelRegistry,
 			settings: Settings.isolated(),
 			profileName: "claude-opus",
 		});
@@ -770,26 +771,26 @@ describe("model profile activation", () => {
 		expect(recovery.model).toBeUndefined();
 	});
 
-	test.each([
-		"user",
-		"registry",
-	] as const)("durable %s profile recovery rejects an unresolved qualified executor when its default resolves", async source => {
-		const profile: ModelProfileDefinition = {
-			name: `${source}-unresolved-executor`,
-			requiredProviders: ["provider-a"],
-			modelMapping: { default: "provider-a/default", executor: "provider-b/missing-executor" },
-			source,
-		};
+	test.each(["user", "registry"] as const)(
+		"durable %s profile recovery rejects an unresolved qualified executor when its default resolves",
+		async source => {
+			const profile: ModelProfileDefinition = {
+				name: `${source}-unresolved-executor`,
+				requiredProviders: ["provider-a"],
+				modelMapping: { default: "provider-a/default", executor: "provider-b/missing-executor" },
+				source,
+			};
 
-		await expect(
-			resolveModelProfileDefaultChain({
-				modelRegistry: fakeRegistry({ profiles: [profile] }) as unknown as ModelRegistry,
-				settings: Settings.isolated(),
-				profileName: profile.name,
-				credentialSessionId: "resume-session",
-			}),
-		).rejects.toThrow(/executor selectors do not match any catalog model/);
-	});
+			await expect(
+				resolveModelProfileDefaultChain({
+					modelRegistry: fakeRegistry({ profiles: [profile] }) as unknown as ModelRegistry,
+					settings: Settings.isolated(),
+					profileName: profile.name,
+					credentialSessionId: "resume-session",
+				}),
+			).rejects.toThrow(/executor selectors do not match any catalog model/);
+		},
+	);
 
 	test("durable default recovery rejects unknown required providers before credential probing", async () => {
 		const profile: ModelProfileDefinition = {
@@ -2207,7 +2208,8 @@ describe("model profile activation", () => {
 					getAvailable: () => [head, fallback],
 					getApiKey: async () => kNoAuth,
 					isSelectorCircuitOpen: () => false,
-				, withConsumerLease: async (body: () => any) => await body()} as unknown as ModelRegistry,
+					withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+				} as unknown as ModelRegistry,
 			});
 			configuringSession.setConfiguredModelChain(
 				"default",
@@ -2230,7 +2232,8 @@ describe("model profile activation", () => {
 					getAvailable: () => [head, fallback],
 					getApiKey: async () => kNoAuth,
 					isSelectorCircuitOpen: () => false,
-				, withConsumerLease: async (body: () => any) => await body()} as unknown as ModelRegistry,
+					withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+				} as unknown as ModelRegistry,
 			});
 			try {
 				expect(await session.switchSession(sessionFile)).toBe(true);
@@ -2394,19 +2397,20 @@ describe("model profile activation", () => {
 				architect: "alibaba-token-plan/glm-5.2:xhigh",
 			},
 		],
-	] satisfies Array<
-		[string, Record<string, string>]
-	>)("prepares the reconstructed five-role mapping for %s", async (profileName, expected) => {
-		const prepared = await prepareModelProfileActivation({
-			session: fakeSession(),
-			modelRegistry: fakeRegistry({ profiles: [...BUILTIN_MODEL_PROFILES] }),
-			settings: Settings.isolated(),
-			profileName,
-		});
+	] satisfies Array<[string, Record<string, string>]>)(
+		"prepares the reconstructed five-role mapping for %s",
+		async (profileName, expected) => {
+			const prepared = await prepareModelProfileActivation({
+				session: fakeSession(),
+				modelRegistry: fakeRegistry({ profiles: [...BUILTIN_MODEL_PROFILES] }),
+				settings: Settings.isolated(),
+				profileName,
+			});
 
-		const defaultSelector = `${prepared.defaultModel?.provider}/${prepared.defaultModel?.id}:${prepared.defaultThinkingLevel}`;
-		expect({ default: defaultSelector, ...prepared.agentModelOverrides }).toEqual(expected);
-	});
+			const defaultSelector = `${prepared.defaultModel?.provider}/${prepared.defaultModel?.id}:${prepared.defaultThinkingLevel}`;
+			expect({ default: defaultSelector, ...prepared.agentModelOverrides }).toEqual(expected);
+		},
+	);
 
 	test("session-only changes active model and replaces runtime overrides without persisted sets", async () => {
 		const session = fakeSession();
@@ -3386,7 +3390,8 @@ describe("preset-equivalent profile activation", () => {
 					getCanonicalId,
 					seedCanonicalVariant,
 					clearCanonicalVariant,
-				, withConsumerLease: async (body: () => any) => await body()} as unknown as ModelRegistry,
+					withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+				} as unknown as ModelRegistry,
 			});
 			try {
 				// The old provider-a model has no canonical identity, so an explicit
@@ -4073,7 +4078,8 @@ describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
 			modelRegistry: {
 				...registry,
 				getAll: () => [...registry.getAll(), proxyModel("grok-4.3")],
-			, withConsumerLease: async (body: () => any) => await body()} as unknown as ModelRegistry,
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+			} as unknown as ModelRegistry,
 			settings: Settings.isolated({ "modelProfile.proxyProvider": "litellm", "modelProfile.proxyMode": "always" }),
 			profileName: profile.name,
 		});
@@ -4120,7 +4126,8 @@ describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
 						proxyModel("meta/muse-spark-1.2"),
 						proxyModel("other/muse-spark-1.2"),
 					],
-				, withConsumerLease: async (body: () => any) => await body()} as unknown as ModelRegistry,
+					withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+				} as unknown as ModelRegistry,
 				settings: Settings.isolated({
 					"modelProfile.proxyProvider": "litellm",
 					"modelProfile.proxyMode": "always",
@@ -4309,7 +4316,8 @@ describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
 			modelRegistry: {
 				...registry,
 				getAll: () => [...registry.getAll(), proxyModel("other/grok-4.3")],
-			, withConsumerLease: async (body: () => any) => await body()} as unknown as ModelRegistry,
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+			} as unknown as ModelRegistry,
 			settings: Settings.isolated({ "modelProfile.proxyProvider": "litellm" }),
 			profileName: profile.name,
 		});
@@ -4328,7 +4336,8 @@ describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
 				modelRegistry: {
 					...registry,
 					getAll: () => [...registry.getAll(), proxyModel("foo/grok-4.4"), proxyModel("bar/grok-4.4")],
-				, withConsumerLease: async (body: () => any) => await body()} as unknown as ModelRegistry,
+					withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+				} as unknown as ModelRegistry,
 				settings: Settings.isolated({ "modelProfile.proxyProvider": "litellm" }),
 				profileName: profile.name,
 			}),

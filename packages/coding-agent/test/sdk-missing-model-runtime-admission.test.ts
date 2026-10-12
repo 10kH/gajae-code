@@ -75,7 +75,7 @@ async function startRuntimeHarness(): Promise<RuntimeHarness> {
 		modelRegistry: {
 			getApiKey: async () => "registry-api-key",
 			getAvailable: () => [],
-			withConsumerLease: async (body: () => any) => await body(),
+			withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 		} as never,
 	});
 	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();

@@ -111,7 +111,7 @@ async function createSession(
 		agent,
 		sessionManager,
 		settings,
-		modelRegistry: { withConsumerLease: async (body: () => any) => await body() } as never,
+		modelRegistry: { withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body() } as never,
 		toolRegistry: new Map(tools.map(t => [t.name, t])),
 		extensionRunner,
 	});
@@ -148,7 +148,7 @@ async function createSessionWithMockModel(
 		settings,
 		modelRegistry: {
 			getApiKey: () => "test-key",
-			withConsumerLease: async (body: () => any) => await body(),
+			withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 		} as never,
 		toolRegistry: new Map(tools.map(t => [t.name, t])),
 	});

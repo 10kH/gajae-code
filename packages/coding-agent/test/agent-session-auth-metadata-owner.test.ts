@@ -56,7 +56,8 @@ describe("AgentSession auth metadata owner boundary", () => {
 				// omits getAuthStorageOwner from its compatibility surface.
 				getApiKey: async () => "registry-api-key",
 				getAvailable: () => [mock.model],
-			, withConsumerLease: async (body: () => any) => await body()} as never,
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+			} as never,
 		});
 		sessions.push(session);
 
@@ -106,7 +107,8 @@ describe("AgentSession auth metadata owner boundary", () => {
 				getApiKey: async () => "stored-oauth-access",
 				getAvailable: () => [mock.model],
 				getAuthStorageOwner: () => owner,
-			, withConsumerLease: async (body: () => any) => await body()} as never,
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+			} as never,
 		});
 		sessions.push(session);
 

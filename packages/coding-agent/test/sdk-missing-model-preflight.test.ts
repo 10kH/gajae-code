@@ -74,7 +74,7 @@ function sessionWithoutModel(): Harness {
 		modelRegistry: {
 			getApiKey: async () => "registry-api-key",
 			getAvailable: () => [],
-			withConsumerLease: async (body: () => any) => await body(),
+			withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 		} as never,
 	});
 	sessions.push(session);
@@ -101,7 +101,7 @@ function sessionWithModel(getApiKey: () => Promise<string | undefined>): Harness
 		modelRegistry: {
 			getApiKey,
 			getAvailable: () => [mock.model],
-			withConsumerLease: async (body: () => any) => await body(),
+			withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 		} as never,
 	});
 	sessions.push(session);

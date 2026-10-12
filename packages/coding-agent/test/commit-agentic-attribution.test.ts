@@ -34,7 +34,9 @@ describe("commit agent prompt attribution", () => {
 			cwd: "/tmp",
 			model,
 			settings: Settings.isolated(),
-			modelRegistry: { withConsumerLease: async (body: () => any) => await body() } as never,
+			modelRegistry: {
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+			} as never,
 			authStorage: {} as never,
 			changelogTargets: [],
 			requireChangelog: false,

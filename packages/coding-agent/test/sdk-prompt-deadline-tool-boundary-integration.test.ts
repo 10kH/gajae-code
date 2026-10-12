@@ -119,7 +119,7 @@ describe("prompt deadline tool boundary on a live AgentSession", () => {
 			modelRegistry: {
 				getApiKey: async () => "test-key",
 				getAvailable: () => [mock.model],
-				withConsumerLease: async (body: () => any) => await body(),
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 			} as never,
 		});
 		session = live;

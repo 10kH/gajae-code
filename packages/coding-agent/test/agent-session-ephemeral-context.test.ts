@@ -96,7 +96,7 @@ function createHarness(
 		modelRegistry: {
 			getApiKey: async () => "test-key",
 			getAvailable: () => [model],
-			withConsumerLease: async (body: () => any) => await body(),
+			withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 		} as never,
 		agentId: "0-Main",
 		agentRegistry: registry,

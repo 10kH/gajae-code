@@ -343,7 +343,9 @@ describe("AgentSession locally handled slash command classification", () => {
 			agent: new Agent({ initialState: { model, systemPrompt: [], tools: [], messages: [] } }),
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated(),
-			modelRegistry: { withConsumerLease: async (body: () => any) => await body() } as never,
+			modelRegistry: {
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+			} as never,
 			extensionRunner: {
 				getCommand: (name: string) => (name === "ext" ? {} : undefined),
 			} as unknown as ExtensionRunner,

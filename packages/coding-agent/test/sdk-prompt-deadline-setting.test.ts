@@ -424,7 +424,7 @@ describe("sdk prompt deadline arming — SDK-only host route (#5583)", () => {
 				modelRegistry: {
 					getApiKey: async () => "test-key",
 					getAuthStorageOwner: () => undefined,
-					withConsumerLease: async (body: () => any) => await body(),
+					withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 				} as never,
 				extensionRunner: {
 					hasHandlers: () => true,

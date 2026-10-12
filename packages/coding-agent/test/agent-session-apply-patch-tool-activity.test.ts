@@ -45,7 +45,9 @@ describe("apply_patch tool activity resolution", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated(),
-			modelRegistry: { withConsumerLease: async (body: () => any) => await body() } as never,
+			modelRegistry: {
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+			} as never,
 			toolRegistry: new Map([[editTool.name, editTool as AgentTool]]),
 		});
 

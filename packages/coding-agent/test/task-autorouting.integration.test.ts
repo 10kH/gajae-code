@@ -33,7 +33,10 @@ function session(settingsOverrides: Record<string, unknown> = {}, overrides: Par
 		settings: Settings.isolated(settingsOverrides),
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
-		modelRegistry: { getAvailable: () => [], withConsumerLease: async (body: () => any) => await body() } as never,
+		modelRegistry: {
+			getAvailable: () => [],
+			withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+		} as never,
 		...overrides,
 	} as unknown as ToolSession;
 }
@@ -108,7 +111,7 @@ describe("TaskTool autorouting integration surfaces", () => {
 				modelRegistry: {
 					getAvailable: () => [],
 					getModelProfile: () => profile,
-					withConsumerLease: async (body: () => any) => await body(),
+					withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 				} as never,
 				getActiveModelProfile: () => profile.name,
 				getActiveModelString: () => "kimi-k3:high",
@@ -213,7 +216,7 @@ describe("TaskTool autorouting integration surfaces", () => {
 					settings,
 					modelRegistry: {
 						getAvailable: () => registryModels,
-						withConsumerLease: async (body: () => any) => await body(),
+						withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 					} as never,
 				},
 			),
@@ -270,7 +273,7 @@ describe("TaskTool autorouting integration surfaces", () => {
 					settings,
 					modelRegistry: {
 						getAvailable: () => registryModels,
-						withConsumerLease: async (body: () => any) => await body(),
+						withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 					} as never,
 				},
 			),
@@ -326,7 +329,7 @@ describe("TaskTool autorouting integration surfaces", () => {
 					settings,
 					modelRegistry: {
 						getAvailable: () => registryModels,
-						withConsumerLease: async (body: () => any) => await body(),
+						withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 					} as never,
 				},
 			),
@@ -374,7 +377,7 @@ describe("TaskTool autorouting integration surfaces", () => {
 					settings,
 					modelRegistry: {
 						getAvailable: () => registryModels,
-						withConsumerLease: async (body: () => any) => await body(),
+						withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 					} as never,
 				},
 			),
@@ -429,7 +432,7 @@ describe("TaskTool autorouting integration surfaces", () => {
 					settings,
 					modelRegistry: {
 						getAvailable: () => registryModels,
-						withConsumerLease: async (body: () => any) => await body(),
+						withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 					} as never,
 				},
 			),

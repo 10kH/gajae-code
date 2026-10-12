@@ -202,7 +202,7 @@ describe("startup credential auto-import marker matrix", () => {
 			authStorage: a.authStorage as never,
 			modelRegistry: {
 				refresh: async (mode?: string) => refreshCalls.push(mode ?? ""),
-				withConsumerLease: async (body: () => any) => await body(),
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 			} as never,
 			discover: args.discover,
 			stateStore: marker.stateStore,
