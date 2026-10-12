@@ -1,0 +1,150 @@
+import { afterEach, describe, it } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { pathToFileURL } from "node:url";
+import { safeRmSync } from "../../../scripts/safe-cleanup";
+
+/**
+ * Bun loads `.env.development` and `.env.development.local` when NODE_ENV is
+ * unset. The project snapshot must see those declarations so the existing
+ * project-dotenv denylist applies to them.
+ */
+
+const tempDirs: string[] = [];
+const envSourceUrl = pathToFileURL(path.resolve(import.meta.dir, "../src/env.ts")).href;
+
+afterEach(() => {
+	for (const dir of tempDirs.splice(0)) safeRmSync(dir, { force: true, recursive: true });
+});
+
+function tempDir(): string {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-env-development-layer-"));
+	tempDirs.push(dir);
+	return dir;
+}
+
+function writeProject(files: Record<string, string>): string {
+	const dir = tempDir();
+	for (const [name, content] of Object.entries(files)) fs.writeFileSync(path.join(dir, name), content);
+	return dir;
+}
+
+function runIsolated(cwd: string, script: string, env: Record<string, string> = {}): void {
+	const scriptPath = path.join(cwd, "env-development-layer-probe.ts");
+	fs.writeFileSync(scriptPath, script);
+	const result = Bun.spawnSync({
+		cmd: [process.execPath, scriptPath],
+		cwd,
+		env: {
+			HOME: tempDir(),
+			GJC_CODING_AGENT_DIR: tempDir(),
+			PATH: Bun.env.PATH ?? "",
+			...env,
+		},
+		stderr: "pipe",
+		stdout: "pipe",
+	});
+	if (result.exitCode !== 0) {
+		const output = [new TextDecoder().decode(result.stdout), new TextDecoder().decode(result.stderr)]
+			.filter(Boolean)
+			.join("\n");
+		throw new Error(output || `probe exited with ${result.exitCode}`);
+	}
+}
+
+describe("development dotenv layer when NODE_ENV is unset", () => {
+	it("drops a project TLS switch declared in .env.development when NODE_ENV is unset", () => {
+		const cwd = writeProject({ ".env.development": "NODE_TLS_REJECT_UNAUTHORIZED=0\n" });
+		runIsolated(
+			cwd,
+			`
+import { $env } from ${JSON.stringify(envSourceUrl)};
+if ($env.NODE_TLS_REJECT_UNAUTHORIZED !== undefined) {
+	throw new Error("development TLS switch reached the live environment: " + $env.NODE_TLS_REJECT_UNAUTHORIZED);
+}
+`,
+		);
+	});
+
+	it("drops a project TLS switch declared in .env.development when NODE_ENV is empty", () => {
+		const cwd = writeProject({ ".env.development": "NODE_TLS_REJECT_UNAUTHORIZED=0\n" });
+		runIsolated(
+			cwd,
+			`
+import { $env } from ${JSON.stringify(envSourceUrl)};
+if ($env.NODE_TLS_REJECT_UNAUTHORIZED !== undefined) {
+	throw new Error("empty NODE_ENV still applied the development TLS switch");
+}
+`,
+			{ NODE_ENV: "" },
+		);
+	});
+
+	it("drops a provider credential declared in .env.development.local when NODE_ENV is unset", () => {
+		const cwd = writeProject({
+			".env.development": "ANTHROPIC_API_KEY=from-development\n",
+			".env.development.local": "ANTHROPIC_API_KEY=from-development-local\n",
+		});
+		runIsolated(
+			cwd,
+			`
+import { $credentialEnv, $env } from ${JSON.stringify(envSourceUrl)};
+if ($env.ANTHROPIC_API_KEY !== "from-development-local") {
+	throw new Error("development.local did not win the project layer: " + $env.ANTHROPIC_API_KEY);
+}
+if ($credentialEnv("ANTHROPIC_API_KEY") !== undefined) {
+	throw new Error("development.local credential was treated as inherited");
+}
+`,
+		);
+	});
+
+	it("keeps an inherited provider credential when NODE_ENV is unset", () => {
+		const cwd = writeProject({ ".env.development": "UNRELATED_PROJECT_VALUE=1\n" });
+		runIsolated(
+			cwd,
+			`
+import { $credentialEnv } from ${JSON.stringify(envSourceUrl)};
+if ($credentialEnv("ANTHROPIC_API_KEY") !== "operator-key") {
+	throw new Error("inherited credential was dropped: " + $credentialEnv("ANTHROPIC_API_KEY"));
+}
+`,
+			{ ANTHROPIC_API_KEY: "operator-key" },
+		);
+	});
+
+	it("keeps an inherited TLS value when NODE_ENV is unset", () => {
+		const cwd = writeProject({ ".env.development.local": "UNRELATED_PROJECT_VALUE=1\n" });
+		runIsolated(
+			cwd,
+			`
+import { $env } from ${JSON.stringify(envSourceUrl)};
+if ($env.NODE_TLS_REJECT_UNAUTHORIZED !== "1") {
+	throw new Error("inherited TLS value was not kept: " + $env.NODE_TLS_REJECT_UNAUTHORIZED);
+}
+`,
+			{ NODE_TLS_REJECT_UNAUTHORIZED: "1" },
+		);
+	});
+
+	it("keeps a production variable when a development file sets another value", () => {
+		const cwd = writeProject({
+			".env": "PROD_MARKER=from-dotenv\n",
+			".env.development": "PROD_MARKER=from-dev\nDEV_ONLY_MARKER=from-dev\nNODE_TLS_REJECT_UNAUTHORIZED=0\n",
+		});
+		runIsolated(
+			cwd,
+			`
+import { $credentialEnv, $env } from ${JSON.stringify(envSourceUrl)};
+if ($env.PROD_MARKER !== "from-dotenv") throw new Error("production layer lost .env: " + $env.PROD_MARKER);
+if ($env.DEV_ONLY_MARKER !== undefined) throw new Error("production loaded .env.development");
+if ($env.NODE_TLS_REJECT_UNAUTHORIZED !== undefined) throw new Error("production loaded the development TLS switch");
+if ($credentialEnv("ANTHROPIC_API_KEY") !== "operator-key") {
+	throw new Error("production credential changed: " + $credentialEnv("ANTHROPIC_API_KEY"));
+}
+`,
+			{ NODE_ENV: "production", ANTHROPIC_API_KEY: "operator-key" },
+		);
+	});
+});

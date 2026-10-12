@@ -15,13 +15,15 @@ function loadProjectEnv(): { values: Record<string, string>; dynamic: Set<string
 	const cwd = process.cwd();
 	const nodeEnv = process.env.NODE_ENV || Bun.env.NODE_ENV;
 	// Match Bun's dotenv precedence. Validate before interpolation so a hostile
-	// NODE_ENV cannot introduce separators or `..` path segments.
+	// NODE_ENV cannot introduce separators or `..` path segments. Unset NODE_ENV
+	// selects the development layer Bun already loaded.
 	const validNodeEnv = nodeEnv && /^[A-Za-z0-9_-]+$/.test(nodeEnv) ? nodeEnv : undefined;
+	const layer = validNodeEnv ?? (nodeEnv ? undefined : "development");
 	const files = [
 		".env",
-		...(validNodeEnv ? [`.env.${validNodeEnv}`] : []),
-		...(validNodeEnv !== "test" ? [".env.local"] : []),
-		...(validNodeEnv ? [`.env.${validNodeEnv}.local`] : []),
+		...(layer ? [`.env.${layer}`] : []),
+		...(layer !== "test" ? [".env.local"] : []),
+		...(layer ? [`.env.${layer}.local`] : []),
 	];
 	const values: Record<string, string> = {};
 	const dynamic = new Set<string>();
