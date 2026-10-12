@@ -5176,10 +5176,12 @@ export class AgentSession {
 
 	#flushPendingAgentEnd(): void {
 		// Collect SDK agent_ends to publish before modifying the set to avoid iterator issues (PR #6388).
-		// Publish both handled SDK agent_ends (with decisions) and deferred ones (without decisions).
+		// Publish only SDK agent_ends that have been decided by their handler.
 		const sdkPendingsToPublish: Array<[AgentSessionEvent, RunResourceProducerLease | undefined]> = [];
 		for (const sdkPending of this.#pendingSdkAgentEnds) {
-			// Skip only if it's being held for a continuation
+			// Skip if the handler hasn't decided yet (decision is recorded by handler finally block).
+			if (!this.#agentEndContinuationDecisions.has(sdkPending)) continue;
+			// Also skip if it's being held for a continuation
 			if ([...this.#pendingAgentEndContinuationHolds.values()].includes(sdkPending)) continue;
 			const sdkLease = this.#deferredAgentEndLeases.get(sdkPending);
 			sdkPendingsToPublish.push([sdkPending, sdkLease]);
@@ -5192,9 +5194,8 @@ export class AgentSession {
 			this.#startAgentEndPublication(sdkPending, sdkLease);
 		}
 		const pending = this.#pendingAgentEndEmit;
-		// Skip fallback publish if the pending agent_end is a held SDK agent_end WITH a decision (already handled by loop above).
-		// But allow publishing held SDK agent_ends without decisions through the fallback path.
-		if (pending && this.#pendingSdkAgentEnds.has(pending) && this.#agentEndContinuationDecisions.has(pending)) return;
+		// Skip fallback publish if there are still SDK agent_ends pending (they will be handled by the loop above once decided).
+		if (pending && this.#pendingSdkAgentEnds.has(pending)) return;
 		if (
 			this.#livePromptsInFlight() > 0 ||
 			this.#agentEventHandlersInFlight > 0 ||
