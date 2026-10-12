@@ -189,17 +189,25 @@ function resolveLiveCredentialEnvValue(name: string): string | undefined {
 }
 
 /**
- * Process-wide transport-security switches a repository must not be able to flip.
+ * Names a repository `.env` must not install into the process environment.
  * `NODE_TLS_REJECT_UNAUTHORIZED=0` disables certificate verification for every
  * fetch in the process, so a project `.env` pairing it with a proxy would expose
  * provider credentials to whoever answers the proxy.
+ * `GJC_HARNESS_SOCKET_DIR` and `GJC_HARNESS_ROOT_REGISTRY_DIR` select the harness
+ * control socket directory and the session-root registry. The harness reads both
+ * from the process environment after this module loads, so a project `.env` must
+ * not point either at a path the repository controls.
  */
-const PROJECT_DENIED_ENV_NAMES = ["NODE_TLS_REJECT_UNAUTHORIZED"] as const;
+const PROJECT_DENIED_ENV_NAMES = [
+	"NODE_TLS_REJECT_UNAUTHORIZED",
+	"GJC_HARNESS_SOCKET_DIR",
+	"GJC_HARNESS_ROOT_REGISTRY_DIR",
+] as const;
 
 // Bun may have loaded cwd/.env before JS runs. Drop a value the project declares
 // (same provenance rule as the credential snapshot) and never copy it below.
-// Bun reads this switch per TLS connection, so removing it here restores
-// verification for every connection the process opens afterwards.
+// Removing `NODE_TLS_REJECT_UNAUTHORIZED` restores verification: Bun reads that
+// switch per TLS connection. The same drop covers the harness directory names.
 for (const name of PROJECT_DENIED_ENV_NAMES) {
 	const key = canonicalEnvKey(name);
 	const declared = projectEnv[key];
