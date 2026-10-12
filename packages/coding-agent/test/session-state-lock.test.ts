@@ -727,6 +727,53 @@ describe("coordinator session state lock", () => {
 		await expectReleasedOwner(lockFile);
 		expectReleasedTransition(lockFile);
 	});
+	it("rewrites an owner record without ever shortening it past its own preamble", async () => {
+		// The in-place rewrite used to `truncate(0)` before writing, so EVERY rewrite passed
+		// through a zero-length record. An empty record carries no `owner_host_id`, so a
+		// process killed inside that window left a transition claim that
+		// `malformedOwnerProvenance` refuses as `unprovenanced` forever:
+		// `transition_claim_timeout` with `claim_or_owner_unreadable`, and coordinator state
+		// persistence for the session was lost for good (#5159, #5216).
+		//
+		// The released tombstone is the shortening half of the cycle — the released form is
+		// shorter than the held form it replaces — so it is where the record used to shrink.
+		// It must now keep the previous length and stay parseable with its host id intact.
+		const { root, stateFile } = await seededRunningSession("lock-rewrite-attributable");
+		const lockFile = `${stateFile}.lock`;
+		let heldBytes = "";
+		SessionStateLockTestHooks.afterCurrentOwnerValidation = async file => {
+			// Runs with the held record still on disk, immediately before the rewrite.
+			if (file === lockFile) heldBytes = fsSync.readFileSync(file, "utf8");
+		};
+		try {
+			await writeToolActivity(root, "call-1", "2026-03-01T00:00:05.000Z");
+		} finally {
+			SessionStateLockTestHooks.afterCurrentOwnerValidation = undefined;
+		}
+
+		expect(heldBytes).not.toBe("");
+		expect((JSON.parse(heldBytes) as { released?: boolean }).released).toBeUndefined();
+
+		const releasedBytes = await Bun.file(lockFile).text();
+		expect(releasedBytes.length).toBeGreaterThanOrEqual(heldBytes.length);
+		// Padding is trailing whitespace and nothing else, so every reader — `JSON.parse`,
+		// `validLockOwner`, `malformedOwnerProvenance` — still sees exactly the released
+		// record, which is what keeps the tombstone reclaimable.
+		const releasedRecord = releasedBytes.trimEnd();
+		expect(releasedRecord).toBe(JSON.stringify(JSON.parse(releasedRecord)));
+		expect(releasedBytes.slice(releasedRecord.length)).toMatch(/^ *$/u);
+		expect(JSON.parse(releasedRecord)).toMatchObject({
+			pid: 1,
+			owner_host_id: expect.any(String),
+			released: true,
+		});
+
+		// The claim's own sidecar is written by the same primitive and is what a contender
+		// reads first when the claim survives a crash.
+		const sidecar = await Bun.file(`${lockFile}.transition.owner`).text();
+		expect(sidecar.length).toBeGreaterThan(0);
+		expect(JSON.parse(sidecar)).toMatchObject({ owner_host_id: expect.any(String), released: true });
+	}, 15_000);
 
 	it("leaves a successor owner that claimed the path after the stale verdict", async () => {
 		const { stateFile } = await seededRunningSession("lock-successor");
