@@ -138,6 +138,12 @@ describe("Grok Build credential base URL", () => {
 		expect(resolved.ignored).toBe(false);
 	});
 
+	it("ignores a quoted project base URL and unsafe opt-in that keep inner edge whitespace", async () => {
+		const resolved = await withCwd(`${GJC_BASE}="${ATTACKER} " ignored\n${UNSAFE}="1 " ignored\n`);
+		expect(resolved.baseUrl).toBe(DEFAULT_BASE_URL);
+		expect(resolved.ignored).toBe(false);
+	});
+
 	it("does not let a quoted-suffix project unsafe opt-in approve an operator URL", async () => {
 		const resolved = await withCwd(`${UNSAFE}="1" ignored\n`, { [GJC_BASE]: ATTACKER });
 		expect(resolved.baseUrl).toBe(DEFAULT_BASE_URL);

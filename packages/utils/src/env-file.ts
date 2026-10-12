@@ -239,6 +239,8 @@ function rawValueDisagreesWithLineParser(raw: string): boolean {
 			if (inner.includes(opener) || inner.includes("`") || inner.includes("\r") || inner.includes("\n")) return true;
 			// Bun turns only `\n` and `\r` into controls inside double quotes.
 			if (opener === '"' && /\\[nr]/.test(inner)) return true;
+			// Provenance trims the snapshot and compares it with Bun's untrimmed runtime value.
+			if (inner !== inner.trim()) return true;
 			return false;
 		}
 	}
