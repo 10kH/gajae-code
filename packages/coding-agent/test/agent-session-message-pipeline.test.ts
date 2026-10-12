@@ -1278,7 +1278,20 @@ describe("AgentSession message pipeline", () => {
 		// Regression test for PR #6668 P1: ensure SDK terminals are not published
 		// before the async handler has recorded its continuation decision.
 		// This test verifies the continuation-decision guard prevents premature publication
-		// in scenarios where prompt settlement flushes before the handler's finally block.
+		// when the handler is still awaiting async work like goal/retry/compaction processing.
+
+		// Control when the handler's async work completes by deferring withConsumerLease.
+		const leaseRelease = Promise.withResolvers<void>();
+		const deferredModelRegistry = {
+			getApiKey: async () => "test-key",
+			getAuthStorageOwner: () => undefined,
+			withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => {
+				// Hold the handler work until the test releases it.
+				const result = await body();
+				await leaseRelease.promise;
+				return result;
+			},
+		};
 
 		const model: Model = {
 			id: "continuation-decision-guard-model",
@@ -1310,7 +1323,7 @@ describe("AgentSession message pipeline", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: testModelRegistry as never,
+			modelRegistry: deferredModelRegistry as never,
 		});
 		sessions.push(session);
 
@@ -1321,27 +1334,32 @@ describe("AgentSession message pipeline", () => {
 			if (event.type === "agent_end") sdkAgentEnds.push(event as never);
 		});
 
-		// Send a message to trigger the agent
-		const prompt = session.prompt("test").then(() => {
-			/* ok */
-		});
+		// Send an SDK message to trigger the agent on the SDK path.
+		// This ensures the agent_end enters #pendingSdkAgentEnds and exercises the decision guard.
+		const sdkPromise = session.sendUserMessage("test", {
+			sdkRunCapability: createSdkRunCapability("continuation-decision-guard"),
+		} as never);
 
-		// Wait for the prompt to complete
-		await prompt;
-		await Bun.sleep(0);
+		// Wait briefly for the agent to stream and reach agent_end, but the handler will
+		// block on the deferred lease.
+		await Bun.sleep(10);
 
-		// Verify that the agent_end was eventually published
-		// This documents that the handler does complete and publish the terminal
-		expect(sdkAgentEnds).toHaveLength(1);
+		// While the handler is awaiting the lease (decision not yet recorded),
+		// verify that NO agent_end has been published yet.
+		// This is the core test: the SDK terminal should NOT be published prematurely.
+		const beforeLease = sdkAgentEnds.length;
+		expect(beforeLease).toBe(0);
 
-		// Additional verification: simulate the scenario where goal processing would be slow
-		// by checking that we have exactly one agent_end (not duplicated publications)
-		const beforeSecondMessage = sdkAgentEnds.length;
-		await session.prompt("second");
-		await Bun.sleep(0);
-		const afterSecondMessage = sdkAgentEnds.length;
+		// Now release the lease, allowing the handler's finally block to record the
+		// decision and flush the pending SDK agent_end.
+		leaseRelease.resolve();
 
-		// Should have exactly 2 agent_ends (one per prompt), no duplicates or missing ones
-		expect(afterSecondMessage).toBe(beforeSecondMessage + 1);
+		// Wait for the SDK submission to complete and the handler to finish.
+		await sdkPromise;
+		await Bun.sleep(10);
+
+		// After the handler completes, the SDK agent_end should now be published.
+		const afterLease = sdkAgentEnds.length;
+		expect(afterLease).toBe(1);
 	});
 });
