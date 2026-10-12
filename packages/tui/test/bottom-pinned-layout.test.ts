@@ -286,6 +286,48 @@ describe("TUI bottom-pinned layout", () => {
 				tui.stop();
 			}
 		});
+
+		for (const pinnedRows of [6, 8]) {
+			it(`keeps the frontier when a ${pinnedRows}-row pinned suffix fills the viewport after a contraction (${isProcessTerminal ? "process" : "virtual"} terminal)`, async () => {
+				const term = new VirtualTerminal(40, 6, { isProcessTerminal });
+				const tui = new TUI(term);
+				const transcript = new MutableLinesComponent(["transcript-0", "transcript-1", "transcript-2"]);
+				const working = new MutableLinesComponent(["working-0"]);
+				const status = new LinesComponent(Array.from({ length: pinnedRows }, (_value, index) => `status-${index}`));
+
+				tui.addChild(transcript);
+				tui.addChild(working);
+				tui.addChild(status);
+				tui.setBottomPinnedComponent(status);
+
+				try {
+					tui.start();
+					await term.waitForRender();
+
+					transcript.setLines(Array.from({ length: 14 }, (_value, index) => `transcript-${index}`));
+					working.setLines(Array.from({ length: 12 }, (_value, index) => `working-${index}`));
+					tui.requestRender();
+					await term.waitForRender();
+					const viewportBeforeContraction = term.getViewport().map(line => line.trimEnd());
+					const redrawsBeforeContraction = tui.fullRedraws;
+					term.clearWriteLog();
+
+					working.setLines([]);
+					tui.requestRender();
+					await term.waitForRender();
+
+					expect(term.getViewport().map(line => line.trimEnd())).toEqual(viewportBeforeContraction);
+					if (isProcessTerminal) {
+						// Retained-scrollback hosts keep the committed frontier: no replay, no history erase.
+						expect(tui.fullRedraws).toBe(redrawsBeforeContraction);
+						expect(term.getWriteLog().join("")).not.toContain("\x1b[3J");
+						expect(term.getScrollBuffer().some(line => line.startsWith("working-0"))).toBe(true);
+					}
+				} finally {
+					tui.stop();
+				}
+			});
+		}
 	}
 
 	for (const isProcessTerminal of [false, true]) {
