@@ -1,3 +1,3 @@
 ### Fixed
 
-- Redact credentials in formatted commit summaries and detail lines before they are passed to git commit.
+- Redact credentials in the formatted commit header and detail lines before they are passed to git commit.

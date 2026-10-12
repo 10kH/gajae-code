@@ -39,10 +39,18 @@ describe("formatCommitMessage credential text", () => {
 			header.replace(/^fix\(commit\): /, ""),
 		);
 		expect(again).toBe(message);
+
+		const scoped = formatCommitMessage(analysis(["note the config"], GITHUB_PAT), "update the config");
+		expect(scoped).toBe("fix([REDACTED_TOKEN]): update the config\n\n- note the config");
+		expect(scoped).not.toContain(GITHUB_PAT);
+		const scopedAgain = formatCommitMessage(analysis(["note the config"], "[REDACTED_TOKEN]"), "update the config");
+		expect(scopedAgain).toBe(scoped);
 	});
 
-	it("leaves an ordinary summary and detail unchanged", () => {
-		const message = formatCommitMessage(analysis(["keep the formatter"], null), "redact formatted commit text");
-		expect(message).toBe("fix: redact formatted commit text\n\n- keep the formatter");
+	it("keeps an ordinary summary, scope, and detail unchanged", () => {
+		const message = formatCommitMessage(analysis(["keep the formatter"], "api"), "update the formatter");
+		expect(message).toBe("fix(api): update the formatter\n\n- keep the formatter");
+		const unscoped = formatCommitMessage(analysis(["keep the formatter"], null), "update the formatter");
+		expect(unscoped).toBe("fix: update the formatter\n\n- keep the formatter");
 	});
 });

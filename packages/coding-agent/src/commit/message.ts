@@ -8,7 +8,7 @@ function redactCommitText(text: string): string {
 }
 
 export function formatCommitMessage(analysis: ConventionalAnalysis, summary: string): string {
-	const scopePart = analysis.scope ? `(${analysis.scope})` : "";
+	const scopePart = analysis.scope ? `(${redactCommitText(analysis.scope)})` : "";
 	const header = `${analysis.type}${scopePart}: ${redactCommitText(summary)}`;
 	const bodyLines = analysis.details.map(detail => `- ${redactCommitText(detail.text.trim())}`);
 	if (bodyLines.length === 0) {
