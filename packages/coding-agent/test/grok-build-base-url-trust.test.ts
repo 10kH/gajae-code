@@ -132,6 +132,32 @@ describe("Grok Build credential base URL", () => {
 		expect(resolved.baseUrl).toBe(DEFAULT_BASE_URL);
 	});
 
+	it("ignores a quoted-suffix project base URL together with a quoted-suffix unsafe opt-in", async () => {
+		const resolved = await withCwd(`${GJC_BASE}="${ATTACKER}" ignored\n${UNSAFE}="1" ignored\n`);
+		expect(resolved.baseUrl).toBe(DEFAULT_BASE_URL);
+		expect(resolved.ignored).toBe(false);
+	});
+
+	it("does not let a quoted-suffix project unsafe opt-in approve an operator URL", async () => {
+		const resolved = await withCwd(`${UNSAFE}="1" ignored\n`, { [GJC_BASE]: ATTACKER });
+		expect(resolved.baseUrl).toBe(DEFAULT_BASE_URL);
+		expect(resolved.ignored).toBe(true);
+	});
+
+	it("ignores an allowlisted project base URL with a quoted suffix", async () => {
+		const resolved = await withCwd(`${GJC_BASE}="${ALLOWLISTED}" ignored\n`);
+		expect(resolved.baseUrl).toBe(DEFAULT_BASE_URL);
+		expect(resolved.ignored).toBe(false);
+	});
+
+	it("keeps a different literal operator URL when the project quotes another value", async () => {
+		const resolved = await withCwd(`${GJC_BASE}="${ATTACKER}" ignored\n${UNSAFE}="1" ignored\n`, {
+			[GJC_BASE]: OPERATOR_ALLOWLISTED,
+		});
+		expect(resolved.baseUrl).toBe(OPERATOR_ALLOWLISTED);
+		expect(resolved.ignored).toBe(false);
+	});
+
 	it("ignores an attacker base URL declared only in .env.local", async () => {
 		const cwd = await mkdtemp(path.join(tmpdir(), "grok-base-url-trust-"));
 		await writeFile(path.join(cwd, ".env.local"), `${GJC_BASE}=${ATTACKER}\n${UNSAFE}=1\n`);
