@@ -34,11 +34,13 @@ function writeProject(files: Record<string, string>): string {
 function runIsolated(cwd: string, script: string, env: Record<string, string> = {}): void {
 	const scriptPath = path.join(cwd, "env-development-layer-probe.ts");
 	fs.writeFileSync(scriptPath, script);
+	const tempHome = tempDir();
 	const result = Bun.spawnSync({
 		cmd: [process.execPath, scriptPath],
 		cwd,
 		env: {
-			HOME: tempDir(),
+			HOME: tempHome,
+			USERPROFILE: tempHome, // Windows equivalent
 			GJC_CODING_AGENT_DIR: tempDir(),
 			PATH: Bun.env.PATH ?? "",
 			...env,
@@ -79,7 +81,7 @@ const snapshot = projectEnvSnapshot(${JSON.stringify(cwd)});
 if (snapshot.values.GJC_WORKTREE_DIR !== ${JSON.stringify(outside)}) {
 	throw new Error("development worktree directory was not project-controlled: " + snapshot.values.GJC_WORKTREE_DIR);
 }
-if (!snapshot.dynamic || snapshot.values.OTHER_OPERATOR !== undefined) {
+if (snapshot.values.OTHER_OPERATOR !== undefined) {
 	throw new Error("snapshot included an operator name the project did not declare");
 }
 `,
@@ -144,6 +146,36 @@ if ($env.NODE_TLS_REJECT_UNAUTHORIZED !== "1") {
 }
 `,
 			{ NODE_TLS_REJECT_UNAUTHORIZED: "1" },
+		);
+	});
+
+	it("marks interpolated development-layer values as dynamic", () => {
+		const cwd = writeProject({ ".env.development": `EXPANDED=$HOME/path\n` });
+		runIsolated(
+			cwd,
+			`
+import { projectEnvSnapshot } from ${JSON.stringify(envFileSourceUrl)};
+const snapshot = projectEnvSnapshot(${JSON.stringify(cwd)});
+if (!snapshot.dynamic.has("EXPANDED")) {
+	throw new Error("interpolated development-layer value was not marked dynamic");
+}
+`,
+		);
+	});
+
+	it("drops a TLS switch when .env.local and .env.development.local conflict", () => {
+		const cwd = writeProject({
+			".env.local": "NODE_TLS_REJECT_UNAUTHORIZED=0\n",
+			".env.development.local": "NODE_TLS_REJECT_UNAUTHORIZED=1\n",
+		});
+		runIsolated(
+			cwd,
+			`
+import { $env } from ${JSON.stringify(envSourceUrl)};
+if ($env.NODE_TLS_REJECT_UNAUTHORIZED !== undefined) {
+	throw new Error("conflicting TLS values did not drop the project value: " + $env.NODE_TLS_REJECT_UNAUTHORIZED);
+}
+`,
 		);
 	});
 
