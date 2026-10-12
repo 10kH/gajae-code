@@ -105,6 +105,7 @@ test("disowned SDK steering cohorts share streams and terminals without adopting
 		modelRegistry: {
 			getApiKey: async () => "test-key",
 			getAuthStorageOwner: () => undefined,
+			withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 		} as never,
 		extensionRunner: {
 			hasHandlers: () => true,
