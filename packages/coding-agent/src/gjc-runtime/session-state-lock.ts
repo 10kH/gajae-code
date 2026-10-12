@@ -300,7 +300,7 @@ async function repairPendingOwnerRecord(pending: PendingOwnerRepair): Promise<bo
 	const handle = pending.repairHandle;
 	if (!handle || pending.repairBytes === undefined) return true;
 	try {
-		const written = await writeOwnerBytes(handle, Buffer.from(pending.repairBytes, "utf8"));
+		const written = await writeOwnerBytes(handle, Buffer.from(pending.repairBytes, "utf8"), undefined);
 		const stat = await handle.stat({ bigint: true });
 		// The rewritten record may have been padded back to its previous length, so the
 		// identity that authorizes later cleanup is the bytes that landed, not the bytes
@@ -536,6 +536,8 @@ export const SessionStateLockTestHooks: {
 	afterCurrentOwnerValidation?: (file: string) => void | Promise<void>;
 	/** @internal Fault seam immediately before a held owner record rewrite mutates bytes. */
 	beforeOwnerRecordRewrite?: (file: string) => void | Promise<void>;
+	/** @internal Fault seam immediately before the pre-rewrite fstat on the owner record handle. */
+	beforeOwnerRecordPrewriteStat?: (file: string) => void | Promise<void>;
 	/** @internal Fault seam immediately before final transition-generation validation. */
 	beforeTransitionReleaseLstat?: (transitionDir: string) => void | Promise<void>;
 	/** @internal Fault seam immediately before setup generation capture. */
@@ -1556,9 +1558,10 @@ const POSIX_OWNER_REWRITE_FLAGS = POSIX_NOFOLLOW_AVAILABLE
  * padded bytes', so this — not the requested payload — is what identifies the record
  * for every later capture, comparison, and replay.
  */
-async function writeOwnerBytes(handle: fs.FileHandle, bytes: Buffer): Promise<Buffer> {
-	const previous = await handle.stat({ bigint: true }).catch(() => null);
-	const previousSize = previous?.isFile() === true ? Number(previous.size) : 0;
+async function writeOwnerBytes(handle: fs.FileHandle, bytes: Buffer, file?: string): Promise<Buffer> {
+	if (file) await SessionStateLockTestHooks.beforeOwnerRecordPrewriteStat?.(file);
+	const previous = await handle.stat({ bigint: true });
+	const previousSize = previous.isFile() === true ? Number(previous.size) : 0;
 	const padding = Math.max(0, previousSize - bytes.byteLength);
 	const payload = padding === 0 ? bytes : Buffer.concat([bytes, Buffer.alloc(padding, 0x20)]);
 	let offset = 0;
@@ -1623,7 +1626,7 @@ async function rewriteHeldOwnerRecord(
 		mutationStarted = true;
 		await SessionStateLockTestHooks.beforeOwnerRecordRewrite?.(file);
 		rewriteHookPassed = true;
-		const writtenBytes = await writeOwnerBytes(handle, replacementBytes);
+		const writtenBytes = await writeOwnerBytes(handle, replacementBytes, file);
 		const canonical = await captureRegularLockOwner(file);
 		// On Windows, an in-place rewrite can expose refreshed descriptor
 		// metadata even though the file object is unchanged. The descriptor opened
@@ -1658,7 +1661,7 @@ async function rewriteHeldOwnerRecord(
 		if (repairNeeded) {
 			let repaired: LockOwnerSnapshot;
 			try {
-				const restored = await writeOwnerBytes(handle, Buffer.from(held.bytes, "utf8"));
+				const restored = await writeOwnerBytes(handle, Buffer.from(held.bytes, "utf8"), file);
 				const repairedStat = await handle.stat({ bigint: true });
 				repaired = ownerSnapshotFrom(repairedStat, restored);
 			} catch (repairError) {

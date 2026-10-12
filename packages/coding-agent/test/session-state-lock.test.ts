@@ -63,6 +63,7 @@ afterEach(async () => {
 	SessionStateLockTestHooks.afterLocalTransitionQueued = undefined;
 	SessionStateLockTestHooks.afterCurrentOwnerValidation = undefined;
 	SessionStateLockTestHooks.beforeOwnerRecordRewrite = undefined;
+	SessionStateLockTestHooks.beforeOwnerRecordPrewriteStat = undefined;
 	SessionStateLockTestHooks.beforeTransitionReleaseLstat = undefined;
 	SessionStateLockTestHooks.beforeTransitionSetupLstat = undefined;
 	SessionStateLockTestHooks.afterAcquireContention = undefined;
@@ -773,6 +774,47 @@ describe("coordinator session state lock", () => {
 		const sidecar = await Bun.file(`${lockFile}.transition.owner`).text();
 		expect(sidecar.length).toBeGreaterThan(0);
 		expect(JSON.parse(sidecar)).toMatchObject({ owner_host_id: expect.any(String), released: true });
+	}, 15_000);
+
+	it("propagates pre-rewrite fstat failure and leaves the held record untouched", async () => {
+		// The pre-rewrite stat must fail before any write attempt, so a descriptor
+		// fault does not silently become a zero-length record assumption (#6621).
+		// If the fstat fails, the rewrite should throw and leave the original held
+		// record on disk unchanged.
+		const { root, stateFile } = await seededRunningSession("lock-prewrite-stat-failure");
+		const lockFile = `${stateFile}.lock`;
+		let heldBytes = "";
+		SessionStateLockTestHooks.afterCurrentOwnerValidation = async file => {
+			// Capture the held record before rewrite attempt
+			if (file === lockFile) heldBytes = await Bun.file(file).text();
+		};
+		let faulted = false;
+		SessionStateLockTestHooks.beforeOwnerRecordPrewriteStat = async file => {
+			if (!faulted && file === lockFile) {
+				faulted = true;
+				throw Object.assign(new Error("pre-rewrite fstat failure"), { code: "EIO" });
+			}
+		};
+		try {
+			// writeToolActivity triggers a rewrite by calling withSessionStateFileLock,
+			// which acquires the lock, transitions it, and tries to release it (rewrite).
+			await expect(writeToolActivity(root, "call-1", "2026-03-01T00:00:05.000Z")).rejects.toBeInstanceOf(
+				SessionStateLockUnavailableError,
+			);
+		} finally {
+			SessionStateLockTestHooks.afterCurrentOwnerValidation = undefined;
+			SessionStateLockTestHooks.beforeOwnerRecordPrewriteStat = undefined;
+		}
+		expect(faulted).toBe(true);
+		// The held record must still be on disk unchanged
+		const finalBytes = await Bun.file(lockFile).text();
+		expect(finalBytes).toBe(heldBytes);
+		// And it must still be valid JSON
+		const parsed = JSON.parse(finalBytes);
+		expect(parsed).toMatchObject({
+			pid: expect.any(Number),
+			owner_host_id: expect.any(String),
+		});
 	}, 15_000);
 
 	it("leaves a successor owner that claimed the path after the stale verdict", async () => {
