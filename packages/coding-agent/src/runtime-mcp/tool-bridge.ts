@@ -15,6 +15,7 @@ import type {
 	RenderResultOptions,
 } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
+import { wrapUntrustedContent } from "../tools/fetch";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
 import { callTool } from "./client";
 import { GJC_PLUGIN_MCP_PROVIDER } from "./plugin-mcp-name-filter";
@@ -141,7 +142,9 @@ function buildResult(
 	provider?: string,
 	providerName?: string,
 ): CustomToolResult<MCPToolDetails> {
-	const text = formatMCPContent(result.content);
+	const body = formatMCPContent(result.content);
+	const visible = result.isError ? `Error: ${body}` : body;
+	const text = wrapUntrustedContent(visible);
 	const details: MCPToolDetails = {
 		serverName,
 		mcpToolName,
@@ -150,9 +153,6 @@ function buildResult(
 		provider,
 		providerName,
 	};
-	if (result.isError) {
-		return { content: [{ type: "text", text: `Error: ${text}` }], details };
-	}
 	return { content: [{ type: "text", text }], details };
 }
 

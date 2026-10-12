@@ -9,6 +9,7 @@ import type { OAuthCallbackFlowOptions } from "@gajae-code/ai/utils/oauth/callba
 import { OAuthCallbackFlow } from "@gajae-code/ai/utils/oauth/callback-server";
 import type { OAuthController, OAuthCredentials } from "@gajae-code/ai/utils/oauth/types";
 import { guardedPublicFetch } from "../web/insane/url-guard";
+import { cancelMCPStream } from "./content-limits";
 import { assertPublicOAuthUrl } from "./oauth-public-url";
 
 const DEFAULT_PORT = 3000;
@@ -102,6 +103,34 @@ function resolveCallbackOptions(config: MCPOAuthConfig): OAuthCallbackFlowOption
 			? { issuerResponseIssSupported: config.issuerResponseIssSupported }
 			: {}),
 	};
+}
+
+function isOAuthRedirect(response: Response): boolean {
+	return response.type === "opaqueredirect" || (response.status >= 300 && response.status < 400);
+}
+
+/**
+ * Dial the URL on an address `guardedPublicFetch` just accepted. That helper
+ * forces `redirect: "manual"`, so a 3xx is a refusal rather than a followed hop.
+ */
+async function fetchPinnedOAuthEndpoint(
+	url: string,
+	init: { method: string; headers: Record<string, string>; body?: string; signal?: AbortSignal },
+): Promise<Response> {
+	const dialed = await guardedPublicFetch(url, {
+		method: init.method,
+		headers: init.headers,
+		body: init.body,
+		signal: init.signal,
+	});
+	if (!dialed.ok) {
+		throw new Error(`Refusing non-public OAuth endpoint: ${dialed.reason}`);
+	}
+	if (isOAuthRedirect(dialed.response)) {
+		cancelMCPStream(dialed.response.body);
+		throw new Error("Refusing non-public OAuth endpoint: redirect");
+	}
+	return dialed.response;
 }
 
 /**
@@ -264,9 +293,8 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 		}
 
 		await assertPublicOAuthUrl(this.config.tokenUrl, { signal: this.ctrl.signal });
-		const response = await fetch(this.config.tokenUrl, {
+		const response = await fetchPinnedOAuthEndpoint(this.config.tokenUrl, {
 			method: "POST",
-			redirect: "error",
 			headers: {
 				"Content-Type": "application/x-www-form-urlencoded",
 			},
@@ -345,9 +373,8 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 
 		try {
 			await assertPublicOAuthUrl(registrationEndpoint, { signal });
-			const response = await fetch(registrationEndpoint, {
+			const response = await fetchPinnedOAuthEndpoint(registrationEndpoint, {
 				method: "POST",
-				redirect: "error",
 				headers: {
 					"Content-Type": "application/json",
 					Accept: "application/json",
@@ -387,9 +414,8 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 			const authorizationEndpoint = new URL(this.config.authorizationUrl);
 			const metadataUrl = new URL("/.well-known/oauth-authorization-server", authorizationEndpoint.origin);
 			await assertPublicOAuthUrl(metadataUrl.toString(), { signal });
-			const response = await fetch(metadataUrl.toString(), {
+			const response = await fetchPinnedOAuthEndpoint(metadataUrl.toString(), {
 				method: "GET",
-				redirect: "error",
 				headers: { Accept: "application/json" },
 				signal,
 			});
