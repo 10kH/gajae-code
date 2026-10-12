@@ -1006,6 +1006,23 @@ function createPreparationCancellation(entry: RenderPreparation): () => void {
 
 function cancelNoPreparation(): void {}
 
+function filesystemErrorCode(error: unknown): string | undefined {
+	if (error === null || typeof error !== "object" || !("code" in error)) return undefined;
+	return typeof error.code === "string" ? error.code : undefined;
+}
+
+// JSON.stringify writes ESC as "\\u001b", and a CSI final is a letter, so a
+// following "Bearer" has no word boundary. Split that join, scrub, then restore.
+function redactTuiRenderDump(debugData: string): string {
+	const separateCsiFinal = (match: string) => `${match}\u0000`;
+	const separated = debugData
+		.replace(/\u001b\[[0-9;?]*[A-Za-z]/g, separateCsiFinal)
+		.replace(/\\u001[bB]\[[0-9;?]*[A-Za-z]/g, separateCsiFinal);
+	return redactCrashSecrets(separated)
+		.replace(/\u001b\[[0-9;?]*[A-Za-z]\u0000/g, match => match.slice(0, -1))
+		.replace(/\\u001[bB]\[[0-9;?]*[A-Za-z]\u0000/g, match => match.slice(0, -1));
+}
+
 /**
  * TUI - Main class for managing terminal UI with differential rendering
  */
@@ -1281,26 +1298,36 @@ export class TUI extends Container {
 		fs.appendFileSync(getDebugLogPath(), message);
 	}
 
-	// Sibling of the debug log, not /tmp/tui. Create the parent only when it is
-	// missing, and keep both the directory and the frame owner-only.
+	// Sibling of the debug log. Create the parent only when it is missing.
+	// The dump file is opened exclusive and no-follow, then written through that fd.
 	#writeRenderDebugDump(debugData: string): void {
 		const debugDir = path.dirname(getDebugLogPath());
 		if (!fs.existsSync(debugDir)) {
 			fs.mkdirSync(debugDir, { recursive: true, mode: 0o700 });
 			fs.chmodSync(debugDir, 0o700);
 		}
+		// stat follows a symlink to the real agent directory; a directory we do
+		// not own is not a place for a session frame.
+		const dirStat = fs.statSync(debugDir);
+		const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+		if (!dirStat.isDirectory() || (uid !== undefined && dirStat.uid !== uid)) return;
+
 		const debugPath = path.join(debugDir, `render-${Date.now()}-${Math.random().toString(36).slice(2)}.log`);
-		// A CSI final is a letter, including after JSON.stringify encodes ESC as
-		// "\\u001b". redactCrashSecrets then misses a line-leading "Bearer".
-		const separateCsiFinal = (match: string) => `${match}\u0000`;
-		const separated = debugData
-			.replace(/\u001b\[[0-9;?]*[A-Za-z]/g, separateCsiFinal)
-			.replace(/\\u001[bB]\[[0-9;?]*[A-Za-z]/g, separateCsiFinal);
-		const redacted = redactCrashSecrets(separated)
-			.replace(/\u001b\[[0-9;?]*[A-Za-z]\u0000/g, match => match.slice(0, -1))
-			.replace(/\\u001[bB]\[[0-9;?]*[A-Za-z]\u0000/g, match => match.slice(0, -1));
-		fs.writeFileSync(debugPath, redacted, { mode: 0o600 });
-		fs.chmodSync(debugPath, 0o600);
+		const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0);
+		let fd: number;
+		try {
+			fd = fs.openSync(debugPath, flags, 0o600);
+		} catch (error) {
+			const code = filesystemErrorCode(error);
+			if (code === "EEXIST" || code === "ELOOP") return;
+			throw error;
+		}
+		try {
+			fs.writeFileSync(fd, redactTuiRenderDump(debugData));
+			fs.fchmodSync(fd, 0o600);
+		} finally {
+			fs.closeSync(fd);
+		}
 	}
 
 	#visibleWidthForDifferentialGuard(line: string): number {
