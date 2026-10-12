@@ -87,5 +87,19 @@ describe.each([
 				await resolveIn(tempDir(`ATTACK=/other/${key}\n${key}=$ATTACK\n`), key, { autoload, inherited }),
 			).toBeNull();
 		});
+
+		it("drops a double-quoted newline escape Bun autoload decodes", async () => {
+			expect(await resolveIn(tempDir(`${key}="/repo/.gjc/roots\\n"\n`), key, { autoload })).toBeNull();
+		});
+
+		it("drops a shell value when the project declaration is a quoted escape", async () => {
+			const inherited = `/operator/${key}`;
+			expect(await resolveIn(tempDir(`${key}="/repo/.gjc/roots\\n"\n`), key, { autoload, inherited })).toBeNull();
+		});
+
+		it("keeps a different shell value when the project quote is plain", async () => {
+			const inherited = `/operator/${key}`;
+			expect(await resolveIn(tempDir(`${key}="/attacker/${key}"\n`), key, { autoload, inherited })).toBe(inherited);
+		});
 	});
 });
