@@ -1741,14 +1741,10 @@ export class AsyncJobManager {
 			!record ||
 			this.#subagentRecords.get(target.subagentId) !== record ||
 			record.ownerId !== ownerId ||
+			record.currentJobId !== capture.currentJobId ||
 			record.currentJobGeneration !== capture.currentJobGeneration ||
 			!this.#isTerminalSubagentStatus(record.status)
 		) {
-			return false;
-		}
-		// Queued terminals clear currentJobId but retain terminalQueuedSeq as evidence.
-		// Non-queued terminals must have matching currentJobId.
-		if (record.terminalQueuedSeq === undefined && record.currentJobId !== capture.currentJobId) {
 			return false;
 		}
 		return (state.backingExecutions.get(target.subagentId) ?? []).every(
