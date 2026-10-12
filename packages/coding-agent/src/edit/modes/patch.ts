@@ -6,10 +6,12 @@
  */
 
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolResult } from "@gajae-code/agent-core";
 import { isEnoent } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import { LocalProtocolHandler } from "../../internal-urls/local-protocol";
 import {
 	type FileDiagnosticsResult,
 	flushLspWritethroughBatch,
@@ -117,6 +119,58 @@ function loadNativePatchBindings(): Promise<NativePatchBindings> {
 	return nativePatchBindingsPromise;
 }
 
+function pathIsWithin(target: string, root: string): boolean {
+	return target === root || target.startsWith(`${root}${path.sep}`);
+}
+
+/**
+ * Trust root for a delete. Session `gjc-local/<id>` and the active explicit
+ * `<artifacts>/local` root match atomic writes. Anything else stays in `cwd`.
+ */
+function boundaryForPatchDelete(cwd: string, absolutePath: string): string {
+	const resolved = path.resolve(absolutePath);
+	const options = LocalProtocolHandler.resolveOptions();
+	if (options && !options.isManagedDestination?.()) {
+		const artifactsDir = options.getArtifactsDir?.();
+		if (artifactsDir) {
+			const explicit = path.resolve(artifactsDir, "local");
+			if (pathIsWithin(resolved, explicit)) return explicit;
+		}
+	}
+	const managedParent = path.join(os.tmpdir(), "gjc-local");
+	if (pathIsWithin(resolved, managedParent)) {
+		const rest = resolved.slice(managedParent.length + path.sep.length);
+		const sessionSegment = rest.split(path.sep, 1)[0] ?? "";
+		if (sessionSegment.length > 0) return path.join(managedParent, sessionSegment);
+	}
+	return path.resolve(cwd);
+}
+
+/**
+ * `unlink` follows a directory symlink. Resolve the parent only, then delete
+ * that real parent plus the final name so a file symlink is removed as a link.
+ */
+async function resolvePatchDeletePath(root: string, absolutePath: string, displayPath: string): Promise<string> {
+	let realRoot: string;
+	try {
+		realRoot = await fs.promises.realpath(root);
+	} catch (error) {
+		if (isEnoent(error)) throw new ApplyPatchError(`File not found: ${displayPath}`);
+		throw error;
+	}
+	let realParent: string;
+	try {
+		realParent = await fs.promises.realpath(path.dirname(absolutePath));
+	} catch (error) {
+		if (isEnoent(error)) throw new ApplyPatchError(`File not found: ${displayPath}`);
+		throw error;
+	}
+	if (!pathIsWithin(realParent, realRoot)) {
+		throw new ApplyPatchError(`Delete target resolves outside its root: ${displayPath}`);
+	}
+	return path.join(realParent, path.basename(absolutePath));
+}
+
 async function readExistingPatchFile(fileSystem: FileSystem, absolutePath: string, path: string): Promise<string> {
 	try {
 		return await fileSystem.read(absolutePath);
@@ -220,9 +274,11 @@ async function applyNormalizedPatch(input: PatchInput, options: ApplyPatchOption
 
 	// Handle DELETE operation
 	if (op === "delete") {
-		const oldContent = await readExistingPatchFile(fs, absolutePath, input.path);
+		const boundary = boundaryForPatchDelete(cwd, absolutePath);
+		const deletePath = await resolvePatchDeletePath(boundary, absolutePath, input.path);
+		const oldContent = await readExistingPatchFile(fs, deletePath, input.path);
 		if (!dryRun) {
-			await fs.delete(absolutePath);
+			await fs.delete(deletePath);
 		}
 
 		return {
