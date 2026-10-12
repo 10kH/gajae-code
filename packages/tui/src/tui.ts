@@ -1432,6 +1432,11 @@ export class TUI extends Container {
 		this.#clearOnShrink = enabled;
 	}
 
+	/** Overlays rely on padded rows, so contraction replays only without them. */
+	#clearOnShrinkReplays(): boolean {
+		return this.#clearOnShrink && this.overlayStack.length === 0;
+	}
+
 	setFocus(component: Component | null): void {
 		// Clear focused flag on old component
 		if (isFocusable(this.#focusedComponent)) {
@@ -5268,7 +5273,10 @@ export class TUI extends Container {
 			if (hasStickySuffix && height > 0 && this.#manualViewportTop === undefined) {
 				// Rebuilds start at their new transcript frontier. Forced redraws use the
 				// captured rendered dimensions rather than their -1 invalidation sentinels.
+				// clearOnShrink replays the whole frame on contraction instead; spacer rows
+				// would otherwise stay on screen as a blank gap above the pinned component.
 				const preserveLiveFrontier =
+					!this.#clearOnShrinkReplays() &&
 					!transcriptIdentityReplaced &&
 					!transcriptRebuildPending &&
 					frontierPreviousWidth === width &&
@@ -5848,13 +5856,11 @@ export class TUI extends Container {
 		// Content shrunk below the previous render and no overlays - re-render to clear empty rows
 		// (overlays need the padding, so only do this when no overlays are active)
 		// Configurable via setClearOnShrink() or GJC_CLEAR_ON_SHRINK=0 env var
-		if (this.#clearOnShrink && newLines.length < this.#previousLines.length && this.overlayStack.length === 0) {
+		// Erase native scrollback too: scrolled-off rows cannot be pulled back into the
+		// viewport, and repainting them on screen would duplicate them in history.
+		if (this.#clearOnShrinkReplays() && newLines.length < this.#previousLines.length) {
 			logRedraw(`clearOnShrink (prev=${this.#previousLines.length}, new=${newLines.length})`);
-			if (useViewportRepaintPath) {
-				viewportRepaint(`clearOnShrink (prev=${this.#previousLines.length}, new=${newLines.length})`);
-			} else {
-				fullRender(true, "clearOnShrink");
-			}
+			fullRender(true, "clearOnShrink", true);
 			return;
 		}
 
