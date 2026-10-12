@@ -33,14 +33,14 @@ async function baseCut(chunks: string[], dumpAfter = 0): Promise<string> {
 	return (await sink.dump()).output;
 }
 
-async function loadSettings(enabled: boolean): Promise<{ settings: Settings; root: string }> {
+async function loadSettings(enabled: boolean, content = CANARY): Promise<{ settings: Settings; root: string }> {
 	const root = mkdtempSync(join(tmpdir(), "column-cap-secret-"));
 	const cwd = join(root, "project");
 	const agentDir = join(root, "agent");
 	mkdirSync(join(cwd, ".gjc"), { recursive: true });
 	mkdirSync(agentDir, { recursive: true });
 	writeFileSync(join(agentDir, "config.yml"), `secrets:\n  enabled: ${enabled ? "true" : "false"}\n`);
-	writeFileSync(join(cwd, ".gjc", "secrets.yml"), `- type: plain\n  content: "${CANARY}"\n`);
+	writeFileSync(join(cwd, ".gjc", "secrets.yml"), `- type: plain\n  content: "${content}"\n`);
 	const settings = await Settings.loadForScope({ cwd, agentDir });
 	if (settings.get("secrets.enabled") !== enabled) {
 		await settings.close();
@@ -280,6 +280,49 @@ describe("column cap plain-secret cut", () => {
 			const output = await executeSink(settings, chunks);
 			expect(output).toBe(await baseCut(chunks));
 			expect(output.startsWith(CANARY)).toBe(true);
+		} finally {
+			await settings.close();
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("an overlapping shorter secret prefix is omitted across a nonterminal dump", async () => {
+		const unit = "ABCDEFGH";
+		const secret = `${unit}${unit}XYZ12`;
+		const { settings, root } = await loadSettings(true, secret);
+		try {
+			const chunks = [`${FILLER.repeat(749)}${unit}${unit}`, `${unit}XYZ1`, `2${FILLER.repeat(80)}\nfooter`];
+			const output = await executeSink(settings, chunks, undefined, undefined, 1);
+			expect(output).toBe(`${FILLER.repeat(749)}${unit}…\nfooter`);
+		} finally {
+			await settings.close();
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("an overlapping shorter secret prefix is omitted when the longer continuation mismatches", async () => {
+		const unit = "ABCDEFGH";
+		const secret = `${unit}${unit}XYZ12`;
+		const { settings, root } = await loadSettings(true, secret);
+		try {
+			const chunks = [`${FILLER.repeat(749)}${unit}${unit}ABCD`];
+			const output = await executeSink(settings, chunks);
+			expect(output).toBe(`${FILLER.repeat(749)}${unit}…`);
+		} finally {
+			await settings.close();
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("secrets disabled still allows the base cut for an overlapping prefix split", async () => {
+		const unit = "ABCDEFGH";
+		const secret = `${unit}${unit}XYZ12`;
+		const { settings, root } = await loadSettings(false, secret);
+		try {
+			const chunks = [`${FILLER.repeat(749)}${unit}${unit}`, `${unit}XYZ1`, `2${FILLER.repeat(80)}\nfooter`];
+			const output = await executeSink(settings, chunks, undefined, undefined, 1);
+			expect(output).toBe(await baseCut(chunks, 1));
+			expect(output).toBe(`${FILLER.repeat(749)}${unit}${unit}…\nfooter`);
 		} finally {
 			await settings.close();
 			rmSync(root, { recursive: true, force: true });

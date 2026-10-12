@@ -71,8 +71,9 @@ function columnHeadEndOutsideSecrets(segment: string, end: number, secrets: read
 
 /**
  * Pull a column-cap end off a proper prefix of a plain secret.
- * A secret that already ends on the cut stays. Bytes already in `text`
- * that contradict the secret leave the cut alone.
+ * Each candidate's continuation is checked from longest to shortest.
+ * A longer candidate that is already finished or contradicted does not hide
+ * a shorter open prefix. A secret that already ends on the cut stays.
  */
 function columnHeadEndBeforeOpenPrefix(text: string, end: number, secrets: readonly string[]): number {
 	let cut = end;
@@ -82,18 +83,15 @@ function columnHeadEndBeforeOpenPrefix(text: string, end: number, secrets: reado
 		if (secretChars < 2 || end < 1) continue;
 		if (end >= secretChars && text.slice(end - secretChars, end) === secret) continue;
 		const maxPrefix = Math.min(secretChars - 1, end);
-		let matched = 0;
 		for (let k = maxPrefix; k >= 1; k--) {
 			if (text.slice(end - k, end) !== secret.slice(0, k)) continue;
-			matched = k;
+			const rest = secret.slice(k);
+			const have = Math.min(after.length, rest.length);
+			if (have === rest.length) continue;
+			if (after.slice(0, have) !== rest.slice(0, have)) continue;
+			cut = Math.min(cut, end - k);
 			break;
 		}
-		if (matched === 0) continue;
-		const rest = secret.slice(matched);
-		const have = Math.min(after.length, rest.length);
-		if (have === rest.length) continue;
-		if (after.slice(0, have) !== rest.slice(0, have)) continue;
-		cut = Math.min(cut, end - matched);
 	}
 	return cut;
 }
