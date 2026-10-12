@@ -27,6 +27,7 @@ import {
 	truncateHead,
 	truncateHeadBytes,
 	truncateLine,
+	truncateLineWithSecretAwareness,
 	truncateMiddleWindows,
 	truncateTailBytes,
 } from "../session/streaming-output";
@@ -1911,7 +1912,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						? segment.content
 								.split("\n")
 								.map(line => {
-									const result = truncateLine(line, maxColumns);
+									const result = truncateLineWithSecretAwareness(line, maxColumns);
 									if (result.wasTruncated) columnTruncated = maxColumns;
 									return result.text;
 								})

@@ -329,6 +329,23 @@ describe("column cap plain-secret cut", () => {
 		}
 	});
 
+	test("a multiline secret split across newlines does not emit partial prefixes", async () => {
+		const multilineSecret = `line1\nline2`;
+		const { settings, root } = await loadSettings(true, multilineSecret);
+		try {
+			// First line is within the cap, second line exceeds it
+			const chunks = [`${FILLER.repeat(750)}line1\n`, `line2${FILLER.repeat(2000)}`];
+			const output = await executeSink(settings, chunks);
+			// Should not contain "line1" at the end of first line when "line2" is capped
+			expect(output.includes(multilineSecret)).toBe(false);
+			expect(output.includes("line1\nline2")).toBe(false);
+			expect(output.endsWith("…")).toBe(true);
+		} finally {
+			await settings.close();
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	test("an aborted signal after secret loading does not run the tool", async () => {
 		const { settings, root } = await loadSettings(true);
 		try {
