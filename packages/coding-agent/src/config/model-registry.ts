@@ -4070,7 +4070,7 @@ export class ModelRegistry {
 	}
 
 	async #writeCheckedModelsConfig(config: ModelsConfig): Promise<void> {
-		await fs.mkdir(path.dirname(this.#modelsConfigFile.path()), { recursive: true });
+		await fs.mkdir(path.dirname(this.#modelsConfigFile.path()), { recursive: true, mode: 0o700 });
 		writeExplicitOwnerOnlyTextSync(this.#modelsConfigFile.path(), Bun.YAML.stringify(config, null, 2));
 		this.#modelsConfigFile.invalidate();
 		this.#reloadStaticModels();
