@@ -8,6 +8,7 @@ import * as path from "node:path";
 import * as readline from "node:readline";
 import type { Process as NativeProcess } from "@gajae-code/natives";
 import { isCompiledBinary } from "@gajae-code/utils/env";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import { parseLinuxProcParentPid, parseLinuxProcStartTime, parseLinuxProcState } from "../gjc-runtime/linux-proc";
 import { processIncarnation } from "../sdk/broker/process-incarnation";
 import { fatalCatchableSignals, signalExitCode } from "./bash-shell-signals";
@@ -264,7 +265,9 @@ export async function runBashShellSupervisor(): Promise<void> {
 	const worker = childProcess.spawn(command!, args, {
 		cwd: process.cwd(),
 		detached: false,
-		env: { ...process.env, GJC_ISOLATED_SHELL_RUNTIME: "1" },
+		// This process reloaded the project `.env` on startup; the runtime's native
+		// shell imports its environment wholesale, so drop project hook variables.
+		env: { ...projectSafeSpawnEnv(), GJC_ISOLATED_SHELL_RUNTIME: "1" },
 		stdio: ["pipe", "pipe", "pipe"],
 		windowsHide: true,
 	});

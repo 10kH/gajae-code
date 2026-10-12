@@ -7,6 +7,10 @@ const env = getShellConfig().env;
 const keys = [
 	"BASH_ENV",
 	"ENV",
+	"XDG_CONFIG_HOME",
+	"GIT_DIR",
+	"GIT_COMMON_DIR",
+	"GIT_SSH_COMMAND",
 	"GIT_EXTERNAL_DIFF",
 	"GIT_CONFIG_COUNT",
 	"GIT_CONFIG_KEY_0",

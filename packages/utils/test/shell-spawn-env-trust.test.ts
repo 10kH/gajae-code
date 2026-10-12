@@ -17,6 +17,10 @@ const PROBE = path.join(import.meta.dir, "fixtures", "shell-spawn-env-probe.ts")
 const HOOK_KEYS = [
 	"BASH_ENV",
 	"ENV",
+	"XDG_CONFIG_HOME",
+	"GIT_DIR",
+	"GIT_COMMON_DIR",
+	"GIT_SSH_COMMAND",
 	"GIT_EXTERNAL_DIFF",
 	"GIT_CONFIG_COUNT",
 	"GIT_CONFIG_KEY_0",
@@ -61,6 +65,10 @@ async function probeIn(cwd: string, autoload: boolean, inherited: Record<string,
 const PLANTED = [
 	"BASH_ENV=./hook.sh",
 	"ENV=./hook.sh",
+	"XDG_CONFIG_HOME=./xdg",
+	"GIT_DIR=./evil-git",
+	"GIT_COMMON_DIR=./evil-git",
+	"GIT_SSH_COMMAND=./hook.sh",
 	"GIT_EXTERNAL_DIFF=./hook.sh",
 	"GIT_CONFIG_COUNT=1",
 	"GIT_CONFIG_KEY_0=core.fsmonitor",
@@ -79,6 +87,10 @@ describe.each([
 		expect(probe).toEqual({
 			BASH_ENV: null,
 			ENV: null,
+			XDG_CONFIG_HOME: null,
+			GIT_DIR: null,
+			GIT_COMMON_DIR: null,
+			GIT_SSH_COMMAND: null,
 			GIT_EXTERNAL_DIFF: null,
 			GIT_CONFIG_COUNT: null,
 			GIT_CONFIG_KEY_0: null,
@@ -103,5 +115,23 @@ describe.each([
 	it("does not let the project .env replace an inherited value", async () => {
 		const probe = await probeIn(tempDir("BASH_ENV=./hook.sh\n"), autoload, { BASH_ENV: "/opt/operator/bashenv" });
 		expect(probe.BASH_ENV).toBe("/opt/operator/bashenv");
+	});
+
+	// Bun does not expose which source supplied a value, so an inherited value
+	// the project repeats verbatim, or a key the project declares dynamically,
+	// is ambiguous. Like the credential snapshot (`$inheritedEnv`), these fail
+	// closed: the hook variable is dropped rather than risk running project code.
+	it("drops an inherited value the project .env repeats verbatim (ambiguous, fails closed)", async () => {
+		const probe = await probeIn(tempDir("BASH_ENV=/opt/operator/bashenv\n"), autoload, {
+			BASH_ENV: "/opt/operator/bashenv",
+		});
+		expect(probe.BASH_ENV).toBeNull();
+	});
+
+	it("drops an inherited value when the project .env declares the key dynamically (ambiguous, fails closed)", async () => {
+		const probe = await probeIn(tempDir("HOOK=./hook.sh\nBASH_ENV=$HOOK\n"), autoload, {
+			BASH_ENV: "/opt/operator/bashenv",
+		});
+		expect(probe.BASH_ENV).toBeNull();
 	});
 });

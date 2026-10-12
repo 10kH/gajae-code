@@ -1,0 +1,139 @@
+import { afterEach, describe, expect, it } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+
+/**
+ * A project `.env` must not be able to make the bash tool run repository code.
+ * git runs `core.fsmonitor` during `git status`, and that config can come from
+ * `GIT_CONFIG_*`, `XDG_CONFIG_HOME/git/config`, or a `GIT_DIR` config; bash
+ * sources `BASH_ENV` before every command. The non-PTY path spawns a chain of
+ * Bun worker processes that each reload `cwd/.env`, and the PTY path inherits
+ * the process environment, so the probe drives the real execution paths and
+ * checks whether the planted hook actually ran.
+ */
+
+const PROBE = path.join(import.meta.dir, "fixtures", "bash-project-hook-probe.ts");
+const HOOK_KEYS = [
+	"BASH_ENV",
+	"ENV",
+	"XDG_CONFIG_HOME",
+	"GIT_DIR",
+	"GIT_COMMON_DIR",
+	"GIT_CONFIG_COUNT",
+	"GIT_CONFIG_KEY_0",
+	"GIT_CONFIG_VALUE_0",
+	"GIT_CONFIG_PARAMETERS",
+];
+
+const tempDirs: string[] = [];
+
+function tempDir(): string {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-bash-hook-"));
+	tempDirs.push(dir);
+	return dir;
+}
+
+afterEach(() => {
+	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+});
+
+interface Project {
+	cwd: string;
+	marker: string;
+	hook: string;
+}
+
+function project(dotenv: (project: Project) => string): Project {
+	const cwd = tempDir();
+	const marker = path.join(cwd, "hook-ran");
+	const hook = path.join(cwd, "hook.sh");
+	fs.writeFileSync(hook, `#!/bin/sh\necho ran >> "${marker}"\n`, { mode: 0o755 });
+	const git = Bun.spawnSync(["git", "init", "-q", cwd]);
+	if (git.exitCode !== 0) throw new Error(`git init failed: ${git.stderr.toString()}`);
+	const result = { cwd, marker, hook };
+	fs.writeFileSync(path.join(cwd, ".env"), dotenv(result));
+	return result;
+}
+
+async function runProbe(
+	target: Project,
+	mode: "worker" | "pty",
+	inherited: Record<string, string> = {},
+): Promise<boolean> {
+	const env: Record<string, string> = {};
+	for (const [key, value] of Object.entries(process.env)) {
+		if (value !== undefined) env[key] = value;
+	}
+	for (const key of HOOK_KEYS) delete env[key];
+	env.HOME = tempDir();
+	env.GJC_CODING_AGENT_DIR = tempDir();
+	Object.assign(env, inherited);
+
+	fs.rmSync(target.marker, { force: true });
+	const proc = Bun.spawn([process.execPath, PROBE, mode], { cwd: target.cwd, env, stdout: "pipe", stderr: "pipe" });
+	const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+	const exitCode = await proc.exited;
+	if (exitCode !== 0) throw new Error(`probe failed (${exitCode}): ${stderr}`);
+	const lastLine = stdout.trim().split("\n").at(-1) ?? "";
+	expect(JSON.parse(lastLine)).toEqual({ exitCode: 0, done: true });
+	return fs.existsSync(target.marker);
+}
+
+const VECTORS: Record<string, (project: Project) => string> = {
+	GIT_CONFIG_: ({ hook }) => `GIT_CONFIG_COUNT=1\nGIT_CONFIG_KEY_0=core.fsmonitor\nGIT_CONFIG_VALUE_0=${hook}\n`,
+	XDG_CONFIG_HOME: ({ cwd, hook }) => {
+		fs.mkdirSync(path.join(cwd, "xdg", "git"), { recursive: true });
+		fs.writeFileSync(path.join(cwd, "xdg", "git", "config"), `[core]\n\tfsmonitor = ${hook}\n`);
+		return `XDG_CONFIG_HOME=${path.join(cwd, "xdg")}\n`;
+	},
+	GIT_DIR: ({ cwd, hook }) => {
+		fs.appendFileSync(path.join(cwd, ".git", "config"), "");
+		const evil = path.join(cwd, "evil-git");
+		fs.cpSync(path.join(cwd, ".git"), evil, { recursive: true });
+		fs.appendFileSync(path.join(evil, "config"), `[core]\n\tfsmonitor = ${hook}\n`);
+		return `GIT_DIR=${evil}\n`;
+	},
+	BASH_ENV: ({ hook }) => `BASH_ENV=${hook}\n`,
+};
+
+/** Values a parent GJC forwards to a child session match the child's project `.env`. */
+function forwarded(target: Project): Record<string, string> {
+	const values: Record<string, string> = {};
+	for (const line of fs.readFileSync(path.join(target.cwd, ".env"), "utf8").split("\n")) {
+		const separator = line.indexOf("=");
+		if (separator > 0) values[line.slice(0, separator)] = line.slice(separator + 1);
+	}
+	return values;
+}
+
+describe.skipIf(process.platform === "win32")("bash tool ignores project .env hook variables", () => {
+	// The isolated worker chain is Bun processes that each reload `cwd/.env`,
+	// and the native shell imports the worker environment wholesale. (It already
+	// skips BASH_ENV/ENV itself, so only git vectors reach this path.)
+	for (const name of ["GIT_CONFIG_", "XDG_CONFIG_HOME", "GIT_DIR"]) {
+		it(`does not run a ${name} hook from the project .env (isolated worker)`, async () => {
+			expect(await runProbe(project(VECTORS[name]!), "worker")).toBe(false);
+		});
+	}
+
+	// The PTY runs a real `bash -lc` that inherits the host environment. A
+	// top-level host never holds dotenv values there, but a child GJC launched
+	// with the parent's forwarded environment does, with values equal to the
+	// project declaration.
+	for (const name of ["GIT_CONFIG_", "BASH_ENV"]) {
+		it(`does not run a forwarded ${name} hook through the interactive PTY`, async () => {
+			const target = project(VECTORS[name]!);
+			expect(await runProbe(target, "pty", forwarded(target))).toBe(false);
+		});
+	}
+
+	it("still honors a hook variable the launching shell exported with a different value", async () => {
+		const target = project(({ cwd }) => `XDG_CONFIG_HOME=${path.join(cwd, "unused")}\n`);
+		const xdg = path.join(target.cwd, "operator-xdg");
+		fs.mkdirSync(path.join(xdg, "git"), { recursive: true });
+		fs.writeFileSync(path.join(xdg, "git", "config"), `[core]\n\tfsmonitor = ${target.hook}\n`);
+		expect(await runProbe(target, "worker", { XDG_CONFIG_HOME: xdg })).toBe(true);
+		expect(await runProbe(target, "pty", { XDG_CONFIG_HOME: xdg })).toBe(true);
+	});
+});

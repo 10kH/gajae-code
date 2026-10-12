@@ -12,6 +12,7 @@ import {
 	visibleWidth,
 } from "@gajae-code/tui";
 import { logger, sanitizeText } from "@gajae-code/utils";
+import { projectDeclaredSpawnHookNames } from "@gajae-code/utils/shell-config";
 import type { Terminal as XtermTerminalType } from "@xterm/headless";
 import { Settings } from "../config/settings";
 import { NON_INTERACTIVE_ENV } from "../exec/non-interactive-env";
@@ -423,7 +424,12 @@ export async function runInteractiveBashPty(
 				cwd: options.cwd,
 				timeoutMs: options.timeoutMs,
 				env: { ...NON_INTERACTIVE_ENV, ...options.env },
-				unsetEnv: options.unsetEnv,
+				// The PTY child inherits the process env; drop project hook variables
+				// unless this call sets them explicitly.
+				unsetEnv: [
+					...(options.unsetEnv ?? []),
+					...projectDeclaredSpawnHookNames().filter(name => !Object.hasOwn(options.env ?? {}, name)),
+				],
 				signal: processAbortController.signal,
 				cols: initialPtySize.cols,
 				rows: initialPtySize.rows,

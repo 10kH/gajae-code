@@ -1,7 +1,14 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { canonicalEnvKey } from "./dirs";
-import { $credentialEnv, $pickCredentialEnv, $pickflag, filterProcessEnv, startupProjectEnvSnapshot } from "./env";
+import {
+	$credentialEnv,
+	$inheritedEnv,
+	$pickCredentialEnv,
+	$pickflag,
+	filterProcessEnv,
+	startupProjectEnvSnapshot,
+} from "./env";
 import { $which } from "./which";
 
 export interface ShellConfig {
@@ -46,33 +53,52 @@ function isExecutable(path: string): boolean {
  * flag value.
  */
 /**
- * Variables that make the shell or git run code on their own: bash sources
- * `BASH_ENV` (sh: `ENV`) before every non-interactive command, and git applies
- * `GIT_CONFIG_*` (e.g. `core.fsmonitor`) and runs `GIT_EXTERNAL_DIFF` even for
- * `git status`/`git diff`. A repository `.env` must not be able to set them, or
- * every bash tool command — including the read-only allowlisted `git status`
- * of restricted role agents — would execute repository code.
+ * Variables that make the shell or git run code on their own. bash sources
+ * `BASH_ENV` (sh: `ENV`) before every non-interactive command. git applies
+ * `GIT_CONFIG_*`, reads config from `GIT_DIR`/`GIT_COMMON_DIR` and from
+ * `$XDG_CONFIG_HOME/git/config`, and so runs e.g. `core.fsmonitor` during
+ * `git status`; it also runs `GIT_EXTERNAL_DIFF` and `GIT_SSH(_COMMAND)`.
+ * A repository `.env` must not be able to set them, or every bash tool command
+ * — including a restricted role agent's allowlisted `git status` — would execute
+ * repository code.
  */
 const PROJECT_DENIED_SPAWN_ENV =
-	/^(?:BASH_ENV|ENV|GIT_EXTERNAL_DIFF|GIT_CONFIG_(?:COUNT|PARAMETERS|GLOBAL|SYSTEM|KEY_\d+|VALUE_\d+))$/;
+	/^(?:BASH_ENV|ENV|XDG_CONFIG_HOME|GIT_DIR|GIT_COMMON_DIR|GIT_EXTERNAL_DIFF|GIT_SSH|GIT_SSH_COMMAND|GIT_CONFIG_(?:COUNT|PARAMETERS|GLOBAL|SYSTEM|KEY_\d+|VALUE_\d+))$/;
 
-/** Drop denied variables whose value came from the project `.env` (same provenance rule as credentials). */
-function dropProjectDeclaredSpawnHooks(env: Record<string, string>): void {
+/**
+ * Names of hook-capable variables whose live value came from the project `.env`.
+ *
+ * Provenance comes from `$inheritedEnv`, the same launch snapshot that guards
+ * credentials: a value the launching shell exported with a different value than
+ * the project declaration is kept. Bun does not reveal which source supplied a
+ * value, so an inherited value the project repeats verbatim, or a key the project
+ * declares dynamically, is ambiguous and fails closed (dropped).
+ */
+export function projectDeclaredSpawnHookNames(env: Record<string, string | undefined> = Bun.env): string[] {
 	const snapshot = startupProjectEnvSnapshot();
+	const names: string[] = [];
 	for (const name of Object.keys(env)) {
 		const key = canonicalEnvKey(name);
-		if (!PROJECT_DENIED_SPAWN_ENV.test(key)) continue;
-		const declared = snapshot.values[key];
-		if (declared === undefined) continue;
-		const value = env[name];
-		if (snapshot.dynamic.has(key) || value === declared || value.trim() === declared) delete env[name];
+		if (!PROJECT_DENIED_SPAWN_ENV.test(key) || snapshot.values[key] === undefined) continue;
+		if (env[name] === undefined || $inheritedEnv(name) !== undefined) continue;
+		names.push(name);
 	}
+	return names;
+}
+
+/**
+ * The process environment without project-declared hook variables, for spawning
+ * the bash tool's shell processes (non-PTY worker and PTY sessions alike).
+ */
+export function projectSafeSpawnEnv(): Record<string, string> {
+	const env = filterProcessEnv(Bun.env);
+	for (const name of projectDeclaredSpawnHookNames(env)) delete env[name];
+	return env;
 }
 
 function buildSpawnEnv(shell: string): Record<string, string> {
 	const noCI = $pickflag("GJC_BASH_NO_CI", "PI_BASH_NO_CI", "CLAUDE_BASH_NO_CI");
-	const inherited = filterProcessEnv(Bun.env);
-	dropProjectDeclaredSpawnHooks(inherited);
+	const inherited = projectSafeSpawnEnv();
 	delete inherited.GJC_SESSION_FILE;
 	delete inherited.GJC_MANAGED_OWNER_TRANSCRIPT_PATH;
 	return {
