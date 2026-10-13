@@ -2942,6 +2942,149 @@ describe("SDK broker identity and discovery", () => {
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
+	describe("non-create lifecycle requests past final legacy rows", () => {
+		const ambiguousTarget = {
+			ok: false,
+			error: { code: "idempotency_conflict", message: "legacy lifecycle request has an ambiguous target" },
+		} as const;
+		const withLegacyLedger = async (
+			seed: (ledger: LifecycleLedger, agentDir: string) => Promise<void>,
+			run: (broker: Broker, root: string) => Promise<void>,
+		): Promise<void> => {
+			const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-legacy-noncreate-"));
+			const agentDir = path.join(root, "agent");
+			const legacyLedger = await new LifecycleLedger(agentDir).open();
+			await seed(legacyLedger, agentDir);
+			const broker = new Broker({ agentDir });
+			setLifecycleCommandResolverForTest(broker, () => ({ file: path.join(root, "missing-gjc"), args: [] }));
+			try {
+				await broker.start();
+				await run(broker, root);
+			} finally {
+				setLifecycleCommandResolverForTest(broker, undefined);
+				await broker.stop();
+				await fs.rm(root, { recursive: true, force: true });
+			}
+		};
+		const seedFinalRowsForSessionA = async (ledger: LifecycleLedger): Promise<void> => {
+			await ledger.begin("legacy-close-a-ok", "legacy-close-a-ok-request", { intendedSessionId: "session-a" });
+			await ledger.transition("legacy-close-a-ok", "terminal_ok", {
+				resultSessionId: "session-a",
+				response: { ok: true, result: { sessionId: "session-a" } },
+			});
+			await ledger.begin("legacy-resume-a-error", "legacy-resume-a-error-request", {
+				intendedSessionId: "session-a",
+			});
+			await ledger.transition("legacy-resume-a-error", "terminal_error", {
+				response: { ok: false, error: { code: "fixture_error", message: "legacy resume failed" } },
+			});
+			expect(ledger.get("legacy-close-a-ok")?.operationKey).toBeUndefined();
+			expect(ledger.get("legacy-resume-a-error")?.operationKey).toBeUndefined();
+		};
+		const requestFor = (operation: string, sessionId: string, root: string): Record<string, unknown> =>
+			operation === "session.close"
+				? { sessionId }
+				: { sessionId, cwd: root, sessionPath: path.join(root, `${sessionId}.jsonl`) };
+		const nonCreateOperations = ["session.close", "session.resume", "session.delete"];
+
+		it("admits close, resume, and delete for a different session with a fresh key", async () => {
+			await withLegacyLedger(seedFinalRowsForSessionA, async (broker, root) => {
+				const responses: Record<string, BrokerResponse> = {};
+				for (const operation of nonCreateOperations)
+					responses[operation] = await broker.handleRequest(
+						operation,
+						requestFor(operation, "session-b", root),
+						`fresh-${operation}-b`,
+					);
+				// Admitted past the legacy fence; each fails later only because session-b has no fixture.
+				expect(responses).toEqual({
+					"session.close": { ok: false, error: { code: "not_found", message: "session is not indexed" } },
+					"session.resume": {
+						ok: false,
+						error: {
+							code: "invalid_input",
+							message: "Saved saved session does not match the requested workspace and session id.",
+						},
+					},
+					"session.delete": {
+						ok: false,
+						error: {
+							code: "invalid_input",
+							message: "session.delete path is not an owned managed session for the configured cwd.",
+						},
+					},
+				});
+			});
+		});
+		it("keeps final legacy rows fenced for their recorded session", async () => {
+			await withLegacyLedger(seedFinalRowsForSessionA, async (broker, root) => {
+				for (const operation of nonCreateOperations)
+					await expect(
+						broker.handleRequest(operation, requestFor(operation, "session-a", root), `fresh-${operation}-a`),
+					).resolves.toEqual(ambiguousTarget);
+			});
+		});
+		it("keeps live legacy rows fenced for any target", async () => {
+			await withLegacyLedger(seedFinalRowsForSessionA, async broker => {
+				await broker.ledger.begin("legacy-live", "legacy-live-request", { intendedSessionId: "session-c" });
+				for (const state of ["accepted", "effect_started", "awaiting_ready"] as const) {
+					if (state !== "accepted") await broker.ledger.transition("legacy-live", state);
+					for (const operation of ["session.close", "session.resume"])
+						await expect(
+							broker.handleRequest(operation, { sessionId: "session-b" }, `fresh-${operation}-${state}`),
+						).resolves.toEqual(ambiguousTarget);
+				}
+			});
+		});
+		it("keeps a final legacy key fenced when reused against another session", async () => {
+			for (const operation of nonCreateOperations) {
+				const reusedKey = `reused-${operation}-key`;
+				await withLegacyLedger(
+					async (ledger, agentDir) => {
+						const targetHash = createHash("sha256")
+							.update(JSON.stringify(lifecycleTargetForTest(operation, { sessionId: "session-a" })))
+							.digest("hex");
+						const identity = await deriveLegacyTargetIdentity(agentDir, operation, reusedKey, targetHash);
+						await ledger.begin(identity, `legacy-${operation}-request`, { intendedSessionId: "session-a" });
+						await ledger.transition(identity, "terminal_ok", {
+							resultSessionId: "session-a",
+							response: { ok: true, result: { sessionId: "session-a" } },
+						});
+					},
+					async (broker, root) => {
+						await expect(
+							broker.handleRequest(operation, requestFor(operation, "session-b", root), reusedKey),
+						).resolves.toEqual(ambiguousTarget);
+						if (operation === "session.close")
+							await expect(
+								broker.handleRequest(
+									operation,
+									{ sessionId: "session-b", endpointGeneration: 1, endpointIncarnation: "a".repeat(64) },
+									reusedKey,
+								),
+							).resolves.toEqual(ambiguousTarget);
+						await expect(
+							broker.handleRequest(operation, requestFor(operation, "session-b", root), `fresh-${operation}`),
+						).resolves.not.toEqual(ambiguousTarget);
+					},
+				);
+			}
+		});
+		it("keeps final legacy rows without a recorded session fenced", async () => {
+			await withLegacyLedger(
+				async ledger => {
+					await ledger.begin("legacy-unbound", "legacy-unbound-request");
+					await ledger.transition("legacy-unbound", "terminal_ok", { response: { ok: true, result: {} } });
+				},
+				async (broker, root) => {
+					for (const operation of nonCreateOperations)
+						await expect(
+							broker.handleRequest(operation, requestFor(operation, "session-b", root), `fresh-${operation}`),
+						).resolves.toEqual(ambiguousTarget);
+				},
+			);
+		});
+	});
 	it("replays exact-target terminal legacy creates and expires opaque cross-target key history", async () => {
 		const normalizedCreateInput = (input: Record<string, unknown>): Record<string, unknown> => {
 			const normalized = normalizeBrokerInput("session.create", input);
