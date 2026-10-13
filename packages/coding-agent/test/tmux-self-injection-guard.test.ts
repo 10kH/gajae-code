@@ -992,10 +992,22 @@ describe("tmux self-injection guard", () => {
 				`cat <<'EOF'\n${document}\nEOF`,
 				`bash -c cat <<'EOF'\n${document}\nEOF`,
 				`bash /tmp/script.sh <<'EOF'\n${document}\nEOF`,
+				`bash <<'EOF' < /dev/null\n${document}\nEOF`,
+				`bash -c 'bash </dev/null' <<'EOF'\n${document}\nEOF`,
+				`xargs bash -c bash <<'EOF'\n${document}\nEOF`,
 				`bash 3<<'EOF'\n${document}\nEOF`,
 			]) {
 				await expect(checkTmuxSelfInjection(command, options)).resolves.toEqual({ block: false });
 			}
+		});
+
+		it("uses the last stdin redirection for a shell here-document", async () => {
+			const document = "tmux send-keys -t %47 x";
+			await expect(
+				checkTmuxSelfInjection(`bash < /dev/null <<'EOF'\n${document}\nEOF`, options),
+			).resolves.toMatchObject({
+				block: true,
+			});
 		});
 
 		it("does not confuse xargs input with shell stdin", async () => {
@@ -1005,6 +1017,9 @@ describe("tmux self-injection guard", () => {
 			});
 			await expect(
 				checkTmuxSelfInjection(`xargs -a /dev/null bash <<EOF\n${document}\nEOF`, options),
+			).resolves.toMatchObject({ block: true });
+			await expect(
+				checkTmuxSelfInjection(`xargs -a /dev/null bash -c bash <<EOF\n${document}\nEOF`, options),
 			).resolves.toMatchObject({ block: true });
 		});
 

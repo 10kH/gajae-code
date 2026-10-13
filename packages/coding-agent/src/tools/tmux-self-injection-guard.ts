@@ -184,6 +184,8 @@ interface Token {
 	quoted: boolean;
 	commandStart: boolean;
 	segment: number;
+	stdinRedirectOrder?: number;
+	stdinRedirectSource?: "here-document" | "other";
 	isRedirectionTarget?: boolean;
 	isWrappedCommand?: boolean; // true if this token is the actual command being wrapped by a wrapper like 'command', 'env', 'sudo'
 }
@@ -193,6 +195,7 @@ interface HereDocument {
 	stripTabs: boolean;
 	segment: number;
 	stdin: boolean;
+	redirectOrder: number;
 	body: string;
 }
 
@@ -260,8 +263,10 @@ function tokenize(command: string): TokenizeResult {
 	let redirectionTargetPending = false;
 	let redirectionTargetIsHereDoc = false;
 	let redirectionTargetStripTabs = false;
+	let redirectionTargetIsInput = false;
 	let redirectionTargetFd: number | undefined;
 	let currentTokenIsPendingOperand = false;
+	const stdinRedirects = new Map<number, { order: number; source: "here-document" | "other" }>();
 	const hereDocDelimiters: HereDocument[] = [];
 	let activeHereDoc: HereDocument | undefined;
 	let hereDocLine = "";
@@ -270,6 +275,20 @@ function tokenize(command: string): TokenizeResult {
 		if (text.length === 0 && !quoted) return;
 
 		if (redirectionTargetPending) {
+			let redirectOrder: number | undefined;
+			if (redirectionTargetIsInput && (redirectionTargetFd === undefined || redirectionTargetFd === 0)) {
+				redirectOrder = (stdinRedirects.get(segment)?.order ?? 0) + 1;
+				stdinRedirects.set(segment, {
+					order: redirectOrder,
+					source: redirectionTargetIsHereDoc ? "here-document" : "other",
+				});
+				for (const token of tokens) {
+					if (token.segment === segment && token.commandStart) {
+						token.stdinRedirectOrder = redirectOrder;
+						token.stdinRedirectSource = redirectionTargetIsHereDoc ? "here-document" : "other";
+					}
+				}
+			}
 			tokens.push({ text, quoted, commandStart: false, segment, isRedirectionTarget: true });
 			if (redirectionTargetIsHereDoc) {
 				const hereDocument: HereDocument = {
@@ -277,6 +296,7 @@ function tokenize(command: string): TokenizeResult {
 					stripTabs: redirectionTargetStripTabs,
 					segment,
 					stdin: redirectionTargetFd === undefined || redirectionTargetFd === 0,
+					redirectOrder: redirectOrder ?? 0,
 					body: "",
 				};
 				hereDocDelimiters.push(hereDocument);
@@ -287,6 +307,7 @@ function tokenize(command: string): TokenizeResult {
 			redirectionTargetPending = false;
 			redirectionTargetIsHereDoc = false;
 			redirectionTargetStripTabs = false;
+			redirectionTargetIsInput = false;
 			redirectionTargetFd = undefined;
 			currentTokenIsPendingOperand = false;
 			return;
@@ -444,7 +465,15 @@ function tokenize(command: string): TokenizeResult {
 			}
 		}
 
-		const token: Token = { text, quoted, commandStart, segment, ...(isWrappedCommand && { isWrappedCommand }) };
+		const stdinRedirect = stdinRedirects.get(segment);
+		const token: Token = {
+			text,
+			quoted,
+			commandStart,
+			segment,
+			...(stdinRedirect && { stdinRedirectOrder: stdinRedirect.order, stdinRedirectSource: stdinRedirect.source }),
+			...(isWrappedCommand && { isWrappedCommand }),
+		};
 		tokens.push(token);
 
 		text = "";
@@ -502,6 +531,7 @@ function tokenize(command: string): TokenizeResult {
 			redirectionTargetPending = false;
 			redirectionTargetIsHereDoc = false;
 			redirectionTargetStripTabs = false;
+			redirectionTargetIsInput = false;
 			redirectionTargetFd = undefined;
 			currentTokenIsPendingOperand = false;
 			if (hereDocDelimiters.length > 0) activeHereDoc = hereDocDelimiters.shift();
@@ -520,6 +550,7 @@ function tokenize(command: string): TokenizeResult {
 			redirectionTargetPending = true;
 			redirectionTargetIsHereDoc = false;
 			redirectionTargetStripTabs = false;
+			redirectionTargetIsInput = false;
 			redirectionTargetFd = undefined;
 			continue;
 		}
@@ -539,6 +570,7 @@ function tokenize(command: string): TokenizeResult {
 			redirectionTargetPending = true;
 			redirectionTargetIsHereDoc = isHereDoc;
 			redirectionTargetStripTabs = stripTabs;
+			redirectionTargetIsInput = ch === "<";
 			continue;
 		}
 		if (isSeparator(ch)) {
@@ -551,6 +583,7 @@ function tokenize(command: string): TokenizeResult {
 			redirectionTargetPending = false;
 			redirectionTargetIsHereDoc = false;
 			redirectionTargetStripTabs = false;
+			redirectionTargetIsInput = false;
 			redirectionTargetFd = undefined;
 			currentTokenIsPendingOperand = false;
 			continue;
@@ -1060,7 +1093,8 @@ function collectShellPayloads(tokens: Token[]): string[] {
 	return payloads;
 }
 
-function shellReadsStdin(arguments_: Token[]): boolean {
+function shellReadsStdin(arguments_: Token[], stdinRedirectSource?: "here-document" | "other"): boolean {
+	if (stdinRedirectSource === "other") return false;
 	const optionsWithArgument = new Set(["-O", "-o"]);
 	let skipNextArgument = false;
 	let optionsTerminated = false;
@@ -1180,12 +1214,17 @@ function hasShellStdinConsumer(tokens: Token[], segment: number, depth = 0): boo
 		if (
 			shellIndex !== undefined &&
 			!xargsConsumesStdin(segmentTokens, index, segment) &&
-			shellReadsStdin(shellArguments(segmentTokens, shellIndex, segment))
+			shellReadsStdin(shellArguments(segmentTokens, shellIndex, segment), token.stdinRedirectSource)
 		) {
 			return true;
 		}
 	}
 	if (depth >= MAX_INDIRECTION_DEPTH) return false;
+	for (let index = 0; index < segmentTokens.length; index++) {
+		const token = segmentTokens[index];
+		if (!token.commandStart || shellRunnerIndex(segmentTokens, index, segment) === undefined) continue;
+		if (xargsConsumesStdin(segmentTokens, index, segment) || token.stdinRedirectSource === "other") return false;
+	}
 
 	for (const payload of collectShellPayloads(segmentTokens)) {
 		const nested = tokenize(payload);
@@ -1202,10 +1241,10 @@ function collectShellStdinPayloads(tokens: Token[], hereDocuments: HereDocument[
 	for (let index = 0; index < hereDocuments.length; index++) {
 		const hereDocument = hereDocuments[index];
 		if (!hereDocument.stdin || hereDocument.body.length === 0) continue;
-		if (
-			hereDocuments.slice(index + 1).some(later => later.segment === hereDocument.segment && later.stdin) ||
-			!hasShellStdinConsumer(tokens, hereDocument.segment)
-		) {
+		const commandRedirectOrder = tokens.find(
+			token => token.segment === hereDocument.segment && token.commandStart,
+		)?.stdinRedirectOrder;
+		if (commandRedirectOrder !== hereDocument.redirectOrder || !hasShellStdinConsumer(tokens, hereDocument.segment)) {
 			continue;
 		}
 		payloads.push(hereDocument.body);
