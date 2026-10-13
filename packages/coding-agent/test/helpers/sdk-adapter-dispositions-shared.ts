@@ -531,6 +531,11 @@ export async function assertMcpRow(operation: Operation, secret: boolean): Promi
 		const expected = expectedOutcome("mcp", operation, secret);
 		const before = host.observed.length;
 		const input = inputFor(operation, secret);
+		if (operation.sdkId === "session.cwd.move") {
+			const target = path.join(host.repo, "cwd-move-target");
+			fs.mkdirSync(target);
+			input.path = target;
+		}
 		mcp = createSdkMcpServer({ agentDir: host.agentDir });
 		const tool =
 			operation.kind === "global"
