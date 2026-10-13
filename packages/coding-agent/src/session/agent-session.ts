@@ -10583,13 +10583,9 @@ export class AgentSession {
 			const publicationFailure = Object.assign(new Error("Session disposed before SDK terminal publication."), {
 				code: "cancelled",
 			});
-			// Only reject publications that are not currently being published (PR #6388 deferral).
-			// Deferred publications should be allowed to complete naturally.
-			for (const publication of this.#sdkTerminalPublications.values()) {
-				if (!this.#publishingSdkTerminals.has(publication)) {
-					publication.reject(publicationFailure);
-				}
-			}
+			// Reject every SDK caller even if internal terminal or extension delivery is
+			// already in flight; the publication task can still drain independently.
+			for (const publication of this.#sdkTerminalPublications.values()) publication.reject(publicationFailure);
 			this.#sdkTerminalPublications.clear();
 			// Invalidate every coordinator event admitted before disposal. Handlers may
 			// still unwind, but their captured generation can no longer enqueue a write.
