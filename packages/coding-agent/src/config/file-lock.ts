@@ -131,7 +131,10 @@ const DEFAULT_OPTIONS: Required<
 	retryDelayMs: 100,
 };
 
-const pendingStagingCleanups = new Map<string, string>();
+type FileLockStagingRootIdentity = { rootDev: string; rootIno: string };
+type PendingFileLockStagingCleanup = FileLockStagingRootIdentity & { lockPath: string };
+
+const pendingStagingCleanups = new Map<string, PendingFileLockStagingCleanup>();
 
 /**
  * Windows can transiently deny a no-replace publication while another process holds
@@ -210,21 +213,52 @@ async function sleepFileLockRetry(delayMs: number, signal?: AbortSignal): Promis
 	}
 }
 
-async function removePendingStaging(stagingPath: string): Promise<void> {
+async function captureFileLockStagingRootIdentity(stagingPath: string): Promise<FileLockStagingRootIdentity> {
+	const root = await fs.lstat(stagingPath, { bigint: true });
+	if (!root.isDirectory() || root.isSymbolicLink())
+		throw Object.assign(new Error("Staged file-lock root is not a directory."), { code: "identity_mismatch" });
+	return {
+		rootDev: canonicalLockDeviceId(root.dev).toString(),
+		rootIno: canonicalLockFileId(root.ino).toString(),
+	};
+}
+
+async function removePendingStaging(stagingPath: string, identity: FileLockStagingRootIdentity): Promise<void> {
+	let root: BigIntStats;
+	try {
+		root = await fs.lstat(stagingPath, { bigint: true });
+	} catch (error) {
+		if (isEnoent(error)) return;
+		throw error;
+	}
+	if (
+		!root.isDirectory() ||
+		root.isSymbolicLink() ||
+		canonicalLockDeviceId(root.dev).toString() !== identity.rootDev ||
+		canonicalLockFileId(root.ino).toString() !== identity.rootIno
+	)
+		throw Object.assign(new Error("Staged file-lock root identity changed; refusing removal."), {
+			code: "identity_mismatch",
+		});
 	const cleanup = FileLockTestHooks.cleanupPendingStaging;
 	if (cleanup) await cleanup(stagingPath);
 	else await fs.rm(stagingPath, { recursive: true, force: true });
 }
 
-async function abortStagingCleanup(lockPath: string, stagingPath: string, signal: AbortSignal): Promise<never> {
+async function abortStagingCleanup(
+	lockPath: string,
+	stagingPath: string,
+	identity: FileLockStagingRootIdentity,
+	signal: AbortSignal,
+): Promise<never> {
 	try {
-		await removePendingStaging(stagingPath);
+		await removePendingStaging(stagingPath, identity);
 		pendingStagingCleanups.delete(stagingPath);
 	} catch (error) {
 		// The stage is still owned by this acquisition. Preserve an in-process retry
 		// until another acquisition can clean it; after process exit the orphan reaper
 		// can safely reclaim it once this publisher is no longer live.
-		pendingStagingCleanups.set(stagingPath, lockPath);
+		pendingStagingCleanups.set(stagingPath, { lockPath, ...identity });
 		logger.debug("Retained file-lock staging cleanup after acquisition abort", {
 			stagingPath,
 			error: String(error),
@@ -238,25 +272,27 @@ async function retryPendingStagingCleanups(
 	retryBudget: FileLockAcquisitionRetryBudget,
 ): Promise<void> {
 	const lockKey = await localLockKey(lockPath);
-	for (const [stagingPath, pendingLockPath] of pendingStagingCleanups) {
-		if ((await localLockKey(pendingLockPath)) !== lockKey) continue;
-		await cleanupPendingStagingOrThrow(lockPath, stagingPath, retryBudget);
+	for (const [stagingPath, pending] of pendingStagingCleanups) {
+		if ((await localLockKey(pending.lockPath)) !== lockKey) continue;
+		await cleanupPendingStagingOrThrow(lockPath, stagingPath, pending, retryBudget);
 	}
 }
 
 async function cleanupPendingStagingOrThrow(
 	lockPath: string,
 	stagingPath: string,
+	identity: FileLockStagingRootIdentity,
 	retryBudget: FileLockAcquisitionRetryBudget,
 ): Promise<void> {
 	for (;;) {
-		if (retryBudget.signal?.aborted) await abortStagingCleanup(lockPath, stagingPath, retryBudget.signal);
+		if (retryBudget.signal?.aborted) await abortStagingCleanup(lockPath, stagingPath, identity, retryBudget.signal);
 		try {
-			await removePendingStaging(stagingPath);
+			await removePendingStaging(stagingPath, identity);
 			pendingStagingCleanups.delete(stagingPath);
 			return;
 		} catch (error) {
-			if (retryBudget.signal?.aborted) await abortStagingCleanup(lockPath, stagingPath, retryBudget.signal);
+			if (retryBudget.signal?.aborted)
+				await abortStagingCleanup(lockPath, stagingPath, identity, retryBudget.signal);
 			if (!isTransientReleaseError(error) || retryBudget.remainingDelays === 0)
 				throw new FileLockStagingCleanupError(lockPath, stagingPath, error);
 			// An open child can deny both publication and removal on Windows. Keep the
@@ -266,7 +302,7 @@ async function cleanupPendingStagingOrThrow(
 				await sleepFileLockRetry(retryBudget.retryDelayMs, retryBudget.signal);
 			} catch (abortError) {
 				if (!retryBudget.signal?.aborted) throw abortError;
-				await abortStagingCleanup(lockPath, stagingPath, retryBudget.signal);
+				await abortStagingCleanup(lockPath, stagingPath, identity, retryBudget.signal);
 			}
 		}
 	}
@@ -2205,9 +2241,15 @@ async function tryAcquireLock(
 		: `${lockPath}.pending.${process.pid}.${crypto.randomUUID()}`;
 	const owner = lockInfo(ownerHostId, ownerToken);
 	let removePending = false;
+	let pendingStagingIdentity: FileLockStagingRootIdentity | undefined;
 	try {
 		await fs.mkdir(pendingPath, { mode: 0o700 });
 		removePending = true;
+		try {
+			pendingStagingIdentity = await captureFileLockStagingRootIdentity(pendingPath);
+		} catch (error) {
+			throw new FileLockStagingCleanupError(lockPath, pendingPath, error);
+		}
 		await fs.chmod(pendingPath, 0o700);
 		await writeLockInfo(pendingPath, owner);
 		// A plain POSIX rename replaces an existing empty directory. The legacy
@@ -2321,7 +2363,7 @@ async function tryAcquireLock(
 				return null;
 			} else if (fallbackFailureCode) {
 				removePending = false;
-				await cleanupPendingStagingOrThrow(lockPath, pendingPath, retryBudget);
+				await cleanupPendingStagingOrThrow(lockPath, pendingPath, pendingStagingIdentity, retryBudget);
 				return { kind: "publication_retry", code: fallbackFailureCode };
 			} else {
 				const failure = new Error(
@@ -2338,7 +2380,7 @@ async function tryAcquireLock(
 			const publicationFailureCode = preMutationPublicationFailureCode(published);
 			if (publicationFailureCode) {
 				removePending = false;
-				await cleanupPendingStagingOrThrow(lockPath, pendingPath, retryBudget);
+				await cleanupPendingStagingOrThrow(lockPath, pendingPath, pendingStagingIdentity, retryBudget);
 				return { kind: "publication_retry", code: publicationFailureCode };
 			}
 			const failure = new Error(
@@ -2389,7 +2431,8 @@ async function tryAcquireLock(
 		onAcquired?.();
 		return owner;
 	} finally {
-		if (removePending) await fs.rm(pendingPath, { recursive: true, force: true }).catch(() => undefined);
+		if (removePending && pendingStagingIdentity)
+			await removePendingStaging(pendingPath, pendingStagingIdentity).catch(() => undefined);
 	}
 }
 

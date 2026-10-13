@@ -641,7 +641,7 @@ test("keeps the staging component within filesystem limits for long target names
 	expect(stagingComponentLength).toBeLessThanOrEqual(legacyComponentLength);
 });
 
-test("retries access-denied publication after transient open-child staging cleanup refusal", async () => {
+test("retries access-denied publication after transient staging cleanup refusal", async () => {
 	const { root, file, lock } = await makeFixture();
 	let publicationAttempts = 0;
 	let cleanupAttempts = 0;
@@ -663,13 +663,9 @@ test("retries access-denied publication after transient open-child staging clean
 		cleanupAttempts++;
 		cleanupPaths.push(stagingPath);
 		if (cleanupAttempts === 1) {
-			const removalError = await fs.rm(stagingPath, { recursive: true, force: true }).then(
-				() => undefined,
-				(error: unknown) => error,
-			);
 			await infoHandle?.close();
 			infoHandle = undefined;
-			throw removalError ?? Object.assign(new Error("open child denied staging cleanup"), { code: "EACCES" });
+			throw Object.assign(new Error("transient staging cleanup denial"), { code: "EACCES" });
 		}
 		await fs.rm(stagingPath, { recursive: true, force: true });
 	};
@@ -766,6 +762,20 @@ test("retains staging cleanup ownership after abort and blocks acquisition until
 	expect(cleanupAttempts).toBe(4);
 	expect(publicationAttempts).toBe(expectedBoundedPublicationCalls);
 	expect((await fs.readdir(root)).filter(name => name.includes(".pending."))).toEqual([retainedName]);
+	const originalStagingPath = `${retainedPath}.preserved`;
+	await fs.rename(retainedPath, originalStagingPath);
+	await fs.mkdir(retainedPath);
+	await Bun.write(path.join(retainedPath, "info"), "replacement staging tree");
+	await expect(acquireFileLock(file, { retries: 2, retryDelayMs: 1 })).rejects.toMatchObject({
+		name: "FileLockStagingCleanupError",
+		lockPath: lock,
+		code: "identity_mismatch",
+	});
+	expect(cleanupAttempts).toBe(4);
+	expect(publicationAttempts).toBe(expectedBoundedPublicationCalls);
+	expect(await Bun.file(path.join(retainedPath, "info")).text()).toBe("replacement staging tree");
+	await fs.rm(retainedPath, { recursive: true, force: true });
+	await fs.rename(originalStagingPath, retainedPath);
 
 	FileLockTestHooks.cleanupPendingStaging = async stagingPath => {
 		cleanupAttempts++;
