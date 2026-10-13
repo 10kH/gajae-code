@@ -984,7 +984,7 @@ describe("tmux self-injection guard", () => {
 				`cat <<'EOF' |\nbash\n${script}\nEOF`,
 				`bash -c 'bash 3<<INNER\n:\nINNER\n' <<'OUTER'\n${script}\nOUTER`,
 				`env bash <<'EOF'\n${script}\nEOF`,
-				`env -S bash <<'EOF'\n${script}\nEOF`,
+				`env -S 'bash -s' <<'EOF'\n${script}\nEOF`,
 				`busybox sh <<'EOF'\n${script}\nEOF`,
 			]) {
 				await expect(checkTmuxSelfInjection(command, options)).resolves.toMatchObject({ block: true });
