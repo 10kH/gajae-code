@@ -674,6 +674,46 @@ describe("startup update contract", () => {
 			authStorage.close();
 		}
 	});
+	it("propagates a session-index lock release failure after registration commits", async () => {
+		using tempDir = TempDir.createSync("@gjc-session-index-release-failure-");
+		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		const releaseError = Object.assign(new Error("Failed to release file lock: identity_mismatch."), {
+			code: "identity_mismatch",
+		});
+		const stderr: string[] = [];
+		vi.spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
+			stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+			return true;
+		});
+		const cleanupSpy = vi.spyOn(postmortem, "cleanup").mockResolvedValue(undefined);
+		const originalExitCode = process.exitCode;
+		let registrationCommitted = false;
+		try {
+			process.exitCode = 0;
+			await expect(
+				runRootCommand(rootArgs({ mode: "text", noSession: false }), [], {
+					createSessionManager: async () => SessionManager.inMemory(tempDir.path()),
+					registerDirectSession: async () => {
+						registrationCommitted = true;
+						throw releaseError;
+					},
+					discoverAuthStorage: async () => authStorage,
+					settings: Settings.isolated({ "marketplace.autoUpdate": "off", "startup.checkUpdate": false }),
+					initTheme: async () => {},
+					runStartupCredentialAutoImportIfNeeded: async () => undefined,
+					suppressProcessExit: true,
+				}),
+			).rejects.toBe(releaseError);
+			expect(registrationCommitted).toBe(true);
+			expect(stderr.join("")).toBe("");
+			expect(process.exitCode).toBe(0);
+			expect(cleanupSpy).not.toHaveBeenCalled();
+		} finally {
+			vi.restoreAllMocks();
+			process.exitCode = originalExitCode ?? 0;
+			authStorage.close();
+		}
+	});
 	it("cleans up noninteractive owners when print mode rejects", async () => {
 		using tempDir = TempDir.createSync("@gjc-print-failure-");
 		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));

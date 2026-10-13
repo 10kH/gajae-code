@@ -1725,10 +1725,10 @@ function directSessionIndexLockFailureMessage(error: unknown, agentDir: string):
 			`retry in a few seconds.\nLock: ${error.lockPath}\nCode: ${code}\n${error.message}`
 		);
 	}
-	if (!(error instanceof Error) || !/^Failed to (?:publish|release) file lock:/u.test(error.message)) return undefined;
+	if (!(error instanceof Error) || !/^Failed to publish file lock:/u.test(error.message)) return undefined;
 	const code =
 		(error as NodeJS.ErrnoException).code ??
-		error.message.match(/^Failed to (?:publish|release) file lock: ([a-z0-9_]+)/u)?.[1] ??
+		error.message.match(/^Failed to publish file lock: ([a-z0-9_]+)/u)?.[1] ??
 		"unknown";
 	const lockPath = path.join(agentDir, "sdk", "sessions", "index.jsonl.lock");
 	return (
