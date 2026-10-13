@@ -1060,6 +1060,22 @@ describe("tmux self-injection guard", () => {
 			}
 		});
 
+		it("inspects a here-document script that sources a second here-document", async () => {
+			const command =
+				"bash /dev/fd/3 3<<'OUTER' 4<<'INNER' 5<&4\nsource /dev/fd/5\nOUTER\ntmux send-keys -t %47 x\nINNER";
+			await expect(checkTmuxSelfInjection(command, options)).resolves.toMatchObject({ block: true });
+		});
+
+		it("inspects here-documents duplicated onto shell stdin", async () => {
+			const script = "tmux send-keys -t %47 x";
+			await expect(checkTmuxSelfInjection(`bash -s 3<<'EOF' 0<&3\n${script}\nEOF`, options)).resolves.toMatchObject({
+				block: true,
+			});
+			await expect(
+				checkTmuxSelfInjection(`bash -c 'cat <&0' 3<<'EOF' 0<&3\n${script}\nEOF`, options),
+			).resolves.toEqual({ block: false });
+		});
+
 		it("inspects shell here-strings but not data-only here-strings", async () => {
 			await expect(checkTmuxSelfInjection("bash <<< 'tmux send-keys -t %47 x'", options)).resolves.toMatchObject({
 				block: true,

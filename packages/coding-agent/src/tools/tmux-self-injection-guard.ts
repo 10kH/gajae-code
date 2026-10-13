@@ -205,6 +205,7 @@ interface HereDocument {
 	activeDescriptors: Set<number>;
 	stdin: boolean;
 	redirectOrder: number;
+	stdinRedirectOrders: Set<number>;
 	body: string;
 }
 
@@ -315,6 +316,7 @@ function tokenize(command: string): TokenizeResult {
 					}
 				}
 			}
+			const redirectedHereDocument = activeHereDocuments.get(descriptorKey);
 
 			let redirectOrder: number | undefined;
 			const isIdentityInputDuplication =
@@ -334,7 +336,7 @@ function tokenize(command: string): TokenizeResult {
 						? "here-document"
 						: redirectionTargetIsHereString
 							? "here-string"
-							: "other",
+							: (redirectedHereDocument?.kind ?? "other"),
 				});
 				for (const token of tokens) {
 					if (token.segment === segment && token.commandStart) {
@@ -343,9 +345,10 @@ function tokenize(command: string): TokenizeResult {
 							? "here-document"
 							: redirectionTargetIsHereString
 								? "here-string"
-								: "other";
+								: (redirectedHereDocument?.kind ?? "other");
 					}
 				}
+				if (redirectedHereDocument) redirectedHereDocument.stdinRedirectOrders.add(redirectOrder);
 			}
 			tokens.push({ text, quoted, commandStart: false, segment, pipeline, isRedirectionTarget: true });
 			if (redirectionTargetIsHereDoc || redirectionTargetIsHereString) {
@@ -360,6 +363,7 @@ function tokenize(command: string): TokenizeResult {
 					activeDescriptors: new Set([descriptor]),
 					stdin: redirectionTargetFd === undefined || redirectionTargetFd === 0,
 					redirectOrder: redirectOrder ?? 0,
+					stdinRedirectOrders: new Set(),
 					body: redirectionTargetIsHereString ? text : "",
 				};
 				if (redirectionTargetIsHereDoc) hereDocDelimiters.push(hereDocument);
@@ -1551,6 +1555,7 @@ function collectShellStdinPayloads(
 			? []
 			: collectHereDocumentCommandSubstitutions(joinUnquotedHereDocumentLines(hereDocument.body)),
 	);
+	const executableHereDocuments = new Set<HereDocument>();
 	for (let index = 0; index < hereDocuments.length; index++) {
 		const hereDocument = hereDocuments[index];
 		if (hereDocument.body.length === 0) continue;
@@ -1564,10 +1569,16 @@ function collectShellStdinPayloads(
 			) ||
 			shellPayloadUsesScriptDescriptor(collectShellPayloads(segmentTokens), hereDocument.activeDescriptors, cwd);
 		if (usedAsScript) {
-			payloads.push(hereDocument.body);
+			executableHereDocuments.add(hereDocument);
 			continue;
 		}
-		if (!hereDocument.stdin) continue;
+		if (!hereDocument.stdin) {
+			const consumedAsShellInput = [...hereDocument.stdinRedirectOrders].some(order =>
+				hasShellStdinConsumer(tokens, hereDocument.segment, 0, order),
+			);
+			if (consumedAsShellInput) executableHereDocuments.add(hereDocument);
+			continue;
+		}
 		const commandRedirectOrder = tokens.find(
 			token => token.segment === hereDocument.segment && token.commandStart,
 		)?.stdinRedirectOrder;
@@ -1583,9 +1594,23 @@ function collectShellStdinPayloads(
 				break;
 			}
 		}
-		if (!consumed) continue;
-		payloads.push(hereDocument.body);
+		if (consumed) executableHereDocuments.add(hereDocument);
 	}
+
+	let addedScriptSource = true;
+	while (addedScriptSource) {
+		addedScriptSource = false;
+		for (const scriptDocument of executableHereDocuments) {
+			for (const candidate of hereDocuments) {
+				if (candidate.body.length === 0 || executableHereDocuments.has(candidate)) continue;
+				if (shellPayloadUsesScriptDescriptor([scriptDocument.body], candidate.activeDescriptors, cwd)) {
+					executableHereDocuments.add(candidate);
+					addedScriptSource = true;
+				}
+			}
+		}
+	}
+	for (const hereDocument of executableHereDocuments) payloads.push(hereDocument.body);
 	return payloads;
 }
 
