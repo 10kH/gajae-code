@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
+import * as crypto from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -10,8 +11,9 @@ import {
 	renameNoReplacePathAsync,
 	snapshotDirectoryTree,
 } from "@gajae-code/natives";
+import { registerOwnedDeletionRoot } from "../../../scripts/safe-cleanup";
 
-const tempDirs: string[] = [];
+const tempDirs: { path: string; forget: () => void }[] = [];
 let originalPlatform: PropertyDescriptor | undefined;
 
 beforeEach(() => {
@@ -29,8 +31,27 @@ afterEach(async () => {
 	FileLockTestHooks.nativeQuarantineBindings = undefined;
 	FileLockTestHooks.nativeExactRemovalProbe = undefined;
 	if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
-	for (const dir of tempDirs.splice(0)) await fs.rm(dir, { recursive: true, force: true });
+	for (const { path: dir, forget } of tempDirs.splice(0)) {
+		try {
+			await fs.rm(dir, { recursive: true, force: true });
+		} finally {
+			forget();
+		}
+	}
 });
+
+async function createTempDir(): Promise<string> {
+	const dir = path.join(os.tmpdir(), `file-lock-empty-dir-${crypto.randomUUID()}`);
+	const forget = registerOwnedDeletionRoot(dir);
+	try {
+		await fs.mkdir(dir, { mode: 0o700 });
+	} catch (error) {
+		forget();
+		throw error;
+	}
+	tempDirs.push({ path: dir, forget });
+	return dir;
+}
 
 async function writeRemovalOwnerRecord(
 	transitionPath: string,
@@ -45,8 +66,7 @@ async function writeRemovalOwnerRecord(
 }
 
 test("reclaims an aged ownerless Windows session-index lock on the final configured attempt", async () => {
-	const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "file-lock-empty-dir-"));
-	tempDirs.push(tempDir);
+	const tempDir = await createTempDir();
 	const filePath = path.join(tempDir, "sdk", "sessions", "index.jsonl");
 	const lockDir = `${filePath}.lock`;
 	await fs.mkdir(lockDir, { recursive: true });
@@ -72,8 +92,7 @@ test("reclaims an aged ownerless Windows session-index lock on the final configu
 });
 
 test("publishes a Windows retirement owner record before native detach", async () => {
-	const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "file-lock-empty-dir-"));
-	tempDirs.push(tempDir);
+	const tempDir = await createTempDir();
 	const filePath = path.join(tempDir, "sdk", "sessions", "index.jsonl");
 	const lockDir = `${filePath}.lock`;
 	let ownerRecordPublishedBeforeDetach = false;
@@ -106,8 +125,7 @@ test("publishes a Windows retirement owner record before native detach", async (
 });
 
 test("does not reclaim a fresh ownerless lock directory", async () => {
-	const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "file-lock-empty-dir-"));
-	tempDirs.push(tempDir);
+	const tempDir = await createTempDir();
 	const filePath = path.join(tempDir, "sdk", "sessions", "index.jsonl");
 	const lockDir = `${filePath}.lock`;
 	await fs.mkdir(lockDir, { recursive: true });
@@ -119,8 +137,7 @@ test("does not reclaim a fresh ownerless lock directory", async () => {
 });
 
 test("adopts a detached Windows retirement before publishing a successor", async () => {
-	const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "file-lock-empty-dir-"));
-	tempDirs.push(tempDir);
+	const tempDir = await createTempDir();
 	const filePath = path.join(tempDir, "sdk", "sessions", "index.jsonl");
 	const lockDir = `${filePath}.lock`;
 	const transitionPath = `${lockDir}.removing`;
@@ -152,8 +169,7 @@ test("adopts a detached Windows retirement before publishing a successor", async
 });
 
 test("does not publish while a live Windows retirement remains", async () => {
-	const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "file-lock-empty-dir-"));
-	tempDirs.push(tempDir);
+	const tempDir = await createTempDir();
 	const filePath = path.join(tempDir, "sdk", "sessions", "index.jsonl");
 	const lockDir = `${filePath}.lock`;
 	const transitionPath = `${lockDir}.removing`;
@@ -183,8 +199,7 @@ test("does not publish while a live Windows retirement remains", async () => {
 });
 
 test("clears a completed Windows retirement record before a successor", async () => {
-	const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "file-lock-empty-dir-"));
-	tempDirs.push(tempDir);
+	const tempDir = await createTempDir();
 	const filePath = path.join(tempDir, "sdk", "sessions", "index.jsonl");
 	const lockDir = `${filePath}.lock`;
 	const transitionPath = `${lockDir}.removing`;
@@ -216,8 +231,7 @@ test("clears a completed Windows retirement record before a successor", async ()
 });
 
 test("retries a completed local retirement record before same-process reacquisition", async () => {
-	const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "file-lock-empty-dir-"));
-	tempDirs.push(tempDir);
+	const tempDir = await createTempDir();
 	const filePath = path.join(tempDir, "sdk", "sessions", "index.jsonl");
 	const lockDir = `${filePath}.lock`;
 	let refuseUnlink = true;
@@ -261,8 +275,7 @@ test("retries a completed local retirement record before same-process reacquisit
 });
 
 test("resumes an ownerless detached cleanup after a transient cleanup refusal", async () => {
-	const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "file-lock-empty-dir-"));
-	tempDirs.push(tempDir);
+	const tempDir = await createTempDir();
 	const filePath = path.join(tempDir, "sdk", "sessions", "index.jsonl");
 	const lockDir = `${filePath}.lock`;
 	const transitionPath = `${lockDir}.removing`;
@@ -312,8 +325,7 @@ test("resumes an ownerless detached cleanup after a transient cleanup refusal", 
 });
 
 test("rolls back a Windows publication when retirement appears before owner registration", async () => {
-	const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "file-lock-empty-dir-"));
-	tempDirs.push(tempDir);
+	const tempDir = await createTempDir();
 	const filePath = path.join(tempDir, "sdk", "sessions", "index.jsonl");
 	const lockDir = `${filePath}.lock`;
 	const transitionPath = `${lockDir}.removing`;
@@ -340,8 +352,7 @@ test("rolls back a Windows publication when retirement appears before owner regi
 });
 
 test("fails closed on an oversized Windows retirement owner sidecar", async () => {
-	const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "file-lock-empty-dir-"));
-	tempDirs.push(tempDir);
+	const tempDir = await createTempDir();
 	const filePath = path.join(tempDir, "sdk", "sessions", "index.jsonl");
 	const recordPath = `${filePath}.lock.removing.owner`;
 	await fs.mkdir(path.dirname(recordPath), { recursive: true });
@@ -356,8 +367,7 @@ test("fails closed on an oversized Windows retirement owner sidecar", async () =
 
 test.skipIf(process.platform === "win32")("does not reclaim an aged ownerless lock directory on POSIX", async () => {
 	if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
-	const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "file-lock-empty-dir-"));
-	tempDirs.push(tempDir);
+	const tempDir = await createTempDir();
 	const filePath = path.join(tempDir, "sdk", "sessions", "index.jsonl");
 	const lockDir = `${filePath}.lock`;
 	await fs.mkdir(lockDir, { recursive: true });
@@ -371,8 +381,7 @@ test.skipIf(process.platform === "win32")("does not reclaim an aged ownerless lo
 });
 
 test("preserves a lock record published after the empty-directory stale verdict", async () => {
-	const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "file-lock-empty-dir-"));
-	tempDirs.push(tempDir);
+	const tempDir = await createTempDir();
 	const filePath = path.join(tempDir, "sdk", "sessions", "index.jsonl");
 	const lockDir = `${filePath}.lock`;
 	await fs.mkdir(lockDir, { recursive: true });
