@@ -107,6 +107,18 @@ describe("MCP command quarantine", () => {
 		}
 	});
 
+	test("rejects method-style MCP handler parameters with pre-guard defaults", () => {
+		const exposed = registryWithEntries([
+			exactMcpTuiEntry.replace(
+				"handleTui: async (command, runtime) => {",
+				"async handleTui(command, runtime = runMcpControl()) {",
+			),
+		]);
+		expect(findMcpBuiltinQuarantineFindings(exposed)).toContain(
+			"root /mcp TUI handler parameters must be command and runtime identifiers",
+		);
+	});
+
 	test("rejects a default handler even when a TUI guard is also present", () => {
 		const exposed = registryWithEntries([
 			exactMcpTuiEntry.replace(
