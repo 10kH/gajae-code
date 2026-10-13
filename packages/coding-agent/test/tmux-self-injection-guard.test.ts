@@ -991,6 +991,12 @@ describe("tmux self-injection guard", () => {
 			}
 		});
 
+		it("does not treat a pipe in a shell comment as a continued pipeline", async () => {
+			await expect(
+				checkTmuxSelfInjection("cat <<'EOF' # |\nEOF\ntmux send-keys -t %47 x", options),
+			).resolves.toMatchObject({ block: true });
+		});
+
 		it("keeps here-document data and non-stdin redirects out of shell analysis", async () => {
 			const document = "tmux send-keys -t %47 x";
 			for (const command of [

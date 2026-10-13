@@ -273,6 +273,8 @@ function tokenize(command: string): TokenizeResult {
 	const hereDocDelimiters: HereDocument[] = [];
 	let activeHereDoc: HereDocument | undefined;
 	let hereDocLine = "";
+	let inComment = false;
+	let commandContinuesAfterLineBreak = false;
 
 	const flush = () => {
 		if (text.length === 0 && !quoted) return;
@@ -502,6 +504,10 @@ function tokenize(command: string): TokenizeResult {
 			}
 			continue;
 		}
+		if (inComment) {
+			if (ch !== "\n") continue;
+			inComment = false;
+		}
 		if (quote !== undefined) {
 			if (ch === quote) {
 				quote = undefined;
@@ -515,22 +521,22 @@ function tokenize(command: string): TokenizeResult {
 			continue;
 		}
 		if (ch === "'" || ch === '"') {
+			commandContinuesAfterLineBreak = false;
 			if (text.length === 0 && !quoted && skipNextArg) currentTokenIsPendingOperand = true;
 			quote = ch;
 			quoted = true;
 			continue;
 		}
 		if (ch === "\\" && index + 1 < command.length) {
+			commandContinuesAfterLineBreak = false;
 			if (text.length === 0 && !quoted && skipNextArg) currentTokenIsPendingOperand = true;
 			text += command[++index];
 			quoted = true;
 			continue;
 		}
 		if (ch === "\n") {
-			const previousLine = command.slice(0, index).trimEnd();
-			if (previousLine.endsWith("|") || (previousLine.endsWith("&") && previousLine.at(-2) === "&")) {
-				continue;
-			}
+			if (commandContinuesAfterLineBreak) continue;
+			commandContinuesAfterLineBreak = false;
 			flush();
 			segment++;
 			pipeline++;
@@ -552,6 +558,7 @@ function tokenize(command: string): TokenizeResult {
 			continue;
 		}
 		if (ch === "&" && command[index + 1] === ">") {
+			commandContinuesAfterLineBreak = false;
 			if (/^\d+$/.test(text)) text = "";
 			else flush();
 			index++;
@@ -565,6 +572,7 @@ function tokenize(command: string): TokenizeResult {
 			continue;
 		}
 		if (ch === "<" || ch === ">") {
+			commandContinuesAfterLineBreak = false;
 			if (/^\d+$/.test(text)) {
 				redirectionTargetFd = Number(text);
 				text = "";
@@ -584,9 +592,16 @@ function tokenize(command: string): TokenizeResult {
 			continue;
 		}
 		if (isSeparator(ch)) {
+			commandContinuesAfterLineBreak =
+				ch === "|" || (ch === "&" && (command[index - 1] === "&" || command[index - 1] === "|"));
 			flush();
 			segment++;
-			if (ch !== "|" || command[index - 1] === "|") pipeline++;
+			if (
+				(ch !== "|" && !(ch === "&" && command[index - 1] === "|")) ||
+				(ch === "|" && command[index - 1] === "|")
+			) {
+				pipeline++;
+			}
 			atCommandStart = true;
 			wrapperCommand = undefined;
 			skipNextArg = false;
@@ -599,7 +614,12 @@ function tokenize(command: string): TokenizeResult {
 			currentTokenIsPendingOperand = false;
 			continue;
 		}
+		if (ch === "#" && text.length === 0 && !quoted) {
+			inComment = true;
+			continue;
+		}
 
+		commandContinuesAfterLineBreak = false;
 		if (text.length === 0 && !quoted && skipNextArg) currentTokenIsPendingOperand = true;
 		text += ch;
 	}
