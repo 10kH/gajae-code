@@ -27619,7 +27619,7 @@ export class AgentSession {
 		let ownerShutdownManager: AsyncJobManager | undefined;
 		let ownerShutdownLease: OwnerSubagentShutdownLease | undefined;
 		let ownerShutdownTransitionCommitted = false;
-		let ownerShutdownRollbackCompleted = false;
+		let ownerShutdownCanDrainResumes = false;
 		let ownerShutdownFinalizationDeferred = false;
 		this.#beginSessionTransition("switch-session");
 		try {
@@ -27658,6 +27658,8 @@ export class AgentSession {
 			if (lease && asyncManager) {
 				ownerShutdownManager = asyncManager;
 				ownerShutdownLease = lease;
+				// Early failures leave the predecessor live, so releasing its fence may drain resumes.
+				ownerShutdownCanDrainResumes = true;
 			}
 			await this.abort();
 			if (this.isCompacting) {
@@ -27711,6 +27713,8 @@ export class AgentSession {
 			const previousActiveAttemptScope = this.#activeAttemptScope;
 			const previousActiveLogicalRunId = this.#activeLogicalRunId;
 
+			// Once session state starts changing, resumes are safe only after rollback completes.
+			ownerShutdownCanDrainResumes = false;
 			this.#steeringMessages = [];
 			this.#followUpMessages = [];
 			this.#pendingNextTurnMessages = [];
@@ -28199,7 +28203,7 @@ export class AgentSession {
 					}
 					throw new AggregateError([error, rollbackErrors[0]], "Session switch rollback failed");
 				}
-				ownerShutdownRollbackCompleted = true;
+				ownerShutdownCanDrainResumes = true;
 				if (unavailableDefaultChainMessage) {
 					this.emitNotice(
 						"error",
@@ -28216,7 +28220,7 @@ export class AgentSession {
 					ownerShutdownManager.finishOwnerSubagentShutdown(ownerShutdownLease, "commit");
 				} else {
 					ownerShutdownManager.finishOwnerSubagentShutdown(ownerShutdownLease, "release", {
-						drainResumeQueue: ownerShutdownRollbackCompleted && !this.#isDisposed,
+						drainResumeQueue: ownerShutdownCanDrainResumes && !this.#isDisposed,
 					});
 				}
 			}
