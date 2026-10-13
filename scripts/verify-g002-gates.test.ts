@@ -94,6 +94,7 @@ describe("MCP command quarantine", () => {
 		for (const signature of [
 			"async (command, runtime, _unused = runMcpControl()) => {",
 			"async (command, runtime = runMcpControl()) => {",
+			"async (command = runMcpControl(), runtime) => {",
 			"async ({ text: command }, runtime) => {",
 			"async (command, ...runtime) => {",
 		]) {
