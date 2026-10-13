@@ -1135,6 +1135,15 @@ export class EventController {
 		}
 		this.ctx.updateEditorBorderColor();
 		const isHandoffAction = event.action === "handoff";
+		if (isHandoffAction && this.ctx.session.hasExactMcpControls === false) {
+			try {
+				await this.ctx.refreshSlashCommandState();
+			} catch (error) {
+				logger.warn("Failed to refresh slash-command state after automatic handoff", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
 		const continuationDisabled = event.continuationSkipReason === "auto_continue_disabled_non_resumable_tail";
 		if (event.aborted) {
 			this.ctx.showStatus(isHandoffAction ? "Auto-handoff cancelled" : "Auto context-full maintenance cancelled");
