@@ -14,6 +14,7 @@ const INPUT_VERBS = new Set(["send-keys", "paste-buffer", "send-prefix"]);
 const SHELL_RUNNERS = new Set(["sh", "bash", "dash", "zsh", "ksh", "busybox"]);
 const COMMAND_WRAPPERS = new Set(["eval", "exec", "command", "builtin", "nohup", "time"]);
 const BUILTIN_COMMAND_WRAPPERS = new Set(["command", "eval", "exec"]);
+const NON_EXECUTING_SUDO_OPTIONS = new Set(["-l", "--list", "-v", "--validate", "-V", "--version"]);
 const ASSIGNMENT_AWARE_WRAPPERS = new Set(["env", "sudo"]); // Only these allow VAR=value at start
 const CONTROL_WORDS = new Set(["then", "do", "else", "fi", "done", "esac"]);
 const MAX_INDIRECTION_DEPTH = 4;
@@ -217,6 +218,13 @@ function tokenize(command: string): Token[] {
 			if (text.startsWith("-") && !isNegativeNumber(text)) {
 				// This is an option (but not a negative number like -5)
 				// Don't touch skipNextArg yet; it will be consumed by the next argument
+				if (wrapperCommand?.name === "sudo" && NON_EXECUTING_SUDO_OPTIONS.has(text)) {
+					// These sudo modes list, validate, or report version information; they
+					// never execute the following command-looking words.
+					wrapperCommand = undefined;
+					skipNextArg = false;
+					positionalsPending = 0;
+				}
 			} else if (skipNextArg) {
 				// This is an argument to an option (e.g., -n 5 or -n -5)
 				// Skip it regardless of whether it looks like an option

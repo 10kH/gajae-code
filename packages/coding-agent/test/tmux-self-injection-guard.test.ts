@@ -237,6 +237,14 @@ describe("tmux self-injection guard", () => {
 			});
 		});
 
+		it("allows sudo listing, validation, and version modes without treating arguments as commands", async () => {
+			for (const option of ["-l", "--list", "-v", "--validate", "-V", "--version"]) {
+				await expect(checkTmuxSelfInjection(`sudo ${option} tmux send-keys -t %47 x`, options)).resolves.toEqual({
+					block: false,
+				});
+			}
+		});
+
 		it("allows builtin with an external executable name", async () => {
 			await expect(checkTmuxSelfInjection("builtin tmux send-keys -t %47 x", options)).resolves.toEqual({
 				block: false,
