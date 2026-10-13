@@ -600,6 +600,11 @@ export async function assertDaemonCliRow(operation: Operation, secret: boolean):
 		const input =
 			lifecycleInput ??
 			(operation.sdkId === "session.get_endpoint" ? { sessionId: host.sessionId } : inputFor(operation, secret));
+		if (operation.sdkId === "session.cwd.move") {
+			const target = path.join(host.repo, "cwd-move-target");
+			fs.mkdirSync(target);
+			input.path = target;
+		}
 		const action = operation.kind === "global" ? "global" : operation.kind === "query" ? "query" : "control";
 		const args = {
 			action,
