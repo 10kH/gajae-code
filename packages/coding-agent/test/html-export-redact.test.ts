@@ -32,7 +32,7 @@ describe("session HTML export embed", () => {
 			session = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
 			session.appendMessage({
 				role: "user",
-				content: `${ORDINARY_SENTENCE} ${API_KEY} ${GITHUB_TOKEN} private_token=abc123 AWS_SECRET_ACCESS_KEY=x`,
+				content: `${ORDINARY_SENTENCE} ${API_KEY} ${GITHUB_TOKEN} private_token=abc123 AWS_SECRET_ACCESS_KEY=x password="correct horse battery" authorization="Bearer abc"`,
 				timestamp: 1,
 			});
 			const outputPath = path.join(tempDir, "export.html");
@@ -49,6 +49,8 @@ describe("session HTML export embed", () => {
 			expect(embedded).not.toContain(GITHUB_TOKEN);
 			expect(embedded).not.toContain("private_token=abc123");
 			expect(embedded).not.toContain("AWS_SECRET_ACCESS_KEY=x");
+			expect(embedded).not.toContain("correct horse battery");
+			expect(embedded).not.toContain("Bearer abc");
 			expect(embedded).toContain("«redacted-api-key»");
 			expect(embedded).toContain("«redacted-github-token»");
 			expect(embedded).toContain(ORDINARY_SENTENCE);

@@ -1,3 +1,3 @@
 ### Fixed
 
-- Session HTML export masks credential-shaped text and opaque values stored under whole sensitive JSON keys, including `token`, `secret`, `credential`, `private_key`, `private_token`, `AWS_SECRET_ACCESS_KEY`, and `cookie`, before base64 encoding while preserving ordinary names such as `tokensBefore`, `maxTokens`, and `token_budget`.
+- Session HTML export masks credential-shaped text and full quoted values under whole sensitive JSON keys, including `token`, `secret`, `credential`, `private_key`, `private_token`, `AWS_SECRET_ACCESS_KEY`, and `cookie`, before base64 encoding while preserving ordinary names such as `tokensBefore`, `maxTokens`, and `token_budget`.

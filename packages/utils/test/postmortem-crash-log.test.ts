@@ -214,6 +214,21 @@ describe("recordFatalCrash", () => {
 		for (const field of labeled.split(" ")) expect(contents).not.toContain(field);
 	});
 
+	it("redacts full quoted credential values that contain spaces", () => {
+		const target = tempCrashLog();
+		const message =
+			'diagnostic safe=keep-this password="correct horse battery" authorization="Bearer abc" note=keep-this';
+
+		recordFatalCrash("Uncaught Exception", new Error(message), { path: target });
+
+		const contents = fs.readFileSync(target, "utf8");
+		expect(contents).not.toContain("correct horse battery");
+		expect(contents).not.toContain("Bearer abc");
+		expect(contents).toContain('password="«redacted»"');
+		expect(contents).toContain('authorization="«redacted»"');
+		expect(contents).toContain("note=keep-this");
+	});
+
 	it("preserves credential lookalikes outside the supported token boundaries", () => {
 		const target = tempCrashLog();
 		const lookalikes = [
