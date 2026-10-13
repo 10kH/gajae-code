@@ -99,13 +99,13 @@ async function writeGh(binDir: string, source: string): Promise<void> {
 	await Bun.write(
 		gh,
 		`#!/usr/bin/env -S ${process.execPath} --no-env-file
-import { appendFile } from "node:fs/promises";
+import * as fsPromises from "node:fs/promises";
 const record = process.env.GJC_SHARE_GH_RECORD;
 if (!record) {
-	console.error("missing share record");
+	process.stderr.write("missing share record\\n");
 	process.exit(2);
 }
-await appendFile(
+await fsPromises.appendFile(
 	record,
 	JSON.stringify({
 		args: process.argv.slice(2),

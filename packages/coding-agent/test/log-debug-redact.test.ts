@@ -223,6 +223,31 @@ describe("debug log credential scrub", () => {
 		}
 	});
 
+	it("scrubs username-only credentials from marketplace clone URLs", async () => {
+		const cacheDir = await fs.mkdtemp(path.join(os.tmpdir(), "mkt-log-"));
+		const clone = vi.spyOn(git, "clone").mockRejectedValue(new Error("clone stopped"));
+		const debug = vi.spyOn(logger, "debug");
+		const sources = [
+			"https://opaque-token-1234@git.invalid/repo.git",
+			"https://opaque-token-5678:@git.invalid/repo.git",
+		];
+		try {
+			for (const source of sources) {
+				debug.mockClear();
+				clone.mockClear();
+				await expect(fetchMarketplace(source, cacheDir)).rejects.toThrow(/clone stopped/);
+
+				const logged = loggedText(debug.mock.calls);
+				expect(logged).not.toContain("opaque-token-");
+				expect(logged).toContain("«redacted-url-credential»");
+				expect(logged).toContain("git.invalid");
+				expect(clone.mock.calls[0]?.[0]).toBe(source);
+			}
+		} finally {
+			await fs.rm(cacheDir, { recursive: true, force: true });
+		}
+	});
+
 	it("keeps a credential-free git URL in the marketplace debug log", async () => {
 		const cacheDir = await fs.mkdtemp(path.join(os.tmpdir(), "mkt-log-"));
 		try {

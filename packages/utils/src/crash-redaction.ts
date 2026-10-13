@@ -54,7 +54,7 @@ export function redactCrashSecrets(text: string): string {
 	// literal `://` re-tries every prefix of a long alphabetic run, which is
 	// quadratic in input length and costs ~10s on a 200 KB crash body.
 	redacted = redacted.replace(
-		/(?<![A-Za-z0-9+.-])([a-z][a-z0-9+.-]{0,15}:\/\/)[^/\s:@]{1,256}:[^/\s@]{1,256}@/gi,
+		/(?<![A-Za-z0-9+.-])([a-z][a-z0-9+.-]{0,15}:\/\/)[^/\s:@]{1,256}(?::[^/\s@]*)?@/gi,
 		"$1«redacted-url-credential»@",
 	);
 	// AKIA is the long-term access key id; ASIA is the temporary/STS one, which is
