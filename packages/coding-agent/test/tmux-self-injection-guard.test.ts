@@ -589,15 +589,7 @@ describe("tmux self-injection guard", () => {
 		});
 	});
 
-	// Regression tests for socket override through wrapper assignments (issue #6564-6)
-	// Note: These tests are complex and require careful token ordering
-	// TODO: implement full TMUX assignment traversal through wrapper assignments
 	describe("regression: socket override through wrapper assignments (issue #6564-6)", () => {
-		// TODO: Socket override with TMUX assignments before wrappers requires
-		// fixing tokenizer to properly preserve assignment tokens in backtracking.
-		// Currently, assignments are tokenized with commandStart=true, making them
-		// appear as command boundaries during backtracking.
-		/*
 		it("should allow TMUX assignment before wrapper to override socket", async () => {
 			// Issue: TMUX=/tmp/other env FOO=x tmux send-keys -t %47 x
 			// Should NOT block because TMUX=/tmp/other points to a different socket
@@ -615,7 +607,6 @@ describe("tmux self-injection guard", () => {
 				block: false,
 			});
 		});
-		*/
 	});
 
 	// Regression tests for command -v lookup boundary (issue #6564-1)
