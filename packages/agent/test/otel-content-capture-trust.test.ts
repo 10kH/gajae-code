@@ -102,6 +102,15 @@ describe("GenAI content capture project dotenv trust", () => {
 		expect(captured.requestMessages).toContain(CANARY);
 	});
 
+	it("does not let project .env downgrade trusted full capture", async () => {
+		const cwd = await tempDir();
+		const captured = await captureIn(cwd, `${ENV_NAME}=summary\n`, {}, `${ENV_NAME}=full\n`);
+		expect(captured.spanFound).toBe(true);
+		expect(captured.envValue).toBe("summary");
+		expect(captured.inputMessages).toContain(CANARY);
+		expect(captured.warnings).toContain("full_content_capture_env_active");
+	});
+
 	it("honors an operator downgrade to false before the first capture read", async () => {
 		const cwd = await tempDir();
 		const captured = await captureIn(cwd, "OTHER=1\n", {
