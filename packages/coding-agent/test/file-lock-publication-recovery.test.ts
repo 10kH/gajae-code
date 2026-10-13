@@ -426,6 +426,26 @@ test("retries a transient pre-mutation access denial and publishes the file lock
 	expect(await fs.readdir(root)).toEqual([]);
 });
 
+test("does not retry access-denied receipts without Windows rename provenance", async () => {
+	const { root, file, lock } = await makeFixture();
+	let attempts = 0;
+	FileLockTestHooks.nativePublicationBindings = () => ({
+		renameNoReplacePathAsync: async () => {
+			attempts++;
+			return { ...accessDeniedPublication(), primitive: "renameat2_noreplace" };
+		},
+		renameDirectoryNoReplacePathAsync,
+	});
+
+	await expect(withFileLock(file, async () => "entered", quickAcquire)).rejects.toMatchObject({
+		message: "Failed to publish file lock: access_denied.",
+		code: "access_denied",
+	});
+	expect(attempts).toBe(1);
+	await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
+	expect(await fs.readdir(root)).toEqual([]);
+});
+
 test("briefly retries access-denied publication and preserves persistent ACL errors", async () => {
 	const { root, file, lock } = await makeFixture();
 	let attempts = 0;
