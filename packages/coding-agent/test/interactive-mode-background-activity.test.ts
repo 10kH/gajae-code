@@ -29,10 +29,10 @@ import { logger, postmortem, TempDir } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal";
 import { FileLockTestHooks } from "../src/config/file-lock";
+import type { FileSlashCommand } from "../src/extensibility/slash-commands";
+import * as slashCommands from "../src/extensibility/slash-commands";
 import { ExtensionUiController } from "../src/modes/controllers/extension-ui-controller";
 import { SelectorController } from "../src/modes/controllers/selector-controller";
-import * as slashCommands from "../src/extensibility/slash-commands";
-import type { FileSlashCommand } from "../src/extensibility/slash-commands";
 
 async function waitFor(predicate: () => boolean): Promise<void> {
 	for (let attempt = 0; attempt < 100; attempt++) {
