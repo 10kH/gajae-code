@@ -186,6 +186,23 @@ function commandName(text: string): string {
 	return separator < 0 ? text : text.slice(separator + 1);
 }
 
+function wrapperOptionTakesNextArgument(wrapper: { name: string; spec: WrapperSpec }, option: string): boolean {
+	if (isLongOption(option)) {
+		const baseOption = option.split("=")[0];
+		if (option.includes("=")) return false;
+		const wrapperOptions = WRAPPER_LONG_OPTIONS[wrapper.name];
+		if (wrapperOptions && baseOption in wrapperOptions) return wrapperOptions[baseOption];
+		return LONG_OPTIONS_WITH_ARG.has(baseOption);
+	}
+
+	for (let index = 1; index < option.length; index++) {
+		const shortOption = `-${option[index]}`;
+		const flagOnly = wrapper.spec.flagOnlyOptions?.has(shortOption) ?? false;
+		if (!flagOnly && wrapper.spec.optionsWithArg.has(shortOption)) return index === option.length - 1;
+	}
+	return false;
+}
+
 /** Small quote-aware lexer. Unknown shell syntax is represented conservatively. */
 function tokenize(command: string): Token[] {
 	const tokens: Token[] = [];
@@ -283,6 +300,8 @@ function tokenize(command: string): Token[] {
 					wrapperCommand = undefined;
 					skipNextArg = false;
 					positionalsPending = 0;
+				} else if (wrapperCommand) {
+					skipNextArg = wrapperOptionTakesNextArgument(wrapperCommand, text);
 				}
 			} else if (skipNextArg) {
 				// This is an argument to an option (e.g., -n 5 or -n -5)
@@ -439,54 +458,6 @@ function tokenize(command: string): Token[] {
 
 		if (text.length === 0 && !quoted && skipNextArg) currentTokenIsPendingOperand = true;
 		text += ch;
-
-		// After building a token, check if it's an option that needs an argument
-		// Skip negative numbers (e.g., -5 for nice -n -5)
-		if (!atCommandStart && wrapperCommand && !skipNextArg && text.startsWith("-") && !isNegativeNumber(text)) {
-			const nextChar = command[index + 1];
-			if (!nextChar || /\s/.test(nextChar) || isSeparator(nextChar)) {
-				// This option is complete; check if it takes an argument
-				skipNextArg = false; // Reset default
-
-				// Handle long options (--*)
-				if (isLongOption(text)) {
-					const baseLongOption = text.split("=")[0];
-					const hasEqualValue = text.includes("=");
-
-					// Check wrapper-specific long options
-					const wrapperLongOpts = WRAPPER_LONG_OPTIONS[wrapperCommand.name];
-					if (wrapperLongOpts) {
-						if (baseLongOption in wrapperLongOpts) {
-							const takesArg = wrapperLongOpts[baseLongOption];
-							if (takesArg && !hasEqualValue) {
-								skipNextArg = true; // Takes separate argument
-							}
-						} else if (LONG_OPTIONS_WITH_ARG.has(baseLongOption) && !hasEqualValue) {
-							skipNextArg = true;
-						}
-					}
-				} else {
-					// Handle short options (including bundles like -iu)
-					// Process each character in the bundle
-					for (let i = 1; i < text.length; i++) {
-						const opt = text[i];
-						const shortOpt = `-${opt}`;
-
-						// Check if this short option takes an argument
-						const isFlagOnly = wrapperCommand.spec.flagOnlyOptions?.has(shortOpt) ?? false;
-						const takesArg = !isFlagOnly && wrapperCommand.spec.optionsWithArg.has(shortOpt);
-
-						if (takesArg) {
-							// If this is the last character in the bundle, the next arg is its operand
-							if (i === text.length - 1) {
-								skipNextArg = true;
-							}
-							break; // Stop processing further chars after an option with arg
-						}
-					}
-				}
-			}
-		}
 	}
 	flush();
 	return tokens;

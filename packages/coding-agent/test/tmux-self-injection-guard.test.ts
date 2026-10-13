@@ -246,6 +246,17 @@ describe("tmux self-injection guard", () => {
 			});
 		});
 
+		it("preserves quoted wrapper-option operands", async () => {
+			for (const [command, block] of [
+				["env '-u' tmux send-keys -t %47 x", false],
+				["env '-u' FOO tmux send-keys -t %47 x", true],
+				["sudo '-u' tmux send-keys -t %47 x", false],
+				["sudo '-u' root tmux send-keys -t %47 x", true],
+			] as const) {
+				await expect(checkTmuxSelfInjection(command, options)).resolves.toMatchObject({ block });
+			}
+		});
+
 		it("should allow sudo -u tmux where tmux is a user name", async () => {
 			await expect(checkTmuxSelfInjection("sudo -u tmux send-keys -t %47 x", options)).resolves.toEqual({
 				block: false,
