@@ -1433,4 +1433,98 @@ describe("AgentSession message pipeline", () => {
 		await session.waitForIdle();
 		expect(sdkAgentEnds).toHaveLength(1);
 	});
+
+	it("serializes a batched SDK terminal publication through the earlier extension delivery", async () => {
+		const firstExtensionStarted = Promise.withResolvers<void>();
+		const releaseFirstExtension = Promise.withResolvers<void>();
+		const secondExtensionStarted = Promise.withResolvers<void>();
+		const releaseSecondExtension = Promise.withResolvers<void>();
+		let extensionPublicationCount = 0;
+		const model: Model = {
+			id: "batched-sdk-terminal-model",
+			name: "batched-sdk-terminal-model",
+			provider: "mock",
+			api: "mock",
+			baseUrl: "mock://",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200_000,
+			maxTokens: 32_768,
+		};
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["system prompt"], messages: [], tools: [] },
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: createAssistantMessage("") });
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("test") });
+				});
+				return stream;
+			},
+		});
+		const session = new AgentSession({
+			agent,
+			sessionManager: createIsolatedSessionManager(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: testModelRegistry as never,
+			extensionRunner: {
+				emitBeforeAgentStart: async () => ({}),
+				emit: async (event: { type: string }) => {
+					if (event.type !== "agent_end") return;
+					extensionPublicationCount++;
+					if (extensionPublicationCount === 1) {
+						firstExtensionStarted.resolve();
+						await releaseFirstExtension.promise;
+					} else if (extensionPublicationCount === 2) {
+						secondExtensionStarted.resolve();
+						await releaseSecondExtension.promise;
+					}
+				},
+				hasHandlers: (eventType: string) => eventType === "agent_end",
+			} as never,
+		});
+		sessions.push(session);
+		const agentPromptReturned = Promise.withResolvers<void>();
+		const releaseAgentPrompt = Promise.withResolvers<void>();
+		const originalAgentPrompt = agent.prompt.bind(agent);
+		vi.spyOn(agent, "prompt").mockImplementation(async (...args) => {
+			const [messages, options] = args;
+			if (!Array.isArray(messages)) throw new Error("Expected AgentSession to submit an SDK message batch.");
+			await originalAgentPrompt(messages, options as AgentPromptOptions | undefined);
+			// A second terminal can be queued while this SDK prompt's finalizer is
+			// still in flight, which reproduces the two-entry flush batch.
+			agent.emitExternalEvent({ type: "agent_end", messages: [], stopReason: "stop" } as never);
+			agentPromptReturned.resolve();
+			await releaseAgentPrompt.promise;
+		});
+
+		const sdkAgentEnds: AgentSessionEvent[] = [];
+		session.subscribe(event => {
+			if (event.type === "agent_end") sdkAgentEnds.push(event);
+		});
+		const prompt = session.sendUserMessage("sdk terminal batch", {
+			sdkRunCapability: createSdkRunCapability("batched-sdk-terminal"),
+		} as never);
+		try {
+			await agentPromptReturned.promise;
+			releaseAgentPrompt.resolve();
+			await firstExtensionStarted.promise;
+			await Bun.sleep(0);
+			expect(extensionPublicationCount).toBe(1);
+			expect(sdkAgentEnds).toHaveLength(1);
+			releaseFirstExtension.resolve();
+			await secondExtensionStarted.promise;
+			expect(extensionPublicationCount).toBe(2);
+		} finally {
+			releaseAgentPrompt.resolve();
+			releaseFirstExtension.resolve();
+			releaseSecondExtension.resolve();
+		}
+		await prompt;
+		await session.waitForIdle();
+		expect(extensionPublicationCount).toBe(2);
+		expect(sdkAgentEnds).toHaveLength(2);
+	});
 });

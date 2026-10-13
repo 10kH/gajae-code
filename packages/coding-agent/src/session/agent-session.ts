@@ -5217,7 +5217,14 @@ export class AgentSession {
 			| AttemptScope
 			| undefined;
 		const sdkTerminal = pendingScope !== undefined && this.#sdkRunTokensByAttemptScope.has(pendingScope);
-		this.#agentEndPublicationPromise = this.#publishDeferredAgentEnd(pending, lease, sdkTerminal);
+		// Several SDK terminals can become publishable in one flush after a
+		// continuation finishes. Keep their delivery ordered, and make the newest
+		// promise cover every earlier terminal so prompt preflight/disposal cannot
+		// race a still-running publication.
+		const previousPublication = this.#agentEndPublicationPromise.catch(() => {});
+		this.#agentEndPublicationPromise = previousPublication.then(() =>
+			this.#publishDeferredAgentEnd(pending, lease, sdkTerminal),
+		);
 		void this.#agentEndPublicationPromise.catch(error => {
 			logger.warn("Agent terminal publication failed", { error: sanitizePromptFailure(error) });
 		});
