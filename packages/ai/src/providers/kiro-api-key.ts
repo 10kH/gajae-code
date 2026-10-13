@@ -1157,12 +1157,17 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				const hasTerminalEvent = events.some(e => e.type === "refusal");
 
 				for (const event of events) {
+					const isActiveToolContinuation =
+						currentTool !== undefined &&
+						!toolComplete &&
+						(event.type === "toolUseInput" ||
+							event.type === "toolUseStop" ||
+							(event.type === "toolUse" && event.data.toolUseId === currentTool.id));
 					if (
 						completionSeen &&
 						(event.type === "content" ||
-							event.type === "toolUse" ||
-							event.type === "toolUseInput" ||
-							event.type === "toolUseStop")
+							((event.type === "toolUse" || event.type === "toolUseInput" || event.type === "toolUseStop") &&
+								!isActiveToolContinuation))
 					) {
 						continue;
 					}
@@ -1201,7 +1206,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 							firstTokenTime = Date.now();
 						}
 						currentTool.input += event.data.input;
-					} else if (event.type === "toolUseStop" && event.data.stop) {
+					} else if (event.type === "toolUseStop" && event.data.stop && !hasTerminalEvent) {
 						toolComplete = true; // Mark tool as complete when toolUseStop is received
 						addToolToBlocks();
 					} else if (event.type === "usage") {
@@ -1261,11 +1266,11 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 
 							output.duration = Date.now() - startTime;
 							if (firstTokenTime) output.ttft = firstTokenTime - startTime;
-							stream.push({ type: "error", reason: "error", error: output, partial: output });
+							stream.push({ type: "error", reason: "error", error: output });
 							stream.end();
 							return;
 						}
-					} else if (event.type === "error") {
+					} else if (event.type === "error" && !hasTerminalEvent) {
 						// On ordinary server errors (error event in stream), emit deferred text and tool events before error
 						// (refusals drop them, incomplete tools must not be emitted)
 
@@ -1346,7 +1351,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				output.errorMessage = "Kiro API key stream returned no tokens";
 				output.duration = Date.now() - startTime;
 				if (firstTokenTime) output.ttft = firstTokenTime - startTime;
-				stream.push({ type: "error", reason: "error", error: output, partial: output });
+				stream.push({ type: "error", reason: "error", error: output });
 				stream.end();
 				return;
 			}
@@ -1436,7 +1441,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			output.errorMessage = sanitizeKiroError(error, apiKey);
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
-			stream.push({ type: "error", reason: output.stopReason, error: output, partial: output });
+			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
 	})().catch(() => {

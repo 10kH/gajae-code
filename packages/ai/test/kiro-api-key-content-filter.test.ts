@@ -5,8 +5,17 @@
  * "Kiro API key stream returned no tokens".
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { isProviderSafetyStopModelTrusted } from "../src/adapter-internals/provider-safety-stop";
-import { kiroApiBaseUrl, kiroApiStaticModels, streamKiroApiKey } from "../src/providers/kiro-api-key";
+import {
+	isProviderSafetyStopAuthenticated,
+	isProviderSafetyStopModelTrusted,
+	withProviderSafetyStopAdapterInvocation,
+} from "../src/adapter-internals/provider-safety-stop";
+import {
+	kiroApiBaseUrl,
+	kiroApiStaticModels,
+	parseKiroApiEvents,
+	streamKiroApiKey,
+} from "../src/providers/kiro-api-key";
 import type { AssistantMessage, AssistantMessageEvent, Context, Model, TextContent } from "../src/types";
 
 const originalFetch = globalThis.fetch;
@@ -1119,8 +1128,6 @@ describe("Regression tests for #6151 issues", () => {
 	});
 
 	test("#4199034431: incomplete JSON frame without valid nested objects preserves data for next call", async () => {
-		const { parseKiroApiEvents } = await import("../src/providers/kiro-api-key");
-
 		// Simulate a malformed chunk with a stray opening brace (no complete nested JSON)
 		// This tests that when there's incomplete JSON with no valid nested objects to resync to,
 		// the data is preserved in remaining for the next parse call
@@ -1200,8 +1207,6 @@ describe("Regression tests for #6151 issues", () => {
 	});
 
 	test("#4199034444: 64KiB retention cap enforced for stray brace with no valid JSON", async () => {
-		const { parseKiroApiEvents } = await import("../src/providers/kiro-api-key");
-
 		// Create a buffer with a stray opening brace followed by 100KB of garbage
 		// This should be truncated to 64KB max when returned as remaining
 		const strayBrace = "{";
@@ -1221,8 +1226,6 @@ describe("Regression tests for #6151 issues", () => {
 	});
 
 	test("#4199282140: balanced junk wrapper around valid refusal event is rescanned", async () => {
-		const { parseKiroApiEvents } = await import("../src/providers/kiro-api-key");
-
 		// Codex finding: balanced junk wrapper around a valid event
 		// e.g. '{junk{"stopReason":"CONTENT_FILTERED",...}}' should not be discarded
 		const balancedJunkWrapper =
@@ -1396,6 +1399,46 @@ describe("P1 Regression: incomplete tool emission at tool-ID rollover", () => {
 		expect(events.some(event => event.type === "done")).toBe(false);
 		expect(events.some(event => event.type === "toolcall_start" || event.type === "toolcall_end")).toBe(false);
 	});
+
+	test("TOOL_USE completion allows the active tool to finish but fences later content", async () => {
+		const events: AssistantMessageEvent[] = [];
+		const eventSequence = [
+			JSON.stringify({ stopReason: "TOOL_USE", toolUseId: "tool-continued", name: "search", input: '{"query":' }),
+			JSON.stringify({ input: '"kiro"}' }),
+			JSON.stringify({ stop: true }),
+			JSON.stringify({ content: "post-terminal text" }),
+		];
+		let emitted = 0;
+
+		globalThis.fetch = (async () => {
+			const body = new ReadableStream<Uint8Array>({
+				pull(controller) {
+					if (emitted < eventSequence.length) {
+						controller.enqueue(new TextEncoder().encode(eventSequence[emitted]));
+						emitted++;
+					} else {
+						controller.close();
+					}
+				},
+			});
+			return new Response(body, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const doneEvent = events.find(
+			(event): event is Extract<AssistantMessageEvent, { type: "done" }> => event.type === "done",
+		);
+		expect(doneEvent?.reason).toBe("toolUse");
+		const toolCall = doneEvent?.message.content.find(block => block.type === "toolCall");
+		expect(toolCall?.type).toBe("toolCall");
+		if (toolCall?.type === "toolCall") expect(toolCall.arguments).toEqual({ query: "kiro" });
+		expect(events.some(event => event.type === "text_delta" && event.delta === "post-terminal text")).toBe(false);
+		expectToolEventsReferenceToolBlocks(events);
+	});
 });
 
 describe("P2 Probepark findings: unconfirmed text on read rejection", () => {
@@ -1515,6 +1558,7 @@ describe("P2 Probepark findings: unconfirmed text on read rejection", () => {
 		);
 		expect(errorEvent?.error.errorMessage).toContain("Network error after unknown stop reason");
 		expect(getTextBlocks(errorEvent?.error)).toHaveLength(0);
+		expect(errorEvent?.partial).toBeUndefined();
 		expect(emittedEvents.some(event => event.type === "text_delta")).toBe(false);
 	});
 
@@ -1676,6 +1720,52 @@ describe("P1 Regression: content leaking across batches", () => {
 		expect(
 			events.some(event => event.type === "text_start" || event.type === "text_delta" || event.type === "text_end"),
 		).toBe(false);
+	});
+
+	test("batched refusal takes precedence over an earlier ordinary error", async () => {
+		const events: AssistantMessageEvent[] = [];
+		const trustedModel = kiroApiStaticModels()[0];
+		if (!trustedModel) throw new Error("Expected a registered Kiro API-key model");
+		const eventSequence = [
+			JSON.stringify({ content: "quarantined answer" }),
+			JSON.stringify({ error: "ServerError", message: "ordinary error must not win" }) +
+				JSON.stringify({
+					stopReason: "CONTENT_FILTERED",
+					stopDetails: { refusal: { category: "MALWARE", explanation: "Refusal must remain authoritative" } },
+				}),
+		];
+		let emitted = 0;
+
+		globalThis.fetch = (async () => {
+			const body = new ReadableStream<Uint8Array>({
+				pull(controller) {
+					if (emitted < eventSequence.length) {
+						controller.enqueue(new TextEncoder().encode(eventSequence[emitted]));
+						emitted++;
+					} else {
+						controller.close();
+					}
+				},
+			});
+			return new Response(body, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		const options = withProviderSafetyStopAdapterInvocation({ apiKey: "ksk_test-secret", region: "us-east-1" });
+		const stream = streamKiroApiKey(trustedModel, context, options);
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const errorEvent = events.find(
+			(event): event is Extract<AssistantMessageEvent, { type: "error" }> => event.type === "error",
+		);
+		expect(errorEvent?.error.errorMessage).toContain("Kiro refused the request (MALWARE)");
+		expect(errorEvent?.error.errorMessage).toContain("Refusal must remain authoritative");
+		expect(errorEvent?.error.errorMessage).not.toContain("ordinary error must not win");
+		expect(errorEvent?.error.errorKind).toBe("provider_safety_stop");
+		expect(isProviderSafetyStopAuthenticated(errorEvent?.error)).toBe(true);
+		expect(errorEvent?.error.content).toHaveLength(0);
+		expect(events.some(event => event.type === "text_start" || event.type === "text_delta")).toBe(false);
 	});
 
 	test("P2: unconfirmed text not in published partials when refusal follows", async () => {
