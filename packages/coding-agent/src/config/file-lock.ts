@@ -2896,8 +2896,10 @@ type FileLockStagingOwner = { pid: number; identity?: FileLockStagingIdentity };
 
 const FILE_LOCK_STAGING_UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 const FILE_LOCK_STAGING_NAME_WITH_IDENTITY =
-	/^.+\.lock\.pending\.([1-9]\d*)\.([is][A-Za-z0-9_-]{16})\.([A-Za-z0-9_-]{16})$/;
-const LEGACY_FILE_LOCK_STAGING_NAME = new RegExp(`^.+\\.lock\\.pending\\.([1-9]\\d*)\\.${FILE_LOCK_STAGING_UUID}$`);
+	/^(?:.+\.lock|\.gjc-lock-[0-9a-f]{64})\.pending\.([1-9]\d*)\.([is][A-Za-z0-9_-]{16})\.([A-Za-z0-9_-]{16})$/;
+const LEGACY_FILE_LOCK_STAGING_NAME = new RegExp(
+	`^(?:.+\\.lock|\\.gjc-lock-[0-9a-f]{64})\\.pending\\.([1-9]\\d*)\\.${FILE_LOCK_STAGING_UUID}$`,
+);
 
 function fileLockStagingOwner(name: string): FileLockStagingOwner | null {
 	const current = FILE_LOCK_STAGING_NAME_WITH_IDENTITY.exec(name);
