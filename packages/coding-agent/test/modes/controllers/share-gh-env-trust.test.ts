@@ -158,6 +158,7 @@ async function share(options: {
 	env?: Record<string, string>;
 	moveAway?: boolean;
 	launchFromFilesystemRoot?: boolean;
+	nonCheckoutLaunch?: boolean;
 	autoload?: boolean;
 	noSpawnError?: string;
 	ghPathMode?:
@@ -168,13 +169,15 @@ async function share(options: {
 		| "checkout-directory-symlink"
 		| "checkout-executable-symlink"
 		| "checkout-executable-symlink-fallback"
-		| "moved-checkout";
+		| "moved-checkout"
+		| "launch-directory";
 }): Promise<GhSpawn[]> {
 	const cwd = await tempDir("gjc-share-gh-env-");
+	if (!options.nonCheckoutLaunch) await fs.mkdir(path.join(cwd, ".git"));
 	const binDir = path.join(cwd, "bin");
 	const operatorBinDir = await tempDir("gjc-share-gh-operator-bin-");
 	const record = path.join(cwd, "spawns.ndjson");
-	await writeGh(binDir, "checkout");
+	await writeGh(binDir, options.nonCheckoutLaunch ? "operator" : "checkout");
 	await writeGh(operatorBinDir, "operator");
 	const ghPathMode = options.ghPathMode ?? "trusted";
 	if (ghPathMode === "checkout-directory-symlink") {
@@ -190,6 +193,7 @@ async function share(options: {
 	const moveTo = options.moveAway ? await tempDir("gjc-share-gh-move-") : undefined;
 	if (ghPathMode === "moved-checkout") {
 		if (!moveTo) throw new Error("Moved-checkout PATH fixture was not created.");
+		await fs.mkdir(path.join(moveTo, ".git"));
 		await writeGh(path.join(moveTo, "bin"), "checkout");
 	}
 
@@ -223,6 +227,9 @@ async function share(options: {
 			break;
 		case "operator-only":
 			env.PATH = operatorBinDir;
+			break;
+		case "launch-directory":
+			env.PATH = binDir;
 			break;
 		default:
 			env.PATH = `${binDir}${path.delimiter}${operatorBinDir}${path.delimiter}${process.env.PATH ?? ""}`;
@@ -294,6 +301,7 @@ function expectDestination(
 			| "DYLD_ROOT_PATH"
 		>
 	>,
+	allowPathsInsideLaunchDirectory = false,
 ): void {
 	expect(spawns[0]?.args).toEqual(["auth", "status"]);
 	expect(spawns[1]?.args.slice(0, 3)).toEqual(["gist", "create", "--public=false"]);
@@ -301,10 +309,10 @@ function expectDestination(
 		expect(spawn.source).toBe("operator");
 		for (const directory of spawn.PATH.split(path.delimiter)) {
 			const relative = path.relative(spawn.cwd, directory);
-			expect(
+			const pathIsInsideLaunchDirectory =
 				relative === "" ||
-					(relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)),
-			).toBe(false);
+				(relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+			expect(pathIsInsideLaunchDirectory).toBe(allowPathsInsideLaunchDirectory);
 		}
 		expect(spawn.GH_HOST).toBe(expected.GH_HOST ?? null);
 		expect(spawn.GH_CONFIG_DIR).toBe(expected.GH_CONFIG_DIR ?? null);
@@ -455,6 +463,18 @@ DYLD_ROOT_PATH=/project/root
 			ghPathMode: "operator-only",
 		});
 		expectDestination(spawns, {});
+	});
+
+	it("keeps a trusted gh install beneath a non-checkout launch directory", async () => {
+		const spawns = await share({
+			autoload: true,
+			nonCheckoutLaunch: true,
+			ghPathMode: "launch-directory",
+		});
+		expectDestination(spawns, {}, true);
+		for (const spawn of spawns) {
+			expect(spawn.PATH.split(path.delimiter)).toEqual([path.join(spawn.cwd, "bin")]);
+		}
 	});
 
 	it("refuses a PATH directory symlink that resolves into the checkout", async () => {

@@ -236,6 +236,20 @@ describe("recordFatalCrash", () => {
 		expect(contents).toContain('metadata=["public"]');
 	});
 
+	it("redacts complete Cookie header values without consuming following diagnostics", async () => {
+		const target = tempCrashLog();
+		const message = "before=keep\nCookie: theme=dark; sid=opaque-cookie-session\nafter=keep";
+
+		recordFatalCrash("Uncaught Exception", new Error(message), { path: target });
+
+		const contents = await Bun.file(target).text();
+		expect(contents).not.toContain("theme=dark");
+		expect(contents).not.toContain("opaque-cookie-session");
+		expect(contents).toContain("Cookie: «redacted»");
+		expect(contents).toContain("before=keep");
+		expect(contents).toContain("after=keep");
+	});
+
 	it("redacts full quoted credential values that contain spaces", async () => {
 		const target = tempCrashLog();
 		const message =

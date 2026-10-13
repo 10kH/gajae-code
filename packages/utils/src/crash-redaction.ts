@@ -66,6 +66,12 @@ export function redactCrashSecrets(text: string): string {
 	// does not match `SecretAccessKey` (the canonical field has `Access` in the
 	// middle), and `access_token` does not match `SessionToken`.
 	redacted = redacted.replace(/\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b/g, "«redacted-aws-key»");
+	// Cookie headers contain multiple semicolon-separated values; redacting only
+	// the first pair would leave later session cookies visible in exported text.
+	redacted = redacted.replace(
+		/(?:(?<![A-Za-z0-9_-])|(?<=\\n))((?:set-)?cookie\s*:\s*)(?:(?!\\+n|\\+r\\+n)[^\r\n])*/gi,
+		"$1«redacted»",
+	);
 	// Escaped delimiters support JSON nested in diagnostic strings. Their quoted
 	// branch stops at a closing delimiter followed by a field boundary, while an
 	// unterminated value is redacted through the end of its line.

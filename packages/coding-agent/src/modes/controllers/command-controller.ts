@@ -168,8 +168,7 @@ async function findCheckoutRoots(directory: string): Promise<string[] | undefine
 		if (parent === ancestor) break;
 		ancestor = parent;
 	}
-	if (roots.length > 0) return roots;
-	return path.parse(resolvedDirectory).root === resolvedDirectory ? [] : [resolvedDirectory];
+	return roots;
 }
 
 function isInsideAnyDirectory(roots: readonly string[], candidate: string): boolean {
@@ -187,8 +186,6 @@ async function resolveGhShareExecutable(): Promise<{ executable: string; searchP
 		return undefined;
 	const checkoutRoots = new Set<string>();
 	for (const directory of new Set([ghShareLaunchRoot, path.resolve(process.cwd())])) {
-		const resolvedDirectory = path.resolve(directory);
-		if (path.parse(resolvedDirectory).root !== resolvedDirectory) checkoutRoots.add(resolvedDirectory);
 		const roots = await findCheckoutRoots(directory);
 		if (!roots) return undefined;
 		for (const root of roots) checkoutRoots.add(root);
@@ -229,7 +226,7 @@ async function resolveGhShareExecutable(): Promise<{ executable: string; searchP
  * cannot redirect the upload, substitute the `gh` binary, authenticate with a
  * project-provided token, or intercept its HTTPS request. The executable itself
  * and its child search path use absolute operator PATH directories whose real
- * paths are outside the launch and active checkouts. Operator values the project
+ * paths are outside actual launch and active checkout roots. Operator values the project
  * does not declare are kept.
  */
 function ghShareChildEnv(trustedPath: string, env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {

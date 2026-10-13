@@ -268,7 +268,7 @@ describe("session HTML export embed", () => {
 		try {
 			session = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
 			const note =
-				'safe=keep credentials=["alpha","beta"] secrets={primary:alpha,secondary:{nested:[beta]}} metadata=["public"]';
+				'safe=keep credentials=["alpha","beta"] secrets={primary:alpha,secondary:{nested:[beta]}} metadata=["public"]\nCookie: theme=dark; sid=opaque-cookie-session\nafter=keep';
 			session.appendMessage({
 				role: "assistant",
 				content: [
@@ -294,6 +294,10 @@ describe("session HTML export embed", () => {
 			expect(exportedNote).toContain("credentials=«redacted»");
 			expect(exportedNote).toContain("secrets=«redacted»");
 			expect(exportedNote).toContain('metadata=["public"]');
+			expect(exportedNote).not.toContain("theme=dark");
+			expect(exportedNote).not.toContain("opaque-cookie-session");
+			expect(exportedNote).toContain("Cookie: «redacted»");
+			expect(exportedNote).toContain("after=keep");
 		} finally {
 			await session?.close();
 			await fs.rm(tempDir, { recursive: true, force: true });
