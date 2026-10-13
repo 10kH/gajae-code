@@ -678,13 +678,11 @@ function convertToolResultContent(
 	content: ToolResultMessage["content"],
 	supportsImages: boolean,
 ): Array<TextBlockWire | ImageBlockWire> {
-	return content.map(c =>
-		c.type === "image"
-			? supportsImages
-				? { image: createImageBlock(c.mimeType, c.data) }
-				: { text: NON_VISION_IMAGE_PLACEHOLDER }
-			: { text: c.text.toWellFormed() },
-	);
+	return content.map(c => {
+		if (c.type !== "image") return { text: c.text.toWellFormed() };
+		if (!supportsImages) return { text: NON_VISION_IMAGE_PLACEHOLDER };
+		return { image: createImageBlock(c.mimeType, c.data) };
+	});
 }
 
 function convertMessages(
