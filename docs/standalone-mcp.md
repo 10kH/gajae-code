@@ -98,6 +98,8 @@ There is no public MCP config reload while the session runs; edit the config and
 
 [Parallel Search MCP](https://docs.parallel.ai/integrations/mcp/search-mcp) provides web search and page fetching over Streamable HTTP without an account or API key. Anonymous searches use Fast mode and have lower rate limits intended for exploration and light use.
 
+Search objectives, queries, and fetch URLs are sent to Parallel when these tools are called; avoid including sensitive information.
+
 From the project where you want the tools, register the server:
 
 ```bash
