@@ -13,6 +13,7 @@ import {
 	isSqliteCorruptionError,
 	OAuthCredentialSelectorError,
 	type OAuthPinTarget,
+	oauthCredentialMatchesOrganization,
 	resolveOAuthStorageProvider,
 } from "@gajae-code/ai/core";
 import { getAgentDir } from "@gajae-code/utils";
@@ -92,9 +93,10 @@ function selectorFromInput(raw: string | undefined): AuthCredentialSelector {
 	if (/^id:[1-9]\d*$/.test(value)) return { kind: "id", value: value.slice(3) };
 	if (/^email:[^@\s]+@[^@\s]+$/.test(value)) return { kind: "email", value: value.slice(6) };
 	if (/^account:\S+$/.test(value)) return { kind: "account", value: value.slice(8) };
+	if (/^org:\S/.test(value)) return { kind: "org", value: value.slice(4).trim() };
 	if (/^[^@\s]+@[^@\s]+$/.test(value)) return { kind: "email", value };
 	throw new AccountsCommandError(
-		"Pin target must be a bare email or an id:<row-id>, email:<email>, or account:<account-id> selector.",
+		"Pin target must be a bare email or an id:<row-id>, email:<email>, account:<account-id>, or org:<organization id or name> selector.",
 	);
 }
 
@@ -291,6 +293,9 @@ function accountMatches(row: CredentialInventoryRecord, rawAccount: string): boo
 	if (value.length === 0) return false;
 	if (/^[1-9]\d*$/.test(value) && row.id === Number(value)) return true;
 	if (/^id:[1-9]\d*$/i.test(value) && row.id === Number(value.slice(3))) return true;
+	if (/^org:/i.test(value)) return oauthCredentialMatchesOrganization(row, value.slice(4));
+	// Labels carry the organization name, so a bare email matches every organization of that account.
+	if (row.email?.toLowerCase() === value.toLowerCase()) return true;
 	const identity = inventoryIdentity(row);
 	return identity?.toLowerCase() === value.toLowerCase();
 }

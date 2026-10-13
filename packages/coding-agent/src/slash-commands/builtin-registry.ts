@@ -1654,7 +1654,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		aliases: ["account"],
 		description: "Switch this session's active stored account, or list accounts",
 		acpDescription: "Switch or list stored credentials for this session",
-		inlineHint: "[email:<addr>|id:<n>|account:<id>|project:<id>|provider/<selector>]",
+		inlineHint: "[email:<addr>|id:<n>|account:<id>|project:<id>|org:<id|name>|provider/<selector>]",
 		acpInputHint: "[selector]",
 		allowArgs: true,
 		handle: async (command, runtime) => {
