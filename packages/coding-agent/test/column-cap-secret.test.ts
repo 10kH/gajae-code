@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult } from "@gajae-code/agent-core";
 import { Settings } from "../src/config/settings";
 import type { ToolSession } from "../src/sdk";
-import { OutputSink } from "../src/session/streaming-output";
+import { OutputSink, runWithOutputRedaction } from "../src/session/streaming-output";
 import { wrapToolWithMetaNotice } from "../src/tools/output-meta";
 import { ReadTool } from "../src/tools/read";
 import { ToolAbortError } from "../src/tools/tool-errors";
@@ -82,6 +82,7 @@ async function executeSink(
 	signal?: AbortSignal,
 	onExecute?: () => void,
 	dumpAfter = 0,
+	sinkOptions: { maxColumns?: number; headBytes?: number; spillThreshold?: number } = {},
 ): Promise<string> {
 	let ran = false;
 	const tool = {
@@ -91,7 +92,11 @@ async function executeSink(
 		execute: async () => {
 			ran = true;
 			onExecute?.();
-			const sink = new OutputSink({ maxColumns: COLUMN_CAP, spillThreshold: 8000 });
+			const sink = new OutputSink({
+				maxColumns: sinkOptions.maxColumns ?? COLUMN_CAP,
+				headBytes: sinkOptions.headBytes ?? 0,
+				spillThreshold: sinkOptions.spillThreshold ?? 8000,
+			});
 			for (let index = 0; index < chunks.length; index++) {
 				sink.push(chunks[index] ?? "");
 				if (dumpAfter > 0 && index + 1 === dumpAfter) await sink.dump();
@@ -363,6 +368,37 @@ describe("column cap plain-secret cut", () => {
 			await settings.close();
 			rmSync(root, { recursive: true, force: true });
 		}
+	});
+
+	test("a multiline secret crossing the retained head-to-tail gap is removed from both windows", async () => {
+		const multilineSecret = `${"A".repeat(700)}\n${"B".repeat(2000)}\n${"C".repeat(5000)}`;
+		const { settings, root } = await loadSettings(true, multilineSecret);
+		try {
+			const output = await executeSink(settings, [multilineSecret], undefined, undefined, 0, {
+				maxColumns: 4096,
+				headBytes: 1024,
+				spillThreshold: 1024,
+			});
+			expect(output).toBe("…");
+			expect(output).not.toContain("A".repeat(8));
+			expect(output).not.toContain("C".repeat(8));
+		} finally {
+			await settings.close();
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("replace clears prior multiline secret context", async () => {
+		const secret = `line1\n${"2".repeat(900)}`;
+		const dumped = await runWithOutputRedaction([secret], async () => {
+			const sink = new OutputSink({ maxColumns: COLUMN_CAP, spillThreshold: 8000 });
+			sink.push("line1\n");
+			sink.replace("plain\n");
+			sink.push("2".repeat(1000));
+			return sink.dump();
+		});
+		expect(dumped.output).toContain("plain\n");
+		expect(dumped.output).toContain("2".repeat(8));
 	});
 
 	test("wrapped ReadTool clips configured secrets but preserves raw and hashline output", async () => {

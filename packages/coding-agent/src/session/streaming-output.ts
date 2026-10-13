@@ -1403,18 +1403,17 @@ export class OutputSink {
 	#retractColumnSuffix(suffix: string): void {
 		if (suffix.length === 0) return;
 		const bytes = Buffer.byteLength(suffix, "utf-8");
-		const tail = this.#buffer;
-		if (tail.endsWith(suffix)) {
-			const next = tail.slice(0, tail.length - suffix.length);
-			this.#setTail(next, Buffer.byteLength(next, "utf-8"));
-		} else if (suffix.endsWith(tail) && this.#head.endsWith(suffix.slice(0, suffix.length - tail.length))) {
-			const headSuffix = suffix.slice(0, suffix.length - tail.length);
-			const nextHead = this.#head.slice(0, this.#head.length - headSuffix.length);
-			this.#head = nextHead;
-			this.#headBytes = Buffer.byteLength(nextHead, "utf-8");
-			this.#setTail("", 0);
-		} else {
-			return;
+		const startByte = Math.max(0, this.#processedBytes - bytes);
+		const tailStartByte = Math.max(0, this.#processedBytes - this.#bufferBytes);
+		const keptTailBytes = Math.max(0, Math.min(this.#bufferBytes, startByte - tailStartByte));
+		if (keptTailBytes < this.#bufferBytes) {
+			const nextTail = truncateHeadBytes(this.#buffer, keptTailBytes);
+			this.#setTail(nextTail.text, nextTail.bytes);
+		}
+		if (startByte < this.#headBytes) {
+			const nextHead = truncateHeadBytes(this.#head, startByte);
+			this.#head = nextHead.text;
+			this.#headBytes = nextHead.bytes;
 		}
 		this.#processedBytes = Math.max(0, this.#processedBytes - bytes);
 		this.#processedLines = Math.max(0, this.#processedLines - countNewlines(suffix));
@@ -1691,6 +1690,7 @@ export class OutputSink {
 	replace(text: string): void {
 		this.#coalesceBuf = "";
 		this.#columnLine = "";
+		this.#columnLineContext = "";
 		const replacementBytes = Buffer.byteLength(text, "utf-8");
 		this.#head = "";
 		this.#headBytes = 0;
