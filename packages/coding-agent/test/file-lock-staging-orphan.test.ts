@@ -31,7 +31,7 @@ async function fixture(
 	roots.push(root);
 	const file = path.join(root, "index.jsonl");
 	const encodedStartTime = `s${crypto.createHash("sha256").update(startTime, "utf8").digest("base64url").slice(0, 16)}`;
-	const staging = `${file}.lock.pending.${pid}.${encodedStartTime}.1234567890123456789012`;
+	const staging = `${file}.lock.pending.${pid}.${encodedStartTime}.1234567890123456`;
 	await fs.mkdir(staging);
 	if (info) await Bun.write(path.join(staging, "info"), JSON.stringify(info));
 	return { root, file, staging };
