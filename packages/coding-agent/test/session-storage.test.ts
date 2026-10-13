@@ -140,6 +140,7 @@ describe("native publish outcome classification", () => {
 			["destination_exists", "already_exists"],
 			["cross_device", "cross_device"],
 			["permission_denied", "permission_denied"],
+			["access_denied", "access_denied"],
 			["io_failure", "io_error"],
 			// A signal landing on the no-replace rename syscall before it enters the
 			// kernel never mutates the filesystem, so a pre-mutation "interrupted"
