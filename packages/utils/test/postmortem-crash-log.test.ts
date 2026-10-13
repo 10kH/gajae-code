@@ -194,6 +194,24 @@ describe("recordFatalCrash", () => {
 		expect(contents).toContain("«redacted»");
 	});
 
+	it("redacts short values under sensitive labels", () => {
+		const target = tempCrashLog();
+		const labeled = [
+			"token=abc123",
+			"secret=x",
+			"credential=123456",
+			"private_key=q",
+			"cookie=z",
+			"password=123456",
+		].join(" ");
+
+		recordFatalCrash("Uncaught Exception", new Error(`diagnostic safe=keep-this ${labeled}`), { path: target });
+
+		const contents = fs.readFileSync(target, "utf8");
+		expect(contents).toContain("diagnostic safe=keep-this");
+		for (const field of labeled.split(" ")) expect(contents).not.toContain(field);
+	});
+
 	it("preserves credential lookalikes outside the supported token boundaries", () => {
 		const target = tempCrashLog();
 		const lookalikes = [

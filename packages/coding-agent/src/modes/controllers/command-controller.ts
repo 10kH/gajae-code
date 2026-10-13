@@ -119,12 +119,22 @@ const GH_SHARE_TRUST_KEYS = [
 	"HOME",
 	"USERPROFILE",
 	"APPDATA",
+	"PATH",
 	"HTTP_PROXY",
 	"HTTPS_PROXY",
 	"ALL_PROXY",
 	"NO_PROXY",
 	"SSL_CERT_FILE",
 	"SSL_CERT_DIR",
+	"LD_PRELOAD",
+	"LD_LIBRARY_PATH",
+	"LD_AUDIT",
+	"DYLD_INSERT_LIBRARIES",
+	"DYLD_LIBRARY_PATH",
+	"DYLD_FRAMEWORK_PATH",
+	"DYLD_FALLBACK_LIBRARY_PATH",
+	"DYLD_FALLBACK_FRAMEWORK_PATH",
+	"DYLD_ROOT_PATH",
 ] as const;
 const GH_SHARE_TRUST_KEY_SET = new Set(GH_SHARE_TRUST_KEYS.map(name => name.toUpperCase()));
 
@@ -134,13 +144,26 @@ const GH_SHARE_TRUST_KEY_SET = new Set(GH_SHARE_TRUST_KEYS.map(name => name.toUp
  * remove them.
  */
 const ghShareProjectSnapshot = projectEnvSnapshot();
+const ghShareExecutable = (() => {
+	const operatorPath = process.env.PATH;
+	const key = canonicalEnvKey("PATH");
+	const declared = ghShareProjectSnapshot.values[key];
+	if (
+		!operatorPath ||
+		(declared !== undefined && (ghShareProjectSnapshot.dynamic.has(key) || declared.trim() === operatorPath.trim()))
+	)
+		return undefined;
+	return Bun.which("gh", { PATH: operatorPath }) ?? undefined;
+})();
 
 /**
  * Environment for the default `/share` `gh` children. GitHub CLI routing,
- * config, authentication, proxy, and certificate overrides that match the
- * project dotenv are omitted so a repository cannot redirect the upload,
- * authenticate with a project-provided token, or intercept its HTTPS request.
- * Operator values the project does not declare are kept.
+ * config, authentication, proxy, certificate, executable-search, and dynamic
+ * loader overrides that match the project dotenv are omitted so a repository
+ * cannot redirect the upload, substitute the `gh` binary, authenticate with a
+ * project-provided token, or intercept its HTTPS request. The executable itself
+ * is resolved from the trusted operator PATH. Operator values the project does
+ * not declare are kept.
  */
 function ghShareChildEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
 	const child: NodeJS.ProcessEnv = { ...env };
@@ -151,7 +174,7 @@ function ghShareChildEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEn
 		const key = canonicalEnvKey(name);
 		const declared = ghShareProjectSnapshot.values[key];
 		if (declared === undefined) continue;
-		if (!(ghShareProjectSnapshot.dynamic.has(key) || declared === raw || declared === raw.trim())) continue;
+		if (!(ghShareProjectSnapshot.dynamic.has(key) || declared.trim() === raw.trim())) continue;
 		delete child[name];
 		if (process.platform === "win32") {
 			for (const present of Object.keys(child)) {
@@ -297,9 +320,15 @@ export class CommandController {
 			return;
 		}
 
+		if (!ghShareExecutable) {
+			this.ctx.showError(
+				"GitHub CLI (gh) is not installed on the trusted operator PATH. Install it from https://cli.github.com/",
+			);
+			return;
+		}
 		const ghEnv = ghShareChildEnv();
 		try {
-			const authProcess = Bun.spawn(["gh", "auth", "status"], {
+			const authProcess = Bun.spawn([ghShareExecutable, "auth", "status"], {
 				env: ghEnv,
 				stdin: "ignore",
 				stdout: "ignore",
@@ -333,7 +362,7 @@ export class CommandController {
 
 		let cancellationRequested = false;
 		try {
-			const gistProcess = Bun.spawn(["gh", "gist", "create", "--public=false", tmpFile], {
+			const gistProcess = Bun.spawn([ghShareExecutable, "gist", "create", "--public=false", tmpFile], {
 				env: ghEnv,
 				stdin: "ignore",
 				stdout: "pipe",

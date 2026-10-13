@@ -1,3 +1,3 @@
 ### Fixed
 
-- The default `/share` gist upload no longer forwards project `.env` routing, config, proxy, or CA trust values to `gh`; operator values the project does not declare are kept.
+- The default `/share` gist upload no longer forwards project `.env` routing, config, proxy, CA, executable-search, or native-loader values to `gh`; the executable comes from the trusted operator PATH and undeclared operator values are kept.

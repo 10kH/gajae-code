@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { projectEnvSnapshot } from "@gajae-code/utils/env-file";
 
 /**
  * Default `/share` spawns `gh auth status` and `gh gist create` with an
@@ -21,6 +22,7 @@ const TRUST_KEYS = [
 	"HOME",
 	"USERPROFILE",
 	"APPDATA",
+	"PATH",
 	"HTTP_PROXY",
 	"HTTPS_PROXY",
 	"ALL_PROXY",
@@ -31,6 +33,15 @@ const TRUST_KEYS = [
 	"no_proxy",
 	"SSL_CERT_FILE",
 	"SSL_CERT_DIR",
+	"LD_PRELOAD",
+	"LD_LIBRARY_PATH",
+	"LD_AUDIT",
+	"DYLD_INSERT_LIBRARIES",
+	"DYLD_LIBRARY_PATH",
+	"DYLD_FRAMEWORK_PATH",
+	"DYLD_FALLBACK_LIBRARY_PATH",
+	"DYLD_FALLBACK_FRAMEWORK_PATH",
+	"DYLD_ROOT_PATH",
 	"GH_HOST_PLANTED",
 	"GH_CONFIG_PLANTED",
 ] as const;
@@ -57,6 +68,15 @@ interface GhSpawn {
 	no_proxy: string | null;
 	SSL_CERT_FILE: string | null;
 	SSL_CERT_DIR: string | null;
+	LD_PRELOAD: string | null;
+	LD_LIBRARY_PATH: string | null;
+	LD_AUDIT: string | null;
+	DYLD_INSERT_LIBRARIES: string | null;
+	DYLD_LIBRARY_PATH: string | null;
+	DYLD_FRAMEWORK_PATH: string | null;
+	DYLD_FALLBACK_LIBRARY_PATH: string | null;
+	DYLD_FALLBACK_FRAMEWORK_PATH: string | null;
+	DYLD_ROOT_PATH: string | null;
 }
 
 const tempDirs: string[] = [];
@@ -107,6 +127,15 @@ appendFileSync(
 		no_proxy: process.env.no_proxy ?? null,
 		SSL_CERT_FILE: process.env.SSL_CERT_FILE ?? null,
 		SSL_CERT_DIR: process.env.SSL_CERT_DIR ?? null,
+		LD_PRELOAD: process.env.LD_PRELOAD ?? null,
+		LD_LIBRARY_PATH: process.env.LD_LIBRARY_PATH ?? null,
+		LD_AUDIT: process.env.LD_AUDIT ?? null,
+		DYLD_INSERT_LIBRARIES: process.env.DYLD_INSERT_LIBRARIES ?? null,
+		DYLD_LIBRARY_PATH: process.env.DYLD_LIBRARY_PATH ?? null,
+		DYLD_FRAMEWORK_PATH: process.env.DYLD_FRAMEWORK_PATH ?? null,
+		DYLD_FALLBACK_LIBRARY_PATH: process.env.DYLD_FALLBACK_LIBRARY_PATH ?? null,
+		DYLD_FALLBACK_FRAMEWORK_PATH: process.env.DYLD_FALLBACK_FRAMEWORK_PATH ?? null,
+		DYLD_ROOT_PATH: process.env.DYLD_ROOT_PATH ?? null,
 	}) + "\\n",
 );
 if (process.argv[2] === "auth") process.exit(0);
@@ -124,9 +153,9 @@ async function share(options: {
 	env?: Record<string, string>;
 	moveAway?: boolean;
 	autoload?: boolean;
+	noSpawnError?: string;
 }): Promise<GhSpawn[]> {
 	const cwd = tempDir("gjc-share-gh-env-");
-	if (options.dotenv !== undefined) fs.writeFileSync(path.join(cwd, ".env"), options.dotenv);
 	const binDir = path.join(cwd, "bin");
 	const record = path.join(cwd, "spawns.ndjson");
 	writeGh(binDir);
@@ -144,6 +173,12 @@ async function share(options: {
 	env.PATH = `${binDir}${path.delimiter}${process.env.PATH ?? ""}`;
 	if (moveTo) env.GJC_SHARE_MOVE_TO = moveTo;
 	Object.assign(env, options.env);
+	if (options.dotenv !== undefined) {
+		fs.writeFileSync(path.join(cwd, ".env"), options.dotenv.replaceAll("$SHARE_TEST_PATH", env.PATH ?? ""));
+		if (options.dotenv.includes("$SHARE_TEST_PATH")) {
+			expect(projectEnvSnapshot(cwd).values.PATH?.trim()).toBe(env.PATH);
+		}
+	}
 
 	const args = options.autoload ? [PROBE] : ["--no-env-file", PROBE];
 	const proc = Bun.spawn([process.execPath, ...args], {
@@ -155,7 +190,10 @@ async function share(options: {
 	const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
 	const exitCode = await proc.exited;
 	if (exitCode !== 0) throw new Error(`probe failed (${exitCode}): ${stderr || stdout}`);
-	if (!fs.existsSync(record)) throw new Error(`probe produced no gh spawns: ${stderr || stdout}`);
+	if (!fs.existsSync(record)) {
+		if (options.noSpawnError && stderr.includes(options.noSpawnError)) return [];
+		throw new Error(`probe produced no gh spawns: ${stderr || stdout}`);
+	}
 	const spawns = fs
 		.readFileSync(record, "utf8")
 		.trim()
@@ -191,6 +229,15 @@ function expectDestination(
 			| "no_proxy"
 			| "SSL_CERT_FILE"
 			| "SSL_CERT_DIR"
+			| "LD_PRELOAD"
+			| "LD_LIBRARY_PATH"
+			| "LD_AUDIT"
+			| "DYLD_INSERT_LIBRARIES"
+			| "DYLD_LIBRARY_PATH"
+			| "DYLD_FRAMEWORK_PATH"
+			| "DYLD_FALLBACK_LIBRARY_PATH"
+			| "DYLD_FALLBACK_FRAMEWORK_PATH"
+			| "DYLD_ROOT_PATH"
 		>
 	>,
 ): void {
@@ -217,6 +264,15 @@ function expectDestination(
 		expect(spawn.no_proxy).toBe(expected.no_proxy ?? null);
 		expect(spawn.SSL_CERT_FILE).toBe(expected.SSL_CERT_FILE ?? null);
 		expect(spawn.SSL_CERT_DIR).toBe(expected.SSL_CERT_DIR ?? null);
+		expect(spawn.LD_PRELOAD).toBe(expected.LD_PRELOAD ?? null);
+		expect(spawn.LD_LIBRARY_PATH).toBe(expected.LD_LIBRARY_PATH ?? null);
+		expect(spawn.LD_AUDIT).toBe(expected.LD_AUDIT ?? null);
+		expect(spawn.DYLD_INSERT_LIBRARIES).toBe(expected.DYLD_INSERT_LIBRARIES ?? null);
+		expect(spawn.DYLD_LIBRARY_PATH).toBe(expected.DYLD_LIBRARY_PATH ?? null);
+		expect(spawn.DYLD_FRAMEWORK_PATH).toBe(expected.DYLD_FRAMEWORK_PATH ?? null);
+		expect(spawn.DYLD_FALLBACK_LIBRARY_PATH).toBe(expected.DYLD_FALLBACK_LIBRARY_PATH ?? null);
+		expect(spawn.DYLD_FALLBACK_FRAMEWORK_PATH).toBe(expected.DYLD_FALLBACK_FRAMEWORK_PATH ?? null);
+		expect(spawn.DYLD_ROOT_PATH).toBe(expected.DYLD_ROOT_PATH ?? null);
 	}
 }
 
@@ -248,10 +304,15 @@ describe.skipIf(process.platform === "win32")("share gh destination trust", () =
 	it("omits project dotenv GitHub CLI tokens from both gh spawns", async () => {
 		const spawns = await share({
 			autoload: true,
-			dotenv:
-				"GH_TOKEN=project-gh-token\\nGITHUB_TOKEN=project-github-token\\n" +
-				"GH_ENTERPRISE_TOKEN=project-enterprise-token\\nGITHUB_ENTERPRISE_TOKEN=project-enterprise-github-token\\n" +
-				"XDG_CONFIG_HOME=project-config\\nHOME=project-home\\nUSERPROFILE=project-profile\\nAPPDATA=project-appdata\\n",
+			dotenv: `GH_TOKEN=project-gh-token
+GITHUB_TOKEN=project-github-token
+GH_ENTERPRISE_TOKEN=project-enterprise-token
+GITHUB_ENTERPRISE_TOKEN=project-enterprise-github-token
+XDG_CONFIG_HOME=project-config
+HOME=project-home
+USERPROFILE=project-profile
+APPDATA=project-appdata
+`,
 		});
 		expectDestination(spawns, {});
 	});
@@ -259,11 +320,40 @@ describe.skipIf(process.platform === "win32")("share gh destination trust", () =
 	it("omits project dotenv proxy and CA overrides from both gh spawns", async () => {
 		const spawns = await share({
 			autoload: true,
-			dotenv:
-				"HTTPS_PROXY=https://project-proxy.example\\nhttps_proxy=http://project-lower-proxy.example\\n" +
-				"SSL_CERT_FILE=project-ca.pem\\nSSL_CERT_DIR=project-ca-dir\\n",
+			dotenv: `HTTPS_PROXY=https://project-proxy.example
+https_proxy=http://project-lower-proxy.example
+SSL_CERT_FILE=project-ca.pem
+SSL_CERT_DIR=project-ca-dir
+`,
 		});
 		expectDestination(spawns, {});
+	});
+
+	it("omits project dotenv native-loader overrides from both gh spawns", async () => {
+		const spawns = await share({
+			autoload: true,
+			dotenv: `LD_PRELOAD=/project/preload.so
+LD_LIBRARY_PATH=/project/lib
+LD_AUDIT=/project/audit.so
+DYLD_INSERT_LIBRARIES=/project/injected.dylib
+DYLD_LIBRARY_PATH=/project/dyld
+DYLD_FRAMEWORK_PATH=/project/frameworks
+DYLD_FALLBACK_LIBRARY_PATH=/project/fallback
+DYLD_FALLBACK_FRAMEWORK_PATH=/project/fallback-frameworks
+DYLD_ROOT_PATH=/project/root
+`,
+		});
+		expectDestination(spawns, {});
+	});
+
+	it("refuses a project-only PATH instead of resolving gh from the checkout", async () => {
+		const spawns = await share({
+			autoload: true,
+			dotenv: `PATH=$SHARE_TEST_PATH
+`,
+			noSpawnError: "GitHub CLI (gh) is not installed on the trusted operator PATH",
+		});
+		expect(spawns).toEqual([]);
 	});
 
 	it("keeps an operator host and config directory the project does not declare", async () => {
@@ -292,7 +382,9 @@ describe.skipIf(process.platform === "win32")("share gh destination trust", () =
 
 	it("keeps operator proxy and CA values that differ from project declarations", async () => {
 		const spawns = await share({
-			dotenv: "HTTPS_PROXY=https://project-proxy.example\\nSSL_CERT_FILE=project-ca.pem\\n",
+			dotenv: `HTTPS_PROXY=https://project-proxy.example
+SSL_CERT_FILE=project-ca.pem
+`,
 			env: {
 				HTTPS_PROXY: "https://operator-proxy.example",
 				SSL_CERT_FILE: "/operator/ca.pem",
