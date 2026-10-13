@@ -58,12 +58,13 @@ function isExecutable(path: string): boolean {
  * `$ZDOTDIR/.zshenv`. git applies `GIT_CONFIG_*`, reads config from
  * `GIT_DIR`/`GIT_COMMON_DIR`, `$XDG_CONFIG_HOME/git/config` and `$HOME/.gitconfig`,
  * and so runs e.g. `core.fsmonitor` during `git status`; it also runs
- * `GIT_EXTERNAL_DIFF` and `GIT_SSH(_COMMAND)`. A repository `.env` must not be
+ * `GIT_EXTERNAL_DIFF`, `GIT_SSH(_COMMAND)`, `GIT_ASKPASS` (auth prompts, even
+ * with `GIT_TERMINAL_PROMPT=0`) and `GIT_SEQUENCE_EDITOR` (`git rebase -i`). A repository `.env` must not be
  * able to set them, or every bash tool command — including a restricted role
  * agent's allowlisted `git status` — would execute repository code.
  */
 const PROJECT_DENIED_SPAWN_ENV =
-	/^(?:BASH_ENV|ENV|ZDOTDIR|HOME|XDG_CONFIG_HOME|GIT_DIR|GIT_COMMON_DIR|GIT_EXTERNAL_DIFF|GIT_SSH|GIT_SSH_COMMAND|GIT_CONFIG_(?:COUNT|PARAMETERS|GLOBAL|SYSTEM|KEY_\d+|VALUE_\d+))$/;
+	/^(?:BASH_ENV|ENV|ZDOTDIR|HOME|XDG_CONFIG_HOME|GIT_DIR|GIT_COMMON_DIR|GIT_EXTERNAL_DIFF|GIT_SSH|GIT_SSH_COMMAND|GIT_ASKPASS|GIT_SEQUENCE_EDITOR|GIT_CONFIG_(?:COUNT|PARAMETERS|GLOBAL|SYSTEM|KEY_\d+|VALUE_\d+))$/;
 
 /**
  * Names of hook-capable variables whose live value came from the project `.env`.

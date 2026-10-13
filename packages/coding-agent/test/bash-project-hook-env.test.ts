@@ -16,6 +16,8 @@ import * as path from "node:path";
 const PROBE = path.join(import.meta.dir, "fixtures", "bash-project-hook-probe.ts");
 const HOOK_KEYS = [
 	"BASH_ENV",
+	"GIT_ASKPASS",
+	"GIT_SEQUENCE_EDITOR",
 	"ZDOTDIR",
 	"ENV",
 	"XDG_CONFIG_HOME",
@@ -59,7 +61,7 @@ function project(dotenv: (project: Project) => string): Project {
 
 async function runProbe(
 	target: Project,
-	mode: "worker" | "pty",
+	mode: "worker" | "pty" | "inprocess",
 	inherited: Record<string, string> = {},
 ): Promise<boolean> {
 	const env: Record<string, string> = {};
@@ -138,6 +140,39 @@ describe.skipIf(process.platform === "win32")("bash tool ignores project .env ho
 			expect(await runProbe(target, "pty", forwarded(target))).toBe(false);
 		});
 	}
+
+	// Windows runs the native shell in-process, and Bun's dotenv autoload puts the
+	// project values into the real process environment, which the shell imports
+	// before `sessionEnv`. Emulated here by forwarding the values into the host.
+	it("does not run a GIT_CONFIG_ hook through the in-process native shell", async () => {
+		const target = project(VECTORS.GIT_CONFIG_!);
+		expect(await runProbe(target, "inprocess", forwarded(target))).toBe(false);
+	});
+
+	it("does not run a project GIT_SEQUENCE_EDITOR during git rebase -i", async () => {
+		const target = project(({ hook }) => `GIT_SEQUENCE_EDITOR=${hook}\n`);
+		for (const message of ["one", "two"]) {
+			Bun.spawnSync(
+				["git", "-c", "user.email=a@b", "-c", "user.name=a", "commit", "-q", "--allow-empty", "-m", message],
+				{
+					cwd: target.cwd,
+				},
+			);
+		}
+		const command = "git rebase -i HEAD~1 >/dev/null 2>&1; git rebase --abort >/dev/null 2>&1; echo probe-done";
+		expect(await runProbe(target, "worker", { GJC_TEST_PROBE_COMMAND: command })).toBe(false);
+	});
+
+	it("does not run a project GIT_ASKPASS on an authenticated fetch", async () => {
+		const target = project(({ hook }) => `GIT_ASKPASS=${hook}\n`);
+		using server = Bun.serve({
+			port: 0,
+			hostname: "127.0.0.1",
+			fetch: () => new Response("", { status: 401, headers: { "WWW-Authenticate": 'Basic realm="x"' } }),
+		});
+		const command = `git ls-remote http://127.0.0.1:${server.port}/r.git >/dev/null 2>&1; echo probe-done`;
+		expect(await runProbe(target, "worker", { GJC_TEST_PROBE_COMMAND: command })).toBe(false);
+	});
 
 	it("still honors a hook variable the launching shell exported with a different value", async () => {
 		const target = project(({ cwd }) => `XDG_CONFIG_HOME=${path.join(cwd, "unused")}\n`);

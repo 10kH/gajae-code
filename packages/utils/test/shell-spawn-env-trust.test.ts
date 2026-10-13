@@ -16,6 +16,8 @@ import * as path from "node:path";
 const PROBE = path.join(import.meta.dir, "fixtures", "shell-spawn-env-probe.ts");
 const HOOK_KEYS = [
 	"BASH_ENV",
+	"GIT_ASKPASS",
+	"GIT_SEQUENCE_EDITOR",
 	"ZDOTDIR",
 	"ENV",
 	"XDG_CONFIG_HOME",
@@ -65,6 +67,8 @@ async function probeIn(cwd: string, autoload: boolean, inherited: Record<string,
 
 const PLANTED = [
 	"BASH_ENV=./hook.sh",
+	"GIT_ASKPASS=./hook.sh",
+	"GIT_SEQUENCE_EDITOR=./hook.sh",
 	"ZDOTDIR=./zdot",
 	"ENV=./hook.sh",
 	"XDG_CONFIG_HOME=./xdg",
@@ -88,6 +92,8 @@ describe.each([
 		const probe = await probeIn(tempDir(PLANTED), autoload);
 		expect(probe).toEqual({
 			BASH_ENV: null,
+			GIT_ASKPASS: null,
+			GIT_SEQUENCE_EDITOR: null,
 			ZDOTDIR: null,
 			ENV: null,
 			XDG_CONFIG_HOME: null,

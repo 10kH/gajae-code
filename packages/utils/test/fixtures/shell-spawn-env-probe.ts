@@ -9,6 +9,8 @@ const env = projectSafeSpawnEnv();
 const shared = getShellConfig().env;
 const keys = [
 	"BASH_ENV",
+	"GIT_ASKPASS",
+	"GIT_SEQUENCE_EDITOR",
 	"ZDOTDIR",
 	"ENV",
 	"XDG_CONFIG_HOME",
