@@ -1684,9 +1684,6 @@ export async function prepareModelProfileActivation(
 			options.preserveManualOverrides ? (installedState?.manualAgentModelOverrides ?? []) : [],
 		);
 		const configuredAgentModelOverrides = options.modelRegistry?.getConfiguredModelBindings?.()?.agentModelOverrides;
-		for (const role of Object.keys(configuredAgentModelOverrides ?? {})) {
-			if (!manualAgentModelOverrides.has(role)) delete baseAgentModelOverrides[role];
-		}
 		for (const role of installedKeys?.modelRoles ?? []) {
 			if (options.preserveManualOverrides && manualModelRoleOverrides.has(role)) continue;
 			const installed = installedState?.installedModelRoles.get(role);
@@ -1712,6 +1709,13 @@ export async function prepareModelProfileActivation(
 				continue;
 			}
 			delete baseAgentModelOverrides[role];
+		}
+		// Compare the current session override with the installed profile value
+		// before excluding configured bindings from the successor baseline. The
+		// current value may itself be the installed profile value; filtering first
+		// would misclassify that role as a manual override during configuration reload.
+		for (const role of Object.keys(configuredAgentModelOverrides ?? {})) {
+			if (!manualAgentModelOverrides.has(role)) delete baseAgentModelOverrides[role];
 		}
 		for (const [role, value] of installedState?.modelRoles ?? []) {
 			if (manualModelRoleOverrides.has(role)) continue;

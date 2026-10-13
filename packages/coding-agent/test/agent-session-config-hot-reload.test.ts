@@ -424,6 +424,8 @@ describe("AgentSession configuration reload", () => {
 		await session!.validateConfiguration(staged);
 		await session!.reloadConfiguration(staged, new AbortController().signal);
 		expect(modelRegistry!.getConfiguredModelBindings()?.agentModelOverrides?.planner).toBe(configuredAfter);
+		expect(session!.settings.getOverride("task.agentModelOverrides")?.planner).toBe(`${provider}/${modelId}`);
+		expect(session!.getProfileInstalledOverrideState().manualAgentModelOverrides).not.toContain("planner");
 
 		await session!.activateModelProfileForControl("no-planner-profile");
 		expect(session!.settings.getOverride("task.agentModelOverrides")?.planner).toBeUndefined();
