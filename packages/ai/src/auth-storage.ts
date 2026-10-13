@@ -3056,10 +3056,6 @@ export class AuthStorage {
 	}
 
 	/**
-	 * Every stored row a selector designates. An `org:` value prefers an exact organization-id match over
-	 * display-name matches; more than one designated row means the selector is ambiguous.
-	 */
-	/**
 	 * Rows whose removal invalidates a selector, mirroring {@link AuthStorage.#findCredentialBySelector}: the row an
 	 * email/account/project/id selector resolves to (the first match), or every row an `org:` selector designates,
 	 * because removing one of several designated organizations would otherwise retarget the selector to another.
@@ -3072,6 +3068,10 @@ export class AuthStorage {
 		return selector.kind === "org" ? designated : designated.slice(0, 1);
 	}
 
+	/**
+	 * Every stored row a selector designates. An `org:` value prefers an exact organization-id match over
+	 * display-name matches; more than one designated row means the selector is ambiguous.
+	 */
 	#entriesDesignatedBySelector<T extends StoredCredential>(
 		entries: readonly T[],
 		selector: AuthCredentialSelector,
