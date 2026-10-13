@@ -2,9 +2,27 @@ import { expect, test } from "bun:test";
 import * as path from "node:path";
 import { parse } from "@babel/parser";
 import traverse from "@babel/traverse";
+import type { Expression } from "@babel/types";
 
 const packageRoot = path.resolve(import.meta.dir, "..");
 const optOutPrefix = "// broker-seam-opt-out: ";
+
+function isMissingSeamValue(value: Expression): boolean {
+	let expression = value;
+	while (
+		expression.type === "TSAsExpression" ||
+		expression.type === "TSTypeAssertion" ||
+		expression.type === "TSNonNullExpression" ||
+		expression.type === "TSSatisfiesExpression"
+	) {
+		expression = expression.expression;
+	}
+	return (
+		(expression.type === "Identifier" && expression.name === "undefined") ||
+		expression.type === "NullLiteral" ||
+		(expression.type === "UnaryExpression" && expression.operator === "void")
+	);
+}
 
 function missingBrokerSeams(source: string, filename: string): number[] {
 	const file = parse(source, { sourceFilename: filename, sourceType: "module", plugins: ["typescript"] });
@@ -20,11 +38,17 @@ function missingBrokerSeams(source: string, filename: string): number[] {
 				options &&
 				options.type === "ObjectExpression" &&
 				options.properties.some(
-					property =>
-						(property.type === "ObjectProperty" || property.type === "ObjectMethod") &&
-						!property.computed &&
-						((property.key.type === "Identifier" && property.key.name === "ensureBrokerImpl") ||
-							(property.key.type === "StringLiteral" && property.key.value === "ensureBrokerImpl")),
+					property => {
+						if (
+							(property.type !== "ObjectProperty" && property.type !== "ObjectMethod") ||
+							property.computed ||
+							!((property.key.type === "Identifier" && property.key.name === "ensureBrokerImpl") ||
+								(property.key.type === "StringLiteral" && property.key.value === "ensureBrokerImpl"))
+						) {
+							return false;
+						}
+						return property.type === "ObjectMethod" || !isMissingSeamValue(property.value);
+					},
 				);
 			const line = node.loc?.start.line;
 			if (line === undefined) throw new Error(`Missing call location in ${filename}`);
@@ -73,4 +97,14 @@ createSdkSessionRuntimeExtension(api, {});`,
 			"fixture.test.ts",
 		),
 	).toEqual([8]);
+	expect(
+		missingBrokerSeams(
+			`createSdkSessionRuntimeExtension(api, { ensureBrokerImpl: undefined });
+createSdkSessionRuntimeExtension(api, { ensureBrokerImpl: void 0 });
+createSdkSessionRuntimeExtension(api, { ensureBrokerImpl: null });
+createSdkSessionRuntimeExtension(api, { ensureBrokerImpl: undefined as never });
+createSdkSessionRuntimeExtension(api, { ensureBrokerImpl: stub });`,
+			"fixture.test.ts",
+		),
+	).toEqual([1, 2, 3, 4]);
 });
