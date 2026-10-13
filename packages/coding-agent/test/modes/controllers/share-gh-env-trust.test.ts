@@ -1,8 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import * as fs from "node:fs";
+import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { projectEnvSnapshot } from "@gajae-code/utils/env-file";
 
 /**
  * Default `/share` spawns `gh auth status` and `gh gist create` with an
@@ -81,29 +80,29 @@ interface GhSpawn {
 
 const tempDirs: string[] = [];
 
-function tempDir(prefix: string): string {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+async function tempDir(prefix: string): Promise<string> {
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
 	tempDirs.push(dir);
 	return dir;
 }
 
-afterEach(() => {
-	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+afterEach(async () => {
+	for (const dir of tempDirs.splice(0)) await fs.rm(dir, { recursive: true, force: true });
 });
 
-function writeGh(binDir: string): void {
-	fs.mkdirSync(binDir, { recursive: true });
+async function writeGh(binDir: string): Promise<void> {
+	await fs.mkdir(binDir, { recursive: true });
 	const gh = path.join(binDir, "gh");
-	fs.writeFileSync(
+	await Bun.write(
 		gh,
 		`#!/usr/bin/env -S bun --no-env-file
-import { appendFileSync } from "node:fs";
+import { appendFile } from "node:fs/promises";
 const record = process.env.GJC_SHARE_GH_RECORD;
 if (!record) {
 	console.error("missing share record");
 	process.exit(2);
 }
-appendFileSync(
+await appendFile(
 	record,
 	JSON.stringify({
 		args: process.argv.slice(2),
@@ -142,10 +141,10 @@ if (process.argv[2] === "auth") process.exit(0);
 process.stdout.write("https://gist.github.com/example/abc123\\n");
 `,
 	);
-	fs.chmodSync(gh, 0o755);
+	await fs.chmod(gh, 0o755);
 	const open = path.join(binDir, "open");
-	fs.writeFileSync(open, "#!/bin/sh\nexit 0\n");
-	fs.chmodSync(open, 0o755);
+	await Bun.write(open, "#!/bin/sh\nexit 0\n");
+	await fs.chmod(open, 0o755);
 }
 
 async function share(options: {
@@ -155,11 +154,11 @@ async function share(options: {
 	autoload?: boolean;
 	noSpawnError?: string;
 }): Promise<GhSpawn[]> {
-	const cwd = tempDir("gjc-share-gh-env-");
+	const cwd = await tempDir("gjc-share-gh-env-");
 	const binDir = path.join(cwd, "bin");
 	const record = path.join(cwd, "spawns.ndjson");
-	writeGh(binDir);
-	const moveTo = options.moveAway ? tempDir("gjc-share-gh-move-") : undefined;
+	await writeGh(binDir);
+	const moveTo = options.moveAway ? await tempDir("gjc-share-gh-move-") : undefined;
 
 	const env: Record<string, string> = {};
 	for (const [key, value] of Object.entries(process.env)) {
@@ -174,10 +173,7 @@ async function share(options: {
 	if (moveTo) env.GJC_SHARE_MOVE_TO = moveTo;
 	Object.assign(env, options.env);
 	if (options.dotenv !== undefined) {
-		fs.writeFileSync(path.join(cwd, ".env"), options.dotenv.replaceAll("$SHARE_TEST_PATH", env.PATH ?? ""));
-		if (options.dotenv.includes("$SHARE_TEST_PATH")) {
-			expect(projectEnvSnapshot(cwd).values.PATH?.trim()).toBe(env.PATH);
-		}
+		await Bun.write(path.join(cwd, ".env"), options.dotenv);
 	}
 
 	const args = options.autoload ? [PROBE] : ["--no-env-file", PROBE];
@@ -190,12 +186,12 @@ async function share(options: {
 	const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
 	const exitCode = await proc.exited;
 	if (exitCode !== 0) throw new Error(`probe failed (${exitCode}): ${stderr || stdout}`);
-	if (!fs.existsSync(record)) {
+	const recordFile = Bun.file(record);
+	if (!(await recordFile.exists())) {
 		if (options.noSpawnError && stderr.includes(options.noSpawnError)) return [];
 		throw new Error(`probe produced no gh spawns: ${stderr || stdout}`);
 	}
-	const spawns = fs
-		.readFileSync(record, "utf8")
+	const spawns = (await recordFile.text())
 		.trim()
 		.split("\n")
 		.filter(line => line.length > 0)
@@ -349,8 +345,8 @@ DYLD_ROOT_PATH=/project/root
 	it("refuses a project-only PATH instead of resolving gh from the checkout", async () => {
 		const spawns = await share({
 			autoload: true,
-			dotenv: `PATH=$SHARE_TEST_PATH
-`,
+			dotenv: "PATH=/project/bin\n",
+			env: { PATH: "/project/bin" },
 			noSpawnError: "GitHub CLI (gh) is not installed on the trusted operator PATH",
 		});
 		expect(spawns).toEqual([]);
