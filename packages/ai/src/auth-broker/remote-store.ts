@@ -1318,7 +1318,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 			return null;
 		}
 		if (!reports) return null;
-		return matchUsageReport(reports, provider, credential);
+		return matchUsageReport(reports, provider, credential, this.#usageMatchContext(provider));
 	}
 
 	/**
@@ -1347,6 +1347,18 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 				},
 			);
 		});
+	}
+
+	#usageMatchContext(provider: string): UsageMatchContext {
+		let credentialCount = 0;
+		const claimedOrganizationIds = new Set<string>();
+		for (const entry of this.#snapshot.credentials) {
+			if (entry.provider !== provider || entry.credential.type !== "oauth") continue;
+			credentialCount += 1;
+			const organizationId = normalizeOrganizationId(entry.credential.organizationId);
+			if (organizationId) claimedOrganizationIds.add(organizationId);
+		}
+		return { credentialCount, claimedOrganizationIds };
 	}
 
 	#identityDigestForEntry(entry: SnapshotEntry): string {
@@ -1386,7 +1398,12 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		if (this.#usageCacheEpoch !== epoch) return;
 		for (const entry of this.#snapshot.credentials) {
 			if (entry.credential.type !== "oauth") continue;
-			const report = matchUsageReport(reports, entry.provider, entry.credential);
+			const report = matchUsageReport(
+				reports,
+				entry.provider,
+				entry.credential,
+				this.#usageMatchContext(entry.provider),
+			);
 			if (!report) continue;
 			const fetchedAt = Number.isFinite(report.fetchedAt) ? report.fetchedAt : Date.now();
 			this.recordUsagePresentation({
@@ -1535,28 +1552,57 @@ function cloneUsagePresentation(observation: CachedUsagePresentation): CachedUsa
 	};
 }
 
+/** Facts about the provider's stored credentials that a usage report match must respect. */
+interface UsageMatchContext {
+	/** Stored OAuth credentials for the provider; a report without identity can only belong to a sole credential. */
+	credentialCount: number;
+	/** Organizations the provider's stored credentials are scoped to. */
+	claimedOrganizationIds: ReadonlySet<string>;
+}
+
 /**
  * Match a broker-supplied usage report to a specific OAuth credential. The
  * broker returns aggregate reports across all credentials it manages, so we
  * pick the one whose identity (accountId / email / projectId) and organization
  * line up with the credential the caller is asking about. Missing or ambiguous
- * usage data is safer than assigning another organization's limits.
+ * usage data is safer than assigning another credential's limits.
+ *
+ * Ownership must be shown by the report itself. A lone returned report is not
+ * evidence: when one credential's usage fetch fails, the broker returns only
+ * the others' reports. So a report is taken without an identity match only
+ * when the provider has a single stored credential. A credential stored
+ * without an organization never takes a report whose organization another
+ * stored credential claims.
  */
-function matchUsageReport(reports: UsageReport[], provider: Provider, credential: OAuthCredential): UsageReport | null {
-	const candidates = reports.filter(report => report.provider === provider);
+function matchUsageReport(
+	reports: UsageReport[],
+	provider: Provider,
+	credential: OAuthCredential,
+	context: UsageMatchContext,
+): UsageReport | null {
+	const organizationId = normalizeOrganizationId(credential.organizationId);
+	const candidates = reports.filter(report => {
+		if (report.provider !== provider) return false;
+		const reportOrganizationId = normalizeOrganizationId(
+			readMetadataString((report.metadata ?? {}) as Record<string, unknown>, "orgId"),
+		);
+		if (organizationId) return reportOrganizationId === organizationId;
+		return reportOrganizationId === undefined || !context.claimedOrganizationIds.has(reportOrganizationId);
+	});
 	if (candidates.length === 0) return null;
-	const organizationId = credential.organizationId?.trim().toLowerCase();
-	if (candidates.length === 1 && !organizationId) return candidates[0];
+	if (candidates.length === 1 && context.credentialCount === 1) return candidates[0];
 	const accountId = credential.accountId?.trim().toLowerCase();
 	const email = credential.email?.trim().toLowerCase();
 	const projectId = credential.projectId?.trim().toLowerCase();
 	for (const report of candidates) {
-		// The same account signed in to another organization reports that organization's limits.
-		const reportOrganizationId = readMetadataString((report.metadata ?? {}) as Record<string, unknown>, "orgId");
-		if (organizationId && reportOrganizationId?.toLowerCase() !== organizationId) continue;
 		if (reportMatchesIdentity(report, accountId, email, projectId)) return report;
 	}
 	return null;
+}
+
+function normalizeOrganizationId(organizationId: string | undefined): string | undefined {
+	const normalized = organizationId?.trim().toLowerCase();
+	return normalized ? normalized : undefined;
 }
 
 function reportMatchesIdentity(

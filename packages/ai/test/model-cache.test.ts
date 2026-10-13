@@ -268,6 +268,34 @@ describe("model cache migrations", () => {
 		dbPath = "";
 	});
 
+	it("removes the owned directory immediately after migrating and reading through the public API", async () => {
+		const legacyModel = createModel("legacy", "Legacy");
+		const legacyDb = new Database(dbPath, { create: true });
+		legacyDb.run(`
+			CREATE TABLE model_cache (
+				provider_id TEXT PRIMARY KEY,
+				version INTEGER NOT NULL,
+				updated_at INTEGER NOT NULL,
+				authoritative INTEGER NOT NULL DEFAULT 0,
+				models TEXT NOT NULL
+			)
+		`);
+		legacyDb.run(
+			"INSERT INTO model_cache (provider_id, version, updated_at, authoritative, models) VALUES (?, ?, ?, ?, ?)",
+			["ollama-cloud", 2, Date.now(), 1, JSON.stringify([legacyModel])],
+		);
+		legacyDb.close();
+
+		expect(readModelCache("ollama-cloud", TTL_MS, Date.now, dbPath)?.models.map(model => model.id)).toEqual([
+			"legacy",
+		]);
+		expect(closeModelCache(dbPath)).toBe(true);
+		expect(closeModelCache(dbPath)).toBe(false);
+		await fs.rm(tempDir, { recursive: true });
+		tempDir = "";
+		dbPath = "";
+	});
+
 	it("fully releases a database it switches away from", async () => {
 		const otherPath = path.join(tempDir, "other-models.db");
 		readModelCache("ollama-cloud", TTL_MS, Date.now, dbPath);
