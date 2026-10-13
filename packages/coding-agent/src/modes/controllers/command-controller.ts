@@ -145,8 +145,37 @@ const GH_SHARE_TRUST_KEY_SET = new Set(GH_SHARE_TRUST_KEYS.map(name => name.toUp
  */
 const ghShareProjectSnapshot = projectEnvSnapshot();
 const ghShareOperatorPath = process.env.PATH;
+const ghShareLaunchRoot = path.resolve(process.cwd());
 
-function resolveGhShareExecutable(): string | undefined {
+function isInsideDirectory(root: string, candidate: string): boolean {
+	const relative = path.relative(root, candidate);
+	return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+async function findCheckoutRoots(directory: string): Promise<string[] | undefined> {
+	const resolvedDirectory = await fs.realpath(directory).catch(() => undefined);
+	if (!resolvedDirectory) return undefined;
+	const roots: string[] = [];
+	let ancestor = resolvedDirectory;
+	while (true) {
+		try {
+			await fs.lstat(path.join(ancestor, ".git"));
+			roots.push(ancestor);
+		} catch (error) {
+			if (!(error instanceof Error) || !("code" in error) || error.code !== "ENOENT") return undefined;
+		}
+		const parent = path.dirname(ancestor);
+		if (parent === ancestor) break;
+		ancestor = parent;
+	}
+	return roots.length > 0 ? roots : [resolvedDirectory];
+}
+
+function isInsideAnyDirectory(roots: readonly string[], candidate: string): boolean {
+	return roots.some(root => isInsideDirectory(root, candidate));
+}
+
+async function resolveGhShareExecutable(): Promise<{ executable: string; searchPath: string } | undefined> {
 	const operatorPath = ghShareOperatorPath;
 	const key = canonicalEnvKey("PATH");
 	const declared = ghShareProjectSnapshot.values[key];
@@ -155,12 +184,40 @@ function resolveGhShareExecutable(): string | undefined {
 		(declared !== undefined && (ghShareProjectSnapshot.dynamic.has(key) || declared.trim() === operatorPath.trim()))
 	)
 		return undefined;
-	const trustedPath = operatorPath
-		.split(path.delimiter)
-		.filter(directory => path.isAbsolute(directory))
-		.join(path.delimiter);
-	if (!trustedPath) return undefined;
-	return Bun.which("gh", { PATH: trustedPath }) ?? undefined;
+	const checkoutRoots = new Set<string>();
+	for (const directory of new Set([ghShareLaunchRoot, path.resolve(process.cwd())])) {
+		checkoutRoots.add(path.resolve(directory));
+		const roots = await findCheckoutRoots(directory);
+		if (!roots) return undefined;
+		for (const root of roots) checkoutRoots.add(root);
+	}
+	const untrustedDirectories = [...checkoutRoots];
+	const trustedDirectories: string[] = [];
+	const seenDirectories = new Set<string>();
+	let executable: string | undefined;
+	for (const directory of operatorPath.split(path.delimiter)) {
+		if (!path.isAbsolute(directory)) continue;
+		const absoluteDirectory = path.resolve(directory);
+		if (isInsideAnyDirectory(untrustedDirectories, absoluteDirectory)) continue;
+		const realDirectory = await fs.realpath(absoluteDirectory).catch(() => undefined);
+		if (
+			!realDirectory ||
+			isInsideAnyDirectory(untrustedDirectories, realDirectory) ||
+			seenDirectories.has(realDirectory)
+		)
+			continue;
+		const candidate = Bun.which("gh", { PATH: realDirectory });
+		if (candidate) {
+			const absoluteCandidate = path.resolve(candidate);
+			if (isInsideAnyDirectory(untrustedDirectories, absoluteCandidate)) continue;
+			const realExecutable = await fs.realpath(absoluteCandidate).catch(() => undefined);
+			if (!realExecutable || isInsideAnyDirectory(untrustedDirectories, realExecutable)) continue;
+			executable ??= realExecutable;
+		}
+		seenDirectories.add(realDirectory);
+		trustedDirectories.push(realDirectory);
+	}
+	return executable ? { executable, searchPath: trustedDirectories.join(path.delimiter) } : undefined;
 }
 
 /**
@@ -169,10 +226,11 @@ function resolveGhShareExecutable(): string | undefined {
  * loader overrides that match the project dotenv are omitted so a repository
  * cannot redirect the upload, substitute the `gh` binary, authenticate with a
  * project-provided token, or intercept its HTTPS request. The executable itself
- * is resolved from the trusted operator PATH. Operator values the project does
- * not declare are kept.
+ * and its child search path use absolute operator PATH directories whose real
+ * paths are outside the launch and active checkouts. Operator values the project
+ * does not declare are kept.
  */
-function ghShareChildEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+function ghShareChildEnv(trustedPath: string, env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
 	const child: NodeJS.ProcessEnv = { ...env };
 	for (const name of Object.keys(child)) {
 		if (!GH_SHARE_TRUST_KEY_SET.has(name.toUpperCase())) continue;
@@ -189,6 +247,11 @@ function ghShareChildEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEn
 			}
 		}
 	}
+	const pathKey = canonicalEnvKey("PATH");
+	for (const name of Object.keys(child)) {
+		if (canonicalEnvKey(name) === pathKey) delete child[name];
+	}
+	child.PATH = trustedPath;
 	return child;
 }
 
@@ -327,14 +390,15 @@ export class CommandController {
 			return;
 		}
 
-		const ghShareExecutable = resolveGhShareExecutable();
-		if (!ghShareExecutable) {
+		const ghShare = await resolveGhShareExecutable();
+		if (!ghShare) {
 			this.ctx.showError(
 				"GitHub CLI (gh) is not installed on the trusted operator PATH. Install it from https://cli.github.com/",
 			);
 			return;
 		}
-		const ghEnv = ghShareChildEnv();
+		const ghShareExecutable = ghShare.executable;
+		const ghEnv = ghShareChildEnv(ghShare.searchPath);
 		try {
 			const authProcess = Bun.spawn([ghShareExecutable, "auth", "status"], {
 				env: ghEnv,

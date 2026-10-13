@@ -47,6 +47,9 @@ const TRUST_KEYS = [
 
 interface GhSpawn {
 	args: string[];
+	source: string;
+	cwd: string;
+	PATH: string;
 	GH_HOST: string | null;
 	GH_CONFIG_DIR: string | null;
 	GH_TOKEN: string | null;
@@ -90,7 +93,7 @@ afterEach(async () => {
 	for (const dir of tempDirs.splice(0)) await fs.rm(dir, { recursive: true, force: true });
 });
 
-async function writeGh(binDir: string): Promise<void> {
+async function writeGh(binDir: string, source: string): Promise<void> {
 	await fs.mkdir(binDir, { recursive: true });
 	const gh = path.join(binDir, "gh");
 	await Bun.write(
@@ -106,6 +109,9 @@ await appendFile(
 	record,
 	JSON.stringify({
 		args: process.argv.slice(2),
+		source: ${JSON.stringify(source)},
+		cwd: process.cwd(),
+		PATH: process.env.PATH ?? "",
 		GH_HOST: process.env.GH_HOST ?? null,
 		GH_CONFIG_DIR: process.env.GH_CONFIG_DIR ?? null,
 		GH_TOKEN: process.env.GH_TOKEN ?? null,
@@ -153,12 +159,37 @@ async function share(options: {
 	moveAway?: boolean;
 	autoload?: boolean;
 	noSpawnError?: string;
+	ghPathMode?:
+		| "trusted"
+		| "checkout-relative"
+		| "checkout-absolute"
+		| "checkout-directory-symlink"
+		| "checkout-executable-symlink"
+		| "checkout-executable-symlink-fallback"
+		| "moved-checkout";
 }): Promise<GhSpawn[]> {
 	const cwd = await tempDir("gjc-share-gh-env-");
 	const binDir = path.join(cwd, "bin");
+	const operatorBinDir = await tempDir("gjc-share-gh-operator-bin-");
 	const record = path.join(cwd, "spawns.ndjson");
-	await writeGh(binDir);
+	await writeGh(binDir, "checkout");
+	await writeGh(operatorBinDir, "operator");
+	const ghPathMode = options.ghPathMode ?? "trusted";
+	if (ghPathMode === "checkout-directory-symlink") {
+		await fs.rm(operatorBinDir, { recursive: true, force: true });
+		await fs.symlink(binDir, operatorBinDir);
+	} else if (ghPathMode === "checkout-executable-symlink" || ghPathMode === "checkout-executable-symlink-fallback") {
+		await fs.rm(path.join(operatorBinDir, "gh"));
+		await fs.symlink(path.join(binDir, "gh"), path.join(operatorBinDir, "gh"));
+	}
+	const fallbackBinDir =
+		ghPathMode === "checkout-executable-symlink-fallback" ? await tempDir("gjc-share-gh-fallback-bin-") : undefined;
+	if (fallbackBinDir) await writeGh(fallbackBinDir, "operator");
 	const moveTo = options.moveAway ? await tempDir("gjc-share-gh-move-") : undefined;
+	if (ghPathMode === "moved-checkout") {
+		if (!moveTo) throw new Error("Moved-checkout PATH fixture was not created.");
+		await writeGh(path.join(moveTo, "bin"), "checkout");
+	}
 
 	const env: Record<string, string> = {};
 	for (const [key, value] of Object.entries(process.env)) {
@@ -169,7 +200,28 @@ async function share(options: {
 	delete env.GJC_SHARE_EXPECT_CONFIG;
 	delete env.GJC_SHARE_MOVE_TO;
 	env.GJC_SHARE_GH_RECORD = record;
-	env.PATH = `${binDir}${path.delimiter}${process.env.PATH ?? ""}`;
+	switch (ghPathMode) {
+		case "checkout-relative":
+			env.PATH = "bin";
+			break;
+		case "checkout-absolute":
+			env.PATH = binDir;
+			break;
+		case "checkout-directory-symlink":
+		case "checkout-executable-symlink":
+			env.PATH = operatorBinDir;
+			break;
+		case "checkout-executable-symlink-fallback":
+			if (!fallbackBinDir) throw new Error("Trusted fallback PATH fixture was not created.");
+			env.PATH = `${operatorBinDir}${path.delimiter}${fallbackBinDir}${path.delimiter}${process.env.PATH ?? ""}`;
+			break;
+		case "moved-checkout":
+			if (!moveTo) throw new Error("Moved-checkout PATH fixture was not created.");
+			env.PATH = path.join(moveTo, "bin");
+			break;
+		default:
+			env.PATH = `${binDir}${path.delimiter}${operatorBinDir}${path.delimiter}${process.env.PATH ?? ""}`;
+	}
 	if (moveTo) env.GJC_SHARE_MOVE_TO = moveTo;
 	Object.assign(env, options.env);
 	if (options.dotenv !== undefined) {
@@ -240,6 +292,14 @@ function expectDestination(
 	expect(spawns[0]?.args).toEqual(["auth", "status"]);
 	expect(spawns[1]?.args.slice(0, 3)).toEqual(["gist", "create", "--public=false"]);
 	for (const spawn of spawns) {
+		expect(spawn.source).toBe("operator");
+		for (const directory of spawn.PATH.split(path.delimiter)) {
+			const relative = path.relative(spawn.cwd, directory);
+			expect(
+				relative === "" ||
+					(relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)),
+			).toBe(false);
+		}
 		expect(spawn.GH_HOST).toBe(expected.GH_HOST ?? null);
 		expect(spawn.GH_CONFIG_DIR).toBe(expected.GH_CONFIG_DIR ?? null);
 		expect(spawn.GH_TOKEN).toBe(expected.GH_TOKEN ?? null);
@@ -357,12 +417,58 @@ DYLD_ROOT_PATH=/project/root
 		const spawns = await share({
 			autoload: true,
 			dotenv: "OTHER=1\n",
-			env: {
-				PATH: "bin",
-			},
+			ghPathMode: "checkout-relative",
 			noSpawnError: "GitHub CLI (gh) is not installed on the trusted operator PATH",
 		});
 		expect(spawns).toEqual([]);
+	});
+
+	it("uses an operator gh instead of an absolute checkout PATH entry", async () => {
+		const spawns = await share({
+			autoload: true,
+			dotenv: "OTHER=1\n",
+			ghPathMode: "trusted",
+		});
+		expectDestination(spawns, {});
+	});
+
+	it("refuses a checkout-only absolute operator PATH", async () => {
+		const spawns = await share({
+			autoload: true,
+			dotenv: "OTHER=1\n",
+			ghPathMode: "checkout-absolute",
+			noSpawnError: "GitHub CLI (gh) is not installed on the trusted operator PATH",
+		});
+		expect(spawns).toEqual([]);
+	});
+
+	it("refuses a PATH directory symlink that resolves into the checkout", async () => {
+		const spawns = await share({
+			autoload: true,
+			dotenv: "OTHER=1\n",
+			ghPathMode: "checkout-directory-symlink",
+			noSpawnError: "GitHub CLI (gh) is not installed on the trusted operator PATH",
+		});
+		expect(spawns).toEqual([]);
+	});
+
+	it("refuses an operator-path gh symlink that resolves into the checkout", async () => {
+		const spawns = await share({
+			autoload: true,
+			dotenv: "OTHER=1\n",
+			ghPathMode: "checkout-executable-symlink",
+			noSpawnError: "GitHub CLI (gh) is not installed on the trusted operator PATH",
+		});
+		expect(spawns).toEqual([]);
+	});
+
+	it("skips a checkout-targeting gh symlink and selects a trusted fallback", async () => {
+		const spawns = await share({
+			autoload: true,
+			dotenv: "OTHER=1\n",
+			ghPathMode: "checkout-executable-symlink-fallback",
+		});
+		expectDestination(spawns, {});
 	});
 
 	it("keeps an operator host and config directory the project does not declare", async () => {
@@ -434,6 +540,17 @@ SSL_CERT_FILE=project-ca.pem
 			},
 		});
 		expectDestination(spawns, { GH_HOST: null, GH_CONFIG_DIR: null, GH_TOKEN: "operator-token" });
+	});
+
+	it("refuses a PATH executable owned by the checkout after the session moves", async () => {
+		const spawns = await share({
+			autoload: true,
+			moveAway: true,
+			ghPathMode: "moved-checkout",
+			dotenv: "OTHER=1\n",
+			noSpawnError: "GitHub CLI (gh) is not installed on the trusted operator PATH",
+		});
+		expect(spawns).toEqual([]);
 	});
 
 	it("omits a dynamic project declaration even when the runtime value differs", async () => {
