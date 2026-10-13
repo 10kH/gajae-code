@@ -1119,8 +1119,10 @@ describe("AgentSession message pipeline", () => {
 		} finally {
 			unsubscribe();
 		}
-		// Re-enable settlement so cleanup can proceed
+		// Re-enable settlement so cleanup can proceed. Reset integrationAborted to track
+		// the next recovery request (not the one that timed out during neverSettle).
 		neverSettle = false;
+		integrationAborted = false;
 		expect(integrationAborted).toBe(false);
 		await sdkSubmission;
 		await Bun.sleep(25);
