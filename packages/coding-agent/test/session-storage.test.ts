@@ -93,6 +93,7 @@ describe("native publish outcome classification", () => {
 			["destination_exists", "already_exists"],
 			["cross_device", "cross_device"],
 			["permission_denied", "permission_denied"],
+			["access_denied", "access_denied"],
 			["io_failure", "io_error"],
 			["interrupted", "interrupted"],
 		] as const) {

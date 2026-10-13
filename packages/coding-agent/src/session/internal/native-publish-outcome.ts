@@ -6,6 +6,7 @@ export type NativePublishReason =
 	| "atomic_unavailable"
 	| "cross_device"
 	| "permission_denied"
+	| "access_denied"
 	| "io_failure"
 	| "interrupted"
 	| "invalid_request"
@@ -77,6 +78,7 @@ const reasons = new Set<NativePublishReason>([
 	"atomic_unavailable",
 	"cross_device",
 	"permission_denied",
+	"access_denied",
 	"io_failure",
 	"interrupted",
 	"invalid_request",
@@ -109,6 +111,7 @@ const preMutationReasons = new Set<NativePublishReason>([
 	"atomic_unavailable",
 	"cross_device",
 	"permission_denied",
+	"access_denied",
 	"io_failure",
 	"interrupted",
 	"invalid_request",
@@ -184,6 +187,7 @@ function legalOutcome(outcome: NativePublishOutcome): boolean {
 					"atomic_unavailable",
 					"cross_device",
 					"permission_denied",
+					"access_denied",
 					"io_failure",
 					"interrupted",
 				].includes(outcome.reason)) ||
