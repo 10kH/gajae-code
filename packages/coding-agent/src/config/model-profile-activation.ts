@@ -157,6 +157,7 @@ export interface PrepareModelProfileActivationOptions {
 				| "getSessionCanonicalVariant"
 				| "restoreSessionCanonicalVariant"
 				| "getConfiguredProviderIds"
+				| "getConfiguredModelBindings"
 				| "isKnownProvider"
 			>
 		> & {
@@ -1682,6 +1683,7 @@ export async function prepareModelProfileActivation(
 		const manualAgentModelOverrides = new Set(
 			options.preserveManualOverrides ? (installedState?.manualAgentModelOverrides ?? []) : [],
 		);
+		const configuredAgentModelOverrides = options.modelRegistry?.getConfiguredModelBindings?.()?.agentModelOverrides;
 		for (const role of installedKeys?.modelRoles ?? []) {
 			if (options.preserveManualOverrides && manualModelRoleOverrides.has(role)) continue;
 			const installed = installedState?.installedModelRoles.get(role);
@@ -1697,6 +1699,7 @@ export async function prepareModelProfileActivation(
 		}
 		for (const role of installedKeys?.agentModelOverrides ?? []) {
 			if (options.preserveManualOverrides && manualAgentModelOverrides.has(role)) continue;
+			if (Object.hasOwn(configuredAgentModelOverrides ?? {}, role)) continue;
 			const installed = installedState?.installedAgentModelOverrides.get(role);
 			if (
 				options.preserveManualOverrides &&
@@ -1713,17 +1716,17 @@ export async function prepareModelProfileActivation(
 			if (value === undefined) delete baseModelRoles[role];
 			else baseModelRoles[role] = value;
 		}
-		const configuredBindings = options.modelRegistry?.getConfiguredModelBindings?.();
 		for (const [role, value] of installedState?.agentModelOverrides ?? []) {
 			if (manualAgentModelOverrides.has(role)) continue;
-			// Do not restore baseline values that match configured model bindings.
-			// Configured bindings are applied separately and should not be part of
-			// the profile's baseline, even if they were the value before a profile
-			// was activated.
-			if (
-				configuredBindings?.agentModelOverrides?.[role] !== undefined &&
-				selectorValuesEqual(value, configuredBindings.agentModelOverrides[role])
-			) {
+			const configuredBinding = configuredAgentModelOverrides?.[role];
+			if (configuredBinding !== undefined) {
+				// Profile activation replaces this runtime slot. Rebase the baseline on
+				// the current configuration instead of restoring a value captured from
+				// an earlier binding revision.
+				baseAgentModelOverrides[role] = configuredBinding;
+			} else if (installedState?.configuredAgentModelOverrides.has(role)) {
+				// A removed binding must not revive its former value from the profile
+				// baseline after a configuration reload.
 				delete baseAgentModelOverrides[role];
 			} else if (value === undefined) {
 				delete baseAgentModelOverrides[role];

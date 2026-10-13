@@ -2703,6 +2703,7 @@ export interface AgentSessionProfileInstalledOverrideState {
 	installedAgentModelOverrides: ReadonlyMap<string, ModelSelectorValue>;
 	manualModelRoles: ReadonlySet<string>;
 	manualAgentModelOverrides: ReadonlySet<string>;
+	configuredAgentModelOverrides: ReadonlySet<string>;
 	preProfileModel: Model | undefined;
 }
 
@@ -2867,6 +2868,7 @@ export class AgentSession {
 	#activeProfileInstalledAgentOverrideValues = new Map<string, ModelSelectorValue>();
 	#activeProfileManualModelRoles = new Set<string>();
 	#activeProfileManualAgentModelOverrides = new Set<string>();
+	#activeProfileConfiguredAgentModelOverrides = new Set<string>();
 	#preProfileModel: Model | undefined;
 	#sessionAdmissionQueue: SessionAdmissionEntry[] = [];
 	#activeSessionAdmission: SessionAdmissionEntry | undefined;
@@ -19160,6 +19162,7 @@ export class AgentSession {
 			this.#activeProfileInstalledAgentOverrides.clear();
 			this.#activeProfileInstalledRoleValues.clear();
 			this.#activeProfileInstalledAgentOverrideValues.clear();
+			this.#activeProfileConfiguredAgentModelOverrides.clear();
 		}
 		if (hadInstalledKeys || this.getActiveModelProfile() !== undefined) {
 			this.#modelRegistry.reapplyConfiguredModelBindings(this.settings);
@@ -19201,6 +19204,7 @@ export class AgentSession {
 			if (!agentOverrideSet.has(role)) {
 				this.#activeProfileInstalledAgentOverrides.delete(role);
 				this.#activeProfileInstalledAgentOverrideValues.delete(role);
+				this.#activeProfileConfiguredAgentModelOverrides.delete(role);
 			}
 		}
 		for (const role of modelRoles) {
@@ -19219,6 +19223,11 @@ export class AgentSession {
 			if (installedValue !== undefined) this.#activeProfileInstalledRoleValues.set(role, installedValue);
 		}
 		for (const role of agentModelOverrides) {
+			if (Object.hasOwn(bindings?.agentModelOverrides ?? {}, role)) {
+				this.#activeProfileConfiguredAgentModelOverrides.add(role);
+			} else {
+				this.#activeProfileConfiguredAgentModelOverrides.delete(role);
+			}
 			if (!this.#activeProfileInstalledAgentOverrides.has(role)) {
 				const bindingValue = bindings?.agentModelOverrides?.[role];
 				this.#activeProfileInstalledAgentOverrides.set(
@@ -19246,6 +19255,7 @@ export class AgentSession {
 			installedAgentModelOverrides: new Map(this.#activeProfileInstalledAgentOverrideValues),
 			manualModelRoles: new Set(this.#activeProfileManualModelRoles),
 			manualAgentModelOverrides: new Set(this.#activeProfileManualAgentModelOverrides),
+			configuredAgentModelOverrides: new Set(this.#activeProfileConfiguredAgentModelOverrides),
 			preProfileModel: this.#preProfileModel,
 		};
 	}
@@ -19257,6 +19267,7 @@ export class AgentSession {
 		this.#activeProfileInstalledAgentOverrideValues = new Map(state.installedAgentModelOverrides);
 		this.#activeProfileManualModelRoles = new Set(state.manualModelRoles);
 		this.#activeProfileManualAgentModelOverrides = new Set(state.manualAgentModelOverrides);
+		this.#activeProfileConfiguredAgentModelOverrides = new Set(state.configuredAgentModelOverrides);
 		this.#preProfileModel = state.preProfileModel;
 	}
 
@@ -19268,6 +19279,7 @@ export class AgentSession {
 		this.#activeProfileInstalledAgentOverrideValues.clear();
 		this.#activeProfileManualModelRoles.clear();
 		this.#activeProfileManualAgentModelOverrides.clear();
+		this.#activeProfileConfiguredAgentModelOverrides.clear();
 	}
 
 	/** Current profile-installed override keys, for deriving the activation base. */
@@ -27668,6 +27680,9 @@ export class AgentSession {
 			);
 			const previousActiveProfileManualModelRoles = new Set(this.#activeProfileManualModelRoles);
 			const previousActiveProfileManualAgentModelOverrides = new Set(this.#activeProfileManualAgentModelOverrides);
+			const previousActiveProfileConfiguredAgentModelOverrides = new Set(
+				this.#activeProfileConfiguredAgentModelOverrides,
+			);
 			const previousPreProfileModel = this.#preProfileModel;
 			const previousServiceTier = this.agent.serviceTier;
 			const previousSelectedMCPToolNames = new Set(this.#selectedMCPToolNames);
@@ -28104,6 +28119,9 @@ export class AgentSession {
 				);
 				this.#activeProfileManualModelRoles = new Set(previousActiveProfileManualModelRoles);
 				this.#activeProfileManualAgentModelOverrides = new Set(previousActiveProfileManualAgentModelOverrides);
+				this.#activeProfileConfiguredAgentModelOverrides = new Set(
+					previousActiveProfileConfiguredAgentModelOverrides,
+				);
 				this.#preProfileModel = previousPreProfileModel;
 				this.#activeModelProfile = previousActiveModelProfile;
 				this.#restoreWorkflowGateEmitter(suspendedWorkflowGateEmitter);

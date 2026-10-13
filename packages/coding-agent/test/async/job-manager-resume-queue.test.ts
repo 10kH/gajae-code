@@ -451,7 +451,9 @@ describe("AsyncJobManager subagent pause/resume/queue", () => {
 		expect(completions.map(completion => completion.text)).toContain("resumed:C");
 		const proof = await manager.cancelAndProveOwnerSubagents(lease, { timeoutMs: 50 });
 		expect(proof).toMatchObject({ confirmed: true, terminalIds: ["A"], unresolvedIds: [] });
+		expect(manager.getSubagentRecord("A")?.status).toBe("queued");
 		manager.finishOwnerSubagentShutdown(lease, "release");
+		expect(manager.getSubagentRecord("A")?.status).toBe("queued");
 		await manager.dispose({ timeoutMs: 500 });
 	});
 

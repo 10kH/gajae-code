@@ -1675,20 +1675,22 @@ export class AsyncJobManager {
 		for (const target of lease.targets) {
 			const executions = state.backingExecutions.get(target.subagentId) ?? [];
 			const capture = state.records.get(target.subagentId);
-			if (
+			const record = capture?.record;
+			const preserveQueuedRecord =
 				target.source === "record" &&
-				capture &&
-				this.#subagentRecords.get(target.subagentId) === capture.record &&
-				capture.record.status === "queued"
-			) {
-				this.cancelSubagent(target.subagentId, { ownerId: lease.ownerId });
-			}
+				target.jobId === null &&
+				capture !== undefined &&
+				record !== undefined &&
+				this.#subagentRecords.get(target.subagentId) === record &&
+				record.ownerId === lease.ownerId &&
+				record.currentJobId === capture.currentJobId &&
+				record.currentJobGeneration === capture.currentJobGeneration &&
+				record.status === "queued";
 			for (const execution of executions) {
-				this.#cancelExactExecution(execution);
+				if (!preserveQueuedRecord) this.#cancelExactExecution(execution);
 				promises.add(execution.physicalCompletion);
 			}
 			if (target.source !== "record" || executions.length > 0) continue;
-			const record = capture?.record;
 			if (!capture || !record || this.#subagentRecords.get(target.subagentId) !== record) continue;
 			if (record.status === "paused") {
 				const row = record.currentJobId ? this.#jobs.get(record.currentJobId) : undefined;
@@ -1737,21 +1739,27 @@ export class AsyncJobManager {
 	): boolean {
 		const capture = state.records.get(target.subagentId);
 		const record = capture?.record;
+		const physicallySettled = (state.backingExecutions.get(target.subagentId) ?? []).every(
+			execution => execution.job.ownerId === ownerId && execution.physicallySettled,
+		);
+		if (!capture || !record) return false;
 
-		// Special case: queued records (target.jobId === null) are terminal for a shutting-down owner
-		// because the owner is fenced and will never let them resume. Any queued record that belonged
-		// to this owner is terminal, whether it's still queued or was cancelled during proving.
-		if (target.jobId === null) {
-			const currentRecord = this.#subagentRecords.get(target.subagentId);
-			const recordOwner = currentRecord?.ownerId ?? record?.ownerId;
-			if (recordOwner === ownerId) {
-				return true;
-			}
+		// A queued record is terminal only for the captured owner record and generation:
+		// the lease fence keeps it queued until release or commit, and it must not be
+		// cancelled merely to collect shutdown evidence.
+		if (
+			target.source === "record" &&
+			target.jobId === null &&
+			this.#subagentRecords.get(target.subagentId) === record &&
+			record.ownerId === ownerId &&
+			record.currentJobId === capture.currentJobId &&
+			record.currentJobGeneration === capture.currentJobGeneration &&
+			record.status === "queued"
+		) {
+			return physicallySettled;
 		}
 
-		// Standard terminal validation for non-queued records
 		if (
-			!record ||
 			this.#subagentRecords.get(target.subagentId) !== record ||
 			record.ownerId !== ownerId ||
 			record.currentJobId !== capture.currentJobId ||
@@ -1762,9 +1770,7 @@ export class AsyncJobManager {
 		if (!this.#isTerminalSubagentStatus(record.status)) {
 			return false;
 		}
-		return (state.backingExecutions.get(target.subagentId) ?? []).every(
-			execution => execution.job.ownerId === ownerId && execution.physicallySettled,
-		);
+		return physicallySettled;
 	}
 
 	#ownerSubagentShutdownProof(
