@@ -531,6 +531,31 @@ test("clears an access-denied receipt when a later acquisition attempt sees a li
 	expect(failure.holderIsLive).toBe(true);
 });
 
+test("classifies access-denied exhaustion as timeout when a holder is proven live", async () => {
+	const { file, lock } = await makeFixture();
+	const liveIncarnation = "current-live-incarnation";
+	FileLockTestHooks.processIncarnation = () => liveIncarnation;
+	await fs.mkdir(lock);
+	await Bun.write(
+		path.join(lock, "info"),
+		removalInfo(process.pid, undefined, { process_incarnation: liveIncarnation }),
+	);
+	FileLockTestHooks.nativePublicationBindings = () => ({
+		renameNoReplacePathAsync: async () => accessDeniedPublication(),
+		renameDirectoryNoReplacePathAsync,
+	});
+
+	const failure = await acquireFileLock(file, { retries: 1, retryDelayMs: 1 }).then(
+		() => undefined,
+		(error: unknown) => error,
+	);
+	expect(failure).toBeInstanceOf(FileLockAcquireError);
+	if (!(failure instanceof FileLockAcquireError)) throw new Error("expected file lock acquisition failure");
+	expect(failure.publicationFailureCode).toBe("access_denied");
+	expect(failure.holderIsLive).toBe(true);
+	expect(isFileLockAcquireTimeout(failure)).toBe(true);
+});
+
 test("acquisition reports live-holder evidence separately from ambiguous lock records", async () => {
 	const liveIncarnation = "known-live-incarnation";
 	const unavailableIncarnation = "unavailable-incarnation";
@@ -688,6 +713,58 @@ test("stops retrying when failed publication staging cannot be cleaned", async (
 	expect(publicationAttempts).toBe(3); // 1 initial + 2 bounded retries
 	expect(cleanupAttempts).toBe(5);
 	expect((await fs.readdir(root)).filter(name => name.includes(".pending."))).toHaveLength(1);
+});
+
+test("retains staging cleanup ownership after abort and retries it on the next acquisition", async () => {
+	const { root, file, lock } = await makeFixture();
+	const cleanupStarted = Promise.withResolvers<void>();
+	const controller = new AbortController();
+	const reason = new Error("cancelled during staging cleanup");
+	let publicationAttempts = 0;
+	let cleanupAttempts = 0;
+	FileLockTestHooks.nativePublicationBindings = () => ({
+		renameNoReplacePathAsync: async (source, destination) => {
+			publicationAttempts++;
+			if (publicationAttempts <= expectedBoundedPublicationCalls) return accessDeniedPublication();
+			await fs.rename(source, destination);
+			return successfulPublication(primaryPrimitive ?? "windows_rename_noreplace");
+		},
+		renameDirectoryNoReplacePathAsync,
+	});
+	FileLockTestHooks.cleanupPendingStaging = async stagingPath => {
+		cleanupAttempts++;
+		if (cleanupAttempts <= 2) {
+			if (cleanupAttempts === 1) cleanupStarted.resolve();
+			throw Object.assign(new Error("staging cleanup denied"), { code: "EACCES" });
+		}
+		await fs.rm(stagingPath, { recursive: true, force: true });
+	};
+
+	const cancelledAcquisition = acquireFileLock(file, {
+		retries: 5,
+		retryDelayMs: 500,
+		signal: controller.signal,
+	});
+	await cleanupStarted.promise;
+	await Bun.sleep(5);
+	controller.abort(reason);
+	await expect(cancelledAcquisition).rejects.toBe(reason);
+	expect(cleanupAttempts).toBe(2);
+	const retainedName = (await fs.readdir(root)).find(name => name.includes(".pending."));
+	if (!retainedName) throw new Error("expected aborted staging directory to remain pending");
+	const retainedPath = path.join(root, retainedName);
+
+	FileLockTestHooks.cleanupPendingStaging = async stagingPath => {
+		cleanupAttempts++;
+		await fs.rm(stagingPath, { recursive: true, force: true });
+	};
+	const release = await acquireFileLock(file, { retries: 1, retryDelayMs: 1 });
+	expect(cleanupAttempts).toBe(3);
+	await expect(fs.lstat(retainedPath)).rejects.toMatchObject({ code: "ENOENT" });
+	expect(publicationAttempts).toBe(expectedBoundedPublicationCalls + 1);
+	await release();
+	await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
+	expect((await fs.readdir(root)).filter(name => name.includes(".pending."))).toHaveLength(0);
 });
 
 test("uses a liveness-probed legacy staging name when process identity is unavailable", async () => {

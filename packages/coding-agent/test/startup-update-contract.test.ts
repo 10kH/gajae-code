@@ -1251,7 +1251,7 @@ describe("startup update contract", () => {
 			expect(exitSpy).toHaveBeenCalledWith(1);
 			expect(printModeStarted).toBe(false);
 			expect(settings.get("modelProfile.default")).toBe("codex-medium");
-			expect(stderr.join("")).toContain('Model profile "codex-medium" requires credentials for: openai-codex');
+			expect(stderr.join("")).toContain('Model profile "Codex Medium" requires credentials for: openai-codex');
 			expect(getApiKeySpy.mock.calls.map(call => [call[0], call[1]])).toContainEqual([
 				"openai-codex",
 				FAKE_SESSION_ID,

@@ -119,7 +119,7 @@ export function isFileLockAcquireTimeout(error: unknown): error is FileLockAcqui
 	return (
 		error instanceof FileLockAcquireError &&
 		error.code === "acquire_timeout" &&
-		error.publicationFailureCode !== "access_denied"
+		(error.publicationFailureCode !== "access_denied" || error.holderIsLive)
 	);
 }
 
@@ -130,6 +130,8 @@ const DEFAULT_OPTIONS: Required<
 	retries: 50,
 	retryDelayMs: 100,
 };
+
+const pendingStagingCleanups = new Set<string>();
 
 /**
  * Windows can transiently deny a no-replace publication while another process holds
@@ -196,25 +198,51 @@ async function sleepFileLockRetry(delayMs: number, signal?: AbortSignal): Promis
 	}
 	throwIfFileLockAcquisitionAborted(signal);
 	const settled = Promise.withResolvers<void>();
-	let timer: NodeJS.Timeout | undefined;
 	const onAbort = (): void => {
-		if (timer) clearTimeout(timer);
 		settled.reject(signal.reason ?? new Error("File lock acquisition aborted"));
 	};
-	timer = setTimeout(
-		() => {
-			signal.removeEventListener("abort", onAbort);
-			settled.resolve();
-		},
-		Math.max(0, delayMs),
-	);
 	signal.addEventListener("abort", onAbort, { once: true });
-	if (signal.aborted) onAbort();
 	try {
-		await settled.promise;
+		if (signal.aborted) onAbort();
+		await Promise.race([Bun.sleep(Math.max(0, delayMs)), settled.promise]);
 	} finally {
-		if (timer) clearTimeout(timer);
 		signal.removeEventListener("abort", onAbort);
+	}
+}
+
+async function removePendingStaging(stagingPath: string): Promise<void> {
+	const cleanup = FileLockTestHooks.cleanupPendingStaging;
+	if (cleanup) await cleanup(stagingPath);
+	else await fs.rm(stagingPath, { recursive: true, force: true });
+}
+
+async function abortStagingCleanup(stagingPath: string, signal: AbortSignal): Promise<never> {
+	try {
+		await removePendingStaging(stagingPath);
+		pendingStagingCleanups.delete(stagingPath);
+	} catch (error) {
+		// The stage is still owned by this acquisition. Preserve an in-process retry
+		// until another acquisition can clean it; after process exit the orphan reaper
+		// can safely reclaim it once this publisher is no longer live.
+		pendingStagingCleanups.add(stagingPath);
+		logger.debug("Retained file-lock staging cleanup after acquisition abort", {
+			stagingPath,
+			error: String(error),
+		});
+	}
+	throw signal.reason ?? new Error("File lock acquisition aborted");
+}
+
+async function retryPendingStagingCleanups(lockPath: string): Promise<void> {
+	const lockParent = path.resolve(path.dirname(lockPath));
+	for (const stagingPath of pendingStagingCleanups) {
+		if (path.resolve(path.dirname(stagingPath)) !== lockParent) continue;
+		try {
+			await removePendingStaging(stagingPath);
+			pendingStagingCleanups.delete(stagingPath);
+		} catch (error) {
+			logger.debug("File-lock staging cleanup remains pending", { stagingPath, error: String(error) });
+		}
 	}
 }
 
@@ -223,23 +251,13 @@ async function cleanupPendingStagingOrThrow(
 	stagingPath: string,
 	retryBudget: FileLockAcquisitionRetryBudget,
 ): Promise<void> {
-	// Honor aborts during staging cleanup retries: when the outer acquisition
-	// is cancelled, clean up the staging directory and propagate the abort.
 	for (;;) {
-		if (retryBudget.signal?.aborted) {
-			await fs.rm(stagingPath, { recursive: true, force: true }).catch(() => undefined);
-			throw retryBudget.signal.reason ?? new Error("File lock acquisition aborted");
-		}
+		if (retryBudget.signal?.aborted) await abortStagingCleanup(stagingPath, retryBudget.signal);
 		try {
-			const cleanup = FileLockTestHooks.cleanupPendingStaging;
-			if (cleanup) await cleanup(stagingPath);
-			else await fs.rm(stagingPath, { recursive: true, force: true });
+			await removePendingStaging(stagingPath);
 			return;
 		} catch (error) {
-			if (retryBudget.signal?.aborted) {
-				await fs.rm(stagingPath, { recursive: true, force: true }).catch(() => undefined);
-				throw retryBudget.signal.reason ?? new Error("File lock acquisition aborted");
-			}
+			if (retryBudget.signal?.aborted) await abortStagingCleanup(stagingPath, retryBudget.signal);
 			if (!isTransientReleaseError(error) || retryBudget.remainingDelays === 0)
 				throw new FileLockStagingCleanupError(lockPath, stagingPath, error);
 			// An open child can deny both publication and removal on Windows. Keep the
@@ -249,8 +267,7 @@ async function cleanupPendingStagingOrThrow(
 				await sleepFileLockRetry(retryBudget.retryDelayMs, retryBudget.signal);
 			} catch (abortError) {
 				if (!retryBudget.signal?.aborted) throw abortError;
-				await fs.rm(stagingPath, { recursive: true, force: true }).catch(() => undefined);
-				throw retryBudget.signal.reason ?? abortError;
+				await abortStagingCleanup(stagingPath, retryBudget.signal);
 			}
 		}
 	}
@@ -2757,6 +2774,7 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 	const lockPath = getLockPath(filePath);
 	await ensureLockParent(path.dirname(lockPath));
 	try {
+		await retryPendingStagingCleanups(lockPath);
 		await reapOrphanedLockStagingDirs(lockPath);
 	} catch (error) {
 		logger.debug("Failed to reap orphaned file-lock staging directories", { lockPath, error: String(error) });
