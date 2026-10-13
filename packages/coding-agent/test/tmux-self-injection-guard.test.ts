@@ -224,10 +224,7 @@ describe("tmux self-injection guard", () => {
 	});
 
 	// Tests for must-stay-allowed cases (issue #6563)
-	// Note: these tests check that wrappers correctly parse option arguments
-	// TODO: revisit these - they currently fail but represent important edge cases
 	describe("must-stay-allowed cases", () => {
-		/*
 		it("should allow env -u tmux where tmux is the unset variable", async () => {
 			await expect(checkTmuxSelfInjection("env -u tmux send-keys -t %47 x", options)).resolves.toEqual({
 				block: false,
@@ -239,7 +236,20 @@ describe("tmux self-injection guard", () => {
 				block: false,
 			});
 		});
-		*/
+
+		it("allows builtin with an external executable name", async () => {
+			await expect(checkTmuxSelfInjection("builtin tmux send-keys -t %47 x", options)).resolves.toEqual({
+				block: false,
+			});
+		});
+
+		it("blocks an external command dispatched through the builtin command wrapper", async () => {
+			await expect(
+				checkTmuxSelfInjection("builtin command tmux send-keys -t %47 x", options),
+			).resolves.toMatchObject({
+				block: true,
+			});
+		});
 
 		it("should allow bash script with -ce after operand", async () => {
 			const scriptPath = "/tmp/gjc-6563-safe.sh";
@@ -656,6 +666,12 @@ describe("tmux self-injection guard", () => {
 			).resolves.toMatchObject({ block: true });
 		});
 
+		it("does not treat xargs --arg-file operands as TMUX assignments", async () => {
+			await expect(
+				checkTmuxSelfInjection("xargs --arg-file TMUX=other tmux send-keys -t %47 x", options),
+			).resolves.toMatchObject({ block: true });
+		});
+
 		// Issue 3: P1 — env -S split-string payload
 		it("blocks env -S with tmux in split string", async () => {
 			// Issue: env -S 'tmux send-keys -t %47 x'
@@ -669,6 +685,12 @@ describe("tmux self-injection guard", () => {
 			// Long form of -S
 			await expect(
 				checkTmuxSelfInjection("env --split-string='tmux send-keys -t %47 x'", options),
+			).resolves.toMatchObject({ block: true });
+		});
+
+		it("blocks env --split-string with a separated payload", async () => {
+			await expect(
+				checkTmuxSelfInjection("env --split-string 'tmux send-keys -t %47 x'", options),
 			).resolves.toMatchObject({ block: true });
 		});
 
@@ -686,6 +708,18 @@ describe("tmux self-injection guard", () => {
 			await expect(
 				checkTmuxSelfInjection("env --split-string='FOO=x tmux send-keys -t %47 x'", options),
 			).resolves.toMatchObject({ block: true });
+		});
+
+		it("preserves env split-string argv for nested shell payloads", async () => {
+			await expect(
+				checkTmuxSelfInjection(`env -S 'bash -c "tmux send-keys -t %47 x"'`, options),
+			).resolves.toMatchObject({ block: true });
+		});
+
+		it("does not parse quoted env split-string arguments as commands", async () => {
+			await expect(checkTmuxSelfInjection(`env -S 'printf "tmux send-keys -t %47 x"'`, options)).resolves.toEqual({
+				block: false,
+			});
 		});
 
 		// Issue 4: P1 — Socket backtracking across command boundaries

@@ -3,6 +3,9 @@
  *
  * This check runs before bash spawns anything. It is intentionally limited to
  * tmux input verbs; inspection and control of another pane remain available.
+ * It is best-effort static analysis, not a security boundary: arbitrary
+ * interpreter one-liners, shell variable indirection, and commands launched by
+ * the Python/eval tools are outside its coverage.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -10,6 +13,7 @@ import * as path from "node:path";
 const INPUT_VERBS = new Set(["send-keys", "paste-buffer", "send-prefix"]);
 const SHELL_RUNNERS = new Set(["sh", "bash", "dash", "zsh", "ksh", "busybox"]);
 const COMMAND_WRAPPERS = new Set(["eval", "exec", "command", "builtin", "nohup", "time"]);
+const BUILTIN_COMMAND_WRAPPERS = new Set(["command", "eval", "exec"]);
 const ASSIGNMENT_AWARE_WRAPPERS = new Set(["env", "sudo"]); // Only these allow VAR=value at start
 const CONTROL_WORDS = new Set(["then", "do", "else", "fi", "done", "esac"]);
 const MAX_INDIRECTION_DEPTH = 4;
@@ -237,7 +241,13 @@ function tokenize(command: string): Token[] {
 				const nestedWrapper = COMMAND_WRAPPERS_WITH_ARGS[nestedBaseName];
 				const isNestedBuiltinWrapper = COMMAND_WRAPPERS.has(nestedBaseName);
 
-				if (nestedWrapper) {
+				if (wrapperCommand.name === "builtin" && !BUILTIN_COMMAND_WRAPPERS.has(nestedBaseName)) {
+					// `builtin` only invokes shell builtins. In particular, `builtin tmux`
+					// does not execute the external tmux binary.
+					wrapperCommand = undefined;
+					skipNextArg = false;
+					positionalsPending = 0;
+				} else if (nestedWrapper) {
 					// Nested wrapper found - set it up as the new wrapper (use baseName)
 					wrapperCommand = { name: nestedBaseName, spec: nestedWrapper };
 
@@ -417,9 +427,9 @@ function targetFromArgs(args: string[]): string | undefined {
  * Reconstruct the full command line from an env -S split string.
  * env -S will split the string and process the resulting tokens as env's own arguments,
  * consuming env's options and variable assignments before finding the actual command to execute.
- * This returns the full command line that env will actually execute.
+ * This returns the argv that env will actually execute.
  */
-function reconstructCommandFromEnvSplit(splitString: string): string | undefined {
+function reconstructCommandFromEnvSplit(splitString: string): string[] | undefined {
 	// Split the string into tokens (respecting simple shell quoting)
 	const parts: string[] = [];
 	let current = "";
@@ -497,11 +507,16 @@ function reconstructCommandFromEnvSplit(splitString: string): string | undefined
 	}
 
 	if (commandStartIdx >= 0) {
-		// Reconstruct the command line from this point onward
-		return parts.slice(commandStartIdx).join(" ");
+		// Keep the argument boundaries so a nested shell still receives its exact
+		// -c payload rather than treating the payload's words as separate argv.
+		return parts.slice(commandStartIdx);
 	}
 
 	return undefined; // No command found
+}
+
+function quoteShellArgument(argument: string): string {
+	return `'${argument.replaceAll("'", "'\\''")}'`;
 }
 
 function collectShellPayloads(tokens: Token[]): string[] {
@@ -696,7 +711,7 @@ function collectShellPayloads(tokens: Token[]): string[] {
 					// Extract and push the actual command that env will execute
 					const command = reconstructCommandFromEnvSplit(splitString);
 					if (command) {
-						payloads.push(command);
+						payloads.push(command.map(quoteShellArgument).join(" "));
 					}
 					cursor++; // Skip the payload we just processed
 				}
@@ -711,7 +726,7 @@ function collectShellPayloads(tokens: Token[]): string[] {
 					if (value) {
 						const command = reconstructCommandFromEnvSplit(value);
 						if (command) {
-							payloads.push(command);
+							payloads.push(command.map(quoteShellArgument).join(" "));
 						}
 					}
 				} else if (arg === "--split-string") {
@@ -720,7 +735,7 @@ function collectShellPayloads(tokens: Token[]): string[] {
 						const splitString = tokens[cursor + 1].text;
 						const command = reconstructCommandFromEnvSplit(splitString);
 						if (command) {
-							payloads.push(command);
+							payloads.push(command.map(quoteShellArgument).join(" "));
 						}
 						cursor++; // Skip the payload we just processed
 					}

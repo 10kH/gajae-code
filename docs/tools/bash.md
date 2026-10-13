@@ -145,6 +145,7 @@ Direct SDK `AgentSession.executeBash()` also captures its minimized-original pub
 
 ## Notes
 - `strict = true` and `concurrency = "exclusive"` are set on `BashTool`; the tool does not run concurrently with another bash tool call in the same session.
+- The tmux self-pane injection guard is best-effort static analysis, not a security boundary. It recognizes supported direct calls, wrappers, and shell payloads, but cannot reliably detect arbitrary interpreter one-liners or shell variable indirection, and it does not mediate commands launched by the Python/eval tools.
 - `command` and `env` URL expansions shell-escape replacements; `cwd` expansion uses `noEscape: true` because it becomes a filesystem path argument, not shell text.
 - `checkBashInterception()` blocks only when the matching rule's `tool` name is present in `ctx.toolNames`; missing tools disable their corresponding rule.
 - Default interceptor rules come from `DEFAULT_BASH_INTERCEPTOR_RULES` in `packages/coding-agent/src/config/settings-schema.ts`:
