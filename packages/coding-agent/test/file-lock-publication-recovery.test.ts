@@ -194,6 +194,19 @@ function sharingViolationPublication(): NativeNoReplaceResult {
 	};
 }
 
+function accessDeniedPublication(): NativeNoReplaceResult {
+	return {
+		ok: false,
+		code: "access_denied",
+		mutationState: "not_committed",
+		durabilityState: "not_attempted",
+		reason: "access_denied",
+		primitive: "windows_rename_noreplace",
+		phase: "rename",
+		diagnostic: { schemaVersion: 1, collectionState: "unavailable" },
+	};
+}
+
 const primaryPrimitive =
 	process.platform === "linux"
 		? "renameat2_noreplace"
@@ -387,6 +400,45 @@ test("retries a pre-mutation sharing violation and publishes the file lock", asy
 	expect(attempts).toBe(3);
 	await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
 	expect(await fs.readdir(root)).toEqual([]);
+});
+
+test("retries a pre-mutation Windows access denial within the lock acquisition budget", async () => {
+	const { root, file, lock } = await makeFixture();
+	let deniedAttempts = 5;
+	let attempts = 0;
+	FileLockTestHooks.nativePublicationBindings = () => ({
+		renameNoReplacePathAsync: async (source, destination) => {
+			attempts++;
+			if (deniedAttempts > 0) {
+				deniedAttempts--;
+				return accessDeniedPublication();
+			}
+			await fs.rename(source, destination);
+			return successfulPublication(primaryPrimitive ?? "windows_rename_noreplace");
+		},
+		renameDirectoryNoReplacePathAsync,
+	});
+
+	await expect(
+		withFileLock(file, async () => await Bun.file(path.join(lock, "info")).text(), quickAcquire),
+	).resolves.toContain('"pid"');
+	expect(attempts).toBe(6);
+	await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
+	expect(await fs.readdir(root)).toEqual([]);
+});
+
+test("exhausted Windows access-denied publication reports lock contention and its code", async () => {
+	const { file, lock } = await makeFixture();
+	FileLockTestHooks.nativePublicationBindings = () => ({
+		renameNoReplacePathAsync: async () => accessDeniedPublication(),
+		renameDirectoryNoReplacePathAsync,
+	});
+
+	await expect(withFileLock(file, async () => "entered", { retries: 2, retryDelayMs: 1 })).rejects.toMatchObject({
+		name: "FileLockAcquireError",
+		message: expect.stringContaining(`last lock publication failed with access_denied (${lock})`),
+	});
+	await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
 });
 
 describe.skipIf(process.platform !== "linux")("file lock committed publication reconciliation", () => {

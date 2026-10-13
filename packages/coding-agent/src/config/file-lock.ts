@@ -36,6 +36,7 @@ export interface FileLockOptions {
 }
 
 export type FileLockAcquireReason = "acquire_timeout" | "orphan_transition";
+export type FileLockPublicationFailureCode = "access_denied" | "sharing_violation";
 
 /**
  * Why the acquire path could not retire a lock directory whose owner it had already
@@ -66,6 +67,7 @@ export class FileLockAcquireError extends Error {
 		readonly reason: FileLockAcquireReason = "acquire_timeout",
 		readonly orphanPath?: string,
 		readonly removalFailure?: FileLockStaleRemovalFailure,
+		readonly publicationFailureCode?: FileLockPublicationFailureCode,
 	) {
 		const detail =
 			reason === "orphan_transition" && orphanPath ? `blocked by retained removal transition ${orphanPath}` : holder;
@@ -77,8 +79,11 @@ export class FileLockAcquireError extends Error {
 		const cleanupDetail = removalFailure?.manualCleanupCommand
 			? `; manual cleanup is appropriate only after independently verifying this exact directory still belongs to the dead owner and no successor has taken it: ${removalFailure.manualCleanupCommand}`
 			: "";
+		const publicationDetail = publicationFailureCode
+			? `; last lock publication failed with ${publicationFailureCode}`
+			: "";
 		super(
-			`Failed to acquire lock for ${filePath} after ${attempts} attempts: ${detail}${removalDetail} (${lockPath}); ` +
+			`Failed to acquire lock for ${filePath} after ${attempts} attempts: ${detail}${removalDetail}${publicationDetail} (${lockPath}); ` +
 				`a live owner is never displaced — if this is an SDK broker (gjc sdk session list), it must finish or be stopped before retrying${cleanupDetail}`,
 		);
 		this.code = reason;
@@ -99,13 +104,12 @@ const DEFAULT_OPTIONS: Required<
 };
 
 /**
- * Windows can transiently deny a no-replace publication while another handle still
- * has the staged or destination path open without delete sharing. The native result
- * is explicitly pre-mutation in this case, so retrying the same source name cannot
- * publish twice or clean up a committed namespace change.
+ * Windows can transiently deny a no-replace publication while another process is
+ * inspecting the staged directory. Only explicit, pre-mutation receipts are retried,
+ * so retrying the same source name cannot publish twice or clean up a committed change.
  */
-const PUBLICATION_SHARING_RETRY_ATTEMPTS = 3;
-const PUBLICATION_SHARING_RETRY_DELAY_MS = 10;
+const PUBLICATION_TRANSIENT_RETRY_ATTEMPTS = 3;
+const PUBLICATION_TRANSIENT_RETRY_DELAY_MS = 10;
 
 /** Ownerless empty residue must outlive both this grace and the acquire budget. */
 const REMOVAL_TRANSITION_GRACE_MS = 10_000;
@@ -640,7 +644,8 @@ function isResumableLocalRemoval(transitionPath: string, record: RemovalTransiti
 
 type FileLockRemovalTransitionState = "active" | "abandoned" | "orphan_transition";
 type FileLockOrphanTransition = { kind: "orphan_transition"; path: string };
-type FileLockAcquisitionResult = LockInfo | FileLockOrphanTransition | null;
+type FileLockPublicationContention = { kind: "publication_contention"; code: FileLockPublicationFailureCode };
+type FileLockAcquisitionResult = LockInfo | FileLockOrphanTransition | FileLockPublicationContention | null;
 
 async function readRemovalTransitionOwnerRecord(transitionPath: string): Promise<RemovalTransitionOwnerRecord | null> {
 	try {
@@ -722,6 +727,10 @@ async function classifyFileLockRemovalTransition(
 
 function isFileLockOrphanTransition(value: FileLockAcquisitionResult): value is FileLockOrphanTransition {
 	return value !== null && "kind" in value && value.kind === "orphan_transition";
+}
+
+function isFileLockPublicationContention(value: FileLockAcquisitionResult): value is FileLockPublicationContention {
+	return value !== null && "kind" in value && value.kind === "publication_contention";
 }
 
 /** Without an owner, only an aged, completely empty directory is reclaimable. */
@@ -1186,6 +1195,7 @@ function isValidNativeNoReplaceResult(value: unknown): value is NativeNoReplaceR
 				"atomic_unavailable",
 				"cross_device",
 				"permission_denied",
+				"access_denied",
 				"io_failure",
 				"invalid_request",
 				"interrupted",
@@ -1314,7 +1324,30 @@ function isPreMutationSharingViolation(value: unknown): value is NativeNoReplace
 	);
 }
 
-async function publishNoReplaceWithSharingRetry(
+function isPreMutationAccessDenied(value: unknown): value is NativeNoReplaceResult {
+	return (
+		isValidNativeNoReplaceResult(value) &&
+		!value.ok &&
+		value.code === "access_denied" &&
+		value.mutationState === "not_committed" &&
+		value.durabilityState === "not_attempted" &&
+		value.reason === "access_denied" &&
+		value.primitive === "windows_rename_noreplace" &&
+		value.phase === "rename"
+	);
+}
+
+function isPreMutationTransientPublicationFailure(value: unknown): value is NativeNoReplaceResult {
+	return isPreMutationSharingViolation(value) || isPreMutationAccessDenied(value);
+}
+
+function transientPublicationFailureCode(value: unknown): FileLockPublicationFailureCode | undefined {
+	if (isPreMutationSharingViolation(value)) return "sharing_violation";
+	if (isPreMutationAccessDenied(value)) return "access_denied";
+	return undefined;
+}
+
+async function publishNoReplaceWithTransientRetry(
 	publish: (sourcePath: string, destinationPath: string) => Promise<NativeNoReplaceResult>,
 	sourcePath: string,
 	destinationPath: string,
@@ -1322,10 +1355,10 @@ async function publishNoReplaceWithSharingRetry(
 	let result = await publish(sourcePath, destinationPath);
 	for (
 		let attempt = 1;
-		attempt < PUBLICATION_SHARING_RETRY_ATTEMPTS && isPreMutationSharingViolation(result);
+		attempt < PUBLICATION_TRANSIENT_RETRY_ATTEMPTS && isPreMutationTransientPublicationFailure(result);
 		attempt++
 	) {
-		await Bun.sleep(PUBLICATION_SHARING_RETRY_DELAY_MS * attempt);
+		await Bun.sleep(PUBLICATION_TRANSIENT_RETRY_DELAY_MS * attempt);
 		result = await publish(sourcePath, destinationPath);
 	}
 	return result;
@@ -2083,7 +2116,7 @@ async function tryAcquireLock(
 			renameNoReplacePathAsync,
 			renameDirectoryNoReplacePathAsync,
 		};
-		const published = await publishNoReplaceWithSharingRetry(
+		const published = await publishNoReplaceWithTransientRetry(
 			publication.renameNoReplacePathAsync,
 			canonicalPendingPath,
 			destinationPath,
@@ -2092,7 +2125,7 @@ async function tryAcquireLock(
 		if (published.ok && !publishedSuccessfully)
 			throw new Error("Failed to publish file lock: invalid primary success receipt.");
 		if (!published.ok && isPreMutationUnsupportedRenameResult(published)) {
-			const fallback = await publishNoReplaceWithSharingRetry(
+			const fallback = await publishNoReplaceWithTransientRetry(
 				publication.renameDirectoryNoReplacePathAsync,
 				canonicalPendingPath,
 				destinationPath,
@@ -2115,10 +2148,13 @@ async function tryAcquireLock(
 					});
 				}
 			}
+			const fallbackFailureCode = transientPublicationFailureCode(fallback);
 			if (fallbackSuccessfully || verifiedCommittedPublication) {
 				publishedSuccessfully = true;
 			} else if (fallback.reason === "destination_exists") {
 				return null;
+			} else if (fallbackFailureCode) {
+				return { kind: "publication_contention", code: fallbackFailureCode };
 			} else {
 				const failure = new Error(
 					`Failed to publish file lock: ${fallback.code ?? fallback.reason ?? "unknown"}.`,
@@ -2131,6 +2167,8 @@ async function tryAcquireLock(
 			if (published.reason === "destination_exists") {
 				return null;
 			}
+			const publicationFailureCode = transientPublicationFailureCode(published);
+			if (publicationFailureCode) return { kind: "publication_contention", code: publicationFailureCode };
 			const failure = new Error(
 				`Failed to publish file lock: ${published.code ?? published.reason ?? "unknown"}.`,
 			) as NodeJS.ErrnoException;
@@ -2511,6 +2549,7 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 	const contentionStartTimes = new Map<string, string | null>();
 	let contentionObserved = false;
 	let staleRemovalFailure: RecordedStaleRemovalFailure | undefined;
+	let publicationFailureCode: FileLockPublicationFailureCode | undefined;
 	for (let attempt = 0; attempt < opts.retries; attempt++) {
 		if (opts.signal?.aborted) throw opts.signal.reason ?? new Error("File lock acquisition aborted");
 		const localKey = await localLockKey(lockPath);
@@ -2536,7 +2575,9 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 				"orphan_transition",
 				result.path,
 			);
-		if (result) {
+		if (isFileLockPublicationContention(result)) {
+			publicationFailureCode = result.code;
+		} else if (result) {
 			localLockStates.set(localKey, { owner: result, status: "held" });
 			return () => releaseLock(lockPath, result, localKey);
 		}
@@ -2600,6 +2641,7 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 			? fileLockRemovalTransitionPath(lockPath)
 			: undefined,
 		await staleRemovalFailureForCurrentGeneration(lockPath, staleRemovalFailure),
+		publicationFailureCode,
 	);
 }
 

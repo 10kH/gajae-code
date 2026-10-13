@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { closeModelCache, getBundledModel, type Model } from "@gajae-code/ai";
 import { getAgentDir, hookFetch, postmortem, setAgentDir, TempDir } from "@gajae-code/utils";
 import { type Args, parseArgs } from "../src/cli/args";
+import { FileLockAcquireError } from "../src/config/file-lock";
 import { ModelRegistry, ModelsConfigFile } from "../src/config/model-registry";
 import { resetSettingsForTest, Settings } from "../src/config/settings";
 import { SETTINGS_SCHEMA } from "../src/config/settings-schema";
@@ -21,6 +22,7 @@ import type { InteractiveMode } from "../src/modes/interactive-mode";
 import { type CreateAgentSessionOptions, type CreateAgentSessionResult, createAgentSession } from "../src/sdk";
 import type { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
+import { SessionManager } from "../src/session/session-manager";
 import { EventBus } from "../src/utils/event-bus";
 
 const alternateRoutes: Array<{
@@ -616,6 +618,60 @@ describe("startup update contract", () => {
 			authStorage.close();
 			if (originalNoTitle === undefined) delete Bun.env.PI_NO_TITLE;
 			else Bun.env.PI_NO_TITLE = originalNoTitle;
+		}
+	});
+	it("reports an exhausted direct session-index lock without an uncaught startup failure", async () => {
+		using tempDir = TempDir.createSync("@gjc-session-index-startup-lock-");
+		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		const filePath = path.join(tempDir.path(), "sdk", "sessions", "index.jsonl");
+		const lockPath = `${filePath}.lock`;
+		const lockError = new FileLockAcquireError(
+			filePath,
+			lockPath,
+			2,
+			"held by a live broker",
+			"acquire_timeout",
+			undefined,
+			undefined,
+			"access_denied",
+		);
+		const stderr: string[] = [];
+		vi.spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
+			stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+			return true;
+		});
+		const cleanupSpy = vi.spyOn(postmortem, "cleanup").mockResolvedValue(undefined);
+		const originalExitCode = process.exitCode;
+		let createAgentSessionCalls = 0;
+		try {
+			process.exitCode = 0;
+			await runRootCommand(rootArgs({ mode: "text", noSession: false }), [], {
+				createAgentSession: async () => {
+					createAgentSessionCalls++;
+					return fakeSessionResult();
+				},
+				createSessionManager: async () => SessionManager.inMemory(tempDir.path()),
+				registerDirectSession: async () => {
+					throw lockError;
+				},
+				discoverAuthStorage: async () => authStorage,
+				settings: Settings.isolated({ "marketplace.autoUpdate": "off", "startup.checkUpdate": false }),
+				initTheme: async () => {},
+				runStartupCredentialAutoImportIfNeeded: async () => undefined,
+				suppressProcessExit: false,
+			});
+
+			expect(stderr.join("")).toContain("Session index is busy");
+			expect(stderr.join("")).toContain(`Lock: ${lockPath}`);
+			expect(stderr.join("")).toContain("Code: access_denied");
+			expect(stderr.join("")).toContain("retry in a few seconds");
+			expect(process.exitCode).toBe(1);
+			expect(createAgentSessionCalls).toBe(0);
+			expect(cleanupSpy).toHaveBeenCalledTimes(1);
+		} finally {
+			vi.restoreAllMocks();
+			process.exitCode = originalExitCode ?? 0;
+			authStorage.close();
 		}
 	});
 	it("cleans up noninteractive owners when print mode rejects", async () => {
