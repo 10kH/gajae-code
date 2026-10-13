@@ -31,12 +31,12 @@ function writeProject(files: Record<string, string>): string {
 	return dir;
 }
 
-function runIsolated(cwd: string, script: string, env: Record<string, string> = {}): void {
+function runIsolated(cwd: string, script: string, env: Record<string, string> = {}, noEnvFile = false): void {
 	const scriptPath = path.join(cwd, "env-development-layer-probe.ts");
 	fs.writeFileSync(scriptPath, script);
 	const tempHome = tempDir();
 	const result = Bun.spawnSync({
-		cmd: [process.execPath, scriptPath],
+		cmd: [process.execPath, ...(noEnvFile ? ["--no-env-file"] : []), scriptPath],
 		cwd,
 		env: {
 			HOME: tempHome,
@@ -147,6 +147,20 @@ if ($env.NODE_TLS_REJECT_UNAUTHORIZED !== "1") {
 `,
 			{ NODE_TLS_REJECT_UNAUTHORIZED: "1" },
 		);
+	});
+
+	it("expands development-layer references for unset and explicit development modes without Bun autoload", () => {
+		const cwd = writeProject({
+			".env.development": `PROJECT_ROOT=/repo\nVIRTUAL_ENV=$PROJECT_ROOT/.venv\nBRACED_ENV=\${PROJECT_ROOT}/bin\nESCAPED_ENV=\\$PROJECT_ROOT\n`,
+		});
+		const script = `
+import { $env } from ${JSON.stringify(envSourceUrl)};
+if ($env.VIRTUAL_ENV !== "/repo/.venv") throw new Error("unbraced interpolation failed: " + $env.VIRTUAL_ENV);
+if ($env.BRACED_ENV !== "/repo/bin") throw new Error("braced interpolation failed: " + $env.BRACED_ENV);
+if ($env.ESCAPED_ENV !== "$PROJECT_ROOT") throw new Error("escaped interpolation failed: " + $env.ESCAPED_ENV);
+		`;
+		runIsolated(cwd, script, {}, true);
+		runIsolated(cwd, script, { NODE_ENV: "development" }, true);
 	});
 
 	it("marks interpolated development-layer values as dynamic", () => {
