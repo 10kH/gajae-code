@@ -2577,9 +2577,12 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 			);
 		if (isFileLockPublicationContention(result)) {
 			publicationFailureCode = result.code;
-		} else if (result) {
-			localLockStates.set(localKey, { owner: result, status: "held" });
-			return () => releaseLock(lockPath, result, localKey);
+		} else {
+			publicationFailureCode = undefined;
+			if (result) {
+				localLockStates.set(localKey, { owner: result, status: "held" });
+				return () => releaseLock(lockPath, result, localKey);
+			}
 		}
 		if (!contentionObserved) {
 			contentionObserved = true;

@@ -1097,6 +1097,7 @@ const GENERAL_FAILURE_CODES = new Set([
 	"identity_unavailable",
 	"identity_mismatch",
 	"owner_mismatch",
+	"access_denied",
 	"mode_mismatch",
 	"io_error",
 ]);

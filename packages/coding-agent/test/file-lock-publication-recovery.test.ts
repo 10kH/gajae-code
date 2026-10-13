@@ -207,6 +207,19 @@ function accessDeniedPublication(): NativeNoReplaceResult {
 	};
 }
 
+function destinationExistsPublication(): NativeNoReplaceResult {
+	return {
+		ok: false,
+		code: "quarantine_collision",
+		mutationState: "not_committed",
+		durabilityState: "not_attempted",
+		reason: "destination_exists",
+		primitive: "windows_rename_noreplace",
+		phase: "rename",
+		diagnostic: { schemaVersion: 1, collectionState: "unavailable" },
+	};
+}
+
 const primaryPrimitive =
 	process.platform === "linux"
 		? "renameat2_noreplace"
@@ -439,6 +452,32 @@ test("exhausted Windows access-denied publication reports lock contention and it
 		message: expect.stringContaining(`last lock publication failed with access_denied (${lock})`),
 	});
 	await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
+});
+
+test("clears an earlier publication code when later attempts contend with a lock owner", async () => {
+	const { file, lock } = await makeFixture();
+	let attempts = 0;
+	FileLockTestHooks.nativePublicationBindings = () => ({
+		renameNoReplacePathAsync: async (_source, destination) => {
+			attempts++;
+			if (attempts <= 3) return accessDeniedPublication();
+			await fs.mkdir(destination);
+			await Bun.write(path.join(destination, "info"), removalInfo(process.pid));
+			return destinationExistsPublication();
+		},
+		renameDirectoryNoReplacePathAsync,
+	});
+
+	const error = await withFileLock(file, async () => "entered", { retries: 2, retryDelayMs: 1 }).catch(
+		failure => failure,
+	);
+	expect(error).toBeInstanceOf(FileLockAcquireError);
+	if (!(error instanceof FileLockAcquireError)) throw new Error("expected file lock acquisition timeout");
+	expect(error.message).toContain(`held by pid ${process.pid}`);
+	expect(error.message).not.toContain("last lock publication failed with access_denied");
+	expect(error.message).toContain(`(${lock})`);
+	expect(error.publicationFailureCode).toBeUndefined();
+	expect(attempts).toBe(4);
 });
 
 describe.skipIf(process.platform !== "linux")("file lock committed publication reconciliation", () => {

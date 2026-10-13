@@ -2320,6 +2320,7 @@ export type NativeOwnerOnlySecurityResult =
 	| {
 			ok: false;
 			code:
+				| "access_denied"
 				| "not_found"
 				| "not_directory"
 				| "network_unsupported"
