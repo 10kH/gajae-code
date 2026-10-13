@@ -3016,6 +3016,52 @@ describe("SDK broker identity and discovery", () => {
 				});
 			});
 		});
+		it("admits session.reconcile_uncertain for a different session with a fresh key", async () => {
+			await withLegacyLedger(seedFinalRowsForSessionA, async broker => {
+				// The request passes legacy admission and then fails because session-b is not indexed.
+				await expect(
+					broker.handleRequest(
+						"session.reconcile_uncertain",
+						{ sessionId: "session-b", remoteCreateKey: "remote-create-b" },
+						"fresh-reconcile-b",
+					),
+				).resolves.toEqual({
+					ok: false,
+					error: { code: "not_found", message: "session is not indexed" },
+				});
+			});
+		});
+		it("admits past a final legacy row whose only session evidence is resultSessionId", async () => {
+			await withLegacyLedger(
+				async ledger => {
+					await ledger.begin("legacy-result-only", "legacy-result-only-request");
+					await ledger.transition("legacy-result-only", "terminal_ok", {
+						resultSessionId: "session-a",
+						response: { ok: true, result: { sessionId: "session-a" } },
+					});
+					expect(ledger.get("legacy-result-only")?.intendedSessionId).toBeUndefined();
+					expect(ledger.get("legacy-result-only")?.resultSessionId).toBe("session-a");
+				},
+				async broker => {
+					await expect(
+						broker.handleRequest("session.close", { sessionId: "session-b" }, "fresh-close-result-only-b"),
+					).resolves.toEqual({
+						ok: false,
+						error: { code: "not_found", message: "session is not indexed" },
+					});
+				},
+			);
+		});
+		it("uses the input.id alias when admitting a different session past final legacy rows", async () => {
+			await withLegacyLedger(seedFinalRowsForSessionA, async broker => {
+				await expect(
+					broker.handleRequest("session.close", { id: "session-b" }, "fresh-close-id-alias-b"),
+				).resolves.toEqual({
+					ok: false,
+					error: { code: "not_found", message: "session is not indexed" },
+				});
+			});
+		});
 		it("keeps final legacy rows fenced for their recorded session", async () => {
 			await withLegacyLedger(seedFinalRowsForSessionA, async (broker, root) => {
 				for (const operation of nonCreateOperations)
