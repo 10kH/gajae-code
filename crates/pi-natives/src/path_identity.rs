@@ -969,10 +969,20 @@ fn ntstatus_code(status: i32) -> &'static str {
 		0xc000_0034 | 0xc000_003a => "not_found",
 		0xc000_0035 => "quarantine_collision",
 		0xc000_0043 => "sharing_violation",
-		0xc000_0022 => "access_denied",
+		0xc000_0022 => "owner_mismatch",
 		0xc000_050b => "reparse_point",
 		0xc000_00d4 => "atomic_unavailable",
 		_ => "io_error",
+	}
+}
+
+#[cfg(any(windows, test))]
+fn publication_rename_error_code(code: &'static str) -> &'static str {
+	match code {
+		// Preserve the existing owner-only security contract everywhere else. A
+		// failed Windows no-replace rename has a distinct access-denied meaning.
+		"owner_mismatch" => "access_denied",
+		other => other,
 	}
 }
 
@@ -1041,6 +1051,7 @@ mod exact_replace_windows_retry_policy_tests {
 		EXACT_REPLACE_DESTINATION_OPEN_RETRY_DELAY_MS, EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT,
 		STATUS_ACCESS_DENIED, STATUS_SHARING_VIOLATION, is_retryable_exact_replace_status,
 		native_windows_error_code, ntstatus_code, open_with_transient_retry,
+		publication_rename_error_code,
 	};
 
 	#[test]
@@ -1070,7 +1081,11 @@ mod exact_replace_windows_retry_policy_tests {
 	fn windows_error_code_is_hex_and_path_free() {
 		assert_eq!(native_windows_error_code(STATUS_SHARING_VIOLATION), "0xC0000043");
 		assert_eq!(native_windows_error_code(STATUS_ACCESS_DENIED), "0xC0000022");
-		assert_eq!(ntstatus_code(STATUS_ACCESS_DENIED), "access_denied");
+		assert_eq!(ntstatus_code(STATUS_ACCESS_DENIED), "owner_mismatch");
+		assert_eq!(
+			publication_rename_error_code(ntstatus_code(STATUS_ACCESS_DENIED)),
+			"access_denied"
+		);
 		assert_eq!(ntstatus_code(STATUS_SHARING_VIOLATION), "sharing_violation");
 	}
 
@@ -10835,7 +10850,8 @@ mod platform {
 		NativeDirectoryTreeResult, NativeDirectoryTreeSnapshot, NativeExactUnlinkResult,
 		NativeOwnerOnlySecurityResult, NativePermissionRepairResult, STATUS_INVALID_PARAMETER,
 		STATUS_SHARING_VIOLATION, is_retryable_exact_replace_status, native_windows_error_code,
-		ntstatus_code, open_with_transient_retry, sha256, volume_case_sensitivity_from_flags,
+		ntstatus_code, open_with_transient_retry, publication_rename_error_code, sha256,
+		volume_case_sensitivity_from_flags,
 	};
 
 	type UvGetOsfhandle = unsafe extern "C" fn(fd: i32) -> isize;
@@ -12337,7 +12353,7 @@ mod platform {
 		let destination_name: Vec<u16> = destination_name.encode_wide().collect();
 		match rename_handle(source.target, destination_parent.target, &destination_name, false) {
 			Ok(()) => NativeExactUnlinkResult::success(),
-			Err(code) => NativeExactUnlinkResult::failure(code),
+			Err(code) => NativeExactUnlinkResult::failure(publication_rename_error_code(code)),
 		}
 	}
 	pub(super) fn exact_unlink(

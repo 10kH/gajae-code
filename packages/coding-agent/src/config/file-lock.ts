@@ -2018,7 +2018,7 @@ async function tryAcquireLock(
 	await ensureLockParent(path.dirname(lockPath));
 	const afterParentMkdir = FileLockTestHooks.afterParentMkdir;
 	if (afterParentMkdir) await afterParentMkdir(lockPath);
-	const pendingPath = `${lockPath}.pending.${process.pid}.${currentFileLockStagingIdentity()}.${crypto.randomUUID()}`;
+	const pendingPath = `${lockPath}.pending.${process.pid}.${currentFileLockStagingIdentity()}.${crypto.randomBytes(16).toString("base64url")}`;
 	const owner = lockInfo(ownerHostId, ownerToken);
 	let removePending = false;
 	try {
@@ -2693,40 +2693,38 @@ type FileLockStagingIdentity = { kind: "process_incarnation" | "start_time"; val
 type FileLockStagingOwner = { pid: number; identity?: FileLockStagingIdentity };
 
 const FILE_LOCK_STAGING_UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
-const FILE_LOCK_STAGING_NAME_WITH_START_TIME = new RegExp(
-	`^.+\\.lock\\.pending\\.([1-9]\\d*)\\.([is][A-Za-z0-9_-]+)\\.${FILE_LOCK_STAGING_UUID}$`,
-);
+const FILE_LOCK_STAGING_NAME_WITH_IDENTITY =
+	/^.+\.lock\.pending\.([1-9]\d*)\.([is][A-Za-z0-9_-]{16})\.([A-Za-z0-9_-]{22})$/;
 const LEGACY_FILE_LOCK_STAGING_NAME = new RegExp(`^.+\\.lock\\.pending\\.([1-9]\\d*)\\.${FILE_LOCK_STAGING_UUID}$`);
 
 function fileLockStagingOwner(name: string): FileLockStagingOwner | null {
-	const current = FILE_LOCK_STAGING_NAME_WITH_START_TIME.exec(name);
+	const current = FILE_LOCK_STAGING_NAME_WITH_IDENTITY.exec(name);
 	const legacy = current ? null : LEGACY_FILE_LOCK_STAGING_NAME.exec(name);
 	const match = current ?? legacy;
 	if (!match) return null;
 	const pid = Number(match[1]);
 	if (!Number.isSafeInteger(pid)) return null;
 	if (!current) return { pid };
-	try {
-		const encodedIdentity = current[2] ?? "";
-		const identityValue = Buffer.from(encodedIdentity.slice(1), "base64url").toString("utf8");
-		if (!identityValue || Buffer.from(identityValue, "utf8").toString("base64url") !== encodedIdentity.slice(1))
-			return null;
-		return {
-			pid,
-			identity: {
-				kind: encodedIdentity.startsWith("i") ? "process_incarnation" : "start_time",
-				value: identityValue,
-			},
-		};
-	} catch {
-		return null;
-	}
+	const encodedIdentity = current[2] ?? "";
+	return {
+		pid,
+		identity: {
+			kind: encodedIdentity.startsWith("i") ? "process_incarnation" : "start_time",
+			value: encodedIdentity.slice(1),
+		},
+	};
+}
+
+function fileLockStagingIdentityHash(identity: string): string {
+	// Ninety-six bits are sufficient to disambiguate process generations while
+	// keeping the sibling name within the old component-length envelope.
+	return crypto.createHash("sha256").update(identity, "utf8").digest("base64url").slice(0, 16);
 }
 
 function currentFileLockStagingIdentity(): string {
 	const incarnation = currentProcessIncarnation();
-	const identity = incarnation ?? currentProcessStartTime();
-	return `${incarnation ? "i" : "s"}${Buffer.from(identity, "utf8").toString("base64url")}`;
+	const identity = incarnation ?? processStartTime(process.pid) ?? `${process.pid}:${currentProcessStartTime()}`;
+	return `${incarnation ? "i" : "s"}${fileLockStagingIdentityHash(identity)}`;
 }
 
 /** Return a name-encoded staging PID for GC discovery. */
@@ -2769,10 +2767,10 @@ export async function inspectFileLockStagingDir(
 	}
 	if (!root.isDirectory() || root.isSymbolicLink()) return kept;
 	let namePidStatus: OwnerLiveness;
-	if (nameOwner.identity && nameOwner.identity.value !== "unknown") {
+	if (nameOwner.identity) {
 		const currentIdentity =
 			nameOwner.identity.kind === "process_incarnation" ? processIncarnation(namePid) : processStartTime(namePid);
-		if (currentIdentity === nameOwner.identity.value) {
+		if (currentIdentity !== null && fileLockStagingIdentityHash(currentIdentity) === nameOwner.identity.value) {
 			return { ...kept, pid: namePid, status: "alive", reason: "live_staging_name_owner" };
 		}
 		namePidStatus = currentIdentity === null ? probe(namePid) : "dead";

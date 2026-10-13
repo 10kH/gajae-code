@@ -1,4 +1,5 @@
 import { afterEach, expect, test, vi } from "bun:test";
+import * as crypto from "node:crypto";
 import * as syncFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -29,8 +30,8 @@ async function fixture(
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "staging-orphan-"));
 	roots.push(root);
 	const file = path.join(root, "index.jsonl");
-	const encodedStartTime = `s${Buffer.from(startTime, "utf8").toString("base64url")}`;
-	const staging = `${file}.lock.pending.${pid}.${encodedStartTime}.${uuid}`;
+	const encodedStartTime = `s${crypto.createHash("sha256").update(startTime, "utf8").digest("base64url").slice(0, 16)}`;
+	const staging = `${file}.lock.pending.${pid}.${encodedStartTime}.1234567890123456789012`;
 	await fs.mkdir(staging);
 	if (info) await Bun.write(path.join(staging, "info"), JSON.stringify(info));
 	return { root, file, staging };

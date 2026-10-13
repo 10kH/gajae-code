@@ -422,6 +422,23 @@ test("preserves access-denied publication failures instead of masking ACL errors
 	expect(await fs.readdir(root)).toEqual([]);
 });
 
+test("keeps the staging component within filesystem limits for long target names", async () => {
+	const { root } = await makeFixture();
+	const file = path.join(root, "x".repeat(170));
+	let stagingComponentLength = 0;
+	FileLockTestHooks.nativePublicationBindings = () => ({
+		renameNoReplacePathAsync: async (source, destination) => {
+			stagingComponentLength = path.basename(source).length;
+			await fs.rename(source, destination);
+			return successfulPublication(primaryPrimitive ?? "windows_rename_noreplace");
+		},
+		renameDirectoryNoReplacePathAsync,
+	});
+
+	await expect(withFileLock(file, async () => "acquired", quickAcquire)).resolves.toBe("acquired");
+	expect(stagingComponentLength).toBeLessThanOrEqual(255);
+});
+
 describe.skipIf(process.platform !== "linux")("file lock committed publication reconciliation", () => {
 	test("accepts a committed fallback receipt when ambient platform metadata is spoofed", async () => {
 		const descriptor = Object.getOwnPropertyDescriptor(process, "platform");
