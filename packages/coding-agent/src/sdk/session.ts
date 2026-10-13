@@ -162,11 +162,7 @@ import {
 } from "../runtime-mcp";
 import { createMCPFormInputHandler } from "../runtime-mcp/elicitation";
 import type { MCPLoadResult } from "../runtime-mcp/manager";
-import {
-	omitPluginMcpNameShadows,
-	retainPluginMcpMandatoryNames,
-	survivingPluginMcpToolNames,
-} from "../runtime-mcp/plugin-mcp-name-filter";
+import { omitPluginMcpNameShadows, retainPluginMcpMandatoryNames } from "../runtime-mcp/plugin-mcp-name-filter";
 import { MCP_STARTUP_WAIT_GRACE_MS } from "../runtime-mcp/startup-policy";
 import type { MCPServerConfig } from "../runtime-mcp/types";
 import {
@@ -1314,11 +1310,9 @@ function classifyInheritedMcpToolNames(
 	for (const tool of tools) {
 		const serverName = tool.mcpServerName;
 		if (serverName === undefined) continue;
-		const source = manager.getSource(serverName);
-		// A caller-owned manager needs concrete bundle provenance, not just a
-		// provider label. Owned managers keep their validated catalog authority.
-		const callerBundle = pluginServers === undefined && source?.provider === "gjc-plugins" && Boolean(source.path);
-		if (pluginServers?.has(serverName) || (callerBundle && survivingPluginMcpToolNames([tool]).length > 0)) {
+		// Caller-supplied source metadata is descriptive; only a manager's
+		// validated plugin-server set can grant mandatory-tool authority.
+		if (pluginServers?.has(serverName)) {
 			pluginMcpToolNames.push(tool.name);
 		} else if (conventionalServers?.has(serverName)) conventionalMcpToolNames.push(tool.name);
 	}
