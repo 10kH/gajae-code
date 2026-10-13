@@ -56,7 +56,7 @@ const ctx = {
 	editorContainer,
 	ui: { setFocus() {}, requestRender() {} },
 	showError(message: string) {
-		console.error(`SHARE_ERROR ${message}`);
+		process.stderr.write(`SHARE_ERROR ${message}\n`);
 	},
 	showStatus() {},
 } as unknown as InteractiveModeContext;
