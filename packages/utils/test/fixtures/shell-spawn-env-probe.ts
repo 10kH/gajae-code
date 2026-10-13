@@ -18,6 +18,7 @@ try {
 }
 const keys = [
 	"BASH_ENV",
+	"BUN_OPTIONS",
 	"GIT_ASKPASS",
 	"GIT_EXEC_PATH",
 	"GIT_PROXY_COMMAND",

@@ -16,6 +16,7 @@ import * as path from "node:path";
 const PROBE = path.join(import.meta.dir, "fixtures", "bash-project-hook-probe.ts");
 const HOOK_KEYS = [
 	"BASH_ENV",
+	"BUN_OPTIONS",
 	"GIT_ASKPASS",
 	"GIT_EXEC_PATH",
 	"GIT_PROXY_COMMAND",
@@ -69,6 +70,7 @@ async function runProbe(
 	target: Project,
 	mode: "worker" | "pty" | "inprocess",
 	inherited: Record<string, string> = {},
+	disableDotenvAutoload = false,
 ): Promise<boolean> {
 	const env: Record<string, string> = {};
 	for (const [key, value] of Object.entries(process.env)) {
@@ -83,7 +85,12 @@ async function runProbe(
 	for (const [key, value] of Object.entries(inherited)) if (value === "") delete env[key];
 
 	fs.rmSync(target.marker, { force: true });
-	const proc = Bun.spawn([process.execPath, PROBE, mode], { cwd: target.cwd, env, stdout: "pipe", stderr: "pipe" });
+	const proc = Bun.spawn([process.execPath, ...(disableDotenvAutoload ? ["--no-env-file"] : []), PROBE, mode], {
+		cwd: target.cwd,
+		env,
+		stdout: "pipe",
+		stderr: "pipe",
+	});
 	const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
 	const exitCode = await proc.exited;
 	if (exitCode !== 0) throw new Error(`probe failed (${exitCode}): ${stderr}`);
@@ -93,6 +100,10 @@ async function runProbe(
 }
 
 const VECTORS: Record<string, (project: Project) => string> = {
+	BUN_OPTIONS: ({ cwd, marker }) => {
+		fs.writeFileSync(path.join(cwd, "project-preload.ts"), `await Bun.write(${JSON.stringify(marker)}, "ran");\n`);
+		return "BUN_OPTIONS=--preload=./project-preload.ts\n";
+	},
 	GIT_CONFIG_: ({ hook }) => `GIT_CONFIG_COUNT=1\nGIT_CONFIG_KEY_0=core.fsmonitor\nGIT_CONFIG_VALUE_0=${hook}\n`,
 	XDG_CONFIG_HOME: ({ cwd, hook }) => {
 		fs.mkdirSync(path.join(cwd, "xdg", "git"), { recursive: true });
@@ -126,6 +137,11 @@ function forwarded(target: Project): Record<string, string> {
 }
 
 describe.skipIf(process.platform === "win32")("bash tool ignores project .env hook variables", () => {
+	it("does not run a project BUN_OPTIONS preload before the isolated worker entrypoint", async () => {
+		const target = project(VECTORS.BUN_OPTIONS!);
+		expect(await runProbe(target, "worker", {}, true)).toBe(false);
+	});
+
 	// The isolated worker chain is Bun processes that each reload `cwd/.env`,
 	// and the native shell imports the worker environment wholesale. (It already
 	// skips BASH_ENV/ENV itself, so only git vectors reach this path.)

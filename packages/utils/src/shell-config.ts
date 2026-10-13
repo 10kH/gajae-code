@@ -46,9 +46,10 @@ function isExecutable(path: string): boolean {
 }
 
 /**
- * Variables that make the shell or git run code on their own. bash sources
- * `BASH_ENV` (sh: `ENV`) before every non-interactive command, and zsh sources
- * `$ZDOTDIR/.zshenv`. git applies `GIT_CONFIG_*`, reads config from
+ * Variables that make the shell, Bun, or git run code on their own. Bun's
+ * `BUN_OPTIONS` can preload code before a source-mode worker entrypoint; bash
+ * sources `BASH_ENV` (sh: `ENV`) before every non-interactive command, and zsh
+ * sources `$ZDOTDIR/.zshenv`. git applies `GIT_CONFIG_*`, reads config from
  * `GIT_DIR`/`GIT_COMMON_DIR`, `$XDG_CONFIG_HOME/git/config` and `$HOME/.gitconfig`;
  * on Windows it can also derive its home from `USERPROFILE`, `HOMEDRIVE` and
  * `HOMEPATH`. It runs e.g. `core.fsmonitor` during `git status` and helpers from
@@ -60,7 +61,7 @@ function isExecutable(path: string): boolean {
  * commands could execute repository code.
  */
 const PROJECT_DENIED_SPAWN_ENV =
-	/^(?:BASH_ENV|ENV|ZDOTDIR|HOME|USERPROFILE|HOMEDRIVE|HOMEPATH|XDG_CONFIG_HOME|GIT_DIR|GIT_COMMON_DIR|GIT_EXEC_PATH|GIT_EXTERNAL_DIFF|GIT_PROXY_COMMAND|GIT_SSH|GIT_SSH_COMMAND|GIT_ASKPASS|GIT_SEQUENCE_EDITOR|GIT_TEMPLATE_DIR|GIT_CONFIG_(?:COUNT|PARAMETERS|GLOBAL|SYSTEM|KEY_\d+|VALUE_\d+))$/;
+	/^(?:BASH_ENV|BUN_OPTIONS|ENV|ZDOTDIR|HOME|USERPROFILE|HOMEDRIVE|HOMEPATH|XDG_CONFIG_HOME|GIT_DIR|GIT_COMMON_DIR|GIT_EXEC_PATH|GIT_EXTERNAL_DIFF|GIT_PROXY_COMMAND|GIT_SSH|GIT_SSH_COMMAND|GIT_ASKPASS|GIT_SEQUENCE_EDITOR|GIT_TEMPLATE_DIR|GIT_CONFIG_(?:COUNT|PARAMETERS|GLOBAL|SYSTEM|KEY_\d+|VALUE_\d+))$/;
 const PROJECT_HOME_SPAWN_ENV = new Set(["HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"]);
 
 /**

@@ -16,6 +16,7 @@ import * as path from "node:path";
 const PROBE = path.join(import.meta.dir, "fixtures", "shell-spawn-env-probe.ts");
 const HOOK_KEYS = [
 	"BASH_ENV",
+	"BUN_OPTIONS",
 	"GIT_ASKPASS",
 	"GIT_EXEC_PATH",
 	"GIT_PROXY_COMMAND",
@@ -210,5 +211,17 @@ describe.each([
 			BASH_ENV: "/opt/operator/bashenv",
 		});
 		expect(probe.BASH_ENV).toBeNull();
+	});
+});
+
+describe("bash spawn env Bun startup options", () => {
+	it("drops a project BUN_OPTIONS declaration before a child Bun runtime starts", async () => {
+		const probe = await probeIn(tempDir("BUN_OPTIONS=--preload=./project-preload.ts\n"), false);
+		expect(probe.BUN_OPTIONS).toBeNull();
+	});
+
+	it("keeps a trusted inherited BUN_OPTIONS value when the project does not declare it", async () => {
+		const probe = await probeIn(tempDir(), false, { BUN_OPTIONS: "--no-env-file" });
+		expect(probe.BUN_OPTIONS).toBe("--no-env-file");
 	});
 });
