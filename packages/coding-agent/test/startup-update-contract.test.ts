@@ -4,7 +4,12 @@ import { closeModelCache, getBundledModel, type Model } from "@gajae-code/ai";
 import { exactRemoveDirectoryTree, snapshotDirectoryTree } from "@gajae-code/natives";
 import { getAgentDir, hookFetch, postmortem, setAgentDir, TempDir } from "@gajae-code/utils";
 import { type Args, parseArgs } from "../src/cli/args";
-import { FileLockAcquireError, FileLockTestHooks, withFileLock } from "../src/config/file-lock";
+import {
+	FileLockAcquireError,
+	FileLockStagingCleanupError,
+	FileLockTestHooks,
+	withFileLock,
+} from "../src/config/file-lock";
 import { ModelRegistry, ModelsConfigFile } from "../src/config/model-registry";
 import { resetSettingsForTest, Settings } from "../src/config/settings";
 import { SETTINGS_SCHEMA } from "../src/config/settings-schema";
@@ -626,16 +631,7 @@ describe("startup update contract", () => {
 		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
 		const filePath = path.join(tempDir.path(), "sdk", "sessions", "index.jsonl");
 		const lockPath = `${filePath}.lock`;
-		const lockError = new FileLockAcquireError(
-			filePath,
-			lockPath,
-			2,
-			"held by a live broker",
-			"acquire_timeout",
-			undefined,
-			undefined,
-			"access_denied",
-		);
+		const lockError = new FileLockAcquireError(filePath, lockPath, 2, "held by a live broker", "acquire_timeout");
 		const stderr: string[] = [];
 		vi.spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
 			stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
@@ -664,8 +660,8 @@ describe("startup update contract", () => {
 
 			expect(stderr.join("")).toContain("Session index is busy");
 			expect(stderr.join("")).toContain(`Lock: ${lockPath}`);
-			expect(stderr.join("")).toContain("Code: access_denied");
-			expect(stderr.join("")).toContain("retry in a few seconds");
+			expect(stderr.join("")).toContain("Code: acquire_timeout");
+			expect(stderr.join("")).toContain("Retry in a few seconds");
 			expect(process.exitCode).toBe(1);
 			expect(createAgentSessionCalls).toBe(0);
 			expect(cleanupSpy).toHaveBeenCalledTimes(1);
@@ -673,6 +669,97 @@ describe("startup update contract", () => {
 			vi.restoreAllMocks();
 			process.exitCode = originalExitCode ?? 0;
 			authStorage.close();
+		}
+	});
+	it("does not label unproven session-index failures as broker contention", async () => {
+		const originalExitCode = process.exitCode;
+		const stderr: string[] = [];
+		vi.spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
+			stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+			return true;
+		});
+		const cleanupSpy = vi.spyOn(postmortem, "cleanup").mockResolvedValue(undefined);
+		const scenarios = [
+			{
+				kind: "access_denied",
+				code: "access_denied",
+				message: "Session index lock acquisition failed",
+			},
+			{
+				kind: "io_error",
+				code: "io_error",
+				message: "Session index lock publication failed",
+			},
+			{
+				kind: "cleanup_denied",
+				code: "EACCES",
+				message: "Session index lock staging cleanup failed",
+			},
+		] as const;
+
+		try {
+			for (const scenario of scenarios) {
+				using tempDir = TempDir.createSync("@gjc-session-index-publication-failure-");
+				const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+				const filePath = path.join(tempDir.path(), "sdk", "sessions", "index.jsonl");
+				const lockPath = `${filePath}.lock`;
+				const error =
+					scenario.kind === "access_denied"
+						? new FileLockAcquireError(
+								filePath,
+								lockPath,
+								2,
+								"publication denied without an observed owner",
+								"acquire_timeout",
+								undefined,
+								undefined,
+								"access_denied",
+							)
+						: scenario.kind === "cleanup_denied"
+							? new FileLockStagingCleanupError(
+									lockPath,
+									`${lockPath}.pending.test`,
+									Object.assign(new Error("staging cleanup denied"), { code: "EACCES" }),
+								)
+							: Object.assign(new Error("Failed to publish file lock: io_error."), { code: "io_error" });
+				process.exitCode = 0;
+				stderr.length = 0;
+				try {
+					await runRootCommand(rootArgs({ mode: "text", noSession: false }), [], {
+						createAgentSession: async () => fakeSessionResult(),
+						createSessionManager: async () => SessionManager.inMemory(tempDir.path()),
+						registerDirectSession: async () => {
+							throw error;
+						},
+						discoverAuthStorage: async () => authStorage,
+						settings: Settings.isolated({
+							"marketplace.autoUpdate": "off",
+							"startup.checkUpdate": false,
+						}),
+						initTheme: async () => {},
+						runStartupCredentialAutoImportIfNeeded: async () => undefined,
+						suppressProcessExit: false,
+					});
+					const output = stderr.join("");
+					expect(output).toContain(scenario.message);
+					const reportedLockPath =
+						scenario.kind === "io_error"
+							? path.join(getAgentDir(), "sdk", "sessions", "index.jsonl.lock")
+							: lockPath;
+					expect(output).toContain(`Lock: ${reportedLockPath}`);
+					expect(output).toContain(`Code: ${scenario.code}`);
+					expect(output).not.toContain("Session index is busy");
+					expect(output).not.toContain("Retry in a few seconds");
+					expect(output).not.toContain("broker");
+					expect(process.exitCode).toBe(1);
+				} finally {
+					authStorage.close();
+				}
+			}
+			expect(cleanupSpy).toHaveBeenCalledTimes(scenarios.length);
+		} finally {
+			vi.restoreAllMocks();
+			process.exitCode = originalExitCode ?? 0;
 		}
 	});
 	it("propagates a session-index lock release failure after registration commits", async () => {
@@ -1103,7 +1190,7 @@ describe("startup update contract", () => {
 			expect(exitSpy).toHaveBeenCalledWith(1);
 			expect(printModeStarted).toBe(false);
 			expect(settings.get("modelProfile.default")).toBe("codex-medium");
-			expect(stderr.join("")).toContain('Model profile "Codex Medium" requires credentials for: openai-codex');
+			expect(stderr.join("")).toContain('Model profile "codex-medium" requires credentials for: openai-codex');
 			expect(getApiKeySpy.mock.calls.map(call => [call[0], call[1]])).toContainEqual([
 				"openai-codex",
 				FAKE_SESSION_ID,

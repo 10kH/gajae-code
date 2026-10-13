@@ -29,7 +29,7 @@ import { resolveLaunchDisposition } from "./cli/launch-disposition";
 import { runListModelsCommand } from "./cli/list-models";
 import { selectSession } from "./cli/session-picker";
 import { findConfigFile } from "./config";
-import { FileLockAcquireError } from "./config/file-lock";
+import { FileLockAcquireError, FileLockStagingCleanupError } from "./config/file-lock";
 import {
 	activateModelProfile,
 	applyModelProfileRuntimeBindings,
@@ -1718,11 +1718,22 @@ export async function registerDirectSession(
 }
 
 function directSessionIndexLockFailureMessage(error: unknown, agentDir: string): string | undefined {
+	if (error instanceof FileLockStagingCleanupError) {
+		return (
+			"Session index lock staging cleanup failed; acquisition stopped instead of retrying with another staging directory.\n" +
+			`Lock: ${error.lockPath}\nStaging: ${error.stagingPath}\nCode: ${error.code ?? "unknown"}\n${error.message}`
+		);
+	}
 	if (error instanceof FileLockAcquireError) {
 		const code = error.publicationFailureCode ?? error.code;
+		if (error.publicationFailureCode === "sharing_violation" || error.holder.startsWith("held by "))
+			return (
+				"Session index is busy; a live owner is never displaced. Retry in a few seconds.\n" +
+				`Lock: ${error.lockPath}\nCode: ${code}\n${error.message}`
+			);
 		return (
-			"Session index is busy (a broker from the previous version may still be shutting down); " +
-			`retry in a few seconds.\nLock: ${error.lockPath}\nCode: ${code}\n${error.message}`
+			"Session index lock acquisition failed; no session was registered.\n" +
+			`Lock: ${error.lockPath}\nCode: ${code}\nHolder: ${error.holder}`
 		);
 	}
 	if (!(error instanceof Error) || !/^Failed to publish file lock:/u.test(error.message)) return undefined;
@@ -1731,9 +1742,11 @@ function directSessionIndexLockFailureMessage(error: unknown, agentDir: string):
 		error.message.match(/^Failed to publish file lock: ([a-z0-9_]+)/u)?.[1] ??
 		"unknown";
 	const lockPath = path.join(agentDir, "sdk", "sessions", "index.jsonl.lock");
+	if (code !== "sharing_violation" && code !== "EBUSY")
+		return `Session index lock publication failed; no session was registered.\nLock: ${lockPath}\nCode: ${code}\n${error.message}`;
 	return (
-		"Session index is busy (a broker from the previous version may still be shutting down); " +
-		`retry in a few seconds.\nLock: ${lockPath}\nCode: ${code}\n${error.message}`
+		"Session index is busy; a live owner is never displaced. Retry in a few seconds.\n" +
+		`Lock: ${lockPath}\nCode: ${code}\n${error.message}`
 	);
 }
 

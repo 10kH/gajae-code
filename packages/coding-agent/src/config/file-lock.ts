@@ -91,6 +91,25 @@ export class FileLockAcquireError extends Error {
 	}
 }
 
+export class FileLockStagingCleanupError extends Error {
+	readonly code: string | undefined;
+
+	constructor(
+		readonly lockPath: string,
+		readonly stagingPath: string,
+		cause: unknown,
+	) {
+		const code =
+			typeof cause === "object" && cause !== null && "code" in cause && typeof cause.code === "string"
+				? cause.code
+				: undefined;
+		const detail = cause instanceof Error ? cause.message : String(cause);
+		super(`Failed to clean staged file-lock publication at ${stagingPath}${code ? ` (${code})` : ""}: ${detail}`);
+		this.code = code;
+		this.name = "FileLockStagingCleanupError";
+	}
+}
+
 export function isFileLockAcquireTimeout(error: unknown): error is FileLockAcquireError {
 	return error instanceof FileLockAcquireError && error.code === "acquire_timeout";
 }
@@ -137,6 +156,7 @@ type LockInfo = FileLockOwnerToken;
 export const FileLockTestHooks: {
 	afterParentMkdir?: (lockPath: string) => void | Promise<void>;
 	beforeRemovalOwnerPublish?: (transitionPath: string) => void | Promise<void>;
+	cleanupPendingStaging?: (stagingPath: string) => Promise<void>;
 	nativePublicationBindings?: () => {
 		renameNoReplacePathAsync: typeof renameNoReplacePathAsync;
 		renameDirectoryNoReplacePathAsync: typeof renameDirectoryNoReplacePathAsync;
@@ -144,6 +164,16 @@ export const FileLockTestHooks: {
 	nativeQuarantineBindings?: () => NativeFileLockBindings;
 	nativeExactRemovalProbe?: () => boolean | Promise<boolean>;
 } = {};
+
+async function cleanupPendingStagingOrThrow(lockPath: string, stagingPath: string): Promise<void> {
+	try {
+		const cleanup = FileLockTestHooks.cleanupPendingStaging;
+		if (cleanup) await cleanup(stagingPath);
+		else await fs.rm(stagingPath, { recursive: true, force: true });
+	} catch (error) {
+		throw new FileLockStagingCleanupError(lockPath, stagingPath, error);
+	}
+}
 
 /**
  * Returns the OS-provided process start timestamp for PID-reuse detection.
@@ -2168,6 +2198,8 @@ async function tryAcquireLock(
 			} else if (fallback.reason === "destination_exists") {
 				return null;
 			} else if (fallbackFailureCode) {
+				removePending = false;
+				await cleanupPendingStagingOrThrow(lockPath, pendingPath);
 				return { kind: "publication_contention", code: fallbackFailureCode };
 			} else {
 				const failure = new Error(
@@ -2182,7 +2214,11 @@ async function tryAcquireLock(
 				return null;
 			}
 			const publicationFailureCode = transientPublicationFailureCode(published);
-			if (publicationFailureCode) return { kind: "publication_contention", code: publicationFailureCode };
+			if (publicationFailureCode) {
+				removePending = false;
+				await cleanupPendingStagingOrThrow(lockPath, pendingPath);
+				return { kind: "publication_contention", code: publicationFailureCode };
+			}
 			const failure = new Error(
 				`Failed to publish file lock: ${published.code ?? published.reason ?? "unknown"}.`,
 			) as NodeJS.ErrnoException;

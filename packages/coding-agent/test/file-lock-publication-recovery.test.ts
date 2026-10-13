@@ -46,6 +46,7 @@ afterEach(async () => {
 	vi.restoreAllMocks();
 	FileLockTestHooks.nativePublicationBindings = undefined;
 	FileLockTestHooks.nativeQuarantineBindings = undefined;
+	FileLockTestHooks.cleanupPendingStaging = undefined;
 	for (const { directory, forgetGrant } of tempDirs.splice(0)) {
 		try {
 			await fs.rm(directory, { recursive: true, force: true });
@@ -438,6 +439,32 @@ test("retries a pre-mutation Windows access denial within the lock acquisition b
 	expect(attempts).toBe(6);
 	await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
 	expect(await fs.readdir(root)).toEqual([]);
+});
+
+test("stops retrying when failed publication staging cannot be cleaned", async () => {
+	const { root, file, lock } = await makeFixture();
+	let publicationAttempts = 0;
+	let cleanupAttempts = 0;
+	FileLockTestHooks.nativePublicationBindings = () => ({
+		renameNoReplacePathAsync: async () => {
+			publicationAttempts++;
+			return accessDeniedPublication();
+		},
+		renameDirectoryNoReplacePathAsync,
+	});
+	FileLockTestHooks.cleanupPendingStaging = async () => {
+		cleanupAttempts++;
+		throw Object.assign(new Error("staging cleanup denied"), { code: "EACCES" });
+	};
+
+	await expect(withFileLock(file, async () => "entered", { retries: 5, retryDelayMs: 1 })).rejects.toMatchObject({
+		name: "FileLockStagingCleanupError",
+		lockPath: lock,
+		code: "EACCES",
+	});
+	expect(publicationAttempts).toBe(3);
+	expect(cleanupAttempts).toBe(1);
+	expect((await fs.readdir(root)).filter(name => name.includes(".pending."))).toHaveLength(1);
 });
 
 test("exhausted Windows access-denied publication reports lock contention and its code", async () => {
