@@ -1,3 +1,3 @@
 ### Fixed
 
-- Reserve the Windows lock retirement path before scrubbing owner metadata, and reclaim aged empty legacy locks only through identity-bound detachment and a fresh staged acquisition, preventing abandoned session-index locks from wedging the SDK broker (issue #6008).
+- Record and reap interrupted Windows retirements before successor publication, reserve `.removing` before scrubbing owner metadata, and recover aged empty legacy locks through identity-bound detachment and fresh staged acquisition so abandoned session-index locks cannot wedge the SDK broker (issue #6008).

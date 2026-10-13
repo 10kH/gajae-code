@@ -674,7 +674,25 @@ async function classifyFileLockRemovalTransition(
 		transition = await fs.lstat(transitionPath, { bigint: true });
 		if (!transition.isDirectory() || transition.isSymbolicLink()) return "active";
 	} catch (error) {
-		if (isEnoent(error)) return null;
+		if (isEnoent(error)) {
+			const recordPath = `${transitionPath}.owner`;
+			const recordedOwner = await readRemovalTransitionOwnerRecord(transitionPath);
+			if (!recordedOwner) {
+				try {
+					await fs.lstat(recordPath);
+					return "active";
+				} catch (recordError) {
+					return isEnoent(recordError) ? null : "active";
+				}
+			}
+			if (
+				recordedOwner.owner.owner_host_id !== undefined &&
+				lockRecordIsForeignHost(recordedOwner.owner, ownerHostId, previousOwnerHostIds)
+			)
+				return "active";
+			if (ownerIsAlive(recordedOwner.owner) || ownerLiveness(recordedOwner.owner.pid) === "unknown") return "active";
+			return (await removeRemovalRecord(recordPath, JSON.stringify(recordedOwner))) ? null : "active";
+		}
 		throw error;
 	}
 
@@ -762,8 +780,16 @@ async function clearRemovalRecord(transitionPath: string): Promise<void> {
 	const bytes = localRemovalRecords.get(recordPath)?.bytes;
 	if (!bytes) return;
 	try {
-		await fs.lstat(transitionPath);
-		return;
+		const transition = await fs.lstat(transitionPath, { bigint: true });
+		const recorded = JSON.parse(bytes) as Partial<RemovalTransitionOwnerRecord>;
+		if (
+			transition.isDirectory() &&
+			typeof recorded.rootDev === "string" &&
+			typeof recorded.rootIno === "string" &&
+			canonicalLockDeviceId(transition.dev).toString() === recorded.rootDev &&
+			canonicalLockFileId(transition.ino).toString() === recorded.rootIno
+		)
+			return;
 	} catch (error) {
 		if (!isEnoent(error)) throw error;
 	}
@@ -805,9 +831,20 @@ async function exactRemoveLockTree(
 	parentIdentity?: { dev: bigint; ino: bigint },
 	detachOnly?: boolean,
 ): Promise<NativeExactUnlinkResult> {
-	if (process.platform === "win32" || lockPath.endsWith(".removing"))
+	if (lockPath.endsWith(".removing"))
 		return nativeFileLockBindings().exactRemoveDirectoryTree(lockPath, snapshot, parentIdentity, detachOnly);
 	const transitionPath = fileLockRemovalTransitionPath(lockPath);
+	if (process.platform === "win32") {
+		try {
+			await fs.lstat(transitionPath);
+			// Native removal can resume this generation when the canonical name is
+			// already detached. A different generation at `.removing` is left for
+			// acquisition-time adoption; never attach this owner record to it.
+			return nativeFileLockBindings().exactRemoveDirectoryTree(lockPath, snapshot, parentIdentity, detachOnly);
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+		}
+	}
 	const recordPath = `${transitionPath}.owner`;
 	const prior = await readRemovalTransitionOwnerRecord(transitionPath);
 	if (prior?.owner.owner_host_id !== undefined && lockRecordIsForeignHost(prior.owner, ownerHostId, []))
@@ -832,7 +869,7 @@ async function exactRemoveLockTree(
 }
 
 /**
- * Adopt-and-finish a provably orphaned POSIX removal transition.
+ * Adopt-and-finish a provably orphaned removal transition.
  *
  * The prepublished sibling carries the remover's process generation and the
  * captured root identity until cleanup finishes. A dead remover permits replay
@@ -2110,61 +2147,59 @@ async function tryAcquireLock(
 		// validation gets a chance to reject it.
 		const canonicalPendingPath = path.join(canonicalParent, path.basename(pendingPath));
 		let stagedSnapshot: NativeDirectoryTreeSnapshot | undefined;
-		if (process.platform !== "win32") {
-			// POSIX exact tree removal owns this deterministic sibling from detach
-			// until cleanup. The outer acquisition loop supplies the existing bounded
-			// contention wait while the predecessor retains that namespace.
-			let transitionState = await classifyFileLockRemovalTransition(
+		// A predecessor may retain this deterministic sibling while native cleanup
+		// is in progress on either platform. Do not let a successor publish until
+		// the transition is gone or its dead owner has been safely adopted.
+		let transitionState = await classifyFileLockRemovalTransition(
+			destinationPath,
+			orphanTransitionAgeMs,
+			ownerHostId,
+			previousOwnerHostIds,
+		);
+		if (transitionState === "orphan_transition") {
+			// A scrubbed, aged transition is the residue of a removal whose owner died
+			// before its final on-disk cleanup. Adopt and finish it here so the wedged
+			// namespace heals instead of aborting (or re-spinning the whole budget).
+			if (
+				!(await adoptOrphanedFileLockRemovalTransition(
+					destinationPath,
+					orphanTransitionAgeMs,
+					ownerHostId,
+					previousOwnerHostIds,
+				))
+			)
+				return { kind: "orphan_transition", path: fileLockRemovalTransitionPath(destinationPath) };
+			transitionState = await classifyFileLockRemovalTransition(
 				destinationPath,
 				orphanTransitionAgeMs,
 				ownerHostId,
 				previousOwnerHostIds,
 			);
-			if (transitionState === "orphan_transition") {
-				// A scrubbed, aged transition is the residue of a removal whose owner died
-				// before its final on-disk cleanup. Adopt and finish it here so the wedged
-				// namespace heals instead of aborting (or re-spinning the whole budget).
-				if (
-					!(await adoptOrphanedFileLockRemovalTransition(
-						destinationPath,
-						orphanTransitionAgeMs,
-						ownerHostId,
-						previousOwnerHostIds,
-					))
-				)
-					return { kind: "orphan_transition", path: fileLockRemovalTransitionPath(destinationPath) };
+		}
+		if (transitionState === "orphan_transition")
+			return { kind: "orphan_transition", path: fileLockRemovalTransitionPath(destinationPath) };
+		if (transitionState === "abandoned") {
+			if (await adoptAbandonedFileLockRemovalTransition(destinationPath, ownerHostId, previousOwnerHostIds)) {
 				transitionState = await classifyFileLockRemovalTransition(
 					destinationPath,
 					orphanTransitionAgeMs,
 					ownerHostId,
 					previousOwnerHostIds,
 				);
+			} else {
+				return null;
 			}
-			if (transitionState === "orphan_transition")
-				return { kind: "orphan_transition", path: fileLockRemovalTransitionPath(destinationPath) };
-			if (transitionState === "abandoned") {
-				if (await adoptAbandonedFileLockRemovalTransition(destinationPath, ownerHostId, previousOwnerHostIds)) {
-					transitionState = await classifyFileLockRemovalTransition(
-						destinationPath,
-						orphanTransitionAgeMs,
-						ownerHostId,
-						previousOwnerHostIds,
-					);
-				} else {
-					return null;
-				}
-			}
-			if (transitionState !== null) return null;
-			const staged = snapshotDirectoryTree(canonicalPendingPath);
-			if (!staged.ok || !staged.snapshot) {
-				const failure = new Error(
-					`Failed to snapshot staged file lock: ${staged.code ?? "unknown"}.`,
-				) as NodeJS.ErrnoException;
-				if (staged.code) failure.code = staged.code;
-				throw failure;
-			}
-			stagedSnapshot = staged.snapshot;
 		}
+		if (transitionState !== null) return null;
+		const staged = snapshotDirectoryTree(canonicalPendingPath);
+		if (!staged.ok || !staged.snapshot) {
+			const failure = new Error(
+				`Failed to snapshot staged file lock: ${staged.code ?? "unknown"}.`,
+			) as NodeJS.ErrnoException;
+			if (staged.code) failure.code = staged.code;
+			throw failure;
+		}
+		stagedSnapshot = staged.snapshot;
 		const publication = FileLockTestHooks.nativePublicationBindings?.() ?? {
 			renameNoReplacePathAsync,
 			renameDirectoryNoReplacePathAsync,
