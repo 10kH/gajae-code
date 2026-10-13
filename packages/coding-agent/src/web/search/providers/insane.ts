@@ -15,6 +15,7 @@ import type { AuthStorage } from "@gajae-code/ai/core";
 
 import type { SearchResponse, SearchSource } from "../../../web/search/types";
 import { SearchProviderError } from "../../../web/search/types";
+import type { AddressResolver } from "../../insane/url-guard";
 import { guardedPublicFetch, validatePublicHttpUrl } from "../../insane/url-guard";
 import { clampNumResults } from "../utils";
 import type { SearchParams } from "./base";
@@ -210,21 +211,27 @@ async function readResponseText(response: Response): Promise<string> {
 async function fetchText(
 	url: string,
 	signal?: AbortSignal,
+	resolverOption?: { resolver?: AddressResolver },
 ): Promise<{ status: number; text: string; contentType: string }> {
 	const deadline = withHardTimeout(signal, PUBLIC_ROUTE_TIMEOUT_MS);
 	let currentUrl = url;
 
 	for (let redirectCount = 0; ; redirectCount++) {
 		// Fresh GET each hop: no body and no caller auth headers. guardedPublicFetch forces redirect:"manual".
-		const dial = await guardedPublicFetch(currentUrl, {
-			method: "GET",
-			headers: {
-				Accept: "application/json, application/atom+xml, application/rss+xml, text/xml, text/html;q=0.8, */*;q=0.5",
-				"User-Agent": USER_AGENT,
+		const dial = await guardedPublicFetch(
+			currentUrl,
+			{
+				method: "GET",
+				headers: {
+					Accept:
+						"application/json, application/atom+xml, application/rss+xml, text/xml, text/html;q=0.8, */*;q=0.5",
+					"User-Agent": USER_AGENT,
+				},
+				redirect: "manual",
+				signal: deadline,
 			},
-			redirect: "manual",
-			signal: deadline,
-		});
+			resolverOption,
+		);
 		if (!dial.ok) throw new PublicUrlRejectedError(dial.reason);
 
 		const { response, logicalUrl } = dial;
@@ -244,7 +251,7 @@ async function fetchText(
 		} catch {
 			throw new PublicUrlRejectedError("invalid redirect Location");
 		}
-		const guard = await validatePublicHttpUrl(nextUrl.href, { signal: deadline });
+		const guard = await validatePublicHttpUrl(nextUrl.href, { signal: deadline, resolver: resolverOption?.resolver });
 		if (deadline.aborted) throw deadline.reason;
 		if (!guard.ok) throw new PublicUrlRejectedError(guard.reason);
 		currentUrl = guard.url.href;
@@ -302,11 +309,15 @@ function redditFeedUrls(url: URL): string[] {
 	return [`${base}/.rss`, `${base}.rss`];
 }
 
-async function routeReddit(url: URL, signal?: AbortSignal): Promise<RouteResult> {
+async function routeReddit(
+	url: URL,
+	signal?: AbortSignal,
+	resolverOption?: { resolver?: AddressResolver },
+): Promise<RouteResult> {
 	const attempts: InsaneRouteAttempt[] = [];
 	for (const feedUrl of redditFeedUrls(url)) {
 		try {
-			const response = await fetchText(feedUrl, signal);
+			const response = await fetchText(feedUrl, signal, resolverOption);
 			const ok = response.status === 200 && /<(feed|rss)\b/i.test(response.text) && !isBlockedBody(response.text);
 			attempts.push(attempt("reddit", "rss", ok, response.status, response.text, ok ? "feed" : "no-feed-markers"));
 			if (ok)
@@ -360,13 +371,17 @@ function sourceFromOEmbed(raw: string, url: string): SearchSource | null {
 	return { title, url: data.url ?? url, snippet, author: data.author_name };
 }
 
-async function routeX(url: URL, signal?: AbortSignal): Promise<RouteResult> {
+async function routeX(
+	url: URL,
+	signal?: AbortSignal,
+	resolverOption?: { resolver?: AddressResolver },
+): Promise<RouteResult> {
 	const attempts: InsaneRouteAttempt[] = [];
 	const id = tweetId(url);
 	if (id) {
 		const tweetResultUrl = `https://cdn.syndication.twimg.com/tweet-result?id=${encodeURIComponent(id)}&token=a`;
 		try {
-			const response = await fetchText(tweetResultUrl, signal);
+			const response = await fetchText(tweetResultUrl, signal, resolverOption);
 			const source =
 				response.status === 200 && !isBlockedBody(response.text)
 					? sourceFromTweetJson(response.text, url.toString())
@@ -381,7 +396,7 @@ async function routeX(url: URL, signal?: AbortSignal): Promise<RouteResult> {
 		}
 		const oembedUrl = `https://publish.twitter.com/oembed?url=${encodeURIComponent(`https://twitter.com/i/status/${id}`)}&omit_script=1`;
 		try {
-			const response = await fetchText(oembedUrl, signal);
+			const response = await fetchText(oembedUrl, signal, resolverOption);
 			const source =
 				response.status === 200 && !isBlockedBody(response.text)
 					? sourceFromOEmbed(response.text, oembedUrl)
@@ -398,7 +413,7 @@ async function routeX(url: URL, signal?: AbortSignal): Promise<RouteResult> {
 	if (handle) {
 		const timelineUrl = `https://syndication.twitter.com/srv/timeline-profile/screen-name/${encodeURIComponent(handle)}`;
 		try {
-			const response = await fetchText(timelineUrl, signal);
+			const response = await fetchText(timelineUrl, signal, resolverOption);
 			const ok = response.status === 200 && response.text.includes("__NEXT_DATA__") && !isBlockedBody(response.text);
 			attempts.push(
 				attempt("x", "syndication-timeline", ok, response.status, response.text, ok ? "timeline" : "no-next-data"),
@@ -431,14 +446,18 @@ function youtubeVideoId(url: URL): string | null {
 	return url.searchParams.get("v") ?? url.pathname.match(/\/shorts\/([^/?#]+)/)?.[1] ?? null;
 }
 
-async function routeYouTube(url: URL, signal?: AbortSignal): Promise<RouteResult> {
+async function routeYouTube(
+	url: URL,
+	signal?: AbortSignal,
+	resolverOption?: { resolver?: AddressResolver },
+): Promise<RouteResult> {
 	const attempts: InsaneRouteAttempt[] = [];
 	const videoId = youtubeVideoId(url);
 	if (videoId) {
 		const watchUrl = `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}`;
 		const oembedUrl = `https://www.youtube.com/oembed?url=${encodeURIComponent(watchUrl)}&format=json`;
 		try {
-			const response = await fetchText(oembedUrl, signal);
+			const response = await fetchText(oembedUrl, signal, resolverOption);
 			const source =
 				response.status === 200 && !isBlockedBody(response.text) ? sourceFromOEmbed(response.text, watchUrl) : null;
 			attempts.push(
@@ -453,7 +472,7 @@ async function routeYouTube(url: URL, signal?: AbortSignal): Promise<RouteResult
 	if (channelId) {
 		const feedUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${encodeURIComponent(channelId)}`;
 		try {
-			const response = await fetchText(feedUrl, signal);
+			const response = await fetchText(feedUrl, signal, resolverOption);
 			const ok = response.status === 200 && /<feed\b/i.test(response.text) && !isBlockedBody(response.text);
 			attempts.push(attempt("youtube", "feed", ok, response.status, response.text, ok ? "feed" : "no-feed"));
 			if (ok)
@@ -501,13 +520,17 @@ function hnSourceFromItem(raw: string): SearchSource | null {
 	};
 }
 
-async function routeHackerNews(url: URL, signal?: AbortSignal): Promise<RouteResult> {
+async function routeHackerNews(
+	url: URL,
+	signal?: AbortSignal,
+	resolverOption?: { resolver?: AddressResolver },
+): Promise<RouteResult> {
 	const attempts: InsaneRouteAttempt[] = [];
 	const id = hnItemId(url);
 	if (!id) return { platform: "hackernews", attempts };
 	const itemUrl = `https://hacker-news.firebaseio.com/v0/item/${encodeURIComponent(id)}.json`;
 	try {
-		const response = await fetchText(itemUrl, signal);
+		const response = await fetchText(itemUrl, signal, resolverOption);
 		const source = response.status === 200 && !isBlockedBody(response.text) ? hnSourceFromItem(response.text) : null;
 		attempts.push(
 			attempt("hackernews", "firebase-item", !!source, response.status, response.text, source ? "item" : "no-item"),
@@ -522,14 +545,18 @@ async function routeHackerNews(url: URL, signal?: AbortSignal): Promise<RouteRes
 	return { platform: "hackernews", attempts };
 }
 
-export async function routeInsanePublicUrl(rawUrl: string, signal?: AbortSignal): Promise<RouteResult> {
+export async function routeInsanePublicUrl(
+	rawUrl: string,
+	signal?: AbortSignal,
+	resolverOption?: { resolver?: AddressResolver },
+): Promise<RouteResult> {
 	const url = parseHttpUrl(rawUrl);
 	if (!url) return null;
 	const platform = detectPlatform(url);
-	if (platform === "reddit") return routeReddit(url, signal);
-	if (platform === "x") return routeX(url, signal);
-	if (platform === "youtube") return routeYouTube(url, signal);
-	if (platform === "hackernews") return routeHackerNews(url, signal);
+	if (platform === "reddit") return routeReddit(url, signal, resolverOption);
+	if (platform === "x") return routeX(url, signal, resolverOption);
+	if (platform === "youtube") return routeYouTube(url, signal, resolverOption);
+	if (platform === "hackernews") return routeHackerNews(url, signal, resolverOption);
 	return null;
 }
 
@@ -563,9 +590,10 @@ export async function searchInsane(params: {
 	num_results?: number;
 	recency?: "day" | "week" | "month" | "year";
 	signal?: AbortSignal;
+	resolverOption?: { resolver?: AddressResolver };
 }): Promise<SearchResponse> {
 	const numResults = clampNumResults(params.num_results, DEFAULT_NUM_RESULTS, MAX_NUM_RESULTS);
-	const direct = await routeInsanePublicUrl(params.query, params.signal);
+	const direct = await routeInsanePublicUrl(params.query, params.signal, params.resolverOption);
 	if (isSuccess(direct) && direct.sources.length > 0) {
 		return {
 			provider: "insane",
@@ -595,7 +623,7 @@ export async function searchInsane(params: {
 	const seenUrls = new Set<string>();
 	for (const candidate of discovery.sources) {
 		if (routedSources.length >= numResults) break;
-		const routed = await routeInsanePublicUrl(candidate.url, params.signal);
+		const routed = await routeInsanePublicUrl(candidate.url, params.signal, params.resolverOption);
 		if (routed && "attempts" in routed) attempts.push(...routed.attempts);
 		if (!isSuccess(routed)) continue;
 		for (const source of routed.sources) {
