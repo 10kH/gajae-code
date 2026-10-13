@@ -443,6 +443,7 @@ export type ManagedOpenFailure =
 	| "managed_gc_journal_capacity_exceeded"
 	| "durability_failed"
 	| "atomic_unavailable"
+	| "permission_denied"
 	| "invalid_request"
 	| "durability_not_provable"
 	| "migration_retired"
@@ -2044,6 +2045,7 @@ function expectedFailure(error: unknown): ManagedOpenFailure {
 		message === "managed_gc_journal_capacity_exceeded" ||
 		message === "durability_failed" ||
 		message === "atomic_unavailable" ||
+		message === "permission_denied" ||
 		message === "invalid_request" ||
 		message === "durability_not_provable" ||
 		message === "migration_retired"

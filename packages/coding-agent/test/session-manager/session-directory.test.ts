@@ -4,6 +4,7 @@ import * as syncFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { NativeNoReplaceResult } from "@gajae-code/natives";
 import * as native from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
 import { registerOwnedDeletionRoot, safeRm, safeRmSync } from "../../../../scripts/safe-cleanup";
@@ -596,6 +597,50 @@ describe("managed session write protocol", () => {
 		expect(prepared.code).toBe("permission_denied");
 		expect(prepared.cause?.classification).toBe("permission_denied");
 		expect(JSON.stringify(prepared.cause)).not.toContain(scope.directoryPath);
+	});
+
+	it.each(["open", "delete"] as const)("preserves permission failures through managed %s", async operation => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const legacy = legacyDirectory(sessionsRoot, cwd);
+		await fs.mkdir(legacy, { recursive: true });
+		await fs.writeFile(path.join(legacy, "2026-01-01_permission-denied.jsonl"), transcript("permission-denied", cwd));
+		await expect(prepareManagedSessionScopeForWrite(scope)).resolves.toMatchObject({ kind: "resolved" });
+		const listed = listManagedCandidates(scope);
+		if (listed.kind !== "complete") throw new Error("Candidate listing was incomplete");
+		const candidate = listed.owned.find(entry => entry.provenance === "legacy");
+		if (!candidate) throw new Error("Missing legacy candidate");
+
+		const result: NativeNoReplaceResult = {
+			ok: false,
+			code: "access_denied",
+			mutationState: "not_committed",
+			durabilityState: "not_attempted",
+			reason: "access_denied",
+			primitive: "windows_rename_noreplace",
+			phase: "rename",
+			diagnostic: { schemaVersion: 1, collectionState: "unavailable" },
+		};
+		const bindingPath = path.join(scope.directoryPath, MANAGED_SESSION_BINDING_FILE);
+		const realRename = native.renameNoReplacePathAsync;
+		let injected = 0;
+		const rename = vi.spyOn(native, "renameNoReplacePathAsync").mockImplementation(async (_source, target) => {
+			if (target === bindingPath) {
+				injected += 1;
+				return result;
+			}
+			return realRename(_source, target);
+		});
+		try {
+			await fs.rm(bindingPath);
+			const result =
+				operation === "open"
+					? await openManagedCandidateForWrite(scope, candidate)
+					: await deleteManagedSessionCandidate(scope, candidate);
+			expect(injected).toBe(1);
+			expect(result).toMatchObject({ kind: "error", code: "permission_denied" });
+		} finally {
+			rename.mockRestore();
+		}
 	});
 
 	it("still redacts an unclassified startup failure that embeds its pathname", async () => {
