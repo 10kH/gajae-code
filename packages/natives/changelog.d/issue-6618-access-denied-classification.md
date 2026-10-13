@@ -1,3 +1,3 @@
 ### Fixed
 
-- Include the existing Windows `access_denied` no-replace result in the generated native declaration and add regression coverage for its pre-mutation receipt fields (issue #6618).
+- Classify Windows `access_denied` publication failures as retryable contention when they occur before mutation, matching the handling of `sharing_violation` and enabling recovery without losing lock staging state (issue #6618).
