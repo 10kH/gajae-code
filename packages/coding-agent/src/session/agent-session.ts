@@ -2922,7 +2922,7 @@ export class AgentSession {
 	/** Last (enable, providerId) tuple resolved by `#syncAppendOnlyContext` — used to skip no-op invalidations. */
 	#lastAppendOnlyResolution?: { enable: boolean; providerId: string | undefined };
 	#eventListeners: AgentSessionEventListener[] = [];
-	#sessionIdentityChangeListeners = new Set<() => void>();
+	#sessionIdentityChangeListeners = new Set<() => void | Promise<void>>();
 	#eventListenerSnapshot: readonly AgentSessionEventListener[] = Object.freeze([]);
 	/** Resolution-time switches that occur before a consumer can subscribe. */
 	#pendingFallbackSwitches: Extract<AgentSessionEvent, { type: "model_fallback_switched" }>[] = [];
@@ -7060,10 +7060,11 @@ export class AgentSession {
 		}
 	}
 
-	#notifySessionIdentityChanged(): void {
-		for (const listener of this.#sessionIdentityChangeListeners) {
+	/** Notify UI projections after a committed extension-driven session identity transition. */
+	async notifySessionIdentityChanged(): Promise<void> {
+		for (const listener of [...this.#sessionIdentityChangeListeners]) {
 			try {
-				listener();
+				await listener();
 			} catch (error) {
 				logger.warn("Session identity change listener failed", { error: String(error) });
 			}
@@ -10391,8 +10392,8 @@ export class AgentSession {
 		};
 	}
 
-	/** Subscribe to committed extension-driven session identity changes. */
-	subscribeSessionIdentityChanges(listener: () => void): () => void {
+	/** Subscribe to committed session identity changes that affect UI projections. */
+	subscribeSessionIdentityChanges(listener: () => void | Promise<void>): () => void {
 		this.#sessionIdentityChangeListeners.add(listener);
 		return () => this.#sessionIdentityChangeListeners.delete(listener);
 	}
@@ -14887,7 +14888,7 @@ export class AgentSession {
 				if (!success) {
 					return { cancelled: true };
 				}
-				this.#notifySessionIdentityChanged();
+				await this.notifySessionIdentityChanged();
 				if (options?.setup) {
 					await options.setup(this.sessionManager);
 				}
@@ -14895,12 +14896,12 @@ export class AgentSession {
 			},
 			branch: async entryId => {
 				const result = await this.branch(entryId);
-				if (!result.cancelled) this.#notifySessionIdentityChanged();
+				if (!result.cancelled) await this.notifySessionIdentityChanged();
 				return { cancelled: result.cancelled };
 			},
 			navigateTree: async (targetId, options) => {
 				const result = await this.navigateTree(targetId, { summarize: options?.summarize });
-				if (!result.cancelled) this.#notifySessionIdentityChanged();
+				if (!result.cancelled) await this.notifySessionIdentityChanged();
 				return { cancelled: result.cancelled };
 			},
 			compact: async instructionsOrOptions => {
@@ -14911,12 +14912,12 @@ export class AgentSession {
 			},
 			switchSession: async sessionPath => {
 				const success = await this.switchSession(sessionPath);
-				if (success) this.#notifySessionIdentityChanged();
+				if (success) await this.notifySessionIdentityChanged();
 				return { cancelled: !success };
 			},
 			reload: async () => {
 				await this.reload();
-				this.#notifySessionIdentityChanged();
+				await this.notifySessionIdentityChanged();
 			},
 			getSystemPrompt: () => [...this.systemPrompt],
 		};

@@ -478,6 +478,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#resolvedSlashCommands: SlashCommand[] = [];
 	#baseReservedSlashCommandNames: Set<string> = new Set();
 	#sessionBuiltinMcpVisible = false;
+	#slashCommandRefreshVersion = 0;
 	#cleanupUnsubscribe?: () => void;
 	#itermPetTransport?: ItermPetTransport;
 
@@ -1169,13 +1170,15 @@ export class InteractiveMode implements InteractiveModeContext {
 		// Subscribe to agent events
 		this.#subscribeToAgent();
 		this.#eventBusUnsubscribers.push(
-			this.session.subscribeSessionIdentityChanges(() => {
-				void this.refreshSlashCommandState().catch(error => {
+			this.session.subscribeSessionIdentityChanges(async () => {
+				try {
+					await this.refreshSlashCommandState();
+				} catch (error) {
 					if (this.#stopped) return;
 					logger.warn("Failed to refresh slash-command state after extension session transition", {
 						error: error instanceof Error ? error.message : String(error),
 					});
-				});
+				}
 			}),
 		);
 
@@ -1242,10 +1245,11 @@ export class InteractiveMode implements InteractiveModeContext {
 	/** Reload slash commands and autocomplete for the provided working directory. */
 	async refreshSlashCommandState(cwd?: string): Promise<void> {
 		if (this.#stopped) return;
+		const refreshVersion = ++this.#slashCommandRefreshVersion;
 		const basePath = cwd ?? this.sessionManager.getCwd();
 		this.#refreshSessionBuiltinSlashCommandVisibility(basePath);
 		const fileCommands = await loadSlashCommands({ cwd: basePath });
-		if (this.#stopped) return;
+		if (this.#stopped || refreshVersion !== this.#slashCommandRefreshVersion) return;
 		this.#refreshSessionBuiltinSlashCommandVisibility(basePath);
 		const fileCommandNames = new Set(fileCommands.map(cmd => cmd.name));
 		this.fileSlashCommands = fileCommandNames;

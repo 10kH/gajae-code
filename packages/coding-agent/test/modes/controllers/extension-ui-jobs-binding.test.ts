@@ -118,6 +118,7 @@ function createFixture(): Fixture {
 			isStreaming: false,
 			navigateTree: vi.fn(async () => ({ cancelled: false })),
 			reload: vi.fn(async () => {}),
+			notifySessionIdentityChanged: vi.fn(async () => undefined),
 			getAsyncJobSnapshot: (): AsyncJobSnapshot | null => {
 				calls += 1;
 				return own.source();
@@ -262,15 +263,17 @@ describe("ExtensionUiController async-job binding", () => {
 		});
 	}
 
-	it("refreshes slash-command visibility after extension navigation and reload", async () => {
+	it("notifies the session identity listener after extension navigation and reload", async () => {
 		const fixture = createFixture();
 		await fixture.controller.initHooksAndCustomTools();
 		const commandActions = fixture.getCommandActions();
+		const notifyIdentityChanged = vi.spyOn(fixture.ctx.session, "notifySessionIdentityChanged");
 
 		await commandActions.navigateTree("target", {});
 		await commandActions.reload();
 
-		expect(fixture.ctx.refreshSlashCommandState).toHaveBeenCalledTimes(2);
+		expect(notifyIdentityChanged).toHaveBeenCalledTimes(2);
+		expect(fixture.ctx.refreshSlashCommandState).not.toHaveBeenCalled();
 	});
 });
 
