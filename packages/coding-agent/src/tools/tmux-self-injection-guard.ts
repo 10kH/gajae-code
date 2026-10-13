@@ -1548,6 +1548,7 @@ function collectShellStdinPayloads(
 	hereDocuments: HereDocument[],
 	scripts: ShellScript[],
 	cwd: string,
+	depth = 0,
 ): string[] {
 	const payloads = hereDocuments.flatMap(hereDocument =>
 		(hereDocument.kind === "here-document" && hereDocument.delimiterQuoted) ||
@@ -1567,7 +1568,12 @@ function collectShellStdinPayloads(
 					script.fileDescriptor !== undefined &&
 					hereDocument.activeDescriptors.has(script.fileDescriptor),
 			) ||
-			shellPayloadUsesScriptDescriptor(collectShellPayloads(segmentTokens), hereDocument.activeDescriptors, cwd);
+			shellPayloadUsesScriptDescriptor(
+				collectShellPayloads(segmentTokens),
+				hereDocument.activeDescriptors,
+				cwd,
+				depth,
+			);
 		if (usedAsScript) {
 			executableHereDocuments.add(hereDocument);
 			continue;
@@ -1603,7 +1609,10 @@ function collectShellStdinPayloads(
 		for (const scriptDocument of executableHereDocuments) {
 			for (const candidate of hereDocuments) {
 				if (candidate.body.length === 0 || executableHereDocuments.has(candidate)) continue;
-				if (shellPayloadUsesScriptDescriptor([scriptDocument.body], candidate.activeDescriptors, cwd)) {
+				if (
+					scriptDocument.segment === candidate.segment &&
+					shellPayloadUsesScriptDescriptor([scriptDocument.body], candidate.activeDescriptors, cwd, depth)
+				) {
 					executableHereDocuments.add(candidate);
 					addedScriptSource = true;
 				}
@@ -1757,10 +1766,13 @@ function shellPayloadUsesScriptDescriptor(
 	cwd: string,
 	depth = 0,
 ): boolean {
+	if (depth > MAX_INDIRECTION_DEPTH) return false;
 	for (const payload of payloads) {
-		const nestedTokens = tokenize(payload).tokens;
+		const nested = tokenize(payload);
+		const nestedTokens = nested.tokens;
+		const nestedScripts = collectShellScripts(nestedTokens, cwd);
 		if (
-			collectShellScripts(nestedTokens, cwd).some(
+			nestedScripts.some(
 				script => script.fileDescriptor !== undefined && activeDescriptors.has(script.fileDescriptor),
 			)
 		) {
@@ -1771,6 +1783,16 @@ function shellPayloadUsesScriptDescriptor(
 			shellPayloadUsesScriptDescriptor(collectShellPayloads(nestedTokens), activeDescriptors, cwd, depth + 1)
 		) {
 			return true;
+		}
+		if (depth < MAX_INDIRECTION_DEPTH) {
+			const stdinPayloads = collectShellStdinPayloads(
+				nestedTokens,
+				nested.hereDocuments,
+				nestedScripts,
+				cwd,
+				depth + 1,
+			);
+			if (shellPayloadUsesScriptDescriptor(stdinPayloads, activeDescriptors, cwd, depth + 1)) return true;
 		}
 	}
 	return false;
