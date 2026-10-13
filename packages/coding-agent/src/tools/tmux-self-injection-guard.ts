@@ -14,7 +14,7 @@ const INPUT_VERBS = new Set(["send-keys", "paste-buffer", "send-prefix"]);
 const SHELL_RUNNERS = new Set(["sh", "bash", "dash", "zsh", "ksh", "busybox"]);
 const COMMAND_WRAPPERS = new Set(["eval", "exec", "command", "builtin", "nohup", "time"]);
 const BUILTIN_COMMAND_WRAPPERS = new Set(["command", "eval", "exec"]);
-const NON_EXECUTING_SUDO_OPTIONS = new Set(["-l", "--list", "-v", "--validate", "-V", "--version"]);
+const NON_EXECUTING_SUDO_OPTIONS = new Set(["-e", "--edit", "-l", "--list", "-v", "--validate", "-V", "--version"]);
 const ASSIGNMENT_AWARE_WRAPPERS = new Set(["env", "sudo"]); // Only these allow VAR=value at start
 const CONTROL_WORDS = new Set(["then", "do", "else", "fi", "done", "esac"]);
 const MAX_INDIRECTION_DEPTH = 4;

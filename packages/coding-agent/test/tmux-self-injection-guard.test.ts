@@ -245,6 +245,16 @@ describe("tmux self-injection guard", () => {
 			}
 		});
 
+		it("allows sudo edit mode without treating file operands as commands", async () => {
+			for (const option of ["-e", "--edit"]) {
+				await expect(checkTmuxSelfInjection(`sudo ${option} -- tmux send-keys -t %47 x`, options)).resolves.toEqual(
+					{
+						block: false,
+					},
+				);
+			}
+		});
+
 		it("allows builtin with an external executable name", async () => {
 			await expect(checkTmuxSelfInjection("builtin tmux send-keys -t %47 x", options)).resolves.toEqual({
 				block: false,
