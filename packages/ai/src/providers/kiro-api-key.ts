@@ -1281,28 +1281,10 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 							if (textIndex !== undefined && textIndex < blocks.length && pendingTextContent.length > 0) {
 								textContentConfirmed = true;
 							}
-							// Emit deferred text start if not yet emitted
-							if (textStartDeferred && textIndex !== undefined && textIndex < blocks.length) {
-								const block = blocks[textIndex];
-								if (block && block.type === "text" && pendingTextContent.length > 0) {
-									stream.push({ type: "text_start", contentIndex: textIndex, partial: snapshotOutput() });
-									// Emit all pending text_delta events
-									for (const evt of pendingTextEvents) {
-										if (evt.type === "delta" && evt.delta) {
-											stream.push({
-												type: "text_delta",
-												contentIndex: textIndex,
-												delta: evt.delta,
-												partial: snapshotOutput(),
-											});
-										}
-									}
-									// Emit text_end for confirmed text before error.
-									block.text = pendingTextContent;
-									closeTextBlock();
-								}
-								textStartDeferred = false;
-							}
+						}
+						if (textContentConfirmed) {
+							emitDeferredTextEvents();
+							closeTextBlock();
 						}
 
 						// Only emit the tool if it was explicitly completed (has stop flag)

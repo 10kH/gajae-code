@@ -1436,7 +1436,10 @@ describe("P1 Regression: incomplete tool emission at tool-ID rollover", () => {
 		const toolCall = doneEvent?.message.content.find(block => block.type === "toolCall");
 		expect(toolCall?.type).toBe("toolCall");
 		if (toolCall?.type === "toolCall") expect(toolCall.arguments).toEqual({ query: "kiro" });
-		expect(events.some(event => event.type === "text_delta" && event.delta === "post-terminal text")).toBe(false);
+		expect(doneEvent?.message.content.filter(block => block.type === "text")).toHaveLength(0);
+		expect(
+			events.some(event => event.type === "text_start" || event.type === "text_delta" || event.type === "text_end"),
+		).toBe(false);
 		expectToolEventsReferenceToolBlocks(events);
 	});
 });
@@ -1560,6 +1563,39 @@ describe("P2 Probepark findings: unconfirmed text on read rejection", () => {
 		expect(getTextBlocks(errorEvent?.error)).toHaveLength(0);
 		expect(errorEvent?.partial).toBeUndefined();
 		expect(emittedEvents.some(event => event.type === "text_delta")).toBe(false);
+	});
+
+	test("confirmed text lifecycle closes before an ordinary error in the same batch", async () => {
+		const events: AssistantMessageEvent[] = [];
+		const responseBody =
+			JSON.stringify({ content: "confirmed before error" }) +
+			JSON.stringify({ stopReason: "COMPLETED" }) +
+			JSON.stringify({ error: "ServerError", message: "failure after completion" });
+
+		globalThis.fetch = (async () => {
+			const body = new ReadableStream<Uint8Array>({
+				start(controller) {
+					controller.enqueue(new TextEncoder().encode(responseBody));
+					controller.close();
+				},
+			});
+			return new Response(body, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const errorIndex = events.findIndex(event => event.type === "error");
+		const textLifecycle = events
+			.slice(0, errorIndex)
+			.filter(event => event.type === "text_start" || event.type === "text_delta" || event.type === "text_end");
+		expect(errorIndex).toBeGreaterThan(-1);
+		expect(textLifecycle.map(event => event.type)).toEqual(["text_start", "text_delta", "text_end"]);
+		const textEnd = textLifecycle.find(event => event.type === "text_end");
+		expect(textEnd?.type === "text_end" ? textEnd.content : undefined).toBe("confirmed before error");
+		expect(events.some(event => event.type === "done")).toBe(false);
 	});
 
 	test("reindexes completed-tool lifecycle events before an ordinary error", async () => {
