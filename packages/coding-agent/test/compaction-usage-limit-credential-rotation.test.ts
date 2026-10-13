@@ -99,8 +99,6 @@ describe("auto-compaction usage limit rotates the session credential", () => {
 		});
 	}
 
-	const keysOf = (spy: ReturnType<typeof stubCompact>) => spy.mock.calls.map(call => call[2]);
-
 	it("retries on another stored row instead of the exhausted one", async () => {
 		session = createSession();
 		const ends = collectCompactionEnds(session);
@@ -109,7 +107,7 @@ describe("auto-compaction usage limit rotates the session credential", () => {
 
 		await session.runIdleCompaction();
 
-		const keys = keysOf(compactSpy);
+		const keys = compactSpy.mock.calls.map(call => call[2]);
 		expect(keys).toHaveLength(2);
 		expect(keys[1]).not.toBe(keys[0]);
 		expect(markUsageLimitReached).toHaveBeenCalledTimes(1);
@@ -125,7 +123,7 @@ describe("auto-compaction usage limit rotates the session credential", () => {
 
 		await session.runIdleCompaction();
 
-		const keys = keysOf(compactSpy);
+		const keys = compactSpy.mock.calls.map(call => call[2]);
 		expect(new Set(keys)).toEqual(new Set(["codex-key-1", "codex-key-2"]));
 		expect(keys.length).toBeLessThanOrEqual(2 + MAX_RETRIES);
 		expect(ends).toHaveLength(1);
@@ -189,7 +187,7 @@ describe("auto-compaction usage limit rotates the session credential", () => {
 
 		await session.runIdleCompaction();
 
-		const keys = keysOf(compactSpy);
+		const keys = compactSpy.mock.calls.map(call => call[2]);
 		expect(keys).toHaveLength(1 + MAX_RETRIES);
 		expect(new Set(keys).size).toBe(1);
 		expect(markUsageLimitReached).not.toHaveBeenCalled();
