@@ -4,8 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult } from "@gajae-code/agent-core";
 import { Settings } from "../src/config/settings";
+import type { ToolSession } from "../src/sdk";
 import { OutputSink } from "../src/session/streaming-output";
 import { wrapToolWithMetaNotice } from "../src/tools/output-meta";
+import { ReadTool } from "../src/tools/read";
 import { ToolAbortError } from "../src/tools/tool-errors";
 
 const CANARY = `GJCC2-${"0123456789abcdef".repeat(2)}01234567`;
@@ -40,7 +42,7 @@ async function loadSettings(enabled: boolean, content = CANARY): Promise<{ setti
 	mkdirSync(join(cwd, ".gjc"), { recursive: true });
 	mkdirSync(agentDir, { recursive: true });
 	writeFileSync(join(agentDir, "config.yml"), `secrets:\n  enabled: ${enabled ? "true" : "false"}\n`);
-	writeFileSync(join(cwd, ".gjc", "secrets.yml"), `- type: plain\n  content: "${content}"\n`);
+	writeFileSync(join(cwd, ".gjc", "secrets.yml"), `- type: plain\n  content: ${JSON.stringify(content)}\n`);
 	const settings = await Settings.loadForScope({ cwd, agentDir });
 	if (settings.get("secrets.enabled") !== enabled) {
 		await settings.close();
@@ -55,6 +57,23 @@ function textOf(result: AgentToolResult): string {
 		.filter((block): block is { type: "text"; text: string } => block.type === "text")
 		.map(block => block.text)
 		.join("");
+}
+
+function wrappedReadTool(settings: Settings, cwd: string) {
+	const sessionDir = join(cwd, "session");
+	const session = {
+		cwd,
+		hasUI: false,
+		getSessionFile: () => join(cwd, "session.jsonl"),
+		getSessionSpawns: () => "*",
+		getArtifactsDir: () => sessionDir,
+		allocateOutputArtifact: async (toolType: string) => ({
+			id: "read-artifact",
+			path: join(sessionDir, `${toolType}.log`),
+		}),
+		settings,
+	};
+	return wrapToolWithMetaNotice(new ReadTool(session as unknown as ToolSession));
 }
 
 async function executeSink(
@@ -329,17 +348,72 @@ describe("column cap plain-secret cut", () => {
 		}
 	});
 
-	test("a multiline secret split across newlines does not emit partial prefixes", async () => {
-		const multilineSecret = `line1\nline2`;
+	test("a multiline secret spanning earlier lines is retracted when a later line crosses the cap", async () => {
+		const multilineSecret = `line1\nmiddle\n${"2".repeat(900)}`;
 		const { settings, root } = await loadSettings(true, multilineSecret);
 		try {
-			// First line is within the cap, second line exceeds it
-			const chunks = [`${FILLER.repeat(750)}line1\n`, `line2${FILLER.repeat(2000)}`];
-			const output = await executeSink(settings, chunks);
-			// Should not contain "line1" at the end of first line when "line2" is capped
-			expect(output.includes(multilineSecret)).toBe(false);
-			expect(output.includes("line1\nline2")).toBe(false);
-			expect(output.endsWith("…")).toBe(true);
+			const chunks = [`${FILLER.repeat(750)}line1\nmiddle\n`, `${"2".repeat(900)}${FILLER.repeat(2000)}`];
+			for (const input of [chunks, [chunks.join("")]]) {
+				const output = await executeSink(settings, input);
+				expect(output).not.toContain("line1");
+				expect(output).not.toContain(multilineSecret);
+				expect(output.endsWith("…")).toBe(true);
+			}
+		} finally {
+			await settings.close();
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("wrapped ReadTool clips configured secrets but preserves raw and hashline output", async () => {
+		const { settings, root } = await loadSettings(true);
+		const cwd = join(root, "project");
+		const file = join(cwd, "secret.txt");
+		const source = `${FILLER.repeat(760)}${CANARY}${FILLER.repeat(30)}\n`;
+		settings.set("tools.outputMaxColumns", COLUMN_CAP);
+		settings.set("read.summarize.enabled", false);
+		settings.set("readHashLines", false);
+		writeFileSync(file, source);
+		const tool = wrappedReadTool(settings, cwd);
+		const context = { settings } as AgentToolContext;
+		try {
+			const clipped = textOf(await tool.execute("read-clipped", { path: file }, undefined, undefined, context));
+			expect(clipped).not.toContain(CANARY.slice(0, 8));
+			expect(clipped).toContain("…");
+
+			const raw = textOf(await tool.execute("read-raw", { path: `${file}:raw` }, undefined, undefined, context));
+			expect(raw).toContain(CANARY);
+			expect(raw).toContain(FILLER.repeat(30));
+
+			settings.set("readHashLines", true);
+			const hashline = textOf(await tool.execute("read-hashline", { path: file }, undefined, undefined, context));
+			expect(hashline).toContain(CANARY);
+			expect(hashline).toContain(FILLER.repeat(30));
+		} finally {
+			await settings.close();
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("wrapped ReadTool retracts a multiline secret prefix before a later line cut", async () => {
+		const multilineSecret = `line1\nmiddle\n${"2".repeat(900)}`;
+		const { settings, root } = await loadSettings(true, multilineSecret);
+		const cwd = join(root, "project");
+		const file = join(cwd, "multiline-secret.txt");
+		settings.set("tools.outputMaxColumns", COLUMN_CAP);
+		settings.set("read.summarize.enabled", false);
+		settings.set("readHashLines", false);
+		writeFileSync(file, `${FILLER.repeat(750)}line1\nmiddle\n${"2".repeat(900)}${FILLER.repeat(2000)}`);
+		const tool = wrappedReadTool(settings, cwd);
+		try {
+			const output = textOf(
+				await tool.execute("read-multiline-secret", { path: file }, undefined, undefined, {
+					settings,
+				} as AgentToolContext),
+			);
+			expect(output).not.toContain("line1");
+			expect(output).not.toContain("2".repeat(8));
+			expect(output).toContain("…");
 		} finally {
 			await settings.close();
 			rmSync(root, { recursive: true, force: true });

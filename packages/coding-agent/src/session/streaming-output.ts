@@ -37,7 +37,7 @@ export function runWithOutputRedaction<T>(plainSecrets: readonly string[], fn: (
 }
 
 /** Get the active plain secrets from AsyncLocalStorage, if any are set. */
-export function activePlainSecrets(): readonly string[] | undefined {
+function activePlainSecrets(): readonly string[] | undefined {
 	const secrets = outputPlainSecrets.getStore();
 	return secrets && secrets.length > 0 ? secrets : undefined;
 }
@@ -384,41 +384,69 @@ export function truncateLine(
 }
 
 /**
- * Truncate a single line to max characters with secret-aware redaction.
- * Pulls the cut back to avoid leaving partial plain secrets in plaintext.
- * Used by tools (e.g., read) that apply per-line column caps.
- * If secrets are not provided, checks for active secrets in AsyncLocalStorage.
+ * Truncate each line to max characters without leaving a configured plain-secret
+ * prefix in the retained text. Prior uncapped lines remain in scope because a
+ * later line's cut can split a multiline secret.
  */
-export function truncateLineWithSecretAwareness(
-	line: string,
+export function truncateTextWithSecretAwareness(
+	text: string,
 	maxChars: number = DEFAULT_MAX_COLUMN,
 	secrets?: readonly string[],
 ): { text: string; wasTruncated: boolean } {
-	if (line.length <= maxChars) return { text: line, wasTruncated: false };
-
-	// Use provided secrets, or try to get active secrets from AsyncLocalStorage
+	const lines = text.split(NL);
 	const activeSecrets = secrets ?? activePlainSecrets();
-
-	// If no secrets, fall back to simple truncation
-	if (!activeSecrets || activeSecrets.length === 0) {
-		return { text: `${line.slice(0, maxChars)}…`, wasTruncated: true };
+	if (!activeSecrets?.some(secret => secret.length > 0)) {
+		let wasTruncated = false;
+		const truncated = lines.map(line => {
+			const result = truncateLine(line, maxChars);
+			wasTruncated ||= result.wasTruncated;
+			return result.text;
+		});
+		return { text: truncated.join(NL), wasTruncated };
 	}
 
-	// Apply secret-aware cutting
-	let end = maxChars;
-	while (end > 0) {
-		const next = Math.min(
-			columnHeadEndOutsideSecrets(line, end, activeSecrets),
-			columnHeadEndBeforeOpenPrefix(line, end, activeSecrets),
-		);
-		if (next >= end) break;
-		end = next;
-	}
+	const contextChars = activeSecrets.reduce((max, secret) => Math.max(max, secret.length), 0);
+	let context = "";
+	const outputParts: string[] = [];
+	let wasTruncated = false;
+	for (let index = 0; index < lines.length; index++) {
+		const line = lines[index] ?? "";
+		const newline = index < lines.length - 1 ? NL : "";
+		if (line.length <= maxChars) {
+			outputParts.push(line, newline);
+			context = (context + line + newline).slice(-contextChars);
+			continue;
+		}
 
-	if (end < maxChars) {
-		return { text: `${line.slice(0, end)}…`, wasTruncated: true };
+		wasTruncated = true;
+		const combined = context + line;
+		let end = context.length + maxChars;
+		while (end > 0) {
+			const next = Math.min(
+				columnHeadEndOutsideSecrets(combined, end, activeSecrets),
+				columnHeadEndBeforeOpenPrefix(combined, end, activeSecrets),
+			);
+			if (next >= end) break;
+			end = next;
+		}
+
+		if (end < context.length) {
+			const retract = context.slice(end);
+			let output = outputParts.join("");
+			if (output.endsWith(retract)) {
+				output = output.slice(0, output.length - retract.length);
+				output += NL.repeat(countNewlines(retract));
+			} else {
+				output = NL.repeat(countNewlines(output));
+			}
+			outputParts.length = 0;
+			outputParts.push(output);
+		}
+		const keptChars = Math.max(0, end - context.length);
+		outputParts.push(line.slice(0, keptChars), ELLIPSIS, newline);
+		context = "";
 	}
-	return { text: `${line.slice(0, maxChars)}…`, wasTruncated: true };
+	return { text: outputParts.join(""), wasTruncated };
 }
 
 // =============================================================================
@@ -1061,10 +1089,11 @@ export class OutputSink {
 	#columnTruncatedLines = 0;
 	/** Plain secrets captured when this sink is built inside an active redaction scope. */
 	readonly #plainSecrets?: readonly string[];
+	readonly #plainSecretContextChars: number;
 	/** Text already retained for the open line. A later chunk may shorten it. */
 	#columnLine = "";
-	/** Previous line with newline, preserved for multiline secret detection. */
-	#columnLinePrior = "";
+	/** Bounded suffix of prior uncapped output, preserved for multiline secrets. */
+	#columnLineContext = "";
 	#file?: {
 		path: string;
 		artifactId?: string;
@@ -1124,6 +1153,7 @@ export class OutputSink {
 		this.#artifactPublisher = artifactPublisher;
 		this.#coalesceSanitize = coalesceSanitize;
 		this.#plainSecrets = activePlainSecrets();
+		this.#plainSecretContextChars = this.#plainSecrets?.reduce((max, secret) => Math.max(max, secret.length), 0) ?? 0;
 	}
 
 	#headText(): string {
@@ -1218,11 +1248,22 @@ export class OutputSink {
 
 		if (rawBytes === 0) return;
 
-		const visibleChunk = this.#maxColumns > 0 ? this.#applyColumnCap(sanitizedChunk) : sanitizedChunk;
 		if (this.#artifactPath && this.#maxColumns > 0) this.#enqueueFileWrite(rawChunk, rawBytes);
 		else if (this.#artifactPublisher && this.#maxColumns > 0) this.#enqueueTerminalArtifactChunk(rawChunk, rawBytes);
+
+		if (this.#maxColumns > 0) {
+			let cursor = 0;
+			while (cursor < sanitizedChunk.length) {
+				const newline = sanitizedChunk.indexOf(NL, cursor);
+				const end = newline === -1 ? sanitizedChunk.length : newline + 1;
+				const visibleLine = this.#applyColumnCap(sanitizedChunk.slice(cursor, end));
+				this.#retainVisible(visibleLine);
+				cursor = end;
+			}
+		} else {
+			this.#retainVisible(sanitizedChunk);
+		}
 		if (this.#columnDroppedBytes > 0) this.#createFileSink();
-		this.#retainVisible(visibleChunk);
 	}
 
 	#retainVisible(visibleChunk: string): void {
@@ -1298,34 +1339,31 @@ export class OutputSink {
 						let lineBytesReset = false;
 						if (secrets && segment.startsWith(keptText)) {
 							const prior = this.#columnLine;
-							const text = prior + segment;
-							const cut = prior.length + keptText.length;
-							// Include previous line(s) for multiline secret detection
-							const textWithMultiline = this.#columnLinePrior + text;
-							const multilineOffset = this.#columnLinePrior.length;
-							const cutWithMultiline = multilineOffset + cut;
-							let end = cutWithMultiline;
-							// Check with multiline context
-							while (end > multilineOffset) {
+							const prefix = this.#columnLineContext + prior;
+							const text = prefix + segment;
+							const cut = prefix.length + keptText.length;
+							let end = cut;
+							while (end > 0) {
 								const next = Math.min(
-									columnHeadEndOutsideSecrets(textWithMultiline, end, secrets),
-									columnHeadEndBeforeOpenPrefix(textWithMultiline, end, secrets),
+									columnHeadEndOutsideSecrets(text, end, secrets),
+									columnHeadEndBeforeOpenPrefix(text, end, secrets),
 								);
 								if (next >= end) break;
 								end = next;
 							}
-							// Map the result back from multiline context to current line context
-							const endInCurrentLine = Math.max(0, end - multilineOffset);
-							if (endInCurrentLine < cut) {
-								if (endInCurrentLine < prior.length) {
-									this.#retractColumnSuffix(prior.slice(endInCurrentLine));
-									this.#columnLine = prior.slice(0, endInCurrentLine);
-									// If the cut is before the current line, clear prior too
-									if (endInCurrentLine === 0) this.#columnLinePrior = "";
+							if (end < cut) {
+								if (end < prefix.length) {
+									this.#retractColumnSuffix(prefix.slice(end));
+									if (end < this.#columnLineContext.length) {
+										this.#columnLineContext = this.#columnLineContext.slice(0, end);
+										this.#columnLine = "";
+									} else {
+										this.#columnLine = prior.slice(0, end - this.#columnLineContext.length);
+									}
 									keptText = "";
 									keptBytes = 0;
 								} else {
-									keptText = segment.slice(0, endInCurrentLine - prior.length);
+									keptText = segment.slice(0, end - prefix.length);
 									keptBytes = Buffer.byteLength(keptText, "utf-8");
 									this.#columnLine = prior + keptText;
 								}
@@ -1347,8 +1385,12 @@ export class OutputSink {
 			}
 			if (nlIdx === -1) break;
 			parts.push(NL);
-			// Preserve the current line with newline for multiline secret detection
-			this.#columnLinePrior = this.#columnLine + NL;
+			if (this.#plainSecretContextChars > 0 && !this.#columnEllipsisAdded) {
+				const context = this.#columnLineContext + this.#columnLine + NL;
+				this.#columnLineContext = context.slice(-this.#plainSecretContextChars);
+			} else {
+				this.#columnLineContext = "";
+			}
 			this.#currentLineBytes = 0;
 			this.#columnEllipsisAdded = false;
 			this.#columnLine = "";
@@ -1357,7 +1399,7 @@ export class OutputSink {
 		return parts.join("");
 	}
 
-	/** Drop a suffix of the open line that was already retained, without reordering. */
+	/** Remove a suffix of previously retained output after a secret-aware cut-back. */
 	#retractColumnSuffix(suffix: string): void {
 		if (suffix.length === 0) return;
 		const bytes = Buffer.byteLength(suffix, "utf-8");
@@ -1375,6 +1417,7 @@ export class OutputSink {
 			return;
 		}
 		this.#processedBytes = Math.max(0, this.#processedBytes - bytes);
+		this.#processedLines = Math.max(0, this.#processedLines - countNewlines(suffix));
 		this.#columnDroppedBytes += bytes;
 	}
 
