@@ -11,29 +11,46 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 const INPUT_VERBS = new Set(["send-keys", "paste-buffer", "send-prefix"]);
-const SHELL_RUNNERS = new Set(["sh", "bash", "dash", "zsh", "ksh", "busybox"]);
-const SHELL_STDIN_SCRIPT_PATHS = new Set(["/dev/stdin", "/dev/fd/0", "/proc/self/fd/0", "/proc/$$/fd/0"]);
+const SHELL_RUNNERS = new Set(["sh", "bash", "dash", "zsh", "ksh", "ash", "hush", "busybox"]);
+const SHELL_STDIN_SCRIPT_PATHS = new Set([
+	"/dev/stdin",
+	"/dev/fd/0",
+	"/proc/self/fd/0",
+	"/proc/thread-self/fd/0",
+	"/proc/$$/fd/0",
+]);
 const COMMAND_WRAPPERS = new Set(["eval", "exec", "command", "builtin", "nohup", "time"]);
-const BUILTIN_COMMAND_WRAPPERS = new Set(["command", "eval", "exec"]);
+const BUILTIN_COMMAND_WRAPPERS = new Set([".", "command", "eval", "exec", "source"]);
+const NON_EXECUTING_COREUTILS_WRAPPERS = new Set([
+	"env",
+	"nice",
+	"nohup",
+	"setsid",
+	"stdbuf",
+	"time",
+	"timeout",
+	"xargs",
+]);
+const NON_EXECUTING_COREUTILS_OPTIONS = new Set(["--help", "--version"]);
 const NON_EXECUTING_SUDO_OPTIONS = new Set([
 	"-e",
 	"--edit",
+	"-K",
 	"-l",
 	"--list",
+	"--remove-timestamp",
 	"-v",
 	"--validate",
 	"-V",
 	"--version",
 	"--help",
 ]);
-const NON_EXECUTING_ENV_OPTIONS = new Set(["--help", "--version"]);
+const NON_EXECUTING_ENV_OPTIONS = new Set(["-0", "--null"]);
 const ENV_SIGNAL_OPTIONS = new Set(["--block-signal", "--default-signal", "--ignore-signal", "--list-signal-handling"]);
-const NON_EXECUTING_NICE_OPTIONS = new Set(["--help", "--version"]);
-const NON_EXECUTING_TIME_OPTIONS = new Set(["--help", "--version"]);
-const NON_EXECUTING_TIMEOUT_OPTIONS = new Set(["--help", "--version"]);
 const ASSIGNMENT_AWARE_WRAPPERS = new Set(["env", "sudo"]);
 const CONTROL_WORDS = new Set(["then", "do", "else", "fi", "done", "esac"]);
 const MAX_INDIRECTION_DEPTH = 4;
+const BASH_TIME_WRAPPER_SPEC: WrapperSpec = { optionsWithArg: new Set(), flagOnlyOptions: new Set(["-p"]) };
 
 // Wrapper commands and their options that take an argument.
 // These are used to properly skip over option arguments so the next word
@@ -52,7 +69,7 @@ const SHELL_LONG_OPTIONS_WITH_ARG = new Set([
 	"--rcfile", // bash --rcfile FILE
 	"--init-file", // bash --init-file FILE (same as --rcfile)
 ]);
-const SHELL_POSITIVE_SHORT_OPTIONS = new Set("abefhkmnptuvxBCEHPT");
+const SHELL_POSITIVE_SHORT_OPTIONS = new Set("abefhiklmnprstuvxBCEHPT");
 
 // Options that take arguments for long-option forms (e.g., env --unset=VAR, xargs --file=FILE)
 const LONG_OPTIONS_WITH_ARG = new Set([
@@ -218,6 +235,9 @@ interface ShellScript {
 	segment: number;
 	path: string;
 	fileDescriptor?: number;
+	cwd?: string;
+	cwdUnknown?: boolean;
+	pathUnknown?: boolean;
 }
 
 interface TokenizeResult {
@@ -238,7 +258,18 @@ function isNegativeNumber(text: string): boolean {
 }
 
 function isPositiveShellOption(text: string): boolean {
-	return text.length === 2 && text[0] === "+" && SHELL_POSITIVE_SHORT_OPTIONS.has(text[1]);
+	return (
+		text.length > 1 && text[0] === "+" && [...text.slice(1)].every(option => SHELL_POSITIVE_SHORT_OPTIONS.has(option))
+	);
+}
+
+function shellOptionDisablesExecution(option: string): boolean {
+	if (!option.startsWith("-") || option.startsWith("--") || /[\s;&|()<>$`]/.test(option)) return false;
+	for (const flag of option.slice(1)) {
+		if (flag === "n" || flag === "D") return true;
+		if (flag === "O" || flag === "o") return false;
+	}
+	return false;
 }
 
 function isLongOption(text: string): boolean {
@@ -250,12 +281,21 @@ function commandName(text: string): string {
 	return separator < 0 ? text : text.slice(separator + 1);
 }
 
+function matchingWrapperLongOption(wrapperName: string, option: string): string | undefined {
+	const options = WRAPPER_LONG_OPTIONS[wrapperName];
+	if (!options) return undefined;
+	if (Object.hasOwn(options, option)) return option;
+	const matches = Object.keys(options).filter(candidate => candidate.startsWith(option));
+	return matches.length === 1 ? matches[0] : undefined;
+}
+
 function wrapperOptionTakesNextArgument(wrapper: { name: string; spec: WrapperSpec }, option: string): boolean {
 	if (isLongOption(option)) {
 		const baseOption = option.split("=")[0];
 		if (option.includes("=")) return false;
 		const wrapperOptions = WRAPPER_LONG_OPTIONS[wrapper.name];
-		if (wrapperOptions && baseOption in wrapperOptions) return wrapperOptions[baseOption];
+		const matchingOption = matchingWrapperLongOption(wrapper.name, baseOption);
+		if (matchingOption !== undefined && wrapperOptions) return wrapperOptions[matchingOption];
 		return LONG_OPTIONS_WITH_ARG.has(baseOption);
 	}
 
@@ -313,13 +353,18 @@ function tokenize(command: string): TokenizeResult {
 				const previousHereDocument = activeHereDocuments.get(descriptorKey);
 				previousHereDocument?.activeDescriptors.delete(descriptor);
 				activeHereDocuments.delete(descriptorKey);
-				const duplicatedDescriptor = redirectionTargetIsDuplication ? /^(\d+)$/.exec(text) : undefined;
-				if (redirectionTargetIsInput && duplicatedDescriptor) {
+				const duplicatedDescriptor = redirectionTargetIsDuplication ? /^(\d+)(-)?$/.exec(text) : undefined;
+				if (duplicatedDescriptor) {
 					const sourceDescriptor = Number(duplicatedDescriptor[1]);
-					const sourceHereDocument = activeHereDocuments.get(`${segment}:${sourceDescriptor}`);
+					const sourceKey = `${segment}:${sourceDescriptor}`;
+					const sourceHereDocument = activeHereDocuments.get(sourceKey);
 					if (sourceHereDocument) {
 						sourceHereDocument.activeDescriptors.add(descriptor);
 						activeHereDocuments.set(descriptorKey, sourceHereDocument);
+						if (duplicatedDescriptor[2]) {
+							sourceHereDocument.activeDescriptors.delete(sourceDescriptor);
+							activeHereDocuments.delete(sourceKey);
+						}
 					}
 				}
 			}
@@ -429,14 +474,15 @@ function tokenize(command: string): TokenizeResult {
 				// If in a wrapper, keep wrapper active and don't change atCommandStart
 			} else if (newWrapper) {
 				// Track this wrapper for its arguments (use baseName for consistent lookup)
+				const wrapperSpec = baseName === "time" && !text.includes("/") ? BASH_TIME_WRAPPER_SPEC : newWrapper;
 				wrapperCommand = {
 					name: baseName,
-					spec: newWrapper,
+					spec: wrapperSpec,
 					optionsTerminated: false,
 					assignmentAware: ASSIGNMENT_AWARE_WRAPPERS.has(baseName) || (baseName === "time" && !text.includes("/")),
 				};
 				skipNextArg = false;
-				positionalsPending = newWrapper.hasPositionalArg ? 1 : 0;
+				positionalsPending = wrapperSpec.hasPositionalArg ? 1 : 0;
 				atCommandStart = false; // Now in wrapper argument mode
 			} else if (isBuiltinWrapper) {
 				// Built-in wrappers
@@ -470,29 +516,57 @@ function tokenize(command: string): TokenizeResult {
 			} else if (wrapperCommand?.optionsTerminated) {
 				if (positionalsPending > 0) {
 					positionalsPending--;
+				} else if (wrapperCommand.name === "env" && isAssignment(text)) {
+					// env still accepts NAME=VALUE assignments after its -- terminator.
+					commandStart = false;
 				} else {
-					wrapperCommand = undefined;
-					skipNextArg = false;
-					positionalsPending = 0;
-					commandStart = true;
-					isWrappedCommand = true;
+					const wrappedName = text.includes("/") ? text.split("/").pop() || text : text;
+					const nestedWrapper = COMMAND_WRAPPERS_WITH_ARGS[wrappedName];
+					if (wrapperCommand.name === "builtin" && !BUILTIN_COMMAND_WRAPPERS.has(wrappedName)) {
+						wrapperCommand = undefined;
+						skipNextArg = false;
+						positionalsPending = 0;
+					} else if (nestedWrapper) {
+						wrapperCommand = {
+							name: wrappedName,
+							spec: nestedWrapper,
+							optionsTerminated: false,
+							assignmentAware: ASSIGNMENT_AWARE_WRAPPERS.has(wrappedName),
+						};
+						skipNextArg = false;
+						positionalsPending = nestedWrapper.hasPositionalArg ? 1 : 0;
+						commandStart = true;
+					} else if (COMMAND_WRAPPERS.has(wrappedName)) {
+						wrapperCommand = {
+							name: wrappedName,
+							spec: { optionsWithArg: new Set() },
+							optionsTerminated: false,
+							assignmentAware: false,
+						};
+						skipNextArg = false;
+						positionalsPending = 0;
+						commandStart = true;
+					} else {
+						wrapperCommand = undefined;
+						skipNextArg = false;
+						positionalsPending = 0;
+						commandStart = true;
+						isWrappedCommand = true;
+					}
 				}
-			} else if (text.startsWith("-") && !isNegativeNumber(text)) {
+			} else if (
+				text.startsWith("-") &&
+				(!isNegativeNumber(text) || (wrapperCommand?.name === "env" && text === "-0"))
+			) {
 				// This is an option (but not a negative number like -5)
 				// Don't touch skipNextArg yet; it will be consumed by the next argument
 				const nonExecutingSudoMode = wrapperCommand?.name === "sudo" && NON_EXECUTING_SUDO_OPTIONS.has(text);
 				const nonExecutingEnvMode = wrapperCommand?.name === "env" && NON_EXECUTING_ENV_OPTIONS.has(text);
-				const nonExecutingNiceMode = wrapperCommand?.name === "nice" && NON_EXECUTING_NICE_OPTIONS.has(text);
-				const nonExecutingTimeMode = wrapperCommand?.name === "time" && NON_EXECUTING_TIME_OPTIONS.has(text);
-				const nonExecutingTimeoutMode =
-					wrapperCommand?.name === "timeout" && NON_EXECUTING_TIMEOUT_OPTIONS.has(text);
-				if (
-					nonExecutingSudoMode ||
-					nonExecutingEnvMode ||
-					nonExecutingNiceMode ||
-					nonExecutingTimeMode ||
-					nonExecutingTimeoutMode
-				) {
+				const nonExecutingCoreutilsMode =
+					wrapperCommand !== undefined &&
+					NON_EXECUTING_COREUTILS_WRAPPERS.has(wrapperCommand.name) &&
+					NON_EXECUTING_COREUTILS_OPTIONS.has(text);
+				if (nonExecutingSudoMode || nonExecutingEnvMode || nonExecutingCoreutilsMode) {
 					// These utility modes never execute the supplied command.
 					wrapperCommand = undefined;
 					skipNextArg = false;
@@ -797,7 +871,10 @@ function parseInvocation(tokens: Token[]): Invocation | undefined {
 				socket = { flag: socketFlag, value };
 				socketArgs.push(socketFlag, value);
 			}
-			if (flag === "c") shellCommands.push(value);
+			if (flag === "c") {
+				shellCommands.length = 0;
+				shellCommands.push(value);
+			}
 			break;
 		}
 		index += separateOperand ? 2 : 1;
@@ -836,15 +913,25 @@ function reconstructCommandFromEnvSplit(splitString: string, depth = 0): string[
 
 	for (let i = 0; i < splitString.length; i++) {
 		const ch = splitString[i];
-		if (ch === "\\" && splitString[i + 1] === "_") {
-			i++;
-			if (quoted) {
-				current += " ";
+		if (ch === "\\" && splitString[i + 1] !== undefined) {
+			const next = splitString[i + 1];
+			if (next === "_") {
+				i++;
+				if (quoted) {
+					current += " ";
+					argumentStarted = true;
+				} else {
+					if (argumentStarted) parts.push(current);
+					current = "";
+					argumentStarted = false;
+				}
+			} else if (next === quoteChar || next === "'" || next === '"' || next === "\\") {
+				current += next;
 				argumentStarted = true;
+				i++;
 			} else {
-				if (argumentStarted) parts.push(current);
-				current = "";
-				argumentStarted = false;
+				current += ch;
+				argumentStarted = true;
 			}
 		} else if (!quoted && (ch === "'" || ch === '"')) {
 			quoted = true;
@@ -865,6 +952,7 @@ function reconstructCommandFromEnvSplit(splitString: string, depth = 0): string[
 
 	const assignments: string[] = [];
 	const envShortOptionsWithArg = new Set(["-u", "-C", "-a"]);
+	const envShortFlagOptions = new Set(["-i", "-v", "-0"]);
 	let skipNext = false;
 	let optionsTerminated = false;
 	let commandStartIdx = -1;
@@ -900,6 +988,26 @@ function reconstructCommandFromEnvSplit(splitString: string, depth = 0): string[
 			splitString = part.slice("--split-string=".length);
 			splitOptionLength = 1;
 		}
+		let shortBundleHandled = false;
+		if (part.startsWith("-") && !part.startsWith("--") && part.length > 2) {
+			shortBundleHandled = true;
+			for (let optionIndex = 1; optionIndex < part.length; optionIndex++) {
+				const option = `-${part[optionIndex]}`;
+				if (option === "-S") {
+					splitString = part.slice(optionIndex + 1) || parts[i + 1];
+					splitOptionLength = part.length - optionIndex > 1 ? 1 : 2;
+					break;
+				}
+				if (envShortOptionsWithArg.has(option)) {
+					if (optionIndex === part.length - 1) skipNext = true;
+					break;
+				}
+				if (!envShortFlagOptions.has(option)) {
+					shortBundleHandled = false;
+					break;
+				}
+			}
+		}
 		if (splitOptionLength > 0) {
 			if (splitString === undefined) return undefined;
 			const nested = reconstructCommandFromEnvSplit(splitString, depth + 1);
@@ -911,6 +1019,7 @@ function reconstructCommandFromEnvSplit(splitString: string, depth = 0): string[
 			optionsTerminated = false;
 			continue;
 		}
+		if (shortBundleHandled) continue;
 
 		if (
 			part === "-" ||
@@ -963,11 +1072,29 @@ function quoteShellArgument(argument: string): string {
 interface ShellPayload {
 	content: string;
 	segment: number;
+	cwd?: string;
+	cwdUnknown?: boolean;
 }
 
-function collectShellPayloadsWithContext(tokens: Token[]): ShellPayload[] {
+function collectShellPayloadsWithContext(tokens: Token[], cwd?: string, cwdUnknown = false): ShellPayload[] {
 	const payloads: ShellPayload[] = [];
-	const addPayload = (content: string, segment: number) => payloads.push({ content, segment });
+	const addPayload = (content: string, segment: number, sourceIndex: number, sourceIsEnv = false) => {
+		if (cwd === undefined) {
+			payloads.push({ content, segment });
+			return;
+		}
+		const commandCwd = commandWorkingDirectory(tokens, sourceIndex, cwd);
+		const payloadCwd =
+			sourceIsEnv && commandCwd !== undefined
+				? envWrapperWorkingDirectory(tokens, sourceIndex, commandCwd)
+				: commandCwd;
+		payloads.push({
+			content,
+			segment,
+			cwd: payloadCwd ?? cwd,
+			cwdUnknown: cwdUnknown || payloadCwd === undefined,
+		});
+	};
 	// Options that take an argument for bash/sh/similar shells
 	const optionsWithArg = new Set(["-O", "-o", "+O", "+o"]);
 
@@ -975,6 +1102,14 @@ function collectShellPayloadsWithContext(tokens: Token[]): ShellPayload[] {
 		const token = tokens[index];
 		if (!token.commandStart) continue;
 		if (isCommandLookup(tokens, index)) continue;
+		if (commandName(token.text) === "eval") {
+			const arguments_: string[] = [];
+			for (let cursor = index + 1; cursor < tokens.length && tokens[cursor].segment === token.segment; cursor++) {
+				if (!tokens[cursor].isRedirectionTarget) arguments_.push(tokens[cursor].text);
+			}
+			if (arguments_.length > 0) addPayload(arguments_.join(" "), token.segment, index);
+			continue;
+		}
 
 		// Check if this is a shell runner or busybox
 		let shellIndex = index;
@@ -1008,6 +1143,7 @@ function collectShellPayloadsWithContext(tokens: Token[]): ShellPayload[] {
 		// so after we see a non-option word (script name), any flags are arguments to that script.
 
 		let skipNextArg = false;
+		let noExecMode = false;
 
 		for (let cursor = shellIndex + 1; cursor < tokens.length && !tokens[cursor].commandStart; cursor++) {
 			const word = tokens[cursor].text;
@@ -1024,6 +1160,7 @@ function collectShellPayloadsWithContext(tokens: Token[]): ShellPayload[] {
 			}
 			if (word.startsWith("+O") || word.startsWith("+o")) continue;
 			if (isPositiveShellOption(word)) continue;
+			if (shellOptionDisablesExecution(word)) noExecMode = true;
 
 			// Once we see a non-option word (not starting with -), that's the script name.
 			// Any further flags are arguments to that script, not shell options.
@@ -1033,6 +1170,7 @@ function collectShellPayloadsWithContext(tokens: Token[]): ShellPayload[] {
 
 			// Check if this is a long option
 			if (word.startsWith("--")) {
+				if (word === "--help" || word === "--version") break;
 				// Handle long options with = (e.g., --rcfile=FILE)
 				if (word.includes("=")) {
 					skipNextArg = false;
@@ -1051,6 +1189,18 @@ function collectShellPayloadsWithContext(tokens: Token[]): ShellPayload[] {
 			if (optionsWithArg.has(word)) {
 				skipNextArg = true;
 				continue;
+			}
+
+			// In a mixed short-option bundle, -O and -o consume the remainder or the
+			// following argv element; do not mistake that operand for a script path.
+			if (word.startsWith("-") && !word.startsWith("-O") && !word.startsWith("-o")) {
+				const flags = word.slice(1);
+				const operandOptionIndex = [...flags].findIndex(option => option === "O" || option === "o");
+				const commandOptionIndex = flags.indexOf("c");
+				if (operandOptionIndex >= 0 && (commandOptionIndex < 0 || operandOptionIndex < commandOptionIndex)) {
+					if (operandOptionIndex === flags.length - 1) skipNextArg = true;
+					continue;
+				}
 			}
 
 			// Handle options with bundled operands (e.g., -Oextglob, -opipefail)
@@ -1078,7 +1228,7 @@ function collectShellPayloadsWithContext(tokens: Token[]): ShellPayload[] {
 							) {
 								const commandWord = tokens[commandCursor].text;
 								if (!commandWord.startsWith("-") || tokens[commandCursor].quoted) {
-									addPayload(commandWord, token.segment);
+									addPayload(commandWord, token.segment, index);
 									break;
 								}
 							}
@@ -1100,6 +1250,7 @@ function collectShellPayloadsWithContext(tokens: Token[]): ShellPayload[] {
 					option => option === "O" || option === "o",
 				).length;
 				let optionsTerminated = false;
+				let payloadNoExec = noExecMode;
 				for (
 					let payloadCursor = cursor + 1 + followingOperandCount;
 					payloadCursor < tokens.length && !tokens[payloadCursor].commandStart;
@@ -1123,6 +1274,7 @@ function collectShellPayloadsWithContext(tokens: Token[]): ShellPayload[] {
 						continue;
 					}
 					if (!optionsTerminated && isPositiveShellOption(payloadWord)) continue;
+					if (!optionsTerminated && shellOptionDisablesExecution(payloadWord)) payloadNoExec = true;
 
 					// Skip over any remaining shell options or their arguments. Quotes
 					// don't change how Bash interprets an argv value beginning with '-'.
@@ -1132,7 +1284,7 @@ function collectShellPayloadsWithContext(tokens: Token[]): ShellPayload[] {
 						// version. Inspect it conservatively instead of assuming it is an
 						// invocation option.
 						if (payloadToken.quoted && /[\s;&|()<>$`]/.test(payloadWord)) {
-							addPayload(payloadWord, token.segment);
+							if (!payloadNoExec) addPayload(payloadWord, token.segment, index);
 							break;
 						}
 						// Check if this option takes an argument
@@ -1151,7 +1303,7 @@ function collectShellPayloadsWithContext(tokens: Token[]): ShellPayload[] {
 
 					// Found the first non-option word after -c; this is the actual command string
 					// Add it regardless of quoted status, because bash will execute it as the command
-					addPayload(payloadWord, token.segment);
+					if (!payloadNoExec) addPayload(payloadWord, token.segment, index);
 					break; // Only take the first payload for this -c
 				}
 				break; // -c stops option parsing
@@ -1200,7 +1352,7 @@ function collectShellPayloadsWithContext(tokens: Token[]): ShellPayload[] {
 					// Extract and push the actual command that env will execute
 					const command = reconstructCommandFromEnvSplit(splitString);
 					if (command) {
-						addPayload(command.map(quoteShellArgument).join(" "), token.segment);
+						addPayload(command.map(quoteShellArgument).join(" "), token.segment, index, true);
 					}
 					cursor++; // Skip the payload we just processed
 				}
@@ -1209,7 +1361,7 @@ function collectShellPayloadsWithContext(tokens: Token[]): ShellPayload[] {
 			else if (arg.startsWith("-S") && arg.length > 2) {
 				const command = reconstructCommandFromEnvSplit(arg.slice(2));
 				if (command) {
-					addPayload(command.map(quoteShellArgument).join(" "), token.segment);
+					addPayload(command.map(quoteShellArgument).join(" "), token.segment, index, true);
 				}
 			}
 			// Check for --split-string option (with or without =)
@@ -1222,7 +1374,7 @@ function collectShellPayloadsWithContext(tokens: Token[]): ShellPayload[] {
 					if (value) {
 						const command = reconstructCommandFromEnvSplit(value);
 						if (command) {
-							addPayload(command.map(quoteShellArgument).join(" "), token.segment);
+							addPayload(command.map(quoteShellArgument).join(" "), token.segment, index, true);
 						}
 					}
 				} else if (arg === "--split-string") {
@@ -1231,7 +1383,7 @@ function collectShellPayloadsWithContext(tokens: Token[]): ShellPayload[] {
 						const splitString = tokens[cursor + 1].text;
 						const command = reconstructCommandFromEnvSplit(splitString);
 						if (command) {
-							addPayload(command.map(quoteShellArgument).join(" "), token.segment);
+							addPayload(command.map(quoteShellArgument).join(" "), token.segment, index, true);
 						}
 						cursor++; // Skip the payload we just processed
 					}
@@ -1243,13 +1395,21 @@ function collectShellPayloadsWithContext(tokens: Token[]): ShellPayload[] {
 			}
 			// Check for long options with = format (--option=value)
 			else if (arg.startsWith("--") && arg.includes("=")) {
-				// Long options with = format don't consume the next argument
+				const optionName = matchingWrapperLongOption("env", arg.slice(0, arg.indexOf("=")));
+				if (optionName === "--split-string") {
+					const splitString = arg.slice(arg.indexOf("=") + 1);
+					const command = reconstructCommandFromEnvSplit(splitString);
+					if (command) addPayload(command.map(quoteShellArgument).join(" "), token.segment, index, true);
+				}
 			}
 			// Check for long options without = that might take arguments
 			else if (arg.startsWith("--")) {
-				// Check if this long option takes an argument
-				const wrapperLongOpts = WRAPPER_LONG_OPTIONS.env;
-				if (wrapperLongOpts && arg in wrapperLongOpts && wrapperLongOpts[arg]) {
+				const optionName = matchingWrapperLongOption("env", arg);
+				if (optionName === "--split-string" && cursor + 1 < tokens.length && !tokens[cursor + 1].commandStart) {
+					const command = reconstructCommandFromEnvSplit(tokens[cursor + 1].text);
+					if (command) addPayload(command.map(quoteShellArgument).join(" "), token.segment, index, true);
+					cursor++;
+				} else if (optionName !== undefined && WRAPPER_LONG_OPTIONS.env[optionName]) {
 					skipNextArg = true;
 				}
 			} else if (arg.startsWith("-") && arg.length > 2) {
@@ -1264,7 +1424,7 @@ function collectShellPayloadsWithContext(tokens: Token[]): ShellPayload[] {
 						if (splitString !== undefined) {
 							const command = reconstructCommandFromEnvSplit(splitString);
 							if (command) {
-								addPayload(command.map(quoteShellArgument).join(" "), token.segment);
+								addPayload(command.map(quoteShellArgument).join(" "), token.segment, index, true);
 							}
 							if (attachedSplitString.length === 0 && optionIndex === arg.length - 1) cursor++;
 						}
@@ -1294,6 +1454,7 @@ function shellReadsStdin(
 	const optionsWithArgument = new Set(["-O", "-o"]);
 	let skipNextArgument = false;
 	let optionsTerminated = false;
+	let readsStdin = false;
 
 	for (const token of arguments_) {
 		const argument = token.text;
@@ -1301,13 +1462,15 @@ function shellReadsStdin(
 			skipNextArgument = false;
 			continue;
 		}
-		if (optionsTerminated) return argument === "-" || SHELL_STDIN_SCRIPT_PATHS.has(argument);
+		if (optionsTerminated) return readsStdin || argument === "-" || SHELL_STDIN_SCRIPT_PATHS.has(argument);
+		if (shellOptionDisablesExecution(argument)) return false;
 		if (argument === "--") {
 			optionsTerminated = true;
 			continue;
 		}
 		if (argument === "-" || argument === "-s" || SHELL_STDIN_SCRIPT_PATHS.has(argument)) {
-			return true;
+			readsStdin = true;
+			continue;
 		}
 		if (
 			argument === "-c" ||
@@ -1331,7 +1494,7 @@ function shellReadsStdin(
 			if (optionsWithArgument.has(argument)) skipNextArgument = true;
 			continue;
 		}
-		return false;
+		return readsStdin;
 	}
 	return true;
 }
@@ -1475,6 +1638,24 @@ function commandSubstitutionEnd(source: string, start: number): number | undefin
 	let singleQuoted = false;
 	let doubleQuoted = false;
 	let backtickQuoted = false;
+	let caseDepth = 0;
+	let expectingCaseIn = false;
+	let inCasePattern = false;
+	let shellWord = "";
+	const flushShellWord = () => {
+		if (shellWord === "case") {
+			caseDepth++;
+			expectingCaseIn = true;
+		} else if (shellWord === "in" && expectingCaseIn) {
+			expectingCaseIn = false;
+			inCasePattern = true;
+		} else if (shellWord === "esac" && caseDepth > 0) {
+			caseDepth--;
+			inCasePattern = false;
+			expectingCaseIn = false;
+		}
+		shellWord = "";
+	};
 
 	for (let index = start + 2; index < source.length; index++) {
 		const character = source[index];
@@ -1502,6 +1683,11 @@ function commandSubstitutionEnd(source: string, start: number): number | undefin
 			}
 			continue;
 		}
+		if (/[A-Za-z0-9_]/.test(character)) {
+			shellWord += character;
+			continue;
+		}
+		flushShellWord();
 		if (character === "#" && (index === 0 || /[\s;|&()]/.test(source[index - 1]))) {
 			while (index < source.length && source[index] !== "\n") index++;
 			continue;
@@ -1523,8 +1709,18 @@ function commandSubstitutionEnd(source: string, start: number): number | undefin
 			index++;
 			continue;
 		}
-		if (character === "(") depth++;
+		if (character === ";" && source[index + 1] === ";" && caseDepth > 0) {
+			inCasePattern = true;
+			index++;
+			if (source[index + 1] === ";") index++;
+			continue;
+		}
+		if (character === "(" && !inCasePattern) depth++;
 		if (character === ")") {
+			if (inCasePattern) {
+				inCasePattern = false;
+				continue;
+			}
 			depth--;
 			if (depth === 0) return index;
 		}
@@ -1596,7 +1792,7 @@ function collectHereDocumentCommandSubstitutions(body: string): string[] {
 			if (source[index] === "`") {
 				const end = backtickSubstitutionEnd(source, index);
 				if (end === undefined) continue;
-				const command = source.slice(index + 1, end);
+				const command = source.slice(index + 1, end).replaceAll("\\`", "`");
 				if (command.length > 0 && !substitutions.has(command)) {
 					substitutions.add(command);
 					pendingSources.push(command);
@@ -1695,7 +1891,7 @@ function scriptFileDescriptor(scriptPath: string): number | undefined {
 	return Number.isSafeInteger(descriptor) ? descriptor : undefined;
 }
 
-function collectShellScripts(tokens: Token[], cwd: string): ShellScript[] {
+function collectShellScripts(tokens: Token[], cwd: string, cwdUnknown = false): ShellScript[] {
 	const scripts: ShellScript[] = [];
 	const optionsWithArg = new Set(["-O", "-o", "+O", "+o"]);
 
@@ -1703,32 +1899,38 @@ function collectShellScripts(tokens: Token[], cwd: string): ShellScript[] {
 		const token = tokens[index];
 		if (!token.commandStart || isCommandLookup(tokens, index)) continue;
 		const name = commandName(token.text);
+		const commandCwd = commandWorkingDirectory(tokens, index, cwd);
+		const scriptCwd = commandCwd ?? cwd;
+		const scriptCwdUnknown = cwdUnknown || commandCwd === undefined;
 		if (token.text === "." || name === "source") {
 			for (let cursor = index + 1; cursor < tokens.length; cursor++) {
 				const argument = tokens[cursor];
 				if (argument.segment !== token.segment || argument.commandStart) break;
 				if (argument.isRedirectionTarget || argument.text === "--") continue;
 				const fileDescriptor = scriptFileDescriptor(argument.text);
-				if (fileDescriptor !== undefined) {
-					scripts.push({ segment: token.segment, path: argument.text, fileDescriptor });
-				}
+				scripts.push({
+					segment: token.segment,
+					path: fileDescriptor === undefined ? path.resolve(scriptCwd, argument.text) : argument.text,
+					...(fileDescriptor !== undefined && { fileDescriptor }),
+					cwd: scriptCwd,
+					cwdUnknown: scriptCwdUnknown,
+					pathUnknown: fileDescriptor === undefined && !path.isAbsolute(argument.text) && scriptCwdUnknown,
+				});
 				break;
 			}
 			continue;
 		}
-		if (
-			token.commandStart &&
-			(token.text.startsWith("./") || token.text.startsWith("/")) &&
-			!SHELL_RUNNERS.has(name) &&
-			name !== "busybox"
-		) {
+		if (token.commandStart && (token.text.startsWith("./") || token.text.startsWith("/"))) {
 			const fileDescriptor = scriptFileDescriptor(token.text);
 			scripts.push({
 				segment: token.segment,
-				path: path.resolve(cwd, token.text),
+				path: path.resolve(scriptCwd, token.text),
 				...(fileDescriptor !== undefined && { fileDescriptor }),
+				cwd: scriptCwd,
+				cwdUnknown: scriptCwdUnknown,
+				pathUnknown: fileDescriptor === undefined && !path.isAbsolute(token.text) && scriptCwdUnknown,
 			});
-			continue;
+			if (!SHELL_RUNNERS.has(name) && name !== "busybox") continue;
 		}
 		// Handle shell runners (bash, sh, etc.) and busybox applets
 		let shellIndex = index;
@@ -1762,11 +1964,16 @@ function collectShellScripts(tokens: Token[], cwd: string): ShellScript[] {
 				const fileDescriptor = scriptFileDescriptor(argument);
 				scripts.push({
 					segment: token.segment,
-					path: path.resolve(cwd, argument),
+					path: fileDescriptor === undefined ? path.resolve(scriptCwd, argument) : argument,
 					...(fileDescriptor !== undefined && { fileDescriptor }),
+					cwd: scriptCwd,
+					cwdUnknown: scriptCwdUnknown,
+					pathUnknown: fileDescriptor === undefined && !path.isAbsolute(argument) && scriptCwdUnknown,
 				});
 				break;
 			}
+			if (shellOptionDisablesExecution(argument)) break;
+			if (argument === "--help" || argument === "--version") break;
 			if (argument === "--") {
 				optionsTerminated = true;
 				continue;
@@ -1830,8 +2037,11 @@ function collectShellScripts(tokens: Token[], cwd: string): ShellScript[] {
 			const fileDescriptor = scriptFileDescriptor(argument);
 			scripts.push({
 				segment: token.segment,
-				path: path.resolve(cwd, argument),
+				path: fileDescriptor === undefined ? path.resolve(scriptCwd, argument) : argument,
 				...(fileDescriptor !== undefined && { fileDescriptor }),
+				cwd: scriptCwd,
+				cwdUnknown: scriptCwdUnknown,
+				pathUnknown: fileDescriptor === undefined && !path.isAbsolute(argument) && scriptCwdUnknown,
 			});
 			break;
 		}
@@ -2133,52 +2343,71 @@ function assignedTmuxEnvironmentValue(
 	return undefined;
 }
 
+function envWrapperWorkingDirectory(tokens: Token[], envIndex: number, cwd: string): string | undefined {
+	let effectiveCwd = cwd;
+	const envToken = tokens[envIndex];
+	if (!envToken) return undefined;
+	for (let cursor = envIndex + 1; cursor < tokens.length; cursor++) {
+		const argument = tokens[cursor];
+		if (argument.segment !== envToken.segment || argument.commandStart) break;
+		if (argument.isRedirectionTarget || argument.text === "--") {
+			if (argument.text === "--") break;
+			continue;
+		}
+
+		let chdir: string | undefined;
+		if (argument.text === "-C") {
+			const value = tokens[cursor + 1];
+			if (value && value.segment === envToken.segment && !value.commandStart) {
+				chdir = value.text;
+				cursor++;
+			}
+		} else if (argument.text.startsWith("-C") && argument.text.length > 2) {
+			chdir = argument.text.slice(2);
+		} else if (argument.text.startsWith("--")) {
+			const equalsIndex = argument.text.indexOf("=");
+			const optionName = matchingWrapperLongOption(
+				"env",
+				equalsIndex < 0 ? argument.text : argument.text.slice(0, equalsIndex),
+			);
+			if (optionName === "--chdir") {
+				if (equalsIndex >= 0) {
+					chdir = argument.text.slice(equalsIndex + 1);
+				} else {
+					const value = tokens[cursor + 1];
+					if (value && value.segment === envToken.segment && !value.commandStart) {
+						chdir = value.text;
+						cursor++;
+					}
+				}
+			}
+		} else if (!argument.text.startsWith("-") && !isAssignment(argument.text)) {
+			break;
+		}
+		if (
+			chdir === undefined &&
+			wrapperOptionTakesNextArgument({ name: "env", spec: COMMAND_WRAPPERS_WITH_ARGS.env }, argument.text)
+		) {
+			cursor++;
+		}
+		if (chdir !== undefined) {
+			if (hasShellPathExpansion(chdir)) return undefined;
+			effectiveCwd = path.resolve(effectiveCwd, chdir);
+		}
+	}
+	return effectiveCwd;
+}
+
 function commandWorkingDirectory(tokens: Token[], commandIndex: number, cwd: string): string | undefined {
 	let effectiveCwd = cwd;
-	const commandSegment = tokens[commandIndex].segment;
+	const commandSegment = tokens[commandIndex]?.segment;
+	if (commandSegment === undefined) return undefined;
 	for (let index = 0; index < commandIndex; index++) {
 		const token = tokens[index];
-		if (token.segment !== commandSegment) continue;
-		if (!token.commandStart || commandName(token.text) !== "env") continue;
-
-		let skipNextArgument = false;
-		for (let cursor = index + 1; cursor < commandIndex; cursor++) {
-			const argument = tokens[cursor];
-			if (argument.segment !== token.segment || argument.commandStart) break;
-			if (skipNextArgument) {
-				skipNextArgument = false;
-				continue;
-			}
-			if (argument.isRedirectionTarget || argument.text === "--") {
-				if (argument.text === "--") break;
-				continue;
-			}
-
-			let chdir: string | undefined;
-			if (argument.text === "-C" || argument.text === "--chdir") {
-				const value = tokens[cursor + 1];
-				if (value && value.segment === token.segment && !value.commandStart) {
-					chdir = value.text;
-					cursor++;
-				}
-			} else if (argument.text.startsWith("-C") && argument.text.length > 2) {
-				chdir = argument.text.slice(2);
-			} else if (argument.text.startsWith("--chdir=")) {
-				chdir = argument.text.slice("--chdir=".length);
-			} else if (!argument.text.startsWith("-") && !isAssignment(argument.text)) {
-				break;
-			}
-			if (
-				chdir === undefined &&
-				wrapperOptionTakesNextArgument({ name: "env", spec: COMMAND_WRAPPERS_WITH_ARGS.env }, argument.text)
-			) {
-				skipNextArgument = true;
-			}
-			if (chdir !== undefined) {
-				if (hasShellPathExpansion(chdir)) return undefined;
-				effectiveCwd = path.resolve(effectiveCwd, chdir);
-			}
-		}
+		if (token.segment !== commandSegment || !token.commandStart || commandName(token.text) !== "env") continue;
+		const envCwd = envWrapperWorkingDirectory(tokens, index, effectiveCwd);
+		if (envCwd === undefined) return undefined;
+		effectiveCwd = envCwd;
 	}
 	return effectiveCwd;
 }
@@ -2244,9 +2473,19 @@ export async function checkTmuxSelfInjection(
 	depth = 0,
 ): Promise<TmuxSelfInjectionResult> {
 	const env = options.env ?? process.env;
+	return checkTmuxSelfInjectionAtCwd(command, options, depth, options.cwd ?? env.PWD ?? ".", false);
+}
+
+async function checkTmuxSelfInjectionAtCwd(
+	command: string,
+	options: TmuxSelfInjectionOptions,
+	depth: number,
+	cwd: string,
+	cwdUnknown: boolean,
+): Promise<TmuxSelfInjectionResult> {
+	const env = options.env ?? process.env;
 	const identity = currentIdentity(env);
 	if (!identity) return { block: false };
-	const cwd = options.cwd ?? env.PWD ?? ".";
 	const uid = typeof process.getuid === "function" ? process.getuid() : 0;
 	const resolvePaneId = options.resolvePaneId ?? defaultResolvePaneId;
 	const { tokens, hereDocuments } = tokenize(command);
@@ -2258,9 +2497,17 @@ export async function checkTmuxSelfInjection(
 		if (isCommandLookup(tokens, index)) continue;
 		const invocation = parseInvocation(tokens.slice(index + 1));
 		if (!invocation || invocation.nonExecuting) continue;
+		const commandCwd = commandWorkingDirectory(tokens, index, cwd);
+		const commandCwdUnknown = cwdUnknown || commandCwd === undefined;
 		if (depth < MAX_INDIRECTION_DEPTH) {
 			for (const shellCommand of invocation.shellCommands) {
-				const result = await checkTmuxSelfInjection(shellCommand, options, depth + 1);
+				const result = await checkTmuxSelfInjectionAtCwd(
+					shellCommand,
+					options,
+					depth + 1,
+					commandCwd ?? cwd,
+					commandCwdUnknown,
+				);
 				if (result.block) return result;
 			}
 		}
@@ -2270,13 +2517,10 @@ export async function checkTmuxSelfInjection(
 		const assignedTmpdir = assignedTmuxEnvironmentValue(tokens, index, "TMUX_TMPDIR");
 		if (assignedTmpdir !== undefined) commandEnv.TMUX_TMPDIR = assignedTmpdir;
 		else if (envClearsVariable(tokens, index, "TMUX_TMPDIR")) delete commandEnv.TMUX_TMPDIR;
-		const commandCwd = commandWorkingDirectory(tokens, index, cwd);
 		const socketPathIsUnknown =
 			invocation.socket !== undefined &&
 			(hasShellPathExpansion(invocation.socket.value) ||
-				(invocation.socket.flag === "-S" &&
-					!path.isAbsolute(invocation.socket.value) &&
-					commandCwd === undefined) ||
+				(invocation.socket.flag === "-S" && !path.isAbsolute(invocation.socket.value) && commandCwdUnknown) ||
 				(invocation.socket.flag === "-L" && assignedTmpdir !== undefined && hasShellPathExpansion(assignedTmpdir)));
 		const commandSocket = socketPathIsUnknown
 			? undefined
@@ -2320,22 +2564,41 @@ export async function checkTmuxSelfInjection(
 	}
 
 	if (depth < MAX_INDIRECTION_DEPTH) {
-		const shellScripts = collectShellScripts(tokens, cwd);
+		const shellScripts = collectShellScripts(tokens, cwd, cwdUnknown);
 		for (const payload of collectShellStdinPayloads(tokens, hereDocuments, shellScripts, cwd)) {
-			const result = await checkTmuxSelfInjection(payload, options, depth + 1);
+			const result = await checkTmuxSelfInjectionAtCwd(payload, options, depth + 1, cwd, cwdUnknown);
 			if (result.block) return result;
 		}
-		for (const payload of collectShellPayloads(tokens)) {
-			const result = await checkTmuxSelfInjection(payload, options, depth + 1);
+		for (const payload of collectShellPayloadsWithContext(tokens, cwd, cwdUnknown)) {
+			const result = await checkTmuxSelfInjectionAtCwd(
+				payload.content,
+				options,
+				depth + 1,
+				payload.cwd ?? cwd,
+				payload.cwdUnknown ?? cwdUnknown,
+			);
 			if (result.block) return result;
 		}
 		for (const shellScript of shellScripts) {
 			if (shellScript.fileDescriptor !== undefined) continue;
+			if (shellScript.pathUnknown) {
+				return {
+					block: true,
+					reason: `Blocked: could not resolve shell script ${shellScript.path} because its working directory is unknown.`,
+				};
+			}
 			try {
 				const file = Bun.file(shellScript.path);
 				if (!(await file.exists()) || file.size > 1_000_000) continue;
 				const script = await file.text();
-				const result = await checkTmuxSelfInjection(script, options, depth + 1);
+				if (script.includes("\0")) continue;
+				const result = await checkTmuxSelfInjectionAtCwd(
+					script,
+					options,
+					depth + 1,
+					shellScript.cwd ?? cwd,
+					shellScript.cwdUnknown ?? cwdUnknown,
+				);
 				if (result.block) return result;
 			} catch {
 				// An unreadable or missing script is not itself evidence that it
