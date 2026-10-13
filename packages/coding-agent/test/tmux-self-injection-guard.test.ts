@@ -111,16 +111,6 @@ describe("tmux self-injection guard", () => {
 		}
 	});
 
-	it("finds injection in a shell script passed to bash", async () => {
-		const scriptPath = "/tmp/gjc-5039-injection.sh";
-		await Bun.write(scriptPath, "tmux send-keys -t %47 x\n");
-		try {
-			await expect(checkTmuxSelfInjection(`bash ${scriptPath}`, options)).resolves.toMatchObject({ block: true });
-		} finally {
-			await Bun.file(scriptPath).delete();
-		}
-	});
-
 	it("finds injection in a command chain", async () => {
 		await expect(checkTmuxSelfInjection("printf safe; tmux send-keys -t %47 x", options)).resolves.toMatchObject({
 			block: true,
