@@ -6,23 +6,86 @@ import { isSafeEnvName, isSafeEnvValue } from "./spawn-env";
 
 export { filterProcessEnv, isSafeEnvName, isSafeEnvValue } from "./spawn-env";
 
-import { parseEnvFile, parseEnvFileContent, parseShellEnvFile, projectEnvSnapshot } from "./env-file";
+import {
+	parseEnvFile,
+	parseEnvFileContent,
+	parseShellEnvFile,
+	projectEnvLayerFiles,
+	projectEnvSnapshot,
+} from "./env-file";
 
 // Re-exported so the public surface of this module is unchanged.
 export { isValidEnvName, parseEnvFile, parseShellEnvFile } from "./env-file";
 
-function loadProjectEnv(): { values: Record<string, string>; dynamic: Set<string> } {
+function findClosingBrace(value: string, open: number): number {
+	let depth = 1;
+	for (let index = open + 2; index < value.length; index++) {
+		if (value[index] === "\\") {
+			index++;
+			continue;
+		}
+		if (value[index] === "$" && value[index + 1] === "{") {
+			depth++;
+			index++;
+		} else if (value[index] === "}" && --depth === 0) {
+			return index;
+		}
+	}
+	return -1;
+}
+
+function expandProjectEnvValue(value: string, resolve: (name: string) => string | undefined): string {
+	let result = "";
+	for (let index = 0; index < value.length; index++) {
+		const char = value[index];
+		if (char === "\\" && value[index + 1] === "$") {
+			result += "$";
+			index++;
+			continue;
+		}
+		if (char !== "$") {
+			result += char;
+			continue;
+		}
+
+		let name: string | undefined;
+		let end = index;
+		let fallback: string | undefined;
+		if (value[index + 1] === "{") {
+			const close = findClosingBrace(value, index);
+			const expression = close < 0 ? undefined : value.slice(index + 2, close);
+			const match = expression && /^([A-Za-z_][A-Za-z0-9_]*)(?::-(.*))?$/.exec(expression);
+			if (match) {
+				name = match[1];
+				fallback = match[2];
+				end = close;
+			}
+		} else {
+			const match = /^[A-Za-z_][A-Za-z0-9_]*/.exec(value.slice(index + 1));
+			if (match) {
+				name = match[0];
+				end = index + name.length;
+			}
+		}
+		if (!name) {
+			result += "$";
+			continue;
+		}
+		result += resolve(name) ?? (fallback === undefined ? "" : expandProjectEnvValue(fallback, resolve));
+		index = end;
+	}
+	return result;
+}
+
+function loadProjectEnv(): {
+	values: Record<string, string>;
+	loadedValues: Record<string, string>;
+	dynamic: Set<string>;
+} {
 	const cwd = process.cwd();
 	const nodeEnv = process.env.NODE_ENV || Bun.env.NODE_ENV;
-	// Match Bun's dotenv precedence. Validate before interpolation so a hostile
-	// NODE_ENV cannot introduce separators or `..` path segments.
-	const validNodeEnv = nodeEnv && /^[A-Za-z0-9_-]+$/.test(nodeEnv) ? nodeEnv : undefined;
-	const files = [
-		".env",
-		...(validNodeEnv ? [`.env.${validNodeEnv}`] : []),
-		...(validNodeEnv !== "test" ? [".env.local"] : []),
-		...(validNodeEnv ? [`.env.${validNodeEnv}.local`] : []),
-	];
+	// Same file list as projectEnvSnapshot, so a loaded value stays project-controlled.
+	const files = projectEnvLayerFiles(nodeEnv);
 	const values: Record<string, string> = {};
 	const dynamic = new Set<string>();
 	for (const file of files) {
@@ -43,7 +106,29 @@ function loadProjectEnv(): { values: Record<string, string>; dynamic: Set<string
 	// is stored there as "" and must not overlay this layer. File selection
 	// stays above, so a higher static layer still clears a lower dynamic one.
 	for (const key of projectEnvSnapshot(cwd).dynamic) dynamic.add(key);
-	return { values, dynamic };
+
+	const resolved = new Map<string, string>();
+	const resolving = new Set<string>();
+	const resolveProjectValue = (key: string): string | undefined => {
+		const inherited = Bun.env[key];
+		if (inherited !== undefined) return inherited;
+		const cached = resolved.get(key);
+		if (cached !== undefined) return cached;
+		if (!Object.hasOwn(values, key) || resolving.has(key)) return undefined;
+
+		resolving.add(key);
+		const value = expandProjectEnvValue(values[key] ?? "", name => resolveProjectValue(canonicalEnvKey(name)));
+		resolving.delete(key);
+		resolved.set(key, value);
+		return value;
+	};
+	for (const [key, value] of Object.entries(values)) {
+		resolved.set(
+			key,
+			expandProjectEnvValue(value, name => resolveProjectValue(canonicalEnvKey(name))),
+		);
+	}
+	return { values, loadedValues: Object.fromEntries(resolved), dynamic };
 }
 
 function resolveFileEnvValue(file: Record<string, string>, name: string): string | undefined {
@@ -112,7 +197,7 @@ const projectEnv = projectSnapshot.values;
 
 /** Project dotenv as it was when this module loaded, before a later `chdir` or file delete. */
 export function startupProjectEnvSnapshot(): { values: Record<string, string>; dynamic: Set<string> } {
-	return projectSnapshot;
+	return { values: projectSnapshot.values, dynamic: projectSnapshot.dynamic };
 }
 const authoritativeHomeKey = process.platform === "win32" ? "USERPROFILE" : "HOME";
 const declaredHomeKey = canonicalEnvKey(authoritativeHomeKey);
@@ -229,9 +314,9 @@ for (const name of PROJECT_DENIED_ENV_NAMES) {
 }
 const projectDeniedKeys = new Set<string>(PROJECT_DENIED_ENV_NAMES.map(canonicalEnvKey));
 
-for (const file of [projectEnv, agentEnv, piEnv, homeEnv, homeShellEnv]) {
+for (const file of [projectSnapshot.loadedValues, agentEnv, piEnv, homeEnv, homeShellEnv]) {
 	for (const key in file) {
-		if (file === projectEnv && projectDeniedKeys.has(key)) continue;
+		if (file === projectSnapshot.loadedValues && projectDeniedKeys.has(key)) continue;
 		if (!Bun.env[key]) {
 			Bun.env[key] = file[key];
 		}
