@@ -1726,7 +1726,7 @@ function directSessionIndexLockFailureMessage(error: unknown, agentDir: string):
 	}
 	if (error instanceof FileLockAcquireError) {
 		const code = error.publicationFailureCode ?? error.code;
-		if (error.publicationFailureCode === "sharing_violation" || error.holder.startsWith("held by "))
+		if (error.publicationFailureCode === "sharing_violation" || error.holderIsLive)
 			return (
 				"Session index is busy; a live owner is never displaced. Retry in a few seconds.\n" +
 				`Lock: ${error.lockPath}\nCode: ${code}\n${error.message}`

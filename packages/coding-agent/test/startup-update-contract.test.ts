@@ -631,7 +631,17 @@ describe("startup update contract", () => {
 		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
 		const filePath = path.join(tempDir.path(), "sdk", "sessions", "index.jsonl");
 		const lockPath = `${filePath}.lock`;
-		const lockError = new FileLockAcquireError(filePath, lockPath, 2, "held by a live broker", "acquire_timeout");
+		const lockError = new FileLockAcquireError(
+			filePath,
+			lockPath,
+			2,
+			`held by pid 123 (live) since ${new Date().toISOString()}`,
+			"acquire_timeout",
+			undefined,
+			undefined,
+			undefined,
+			true,
+		);
 		const stderr: string[] = [];
 		vi.spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
 			stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
@@ -683,17 +693,51 @@ describe("startup update contract", () => {
 			{
 				kind: "access_denied",
 				code: "access_denied",
+				holder: "held by an unrecognized owner record",
 				message: "Session index lock acquisition failed",
+				busy: false,
+			},
+			{
+				kind: "sharing_violation",
+				code: "sharing_violation",
+				holder: "publication failed without an observed holder",
+				message: "Session index is busy",
+				busy: true,
+			},
+			{
+				kind: "dead_holder",
+				code: "acquire_timeout",
+				holder: "held by pid 123 (dead but not reaped) since 2026-10-13T00:00:00.000Z",
+				message: "Session index lock acquisition failed",
+				busy: false,
+			},
+			{
+				kind: "unknown_holder",
+				code: "acquire_timeout",
+				holder: "held by pid 123 (liveness unknown) since 2026-10-13T00:00:00.000Z",
+				message: "Session index lock acquisition failed",
+				busy: false,
+			},
+			{
+				kind: "malformed_holder",
+				code: "acquire_timeout",
+				holder: "held by an owner record that never became readable",
+				message: "Session index lock acquisition failed",
+				busy: false,
 			},
 			{
 				kind: "io_error",
 				code: "io_error",
+				holder: "",
 				message: "Session index lock publication failed",
+				busy: false,
 			},
 			{
 				kind: "cleanup_denied",
 				code: "EACCES",
+				holder: "",
 				message: "Session index lock staging cleanup failed",
+				busy: false,
 			},
 		] as const;
 
@@ -704,24 +748,28 @@ describe("startup update contract", () => {
 				const filePath = path.join(tempDir.path(), "sdk", "sessions", "index.jsonl");
 				const lockPath = `${filePath}.lock`;
 				const error =
-					scenario.kind === "access_denied"
-						? new FileLockAcquireError(
-								filePath,
-								lockPath,
-								2,
-								"publication denied without an observed owner",
-								"acquire_timeout",
-								undefined,
-								undefined,
-								"access_denied",
-							)
+					scenario.kind === "io_error"
+						? Object.assign(new Error("Failed to publish file lock: io_error."), { code: "io_error" })
 						: scenario.kind === "cleanup_denied"
 							? new FileLockStagingCleanupError(
 									lockPath,
 									`${lockPath}.pending.test`,
 									Object.assign(new Error("staging cleanup denied"), { code: "EACCES" }),
 								)
-							: Object.assign(new Error("Failed to publish file lock: io_error."), { code: "io_error" });
+							: new FileLockAcquireError(
+									filePath,
+									lockPath,
+									2,
+									scenario.holder,
+									"acquire_timeout",
+									undefined,
+									undefined,
+									scenario.kind === "access_denied"
+										? "access_denied"
+										: scenario.kind === "sharing_violation"
+											? "sharing_violation"
+											: undefined,
+								);
 				process.exitCode = 0;
 				stderr.length = 0;
 				try {
@@ -748,9 +796,13 @@ describe("startup update contract", () => {
 							: lockPath;
 					expect(output).toContain(`Lock: ${reportedLockPath}`);
 					expect(output).toContain(`Code: ${scenario.code}`);
-					expect(output).not.toContain("Session index is busy");
-					expect(output).not.toContain("Retry in a few seconds");
-					expect(output).not.toContain("broker");
+					if (scenario.busy) {
+						expect(output).toContain("Retry in a few seconds");
+					} else {
+						expect(output).not.toContain("Session index is busy");
+						expect(output).not.toContain("Retry in a few seconds");
+						expect(output).not.toContain("broker");
+					}
 					expect(process.exitCode).toBe(1);
 				} finally {
 					authStorage.close();

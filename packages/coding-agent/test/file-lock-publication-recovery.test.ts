@@ -210,19 +210,6 @@ function accessDeniedPublication(): NativeNoReplaceResult {
 	};
 }
 
-function destinationExistsPublication(): NativeNoReplaceResult {
-	return {
-		ok: false,
-		code: "quarantine_collision",
-		mutationState: "not_committed",
-		durabilityState: "not_attempted",
-		reason: "destination_exists",
-		primitive: "windows_rename_noreplace",
-		phase: "rename",
-		diagnostic: { schemaVersion: 1, collectionState: "unavailable" },
-	};
-}
-
 const primaryPrimitive =
 	process.platform === "linux"
 		? "renameat2_noreplace"
@@ -418,7 +405,28 @@ test("retries a pre-mutation sharing violation and publishes the file lock", asy
 	expect(await fs.readdir(root)).toEqual([]);
 });
 
-test("preserves access-denied publication failures instead of masking ACL errors as contention", async () => {
+test("retries a transient pre-mutation access denial and publishes the file lock", async () => {
+	const { root, file, lock } = await makeFixture();
+	let attempts = 0;
+	FileLockTestHooks.nativePublicationBindings = () => ({
+		renameNoReplacePathAsync: async (source, destination) => {
+			attempts++;
+			if (attempts < 3) return accessDeniedPublication();
+			await fs.rename(source, destination);
+			return successfulPublication(primaryPrimitive ?? "windows_rename_noreplace");
+		},
+		renameDirectoryNoReplacePathAsync,
+	});
+
+	await expect(
+		withFileLock(file, async () => await Bun.file(path.join(lock, "info")).text(), quickAcquire),
+	).resolves.toContain('"pid"');
+	expect(attempts).toBe(3);
+	await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
+	expect(await fs.readdir(root)).toEqual([]);
+});
+
+test("briefly retries access-denied publication and preserves persistent ACL errors", async () => {
 	const { root, file, lock } = await makeFixture();
 	let attempts = 0;
 	FileLockTestHooks.nativePublicationBindings = () => ({
@@ -433,9 +441,44 @@ test("preserves access-denied publication failures instead of masking ACL errors
 		message: "Failed to publish file lock: access_denied.",
 		code: "access_denied",
 	});
-	expect(attempts).toBe(1);
+	expect(attempts).toBe(3);
 	await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
 	expect(await fs.readdir(root)).toEqual([]);
+});
+
+test("acquisition reports live-holder evidence separately from ambiguous lock records", async () => {
+	const cases = [
+		{
+			info: removalInfo(process.pid),
+			isLive: true,
+			description: `held by pid ${process.pid} (live)`,
+		},
+		{
+			info: removalInfo(await deadPid()),
+			isLive: false,
+			description: undefined,
+		},
+		{
+			info: "malformed owner metadata",
+			isLive: false,
+			description: "held by an owner record that never became readable",
+		},
+	] as const;
+
+	for (const scenario of cases) {
+		const { file, lock } = await makeFixture();
+		await fs.mkdir(lock);
+		await Bun.write(path.join(lock, "info"), scenario.info);
+		const failure = await acquireFileLock(file, { retries: 1, retryDelayMs: 1, staleMs: 10_000 }).then(
+			() => undefined,
+			(error: unknown) => error,
+		);
+		expect(failure).toBeInstanceOf(FileLockAcquireError);
+		if (!(failure instanceof FileLockAcquireError)) throw new Error("expected file lock acquisition failure");
+		if (scenario.description) expect(failure.holder).toContain(scenario.description);
+		if (!scenario.isLive) expect(failure.holder).not.toContain("(live)");
+		expect(failure.holderIsLive).toBe(scenario.isLive);
+	}
 });
 
 test("keeps the staging component within filesystem limits for long target names", async () => {
@@ -493,7 +536,7 @@ test("stops retrying when failed publication staging cannot be cleaned", async (
 		lockPath: lock,
 		code: "EACCES",
 	});
-	expect(publicationAttempts).toBe(4); // 1 initial + 3 retries
+	expect(publicationAttempts).toBe(3); // 1 initial + 2 bounded retries
 	expect(cleanupAttempts).toBe(1);
 	expect((await fs.readdir(root)).filter(name => name.includes(".pending."))).toHaveLength(1);
 });

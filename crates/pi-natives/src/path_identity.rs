@@ -965,16 +965,16 @@ const STATUS_ACCESS_DENIED: i32 = 0xc000_0022u32 as i32;
 
 #[cfg(any(windows, test))]
 fn ntstatus_code(status: i32) -> &'static str {
-		match status as u32 {
-			0xc000_0034 | 0xc000_003a => "not_found",
-			0xc000_0035 => "quarantine_collision",
-			0xc000_0043 => "sharing_violation",
-			0xc000_0022 => "owner_mismatch",
-			0xc000_050b => "reparse_point",
-			0xc000_00d4 => "atomic_unavailable",
-			_ => "io_error",
-		}
+	match status as u32 {
+		0xc000_0034 | 0xc000_003a => "not_found",
+		0xc000_0035 => "quarantine_collision",
+		0xc000_0043 => "sharing_violation",
+		0xc000_0022 => "owner_mismatch",
+		0xc000_050b => "reparse_point",
+		0xc000_00d4 => "atomic_unavailable",
+		_ => "io_error",
 	}
+}
 
 #[cfg(any(windows, test))]
 fn publication_rename_error_code(code: &'static str) -> &'static str {
@@ -10855,7 +10855,8 @@ mod platform {
 		NativeDirectoryTreeResult, NativeDirectoryTreeSnapshot, NativeExactUnlinkResult,
 		NativeOwnerOnlySecurityResult, NativePermissionRepairResult, STATUS_INVALID_PARAMETER,
 		STATUS_SHARING_VIOLATION, is_retryable_exact_replace_status, native_windows_error_code,
-		ntstatus_code, open_with_transient_retry, publication_rename_error_code, sha256, volume_case_sensitivity_from_flags,
+		ntstatus_code, open_with_transient_retry, publication_rename_error_code, sha256,
+		volume_case_sensitivity_from_flags,
 	};
 
 	type UvGetOsfhandle = unsafe extern "C" fn(fd: i32) -> isize;

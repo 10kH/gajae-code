@@ -68,6 +68,8 @@ export class FileLockAcquireError extends Error {
 		readonly orphanPath?: string,
 		readonly removalFailure?: FileLockStaleRemovalFailure,
 		readonly publicationFailureCode?: FileLockPublicationFailureCode,
+		/** True only when exhaustion proved a same-host owner process is live. */
+		readonly holderIsLive = false,
 	) {
 		const detail =
 			reason === "orphan_transition" && orphanPath ? `blocked by retained removal transition ${orphanPath}` : holder;
@@ -123,12 +125,12 @@ const DEFAULT_OPTIONS: Required<
 };
 
 /**
- * Windows can transiently deny a no-replace publication while another process is
- * inspecting the staged directory. Only explicit, pre-mutation receipts are retried,
- * so retrying the same source name cannot publish twice or clean up a committed change.
+ * Windows can transiently deny a no-replace publication while another process holds
+ * the staged or destination path open. Retry only validated pre-mutation receipts;
+ * persistent access-denied failures remain fatal rather than being reported as contention.
  */
-const PUBLICATION_CONTENTION_RETRY_ATTEMPTS = 3;
-const PUBLICATION_CONTENTION_RETRY_DELAY_MS = 10;
+const PUBLICATION_TRANSIENT_RETRY_ATTEMPTS = 3;
+const PUBLICATION_TRANSIENT_RETRY_DELAY_MS = 10;
 
 /** Ownerless empty residue must outlive both this grace and the acquire budget. */
 const REMOVAL_TRANSITION_GRACE_MS = 10_000;
@@ -1373,7 +1375,24 @@ function isPreMutationPublicationContention(value: unknown): boolean {
 	);
 }
 
-async function publishNoReplaceWithContentionRetry(
+function isPreMutationAccessDeniedPublication(value: unknown): boolean {
+	return (
+		isValidNativeNoReplaceResult(value) &&
+		!value.ok &&
+		value.code === "access_denied" &&
+		value.mutationState === "not_committed" &&
+		value.durabilityState === "not_attempted" &&
+		value.reason === "access_denied" &&
+		value.primitive === "windows_rename_noreplace" &&
+		value.phase === "rename"
+	);
+}
+
+function isPreMutationPublicationRetryable(value: unknown): boolean {
+	return isPreMutationPublicationContention(value) || isPreMutationAccessDeniedPublication(value);
+}
+
+async function publishNoReplaceWithTransientRetry(
 	publish: (sourcePath: string, destinationPath: string) => Promise<NativeNoReplaceResult>,
 	sourcePath: string,
 	destinationPath: string,
@@ -1381,10 +1400,10 @@ async function publishNoReplaceWithContentionRetry(
 	let result = await publish(sourcePath, destinationPath);
 	for (
 		let attempt = 1;
-		attempt < PUBLICATION_CONTENTION_RETRY_ATTEMPTS && isPreMutationPublicationContention(result);
+		attempt < PUBLICATION_TRANSIENT_RETRY_ATTEMPTS && isPreMutationPublicationRetryable(result);
 		attempt++
 	) {
-		await Bun.sleep(PUBLICATION_CONTENTION_RETRY_DELAY_MS * attempt);
+		await Bun.sleep(PUBLICATION_TRANSIENT_RETRY_DELAY_MS * attempt);
 		result = await publish(sourcePath, destinationPath);
 	}
 	return result;
@@ -2145,7 +2164,7 @@ async function tryAcquireLock(
 			renameNoReplacePathAsync,
 			renameDirectoryNoReplacePathAsync,
 		};
-		const published = await publishNoReplaceWithContentionRetry(
+		const published = await publishNoReplaceWithTransientRetry(
 			publication.renameNoReplacePathAsync,
 			canonicalPendingPath,
 			destinationPath,
@@ -2154,7 +2173,7 @@ async function tryAcquireLock(
 		if (published.ok && !publishedSuccessfully)
 			throw new Error("Failed to publish file lock: invalid primary success receipt.");
 		if (!published.ok && isPreMutationUnsupportedRenameResult(published)) {
-			const fallback = await publishNoReplaceWithContentionRetry(
+			const fallback = await publishNoReplaceWithTransientRetry(
 				publication.renameDirectoryNoReplacePathAsync,
 				canonicalPendingPath,
 				destinationPath,
@@ -2513,12 +2532,17 @@ function scheduleReleasePendingRetry(lockPath: string, key: string, state: Local
  * Bounded, actionable description of who holds `lockPath` at exhaustion time.
  * Never a stealing authority: purely diagnostic, read once after the last retry.
  */
+interface FileLockHolderDescription {
+	description: string;
+	isLive: boolean;
+}
+
 async function lockHolderDescription(
 	lockPath: string,
 	orphanTransitionAgeMs: number,
 	ownerHostId?: string,
 	previousOwnerHostIds: readonly string[] = [],
-): Promise<string> {
+): Promise<FileLockHolderDescription> {
 	try {
 		if (process.platform !== "win32") {
 			const transitionState = await classifyFileLockRemovalTransition(
@@ -2528,11 +2552,17 @@ async function lockHolderDescription(
 				previousOwnerHostIds,
 			);
 			if (transitionState === "orphan_transition")
-				return `orphan_transition at ${fileLockRemovalTransitionPath(lockPath)}`;
+				return { description: `orphan_transition at ${fileLockRemovalTransitionPath(lockPath)}`, isLive: false };
 			if (transitionState === "abandoned")
-				return `blocked by abandoned removal transition at ${fileLockRemovalTransitionPath(lockPath)}; inspect and remove the directory manually once no publisher remains`;
+				return {
+					description: `blocked by abandoned removal transition at ${fileLockRemovalTransitionPath(lockPath)}; inspect and remove the directory manually once no publisher remains`,
+					isLive: false,
+				};
 			if (transitionState === "active")
-				return `blocked by retained removal transition ${fileLockRemovalTransitionPath(lockPath)}; retry the owning process cleanup or inspect the exact orphan manually; unproven transition ownership is never removed`;
+				return {
+					description: `blocked by retained removal transition ${fileLockRemovalTransitionPath(lockPath)}; retry the owning process cleanup or inspect the exact orphan manually; unproven transition ownership is never removed`,
+					isLive: false,
+				};
 		}
 		let info = await readLockInfo(lockPath);
 		let bytes: string | null = null;
@@ -2555,10 +2585,12 @@ async function lockHolderDescription(
 				// is missing instead of naming a host it does not have.
 				const provenance =
 					info.owner_host_id === undefined ? "on an unrecorded host" : `on host ${info.owner_host_id}`;
-				return (
-					`held by pid ${info.pid} ${provenance} (liveness unknown from this host)` +
-					` since ${new Date(info.timestamp).toISOString()}`
-				);
+				return {
+					description:
+						`held by pid ${info.pid} ${provenance} (liveness unknown from this host)` +
+						` since ${new Date(info.timestamp).toISOString()}`,
+					isLive: false,
+				};
 			}
 			// Same-host holder: use the full liveness proof (pid alive AND, when the
 			// record carries a start_time, the start-time identity match) so a dead
@@ -2569,37 +2601,45 @@ async function lockHolderDescription(
 				: ownerLiveness(info.pid) === "dead"
 					? "dead but not reaped"
 					: "liveness unknown";
-			return (
-				`held by pid ${info.pid}` +
-				// Keep the host on a host-qualified local record: on a shared volume the
-				// same pathname is contended from several hosts, so naming the one whose
-				// pid space this verdict came from is what makes it actionable.
-				(info.owner_host_id === undefined ? "" : " on this host") +
-				` (${liveness})` +
-				` since ${new Date(info.timestamp).toISOString()}`
-			);
+			return {
+				description:
+					`held by pid ${info.pid}` +
+					// Keep the host on a host-qualified local record: on a shared volume the
+					// same pathname is contended from several hosts, so naming the one whose
+					// pid space this verdict came from is what makes it actionable.
+					(info.owner_host_id === undefined ? "" : " on this host") +
+					` (${liveness})` +
+					` since ${new Date(info.timestamp).toISOString()}`,
+				isLive: alive,
+			};
 		}
 		try {
 			if (bytes !== null)
-				return "held by an owner record that never became readable (empty, truncated, or non-JSON info); malformed records carry no liveness proof and are never reclaimed — inspect and remove the directory manually once no publisher remains";
+				return {
+					description:
+						"held by an owner record that never became readable (empty, truncated, or non-JSON info); malformed records carry no liveness proof and are never reclaimed — inspect and remove the directory manually once no publisher remains",
+					isLive: false,
+				};
 			await fs.stat(path.join(lockPath, "info"));
-			return "held by an owner whose metadata is not yet readable";
+			return { description: "held by an owner whose metadata is not yet readable", isLive: false };
 		} catch (error) {
 			if (!isEnoent(error)) throw error;
 		}
 		try {
 			if ((await fs.readdir(lockPath)).length === 0) {
-				return (
-					"held by an ownerless empty lock directory; inspect and remove this exact directory manually only after " +
-					`confirming no publisher remains: ${manualLockCleanupCommand(lockPath)}`
-				);
+				return {
+					description:
+						"held by an ownerless empty lock directory; inspect and remove this exact directory manually only after " +
+						`confirming no publisher remains: ${manualLockCleanupCommand(lockPath)}`,
+					isLive: false,
+				};
 			}
 		} catch (error) {
 			if (!isEnoent(error)) throw error;
 		}
-		return "held by an unrecognized owner record";
+		return { description: "held by an unrecognized owner record", isLive: false };
 	} catch (error) {
-		return `held by an unreadable owner (${(error as Error).message})`;
+		return { description: `held by an unreadable owner (${(error as Error).message})`, isLive: false };
 	}
 }
 
@@ -2706,11 +2746,17 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 			opts.signal.removeEventListener("abort", onAbort);
 		}
 	}
+	const holder = await lockHolderDescription(
+		lockPath,
+		orphanTransitionAgeMs,
+		opts.ownerHostId,
+		opts.previousOwnerHostIds ?? [],
+	);
 	throw new FileLockAcquireError(
 		filePath,
 		lockPath,
 		opts.retries,
-		await lockHolderDescription(lockPath, orphanTransitionAgeMs, opts.ownerHostId, opts.previousOwnerHostIds ?? []),
+		holder.description,
 		"acquire_timeout",
 		(await classifyFileLockRemovalTransition(
 			lockPath,
@@ -2722,6 +2768,7 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 			: undefined,
 		await staleRemovalFailureForCurrentGeneration(lockPath, staleRemovalFailure),
 		publicationFailureCode,
+		holder.isLive,
 	);
 }
 
