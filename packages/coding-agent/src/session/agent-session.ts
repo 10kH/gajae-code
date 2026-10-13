@@ -23303,12 +23303,13 @@ export class AgentSession {
 		failedRowIds: Set<number>,
 	): Promise<{ apiKey: string; credentialRowId: number } | undefined> {
 		if (candidate.provider !== this.model?.provider) return undefined;
+		if (this.#hasManagedFallbackCredentialPin(candidate.provider)) return undefined;
 		const authStorage = this.#modelRegistry.authStorage;
 		const matchingRowIds = await authStorage.getCredentialRowIdsMatchingApiKey(candidate.provider, apiKey);
 		if (credentialRowId !== undefined && !matchingRowIds.includes(credentialRowId)) {
 			matchingRowIds.unshift(credentialRowId);
 		}
-		if (matchingRowIds.length === 0 || this.#hasManagedFallbackCredentialPin(candidate.provider)) return undefined;
+		if (matchingRowIds.length === 0) return undefined;
 		for (const failedRowId of matchingRowIds) {
 			if (failedRowIds.has(failedRowId)) continue;
 			failedRowIds.add(failedRowId);

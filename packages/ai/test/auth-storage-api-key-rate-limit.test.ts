@@ -1,7 +1,8 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { logger } from "@gajae-code/utils";
 
 import { AuthStorage, SqliteAuthCredentialStore } from "../src/auth-storage";
 
@@ -9,11 +10,18 @@ describe("AuthStorage api-key usage-limit fallback", () => {
 	let tempDir = "";
 	let store: SqliteAuthCredentialStore | null = null;
 	let authStorage: AuthStorage | null = null;
+	let rejectedConfigKey: string | undefined;
 
 	beforeEach(async () => {
+		rejectedConfigKey = undefined;
 		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-ai-auth-api-key-rate-limit-"));
 		store = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
-		authStorage = new AuthStorage(store);
+		authStorage = new AuthStorage(store, {
+			configValueResolver: async config => {
+				if (config === rejectedConfigKey) throw new Error("credential resolver failed");
+				return config;
+			},
+		});
 		await authStorage.set("zai", [
 			{ type: "api_key", key: "zai-key-1" },
 			{ type: "api_key", key: "zai-key-2" },
@@ -22,6 +30,8 @@ describe("AuthStorage api-key usage-limit fallback", () => {
 	});
 
 	afterEach(async () => {
+		vi.restoreAllMocks();
+		rejectedConfigKey = undefined;
 		store?.close();
 		store = null;
 		authStorage = null;
@@ -101,5 +111,23 @@ describe("AuthStorage api-key usage-limit fallback", () => {
 
 		expect(matchingRowIds).toHaveLength(2);
 		expect(new Set(matchingRowIds)).toEqual(new Set(rowIds));
+	});
+
+	it("continues matching when an unrelated API-key resolver rejects", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+
+		const rows = store.listAuthCredentials("zai");
+		const matchedRow = rows.find(row => row.credential.type === "api_key" && row.credential.key === "zai-key-1");
+		const rejectedRow = rows.find(row => row.credential.type === "api_key" && row.credential.key === "zai-key-2");
+		if (!matchedRow || !rejectedRow) throw new Error("test setup did not create the expected credentials");
+		rejectedConfigKey = "zai-key-2";
+		const warning = vi.spyOn(logger, "warn");
+
+		await expect(authStorage.getCredentialRowIdsMatchingApiKey("zai", "zai-key-1")).resolves.toEqual([matchedRow.id]);
+		expect(warning).toHaveBeenCalledWith("Failed to resolve stored API key while matching credential rows", {
+			provider: "zai",
+			credentialId: rejectedRow.id,
+			errorType: "Error",
+		});
 	});
 });

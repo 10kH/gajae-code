@@ -5499,12 +5499,22 @@ export class AuthStorage {
 	 * Opaque stored row IDs for credentials whose resolved key matches `apiKey`.
 	 * Unlike the session's sticky row pointer, these remain tied to the actual key
 	 * when concurrent requests share a credential session ID.
+	 * A row that cannot be resolved is skipped so an unrelated resolver failure
+	 * cannot prevent callers from using already-known credential identity.
 	 */
 	async getCredentialRowIdsMatchingApiKey(provider: string, apiKey: string): Promise<number[]> {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		const rowIds: number[] = [];
 		for (const entry of this.#getStoredCredentials(storageProvider)) {
-			if (await this.#credentialMatchesApiKey(storageProvider, entry.credential, apiKey)) rowIds.push(entry.id);
+			try {
+				if (await this.#credentialMatchesApiKey(storageProvider, entry.credential, apiKey)) rowIds.push(entry.id);
+			} catch (error) {
+				logger.warn("Failed to resolve stored API key while matching credential rows", {
+					provider: storageProvider,
+					credentialId: entry.id,
+					errorType: error instanceof Error ? error.name : typeof error,
+				});
+			}
 		}
 		return rowIds;
 	}

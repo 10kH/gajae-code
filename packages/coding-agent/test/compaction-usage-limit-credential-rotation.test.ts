@@ -9,7 +9,7 @@ import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { TempDir } from "@gajae-code/utils";
+import { logger, TempDir } from "@gajae-code/utils";
 import { assistantMsg, userMsg } from "./utilities";
 
 const USAGE_LIMIT =
@@ -112,6 +112,55 @@ describe("auto-compaction usage limit rotates the session credential", () => {
 		expect(keys).toHaveLength(2);
 		expect(keys[1]).not.toBe(keys[0]);
 		expect(markUsageLimitReached).toHaveBeenCalledTimes(1);
+		expect(ends).toHaveLength(1);
+		expect(ends[0]?.errorMessage).toBeUndefined();
+		expect(ends[0]?.result).toBeDefined();
+	});
+
+	it("rotates despite an unrelated stored credential resolver rejecting during alias discovery", async () => {
+		authStorage.close();
+		let siblingResolverCalls = 0;
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"), {
+			configValueResolver: async config => {
+				if (config === "codex-key-2") {
+					siblingResolverCalls++;
+					if (siblingResolverCalls === 1) throw new Error("transient sibling resolver failure");
+				}
+				return config;
+			},
+		});
+		const credentials = authStorage
+			.exportSnapshot()
+			.credentials.filter(entry => entry.provider === "openai-codex" && entry.credential.type === "api_key");
+		const dispatchedRow = credentials.find(
+			entry => entry.credential.type === "api_key" && entry.credential.key === "codex-key-1",
+		);
+		const siblingRow = credentials.find(
+			entry => entry.credential.type === "api_key" && entry.credential.key === "codex-key-2",
+		);
+		if (!dispatchedRow || !siblingRow) throw new Error("test setup did not create the expected credentials");
+		const credentialSessionId = "compaction-resolver-isolation-session";
+		await authStorage.getApiKey("openai-codex", credentialSessionId, {
+			credentialSelector: { kind: "id", value: String(dispatchedRow.id) },
+		});
+		session = createSession(credentialSessionId);
+		const ends = collectCompactionEnds(session);
+		const compactSpy = stubCompact((apiKey, firstKey) => apiKey === firstKey);
+		const markUsageLimitReached = vi.spyOn(authStorage, "markUsageLimitReached");
+		const warning = vi.spyOn(logger, "warn");
+
+		await session.runIdleCompaction();
+
+		expect(siblingResolverCalls).toBeGreaterThan(1);
+		expect(compactSpy.mock.calls).toHaveLength(2);
+		expect(compactSpy.mock.calls[1]?.[2]).toBe("codex-key-2");
+		expect(markUsageLimitReached).toHaveBeenCalledTimes(1);
+		expect(markUsageLimitReached.mock.calls[0]?.[2]?.rowId).toBe(dispatchedRow.id);
+		expect(warning).toHaveBeenCalledWith("Failed to resolve stored API key while matching credential rows", {
+			provider: "openai-codex",
+			credentialId: siblingRow.id,
+			errorType: "Error",
+		});
 		expect(ends).toHaveLength(1);
 		expect(ends[0]?.errorMessage).toBeUndefined();
 		expect(ends[0]?.result).toBeDefined();
@@ -388,6 +437,7 @@ describe("auto-compaction usage limit rotates the session credential", () => {
 		session = createSession();
 		const ends = collectCompactionEnds(session);
 		const compactSpy = stubCompact(() => true);
+		const getCredentialRowIdsMatchingApiKey = vi.spyOn(authStorage, "getCredentialRowIdsMatchingApiKey");
 		const markUsageLimitReached = vi.spyOn(authStorage, "markUsageLimitReached");
 
 		await session.runIdleCompaction();
@@ -395,6 +445,7 @@ describe("auto-compaction usage limit rotates the session credential", () => {
 		const keys = compactSpy.mock.calls.map(call => call[2]);
 		expect(keys).toHaveLength(1 + MAX_RETRIES);
 		expect(new Set(keys).size).toBe(1);
+		expect(getCredentialRowIdsMatchingApiKey).not.toHaveBeenCalled();
 		expect(markUsageLimitReached).not.toHaveBeenCalled();
 		expect(ends[0]?.errorMessage).toContain("usage limit has been reached");
 	});
