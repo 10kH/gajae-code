@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as os from "node:os";
+import * as path from "node:path";
 import { Agent, type AgentMessage, isNonDispatchedToolEvent, markNonDispatchedToolEvent } from "@gajae-code/agent-core";
 import type { Message, Model, SimpleStreamOptions } from "@gajae-code/ai";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
@@ -1275,10 +1277,8 @@ describe("AgentSession message pipeline", () => {
 	});
 
 	it("does not publish SDK terminal before continuation decision settles", async () => {
-		// Regression test for PR #6668 P1: ensure SDK terminals are not published
-		// before the async handler has recorded its continuation decision.
-		// This test verifies the continuation-decision guard prevents premature publication
-		// in scenarios where prompt settlement flushes before the handler's finally block.
+		// Regression test for PR #6668 P1: a real SDK-owned terminal stays pending
+		// while post-turn handling is unfinished, even when settlement attempts a flush.
 
 		const model: Model = {
 			id: "continuation-decision-guard-model",
@@ -1306,13 +1306,20 @@ describe("AgentSession message pipeline", () => {
 			},
 		});
 
+		const isolatedSessionCwd = path.join(os.tmpdir(), `agent-session-sdk-terminal-${Bun.randomUUIDv7()}`);
 		const session = new AgentSession({
 			agent,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: SessionManager.inMemory(isolatedSessionCwd),
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry: testModelRegistry as never,
 		});
 		sessions.push(session);
+		const decisionStarted = Promise.withResolvers<void>();
+		const releaseDecision = Promise.withResolvers<void>();
+		vi.spyOn(session.goalRuntime, "onAgentEnd").mockImplementation(async () => {
+			decisionStarted.resolve();
+			await releaseDecision.promise;
+		});
 
 		const events: AgentSessionEvent[] = [];
 		const sdkAgentEnds: Array<AgentSessionEvent & { type: "agent_end" }> = [];
@@ -1321,27 +1328,19 @@ describe("AgentSession message pipeline", () => {
 			if (event.type === "agent_end") sdkAgentEnds.push(event as never);
 		});
 
-		// Send a message to trigger the agent
-		const prompt = session.prompt("test").then(() => {
-			/* ok */
-		});
+		const prompt = session.sendUserMessage("sdk terminal", {
+			sdkRunCapability: createSdkRunCapability("continuation-decision-guard"),
+		} as never);
+		try {
+			await decisionStarted.promise;
+			session.flushParkedAgentEndForCoordinatorPersistForTests();
+			expect(sdkAgentEnds).toHaveLength(0);
+		} finally {
+			releaseDecision.resolve();
+		}
 
-		// Wait for the prompt to complete
 		await prompt;
-		await Bun.sleep(0);
-
-		// Verify that the agent_end was eventually published
-		// This documents that the handler does complete and publish the terminal
+		await session.waitForIdle();
 		expect(sdkAgentEnds).toHaveLength(1);
-
-		// Additional verification: simulate the scenario where goal processing would be slow
-		// by checking that we have exactly one agent_end (not duplicated publications)
-		const beforeSecondMessage = sdkAgentEnds.length;
-		await session.prompt("second");
-		await Bun.sleep(0);
-		const afterSecondMessage = sdkAgentEnds.length;
-
-		// Should have exactly 2 agent_ends (one per prompt), no duplicates or missing ones
-		expect(afterSecondMessage).toBe(beforeSecondMessage + 1);
 	});
 });
