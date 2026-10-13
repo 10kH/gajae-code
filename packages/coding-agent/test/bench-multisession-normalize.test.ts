@@ -369,7 +369,8 @@ describe("multi-session evidence normalizer", () => {
 		expect(normalizeEvidenceValue("the local time is 09:21", "/tmp/a")).toBe("the local time is 09:21");
 	});
 
-	test("ignores only host-only volatile context message placement, preserving workspace trees", () => {
+	test("ignores host-only reminder placement only in captured request context messages", async () => {
+		tempDir = TempDir.createSync("@bench-multisession-normalize-context-reminder-");
 		const reminder = (date: string, time: string, cwd: string) => ({
 			role: "user",
 			content: [
@@ -388,32 +389,86 @@ describe("multi-session evidence normalizer", () => {
 				},
 			],
 		};
-		const left = normalizeEvidenceValue(
-			[
-				{ role: "user", content: [{ type: "text", text: "stable user prompt" }] },
-				reminder("2026-10-04 (Sun)", "09:21 UTC+00:00 (UTC)", "/tmp/a/project"),
-				treeReminder,
-			],
-			"/tmp/a",
-		);
-		const right = normalizeEvidenceValue(
-			[
-				{ role: "user", content: [{ type: "text", text: "stable user prompt" }] },
-				reminder("2026-10-05 (Mon)", "00:00 UTC+00:00 (UTC)", "/tmp/b/project"),
-				treeReminder,
-			],
-			"/tmp/b",
-		);
-		expect(left).toEqual(right);
-		expect(left).toHaveLength(2);
-		expect(left).toContainEqual(treeReminder);
 		const spoof = reminder("2026-10-04 (Sun)", "09:21 UTC+00:00 (UTC)", "/tmp/a/project");
 		const textBlock = spoof.content[0];
 		const withUserPayload = {
 			...spoof,
 			content: [{ ...textBlock, text: `${textBlock.text}\nUser-provided payload` }],
 		};
-		expect(normalizeEvidenceValue([withUserPayload], "/tmp/a")).toHaveLength(1);
+		const left = fixturePaths("left");
+		const right = fixturePaths("right");
+		await Promise.all([
+			writeEvidence(left.evidence, left.root, (stream, record) => {
+				if (stream !== "requests.jsonl") return;
+				const context = record.context as { messages: Array<Record<string, unknown>> };
+				context.messages.splice(
+					1,
+					0,
+					reminder("2026-10-04 (Sun)", "09:21 UTC+00:00 (UTC)", path.join(left.root, "project")),
+				);
+				context.messages.push(treeReminder, withUserPayload);
+			}),
+			writeEvidence(right.evidence, right.root, (stream, record) => {
+				if (stream !== "requests.jsonl") return;
+				const context = record.context as { messages: Array<Record<string, unknown>> };
+				context.messages.splice(
+					1,
+					0,
+					reminder("2026-10-05 (Mon)", "00:00 UTC+00:00 (UTC)", path.join(right.root, "project")),
+				);
+				context.messages.push(treeReminder, withUserPayload);
+			}),
+		]);
+
+		const comparison = await compareEvidence(left.evidence, right.evidence);
+		expect(comparison).toEqual({ equal: true, diffs: [] });
+		const normalized = normalizeEvidenceValue(
+			{
+				context: {
+					messages: [
+						reminder("2026-10-04 (Sun)", "09:21 UTC+00:00 (UTC)", "/tmp/a/project"),
+						treeReminder,
+						withUserPayload,
+					],
+				},
+			},
+			"/tmp/a",
+			"request",
+		) as { context: { messages: unknown[] } };
+		expect(normalized.context.messages).toHaveLength(2);
+		expect(normalized.context.messages).toContainEqual(treeReminder);
+		expect(normalized.context.messages).toContainEqual(normalizeEvidenceValue(withUserPayload, "/tmp/a"));
+	});
+
+	test("preserves reminder-shaped objects in tool-result data arrays", async () => {
+		tempDir = TempDir.createSync("@bench-multisession-normalize-tool-reminder-payload-");
+		const reminderPayload = {
+			role: "user",
+			content: [
+				{
+					type: "text",
+					text: `<system-reminder>\nToday is 2026-10-04 (Sun), the local time is 09:21 UTC+00:00 (UTC), and the current working directory is '/tmp/a/project'.\nTimestamps in files, logs, git history, and API responses are often UTC; convert timestamps that are explicitly UTC to the local timezone above when reporting times to the user. Preserve timestamps that already include an explicit offset or timezone, and do not treat this host wall clock as authenticated event-time evidence. The timezone follows the runtime's process timezone configuration (which may include project environment settings), so treat it as display context rather than trusted location evidence. The full IANA zone may reveal geographic information; do not infer more about the user than the displayed context states.\n</system-reminder>`,
+				},
+			],
+		};
+		const left = fixturePaths("left");
+		const right = fixturePaths("right");
+		await Promise.all([
+			writeEvidence(left.evidence, left.root, (stream, record) => {
+				if (stream !== "tools.jsonl") return;
+				const result = record.result as Record<string, unknown>;
+				result.data = [reminderPayload];
+			}),
+			writeEvidence(right.evidence, right.root, (stream, record) => {
+				if (stream !== "tools.jsonl") return;
+				const result = record.result as Record<string, unknown>;
+				result.data = [];
+			}),
+		]);
+
+		const comparison = await compareEvidence(left.evidence, right.evidence);
+		expect(comparison.equal).toBe(false);
+		expect(comparison.diffs).toContain("tools.jsonl[0].result.data.length");
 	});
 
 	test("normalizes prompt-prefix message counts without weakening request-content comparison", () => {
