@@ -77,8 +77,9 @@ export function projectDeclaredSpawnHookNames(env: Record<string, string | undef
 	const names: string[] = [];
 	for (const name of Object.keys(env)) {
 		const key = canonicalEnvKey(name);
-		if (!PROJECT_DENIED_SPAWN_ENV.test(key) || snapshot.values[key] === undefined) continue;
-		if (env[name] === undefined || $inheritedEnv(name) !== undefined) continue;
+		const dynamic = snapshot.dynamic.has(key);
+		if (!PROJECT_DENIED_SPAWN_ENV.test(key) || (snapshot.values[key] === undefined && !dynamic)) continue;
+		if (env[name] === undefined || (!dynamic && $inheritedEnv(name) !== undefined)) continue;
 		names.push(name);
 	}
 	return names;
@@ -116,6 +117,17 @@ export function stripProjectSpawnHooks(env: Record<string, string>): Record<stri
  */
 export function projectSafeSpawnEnv(): Record<string, string> {
 	return stripProjectSpawnHooks(filterProcessEnv(Bun.env));
+}
+
+/** Provide the trusted HOME override needed when PTY hook filtering removes a home selector. */
+export function projectSafeHomeOverride(explicit?: Record<string, string>): Record<string, string> {
+	if (Object.hasOwn(explicit ?? {}, "HOME")) return {};
+	const removesHomeSelector = projectDeclaredSpawnHookNames().some(
+		name => !Object.hasOwn(explicit ?? {}, name) && PROJECT_HOME_SPAWN_ENV.has(canonicalEnvKey(name)),
+	);
+	if (!removesHomeSelector) return {};
+	const home = projectSafeSpawnEnv().HOME;
+	return home === undefined ? {} : { HOME: home };
 }
 
 /**

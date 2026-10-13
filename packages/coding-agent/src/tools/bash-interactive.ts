@@ -12,7 +12,7 @@ import {
 	visibleWidth,
 } from "@gajae-code/tui";
 import { logger, sanitizeText } from "@gajae-code/utils";
-import { projectDeclaredSpawnHookNames, stripProjectSpawnHooks } from "@gajae-code/utils/shell-config";
+import { projectDeclaredSpawnHookNames, projectSafeHomeOverride } from "@gajae-code/utils/shell-config";
 import type { Terminal as XtermTerminalType } from "@xterm/headless";
 import { Settings } from "../config/settings";
 import { NON_INTERACTIVE_ENV } from "../exec/non-interactive-env";
@@ -329,9 +329,7 @@ function ptyUnsetHookNames(explicit: Record<string, string> | undefined): string
 }
 
 function ptyHomeOverride(explicit: Record<string, string> | undefined): Record<string, string> {
-	if (Object.hasOwn(explicit ?? {}, "HOME") || !ptyUnsetHookNames(explicit).includes("HOME")) return {};
-	const home = stripProjectSpawnHooks({}).HOME;
-	return home === undefined ? {} : { HOME: home };
+	return projectSafeHomeOverride(explicit);
 }
 
 export async function runInteractiveBashPty(

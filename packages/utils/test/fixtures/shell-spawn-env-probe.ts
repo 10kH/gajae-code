@@ -3,11 +3,13 @@
 // Spawned with a controlled cwd so the caller can plant a project `.env`, which
 // is parsed at module load from `process.cwd()`.
 import { getTrustedHomeDir } from "../../src/dirs";
+import { startupProjectEnvSnapshot } from "../../src/env";
 import { getShellConfig } from "../../src/procmgr";
-import { projectSafeSpawnEnv } from "../../src/shell-config";
+import { projectSafeHomeOverride, projectSafeSpawnEnv } from "../../src/shell-config";
 
 const env = projectSafeSpawnEnv();
 const shared = getShellConfig().env;
+const projectEnv = startupProjectEnvSnapshot();
 let trustedHome: string | null = null;
 try {
 	trustedHome = getTrustedHomeDir();
@@ -41,6 +43,10 @@ const keys = [
 console.log(
 	JSON.stringify({
 		...Object.fromEntries(keys.map(key => [key, env[key] ?? null])),
+		LIVE_BASH_ENV: Bun.env.BASH_ENV ?? null,
+		PROJECT_DYNAMIC_BASH_ENV: projectEnv.dynamic.has("BASH_ENV"),
+		PROJECT_HAS_BASH_ENV_VALUE: Object.hasOwn(projectEnv.values, "BASH_ENV"),
+		HOME_OVERRIDE: projectSafeHomeOverride().HOME ?? null,
 		TRUSTED_HOME: trustedHome,
 		SHARED_XDG_CONFIG_HOME: shared.XDG_CONFIG_HOME ?? null,
 	}),

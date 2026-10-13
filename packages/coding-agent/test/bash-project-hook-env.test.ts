@@ -75,6 +75,7 @@ async function runProbe(
 		if (value !== undefined) env[key] = value;
 	}
 	for (const key of HOOK_KEYS) delete env[key];
+	delete env.GJC_TEST_DOTENV_AFTER_START;
 	env.HOME = tempDir();
 	env.GJC_CODING_AGENT_DIR = tempDir();
 	Object.assign(env, inherited);
@@ -136,6 +137,12 @@ describe.skipIf(process.platform === "win32")("bash tool ignores project .env ho
 		});
 	}
 
+	it("does not reload a hook added to .env after startup in the source runtime", async () => {
+		const target = project(() => "");
+		const dotenv = `GIT_CONFIG_COUNT=1\nGIT_CONFIG_KEY_0=core.fsmonitor\nGIT_CONFIG_VALUE_0=${target.hook}\n`;
+		expect(await runProbe(target, "worker", { GJC_TEST_DOTENV_AFTER_START: dotenv })).toBe(false);
+	});
+
 	// The PTY runs a real `bash -lc` that inherits the host environment. A
 	// top-level host never holds dotenv values there, but a child GJC launched
 	// with the parent's forwarded environment does, with values equal to the
@@ -157,7 +164,7 @@ describe.skipIf(process.platform === "win32")("bash tool ignores project .env ho
 
 	it("removes project Windows home selectors from the in-process native shell", async () => {
 		const target = project(() => "USERPROFILE=project-profile\nHOMEDRIVE=project-drive\nHOMEPATH=project-path\n");
-		const command = `test -z "\${USERPROFILE-}\${HOMEDRIVE-}\${HOMEPATH-}" && test -n "\${HOME-}"; echo probe-done`;
+		const command = `test -z "\${USERPROFILE-}\${HOMEDRIVE-}\${HOMEPATH-}" && test -n "\${HOME-}" && echo probe-done`;
 		expect(await runProbe(target, "inprocess", { GJC_TEST_PROBE_COMMAND: command, HOME: "" })).toBe(false);
 	});
 

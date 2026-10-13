@@ -37,7 +37,13 @@ const HOOK_KEYS = [
 	"GIT_CONFIG_PARAMETERS",
 	"UNRELATED_PROJECT_VAR",
 ] as const;
-type Probe = Record<(typeof HOOK_KEYS)[number] | "SHARED_XDG_CONFIG_HOME" | "HOME" | "TRUSTED_HOME", string | null>;
+type Probe = Record<
+	(typeof HOOK_KEYS)[number] | "SHARED_XDG_CONFIG_HOME" | "HOME" | "TRUSTED_HOME" | "LIVE_BASH_ENV" | "HOME_OVERRIDE",
+	string | null
+> & {
+	PROJECT_DYNAMIC_BASH_ENV: boolean;
+	PROJECT_HAS_BASH_ENV_VALUE: boolean;
+};
 
 const tempDirs: string[] = [];
 
@@ -142,12 +148,24 @@ describe.each([
 		expect(probe.HOMEDRIVE).toBeNull();
 		expect(probe.HOMEPATH).toBeNull();
 		expect(probe.HOME).toBe(probe.TRUSTED_HOME);
+		expect(probe.HOME_OVERRIDE).toBe(probe.TRUSTED_HOME);
 		expect(probe.HOME).not.toBe(projectHome);
 	});
 
 	it("drops a dynamic project declaration", async () => {
 		const probe = await probeIn(tempDir("HOOK=./hook.sh\nBASH_ENV=$HOOK\n"), autoload);
 		expect(probe.BASH_ENV).toBeNull();
+	});
+
+	it("drops a dynamic-only hook declaration without a parsed value", async () => {
+		const value = "./hook\r.sh";
+		const probe = await probeIn(tempDir(`BASH_ENV=${value}\n`), autoload, { BASH_ENV: value });
+		expect(probe).toMatchObject({
+			LIVE_BASH_ENV: value,
+			PROJECT_DYNAMIC_BASH_ENV: true,
+			PROJECT_HAS_BASH_ENV_VALUE: false,
+			BASH_ENV: null,
+		});
 	});
 
 	it("keeps hook variables inherited from the launching shell", async () => {

@@ -40,9 +40,10 @@ function darwinUniqueProcessId(pid: number, incarnation: string): string | undef
 }
 
 function runtimeArgv(): string[] {
-	return isCompiledBinary()
-		? [process.execPath, BASH_SHELL_RUNTIME_ARG]
-		: [process.execPath, path.join(import.meta.dir, "bash-shell-runtime-entry.ts")];
+	if (isCompiledBinary()) return [process.execPath, BASH_SHELL_RUNTIME_ARG];
+	// The supervisor already sanitized this environment. Do not let the source
+	// runtime reload a cwd `.env` that may have changed since the snapshot.
+	return [process.execPath, "--no-env-file", path.join(import.meta.dir, "bash-shell-runtime-entry.ts")];
 }
 
 function enableLinuxChildSubreaper(): void {

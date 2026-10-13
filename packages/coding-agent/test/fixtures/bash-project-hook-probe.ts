@@ -1,6 +1,7 @@
 // Runs `git status` through the bash tool's real execution paths (isolated
 // non-PTY worker and interactive PTY) from the caller-chosen cwd, so the caller
 // can plant a project `.env` whose hook variables point at a marker script.
+import * as path from "node:path";
 import type { AgentToolContext } from "@gajae-code/agent-core";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { executeBash, setShellFactoryForTests } from "@gajae-code/coding-agent/exec/bash-executor";
@@ -18,6 +19,8 @@ const cwd = process.cwd();
 // `shellPath` is read from global settings only, so set it there.
 const shellPath = process.env.GJC_TEST_SHELL_PATH;
 const settings = shellPath ? Settings.isolated({ shellPath }) : await Settings.init({ inMemory: true, cwd });
+const dotenvAfterStartup = process.env.GJC_TEST_DOTENV_AFTER_START;
+if (dotenvAfterStartup !== undefined) await Bun.write(path.join(cwd, ".env"), dotenvAfterStartup);
 
 function headlessUi(): NonNullable<AgentToolContext["ui"]> {
 	return {
