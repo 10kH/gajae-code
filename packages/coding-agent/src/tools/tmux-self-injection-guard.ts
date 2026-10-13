@@ -1017,6 +1017,7 @@ function collectShellPayloadsWithContext(tokens: Token[]): ShellPayload[] {
 				skipNextArg = false;
 				continue;
 			}
+			if (word === "--") break;
 			if (word === "+O" || word === "+o") {
 				skipNextArg = true;
 				continue;
@@ -1162,7 +1163,12 @@ function collectShellPayloadsWithContext(tokens: Token[]): ShellPayload[] {
 	// env -S 'payload' splits the string and executes the result
 	for (let index = 0; index < tokens.length; index++) {
 		const token = tokens[index];
-		if (!token.commandStart || (token.text !== "env" && !token.text.endsWith("/env"))) continue;
+		if (
+			!token.commandStart ||
+			isCommandLookup(tokens, index) ||
+			(token.text !== "env" && !token.text.endsWith("/env"))
+		)
+			continue;
 
 		// Options for env that consume the next argument
 		const envOptionsWithArg = new Set(["-u", "-C", "-S", "-a"]);
@@ -1245,6 +1251,29 @@ function collectShellPayloadsWithContext(tokens: Token[]): ShellPayload[] {
 				const wrapperLongOpts = WRAPPER_LONG_OPTIONS.env;
 				if (wrapperLongOpts && arg in wrapperLongOpts && wrapperLongOpts[arg]) {
 					skipNextArg = true;
+				}
+			} else if (arg.startsWith("-") && arg.length > 2) {
+				for (let optionIndex = 1; optionIndex < arg.length; optionIndex++) {
+					const option = `-${arg[optionIndex]}`;
+					if (!envOptionsWithArg.has(option)) continue;
+
+					if (option === "-S") {
+						const attachedSplitString = arg.slice(optionIndex + 1);
+						const splitString =
+							attachedSplitString || (optionIndex === arg.length - 1 ? tokens[cursor + 1]?.text : undefined);
+						if (splitString !== undefined) {
+							const command = reconstructCommandFromEnvSplit(splitString);
+							if (command) {
+								addPayload(command.map(quoteShellArgument).join(" "), token.segment);
+							}
+							if (attachedSplitString.length === 0 && optionIndex === arg.length - 1) cursor++;
+						}
+
+						break;
+					}
+
+					if (optionIndex === arg.length - 1) skipNextArg = true;
+					break;
 				}
 			}
 		}
@@ -1720,12 +1749,26 @@ function collectShellScripts(tokens: Token[], cwd: string): ShellScript[] {
 
 		// Skip past all options (short, long, and their arguments) to find the script argument
 		let skipNextArg = false;
+		let optionsTerminated = false;
 		for (let cursor = shellIndex + 1; cursor < tokens.length && !tokens[cursor].commandStart; cursor++) {
 			const argument = tokens[cursor].text;
 
 			// If the previous option takes an argument, skip this word
 			if (skipNextArg) {
 				skipNextArg = false;
+				continue;
+			}
+			if (optionsTerminated) {
+				const fileDescriptor = scriptFileDescriptor(argument);
+				scripts.push({
+					segment: token.segment,
+					path: path.resolve(cwd, argument),
+					...(fileDescriptor !== undefined && { fileDescriptor }),
+				});
+				break;
+			}
+			if (argument === "--") {
+				optionsTerminated = true;
 				continue;
 			}
 			if (argument === "+O" || argument === "+o") {
@@ -1940,6 +1983,76 @@ function sameSocket(left: string, right: string): boolean {
 	}
 }
 
+function envWrapperClearsVariable(
+	tokens: Token[],
+	envIndex: number,
+	commandIndex: number,
+	name: "TMUX" | "TMUX_TMPDIR",
+): boolean {
+	const segment = tokens[envIndex].segment;
+	for (let index = envIndex + 1; index < commandIndex; index++) {
+		const token = tokens[index];
+		if (token.segment !== segment || token.commandStart) break;
+		if (token.isRedirectionTarget) continue;
+
+		const argument = token.text;
+		if (argument === "--") break;
+		if (argument === "-i" || argument === "--ignore-environment") return true;
+		if (argument === "-u" || argument === "--unset") {
+			const operand = tokens[index + 1];
+			if (operand && operand.segment === segment && !operand.commandStart) {
+				if (operand.text === name) return true;
+				index++;
+			}
+			continue;
+		}
+		if (argument.startsWith("--unset=")) {
+			if (argument.slice("--unset=".length) === name) return true;
+			continue;
+		}
+		if (argument.startsWith("--")) {
+			if (wrapperOptionTakesNextArgument({ name: "env", spec: COMMAND_WRAPPERS_WITH_ARGS.env }, argument)) index++;
+			continue;
+		}
+		if (argument.startsWith("-") && argument.length > 1) {
+			for (let optionIndex = 1; optionIndex < argument.length; optionIndex++) {
+				const option = `-${argument[optionIndex]}`;
+				if (option === "-i") return true;
+				if (option === "-u") {
+					const attachedOperand = argument.slice(optionIndex + 1);
+					const operand = attachedOperand || tokens[index + 1]?.text;
+					if (attachedOperand.length === 0) index++;
+					if (operand === name) return true;
+					break;
+				}
+				if (COMMAND_WRAPPERS_WITH_ARGS.env.optionsWithArg.has(option)) {
+					if (optionIndex === argument.length - 1) index++;
+					break;
+				}
+			}
+			continue;
+		}
+		if (!isAssignment(argument)) break;
+	}
+	return false;
+}
+
+function envClearsVariable(tokens: Token[], commandIndex: number, name: "TMUX" | "TMUX_TMPDIR"): boolean {
+	const commandSegment = tokens[commandIndex].segment;
+	for (let index = commandIndex - 1; index >= 0; index--) {
+		const token = tokens[index];
+		if (token.segment !== commandSegment) break;
+		if (
+			token.commandStart &&
+			commandName(token.text) === "env" &&
+			envWrapperClearsVariable(tokens, index, commandIndex, name)
+		) {
+			return true;
+		}
+	}
+	return false;
+}
+
 function assignedTmuxEnvironmentValue(
 	tokens: Token[],
 	commandIndex: number,
@@ -1949,9 +2062,13 @@ function assignedTmuxEnvironmentValue(
 	// operands that look like assignments are not environment overrides.
 
 	const commandSegment = tokens[commandIndex].segment;
+	let clearedByEnv = false;
 	for (let index = commandIndex - 1; index >= 0; index--) {
 		const token = tokens[index];
 		if (token.segment !== commandSegment) break;
+		if (token.commandStart && commandName(token.text) === "env") {
+			clearedByEnv ||= envWrapperClearsVariable(tokens, index, commandIndex, name);
+		}
 
 		const assignment = name === "TMUX" ? token.text.match(/^TMUX=([^,\s]+)/) : token.text.match(/^TMUX_TMPDIR=(.*)$/);
 		let isOptionOperand = false;
@@ -2016,7 +2133,7 @@ function assignedTmuxEnvironmentValue(
 			// 2. Not at commandStart but also not option operands (e.g., assignments between wrappers)
 			if (token.commandStart || !isOptionOperand) {
 				// Found a genuine environment assignment; it applies to this invocation
-				return assignment[1];
+				return clearedByEnv ? undefined : assignment[1];
 			}
 		}
 
@@ -2172,6 +2289,7 @@ export async function checkTmuxSelfInjection(
 		const assignedTmux = assignedTmuxEnvironmentValue(tokens, index, "TMUX");
 		const assignedTmpdir = assignedTmuxEnvironmentValue(tokens, index, "TMUX_TMPDIR");
 		if (assignedTmpdir !== undefined) commandEnv.TMUX_TMPDIR = assignedTmpdir;
+		else if (envClearsVariable(tokens, index, "TMUX_TMPDIR")) delete commandEnv.TMUX_TMPDIR;
 		const commandCwd = commandWorkingDirectory(tokens, index, cwd);
 		const socketPathIsUnknown =
 			invocation.socket !== undefined &&

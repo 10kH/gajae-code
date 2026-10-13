@@ -1,4 +1,7 @@
 import { describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { checkTmuxSelfInjection } from "../src/tools/tmux-self-injection-guard";
 
 const env = {
@@ -1249,6 +1252,55 @@ describe("tmux self-injection guard", () => {
 	});
 
 	describe("regression: follow-up review findings", () => {
+		it("continues scanning env options after a bundled -iu operand", async () => {
+			await expect(
+				checkTmuxSelfInjection("env -iu FOO -S 'tmux send-keys -t %47 x'", options),
+			).resolves.toMatchObject({ block: true });
+		});
+
+		it("does not use a TMUX assignment cleared by env -u", async () => {
+			for (const command of [
+				"TMUX=/tmp/foreign env -u TMUX tmux send-keys -t %47 x",
+				"TMUX=/tmp/foreign env --unset=TMUX tmux send-keys -t %47 x",
+				"TMUX=/tmp/foreign env --unset=FOO --unset=TMUX tmux send-keys -t %47 x",
+				"TMUX=/tmp/foreign env -iu FOO tmux send-keys -t %47 x",
+			]) {
+				await expect(checkTmuxSelfInjection(command, options)).resolves.toMatchObject({ block: true });
+			}
+		});
+
+		it("uses the default TMUX_TMPDIR after env unsets it", async () => {
+			const envOptions = { ...options, env: { ...options.env, TMUX_TMPDIR: "/tmp/foreign" } };
+			await expect(
+				checkTmuxSelfInjection(
+					"TMUX_TMPDIR=/tmp/outer env -u TMUX_TMPDIR tmux -L default send-keys -t %47 x",
+					envOptions,
+				),
+			).resolves.toMatchObject({ block: true });
+		});
+
+		it("does not inspect env split strings that are command lookup operands", async () => {
+			await expect(checkTmuxSelfInjection("command -v env -S 'tmux send-keys -t %47 x'", options)).resolves.toEqual({
+				block: false,
+			});
+		});
+
+		it("honors a shell option terminator before the script argument", async () => {
+			const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-tmux-shell-option-end-"));
+			const localOptions = { ...options, cwd };
+			try {
+				await expect(checkTmuxSelfInjection("bash -- -c 'tmux send-keys -t %47 x'", localOptions)).resolves.toEqual(
+					{
+						block: false,
+					},
+				);
+				await Bun.write(path.join(cwd, "-c"), "tmux send-keys -t %47 x\n");
+				await expect(checkTmuxSelfInjection("bash -- -c", localOptions)).resolves.toMatchObject({ block: true });
+			} finally {
+				await fs.rm(cwd, { recursive: true, force: true });
+			}
+		});
+
 		it("consumes env split-string option terminators", async () => {
 			await expect(checkTmuxSelfInjection("env -S '-- tmux send-keys -t %47 x'", options)).resolves.toMatchObject({
 				block: true,
