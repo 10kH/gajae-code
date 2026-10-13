@@ -132,28 +132,35 @@ describe("AuthStorage anthropic organizations", () => {
 			return stored?.id ?? -1;
 		}
 
-		it("survives another organization's login and keeps it once its refresh names its organization", async () => {
-			const legacyId = await seedLegacyThenLogin(TEAM);
-
-			store.updateAuthCredential(legacyId, {
-				...legacy,
-				organizationId: PERSONAL.uuid,
-				organizationName: PERSONAL.name,
-			});
+		async function refreshLegacyCredential(
+			legacyId: number,
+			organization: { uuid: string; name: string },
+			suffix: string,
+		): Promise<void> {
+			const expired = { ...legacy, expires: Date.now() - 60_000 };
+			store.updateAuthCredential(legacyId, expired);
 			await authStorage.reload();
+			global.fetch = vi.fn(async () => tokenResponse(organization, suffix)) as unknown as typeof fetch;
+			await authStorage.forceRefreshOAuthCredential("anthropic", expired);
+		}
+
+		it("refreshes a legacy row into a different organization without replacing the known one", async () => {
+			const legacyId = await seedLegacyThenLogin(TEAM);
+			await refreshLegacyCredential(legacyId, PERSONAL, "legacy-personal");
 
 			expect(activeOrganizations()).toEqual([PERSONAL.uuid, TEAM.uuid]);
 		});
 
-		it("is deduplicated once its refresh names the organization that logged in again", async () => {
+		it("deduplicates a legacy row immediately when refresh names the same organization", async () => {
 			const legacyId = await seedLegacyThenLogin(TEAM);
-
-			store.updateAuthCredential(legacyId, { ...legacy, organizationId: TEAM.uuid, organizationName: TEAM.name });
-			await authStorage.reload();
+			await refreshLegacyCredential(legacyId, TEAM, "legacy-team");
 
 			const active = store.listAuthCredentials("anthropic");
-			expect(active.map(entry => entry.id)).not.toContain(legacyId);
-			expect(activeOrganizations()).toEqual([TEAM.uuid]);
+			expect(active).toHaveLength(1);
+			expect(active[0]?.id).toBe(legacyId);
+			expect(active[0]?.credential.type === "oauth" ? active[0].credential.access : undefined).toBe(
+				"access-legacy-team",
+			);
 		});
 	});
 

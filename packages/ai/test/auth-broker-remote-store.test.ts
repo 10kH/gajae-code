@@ -438,6 +438,54 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 		expect(remote.peekCachedUsagePresentation(entry.provider as never, entry.id)).toBeUndefined();
 	});
 
+	test("does not assign a lone usage report to another Anthropic organization", async () => {
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		remote = new RemoteAuthCredentialStore({ client, streamSnapshots: false });
+		const teamCredential = {
+			...mintOAuthCredential("shared", Date.now() + 60_000),
+			accountId: "shared-account",
+			email: "shared@example.com",
+			organizationId: "org-team",
+			organizationName: "Acme Team",
+		};
+		const personalCredential = {
+			...teamCredential,
+			access: "access-shared-personal",
+			refresh: "refresh-shared-personal",
+			organizationId: "org-personal",
+			organizationName: "Personal Max",
+		};
+		storage!.upsertCredential("anthropic", teamCredential);
+		storage!.upsertCredential("anthropic", personalCredential);
+		await remote.refreshSnapshot();
+
+		const teamEntry = remote.snapshot.credentials.find(
+			entry => entry.credential.type === "oauth" && entry.credential.organizationId === "org-team",
+		);
+		const personalEntry = remote.snapshot.credentials.find(
+			entry => entry.credential.type === "oauth" && entry.credential.organizationId === "org-personal",
+		);
+		if (teamEntry?.credential.type !== "oauth" || personalEntry?.credential.type !== "oauth") {
+			throw new Error("expected broker snapshot to contain both Anthropic organizations");
+		}
+
+		const now = Date.now();
+		const teamReport = {
+			provider: "anthropic" as const,
+			fetchedAt: now,
+			limits: [],
+			metadata: { accountId: "shared-account", email: "shared@example.com", orgId: "org-team" },
+		};
+		const fetchUsage = vi.spyOn(client, "fetchUsage").mockResolvedValue({
+			generatedAt: now,
+			reports: [teamReport],
+		});
+
+		await expect(remote.getUsageReport("anthropic", teamEntry.credential)).resolves.toEqual(teamReport);
+		await expect(remote.getUsageReport("anthropic", personalEntry.credential)).resolves.toBeNull();
+		expect(fetchUsage).toHaveBeenCalledTimes(1);
+	});
+
 	test("does not let an obsolete scoped usage flight delete its replacement", async () => {
 		const client = new AuthBrokerClient({ url: handle!.url, token });
 		remote = new RemoteAuthCredentialStore({ client, streamSnapshots: false });

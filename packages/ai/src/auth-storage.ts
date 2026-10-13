@@ -2839,28 +2839,30 @@ export class AuthStorage {
 		return deduped.reverse();
 	}
 
-	#pruneDuplicateStoredCredentials(provider: string, entries: StoredCredential[]): StoredCredential[] {
-		const seen = new Set<string>();
-		const kept: StoredCredential[] = [];
-		const removed: StoredCredential[] = [];
+	#pruneDuplicateStoredCredentials(
+		provider: string,
+		entries: StoredCredential[],
+		preferredCredentialId?: number,
+	): StoredCredential[] {
+		const selectedByIdentity = new Map<string, number>();
 		for (let index = entries.length - 1; index >= 0; index -= 1) {
 			const entry = entries[index];
-			const credential = entry.credential;
-			if (credential.type !== "oauth") {
-				kept.push(entry);
-				continue;
+			if (entry.credential.type !== "oauth") continue;
+			const identityKey = this.#resolveOAuthDedupeIdentityKey(provider, entry.credential);
+			if (!identityKey) continue;
+			if (!selectedByIdentity.has(identityKey) || entry.id === preferredCredentialId) {
+				selectedByIdentity.set(identityKey, entry.id);
 			}
-			const identityKey = this.#resolveOAuthDedupeIdentityKey(provider, credential);
-			if (!identityKey) {
-				kept.push(entry);
-				continue;
-			}
-			if (seen.has(identityKey)) {
-				removed.push(entry);
-				continue;
-			}
-			seen.add(identityKey);
-			kept.push(entry);
+		}
+
+		const selectedIds = new Set(selectedByIdentity.values());
+		const kept: StoredCredential[] = [];
+		const removed: StoredCredential[] = [];
+		for (const entry of entries) {
+			const identityKey =
+				entry.credential.type === "oauth" ? this.#resolveOAuthDedupeIdentityKey(provider, entry.credential) : null;
+			if (identityKey && !selectedIds.has(entry.id)) removed.push(entry);
+			else kept.push(entry);
 		}
 		if (removed.length > 0) {
 			for (const entry of removed) {
@@ -2869,7 +2871,7 @@ export class AuthStorage {
 			this.#clearSelectorsForRemovedCredential(provider, new Set(removed.map(entry => entry.id)), entries);
 			this.#resetProviderAssignments(provider);
 		}
-		return kept.reverse();
+		return kept;
 	}
 
 	/** Returns all credentials for a provider as an array */
@@ -3224,7 +3226,7 @@ export class AuthStorage {
 		const updated = [...entries];
 		updated[index] = { id: target.id, credential };
 		const configurationGeneration = this.#getProviderConfigurationGeneration(provider);
-		this.#setStoredCredentials(provider, updated);
+		this.#setStoredCredentials(provider, this.#pruneDuplicateStoredCredentials(provider, updated, target.id));
 		// Callers use the refresh generation to discount configuration bumps caused by a refresh, so it only
 		// advances when this refresh bumped configuration; token rotation for a known account does not.
 		if (
