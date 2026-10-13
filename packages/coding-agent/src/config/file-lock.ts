@@ -1057,7 +1057,15 @@ async function exactRemoveLockTree(
 				Object.keys(detached).some(key => key !== "ok" && key !== "detachedPath")
 			)
 				return { ok: false, code: "identity_mismatch", detachedPath: detached.detachedPath };
-			return bindings.exactRemoveDirectoryTree(transitionPath, snapshot, parentIdentity);
+			try {
+				return bindings.exactRemoveDirectoryTree(transitionPath, snapshot, parentIdentity);
+			} catch (error) {
+				// Detach is confirmed, so a transient replay denial can safely leave this
+				// exact receipt resumable once the in-flight attempt returns.
+				if (isTransientReleaseError(error))
+					markLocalRemovalResumable(transitionPath, snapshot.rootDev, snapshot.rootIno);
+				throw error;
+			}
 		}
 		return bindings.exactRemoveDirectoryTree(lockPath, snapshot, parentIdentity, detachOnly);
 	} finally {
@@ -2240,15 +2248,6 @@ async function removeStaleLockForAcquire(
 		// completing the same dead generation, and record the cause so exhaustion
 		// reports *why* a dead owner's lock could not be reaped instead of only
 		// "dead but not reaped".
-		if (isTransientReleaseError(error)) {
-			// A thrown native denial can arrive after detach. No release handle owns
-			// this stale generation, so let a later local acquisition resume its receipt.
-			markLocalRemovalResumable(
-				fileLockRemovalTransitionPath(lockPath),
-				snapshot.identity.rootDev,
-				snapshot.identity.rootIno,
-			);
-		}
 		return {
 			removed: false,
 			failure: {
