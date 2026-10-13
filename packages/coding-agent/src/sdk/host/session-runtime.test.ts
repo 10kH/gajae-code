@@ -8596,7 +8596,10 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			});
 			const accepted = await harness.control("turn.prompt", { text: "capture uncertain end" });
 			expect(accepted.ok).toBe(true);
-			const correlation = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
+			const commandId = accepted.result?.commandId;
+			const turnId = accepted.result?.turnId;
+			if (commandId === undefined || turnId === undefined) throw new Error("Expected prompt correlation");
+			const correlation = { commandId, turnId };
 			await harness.emit("agent_start");
 			await harness.emit("tool_execution_start", {
 				type: "tool_execution_start",
@@ -11708,6 +11711,7 @@ test.each([
 ])("SDK-only queued terminal recovery permits replacement after EIO (early shutdown=%s)", async earlyShutdown => {
 	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-terminal-recovery-"));
 	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
+	const recoveryRetired = Promise.withResolvers<SdkOnlyDeadlineRecoveryCheckpoint>();
 	let transport = memoryTransport();
 	const sessionId = transport.sessionId;
 	const sessionFile = path.join(cwd, `${sessionId}.json`);
@@ -11753,6 +11757,9 @@ test.each([
 			getActivePromptHandle: () => "unrelated-handle",
 			cancelPendingPreflightForTerminalAbort: () => {},
 			abortPromptAndWaitWithTerminal: async () => ({ status: "settled", terminalScope: {} }),
+			onDeadlineRecoveryCheckpointForTests: checkpoint => {
+				if (checkpoint.stage === "deadline-recovery-retired") recoveryRetired.resolve(checkpoint);
+			},
 		},
 	});
 	const ctx = { ...extensionContext(sessionId, cwd), isIdle: () => true } as unknown as ExtensionContext;
@@ -11794,7 +11801,7 @@ test.each([
 		expect(accepted.ok).toBe(true);
 		commandId = accepted.result?.commandId;
 		const turnId = accepted.result?.turnId;
-		expect(commandId).toBeDefined();
+		if (commandId === undefined || turnId === undefined) throw new Error("Expected queued prompt correlation");
 		await waitFor(() => queued && queueSignal !== undefined, "queued admission");
 		expect(await request({ type: "control_request", operation: "turn.abort", input: {} })).toMatchObject({
 			ok: true,
@@ -11819,6 +11826,8 @@ test.each([
 			status: "failed",
 			error: { code: "cancelled" },
 		});
+		const retired = await recoveryRetired.promise;
+		expect(retired.correlation).toEqual({ commandId, turnId });
 		if (!earlyShutdown) await handlers.get("session_shutdown")?.({}, ctx);
 		await handlers.get("session_start")?.({}, ctx);
 		expect(creations).toBe(2);

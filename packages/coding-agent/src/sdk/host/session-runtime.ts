@@ -496,7 +496,8 @@ export interface SdkOnlyDeadlineRecoveryCheckpoint {
 		| "note-transition-finalization-ready"
 		| "note-transition-before-persist"
 		| "note-transition-persisted"
-		| "note-transition-persist-failed";
+		| "note-transition-persist-failed"
+		| "deadline-recovery-retired";
 	correlation: InvocationCorrelation;
 	result?: "settled" | "uncertain" | "published" | "not-published" | "rejected";
 	reason?: string;
@@ -6948,9 +6949,15 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			onExpired: correlation => {
 				retireAcceptedQueueCancellation(acceptedQueueCancellations, correlation, true);
 				const owner = lifecycleOwnerHolder.state;
-				if (!owner) return;
-				removeLifecycleReferences(owner, correlation);
-				maybeRetireLifecycleOwner(owner);
+				if (owner) {
+					removeLifecycleReferences(owner, correlation);
+					maybeRetireLifecycleOwner(owner);
+				}
+				recordDeadlineRecoveryCheckpoint({
+					stage: "deadline-recovery-retired",
+					correlation,
+					terminalCommitted: true,
+				});
 			},
 		});
 		const pending: Array<{
