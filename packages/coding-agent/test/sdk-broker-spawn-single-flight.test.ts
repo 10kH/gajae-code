@@ -1070,7 +1070,7 @@ it("the spawn lock rejects an incomplete published owner instead of acquiring ov
 	try {
 		await fs.mkdir(path.join(dir, "sdk", "broker.spawn.lock"), { recursive: true });
 		await expect(acquireSpawnLockForTest(dir, { retries: 1, retryDelayMs: 1 })).rejects.toThrow(
-			"held by an unrecognized owner record",
+			"held by an ownerless empty lock directory",
 		);
 		expect(await fs.readdir(path.join(dir, "sdk", "broker.spawn.lock"))).toEqual([]);
 	} finally {
