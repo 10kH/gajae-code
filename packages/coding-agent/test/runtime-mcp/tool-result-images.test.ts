@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import type { ImageContent, Model, ToolResultMessage } from "@gajae-code/ai/core";
+import type { AssistantMessage, ImageContent, Model, ToolResultMessage } from "@gajae-code/ai/core";
+import { convertAnthropicMessages } from "@gajae-code/ai/providers/anthropic";
 import { appendResponsesToolResultMessages } from "@gajae-code/ai/providers/openai-responses-shared";
 import { NON_VISION_IMAGE_PLACEHOLDER } from "@gajae-code/ai/providers/vision-guard";
 import { Text } from "@gajae-code/tui";
@@ -331,6 +332,81 @@ describe("MCP tool-result images", () => {
 			sessionUpdate: "tool_call_update",
 			content: result.content.map(content => ({ type: "content", content })),
 		});
+	});
+
+	it("keeps untrusted image guidance adjacent through Anthropic tool-result mapping", async () => {
+		const result = await executeResult({ content: [PNG] });
+		for (const supportsImages of [false, true]) {
+			const model: Model<"anthropic-messages"> = {
+				id: "fixture",
+				name: "fixture",
+				api: "anthropic-messages",
+				provider: "anthropic",
+				baseUrl: "https://example.com",
+				reasoning: false,
+				input: supportsImages ? ["text", "image"] : ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 128_000,
+				maxTokens: 8192,
+			};
+			const assistant: AssistantMessage = {
+				role: "assistant",
+				content: [{ type: "toolCall", id: "call-1", name: "mcp__fixture_screenshot", arguments: {} }],
+				api: model.api,
+				provider: model.provider,
+				model: model.id,
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "toolUse",
+				timestamp: 2,
+			};
+			const toolResult: ToolResultMessage = {
+				role: "toolResult",
+				toolCallId: "call-1",
+				toolName: "mcp__fixture_screenshot",
+				content: result.content,
+				isError: false,
+				timestamp: 3,
+			};
+			const messages = convertAnthropicMessages(
+				[{ role: "user", content: "Inspect this MCP image", timestamp: 1 }, assistant, toolResult],
+				model,
+				false,
+			);
+			if (supportsImages) {
+				expect(messages.at(-1)).toMatchObject({
+					role: "user",
+					content: [
+						{
+							type: "tool_result",
+							content: [
+								{ type: "text", text: expectedText("[Image: image/png]", true) },
+								{
+									type: "image",
+									source: { type: "base64", media_type: "image/png", data: PNG.data },
+								},
+							],
+						},
+					],
+				});
+			} else {
+				expect(messages.at(-1)).toMatchObject({
+					role: "user",
+					content: [
+						{
+							type: "tool_result",
+							content: `${expectedText("[Image: image/png]", true)}\n${NON_VISION_IMAGE_PLACEHOLDER}`,
+						},
+					],
+				});
+			}
+		}
 	});
 
 	for (const supportsImages of [false, true]) {
