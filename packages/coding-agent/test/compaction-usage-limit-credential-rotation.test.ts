@@ -314,6 +314,12 @@ describe("auto-compaction usage limit rotates the session credential", () => {
 				"openai-codex",
 				"codex-dup-secret",
 			);
+			const duplicateRowId = duplicateRowIds[0];
+			if (duplicateRowId === undefined) throw new Error("expected a duplicate credential row");
+			const initialApiKey = await authStorage.getApiKey("openai-codex", session.credentialSessionId, {
+				credentialSelector: { kind: "id", value: String(duplicateRowId) },
+			});
+			expect(initialApiKey).toBe("codex-dup-secret");
 			const uniqueRowIds = await authStorage.getCredentialRowIdsMatchingApiKey("openai-codex", "codex-key-3");
 			const uniqueRowId = uniqueRowIds[0];
 			if (uniqueRowId === undefined) throw new Error("expected a distinct third credential row");
