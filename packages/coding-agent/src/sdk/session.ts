@@ -1314,8 +1314,13 @@ function classifyInheritedMcpToolNames(
 	for (const tool of tools) {
 		const serverName = tool.mcpServerName;
 		if (serverName === undefined) continue;
-		if (pluginServers?.has(serverName)) pluginMcpToolNames.push(tool.name);
-		else if (conventionalServers?.has(serverName)) conventionalMcpToolNames.push(tool.name);
+		const source = manager.getSource(serverName);
+		// A caller-owned manager needs concrete bundle provenance, not just a
+		// provider label. Owned managers keep their validated catalog authority.
+		const callerBundle = pluginServers === undefined && source?.provider === "gjc-plugins" && Boolean(source.path);
+		if (pluginServers?.has(serverName) || (callerBundle && survivingPluginMcpToolNames([tool]).length > 0)) {
+			pluginMcpToolNames.push(tool.name);
+		} else if (conventionalServers?.has(serverName)) conventionalMcpToolNames.push(tool.name);
 	}
 	return { pluginMcpToolNames, conventionalMcpToolNames };
 }
@@ -2821,7 +2826,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							if (serverName === undefined) continue;
 							if (!pluginNames.has(serverName)) conventionalMcpToolNames.push(tool.name);
 						}
-						pluginMcpToolNames.push(...survivingPluginMcpToolNames(result.tools as CustomTool[]));
+						pluginMcpToolNames.push(
+							...retainPluginMcpMandatoryNames(
+								result.tools,
+								result.tools
+									.filter(tool => tool.mcpServerName && pluginNames.has(tool.mcpServerName))
+									.map(tool => tool.name),
+							),
+						);
 					}
 				} catch (error) {
 					logger.warn("Failed to recreate MCP authority after session rescope", {
@@ -4926,7 +4938,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 		// Mandatory names follow the plugin tools that survived registration.
 		// A colliding user tool keeps the normalized name and must stay selectable.
-		pluginMcpToolNames.splice(0, pluginMcpToolNames.length, ...survivingPluginMcpToolNames(customTools));
+		pluginMcpToolNames.splice(
+			0,
+			pluginMcpToolNames.length,
+			...retainPluginMcpMandatoryNames(customTools, pluginMcpToolNames),
+		);
 		const mandatoryMCPToolNameSet = new Set(pluginMcpToolNames);
 		const selectableExplicitMCPToolNames = explicitlyRequestedMCPToolNames.filter(
 			name => !mandatoryMCPToolNameSet.has(name),
@@ -5753,7 +5769,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						const previousNames = ownedMcpManagerToolNames;
 						const nextToolNames = nextTools.map(tool => tool.name);
 						const previousSet = new Set(previousNames);
-						const nextPluginToolNames = survivingPluginMcpToolNames(nextTools);
+						const nextPluginToolNames = retainPluginMcpMandatoryNames(
+							nextTools,
+							nextTools
+								.filter(tool => tool.mcpServerName && pluginServerNames.has(tool.mcpServerName))
+								.map(tool => tool.name),
+						);
 						const nextConventionalToolNames = nextTools
 							.filter(tool => tool.mcpServerName && conventionalServerNames.has(tool.mcpServerName))
 							.map(tool => tool.name);
@@ -5873,7 +5894,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						const previousNames = inheritedMcpManagerToolNames;
 						const nextNames = snapshot.map(tool => tool.name);
 						const classifiedTools = classifyInheritedMcpToolNames(manager, snapshot);
-						const mandatoryPluginToolNames = survivingPluginMcpToolNames(snapshot);
+						const mandatoryPluginToolNames = retainPluginMcpMandatoryNames(
+							snapshot,
+							classifiedTools.pluginMcpToolNames,
+						);
 						try {
 							await session.replaceNamedCustomTools(previousNames, snapshot, {
 								mandatoryMCPToolNames: mandatoryPluginToolNames,
