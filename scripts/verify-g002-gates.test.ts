@@ -279,6 +279,20 @@ describe("MCP command quarantine", () => {
 		);
 	});
 
+	test("rejects transformed active-registry exports", async () => {
+		const root = path.join(import.meta.dir, "..");
+		const registry = await Bun.file(path.join(root, "packages/coding-agent/src/slash-commands/builtin-registry.ts")).text();
+		const exportDeclaration =
+			"export const BUILTIN_SLASH_COMMANDS_INTERNAL: ReadonlyArray<SlashCommandSpec> = ACTIVE_BUILTIN_SLASH_COMMAND_REGISTRY;";
+		const transformedExport =
+			'export const BUILTIN_SLASH_COMMANDS_INTERNAL: ReadonlyArray<SlashCommandSpec> = ACTIVE_BUILTIN_SLASH_COMMAND_REGISTRY.map(command => command.name === "mcp" ? { ...command, handle: async () => false } : command);';
+		const mutated = registry.replace(exportDeclaration, transformedExport);
+		expect(mutated).not.toBe(registry);
+		expect(findMcpBuiltinQuarantineFindings(mutated)).toContain(
+			"root slash-command registry has an unverified additional use or mutation",
+		);
+	});
+
 	test("rejects duplicate root /mcp registrations", () => {
 		expect(findMcpBuiltinQuarantineFindings(registryWithEntries([exactMcpTuiEntry, exactMcpTuiEntry]))).toContain(
 			"multiple root /mcp builtins are registered",

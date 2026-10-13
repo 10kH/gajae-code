@@ -604,25 +604,171 @@ function isActiveMcpRegistryFilterReference(identifierPath: NodePath<Babel.Ident
 	return isStaticMcpFilterExpression(callback.body, callback.params[0].name);
 }
 
+function isSafeMcpLookupSet(
+	statement: Babel.Statement,
+	key: { name: string; member?: string },
+	commandName: string,
+): boolean {
+	if (statement.type !== "ExpressionStatement" || statement.expression.type !== "CallExpression") return false;
+	const call = statement.expression;
+	if (
+		call.optional ||
+		!isMcpFilterMember(call.callee, "BUILTIN_SLASH_COMMAND_LOOKUP", "set") ||
+		call.arguments.length !== 2
+	) {
+		return false;
+	}
+	const keyArgument = call.arguments[0];
+	const commandArgument = call.arguments[1];
+	return (
+		keyArgument !== undefined &&
+		keyArgument.type !== "SpreadElement" &&
+		keyArgument.type !== "ArgumentPlaceholder" &&
+		(key.member
+			? keyArgument.type === "MemberExpression" &&
+				!keyArgument.computed &&
+				keyArgument.object.type === "Identifier" &&
+				keyArgument.object.name === key.name &&
+				keyArgument.property.type === "Identifier" &&
+				keyArgument.property.name === key.member
+			: keyArgument.type === "Identifier" && keyArgument.name === key.name) &&
+		commandArgument?.type === "Identifier" &&
+		commandArgument.name === commandName
+	);
+}
+
+function isSafeMcpLookupLoop(statement: Babel.ForOfStatement): boolean {
+	if (
+		statement.await ||
+		statement.right.type !== "Identifier" ||
+		statement.right.name !== "ACTIVE_BUILTIN_SLASH_COMMAND_REGISTRY" ||
+		statement.left.type !== "VariableDeclaration" ||
+		statement.left.kind !== "const" ||
+		statement.left.declarations.length !== 1 ||
+		statement.left.declarations[0]?.id.type !== "Identifier" ||
+		statement.left.declarations[0].id.name !== "command" ||
+		statement.body.type !== "BlockStatement" ||
+		statement.body.body.length !== 2
+	) {
+		return false;
+	}
+	const [commandLookup, aliasLoop] = statement.body.body;
+	return (
+		commandLookup !== undefined &&
+		isSafeMcpLookupSet(commandLookup, { name: "command", member: "name" }, "command") &&
+		aliasLoop?.type === "ForOfStatement" &&
+		!aliasLoop.await &&
+		aliasLoop.left.type === "VariableDeclaration" &&
+		aliasLoop.left.kind === "const" &&
+		aliasLoop.left.declarations.length === 1 &&
+		aliasLoop.left.declarations[0]?.id.type === "Identifier" &&
+		aliasLoop.left.declarations[0].id.name === "alias" &&
+		aliasLoop.right.type === "LogicalExpression" &&
+		aliasLoop.right.operator === "??" &&
+		hasMcpMemberAccessChain(aliasLoop.right.left, "command", ["aliases"]) &&
+		aliasLoop.right.right.type === "ArrayExpression" &&
+		aliasLoop.right.right.elements.length === 0 &&
+		aliasLoop.body.type === "BlockStatement" &&
+		aliasLoop.body.body.length === 1 &&
+		isSafeMcpLookupSet(aliasLoop.body.body[0]!, { name: "alias" }, "command")
+	);
+}
+
+function isSafeMcpMetadataMapReference(identifierPath: NodePath<Babel.Identifier>): boolean {
+	const memberPath = identifierPath.parentPath;
+	if (
+		!memberPath?.isMemberExpression() ||
+		memberPath.node.object !== identifierPath.node ||
+		memberPath.node.computed ||
+		memberPath.node.property.type !== "Identifier" ||
+		memberPath.node.property.name !== "map"
+	) {
+		return false;
+	}
+	const callPath = memberPath.parentPath;
+	if (
+		!callPath?.isCallExpression() ||
+		callPath.node.callee !== memberPath.node ||
+		callPath.node.optional ||
+		callPath.node.arguments.length !== 1
+	) {
+		return false;
+	}
+	const callback = callPath.node.arguments[0];
+	const callbackParameter = callback?.type === "ArrowFunctionExpression" ? callback.params[0] : undefined;
+	if (
+		callback?.type !== "ArrowFunctionExpression" ||
+		callback.async ||
+		callback.generator ||
+		callback.params.length !== 1 ||
+		callbackParameter?.type !== "Identifier" ||
+		callback.body.type !== "ObjectExpression"
+	) {
+		return false;
+	}
+	const expectedProperties = ["name", "description", "subcommands", "inlineHint", "priority"];
+	return (
+		callback.body.properties.length === expectedProperties.length &&
+		callback.body.properties.every((property, index) => {
+			const expectedProperty = expectedProperties[index];
+			return (
+				property.type === "ObjectProperty" &&
+				!property.computed &&
+				!property.shorthand &&
+				getStaticMcpMemberName(property) === expectedProperty &&
+				property.value.type === "MemberExpression" &&
+				!property.value.computed &&
+				property.value.object.type === "Identifier" &&
+				property.value.object.name === callbackParameter.name &&
+				property.value.property.type === "Identifier" &&
+				property.value.property.name === expectedProperty
+			);
+		})
+	);
+}
+
 function hasOnlyExpectedActiveMcpRegistryUse(program: Babel.File): boolean {
 	let hasActiveRegistryDeclaration = false;
 	let referenceCount = 0;
+	let lookupReferences = 0;
+	let metadataReferences = 0;
+	let exportReferences = 0;
+	let hasUnverifiedReference = false;
 	traverse(program, {
 		Identifier(identifierPath) {
 			if (identifierPath.node.name !== "ACTIVE_BUILTIN_SLASH_COMMAND_REGISTRY") return;
-			if (
-				identifierPath.parentPath?.isVariableDeclarator() &&
-				identifierPath.parentPath.node.id === identifierPath.node
-			) {
+			const parentPath = identifierPath.parentPath;
+			if (parentPath?.isVariableDeclarator() && parentPath.node.id === identifierPath.node) {
 				hasActiveRegistryDeclaration = true;
 				return;
 			}
-			referenceCount++;
+		referenceCount++;
+			if (parentPath?.isForOfStatement() && parentPath.node.right === identifierPath.node) {
+				if (isSafeMcpLookupLoop(parentPath.node)) lookupReferences++;
+				else hasUnverifiedReference = true;
+				return;
+			}
+			if (
+				parentPath?.isVariableDeclarator() &&
+				parentPath.node.init === identifierPath.node &&
+				parentPath.node.id.type === "Identifier" &&
+				parentPath.node.id.name === "BUILTIN_SLASH_COMMANDS_INTERNAL" &&
+				parentPath.parentPath?.parentPath?.isExportNamedDeclaration()
+			) {
+				exportReferences++;
+				return;
+			}
+			if (isSafeMcpMetadataMapReference(identifierPath)) metadataReferences++;
+			else hasUnverifiedReference = true;
 		},
 	});
 	if (!hasActiveRegistryDeclaration) return referenceCount === 0;
-	// The active alias is shared by the lookup, metadata, and internal ACP export; reject any fourth use.
-	return referenceCount === 3;
+	return (
+		!hasUnverifiedReference &&
+		lookupReferences === 1 &&
+		metadataReferences === 1 &&
+		exportReferences === 1
+	);
 }
 
 function hasOnlyExpectedMcpRegistryUse(
@@ -750,11 +896,20 @@ export function findMcpTuiMetadataFindings(slashCommandsSource: string, interact
 		/export function getBuiltinSlashCommandsForSession\s*\(\s*hasExactMcpControls:\s*boolean\s*\)\s*:\s*typeof BUILTIN_SLASH_COMMANDS\s*\{\s*if\s*\(\s*hasExactMcpControls\s*\)\s*return\s+BUILTIN_SLASH_COMMANDS\s*;\s*return\s+BUILTIN_SLASH_COMMANDS\.filter\(\s*command\s*=>\s*command\.name\s*!==\s*["']mcp["']\s*\)\s*;\s*\}/u.test(
 			slashCommandsSource,
 		);
-	const sessionCapabilityUsed =
-		/const\s+sessionBuiltinSlashCommands\s*=\s*getBuiltinSlashCommandsForSession\(\s*this\.session\.hasExactMcpControls\s*\)\s*;/u.test(
+	const sessionVisibilityInitialized =
+		/this\.#sessionBuiltinMcpVisible\s*=\s*this\.session\.hasExactMcpControls\s*;\s*const\s+sessionBuiltinSlashCommands\s*=\s*getBuiltinSlashCommandsForSession\(\s*this\.#sessionBuiltinMcpVisible\s*\)\s*;[\s\S]*?this\.#baseSlashCommands\s*=\s*\[\s*\.\.\.sessionBuiltinSlashCommands\s*,/u.test(
 			interactiveModeSource,
-		) &&
-		/this\.#baseSlashCommands\s*=\s*\[\s*\.\.\.sessionBuiltinSlashCommands\s*,/u.test(interactiveModeSource);
+		);
+	const sessionVisibilityRefreshHelper =
+		/#refreshSessionBuiltinSlashCommandVisibility\s*\(\s*cwd:\s*string\s*\)\s*:\s*void\s*\{[\s\S]*?const\s+hasExactMcpControls\s*=\s*this\.session\.hasExactMcpControls\s*;[\s\S]*?getBuiltinSlashCommandsForSession\(\s*hasExactMcpControls\s*\)[\s\S]*?this\.#sessionBuiltinMcpVisible\s*=\s*hasExactMcpControls\s*;[\s\S]*?setAutocompleteProvider\s*\(/u.test(
+			interactiveModeSource,
+		);
+	const sessionVisibilityRefreshCalled =
+		/async\s+refreshSlashCommandState\s*\(\s*cwd\?:\s*string\s*\)\s*:\s*Promise<void>\s*\{[\s\S]*?this\.#refreshSessionBuiltinSlashCommandVisibility\(basePath\);[\s\S]*?await\s+loadSlashCommands\(\{\s*cwd:\s*basePath\s*\}\);[\s\S]*?this\.#refreshSessionBuiltinSlashCommandVisibility\(basePath\);/u.test(
+			interactiveModeSource,
+		);
+	const sessionCapabilityUsed =
+		sessionVisibilityInitialized && sessionVisibilityRefreshHelper && sessionVisibilityRefreshCalled;
 	return metadataFilter && sessionCapabilityUsed
 		? []
 		: ["ordinary TUI /mcp metadata is not filtered by the exact MCP capability"];

@@ -3228,7 +3228,6 @@ export class SelectorController {
 							return;
 						}
 						selectedText = result.selectedText;
-						await this.ctx.refreshSlashCommandState();
 					} catch (error) {
 						if (this.ctx.isStopped?.()) return;
 						const committed =
@@ -3241,6 +3240,16 @@ export class SelectorController {
 						// The successor is already durable. Never describe this as a
 						// cancelled transition or roll it back to the parent's UI.
 						branchFailure = error;
+					}
+					if (
+						this.ctx.sessionManager.getSessionId() !== openedSessionId ||
+						this.ctx.sessionManager.getSessionFile() !== openedSessionFile
+					) {
+						try {
+							await this.ctx.refreshSlashCommandState();
+						} catch (error) {
+							branchFailure ??= error;
+						}
 					}
 
 					try {

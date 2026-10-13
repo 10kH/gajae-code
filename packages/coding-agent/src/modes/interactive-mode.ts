@@ -477,6 +477,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#baseSlashCommands: SlashCommand[] = [];
 	#resolvedSlashCommands: SlashCommand[] = [];
 	#baseReservedSlashCommandNames: Set<string> = new Set();
+	#sessionBuiltinMcpVisible = false;
 	#cleanupUnsubscribe?: () => void;
 	#itermPetTransport?: ItermPetTransport;
 
@@ -775,7 +776,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.hideThinkingBlock = settings.get("hideThinkingBlock");
 
 		const builtinCommandNames = new Set(BUILTIN_SLASH_COMMANDS.map(c => c.name));
-		const sessionBuiltinSlashCommands = getBuiltinSlashCommandsForSession(this.session.hasExactMcpControls);
+		this.#sessionBuiltinMcpVisible = this.session.hasExactMcpControls;
+		const sessionBuiltinSlashCommands = getBuiltinSlashCommandsForSession(this.#sessionBuiltinMcpVisible);
 		const activeProvider = this.session.model?.provider;
 		const hookCommands: SlashCommand[] = (
 			this.session.extensionRunner?.getRegisteredCommands(builtinCommandNames) ?? []
@@ -1231,14 +1233,10 @@ export class InteractiveMode implements InteractiveModeContext {
 	async refreshSlashCommandState(cwd?: string): Promise<void> {
 		if (this.#stopped) return;
 		const basePath = cwd ?? this.sessionManager.getCwd();
+		this.#refreshSessionBuiltinSlashCommandVisibility(basePath);
 		const fileCommands = await loadSlashCommands({ cwd: basePath });
 		if (this.#stopped) return;
-		const builtinCommandNames = new Set(BUILTIN_SLASH_COMMANDS.map(command => command.name));
-		const sessionBuiltinSlashCommands = getBuiltinSlashCommandsForSession(this.session.hasExactMcpControls);
-		this.#baseSlashCommands = [
-			...sessionBuiltinSlashCommands,
-			...this.#baseSlashCommands.filter(command => !builtinCommandNames.has(command.name)),
-		];
+		this.#refreshSessionBuiltinSlashCommandVisibility(basePath);
 		const fileCommandNames = new Set(fileCommands.map(cmd => cmd.name));
 		this.fileSlashCommands = fileCommandNames;
 		const fileSlashCommands: SlashCommand[] = fileCommands.map(cmd => ({
@@ -1253,6 +1251,23 @@ export class InteractiveMode implements InteractiveModeContext {
 		);
 		this.editor.setAutocompleteProvider(autocompleteProvider);
 		this.session.setSlashCommands(fileCommands);
+	}
+
+	#refreshSessionBuiltinSlashCommandVisibility(cwd: string): void {
+		const hasExactMcpControls = this.session.hasExactMcpControls;
+		if (hasExactMcpControls === this.#sessionBuiltinMcpVisible) return;
+
+		const previousSlashCommandTail = this.#resolvedSlashCommands.slice(this.#baseSlashCommands.length);
+		const builtinCommandNames = new Set(BUILTIN_SLASH_COMMANDS.map(command => command.name));
+		this.#baseSlashCommands = [
+			...getBuiltinSlashCommandsForSession(hasExactMcpControls),
+			...this.#baseSlashCommands.filter(command => !builtinCommandNames.has(command.name)),
+		];
+		this.#sessionBuiltinMcpVisible = hasExactMcpControls;
+		this.#resolvedSlashCommands = [...this.#baseSlashCommands, ...previousSlashCommandTail];
+		this.editor.setAutocompleteProvider(
+			this.#inputController.createAutocompleteProvider(this.#resolvedSlashCommands, cwd),
+		);
 	}
 
 	#rebuildSkillSlashCommands(fileCommandNames: ReadonlySet<string> = new Set()): SlashCommand[] {
