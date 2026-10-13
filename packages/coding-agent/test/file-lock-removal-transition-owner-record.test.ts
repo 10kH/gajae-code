@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { exactRemoveDirectoryTree, snapshotDirectoryTree } from "@gajae-code/natives";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
-import { acquireFileLock, type FileLockOwnerToken, FileLockTestHooks } from "../src/config/file-lock";
+import { acquireFileLock, type FileLockOwnerToken, FileLockTestHooks, withFileLock } from "../src/config/file-lock";
 
 const roots: string[] = [];
 type ControlledReleaseRetry = {
@@ -237,6 +237,62 @@ test("a foreign remover is never probed or displaced using local pid evidence", 
 		orphanPath: transition,
 	});
 	expect(await Bun.file(path.join(transition, "payload")).text()).toBe("foreign payload");
+});
+
+test.each([
+	["host-qualified", "local-host"],
+	["unqualified", undefined],
+] as const)("%s successor retries release behind a foreign sidecar-only remover without changing its owner", async (_name, ownerHostId) => {
+	const { file, lock, transition } = await fixture();
+	const foreignOwner: FileLockOwnerToken = {
+		pid: 2147483646,
+		timestamp: Date.now(),
+		owner_token: "foreign-remover",
+		owner_host_id: "foreign-host",
+	};
+	const recordPath = `${transition}.owner`;
+	const foreignRecord = JSON.stringify({ owner: foreignOwner, rootDev: "0", rootIno: "0" });
+	await Bun.write(recordPath, foreignRecord);
+	expect(await fs.exists(transition)).toBe(false);
+
+	let callbackCommitted = false;
+	let releaseTransitionProbes = 0;
+	let foreignRecordWasUntouched = false;
+	const realLstat = fs.lstat;
+	vi.spyOn(fs, "lstat").mockImplementation((async (target, options) => {
+		if (callbackCommitted && String(target) === transition && ++releaseTransitionProbes === 1) {
+			try {
+				return await realLstat(target, options);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+				foreignRecordWasUntouched = (await Bun.file(recordPath).text()) === foreignRecord;
+				await fs.rm(recordPath);
+				throw error;
+			}
+		}
+		return realLstat(target, options);
+	}) as typeof fs.lstat);
+	const kill = vi.spyOn(process, "kill");
+
+	await expect(
+		withFileLock(
+			file,
+			async () => {
+				await Bun.write(file, "committed successor state");
+				callbackCommitted = true;
+				expect(await Bun.file(recordPath).text()).toBe(foreignRecord);
+				return "successor callback committed";
+			},
+			{ ownerHostId, retries: 2, retryDelayMs: 1 },
+		),
+	).resolves.toBe("successor callback committed");
+
+	expect(foreignRecordWasUntouched).toBe(true);
+	expect(releaseTransitionProbes).toBeGreaterThan(1);
+	expect(kill.mock.calls.filter(([pid]) => pid === foreignOwner.pid)).toHaveLength(0);
+	expect(await Bun.file(file).text()).toBe("committed successor state");
+	expect(await fs.exists(recordPath)).toBe(false);
+	expect(await fs.exists(lock)).toBe(false);
 });
 
 test.each(["local-host", "previous-local-host"])("dead %s remover is adopted on the same installation", async host => {
