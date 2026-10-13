@@ -305,8 +305,9 @@ function tokenize(command: string): TokenizeResult {
 				const previousHereDocument = activeHereDocuments.get(descriptorKey);
 				previousHereDocument?.activeDescriptors.delete(descriptor);
 				activeHereDocuments.delete(descriptorKey);
-				if (redirectionTargetIsInput && redirectionTargetIsDuplication && /^\d+$/.test(text)) {
-					const sourceDescriptor = Number(text);
+				const duplicatedDescriptor = redirectionTargetIsDuplication ? /^(\d+)$/.exec(text) : undefined;
+				if (redirectionTargetIsInput && duplicatedDescriptor) {
+					const sourceDescriptor = Number(duplicatedDescriptor[1]);
 					const sourceHereDocument = activeHereDocuments.get(`${segment}:${sourceDescriptor}`);
 					if (sourceHereDocument) {
 						sourceHereDocument.activeDescriptors.add(descriptor);
