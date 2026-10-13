@@ -179,14 +179,31 @@ export const FileLockTestHooks: {
 	nativeExactRemovalProbe?: () => boolean | Promise<boolean>;
 } = {};
 
-async function cleanupPendingStagingOrThrow(lockPath: string, stagingPath: string): Promise<void> {
-	try {
-		const cleanup = FileLockTestHooks.cleanupPendingStaging;
-		if (cleanup) await cleanup(stagingPath);
-		else await fs.rm(stagingPath, { recursive: true, force: true });
-	} catch (error) {
-		throw new FileLockStagingCleanupError(lockPath, stagingPath, error);
+async function cleanupPendingStagingOrThrow(
+	lockPath: string,
+	stagingPath: string,
+	retryAttempts: number,
+	retryDelayMs: number,
+): Promise<void> {
+	for (let attempt = 0; attempt < retryAttempts; attempt++) {
+		try {
+			const cleanup = FileLockTestHooks.cleanupPendingStaging;
+			if (cleanup) await cleanup(stagingPath);
+			else await fs.rm(stagingPath, { recursive: true, force: true });
+			return;
+		} catch (error) {
+			if (!isTransientReleaseError(error) || attempt + 1 === retryAttempts)
+				throw new FileLockStagingCleanupError(lockPath, stagingPath, error);
+			// An open child can deny both publication and removal on Windows. Keep the
+			// same staging identity while cleanup retries within the acquisition budget.
+			await Bun.sleep(retryDelayMs);
+		}
 	}
+	throw new FileLockStagingCleanupError(
+		lockPath,
+		stagingPath,
+		new Error("No staging cleanup attempts were available."),
+	);
 }
 
 /**
@@ -2110,7 +2127,9 @@ async function tryAcquireLock(
 	orphanTransitionAgeMs: number,
 	previousOwnerHostIds: readonly string[],
 	ownerToken = crypto.randomUUID(),
-	onAcquired?: () => void,
+	onAcquired: (() => void) | undefined,
+	stagingCleanupRetries: number,
+	stagingCleanupRetryDelayMs: number,
 ): Promise<FileLockAcquisitionResult> {
 	await ensureLockParent(path.dirname(lockPath));
 	const afterParentMkdir = FileLockTestHooks.afterParentMkdir;
@@ -2237,7 +2256,12 @@ async function tryAcquireLock(
 				return null;
 			} else if (fallbackFailureCode) {
 				removePending = false;
-				await cleanupPendingStagingOrThrow(lockPath, pendingPath);
+				await cleanupPendingStagingOrThrow(
+					lockPath,
+					pendingPath,
+					stagingCleanupRetries,
+					stagingCleanupRetryDelayMs,
+				);
 				return { kind: "publication_retry", code: fallbackFailureCode };
 			} else {
 				const failure = new Error(
@@ -2254,7 +2278,12 @@ async function tryAcquireLock(
 			const publicationFailureCode = preMutationPublicationFailureCode(published);
 			if (publicationFailureCode) {
 				removePending = false;
-				await cleanupPendingStagingOrThrow(lockPath, pendingPath);
+				await cleanupPendingStagingOrThrow(
+					lockPath,
+					pendingPath,
+					stagingCleanupRetries,
+					stagingCleanupRetryDelayMs,
+				);
 				return { kind: "publication_retry", code: publicationFailureCode };
 			}
 			const failure = new Error(
@@ -2713,6 +2742,8 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 			opts.previousOwnerHostIds ?? [],
 			ownerToken,
 			opts.onAcquired,
+			opts.retries,
+			opts.retryDelayMs,
 		);
 		if (isFileLockOrphanTransition(result))
 			throw new FileLockAcquireError(

@@ -616,6 +616,54 @@ test("keeps the staging component within filesystem limits for long target names
 	expect(stagingComponentLength).toBeLessThanOrEqual(legacyComponentLength);
 });
 
+test("retries access-denied publication after transient open-child staging cleanup refusal", async () => {
+	const { root, file, lock } = await makeFixture();
+	let publicationAttempts = 0;
+	let cleanupAttempts = 0;
+	let infoHandle: fs.FileHandle | undefined;
+	const stagedPaths: string[] = [];
+	const cleanupPaths: string[] = [];
+	FileLockTestHooks.nativePublicationBindings = () => ({
+		renameNoReplacePathAsync: async (source, destination) => {
+			publicationAttempts++;
+			stagedPaths.push(source);
+			if (publicationAttempts === 1) infoHandle = await fs.open(path.join(source, "info"), "r");
+			if (publicationAttempts <= expectedBoundedPublicationCalls) return accessDeniedPublication();
+			await fs.rename(source, destination);
+			return successfulPublication(primaryPrimitive ?? "windows_rename_noreplace");
+		},
+		renameDirectoryNoReplacePathAsync,
+	});
+	FileLockTestHooks.cleanupPendingStaging = async stagingPath => {
+		cleanupAttempts++;
+		cleanupPaths.push(stagingPath);
+		if (cleanupAttempts === 1) {
+			const removalError = await fs.rm(stagingPath, { recursive: true, force: true }).then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			await infoHandle?.close();
+			infoHandle = undefined;
+			throw removalError ?? Object.assign(new Error("open child denied staging cleanup"), { code: "EACCES" });
+		}
+		await fs.rm(stagingPath, { recursive: true, force: true });
+	};
+
+	try {
+		await expect(withFileLock(file, async () => "entered", { retries: 3, retryDelayMs: 1 })).resolves.toBe("entered");
+	} finally {
+		await infoHandle?.close();
+	}
+
+	expect(publicationAttempts).toBe(expectedBoundedPublicationCalls + 1);
+	expect(new Set(stagedPaths.slice(0, expectedBoundedPublicationCalls)).size).toBe(1);
+	expect(stagedPaths[expectedBoundedPublicationCalls]).not.toBe(stagedPaths[0]);
+	expect(cleanupAttempts).toBe(2);
+	expect(cleanupPaths).toEqual([stagedPaths[0], stagedPaths[0]]);
+	await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
+	expect(await fs.readdir(root)).toEqual([]);
+});
+
 test("stops retrying when failed publication staging cannot be cleaned", async () => {
 	const { root, file, lock } = await makeFixture();
 	let publicationAttempts = 0;
@@ -638,7 +686,7 @@ test("stops retrying when failed publication staging cannot be cleaned", async (
 		code: "EACCES",
 	});
 	expect(publicationAttempts).toBe(3); // 1 initial + 2 bounded retries
-	expect(cleanupAttempts).toBe(1);
+	expect(cleanupAttempts).toBe(5);
 	expect((await fs.readdir(root)).filter(name => name.includes(".pending."))).toHaveLength(1);
 });
 
