@@ -47,7 +47,7 @@ describe("auto-compaction usage limit rotates the session credential", () => {
 		tempDir.removeSync();
 	});
 
-	function createSession(): AgentSession {
+	function createSession(credentialSessionId?: string): AgentSession {
 		const model = getBundledModel("openai-codex", "gpt-5.4-mini");
 		if (!model) throw new Error("Expected bundled test model");
 		const settings = Settings.isolated({
@@ -61,6 +61,7 @@ describe("auto-compaction usage limit rotates the session credential", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings,
 			modelRegistry: new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml")),
+			credentialSessionId,
 		});
 		for (const [userText, assistantText] of [
 			["first question", "first answer"],
@@ -309,17 +310,26 @@ describe("auto-compaction usage limit rotates the session credential", () => {
 				{ type: "api_key", key: "GJC_TEST_COMPACTION_DUP_KEY_B" },
 				{ type: "api_key", key: "codex-key-3" },
 			]);
-			session = createSession();
+			let credentialSessionId: string | undefined;
+			for (let index = 0; index < 100; index++) {
+				const candidate = `duplicate-key-session-${index}`;
+				if (Bun.hash.xxHash32(candidate) % 3 < 2) {
+					credentialSessionId = candidate;
+					break;
+				}
+			}
+			if (credentialSessionId === undefined) throw new Error("expected a session seed selecting a duplicate row");
+			session = createSession(credentialSessionId);
 			const duplicateRowIds = await authStorage.getCredentialRowIdsMatchingApiKey(
 				"openai-codex",
 				"codex-dup-secret",
 			);
-			const duplicateRowId = duplicateRowIds[0];
-			if (duplicateRowId === undefined) throw new Error("expected a duplicate credential row");
-			const initialApiKey = await authStorage.getApiKey("openai-codex", session.credentialSessionId, {
-				credentialSelector: { kind: "id", value: String(duplicateRowId) },
-			});
-			expect(initialApiKey).toBe("codex-dup-secret");
+			const initialCredential = await authStorage.getApiKeyWithCredentialRowId(
+				"openai-codex",
+				session.credentialSessionId,
+			);
+			expect(initialCredential.apiKey).toBe("codex-dup-secret");
+			expect(duplicateRowIds).toContain(initialCredential.credentialRowId);
 			const uniqueRowIds = await authStorage.getCredentialRowIdsMatchingApiKey("openai-codex", "codex-key-3");
 			const uniqueRowId = uniqueRowIds[0];
 			if (uniqueRowId === undefined) throw new Error("expected a distinct third credential row");
