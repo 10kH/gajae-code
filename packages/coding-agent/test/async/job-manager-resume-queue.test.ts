@@ -1,11 +1,27 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { AsyncJobManager, type SubagentRunOutcome } from "@gajae-code/coding-agent/async/job-manager";
 import {
 	bindToolLineage,
+	type LineageBinding,
 	lookupOwnedRegistration,
 	registerOwnedIfLineaged,
+	type TurnRegistrationKey,
+	unbindToolLineage,
 	unregisterOwnedRegistration,
 } from "@gajae-code/coding-agent/session/terminal-abort";
+
+const testToolLineages: Array<{ toolCallId: string; endpointId?: string }> = [];
+const testOwnedRegistrations: TurnRegistrationKey[] = [];
+
+afterEach(() => {
+	for (const { toolCallId, endpointId } of testToolLineages.splice(0)) unbindToolLineage(toolCallId, endpointId);
+	for (const registration of testOwnedRegistrations.splice(0)) unregisterOwnedRegistration(registration);
+});
+
+function bindTestToolLineage(toolCallId: string, binding: LineageBinding): void {
+	bindToolLineage(toolCallId, binding);
+	testToolLineages.push({ toolCallId, endpointId: binding.endpointId });
+}
 
 /** Build a manager that records every delivered completion. */
 function makeManager(opts?: { maxRunningJobs?: number; retentionMs?: number }) {
@@ -76,6 +92,12 @@ function installResumeRunner(manager: AsyncJobManager) {
 			);
 			// Resolve lineage at admission while storing ownership under the manager's current endpoint.
 			registerOwnedIfLineaged(manager, resumeToolCallId, jobId, admissionEndpointId, ownedRegistrationEndpointId);
+			const generation = manager.getJob(jobId)?.generation;
+			const registrationEndpoint = ownedRegistrationEndpointId ?? admissionEndpointId;
+			if (generation) {
+				const registration = lookupOwnedRegistration(jobId, generation, registrationEndpoint);
+				if (registration) testOwnedRegistrations.push(registration);
+			}
 			return jobId;
 		},
 	);
@@ -513,7 +535,7 @@ describe("AsyncJobManager subagent pause/resume/queue", () => {
 		// Set up a tool lineage for the stale resume
 		const staleToolCallId = "tool-call-stale-123";
 		const managerEndpointId = "endpoint-v1";
-		bindToolLineage(staleToolCallId, {
+		bindTestToolLineage(staleToolCallId, {
 			lineageIdHash: "hash-stale",
 			promptAttemptEpoch: 1,
 			endpointGeneration: 1,
@@ -540,7 +562,7 @@ describe("AsyncJobManager subagent pause/resume/queue", () => {
 		});
 		// Queue the new resume (also with tool call ID)
 		const currentToolCallId = "tool-call-current-456";
-		bindToolLineage(currentToolCallId, {
+		bindTestToolLineage(currentToolCallId, {
 			lineageIdHash: "hash-current",
 			promptAttemptEpoch: 2,
 			endpointGeneration: 1,
@@ -678,7 +700,7 @@ describe("AsyncJobManager subagent pause/resume/queue", () => {
 		// Set up a tool lineage at endpoint E1
 		const staleToolCallId = "tool-call-stale-endpoint-123";
 		const endpointE1 = "endpoint-e1";
-		bindToolLineage(staleToolCallId, {
+		bindTestToolLineage(staleToolCallId, {
 			lineageIdHash: "hash-stale",
 			promptAttemptEpoch: 1,
 			endpointGeneration: 1,
@@ -704,7 +726,7 @@ describe("AsyncJobManager subagent pause/resume/queue", () => {
 		// Queue the new resume (also with tool call ID at E2)
 		const endpointE2 = "endpoint-e2";
 		const currentToolCallId = "tool-call-current-456";
-		bindToolLineage(currentToolCallId, {
+		bindTestToolLineage(currentToolCallId, {
 			lineageIdHash: "hash-current",
 			promptAttemptEpoch: 2,
 			endpointGeneration: 1,
@@ -745,7 +767,7 @@ describe("AsyncJobManager subagent pause/resume/queue", () => {
 		// Queue a resume for A (owner-a); this saves the admission endpoint
 		const toolCallIdA = "tool-call-a-123";
 		const endpointA = "endpoint-a";
-		bindToolLineage(toolCallIdA, {
+		bindTestToolLineage(toolCallIdA, {
 			lineageIdHash: "hash-a",
 			promptAttemptEpoch: 1,
 			endpointGeneration: 1,
@@ -773,7 +795,7 @@ describe("AsyncJobManager subagent pause/resume/queue", () => {
 		// Queue the new resume for B
 		const toolCallIdB = "tool-call-b-456";
 		const endpointB = "endpoint-b";
-		bindToolLineage(toolCallIdB, {
+		bindTestToolLineage(toolCallIdB, {
 			lineageIdHash: "hash-b",
 			promptAttemptEpoch: 2,
 			endpointGeneration: 1,
@@ -822,7 +844,7 @@ describe("AsyncJobManager subagent pause/resume/queue", () => {
 		// Set up a tool lineage at endpoint E1
 		const validToolCallId = "tool-call-valid-e1-123";
 		const endpointE1 = "endpoint-e1-valid";
-		bindToolLineage(validToolCallId, {
+		bindTestToolLineage(validToolCallId, {
 			lineageIdHash: "hash-valid-e1",
 			promptAttemptEpoch: 1,
 			endpointGeneration: 1,
