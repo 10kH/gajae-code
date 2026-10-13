@@ -17,6 +17,23 @@ import {
 // Re-exported so the public surface of this module is unchanged.
 export { isValidEnvName, parseEnvFile, parseShellEnvFile } from "./env-file";
 
+function findClosingBrace(value: string, open: number): number {
+	let depth = 1;
+	for (let index = open + 2; index < value.length; index++) {
+		if (value[index] === "\\") {
+			index++;
+			continue;
+		}
+		if (value[index] === "$" && value[index + 1] === "{") {
+			depth++;
+			index++;
+		} else if (value[index] === "}" && --depth === 0) {
+			return index;
+		}
+	}
+	return -1;
+}
+
 function expandProjectEnvValue(value: string, resolve: (name: string) => string | undefined): string {
 	let result = "";
 	for (let index = 0; index < value.length; index++) {
@@ -33,11 +50,14 @@ function expandProjectEnvValue(value: string, resolve: (name: string) => string 
 
 		let name: string | undefined;
 		let end = index;
+		let fallback: string | undefined;
 		if (value[index + 1] === "{") {
-			const close = value.indexOf("}", index + 2);
-			const candidate = close < 0 ? undefined : value.slice(index + 2, close);
-			if (candidate && /^[A-Za-z_][A-Za-z0-9_]*$/.test(candidate)) {
-				name = candidate;
+			const close = findClosingBrace(value, index);
+			const expression = close < 0 ? undefined : value.slice(index + 2, close);
+			const match = expression && /^([A-Za-z_][A-Za-z0-9_]*)(?::-(.*))?$/.exec(expression);
+			if (match) {
+				name = match[1];
+				fallback = match[2];
 				end = close;
 			}
 		} else {
@@ -51,7 +71,7 @@ function expandProjectEnvValue(value: string, resolve: (name: string) => string 
 			result += "$";
 			continue;
 		}
-		result += resolve(name) ?? "";
+		result += resolve(name) ?? (fallback === undefined ? "" : expandProjectEnvValue(fallback, resolve));
 		index = end;
 	}
 	return result;

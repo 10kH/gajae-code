@@ -151,13 +151,17 @@ if ($env.NODE_TLS_REJECT_UNAUTHORIZED !== "1") {
 
 	it("expands development-layer references for unset and explicit development modes without Bun autoload", () => {
 		const cwd = writeProject({
-			".env.development": `PROJECT_ROOT=/repo\nVIRTUAL_ENV=$PROJECT_ROOT/.venv\nBRACED_ENV=\${PROJECT_ROOT}/bin\nESCAPED_ENV=\\$PROJECT_ROOT\n`,
+			".env.development": `PROJECT_ROOT=/repo\nEMPTY_ENV=\nVIRTUAL_ENV=$PROJECT_ROOT/.venv\nBRACED_ENV=\${PROJECT_ROOT}/bin\nESCAPED_ENV=\\$PROJECT_ROOT\nDEFAULT_ENV=\${PROJECT_MISSING:-fallback}\nEMPTY_DEFAULT=\${EMPTY_ENV:-fallback}\nDEFAULT_REFERENCE=\${PROJECT_MISSING:-$PROJECT_ROOT}\nNESTED_DEFAULT=\${PROJECT_MISSING:-\${PROJECT_ROOT}/fallback}\n`,
 		});
 		const script = `
 import { $env } from ${JSON.stringify(envSourceUrl)};
 if ($env.VIRTUAL_ENV !== "/repo/.venv") throw new Error("unbraced interpolation failed: " + $env.VIRTUAL_ENV);
 if ($env.BRACED_ENV !== "/repo/bin") throw new Error("braced interpolation failed: " + $env.BRACED_ENV);
 if ($env.ESCAPED_ENV !== "$PROJECT_ROOT") throw new Error("escaped interpolation failed: " + $env.ESCAPED_ENV);
+if ($env.DEFAULT_ENV !== "fallback") throw new Error("unset default failed: " + $env.DEFAULT_ENV);
+if ($env.EMPTY_DEFAULT !== "") throw new Error("empty existing value should not use the default: " + $env.EMPTY_DEFAULT);
+if ($env.DEFAULT_REFERENCE !== "/repo") throw new Error("default reference failed: " + $env.DEFAULT_REFERENCE);
+if ($env.NESTED_DEFAULT !== "/repo/fallback") throw new Error("nested default failed: " + $env.NESTED_DEFAULT);
 		`;
 		runIsolated(cwd, script, {}, true);
 		runIsolated(cwd, script, { NODE_ENV: "development" }, true);
