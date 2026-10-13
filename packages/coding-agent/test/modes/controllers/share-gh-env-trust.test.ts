@@ -21,6 +21,16 @@ const TRUST_KEYS = [
 	"HOME",
 	"USERPROFILE",
 	"APPDATA",
+	"HTTP_PROXY",
+	"HTTPS_PROXY",
+	"ALL_PROXY",
+	"NO_PROXY",
+	"http_proxy",
+	"https_proxy",
+	"all_proxy",
+	"no_proxy",
+	"SSL_CERT_FILE",
+	"SSL_CERT_DIR",
 	"GH_HOST_PLANTED",
 	"GH_CONFIG_PLANTED",
 ] as const;
@@ -37,6 +47,16 @@ interface GhSpawn {
 	HOME: string | null;
 	USERPROFILE: string | null;
 	APPDATA: string | null;
+	HTTP_PROXY: string | null;
+	HTTPS_PROXY: string | null;
+	ALL_PROXY: string | null;
+	NO_PROXY: string | null;
+	http_proxy: string | null;
+	https_proxy: string | null;
+	all_proxy: string | null;
+	no_proxy: string | null;
+	SSL_CERT_FILE: string | null;
+	SSL_CERT_DIR: string | null;
 }
 
 const tempDirs: string[] = [];
@@ -77,6 +97,16 @@ appendFileSync(
 		HOME: process.env.HOME ?? null,
 		USERPROFILE: process.env.USERPROFILE ?? null,
 		APPDATA: process.env.APPDATA ?? null,
+		HTTP_PROXY: process.env.HTTP_PROXY ?? null,
+		HTTPS_PROXY: process.env.HTTPS_PROXY ?? null,
+		ALL_PROXY: process.env.ALL_PROXY ?? null,
+		NO_PROXY: process.env.NO_PROXY ?? null,
+		http_proxy: process.env.http_proxy ?? null,
+		https_proxy: process.env.https_proxy ?? null,
+		all_proxy: process.env.all_proxy ?? null,
+		no_proxy: process.env.no_proxy ?? null,
+		SSL_CERT_FILE: process.env.SSL_CERT_FILE ?? null,
+		SSL_CERT_DIR: process.env.SSL_CERT_DIR ?? null,
 	}) + "\\n",
 );
 if (process.argv[2] === "auth") process.exit(0);
@@ -151,6 +181,16 @@ function expectDestination(
 			| "HOME"
 			| "USERPROFILE"
 			| "APPDATA"
+			| "HTTP_PROXY"
+			| "HTTPS_PROXY"
+			| "ALL_PROXY"
+			| "NO_PROXY"
+			| "http_proxy"
+			| "https_proxy"
+			| "all_proxy"
+			| "no_proxy"
+			| "SSL_CERT_FILE"
+			| "SSL_CERT_DIR"
 		>
 	>,
 ): void {
@@ -167,6 +207,16 @@ function expectDestination(
 		expect(spawn.HOME).toBe(expected.HOME ?? null);
 		expect(spawn.USERPROFILE).toBe(expected.USERPROFILE ?? null);
 		expect(spawn.APPDATA).toBe(expected.APPDATA ?? null);
+		expect(spawn.HTTP_PROXY).toBe(expected.HTTP_PROXY ?? null);
+		expect(spawn.HTTPS_PROXY).toBe(expected.HTTPS_PROXY ?? null);
+		expect(spawn.ALL_PROXY).toBe(expected.ALL_PROXY ?? null);
+		expect(spawn.NO_PROXY).toBe(expected.NO_PROXY ?? null);
+		expect(spawn.http_proxy).toBe(expected.http_proxy ?? null);
+		expect(spawn.https_proxy).toBe(expected.https_proxy ?? null);
+		expect(spawn.all_proxy).toBe(expected.all_proxy ?? null);
+		expect(spawn.no_proxy).toBe(expected.no_proxy ?? null);
+		expect(spawn.SSL_CERT_FILE).toBe(expected.SSL_CERT_FILE ?? null);
+		expect(spawn.SSL_CERT_DIR).toBe(expected.SSL_CERT_DIR ?? null);
 	}
 }
 
@@ -206,6 +256,16 @@ describe.skipIf(process.platform === "win32")("share gh destination trust", () =
 		expectDestination(spawns, {});
 	});
 
+	it("omits project dotenv proxy and CA overrides from both gh spawns", async () => {
+		const spawns = await share({
+			autoload: true,
+			dotenv:
+				"HTTPS_PROXY=https://project-proxy.example\\nhttps_proxy=http://project-lower-proxy.example\\n" +
+				"SSL_CERT_FILE=project-ca.pem\\nSSL_CERT_DIR=project-ca-dir\\n",
+		});
+		expectDestination(spawns, {});
+	});
+
 	it("keeps an operator host and config directory the project does not declare", async () => {
 		const spawns = await share({
 			dotenv: "OTHER=1\n",
@@ -227,6 +287,20 @@ describe.skipIf(process.platform === "win32")("share gh destination trust", () =
 			XDG_CONFIG_HOME: "operator-xdg-config",
 			HOME: "operator-home",
 			USERPROFILE: "operator-profile",
+		});
+	});
+
+	it("keeps operator proxy and CA values that differ from project declarations", async () => {
+		const spawns = await share({
+			dotenv: "HTTPS_PROXY=https://project-proxy.example\\nSSL_CERT_FILE=project-ca.pem\\n",
+			env: {
+				HTTPS_PROXY: "https://operator-proxy.example",
+				SSL_CERT_FILE: "/operator/ca.pem",
+			},
+		});
+		expectDestination(spawns, {
+			HTTPS_PROXY: "https://operator-proxy.example",
+			SSL_CERT_FILE: "/operator/ca.pem",
 		});
 	});
 

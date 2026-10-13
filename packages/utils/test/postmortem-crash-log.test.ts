@@ -172,6 +172,28 @@ describe("recordFatalCrash", () => {
 		expect(contents).toContain("«redacted-aws-key»-tail");
 	});
 
+	it("redacts opaque values under generic credential labels", () => {
+		const target = tempCrashLog();
+		const secrets = [
+			"opaque-token-value",
+			"opaque-secret-value",
+			"opaque-credential-value",
+			"opaque-private-key-value",
+			"opaque-cookie-value",
+		];
+		const labels = ["token", "secret", "credential", "private_key", "cookie"];
+		const labeled = labels.map((label, index) => `${label}=${secrets[index]}`).join(" ");
+
+		recordFatalCrash("Uncaught Exception", new Error(`diagnostic safe=keep-this ${labeled}`), {
+			path: target,
+		});
+
+		const contents = fs.readFileSync(target, "utf8");
+		expect(contents).toContain("diagnostic safe=keep-this");
+		for (const secret of secrets) expect(contents).not.toContain(secret);
+		expect(contents).toContain("«redacted»");
+	});
+
 	it("preserves credential lookalikes outside the supported token boundaries", () => {
 		const target = tempCrashLog();
 		const lookalikes = [

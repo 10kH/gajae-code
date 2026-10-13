@@ -96,6 +96,29 @@ describe("debug log credential scrub", () => {
 		expect(sent?.messages?.[0]?.content).toContain(message);
 	});
 
+	it("scrubs opaque generic credential labels from title logs but not the model request", async () => {
+		const model = getModelOrThrow("claude-sonnet-4-5");
+		const completeSimple = vi.spyOn(ai, "completeSimple").mockResolvedValue(titleResponse());
+		const debug = vi.spyOn(logger, "debug");
+		const secrets = [
+			"opaque-token-value",
+			"opaque-secret-value",
+			"opaque-credential-value",
+			"opaque-private-key-value",
+			"opaque-cookie-value",
+		];
+		const labels = ["token", "secret", "credential", "private_key", "cookie"];
+		const message = labels.map((label, index) => `${label}=${secrets[index]}`).join(" ");
+
+		await generateSessionTitle(message, createRegistry(model), createSettings(model));
+
+		const logged = loggedText(debug.mock.calls);
+		for (const secret of secrets) expect(logged).not.toContain(secret);
+		expect(logged.match(/«redacted»/g)).toHaveLength(secrets.length);
+		const sent = completeSimple.mock.calls[0]?.[1] as { messages?: Array<{ content?: string }> } | undefined;
+		for (const secret of secrets) expect(sent?.messages?.[0]?.content).toContain(secret);
+	});
+
 	it("does not write the marketplace clone userinfo into the debug log", async () => {
 		const cacheDir = await fs.mkdtemp(path.join(os.tmpdir(), "mkt-log-"));
 		try {

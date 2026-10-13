@@ -119,7 +119,14 @@ const GH_SHARE_TRUST_KEYS = [
 	"HOME",
 	"USERPROFILE",
 	"APPDATA",
+	"HTTP_PROXY",
+	"HTTPS_PROXY",
+	"ALL_PROXY",
+	"NO_PROXY",
+	"SSL_CERT_FILE",
+	"SSL_CERT_DIR",
 ] as const;
+const GH_SHARE_TRUST_KEY_SET = new Set(GH_SHARE_TRUST_KEYS.map(name => name.toUpperCase()));
 
 /**
  * Project dotenv at import, before `/move` changes cwd. Those declarations are
@@ -130,14 +137,15 @@ const ghShareProjectSnapshot = projectEnvSnapshot();
 
 /**
  * Environment for the default `/share` `gh` children. GitHub CLI routing,
- * config, and authentication values that match the project dotenv are omitted
- * so a repository cannot redirect the upload, select a shipped config, or
- * authenticate with a project-provided token. Operator values the project does
- * not declare are kept.
+ * config, authentication, proxy, and certificate overrides that match the
+ * project dotenv are omitted so a repository cannot redirect the upload,
+ * authenticate with a project-provided token, or intercept its HTTPS request.
+ * Operator values the project does not declare are kept.
  */
 function ghShareChildEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
 	const child: NodeJS.ProcessEnv = { ...env };
-	for (const name of GH_SHARE_TRUST_KEYS) {
+	for (const name of Object.keys(child)) {
+		if (!GH_SHARE_TRUST_KEY_SET.has(name.toUpperCase())) continue;
 		const raw = child[name];
 		if (typeof raw !== "string") continue;
 		const key = canonicalEnvKey(name);

@@ -67,7 +67,7 @@ export function redactCrashSecrets(text: string): string {
 	// middle), and `access_token` does not match `SessionToken`.
 	redacted = redacted.replace(/\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b/g, "«redacted-aws-key»");
 	redacted = redacted.replace(
-		/(?<![A-Za-z0-9_])(["']?(?:api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?token|client[_-]?secret|secret[_-]?key|secret[_-]?access[_-]?key|password|passwd|authorization)["']?\s*[=:]\s*["']?)[^\s"',;}\]]{8,}/gi,
+		/(?<![A-Za-z0-9_])(["']?(?:api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?token|client[_-]?secret|secret[_-]?key|secret[_-]?access[_-]?key|password|passwd|authorization|token|secret|credential|private[_-]?key|cookie)["']?\s*[=:]\s*["']?)[^\s"',;}\]]{8,}/gi,
 		"$1«redacted»",
 	);
 	return redacted;
