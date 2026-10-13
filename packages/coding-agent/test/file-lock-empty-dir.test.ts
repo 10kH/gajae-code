@@ -78,7 +78,7 @@ test("reclaims an aged empty ownerless lock directory on POSIX and reports manua
 		retryDelayMs: 1,
 		staleMs: 0,
 	}).then(
-		(value) => ({ ok: true as const, value }),
+		value => ({ ok: true as const, value }),
 		(error: unknown) => ({ ok: false as const, error }),
 	);
 	// On Windows, aged empty lock directories are now reclaimed and acquisition succeeds
@@ -87,7 +87,9 @@ test("reclaims an aged empty ownerless lock directory on POSIX and reports manua
 		await expect(fs.lstat(lockDir)).rejects.toMatchObject({ code: "ENOENT" });
 	} else {
 		// Fallback for unexpected failure
-		expect(((result as { ok: false; error: unknown }).error as Error).message).toContain(`Remove-Item -LiteralPath '${lockDir}' -Recurse -Force`);
+		expect(((result as { ok: false; error: unknown }).error as Error).message).toContain(
+			`Remove-Item -LiteralPath '${lockDir}' -Recurse -Force`,
+		);
 	}
 });
 
