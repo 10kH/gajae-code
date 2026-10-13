@@ -2013,10 +2013,18 @@ export async function removeFileLockDirForGc(
 			rootIno: captured.snapshot.rootIno,
 			snapshot: captured.snapshot,
 		});
-		if (await finishDetachedLockCleanup(expected)) return "removed";
+		let cleanupCompleted = false;
+		try {
+			cleanupCompleted = await finishDetachedLockCleanup(expected);
+		} catch (error) {
+			// Treat an OS sharing denial like a cleanup_pending receipt: both leave
+			// this exact detached generation for a later local retry.
+			if (!isTransientReleaseError(error)) throw error;
+		}
+		if (cleanupCompleted) return "removed";
 		// Stale-owner cleanup has no LocalLockState release handle to drive another
-		// retry. Mark only this completed native attempt resumable so a later local
-		// acquisition can adopt the exact transition after a transient refusal.
+		// retry. Mark the receipt resumable only after the native attempt returns;
+		// other processes still see its live owner and remain fenced from adoption.
 		markLocalRemovalResumable(detachedPath, captured.snapshot.rootDev, captured.snapshot.rootIno);
 		return "cleanup_failed";
 	}

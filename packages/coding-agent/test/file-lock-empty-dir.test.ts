@@ -427,7 +427,10 @@ test("resumes an ownerless detached cleanup after a transient cleanup refusal", 
 	await expect(fs.lstat(`${transitionPath}.owner`)).rejects.toMatchObject({ code: "ENOENT" });
 });
 
-test("retries stale-owner Windows detached cleanup on a later same-process acquisition", async () => {
+test.each([
+	"cleanup_pending",
+	"sharing_violation",
+] as const)("retries stale-owner Windows detached cleanup after transient %s on a later same-process acquisition", async transientRefusal => {
 	const tempDir = await createTempDir();
 	const filePath = path.join(tempDir, "sdk", "sessions", "index.jsonl");
 	const lockDir = `${filePath}.lock`;
@@ -449,6 +452,9 @@ test("retries stale-owner Windows detached cleanup on a later same-process acqui
 			}
 			if (target === transitionPath) {
 				transitionRemovalAttempts++;
+				if (transitionRemovalAttempts === 2 && transientRefusal === "sharing_violation") {
+					throw Object.assign(new Error("simulated Windows sharing denial"), { code: "EPERM" });
+				}
 				if (transitionRemovalAttempts <= 2) {
 					return {
 						ok: false,
