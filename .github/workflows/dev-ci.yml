@@ -358,6 +358,11 @@ jobs:
           TARGET_ARCH: x64
           TARGET_VARIANTS: baseline
         run: bun run ci:build:native
+      - name: Verify Windows native lock retirement collision
+        shell: pwsh
+        run: |
+          cargo test -p pi-natives retirement_collision_preserves_canonical_owner_metadata
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Verify Windows workspace shim and doctor
         shell: pwsh
         run: |
