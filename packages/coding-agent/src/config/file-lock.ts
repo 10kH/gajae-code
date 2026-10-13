@@ -137,6 +137,10 @@ export const FileLockTestHooks: {
 		renameNoReplacePathAsync: typeof renameNoReplacePathAsync;
 		renameDirectoryNoReplacePathAsync: typeof renameDirectoryNoReplacePathAsync;
 	};
+	stagingIdentityEvidence?: () => {
+		processIncarnation: string | null;
+		startTime: string | null;
+	};
 	nativeQuarantineBindings?: () => NativeFileLockBindings;
 	nativeExactRemovalProbe?: () => boolean | Promise<boolean>;
 } = {};
@@ -2018,7 +2022,10 @@ async function tryAcquireLock(
 	await ensureLockParent(path.dirname(lockPath));
 	const afterParentMkdir = FileLockTestHooks.afterParentMkdir;
 	if (afterParentMkdir) await afterParentMkdir(lockPath);
-	const pendingPath = `${lockPath}.pending.${process.pid}.${currentFileLockStagingIdentity()}.${crypto.randomBytes(12).toString("base64url")}`;
+	const stagingIdentity = currentFileLockStagingIdentity();
+	const pendingPath = stagingIdentity
+		? `${lockPath}.pending.${process.pid}.${stagingIdentity}.${crypto.randomBytes(12).toString("base64url")}`
+		: `${lockPath}.pending.${process.pid}.${crypto.randomUUID()}`;
 	const owner = lockInfo(ownerHostId, ownerToken);
 	let removePending = false;
 	try {
@@ -2721,10 +2728,17 @@ function fileLockStagingIdentityHash(identity: string): string {
 	return crypto.createHash("sha256").update(identity, "utf8").digest("base64url").slice(0, 16);
 }
 
-function currentFileLockStagingIdentity(): string {
-	const incarnation = currentProcessIncarnation();
-	const identity = incarnation ?? processStartTime(process.pid) ?? `${process.pid}:${currentProcessStartTime()}`;
-	return `${incarnation ? "i" : "s"}${fileLockStagingIdentityHash(identity)}`;
+/**
+ * A missing generation is represented by a legacy UUID name that forces a
+ * liveness probe; never hash a synthetic "unknown" as if it were identity evidence.
+ */
+function currentFileLockStagingIdentity(): string | null {
+	const evidence = FileLockTestHooks.stagingIdentityEvidence?.();
+	const incarnation = evidence ? evidence.processIncarnation : currentProcessIncarnation();
+	if (incarnation) return `i${fileLockStagingIdentityHash(incarnation)}`;
+	const startTime = evidence ? evidence.startTime : currentProcessStartTime();
+	if (!startTime || startTime === "unknown") return null;
+	return `s${fileLockStagingIdentityHash(startTime)}`;
 }
 
 /** Return a name-encoded staging PID for GC discovery. */
@@ -2773,7 +2787,15 @@ export async function inspectFileLockStagingDir(
 		if (currentIdentity !== null && fileLockStagingIdentityHash(currentIdentity) === nameOwner.identity.value) {
 			return { ...kept, pid: namePid, status: "alive", reason: "live_staging_name_owner" };
 		}
-		namePidStatus = currentIdentity === null ? probe(namePid) : "dead";
+		const syntheticStartTimeFallback =
+			nameOwner.identity.kind === "start_time" &&
+			(nameOwner.identity.value === fileLockStagingIdentityHash(`${namePid}:unknown`) ||
+				(currentIdentity !== null &&
+					nameOwner.identity.value === fileLockStagingIdentityHash(`${namePid}:${currentIdentity}`)));
+		// Older publishers hashed `${pid}:${startTime}` or `${pid}:unknown` when
+		// start-time evidence was unavailable. A later raw start-time mismatch is
+		// not proof those already-running staging owners are dead.
+		namePidStatus = currentIdentity === null || syntheticStartTimeFallback ? probe(namePid) : "dead";
 	} else {
 		namePidStatus = probe(namePid);
 	}

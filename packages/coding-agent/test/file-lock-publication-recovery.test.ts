@@ -8,6 +8,7 @@ import {
 	acquireFileLock,
 	FileLockAcquireError,
 	FileLockTestHooks,
+	fileLockStagingOwnerPid,
 	withFileLock,
 } from "@gajae-code/coding-agent/config/file-lock";
 import {
@@ -45,6 +46,7 @@ interface RemovalCall {
 afterEach(async () => {
 	vi.restoreAllMocks();
 	FileLockTestHooks.nativePublicationBindings = undefined;
+	FileLockTestHooks.stagingIdentityEvidence = undefined;
 	FileLockTestHooks.nativeQuarantineBindings = undefined;
 	for (const { directory, forgetGrant } of tempDirs.splice(0)) {
 		try {
@@ -454,6 +456,29 @@ test("keeps the staging component within filesystem limits for long target names
 	const legacyComponentLength =
 		path.basename(file).length + ".lock.pending.".length + String(process.pid).length + 1 + 36;
 	expect(stagingComponentLength).toBeLessThanOrEqual(legacyComponentLength);
+});
+
+test("uses a liveness-probed legacy staging name when process identity is unavailable", async () => {
+	const { file } = await makeFixture();
+	FileLockTestHooks.stagingIdentityEvidence = () => ({ processIncarnation: null, startTime: null });
+	let stagingPath = "";
+	FileLockTestHooks.nativePublicationBindings = () => ({
+		renameNoReplacePathAsync: async (source, destination) => {
+			stagingPath = source;
+			await fs.rename(source, destination);
+			return successfulPublication(primaryPrimitive ?? "windows_rename_noreplace");
+		},
+		renameDirectoryNoReplacePathAsync: async () => {
+			throw new Error("unexpected directory publication fallback");
+		},
+	});
+
+	expect(await withFileLock(file, async () => "acquired", quickAcquire)).toBe("acquired");
+	const stagingName = path.basename(stagingPath);
+	expect(stagingName).toMatch(
+		new RegExp(`\\.pending\\.${process.pid}\\.[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$`),
+	);
+	expect(fileLockStagingOwnerPid(stagingName)).toBe(process.pid);
 });
 
 describe.skipIf(process.platform !== "linux")("file lock committed publication reconciliation", () => {

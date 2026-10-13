@@ -20,6 +20,7 @@ const uuid = "12345678-1234-1234-1234-123456789abc";
 afterEach(async () => {
 	vi.restoreAllMocks();
 	FileLockTestHooks.nativeQuarantineBindings = undefined;
+	FileLockTestHooks.stagingIdentityEvidence = undefined;
 	for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
 });
 async function fixture(
@@ -90,6 +91,68 @@ test.each(["alive", "unknown"] as const)("unproven staging owner is skipped befo
 	expect(probe).toHaveBeenCalledWith(DEAD_PID);
 	expect(snapshot).not.toHaveBeenCalled();
 	expect(await fs.exists(staging)).toBe(true);
+});
+
+test.each(["unknown", "start-time"] as const)("probes liveness for old synthetic %s staging identities", async kind => {
+	const startTime = processStartTime(process.pid);
+	if (!startTime) throw new Error("Expected a process start time for this regression test");
+	const ownerStartTime = kind === "unknown" ? "unknown" : startTime;
+	const { file, staging } = await fixture(
+		process.pid,
+		{
+			pid: process.pid,
+			timestamp: 1,
+			start_time: ownerStartTime,
+			start_time_format: "utc-v1",
+		},
+		"fixture-start-time",
+	);
+	const encoded = crypto
+		.createHash("sha256")
+		.update(`${process.pid}:${ownerStartTime}`, "utf8")
+		.digest("base64url")
+		.slice(0, 16);
+	const syntheticStaging = `${file}.lock.pending.${process.pid}.s${encoded}.1234567890123456`;
+	await fs.rename(staging, syntheticStaging);
+	const probe = vi.fn(() => "alive" as const);
+	const snapshot = vi.fn(() => {
+		throw new Error("live synthetic staging owner must not be snapshotted");
+	});
+	FileLockTestHooks.nativeQuarantineBindings = () => ({
+		snapshotDirectoryTree: snapshot,
+		exactRemoveDirectoryTree: () => ({ ok: false, code: "identity_mismatch" }),
+	});
+
+	const result = await inspectFileLockStagingDir(syntheticStaging, probe, true);
+	expect(result).toMatchObject({ pid: process.pid, status: "alive", removed: false });
+	expect(probe).toHaveBeenCalledWith(process.pid);
+	expect(snapshot).not.toHaveBeenCalled();
+	expect(await fs.exists(syntheticStaging)).toBe(true);
+});
+
+test.each(["alive", "unknown"] as const)("legacy fallback staging retains a %s owner", async status => {
+	const { file, staging } = await fixture(DEAD_PID, {
+		pid: DEAD_PID,
+		timestamp: 1,
+		start_time: "later-known-start-time",
+		start_time_format: "utc-v1",
+	});
+	const legacyStaging = `${file}.lock.pending.${DEAD_PID}.${uuid}`;
+	await fs.rename(staging, legacyStaging);
+	const probe = vi.fn(() => status);
+	const snapshot = vi.fn(() => {
+		throw new Error("unproven legacy owner must not be snapshotted");
+	});
+	FileLockTestHooks.nativeQuarantineBindings = () => ({
+		snapshotDirectoryTree: snapshot,
+		exactRemoveDirectoryTree: () => ({ ok: false, code: "identity_mismatch" }),
+	});
+
+	const result = await inspectFileLockStagingDir(legacyStaging, probe, true);
+	expect(result).toMatchObject({ pid: DEAD_PID, status, removed: false });
+	expect(probe).toHaveBeenCalledWith(DEAD_PID);
+	expect(snapshot).not.toHaveBeenCalled();
+	expect(await fs.exists(legacyStaging)).toBe(true);
 });
 
 test("reaps old staging after its name-encoded PID is reused", async () => {
