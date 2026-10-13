@@ -29,7 +29,8 @@ function missingBrokerSeams(source: string, filename: string): number[] {
 			const line = node.loc?.start.line;
 			if (line === undefined) throw new Error(`Missing call location in ${filename}`);
 			const previousLine = source.split("\n")[line - 2]?.trim() ?? "";
-			const optedOut = previousLine.startsWith(optOutPrefix) && previousLine.slice(optOutPrefix.length).trim().length > 0;
+			const optedOut =
+				previousLine.startsWith(optOutPrefix) && previousLine.slice(optOutPrefix.length).trim().length > 0;
 			if (!hasSeam && !optedOut) missing.push(line);
 		},
 	});
