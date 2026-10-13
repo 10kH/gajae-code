@@ -23343,20 +23343,26 @@ export class AgentSession {
 			resolved.credentialRowId !== undefined &&
 			!authStorage.isCredentialAvailable(candidate.provider, resolved.credentialRowId)
 		) {
-			for (const credential of authStorage.listCredentialInventory(candidate.provider)) {
-				if (credential.disabled || !authStorage.isCredentialAvailable(candidate.provider, credential.id)) continue;
-				const alternative = await this.#modelRegistry.getApiKeyWithCredentialRowId(candidate, this.credentialSessionId, {
-					credentialSelector: { kind: "id", value: String(credential.id) },
-				});
-				if (
-					!alternative.apiKey ||
-					alternative.credentialRowId !== credential.id ||
-					!authStorage.isCredentialAvailable(candidate.provider, credential.id)
-				) {
-					continue;
+			if (!this.#hasManagedFallbackCredentialPin(candidate.provider)) {
+				for (const credential of authStorage.listCredentialInventory(candidate.provider)) {
+					if (credential.disabled || !authStorage.isCredentialAvailable(candidate.provider, credential.id)) continue;
+					const alternative = await this.#modelRegistry.getApiKeyWithCredentialRowId(
+						candidate,
+						this.credentialSessionId,
+						{
+							credentialSelector: { kind: "id", value: String(credential.id) },
+						},
+					);
+					if (
+						!alternative.apiKey ||
+						alternative.credentialRowId !== credential.id ||
+						!authStorage.isCredentialAvailable(candidate.provider, credential.id)
+					) {
+						continue;
+					}
+					resolved = alternative;
+					break;
 				}
-				resolved = alternative;
-				break;
 			}
 			if (
 				resolved.credentialRowId !== undefined &&

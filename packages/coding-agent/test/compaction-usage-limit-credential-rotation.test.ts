@@ -386,4 +386,26 @@ describe("auto-compaction usage limit rotates the session credential", () => {
 		expect(markUsageLimitReached).not.toHaveBeenCalled();
 		expect(ends[0]?.errorMessage).toContain("usage limit has been reached");
 	});
+
+	it("does not bypass a pinned credential that is already in quota backoff", async () => {
+		const credentials = authStorage.exportSnapshot().credentials.filter(entry => entry.provider === "openai-codex");
+		const pinnedRow = credentials[0];
+		const healthyRow = credentials[1];
+		if (!pinnedRow || !healthyRow) throw new Error("Expected two stored openai-codex credentials");
+		authStorage.setRuntimeCredentialSelector("openai-codex", { kind: "id", value: String(pinnedRow.id) });
+		session = createSession();
+		await authStorage.markUsageLimitReached("openai-codex", session.credentialSessionId, {
+			rowId: pinnedRow.id,
+			retryAfterMs: 60_000,
+		});
+		const ends = collectCompactionEnds(session);
+		const compactSpy = stubCompact(() => false);
+
+		await session.runIdleCompaction();
+
+		expect(authStorage.isCredentialAvailable("openai-codex", pinnedRow.id)).toBe(false);
+		expect(authStorage.isCredentialAvailable("openai-codex", healthyRow.id)).toBe(true);
+		expect(compactSpy).not.toHaveBeenCalled();
+		expect(ends[0]?.errorMessage).toContain("No available stored credential");
+	});
 });
