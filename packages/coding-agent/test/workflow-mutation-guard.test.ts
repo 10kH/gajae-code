@@ -32,39 +32,10 @@ async function makeTempRoot(): Promise<string> {
 
 /** A directory that is not the project cwd and not a platform temp root. */
 async function makeNonNeutralDir(): Promise<string> {
-	// The test harness nests HOME below TMPDIR, so os.userInfo().homedir can
-	// itself resolve inside the system temp root. Prefer a directory beside the
-	// checkout and verify that the guard will not treat it as neutral scratch.
-	const candidates = [process.cwd(), os.userInfo().homedir];
-	const tempRoots =
-		process.platform === "win32"
-			? [os.tmpdir(), process.env.TMPDIR, process.env.TEMP, process.env.TMP]
-			: ["/tmp", "/var/tmp", "/private/tmp", "/private/var/tmp", os.tmpdir(), process.env.TMPDIR];
-	const resolvedTempRoots = await Promise.all(
-		tempRoots
-			.filter((root): root is string => Boolean(root))
-			.map(async root => {
-				try {
-					return await fs.realpath(root);
-				} catch {
-					return path.resolve(root);
-				}
-			}),
-	);
-	for (const candidate of candidates) {
-		const directory = await fs.mkdtemp(path.join(candidate, "gjc-plan-tmpdir-"));
-		const resolvedDirectory = await fs.realpath(directory);
-		const isNeutral = resolvedTempRoots.some(root => {
-			const relative = path.relative(root, resolvedDirectory);
-			return (
-				relative === "" ||
-				(relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
-			);
-		});
-		if (!isNeutral) return directory;
-		await fs.rm(directory, { recursive: true, force: true });
-	}
-	throw new Error("Cannot create the project TMPDIR fixture outside neutral system temp roots.");
+	// Bun's os.userInfo().homedir follows HOME, which shard harnesses may place
+	// below /tmp. Use a sibling of the checkout so this target is not neutral temp.
+	const repoRoot = path.resolve(import.meta.dir, "../../..");
+	return fs.mkdtemp(path.join(path.dirname(repoRoot), "gjc-plan-tmpdir-"));
 }
 
 async function removeDirLeafFirst(dir: string): Promise<void> {
@@ -153,20 +124,23 @@ const projectTmpdirProbe = path.join(import.meta.dir, "fixtures/workflow-mutatio
 
 async function runProjectTmpdirProbe(input: {
 	cwd: string;
+	processCwd?: string;
 	target: string;
 	sessionId: string;
 	drop?: "unlink" | "chdir";
+	tmpdir?: string;
 	expectedTmpdir?: string;
 }): Promise<{ blocked: boolean; message?: string }> {
 	const env: Record<string, string> = { ...process.env } as Record<string, string>;
 	if (input.expectedTmpdir !== undefined) delete env.TMPDIR;
+	if (input.tmpdir !== undefined) env.TMPDIR = input.tmpdir;
 	env.GJC_TMPDIR_PROBE_CWD = input.cwd;
 	env.GJC_TMPDIR_PROBE_PATH = input.target;
 	env.GJC_TMPDIR_PROBE_SESSION = input.sessionId;
 	if (input.drop) env.GJC_TMPDIR_PROBE_DROP = input.drop;
 	if (input.expectedTmpdir !== undefined) env.GJC_TMPDIR_PROBE_EXPECT = input.expectedTmpdir;
 	const proc = Bun.spawn([process.execPath, projectTmpdirProbe], {
-		cwd: input.cwd,
+		cwd: input.processCwd ?? input.cwd,
 		env,
 		stdin: "ignore",
 		stdout: "pipe",
@@ -1193,6 +1167,59 @@ describe("workflow mutation guard", () => {
 			} finally {
 				await removeDirLeafFirst(projectTmp);
 			}
+		}
+	}, 60_000);
+
+	it("uses the caller cwd dotenv snapshot when the guard was imported elsewhere", async () => {
+		const cwd = await makeTempRoot();
+		const processCwd = await makeTempRoot();
+		await writeActiveDeepInterview(cwd);
+		const projectTmp = await makeNonNeutralDir();
+		try {
+			const product = path.join(projectTmp, "src", "product.ts");
+			await fs.mkdir(path.dirname(product), { recursive: true });
+			await Bun.write(product, "original\n");
+			await Bun.write(path.join(cwd, ".env"), `TMPDIR=${projectTmp}\n`);
+
+			const decision = await runProjectTmpdirProbe({
+				cwd,
+				processCwd,
+				target: product,
+				sessionId: "session-a",
+				tmpdir: projectTmp,
+				expectedTmpdir: projectTmp,
+			});
+			expect(decision.blocked).toBe(true);
+			expect(decision.message).toBe(DEEP_INTERVIEW_MUTATION_BLOCK_MESSAGE);
+			expect(await Bun.file(product).text()).toBe("original\n");
+		} finally {
+			await removeDirLeafFirst(projectTmp);
+		}
+	}, 60_000);
+
+	it("fails closed when the caller cwd dotenv exceeds the bounded snapshot size", async () => {
+		const cwd = await makeTempRoot();
+		const processCwd = await makeTempRoot();
+		await writeActiveDeepInterview(cwd);
+		const projectTmp = await makeNonNeutralDir();
+		try {
+			const product = path.join(projectTmp, "src", "product.ts");
+			await fs.mkdir(path.dirname(product), { recursive: true });
+			await Bun.write(product, "original\n");
+			await Bun.write(path.join(cwd, ".env"), `TMPDIR=${projectTmp}\n${"#".repeat(128 * 1024)}\n`);
+
+			const decision = await runProjectTmpdirProbe({
+				cwd,
+				processCwd,
+				target: product,
+				sessionId: "session-a",
+				tmpdir: projectTmp,
+			});
+			expect(decision.blocked).toBe(true);
+			expect(decision.message).toBe(DEEP_INTERVIEW_MUTATION_BLOCK_MESSAGE);
+			expect(await Bun.file(product).text()).toBe("original\n");
+		} finally {
+			await removeDirLeafFirst(projectTmp);
 		}
 	}, 60_000);
 
