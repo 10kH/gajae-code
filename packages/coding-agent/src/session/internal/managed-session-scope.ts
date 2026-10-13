@@ -299,6 +299,7 @@ export type ManagedScopeErrorCode =
 	| "managed_gc_journal_capacity_exceeded"
 	| "atomic_unavailable"
 	| "invalid_request"
+	| "permission_denied"
 	| "durability_failed"
 	| "durability_not_provable"
 	| "capacity_exceeded";
@@ -342,6 +343,7 @@ const managedScopeErrnoFailureCodes = new Set([
 const managedScopeFailureCodes = new Set<ManagedScopeErrorCode>([
 	"atomic_unavailable",
 	"invalid_request",
+	"permission_denied",
 	"durability_failed",
 	"durability_not_provable",
 	"migration_busy",

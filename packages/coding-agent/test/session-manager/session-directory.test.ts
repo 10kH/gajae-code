@@ -555,6 +555,49 @@ describe("managed session write protocol", () => {
 		expect(SessionManager.managedDestination(cwd, agentDir).directory).toBe(scope.directoryPath);
 	});
 
+	it("preserves managed publication permission errors in the scope result", async () => {
+		const { scope } = await fixture();
+		const outcome = classifyNativePublishOutcome({
+			ok: false,
+			code: "access_denied",
+			mutationState: "not_committed",
+			durabilityState: "not_attempted",
+			reason: "access_denied",
+			primitive: "windows_rename_noreplace",
+			phase: "rename",
+			diagnostic: { schemaVersion: 1, collectionState: "unavailable" },
+		});
+		const denied = new managedSessionStorage.ManagedPublishError("permission_denied", outcome);
+		const prototype = managedSessionStorage.ManagedSessionDescendantStore.prototype;
+		const realPublish = prototype.publishNoReplaceSync;
+		let injected = 0;
+		const publish = vi.spyOn(prototype, "publishNoReplaceSync").mockImplementation(function (
+			this: managedSessionStorage.ManagedSessionDescendantStore,
+			relativePath: string,
+			bytes: Uint8Array,
+		): void {
+			if (relativePath === MANAGED_SESSION_BINDING_FILE) {
+				injected += 1;
+				throw denied;
+			}
+			return realPublish.call(this, relativePath, bytes);
+		});
+
+		let prepared: ManagedScopeResolution;
+		try {
+			prepared = prepareManagedSessionScopeForWriteSync(scope, "windows-existing-verify-first");
+		} finally {
+			publish.mockRestore();
+		}
+
+		expect(injected).toBe(1);
+		expect(prepared.kind).toBe("error");
+		if (prepared.kind !== "error") throw new Error("Expected a prepare failure");
+		expect(prepared.code).toBe("permission_denied");
+		expect(prepared.cause?.classification).toBe("permission_denied");
+		expect(JSON.stringify(prepared.cause)).not.toContain(scope.directoryPath);
+	});
+
 	it("still redacts an unclassified startup failure that embeds its pathname", async () => {
 		const { cwd, sessionsRoot, scope } = await fixture();
 		const agentDir = path.dirname(sessionsRoot);
