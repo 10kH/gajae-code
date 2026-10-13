@@ -205,6 +205,38 @@ describe("auto-compaction usage limit rotates the session credential", () => {
 		expect(ends[0]?.errorMessage).toContain("usage limit has been reached");
 	});
 
+	it("stays within the retry policy when two stored rows resolve to the same key", async () => {
+		// Two env references to one secret: matching the failed key back to a row always
+		// finds the first row, so without a key-level check the second row looks unvisited
+		// and every rotation resubmits the key that just failed.
+		process.env.GJC_TEST_COMPACTION_DUP_KEY_A = "codex-dup-secret";
+		process.env.GJC_TEST_COMPACTION_DUP_KEY_B = "codex-dup-secret";
+		try {
+			await authStorage.set("openai-codex", [
+				{ type: "api_key", key: "GJC_TEST_COMPACTION_DUP_KEY_A" },
+				{ type: "api_key", key: "GJC_TEST_COMPACTION_DUP_KEY_B" },
+			]);
+			session = createSession();
+			const ends = collectCompactionEnds(session);
+			let calls = 0;
+			const compactSpy = vi.spyOn(compactionModule, "compact").mockImplementation(async () => {
+				calls++;
+				// Bound a regression to a fast failure instead of an endless retry.
+				if (calls > 10) throw new Error("test bound: compaction kept resubmitting the same key");
+				throw new Error(USAGE_LIMIT);
+			});
+
+			await session.runIdleCompaction();
+
+			expect(compactSpy.mock.calls.every(call => call[2] === "codex-dup-secret")).toBe(true);
+			expect(compactSpy.mock.calls.length).toBe(1 + MAX_RETRIES);
+			expect(ends[0]?.errorMessage).toContain("usage limit has been reached");
+		} finally {
+			delete process.env.GJC_TEST_COMPACTION_DUP_KEY_A;
+			delete process.env.GJC_TEST_COMPACTION_DUP_KEY_B;
+		}
+	});
+
 	it("leaves the session provider's rows alone when a fallback candidate on another provider hits the limit", async () => {
 		await authStorage.set("anthropic", [
 			{ type: "api_key", key: "anthropic-key-1" },

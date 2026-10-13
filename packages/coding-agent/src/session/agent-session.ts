@@ -23941,6 +23941,9 @@ export class AgentSession {
 					}
 					let apiKey = resolved.apiKey;
 					const usageLimitedRowIds = new Set<number>();
+					// Rows can resolve to the same key (two env references to one secret), so
+					// a rotation is accepted only when it brings a key that has not failed yet.
+					const usageLimitedApiKeys = new Set<string>();
 
 					let attempt = 0;
 					while (true) {
@@ -23981,13 +23984,14 @@ export class AgentSession {
 							}
 							const retryAfterMs = this.#parseRetryAfterMsFromError(message);
 							if (isUsageLimitError(message)) {
+								usageLimitedApiKeys.add(apiKey);
 								const rotatedApiKey = await this.#rotateCompactionCredentialAfterUsageLimit(
 									candidate,
 									apiKey,
 									retryAfterMs,
 									usageLimitedRowIds,
 								);
-								if (rotatedApiKey !== undefined) {
+								if (rotatedApiKey !== undefined && !usageLimitedApiKeys.has(rotatedApiKey)) {
 									apiKey = rotatedApiKey;
 									logger.warn("Auto-compaction hit a usage limit, retrying on another credential", {
 										error: message,
