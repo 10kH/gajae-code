@@ -237,6 +237,8 @@ export interface CredentialInventoryRecord {
 	accountId?: string;
 	email?: string;
 	projectId?: string;
+	organizationId?: string;
+	organizationName?: string;
 	disabled: boolean;
 	disabledCause: string | null;
 }
@@ -1129,11 +1131,61 @@ export type AuthApiKeyOptions = {
 	/** Prefer one stored OAuth credential while preserving quota-triggered fallback. */
 	preferredCredentialSelector?: AuthCredentialSelector;
 };
-export type AuthCredentialSelectorKind = "id" | "email" | "account" | "project";
+export type AuthCredentialSelectorKind = "id" | "email" | "account" | "project" | "org";
 
 export interface AuthCredentialSelector {
 	kind: AuthCredentialSelectorKind;
 	value: string;
+}
+
+/**
+ * Whether an OAuth credential belongs to the organization named by an `org:`
+ * selector value: the organization id, or its display name (case-insensitive).
+ */
+export function oauthCredentialMatchesOrganization(
+	credential: Pick<OAuthCredentials, "organizationId" | "organizationName">,
+	value: string,
+): boolean {
+	const wanted = value.trim().toLowerCase();
+	if (wanted.length === 0) return false;
+	return (
+		credential.organizationId?.trim().toLowerCase() === wanted ||
+		credential.organizationName?.trim().toLowerCase() === wanted
+	);
+}
+
+/**
+ * The items an `org:` selector designates. An exact organization-id match wins
+ * over display-name matches, because names are not unique: two organizations
+ * can share a name, and a name can equal another organization's id. Callers
+ * must treat more than one result as ambiguous rather than picking one.
+ */
+export function selectOrganizationMatches<T>(
+	items: readonly T[],
+	value: string,
+	organizationOf: (item: T) => Pick<OAuthCredentials, "organizationId" | "organizationName"> | undefined,
+): T[] {
+	const wanted = value.trim().toLowerCase();
+	const matches = items.filter(item => {
+		const organization = organizationOf(item);
+		return organization !== undefined && oauthCredentialMatchesOrganization(organization, wanted);
+	});
+	const exact = matches.filter(item => organizationOf(item)?.organizationId?.trim().toLowerCase() === wanted);
+	return exact.length > 0 ? exact : matches;
+}
+
+/**
+ * Human-facing identity of a stored OAuth credential. The organization name is
+ * appended because one account (same email) can hold one credential per
+ * organization.
+ */
+export function formatOAuthIdentityLabel(
+	credential: Pick<OAuthCredentials, "email" | "accountId" | "projectId" | "organizationName">,
+): string | null {
+	const base = credential.email ?? credential.accountId ?? credential.projectId ?? null;
+	const organization = credential.organizationName?.trim();
+	if (!organization) return base;
+	return base ? `${base} (${organization})` : organization;
 }
 
 type OAuthResolutionResult = { apiKey: string; credential: OAuthCredential };
@@ -1296,6 +1348,8 @@ function oauthNonTokenFieldsEqual(left: OAuthCredential, right: OAuthCredential)
 		left.projectId === right.projectId &&
 		left.enterpriseUrl === right.enterpriseUrl &&
 		left.profileArn === right.profileArn &&
+		left.organizationId === right.organizationId &&
+		left.organizationName === right.organizationName &&
 		left.mcpBinding?.resourceOrigin === right.mcpBinding?.resourceOrigin &&
 		left.mcpBinding?.tokenEndpoint === right.mcpBinding?.tokenEndpoint
 	);
@@ -1345,6 +1399,7 @@ function resolveMemoizedOAuthIdentityKey(provider: string, credential: OAuthCred
 		credential.projectId ?? "",
 		credential.enterpriseUrl ?? "",
 		credential.profileArn ?? "",
+		credential.organizationId ?? "",
 		credential.access,
 		credential.refresh,
 	].join("\u0000");
@@ -2096,8 +2151,9 @@ export class AuthStorage {
 			);
 		}
 		const allRows = this.#store.listCredentialInventory?.(storageProvider) ?? [];
-		const matchingCredentials = this.#getStoredCredentials(storageProvider).filter(entry =>
-			this.#credentialMatchesSelector(entry, selector),
+		const matchingCredentials = this.#entriesDesignatedBySelector(
+			this.#getStoredCredentials(storageProvider),
+			selector,
 		);
 		const matchingIds = new Set(matchingCredentials.map(entry => entry.id));
 		const matchingRows = allRows.filter(
@@ -2147,7 +2203,7 @@ export class AuthStorage {
 				"ambiguous",
 				storageProvider,
 				selector,
-				`Selector ${this.#formatCredentialSelector(selector)} matches multiple OAuth credentials; choose id:<row-id>`,
+				`Selector ${this.#formatCredentialSelector(selector)} matches multiple OAuth credentials (ids: ${matchingRows.map(row => row.id).join(", ")}); choose one with id:<row-id>`,
 				matchingRows.map(row => row.id),
 			);
 		}
@@ -2194,10 +2250,9 @@ export class AuthStorage {
 		this.#usageCache.deletePrefix?.("reports:");
 		for (const [scopeId, selectors] of this.#sessionCredentialSelectors) {
 			const selector = selectors.get(storageProvider);
-			const selected = selector
-				? previousEntries.find(entry => this.#credentialMatchesSelector(entry, selector))
-				: undefined;
-			if (selected && removed.has(selected.id)) this.clearSessionCredentialSelector(storageProvider, scopeId);
+			const selected = selector ? this.#entriesSelectedBySelector(previousEntries, selector) : [];
+			if (selected.some(entry => removed.has(entry.id)))
+				this.clearSessionCredentialSelector(storageProvider, scopeId);
 		}
 		for (const [sessionId, sticky] of this.#sessionLastCredential.get(storageProvider) ?? []) {
 			if (removed.has(previousEntries[sticky.index]?.id ?? -1))
@@ -2804,28 +2859,30 @@ export class AuthStorage {
 		return deduped.reverse();
 	}
 
-	#pruneDuplicateStoredCredentials(provider: string, entries: StoredCredential[]): StoredCredential[] {
-		const seen = new Set<string>();
-		const kept: StoredCredential[] = [];
-		const removed: StoredCredential[] = [];
+	#pruneDuplicateStoredCredentials(
+		provider: string,
+		entries: StoredCredential[],
+		preferredCredentialId?: number,
+	): StoredCredential[] {
+		const selectedByIdentity = new Map<string, number>();
 		for (let index = entries.length - 1; index >= 0; index -= 1) {
 			const entry = entries[index];
-			const credential = entry.credential;
-			if (credential.type !== "oauth") {
-				kept.push(entry);
-				continue;
+			if (entry.credential.type !== "oauth") continue;
+			const identityKey = this.#resolveOAuthDedupeIdentityKey(provider, entry.credential);
+			if (!identityKey) continue;
+			if (!selectedByIdentity.has(identityKey) || entry.id === preferredCredentialId) {
+				selectedByIdentity.set(identityKey, entry.id);
 			}
-			const identityKey = this.#resolveOAuthDedupeIdentityKey(provider, credential);
-			if (!identityKey) {
-				kept.push(entry);
-				continue;
-			}
-			if (seen.has(identityKey)) {
-				removed.push(entry);
-				continue;
-			}
-			seen.add(identityKey);
-			kept.push(entry);
+		}
+
+		const selectedIds = new Set(selectedByIdentity.values());
+		const kept: StoredCredential[] = [];
+		const removed: StoredCredential[] = [];
+		for (const entry of entries) {
+			const identityKey =
+				entry.credential.type === "oauth" ? this.#resolveOAuthDedupeIdentityKey(provider, entry.credential) : null;
+			if (identityKey && !selectedIds.has(entry.id)) removed.push(entry);
+			else kept.push(entry);
 		}
 		if (removed.length > 0) {
 			for (const entry of removed) {
@@ -2834,7 +2891,7 @@ export class AuthStorage {
 			this.#clearSelectorsForRemovedCredential(provider, new Set(removed.map(entry => entry.id)), entries);
 			this.#resetProviderAssignments(provider);
 		}
-		return kept.reverse();
+		return kept;
 	}
 
 	/** Returns all credentials for a provider as an array */
@@ -2971,16 +3028,60 @@ export class AuthStorage {
 				return entry.credential.type === "oauth" && entry.credential.accountId === selector.value;
 			case "project":
 				return entry.credential.type === "oauth" && entry.credential.projectId === selector.value;
+			case "org":
+				return (
+					entry.credential.type === "oauth" && oauthCredentialMatchesOrganization(entry.credential, selector.value)
+				);
 		}
 	}
 
 	#findCredentialBySelector(provider: string, selector: AuthCredentialSelector): IndexedStoredCredential | undefined {
 		const stored = this.#getStoredCredentials(provider);
-		for (let index = 0; index < stored.length; index++) {
-			const entry = stored[index];
-			if (entry && this.#credentialMatchesSelector(entry, selector)) return { ...entry, index };
+		const designated = this.#entriesDesignatedBySelector(stored, selector);
+		// Organization names are not unique, so an organization selector naming several rows is rejected rather than
+		// resolved to the first. Email/account/project selectors keep resolving to the first row: pins persisted in
+		// config and session history use those kinds, and they are not organization-aware.
+		if (selector.kind === "org" && designated.length > 1) {
+			const ids = designated.map(entry => entry.id);
+			throw new OAuthCredentialSelectorError(
+				"ambiguous",
+				resolveOAuthStorageProvider(provider),
+				selector,
+				`Selector ${this.#formatCredentialSelector(selector)} matches multiple stored credentials for ${provider} (ids: ${ids.join(", ")}); choose one with id:<row-id>`,
+				ids,
+			);
 		}
-		return undefined;
+		const [entry] = designated;
+		return entry ? { ...entry, index: stored.indexOf(entry) } : undefined;
+	}
+
+	/**
+	 * Rows whose removal invalidates a selector, mirroring {@link AuthStorage.#findCredentialBySelector}: the row an
+	 * email/account/project/id selector resolves to (the first match), or every row an `org:` selector designates,
+	 * because removing one of several designated organizations would otherwise retarget the selector to another.
+	 */
+	#entriesSelectedBySelector<T extends StoredCredential>(
+		entries: readonly T[],
+		selector: AuthCredentialSelector,
+	): T[] {
+		const designated = this.#entriesDesignatedBySelector(entries, selector);
+		return selector.kind === "org" ? designated : designated.slice(0, 1);
+	}
+
+	/**
+	 * Every stored row a selector designates. An `org:` value prefers an exact organization-id match over
+	 * display-name matches; more than one designated row means the selector is ambiguous.
+	 */
+	#entriesDesignatedBySelector<T extends StoredCredential>(
+		entries: readonly T[],
+		selector: AuthCredentialSelector,
+	): T[] {
+		if (selector.kind === "org") {
+			return selectOrganizationMatches(entries, selector.value, entry =>
+				entry.credential.type === "oauth" ? entry.credential : undefined,
+			);
+		}
+		return entries.filter(entry => this.#credentialMatchesSelector(entry, selector));
 	}
 
 	#credentialMatchesInventorySelector(row: CredentialInventoryRecord, selector: AuthCredentialSelector): boolean {
@@ -2989,10 +3090,13 @@ export class AuthStorage {
 			case "id":
 				return String(row.id) === selector.value;
 			case "email":
-				return row.identityLabel?.toLowerCase() === selector.value.toLowerCase();
+				return (row.email ?? row.identityLabel)?.toLowerCase() === selector.value.toLowerCase();
 			case "account":
+				return (row.accountId ?? row.identityLabel) === selector.value;
 			case "project":
-				return row.identityLabel === selector.value;
+				return (row.projectId ?? row.identityLabel) === selector.value;
+			case "org":
+				return oauthCredentialMatchesOrganization(row, selector.value);
 		}
 	}
 	#getCredentialSelector(
@@ -3182,7 +3286,7 @@ export class AuthStorage {
 		const updated = [...entries];
 		updated[index] = { id: target.id, credential };
 		const configurationGeneration = this.#getProviderConfigurationGeneration(provider);
-		this.#setStoredCredentials(provider, updated);
+		this.#setStoredCredentials(provider, this.#pruneDuplicateStoredCredentials(provider, updated, target.id));
 		// Callers use the refresh generation to discount configuration bumps caused by a refresh, so it only
 		// advances when this refresh bumped configuration; token rotation for a known account does not.
 		if (
@@ -3301,8 +3405,8 @@ export class AuthStorage {
 		for (const [scopeId, selectors] of this.#sessionCredentialSelectors) {
 			const selector = selectors.get(storageProvider);
 			if (!selector) continue;
-			const selected = previousEntries.find(entry => this.#credentialMatchesSelector(entry, selector));
-			if (selected && removedIds.has(selected.id)) {
+			const selected = this.#entriesSelectedBySelector(previousEntries, selector);
+			if (selected.some(entry => removedIds.has(entry.id))) {
 				this.markSessionCredentialUnavailable(scopeId, storageProvider, selector);
 			}
 		}
@@ -4148,6 +4252,8 @@ export class AuthStorage {
 			email: credential.email,
 			enterpriseUrl: credential.enterpriseUrl,
 			profileArn: credential.profileArn,
+			organizationId: credential.organizationId,
+			organizationName: credential.organizationName,
 			mcpBinding: credential.mcpBinding,
 		};
 	}
@@ -4164,6 +4270,9 @@ export class AuthStorage {
 		if (enterpriseUrl) parts.push(`enterprise:${enterpriseUrl}`);
 		const profileArn = credential.profileArn?.trim();
 		if (profileArn) parts.push(`profile:${profileArn}`);
+		// One account can hold a credential per organization, each with its own limits.
+		const organizationId = credential.organizationId?.trim();
+		if (organizationId) parts.push(`org:${organizationId}`);
 		// Only fall back to a secret-derived key when stable credential identity is unavailable.
 		// Including the token hash when accountId/email/profileArn are present causes cache misses on
 		// every OAuth refresh — usage data is per-account, not per-token.
@@ -4226,6 +4335,8 @@ export class AuthStorage {
 			email: credential.email,
 			enterpriseUrl: credential.enterpriseUrl,
 			profileArn: credential.profileArn,
+			organizationId: credential.organizationId,
+			organizationName: credential.organizationName,
 			mcpBinding: credential.mcpBinding,
 		};
 	}
@@ -4241,6 +4352,8 @@ export class AuthStorage {
 			email: refreshed.email ?? credential.email,
 			enterpriseUrl: refreshed.enterpriseUrl ?? credential.enterpriseUrl,
 			profileArn: refreshed.profileArn ?? credential.profileArn,
+			organizationId: refreshed.organizationId ?? credential.organizationId,
+			organizationName: refreshed.organizationName ?? credential.organizationName,
 			mcpBinding: credential.mcpBinding,
 		};
 	}
@@ -4260,7 +4373,8 @@ export class AuthStorage {
 				entry.credential.accountId === previous.accountId &&
 				entry.credential.email === previous.email &&
 				entry.credential.projectId === previous.projectId &&
-				entry.credential.profileArn === previous.profileArn
+				entry.credential.profileArn === previous.profileArn &&
+				entry.credential.organizationId === previous.organizationId
 			);
 		});
 		return match?.id;
@@ -4281,7 +4395,8 @@ export class AuthStorage {
 				entry.credential.accountId === previous.accountId &&
 				entry.credential.email === previous.email &&
 				entry.credential.projectId === previous.projectId &&
-				entry.credential.profileArn === previous.profileArn
+				entry.credential.profileArn === previous.profileArn &&
+				entry.credential.organizationId === previous.organizationId
 			);
 		});
 		if (index === -1) return;
@@ -4300,6 +4415,8 @@ export class AuthStorage {
 				email: next.email,
 				enterpriseUrl: next.enterpriseUrl,
 				profileArn: next.profileArn ?? existing.profileArn,
+				organizationId: next.organizationId ?? existing.organizationId,
+				organizationName: next.organizationName ?? existing.organizationName,
 				mcpBinding: next.mcpBinding ?? existing.mcpBinding,
 			},
 			persist,
@@ -4665,6 +4782,9 @@ export class AuthStorage {
 		const email = this.#getUsageReportMetadataValue(report, "email");
 		if (email) identifiers.push(`email:${email.toLowerCase()}`);
 		if (report.provider === "openai-codex" || report.provider === "anthropic") {
+			// One Anthropic account can sign in to several organizations; each has its own limits.
+			const orgId = report.provider === "anthropic" ? this.#getUsageReportMetadataValue(report, "orgId") : undefined;
+			if (orgId) return identifiers.map(identifier => `${report.provider}:${identifier}|org:${orgId}`.toLowerCase());
 			return identifiers.map(identifier => `${report.provider}:${identifier.toLowerCase()}`);
 		}
 		const accountId = this.#getUsageReportMetadataValue(report, "accountId");
@@ -5954,6 +6074,8 @@ export class AuthStorage {
 								projectId: claim.credential.projectId,
 								enterpriseUrl: claim.credential.enterpriseUrl,
 								profileArn: claim.credential.profileArn,
+								organizationId: claim.credential.organizationId,
+								organizationName: claim.credential.organizationName,
 								mcpBinding: claim.credential.mcpBinding,
 								persistedByLease: true,
 							};
@@ -6074,6 +6196,8 @@ export class AuthStorage {
 				projectId: effectiveRefreshed.projectId ?? credential.projectId,
 				enterpriseUrl: effectiveRefreshed.enterpriseUrl ?? credential.enterpriseUrl,
 				profileArn: effectiveRefreshed.profileArn ?? credential.profileArn,
+				organizationId: effectiveRefreshed.organizationId ?? credential.organizationId,
+				organizationName: effectiveRefreshed.organizationName ?? credential.organizationName,
 				mcpBinding: (effectiveRefreshed as RefreshedOAuthCredentials).mcpBinding ?? credential.mcpBinding,
 			};
 			if (refreshLease) {
@@ -6262,6 +6386,8 @@ export class AuthStorage {
 				projectId: result.newCredentials.projectId ?? selection.credential.projectId,
 				enterpriseUrl: result.newCredentials.enterpriseUrl ?? selection.credential.enterpriseUrl,
 				profileArn: result.newCredentials.profileArn ?? selection.credential.profileArn,
+				organizationId: result.newCredentials.organizationId ?? selection.credential.organizationId,
+				organizationName: result.newCredentials.organizationName ?? selection.credential.organizationName,
 				mcpBinding: refreshedAuthority.mcpBinding,
 			};
 			this.#replaceCredentialAt(
@@ -7034,6 +7160,8 @@ export class AuthStorage {
 				projectId: refreshed.projectId ?? target.credential.projectId,
 				enterpriseUrl: refreshed.enterpriseUrl ?? target.credential.enterpriseUrl,
 				profileArn: refreshed.profileArn ?? target.credential.profileArn,
+				organizationId: refreshed.organizationId ?? target.credential.organizationId,
+				organizationName: refreshed.organizationName ?? target.credential.organizationName,
 				mcpBinding: refreshed.mcpBinding,
 			};
 			this.#replaceCredentialAt(provider, index, updated, !refreshed.persistedByLease, id);
@@ -7145,7 +7273,7 @@ export class AuthStorage {
 		const credential = chosen.credential;
 		const identity =
 			credential.type === "oauth"
-				? (credential.email ?? credential.accountId ?? credential.projectId ?? `cred ${chosen.id}`)
+				? (formatOAuthIdentityLabel(credential) ?? `cred ${chosen.id}`)
 				: `cred ${chosen.id}`;
 		return `${baseLabel} · ${preferredType} #${chosen.id} (${identity})`;
 	}
@@ -7258,7 +7386,22 @@ function resolveProviderCredentialIdentityKey(provider: string, identifiers: str
 
 function resolveCredentialIdentityKey(provider: string, credential: AuthCredential): string | null {
 	if (credential.type === "api_key") return null;
-	return resolveProviderCredentialIdentityKey(provider, extractOAuthCredentialIdentifiers(credential));
+	return withOrganizationIdentity(
+		resolveProviderCredentialIdentityKey(provider, extractOAuthCredentialIdentifiers(credential)),
+		credential,
+	);
+}
+
+/**
+ * Scope an account identity key to the credential's organization. One account
+ * (same email) can sign in to several organizations, and each login yields an
+ * independent credential with its own plan and limits, so they must not
+ * replace or dedupe each other.
+ */
+function withOrganizationIdentity(identityKey: string | null, credential: OAuthCredential): string | null {
+	const organizationId = credential.organizationId?.trim();
+	if (!identityKey || !organizationId) return identityKey;
+	return `${identityKey}|org:${organizationId}`;
 }
 
 function resolveRowCredentialIdentityKey(provider: string, row: AuthRow): string | null {
@@ -7353,6 +7496,7 @@ function extractOAuthTokenIdentifiers(token: string | undefined): string[] | und
  */
 export class SqliteAuthCredentialStore implements AuthCredentialStore {
 	#db: Database;
+	#ownedStatements: Statement[] = [];
 	#listActiveStmt: Statement;
 	#listActiveByProviderStmt: Statement;
 	#listAllStmt: Statement;
@@ -7378,53 +7522,89 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		this.#db = db;
 		this.#initializeSchema();
 
-		this.#listActiveStmt = this.#db.prepare(
+		this.#listActiveStmt = this.#prepareOwnedStatement(
 			"SELECT id, provider, credential_type, data, disabled_cause, identity_key, revision FROM auth_credentials WHERE disabled_cause IS NULL ORDER BY id ASC",
 		);
-		this.#listActiveByProviderStmt = this.#db.prepare(
+		this.#listActiveByProviderStmt = this.#prepareOwnedStatement(
 			"SELECT id, provider, credential_type, data, disabled_cause, identity_key, revision FROM auth_credentials WHERE provider = ? AND disabled_cause IS NULL ORDER BY id ASC",
 		);
-		this.#listAllStmt = this.#db.prepare(
+		this.#listAllStmt = this.#prepareOwnedStatement(
 			"SELECT id, provider, credential_type, data, disabled_cause, identity_key, revision FROM auth_credentials ORDER BY id ASC",
 		);
-		this.#listAllByProviderStmt = this.#db.prepare(
+		this.#listAllByProviderStmt = this.#prepareOwnedStatement(
 			"SELECT id, provider, credential_type, data, disabled_cause, identity_key, revision FROM auth_credentials WHERE provider = ? ORDER BY id ASC",
 		);
-		this.#listDisabledByProviderStmt = this.#db.prepare(
+		this.#listDisabledByProviderStmt = this.#prepareOwnedStatement(
 			"SELECT id, provider, credential_type, data, disabled_cause, identity_key, revision FROM auth_credentials WHERE provider = ? AND disabled_cause IS NOT NULL ORDER BY id ASC",
 		);
-		this.#insertStmt = this.#db.prepare(
+		this.#insertStmt = this.#prepareOwnedStatement(
 			`INSERT INTO auth_credentials (provider, credential_type, data, identity_key, revision, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ${SQLITE_NOW_EPOCH}, ${SQLITE_NOW_EPOCH}) RETURNING id`,
 		);
-		this.#updateStmt = this.#db.prepare(
+		this.#updateStmt = this.#prepareOwnedStatement(
 			`UPDATE auth_credentials SET credential_type = ?, data = ?, identity_key = ?, revision = revision + 1, updated_at = ${SQLITE_NOW_EPOCH} WHERE id = ?`,
 		);
-		this.#deleteStmt = this.#db.prepare(
+		this.#deleteStmt = this.#prepareOwnedStatement(
 			`UPDATE auth_credentials SET disabled_cause = ?, revision = revision + 1, updated_at = ${SQLITE_NOW_EPOCH} WHERE id = ?`,
 		);
-		this.#deleteIfMatchesStmt = this.#db.prepare(
+		this.#deleteIfMatchesStmt = this.#prepareOwnedStatement(
 			`UPDATE auth_credentials SET disabled_cause = ?, revision = revision + 1, updated_at = ${SQLITE_NOW_EPOCH} WHERE id = ? AND data = ? AND disabled_cause IS NULL`,
 		);
-		this.#deleteIfRevisionStmt = this.#db.prepare(
+		this.#deleteIfRevisionStmt = this.#prepareOwnedStatement(
 			`UPDATE auth_credentials SET disabled_cause = ?, revision = revision + 1, updated_at = ${SQLITE_NOW_EPOCH} WHERE id = ? AND revision = ? AND disabled_cause IS NULL`,
 		);
-		this.#deleteByProviderStmt = this.#db.prepare(
+		this.#deleteByProviderStmt = this.#prepareOwnedStatement(
 			`UPDATE auth_credentials SET disabled_cause = ?, revision = revision + 1, updated_at = ${SQLITE_NOW_EPOCH} WHERE provider = ? AND disabled_cause IS NULL`,
 		);
-		this.#hardDeleteStmt = this.#db.prepare("DELETE FROM auth_credentials WHERE id = ?");
-		this.#getCacheStmt = this.#db.prepare(
+		this.#hardDeleteStmt = this.#prepareOwnedStatement("DELETE FROM auth_credentials WHERE id = ?");
+		this.#getCacheStmt = this.#prepareOwnedStatement(
 			`SELECT value FROM cache WHERE key = ? AND expires_at > ${SQLITE_NOW_EPOCH}`,
 		);
-		this.#getCacheIncludingExpiredStmt = this.#db.prepare("SELECT value FROM cache WHERE key = ?");
-		this.#upsertCacheStmt = this.#db.prepare(
+		this.#getCacheIncludingExpiredStmt = this.#prepareOwnedStatement("SELECT value FROM cache WHERE key = ?");
+		this.#upsertCacheStmt = this.#prepareOwnedStatement(
 			"INSERT INTO cache (key, value, expires_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, expires_at = excluded.expires_at",
 		);
-		this.#claimUsageFetchLeaseStmt = this.#db.prepare(
+		this.#claimUsageFetchLeaseStmt = this.#prepareOwnedStatement(
 			"INSERT INTO cache (key, value, expires_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, expires_at = excluded.expires_at WHERE cache.expires_at <= ?",
 		);
-		this.#releaseUsageFetchLeaseStmt = this.#db.prepare("DELETE FROM cache WHERE key = ? AND value = ?");
-		this.#deleteCachePrefixStmt = this.#db.prepare("DELETE FROM cache WHERE substr(key, 1, ?) = ?");
-		this.#deleteExpiredCacheStmt = this.#db.prepare(`DELETE FROM cache WHERE expires_at <= ${SQLITE_NOW_EPOCH}`);
+		this.#releaseUsageFetchLeaseStmt = this.#prepareOwnedStatement("DELETE FROM cache WHERE key = ? AND value = ?");
+		this.#deleteCachePrefixStmt = this.#prepareOwnedStatement("DELETE FROM cache WHERE substr(key, 1, ?) = ?");
+		this.#deleteExpiredCacheStmt = this.#prepareOwnedStatement(
+			`DELETE FROM cache WHERE expires_at <= ${SQLITE_NOW_EPOCH}`,
+		);
+	}
+
+	#prepareOwnedStatement(sql: string): Statement {
+		const statement = this.#db.prepare(sql);
+		this.#ownedStatements.push(statement);
+		return statement;
+	}
+
+	#withStatement<T>(sql: string, use: (statement: Statement) => T): T {
+		const statement = this.#db.prepare(sql);
+		let result!: T;
+		let operationFailed = false;
+		let operationError: unknown;
+		try {
+			result = use(statement);
+		} catch (error) {
+			operationFailed = true;
+			operationError = error;
+		}
+
+		try {
+			statement.finalize();
+		} catch (finalizeError) {
+			if (operationFailed) {
+				throw new AggregateError(
+					[operationError, finalizeError],
+					"SQLite statement operation and finalization failed",
+					{ cause: operationError },
+				);
+			}
+			throw finalizeError;
+		}
+		if (operationFailed) throw operationError;
+		return result;
 	}
 
 	static async open(dbPath: string = getAgentDbPath()): Promise<SqliteAuthCredentialStore> {
@@ -7500,33 +7680,40 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 	}
 
 	#authCredentialsTableExists(): boolean {
-		const row = this.#db
-			.prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'auth_credentials'")
-			.get() as { present?: number } | undefined;
-		return row?.present === 1;
+		return this.#withStatement(
+			"SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'auth_credentials'",
+			statement => {
+				const row = statement.get() as { present?: number } | undefined;
+				return row?.present === 1;
+			},
+		);
 	}
 
 	#readAuthSchemaVersion(): number | null {
-		const row = this.#db.prepare("SELECT version FROM auth_schema_version WHERE id = 1").get() as
-			| { version?: number }
-			| undefined;
-		return typeof row?.version === "number" ? row.version : null;
+		return this.#withStatement("SELECT version FROM auth_schema_version WHERE id = 1", statement => {
+			const row = statement.get() as { version?: number } | undefined;
+			return typeof row?.version === "number" ? row.version : null;
+		});
 	}
 
 	#writeAuthSchemaVersion(version: number): void {
-		this.#db.prepare("INSERT OR REPLACE INTO auth_schema_version(id, version) VALUES (1, ?)").run(version);
+		this.#withStatement("INSERT OR REPLACE INTO auth_schema_version(id, version) VALUES (1, ?)", statement => {
+			statement.run(version);
+		});
 	}
 
 	#inferAuthSchemaVersion(): number {
-		const cols = this.#db.prepare("PRAGMA table_info(auth_credentials)").all() as Array<{ name?: string }>;
-		const hasDisabledCause = cols.some(column => column.name === "disabled_cause");
-		const hasIdentityKey = cols.some(column => column.name === "identity_key");
-		const hasAccountId = cols.some(column => column.name === "account_id");
-		const hasEmail = cols.some(column => column.name === "email");
-		if (hasIdentityKey) return 3;
-		if (hasAccountId || hasEmail) return 2;
-		if (hasDisabledCause) return 1;
-		return 0;
+		return this.#withStatement("PRAGMA table_info(auth_credentials)", statement => {
+			const cols = statement.all() as Array<{ name?: string }>;
+			const hasDisabledCause = cols.some(column => column.name === "disabled_cause");
+			const hasIdentityKey = cols.some(column => column.name === "identity_key");
+			const hasAccountId = cols.some(column => column.name === "account_id");
+			const hasEmail = cols.some(column => column.name === "email");
+			if (hasIdentityKey) return 3;
+			if (hasAccountId || hasEmail) return 2;
+			if (hasDisabledCause) return 1;
+			return 0;
+		});
 	}
 
 	#createAuthCredentialsTable(): void {
@@ -7570,7 +7757,10 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 
 	#migrateAuthSchemaV0ToV1(): void {
 		const migrate = this.#db.transaction(() => {
-			const v0Cols = this.#db.prepare("PRAGMA table_info(auth_credentials)").all() as Array<{ name?: string }>;
+			const v0Cols = this.#withStatement(
+				"PRAGMA table_info(auth_credentials)",
+				statement => statement.all() as Array<{ name?: string }>,
+			);
 			const hasDisabled = v0Cols.some(col => col.name === "disabled");
 
 			this.#db.run("ALTER TABLE auth_credentials RENAME TO auth_credentials_v0");
@@ -7646,24 +7836,27 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		migrate.immediate();
 	}
 	#migrateAuthSchemaV4ToV5(): void {
-		const columns = this.#db.prepare("PRAGMA table_info(auth_credentials)").all() as Array<{ name?: string }>;
+		const columns = this.#withStatement(
+			"PRAGMA table_info(auth_credentials)",
+			statement => statement.all() as Array<{ name?: string }>,
+		);
 		if (columns.some(column => column.name === "revision")) return;
 		this.#db.run("ALTER TABLE auth_credentials ADD COLUMN revision INTEGER NOT NULL DEFAULT 1");
 	}
 
 	#backfillCredentialIdentityKeys(): void {
-		const rows = this.#db
-			.prepare(
-				"SELECT id, provider, credential_type, data, disabled_cause, identity_key, revision FROM auth_credentials WHERE identity_key IS NULL ORDER BY id ASC",
-			)
-			.all() as AuthRow[];
+		const rows = this.#withStatement(
+			"SELECT id, provider, credential_type, data, disabled_cause, identity_key, revision FROM auth_credentials WHERE identity_key IS NULL ORDER BY id ASC",
+			statement => statement.all() as AuthRow[],
+		);
 		if (rows.length === 0) return;
 
-		const updateIdentity = this.#db.prepare("UPDATE auth_credentials SET identity_key = ? WHERE id = ?");
-		for (const row of rows) {
-			const identityKey = resolveRowCredentialIdentityKey(row.provider, row);
-			updateIdentity.run(identityKey, row.id);
-		}
+		this.#withStatement("UPDATE auth_credentials SET identity_key = ? WHERE id = ?", updateIdentity => {
+			for (const row of rows) {
+				const identityKey = resolveRowCredentialIdentityKey(row.provider, row);
+				updateIdentity.run(identityKey, row.id);
+			}
+		});
 	}
 
 	// ─── AuthCredentialStore interface ──────────────────────────────────────
@@ -7692,10 +7885,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		for (const row of rows) {
 			const credential = deserializeCredential(row);
 			if (!credential) continue;
-			const identityLabel =
-				credential.type === "oauth"
-					? (credential.email ?? credential.accountId ?? credential.projectId ?? null)
-					: null;
+			const identityLabel = credential.type === "oauth" ? formatOAuthIdentityLabel(credential) : null;
 			results.push({
 				id: row.id,
 				provider: row.provider,
@@ -7704,6 +7894,12 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				...(credential.type === "oauth" && credential.accountId ? { accountId: credential.accountId } : {}),
 				...(credential.type === "oauth" && credential.email ? { email: credential.email } : {}),
 				...(credential.type === "oauth" && credential.projectId ? { projectId: credential.projectId } : {}),
+				...(credential.type === "oauth" && credential.organizationId
+					? { organizationId: credential.organizationId }
+					: {}),
+				...(credential.type === "oauth" && credential.organizationName
+					? { organizationName: credential.organizationName }
+					: {}),
 				disabled: row.disabled_cause !== null,
 				disabledCause: row.disabled_cause,
 			});
@@ -7726,11 +7922,13 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		const remove = this.#db.transaction((): AuthCredentialHardRemovalResult => {
 			const currentIds: number[] = [];
 			for (const target of unique) {
-				const row = this.#db
-					.prepare("SELECT id, provider, credential_type, revision FROM auth_credentials WHERE id = ?")
-					.get(target.id) as
-					| { id?: number; provider?: string; credential_type?: string; revision?: number }
-					| undefined;
+				const row = this.#withStatement(
+					"SELECT id, provider, credential_type, revision FROM auth_credentials WHERE id = ?",
+					statement =>
+						statement.get(target.id) as
+							| { id?: number; provider?: string; credential_type?: string; revision?: number }
+							| undefined,
+				);
 				if (!row || row.provider !== provider || row.revision !== target.expectedRevision) {
 					currentIds.push(row?.id ?? target.id);
 				}
@@ -7738,12 +7936,16 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			if (currentIds.length > 0) return { kind: "conflict", currentIds };
 			for (const target of unique) {
 				this.#hardDeleteStmt.run(target.id);
-				this.#db.prepare("DELETE FROM oauth_refresh_leases WHERE credential_id = ?").run(target.id);
-				this.#db.prepare("DELETE FROM cache WHERE key = ?").run(`${HEALTH_CACHE_PREFIX}${target.id}`);
+				this.#withStatement("DELETE FROM oauth_refresh_leases WHERE credential_id = ?", statement => {
+					statement.run(target.id);
+				});
+				this.#withStatement("DELETE FROM cache WHERE key = ?", statement => {
+					statement.run(`${HEALTH_CACHE_PREFIX}${target.id}`);
+				});
 			}
-			this.#db
-				.prepare("DELETE FROM cache WHERE substr(key, 1, ?) = ?")
-				.run(`usage_cache:report:${provider}:`.length, `usage_cache:report:${provider}:`);
+			this.#withStatement("DELETE FROM cache WHERE substr(key, 1, ?) = ?", statement => {
+				statement.run(`usage_cache:report:${provider}:`.length, `usage_cache:report:${provider}:`);
+			});
 			return { kind: "removed", ids: unique.map(target => target.id) };
 		});
 		return remove.immediate();
@@ -7760,11 +7962,10 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		const enteredAtMs = Date.now();
 		const claim = this.#db.transaction((): OAuthRefreshLeaseClaim => {
 			const effectiveNowMs = nowMs + Math.max(0, Date.now() - enteredAtMs);
-			const row = this.#db
-				.prepare(
-					"SELECT id, provider, credential_type, data, disabled_cause, identity_key, revision FROM auth_credentials WHERE id = ? AND disabled_cause IS NULL",
-				)
-				.get(credentialId) as AuthRow | undefined;
+			const row = this.#withStatement(
+				"SELECT id, provider, credential_type, data, disabled_cause, identity_key, revision FROM auth_credentials WHERE id = ? AND disabled_cause IS NULL",
+				statement => statement.get(credentialId) as AuthRow | undefined,
+			);
 			const credential = row ? deserializeCredential(row) : null;
 			if (credential?.type !== "oauth") return { kind: "missing" };
 			if (
@@ -7781,14 +7982,16 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			) {
 				return { kind: "adopted", credential };
 			}
-			const active = this.#db
-				.prepare("SELECT owner, expires_at FROM oauth_refresh_leases WHERE credential_id = ?")
-				.get(credentialId) as { owner?: string; expires_at?: number } | undefined;
+			const active = this.#withStatement(
+				"SELECT owner, expires_at FROM oauth_refresh_leases WHERE credential_id = ?",
+				statement => statement.get(credentialId) as { owner?: string; expires_at?: number } | undefined,
+			);
 			if (typeof active?.expires_at === "number" && active.expires_at > effectiveNowMs) {
 				if (active.owner === owner) {
-					this.#db
-						.prepare("UPDATE oauth_refresh_leases SET expires_at = ? WHERE credential_id = ? AND owner = ?")
-						.run(effectiveNowMs + leaseMs, credentialId, owner);
+					this.#withStatement(
+						"UPDATE oauth_refresh_leases SET expires_at = ? WHERE credential_id = ? AND owner = ?",
+						statement => statement.run(effectiveNowMs + leaseMs, credentialId, owner),
+					);
 					return {
 						kind: "claimed",
 						credential,
@@ -7802,13 +8005,14 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				return { kind: "busy", expiresAt: active.expires_at };
 			}
 
-			this.#db.prepare("DELETE FROM oauth_refresh_leases WHERE credential_id = ?").run(credentialId);
+			this.#withStatement("DELETE FROM oauth_refresh_leases WHERE credential_id = ?", statement => {
+				statement.run(credentialId);
+			});
 			const tokenFingerprint = crypto.createHash("sha256").update(credential.refresh).digest("hex");
-			this.#db
-				.prepare(
-					"INSERT INTO oauth_refresh_leases (credential_id, owner, token_fingerprint, expires_at) VALUES (?, ?, ?, ?)",
-				)
-				.run(credentialId, owner, tokenFingerprint, effectiveNowMs + leaseMs);
+			this.#withStatement(
+				"INSERT INTO oauth_refresh_leases (credential_id, owner, token_fingerprint, expires_at) VALUES (?, ?, ?, ?)",
+				statement => statement.run(credentialId, owner, tokenFingerprint, effectiveNowMs + leaseMs),
+			);
 			return { kind: "claimed", credential, lease: { credentialId, owner, tokenFingerprint } };
 		});
 		return claim.immediate();
@@ -7816,22 +8020,24 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 
 	completeOAuthRefreshLease(lease: OAuthRefreshLease, credential: OAuthCredential): boolean {
 		const serialized = serializeCredential(
-			(
-				this.#db.prepare("SELECT provider FROM auth_credentials WHERE id = ?").get(lease.credentialId) as
-					| { provider?: string }
-					| undefined
+			this.#withStatement(
+				"SELECT provider FROM auth_credentials WHERE id = ?",
+				statement => statement.get(lease.credentialId) as { provider?: string } | undefined,
 			)?.provider ?? "",
 			credential,
 		);
 		if (!serialized) return false;
 		const complete = this.#db.transaction(() => {
-			const leaseRow = this.#db
-				.prepare("SELECT owner, token_fingerprint FROM oauth_refresh_leases WHERE credential_id = ?")
-				.get(lease.credentialId) as { owner?: string; token_fingerprint?: string } | undefined;
+			const leaseRow = this.#withStatement(
+				"SELECT owner, token_fingerprint FROM oauth_refresh_leases WHERE credential_id = ?",
+				statement =>
+					statement.get(lease.credentialId) as { owner?: string; token_fingerprint?: string } | undefined,
+			);
 			if (leaseRow?.owner !== lease.owner || leaseRow.token_fingerprint !== lease.tokenFingerprint) return false;
-			const row = this.#db
-				.prepare("SELECT data FROM auth_credentials WHERE id = ? AND disabled_cause IS NULL")
-				.get(lease.credentialId) as { data?: string } | undefined;
+			const row = this.#withStatement(
+				"SELECT data FROM auth_credentials WHERE id = ? AND disabled_cause IS NULL",
+				statement => statement.get(lease.credentialId) as { data?: string } | undefined,
+			);
 			if (
 				!row ||
 				crypto
@@ -7841,18 +8047,18 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			)
 				return false;
 			this.#updateStmt.run(serialized.credentialType, serialized.data, serialized.identityKey, lease.credentialId);
-			this.#db
-				.prepare("DELETE FROM oauth_refresh_leases WHERE credential_id = ? AND owner = ?")
-				.run(lease.credentialId, lease.owner);
+			this.#withStatement("DELETE FROM oauth_refresh_leases WHERE credential_id = ? AND owner = ?", statement => {
+				statement.run(lease.credentialId, lease.owner);
+			});
 			return true;
 		});
 		return complete.immediate();
 	}
 
 	releaseOAuthRefreshLease(lease: OAuthRefreshLease): void {
-		this.#db
-			.prepare("DELETE FROM oauth_refresh_leases WHERE credential_id = ? AND owner = ?")
-			.run(lease.credentialId, lease.owner);
+		this.#withStatement("DELETE FROM oauth_refresh_leases WHERE credential_id = ? AND owner = ?", statement => {
+			statement.run(lease.credentialId, lease.owner);
+		});
 	}
 
 	replaceAuthCredentialsForProvider(provider: string, credentials: AuthCredential[]): StoredAuthCredential[] {
@@ -8076,9 +8282,10 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 	}
 
 	updateAuthCredential(id: number, credential: AuthCredential): void {
-		const providerRow = this.#db.prepare("SELECT provider FROM auth_credentials WHERE id = ?").get(id) as
-			| { provider?: string }
-			| undefined;
+		const providerRow = this.#withStatement(
+			"SELECT provider FROM auth_credentials WHERE id = ?",
+			statement => statement.get(id) as { provider?: string } | undefined,
+		);
 		const provider = providerRow?.provider ?? "";
 		const serialized = serializeCredential(provider, credential);
 		if (!serialized) return;
@@ -8277,25 +8484,23 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 	close(): void {
 		if (this.#closed) return;
 		this.#closed = true;
-		this.#listActiveStmt.finalize();
-		this.#listActiveByProviderStmt.finalize();
-		this.#listAllStmt.finalize();
-		this.#listAllByProviderStmt.finalize();
-		this.#listDisabledByProviderStmt.finalize();
-		this.#insertStmt.finalize();
-		this.#updateStmt.finalize();
-		this.#deleteStmt.finalize();
-		this.#deleteIfMatchesStmt.finalize();
-		this.#deleteIfRevisionStmt.finalize();
-		this.#deleteByProviderStmt.finalize();
-		this.#hardDeleteStmt.finalize();
-		this.#getCacheStmt.finalize();
-		this.#getCacheIncludingExpiredStmt.finalize();
-		this.#upsertCacheStmt.finalize();
-		this.#claimUsageFetchLeaseStmt.finalize();
-		this.#releaseUsageFetchLeaseStmt.finalize();
-		this.#deleteCachePrefixStmt.finalize();
-		this.#deleteExpiredCacheStmt.finalize();
-		this.#db.close(true);
+		const errors: unknown[] = [];
+		for (const statement of this.#ownedStatements) {
+			try {
+				statement.finalize();
+			} catch (error) {
+				errors.push(error);
+			}
+		}
+		this.#ownedStatements.length = 0;
+		try {
+			this.#db.close(true);
+		} catch (error) {
+			errors.push(error);
+		}
+		if (errors.length === 1) throw errors[0];
+		if (errors.length > 1) {
+			throw new AggregateError(errors, "Failed to close SQLite auth credential store", { cause: errors[0] });
+		}
 	}
 }

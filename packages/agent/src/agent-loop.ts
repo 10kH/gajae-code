@@ -3413,7 +3413,7 @@ function buildAgentEndEvent(
 	messages: AgentMessage[],
 	telemetry: AgentTelemetry | undefined,
 	stepCount: number,
-	stopReason: "completed" | "paused" = "completed",
+	stopReason: "completed" | "paused" | "cancelled" = "completed",
 	scope?: AttemptScope,
 ): Extract<AgentEvent, { type: "agent_end" }> {
 	const base = { type: "agent_end" as const, messages, stopReason, ...(scope ? { scope } : {}) };
@@ -3857,6 +3857,23 @@ async function runLoopBody(
 	// the loop could run forever. Any turn that produces a non-malformed batch
 	// resets the counter, so healthy runs are unaffected.
 	let consecutiveMalformedTurns = 0;
+	const finishCancelled = (scope?: AttemptScope): void => {
+		publishAgentEnd(
+			stream,
+			config,
+			buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "cancelled", scope),
+			scope,
+		);
+		stream.end(newMessages);
+	};
+	const commitMessages = (messages: AgentMessage[], scope?: AttemptScope): void => {
+		for (const message of messages) {
+			stream.push({ type: "message_start", message, scope });
+			stream.push({ type: "message_end", message, scope });
+			currentContext.messages.push(message);
+			newMessages.push(message);
+		}
+	};
 
 	// Outer loop: continues when queued follow-up messages arrive after agent would stop
 	while (true) {
@@ -3889,12 +3906,7 @@ async function runLoopBody(
 			// Commit queued user input outside the provisional assistant transaction so a
 			// discarded managed attempt cannot lose it before its retry continuation.
 			if (pendingMessages.length > 0) {
-				for (const message of pendingMessages) {
-					stream.push({ type: "message_start", message, scope: attemptScope });
-					stream.push({ type: "message_end", message, scope: attemptScope });
-					currentContext.messages.push(message);
-					newMessages.push(message);
-				}
+				commitMessages(pendingMessages, attemptScope);
 				pendingMessages = [];
 			}
 
@@ -4411,13 +4423,17 @@ async function runLoopBody(
 					});
 				}
 				stream.push({ type: "turn_end", message, toolResults, scope: attemptScope });
-				publishAgentEnd(
-					stream,
-					config,
-					buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "completed", attemptScope),
-					attemptScope,
-				);
-				stream.end(newMessages);
+				if (message.stopReason === "aborted") {
+					finishCancelled(attemptScope);
+				} else {
+					publishAgentEnd(
+						stream,
+						config,
+						buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "completed", attemptScope),
+						attemptScope,
+					);
+					stream.end(newMessages);
+				}
 				return;
 			}
 
@@ -4578,7 +4594,15 @@ async function runLoopBody(
 		}
 
 		// Agent would stop here. Check for follow-up messages.
+		if (loopSignal.aborted) {
+			finishCancelled(lastAttemptScope);
+			return;
+		}
 		await config.onBeforeYield?.();
+		if (loopSignal.aborted) {
+			finishCancelled(lastAttemptScope);
+			return;
+		}
 		if (config.shouldPause?.()) {
 			publishAgentEnd(
 				stream,
@@ -4593,7 +4617,16 @@ async function runLoopBody(
 		// user message can supersede it without letting the stale recovery resurface
 		// after that follow-up turn.
 		const syntheticRecoveryMessage = await config.getSyntheticRecoveryMessage?.();
+		if (loopSignal.aborted) {
+			finishCancelled(lastAttemptScope);
+			return;
+		}
 		const followUpMessages = (await config.getFollowUpMessages?.()) || [];
+		if (loopSignal.aborted) {
+			commitMessages(followUpMessages, lastAttemptScope);
+			finishCancelled(lastAttemptScope);
+			return;
+		}
 		if (followUpMessages.length > 0) {
 			// Set as pending so inner loop processes them
 			pendingMessages = followUpMessages;
