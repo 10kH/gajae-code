@@ -1104,40 +1104,63 @@ function shellReadsStdin(arguments_: Token[]): boolean {
 	return true;
 }
 
+function shellRunnerIndex(tokens: Token[], commandIndex: number, segment: number): number | undefined {
+	const command = tokens[commandIndex];
+	if (commandName(command.text) === "busybox") {
+		for (let cursor = commandIndex + 1; cursor < tokens.length; cursor++) {
+			const argument = tokens[cursor];
+			if (argument.segment !== segment || argument.commandStart) break;
+			if (argument.isRedirectionTarget || argument.text.startsWith("-")) continue;
+			const applet = commandName(argument.text);
+			return applet !== "busybox" && SHELL_RUNNERS.has(applet) ? cursor : undefined;
+		}
+		return undefined;
+	}
+	return SHELL_RUNNERS.has(commandName(command.text)) ? commandIndex : undefined;
+}
+
+function shellArguments(tokens: Token[], shellIndex: number, segment: number): Token[] {
+	const args: Token[] = [];
+	for (let cursor = shellIndex + 1; cursor < tokens.length; cursor++) {
+		const argument = tokens[cursor];
+		if (argument.segment !== segment || argument.commandStart) break;
+		if (!argument.isRedirectionTarget) args.push(argument);
+	}
+	return args;
+}
+
+function hasShellStdinConsumer(tokens: Token[], segment: number, depth = 0): boolean {
+	const segmentTokens = tokens.filter(token => token.segment === segment);
+	for (let index = 0; index < segmentTokens.length; index++) {
+		const token = segmentTokens[index];
+		if (!token.commandStart || isCommandLookup(segmentTokens, index)) continue;
+		const shellIndex = shellRunnerIndex(segmentTokens, index, segment);
+		if (shellIndex !== undefined && shellReadsStdin(shellArguments(segmentTokens, shellIndex, segment))) return true;
+	}
+	if (depth >= MAX_INDIRECTION_DEPTH) return false;
+
+	for (const payload of collectShellPayloads(segmentTokens)) {
+		const nested = tokenize(payload);
+		if (nested.hereDocuments.length > 0) continue;
+		for (const nestedSegment of new Set(nested.tokens.map(token => token.segment))) {
+			if (hasShellStdinConsumer(nested.tokens, nestedSegment, depth + 1)) return true;
+		}
+	}
+	return false;
+}
+
 function collectShellStdinPayloads(tokens: Token[], hereDocuments: HereDocument[]): string[] {
 	const payloads: string[] = [];
-	for (const hereDocument of hereDocuments) {
+	for (let index = 0; index < hereDocuments.length; index++) {
+		const hereDocument = hereDocuments[index];
 		if (!hereDocument.stdin || hereDocument.body.length === 0) continue;
-
-		for (let index = 0; index < tokens.length; index++) {
-			const token = tokens[index];
-			if (token.segment !== hereDocument.segment || !token.commandStart || isCommandLookup(tokens, index)) continue;
-
-			let shellIndex: number | undefined;
-			if (commandName(token.text) === "busybox") {
-				for (let cursor = index + 1; cursor < tokens.length; cursor++) {
-					const argument = tokens[cursor];
-					if (argument.segment !== hereDocument.segment || argument.commandStart) break;
-					if (argument.isRedirectionTarget || argument.text.startsWith("-")) continue;
-					if (SHELL_RUNNERS.has(commandName(argument.text))) shellIndex = cursor;
-					break;
-				}
-			} else if (SHELL_RUNNERS.has(commandName(token.text))) {
-				shellIndex = index;
-			}
-			if (shellIndex === undefined) continue;
-
-			const shellArguments: Token[] = [];
-			for (let cursor = shellIndex + 1; cursor < tokens.length; cursor++) {
-				const argument = tokens[cursor];
-				if (argument.segment !== hereDocument.segment || argument.commandStart) break;
-				if (!argument.isRedirectionTarget) shellArguments.push(argument);
-			}
-			if (shellReadsStdin(shellArguments)) {
-				payloads.push(hereDocument.body);
-				break;
-			}
+		if (
+			hereDocuments.slice(index + 1).some(later => later.segment === hereDocument.segment && later.stdin) ||
+			!hasShellStdinConsumer(tokens, hereDocument.segment)
+		) {
+			continue;
 		}
+		payloads.push(hereDocument.body);
 	}
 	return payloads;
 }
