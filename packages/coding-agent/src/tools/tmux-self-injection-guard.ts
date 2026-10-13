@@ -184,6 +184,7 @@ interface Token {
 	quoted: boolean;
 	commandStart: boolean;
 	segment: number;
+	pipeline: number;
 	stdinRedirectOrder?: number;
 	stdinRedirectSource?: "here-document" | "other";
 	isRedirectionTarget?: boolean;
@@ -194,6 +195,7 @@ interface HereDocument {
 	delimiter: string;
 	stripTabs: boolean;
 	segment: number;
+	pipeline: number;
 	stdin: boolean;
 	redirectOrder: number;
 	body: string;
@@ -255,6 +257,7 @@ function tokenize(command: string): TokenizeResult {
 	let quote: "'" | '"' | undefined;
 	let atCommandStart = true;
 	let segment = 0;
+	let pipeline = 0;
 	let wrapperCommand:
 		| { name: string; spec: WrapperSpec; optionsTerminated: boolean; assignmentAware: boolean }
 		| undefined;
@@ -289,12 +292,13 @@ function tokenize(command: string): TokenizeResult {
 					}
 				}
 			}
-			tokens.push({ text, quoted, commandStart: false, segment, isRedirectionTarget: true });
+			tokens.push({ text, quoted, commandStart: false, segment, pipeline, isRedirectionTarget: true });
 			if (redirectionTargetIsHereDoc) {
 				const hereDocument: HereDocument = {
 					delimiter: text,
 					stripTabs: redirectionTargetStripTabs,
 					segment,
+					pipeline,
 					stdin: redirectionTargetFd === undefined || redirectionTargetFd === 0,
 					redirectOrder: redirectOrder ?? 0,
 					body: "",
@@ -471,6 +475,7 @@ function tokenize(command: string): TokenizeResult {
 			quoted,
 			commandStart,
 			segment,
+			pipeline,
 			...(stdinRedirect && { stdinRedirectOrder: stdinRedirect.order, stdinRedirectSource: stdinRedirect.source }),
 			...(isWrappedCommand && { isWrappedCommand }),
 		};
@@ -524,6 +529,7 @@ function tokenize(command: string): TokenizeResult {
 		if (ch === "\n") {
 			flush();
 			segment++;
+			pipeline++;
 			atCommandStart = true;
 			wrapperCommand = undefined;
 			skipNextArg = false;
@@ -576,6 +582,7 @@ function tokenize(command: string): TokenizeResult {
 		if (isSeparator(ch)) {
 			flush();
 			segment++;
+			if (ch !== "|" || command[index - 1] === "|") pipeline++;
 			atCommandStart = true;
 			wrapperCommand = undefined;
 			skipNextArg = false;
@@ -1110,7 +1117,15 @@ function shellReadsStdin(arguments_: Token[], stdinRedirectSource?: "here-docume
 			optionsTerminated = true;
 			continue;
 		}
-		if (argument === "-" || argument === "-s") return true;
+		if (
+			argument === "-" ||
+			argument === "-s" ||
+			argument === "/dev/stdin" ||
+			argument === "/dev/fd/0" ||
+			argument === "/proc/self/fd/0"
+		) {
+			return true;
+		}
 		if (
 			argument === "-c" ||
 			(argument.startsWith("-") &&
@@ -1205,14 +1220,18 @@ function xargsConsumesStdin(tokens: Token[], commandIndex: number, segment: numb
 	return false;
 }
 
-function hasShellStdinConsumer(tokens: Token[], segment: number, depth = 0): boolean {
+function hasShellStdinConsumer(tokens: Token[], segment: number, depth = 0, hereDocumentOrder?: number): boolean {
 	const segmentTokens = tokens.filter(token => token.segment === segment);
 	for (let index = 0; index < segmentTokens.length; index++) {
 		const token = segmentTokens[index];
 		if (!token.commandStart || isCommandLookup(segmentTokens, index)) continue;
 		const shellIndex = shellRunnerIndex(segmentTokens, index, segment);
+		const readsHereDocument =
+			token.stdinRedirectSource !== "here-document" ||
+			(token.stdinRedirectOrder === hereDocumentOrder && hereDocumentOrder !== undefined);
 		if (
 			shellIndex !== undefined &&
+			readsHereDocument &&
 			!xargsConsumesStdin(segmentTokens, index, segment) &&
 			shellReadsStdin(shellArguments(segmentTokens, shellIndex, segment), token.stdinRedirectSource)
 		) {
@@ -1223,13 +1242,32 @@ function hasShellStdinConsumer(tokens: Token[], segment: number, depth = 0): boo
 	for (let index = 0; index < segmentTokens.length; index++) {
 		const token = segmentTokens[index];
 		if (!token.commandStart || shellRunnerIndex(segmentTokens, index, segment) === undefined) continue;
-		if (xargsConsumesStdin(segmentTokens, index, segment) || token.stdinRedirectSource === "other") return false;
+		if (
+			xargsConsumesStdin(segmentTokens, index, segment) ||
+			token.stdinRedirectSource === "other" ||
+			(token.stdinRedirectSource === "here-document" &&
+				(token.stdinRedirectOrder !== hereDocumentOrder || hereDocumentOrder === undefined))
+		) {
+			return false;
+		}
 	}
 
 	for (const payload of collectShellPayloads(segmentTokens)) {
 		const nested = tokenize(payload);
-		if (nested.hereDocuments.length > 0) continue;
+		const pipelinesWithOwnStdin = new Set(
+			nested.hereDocuments
+				.filter(hereDocument => {
+					if (!hereDocument.stdin) return false;
+					const redirectOrder = nested.tokens.find(
+						token => token.segment === hereDocument.segment && token.commandStart,
+					)?.stdinRedirectOrder;
+					return redirectOrder === hereDocument.redirectOrder;
+				})
+				.map(hereDocument => hereDocument.pipeline),
+		);
 		for (const nestedSegment of new Set(nested.tokens.map(token => token.segment))) {
+			const nestedPipeline = nested.tokens.find(token => token.segment === nestedSegment)?.pipeline;
+			if (nestedPipeline !== undefined && pipelinesWithOwnStdin.has(nestedPipeline)) continue;
 			if (hasShellStdinConsumer(nested.tokens, nestedSegment, depth + 1)) return true;
 		}
 	}
@@ -1244,9 +1282,19 @@ function collectShellStdinPayloads(tokens: Token[], hereDocuments: HereDocument[
 		const commandRedirectOrder = tokens.find(
 			token => token.segment === hereDocument.segment && token.commandStart,
 		)?.stdinRedirectOrder;
-		if (commandRedirectOrder !== hereDocument.redirectOrder || !hasShellStdinConsumer(tokens, hereDocument.segment)) {
-			continue;
+		if (commandRedirectOrder !== hereDocument.redirectOrder) continue;
+		const pipelineSegments = new Set(
+			tokens.filter(token => token.pipeline === hereDocument.pipeline).map(token => token.segment),
+		);
+		let consumed = false;
+		for (const segment of pipelineSegments) {
+			const sourceOrder = segment === hereDocument.segment ? hereDocument.redirectOrder : undefined;
+			if (hasShellStdinConsumer(tokens, segment, 0, sourceOrder)) {
+				consumed = true;
+				break;
+			}
 		}
+		if (!consumed) continue;
 		payloads.push(hereDocument.body);
 	}
 	return payloads;

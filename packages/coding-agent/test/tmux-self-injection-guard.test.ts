@@ -975,9 +975,12 @@ describe("tmux self-injection guard", () => {
 			const script = "tmux send-keys -t %47 x";
 			for (const command of [
 				`bash <<'EOF'\n${script}\nEOF`,
+				`bash /dev/stdin <<'EOF'\n${script}\nEOF`,
 				`bash -s <<'EOF'\n${script}\nEOF`,
 				`bash -- - <<'EOF'\n${script}\nEOF`,
 				`bash -c bash <<'EOF'\n${script}\nEOF`,
+				`cat <<'EOF' | bash\n${script}\nEOF`,
+				`bash -c 'bash 3<<INNER\n:\nINNER\n' <<'OUTER'\n${script}\nOUTER`,
 				`env bash <<'EOF'\n${script}\nEOF`,
 				`env -S bash <<'EOF'\n${script}\nEOF`,
 				`busybox sh <<'EOF'\n${script}\nEOF`,
@@ -990,7 +993,9 @@ describe("tmux self-injection guard", () => {
 			const document = "tmux send-keys -t %47 x";
 			for (const command of [
 				`cat <<'EOF'\n${document}\nEOF`,
+				`cat <<'EOF' | cat\n${document}\nEOF`,
 				`bash -c cat <<'EOF'\n${document}\nEOF`,
+				`bash -c 'bash <<INNER\n:\nINNER\n' <<'OUTER'\n${document}\nOUTER`,
 				`bash /tmp/script.sh <<'EOF'\n${document}\nEOF`,
 				`bash <<'EOF' < /dev/null\n${document}\nEOF`,
 				`bash -c 'bash </dev/null' <<'EOF'\n${document}\nEOF`,
