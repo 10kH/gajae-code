@@ -8552,6 +8552,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		});
 		const activeTools = new Set(["unfenced-tool"]);
 		const toolDrainObserved = Promise.withResolvers<void>();
+		const terminalPublication = Promise.withResolvers<SdkOnlyDeadlineRecoveryCheckpoint>();
 		const recoveryCheckpoints: SdkOnlyDeadlineRecoveryCheckpoint[] = [];
 		const persistenceLog: Array<PersistenceInstrumentationEvent & { label: string }> = [];
 		let boundaryWaitStarted = false;
@@ -8576,7 +8577,11 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 					getReconciliationStore: () => store,
 					getTerminalTurnEpoch: () => 109,
 					getActivePromptHandle: () => "deadline-captured-uncertain-run",
-					onDeadlineRecoveryCheckpointForTests: checkpoint => recoveryCheckpoints.push(checkpoint),
+					onDeadlineRecoveryCheckpointForTests: checkpoint => {
+						recoveryCheckpoints.push(checkpoint);
+						if (checkpoint.stage === "publication-result" && checkpoint.result === "published")
+							terminalPublication.resolve(checkpoint);
+					},
 					pendingToolExecutions: () => {
 						if (activeTools.size > 0) boundaryWaitStarted = true;
 						const pending = [...activeTools];
@@ -8633,6 +8638,10 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			// tool-set drain; clearing the test seam alone does not wake its bounded
 			// retry timer.
 			await toolDrainObserved.promise;
+			// Wait for the durable terminal boundary itself, not an arbitrary status
+			// polling budget that can expire while a slow CI filesystem is flushing it.
+			const published = await terminalPublication.promise;
+			expect(published.correlation).toEqual(correlation);
 			let terminalStatus: NonNullable<ResponseFrame["result"]>;
 			try {
 				terminalStatus = await settledStatus(harness, "turn.prompt_status", correlation);
