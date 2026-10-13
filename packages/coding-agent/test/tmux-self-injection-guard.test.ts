@@ -151,6 +151,35 @@ describe("tmux self-injection guard", () => {
 		});
 	});
 
+	it("inspects executable command substitutions in ordinary shell words", async () => {
+		for (const command of [
+			'tmux send-keys -t %99 "$(tmux send-keys -t %47 x)"',
+			"tmux send-keys -t %99 $(tmux send-keys -t %47 x)",
+			'tmux send-keys -t %99 "`tmux send-keys -t %47 x`"',
+		]) {
+			await expect(checkTmuxSelfInjection(command, options)).resolves.toMatchObject({ block: true });
+		}
+		for (const command of [
+			"tmux send-keys -t %99 '$(tmux send-keys -t %47 x)'",
+			'tmux send-keys -t %99 "\\$(tmux send-keys -t %47 x)"',
+		]) {
+			await expect(checkTmuxSelfInjection(command, options)).resolves.toEqual({ block: false });
+		}
+	});
+
+	it("decodes ANSI-C-quoted Bash command strings", async () => {
+		for (const command of [
+			"bash -c $'tmux send-keys -t %47 x'",
+			"bash -c $'\\x74mux send-keys -t %47 x'",
+			"bash -c $'\\164mux send-keys -t %47 x'",
+		]) {
+			await expect(checkTmuxSelfInjection(command, options)).resolves.toMatchObject({ block: true });
+		}
+		await expect(checkTmuxSelfInjection("printf $'tmux send-keys -t %47 x'", options)).resolves.toEqual({
+			block: false,
+		});
+	});
+
 	it("finds injection through path-qualified shell runners", async () => {
 		for (const command of [
 			"/bin/bash -c 'tmux send-keys -t %47 x'",
@@ -173,6 +202,44 @@ describe("tmux self-injection guard", () => {
 			}
 		} finally {
 			await Bun.file(scriptPath).delete();
+		}
+	});
+
+	it("inspects relative and PATH-resolved shell-runner scripts", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-tmux-shell-runner-path-"));
+		const subdirectory = path.join(cwd, "sub");
+		const fakeBin = path.join(cwd, "fake-bin");
+		await Promise.all([fs.mkdir(subdirectory), fs.mkdir(fakeBin)]);
+		await Bun.write(path.join(subdirectory, "bash"), "#!/bin/sh\ntmux send-keys -t %47 x\n");
+		await Bun.write(path.join(fakeBin, "bash"), "#!/bin/sh\ntmux send-keys -t %47 x\n");
+		await Promise.all([
+			fs.chmod(path.join(subdirectory, "bash"), 0o755),
+			fs.chmod(path.join(fakeBin, "bash"), 0o755),
+		]);
+		const localOptions = { ...options, cwd, env: { ...env, FAKE_BIN: fakeBin, PATH: process.env.PATH ?? "" } };
+		const pathOptions = { ...localOptions, env: { ...localOptions.env, PATH: fakeBin } };
+		try {
+			for (const command of [
+				`sub/bash`,
+				`PATH=${fakeBin} bash`,
+				'PATH="$FAKE_BIN" bash',
+				`env PATH=${fakeBin} bash`,
+				'env PATH="$FAKE_BIN" bash',
+			]) {
+				await expect(checkTmuxSelfInjection(command, localOptions)).resolves.toMatchObject({ block: true });
+			}
+			await expect(checkTmuxSelfInjection("bash", pathOptions)).resolves.toMatchObject({ block: true });
+		} finally {
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("fails closed when a shell runner PATH override cannot be resolved", async () => {
+		for (const command of ['PATH="$UNKNOWN_BIN" bash', 'env PATH="$UNKNOWN_BIN" bash']) {
+			await expect(checkTmuxSelfInjection(command, options)).resolves.toMatchObject({
+				block: true,
+				reason: expect.stringContaining("PATH override contains an unresolved shell expansion"),
+			});
 		}
 	});
 
@@ -254,6 +321,29 @@ describe("tmux self-injection guard", () => {
 				await expect(checkTmuxSelfInjection(`env -C ${targetCwd} ./bash`, localOptions)).resolves.toMatchObject({
 					block: true,
 				});
+			} finally {
+				await fs.rm(tempDir, { recursive: true, force: true });
+			}
+		});
+
+		it("resolves env chdir paths from known environment values", async () => {
+			const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-tmux-env-known-cwd-"));
+			const originalCwd = path.join(tempDir, "original");
+			const targetCwd = path.join(tempDir, "target");
+			await Promise.all([fs.mkdir(originalCwd), fs.mkdir(targetCwd)]);
+			await Bun.write(path.join(targetCwd, "safe.sh"), "printf safe\n");
+			const localOptions = {
+				...options,
+				cwd: originalCwd,
+				env: { ...env, TMUX_TARGET: targetCwd, PWD: originalCwd },
+			};
+			try {
+				await expect(checkTmuxSelfInjection('env -C "$TMUX_TARGET" bash safe.sh', localOptions)).resolves.toEqual({
+					block: false,
+				});
+				await expect(
+					checkTmuxSelfInjection('env -C "$UNKNOWN_TARGET" bash safe.sh', localOptions),
+				).resolves.toMatchObject({ block: true });
 			} finally {
 				await fs.rm(tempDir, { recursive: true, force: true });
 			}
@@ -368,12 +458,12 @@ describe("tmux self-injection guard", () => {
 				"nohup --help tmux send-keys -t %47 x",
 				"nohup --version tmux send-keys -t %47 x",
 				"setsid --help tmux send-keys -t %47 x",
+				"setsid -h tmux send-keys -t %47 x",
+				"setsid -V tmux send-keys -t %47 x",
 				"xargs --version tmux send-keys -t %47 x",
 				"stdbuf --help tmux send-keys -t %47 x",
 				"sudo -K tmux send-keys -t %47 x",
 				"sudo --remove-timestamp tmux send-keys -t %47 x",
-				"env -0 tmux send-keys -t %47 x",
-				"env --null tmux send-keys -t %47 x",
 			]) {
 				await expect(checkTmuxSelfInjection(command, options)).resolves.toEqual({ block: false });
 			}
@@ -688,6 +778,15 @@ describe("tmux self-injection guard", () => {
 			await expect(checkTmuxSelfInjection("timeout -v 5 tmux send-keys -t %47 x", options)).resolves.toMatchObject({
 				block: true,
 			});
+		});
+
+		it("stops timeout option parsing after its duration", async () => {
+			for (const command of [
+				"timeout 1 -v tmux send-keys -t %47 x",
+				"timeout --signal TERM 5 -v tmux send-keys -t %47 x",
+			]) {
+				await expect(checkTmuxSelfInjection(command, options)).resolves.toEqual({ block: false });
+			}
 		});
 	});
 
@@ -1016,6 +1115,15 @@ describe("tmux self-injection guard", () => {
 			});
 		});
 
+		it("keeps words after env split strings as arguments to the split command", async () => {
+			await expect(checkTmuxSelfInjection("env -S 'printf <%s>' tmux send-keys -t %47 x", options)).resolves.toEqual(
+				{ block: false },
+			);
+			await expect(
+				checkTmuxSelfInjection("env -S 'bash -c' 'tmux send-keys -t %47 x'", options),
+			).resolves.toMatchObject({ block: true });
+		});
+
 		// Issue 4: P1 — Socket backtracking across command boundaries
 		it("allows tmux after semicolon-separated TMUX assignment", async () => {
 			// Issue: TMUX=/tmp/other env FOO=x; tmux send-keys -t %47 x
@@ -1105,9 +1213,9 @@ describe("tmux self-injection guard", () => {
 
 	describe("regression: wrapper and shell parsing boundaries", () => {
 		it("blocks attached env split-string payloads", async () => {
-			await expect(checkTmuxSelfInjection("env '-Stmux send-keys -t %47 x'", options)).resolves.toMatchObject({
-				block: true,
-			});
+			for (const command of ["env '-Stmux send-keys -t %47 x'", "env -vS 'tmux send-keys -t %47 x'"]) {
+				await expect(checkTmuxSelfInjection(command, options)).resolves.toMatchObject({ block: true });
+			}
 		});
 
 		it("keeps xargs --eof's optional value attached-only", async () => {
@@ -1278,6 +1386,7 @@ describe("tmux self-injection guard", () => {
 			const substitution = "tmux send-keys -t %47 x";
 			for (const command of [
 				`cat <<EOF\n$(${substitution})\nEOF`,
+				`bash -n <<EOF\n$(${substitution})\nEOF`,
 				`cat <<EOF\n\`${substitution}\`\nEOF`,
 				`cat <<EOF\n$\\\n(${substitution})\nEOF`,
 				"cat <<EOF\n$(echo \"$(tmux send-keys -t '%47' x)\")\nEOF",
@@ -1364,6 +1473,8 @@ describe("tmux self-injection guard", () => {
 			for (const command of [
 				"bash +O extglob -c 'tmux send-keys -t %47 x'",
 				"bash +o pipefail -c 'tmux send-keys -t %47 x'",
+				"bash +eo pipefail -c 'tmux send-keys -t %47 x'",
+				"bash +eO extglob -c 'tmux send-keys -t %47 x'",
 				"bash +i -c 'tmux send-keys -t %47 x'",
 				"bash +l -c 'tmux send-keys -t %47 x'",
 				"bash +r -c 'tmux send-keys -t %47 x'",
@@ -1382,13 +1493,52 @@ describe("tmux self-injection guard", () => {
 				for (const command of [
 					"bash -nc 'tmux send-keys -t %47 x'",
 					"bash -D -c 'tmux send-keys -t %47 x'",
+					"bash -o noexec -c 'tmux send-keys -t %47 x'",
+					"bash --dump-strings -c 'tmux send-keys -t %47 x'",
+					"bash --dump-po-strings -c 'tmux send-keys -t %47 x'",
 					`bash -n ${scriptPath}`,
+					`bash -o noexec ${scriptPath}`,
+					`bash --dump-strings ${scriptPath}`,
+					`bash --dump-po-strings ${scriptPath}`,
 					"bash --help 'tmux send-keys -t %47 x'",
 				]) {
 					await expect(checkTmuxSelfInjection(command, { ...options, cwd })).resolves.toEqual({ block: false });
 				}
+				for (const command of [`bash -n +n ${scriptPath}`, `bash -o noexec +o noexec ${scriptPath}`]) {
+					await expect(checkTmuxSelfInjection(command, { ...options, cwd })).resolves.toMatchObject({
+						block: true,
+					});
+				}
 			} finally {
 				await fs.rm(cwd, { recursive: true, force: true });
+			}
+		});
+
+		it("honors the final Bash no-exec option state", async () => {
+			const document = "tmux send-keys -t %47 x";
+			for (const command of [
+				"bash -n +n -c 'tmux send-keys -t %47 x'",
+				"bash -o noexec +o noexec -c 'tmux send-keys -t %47 x'",
+				`bash -n +n <<'EOF'\n${document}\nEOF`,
+				`bash -n +n -s scriptarg <<'EOF'\n${document}\nEOF`,
+			]) {
+				await expect(checkTmuxSelfInjection(command, options)).resolves.toMatchObject({ block: true });
+			}
+			for (const command of [
+				`bash -n <<'EOF'\n${document}\nEOF`,
+				`bash -n -s scriptarg <<'EOF'\n${document}\nEOF`,
+				"bash -n -c 'tmux send-keys -t %47 x'",
+			]) {
+				await expect(checkTmuxSelfInjection(command, options)).resolves.toEqual({ block: false });
+			}
+		});
+
+		it("does not parse eval payloads passed to env as shell builtins", async () => {
+			await expect(
+				checkTmuxSelfInjection("env PATH=/nonexistent eval 'tmux send-keys -t %47 x'", options),
+			).resolves.toEqual({ block: false });
+			for (const command of ["command eval 'tmux send-keys -t %47 x'", "builtin eval 'tmux send-keys -t %47 x'"]) {
+				await expect(checkTmuxSelfInjection(command, options)).resolves.toMatchObject({ block: true });
 			}
 		});
 
@@ -1553,11 +1703,9 @@ describe("tmux self-injection guard", () => {
 			).resolves.toEqual({ block: false });
 		});
 
-		it("consumes GNU env options in split strings", async () => {
+		it("consumes GNU env signal options in split strings", async () => {
 			for (const option of [
 				"-",
-				"-0",
-				"--null",
 				"--block-signal",
 				"--default-signal=TERM",
 				"--ignore-signal=TERM",
@@ -1567,6 +1715,42 @@ describe("tmux self-injection guard", () => {
 					checkTmuxSelfInjection(`env -S '${option} tmux send-keys -t %47 x'`, options),
 				).resolves.toMatchObject({ block: true });
 			}
+		});
+
+		it("does not discover commands after non-executing GNU env options", async () => {
+			for (const command of [
+				"env -0 tmux send-keys -t %47 x",
+				"env -i0 tmux send-keys -t %47 x",
+				"env --null tmux send-keys -t %47 x",
+				"env --nu tmux send-keys -t %47 x",
+				"env --help tmux send-keys -t %47 x",
+				"env --version tmux send-keys -t %47 x",
+				"env --he tmux send-keys -t %47 x",
+				"env --ver tmux send-keys -t %47 x",
+				"env -S '-0 tmux send-keys -t %47 x'",
+				"env -S '-0' tmux send-keys -t %47 x",
+				"env -S '--null tmux send-keys -t %47 x'",
+				"env -S '--null' tmux send-keys -t %47 x",
+			]) {
+				await expect(checkTmuxSelfInjection(command, options)).resolves.toEqual({ block: false });
+			}
+			await expect(
+				checkTmuxSelfInjection("env -0 tmux send-keys -t %47 x; tmux send-keys -t %47 x", options),
+			).resolves.toMatchObject({ block: true });
+		});
+
+		it("does not discover commands after non-executing sudo modes", async () => {
+			for (const command of [
+				"sudo -K tmux send-keys -t %47 x",
+				"sudo --remove-timestamp tmux send-keys -t %47 x",
+				"sudo -l tmux send-keys -t %47 x",
+				"sudo -v tmux send-keys -t %47 x",
+			]) {
+				await expect(checkTmuxSelfInjection(command, options)).resolves.toEqual({ block: false });
+			}
+			await expect(
+				checkTmuxSelfInjection("sudo -K tmux send-keys -t %47 x; tmux send-keys -t %47 x", options),
+			).resolves.toMatchObject({ block: true });
 		});
 
 		it("recognizes positive shell options around -c", async () => {
