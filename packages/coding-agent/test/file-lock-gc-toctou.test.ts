@@ -2444,6 +2444,7 @@ describe("withFileLock stale-removal diagnostics (#5434)", () => {
 						JSON.stringify({
 							pid: process.pid,
 							start_time: processStartTime(process.pid),
+							start_time_format: "utc-v1",
 							timestamp: Date.now(),
 						}),
 					);
@@ -2495,6 +2496,7 @@ describe("withFileLock stale-removal diagnostics (#5434)", () => {
 					JSON.stringify({
 						pid: process.pid,
 						start_time: processStartTime(process.pid),
+						start_time_format: "utc-v1",
 						timestamp: Date.now(),
 					}),
 				);
