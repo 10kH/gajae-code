@@ -258,7 +258,8 @@ describe.skipIf(process.platform !== "linux")("managed artifact reads stay bound
 			return fd;
 		}) as typeof fs.openSync);
 
-		await expect(manager.readRange(id)).rejects.toThrow("source_changed");
+		// Either the captured-descriptor check or the subsequent pathname check may observe the symlink swap first.
+		await expect(manager.readRange(id)).rejects.toThrow(/^(?:source_changed|managed_range_generation_mismatch)$/u);
 		expect(replaced).toBe(true);
 		expect(await fsp.readFile(outside, "utf8")).toBe("path-backed outside secret");
 	});
