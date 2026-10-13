@@ -990,7 +990,7 @@ describe("tmux self-injection guard", () => {
 
 		it("inspects here-documents used as non-stdin shell script files", async () => {
 			const script = "tmux send-keys -t %47 x";
-			for (const scriptPath of ["/dev/fd/3", "/proc/self/fd/3", "/proc/thread-self/fd/3"]) {
+			for (const scriptPath of ["/dev/fd/3", "/proc/self/fd/3", "/proc/thread-self/fd/3", "/proc/$$/fd/3"]) {
 				const command = `bash ${scriptPath} 3<<'EOF'\n${script}\nEOF`;
 				await expect(checkTmuxSelfInjection(command, options)).resolves.toMatchObject({ block: true });
 			}

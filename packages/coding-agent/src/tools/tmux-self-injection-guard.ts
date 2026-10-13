@@ -1538,7 +1538,7 @@ function collectShellStdinPayloads(tokens: Token[], hereDocuments: HereDocument[
 }
 
 function scriptFileDescriptor(scriptPath: string): number | undefined {
-	const match = /^(?:\/dev\/fd|\/proc\/(?:self|thread-self)\/fd)\/(\d+)$/.exec(scriptPath);
+	const match = /^(?:\/dev\/fd|\/proc\/(?:self|thread-self|\$\$)\/fd)\/(\d+)$/.exec(scriptPath);
 	if (!match) return undefined;
 	const descriptor = Number(match[1]);
 	return Number.isSafeInteger(descriptor) ? descriptor : undefined;
