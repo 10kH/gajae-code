@@ -167,6 +167,15 @@ describe("tmux self-injection guard", () => {
 		}
 	});
 
+	it("skips here-document bodies when matching command-substitution ends", async () => {
+		await expect(checkTmuxSelfInjection("echo \"$(cat <<'EOF'\n)\nEOF\n)\"", options)).resolves.toEqual({
+			block: false,
+		});
+		await expect(
+			checkTmuxSelfInjection("echo \"$(cat <<'EOF'\n)\nEOF\ntmux send-keys -t %47 x\n)\"", options),
+		).resolves.toMatchObject({ block: true });
+	});
+
 	it("decodes ANSI-C-quoted Bash command strings", async () => {
 		for (const command of [
 			"bash -c $'tmux send-keys -t %47 x'",
@@ -544,6 +553,14 @@ describe("tmux self-injection guard", () => {
 			await expect(checkTmuxSelfInjection("env --unset tmux send-keys -t %47 x", options)).resolves.toEqual({
 				block: false,
 			});
+		});
+
+		it("consumes the BSD env search-path operand", async () => {
+			await expect(checkTmuxSelfInjection('env -P "$PATH" tmux send-keys -t %47 x', options)).resolves.toMatchObject(
+				{
+					block: true,
+				},
+			);
 		});
 
 		it("preserves quoted wrapper-option operands", async () => {

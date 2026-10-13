@@ -174,7 +174,7 @@ const WRAPPER_LONG_OPTIONS: Record<string, Record<string, boolean>> = {
 
 const COMMAND_WRAPPERS_WITH_ARGS: Record<string, WrapperSpec> = {
 	env: {
-		optionsWithArg: new Set(["-u", "-C", "-S", "-a"]),
+		optionsWithArg: new Set(["-u", "-C", "-S", "-a", "-P"]),
 	},
 	sudo: {
 		optionsWithArg: new Set(["-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-U", "-T", "-R", "-c"]),
@@ -1271,7 +1271,7 @@ function reconstructCommandFromEnvSplit(splitString: string, depth = 0): string[
 	if (argumentStarted) parts.push(current);
 
 	const assignments: string[] = [];
-	const envShortOptionsWithArg = new Set(["-u", "-C", "-a"]);
+	const envShortOptionsWithArg = new Set(["-u", "-C", "-a", "-P"]);
 	const envShortFlagOptions = new Set(["-i", "-v"]);
 	let skipNext = false;
 	let optionsTerminated = false;
@@ -1744,7 +1744,7 @@ function collectShellPayloadsWithContext(
 			continue;
 
 		// Options for env that consume the next argument
-		const envOptionsWithArg = new Set(["-u", "-C", "-S", "-a"]);
+		const envOptionsWithArg = new Set(["-u", "-C", "-S", "-a", "-P"]);
 		let skipNextArg = false;
 
 		// Look for -S or --split-string option
@@ -2114,6 +2114,85 @@ function hasShellStdinConsumer(tokens: Token[], segment: number, depth = 0, here
 	return false;
 }
 
+function hereDocumentDelimiterAt(
+	source: string,
+	operatorIndex: number,
+): { delimiter: string; stripTabs: boolean; end: number } | undefined {
+	if (source[operatorIndex] !== "<" || source[operatorIndex + 1] !== "<" || source[operatorIndex + 2] === "<") {
+		return undefined;
+	}
+	let cursor = operatorIndex + 2;
+	let stripTabs = false;
+	if (source[cursor] === "-") {
+		stripTabs = true;
+		cursor++;
+	}
+	while (source[cursor] === " " || source[cursor] === "\t") cursor++;
+	let delimiter = "";
+	let argumentStarted = false;
+	while (cursor < source.length) {
+		const character = source[cursor];
+		if (character === "'") {
+			argumentStarted = true;
+			cursor++;
+			while (cursor < source.length && source[cursor] !== "'") delimiter += source[cursor++];
+			if (source[cursor] !== "'") return undefined;
+			cursor++;
+			continue;
+		}
+		if (character === '"') {
+			argumentStarted = true;
+			cursor++;
+			while (cursor < source.length && source[cursor] !== '"') {
+				if (source[cursor] === "\\" && cursor + 1 < source.length) cursor++;
+				delimiter += source[cursor++];
+			}
+			if (source[cursor] !== '"') return undefined;
+			cursor++;
+			continue;
+		}
+		if (character === "\\" && cursor + 1 < source.length) {
+			argumentStarted = true;
+			delimiter += source[cursor + 1];
+			cursor += 2;
+			continue;
+		}
+		if (/[\s;|&()<>]/.test(character)) break;
+		argumentStarted = true;
+		delimiter += character;
+		cursor++;
+	}
+	if (!argumentStarted) return undefined;
+	return { delimiter, stripTabs, end: cursor - 1 };
+}
+
+function skipHereDocumentBodies(
+	source: string,
+	newlineIndex: number,
+	delimiters: Array<{ delimiter: string; stripTabs: boolean }>,
+): number | undefined {
+	let cursor = newlineIndex + 1;
+	for (const document of delimiters) {
+		let foundDelimiter = false;
+		while (cursor < source.length) {
+			const newline = source.indexOf("\n", cursor);
+			const lineEnd = newline < 0 ? source.length : newline;
+			let line = source.slice(cursor, lineEnd);
+			if (document.stripTabs) line = line.replace(/^\t+/, "");
+			if (line === document.delimiter) {
+				if (newline < 0) return undefined;
+				cursor = newline + 1;
+				foundDelimiter = true;
+				break;
+			}
+			if (newline < 0) return undefined;
+			cursor = newline + 1;
+		}
+		if (!foundDelimiter) return undefined;
+	}
+	return cursor - 1;
+}
+
 function commandSubstitutionEnd(source: string, start: number): number | undefined {
 	let depth = 1;
 	let singleQuoted = false;
@@ -2123,6 +2202,7 @@ function commandSubstitutionEnd(source: string, start: number): number | undefin
 	let expectingCaseIn = false;
 	let inCasePattern = false;
 	let shellWord = "";
+	const hereDocumentDelimiters: Array<{ delimiter: string; stripTabs: boolean }> = [];
 	const flushShellWord = () => {
 		if (shellWord === "case") {
 			caseDepth++;
@@ -2169,6 +2249,14 @@ function commandSubstitutionEnd(source: string, start: number): number | undefin
 			continue;
 		}
 		flushShellWord();
+		if (character === "<" && source[index + 1] === "<" && source[index + 2] !== "<") {
+			const hereDocument = hereDocumentDelimiterAt(source, index);
+			if (hereDocument) {
+				hereDocumentDelimiters.push({ delimiter: hereDocument.delimiter, stripTabs: hereDocument.stripTabs });
+				index = hereDocument.end;
+				continue;
+			}
+		}
 		if (character === "#" && (index === 0 || /[\s;|&()]/.test(source[index - 1]))) {
 			while (index < source.length && source[index] !== "\n") index++;
 			continue;
@@ -2194,6 +2282,13 @@ function commandSubstitutionEnd(source: string, start: number): number | undefin
 			inCasePattern = true;
 			index++;
 			if (source[index + 1] === ";") index++;
+			continue;
+		}
+		if (character === "\n" && hereDocumentDelimiters.length > 0) {
+			const afterHereDocuments = skipHereDocumentBodies(source, index, hereDocumentDelimiters);
+			if (afterHereDocuments === undefined) return undefined;
+			hereDocumentDelimiters.length = 0;
+			index = afterHereDocuments;
 			continue;
 		}
 		if (character === "(" && !inCasePattern) depth++;
