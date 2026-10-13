@@ -179,31 +179,81 @@ export const FileLockTestHooks: {
 	nativeExactRemovalProbe?: () => boolean | Promise<boolean>;
 } = {};
 
+type FileLockAcquisitionRetryBudget = {
+	remainingDelays: number;
+	retryDelayMs: number;
+	signal?: AbortSignal;
+};
+
+function throwIfFileLockAcquisitionAborted(signal?: AbortSignal): void {
+	if (signal?.aborted) throw signal.reason ?? new Error("File lock acquisition aborted");
+}
+
+async function sleepFileLockRetry(delayMs: number, signal?: AbortSignal): Promise<void> {
+	if (!signal) {
+		await Bun.sleep(delayMs);
+		return;
+	}
+	throwIfFileLockAcquisitionAborted(signal);
+	const settled = Promise.withResolvers<void>();
+	let timer: NodeJS.Timeout | undefined;
+	const onAbort = (): void => {
+		if (timer) clearTimeout(timer);
+		settled.reject(signal.reason ?? new Error("File lock acquisition aborted"));
+	};
+	timer = setTimeout(
+		() => {
+			signal.removeEventListener("abort", onAbort);
+			settled.resolve();
+		},
+		Math.max(0, delayMs),
+	);
+	signal.addEventListener("abort", onAbort, { once: true });
+	if (signal.aborted) onAbort();
+	try {
+		await settled.promise;
+	} finally {
+		if (timer) clearTimeout(timer);
+		signal.removeEventListener("abort", onAbort);
+	}
+}
+
 async function cleanupPendingStagingOrThrow(
 	lockPath: string,
 	stagingPath: string,
-	retryAttempts: number,
-	retryDelayMs: number,
+	retryBudget: FileLockAcquisitionRetryBudget,
 ): Promise<void> {
-	for (let attempt = 0; attempt < retryAttempts; attempt++) {
+	// Honor aborts during staging cleanup retries: when the outer acquisition
+	// is cancelled, clean up the staging directory and propagate the abort.
+	for (;;) {
+		if (retryBudget.signal?.aborted) {
+			await fs.rm(stagingPath, { recursive: true, force: true }).catch(() => undefined);
+			throw retryBudget.signal.reason ?? new Error("File lock acquisition aborted");
+		}
 		try {
 			const cleanup = FileLockTestHooks.cleanupPendingStaging;
 			if (cleanup) await cleanup(stagingPath);
 			else await fs.rm(stagingPath, { recursive: true, force: true });
 			return;
 		} catch (error) {
-			if (!isTransientReleaseError(error) || attempt + 1 === retryAttempts)
+			if (retryBudget.signal?.aborted) {
+				await fs.rm(stagingPath, { recursive: true, force: true }).catch(() => undefined);
+				throw retryBudget.signal.reason ?? new Error("File lock acquisition aborted");
+			}
+			if (!isTransientReleaseError(error) || retryBudget.remainingDelays === 0)
 				throw new FileLockStagingCleanupError(lockPath, stagingPath, error);
 			// An open child can deny both publication and removal on Windows. Keep the
-			// same staging identity while cleanup retries within the acquisition budget.
-			await Bun.sleep(retryDelayMs);
+			// same staging identity and share the outer acquisition delay budget.
+			retryBudget.remainingDelays--;
+			try {
+				await sleepFileLockRetry(retryBudget.retryDelayMs, retryBudget.signal);
+			} catch (abortError) {
+				if (!retryBudget.signal?.aborted) throw abortError;
+				await fs.rm(stagingPath, { recursive: true, force: true }).catch(() => undefined);
+				throw retryBudget.signal.reason ?? abortError;
+			}
 		}
 	}
-	throw new FileLockStagingCleanupError(
-		lockPath,
-		stagingPath,
-		new Error("No staging cleanup attempts were available."),
-	);
 }
 
 /**
@@ -2128,8 +2178,7 @@ async function tryAcquireLock(
 	previousOwnerHostIds: readonly string[],
 	ownerToken = crypto.randomUUID(),
 	onAcquired: (() => void) | undefined,
-	stagingCleanupRetries: number,
-	stagingCleanupRetryDelayMs: number,
+	retryBudget: FileLockAcquisitionRetryBudget,
 ): Promise<FileLockAcquisitionResult> {
 	await ensureLockParent(path.dirname(lockPath));
 	const afterParentMkdir = FileLockTestHooks.afterParentMkdir;
@@ -2256,12 +2305,7 @@ async function tryAcquireLock(
 				return null;
 			} else if (fallbackFailureCode) {
 				removePending = false;
-				await cleanupPendingStagingOrThrow(
-					lockPath,
-					pendingPath,
-					stagingCleanupRetries,
-					stagingCleanupRetryDelayMs,
-				);
+				await cleanupPendingStagingOrThrow(lockPath, pendingPath, retryBudget);
 				return { kind: "publication_retry", code: fallbackFailureCode };
 			} else {
 				const failure = new Error(
@@ -2278,12 +2322,7 @@ async function tryAcquireLock(
 			const publicationFailureCode = preMutationPublicationFailureCode(published);
 			if (publicationFailureCode) {
 				removePending = false;
-				await cleanupPendingStagingOrThrow(
-					lockPath,
-					pendingPath,
-					stagingCleanupRetries,
-					stagingCleanupRetryDelayMs,
-				);
+				await cleanupPendingStagingOrThrow(lockPath, pendingPath, retryBudget);
 				return { kind: "publication_retry", code: publicationFailureCode };
 			}
 			const failure = new Error(
@@ -2724,11 +2763,18 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 	}
 	const ownerToken = crypto.randomUUID();
 	const contentionStartTimes = new Map<string, string | null>();
+	// Bound staging cleanup across the outer retry budget: all staging cleanup retries
+	// use a shared delay budget and are subject to the same abort signal as the lock acquisition.
+	const retryBudget: FileLockAcquisitionRetryBudget = {
+		remainingDelays: opts.retries - 1,
+		retryDelayMs: opts.retryDelayMs,
+		signal: opts.signal,
+	};
 	let contentionObserved = false;
 	let staleRemovalFailure: RecordedStaleRemovalFailure | undefined;
 	let publicationFailureCode: FileLockPublicationFailureCode | undefined;
 	for (let attempt = 0; attempt < opts.retries; attempt++) {
-		if (opts.signal?.aborted) throw opts.signal.reason ?? new Error("File lock acquisition aborted");
+		throwIfFileLockAcquisitionAborted(opts.signal);
 		const localKey = await localLockKey(lockPath);
 		const priorRelease = localLockStates.get(localKey);
 		if (priorRelease && priorRelease.status !== "held" && pendingDetachedLockCleanups.has(priorRelease.owner)) {
@@ -2742,8 +2788,7 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 			opts.previousOwnerHostIds ?? [],
 			ownerToken,
 			opts.onAcquired,
-			opts.retries,
-			opts.retryDelayMs,
+			retryBudget,
 		);
 		if (isFileLockOrphanTransition(result))
 			throw new FileLockAcquireError(
@@ -2763,6 +2808,7 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 				return () => releaseLock(lockPath, result, localKey);
 			}
 		}
+		throwIfFileLockAcquisitionAborted(opts.signal);
 		const publicationIsProvenContention = isFileLockPublicationRetry(result) && result.code === "sharing_violation";
 		if (!contentionObserved && (!isFileLockPublicationRetry(result) || publicationIsProvenContention)) {
 			contentionObserved = true;
@@ -2795,26 +2841,20 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 			stale.stale && staleRemoval.failure
 				? { owner: stale.owner, identity: stale.identity, failure: staleRemoval.failure }
 				: undefined;
-		if (!opts.signal) {
-			await Bun.sleep(opts.retryDelayMs);
-			continue;
-		}
-		const { promise, resolve, reject } = Promise.withResolvers<void>();
-		const onAbort = (): void => reject(opts.signal?.reason ?? new Error("File lock acquisition aborted"));
-		opts.signal.addEventListener("abort", onAbort, { once: true });
-		void Bun.sleep(opts.retryDelayMs).then(resolve);
-		try {
-			await promise;
-		} finally {
-			opts.signal.removeEventListener("abort", onAbort);
+		if (retryBudget.remainingDelays > 0) {
+			retryBudget.remainingDelays--;
+			await sleepFileLockRetry(opts.retryDelayMs, opts.signal);
 		}
 	}
+	throwIfFileLockAcquisitionAborted(opts.signal);
 	const holder = await lockHolderDescription(
 		lockPath,
 		orphanTransitionAgeMs,
 		opts.ownerHostId,
 		opts.previousOwnerHostIds ?? [],
 	);
+	// Preserve access-denied errors after bounded retries: communicate that
+	// persistent access denial is a publication failure, not acquisition contention.
 	throw new FileLockAcquireError(
 		filePath,
 		lockPath,
