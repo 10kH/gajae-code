@@ -18,7 +18,7 @@ afterEach(async () => {
 	for (const dir of tempDirs.splice(0)) await fs.rm(dir, { recursive: true, force: true });
 });
 
-test("reclaims an aged empty ownerless lock directory after the publication grace period", async () => {
+test("preserves an aged empty ownerless lock directory and reports manual cleanup", async () => {
 	const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "file-lock-empty-dir-"));
 	tempDirs.push(tempDir);
 	const filePath = path.join(tempDir, "index.jsonl");
@@ -26,19 +26,6 @@ test("reclaims an aged empty ownerless lock directory after the publication grac
 	await fs.mkdir(lockDir);
 	const pastTime = new Date(Date.now() - 60_000);
 	await fs.utimes(lockDir, pastTime, pastTime);
-
-	await expect(
-		withFileLock(filePath, async () => "acquired", { retries: 2, retryDelayMs: 1, staleMs: 0 }),
-	).resolves.toBe("acquired");
-	await expect(fs.lstat(lockDir)).rejects.toMatchObject({ code: "ENOENT" });
-});
-
-test("does not reclaim a fresh empty ownerless lock directory", async () => {
-	const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "file-lock-empty-dir-"));
-	tempDirs.push(tempDir);
-	const filePath = path.join(tempDir, "index.jsonl");
-	const lockDir = `${filePath}.lock`;
-	await fs.mkdir(lockDir);
 
 	const failure = await withFileLock(filePath, async () => "entered", {
 		retries: 2,
@@ -49,7 +36,7 @@ test("does not reclaim a fresh empty ownerless lock directory", async () => {
 		(error: unknown) => error,
 	);
 	expect(failure).toBeInstanceOf(FileLockAcquireError);
-	expect((failure as Error).message).toContain("manual");
+	expect((failure as Error).message).toContain(`Remove-Item -LiteralPath '${lockDir}' -Recurse -Force`);
 	expect(await fs.readdir(lockDir)).toEqual([]);
 });
 

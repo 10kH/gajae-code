@@ -841,51 +841,6 @@ async function exactRemoveLockTree(
 	}
 }
 
-/** Reclaim only a provably old, empty Windows publication residue. */
-async function reclaimAgedEmptyFileLock(lockPath: string, graceMs: number, ownerHostId?: string): Promise<boolean> {
-	if (process.platform !== "win32") return false;
-	let root: BigIntStats;
-	try {
-		root = await fs.lstat(lockPath, { bigint: true });
-	} catch (error) {
-		if (isEnoent(error)) return false;
-		return false;
-	}
-	if (!root.isDirectory() || root.isSymbolicLink()) return false;
-	if (Date.now() - Number(root.mtimeMs) < graceMs) return false;
-	try {
-		await fs.lstat(path.join(lockPath, "info"));
-		return false;
-	} catch (error) {
-		if (!isEnoent(error)) return false;
-	}
-	try {
-		if ((await fs.readdir(lockPath)).length !== 0) return false;
-	} catch {
-		return false;
-	}
-	let captured: NativeDirectoryTreeResult;
-	try {
-		captured = nativeFileLockBindings().snapshotDirectoryTree(lockPath);
-	} catch {
-		return false;
-	}
-	if (!captured.ok || !captured.snapshot) return false;
-	const snapshot = captured.snapshot;
-	if (
-		snapshot.rootDev !== canonicalLockDeviceId(root.dev).toString() ||
-		snapshot.rootIno !== canonicalLockFileId(root.ino).toString() ||
-		!isEmptyRemovalTransition(snapshot, graceMs)
-	)
-		return false;
-	try {
-		const removal = await exactRemoveLockTree(lockPath, snapshot, ownerHostId);
-		return removal.ok || removal.code === "not_found";
-	} catch {
-		return false;
-	}
-}
-
 /**
  * Adopt-and-finish a provably orphaned POSIX removal transition.
  *
@@ -1366,7 +1321,7 @@ function isPreMutationPublicationContention(value: unknown): boolean {
 	return (
 		isValidNativeNoReplaceResult(value) &&
 		!value.ok &&
-		(value.code === "sharing_violation" || value.code === "access_denied") &&
+		value.code === "sharing_violation" &&
 		value.mutationState === "not_committed" &&
 		value.durabilityState === "not_attempted" &&
 		value.reason === value.code &&
@@ -2063,7 +2018,7 @@ async function tryAcquireLock(
 	await ensureLockParent(path.dirname(lockPath));
 	const afterParentMkdir = FileLockTestHooks.afterParentMkdir;
 	if (afterParentMkdir) await afterParentMkdir(lockPath);
-	const pendingPath = `${lockPath}.pending.${process.pid}.${crypto.randomUUID()}`;
+	const pendingPath = `${lockPath}.pending.${process.pid}.${currentFileLockStagingIdentity()}.${crypto.randomUUID()}`;
 	const owner = lockInfo(ownerHostId, ownerToken);
 	let removePending = false;
 	try {
@@ -2623,9 +2578,6 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 			await retryPendingLocalRelease(lockPath, localKey);
 			continue;
 		}
-		if (await reclaimAgedEmptyFileLock(lockPath, orphanTransitionAgeMs, opts.ownerHostId)) {
-			logger.debug("Reclaimed aged empty Windows file-lock publication residue", { lockPath });
-		}
 		const result = await tryAcquireLock(
 			lockPath,
 			opts.ownerHostId,
@@ -2737,14 +2689,49 @@ export async function withFileLock<T>(
 	return result;
 }
 
-/** Strictly recognize the staging names emitted by tryAcquireLock. */
-export function fileLockStagingOwnerPid(name: string): number | null {
-	const match = /^.+\.lock\.pending\.([1-9]\d*)\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.exec(
-		name,
-	);
+type FileLockStagingIdentity = { kind: "process_incarnation" | "start_time"; value: string };
+type FileLockStagingOwner = { pid: number; identity?: FileLockStagingIdentity };
+
+const FILE_LOCK_STAGING_UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+const FILE_LOCK_STAGING_NAME_WITH_START_TIME = new RegExp(
+	`^.+\\.lock\\.pending\\.([1-9]\\d*)\\.([is][A-Za-z0-9_-]+)\\.${FILE_LOCK_STAGING_UUID}$`,
+);
+const LEGACY_FILE_LOCK_STAGING_NAME = new RegExp(`^.+\\.lock\\.pending\\.([1-9]\\d*)\\.${FILE_LOCK_STAGING_UUID}$`);
+
+function fileLockStagingOwner(name: string): FileLockStagingOwner | null {
+	const current = FILE_LOCK_STAGING_NAME_WITH_START_TIME.exec(name);
+	const legacy = current ? null : LEGACY_FILE_LOCK_STAGING_NAME.exec(name);
+	const match = current ?? legacy;
 	if (!match) return null;
 	const pid = Number(match[1]);
-	return Number.isSafeInteger(pid) ? pid : null;
+	if (!Number.isSafeInteger(pid)) return null;
+	if (!current) return { pid };
+	try {
+		const encodedIdentity = current[2] ?? "";
+		const identityValue = Buffer.from(encodedIdentity.slice(1), "base64url").toString("utf8");
+		if (!identityValue || Buffer.from(identityValue, "utf8").toString("base64url") !== encodedIdentity.slice(1))
+			return null;
+		return {
+			pid,
+			identity: {
+				kind: encodedIdentity.startsWith("i") ? "process_incarnation" : "start_time",
+				value: identityValue,
+			},
+		};
+	} catch {
+		return null;
+	}
+}
+
+function currentFileLockStagingIdentity(): string {
+	const incarnation = currentProcessIncarnation();
+	const identity = incarnation ?? currentProcessStartTime();
+	return `${incarnation ? "i" : "s"}${Buffer.from(identity, "utf8").toString("base64url")}`;
+}
+
+/** Return a name-encoded staging PID for GC discovery. */
+export function fileLockStagingOwnerPid(name: string): number | null {
+	return fileLockStagingOwner(name)?.pid ?? null;
 }
 
 export interface FileLockStagingResult {
@@ -2767,11 +2754,9 @@ export async function inspectFileLockStagingDir(
 		removed: false,
 		reason: "unverified_staging_directory",
 	};
-	const namePid = fileLockStagingOwnerPid(path.basename(stagingPath));
-	if (namePid === null) return kept;
-	if (namePid === process.pid) {
-		return { ...kept, pid: namePid, status: "alive", reason: "in_process_staging_owner" };
-	}
+	const nameOwner = fileLockStagingOwner(path.basename(stagingPath));
+	if (!nameOwner) return kept;
+	const namePid = nameOwner.pid;
 	const canonical = await canonicalLockPathPreservingFinal(stagingPath);
 	// A winning acquirer publishes (renames) its staging directory concurrently, so the
 	// candidate can disappear between the caller's readdir and this observation.
@@ -2783,12 +2768,21 @@ export async function inspectFileLockStagingDir(
 		return { ...kept, reason: "enoent_already_gone" };
 	}
 	if (!root.isDirectory() || root.isSymbolicLink()) return kept;
-	const namePidStatus = probe(namePid);
+	let namePidStatus: OwnerLiveness;
+	if (nameOwner.identity && nameOwner.identity.value !== "unknown") {
+		const currentIdentity =
+			nameOwner.identity.kind === "process_incarnation" ? processIncarnation(namePid) : processStartTime(namePid);
+		if (currentIdentity === nameOwner.identity.value) {
+			return { ...kept, pid: namePid, status: "alive", reason: "live_staging_name_owner" };
+		}
+		namePidStatus = currentIdentity === null ? probe(namePid) : "dead";
+	} else {
+		namePidStatus = probe(namePid);
+	}
 	if (namePidStatus !== "dead") {
 		// Do not open the publication source while its owner may be live. On Windows an
-		// info-file handle can prevent the owner's atomic directory rename. If a PID was
-		// reused or liveness is unknown, retaining harmless staging debris is safer than
-		// opening info to prove an incarnation and racing the publisher.
+		// info-file handle can prevent the owner's atomic directory rename. Legacy names
+		// without generation evidence and unknown liveness fail closed.
 		return {
 			...kept,
 			pid: namePid,
@@ -2825,10 +2819,8 @@ export async function inspectFileLockStagingDir(
 		if (captured.snapshot.entries.some(entry => entry.relativePath !== "")) return kept;
 		pid = namePid;
 	}
-	if (pid === process.pid) {
-		return { ...kept, pid, status: "alive", reason: "in_process_staging_owner" };
-	}
-	let status = probe(pid);
+	let status = pid === namePid ? namePidStatus : probe(pid);
+	if (pid === process.pid && observation && !ownerIncarnationChanged(observation.info)) status = "alive";
 	if (status === "alive" && observation && ownerIncarnationChanged(observation.info)) status = "dead";
 	const result: FileLockStagingResult = {
 		path: stagingPath,

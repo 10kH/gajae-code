@@ -6,6 +6,7 @@ import * as path from "node:path";
 import {
 	FileLockTestHooks,
 	inspectFileLockStagingDir,
+	processStartTime,
 	reapOrphanedLockStagingDirs,
 	withFileLock,
 } from "../src/config/file-lock";
@@ -20,11 +21,16 @@ afterEach(async () => {
 	FileLockTestHooks.nativeQuarantineBindings = undefined;
 	for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
 });
-async function fixture(pid = DEAD_PID, info: object | null = { pid, timestamp: 1 }) {
+async function fixture(
+	pid = DEAD_PID,
+	info: object | null = { pid, timestamp: 1 },
+	startTime = pid === process.pid ? (processStartTime(pid) ?? "unknown") : "fixture-start-time",
+) {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "staging-orphan-"));
 	roots.push(root);
 	const file = path.join(root, "index.jsonl");
-	const staging = `${file}.lock.pending.${pid}.${uuid}`;
+	const encodedStartTime = `s${Buffer.from(startTime, "utf8").toString("base64url")}`;
+	const staging = `${file}.lock.pending.${pid}.${encodedStartTime}.${uuid}`;
 	await fs.mkdir(staging);
 	if (info) await Bun.write(path.join(staging, "info"), JSON.stringify(info));
 	return { root, file, staging };
@@ -68,7 +74,7 @@ test.each([true, false])("current process staging is retained (info=%s)", async 
 });
 
 test.each(["alive", "unknown"] as const)("unproven staging owner is skipped before snapshotting (%s)", async status => {
-	const { staging } = await fixture(DEAD_PID);
+	const { staging } = await fixture(DEAD_PID, { pid: DEAD_PID, timestamp: 1 }, "unknown");
 	const probe = vi.fn(() => status);
 	const snapshot = vi.fn(() => {
 		throw new Error("unproven staging owner must not be snapshotted");
@@ -83,6 +89,19 @@ test.each(["alive", "unknown"] as const)("unproven staging owner is skipped befo
 	expect(probe).toHaveBeenCalledWith(DEAD_PID);
 	expect(snapshot).not.toHaveBeenCalled();
 	expect(await fs.exists(staging)).toBe(true);
+});
+
+test("reaps old staging after its name-encoded PID is reused", async () => {
+	const { staging } = await fixture(
+		process.pid,
+		{ pid: process.pid, timestamp: 1, start_time: "old-process-incarnation", start_time_format: "utc-v1" },
+		"old-process-incarnation",
+	);
+	const probe = vi.fn(() => "alive" as const);
+
+	const result = await inspectFileLockStagingDir(staging, probe, true);
+	expect(result).toMatchObject({ pid: process.pid, status: "dead", removed: true });
+	expect(await fs.exists(staging)).toBe(false);
 });
 
 test("record pid is authoritative over a dead name pid", async () => {
