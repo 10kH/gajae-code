@@ -207,6 +207,8 @@ describe("recordFatalCrash", () => {
 			"api_token=opaque-api-token",
 			"cookie=z",
 			"password=123456",
+			"auth=x",
+			"bearer=abc123",
 		].join(" ");
 
 		recordFatalCrash("Uncaught Exception", new Error(`diagnostic safe=keep-this ${labeled}`), { path: target });

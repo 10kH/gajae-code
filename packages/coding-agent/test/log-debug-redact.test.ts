@@ -108,8 +108,20 @@ describe("debug log credential scrub", () => {
 			"opaque-openai-api-key-value",
 			"opaque-api-token-value",
 			"opaque-cookie-value",
+			"opaque-auth-value",
+			"opaque-bearer-value",
 		];
-		const labels = ["token", "secret", "credential", "private_key", "OPENAI_API_KEY", "api_token", "cookie"];
+		const labels = [
+			"token",
+			"secret",
+			"credential",
+			"private_key",
+			"OPENAI_API_KEY",
+			"api_token",
+			"cookie",
+			"auth",
+			"bearer",
+		];
 		const message = labels.map((label, index) => `${label}=${secrets[index]}`).join(" ");
 
 		await generateSessionTitle(message, createRegistry(model), createSettings(model));
@@ -125,7 +137,8 @@ describe("debug log credential scrub", () => {
 		const model = getModelOrThrow("claude-sonnet-4-5");
 		const completeSimple = vi.spyOn(ai, "completeSimple").mockResolvedValue(titleResponse());
 		const debug = vi.spyOn(logger, "debug");
-		const labeled = "token=abc123 password=123456 cookie=Q private_token=xyz AWS_SECRET_ACCESS_KEY=x";
+		const labeled =
+			"token=abc123 password=123456 cookie=Q private_token=xyz AWS_SECRET_ACCESS_KEY=x auth=x bearer=abc123";
 
 		await generateSessionTitle(labeled, createRegistry(model), createSettings(model));
 

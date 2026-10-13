@@ -131,7 +131,8 @@ describe("session HTML export embed", () => {
 						id: "call-generic-credentials",
 						name: "echo",
 						arguments: {
-							auth: {
+							credentials: {
+								bearer: "opaque-bearer-value",
 								token: "opaque-token-value",
 								secret: "opaque-secret-value",
 								credential: "opaque-credential-value",
@@ -142,6 +143,8 @@ describe("session HTML export embed", () => {
 								api_token: "opaque-api-token-value",
 								cookie: "opaque-cookie-value",
 							},
+							auth: "opaque-auth-value",
+							bearer: "opaque-bearer-field-value",
 							tokensBefore: 12,
 							maxTokens: 32,
 							token_budget: { available: 4096 },
@@ -158,9 +161,10 @@ describe("session HTML export embed", () => {
 				entries: Array<{ message?: { content?: Array<{ arguments?: Record<string, unknown> }> } }>;
 			};
 			const args = parsed.entries[0]?.message?.content?.[0]?.arguments;
-			const auth = args?.auth as Record<string, unknown> | undefined;
+			const credentials = args?.credentials as Record<string, unknown> | undefined;
 			for (const secret of [
 				"opaque-token-value",
+				"opaque-bearer-value",
 				"opaque-secret-value",
 				"opaque-credential-value",
 				"opaque-private-key-value",
@@ -169,10 +173,13 @@ describe("session HTML export embed", () => {
 				"opaque-openai-api-key-value",
 				"opaque-api-token-value",
 				"opaque-cookie-value",
+				"opaque-auth-value",
+				"opaque-bearer-field-value",
 			]) {
 				expect(embedded).not.toContain(secret);
 			}
-			expect(auth).toEqual({
+			expect(credentials).toEqual({
+				bearer: "«redacted»",
 				token: "«redacted»",
 				secret: "«redacted»",
 				credential: "«redacted»",
@@ -183,6 +190,8 @@ describe("session HTML export embed", () => {
 				api_token: "«redacted»",
 				cookie: "«redacted»",
 			});
+			expect(args?.auth).toBe("«redacted»");
+			expect(args?.bearer).toBe("«redacted»");
 			expect(args?.tokensBefore).toBe(12);
 			expect(args?.maxTokens).toBe(32);
 			expect(args?.token_budget).toEqual({ available: 4096 });
