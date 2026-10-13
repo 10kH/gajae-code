@@ -28199,6 +28199,10 @@ export class AgentSession {
 				if (ownerShutdownTransitionCommitted) {
 					ownerShutdownManager.finishOwnerSubagentShutdown(ownerShutdownLease, "commit");
 				} else {
+					// A pre-mutation flush or snapshot failure can leave the predecessor
+					// live after the Agent event bridge was disconnected. Reconnect before
+					// releasing the lease, which may synchronously start queued resumes.
+					if (!this.#isDisposed) this.#reconnectToAgent();
 					ownerShutdownManager.finishOwnerSubagentShutdown(ownerShutdownLease, "release", {
 						drainResumeQueue: ownerShutdownCanDrainResumes && !this.#isDisposed,
 					});

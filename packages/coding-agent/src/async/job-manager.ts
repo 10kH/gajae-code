@@ -2137,12 +2137,16 @@ export class AsyncJobManager {
 		}
 		for (const [sid, rec] of this.#subagentRecords) {
 			if (!ownerId || rec.ownerId === ownerId) {
+				const queuedSeq = rec.status === "queued" ? rec.queued?.seq : undefined;
+				if (queuedSeq !== undefined) {
+					rec.terminalQueuedSeq = queuedSeq;
+					this.#publishQueuedTerminal(sid, `queued:${sid}:${queuedSeq}`, "cancelled");
+				}
 				// Retire the queued resume's owned registration BEFORE deleting the
-				// record: the purge removes the resume-queue entry and record with
-				// no start, cancellation, or delivery boundary, so the registration
-				// would otherwise leak into the global ownership registries and
-				// eventually make later owned aborts fail closed (review thread
-				// P2). #retireQueuedOwned is a no-op for non-queued records.
+				// record: #publishQueuedTerminal above is the wait-notification
+				// boundary for queued work; this removes the corresponding ownership
+				// tuple so it cannot leak into later owned aborts. The helper is a
+				// no-op for non-queued records.
 				this.#retireQueuedOwned(rec);
 				this.#liveHandles.delete(sid);
 				this.#resumeDescriptors.delete(sid);

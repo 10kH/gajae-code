@@ -259,6 +259,7 @@ describe("AgentSession Issue #2261 /new owner-subagent cancellation", () => {
 	it("drains a queued resume after a live session-switch flush failure", async () => {
 		const ownerManager = installOwnerManager(1);
 		const previousSessionFile = session.sessionFile;
+		const appendMessage = vi.spyOn(sessionManager, "appendMessage");
 		const foreignStarted = Promise.withResolvers<void>();
 		const foreignGate = Promise.withResolvers<string>();
 		const foreignJobId = ownerManager.register(
@@ -312,6 +313,13 @@ describe("AgentSession Issue #2261 /new owner-subagent cancellation", () => {
 			rejectFlush.resolve();
 			await expect(transition).rejects.toThrow("disk full");
 			expect(session.sessionFile).toBe(previousSessionFile);
+			session.agent.emitExternalEvent({
+				type: "message_end",
+				message: { role: "user", content: "predecessor bridge restored", timestamp: Date.now() },
+			});
+			expect(appendMessage).toHaveBeenCalledWith(
+				expect.objectContaining({ content: "predecessor bridge restored" }),
+			);
 			expect(resumeStarts).toBe(1);
 			const resumedJobId = ownerManager.getSubagentRecord("queued-child")?.currentJobId;
 			if (!resumedJobId) throw new Error("Queued child did not start after the failed switch");

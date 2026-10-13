@@ -608,6 +608,69 @@ describe("owner subagent shutdown leases", () => {
 		}
 	});
 
+	test("publishes terminal evidence when shutdown commit purges a queued resume", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: async () => {}, maxRunningJobs: 1 });
+		const blockerStarted = Promise.withResolvers<void>();
+		const blockerGate = Promise.withResolvers<void>();
+		const subagentId = "queued-wait-on-commit";
+		const blockerJobId = manager.register(
+			"task",
+			"foreign blocker",
+			async () => {
+				blockerStarted.resolve();
+				await blockerGate.promise;
+				return "blocker done";
+			},
+			{ ownerId: "owner-b" },
+		);
+		await blockerStarted.promise;
+		manager.registerSubagentRecord({
+			subagentId,
+			ownerId: "owner-a",
+			currentJobId: null,
+			historicalJobIds: [],
+			status: "paused",
+			sessionFile: `/tmp/${subagentId}.jsonl`,
+			resumable: true,
+		});
+		manager.setResumeRunner(id =>
+			manager.register("task", `resume ${id}`, async () => "resumed", {
+				ownerId: "owner-a",
+				metadata: { subagent: { id, agent: "executor", agentSource: "bundled" } },
+			}),
+		);
+		expect(manager.resumeSubagent(subagentId, { ownerId: "owner-a" })).toMatchObject({
+			ok: true,
+			queued: true,
+			status: "queued",
+		});
+		const target = manager.resolveSubagentWaitTarget(subagentId, { ownerId: "owner-a" });
+		if (!target) throw new Error("Expected a terminal-wait target for the queued resume");
+		const wait = manager.subscribeTerminalWait([target], "all_terminal");
+		const lease = manager.beginOwnerSubagentShutdown("owner-a");
+		if (!lease) throw new Error("Owner shutdown lease was not created");
+		try {
+			expect(await manager.cancelAndProveOwnerSubagents(lease, { timeoutMs: 100 })).toMatchObject({
+				confirmed: true,
+				terminalIds: [subagentId],
+			});
+			manager.finishOwnerSubagentShutdown(lease, "commit");
+			expect(manager.getSubagentRecord(subagentId)).toBeUndefined();
+			await expect(wait.result).resolves.toMatchObject({
+				outcome: "completed",
+				condition: "all_terminal",
+				terminalJobIds: [subagentId],
+				pendingJobIds: [],
+			});
+		} finally {
+			wait.close();
+			blockerGate.resolve();
+			await manager.getJob(blockerJobId)?.promise;
+			manager.finishOwnerSubagentShutdown(lease, "release");
+			await manager.dispose();
+		}
+	});
+
 	for (const invalidation of ["record identity", "current job id", "current job generation"] as const) {
 		test(`cancels the captured queued execution when its ${invalidation} changes`, async () => {
 			const manager = makeManager();
