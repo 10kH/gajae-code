@@ -23265,6 +23265,38 @@ export class AgentSession {
 			});
 		}
 	}
+	/**
+	 * Move a compaction off a credential row that reported a usage limit, the way the
+	 * turn path does through `#markFailedCredential`. Without this, compaction retried
+	 * the exhausted row until its retries ran out, and because compaction gates the next
+	 * request, the session never reached the turn path's rotation while other rows still
+	 * had quota. Returns the rotated row's key, or undefined to fall back to the normal
+	 * retry policy: when the candidate is not on the session model's provider (the mark
+	 * acts on that provider's session credential), the provider is pinned, or the
+	 * rotation lands on a row this compaction already failed on.
+	 */
+	async #rotateCompactionCredentialAfterUsageLimit(
+		candidate: Model,
+		retryAfterMs: number | undefined,
+		failedRowIds: Set<number>,
+	): Promise<string | undefined> {
+		if (candidate.provider !== this.model?.provider) return undefined;
+		const authStorage = this.#modelRegistry.authStorage;
+		const failedRowId = authStorage.getSessionCredentialRowId(candidate.provider, this.credentialSessionId);
+		if (failedRowId === undefined) return undefined;
+		failedRowIds.add(failedRowId);
+		const mark = await this.#markFailedCredential({ class: "quota", retryAfterMs });
+		if (mark !== "rotated") return undefined;
+		const nextRowId = authStorage.getSessionCredentialRowId(candidate.provider, this.credentialSessionId);
+		if (nextRowId === undefined || failedRowIds.has(nextRowId)) return undefined;
+		// Resolve the rotated row by id: a bare lookup re-ranks the pool and can land back
+		// on a row whose backoff has already run out.
+		const apiKey = await this.#modelRegistry.getApiKey(candidate, this.credentialSessionId, {
+			credentialSelector: { kind: "id", value: String(nextRowId) },
+		});
+		return isAuthenticated(apiKey) ? apiKey : undefined;
+	}
+
 	async #resolveCompactionCandidate(
 		candidate: Model,
 		previousCandidate: Model | undefined,
@@ -23873,21 +23905,19 @@ export class AgentSession {
 				let previousFailure: unknown;
 
 				for (const candidate of candidates) {
-					const { apiKey, authError } = await this.#resolveCompactionCandidate(
-						candidate,
-						previousCandidate,
-						previousFailure,
-					);
-					if (apiKey === undefined) {
-						lastError = authError;
+					const resolved = await this.#resolveCompactionCandidate(candidate, previousCandidate, previousFailure);
+					if (resolved.apiKey === undefined) {
+						lastError = resolved.authError;
 						previousCandidate = candidate;
-						previousFailure = authError;
+						previousFailure = resolved.authError;
 						candidateFailures.push({
 							model: `${candidate.provider}/${candidate.id}`,
-							message: authError.message,
+							message: resolved.authError.message,
 						});
 						continue;
 					}
+					let apiKey = resolved.apiKey;
+					const usageLimitedRowIds = new Set<number>();
 
 					let attempt = 0;
 					while (true) {
@@ -23927,6 +23957,21 @@ export class AgentSession {
 								break;
 							}
 							const retryAfterMs = this.#parseRetryAfterMsFromError(message);
+							if (isUsageLimitError(message)) {
+								const rotatedApiKey = await this.#rotateCompactionCredentialAfterUsageLimit(
+									candidate,
+									retryAfterMs,
+									usageLimitedRowIds,
+								);
+								if (rotatedApiKey !== undefined) {
+									apiKey = rotatedApiKey;
+									logger.warn("Auto-compaction hit a usage limit, retrying on another credential", {
+										error: message,
+										model: `${candidate.provider}/${candidate.id}`,
+									});
+									continue;
+								}
+							}
 							const shouldRetry =
 								!this.#isTerminalProviderCompactionTimeout(candidate, message) &&
 								retrySettings.enabled &&
