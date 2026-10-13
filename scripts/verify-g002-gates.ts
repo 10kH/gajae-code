@@ -389,6 +389,35 @@ async function verifyBroadWorkflowExposure(): Promise<GateResult> {
 	};
 }
 
+export function findMcpBuiltinQuarantineFindings(builtinRegistry: string): string[] {
+	const markers = [...builtinRegistry.matchAll(/^\t\tname:\s*["']mcp["']\s*,/gm)];
+	if (markers.length === 0) return [];
+
+	const marker = markers[0]!;
+	const entryEnd = builtinRegistry.indexOf("\n\t},", marker.index);
+	if (entryEnd < 0) return ["root /mcp builtin could not be isolated"];
+	const entry = builtinRegistry.slice(marker.index, entryEnd);
+	const findings: string[] = [];
+	if (markers.length > 1) findings.push("multiple root /mcp builtins are registered");
+	if (/^\t\thandle\s*:/m.test(entry)) findings.push("root /mcp builtin has an unrestricted default handler");
+
+	const tuiHandler = /^\t\thandleTui:\s*(?:async\s*)?\([^)]*\)\s*=>\s*\{/m.exec(entry);
+	if (!tuiHandler) {
+		findings.push("root /mcp builtin is not TUI-only");
+		return findings;
+	}
+
+	const body = entry.slice(tuiHandler.index + tuiHandler[0].length);
+	const firstStatement = body
+		.split("\n")
+		.map(line => line.trim())
+		.find(line => line.length > 0 && !line.startsWith("//"));
+	if (firstStatement !== "if (!runtime.ctx.session.hasExactMcpControls) return { prompt: command.text };") {
+		findings.push("root /mcp TUI handler must fall through without exact MCP controls");
+	}
+	return findings;
+}
+
 async function verifyMcpQuarantine(): Promise<GateResult> {
 	const codingPackage = await readJson("packages/coding-agent/package.json");
 	const exportsRecord = isRecord(codingPackage.exports) ? codingPackage.exports : {};
@@ -398,9 +427,11 @@ async function verifyMcpQuarantine(): Promise<GateResult> {
 	const missingPrivateBlocks = REQUIRED_PRIVATE_EXPORT_BLOCKS.filter(key => exportsRecord[key] !== null);
 	const builtinRegistry = await readText("packages/coding-agent/src/slash-commands/builtin-registry.ts");
 	const acpBuiltins = await readText("packages/coding-agent/src/slash-commands/acp-builtins.ts");
-	// Only a root-level slash-command entry is public. Nested subcommands such as
-	// `/aside mcp` are intentionally allowed and must not trip the quarantine gate.
+	// The root /mcp TUI entry is a supported control surface only for sessions
+	// holding the exact MCP capability. Nested subcommands such as `/aside mcp`
+	// and this guarded TUI command must not become default or ACP MCP access.
 	const exposesMcpBuiltin = /^\t\tname:\s*["']mcp["']/m.test(builtinRegistry);
+	const mcpBuiltinQuarantineFindings = findMcpBuiltinQuarantineFindings(builtinRegistry);
 	const importsMcpBuiltinHandler = builtinRegistry.includes("handleMcpAcp");
 	const acpReferencesMcpHandler = acpBuiltins.includes("handleMcpAcp");
 	const acpAdvertisesMcpCommand = /name:\s*["']mcp["']/.test(acpBuiltins);
@@ -430,7 +461,9 @@ async function verifyMcpQuarantine(): Promise<GateResult> {
 		`exposed private package keys: ${exposedMcpKeys.join(", ") || "<none>"}`,
 		`blocked private package keys: ${blockedMcpKeys.join(", ") || "<none>"}`,
 		`missing private export blocks: ${missingPrivateBlocks.join(", ") || "<none>"}`,
-		`default /mcp builtin registered: ${exposesMcpBuiltin}`,
+		`root /mcp builtin registered: ${exposesMcpBuiltin}`,
+		`root /mcp builtin restricted to exact-config TUI: ${exposesMcpBuiltin && mcpBuiltinQuarantineFindings.length === 0}`,
+		`root /mcp builtin quarantine findings: ${mcpBuiltinQuarantineFindings.join(", ") || "<none>"}`,
 		`default /mcp handler imported: ${importsMcpBuiltinHandler}`,
 		`ACP /mcp command advertised: ${acpAdvertisesMcpCommand}`,
 		`ACP MCP handler referenced: ${acpReferencesMcpHandler}`,
@@ -445,7 +478,7 @@ async function verifyMcpQuarantine(): Promise<GateResult> {
 	];
 
 	return {
-		name: "MCP quarantine/no default discoverable MCP",
+		name: "MCP quarantine/no unrestricted default MCP access",
 		passed:
 			exposedMcpKeys.length === 0 &&
 			missingPrivateBlocks.length === 0 &&
@@ -454,7 +487,7 @@ async function verifyMcpQuarantine(): Promise<GateResult> {
 			publicDocFindings.length === 0 &&
 			exaMcpDocFindings.length === 0 &&
 			removedPublicDocsStillPresent.length === 0 &&
-			!exposesMcpBuiltin &&
+			mcpBuiltinQuarantineFindings.length === 0 &&
 			!importsMcpBuiltinHandler &&
 			!acpAdvertisesMcpCommand &&
 			!acpReferencesMcpHandler &&

@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import * as path from "node:path";
 import { buildDocsIndexOutput } from "./check-public-version-sync";
-import { findExaMcpDocFindings, parseEmbeddedDocs } from "./verify-g002-gates";
+import {
+	findExaMcpDocFindings,
+	findMcpBuiltinQuarantineFindings,
+	parseEmbeddedDocs,
+} from "./verify-g002-gates";
 
 const generatedPath = "packages/coding-agent/src/internal-urls/docs-index.generated.ts";
 const sourcePaths = ["README.md", "docs/tools/web_search.md", "docs/environment-variables.md"];
@@ -32,6 +36,55 @@ function findings(generated = corpus(), sources: Record<string, string> = {}): P
 		return sources[file] ?? "Exa requires EXA_API_KEY.";
 	});
 }
+
+const exactMcpTuiBuiltin = [
+	'\t\tname: "mcp",',
+	"\t\thandleTui: async (command, runtime) => {",
+	"\t\t\t// MCP controls are unavailable to ordinary sessions.",
+	"\t\t\tif (!runtime.ctx.session.hasExactMcpControls) return { prompt: command.text };",
+	"\t\t\treturn false;",
+	"\t\t},",
+	"\t},",
+].join("\n");
+
+describe("MCP command quarantine", () => {
+	test("allows the registered /mcp command when it is TUI-only and exact-capability gated", async () => {
+		const root = path.join(import.meta.dir, "..");
+		const registry = await Bun.file(path.join(root, "packages/coding-agent/src/slash-commands/builtin-registry.ts")).text();
+		expect(registry).toMatch(/^\t\tname:\s*["']mcp["']/m);
+		expect(findMcpBuiltinQuarantineFindings(registry)).toEqual([]);
+	});
+
+	test("rejects a TUI handler that does not fall through before handling the command", () => {
+		const unguarded = exactMcpTuiBuiltin.replace(
+			"if (!runtime.ctx.session.hasExactMcpControls) return { prompt: command.text };",
+			"return false;",
+		);
+		expect(findMcpBuiltinQuarantineFindings(unguarded)).toContain(
+			"root /mcp TUI handler must fall through without exact MCP controls",
+		);
+	});
+
+	test("rejects a default handler even when a TUI guard is also present", () => {
+		const exposed = exactMcpTuiBuiltin.replace(
+			'\t\thandleTui: async (command, runtime) => {',
+			'\t\thandle: async (command, runtime) => false,\n\t\thandleTui: async (command, runtime) => {',
+		);
+		expect(findMcpBuiltinQuarantineFindings(exposed)).toContain(
+			"root /mcp builtin has an unrestricted default handler",
+		);
+	});
+
+	test("rejects duplicate root /mcp registrations", () => {
+		expect(findMcpBuiltinQuarantineFindings(`${exactMcpTuiBuiltin}\n${exactMcpTuiBuiltin}`)).toContain(
+			"multiple root /mcp builtins are registered",
+		);
+	});
+
+	test("allows the quarantined state with no root /mcp command", () => {
+		expect(findMcpBuiltinQuarantineFindings('\t\tname: "status",')).toEqual([]);
+	});
+});
 
 describe("Exa MCP documentation scope", () => {
 	test("allows the actual unrelated standalone MCP negative statements", async () => {
