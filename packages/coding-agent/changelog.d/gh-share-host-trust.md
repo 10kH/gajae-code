@@ -1,3 +1,3 @@
 ### Fixed
 
-- The default `/share` gist upload no longer forwards a project `.env` `GH_HOST` or `GH_CONFIG_DIR` to `gh`; an operator value the project does not declare is kept.
+- The default `/share` gist upload no longer forwards project `.env` routing, config (including XDG, home-directory, and Windows app-data fallbacks), or GitHub CLI authentication values to `gh`; operator values the project does not declare are kept.

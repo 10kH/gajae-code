@@ -270,7 +270,7 @@ function redactJsonValue(value: unknown): unknown {
 }
 
 const CREDENTIAL_JSON_KEY =
-	/^(?:api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?id|session[_-]?token|client[_-]?secret|secret[_-]?key|aws[_-]?secret[_-]?access[_-]?key|secret[_-]?access[_-]?key|password|passwd|authorization)$/i;
+	/(?:api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?id|session[_-]?token|client[_-]?secret|secret[_-]?key|aws[_-]?secret[_-]?access[_-]?key|secret[_-]?access[_-]?key|password|passwd|authorization|token|secret|credential|private[_-]?key|cookie)/i;
 
 function redactKeyedValue(key: string, value: unknown): unknown {
 	// A recognized key is authoritative for every JSON type, including a short
@@ -282,9 +282,9 @@ function redactKeyedValue(key: string, value: unknown): unknown {
 		const parsed = JSON.parse(redactCrashSecrets(encoded)) as Record<string, unknown>;
 		if (parsed !== null && typeof parsed === "object" && Object.hasOwn(parsed, key)) return parsed[key];
 	} catch {
-		// A quote inside a credential field can make the redacted JSON invalid.
-		// Mask that field instead of exporting the raw value without its key.
-		if (CREDENTIAL_JSON_KEY.test(key)) return "«redacted»";
+		// Credential keys are masked above. Redaction of an embedded credential can
+		// otherwise make the serialized field invalid, so scrub its detached value.
+		return redactCrashSecrets(value);
 	}
 	return redactCrashSecrets(value);
 }

@@ -108,7 +108,18 @@ export function buildHelpMarkdown(keybindings: Pick<KeybindingsManager, "getAcce
 	].join("\n");
 }
 
-const GH_SHARE_DESTINATION_KEYS = ["GH_HOST", "GH_CONFIG_DIR"] as const;
+const GH_SHARE_TRUST_KEYS = [
+	"GH_HOST",
+	"GH_CONFIG_DIR",
+	"GH_TOKEN",
+	"GITHUB_TOKEN",
+	"GH_ENTERPRISE_TOKEN",
+	"GITHUB_ENTERPRISE_TOKEN",
+	"XDG_CONFIG_HOME",
+	"HOME",
+	"USERPROFILE",
+	"APPDATA",
+] as const;
 
 /**
  * Project dotenv at import, before `/move` changes cwd. Those declarations are
@@ -118,14 +129,15 @@ const GH_SHARE_DESTINATION_KEYS = ["GH_HOST", "GH_CONFIG_DIR"] as const;
 const ghShareProjectSnapshot = projectEnvSnapshot();
 
 /**
- * Environment for the default `/share` `gh` children. A `GH_HOST` or
- * `GH_CONFIG_DIR` that matches the project dotenv is omitted so the repository
- * cannot retarget gist upload or point `gh` at a config directory it shipped.
- * An operator value the project does not declare is kept.
+ * Environment for the default `/share` `gh` children. GitHub CLI routing,
+ * config, and authentication values that match the project dotenv are omitted
+ * so a repository cannot redirect the upload, select a shipped config, or
+ * authenticate with a project-provided token. Operator values the project does
+ * not declare are kept.
  */
 function ghShareChildEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
 	const child: NodeJS.ProcessEnv = { ...env };
-	for (const name of GH_SHARE_DESTINATION_KEYS) {
+	for (const name of GH_SHARE_TRUST_KEYS) {
 		const raw = child[name];
 		if (typeof raw !== "string") continue;
 		const key = canonicalEnvKey(name);

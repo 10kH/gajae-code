@@ -1,3 +1,3 @@
 ### Fixed
 
-- Session HTML export scrubs credential-shaped text inside embedded session values before base64 encoding, including any value stored under a credential JSON key.
+- Session HTML export masks credential-shaped text and opaque values stored under common sensitive JSON keys, including `token`, `secret`, `credential`, `private_key`, and `cookie`, before base64 encoding.

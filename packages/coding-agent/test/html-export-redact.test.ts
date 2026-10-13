@@ -111,6 +111,63 @@ describe("session HTML export embed", () => {
 		}
 	});
 
+	it("masks opaque credentials under generic field names", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-html-export-generic-credentials-"));
+		let session: SessionManager | undefined;
+		try {
+			session = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+			session.appendMessage({
+				role: "assistant",
+				content: [
+					{
+						type: "toolCall",
+						id: "call-generic-credentials",
+						name: "echo",
+						arguments: {
+							auth: {
+								token: "opaque-token-value",
+								secret: "opaque-secret-value",
+								credential: "opaque-credential-value",
+								private_key: "opaque-private-key-value",
+								cookie: "opaque-cookie-value",
+							},
+							note: ORDINARY_SENTENCE,
+						},
+					},
+				],
+				timestamp: 1,
+			} as unknown as Parameters<SessionManager["appendMessage"]>[0]);
+			const outputPath = path.join(tempDir, "export.html");
+			await exportSessionToHtml(session, undefined, { outputPath });
+			const embedded = embeddedSessionText(await Bun.file(outputPath).text());
+			const parsed = JSON.parse(embedded) as {
+				entries: Array<{ message?: { content?: Array<{ arguments?: Record<string, unknown> }> } }>;
+			};
+			const args = parsed.entries[0]?.message?.content?.[0]?.arguments;
+			const auth = args?.auth as Record<string, unknown> | undefined;
+			for (const secret of [
+				"opaque-token-value",
+				"opaque-secret-value",
+				"opaque-credential-value",
+				"opaque-private-key-value",
+				"opaque-cookie-value",
+			]) {
+				expect(embedded).not.toContain(secret);
+			}
+			expect(auth).toEqual({
+				token: "«redacted»",
+				secret: "«redacted»",
+				credential: "«redacted»",
+				private_key: "«redacted»",
+				cookie: "«redacted»",
+			});
+			expect(args?.note).toBe(ORDINARY_SENTENCE);
+		} finally {
+			await session?.close();
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("scrubs a short value under a password key", async () => {
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-html-export-key-short-"));
 		let session: SessionManager | undefined;

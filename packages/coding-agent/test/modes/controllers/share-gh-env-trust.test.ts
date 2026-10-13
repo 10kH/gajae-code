@@ -10,13 +10,33 @@ import * as path from "node:path";
  */
 
 const PROBE = path.join(import.meta.dir, "../../fixtures/share-gh-env-probe.ts");
-const DESTINATION_KEYS = ["GH_HOST", "GH_CONFIG_DIR", "GH_TOKEN", "GH_HOST_PLANTED", "GH_CONFIG_PLANTED"] as const;
+const TRUST_KEYS = [
+	"GH_HOST",
+	"GH_CONFIG_DIR",
+	"GH_TOKEN",
+	"GITHUB_TOKEN",
+	"GH_ENTERPRISE_TOKEN",
+	"GITHUB_ENTERPRISE_TOKEN",
+	"XDG_CONFIG_HOME",
+	"HOME",
+	"USERPROFILE",
+	"APPDATA",
+	"GH_HOST_PLANTED",
+	"GH_CONFIG_PLANTED",
+] as const;
 
 interface GhSpawn {
 	args: string[];
 	GH_HOST: string | null;
 	GH_CONFIG_DIR: string | null;
 	GH_TOKEN: string | null;
+	GITHUB_TOKEN: string | null;
+	GH_ENTERPRISE_TOKEN: string | null;
+	GITHUB_ENTERPRISE_TOKEN: string | null;
+	XDG_CONFIG_HOME: string | null;
+	HOME: string | null;
+	USERPROFILE: string | null;
+	APPDATA: string | null;
 }
 
 const tempDirs: string[] = [];
@@ -50,6 +70,13 @@ appendFileSync(
 		GH_HOST: process.env.GH_HOST ?? null,
 		GH_CONFIG_DIR: process.env.GH_CONFIG_DIR ?? null,
 		GH_TOKEN: process.env.GH_TOKEN ?? null,
+		GITHUB_TOKEN: process.env.GITHUB_TOKEN ?? null,
+		GH_ENTERPRISE_TOKEN: process.env.GH_ENTERPRISE_TOKEN ?? null,
+		GITHUB_ENTERPRISE_TOKEN: process.env.GITHUB_ENTERPRISE_TOKEN ?? null,
+		XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME ?? null,
+		HOME: process.env.HOME ?? null,
+		USERPROFILE: process.env.USERPROFILE ?? null,
+		APPDATA: process.env.APPDATA ?? null,
 	}) + "\\n",
 );
 if (process.argv[2] === "auth") process.exit(0);
@@ -79,7 +106,7 @@ async function share(options: {
 	for (const [key, value] of Object.entries(process.env)) {
 		if (value !== undefined) env[key] = value;
 	}
-	for (const key of DESTINATION_KEYS) delete env[key];
+	for (const key of TRUST_KEYS) delete env[key];
 	delete env.GJC_SHARE_EXPECT_HOST;
 	delete env.GJC_SHARE_EXPECT_CONFIG;
 	delete env.GJC_SHARE_MOVE_TO;
@@ -111,14 +138,35 @@ async function share(options: {
 
 function expectDestination(
 	spawns: GhSpawn[],
-	expected: { GH_HOST: string | null; GH_CONFIG_DIR: string | null; GH_TOKEN: string | null },
+	expected: Partial<
+		Pick<
+			GhSpawn,
+			| "GH_HOST"
+			| "GH_CONFIG_DIR"
+			| "GH_TOKEN"
+			| "GITHUB_TOKEN"
+			| "GH_ENTERPRISE_TOKEN"
+			| "GITHUB_ENTERPRISE_TOKEN"
+			| "XDG_CONFIG_HOME"
+			| "HOME"
+			| "USERPROFILE"
+			| "APPDATA"
+		>
+	>,
 ): void {
 	expect(spawns[0]?.args).toEqual(["auth", "status"]);
 	expect(spawns[1]?.args.slice(0, 3)).toEqual(["gist", "create", "--public=false"]);
 	for (const spawn of spawns) {
-		expect(spawn.GH_HOST).toBe(expected.GH_HOST);
-		expect(spawn.GH_CONFIG_DIR).toBe(expected.GH_CONFIG_DIR);
-		expect(spawn.GH_TOKEN).toBe(expected.GH_TOKEN);
+		expect(spawn.GH_HOST).toBe(expected.GH_HOST ?? null);
+		expect(spawn.GH_CONFIG_DIR).toBe(expected.GH_CONFIG_DIR ?? null);
+		expect(spawn.GH_TOKEN).toBe(expected.GH_TOKEN ?? null);
+		expect(spawn.GITHUB_TOKEN).toBe(expected.GITHUB_TOKEN ?? null);
+		expect(spawn.GH_ENTERPRISE_TOKEN).toBe(expected.GH_ENTERPRISE_TOKEN ?? null);
+		expect(spawn.GITHUB_ENTERPRISE_TOKEN).toBe(expected.GITHUB_ENTERPRISE_TOKEN ?? null);
+		expect(spawn.XDG_CONFIG_HOME).toBe(expected.XDG_CONFIG_HOME ?? null);
+		expect(spawn.HOME).toBe(expected.HOME ?? null);
+		expect(spawn.USERPROFILE).toBe(expected.USERPROFILE ?? null);
+		expect(spawn.APPDATA).toBe(expected.APPDATA ?? null);
 	}
 }
 
@@ -130,11 +178,32 @@ describe.skipIf(process.platform === "win32")("share gh destination trust", () =
 			dotenv: "export GH_HOST=attacker-egress.example # note\nGH_CONFIG_DIR=attacker-config\n",
 			env: {
 				GH_TOKEN: "operator-token",
+				GITHUB_TOKEN: "operator-github-token",
+				GH_ENTERPRISE_TOKEN: "operator-enterprise-token",
+				GITHUB_ENTERPRISE_TOKEN: "operator-enterprise-github-token",
 				GJC_SHARE_EXPECT_HOST: "attacker-egress.example",
 				GJC_SHARE_EXPECT_CONFIG: "attacker-config",
 			},
 		});
-		expectDestination(spawns, { GH_HOST: null, GH_CONFIG_DIR: null, GH_TOKEN: "operator-token" });
+		expectDestination(spawns, {
+			GH_HOST: null,
+			GH_CONFIG_DIR: null,
+			GH_TOKEN: "operator-token",
+			GITHUB_TOKEN: "operator-github-token",
+			GH_ENTERPRISE_TOKEN: "operator-enterprise-token",
+			GITHUB_ENTERPRISE_TOKEN: "operator-enterprise-github-token",
+		});
+	});
+
+	it("omits project dotenv GitHub CLI tokens from both gh spawns", async () => {
+		const spawns = await share({
+			autoload: true,
+			dotenv:
+				"GH_TOKEN=project-gh-token\\nGITHUB_TOKEN=project-github-token\\n" +
+				"GH_ENTERPRISE_TOKEN=project-enterprise-token\\nGITHUB_ENTERPRISE_TOKEN=project-enterprise-github-token\\n" +
+				"XDG_CONFIG_HOME=project-config\\nHOME=project-home\\nUSERPROFILE=project-profile\\nAPPDATA=project-appdata\\n",
+		});
+		expectDestination(spawns, {});
 	});
 
 	it("keeps an operator host and config directory the project does not declare", async () => {
@@ -146,12 +215,18 @@ describe.skipIf(process.platform === "win32")("share gh destination trust", () =
 				GH_TOKEN: "operator-token",
 				GJC_SHARE_EXPECT_HOST: "ghe.example.com",
 				GJC_SHARE_EXPECT_CONFIG: "operator-config",
+				XDG_CONFIG_HOME: "operator-xdg-config",
+				HOME: "operator-home",
+				USERPROFILE: "operator-profile",
 			},
 		});
 		expectDestination(spawns, {
 			GH_HOST: "ghe.example.com",
 			GH_CONFIG_DIR: "operator-config",
 			GH_TOKEN: "operator-token",
+			XDG_CONFIG_HOME: "operator-xdg-config",
+			HOME: "operator-home",
+			USERPROFILE: "operator-profile",
 		});
 	});
 
