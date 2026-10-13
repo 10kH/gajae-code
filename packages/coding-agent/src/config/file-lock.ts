@@ -167,6 +167,7 @@ export const FileLockTestHooks: {
 		processIncarnation: string | null;
 		startTime: string | null;
 	};
+	processIncarnation?: (pid: number) => string | null;
 	nativeQuarantineBindings?: () => NativeFileLockBindings;
 	nativeExactRemovalProbe?: () => boolean | Promise<boolean>;
 } = {};
@@ -222,7 +223,7 @@ function currentProcessStartTime(): string {
 	return ownProcessStartTime;
 }
 
-function processIncarnation(pid: number): string | null {
+function nativeProcessIncarnation(pid: number): string | null {
 	try {
 		const incarnation = nativeProcessBindings().Process.fromPid(pid)?.incarnation;
 		return typeof incarnation === "string" && incarnation.length > 0 ? incarnation : null;
@@ -231,8 +232,17 @@ function processIncarnation(pid: number): string | null {
 	}
 }
 
+function processIncarnation(pid: number): string | null {
+	try {
+		const testHook = FileLockTestHooks.processIncarnation;
+		return testHook ? testHook(pid) : nativeProcessIncarnation(pid);
+	} catch {
+		return null;
+	}
+}
+
 function currentProcessIncarnation(): string | null {
-	if (ownProcessIncarnation === undefined) ownProcessIncarnation = processIncarnation(process.pid);
+	if (ownProcessIncarnation === undefined) ownProcessIncarnation = nativeProcessIncarnation(process.pid);
 	return ownProcessIncarnation;
 }
 
@@ -260,6 +270,17 @@ function ownerIsAlive(owner: FileLockOwnerToken, startTimeCache?: Map<string, st
 	// so a locale/timezone change can make a live holder look different and must never
 	// authorize its removal.
 	return owner.start_time_format !== PROCESS_START_TIME_FORMAT;
+}
+
+function ownerIdentityIsProven(owner: FileLockOwnerToken): boolean {
+	if (owner.process_incarnation) {
+		const currentIncarnation = processIncarnation(owner.pid);
+		if (currentIncarnation !== null) return currentIncarnation === owner.process_incarnation;
+	}
+	if (owner.start_time_format !== PROCESS_START_TIME_FORMAT || !owner.start_time || owner.start_time === "unknown")
+		return false;
+	const currentStartTime = cachedProcessStartTime(owner);
+	return currentStartTime !== null && currentStartTime === owner.start_time;
 }
 
 function lockInfo(ownerHostId: string | undefined, ownerToken: string): LockInfo {
@@ -680,8 +701,8 @@ function isResumableLocalRemoval(transitionPath: string, record: RemovalTransiti
 
 type FileLockRemovalTransitionState = "active" | "abandoned" | "orphan_transition";
 type FileLockOrphanTransition = { kind: "orphan_transition"; path: string };
-type FileLockPublicationContention = { kind: "publication_contention"; code: FileLockPublicationFailureCode };
-type FileLockAcquisitionResult = LockInfo | FileLockOrphanTransition | FileLockPublicationContention | null;
+type FileLockPublicationRetry = { kind: "publication_retry"; code: FileLockPublicationFailureCode };
+type FileLockAcquisitionResult = LockInfo | FileLockOrphanTransition | FileLockPublicationRetry | null;
 
 async function readRemovalTransitionOwnerRecord(transitionPath: string): Promise<RemovalTransitionOwnerRecord | null> {
 	try {
@@ -765,8 +786,8 @@ function isFileLockOrphanTransition(value: FileLockAcquisitionResult): value is 
 	return value !== null && "kind" in value && value.kind === "orphan_transition";
 }
 
-function isFileLockPublicationContention(value: FileLockAcquisitionResult): value is FileLockPublicationContention {
-	return value !== null && "kind" in value && value.kind === "publication_contention";
+function isFileLockPublicationRetry(value: FileLockAcquisitionResult): value is FileLockPublicationRetry {
+	return value !== null && "kind" in value && value.kind === "publication_retry";
 }
 
 /** Without an owner, only an aged, completely empty directory is reclaimable. */
@@ -1390,6 +1411,12 @@ function isPreMutationAccessDeniedPublication(value: unknown): boolean {
 
 function isPreMutationPublicationRetryable(value: unknown): boolean {
 	return isPreMutationPublicationContention(value) || isPreMutationAccessDeniedPublication(value);
+}
+
+function preMutationPublicationFailureCode(value: unknown): FileLockPublicationFailureCode | undefined {
+	if (isPreMutationPublicationContention(value)) return "sharing_violation";
+	if (isPreMutationAccessDeniedPublication(value)) return "access_denied";
+	return undefined;
 }
 
 async function publishNoReplaceWithTransientRetry(
@@ -2181,6 +2208,7 @@ async function tryAcquireLock(
 			const fallbackSuccessfully = isSuccessfulNativePublication(fallback, "directory");
 			if (fallback.ok && !fallbackSuccessfully)
 				throw new Error("Failed to publish file lock: invalid directory success receipt.");
+			const fallbackFailureCode = preMutationPublicationFailureCode(fallback);
 			let verifiedCommittedPublication = false;
 			if (isCommittedDirectoryVerificationFailure(fallback)) {
 				// The staged name has been consumed. Relinquish pathname cleanup even
@@ -2200,11 +2228,10 @@ async function tryAcquireLock(
 				publishedSuccessfully = true;
 			} else if (fallback.reason === "destination_exists") {
 				return null;
-			} else if (isPreMutationPublicationContention(fallback)) {
+			} else if (fallbackFailureCode) {
 				removePending = false;
 				await cleanupPendingStagingOrThrow(lockPath, pendingPath);
-				const fallbackFailureCode = fallback.code as FileLockPublicationFailureCode;
-				return { kind: "publication_contention", code: fallbackFailureCode };
+				return { kind: "publication_retry", code: fallbackFailureCode };
 			} else {
 				const failure = new Error(
 					`Failed to publish file lock: ${fallback.code ?? fallback.reason ?? "unknown"}.`,
@@ -2217,11 +2244,11 @@ async function tryAcquireLock(
 			if (published.reason === "destination_exists") {
 				return null;
 			}
-			if (isPreMutationPublicationContention(published)) {
+			const publicationFailureCode = preMutationPublicationFailureCode(published);
+			if (publicationFailureCode) {
 				removePending = false;
 				await cleanupPendingStagingOrThrow(lockPath, pendingPath);
-				const publicationFailureCode = published.code as FileLockPublicationFailureCode;
-				return { kind: "publication_contention", code: publicationFailureCode };
+				return { kind: "publication_retry", code: publicationFailureCode };
 			}
 			const failure = new Error(
 				`Failed to publish file lock: ${published.code ?? published.reason ?? "unknown"}.`,
@@ -2592,15 +2619,12 @@ async function lockHolderDescription(
 					isLive: false,
 				};
 			}
-			// Same-host holder: use the full liveness proof (pid alive AND, when the
-			// record carries a start_time, the start-time identity match) so a dead
-			// holder whose pid was already reused is not mislabeled "(live)".
-			const alive = ownerIsAlive(info);
-			const liveness = alive
-				? "live"
-				: ownerLiveness(info.pid) === "dead"
-					? "dead but not reaped"
-					: "liveness unknown";
+			// Same-host holder: label it live only when the PID is alive and its
+			// recorded process identity matches exactly. Conservative uncertainty
+			// still prevents reclamation, but is not proof for operator diagnostics.
+			const pidLiveness = ownerLiveness(info.pid);
+			const alive = pidLiveness === "alive" && ownerIdentityIsProven(info);
+			const liveness = alive ? "live" : pidLiveness === "dead" ? "dead but not reaped" : "liveness unknown";
 			return {
 				description:
 					`held by pid ${info.pid}` +
@@ -2692,7 +2716,7 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 				"orphan_transition",
 				result.path,
 			);
-		if (isFileLockPublicationContention(result)) {
+		if (isFileLockPublicationRetry(result)) {
 			publicationFailureCode = result.code;
 		} else {
 			publicationFailureCode = undefined;
@@ -2701,7 +2725,8 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 				return () => releaseLock(lockPath, result, localKey);
 			}
 		}
-		if (!contentionObserved) {
+		const publicationIsProvenContention = isFileLockPublicationRetry(result) && result.code === "sharing_violation";
+		if (!contentionObserved && (!isFileLockPublicationRetry(result) || publicationIsProvenContention)) {
 			contentionObserved = true;
 			opts.onContended?.();
 		}

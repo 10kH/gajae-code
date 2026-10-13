@@ -24,6 +24,7 @@ import { registerOwnedDeletionRoot } from "../../../scripts/safe-cleanup";
 
 const tempDirs: { directory: string; forgetGrant: () => void }[] = [];
 const quickAcquire = { retries: 3, retryDelayMs: 1 };
+const expectedBoundedPublicationCalls = 3;
 
 interface Fixture {
 	root: string;
@@ -47,6 +48,7 @@ afterEach(async () => {
 	vi.restoreAllMocks();
 	FileLockTestHooks.nativePublicationBindings = undefined;
 	FileLockTestHooks.stagingIdentityEvidence = undefined;
+	FileLockTestHooks.processIncarnation = undefined;
 	FileLockTestHooks.nativeQuarantineBindings = undefined;
 	FileLockTestHooks.cleanupPendingStaging = undefined;
 	for (const { directory, forgetGrant } of tempDirs.splice(0)) {
@@ -80,12 +82,17 @@ async function deadPid(): Promise<number> {
 	return child.pid;
 }
 
-function removalInfo(pid: number, ownerHostId?: string): string {
+function removalInfo(
+	pid: number,
+	ownerHostId?: string,
+	identity: { process_incarnation?: string; start_time?: string; start_time_format?: string } = {},
+): string {
 	return JSON.stringify({
 		pid,
 		timestamp: Date.now(),
 		owner_token: crypto.randomUUID(),
 		...(ownerHostId === undefined ? {} : { owner_host_id: ownerHostId }),
+		...identity,
 	});
 }
 
@@ -204,6 +211,19 @@ function accessDeniedPublication(): NativeNoReplaceResult {
 		mutationState: "not_committed",
 		durabilityState: "not_attempted",
 		reason: "access_denied",
+		primitive: "windows_rename_noreplace",
+		phase: "rename",
+		diagnostic: { schemaVersion: 1, collectionState: "unavailable" },
+	};
+}
+
+function destinationExistsPublication(): NativeNoReplaceResult {
+	return {
+		ok: false,
+		code: "quarantine_collision",
+		mutationState: "not_committed",
+		durabilityState: "not_attempted",
+		reason: "destination_exists",
 		primitive: "windows_rename_noreplace",
 		phase: "rename",
 		diagnostic: { schemaVersion: 1, collectionState: "unavailable" },
@@ -446,9 +466,10 @@ test("does not retry access-denied receipts without Windows rename provenance", 
 	expect(await fs.readdir(root)).toEqual([]);
 });
 
-test("briefly retries access-denied publication and preserves persistent ACL errors", async () => {
+test("retries persistent access-denied publication through the acquisition budget without reporting contention", async () => {
 	const { root, file, lock } = await makeFixture();
 	let attempts = 0;
+	let contentionNotifications = 0;
 	FileLockTestHooks.nativePublicationBindings = () => ({
 		renameNoReplacePathAsync: async () => {
 			attempts++;
@@ -457,35 +478,92 @@ test("briefly retries access-denied publication and preserves persistent ACL err
 		renameDirectoryNoReplacePathAsync,
 	});
 
-	await expect(withFileLock(file, async () => "entered", { retries: 2, retryDelayMs: 1 })).rejects.toMatchObject({
-		message: "Failed to publish file lock: access_denied.",
-		code: "access_denied",
-	});
-	expect(attempts).toBe(3);
+	const failure = await acquireFileLock(file, {
+		retries: 2,
+		retryDelayMs: 1,
+		onContended: () => contentionNotifications++,
+	}).then(
+		() => undefined,
+		(error: unknown) => error,
+	);
+	expect(failure).toBeInstanceOf(FileLockAcquireError);
+	if (!(failure instanceof FileLockAcquireError)) throw new Error("expected file lock acquisition failure");
+	expect(failure.publicationFailureCode).toBe("access_denied");
+	expect(failure.holderIsLive).toBe(false);
+	expect(attempts).toBe(2 * expectedBoundedPublicationCalls);
+	expect(contentionNotifications).toBe(0);
 	await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
 	expect(await fs.readdir(root)).toEqual([]);
 });
 
+test("clears an access-denied receipt when a later acquisition attempt sees a live lock", async () => {
+	const { file } = await makeFixture();
+	const liveIncarnation = "current-live-incarnation";
+	FileLockTestHooks.processIncarnation = () => liveIncarnation;
+	let attempts = 0;
+	FileLockTestHooks.nativePublicationBindings = () => ({
+		renameNoReplacePathAsync: async (_source, destination) => {
+			attempts++;
+			if (attempts <= expectedBoundedPublicationCalls) return accessDeniedPublication();
+			if (attempts === expectedBoundedPublicationCalls + 1) {
+				await fs.mkdir(destination);
+				await Bun.write(
+					path.join(destination, "info"),
+					removalInfo(process.pid, undefined, { process_incarnation: liveIncarnation }),
+				);
+			}
+			return destinationExistsPublication();
+		},
+		renameDirectoryNoReplacePathAsync,
+	});
+
+	const failure = await acquireFileLock(file, { retries: 2, retryDelayMs: 1 }).then(
+		() => undefined,
+		(error: unknown) => error,
+	);
+	expect(failure).toBeInstanceOf(FileLockAcquireError);
+	if (!(failure instanceof FileLockAcquireError)) throw new Error("expected file lock acquisition failure");
+	expect(attempts).toBe(expectedBoundedPublicationCalls + 1);
+	expect(failure.publicationFailureCode).toBeUndefined();
+	expect(failure.holderIsLive).toBe(true);
+});
+
 test("acquisition reports live-holder evidence separately from ambiguous lock records", async () => {
+	const liveIncarnation = "known-live-incarnation";
+	const unavailableIncarnation = "unavailable-incarnation";
 	const cases = [
 		{
-			info: removalInfo(process.pid),
+			info: removalInfo(process.pid, undefined, { process_incarnation: liveIncarnation }),
+			currentIncarnation: liveIncarnation,
 			isLive: true,
 			description: `held by pid ${process.pid} (live)`,
 		},
 		{
+			info: removalInfo(process.pid, undefined, {
+				process_incarnation: unavailableIncarnation,
+				start_time: "unknown",
+				start_time_format: "utc-v1",
+			}),
+			currentIncarnation: null,
+			isLive: false,
+			description: `held by pid ${process.pid} (liveness unknown)`,
+		},
+		{
 			info: removalInfo(await deadPid()),
+			currentIncarnation: null,
 			isLive: false,
 			description: undefined,
 		},
 		{
 			info: "malformed owner metadata",
+			currentIncarnation: null,
 			isLive: false,
 			description: "held by an owner record that never became readable",
 		},
 	] as const;
 
 	for (const scenario of cases) {
+		FileLockTestHooks.processIncarnation = () => scenario.currentIncarnation;
 		const { file, lock } = await makeFixture();
 		await fs.mkdir(lock);
 		await Bun.write(path.join(lock, "info"), scenario.info);

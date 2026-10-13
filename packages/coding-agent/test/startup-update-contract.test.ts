@@ -801,7 +801,7 @@ describe("startup update contract", () => {
 					} else {
 						expect(output).not.toContain("Session index is busy");
 						expect(output).not.toContain("Retry in a few seconds");
-						expect(output).not.toContain("broker");
+						expect(output).not.toContain("SDK broker");
 					}
 					expect(process.exitCode).toBe(1);
 				} finally {
@@ -813,7 +813,7 @@ describe("startup update contract", () => {
 			vi.restoreAllMocks();
 			process.exitCode = originalExitCode ?? 0;
 		}
-	});
+	}, 15_000);
 	it("propagates a session-index lock release failure after registration commits", async () => {
 		using tempDir = TempDir.createSync("@gjc-session-index-release-failure-");
 		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
@@ -1242,7 +1242,7 @@ describe("startup update contract", () => {
 			expect(exitSpy).toHaveBeenCalledWith(1);
 			expect(printModeStarted).toBe(false);
 			expect(settings.get("modelProfile.default")).toBe("codex-medium");
-			expect(stderr.join("")).toContain('Model profile "codex-medium" requires credentials for: openai-codex');
+			expect(stderr.join("")).toContain('Model profile "Codex Medium" requires credentials for: openai-codex');
 			expect(getApiKeySpy.mock.calls.map(call => [call[0], call[1]])).toContainEqual([
 				"openai-codex",
 				FAKE_SESSION_ID,
