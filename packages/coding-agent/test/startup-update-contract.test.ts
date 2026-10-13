@@ -701,7 +701,7 @@ describe("startup update contract", () => {
 				kind: "sharing_violation",
 				code: "sharing_violation",
 				holder: "publication failed without an observed holder",
-				message: "Session index is busy",
+				message: "Session index is busy (validated lock-publication contention)",
 				busy: true,
 			},
 			{

@@ -1728,7 +1728,7 @@ function directSessionIndexLockFailureMessage(error: unknown, agentDir: string):
 		const code = error.publicationFailureCode ?? error.code;
 		if (error.publicationFailureCode === "sharing_violation" || error.holderIsLive)
 			return (
-				"Session index is busy (validated contention by a live owner). Retry in a few seconds.\n" +
+				"Session index is busy (validated lock-publication contention). Retry in a few seconds.\n" +
 				`Lock: ${error.lockPath}\nCode: ${code}\n${error.message}`
 			);
 		return (
