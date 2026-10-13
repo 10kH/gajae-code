@@ -31,7 +31,7 @@ export default class Accounts extends Command {
 		json: Flags.boolean({ description: "Output safe machine-readable JSON" }),
 		persistent: Flags.boolean({ description: "Required for persistent pin changes" }),
 		clear: Flags.boolean({ description: "Clear the persistent pin" }),
-		account: Flags.string({ description: "Logout one account by row id or email" }),
+		account: Flags.string({ description: "Logout one account by row id, email, or org:<organization id or name>" }),
 		all: Flags.boolean({ description: "Logout every OAuth account for the provider" }),
 	};
 
@@ -42,6 +42,7 @@ export default class Accounts extends Command {
 		"gjc accounts check anthropic --json",
 		"gjc accounts pin anthropic me@example.com --persistent",
 		"gjc accounts pin anthropic id:42 --persistent",
+		"gjc accounts pin anthropic 'org:Acme Team' --persistent",
 		"gjc accounts pin anthropic --clear --persistent",
 		"gjc accounts logout anthropic --account me@example.com",
 		"gjc accounts logout anthropic --all",

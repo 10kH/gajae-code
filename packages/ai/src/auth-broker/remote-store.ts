@@ -23,6 +23,7 @@ import {
 	type CachedUsagePresentation,
 	type CredentialDispatchTicket,
 	type CredentialInventoryRecord,
+	formatOAuthIdentityLabel,
 	type MCPOAuthRefreshClient,
 	type OAuthCredential,
 	REMOTE_REFRESH_SENTINEL,
@@ -1106,6 +1107,8 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 			email: current.email,
 			projectId: current.projectId,
 			enterpriseUrl: current.enterpriseUrl,
+			organizationId: current.organizationId,
+			organizationName: current.organizationName,
 		});
 		const observed = this.#snapshot.credentials.find(candidate => candidate.id === credentialId);
 		if (
@@ -1356,6 +1359,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 						projectId: credential.projectId ?? null,
 						enterpriseUrl: credential.enterpriseUrl ?? null,
 						mcpBinding: credential.mcpBinding ?? null,
+						...(credential.organizationId ? { organizationId: credential.organizationId } : {}),
 					}
 				: { type: credential.type };
 		return createHash("sha256")
@@ -1485,7 +1489,7 @@ function isErrorStatus(error: unknown, status: number): boolean {
 
 function snapshotIdentityLabel(entry: SnapshotEntry): string | null {
 	if (entry.credential.type !== "oauth") return null;
-	return entry.credential.email ?? entry.credential.accountId ?? entry.credential.projectId ?? null;
+	return formatOAuthIdentityLabel(entry.credential);
 }
 
 function safePresentationUsageReport(report: UsageReport): SafeUsageReport {
@@ -1548,7 +1552,11 @@ function matchUsageReport(reports: UsageReport[], provider: Provider, credential
 	const accountId = credential.accountId?.trim().toLowerCase();
 	const email = credential.email?.trim().toLowerCase();
 	const projectId = credential.projectId?.trim().toLowerCase();
+	const organizationId = credential.organizationId?.trim().toLowerCase();
 	for (const report of candidates) {
+		// The same account signed in to another organization reports that organization's limits.
+		const reportOrganizationId = readMetadataString((report.metadata ?? {}) as Record<string, unknown>, "orgId");
+		if (organizationId && reportOrganizationId && reportOrganizationId.toLowerCase() !== organizationId) continue;
 		if (reportMatchesIdentity(report, accountId, email, projectId)) return report;
 	}
 	return null;

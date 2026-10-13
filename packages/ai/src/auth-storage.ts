@@ -237,6 +237,8 @@ export interface CredentialInventoryRecord {
 	accountId?: string;
 	email?: string;
 	projectId?: string;
+	organizationId?: string;
+	organizationName?: string;
 	disabled: boolean;
 	disabledCause: string | null;
 }
@@ -1129,11 +1131,41 @@ export type AuthApiKeyOptions = {
 	/** Prefer one stored OAuth credential while preserving quota-triggered fallback. */
 	preferredCredentialSelector?: AuthCredentialSelector;
 };
-export type AuthCredentialSelectorKind = "id" | "email" | "account" | "project";
+export type AuthCredentialSelectorKind = "id" | "email" | "account" | "project" | "org";
 
 export interface AuthCredentialSelector {
 	kind: AuthCredentialSelectorKind;
 	value: string;
+}
+
+/**
+ * Whether an OAuth credential belongs to the organization named by an `org:`
+ * selector value: the organization id, or its display name (case-insensitive).
+ */
+export function oauthCredentialMatchesOrganization(
+	credential: Pick<OAuthCredentials, "organizationId" | "organizationName">,
+	value: string,
+): boolean {
+	const wanted = value.trim().toLowerCase();
+	if (wanted.length === 0) return false;
+	return (
+		credential.organizationId?.trim().toLowerCase() === wanted ||
+		credential.organizationName?.trim().toLowerCase() === wanted
+	);
+}
+
+/**
+ * Human-facing identity of a stored OAuth credential. The organization name is
+ * appended because one account (same email) can hold one credential per
+ * organization.
+ */
+export function formatOAuthIdentityLabel(
+	credential: Pick<OAuthCredentials, "email" | "accountId" | "projectId" | "organizationName">,
+): string | null {
+	const base = credential.email ?? credential.accountId ?? credential.projectId ?? null;
+	const organization = credential.organizationName?.trim();
+	if (!organization) return base;
+	return base ? `${base} (${organization})` : organization;
 }
 
 type OAuthResolutionResult = { apiKey: string; credential: OAuthCredential };
@@ -1296,6 +1328,8 @@ function oauthNonTokenFieldsEqual(left: OAuthCredential, right: OAuthCredential)
 		left.projectId === right.projectId &&
 		left.enterpriseUrl === right.enterpriseUrl &&
 		left.profileArn === right.profileArn &&
+		left.organizationId === right.organizationId &&
+		left.organizationName === right.organizationName &&
 		left.mcpBinding?.resourceOrigin === right.mcpBinding?.resourceOrigin &&
 		left.mcpBinding?.tokenEndpoint === right.mcpBinding?.tokenEndpoint
 	);
@@ -1345,6 +1379,7 @@ function resolveMemoizedOAuthIdentityKey(provider: string, credential: OAuthCred
 		credential.projectId ?? "",
 		credential.enterpriseUrl ?? "",
 		credential.profileArn ?? "",
+		credential.organizationId ?? "",
 		credential.access,
 		credential.refresh,
 	].join("\u0000");
@@ -2971,6 +3006,10 @@ export class AuthStorage {
 				return entry.credential.type === "oauth" && entry.credential.accountId === selector.value;
 			case "project":
 				return entry.credential.type === "oauth" && entry.credential.projectId === selector.value;
+			case "org":
+				return (
+					entry.credential.type === "oauth" && oauthCredentialMatchesOrganization(entry.credential, selector.value)
+				);
 		}
 	}
 
@@ -2989,10 +3028,13 @@ export class AuthStorage {
 			case "id":
 				return String(row.id) === selector.value;
 			case "email":
-				return row.identityLabel?.toLowerCase() === selector.value.toLowerCase();
+				return (row.email ?? row.identityLabel)?.toLowerCase() === selector.value.toLowerCase();
 			case "account":
+				return (row.accountId ?? row.identityLabel) === selector.value;
 			case "project":
-				return row.identityLabel === selector.value;
+				return (row.projectId ?? row.identityLabel) === selector.value;
+			case "org":
+				return oauthCredentialMatchesOrganization(row, selector.value);
 		}
 	}
 	#getCredentialSelector(
@@ -4148,6 +4190,8 @@ export class AuthStorage {
 			email: credential.email,
 			enterpriseUrl: credential.enterpriseUrl,
 			profileArn: credential.profileArn,
+			organizationId: credential.organizationId,
+			organizationName: credential.organizationName,
 			mcpBinding: credential.mcpBinding,
 		};
 	}
@@ -4164,6 +4208,9 @@ export class AuthStorage {
 		if (enterpriseUrl) parts.push(`enterprise:${enterpriseUrl}`);
 		const profileArn = credential.profileArn?.trim();
 		if (profileArn) parts.push(`profile:${profileArn}`);
+		// One account can hold a credential per organization, each with its own limits.
+		const organizationId = credential.organizationId?.trim();
+		if (organizationId) parts.push(`org:${organizationId}`);
 		// Only fall back to a secret-derived key when stable credential identity is unavailable.
 		// Including the token hash when accountId/email/profileArn are present causes cache misses on
 		// every OAuth refresh — usage data is per-account, not per-token.
@@ -4226,6 +4273,8 @@ export class AuthStorage {
 			email: credential.email,
 			enterpriseUrl: credential.enterpriseUrl,
 			profileArn: credential.profileArn,
+			organizationId: credential.organizationId,
+			organizationName: credential.organizationName,
 			mcpBinding: credential.mcpBinding,
 		};
 	}
@@ -4241,6 +4290,8 @@ export class AuthStorage {
 			email: refreshed.email ?? credential.email,
 			enterpriseUrl: refreshed.enterpriseUrl ?? credential.enterpriseUrl,
 			profileArn: refreshed.profileArn ?? credential.profileArn,
+			organizationId: refreshed.organizationId ?? credential.organizationId,
+			organizationName: refreshed.organizationName ?? credential.organizationName,
 			mcpBinding: credential.mcpBinding,
 		};
 	}
@@ -4260,7 +4311,8 @@ export class AuthStorage {
 				entry.credential.accountId === previous.accountId &&
 				entry.credential.email === previous.email &&
 				entry.credential.projectId === previous.projectId &&
-				entry.credential.profileArn === previous.profileArn
+				entry.credential.profileArn === previous.profileArn &&
+				entry.credential.organizationId === previous.organizationId
 			);
 		});
 		return match?.id;
@@ -4281,7 +4333,8 @@ export class AuthStorage {
 				entry.credential.accountId === previous.accountId &&
 				entry.credential.email === previous.email &&
 				entry.credential.projectId === previous.projectId &&
-				entry.credential.profileArn === previous.profileArn
+				entry.credential.profileArn === previous.profileArn &&
+				entry.credential.organizationId === previous.organizationId
 			);
 		});
 		if (index === -1) return;
@@ -4300,6 +4353,8 @@ export class AuthStorage {
 				email: next.email,
 				enterpriseUrl: next.enterpriseUrl,
 				profileArn: next.profileArn ?? existing.profileArn,
+				organizationId: next.organizationId ?? existing.organizationId,
+				organizationName: next.organizationName ?? existing.organizationName,
 				mcpBinding: next.mcpBinding ?? existing.mcpBinding,
 			},
 			persist,
@@ -4665,6 +4720,9 @@ export class AuthStorage {
 		const email = this.#getUsageReportMetadataValue(report, "email");
 		if (email) identifiers.push(`email:${email.toLowerCase()}`);
 		if (report.provider === "openai-codex" || report.provider === "anthropic") {
+			// One Anthropic account can sign in to several organizations; each has its own limits.
+			const orgId = report.provider === "anthropic" ? this.#getUsageReportMetadataValue(report, "orgId") : undefined;
+			if (orgId) return identifiers.map(identifier => `${report.provider}:${identifier}|org:${orgId}`.toLowerCase());
 			return identifiers.map(identifier => `${report.provider}:${identifier.toLowerCase()}`);
 		}
 		const accountId = this.#getUsageReportMetadataValue(report, "accountId");
@@ -5954,6 +6012,8 @@ export class AuthStorage {
 								projectId: claim.credential.projectId,
 								enterpriseUrl: claim.credential.enterpriseUrl,
 								profileArn: claim.credential.profileArn,
+								organizationId: claim.credential.organizationId,
+								organizationName: claim.credential.organizationName,
 								mcpBinding: claim.credential.mcpBinding,
 								persistedByLease: true,
 							};
@@ -6074,6 +6134,8 @@ export class AuthStorage {
 				projectId: effectiveRefreshed.projectId ?? credential.projectId,
 				enterpriseUrl: effectiveRefreshed.enterpriseUrl ?? credential.enterpriseUrl,
 				profileArn: effectiveRefreshed.profileArn ?? credential.profileArn,
+				organizationId: effectiveRefreshed.organizationId ?? credential.organizationId,
+				organizationName: effectiveRefreshed.organizationName ?? credential.organizationName,
 				mcpBinding: (effectiveRefreshed as RefreshedOAuthCredentials).mcpBinding ?? credential.mcpBinding,
 			};
 			if (refreshLease) {
@@ -6262,6 +6324,8 @@ export class AuthStorage {
 				projectId: result.newCredentials.projectId ?? selection.credential.projectId,
 				enterpriseUrl: result.newCredentials.enterpriseUrl ?? selection.credential.enterpriseUrl,
 				profileArn: result.newCredentials.profileArn ?? selection.credential.profileArn,
+				organizationId: result.newCredentials.organizationId ?? selection.credential.organizationId,
+				organizationName: result.newCredentials.organizationName ?? selection.credential.organizationName,
 				mcpBinding: refreshedAuthority.mcpBinding,
 			};
 			this.#replaceCredentialAt(
@@ -7034,6 +7098,8 @@ export class AuthStorage {
 				projectId: refreshed.projectId ?? target.credential.projectId,
 				enterpriseUrl: refreshed.enterpriseUrl ?? target.credential.enterpriseUrl,
 				profileArn: refreshed.profileArn ?? target.credential.profileArn,
+				organizationId: refreshed.organizationId ?? target.credential.organizationId,
+				organizationName: refreshed.organizationName ?? target.credential.organizationName,
 				mcpBinding: refreshed.mcpBinding,
 			};
 			this.#replaceCredentialAt(provider, index, updated, !refreshed.persistedByLease, id);
@@ -7145,7 +7211,7 @@ export class AuthStorage {
 		const credential = chosen.credential;
 		const identity =
 			credential.type === "oauth"
-				? (credential.email ?? credential.accountId ?? credential.projectId ?? `cred ${chosen.id}`)
+				? (formatOAuthIdentityLabel(credential) ?? `cred ${chosen.id}`)
 				: `cred ${chosen.id}`;
 		return `${baseLabel} · ${preferredType} #${chosen.id} (${identity})`;
 	}
@@ -7258,7 +7324,22 @@ function resolveProviderCredentialIdentityKey(provider: string, identifiers: str
 
 function resolveCredentialIdentityKey(provider: string, credential: AuthCredential): string | null {
 	if (credential.type === "api_key") return null;
-	return resolveProviderCredentialIdentityKey(provider, extractOAuthCredentialIdentifiers(credential));
+	return withOrganizationIdentity(
+		resolveProviderCredentialIdentityKey(provider, extractOAuthCredentialIdentifiers(credential)),
+		credential,
+	);
+}
+
+/**
+ * Scope an account identity key to the credential's organization. One account
+ * (same email) can sign in to several organizations, and each login yields an
+ * independent credential with its own plan and limits, so they must not
+ * replace or dedupe each other.
+ */
+function withOrganizationIdentity(identityKey: string | null, credential: OAuthCredential): string | null {
+	const organizationId = credential.organizationId?.trim();
+	if (!identityKey || !organizationId) return identityKey;
+	return `${identityKey}|org:${organizationId}`;
 }
 
 function resolveRowCredentialIdentityKey(provider: string, row: AuthRow): string | null {
@@ -7692,10 +7773,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		for (const row of rows) {
 			const credential = deserializeCredential(row);
 			if (!credential) continue;
-			const identityLabel =
-				credential.type === "oauth"
-					? (credential.email ?? credential.accountId ?? credential.projectId ?? null)
-					: null;
+			const identityLabel = credential.type === "oauth" ? formatOAuthIdentityLabel(credential) : null;
 			results.push({
 				id: row.id,
 				provider: row.provider,
@@ -7704,6 +7782,12 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				...(credential.type === "oauth" && credential.accountId ? { accountId: credential.accountId } : {}),
 				...(credential.type === "oauth" && credential.email ? { email: credential.email } : {}),
 				...(credential.type === "oauth" && credential.projectId ? { projectId: credential.projectId } : {}),
+				...(credential.type === "oauth" && credential.organizationId
+					? { organizationId: credential.organizationId }
+					: {}),
+				...(credential.type === "oauth" && credential.organizationName
+					? { organizationName: credential.organizationName }
+					: {}),
 				disabled: row.disabled_cause !== null,
 				disabledCause: row.disabled_cause,
 			});
