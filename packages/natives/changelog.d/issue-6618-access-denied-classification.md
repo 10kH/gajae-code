@@ -1,3 +1,3 @@
 ### Fixed
 
-- Classify Windows `STATUS_ACCESS_DENIED` as `access_denied`, not `owner_mismatch`; no-replace publication receipts now identify the failure as pre-mutation (issue #6618).
+- Include the existing Windows `access_denied` no-replace result in the generated native declaration and add regression coverage for its pre-mutation receipt fields (issue #6618).

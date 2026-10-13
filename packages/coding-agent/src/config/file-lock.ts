@@ -84,9 +84,12 @@ export class FileLockAcquireError extends Error {
 		const publicationDetail = publicationFailureCode
 			? `; last lock publication failed with ${publicationFailureCode}`
 			: "";
+		const contentionGuidance =
+			publicationFailureCode === "access_denied" && !holderIsLive
+				? ""
+				: "; a live owner is never displaced — if this is an SDK broker (gjc sdk session list), it must finish or be stopped before retrying";
 		super(
-			`Failed to acquire lock for ${filePath} after ${attempts} attempts: ${detail}${removalDetail}${publicationDetail} (${lockPath}); ` +
-				`a live owner is never displaced — if this is an SDK broker (gjc sdk session list), it must finish or be stopped before retrying${cleanupDetail}`,
+			`Failed to acquire lock for ${filePath} after ${attempts} attempts: ${detail}${removalDetail}${publicationDetail} (${lockPath})${contentionGuidance}${cleanupDetail}`,
 		);
 		this.code = reason;
 		this.name = "FileLockAcquireError";
@@ -113,7 +116,11 @@ export class FileLockStagingCleanupError extends Error {
 }
 
 export function isFileLockAcquireTimeout(error: unknown): error is FileLockAcquireError {
-	return error instanceof FileLockAcquireError && error.code === "acquire_timeout";
+	return (
+		error instanceof FileLockAcquireError &&
+		error.code === "acquire_timeout" &&
+		error.publicationFailureCode !== "access_denied"
+	);
 }
 
 const DEFAULT_OPTIONS: Required<

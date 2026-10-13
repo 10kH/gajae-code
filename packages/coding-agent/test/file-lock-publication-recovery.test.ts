@@ -9,6 +9,7 @@ import {
 	FileLockAcquireError,
 	FileLockTestHooks,
 	fileLockStagingOwnerPid,
+	isFileLockAcquireTimeout,
 	withFileLock,
 } from "@gajae-code/coding-agent/config/file-lock";
 import {
@@ -489,7 +490,9 @@ test("retries persistent access-denied publication through the acquisition budge
 	expect(failure).toBeInstanceOf(FileLockAcquireError);
 	if (!(failure instanceof FileLockAcquireError)) throw new Error("expected file lock acquisition failure");
 	expect(failure.publicationFailureCode).toBe("access_denied");
+	expect(isFileLockAcquireTimeout(failure)).toBe(false);
 	expect(failure.holderIsLive).toBe(false);
+	expect(failure.message).not.toContain("SDK broker");
 	expect(attempts).toBe(2 * expectedBoundedPublicationCalls);
 	expect(contentionNotifications).toBe(0);
 	await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });

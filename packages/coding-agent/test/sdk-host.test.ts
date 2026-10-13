@@ -305,6 +305,36 @@ describe("SessionSdkHost", () => {
 		expect(host.started).toBe(false);
 	});
 
+	test("does not suppress access-denied publication failures as lock contention", async () => {
+		const error = new FileLockAcquireError(
+			"/tmp/index.jsonl",
+			"/tmp/index.jsonl.lock",
+			3,
+			"publication failed with access_denied",
+			"acquire_timeout",
+			undefined,
+			undefined,
+			"access_denied",
+		);
+		const host = new SessionSdkHost({
+			sessionId: "access-denied-stop",
+			stateRoot: "/tmp/access-denied-stop",
+			token: "t",
+			sendFrame: () => "written",
+			onFrame: () => () => {},
+		});
+		await host.start();
+		await host.registerWithBroker({
+			register: () => {},
+			unregister: () => {
+				throw error;
+			},
+		});
+
+		await expect(host.stop({ allowLockContention: true })).rejects.toBe(error);
+		expect(host.started).toBe(true);
+	});
+
 	test("does not swallow orphan transition errors as allowed lock contention", async () => {
 		const host = new SessionSdkHost({
 			sessionId: "orphan-stop",

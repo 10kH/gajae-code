@@ -733,6 +733,13 @@ describe("startup update contract", () => {
 				busy: false,
 			},
 			{
+				kind: "raw_sharing_violation",
+				code: "sharing_violation",
+				holder: "",
+				message: "Session index lock publication failed",
+				busy: false,
+			},
+			{
 				kind: "cleanup_denied",
 				code: "EACCES",
 				holder: "",
@@ -748,8 +755,10 @@ describe("startup update contract", () => {
 				const filePath = path.join(tempDir.path(), "sdk", "sessions", "index.jsonl");
 				const lockPath = `${filePath}.lock`;
 				const error =
-					scenario.kind === "io_error"
-						? Object.assign(new Error("Failed to publish file lock: io_error."), { code: "io_error" })
+					scenario.kind === "io_error" || scenario.kind === "raw_sharing_violation"
+						? Object.assign(new Error(`Failed to publish file lock: ${scenario.code}.`), {
+								code: scenario.code,
+							})
 						: scenario.kind === "cleanup_denied"
 							? new FileLockStagingCleanupError(
 									lockPath,
@@ -791,7 +800,7 @@ describe("startup update contract", () => {
 					const output = stderr.join("");
 					expect(output).toContain(scenario.message);
 					const reportedLockPath =
-						scenario.kind === "io_error"
+						scenario.kind === "io_error" || scenario.kind === "raw_sharing_violation"
 							? path.join(getAgentDir(), "sdk", "sessions", "index.jsonl.lock")
 							: lockPath;
 					expect(output).toContain(`Lock: ${reportedLockPath}`);

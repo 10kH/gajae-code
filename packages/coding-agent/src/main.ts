@@ -1742,12 +1742,7 @@ function directSessionIndexLockFailureMessage(error: unknown, agentDir: string):
 		error.message.match(/^Failed to publish file lock: ([a-z0-9_]+)/u)?.[1] ??
 		"unknown";
 	const lockPath = path.join(agentDir, "sdk", "sessions", "index.jsonl.lock");
-	if (code !== "sharing_violation" && code !== "EBUSY")
-		return `Session index lock publication failed; no session was registered.\nLock: ${lockPath}\nCode: ${code}\n${error.message}`;
-	return (
-		"Session index is busy; a live owner is never displaced. Retry in a few seconds.\n" +
-		`Lock: ${lockPath}\nCode: ${code}\n${error.message}`
-	);
+	return `Session index lock publication failed; no session was registered.\nLock: ${lockPath}\nCode: ${code}\n${error.message}`;
 }
 
 export interface ModelRoleOverrides {
