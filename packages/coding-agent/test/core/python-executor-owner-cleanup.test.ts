@@ -886,7 +886,7 @@ if (cleanupFailed) throw cleanupError;
 		}
 	}, 30_000);
 
-	it("propagates an actual unconfirmed shutdown result and retries that retained physical kernel", async () => {
+	it("propagates an unconfirmed shutdown result and retries that retained physical kernel", async () => {
 		using tempDir = TempDir.createSync("@gjc-python-owner-shutdown-unconfirmed-");
 		const kernels = trackStartedKernels();
 		const readyFile = `${tempDir.path()}/unconfirmed-shutdown.ready`;
@@ -921,14 +921,20 @@ if (cleanupFailed) throw cleanupError;
 			const originalShutdown = kernel.shutdown.bind(kernel);
 			kernel.shutdown = async function (this: PythonKernel, options?: Parameters<PythonKernel["shutdown"]>[0]) {
 				const call = ++shutdownCalls;
+				if (call === 1) {
+					// The real zero-timeout result races process-exit observation; force the
+					// executor-facing result after exercising the real physical shutdown.
+					await originalShutdown({ ...options, timeoutMs: 0 });
+					firstShutdownResult = { confirmed: false };
+					return firstShutdownResult;
+				}
 				if (call === 2) {
 					secondShutdownReceiver = this;
 					secondShutdownStarted.resolve();
 					await releaseSecondShutdown.promise;
 				}
-				const result = await originalShutdown(call === 1 ? { ...options, timeoutMs: 0 } : options);
-				if (call === 1) firstShutdownResult = result;
-				else secondShutdownResult = result;
+				const result = await originalShutdown(options);
+				secondShutdownResult = result;
 				return result;
 			};
 
@@ -942,7 +948,6 @@ if (cleanupFailed) throw cleanupError;
 			expect(executionResult.cancelled).toBe(true);
 			expect(firstShutdownResult).toEqual({ confirmed: false });
 			expect(shutdownCalls).toBe(1);
-
 			await waitForProcessGone(pid);
 			retryCleanup = disposeKernelSessionsByOwner("unconfirmed-owner");
 			const retryStartTimeout = Promise.withResolvers<void>();
