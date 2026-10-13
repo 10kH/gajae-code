@@ -12,6 +12,7 @@ import * as path from "node:path";
 
 const INPUT_VERBS = new Set(["send-keys", "paste-buffer", "send-prefix"]);
 const SHELL_RUNNERS = new Set(["sh", "bash", "dash", "zsh", "ksh", "busybox"]);
+const SHELL_STDIN_SCRIPT_PATHS = new Set(["/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"]);
 const COMMAND_WRAPPERS = new Set(["eval", "exec", "command", "builtin", "nohup", "time"]);
 const BUILTIN_COMMAND_WRAPPERS = new Set(["command", "eval", "exec"]);
 const NON_EXECUTING_SUDO_OPTIONS = new Set([
@@ -193,6 +194,7 @@ interface Token {
 
 interface HereDocument {
 	delimiter: string;
+	delimiterQuoted: boolean;
 	stripTabs: boolean;
 	segment: number;
 	pipeline: number;
@@ -267,6 +269,7 @@ function tokenize(command: string): TokenizeResult {
 	let redirectionTargetIsHereDoc = false;
 	let redirectionTargetStripTabs = false;
 	let redirectionTargetIsInput = false;
+	let redirectionTargetIsDuplication = false;
 	let redirectionTargetFd: number | undefined;
 	let currentTokenIsPendingOperand = false;
 	const stdinRedirects = new Map<number, { order: number; source: "here-document" | "other" }>();
@@ -281,7 +284,16 @@ function tokenize(command: string): TokenizeResult {
 
 		if (redirectionTargetPending) {
 			let redirectOrder: number | undefined;
-			if (redirectionTargetIsInput && (redirectionTargetFd === undefined || redirectionTargetFd === 0)) {
+			const isIdentityInputDuplication =
+				redirectionTargetIsInput &&
+				redirectionTargetIsDuplication &&
+				text === "0" &&
+				(redirectionTargetFd === undefined || redirectionTargetFd === 0);
+			if (
+				redirectionTargetIsInput &&
+				!isIdentityInputDuplication &&
+				(redirectionTargetFd === undefined || redirectionTargetFd === 0)
+			) {
 				redirectOrder = (stdinRedirects.get(segment)?.order ?? 0) + 1;
 				stdinRedirects.set(segment, {
 					order: redirectOrder,
@@ -298,6 +310,7 @@ function tokenize(command: string): TokenizeResult {
 			if (redirectionTargetIsHereDoc) {
 				const hereDocument: HereDocument = {
 					delimiter: text,
+					delimiterQuoted: quoted,
 					stripTabs: redirectionTargetStripTabs,
 					segment,
 					pipeline,
@@ -314,6 +327,7 @@ function tokenize(command: string): TokenizeResult {
 			redirectionTargetIsHereDoc = false;
 			redirectionTargetStripTabs = false;
 			redirectionTargetIsInput = false;
+			redirectionTargetIsDuplication = false;
 			redirectionTargetFd = undefined;
 			currentTokenIsPendingOperand = false;
 			return;
@@ -514,6 +528,10 @@ function tokenize(command: string): TokenizeResult {
 				continue;
 			}
 			if (quote === '"' && ch === "\\" && index + 1 < command.length) {
+				if (command[index + 1] === "\n") {
+					index++;
+					continue;
+				}
 				text += command[++index];
 				continue;
 			}
@@ -528,6 +546,10 @@ function tokenize(command: string): TokenizeResult {
 			continue;
 		}
 		if (ch === "\\" && index + 1 < command.length) {
+			if (command[index + 1] === "\n") {
+				index++;
+				continue;
+			}
 			commandContinuesAfterLineBreak = false;
 			if (text.length === 0 && !quoted && skipNextArg) currentTokenIsPendingOperand = true;
 			text += command[++index];
@@ -548,6 +570,7 @@ function tokenize(command: string): TokenizeResult {
 			redirectionTargetIsHereDoc = false;
 			redirectionTargetStripTabs = false;
 			redirectionTargetIsInput = false;
+			redirectionTargetIsDuplication = false;
 			redirectionTargetFd = undefined;
 			currentTokenIsPendingOperand = false;
 			if (hereDocDelimiters.length > 0) activeHereDoc = hereDocDelimiters.shift();
@@ -568,6 +591,7 @@ function tokenize(command: string): TokenizeResult {
 			redirectionTargetIsHereDoc = false;
 			redirectionTargetStripTabs = false;
 			redirectionTargetIsInput = false;
+			redirectionTargetIsDuplication = false;
 			redirectionTargetFd = undefined;
 			continue;
 		}
@@ -584,7 +608,8 @@ function tokenize(command: string): TokenizeResult {
 			while (command[index + 1] === ch) index++;
 			const stripTabs = isHereDoc && command[index + 1] === "-";
 			if (stripTabs) index++;
-			if (command[index + 1] === "&" || (ch === ">" && command[index + 1] === "|")) index++;
+			redirectionTargetIsDuplication = command[index + 1] === "&";
+			if (redirectionTargetIsDuplication || (ch === ">" && command[index + 1] === "|")) index++;
 			redirectionTargetPending = true;
 			redirectionTargetIsHereDoc = isHereDoc;
 			redirectionTargetStripTabs = stripTabs;
@@ -610,6 +635,7 @@ function tokenize(command: string): TokenizeResult {
 			redirectionTargetIsHereDoc = false;
 			redirectionTargetStripTabs = false;
 			redirectionTargetIsInput = false;
+			redirectionTargetIsDuplication = false;
 			redirectionTargetFd = undefined;
 			currentTokenIsPendingOperand = false;
 			continue;
@@ -1127,7 +1153,6 @@ function collectShellPayloads(tokens: Token[]): string[] {
 function shellReadsStdin(arguments_: Token[], stdinRedirectSource?: "here-document" | "other"): boolean {
 	if (stdinRedirectSource === "other") return false;
 	const optionsWithArgument = new Set(["-O", "-o"]);
-	const stdinScriptPaths = new Set(["/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"]);
 	let skipNextArgument = false;
 	let optionsTerminated = false;
 
@@ -1137,12 +1162,12 @@ function shellReadsStdin(arguments_: Token[], stdinRedirectSource?: "here-docume
 			skipNextArgument = false;
 			continue;
 		}
-		if (optionsTerminated) return argument === "-" || stdinScriptPaths.has(argument);
+		if (optionsTerminated) return argument === "-" || SHELL_STDIN_SCRIPT_PATHS.has(argument);
 		if (argument === "--") {
 			optionsTerminated = true;
 			continue;
 		}
-		if (argument === "-" || argument === "-s" || stdinScriptPaths.has(argument)) {
+		if (argument === "-" || argument === "-s" || SHELL_STDIN_SCRIPT_PATHS.has(argument)) {
 			return true;
 		}
 		if (
@@ -1239,21 +1264,34 @@ function xargsConsumesStdin(tokens: Token[], commandIndex: number, segment: numb
 	return false;
 }
 
+function sourceBuiltinReadsStdin(tokens: Token[], commandIndex: number, segment: number): boolean {
+	const command = tokens[commandIndex].text;
+	if (command !== "." && command !== "source") return false;
+
+	for (let index = commandIndex + 1; index < tokens.length; index++) {
+		const argument = tokens[index];
+		if (argument.segment !== segment || argument.commandStart) break;
+		if (argument.isRedirectionTarget || argument.text === "--") continue;
+		return SHELL_STDIN_SCRIPT_PATHS.has(argument.text);
+	}
+	return false;
+}
+
 function hasShellStdinConsumer(tokens: Token[], segment: number, depth = 0, hereDocumentOrder?: number): boolean {
 	const segmentTokens = tokens.filter(token => token.segment === segment);
 	for (let index = 0; index < segmentTokens.length; index++) {
 		const token = segmentTokens[index];
 		if (!token.commandStart || isCommandLookup(segmentTokens, index)) continue;
 		const shellIndex = shellRunnerIndex(segmentTokens, index, segment);
+		const readsStdin =
+			shellIndex !== undefined &&
+			shellReadsStdin(shellArguments(segmentTokens, shellIndex, segment), token.stdinRedirectSource);
+		const sourcesStdin =
+			token.stdinRedirectSource !== "other" && sourceBuiltinReadsStdin(segmentTokens, index, segment);
 		const readsHereDocument =
 			token.stdinRedirectSource !== "here-document" ||
 			(token.stdinRedirectOrder === hereDocumentOrder && hereDocumentOrder !== undefined);
-		if (
-			shellIndex !== undefined &&
-			readsHereDocument &&
-			!xargsConsumesStdin(segmentTokens, index, segment) &&
-			shellReadsStdin(shellArguments(segmentTokens, shellIndex, segment), token.stdinRedirectSource)
-		) {
+		if ((readsStdin || sourcesStdin) && readsHereDocument && !xargsConsumesStdin(segmentTokens, index, segment)) {
 			return true;
 		}
 	}
@@ -1293,8 +1331,121 @@ function hasShellStdinConsumer(tokens: Token[], segment: number, depth = 0, here
 	return false;
 }
 
+function commandSubstitutionEnd(source: string, start: number): number | undefined {
+	let depth = 1;
+	let singleQuoted = false;
+	let doubleQuoted = false;
+	let backtickQuoted = false;
+
+	for (let index = start + 2; index < source.length; index++) {
+		const character = source[index];
+		if (character === "\\" && !singleQuoted && index + 1 < source.length) {
+			index++;
+			continue;
+		}
+		if (singleQuoted) {
+			if (character === "'") singleQuoted = false;
+			continue;
+		}
+		if (backtickQuoted) {
+			if (character === "`") backtickQuoted = false;
+			continue;
+		}
+		if (doubleQuoted) {
+			if (character === '"') {
+				doubleQuoted = false;
+				continue;
+			}
+			if (character === "`") backtickQuoted = true;
+			if (character === "$" && source[index + 1] === "(") {
+				const nestedEnd = commandSubstitutionEnd(source, index);
+				if (nestedEnd !== undefined) index = nestedEnd;
+			}
+			continue;
+		}
+		if (character === "#" && (index === 0 || /[\s;|&()]/.test(source[index - 1]))) {
+			while (index < source.length && source[index] !== "\n") index++;
+			continue;
+		}
+		if (character === "'") {
+			singleQuoted = true;
+			continue;
+		}
+		if (character === '"') {
+			doubleQuoted = true;
+			continue;
+		}
+		if (character === "`") {
+			backtickQuoted = true;
+			continue;
+		}
+		if (character === "$" && source[index + 1] === "(") {
+			depth++;
+			index++;
+			continue;
+		}
+		if (character === "(") depth++;
+		if (character === ")") {
+			depth--;
+			if (depth === 0) return index;
+		}
+	}
+	return undefined;
+}
+
+function backtickSubstitutionEnd(source: string, start: number): number | undefined {
+	for (let index = start + 1; index < source.length; index++) {
+		if (source[index] === "\\" && index + 1 < source.length) {
+			index++;
+			continue;
+		}
+		if (source[index] === "`") return index;
+	}
+	return undefined;
+}
+
+function collectHereDocumentCommandSubstitutions(body: string): string[] {
+	const substitutions = new Set<string>();
+	const pendingSources = [body];
+	while (pendingSources.length > 0) {
+		const source = pendingSources.pop();
+		if (source === undefined) continue;
+		for (let index = 0; index < source.length; index++) {
+			if (source[index] === "\\" && index + 1 < source.length) {
+				const next = source[index + 1];
+				if (next === "\\" || next === "$" || next === "`" || next === "\n") index++;
+				continue;
+			}
+			if (source[index] === "$" && source[index + 1] === "(") {
+				const end = commandSubstitutionEnd(source, index);
+				if (end === undefined) continue;
+				const command = source.slice(index + 2, end);
+				if (command.length > 0 && !substitutions.has(command)) {
+					substitutions.add(command);
+					pendingSources.push(command);
+				}
+				index = end;
+				continue;
+			}
+			if (source[index] === "`") {
+				const end = backtickSubstitutionEnd(source, index);
+				if (end === undefined) continue;
+				const command = source.slice(index + 1, end);
+				if (command.length > 0 && !substitutions.has(command)) {
+					substitutions.add(command);
+					pendingSources.push(command);
+				}
+				index = end;
+			}
+		}
+	}
+	return [...substitutions];
+}
+
 function collectShellStdinPayloads(tokens: Token[], hereDocuments: HereDocument[]): string[] {
-	const payloads: string[] = [];
+	const payloads = hereDocuments.flatMap(hereDocument =>
+		hereDocument.delimiterQuoted ? [] : collectHereDocumentCommandSubstitutions(hereDocument.body),
+	);
 	for (let index = 0; index < hereDocuments.length; index++) {
 		const hereDocument = hereDocuments[index];
 		if (!hereDocument.stdin || hereDocument.body.length === 0) continue;

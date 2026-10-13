@@ -7,6 +7,6 @@
   - Recognize shell option operands (`bash -O extglob`, `bash -o pipefail`) and skip over them when scanning for script payloads; previously halted at option operands
   - Removed unreachable dead code in wrapper mode state machine
 - Preserve argv boundaries when recursively inspecting `env -S` payloads, including nested `bash -c` commands, and avoid treating `builtin` or non-executing `sudo` modes as external command executions.
-- Inspect here-document bodies passed to supported shells on stdin while leaving data-only here-document consumers unblocked.
+- Inspect executable here-document input and unquoted command substitutions, follow shell stdin through wrappers, pipelines, and identity descriptor redirects, while leaving literal data-only consumers unblocked.
 - Treat `sudo -e`/`--edit` as file editing rather than command execution when checking wrapper arguments.
 - Document that the guard is best-effort and does not cover arbitrary interpreter one-liners, shell variable indirection, or commands launched by the Python/eval tools.

@@ -975,6 +975,7 @@ describe("tmux self-injection guard", () => {
 			const script = "tmux send-keys -t %47 x";
 			for (const command of [
 				`bash <<'EOF'\n${script}\nEOF`,
+				`bash <<'EOF' 0<&0\n${script}\nEOF`,
 				`bash /dev/stdin <<'EOF'\n${script}\nEOF`,
 				`bash -- /dev/stdin <<'EOF'\n${script}\nEOF`,
 				`bash -s <<'EOF'\n${script}\nEOF`,
@@ -982,10 +983,24 @@ describe("tmux self-injection guard", () => {
 				`bash -c bash <<'EOF'\n${script}\nEOF`,
 				`cat <<'EOF' | bash\n${script}\nEOF`,
 				`cat <<'EOF' |\nbash\n${script}\nEOF`,
+				`cat <<'EOF' |\\\nbash\n${script}\nEOF`,
 				`bash -c 'bash 3<<INNER\n:\nINNER\n' <<'OUTER'\n${script}\nOUTER`,
+				`bash -c '. /dev/stdin' <<'EOF'\n${script}\nEOF`,
+				`bash -c 'source /dev/stdin' <<'EOF'\n${script}\nEOF`,
 				`env bash <<'EOF'\n${script}\nEOF`,
 				`env -S 'bash -s' <<'EOF'\n${script}\nEOF`,
 				`busybox sh <<'EOF'\n${script}\nEOF`,
+			]) {
+				await expect(checkTmuxSelfInjection(command, options)).resolves.toMatchObject({ block: true });
+			}
+		});
+
+		it("inspects command substitutions in unquoted here-documents", async () => {
+			const substitution = "tmux send-keys -t %47 x";
+			for (const command of [
+				`cat <<EOF\n$(${substitution})\nEOF`,
+				`cat <<EOF\n\`${substitution}\`\nEOF`,
+				"cat <<EOF\n$(echo \"$(tmux send-keys -t '%47' x)\")\nEOF",
 			]) {
 				await expect(checkTmuxSelfInjection(command, options)).resolves.toMatchObject({ block: true });
 			}
@@ -1001,6 +1016,9 @@ describe("tmux self-injection guard", () => {
 			const document = "tmux send-keys -t %47 x";
 			for (const command of [
 				`cat <<'EOF'\n${document}\nEOF`,
+				`cat <<EOF\n${document}\nEOF`,
+				`cat <<'EOF'\n$(${document})\nEOF`,
+				`cat <<EOF\n\\$(${document})\nEOF`,
 				`cat <<'EOF' | cat\n${document}\nEOF`,
 				`bash -c cat <<'EOF'\n${document}\nEOF`,
 				`bash -c 'bash <<INNER\n:\nINNER\n' <<'OUTER'\n${document}\nOUTER`,
