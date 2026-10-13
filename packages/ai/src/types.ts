@@ -1143,6 +1143,7 @@ export type AssistantMessageEvent =
 			contentIndex?: undefined;
 			reason: Extract<StopReason, "aborted" | "error">;
 			error: AssistantMessage;
+			partial?: AssistantMessage;
 	  }
 	| {
 			type: "toolChoiceIncapability";
