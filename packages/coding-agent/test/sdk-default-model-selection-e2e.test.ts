@@ -38,6 +38,21 @@ afterEach(async () => {
 	tempDir = undefined;
 });
 
+function createIndependentInMemorySessionManager(cwd: string): SessionManager {
+	const lifecycleRequestId = process.env.GJC_LIFECYCLE_REQUEST_ID;
+	const lifecycleSessionId = process.env.GJC_SESSION_ID;
+	try {
+		delete process.env.GJC_LIFECYCLE_REQUEST_ID;
+		delete process.env.GJC_SESSION_ID;
+		return SessionManager.inMemory(cwd);
+	} finally {
+		if (lifecycleRequestId === undefined) delete process.env.GJC_LIFECYCLE_REQUEST_ID;
+		else process.env.GJC_LIFECYCLE_REQUEST_ID = lifecycleRequestId;
+		if (lifecycleSessionId === undefined) delete process.env.GJC_SESSION_ID;
+		else process.env.GJC_SESSION_ID = lifecycleSessionId;
+	}
+}
+
 test("model.set executes every Q10-advertised selection and persists the public current readback", async () => {
 	tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-default-model-"));
 	const agentDir = path.join(tempDir, "agent");
@@ -235,7 +250,7 @@ test("model.set executes every Q10-advertised selection and persists the public 
 		authStorage,
 		modelRegistry,
 		settings,
-		sessionManager: SessionManager.inMemory(tempDir),
+		sessionManager: createIndependentInMemorySessionManager(tempDir),
 		disableExtensionDiscovery: true,
 		extensions: [],
 		skills: [],
