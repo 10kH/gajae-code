@@ -806,8 +806,10 @@ async function exactRemoveLockTree(
 	const transitionPath = fileLockRemovalTransitionPath(lockPath);
 	const recordPath = `${transitionPath}.owner`;
 	const prior = await readRemovalTransitionOwnerRecord(transitionPath);
+	// A foreign host's sidecar cannot be probed or retired locally. It remains
+	// removal contention: its owner may still clear it after finishing the tree.
 	if (prior?.owner.owner_host_id !== undefined && lockRecordIsForeignHost(prior.owner, ownerHostId, []))
-		return { ok: false, code: "identity_mismatch" };
+		return { ok: false, code: "removal_record_busy" };
 	if (prior && !ownerIsAlive(prior.owner) && ownerLiveness(prior.owner.pid) !== "unknown") {
 		try {
 			await fs.lstat(transitionPath);

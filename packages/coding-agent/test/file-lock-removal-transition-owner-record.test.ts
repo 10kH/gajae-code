@@ -309,6 +309,38 @@ test("release retries behind a live remover's lingering record instead of report
 	expect(await fs.exists(lock)).toBe(false);
 });
 
+test.skipIf(process.platform === "win32")(
+	"release retries behind a foreign remover's lingering sidecar without removing it",
+	async () => {
+		const { file, lock, transition } = await fixture();
+		const release = await acquireFileLock(file, { ownerHostId: "local-host", retries: 2, retryDelayMs: 1 });
+		const recordBytes = JSON.stringify({
+			owner: { ...deadOwner, owner_host_id: "foreign-host" },
+			rootDev: "0",
+			rootIno: "0",
+		});
+		await Bun.write(`${transition}.owner`, recordBytes);
+
+		let settled = false;
+		const releasePromise = release();
+		const observedRelease = releasePromise.then(
+			() => {
+				settled = true;
+			},
+			() => {
+				settled = true;
+			},
+		);
+		await Bun.sleep(75);
+		expect(settled).toBe(false);
+		expect(await Bun.file(`${transition}.owner`).text()).toBe(recordBytes);
+		await fs.rm(`${transition}.owner`);
+		await observedRelease;
+
+		expect(await fs.exists(lock)).toBe(false);
+	},
+);
+
 test("a release that outlasts its retry budget finishes in the background without reacquisition", async () => {
 	const { file, lock, transition } = await fixture();
 	const release = await acquireFileLock(file, { retries: 2, retryDelayMs: 1 });
