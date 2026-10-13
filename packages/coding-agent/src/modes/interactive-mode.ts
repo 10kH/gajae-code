@@ -1168,6 +1168,16 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		// Subscribe to agent events
 		this.#subscribeToAgent();
+		this.#eventBusUnsubscribers.push(
+			this.session.subscribeSessionIdentityChanges(() => {
+				void this.refreshSlashCommandState().catch(error => {
+					if (this.#stopped) return;
+					logger.warn("Failed to refresh slash-command state after extension session transition", {
+						error: error instanceof Error ? error.message : String(error),
+					});
+				});
+			}),
+		);
 
 		this.#eventBusUnsubscribers.push(
 			this.session.subscribe(event => {

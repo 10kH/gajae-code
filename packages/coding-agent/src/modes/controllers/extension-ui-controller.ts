@@ -131,6 +131,16 @@ export class ExtensionUiController {
 	#hookSelectorResizeHandler?: () => void;
 	constructor(private ctx: InteractiveModeContext) {}
 
+	async #refreshSlashCommandStateAfterIdentityChange(): Promise<void> {
+		try {
+			await this.ctx.refreshSlashCommandState();
+		} catch (error) {
+			logger.warn("Failed to refresh slash-command state after extension session transition", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
 	#clearActiveHookCustom(): void {
 		const component = this.#activeHookCustomComponent;
 		const overlay = this.#activeHookCustomOverlay;
@@ -646,12 +656,15 @@ export class ExtensionUiController {
 			branch: async () => prohibitBrokerLifecycleOperation("session.branch"),
 			navigateTree: async (targetId, navOptions) => {
 				const result = await this.ctx.session.navigateTree(targetId, { summarize: navOptions?.summarize });
+				if (!result.cancelled) await this.#refreshSlashCommandStateAfterIdentityChange();
 				return { cancelled: result.cancelled };
 			},
 			switchSession: async () => prohibitBrokerLifecycleOperation("session.switch"),
 			reload: async () => {
 				const previousSessionId = this.ctx.sessionManager.getSessionId();
 				await this.ctx.session.reload();
+				if (this.#isStopped()) return;
+				await this.#refreshSlashCommandStateAfterIdentityChange();
 				if (this.#isStopped()) return;
 				const sessionIdentityChanged = previousSessionId !== this.ctx.sessionManager.getSessionId();
 				if (sessionIdentityChanged) this.ctx.resetIrcSidebarSession();
@@ -876,6 +889,7 @@ export class ExtensionUiController {
 			branch: async () => prohibitBrokerLifecycleOperation("session.branch"),
 			navigateTree: async (targetId, navOptions) => {
 				const result = await this.ctx.session.navigateTree(targetId, { summarize: navOptions?.summarize });
+				if (!result.cancelled) await this.#refreshSlashCommandStateAfterIdentityChange();
 				return { cancelled: result.cancelled };
 			},
 			switchSession: async () => prohibitBrokerLifecycleOperation("session.switch"),
@@ -885,6 +899,8 @@ export class ExtensionUiController {
 				}
 				const previousSessionId = this.ctx.sessionManager.getSessionId();
 				await this.ctx.session.reload();
+				if (this.#isStopped()) return;
+				await this.#refreshSlashCommandStateAfterIdentityChange();
 				if (this.#isStopped()) return;
 				const sessionIdentityChanged = previousSessionId !== this.ctx.sessionManager.getSessionId();
 				if (sessionIdentityChanged) this.ctx.resetIrcSidebarSession();
