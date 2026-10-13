@@ -188,6 +188,7 @@ interface Token {
 	commandStart: boolean;
 	segment: number;
 	pipeline: number;
+	subshellDepth: number;
 	stdinRedirectOrder?: number;
 	stdinRedirectSource?: "here-document" | "here-string" | "other";
 	isRedirectionTarget?: boolean;
@@ -275,6 +276,7 @@ function tokenize(command: string): TokenizeResult {
 	let atCommandStart = true;
 	let segment = 0;
 	let pipeline = 0;
+	let subshellDepth = 0;
 	let wrapperCommand:
 		| { name: string; spec: WrapperSpec; optionsTerminated: boolean; assignmentAware: boolean }
 		| undefined;
@@ -359,6 +361,7 @@ function tokenize(command: string): TokenizeResult {
 				commandStart: false,
 				segment,
 				pipeline,
+				subshellDepth,
 				isRedirectionTarget: true,
 				redirectionFd: descriptor,
 				redirectionIsInput: redirectionTargetIsInput,
@@ -563,6 +566,7 @@ function tokenize(command: string): TokenizeResult {
 			commandStart,
 			segment,
 			pipeline,
+			subshellDepth,
 			...(stdinRedirect && { stdinRedirectOrder: stdinRedirect.order, stdinRedirectSource: stdinRedirect.source }),
 			...(isWrappedCommand && { isWrappedCommand }),
 		};
@@ -700,6 +704,8 @@ function tokenize(command: string): TokenizeResult {
 				ch === "|" || (ch === "&" && (command[index - 1] === "&" || command[index - 1] === "|"));
 			flush();
 			segment++;
+			if (ch === "(") subshellDepth++;
+			else if (ch === ")") subshellDepth = Math.max(0, subshellDepth - 1);
 			if (
 				(ch !== "|" && !(ch === "&" && command[index - 1] === "|")) ||
 				(ch === "|" && command[index - 1] === "|")
@@ -1788,7 +1794,16 @@ function shellDescriptorsClosedBefore(tokens: Token[], segment: number): Set<num
 	for (let index = 0; index < tokens.length; index++) {
 		const command = tokens[index];
 		if (command.segment >= segment) break;
-		if (!command.commandStart || commandName(command.text) !== "exec") continue;
+		if (
+			!command.commandStart ||
+			commandName(command.text) !== "exec" ||
+			command.subshellDepth > 0 ||
+			tokens.some(
+				other => other.commandStart && other.pipeline === command.pipeline && other.segment !== command.segment,
+			)
+		) {
+			continue;
+		}
 		for (let cursor = index + 1; cursor < tokens.length && tokens[cursor].segment === command.segment; cursor++) {
 			const redirection = tokens[cursor];
 			if (!redirection.isRedirectionTarget || redirection.redirectionFd === undefined) continue;
