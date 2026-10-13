@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -924,6 +924,34 @@ describe("OutputSink maxColumns (per-line cap)", () => {
 		expect(dumped.columnTruncatedLines).toBe(1);
 		expect(dumped.totalBytes).toBe(byteLength(input));
 		expect(dumped.outputBytes).toBe(byteLength(`${"x".repeat(64 * 1024 - 1)}…\nshort\n`));
+	});
+
+	test("limits each cap transformation batch for a single large callback", async () => {
+		const input = "x\n".repeat(64 * 1024);
+		const originalSubstring = String.prototype.substring;
+		let largestTransformInputChars = 0;
+		const substringSpy = spyOn(String.prototype, "substring").mockImplementation(function (
+			this: string,
+			start: number,
+			end?: number,
+		) {
+			largestTransformInputChars = Math.max(largestTransformInputChars, this.length);
+			return originalSubstring.call(this, start, end);
+		});
+
+		try {
+			const sink = new OutputSink({ maxColumns: 4, headBytes: 200_000 });
+			await sink.push(input);
+			const dumped = await sink.dump();
+
+			expect(dumped.output).toBe(input);
+			expect(dumped.totalLines).toBe(64 * 1024 + 1);
+			expect(dumped.outputBytes).toBe(byteLength(input));
+		} finally {
+			substringSpy.mockRestore();
+		}
+
+		expect(largestTransformInputChars).toBeLessThanOrEqual(64 * 1024);
 	});
 
 	test("disabled by default — maxColumns: 0 is a passthrough", async () => {
