@@ -110,6 +110,9 @@ const PUBLICATION_SHARING_RETRY_DELAY_MS = 10;
 /** Ownerless empty residue must outlive both this grace and the acquire budget. */
 const REMOVAL_TRANSITION_GRACE_MS = 10_000;
 
+/** Empty legacy locks need an age fence because no owner record can prove liveness. */
+const OWNERLESS_LOCK_RECOVERY_MIN_AGE_MS = 30_000;
+
 /** Release retries cover transient handle denial and a competing exact-removal quarantine cleanup. */
 export const FILE_LOCK_RELEASE_RETRY_ATTEMPTS = 20;
 export const FILE_LOCK_RELEASE_RETRY_DELAY_MS = 25;
@@ -132,6 +135,7 @@ type LockInfo = FileLockOwnerToken;
 
 export const FileLockTestHooks: {
 	afterParentMkdir?: (lockPath: string) => void | Promise<void>;
+	afterOwnerlessLockStaleVerdict?: (lockPath: string) => void | Promise<void>;
 	beforeRemovalOwnerPublish?: (transitionPath: string) => void | Promise<void>;
 	nativePublicationBindings?: () => {
 		renameNoReplacePathAsync: typeof renameNoReplacePathAsync;
@@ -1808,9 +1812,10 @@ async function staleLockSnapshot(
 		throw error;
 	}
 	if (!info) {
-		// An ownerless directory has no generation or liveness proof. Age and
-		// emptiness cannot distinguish interrupted cleanup from a live legacy holder
-		// or a paused acquisition, so every platform fails closed.
+		// This verdict can authorize cleanup only from a recorded owner generation.
+		// Windows acquisition has a separate age- and identity-bound path for a
+		// completely empty legacy directory; that path never treats it as a dead
+		// owner or claims the existing directory as a new lock.
 		return { stale: false };
 	}
 
@@ -1945,6 +1950,87 @@ async function removeStaleLockForAcquire(
 				message: (error as Error).message,
 			},
 		};
+	}
+}
+
+/**
+ * Recover a legacy empty directory only on Windows. Current writers publish a
+ * complete owner record from a staging directory before the canonical rename;
+ * an empty canonical directory therefore has no current-generation owner proof.
+ * Age only admits cleanup after the caller's stale/acquire windows, while two
+ * identical tree snapshots and native exact detach prevent deleting a successor.
+ * The outer acquire loop then publishes a fresh staged lock generation.
+ */
+async function removeStaleEmptyWindowsLockDirectory(
+	lockPath: string,
+	staleMs: number,
+	acquireBudgetMs: number,
+): Promise<boolean> {
+	if (process.platform !== "win32") return false;
+	const minimumAgeMs = Math.max(OWNERLESS_LOCK_RECOVERY_MIN_AGE_MS, staleMs, acquireBudgetMs);
+	if (!Number.isFinite(minimumAgeMs)) return false;
+	let pathStat: BigIntStats;
+	try {
+		pathStat = await fs.lstat(lockPath, { bigint: true });
+	} catch (error) {
+		if (isEnoent(error) || isTransientReleaseError(error)) return false;
+		throw error;
+	}
+	if (!pathStat.isDirectory() || pathStat.isSymbolicLink()) return false;
+	const pathMtimeMs = Number(pathStat.mtimeNs / 1_000_000n);
+	if (!Number.isFinite(pathMtimeMs) || Date.now() - pathMtimeMs < minimumAgeMs) return false;
+	let children: string[];
+	try {
+		children = await fs.readdir(lockPath);
+	} catch (error) {
+		if (isEnoent(error) || isTransientReleaseError(error)) return false;
+		throw error;
+	}
+	if (children.length !== 0) return false;
+
+	const native = nativeFileLockBindings();
+	let nativeLockPath: string;
+	try {
+		nativeLockPath = await canonicalLockPathPreservingFinal(lockPath);
+	} catch (error) {
+		if (isTransientReleaseError(error)) return false;
+		throw error;
+	}
+	let initial: NativeDirectoryTreeResult;
+	try {
+		initial = native.snapshotDirectoryTree(nativeLockPath);
+	} catch (error) {
+		if (isTransientReleaseError(error)) return false;
+		throw error;
+	}
+	if (!initial.ok || !initial.snapshot) return false;
+	const root = initial.snapshot.entries[0];
+	if (initial.snapshot.entries.length !== 1 || root?.relativePath !== "" || root.kind !== "directory") return false;
+	let rootMtimeMs: number;
+	try {
+		rootMtimeMs = Number(BigInt(root.mtimeNs) / 1_000_000n);
+	} catch {
+		return false;
+	}
+	if (!Number.isFinite(rootMtimeMs) || Date.now() - rootMtimeMs < minimumAgeMs) return false;
+
+	await FileLockTestHooks.afterOwnerlessLockStaleVerdict?.(nativeLockPath);
+	let verified: NativeDirectoryTreeResult;
+	try {
+		verified = native.snapshotDirectoryTree(nativeLockPath);
+	} catch (error) {
+		if (isTransientReleaseError(error)) return false;
+		throw error;
+	}
+	if (!verified.ok || !verified.snapshot || !sameFileLockTreeAfterPublication(initial.snapshot, verified.snapshot))
+		return false;
+
+	try {
+		return (await removeVerifiedLockDirWithoutNative(nativeLockPath, verified.snapshot)) === "removed";
+	} catch {
+		// A failed exact detach is not authority to try a path-only cleanup. Keep
+		// contending and let acquisition exhaustion report the remaining directory.
+		return false;
 	}
 }
 
@@ -2562,6 +2648,10 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 			opts.previousOwnerHostIds,
 			contentionStartTimes,
 		);
+		if (!stale.stale && (await removeStaleEmptyWindowsLockDirectory(lockPath, opts.staleMs, orphanTransitionAgeMs))) {
+			staleRemovalFailure = undefined;
+			continue;
+		}
 		const staleRemoval = await removeStaleLockForAcquire(lockPath, stale);
 		if (staleRemoval.removed) {
 			staleRemovalFailure = undefined;

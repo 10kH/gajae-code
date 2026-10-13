@@ -1926,10 +1926,10 @@ pub fn snapshot_empty_directory(path: String) -> NativeDirectoryTreeResult {
 
 /// Remove a directory tree only when a fresh descriptor-relative snapshot
 #[cfg_attr(clippy, doc = "")]
-/// exactly equals the persisted snapshot. POSIX first no-replace detaches the
-/// verified root to its deterministic `.removing` sibling; the reopened
-/// detached descriptor remains authoritative throughout payload scrubbing and
-/// replay.
+/// exactly equals the persisted snapshot. The Windows and POSIX paths first
+/// no-replace detach the verified root to its deterministic `.removing`
+/// sibling; the retained descriptor remains authoritative throughout payload
+/// scrubbing and replay.
 #[napi]
 pub fn exact_remove_directory_tree(
 	path: String,
@@ -13296,7 +13296,37 @@ mod platform {
 	}
 	#[cfg(test)]
 	mod tests {
-		use super::{FILE_ALL_ACCESS, FILE_READ_DATA, GENERIC_ALL, owner_only_ace_mask_is_safe};
+		use std::{
+			path::PathBuf,
+			sync::atomic::{AtomicU64, Ordering},
+		};
+
+		use super::{
+			FILE_ALL_ACCESS, FILE_READ_DATA, GENERIC_ALL, exact_remove_directory_tree_with_mode,
+			owner_only_ace_mask_is_safe, snapshot_directory_tree,
+		};
+
+		static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+		struct TempDir(PathBuf);
+
+		impl TempDir {
+			fn new() -> Self {
+				let path = std::env::temp_dir().join(format!(
+					"gjc-lock-retirement-collision-{}-{}",
+					std::process::id(),
+					NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+				));
+				std::fs::create_dir(&path).expect("create lock-retirement temp directory");
+				Self(path)
+			}
+		}
+
+		impl Drop for TempDir {
+			fn drop(&mut self) {
+				let _ = std::fs::remove_dir_all(&self.0);
+			}
+		}
 
 		#[test]
 		fn owner_only_ace_mask_accepts_legacy_and_current_full_access_masks() {
@@ -13308,6 +13338,33 @@ mod platform {
 		fn owner_only_ace_mask_rejects_partial_and_combined_masks() {
 			assert!(!owner_only_ace_mask_is_safe(FILE_ALL_ACCESS & !FILE_READ_DATA));
 			assert!(!owner_only_ace_mask_is_safe(GENERIC_ALL | FILE_READ_DATA));
+		}
+
+		#[test]
+		fn retirement_collision_preserves_canonical_owner_metadata() {
+			let root = TempDir::new();
+			let canonical = root.0.join("index.jsonl.lock");
+			let retired = root.0.join("index.jsonl.lock.removing");
+			std::fs::create_dir(&canonical).expect("create canonical lock");
+			std::fs::write(canonical.join("info"), b"canonical-owner").expect("write canonical owner");
+			std::fs::create_dir(&retired).expect("create occupied retirement path");
+			std::fs::write(retired.join("info"), b"predecessor-owner")
+				.expect("write predecessor owner");
+
+			let snapshot = snapshot_directory_tree(&canonical)
+				.snapshot
+				.expect("snapshot canonical lock");
+			let result = exact_remove_directory_tree_with_mode(&canonical, &snapshot, None, false);
+			assert!(!result.ok);
+			assert_eq!(result.code.as_deref(), Some("quarantine_collision"));
+			assert_eq!(
+				std::fs::read(canonical.join("info")).expect("canonical owner remains"),
+				b"canonical-owner"
+			);
+			assert_eq!(
+				std::fs::read(retired.join("info")).expect("predecessor owner remains"),
+				b"predecessor-owner"
+			);
 		}
 	}
 	fn hex_digest(digest: [u8; 32]) -> String {
@@ -13980,20 +14037,25 @@ mod platform {
 				&identity,
 			);
 		}
-		match remove_tree_handle(root.target, "", &expected.entries) {
-			Ok(()) if !already_final => match rename_handle(root.target, parent, &final_name, false) {
-				Ok(()) => match tree_entry(root.target, String::new(), "directory") {
-					Ok(entry) if entry.dev == expected.root_dev && entry.ino == expected.root_ino => {
-						match delete_handle(root.target) {
-							Ok(()) => NativeExactUnlinkResult::success(),
-							Err(code) => NativeExactUnlinkResult::detached_failure(code, final_path),
-						}
-					},
-					Ok(_) => NativeExactUnlinkResult::detached_failure("identity_mismatch", final_path),
-					Err(code) => NativeExactUnlinkResult::detached_failure(code, final_path),
-				},
-				Err(code) => NativeExactUnlinkResult::detached_failure(code, planned_path),
+		let retained_path = if already_final {
+			retained_path
+		} else {
+			// Reserve the retirement name before deleting owner metadata. A
+			// predecessor may still occupy `.removing`; collision must leave this
+			// generation's canonical `info` intact so release can safely retry.
+			if let Err(code) = rename_handle(root.target, parent, &final_name, false) {
+				return NativeExactUnlinkResult::failure(code);
+			}
+			final_path
+		};
+		match tree_entry(root.target, String::new(), "directory") {
+			Ok(entry) if entry.dev == expected.root_dev && entry.ino == expected.root_ino => {},
+			Ok(_) => {
+				return NativeExactUnlinkResult::detached_failure("identity_mismatch", retained_path);
 			},
+			Err(code) => return NativeExactUnlinkResult::detached_failure(code, retained_path),
+		}
+		match remove_tree_handle(root.target, "", &expected.entries) {
 			Ok(()) => match delete_handle(root.target) {
 				Ok(()) => NativeExactUnlinkResult::success(),
 				Err(code) => NativeExactUnlinkResult::detached_failure(code, retained_path),
