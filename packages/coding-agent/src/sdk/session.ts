@@ -217,6 +217,7 @@ import {
 	computeEssentialBuiltinNames,
 	createTools,
 	HIDDEN_TOOLS,
+	type LazyAgentTool,
 	resolveEffectiveDiscoveryMode,
 	type Tool,
 	type ToolSession,
@@ -3389,6 +3390,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			options.toolNames,
 			automationTools,
 		);
+		const taskFacade = builtinTools.find(tool => tool.name === "task") as LazyAgentTool | undefined;
 
 		// A top-level session loads MCP tools from three bounded surfaces: a
 		// caller-supplied exact config (`--mcp-config`), conventional native
@@ -5493,6 +5495,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// carried by the host replay ring through the internal runtime seam above.
 		if (autoroutingInactive) session.configWarnings.push(AUTOROUTING_INACTIVE_WARNING);
 		hasSession = true;
+		if (taskFacade) {
+			const unregisterTaskMoveListener = sessionManager.registerAfterMoveListener(move =>
+				taskFacade.invalidateForSessionMove(move.newCwd),
+			);
+			session.registerToolSessionCleanup(unregisterTaskMoveListener);
+		}
 		const cleanupOwnedManager = cleanupOwnedMcpManager;
 		const sessionOwnedMcpManager = ownsMcpManager ? mcpManager : undefined;
 		if (cleanupOwnedManager && cleanupOwnedMcpManagerOwner !== sessionOwnedMcpManager) {
