@@ -396,7 +396,7 @@ describe("AgentSession configuration reload", () => {
 		expect(session!.getProfileInstalledOverrideState().manualAgentModelOverrides).toEqual(new Set(["planner"]));
 	});
 
-	it("rebases configured agent-role baselines after a model configuration reload", async () => {
+	it("keeps configured agent bindings out of active successor profiles after reload", async () => {
 		const configuredBefore = `${provider}/configured-next`;
 		const configuredAfter = `${provider}/${modelId}`;
 		const { configPath, modelsPath } = await createSession({
@@ -426,6 +426,10 @@ describe("AgentSession configuration reload", () => {
 		expect(modelRegistry!.getConfiguredModelBindings()?.agentModelOverrides?.planner).toBe(configuredAfter);
 
 		await session!.activateModelProfileForControl("no-planner-profile");
+		expect(session!.settings.getOverride("task.agentModelOverrides")?.planner).toBeUndefined();
+
+		await session!.setDefaultModelSelection(session!.model!, undefined);
+		expect(session!.getActiveModelProfile()).toBeUndefined();
 		expect(session!.settings.getOverride("task.agentModelOverrides")?.planner).toBe(configuredAfter);
 	});
 

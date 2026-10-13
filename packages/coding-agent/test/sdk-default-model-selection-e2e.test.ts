@@ -862,7 +862,7 @@ test("selecting a synthetic gajae-code profile remains session-scoped across con
 	});
 	if (!fixtureCleanup) throw new Error("Expected fixture broker cleanup.");
 	registerFixtureRuntime(fixtureCleanup, {
-		key: `session:${freshSession.sessionId}`,
+		key: `fresh-session:${freshSession.sessionId}`,
 		requiredOwner: "runtime-and-broker",
 		dispose: () => freshSession.dispose(),
 	});

@@ -1792,7 +1792,11 @@ export class AsyncJobManager {
 		};
 	}
 
-	finishOwnerSubagentShutdown(lease: OwnerSubagentShutdownLease, outcome: "commit" | "release"): void {
+	finishOwnerSubagentShutdown(
+		lease: OwnerSubagentShutdownLease,
+		outcome: "commit" | "release",
+		options?: { drainResumeQueue?: boolean },
+	): void {
 		const state = this.#ownerSubagentShutdownLeases.get(lease.ownerId);
 		if (!state || state.lease.id !== lease.id) return;
 		if (outcome === "commit" && state.proof?.confirmed) {
@@ -1801,7 +1805,10 @@ export class AsyncJobManager {
 			this.#purgeOwnerSubagentState(lease.ownerId);
 		}
 		this.#ownerSubagentShutdownLeases.delete(lease.ownerId);
-		if (outcome === "release") this.#ensureDeliveryLoop();
+		if (outcome === "release") {
+			if (options?.drainResumeQueue && !this.#disposed && !this.#registrationClosed) this.#drainResumeQueue();
+			this.#ensureDeliveryLoop();
+		}
 	}
 
 	#recordByJobId(jobId: string, expectedGeneration?: string): SubagentRecord | undefined {

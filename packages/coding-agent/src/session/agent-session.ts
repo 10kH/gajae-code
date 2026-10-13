@@ -17962,7 +17962,7 @@ export class AgentSession {
 						"Unable to confirm owned subagent cleanup; session was not replaced. Wait for or inspect remaining subagents, then retry /new.",
 						"new-session-subagent-cleanup",
 					);
-					manager.finishOwnerSubagentShutdown(lease, "release");
+					manager.finishOwnerSubagentShutdown(lease, "release", { drainResumeQueue: !this.#isDisposed });
 					return false;
 				}
 			} catch {
@@ -17971,7 +17971,7 @@ export class AgentSession {
 					"Unable to confirm owned subagent cleanup; session was not replaced. Wait for or inspect remaining subagents, then retry /new.",
 					"new-session-subagent-cleanup",
 				);
-				manager.finishOwnerSubagentShutdown(lease, "release");
+				manager.finishOwnerSubagentShutdown(lease, "release", { drainResumeQueue: !this.#isDisposed });
 				return false;
 			}
 
@@ -18029,10 +18029,11 @@ export class AgentSession {
 			manager.finishOwnerSubagentShutdown(lease, "commit");
 			return true;
 		} catch (error) {
-			manager.finishOwnerSubagentShutdown(
-				lease,
-				this.sessionManager.getSessionId() !== previousSessionIdentity ? "commit" : "release",
-			);
+			if (this.sessionManager.getSessionId() !== previousSessionIdentity) {
+				manager.finishOwnerSubagentShutdown(lease, "commit");
+			} else {
+				manager.finishOwnerSubagentShutdown(lease, "release", { drainResumeQueue: !this.#isDisposed });
+			}
 			throw error;
 		}
 	}
@@ -27606,6 +27607,7 @@ export class AgentSession {
 		let ownerShutdownManager: AsyncJobManager | undefined;
 		let ownerShutdownLease: OwnerSubagentShutdownLease | undefined;
 		let ownerShutdownTransitionCommitted = false;
+		let ownerShutdownRollbackCompleted = false;
 		let ownerShutdownFinalizationDeferred = false;
 		this.#beginSessionTransition("switch-session");
 		try {
@@ -28185,6 +28187,7 @@ export class AgentSession {
 					}
 					throw new AggregateError([error, rollbackErrors[0]], "Session switch rollback failed");
 				}
+				ownerShutdownRollbackCompleted = true;
 				if (unavailableDefaultChainMessage) {
 					this.emitNotice(
 						"error",
@@ -28197,10 +28200,13 @@ export class AgentSession {
 			}
 		} finally {
 			if (ownerShutdownManager && ownerShutdownLease && !ownerShutdownFinalizationDeferred) {
-				ownerShutdownManager.finishOwnerSubagentShutdown(
-					ownerShutdownLease,
-					ownerShutdownTransitionCommitted ? "commit" : "release",
-				);
+				if (ownerShutdownTransitionCommitted) {
+					ownerShutdownManager.finishOwnerSubagentShutdown(ownerShutdownLease, "commit");
+				} else {
+					ownerShutdownManager.finishOwnerSubagentShutdown(ownerShutdownLease, "release", {
+						drainResumeQueue: ownerShutdownRollbackCompleted && !this.#isDisposed,
+					});
+				}
 			}
 			this.#endSessionTransition();
 		}

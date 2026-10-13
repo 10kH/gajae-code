@@ -428,7 +428,7 @@ describe("AsyncJobManager subagent pause/resume/queue", () => {
 		await manager.dispose({ timeoutMs: 500 });
 	});
 
-	test("a fenced queued owner remains queued while a later foreign owner resumes", async () => {
+	test("a live rollback drains a fenced queued owner after foreign progress", async () => {
 		const { manager, completions } = makeManager({ maxRunningJobs: 1 });
 		installResumeRunner(manager);
 		const a = spawnControllable(manager, "A", "owner-a");
@@ -452,8 +452,11 @@ describe("AsyncJobManager subagent pause/resume/queue", () => {
 		const proof = await manager.cancelAndProveOwnerSubagents(lease, { timeoutMs: 50 });
 		expect(proof).toMatchObject({ confirmed: true, terminalIds: ["A"], unresolvedIds: [] });
 		expect(manager.getSubagentRecord("A")?.status).toBe("queued");
-		manager.finishOwnerSubagentShutdown(lease, "release");
-		expect(manager.getSubagentRecord("A")?.status).toBe("queued");
+		manager.finishOwnerSubagentShutdown(lease, "release", { drainResumeQueue: true });
+		expect(manager.getSubagentRecord("A")?.status).not.toBe("queued");
+		await manager.waitForAll();
+		expect(manager.getSubagentRecord("A")?.status).toBe("completed");
+		expect(completions.map(completion => completion.text)).toContain("resumed:A");
 		await manager.dispose({ timeoutMs: 500 });
 	});
 

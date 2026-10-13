@@ -81,6 +81,58 @@ describe("owner subagent shutdown leases", () => {
 		await manager.dispose();
 	});
 
+	test("does not restart queued work when an owner lease is released after manager disposal", async () => {
+		const manager = makeManager(1);
+		const blockerStarted = Promise.withResolvers<void>();
+		const blockerGate = Promise.withResolvers<void>();
+		const blockerId = manager.register(
+			"task",
+			"foreign blocker",
+			async () => {
+				blockerStarted.resolve();
+				await blockerGate.promise;
+				return "finished";
+			},
+			{ ownerId: "owner-b" },
+		);
+		await blockerStarted.promise;
+		const blockerJob = manager.getJob(blockerId);
+		manager.registerSubagentRecord({
+			subagentId: "disposed-queued",
+			ownerId: "owner-a",
+			currentJobId: null,
+			historicalJobIds: [],
+			status: "paused",
+			sessionFile: "/tmp/disposed-queued.jsonl",
+			resumable: true,
+		});
+		let resumeStarts = 0;
+		manager.setResumeRunner(subagentId => {
+			resumeStarts++;
+			return manager.register("task", `resume ${subagentId}`, async () => "resumed", {
+				ownerId: "owner-a",
+				metadata: { subagent: { id: subagentId, agent: "executor", agentSource: "bundled" } },
+			});
+		});
+		expect(manager.resumeSubagent("disposed-queued", { ownerId: "owner-a" })).toMatchObject({
+			ok: true,
+			queued: true,
+			status: "queued",
+		});
+		const lease = manager.beginOwnerSubagentShutdown("owner-a");
+		if (!lease) throw new Error("Owner shutdown lease was not created");
+
+		try {
+			await manager.dispose({ timeoutMs: 0 });
+			manager.finishOwnerSubagentShutdown(lease, "release", { drainResumeQueue: true });
+			expect(resumeStarts).toBe(0);
+		} finally {
+			blockerGate.resolve();
+			await blockerJob?.promise;
+			await manager.waitForAll();
+		}
+	});
+
 	test("proves a captured running record by stable id and commit purges only its owner", async () => {
 		const manager = makeManager();
 		registerCooperativeSubagent(manager, "running", "owner-a");
@@ -458,56 +510,68 @@ describe("owner subagent shutdown leases", () => {
 		}
 	});
 
-	test("does not confirm a queued record replaced after shutdown capture", async () => {
-		const manager = makeManager();
-		const captured = {
-			subagentId: "replaced-queued",
-			ownerId: "owner-a",
-			currentJobId: null,
-			historicalJobIds: [],
-			status: "queued" as const,
-			sessionFile: "/tmp/original.jsonl",
-			resumable: true,
-		};
-		manager.registerSubagentRecord(captured);
-		const lease = manager.beginOwnerSubagentShutdown("owner-a")!;
-		const replacement = { ...captured, sessionFile: "/tmp/replacement.jsonl" };
-		manager.registerSubagentRecord(replacement);
+	for (const invalidation of ["record identity", "current job id", "current job generation"] as const) {
+		test(`cancels the captured queued execution when its ${invalidation} changes`, async () => {
+			const manager = makeManager();
+			const executionGate = Promise.withResolvers<void>();
+			const executionStarted = Promise.withResolvers<void>();
+			let executionSignal: AbortSignal | undefined;
+			const backingJobId = manager.register(
+				"task",
+				"queued backing execution",
+				async ({ signal }) => {
+					executionSignal = signal;
+					executionStarted.resolve();
+					await executionGate.promise;
+					return "settled";
+				},
+				{
+					ownerId: "owner-a",
+					metadata: { subagent: { id: "invalidated-queued", agent: "executor", agentSource: "bundled" } },
+				},
+			);
+			await executionStarted.promise;
+			const backingJob = manager.getJob(backingJobId);
+			if (!backingJob) throw new Error("Queued backing job was not registered");
+			const captured = {
+				subagentId: "invalidated-queued",
+				ownerId: "owner-a",
+				currentJobId: backingJobId,
+				currentJobGeneration: backingJob.generation,
+				historicalJobIds: [],
+				status: "queued" as const,
+				sessionFile: "/tmp/original.jsonl",
+				resumable: true,
+			};
+			manager.registerSubagentRecord(captured);
+			const lease = manager.beginOwnerSubagentShutdown("owner-a");
+			if (!lease) throw new Error("Owner shutdown lease was not created");
+			let canonicalRecord = captured;
+			if (invalidation === "record identity") {
+				canonicalRecord = { ...captured, sessionFile: "/tmp/replacement.jsonl" };
+				manager.registerSubagentRecord(canonicalRecord);
+			} else if (invalidation === "current job id") {
+				captured.currentJobId = "replacement-job";
+			} else {
+				captured.currentJobGeneration = "replacement-generation";
+			}
 
-		expect(await manager.cancelAndProveOwnerSubagents(lease, { timeoutMs: 50 })).toMatchObject({
-			confirmed: false,
-			reason: "missing_terminal_evidence",
-			unresolvedIds: [captured.subagentId],
+			try {
+				expect(await manager.cancelAndProveOwnerSubagents(lease, { timeoutMs: 0 })).toMatchObject({
+					confirmed: false,
+					reason: "deadline_exceeded",
+					unresolvedIds: [captured.subagentId],
+				});
+				expect(executionSignal?.aborted).toBe(true);
+				expect(manager.getSubagentRecord(captured.subagentId)).toBe(canonicalRecord);
+			} finally {
+				manager.finishOwnerSubagentShutdown(lease, "release");
+				executionGate.resolve();
+				await manager.waitForAll();
+				await manager.dispose();
+			}
 		});
-		expect(manager.getSubagentRecord(captured.subagentId)).toBe(replacement);
-		manager.finishOwnerSubagentShutdown(lease, "release");
-		await manager.dispose();
-	});
-
-	test("does not confirm a queued record whose captured job generation changed", async () => {
-		const manager = makeManager();
-		const record = {
-			subagentId: "changed-generation-queued",
-			ownerId: "owner-a",
-			currentJobId: "prior-job",
-			currentJobGeneration: "prior-generation",
-			historicalJobIds: [],
-			status: "queued" as const,
-			sessionFile: "/tmp/queued.jsonl",
-			resumable: true,
-		};
-		manager.registerSubagentRecord(record);
-		const lease = manager.beginOwnerSubagentShutdown("owner-a")!;
-		record.currentJobGeneration = "replacement-generation";
-
-		expect(await manager.cancelAndProveOwnerSubagents(lease, { timeoutMs: 50 })).toMatchObject({
-			confirmed: false,
-			reason: "missing_terminal_evidence",
-			unresolvedIds: [record.subagentId],
-		});
-		manager.finishOwnerSubagentShutdown(lease, "release");
-		await manager.dispose();
-	});
+	}
 
 	test("queues a watched completion and delivers it after unwatch", async () => {
 		const delivered: string[] = [];
