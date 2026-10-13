@@ -1225,6 +1225,7 @@ export class AsyncJobManager {
 				this.#externallySettled.delete(job.generation);
 				if (this.#jobs.get(id) === job) this.#settledJobs.add(job);
 				this.#settleExecution(execution);
+				if (!this.#disposed && !this.#registrationClosed) this.#drainResumeQueue();
 			})
 			.then(completion.resolve, completion.reject);
 
@@ -2029,6 +2030,21 @@ export class AsyncJobManager {
 				continue;
 			}
 			if (this.#isOwnerSubagentShutdownFenced(entry.ownerId)) {
+				index += 1;
+				continue;
+			}
+			let priorExecutionActive = false;
+			for (const execution of this.#activeExecutions) {
+				if (
+					execution.job.ownerId === entry.ownerId &&
+					execution.job.metadata?.subagent?.id === entry.subagentId &&
+					!execution.physicallySettled
+				) {
+					priorExecutionActive = true;
+					break;
+				}
+			}
+			if (priorExecutionActive) {
 				index += 1;
 				continue;
 			}
