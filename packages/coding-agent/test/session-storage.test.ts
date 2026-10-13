@@ -184,6 +184,14 @@ describe("native publish outcome classification", () => {
 				phase: "preflight",
 			}).reason,
 		).toBe("unknown");
+		expect(
+			classifyNativePublishOutcome({
+				...preMutation,
+				reason: "access_denied",
+				code: "access_denied",
+				phase: "preflight",
+			}).reason,
+		).toBe("unknown");
 	});
 
 	it("rejects a direct-rename success envelope when retained publication requires durability proof", () => {

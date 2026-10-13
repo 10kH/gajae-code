@@ -192,7 +192,7 @@ function legalOutcome(outcome: NativePublishOutcome): boolean {
 					"interrupted",
 				].includes(outcome.reason)) ||
 				(outcome.phase === "preflight" &&
-					!["atomic_unavailable", "cross_device", "interrupted"].includes(outcome.reason)) ||
+					!["atomic_unavailable", "cross_device", "interrupted", "access_denied"].includes(outcome.reason)) ||
 				(outcome.phase === "file_sync" && outcome.reason === "io_failure"))
 		);
 	if (outcome.mutationState === "unknown")
