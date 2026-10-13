@@ -1252,13 +1252,20 @@ export class OutputSink {
 		else if (this.#artifactPublisher && this.#maxColumns > 0) this.#enqueueTerminalArtifactChunk(rawChunk, rawBytes);
 
 		if (this.#maxColumns > 0) {
-			let cursor = 0;
-			while (cursor < sanitizedChunk.length) {
-				const newline = sanitizedChunk.indexOf(NL, cursor);
-				const end = newline === -1 ? sanitizedChunk.length : newline + 1;
-				const visibleLine = this.#applyColumnCap(sanitizedChunk.slice(cursor, end));
-				this.#retainVisible(visibleLine);
-				cursor = end;
+			if (this.#plainSecrets) {
+				// Secret-aware cuts can retract text from an earlier line, so retain
+				// each line before processing the next one.
+				let cursor = 0;
+				while (cursor < sanitizedChunk.length) {
+					const newline = sanitizedChunk.indexOf(NL, cursor);
+					const end = newline === -1 ? sanitizedChunk.length : newline + 1;
+					this.#retainVisible(this.#applyColumnCap(sanitizedChunk.slice(cursor, end)));
+					cursor = end;
+				}
+			} else {
+				// Batch ordinary output by native read chunk. Retaining each line
+				// separately repeats byte/newline accounting millions of times.
+				this.#retainVisible(this.#applyColumnCap(sanitizedChunk));
 			}
 		} else {
 			this.#retainVisible(sanitizedChunk);
