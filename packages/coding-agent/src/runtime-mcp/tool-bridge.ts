@@ -6,7 +6,7 @@
 import type { AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import type { ImageContent, TSchema } from "@gajae-code/ai/core";
 import { normalizeSchemaForMCP } from "@gajae-code/ai/utils/schema";
-import { SUPPORTED_IMAGE_MIME_TYPES, untilAborted } from "@gajae-code/utils";
+import { parseImageMetadata, SUPPORTED_IMAGE_MIME_TYPES, untilAborted } from "@gajae-code/utils";
 import type { SourceMeta } from "../capability/types";
 import type {
 	CustomTool,
@@ -115,6 +115,7 @@ export interface MCPToolDetails {
 async function formatMCPContent(
 	content: MCPContent[],
 	includeImages: boolean,
+	signal?: AbortSignal,
 ): Promise<{ text: string; images: ImageContent[] }> {
 	const parts: string[] = [];
 	const images: ImageContent[] = [];
@@ -125,17 +126,26 @@ async function formatMCPContent(
 	async function appendImage(image: ImageContent): Promise<string | undefined> {
 		if (!includeImages || imageAttempts >= MCP_MAX_IMAGES) return;
 		if (!SUPPORTED_IMAGE_MIME_TYPES.has(image.mimeType)) return;
+		const data = image.data;
 		// Bound work before decoding, including for stdio results. Count encoded
 		// source bytes against the same budget as an HTTP MCP response.
-		if (!image.data || image.data.length > MCP_MAX_CONTENT_BYTES - sourceBytes) return;
+		// This guard also bounds embedded resource blobs routed through this helper.
+		if (typeof data !== "string" || !data || data.length > MCP_MAX_CONTENT_BYTES - sourceBytes) return;
 		imageAttempts++;
-		sourceBytes += image.data.length;
+		sourceBytes += data.length;
 		try {
 			// Buffer.from is permissive: require canonical standard base64, with
 			// optional padding, so corrupt payloads cannot become partial images.
-			const canonical = Buffer.from(image.data, "base64").toBase64();
-			if (image.data !== canonical && image.data !== canonical.replace(/=+$/, "")) return;
-			const resized = await resizeImage(image);
+			const bytes = Buffer.from(data, "base64");
+			const canonical = bytes.toBase64();
+			if (data !== canonical && data !== canonical.replace(/=+$/, "")) return;
+			// The resizer's compact-image fast path preserves the supplied MIME,
+			// so identify supported bytes before passing in a server's MIME label.
+			const metadata = parseImageMetadata(bytes);
+			if (!metadata) return;
+			signal?.throwIfAborted();
+			const resized = await resizeImage({ type: "image", data, mimeType: metadata.mimeType });
+			signal?.throwIfAborted();
 			// The shared helper returns the original on decode failure and may
 			// exceed its target after exhausting its compression ladder.
 			if (
@@ -149,13 +159,15 @@ async function formatMCPContent(
 			outputBytes += resized.buffer.length;
 			images.push({ type: "image", data: resized.data, mimeType: resized.mimeType });
 			return formatDimensionNote(resized);
-		} catch {
+		} catch (error) {
+			rethrowIfAborted(error, signal);
 			// An invalid/unsupported image must not turn a successful tool into an error.
 			return;
 		}
 	}
 
 	for (const item of content) {
+		signal?.throwIfAborted();
 		switch (item.type) {
 			case "text":
 				parts.push(item.text);
@@ -181,6 +193,7 @@ async function formatMCPContent(
 		}
 	}
 
+	signal?.throwIfAborted();
 	return { text: parts.join("\n\n"), images };
 }
 
@@ -191,8 +204,9 @@ async function buildResult(
 	mcpToolName: string,
 	provider?: string,
 	providerName?: string,
+	signal?: AbortSignal,
 ): Promise<CustomToolResult<MCPToolDetails>> {
-	const { text: body, images } = await formatMCPContent(result.content, !result.isError);
+	const { text: body, images } = await formatMCPContent(result.content, !result.isError, signal);
 	const visible = result.isError ? `Error: ${body}` : body;
 	const text = wrapUntrustedContent(visible);
 	const details: MCPToolDetails = {
@@ -382,7 +396,7 @@ export class MCPTool implements CustomTool<TSchema, MCPToolDetails> {
 
 		try {
 			const result = await callTool(this.connection, this.tool.name, args, this.#callOptions(signal));
-			return await buildResult(result, this.connection.name, this.tool.name, provider, providerName);
+			return await buildResult(result, this.connection.name, this.tool.name, provider, providerName, signal);
 		} catch (error) {
 			rethrowIfAborted(error, signal);
 			if (this.reconnect && isRetriableConnectionError(error)) {
@@ -405,7 +419,14 @@ export class MCPTool implements CustomTool<TSchema, MCPToolDetails> {
 					const retryProviderName = newConn._source?.providerName ?? providerName;
 					try {
 						const result = await callTool(newConn, this.tool.name, args, this.#callOptions(signal));
-						return await buildResult(result, newConn.name, this.tool.name, retryProvider, retryProviderName);
+						return await buildResult(
+							result,
+							newConn.name,
+							this.tool.name,
+							retryProvider,
+							retryProviderName,
+							signal,
+						);
 					} catch (retryError) {
 						rethrowIfAborted(retryError, signal);
 						return buildErrorResult(
@@ -529,6 +550,7 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 					this.tool.name,
 					connection._source?.provider ?? provider,
 					connection._source?.providerName ?? providerName,
+					signal,
 				);
 			} catch (callError) {
 				rethrowIfAborted(callError, signal);
@@ -556,6 +578,7 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 								this.tool.name,
 								retryProvider,
 								retryProviderName,
+								signal,
 							);
 						} catch (retryError) {
 							rethrowIfAborted(retryError, signal);
@@ -596,6 +619,7 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 							this.tool.name,
 							newConn._source?.provider ?? provider,
 							newConn._source?.providerName ?? providerName,
+							signal,
 						);
 					} catch (retryError) {
 						rethrowIfAborted(retryError, signal);

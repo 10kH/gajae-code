@@ -20,6 +20,7 @@ import type {
 	MCPToolDefinition,
 } from "../../src/runtime-mcp/types";
 import { wrapUntrustedContent } from "../../src/tools/fetch";
+import { ToolAbortError } from "../../src/tools/tool-errors";
 import * as imageResize from "../../src/utils/image-resize";
 
 const PNG: ImageContent = {
@@ -32,12 +33,12 @@ const connection = { name: "fixture" } as MCPServerConnection;
 
 afterEach(() => vi.restoreAllMocks());
 
-async function executeResult(result: MCPToolCallResult, deferred = false) {
+async function executeResult(result: MCPToolCallResult, deferred = false, signal?: AbortSignal) {
 	vi.spyOn(mcpClient, "callTool").mockResolvedValue(result);
 	const tool = deferred
 		? new DeferredMCPTool("fixture", probe, async () => connection)
 		: new MCPTool(connection, probe);
-	return tool.execute("call-1", {}, undefined, {} as never);
+	return tool.execute("call-1", {}, undefined, {} as never, signal);
 }
 
 function textOf(content: ToolResultMessage["content"]): string {
@@ -85,6 +86,29 @@ describe("MCP tool-result images", () => {
 			expect(result.details?.rawContent).toEqual(content);
 			expect(resize).not.toHaveBeenCalled();
 		});
+
+		for (const imageCount of [1, 2]) {
+			it(`aborts during resizing with ${imageCount} image(s) (${deferred ? "deferred" : "connected"})`, async () => {
+				const resized = await imageResize.resizeImage(PNG);
+				const started = Promise.withResolvers<void>();
+				const finished = Promise.withResolvers<imageResize.ResizedImage>();
+				const resize = vi.spyOn(imageResize, "resizeImage").mockImplementation(() => {
+					started.resolve();
+					return finished.promise;
+				});
+				const controller = new AbortController();
+				const pending = executeResult(
+					{ content: Array.from({ length: imageCount }, () => PNG) },
+					deferred,
+					controller.signal,
+				);
+				await started.promise;
+				controller.abort();
+				finished.resolve(resized);
+				await expect(pending).rejects.toBeInstanceOf(ToolAbortError);
+				expect(resize).toHaveBeenCalledTimes(1);
+			});
+		}
 	}
 
 	it("forwards embedded image blobs in order and preserves resource text", async () => {
@@ -108,6 +132,26 @@ describe("MCP tool-result images", () => {
 			PNG,
 		]);
 		expect(result.details?.rawContent).toEqual(content);
+	});
+
+	it("uses the detected MIME for mislabeled images and embedded resources", async () => {
+		const result = await executeResult({
+			content: [
+				{ ...PNG, mimeType: "image/jpeg" },
+				{ type: "resource", resource: { uri: "screen://image", mimeType: "image/jpeg", blob: PNG.data } },
+			],
+		});
+		expect(result.content).toEqual([
+			{ type: "text", text: wrapUntrustedContent("[Image: image/jpeg]\n\n[Resource: screen://image]") },
+			PNG,
+			PNG,
+		]);
+	});
+
+	it("keeps only the marker when supported MIME labels hide unsupported image bytes", async () => {
+		const data = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>').toBase64();
+		const result = await executeResult({ content: [{ ...PNG, data }] });
+		expect(result.content).toEqual([{ type: "text", text: wrapUntrustedContent("[Image: image/png]") }]);
 	});
 
 	it("resizes screenshots with the shared defaults and includes coordinate mapping", async () => {
@@ -170,13 +214,29 @@ describe("MCP tool-result images", () => {
 	});
 
 	it("bounds encoded source bytes before decoding, including the aggregate", async () => {
-		const resize = vi.spyOn(imageResize, "resizeImage");
-		const data = "A".repeat(MCP_MAX_CONTENT_BYTES / 2);
+		const resized = await imageResize.resizeImage(PNG);
+		const resize = vi.spyOn(imageResize, "resizeImage").mockResolvedValue(resized);
+		const data = PNG.data + "A".repeat(MCP_MAX_CONTENT_BYTES / 2 - PNG.data.length);
 		const result = await executeResult({
-			content: [{ ...PNG, data: `${data}${data}AAAA` }, { ...PNG, data }, { ...PNG, data }, PNG],
+			content: [
+				{
+					type: "resource",
+					resource: { uri: "screen://large", mimeType: PNG.mimeType, blob: `${data}${data}AAAA` },
+				},
+				{ ...PNG, data },
+				{ ...PNG, data },
+				PNG,
+			],
 		});
 		expect(result.content).toEqual([
-			{ type: "text", text: wrapUntrustedContent(Array(4).fill("[Image: image/png]").join("\n\n")) },
+			{
+				type: "text",
+				text: wrapUntrustedContent(
+					["[Resource: screen://large]", ...Array(3).fill("[Image: image/png]")].join("\n\n"),
+				),
+			},
+			PNG,
+			PNG,
 		]);
 		expect(resize).toHaveBeenCalledTimes(2);
 	});

@@ -74,7 +74,9 @@ Top-level sessions own their MCP manager and clean up server processes on sessio
 
 Successful MCP tool results forward PNG, JPEG, GIF, and WebP images (including
 embedded resources with an image `mimeType` and base64 `blob`) to image-capable
-models. Images follow the text block in their original order. Text keeps an image
+models on providers whose tool-result transport carries images. Providers that
+flatten tool results to text, including Kiro, receive the text markers instead.
+Images follow the text block in their original order. Text keeps an image
 or resource marker, with a coordinate-mapping note when an image is resized, and
 retains the untrusted-content wrapper. MCP images are untrusted server content,
 just like MCP text.
@@ -84,9 +86,11 @@ Images use the built-in shared resizer: at most 1,568 pixels per dimension and
 result attempts at most 16 supported images (matching the pasted-image count
 limit), processes at most 16 MiB of base64 source data (the MCP response budget),
 and forwards at most 4 MiB of image-file bytes after resizing, before base64
-encoding. Images that are invalid, unsupported, or over these limits retain only
-their text markers. Error results remain text-only. Models without image input
-use the existing provider filtering and receive text instead of image payloads.
+encoding. Supported image bytes determine the forwarded MIME type when a server
+mislabels an image. Images that are invalid, unsupported, or over these limits
+retain only their text markers. Error results remain text-only. Models without
+image input use the existing provider filtering and receive text instead of image
+payloads.
 
 ## Use an explicit config
 
