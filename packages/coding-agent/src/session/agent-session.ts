@@ -23290,7 +23290,8 @@ export class AgentSession {
 	 * had quota. Returns the rotated row's key, or undefined to fall back to the normal
 	 * retry policy: when the candidate is not on the session model's provider (the mark
 	 * acts on that provider's session credential), the provider is pinned, or the
-	 * rotation lands on a row this candidate's rotation phase already failed on.
+	 * rotation lands on a row this candidate's rotation phase already failed on. All rows
+	 * resolving to the failed key are marked because they share the same provider quota.
 	 */
 	async #rotateCompactionCredentialAfterUsageLimit(
 		candidate: Model,
@@ -23300,16 +23301,18 @@ export class AgentSession {
 	): Promise<string | undefined> {
 		if (candidate.provider !== this.model?.provider) return undefined;
 		const authStorage = this.#modelRegistry.authStorage;
-		const failedRowId = await authStorage.getCredentialRowIdMatchingApiKey(candidate.provider, apiKey);
-		if (failedRowId === undefined) return undefined;
-		failedRowIds.add(failedRowId);
-		const mark = await this.#markFailedCredential({
-			class: "quota",
-			retryAfterMs,
-			model: candidate,
-			credentialRowId: failedRowId,
-		});
-		if (mark !== "rotated") return undefined;
+		const matchingRowIds = await authStorage.getCredentialRowIdsMatchingApiKey(candidate.provider, apiKey);
+		if (matchingRowIds.length === 0 || this.#hasManagedFallbackCredentialPin(candidate.provider)) return undefined;
+		for (const failedRowId of matchingRowIds) {
+			if (failedRowIds.has(failedRowId)) continue;
+			failedRowIds.add(failedRowId);
+			await this.#markFailedCredential({
+				class: "quota",
+				retryAfterMs,
+				model: candidate,
+				credentialRowId: failedRowId,
+			});
+		}
 		const nextRowId = authStorage.getSessionCredentialRowId(candidate.provider, this.credentialSessionId);
 		if (nextRowId === undefined || failedRowIds.has(nextRowId)) return undefined;
 		// Resolve the rotated row by id: a bare lookup re-ranks the pool and can land back

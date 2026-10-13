@@ -85,7 +85,21 @@ describe("AuthStorage api-key usage-limit fallback", () => {
 		});
 
 		expect(authStorage.getSessionCredentialRowId("zai", sessionId)).toBe(siblingRowId);
-		expect(await authStorage.getCredentialRowIdMatchingApiKey("zai", apiKey)).toBe(selectedRowId);
-		expect(await authStorage.getCredentialRowIdMatchingApiKey("zai", "not-a-stored-key")).toBeUndefined();
+		expect(await authStorage.getCredentialRowIdsMatchingApiKey("zai", apiKey)).toEqual([selectedRowId]);
+		expect(await authStorage.getCredentialRowIdsMatchingApiKey("zai", "not-a-stored-key")).toEqual([]);
+	});
+
+	it("matches every stored row that resolves to the same API key", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+
+		await authStorage.set("zai", [
+			{ type: "api_key", key: "shared-zai-key" },
+			{ type: "api_key", key: "shared-zai-key" },
+		]);
+		const rowIds = store.listAuthCredentials("zai").map(row => row.id);
+		const matchingRowIds = await authStorage.getCredentialRowIdsMatchingApiKey("zai", "shared-zai-key");
+
+		expect(matchingRowIds).toHaveLength(2);
+		expect(new Set(matchingRowIds)).toEqual(new Set(rowIds));
 	});
 });

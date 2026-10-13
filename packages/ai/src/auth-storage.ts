@@ -5496,16 +5496,17 @@ export class AuthStorage {
 	}
 
 	/**
-	 * Opaque stored row ID for the credential whose resolved key matches `apiKey`.
-	 * Unlike the session's sticky row pointer, this remains tied to the actual key
+	 * Opaque stored row IDs for credentials whose resolved key matches `apiKey`.
+	 * Unlike the session's sticky row pointer, these remain tied to the actual key
 	 * when concurrent requests share a credential session ID.
 	 */
-	async getCredentialRowIdMatchingApiKey(provider: string, apiKey: string): Promise<number | undefined> {
+	async getCredentialRowIdsMatchingApiKey(provider: string, apiKey: string): Promise<number[]> {
 		const storageProvider = resolveOAuthStorageProvider(provider);
+		const rowIds: number[] = [];
 		for (const entry of this.#getStoredCredentials(storageProvider)) {
-			if (await this.#credentialMatchesApiKey(storageProvider, entry.credential, apiKey)) return entry.id;
+			if (await this.#credentialMatchesApiKey(storageProvider, entry.credential, apiKey)) rowIds.push(entry.id);
 		}
-		return undefined;
+		return rowIds;
 	}
 
 	/**

@@ -207,8 +207,9 @@ describe("auto-compaction usage limit rotates the session credential", () => {
 
 	it("stays within the retry policy when two stored rows resolve to the same key", async () => {
 		// Two env references to one secret: matching the failed key back to a row always
-		// finds the first row, so without a key-level check the second row looks unvisited
-		// and every rotation resubmits the key that just failed.
+		// finds the first row, so both rows must be marked before the retry policy takes over.
+		const previousA = process.env.GJC_TEST_COMPACTION_DUP_KEY_A;
+		const previousB = process.env.GJC_TEST_COMPACTION_DUP_KEY_B;
 		process.env.GJC_TEST_COMPACTION_DUP_KEY_A = "codex-dup-secret";
 		process.env.GJC_TEST_COMPACTION_DUP_KEY_B = "codex-dup-secret";
 		try {
@@ -216,7 +217,12 @@ describe("auto-compaction usage limit rotates the session credential", () => {
 				{ type: "api_key", key: "GJC_TEST_COMPACTION_DUP_KEY_A" },
 				{ type: "api_key", key: "GJC_TEST_COMPACTION_DUP_KEY_B" },
 			]);
+			const duplicateRowIds = await authStorage.getCredentialRowIdsMatchingApiKey(
+				"openai-codex",
+				"codex-dup-secret",
+			);
 			session = createSession();
+			const markUsageLimitReached = vi.spyOn(authStorage, "markUsageLimitReached");
 			const ends = collectCompactionEnds(session);
 			let calls = 0;
 			const compactSpy = vi.spyOn(compactionModule, "compact").mockImplementation(async () => {
@@ -228,12 +234,61 @@ describe("auto-compaction usage limit rotates the session credential", () => {
 
 			await session.runIdleCompaction();
 
+			expect(duplicateRowIds).toHaveLength(2);
 			expect(compactSpy.mock.calls.every(call => call[2] === "codex-dup-secret")).toBe(true);
 			expect(compactSpy.mock.calls.length).toBe(1 + MAX_RETRIES);
+			expect(new Set(markUsageLimitReached.mock.calls.map(call => call[2]?.rowId))).toEqual(
+				new Set(duplicateRowIds),
+			);
+			expect(duplicateRowIds.every(rowId => !authStorage.isCredentialAvailable("openai-codex", rowId))).toBe(true);
 			expect(ends[0]?.errorMessage).toContain("usage limit has been reached");
 		} finally {
-			delete process.env.GJC_TEST_COMPACTION_DUP_KEY_A;
-			delete process.env.GJC_TEST_COMPACTION_DUP_KEY_B;
+			if (previousA === undefined) delete process.env.GJC_TEST_COMPACTION_DUP_KEY_A;
+			else process.env.GJC_TEST_COMPACTION_DUP_KEY_A = previousA;
+			if (previousB === undefined) delete process.env.GJC_TEST_COMPACTION_DUP_KEY_B;
+			else process.env.GJC_TEST_COMPACTION_DUP_KEY_B = previousB;
+		}
+	});
+
+	it("rotates past duplicate rows that resolve to the same key", async () => {
+		const previousA = process.env.GJC_TEST_COMPACTION_DUP_KEY_A;
+		const previousB = process.env.GJC_TEST_COMPACTION_DUP_KEY_B;
+		process.env.GJC_TEST_COMPACTION_DUP_KEY_A = "codex-dup-secret";
+		process.env.GJC_TEST_COMPACTION_DUP_KEY_B = "codex-dup-secret";
+		try {
+			await authStorage.set("openai-codex", [
+				{ type: "api_key", key: "GJC_TEST_COMPACTION_DUP_KEY_A" },
+				{ type: "api_key", key: "GJC_TEST_COMPACTION_DUP_KEY_B" },
+				{ type: "api_key", key: "codex-key-3" },
+			]);
+			session = createSession();
+			const duplicateRowIds = await authStorage.getCredentialRowIdsMatchingApiKey(
+				"openai-codex",
+				"codex-dup-secret",
+			);
+			const uniqueRowIds = await authStorage.getCredentialRowIdsMatchingApiKey("openai-codex", "codex-key-3");
+			const uniqueRowId = uniqueRowIds[0];
+			if (uniqueRowId === undefined) throw new Error("expected a distinct third credential row");
+			const markUsageLimitReached = vi.spyOn(authStorage, "markUsageLimitReached");
+			const ends = collectCompactionEnds(session);
+			const compactSpy = stubCompact(apiKey => apiKey === "codex-dup-secret");
+
+			await session.runIdleCompaction();
+
+			expect(compactSpy.mock.calls.map(call => call[2])).toEqual(["codex-dup-secret", "codex-key-3"]);
+			expect(new Set(markUsageLimitReached.mock.calls.map(call => call[2]?.rowId))).toEqual(
+				new Set(duplicateRowIds),
+			);
+			expect(duplicateRowIds).toHaveLength(2);
+			expect(duplicateRowIds.every(rowId => !authStorage.isCredentialAvailable("openai-codex", rowId))).toBe(true);
+			expect(authStorage.isCredentialAvailable("openai-codex", uniqueRowId)).toBe(true);
+			expect(ends).toHaveLength(1);
+			expect(ends[0]?.errorMessage).toBeUndefined();
+		} finally {
+			if (previousA === undefined) delete process.env.GJC_TEST_COMPACTION_DUP_KEY_A;
+			else process.env.GJC_TEST_COMPACTION_DUP_KEY_A = previousA;
+			if (previousB === undefined) delete process.env.GJC_TEST_COMPACTION_DUP_KEY_B;
+			else process.env.GJC_TEST_COMPACTION_DUP_KEY_B = previousB;
 		}
 	});
 
