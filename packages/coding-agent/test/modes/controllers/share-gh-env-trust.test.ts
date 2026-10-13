@@ -277,6 +277,7 @@ function expectDestination(
 describe.skipIf(process.platform === "win32")("share gh destination trust", () => {
 	it("omits a project dotenv host and config directory from both gh spawns", async () => {
 		const spawns = await share({
+			autoload: true,
 			dotenv: "export GH_HOST=attacker-egress.example # note\nGH_CONFIG_DIR=attacker-config\n",
 			env: {
 				GH_TOKEN: "operator-token",

@@ -32,7 +32,7 @@ describe("session HTML export embed", () => {
 			session = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
 			session.appendMessage({
 				role: "user",
-				content: `${ORDINARY_SENTENCE} ${API_KEY} ${GITHUB_TOKEN}`,
+				content: `${ORDINARY_SENTENCE} ${API_KEY} ${GITHUB_TOKEN} private_token=abc123 AWS_SECRET_ACCESS_KEY=x`,
 				timestamp: 1,
 			});
 			const outputPath = path.join(tempDir, "export.html");
@@ -47,6 +47,8 @@ describe("session HTML export embed", () => {
 			expect(html).not.toContain(GITHUB_TOKEN);
 			expect(embedded).not.toContain(API_KEY);
 			expect(embedded).not.toContain(GITHUB_TOKEN);
+			expect(embedded).not.toContain("private_token=abc123");
+			expect(embedded).not.toContain("AWS_SECRET_ACCESS_KEY=x");
 			expect(embedded).toContain("«redacted-api-key»");
 			expect(embedded).toContain("«redacted-github-token»");
 			expect(embedded).toContain(ORDINARY_SENTENCE);
@@ -129,6 +131,8 @@ describe("session HTML export embed", () => {
 								secret: "opaque-secret-value",
 								credential: "opaque-credential-value",
 								private_key: "opaque-private-key-value",
+								private_token: "opaque-private-token-value",
+								aws_secret_access_key: "opaque-aws-secret-key-value",
 								cookie: "opaque-cookie-value",
 							},
 							tokensBefore: 12,
@@ -153,6 +157,8 @@ describe("session HTML export embed", () => {
 				"opaque-secret-value",
 				"opaque-credential-value",
 				"opaque-private-key-value",
+				"opaque-private-token-value",
+				"opaque-aws-secret-key-value",
 				"opaque-cookie-value",
 			]) {
 				expect(embedded).not.toContain(secret);
@@ -162,6 +168,8 @@ describe("session HTML export embed", () => {
 				secret: "«redacted»",
 				credential: "«redacted»",
 				private_key: "«redacted»",
+				private_token: "«redacted»",
+				aws_secret_access_key: "«redacted»",
 				cookie: "«redacted»",
 			});
 			expect(args?.tokensBefore).toBe(12);

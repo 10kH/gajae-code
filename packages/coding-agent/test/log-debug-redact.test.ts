@@ -12,7 +12,7 @@ import { generateSessionTitle } from "../src/utils/title-generator";
 
 const TITLE_SECRET = "sk-TESTFAKE-TITLE-0123456789abcdef";
 const CLONE_SECRET = "ghp_TESTFAKE-MKT-0123456789abcdef";
-const CLONE_URL = `https://user:${CLONE_SECRET}@git.invalid/repo.git`;
+const CLONE_URL = `https://user:${CLONE_SECRET}@git.invalid/repo.git?private_token=abc123`;
 const PLAIN_CLONE_URL = "https://git.invalid/plain-repo.git";
 
 function getModelOrThrow(id: string): Model<Api> {
@@ -123,7 +123,7 @@ describe("debug log credential scrub", () => {
 		const model = getModelOrThrow("claude-sonnet-4-5");
 		const completeSimple = vi.spyOn(ai, "completeSimple").mockResolvedValue(titleResponse());
 		const debug = vi.spyOn(logger, "debug");
-		const labeled = "token=abc123 password=123456 cookie=Q";
+		const labeled = "token=abc123 password=123456 cookie=Q private_token=xyz AWS_SECRET_ACCESS_KEY=x";
 
 		await generateSessionTitle(labeled, createRegistry(model), createSettings(model));
 
@@ -144,8 +144,10 @@ describe("debug log credential scrub", () => {
 			const logged = loggedText(debug.mock.calls);
 			expect(logged).toContain("[marketplace] cloning");
 			expect(logged).toContain("«redacted-url-credential»");
+			expect(logged).toContain("«redacted»");
 			expect(logged).toContain("git.invalid");
 			expect(logged).not.toContain(CLONE_SECRET);
+			expect(logged).not.toContain("private_token=abc123");
 			expect(logged).not.toContain("user:");
 			expect(clone.mock.calls[0]?.[0]).toBe(CLONE_URL);
 		} finally {

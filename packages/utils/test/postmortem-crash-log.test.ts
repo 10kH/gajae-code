@@ -201,6 +201,8 @@ describe("recordFatalCrash", () => {
 			"secret=x",
 			"credential=123456",
 			"private_key=q",
+			"private_token=abc123",
+			"AWS_SECRET_ACCESS_KEY=x",
 			"cookie=z",
 			"password=123456",
 		].join(" ");
