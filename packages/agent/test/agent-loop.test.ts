@@ -1452,6 +1452,48 @@ describe("agentLoop with AgentMessage", () => {
 		}
 	});
 
+	it("cancels accepted output when a synthetic recovery is still pending", async () => {
+		const abortController = new AbortController();
+		const recoveryMessage = { ...createUserMessage("required recovery"), synthetic: true };
+		const mock = createMockModel({ responses: [{ content: ["blocked"] }] });
+		const events: AgentEvent[] = [];
+		let recoveryPolls = 0;
+		let modelCalls = 0;
+		const stream = agentLoop(
+			[createUserMessage("start")],
+			{ systemPrompt: [""], messages: [], tools: [] },
+			{
+				model: mock.model,
+				convertToLlm: identityConverter,
+				getSyntheticRecoveryMessage: async () => {
+					recoveryPolls++;
+					return recoveryMessage;
+				},
+			},
+			abortController.signal,
+			(model, context, options) => {
+				modelCalls++;
+				return mock.stream(model, context, options);
+			},
+		);
+		const completion = (async () => {
+			for await (const event of stream) {
+				events.push(event);
+				if (event.type === "message_end" && event.message.role === "assistant") abortController.abort();
+			}
+			return stream.result();
+		})();
+		await completion;
+
+		const agentEnds = events.filter(
+			(event): event is Extract<AgentEvent, { type: "agent_end" }> => event.type === "agent_end",
+		);
+		expect(recoveryPolls).toBe(1);
+		expect(modelCalls).toBe(1);
+		expect(agentEnds).toHaveLength(1);
+		expect(agentEnds[0]?.stopReason).toBe("cancelled");
+	});
+
 	it("commits a follow-up dequeued before cancellation instead of losing it", async () => {
 		const abortController = new AbortController();
 		const followUpConsumptionStarted = Promise.withResolvers<void>();

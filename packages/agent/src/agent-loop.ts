@@ -3812,6 +3812,9 @@ async function runLoopBody(
 ): Promise<void> {
 	let firstTurn = true;
 	let lastAttemptScope: AttemptScope | undefined;
+	// A subscriber may abort reentrantly from the final assistant message_end;
+	// do not relabel that already-accepted answer as cancelled.
+	let lastAttemptAcceptedFinalAssistantMessage = false;
 	// Check for steering messages at start (user may have typed while waiting)
 	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
 	let harmonyRetryAttempt = 0;
@@ -3866,15 +3869,6 @@ async function runLoopBody(
 		);
 		stream.end(newMessages);
 	};
-	const finishCompleted = (scope?: AttemptScope): void => {
-		publishAgentEnd(
-			stream,
-			config,
-			buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "completed", scope),
-			scope,
-		);
-		stream.end(newMessages);
-	};
 	const commitMessages = (messages: AgentMessage[], scope?: AttemptScope): void => {
 		for (const message of messages) {
 			stream.push({ type: "message_start", message, scope });
@@ -3887,29 +3881,10 @@ async function runLoopBody(
 	// Outer loop: continues when queued follow-up messages arrive after agent would stop
 	while (true) {
 		let hasMoreToolCalls = true;
-		let acceptedResponseWithoutToolCalls = false;
-		const finishAbortedOuterRun = async (scope?: AttemptScope): Promise<void> => {
-			if (!acceptedResponseWithoutToolCalls || pendingMessages.length > 0) {
-				finishCancelled(scope);
-				return;
-			}
-			try {
-				// A no-tool assistant response is not terminal when a provider-side
-				// synthetic recovery turn is still pending.
-				if (await config.getSyntheticRecoveryMessage?.()) {
-					finishCancelled(scope);
-					return;
-				}
-			} catch {
-				finishCancelled(scope);
-				return;
-			}
-			finishCompleted(scope);
-		};
 
 		// Inner loop: process tool calls and steering messages
 		while (hasMoreToolCalls || pendingMessages.length > 0) {
-			acceptedResponseWithoutToolCalls = false;
+			lastAttemptAcceptedFinalAssistantMessage = false;
 			const scope =
 				initialScope ?? (firstTurn ? config.initialScope : undefined) ?? config.attemptMinter?.mint("main");
 			initialScope = undefined;
@@ -4472,7 +4447,7 @@ async function runLoopBody(
 				(c): c is ToolCallContent => c.type === "toolCall" && !isProviderResolvedToolCall(c),
 			);
 			hasMoreToolCalls = toolCalls.length > 0;
-			acceptedResponseWithoutToolCalls = !hasMoreToolCalls;
+			lastAttemptAcceptedFinalAssistantMessage = !hasMoreToolCalls;
 
 			const toolResults: ToolResultMessage[] = [];
 			let repeatedMalformedToolCall = false;
@@ -4624,16 +4599,18 @@ async function runLoopBody(
 		}
 
 		// Agent would stop here. Check for follow-up messages.
-		if (loopSignal.aborted) {
-			await finishAbortedOuterRun(lastAttemptScope);
+		if (loopSignal.aborted && !lastAttemptAcceptedFinalAssistantMessage) {
+			finishCancelled(lastAttemptScope);
 			return;
 		}
-		await config.onBeforeYield?.();
-		if (loopSignal.aborted) {
-			await finishAbortedOuterRun(lastAttemptScope);
+		if (!loopSignal.aborted) {
+			await config.onBeforeYield?.();
+		}
+		if (loopSignal.aborted && !lastAttemptAcceptedFinalAssistantMessage) {
+			finishCancelled(lastAttemptScope);
 			return;
 		}
-		if (config.shouldPause?.()) {
+		if (!loopSignal.aborted && config.shouldPause?.()) {
 			publishAgentEnd(
 				stream,
 				config,
@@ -4645,15 +4622,19 @@ async function runLoopBody(
 		}
 		// Poll the consume-on-read recovery candidate before follow-ups so a real
 		// user message can supersede it without letting the stale recovery resurface
-		// after that follow-up turn.
+		// after that follow-up turn. An abort from an accepted final message_end must
+		// also see a pending recovery before the run can report successful completion.
 		const syntheticRecoveryMessage = await config.getSyntheticRecoveryMessage?.();
 		if (loopSignal.aborted) {
+			if (lastAttemptAcceptedFinalAssistantMessage && !syntheticRecoveryMessage) break;
 			finishCancelled(lastAttemptScope);
 			return;
 		}
 		const followUpMessages = (await config.getFollowUpMessages?.()) || [];
 		if (loopSignal.aborted) {
 			commitMessages(followUpMessages, lastAttemptScope);
+			if (lastAttemptAcceptedFinalAssistantMessage && followUpMessages.length === 0 && !syntheticRecoveryMessage)
+				break;
 			finishCancelled(lastAttemptScope);
 			return;
 		}

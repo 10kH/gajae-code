@@ -93,6 +93,7 @@ describe("native publish outcome classification", () => {
 			["destination_exists", "already_exists"],
 			["cross_device", "cross_device"],
 			["permission_denied", "permission_denied"],
+			["access_denied", "access_denied"],
 			["io_failure", "io_error"],
 			["interrupted", "interrupted"],
 		] as const) {
@@ -139,6 +140,7 @@ describe("native publish outcome classification", () => {
 			["destination_exists", "already_exists"],
 			["cross_device", "cross_device"],
 			["permission_denied", "permission_denied"],
+			["access_denied", "access_denied"],
 			["io_failure", "io_error"],
 			// A signal landing on the no-replace rename syscall before it enters the
 			// kernel never mutates the filesystem, so a pre-mutation "interrupted"
@@ -180,6 +182,14 @@ describe("native publish outcome classification", () => {
 				...preMutation,
 				reason: "cross_device",
 				code: "cross_device",
+				phase: "preflight",
+			}).reason,
+		).toBe("unknown");
+		expect(
+			classifyNativePublishOutcome({
+				...preMutation,
+				reason: "access_denied",
+				code: "access_denied",
 				phase: "preflight",
 			}).reason,
 		).toBe("unknown");
