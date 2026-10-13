@@ -117,18 +117,23 @@ describe("auto-compaction usage limit rotates the session credential", () => {
 		expect(ends[0]?.result).toBeDefined();
 	});
 
-	it("rotates despite an unrelated stored credential resolver rejecting during alias discovery", async () => {
+	it("continues past an unrelated stored credential resolver rejection during rotation", async () => {
 		authStorage.close();
 		let siblingResolverCalls = 0;
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"), {
 			configValueResolver: async config => {
 				if (config === "codex-key-2") {
 					siblingResolverCalls++;
-					if (siblingResolverCalls === 1) throw new Error("transient sibling resolver failure");
+					throw new Error("sibling resolver failure");
 				}
 				return config;
 			},
 		});
+		await authStorage.set("openai-codex", [
+			{ type: "api_key", key: "codex-key-1" },
+			{ type: "api_key", key: "codex-key-2" },
+			{ type: "api_key", key: "codex-key-3" },
+		]);
 		const credentials = authStorage
 			.exportSnapshot()
 			.credentials.filter(entry => entry.provider === "openai-codex" && entry.credential.type === "api_key");
@@ -139,10 +144,7 @@ describe("auto-compaction usage limit rotates the session credential", () => {
 			entry => entry.credential.type === "api_key" && entry.credential.key === "codex-key-2",
 		);
 		if (!dispatchedRow || !siblingRow) throw new Error("test setup did not create the expected credentials");
-		const credentialSessionId = "compaction-resolver-isolation-session";
-		await authStorage.getApiKey("openai-codex", credentialSessionId, {
-			credentialSelector: { kind: "id", value: String(dispatchedRow.id) },
-		});
+		const credentialSessionId = "compaction-resolver-isolation-0";
 		session = createSession(credentialSessionId);
 		const ends = collectCompactionEnds(session);
 		const compactSpy = stubCompact((apiKey, firstKey) => apiKey === firstKey);
@@ -151,12 +153,18 @@ describe("auto-compaction usage limit rotates the session credential", () => {
 
 		await session.runIdleCompaction();
 
-		expect(siblingResolverCalls).toBeGreaterThan(1);
-		expect(compactSpy.mock.calls).toHaveLength(2);
-		expect(compactSpy.mock.calls[1]?.[2]).toBe("codex-key-2");
+		expect(siblingResolverCalls).toBe(2);
+		expect(compactSpy.mock.calls[0]?.[2]).toBe("codex-key-1");
 		expect(markUsageLimitReached).toHaveBeenCalledTimes(1);
 		expect(markUsageLimitReached.mock.calls[0]?.[2]?.rowId).toBe(dispatchedRow.id);
 		expect(warning).toHaveBeenCalledWith("Failed to resolve stored API key while matching credential rows", {
+			provider: "openai-codex",
+			credentialId: siblingRow.id,
+			errorType: "Error",
+		});
+		expect(compactSpy.mock.calls).toHaveLength(2);
+		expect(compactSpy.mock.calls[1]?.[2]).toBe("codex-key-3");
+		expect(warning).toHaveBeenCalledWith("Failed to resolve stored credential while selecting an alternate", {
 			provider: "openai-codex",
 			credentialId: siblingRow.id,
 			errorType: "Error",

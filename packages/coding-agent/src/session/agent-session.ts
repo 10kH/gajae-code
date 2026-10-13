@@ -23316,6 +23316,7 @@ export class AgentSession {
 			await this.#markFailedCredential({
 				class: "quota",
 				retryAfterMs,
+				continueOnPeerResolutionFailure: true,
 				model: candidate,
 				credentialRowId: failedRowId,
 			});
@@ -25620,6 +25621,7 @@ export class AgentSession {
 		retryAfterMs?: number;
 		authDisposition?: AuthDisposition;
 		trackSameTurnRows?: boolean;
+		continueOnPeerResolutionFailure?: boolean;
 		model?: Model;
 		credentialRowId?: number;
 	}): Promise<"rotated" | "alternate" | "exhausted" | "unchanged"> {
@@ -25694,7 +25696,13 @@ export class AgentSession {
 						credentialSelector: { kind: "id", value: String(peerId) },
 					});
 				} catch (error) {
-					if (authStorage.isCredentialAvailable(provider, peerId)) throw error;
+					if (!authStorage.isCredentialAvailable(provider, peerId)) continue;
+					if (!trigger.continueOnPeerResolutionFailure) throw error;
+					logger.warn("Failed to resolve stored credential while selecting an alternate", {
+						provider,
+						credentialId: peerId,
+						errorType: error instanceof Error ? error.name : typeof error,
+					});
 					continue;
 				}
 				if (!isAuthenticated(peerApiKey)) continue;
