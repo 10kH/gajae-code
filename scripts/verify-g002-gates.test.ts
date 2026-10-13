@@ -74,6 +74,21 @@ describe("MCP command quarantine", () => {
 		);
 	});
 
+	test("rejects side effects in the exact-capability fallback object", () => {
+		for (const fallback of [
+			"return { ...runMcp(), prompt: command.text };",
+			"return { prompt: command.text, extra: runMcp() };",
+			"return { prompt: command.text, prompt: runMcp() };",
+		]) {
+			const exposed = registryWithEntries([
+				exactMcpTuiEntry.replace("return { prompt: command.text };", fallback),
+			]);
+			expect(findMcpBuiltinQuarantineFindings(exposed)).toContain(
+				"root /mcp TUI handler must fall through without exact MCP controls",
+			);
+		}
+	});
+
 	test("rejects a default handler even when a TUI guard is also present", () => {
 		const exposed = registryWithEntries([
 			exactMcpTuiEntry.replace(

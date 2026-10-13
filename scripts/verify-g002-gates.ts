@@ -473,11 +473,12 @@ function isExactMcpFallback(statement: Babel.Statement): boolean {
 	}
 	const fallback = statement.consequent;
 	if (fallback.type !== "ReturnStatement" || !fallback.argument || fallback.argument.type !== "ObjectExpression") return false;
-	const prompt = fallback.argument.properties.find(
-		property => getStaticMcpMemberName(property) === "prompt",
-	);
+	if (fallback.argument.properties.length !== 1) return false;
+	const prompt = fallback.argument.properties[0];
 	return (
 		prompt?.type === "ObjectProperty" &&
+		!prompt.computed &&
+		getStaticMcpMemberName(prompt) === "prompt" &&
 		prompt.value.type === "MemberExpression" &&
 		!prompt.value.computed &&
 		prompt.value.object.type === "Identifier" &&
