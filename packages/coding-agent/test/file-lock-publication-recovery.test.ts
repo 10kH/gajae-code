@@ -709,6 +709,53 @@ test("stops retrying when failed publication staging cannot be cleaned", async (
 	expect(publicationAttempts).toBe(3); // 1 initial + 2 bounded retries
 	expect(cleanupAttempts).toBe(5);
 	expect((await fs.readdir(root)).filter(name => name.includes(".pending."))).toHaveLength(1);
+	FileLockTestHooks.nativePublicationBindings = () => ({
+		renameNoReplacePathAsync: async (source, destination) => {
+			publicationAttempts++;
+			await fs.rename(source, destination);
+			return successfulPublication(primaryPrimitive ?? "windows_rename_noreplace");
+		},
+		renameDirectoryNoReplacePathAsync,
+	});
+	FileLockTestHooks.cleanupPendingStaging = async stagingPath => {
+		cleanupAttempts++;
+		await fs.rm(stagingPath, { recursive: true, force: true });
+	};
+	const release = await acquireFileLock(file, { retries: 1, retryDelayMs: 1 });
+	expect(cleanupAttempts).toBe(6);
+	expect(publicationAttempts).toBe(4);
+	expect((await fs.readdir(root)).filter(name => name.includes(".pending."))).toHaveLength(0);
+	await release();
+	await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
+	expect(await fs.readdir(root)).toEqual([]);
+});
+
+test("aborts a transient publication retry before another publish attempt", async () => {
+	const { root, file } = await makeFixture();
+	const firstAttempt = Promise.withResolvers<void>();
+	const controller = new AbortController();
+	const reason = new Error("cancelled during publication retry");
+	let publicationAttempts = 0;
+	FileLockTestHooks.nativePublicationBindings = () => ({
+		renameNoReplacePathAsync: async (source, destination) => {
+			publicationAttempts++;
+			if (publicationAttempts === 1) {
+				firstAttempt.resolve();
+				return accessDeniedPublication();
+			}
+			await fs.rename(source, destination);
+			return successfulPublication(primaryPrimitive ?? "windows_rename_noreplace");
+		},
+		renameDirectoryNoReplacePathAsync,
+	});
+
+	const acquisition = acquireFileLock(file, { retries: 5, retryDelayMs: 1, signal: controller.signal });
+	await firstAttempt.promise;
+	await Bun.sleep(1);
+	controller.abort(reason);
+	await expect(acquisition).rejects.toBe(reason);
+	expect(publicationAttempts).toBe(1);
+	expect(await fs.readdir(root)).toEqual([]);
 });
 
 test("retains staging cleanup ownership after abort and blocks acquisition until cleanup succeeds", async () => {

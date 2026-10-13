@@ -245,6 +245,16 @@ async function removePendingStaging(stagingPath: string, identity: FileLockStagi
 	else await fs.rm(stagingPath, { recursive: true, force: true });
 }
 
+function retainPendingStagingCleanup(
+	lockPath: string,
+	stagingPath: string,
+	identity: FileLockStagingRootIdentity,
+	error: unknown,
+): void {
+	pendingStagingCleanups.set(stagingPath, { lockPath, ...identity });
+	logger.debug("Retained file-lock staging cleanup", { stagingPath, error: String(error) });
+}
+
 async function abortStagingCleanup(
 	lockPath: string,
 	stagingPath: string,
@@ -258,11 +268,7 @@ async function abortStagingCleanup(
 		// The stage is still owned by this acquisition. Preserve an in-process retry
 		// until another acquisition can clean it; after process exit the orphan reaper
 		// can safely reclaim it once this publisher is no longer live.
-		pendingStagingCleanups.set(stagingPath, { lockPath, ...identity });
-		logger.debug("Retained file-lock staging cleanup after acquisition abort", {
-			stagingPath,
-			error: String(error),
-		});
+		retainPendingStagingCleanup(lockPath, stagingPath, identity, error);
 	}
 	throw signal.reason ?? new Error("File lock acquisition aborted");
 }
@@ -293,8 +299,10 @@ async function cleanupPendingStagingOrThrow(
 		} catch (error) {
 			if (retryBudget.signal?.aborted)
 				await abortStagingCleanup(lockPath, stagingPath, identity, retryBudget.signal);
-			if (!isTransientReleaseError(error) || retryBudget.remainingDelays === 0)
+			if (!isTransientReleaseError(error) || retryBudget.remainingDelays === 0) {
+				retainPendingStagingCleanup(lockPath, stagingPath, identity, error);
 				throw new FileLockStagingCleanupError(lockPath, stagingPath, error);
+			}
 			// An open child can deny both publication and removal on Windows. Keep the
 			// same staging identity and share the outer acquisition delay budget.
 			retryBudget.remainingDelays--;
@@ -1549,14 +1557,17 @@ async function publishNoReplaceWithTransientRetry(
 	publish: (sourcePath: string, destinationPath: string) => Promise<NativeNoReplaceResult>,
 	sourcePath: string,
 	destinationPath: string,
+	signal?: AbortSignal,
 ): Promise<NativeNoReplaceResult> {
+	throwIfFileLockAcquisitionAborted(signal);
 	let result = await publish(sourcePath, destinationPath);
 	for (
 		let attempt = 1;
 		attempt < PUBLICATION_TRANSIENT_RETRY_ATTEMPTS && isPreMutationPublicationRetryable(result);
 		attempt++
 	) {
-		await Bun.sleep(PUBLICATION_TRANSIENT_RETRY_DELAY_MS * attempt);
+		await sleepFileLockRetry(PUBLICATION_TRANSIENT_RETRY_DELAY_MS * attempt, signal);
+		throwIfFileLockAcquisitionAborted(signal);
 		result = await publish(sourcePath, destinationPath);
 	}
 	return result;
@@ -2328,6 +2339,7 @@ async function tryAcquireLock(
 			publication.renameNoReplacePathAsync,
 			canonicalPendingPath,
 			destinationPath,
+			retryBudget.signal,
 		);
 		let publishedSuccessfully = isSuccessfulNativePublication(published, "primary");
 		if (published.ok && !publishedSuccessfully)
@@ -2337,6 +2349,7 @@ async function tryAcquireLock(
 				publication.renameDirectoryNoReplacePathAsync,
 				canonicalPendingPath,
 				destinationPath,
+				retryBudget.signal,
 			);
 			const fallbackSuccessfully = isSuccessfulNativePublication(fallback, "directory");
 			if (fallback.ok && !fallbackSuccessfully)
@@ -2430,9 +2443,21 @@ async function tryAcquireLock(
 		// propagate instead of retrying an acquisition that already owns the lock.
 		onAcquired?.();
 		return owner;
+	} catch (error) {
+		if (retryBudget.signal?.aborted && removePending && pendingStagingIdentity) {
+			removePending = false;
+			await abortStagingCleanup(lockPath, pendingPath, pendingStagingIdentity, retryBudget.signal);
+		}
+		throw error;
 	} finally {
-		if (removePending && pendingStagingIdentity)
-			await removePendingStaging(pendingPath, pendingStagingIdentity).catch(() => undefined);
+		if (removePending && pendingStagingIdentity) {
+			try {
+				await removePendingStaging(pendingPath, pendingStagingIdentity);
+				pendingStagingCleanups.delete(pendingPath);
+			} catch (cleanupError) {
+				retainPendingStagingCleanup(lockPath, pendingPath, pendingStagingIdentity, cleanupError);
+			}
+		}
 	}
 }
 
