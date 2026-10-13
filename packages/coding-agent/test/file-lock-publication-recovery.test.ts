@@ -427,6 +427,8 @@ test("preserves access-denied publication failures instead of masking ACL errors
 test("keeps the staging component within filesystem limits for long target names", async () => {
 	const { root } = await makeFixture();
 	const file = path.join(root, "x".repeat(196));
+	const lock = `${file}.lock`;
+	const transitionPath = `${lock}.removing`;
 	const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
 	if (!originalPlatform?.configurable) throw new Error("process_platform_not_configurable");
 	let stagingComponentLength = 0;
@@ -440,7 +442,11 @@ test("keeps the staging component within filesystem limits for long target names
 	});
 	FileLockTestHooks.nativeQuarantineBindings = () => ({
 		snapshotDirectoryTree,
-		exactRemoveDirectoryTree: target => {
+		exactRemoveDirectoryTree: (target, _snapshot, _parentIdentity, detachOnly) => {
+			if (target === lock && detachOnly) {
+				syncFs.renameSync(target, transitionPath);
+				return { ok: true, detachedPath: transitionPath };
+			}
 			syncFs.rmSync(target, { recursive: true, force: true });
 			return { ok: true };
 		},

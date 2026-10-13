@@ -259,6 +259,9 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/sdk-session-index-lock-contention.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/file-lock-empty-dir.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/file-lock-signed-identity.test.ts");
+		expect(windowsJob).toContain(
+			"cargo test -p pi-natives generic_removal_does_not_reserve_the_lock_retirement_name",
+		);
 		expect(windowsJob).toContain("crates/pi-natives/src/path_identity.rs");
 		expect(windowsJob).toContain("bun test ./packages/natives/test/path-identity-windows.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/session-state-lock.test.ts");

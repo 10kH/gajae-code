@@ -19,6 +19,7 @@ afterEach(async () => {
 	FileLockTestHooks.nativeQuarantineBindings = undefined;
 	FileLockTestHooks.beforeRemovalRecordUnlink = undefined;
 	FileLockTestHooks.beforeRemovalOwnerPublish = undefined;
+	FileLockTestHooks.afterForeignTransitionMissing = undefined;
 	for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
 });
 
@@ -468,6 +469,37 @@ test.skipIf(process.platform === "win32")(
 		expect(await fs.exists(lock)).toBe(true);
 	},
 );
+
+test("does not clear a foreign receipt when its root is detached between namespace checks", async () => {
+	const { file, lock, transition } = await fixture();
+	await fs.mkdir(lock);
+	const canonicalInfo = JSON.stringify({ ...deadOwner, owner_host_id: "foreign-host" });
+	await Bun.write(path.join(lock, "info"), canonicalInfo);
+	const canonical = await fs.lstat(lock, { bigint: true });
+	const recordBytes = JSON.stringify({
+		owner: { ...deadOwner, owner_host_id: "foreign-host" },
+		rootDev: canonical.dev.toString(),
+		rootIno: canonical.ino.toString(),
+	});
+	await Bun.write(`${transition}.owner`, recordBytes);
+
+	let detached = false;
+	FileLockTestHooks.afterForeignTransitionMissing = async checkedPath => {
+		if (checkedPath !== transition || detached) return;
+		detached = true;
+		await fs.rename(lock, transition);
+	};
+	const callback = vi.fn(async () => undefined);
+	await expect(
+		withFileLock(file, callback, { ownerHostId: "local-host", retries: 2, retryDelayMs: 1 }),
+	).rejects.toMatchObject({ code: "acquire_timeout" });
+
+	expect(detached).toBe(true);
+	expect(callback).not.toHaveBeenCalled();
+	expect(await Bun.file(`${transition}.owner`).text()).toBe(recordBytes);
+	expect(await Bun.file(path.join(transition, "info")).text()).toBe(canonicalInfo);
+	expect(await fs.exists(lock)).toBe(false);
+});
 
 test("the same release handle retries a refused detach and a refused local receipt unlink", async () => {
 	const { file, lock, transition } = await fixture();

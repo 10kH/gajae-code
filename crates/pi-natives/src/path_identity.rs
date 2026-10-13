@@ -2089,10 +2089,11 @@ pub fn snapshot_empty_directory(path: String) -> NativeDirectoryTreeResult {
 
 /// Remove a directory tree only when a fresh descriptor-relative snapshot
 #[cfg_attr(clippy, doc = "")]
-/// exactly equals the persisted snapshot. The Windows and POSIX paths first
-/// no-replace detach the verified root to its deterministic `.removing`
-/// sibling; the retained descriptor remains authoritative throughout payload
-/// scrubbing and replay.
+/// exactly equals the persisted snapshot. POSIX removal no-replace detaches the
+/// verified root to its deterministic `.removing` sibling before scrubbing. On
+/// Windows, callers that need retirement semantics must request a detach-only
+/// pass, then replay exact removal at the returned sibling; ordinary Windows
+/// removal never vacates the caller's path before scrubbing completes.
 #[napi]
 pub fn exact_remove_directory_tree(
 	path: String,
@@ -13513,7 +13514,7 @@ mod platform {
 			let snapshot = snapshot_directory_tree(&canonical)
 				.snapshot
 				.expect("snapshot canonical lock");
-			let result = exact_remove_directory_tree_with_mode(&canonical, &snapshot, None, false);
+			let result = exact_remove_directory_tree_with_mode(&canonical, &snapshot, None, true);
 			assert!(!result.ok);
 			assert_eq!(result.code.as_deref(), Some("quarantine_collision"));
 			assert_eq!(
@@ -13523,6 +13524,30 @@ mod platform {
 			assert_eq!(
 				std::fs::read(retired.join("info")).expect("predecessor owner remains"),
 				b"predecessor-owner"
+			);
+		}
+
+		#[test]
+		fn generic_removal_does_not_reserve_the_lock_retirement_name() {
+			let root = TempDir::new();
+			let canonical = root.0.join("plugin");
+			let retired = root.0.join("plugin.removing");
+			std::fs::create_dir(&canonical).expect("create generic tree");
+			std::fs::write(canonical.join("payload"), b"generic payload")
+				.expect("write generic payload");
+			std::fs::create_dir(&retired).expect("create occupied retirement path");
+			std::fs::write(retired.join("payload"), b"unrelated retirement")
+				.expect("write unrelated payload");
+
+			let snapshot = snapshot_directory_tree(&canonical)
+				.snapshot
+				.expect("snapshot generic tree");
+			let result = exact_remove_directory_tree_with_mode(&canonical, &snapshot, None, false);
+			assert!(result.ok);
+			assert!(!canonical.exists());
+			assert_eq!(
+				std::fs::read(retired.join("payload")).expect("unrelated payload remains"),
+				b"unrelated retirement"
 			);
 		}
 	}
@@ -14193,16 +14218,14 @@ mod platform {
 				&identity,
 			);
 		}
+		// Keep generic Windows removal at its caller-visible name if payload
+		// scrubbing fails. File-lock retirement requests detach_only first and
+		// replays this exact removal at `.removing` after the canonical name is
+		// safely vacant.
 		let retained_path = if already_final {
 			retained_path
 		} else {
-			// Reserve the retirement name before deleting owner metadata. A
-			// predecessor may still occupy `.removing`; collision must leave this
-			// generation's canonical `info` intact so release can safely retry.
-			if let Err(code) = rename_handle(root.target, parent, &final_name, false) {
-				return NativeExactUnlinkResult::failure(code);
-			}
-			final_path
+			planned_path
 		};
 		match tree_entry(root.target, String::new(), "directory") {
 			Ok(entry) if entry.dev == expected.root_dev && entry.ino == expected.root_ino => {},

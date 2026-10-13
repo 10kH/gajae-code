@@ -134,6 +134,7 @@ type LockInfo = FileLockOwnerToken;
 export const FileLockTestHooks: {
 	afterParentMkdir?: (lockPath: string) => void | Promise<void>;
 	beforeDetachedLockCleanup?: (detachedPath: string) => boolean | Promise<boolean>;
+	afterForeignTransitionMissing?: (transitionPath: string) => void | Promise<void>;
 	beforeRemovalRecordUnlink?: (recordPath: string) => boolean | Promise<boolean>;
 	beforeRemovalOwnerPublish?: (transitionPath: string) => void | Promise<void>;
 	nativePublicationBindings?: () => {
@@ -872,6 +873,7 @@ async function clearCompletedForeignRemovalRecord(
 	} catch (error) {
 		if (!isEnoent(error)) throw error;
 	}
+	await FileLockTestHooks.afterForeignTransitionMissing?.(transitionPath);
 	try {
 		const canonical = await fs.lstat(lockPath, { bigint: true });
 		if (
@@ -879,6 +881,16 @@ async function clearCompletedForeignRemovalRecord(
 			canonicalLockFileId(canonical.ino).toString() === record.rootIno
 		)
 			return false;
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+	}
+	// The remover may have atomically moved the captured canonical root to
+	// `.removing` between the first transition check and the canonical lookup.
+	// Recheck after observing that the old root is no longer canonical so its
+	// live receipt is never cleared while the detached tree still exists.
+	try {
+		await fs.lstat(transitionPath);
+		return false;
 	} catch (error) {
 		if (!isEnoent(error)) throw error;
 	}
@@ -933,6 +945,12 @@ async function exactRemoveLockTree(
 			// Native removal can resume this generation when the canonical name is
 			// already detached. A different generation at `.removing` is left for
 			// acquisition-time adoption; never attach this owner record to it.
+			try {
+				await fs.lstat(lockPath);
+				return { ok: false, code: "quarantine_collision" };
+			} catch (error) {
+				if (!isEnoent(error)) throw error;
+			}
 			return nativeFileLockBindings().exactRemoveDirectoryTree(lockPath, snapshot, parentIdentity, detachOnly);
 		} catch (error) {
 			if (!isEnoent(error)) throw error;
@@ -960,7 +978,19 @@ async function exactRemoveLockTree(
 	if (!(await publishRemovalRecord(transitionPath, snapshot, ownerHostId)))
 		return { ok: false, code: "removal_record_busy" };
 	try {
-		return nativeFileLockBindings().exactRemoveDirectoryTree(lockPath, snapshot, parentIdentity, detachOnly);
+		const bindings = nativeFileLockBindings();
+		if (process.platform === "win32" && !detachOnly) {
+			const detached = bindings.exactRemoveDirectoryTree(lockPath, snapshot, parentIdentity, true);
+			if (!detached.ok) return detached;
+			if (
+				detached.code !== undefined ||
+				detached.detachedPath !== transitionPath ||
+				Object.keys(detached).some(key => key !== "ok" && key !== "detachedPath")
+			)
+				return { ok: false, code: "identity_mismatch", detachedPath: detached.detachedPath };
+			return bindings.exactRemoveDirectoryTree(transitionPath, snapshot, parentIdentity);
+		}
+		return bindings.exactRemoveDirectoryTree(lockPath, snapshot, parentIdentity, detachOnly);
 	} finally {
 		await clearRemovalRecord(transitionPath);
 	}

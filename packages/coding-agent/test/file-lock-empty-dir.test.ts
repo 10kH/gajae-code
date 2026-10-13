@@ -185,13 +185,18 @@ test("publishes a Windows retirement owner record before native detach", async (
 	const tempDir = await createTempDir();
 	const filePath = path.join(tempDir, "sdk", "sessions", "index.jsonl");
 	const lockDir = `${filePath}.lock`;
+	const transitionPath = `${lockDir}.removing`;
 	let ownerRecordPublishedBeforeDetach = false;
 	FileLockTestHooks.nativeExactRemovalProbe = () => true;
 	FileLockTestHooks.nativeQuarantineBindings = () => ({
 		snapshotDirectoryTree,
 		exactRemoveDirectoryTree: (target, snapshot, parentIdentity, detachOnly) => {
-			if (target === lockDir) {
+			if (target === lockDir && detachOnly) {
 				ownerRecordPublishedBeforeDetach = fsSync.existsSync(`${lockDir}.removing.owner`);
+				fsSync.renameSync(target, transitionPath);
+				return { ok: true, detachedPath: transitionPath };
+			}
+			if (target === transitionPath) {
 				fsSync.rmSync(target, { recursive: true, force: true });
 				return { ok: true };
 			}
@@ -324,6 +329,7 @@ test("retries a completed local retirement record before same-process reacquisit
 	const tempDir = await createTempDir();
 	const filePath = path.join(tempDir, "sdk", "sessions", "index.jsonl");
 	const lockDir = `${filePath}.lock`;
+	const transitionPath = `${lockDir}.removing`;
 	let refuseUnlink = true;
 	FileLockTestHooks.nativeExactRemovalProbe = () => true;
 	FileLockTestHooks.beforeRemovalRecordUnlink = () => {
@@ -334,7 +340,11 @@ test("retries a completed local retirement record before same-process reacquisit
 	FileLockTestHooks.nativeQuarantineBindings = () => ({
 		snapshotDirectoryTree,
 		exactRemoveDirectoryTree: (target, snapshot, parentIdentity, detachOnly) => {
-			if (target === lockDir) {
+			if (target === lockDir && detachOnly) {
+				fsSync.renameSync(target, transitionPath);
+				return { ok: true, detachedPath: transitionPath };
+			}
+			if (target === transitionPath) {
 				fsSync.rmSync(target, { recursive: true, force: true });
 				return { ok: true };
 			}
