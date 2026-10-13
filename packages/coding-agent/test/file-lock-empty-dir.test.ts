@@ -4,7 +4,12 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { FileLockTestHooks, withFileLock } from "@gajae-code/coding-agent/config/file-lock";
-import { exactRemoveDirectoryTree, snapshotDirectoryTree } from "@gajae-code/natives";
+import {
+	exactRemoveDirectoryTree,
+	renameDirectoryNoReplacePathAsync,
+	renameNoReplacePathAsync,
+	snapshotDirectoryTree,
+} from "@gajae-code/natives";
 
 const tempDirs: string[] = [];
 let originalPlatform: PropertyDescriptor | undefined;
@@ -17,7 +22,10 @@ beforeEach(() => {
 
 afterEach(async () => {
 	FileLockTestHooks.afterOwnerlessLockStaleVerdict = undefined;
+	FileLockTestHooks.beforeDetachedLockCleanup = undefined;
+	FileLockTestHooks.beforeRemovalRecordUnlink = undefined;
 	FileLockTestHooks.beforeRemovalOwnerPublish = undefined;
+	FileLockTestHooks.nativePublicationBindings = undefined;
 	FileLockTestHooks.nativeQuarantineBindings = undefined;
 	FileLockTestHooks.nativeExactRemovalProbe = undefined;
 	if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
@@ -205,6 +213,145 @@ test("clears a completed Windows retirement record before a successor", async ()
 	expect(acquisitionError).toBeNull();
 	expect(callbackEntered).toBe(true);
 	await expect(fs.lstat(`${transitionPath}.owner`)).rejects.toMatchObject({ code: "ENOENT" });
+});
+
+test("retries a completed local retirement record before same-process reacquisition", async () => {
+	const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "file-lock-empty-dir-"));
+	tempDirs.push(tempDir);
+	const filePath = path.join(tempDir, "sdk", "sessions", "index.jsonl");
+	const lockDir = `${filePath}.lock`;
+	let refuseUnlink = true;
+	FileLockTestHooks.nativeExactRemovalProbe = () => true;
+	FileLockTestHooks.beforeRemovalRecordUnlink = () => {
+		if (!refuseUnlink) return true;
+		refuseUnlink = false;
+		return false;
+	};
+	FileLockTestHooks.nativeQuarantineBindings = () => ({
+		snapshotDirectoryTree,
+		exactRemoveDirectoryTree: (target, snapshot, parentIdentity, detachOnly) => {
+			if (target === lockDir) {
+				fsSync.rmSync(target, { recursive: true, force: true });
+				return { ok: true };
+			}
+			return exactRemoveDirectoryTree(target, snapshot, parentIdentity, detachOnly);
+		},
+	});
+
+	await withFileLock(filePath, async () => undefined, {
+		retries: 2,
+		retryDelayMs: 1,
+		staleMs: 0,
+		ownerHostId: "previous-local-host",
+	});
+	await expect(fs.lstat(lockDir)).rejects.toMatchObject({ code: "ENOENT" });
+	await fs.lstat(`${lockDir}.removing.owner`);
+
+	let successorEntered = false;
+	await withFileLock(
+		filePath,
+		async () => {
+			successorEntered = true;
+		},
+		{ retries: 2, retryDelayMs: 1, staleMs: 0 },
+	);
+
+	expect(successorEntered).toBe(true);
+	await expect(fs.lstat(`${lockDir}.removing.owner`)).rejects.toMatchObject({ code: "ENOENT" });
+});
+
+test("resumes an ownerless detached cleanup after a transient cleanup refusal", async () => {
+	const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "file-lock-empty-dir-"));
+	tempDirs.push(tempDir);
+	const filePath = path.join(tempDir, "sdk", "sessions", "index.jsonl");
+	const lockDir = `${filePath}.lock`;
+	const transitionPath = `${lockDir}.removing`;
+	await fs.mkdir(lockDir, { recursive: true });
+	const pastTime = new Date(Date.now() - 60_000);
+	await fs.utimes(lockDir, pastTime, pastTime);
+	let refuseCleanup = true;
+	FileLockTestHooks.nativeExactRemovalProbe = () => true;
+	FileLockTestHooks.beforeDetachedLockCleanup = () => {
+		if (!refuseCleanup) return true;
+		refuseCleanup = false;
+		throw Object.assign(new Error("simulated sharing violation"), { code: "EPERM" });
+	};
+	FileLockTestHooks.nativeQuarantineBindings = () => ({
+		snapshotDirectoryTree,
+		exactRemoveDirectoryTree: (target, snapshot, parentIdentity, detachOnly) => {
+			if (target === lockDir) {
+				fsSync.renameSync(target, transitionPath);
+				return {
+					ok: false,
+					code: "cleanup_pending",
+					payloadDurable: true,
+					detachedPath: transitionPath,
+				};
+			}
+			if (target === transitionPath) {
+				fsSync.rmSync(target, { recursive: true, force: true });
+				return { ok: true };
+			}
+			return exactRemoveDirectoryTree(target, snapshot, parentIdentity, detachOnly);
+		},
+	});
+
+	let callbackEntered = false;
+	await withFileLock(
+		filePath,
+		async () => {
+			callbackEntered = true;
+		},
+		{ retries: 4, retryDelayMs: 1, staleMs: 0 },
+	);
+
+	expect(refuseCleanup).toBe(false);
+	expect(callbackEntered).toBe(true);
+	await expect(fs.lstat(transitionPath)).rejects.toMatchObject({ code: "ENOENT" });
+	await expect(fs.lstat(`${transitionPath}.owner`)).rejects.toMatchObject({ code: "ENOENT" });
+});
+
+test("rolls back a Windows publication when retirement appears before owner registration", async () => {
+	const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "file-lock-empty-dir-"));
+	tempDirs.push(tempDir);
+	const filePath = path.join(tempDir, "sdk", "sessions", "index.jsonl");
+	const lockDir = `${filePath}.lock`;
+	const transitionPath = `${lockDir}.removing`;
+	let transitionPublished = false;
+	FileLockTestHooks.nativePublicationBindings = () => ({
+		renameNoReplacePathAsync: async (source, destination) => {
+			const result = await renameNoReplacePathAsync(source, destination);
+			if (result.ok && !transitionPublished) {
+				transitionPublished = true;
+				await fs.mkdir(transitionPath);
+			}
+			return result;
+		},
+		renameDirectoryNoReplacePathAsync,
+	});
+
+	await expect(
+		withFileLock(filePath, async () => undefined, { retries: 1, retryDelayMs: 1, staleMs: 0 }),
+	).rejects.toMatchObject({ code: "acquire_timeout" });
+
+	expect(transitionPublished).toBe(true);
+	await expect(fs.lstat(lockDir)).rejects.toMatchObject({ code: "ENOENT" });
+	expect(await fs.readdir(path.dirname(lockDir))).toEqual([path.basename(transitionPath)]);
+});
+
+test("fails closed on an oversized Windows retirement owner sidecar", async () => {
+	const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "file-lock-empty-dir-"));
+	tempDirs.push(tempDir);
+	const filePath = path.join(tempDir, "sdk", "sessions", "index.jsonl");
+	const recordPath = `${filePath}.lock.removing.owner`;
+	await fs.mkdir(path.dirname(recordPath), { recursive: true });
+	await fs.writeFile(recordPath, "");
+	await fs.truncate(recordPath, 2 * 1024 * 1024);
+
+	await expect(
+		withFileLock(filePath, async () => undefined, { retries: 1, retryDelayMs: 1, staleMs: 0 }),
+	).rejects.toMatchObject({ code: "acquire_timeout" });
+	expect((await fs.stat(recordPath)).size).toBe(2 * 1024 * 1024);
 });
 
 test.skipIf(process.platform === "win32")("does not reclaim an aged ownerless lock directory on POSIX", async () => {

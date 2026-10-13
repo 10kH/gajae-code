@@ -130,12 +130,15 @@ type LocalLockState = {
  * created, so a nested contender cannot steal a lock from a still-running holder.
  */
 const localLockStates = new Map<string, LocalLockState>();
+const MAX_FILE_LOCK_REMOVAL_RECORD_BYTES = 64 * 1024;
 
 type LockInfo = FileLockOwnerToken;
 
 export const FileLockTestHooks: {
 	afterParentMkdir?: (lockPath: string) => void | Promise<void>;
 	afterOwnerlessLockStaleVerdict?: (lockPath: string) => void | Promise<void>;
+	beforeDetachedLockCleanup?: (detachedPath: string) => boolean | Promise<boolean>;
+	beforeRemovalRecordUnlink?: (recordPath: string) => boolean | Promise<boolean>;
 	beforeRemovalOwnerPublish?: (transitionPath: string) => void | Promise<void>;
 	nativePublicationBindings?: () => {
 		renameNoReplacePathAsync: typeof renameNoReplacePathAsync;
@@ -567,8 +570,22 @@ async function removeDetachedLockQuarantineOnDisk(
 	) {
 		return false;
 	}
+	if ((await FileLockTestHooks.beforeDetachedLockCleanup?.(detachedPath)) === false) return false;
 	await fs.rm(detachedPath, { recursive: true, force: true });
 	return true;
+}
+
+function markLocalRemovalResumable(transitionPath: string, rootDev: string, rootIno: string): void {
+	const recordPath = `${transitionPath}.owner`;
+	const local = localRemovalRecords.get(recordPath);
+	if (!local) return;
+	try {
+		const record = JSON.parse(local.bytes) as Partial<RemovalTransitionOwnerRecord>;
+		if (record.rootDev === rootDev && record.rootIno === rootIno)
+			localRemovalRecords.set(recordPath, { ...local, resumable: true });
+	} catch {
+		// A malformed local receipt cannot authorize resuming a detached tree.
+	}
 }
 
 async function finishDetachedLockCleanup(owner: FileLockOwnerToken): Promise<boolean> {
@@ -642,15 +659,33 @@ function isResumableLocalRemoval(transitionPath: string, record: RemovalTransiti
 	return local?.resumable === true && sameRemovalRecordBytes(local.bytes, JSON.stringify(record));
 }
 
+async function readBoundedRemovalRecordBytes(recordPath: string): Promise<Buffer | null> {
+	const bytes = Buffer.from(
+		await Bun.file(recordPath)
+			.slice(0, MAX_FILE_LOCK_REMOVAL_RECORD_BYTES + 1)
+			.arrayBuffer(),
+	);
+	return bytes.length > MAX_FILE_LOCK_REMOVAL_RECORD_BYTES ? null : bytes;
+}
+
 type FileLockRemovalTransitionState = "active" | "abandoned" | "orphan_transition";
 type FileLockOrphanTransition = { kind: "orphan_transition"; path: string };
 type FileLockAcquisitionResult = LockInfo | FileLockOrphanTransition | null;
 
 async function readRemovalTransitionOwnerRecord(transitionPath: string): Promise<RemovalTransitionOwnerRecord | null> {
 	try {
-		const stat = await fs.lstat(`${transitionPath}.owner`);
-		if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) return null;
-		const record = JSON.parse(await Bun.file(`${transitionPath}.owner`).text()) as RemovalTransitionOwnerRecord;
+		const recordPath = `${transitionPath}.owner`;
+		const stat = await fs.lstat(recordPath, { bigint: true });
+		if (
+			!stat.isFile() ||
+			stat.isSymbolicLink() ||
+			stat.nlink !== 1n ||
+			stat.size > BigInt(MAX_FILE_LOCK_REMOVAL_RECORD_BYTES)
+		)
+			return null;
+		const bytes = await readBoundedRemovalRecordBytes(recordPath);
+		if (!bytes) return null;
+		const record = JSON.parse(bytes.toString("utf8")) as RemovalTransitionOwnerRecord;
 		const owner = parseLockInfoBytes(JSON.stringify(record.owner));
 		return owner && typeof record.rootDev === "string" && typeof record.rootIno === "string"
 			? { owner, rootDev: record.rootDev, rootIno: record.rootIno }
@@ -684,6 +719,12 @@ async function classifyFileLockRemovalTransition(
 				} catch (recordError) {
 					return isEnoent(recordError) ? null : "active";
 				}
+			}
+			const localRecord = localRemovalRecords.get(recordPath);
+			if (localRecord && sameRemovalRecordBytes(localRecord.bytes, JSON.stringify(recordedOwner))) {
+				if (!(await removeRemovalRecord(recordPath, localRecord.bytes))) return "active";
+				localRemovalRecords.delete(recordPath);
+				return null;
 			}
 			if (
 				recordedOwner.owner.owner_host_id !== undefined &&
@@ -757,9 +798,11 @@ function isEmptyRemovalTransition(snapshot: NativeDirectoryTreeSnapshot, graceMs
 async function removeRemovalRecord(recordPath: string, expectedBytes: string): Promise<boolean> {
 	try {
 		const stat = await fs.lstat(recordPath, { bigint: true });
-		if (!stat.isFile() || stat.isSymbolicLink()) return false;
-		const bytes = await Bun.file(recordPath).text();
-		if (!sameRemovalRecordBytes(bytes, expectedBytes)) return false;
+		if (!stat.isFile() || stat.isSymbolicLink() || stat.size > BigInt(MAX_FILE_LOCK_REMOVAL_RECORD_BYTES))
+			return false;
+		const bytes = await readBoundedRemovalRecordBytes(recordPath);
+		if (!bytes || !sameRemovalRecordBytes(bytes.toString("utf8"), expectedBytes)) return false;
+		if ((await FileLockTestHooks.beforeRemovalRecordUnlink?.(recordPath)) === false) return false;
 		return exactUnlinkDirect(recordPath, {
 			dev: canonicalLockDeviceId(stat.dev),
 			ino: canonicalLockFileId(stat.ino),
@@ -809,6 +852,7 @@ async function publishRemovalRecord(
 		rootDev: snapshot.rootDev,
 		rootIno: snapshot.rootIno,
 	});
+	if (Buffer.byteLength(bytes, "utf8") > MAX_FILE_LOCK_REMOVAL_RECORD_BYTES) return false;
 	const staged = `${recordPath}.${process.pid}.${crypto.randomUUID()}`;
 	await Bun.write(staged, bytes, { mode: 0o600 });
 	try {
@@ -1078,6 +1122,7 @@ async function rollbackPublishedFileLock(
 	lockPath: string,
 	pendingPath: string,
 	stagedSnapshot: NativeDirectoryTreeSnapshot,
+	parentIdentity: { dev: bigint; ino: bigint },
 ): Promise<void> {
 	if (process.platform !== "linux") {
 		// RecoveryFsRoot is Linux-only. POSIX exact restore retains the parent
@@ -1087,6 +1132,8 @@ async function rollbackPublishedFileLock(
 		const rollback = exactRestore(lockPath, pendingPath, {
 			dev: BigInt(stagedSnapshot.rootDev),
 			ino: BigInt(stagedSnapshot.rootIno),
+			parentDev: parentIdentity.dev,
+			parentIno: parentIdentity.ino,
 			size: BigInt(root.size),
 			mtimeNs: BigInt(root.mtimeNs),
 			directory: true,
@@ -1551,8 +1598,22 @@ async function removeVerifiedLockDirWithoutNative(
 		removal.retainedUnknownPath !== undefined
 	)
 		return "cleanup_failed";
-	if (!(await removeDetachedLockQuarantineOnDisk(removal.detachedPath, expected.rootDev, expected.rootIno)))
+	let detachedCleanupCompleted: boolean;
+	try {
+		detachedCleanupCompleted = await removeDetachedLockQuarantineOnDisk(
+			removal.detachedPath,
+			expected.rootDev,
+			expected.rootIno,
+		);
+	} catch (error) {
+		markLocalRemovalResumable(removal.detachedPath, expected.rootDev, expected.rootIno);
+		if (!isTransientReleaseError(error)) throw error;
 		return "cleanup_failed";
+	}
+	if (!detachedCleanupCompleted) {
+		markLocalRemovalResumable(removal.detachedPath, expected.rootDev, expected.rootIno);
+		return "cleanup_failed";
+	}
 	await clearRemovalRecord(removal.detachedPath);
 	return "removed";
 }
@@ -2142,6 +2203,11 @@ async function tryAcquireLock(
 		// retain the same lock identity as the ordinary path.
 		const canonicalParent = await fs.realpath(path.dirname(lockPath));
 		const destinationPath = path.join(canonicalParent, path.basename(lockPath));
+		const parent = await fs.lstat(canonicalParent, { bigint: true });
+		const parentIdentity = {
+			dev: canonicalLockDeviceId(parent.dev),
+			ino: canonicalLockFileId(parent.ino),
+		};
 		// Resolve only the stable parent: resolving the mutable staging final
 		// component would follow an attacker-replaced symlink before native no-follow
 		// validation gets a chance to reject it.
@@ -2288,6 +2354,7 @@ async function tryAcquireLock(
 					destinationPath,
 					canonicalPendingPath,
 					publishedSnapshot.snapshot,
+					parentIdentity,
 				);
 				removePending = true;
 				return transitionState === "orphan_transition"
