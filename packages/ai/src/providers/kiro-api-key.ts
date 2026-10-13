@@ -826,7 +826,6 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 		// Variables for streaming tool calls (initialized before try block so they're accessible in catch)
 		let currentTool: { id: string; name: string; input: string } | undefined;
 		let toolComplete = false; // Track whether the current tool has been completed (has stop flag)
-		let toolcallIndex: number | undefined;
 		const pendingToolCalls: Array<{ input: string; toolCall: ToolCall; index: number }> = [];
 		// Only an accepted successful completion confirms buffered text before clean EOF.
 		let completionSeen = false;
@@ -835,6 +834,24 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 		let textStartDeferred = false; // Track if text_start is deferred (accessible in catch)
 		let pendingTextContent = ""; // Text buffer (accessible in catch)
 		const pendingTextEvents: Array<{ type: "start" | "delta" | "end"; delta?: string; content?: string }> = []; // Deferred text events (accessible in catch)
+		const removeUnconfirmedTextBlock = () => {
+			if (textContentConfirmed || textIndex === undefined) return;
+
+			const removedIndex = textIndex;
+			blocks.splice(removedIndex, 1);
+			for (let i = removedIndex; i < blocks.length; i++) {
+				const block = blocks[i] as Block;
+				if (block && typeof block === "object" && "index" in block) {
+					block.index = i;
+				}
+			}
+			for (const pending of pendingToolCalls) {
+				if (pending.index > removedIndex) pending.index--;
+			}
+			textIndex = undefined;
+			pendingTextContent = "";
+			pendingTextEvents.length = 0;
+		};
 
 		try {
 			// Use validated identity snapshot from trust check if available (no second read of getters),
@@ -928,9 +945,6 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				};
 				const index = blocks.length;
 				blocks.push({ ...toolCall, index });
-				if (toolcallIndex === undefined) {
-					toolcallIndex = index;
-				}
 				const toolArgs =
 					typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
 						? (parsed as Record<string, unknown>)
@@ -1109,7 +1123,6 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 						}
 						// Update state tracking variables for shifted blocks
 						if (textIndex !== undefined) textIndex += 1;
-						if (toolcallIndex !== undefined) toolcallIndex += 1;
 						// Update indices in pending tool calls since all blocks shifted by 1
 						for (const pending of pendingToolCalls) {
 							pending.index += 1;
@@ -1195,7 +1208,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 						if (event.data.inputTokens !== undefined) output.usage.input = event.data.inputTokens;
 						if (event.data.outputTokens !== undefined) output.usage.output = event.data.outputTokens;
 						output.usage.totalTokens = output.usage.input + output.usage.output;
-					} else if (event.type === "completion") {
+					} else if (event.type === "completion" && !hasTerminalEvent) {
 						// Accepted successful terminal metadata confirms text, unlike usage accounting.
 						completionSeen = true;
 						// Finding #2: Immediately commit and emit all pending text events on completion
@@ -1289,21 +1302,8 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 
 						// Only emit the tool if it was explicitly completed (has stop flag)
 						if (toolComplete) addToolToBlocks();
+						removeUnconfirmedTextBlock();
 						emitPendingToolCalls();
-
-						// Remove unconfirmed text blocks from the error event
-						if (!textContentConfirmed && textIndex !== undefined) {
-							// Remove the unconfirmed text block from blocks
-							blocks.splice(textIndex, 1);
-							// Update indices of blocks after the removed one
-							for (let i = textIndex; i < blocks.length; i++) {
-								const block = blocks[i] as Block;
-								if (block && typeof block === "object" && "index" in block) {
-									block.index = i;
-								}
-							}
-							textIndex = undefined;
-						}
 
 						// Preserve text in the error context only after successful completion.
 						const accumulatedText = textContentConfirmed
@@ -1412,6 +1412,8 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				}
 			}
 
+			removeUnconfirmedTextBlock();
+
 			// Emit all pending tool call events (inline of emitPendingToolCalls logic)
 			for (const { input, toolCall, index } of pendingToolCalls) {
 				stream.push({ type: "toolcall_start", contentIndex: index, partial: output });
@@ -1429,20 +1431,6 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				});
 			}
 			pendingToolCalls.length = 0;
-
-			// Remove unconfirmed text blocks from the error event
-			if (!textContentConfirmed && textIndex !== undefined) {
-				// Remove the unconfirmed text block from blocks
-				blocks.splice(textIndex, 1);
-				// Update indices of blocks after the removed one
-				for (let i = textIndex; i < blocks.length; i++) {
-					const block = blocks[i] as Block;
-					if (block && typeof block === "object" && "index" in block) {
-						block.index = i;
-					}
-				}
-				textIndex = undefined;
-			}
 
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorMessage = sanitizeKiroError(error, apiKey);
