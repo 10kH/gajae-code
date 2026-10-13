@@ -1,6 +1,7 @@
 import { logger } from "@gajae-code/utils";
 import {
 	lookupOwnedRegistration,
+	migrateOwnedAttemptSaturationsForEndpoint,
 	registerOwnedRegistration,
 	resolveToolLineage,
 	retireOwnedRegistrationForDeadLetter,
@@ -667,6 +668,7 @@ export class AsyncJobManager {
 		}
 		AsyncJobManager.#byEndpoint.delete(predecessorEndpointId);
 		AsyncJobManager.#byEndpoint.set(successorEndpointId, manager);
+		migrateOwnedAttemptSaturationsForEndpoint(predecessorEndpointId, successorEndpointId);
 		// Migrate queued ownership registrations from the predecessor endpoint to
 		// the successor. The admission endpoint remains unchanged for exact lineage
 		// lookup; each queue entry tracks the separate endpoint used for ownership.

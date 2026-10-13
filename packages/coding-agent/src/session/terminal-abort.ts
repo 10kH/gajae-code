@@ -382,6 +382,16 @@ export function isOwnedAttemptRegistrationIncomplete(lineageIdHash: string, atte
 	return incompleteOwnedAttempts.has(`${lineageIdHash}\u0000${attemptEpoch}`);
 }
 
+/** Move fail-closed saturation authority with all ownership state during endpoint rekey. */
+export function migrateOwnedAttemptSaturationsForEndpoint(
+	predecessorEndpointId: string,
+	successorEndpointId: string,
+): void {
+	for (const [attemptKey, endpointId] of saturatedAttemptEndpoints) {
+		if (endpointId === predecessorEndpointId) saturatedAttemptEndpoints.set(attemptKey, successorEndpointId);
+	}
+}
+
 /** Exact (jobId, jobGeneration) lookup for completion-origin classification. */
 export function lookupOwnedRegistration(
 	jobId: string,

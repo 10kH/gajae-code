@@ -2,9 +2,12 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { AsyncJobManager, type SubagentRunOutcome } from "@gajae-code/coding-agent/async/job-manager";
 import {
 	bindToolLineage,
+	isOwnedAttemptRegistrationIncomplete,
 	type LineageBinding,
 	lookupOwnedRegistration,
 	registerOwnedIfLineaged,
+	registerOwnedRegistration,
+	retireOwnedRegistrationsForEndpoint,
 	type TurnRegistrationKey,
 	unbindToolLineage,
 	unregisterOwnedRegistration,
@@ -903,5 +906,62 @@ describe("AsyncJobManager subagent pause/resume/queue", () => {
 		}
 
 		await manager.dispose({ timeoutMs: 500 });
+	});
+
+	test("queued rekey retains saturation evidence until successor endpoint teardown", async () => {
+		const { manager } = makeManager({ maxRunningJobs: 1 });
+		installResumeRunner(manager);
+		const a = spawnControllable(manager, "A", "owner-a");
+		expect(manager.pauseSubagent("A").ok).toBe(true);
+		a.release();
+		await manager.waitForAll();
+		const blocker = spawnControllable(manager, "BLOCK", "owner-blocker");
+		const endpointE1 = "endpoint-e1-saturated";
+		const endpointE2 = "endpoint-e2-saturated";
+		const lineageIdHash = "hash-saturated-queued-rekey";
+		const attemptEpoch = 71;
+		try {
+			expect(AsyncJobManager.registerForEndpoint(endpointE1, manager)).toBe(true);
+
+			// Fill the process-global registration registry with non-evictable work.
+			for (let i = 0; i < 8192; i++) {
+				const generation = `saturation-filler:${i}`;
+				const registration: TurnRegistrationKey = {
+					endpointId: endpointE1,
+					lineageIdHash: "hash-saturation-filler",
+					promptAttemptEpoch: 1,
+					endpointGeneration: 1,
+					jobId: generation,
+					jobGeneration: generation,
+				};
+				registerOwnedRegistration(registration);
+				testOwnedRegistrations.push(registration);
+			}
+
+			const toolCallId = "tool-call-saturated-queued-rekey";
+			bindTestToolLineage(toolCallId, {
+				lineageIdHash,
+				promptAttemptEpoch: attemptEpoch,
+				endpointGeneration: 1,
+				endpointId: endpointE1,
+			});
+			expect(manager.resumeSubagent("A", { ownerId: "owner-a" }, "resume", toolCallId).queued).toBe(true);
+			const queuedGeneration = "queued:A:1";
+			expect(lookupOwnedRegistration(queuedGeneration, queuedGeneration, endpointE1)).toBeUndefined();
+			expect(isOwnedAttemptRegistrationIncomplete(lineageIdHash, attemptEpoch)).toBe(true);
+
+			expect(AsyncJobManager.rekeyForEndpoint(endpointE1, endpointE2, manager)).toBe(true);
+			retireOwnedRegistrationsForEndpoint(endpointE1);
+			expect(isOwnedAttemptRegistrationIncomplete(lineageIdHash, attemptEpoch)).toBe(true);
+		} finally {
+			manager.cancelSubagent("A", { ownerId: "owner-a" });
+			blocker.release();
+			await manager.waitForAll();
+			await manager.drainDeliveries({ timeoutMs: 500 });
+			await manager.dispose({ timeoutMs: 500 });
+			retireOwnedRegistrationsForEndpoint(endpointE1);
+			retireOwnedRegistrationsForEndpoint(endpointE2);
+		}
+		expect(isOwnedAttemptRegistrationIncomplete(lineageIdHash, attemptEpoch)).toBe(false);
 	});
 });
