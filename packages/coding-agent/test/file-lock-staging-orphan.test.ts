@@ -3,7 +3,12 @@ import * as syncFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { inspectFileLockStagingDir, reapOrphanedLockStagingDirs, withFileLock } from "../src/config/file-lock";
+import {
+	FileLockTestHooks,
+	inspectFileLockStagingDir,
+	reapOrphanedLockStagingDirs,
+	withFileLock,
+} from "../src/config/file-lock";
 import { collectFileLocksForGc, fileLocksGcAdapter } from "../src/config/file-lock-gc";
 import type { GcContext } from "../src/gjc-runtime/gc-runtime";
 
@@ -12,6 +17,7 @@ const roots: string[] = [];
 const uuid = "12345678-1234-1234-1234-123456789abc";
 afterEach(async () => {
 	vi.restoreAllMocks();
+	FileLockTestHooks.nativeQuarantineBindings = undefined;
 	for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
 });
 async function fixture(pid = DEAD_PID, info: object | null = { pid, timestamp: 1 }) {
@@ -58,6 +64,24 @@ test.each([true, false])("current process staging is retained (info=%s)", async 
 	const probe = vi.fn(() => "dead" as const);
 	expect((await inspectFileLockStagingDir(staging, probe, true)).status).toBe("alive");
 	expect(probe).not.toHaveBeenCalled();
+	expect(await fs.exists(staging)).toBe(true);
+});
+
+test("live staging owner is skipped before snapshotting its directory", async () => {
+	const { staging } = await fixture(DEAD_PID);
+	const probe = vi.fn(() => "alive" as const);
+	const snapshot = vi.fn(() => {
+		throw new Error("live staging owner must not be snapshotted");
+	});
+	FileLockTestHooks.nativeQuarantineBindings = () => ({
+		snapshotDirectoryTree: snapshot,
+		exactRemoveDirectoryTree: () => ({ ok: false, code: "identity_mismatch" }),
+	});
+
+	const result = await inspectFileLockStagingDir(staging, probe, true);
+	expect(result).toMatchObject({ pid: DEAD_PID, status: "alive", removed: false });
+	expect(probe).toHaveBeenCalledWith(DEAD_PID);
+	expect(snapshot).not.toHaveBeenCalled();
 	expect(await fs.exists(staging)).toBe(true);
 });
 
