@@ -202,6 +202,7 @@ describe("ModelRegistry vLLM Discovery", () => {
 		await registry.refreshProvider("vllm", "online");
 		const model = registry.find("vllm", "legacy-sentinel-vllm-model");
 		expect(model).toBeDefined();
+		expect(await registry.getApiKey(model!)).toBe("env-vllm-key");
 		const resolved = await registry.getApiKeyWithCredentialRowId(model!);
 		expect(resolved.apiKey).toBe("env-vllm-key");
 		expect(resolved.credentialRowId).toBeUndefined();
@@ -222,6 +223,7 @@ describe("ModelRegistry vLLM Discovery", () => {
 		await registry.refreshProvider("vllm", "online");
 		const model = registry.find("vllm", "legacy-keyless-vllm-model");
 		expect(model).toBeDefined();
+		expect(await registry.getApiKey(model!)).toBe(kNoAuth);
 		const resolved = await registry.getApiKeyWithCredentialRowId(model!);
 		expect(resolved.apiKey).toBe(kNoAuth);
 		expect(resolved.credentialRowId).toBeUndefined();
