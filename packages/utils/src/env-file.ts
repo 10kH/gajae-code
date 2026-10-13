@@ -263,15 +263,20 @@ function rawValueDisagreesWithLineParser(raw: string): boolean {
  * `.env.local` is deliberately skipped when `NODE_ENV === "test"`, matching the
  * convention that a local override file is not part of a test run.
  */
-export function projectEnvSnapshot(cwd = process.cwd()): ProjectEnvSnapshot {
-	const nodeEnv = process.env.NODE_ENV;
+/** Files Bun overlays for a cwd. Unset NODE_ENV selects the development layer. */
+export function projectEnvLayerFiles(nodeEnv: string | undefined): string[] {
 	const validNodeEnv = nodeEnv && /^[A-Za-z0-9_-]+$/.test(nodeEnv) ? nodeEnv : undefined;
-	const files = [
+	const layer = validNodeEnv ?? (nodeEnv ? undefined : "development");
+	return [
 		".env",
-		...(validNodeEnv ? [`.env.${validNodeEnv}`] : []),
-		...(validNodeEnv !== "test" ? [".env.local"] : []),
-		...(validNodeEnv ? [`.env.${validNodeEnv}.local`] : []),
+		...(layer ? [`.env.${layer}`] : []),
+		...(layer !== "test" ? [".env.local"] : []),
+		...(layer ? [`.env.${layer}.local`] : []),
 	];
+}
+
+export function projectEnvSnapshot(cwd = process.cwd()): ProjectEnvSnapshot {
+	const files = projectEnvLayerFiles(process.env.NODE_ENV);
 	const values: Record<string, string> = {};
 	const dynamic = new Set<string>();
 	for (const file of files) {
