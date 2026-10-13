@@ -224,12 +224,24 @@ describe("tmux self-injection guard", () => {
 				block: false,
 			});
 		});
+
+		it("should allow bundled command lookup flags", async () => {
+			await expect(checkTmuxSelfInjection("command -pv tmux send-keys", options)).resolves.toEqual({
+				block: false,
+			});
+		});
 	});
 
 	// Tests for must-stay-allowed cases (issue #6563)
 	describe("must-stay-allowed cases", () => {
 		it("should allow env -u tmux where tmux is the unset variable", async () => {
 			await expect(checkTmuxSelfInjection("env -u tmux send-keys -t %47 x", options)).resolves.toEqual({
+				block: false,
+			});
+		});
+
+		it("allows env --unset tmux where tmux is the unset variable", async () => {
+			await expect(checkTmuxSelfInjection("env --unset tmux send-keys -t %47 x", options)).resolves.toEqual({
 				block: false,
 			});
 		});
@@ -413,6 +425,12 @@ describe("tmux self-injection guard", () => {
 			).resolves.toMatchObject({
 				block: true,
 			});
+		});
+
+		it("should block bash with bundled -oc option", async () => {
+			await expect(
+				checkTmuxSelfInjection("bash -oc nounset 'tmux send-keys -t %47 x'", options),
+			).resolves.toMatchObject({ block: true });
 		});
 	});
 
@@ -634,6 +652,9 @@ describe("tmux self-injection guard", () => {
 				await expect(checkTmuxSelfInjection(`bash --norc ${scriptPath}`, options)).resolves.toMatchObject({
 					block: true,
 				});
+				await expect(checkTmuxSelfInjection(`bash +O extglob ${scriptPath}`, options)).resolves.toMatchObject({
+					block: true,
+				});
 			} finally {
 				await Bun.file(scriptPath).delete();
 			}
@@ -828,6 +849,94 @@ describe("tmux self-injection guard", () => {
 			await expect(
 				checkTmuxSelfInjection("printf x | xargs --max-lines 1 tmux send-keys -t %47 x", options),
 			).resolves.toMatchObject({ block: true });
+		});
+	});
+
+	describe("regression: wrapper and shell parsing boundaries", () => {
+		it("blocks attached env split-string payloads", async () => {
+			await expect(checkTmuxSelfInjection("env '-Stmux send-keys -t %47 x'", options)).resolves.toMatchObject({
+				block: true,
+			});
+		});
+
+		it("keeps xargs --eof's optional value attached-only", async () => {
+			await expect(checkTmuxSelfInjection("xargs --eof tmux send-keys -t %47 x", options)).resolves.toMatchObject({
+				block: true,
+			});
+		});
+
+		it("consumes sudo short and long chroot operands", async () => {
+			for (const command of [
+				"sudo -R / tmux send-keys -t %47 x",
+				"sudo --chroot / tmux send-keys -t %47 x",
+				"sudo --user root tmux send-keys -t %47 x",
+			]) {
+				await expect(checkTmuxSelfInjection(command, options)).resolves.toMatchObject({ block: true });
+			}
+		});
+
+		it("consumes an empty env split-string operand without hiding the command", async () => {
+			await expect(checkTmuxSelfInjection("env -S '' tmux send-keys -t %47 x", options)).resolves.toMatchObject({
+				block: true,
+			});
+		});
+
+		it("decodes env split-string escaped separators", async () => {
+			await expect(
+				checkTmuxSelfInjection("env -S 'tmux\\_send-keys\\_-t\\_%47\\_x'", options),
+			).resolves.toMatchObject({ block: true });
+		});
+
+		it("keeps shell redirections from ending wrapper parsing", async () => {
+			for (const command of [
+				"env > /tmp/log tmux send-keys -t %47 x",
+				"env >/tmp/log tmux send-keys -t %47 x",
+				"env 2>/tmp/log tmux send-keys -t %47 x",
+				"env </dev/null tmux send-keys -t %47 x",
+			]) {
+				await expect(checkTmuxSelfInjection(command, options)).resolves.toMatchObject({ block: true });
+			}
+		});
+
+		it("does not treat here-document text as an executed command", async () => {
+			await expect(
+				checkTmuxSelfInjection(`bash -c 'cat <<EOF\ntmux send-keys -t %47 x\nEOF'`, options),
+			).resolves.toEqual({ block: false });
+		});
+
+		it("consumes exec's alternate-name operand", async () => {
+			await expect(
+				checkTmuxSelfInjection("exec -a disguise tmux send-keys -t %47 x", options),
+			).resolves.toMatchObject({ block: true });
+		});
+
+		it("recognizes positive Bash option operands before -c", async () => {
+			for (const command of [
+				"bash +O extglob -c 'tmux send-keys -t %47 x'",
+				"bash +o pipefail -c 'tmux send-keys -t %47 x'",
+			]) {
+				await expect(checkTmuxSelfInjection(command, options)).resolves.toMatchObject({ block: true });
+			}
+		});
+
+		it("resets builtin parsing at a newline", async () => {
+			await expect(
+				checkTmuxSelfInjection("builtin\nbash -c 'tmux send-keys -t %47 x'", options),
+			).resolves.toMatchObject({ block: true });
+		});
+
+		it("does not inspect a shell that is only a command lookup operand", async () => {
+			await expect(checkTmuxSelfInjection("command -v bash -c 'tmux send-keys -t %47 x'", options)).resolves.toEqual(
+				{ block: false },
+			);
+		});
+
+		it("allows env terminal modes without treating following words as commands", async () => {
+			for (const option of ["--help", "--version"]) {
+				await expect(checkTmuxSelfInjection(`env ${option} tmux send-keys -t %47 x`, options)).resolves.toEqual({
+					block: false,
+				});
+			}
 		});
 	});
 });

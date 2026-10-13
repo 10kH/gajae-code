@@ -14,7 +14,18 @@ const INPUT_VERBS = new Set(["send-keys", "paste-buffer", "send-prefix"]);
 const SHELL_RUNNERS = new Set(["sh", "bash", "dash", "zsh", "ksh", "busybox"]);
 const COMMAND_WRAPPERS = new Set(["eval", "exec", "command", "builtin", "nohup", "time"]);
 const BUILTIN_COMMAND_WRAPPERS = new Set(["command", "eval", "exec"]);
-const NON_EXECUTING_SUDO_OPTIONS = new Set(["-e", "--edit", "-l", "--list", "-v", "--validate", "-V", "--version"]);
+const NON_EXECUTING_SUDO_OPTIONS = new Set([
+	"-e",
+	"--edit",
+	"-l",
+	"--list",
+	"-v",
+	"--validate",
+	"-V",
+	"--version",
+	"--help",
+]);
+const NON_EXECUTING_ENV_OPTIONS = new Set(["--help", "--version"]);
 const ASSIGNMENT_AWARE_WRAPPERS = new Set(["env", "sudo"]); // Only these allow VAR=value at start
 const CONTROL_WORDS = new Set(["then", "do", "else", "fi", "done", "esac"]);
 const MAX_INDIRECTION_DEPTH = 4;
@@ -49,6 +60,21 @@ const WRAPPER_LONG_OPTIONS: Record<string, Record<string, boolean>> = {
 		"--chdir": true, // env --chdir=DIR (takes directory)
 		"--split-string": true, // env -S/--split-string (takes command string)
 	},
+	sudo: {
+		"--chdir": true,
+		"--chroot": true,
+		"--close-from": true,
+		"--command-timeout": true,
+		"--group": true,
+		"--host": true,
+		"--login-class": true,
+		"--other-user": true,
+		"--prompt": true,
+		"--role": true,
+		"--type": true,
+		"--user": true,
+		"--preserve-env": false,
+	},
 	timeout: {
 		"--signal": true, // timeout --signal=SIGNAL (takes signal name)
 		"--kill-after": true, // timeout --kill-after=TIME
@@ -70,7 +96,7 @@ const WRAPPER_LONG_OPTIONS: Record<string, Record<string, boolean>> = {
 		"--max-lines": true, // xargs --max-lines MAX-LINES
 		"--arg-file": true, // xargs --arg-file FILE
 		"--delimiter": true, // xargs --delimiter DELIM
-		"--eof": true, // xargs --eof STRING
+		"--eof": false, // xargs --eof[=STRING]; the optional value is attached-only
 		"--max-procs": true, // xargs --max-procs N
 		"--max-chars": true, // xargs --max-chars SIZE (previously --size)
 		"--size": true, // xargs --size BYTES
@@ -88,8 +114,11 @@ const COMMAND_WRAPPERS_WITH_ARGS: Record<string, WrapperSpec> = {
 		optionsWithArg: new Set(["-u", "-C", "-S"]),
 	},
 	sudo: {
-		optionsWithArg: new Set(["-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-U", "-T"]),
+		optionsWithArg: new Set(["-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-U", "-T", "-R", "-c"]),
 		flagOnlyOptions: new Set(["-s", "-i"]),
+	},
+	exec: {
+		optionsWithArg: new Set(["-a"]),
 	},
 	timeout: {
 		optionsWithArg: new Set(["-s", "-k"]), // -s SIGNAL, -k KILL_SIGNAL; -v is flag-only
@@ -167,9 +196,30 @@ function tokenize(command: string): Token[] {
 	let wrapperCommand: { name: string; spec: WrapperSpec } | undefined;
 	let skipNextArg = false;
 	let positionalsPending = 0;
+	let redirectionTargetPending = false;
+	let redirectionTargetIsHereDoc = false;
+	let redirectionTargetStripTabs = false;
+	let currentTokenIsPendingOperand = false;
+	const hereDocDelimiters: { delimiter: string; stripTabs: boolean }[] = [];
+	let activeHereDoc: { delimiter: string; stripTabs: boolean } | undefined;
+	let hereDocLine = "";
 
 	const flush = () => {
-		if (text.length === 0) return;
+		if (text.length === 0 && !quoted) return;
+
+		if (redirectionTargetPending) {
+			tokens.push({ text, quoted, commandStart: false });
+			if (redirectionTargetIsHereDoc) {
+				hereDocDelimiters.push({ delimiter: text, stripTabs: redirectionTargetStripTabs });
+			}
+			text = "";
+			quoted = false;
+			redirectionTargetPending = false;
+			redirectionTargetIsHereDoc = false;
+			redirectionTargetStripTabs = false;
+			currentTokenIsPendingOperand = false;
+			return;
+		}
 
 		let commandStart = atCommandStart;
 		let isWrappedCommand = false;
@@ -220,12 +270,16 @@ function tokenize(command: string): Token[] {
 			}
 		} else {
 			// Not at command start
-			if (text.startsWith("-") && !isNegativeNumber(text)) {
+			if (currentTokenIsPendingOperand) {
+				skipNextArg = false;
+			} else if (text.startsWith("-") && !isNegativeNumber(text)) {
 				// This is an option (but not a negative number like -5)
 				// Don't touch skipNextArg yet; it will be consumed by the next argument
-				if (wrapperCommand?.name === "sudo" && NON_EXECUTING_SUDO_OPTIONS.has(text)) {
-					// These sudo modes list, validate, or report version information; they
-					// never execute the following command-looking words.
+				const nonExecutingSudoMode = wrapperCommand?.name === "sudo" && NON_EXECUTING_SUDO_OPTIONS.has(text);
+				const nonExecutingEnvMode = wrapperCommand?.name === "env" && NON_EXECUTING_ENV_OPTIONS.has(text);
+				if (nonExecutingSudoMode || nonExecutingEnvMode) {
+					// These sudo modes never execute a command. env's help/version modes
+					// also exit after displaying output.
 					wrapperCommand = undefined;
 					skipNextArg = false;
 					positionalsPending = 0;
@@ -288,10 +342,23 @@ function tokenize(command: string): Token[] {
 
 		text = "";
 		quoted = false;
+		currentTokenIsPendingOperand = false;
 	};
 
 	for (let index = 0; index < command.length; index++) {
 		const ch = command[index];
+		if (activeHereDoc) {
+			if (ch === "\n") {
+				const line = activeHereDoc.stripTabs ? hereDocLine.replace(/^\t+/, "") : hereDocLine;
+				if (line.replace(/\r$/, "") === activeHereDoc.delimiter) {
+					activeHereDoc = hereDocDelimiters.shift();
+				}
+				hereDocLine = "";
+			} else {
+				hereDocLine += ch;
+			}
+			continue;
+		}
 		if (quote !== undefined) {
 			if (ch === quote) {
 				quote = undefined;
@@ -305,17 +372,56 @@ function tokenize(command: string): Token[] {
 			continue;
 		}
 		if (ch === "'" || ch === '"') {
+			if (text.length === 0 && !quoted && skipNextArg) currentTokenIsPendingOperand = true;
 			quote = ch;
 			quoted = true;
 			continue;
 		}
 		if (ch === "\\" && index + 1 < command.length) {
+			if (text.length === 0 && !quoted && skipNextArg) currentTokenIsPendingOperand = true;
 			text += command[++index];
 			quoted = true;
 			continue;
 		}
+		if (ch === "\n") {
+			flush();
+			atCommandStart = true;
+			wrapperCommand = undefined;
+			skipNextArg = false;
+			positionalsPending = 0;
+			redirectionTargetPending = false;
+			redirectionTargetIsHereDoc = false;
+			redirectionTargetStripTabs = false;
+			currentTokenIsPendingOperand = false;
+			if (hereDocDelimiters.length > 0) activeHereDoc = hereDocDelimiters.shift();
+			continue;
+		}
 		if (/\s/.test(ch)) {
 			flush();
+			continue;
+		}
+		if (ch === "&" && command[index + 1] === ">") {
+			if (/^\d+$/.test(text)) text = "";
+			else flush();
+			index++;
+			if (command[index + 1] === ">") index++;
+			if (command[index + 1] === "|") index++;
+			redirectionTargetPending = true;
+			redirectionTargetIsHereDoc = false;
+			redirectionTargetStripTabs = false;
+			continue;
+		}
+		if (ch === "<" || ch === ">") {
+			if (/^\d+$/.test(text)) text = "";
+			else flush();
+			const isHereDoc = ch === "<" && command[index + 1] === "<" && command[index + 2] !== "<";
+			while (command[index + 1] === ch) index++;
+			const stripTabs = isHereDoc && command[index + 1] === "-";
+			if (stripTabs) index++;
+			if (command[index + 1] === "&" || (ch === ">" && command[index + 1] === "|")) index++;
+			redirectionTargetPending = true;
+			redirectionTargetIsHereDoc = isHereDoc;
+			redirectionTargetStripTabs = stripTabs;
 			continue;
 		}
 		if (isSeparator(ch)) {
@@ -324,14 +430,19 @@ function tokenize(command: string): Token[] {
 			wrapperCommand = undefined;
 			skipNextArg = false;
 			positionalsPending = 0;
+			redirectionTargetPending = false;
+			redirectionTargetIsHereDoc = false;
+			redirectionTargetStripTabs = false;
+			currentTokenIsPendingOperand = false;
 			continue;
 		}
 
+		if (text.length === 0 && !quoted && skipNextArg) currentTokenIsPendingOperand = true;
 		text += ch;
 
 		// After building a token, check if it's an option that needs an argument
 		// Skip negative numbers (e.g., -5 for nice -n -5)
-		if (!atCommandStart && wrapperCommand && text.startsWith("-") && !isNegativeNumber(text)) {
+		if (!atCommandStart && wrapperCommand && !skipNextArg && text.startsWith("-") && !isNegativeNumber(text)) {
 			const nextChar = command[index + 1];
 			if (!nextChar || /\s/.test(nextChar) || isSeparator(nextChar)) {
 				// This option is complete; check if it takes an argument
@@ -451,7 +562,15 @@ function reconstructCommandFromEnvSplit(splitString: string): string[] | undefin
 
 	for (let i = 0; i < splitString.length; i++) {
 		const ch = splitString[i];
-		if (!quoted && (ch === "'" || ch === '"')) {
+		if (ch === "\\" && splitString[i + 1] === "_") {
+			i++;
+			if (quoted) {
+				current += " ";
+			} else {
+				if (current) parts.push(current);
+				current = "";
+			}
+		} else if (!quoted && (ch === "'" || ch === '"')) {
 			quoted = true;
 			quoteChar = ch;
 		} else if (quoted && ch === quoteChar) {
@@ -535,11 +654,12 @@ function quoteShellArgument(argument: string): string {
 function collectShellPayloads(tokens: Token[]): string[] {
 	const payloads: string[] = [];
 	// Options that take an argument for bash/sh/similar shells
-	const optionsWithArg = new Set(["-O", "-o"]); // bash -O extglob, bash -o pipefail, etc.
+	const optionsWithArg = new Set(["-O", "-o", "+O", "+o"]);
 
 	for (let index = 0; index < tokens.length; index++) {
 		const token = tokens[index];
 		if (!token.commandStart) continue;
+		if (isCommandLookup(tokens, index)) continue;
 
 		// Check if this is a shell runner or busybox
 		let shellIndex = index;
@@ -582,6 +702,11 @@ function collectShellPayloads(tokens: Token[]): string[] {
 				skipNextArg = false;
 				continue;
 			}
+			if (word === "+O" || word === "+o") {
+				skipNextArg = true;
+				continue;
+			}
+			if (word.startsWith("+O") || word.startsWith("+o")) continue;
 
 			// Once we see a non-option word (not starting with -), that's the script name.
 			// Any further flags are arguments to that script, not shell options.
@@ -669,6 +794,13 @@ function collectShellPayloads(tokens: Token[]): string[] {
 						optionsTerminated = true;
 						continue;
 					}
+					if (!optionsTerminated && (payloadWord === "+O" || payloadWord === "+o")) {
+						payloadCursor++;
+						continue;
+					}
+					if (!optionsTerminated && (payloadWord.startsWith("+O") || payloadWord.startsWith("+o"))) {
+						continue;
+					}
 
 					// Skip over any remaining shell options or their arguments. Quotes
 					// don't change how Bash interprets an argv value beginning with '-'.
@@ -738,6 +870,13 @@ function collectShellPayloads(tokens: Token[]): string[] {
 					cursor++; // Skip the payload we just processed
 				}
 			}
+			// GNU env also accepts the split string attached to -S.
+			else if (arg.startsWith("-S") && arg.length > 2) {
+				const command = reconstructCommandFromEnvSplit(arg.slice(2));
+				if (command) {
+					payloads.push(command.map(quoteShellArgument).join(" "));
+				}
+			}
 			// Check for --split-string option (with or without =)
 			else if (arg.startsWith("--split-string")) {
 				if (arg.includes("=")) {
@@ -787,10 +926,11 @@ function collectShellPayloads(tokens: Token[]): string[] {
 
 function collectShellScripts(tokens: Token[], cwd: string): string[] {
 	const scripts: string[] = [];
-	const optionsWithArg = new Set(["-O", "-o"]); // bash -O extglob, bash -o pipefail, etc.
+	const optionsWithArg = new Set(["-O", "-o", "+O", "+o"]);
 
 	for (let index = 0; index < tokens.length; index++) {
 		const token = tokens[index];
+		if (!token.commandStart || isCommandLookup(tokens, index)) continue;
 		const name = commandName(token.text);
 		if (
 			token.commandStart &&
@@ -801,8 +941,6 @@ function collectShellScripts(tokens: Token[], cwd: string): string[] {
 			scripts.push(path.resolve(cwd, token.text));
 			continue;
 		}
-		if (!token.commandStart) continue;
-
 		// Handle shell runners (bash, sh, etc.) and busybox applets
 		let shellIndex = index;
 		if (commandName(token.text) === "busybox") {
@@ -830,6 +968,11 @@ function collectShellScripts(tokens: Token[], cwd: string): string[] {
 				skipNextArg = false;
 				continue;
 			}
+			if (argument === "+O" || argument === "+o") {
+				skipNextArg = true;
+				continue;
+			}
+			if (argument.startsWith("+O") || argument.startsWith("+o")) continue;
 
 			// If we encounter -c, stop looking (script mode is not used)
 			if (argument === "-c") break;
