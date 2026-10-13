@@ -231,3 +231,57 @@ for (const payload of ["", "unproven payload"]) {
 		expect(await Bun.file(path.join(transition, "info")).text()).toBe(payload);
 	});
 }
+
+/**
+ * A live remover's `.removing.owner` record outlives its tree: the record is cleared only
+ * after native removal returns. A lock acquired in that window must still release.
+ */
+async function lingeringLiveRemoverRecord(transition: string, clearAfterMs: number): Promise<void> {
+	const incarnation = nativeProcessBindings().Process.fromPid(process.pid)?.incarnation;
+	expect(incarnation).toBeString();
+	await Bun.write(
+		`${transition}.owner`,
+		JSON.stringify({
+			owner: { pid: process.pid, timestamp: Date.now(), process_incarnation: incarnation },
+			rootDev: "0",
+			rootIno: "0",
+		}),
+	);
+	setTimeout(() => void fs.rm(`${transition}.owner`, { force: true }), clearAfterMs);
+}
+
+async function waitForAbsence(target: string, timeoutMs: number): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (!(await fs.exists(target))) return true;
+		await Bun.sleep(25);
+	}
+	return !(await fs.exists(target));
+}
+
+test("release retries behind a live remover's lingering record instead of reporting owner_changed", async () => {
+	const { file, lock, transition } = await fixture();
+	const release = await acquireFileLock(file, { retries: 2, retryDelayMs: 1 });
+	await lingeringLiveRemoverRecord(transition, 100);
+	await release();
+	expect(await fs.exists(lock)).toBe(false);
+});
+
+test("a release that outlasts its retry budget finishes in the background without reacquisition", async () => {
+	const { file, lock, transition } = await fixture();
+	const release = await acquireFileLock(file, { retries: 2, retryDelayMs: 1 });
+	await lingeringLiveRemoverRecord(transition, 1_000);
+	await expect(release()).rejects.toThrow("removal_record_busy");
+	expect(await fs.exists(lock)).toBe(true);
+	expect(await waitForAbsence(lock, 4_000)).toBe(true);
+});
+
+test("background release retries never remove a successor generation", async () => {
+	const { file, lock } = await fixture();
+	const release = await acquireFileLock(file, { retries: 2, retryDelayMs: 1 });
+	const successor = { pid: process.pid, timestamp: Date.now() + 1_000, owner_token: "successor" };
+	await Bun.write(path.join(lock, "info"), JSON.stringify(successor));
+	await expect(release()).rejects.toThrow("Failed to release file lock: owner_changed.");
+	await Bun.sleep(1_500);
+	expect(await Bun.file(path.join(lock, "info")).json()).toEqual(successor);
+});

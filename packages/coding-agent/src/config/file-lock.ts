@@ -818,8 +818,12 @@ async function exactRemoveLockTree(
 		if (!(await removeRemovalRecord(recordPath, JSON.stringify(prior))))
 			return { ok: false, code: "identity_mismatch" };
 	}
+	// A live remover still owns the sibling record, usually the previous lock
+	// generation whose tree is gone but whose record clear is still in flight.
+	// That is contention, not a changed owner: identity_mismatch makes a release
+	// final and strands this live owner's lock for every other process.
 	if (!(await publishRemovalRecord(transitionPath, snapshot, ownerHostId)))
-		return { ok: false, code: "identity_mismatch" };
+		return { ok: false, code: "removal_record_busy" };
 	try {
 		return nativeFileLockBindings().exactRemoveDirectoryTree(lockPath, snapshot, parentIdentity, detachOnly);
 	} finally {
@@ -2399,10 +2403,33 @@ async function releaseLock(lockPath: string, owner: FileLockOwnerToken, knownKey
 		if (localLockStates.get(key) === state) localLockStates.delete(key);
 	} catch (error) {
 		state.status = "release_pending";
+		scheduleReleasePendingRetry(lockPath, key, state);
 		throw error;
 	} finally {
 		if (state.releasePromise === releasePromise) state.releasePromise = undefined;
 	}
+}
+
+const RELEASE_PENDING_RETRY_DELAYS_MS = [250, 1_000, 5_000, 15_000, 60_000];
+
+/**
+ * A failed release otherwise waits for this process's next acquisition of the
+ * same path. An idle process may never acquire again and other processes never
+ * displace a live owner, so retry in the background. Each retry re-runs the full
+ * guarded release and can only remove this owner generation.
+ */
+function scheduleReleasePendingRetry(lockPath: string, key: string, state: LocalLockState, attempt = 0): void {
+	const delay = RELEASE_PENDING_RETRY_DELAYS_MS[attempt];
+	if (delay === undefined) {
+		logger.warn("File lock release is still pending after background retries", { lockPath });
+		return;
+	}
+	const timer = setTimeout(async () => {
+		if (localLockStates.get(key) !== state) return;
+		await retryPendingLocalRelease(lockPath, key).catch(() => undefined);
+		if (localLockStates.get(key) === state) scheduleReleasePendingRetry(lockPath, key, state, attempt + 1);
+	}, delay);
+	timer.unref?.();
 }
 /**
  * Bounded, actionable description of who holds `lockPath` at exhaustion time.
