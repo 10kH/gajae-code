@@ -299,6 +299,50 @@ test("a pre-detach foreign receipt matching the live canonical root blocks acqui
 	}
 });
 
+test("host-qualified acquisition treats a hostless pre-detach receipt as foreign", async () => {
+	const { file, lock, transition } = await fixture();
+	await fs.mkdir(lock);
+	const canonicalInfo = JSON.stringify({ ...deadOwner, owner_token: "hostless-canonical-owner" });
+	await Bun.write(path.join(lock, "info"), canonicalInfo);
+	const canonical = await fs.lstat(lock, { bigint: true });
+	const hostlessOwner = { ...deadOwner, owner_token: "hostless-remover" };
+	const recordBytes = JSON.stringify({
+		owner: hostlessOwner,
+		rootDev: canonical.dev.toString(),
+		rootIno: canonical.ino.toString(),
+	});
+	await Bun.write(`${transition}.owner`, recordBytes);
+
+	const kill = vi.spyOn(process, "kill");
+	const callback = vi.fn(async () => undefined);
+	await expect(
+		withFileLock(file, callback, { ownerHostId: "local-host", retries: 2, retryDelayMs: 1 }),
+	).rejects.toMatchObject({ code: "acquire_timeout" });
+
+	expect(callback).not.toHaveBeenCalled();
+	expect(kill.mock.calls.filter(([pid]) => pid === hostlessOwner.pid)).toHaveLength(0);
+	expect(await Bun.file(`${transition}.owner`).text()).toBe(recordBytes);
+	expect(await Bun.file(path.join(lock, "info")).text()).toBe(canonicalInfo);
+});
+
+test("host-qualified acquisition never probes or adopts a hostless retirement", async () => {
+	const { file, transition } = await fixture();
+	await fs.mkdir(transition);
+	await Bun.write(path.join(transition, "payload"), "foreign payload");
+	const hostlessOwner = { ...deadOwner, owner_token: "hostless-remover" };
+	await record(transition, hostlessOwner);
+	const recordBytes = await Bun.file(`${transition}.owner`).text();
+	const kill = vi.spyOn(process, "kill");
+
+	await expect(
+		acquireFileLock(file, { ownerHostId: "local-host", retries: 2, retryDelayMs: 1 }),
+	).rejects.toMatchObject({ code: "acquire_timeout" });
+
+	expect(kill.mock.calls.filter(([pid]) => pid === hostlessOwner.pid)).toHaveLength(0);
+	expect(await Bun.file(path.join(transition, "payload")).text()).toBe("foreign payload");
+	expect(await Bun.file(`${transition}.owner`).text()).toBe(recordBytes);
+});
+
 test.skipIf(process.platform === "win32").each([
 	["host-qualified", "local-host"],
 	["unqualified", undefined],

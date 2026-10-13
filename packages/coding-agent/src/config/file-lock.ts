@@ -742,10 +742,7 @@ async function classifyFileLockRemovalTransition(
 				localRemovalRecords.delete(recordPath);
 				return null;
 			}
-			if (
-				recordedOwner.owner.owner_host_id !== undefined &&
-				lockRecordIsForeignHost(recordedOwner.owner, ownerHostId, previousOwnerHostIds)
-			) {
+			if (lockRecordIsForeignHost(recordedOwner.owner, ownerHostId, previousOwnerHostIds)) {
 				// Never probe a foreign PID. Absence of both captured names proves
 				// retirement completed, rather than a live remover awaiting detach.
 				return (await clearCompletedForeignRemovalRecord(lockPath, transitionPath, recordedOwner))
@@ -761,11 +758,7 @@ async function classifyFileLockRemovalTransition(
 	// A sibling record survives rename and scrub without mutating the captured tree.
 	const recordedOwner = await readRemovalTransitionOwnerRecord(transitionPath);
 	if (recordedOwner) {
-		if (
-			recordedOwner.owner.owner_host_id !== undefined &&
-			lockRecordIsForeignHost(recordedOwner.owner, ownerHostId, previousOwnerHostIds)
-		)
-			return "active";
+		if (lockRecordIsForeignHost(recordedOwner.owner, ownerHostId, previousOwnerHostIds)) return "active";
 		if (
 			canonicalLockDeviceId(transition.dev).toString() !== recordedOwner.rootDev ||
 			canonicalLockFileId(transition.ino).toString() !== recordedOwner.rootIno
@@ -958,7 +951,7 @@ async function exactRemoveLockTree(
 	}
 	const recordPath = removalRecordPath(transitionPath);
 	const prior = await readRemovalTransitionOwnerRecord(transitionPath);
-	if (prior?.owner.owner_host_id !== undefined && lockRecordIsForeignHost(prior.owner, ownerHostId, [])) {
+	if (prior && lockRecordIsForeignHost(prior.owner, ownerHostId, [])) {
 		if (!(await clearCompletedForeignRemovalRecord(lockPath, transitionPath, prior)))
 			return { ok: false, code: "removal_record_busy" };
 	} else if (prior && !ownerIsAlive(prior.owner) && ownerLiveness(prior.owner.pid) !== "unknown") {
