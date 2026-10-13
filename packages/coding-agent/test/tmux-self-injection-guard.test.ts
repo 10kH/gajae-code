@@ -1013,4 +1013,76 @@ describe("tmux self-injection guard", () => {
 			}
 		});
 	});
+
+	describe("regression: follow-up review findings", () => {
+		it("consumes env split-string option terminators", async () => {
+			await expect(checkTmuxSelfInjection("env -S '-- tmux send-keys -t %47 x'", options)).resolves.toMatchObject({
+				block: true,
+			});
+		});
+
+		it("preserves TMUX assignments from env split strings", async () => {
+			await expect(
+				checkTmuxSelfInjection("env -S 'TMUX=/tmp/other tmux send-keys -t %47 x'", options),
+			).resolves.toEqual({ block: false });
+		});
+
+		it("ends wrapper option parsing at --", async () => {
+			await expect(checkTmuxSelfInjection("env -- -x tmux send-keys -t %47 x", options)).resolves.toEqual({
+				block: false,
+			});
+			await expect(checkTmuxSelfInjection("env -- tmux send-keys -t %47 x", options)).resolves.toMatchObject({
+				block: true,
+			});
+		});
+
+		it("treats assignments after the shell time keyword as environment assignments", async () => {
+			await expect(checkTmuxSelfInjection("time FOO=x tmux send-keys -t %47 x", options)).resolves.toMatchObject({
+				block: true,
+			});
+			await expect(checkTmuxSelfInjection("/usr/bin/time FOO=x tmux send-keys -t %47 x", options)).resolves.toEqual({
+				block: false,
+			});
+		});
+
+		it("finds xargs option operands across long option lists", async () => {
+			await expect(
+				checkTmuxSelfInjection("printf x | xargs -t -x -0 -r -I TMUX=/tmp/other tmux send-keys -t %47 x", options),
+			).resolves.toMatchObject({ block: true });
+		});
+
+		it("recursively processes nested env split strings", async () => {
+			await expect(
+				checkTmuxSelfInjection("env -S \"-S 'tmux send-keys -t %47 x'\"", options),
+			).resolves.toMatchObject({ block: true });
+		});
+
+		it("preserves empty argv entries in env split strings", async () => {
+			await expect(
+				checkTmuxSelfInjection(`env -S "bash -c '' 'tmux send-keys -t %47 x'"`, options),
+			).resolves.toEqual({ block: false });
+		});
+
+		it("consumes GNU env options in split strings", async () => {
+			for (const option of [
+				"-",
+				"-0",
+				"--null",
+				"--block-signal",
+				"--default-signal=TERM",
+				"--ignore-signal=TERM",
+				"--list-signal-handling",
+			]) {
+				await expect(
+					checkTmuxSelfInjection(`env -S '${option} tmux send-keys -t %47 x'`, options),
+				).resolves.toMatchObject({ block: true });
+			}
+		});
+
+		it("recognizes positive shell options around -c", async () => {
+			for (const command of ["bash +e -c 'tmux send-keys -t %47 x'", "bash -c +e 'tmux send-keys -t %47 x'"]) {
+				await expect(checkTmuxSelfInjection(command, options)).resolves.toMatchObject({ block: true });
+			}
+		});
+	});
 });

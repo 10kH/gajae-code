@@ -26,9 +26,10 @@ const NON_EXECUTING_SUDO_OPTIONS = new Set([
 	"--help",
 ]);
 const NON_EXECUTING_ENV_OPTIONS = new Set(["--help", "--version"]);
+const ENV_SIGNAL_OPTIONS = new Set(["--block-signal", "--default-signal", "--ignore-signal", "--list-signal-handling"]);
 const NON_EXECUTING_NICE_OPTIONS = new Set(["--help", "--version"]);
 const NON_EXECUTING_TIME_OPTIONS = new Set(["--help", "--version"]);
-const ASSIGNMENT_AWARE_WRAPPERS = new Set(["env", "sudo"]); // Only these allow VAR=value at start
+const ASSIGNMENT_AWARE_WRAPPERS = new Set(["env", "sudo"]);
 const CONTROL_WORDS = new Set(["then", "do", "else", "fi", "done", "esac"]);
 const MAX_INDIRECTION_DEPTH = 4;
 
@@ -49,6 +50,7 @@ const SHELL_LONG_OPTIONS_WITH_ARG = new Set([
 	"--rcfile", // bash --rcfile FILE
 	"--init-file", // bash --init-file FILE (same as --rcfile)
 ]);
+const SHELL_POSITIVE_SHORT_OPTIONS = new Set("abefhkmnptuvxBCEHPT");
 
 // Options that take arguments for long-option forms (e.g., env --unset=VAR, xargs --file=FILE)
 const LONG_OPTIONS_WITH_ARG = new Set([
@@ -61,6 +63,11 @@ const WRAPPER_LONG_OPTIONS: Record<string, Record<string, boolean>> = {
 		"--unset": true, // env --unset=VAR or --unset VAR
 		"--chdir": true, // env --chdir=DIR (takes directory)
 		"--split-string": true, // env -S/--split-string (takes command string)
+		"--block-signal": false,
+		"--default-signal": false,
+		"--ignore-signal": false,
+		"--list-signal-handling": false,
+		"--null": false,
 	},
 	sudo: {
 		"--chdir": true,
@@ -176,6 +183,7 @@ interface Token {
 	text: string;
 	quoted: boolean;
 	commandStart: boolean;
+	segment: number;
 	isWrappedCommand?: boolean; // true if this token is the actual command being wrapped by a wrapper like 'command', 'env', 'sudo'
 }
 
@@ -189,6 +197,10 @@ function isAssignment(text: string): boolean {
 
 function isNegativeNumber(text: string): boolean {
 	return /^-\d+/.test(text); // e.g., -5, -10, etc.
+}
+
+function isPositiveShellOption(text: string): boolean {
+	return text.length === 2 && text[0] === "+" && SHELL_POSITIVE_SHORT_OPTIONS.has(text[1]);
 }
 
 function isLongOption(text: string): boolean {
@@ -224,7 +236,10 @@ function tokenize(command: string): Token[] {
 	let quoted = false;
 	let quote: "'" | '"' | undefined;
 	let atCommandStart = true;
-	let wrapperCommand: { name: string; spec: WrapperSpec } | undefined;
+	let segment = 0;
+	let wrapperCommand:
+		| { name: string; spec: WrapperSpec; optionsTerminated: boolean; assignmentAware: boolean }
+		| undefined;
 	let skipNextArg = false;
 	let positionalsPending = 0;
 	let redirectionTargetPending = false;
@@ -239,7 +254,7 @@ function tokenize(command: string): Token[] {
 		if (text.length === 0 && !quoted) return;
 
 		if (redirectionTargetPending) {
-			tokens.push({ text, quoted, commandStart: false });
+			tokens.push({ text, quoted, commandStart: false, segment });
 			if (redirectionTargetIsHereDoc) {
 				hereDocDelimiters.push({ delimiter: text, stripTabs: redirectionTargetStripTabs });
 			}
@@ -278,13 +293,23 @@ function tokenize(command: string): Token[] {
 				// If in a wrapper, keep wrapper active and don't change atCommandStart
 			} else if (newWrapper) {
 				// Track this wrapper for its arguments (use baseName for consistent lookup)
-				wrapperCommand = { name: baseName, spec: newWrapper };
+				wrapperCommand = {
+					name: baseName,
+					spec: newWrapper,
+					optionsTerminated: false,
+					assignmentAware: ASSIGNMENT_AWARE_WRAPPERS.has(baseName) || (baseName === "time" && !text.includes("/")),
+				};
 				skipNextArg = false;
 				positionalsPending = newWrapper.hasPositionalArg ? 1 : 0;
 				atCommandStart = false; // Now in wrapper argument mode
 			} else if (isBuiltinWrapper) {
 				// Built-in wrappers
-				wrapperCommand = { name: baseName, spec: { optionsWithArg: new Set() } };
+				wrapperCommand = {
+					name: baseName,
+					spec: { optionsWithArg: new Set() },
+					optionsTerminated: false,
+					assignmentAware: false,
+				};
 				skipNextArg = false;
 				positionalsPending = 0;
 				atCommandStart = false; // Now in wrapper argument mode
@@ -303,6 +328,19 @@ function tokenize(command: string): Token[] {
 			// Not at command start
 			if (currentTokenIsPendingOperand) {
 				skipNextArg = false;
+			} else if (wrapperCommand && text === "--") {
+				wrapperCommand.optionsTerminated = true;
+				skipNextArg = false;
+			} else if (wrapperCommand?.optionsTerminated) {
+				if (positionalsPending > 0) {
+					positionalsPending--;
+				} else {
+					wrapperCommand = undefined;
+					skipNextArg = false;
+					positionalsPending = 0;
+					commandStart = true;
+					isWrappedCommand = true;
+				}
 			} else if (text.startsWith("-") && !isNegativeNumber(text)) {
 				// This is an option (but not a negative number like -5)
 				// Don't touch skipNextArg yet; it will be consumed by the next argument
@@ -326,11 +364,10 @@ function tokenize(command: string): Token[] {
 			} else if (positionalsPending > 0) {
 				// This is a positional argument like timeout's DURATION
 				positionalsPending--;
-			} else if (isAssignment(text) && wrapperCommand && ASSIGNMENT_AWARE_WRAPPERS.has(wrapperCommand.name)) {
-				// In assignment-aware wrappers (env, sudo), assignments are arguments
-				// Keep wrapper mode active for nested wrappers like 'env sudo -E tmux ...'
+			} else if (isAssignment(text) && wrapperCommand?.assignmentAware) {
+				// Keep assignment-aware wrappers active for commands such as 'env FOO=x tmux'.
 				commandStart = false;
-			} else if (isAssignment(text) && wrapperCommand && !ASSIGNMENT_AWARE_WRAPPERS.has(wrapperCommand.name)) {
+			} else if (isAssignment(text) && wrapperCommand && !wrapperCommand.assignmentAware) {
 				// In non-assignment-aware wrappers, VAR=value tries to be executed as a command
 				// This means we've hit the end of the wrapper and found the wrapped command
 				wrapperCommand = undefined;
@@ -351,14 +388,24 @@ function tokenize(command: string): Token[] {
 					positionalsPending = 0;
 				} else if (nestedWrapper) {
 					// Nested wrapper found - set it up as the new wrapper (use baseName)
-					wrapperCommand = { name: nestedBaseName, spec: nestedWrapper };
+					wrapperCommand = {
+						name: nestedBaseName,
+						spec: nestedWrapper,
+						optionsTerminated: false,
+						assignmentAware: ASSIGNMENT_AWARE_WRAPPERS.has(nestedBaseName),
+					};
 
 					skipNextArg = false;
 					positionalsPending = nestedWrapper.hasPositionalArg ? 1 : 0;
 					commandStart = true; // The wrapper itself is still a command start
 				} else if (isNestedBuiltinWrapper) {
 					// Nested built-in wrapper found
-					wrapperCommand = { name: nestedBaseName, spec: { optionsWithArg: new Set() } };
+					wrapperCommand = {
+						name: nestedBaseName,
+						spec: { optionsWithArg: new Set() },
+						optionsTerminated: false,
+						assignmentAware: false,
+					};
 					skipNextArg = false;
 					positionalsPending = 0;
 					commandStart = true; // The wrapper itself is still a command start
@@ -372,7 +419,7 @@ function tokenize(command: string): Token[] {
 			}
 		}
 
-		const token: Token = { text, quoted, commandStart, ...(isWrappedCommand && { isWrappedCommand }) };
+		const token: Token = { text, quoted, commandStart, segment, ...(isWrappedCommand && { isWrappedCommand }) };
 		tokens.push(token);
 
 		text = "";
@@ -420,6 +467,7 @@ function tokenize(command: string): Token[] {
 		}
 		if (ch === "\n") {
 			flush();
+			segment++;
 			atCommandStart = true;
 			wrapperCommand = undefined;
 			skipNextArg = false;
@@ -461,6 +509,7 @@ function tokenize(command: string): Token[] {
 		}
 		if (isSeparator(ch)) {
 			flush();
+			segment++;
 			atCommandStart = true;
 			wrapperCommand = undefined;
 			skipNextArg = false;
@@ -550,14 +599,16 @@ function targetFromArgs(args: string[]): string | undefined {
 
 /**
  * Reconstruct the full command line from an env -S split string.
- * env -S will split the string and process the resulting tokens as env's own arguments,
- * consuming env's options and variable assignments before finding the actual command to execute.
- * This returns the argv that env will actually execute.
+ * env -S will split the string and process the resulting tokens as env's own arguments.
+ * Keep leading variable assignments in the returned argv so recursive analysis can
+ * account for their socket override.
  */
-function reconstructCommandFromEnvSplit(splitString: string): string[] | undefined {
-	// Split the string into tokens (respecting simple shell quoting)
+function reconstructCommandFromEnvSplit(splitString: string, depth = 0): string[] | undefined {
+	if (depth > MAX_INDIRECTION_DEPTH) return undefined;
+
 	const parts: string[] = [];
 	let current = "";
+	let argumentStarted = false;
 	let quoted = false;
 	let quoteChar: "'" | '"' = "'";
 
@@ -567,27 +618,33 @@ function reconstructCommandFromEnvSplit(splitString: string): string[] | undefin
 			i++;
 			if (quoted) {
 				current += " ";
+				argumentStarted = true;
 			} else {
-				if (current) parts.push(current);
+				if (argumentStarted) parts.push(current);
 				current = "";
+				argumentStarted = false;
 			}
 		} else if (!quoted && (ch === "'" || ch === '"')) {
 			quoted = true;
 			quoteChar = ch;
+			argumentStarted = true;
 		} else if (quoted && ch === quoteChar) {
 			quoted = false;
 		} else if (!quoted && /\s/.test(ch)) {
-			if (current) parts.push(current);
+			if (argumentStarted) parts.push(current);
 			current = "";
+			argumentStarted = false;
 		} else {
 			current += ch;
+			argumentStarted = true;
 		}
 	}
-	if (current) parts.push(current);
+	if (argumentStarted) parts.push(current);
 
-	// Process parts through env's option parsing
-	const envShortOptionsWithArg = new Set(["-u", "-C"]); // env -u VAR, env -C DIR
+	const assignments: string[] = [];
+	const envShortOptionsWithArg = new Set(["-u", "-C"]);
 	let skipNext = false;
+	let optionsTerminated = false;
 	let commandStartIdx = -1;
 
 	for (let i = 0; i < parts.length; i++) {
@@ -597,55 +654,80 @@ function reconstructCommandFromEnvSplit(splitString: string): string[] | undefin
 			skipNext = false;
 			continue;
 		}
-
-		// Skip env's own options
-		if (part === "-i" || part === "--ignore-environment") {
-			continue; // flag-only
+		if (optionsTerminated) {
+			commandStartIdx = i;
+			break;
 		}
-		if (part === "-v" || part === "--debug") {
-			continue; // flag-only
+		if (part === "--") {
+			optionsTerminated = true;
+			continue;
+		}
+		if (part === "--help" || part === "--version") return undefined;
+		const longOptionName = part.split("=")[0];
+		if (ENV_SIGNAL_OPTIONS.has(longOptionName)) continue;
+
+		let splitString: string | undefined;
+		let splitOptionLength = 0;
+		if (part === "-S" || part === "--split-string") {
+			splitString = parts[i + 1];
+			splitOptionLength = 2;
+		} else if (part.startsWith("-S") && part.length > 2) {
+			splitString = part.slice(2);
+			splitOptionLength = 1;
+		} else if (part.startsWith("--split-string=")) {
+			splitString = part.slice("--split-string=".length);
+			splitOptionLength = 1;
+		}
+		if (splitOptionLength > 0) {
+			if (splitString === undefined) return undefined;
+			const nested = reconstructCommandFromEnvSplit(splitString, depth + 1);
+			if (!nested) return undefined;
+			parts.splice(i, splitOptionLength, ...nested);
+			i = -1;
+			assignments.length = 0;
+			skipNext = false;
+			optionsTerminated = false;
+			continue;
+		}
+
+		if (
+			part === "-" ||
+			part === "-i" ||
+			part === "--ignore-environment" ||
+			part === "-v" ||
+			part === "--debug" ||
+			part === "-0" ||
+			part === "--null"
+		) {
+			continue;
 		}
 		if (envShortOptionsWithArg.has(part)) {
 			skipNext = true;
 			continue;
 		}
-		if (part.startsWith("-u") && part.length > 2) {
-			continue; // bundled form like -uVAR
-		}
-		if (part.startsWith("-C") && part.length > 2) {
-			continue; // bundled form like -CDIR
+		if ((part.startsWith("-u") && part.length > 2) || (part.startsWith("-C") && part.length > 2)) {
+			continue;
 		}
 		if (part.startsWith("--")) {
 			const eqIdx = part.indexOf("=");
 			const optName = eqIdx >= 0 ? part.substring(0, eqIdx) : part;
-
 			if (optName === "--unset" || optName === "--chdir") {
-				if (eqIdx < 0) skipNext = true; // separate argument form
+				if (eqIdx < 0) skipNext = true;
 				continue;
 			}
-			// Other long options are either flag-only or not env options
-			if (optName === "--ignore-environment" || optName === "--debug") {
-				continue; // flag-only env options
-			}
 		}
 
-		// Check if it's a variable assignment (env allows VAR=value arguments)
-		if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(part)) {
-			continue; // Skip variable assignments
+		if (isAssignment(part)) {
+			assignments.push(part);
+			continue;
 		}
-
-		// This is the actual command - reconstruct from here to the end
 		commandStartIdx = i;
 		break;
 	}
 
-	if (commandStartIdx >= 0) {
-		// Keep the argument boundaries so a nested shell still receives its exact
-		// -c payload rather than treating the payload's words as separate argv.
-		return parts.slice(commandStartIdx);
-	}
-
-	return undefined; // No command found
+	if (commandStartIdx < 0) return undefined;
+	// Keep environment assignments and argv boundaries for recursive inspection.
+	return [...assignments, ...parts.slice(commandStartIdx)];
 }
 
 function quoteShellArgument(argument: string): string {
@@ -708,6 +790,7 @@ function collectShellPayloads(tokens: Token[]): string[] {
 				continue;
 			}
 			if (word.startsWith("+O") || word.startsWith("+o")) continue;
+			if (isPositiveShellOption(word)) continue;
 
 			// Once we see a non-option word (not starting with -), that's the script name.
 			// Any further flags are arguments to that script, not shell options.
@@ -806,6 +889,7 @@ function collectShellPayloads(tokens: Token[]): string[] {
 					if (!optionsTerminated && (payloadWord.startsWith("+O") || payloadWord.startsWith("+o"))) {
 						continue;
 					}
+					if (!optionsTerminated && isPositiveShellOption(payloadWord)) continue;
 
 					// Skip over any remaining shell options or their arguments. Quotes
 					// don't change how Bash interprets an argv value beginning with '-'.
@@ -978,6 +1062,7 @@ function collectShellScripts(tokens: Token[], cwd: string): string[] {
 				continue;
 			}
 			if (argument.startsWith("+O") || argument.startsWith("+o")) continue;
+			if (isPositiveShellOption(argument)) continue;
 
 			// If we encounter -c, stop looking (script mode is not used)
 			if (argument === "-c") break;
@@ -1059,12 +1144,14 @@ function sameSocket(left: string, right: string): boolean {
 function assignedTmuxSocket(tokens: Token[], commandIndex: number): string | undefined {
 	// Backtrack from the command position to find any TMUX assignment.
 	// TMUX assignments are valid if they appear before the command and any wrappers,
-	// within the same invocation (before a command boundary marked by non-wrapper commandStart).
+	// within the same simple command (tracked by the token segment).
 	// Important: we must not treat wrapper option operands as assignments.
 	// For example, in 'xargs -I TMUX=/tmp/other ...', the TMUX=/tmp/other is -I's operand, not an assignment.
 
-	for (let index = commandIndex - 1; index >= 0 && commandIndex - index <= 20; index++) {
+	const commandSegment = tokens[commandIndex].segment;
+	for (let index = commandIndex - 1; index >= 0; index--) {
 		const token = tokens[index];
+		if (token.segment !== commandSegment) break;
 
 		// Check for TMUX assignment, but exclude tokens that are operands to wrapper options.
 		const assignment = token.text.match(/^TMUX=([^,\s]+)/);
@@ -1084,8 +1171,8 @@ function assignedTmuxSocket(tokens: Token[], commandIndex: number): string | und
 					// This is a conservative check: if it's a flag starting with -, it might consume the next argument
 					let optionTakesArg = false;
 
-					// Look for wrapper commands near this position
-					for (let wrapIdx = index - 1; wrapIdx >= 0 && index - wrapIdx <= 5; wrapIdx--) {
+					// Find the wrapper within the current command, regardless of option count.
+					for (let wrapIdx = index - 1; wrapIdx >= 0; wrapIdx--) {
 						if (tokens[wrapIdx].commandStart) {
 							const baseName = tokens[wrapIdx].text.includes("/")
 								? tokens[wrapIdx].text.split("/").pop() || tokens[wrapIdx].text
