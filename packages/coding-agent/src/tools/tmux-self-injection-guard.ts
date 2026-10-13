@@ -1879,7 +1879,7 @@ function assignedTmuxEnvironmentValue(
 	return undefined;
 }
 
-function commandWorkingDirectory(tokens: Token[], commandIndex: number, cwd: string): string {
+function commandWorkingDirectory(tokens: Token[], commandIndex: number, cwd: string): string | undefined {
 	let effectiveCwd = cwd;
 	for (let index = 0; index < commandIndex; index++) {
 		const token = tokens[index];
@@ -1908,10 +1908,17 @@ function commandWorkingDirectory(tokens: Token[], commandIndex: number, cwd: str
 			} else if (!argument.text.startsWith("-") && !isAssignment(argument.text)) {
 				break;
 			}
-			if (chdir !== undefined) effectiveCwd = path.resolve(effectiveCwd, chdir);
+			if (chdir !== undefined) {
+				if (hasShellPathExpansion(chdir)) return undefined;
+				effectiveCwd = path.resolve(effectiveCwd, chdir);
+			}
 		}
 	}
 	return effectiveCwd;
+}
+
+function hasShellPathExpansion(value: string): boolean {
+	return /[$`*?[\]]/.test(value) || value.startsWith("~");
 }
 
 /**
@@ -1997,9 +2004,20 @@ export async function checkTmuxSelfInjection(
 		const assignedTmpdir = assignedTmuxEnvironmentValue(tokens, index, "TMUX_TMPDIR");
 		if (assignedTmpdir !== undefined) commandEnv.TMUX_TMPDIR = assignedTmpdir;
 		const commandCwd = commandWorkingDirectory(tokens, index, cwd);
-		const commandSocket = invocation.socket
-			? socketPathFor(invocation.socket, commandEnv, commandCwd, uid)
-			: assignedTmux;
+		const socketPathIsUnknown =
+			invocation.socket !== undefined &&
+			(hasShellPathExpansion(invocation.socket.value) ||
+				(invocation.socket.flag === "-S" &&
+					!path.isAbsolute(invocation.socket.value) &&
+					commandCwd === undefined) ||
+				(invocation.socket.flag === "-L" && assignedTmpdir !== undefined && hasShellPathExpansion(assignedTmpdir)));
+		const commandSocket = socketPathIsUnknown
+			? undefined
+			: invocation.socket
+				? socketPathFor(invocation.socket, commandEnv, commandCwd ?? cwd, uid)
+				: assignedTmux !== undefined && !hasShellPathExpansion(assignedTmux)
+					? assignedTmux
+					: undefined;
 		if (commandSocket && !sameSocket(commandSocket, identity.socketPath)) continue;
 
 		const target = targetFromArgs(invocation.args);

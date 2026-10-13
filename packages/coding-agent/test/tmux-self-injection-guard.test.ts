@@ -74,6 +74,17 @@ describe("tmux self-injection guard", () => {
 		).resolves.toEqual({ block: false });
 	});
 
+	it("fails closed when shell expansion makes socket selection unknown", async () => {
+		const socketDir = env.TMUX.split(",")[0].substring(0, env.TMUX.split(",")[0].lastIndexOf("/"));
+		for (const command of [
+			`env -C "$(printf '%s' '${socketDir}')" tmux -S default send-keys -t %47 x`,
+			`TMUX_TMPDIR="$(printf '%s' /tmp/other)" tmux -L default send-keys -t %47 x`,
+			`tmux -S "$TMUX_SOCKET" send-keys -t %47 x`,
+		]) {
+			await expect(checkTmuxSelfInjection(command, options)).resolves.toMatchObject({ block: true });
+		}
+	});
+
 	it("blocks the current server selected with -L", async () => {
 		await expect(checkTmuxSelfInjection("tmux -L default send-keys -t %47 x", options)).resolves.toMatchObject({
 			block: true,
