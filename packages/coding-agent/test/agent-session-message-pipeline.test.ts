@@ -1221,6 +1221,70 @@ describe("AgentSession message pipeline", () => {
 		await prompt;
 	});
 
+	it("rejects an in-flight SDK terminal when disposal starts during extension delivery", async () => {
+		const extensionStarted = Promise.withResolvers<void>();
+		const releaseExtension = Promise.withResolvers<void>();
+		const model: Model = {
+			id: "dispose-slow-extension-model",
+			name: "dispose-slow-extension-model",
+			provider: "mock",
+			api: "mock",
+			baseUrl: "mock://",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200_000,
+			maxTokens: 32_768,
+		};
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["system prompt"], messages: [], tools: [] },
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: createAssistantMessage("") });
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("done") });
+				});
+				return stream;
+			},
+		});
+		const session = new AgentSession({
+			agent,
+			sessionManager: createIsolatedSessionManager(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: testModelRegistry as never,
+			extensionRunner: {
+				emitBeforeAgentStart: async () => undefined,
+				emit: async (event: { type: string }) => {
+					if (event.type !== "agent_end") return;
+					extensionStarted.resolve();
+					await releaseExtension.promise;
+				},
+				hasHandlers: (eventType: string) => eventType === "agent_end",
+			} as never,
+		});
+		sessions.push(session);
+
+		const prompt = session.sendUserMessage("dispose during terminal delivery", {
+			sdkRunCapability: createSdkRunCapability("dispose-slow-extension"),
+		} as never);
+		await extensionStarted.promise;
+		const disposal = session.dispose();
+		const promptOutcome = await Promise.race([
+			prompt.then(
+				() => "resolved",
+				error => error,
+			),
+			Bun.sleep(100).then(() => "timeout"),
+		]);
+		expect(promptOutcome).not.toBe("timeout");
+		expect(promptOutcome).not.toBe("resolved");
+		expect(promptOutcome).toMatchObject({ code: "cancelled" });
+
+		releaseExtension.resolve();
+		await disposal;
+	});
+
 	it("drains deferred agent_end extension delivery before session shutdown", async () => {
 		const extensionStarted = Promise.withResolvers<void>();
 		const releaseExtension = Promise.withResolvers<void>();
