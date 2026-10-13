@@ -1083,7 +1083,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		};
 		let resumeRunner: ResumeRunner | undefined;
 		if (typeof manager.setResumeRunner === "function") {
-			resumeRunner = (_subagentId, message, resumeDescriptor, resumeToolCallId, admissionEndpointId) => {
+			resumeRunner = (
+				_subagentId,
+				message,
+				resumeDescriptor,
+				resumeToolCallId,
+				admissionEndpointId,
+				ownedRegistrationEndpointId,
+			) => {
 				const descriptor = isTaskResumeDescriptor(resumeDescriptor?.data) ? resumeDescriptor.data : undefined;
 				if (!descriptor) return undefined;
 				const admission = (() => {
@@ -1209,6 +1216,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					resumeToolCallId ?? descriptor.toolCallId,
 					resumeJobId,
 					admissionEndpointId ?? this.session.getAsyncEndpointId?.() ?? this.session.getSessionId?.() ?? undefined,
+					ownedRegistrationEndpointId ?? AsyncJobManager.endpointIdOf(manager),
 				);
 				return resumeJobId;
 			};

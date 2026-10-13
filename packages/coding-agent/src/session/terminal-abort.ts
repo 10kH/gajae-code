@@ -841,6 +841,7 @@ export function registerOwnedIfLineaged(
 	toolCallId: string | undefined,
 	jobId: string,
 	endpointId?: string,
+	ownedRegistrationEndpointId?: string,
 ): void {
 	try {
 		let lineage = resolveToolLineage(toolCallId, endpointId);
@@ -860,9 +861,10 @@ export function registerOwnedIfLineaged(
 		const job = manager.getJob?.(jobId);
 		const jobGeneration = job?.generation;
 		if (!jobGeneration) return;
+		const registrationEndpointId = ownedRegistrationEndpointId ?? lineage.endpointId;
 		registerOwnedRegistration(
 			{
-				...(lineage.endpointId ? { endpointId: lineage.endpointId } : {}),
+				...(registrationEndpointId ? { endpointId: registrationEndpointId } : {}),
 				endpointGeneration: lineage.endpointGeneration,
 				lineageIdHash: lineage.lineageIdHash,
 				promptAttemptEpoch: lineage.promptAttemptEpoch,
@@ -877,7 +879,7 @@ export function registerOwnedIfLineaged(
 				// job id bg_1) must not be judged terminal using THIS manager's
 				// unrelated bg_1 record (review thread P2).
 				isJobTerminal: candidate => {
-					if ((candidate.endpointId ?? "") !== (lineage.endpointId ?? "")) return undefined;
+					if ((candidate.endpointId ?? "") !== (registrationEndpointId ?? "")) return undefined;
 					const status = manager.getJob?.(candidate.jobId)?.status;
 					return status === "completed" || status === "cancelled" || status === "failed" || status === "evicted";
 				},

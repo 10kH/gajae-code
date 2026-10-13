@@ -1,6 +1,10 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import { AsyncJobManager } from "@gajae-code/coding-agent/async/job-manager";
-import { lookupOwnedRegistration, registerOwnedRegistration } from "../src/session/terminal-abort";
+import {
+	lookupOwnedRegistration,
+	registerOwnedRegistration,
+	unregisterOwnedRegistration,
+} from "../src/session/terminal-abort";
 
 describe("AsyncJobManager", () => {
 	test("reentrant cancellation disposal waits for the published runner completion", async () => {
@@ -1307,23 +1311,21 @@ describe("AsyncJobManager", () => {
 
 	test("rekeyForEndpoint migrates queued resume registrations from E1 to E2", async () => {
 		// Test that when a manager is rekeyed from E1 to E2, any queued resume
-		// entries that were registered at E1 are migrated to E2. This verifies that
-		// the E1-bound lineage/admission tuple is migrated atomically during rekey
-		// so ownership resolves at E2 and retirement of the queued entry uses the
-		// same migrated identity.
+		// ownership tuple moves to E2 while its admission endpoint remains E1 for
+		// exact lineage lookup. Both endpoint identities are retained so queue
+		// cleanup and resumed-job registration stay aligned after rekey.
 		const endpointE1 = "endpoint-1-rekey-source";
 		const endpointE2 = "endpoint-2-rekey-target";
+		const subagentId = "test-subagent-rekey";
+		const seq = 1;
+		const queuedGeneration = `queued:${subagentId}:${seq}`;
+		const lineageIdHash = "test-lineage-hash";
+		const attemptEpoch = 42;
 		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
 		try {
 			// Register the manager at E1
 			expect(AsyncJobManager.registerForEndpoint(endpointE1, manager)).toBe(true);
 			expect(AsyncJobManager.endpointIdOf(manager)).toBe(endpointE1);
-
-			const subagentId = "test-subagent-rekey";
-			const seq = 1;
-			const queuedGeneration = `queued:${subagentId}:${seq}`;
-			const lineageIdHash = "test-lineage-hash";
-			const attemptEpoch = 42;
 
 			// Register an owned registration at E1 for the queued generation
 			registerOwnedRegistration({
@@ -1379,13 +1381,17 @@ describe("AsyncJobManager", () => {
 			expect(regAtE2After?.lineageIdHash).toBe(lineageIdHash);
 			expect(regAtE2After?.promptAttemptEpoch).toBe(attemptEpoch);
 
-			// Verify the queued resume's admission endpoint was NOT updated (remains E1)
-			// so the resumed job will register at E1, not E2
+			// Preserve lineage admission at E1 while recording the tuple's new E2 key.
 			const updatedRecord = manager.getSubagentRecord(subagentId);
 			expect(updatedRecord?.queued?.admissionEndpointId).toBe(endpointE1);
+			expect(updatedRecord?.queued?.ownedRegistrationEndpointId).toBe(endpointE2);
 		} finally {
 			await manager.dispose({ timeoutMs: 100 });
 			AsyncJobManager.unregisterManager(manager);
+			for (const endpointId of [endpointE1, endpointE2]) {
+				const queuedRegistration = lookupOwnedRegistration(queuedGeneration, queuedGeneration, endpointId);
+				if (queuedRegistration) unregisterOwnedRegistration(queuedRegistration);
+			}
 		}
 	});
 });

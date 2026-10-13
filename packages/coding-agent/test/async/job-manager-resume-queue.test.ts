@@ -4,6 +4,7 @@ import {
 	bindToolLineage,
 	lookupOwnedRegistration,
 	registerOwnedIfLineaged,
+	unregisterOwnedRegistration,
 } from "@gajae-code/coding-agent/session/terminal-abort";
 
 /** Build a manager that records every delivered completion. */
@@ -57,25 +58,27 @@ function spawnControllable(manager: AsyncJobManager, subagentId: string, ownerId
 
 /** A resume runner that re-spawns a subagent which completes immediately. */
 function installResumeRunner(manager: AsyncJobManager) {
-	manager.setResumeRunner((subagentId, message, _descriptor, resumeToolCallId, admissionEndpointId) => {
-		const rec = manager.getSubagentRecord(subagentId);
-		const jobId = manager.register(
-			"task",
-			subagentId,
-			async (): Promise<SubagentRunOutcome> => ({
-				kind: "completed",
-				text: message ? `resumed:${message}` : `resumed:${subagentId}`,
-			}),
-			{
-				id: `${subagentId}-r`,
-				ownerId: rec?.ownerId,
-				metadata: { subagent: { id: subagentId, agent: "executor", agentSource: "bundled" } },
-			},
-		);
-		// Register the resumed job as owned work using the admission endpoint
-		registerOwnedIfLineaged(manager, resumeToolCallId, jobId, admissionEndpointId);
-		return jobId;
-	});
+	manager.setResumeRunner(
+		(subagentId, message, _descriptor, resumeToolCallId, admissionEndpointId, ownedRegistrationEndpointId) => {
+			const rec = manager.getSubagentRecord(subagentId);
+			const jobId = manager.register(
+				"task",
+				subagentId,
+				async (): Promise<SubagentRunOutcome> => ({
+					kind: "completed",
+					text: message ? `resumed:${message}` : `resumed:${subagentId}`,
+				}),
+				{
+					id: `${subagentId}-r`,
+					ownerId: rec?.ownerId,
+					metadata: { subagent: { id: subagentId, agent: "executor", agentSource: "bundled" } },
+				},
+			);
+			// Resolve lineage at admission while storing ownership under the manager's current endpoint.
+			registerOwnedIfLineaged(manager, resumeToolCallId, jobId, admissionEndpointId, ownedRegistrationEndpointId);
+			return jobId;
+		},
+	);
 }
 
 describe("AsyncJobManager subagent pause/resume/queue", () => {
@@ -830,7 +833,8 @@ describe("AsyncJobManager subagent pause/resume/queue", () => {
 		const registeredAtE1 = AsyncJobManager.registerForEndpoint(endpointE1, manager);
 		expect(registeredAtE1).toBe(true);
 
-		// Queue the resume with the tool call ID at E1; this saves endpointE1 as the admission endpoint
+		// Queue the resume with the tool call ID at E1; both lineage admission
+		// and queued ownership initially use endpoint E1.
 		expect(manager.resumeSubagent("A", { ownerId: "owner-a" }, "valid", validToolCallId).queued).toBe(true);
 		const validGen = `queued:A:1`;
 		const validRegBefore = lookupOwnedRegistration(validGen, validGen, endpointE1);
@@ -842,30 +846,38 @@ describe("AsyncJobManager subagent pause/resume/queue", () => {
 		expect(rekeySuccess).toBe(true);
 		// Verify the manager has been moved to E2
 		expect(AsyncJobManager.endpointIdOf(manager)).toBe(endpointE2);
+		expect(manager.getSubagentRecord("A")?.queued).toMatchObject({
+			admissionEndpointId: endpointE1,
+			ownedRegistrationEndpointId: endpointE2,
+		});
+		expect(lookupOwnedRegistration(validGen, validGen, endpointE1)).toBeUndefined();
+		expect(lookupOwnedRegistration(validGen, validGen, endpointE2)).toMatchObject({
+			lineageIdHash: "hash-valid-e1",
+			endpointId: endpointE2,
+		});
 
-		// Drain the queue by releasing the blocker; the valid entry should be cleaned up
-		// using the saved E1 endpoint, not the manager's current E2 endpoint
+		// Drain the queue by releasing the blocker; the queued tuple is retired
+		// at E2 while its original E1 lineage is used for the resumed job.
 		blocker.release();
 		await manager.waitForAll();
 		await manager.drainDeliveries({ timeoutMs: 500 });
 
-		// The valid registration should have been retired (using the saved E1 endpoint)
-		const validRegAfter = lookupOwnedRegistration(validGen, validGen, endpointE1);
+		// The queued ownership tuple moves with the manager to E2 and is retired there.
+		const validRegAfter = lookupOwnedRegistration(validGen, validGen, endpointE2);
 		expect(validRegAfter).toBeUndefined();
 
 		// The resumed job should have transitioned from queued to running/completed
 		const rec = manager.getSubagentRecord("A");
 		expect(rec?.status).not.toBe("queued");
 
-		// Verify that the resumed job is registered at the admission endpoint E1,
-		// not at the current endpoint E2
+		// The original E1 lineage is retained, but the resumed job's ownership tuple
+		// follows the manager to its current E2 endpoint.
 		if (rec?.currentJobId && rec?.currentJobGeneration) {
-			// Should exist at E1 (admission endpoint)
 			const runningRegE1 = lookupOwnedRegistration(rec.currentJobId, rec.currentJobGeneration, endpointE1);
-			expect(runningRegE1).toBeDefined();
-			// Should NOT exist at E2 (current endpoint)
+			expect(runningRegE1).toBeUndefined();
 			const runningRegE2 = lookupOwnedRegistration(rec.currentJobId, rec.currentJobGeneration, endpointE2);
-			expect(runningRegE2).toBeUndefined();
+			expect(runningRegE2).toMatchObject({ lineageIdHash: "hash-valid-e1", endpointId: endpointE2 });
+			if (runningRegE2) unregisterOwnedRegistration(runningRegE2);
 		}
 
 		await manager.dispose({ timeoutMs: 500 });

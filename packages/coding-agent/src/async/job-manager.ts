@@ -198,6 +198,7 @@ export interface SubagentRecord {
 		message?: string;
 		resumeToolCallId?: string;
 		admissionEndpointId?: string;
+		ownedRegistrationEndpointId?: string;
 		createdAt: number;
 	};
 	/** Last queued-resume seq for a CANCELLED queued resume (rec.queued is
@@ -254,6 +255,7 @@ export type ResumeRunner = (
 	descriptor?: ResumeDescriptor,
 	resumeToolCallId?: string,
 	admissionEndpointId?: string,
+	ownedRegistrationEndpointId?: string,
 ) => string | undefined;
 
 function sessionFileFromResumeDescriptorData(data: unknown): string | null {
@@ -286,6 +288,7 @@ interface ResumeQueueEntry {
 	message?: string;
 	resumeToolCallId?: string;
 	admissionEndpointId?: string;
+	ownedRegistrationEndpointId?: string;
 	createdAt: number;
 }
 
@@ -664,11 +667,9 @@ export class AsyncJobManager {
 		}
 		AsyncJobManager.#byEndpoint.delete(predecessorEndpointId);
 		AsyncJobManager.#byEndpoint.set(successorEndpointId, manager);
-		// Migrate queued resume registrations from the predecessor endpoint to the
-		// successor endpoint: if the manager was rekeyed before queue drain, we must
-		// migrate the E1-bound lineage/admission tuple to E2 atomically so ownership
-		// resolves at E2 and retirement of the queued entry uses the same migrated
-		// identity (review thread P1).
+		// Migrate queued ownership registrations from the predecessor endpoint to
+		// the successor. The admission endpoint remains unchanged for exact lineage
+		// lookup; each queue entry tracks the separate endpoint used for ownership.
 		manager.#migrateQueuedResumeRegistrations(predecessorEndpointId, successorEndpointId);
 		return true;
 	}
@@ -1915,10 +1916,13 @@ export class AsyncJobManager {
 			// rekeyed before the queue is drained or the subagent is cancelled, we
 			// need the original endpoint to unregister the queued registration.
 			let admissionEndpointId: string | undefined;
+			let ownedRegistrationEndpointId: string | undefined;
 			if (resumeToolCallId) {
-				const lineage = resolveToolLineage(resumeToolCallId, AsyncJobManager.endpointIdOf(this));
+				const managerEndpointId = AsyncJobManager.endpointIdOf(this);
+				const lineage = resolveToolLineage(resumeToolCallId, managerEndpointId);
 				if (lineage) {
-					admissionEndpointId = lineage.endpointId ?? AsyncJobManager.endpointIdOf(this);
+					admissionEndpointId = lineage.endpointId ?? managerEndpointId;
+					ownedRegistrationEndpointId = managerEndpointId ?? lineage.endpointId;
 				}
 			}
 			rec.queued = {
@@ -1927,6 +1931,7 @@ export class AsyncJobManager {
 				message,
 				...(resumeToolCallId ? { resumeToolCallId } : {}),
 				...(admissionEndpointId ? { admissionEndpointId } : {}),
+				...(ownedRegistrationEndpointId ? { ownedRegistrationEndpointId } : {}),
 				createdAt: Date.now(),
 			};
 			this.#resumeQueue.push({
@@ -1936,6 +1941,7 @@ export class AsyncJobManager {
 				message,
 				...(resumeToolCallId ? { resumeToolCallId } : {}),
 				...(admissionEndpointId ? { admissionEndpointId } : {}),
+				...(ownedRegistrationEndpointId ? { ownedRegistrationEndpointId } : {}),
 				createdAt: rec.queued.createdAt,
 			});
 			// Register the QUEUED generation as owned work of the resume request's
@@ -1948,7 +1954,7 @@ export class AsyncJobManager {
 				if (lineage) {
 					const queuedGeneration = `queued:${rec.subagentId}:${seq}`;
 					registerOwnedRegistration({
-						...(lineage.endpointId ? { endpointId: lineage.endpointId } : {}),
+						...(ownedRegistrationEndpointId ? { endpointId: ownedRegistrationEndpointId } : {}),
 						lineageIdHash: lineage.lineageIdHash,
 						promptAttemptEpoch: lineage.promptAttemptEpoch,
 						endpointGeneration: lineage.endpointGeneration,
@@ -1975,23 +1981,24 @@ export class AsyncJobManager {
 	}
 
 	#migrateQueuedResumeRegistrations(predecessorEndpointId: string, successorEndpointId: string): void {
-		// Migrate queued resume entries and their owned registrations from E1 to E2.
-		// When the manager is rekeyed before queue drain or resume, we must migrate
-		// the E1-bound lineage/admission tuple to E2 atomically so ownership resolves
-		// at E2 (review thread P1).
+		// Keep the admission endpoint for exact lineage lookup, but migrate each
+		// queued ownership tuple with the manager so cleanup and resumed-job
+		// ownership use the successor endpoint.
 
 		// Iterate through both the resume queue and subagent records to migrate all
-		// entries with admissionEndpointId matching the predecessor endpoint.
+		// entries whose owned registration is still at the predecessor endpoint.
 		const processedSeqs = new Set<number>();
 
 		// First pass: migrate queue entries
 		for (const queueEntry of this.#resumeQueue) {
-			if ((queueEntry.admissionEndpointId ?? predecessorEndpointId) === predecessorEndpointId) {
+			const queuedEndpointId =
+				queueEntry.ownedRegistrationEndpointId ?? queueEntry.admissionEndpointId ?? predecessorEndpointId;
+			if (queuedEndpointId === predecessorEndpointId) {
 				processedSeqs.add(queueEntry.seq);
 
 				// Migrate the owned registration from E1 to E2
 				const queuedGeneration = `queued:${queueEntry.subagentId}:${queueEntry.seq}`;
-				const oldReg = lookupOwnedRegistration(queuedGeneration, queuedGeneration, predecessorEndpointId);
+				const oldReg = lookupOwnedRegistration(queuedGeneration, queuedGeneration, queuedEndpointId);
 				if (oldReg) {
 					unregisterOwnedRegistration(oldReg);
 					registerOwnedRegistration({
@@ -2003,6 +2010,9 @@ export class AsyncJobManager {
 						jobGeneration: queuedGeneration,
 					});
 				}
+				queueEntry.ownedRegistrationEndpointId = successorEndpointId;
+				const rec = this.#subagentRecords.get(queueEntry.subagentId);
+				if (rec?.queued?.seq === queueEntry.seq) rec.queued.ownedRegistrationEndpointId = successorEndpointId;
 			}
 		}
 
@@ -2010,10 +2020,12 @@ export class AsyncJobManager {
 		// (e.g., entries that were queued before this rekey)
 		for (const [, rec] of this.#subagentRecords) {
 			if (rec.queued && !processedSeqs.has(rec.queued.seq)) {
-				if ((rec.queued.admissionEndpointId ?? predecessorEndpointId) === predecessorEndpointId) {
+				const queuedEndpointId =
+					rec.queued.ownedRegistrationEndpointId ?? rec.queued.admissionEndpointId ?? predecessorEndpointId;
+				if (queuedEndpointId === predecessorEndpointId) {
 					// Migrate the owned registration
 					const queuedGeneration = `queued:${rec.subagentId}:${rec.queued.seq}`;
-					const oldReg = lookupOwnedRegistration(queuedGeneration, queuedGeneration, predecessorEndpointId);
+					const oldReg = lookupOwnedRegistration(queuedGeneration, queuedGeneration, queuedEndpointId);
 					if (oldReg) {
 						unregisterOwnedRegistration(oldReg);
 						registerOwnedRegistration({
@@ -2025,6 +2037,7 @@ export class AsyncJobManager {
 							jobGeneration: queuedGeneration,
 						});
 					}
+					rec.queued.ownedRegistrationEndpointId = successorEndpointId;
 				}
 			}
 		}
@@ -2034,15 +2047,15 @@ export class AsyncJobManager {
 		const seq = rec.queued?.seq ?? rec.terminalQueuedSeq;
 		if (seq === undefined) return;
 		const queuedGeneration = `queued:${rec.subagentId}:${seq}`;
-		// Use the saved admission endpoint: if the manager was rekeyed from E1 to
-		// E2 before this queued resume was started or cancelled, we must look up
-		// the registration at E1 where it was created, not E2. Preserve endpoint
-		// isolation; do not add cross-endpoint fallback (review thread P2).
+		// The ownership endpoint follows the manager during rekey, while the
+		// admission endpoint remains tied to the original tool lineage.
 		const endpointId =
+			rec.queued?.ownedRegistrationEndpointId ??
 			rec.queued?.admissionEndpointId ??
 			(rec.queued?.resumeToolCallId
 				? resolveToolLineage(rec.queued.resumeToolCallId, AsyncJobManager.endpointIdOf(this))?.endpointId
-				: undefined);
+				: undefined) ??
+			AsyncJobManager.endpointIdOf(this);
 		const registration = lookupOwnedRegistration(queuedGeneration, queuedGeneration, endpointId);
 		if (registration) unregisterOwnedRegistration(registration);
 	}
@@ -2053,12 +2066,18 @@ export class AsyncJobManager {
 		descriptor: ResumeDescriptor | undefined,
 		resumeToolCallId?: string,
 		admissionEndpointId?: string,
+		ownedRegistrationEndpointId?: string,
 	): { ok: boolean; status?: SubagentLifecycle; jobId?: string; reason?: string } {
 		if (this.#isOwnerSubagentShutdownFenced(rec.ownerId)) {
 			return { ok: false, status: rec.status, reason: "owner_shutdown_in_progress" };
 		}
 		const prevJobId = rec.currentJobId;
 		const queuedGeneration = rec.queued?.seq !== undefined ? `queued:${rec.subagentId}:${rec.queued.seq}` : undefined;
+		const queuedEndpointId =
+			ownedRegistrationEndpointId ??
+			rec.queued?.ownedRegistrationEndpointId ??
+			rec.queued?.admissionEndpointId ??
+			AsyncJobManager.endpointIdOf(this);
 		// Clear any retained progress from the previous run so a resumed subagent
 		// never renders the prior run's tool/output as live before it emits again.
 		this.#subagentProgress.delete(rec.subagentId);
@@ -2069,6 +2088,7 @@ export class AsyncJobManager {
 			descriptor,
 			resumeToolCallId,
 			admissionEndpointId ?? rec.queued?.admissionEndpointId,
+			ownedRegistrationEndpointId ?? queuedEndpointId,
 		);
 		if (!newJobId) {
 			// The queued resume FAILED to start: retire its owned registration
@@ -2089,15 +2109,10 @@ export class AsyncJobManager {
 			// causal set has exactly one tuple per job. The EXACT stored tuple
 			// is looked up first — unregisterOwnedRegistration now verifies the
 			// full five-tuple before deleting (review thread P1). The lookup is
-			// ENDPOINT-qualified via the saved admission endpoint: if the manager
-			// was rekeyed from E1 to E2, we must use E1 to find the registration
-			// that was created at admission, not E2. Preserve endpoint isolation;
-			// do not add cross-session fallback (review thread P2).
-			const resumeEndpoint =
-				admissionEndpointId ??
-				(resumeToolCallId
-					? resolveToolLineage(resumeToolCallId, AsyncJobManager.endpointIdOf(this))?.endpointId
-					: undefined);
+			// ENDPOINT-qualified by the saved ownership endpoint. The tool lineage
+			// is looked up at admissionEndpointId, but the queued registration may
+			// have moved with the manager during rekey.
+			const resumeEndpoint = queuedEndpointId;
 			const queuedReg = lookupOwnedRegistration(queuedGeneration, queuedGeneration, resumeEndpoint);
 			if (queuedReg) unregisterOwnedRegistration(queuedReg);
 		}
@@ -2127,11 +2142,10 @@ export class AsyncJobManager {
 				// transitioned away from queued). Unregister its owned tuple so a
 				// later owned abort does not see orphaned work.
 				const staleQueuedGeneration = `queued:${entry.subagentId}:${entry.seq}`;
-				// Use the saved admission endpoint to retire the registration:
-				// the tuple was registered under that endpoint when admission queued
-				// the resume; if the manager was rekeyed before stale-entry cleanup,
-				// the current endpoint won't find the predecessor tuple.
-				const endpointId = entry.admissionEndpointId ?? AsyncJobManager.endpointIdOf(this);
+				// The tuple follows the manager's ownership endpoint during rekey;
+				// the original admission endpoint remains solely for lineage lookup.
+				const endpointId =
+					entry.ownedRegistrationEndpointId ?? entry.admissionEndpointId ?? AsyncJobManager.endpointIdOf(this);
 				const registration = lookupOwnedRegistration(staleQueuedGeneration, staleQueuedGeneration, endpointId);
 				if (registration) unregisterOwnedRegistration(registration);
 				// Mark the stale generation as terminal so waiters for that exact
@@ -2189,6 +2203,7 @@ export class AsyncJobManager {
 					this.#descriptorForRecord(rec),
 					rec.queued?.resumeToolCallId,
 					entry.admissionEndpointId,
+					entry.ownedRegistrationEndpointId,
 				);
 				if (!result.ok) {
 					if (result.reason === "owner_shutdown_in_progress") {
@@ -2276,10 +2291,11 @@ export class AsyncJobManager {
 				// the purge removes the entry with no start, cancellation, or delivery
 				// boundary, so the registration would otherwise leak into the global
 				// ownership registries and eventually make later owned aborts fail
-				// closed (review thread P2). Use the saved admission endpoint so we
-				// find the registration even if the manager was rekeyed.
+				// closed (review thread P2). Use the saved ownership endpoint after
+				// rekey, not the immutable lineage/admission endpoint.
 				const staleQueuedGeneration = `queued:${entry.subagentId}:${entry.seq}`;
-				const endpointId = entry.admissionEndpointId ?? AsyncJobManager.endpointIdOf(this);
+				const endpointId =
+					entry.ownedRegistrationEndpointId ?? entry.admissionEndpointId ?? AsyncJobManager.endpointIdOf(this);
 				const registration = lookupOwnedRegistration(staleQueuedGeneration, staleQueuedGeneration, endpointId);
 				if (registration) unregisterOwnedRegistration(registration);
 				// Also publish a terminal event for this generation so any waiters know it won't resume.
