@@ -116,6 +116,23 @@ describe("auto-compaction usage limit rotates the session credential", () => {
 		expect(ends[0]?.result).toBeDefined();
 	});
 
+	it("rotates stored credentials even when automatic retries are disabled", async () => {
+		session = createSession();
+		session.settings.set("retry.enabled", false);
+		session.settings.set("retry.maxRetries", 0);
+		const ends = collectCompactionEnds(session);
+		const compactSpy = stubCompact((apiKey, firstKey) => apiKey === firstKey);
+
+		await session.runIdleCompaction();
+
+		const keys = compactSpy.mock.calls.map(call => call[2]);
+		expect(keys).toHaveLength(2);
+		expect(keys[1]).not.toBe(keys[0]);
+		expect(ends).toHaveLength(1);
+		expect(ends[0]?.errorMessage).toBeUndefined();
+		expect(ends[0]?.result).toBeDefined();
+	});
+
 	it("marks the credential used when a sibling advances the session pointer during key resolution", async () => {
 		session = createSession();
 		const credentialIds = authStorage

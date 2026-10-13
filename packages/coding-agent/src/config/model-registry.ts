@@ -6839,9 +6839,10 @@ export class ModelRegistry {
 				owner: this.#authStorageConfigOwner,
 				signal: options.signal,
 			});
-			credentialRowId = resolved.credentialRowId;
+			credentialRowId = isVllmNoAuthToken(model.provider, resolved.apiKey) ? undefined : resolved.credentialRowId;
 			return resolved.apiKey;
 		});
+		if (apiKey === kNoAuth) credentialRowId = undefined;
 		this.#applyEffectiveAuthHeader(model, apiKey);
 		return { apiKey, credentialRowId };
 	}
