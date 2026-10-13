@@ -424,7 +424,9 @@ test("preserves access-denied publication failures instead of masking ACL errors
 
 test("keeps the staging component within filesystem limits for long target names", async () => {
 	const { root } = await makeFixture();
-	const file = path.join(root, "x".repeat(170));
+	const file = path.join(root, "x".repeat(196));
+	const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+	if (!originalPlatform?.configurable) throw new Error("process_platform_not_configurable");
 	let stagingComponentLength = 0;
 	FileLockTestHooks.nativePublicationBindings = () => ({
 		renameNoReplacePathAsync: async (source, destination) => {
@@ -434,9 +436,24 @@ test("keeps the staging component within filesystem limits for long target names
 		},
 		renameDirectoryNoReplacePathAsync,
 	});
+	FileLockTestHooks.nativeQuarantineBindings = () => ({
+		snapshotDirectoryTree,
+		exactRemoveDirectoryTree: target => {
+			syncFs.rmSync(target, { recursive: true, force: true });
+			return { ok: true };
+		},
+	});
 
-	await expect(withFileLock(file, async () => "acquired", quickAcquire)).resolves.toBe("acquired");
+	try {
+		Object.defineProperty(process, "platform", { ...originalPlatform, value: "win32" });
+		await expect(withFileLock(file, async () => "acquired", quickAcquire)).resolves.toBe("acquired");
+	} finally {
+		Object.defineProperty(process, "platform", originalPlatform);
+	}
 	expect(stagingComponentLength).toBeLessThanOrEqual(255);
+	const legacyComponentLength =
+		path.basename(file).length + ".lock.pending.".length + String(process.pid).length + 1 + 36;
+	expect(stagingComponentLength).toBeLessThanOrEqual(legacyComponentLength);
 });
 
 describe.skipIf(process.platform !== "linux")("file lock committed publication reconciliation", () => {
