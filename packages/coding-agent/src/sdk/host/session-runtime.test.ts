@@ -4447,7 +4447,10 @@ describe("SessionSdkSessionRuntime", () => {
 function createTestRuntimeExtension(api: ExtensionAPI, options: CreateSdkSessionRuntimeOptions): void {
 	createSdkSessionRuntimeExtension(api, {
 		...options,
-		ensureBrokerImpl: options.ensureBrokerImpl ?? (async () => testBrokerDiscovery),
+		ensureBrokerImpl: async input => {
+			if (options.ensureBrokerImpl) return await options.ensureBrokerImpl(input);
+			return testBrokerDiscovery;
+		},
 	});
 }
 

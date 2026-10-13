@@ -169,7 +169,6 @@ async function createHostHarness(
 	} as unknown as ExtensionAPI;
 	createSdkSessionRuntimeExtension(api, {
 		agentDir: path.join(cwd, ".gjc", "agent"),
-		ensureBrokerImpl: async () => testBrokerDiscovery,
 		...(harnessOptions.reconciliationStore
 			? {
 					terminalAbortSeams: {
@@ -181,6 +180,7 @@ async function createHostHarness(
 					},
 				}
 			: {}),
+		ensureBrokerImpl: async () => testBrokerDiscovery,
 		createTransport: async ({ sessionId: id, stateRoot, token }) => ({
 			sessionId: id,
 			stateRoot,
