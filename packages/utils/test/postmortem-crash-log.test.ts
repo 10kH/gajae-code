@@ -172,7 +172,7 @@ describe("recordFatalCrash", () => {
 		expect(contents).toContain("«redacted-aws-key»-tail");
 	});
 
-	it("redacts opaque values under generic credential labels", () => {
+	it("redacts opaque values under generic credential labels", async () => {
 		const target = tempCrashLog();
 		const secrets = [
 			"opaque-token-value",
@@ -188,13 +188,13 @@ describe("recordFatalCrash", () => {
 			path: target,
 		});
 
-		const contents = fs.readFileSync(target, "utf8");
+		const contents = await Bun.file(target).text();
 		expect(contents).toContain("diagnostic safe=keep-this");
 		for (const secret of secrets) expect(contents).not.toContain(secret);
 		expect(contents).toContain("«redacted»");
 	});
 
-	it("redacts short values under sensitive labels", () => {
+	it("redacts short values under sensitive labels", async () => {
 		const target = tempCrashLog();
 		const labeled = [
 			"token=abc123",
@@ -213,19 +213,19 @@ describe("recordFatalCrash", () => {
 
 		recordFatalCrash("Uncaught Exception", new Error(`diagnostic safe=keep-this ${labeled}`), { path: target });
 
-		const contents = fs.readFileSync(target, "utf8");
+		const contents = await Bun.file(target).text();
 		expect(contents).toContain("diagnostic safe=keep-this");
 		for (const field of labeled.split(" ")) expect(contents).not.toContain(field);
 	});
 
-	it("redacts full quoted credential values that contain spaces", () => {
+	it("redacts full quoted credential values that contain spaces", async () => {
 		const target = tempCrashLog();
 		const message =
 			'diagnostic safe=keep-this password="correct horse battery" authorization="Bearer abc" note=keep-this';
 
 		recordFatalCrash("Uncaught Exception", new Error(message), { path: target });
 
-		const contents = fs.readFileSync(target, "utf8");
+		const contents = await Bun.file(target).text();
 		expect(contents).not.toContain("correct horse battery");
 		expect(contents).not.toContain("Bearer abc");
 		expect(contents).toContain('password="«redacted»"');
@@ -233,27 +233,27 @@ describe("recordFatalCrash", () => {
 		expect(contents).toContain("note=keep-this");
 	});
 
-	it("redacts escaped quoted credentials in serialized crash text", () => {
+	it("redacts escaped quoted credentials in serialized crash text", async () => {
 		const target = tempCrashLog();
 		const message = String.raw`diagnostic safe=keep-this password=\"correct horse battery\" payload={\"password\":\"correct horse battery\"} note=keep-this`;
 
 		recordFatalCrash("Uncaught Exception", new Error(message), { path: target });
 
-		const contents = fs.readFileSync(target, "utf8");
+		const contents = await Bun.file(target).text();
 		expect(contents).not.toContain("correct horse battery");
 		expect(contents).toContain("«redacted»");
 		expect(contents).toContain("payload=");
 		expect(contents).toContain("note=keep-this");
 	});
 
-	it("redacts unterminated quoted credentials without consuming the next line", () => {
+	it("redacts unterminated quoted credentials without consuming the next line", async () => {
 		for (const credential of ['password="hunter2secret', String.raw`password=\"hunter2secret`]) {
 			const target = tempCrashLog();
 			const message = `${credential}\nsafe-after-newline=keep-this`;
 
 			recordFatalCrash("Uncaught Exception", new Error(message), { path: target });
 
-			const contents = fs.readFileSync(target, "utf8");
+			const contents = await Bun.file(target).text();
 			expect(contents).not.toContain("hunter2secret");
 			expect(contents).toContain("«redacted»");
 			expect(contents).toContain("safe-after-newline=keep-this");
