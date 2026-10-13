@@ -1670,6 +1670,12 @@ describe("tmux self-injection guard", () => {
 			).resolves.toEqual({ block: false });
 		});
 
+		it("re-enters nested wrapper parsing after a command terminator", async () => {
+			await expect(checkTmuxSelfInjection("command -- env tmux send-keys -t %47 x", options)).resolves.toMatchObject(
+				{ block: true },
+			);
+		});
+
 		it("treats assignments after the shell time keyword as environment assignments", async () => {
 			await expect(checkTmuxSelfInjection("time FOO=x tmux send-keys -t %47 x", options)).resolves.toMatchObject({
 				block: true,
