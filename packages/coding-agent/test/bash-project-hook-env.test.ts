@@ -23,6 +23,9 @@ const HOOK_KEYS = [
 	"GIT_TEMPLATE_DIR",
 	"ZDOTDIR",
 	"ENV",
+	"USERPROFILE",
+	"HOMEDRIVE",
+	"HOMEPATH",
 	"XDG_CONFIG_HOME",
 	"GIT_DIR",
 	"GIT_COMMON_DIR",
@@ -150,6 +153,12 @@ describe.skipIf(process.platform === "win32")("bash tool ignores project .env ho
 	it("does not run a GIT_CONFIG_ hook through the in-process native shell", async () => {
 		const target = project(VECTORS.GIT_CONFIG_!);
 		expect(await runProbe(target, "inprocess", forwarded(target))).toBe(false);
+	});
+
+	it("removes project Windows home selectors from the in-process native shell", async () => {
+		const target = project(() => "USERPROFILE=project-profile\nHOMEDRIVE=project-drive\nHOMEPATH=project-path\n");
+		const command = `test -z "\${USERPROFILE-}\${HOMEDRIVE-}\${HOMEPATH-}" && test -n "\${HOME-}"; echo probe-done`;
+		expect(await runProbe(target, "inprocess", { GJC_TEST_PROBE_COMMAND: command, HOME: "" })).toBe(false);
 	});
 
 	it("does not run a project GIT_SEQUENCE_EDITOR during git rebase -i", async () => {

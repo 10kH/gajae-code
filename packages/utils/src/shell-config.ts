@@ -49,9 +49,10 @@ function isExecutable(path: string): boolean {
  * Variables that make the shell or git run code on their own. bash sources
  * `BASH_ENV` (sh: `ENV`) before every non-interactive command, and zsh sources
  * `$ZDOTDIR/.zshenv`. git applies `GIT_CONFIG_*`, reads config from
- * `GIT_DIR`/`GIT_COMMON_DIR`, `$XDG_CONFIG_HOME/git/config` and `$HOME/.gitconfig`,
- * and so runs e.g. `core.fsmonitor` during `git status`; it also runs
- * helpers from `GIT_EXEC_PATH`, `GIT_PROXY_COMMAND` for `git://` remotes,
+ * `GIT_DIR`/`GIT_COMMON_DIR`, `$XDG_CONFIG_HOME/git/config` and `$HOME/.gitconfig`;
+ * on Windows it can also derive its home from `USERPROFILE`, `HOMEDRIVE` and
+ * `HOMEPATH`. It runs e.g. `core.fsmonitor` during `git status` and helpers from
+ * `GIT_EXEC_PATH`, `GIT_PROXY_COMMAND` for `git://` remotes,
  * `GIT_EXTERNAL_DIFF`, `GIT_SSH(_COMMAND)`, `GIT_ASKPASS` (auth prompts, even
  * with `GIT_TERMINAL_PROMPT=0`) and `GIT_SEQUENCE_EDITOR` (`git rebase -i`).
  * `GIT_TEMPLATE_DIR` can also seed executable hooks when `git init` creates a
@@ -59,7 +60,8 @@ function isExecutable(path: string): boolean {
  * commands could execute repository code.
  */
 const PROJECT_DENIED_SPAWN_ENV =
-	/^(?:BASH_ENV|ENV|ZDOTDIR|HOME|XDG_CONFIG_HOME|GIT_DIR|GIT_COMMON_DIR|GIT_EXEC_PATH|GIT_EXTERNAL_DIFF|GIT_PROXY_COMMAND|GIT_SSH|GIT_SSH_COMMAND|GIT_ASKPASS|GIT_SEQUENCE_EDITOR|GIT_TEMPLATE_DIR|GIT_CONFIG_(?:COUNT|PARAMETERS|GLOBAL|SYSTEM|KEY_\d+|VALUE_\d+))$/;
+	/^(?:BASH_ENV|ENV|ZDOTDIR|HOME|USERPROFILE|HOMEDRIVE|HOMEPATH|XDG_CONFIG_HOME|GIT_DIR|GIT_COMMON_DIR|GIT_EXEC_PATH|GIT_EXTERNAL_DIFF|GIT_PROXY_COMMAND|GIT_SSH|GIT_SSH_COMMAND|GIT_ASKPASS|GIT_SEQUENCE_EDITOR|GIT_TEMPLATE_DIR|GIT_CONFIG_(?:COUNT|PARAMETERS|GLOBAL|SYSTEM|KEY_\d+|VALUE_\d+))$/;
+const PROJECT_HOME_SPAWN_ENV = new Set(["HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"]);
 
 /**
  * Names of hook-capable variables whose live value came from the project `.env`.
@@ -93,14 +95,17 @@ function trustedHome(): string | undefined {
 
 /**
  * Remove project-declared hook variables from a spawn environment in place.
- * Shells and git need a home, so a project-declared `HOME` is replaced by the
- * trusted account home when one exists rather than left unset.
+ * If removing a home selector leaves `HOME` unset, provide the trusted account
+ * home when one exists rather than allowing a Windows profile fallback.
  */
 export function stripProjectSpawnHooks(env: Record<string, string>): Record<string, string> {
-	for (const name of projectDeclaredSpawnHookNames(env)) delete env[name];
-	if (env.HOME === undefined && process.platform !== "win32") {
+	const removed = projectDeclaredSpawnHookNames(env);
+	for (const name of removed) delete env[name];
+	const removedHomeSelector = removed.some(name => PROJECT_HOME_SPAWN_ENV.has(canonicalEnvKey(name)));
+	if ((env.HOME === undefined || env.HOME === "") && (process.platform !== "win32" || removedHomeSelector)) {
 		const home = trustedHome();
 		if (home !== undefined) env.HOME = home;
+		else delete env.HOME;
 	}
 	return env;
 }

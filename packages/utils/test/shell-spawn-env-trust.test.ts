@@ -23,6 +23,9 @@ const HOOK_KEYS = [
 	"GIT_TEMPLATE_DIR",
 	"ZDOTDIR",
 	"ENV",
+	"USERPROFILE",
+	"HOMEDRIVE",
+	"HOMEPATH",
 	"XDG_CONFIG_HOME",
 	"GIT_DIR",
 	"GIT_COMMON_DIR",
@@ -34,7 +37,7 @@ const HOOK_KEYS = [
 	"GIT_CONFIG_PARAMETERS",
 	"UNRELATED_PROJECT_VAR",
 ] as const;
-type Probe = Record<(typeof HOOK_KEYS)[number] | "SHARED_XDG_CONFIG_HOME", string | null>;
+type Probe = Record<(typeof HOOK_KEYS)[number] | "SHARED_XDG_CONFIG_HOME" | "HOME" | "TRUSTED_HOME", string | null>;
 
 const tempDirs: string[] = [];
 
@@ -77,6 +80,9 @@ const PLANTED = [
 	"GIT_TEMPLATE_DIR=./templates",
 	"ZDOTDIR=./zdot",
 	"ENV=./hook.sh",
+	"USERPROFILE=./project-home",
+	"HOMEDRIVE=project-drive",
+	"HOMEPATH=project-home",
 	"XDG_CONFIG_HOME=./xdg",
 	"GIT_DIR=./evil-git",
 	"GIT_COMMON_DIR=./evil-git",
@@ -96,7 +102,7 @@ describe.each([
 ] as const)("bash spawn env hook variables (%s)", (_label, autoload) => {
 	it("drops shell and git hook variables declared by the project .env", async () => {
 		const probe = await probeIn(tempDir(PLANTED), autoload);
-		expect(probe).toEqual({
+		expect(probe).toMatchObject({
 			BASH_ENV: null,
 			GIT_ASKPASS: null,
 			GIT_EXEC_PATH: null,
@@ -105,6 +111,9 @@ describe.each([
 			GIT_TEMPLATE_DIR: null,
 			ZDOTDIR: null,
 			ENV: null,
+			USERPROFILE: null,
+			HOMEDRIVE: null,
+			HOMEPATH: null,
 			XDG_CONFIG_HOME: null,
 			GIT_DIR: null,
 			GIT_COMMON_DIR: null,
@@ -121,6 +130,21 @@ describe.each([
 		});
 	});
 
+	it("drops project Windows home selectors and restores the trusted account home when available", async () => {
+		const cwd = tempDir();
+		const projectHome = path.join(cwd, "project-home");
+		fs.writeFileSync(
+			path.join(cwd, ".env"),
+			`USERPROFILE=${projectHome}\nHOMEDRIVE=project-drive\nHOMEPATH=project-home\n`,
+		);
+		const probe = await probeIn(cwd, autoload, { HOME: "" });
+		expect(probe.USERPROFILE).toBeNull();
+		expect(probe.HOMEDRIVE).toBeNull();
+		expect(probe.HOMEPATH).toBeNull();
+		expect(probe.HOME).toBe(probe.TRUSTED_HOME);
+		expect(probe.HOME).not.toBe(projectHome);
+	});
+
 	it("drops a dynamic project declaration", async () => {
 		const probe = await probeIn(tempDir("HOOK=./hook.sh\nBASH_ENV=$HOOK\n"), autoload);
 		expect(probe.BASH_ENV).toBeNull();
@@ -133,12 +157,18 @@ describe.each([
 			GIT_EXEC_PATH: "/opt/operator/git-exec",
 			GIT_PROXY_COMMAND: "/opt/operator/proxy.sh",
 			GIT_TEMPLATE_DIR: "/opt/operator/templates",
+			USERPROFILE: "/opt/operator/profile",
+			HOMEDRIVE: "C:",
+			HOMEPATH: "\\Users\\operator",
 		});
 		expect(probe.BASH_ENV).toBe("/opt/operator/bashenv");
 		expect(probe.GIT_CONFIG_COUNT).toBe("0");
 		expect(probe.GIT_EXEC_PATH).toBe("/opt/operator/git-exec");
 		expect(probe.GIT_PROXY_COMMAND).toBe("/opt/operator/proxy.sh");
 		expect(probe.GIT_TEMPLATE_DIR).toBe("/opt/operator/templates");
+		expect(probe.USERPROFILE).toBe("/opt/operator/profile");
+		expect(probe.HOMEDRIVE).toBe("C:");
+		expect(probe.HOMEPATH).toBe("\\Users\\operator");
 	});
 
 	it("does not let the project .env replace an inherited value", async () => {
