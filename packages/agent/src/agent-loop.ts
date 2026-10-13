@@ -3866,6 +3866,15 @@ async function runLoopBody(
 		);
 		stream.end(newMessages);
 	};
+	const finishCompleted = (scope?: AttemptScope): void => {
+		publishAgentEnd(
+			stream,
+			config,
+			buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "completed", scope),
+			scope,
+		);
+		stream.end(newMessages);
+	};
 	const commitMessages = (messages: AgentMessage[], scope?: AttemptScope): void => {
 		for (const message of messages) {
 			stream.push({ type: "message_start", message, scope });
@@ -3878,9 +3887,11 @@ async function runLoopBody(
 	// Outer loop: continues when queued follow-up messages arrive after agent would stop
 	while (true) {
 		let hasMoreToolCalls = true;
+		let acceptedResponseWithoutToolCalls = false;
 
 		// Inner loop: process tool calls and steering messages
 		while (hasMoreToolCalls || pendingMessages.length > 0) {
+			acceptedResponseWithoutToolCalls = false;
 			const scope =
 				initialScope ?? (firstTurn ? config.initialScope : undefined) ?? config.attemptMinter?.mint("main");
 			initialScope = undefined;
@@ -4443,6 +4454,7 @@ async function runLoopBody(
 				(c): c is ToolCallContent => c.type === "toolCall" && !isProviderResolvedToolCall(c),
 			);
 			hasMoreToolCalls = toolCalls.length > 0;
+			acceptedResponseWithoutToolCalls = !hasMoreToolCalls;
 
 			const toolResults: ToolResultMessage[] = [];
 			let repeatedMalformedToolCall = false;
@@ -4595,11 +4607,19 @@ async function runLoopBody(
 
 		// Agent would stop here. Check for follow-up messages.
 		if (loopSignal.aborted) {
+			if (acceptedResponseWithoutToolCalls && pendingMessages.length === 0) {
+				finishCompleted(lastAttemptScope);
+				return;
+			}
 			finishCancelled(lastAttemptScope);
 			return;
 		}
 		await config.onBeforeYield?.();
 		if (loopSignal.aborted) {
+			if (acceptedResponseWithoutToolCalls && pendingMessages.length === 0) {
+				finishCompleted(lastAttemptScope);
+				return;
+			}
 			finishCancelled(lastAttemptScope);
 			return;
 		}
