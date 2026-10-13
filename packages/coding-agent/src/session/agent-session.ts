@@ -23306,6 +23306,7 @@ export class AgentSession {
 		if (this.#hasManagedFallbackCredentialPin(candidate.provider)) return undefined;
 		const authStorage = this.#modelRegistry.authStorage;
 		const matchingRowIds = await authStorage.getCredentialRowIdsMatchingApiKey(candidate.provider, apiKey);
+		if (this.#hasManagedFallbackCredentialPin(candidate.provider)) return undefined;
 		if (credentialRowId !== undefined && !matchingRowIds.includes(credentialRowId)) {
 			matchingRowIds.unshift(credentialRowId);
 		}
@@ -23319,6 +23320,7 @@ export class AgentSession {
 			authStorage.getSessionCredentialType(candidate.provider, this.credentialSessionId);
 		if (credentialKind === undefined) return undefined;
 		for (const failedRowId of matchingRowIds) {
+			if (this.#hasManagedFallbackCredentialPin(candidate.provider)) return undefined;
 			if (failedRowIds.has(failedRowId)) continue;
 			failedRowIds.add(failedRowId);
 			await authStorage.markUsageLimitReached(candidate.provider, this.credentialSessionId, {
@@ -23331,6 +23333,7 @@ export class AgentSession {
 		// sticky pointer back to a row this rotation already tried. Scan the live
 		// inventory and exclude every failed row instead of trusting that pointer.
 		for (const peer of inventory) {
+			if (this.#hasManagedFallbackCredentialPin(candidate.provider)) return undefined;
 			if (
 				peer.credentialKind !== credentialKind ||
 				failedRowIds.has(peer.id) ||
@@ -23352,6 +23355,7 @@ export class AgentSession {
 				});
 				continue;
 			}
+			if (this.#hasManagedFallbackCredentialPin(candidate.provider)) return undefined;
 			if (
 				resolved.credentialRowId === peer.id &&
 				isAuthenticated(resolved.apiKey) &&

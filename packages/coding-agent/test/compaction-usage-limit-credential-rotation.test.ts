@@ -566,6 +566,33 @@ describe("auto-compaction usage limit rotates the session credential", () => {
 		expect(ends[0]?.errorMessage).toContain("usage limit has been reached");
 	});
 
+	it("rechecks credential pins installed while matching the failed key", async () => {
+		session = createSession();
+		const resolveRows = authStorage.getCredentialRowIdsMatchingApiKey.bind(authStorage);
+		const getCredentialRowIdsMatchingApiKey = vi
+			.spyOn(authStorage, "getCredentialRowIdsMatchingApiKey")
+			.mockImplementation(async (provider, apiKey) => {
+				const rowIds = await resolveRows(provider, apiKey);
+				const rowId = rowIds[0];
+				if (rowId === undefined) throw new Error("expected to match the failed stored credential");
+				authStorage.setRuntimeCredentialSelector(provider, { kind: "id", value: String(rowId) });
+				return rowIds;
+			});
+		const markUsageLimitReached = vi.spyOn(authStorage, "markUsageLimitReached");
+		const ends = collectCompactionEnds(session);
+		const compactSpy = stubCompact(() => true);
+
+		await session.runIdleCompaction();
+
+		const keys = compactSpy.mock.calls.map(call => call[2]);
+		expect(getCredentialRowIdsMatchingApiKey).toHaveBeenCalledTimes(1);
+		expect(keys).toHaveLength(1 + MAX_RETRIES);
+		expect(new Set(keys).size).toBe(1);
+		expect(markUsageLimitReached).not.toHaveBeenCalled();
+		expect(ends).toHaveLength(1);
+		expect(ends[0]?.errorMessage).toContain("usage limit has been reached");
+	});
+
 	it("does not bypass a pinned credential that is already in quota backoff", async () => {
 		const credentials = authStorage.exportSnapshot().credentials.filter(entry => entry.provider === "openai-codex");
 		const pinnedRow = credentials[0];
