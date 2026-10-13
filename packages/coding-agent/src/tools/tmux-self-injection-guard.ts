@@ -1129,13 +1129,61 @@ function shellArguments(tokens: Token[], shellIndex: number, segment: number): T
 	return args;
 }
 
+function xargsUsesArgumentFile(tokens: Token[], xargsIndex: number, commandIndex: number, segment: number): boolean {
+	const wrapper = { name: "xargs", spec: COMMAND_WRAPPERS_WITH_ARGS.xargs };
+	let skipNextArgument = false;
+
+	for (let index = xargsIndex + 1; index < commandIndex; index++) {
+		const argument = tokens[index];
+		if (argument.segment !== segment) break;
+		if (skipNextArgument) {
+			skipNextArgument = false;
+			continue;
+		}
+		if (argument.text === "--") break;
+		if (argument.text === "--arg-file" || argument.text.startsWith("--arg-file=")) return true;
+		if (!argument.text.startsWith("-") || argument.text === "-") continue;
+		if (argument.text.startsWith("--")) {
+			if (wrapperOptionTakesNextArgument(wrapper, argument.text)) skipNextArgument = true;
+			continue;
+		}
+		for (let optionIndex = 1; optionIndex < argument.text.length; optionIndex++) {
+			const shortOption = `-${argument.text[optionIndex]}`;
+			if (shortOption === "-a") return true;
+			if (wrapper.spec.optionsWithArg.has(shortOption)) {
+				if (optionIndex === argument.text.length - 1) skipNextArgument = true;
+				break;
+			}
+		}
+	}
+	return false;
+}
+
+function xargsConsumesStdin(tokens: Token[], commandIndex: number, segment: number): boolean {
+	for (let index = commandIndex - 1; index >= 0; index--) {
+		const token = tokens[index];
+		if (token.segment !== segment) break;
+		if (!token.commandStart) continue;
+		const name = commandName(token.text);
+		if (name === "xargs") return !xargsUsesArgumentFile(tokens, index, commandIndex, segment);
+		if (!COMMAND_WRAPPERS.has(name) && !COMMAND_WRAPPERS_WITH_ARGS[name]) break;
+	}
+	return false;
+}
+
 function hasShellStdinConsumer(tokens: Token[], segment: number, depth = 0): boolean {
 	const segmentTokens = tokens.filter(token => token.segment === segment);
 	for (let index = 0; index < segmentTokens.length; index++) {
 		const token = segmentTokens[index];
 		if (!token.commandStart || isCommandLookup(segmentTokens, index)) continue;
 		const shellIndex = shellRunnerIndex(segmentTokens, index, segment);
-		if (shellIndex !== undefined && shellReadsStdin(shellArguments(segmentTokens, shellIndex, segment))) return true;
+		if (
+			shellIndex !== undefined &&
+			!xargsConsumesStdin(segmentTokens, index, segment) &&
+			shellReadsStdin(shellArguments(segmentTokens, shellIndex, segment))
+		) {
+			return true;
+		}
 	}
 	if (depth >= MAX_INDIRECTION_DEPTH) return false;
 

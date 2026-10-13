@@ -998,6 +998,16 @@ describe("tmux self-injection guard", () => {
 			}
 		});
 
+		it("does not confuse xargs input with shell stdin", async () => {
+			const document = "tmux send-keys -t %47 x";
+			await expect(checkTmuxSelfInjection(`xargs bash <<EOF\n${document}\nEOF`, options)).resolves.toEqual({
+				block: false,
+			});
+			await expect(
+				checkTmuxSelfInjection(`xargs -a /dev/null bash <<EOF\n${document}\nEOF`, options),
+			).resolves.toMatchObject({ block: true });
+		});
+
 		it("consumes exec's alternate-name operand", async () => {
 			await expect(
 				checkTmuxSelfInjection("exec -a disguise tmux send-keys -t %47 x", options),
