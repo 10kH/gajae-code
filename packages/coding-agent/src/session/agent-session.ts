@@ -23270,7 +23270,7 @@ export class AgentSession {
 	 * turn path does through `#markFailedCredential`. Without this, compaction retried
 	 * the exhausted row until its retries ran out, and because compaction gates the next
 	 * request, the session never reached the turn path's rotation while other rows still
-	 * had quota. Returns the rotated row's key, or undefined to fall back to the normal
+	 * had quota. Returns the rotated row's key and ID, or undefined to fall back to the normal
 	 * retry policy: when the candidate is not on the session model's provider (the mark
 	 * acts on that provider's session credential), the provider is pinned, or the
 	 * rotation lands on a row this compaction already failed on.
@@ -23279,14 +23279,19 @@ export class AgentSession {
 		candidate: Model,
 		retryAfterMs: number | undefined,
 		failedRowIds: Set<number>,
-	): Promise<string | undefined> {
+		failedRowId: number | undefined,
+	): Promise<{ apiKey: string; rowId: number } | undefined> {
 		if (candidate.provider !== this.model?.provider) return undefined;
-		const authStorage = this.#modelRegistry.authStorage;
-		const failedRowId = authStorage.getSessionCredentialRowId(candidate.provider, this.credentialSessionId);
 		if (failedRowId === undefined) return undefined;
 		failedRowIds.add(failedRowId);
-		const mark = await this.#markFailedCredential({ class: "quota", retryAfterMs });
+		const mark = await this.#markFailedCredential({
+			class: "quota",
+			retryAfterMs,
+			model: candidate,
+			credentialRowId: failedRowId,
+		});
 		if (mark !== "rotated") return undefined;
+		const authStorage = this.#modelRegistry.authStorage;
 		const nextRowId = authStorage.getSessionCredentialRowId(candidate.provider, this.credentialSessionId);
 		if (nextRowId === undefined || failedRowIds.has(nextRowId)) return undefined;
 		// Resolve the rotated row by id: a bare lookup re-ranks the pool and can land back
@@ -23294,16 +23299,23 @@ export class AgentSession {
 		const apiKey = await this.#modelRegistry.getApiKey(candidate, this.credentialSessionId, {
 			credentialSelector: { kind: "id", value: String(nextRowId) },
 		});
-		return isAuthenticated(apiKey) ? apiKey : undefined;
+		return isAuthenticated(apiKey) ? { apiKey, rowId: nextRowId } : undefined;
 	}
 
 	async #resolveCompactionCandidate(
 		candidate: Model,
 		previousCandidate: Model | undefined,
 		previousFailure: unknown,
-	): Promise<{ apiKey: string; authError?: undefined } | { apiKey: undefined; authError: Error }> {
+	): Promise<
+		| { apiKey: string; credentialRowId: number | undefined; authError?: undefined }
+		| { apiKey: undefined; authError: Error }
+	> {
 		const apiKey = await this.#modelRegistry.getApiKey(candidate, this.credentialSessionId);
 		if (!apiKey) return { apiKey: undefined, authError: this.#buildCompactionAuthError(candidate) };
+		const credentialRowId = this.#modelRegistry.authStorage.getSessionCredentialRowId(
+			candidate.provider,
+			this.credentialSessionId,
+		);
 		if (previousCandidate) {
 			await this.#emitCompactionModelSubstitution(
 				previousCandidate,
@@ -23311,7 +23323,7 @@ export class AgentSession {
 				this.#compactionFailureReason(previousFailure),
 			);
 		}
-		return { apiKey, authError: undefined };
+		return { apiKey, credentialRowId, authError: undefined };
 	}
 	#isCompactionAuthFailure(error: unknown): boolean {
 		if (!(error instanceof Error)) return false;
@@ -23917,6 +23929,7 @@ export class AgentSession {
 						continue;
 					}
 					let apiKey = resolved.apiKey;
+					let credentialRowId = resolved.credentialRowId;
 					const usageLimitedRowIds = new Set<number>();
 
 					let attempt = 0;
@@ -23962,9 +23975,11 @@ export class AgentSession {
 									candidate,
 									retryAfterMs,
 									usageLimitedRowIds,
+									credentialRowId,
 								);
 								if (rotatedApiKey !== undefined) {
-									apiKey = rotatedApiKey;
+									apiKey = rotatedApiKey.apiKey;
+									credentialRowId = rotatedApiKey.rowId;
 									logger.warn("Auto-compaction hit a usage limit, retrying on another credential", {
 										error: message,
 										model: `${candidate.provider}/${candidate.id}`,
@@ -25539,8 +25554,10 @@ export class AgentSession {
 		retryAfterMs?: number;
 		authDisposition?: AuthDisposition;
 		trackSameTurnRows?: boolean;
+		model?: Model;
+		credentialRowId?: number;
 	}): Promise<"rotated" | "alternate" | "exhausted" | "unchanged"> {
-		const model = this.model;
+		const model = trigger.model ?? this.model;
 		if (
 			!model ||
 			(trigger.class !== "auth" &&
@@ -25574,7 +25591,9 @@ export class AgentSession {
 			// Retain this snapshot through mark/result policy; the mark can mutate
 			// assignments before fallback decides whether the typed pool is exhausted.
 			const before =
-				dispatchedCredential?.rowId ?? authStorage.getSessionCredentialRowId(provider, credentialSessionId);
+				trigger.credentialRowId ??
+				dispatchedCredential?.rowId ??
+				authStorage.getSessionCredentialRowId(provider, credentialSessionId);
 			const beforeKind = trigger.trackSameTurnRows
 				? (dispatchedCredential?.credentialKind ??
 					authStorage.getSessionCredentialType(provider, credentialSessionId))

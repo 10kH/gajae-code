@@ -116,6 +116,44 @@ describe("auto-compaction usage limit rotates the session credential", () => {
 		expect(ends[0]?.result).toBeDefined();
 	});
 
+	it("marks the credential used by compaction when a sibling advances the session pointer", async () => {
+		session = createSession();
+		const credentialIds = authStorage
+			.exportSnapshot()
+			.credentials.filter(entry => entry.provider === "openai-codex")
+			.map(entry => entry.id);
+		let dispatchedRowId: number | undefined;
+		let calls = 0;
+		const markUsageLimitReached = vi.spyOn(authStorage, "markUsageLimitReached");
+		const compactSpy = vi.spyOn(compactionModule, "compact").mockImplementation(async (preparation, model) => {
+			if (calls++ === 0) {
+				dispatchedRowId = authStorage.getSessionCredentialRowId(model.provider, session?.credentialSessionId);
+				const siblingRowId = credentialIds.find(rowId => rowId !== dispatchedRowId);
+				if (dispatchedRowId === undefined || siblingRowId === undefined) {
+					throw new Error("expected two stored credentials and a selected compaction credential");
+				}
+				await authStorage.getApiKey(model.provider, session?.credentialSessionId, {
+					credentialSelector: { kind: "id", value: String(siblingRowId) },
+				});
+				throw new Error(USAGE_LIMIT);
+			}
+			return {
+				summary: "summary via sibling",
+				shortSummary: "short",
+				firstKeptEntryId: preparation.firstKeptEntryId,
+				tokensBefore: 42,
+				details: { provider: model.provider },
+			};
+		});
+
+		await session.runIdleCompaction();
+
+		expect(compactSpy.mock.calls).toHaveLength(2);
+		expect(compactSpy.mock.calls[1]?.[2]).not.toBe(compactSpy.mock.calls[0]?.[2]);
+		expect(markUsageLimitReached).toHaveBeenCalledTimes(1);
+		expect(markUsageLimitReached.mock.calls[0]?.[2]?.rowId).toBe(dispatchedRowId);
+	});
+
 	it("tries each row once, then falls back to the retry policy and stops", async () => {
 		session = createSession();
 		const ends = collectCompactionEnds(session);
