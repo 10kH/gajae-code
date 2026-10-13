@@ -203,6 +203,101 @@ describe("AuthStorage anthropic organizations", () => {
 		);
 	});
 
+	describe("removing a row while a session is pinned by the shared email", () => {
+		const emailSelector = { kind: "email", value: EMAIL } as const;
+
+		async function pinByEmail(): Promise<{ teamId: number; personalId: number }> {
+			await login(TEAM, "team");
+			await login(PERSONAL, "personal");
+			const [team, personal] = store.listAuthCredentials("anthropic");
+			authStorage.setSessionCredentialSelector("session-1", "anthropic", emailSelector);
+			// An email selector resolves to the first matching row, here the Team organization.
+			expect(authStorage.getOAuthCredential("anthropic", "session-1")?.organizationId).toBe(TEAM.uuid);
+			return { teamId: team!.id, personalId: personal!.id };
+		}
+
+		function removeHard(id: number): void {
+			const targets = authStorage.listCredentialRemovalTargets("anthropic").filter(target => target.id === id);
+			expect(authStorage.removeAuthCredentialsHard("anthropic", targets).kind).toBe("removed");
+		}
+
+		it("keeps the pin when the disabled row is not the one it selects", async () => {
+			const { personalId } = await pinByEmail();
+
+			authStorage.disableCredentialById(personalId, "disabled in test");
+
+			expect(authStorage.hasSessionCredentialUnavailable("anthropic", "session-1")).toBe(false);
+			expect(authStorage.getOAuthCredential("anthropic", "session-1")?.organizationId).toBe(TEAM.uuid);
+		});
+
+		it("marks the pin unavailable when the disabled row is the one it selects", async () => {
+			const { teamId } = await pinByEmail();
+
+			authStorage.disableCredentialById(teamId, "disabled in test");
+
+			expect(authStorage.hasSessionCredentialUnavailable("anthropic", "session-1")).toBe(true);
+		});
+
+		it("keeps the pin when a hard-removed row is not the one it selects", async () => {
+			const { personalId } = await pinByEmail();
+
+			removeHard(personalId);
+
+			expect(authStorage.hasSessionCredentialSelector("anthropic", "session-1")).toBe(true);
+			expect(authStorage.getOAuthCredential("anthropic", "session-1")?.organizationId).toBe(TEAM.uuid);
+		});
+
+		it("clears the pin when the hard-removed row is the one it selects", async () => {
+			const { teamId } = await pinByEmail();
+
+			removeHard(teamId);
+
+			expect(authStorage.hasSessionCredentialSelector("anthropic", "session-1")).toBe(false);
+		});
+	});
+
+	describe("organization selectors that designate more than one row", () => {
+		const SHARED_NAME = "Acme";
+		const FIRST = { uuid: "org-first", name: SHARED_NAME };
+		const SECOND = { uuid: "org-second", name: SHARED_NAME };
+
+		it("rejects a shared organization name instead of using the first row, on every selection path", async () => {
+			await login(FIRST, "first");
+			await login(SECOND, "second");
+			const ids = store.listAuthCredentials("anthropic").map(entry => entry.id);
+			expect(ids).toHaveLength(2);
+			const selector = { kind: "org", value: SHARED_NAME } as const;
+			const ambiguous = new RegExp(`matches multiple .*ids: ${ids.join(", ")}`);
+
+			expect(() => authStorage.switchSessionCredential("anthropic", "session-1", selector)).toThrow(ambiguous);
+			expect(authStorage.getSessionCredentialRowId("anthropic", "session-1")).toBeUndefined();
+			expect(() => authStorage.setSessionCredentialSelector("session-1", "anthropic", selector)).toThrow(ambiguous);
+			expect(() => authStorage.setRuntimeCredentialSelector("anthropic", selector)).toThrow(ambiguous);
+			expect(() => authStorage.setRuntimePreferredCredentialSelector("anthropic", selector)).toThrow(ambiguous);
+			expect(() => authStorage.resolveOAuthPinTarget("anthropic", selector)).toThrow(/matches multiple/);
+		});
+
+		it("selects by exact organization id even when that id is also another organization's name", async () => {
+			await login(FIRST, "first");
+			await login({ uuid: "org-named-like-an-id", name: FIRST.uuid }, "impostor");
+			const [firstRow] = store.listAuthCredentials("anthropic");
+			const selector = { kind: "org", value: FIRST.uuid } as const;
+
+			authStorage.switchSessionCredential("anthropic", "session-1", selector);
+			expect(authStorage.getSessionCredentialRowId("anthropic", "session-1")).toBe(firstRow?.id);
+			expect(authStorage.resolveOAuthPinTarget("anthropic", selector).credentialId).toBe(firstRow?.id);
+		});
+
+		it("fails a pinned selector at request time once a later login makes it ambiguous", async () => {
+			await login(FIRST, "first");
+			authStorage.setRuntimeCredentialSelector("anthropic", { kind: "org", value: SHARED_NAME });
+			expect(authStorage.getOAuthCredential("anthropic", "session-1")?.access).toBe("access-first");
+
+			await login(SECOND, "second");
+			await expect(authStorage.getApiKey("anthropic", "session-1")).rejects.toThrow(/matches multiple/);
+		});
+	});
+
 	it("labels each organization's credential in the inventory", async () => {
 		await login(TEAM, "team");
 		await login(PERSONAL, "personal");

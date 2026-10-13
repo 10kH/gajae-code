@@ -403,7 +403,7 @@ describe("workflow permission policy", () => {
 			"github",
 			"context",
 			`return (async () => { ${authorizeScript} })();`,
-		) as (github: GithubStub, context: typeof context) => Promise<string>;
+		) as (github: GithubStub, ctx: typeof context) => Promise<string>;
 
 		expect(await executeAuthorizationStep(github, context)).toBe("authorized");
 		const unrelatedPrefixContext = {
@@ -511,7 +511,7 @@ describe("workflow permission policy", () => {
 			"context",
 			"process",
 			`return (async () => { ${requestScript} })();`,
-		) as (github: GithubStub, context: typeof context, processStub: typeof processStub) => Promise<void>;
+		) as (github: GithubStub, ctx: typeof context, proc: typeof processStub) => Promise<void>;
 
 		await executeRequestStep(github, context, processStub);
 

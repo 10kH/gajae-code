@@ -13,8 +13,8 @@ import {
 	isSqliteCorruptionError,
 	OAuthCredentialSelectorError,
 	type OAuthPinTarget,
-	oauthCredentialMatchesOrganization,
 	resolveOAuthStorageProvider,
+	selectOrganizationMatches,
 } from "@gajae-code/ai/core";
 import { getAgentDir } from "@gajae-code/utils";
 import { ModelRegistry } from "../config/model-registry";
@@ -293,11 +293,23 @@ function accountMatches(row: CredentialInventoryRecord, rawAccount: string): boo
 	if (value.length === 0) return false;
 	if (/^[1-9]\d*$/.test(value) && row.id === Number(value)) return true;
 	if (/^id:[1-9]\d*$/i.test(value) && row.id === Number(value.slice(3))) return true;
-	if (/^org:/i.test(value)) return oauthCredentialMatchesOrganization(row, value.slice(4));
 	// Labels carry the organization name, so a bare email matches every organization of that account.
 	if (row.email?.toLowerCase() === value.toLowerCase()) return true;
 	const identity = inventoryIdentity(row);
 	return identity?.toLowerCase() === value.toLowerCase();
+}
+
+/**
+ * Rows a `--account` value designates. `org:` prefers an exact organization-id match over display-name
+ * matches; more than one result is reported as ambiguous by the caller, never resolved by guessing.
+ */
+function selectLogoutTargets<T extends { row: CredentialInventoryRecord }>(
+	targets: readonly T[],
+	rawAccount: string,
+): T[] {
+	const value = rawAccount.trim();
+	if (/^org:/i.test(value)) return selectOrganizationMatches(targets, value.slice(4), target => target.row);
+	return targets.filter(target => accountMatches(target.row, value));
 }
 
 function removalCandidates(
@@ -340,9 +352,7 @@ async function runLogout(providerArg: string | undefined, flags: AccountsCommand
 	try {
 		const inventory = storage.listCredentialInventory(provider);
 		const targets = removalCandidates(inventory, storage.listCredentialRemovalTargets(provider));
-		const selected = flags.all
-			? targets
-			: targets.filter(candidate => accountMatches(candidate.row, flags.account ?? ""));
+		const selected = flags.all ? targets : selectLogoutTargets(targets, flags.account ?? "");
 		if (selected.length !== 1 && !flags.all) throwLogoutResolutionError(provider, flags.account, targets);
 		if (selected.length === 0) throwLogoutResolutionError(provider, flags.account, targets);
 		const result = storage.removeAuthCredentialsHard(
