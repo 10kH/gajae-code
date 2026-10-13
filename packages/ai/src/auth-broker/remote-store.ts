@@ -23,6 +23,7 @@ import {
 	type CachedUsagePresentation,
 	type CredentialDispatchTicket,
 	type CredentialInventoryRecord,
+	formatOAuthIdentityLabel,
 	type MCPOAuthRefreshClient,
 	type OAuthCredential,
 	REMOTE_REFRESH_SENTINEL,
@@ -1106,6 +1107,8 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 			email: current.email,
 			projectId: current.projectId,
 			enterpriseUrl: current.enterpriseUrl,
+			organizationId: current.organizationId,
+			organizationName: current.organizationName,
 		});
 		const observed = this.#snapshot.credentials.find(candidate => candidate.id === credentialId);
 		if (
@@ -1356,6 +1359,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 						projectId: credential.projectId ?? null,
 						enterpriseUrl: credential.enterpriseUrl ?? null,
 						mcpBinding: credential.mcpBinding ?? null,
+						...(credential.organizationId ? { organizationId: credential.organizationId } : {}),
 					}
 				: { type: credential.type };
 		return createHash("sha256")
@@ -1485,7 +1489,7 @@ function isErrorStatus(error: unknown, status: number): boolean {
 
 function snapshotIdentityLabel(entry: SnapshotEntry): string | null {
 	if (entry.credential.type !== "oauth") return null;
-	return entry.credential.email ?? entry.credential.accountId ?? entry.credential.projectId ?? null;
+	return formatOAuthIdentityLabel(entry.credential);
 }
 
 function safePresentationUsageReport(report: UsageReport): SafeUsageReport {
@@ -1534,21 +1538,22 @@ function cloneUsagePresentation(observation: CachedUsagePresentation): CachedUsa
 /**
  * Match a broker-supplied usage report to a specific OAuth credential. The
  * broker returns aggregate reports across all credentials it manages, so we
- * pick the one whose identity (accountId / email / projectId) lines up with
- * the credential the caller is asking about.
- *
- * Falls back to the lone candidate when only one matches the provider; falls
- * through to `null` when nothing matches, which `AuthStorage` treats as "no
- * usage data" (ranking proceeds without a usage signal for this credential).
+ * pick the one whose identity (accountId / email / projectId) and organization
+ * line up with the credential the caller is asking about. Missing or ambiguous
+ * usage data is safer than assigning another organization's limits.
  */
 function matchUsageReport(reports: UsageReport[], provider: Provider, credential: OAuthCredential): UsageReport | null {
 	const candidates = reports.filter(report => report.provider === provider);
 	if (candidates.length === 0) return null;
-	if (candidates.length === 1) return candidates[0];
+	const organizationId = credential.organizationId?.trim().toLowerCase();
+	if (candidates.length === 1 && !organizationId) return candidates[0];
 	const accountId = credential.accountId?.trim().toLowerCase();
 	const email = credential.email?.trim().toLowerCase();
 	const projectId = credential.projectId?.trim().toLowerCase();
 	for (const report of candidates) {
+		// The same account signed in to another organization reports that organization's limits.
+		const reportOrganizationId = readMetadataString((report.metadata ?? {}) as Record<string, unknown>, "orgId");
+		if (organizationId && reportOrganizationId?.toLowerCase() !== organizationId) continue;
 		if (reportMatchesIdentity(report, accountId, email, projectId)) return report;
 	}
 	return null;
