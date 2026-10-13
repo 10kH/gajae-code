@@ -574,6 +574,7 @@ function projectIdentity(
 	ambiguous: boolean,
 	now: number,
 	probedIncarnations?: ReadonlyMap<string, string | undefined>,
+	skipOsProcessProbes = false,
 ): IndexedSession {
 	const { latest, heartbeat } = state;
 	const terminal = isTerminalEvent(latest);
@@ -582,7 +583,7 @@ function projectIdentity(
 		latest.hostUnregisteredReason === "process_exited" || latest.hostUnregisteredReason === "detached_idle"
 			? latest.hostUnregisteredReason
 			: undefined;
-	const pidAlive = alive(latest.pid);
+	const pidAlive = !skipOsProcessProbes && alive(latest.pid);
 	// Liveness evidence is host-written: a checkpointed heartbeat, or the
 	// `host_registered` event the host appended itself. Counting registration
 	// closes the up-to-one-interval window where a just-registered session
@@ -602,7 +603,7 @@ function projectIdentity(
 	// costing a powershell.exe spawn per stale registration on Windows.
 	const probeKey = `${latest.sessionId}\u0000${latest.endpointGeneration}\u0000${latest.pid}`;
 	const currentIncarnation =
-		recordedIncarnation === undefined || !pidAlive
+		skipOsProcessProbes || recordedIncarnation === undefined || !pidAlive
 			? undefined
 			: probedIncarnations !== undefined
 				? probedIncarnations.get(probeKey)
@@ -654,7 +655,9 @@ function reduceEvents(
 	agentDir: string,
 	probedIncarnations?: ReadonlyMap<string, string | undefined>,
 	sessionIds?: ReadonlySet<string>,
+	options: { readonly skipOsProcessProbes?: boolean } = {},
 ): SessionIndexProjection {
+	const skipOsProcessProbes = options.skipOsProcessProbes === true;
 	// Resolved once: the fence-row check runs per root, and only this side of the
 	// comparison is ours to normalize.
 	const agentDirIdentity = resolveEquivalentPath(agentDir);
@@ -741,7 +744,8 @@ function reduceEvents(
 		const fencing = fencingRoots.get(sessionId);
 		const unresolved = unresolvedRoots.get(sessionId);
 		const ambiguous = (fencing?.size ?? 0) > 1;
-		for (const state of states) identities.push(projectIdentity(state, ambiguous, now, probedIncarnations));
+		for (const state of states)
+			identities.push(projectIdentity(state, ambiguous, now, probedIncarnations, skipOsProcessProbes));
 		const defaultAuthority = preferredIdentity(states);
 		if (defaultAuthority === undefined || defaultAuthority.latest.type === "session_deleted") continue;
 		let authority = defaultAuthority;
@@ -754,7 +758,7 @@ function reduceEvents(
 			const survivingAuthority = onlyRoot ? preferredIdentity(onlyRoot) : undefined;
 			if (survivingAuthority !== undefined) authority = survivingAuthority;
 		}
-		sessions.push(projectIdentity(authority, ambiguous, now, probedIncarnations));
+		sessions.push(projectIdentity(authority, ambiguous, now, probedIncarnations, skipOsProcessProbes));
 	}
 	return { identities, sessions };
 }
@@ -2455,14 +2459,25 @@ export class SessionIndex {
 			// revalidation that never probes the OS under the lock: the next pass
 			// re-probes from scratch.
 			const probed = new Map<string, string | undefined>();
-			for (const row of reduceEvents(this.#events, now, this.#agentDir).sessions) {
+			// This projection is only used to select structurally eligible rows; its
+			// `live` field is not consumed here. Skip OS probes during projection so
+			// the deadline-aware loop below performs only the required observations.
+			const candidates = reduceEvents(this.#events, now, this.#agentDir, undefined, undefined, {
+				skipOsProcessProbes: true,
+			}).sessions;
+			if (signal.aborted || performance.now() >= deadline) return 0;
+			for (const row of candidates) {
+				if (signal.aborted || performance.now() >= deadline) return 0;
 				if (!isSessionAuthorityEligible(row) || row.terminal || row.terminalUncertain) continue;
 				if (row.lastHeartbeatAt !== undefined && now - row.lastHeartbeatAt < SESSION_HEARTBEAT_INTERVAL_MS)
 					continue;
-				if (!alive(row.pid)) continue;
 				const recordedIncarnation = row.hostIncarnation ?? row.processIncarnation;
 				if (recordedIncarnation === undefined) continue;
-				probed.set(`${row.sessionId}\u0000${row.endpointGeneration}\u0000${row.pid}`, processIncarnation(row.pid));
+				if (!alive(row.pid)) continue;
+				if (signal.aborted || performance.now() >= deadline) return 0;
+				const currentIncarnation = processIncarnation(row.pid);
+				if (signal.aborted || performance.now() >= deadline) return 0;
+				probed.set(`${row.sessionId}\u0000${row.endpointGeneration}\u0000${row.pid}`, currentIncarnation);
 			}
 			const probedAt = performance.now();
 			if (signal.aborted || probedAt >= deadline) return 0;
@@ -2492,7 +2507,9 @@ export class SessionIndex {
 					if (performance.now() - probedAt > SESSION_INDEX_REPLAY_FRESHNESS_MS) return STALE_OBSERVATION;
 					if (this.#corruptSuffix) return 0;
 					const events: SessionIndexEvent[] = [];
-					const rows = reduceEvents(this.#events, now, this.#agentDir, probed).sessions;
+					const rows = reduceEvents(this.#events, now, this.#agentDir, probed, undefined, {
+						skipOsProcessProbes: true,
+					}).sessions;
 					for (const row of rows) {
 						if (!isSessionAuthorityEligible(row) || row.terminal || row.terminalUncertain) continue;
 						if (row.lastHeartbeatAt !== undefined && now - row.lastHeartbeatAt < SESSION_HEARTBEAT_INTERVAL_MS)

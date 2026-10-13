@@ -597,6 +597,9 @@ impl NativeNoReplaceResult {
 				Some("atomic_unavailable") => ("not_committed", "not_attempted", "atomic_unavailable"),
 				Some("cross_device") => ("not_committed", "not_attempted", "cross_device"),
 				Some("permission_denied") => ("not_committed", "not_attempted", "permission_denied"),
+				// Windows can reject NtSetInformationFile before any rename occurs
+				// because an open child handle does not permit delete sharing.
+				Some("access_denied") => ("not_committed", "not_attempted", "access_denied"),
 				Some("not_found" | "invalid_request") => {
 					("not_committed", "not_attempted", "invalid_request")
 				},
@@ -658,6 +661,23 @@ impl NativeNoReplaceResult {
 				sync_failures:    None,
 			},
 		}
+	}
+}
+
+#[cfg(test)]
+mod no_replace_access_denied_tests {
+	use super::{NativeExactUnlinkResult, NativeNoReplaceResult};
+
+	#[test]
+	fn access_denied_rename_is_reported_as_pre_mutation() {
+		let result =
+			NativeNoReplaceResult::from_exact(NativeExactUnlinkResult::failure("access_denied"));
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("access_denied"));
+		assert_eq!(result.mutation_state, "not_committed");
+		assert_eq!(result.durability_state, "not_attempted");
+		assert_eq!(result.reason, "access_denied");
+		assert_eq!(result.phase, "rename");
 	}
 }
 
@@ -939,6 +959,34 @@ impl NativeExactUnlinkResult {
 const STATUS_SHARING_VIOLATION: i32 = 0xc000_0043u32 as i32;
 
 #[cfg(any(windows, test))]
+/// `STATUS_ACCESS_DENIED`, kept distinct from owner-identity failures because
+/// Windows directory rename can fail before mutation while a child is open.
+const STATUS_ACCESS_DENIED: i32 = 0xc000_0022u32 as i32;
+
+#[cfg(any(windows, test))]
+fn ntstatus_code(status: i32) -> &'static str {
+	match status as u32 {
+		0xc000_0034 | 0xc000_003a => "not_found",
+		0xc000_0035 => "quarantine_collision",
+		0xc000_0043 => "sharing_violation",
+		0xc000_0022 => "owner_mismatch",
+		0xc000_050b => "reparse_point",
+		0xc000_00d4 => "atomic_unavailable",
+		_ => "io_error",
+	}
+}
+
+#[cfg(any(windows, test))]
+fn publication_rename_error_code(code: &'static str) -> &'static str {
+	match code {
+		// Preserve the existing owner-only security contract everywhere else. A
+		// failed Windows no-replace rename has a distinct access-denied meaning.
+		"owner_mismatch" => "access_denied",
+		other => other,
+	}
+}
+
+#[cfg(any(windows, test))]
 /// True only for pre-mutation Windows failures that are transient and safe to
 /// retry at the exact-replace destination open. Sharing violations happen
 /// before anything was renamed or unlinked, so retrying cannot publish twice;
@@ -1001,8 +1049,9 @@ fn native_windows_error_code(status: i32) -> String {
 mod exact_replace_windows_retry_policy_tests {
 	use super::{
 		EXACT_REPLACE_DESTINATION_OPEN_RETRY_DELAY_MS, EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT,
-		STATUS_SHARING_VIOLATION, is_retryable_exact_replace_status, native_windows_error_code,
-		open_with_transient_retry,
+		STATUS_ACCESS_DENIED, STATUS_SHARING_VIOLATION, is_retryable_exact_replace_status,
+		native_windows_error_code, ntstatus_code, open_with_transient_retry,
+		publication_rename_error_code,
 	};
 
 	#[test]
@@ -1031,7 +1080,13 @@ mod exact_replace_windows_retry_policy_tests {
 	#[test]
 	fn windows_error_code_is_hex_and_path_free() {
 		assert_eq!(native_windows_error_code(STATUS_SHARING_VIOLATION), "0xC0000043");
-		assert_eq!(native_windows_error_code(0xc000_0022u32 as i32), "0xC0000022");
+		assert_eq!(native_windows_error_code(STATUS_ACCESS_DENIED), "0xC0000022");
+		assert_eq!(ntstatus_code(STATUS_ACCESS_DENIED), "owner_mismatch");
+		assert_eq!(
+			publication_rename_error_code(ntstatus_code(STATUS_ACCESS_DENIED)),
+			"access_denied"
+		);
+		assert_eq!(ntstatus_code(STATUS_SHARING_VIOLATION), "sharing_violation");
 	}
 
 	#[test]
@@ -10795,7 +10850,8 @@ mod platform {
 		NativeDirectoryTreeResult, NativeDirectoryTreeSnapshot, NativeExactUnlinkResult,
 		NativeOwnerOnlySecurityResult, NativePermissionRepairResult, STATUS_INVALID_PARAMETER,
 		STATUS_SHARING_VIOLATION, is_retryable_exact_replace_status, native_windows_error_code,
-		open_with_transient_retry, sha256, volume_case_sensitivity_from_flags,
+		ntstatus_code, open_with_transient_retry, publication_rename_error_code, sha256,
+		volume_case_sensitivity_from_flags,
 	};
 
 	type UvGetOsfhandle = unsafe extern "C" fn(fd: i32) -> isize;
@@ -11213,18 +11269,6 @@ mod platform {
 			return Err("not_directory");
 		}
 		Ok((root, names))
-	}
-
-	fn ntstatus_code(status: i32) -> &'static str {
-		match status as u32 {
-			0xc000_0034 | 0xc000_003a => "not_found",
-			0xc000_0035 => "quarantine_collision",
-			0xc000_0043 => "sharing_violation",
-			0xc000_0022 => "owner_mismatch",
-			0xc000_050b => "reparse_point",
-			0xc000_00d4 => "atomic_unavailable",
-			_ => "io_error",
-		}
 	}
 
 	fn open_relative_with_share(
@@ -12309,7 +12353,7 @@ mod platform {
 		let destination_name: Vec<u16> = destination_name.encode_wide().collect();
 		match rename_handle(source.target, destination_parent.target, &destination_name, false) {
 			Ok(()) => NativeExactUnlinkResult::success(),
-			Err(code) => NativeExactUnlinkResult::failure(code),
+			Err(code) => NativeExactUnlinkResult::failure(publication_rename_error_code(code)),
 		}
 	}
 	pub(super) fn exact_unlink(

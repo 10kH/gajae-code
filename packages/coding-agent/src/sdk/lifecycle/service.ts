@@ -686,6 +686,7 @@ const savedSessionScopeDetailCodes = new Set([
 	"migration_busy",
 	"atomic_unavailable",
 	"invalid_request",
+	"permission_denied",
 	"durability_failed",
 	"durability_not_provable",
 	"capacity_exceeded",
