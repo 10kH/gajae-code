@@ -231,6 +231,33 @@ describe("recordFatalCrash", () => {
 		expect(contents).toContain("note=keep-this");
 	});
 
+	it("redacts escaped quoted credentials in serialized crash text", () => {
+		const target = tempCrashLog();
+		const message = String.raw`diagnostic safe=keep-this password=\"correct horse battery\" payload={\"password\":\"correct horse battery\"} note=keep-this`;
+
+		recordFatalCrash("Uncaught Exception", new Error(message), { path: target });
+
+		const contents = fs.readFileSync(target, "utf8");
+		expect(contents).not.toContain("correct horse battery");
+		expect(contents).toContain("«redacted»");
+		expect(contents).toContain("payload=");
+		expect(contents).toContain("note=keep-this");
+	});
+
+	it("redacts unterminated quoted credentials without consuming the next line", () => {
+		for (const credential of ['password="hunter2secret', String.raw`password=\"hunter2secret`]) {
+			const target = tempCrashLog();
+			const message = `${credential}\nsafe-after-newline=keep-this`;
+
+			recordFatalCrash("Uncaught Exception", new Error(message), { path: target });
+
+			const contents = fs.readFileSync(target, "utf8");
+			expect(contents).not.toContain("hunter2secret");
+			expect(contents).toContain("«redacted»");
+			expect(contents).toContain("safe-after-newline=keep-this");
+		}
+	});
+
 	it("preserves credential lookalikes outside the supported token boundaries", () => {
 		const target = tempCrashLog();
 		const lookalikes = [

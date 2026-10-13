@@ -66,11 +66,59 @@ export function redactCrashSecrets(text: string): string {
 	// does not match `SecretAccessKey` (the canonical field has `Access` in the
 	// middle), and `access_token` does not match `SessionToken`.
 	redacted = redacted.replace(/\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b/g, "«redacted-aws-key»");
+	// Escaped delimiters support JSON nested in diagnostic strings. Their quoted
+	// branch stops at a closing delimiter followed by a field boundary, while an
+	// unterminated value is redacted through the end of its line.
 	redacted = redacted.replace(
-		/(?<![A-Za-z0-9_])(["']?(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?token|client[_-]?secret|aws[_-]?secret[_-]?access[_-]?key|secret[_-]?key|secret[_-]?access[_-]?key|password|passwd|authorization|private[_-]?token|token|secret|credential|private[_-]?key|cookie)["']?\s*[=:]\s*)(?:"((?:\\[\s\S]|[^"\\])*)"|'((?:\\[\s\S]|[^'\\])*)'|([^\s"',;}\]]+))/gi,
-		(_match, prefix: string, doubleQuoted: string | undefined, singleQuoted: string | undefined) => {
-			if (doubleQuoted !== undefined) return `${prefix}"«redacted»"`;
-			if (singleQuoted !== undefined) return `${prefix}'«redacted»'`;
+		/(?<![A-Za-z0-9_])((?:\\*["']?)(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?token|client[_-]?secret|aws[_-]?secret[_-]?access[_-]?key|secret[_-]?key|secret[_-]?access[_-]?key|password|passwd|authorization|private[_-]?token|token|secret|credential|private[_-]?key|cookie)(?:\\*["']?\s*[=:]\s*))(?:(\\+")((?:\\[\s\S]|[^"\\])*?)(\\+")(?=$|[\s,;}\]])|(")((?:\\[\s\S]|[^"\\])*)(")|(\\+')((?:\\[\s\S]|[^'\\])*?)(\\+')(?=$|[\s,;}\]])|(')((?:\\[\s\S]|[^'\\])*)(')|(\\+")([^\r\n]*)(?=\r?\n|$)|(")([^\r\n]*)(?=\r?\n|$)|(\\+')([^\r\n]*)(?=\r?\n|$)|(')([^\r\n]*)(?=\r?\n|$)|([^\s"',;}\]]+))/gi,
+		(
+			_match,
+			prefix: string,
+			escapedDoubleOpen: string | undefined,
+			escapedDoubleQuoted: string | undefined,
+			escapedDoubleClose: string | undefined,
+			doubleOpen: string | undefined,
+			doubleQuoted: string | undefined,
+			doubleClose: string | undefined,
+			escapedSingleOpen: string | undefined,
+			escapedSingleQuoted: string | undefined,
+			escapedSingleClose: string | undefined,
+			singleOpen: string | undefined,
+			singleQuoted: string | undefined,
+			singleClose: string | undefined,
+			unclosedEscapedDoubleOpen: string | undefined,
+			unclosedEscapedDoubleQuoted: string | undefined,
+			unclosedDoubleOpen: string | undefined,
+			unclosedDoubleQuoted: string | undefined,
+			unclosedEscapedSingleOpen: string | undefined,
+			unclosedEscapedSingleQuoted: string | undefined,
+			unclosedSingleOpen: string | undefined,
+			unclosedSingleQuoted: string | undefined,
+		) => {
+			if (escapedDoubleQuoted !== undefined && escapedDoubleOpen !== undefined && escapedDoubleClose !== undefined) {
+				return `${prefix}${escapedDoubleOpen}«redacted»${escapedDoubleClose}`;
+			}
+			if (doubleQuoted !== undefined && doubleOpen !== undefined && doubleClose !== undefined) {
+				return `${prefix}${doubleOpen}«redacted»${doubleClose}`;
+			}
+			if (escapedSingleQuoted !== undefined && escapedSingleOpen !== undefined && escapedSingleClose !== undefined) {
+				return `${prefix}${escapedSingleOpen}«redacted»${escapedSingleClose}`;
+			}
+			if (singleQuoted !== undefined && singleOpen !== undefined && singleClose !== undefined) {
+				return `${prefix}${singleOpen}«redacted»${singleClose}`;
+			}
+			if (unclosedEscapedDoubleQuoted !== undefined && unclosedEscapedDoubleOpen !== undefined) {
+				return `${prefix}${unclosedEscapedDoubleOpen}«redacted»`;
+			}
+			if (unclosedDoubleQuoted !== undefined && unclosedDoubleOpen !== undefined) {
+				return `${prefix}${unclosedDoubleOpen}«redacted»`;
+			}
+			if (unclosedEscapedSingleQuoted !== undefined && unclosedEscapedSingleOpen !== undefined) {
+				return `${prefix}${unclosedEscapedSingleOpen}«redacted»`;
+			}
+			if (unclosedSingleQuoted !== undefined && unclosedSingleOpen !== undefined) {
+				return `${prefix}${unclosedSingleOpen}«redacted»`;
+			}
 			return `${prefix}«redacted»`;
 		},
 	);

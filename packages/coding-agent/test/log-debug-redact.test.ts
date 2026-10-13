@@ -151,6 +151,23 @@ describe("debug log credential scrub", () => {
 		expect(sent?.messages?.[0]?.content).toContain(labeled);
 	});
 
+	it("scrubs escaped quoted credentials from title logs", async () => {
+		const model = getModelOrThrow("claude-sonnet-4-5");
+		const completeSimple = vi.spyOn(ai, "completeSimple").mockResolvedValue(titleResponse());
+		const debug = vi.spyOn(logger, "debug");
+		const labeled = String.raw`password=\"correct horse battery\" payload={\"password\":\"correct horse battery\"} note=keep-this`;
+
+		await generateSessionTitle(labeled, createRegistry(model), createSettings(model));
+
+		const logged = loggedText(debug.mock.calls);
+		expect(logged).not.toContain("correct horse battery");
+		expect(logged).toContain("«redacted»");
+		expect(logged).toContain("payload=");
+		expect(logged).toContain("note=keep-this");
+		const sent = completeSimple.mock.calls[0]?.[1] as { messages?: Array<{ content?: string }> } | undefined;
+		expect(sent?.messages?.[0]?.content).toContain(labeled);
+	});
+
 	it("does not write the marketplace clone userinfo into the debug log", async () => {
 		const cacheDir = await fs.mkdtemp(path.join(os.tmpdir(), "mkt-log-"));
 		try {
