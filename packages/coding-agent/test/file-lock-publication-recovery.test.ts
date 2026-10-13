@@ -8,6 +8,7 @@ import {
 	acquireFileLock,
 	FileLockAcquireError,
 	FileLockTestHooks,
+	fileLockStagingOwnerPid,
 	withFileLock,
 } from "@gajae-code/coding-agent/config/file-lock";
 import {
@@ -45,6 +46,7 @@ interface RemovalCall {
 afterEach(async () => {
 	vi.restoreAllMocks();
 	FileLockTestHooks.nativePublicationBindings = undefined;
+	FileLockTestHooks.stagingIdentityEvidence = undefined;
 	FileLockTestHooks.nativeQuarantineBindings = undefined;
 	for (const { directory, forgetGrant } of tempDirs.splice(0)) {
 		try {
@@ -188,6 +190,19 @@ function sharingViolationPublication(): NativeNoReplaceResult {
 		mutationState: "not_committed",
 		durabilityState: "not_attempted",
 		reason: "sharing_violation",
+		primitive: "windows_rename_noreplace",
+		phase: "rename",
+		diagnostic: { schemaVersion: 1, collectionState: "unavailable" },
+	};
+}
+
+function accessDeniedPublication(): NativeNoReplaceResult {
+	return {
+		ok: false,
+		code: "access_denied",
+		mutationState: "not_committed",
+		durabilityState: "not_attempted",
+		reason: "access_denied",
 		primitive: "windows_rename_noreplace",
 		phase: "rename",
 		diagnostic: { schemaVersion: 1, collectionState: "unavailable" },
@@ -387,6 +402,83 @@ test("retries a pre-mutation sharing violation and publishes the file lock", asy
 	expect(attempts).toBe(3);
 	await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
 	expect(await fs.readdir(root)).toEqual([]);
+});
+
+test("preserves access-denied publication failures instead of masking ACL errors as contention", async () => {
+	const { root, file, lock } = await makeFixture();
+	let attempts = 0;
+	FileLockTestHooks.nativePublicationBindings = () => ({
+		renameNoReplacePathAsync: async () => {
+			attempts++;
+			return accessDeniedPublication();
+		},
+		renameDirectoryNoReplacePathAsync,
+	});
+
+	await expect(withFileLock(file, async () => "entered", { retries: 2, retryDelayMs: 1 })).rejects.toMatchObject({
+		message: "Failed to publish file lock: access_denied.",
+		code: "access_denied",
+	});
+	expect(attempts).toBe(1);
+	await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
+	expect(await fs.readdir(root)).toEqual([]);
+});
+
+test("keeps the staging component within filesystem limits for long target names", async () => {
+	const { root } = await makeFixture();
+	const file = path.join(root, "x".repeat(196));
+	const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+	if (!originalPlatform?.configurable) throw new Error("process_platform_not_configurable");
+	let stagingComponentLength = 0;
+	FileLockTestHooks.nativePublicationBindings = () => ({
+		renameNoReplacePathAsync: async (source, destination) => {
+			stagingComponentLength = path.basename(source).length;
+			await fs.rename(source, destination);
+			return successfulPublication(primaryPrimitive ?? "windows_rename_noreplace");
+		},
+		renameDirectoryNoReplacePathAsync,
+	});
+	FileLockTestHooks.nativeQuarantineBindings = () => ({
+		snapshotDirectoryTree,
+		exactRemoveDirectoryTree: target => {
+			syncFs.rmSync(target, { recursive: true, force: true });
+			return { ok: true };
+		},
+	});
+
+	try {
+		Object.defineProperty(process, "platform", { ...originalPlatform, value: "win32" });
+		await expect(withFileLock(file, async () => "acquired", quickAcquire)).resolves.toBe("acquired");
+	} finally {
+		Object.defineProperty(process, "platform", originalPlatform);
+	}
+	expect(stagingComponentLength).toBeLessThanOrEqual(255);
+	const legacyComponentLength =
+		path.basename(file).length + ".lock.pending.".length + String(process.pid).length + 1 + 36;
+	expect(stagingComponentLength).toBeLessThanOrEqual(legacyComponentLength);
+});
+
+test("uses a liveness-probed legacy staging name when process identity is unavailable", async () => {
+	const { file } = await makeFixture();
+	FileLockTestHooks.stagingIdentityEvidence = () => ({ processIncarnation: null, startTime: null });
+	let stagingPath = "";
+	FileLockTestHooks.nativePublicationBindings = () => ({
+		renameNoReplacePathAsync: async (source, destination) => {
+			stagingPath = source;
+			await fs.rename(source, destination);
+			return successfulPublication(primaryPrimitive ?? "windows_rename_noreplace");
+		},
+		renameDirectoryNoReplacePathAsync: async () => {
+			throw new Error("unexpected directory publication fallback");
+		},
+	});
+
+	expect(await withFileLock(file, async () => "acquired", quickAcquire)).toBe("acquired");
+	const stagingName = path.basename(stagingPath);
+	expect(stagingName).toMatch(
+		new RegExp(`\\.pending\\.${process.pid}\\.[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$`),
+	);
+	expect(fileLockStagingOwnerPid(stagingName)).toBe(process.pid);
 });
 
 describe.skipIf(process.platform !== "linux")("file lock committed publication reconciliation", () => {
