@@ -527,6 +527,10 @@ function tokenize(command: string): TokenizeResult {
 			continue;
 		}
 		if (ch === "\n") {
+			const previousLine = command.slice(0, index).trimEnd();
+			if (previousLine.endsWith("|") || (previousLine.endsWith("&") && previousLine.at(-2) === "&")) {
+				continue;
+			}
 			flush();
 			segment++;
 			pipeline++;
@@ -1103,6 +1107,7 @@ function collectShellPayloads(tokens: Token[]): string[] {
 function shellReadsStdin(arguments_: Token[], stdinRedirectSource?: "here-document" | "other"): boolean {
 	if (stdinRedirectSource === "other") return false;
 	const optionsWithArgument = new Set(["-O", "-o"]);
+	const stdinScriptPaths = new Set(["/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"]);
 	let skipNextArgument = false;
 	let optionsTerminated = false;
 
@@ -1112,18 +1117,12 @@ function shellReadsStdin(arguments_: Token[], stdinRedirectSource?: "here-docume
 			skipNextArgument = false;
 			continue;
 		}
-		if (optionsTerminated) return argument === "-";
+		if (optionsTerminated) return argument === "-" || stdinScriptPaths.has(argument);
 		if (argument === "--") {
 			optionsTerminated = true;
 			continue;
 		}
-		if (
-			argument === "-" ||
-			argument === "-s" ||
-			argument === "/dev/stdin" ||
-			argument === "/dev/fd/0" ||
-			argument === "/proc/self/fd/0"
-		) {
+		if (argument === "-" || argument === "-s" || stdinScriptPaths.has(argument)) {
 			return true;
 		}
 		if (

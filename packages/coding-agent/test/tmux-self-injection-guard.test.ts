@@ -976,10 +976,12 @@ describe("tmux self-injection guard", () => {
 			for (const command of [
 				`bash <<'EOF'\n${script}\nEOF`,
 				`bash /dev/stdin <<'EOF'\n${script}\nEOF`,
+				`bash -- /dev/stdin <<'EOF'\n${script}\nEOF`,
 				`bash -s <<'EOF'\n${script}\nEOF`,
 				`bash -- - <<'EOF'\n${script}\nEOF`,
 				`bash -c bash <<'EOF'\n${script}\nEOF`,
 				`cat <<'EOF' | bash\n${script}\nEOF`,
+				`cat <<'EOF' |\nbash\n${script}\nEOF`,
 				`bash -c 'bash 3<<INNER\n:\nINNER\n' <<'OUTER'\n${script}\nOUTER`,
 				`env bash <<'EOF'\n${script}\nEOF`,
 				`env -S bash <<'EOF'\n${script}\nEOF`,
