@@ -399,6 +399,43 @@ function getStaticMcpMemberName(member: Babel.ObjectMethod | Babel.ObjectPropert
 	return undefined;
 }
 
+function unwrapMcpPropertyValue(value: Babel.ObjectProperty["value"]): Babel.ObjectProperty["value"] {
+	let expression = value;
+	while (
+		expression.type === "ParenthesizedExpression" ||
+		expression.type === "TSAsExpression" ||
+		expression.type === "TSTypeAssertion" ||
+		expression.type === "TSSatisfiesExpression" ||
+		expression.type === "TSNonNullExpression"
+	) {
+		expression = expression.expression;
+	}
+	return expression;
+}
+
+function getStaticMcpString(value: Babel.ObjectProperty["value"]): string | undefined {
+	const expression = unwrapMcpPropertyValue(value);
+	return expression.type === "StringLiteral" ? expression.value : undefined;
+}
+
+function getStaticMcpAliases(entry: Babel.ObjectExpression): string[] | undefined {
+	const aliasProperties = entry.properties.filter(member => getStaticMcpMemberName(member) === "aliases");
+	if (aliasProperties.length === 0) return [];
+	const aliasProperty = aliasProperties[0];
+	if (aliasProperties.length !== 1 || aliasProperty?.type !== "ObjectProperty") return undefined;
+
+	const aliasesValue = unwrapMcpPropertyValue(aliasProperty.value);
+	if (aliasesValue.type !== "ArrayExpression") return undefined;
+	const aliases: string[] = [];
+	for (const element of aliasesValue.elements) {
+		if (!element || element.type === "SpreadElement") return undefined;
+		const alias = getStaticMcpString(element);
+		if (alias === undefined) return undefined;
+		aliases.push(alias);
+	}
+	return aliases;
+}
+
 function getMcpHandlerBody(member: Babel.ObjectMethod | Babel.ObjectProperty): Babel.BlockStatement | undefined {
 	if (member.type === "ObjectMethod") return member.body;
 	if (member.value.type === "ArrowFunctionExpression" || member.value.type === "FunctionExpression") {
@@ -475,31 +512,37 @@ export function findMcpBuiltinQuarantineFindings(builtinRegistry: string): strin
 	for (const element of registry.elements) {
 		if (!element) continue;
 		if (element.type === "SpreadElement") return ["root slash-command registry contains an unverified spread"];
-		if (element.type !== "ObjectExpression") continue;
-		const hasMcpName = element.properties.some(
-			property =>
-				getStaticMcpMemberName(property) === "name" &&
-				property.type === "ObjectProperty" &&
-				property.value.type === "StringLiteral" &&
-				property.value.value === "mcp",
+		if (element.type !== "ObjectExpression") return ["root slash-command registry contains an unverified entry"];
+		if (element.properties.some(property => property.type === "SpreadElement")) {
+			return ["root slash-command registry entry contains an unverified spread"];
+		}
+		if (
+			element.properties.some(
+				property =>
+					property.type !== "SpreadElement" && property.computed && property.key.type !== "StringLiteral",
+			)
+		) {
+			return ["root slash-command registry entry contains an unverified computed property"];
+		}
+
+		const nameProperties = element.properties.filter(
+			(property): property is Babel.ObjectProperty =>
+				property.type === "ObjectProperty" && getStaticMcpMemberName(property) === "name",
 		);
-		if (hasMcpName) mcpEntries.push(element);
+		if (nameProperties.length !== 1) return ["root slash-command registry contains an unverified command name"];
+		const nameProperty = nameProperties[0];
+		const name = nameProperty ? getStaticMcpString(nameProperty.value) : undefined;
+		if (name === undefined) return ["root slash-command registry contains an unverified command name"];
+
+		const aliases = getStaticMcpAliases(element);
+		if (aliases === undefined) return ["root slash-command registry contains unverified aliases"];
+		if (name === "mcp" || aliases.includes("mcp")) mcpEntries.push(element);
 	}
 
 	if (mcpEntries.length === 0) return [];
 	const findings: string[] = [];
 	if (mcpEntries.length > 1) findings.push("multiple root /mcp builtins are registered");
 	for (const entry of mcpEntries) {
-		if (entry.properties.some(property => property.type === "SpreadElement")) {
-			findings.push("root /mcp builtin contains an unverified spread");
-		}
-		if (
-			entry.properties.some(
-				property => property.type !== "SpreadElement" && property.computed && property.key.type !== "StringLiteral",
-			)
-		) {
-			findings.push("root /mcp builtin contains an unverified computed property");
-		}
 		if (entry.properties.some(property => getStaticMcpMemberName(property) === "handle")) {
 			findings.push("root /mcp builtin has an unrestricted default handler");
 		}
@@ -563,7 +606,7 @@ async function verifyMcpQuarantine(): Promise<GateResult> {
 		`exposed private package keys: ${exposedMcpKeys.join(", ") || "<none>"}`,
 		`blocked private package keys: ${blockedMcpKeys.join(", ") || "<none>"}`,
 		`missing private export blocks: ${missingPrivateBlocks.join(", ") || "<none>"}`,
-		`root /mcp builtin registered: ${exposesMcpBuiltin}`,
+		`root /mcp literal-name builtin registered: ${exposesMcpBuiltin}`,
 		`root /mcp builtin restricted to exact-config TUI: ${exposesMcpBuiltin && mcpBuiltinQuarantineFindings.length === 0}`,
 		`root /mcp builtin quarantine findings: ${mcpBuiltinQuarantineFindings.join(", ") || "<none>"}`,
 		`default /mcp handler imported: ${importsMcpBuiltinHandler}`,

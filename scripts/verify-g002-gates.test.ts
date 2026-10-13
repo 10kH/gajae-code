@@ -106,7 +106,69 @@ describe("MCP command quarantine", () => {
 			),
 		]);
 		expect(findMcpBuiltinQuarantineFindings(exposed)).toContain(
-			"root /mcp builtin contains an unverified computed property",
+			"root slash-command registry entry contains an unverified computed property",
+		);
+	});
+
+	test("recognizes MCP identity through a transparent TypeScript assertion", () => {
+		const exposed = registryWithEntries([
+			exactMcpTuiEntry
+				.replace('\t\tname: "mcp",', '\t\tname: "mcp" as const,')
+				.replace(
+					'\t\thandleTui: async (command, runtime) => {',
+					'\t\thandle: async () => false,\n\t\thandleTui: async (command, runtime) => {',
+				),
+		]);
+		expect(findMcpBuiltinQuarantineFindings(exposed)).toContain(
+			"root /mcp builtin has an unrestricted default handler",
+		);
+	});
+
+	test("recognizes MCP aliases as root command entries", () => {
+		const exposed = registryWithEntries([
+			exactMcpTuiEntry
+				.replace('\t\tname: "mcp",', '\t\tname: "other",\n\t\taliases: ["mcp"],')
+				.replace(
+					'\t\thandleTui: async (command, runtime) => {',
+					'\t\thandle: async () => false,\n\t\thandleTui: async (command, runtime) => {',
+				),
+		]);
+		expect(findMcpBuiltinQuarantineFindings(exposed)).toContain(
+			"root /mcp builtin has an unrestricted default handler",
+		);
+	});
+
+	test("rejects aliases that cannot be statically resolved", () => {
+		const unresolvedAliases = registryWithEntries([
+			exactMcpTuiEntry
+				.replace('\t\tname: "mcp",', '\t\tname: "other",')
+				.replace(
+					'\t\thandleTui: async (command, runtime) => {',
+					'\t\taliases: commandAliases,\n\t\thandleTui: async (command, runtime) => {',
+				),
+		]);
+		expect(findMcpBuiltinQuarantineFindings(unresolvedAliases)).toContain(
+			"root slash-command registry contains unverified aliases",
+		);
+	});
+
+	test("rejects identifier entries before checking command names", () => {
+		const registry = [
+			'const mcpCommand = { name: "mcp", handle: async () => false };',
+			"const BUILTIN_SLASH_COMMAND_REGISTRY = [mcpCommand];",
+		].join("\n");
+		expect(findMcpBuiltinQuarantineFindings(registry)).toContain(
+			"root slash-command registry contains an unverified entry",
+		);
+	});
+
+	test("rejects object spreads before checking command names", () => {
+		const registry = [
+			'const mcpCommand = { name: "mcp", handle: async () => false };',
+			"const BUILTIN_SLASH_COMMAND_REGISTRY = [{ ...mcpCommand }];",
+		].join("\n");
+		expect(findMcpBuiltinQuarantineFindings(registry)).toContain(
+			"root slash-command registry entry contains an unverified spread",
 		);
 	});
 
