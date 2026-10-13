@@ -265,8 +265,18 @@ function redactJsonValue(value: unknown): unknown {
 	if (value === null || typeof value !== "object") return value;
 	const source = value as Record<string, unknown>;
 	const redacted = Object.create(null) as Record<string, unknown>;
-	for (const key of Object.keys(source)) redacted[key] = redactKeyedValue(key, source[key]);
+	for (const key of Object.keys(source)) {
+		const redactedKey = uniqueJsonObjectKey(redacted, redactCrashSecrets(key));
+		redacted[redactedKey] = redactKeyedValue(key, source[key]);
+	}
 	return redacted;
+}
+
+function uniqueJsonObjectKey(target: Record<string, unknown>, key: string): string {
+	let candidate = key;
+	let suffix = 2;
+	while (Object.hasOwn(target, candidate)) candidate = `${key}#${suffix++}`;
+	return candidate;
 }
 
 const CREDENTIAL_JSON_KEY =

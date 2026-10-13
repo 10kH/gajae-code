@@ -98,7 +98,7 @@ async function writeGh(binDir: string, source: string): Promise<void> {
 	const gh = path.join(binDir, "gh");
 	await Bun.write(
 		gh,
-		`#!/usr/bin/env -S bun --no-env-file
+		`#!/usr/bin/env -S ${process.execPath} --no-env-file
 import { appendFile } from "node:fs/promises";
 const record = process.env.GJC_SHARE_GH_RECORD;
 if (!record) {
@@ -157,10 +157,12 @@ async function share(options: {
 	dotenv?: string;
 	env?: Record<string, string>;
 	moveAway?: boolean;
+	launchFromFilesystemRoot?: boolean;
 	autoload?: boolean;
 	noSpawnError?: string;
 	ghPathMode?:
 		| "trusted"
+		| "operator-only"
 		| "checkout-relative"
 		| "checkout-absolute"
 		| "checkout-directory-symlink"
@@ -219,10 +221,14 @@ async function share(options: {
 			if (!moveTo) throw new Error("Moved-checkout PATH fixture was not created.");
 			env.PATH = path.join(moveTo, "bin");
 			break;
+		case "operator-only":
+			env.PATH = operatorBinDir;
+			break;
 		default:
 			env.PATH = `${binDir}${path.delimiter}${operatorBinDir}${path.delimiter}${process.env.PATH ?? ""}`;
 	}
 	if (moveTo) env.GJC_SHARE_MOVE_TO = moveTo;
+	env.GJC_SHARE_AGENT_DIR = path.join(cwd, "agent-dir");
 	Object.assign(env, options.env);
 	if (options.dotenv !== undefined) {
 		await Bun.write(path.join(cwd, ".env"), options.dotenv);
@@ -230,7 +236,7 @@ async function share(options: {
 
 	const args = options.autoload ? [PROBE] : ["--no-env-file", PROBE];
 	const proc = Bun.spawn([process.execPath, ...args], {
-		cwd,
+		cwd: options.launchFromFilesystemRoot ? path.parse(cwd).root : cwd,
 		env,
 		stdout: "pipe",
 		stderr: "pipe",
@@ -440,6 +446,15 @@ DYLD_ROOT_PATH=/project/root
 			noSpawnError: "GitHub CLI (gh) is not installed on the trusted operator PATH",
 		});
 		expect(spawns).toEqual([]);
+	});
+
+	it("keeps operator PATH entries when launched from the filesystem root", async () => {
+		const spawns = await share({
+			moveAway: true,
+			launchFromFilesystemRoot: true,
+			ghPathMode: "operator-only",
+		});
+		expectDestination(spawns, {});
 	});
 
 	it("refuses a PATH directory symlink that resolves into the checkout", async () => {

@@ -217,6 +217,51 @@ describe("session HTML export embed", () => {
 		}
 	});
 
+	it("redacts credential-shaped object keys without dropping colliding values", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-html-export-credential-keys-"));
+		let session: SessionManager | undefined;
+		try {
+			session = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+			session.appendMessage({
+				role: "assistant",
+				content: [
+					{
+						type: "toolCall",
+						id: "call-credential-keys",
+						name: "echo",
+						arguments: {
+							credentialKeyMap: {
+								"«redacted-api-key»": "ordinary-key-value",
+								"sk-abcdefghijklmnop": true,
+								"sk-qrstuvwxyz012345": false,
+							},
+						},
+					},
+				],
+				timestamp: 1,
+			} as unknown as Parameters<SessionManager["appendMessage"]>[0]);
+			const outputPath = path.join(tempDir, "export.html");
+			await exportSessionToHtml(session, undefined, { outputPath });
+			const embedded = embeddedSessionText(await Bun.file(outputPath).text());
+			const parsed = JSON.parse(embedded) as {
+				entries: Array<{ message?: { content?: Array<{ arguments?: Record<string, unknown> }> } }>;
+			};
+			const args = parsed.entries[0]?.message?.content?.[0]?.arguments;
+			const credentialKeyMap = args?.credentialKeyMap as Record<string, unknown> | undefined;
+
+			expect(embedded).not.toContain("sk-abcdefghijklmnop");
+			expect(embedded).not.toContain("sk-qrstuvwxyz012345");
+			expect(credentialKeyMap).toEqual({
+				"«redacted-api-key»": "ordinary-key-value",
+				"«redacted-api-key»#2": true,
+				"«redacted-api-key»#3": false,
+			});
+		} finally {
+			await session?.close();
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("scrubs a short value under a password key", async () => {
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-html-export-key-short-"));
 		let session: SessionManager | undefined;

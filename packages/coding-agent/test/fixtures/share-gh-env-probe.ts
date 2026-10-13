@@ -29,7 +29,7 @@ function createContainer() {
 	};
 }
 
-const agentDir = path.join(process.cwd(), "empty-agent");
+const agentDir = process.env.GJC_SHARE_AGENT_DIR ?? path.join(process.cwd(), "empty-agent");
 await fs.mkdir(agentDir, { recursive: true });
 setAgentDir(agentDir);
 

@@ -168,7 +168,8 @@ async function findCheckoutRoots(directory: string): Promise<string[] | undefine
 		if (parent === ancestor) break;
 		ancestor = parent;
 	}
-	return roots.length > 0 ? roots : [resolvedDirectory];
+	if (roots.length > 0) return roots;
+	return path.parse(resolvedDirectory).root === resolvedDirectory ? [] : [resolvedDirectory];
 }
 
 function isInsideAnyDirectory(roots: readonly string[], candidate: string): boolean {
@@ -186,7 +187,8 @@ async function resolveGhShareExecutable(): Promise<{ executable: string; searchP
 		return undefined;
 	const checkoutRoots = new Set<string>();
 	for (const directory of new Set([ghShareLaunchRoot, path.resolve(process.cwd())])) {
-		checkoutRoots.add(path.resolve(directory));
+		const resolvedDirectory = path.resolve(directory);
+		if (path.parse(resolvedDirectory).root !== resolvedDirectory) checkoutRoots.add(resolvedDirectory);
 		const roots = await findCheckoutRoots(directory);
 		if (!roots) return undefined;
 		for (const root of roots) checkoutRoots.add(root);
