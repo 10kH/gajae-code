@@ -12,7 +12,7 @@ import * as path from "node:path";
 
 const INPUT_VERBS = new Set(["send-keys", "paste-buffer", "send-prefix"]);
 const SHELL_RUNNERS = new Set(["sh", "bash", "dash", "zsh", "ksh", "busybox"]);
-const SHELL_STDIN_SCRIPT_PATHS = new Set(["/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"]);
+const SHELL_STDIN_SCRIPT_PATHS = new Set(["/dev/stdin", "/dev/fd/0", "/proc/self/fd/0", "/proc/$$/fd/0"]);
 const COMMAND_WRAPPERS = new Set(["eval", "exec", "command", "builtin", "nohup", "time"]);
 const BUILTIN_COMMAND_WRAPPERS = new Set(["command", "eval", "exec"]);
 const NON_EXECUTING_SUDO_OPTIONS = new Set([
@@ -287,7 +287,7 @@ function tokenize(command: string): TokenizeResult {
 			const isIdentityInputDuplication =
 				redirectionTargetIsInput &&
 				redirectionTargetIsDuplication &&
-				text === "0" &&
+				/^0+$/.test(text) &&
 				(redirectionTargetFd === undefined || redirectionTargetFd === 0);
 			if (
 				redirectionTargetIsInput &&
@@ -1404,6 +1404,33 @@ function backtickSubstitutionEnd(source: string, start: number): number | undefi
 	return undefined;
 }
 
+function joinUnquotedHereDocumentLines(body: string): string {
+	let joined = "";
+	for (let index = 0; index < body.length; index++) {
+		if (body[index] !== "\\") {
+			joined += body[index];
+			continue;
+		}
+
+		const start = index;
+		while (body[index + 1] === "\\") index++;
+		const slashCount = index - start + 1;
+		if (body[index + 1] !== "\n") {
+			joined += "\\".repeat(slashCount);
+			continue;
+		}
+
+		if (slashCount % 2 === 1) {
+			joined += "\\".repeat(slashCount - 1);
+			index++;
+			continue;
+		}
+		joined += `${"\\".repeat(slashCount)}\n`;
+		index++;
+	}
+	return joined;
+}
+
 function collectHereDocumentCommandSubstitutions(body: string): string[] {
 	const substitutions = new Set<string>();
 	const pendingSources = [body];
@@ -1444,7 +1471,9 @@ function collectHereDocumentCommandSubstitutions(body: string): string[] {
 
 function collectShellStdinPayloads(tokens: Token[], hereDocuments: HereDocument[]): string[] {
 	const payloads = hereDocuments.flatMap(hereDocument =>
-		hereDocument.delimiterQuoted ? [] : collectHereDocumentCommandSubstitutions(hereDocument.body),
+		hereDocument.delimiterQuoted
+			? []
+			: collectHereDocumentCommandSubstitutions(joinUnquotedHereDocumentLines(hereDocument.body)),
 	);
 	for (let index = 0; index < hereDocuments.length; index++) {
 		const hereDocument = hereDocuments[index];
