@@ -1,9 +1,10 @@
 import { describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { closeModelCache, getBundledModel, type Model } from "@gajae-code/ai";
+import { exactRemoveDirectoryTree, snapshotDirectoryTree } from "@gajae-code/natives";
 import { getAgentDir, hookFetch, postmortem, setAgentDir, TempDir } from "@gajae-code/utils";
 import { type Args, parseArgs } from "../src/cli/args";
-import { FileLockAcquireError } from "../src/config/file-lock";
+import { FileLockAcquireError, FileLockTestHooks, withFileLock } from "../src/config/file-lock";
 import { ModelRegistry, ModelsConfigFile } from "../src/config/model-registry";
 import { resetSettingsForTest, Settings } from "../src/config/settings";
 import { SETTINGS_SCHEMA } from "../src/config/settings-schema";
@@ -677,38 +678,48 @@ describe("startup update contract", () => {
 	it("propagates a session-index lock release failure after registration commits", async () => {
 		using tempDir = TempDir.createSync("@gjc-session-index-release-failure-");
 		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
-		const releaseError = Object.assign(new Error("Failed to release file lock: identity_mismatch."), {
-			code: "identity_mismatch",
-		});
-		const stderr: string[] = [];
-		vi.spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
-			stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
-			return true;
-		});
-		const cleanupSpy = vi.spyOn(postmortem, "cleanup").mockResolvedValue(undefined);
+		const originalAgentDir = getAgentDir();
+		const originalLifecycleRequestId = process.env.GJC_LIFECYCLE_REQUEST_ID;
 		const originalExitCode = process.exitCode;
-		let registrationCommitted = false;
+		const sessionManager = SessionManager.create(
+			tempDir.path(),
+			SessionManager.explicitDestination(path.join(tempDir.path(), "sessions")),
+		);
+		const indexPath = path.join(tempDir.path(), "sdk", "sessions", "index.jsonl");
+		let failNextRemoval = true;
+		FileLockTestHooks.nativeQuarantineBindings = () => ({
+			snapshotDirectoryTree,
+			exactRemoveDirectoryTree: (lockPath, snapshot, parentIdentity, detachOnly) => {
+				if (failNextRemoval) {
+					failNextRemoval = false;
+					return { ok: false, code: "identity_mismatch" };
+				}
+				return exactRemoveDirectoryTree(lockPath, snapshot, parentIdentity, detachOnly);
+			},
+		});
 		try {
+			setAgentDir(tempDir.path());
+			delete process.env.GJC_LIFECYCLE_REQUEST_ID;
 			process.exitCode = 0;
 			await expect(
 				runRootCommand(rootArgs({ mode: "text", noSession: false }), [], {
-					createSessionManager: async () => SessionManager.inMemory(tempDir.path()),
-					registerDirectSession: async () => {
-						registrationCommitted = true;
-						throw releaseError;
-					},
+					createSessionManager: async () => sessionManager,
 					discoverAuthStorage: async () => authStorage,
 					settings: Settings.isolated({ "marketplace.autoUpdate": "off", "startup.checkUpdate": false }),
 					initTheme: async () => {},
 					runStartupCredentialAutoImportIfNeeded: async () => undefined,
 					suppressProcessExit: true,
 				}),
-			).rejects.toBe(releaseError);
-			expect(registrationCommitted).toBe(true);
-			expect(stderr.join("")).toBe("");
+			).rejects.toThrow("Failed to release file lock:");
+			expect(await Bun.file(indexPath).text()).toContain('"type":"host_registered"');
+			expect(await Bun.file(indexPath).text()).toContain(sessionManager.getSessionId());
 			expect(process.exitCode).toBe(0);
-			expect(cleanupSpy).not.toHaveBeenCalled();
+			await withFileLock(indexPath, async () => undefined, { retries: 2, retryDelayMs: 1 });
 		} finally {
+			FileLockTestHooks.nativeQuarantineBindings = undefined;
+			setAgentDir(originalAgentDir);
+			if (originalLifecycleRequestId === undefined) delete process.env.GJC_LIFECYCLE_REQUEST_ID;
+			else process.env.GJC_LIFECYCLE_REQUEST_ID = originalLifecycleRequestId;
 			vi.restoreAllMocks();
 			process.exitCode = originalExitCode ?? 0;
 			authStorage.close();
