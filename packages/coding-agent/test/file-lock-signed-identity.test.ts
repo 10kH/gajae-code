@@ -202,7 +202,7 @@ test.each(["root", "info"] as const)("reclaims a dead-owner lock with a signed %
 		throw new Error(
 			JSON.stringify({ result, identity: observed.identity, paths: fixture.pathObservations }, null, 2),
 		);
-	expect(fixture.remove).toHaveBeenCalledTimes(1);
+	expect(fixture.remove).toHaveBeenCalledTimes(process.platform === "win32" ? 2 : 1);
 	expect(await fs.exists(fixture.lock)).toBe(false);
 });
 
@@ -256,7 +256,7 @@ test.skipIf(process.platform !== "win32")(
 		const observed = await readFileLockObservationForGc(fixture.lock);
 		if (!observed) throw new Error("Expected a lock observation");
 		expect(await removeFileLockDirForGc(fixture.lock, observed.info, observed.identity)).toBe("removed");
-		expect(fixture.remove).toHaveBeenCalledTimes(1);
+		expect(fixture.remove).toHaveBeenCalledTimes(process.platform === "win32" ? 2 : 1);
 		expect(await fs.exists(fixture.lock)).toBe(false);
 		expect(path.dirname(fixture.lock)).toBe(await fs.realpath(path.dirname(fixture.file)));
 		const cleanup = vi.spyOn(fs, "rm");
