@@ -131,6 +131,9 @@ describe("session HTML export embed", () => {
 								private_key: "opaque-private-key-value",
 								cookie: "opaque-cookie-value",
 							},
+							tokensBefore: 12,
+							maxTokens: 32,
+							token_budget: { available: 4096 },
 							note: ORDINARY_SENTENCE,
 						},
 					},
@@ -161,6 +164,9 @@ describe("session HTML export embed", () => {
 				private_key: "«redacted»",
 				cookie: "«redacted»",
 			});
+			expect(args?.tokensBefore).toBe(12);
+			expect(args?.maxTokens).toBe(32);
+			expect(args?.token_budget).toEqual({ available: 4096 });
 			expect(args?.note).toBe(ORDINARY_SENTENCE);
 		} finally {
 			await session?.close();
