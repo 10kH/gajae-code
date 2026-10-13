@@ -23273,7 +23273,7 @@ export class AgentSession {
 	 * had quota. Returns the rotated row's key and ID, or undefined to fall back to the normal
 	 * retry policy: when the candidate is not on the session model's provider (the mark
 	 * acts on that provider's session credential), the provider is pinned, or the
-	 * rotation lands on a row this compaction already failed on.
+	 * rotation lands on a row this candidate's rotation phase already failed on.
 	 */
 	async #rotateCompactionCredentialAfterUsageLimit(
 		candidate: Model,
