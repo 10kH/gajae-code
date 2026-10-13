@@ -191,6 +191,9 @@ interface Token {
 	stdinRedirectOrder?: number;
 	stdinRedirectSource?: "here-document" | "here-string" | "other";
 	isRedirectionTarget?: boolean;
+	redirectionFd?: number;
+	redirectionIsInput?: boolean;
+	redirectionIsDuplication?: boolean;
 	isWrappedCommand?: boolean; // true if this token is the actual command being wrapped by a wrapper like 'command', 'env', 'sudo'
 }
 
@@ -350,7 +353,17 @@ function tokenize(command: string): TokenizeResult {
 				}
 				if (redirectedHereDocument) redirectedHereDocument.stdinRedirectOrders.add(redirectOrder);
 			}
-			tokens.push({ text, quoted, commandStart: false, segment, pipeline, isRedirectionTarget: true });
+			tokens.push({
+				text,
+				quoted,
+				commandStart: false,
+				segment,
+				pipeline,
+				isRedirectionTarget: true,
+				redirectionFd: descriptor,
+				redirectionIsInput: redirectionTargetIsInput,
+				redirectionIsDuplication: redirectionTargetIsDuplication,
+			});
 			if (redirectionTargetIsHereDoc || redirectionTargetIsHereString) {
 				const hereDocument: HereDocument = {
 					kind: redirectionTargetIsHereDoc ? "here-document" : "here-string",
@@ -934,8 +947,14 @@ function quoteShellArgument(argument: string): string {
 	return `'${argument.replaceAll("'", "'\\''")}'`;
 }
 
-function collectShellPayloads(tokens: Token[]): string[] {
-	const payloads: string[] = [];
+interface ShellPayload {
+	content: string;
+	segment: number;
+}
+
+function collectShellPayloadsWithContext(tokens: Token[]): ShellPayload[] {
+	const payloads: ShellPayload[] = [];
+	const addPayload = (content: string, segment: number) => payloads.push({ content, segment });
 	// Options that take an argument for bash/sh/similar shells
 	const optionsWithArg = new Set(["-O", "-o", "+O", "+o"]);
 
@@ -1045,7 +1064,7 @@ function collectShellPayloads(tokens: Token[]): string[] {
 							) {
 								const commandWord = tokens[commandCursor].text;
 								if (!commandWord.startsWith("-") || tokens[commandCursor].quoted) {
-									payloads.push(commandWord);
+									addPayload(commandWord, token.segment);
 									break;
 								}
 							}
@@ -1099,7 +1118,7 @@ function collectShellPayloads(tokens: Token[]): string[] {
 						// version. Inspect it conservatively instead of assuming it is an
 						// invocation option.
 						if (payloadToken.quoted && /[\s;&|()<>$`]/.test(payloadWord)) {
-							payloads.push(payloadWord);
+							addPayload(payloadWord, token.segment);
 							break;
 						}
 						// Check if this option takes an argument
@@ -1118,7 +1137,7 @@ function collectShellPayloads(tokens: Token[]): string[] {
 
 					// Found the first non-option word after -c; this is the actual command string
 					// Add it regardless of quoted status, because bash will execute it as the command
-					payloads.push(payloadWord);
+					addPayload(payloadWord, token.segment);
 					break; // Only take the first payload for this -c
 				}
 				break; // -c stops option parsing
@@ -1162,7 +1181,7 @@ function collectShellPayloads(tokens: Token[]): string[] {
 					// Extract and push the actual command that env will execute
 					const command = reconstructCommandFromEnvSplit(splitString);
 					if (command) {
-						payloads.push(command.map(quoteShellArgument).join(" "));
+						addPayload(command.map(quoteShellArgument).join(" "), token.segment);
 					}
 					cursor++; // Skip the payload we just processed
 				}
@@ -1171,7 +1190,7 @@ function collectShellPayloads(tokens: Token[]): string[] {
 			else if (arg.startsWith("-S") && arg.length > 2) {
 				const command = reconstructCommandFromEnvSplit(arg.slice(2));
 				if (command) {
-					payloads.push(command.map(quoteShellArgument).join(" "));
+					addPayload(command.map(quoteShellArgument).join(" "), token.segment);
 				}
 			}
 			// Check for --split-string option (with or without =)
@@ -1184,7 +1203,7 @@ function collectShellPayloads(tokens: Token[]): string[] {
 					if (value) {
 						const command = reconstructCommandFromEnvSplit(value);
 						if (command) {
-							payloads.push(command.map(quoteShellArgument).join(" "));
+							addPayload(command.map(quoteShellArgument).join(" "), token.segment);
 						}
 					}
 				} else if (arg === "--split-string") {
@@ -1193,7 +1212,7 @@ function collectShellPayloads(tokens: Token[]): string[] {
 						const splitString = tokens[cursor + 1].text;
 						const command = reconstructCommandFromEnvSplit(splitString);
 						if (command) {
-							payloads.push(command.map(quoteShellArgument).join(" "));
+							addPayload(command.map(quoteShellArgument).join(" "), token.segment);
 						}
 						cursor++; // Skip the payload we just processed
 					}
@@ -1219,6 +1238,10 @@ function collectShellPayloads(tokens: Token[]): string[] {
 	}
 
 	return payloads;
+}
+
+function collectShellPayloads(tokens: Token[]): string[] {
+	return collectShellPayloadsWithContext(tokens).map(payload => payload.content);
 }
 
 function shellReadsStdin(
@@ -1760,6 +1783,25 @@ function collectShellScripts(tokens: Token[], cwd: string): ShellScript[] {
 	return scripts;
 }
 
+function shellDescriptorsClosedBefore(tokens: Token[], segment: number): Set<number> {
+	const closed = new Set<number>();
+	for (let index = 0; index < tokens.length; index++) {
+		const command = tokens[index];
+		if (command.segment >= segment) break;
+		if (!command.commandStart || commandName(command.text) !== "exec") continue;
+		for (let cursor = index + 1; cursor < tokens.length && tokens[cursor].segment === command.segment; cursor++) {
+			const redirection = tokens[cursor];
+			if (!redirection.isRedirectionTarget || redirection.redirectionFd === undefined) continue;
+			if (redirection.redirectionIsDuplication && redirection.text === "-") {
+				closed.add(redirection.redirectionFd);
+			} else {
+				closed.delete(redirection.redirectionFd);
+			}
+		}
+	}
+	return closed;
+}
+
 function shellPayloadUsesScriptDescriptor(
 	payloads: string[],
 	activeDescriptors: Set<number>,
@@ -1773,16 +1815,20 @@ function shellPayloadUsesScriptDescriptor(
 		const nestedScripts = collectShellScripts(nestedTokens, cwd);
 		if (
 			nestedScripts.some(
-				script => script.fileDescriptor !== undefined && activeDescriptors.has(script.fileDescriptor),
+				script =>
+					script.fileDescriptor !== undefined &&
+					activeDescriptors.has(script.fileDescriptor) &&
+					!shellDescriptorsClosedBefore(nestedTokens, script.segment).has(script.fileDescriptor),
 			)
 		) {
 			return true;
 		}
-		if (
-			depth < MAX_INDIRECTION_DEPTH &&
-			shellPayloadUsesScriptDescriptor(collectShellPayloads(nestedTokens), activeDescriptors, cwd, depth + 1)
-		) {
-			return true;
+		if (depth < MAX_INDIRECTION_DEPTH) {
+			for (const shellPayload of collectShellPayloadsWithContext(nestedTokens)) {
+				const closed = shellDescriptorsClosedBefore(nestedTokens, shellPayload.segment);
+				const available = new Set([...activeDescriptors].filter(descriptor => !closed.has(descriptor)));
+				if (shellPayloadUsesScriptDescriptor([shellPayload.content], available, cwd, depth + 1)) return true;
+			}
 		}
 		if (depth < MAX_INDIRECTION_DEPTH) {
 			const stdinPayloads = collectShellStdinPayloads(
@@ -1792,7 +1838,18 @@ function shellPayloadUsesScriptDescriptor(
 				cwd,
 				depth + 1,
 			);
-			if (shellPayloadUsesScriptDescriptor(stdinPayloads, activeDescriptors, cwd, depth + 1)) return true;
+			for (const hereDocument of nested.hereDocuments) {
+				const hereDocumentPayloads =
+					(hereDocument.kind === "here-document" && hereDocument.delimiterQuoted) ||
+					(hereDocument.kind === "here-string" && !hereDocument.expandsCommandSubstitutions)
+						? []
+						: collectHereDocumentCommandSubstitutions(joinUnquotedHereDocumentLines(hereDocument.body));
+				if (stdinPayloads.includes(hereDocument.body)) hereDocumentPayloads.push(hereDocument.body);
+				if (hereDocumentPayloads.length === 0) continue;
+				const closed = shellDescriptorsClosedBefore(nestedTokens, hereDocument.segment);
+				const available = new Set([...activeDescriptors].filter(descriptor => !closed.has(descriptor)));
+				if (shellPayloadUsesScriptDescriptor(hereDocumentPayloads, available, cwd, depth + 1)) return true;
+			}
 		}
 	}
 	return false;

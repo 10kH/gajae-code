@@ -1072,6 +1072,12 @@ describe("tmux self-injection guard", () => {
 			await expect(checkTmuxSelfInjection(command, options)).resolves.toMatchObject({ block: true });
 		});
 
+		it("allows nested stdin scripts after the source descriptor is closed", async () => {
+			const command =
+				"bash /dev/fd/3 3<<'OUTER' 4<<'INNER' 5<&4\nexec 5<&-\nbash -s <<'NESTED'\nsource /dev/fd/5\nNESTED\nOUTER\ntmux send-keys -t %47 x\nINNER";
+			await expect(checkTmuxSelfInjection(command, options)).resolves.toEqual({ block: false });
+		});
+
 		it("inspects here-documents duplicated onto shell stdin", async () => {
 			const script = "tmux send-keys -t %47 x";
 			await expect(checkTmuxSelfInjection(`bash -s 3<<'EOF' 0<&3\n${script}\nEOF`, options)).resolves.toMatchObject({
