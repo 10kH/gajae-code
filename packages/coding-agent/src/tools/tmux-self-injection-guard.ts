@@ -894,6 +894,14 @@ function collectShellPayloads(tokens: Token[]): string[] {
 					// Skip over any remaining shell options or their arguments. Quotes
 					// don't change how Bash interprets an argv value beginning with '-'.
 					if (!optionsTerminated && payloadWord.startsWith("-")) {
+						// A quoted argv value that starts with a dash but contains shell
+						// syntax may be treated as command text by another supported shell
+						// version. Inspect it conservatively instead of assuming it is an
+						// invocation option.
+						if (payloadToken.quoted && /[\s;&|()<>$`]/.test(payloadWord)) {
+							payloads.push(payloadWord);
+							break;
+						}
 						// Check if this option takes an argument
 						if (optionsWithArg.has(payloadWord)) {
 							payloadCursor++; // Skip the argument

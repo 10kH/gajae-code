@@ -697,9 +697,11 @@ describe("tmux self-injection guard", () => {
 			});
 		});
 
-		it("does not scan a dash-prefixed command string Bash rejects without --", async () => {
-			await expect(checkTmuxSelfInjection("bash -c '-x || tmux send-keys -t %47 x'", options)).resolves.toEqual({
-				block: false,
+		it("conservatively scans shell syntax in a dash-prefixed quoted -c argument", async () => {
+			await expect(
+				checkTmuxSelfInjection("bash -c '-x || tmux send-keys -t %47 x'", options),
+			).resolves.toMatchObject({
+				block: true,
 			});
 		});
 
