@@ -37,15 +37,22 @@ function findings(generated = corpus(), sources: Record<string, string> = {}): P
 	});
 }
 
-const exactMcpTuiBuiltin = [
+const exactMcpTuiEntry = [
 	'\t\tname: "mcp",',
 	"\t\thandleTui: async (command, runtime) => {",
 	"\t\t\t// MCP controls are unavailable to ordinary sessions.",
 	"\t\t\tif (!runtime.ctx.session.hasExactMcpControls) return { prompt: command.text };",
 	"\t\t\treturn false;",
 	"\t\t},",
-	"\t},",
 ].join("\n");
+
+function registryWithEntries(entries: readonly string[]): string {
+	return [
+		"const BUILTIN_SLASH_COMMAND_REGISTRY = [",
+		...entries.flatMap(entry => ["\t{", entry, "\t},"]),
+		"];",
+	].join("\n");
+}
 
 describe("MCP command quarantine", () => {
 	test("allows the registered /mcp command when it is TUI-only and exact-capability gated", async () => {
@@ -56,33 +63,49 @@ describe("MCP command quarantine", () => {
 	});
 
 	test("rejects a TUI handler that does not fall through before handling the command", () => {
-		const unguarded = exactMcpTuiBuiltin.replace(
-			"if (!runtime.ctx.session.hasExactMcpControls) return { prompt: command.text };",
-			"return false;",
-		);
+		const unguarded = registryWithEntries([
+			exactMcpTuiEntry.replace(
+				"if (!runtime.ctx.session.hasExactMcpControls) return { prompt: command.text };",
+				"return false;",
+			),
+		]);
 		expect(findMcpBuiltinQuarantineFindings(unguarded)).toContain(
 			"root /mcp TUI handler must fall through without exact MCP controls",
 		);
 	});
 
 	test("rejects a default handler even when a TUI guard is also present", () => {
-		const exposed = exactMcpTuiBuiltin.replace(
-			'\t\thandleTui: async (command, runtime) => {',
-			'\t\thandle: async (command, runtime) => false,\n\t\thandleTui: async (command, runtime) => {',
+		const exposed = registryWithEntries([
+			exactMcpTuiEntry.replace(
+				'\t\thandleTui: async (command, runtime) => {',
+				'\t\thandle: async (command, runtime) => false,\n\t\thandleTui: async (command, runtime) => {',
+			),
+		]);
+		expect(findMcpBuiltinQuarantineFindings(exposed)).toContain(
+			"root /mcp builtin has an unrestricted default handler",
 		);
+	});
+
+	test("rejects method-style default handlers", () => {
+		const exposed = registryWithEntries([
+			exactMcpTuiEntry.replace(
+				'\t\thandleTui: async (command, runtime) => {',
+				'\t\tasync handle(command, runtime) { return false; },\n\t\thandleTui: async (command, runtime) => {',
+			),
+		]);
 		expect(findMcpBuiltinQuarantineFindings(exposed)).toContain(
 			"root /mcp builtin has an unrestricted default handler",
 		);
 	});
 
 	test("rejects duplicate root /mcp registrations", () => {
-		expect(findMcpBuiltinQuarantineFindings(`${exactMcpTuiBuiltin}\n${exactMcpTuiBuiltin}`)).toContain(
+		expect(findMcpBuiltinQuarantineFindings(registryWithEntries([exactMcpTuiEntry, exactMcpTuiEntry]))).toContain(
 			"multiple root /mcp builtins are registered",
 		);
 	});
 
 	test("allows the quarantined state with no root /mcp command", () => {
-		expect(findMcpBuiltinQuarantineFindings('\t\tname: "status",')).toEqual([]);
+		expect(findMcpBuiltinQuarantineFindings(registryWithEntries(['\t\tname: "status",']))).toEqual([]);
 	});
 });
 

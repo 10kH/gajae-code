@@ -10,6 +10,8 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { parse } from "@babel/parser";
+import type * as Babel from "@babel/types";
 
 const repoRoot = path.join(import.meta.dir, "..");
 const EXPECTED_DEFINITIONS = ["autoresearch", "deep-interview", "ralplan", "ultragoal"] as const;
@@ -389,31 +391,124 @@ async function verifyBroadWorkflowExposure(): Promise<GateResult> {
 	};
 }
 
+function getStaticMcpMemberName(member: Babel.ObjectMethod | Babel.ObjectProperty | Babel.SpreadElement): string | undefined {
+	if (member.type === "SpreadElement") return undefined;
+	if (member.computed) return member.key.type === "StringLiteral" ? member.key.value : undefined;
+	if (member.key.type === "Identifier") return member.key.name;
+	if (member.key.type === "StringLiteral") return member.key.value;
+	return undefined;
+}
+
+function getMcpHandlerBody(member: Babel.ObjectMethod | Babel.ObjectProperty): Babel.BlockStatement | undefined {
+	if (member.type === "ObjectMethod") return member.body;
+	if (member.value.type === "ArrowFunctionExpression" || member.value.type === "FunctionExpression") {
+		return member.value.body.type === "BlockStatement" ? member.value.body : undefined;
+	}
+	return undefined;
+}
+
+function hasMcpMemberAccessChain(expression: Babel.Expression, root: string, properties: readonly string[]): boolean {
+	let current = expression;
+	for (let index = properties.length - 1; index >= 0; index--) {
+		if (
+			current.type !== "MemberExpression" ||
+			current.computed ||
+			current.property.type !== "Identifier" ||
+			current.property.name !== properties[index] ||
+			current.object.type === "Super"
+		) {
+			return false;
+		}
+		current = current.object;
+	}
+	return current.type === "Identifier" && current.name === root;
+}
+
+function isExactMcpFallback(statement: Babel.Statement): boolean {
+	if (statement.type !== "IfStatement" || statement.alternate !== null) return false;
+	const condition = statement.test;
+	if (
+		condition.type !== "UnaryExpression" ||
+		condition.operator !== "!" ||
+		!hasMcpMemberAccessChain(condition.argument, "runtime", ["ctx", "session", "hasExactMcpControls"])
+	) {
+		return false;
+	}
+	const fallback = statement.consequent;
+	if (fallback.type !== "ReturnStatement" || !fallback.argument || fallback.argument.type !== "ObjectExpression") return false;
+	const prompt = fallback.argument.properties.find(
+		property => getStaticMcpMemberName(property) === "prompt",
+	);
+	return (
+		prompt?.type === "ObjectProperty" &&
+		prompt.value.type === "MemberExpression" &&
+		!prompt.value.computed &&
+		prompt.value.object.type === "Identifier" &&
+		prompt.value.object.name === "command" &&
+		prompt.value.property.type === "Identifier" &&
+		prompt.value.property.name === "text"
+	);
+}
+
 export function findMcpBuiltinQuarantineFindings(builtinRegistry: string): string[] {
-	const markers = [...builtinRegistry.matchAll(/^\t\tname:\s*["']mcp["']\s*,/gm)];
-	if (markers.length === 0) return [];
+	let registry: Babel.ArrayExpression | undefined;
+	try {
+		const source = parse(builtinRegistry, { sourceType: "module", plugins: ["typescript"] });
+		for (const statement of source.program.body) {
+			if (statement.type !== "VariableDeclaration") continue;
+			for (const declaration of statement.declarations) {
+				if (declaration.id.type !== "Identifier" || declaration.id.name !== "BUILTIN_SLASH_COMMAND_REGISTRY") continue;
+				if (declaration.init?.type !== "ArrayExpression") {
+					return ["root slash-command registry could not be isolated"];
+				}
+				registry = declaration.init;
+				break;
+			}
+			if (registry) break;
+		}
+	} catch {
+		return ["root slash-command registry could not be parsed"];
+	}
+	if (!registry) return ["root slash-command registry could not be isolated"];
 
-	const marker = markers[0]!;
-	const entryEnd = builtinRegistry.indexOf("\n\t},", marker.index);
-	if (entryEnd < 0) return ["root /mcp builtin could not be isolated"];
-	const entry = builtinRegistry.slice(marker.index, entryEnd);
-	const findings: string[] = [];
-	if (markers.length > 1) findings.push("multiple root /mcp builtins are registered");
-	if (/^\t\thandle\s*:/m.test(entry)) findings.push("root /mcp builtin has an unrestricted default handler");
-
-	const tuiHandler = /^\t\thandleTui:\s*(?:async\s*)?\([^)]*\)\s*=>\s*\{/m.exec(entry);
-	if (!tuiHandler) {
-		findings.push("root /mcp builtin is not TUI-only");
-		return findings;
+	const mcpEntries: Babel.ObjectExpression[] = [];
+	for (const element of registry.elements) {
+		if (!element) continue;
+		if (element.type === "SpreadElement") return ["root slash-command registry contains an unverified spread"];
+		if (element.type !== "ObjectExpression") continue;
+		const hasMcpName = element.properties.some(
+			property =>
+				getStaticMcpMemberName(property) === "name" &&
+				property.type === "ObjectProperty" &&
+				property.value.type === "StringLiteral" &&
+				property.value.value === "mcp",
+		);
+		if (hasMcpName) mcpEntries.push(element);
 	}
 
-	const body = entry.slice(tuiHandler.index + tuiHandler[0].length);
-	const firstStatement = body
-		.split("\n")
-		.map(line => line.trim())
-		.find(line => line.length > 0 && !line.startsWith("//"));
-	if (firstStatement !== "if (!runtime.ctx.session.hasExactMcpControls) return { prompt: command.text };") {
-		findings.push("root /mcp TUI handler must fall through without exact MCP controls");
+	if (mcpEntries.length === 0) return [];
+	const findings: string[] = [];
+	if (mcpEntries.length > 1) findings.push("multiple root /mcp builtins are registered");
+	for (const entry of mcpEntries) {
+		if (entry.properties.some(property => property.type === "SpreadElement")) {
+			findings.push("root /mcp builtin contains an unverified spread");
+		}
+		if (entry.properties.some(property => getStaticMcpMemberName(property) === "handle")) {
+			findings.push("root /mcp builtin has an unrestricted default handler");
+		}
+
+		const tuiHandlers = entry.properties.filter(
+			(property): property is Babel.ObjectMethod | Babel.ObjectProperty =>
+				getStaticMcpMemberName(property) === "handleTui" && property.type !== "SpreadElement",
+		);
+		if (tuiHandlers.length !== 1) {
+			findings.push("root /mcp builtin must define exactly one TUI-only handler");
+			continue;
+		}
+		const handlerBody = getMcpHandlerBody(tuiHandlers[0]!);
+		if (!handlerBody || !handlerBody.body[0] || !isExactMcpFallback(handlerBody.body[0])) {
+			findings.push("root /mcp TUI handler must fall through without exact MCP controls");
+		}
 	}
 	return findings;
 }
