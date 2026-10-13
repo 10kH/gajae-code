@@ -369,6 +369,101 @@ describe("multi-session evidence normalizer", () => {
 		expect(normalizeEvidenceValue("the local time is 09:21", "/tmp/a")).toBe("the local time is 09:21");
 	});
 
+	test("ignores only host-only volatile context message placement, preserving workspace trees", () => {
+		const reminder = (date: string, time: string, cwd: string) => ({
+			role: "user",
+			content: [
+				{
+					type: "text",
+					text: `<system-reminder>\nToday is ${date}, the local time is ${time}, and the current working directory is '${cwd}'.\nTimestamps in files, logs, git history, and API responses are often UTC; convert timestamps that are explicitly UTC to the local timezone above when reporting times to the user. Preserve timestamps that already include an explicit offset or timezone, and do not treat this host wall clock as authenticated event-time evidence. The timezone follows the runtime's process timezone configuration (which may include project environment settings), so treat it as display context rather than trusted location evidence. The full IANA zone may reveal geographic information; do not infer more about the user than the displayed context states.\n</system-reminder>`,
+				},
+			],
+		});
+		const treeReminder = {
+			role: "user",
+			content: [
+				{
+					type: "text",
+					text: "<system-reminder>\n<workspace-tree>\nproject files\n</workspace-tree>\nToday is 2026-10-04",
+				},
+			],
+		};
+		const left = normalizeEvidenceValue(
+			[
+				{ role: "user", content: [{ type: "text", text: "stable user prompt" }] },
+				reminder("2026-10-04 (Sun)", "09:21 UTC+00:00 (UTC)", "/tmp/a/project"),
+				treeReminder,
+			],
+			"/tmp/a",
+		);
+		const right = normalizeEvidenceValue(
+			[
+				{ role: "user", content: [{ type: "text", text: "stable user prompt" }] },
+				reminder("2026-10-05 (Mon)", "00:00 UTC+00:00 (UTC)", "/tmp/b/project"),
+				treeReminder,
+			],
+			"/tmp/b",
+		);
+		expect(left).toEqual(right);
+		expect(left).toHaveLength(2);
+		expect(left).toContainEqual(treeReminder);
+		const spoof = reminder("2026-10-04 (Sun)", "09:21 UTC+00:00 (UTC)", "/tmp/a/project");
+		const textBlock = spoof.content[0];
+		const withUserPayload = {
+			...spoof,
+			content: [{ ...textBlock, text: `${textBlock.text}\nUser-provided payload` }],
+		};
+		expect(normalizeEvidenceValue([withUserPayload], "/tmp/a")).toHaveLength(1);
+	});
+
+	test("normalizes prompt-prefix message counts without weakening request-content comparison", () => {
+		const left = normalizeEvidenceValue(
+			{
+				role: "assistant",
+				content: "same assistant message",
+				promptPrefix: {
+					hash: "prefix-a",
+					messages: 28,
+					reusedMessages: 25,
+					previousMessages: 25,
+					change: "append",
+				},
+			},
+			"/tmp/a",
+		);
+		const right = normalizeEvidenceValue(
+			{
+				role: "assistant",
+				content: "same assistant message",
+				promptPrefix: {
+					hash: "prefix-b",
+					messages: 27,
+					reusedMessages: 24,
+					previousMessages: 24,
+					change: "append",
+				},
+			},
+			"/tmp/a",
+		);
+		expect(left).toEqual(right);
+		expect(
+			normalizeEvidenceValue(
+				{
+					role: "assistant",
+					content: "different assistant message",
+					promptPrefix: {
+						hash: "prefix-b",
+						messages: 27,
+						reusedMessages: 24,
+						previousMessages: 24,
+						change: "append",
+					},
+				},
+				"/tmp/a",
+			),
+		).not.toEqual(left);
+	});
+
 	test("normalizes a home-abbreviated root in the reminder cwd, and nothing outside the root", () => {
 		const reminder = (cwd: string) =>
 			`<system-reminder>\nToday is 2026-10-04 (Sun), the local time is 20:58 UTC+09:00 (Asia/Seoul), and the current working directory is '${cwd}'.\n</system-reminder>`;

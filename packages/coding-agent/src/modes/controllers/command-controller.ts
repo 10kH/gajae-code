@@ -144,8 +144,10 @@ const GH_SHARE_TRUST_KEY_SET = new Set(GH_SHARE_TRUST_KEYS.map(name => name.toUp
  * remove them.
  */
 const ghShareProjectSnapshot = projectEnvSnapshot();
-const ghShareExecutable = (() => {
-	const operatorPath = process.env.PATH;
+const ghShareOperatorPath = process.env.PATH;
+
+function resolveGhShareExecutable(): string | undefined {
+	const operatorPath = ghShareOperatorPath;
 	const key = canonicalEnvKey("PATH");
 	const declared = ghShareProjectSnapshot.values[key];
 	if (
@@ -154,7 +156,7 @@ const ghShareExecutable = (() => {
 	)
 		return undefined;
 	return Bun.which("gh", { PATH: operatorPath }) ?? undefined;
-})();
+}
 
 /**
  * Environment for the default `/share` `gh` children. GitHub CLI routing,
@@ -320,6 +322,7 @@ export class CommandController {
 			return;
 		}
 
+		const ghShareExecutable = resolveGhShareExecutable();
 		if (!ghShareExecutable) {
 			this.ctx.showError(
 				"GitHub CLI (gh) is not installed on the trusted operator PATH. Install it from https://cli.github.com/",

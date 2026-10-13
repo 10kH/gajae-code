@@ -258,7 +258,7 @@ describe.skipIf(process.platform !== "linux")("managed artifact reads stay bound
 			return fd;
 		}) as typeof fs.openSync);
 
-		await expect(manager.readRange(id)).rejects.toThrow("managed_range_generation_mismatch");
+		await expect(manager.readRange(id)).rejects.toThrow("source_changed");
 		expect(replaced).toBe(true);
 		expect(await fsp.readFile(outside, "utf8")).toBe("path-backed outside secret");
 	});
