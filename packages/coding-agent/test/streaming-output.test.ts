@@ -913,6 +913,19 @@ describe("OutputSink maxColumns (per-line cap)", () => {
 		expect(dumped.columnTruncatedLines).toBe(1);
 	});
 
+	test("bounds large cap batches without splitting UTF-8 accounting across a surrogate pair", async () => {
+		const input = `${"x".repeat(64 * 1024 - 1)}😀${"y".repeat(4)}\nshort\n`;
+		const sink = new OutputSink({ maxColumns: 64 * 1024 - 1 + 5, headBytes: 100_000 });
+		await sink.push(input);
+
+		const dumped = await sink.dump();
+		expect(dumped.output).toBe(`${"x".repeat(64 * 1024 - 1)}…\nshort\n`);
+		expect(dumped.columnDroppedBytes).toBe(8);
+		expect(dumped.columnTruncatedLines).toBe(1);
+		expect(dumped.totalBytes).toBe(byteLength(input));
+		expect(dumped.outputBytes).toBe(byteLength(`${"x".repeat(64 * 1024 - 1)}…\nshort\n`));
+	});
+
 	test("disabled by default — maxColumns: 0 is a passthrough", async () => {
 		const sink = new OutputSink({ spillThreshold: 4000 });
 		const wide = "y".repeat(2000);

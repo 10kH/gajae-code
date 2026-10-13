@@ -29,6 +29,10 @@ const NL = "\n";
 
 const ELLIPSIS = "…";
 
+// Bound the temporary parts/join allocation in #applyColumnCap for a single
+// large callback. Keep batches small enough to avoid per-line retention work.
+const COLUMN_CAP_BATCH_CHARS = 64 * 1024;
+
 const outputPlainSecrets = new AsyncLocalStorage<readonly string[]>();
 
 /** Run `fn` while column caps can see these plain secrets. */
@@ -1263,9 +1267,22 @@ export class OutputSink {
 					cursor = end;
 				}
 			} else {
-				// Batch ordinary output by native read chunk. Retaining each line
-				// separately repeats byte/newline accounting millions of times.
-				this.#retainVisible(this.#applyColumnCap(sanitizedChunk));
+				// Batch ordinary output while bounding #applyColumnCap's temporary
+				// parts/join allocation for large single callbacks. Retaining each
+				// line separately repeats accounting millions of times.
+				let cursor = 0;
+				while (cursor < sanitizedChunk.length) {
+					let end = Math.min(cursor + COLUMN_CAP_BATCH_CHARS, sanitizedChunk.length);
+					// UTF-8 byte accounting must not observe a surrogate pair as two
+					// replacement characters when a batch boundary lands between them.
+					if (end < sanitizedChunk.length) {
+						const before = sanitizedChunk.charCodeAt(end - 1);
+						const after = sanitizedChunk.charCodeAt(end);
+						if (before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff) end--;
+					}
+					this.#retainVisible(this.#applyColumnCap(sanitizedChunk.slice(cursor, end)));
+					cursor = end;
+				}
 			}
 		} else {
 			this.#retainVisible(sanitizedChunk);
