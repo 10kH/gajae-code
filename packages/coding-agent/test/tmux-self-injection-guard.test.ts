@@ -82,6 +82,40 @@ describe("tmux self-injection guard", () => {
 		});
 	});
 
+	describe("tmux global option parsing", () => {
+		it("finds input verbs after global options with operands", async () => {
+			for (const command of ["tmux -f /dev/null send-keys -t %47 x", "tmux -T 256 send-keys -t %47 x"]) {
+				await expect(checkTmuxSelfInjection(command, options)).resolves.toMatchObject({ block: true });
+			}
+		});
+
+		it("finds input verbs after attached and bundled global options", async () => {
+			for (const command of ["tmux -f/dev/null send-keys -t %47 x", "tmux -2f /dev/null send-keys -t %47 x"]) {
+				await expect(checkTmuxSelfInjection(command, options)).resolves.toMatchObject({ block: true });
+			}
+		});
+
+		it("inspects shell commands passed through tmux -c", async () => {
+			await expect(checkTmuxSelfInjection("tmux -c 'tmux send-keys -t %47 x'", options)).resolves.toMatchObject({
+				block: true,
+			});
+		});
+
+		it("allows tmux help and version modes", async () => {
+			for (const option of ["-h", "-V"]) {
+				await expect(checkTmuxSelfInjection(`tmux ${option} send-keys -t %47 x`, options)).resolves.toEqual({
+					block: false,
+				});
+			}
+		});
+
+		it("allows read-only commands after a configuration-file option", async () => {
+			await expect(checkTmuxSelfInjection("tmux -f /dev/null list-panes -t demo", options)).resolves.toEqual({
+				block: false,
+			});
+		});
+	});
+
 	it("finds injection hidden behind a shell wrapper", async () => {
 		await expect(checkTmuxSelfInjection("sh -c 'tmux send-keys -t %47 x'", options)).resolves.toMatchObject({
 			block: true,
@@ -157,6 +191,26 @@ describe("tmux self-injection guard", () => {
 			await expect(checkTmuxSelfInjection("nice -n 10 tmux send-keys -t %47 x", options)).resolves.toMatchObject({
 				block: true,
 			});
+		});
+
+		it("should block GNU time with short and long format operands", async () => {
+			for (const command of [
+				"/usr/bin/time -f '%E' tmux send-keys -t %47 x",
+				"/usr/bin/time --format '%E' tmux send-keys -t %47 x",
+			]) {
+				await expect(checkTmuxSelfInjection(command, options)).resolves.toMatchObject({ block: true });
+			}
+		});
+
+		it("allows nice and time help/version modes", async () => {
+			for (const command of [
+				"nice --help tmux send-keys -t %47 x",
+				"nice --version tmux send-keys -t %47 x",
+				"time --help tmux send-keys -t %47 x",
+				"time --version tmux send-keys -t %47 x",
+			]) {
+				await expect(checkTmuxSelfInjection(command, options)).resolves.toEqual({ block: false });
+			}
 		});
 
 		it("should block xargs wrapper", async () => {

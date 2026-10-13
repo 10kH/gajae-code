@@ -26,6 +26,8 @@ const NON_EXECUTING_SUDO_OPTIONS = new Set([
 	"--help",
 ]);
 const NON_EXECUTING_ENV_OPTIONS = new Set(["--help", "--version"]);
+const NON_EXECUTING_NICE_OPTIONS = new Set(["--help", "--version"]);
+const NON_EXECUTING_TIME_OPTIONS = new Set(["--help", "--version"]);
 const ASSIGNMENT_AWARE_WRAPPERS = new Set(["env", "sudo"]); // Only these allow VAR=value at start
 const CONTROL_WORDS = new Set(["then", "do", "else", "fi", "done", "esac"]);
 const MAX_INDIRECTION_DEPTH = 4;
@@ -85,6 +87,14 @@ const WRAPPER_LONG_OPTIONS: Record<string, Record<string, boolean>> = {
 	nice: {
 		"--adjustment": true, // nice --adjustment=N (takes adjustment value)
 	},
+	time: {
+		"--format": true,
+		"--output": true,
+		"--append": false,
+		"--portability": false,
+		"--quiet": false,
+		"--verbose": false,
+	},
 	stdbuf: {
 		"--input": true, // stdbuf --input=MODE
 		"--output": true, // stdbuf --output=MODE
@@ -127,6 +137,10 @@ const COMMAND_WRAPPERS_WITH_ARGS: Record<string, WrapperSpec> = {
 	},
 	nice: {
 		optionsWithArg: new Set(["-n"]),
+	},
+	time: {
+		optionsWithArg: new Set(["-f", "-o"]),
+		flagOnlyOptions: new Set(["-a", "-p", "-q", "-v"]),
 	},
 	xargs: {
 		optionsWithArg: new Set(["-E", "-I", "-J", "-L", "-n", "-P", "-R", "-d", "-s", "-a"]), // -s SIZE, -a FILE
@@ -294,7 +308,9 @@ function tokenize(command: string): Token[] {
 				// Don't touch skipNextArg yet; it will be consumed by the next argument
 				const nonExecutingSudoMode = wrapperCommand?.name === "sudo" && NON_EXECUTING_SUDO_OPTIONS.has(text);
 				const nonExecutingEnvMode = wrapperCommand?.name === "env" && NON_EXECUTING_ENV_OPTIONS.has(text);
-				if (nonExecutingSudoMode || nonExecutingEnvMode) {
+				const nonExecutingNiceMode = wrapperCommand?.name === "nice" && NON_EXECUTING_NICE_OPTIONS.has(text);
+				const nonExecutingTimeMode = wrapperCommand?.name === "time" && NON_EXECUTING_TIME_OPTIONS.has(text);
+				if (nonExecutingSudoMode || nonExecutingEnvMode || nonExecutingNiceMode || nonExecutingTimeMode) {
 					// These sudo modes never execute a command. env's help/version modes
 					// also exit after displaying output.
 					wrapperCommand = undefined;
@@ -464,50 +480,64 @@ function tokenize(command: string): Token[] {
 }
 
 interface Invocation {
-	verb: string;
+	verb: string | undefined;
 	args: string[];
 	socketArgs: string[];
 	socket?: { flag: "-L" | "-S"; value: string };
+	shellCommands: string[];
+	nonExecuting: boolean;
 }
+
+const TMUX_GLOBAL_OPTIONS_WITH_ARGUMENT = new Set(["c", "f", "L", "S", "T"]);
 
 function parseInvocation(tokens: Token[]): Invocation | undefined {
 	let index = 0;
 	const socketArgs: string[] = [];
 	let socket: Invocation["socket"];
+	const shellCommands: string[] = [];
 	while (index < tokens.length && !tokens[index].commandStart) {
 		const option = tokens[index].text;
 		if (option === "--") {
 			index++;
 			break;
 		}
-		if (option === "-L" || option === "-S") {
-			const value = tokens[index + 1];
-			if (!value || value.commandStart) return undefined;
-			socket = { flag: option, value: value.text };
-			socketArgs.push(option, value.text);
-			index += 2;
-			continue;
+		if (option === "--help" || option === "--version") {
+			return { verb: undefined, args: [], socketArgs, socket, shellCommands, nonExecuting: true };
 		}
-		if (option.startsWith("-L") || option.startsWith("-S")) {
-			const flag = option.slice(0, 2) as "-L" | "-S";
-			const value = option.slice(2);
-			if (!value) return undefined;
-			socket = { flag, value };
-			socketArgs.push(flag, value);
-			index++;
-			continue;
+		if (!option.startsWith("-") || option.startsWith("--") || option === "-") break;
+
+		let separateOperand = false;
+		for (let optionIndex = 1; optionIndex < option.length; optionIndex++) {
+			const flag = option[optionIndex];
+			if (flag === "h" || flag === "V") {
+				return { verb: undefined, args: [], socketArgs, socket, shellCommands, nonExecuting: true };
+			}
+			if (!TMUX_GLOBAL_OPTIONS_WITH_ARGUMENT.has(flag)) continue;
+
+			let value = option.slice(optionIndex + 1);
+			if (value.length === 0) {
+				const operand = tokens[index + 1];
+				if (!operand || operand.commandStart) return undefined;
+				value = operand.text;
+				separateOperand = true;
+			}
+			if (flag === "L" || flag === "S") {
+				const socketFlag = `-${flag}` as "-L" | "-S";
+				socket = { flag: socketFlag, value };
+				socketArgs.push(socketFlag, value);
+			}
+			if (flag === "c") shellCommands.push(value);
+			break;
 		}
-		if (option.startsWith("-")) {
-			index++;
-			continue;
-		}
-		break;
+		index += separateOperand ? 2 : 1;
 	}
 	const verb = tokens[index];
-	if (!verb || verb.commandStart) return undefined;
+	if (!verb || verb.commandStart) {
+		return { verb: undefined, args: [], socketArgs, socket, shellCommands, nonExecuting: false };
+	}
 	const args: string[] = [];
 	for (index++; index < tokens.length && !tokens[index].commandStart; index++) args.push(tokens[index].text);
-	return { verb: verb.text, args, socketArgs, socket };
+	return { verb: verb.text, args, socketArgs, socket, shellCommands, nonExecuting: false };
 }
 
 function targetFromArgs(args: string[]): string | undefined {
@@ -1224,7 +1254,14 @@ export async function checkTmuxSelfInjection(
 		// Skip tmux invocations that are part of a `command -v` lookup (not execution)
 		if (isCommandLookup(tokens, index)) continue;
 		const invocation = parseInvocation(tokens.slice(index + 1));
-		if (!invocation || !INPUT_VERBS.has(invocation.verb)) continue;
+		if (!invocation || invocation.nonExecuting) continue;
+		if (depth < MAX_INDIRECTION_DEPTH) {
+			for (const shellCommand of invocation.shellCommands) {
+				const result = await checkTmuxSelfInjection(shellCommand, options, depth + 1);
+				if (result.block) return result;
+			}
+		}
+		if (!invocation.verb || !INPUT_VERBS.has(invocation.verb)) continue;
 		const assignedSocket = assignedTmuxSocket(tokens, index);
 		const commandSocket = invocation.socket ? socketPathFor(invocation.socket, env, cwd, uid) : assignedSocket;
 		if (commandSocket && !sameSocket(commandSocket, identity.socketPath)) continue;
