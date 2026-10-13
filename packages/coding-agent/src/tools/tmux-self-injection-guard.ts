@@ -777,10 +777,14 @@ function collectShellPayloads(tokens: Token[]): string[] {
 			const isBundledC = word.startsWith("-") && !word.startsWith("--") && word.length > 2 && word.includes("c");
 			if (isStandaloneC || isBundledC) {
 				// Found a -c option (standalone or bundled)
-				// The command string is the first non-option word after -c
+				// Options such as -O and -o still take operands when bundled after -c.
+				const commandOptionIndex = word.indexOf("c");
+				const followingOperandCount = [...word.slice(commandOptionIndex + 1)].filter(
+					option => option === "O" || option === "o",
+				).length;
 				let optionsTerminated = false;
 				for (
-					let payloadCursor = cursor + 1;
+					let payloadCursor = cursor + 1 + followingOperandCount;
 					payloadCursor < tokens.length && !tokens[payloadCursor].commandStart;
 					payloadCursor++
 				) {

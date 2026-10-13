@@ -919,6 +919,15 @@ describe("tmux self-injection guard", () => {
 			}
 		});
 
+		it("consumes Bash option operands bundled after -c", async () => {
+			for (const command of [
+				"bash -cO extglob 'tmux send-keys -t %47 x'",
+				"bash -co pipefail 'tmux send-keys -t %47 x'",
+			]) {
+				await expect(checkTmuxSelfInjection(command, options)).resolves.toMatchObject({ block: true });
+			}
+		});
+
 		it("resets builtin parsing at a newline", async () => {
 			await expect(
 				checkTmuxSelfInjection("builtin\nbash -c 'tmux send-keys -t %47 x'", options),
