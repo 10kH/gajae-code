@@ -189,6 +189,7 @@ interface Token {
 	segment: number;
 	pipeline: number;
 	subshellDepth: number;
+	conditionallyExecuted?: boolean;
 	stdinRedirectOrder?: number;
 	stdinRedirectSource?: "here-document" | "here-string" | "other";
 	isRedirectionTarget?: boolean;
@@ -277,6 +278,7 @@ function tokenize(command: string): TokenizeResult {
 	let segment = 0;
 	let pipeline = 0;
 	let subshellDepth = 0;
+	const conditionalSegments = new Set<number>();
 	let wrapperCommand:
 		| { name: string; spec: WrapperSpec; optionsTerminated: boolean; assignmentAware: boolean }
 		| undefined;
@@ -362,6 +364,7 @@ function tokenize(command: string): TokenizeResult {
 				segment,
 				pipeline,
 				subshellDepth,
+				...(conditionalSegments.has(segment) && { conditionallyExecuted: true }),
 				isRedirectionTarget: true,
 				redirectionFd: descriptor,
 				redirectionIsInput: redirectionTargetIsInput,
@@ -567,6 +570,7 @@ function tokenize(command: string): TokenizeResult {
 			segment,
 			pipeline,
 			subshellDepth,
+			...(conditionalSegments.has(segment) && { conditionallyExecuted: true }),
 			...(stdinRedirect && { stdinRedirectOrder: stdinRedirect.order, stdinRedirectSource: stdinRedirect.source }),
 			...(isWrappedCommand && { isWrappedCommand }),
 		};
@@ -704,6 +708,9 @@ function tokenize(command: string): TokenizeResult {
 				ch === "|" || (ch === "&" && (command[index - 1] === "&" || command[index - 1] === "|"));
 			flush();
 			segment++;
+			if ((ch === "&" && command[index - 1] === "&") || (ch === "|" && command[index - 1] === "|")) {
+				conditionalSegments.add(segment);
+			}
 			if (ch === "(") subshellDepth++;
 			else if (ch === ")") subshellDepth = Math.max(0, subshellDepth - 1);
 			if (
@@ -1791,13 +1798,45 @@ function collectShellScripts(tokens: Token[], cwd: string): ShellScript[] {
 
 function shellDescriptorsClosedBefore(tokens: Token[], segment: number): Set<number> {
 	const closed = new Set<number>();
+	let conditionalDepth = 0;
+	let loopDepth = 0;
+	let caseDepth = 0;
 	for (let index = 0; index < tokens.length; index++) {
 		const command = tokens[index];
 		if (command.segment >= segment) break;
+		if (command.commandStart) {
+			switch (command.text) {
+				case "if":
+					conditionalDepth++;
+					continue;
+				case "fi":
+					conditionalDepth = Math.max(0, conditionalDepth - 1);
+					continue;
+				case "for":
+				case "while":
+				case "until":
+				case "select":
+					loopDepth++;
+					continue;
+				case "done":
+					loopDepth = Math.max(0, loopDepth - 1);
+					continue;
+				case "case":
+					caseDepth++;
+					continue;
+				case "esac":
+					caseDepth = Math.max(0, caseDepth - 1);
+					continue;
+			}
+		}
 		if (
 			!command.commandStart ||
 			commandName(command.text) !== "exec" ||
+			command.conditionallyExecuted === true ||
 			command.subshellDepth > 0 ||
+			conditionalDepth > 0 ||
+			loopDepth > 0 ||
+			caseDepth > 0 ||
 			tokens.some(
 				other => other.commandStart && other.pipeline === command.pipeline && other.segment !== command.segment,
 			)
@@ -2005,9 +2044,14 @@ function commandWorkingDirectory(tokens: Token[], commandIndex: number, cwd: str
 		if (token.segment !== tokens[commandIndex].segment) break;
 		if (!token.commandStart || commandName(token.text) !== "env") continue;
 
+		let skipNextArgument = false;
 		for (let cursor = index + 1; cursor < commandIndex; cursor++) {
 			const argument = tokens[cursor];
 			if (argument.segment !== token.segment || argument.commandStart) break;
+			if (skipNextArgument) {
+				skipNextArgument = false;
+				continue;
+			}
 			if (argument.isRedirectionTarget || argument.text === "--") {
 				if (argument.text === "--") break;
 				continue;
@@ -2026,6 +2070,12 @@ function commandWorkingDirectory(tokens: Token[], commandIndex: number, cwd: str
 				chdir = argument.text.slice("--chdir=".length);
 			} else if (!argument.text.startsWith("-") && !isAssignment(argument.text)) {
 				break;
+			}
+			if (
+				chdir === undefined &&
+				wrapperOptionTakesNextArgument({ name: "env", spec: COMMAND_WRAPPERS_WITH_ARGS.env }, argument.text)
+			) {
+				skipNextArgument = true;
 			}
 			if (chdir !== undefined) {
 				if (hasShellPathExpansion(chdir)) return undefined;

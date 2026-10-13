@@ -197,6 +197,17 @@ describe("tmux self-injection guard", () => {
 			).resolves.toMatchObject({ block: true });
 		});
 
+		it("finds env chdir options after argv0 operands", async () => {
+			const socketPath = env.TMUX.split(",")[0];
+			const socketDir = socketPath.substring(0, socketPath.lastIndexOf("/"));
+			for (const command of [
+				`env -a disguise -C ${socketDir} tmux -S default send-keys -t %47 x`,
+				`env --argv0 disguise --chdir=${socketDir} tmux -S default send-keys -t %47 x`,
+			]) {
+				await expect(checkTmuxSelfInjection(command, options)).resolves.toMatchObject({ block: true });
+			}
+		});
+
 		it("should block sudo wrapper with option taking argument", async () => {
 			await expect(checkTmuxSelfInjection("sudo -u root tmux send-keys -t %47 x", options)).resolves.toMatchObject({
 				block: true,
@@ -1076,6 +1087,16 @@ describe("tmux self-injection guard", () => {
 			const command =
 				"bash /dev/fd/3 3<<'OUTER' 4<<'INNER' 5<&4\nexec 5<&-\nbash -s <<'NESTED'\nsource /dev/fd/5\nNESTED\nOUTER\ntmux send-keys -t %47 x\nINNER";
 			await expect(checkTmuxSelfInjection(command, options)).resolves.toEqual({ block: false });
+		});
+
+		it("keeps descriptors live when a conditional exec close may be skipped", async () => {
+			const commands = [
+				"bash /dev/fd/3 3<<'OUTER' 4<<'INNER' 5<&4\nif false; then exec 5<&-; fi\nsource /dev/fd/5\nOUTER\ntmux send-keys -t %47 x\nINNER",
+				"bash /dev/fd/3 3<<'OUTER' 4<<'INNER' 5<&4\nfalse && exec 5<&-\nsource /dev/fd/5\nOUTER\ntmux send-keys -t %47 x\nINNER",
+			];
+			for (const command of commands) {
+				await expect(checkTmuxSelfInjection(command, options)).resolves.toMatchObject({ block: true });
+			}
 		});
 
 		it("keeps descriptor-backed scripts live when a subshell closes its copy", async () => {
