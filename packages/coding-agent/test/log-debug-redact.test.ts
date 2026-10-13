@@ -105,9 +105,11 @@ describe("debug log credential scrub", () => {
 			"opaque-secret-value",
 			"opaque-credential-value",
 			"opaque-private-key-value",
+			"opaque-openai-api-key-value",
+			"opaque-api-token-value",
 			"opaque-cookie-value",
 		];
-		const labels = ["token", "secret", "credential", "private_key", "cookie"];
+		const labels = ["token", "secret", "credential", "private_key", "OPENAI_API_KEY", "api_token", "cookie"];
 		const message = labels.map((label, index) => `${label}=${secrets[index]}`).join(" ");
 
 		await generateSessionTitle(message, createRegistry(model), createSettings(model));

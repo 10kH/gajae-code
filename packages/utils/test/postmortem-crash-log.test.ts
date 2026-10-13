@@ -203,6 +203,8 @@ describe("recordFatalCrash", () => {
 			"private_key=q",
 			"private_token=abc123",
 			"AWS_SECRET_ACCESS_KEY=x",
+			"OPENAI_API_KEY=opaque-openai-key",
+			"api_token=opaque-api-token",
 			"cookie=z",
 			"password=123456",
 		].join(" ");

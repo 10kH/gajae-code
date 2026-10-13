@@ -135,6 +135,8 @@ describe("session HTML export embed", () => {
 								private_key: "opaque-private-key-value",
 								private_token: "opaque-private-token-value",
 								aws_secret_access_key: "opaque-aws-secret-key-value",
+								OPENAI_API_KEY: "opaque-openai-api-key-value",
+								api_token: "opaque-api-token-value",
 								cookie: "opaque-cookie-value",
 							},
 							tokensBefore: 12,
@@ -161,6 +163,8 @@ describe("session HTML export embed", () => {
 				"opaque-private-key-value",
 				"opaque-private-token-value",
 				"opaque-aws-secret-key-value",
+				"opaque-openai-api-key-value",
+				"opaque-api-token-value",
 				"opaque-cookie-value",
 			]) {
 				expect(embedded).not.toContain(secret);
@@ -172,6 +176,8 @@ describe("session HTML export embed", () => {
 				private_key: "«redacted»",
 				private_token: "«redacted»",
 				aws_secret_access_key: "«redacted»",
+				OPENAI_API_KEY: "«redacted»",
+				api_token: "«redacted»",
 				cookie: "«redacted»",
 			});
 			expect(args?.tokensBefore).toBe(12);

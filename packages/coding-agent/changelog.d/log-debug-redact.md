@@ -1,3 +1,3 @@
 ### Fixed
 
-- Session title debug logs and marketplace clone debug logs scrub recognizable credentials and full quoted values under generic and compound sensitive labels, including `private_token` and `AWS_SECRET_ACCESS_KEY`, before they are written.
+- Session title debug logs and marketplace clone debug logs scrub recognizable credentials and full quoted values under generic and compound sensitive labels, including `private_token`, `OPENAI_API_KEY`, `api_token`, and `AWS_SECRET_ACCESS_KEY`, before they are written.
