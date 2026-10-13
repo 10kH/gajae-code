@@ -5175,6 +5175,9 @@ export class AgentSession {
 	}
 
 	#flushPendingAgentEnd(): void {
+		// SDK terminals are a readiness signal too: publish them only after the
+		// originating prompt finalizer and all earlier event handlers have unwound.
+		if (this.#livePromptsInFlight() > 0 || this.#agentEventHandlersInFlight > 0) return;
 		// Collect SDK agent_ends to publish before modifying the set to avoid iterator issues (PR #6388).
 		// Publish only SDK agent_ends that have been decided by their handler.
 		const sdkPendingsToPublish: Array<[AgentSessionEvent, RunResourceProducerLease | undefined]> = [];
@@ -5196,12 +5199,7 @@ export class AgentSession {
 		const pending = this.#pendingAgentEndEmit;
 		// Skip fallback publish if there are still SDK agent_ends pending (they will be handled by the loop above once decided).
 		if (pending && this.#pendingSdkAgentEnds.has(pending)) return;
-		if (
-			this.#livePromptsInFlight() > 0 ||
-			this.#agentEventHandlersInFlight > 0 ||
-			this.#pendingAgentEndContinuationHolds.size > 0
-		)
-			return;
+		if (this.#pendingAgentEndContinuationHolds.size > 0) return;
 		if (!pending) {
 			this.#resolveSessionSettlement();
 			return;
@@ -11070,6 +11068,10 @@ export class AgentSession {
 
 	flushParkedAgentEndForCoordinatorPersistForTests(): void {
 		this.#flushPendingAgentEnd();
+	}
+
+	async waitForAgentEndHandlingForTests(): Promise<void> {
+		await this.#agentEndHandlingPromise;
 	}
 
 	async drainAsyncJobDeliveriesForAcp(options?: { timeoutMs?: number }): Promise<boolean> {

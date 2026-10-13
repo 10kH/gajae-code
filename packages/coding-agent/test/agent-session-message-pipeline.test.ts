@@ -1,7 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Agent, type AgentMessage, isNonDispatchedToolEvent, markNonDispatchedToolEvent } from "@gajae-code/agent-core";
+import {
+	Agent,
+	type AgentMessage,
+	type AgentPromptOptions,
+	isNonDispatchedToolEvent,
+	markNonDispatchedToolEvent,
+} from "@gajae-code/agent-core";
 import type { Message, Model, SimpleStreamOptions } from "@gajae-code/ai";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
@@ -27,6 +33,10 @@ const testModelRegistry = {
 	getAuthStorageOwner: () => undefined,
 	withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 };
+
+function createIsolatedSessionManager(): SessionManager {
+	return SessionManager.inMemory(path.join(os.tmpdir(), `gjc-agent-session-pipeline-${Bun.randomUUIDv7()}`));
+}
 
 function createAgent(): Agent {
 	return new Agent({
@@ -888,7 +898,7 @@ describe("AgentSession message pipeline", () => {
 		});
 		const session = new AgentSession({
 			agent,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: createIsolatedSessionManager(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry: testModelRegistry as never,
 		});
@@ -977,7 +987,7 @@ describe("AgentSession message pipeline", () => {
 		});
 		const session = new AgentSession({
 			agent,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: createIsolatedSessionManager(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry: testModelRegistry as never,
 		});
@@ -1060,7 +1070,7 @@ describe("AgentSession message pipeline", () => {
 		});
 		const session = new AgentSession({
 			agent,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: createIsolatedSessionManager(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry: testModelRegistry as never,
 			workerIntegrationRequest: signal => {
@@ -1181,7 +1191,7 @@ describe("AgentSession message pipeline", () => {
 		});
 		const session = new AgentSession({
 			agent,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: createIsolatedSessionManager(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry: testModelRegistry as never,
 			workerIntegrationRequest: async () => {
@@ -1241,7 +1251,7 @@ describe("AgentSession message pipeline", () => {
 		});
 		const session = new AgentSession({
 			agent,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: createIsolatedSessionManager(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry: testModelRegistry as never,
 			extensionRunner: {
@@ -1316,9 +1326,19 @@ describe("AgentSession message pipeline", () => {
 		sessions.push(session);
 		const decisionStarted = Promise.withResolvers<void>();
 		const releaseDecision = Promise.withResolvers<void>();
+		const agentPromptReturned = Promise.withResolvers<void>();
+		const releaseAgentPrompt = Promise.withResolvers<void>();
 		vi.spyOn(session.goalRuntime, "onAgentEnd").mockImplementation(async () => {
 			decisionStarted.resolve();
 			await releaseDecision.promise;
+		});
+		const originalAgentPrompt = agent.prompt.bind(agent);
+		vi.spyOn(agent, "prompt").mockImplementation(async (...args) => {
+			const [messages, options] = args;
+			if (!Array.isArray(messages)) throw new Error("Expected AgentSession to submit an SDK message batch.");
+			await originalAgentPrompt(messages, options as AgentPromptOptions | undefined);
+			agentPromptReturned.resolve();
+			await releaseAgentPrompt.promise;
 		});
 
 		const events: AgentSessionEvent[] = [];
@@ -1335,8 +1355,14 @@ describe("AgentSession message pipeline", () => {
 			await decisionStarted.promise;
 			session.flushParkedAgentEndForCoordinatorPersistForTests();
 			expect(sdkAgentEnds).toHaveLength(0);
+			releaseDecision.resolve();
+			await agentPromptReturned.promise;
+			await session.waitForAgentEndHandlingForTests();
+			session.flushParkedAgentEndForCoordinatorPersistForTests();
+			expect(sdkAgentEnds).toHaveLength(0);
 		} finally {
 			releaseDecision.resolve();
+			releaseAgentPrompt.resolve();
 		}
 
 		await prompt;
