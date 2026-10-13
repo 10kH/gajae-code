@@ -68,4 +68,24 @@ describe("AuthStorage api-key usage-limit fallback", () => {
 		expect(authStorage.isCredentialAvailable("zai", failedRowId)).toBe(false);
 		expect(authStorage.isCredentialAvailable("zai", peerRowId)).toBe(true);
 	});
+
+	it("matches a resolved key to its stored row after the shared session pointer advances", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+
+		const sessionId = "zai-api-key-row-match-session";
+		const apiKey = await authStorage.getApiKey("zai", sessionId);
+		if (apiKey === undefined) throw new Error("test setup did not resolve a stored API key");
+		const selectedRowId = authStorage.getSessionCredentialRowId("zai", sessionId);
+		if (selectedRowId === undefined) throw new Error("test setup did not record the selected stored row");
+		const siblingRowId = store.listAuthCredentials("zai").find(row => row.id !== selectedRowId)?.id;
+		if (siblingRowId === undefined) throw new Error("test setup did not provide a sibling stored row");
+
+		await authStorage.getApiKey("zai", sessionId, {
+			credentialSelector: { kind: "id", value: String(siblingRowId) },
+		});
+
+		expect(authStorage.getSessionCredentialRowId("zai", sessionId)).toBe(siblingRowId);
+		expect(await authStorage.getCredentialRowIdMatchingApiKey("zai", apiKey)).toBe(selectedRowId);
+		expect(await authStorage.getCredentialRowIdMatchingApiKey("zai", "not-a-stored-key")).toBeUndefined();
+	});
 });

@@ -23270,18 +23270,20 @@ export class AgentSession {
 	 * turn path does through `#markFailedCredential`. Without this, compaction retried
 	 * the exhausted row until its retries ran out, and because compaction gates the next
 	 * request, the session never reached the turn path's rotation while other rows still
-	 * had quota. Returns the rotated row's key and ID, or undefined to fall back to the normal
+	 * had quota. Returns the rotated row's key, or undefined to fall back to the normal
 	 * retry policy: when the candidate is not on the session model's provider (the mark
 	 * acts on that provider's session credential), the provider is pinned, or the
 	 * rotation lands on a row this candidate's rotation phase already failed on.
 	 */
 	async #rotateCompactionCredentialAfterUsageLimit(
 		candidate: Model,
+		apiKey: string,
 		retryAfterMs: number | undefined,
 		failedRowIds: Set<number>,
-		failedRowId: number | undefined,
-	): Promise<{ apiKey: string; rowId: number } | undefined> {
+	): Promise<string | undefined> {
 		if (candidate.provider !== this.model?.provider) return undefined;
+		const authStorage = this.#modelRegistry.authStorage;
+		const failedRowId = await authStorage.getCredentialRowIdMatchingApiKey(candidate.provider, apiKey);
 		if (failedRowId === undefined) return undefined;
 		failedRowIds.add(failedRowId);
 		const mark = await this.#markFailedCredential({
@@ -23291,31 +23293,23 @@ export class AgentSession {
 			credentialRowId: failedRowId,
 		});
 		if (mark !== "rotated") return undefined;
-		const authStorage = this.#modelRegistry.authStorage;
 		const nextRowId = authStorage.getSessionCredentialRowId(candidate.provider, this.credentialSessionId);
 		if (nextRowId === undefined || failedRowIds.has(nextRowId)) return undefined;
 		// Resolve the rotated row by id: a bare lookup re-ranks the pool and can land back
 		// on a row whose backoff has already run out.
-		const apiKey = await this.#modelRegistry.getApiKey(candidate, this.credentialSessionId, {
+		const rotatedApiKey = await this.#modelRegistry.getApiKey(candidate, this.credentialSessionId, {
 			credentialSelector: { kind: "id", value: String(nextRowId) },
 		});
-		return isAuthenticated(apiKey) ? { apiKey, rowId: nextRowId } : undefined;
+		return isAuthenticated(rotatedApiKey) ? rotatedApiKey : undefined;
 	}
 
 	async #resolveCompactionCandidate(
 		candidate: Model,
 		previousCandidate: Model | undefined,
 		previousFailure: unknown,
-	): Promise<
-		| { apiKey: string; credentialRowId: number | undefined; authError?: undefined }
-		| { apiKey: undefined; authError: Error }
-	> {
+	): Promise<{ apiKey: string; authError?: undefined } | { apiKey: undefined; authError: Error }> {
 		const apiKey = await this.#modelRegistry.getApiKey(candidate, this.credentialSessionId);
 		if (!apiKey) return { apiKey: undefined, authError: this.#buildCompactionAuthError(candidate) };
-		const credentialRowId = this.#modelRegistry.authStorage.getSessionCredentialRowId(
-			candidate.provider,
-			this.credentialSessionId,
-		);
 		if (previousCandidate) {
 			await this.#emitCompactionModelSubstitution(
 				previousCandidate,
@@ -23323,7 +23317,7 @@ export class AgentSession {
 				this.#compactionFailureReason(previousFailure),
 			);
 		}
-		return { apiKey, credentialRowId, authError: undefined };
+		return { apiKey, authError: undefined };
 	}
 	#isCompactionAuthFailure(error: unknown): boolean {
 		if (!(error instanceof Error)) return false;
@@ -23929,7 +23923,6 @@ export class AgentSession {
 						continue;
 					}
 					let apiKey = resolved.apiKey;
-					let credentialRowId = resolved.credentialRowId;
 					const usageLimitedRowIds = new Set<number>();
 
 					let attempt = 0;
@@ -23973,13 +23966,12 @@ export class AgentSession {
 							if (isUsageLimitError(message)) {
 								const rotatedApiKey = await this.#rotateCompactionCredentialAfterUsageLimit(
 									candidate,
+									apiKey,
 									retryAfterMs,
 									usageLimitedRowIds,
-									credentialRowId,
 								);
 								if (rotatedApiKey !== undefined) {
-									apiKey = rotatedApiKey.apiKey;
-									credentialRowId = rotatedApiKey.rowId;
+									apiKey = rotatedApiKey;
 									logger.warn("Auto-compaction hit a usage limit, retrying on another credential", {
 										error: message,
 										model: `${candidate.provider}/${candidate.id}`,

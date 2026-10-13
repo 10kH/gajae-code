@@ -5436,6 +5436,19 @@ export class AuthStorage {
 	}
 
 	/**
+	 * Opaque stored row ID for the credential whose resolved key matches `apiKey`.
+	 * Unlike the session's sticky row pointer, this remains tied to the actual key
+	 * when concurrent requests share a credential session ID.
+	 */
+	async getCredentialRowIdMatchingApiKey(provider: string, apiKey: string): Promise<number | undefined> {
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		for (const entry of this.#getStoredCredentials(storageProvider)) {
+			if (await this.#credentialMatchesApiKey(storageProvider, entry.credential, apiKey)) return entry.id;
+		}
+		return undefined;
+	}
+
+	/**
 	 * Mark the stored credential whose key matches `apiKey` usage-limited for
 	 * `retryAfterMs` (or the default backoff). Used when the caller knows
 	 * exactly which leased credential failed (e.g. the auth-gateway leases a
