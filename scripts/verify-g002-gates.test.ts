@@ -293,6 +293,20 @@ describe("MCP command quarantine", () => {
 		);
 	});
 
+	test("rejects transformed active-registry exports", async () => {
+		const root = path.join(import.meta.dir, "..");
+		const registry = await Bun.file(path.join(root, "packages/coding-agent/src/slash-commands/builtin-registry.ts")).text();
+		const exportDeclaration =
+			"export const BUILTIN_SLASH_COMMANDS_INTERNAL: ReadonlyArray<SlashCommandSpec> = ACTIVE_BUILTIN_SLASH_COMMAND_REGISTRY;";
+		const transformedExport =
+			'export const BUILTIN_SLASH_COMMANDS_INTERNAL: ReadonlyArray<SlashCommandSpec> = ACTIVE_BUILTIN_SLASH_COMMAND_REGISTRY.map(command => command.name === "mcp" ? { ...command, handle: async () => false } : command);';
+		const mutated = registry.replace(exportDeclaration, transformedExport);
+		expect(mutated).not.toBe(registry);
+		expect(findMcpBuiltinQuarantineFindings(mutated)).toContain(
+			"root slash-command registry has an unverified additional use or mutation",
+		);
+	});
+
 	test("rejects duplicate root /mcp registrations", () => {
 		expect(findMcpBuiltinQuarantineFindings(registryWithEntries([exactMcpTuiEntry, exactMcpTuiEntry]))).toContain(
 			"multiple root /mcp builtins are registered",
@@ -308,6 +322,22 @@ describe("MCP command quarantine", () => {
 		const slashCommands = await Bun.file(path.join(root, "packages/coding-agent/src/extensibility/slash-commands.ts")).text();
 		const interactiveMode = await Bun.file(path.join(root, "packages/coding-agent/src/modes/interactive-mode.ts")).text();
 		expect(findMcpTuiMetadataFindings(slashCommands, interactiveMode)).toEqual([]);
+
+		const staleComment = [
+			"/*",
+			"export function getBuiltinSlashCommandsForSession(hasExactMcpControls: boolean): typeof BUILTIN_SLASH_COMMANDS {",
+			"if (hasExactMcpControls) return BUILTIN_SLASH_COMMANDS;",
+			'return BUILTIN_SLASH_COMMANDS.filter(command => command.name !== "mcp");',
+			"}",
+			"*/",
+		].join("\n");
+		const unfilteredSlashCommands = slashCommands.replace(
+			'BUILTIN_SLASH_COMMANDS.filter(command => command.name !== "mcp")',
+			"BUILTIN_SLASH_COMMANDS",
+		);
+		expect(findMcpTuiMetadataFindings(`${staleComment}\n${unfilteredSlashCommands}`, interactiveMode)).toContain(
+			"ordinary TUI /mcp metadata is not filtered by the exact MCP capability",
+		);
 	});
 
 	test("rejects TUI metadata filters that do not hide /mcp without the exact capability", () => {

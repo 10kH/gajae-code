@@ -892,27 +892,198 @@ export function findMcpBuiltinQuarantineFindings(builtinRegistry: string): strin
 }
 
 export function findMcpTuiMetadataFindings(slashCommandsSource: string, interactiveModeSource: string): string[] {
-	const metadataFilter =
-		/export function getBuiltinSlashCommandsForSession\s*\(\s*hasExactMcpControls:\s*boolean\s*\)\s*:\s*typeof BUILTIN_SLASH_COMMANDS\s*\{\s*if\s*\(\s*hasExactMcpControls\s*\)\s*return\s+BUILTIN_SLASH_COMMANDS\s*;\s*return\s+BUILTIN_SLASH_COMMANDS\.filter\(\s*command\s*=>\s*command\.name\s*!==\s*["']mcp["']\s*\)\s*;\s*\}/u.test(
-			slashCommandsSource,
+	try {
+		const slashCommands = parse(slashCommandsSource, { sourceType: "module", plugins: ["typescript"] });
+		const interactiveMode = parse(interactiveModeSource, { sourceType: "module", plugins: ["typescript"] });
+		const filterIsSafe = slashCommands.program.body.some(statement => {
+			if (statement.type !== "ExportNamedDeclaration" || statement.declaration?.type !== "FunctionDeclaration") {
+				return false;
+			}
+			const declaration = statement.declaration;
+			const [capabilityBranch, filteredReturn] = declaration.body.body;
+			if (
+				declaration.id?.name !== "getBuiltinSlashCommandsForSession" ||
+				declaration.params.length !== 1 ||
+				declaration.params[0]?.type !== "Identifier" ||
+				declaration.params[0].name !== "hasExactMcpControls" ||
+				declaration.body.body.length !== 2 ||
+				capabilityBranch?.type !== "IfStatement" ||
+				capabilityBranch.test.type !== "Identifier" ||
+				capabilityBranch.test.name !== "hasExactMcpControls" ||
+				capabilityBranch.alternate !== null ||
+				capabilityBranch.consequent.type !== "ReturnStatement" ||
+				capabilityBranch.consequent.argument?.type !== "Identifier" ||
+				capabilityBranch.consequent.argument.name !== "BUILTIN_SLASH_COMMANDS" ||
+				filteredReturn?.type !== "ReturnStatement" ||
+				filteredReturn.argument?.type !== "CallExpression" ||
+				filteredReturn.argument.optional ||
+				filteredReturn.argument.callee.type !== "MemberExpression" ||
+				filteredReturn.argument.callee.computed ||
+				filteredReturn.argument.callee.object.type !== "Identifier" ||
+				filteredReturn.argument.callee.object.name !== "BUILTIN_SLASH_COMMANDS" ||
+				filteredReturn.argument.callee.property.type !== "Identifier" ||
+				filteredReturn.argument.callee.property.name !== "filter"
+			) {
+				return false;
+			}
+			const predicate = filteredReturn.argument.arguments[0];
+			return (
+				filteredReturn.argument.arguments.length === 1 &&
+				predicate?.type === "ArrowFunctionExpression" &&
+				!predicate.async &&
+				!predicate.generator &&
+				predicate.params.length === 1 &&
+				predicate.params[0]?.type === "Identifier" &&
+				predicate.params[0].name === "command" &&
+				predicate.body.type === "BinaryExpression" &&
+				predicate.body.operator === "!==" &&
+				predicate.body.left.type === "MemberExpression" &&
+				predicate.body.left.object.type === "Identifier" &&
+				predicate.body.left.object.name === "command" &&
+				predicate.body.left.property.type === "Identifier" &&
+				predicate.body.left.property.name === "name" &&
+				predicate.body.right.type === "StringLiteral" &&
+				predicate.body.right.value === "mcp"
 		);
-	const sessionVisibilityInitialized =
-		/this\.#sessionBuiltinMcpVisible\s*=\s*this\.session\.hasExactMcpControls\s*;\s*const\s+sessionBuiltinSlashCommands\s*=\s*getBuiltinSlashCommandsForSession\(\s*this\.#sessionBuiltinMcpVisible\s*\)\s*;[\s\S]*?this\.#baseSlashCommands\s*=\s*\[\s*\.\.\.sessionBuiltinSlashCommands\s*,/u.test(
-			interactiveModeSource,
+		});
+		const interactiveClass = interactiveMode.program.body
+			.map(statement => (statement.type === "ExportNamedDeclaration" ? statement.declaration : statement))
+			.find(
+				(declaration): declaration is Babel.ClassDeclaration =>
+					declaration?.type === "ClassDeclaration" && declaration.id?.name === "InteractiveMode",
+			);
+		if (!interactiveClass) throw new Error("InteractiveMode class is missing");
+		const method = (name: string): Babel.ClassMethod | Babel.ClassPrivateMethod | undefined =>
+			interactiveClass.body.body.find((member): member is Babel.ClassMethod | Babel.ClassPrivateMethod => {
+				if (member.type !== "ClassMethod" && member.type !== "ClassPrivateMethod") return false;
+				return name.startsWith("#")
+					? member.key.type === "PrivateName" && member.key.id.name === name.slice(1)
+					: member.key.type === "Identifier" && member.key.name === name;
+			});
+		const thisPrivate = (node: Babel.Node, property: string): boolean =>
+			node.type === "MemberExpression" &&
+			!node.computed &&
+			node.object.type === "ThisExpression" &&
+			node.property.type === "PrivateName" &&
+			node.property.id.name === property;
+		const constructor = method("constructor");
+		const refreshHelper = method("#refreshSessionBuiltinSlashCommandVisibility");
+		const refreshCommands = method("refreshSlashCommandState");
+		const constructorBody = constructor?.body.body ?? [];
+		const initialization = constructorBody.some(
+			statement =>
+				statement.type === "ExpressionStatement" &&
+				statement.expression.type === "AssignmentExpression" &&
+				thisPrivate(statement.expression.left, "sessionBuiltinMcpVisible") &&
+				statement.expression.right.type === "MemberExpression" &&
+				statement.expression.right.object.type === "MemberExpression" &&
+				statement.expression.right.object.object.type === "ThisExpression" &&
+				statement.expression.right.object.property.type === "Identifier" &&
+				statement.expression.right.object.property.name === "session" &&
+				statement.expression.right.property.type === "Identifier" &&
+				statement.expression.right.property.name === "hasExactMcpControls",
 		);
-	const sessionVisibilityRefreshHelper =
-		/#refreshSessionBuiltinSlashCommandVisibility\s*\(\s*cwd:\s*string\s*\)\s*:\s*void\s*\{[\s\S]*?const\s+hasExactMcpControls\s*=\s*this\.session\.hasExactMcpControls\s*;[\s\S]*?getBuiltinSlashCommandsForSession\(\s*hasExactMcpControls\s*\)[\s\S]*?this\.#sessionBuiltinMcpVisible\s*=\s*hasExactMcpControls\s*;[\s\S]*?setAutocompleteProvider\s*\(/u.test(
-			interactiveModeSource,
+		const initSlashCommands = constructorBody.some(
+			statement =>
+				statement.type === "VariableDeclaration" &&
+				statement.declarations.some(
+					declaration =>
+						declaration.id.type === "Identifier" &&
+						declaration.id.name === "sessionBuiltinSlashCommands" &&
+						declaration.init?.type === "CallExpression" &&
+						declaration.init.callee.type === "Identifier" &&
+						declaration.init.callee.name === "getBuiltinSlashCommandsForSession" &&
+						declaration.init.arguments[0]?.type === "MemberExpression" &&
+						thisPrivate(declaration.init.arguments[0], "sessionBuiltinMcpVisible"),
+				),
 		);
-	const sessionVisibilityRefreshCalled =
-		/async\s+refreshSlashCommandState\s*\(\s*cwd\?:\s*string\s*\)\s*:\s*Promise<void>\s*\{[\s\S]*?this\.#refreshSessionBuiltinSlashCommandVisibility\(basePath\);[\s\S]*?await\s+loadSlashCommands\(\{\s*cwd:\s*basePath\s*\}\);[\s\S]*?this\.#refreshSessionBuiltinSlashCommandVisibility\(basePath\);/u.test(
-			interactiveModeSource,
+		const refreshBody = refreshHelper?.body.body ?? [];
+		const refreshCapabilityFlag = refreshBody.some(
+			statement =>
+				statement.type === "ExpressionStatement" &&
+				statement.expression.type === "AssignmentExpression" &&
+				statement.expression.operator === "=" &&
+				thisPrivate(statement.expression.left, "sessionBuiltinMcpVisible") &&
+				statement.expression.right.type === "Identifier" &&
+				statement.expression.right.name === "hasExactMcpControls",
 		);
-	const sessionCapabilityUsed =
-		sessionVisibilityInitialized && sessionVisibilityRefreshHelper && sessionVisibilityRefreshCalled;
-	return metadataFilter && sessionCapabilityUsed
-		? []
-		: ["ordinary TUI /mcp metadata is not filtered by the exact MCP capability"];
+		const rebuildSlashCommands = refreshBody.some(
+			statement =>
+				statement.type === "ExpressionStatement" &&
+				statement.expression.type === "AssignmentExpression" &&
+				statement.expression.operator === "=" &&
+				thisPrivate(statement.expression.left, "baseSlashCommands") &&
+				statement.expression.right.type === "ArrayExpression" &&
+				statement.expression.right.elements[0]?.type === "SpreadElement" &&
+				statement.expression.right.elements[0].argument.type === "CallExpression" &&
+				statement.expression.right.elements[0].argument.callee.type === "Identifier" &&
+				statement.expression.right.elements[0].argument.callee.name === "getBuiltinSlashCommandsForSession" &&
+				statement.expression.right.elements[0].argument.arguments.length === 1 &&
+				statement.expression.right.elements[0].argument.arguments[0]?.type === "Identifier" &&
+				statement.expression.right.elements[0].argument.arguments[0].name === "hasExactMcpControls",
+		);
+		const rebuildResolvedSlashCommands = refreshBody.some(
+			statement =>
+				statement.type === "ExpressionStatement" &&
+				statement.expression.type === "AssignmentExpression" &&
+				statement.expression.operator === "=" &&
+				thisPrivate(statement.expression.left, "resolvedSlashCommands") &&
+				statement.expression.right.type === "ArrayExpression" &&
+				statement.expression.right.elements[0]?.type === "SpreadElement" &&
+				thisPrivate(statement.expression.right.elements[0].argument, "baseSlashCommands"),
+		);
+		const updateAutocomplete = refreshBody.some(
+			statement =>
+				statement.type === "ExpressionStatement" &&
+				statement.expression.type === "CallExpression" &&
+				statement.expression.callee.type === "MemberExpression" &&
+				statement.expression.callee.property.type === "Identifier" &&
+				statement.expression.callee.property.name === "setAutocompleteProvider" &&
+				statement.expression.arguments.length === 1 &&
+				statement.expression.arguments[0]?.type === "CallExpression" &&
+				statement.expression.arguments[0].callee.type === "MemberExpression" &&
+				statement.expression.arguments[0].callee.property.type === "Identifier" &&
+				statement.expression.arguments[0].callee.property.name === "createAutocompleteProvider" &&
+				statement.expression.arguments[0].arguments[0]?.type === "MemberExpression" &&
+				thisPrivate(statement.expression.arguments[0].arguments[0], "resolvedSlashCommands"),
+		);
+		const refreshBodyStatements = refreshCommands?.body.body ?? [];
+		const loadIndex = refreshBodyStatements.findIndex(
+			statement =>
+				statement.type === "VariableDeclaration" &&
+				statement.declarations.some(
+					declaration =>
+						declaration.id.type === "Identifier" &&
+						declaration.id.name === "fileCommands" &&
+						declaration.init?.type === "AwaitExpression" &&
+						declaration.init.argument.type === "CallExpression" &&
+						declaration.init.argument.callee.type === "Identifier" &&
+						declaration.init.argument.callee.name === "loadSlashCommands",
+				),
+		);
+		const refreshIndices = refreshBodyStatements.flatMap((statement, index) =>
+			statement.type === "ExpressionStatement" &&
+			statement.expression.type === "CallExpression" &&
+			thisPrivate(statement.expression.callee, "refreshSessionBuiltinSlashCommandVisibility")
+				? [index]
+				: [],
+		);
+		return filterIsSafe &&
+			initialization &&
+			initSlashCommands &&
+			refreshCapabilityFlag &&
+			rebuildSlashCommands &&
+			rebuildResolvedSlashCommands &&
+			updateAutocomplete &&
+			loadIndex >= 0 &&
+			refreshIndices.length >= 2 &&
+			refreshIndices[0]! < loadIndex &&
+			refreshIndices.at(-1)! > loadIndex
+			? []
+			: ["ordinary TUI /mcp metadata is not filtered by the exact MCP capability"];
+	} catch {
+		return ["ordinary TUI /mcp metadata is not filtered by the exact MCP capability"];
+	}
 }
 
 async function verifyMcpQuarantine(): Promise<GateResult> {
