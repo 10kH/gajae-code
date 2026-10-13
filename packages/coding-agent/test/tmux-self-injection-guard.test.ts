@@ -68,6 +68,12 @@ describe("tmux self-injection guard", () => {
 		});
 	});
 
+	it("allows a different socket selected by an inline TMUX_TMPDIR assignment", async () => {
+		await expect(
+			checkTmuxSelfInjection("TMUX_TMPDIR=/tmp/other-tmux-dir tmux -L default send-keys -t %47 x", options),
+		).resolves.toEqual({ block: false });
+	});
+
 	it("blocks the current server selected with -L", async () => {
 		await expect(checkTmuxSelfInjection("tmux -L default send-keys -t %47 x", options)).resolves.toMatchObject({
 			block: true,
@@ -163,6 +169,23 @@ describe("tmux self-injection guard", () => {
 			});
 		});
 
+		it("should block env when an argv0 option precedes the command", async () => {
+			for (const command of [
+				"env -a disguise tmux send-keys -t %47 x",
+				"env --argv0 disguise tmux send-keys -t %47 x",
+			]) {
+				await expect(checkTmuxSelfInjection(command, options)).resolves.toMatchObject({ block: true });
+			}
+		});
+
+		it("blocks a relative explicit socket after env changes the command directory", async () => {
+			const socketDir = env.TMUX.split(",")[0];
+			const tempDir = socketDir.substring(0, socketDir.lastIndexOf("/"));
+			await expect(
+				checkTmuxSelfInjection(`env -C ${tempDir} tmux -S default send-keys -t %47 x`, options),
+			).resolves.toMatchObject({ block: true });
+		});
+
 		it("should block sudo wrapper with option taking argument", async () => {
 			await expect(checkTmuxSelfInjection("sudo -u root tmux send-keys -t %47 x", options)).resolves.toMatchObject({
 				block: true,
@@ -206,6 +229,8 @@ describe("tmux self-injection guard", () => {
 			for (const command of [
 				"nice --help tmux send-keys -t %47 x",
 				"nice --version tmux send-keys -t %47 x",
+				"timeout --help tmux send-keys -t %47 x",
+				"timeout --version tmux send-keys -t %47 x",
 				"time --help tmux send-keys -t %47 x",
 				"time --version tmux send-keys -t %47 x",
 			]) {
@@ -279,8 +304,14 @@ describe("tmux self-injection guard", () => {
 			});
 		});
 
-		it("should allow bundled command lookup flags", async () => {
+		it("allows bundled command lookup flags", async () => {
 			await expect(checkTmuxSelfInjection("command -pv tmux send-keys", options)).resolves.toEqual({
+				block: false,
+			});
+		});
+
+		it("allows multiple lookup operands even when an earlier operand is a wrapper", async () => {
+			await expect(checkTmuxSelfInjection("command -v env tmux send-keys -t %47 x", options)).resolves.toEqual({
 				block: false,
 			});
 		});
@@ -788,6 +819,15 @@ describe("tmux self-injection guard", () => {
 			});
 		});
 
+		it("blocks env -S when argv0 options precede tmux", async () => {
+			for (const command of [
+				"env -S '-a disguise tmux send-keys -t %47 x'",
+				"env -S '--argv0 disguise tmux send-keys -t %47 x'",
+			]) {
+				await expect(checkTmuxSelfInjection(command, options)).resolves.toMatchObject({ block: true });
+			}
+		});
+
 		it("blocks env --split-string with tmux in split string", async () => {
 			// Long form of -S
 			await expect(
@@ -996,12 +1036,42 @@ describe("tmux self-injection guard", () => {
 			}
 		});
 
+		it("inspects here-documents duplicated onto script and source descriptors", async () => {
+			const script = "tmux send-keys -t %47 x";
+			for (const command of [
+				`bash /dev/fd/4 3<<'EOF' 4<&3\n${script}\nEOF`,
+				`source /dev/fd/3 3<<'EOF'\n${script}\nEOF`,
+				`source /dev/fd/4 3<<'EOF' 4<&3\n${script}\nEOF`,
+				`bash -c 'source /dev/fd/3' 3<<'EOF'\n${script}\nEOF`,
+				`bash -c 'source /dev/fd/4' 3<<'EOF' 4<&3\n${script}\nEOF`,
+			]) {
+				await expect(checkTmuxSelfInjection(command, options)).resolves.toMatchObject({ block: true });
+			}
+		});
+
+		it("inspects shell here-strings but not data-only here-strings", async () => {
+			await expect(checkTmuxSelfInjection("bash <<< 'tmux send-keys -t %47 x'", options)).resolves.toMatchObject({
+				block: true,
+			});
+			await expect(checkTmuxSelfInjection("cat <<< 'tmux send-keys -t %47 x'", options)).resolves.toEqual({
+				block: false,
+			});
+			await expect(checkTmuxSelfInjection("cat <<< '$(tmux send-keys -t %47 x)'", options)).resolves.toMatchObject({
+				block: false,
+			});
+			for (const command of ["cat <<< $(tmux send-keys -t %47 x)", 'cat <<< "$(tmux send-keys -t %47 x)"']) {
+				await expect(checkTmuxSelfInjection(command, options)).resolves.toMatchObject({ block: true });
+			}
+		});
+
 		it("leaves non-stdin here-documents alone when they are data or superseded", async () => {
 			const document = "tmux send-keys -t %47 x";
 			for (const command of [
 				`bash -c 'cat <&3' 3<<'EOF'\n${document}\nEOF`,
 				`bash /dev/fd/4 3<<'EOF'\n${document}\nEOF`,
 				`bash /dev/fd/3 3<<'EOF' 3</dev/null\n${document}\nEOF`,
+				`bash -c 'cat <&4' 3<<'EOF' 4<&3\n${document}\nEOF`,
+				`bash /dev/fd/4 3<<'EOF' 4<&3 4</dev/null\n${document}\nEOF`,
 			]) {
 				await expect(checkTmuxSelfInjection(command, options)).resolves.toEqual({ block: false });
 			}

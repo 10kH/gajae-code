@@ -30,6 +30,7 @@ const NON_EXECUTING_ENV_OPTIONS = new Set(["--help", "--version"]);
 const ENV_SIGNAL_OPTIONS = new Set(["--block-signal", "--default-signal", "--ignore-signal", "--list-signal-handling"]);
 const NON_EXECUTING_NICE_OPTIONS = new Set(["--help", "--version"]);
 const NON_EXECUTING_TIME_OPTIONS = new Set(["--help", "--version"]);
+const NON_EXECUTING_TIMEOUT_OPTIONS = new Set(["--help", "--version"]);
 const ASSIGNMENT_AWARE_WRAPPERS = new Set(["env", "sudo"]);
 const CONTROL_WORDS = new Set(["then", "do", "else", "fi", "done", "esac"]);
 const MAX_INDIRECTION_DEPTH = 4;
@@ -64,6 +65,7 @@ const WRAPPER_LONG_OPTIONS: Record<string, Record<string, boolean>> = {
 		"--unset": true, // env --unset=VAR or --unset VAR
 		"--chdir": true, // env --chdir=DIR (takes directory)
 		"--split-string": true, // env -S/--split-string (takes command string)
+		"--argv0": true, // env --argv0=ARG or --argv0 ARG
 		"--block-signal": false,
 		"--default-signal": false,
 		"--ignore-signal": false,
@@ -129,7 +131,7 @@ const WRAPPER_LONG_OPTIONS: Record<string, Record<string, boolean>> = {
 
 const COMMAND_WRAPPERS_WITH_ARGS: Record<string, WrapperSpec> = {
 	env: {
-		optionsWithArg: new Set(["-u", "-C", "-S"]),
+		optionsWithArg: new Set(["-u", "-C", "-S", "-a"]),
 	},
 	sudo: {
 		optionsWithArg: new Set(["-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-U", "-T", "-R", "-c"]),
@@ -187,19 +189,20 @@ interface Token {
 	segment: number;
 	pipeline: number;
 	stdinRedirectOrder?: number;
-	stdinRedirectSource?: "here-document" | "other";
+	stdinRedirectSource?: "here-document" | "here-string" | "other";
 	isRedirectionTarget?: boolean;
 	isWrappedCommand?: boolean; // true if this token is the actual command being wrapped by a wrapper like 'command', 'env', 'sudo'
 }
 
 interface HereDocument {
+	kind: "here-document" | "here-string";
+	expandsCommandSubstitutions: boolean;
 	delimiter: string;
 	delimiterQuoted: boolean;
 	stripTabs: boolean;
 	segment: number;
 	pipeline: number;
-	descriptor: number;
-	descriptorActive: boolean;
+	activeDescriptors: Set<number>;
 	stdin: boolean;
 	redirectOrder: number;
 	body: string;
@@ -275,12 +278,14 @@ function tokenize(command: string): TokenizeResult {
 	let positionalsPending = 0;
 	let redirectionTargetPending = false;
 	let redirectionTargetIsHereDoc = false;
+	let redirectionTargetIsHereString = false;
+	let redirectionTargetExpandsCommandSubstitutions = false;
 	let redirectionTargetStripTabs = false;
 	let redirectionTargetIsInput = false;
 	let redirectionTargetIsDuplication = false;
 	let redirectionTargetFd: number | undefined;
 	let currentTokenIsPendingOperand = false;
-	const stdinRedirects = new Map<number, { order: number; source: "here-document" | "other" }>();
+	const stdinRedirects = new Map<number, { order: number; source: "here-document" | "here-string" | "other" }>();
 	const activeHereDocuments = new Map<string, HereDocument>();
 	const hereDocDelimiters: HereDocument[] = [];
 	let activeHereDoc: HereDocument | undefined;
@@ -298,8 +303,16 @@ function tokenize(command: string): TokenizeResult {
 			const descriptorKey = `${segment}:${descriptor}`;
 			if (!isIdentityDescriptorDuplication) {
 				const previousHereDocument = activeHereDocuments.get(descriptorKey);
-				if (previousHereDocument) previousHereDocument.descriptorActive = false;
+				previousHereDocument?.activeDescriptors.delete(descriptor);
 				activeHereDocuments.delete(descriptorKey);
+				if (redirectionTargetIsInput && redirectionTargetIsDuplication && /^\d+$/.test(text)) {
+					const sourceDescriptor = Number(text);
+					const sourceHereDocument = activeHereDocuments.get(`${segment}:${sourceDescriptor}`);
+					if (sourceHereDocument) {
+						sourceHereDocument.activeDescriptors.add(descriptor);
+						activeHereDocuments.set(descriptorKey, sourceHereDocument);
+					}
+				}
 			}
 
 			let redirectOrder: number | undefined;
@@ -316,30 +329,39 @@ function tokenize(command: string): TokenizeResult {
 				redirectOrder = (stdinRedirects.get(segment)?.order ?? 0) + 1;
 				stdinRedirects.set(segment, {
 					order: redirectOrder,
-					source: redirectionTargetIsHereDoc ? "here-document" : "other",
+					source: redirectionTargetIsHereDoc
+						? "here-document"
+						: redirectionTargetIsHereString
+							? "here-string"
+							: "other",
 				});
 				for (const token of tokens) {
 					if (token.segment === segment && token.commandStart) {
 						token.stdinRedirectOrder = redirectOrder;
-						token.stdinRedirectSource = redirectionTargetIsHereDoc ? "here-document" : "other";
+						token.stdinRedirectSource = redirectionTargetIsHereDoc
+							? "here-document"
+							: redirectionTargetIsHereString
+								? "here-string"
+								: "other";
 					}
 				}
 			}
 			tokens.push({ text, quoted, commandStart: false, segment, pipeline, isRedirectionTarget: true });
-			if (redirectionTargetIsHereDoc) {
+			if (redirectionTargetIsHereDoc || redirectionTargetIsHereString) {
 				const hereDocument: HereDocument = {
+					kind: redirectionTargetIsHereDoc ? "here-document" : "here-string",
+					expandsCommandSubstitutions: redirectionTargetExpandsCommandSubstitutions,
 					delimiter: text,
 					delimiterQuoted: quoted,
 					stripTabs: redirectionTargetStripTabs,
 					segment,
 					pipeline,
-					descriptor,
-					descriptorActive: true,
+					activeDescriptors: new Set([descriptor]),
 					stdin: redirectionTargetFd === undefined || redirectionTargetFd === 0,
 					redirectOrder: redirectOrder ?? 0,
-					body: "",
+					body: redirectionTargetIsHereString ? text : "",
 				};
-				hereDocDelimiters.push(hereDocument);
+				if (redirectionTargetIsHereDoc) hereDocDelimiters.push(hereDocument);
 				hereDocuments.push(hereDocument);
 				activeHereDocuments.set(descriptorKey, hereDocument);
 			}
@@ -347,6 +369,8 @@ function tokenize(command: string): TokenizeResult {
 			quoted = false;
 			redirectionTargetPending = false;
 			redirectionTargetIsHereDoc = false;
+			redirectionTargetIsHereString = false;
+			redirectionTargetExpandsCommandSubstitutions = false;
 			redirectionTargetStripTabs = false;
 			redirectionTargetIsInput = false;
 			redirectionTargetIsDuplication = false;
@@ -436,9 +460,16 @@ function tokenize(command: string): TokenizeResult {
 				const nonExecutingEnvMode = wrapperCommand?.name === "env" && NON_EXECUTING_ENV_OPTIONS.has(text);
 				const nonExecutingNiceMode = wrapperCommand?.name === "nice" && NON_EXECUTING_NICE_OPTIONS.has(text);
 				const nonExecutingTimeMode = wrapperCommand?.name === "time" && NON_EXECUTING_TIME_OPTIONS.has(text);
-				if (nonExecutingSudoMode || nonExecutingEnvMode || nonExecutingNiceMode || nonExecutingTimeMode) {
-					// These sudo modes never execute a command. env's help/version modes
-					// also exit after displaying output.
+				const nonExecutingTimeoutMode =
+					wrapperCommand?.name === "timeout" && NON_EXECUTING_TIMEOUT_OPTIONS.has(text);
+				if (
+					nonExecutingSudoMode ||
+					nonExecutingEnvMode ||
+					nonExecutingNiceMode ||
+					nonExecutingTimeMode ||
+					nonExecutingTimeoutMode
+				) {
+					// These utility modes never execute the supplied command.
 					wrapperCommand = undefined;
 					skipNextArg = false;
 					positionalsPending = 0;
@@ -544,6 +575,9 @@ function tokenize(command: string): TokenizeResult {
 			if (ch !== "\n") continue;
 			inComment = false;
 		}
+		if (redirectionTargetPending && ((ch === "$" && command[index + 1] === "(") || ch === "`") && quote !== "'") {
+			redirectionTargetExpandsCommandSubstitutions = true;
+		}
 		if (quote !== undefined) {
 			if (ch === quote) {
 				quote = undefined;
@@ -590,6 +624,8 @@ function tokenize(command: string): TokenizeResult {
 			positionalsPending = 0;
 			redirectionTargetPending = false;
 			redirectionTargetIsHereDoc = false;
+			redirectionTargetIsHereString = false;
+			redirectionTargetExpandsCommandSubstitutions = false;
 			redirectionTargetStripTabs = false;
 			redirectionTargetIsInput = false;
 			redirectionTargetIsDuplication = false;
@@ -611,6 +647,7 @@ function tokenize(command: string): TokenizeResult {
 			if (command[index + 1] === "|") index++;
 			redirectionTargetPending = true;
 			redirectionTargetIsHereDoc = false;
+			redirectionTargetIsHereString = false;
 			redirectionTargetStripTabs = false;
 			redirectionTargetIsInput = false;
 			redirectionTargetIsDuplication = false;
@@ -627,6 +664,7 @@ function tokenize(command: string): TokenizeResult {
 				redirectionTargetFd = undefined;
 			}
 			const isHereDoc = ch === "<" && command[index + 1] === "<" && command[index + 2] !== "<";
+			const isHereString = ch === "<" && command[index + 1] === "<" && command[index + 2] === "<";
 			while (command[index + 1] === ch) index++;
 			const stripTabs = isHereDoc && command[index + 1] === "-";
 			if (stripTabs) index++;
@@ -634,6 +672,7 @@ function tokenize(command: string): TokenizeResult {
 			if (redirectionTargetIsDuplication || (ch === ">" && command[index + 1] === "|")) index++;
 			redirectionTargetPending = true;
 			redirectionTargetIsHereDoc = isHereDoc;
+			redirectionTargetIsHereString = isHereString;
 			redirectionTargetStripTabs = stripTabs;
 			redirectionTargetIsInput = ch === "<";
 			continue;
@@ -655,6 +694,7 @@ function tokenize(command: string): TokenizeResult {
 			positionalsPending = 0;
 			redirectionTargetPending = false;
 			redirectionTargetIsHereDoc = false;
+			redirectionTargetIsHereString = false;
 			redirectionTargetStripTabs = false;
 			redirectionTargetIsInput = false;
 			redirectionTargetIsDuplication = false;
@@ -793,7 +833,7 @@ function reconstructCommandFromEnvSplit(splitString: string, depth = 0): string[
 	if (argumentStarted) parts.push(current);
 
 	const assignments: string[] = [];
-	const envShortOptionsWithArg = new Set(["-u", "-C"]);
+	const envShortOptionsWithArg = new Set(["-u", "-C", "-a"]);
 	let skipNext = false;
 	let optionsTerminated = false;
 	let commandStartIdx = -1;
@@ -856,13 +896,17 @@ function reconstructCommandFromEnvSplit(splitString: string, depth = 0): string[
 			skipNext = true;
 			continue;
 		}
-		if ((part.startsWith("-u") && part.length > 2) || (part.startsWith("-C") && part.length > 2)) {
+		if (
+			(part.startsWith("-u") && part.length > 2) ||
+			(part.startsWith("-C") && part.length > 2) ||
+			(part.startsWith("-a") && part.length > 2)
+		) {
 			continue;
 		}
 		if (part.startsWith("--")) {
 			const eqIdx = part.indexOf("=");
 			const optName = eqIdx >= 0 ? part.substring(0, eqIdx) : part;
-			if (optName === "--unset" || optName === "--chdir") {
+			if (optName === "--unset" || optName === "--chdir" || optName === "--argv0") {
 				if (eqIdx < 0) skipNext = true;
 				continue;
 			}
@@ -1084,7 +1128,7 @@ function collectShellPayloads(tokens: Token[]): string[] {
 		if (!token.commandStart || (token.text !== "env" && !token.text.endsWith("/env"))) continue;
 
 		// Options for env that consume the next argument
-		const envOptionsWithArg = new Set(["-u", "-C", "-S"]);
+		const envOptionsWithArg = new Set(["-u", "-C", "-S", "-a"]);
 		let skipNextArg = false;
 
 		// Look for -S or --split-string option
@@ -1172,7 +1216,10 @@ function collectShellPayloads(tokens: Token[]): string[] {
 	return payloads;
 }
 
-function shellReadsStdin(arguments_: Token[], stdinRedirectSource?: "here-document" | "other"): boolean {
+function shellReadsStdin(
+	arguments_: Token[],
+	stdinRedirectSource?: "here-document" | "here-string" | "other",
+): boolean {
 	if (stdinRedirectSource === "other") return false;
 	const optionsWithArgument = new Set(["-O", "-o"]);
 	let skipNextArgument = false;
@@ -1310,10 +1357,10 @@ function hasShellStdinConsumer(tokens: Token[], segment: number, depth = 0, here
 			shellReadsStdin(shellArguments(segmentTokens, shellIndex, segment), token.stdinRedirectSource);
 		const sourcesStdin =
 			token.stdinRedirectSource !== "other" && sourceBuiltinReadsStdin(segmentTokens, index, segment);
-		const readsHereDocument =
-			token.stdinRedirectSource !== "here-document" ||
+		const readsRedirectedScript =
+			(token.stdinRedirectSource !== "here-document" && token.stdinRedirectSource !== "here-string") ||
 			(token.stdinRedirectOrder === hereDocumentOrder && hereDocumentOrder !== undefined);
-		if ((readsStdin || sourcesStdin) && readsHereDocument && !xargsConsumesStdin(segmentTokens, index, segment)) {
+		if ((readsStdin || sourcesStdin) && readsRedirectedScript && !xargsConsumesStdin(segmentTokens, index, segment)) {
 			return true;
 		}
 	}
@@ -1324,7 +1371,7 @@ function hasShellStdinConsumer(tokens: Token[], segment: number, depth = 0, here
 		if (
 			xargsConsumesStdin(segmentTokens, index, segment) ||
 			token.stdinRedirectSource === "other" ||
-			(token.stdinRedirectSource === "here-document" &&
+			((token.stdinRedirectSource === "here-document" || token.stdinRedirectSource === "here-string") &&
 				(token.stdinRedirectOrder !== hereDocumentOrder || hereDocumentOrder === undefined))
 		) {
 			return false;
@@ -1491,31 +1538,35 @@ function collectHereDocumentCommandSubstitutions(body: string): string[] {
 	return [...substitutions];
 }
 
-function collectShellStdinPayloads(tokens: Token[], hereDocuments: HereDocument[], scripts: ShellScript[]): string[] {
+function collectShellStdinPayloads(
+	tokens: Token[],
+	hereDocuments: HereDocument[],
+	scripts: ShellScript[],
+	cwd: string,
+): string[] {
 	const payloads = hereDocuments.flatMap(hereDocument =>
-		hereDocument.delimiterQuoted
+		(hereDocument.kind === "here-document" && hereDocument.delimiterQuoted) ||
+		(hereDocument.kind === "here-string" && !hereDocument.expandsCommandSubstitutions)
 			? []
 			: collectHereDocumentCommandSubstitutions(joinUnquotedHereDocumentLines(hereDocument.body)),
 	);
-	const scriptDescriptorsBySegment = new Map<number, Set<number>>();
-	for (const script of scripts) {
-		if (script.fileDescriptor === undefined) continue;
-		const descriptors = scriptDescriptorsBySegment.get(script.segment) ?? new Set<number>();
-		descriptors.add(script.fileDescriptor);
-		scriptDescriptorsBySegment.set(script.segment, descriptors);
-	}
 	for (let index = 0; index < hereDocuments.length; index++) {
 		const hereDocument = hereDocuments[index];
 		if (hereDocument.body.length === 0) continue;
-		if (!hereDocument.stdin) {
-			if (
-				hereDocument.descriptorActive &&
-				scriptDescriptorsBySegment.get(hereDocument.segment)?.has(hereDocument.descriptor)
-			) {
-				payloads.push(hereDocument.body);
-			}
+		const segmentTokens = tokens.filter(token => token.segment === hereDocument.segment);
+		const usedAsScript =
+			scripts.some(
+				script =>
+					script.segment === hereDocument.segment &&
+					script.fileDescriptor !== undefined &&
+					hereDocument.activeDescriptors.has(script.fileDescriptor),
+			) ||
+			shellPayloadUsesScriptDescriptor(collectShellPayloads(segmentTokens), hereDocument.activeDescriptors, cwd);
+		if (usedAsScript) {
+			payloads.push(hereDocument.body);
 			continue;
 		}
+		if (!hereDocument.stdin) continue;
 		const commandRedirectOrder = tokens.find(
 			token => token.segment === hereDocument.segment && token.commandStart,
 		)?.stdinRedirectOrder;
@@ -1552,6 +1603,19 @@ function collectShellScripts(tokens: Token[], cwd: string): ShellScript[] {
 		const token = tokens[index];
 		if (!token.commandStart || isCommandLookup(tokens, index)) continue;
 		const name = commandName(token.text);
+		if (token.text === "." || name === "source") {
+			for (let cursor = index + 1; cursor < tokens.length; cursor++) {
+				const argument = tokens[cursor];
+				if (argument.segment !== token.segment || argument.commandStart) break;
+				if (argument.isRedirectionTarget || argument.text === "--") continue;
+				const fileDescriptor = scriptFileDescriptor(argument.text);
+				if (fileDescriptor !== undefined) {
+					scripts.push({ segment: token.segment, path: argument.text, fileDescriptor });
+				}
+				break;
+			}
+			continue;
+		}
 		if (
 			token.commandStart &&
 			(token.text.startsWith("./") || token.text.startsWith("/")) &&
@@ -1661,6 +1725,31 @@ function collectShellScripts(tokens: Token[], cwd: string): ShellScript[] {
 	return scripts;
 }
 
+function shellPayloadUsesScriptDescriptor(
+	payloads: string[],
+	activeDescriptors: Set<number>,
+	cwd: string,
+	depth = 0,
+): boolean {
+	for (const payload of payloads) {
+		const nestedTokens = tokenize(payload).tokens;
+		if (
+			collectShellScripts(nestedTokens, cwd).some(
+				script => script.fileDescriptor !== undefined && activeDescriptors.has(script.fileDescriptor),
+			)
+		) {
+			return true;
+		}
+		if (
+			depth < MAX_INDIRECTION_DEPTH &&
+			shellPayloadUsesScriptDescriptor(collectShellPayloads(nestedTokens), activeDescriptors, cwd, depth + 1)
+		) {
+			return true;
+		}
+	}
+	return false;
+}
+
 interface Identity {
 	socketPath: string;
 	paneId: string;
@@ -1692,20 +1781,20 @@ function sameSocket(left: string, right: string): boolean {
 	}
 }
 
-function assignedTmuxSocket(tokens: Token[], commandIndex: number): string | undefined {
-	// Backtrack from the command position to find any TMUX assignment.
-	// TMUX assignments are valid if they appear before the command and any wrappers,
-	// within the same simple command (tracked by the token segment).
-	// Important: we must not treat wrapper option operands as assignments.
-	// For example, in 'xargs -I TMUX=/tmp/other ...', the TMUX=/tmp/other is -I's operand, not an assignment.
+function assignedTmuxEnvironmentValue(
+	tokens: Token[],
+	commandIndex: number,
+	name: "TMUX" | "TMUX_TMPDIR",
+): string | undefined {
+	// Backtrack through wrappers in the current simple command. Wrapper option
+	// operands that look like assignments are not environment overrides.
 
 	const commandSegment = tokens[commandIndex].segment;
 	for (let index = commandIndex - 1; index >= 0; index--) {
 		const token = tokens[index];
 		if (token.segment !== commandSegment) break;
 
-		// Check for TMUX assignment, but exclude tokens that are operands to wrapper options.
-		const assignment = token.text.match(/^TMUX=([^,\s]+)/);
+		const assignment = name === "TMUX" ? token.text.match(/^TMUX=([^,\s]+)/) : token.text.match(/^TMUX_TMPDIR=(.*)$/);
 		let isOptionOperand = false;
 		// Note: assignments at commandStart are valid (e.g., 'TMUX=...');
 		// we only need to check for option operands when it's NOT at commandStart
@@ -1767,7 +1856,7 @@ function assignedTmuxSocket(tokens: Token[], commandIndex: number): string | und
 			// 1. At commandStart (e.g., 'TMUX=...' at the beginning of the command)
 			// 2. Not at commandStart but also not option operands (e.g., assignments between wrappers)
 			if (token.commandStart || !isOptionOperand) {
-				// Found a genuine TMUX assignment; it applies to this invocation
+				// Found a genuine environment assignment; it applies to this invocation
 				return assignment[1];
 			}
 		}
@@ -1789,65 +1878,67 @@ function assignedTmuxSocket(tokens: Token[], commandIndex: number): string | und
 	return undefined;
 }
 
+function commandWorkingDirectory(tokens: Token[], commandIndex: number, cwd: string): string {
+	let effectiveCwd = cwd;
+	for (let index = 0; index < commandIndex; index++) {
+		const token = tokens[index];
+		if (token.segment !== tokens[commandIndex].segment) break;
+		if (!token.commandStart || commandName(token.text) !== "env") continue;
+
+		for (let cursor = index + 1; cursor < commandIndex; cursor++) {
+			const argument = tokens[cursor];
+			if (argument.segment !== token.segment || argument.commandStart) break;
+			if (argument.isRedirectionTarget || argument.text === "--") {
+				if (argument.text === "--") break;
+				continue;
+			}
+
+			let chdir: string | undefined;
+			if (argument.text === "-C" || argument.text === "--chdir") {
+				const value = tokens[cursor + 1];
+				if (value && value.segment === token.segment && !value.commandStart) {
+					chdir = value.text;
+					cursor++;
+				}
+			} else if (argument.text.startsWith("-C") && argument.text.length > 2) {
+				chdir = argument.text.slice(2);
+			} else if (argument.text.startsWith("--chdir=")) {
+				chdir = argument.text.slice("--chdir=".length);
+			} else if (!argument.text.startsWith("-") && !isAssignment(argument.text)) {
+				break;
+			}
+			if (chdir !== undefined) effectiveCwd = path.resolve(effectiveCwd, chdir);
+		}
+	}
+	return effectiveCwd;
+}
+
 /**
  * Check if the given index is part of a `command -v` or `command -V` lookup.
  * Such invocations are not executions, so tmux commands within them don't run.
- * The target token must be the actual command being looked up, not a subsequent command after a separator.
+ * Every operand in the same simple command is a lookup name; wrappers among
+ * those operands must not turn later names into executions.
  */
 function isCommandLookup(tokens: Token[], targetIndex: number): boolean {
-	// Backtrack through all tokens to find if we're in a `command -v` sequence
-	// Look for the pattern: command -v/V TARGET, where TARGET is the direct command being looked up
+	const targetSegment = tokens[targetIndex].segment;
 	for (let commandIdx = 0; commandIdx < targetIndex; commandIdx++) {
-		if (!tokens[commandIdx].commandStart || tokens[commandIdx].text !== "command") {
+		if (
+			!tokens[commandIdx].commandStart ||
+			tokens[commandIdx].text !== "command" ||
+			tokens[commandIdx].segment !== targetSegment
+		) {
 			continue;
 		}
 
-		// Found a "command" token, look for -v or -V after it (standalone or bundled)
-		let lookupFlagIdx = -1;
 		for (let i = commandIdx + 1; i < targetIndex; i++) {
+			if (tokens[i].segment !== targetSegment) break;
 			const token = tokens[i].text;
-			// Check for -v/-V standalone or bundled in short options (e.g., -pv)
 			if (
 				token === "-v" ||
 				token === "-V" ||
 				(token.startsWith("-") && !token.startsWith("--") && (token.includes("v") || token.includes("V")))
 			) {
-				lookupFlagIdx = i;
-				break;
-			}
-		}
-
-		// If we found the lookup flag, check if the target is the next non-option word
-		// within the same command (not after a command boundary)
-		if (lookupFlagIdx >= 0) {
-			// Check if there's a command boundary (commandStart token) between the lookup flag and target
-			let hasCommandBoundary = false;
-			for (let sep = lookupFlagIdx + 1; sep < targetIndex; sep++) {
-				if (tokens[sep].commandStart) {
-					hasCommandBoundary = true;
-					break;
-				}
-			}
-			if (hasCommandBoundary) {
-				// Target is after a command boundary, so it's not part of the lookup
-				continue;
-			}
-
-			// Find the wrapped command (first non-option, non-assignment after the lookup flag)
-			for (let i = lookupFlagIdx + 1; i < tokens.length; i++) {
-				const word = tokens[i].text;
-				// Skip options and assignments
-				if (word.startsWith("-") || isAssignment(word)) {
-					continue;
-				}
-				// If the first non-option word has commandStart=true but is NOT a wrapped command,
-				// it's a new command after a separator, not an operand of the lookup.
-				// This handles empty lookups like `command -v; tmux send-keys`
-				if (tokens[i].commandStart && !tokens[i].isWrappedCommand) {
-					break;
-				}
-				// This is the operand of the lookup; check if it matches the target
-				return i === targetIndex;
+				return true;
 			}
 		}
 	}
@@ -1900,8 +1991,14 @@ export async function checkTmuxSelfInjection(
 			}
 		}
 		if (!invocation.verb || !INPUT_VERBS.has(invocation.verb)) continue;
-		const assignedSocket = assignedTmuxSocket(tokens, index);
-		const commandSocket = invocation.socket ? socketPathFor(invocation.socket, env, cwd, uid) : assignedSocket;
+		const commandEnv = { ...env };
+		const assignedTmux = assignedTmuxEnvironmentValue(tokens, index, "TMUX");
+		const assignedTmpdir = assignedTmuxEnvironmentValue(tokens, index, "TMUX_TMPDIR");
+		if (assignedTmpdir !== undefined) commandEnv.TMUX_TMPDIR = assignedTmpdir;
+		const commandCwd = commandWorkingDirectory(tokens, index, cwd);
+		const commandSocket = invocation.socket
+			? socketPathFor(invocation.socket, commandEnv, commandCwd, uid)
+			: assignedTmux;
 		if (commandSocket && !sameSocket(commandSocket, identity.socketPath)) continue;
 
 		const target = targetFromArgs(invocation.args);
@@ -1938,7 +2035,7 @@ export async function checkTmuxSelfInjection(
 
 	if (depth < MAX_INDIRECTION_DEPTH) {
 		const shellScripts = collectShellScripts(tokens, cwd);
-		for (const payload of collectShellStdinPayloads(tokens, hereDocuments, shellScripts)) {
+		for (const payload of collectShellStdinPayloads(tokens, hereDocuments, shellScripts, cwd)) {
 			const result = await checkTmuxSelfInjection(payload, options, depth + 1);
 			if (result.block) return result;
 		}
