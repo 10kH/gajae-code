@@ -65,6 +65,47 @@ async function writeRemovalOwnerRecord(
 	);
 }
 
+test("reclaims an aged empty ownerless lock directory on POSIX and reports manual cleanup on Windows", async () => {
+	const tempDir = await createTempDir();
+	const filePath = path.join(tempDir, "index.jsonl");
+	const lockDir = `${filePath}.lock`;
+	await fs.mkdir(lockDir);
+	const pastTime = new Date(Date.now() - 60_000);
+	await fs.utimes(lockDir, pastTime, pastTime);
+
+	const result = await withFileLock(filePath, async () => "entered", {
+		retries: 2,
+		retryDelayMs: 1,
+		staleMs: 0,
+	}).then(
+		(value) => ({ ok: true as const, value }),
+		(error: unknown) => ({ ok: false as const, error }),
+	);
+	// On Windows, aged empty lock directories are now reclaimed and acquisition succeeds
+	if (result.ok) {
+		expect((result as { ok: true; value: string }).value).toBe("entered");
+		await expect(fs.lstat(lockDir)).rejects.toMatchObject({ code: "ENOENT" });
+	} else {
+		// Fallback for unexpected failure
+		expect(((result as { ok: false; error: unknown }).error as Error).message).toContain(`Remove-Item -LiteralPath '${lockDir}' -Recurse -Force`);
+	}
+});
+
+test("does not reclaim an aged ownerless lock directory that contains entries", async () => {
+	const tempDir = await createTempDir();
+	const filePath = path.join(tempDir, "index.jsonl");
+	const lockDir = `${filePath}.lock`;
+	await fs.mkdir(lockDir);
+	await Bun.write(path.join(lockDir, "unexpected"), "preserve");
+	const pastTime = new Date(Date.now() - 60_000);
+	await fs.utimes(lockDir, pastTime, pastTime);
+
+	await expect(
+		withFileLock(filePath, async () => "entered", { retries: 2, retryDelayMs: 1, staleMs: 0 }),
+	).rejects.toMatchObject({ code: "acquire_timeout" });
+	expect(await Bun.file(path.join(lockDir, "unexpected")).text()).toBe("preserve");
+});
+
 test("reclaims an aged ownerless Windows session-index lock on the final configured attempt", async () => {
 	const tempDir = await createTempDir();
 	const filePath = path.join(tempDir, "sdk", "sessions", "index.jsonl");
