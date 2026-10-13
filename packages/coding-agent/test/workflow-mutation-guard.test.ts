@@ -32,10 +32,39 @@ async function makeTempRoot(): Promise<string> {
 
 /** A directory that is not the project cwd and not a platform temp root. */
 async function makeNonNeutralDir(): Promise<string> {
-	// The shard harness nests TMPDIR and HOME below the platform temp root.
-	// Neither their parent nor os.homedir() is necessarily non-neutral. Use the
-	// account home instead of the harness's environment-derived home directory.
-	return fs.mkdtemp(path.join(os.userInfo().homedir, "gjc-plan-tmpdir-"));
+	// The test harness nests HOME below TMPDIR, so os.userInfo().homedir can
+	// itself resolve inside the system temp root. Prefer a directory beside the
+	// checkout and verify that the guard will not treat it as neutral scratch.
+	const candidates = [process.cwd(), os.userInfo().homedir];
+	const tempRoots =
+		process.platform === "win32"
+			? [os.tmpdir(), process.env.TMPDIR, process.env.TEMP, process.env.TMP]
+			: ["/tmp", "/var/tmp", "/private/tmp", "/private/var/tmp", os.tmpdir(), process.env.TMPDIR];
+	const resolvedTempRoots = await Promise.all(
+		tempRoots
+			.filter((root): root is string => Boolean(root))
+			.map(async root => {
+				try {
+					return await fs.realpath(root);
+				} catch {
+					return path.resolve(root);
+				}
+			}),
+	);
+	for (const candidate of candidates) {
+		const directory = await fs.mkdtemp(path.join(candidate, "gjc-plan-tmpdir-"));
+		const resolvedDirectory = await fs.realpath(directory);
+		const isNeutral = resolvedTempRoots.some(root => {
+			const relative = path.relative(root, resolvedDirectory);
+			return (
+				relative === "" ||
+				(relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
+			);
+		});
+		if (!isNeutral) return directory;
+		await fs.rm(directory, { recursive: true, force: true });
+	}
+	throw new Error("Cannot create the project TMPDIR fixture outside neutral system temp roots.");
 }
 
 async function removeDirLeafFirst(dir: string): Promise<void> {
