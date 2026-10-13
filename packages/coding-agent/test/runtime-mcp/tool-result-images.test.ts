@@ -258,6 +258,17 @@ describe("MCP tool-result images", () => {
 		]);
 	});
 
+	it("accepts images at the source dimension and pixel limits", async () => {
+		const resized = await imageResize.resizeImage(PNG);
+		const resize = vi.spyOn(imageResize, "resizeImage").mockResolvedValue(resized);
+		const result = await executeResult({
+			content: [pngHeader(MCP_MAX_IMAGE_SOURCE_DIMENSION, 1), pngHeader(4_000, 4_000)],
+		});
+		expect(resize).toHaveBeenCalledTimes(2);
+		expect(result.content.slice(1)).toEqual([PNG, PNG]);
+		expect(textOf(result.content)).toBe(expectedText("[Image: image/png]\n\n[Image: image/png]", true));
+	});
+
 	it("bounds encoded source bytes before decoding, including the aggregate", async () => {
 		const resized = await imageResize.resizeImage(PNG);
 		const resize = vi.spyOn(imageResize, "resizeImage").mockResolvedValue(resized);
