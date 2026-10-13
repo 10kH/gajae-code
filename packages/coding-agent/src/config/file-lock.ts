@@ -2240,6 +2240,15 @@ async function removeStaleLockForAcquire(
 		// completing the same dead generation, and record the cause so exhaustion
 		// reports *why* a dead owner's lock could not be reaped instead of only
 		// "dead but not reaped".
+		if (isTransientReleaseError(error)) {
+			// A thrown native denial can arrive after detach. No release handle owns
+			// this stale generation, so let a later local acquisition resume its receipt.
+			markLocalRemovalResumable(
+				fileLockRemovalTransitionPath(lockPath),
+				snapshot.identity.rootDev,
+				snapshot.identity.rootIno,
+			);
+		}
 		return {
 			removed: false,
 			failure: {

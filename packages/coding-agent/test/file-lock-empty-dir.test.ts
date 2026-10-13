@@ -431,6 +431,7 @@ test.each([
 	"cleanup_pending",
 	"sharing_violation",
 	"thrown_sharing_violation",
+	"thrown_replay",
 ] as const)("retries stale-owner Windows detached cleanup after transient %s on a later same-process acquisition", async transientRefusal => {
 	const tempDir = await createTempDir();
 	const filePath = path.join(tempDir, "sdk", "sessions", "index.jsonl");
@@ -442,6 +443,7 @@ test.each([
 		JSON.stringify({ pid: 4_194_303, timestamp: Date.now(), owner_token: crypto.randomUUID() }),
 	);
 
+	const attemptsBeforeCallback = transientRefusal === "thrown_replay" ? 2 : 3;
 	let transitionRemovalAttempts = 0;
 	FileLockTestHooks.nativeExactRemovalProbe = () => true;
 	FileLockTestHooks.nativeQuarantineBindings = () => ({
@@ -453,6 +455,9 @@ test.each([
 			}
 			if (target === transitionPath) {
 				transitionRemovalAttempts++;
+				if (transitionRemovalAttempts === 1 && transientRefusal === "thrown_replay") {
+					throw Object.assign(new Error("simulated Windows replay denial"), { code: "EPERM" });
+				}
 				if (transitionRemovalAttempts === 2 && transientRefusal === "sharing_violation") {
 					return { ok: false, code: "sharing_violation", detachedPath: transitionPath };
 				}
@@ -485,7 +490,7 @@ test.each([
 		),
 	).rejects.toMatchObject({ code: "acquire_timeout" });
 	expect(firstCallbackEntered).toBe(false);
-	expect(transitionRemovalAttempts).toBe(2);
+	expect(transitionRemovalAttempts).toBe(transientRefusal === "thrown_replay" ? 1 : 2);
 	await fs.lstat(transitionPath);
 	await fs.lstat(`${transitionPath}.owner`);
 
@@ -493,14 +498,14 @@ test.each([
 	await withFileLock(
 		filePath,
 		async () => {
-			expect(transitionRemovalAttempts).toBe(3);
+			expect(transitionRemovalAttempts).toBe(attemptsBeforeCallback);
 			recoveredCallbackEntered = true;
 		},
 		{ retries: 2, retryDelayMs: 1, staleMs: 0 },
 	);
 
 	expect(recoveredCallbackEntered).toBe(true);
-	expect(transitionRemovalAttempts).toBe(4);
+	expect(transitionRemovalAttempts).toBe(attemptsBeforeCallback + 1);
 	await expect(fs.lstat(lockDir)).rejects.toMatchObject({ code: "ENOENT" });
 	await expect(fs.lstat(transitionPath)).rejects.toMatchObject({ code: "ENOENT" });
 	await expect(fs.lstat(`${transitionPath}.owner`)).rejects.toMatchObject({ code: "ENOENT" });
