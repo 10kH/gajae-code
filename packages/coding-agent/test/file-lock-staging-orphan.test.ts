@@ -67,11 +67,11 @@ test.each([true, false])("current process staging is retained (info=%s)", async 
 	expect(await fs.exists(staging)).toBe(true);
 });
 
-test("live staging owner is skipped before snapshotting its directory", async () => {
+test.each(["alive", "unknown"] as const)("unproven staging owner is skipped before snapshotting (%s)", async status => {
 	const { staging } = await fixture(DEAD_PID);
-	const probe = vi.fn(() => "alive" as const);
+	const probe = vi.fn(() => status);
 	const snapshot = vi.fn(() => {
-		throw new Error("live staging owner must not be snapshotted");
+		throw new Error("unproven staging owner must not be snapshotted");
 	});
 	FileLockTestHooks.nativeQuarantineBindings = () => ({
 		snapshotDirectoryTree: snapshot,
@@ -79,7 +79,7 @@ test("live staging owner is skipped before snapshotting its directory", async ()
 	});
 
 	const result = await inspectFileLockStagingDir(staging, probe, true);
-	expect(result).toMatchObject({ pid: DEAD_PID, status: "alive", removed: false });
+	expect(result).toMatchObject({ pid: DEAD_PID, status, removed: false });
 	expect(probe).toHaveBeenCalledWith(DEAD_PID);
 	expect(snapshot).not.toHaveBeenCalled();
 	expect(await fs.exists(staging)).toBe(true);

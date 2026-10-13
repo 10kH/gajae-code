@@ -2783,10 +2783,18 @@ export async function inspectFileLockStagingDir(
 		return { ...kept, reason: "enoent_already_gone" };
 	}
 	if (!root.isDirectory() || root.isSymbolicLink()) return kept;
-	if (probe(namePid) === "alive") {
-		// Do not open the publication source while its owner is live. On Windows an
-		// info-file handle can prevent the owner's atomic directory rename.
-		return { ...kept, pid: namePid, status: "alive", reason: "live_staging_name_owner" };
+	const namePidStatus = probe(namePid);
+	if (namePidStatus !== "dead") {
+		// Do not open the publication source while its owner may be live. On Windows an
+		// info-file handle can prevent the owner's atomic directory rename. If a PID was
+		// reused or liveness is unknown, retaining harmless staging debris is safer than
+		// opening info to prove an incarnation and racing the publisher.
+		return {
+			...kept,
+			pid: namePid,
+			status: namePidStatus,
+			reason: namePidStatus === "alive" ? "live_staging_name_owner" : "staging_name_owner_liveness_unknown",
+		};
 	}
 	const captured = nativeFileLockBindings().snapshotDirectoryTree(canonical);
 	if (
