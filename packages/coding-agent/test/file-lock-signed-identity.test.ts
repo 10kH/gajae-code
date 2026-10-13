@@ -134,13 +134,17 @@ async function signedIdentityFixture(component: "root" | "info" | "both", detach
 			})),
 		};
 	};
+	const withoutCtime = (snapshot: NativeDirectoryTreeSnapshot) => ({
+		...snapshot,
+		entries: snapshot.entries.map(entry => ({ ...entry, ctimeNs: "" })),
+	});
 	const originals = new Map<string, NativeDirectoryTreeSnapshot>();
 	const remove = vi.fn(
 		(
 			target: string,
 			snapshot: NativeDirectoryTreeSnapshot,
 			parentIdentity?: { dev: bigint; ino: bigint },
-			_detachOnly?: boolean,
+			detachOnly?: boolean,
 		) => {
 			const original = originals.get(target);
 			if (!original) throw new Error("Removal without captured authority");
@@ -150,9 +154,18 @@ async function signedIdentityFixture(component: "root" | "info" | "both", detach
 				renameSync(target, cleanupParked);
 				return { ok: true, detachedPath: cleanupParked };
 			}
+			if (detachOnly) {
+				const detachedPath = `${target}.removing`;
+				originals.set(detachedPath, original);
+				renameSync(target, detachedPath);
+				return { ok: true, detachedPath };
+			}
 			// Only simulate the native commit after both the adapted authority and
-			// the original filesystem generation match the captured snapshot.
-			expect(snapshotDirectoryTree(target).snapshot).toEqual(original);
+			// the original filesystem generation match. Directory ctime may change
+			// when Windows atomically detaches the captured root.
+			const current = snapshotDirectoryTree(target).snapshot;
+			if (!current) throw new Error("Expected a native snapshot before exact removal");
+			expect(withoutCtime(current)).toEqual(withoutCtime(original));
 			rmSync(target, { recursive: true, force: true });
 			return { ok: true };
 		},
@@ -191,6 +204,27 @@ test.each(["root", "info"] as const)("reclaims a dead-owner lock with a signed %
 		);
 	expect(fixture.remove).toHaveBeenCalledTimes(1);
 	expect(await fs.exists(fixture.lock)).toBe(false);
+});
+
+test("completes Windows detachment before cleanup with signed file IDs", async () => {
+	const platform = Object.getOwnPropertyDescriptor(process, "platform");
+	if (!platform?.configurable) throw new Error("process_platform_not_configurable");
+	const fixture = await signedIdentityFixture("both");
+	try {
+		Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+		const observed = await readFileLockObservationForGc(fixture.lock);
+		if (!observed) throw new Error("Expected a lock observation");
+		const result = await removeFileLockDirForGc(fixture.lock, observed.info, observed.identity);
+		if (result !== "removed")
+			throw new Error(
+				JSON.stringify({ result, identity: observed.identity, paths: fixture.pathObservations }, null, 2),
+			);
+	} finally {
+		Object.defineProperty(process, "platform", platform);
+	}
+	expect(fixture.remove).toHaveBeenCalledTimes(2);
+	expect(await fs.exists(fixture.lock)).toBe(false);
+	expect(await fs.exists(fixture.parked)).toBe(false);
 });
 
 test("acquires and releases after reclaiming a signed-ID dead-owner lock", async () => {

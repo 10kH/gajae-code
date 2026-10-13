@@ -1,4 +1,5 @@
 import { afterEach, expect, test, vi } from "bun:test";
+import * as syncFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -19,6 +20,8 @@ afterEach(async () => {
 	FileLockTestHooks.nativeQuarantineBindings = undefined;
 	FileLockTestHooks.beforeRemovalRecordUnlink = undefined;
 	FileLockTestHooks.beforeRemovalOwnerPublish = undefined;
+	FileLockTestHooks.afterRemovalOwnerPublish = undefined;
+	FileLockTestHooks.afterRemovalTransitionMissing = undefined;
 	FileLockTestHooks.afterForeignTransitionMissing = undefined;
 	for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
 });
@@ -543,6 +546,66 @@ test("does not clear a foreign receipt when its root is detached between namespa
 	expect(await Bun.file(`${transition}.owner`).text()).toBe(recordBytes);
 	expect(await Bun.file(path.join(transition, "info")).text()).toBe(canonicalInfo);
 	expect(await fs.exists(lock)).toBe(false);
+});
+
+test("preserves a local receipt when release detaches after acquisition observes no transition", async () => {
+	const { file, lock, transition } = await fixture();
+	const release = await acquireFileLock(file, { retries: 2, retryDelayMs: 1 });
+	await Bun.write(path.join(lock, "payload"), "partially scrubbed transition");
+	controlReleasePendingRetries();
+
+	const ownerPublished = Promise.withResolvers<void>();
+	const allowRemoval = Promise.withResolvers<void>();
+	const transitionObservedMissing = Promise.withResolvers<void>();
+	const allowClassification = Promise.withResolvers<void>();
+	let releasePaused = false;
+	let classificationPaused = false;
+	let transitionPartiallyScrubbed = false;
+	let receiptBytes = "";
+	FileLockTestHooks.afterRemovalOwnerPublish = async publishedPath => {
+		if (publishedPath !== transition || releasePaused) return;
+		releasePaused = true;
+		receiptBytes = await Bun.file(`${transition}.owner`).text();
+		ownerPublished.resolve();
+		await allowRemoval.promise;
+	};
+	FileLockTestHooks.afterRemovalTransitionMissing = async observedPath => {
+		if (observedPath !== transition || classificationPaused) return;
+		classificationPaused = true;
+		transitionObservedMissing.resolve();
+		await allowClassification.promise;
+	};
+	FileLockTestHooks.nativeQuarantineBindings = () => ({
+		snapshotDirectoryTree,
+		exactRemoveDirectoryTree(target, snapshot, parent, detachOnly) {
+			if (target === lock && !transitionPartiallyScrubbed) {
+				transitionPartiallyScrubbed = true;
+				syncFs.renameSync(lock, transition);
+				syncFs.unlinkSync(path.join(transition, "info"));
+				return { ok: false, code: "identity_mismatch" };
+			}
+			return exactRemoveDirectoryTree(target, snapshot, parent, detachOnly);
+		},
+	});
+
+	const releasePromise = release();
+	await ownerPublished.promise;
+	const acquisition = acquireFileLock(file, { retries: 2, retryDelayMs: 1 });
+	await transitionObservedMissing.promise;
+	allowRemoval.resolve();
+	await expect(releasePromise).rejects.toThrow("owner_changed");
+	allowClassification.resolve();
+	await expect(acquisition).rejects.toMatchObject({ code: "acquire_timeout" });
+
+	expect(await Bun.file(`${transition}.owner`).text()).toBe(receiptBytes);
+	expect(await Bun.file(path.join(transition, "payload")).text()).toBe("partially scrubbed transition");
+	await record(transition, deadOwner);
+
+	const successorRelease = await acquireFileLock(file, { retries: 3, retryDelayMs: 1 });
+	await successorRelease();
+	expect(await fs.exists(lock)).toBe(false);
+	expect(await fs.exists(transition)).toBe(false);
+	expect(await fs.exists(`${transition}.owner`)).toBe(false);
 });
 
 test("the same release handle retries a refused detach and a refused local receipt unlink", async () => {
