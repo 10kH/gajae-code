@@ -198,9 +198,17 @@ interface HereDocument {
 	stripTabs: boolean;
 	segment: number;
 	pipeline: number;
+	descriptor: number;
+	descriptorActive: boolean;
 	stdin: boolean;
 	redirectOrder: number;
 	body: string;
+}
+
+interface ShellScript {
+	segment: number;
+	path: string;
+	fileDescriptor?: number;
 }
 
 interface TokenizeResult {
@@ -273,6 +281,7 @@ function tokenize(command: string): TokenizeResult {
 	let redirectionTargetFd: number | undefined;
 	let currentTokenIsPendingOperand = false;
 	const stdinRedirects = new Map<number, { order: number; source: "here-document" | "other" }>();
+	const activeHereDocuments = new Map<string, HereDocument>();
 	const hereDocDelimiters: HereDocument[] = [];
 	let activeHereDoc: HereDocument | undefined;
 	let hereDocLine = "";
@@ -283,6 +292,16 @@ function tokenize(command: string): TokenizeResult {
 		if (text.length === 0 && !quoted) return;
 
 		if (redirectionTargetPending) {
+			const descriptor = redirectionTargetFd ?? 0;
+			const isIdentityDescriptorDuplication =
+				redirectionTargetIsDuplication && /^\d+$/.test(text) && Number(text) === descriptor;
+			const descriptorKey = `${segment}:${descriptor}`;
+			if (!isIdentityDescriptorDuplication) {
+				const previousHereDocument = activeHereDocuments.get(descriptorKey);
+				if (previousHereDocument) previousHereDocument.descriptorActive = false;
+				activeHereDocuments.delete(descriptorKey);
+			}
+
 			let redirectOrder: number | undefined;
 			const isIdentityInputDuplication =
 				redirectionTargetIsInput &&
@@ -314,12 +333,15 @@ function tokenize(command: string): TokenizeResult {
 					stripTabs: redirectionTargetStripTabs,
 					segment,
 					pipeline,
+					descriptor,
+					descriptorActive: true,
 					stdin: redirectionTargetFd === undefined || redirectionTargetFd === 0,
 					redirectOrder: redirectOrder ?? 0,
 					body: "",
 				};
 				hereDocDelimiters.push(hereDocument);
 				hereDocuments.push(hereDocument);
+				activeHereDocuments.set(descriptorKey, hereDocument);
 			}
 			text = "";
 			quoted = false;
@@ -1469,15 +1491,31 @@ function collectHereDocumentCommandSubstitutions(body: string): string[] {
 	return [...substitutions];
 }
 
-function collectShellStdinPayloads(tokens: Token[], hereDocuments: HereDocument[]): string[] {
+function collectShellStdinPayloads(tokens: Token[], hereDocuments: HereDocument[], scripts: ShellScript[]): string[] {
 	const payloads = hereDocuments.flatMap(hereDocument =>
 		hereDocument.delimiterQuoted
 			? []
 			: collectHereDocumentCommandSubstitutions(joinUnquotedHereDocumentLines(hereDocument.body)),
 	);
+	const scriptDescriptorsBySegment = new Map<number, Set<number>>();
+	for (const script of scripts) {
+		if (script.fileDescriptor === undefined) continue;
+		const descriptors = scriptDescriptorsBySegment.get(script.segment) ?? new Set<number>();
+		descriptors.add(script.fileDescriptor);
+		scriptDescriptorsBySegment.set(script.segment, descriptors);
+	}
 	for (let index = 0; index < hereDocuments.length; index++) {
 		const hereDocument = hereDocuments[index];
-		if (!hereDocument.stdin || hereDocument.body.length === 0) continue;
+		if (hereDocument.body.length === 0) continue;
+		if (!hereDocument.stdin) {
+			if (
+				hereDocument.descriptorActive &&
+				scriptDescriptorsBySegment.get(hereDocument.segment)?.has(hereDocument.descriptor)
+			) {
+				payloads.push(hereDocument.body);
+			}
+			continue;
+		}
 		const commandRedirectOrder = tokens.find(
 			token => token.segment === hereDocument.segment && token.commandStart,
 		)?.stdinRedirectOrder;
@@ -1499,8 +1537,15 @@ function collectShellStdinPayloads(tokens: Token[], hereDocuments: HereDocument[
 	return payloads;
 }
 
-function collectShellScripts(tokens: Token[], cwd: string): string[] {
-	const scripts: string[] = [];
+function scriptFileDescriptor(scriptPath: string): number | undefined {
+	const match = /^(?:\/dev\/fd|\/proc\/(?:self|thread-self)\/fd)\/(\d+)$/.exec(scriptPath);
+	if (!match) return undefined;
+	const descriptor = Number(match[1]);
+	return Number.isSafeInteger(descriptor) ? descriptor : undefined;
+}
+
+function collectShellScripts(tokens: Token[], cwd: string): ShellScript[] {
+	const scripts: ShellScript[] = [];
 	const optionsWithArg = new Set(["-O", "-o", "+O", "+o"]);
 
 	for (let index = 0; index < tokens.length; index++) {
@@ -1513,7 +1558,12 @@ function collectShellScripts(tokens: Token[], cwd: string): string[] {
 			!SHELL_RUNNERS.has(name) &&
 			name !== "busybox"
 		) {
-			scripts.push(path.resolve(cwd, token.text));
+			const fileDescriptor = scriptFileDescriptor(token.text);
+			scripts.push({
+				segment: token.segment,
+				path: path.resolve(cwd, token.text),
+				...(fileDescriptor !== undefined && { fileDescriptor }),
+			});
 			continue;
 		}
 		// Handle shell runners (bash, sh, etc.) and busybox applets
@@ -1550,8 +1600,18 @@ function collectShellScripts(tokens: Token[], cwd: string): string[] {
 			if (argument.startsWith("+O") || argument.startsWith("+o")) continue;
 			if (isPositiveShellOption(argument)) continue;
 
-			// If we encounter -c, stop looking (script mode is not used)
-			if (argument === "-c") break;
+			// A command string or stdin option means there is no script-file operand.
+			const shortOption = argument.startsWith("-") && !argument.startsWith("--");
+			const bundledOption =
+				shortOption && argument.length > 2 && !argument.startsWith("-O") && !argument.startsWith("-o");
+			if (
+				argument === "-" ||
+				argument === "-s" ||
+				argument === "-c" ||
+				(bundledOption && (argument.includes("s") || argument.includes("c")))
+			) {
+				break;
+			}
 
 			// Skip options and their arguments
 			if (argument.startsWith("-")) {
@@ -1589,7 +1649,12 @@ function collectShellScripts(tokens: Token[], cwd: string): string[] {
 			}
 
 			// Found the first non-option word; this is the script name
-			scripts.push(path.resolve(cwd, argument));
+			const fileDescriptor = scriptFileDescriptor(argument);
+			scripts.push({
+				segment: token.segment,
+				path: path.resolve(cwd, argument),
+				...(fileDescriptor !== undefined && { fileDescriptor }),
+			});
 			break;
 		}
 	}
@@ -1872,7 +1937,8 @@ export async function checkTmuxSelfInjection(
 	}
 
 	if (depth < MAX_INDIRECTION_DEPTH) {
-		for (const payload of collectShellStdinPayloads(tokens, hereDocuments)) {
+		const shellScripts = collectShellScripts(tokens, cwd);
+		for (const payload of collectShellStdinPayloads(tokens, hereDocuments, shellScripts)) {
 			const result = await checkTmuxSelfInjection(payload, options, depth + 1);
 			if (result.block) return result;
 		}
@@ -1880,9 +1946,10 @@ export async function checkTmuxSelfInjection(
 			const result = await checkTmuxSelfInjection(payload, options, depth + 1);
 			if (result.block) return result;
 		}
-		for (const scriptPath of collectShellScripts(tokens, cwd)) {
+		for (const shellScript of shellScripts) {
+			if (shellScript.fileDescriptor !== undefined) continue;
 			try {
-				const file = Bun.file(scriptPath);
+				const file = Bun.file(shellScript.path);
 				if (!(await file.exists()) || file.size > 1_000_000) continue;
 				const script = await file.text();
 				const result = await checkTmuxSelfInjection(script, options, depth + 1);

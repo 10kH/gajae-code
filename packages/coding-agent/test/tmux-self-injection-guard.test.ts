@@ -997,6 +997,25 @@ describe("tmux self-injection guard", () => {
 			}
 		});
 
+		it("inspects here-documents used as non-stdin shell script files", async () => {
+			const script = "tmux send-keys -t %47 x";
+			for (const scriptPath of ["/dev/fd/3", "/proc/self/fd/3", "/proc/thread-self/fd/3"]) {
+				const command = `bash ${scriptPath} 3<<'EOF'\n${script}\nEOF`;
+				await expect(checkTmuxSelfInjection(command, options)).resolves.toMatchObject({ block: true });
+			}
+		});
+
+		it("leaves non-stdin here-documents alone when they are data or superseded", async () => {
+			const document = "tmux send-keys -t %47 x";
+			for (const command of [
+				`bash -c 'cat <&3' 3<<'EOF'\n${document}\nEOF`,
+				`bash /dev/fd/4 3<<'EOF'\n${document}\nEOF`,
+				`bash /dev/fd/3 3<<'EOF' 3</dev/null\n${document}\nEOF`,
+			]) {
+				await expect(checkTmuxSelfInjection(command, options)).resolves.toEqual({ block: false });
+			}
+		});
+
 		it("inspects command substitutions in unquoted here-documents", async () => {
 			const substitution = "tmux send-keys -t %47 x";
 			for (const command of [
