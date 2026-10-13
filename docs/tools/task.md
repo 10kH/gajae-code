@@ -58,9 +58,11 @@ requests additional per-task isolation in the session's own repository; it is ex
 only when `task.isolation.mode` enables an isolation backend.
 
 `move_session` only narrows to a descendant directory, not a sibling repository.
-User-driven `/move` and SDK cwd relocation are separate surfaces; an already-created
-task tool retains its original repository binding. A fresh target-rooted session avoids
-carrying that old delegation authority across a repository move.
+User-driven `/move` and SDK cwd relocation are separate surfaces. After an authorized
+move commits, new Task calls use the committed target directory; rejected or rolled-back
+moves leave the source authority intact. A binding payload or an arbitrary cwd change
+cannot substitute for that commit. Already-admitted work retains its source execution
+inputs, and moving does not allocate a new Task output owner or reset task IDs.
 
 `tasks[].tier` is inert while `task.autorouting.enabled` is `false`. When autorouting is active it selects the model chain for that item, an omitted `tier` routes as `balanced`, and the routed pin overrides the manual model chain. See [Autorouting](#autorouting).
 

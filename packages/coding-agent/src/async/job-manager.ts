@@ -1245,6 +1245,7 @@ export class AsyncJobManager {
 				this.#externallySettled.delete(job.generation);
 				if (this.#jobs.get(id) === job) this.#settledJobs.add(job);
 				this.#settleExecution(execution);
+				if (!this.#disposed && !this.#registrationClosed) this.#drainResumeQueue();
 			})
 			.then(completion.resolve, completion.reject);
 
@@ -1706,21 +1707,23 @@ export class AsyncJobManager {
 		for (const target of lease.targets) {
 			const executions = state.backingExecutions.get(target.subagentId) ?? [];
 			const capture = state.records.get(target.subagentId);
-			if (
+			const record = capture?.record;
+			const preserveQueuedRecord =
 				target.source === "record" &&
-				capture &&
-				this.#subagentRecords.get(target.subagentId) === capture.record &&
-				capture.record.status === "queued" &&
-				(capture.queuedSeq === undefined || capture.record.queued?.seq === capture.queuedSeq)
-			) {
-				this.cancelSubagent(target.subagentId, { ownerId: lease.ownerId });
-			}
+				target.jobId === null &&
+				capture !== undefined &&
+				record !== undefined &&
+				this.#subagentRecords.get(target.subagentId) === record &&
+				record.ownerId === lease.ownerId &&
+				record.currentJobId === capture.currentJobId &&
+				record.currentJobGeneration === capture.currentJobGeneration &&
+				record.status === "queued" &&
+				record.queued?.seq === capture.queuedSeq;
 			for (const execution of executions) {
-				this.#cancelExactExecution(execution);
+				if (!preserveQueuedRecord) this.#cancelExactExecution(execution);
 				promises.add(execution.physicalCompletion);
 			}
 			if (target.source !== "record" || executions.length > 0) continue;
-			const record = capture?.record;
 			if (!capture || !record || this.#subagentRecords.get(target.subagentId) !== record) continue;
 			if (record.status === "paused") {
 				const row = record.currentJobId ? this.#jobs.get(record.currentJobId) : undefined;
@@ -1769,8 +1772,28 @@ export class AsyncJobManager {
 	): boolean {
 		const capture = state.records.get(target.subagentId);
 		const record = capture?.record;
+		const physicallySettled = (state.backingExecutions.get(target.subagentId) ?? []).every(
+			execution => execution.job.ownerId === ownerId && execution.physicallySettled,
+		);
+		if (!capture || !record) return false;
+
+		// A queued record is terminal only for the captured owner record and generation:
+		// the lease fence keeps it queued until release or commit, and it must not be
+		// cancelled merely to collect shutdown evidence.
 		if (
-			!record ||
+			target.source === "record" &&
+			target.jobId === null &&
+			this.#subagentRecords.get(target.subagentId) === record &&
+			record.ownerId === ownerId &&
+			record.currentJobId === capture.currentJobId &&
+			record.currentJobGeneration === capture.currentJobGeneration &&
+			record.status === "queued" &&
+			record.queued?.seq === capture.queuedSeq
+		) {
+			return physicallySettled;
+		}
+
+		if (
 			this.#subagentRecords.get(target.subagentId) !== record ||
 			record.ownerId !== ownerId ||
 			!this.#isTerminalSubagentStatus(record.status)
@@ -1792,9 +1815,7 @@ export class AsyncJobManager {
 		) {
 			return false;
 		}
-		return (state.backingExecutions.get(target.subagentId) ?? []).every(
-			execution => execution.job.ownerId === ownerId && execution.physicallySettled,
-		);
+		return physicallySettled;
 	}
 
 	#ownerSubagentShutdownProof(
@@ -1816,7 +1837,11 @@ export class AsyncJobManager {
 		};
 	}
 
-	finishOwnerSubagentShutdown(lease: OwnerSubagentShutdownLease, outcome: "commit" | "release"): void {
+	finishOwnerSubagentShutdown(
+		lease: OwnerSubagentShutdownLease,
+		outcome: "commit" | "release",
+		options?: { drainResumeQueue?: boolean },
+	): void {
 		const state = this.#ownerSubagentShutdownLeases.get(lease.ownerId);
 		if (!state || state.lease.id !== lease.id) return;
 		if (outcome === "commit" && state.proof?.confirmed) {
@@ -1825,7 +1850,10 @@ export class AsyncJobManager {
 			this.#purgeOwnerSubagentState(lease.ownerId);
 		}
 		this.#ownerSubagentShutdownLeases.delete(lease.ownerId);
-		if (outcome === "release") this.#ensureDeliveryLoop();
+		if (outcome === "release") {
+			if (options?.drainResumeQueue && !this.#disposed && !this.#registrationClosed) this.#drainResumeQueue();
+			this.#ensureDeliveryLoop();
+		}
 	}
 
 	#recordByJobId(jobId: string, expectedGeneration?: string): SubagentRecord | undefined {
@@ -2198,6 +2226,21 @@ export class AsyncJobManager {
 				index += 1;
 				continue;
 			}
+			let priorExecutionActive = false;
+			for (const execution of this.#activeExecutions) {
+				if (
+					execution.job.ownerId === entry.ownerId &&
+					execution.job.metadata?.subagent?.id === entry.subagentId &&
+					!execution.physicallySettled
+				) {
+					priorExecutionActive = true;
+					break;
+				}
+			}
+			if (priorExecutionActive) {
+				index += 1;
+				continue;
+			}
 			try {
 				const result = this.#startResume(
 					rec,
@@ -2328,12 +2371,16 @@ export class AsyncJobManager {
 		}
 		for (const [sid, rec] of this.#subagentRecords) {
 			if (!ownerId || rec.ownerId === ownerId) {
+				const queuedSeq = rec.status === "queued" ? rec.queued?.seq : undefined;
+				if (queuedSeq !== undefined) {
+					rec.terminalQueuedSeq = queuedSeq;
+					this.#publishQueuedTerminal(sid, `queued:${sid}:${queuedSeq}`, "cancelled");
+				}
 				// Retire the queued resume's owned registration BEFORE deleting the
-				// record: the purge removes the resume-queue entry and record with
-				// no start, cancellation, or delivery boundary, so the registration
-				// would otherwise leak into the global ownership registries and
-				// eventually make later owned aborts fail closed (review thread
-				// P2). #retireQueuedOwned is a no-op for non-queued records.
+				// record: #publishQueuedTerminal above is the wait-notification
+				// boundary for queued work; this removes the corresponding ownership
+				// tuple so it cannot leak into later owned aborts. The helper is a
+				// no-op for non-queued records.
 				this.#retireQueuedOwned(rec);
 				this.#liveHandles.delete(sid);
 				this.#resumeDescriptors.delete(sid);
