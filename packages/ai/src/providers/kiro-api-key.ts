@@ -483,6 +483,188 @@ function findJsonEnd(text: string, start: number): number {
 	return -1;
 }
 
+type JsonPrefixResult = "complete" | "incomplete" | "invalid";
+
+/** Return whether an unfinished object is still a valid JSON prefix. */
+function isValidJsonPrefix(text: string): boolean {
+	let position = 0;
+	const maxDepth = 128;
+
+	function skipWhitespace(): void {
+		while (position < text.length) {
+			const char = text[position];
+			if (char !== " " && char !== "\t" && char !== "\n" && char !== "\r") break;
+			position++;
+		}
+	}
+
+	function isDigit(char: string | undefined): boolean {
+		return char !== undefined && char >= "0" && char <= "9";
+	}
+
+	function isHexDigit(char: string | undefined): boolean {
+		return (
+			char !== undefined &&
+			((char >= "0" && char <= "9") || (char >= "a" && char <= "f") || (char >= "A" && char <= "F"))
+		);
+	}
+
+	function parseString(): JsonPrefixResult {
+		if (text[position] !== '"') return "invalid";
+		position++;
+		while (position < text.length) {
+			const char = text[position];
+			if (char === '"') {
+				position++;
+				return "complete";
+			}
+			if (char === "\\") {
+				position++;
+				if (position >= text.length) return "incomplete";
+				const escaped = text[position];
+				if (escaped === "u") {
+					position++;
+					for (let i = 0; i < 4; i++) {
+						if (position >= text.length) return "incomplete";
+						if (!isHexDigit(text[position])) return "invalid";
+						position++;
+					}
+					continue;
+				}
+				if (escaped !== '"' && escaped !== "\\" && escaped !== "/" && !"bfnrt".includes(escaped ?? "")) {
+					return "invalid";
+				}
+				position++;
+				continue;
+			}
+			if (char !== undefined && char.charCodeAt(0) < 0x20) return "invalid";
+			position++;
+		}
+		return "incomplete";
+	}
+
+	function parseLiteral(literal: string): JsonPrefixResult {
+		for (const char of literal) {
+			if (position >= text.length) return "incomplete";
+			if (text[position] !== char) return "invalid";
+			position++;
+		}
+		return "complete";
+	}
+
+	function parseNumber(): JsonPrefixResult {
+		if (text[position] === "-") {
+			position++;
+			if (position >= text.length) return "incomplete";
+		}
+
+		if (text[position] === "0") {
+			position++;
+			if (isDigit(text[position])) return "invalid";
+		} else if (isDigit(text[position]) && text[position] !== "0") {
+			while (isDigit(text[position])) position++;
+		} else {
+			return "invalid";
+		}
+
+		if (text[position] === ".") {
+			position++;
+			if (position >= text.length) return "incomplete";
+			if (!isDigit(text[position])) return "invalid";
+			while (isDigit(text[position])) position++;
+		}
+
+		if (text[position] === "e" || text[position] === "E") {
+			position++;
+			if (position >= text.length) return "incomplete";
+			if (text[position] === "+" || text[position] === "-") position++;
+			if (position >= text.length) return "incomplete";
+			if (!isDigit(text[position])) return "invalid";
+			while (isDigit(text[position])) position++;
+		}
+		return "complete";
+	}
+
+	function parseValue(depth: number): JsonPrefixResult {
+		if (depth > maxDepth) return "incomplete";
+		skipWhitespace();
+		if (position >= text.length) return "incomplete";
+
+		const char = text[position];
+		if (char === "{") return parseObject(depth);
+		if (char === "[") return parseArray(depth);
+		if (char === '"') return parseString();
+		if (char === "t") return parseLiteral("true");
+		if (char === "f") return parseLiteral("false");
+		if (char === "n") return parseLiteral("null");
+		if (char === "-" || isDigit(char)) return parseNumber();
+		return "invalid";
+	}
+
+	function parseObject(depth: number): JsonPrefixResult {
+		if (depth > maxDepth) return "incomplete";
+		if (text[position] !== "{") return "invalid";
+		position++;
+		skipWhitespace();
+		if (position >= text.length) return "incomplete";
+		if (text[position] === "}") {
+			position++;
+			return "complete";
+		}
+
+		while (position < text.length) {
+			const key = parseString();
+			if (key !== "complete") return key;
+			skipWhitespace();
+			if (position >= text.length) return "incomplete";
+			if (text[position] !== ":") return "invalid";
+			position++;
+
+			const value = parseValue(depth + 1);
+			if (value !== "complete") return value;
+			skipWhitespace();
+			if (position >= text.length) return "incomplete";
+			if (text[position] === "}") {
+				position++;
+				return "complete";
+			}
+			if (text[position] !== ",") return "invalid";
+			position++;
+			skipWhitespace();
+		}
+		return "incomplete";
+	}
+
+	function parseArray(depth: number): JsonPrefixResult {
+		if (depth > maxDepth) return "incomplete";
+		if (text[position] !== "[") return "invalid";
+		position++;
+		skipWhitespace();
+		if (position >= text.length) return "incomplete";
+		if (text[position] === "]") {
+			position++;
+			return "complete";
+		}
+
+		while (position < text.length) {
+			const value = parseValue(depth + 1);
+			if (value !== "complete") return value;
+			skipWhitespace();
+			if (position >= text.length) return "incomplete";
+			if (text[position] === "]") {
+				position++;
+				return "complete";
+			}
+			if (text[position] !== ",") return "invalid";
+			position++;
+			skipWhitespace();
+		}
+		return "incomplete";
+	}
+
+	return parseObject(0) !== "invalid";
+}
+
 export function parseKiroApiEvents(buffer: string): { events: KiroStreamEvent[]; remaining: string } {
 	const events: KiroStreamEvent[] = [];
 	let pos = 0;
@@ -499,13 +681,13 @@ export function parseKiroApiEvents(buffer: string): { events: KiroStreamEvent[];
 		if (end < 0) {
 			// Unclosed brace at 'start'. Could be incomplete JSON waiting for more data, or junk/corruption.
 			const strayBraceEnd = Math.min(start + MAX_RESCAN_DISTANCE, buffer.length);
-			const firstPayloadCharacter = buffer.slice(start + 1).trimStart()[0];
-			if (firstPayloadCharacter === undefined || firstPayloadCharacter === '"' || firstPayloadCharacter === "}") {
-				// A JSON object can begin only with a quoted key or close immediately. Preserve plausible
-				// incomplete envelopes; a complete nested child is not evidence that the outer frame is junk.
-				return { events, remaining: buffer.slice(start, strayBraceEnd) };
+			const incompleteCandidate = buffer.slice(start, strayBraceEnd);
+			if (isValidJsonPrefix(incompleteCandidate)) {
+				// Preserve valid incomplete envelopes; a complete nested child is not evidence that the
+				// outer frame is junk until its own JSON prefix is syntactically impossible.
+				return { events, remaining: incompleteCandidate };
 			}
-			// The opener cannot begin a JSON object. Resync only after establishing invalid framing.
+			// The prefix is syntactically impossible. Resync only after establishing invalid framing.
 			let resyncPos = start + 1;
 			let found = false;
 			while (resyncPos < strayBraceEnd) {
@@ -827,10 +1009,11 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 		let currentTool: { id: string; name: string; input: string } | undefined;
 		let toolComplete = false; // Track whether the current tool has been completed (has stop flag)
 		const pendingToolCalls: Array<{ input: string; toolCall: ToolCall; index: number }> = [];
-		// Only an accepted successful completion confirms buffered text before clean EOF.
+		// Successful metadata fences later generation but text remains quarantined until clean EOF.
 		let completionSeen = false;
+		let completionStopReason: "COMPLETED" | "TOOL_USE" | undefined;
 		let textIndex: number | undefined; // Track text block index (accessible in catch)
-		let textContentConfirmed = false; // Track whether text has been committed to blocks (accessible in catch)
+		let textContentConfirmed = false; // Track whether clean EOF committed text to blocks (accessible in catch)
 		let textStartDeferred = false; // Track if text_start is deferred (accessible in catch)
 		let pendingTextContent = ""; // Text buffer (accessible in catch)
 		const pendingTextEvents: Array<{ type: "start" | "delta" | "end"; delta?: string; content?: string }> = []; // Deferred text events (accessible in catch)
@@ -994,8 +1177,8 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 					textIndex = blocks.length;
 					// Create block with empty text (content will be added only after confirmation)
 					blocks.push({ type: "text", text: "", index: textIndex });
-					// ALWAYS defer text_start until we have terminal metadata or reach EOF without error.
-					// This ensures unconfirmed text is not exposed if an error occurs.
+					// ALWAYS defer text_start until clean EOF. Terminal metadata may be followed
+					// by a refusal in a later read, so it cannot safely publish text by itself.
 					textStartDeferred = true;
 				}
 				// Buffer text content separately (don't add to blocks yet)
@@ -1005,7 +1188,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				pendingTextEvents.push({ type: "delta", delta });
 			};
 
-			// Commit pending text to blocks (only safe at stream end when refusal is ruled out)
+			// Commit pending text to blocks only at clean EOF, when a later refusal is ruled out.
 			const commitPendingText = () => {
 				if (textContentConfirmed || pendingTextContent.length === 0) return; // Already committed or no text
 				textContentConfirmed = true;
@@ -1159,6 +1342,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				for (const event of events) {
 					const isActiveToolContinuation =
 						currentTool !== undefined &&
+						completionStopReason === "TOOL_USE" &&
 						!toolComplete &&
 						(event.type === "toolUseInput" ||
 							event.type === "toolUseStop" ||
@@ -1214,13 +1398,10 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 						if (event.data.outputTokens !== undefined) output.usage.output = event.data.outputTokens;
 						output.usage.totalTokens = output.usage.input + output.usage.output;
 					} else if (event.type === "completion" && !hasTerminalEvent) {
-						// Accepted successful terminal metadata confirms text, unlike usage accounting.
+						// Successful terminal metadata fences later generation. Keep text quarantined
+						// until clean EOF so a later refusal cannot depend on HTTP chunk boundaries.
 						completionSeen = true;
-						// Finding #2: Immediately commit and emit all pending text events on completion
-						commitPendingText();
-						emitThinking();
-						emitDeferredTextEvents();
-						closeTextBlock();
+						completionStopReason = event.data.stopReason;
 					} else if (event.type === "refusal") {
 						const refusalData = event.data as {
 							stopReason?: string;
@@ -1271,37 +1452,15 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 							return;
 						}
 					} else if (event.type === "error" && !hasTerminalEvent) {
-						// On ordinary server errors (error event in stream), emit deferred text and tool events before error
-						// (refusals drop them, incomplete tools must not be emitted)
+						// An ordinary error is not clean EOF, so keep quarantined text private.
 
-						// For server-sent errors, emit the deferred text first (it was received before the error)
-						// Usage is accounting metadata, not a successful completion boundary.
-						if (textContentConfirmed === false && completionSeen) {
-							// Commit pending text to blocks
-							if (textIndex !== undefined && textIndex < blocks.length && pendingTextContent.length > 0) {
-								textContentConfirmed = true;
-							}
-						}
-						if (textContentConfirmed) {
-							emitDeferredTextEvents();
-							closeTextBlock();
-						}
-
-						// Only emit the tool if it was explicitly completed (has stop flag)
+						// Preserve only tools that were explicitly completed (have a stop flag).
 						if (toolComplete) addToolToBlocks();
 						removeUnconfirmedTextBlock();
 						emitPendingToolCalls();
 
-						// Preserve text in the error context only after successful completion.
-						const accumulatedText = textContentConfirmed
-							? blocks
-									.filter((b): b is TextContent => b.type === "text")
-									.map(b => b.text)
-									.join("")
-							: ""; // Discard unconfirmed pending text before error
 						const errorMsg = sanitizeKiroError(`${event.data.error}: ${event.data.message ?? ""}`, apiKey);
-						const fullErrorMsg = accumulatedText ? `${errorMsg}\n\nPartial output: ${accumulatedText}` : errorMsg;
-						throw new Error(fullErrorMsg);
+						throw new Error(errorMsg);
 					}
 				}
 			}
@@ -1316,8 +1475,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				}
 			}
 
-			// Stream is done - commit pending text (safe since no refusal occurred), add pending tool, emit accumulated thinking, etc.
-			// First commit pending text to blocks since stream ended without refusal
+			// Clean EOF rules out a later refusal, so pending text can now be published.
 			commitPendingText();
 			// Emit tool only if explicitly completed (has stop flag); incomplete tools are discarded at EOF
 			if (currentTool && toolComplete) addToolToBlocks();
@@ -1358,20 +1516,14 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 		} catch (error) {
 			// On ordinary errors (including reader.read() throws):
 			// - Emit COMPLETED tool events (same semantics as in the event processing loop)
-			// - Emit confirmed text only after an accepted successful completion
+			// - Emit text only if clean EOF already confirmed it
 			// - Incomplete currentTool is NOT finalized/emitted (only completed tools in pendingToolCalls flush).
-			// - Unconfirmed text is suppressed (usage alone does not confirm it)
+			// - Unconfirmed text is suppressed (terminal metadata alone does not rule out a later refusal)
 
-			// Emit confirmed text if we received an accepted successful completion.
-			if (completionSeen && textContentConfirmed === false) {
-				// Commit pending text to blocks
-				if (textIndex !== undefined && textIndex < blocks.length && pendingTextContent.length > 0) {
-					textContentConfirmed = true;
-				}
-				// Emit deferred text start if not yet emitted
-				if (textStartDeferred && textIndex !== undefined && textIndex < blocks.length) {
-					const block = blocks[textIndex];
-					if (block && block.type === "text" && pendingTextContent.length > 0) {
+			if (textContentConfirmed && textIndex !== undefined && textIndex < blocks.length) {
+				const block = blocks[textIndex];
+				if (block && block.type === "text") {
+					if (textStartDeferred && pendingTextContent.length > 0) {
 						stream.push({ type: "text_start", contentIndex: textIndex, partial: snapshotOutput() });
 						// Emit all pending text_delta events
 						for (const evt of pendingTextEvents) {
@@ -1384,19 +1536,19 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 								});
 							}
 						}
-						block.text = pendingTextContent;
-						stream.push({
-							type: "text_end",
-							contentIndex: textIndex,
-							content: block.text,
-							partial: snapshotOutput(),
-						});
-						textIndex = undefined;
-						pendingTextContent = "";
-						pendingTextEvents.length = 0;
 					}
-					textStartDeferred = false;
+					if (block.text.length === 0 && pendingTextContent.length > 0) block.text = pendingTextContent;
+					stream.push({
+						type: "text_end",
+						contentIndex: textIndex,
+						content: block.text,
+						partial: snapshotOutput(),
+					});
 				}
+				textIndex = undefined;
+				pendingTextContent = "";
+				pendingTextEvents.length = 0;
+				textStartDeferred = false;
 			}
 
 			removeUnconfirmedTextBlock();

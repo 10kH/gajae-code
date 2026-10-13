@@ -1152,6 +1152,15 @@ describe("Regression tests for #6151 issues", () => {
 		expect(contentEvent?.type).toBe("content");
 	});
 
+	test("malformed quoted envelopes resync to a valid nested event", () => {
+		const result = parseKiroApiEvents('{"bad":nope{"content":"recoverable content"}');
+
+		expect(result.events.map(event => event.type)).toEqual(["content"]);
+		const contentEvent = result.events[0];
+		expect(contentEvent?.type === "content" ? contentEvent.data : undefined).toBe("recoverable content");
+		expect(result.remaining).toBe("");
+	});
+
 	test("#4199034439: incomplete tool should NOT be emitted when reader.read() throws mid-tool", async () => {
 		const emittedEventTypes: string[] = [];
 
@@ -1442,6 +1451,40 @@ describe("P1 Regression: incomplete tool emission at tool-ID rollover", () => {
 		).toBe(false);
 		expectToolEventsReferenceToolBlocks(events);
 	});
+
+	test("COMPLETED fences unfinished tool fragments", async () => {
+		const events: AssistantMessageEvent[] = [];
+		const eventSequence = [
+			JSON.stringify({ toolUseId: "tool-incomplete", name: "search", input: '{"query":' }),
+			JSON.stringify({ stopReason: "COMPLETED" }),
+			JSON.stringify({ input: '"kiro"}' }),
+			JSON.stringify({ stop: true }),
+		];
+		let emitted = 0;
+
+		globalThis.fetch = (async () => {
+			const body = new ReadableStream<Uint8Array>({
+				pull(controller) {
+					if (emitted < eventSequence.length) {
+						controller.enqueue(new TextEncoder().encode(eventSequence[emitted]));
+						emitted++;
+					} else {
+						controller.close();
+					}
+				},
+			});
+			return new Response(body, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const errorEvent = events.find(event => event.type === "error");
+		expect(errorEvent).toBeDefined();
+		expect(events.some(event => event.type === "toolcall_start" || event.type === "toolcall_end")).toBe(false);
+	});
 });
 
 describe("P2 Probepark findings: unconfirmed text on read rejection", () => {
@@ -1565,7 +1608,7 @@ describe("P2 Probepark findings: unconfirmed text on read rejection", () => {
 		expect(emittedEvents.some(event => event.type === "text_delta")).toBe(false);
 	});
 
-	test("confirmed text lifecycle closes before an ordinary error in the same batch", async () => {
+	test("completed text remains quarantined on an ordinary error before clean EOF", async () => {
 		const events: AssistantMessageEvent[] = [];
 		const responseBody =
 			JSON.stringify({ content: "confirmed before error" }) +
@@ -1587,14 +1630,14 @@ describe("P2 Probepark findings: unconfirmed text on read rejection", () => {
 			events.push(event);
 		}
 
-		const errorIndex = events.findIndex(event => event.type === "error");
-		const textLifecycle = events
-			.slice(0, errorIndex)
-			.filter(event => event.type === "text_start" || event.type === "text_delta" || event.type === "text_end");
-		expect(errorIndex).toBeGreaterThan(-1);
-		expect(textLifecycle.map(event => event.type)).toEqual(["text_start", "text_delta", "text_end"]);
-		const textEnd = textLifecycle.find(event => event.type === "text_end");
-		expect(textEnd?.type === "text_end" ? textEnd.content : undefined).toBe("confirmed before error");
+		const errorEvent = events.find(
+			(event): event is Extract<AssistantMessageEvent, { type: "error" }> => event.type === "error",
+		);
+		expect(errorEvent?.error.errorMessage).toContain("failure after completion");
+		expect(getTextBlocks(errorEvent?.error)).toHaveLength(0);
+		expect(
+			events.some(event => event.type === "text_start" || event.type === "text_delta" || event.type === "text_end"),
+		).toBe(false);
 		expect(events.some(event => event.type === "done")).toBe(false);
 	});
 
@@ -1726,6 +1769,47 @@ describe("P1 Regression: content leaking across batches", () => {
 					stopReason: "CONTENT_FILTERED",
 					stopDetails: { refusal: { category: "VIOLENCE", explanation: "Do not show answer" } },
 				}),
+		];
+		let emitted = 0;
+
+		globalThis.fetch = (async () => {
+			const body = new ReadableStream<Uint8Array>({
+				pull(controller) {
+					if (emitted < eventSequence.length) {
+						controller.enqueue(new TextEncoder().encode(eventSequence[emitted]));
+						emitted++;
+					} else {
+						controller.close();
+					}
+				},
+			});
+			return new Response(body, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const errorEvent = events.find(
+			(event): event is Extract<AssistantMessageEvent, { type: "error" }> => event.type === "error",
+		);
+		expect(errorEvent?.error.errorMessage).toContain("Kiro refused the request (VIOLENCE)");
+		expect(errorEvent?.error.content).toHaveLength(0);
+		expect(
+			events.some(event => event.type === "text_start" || event.type === "text_delta" || event.type === "text_end"),
+		).toBe(false);
+	});
+
+	test("a refusal in a later read suppresses text after COMPLETED", async () => {
+		const events: AssistantMessageEvent[] = [];
+		const eventSequence = [
+			JSON.stringify({ content: "filtered across reads" }),
+			JSON.stringify({ stopReason: "COMPLETED" }),
+			JSON.stringify({
+				stopReason: "CONTENT_FILTERED",
+				stopDetails: { refusal: { category: "VIOLENCE", explanation: "Do not show answer" } },
+			}),
 		];
 		let emitted = 0;
 
@@ -1926,9 +2010,8 @@ describe("Completion event handling (probepark fix for #6451)", () => {
 		expect(done || error).toBe(true);
 	});
 
-	test("content + COMPLETED, then stream error: text block in error terminal", async () => {
-		// When stream contains content followed by COMPLETED event, then reader.read() throws,
-		// the error terminal should include the confirmed text block.
+	test("content + COMPLETED, then stream error: quarantined text stays private", async () => {
+		// Completion metadata is not enough to publish text when the response fails before clean EOF.
 		const emittedEvents: AssistantMessageEvent[] = [];
 
 		globalThis.fetch = (async () => {
@@ -1966,7 +2049,12 @@ describe("Completion event handling (probepark fix for #6451)", () => {
 			(event): event is Extract<AssistantMessageEvent, { type: "error" }> => event.type === "error",
 		);
 		expect(errorEvent?.error.errorMessage).toContain("Network error after completion");
-		expect(getTextBlocks(errorEvent?.error).map(block => block.text)).toEqual(["Hello"]);
+		expect(getTextBlocks(errorEvent?.error)).toHaveLength(0);
+		expect(
+			emittedEvents.some(
+				event => event.type === "text_start" || event.type === "text_delta" || event.type === "text_end",
+			),
+		).toBe(false);
 	});
 
 	test("content without COMPLETED, then stream error: no text block in error terminal", async () => {
@@ -2064,9 +2152,8 @@ describe("Completion event handling (probepark fix for #6451)", () => {
 		expect(getTextBlocks(errorEvent?.error)).toHaveLength(0);
 	});
 
-	test("completion event emits all pending text events immediately (Finding #2)", async () => {
-		// When completion event arrives, all pending text events should be emitted immediately,
-		// not deferred until EOF. This includes text_start, text_delta, and text_end.
+	test("clean EOF publishes completion-confirmed text and fences later content", async () => {
+		// Completion metadata fences later content, but text is not published until EOF rules out a later refusal.
 		const emittedEvents: AssistantMessageEvent[] = [];
 
 		globalThis.fetch = (async () => {
@@ -2102,17 +2189,13 @@ describe("Completion event handling (probepark fix for #6451)", () => {
 			// Stream error handling
 		}
 
-		// Verify text_start, text_delta, and text_end are emitted
+		// Clean EOF publishes the confirmed text as a complete lifecycle.
 		const eventTypes = emittedEvents.map(e => e.type);
-		const hasTextStart = eventTypes.includes("text_start");
-		const hasTextDelta = eventTypes.includes("text_delta");
-		const hasTextEnd = eventTypes.includes("text_end");
-		const hasDone = eventTypes.includes("done");
-
-		expect(hasTextStart).toBe(true); // text_start must be emitted
-		expect(hasTextDelta).toBe(true); // text_delta must be emitted
-		expect(hasTextEnd).toBe(true); // text_end must be emitted after completion
-		expect(hasDone).toBe(true); // done event must follow
+		const textLifecycle = emittedEvents.filter(
+			event => event.type === "text_start" || event.type === "text_delta" || event.type === "text_end",
+		);
+		expect(textLifecycle.map(event => event.type)).toEqual(["text_start", "text_delta", "text_end"]);
+		expect(eventTypes.includes("done")).toBe(true);
 
 		// Verify the order: text events should come before done
 		const textStartIdx = eventTypes.indexOf("text_start");
@@ -2128,6 +2211,7 @@ describe("Completion event handling (probepark fix for #6451)", () => {
 			(event): event is Extract<AssistantMessageEvent, { type: "done" }> => event.type === "done",
 		);
 		expect(getTextBlocks(doneEvent?.message).map(block => block.text)).toEqual(["Hello world"]);
+		expect(doneEvent?.message.content.filter(block => block.type === "text")).toHaveLength(1);
 	});
 
 	test("incomplete JSON frame with nested object: no resync into nested (Finding #3)", async () => {
@@ -2211,10 +2295,8 @@ describe("Completion event handling (probepark fix for #6451)", () => {
 		).toBe(false);
 	});
 
-	test("content + COMPLETED, then error event: text_end emitted before error (Finding #4)", async () => {
-		// Finding #4: When a server error event is received after COMPLETED,
-		// all text events including text_end should be emitted before the error.
-		const emittedEvents: Array<{ type: string }> = [];
+	test("post-completion error in a later read still suppresses text before clean EOF", async () => {
+		const emittedEvents: AssistantMessageEvent[] = [];
 
 		globalThis.fetch = (async () => {
 			const eventSequence = [
@@ -2242,25 +2324,21 @@ describe("Completion event handling (probepark fix for #6451)", () => {
 		try {
 			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
 			for await (const event of stream) {
-				emittedEvents.push({ type: event.type });
+				emittedEvents.push(event);
 			}
 		} catch {
 			// Stream error handling
 		}
 
-		// Verify event sequence includes text_end before error
-		const eventTypes = emittedEvents.map(e => e.type);
-		const hasTextStart = eventTypes.includes("text_start");
-		const hasTextEnd = eventTypes.includes("text_end");
-		const hasError = eventTypes.includes("error");
-
-		expect(hasTextStart).toBe(true); // text_start should be emitted
-		expect(hasTextEnd).toBe(true); // text_end should be emitted before error
-		expect(hasError).toBe(true); // error event follows
-
-		// Verify order: text_end comes before error
-		const textEndIdx = eventTypes.indexOf("text_end");
-		const errorIdx = eventTypes.indexOf("error");
-		expect(textEndIdx).toBeLessThan(errorIdx);
+		const errorEvent = emittedEvents.find(
+			(event): event is Extract<AssistantMessageEvent, { type: "error" }> => event.type === "error",
+		);
+		expect(errorEvent?.error.errorMessage).toContain("Internal server error");
+		expect(getTextBlocks(errorEvent?.error)).toHaveLength(0);
+		expect(
+			emittedEvents.some(
+				event => event.type === "text_start" || event.type === "text_delta" || event.type === "text_end",
+			),
+		).toBe(false);
 	});
 });
