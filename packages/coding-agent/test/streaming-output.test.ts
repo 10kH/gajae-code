@@ -926,6 +926,18 @@ describe("OutputSink maxColumns (per-line cap)", () => {
 		expect(dumped.outputBytes).toBe(byteLength(`${"x".repeat(64 * 1024 - 1)}…\nshort\n`));
 	});
 
+	test("keeps later cap batches after head overflow in stream order", async () => {
+		const input = `é${"x".repeat(64 * 1024 - 1)}Z`;
+		const sink = new OutputSink({ headBytes: 1, maxColumns: 70_000, spillThreshold: 200_000 });
+		await sink.push(input);
+
+		const dumped = await sink.dump();
+		expect(dumped.output).toBe(input);
+		expect(dumped.totalBytes).toBe(byteLength(input));
+		expect(dumped.outputBytes).toBe(byteLength(input));
+		expect(dumped.truncated).toBe(false);
+	});
+
 	test("limits each cap transformation batch for a single large callback", async () => {
 		const input = "x\n".repeat(64 * 1024);
 		const originalSubstring = String.prototype.substring;
@@ -951,6 +963,7 @@ describe("OutputSink maxColumns (per-line cap)", () => {
 			substringSpy.mockRestore();
 		}
 
+		expect(largestTransformInputChars).toBeGreaterThan(0);
 		expect(largestTransformInputChars).toBeLessThanOrEqual(64 * 1024);
 	});
 

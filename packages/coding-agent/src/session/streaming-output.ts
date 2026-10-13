@@ -1308,6 +1308,7 @@ export class OutputSink {
 				return;
 			}
 			const headSlice = truncateHeadBytes(visibleChunk, room);
+			this.#headRetentionDisabled = true;
 			if (headSlice.bytes > 0) {
 				this.#appendHead(headSlice.text, headSlice.bytes);
 				tailChunk = visibleChunk.substring(headSlice.text.length);
