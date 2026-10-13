@@ -79,6 +79,7 @@ describe("MCP command quarantine", () => {
 			"return { ...runMcp(), prompt: command.text };",
 			"return { prompt: command.text, extra: runMcp() };",
 			"return { prompt: command.text, prompt: runMcp() };",
+			"return { get prompt() { runMcp(); return command.text; } };",
 		]) {
 			const exposed = registryWithEntries([
 				exactMcpTuiEntry.replace("return { prompt: command.text };", fallback),
