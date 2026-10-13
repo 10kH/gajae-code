@@ -1155,6 +1155,26 @@ export function oauthCredentialMatchesOrganization(
 }
 
 /**
+ * The items an `org:` selector designates. An exact organization-id match wins
+ * over display-name matches, because names are not unique: two organizations
+ * can share a name, and a name can equal another organization's id. Callers
+ * must treat more than one result as ambiguous rather than picking one.
+ */
+export function selectOrganizationMatches<T>(
+	items: readonly T[],
+	value: string,
+	organizationOf: (item: T) => Pick<OAuthCredentials, "organizationId" | "organizationName"> | undefined,
+): T[] {
+	const wanted = value.trim().toLowerCase();
+	const matches = items.filter(item => {
+		const organization = organizationOf(item);
+		return organization !== undefined && oauthCredentialMatchesOrganization(organization, wanted);
+	});
+	const exact = matches.filter(item => organizationOf(item)?.organizationId?.trim().toLowerCase() === wanted);
+	return exact.length > 0 ? exact : matches;
+}
+
+/**
  * Human-facing identity of a stored OAuth credential. The organization name is
  * appended because one account (same email) can hold one credential per
  * organization.
@@ -2131,8 +2151,9 @@ export class AuthStorage {
 			);
 		}
 		const allRows = this.#store.listCredentialInventory?.(storageProvider) ?? [];
-		const matchingCredentials = this.#getStoredCredentials(storageProvider).filter(entry =>
-			this.#credentialMatchesSelector(entry, selector),
+		const matchingCredentials = this.#entriesDesignatedBySelector(
+			this.#getStoredCredentials(storageProvider),
+			selector,
 		);
 		const matchingIds = new Set(matchingCredentials.map(entry => entry.id));
 		const matchingRows = allRows.filter(
@@ -2182,7 +2203,7 @@ export class AuthStorage {
 				"ambiguous",
 				storageProvider,
 				selector,
-				`Selector ${this.#formatCredentialSelector(selector)} matches multiple OAuth credentials; choose id:<row-id>`,
+				`Selector ${this.#formatCredentialSelector(selector)} matches multiple OAuth credentials (ids: ${matchingRows.map(row => row.id).join(", ")}); choose one with id:<row-id>`,
 				matchingRows.map(row => row.id),
 			);
 		}
@@ -2229,10 +2250,9 @@ export class AuthStorage {
 		this.#usageCache.deletePrefix?.("reports:");
 		for (const [scopeId, selectors] of this.#sessionCredentialSelectors) {
 			const selector = selectors.get(storageProvider);
-			const selected = selector
-				? previousEntries.find(entry => this.#credentialMatchesSelector(entry, selector))
-				: undefined;
-			if (selected && removed.has(selected.id)) this.clearSessionCredentialSelector(storageProvider, scopeId);
+			const selected = selector ? this.#entriesSelectedBySelector(previousEntries, selector) : [];
+			if (selected.some(entry => removed.has(entry.id)))
+				this.clearSessionCredentialSelector(storageProvider, scopeId);
 		}
 		for (const [sessionId, sticky] of this.#sessionLastCredential.get(storageProvider) ?? []) {
 			if (removed.has(previousEntries[sticky.index]?.id ?? -1))
@@ -3017,11 +3037,51 @@ export class AuthStorage {
 
 	#findCredentialBySelector(provider: string, selector: AuthCredentialSelector): IndexedStoredCredential | undefined {
 		const stored = this.#getStoredCredentials(provider);
-		for (let index = 0; index < stored.length; index++) {
-			const entry = stored[index];
-			if (entry && this.#credentialMatchesSelector(entry, selector)) return { ...entry, index };
+		const designated = this.#entriesDesignatedBySelector(stored, selector);
+		// Organization names are not unique, so an organization selector naming several rows is rejected rather than
+		// resolved to the first. Email/account/project selectors keep resolving to the first row: pins persisted in
+		// config and session history use those kinds, and they are not organization-aware.
+		if (selector.kind === "org" && designated.length > 1) {
+			const ids = designated.map(entry => entry.id);
+			throw new OAuthCredentialSelectorError(
+				"ambiguous",
+				resolveOAuthStorageProvider(provider),
+				selector,
+				`Selector ${this.#formatCredentialSelector(selector)} matches multiple stored credentials for ${provider} (ids: ${ids.join(", ")}); choose one with id:<row-id>`,
+				ids,
+			);
 		}
-		return undefined;
+		const [entry] = designated;
+		return entry ? { ...entry, index: stored.indexOf(entry) } : undefined;
+	}
+
+	/**
+	 * Rows whose removal invalidates a selector, mirroring {@link AuthStorage.#findCredentialBySelector}: the row an
+	 * email/account/project/id selector resolves to (the first match), or every row an `org:` selector designates,
+	 * because removing one of several designated organizations would otherwise retarget the selector to another.
+	 */
+	#entriesSelectedBySelector<T extends StoredCredential>(
+		entries: readonly T[],
+		selector: AuthCredentialSelector,
+	): T[] {
+		const designated = this.#entriesDesignatedBySelector(entries, selector);
+		return selector.kind === "org" ? designated : designated.slice(0, 1);
+	}
+
+	/**
+	 * Every stored row a selector designates. An `org:` value prefers an exact organization-id match over
+	 * display-name matches; more than one designated row means the selector is ambiguous.
+	 */
+	#entriesDesignatedBySelector<T extends StoredCredential>(
+		entries: readonly T[],
+		selector: AuthCredentialSelector,
+	): T[] {
+		if (selector.kind === "org") {
+			return selectOrganizationMatches(entries, selector.value, entry =>
+				entry.credential.type === "oauth" ? entry.credential : undefined,
+			);
+		}
+		return entries.filter(entry => this.#credentialMatchesSelector(entry, selector));
 	}
 
 	#credentialMatchesInventorySelector(row: CredentialInventoryRecord, selector: AuthCredentialSelector): boolean {
@@ -3345,8 +3405,8 @@ export class AuthStorage {
 		for (const [scopeId, selectors] of this.#sessionCredentialSelectors) {
 			const selector = selectors.get(storageProvider);
 			if (!selector) continue;
-			const selected = previousEntries.find(entry => this.#credentialMatchesSelector(entry, selector));
-			if (selected && removedIds.has(selected.id)) {
+			const selected = this.#entriesSelectedBySelector(previousEntries, selector);
+			if (selected.some(entry => removedIds.has(entry.id))) {
 				this.markSessionCredentialUnavailable(scopeId, storageProvider, selector);
 			}
 		}
