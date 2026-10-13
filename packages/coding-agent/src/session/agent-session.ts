@@ -23310,25 +23310,57 @@ export class AgentSession {
 			matchingRowIds.unshift(credentialRowId);
 		}
 		if (matchingRowIds.length === 0) return undefined;
+		const inventory = authStorage.listCredentialInventory(candidate.provider);
+		const failedCredential =
+			inventory.find(credential => credential.id === credentialRowId) ??
+			inventory.find(credential => matchingRowIds.includes(credential.id));
+		const credentialKind =
+			failedCredential?.credentialKind ??
+			authStorage.getSessionCredentialType(candidate.provider, this.credentialSessionId);
+		if (credentialKind === undefined) return undefined;
 		for (const failedRowId of matchingRowIds) {
 			if (failedRowIds.has(failedRowId)) continue;
 			failedRowIds.add(failedRowId);
-			await this.#markFailedCredential({
-				class: "quota",
+			await authStorage.markUsageLimitReached(candidate.provider, this.credentialSessionId, {
 				retryAfterMs,
-				continueOnPeerResolutionFailure: true,
-				model: candidate,
-				credentialRowId: failedRowId,
+				owner: this.#modelRegistry.getAuthStorageOwner(),
+				rowId: failedRowId,
 			});
 		}
-		const nextRowId = authStorage.getSessionCredentialRowId(candidate.provider, this.credentialSessionId);
-		if (nextRowId === undefined || failedRowIds.has(nextRowId)) return undefined;
-		// Resolve the rotated row by id: a bare lookup re-ranks the pool and can land back
-		// on a row whose backoff has already run out.
-		const rotatedApiKey = await this.#modelRegistry.getApiKey(candidate, this.credentialSessionId, {
-			credentialSelector: { kind: "id", value: String(nextRowId) },
-		});
-		return isAuthenticated(rotatedApiKey) ? { apiKey: rotatedApiKey, credentialRowId: nextRowId } : undefined;
+		// A row's backoff can expire while compaction is in flight and move the
+		// sticky pointer back to a row this rotation already tried. Scan the live
+		// inventory and exclude every failed row instead of trusting that pointer.
+		for (const peer of inventory) {
+			if (
+				peer.credentialKind !== credentialKind ||
+				failedRowIds.has(peer.id) ||
+				peer.disabled ||
+				!authStorage.isCredentialAvailable(candidate.provider, peer.id)
+			) {
+				continue;
+			}
+			let resolved: { apiKey: string | undefined; credentialRowId: number | undefined };
+			try {
+				resolved = await this.#modelRegistry.getApiKeyWithCredentialRowId(candidate, this.credentialSessionId, {
+					credentialSelector: { kind: "id", value: String(peer.id) },
+				});
+			} catch (error) {
+				logger.warn("Failed to resolve stored credential while rotating auto-compaction", {
+					provider: candidate.provider,
+					credentialId: peer.id,
+					errorType: error instanceof Error ? error.name : typeof error,
+				});
+				continue;
+			}
+			if (
+				resolved.credentialRowId === peer.id &&
+				isAuthenticated(resolved.apiKey) &&
+				authStorage.isCredentialAvailable(candidate.provider, peer.id)
+			) {
+				return { apiKey: resolved.apiKey, credentialRowId: peer.id };
+			}
+		}
+		return undefined;
 	}
 
 	async #resolveCompactionCandidate(
@@ -25592,7 +25624,7 @@ export class AgentSession {
 			authStorage.hasRuntimeApiKey(provider) ||
 			authStorage.hasRuntimeCredentialSelector(provider) ||
 			authStorage.hasSessionCredentialSelector(provider, this.credentialSessionId) ||
-			authStorage.hasConfigApiKey(provider, this.#modelRegistry.getAuthStorageOwner())
+			authStorage.hasLiteralConfigApiKey(provider, this.#modelRegistry.getAuthStorageOwner())
 		);
 	}
 

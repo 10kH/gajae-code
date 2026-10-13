@@ -3127,12 +3127,14 @@ export class AuthStorage {
 				`Credential selector ${this.#formatCredentialSelector(selector)} cannot be used for ${provider} while a runtime API key override is active`,
 			);
 		}
-		if (this.#hasConfigOverride(provider, owner)) {
+		const selected = this.#findCredentialBySelector(provider, selector);
+		const configOverride = this.#configOverrideRegistration(provider, owner);
+		if (configOverride && !(configOverride.envSourced && selected?.credential.type === "api_key")) {
 			throw new Error(
 				`Credential selector ${this.#formatCredentialSelector(selector)} cannot be used for ${provider} while a config API key override is active`,
 			);
 		}
-		if (!this.#findCredentialBySelector(provider, selector)) {
+		if (!selected) {
 			throw new Error(`No credential found for ${provider} matching ${this.#formatCredentialSelector(selector)}`);
 		}
 	}

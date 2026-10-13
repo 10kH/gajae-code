@@ -117,6 +117,92 @@ describe("auto-compaction usage limit rotates the session credential", () => {
 		expect(ends[0]?.result).toBeDefined();
 	});
 
+	it("rotates a stored row when an env-sourced config key is also configured", async () => {
+		let credentialSessionId: string | undefined;
+		for (let index = 0; index < 100; index++) {
+			const candidate = `compaction-env-config-${index}`;
+			if (Bun.hash.xxHash32(candidate) % 2 === 0) {
+				credentialSessionId = candidate;
+				break;
+			}
+		}
+		if (credentialSessionId === undefined) throw new Error("expected a session seed selecting the first credential");
+		session = createSession(credentialSessionId);
+		authStorage.setConfigApiKey("openai-codex", "env-configured-key", {
+			envSourced: true,
+			owner: session.modelRegistry.getAuthStorageOwner(),
+		});
+		expect(authStorage.hasLiteralConfigApiKey("openai-codex", session.modelRegistry.getAuthStorageOwner())).toBe(
+			false,
+		);
+		const model = getBundledModel("openai-codex", "gpt-5.4-mini");
+		if (!model) throw new Error("Expected bundled test model");
+		const initial = await session.modelRegistry.getApiKeyWithCredentialRowId(model, credentialSessionId);
+		expect(initial.apiKey).toBe("codex-key-1");
+		expect(initial.credentialRowId).toBeDefined();
+		const matchingRows = vi.spyOn(authStorage, "getCredentialRowIdsMatchingApiKey");
+		const markUsageLimitReached = vi.spyOn(authStorage, "markUsageLimitReached");
+		const ends = collectCompactionEnds(session);
+		const compactSpy = stubCompact((apiKey, firstKey) => apiKey === firstKey);
+
+		await session.runIdleCompaction();
+
+		const keys = compactSpy.mock.calls.map(call => call[2]);
+		expect(matchingRows).toHaveBeenCalled();
+		expect(markUsageLimitReached).toHaveBeenCalledTimes(1);
+		expect(keys).toEqual(["codex-key-1", "codex-key-2"]);
+		expect(ends).toHaveLength(1);
+		expect(ends[0]?.errorMessage).toBeUndefined();
+		expect(ends[0]?.result).toBeDefined();
+	});
+
+	it("falls back to the retry policy when an alternate credential resolver rejects", async () => {
+		authStorage.close();
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"), {
+			configValueResolver: async config => {
+				if (config === "codex-key-2") throw new Error("sibling resolver failure");
+				return config;
+			},
+		});
+		await authStorage.set("openai-codex", [
+			{ type: "api_key", key: "codex-key-1" },
+			{ type: "api_key", key: "codex-key-2" },
+		]);
+		const dispatchedRow = authStorage
+			.exportSnapshot()
+			.credentials.find(
+				entry =>
+					entry.provider === "openai-codex" &&
+					entry.credential.type === "api_key" &&
+					entry.credential.key === "codex-key-1",
+			);
+		if (!dispatchedRow) throw new Error("test setup did not create the dispatched credential");
+		let credentialSessionId: string | undefined;
+		for (let index = 0; index < 100; index++) {
+			const candidate = `compaction-resolver-retry-${index}`;
+			try {
+				const resolved = await authStorage.getApiKeyWithCredentialRowId("openai-codex", candidate);
+				if (resolved.apiKey === "codex-key-1" && resolved.credentialRowId === dispatchedRow.id) {
+					credentialSessionId = candidate;
+					break;
+				}
+			} catch {
+				// This candidate selected the deliberately rejecting sibling.
+			}
+		}
+		if (credentialSessionId === undefined) throw new Error("expected a session seed selecting the healthy first row");
+		session = createSession(credentialSessionId);
+		const ends = collectCompactionEnds(session);
+		const compactSpy = stubCompact(() => true);
+
+		await session.runIdleCompaction();
+
+		const keys = compactSpy.mock.calls.map(call => call[2]);
+		expect(keys).toEqual(Array(MAX_RETRIES + 1).fill("codex-key-1"));
+		expect(ends).toHaveLength(1);
+		expect(ends[0]?.errorMessage).toContain("usage limit has been reached");
+	});
+
 	it("continues past an unrelated stored credential resolver rejection during rotation", async () => {
 		authStorage.close();
 		let siblingResolverCalls = 0;
@@ -164,7 +250,7 @@ describe("auto-compaction usage limit rotates the session credential", () => {
 		});
 		expect(compactSpy.mock.calls).toHaveLength(2);
 		expect(compactSpy.mock.calls[1]?.[2]).toBe("codex-key-3");
-		expect(warning).toHaveBeenCalledWith("Failed to resolve stored credential while selecting an alternate", {
+		expect(warning).toHaveBeenCalledWith("Failed to resolve stored credential while rotating auto-compaction", {
 			provider: "openai-codex",
 			credentialId: siblingRow.id,
 			errorType: "Error",
@@ -250,7 +336,9 @@ describe("auto-compaction usage limit rotates the session credential", () => {
 		vi.spyOn(session.modelRegistry, "getApiKeyWithCredentialRowId").mockImplementation(
 			async (model, sessionId, options) => {
 				const resolved = await resolveApiKey(model, sessionId, options);
-				if (model.provider === "openai-codex") dispatchedRowId = resolved.credentialRowId;
+				if (model.provider === "openai-codex" && options?.credentialSelector === undefined) {
+					dispatchedRowId = resolved.credentialRowId;
+				}
 				return resolved;
 			},
 		);
@@ -281,27 +369,47 @@ describe("auto-compaction usage limit rotates the session credential", () => {
 		expect(ends[0]?.errorMessage).toContain("usage limit has been reached");
 	});
 
-	it("stops rotating when a row it already failed on comes back off backoff", async () => {
-		session = createSession();
+	it("continues past an already-failed row whose backoff expires", async () => {
+		await authStorage.set("openai-codex", [
+			{ type: "api_key", key: "codex-key-1" },
+			{ type: "api_key", key: "codex-key-2" },
+			{ type: "api_key", key: "codex-key-3" },
+		]);
+		const firstRow = authStorage
+			.exportSnapshot()
+			.credentials.find(
+				entry =>
+					entry.provider === "openai-codex" &&
+					entry.credential.type === "api_key" &&
+					entry.credential.key === "codex-key-1",
+			);
+		if (!firstRow) throw new Error("test setup did not create the first credential");
+		let credentialSessionId: string | undefined;
+		for (let index = 0; index < 100; index++) {
+			const candidate = `compaction-expired-backoff-${index}`;
+			const initial = await authStorage.getApiKeyWithCredentialRowId("openai-codex", candidate);
+			if (initial.apiKey === "codex-key-1" && initial.credentialRowId === firstRow.id) {
+				credentialSessionId = candidate;
+				break;
+			}
+		}
+		if (credentialSessionId === undefined) throw new Error("expected a session seed selecting the first credential");
+		session = createSession(credentialSessionId);
 		const ends = collectCompactionEnds(session);
-		// A zero backoff makes every failed row available again at once, which is what a
-		// long compaction sees once the default backoff runs out mid-rotation.
+		// Expire each row immediately so the first failed row reappears ahead of the
+		// healthy third row when the second row fails.
 		const markUsageLimitReached = authStorage.markUsageLimitReached.bind(authStorage);
 		vi.spyOn(authStorage, "markUsageLimitReached").mockImplementation((provider, sessionId, options) =>
 			markUsageLimitReached(provider, sessionId, { ...options, retryAfterMs: 0 }),
 		);
-		let calls = 0;
-		const compactSpy = vi.spyOn(compactionModule, "compact").mockImplementation(async () => {
-			calls++;
-			// Bound a regression to a fast failure instead of an endless rotation.
-			if (calls > 10) throw new Error("test bound: compaction kept rotating between failed rows");
-			throw new Error(USAGE_LIMIT);
-		});
+		const compactSpy = stubCompact(apiKey => apiKey !== "codex-key-3");
 
 		await session.runIdleCompaction();
 
-		expect(compactSpy.mock.calls.length).toBeLessThanOrEqual(2 + MAX_RETRIES);
-		expect(ends[0]?.errorMessage).toContain("usage limit has been reached");
+		expect(compactSpy.mock.calls.map(call => call[2])).toEqual(["codex-key-1", "codex-key-2", "codex-key-3"]);
+		expect(ends).toHaveLength(1);
+		expect(ends[0]?.errorMessage).toBeUndefined();
+		expect(ends[0]?.result).toBeDefined();
 	});
 
 	it("stays within the retry policy when two stored rows resolve to the same key", async () => {
