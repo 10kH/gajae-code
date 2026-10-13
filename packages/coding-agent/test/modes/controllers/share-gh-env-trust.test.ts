@@ -353,6 +353,18 @@ DYLD_ROOT_PATH=/project/root
 		expect(spawns).toEqual([]);
 	});
 
+	it("refuses a checkout-relative operator PATH instead of resolving gh from the checkout", async () => {
+		const spawns = await share({
+			autoload: true,
+			dotenv: "OTHER=1\n",
+			env: {
+				PATH: "bin",
+			},
+			noSpawnError: "GitHub CLI (gh) is not installed on the trusted operator PATH",
+		});
+		expect(spawns).toEqual([]);
+	});
+
 	it("keeps an operator host and config directory the project does not declare", async () => {
 		const spawns = await share({
 			dotenv: "OTHER=1\n",

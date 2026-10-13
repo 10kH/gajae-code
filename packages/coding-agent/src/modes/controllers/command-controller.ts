@@ -155,7 +155,12 @@ function resolveGhShareExecutable(): string | undefined {
 		(declared !== undefined && (ghShareProjectSnapshot.dynamic.has(key) || declared.trim() === operatorPath.trim()))
 	)
 		return undefined;
-	return Bun.which("gh", { PATH: operatorPath }) ?? undefined;
+	const trustedPath = operatorPath
+		.split(path.delimiter)
+		.filter(directory => path.isAbsolute(directory))
+		.join(path.delimiter);
+	if (!trustedPath) return undefined;
+	return Bun.which("gh", { PATH: trustedPath }) ?? undefined;
 }
 
 /**
