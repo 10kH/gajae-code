@@ -3,6 +3,7 @@
 #[cfg(any(unix, test))]
 use std::io::{self, Read};
 use std::{
+	ffi::{OsStr, OsString},
 	panic::{AssertUnwindSafe, catch_unwind},
 	path::{Component, Path, PathBuf},
 	sync::{
@@ -1146,6 +1147,113 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
 	let mut hasher = Sha256::new();
 	hasher.update(bytes);
 	hasher.finalize().into()
+}
+
+const DIRECTORY_TREE_TRANSITION_SUFFIX: &str = ".removing";
+const MAX_DIRECTORY_TREE_COMPONENT_BYTES: usize = 255;
+
+fn directory_tree_transition_name(original_basename: &OsStr) -> Option<OsString> {
+	let original_basename_bytes = original_basename.as_encoded_bytes();
+	if original_basename_bytes.ends_with(DIRECTORY_TREE_TRANSITION_SUFFIX.as_bytes()) {
+		return Some(original_basename.to_os_string());
+	}
+	let derived_length = original_basename_bytes
+		.len()
+		.checked_add(DIRECTORY_TREE_TRANSITION_SUFFIX.len())?;
+	if derived_length <= MAX_DIRECTORY_TREE_COMPONENT_BYTES {
+		let mut transition_name = original_basename.to_os_string();
+		transition_name.push(DIRECTORY_TREE_TRANSITION_SUFFIX);
+		return Some(transition_name);
+	}
+
+	let mut hashed_name = String::with_capacity(10 + 64 + DIRECTORY_TREE_TRANSITION_SUFFIX.len());
+	hashed_name.push_str(".gjc-lock-");
+	for byte in sha256(original_basename_bytes) {
+		hashed_name.push(char::from(b"0123456789abcdef"[usize::from(byte >> 4)]));
+		hashed_name.push(char::from(b"0123456789abcdef"[usize::from(byte & 0x0f)]));
+	}
+	hashed_name.push_str(DIRECTORY_TREE_TRANSITION_SUFFIX);
+	Some(OsString::from(hashed_name))
+}
+
+#[cfg(test)]
+mod directory_tree_transition_name_tests {
+	use std::ffi::{OsStr, OsString};
+
+	use super::{
+		DIRECTORY_TREE_TRANSITION_SUFFIX, MAX_DIRECTORY_TREE_COMPONENT_BYTES,
+		directory_tree_transition_name, sha256,
+	};
+
+	#[test]
+	fn transition_name_preserves_short_names_and_uses_utf8_byte_lengths() {
+		assert_eq!(
+			directory_tree_transition_name(OsStr::new("lock")),
+			Some(OsString::from("lock.removing")),
+		);
+
+		let unicode_at_limit = "é".repeat(123);
+		assert_eq!(unicode_at_limit.len() + DIRECTORY_TREE_TRANSITION_SUFFIX.len(), 255);
+		assert_eq!(
+			directory_tree_transition_name(OsStr::new(&unicode_at_limit)),
+			Some(OsString::from(format!("{unicode_at_limit}{DIRECTORY_TREE_TRANSITION_SUFFIX}"))),
+		);
+
+		let unicode_over_limit = "é".repeat(124);
+		assert_eq!(unicode_over_limit.len(), 248);
+		let hashed = directory_tree_transition_name(OsStr::new(&unicode_over_limit))
+			.expect("long UTF-8 basename should hash");
+		let hashed = hashed.to_str().expect("hash name is UTF-8");
+		assert!(hashed.starts_with(".gjc-lock-"));
+		assert!(hashed.ends_with(DIRECTORY_TREE_TRANSITION_SUFFIX));
+		assert!(hashed.len() <= MAX_DIRECTORY_TREE_COMPONENT_BYTES);
+	}
+
+	#[test]
+	fn basenames_of_255_bytes_get_deterministic_distinct_hashes() {
+		let first = "a".repeat(255);
+		let second = "b".repeat(255);
+		let first_name =
+			directory_tree_transition_name(OsStr::new(&first)).expect("255-byte basename should hash");
+		let repeated_first_name = directory_tree_transition_name(OsStr::new(&first))
+			.expect("same basename should hash deterministically");
+		let second_name = directory_tree_transition_name(OsStr::new(&second))
+			.expect("second 255-byte basename should hash");
+
+		assert_eq!(first_name, repeated_first_name);
+		assert_ne!(first_name, second_name);
+		let digest = sha256(first.as_bytes());
+		let expected_hash: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+		let expected_name = format!(".gjc-lock-{expected_hash}{DIRECTORY_TREE_TRANSITION_SUFFIX}");
+		assert_eq!(first_name.to_str(), Some(expected_name.as_str()));
+		assert!(first_name.to_str().expect("hash name is UTF-8").len() <= 255);
+	}
+
+	#[test]
+	fn transition_name_is_idempotent_for_replay_inputs() {
+		let already_transition = OsStr::new(".gjc-lock-deadbeef.removing");
+		assert_eq!(
+			directory_tree_transition_name(already_transition),
+			Some(OsString::from(already_transition)),
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn transition_name_preserves_short_non_utf8_unix_names() {
+		use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+		let original = OsString::from_vec(vec![b'l', 0xff, b'k']);
+		let mut expected = original.clone();
+		expected.push(DIRECTORY_TREE_TRANSITION_SUFFIX);
+		let derived = directory_tree_transition_name(&original).expect("short name should fit");
+		assert_eq!(derived.as_os_str().as_bytes(), b"l\xffk.removing");
+		assert_eq!(derived, expected);
+
+		let mut already_transitioned = original;
+		already_transitioned.push(DIRECTORY_TREE_TRANSITION_SUFFIX);
+		assert_eq!(directory_tree_transition_name(&already_transitioned), Some(already_transitioned),);
+	}
 }
 
 #[cfg(any(unix, test))]
@@ -2507,14 +2615,14 @@ pub(crate) mod platform {
 			fd::{AsRawFd, FromRawFd},
 			unix::ffi::OsStrExt,
 		},
-		path::{Component, Path},
+		path::{Component, Path, PathBuf},
 	};
 
 	use super::{
 		ExactFileIdentity, NativeCanonicalDirectoryIdentity, NativeDirectoryTreeEntry,
 		NativeDirectoryTreeResult, NativeDirectoryTreeSnapshot, NativeExactUnlinkResult,
-		NativeOwnerOnlySecurityResult, NativePermissionRepairResult, digest_reader, io_code,
-		security_io_code, sha256,
+		NativeOwnerOnlySecurityResult, NativePermissionRepairResult, digest_reader,
+		directory_tree_transition_name, io_code, security_io_code, sha256,
 	};
 
 	/// Bound on EINTR restarts for the no-replace rename primitive. A signal
@@ -7645,7 +7753,6 @@ pub(crate) mod platform {
 		detach_only: bool,
 	) -> NativeExactUnlinkResult {
 		let planned_path = path.to_string_lossy().into_owned();
-		let final_path = format!("{planned_path}.removing");
 		let (parent, name) = match open_parent_no_follow(path) {
 			Ok(value) => value,
 			Err(result) => return *result,
@@ -7663,9 +7770,18 @@ pub(crate) mod platform {
 				return NativeExactUnlinkResult::failure("parent_mismatch");
 			}
 		}
-		let mut final_bytes = name.as_bytes().to_vec();
-		final_bytes.extend_from_slice(b".removing");
-		let Ok(final_name) = CString::new(final_bytes) else {
+		let input_is_final = name.as_bytes().ends_with(b".removing");
+		let Some(final_component) =
+			directory_tree_transition_name(std::ffi::OsStr::from_bytes(name.as_bytes()))
+		else {
+			// SAFETY: this branch owns the live descriptor and closes it exactly once.
+			unsafe { libc::close(parent) };
+			return NativeExactUnlinkResult::failure("io_error");
+		};
+		let mut final_candidate = PathBuf::from(path);
+		final_candidate.set_file_name(&final_component);
+		let final_path = final_candidate.to_string_lossy().into_owned();
+		let Ok(final_name) = CString::new(final_component.as_os_str().as_bytes()) else {
 			// SAFETY: this branch owns the live descriptor and closes it exactly once.
 			unsafe { libc::close(parent) };
 			return NativeExactUnlinkResult::failure("io_error");
@@ -7673,7 +7789,6 @@ pub(crate) mod platform {
 		// A crash after the final no-replace rename is replayed from the single,
 		// caller-derivable sibling. This is not a search fallback: it is the only
 		// alternate retained authority for this exact planned root.
-		let input_is_final = name.as_bytes().ends_with(b".removing");
 		let (fd, root_name, retained_path, already_final) = {
 			// SAFETY: the live descriptor, where used, and NUL-terminated path remain
 			// valid.
@@ -10849,9 +10964,9 @@ mod platform {
 		ExactFileIdentity, NativeCanonicalDirectoryIdentity, NativeDirectoryTreeEntry,
 		NativeDirectoryTreeResult, NativeDirectoryTreeSnapshot, NativeExactUnlinkResult,
 		NativeOwnerOnlySecurityResult, NativePermissionRepairResult, STATUS_INVALID_PARAMETER,
-		STATUS_SHARING_VIOLATION, is_retryable_exact_replace_status, native_windows_error_code,
-		ntstatus_code, open_with_transient_retry, publication_rename_error_code, sha256,
-		volume_case_sensitivity_from_flags,
+		STATUS_SHARING_VIOLATION, directory_tree_transition_name, is_retryable_exact_replace_status,
+		native_windows_error_code, ntstatus_code, open_with_transient_retry,
+		publication_rename_error_code, sha256, volume_case_sensitivity_from_flags,
 	};
 
 	type UvGetOsfhandle = unsafe extern "C" fn(fd: i32) -> isize;
@@ -13974,17 +14089,14 @@ mod platform {
 		detach_only: bool,
 	) -> NativeExactUnlinkResult {
 		let planned_path = path.to_string_lossy().into_owned();
-		let final_path = format!("{planned_path}.removing");
-		let final_name: Vec<u16> = match path.file_name() {
-			Some(name) => {
-				let mut value: Vec<u16> = name.encode_wide().collect();
-				value.extend(".removing".encode_utf16());
-				value
-			},
+		let final_component = match path.file_name().and_then(directory_tree_transition_name) {
+			Some(name) => name,
 			None => return NativeExactUnlinkResult::failure("io_error"),
 		};
+		let final_name: Vec<u16> = final_component.encode_wide().collect();
 		let mut final_candidate = PathBuf::from(path);
-		final_candidate.set_file_name(OsString::from_wide(&final_name));
+		final_candidate.set_file_name(&final_component);
+		let final_path = final_candidate.to_string_lossy().into_owned();
 		let input_is_final = planned_path.ends_with(".removing");
 		let (root, retained_path, already_final) = match open_exact(
 			path,

@@ -257,7 +257,10 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/session/managed-lock-lease.windows.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/sdk-session-index-fsync.windows.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/sdk-session-index-lock-contention.test.ts");
+		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/file-lock-empty-dir.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/file-lock-signed-identity.test.ts");
+		expect(windowsJob).toContain("crates/pi-natives/src/path_identity.rs");
+		expect(windowsJob).toContain("bun test ./packages/natives/test/path-identity-windows.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/session-state-lock.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/natives/test/windows-runtime-install.windows.test.ts");
 		// The required predicate must textually match the job gate so the aggregate
@@ -265,7 +268,11 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(windowsJob).toContain("bun test ./packages/natives/test/walker-pool-unavailable.windows.test.ts");
 		const requiredLines = workflow.split("\n").filter(line => line.includes("CI_DEV_WINDOWS_DOCTOR_REQUIRED:"));
 		expect(requiredLines.length).toBe(2);
-		for (const line of requiredLines) expect(line).toContain("|| needs.affected-plan.outputs.has_windows_session_path == 'true'");
+		for (const line of requiredLines) {
+			expect(line).toContain("|| needs.affected-plan.outputs.has_windows_session_path == 'true'");
+			expect(line).toContain("packages/coding-agent/test/file-lock-empty-dir.test.ts");
+			expect(line).toContain("crates/pi-natives/src/path_identity.rs");
+		}
 	});
 
 	describe("detached evidence subprocess contract", () => {
@@ -1384,6 +1391,16 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(isWindowsSessionPathRegressionPath("packages/utils/test/env.test.ts")).toBe(false);
 		expect(isWindowsSessionPathRegressionPath("packages/coding-agent/src/session/session-store.ts")).toBe(false);
 		expect(needsWindowsSessionPathRegression(["packages/coding-agent/src/edit/foo.ts"])).toBe(false);
+	});
+
+	test("routes empty lock-directory and native path identity changes to Windows", () => {
+		for (const changedPath of [
+			"packages/coding-agent/test/file-lock-empty-dir.test.ts",
+			"crates/pi-natives/src/path_identity.rs",
+		]) {
+			expect(isWindowsSessionPathRegressionPath(changedPath)).toBe(true);
+			expect(needsWindowsSessionPathRegression([changedPath])).toBe(true);
+		}
 	});
 
 	test("a deleted test path is not scheduled as a runnable test shard", () => {

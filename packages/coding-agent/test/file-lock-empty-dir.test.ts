@@ -23,7 +23,6 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
-	FileLockTestHooks.afterOwnerlessLockStaleVerdict = undefined;
 	FileLockTestHooks.beforeDetachedLockCleanup = undefined;
 	FileLockTestHooks.beforeRemovalRecordUnlink = undefined;
 	FileLockTestHooks.beforeRemovalOwnerPublish = undefined;
@@ -41,9 +40,18 @@ afterEach(async () => {
 });
 
 async function createTempDir(): Promise<string> {
-	const dir = path.join(os.tmpdir(), `file-lock-empty-dir-${crypto.randomUUID()}`);
-	const forget = registerOwnedDeletionRoot(dir);
+	const canonicalTempRoot = await fs.realpath(os.tmpdir());
+	const dir = path.join(canonicalTempRoot, `file-lock-empty-dir-${crypto.randomUUID()}`);
+	const forgetRoots: (() => void)[] = [];
+	const forget = () => {
+		for (const forgetRoot of forgetRoots) forgetRoot();
+	};
 	try {
+		forgetRoots.push(registerOwnedDeletionRoot(dir));
+		// Native Windows cleanup may use an extended-length spelling while
+		// realpath(os.tmpdir()) is unprefixed; authorize only this fixture in both.
+		const namespacedDir = path.toNamespacedPath(dir);
+		if (namespacedDir !== dir) forgetRoots.push(registerOwnedDeletionRoot(namespacedDir));
 		await fs.mkdir(dir, { mode: 0o700 });
 	} catch (error) {
 		forget();
@@ -65,30 +73,31 @@ async function writeRemovalOwnerRecord(
 	);
 }
 
-test("reclaims an aged empty ownerless lock directory on POSIX and reports manual cleanup on Windows", async () => {
+test("fails closed on an aged empty ownerless Windows lock directory", async () => {
 	const tempDir = await createTempDir();
 	const filePath = path.join(tempDir, "index.jsonl");
 	const lockDir = `${filePath}.lock`;
 	await fs.mkdir(lockDir);
 	const pastTime = new Date(Date.now() - 60_000);
 	await fs.utimes(lockDir, pastTime, pastTime);
+	const originalIdentity = await fs.stat(lockDir, { bigint: true });
 
-	const result = await withFileLock(filePath, async () => "entered", {
-		retries: 2,
-		retryDelayMs: 1,
-		staleMs: 0,
-	}).then(
-		(value) => ({ ok: true as const, value }),
-		(error: unknown) => ({ ok: false as const, error }),
-	);
-	// On Windows, aged empty lock directories are now reclaimed and acquisition succeeds
-	if (result.ok) {
-		expect((result as { ok: true; value: string }).value).toBe("entered");
-		await expect(fs.lstat(lockDir)).rejects.toMatchObject({ code: "ENOENT" });
-	} else {
-		// Fallback for unexpected failure
-		expect(((result as { ok: false; error: unknown }).error as Error).message).toContain(`Remove-Item -LiteralPath '${lockDir}' -Recurse -Force`);
-	}
+	let callbackEntered = false;
+	await expect(
+		withFileLock(
+			filePath,
+			async () => {
+				callbackEntered = true;
+			},
+			{ retries: 2, retryDelayMs: 1, staleMs: 0 },
+		),
+	).rejects.toMatchObject({ code: "acquire_timeout" });
+
+	expect(callbackEntered).toBe(false);
+	expect(await fs.readdir(lockDir)).toEqual([]);
+	const remainingIdentity = await fs.stat(lockDir, { bigint: true });
+	expect(remainingIdentity.dev).toBe(originalIdentity.dev);
+	expect(remainingIdentity.ino).toBe(originalIdentity.ino);
 });
 
 test("does not reclaim an aged ownerless lock directory that contains entries", async () => {
@@ -106,30 +115,70 @@ test("does not reclaim an aged ownerless lock directory that contains entries", 
 	expect(await Bun.file(path.join(lockDir, "unexpected")).text()).toBe("preserve");
 });
 
-test("reclaims an aged ownerless Windows session-index lock on the final configured attempt", async () => {
+test("does not steal an aged empty session-index lock while a legacy writer is paused", async () => {
 	const tempDir = await createTempDir();
 	const filePath = path.join(tempDir, "sdk", "sessions", "index.jsonl");
 	const lockDir = `${filePath}.lock`;
 	await fs.mkdir(lockDir, { recursive: true });
 	const pastTime = new Date(Date.now() - 60_000);
 	await fs.utimes(lockDir, pastTime, pastTime);
-
-	let callbackEntered = false;
-	const acquisitionError = await withFileLock(
-		filePath,
-		async () => {
-			callbackEntered = true;
-			if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
-		},
-		{ retries: 1, retryDelayMs: 1, staleMs: 0 },
-	).then(
+	const originalIdentity = await fs.stat(lockDir, { bigint: true });
+	const infoPath = path.join(lockDir, "info");
+	const ownerBytes = JSON.stringify({ pid: process.pid, timestamp: pastTime.getTime() });
+	let resumeLegacyWriter!: () => void;
+	const writerMayPublish = new Promise<void>(resolve => {
+		resumeLegacyWriter = resolve;
+	});
+	const legacyWrite = (async () => {
+		await writerMayPublish;
+		await fs.writeFile(infoPath, ownerBytes);
+	})().then(
 		() => null,
-		error => error,
+		(error: unknown) => error,
 	);
 
-	expect(acquisitionError).toBeNull();
-	expect(callbackEntered).toBe(true);
-	await expect(fs.lstat(lockDir)).rejects.toMatchObject({ code: "ENOENT" });
+	let callbackEntered = false;
+	try {
+		await expect(
+			withFileLock(
+				filePath,
+				async () => {
+					callbackEntered = true;
+				},
+				{ retries: 2, retryDelayMs: 1, staleMs: 0 },
+			),
+		).rejects.toMatchObject({ code: "acquire_timeout" });
+		expect(callbackEntered).toBe(false);
+		const identityWhileLegacyWriterIsPaused = await fs.stat(lockDir, { bigint: true });
+		expect(identityWhileLegacyWriterIsPaused.dev).toBe(originalIdentity.dev);
+		expect(identityWhileLegacyWriterIsPaused.ino).toBe(originalIdentity.ino);
+	} finally {
+		resumeLegacyWriter();
+	}
+	expect(await legacyWrite).toBeNull();
+
+	expect(callbackEntered).toBe(false);
+	expect(await fs.readFile(infoPath, "utf8")).toBe(ownerBytes);
+	const identityAfterLegacyWrite = await fs.stat(lockDir, { bigint: true });
+	expect(identityAfterLegacyWrite.dev).toBe(originalIdentity.dev);
+	expect(identityAfterLegacyWrite.ino).toBe(originalIdentity.ino);
+	await fs.utimes(lockDir, pastTime, pastTime);
+
+	await expect(
+		withFileLock(
+			filePath,
+			async () => {
+				callbackEntered = true;
+			},
+			{ retries: 2, retryDelayMs: 1, staleMs: 0 },
+		),
+	).rejects.toMatchObject({ code: "acquire_timeout" });
+
+	expect(callbackEntered).toBe(false);
+	expect(await fs.readFile(infoPath, "utf8")).toBe(ownerBytes);
+	const finalIdentity = await fs.stat(lockDir, { bigint: true });
+	expect(finalIdentity.dev).toBe(originalIdentity.dev);
+	expect(finalIdentity.ino).toBe(originalIdentity.ino);
 });
 
 test("publishes a Windows retirement owner record before native detach", async () => {
@@ -320,10 +369,11 @@ test("resumes an ownerless detached cleanup after a transient cleanup refusal", 
 	const filePath = path.join(tempDir, "sdk", "sessions", "index.jsonl");
 	const lockDir = `${filePath}.lock`;
 	const transitionPath = `${lockDir}.removing`;
-	await fs.mkdir(lockDir, { recursive: true });
+	await fs.mkdir(transitionPath, { recursive: true });
 	const pastTime = new Date(Date.now() - 60_000);
-	await fs.utimes(lockDir, pastTime, pastTime);
+	await fs.utimes(transitionPath, pastTime, pastTime);
 	let refuseCleanup = true;
+	let transitionRemovalAttempts = 0;
 	FileLockTestHooks.nativeExactRemovalProbe = () => true;
 	FileLockTestHooks.beforeDetachedLockCleanup = () => {
 		if (!refuseCleanup) return true;
@@ -333,16 +383,16 @@ test("resumes an ownerless detached cleanup after a transient cleanup refusal", 
 	FileLockTestHooks.nativeQuarantineBindings = () => ({
 		snapshotDirectoryTree,
 		exactRemoveDirectoryTree: (target, snapshot, parentIdentity, detachOnly) => {
-			if (target === lockDir) {
-				fsSync.renameSync(target, transitionPath);
-				return {
-					ok: false,
-					code: "cleanup_pending",
-					payloadDurable: true,
-					detachedPath: transitionPath,
-				};
-			}
 			if (target === transitionPath) {
+				transitionRemovalAttempts++;
+				if (transitionRemovalAttempts === 1) {
+					return {
+						ok: false,
+						code: "cleanup_pending",
+						payloadDurable: true,
+						detachedPath: transitionPath,
+					};
+				}
 				fsSync.rmSync(target, { recursive: true, force: true });
 				return { ok: true };
 			}
@@ -354,6 +404,8 @@ test("resumes an ownerless detached cleanup after a transient cleanup refusal", 
 	await withFileLock(
 		filePath,
 		async () => {
+			// Count adoption before successor release can replay its own retirement.
+			expect(transitionRemovalAttempts).toBe(2);
 			callbackEntered = true;
 		},
 		{ retries: 4, retryDelayMs: 1, staleMs: 0 },
@@ -406,40 +458,20 @@ test("fails closed on an oversized Windows retirement owner sidecar", async () =
 	expect((await fs.stat(recordPath)).size).toBe(2 * 1024 * 1024);
 });
 
-test.skipIf(process.platform === "win32")("does not reclaim an aged ownerless lock directory on POSIX", async () => {
-	if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
-	const tempDir = await createTempDir();
-	const filePath = path.join(tempDir, "sdk", "sessions", "index.jsonl");
-	const lockDir = `${filePath}.lock`;
-	await fs.mkdir(lockDir, { recursive: true });
-	const pastTime = new Date(Date.now() - 60_000);
-	await fs.utimes(lockDir, pastTime, pastTime);
+test.skipIf(process.platform === "win32")(
+	"fails closed on an aged empty ownerless lock directory on POSIX",
+	async () => {
+		if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
+		const tempDir = await createTempDir();
+		const filePath = path.join(tempDir, "sdk", "sessions", "index.jsonl");
+		const lockDir = `${filePath}.lock`;
+		await fs.mkdir(lockDir, { recursive: true });
+		const pastTime = new Date(Date.now() - 60_000);
+		await fs.utimes(lockDir, pastTime, pastTime);
 
-	await expect(
-		withFileLock(filePath, async () => undefined, { retries: 2, retryDelayMs: 1, staleMs: 0 }),
-	).rejects.toMatchObject({ code: "acquire_timeout" });
-	expect(await fs.readdir(lockDir)).toEqual([]);
-});
-
-test("preserves a lock record published after the empty-directory stale verdict", async () => {
-	const tempDir = await createTempDir();
-	const filePath = path.join(tempDir, "sdk", "sessions", "index.jsonl");
-	const lockDir = `${filePath}.lock`;
-	await fs.mkdir(lockDir, { recursive: true });
-	const pastTime = new Date(Date.now() - 60_000);
-	await fs.utimes(lockDir, pastTime, pastTime);
-
-	let published = false;
-	FileLockTestHooks.afterOwnerlessLockStaleVerdict = async observedPath => {
-		if (published) return;
-		published = true;
-		await fs.writeFile(path.join(observedPath, "info"), JSON.stringify({ pid: process.pid, timestamp: Date.now() }));
-	};
-
-	await expect(
-		withFileLock(filePath, async () => undefined, { retries: 2, retryDelayMs: 1, staleMs: 0 }),
-	).rejects.toMatchObject({ code: "acquire_timeout" });
-
-	expect(published).toBe(true);
-	expect(JSON.parse(await fs.readFile(path.join(lockDir, "info"), "utf8"))).toMatchObject({ pid: process.pid });
-});
+		await expect(
+			withFileLock(filePath, async () => undefined, { retries: 2, retryDelayMs: 1, staleMs: 0 }),
+		).rejects.toMatchObject({ code: "acquire_timeout" });
+		expect(await fs.readdir(lockDir)).toEqual([]);
+	},
+);

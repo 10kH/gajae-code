@@ -458,6 +458,43 @@ test("keeps the staging component within filesystem limits for long target names
 	expect(stagingComponentLength).toBeLessThanOrEqual(legacyComponentLength);
 });
 
+test.each([
+	"x".repeat(196),
+	"x".repeat(240),
+	"x".repeat(250),
+	"é".repeat(125),
+])("acquires and releases a long canonical target without overflowing derived components: %s", async name => {
+	const { root } = await makeFixture();
+	const file = path.join(root, name);
+	const lock = `${file}.lock`;
+	const transitions: string[] = [];
+	FileLockTestHooks.beforeRemovalOwnerPublish = async transition => {
+		transitions.push(transition);
+		expect(Buffer.byteLength(path.basename(transition), "utf8")).toBeLessThanOrEqual(255);
+		for (const entry of await fs.readdir(root)) {
+			expect(Buffer.byteLength(entry, "utf8")).toBeLessThanOrEqual(255);
+		}
+	};
+	try {
+		await expect(
+			withFileLock(
+				file,
+				async () => {
+					const info = JSON.parse(await Bun.file(path.join(lock, "info")).text());
+					expect(info.pid).toBe(process.pid);
+					expect((await fs.lstat(lock)).isDirectory()).toBe(true);
+					return "released";
+				},
+				quickAcquire,
+			),
+		).resolves.toBe("released");
+		expect(transitions.length).toBeGreaterThan(0);
+		expect(await fs.readdir(root)).toEqual([]);
+	} finally {
+		FileLockTestHooks.beforeRemovalOwnerPublish = undefined;
+	}
+});
+
 test("uses a liveness-probed legacy staging name when process identity is unavailable", async () => {
 	const { file } = await makeFixture();
 	FileLockTestHooks.stagingIdentityEvidence = () => ({ processIncarnation: null, startTime: null });
