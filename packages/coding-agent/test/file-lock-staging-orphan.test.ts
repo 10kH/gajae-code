@@ -115,6 +115,17 @@ test.each(["alive", "unknown"] as const)("missing info retains %s owner", async 
 	expect(await fs.exists(staging)).toBe(true);
 });
 
+test("reaps a legacy staging name after its PID is proven dead", async () => {
+	const { file, staging } = await fixture();
+	const legacyStaging = `${file}.lock.pending.${DEAD_PID}.${uuid}`;
+	await fs.rename(staging, legacyStaging);
+	deadPid();
+
+	const summary = await reapOrphanedLockStagingDirs(`${file}.lock`);
+	expect(summary.removed).toEqual([legacyStaging]);
+	expect(await fs.exists(legacyStaging)).toBe(false);
+});
+
 test("symlink candidate and malformed names are untouched", async () => {
 	const { root, file, staging } = await fixture();
 	const target = path.join(root, "target");
