@@ -585,7 +585,7 @@
       true,
       false
     ],
-    "reason": "The read tool description prompt changed."
+    "reason": "The default read output snapshot is kept separate from its prompt description."
   },
   {
     "bucket": "changed",
@@ -603,7 +603,41 @@
       true,
       false
     ],
-    "reason": "The read tool description prompt changed."
+    "reason": "The head-truncated read output snapshot is kept separate from its prompt description."
+  },
+  {
+    "bucket": "surface",
+    "phase": 1,
+    "name": "prompt-read-default-surface",
+    "request": {
+      "path": "{FIXTURE}/prose.txt"
+    },
+    "settings": {
+      "read.summarize.enabled": false
+    },
+    "hashLines": [
+      true,
+      false
+    ],
+    "reason": "Keep the default read tool description pinned independently from result snapshots."
+  },
+  {
+    "bucket": "surface",
+    "phase": 1,
+    "name": "prompt-read-head-surface",
+    "request": {
+      "path": "{FIXTURE}/prose.txt",
+      "truncation": "head"
+    },
+    "settings": {
+      "read.summarize.enabled": false,
+      "read.truncation": "head"
+    },
+    "hashLines": [
+      true,
+      false
+    ],
+    "reason": "Keep the head-truncation read tool description pinned independently from result snapshots."
   },
   {
     "bucket": "surface",

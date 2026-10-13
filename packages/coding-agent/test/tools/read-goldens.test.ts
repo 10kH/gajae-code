@@ -32,7 +32,7 @@ type Variant = "hl" | "plain";
 const EXPECTED_MANIFEST_COUNTS: Record<Bucket, number> = {
 	invariant: 29,
 	changed: 10,
-	surface: 2,
+	surface: 4,
 };
 const EXPECTED_MANIFEST_NAMES: Record<Bucket, readonly string[]> = {
 	invariant: [
@@ -78,7 +78,7 @@ const EXPECTED_MANIFEST_NAMES: Record<Bucket, readonly string[]> = {
 		"prompt-read-head",
 		"range-tail",
 	],
-	surface: ["docs-read-flow-line", "cli-read-help"],
+	surface: ["docs-read-flow-line", "cli-read-help", "prompt-read-default-surface", "prompt-read-head-surface"],
 };
 const EXPECTED_PHASE_ZERO_GOLDEN_FILES = 58; // phase 0 only has invariant (29 * 2 variants)
 type Request = { path: string; [key: string]: unknown };
@@ -476,6 +476,8 @@ async function captureSurface(entry: Entry, tool: { description: string }): Prom
 	switch (entry.name) {
 		case "prompt-read-default":
 		case "prompt-read-head":
+		case "prompt-read-default-surface":
+		case "prompt-read-head-surface":
 			return surfaceCaptured(tool.description);
 		case "docs-read-flow-line": {
 			const repoRoot = path.resolve(import.meta.dir, "../../../..");
@@ -603,7 +605,7 @@ describe("read truncation golden harness", () => {
 			expect([...names].sort()).toEqual([...EXPECTED_MANIFEST_NAMES[bucket]].sort());
 		}
 
-		expect(manifest).toHaveLength(41);
+		expect(manifest).toHaveLength(43);
 		const phaseZeroGoldenFiles = manifest
 			.filter(entry => entry.phase === 0)
 			.reduce((total, entry) => total + entry.hashLines.length, 0);
