@@ -3772,6 +3772,7 @@ describe("preset-equivalent profile activation", () => {
 			installedAgentModelOverrides: new Map([["planner", "provider-b/executor"]]),
 			manualModelRoles: new Set<string>(),
 			manualAgentModelOverrides: new Set(["planner"]),
+			configuredAgentModelOverrides: new Set<string>(),
 			preProfileModel: undefined,
 		};
 		const emptyOwnership = (): AgentSessionProfileInstalledOverrideState => ({
@@ -3781,6 +3782,7 @@ describe("preset-equivalent profile activation", () => {
 			installedAgentModelOverrides: new Map(),
 			manualModelRoles: new Set(),
 			manualAgentModelOverrides: new Set(),
+			configuredAgentModelOverrides: new Set(),
 			preProfileModel: undefined,
 		});
 		let activeProfile: string | undefined = profile.name;
