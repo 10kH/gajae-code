@@ -122,27 +122,27 @@ describe("auto-compaction usage limit rotates the session credential", () => {
 			.exportSnapshot()
 			.credentials.filter(entry => entry.provider === "openai-codex")
 			.map(entry => entry.id);
-		const resolveApiKey = authStorage.getApiKey.bind(authStorage);
+		const resolveApiKey = authStorage.getApiKeyWithCredentialRowId.bind(authStorage);
 		let selectedRowId: number | undefined;
 		let siblingRowId: number | undefined;
 		let pointerAtDispatch: number | undefined;
 		let advancedDuringResolution = false;
 		let calls = 0;
 		const markUsageLimitReached = vi.spyOn(authStorage, "markUsageLimitReached");
-		vi.spyOn(authStorage, "getApiKey").mockImplementation(async (provider, sessionId, options) => {
-			const apiKey = await resolveApiKey(provider, sessionId, options);
+		vi.spyOn(authStorage, "getApiKeyWithCredentialRowId").mockImplementation(async (provider, sessionId, options) => {
+			const resolved = await resolveApiKey(provider, sessionId, options);
 			if (!advancedDuringResolution && provider === "openai-codex" && options?.credentialSelector === undefined) {
 				advancedDuringResolution = true;
-				selectedRowId = authStorage.getSessionCredentialRowId(provider, sessionId);
+				selectedRowId = resolved.credentialRowId;
 				siblingRowId = credentialIds.find(rowId => rowId !== selectedRowId);
 				if (selectedRowId === undefined || siblingRowId === undefined) {
 					throw new Error("expected two stored credentials and a selected compaction credential");
 				}
-				await resolveApiKey(provider, sessionId, {
+				await authStorage.getApiKey(provider, sessionId, {
 					credentialSelector: { kind: "id", value: String(siblingRowId) },
 				});
 			}
-			return apiKey;
+			return resolved;
 		});
 		const compactSpy = vi.spyOn(compactionModule, "compact").mockImplementation(async (preparation, model) => {
 			if (calls++ === 0) {
@@ -166,6 +166,30 @@ describe("auto-compaction usage limit rotates the session credential", () => {
 		expect(compactSpy.mock.calls[1]?.[2]).not.toBe(compactSpy.mock.calls[0]?.[2]);
 		expect(markUsageLimitReached).toHaveBeenCalledTimes(1);
 		expect(markUsageLimitReached.mock.calls[0]?.[2]?.rowId).toBe(selectedRowId);
+	});
+
+	it("marks the dispatched row when its current key no longer matches storage", async () => {
+		session = createSession();
+		const resolveApiKey = session.modelRegistry.getApiKeyWithCredentialRowId.bind(session.modelRegistry);
+		let dispatchedRowId: number | undefined;
+		vi.spyOn(session.modelRegistry, "getApiKeyWithCredentialRowId").mockImplementation(
+			async (model, sessionId, options) => {
+				const resolved = await resolveApiKey(model, sessionId, options);
+				if (model.provider === "openai-codex") dispatchedRowId = resolved.credentialRowId;
+				return resolved;
+			},
+		);
+		const matchRows = vi.spyOn(authStorage, "getCredentialRowIdsMatchingApiKey").mockResolvedValue([]);
+		const markUsageLimitReached = vi.spyOn(authStorage, "markUsageLimitReached");
+		const compactSpy = stubCompact((apiKey, firstKey) => apiKey === firstKey);
+
+		await session.runIdleCompaction();
+
+		expect(dispatchedRowId).toBeDefined();
+		expect(matchRows).toHaveBeenCalledTimes(1);
+		expect(compactSpy.mock.calls).toHaveLength(2);
+		expect(markUsageLimitReached).toHaveBeenCalledTimes(1);
+		expect(markUsageLimitReached.mock.calls[0]?.[2]?.rowId).toBe(dispatchedRowId);
 	});
 
 	it("tries each row once, then falls back to the retry policy and stops", async () => {
@@ -242,6 +266,13 @@ describe("auto-compaction usage limit rotates the session credential", () => {
 			);
 			expect(duplicateRowIds.every(rowId => !authStorage.isCredentialAvailable("openai-codex", rowId))).toBe(true);
 			expect(ends[0]?.errorMessage).toContain("usage limit has been reached");
+
+			const callsBeforeLaterCompaction = compactSpy.mock.calls.length;
+			await session.runIdleCompaction();
+
+			expect(compactSpy.mock.calls).toHaveLength(callsBeforeLaterCompaction);
+			expect(ends).toHaveLength(2);
+			expect(ends[1]?.errorMessage).toContain("No available stored credential");
 		} finally {
 			if (previousA === undefined) delete process.env.GJC_TEST_COMPACTION_DUP_KEY_A;
 			else process.env.GJC_TEST_COMPACTION_DUP_KEY_A = previousA;

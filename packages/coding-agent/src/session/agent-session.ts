@@ -23292,16 +23292,22 @@ export class AgentSession {
 	 * acts on that provider's session credential), the provider is pinned, or the
 	 * rotation lands on a row this candidate's rotation phase already failed on. All rows
 	 * resolving to the failed key are marked because they share the same provider quota.
+	 * The dispatched row ID is retained even if OAuth refresh changes the key before the
+	 * usage-limit response is handled.
 	 */
 	async #rotateCompactionCredentialAfterUsageLimit(
 		candidate: Model,
 		apiKey: string,
+		credentialRowId: number | undefined,
 		retryAfterMs: number | undefined,
 		failedRowIds: Set<number>,
-	): Promise<string | undefined> {
+	): Promise<{ apiKey: string; credentialRowId: number } | undefined> {
 		if (candidate.provider !== this.model?.provider) return undefined;
 		const authStorage = this.#modelRegistry.authStorage;
 		const matchingRowIds = await authStorage.getCredentialRowIdsMatchingApiKey(candidate.provider, apiKey);
+		if (credentialRowId !== undefined && !matchingRowIds.includes(credentialRowId)) {
+			matchingRowIds.unshift(credentialRowId);
+		}
 		if (matchingRowIds.length === 0 || this.#hasManagedFallbackCredentialPin(candidate.provider)) return undefined;
 		for (const failedRowId of matchingRowIds) {
 			if (failedRowIds.has(failedRowId)) continue;
@@ -23320,15 +23326,49 @@ export class AgentSession {
 		const rotatedApiKey = await this.#modelRegistry.getApiKey(candidate, this.credentialSessionId, {
 			credentialSelector: { kind: "id", value: String(nextRowId) },
 		});
-		return isAuthenticated(rotatedApiKey) ? rotatedApiKey : undefined;
+		return isAuthenticated(rotatedApiKey) ? { apiKey: rotatedApiKey, credentialRowId: nextRowId } : undefined;
 	}
 
 	async #resolveCompactionCandidate(
 		candidate: Model,
 		previousCandidate: Model | undefined,
 		previousFailure: unknown,
-	): Promise<{ apiKey: string; authError?: undefined } | { apiKey: undefined; authError: Error }> {
-		const apiKey = await this.#modelRegistry.getApiKey(candidate, this.credentialSessionId);
+	): Promise<
+		| { apiKey: string; credentialRowId: number | undefined; authError?: undefined }
+		| { apiKey: undefined; authError: Error }
+	> {
+		const authStorage = this.#modelRegistry.authStorage;
+		let resolved = await this.#modelRegistry.getApiKeyWithCredentialRowId(candidate, this.credentialSessionId);
+		if (
+			resolved.credentialRowId !== undefined &&
+			!authStorage.isCredentialAvailable(candidate.provider, resolved.credentialRowId)
+		) {
+			for (const credential of authStorage.listCredentialInventory(candidate.provider)) {
+				if (credential.disabled || !authStorage.isCredentialAvailable(candidate.provider, credential.id)) continue;
+				const alternative = await this.#modelRegistry.getApiKeyWithCredentialRowId(candidate, this.credentialSessionId, {
+					credentialSelector: { kind: "id", value: String(credential.id) },
+				});
+				if (
+					!alternative.apiKey ||
+					alternative.credentialRowId !== credential.id ||
+					!authStorage.isCredentialAvailable(candidate.provider, credential.id)
+				) {
+					continue;
+				}
+				resolved = alternative;
+				break;
+			}
+			if (
+				resolved.credentialRowId !== undefined &&
+				!authStorage.isCredentialAvailable(candidate.provider, resolved.credentialRowId)
+			) {
+				return {
+					apiKey: undefined,
+					authError: new Error(`No available stored credential for ${candidate.provider}.`),
+				};
+			}
+		}
+		const apiKey = resolved.apiKey;
 		if (!apiKey) return { apiKey: undefined, authError: this.#buildCompactionAuthError(candidate) };
 		if (previousCandidate) {
 			await this.#emitCompactionModelSubstitution(
@@ -23337,7 +23377,7 @@ export class AgentSession {
 				this.#compactionFailureReason(previousFailure),
 			);
 		}
-		return { apiKey, authError: undefined };
+		return { apiKey, credentialRowId: resolved.credentialRowId, authError: undefined };
 	}
 	#isCompactionAuthFailure(error: unknown): boolean {
 		if (!(error instanceof Error)) return false;
@@ -23943,6 +23983,7 @@ export class AgentSession {
 						continue;
 					}
 					let apiKey = resolved.apiKey;
+					let credentialRowId = resolved.credentialRowId;
 					const usageLimitedRowIds = new Set<number>();
 					// Rows can resolve to the same key (two env references to one secret), so
 					// a rotation is accepted only when it brings a key that has not failed yet.
@@ -23988,14 +24029,16 @@ export class AgentSession {
 							const retryAfterMs = this.#parseRetryAfterMsFromError(message);
 							if (isUsageLimitError(message)) {
 								usageLimitedApiKeys.add(apiKey);
-								const rotatedApiKey = await this.#rotateCompactionCredentialAfterUsageLimit(
+								const rotatedCredential = await this.#rotateCompactionCredentialAfterUsageLimit(
 									candidate,
 									apiKey,
+									credentialRowId,
 									retryAfterMs,
 									usageLimitedRowIds,
 								);
-								if (rotatedApiKey !== undefined && !usageLimitedApiKeys.has(rotatedApiKey)) {
-									apiKey = rotatedApiKey;
+								if (rotatedCredential !== undefined && !usageLimitedApiKeys.has(rotatedCredential.apiKey)) {
+									apiKey = rotatedCredential.apiKey;
+									credentialRowId = rotatedCredential.credentialRowId;
 									logger.warn("Auto-compaction hit a usage limit, retrying on another credential", {
 										error: message,
 										model: `${candidate.provider}/${candidate.id}`,
