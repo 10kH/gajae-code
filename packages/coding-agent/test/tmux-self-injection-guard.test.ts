@@ -88,11 +88,24 @@ describe("tmux self-injection guard", () => {
 		});
 	});
 
-	it("finds injection in a shell script passed to bash", async () => {
+	it("finds injection through path-qualified shell runners", async () => {
+		for (const command of [
+			"/bin/bash -c 'tmux send-keys -t %47 x'",
+			"/usr/bin/busybox sh -c 'tmux send-keys -t %47 x'",
+		]) {
+			await expect(checkTmuxSelfInjection(command, options)).resolves.toMatchObject({ block: true });
+		}
+	});
+
+	it("finds injection in a shell script passed to bash by name or path", async () => {
 		const scriptPath = "/tmp/gjc-5039-injection.sh";
 		await Bun.write(scriptPath, "tmux send-keys -t %47 x\n");
 		try {
-			await expect(checkTmuxSelfInjection(`bash ${scriptPath}`, options)).resolves.toMatchObject({ block: true });
+			for (const runner of ["bash", "/bin/bash"]) {
+				await expect(checkTmuxSelfInjection(`${runner} ${scriptPath}`, options)).resolves.toMatchObject({
+					block: true,
+				});
+			}
 		} finally {
 			await Bun.file(scriptPath).delete();
 		}
@@ -243,6 +256,12 @@ describe("tmux self-injection guard", () => {
 					block: false,
 				});
 			}
+		});
+
+		it("allows sudo list mode with an end-of-options marker", async () => {
+			await expect(checkTmuxSelfInjection("sudo -l -- tmux send-keys -t %47 x", options)).resolves.toEqual({
+				block: false,
+			});
 		});
 
 		it("allows sudo edit mode without treating file operands as commands", async () => {
@@ -605,15 +624,16 @@ describe("tmux self-injection guard", () => {
 			});
 		});
 
-		it("should not mistake unquoted command string for option", async () => {
-			// Issue: bash -c '-x || tmux send-keys -t %47 x'
-			// The command string starts with -, so it looks like an option
-			// But since it's unquoted, it shouldn't be accepted as a payload anyway
-			await expect(
-				checkTmuxSelfInjection("bash -c '-x || tmux send-keys -t %47 x'", options),
-			).resolves.toMatchObject({
-				block: true,
+		it("does not scan a dash-prefixed command string Bash rejects without --", async () => {
+			await expect(checkTmuxSelfInjection("bash -c '-x || tmux send-keys -t %47 x'", options)).resolves.toEqual({
+				block: false,
 			});
+		});
+
+		it("scans a dash-prefixed command string after Bash's -- terminator", async () => {
+			await expect(
+				checkTmuxSelfInjection("bash -c -- '-x || tmux send-keys -t %47 x'", options),
+			).resolves.toMatchObject({ block: true });
 		});
 
 		it("should find injection in script file with long option", async () => {

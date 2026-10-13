@@ -152,6 +152,11 @@ function isLongOption(text: string): boolean {
 	return text.startsWith("--");
 }
 
+function commandName(text: string): string {
+	const separator = text.lastIndexOf("/");
+	return separator < 0 ? text : text.slice(separator + 1);
+}
+
 /** Small quote-aware lexer. Unknown shell syntax is represented conservatively. */
 function tokenize(command: string): Token[] {
 	const tokens: Token[] = [];
@@ -538,7 +543,7 @@ function collectShellPayloads(tokens: Token[]): string[] {
 
 		// Check if this is a shell runner or busybox
 		let shellIndex = index;
-		if (token.text === "busybox") {
+		if (commandName(token.text) === "busybox") {
 			// For busybox, the next non-option token is the applet name
 			// Check if it's a shell applet
 			for (let cursor = index + 1; cursor < tokens.length && !tokens[cursor].commandStart; cursor++) {
@@ -553,7 +558,7 @@ function collectShellPayloads(tokens: Token[]): string[] {
 			}
 		}
 
-		if (!SHELL_RUNNERS.has(tokens[shellIndex].text)) continue;
+		if (!SHELL_RUNNERS.has(commandName(tokens[shellIndex].text))) continue;
 
 		// Scan for -c options in the shell invocation.
 		// Look for patterns like:
@@ -648,6 +653,7 @@ function collectShellPayloads(tokens: Token[]): string[] {
 			if (isStandaloneC || isBundledC) {
 				// Found a -c option (standalone or bundled)
 				// The command string is the first non-option word after -c
+				let optionsTerminated = false;
 				for (
 					let payloadCursor = cursor + 1;
 					payloadCursor < tokens.length && !tokens[payloadCursor].commandStart;
@@ -656,9 +662,17 @@ function collectShellPayloads(tokens: Token[]): string[] {
 					const payloadToken = tokens[payloadCursor];
 					const payloadWord = payloadToken.text;
 
-					// Skip over any remaining shell options or their arguments
-					// But don't skip quoted strings, even if they start with -
-					if (payloadWord.startsWith("-") && !payloadToken.quoted) {
+					// Bash still accepts invocation options after -c. A bare -- ends
+					// option parsing, so the following argument is the command string
+					// even when it starts with a dash.
+					if (!optionsTerminated && payloadWord === "--") {
+						optionsTerminated = true;
+						continue;
+					}
+
+					// Skip over any remaining shell options or their arguments. Quotes
+					// don't change how Bash interprets an argv value beginning with '-'.
+					if (!optionsTerminated && payloadWord.startsWith("-")) {
 						// Check if this option takes an argument
 						if (optionsWithArg.has(payloadWord)) {
 							payloadCursor++; // Skip the argument
@@ -777,7 +791,13 @@ function collectShellScripts(tokens: Token[], cwd: string): string[] {
 
 	for (let index = 0; index < tokens.length; index++) {
 		const token = tokens[index];
-		if (token.commandStart && (token.text.startsWith("./") || token.text.startsWith("/"))) {
+		const name = commandName(token.text);
+		if (
+			token.commandStart &&
+			(token.text.startsWith("./") || token.text.startsWith("/")) &&
+			!SHELL_RUNNERS.has(name) &&
+			name !== "busybox"
+		) {
 			scripts.push(path.resolve(cwd, token.text));
 			continue;
 		}
@@ -785,7 +805,7 @@ function collectShellScripts(tokens: Token[], cwd: string): string[] {
 
 		// Handle shell runners (bash, sh, etc.) and busybox applets
 		let shellIndex = index;
-		if (token.text === "busybox") {
+		if (commandName(token.text) === "busybox") {
 			// For busybox, find the applet name
 			for (let cursor = index + 1; cursor < tokens.length && !tokens[cursor].commandStart; cursor++) {
 				const arg = tokens[cursor].text;
@@ -798,7 +818,7 @@ function collectShellScripts(tokens: Token[], cwd: string): string[] {
 			}
 		}
 
-		if (!SHELL_RUNNERS.has(tokens[shellIndex].text)) continue;
+		if (!SHELL_RUNNERS.has(commandName(tokens[shellIndex].text))) continue;
 
 		// Skip past all options (short, long, and their arguments) to find the script argument
 		let skipNextArg = false;
