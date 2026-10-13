@@ -39,7 +39,7 @@ function createRegistry(model: Model<Api>) {
 	} as never;
 }
 
-function titleResponse() {
+function titleResponse(title = "Structured Title") {
 	return {
 		stopReason: "stop",
 		content: [
@@ -47,7 +47,7 @@ function titleResponse() {
 				type: "toolCall",
 				id: "call-title",
 				name: "set_title",
-				arguments: { title: "Structured Title" },
+				arguments: { title },
 			},
 		],
 	} as never;
@@ -179,6 +179,22 @@ describe("debug log credential scrub", () => {
 		expect(logged).toContain("note=keep-this");
 		const sent = completeSimple.mock.calls[0]?.[1] as { messages?: Array<{ content?: string }> } | undefined;
 		expect(sent?.messages?.[0]?.content).toContain(labeled);
+	});
+
+	it("scrubs credential labels echoed in generated titles before logging", async () => {
+		const model = getModelOrThrow("claude-sonnet-4-5");
+		const generatedTitle = "token=abc123";
+		const completeSimple = vi.spyOn(ai, "completeSimple").mockResolvedValue(titleResponse(generatedTitle));
+		const debug = vi.spyOn(logger, "debug");
+
+		const title = await generateSessionTitle("ordinary title input", createRegistry(model), createSettings(model));
+
+		expect(title).toBe(generatedTitle);
+		const logged = loggedText(debug.mock.calls);
+		expect(logged).not.toContain(generatedTitle);
+		expect(logged).toContain("token=«redacted»");
+		const sent = completeSimple.mock.calls[0]?.[1] as { messages?: Array<{ content?: string }> } | undefined;
+		expect(sent?.messages?.[0]?.content).toContain("ordinary title input");
 	});
 
 	it("does not write the marketplace clone userinfo into the debug log", async () => {

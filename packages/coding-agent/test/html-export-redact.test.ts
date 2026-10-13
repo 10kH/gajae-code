@@ -135,6 +135,7 @@ describe("session HTML export embed", () => {
 								bearer: "opaque-bearer-value",
 								token: "opaque-token-value",
 								secret: "opaque-secret-value",
+								session_key: "opaque-session-key-value",
 								credential: "opaque-credential-value",
 								private_key: "opaque-private-key-value",
 								private_token: "opaque-private-token-value",
@@ -145,6 +146,9 @@ describe("session HTML export embed", () => {
 							},
 							auth: "opaque-auth-value",
 							bearer: "opaque-bearer-field-value",
+							session_id: "session-id-123",
+							source_session_id: "source-session-id-456",
+							native_session_id: "native-session-id-789",
 							tokensBefore: 12,
 							maxTokens: 32,
 							token_budget: { available: 4096 },
@@ -166,6 +170,7 @@ describe("session HTML export embed", () => {
 				"opaque-token-value",
 				"opaque-bearer-value",
 				"opaque-secret-value",
+				"opaque-session-key-value",
 				"opaque-credential-value",
 				"opaque-private-key-value",
 				"opaque-private-token-value",
@@ -182,6 +187,7 @@ describe("session HTML export embed", () => {
 				bearer: "«redacted»",
 				token: "«redacted»",
 				secret: "«redacted»",
+				session_key: "«redacted»",
 				credential: "«redacted»",
 				private_key: "«redacted»",
 				private_token: "«redacted»",
@@ -192,6 +198,9 @@ describe("session HTML export embed", () => {
 			});
 			expect(args?.auth).toBe("«redacted»");
 			expect(args?.bearer).toBe("«redacted»");
+			expect(args?.session_id).toBe("session-id-123");
+			expect(args?.source_session_id).toBe("source-session-id-456");
+			expect(args?.native_session_id).toBe("native-session-id-789");
 			expect(args?.tokensBefore).toBe(12);
 			expect(args?.maxTokens).toBe(32);
 			expect(args?.token_budget).toEqual({ available: 4096 });

@@ -209,6 +209,7 @@ describe("recordFatalCrash", () => {
 			"password=123456",
 			"auth=x",
 			"bearer=abc123",
+			"session_key=opaque-session-key",
 		].join(" ");
 
 		recordFatalCrash("Uncaught Exception", new Error(`diagnostic safe=keep-this ${labeled}`), { path: target });
