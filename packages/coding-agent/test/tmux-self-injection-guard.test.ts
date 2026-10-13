@@ -200,6 +200,14 @@ describe("tmux self-injection guard", () => {
 			).resolves.toMatchObject({ block: true });
 		});
 
+		it("uses env chdir options after earlier command segments", async () => {
+			const socketPath = env.TMUX.split(",")[0];
+			const socketDir = socketPath.substring(0, socketPath.lastIndexOf("/"));
+			await expect(
+				checkTmuxSelfInjection(`true; env -C ${socketDir} tmux -S default send-keys -t %47 x`, options),
+			).resolves.toMatchObject({ block: true });
+		});
+
 		it("finds env chdir options after argv0 operands", async () => {
 			const socketPath = env.TMUX.split(",")[0];
 			const socketDir = socketPath.substring(0, socketPath.lastIndexOf("/"));
@@ -955,6 +963,12 @@ describe("tmux self-injection guard", () => {
 			// Socket should not be overridden, tmux targets current pane and should be blocked
 			await expect(
 				checkTmuxSelfInjection("printf x | xargs -I TMUX=/tmp/other tmux send-keys -t %47 x", options),
+			).resolves.toMatchObject({ block: true });
+		});
+
+		it("respects bundled xargs -rI operand arity during socket lookup", async () => {
+			await expect(
+				checkTmuxSelfInjection("printf x | xargs -rI TMUX=/tmp/other tmux send-keys -t %47 x", options),
 			).resolves.toMatchObject({ block: true });
 		});
 

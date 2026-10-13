@@ -2095,28 +2095,7 @@ function assignedTmuxEnvironmentValue(
 								: tokens[wrapIdx].text;
 							const wrapper = COMMAND_WRAPPERS_WITH_ARGS[baseName];
 							if (wrapper) {
-								// Check for short options
-								if (optText.startsWith("-") && !optText.startsWith("--")) {
-									const optChar = optText.length > 1 ? optText[1] : "";
-									const shortOpt = `-${optChar}`;
-
-									// Check if this wrapper's options would consume the next argument
-									if (wrapper.optionsWithArg.has(shortOpt) && !wrapper.flagOnlyOptions?.has(shortOpt)) {
-										optionTakesArg = true;
-									}
-								} else if (optText.startsWith("--")) {
-									// Check for long options (handle both --option and --option=value forms)
-									const longOptName = optText.includes("=") ? optText.split("=")[0] : optText;
-
-									// Check wrapper-specific long options
-									const wrapperLongOpts = WRAPPER_LONG_OPTIONS[baseName];
-									if (wrapperLongOpts && longOptName in wrapperLongOpts) {
-										const takesArg = wrapperLongOpts[longOptName];
-										if (takesArg && !optText.includes("=")) {
-											optionTakesArg = true;
-										}
-									}
-								}
+								optionTakesArg = wrapperOptionTakesNextArgument({ name: baseName, spec: wrapper }, optText);
 							}
 							break;
 						}
@@ -2156,9 +2135,10 @@ function assignedTmuxEnvironmentValue(
 
 function commandWorkingDirectory(tokens: Token[], commandIndex: number, cwd: string): string | undefined {
 	let effectiveCwd = cwd;
+	const commandSegment = tokens[commandIndex].segment;
 	for (let index = 0; index < commandIndex; index++) {
 		const token = tokens[index];
-		if (token.segment !== tokens[commandIndex].segment) break;
+		if (token.segment !== commandSegment) continue;
 		if (!token.commandStart || commandName(token.text) !== "env") continue;
 
 		let skipNextArgument = false;

@@ -9,5 +9,6 @@
 - Preserve argv boundaries when recursively inspecting `env -S` payloads, including nested `bash -c` commands, and avoid treating `builtin` or non-executing `sudo` modes as external command executions.
 - Inspect executable here-document input and unquoted command substitutions, follow shell stdin through wrappers, pipelines, and identity descriptor redirects, while leaving literal data-only consumers unblocked.
 - Honor bundled `env` split-string options and environment unsets, ignore lookup-only `env -S` operands, and stop shell command scanning at a pre-command `--`.
+- Resolve `env -C` from the tmux command's simple-command segment and respect bundled `xargs` option operands when detecting socket overrides.
 - Treat `sudo -e`/`--edit` as file editing rather than command execution when checking wrapper arguments.
 - Document that the guard is best-effort and does not cover arbitrary interpreter one-liners, shell variable indirection, or commands launched by the Python/eval tools.
