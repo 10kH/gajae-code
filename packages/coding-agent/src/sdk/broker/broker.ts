@@ -1088,6 +1088,13 @@ function sameSessionControlAuthority(
 	);
 }
 
+const SESSION_TARGETED_LIFECYCLE_OPERATIONS: ReadonlySet<string> = new Set([
+	"session.close",
+	"session.resume",
+	"session.delete",
+	"session.reconcile_uncertain",
+]);
+
 function lifecycleTarget(operation: string, input: Record<string, unknown>): unknown {
 	const target = input.target as Record<string, unknown> | undefined;
 	const string = (...values: unknown[]): string | undefined =>
@@ -4876,6 +4883,32 @@ export class Broker {
 			this.#admitted.delete(admission);
 		});
 	}
+	/**
+	 * Session-targeted lifecycle requests may pass terminal legacy rows recorded
+	 * for other sessions. A row equal to this key's legacy target identity for its
+	 * recorded session proves cross-target key reuse and keeps the fence; close
+	 * targets are reconstructed sessionId-only because legacy close rows may lack
+	 * endpoint authority.
+	 */
+	async #legacySessionTarget(
+		operation: string,
+		input: Record<string, unknown>,
+		idempotencyKey: string,
+	): Promise<{ sessionId: string; keyReuseIdentities: ReadonlySet<string> } | undefined> {
+		if (!SESSION_TARGETED_LIFECYCLE_OPERATIONS.has(operation)) return undefined;
+		const { sessionId } = lifecycleTarget(operation, input) as { sessionId?: string };
+		if (sessionId === undefined) return undefined;
+		const keyReuseIdentities = new Set<string>();
+		for (const recordedSessionId of this.ledger.terminalLegacySessionIds()) {
+			const recordedTarget = createHash("sha256")
+				.update(canonicalJson(lifecycleTarget(operation, { sessionId: recordedSessionId })))
+				.digest("hex");
+			keyReuseIdentities.add(
+				await deriveLegacyTargetIdentity(this.settings.agentDir, operation, idempotencyKey, recordedTarget),
+			);
+		}
+		return { sessionId, keyReuseIdentities };
+	}
 	async #handleRequest(
 		operation: string,
 		input: Record<string, unknown>,
@@ -5094,7 +5127,10 @@ export class Broker {
 				} else if (
 					this.ledger.hasLegacyIdentity(
 						new Set(this.#spawnAuthority?.claims().map(claim => claim.lifecycleIdentity) ?? []),
-						{ ignoreFinalRows: operation === "session.create" },
+						{
+							ignoreFinalRows: operation === "session.create",
+							sessionTarget: await this.#legacySessionTarget(operation, input, idempotencyKey),
+						},
 					)
 				) {
 					return error("idempotency_conflict", "legacy lifecycle request has an ambiguous target");
