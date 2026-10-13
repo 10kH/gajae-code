@@ -604,6 +604,27 @@ function isActiveMcpRegistryFilterReference(identifierPath: NodePath<Babel.Ident
 	return isStaticMcpFilterExpression(callback.body, callback.params[0].name);
 }
 
+function hasOnlyExpectedActiveMcpRegistryUse(program: Babel.File): boolean {
+	let hasActiveRegistryDeclaration = false;
+	let referenceCount = 0;
+	traverse(program, {
+		Identifier(identifierPath) {
+			if (identifierPath.node.name !== "ACTIVE_BUILTIN_SLASH_COMMAND_REGISTRY") return;
+			if (
+				identifierPath.parentPath?.isVariableDeclarator() &&
+				identifierPath.parentPath.node.id === identifierPath.node
+			) {
+				hasActiveRegistryDeclaration = true;
+				return;
+			}
+			referenceCount++;
+		},
+	});
+	if (!hasActiveRegistryDeclaration) return referenceCount === 0;
+	// The active alias is shared by the lookup, metadata, and internal ACP export; reject any fourth use.
+	return referenceCount === 3;
+}
+
 function hasOnlyExpectedMcpRegistryUse(
 	program: Babel.File,
 	registryDeclaration: Babel.VariableDeclarator,
@@ -622,7 +643,10 @@ function hasOnlyExpectedMcpRegistryUse(
 			if (isActiveMcpRegistryFilterReference(identifierPath)) hasExpectedFilterReference = true;
 		},
 	});
-	return referenceCount === 0 || (referenceCount === 1 && hasExpectedFilterReference);
+	return (
+		(referenceCount === 0 || (referenceCount === 1 && hasExpectedFilterReference)) &&
+		hasOnlyExpectedActiveMcpRegistryUse(program)
+	);
 }
 
 export function findMcpBuiltinQuarantineFindings(builtinRegistry: string): string[] {
@@ -659,6 +683,16 @@ export function findMcpBuiltinQuarantineFindings(builtinRegistry: string): strin
 		if (element.type !== "ObjectExpression") return ["root slash-command registry contains an unverified entry"];
 		if (element.properties.some(property => property.type === "SpreadElement")) {
 			return ["root slash-command registry entry contains an unverified spread"];
+		}
+		const hasUnverifiedPrototype = element.properties.some(
+			property =>
+				property.type === "ObjectProperty" &&
+				!property.computed &&
+				!property.shorthand &&
+				getStaticMcpMemberName(property) === "__proto__",
+		);
+		if (hasUnverifiedPrototype) {
+			return ["root slash-command registry entry contains an unverified prototype"];
 		}
 		if (
 			element.properties.some(

@@ -1075,6 +1075,7 @@ export class CommandController {
 	async #runNewSessionFlow(options?: NewSessionOptions, label: string = "New session started"): Promise<boolean> {
 		if (!(await this.ctx.session.newSession(options))) return false;
 		if (this.ctx.isStopped?.()) return false;
+		await this.ctx.refreshSlashCommandState();
 		clearInteractiveActivityLoaders(this.ctx);
 
 		stopInteractiveActivityIndicator(this.ctx, { foregroundSettled: true });

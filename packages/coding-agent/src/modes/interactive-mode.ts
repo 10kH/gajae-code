@@ -1233,6 +1233,12 @@ export class InteractiveMode implements InteractiveModeContext {
 		const basePath = cwd ?? this.sessionManager.getCwd();
 		const fileCommands = await loadSlashCommands({ cwd: basePath });
 		if (this.#stopped) return;
+		const builtinCommandNames = new Set(BUILTIN_SLASH_COMMANDS.map(command => command.name));
+		const sessionBuiltinSlashCommands = getBuiltinSlashCommandsForSession(this.session.hasExactMcpControls);
+		this.#baseSlashCommands = [
+			...sessionBuiltinSlashCommands,
+			...this.#baseSlashCommands.filter(command => !builtinCommandNames.has(command.name)),
+		];
 		const fileCommandNames = new Set(fileCommands.map(cmd => cmd.name));
 		this.fileSlashCommands = fileCommandNames;
 		const fileSlashCommands: SlashCommand[] = fileCommands.map(cmd => ({

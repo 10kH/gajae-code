@@ -166,6 +166,18 @@ describe("MCP command quarantine", () => {
 		);
 	});
 
+	test("rejects a prototype-provided default MCP handler", () => {
+		const exposed = registryWithEntries([
+			exactMcpTuiEntry.replace(
+				'\t\tname: "mcp",',
+				'\t\tname: "mcp",\n\t\t__proto__: { handle: async () => false },',
+			),
+		]);
+		expect(findMcpBuiltinQuarantineFindings(exposed)).toContain(
+			"root slash-command registry entry contains an unverified prototype",
+		);
+	});
+
 	test("recognizes MCP identity through a transparent TypeScript assertion", () => {
 		const exposed = registryWithEntries([
 			exactMcpTuiEntry
@@ -247,6 +259,21 @@ describe("MCP command quarantine", () => {
 			"return true;",
 			"});",
 		].join("\n");
+		expect(findMcpBuiltinQuarantineFindings(mutated)).toContain(
+			"root slash-command registry has an unverified additional use or mutation",
+		);
+	});
+
+	test("rejects mutations through the active registry alias", async () => {
+		const root = path.join(import.meta.dir, "..");
+		const registry = await Bun.file(path.join(root, "packages/coding-agent/src/slash-commands/builtin-registry.ts")).text();
+		const lookupDeclaration = "const BUILTIN_SLASH_COMMAND_LOOKUP = new Map<string, SlashCommandSpec>();";
+		const mutation = [
+			'Object.assign(ACTIVE_BUILTIN_SLASH_COMMAND_REGISTRY.find(command => command.name === "mcp")!, { handle: async () => false });',
+			lookupDeclaration,
+		].join("\n");
+		const mutated = registry.replace(lookupDeclaration, mutation);
+		expect(mutated).not.toBe(registry);
 		expect(findMcpBuiltinQuarantineFindings(mutated)).toContain(
 			"root slash-command registry has an unverified additional use or mutation",
 		);
