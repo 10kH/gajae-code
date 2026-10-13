@@ -510,11 +510,10 @@ describe("python eval lifecycle red-team", () => {
 		LIFECYCLE_TEST_TIMEOUT_MS,
 	);
 
-	it("treats clean exit code 0 as confirmed and starts a fresh session instead of reinserting", async () => {
+	it("starts a fresh session after disposal instead of reusing the old kernel", async () => {
 		Bun.env.PI_PYTHON_SKIP_CHECK = "1";
 		using tempDir = TempDir.createSync("@gjc-python-lifecycle-redteam-");
 		const firstKernel = new FakeKernel();
-		firstKernel.exitCode = 0;
 		const secondKernel = new FakeKernel();
 		let startCalls = 0;
 		PythonKernel.start = async () => {
@@ -538,4 +537,20 @@ describe("python eval lifecycle red-team", () => {
 		expect(startCalls).toBe(2);
 		expect(secondKernel.executeCalls).toEqual(["print('after clean shutdown')"]);
 	});
+
+	it(
+		"confirms clean exit code zero from the real Python kernel process",
+		async () => {
+			using tempDir = TempDir.createSync("@gjc-python-kernel-exit-zero-");
+			const kernel = await originalStart({ cwd: tempDir.path() });
+			try {
+				expect(kernel.getExitCode()).toBeNull();
+				expect(await kernel.shutdown()).toEqual({ confirmed: true });
+				expect(kernel.getExitCode()).toBe(0);
+			} finally {
+				await kernel.shutdown();
+			}
+		},
+		LIFECYCLE_TEST_TIMEOUT_MS,
+	);
 });
