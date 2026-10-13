@@ -1,3 +1,3 @@
 ### Fixed
 
-- Classify Windows `access_denied` publication failures as retryable contention when they occur before mutation, matching the handling of `sharing_violation` and enabling recovery without losing lock staging state (issue #6618).
+- Expose Windows `access_denied` in the native owner-only security result type so callers can represent ACL-denied checks and classify them accurately (issue #6618).
