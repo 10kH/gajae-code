@@ -115,9 +115,13 @@ const WRAPPER_LONG_OPTIONS: Record<string, Record<string, boolean>> = {
 		"--preserve-status": false, // timeout --preserve-status (flag-only)
 		"--verbose": false, // timeout --verbose (flag-only)
 		"--foreground": false, // timeout --foreground (flag-only)
+		"--help": false,
+		"--version": false,
 	},
 	nice: {
 		"--adjustment": true, // nice --adjustment=N (takes adjustment value)
+		"--help": false,
+		"--version": false,
 	},
 	time: {
 		"--format": true,
@@ -126,11 +130,15 @@ const WRAPPER_LONG_OPTIONS: Record<string, Record<string, boolean>> = {
 		"--portability": false,
 		"--quiet": false,
 		"--verbose": false,
+		"--help": false,
+		"--version": false,
 	},
 	stdbuf: {
 		"--input": true, // stdbuf --input=MODE
 		"--output": true, // stdbuf --output=MODE
 		"--error": true, // stdbuf --error=MODE
+		"--help": false,
+		"--version": false,
 	},
 	xargs: {
 		"--null": false, // xargs --null (flag-only)
@@ -148,6 +156,19 @@ const WRAPPER_LONG_OPTIONS: Record<string, Record<string, boolean>> = {
 		"--no-run-if-empty": false, // xargs --no-run-if-empty (flag-only)
 		"--exit": false, // xargs --exit (flag-only)
 		"--null-input": false, // xargs --null-input (flag-only, same as -0)
+		"--help": false,
+		"--version": false,
+	},
+	nohup: {
+		"--help": false,
+		"--version": false,
+	},
+	setsid: {
+		"--ctty": false,
+		"--fork": false,
+		"--wait": false,
+		"--help": false,
+		"--version": false,
 	},
 };
 
@@ -697,12 +718,38 @@ function tokenize(command: string): TokenizeResult {
 				}
 				skipNextArg = false;
 			} else if (wrapperCommand?.positionalArgConsumed) {
-				wrappedBy = wrapperCommand.name;
-				wrapperCommand = undefined;
+				const outerWrapper = wrapperCommand;
+				const wrappedName = text.includes("/") ? text.split("/").pop() || text : text;
+				const nestedWrapper = COMMAND_WRAPPERS_WITH_ARGS[wrappedName];
+				const nestedBuiltinWrapper = COMMAND_WRAPPERS.has(wrappedName);
+				if (nestedWrapper) {
+					wrapperCommand = {
+						name: wrappedName,
+						spec: nestedWrapper,
+						optionsTerminated: false,
+						assignmentAware: ASSIGNMENT_AWARE_WRAPPERS.has(wrappedName),
+					};
+					positionalsPending = nestedWrapper.hasPositionalArg ? 1 : 0;
+				} else if (
+					nestedBuiltinWrapper &&
+					wrapperMayInvokeShellBuiltins(outerWrapper.name, outerWrapper.assignmentAware)
+				) {
+					wrapperCommand = {
+						name: wrappedName,
+						spec: { optionsWithArg: new Set() },
+						optionsTerminated: false,
+						assignmentAware: false,
+					};
+					positionalsPending = 0;
+				} else {
+					wrappedBy = outerWrapper.name;
+					wrapperCommand = undefined;
+					positionalsPending = 0;
+					isWrappedCommand = true;
+				}
+				if (wrapperCommand) wrappedBy = outerWrapper.name;
 				skipNextArg = false;
-				positionalsPending = 0;
 				commandStart = true;
-				isWrappedCommand = true;
 			} else if (wrapperCommand && text === "--") {
 				wrapperCommand.optionsTerminated = true;
 				skipNextArg = false;
@@ -757,6 +804,10 @@ function tokenize(command: string): TokenizeResult {
 				const envLongOption = text.startsWith("--")
 					? matchingWrapperLongOption("env", text.split("=")[0])
 					: undefined;
+				const wrapperLongOption =
+					text.startsWith("--") && wrapperCommand !== undefined
+						? matchingWrapperLongOption(wrapperCommand.name, text.split("=")[0])
+						: undefined;
 				const nonExecutingSudoMode = wrapperCommand?.name === "sudo" && NON_EXECUTING_SUDO_OPTIONS.has(text);
 				const nonExecutingEnvMode =
 					wrapperCommand?.name === "env" &&
@@ -767,6 +818,7 @@ function tokenize(command: string): TokenizeResult {
 					wrapperCommand !== undefined &&
 					NON_EXECUTING_COREUTILS_WRAPPERS.has(wrapperCommand.name) &&
 					(NON_EXECUTING_COREUTILS_OPTIONS.has(text) ||
+						(wrapperLongOption !== undefined && NON_EXECUTING_COREUTILS_OPTIONS.has(wrapperLongOption)) ||
 						NON_EXECUTING_WRAPPER_OPTIONS[wrapperCommand.name]?.has(text) === true);
 				if (nonExecutingSudoMode || nonExecutingEnvMode || nonExecutingCoreutilsMode) {
 					// These utility modes never execute the supplied command.

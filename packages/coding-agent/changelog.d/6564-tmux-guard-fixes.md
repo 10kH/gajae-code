@@ -17,5 +17,5 @@
 - Preserve Bash option order across mixed bundles and `noexec` toggles, distinguish shell-builtin `eval` from an external command under wrappers, inspect shell-runner scripts resolved through the effective `PATH`, and fail closed on unresolved `PATH` overrides.
 - Resolve statically known environment references in `env -C` and suppress command discovery after GNU `env --null` and non-executing sudo modes.
 - Inspect command substitutions in ordinary shell arguments and decode ANSI-C-quoted Bash `-c` payloads so their executed tmux commands remain visible to the guard.
-- Stop timeout option parsing after its required duration, and recognize terminal help/version modes for GNU `env` and `setsid`.
+- Stop timeout option parsing after its required duration, and recognize terminal help/version modes and unambiguous long-option abbreviations for common wrappers.
 - Document that the guard is best-effort and does not cover arbitrary interpreter one-liners, shell variable indirection, or commands launched by the Python/eval tools.

@@ -457,11 +457,15 @@ describe("tmux self-injection guard", () => {
 			for (const command of [
 				"nohup --help tmux send-keys -t %47 x",
 				"nohup --version tmux send-keys -t %47 x",
+				"nohup --ver tmux send-keys -t %47 x",
 				"setsid --help tmux send-keys -t %47 x",
+				"setsid --ver tmux send-keys -t %47 x",
 				"setsid -h tmux send-keys -t %47 x",
 				"setsid -V tmux send-keys -t %47 x",
+				"nice --ver tmux send-keys -t %47 x",
 				"xargs --version tmux send-keys -t %47 x",
 				"stdbuf --help tmux send-keys -t %47 x",
+				"stdbuf --ver tmux send-keys -t %47 x",
 				"sudo -K tmux send-keys -t %47 x",
 				"sudo --remove-timestamp tmux send-keys -t %47 x",
 			]) {
@@ -786,6 +790,12 @@ describe("tmux self-injection guard", () => {
 				"timeout --signal TERM 5 -v tmux send-keys -t %47 x",
 			]) {
 				await expect(checkTmuxSelfInjection(command, options)).resolves.toEqual({ block: false });
+			}
+			for (const command of [
+				"timeout 1 env tmux send-keys -t %47 x",
+				"timeout --signal TERM 5 env tmux send-keys -t %47 x",
+			]) {
+				await expect(checkTmuxSelfInjection(command, options)).resolves.toMatchObject({ block: true });
 			}
 		});
 	});
