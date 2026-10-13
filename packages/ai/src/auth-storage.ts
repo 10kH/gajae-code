@@ -7496,6 +7496,7 @@ function extractOAuthTokenIdentifiers(token: string | undefined): string[] | und
  */
 export class SqliteAuthCredentialStore implements AuthCredentialStore {
 	#db: Database;
+	#ownedStatements: Statement[] = [];
 	#listActiveStmt: Statement;
 	#listActiveByProviderStmt: Statement;
 	#listAllStmt: Statement;
@@ -7521,53 +7522,89 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		this.#db = db;
 		this.#initializeSchema();
 
-		this.#listActiveStmt = this.#db.prepare(
+		this.#listActiveStmt = this.#prepareOwnedStatement(
 			"SELECT id, provider, credential_type, data, disabled_cause, identity_key, revision FROM auth_credentials WHERE disabled_cause IS NULL ORDER BY id ASC",
 		);
-		this.#listActiveByProviderStmt = this.#db.prepare(
+		this.#listActiveByProviderStmt = this.#prepareOwnedStatement(
 			"SELECT id, provider, credential_type, data, disabled_cause, identity_key, revision FROM auth_credentials WHERE provider = ? AND disabled_cause IS NULL ORDER BY id ASC",
 		);
-		this.#listAllStmt = this.#db.prepare(
+		this.#listAllStmt = this.#prepareOwnedStatement(
 			"SELECT id, provider, credential_type, data, disabled_cause, identity_key, revision FROM auth_credentials ORDER BY id ASC",
 		);
-		this.#listAllByProviderStmt = this.#db.prepare(
+		this.#listAllByProviderStmt = this.#prepareOwnedStatement(
 			"SELECT id, provider, credential_type, data, disabled_cause, identity_key, revision FROM auth_credentials WHERE provider = ? ORDER BY id ASC",
 		);
-		this.#listDisabledByProviderStmt = this.#db.prepare(
+		this.#listDisabledByProviderStmt = this.#prepareOwnedStatement(
 			"SELECT id, provider, credential_type, data, disabled_cause, identity_key, revision FROM auth_credentials WHERE provider = ? AND disabled_cause IS NOT NULL ORDER BY id ASC",
 		);
-		this.#insertStmt = this.#db.prepare(
+		this.#insertStmt = this.#prepareOwnedStatement(
 			`INSERT INTO auth_credentials (provider, credential_type, data, identity_key, revision, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ${SQLITE_NOW_EPOCH}, ${SQLITE_NOW_EPOCH}) RETURNING id`,
 		);
-		this.#updateStmt = this.#db.prepare(
+		this.#updateStmt = this.#prepareOwnedStatement(
 			`UPDATE auth_credentials SET credential_type = ?, data = ?, identity_key = ?, revision = revision + 1, updated_at = ${SQLITE_NOW_EPOCH} WHERE id = ?`,
 		);
-		this.#deleteStmt = this.#db.prepare(
+		this.#deleteStmt = this.#prepareOwnedStatement(
 			`UPDATE auth_credentials SET disabled_cause = ?, revision = revision + 1, updated_at = ${SQLITE_NOW_EPOCH} WHERE id = ?`,
 		);
-		this.#deleteIfMatchesStmt = this.#db.prepare(
+		this.#deleteIfMatchesStmt = this.#prepareOwnedStatement(
 			`UPDATE auth_credentials SET disabled_cause = ?, revision = revision + 1, updated_at = ${SQLITE_NOW_EPOCH} WHERE id = ? AND data = ? AND disabled_cause IS NULL`,
 		);
-		this.#deleteIfRevisionStmt = this.#db.prepare(
+		this.#deleteIfRevisionStmt = this.#prepareOwnedStatement(
 			`UPDATE auth_credentials SET disabled_cause = ?, revision = revision + 1, updated_at = ${SQLITE_NOW_EPOCH} WHERE id = ? AND revision = ? AND disabled_cause IS NULL`,
 		);
-		this.#deleteByProviderStmt = this.#db.prepare(
+		this.#deleteByProviderStmt = this.#prepareOwnedStatement(
 			`UPDATE auth_credentials SET disabled_cause = ?, revision = revision + 1, updated_at = ${SQLITE_NOW_EPOCH} WHERE provider = ? AND disabled_cause IS NULL`,
 		);
-		this.#hardDeleteStmt = this.#db.prepare("DELETE FROM auth_credentials WHERE id = ?");
-		this.#getCacheStmt = this.#db.prepare(
+		this.#hardDeleteStmt = this.#prepareOwnedStatement("DELETE FROM auth_credentials WHERE id = ?");
+		this.#getCacheStmt = this.#prepareOwnedStatement(
 			`SELECT value FROM cache WHERE key = ? AND expires_at > ${SQLITE_NOW_EPOCH}`,
 		);
-		this.#getCacheIncludingExpiredStmt = this.#db.prepare("SELECT value FROM cache WHERE key = ?");
-		this.#upsertCacheStmt = this.#db.prepare(
+		this.#getCacheIncludingExpiredStmt = this.#prepareOwnedStatement("SELECT value FROM cache WHERE key = ?");
+		this.#upsertCacheStmt = this.#prepareOwnedStatement(
 			"INSERT INTO cache (key, value, expires_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, expires_at = excluded.expires_at",
 		);
-		this.#claimUsageFetchLeaseStmt = this.#db.prepare(
+		this.#claimUsageFetchLeaseStmt = this.#prepareOwnedStatement(
 			"INSERT INTO cache (key, value, expires_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, expires_at = excluded.expires_at WHERE cache.expires_at <= ?",
 		);
-		this.#releaseUsageFetchLeaseStmt = this.#db.prepare("DELETE FROM cache WHERE key = ? AND value = ?");
-		this.#deleteCachePrefixStmt = this.#db.prepare("DELETE FROM cache WHERE substr(key, 1, ?) = ?");
-		this.#deleteExpiredCacheStmt = this.#db.prepare(`DELETE FROM cache WHERE expires_at <= ${SQLITE_NOW_EPOCH}`);
+		this.#releaseUsageFetchLeaseStmt = this.#prepareOwnedStatement("DELETE FROM cache WHERE key = ? AND value = ?");
+		this.#deleteCachePrefixStmt = this.#prepareOwnedStatement("DELETE FROM cache WHERE substr(key, 1, ?) = ?");
+		this.#deleteExpiredCacheStmt = this.#prepareOwnedStatement(
+			`DELETE FROM cache WHERE expires_at <= ${SQLITE_NOW_EPOCH}`,
+		);
+	}
+
+	#prepareOwnedStatement(sql: string): Statement {
+		const statement = this.#db.prepare(sql);
+		this.#ownedStatements.push(statement);
+		return statement;
+	}
+
+	#withStatement<T>(sql: string, use: (statement: Statement) => T): T {
+		const statement = this.#db.prepare(sql);
+		let result!: T;
+		let operationFailed = false;
+		let operationError: unknown;
+		try {
+			result = use(statement);
+		} catch (error) {
+			operationFailed = true;
+			operationError = error;
+		}
+
+		try {
+			statement.finalize();
+		} catch (finalizeError) {
+			if (operationFailed) {
+				throw new AggregateError(
+					[operationError, finalizeError],
+					"SQLite statement operation and finalization failed",
+					{ cause: operationError },
+				);
+			}
+			throw finalizeError;
+		}
+		if (operationFailed) throw operationError;
+		return result;
 	}
 
 	static async open(dbPath: string = getAgentDbPath()): Promise<SqliteAuthCredentialStore> {
@@ -7643,33 +7680,40 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 	}
 
 	#authCredentialsTableExists(): boolean {
-		const row = this.#db
-			.prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'auth_credentials'")
-			.get() as { present?: number } | undefined;
-		return row?.present === 1;
+		return this.#withStatement(
+			"SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'auth_credentials'",
+			statement => {
+				const row = statement.get() as { present?: number } | undefined;
+				return row?.present === 1;
+			},
+		);
 	}
 
 	#readAuthSchemaVersion(): number | null {
-		const row = this.#db.prepare("SELECT version FROM auth_schema_version WHERE id = 1").get() as
-			| { version?: number }
-			| undefined;
-		return typeof row?.version === "number" ? row.version : null;
+		return this.#withStatement("SELECT version FROM auth_schema_version WHERE id = 1", statement => {
+			const row = statement.get() as { version?: number } | undefined;
+			return typeof row?.version === "number" ? row.version : null;
+		});
 	}
 
 	#writeAuthSchemaVersion(version: number): void {
-		this.#db.prepare("INSERT OR REPLACE INTO auth_schema_version(id, version) VALUES (1, ?)").run(version);
+		this.#withStatement("INSERT OR REPLACE INTO auth_schema_version(id, version) VALUES (1, ?)", statement => {
+			statement.run(version);
+		});
 	}
 
 	#inferAuthSchemaVersion(): number {
-		const cols = this.#db.prepare("PRAGMA table_info(auth_credentials)").all() as Array<{ name?: string }>;
-		const hasDisabledCause = cols.some(column => column.name === "disabled_cause");
-		const hasIdentityKey = cols.some(column => column.name === "identity_key");
-		const hasAccountId = cols.some(column => column.name === "account_id");
-		const hasEmail = cols.some(column => column.name === "email");
-		if (hasIdentityKey) return 3;
-		if (hasAccountId || hasEmail) return 2;
-		if (hasDisabledCause) return 1;
-		return 0;
+		return this.#withStatement("PRAGMA table_info(auth_credentials)", statement => {
+			const cols = statement.all() as Array<{ name?: string }>;
+			const hasDisabledCause = cols.some(column => column.name === "disabled_cause");
+			const hasIdentityKey = cols.some(column => column.name === "identity_key");
+			const hasAccountId = cols.some(column => column.name === "account_id");
+			const hasEmail = cols.some(column => column.name === "email");
+			if (hasIdentityKey) return 3;
+			if (hasAccountId || hasEmail) return 2;
+			if (hasDisabledCause) return 1;
+			return 0;
+		});
 	}
 
 	#createAuthCredentialsTable(): void {
@@ -7713,7 +7757,10 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 
 	#migrateAuthSchemaV0ToV1(): void {
 		const migrate = this.#db.transaction(() => {
-			const v0Cols = this.#db.prepare("PRAGMA table_info(auth_credentials)").all() as Array<{ name?: string }>;
+			const v0Cols = this.#withStatement(
+				"PRAGMA table_info(auth_credentials)",
+				statement => statement.all() as Array<{ name?: string }>,
+			);
 			const hasDisabled = v0Cols.some(col => col.name === "disabled");
 
 			this.#db.run("ALTER TABLE auth_credentials RENAME TO auth_credentials_v0");
@@ -7789,24 +7836,27 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		migrate.immediate();
 	}
 	#migrateAuthSchemaV4ToV5(): void {
-		const columns = this.#db.prepare("PRAGMA table_info(auth_credentials)").all() as Array<{ name?: string }>;
+		const columns = this.#withStatement(
+			"PRAGMA table_info(auth_credentials)",
+			statement => statement.all() as Array<{ name?: string }>,
+		);
 		if (columns.some(column => column.name === "revision")) return;
 		this.#db.run("ALTER TABLE auth_credentials ADD COLUMN revision INTEGER NOT NULL DEFAULT 1");
 	}
 
 	#backfillCredentialIdentityKeys(): void {
-		const rows = this.#db
-			.prepare(
-				"SELECT id, provider, credential_type, data, disabled_cause, identity_key, revision FROM auth_credentials WHERE identity_key IS NULL ORDER BY id ASC",
-			)
-			.all() as AuthRow[];
+		const rows = this.#withStatement(
+			"SELECT id, provider, credential_type, data, disabled_cause, identity_key, revision FROM auth_credentials WHERE identity_key IS NULL ORDER BY id ASC",
+			statement => statement.all() as AuthRow[],
+		);
 		if (rows.length === 0) return;
 
-		const updateIdentity = this.#db.prepare("UPDATE auth_credentials SET identity_key = ? WHERE id = ?");
-		for (const row of rows) {
-			const identityKey = resolveRowCredentialIdentityKey(row.provider, row);
-			updateIdentity.run(identityKey, row.id);
-		}
+		this.#withStatement("UPDATE auth_credentials SET identity_key = ? WHERE id = ?", updateIdentity => {
+			for (const row of rows) {
+				const identityKey = resolveRowCredentialIdentityKey(row.provider, row);
+				updateIdentity.run(identityKey, row.id);
+			}
+		});
 	}
 
 	// ─── AuthCredentialStore interface ──────────────────────────────────────
@@ -7872,11 +7922,13 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		const remove = this.#db.transaction((): AuthCredentialHardRemovalResult => {
 			const currentIds: number[] = [];
 			for (const target of unique) {
-				const row = this.#db
-					.prepare("SELECT id, provider, credential_type, revision FROM auth_credentials WHERE id = ?")
-					.get(target.id) as
-					| { id?: number; provider?: string; credential_type?: string; revision?: number }
-					| undefined;
+				const row = this.#withStatement(
+					"SELECT id, provider, credential_type, revision FROM auth_credentials WHERE id = ?",
+					statement =>
+						statement.get(target.id) as
+							| { id?: number; provider?: string; credential_type?: string; revision?: number }
+							| undefined,
+				);
 				if (!row || row.provider !== provider || row.revision !== target.expectedRevision) {
 					currentIds.push(row?.id ?? target.id);
 				}
@@ -7884,12 +7936,16 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			if (currentIds.length > 0) return { kind: "conflict", currentIds };
 			for (const target of unique) {
 				this.#hardDeleteStmt.run(target.id);
-				this.#db.prepare("DELETE FROM oauth_refresh_leases WHERE credential_id = ?").run(target.id);
-				this.#db.prepare("DELETE FROM cache WHERE key = ?").run(`${HEALTH_CACHE_PREFIX}${target.id}`);
+				this.#withStatement("DELETE FROM oauth_refresh_leases WHERE credential_id = ?", statement => {
+					statement.run(target.id);
+				});
+				this.#withStatement("DELETE FROM cache WHERE key = ?", statement => {
+					statement.run(`${HEALTH_CACHE_PREFIX}${target.id}`);
+				});
 			}
-			this.#db
-				.prepare("DELETE FROM cache WHERE substr(key, 1, ?) = ?")
-				.run(`usage_cache:report:${provider}:`.length, `usage_cache:report:${provider}:`);
+			this.#withStatement("DELETE FROM cache WHERE substr(key, 1, ?) = ?", statement => {
+				statement.run(`usage_cache:report:${provider}:`.length, `usage_cache:report:${provider}:`);
+			});
 			return { kind: "removed", ids: unique.map(target => target.id) };
 		});
 		return remove.immediate();
@@ -7906,11 +7962,10 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		const enteredAtMs = Date.now();
 		const claim = this.#db.transaction((): OAuthRefreshLeaseClaim => {
 			const effectiveNowMs = nowMs + Math.max(0, Date.now() - enteredAtMs);
-			const row = this.#db
-				.prepare(
-					"SELECT id, provider, credential_type, data, disabled_cause, identity_key, revision FROM auth_credentials WHERE id = ? AND disabled_cause IS NULL",
-				)
-				.get(credentialId) as AuthRow | undefined;
+			const row = this.#withStatement(
+				"SELECT id, provider, credential_type, data, disabled_cause, identity_key, revision FROM auth_credentials WHERE id = ? AND disabled_cause IS NULL",
+				statement => statement.get(credentialId) as AuthRow | undefined,
+			);
 			const credential = row ? deserializeCredential(row) : null;
 			if (credential?.type !== "oauth") return { kind: "missing" };
 			if (
@@ -7927,14 +7982,16 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			) {
 				return { kind: "adopted", credential };
 			}
-			const active = this.#db
-				.prepare("SELECT owner, expires_at FROM oauth_refresh_leases WHERE credential_id = ?")
-				.get(credentialId) as { owner?: string; expires_at?: number } | undefined;
+			const active = this.#withStatement(
+				"SELECT owner, expires_at FROM oauth_refresh_leases WHERE credential_id = ?",
+				statement => statement.get(credentialId) as { owner?: string; expires_at?: number } | undefined,
+			);
 			if (typeof active?.expires_at === "number" && active.expires_at > effectiveNowMs) {
 				if (active.owner === owner) {
-					this.#db
-						.prepare("UPDATE oauth_refresh_leases SET expires_at = ? WHERE credential_id = ? AND owner = ?")
-						.run(effectiveNowMs + leaseMs, credentialId, owner);
+					this.#withStatement(
+						"UPDATE oauth_refresh_leases SET expires_at = ? WHERE credential_id = ? AND owner = ?",
+						statement => statement.run(effectiveNowMs + leaseMs, credentialId, owner),
+					);
 					return {
 						kind: "claimed",
 						credential,
@@ -7948,13 +8005,14 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				return { kind: "busy", expiresAt: active.expires_at };
 			}
 
-			this.#db.prepare("DELETE FROM oauth_refresh_leases WHERE credential_id = ?").run(credentialId);
+			this.#withStatement("DELETE FROM oauth_refresh_leases WHERE credential_id = ?", statement => {
+				statement.run(credentialId);
+			});
 			const tokenFingerprint = crypto.createHash("sha256").update(credential.refresh).digest("hex");
-			this.#db
-				.prepare(
-					"INSERT INTO oauth_refresh_leases (credential_id, owner, token_fingerprint, expires_at) VALUES (?, ?, ?, ?)",
-				)
-				.run(credentialId, owner, tokenFingerprint, effectiveNowMs + leaseMs);
+			this.#withStatement(
+				"INSERT INTO oauth_refresh_leases (credential_id, owner, token_fingerprint, expires_at) VALUES (?, ?, ?, ?)",
+				statement => statement.run(credentialId, owner, tokenFingerprint, effectiveNowMs + leaseMs),
+			);
 			return { kind: "claimed", credential, lease: { credentialId, owner, tokenFingerprint } };
 		});
 		return claim.immediate();
@@ -7962,22 +8020,24 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 
 	completeOAuthRefreshLease(lease: OAuthRefreshLease, credential: OAuthCredential): boolean {
 		const serialized = serializeCredential(
-			(
-				this.#db.prepare("SELECT provider FROM auth_credentials WHERE id = ?").get(lease.credentialId) as
-					| { provider?: string }
-					| undefined
+			this.#withStatement(
+				"SELECT provider FROM auth_credentials WHERE id = ?",
+				statement => statement.get(lease.credentialId) as { provider?: string } | undefined,
 			)?.provider ?? "",
 			credential,
 		);
 		if (!serialized) return false;
 		const complete = this.#db.transaction(() => {
-			const leaseRow = this.#db
-				.prepare("SELECT owner, token_fingerprint FROM oauth_refresh_leases WHERE credential_id = ?")
-				.get(lease.credentialId) as { owner?: string; token_fingerprint?: string } | undefined;
+			const leaseRow = this.#withStatement(
+				"SELECT owner, token_fingerprint FROM oauth_refresh_leases WHERE credential_id = ?",
+				statement =>
+					statement.get(lease.credentialId) as { owner?: string; token_fingerprint?: string } | undefined,
+			);
 			if (leaseRow?.owner !== lease.owner || leaseRow.token_fingerprint !== lease.tokenFingerprint) return false;
-			const row = this.#db
-				.prepare("SELECT data FROM auth_credentials WHERE id = ? AND disabled_cause IS NULL")
-				.get(lease.credentialId) as { data?: string } | undefined;
+			const row = this.#withStatement(
+				"SELECT data FROM auth_credentials WHERE id = ? AND disabled_cause IS NULL",
+				statement => statement.get(lease.credentialId) as { data?: string } | undefined,
+			);
 			if (
 				!row ||
 				crypto
@@ -7987,18 +8047,18 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			)
 				return false;
 			this.#updateStmt.run(serialized.credentialType, serialized.data, serialized.identityKey, lease.credentialId);
-			this.#db
-				.prepare("DELETE FROM oauth_refresh_leases WHERE credential_id = ? AND owner = ?")
-				.run(lease.credentialId, lease.owner);
+			this.#withStatement("DELETE FROM oauth_refresh_leases WHERE credential_id = ? AND owner = ?", statement => {
+				statement.run(lease.credentialId, lease.owner);
+			});
 			return true;
 		});
 		return complete.immediate();
 	}
 
 	releaseOAuthRefreshLease(lease: OAuthRefreshLease): void {
-		this.#db
-			.prepare("DELETE FROM oauth_refresh_leases WHERE credential_id = ? AND owner = ?")
-			.run(lease.credentialId, lease.owner);
+		this.#withStatement("DELETE FROM oauth_refresh_leases WHERE credential_id = ? AND owner = ?", statement => {
+			statement.run(lease.credentialId, lease.owner);
+		});
 	}
 
 	replaceAuthCredentialsForProvider(provider: string, credentials: AuthCredential[]): StoredAuthCredential[] {
@@ -8222,9 +8282,10 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 	}
 
 	updateAuthCredential(id: number, credential: AuthCredential): void {
-		const providerRow = this.#db.prepare("SELECT provider FROM auth_credentials WHERE id = ?").get(id) as
-			| { provider?: string }
-			| undefined;
+		const providerRow = this.#withStatement(
+			"SELECT provider FROM auth_credentials WHERE id = ?",
+			statement => statement.get(id) as { provider?: string } | undefined,
+		);
 		const provider = providerRow?.provider ?? "";
 		const serialized = serializeCredential(provider, credential);
 		if (!serialized) return;
@@ -8423,25 +8484,23 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 	close(): void {
 		if (this.#closed) return;
 		this.#closed = true;
-		this.#listActiveStmt.finalize();
-		this.#listActiveByProviderStmt.finalize();
-		this.#listAllStmt.finalize();
-		this.#listAllByProviderStmt.finalize();
-		this.#listDisabledByProviderStmt.finalize();
-		this.#insertStmt.finalize();
-		this.#updateStmt.finalize();
-		this.#deleteStmt.finalize();
-		this.#deleteIfMatchesStmt.finalize();
-		this.#deleteIfRevisionStmt.finalize();
-		this.#deleteByProviderStmt.finalize();
-		this.#hardDeleteStmt.finalize();
-		this.#getCacheStmt.finalize();
-		this.#getCacheIncludingExpiredStmt.finalize();
-		this.#upsertCacheStmt.finalize();
-		this.#claimUsageFetchLeaseStmt.finalize();
-		this.#releaseUsageFetchLeaseStmt.finalize();
-		this.#deleteCachePrefixStmt.finalize();
-		this.#deleteExpiredCacheStmt.finalize();
-		this.#db.close(true);
+		const errors: unknown[] = [];
+		for (const statement of this.#ownedStatements) {
+			try {
+				statement.finalize();
+			} catch (error) {
+				errors.push(error);
+			}
+		}
+		this.#ownedStatements.length = 0;
+		try {
+			this.#db.close(true);
+		} catch (error) {
+			errors.push(error);
+		}
+		if (errors.length === 1) throw errors[0];
+		if (errors.length > 1) {
+			throw new AggregateError(errors, "Failed to close SQLite auth credential store", { cause: errors[0] });
+		}
 	}
 }
