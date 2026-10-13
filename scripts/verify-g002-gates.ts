@@ -10,6 +10,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import traverse, { type NodePath } from "@babel/traverse";
 import { parse } from "@babel/parser";
 import type * as Babel from "@babel/types";
 
@@ -506,10 +507,130 @@ function isExactMcpFallback(statement: Babel.Statement): boolean {
 	);
 }
 
+function isMcpFilterMember(expression: Babel.Node, object: string, property: string): boolean {
+	return (
+		expression.type === "MemberExpression" &&
+		!expression.computed &&
+		expression.object.type === "Identifier" &&
+		expression.object.name === object &&
+		expression.property.type === "Identifier" &&
+		expression.property.name === property
+	);
+}
+
+function isStaticMcpFilterExpression(expression: Babel.Node, parameterName: string): boolean {
+	switch (expression.type) {
+		case "LogicalExpression":
+			return (
+				(expression.operator === "&&" || expression.operator === "||") &&
+				isStaticMcpFilterExpression(expression.left, parameterName) &&
+				isStaticMcpFilterExpression(expression.right, parameterName)
+			);
+		case "UnaryExpression":
+			return expression.operator === "!" && isStaticMcpFilterExpression(expression.argument, parameterName);
+		case "BinaryExpression":
+			return (
+				(expression.operator === "===" || expression.operator === "!==") &&
+				isStaticMcpFilterExpression(expression.left, parameterName) &&
+				isStaticMcpFilterExpression(expression.right, parameterName)
+			);
+		case "CallExpression": {
+			const argument = expression.arguments[0];
+			return (
+				!expression.optional &&
+				expression.arguments.length === 1 &&
+				isMcpFilterMember(expression.callee, "QUARANTINED_UTILITY_SLASH_COMMANDS", "has") &&
+				argument !== undefined &&
+				argument.type !== "SpreadElement" &&
+				argument.type !== "ArgumentPlaceholder" &&
+				isStaticMcpFilterExpression(argument, parameterName)
+			);
+		}
+		case "MemberExpression":
+			return isMcpFilterMember(expression, parameterName, "name");
+		case "Identifier":
+			return (
+				expression.name === parameterName ||
+				expression.name === "IMPORT_SESSION_RETAINED_DESCRIPTOR_AUTHORITY_AVAILABLE"
+			);
+		case "BooleanLiteral":
+		case "StringLiteral":
+			return true;
+		default:
+			return false;
+	}
+}
+
+function isActiveMcpRegistryFilterReference(identifierPath: NodePath<Babel.Identifier>): boolean {
+	const memberPath = identifierPath.parentPath;
+	if (
+		!memberPath?.isMemberExpression() ||
+		memberPath.node.object !== identifierPath.node ||
+		memberPath.node.computed ||
+		memberPath.node.property.type !== "Identifier" ||
+		memberPath.node.property.name !== "filter"
+	) {
+		return false;
+	}
+	const callPath = memberPath.parentPath;
+	if (
+		!callPath?.isCallExpression() ||
+		callPath.node.callee !== memberPath.node ||
+		callPath.node.optional ||
+		callPath.node.arguments.length !== 1
+	) {
+		return false;
+	}
+	const declarationPath = callPath.parentPath;
+	if (
+		!declarationPath?.isVariableDeclarator() ||
+		declarationPath.node.init !== callPath.node ||
+		declarationPath.node.id.type !== "Identifier" ||
+		declarationPath.node.id.name !== "ACTIVE_BUILTIN_SLASH_COMMAND_REGISTRY"
+	) {
+		return false;
+	}
+	const callback = callPath.node.arguments[0];
+	if (
+		callback?.type !== "ArrowFunctionExpression" ||
+		callback.async ||
+		callback.generator ||
+		callback.params.length !== 1 ||
+		callback.params[0]?.type !== "Identifier" ||
+		callback.body.type === "BlockStatement"
+	) {
+		return false;
+	}
+	return isStaticMcpFilterExpression(callback.body, callback.params[0].name);
+}
+
+function hasOnlyExpectedMcpRegistryUse(
+	program: Babel.File,
+	registryDeclaration: Babel.VariableDeclarator,
+): boolean {
+	let referenceCount = 0;
+	let hasExpectedFilterReference = false;
+	traverse(program, {
+		Identifier(identifierPath) {
+			if (
+				identifierPath.node.name !== "BUILTIN_SLASH_COMMAND_REGISTRY" ||
+				identifierPath.node === registryDeclaration.id
+			) {
+				return;
+			}
+			referenceCount++;
+			if (isActiveMcpRegistryFilterReference(identifierPath)) hasExpectedFilterReference = true;
+		},
+	});
+	return referenceCount === 0 || (referenceCount === 1 && hasExpectedFilterReference);
+}
+
 export function findMcpBuiltinQuarantineFindings(builtinRegistry: string): string[] {
 	let registry: Babel.ArrayExpression | undefined;
+	let registryDeclaration: Babel.VariableDeclarator | undefined;
+	let source: Babel.File;
 	try {
-		const source = parse(builtinRegistry, { sourceType: "module", plugins: ["typescript"] });
+		source = parse(builtinRegistry, { sourceType: "module", plugins: ["typescript"] });
 		for (const statement of source.program.body) {
 			if (statement.type !== "VariableDeclaration") continue;
 			for (const declaration of statement.declarations) {
@@ -518,6 +639,7 @@ export function findMcpBuiltinQuarantineFindings(builtinRegistry: string): strin
 					return ["root slash-command registry could not be isolated"];
 				}
 				registry = declaration.init;
+				registryDeclaration = declaration;
 				break;
 			}
 			if (registry) break;
@@ -525,7 +647,10 @@ export function findMcpBuiltinQuarantineFindings(builtinRegistry: string): strin
 	} catch {
 		return ["root slash-command registry could not be parsed"];
 	}
-	if (!registry) return ["root slash-command registry could not be isolated"];
+	if (!registry || !registryDeclaration) return ["root slash-command registry could not be isolated"];
+	if (!hasOnlyExpectedMcpRegistryUse(source, registryDeclaration)) {
+		return ["root slash-command registry has an unverified additional use or mutation"];
+	}
 
 	const mcpEntries: Babel.ObjectExpression[] = [];
 	for (const element of registry.elements) {
@@ -586,6 +711,21 @@ export function findMcpBuiltinQuarantineFindings(builtinRegistry: string): strin
 	return findings;
 }
 
+export function findMcpTuiMetadataFindings(slashCommandsSource: string, interactiveModeSource: string): string[] {
+	const metadataFilter =
+		/export function getBuiltinSlashCommandsForSession\s*\(\s*hasExactMcpControls:\s*boolean\s*\)\s*:\s*typeof BUILTIN_SLASH_COMMANDS\s*\{\s*if\s*\(\s*hasExactMcpControls\s*\)\s*return\s+BUILTIN_SLASH_COMMANDS\s*;\s*return\s+BUILTIN_SLASH_COMMANDS\.filter\(\s*command\s*=>\s*command\.name\s*!==\s*["']mcp["']\s*\)\s*;\s*\}/u.test(
+			slashCommandsSource,
+		);
+	const sessionCapabilityUsed =
+		/const\s+sessionBuiltinSlashCommands\s*=\s*getBuiltinSlashCommandsForSession\(\s*this\.session\.hasExactMcpControls\s*\)\s*;/u.test(
+			interactiveModeSource,
+		) &&
+		/this\.#baseSlashCommands\s*=\s*\[\s*\.\.\.sessionBuiltinSlashCommands\s*,/u.test(interactiveModeSource);
+	return metadataFilter && sessionCapabilityUsed
+		? []
+		: ["ordinary TUI /mcp metadata is not filtered by the exact MCP capability"];
+}
+
 async function verifyMcpQuarantine(): Promise<GateResult> {
 	const codingPackage = await readJson("packages/coding-agent/package.json");
 	const exportsRecord = isRecord(codingPackage.exports) ? codingPackage.exports : {};
@@ -595,11 +735,14 @@ async function verifyMcpQuarantine(): Promise<GateResult> {
 	const missingPrivateBlocks = REQUIRED_PRIVATE_EXPORT_BLOCKS.filter(key => exportsRecord[key] !== null);
 	const builtinRegistry = await readText("packages/coding-agent/src/slash-commands/builtin-registry.ts");
 	const acpBuiltins = await readText("packages/coding-agent/src/slash-commands/acp-builtins.ts");
+	const slashCommands = await readText("packages/coding-agent/src/extensibility/slash-commands.ts");
+	const interactiveMode = await readText("packages/coding-agent/src/modes/interactive-mode.ts");
 	// The root /mcp TUI entry is a supported control surface only for sessions
 	// holding the exact MCP capability. Nested subcommands such as `/aside mcp`
 	// and this guarded TUI command must not become default or ACP MCP access.
 	const exposesMcpBuiltin = /^\t\tname:\s*["']mcp["']/m.test(builtinRegistry);
 	const mcpBuiltinQuarantineFindings = findMcpBuiltinQuarantineFindings(builtinRegistry);
+	const mcpTuiMetadataFindings = findMcpTuiMetadataFindings(slashCommands, interactiveMode);
 	const importsMcpBuiltinHandler = builtinRegistry.includes("handleMcpAcp");
 	const acpReferencesMcpHandler = acpBuiltins.includes("handleMcpAcp");
 	const acpAdvertisesMcpCommand = /name:\s*["']mcp["']/.test(acpBuiltins);
@@ -632,6 +775,7 @@ async function verifyMcpQuarantine(): Promise<GateResult> {
 		`root /mcp literal-name builtin registered: ${exposesMcpBuiltin}`,
 		`root /mcp builtin restricted to exact-config TUI: ${exposesMcpBuiltin && mcpBuiltinQuarantineFindings.length === 0}`,
 		`root /mcp builtin quarantine findings: ${mcpBuiltinQuarantineFindings.join(", ") || "<none>"}`,
+		`ordinary TUI /mcp metadata findings: ${mcpTuiMetadataFindings.join(", ") || "<none>"}`,
 		`default /mcp handler imported: ${importsMcpBuiltinHandler}`,
 		`ACP /mcp command advertised: ${acpAdvertisesMcpCommand}`,
 		`ACP MCP handler referenced: ${acpReferencesMcpHandler}`,
@@ -656,6 +800,7 @@ async function verifyMcpQuarantine(): Promise<GateResult> {
 			exaMcpDocFindings.length === 0 &&
 			removedPublicDocsStillPresent.length === 0 &&
 			mcpBuiltinQuarantineFindings.length === 0 &&
+			mcpTuiMetadataFindings.length === 0 &&
 			!importsMcpBuiltinHandler &&
 			!acpAdvertisesMcpCommand &&
 			!acpReferencesMcpHandler &&

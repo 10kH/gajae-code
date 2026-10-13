@@ -39,7 +39,11 @@ import type {
 } from "../extensibility/extensions";
 import type { CompactOptions } from "../extensibility/extensions/types";
 import { resolveSkillSlashCommands, type Skill } from "../extensibility/skills";
-import { BUILTIN_SLASH_COMMANDS, loadSlashCommands } from "../extensibility/slash-commands";
+import {
+	BUILTIN_SLASH_COMMANDS,
+	getBuiltinSlashCommandsForSession,
+	loadSlashCommands,
+} from "../extensibility/slash-commands";
 import { getLspStartupWarningMessage, LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "../lsp/startup-events";
 import {
 	createStarReminderBeforeAgentStartContributor,
@@ -771,6 +775,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.hideThinkingBlock = settings.get("hideThinkingBlock");
 
 		const builtinCommandNames = new Set(BUILTIN_SLASH_COMMANDS.map(c => c.name));
+		const sessionBuiltinSlashCommands = getBuiltinSlashCommandsForSession(this.session.hasExactMcpControls);
 		const activeProvider = this.session.model?.provider;
 		const hookCommands: SlashCommand[] = (
 			this.session.extensionRunner?.getRegisteredCommands(builtinCommandNames) ?? []
@@ -788,8 +793,13 @@ export class InteractiveMode implements InteractiveModeContext {
 			description: `${loaded.command.description} (${loaded.source})`,
 		}));
 
-		this.#baseSlashCommands = [...BUILTIN_SLASH_COMMANDS, ...hookCommands, ...customCommands];
-		this.#baseReservedSlashCommandNames = new Set(this.#baseSlashCommands.map(command => command.name));
+		this.#baseSlashCommands = [...sessionBuiltinSlashCommands, ...hookCommands, ...customCommands];
+		// Hidden builtin metadata must still reserve its name from extensions and skills.
+		this.#baseReservedSlashCommandNames = new Set([
+			...builtinCommandNames,
+			...hookCommands.map(command => command.name),
+			...customCommands.map(command => command.name),
+		]);
 		this.#resolvedSlashCommands = [...this.#baseSlashCommands, ...this.#rebuildSkillSlashCommands()];
 
 		this.#uiHelpers = new UiHelpers(this);

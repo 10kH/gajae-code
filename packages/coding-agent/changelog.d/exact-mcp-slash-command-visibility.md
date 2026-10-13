@@ -1,0 +1,3 @@
+### Changed
+
+- Show `/mcp` command metadata only in interactive sessions with exact-file MCP controls; ordinary TUI sessions no longer advertise it.

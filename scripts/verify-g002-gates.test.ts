@@ -4,6 +4,7 @@ import { buildDocsIndexOutput } from "./check-public-version-sync";
 import {
 	findExaMcpDocFindings,
 	findMcpBuiltinQuarantineFindings,
+	findMcpTuiMetadataFindings,
 	parseEmbeddedDocs,
 } from "./verify-g002-gates";
 
@@ -105,6 +106,16 @@ describe("MCP command quarantine", () => {
 				"root /mcp TUI handler parameters must be command and runtime identifiers",
 			);
 		}
+	});
+
+	test("does not bind the capability guard to a module-scoped runtime instead of the handler parameter", () => {
+		const shadowedRuntime = [
+			'const runtime = { ctx: { session: { hasExactMcpControls: true } } };',
+			registryWithEntries([exactMcpTuiEntry.replaceAll("runtime", "sessionRuntime")]),
+		].join("\n");
+		expect(findMcpBuiltinQuarantineFindings(shadowedRuntime)).toContain(
+			"root /mcp TUI handler parameters must be command and runtime identifiers",
+		);
 	});
 
 	test("rejects method-style MCP handler parameters with pre-guard defaults", () => {
@@ -217,6 +228,30 @@ describe("MCP command quarantine", () => {
 		);
 	});
 
+	test("rejects mutations and extra reads after the root registry declaration", () => {
+		const mutated = [
+			"const BUILTIN_SLASH_COMMAND_REGISTRY = [{ name: 'mcp' }];",
+			'BUILTIN_SLASH_COMMAND_REGISTRY.find(command => command.name === "mcp")!.handle = () => false;',
+			"const ACTIVE_BUILTIN_SLASH_COMMAND_REGISTRY = BUILTIN_SLASH_COMMAND_REGISTRY.filter(command => true);",
+		].join("\n");
+		expect(findMcpBuiltinQuarantineFindings(mutated)).toContain(
+			"root slash-command registry has an unverified additional use or mutation",
+		);
+	});
+
+	test("rejects side effects while constructing the active registry", () => {
+		const mutated = [
+			"const BUILTIN_SLASH_COMMAND_REGISTRY = [{ name: 'mcp' }];",
+			"const ACTIVE_BUILTIN_SLASH_COMMAND_REGISTRY = BUILTIN_SLASH_COMMAND_REGISTRY.filter(command => {",
+			"command.handle = () => false;",
+			"return true;",
+			"});",
+		].join("\n");
+		expect(findMcpBuiltinQuarantineFindings(mutated)).toContain(
+			"root slash-command registry has an unverified additional use or mutation",
+		);
+	});
+
 	test("rejects duplicate root /mcp registrations", () => {
 		expect(findMcpBuiltinQuarantineFindings(registryWithEntries([exactMcpTuiEntry, exactMcpTuiEntry]))).toContain(
 			"multiple root /mcp builtins are registered",
@@ -225,6 +260,32 @@ describe("MCP command quarantine", () => {
 
 	test("allows the quarantined state with no root /mcp command", () => {
 		expect(findMcpBuiltinQuarantineFindings(registryWithEntries(['\t\tname: "status",']))).toEqual([]);
+	});
+
+	test("requires session-gated TUI metadata for the root /mcp command", async () => {
+		const root = path.join(import.meta.dir, "..");
+		const slashCommands = await Bun.file(path.join(root, "packages/coding-agent/src/extensibility/slash-commands.ts")).text();
+		const interactiveMode = await Bun.file(path.join(root, "packages/coding-agent/src/modes/interactive-mode.ts")).text();
+		expect(findMcpTuiMetadataFindings(slashCommands, interactiveMode)).toEqual([]);
+	});
+
+	test("rejects TUI metadata filters that do not hide /mcp without the exact capability", () => {
+		const slashCommands = [
+			"export function getBuiltinSlashCommandsForSession(hasExactMcpControls: boolean): typeof BUILTIN_SLASH_COMMANDS {",
+			"if (hasExactMcpControls) return BUILTIN_SLASH_COMMANDS;",
+			"return BUILTIN_SLASH_COMMANDS.filter(command => command.name !== 'mcp');",
+			"}",
+		].join("\n");
+		const interactiveMode = [
+			"const sessionBuiltinSlashCommands = getBuiltinSlashCommandsForSession(this.session.hasExactMcpControls);",
+			"this.#baseSlashCommands = [...sessionBuiltinSlashCommands, ...hookCommands, ...customCommands];",
+		].join("\n");
+		expect(findMcpTuiMetadataFindings(slashCommands.replace("command.name !== 'mcp'", "true"), interactiveMode)).toContain(
+			"ordinary TUI /mcp metadata is not filtered by the exact MCP capability",
+		);
+		expect(
+			findMcpTuiMetadataFindings(slashCommands, interactiveMode.replace("this.session.hasExactMcpControls", "true")),
+		).toContain("ordinary TUI /mcp metadata is not filtered by the exact MCP capability");
 	});
 });
 
