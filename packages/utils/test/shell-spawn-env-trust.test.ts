@@ -17,7 +17,10 @@ const PROBE = path.join(import.meta.dir, "fixtures", "shell-spawn-env-probe.ts")
 const HOOK_KEYS = [
 	"BASH_ENV",
 	"GIT_ASKPASS",
+	"GIT_EXEC_PATH",
+	"GIT_PROXY_COMMAND",
 	"GIT_SEQUENCE_EDITOR",
+	"GIT_TEMPLATE_DIR",
 	"ZDOTDIR",
 	"ENV",
 	"XDG_CONFIG_HOME",
@@ -68,7 +71,10 @@ async function probeIn(cwd: string, autoload: boolean, inherited: Record<string,
 const PLANTED = [
 	"BASH_ENV=./hook.sh",
 	"GIT_ASKPASS=./hook.sh",
+	"GIT_EXEC_PATH=./git-exec",
+	"GIT_PROXY_COMMAND=./proxy.sh",
 	"GIT_SEQUENCE_EDITOR=./hook.sh",
+	"GIT_TEMPLATE_DIR=./templates",
 	"ZDOTDIR=./zdot",
 	"ENV=./hook.sh",
 	"XDG_CONFIG_HOME=./xdg",
@@ -93,7 +99,10 @@ describe.each([
 		expect(probe).toEqual({
 			BASH_ENV: null,
 			GIT_ASKPASS: null,
+			GIT_EXEC_PATH: null,
+			GIT_PROXY_COMMAND: null,
 			GIT_SEQUENCE_EDITOR: null,
+			GIT_TEMPLATE_DIR: null,
 			ZDOTDIR: null,
 			ENV: null,
 			XDG_CONFIG_HOME: null,
@@ -118,9 +127,18 @@ describe.each([
 	});
 
 	it("keeps hook variables inherited from the launching shell", async () => {
-		const probe = await probeIn(tempDir(), autoload, { BASH_ENV: "/opt/operator/bashenv", GIT_CONFIG_COUNT: "0" });
+		const probe = await probeIn(tempDir(), autoload, {
+			BASH_ENV: "/opt/operator/bashenv",
+			GIT_CONFIG_COUNT: "0",
+			GIT_EXEC_PATH: "/opt/operator/git-exec",
+			GIT_PROXY_COMMAND: "/opt/operator/proxy.sh",
+			GIT_TEMPLATE_DIR: "/opt/operator/templates",
+		});
 		expect(probe.BASH_ENV).toBe("/opt/operator/bashenv");
 		expect(probe.GIT_CONFIG_COUNT).toBe("0");
+		expect(probe.GIT_EXEC_PATH).toBe("/opt/operator/git-exec");
+		expect(probe.GIT_PROXY_COMMAND).toBe("/opt/operator/proxy.sh");
+		expect(probe.GIT_TEMPLATE_DIR).toBe("/opt/operator/templates");
 	});
 
 	it("does not let the project .env replace an inherited value", async () => {

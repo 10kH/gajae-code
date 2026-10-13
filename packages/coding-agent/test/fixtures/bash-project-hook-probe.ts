@@ -5,13 +5,13 @@ import type { AgentToolContext } from "@gajae-code/agent-core";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { executeBash, setShellFactoryForTests } from "@gajae-code/coding-agent/exec/bash-executor";
 import { runInteractiveBashPty } from "@gajae-code/coding-agent/tools/bash-interactive";
+import { Shell } from "@gajae-code/natives";
 
 const mode = process.argv[2];
 const command = process.env.GJC_TEST_PROBE_COMMAND ?? "git status --short >/dev/null 2>&1; echo probe-done";
 // `inprocess` drives the native shell directly in this process, the path Windows
 // uses, where the shell imports the host environment before `sessionEnv`.
 if (mode === "inprocess") {
-	const { Shell } = await import("@gajae-code/natives");
 	setShellFactoryForTests(async options => new Shell(options));
 }
 const cwd = process.cwd();

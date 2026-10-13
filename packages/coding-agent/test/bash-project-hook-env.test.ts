@@ -17,7 +17,10 @@ const PROBE = path.join(import.meta.dir, "fixtures", "bash-project-hook-probe.ts
 const HOOK_KEYS = [
 	"BASH_ENV",
 	"GIT_ASKPASS",
+	"GIT_EXEC_PATH",
+	"GIT_PROXY_COMMAND",
 	"GIT_SEQUENCE_EDITOR",
+	"GIT_TEMPLATE_DIR",
 	"ZDOTDIR",
 	"ENV",
 	"XDG_CONFIG_HOME",
@@ -172,6 +175,49 @@ describe.skipIf(process.platform === "win32")("bash tool ignores project .env ho
 		});
 		const command = `git ls-remote http://127.0.0.1:${server.port}/r.git >/dev/null 2>&1; echo probe-done`;
 		expect(await runProbe(target, "worker", { GJC_TEST_PROBE_COMMAND: command })).toBe(false);
+	});
+
+	it("does not run a project GIT_EXEC_PATH helper during a remote lookup", async () => {
+		const target = project(({ cwd, hook }) => {
+			const execPath = path.join(cwd, "git-exec");
+			fs.mkdirSync(execPath);
+			const helper = path.join(execPath, "git-remote-http");
+			fs.copyFileSync(hook, helper);
+			fs.chmodSync(helper, 0o755);
+			return `GIT_EXEC_PATH=${execPath}\n`;
+		});
+		const command = "git ls-remote http://127.0.0.1:1/r.git >/dev/null 2>&1; echo probe-done";
+		for (const mode of ["worker", "pty", "inprocess"] as const) {
+			const inherited = { GJC_TEST_PROBE_COMMAND: command, ...(mode === "worker" ? {} : forwarded(target)) };
+			expect(await runProbe(target, mode, inherited)).toBe(false);
+		}
+	});
+
+	it("does not run a project GIT_PROXY_COMMAND during a git-protocol lookup", async () => {
+		const target = project(({ hook }) => `GIT_PROXY_COMMAND=${hook}\n`);
+		const command = "git ls-remote git://127.0.0.1:1/r.git >/dev/null 2>&1; echo probe-done";
+		for (const mode of ["worker", "pty", "inprocess"] as const) {
+			const inherited = { GJC_TEST_PROBE_COMMAND: command, ...(mode === "worker" ? {} : forwarded(target)) };
+			expect(await runProbe(target, mode, inherited)).toBe(false);
+		}
+	});
+
+	it("does not install a project GIT_TEMPLATE_DIR hook during git init", async () => {
+		const target = project(({ cwd, hook }) => {
+			const templates = path.join(cwd, "templates");
+			const hooks = path.join(templates, "hooks");
+			fs.mkdirSync(hooks, { recursive: true });
+			const preCommit = path.join(hooks, "pre-commit");
+			fs.copyFileSync(hook, preCommit);
+			fs.chmodSync(preCommit, 0o755);
+			return `GIT_TEMPLATE_DIR=${templates}\n`;
+		});
+		const repo = path.join(target.cwd, "new-repo");
+		const command = `git init -q "${repo}" && git -C "${repo}" -c user.email=a@b -c user.name=a commit --allow-empty -qm probe; echo probe-done`;
+		for (const mode of ["worker", "pty", "inprocess"] as const) {
+			const inherited = { GJC_TEST_PROBE_COMMAND: command, ...(mode === "worker" ? {} : forwarded(target)) };
+			expect(await runProbe(target, mode, inherited)).toBe(false);
+		}
 	});
 
 	it("still honors a hook variable the launching shell exported with a different value", async () => {

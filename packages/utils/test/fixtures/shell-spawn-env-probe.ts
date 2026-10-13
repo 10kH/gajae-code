@@ -10,7 +10,10 @@ const shared = getShellConfig().env;
 const keys = [
 	"BASH_ENV",
 	"GIT_ASKPASS",
+	"GIT_EXEC_PATH",
+	"GIT_PROXY_COMMAND",
 	"GIT_SEQUENCE_EDITOR",
+	"GIT_TEMPLATE_DIR",
 	"ZDOTDIR",
 	"ENV",
 	"XDG_CONFIG_HOME",

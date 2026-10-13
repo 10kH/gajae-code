@@ -46,25 +46,20 @@ function isExecutable(path: string): boolean {
 }
 
 /**
- * Build the spawn environment (cached).
- *
- * `CI=true` is injected unless the documented `GJC_BASH_NO_CI` (or its legacy
- * `PI_BASH_NO_CI` / `CLAUDE_BASH_NO_CI` aliases) is set to a canonical truthy
- * flag value.
- */
-/**
  * Variables that make the shell or git run code on their own. bash sources
  * `BASH_ENV` (sh: `ENV`) before every non-interactive command, and zsh sources
  * `$ZDOTDIR/.zshenv`. git applies `GIT_CONFIG_*`, reads config from
  * `GIT_DIR`/`GIT_COMMON_DIR`, `$XDG_CONFIG_HOME/git/config` and `$HOME/.gitconfig`,
  * and so runs e.g. `core.fsmonitor` during `git status`; it also runs
+ * helpers from `GIT_EXEC_PATH`, `GIT_PROXY_COMMAND` for `git://` remotes,
  * `GIT_EXTERNAL_DIFF`, `GIT_SSH(_COMMAND)`, `GIT_ASKPASS` (auth prompts, even
- * with `GIT_TERMINAL_PROMPT=0`) and `GIT_SEQUENCE_EDITOR` (`git rebase -i`). A repository `.env` must not be
- * able to set them, or every bash tool command — including a restricted role
- * agent's allowlisted `git status` — would execute repository code.
+ * with `GIT_TERMINAL_PROMPT=0`) and `GIT_SEQUENCE_EDITOR` (`git rebase -i`).
+ * `GIT_TEMPLATE_DIR` can also seed executable hooks when `git init` creates a
+ * repository. A repository `.env` must not be able to set them, or bash tool
+ * commands could execute repository code.
  */
 const PROJECT_DENIED_SPAWN_ENV =
-	/^(?:BASH_ENV|ENV|ZDOTDIR|HOME|XDG_CONFIG_HOME|GIT_DIR|GIT_COMMON_DIR|GIT_EXTERNAL_DIFF|GIT_SSH|GIT_SSH_COMMAND|GIT_ASKPASS|GIT_SEQUENCE_EDITOR|GIT_CONFIG_(?:COUNT|PARAMETERS|GLOBAL|SYSTEM|KEY_\d+|VALUE_\d+))$/;
+	/^(?:BASH_ENV|ENV|ZDOTDIR|HOME|XDG_CONFIG_HOME|GIT_DIR|GIT_COMMON_DIR|GIT_EXEC_PATH|GIT_EXTERNAL_DIFF|GIT_PROXY_COMMAND|GIT_SSH|GIT_SSH_COMMAND|GIT_ASKPASS|GIT_SEQUENCE_EDITOR|GIT_TEMPLATE_DIR|GIT_CONFIG_(?:COUNT|PARAMETERS|GLOBAL|SYSTEM|KEY_\d+|VALUE_\d+))$/;
 
 /**
  * Names of hook-capable variables whose live value came from the project `.env`.
@@ -118,6 +113,13 @@ export function projectSafeSpawnEnv(): Record<string, string> {
 	return stripProjectSpawnHooks(filterProcessEnv(Bun.env));
 }
 
+/**
+ * Build the spawn environment (cached).
+ *
+ * `CI=true` is injected unless the documented `GJC_BASH_NO_CI` (or its legacy
+ * `PI_BASH_NO_CI` / `CLAUDE_BASH_NO_CI` aliases) is set to a canonical truthy
+ * flag value.
+ */
 function buildSpawnEnv(shell: string): Record<string, string> {
 	const noCI = $pickflag("GJC_BASH_NO_CI", "PI_BASH_NO_CI", "CLAUDE_BASH_NO_CI");
 	const inherited = filterProcessEnv(Bun.env);
