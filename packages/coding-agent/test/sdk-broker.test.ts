@@ -3070,6 +3070,34 @@ describe("SDK broker identity and discovery", () => {
 				);
 			}
 		});
+		it("fences every session a final legacy row records and keeps uncertain rows fenced", async () => {
+			await withLegacyLedger(
+				async ledger => {
+					await ledger.begin("legacy-two-sessions", "legacy-two-sessions-request", {
+						intendedSessionId: "session-a",
+					});
+					await ledger.transition("legacy-two-sessions", "terminal_ok", {
+						resultSessionId: "session-c",
+						response: { ok: true, result: { sessionId: "session-c" } },
+					});
+				},
+				async broker => {
+					await expect(
+						broker.handleRequest("session.close", { sessionId: "session-c" }, "fresh-close-c"),
+					).resolves.toEqual(ambiguousTarget);
+					await expect(
+						broker.handleRequest("session.close", { sessionId: "session-b" }, "fresh-close-b"),
+					).resolves.not.toEqual(ambiguousTarget);
+					await broker.ledger.begin("legacy-uncertain", "legacy-uncertain-request", {
+						intendedSessionId: "session-a",
+					});
+					await broker.ledger.transition("legacy-uncertain", "terminal_uncertain");
+					await expect(
+						broker.handleRequest("session.close", { sessionId: "session-b" }, "fresh-close-b-uncertain"),
+					).resolves.toEqual(ambiguousTarget);
+				},
+			);
+		});
 		it("keeps final legacy rows without a recorded session fenced", async () => {
 			await withLegacyLedger(
 				async ledger => {
