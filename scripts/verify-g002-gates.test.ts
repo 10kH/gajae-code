@@ -98,6 +98,18 @@ describe("MCP command quarantine", () => {
 		);
 	});
 
+	test("rejects computed properties whose handler names cannot be verified", () => {
+		const exposed = registryWithEntries([
+			exactMcpTuiEntry.replace(
+				'\t\thandleTui: async (command, runtime) => {',
+				'\t\t[handlerName]: async () => false,\n\t\thandleTui: async (command, runtime) => {',
+			),
+		]);
+		expect(findMcpBuiltinQuarantineFindings(exposed)).toContain(
+			"root /mcp builtin contains an unverified computed property",
+		);
+	});
+
 	test("rejects duplicate root /mcp registrations", () => {
 		expect(findMcpBuiltinQuarantineFindings(registryWithEntries([exactMcpTuiEntry, exactMcpTuiEntry]))).toContain(
 			"multiple root /mcp builtins are registered",

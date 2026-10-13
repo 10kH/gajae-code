@@ -493,6 +493,13 @@ export function findMcpBuiltinQuarantineFindings(builtinRegistry: string): strin
 		if (entry.properties.some(property => property.type === "SpreadElement")) {
 			findings.push("root /mcp builtin contains an unverified spread");
 		}
+		if (
+			entry.properties.some(
+				property => property.type !== "SpreadElement" && property.computed && property.key.type !== "StringLiteral",
+			)
+		) {
+			findings.push("root /mcp builtin contains an unverified computed property");
+		}
 		if (entry.properties.some(property => getStaticMcpMemberName(property) === "handle")) {
 			findings.push("root /mcp builtin has an unrestricted default handler");
 		}
