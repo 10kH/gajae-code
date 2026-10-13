@@ -34,6 +34,7 @@ describe("/handoff command", () => {
 		const chatContainer = createContainer();
 		const abortHandoff = vi.fn();
 		const requestRender = vi.fn();
+		const refreshSlashCommandState = vi.fn(async () => {});
 		const ctx = {
 			sessionManager: {
 				getEntries: () => [{ type: "message" }, { type: "message" }],
@@ -59,6 +60,7 @@ describe("/handoff command", () => {
 			showWarning: vi.fn(),
 			showError: vi.fn(),
 			resetIrcSidebarSession: vi.fn(),
+			refreshSlashCommandState,
 		} as unknown as InteractiveModeContext;
 		const controller = new CommandController(ctx);
 
@@ -76,6 +78,7 @@ describe("/handoff command", () => {
 		expect(statusContainer.children).toHaveLength(0);
 		expect(ctx.editor.onEscape).toBe(originalOnEscape);
 		expect(ctx.session.handoff).toHaveBeenCalledWith("focus on tests");
+		expect(refreshSlashCommandState).toHaveBeenCalledTimes(1);
 		expect(ctx.resetIrcSidebarSession).toHaveBeenCalledTimes(1);
 	});
 

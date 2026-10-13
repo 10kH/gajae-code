@@ -5,7 +5,7 @@ import { CompactionCancelledError, type CompactionOutcome } from "@gajae-code/ag
 import { getEnvApiKey, type ToolCall, type UsageLimit, type UsageReport } from "@gajae-code/ai/core";
 import type { ProviderDetails } from "@gajae-code/ai/provider-details";
 import { type Keybinding, Loader, Markdown, padding, Spacer, Text, visibleWidth } from "@gajae-code/tui";
-import { formatBytes, formatDuration, Snowflake, setProjectDir } from "@gajae-code/utils";
+import { formatBytes, formatDuration, logger, Snowflake, setProjectDir } from "@gajae-code/utils";
 import { canonicalEnvKey, projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import { resolveAppendOnlyMode } from "../../append-only-mode";
 import { jobElapsedMs } from "../../async";
@@ -1072,10 +1072,20 @@ export class CommandController {
 		}
 	}
 
+	async #refreshSlashCommandStateAfterIdentityChange(): Promise<void> {
+		try {
+			await this.ctx.refreshSlashCommandState();
+		} catch (error) {
+			logger.warn("Failed to refresh slash-command state after session identity change", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
 	async #runNewSessionFlow(options?: NewSessionOptions, label: string = "New session started"): Promise<boolean> {
 		if (!(await this.ctx.session.newSession(options))) return false;
 		if (this.ctx.isStopped?.()) return false;
-		await this.ctx.refreshSlashCommandState();
+		await this.#refreshSlashCommandStateAfterIdentityChange();
 		clearInteractiveActivityLoaders(this.ctx);
 
 		stopInteractiveActivityIndicator(this.ctx, { foregroundSettled: true });
@@ -1493,6 +1503,7 @@ export class CommandController {
 				this.ctx.showError("Handoff cancelled");
 				return;
 			}
+			await this.#refreshSlashCommandStateAfterIdentityChange();
 			this.ctx.resetIrcSidebarSession();
 
 			// Rebuild chat from the new session (which now contains the handoff document)
