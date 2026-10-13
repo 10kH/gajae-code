@@ -971,6 +971,31 @@ describe("tmux self-injection guard", () => {
 			).resolves.toEqual({ block: false });
 		});
 
+		it("inspects here-document bodies executed from shell stdin", async () => {
+			const script = "tmux send-keys -t %47 x";
+			for (const command of [
+				`bash <<'EOF'\n${script}\nEOF`,
+				`bash -s <<'EOF'\n${script}\nEOF`,
+				`bash -- - <<'EOF'\n${script}\nEOF`,
+				`env bash <<'EOF'\n${script}\nEOF`,
+				`busybox sh <<'EOF'\n${script}\nEOF`,
+			]) {
+				await expect(checkTmuxSelfInjection(command, options)).resolves.toMatchObject({ block: true });
+			}
+		});
+
+		it("keeps here-document data and non-stdin redirects out of shell analysis", async () => {
+			const document = "tmux send-keys -t %47 x";
+			for (const command of [
+				`cat <<'EOF'\n${document}\nEOF`,
+				`bash -c cat <<'EOF'\n${document}\nEOF`,
+				`bash /tmp/script.sh <<'EOF'\n${document}\nEOF`,
+				`bash 3<<'EOF'\n${document}\nEOF`,
+			]) {
+				await expect(checkTmuxSelfInjection(command, options)).resolves.toEqual({ block: false });
+			}
+		});
+
 		it("consumes exec's alternate-name operand", async () => {
 			await expect(
 				checkTmuxSelfInjection("exec -a disguise tmux send-keys -t %47 x", options),

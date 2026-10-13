@@ -184,7 +184,21 @@ interface Token {
 	quoted: boolean;
 	commandStart: boolean;
 	segment: number;
+	isRedirectionTarget?: boolean;
 	isWrappedCommand?: boolean; // true if this token is the actual command being wrapped by a wrapper like 'command', 'env', 'sudo'
+}
+
+interface HereDocument {
+	delimiter: string;
+	stripTabs: boolean;
+	segment: number;
+	stdin: boolean;
+	body: string;
+}
+
+interface TokenizeResult {
+	tokens: Token[];
+	hereDocuments: HereDocument[];
 }
 
 function isSeparator(ch: string): boolean {
@@ -230,8 +244,9 @@ function wrapperOptionTakesNextArgument(wrapper: { name: string; spec: WrapperSp
 }
 
 /** Small quote-aware lexer. Unknown shell syntax is represented conservatively. */
-function tokenize(command: string): Token[] {
+function tokenize(command: string): TokenizeResult {
 	const tokens: Token[] = [];
+	const hereDocuments: HereDocument[] = [];
 	let text = "";
 	let quoted = false;
 	let quote: "'" | '"' | undefined;
@@ -245,24 +260,34 @@ function tokenize(command: string): Token[] {
 	let redirectionTargetPending = false;
 	let redirectionTargetIsHereDoc = false;
 	let redirectionTargetStripTabs = false;
+	let redirectionTargetFd: number | undefined;
 	let currentTokenIsPendingOperand = false;
-	const hereDocDelimiters: { delimiter: string; stripTabs: boolean }[] = [];
-	let activeHereDoc: { delimiter: string; stripTabs: boolean } | undefined;
+	const hereDocDelimiters: HereDocument[] = [];
+	let activeHereDoc: HereDocument | undefined;
 	let hereDocLine = "";
 
 	const flush = () => {
 		if (text.length === 0 && !quoted) return;
 
 		if (redirectionTargetPending) {
-			tokens.push({ text, quoted, commandStart: false, segment });
+			tokens.push({ text, quoted, commandStart: false, segment, isRedirectionTarget: true });
 			if (redirectionTargetIsHereDoc) {
-				hereDocDelimiters.push({ delimiter: text, stripTabs: redirectionTargetStripTabs });
+				const hereDocument: HereDocument = {
+					delimiter: text,
+					stripTabs: redirectionTargetStripTabs,
+					segment,
+					stdin: redirectionTargetFd === undefined || redirectionTargetFd === 0,
+					body: "",
+				};
+				hereDocDelimiters.push(hereDocument);
+				hereDocuments.push(hereDocument);
 			}
 			text = "";
 			quoted = false;
 			redirectionTargetPending = false;
 			redirectionTargetIsHereDoc = false;
 			redirectionTargetStripTabs = false;
+			redirectionTargetFd = undefined;
 			currentTokenIsPendingOperand = false;
 			return;
 		}
@@ -434,6 +459,8 @@ function tokenize(command: string): Token[] {
 				const line = activeHereDoc.stripTabs ? hereDocLine.replace(/^\t+/, "") : hereDocLine;
 				if (line.replace(/\r$/, "") === activeHereDoc.delimiter) {
 					activeHereDoc = hereDocDelimiters.shift();
+				} else {
+					activeHereDoc.body += `${line}\n`;
 				}
 				hereDocLine = "";
 			} else {
@@ -475,6 +502,7 @@ function tokenize(command: string): Token[] {
 			redirectionTargetPending = false;
 			redirectionTargetIsHereDoc = false;
 			redirectionTargetStripTabs = false;
+			redirectionTargetFd = undefined;
 			currentTokenIsPendingOperand = false;
 			if (hereDocDelimiters.length > 0) activeHereDoc = hereDocDelimiters.shift();
 			continue;
@@ -492,11 +520,17 @@ function tokenize(command: string): Token[] {
 			redirectionTargetPending = true;
 			redirectionTargetIsHereDoc = false;
 			redirectionTargetStripTabs = false;
+			redirectionTargetFd = undefined;
 			continue;
 		}
 		if (ch === "<" || ch === ">") {
-			if (/^\d+$/.test(text)) text = "";
-			else flush();
+			if (/^\d+$/.test(text)) {
+				redirectionTargetFd = Number(text);
+				text = "";
+			} else {
+				flush();
+				redirectionTargetFd = undefined;
+			}
 			const isHereDoc = ch === "<" && command[index + 1] === "<" && command[index + 2] !== "<";
 			while (command[index + 1] === ch) index++;
 			const stripTabs = isHereDoc && command[index + 1] === "-";
@@ -517,6 +551,7 @@ function tokenize(command: string): Token[] {
 			redirectionTargetPending = false;
 			redirectionTargetIsHereDoc = false;
 			redirectionTargetStripTabs = false;
+			redirectionTargetFd = undefined;
 			currentTokenIsPendingOperand = false;
 			continue;
 		}
@@ -525,7 +560,11 @@ function tokenize(command: string): Token[] {
 		text += ch;
 	}
 	flush();
-	return tokens;
+	if (activeHereDoc && hereDocLine.length > 0) {
+		const line = activeHereDoc.stripTabs ? hereDocLine.replace(/^\t+/, "") : hereDocLine;
+		if (line.replace(/\r$/, "") !== activeHereDoc.delimiter) activeHereDoc.body += line;
+	}
+	return { tokens, hereDocuments };
 }
 
 interface Invocation {
@@ -1021,6 +1060,88 @@ function collectShellPayloads(tokens: Token[]): string[] {
 	return payloads;
 }
 
+function shellReadsStdin(arguments_: Token[]): boolean {
+	const optionsWithArgument = new Set(["-O", "-o"]);
+	let skipNextArgument = false;
+	let optionsTerminated = false;
+
+	for (const token of arguments_) {
+		const argument = token.text;
+		if (skipNextArgument) {
+			skipNextArgument = false;
+			continue;
+		}
+		if (optionsTerminated) return argument === "-";
+		if (argument === "--") {
+			optionsTerminated = true;
+			continue;
+		}
+		if (argument === "-" || argument === "-s") return true;
+		if (
+			argument === "-c" ||
+			(argument.startsWith("-") &&
+				!argument.startsWith("--") &&
+				argument.length > 2 &&
+				argument.slice(1).includes("c"))
+		) {
+			return false;
+		}
+		if (argument === "+O" || argument === "+o") {
+			skipNextArgument = true;
+			continue;
+		}
+		if (argument.startsWith("+O") || argument.startsWith("+o") || isPositiveShellOption(argument)) continue;
+		if (argument.startsWith("--")) {
+			if (!argument.includes("=") && SHELL_LONG_OPTIONS_WITH_ARG.has(argument)) skipNextArgument = true;
+			continue;
+		}
+		if (argument.startsWith("-")) {
+			if (optionsWithArgument.has(argument)) skipNextArgument = true;
+			continue;
+		}
+		return false;
+	}
+	return true;
+}
+
+function collectShellStdinPayloads(tokens: Token[], hereDocuments: HereDocument[]): string[] {
+	const payloads: string[] = [];
+	for (const hereDocument of hereDocuments) {
+		if (!hereDocument.stdin || hereDocument.body.length === 0) continue;
+
+		for (let index = 0; index < tokens.length; index++) {
+			const token = tokens[index];
+			if (token.segment !== hereDocument.segment || !token.commandStart || isCommandLookup(tokens, index)) continue;
+
+			let shellIndex: number | undefined;
+			if (commandName(token.text) === "busybox") {
+				for (let cursor = index + 1; cursor < tokens.length; cursor++) {
+					const argument = tokens[cursor];
+					if (argument.segment !== hereDocument.segment || argument.commandStart) break;
+					if (argument.isRedirectionTarget || argument.text.startsWith("-")) continue;
+					if (SHELL_RUNNERS.has(commandName(argument.text))) shellIndex = cursor;
+					break;
+				}
+			} else if (SHELL_RUNNERS.has(commandName(token.text))) {
+				shellIndex = index;
+			}
+			if (shellIndex === undefined) continue;
+
+			const shellArguments: Token[] = [];
+			for (let cursor = shellIndex + 1; cursor < tokens.length; cursor++) {
+				const argument = tokens[cursor];
+				if (argument.segment !== hereDocument.segment || argument.commandStart) break;
+				if (!argument.isRedirectionTarget) shellArguments.push(argument);
+			}
+			if (shellReadsStdin(shellArguments)) {
+				payloads.push(hereDocument.body);
+				break;
+			}
+		}
+	}
+	return payloads;
+}
+
 function collectShellScripts(tokens: Token[], cwd: string): string[] {
 	const scripts: string[] = [];
 	const optionsWithArg = new Set(["-O", "-o", "+O", "+o"]);
@@ -1341,7 +1462,7 @@ export async function checkTmuxSelfInjection(
 	const cwd = options.cwd ?? env.PWD ?? ".";
 	const uid = typeof process.getuid === "function" ? process.getuid() : 0;
 	const resolvePaneId = options.resolvePaneId ?? defaultResolvePaneId;
-	const tokens = tokenize(command);
+	const { tokens, hereDocuments } = tokenize(command);
 
 	for (let index = 0; index < tokens.length; index++) {
 		if (!tokens[index].commandStart || (tokens[index].text !== "tmux" && !tokens[index].text.endsWith("/tmux")))
@@ -1394,6 +1515,10 @@ export async function checkTmuxSelfInjection(
 	}
 
 	if (depth < MAX_INDIRECTION_DEPTH) {
+		for (const payload of collectShellStdinPayloads(tokens, hereDocuments)) {
+			const result = await checkTmuxSelfInjection(payload, options, depth + 1);
+			if (result.block) return result;
+		}
 		for (const payload of collectShellPayloads(tokens)) {
 			const result = await checkTmuxSelfInjection(payload, options, depth + 1);
 			if (result.block) return result;
