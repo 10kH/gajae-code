@@ -380,13 +380,8 @@ async function canonicalLockPathPreservingFinal(lockPath: string): Promise<strin
 	const parent = path.dirname(lockPath);
 	try {
 		return path.join(await fs.realpath(parent), path.basename(lockPath));
-	} catch {
-		// If canonicalization fails for any reason (symlink resolution, transient FS
-		// errors, etc.), fall back to the original path. This is safe because the
-		// path itself is not replaced; canonicalization is only used to detect
-		// moved or replaced parent directories, which are caught separately by
-		// identity checks. A failed canonicalization does not authorize stale
-		// removal or prevent the removal operation from proceeding.
+	} catch (error) {
+		if (!isEnoent(error) && !isTransientReleaseError(error)) throw error;
 		return lockPath;
 	}
 }
