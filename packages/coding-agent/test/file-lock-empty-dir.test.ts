@@ -427,6 +427,75 @@ test("resumes an ownerless detached cleanup after a transient cleanup refusal", 
 	await expect(fs.lstat(`${transitionPath}.owner`)).rejects.toMatchObject({ code: "ENOENT" });
 });
 
+test("retries stale-owner Windows detached cleanup on a later same-process acquisition", async () => {
+	const tempDir = await createTempDir();
+	const filePath = path.join(tempDir, "sdk", "sessions", "index.jsonl");
+	const lockDir = `${filePath}.lock`;
+	const transitionPath = `${lockDir}.removing`;
+	await fs.mkdir(lockDir, { recursive: true });
+	await fs.writeFile(
+		path.join(lockDir, "info"),
+		JSON.stringify({ pid: 4_194_303, timestamp: Date.now(), owner_token: crypto.randomUUID() }),
+	);
+
+	let transitionRemovalAttempts = 0;
+	FileLockTestHooks.nativeExactRemovalProbe = () => true;
+	FileLockTestHooks.nativeQuarantineBindings = () => ({
+		snapshotDirectoryTree,
+		exactRemoveDirectoryTree(target, snapshot, parentIdentity, detachOnly) {
+			if (target === lockDir && detachOnly) {
+				fsSync.renameSync(target, transitionPath);
+				return { ok: true, detachedPath: transitionPath };
+			}
+			if (target === transitionPath) {
+				transitionRemovalAttempts++;
+				if (transitionRemovalAttempts <= 2) {
+					return {
+						ok: false,
+						code: "cleanup_pending",
+						payloadDurable: true,
+						detachedPath: transitionPath,
+					};
+				}
+				fsSync.rmSync(target, { recursive: true, force: true });
+				return { ok: true };
+			}
+			return exactRemoveDirectoryTree(target, snapshot, parentIdentity, detachOnly);
+		},
+	});
+
+	let firstCallbackEntered = false;
+	await expect(
+		withFileLock(
+			filePath,
+			async () => {
+				firstCallbackEntered = true;
+			},
+			{ retries: 1, retryDelayMs: 1, staleMs: 0 },
+		),
+	).rejects.toMatchObject({ code: "acquire_timeout" });
+	expect(firstCallbackEntered).toBe(false);
+	expect(transitionRemovalAttempts).toBe(2);
+	await fs.lstat(transitionPath);
+	await fs.lstat(`${transitionPath}.owner`);
+
+	let recoveredCallbackEntered = false;
+	await withFileLock(
+		filePath,
+		async () => {
+			expect(transitionRemovalAttempts).toBe(3);
+			recoveredCallbackEntered = true;
+		},
+		{ retries: 2, retryDelayMs: 1, staleMs: 0 },
+	);
+
+	expect(recoveredCallbackEntered).toBe(true);
+	expect(transitionRemovalAttempts).toBe(4);
+	await expect(fs.lstat(lockDir)).rejects.toMatchObject({ code: "ENOENT" });
+	await expect(fs.lstat(transitionPath)).rejects.toMatchObject({ code: "ENOENT" });
+	await expect(fs.lstat(`${transitionPath}.owner`)).rejects.toMatchObject({ code: "ENOENT" });
+});
+
 test("rolls back a Windows publication when retirement appears before owner registration", async () => {
 	const tempDir = await createTempDir();
 	const filePath = path.join(tempDir, "sdk", "sessions", "index.jsonl");

@@ -2013,7 +2013,12 @@ export async function removeFileLockDirForGc(
 			rootIno: captured.snapshot.rootIno,
 			snapshot: captured.snapshot,
 		});
-		return (await finishDetachedLockCleanup(expected)) ? "removed" : "cleanup_failed";
+		if (await finishDetachedLockCleanup(expected)) return "removed";
+		// Stale-owner cleanup has no LocalLockState release handle to drive another
+		// retry. Mark only this completed native attempt resumable so a later local
+		// acquisition can adopt the exact transition after a transient refusal.
+		markLocalRemovalResumable(detachedPath, captured.snapshot.rootDev, captured.snapshot.rootIno);
+		return "cleanup_failed";
 	}
 	if (removed.code === "not_found") return "removed";
 	if (removed.code === "identity_mismatch") return "owner_changed";
