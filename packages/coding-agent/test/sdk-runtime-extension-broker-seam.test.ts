@@ -2,12 +2,12 @@ import { expect, test } from "bun:test";
 import * as path from "node:path";
 import { parse } from "@babel/parser";
 import traverse from "@babel/traverse";
-import type { Expression } from "@babel/types";
+import type { Node } from "@babel/types";
 
 const packageRoot = path.resolve(import.meta.dir, "..");
 const optOutPrefix = "// broker-seam-opt-out: ";
 
-function isMissingSeamValue(value: Expression): boolean {
+function isMissingSeamValue(value: Node): boolean {
 	let expression = value;
 	while (
 		expression.type === "TSAsExpression" ||
@@ -37,19 +37,19 @@ function missingBrokerSeams(source: string, filename: string): number[] {
 			const hasSeam =
 				options &&
 				options.type === "ObjectExpression" &&
-				options.properties.some(
-					property => {
-						if (
-							(property.type !== "ObjectProperty" && property.type !== "ObjectMethod") ||
-							property.computed ||
-							!((property.key.type === "Identifier" && property.key.name === "ensureBrokerImpl") ||
-								(property.key.type === "StringLiteral" && property.key.value === "ensureBrokerImpl"))
-						) {
-							return false;
-						}
-						return property.type === "ObjectMethod" || !isMissingSeamValue(property.value);
-					},
-				);
+				options.properties.some(property => {
+					if (
+						(property.type !== "ObjectProperty" && property.type !== "ObjectMethod") ||
+						property.computed ||
+						!(
+							(property.key.type === "Identifier" && property.key.name === "ensureBrokerImpl") ||
+							(property.key.type === "StringLiteral" && property.key.value === "ensureBrokerImpl")
+						)
+					) {
+						return false;
+					}
+					return property.type === "ObjectMethod" || !isMissingSeamValue(property.value);
+				});
 			const line = node.loc?.start.line;
 			if (line === undefined) throw new Error(`Missing call location in ${filename}`);
 			const previousLine = source.split("\n")[line - 2]?.trim() ?? "";
