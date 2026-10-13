@@ -37,8 +37,8 @@ import {
 	type ToolChoice,
 	type Usage,
 } from "@gajae-code/ai";
-import { $credentialEnv } from "@gajae-code/utils";
-import { canonicalEnvKey, projectEnvSnapshot } from "@gajae-code/utils/env-file";
+import { $credentialEnv, startupProjectEnvSnapshot } from "@gajae-code/utils";
+import { canonicalEnvKey } from "@gajae-code/utils/env-file";
 import { isDesignedError } from "@gajae-code/utils/error-classification";
 import { recordHandledError } from "@gajae-code/utils/postmortem";
 import {
@@ -480,7 +480,7 @@ function readContentCaptureEnv(): ResolvedTelemetryContentCapture {
 	const trusted = $credentialEnv(CONTENT_CAPTURE_ENV);
 	const live = Bun.env[CONTENT_CAPTURE_ENV];
 	const key = canonicalEnvKey(CONTENT_CAPTURE_ENV);
-	const project = projectEnvSnapshot();
+	const project = startupProjectEnvSnapshot();
 	const projectDeclaration = project.values[key];
 	const liveIsProjectValue =
 		projectDeclaration !== undefined && (project.dynamic.has(key) || live === projectDeclaration);

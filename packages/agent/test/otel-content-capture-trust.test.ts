@@ -111,6 +111,20 @@ describe("GenAI content capture project dotenv trust", () => {
 		expect(captured.warnings).toContain("full_content_capture_env_active");
 	});
 
+	it("keeps launch dotenv provenance when moving before the first capture read", async () => {
+		const cwd = await tempDir();
+		const movedCwd = await tempDir();
+		const captured = await captureIn(
+			cwd,
+			`${ENV_NAME}=summary\n`,
+			{ OTEL_CAPTURE_TRUST_MOVE_TO: movedCwd },
+			`${ENV_NAME}=full\n`,
+		);
+		expect(captured.envValue).toBe("summary");
+		expect(captured.inputMessages).toContain(CANARY);
+		expect(captured.warnings).toContain("full_content_capture_env_active");
+	});
+
 	it("honors an operator downgrade to false before the first capture read", async () => {
 		const cwd = await tempDir();
 		const captured = await captureIn(cwd, "OTHER=1\n", {
