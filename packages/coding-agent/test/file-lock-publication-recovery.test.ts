@@ -8,6 +8,7 @@ import {
 	acquireFileLock,
 	FileLockAcquireError,
 	FileLockTestHooks,
+	fileLockStagingOwnerPid,
 	withFileLock,
 } from "@gajae-code/coding-agent/config/file-lock";
 import {
@@ -45,6 +46,7 @@ interface RemovalCall {
 afterEach(async () => {
 	vi.restoreAllMocks();
 	FileLockTestHooks.nativePublicationBindings = undefined;
+	FileLockTestHooks.stagingIdentityEvidence = undefined;
 	FileLockTestHooks.nativeQuarantineBindings = undefined;
 	FileLockTestHooks.cleanupPendingStaging = undefined;
 	for (const { directory, forgetGrant } of tempDirs.splice(0)) {
@@ -416,29 +418,58 @@ test("retries a pre-mutation sharing violation and publishes the file lock", asy
 	expect(await fs.readdir(root)).toEqual([]);
 });
 
-test("retries a pre-mutation Windows access denial within the lock acquisition budget", async () => {
+test("preserves access-denied publication failures instead of masking ACL errors as contention", async () => {
 	const { root, file, lock } = await makeFixture();
-	let deniedAttempts = 5;
 	let attempts = 0;
 	FileLockTestHooks.nativePublicationBindings = () => ({
-		renameNoReplacePathAsync: async (source, destination) => {
+		renameNoReplacePathAsync: async () => {
 			attempts++;
-			if (deniedAttempts > 0) {
-				deniedAttempts--;
-				return accessDeniedPublication();
-			}
+			return accessDeniedPublication();
+		},
+		renameDirectoryNoReplacePathAsync,
+	});
+
+	await expect(withFileLock(file, async () => "entered", { retries: 2, retryDelayMs: 1 })).rejects.toMatchObject({
+		message: "Failed to publish file lock: access_denied.",
+		code: "access_denied",
+	});
+	expect(attempts).toBe(1);
+	await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
+	expect(await fs.readdir(root)).toEqual([]);
+});
+
+test("keeps the staging component within filesystem limits for long target names", async () => {
+	const { root } = await makeFixture();
+	const file = path.join(root, "x".repeat(196));
+	const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+	if (!originalPlatform?.configurable) throw new Error("process_platform_not_configurable");
+	let stagingComponentLength = 0;
+	FileLockTestHooks.nativePublicationBindings = () => ({
+		renameNoReplacePathAsync: async (source, destination) => {
+			stagingComponentLength = path.basename(source).length;
 			await fs.rename(source, destination);
 			return successfulPublication(primaryPrimitive ?? "windows_rename_noreplace");
 		},
 		renameDirectoryNoReplacePathAsync,
 	});
+	FileLockTestHooks.nativeQuarantineBindings = () => ({
+		snapshotDirectoryTree,
+		exactRemoveDirectoryTree: target => {
+			syncFs.rmSync(target, { recursive: true, force: true });
+			return { ok: true };
+		},
+	});
 
-	await expect(
-		withFileLock(file, async () => await Bun.file(path.join(lock, "info")).text(), quickAcquire),
-	).resolves.toContain('"pid"');
-	expect(attempts).toBe(6);
-	await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
-	expect(await fs.readdir(root)).toEqual([]);
+	try {
+		Object.defineProperty(process, "platform", { ...originalPlatform, value: "win32" });
+		await expect(withFileLock(file, async () => "acquired", quickAcquire)).resolves.toBe("acquired");
+	} finally {
+		Object.defineProperty(process, "platform", originalPlatform);
+	}
+	expect(stagingComponentLength).toBeLessThanOrEqual(255);
+	const legacyComponentLength =
+		path.basename(file).length + ".lock.pending.".length + String(process.pid).length + 1 + 36;
+	expect(stagingComponentLength).toBeLessThanOrEqual(legacyComponentLength);
 });
 
 test("stops retrying when failed publication staging cannot be cleaned", async () => {
@@ -448,7 +479,7 @@ test("stops retrying when failed publication staging cannot be cleaned", async (
 	FileLockTestHooks.nativePublicationBindings = () => ({
 		renameNoReplacePathAsync: async () => {
 			publicationAttempts++;
-			return accessDeniedPublication();
+			return sharingViolationPublication();
 		},
 		renameDirectoryNoReplacePathAsync,
 	});
@@ -462,49 +493,32 @@ test("stops retrying when failed publication staging cannot be cleaned", async (
 		lockPath: lock,
 		code: "EACCES",
 	});
-	expect(publicationAttempts).toBe(3);
+	expect(publicationAttempts).toBe(4); // 1 initial + 3 retries
 	expect(cleanupAttempts).toBe(1);
 	expect((await fs.readdir(root)).filter(name => name.includes(".pending."))).toHaveLength(1);
 });
 
-test("exhausted Windows access-denied publication reports lock contention and its code", async () => {
-	const { file, lock } = await makeFixture();
+test("uses a liveness-probed legacy staging name when process identity is unavailable", async () => {
+	const { file } = await makeFixture();
+	FileLockTestHooks.stagingIdentityEvidence = () => ({ processIncarnation: null, startTime: null });
+	let stagingPath = "";
 	FileLockTestHooks.nativePublicationBindings = () => ({
-		renameNoReplacePathAsync: async () => accessDeniedPublication(),
-		renameDirectoryNoReplacePathAsync,
-	});
-
-	await expect(withFileLock(file, async () => "entered", { retries: 2, retryDelayMs: 1 })).rejects.toMatchObject({
-		name: "FileLockAcquireError",
-		message: expect.stringContaining(`last lock publication failed with access_denied (${lock})`),
-	});
-	await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
-});
-
-test("clears an earlier publication code when later attempts contend with a lock owner", async () => {
-	const { file, lock } = await makeFixture();
-	let attempts = 0;
-	FileLockTestHooks.nativePublicationBindings = () => ({
-		renameNoReplacePathAsync: async (_source, destination) => {
-			attempts++;
-			if (attempts <= 3) return accessDeniedPublication();
-			await fs.mkdir(destination);
-			await Bun.write(path.join(destination, "info"), removalInfo(process.pid));
-			return destinationExistsPublication();
+		renameNoReplacePathAsync: async (source, destination) => {
+			stagingPath = source;
+			await fs.rename(source, destination);
+			return successfulPublication(primaryPrimitive ?? "windows_rename_noreplace");
 		},
-		renameDirectoryNoReplacePathAsync,
+		renameDirectoryNoReplacePathAsync: async () => {
+			throw new Error("unexpected directory publication fallback");
+		},
 	});
 
-	const error = await withFileLock(file, async () => "entered", { retries: 2, retryDelayMs: 1 }).catch(
-		failure => failure,
+	expect(await withFileLock(file, async () => "acquired", quickAcquire)).toBe("acquired");
+	const stagingName = path.basename(stagingPath);
+	expect(stagingName).toMatch(
+		new RegExp(`\\.pending\\.${process.pid}\\.[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$`),
 	);
-	expect(error).toBeInstanceOf(FileLockAcquireError);
-	if (!(error instanceof FileLockAcquireError)) throw new Error("expected file lock acquisition timeout");
-	expect(error.message).toContain(`held by pid ${process.pid}`);
-	expect(error.message).not.toContain("last lock publication failed with access_denied");
-	expect(error.message).toContain(`(${lock})`);
-	expect(error.publicationFailureCode).toBeUndefined();
-	expect(attempts).toBe(4);
+	expect(fileLockStagingOwnerPid(stagingName)).toBe(process.pid);
 });
 
 describe.skipIf(process.platform !== "linux")("file lock committed publication reconciliation", () => {

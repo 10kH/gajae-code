@@ -80,6 +80,7 @@ export class ManagedPublishError extends Error {
 		| "invalid_request"
 		| "durability_not_provable"
 		| "identity_mismatch"
+		| "permission_denied"
 		| "io_error"
 		| "durability_failed";
 	readonly diagnostic: string;
@@ -141,17 +142,19 @@ function publishFailure(outcome: NativePublishOutcome): ManagedPublishError {
 	const classification =
 		outcome.reason === "destination_exists"
 			? "destination_conflict"
-			: outcome.reason === "atomic_unavailable"
-				? "atomic_unavailable"
-				: outcome.reason === "invalid_request"
-					? "invalid_request"
-					: outcome.reason === "durability_not_provable"
-						? "durability_not_provable"
-						: outcome.reason === "identity_violation"
-							? "identity_mismatch"
-							: outcome.reason === "io_failure"
-								? "io_error"
-								: "durability_failed";
+			: outcome.reason === "access_denied" || outcome.reason === "permission_denied"
+				? "permission_denied"
+				: outcome.reason === "atomic_unavailable"
+					? "atomic_unavailable"
+					: outcome.reason === "invalid_request"
+						? "invalid_request"
+						: outcome.reason === "durability_not_provable"
+							? "durability_not_provable"
+							: outcome.reason === "identity_violation"
+								? "identity_mismatch"
+								: outcome.reason === "io_failure"
+									? "io_error"
+									: "durability_failed";
 	return new ManagedPublishError(classification, outcome);
 }
 
