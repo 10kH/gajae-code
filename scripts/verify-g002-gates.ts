@@ -444,6 +444,24 @@ function getMcpHandlerBody(member: Babel.ObjectMethod | Babel.ObjectProperty): B
 	return undefined;
 }
 
+function hasExactMcpHandlerParameters(member: Babel.ObjectMethod | Babel.ObjectProperty): boolean {
+	const parameters =
+		member.type === "ObjectMethod"
+			? member.params
+			: member.value.type === "ArrowFunctionExpression" || member.value.type === "FunctionExpression"
+				? member.value.params
+				: undefined;
+	const command = parameters?.[0];
+	const runtime = parameters?.[1];
+	return (
+		parameters?.length === 2 &&
+		command?.type === "Identifier" &&
+		command.name === "command" &&
+		runtime?.type === "Identifier" &&
+		runtime.name === "runtime"
+	);
+}
+
 function hasMcpMemberAccessChain(expression: Babel.Expression, root: string, properties: readonly string[]): boolean {
 	let current = expression;
 	for (let index = properties.length - 1; index >= 0; index--) {
@@ -554,6 +572,10 @@ export function findMcpBuiltinQuarantineFindings(builtinRegistry: string): strin
 		);
 		if (tuiHandlers.length !== 1) {
 			findings.push("root /mcp builtin must define exactly one TUI-only handler");
+			continue;
+		}
+		if (!hasExactMcpHandlerParameters(tuiHandlers[0]!)) {
+			findings.push("root /mcp TUI handler parameters must be command and runtime identifiers");
 			continue;
 		}
 		const handlerBody = getMcpHandlerBody(tuiHandlers[0]!);
