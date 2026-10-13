@@ -7007,7 +7007,11 @@ export class AgentSession {
 				throw new Error("Owned async jobs did not settle before artifact retirement.");
 			committed = true;
 		} finally {
-			manager.finishOwnerSubagentShutdown(lease, committed ? "commit" : "release");
+			if (committed) {
+				manager.finishOwnerSubagentShutdown(lease, "commit");
+			} else {
+				manager.finishOwnerSubagentShutdown(lease, "release", { drainResumeQueue: !this.#isDisposed });
+			}
 		}
 	}
 

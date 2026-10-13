@@ -324,6 +324,73 @@ describe("AgentSession Issue #2261 /new owner-subagent cancellation", () => {
 		}
 	});
 
+	it("drains preserved resumes when fork retirement fails before successor adoption", async () => {
+		const ownerManager = installOwnerManager(1);
+		const previousSessionFile = session.sessionFile;
+		const foreignStarted = Promise.withResolvers<void>();
+		const foreignGate = Promise.withResolvers<string>();
+		const foreignJobId = ownerManager.register(
+			"bash",
+			"foreign blocker",
+			async () => {
+				foreignStarted.resolve();
+				return foreignGate.promise;
+			},
+			{ ownerId: "foreign-owner" },
+		);
+		await foreignStarted.promise;
+		ownerManager.registerSubagentRecord({
+			subagentId: "fork-queued-child",
+			ownerId: "owner",
+			currentJobId: null,
+			historicalJobIds: [],
+			status: "paused",
+			sessionFile: "/tmp/fork-queued-child.jsonl",
+			resumable: true,
+		});
+		let resumeStarts = 0;
+		ownerManager.setResumeRunner(subagentId => {
+			resumeStarts++;
+			return ownerManager.register("task", `resume ${subagentId}`, async () => "resumed", {
+				ownerId: "owner",
+				metadata: { subagent: { id: subagentId, agent: "executor", agentSource: "bundled" } },
+			});
+		});
+		expect(ownerManager.resumeSubagent("fork-queued-child", { ownerId: "owner" })).toMatchObject({
+			ok: true,
+			queued: true,
+			status: "queued",
+		});
+
+		const deliveryGateEntered = Promise.withResolvers<void>();
+		const releaseDeliveryGate = Promise.withResolvers<boolean>();
+		const deliveryGateSpy = vi.spyOn(ownerManager, "waitForOwnerInFlightDeliveries").mockImplementation(async () => {
+			deliveryGateEntered.resolve();
+			return releaseDeliveryGate.promise;
+		});
+		const transition = session.fork();
+		try {
+			await deliveryGateEntered.promise;
+			foreignGate.resolve("foreign complete");
+			await ownerManager.getJob(foreignJobId)?.promise;
+			expect(ownerManager.getSubagentRecord("fork-queued-child")?.status).toBe("queued");
+			expect(resumeStarts).toBe(0);
+
+			releaseDeliveryGate.resolve(false);
+			await expect(transition).rejects.toThrow("Owned async deliveries did not settle before artifact retirement.");
+			expect(session.sessionFile).toBe(previousSessionFile);
+			expect(resumeStarts).toBe(1);
+			const resumedJobId = ownerManager.getSubagentRecord("fork-queued-child")?.currentJobId;
+			if (!resumedJobId) throw new Error("Queued child did not start after fork rollback");
+			await ownerManager.getJob(resumedJobId)?.promise;
+			expect(ownerManager.getSubagentRecord("fork-queued-child")?.status).toBe("completed");
+		} finally {
+			releaseDeliveryGate.resolve(false);
+			deliveryGateSpy.mockRestore();
+			foreignGate.resolve("foreign complete");
+		}
+	});
+
 	it("waits for in-flight owner delivery before flush and generic owner cancellation", async () => {
 		const ownerManager = installOwnerManager();
 		const order: string[] = [];
