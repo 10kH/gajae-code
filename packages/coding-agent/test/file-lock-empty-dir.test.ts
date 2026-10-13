@@ -430,6 +430,7 @@ test("resumes an ownerless detached cleanup after a transient cleanup refusal", 
 test.each([
 	"cleanup_pending",
 	"sharing_violation",
+	"thrown_sharing_violation",
 ] as const)("retries stale-owner Windows detached cleanup after transient %s on a later same-process acquisition", async transientRefusal => {
 	const tempDir = await createTempDir();
 	const filePath = path.join(tempDir, "sdk", "sessions", "index.jsonl");
@@ -453,6 +454,9 @@ test.each([
 			if (target === transitionPath) {
 				transitionRemovalAttempts++;
 				if (transitionRemovalAttempts === 2 && transientRefusal === "sharing_violation") {
+					return { ok: false, code: "sharing_violation", detachedPath: transitionPath };
+				}
+				if (transitionRemovalAttempts === 2 && transientRefusal === "thrown_sharing_violation") {
 					throw Object.assign(new Error("simulated Windows sharing denial"), { code: "EPERM" });
 				}
 				if (transitionRemovalAttempts <= 2) {

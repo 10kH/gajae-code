@@ -609,7 +609,7 @@ async function finishDetachedLockCleanup(owner: FileLockOwnerToken): Promise<boo
 		// finish the quarantine its own fallback created, so finish on disk instead.
 		if (process.platform === "win32" && (await isNativeExactRemovalUsable())) {
 			const removal = nativeFileLockBindings().exactRemoveDirectoryTree(pending.path, pending.snapshot);
-			if (removal.code === "cleanup_pending") return false;
+			if (removal.code === "cleanup_pending" || (!removal.ok && isTransientReleaseError(removal))) return false;
 			if (!removal.ok && removal.code !== "not_found")
 				throw new Error(`Failed to finish detached file lock cleanup: ${removal.code ?? "unknown"}.`);
 		} else {
