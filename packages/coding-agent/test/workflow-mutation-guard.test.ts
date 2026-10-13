@@ -32,9 +32,10 @@ async function makeTempRoot(): Promise<string> {
 
 /** A directory that is not the project cwd and not a platform temp root. */
 async function makeNonNeutralDir(): Promise<string> {
-	const tmpParent = path.dirname(path.resolve(os.tmpdir()));
-	const parent = tmpParent === path.parse(tmpParent).root ? os.homedir() : tmpParent;
-	return fs.mkdtemp(path.join(parent, "gjc-plan-tmpdir-"));
+	// The shard harness nests TMPDIR and HOME below the platform temp root.
+	// Neither their parent nor os.homedir() is necessarily non-neutral. Use the
+	// account home instead of the harness's environment-derived home directory.
+	return fs.mkdtemp(path.join(os.userInfo().homedir, "gjc-plan-tmpdir-"));
 }
 
 async function removeDirLeafFirst(dir: string): Promise<void> {
@@ -128,10 +129,8 @@ async function runProjectTmpdirProbe(input: {
 	drop?: "unlink" | "chdir";
 	expectedTmpdir?: string;
 }): Promise<{ blocked: boolean; message?: string }> {
-	const env: Record<string, string> = {};
-	for (const [key, value] of Object.entries(process.env)) {
-		if (value !== undefined && key !== "TMPDIR") env[key] = value;
-	}
+	const env: Record<string, string> = { ...process.env } as Record<string, string>;
+	if (input.expectedTmpdir !== undefined) delete env.TMPDIR;
 	env.GJC_TMPDIR_PROBE_CWD = input.cwd;
 	env.GJC_TMPDIR_PROBE_PATH = input.target;
 	env.GJC_TMPDIR_PROBE_SESSION = input.sessionId;
