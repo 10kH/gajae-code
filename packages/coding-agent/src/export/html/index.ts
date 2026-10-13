@@ -270,7 +270,7 @@ function redactJsonValue(value: unknown): unknown {
 }
 
 const CREDENTIAL_JSON_KEY =
-	/^(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?key|session[_-]?token|client[_-]?secret|aws[_-]?secret[_-]?access[_-]?key|secret[_-]?key|secret[_-]?access[_-]?key|password|passwd|auth|authorization|bearer|private[_-]?token|token|secret|credential|private[_-]?key|cookie)$/i;
+	/^(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?key|session[_-]?token|client[_-]?secret|aws[_-]?secret[_-]?access[_-]?key|secret[_-]?key|secret[_-]?access[_-]?key|password|passwd|auth|authorization|bearer|private[_-]?token|token|secrets|secret|credentials|credential|private[_-]?key|cookie)$/i;
 
 function redactKeyedValue(key: string, value: unknown): unknown {
 	// A recognized key is authoritative for every JSON type, including a short

@@ -6,8 +6,8 @@ import { compareEvidence, normalizeEvidenceValue } from "../bench/multisession/n
 
 let tempDir: TempDir | undefined;
 
-afterEach(() => {
-	tempDir?.removeSync();
+afterEach(async () => {
+	await tempDir?.remove();
 	tempDir = undefined;
 });
 
@@ -134,7 +134,7 @@ function fixturePaths(name: string): { evidence: string; root: string } {
 
 describe("multi-session evidence normalizer", () => {
 	test("normalizes allowed runtime IDs, time fields, job-notice tokens, hashes, and temp paths", async () => {
-		tempDir = TempDir.createSync("@bench-multisession-normalize-equal-");
+		tempDir = await TempDir.create("@bench-multisession-normalize-equal-");
 		const left = fixturePaths("left");
 		const right = fixturePaths("right");
 		await Promise.all([
@@ -211,7 +211,7 @@ describe("multi-session evidence normalizer", () => {
 	});
 
 	test("keeps relationships between IDs significant", async () => {
-		tempDir = TempDir.createSync("@bench-multisession-normalize-ids-");
+		tempDir = await TempDir.create("@bench-multisession-normalize-ids-");
 		const left = fixturePaths("left");
 		const right = fixturePaths("right");
 		await Promise.all([
@@ -228,7 +228,7 @@ describe("multi-session evidence normalizer", () => {
 	});
 
 	test("retains request payload, tool arguments, assistant text, tool results, and token evidence", async () => {
-		tempDir = TempDir.createSync("@bench-multisession-normalize-diff-");
+		tempDir = await TempDir.create("@bench-multisession-normalize-diff-");
 		const cases = [
 			{
 				stream: "requests.jsonl",
@@ -370,7 +370,7 @@ describe("multi-session evidence normalizer", () => {
 	});
 
 	test("ignores host-only reminder placement only in captured request context messages", async () => {
-		tempDir = TempDir.createSync("@bench-multisession-normalize-context-reminder-");
+		tempDir = await TempDir.create("@bench-multisession-normalize-context-reminder-");
 		const reminder = (date: string, time: string, cwd: string) => ({
 			role: "user",
 			content: [
@@ -441,7 +441,7 @@ describe("multi-session evidence normalizer", () => {
 	});
 
 	test("preserves reminder-shaped objects in tool-result data arrays", async () => {
-		tempDir = TempDir.createSync("@bench-multisession-normalize-tool-reminder-payload-");
+		tempDir = await TempDir.create("@bench-multisession-normalize-tool-reminder-payload-");
 		const reminderPayload = {
 			role: "user",
 			content: [

@@ -131,7 +131,7 @@ describe("session HTML export embed", () => {
 						id: "call-generic-credentials",
 						name: "echo",
 						arguments: {
-							credentials: {
+							sensitive_values: {
 								bearer: "opaque-bearer-value",
 								token: "opaque-token-value",
 								secret: "opaque-secret-value",
@@ -146,6 +146,8 @@ describe("session HTML export embed", () => {
 							},
 							auth: "opaque-auth-value",
 							bearer: "opaque-bearer-field-value",
+							credentials: "opaque-credentials-value",
+							secrets: ["opaque-secrets-value"],
 							session_id: "session-id-123",
 							source_session_id: "source-session-id-456",
 							native_session_id: "native-session-id-789",
@@ -165,7 +167,7 @@ describe("session HTML export embed", () => {
 				entries: Array<{ message?: { content?: Array<{ arguments?: Record<string, unknown> }> } }>;
 			};
 			const args = parsed.entries[0]?.message?.content?.[0]?.arguments;
-			const credentials = args?.credentials as Record<string, unknown> | undefined;
+			const sensitiveValues = args?.sensitive_values as Record<string, unknown> | undefined;
 			for (const secret of [
 				"opaque-token-value",
 				"opaque-bearer-value",
@@ -180,10 +182,12 @@ describe("session HTML export embed", () => {
 				"opaque-cookie-value",
 				"opaque-auth-value",
 				"opaque-bearer-field-value",
+				"opaque-credentials-value",
+				"opaque-secrets-value",
 			]) {
 				expect(embedded).not.toContain(secret);
 			}
-			expect(credentials).toEqual({
+			expect(sensitiveValues).toEqual({
 				bearer: "«redacted»",
 				token: "«redacted»",
 				secret: "«redacted»",
@@ -198,6 +202,8 @@ describe("session HTML export embed", () => {
 			});
 			expect(args?.auth).toBe("«redacted»");
 			expect(args?.bearer).toBe("«redacted»");
+			expect(args?.credentials).toBe("«redacted»");
+			expect(args?.secrets).toBe("«redacted»");
 			expect(args?.session_id).toBe("session-id-123");
 			expect(args?.source_session_id).toBe("source-session-id-456");
 			expect(args?.native_session_id).toBe("native-session-id-789");

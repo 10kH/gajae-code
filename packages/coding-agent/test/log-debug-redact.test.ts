@@ -110,6 +110,8 @@ describe("debug log credential scrub", () => {
 			"opaque-cookie-value",
 			"opaque-auth-value",
 			"opaque-bearer-value",
+			"opaque-credentials-value",
+			"opaque-secrets-value",
 		];
 		const labels = [
 			"token",
@@ -121,6 +123,8 @@ describe("debug log credential scrub", () => {
 			"cookie",
 			"auth",
 			"bearer",
+			"credentials",
+			"secrets",
 		];
 		const message = labels.map((label, index) => `${label}=${secrets[index]}`).join(" ");
 
@@ -138,7 +142,7 @@ describe("debug log credential scrub", () => {
 		const completeSimple = vi.spyOn(ai, "completeSimple").mockResolvedValue(titleResponse());
 		const debug = vi.spyOn(logger, "debug");
 		const labeled =
-			"token=abc123 password=123456 cookie=Q private_token=xyz AWS_SECRET_ACCESS_KEY=x auth=x bearer=abc123";
+			"token=abc123 password=123456 cookie=Q private_token=xyz AWS_SECRET_ACCESS_KEY=x auth=x bearer=abc123 credentials=x secrets=abc123";
 
 		await generateSessionTitle(labeled, createRegistry(model), createSettings(model));
 
