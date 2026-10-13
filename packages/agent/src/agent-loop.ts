@@ -3888,6 +3888,24 @@ async function runLoopBody(
 	while (true) {
 		let hasMoreToolCalls = true;
 		let acceptedResponseWithoutToolCalls = false;
+		const finishAbortedOuterRun = async (scope?: AttemptScope): Promise<void> => {
+			if (!acceptedResponseWithoutToolCalls || pendingMessages.length > 0) {
+				finishCancelled(scope);
+				return;
+			}
+			try {
+				// A no-tool assistant response is not terminal when a provider-side
+				// synthetic recovery turn is still pending.
+				if (await config.getSyntheticRecoveryMessage?.()) {
+					finishCancelled(scope);
+					return;
+				}
+			} catch {
+				finishCancelled(scope);
+				return;
+			}
+			finishCompleted(scope);
+		};
 
 		// Inner loop: process tool calls and steering messages
 		while (hasMoreToolCalls || pendingMessages.length > 0) {
@@ -4607,20 +4625,12 @@ async function runLoopBody(
 
 		// Agent would stop here. Check for follow-up messages.
 		if (loopSignal.aborted) {
-			if (acceptedResponseWithoutToolCalls && pendingMessages.length === 0) {
-				finishCompleted(lastAttemptScope);
-				return;
-			}
-			finishCancelled(lastAttemptScope);
+			await finishAbortedOuterRun(lastAttemptScope);
 			return;
 		}
 		await config.onBeforeYield?.();
 		if (loopSignal.aborted) {
-			if (acceptedResponseWithoutToolCalls && pendingMessages.length === 0) {
-				finishCompleted(lastAttemptScope);
-				return;
-			}
-			finishCancelled(lastAttemptScope);
+			await finishAbortedOuterRun(lastAttemptScope);
 			return;
 		}
 		if (config.shouldPause?.()) {
