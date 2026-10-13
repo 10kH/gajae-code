@@ -36,7 +36,7 @@ async function writeRemovalOwnerRecord(
 	);
 }
 
-test("reclaims an aged ownerless Windows session-index lock", async () => {
+test("reclaims an aged ownerless Windows session-index lock on the final configured attempt", async () => {
 	const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "file-lock-empty-dir-"));
 	tempDirs.push(tempDir);
 	const filePath = path.join(tempDir, "sdk", "sessions", "index.jsonl");
@@ -52,7 +52,7 @@ test("reclaims an aged ownerless Windows session-index lock", async () => {
 			callbackEntered = true;
 			if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
 		},
-		{ retries: 2, retryDelayMs: 1, staleMs: 0 },
+		{ retries: 1, retryDelayMs: 1, staleMs: 0 },
 	).then(
 		() => null,
 		error => error,

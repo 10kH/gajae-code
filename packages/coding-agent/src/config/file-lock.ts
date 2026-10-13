@@ -2632,12 +2632,23 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 	const contentionStartTimes = new Map<string, string | null>();
 	let contentionObserved = false;
 	let staleRemovalFailure: RecordedStaleRemovalFailure | undefined;
-	for (let attempt = 0; attempt < opts.retries; attempt++) {
+	let attemptBudget = opts.retries;
+	let recoveryExtensions = 0;
+	const extendAttemptBudgetAfterCleanup = (): void => {
+		// Reaping is progress, but it still needs a fresh publication attempt. Bound
+		// extensions so a stream of dead generations cannot make acquisition unbounded.
+		if (recoveryExtensions >= opts.retries) return;
+		recoveryExtensions++;
+		attemptBudget++;
+	};
+	let attempt = 0;
+	for (; attempt < attemptBudget; attempt++) {
 		if (opts.signal?.aborted) throw opts.signal.reason ?? new Error("File lock acquisition aborted");
 		const localKey = await localLockKey(lockPath);
 		const priorRelease = localLockStates.get(localKey);
 		if (priorRelease && priorRelease.status !== "held" && pendingDetachedLockCleanups.has(priorRelease.owner)) {
 			await retryPendingLocalRelease(lockPath, localKey);
+			extendAttemptBudgetAfterCleanup();
 			continue;
 		}
 		const result = await tryAcquireLock(
@@ -2670,6 +2681,7 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 		if (pendingKey !== undefined && localState?.status !== "held" && localState?.owner.owner_token !== undefined) {
 			try {
 				await retryPendingLocalRelease(lockPath, pendingKey);
+				extendAttemptBudgetAfterCleanup();
 				continue;
 			} catch {
 				// Keep contending below. A failed local retry is not authority to steal a
@@ -2685,11 +2697,13 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 		);
 		if (!stale.stale && (await removeStaleEmptyWindowsLockDirectory(lockPath, opts.staleMs, orphanTransitionAgeMs))) {
 			staleRemovalFailure = undefined;
+			extendAttemptBudgetAfterCleanup();
 			continue;
 		}
 		const staleRemoval = await removeStaleLockForAcquire(lockPath, stale);
 		if (staleRemoval.removed) {
 			staleRemovalFailure = undefined;
+			extendAttemptBudgetAfterCleanup();
 			continue;
 		}
 		staleRemovalFailure =
@@ -2713,7 +2727,7 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 	throw new FileLockAcquireError(
 		filePath,
 		lockPath,
-		opts.retries,
+		attempt,
 		await lockHolderDescription(lockPath, orphanTransitionAgeMs, opts.ownerHostId, opts.previousOwnerHostIds ?? []),
 		"acquire_timeout",
 		(await classifyFileLockRemovalTransition(
