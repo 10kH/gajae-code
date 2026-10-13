@@ -221,6 +221,21 @@ describe("recordFatalCrash", () => {
 		for (const field of labeled.split(" ")) expect(contents).not.toContain(field);
 	});
 
+	it("redacts complete bracketed credential containers", async () => {
+		const target = tempCrashLog();
+		const message =
+			'safe=keep credentials=["alpha","beta"] secrets={primary:alpha,secondary:{nested:[beta]}} metadata=["public"]';
+
+		recordFatalCrash("Uncaught Exception", new Error(message), { path: target });
+
+		const contents = await Bun.file(target).text();
+		expect(contents).not.toContain("alpha");
+		expect(contents).not.toContain("beta");
+		expect(contents).toContain("credentials=«redacted»");
+		expect(contents).toContain("secrets=«redacted»");
+		expect(contents).toContain('metadata=["public"]');
+	});
+
 	it("redacts full quoted credential values that contain spaces", async () => {
 		const target = tempCrashLog();
 		const message =

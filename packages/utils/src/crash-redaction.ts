@@ -15,7 +15,7 @@
  * diagnostic context survives.
  */
 export function redactCrashSecrets(text: string): string {
-	let redacted = text;
+	let redacted = redactCredentialContainers(text);
 	redacted = redacted.replace(/\b(?:Bearer|Basic|Token)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "«redacted-auth»");
 	redacted = redacted.replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, "«redacted-jwt»");
 	redacted = redacted.replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, "«redacted-api-key»");
@@ -123,6 +123,54 @@ export function redactCrashSecrets(text: string): string {
 		},
 	);
 	return redacted;
+}
+
+function redactCredentialContainers(text: string): string {
+	const assignment =
+		/(?<![A-Za-z0-9_])((?:\\*["']?)(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?key|session[_-]?token|client[_-]?secret|aws[_-]?secret[_-]?access[_-]?key|secret[_-]?key|secret[_-]?access[_-]?key|password|passwd|auth|authorization|bearer|private[_-]?token|token|secrets?|credentials?|private[_-]?key|cookie)(?:\\*["']?\s*[=:]\s*))(?=\[|\{)/gi;
+	let output = "";
+	let copiedUntil = 0;
+	for (let match = assignment.exec(text); match !== null; match = assignment.exec(text)) {
+		const containerStart = assignment.lastIndex;
+		if (containerStart < copiedUntil) continue;
+		const containerEnd = findCredentialContainerEnd(text, containerStart);
+		output += `${text.slice(copiedUntil, containerStart)}«redacted»`;
+		copiedUntil = containerEnd;
+		assignment.lastIndex = containerEnd;
+	}
+	return copiedUntil === 0 ? text : output + text.slice(copiedUntil);
+}
+
+function findCredentialContainerEnd(text: string, start: number): number {
+	const closing = [text[start] === "[" ? "]" : "}"];
+	let quote: "'" | '"' | undefined;
+	let escaped = false;
+	for (let index = start + 1; index < text.length; index++) {
+		const character = text[index] ?? "";
+		if (escaped) {
+			escaped = false;
+			continue;
+		}
+		if (character === "\\") {
+			escaped = true;
+			continue;
+		}
+		if (quote) {
+			if (character === quote) quote = undefined;
+			continue;
+		}
+		if (character === '"' || character === "'") {
+			quote = character;
+			continue;
+		}
+		if (character === "[") closing.push("]");
+		else if (character === "{") closing.push("}");
+		else if (character === closing[closing.length - 1]) {
+			closing.pop();
+			if (closing.length === 0) return index + 1;
+		}
+	}
+	return text.length;
 }
 
 /** Every placeholder `redactCrashSecrets` can emit. Used by downstream normalizers. */

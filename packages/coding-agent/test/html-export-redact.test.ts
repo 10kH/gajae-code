@@ -262,6 +262,44 @@ describe("session HTML export embed", () => {
 		}
 	});
 
+	it("redacts complete bracketed credential containers in free text", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-html-export-credential-containers-"));
+		let session: SessionManager | undefined;
+		try {
+			session = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+			const note =
+				'safe=keep credentials=["alpha","beta"] secrets={primary:alpha,secondary:{nested:[beta]}} metadata=["public"]';
+			session.appendMessage({
+				role: "assistant",
+				content: [
+					{
+						type: "toolCall",
+						id: "call-credential-containers",
+						name: "echo",
+						arguments: { note },
+					},
+				],
+				timestamp: 1,
+			} as unknown as Parameters<SessionManager["appendMessage"]>[0]);
+			const outputPath = path.join(tempDir, "export.html");
+			await exportSessionToHtml(session, undefined, { outputPath });
+			const embedded = embeddedSessionText(await Bun.file(outputPath).text());
+			const parsed = JSON.parse(embedded) as {
+				entries: Array<{ message?: { content?: Array<{ arguments?: Record<string, unknown> }> } }>;
+			};
+			const exportedNote = parsed.entries[0]?.message?.content?.[0]?.arguments?.note as string;
+
+			expect(embedded).not.toContain("alpha");
+			expect(embedded).not.toContain("beta");
+			expect(exportedNote).toContain("credentials=«redacted»");
+			expect(exportedNote).toContain("secrets=«redacted»");
+			expect(exportedNote).toContain('metadata=["public"]');
+		} finally {
+			await session?.close();
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("scrubs a short value under a password key", async () => {
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-html-export-key-short-"));
 		let session: SessionManager | undefined;
