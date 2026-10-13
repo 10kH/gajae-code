@@ -70,6 +70,31 @@ reauthorization entry path, nor a public `/mcp` reconnection or reload contract.
 
 Top-level sessions own their MCP manager and clean up server processes on session end. Subagents inherit the parent session's manager facade: they never spawn duplicate server processes and never take ownership of cleanup.
 
+## Tool-result images
+
+Successful MCP tool results forward PNG, JPEG, GIF, and WebP images (including
+embedded resources with an image `mimeType` and base64 `blob`) to image-capable
+models on providers whose tool-result transport carries images. Providers that
+flatten tool results to text, including Kiro, receive the text markers instead.
+Images follow the text block in their original order. Text keeps an image
+or resource marker, with a coordinate-mapping note when an image is resized, and
+retains the untrusted-content wrapper. Forwarded images also carry an explicit
+notice that they are untrusted server content and must be treated as data, not
+instructions.
+
+Images use the built-in shared resizer: at most 1,568 pixels per dimension and
+500 KiB per image, with the same recompression and `GJC_NO_WEBP` behavior. Each
+result attempts at most 16 supported images (matching the pasted-image count
+limit), processes at most 16 MiB of base64 source data (the MCP response budget),
+and forwards at most 4 MiB of image-file bytes after resizing, before base64
+encoding. Before native decoding, source images must have dimensions no larger
+than 8,192 pixels per side and no more than 16 million pixels total. Supported
+image bytes determine the forwarded MIME type when a server mislabels an image.
+Images that are invalid, unsupported, or over these limits retain only their
+text markers. Error results remain text-only. Models without
+image input use the existing provider filtering and receive text instead of image
+payloads.
+
 ## Use an explicit config
 
 A caller can opt one top-level standalone session into one trusted config file instead of conventional autoload:
