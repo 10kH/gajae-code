@@ -938,6 +938,7 @@ export function findMcpTuiMetadataFindings(slashCommandsSource: string, interact
 				predicate.body.type === "BinaryExpression" &&
 				predicate.body.operator === "!==" &&
 				predicate.body.left.type === "MemberExpression" &&
+				!predicate.body.left.computed &&
 				predicate.body.left.object.type === "Identifier" &&
 				predicate.body.left.object.name === "command" &&
 				predicate.body.left.property.type === "Identifier" &&

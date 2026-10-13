@@ -338,6 +338,13 @@ describe("MCP command quarantine", () => {
 		expect(findMcpTuiMetadataFindings(`${staleComment}\n${unfilteredSlashCommands}`, interactiveMode)).toContain(
 			"ordinary TUI /mcp metadata is not filtered by the exact MCP capability",
 		);
+		const computedPropertySlashCommands = slashCommands.replace(
+			'command.name !== "mcp"',
+			'command["name"] !== "mcp"',
+		);
+		expect(findMcpTuiMetadataFindings(computedPropertySlashCommands, interactiveMode)).toContain(
+			"ordinary TUI /mcp metadata is not filtered by the exact MCP capability",
+		);
 	});
 
 	test("rejects TUI metadata filters that do not hide /mcp without the exact capability", () => {
