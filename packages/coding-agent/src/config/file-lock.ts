@@ -2312,14 +2312,23 @@ async function quarantineReleasedLock(
 	return false;
 }
 
-async function releaseOwnedLock(lockPath: string, owner: FileLockOwnerToken): Promise<void> {
+async function releaseOwnedLock(
+	lockPath: string,
+	owner: FileLockOwnerToken,
+	captureInitialIdentity = false,
+): Promise<void> {
 	if (await finishDetachedLockCleanup(owner)) return;
-	let preVerdictIdentity: GenericFileLockDirIdentity | undefined;
-	try {
-		preVerdictIdentity = (await captureFileLockDirIdentity(lockPath)) ?? undefined;
-		if (preVerdictIdentity) fileLockDirIdentities.set(owner, preVerdictIdentity);
-	} catch (error) {
-		if (!isTransientReleaseError(error)) throw error;
+	// Only the initial release may establish removal authority. Pending retries
+	// must retain that evidence, even if a replacement carries identical info.
+	// If the initial capture failed, a later pathname cannot supply authority.
+	let preVerdictIdentity = fileLockDirIdentities.get(owner);
+	if (captureInitialIdentity && !preVerdictIdentity) {
+		try {
+			preVerdictIdentity = (await captureFileLockDirIdentity(lockPath)) ?? undefined;
+			if (preVerdictIdentity) fileLockDirIdentities.set(owner, preVerdictIdentity);
+		} catch (error) {
+			if (!isTransientReleaseError(error)) throw error;
+		}
 	}
 	let lastTransientError: unknown;
 	for (let attempt = 0; attempt < FILE_LOCK_RELEASE_RETRY_ATTEMPTS; attempt++) {
@@ -2396,7 +2405,7 @@ async function releaseLock(lockPath: string, owner: FileLockOwnerToken, knownKey
 		return;
 	}
 	state.status = "releasing";
-	const releasePromise = releaseOwnedLock(lockPath, owner);
+	const releasePromise = releaseOwnedLock(lockPath, owner, true);
 	state.releasePromise = releasePromise;
 	try {
 		await releasePromise;
