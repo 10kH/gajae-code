@@ -1058,10 +1058,20 @@ async function exactRemoveLockTree(
 			)
 				return { ok: false, code: "identity_mismatch", detachedPath: detached.detachedPath };
 			try {
-				return bindings.exactRemoveDirectoryTree(transitionPath, snapshot, parentIdentity);
+				const removeResult = bindings.exactRemoveDirectoryTree(transitionPath, snapshot, parentIdentity);
+				// Handle returned transient failures (not thrown exceptions):
+				// when native pre-open fails with e.g. sharing_violation, the result
+				// is returned without detachedPath. Mark the receipt resumable before
+				// returning so that in-process retry or cleanup can complete the removal.
+				if (!removeResult.ok && isResultTransientFailure(removeResult)) {
+					markLocalRemovalResumable(transitionPath, snapshot.rootDev, snapshot.rootIno);
+					// Transitionpath was successfully detached; include it in the result
+					// so cleanup can continue in-process or by a later invocation.
+					return { ...removeResult, detachedPath: transitionPath };
+				}
+				return removeResult;
 			} catch (error) {
-				// Detach is confirmed, so a transient replay denial can safely leave this
-				// exact receipt resumable once the in-flight attempt returns.
+				// Also handle thrown errors (if implementation changes in future)
 				if (isTransientReleaseError(error))
 					markLocalRemovalResumable(transitionPath, snapshot.rootDev, snapshot.rootIno);
 				throw error;
@@ -2503,6 +2513,13 @@ async function tryAcquireLock(
 	} finally {
 		if (removePending) await fs.rm(pendingPath, { recursive: true, force: true }).catch(() => undefined);
 	}
+}
+
+function isResultTransientFailure(result: { code?: string }): boolean {
+	const code = result.code;
+	return (
+		code === "EBUSY" || code === "EPERM" || code === "EACCES" || code === "ENOTEMPTY" || code === "sharing_violation"
+	);
 }
 
 function isTransientReleaseError(error: unknown): boolean {
