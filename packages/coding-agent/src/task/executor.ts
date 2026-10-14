@@ -342,28 +342,32 @@ export interface ExecutorOptions {
 export class ManagedTaskPersistence {
 	readonly #artifacts: ArtifactManager;
 	readonly #taskId: string;
+	readonly #getArtifacts: () => ArtifactManager;
 
-	constructor(artifacts: ArtifactManager, taskId: string) {
+	constructor(artifacts: ArtifactManager, taskId: string, getArtifacts: () => ArtifactManager = () => artifacts) {
 		this.#artifacts = artifacts;
 		this.#taskId = validateAllocatedTaskId(taskId);
+		this.#getArtifacts = getArtifacts;
 		if (!artifacts.getManagedSubtreeRootAuthority())
 			throw new Error("Managed task persistence authority is unavailable");
 	}
 
 	async openSession(cwd: string, sessionMemoryMode: SessionMemoryMode = "shadow"): Promise<SessionManager> {
-		const store = this.#artifacts.getManagedStore();
+		const artifacts = this.#getArtifacts();
+		const store = artifacts.getManagedStore();
 		if (!store) throw new Error("Managed task persistence authority is unavailable");
-		this.#artifacts.assertManagedBinding();
-		const sessionFile = path.join(this.#artifacts.dir, `${this.#taskId}.jsonl`);
+		artifacts.assertManagedBinding();
+		const sessionFile = path.join(artifacts.dir, `${this.#taskId}.jsonl`);
 		const session = await SessionManager.openNestedManaged(
 			sessionFile,
-			SessionManager.nestedManagedDestination(store, this.#artifacts.dir),
+			SessionManager.nestedManagedDestination(store, artifacts.dir),
 			store,
 			undefined,
 			cwd,
 			sessionMemoryMode,
 		);
-		this.#artifacts.assertManagedBinding();
+		artifacts.assertManagedBinding();
+		session.registerManagedTranscriptRelocationResolver(this.#getArtifacts);
 		return session;
 	}
 	async openStagedSession(attemptId = this.#taskId): Promise<SessionManager> {
@@ -385,8 +389,10 @@ export class ManagedTaskPersistence {
 	}
 
 	async publishOutput(rawOutput: string, metadata: Uint8Array): Promise<void> {
-		await withArtifactManagerFinalizationTurn(this.#artifacts, () =>
-			this.#artifacts.publishManagedOutputGeneration(
+		const artifacts = this.#getArtifacts();
+		artifacts.assertManagedBinding();
+		await withArtifactManagerFinalizationTurn(artifacts, () =>
+			artifacts.publishManagedOutputGeneration(
 				`${this.#taskId}.md.selector.json`,
 				`${this.#taskId}.md`,
 				Buffer.from(rawOutput, "utf8"),
@@ -396,8 +402,12 @@ export class ManagedTaskPersistence {
 	}
 }
 
-export function createManagedTaskPersistence(artifacts: ArtifactManager, taskId: string): ManagedTaskPersistence {
-	return new ManagedTaskPersistence(artifacts, taskId);
+export function createManagedTaskPersistence(
+	artifacts: ArtifactManager,
+	taskId: string,
+	getArtifacts?: () => ArtifactManager,
+): ManagedTaskPersistence {
+	return new ManagedTaskPersistence(artifacts, taskId, getArtifacts);
 }
 
 const MAX_REVIEW_FINDINGS_ARTIFACT_BYTES = 16 * 1024 * 1024;
@@ -2886,6 +2896,39 @@ function preflightTerminalResult(
 
 /** Run routed initial tasks through the bounded probe/durable candidate ledger. */
 export async function runSubprocess(options: ExecutorOptions): Promise<SingleResult> {
+	// Resume routing resolves credentials before dispatch; do not let an unexpected
+	// lookup exception bypass terminalization just because the initial probe ledger is off.
+	if (
+		(options.runMode ?? "initial") !== "initial" &&
+		options.autoroutingCandidates &&
+		options.autoroutingPreflightErrors
+	) {
+		const failedSelector = options.autoroutingCandidates.find(selector =>
+			options.autoroutingPreflightErrors?.has(selector),
+		);
+		if (failedSelector) {
+			const preflightError = options.autoroutingPreflightErrors.get(failedSelector);
+			const failure = classifyAutoroutingPreflightFailure(preflightError, "auth_resolve");
+			const { code } = autoroutingAttemptDisposition(failure);
+			const skips = buildBoundedRoutingSkips(options.autoroutingSkips);
+			const routedOptions = options.routing ? { ...options.routing, ...skips } : options.routing;
+			return preflightTerminalResult(
+				{ ...options, routing: routedOptions },
+				[{ selector: failedSelector, phase: "probe", code }],
+				"preflight_exhausted",
+			);
+		}
+	}
+	if ((options.runMode ?? "initial") !== "initial" && options.autoroutingCandidates?.length === 0 && options.routing) {
+		const skippedCandidates = options.autoroutingSkips?.filter(skip => skip.code === "credential_unavailable") ?? [];
+		return preflightTerminalResult(
+			{ ...options, routing: { ...options.routing, ...buildBoundedRoutingSkips(options.autoroutingSkips) } },
+			skippedCandidates
+				.slice(0, 6)
+				.map(skip => ({ selector: skip.selector, phase: "probe", code: "credential_unavailable" })),
+			"all_candidates_skipped",
+		);
+	}
 	if (
 		!options.autoroutingPreflight ||
 		(options.runMode ?? "initial") !== "initial" ||
