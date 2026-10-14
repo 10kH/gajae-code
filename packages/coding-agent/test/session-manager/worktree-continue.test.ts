@@ -184,6 +184,39 @@ describe("continueRecent with --worktree sessions", () => {
 		}
 	});
 
+	it("uses a custom managed root for breadcrumbs ahead of newer siblings", async () => {
+		const customAgentDir = path.join(root, "custom-agent");
+		const destination = SessionManager.managedDestination(repo, customAgentDir);
+		const createSession = async (content: string, timestamp: number) => {
+			const manager = SessionManager.create(repo, destination);
+			try {
+				manager.appendMessage({ role: "user", content, timestamp });
+				await manager.ensureOnDisk();
+				await manager.flush();
+				const file = manager.getSessionFile();
+				if (!file) throw new Error("Expected managed session file");
+				return { file, id: manager.getSessionId() };
+			} finally {
+				await manager.close();
+			}
+		};
+
+		const older = await createSession("breadcrumb target", 1);
+		const oldTime = new Date("2020-01-01T00:00:00Z");
+		fs.utimesSync(older.file, oldTime, oldTime);
+		const newer = await createSession("newer sibling", 2);
+		expect(fs.statSync(newer.file).mtimeMs).toBeGreaterThan(fs.statSync(older.file).mtimeMs);
+		writeBreadcrumb(repo, older.file);
+
+		const resumed = await SessionManager.continueRecent(repo, destination);
+		try {
+			expect(resumed.getSessionFile()).toBe(older.file);
+			expect(resumed.getSessionId()).toBe(older.id);
+		} finally {
+			await resumed.close();
+		}
+	});
+
 	it("does not resume a breadcrumb outside an explicit session directory", async () => {
 		const explicitDir = path.join(root, "explicit-sessions-contained");
 		const inside = path.join(explicitDir, "inside.jsonl");
