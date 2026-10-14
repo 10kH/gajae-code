@@ -118,6 +118,18 @@ describe("MCP command quarantine", () => {
 		);
 	});
 
+	test("rejects a function binding that shadows the handler runtime parameter", () => {
+		const shadowedRuntime = registryWithEntries([
+			exactMcpTuiEntry.replace(
+				"\t\t\treturn false;",
+				"\t\t\tfunction runtime() {}\n\t\t\treturn false;",
+			),
+		]);
+		expect(findMcpBuiltinQuarantineFindings(shadowedRuntime)).toContain(
+			"root /mcp TUI handler parameters must be command and runtime identifiers",
+		);
+	});
+
 	test("rejects method-style MCP handler parameters with pre-guard defaults", () => {
 		const exposed = registryWithEntries([
 			exactMcpTuiEntry.replace(
@@ -279,14 +291,15 @@ describe("MCP command quarantine", () => {
 		);
 	});
 
-	test("rejects transformed active-registry exports", async () => {
+	test("rejects a root registry mutation after active-registry initialization", async () => {
 		const root = path.join(import.meta.dir, "..");
 		const registry = await Bun.file(path.join(root, "packages/coding-agent/src/slash-commands/builtin-registry.ts")).text();
-		const exportDeclaration =
-			"export const BUILTIN_SLASH_COMMANDS_INTERNAL: ReadonlyArray<SlashCommandSpec> = ACTIVE_BUILTIN_SLASH_COMMAND_REGISTRY;";
-		const transformedExport =
-			'export const BUILTIN_SLASH_COMMANDS_INTERNAL: ReadonlyArray<SlashCommandSpec> = ACTIVE_BUILTIN_SLASH_COMMAND_REGISTRY.map(command => command.name === "mcp" ? { ...command, handle: async () => false } : command);';
-		const mutated = registry.replace(exportDeclaration, transformedExport);
+		const lookupDeclaration = "const BUILTIN_SLASH_COMMAND_LOOKUP = new Map<string, SlashCommandSpec>();";
+		const mutation = [
+			'BUILTIN_SLASH_COMMAND_REGISTRY.find(command => command.name === "mcp")!.handle = async () => false;',
+			lookupDeclaration,
+		].join("\n");
+		const mutated = registry.replace(lookupDeclaration, mutation);
 		expect(mutated).not.toBe(registry);
 		expect(findMcpBuiltinQuarantineFindings(mutated)).toContain(
 			"root slash-command registry has an unverified additional use or mutation",
@@ -340,11 +353,55 @@ describe("MCP command quarantine", () => {
 		);
 		const computedPropertySlashCommands = slashCommands.replace(
 			'command.name !== "mcp"',
-			'command["name"] !== "mcp"',
+			"command[name] !== \"mcp\"",
 		);
 		expect(findMcpTuiMetadataFindings(computedPropertySlashCommands, interactiveMode)).toContain(
 			"ordinary TUI /mcp metadata is not filtered by the exact MCP capability",
 		);
+	});
+
+	test("requires filtered builtin metadata to feed the constructor base commands", async () => {
+		const root = path.join(import.meta.dir, "..");
+		const slashCommands = await Bun.file(path.join(root, "packages/coding-agent/src/extensibility/slash-commands.ts")).text();
+		const interactiveMode = await Bun.file(path.join(root, "packages/coding-agent/src/modes/interactive-mode.ts")).text();
+		const unfilteredBaseMetadata = interactiveMode.replace(
+			"this.#baseSlashCommands = [...sessionBuiltinSlashCommands, ...hookCommands, ...customCommands];",
+			"this.#baseSlashCommands = [...BUILTIN_SLASH_COMMANDS, ...hookCommands, ...customCommands];",
+		);
+		expect(unfilteredBaseMetadata).not.toBe(interactiveMode);
+		expect(findMcpTuiMetadataFindings(slashCommands, unfilteredBaseMetadata)).toContain(
+			"ordinary TUI /mcp metadata is not filtered by the exact MCP capability",
+		);
+	});
+
+	test("rejects a direct early return before refresh visibility updates", async () => {
+		const root = path.join(import.meta.dir, "..");
+		const slashCommands = await Bun.file(path.join(root, "packages/coding-agent/src/extensibility/slash-commands.ts")).text();
+		const interactiveMode = await Bun.file(path.join(root, "packages/coding-agent/src/modes/interactive-mode.ts")).text();
+		const earlyReturn = interactiveMode.replace(
+			"\t\tconst previousSlashCommandTail = this.#resolvedSlashCommands.slice(this.#baseSlashCommands.length);",
+			"\t\treturn;\n\t\tconst previousSlashCommandTail = this.#resolvedSlashCommands.slice(this.#baseSlashCommands.length);",
+		);
+		expect(earlyReturn).not.toBe(interactiveMode);
+		expect(findMcpTuiMetadataFindings(slashCommands, earlyReturn)).toContain(
+			"ordinary TUI /mcp metadata is not filtered by the exact MCP capability",
+		);
+	});
+
+	test("rejects conditional exits before refresh visibility updates", async () => {
+		const root = path.join(import.meta.dir, "..");
+		const slashCommands = await Bun.file(path.join(root, "packages/coding-agent/src/extensibility/slash-commands.ts")).text();
+		const interactiveMode = await Bun.file(path.join(root, "packages/coding-agent/src/modes/interactive-mode.ts")).text();
+		for (const earlyExit of ["if (true) return;", "if (true) throw new Error();"]) {
+			const bypassedRefresh = interactiveMode.replace(
+				"\t\tconst previousSlashCommandTail = this.#resolvedSlashCommands.slice(this.#baseSlashCommands.length);",
+				`\t\t${earlyExit}\n\t\tconst previousSlashCommandTail = this.#resolvedSlashCommands.slice(this.#baseSlashCommands.length);`,
+			);
+			expect(bypassedRefresh).not.toBe(interactiveMode);
+			expect(findMcpTuiMetadataFindings(slashCommands, bypassedRefresh)).toContain(
+				"ordinary TUI /mcp metadata is not filtered by the exact MCP capability",
+			);
+		}
 	});
 
 	test("rejects TUI metadata filters that do not hide /mcp without the exact capability", () => {

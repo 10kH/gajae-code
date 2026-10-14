@@ -454,12 +454,19 @@ function hasExactMcpHandlerParameters(member: Babel.ObjectMethod | Babel.ObjectP
 				: undefined;
 	const command = parameters?.[0];
 	const runtime = parameters?.[1];
+	const body = getMcpHandlerBody(member);
+	const shadowedParameter = body?.body.some(
+		statement =>
+			statement.type === "FunctionDeclaration" &&
+			(statement.id?.name === "command" || statement.id?.name === "runtime"),
+	);
 	return (
 		parameters?.length === 2 &&
 		command?.type === "Identifier" &&
 		command.name === "command" &&
 		runtime?.type === "Identifier" &&
-		runtime.name === "runtime"
+		runtime.name === "runtime" &&
+		!shadowedParameter
 	);
 }
 
@@ -805,7 +812,7 @@ export function findMcpBuiltinQuarantineFindings(builtinRegistry: string): strin
 			if (statement.type !== "VariableDeclaration") continue;
 			for (const declaration of statement.declarations) {
 				if (declaration.id.type !== "Identifier" || declaration.id.name !== "BUILTIN_SLASH_COMMAND_REGISTRY") continue;
-				if (declaration.init?.type !== "ArrayExpression") {
+				if (statement.kind !== "const" || declaration.init?.type !== "ArrayExpression") {
 					return ["root slash-command registry could not be isolated"];
 				}
 				registry = declaration.init;
@@ -984,9 +991,10 @@ export function findMcpTuiMetadataFindings(slashCommandsSource: string, interact
 				statement.expression.right.property.type === "Identifier" &&
 				statement.expression.right.property.name === "hasExactMcpControls",
 		);
-		const initSlashCommands = constructorBody.some(
+		const initSlashCommandsIndex = constructorBody.findIndex(
 			statement =>
 				statement.type === "VariableDeclaration" &&
+				statement.kind === "const" &&
 				statement.declarations.some(
 					declaration =>
 						declaration.id.type === "Identifier" &&
@@ -998,8 +1006,69 @@ export function findMcpTuiMetadataFindings(slashCommandsSource: string, interact
 						thisPrivate(declaration.init.arguments[0], "sessionBuiltinMcpVisible"),
 				),
 		);
+		const baseSlashCommandsAssignments = constructorBody.filter(
+			statement =>
+				statement.type === "ExpressionStatement" &&
+				statement.expression.type === "AssignmentExpression" &&
+				thisPrivate(statement.expression.left, "baseSlashCommands"),
+		);
+		const baseSlashCommandsIndex = constructorBody.findIndex(statement => {
+			if (
+				baseSlashCommandsAssignments.length !== 1 ||
+				statement.type !== "ExpressionStatement" ||
+				statement.expression.type !== "AssignmentExpression" ||
+				statement.expression.operator !== "=" ||
+				!thisPrivate(statement.expression.left, "baseSlashCommands") ||
+				statement.expression.right.type !== "ArrayExpression"
+			) {
+				return false;
+			}
+			const elements = statement.expression.right.elements;
+			return (
+				elements.length === 3 &&
+				elements[0]?.type === "SpreadElement" &&
+				elements[0].argument.type === "Identifier" &&
+				elements[0].argument.name === "sessionBuiltinSlashCommands" &&
+				elements[1]?.type === "SpreadElement" &&
+				elements[1].argument.type === "Identifier" &&
+				elements[1].argument.name === "hookCommands" &&
+				elements[2]?.type === "SpreadElement" &&
+				elements[2].argument.type === "Identifier" &&
+				elements[2].argument.name === "customCommands"
+			);
+		});
+		const initSlashCommands = initSlashCommandsIndex >= 0 && initSlashCommandsIndex < baseSlashCommandsIndex;
 		const refreshBody = refreshHelper?.body.body ?? [];
-		const refreshCapabilityFlag = refreshBody.some(
+		const capabilitySnapshot = refreshBody[0];
+		const capabilitySnapshotIsExact =
+			capabilitySnapshot?.type === "VariableDeclaration" &&
+			capabilitySnapshot.kind === "const" &&
+			capabilitySnapshot.declarations.length === 1 &&
+			capabilitySnapshot.declarations[0]?.id.type === "Identifier" &&
+			capabilitySnapshot.declarations[0].id.name === "hasExactMcpControls" &&
+			capabilitySnapshot.declarations[0].init?.type === "MemberExpression" &&
+			!capabilitySnapshot.declarations[0].init.computed &&
+			capabilitySnapshot.declarations[0].init.object.type === "MemberExpression" &&
+			!capabilitySnapshot.declarations[0].init.object.computed &&
+			capabilitySnapshot.declarations[0].init.object.object.type === "ThisExpression" &&
+			capabilitySnapshot.declarations[0].init.object.property.type === "Identifier" &&
+			capabilitySnapshot.declarations[0].init.object.property.name === "session" &&
+			capabilitySnapshot.declarations[0].init.property.type === "Identifier" &&
+			capabilitySnapshot.declarations[0].init.property.name === "hasExactMcpControls";
+		const capabilityNoopGuard = refreshBody[1];
+		const capabilityNoopReturn =
+			capabilityNoopGuard?.type === "IfStatement" &&
+			capabilityNoopGuard.alternate === null &&
+			capabilityNoopGuard.test.type === "BinaryExpression" &&
+			capabilityNoopGuard.test.operator === "===" &&
+			capabilityNoopGuard.test.left.type === "Identifier" &&
+			capabilityNoopGuard.test.left.name === "hasExactMcpControls" &&
+			thisPrivate(capabilityNoopGuard.test.right, "sessionBuiltinMcpVisible") &&
+			capabilityNoopGuard.consequent.type === "ReturnStatement" &&
+			capabilityNoopGuard.consequent.argument === null
+				? capabilityNoopGuard.consequent
+				: undefined;
+		const refreshCapabilityFlagIndex = refreshBody.findIndex(
 			statement =>
 				statement.type === "ExpressionStatement" &&
 				statement.expression.type === "AssignmentExpression" &&
@@ -1008,7 +1077,7 @@ export function findMcpTuiMetadataFindings(slashCommandsSource: string, interact
 				statement.expression.right.type === "Identifier" &&
 				statement.expression.right.name === "hasExactMcpControls",
 		);
-		const rebuildSlashCommands = refreshBody.some(
+		const rebuildSlashCommandsIndex = refreshBody.findIndex(
 			statement =>
 				statement.type === "ExpressionStatement" &&
 				statement.expression.type === "AssignmentExpression" &&
@@ -1023,7 +1092,7 @@ export function findMcpTuiMetadataFindings(slashCommandsSource: string, interact
 				statement.expression.right.elements[0].argument.arguments[0]?.type === "Identifier" &&
 				statement.expression.right.elements[0].argument.arguments[0].name === "hasExactMcpControls",
 		);
-		const rebuildResolvedSlashCommands = refreshBody.some(
+		const rebuildResolvedSlashCommandsIndex = refreshBody.findIndex(
 			statement =>
 				statement.type === "ExpressionStatement" &&
 				statement.expression.type === "AssignmentExpression" &&
@@ -1033,7 +1102,7 @@ export function findMcpTuiMetadataFindings(slashCommandsSource: string, interact
 				statement.expression.right.elements[0]?.type === "SpreadElement" &&
 				thisPrivate(statement.expression.right.elements[0].argument, "baseSlashCommands"),
 		);
-		const updateAutocomplete = refreshBody.some(
+		const updateAutocompleteIndex = refreshBody.findIndex(
 			statement =>
 				statement.type === "ExpressionStatement" &&
 				statement.expression.type === "CallExpression" &&
@@ -1048,6 +1117,30 @@ export function findMcpTuiMetadataFindings(slashCommandsSource: string, interact
 				statement.expression.arguments[0].arguments[0]?.type === "MemberExpression" &&
 				thisPrivate(statement.expression.arguments[0].arguments[0], "resolvedSlashCommands"),
 		);
+		let hasUnexpectedRefreshExit = false;
+		if (refreshHelper) {
+			traverse(interactiveMode, {
+				ReturnStatement(returnPath) {
+					if (
+						returnPath.getFunctionParent()?.node === refreshHelper &&
+						returnPath.node !== capabilityNoopReturn
+					) {
+						hasUnexpectedRefreshExit = true;
+					}
+				},
+				ThrowStatement(throwPath) {
+					if (throwPath.getFunctionParent()?.node === refreshHelper) hasUnexpectedRefreshExit = true;
+				},
+			});
+		}
+		const refreshActionsAreReachable =
+			capabilitySnapshotIsExact &&
+			capabilityNoopReturn !== undefined &&
+			!hasUnexpectedRefreshExit &&
+			rebuildSlashCommandsIndex > 1 &&
+			refreshCapabilityFlagIndex > rebuildSlashCommandsIndex &&
+			rebuildResolvedSlashCommandsIndex > refreshCapabilityFlagIndex &&
+			updateAutocompleteIndex > rebuildResolvedSlashCommandsIndex;
 		const refreshBodyStatements = refreshCommands?.body.body ?? [];
 		const loadIndex = refreshBodyStatements.findIndex(
 			statement =>
@@ -1072,10 +1165,8 @@ export function findMcpTuiMetadataFindings(slashCommandsSource: string, interact
 		return filterIsSafe &&
 			initialization &&
 			initSlashCommands &&
-			refreshCapabilityFlag &&
-			rebuildSlashCommands &&
-			rebuildResolvedSlashCommands &&
-			updateAutocomplete &&
+			baseSlashCommandsIndex > initSlashCommandsIndex &&
+			refreshActionsAreReachable &&
 			loadIndex >= 0 &&
 			refreshIndices.length >= 2 &&
 			refreshIndices[0]! < loadIndex &&
