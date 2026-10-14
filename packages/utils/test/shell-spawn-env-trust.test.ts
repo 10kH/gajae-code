@@ -225,3 +225,23 @@ describe("bash spawn env Bun startup options", () => {
 		expect(probe.BUN_OPTIONS).toBe("--no-env-file");
 	});
 });
+
+describe("bash spawn env interpreter injection", () => {
+	for (const autoload of [true, false]) {
+		it(`drops project NODE_OPTIONS/PYTHONPATH/LD_PRELOAD declarations (autoload=${autoload})`, async () => {
+			const probe = await probeIn(
+				tempDir("NODE_OPTIONS=--require ./r.js\nPYTHONPATH=.\nLD_PRELOAD=./planted.so\n"),
+				autoload,
+			);
+			expect(probe).toMatchObject({ NODE_OPTIONS: null, PYTHONPATH: null, LD_PRELOAD: null });
+		});
+	}
+
+	it("keeps interpreter variables the launching shell exported with a different value", async () => {
+		const probe = await probeIn(tempDir("NODE_OPTIONS=--require ./r.js\nPYTHONPATH=.\n"), true, {
+			NODE_OPTIONS: "--max-old-space-size=4096",
+			PYTHONPATH: "/opt/operator/lib",
+		});
+		expect(probe).toMatchObject({ NODE_OPTIONS: "--max-old-space-size=4096", PYTHONPATH: "/opt/operator/lib" });
+	});
+});

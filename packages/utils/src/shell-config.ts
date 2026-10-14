@@ -57,11 +57,16 @@ function isExecutable(path: string): boolean {
  * `GIT_EXTERNAL_DIFF`, `GIT_SSH(_COMMAND)`, `GIT_ASKPASS` (auth prompts, even
  * with `GIT_TERMINAL_PROMPT=0`) and `GIT_SEQUENCE_EDITOR` (`git rebase -i`).
  * `GIT_TEMPLATE_DIR` can also seed executable hooks when `git init` creates a
- * repository. A repository `.env` must not be able to set them, or bash tool
- * commands could execute repository code.
+ * repository. Interpreters the shell starts also load code named by the
+ * environment: Node `NODE_OPTIONS` (`--require`), Python `PYTHONPATH`
+ * (`sitecustomize`), Perl `PERL5OPT`/`PERL5LIB` (`-M`), the JVM
+ * `JAVA_TOOL_OPTIONS` (`-javaagent`), and the dynamic loader `LD_PRELOAD`
+ * (macOS: `DYLD_INSERT_LIBRARIES`) for every dynamically linked command. A
+ * repository `.env` must not be able to set them, or bash tool commands could
+ * execute repository code.
  */
 const PROJECT_DENIED_SPAWN_ENV =
-	/^(?:BASH_ENV|BUN_OPTIONS|ENV|ZDOTDIR|HOME|USERPROFILE|HOMEDRIVE|HOMEPATH|XDG_CONFIG_HOME|GIT_DIR|GIT_COMMON_DIR|GIT_EXEC_PATH|GIT_EXTERNAL_DIFF|GIT_PROXY_COMMAND|GIT_SSH|GIT_SSH_COMMAND|GIT_ASKPASS|GIT_SEQUENCE_EDITOR|GIT_TEMPLATE_DIR|GIT_CONFIG_(?:COUNT|PARAMETERS|GLOBAL|SYSTEM|KEY_\d+|VALUE_\d+))$/;
+	/^(?:BASH_ENV|BUN_OPTIONS|ENV|ZDOTDIR|HOME|USERPROFILE|HOMEDRIVE|HOMEPATH|XDG_CONFIG_HOME|GIT_DIR|GIT_COMMON_DIR|GIT_EXEC_PATH|GIT_EXTERNAL_DIFF|GIT_PROXY_COMMAND|GIT_SSH|GIT_SSH_COMMAND|GIT_ASKPASS|GIT_SEQUENCE_EDITOR|GIT_TEMPLATE_DIR|NODE_OPTIONS|PYTHONPATH|PERL5OPT|PERL5LIB|JAVA_TOOL_OPTIONS|LD_PRELOAD|DYLD_INSERT_LIBRARIES|GIT_CONFIG_(?:COUNT|PARAMETERS|GLOBAL|SYSTEM|KEY_\d+|VALUE_\d+))$/;
 const PROJECT_HOME_SPAWN_ENV = new Set(["HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"]);
 
 /**

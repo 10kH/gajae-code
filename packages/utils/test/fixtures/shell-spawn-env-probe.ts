@@ -19,6 +19,9 @@ try {
 const keys = [
 	"BASH_ENV",
 	"BUN_OPTIONS",
+	"NODE_OPTIONS",
+	"PYTHONPATH",
+	"LD_PRELOAD",
 	"GIT_ASKPASS",
 	"GIT_EXEC_PATH",
 	"GIT_PROXY_COMMAND",

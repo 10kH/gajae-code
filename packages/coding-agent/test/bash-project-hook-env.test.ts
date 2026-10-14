@@ -16,6 +16,13 @@ import * as path from "node:path";
 const PROBE = path.join(import.meta.dir, "fixtures", "bash-project-hook-probe.ts");
 const HOOK_KEYS = [
 	"BASH_ENV",
+	"NODE_OPTIONS",
+	"PYTHONPATH",
+	"PERL5OPT",
+	"PERL5LIB",
+	"JAVA_TOOL_OPTIONS",
+	"LD_PRELOAD",
+	"DYLD_INSERT_LIBRARIES",
 	"BUN_OPTIONS",
 	"GIT_ASKPASS",
 	"GIT_EXEC_PATH",
@@ -157,6 +164,115 @@ describe.skipIf(process.platform === "win32")("bash tool ignores project .env ho
 		const target = project(() => "");
 		const dotenv = `GIT_CONFIG_COUNT=1\nGIT_CONFIG_KEY_0=core.fsmonitor\nGIT_CONFIG_VALUE_0=${target.hook}\n`;
 		expect(await runProbe(target, "worker", { GJC_TEST_DOTENV_AFTER_START: dotenv })).toBe(false);
+	});
+
+	// Interpreters the command starts load code named by the environment. Each
+	// case plants the payload in the project and runs the interpreter from the
+	// bash tool; skipped when the interpreter is not installed.
+	const RUNTIME_VECTORS: { name: string; binary: string; command: string; plant: (project: Project) => string }[] = [
+		{
+			name: "NODE_OPTIONS",
+			binary: "node",
+			command: "node -e 0",
+			plant: ({ cwd, marker }) => {
+				fs.writeFileSync(
+					path.join(cwd, "preload.cjs"),
+					`require("fs").writeFileSync(${JSON.stringify(marker)}, "ran");\n`,
+				);
+				return `NODE_OPTIONS=--require ${path.join(cwd, "preload.cjs")}\n`;
+			},
+		},
+		{
+			name: "PYTHONPATH",
+			binary: "python3",
+			command: "python3 -c 0",
+			plant: ({ cwd, marker }) => {
+				fs.writeFileSync(path.join(cwd, "sitecustomize.py"), `open(${JSON.stringify(marker)}, "w").write("ran")\n`);
+				return `PYTHONPATH=${cwd}\n`;
+			},
+		},
+		{
+			name: "PERL5OPT",
+			binary: "perl",
+			command: "perl -e 0",
+			plant: ({ cwd, marker }) => {
+				fs.writeFileSync(
+					path.join(cwd, "Planted.pm"),
+					`open(my $f, ">", ${JSON.stringify(marker)}); print $f "ran"; 1;\n`,
+				);
+				return `PERL5OPT=-MPlanted\nPERL5LIB=${cwd}\n`;
+			},
+		},
+	];
+	for (const vector of RUNTIME_VECTORS) {
+		it.skipIf(!Bun.which(vector.binary))(
+			`does not let a project ${vector.name} inject code into ${vector.binary}`,
+			async () => {
+				const target = project(vector.plant);
+				const command = `${vector.command} >/dev/null 2>&1; echo probe-done`;
+				expect(await runProbe(target, "worker", { GJC_TEST_PROBE_COMMAND: command })).toBe(false);
+			},
+		);
+	}
+
+	// The JVM loads a `-javaagent` from JAVA_TOOL_OPTIONS before `main`.
+	it.skipIf(!Bun.which("javac") || !Bun.which("jar") || !Bun.which("java"))(
+		"does not let a project JAVA_TOOL_OPTIONS agent load into java",
+		async () => {
+			const target = project(({ cwd, marker }) => {
+				const source = path.join(cwd, "Planted.java");
+				fs.writeFileSync(
+					source,
+					`public class Planted { public static void premain(String a) throws Exception { java.nio.file.Files.write(java.nio.file.Paths.get(${JSON.stringify(marker)}), new byte[0]); } }\n`,
+				);
+				fs.writeFileSync(path.join(cwd, "manifest.txt"), "Premain-Class: Planted\n");
+				for (const argv of [
+					["javac", source],
+					["jar", "cfm", "planted.jar", "manifest.txt", "Planted.class"],
+				]) {
+					const step = Bun.spawnSync(argv, { cwd });
+					if (step.exitCode !== 0) throw new Error(`${argv[0]} failed: ${step.stderr.toString()}`);
+				}
+				return `JAVA_TOOL_OPTIONS=-javaagent:${path.join(cwd, "planted.jar")}\n`;
+			});
+			const command = "java -version >/dev/null 2>&1; echo probe-done";
+			expect(await runProbe(target, "worker", { GJC_TEST_PROBE_COMMAND: command })).toBe(false);
+		},
+		60_000,
+	);
+
+	// The dynamic loader runs a preloaded library in every dynamically linked
+	// command, including a plain `ls`.
+	it.skipIf(process.platform !== "linux" || !Bun.which("cc"))(
+		"does not let a project LD_PRELOAD library load into shell commands",
+		async () => {
+			const target = project(({ cwd, marker }) => {
+				const source = path.join(cwd, "preload.c");
+				fs.writeFileSync(
+					source,
+					`#include <stdio.h>\n__attribute__((constructor)) static void planted(void) { FILE *f = fopen(${JSON.stringify(marker)}, "w"); if (f) fclose(f); }\n`,
+				);
+				const library = path.join(cwd, "preload.so");
+				const cc = Bun.spawnSync(["cc", "-shared", "-fPIC", "-o", library, source]);
+				if (cc.exitCode !== 0) throw new Error(`cc failed: ${cc.stderr.toString()}`);
+				return `LD_PRELOAD=${library}\n`;
+			});
+			expect(await runProbe(target, "worker", { GJC_TEST_PROBE_COMMAND: "ls >/dev/null; echo probe-done" })).toBe(
+				false,
+			);
+		},
+	);
+
+	it.skipIf(!Bun.which("python3"))("still honors a PYTHONPATH the launching shell exported", async () => {
+		const target = project(() => "PYTHONPATH=/nonexistent-project-path\n");
+		const trusted = path.join(target.cwd, "trusted");
+		fs.mkdirSync(trusted);
+		fs.writeFileSync(
+			path.join(trusted, "sitecustomize.py"),
+			`open(${JSON.stringify(target.marker)}, "w").write("ran")\n`,
+		);
+		const command = "python3 -c 0 >/dev/null 2>&1; echo probe-done";
+		expect(await runProbe(target, "worker", { PYTHONPATH: trusted, GJC_TEST_PROBE_COMMAND: command })).toBe(true);
 	});
 
 	// The PTY runs a real `bash -lc` that inherits the host environment. A
