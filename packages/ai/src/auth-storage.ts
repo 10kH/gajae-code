@@ -699,6 +699,23 @@ export interface CredentialDisabledEvent {
 export type CredentialRankingMode = "balanced" | "earliest-reset";
 
 /**
+ * Persisted soft preference for one provider's OAuth pool.
+ *
+ * The matching credential is moved ahead of the normal ranking while it is
+ * usable. It yields to the normal ranking when it is blocked, when it cannot be
+ * found, or when its most-used known usage window has reached
+ * `maxUsedFraction`. Unknown usage never counts as over the threshold.
+ *
+ * Runtime selectors (`--credential`, `--prefer-credential`) and session
+ * stickiness take precedence over a configured preference.
+ */
+export interface ConfiguredCredentialPreference {
+	selector: AuthCredentialSelector;
+	/** Used fraction in (0, 1] at which the preference stops applying. Absent means only blocking rotates away. */
+	maxUsedFraction?: number;
+}
+
+/**
  * Whether credential selection may probe provider usage endpoints.
  *
  * - `network` (default): ranking and quota checks fetch usage when the shared
@@ -714,6 +731,8 @@ export type AuthStorageOptions = {
 	usageProviderResolver?: (provider: Provider) => UsageProvider | undefined;
 	rankingStrategyResolver?: (provider: Provider) => CredentialRankingStrategy | undefined;
 	credentialRankingMode?: CredentialRankingMode;
+	/** Persisted soft preferences keyed by provider id. */
+	credentialPreferences?: Readonly<Record<string, ConfiguredCredentialPreference>>;
 	usageFetch?: typeof fetch;
 	usageRequestTimeoutMs?: number;
 	usageLogger?: UsageLogger;
@@ -1527,6 +1546,8 @@ export class AuthStorage {
 	#runtimeCredentialSelectors: Map<string, AuthCredentialSelector> = new Map();
 	/** Soft runtime credential preference per provider; quota failures may rotate away from it. */
 	#runtimePreferredCredentialSelectors: Map<string, AuthCredentialSelector> = new Map();
+	/** Persisted soft credential preference per provider; usage threshold and quota failures may rotate away from it. */
+	#configuredCredentialPreferences: Map<string, ConfiguredCredentialPreference> = new Map();
 	/** Credential selectors explicitly attached to a credential session scope. */
 	#sessionCredentialSelectors: Map<string, Map<string, AuthCredentialSelector>> = new Map();
 	/** Explicit AUTO masks suppress both scoped and process-global selectors for a scope/provider. */
@@ -1617,6 +1638,9 @@ export class AuthStorage {
 				: DEFAULT_USAGE_REQUEST_TIMEOUT_MS;
 		this.#usageFetchLeaseMs = usageTimeoutForLease + USAGE_FETCH_LEASE_GRACE_MS;
 		this.#credentialRankingMode = options.credentialRankingMode ?? "balanced";
+		for (const [provider, preference] of Object.entries(options.credentialPreferences ?? {})) {
+			this.#configuredCredentialPreferences.set(resolveOAuthStorageProvider(provider), preference);
+		}
 		this.#refreshOAuthCredentialOverride = options.refreshOAuthCredential;
 		this.#fetchUsageReportsOverride = options.fetchUsageReports;
 		this.#fetchUsageReportsForProviderOverride = options.fetchUsageReportsForProvider;
@@ -3195,6 +3219,52 @@ export class AuthStorage {
 			options?.preferredCredentialSelector ??
 			this.#runtimePreferredCredentialSelectors.get(resolveOAuthStorageProvider(provider))
 		);
+	}
+
+	/**
+	 * Move the configured preferred credential to the front of `candidates` while it is usable and under its usage
+	 * threshold. A missing row, a blocked row, or a row at its threshold leaves the normal ranking untouched.
+	 */
+	#applyConfiguredCredentialPreference(
+		provider: string,
+		providerKey: string,
+		candidates: Array<{ selection: OAuthCredentialSelection; usage: UsageReport | null }>,
+		strategy: CredentialRankingStrategy | undefined,
+	): void {
+		const preference = this.#configuredCredentialPreferences.get(resolveOAuthStorageProvider(provider));
+		if (!preference) return;
+		const preferredSelection = this.#findCredentialBySelector(provider, preference.selector);
+		if (preferredSelection?.credential.type !== "oauth") return;
+		if (this.#isCredentialBlocked(providerKey, preferredSelection.index)) return;
+		const preferredCandidate = candidates.findIndex(
+			candidate => candidate.selection.index === preferredSelection.index,
+		);
+		if (preferredCandidate < 0) return;
+		const { maxUsedFraction } = preference;
+		if (maxUsedFraction !== undefined) {
+			const usedFraction = this.#maxKnownUsedFraction(candidates[preferredCandidate]!.usage, strategy);
+			if (usedFraction !== undefined && usedFraction >= maxUsedFraction) return;
+		}
+		if (preferredCandidate > 0) {
+			const [preferred] = candidates.splice(preferredCandidate, 1);
+			candidates.unshift(preferred);
+		}
+	}
+
+	/** Highest reported used fraction across the strategy's ranking windows; undefined when no window reports one. */
+	#maxKnownUsedFraction(
+		usage: UsageReport | null,
+		strategy: CredentialRankingStrategy | undefined,
+	): number | undefined {
+		if (!usage || !strategy) return undefined;
+		const windows = strategy.findWindowLimits(usage);
+		let maxUsed: number | undefined;
+		for (const limit of [windows.primary, windows.secondary]) {
+			const usedFraction = limit?.amount.usedFraction;
+			if (typeof usedFraction !== "number" || !Number.isFinite(usedFraction)) continue;
+			maxUsed = maxUsed === undefined ? usedFraction : Math.max(maxUsed, usedFraction);
+		}
+		return maxUsed;
 	}
 
 	#assertCredentialSelectorUsable(provider: string, selector: AuthCredentialSelector, owner?: object): void {
@@ -5910,6 +5980,8 @@ export class AuthStorage {
 					const [preferred] = candidates.splice(preferredCandidate, 1);
 					candidates.unshift(preferred);
 				}
+			} else if (!preferredSelector) {
+				this.#applyConfiguredCredentialPreference(provider, providerKey, candidates, strategy);
 			}
 		}
 
