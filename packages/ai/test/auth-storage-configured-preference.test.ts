@@ -21,13 +21,12 @@ const usageProvider: UsageProvider = {
 	},
 };
 
-function limit(id: "anthropic:5h" | "anthropic:7d", usedFraction: number): UsageLimit {
-	const durationMs = id === "anthropic:5h" ? 5 * HOUR_MS : 7 * DAY_MS;
-	const windowId = id === "anthropic:5h" ? "5h" : "7d";
+function limit(provider: string, windowId: "5h" | "7d", usedFraction: number): UsageLimit {
+	const durationMs = windowId === "5h" ? 5 * HOUR_MS : 7 * DAY_MS;
 	return {
-		id,
+		id: `${provider}:${windowId}`,
 		label: windowId,
-		scope: { provider: "anthropic", windowId, shared: true },
+		scope: { provider, windowId, shared: true },
 		window: { id: windowId, label: windowId, durationMs, resetsAt: Date.now() + durationMs / 2 },
 		amount: {
 			unit: "percent",
@@ -41,11 +40,11 @@ function limit(id: "anthropic:5h" | "anthropic:7d", usedFraction: number): Usage
 	};
 }
 
-function report(email: string, fiveHourUsed: number, sevenDayUsed: number): UsageReport {
+function report(email: string, fiveHourUsed: number, sevenDayUsed: number, provider = "anthropic"): UsageReport {
 	return {
-		provider: "anthropic",
+		provider,
 		fetchedAt: Date.now(),
-		limits: [limit("anthropic:5h", fiveHourUsed), limit("anthropic:7d", sevenDayUsed)],
+		limits: [limit(provider, "5h", fiveHourUsed), limit(provider, "7d", sevenDayUsed)],
 		metadata: { email },
 	};
 }
@@ -54,14 +53,29 @@ function oauth(access: string, email: string): OAuthCredential {
 	return { type: "oauth", access, refresh: `refresh-${access}`, expires: Date.now() + HOUR_MS, email };
 }
 
-async function createStorage(preference?: ConfiguredCredentialPreference): Promise<AuthStorage> {
+async function createStorage(
+	preference?: ConfiguredCredentialPreference,
+	rankingStrategyResolver?: () => undefined,
+	provider: "anthropic" | "kimi-code" = "anthropic",
+): Promise<AuthStorage> {
 	const store = await SqliteAuthCredentialStore.open(":memory:");
 	openStores.push(store);
+	const usageProviderForStorage: UsageProvider =
+		provider === "anthropic"
+			? usageProvider
+			: {
+					id: provider,
+					async fetchUsage(params) {
+						const email = params.credential.email;
+						return email ? (usageByEmail.get(email) ?? null) : null;
+					},
+				};
 	const storage = new AuthStorage(store, {
-		usageProviderResolver: provider => (provider === "anthropic" ? usageProvider : undefined),
-		...(preference ? { credentialPreferences: { anthropic: preference } } : {}),
+		usageProviderResolver: resolvedProvider => (resolvedProvider === provider ? usageProviderForStorage : undefined),
+		...(rankingStrategyResolver ? { rankingStrategyResolver } : {}),
+		...(preference ? { credentialPreferences: { [provider]: preference } } : {}),
 	});
-	await storage.set("anthropic", [
+	await storage.set(provider, [
 		oauth("token-personal", "personal@example.test"),
 		oauth("token-cheap", "cheap@example.test"),
 	]);
@@ -110,6 +124,21 @@ describe("configured credential preference", () => {
 		});
 
 		expect(await storage.getApiKey("anthropic", "long-window-over-threshold")).toBe("token-personal");
+	});
+
+	test("the threshold applies when usage is available without a ranking strategy", async () => {
+		usageByEmail.set("personal@example.test", report("personal@example.test", 0.1, 0.1, "kimi-code"));
+		usageByEmail.set("cheap@example.test", report("cheap@example.test", 0.95, 0.2, "kimi-code"));
+		const storage = await createStorage(
+			{
+				selector: { kind: "email", value: "cheap@example.test" },
+				maxUsedFraction: 0.9,
+			},
+			() => undefined,
+			"kimi-code",
+		);
+
+		expect(await storage.getApiKey("kimi-code")).toBe("token-personal");
 	});
 
 	test("the preference still applies just below maxUsedFraction", async () => {

@@ -3225,19 +3225,33 @@ export class AuthStorage {
 	 * Move the configured preferred credential to the front of `candidates` while it is usable and under its usage
 	 * threshold. A missing row, a blocked row, or a row at its threshold leaves the normal ranking untouched.
 	 */
-	#applyConfiguredCredentialPreference(
+	async #applyConfiguredCredentialPreference(
 		provider: string,
 		providerKey: string,
-		candidates: Array<{ selection: OAuthCredentialSelection; usage: UsageReport | null }>,
+		candidates: Array<{
+			selection: OAuthCredentialSelection;
+			usage: UsageReport | null;
+			usageChecked: boolean;
+		}>,
 		strategy: CredentialRankingStrategy | undefined,
-	): void {
+		options?: AuthApiKeyOptions,
+	): Promise<void> {
 		const preference = this.#configuredCredentialPreferences.get(resolveOAuthStorageProvider(provider));
 		if (!preference) return;
 		const preferredCandidate = this.#findUsableOAuthCandidate(provider, providerKey, candidates, preference.selector);
 		if (preferredCandidate < 0) return;
 		const { maxUsedFraction } = preference;
 		if (maxUsedFraction !== undefined) {
-			const usedFraction = this.#maxKnownUsedFraction(candidates[preferredCandidate]!.usage, strategy);
+			const candidate = candidates[preferredCandidate]!;
+			if (!candidate.usageChecked) {
+				candidate.usage = await this.#getUsageReport(provider, candidate.selection.credential, {
+					baseUrl: options?.baseUrl,
+					timeoutMs: this.#usageRequestTimeoutMs,
+					signal: options?.signal,
+				});
+				candidate.usageChecked = true;
+			}
+			const usedFraction = this.#maxKnownUsedFraction(candidate.usage, strategy);
 			if (usedFraction !== undefined && usedFraction >= maxUsedFraction) return;
 		}
 		if (preferredCandidate > 0) {
@@ -3264,15 +3278,15 @@ export class AuthStorage {
 		return this.#isCredentialBlocked(providerKey, candidates[position]!.selection.index) ? -1 : position;
 	}
 
-	/** Highest reported used fraction across the strategy's ranking windows; undefined when no window reports one. */
+	/** Highest reported used fraction across known usage windows; undefined when no window reports one. */
 	#maxKnownUsedFraction(
 		usage: UsageReport | null,
 		strategy: CredentialRankingStrategy | undefined,
 	): number | undefined {
-		if (!usage || !strategy) return undefined;
-		const windows = strategy.findWindowLimits(usage);
+		if (!usage) return undefined;
+		const limits = strategy ? Object.values(strategy.findWindowLimits(usage)) : usage.limits;
 		let maxUsed: number | undefined;
-		for (const limit of [windows.primary, windows.secondary]) {
+		for (const limit of limits) {
 			const usedFraction = limit?.amount.usedFraction;
 			if (typeof usedFraction !== "number" || !Number.isFinite(usedFraction)) continue;
 			maxUsed = maxUsed === undefined ? usedFraction : Math.max(maxUsed, usedFraction);
@@ -5988,7 +6002,7 @@ export class AuthStorage {
 					candidates.unshift(preferred);
 				}
 			} else if (!preferredSelector) {
-				this.#applyConfiguredCredentialPreference(provider, providerKey, candidates, strategy);
+				await this.#applyConfiguredCredentialPreference(provider, providerKey, candidates, strategy, options);
 			}
 		}
 
