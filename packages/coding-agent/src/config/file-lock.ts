@@ -244,6 +244,41 @@ async function captureFileLockStagingRootIdentity(
 	}
 }
 
+async function captureFileLockStagingTreeSnapshot(
+	stagingPath: string,
+	retryBudget: FileLockAcquisitionRetryBudget,
+): Promise<NativeDirectoryTreeSnapshot> {
+	for (;;) {
+		const captured = nativeFileLockBindings().snapshotDirectoryTree(stagingPath);
+		if (captured.ok && captured.snapshot) return captured.snapshot;
+		const code = captured.code ?? "snapshot_unavailable";
+		if (
+			code !== "access_denied" &&
+			code !== "io_error" &&
+			code !== "permission_denied" &&
+			code !== "sharing_violation"
+		) {
+			throw Object.assign(new Error(`Failed to snapshot staged file lock: ${code}.`), { code });
+		}
+		if (retryBudget.remainingDelays === 0)
+			throw Object.assign(new Error(`Failed to snapshot staged file lock: ${code}.`), { code });
+		retryBudget.remainingDelays--;
+		await sleepFileLockRetry(retryBudget.retryDelayMs, retryBudget.signal);
+	}
+}
+
+function bindFileLockStagingTreeSnapshot(
+	stagingPath: string,
+	identity: FileLockStagingRootIdentity,
+	snapshot: NativeDirectoryTreeSnapshot,
+): FileLockStagingRootIdentity {
+	if (snapshot.rootDev !== identity.rootDev || snapshot.rootIno !== identity.rootIno)
+		throw Object.assign(new Error(`Staged file-lock root identity changed while snapshotting ${stagingPath}.`), {
+			code: "identity_mismatch",
+		});
+	return { ...identity, treeSnapshot: snapshot };
+}
+
 async function hasPendingStagingRootIdentity(
 	stagingPath: string,
 	identity: FileLockStagingRootIdentity,
@@ -275,6 +310,7 @@ async function removePendingStaging(stagingPath: string, identity: FileLockStagi
 		return;
 	}
 	if (process.platform === "win32") {
+		if (!identity.treeSnapshot && !(await hasPendingStagingRootIdentity(stagingPath, identity))) return;
 		if (!identity.treeSnapshot)
 			throw Object.assign(new Error("Staged file-lock tree identity is unavailable; refusing removal."), {
 				code: "identity_unavailable",
@@ -332,6 +368,19 @@ async function retryPendingStagingCleanups(
 				code: "identity_unavailable",
 			});
 			throw new FileLockStagingCleanupError(lockPath, stagingPath, error);
+		}
+		if (process.platform === "win32" && !pending.identity.treeSnapshot) {
+			try {
+				if (!(await hasPendingStagingRootIdentity(stagingPath, pending.identity))) {
+					pendingStagingCleanups.delete(stagingPath);
+					continue;
+				}
+				const snapshot = await captureFileLockStagingTreeSnapshot(stagingPath, retryBudget);
+				pending.identity = bindFileLockStagingTreeSnapshot(stagingPath, pending.identity, snapshot);
+			} catch (error) {
+				if (retryBudget.signal?.aborted) throw retryBudget.signal.reason ?? error;
+				throw new FileLockStagingCleanupError(lockPath, stagingPath, error);
+			}
 		}
 		await cleanupPendingStagingOrThrow(lockPath, stagingPath, pending.identity, retryBudget);
 	}
@@ -2389,13 +2438,11 @@ async function tryAcquireLock(
 			if (pendingStagingIdentity)
 				pendingStagingIdentity = { ...pendingStagingIdentity, treeSnapshot: staged.snapshot };
 		} else {
-			const staged = snapshotDirectoryTree(canonicalPendingPath);
-			if (!staged.ok || !staged.snapshot) {
-				const failure = new Error(
-					`Failed to snapshot staged file lock: ${staged.code ?? "unknown"}.`,
-				) as NodeJS.ErrnoException;
-				if (staged.code) failure.code = staged.code;
-				throw new FileLockStagingCleanupError(lockPath, pendingPath, failure);
+			let stagedSnapshotForRemoval: NativeDirectoryTreeSnapshot;
+			try {
+				stagedSnapshotForRemoval = await captureFileLockStagingTreeSnapshot(canonicalPendingPath, retryBudget);
+			} catch (error) {
+				throw new FileLockStagingCleanupError(lockPath, pendingPath, error);
 			}
 			if (!pendingStagingIdentity)
 				throw new FileLockStagingCleanupError(
@@ -2405,7 +2452,16 @@ async function tryAcquireLock(
 						code: "identity_unavailable",
 					}),
 				);
-			pendingStagingIdentity = { ...pendingStagingIdentity, treeSnapshot: staged.snapshot };
+			try {
+				pendingStagingIdentity = bindFileLockStagingTreeSnapshot(
+					canonicalPendingPath,
+					pendingStagingIdentity,
+					stagedSnapshotForRemoval,
+				);
+			} catch (error) {
+				throw new FileLockStagingCleanupError(lockPath, pendingPath, error);
+			}
+			stagedSnapshot = stagedSnapshotForRemoval;
 		}
 		const publication = FileLockTestHooks.nativePublicationBindings?.() ?? {
 			renameNoReplacePathAsync,

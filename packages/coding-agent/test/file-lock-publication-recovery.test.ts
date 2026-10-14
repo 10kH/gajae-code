@@ -790,6 +790,53 @@ test("blocks future acquisition when staging root identity cannot be captured", 
 	expect((await fs.readdir(root)).filter(name => name.includes(".pending."))).toHaveLength(1);
 });
 
+test("recaptures a retained Windows staging tree after a transient snapshot failure", async () => {
+	const { root, file, lock } = await makeFixture();
+	const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+	if (!originalPlatform?.configurable) throw new Error("process_platform_not_configurable");
+	let snapshotAttempts = 0;
+	let publicationAttempts = 0;
+	FileLockTestHooks.nativeQuarantineBindings = () => ({
+		snapshotDirectoryTree: stagingPath => {
+			snapshotAttempts++;
+			if (snapshotAttempts === 1) return { ok: false, code: "io_error" };
+			return snapshotDirectoryTree(stagingPath);
+		},
+		exactRemoveDirectoryTree: stagingPath => {
+			syncFs.rmSync(stagingPath, { recursive: true, force: true });
+			return { ok: true };
+		},
+	});
+	FileLockTestHooks.nativePublicationBindings = () => ({
+		renameNoReplacePathAsync: async (source, destination) => {
+			publicationAttempts++;
+			await fs.rename(source, destination);
+			return successfulPublication("windows_rename_noreplace");
+		},
+		renameDirectoryNoReplacePathAsync,
+	});
+	let release: (() => Promise<void>) | undefined;
+	try {
+		Object.defineProperty(process, "platform", { ...originalPlatform, value: "win32" });
+		await expect(acquireFileLock(file, { retries: 1, retryDelayMs: 1 })).rejects.toMatchObject({
+			name: "FileLockStagingCleanupError",
+			lockPath: lock,
+			code: "io_error",
+		});
+		expect((await fs.readdir(root)).filter(name => name.includes(".pending."))).toHaveLength(1);
+		release = await acquireFileLock(file, { retries: 2, retryDelayMs: 1 });
+		expect(snapshotAttempts).toBe(3);
+		expect(publicationAttempts).toBe(1);
+		expect((await fs.readdir(root)).filter(name => name.includes(".pending."))).toHaveLength(0);
+	} finally {
+		Object.defineProperty(process, "platform", originalPlatform);
+		FileLockTestHooks.nativeQuarantineBindings = undefined;
+	}
+	if (!release) throw new Error("Expected the second acquisition to succeed");
+	await release();
+	expect(await fs.readdir(root)).toEqual([]);
+});
+
 test("aborts a transient publication retry before another publish attempt", async () => {
 	const { root, file } = await makeFixture();
 	const firstAttempt = Promise.withResolvers<void>();
