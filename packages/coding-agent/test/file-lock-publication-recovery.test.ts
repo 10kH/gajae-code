@@ -49,6 +49,7 @@ afterEach(async () => {
 	vi.restoreAllMocks();
 	FileLockTestHooks.nativePublicationBindings = undefined;
 	FileLockTestHooks.stagingIdentityEvidence = undefined;
+	FileLockTestHooks.stagingRootIdentity = undefined;
 	FileLockTestHooks.processIncarnation = undefined;
 	FileLockTestHooks.nativeQuarantineBindings = undefined;
 	FileLockTestHooks.cleanupPendingStaging = undefined;
@@ -728,6 +729,65 @@ test("stops retrying when failed publication staging cannot be cleaned", async (
 	await release();
 	await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
 	expect(await fs.readdir(root)).toEqual([]);
+});
+
+test("drains destination-exists cleanup before creating another staging directory", async () => {
+	const { root, file, lock } = await makeFixture();
+	let publicationAttempts = 0;
+	let cleanupAttempts = 0;
+	FileLockTestHooks.nativePublicationBindings = () => ({
+		renameNoReplacePathAsync: async (source, destination) => {
+			publicationAttempts++;
+			if (publicationAttempts === 1) return destinationExistsPublication();
+			await fs.rename(source, destination);
+			return successfulPublication(primaryPrimitive ?? "windows_rename_noreplace");
+		},
+		renameDirectoryNoReplacePathAsync,
+	});
+	FileLockTestHooks.cleanupPendingStaging = async stagingPath => {
+		cleanupAttempts++;
+		if (cleanupAttempts === 1) throw Object.assign(new Error("staging cleanup denied"), { code: "EACCES" });
+		await fs.rm(stagingPath, { recursive: true, force: true });
+	};
+
+	const release = await acquireFileLock(file, { retries: 2, retryDelayMs: 1 });
+	expect(publicationAttempts).toBe(2);
+	expect(cleanupAttempts).toBe(2);
+	expect((await fs.readdir(root)).filter(name => name.includes(".pending."))).toHaveLength(0);
+	await release();
+	await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
+	expect(await fs.readdir(root)).toEqual([]);
+});
+
+test("blocks future acquisition when staging root identity cannot be captured", async () => {
+	const { root, file, lock } = await makeFixture();
+	let publicationAttempts = 0;
+	let identityAttempts = 0;
+	FileLockTestHooks.nativePublicationBindings = () => ({
+		renameNoReplacePathAsync: async () => {
+			publicationAttempts++;
+			return destinationExistsPublication();
+		},
+		renameDirectoryNoReplacePathAsync,
+	});
+	FileLockTestHooks.stagingRootIdentity = async () => {
+		identityAttempts++;
+		throw Object.assign(new Error("staging identity unavailable"), { code: "EACCES" });
+	};
+
+	await expect(acquireFileLock(file, { retries: 2, retryDelayMs: 1 })).rejects.toMatchObject({
+		name: "FileLockStagingCleanupError",
+		lockPath: lock,
+		code: "EACCES",
+	});
+	await expect(acquireFileLock(file, { retries: 2, retryDelayMs: 1 })).rejects.toMatchObject({
+		name: "FileLockStagingCleanupError",
+		lockPath: lock,
+		code: "identity_unavailable",
+	});
+	expect(identityAttempts).toBe(1);
+	expect(publicationAttempts).toBe(0);
+	expect((await fs.readdir(root)).filter(name => name.includes(".pending."))).toHaveLength(1);
 });
 
 test("aborts a transient publication retry before another publish attempt", async () => {

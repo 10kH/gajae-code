@@ -131,8 +131,15 @@ const DEFAULT_OPTIONS: Required<
 	retryDelayMs: 100,
 };
 
-type FileLockStagingRootIdentity = { rootDev: string; rootIno: string };
-type PendingFileLockStagingCleanup = FileLockStagingRootIdentity & { lockPath: string };
+type FileLockStagingRootIdentity = {
+	rootDev: string;
+	rootIno: string;
+	treeSnapshot?: NativeDirectoryTreeSnapshot;
+};
+type PendingFileLockStagingCleanup = {
+	lockPath: string;
+	identity?: FileLockStagingRootIdentity;
+};
 
 const pendingStagingCleanups = new Map<string, PendingFileLockStagingCleanup>();
 
@@ -171,6 +178,7 @@ export const FileLockTestHooks: {
 	afterParentMkdir?: (lockPath: string) => void | Promise<void>;
 	beforeRemovalOwnerPublish?: (transitionPath: string) => void | Promise<void>;
 	cleanupPendingStaging?: (stagingPath: string) => Promise<void>;
+	stagingRootIdentity?: (stagingPath: string) => FileLockStagingRootIdentity | Promise<FileLockStagingRootIdentity>;
 	nativePublicationBindings?: () => {
 		renameNoReplacePathAsync: typeof renameNoReplacePathAsync;
 		renameDirectoryNoReplacePathAsync: typeof renameDirectoryNoReplacePathAsync;
@@ -213,22 +221,38 @@ async function sleepFileLockRetry(delayMs: number, signal?: AbortSignal): Promis
 	}
 }
 
-async function captureFileLockStagingRootIdentity(stagingPath: string): Promise<FileLockStagingRootIdentity> {
-	const root = await fs.lstat(stagingPath, { bigint: true });
-	if (!root.isDirectory() || root.isSymbolicLink())
-		throw Object.assign(new Error("Staged file-lock root is not a directory."), { code: "identity_mismatch" });
-	return {
-		rootDev: canonicalLockDeviceId(root.dev).toString(),
-		rootIno: canonicalLockFileId(root.ino).toString(),
-	};
+async function captureFileLockStagingRootIdentity(
+	stagingPath: string,
+	retryBudget: FileLockAcquisitionRetryBudget,
+): Promise<FileLockStagingRootIdentity> {
+	const capture = FileLockTestHooks.stagingRootIdentity;
+	if (capture) return await capture(stagingPath);
+	for (;;) {
+		try {
+			const root = await fs.lstat(stagingPath, { bigint: true });
+			if (!root.isDirectory() || root.isSymbolicLink())
+				throw Object.assign(new Error("Staged file-lock root is not a directory."), { code: "identity_mismatch" });
+			return {
+				rootDev: canonicalLockDeviceId(root.dev).toString(),
+				rootIno: canonicalLockFileId(root.ino).toString(),
+			};
+		} catch (error) {
+			if (!isTransientReleaseError(error) || retryBudget.remainingDelays === 0) throw error;
+			retryBudget.remainingDelays--;
+			await sleepFileLockRetry(retryBudget.retryDelayMs, retryBudget.signal);
+		}
+	}
 }
 
-async function removePendingStaging(stagingPath: string, identity: FileLockStagingRootIdentity): Promise<void> {
+async function hasPendingStagingRootIdentity(
+	stagingPath: string,
+	identity: FileLockStagingRootIdentity,
+): Promise<boolean> {
 	let root: BigIntStats;
 	try {
 		root = await fs.lstat(stagingPath, { bigint: true });
 	} catch (error) {
-		if (isEnoent(error)) return;
+		if (isEnoent(error)) return false;
 		throw error;
 	}
 	if (
@@ -240,18 +264,41 @@ async function removePendingStaging(stagingPath: string, identity: FileLockStagi
 		throw Object.assign(new Error("Staged file-lock root identity changed; refusing removal."), {
 			code: "identity_mismatch",
 		});
+	return true;
+}
+
+async function removePendingStaging(stagingPath: string, identity: FileLockStagingRootIdentity): Promise<void> {
 	const cleanup = FileLockTestHooks.cleanupPendingStaging;
-	if (cleanup) await cleanup(stagingPath);
-	else await fs.rm(stagingPath, { recursive: true, force: true });
+	if (cleanup) {
+		if (!(await hasPendingStagingRootIdentity(stagingPath, identity))) return;
+		await cleanup(stagingPath);
+		return;
+	}
+	if (process.platform === "win32") {
+		if (!identity.treeSnapshot)
+			throw Object.assign(new Error("Staged file-lock tree identity is unavailable; refusing removal."), {
+				code: "identity_unavailable",
+			});
+		// A pathname check followed by fs.rm can erase a replacement installed in
+		// between; Windows cleanup must revalidate the captured tree atomically.
+		const removal = nativeFileLockBindings().exactRemoveDirectoryTree(stagingPath, identity.treeSnapshot);
+		if (!removal.ok && removal.code !== "not_found")
+			throw Object.assign(new Error(`Failed to remove staged file-lock tree: ${removal.code ?? "unknown"}.`), {
+				code: removal.code ?? "cleanup_failed",
+			});
+		return;
+	}
+	if (await hasPendingStagingRootIdentity(stagingPath, identity))
+		await fs.rm(stagingPath, { recursive: true, force: true });
 }
 
 function retainPendingStagingCleanup(
 	lockPath: string,
 	stagingPath: string,
-	identity: FileLockStagingRootIdentity,
+	identity: FileLockStagingRootIdentity | undefined,
 	error: unknown,
 ): void {
-	pendingStagingCleanups.set(stagingPath, { lockPath, ...identity });
+	pendingStagingCleanups.set(stagingPath, { lockPath, identity });
 	logger.debug("Retained file-lock staging cleanup", { stagingPath, error: String(error) });
 }
 
@@ -280,7 +327,13 @@ async function retryPendingStagingCleanups(
 	const lockKey = await localLockKey(lockPath);
 	for (const [stagingPath, pending] of pendingStagingCleanups) {
 		if ((await localLockKey(pending.lockPath)) !== lockKey) continue;
-		await cleanupPendingStagingOrThrow(lockPath, stagingPath, pending, retryBudget);
+		if (!pending.identity) {
+			const error = Object.assign(new Error("Retained staging cleanup has no captured identity."), {
+				code: "identity_unavailable",
+			});
+			throw new FileLockStagingCleanupError(lockPath, stagingPath, error);
+		}
+		await cleanupPendingStagingOrThrow(lockPath, stagingPath, pending.identity, retryBudget);
 	}
 }
 
@@ -2257,8 +2310,11 @@ async function tryAcquireLock(
 		await fs.mkdir(pendingPath, { mode: 0o700 });
 		removePending = true;
 		try {
-			pendingStagingIdentity = await captureFileLockStagingRootIdentity(pendingPath);
+			pendingStagingIdentity = await captureFileLockStagingRootIdentity(pendingPath, retryBudget);
 		} catch (error) {
+			removePending = false;
+			retainPendingStagingCleanup(lockPath, pendingPath, undefined, error);
+			if (retryBudget.signal?.aborted) throw retryBudget.signal.reason ?? error;
 			throw new FileLockStagingCleanupError(lockPath, pendingPath, error);
 		}
 		await fs.chmod(pendingPath, 0o700);
@@ -2330,6 +2386,26 @@ async function tryAcquireLock(
 				throw failure;
 			}
 			stagedSnapshot = staged.snapshot;
+			if (pendingStagingIdentity)
+				pendingStagingIdentity = { ...pendingStagingIdentity, treeSnapshot: staged.snapshot };
+		} else {
+			const staged = snapshotDirectoryTree(canonicalPendingPath);
+			if (!staged.ok || !staged.snapshot) {
+				const failure = new Error(
+					`Failed to snapshot staged file lock: ${staged.code ?? "unknown"}.`,
+				) as NodeJS.ErrnoException;
+				if (staged.code) failure.code = staged.code;
+				throw new FileLockStagingCleanupError(lockPath, pendingPath, failure);
+			}
+			if (!pendingStagingIdentity)
+				throw new FileLockStagingCleanupError(
+					lockPath,
+					pendingPath,
+					Object.assign(new Error("Staged file-lock root identity is unavailable."), {
+						code: "identity_unavailable",
+					}),
+				);
+			pendingStagingIdentity = { ...pendingStagingIdentity, treeSnapshot: staged.snapshot };
 		}
 		const publication = FileLockTestHooks.nativePublicationBindings?.() ?? {
 			renameNoReplacePathAsync,
@@ -2860,6 +2936,7 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 	let publicationFailureCode: FileLockPublicationFailureCode | undefined;
 	for (let attempt = 0; attempt < opts.retries; attempt++) {
 		throwIfFileLockAcquisitionAborted(opts.signal);
+		await retryPendingStagingCleanups(lockPath, retryBudget);
 		const localKey = await localLockKey(lockPath);
 		const priorRelease = localLockStates.get(localKey);
 		if (priorRelease && priorRelease.status !== "held" && pendingDetachedLockCleanups.has(priorRelease.owner)) {
