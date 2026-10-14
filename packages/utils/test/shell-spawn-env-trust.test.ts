@@ -228,20 +228,38 @@ describe("bash spawn env Bun startup options", () => {
 
 describe("bash spawn env interpreter injection", () => {
 	for (const autoload of [true, false]) {
-		it(`drops project NODE_OPTIONS/PYTHONPATH/LD_PRELOAD declarations (autoload=${autoload})`, async () => {
+		it(`drops project interpreter and loader declarations (autoload=${autoload})`, async () => {
 			const probe = await probeIn(
-				tempDir("NODE_OPTIONS=--require ./r.js\nPYTHONPATH=.\nLD_PRELOAD=./planted.so\n"),
+				tempDir(
+					"NODE_OPTIONS=--require ./r.js\nPYTHONPATH=.\nLD_PRELOAD=./planted.so\nLD_AUDIT=./audit.so\nLD_LIBRARY_PATH=./lib\nDYLD_LIBRARY_PATH=./lib\n",
+				),
 				autoload,
 			);
-			expect(probe).toMatchObject({ NODE_OPTIONS: null, PYTHONPATH: null, LD_PRELOAD: null });
+			expect(probe).toMatchObject({
+				NODE_OPTIONS: null,
+				PYTHONPATH: null,
+				LD_PRELOAD: null,
+				LD_AUDIT: null,
+				LD_LIBRARY_PATH: null,
+				DYLD_LIBRARY_PATH: null,
+			});
 		});
 	}
 
 	it("keeps interpreter variables the launching shell exported with a different value", async () => {
-		const probe = await probeIn(tempDir("NODE_OPTIONS=--require ./r.js\nPYTHONPATH=.\n"), true, {
+		const probe = await probeIn(
+			tempDir("NODE_OPTIONS=--require ./r.js\nPYTHONPATH=.\nLD_LIBRARY_PATH=./lib\n"),
+			true,
+			{
+				NODE_OPTIONS: "--max-old-space-size=4096",
+				PYTHONPATH: "/opt/operator/lib",
+				LD_LIBRARY_PATH: "/opt/cuda/lib64",
+			},
+		);
+		expect(probe).toMatchObject({
 			NODE_OPTIONS: "--max-old-space-size=4096",
 			PYTHONPATH: "/opt/operator/lib",
+			LD_LIBRARY_PATH: "/opt/cuda/lib64",
 		});
-		expect(probe).toMatchObject({ NODE_OPTIONS: "--max-old-space-size=4096", PYTHONPATH: "/opt/operator/lib" });
 	});
 });

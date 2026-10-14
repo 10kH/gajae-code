@@ -22,6 +22,8 @@ const HOOK_KEYS = [
 	"PERL5LIB",
 	"JAVA_TOOL_OPTIONS",
 	"LD_PRELOAD",
+	"LD_AUDIT",
+	"LD_LIBRARY_PATH",
 	"DYLD_INSERT_LIBRARIES",
 	"BUN_OPTIONS",
 	"GIT_ASKPASS",
@@ -262,6 +264,71 @@ describe.skipIf(process.platform === "win32")("bash tool ignores project .env ho
 			);
 		},
 	);
+
+	// `LD_AUDIT` modules are loaded by the loader itself, before the program runs.
+	it.skipIf(process.platform !== "linux" || !Bun.which("cc"))(
+		"does not let a project LD_AUDIT module load into shell commands",
+		async () => {
+			const target = project(({ cwd, marker }) => {
+				const source = path.join(cwd, "audit.c");
+				fs.writeFileSync(
+					source,
+					`#include <stdio.h>\nunsigned int la_version(unsigned int v) { FILE *f = fopen(${JSON.stringify(marker)}, "w"); if (f) fclose(f); return v; }\n`,
+				);
+				const library = path.join(cwd, "audit.so");
+				const cc = Bun.spawnSync(["cc", "-shared", "-fPIC", "-o", library, source]);
+				if (cc.exitCode !== 0) throw new Error(`cc failed: ${cc.stderr.toString()}`);
+				return `LD_AUDIT=${library}\n`;
+			});
+			expect(await runProbe(target, "worker", { GJC_TEST_PROBE_COMMAND: "ls >/dev/null; echo probe-done" })).toBe(
+				false,
+			);
+		},
+	);
+
+	// `LD_LIBRARY_PATH` is searched before the system directories, so a project
+	// library with the soname of one `ls` links against shadows it. The planted
+	// copy is an ELF filter on the real library, so `ls` still works.
+	const lsDependency = (() => {
+		if (process.platform !== "linux" || !Bun.which("cc") || !Bun.which("ldd")) return undefined;
+		const ls = Bun.which("ls");
+		if (!ls) return undefined;
+		const ldd = Bun.spawnSync(["ldd", ls]).stdout.toString();
+		for (const line of ldd.split("\n")) {
+			const match = /^\s*(\S+)\s+=>\s+(\/\S+)/.exec(line);
+			if (match && !/^(?:libc|libm|libdl|libpthread|ld-linux)[.-]/.test(match[1]!)) {
+				return { soname: match[1]!, real: match[2]! };
+			}
+		}
+		return undefined;
+	})();
+	it.skipIf(!lsDependency)("does not let a project LD_LIBRARY_PATH shadow a library of shell commands", async () => {
+		const target = project(({ cwd, marker }) => {
+			const source = path.join(cwd, "shadow.c");
+			fs.writeFileSync(
+				source,
+				`#include <stdio.h>\n__attribute__((constructor)) static void planted(void) { FILE *f = fopen(${JSON.stringify(marker)}, "w"); if (f) fclose(f); }\n`,
+			);
+			const libDir = path.join(cwd, "lib");
+			fs.mkdirSync(libDir);
+			const { soname, real } = lsDependency!;
+			const cc = Bun.spawnSync([
+				"cc",
+				"-shared",
+				"-fPIC",
+				"-o",
+				path.join(libDir, soname),
+				source,
+				`-Wl,-soname,${soname}`,
+				`-Wl,--filter,${real}`,
+			]);
+			if (cc.exitCode !== 0) throw new Error(`cc failed: ${cc.stderr.toString()}`);
+			return `LD_LIBRARY_PATH=${libDir}\n`;
+		});
+		expect(await runProbe(target, "worker", { GJC_TEST_PROBE_COMMAND: "ls >/dev/null 2>&1; echo probe-done" })).toBe(
+			false,
+		);
+	});
 
 	it.skipIf(!Bun.which("python3"))("still honors a PYTHONPATH the launching shell exported", async () => {
 		const target = project(() => "PYTHONPATH=/nonexistent-project-path\n");
