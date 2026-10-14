@@ -48,7 +48,7 @@ const NON_EXECUTING_SUDO_OPTIONS = new Set([
 	"--version",
 	"--help",
 ]);
-const NON_EXECUTING_ENV_OPTIONS = new Set(["-0", "--help", "--null", "--version"]);
+const NON_EXECUTING_ENV_OPTIONS = new Set(["--help", "--version"]);
 const ENV_SIGNAL_OPTIONS = new Set(["--block-signal", "--default-signal", "--ignore-signal", "--list-signal-handling"]);
 const ASSIGNMENT_AWARE_WRAPPERS = new Set(["env", "sudo"]);
 const CONTROL_WORDS = new Set(["then", "do", "else", "fi", "done", "esac"]);
@@ -222,6 +222,8 @@ export type TmuxPaneResolver = (options: {
 export interface TmuxSelfInjectionOptions {
 	env?: Record<string, string | undefined>;
 	cwd?: string;
+	/** Effective Bash environment for locating shell-runner scripts; never used for tmux identity. */
+	executionEnv?: Record<string, string | undefined>;
 	resolvePaneId?: TmuxPaneResolver;
 }
 
@@ -376,9 +378,9 @@ function envSplitStringIsNonExecuting(splitString: string): boolean {
 	if (firstWord === undefined) return false;
 	if (firstWord.startsWith("--")) {
 		const optionName = matchingWrapperLongOption("env", firstWord);
-		return optionName === "--help" || optionName === "--null" || optionName === "--version";
+		return optionName === "--help" || optionName === "--version";
 	}
-	return firstWord.startsWith("-") && firstWord.slice(1).includes("0");
+	return false;
 }
 
 function wrapperMayInvokeShellBuiltins(name: string, assignmentAware: boolean): boolean {
@@ -812,7 +814,6 @@ function tokenize(command: string): TokenizeResult {
 				const nonExecutingEnvMode =
 					wrapperCommand?.name === "env" &&
 					(NON_EXECUTING_ENV_OPTIONS.has(text) ||
-						(text.startsWith("-") && !text.startsWith("--") && text.slice(1).includes("0")) ||
 						(envLongOption !== undefined && NON_EXECUTING_ENV_OPTIONS.has(envLongOption)));
 				const nonExecutingCoreutilsMode =
 					wrapperCommand !== undefined &&
@@ -1272,7 +1273,7 @@ function reconstructCommandFromEnvSplit(splitString: string, depth = 0): string[
 
 	const assignments: string[] = [];
 	const envShortOptionsWithArg = new Set(["-u", "-C", "-a", "-P"]);
-	const envShortFlagOptions = new Set(["-i", "-v"]);
+	const envShortFlagOptions = new Set(["-0", "-i", "-v"]);
 	let skipNext = false;
 	let optionsTerminated = false;
 	let commandStartIdx = -1;
@@ -1294,7 +1295,7 @@ function reconstructCommandFromEnvSplit(splitString: string, depth = 0): string[
 		}
 		if (part === "--help" || part === "--version") return undefined;
 		const longOptionName = part.split("=")[0];
-		if (matchingWrapperLongOption("env", longOptionName) === "--null") return undefined;
+		if (matchingWrapperLongOption("env", longOptionName) === "--null") continue;
 		if (ENV_SIGNAL_OPTIONS.has(longOptionName)) continue;
 
 		let splitString: string | undefined;
@@ -1314,7 +1315,6 @@ function reconstructCommandFromEnvSplit(splitString: string, depth = 0): string[
 			shortBundleHandled = true;
 			for (let optionIndex = 1; optionIndex < part.length; optionIndex++) {
 				const option = `-${part[optionIndex]}`;
-				if (option === "-0") return undefined;
 				if (option === "-S") {
 					splitString = part.slice(optionIndex + 1) || parts[i + 1];
 					splitOptionLength = part.length - optionIndex > 1 ? 1 : 2;
@@ -1351,7 +1351,6 @@ function reconstructCommandFromEnvSplit(splitString: string, depth = 0): string[
 			part === "--debug" ||
 			part === "-0"
 		) {
-			if (part === "-0") return undefined;
 			continue;
 		}
 		if (envShortOptionsWithArg.has(part)) {
@@ -3195,17 +3194,20 @@ function isCommandLookup(tokens: Token[], targetIndex: number): boolean {
 			continue;
 		}
 
+		let lookup = false;
 		for (let i = commandIdx + 1; i < targetIndex; i++) {
 			if (tokens[i].segment !== targetSegment) break;
 			const token = tokens[i].text;
-			if (
-				token === "-v" ||
-				token === "-V" ||
-				(token.startsWith("-") && !token.startsWith("--") && (token.includes("v") || token.includes("V")))
-			) {
-				return true;
+			if (token === "--") return lookup;
+			if (/^-[pVv]+$/.test(token)) {
+				lookup ||= token.includes("v") || token.includes("V");
+				continue;
 			}
+			// Bash's `command` options stop at its first command operand. A later
+			// `-v` belongs to that command (for example, `command env -v ...`).
+			return lookup;
 		}
+		if (lookup) return true;
 	}
 
 	return false;
@@ -3314,7 +3316,7 @@ async function checkTmuxSelfInjectionAtCwd(
 			const resolved = await resolvePaneId({
 				socketArgs: invocation.socketArgs,
 				target,
-				env: { ...env, TMUX: `${identity.socketPath},0,0` } as Record<string, string>,
+				env: { ...commandEnv, TMUX: `${identity.socketPath},0,0` } as Record<string, string>,
 			});
 			if (resolved !== undefined && resolved !== identity.paneId) continue;
 			if (resolved === identity.paneId || resolved === undefined) {
@@ -3336,7 +3338,7 @@ async function checkTmuxSelfInjectionAtCwd(
 				if (result.block) return result;
 			}
 		}
-		const shellScripts = collectShellScripts(tokens, cwd, cwdUnknown, env);
+		const shellScripts = collectShellScripts(tokens, cwd, cwdUnknown, options.executionEnv ?? env);
 		for (const payload of collectShellStdinPayloads(tokens, hereDocuments, shellScripts, cwd)) {
 			const result = await checkTmuxSelfInjectionAtCwd(payload, options, depth + 1, cwd, cwdUnknown);
 			if (result.block) return result;

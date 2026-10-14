@@ -15,7 +15,7 @@
 - Respect unambiguous GNU wrapper-option abbreviations and bundled options inside `env -S` payloads.
 - Treat `sudo -e`/`--edit` as file editing rather than command execution when checking wrapper arguments.
 - Preserve Bash option order across mixed bundles and `noexec` toggles, distinguish shell-builtin `eval` from an external command under wrappers, inspect shell-runner scripts resolved through the effective `PATH`, and fail closed on unresolved `PATH` overrides.
-- Resolve statically known environment references in `env -C` and suppress command discovery after GNU `env --null` and non-executing sudo modes.
+- Resolve statically known environment references in `env -C`, continue inspecting commands after GNU `env --null`/`-0`, and suppress command discovery for non-executing GNU `env` help/version and sudo modes.
 - Inspect command substitutions in ordinary shell arguments and here-documents, skip literal here-document bodies when matching substitution boundaries, and decode ANSI-C-quoted Bash `-c` payloads.
 - Stop timeout option parsing after its required duration, and recognize terminal help/version modes and unambiguous long-option abbreviations for common wrappers.
 - Document that the guard is best-effort and does not cover arbitrary interpreter one-liners, shell variable indirection, or commands launched by the Python/eval tools.

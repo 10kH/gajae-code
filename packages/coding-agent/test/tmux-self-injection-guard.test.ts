@@ -77,6 +77,25 @@ describe("tmux self-injection guard", () => {
 		).resolves.toEqual({ block: false });
 	});
 
+	it("uses env's effective socket environment when resolving named targets", async () => {
+		for (const [command, expectedTmpdir] of [
+			["env -u TMUX_TMPDIR tmux -L default send-keys -t demo x", undefined],
+			["env -i tmux -L default send-keys -t demo x", undefined],
+			["env TMUX_TMPDIR=/tmp tmux -L default send-keys -t demo x", "/tmp"],
+		] as const) {
+			let resolvedTmpdir: string | undefined;
+			const localOptions = {
+				...options,
+				resolvePaneId: async ({ target, env: resolverEnv }: { target: string; env: Record<string, string> }) => {
+					resolvedTmpdir = resolverEnv.TMUX_TMPDIR;
+					return resolver(target);
+				},
+			};
+			await expect(checkTmuxSelfInjection(command, localOptions)).resolves.toMatchObject({ block: true });
+			expect(resolvedTmpdir).toBe(expectedTmpdir);
+		}
+	});
+
 	it("fails closed when shell expansion makes socket selection unknown", async () => {
 		const socketDir = env.TMUX.split(",")[0].substring(0, env.TMUX.split(",")[0].lastIndexOf("/"));
 		for (const command of [
@@ -238,6 +257,21 @@ describe("tmux self-injection guard", () => {
 				await expect(checkTmuxSelfInjection(command, localOptions)).resolves.toMatchObject({ block: true });
 			}
 			await expect(checkTmuxSelfInjection("bash", pathOptions)).resolves.toMatchObject({ block: true });
+		} finally {
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("uses an explicit execution PATH when resolving shell-runner scripts", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-tmux-shell-runner-execution-path-"));
+		const fakeBin = path.join(cwd, "fake-bin");
+		await fs.mkdir(fakeBin);
+		await Bun.write(path.join(fakeBin, "bash"), "#!/bin/sh\ntmux send-keys -t %47 x\n");
+		await fs.chmod(path.join(fakeBin, "bash"), 0o755);
+		try {
+			await expect(
+				checkTmuxSelfInjection("bash", { ...options, cwd, executionEnv: { PATH: fakeBin } }),
+			).resolves.toMatchObject({ block: true });
 		} finally {
 			await fs.rm(cwd, { recursive: true, force: true });
 		}
@@ -538,6 +572,12 @@ describe("tmux self-injection guard", () => {
 			await expect(checkTmuxSelfInjection("command -v env tmux send-keys -t %47 x", options)).resolves.toEqual({
 				block: false,
 			});
+		});
+
+		it("only recognizes lookup options before command's command operand", async () => {
+			await expect(checkTmuxSelfInjection("command env -v tmux send-keys -t %47 x", options)).resolves.toMatchObject(
+				{ block: true },
+			);
 		});
 	});
 
@@ -1750,20 +1790,27 @@ describe("tmux self-injection guard", () => {
 			}
 		});
 
-		it("does not discover commands after non-executing GNU env options", async () => {
+		it("inspects commands following env null-output options", async () => {
 			for (const command of [
 				"env -0 tmux send-keys -t %47 x",
 				"env -i0 tmux send-keys -t %47 x",
 				"env --null tmux send-keys -t %47 x",
 				"env --nu tmux send-keys -t %47 x",
-				"env --help tmux send-keys -t %47 x",
-				"env --version tmux send-keys -t %47 x",
-				"env --he tmux send-keys -t %47 x",
-				"env --ver tmux send-keys -t %47 x",
 				"env -S '-0 tmux send-keys -t %47 x'",
 				"env -S '-0' tmux send-keys -t %47 x",
 				"env -S '--null tmux send-keys -t %47 x'",
 				"env -S '--null' tmux send-keys -t %47 x",
+			]) {
+				await expect(checkTmuxSelfInjection(command, options)).resolves.toMatchObject({ block: true });
+			}
+		});
+
+		it("does not discover commands after non-executing GNU env modes", async () => {
+			for (const command of [
+				"env --help tmux send-keys -t %47 x",
+				"env --he tmux send-keys -t %47 x",
+				"env --version tmux send-keys -t %47 x",
+				"env --ver tmux send-keys -t %47 x",
 			]) {
 				await expect(checkTmuxSelfInjection(command, options)).resolves.toEqual({ block: false });
 			}
