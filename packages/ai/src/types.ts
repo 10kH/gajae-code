@@ -1464,6 +1464,8 @@ export interface Model<TApi extends Api = any> {
 	requestTransform?: ModelRequestTransform;
 	/** Default prompt-cache retention preference for this model when the request omits one. */
 	cacheRetention?: CacheRetention;
+	/** Configured inter-event idle timeout for this model, in milliseconds. */
+	streamIdleTimeoutMs?: number;
 	/** Provider-assigned priority value (lower = higher priority). */
 	priority?: number;
 	/** Canonical thinking capability metadata for this model. */
