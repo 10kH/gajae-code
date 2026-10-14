@@ -2043,6 +2043,7 @@ const LOSSLESS_SNAPSHOT_KEYS = [
 	"provider",
 	"model",
 	"responseId",
+	"serviceTier",
 	"usage",
 	"stopReason",
 	"errorMessage",
