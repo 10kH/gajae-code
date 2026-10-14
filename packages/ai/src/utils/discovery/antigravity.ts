@@ -170,7 +170,7 @@ export interface FetchAntigravityDiscoveryModelsOptions {
 	 */
 	targetProvider?: "google-antigravity" | "google-gemini-cli";
 	/** Optional logger for debug diagnostics. */
-	logger?: typeof logger;
+	logger?: Pick<typeof logger, "debug">;
 }
 
 /**
@@ -188,7 +188,7 @@ export async function fetchAntigravityDiscoveryModels(
 	const endpoints = options.endpoint
 		? [trimTrailingSlashes(options.endpoint)]
 		: DEFAULT_ANTIGRAVITY_DISCOVERY_ENDPOINTS.map(trimTrailingSlashes);
-	const debugLog = options.logger?.debug ?? logger?.debug;
+	const debugLog = options.logger?.debug ?? logger.debug;
 
 	for (const endpoint of endpoints) {
 		let response: Response;

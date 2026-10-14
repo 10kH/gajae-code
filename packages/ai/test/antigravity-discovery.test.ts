@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { logger } from "@gajae-code/utils";
 import { writeModelCache } from "../src/model-cache";
 import { resolveProviderModels } from "../src/model-manager";
 import { getBundledModel, getBundledModels } from "../src/models";
@@ -244,12 +245,12 @@ describe("Antigravity model discovery", () => {
 	});
 
 	it("logs drop reasons for filtered models when logger is provided", async () => {
-		const debugLogs: Array<[string, unknown]> = [];
-		const testLogger = {
-			debug: (message: string, meta?: unknown) => {
+		const debugLogs: Array<[string, Record<string, unknown> | undefined]> = [];
+		const testLogger: Pick<typeof logger, "debug"> = {
+			debug: (message, meta) => {
 				debugLogs.push([message, meta]);
 			},
-		} as any;
+		};
 
 		const fetcher = (async () =>
 			new Response(
@@ -285,25 +286,14 @@ describe("Antigravity model discovery", () => {
 
 		expect(models?.map(model => model.id)).toEqual(["gemini-3.1-pro-low"]);
 
-		// Check that drop reasons were logged
 		const dropReasonLog = debugLogs.find(log => log[0] === "Antigravity discovery dropped models");
-		expect(dropReasonLog).toBeDefined();
-		if (dropReasonLog) {
-			const [, meta] = dropReasonLog;
-			const reasons = (meta as any)?.dropReasons ?? {};
-			expect(reasons["chat_20706"]).toBe("denylist");
-			expect(reasons["gemini-3.1-pro-high"]).toBe("retired");
-			expect(reasons["internal-hidden"]).toBe("isInternal-not-surfaced");
-		}
-
-		// Check that kept models were logged
+		expect(dropReasonLog?.[1]?.dropReasons).toEqual({
+			chat_20706: "denylist",
+			"gemini-3.1-pro-high": "retired",
+			"internal-hidden": "isInternal-not-surfaced",
+		});
 		const keptModelsLog = debugLogs.find(log => log[0] === "Antigravity discovery kept models");
-		expect(keptModelsLog).toBeDefined();
-		if (keptModelsLog) {
-			const [, meta] = keptModelsLog;
-			const keptIds = (meta as any)?.keptModelIds ?? [];
-			expect(keptIds).toEqual(["gemini-3.1-pro-low"]);
-		}
+		expect(keptModelsLog?.[1]?.keptModelIds).toEqual(["gemini-3.1-pro-low"]);
 	});
 
 	it("filters retired selectors from fresh authoritative model caches", async () => {
