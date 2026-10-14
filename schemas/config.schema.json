@@ -53,7 +53,9 @@
 				},
 				"credentialPreferenceMaxUsedPercent": {
 					"type": "number",
-					"default": 100
+					"default": 100,
+					"exclusiveMinimum": 0,
+					"maximum": 100
 				}
 			},
 			"additionalProperties": false

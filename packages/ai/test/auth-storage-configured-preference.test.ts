@@ -101,6 +101,17 @@ describe("configured credential preference", () => {
 		expect(await storage.getApiKey("anthropic", "over-threshold")).toBe("token-personal");
 	});
 
+	test("the long window alone can push the preference over maxUsedFraction", async () => {
+		usageByEmail.set("personal@example.test", report("personal@example.test", 0.1, 0.1));
+		usageByEmail.set("cheap@example.test", report("cheap@example.test", 0.05, 0.95));
+		const storage = await createStorage({
+			selector: { kind: "email", value: "cheap@example.test" },
+			maxUsedFraction: 0.9,
+		});
+
+		expect(await storage.getApiKey("anthropic", "long-window-over-threshold")).toBe("token-personal");
+	});
+
 	test("the preference still applies just below maxUsedFraction", async () => {
 		usageByEmail.set("personal@example.test", report("personal@example.test", 0.1, 0.1));
 		usageByEmail.set("cheap@example.test", report("cheap@example.test", 0.89, 0.2));
@@ -138,6 +149,28 @@ describe("configured credential preference", () => {
 		const storage = await createStorage({ selector: { kind: "email", value: "removed@example.test" } });
 
 		expect(await storage.getApiKey("anthropic", "missing")).toBe("token-cheap");
+	});
+
+	test.each([
+		["configured preference", "configured"],
+		["runtime --prefer-credential", "runtime"],
+	] as const)("%s selects the designated OAuth row in a pool that also stores an API key", async (_label, source) => {
+		const store = await SqliteAuthCredentialStore.open(":memory:");
+		openStores.push(store);
+		const selector = { kind: "email", value: "cheap@example.test" } as const;
+		const storage = new AuthStorage(store, {
+			rankingStrategyResolver: () => undefined,
+			configValueResolver: async value => (value === "unusable-api-key" ? undefined : value),
+			...(source === "configured" ? { credentialPreferences: { anthropic: { selector } } } : {}),
+		});
+		await storage.set("anthropic", [
+			{ type: "api_key", key: "unusable-api-key" },
+			oauth("token-cheap", "cheap@example.test"),
+			oauth("token-personal", "personal@example.test"),
+		]);
+		if (source === "runtime") storage.setRuntimePreferredCredentialSelector("anthropic", selector);
+
+		expect(await storage.getApiKey("anthropic", `mixed-${source}`)).toBe("token-cheap");
 	});
 
 	test("a runtime --prefer-credential selector outranks the configured preference", async () => {

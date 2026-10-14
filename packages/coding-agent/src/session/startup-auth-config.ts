@@ -170,7 +170,7 @@ function throwLegacyLiteralKeyError(keys: string[]): never {
 			"    <provider>: id:<positive-id>\n" +
 			"  credentialPreferences:\n" +
 			"    <provider>: email:<address>\n" +
-			"  credentialPreferenceMaxUsedPercent: <1-100>\n" +
+			"  credentialPreferenceMaxUsedPercent: <0-100, exclusive of 0>\n" +
 			"Do not copy secret values into command output; rewrite the file by hand.",
 	);
 }

@@ -3233,12 +3233,7 @@ export class AuthStorage {
 	): void {
 		const preference = this.#configuredCredentialPreferences.get(resolveOAuthStorageProvider(provider));
 		if (!preference) return;
-		const preferredSelection = this.#findCredentialBySelector(provider, preference.selector);
-		if (preferredSelection?.credential.type !== "oauth") return;
-		if (this.#isCredentialBlocked(providerKey, preferredSelection.index)) return;
-		const preferredCandidate = candidates.findIndex(
-			candidate => candidate.selection.index === preferredSelection.index,
-		);
+		const preferredCandidate = this.#findUsableOAuthCandidate(provider, providerKey, candidates, preference.selector);
 		if (preferredCandidate < 0) return;
 		const { maxUsedFraction } = preference;
 		if (maxUsedFraction !== undefined) {
@@ -3249,6 +3244,24 @@ export class AuthStorage {
 			const [preferred] = candidates.splice(preferredCandidate, 1);
 			candidates.unshift(preferred);
 		}
+	}
+
+	/**
+	 * Position in `candidates` of the OAuth row `selector` designates, or -1 when it is missing, not OAuth, or blocked.
+	 * Candidates are matched by stored row id: `#findCredentialBySelector` indexes the full provider list (API-key rows
+	 * included) while candidate selections and the OAuth backoff map use OAuth-only indices.
+	 */
+	#findUsableOAuthCandidate(
+		provider: string,
+		providerKey: string,
+		candidates: ReadonlyArray<{ selection: OAuthCredentialSelection }>,
+		selector: AuthCredentialSelector,
+	): number {
+		const designated = this.#findCredentialBySelector(provider, selector);
+		if (designated?.credential.type !== "oauth") return -1;
+		const position = candidates.findIndex(candidate => candidate.selection.id === designated.id);
+		if (position < 0) return -1;
+		return this.#isCredentialBlocked(providerKey, candidates[position]!.selection.index) ? -1 : position;
 	}
 
 	/** Highest reported used fraction across the strategy's ranking windows; undefined when no window reports one. */
@@ -5966,16 +5979,10 @@ export class AuthStorage {
 					options?.owner,
 				);
 			}
-			const preferredSelection = preferredSelector
-				? this.#findCredentialBySelector(provider, preferredSelector)
-				: undefined;
-			if (
-				preferredSelection?.credential.type === "oauth" &&
-				!this.#isCredentialBlocked(providerKey, preferredSelection.index)
-			) {
-				const preferredCandidate = candidates.findIndex(
-					candidate => candidate.selection.index === preferredSelection.index,
-				);
+			const preferredCandidate = preferredSelector
+				? this.#findUsableOAuthCandidate(provider, providerKey, candidates, preferredSelector)
+				: -1;
+			if (preferredCandidate >= 0) {
 				if (preferredCandidate > 0) {
 					const [preferred] = candidates.splice(preferredCandidate, 1);
 					candidates.unshift(preferred);
