@@ -3634,7 +3634,7 @@ function isLinkedWorktreePeer(a: string, b: string): boolean {
  * Read the terminal breadcrumb for the current terminal, scoped to a cwd.
  * Returns the session file path if it exists and matches the cwd, null otherwise.
  */
-async function readTerminalBreadcrumb(cwd: string): Promise<string | null> {
+async function readTerminalBreadcrumb(cwd: string, allowExplicitOutsideRoot = false): Promise<string | null> {
 	const terminalId = getTerminalId();
 	if (!terminalId) return null;
 
@@ -3693,9 +3693,12 @@ async function readTerminalBreadcrumb(cwd: string): Promise<string | null> {
 			candidate => !isStagedSessionPath(candidate.path) && candidate.sessionId === header.id,
 		);
 		if (byIdentity) return byIdentity.path;
-		// The listing does not own this file. Do not adopt it, including when it
-		// sits outside the managed sessions root.
-		return null;
+		// Not an owned candidate. A file inside the sessions root stays rejected.
+		// Managed resume also rejects a file outside that root. An explicit
+		// destination still receives the outside path; the caller applies containment.
+		const resolvedFile = path.resolve(sessionFile);
+		if (!allowExplicitOutsideRoot || pathIsWithin(sessionsRoot, resolvedFile)) return null;
+		return resolvedFile;
 	} catch (err) {
 		if (!isEnoent(err)) logger.debug("Terminal breadcrumb read failed", { err });
 		// Breadcrumb doesn't exist or is corrupt — fall through
@@ -23047,7 +23050,7 @@ export class SessionManager {
 						storage,
 					);
 
-		const terminalSession = await readTerminalBreadcrumb(cwd);
+		const terminalSession = await readTerminalBreadcrumb(cwd, destination.kind === "explicit");
 		const terminalSessionIsInExplicitRoot = (() => {
 			if (destination.kind === "managed" || !terminalSession) return destination.kind === "managed";
 			const canonicalRoot = canonicalizeTrustedPath(destination.directory);

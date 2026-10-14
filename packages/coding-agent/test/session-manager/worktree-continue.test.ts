@@ -155,6 +155,63 @@ describe("continueRecent with --worktree sessions", () => {
 		}
 	});
 
+	it("keeps an older explicit-directory breadcrumb ahead of a newer sibling", async () => {
+		const explicitDir = path.join(root, "explicit-sessions");
+		const older = path.join(explicitDir, "older.jsonl");
+		const newer = path.join(explicitDir, "newer.jsonl");
+		fs.mkdirSync(explicitDir, { recursive: true });
+		const writeExplicit = (file: string, id: string): void => {
+			fs.writeFileSync(
+				file,
+				`${JSON.stringify({ type: "session", id, timestamp: "2025-01-01T00:00:00Z", cwd: repo, version: 3 })}\n${JSON.stringify({ type: "message", id: "1", parentId: null, timestamp: "2025-01-01T00:00:01Z", message: { role: "user", content: id, timestamp: 1 } })}\n`,
+			);
+		};
+		writeExplicit(older, "older-session");
+		writeExplicit(newer, "newer-session");
+		const olderTime = new Date("2020-01-01T00:00:00Z");
+		const newerTime = new Date("2024-06-01T00:00:00Z");
+		fs.utimesSync(older, olderTime, olderTime);
+		fs.utimesSync(newer, newerTime, newerTime);
+		expect(fs.statSync(newer).mtimeMs).toBeGreaterThan(fs.statSync(older).mtimeMs);
+		writeBreadcrumb(repo, older);
+
+		const resumed = await SessionManager.continueRecent(repo, SessionManager.explicitDestination(explicitDir));
+		try {
+			expect(resumed.getSessionId()).toBe("older-session");
+			expect(path.resolve(resumed.getSessionFile() ?? "")).toBe(path.resolve(older));
+		} finally {
+			await resumed.close();
+		}
+	});
+
+	it("does not resume a breadcrumb outside an explicit session directory", async () => {
+		const explicitDir = path.join(root, "explicit-sessions-contained");
+		const inside = path.join(explicitDir, "inside.jsonl");
+		const outsideDir = path.join(root, "outside-explicit");
+		const outside = path.join(outsideDir, "outside.jsonl");
+		fs.mkdirSync(explicitDir, { recursive: true });
+		fs.mkdirSync(outsideDir, { recursive: true });
+		const writeExplicit = (file: string, id: string): void => {
+			fs.writeFileSync(
+				file,
+				`${JSON.stringify({ type: "session", id, timestamp: "2025-01-01T00:00:00Z", cwd: repo, version: 3 })}\n${JSON.stringify({ type: "message", id: "1", parentId: null, timestamp: "2025-01-01T00:00:01Z", message: { role: "user", content: id, timestamp: 1 } })}\n`,
+			);
+		};
+		writeExplicit(inside, "inside-session");
+		writeExplicit(outside, "outside-explicit-session");
+		const before = fs.readFileSync(outside, "utf8");
+		writeBreadcrumb(repo, outside);
+
+		const resumed = await SessionManager.continueRecent(repo, SessionManager.explicitDestination(explicitDir));
+		try {
+			expect(resumed.getSessionId()).not.toBe("outside-explicit-session");
+			expect(path.resolve(resumed.getSessionFile() ?? "")).not.toBe(path.resolve(outside));
+			expect(fs.readFileSync(outside, "utf8")).toBe(before);
+		} finally {
+			await resumed.close();
+		}
+	});
+
 	it("refuses a legacy breadcrumb when migration is disabled instead of creating a fresh session", async () => {
 		const legacyDir = path.join(
 			getSessionsDir(),
