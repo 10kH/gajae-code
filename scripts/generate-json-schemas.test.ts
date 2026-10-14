@@ -140,6 +140,10 @@ describe("generated JSON Schemas", () => {
 		expect(single).toEqual({ type: "string", pattern: PREFERENCE_ACCOUNT_PATTERN });
 		expect(account).toEqual(single);
 		expect(list.minItems).toBe(1);
+		// The runtime rejects an account listed twice; the schema rejects the exact repeats it can express.
+		expect(list.uniqueItems).toBe(true);
+		expect(parseCredentialPreferenceList(["me@example.com", "me@example.com"])).toBeUndefined();
+		expect(parseCredentialPreferenceList([{ "me@example.com": 75 }, { "me@example.com": 75 }])).toBeUndefined();
 		expect(capped).toMatchObject({
 			minProperties: 1,
 			maxProperties: 1,

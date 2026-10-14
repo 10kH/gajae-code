@@ -1551,6 +1551,8 @@ export class AuthStorage {
 	#runtimePreferredCredentialSelectors: Map<string, AuthCredentialSelector> = new Map();
 	/** Persisted ordered soft credential preferences per provider; usage caps and quota failures move past entries. */
 	#configuredCredentialPreferences: Map<string, readonly ConfiguredCredentialPreference[]> = new Map();
+	/** Providers already warned that their preference list names one stored row twice. */
+	#warnedDuplicateCredentialPreferences = new Set<string>();
 	/** Credential selectors explicitly attached to a credential session scope. */
 	#sessionCredentialSelectors: Map<string, Map<string, AuthCredentialSelector>> = new Map();
 	/** Explicit AUTO masks suppress both scoped and process-global selectors for a scope/provider. */
@@ -3227,10 +3229,39 @@ export class AuthStorage {
 	}
 
 	/**
+	 * Providers whose configured preference list names one stored credential row through more than one entry, for
+	 * example `email:` and `account:` selectors for the same login. Startup rejects such a list.
+	 */
+	findDuplicateCredentialPreferences(): Array<{ provider: string; credentialId: number }> {
+		const duplicates: Array<{ provider: string; credentialId: number }> = [];
+		for (const [provider, preferences] of this.#configuredCredentialPreferences) {
+			const credentialId = this.#duplicateConfiguredPreferenceRow(provider, preferences);
+			if (credentialId !== undefined) duplicates.push({ provider, credentialId });
+		}
+		return duplicates;
+	}
+
+	/** Id of the first stored row that two entries of `preferences` both designate; undefined when every entry differs. */
+	#duplicateConfiguredPreferenceRow(
+		provider: string,
+		preferences: readonly ConfiguredCredentialPreference[],
+	): number | undefined {
+		const designatedIds = new Set<number>();
+		for (const { selector } of preferences) {
+			const credentialId = this.#findCredentialBySelector(provider, selector)?.id;
+			if (credentialId === undefined) continue;
+			if (designatedIds.has(credentialId)) return credentialId;
+			designatedIds.add(credentialId);
+		}
+		return undefined;
+	}
+
+	/**
 	 * Reorder `candidates` by the provider's configured preference list: usable entries under their cap first, in list
 	 * order; then the remaining candidates in their ranked order; then entries at or over their cap, in list order.
-	 * Missing and blocked entries are skipped and keep their ranked position. A row listed twice counts once, at its
-	 * first entry.
+	 * Missing and blocked entries are skipped and keep their ranked position. A list that names one stored row twice
+	 * (startup rejects it, but a later login can make two entries resolve to one row) is ignored as a whole rather than
+	 * applying one entry's position and cap and dropping the other's.
 	 */
 	async #applyConfiguredCredentialPreferences(
 		provider: string,
@@ -3245,6 +3276,18 @@ export class AuthStorage {
 	): Promise<void> {
 		const preferences = this.#configuredCredentialPreferences.get(resolveOAuthStorageProvider(provider));
 		if (!preferences) return;
+		const duplicateCredentialId = this.#duplicateConfiguredPreferenceRow(provider, preferences);
+		if (duplicateCredentialId !== undefined) {
+			const storageProvider = resolveOAuthStorageProvider(provider);
+			if (!this.#warnedDuplicateCredentialPreferences.has(storageProvider)) {
+				this.#warnedDuplicateCredentialPreferences.add(storageProvider);
+				logger.warn("Configured credential preferences name one account twice; using normal ranking", {
+					provider: storageProvider,
+					credentialId: duplicateCredentialId,
+				});
+			}
+			return;
+		}
 		type Candidate = (typeof candidates)[number];
 		const matched: Array<{ candidate: Candidate; maxUsedFraction: number | undefined }> = [];
 		const claimed = new Set<Candidate>();
@@ -3252,7 +3295,6 @@ export class AuthStorage {
 			const position = this.#findUsableOAuthCandidate(provider, providerKey, candidates, preference.selector);
 			if (position < 0) continue;
 			const candidate = candidates[position]!;
-			if (claimed.has(candidate)) continue;
 			claimed.add(candidate);
 			matched.push({ candidate, maxUsedFraction: preference.maxUsedFraction });
 		}

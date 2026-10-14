@@ -2,9 +2,11 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { SqliteAuthCredentialStore } from "@gajae-code/ai";
 import { getAgentDbPath } from "@gajae-code/utils";
 import { Settings } from "../src/config/settings";
 import { validateSettingPatch } from "../src/config/settings-schema";
+import { discoverAuthStorage } from "../src/sdk/session";
 import {
 	isValidPersistedCredentialSelector,
 	resolveStartupAuthConfig,
@@ -223,6 +225,41 @@ describe("startup auth config", () => {
 			"invalid-credential-preferences",
 			"preference-section-secret",
 		);
+	});
+
+	it.each([
+		["fails closed when two entries name one stored account", "acct-cheap", true],
+		["opens the store when the entries name different stored accounts", "acct-other", false],
+	])("%s through different selectors", async (_label, cheapAccountId, rejected) => {
+		clearAuthEnv();
+		const agentDir = await makeAgentDir(
+			"auth:\n  credentialPreferences:\n    anthropic:\n      - cheap@example.com: 50\n      - account:acct-cheap\n",
+		);
+		const store = await SqliteAuthCredentialStore.open(getAgentDbPath(agentDir));
+		try {
+			store.upsertAuthCredentialForProvider("anthropic", {
+				type: "oauth",
+				access: "access-cheap",
+				refresh: "refresh-cheap",
+				expires: Date.now() + 3_600_000,
+				email: "cheap@example.com",
+				accountId: cheapAccountId,
+			});
+		} finally {
+			store.close();
+		}
+
+		const discovery = discoverAuthStorage(agentDir);
+		if (rejected) {
+			await expectStartupAuthConfigError(discovery, "invalid-credential-preferences", "cheap@example.com");
+			return;
+		}
+		const storage = await discovery;
+		try {
+			expect(storage.findDuplicateCredentialPreferences()).toEqual([]);
+		} finally {
+			storage.close();
+		}
 	});
 
 	it("keeps malformed or absent pin-store metadata from authorizing numeric pins", async () => {

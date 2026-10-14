@@ -86,7 +86,7 @@ function shortenConfigPath(configPath: string): string {
 	return absolutePath.startsWith(homePrefix) ? `~${absolutePath.slice(homePath.length)}` : absolutePath;
 }
 
-function startupAuthConfigError(agentDir: string, kind: StartupAuthConfigErrorKind): StartupAuthConfigError {
+export function startupAuthConfigError(agentDir: string, kind: StartupAuthConfigErrorKind): StartupAuthConfigError {
 	return new StartupAuthConfigError(kind, configPathForAgentDir(agentDir));
 }
 

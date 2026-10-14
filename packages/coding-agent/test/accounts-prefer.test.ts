@@ -110,6 +110,33 @@ describe("gjc accounts prefer", () => {
 		CLI_TIMEOUT_MS,
 	);
 
+	it.each([
+		["a colon in its local part, in the email: form", "odd:name@example.com", "email:odd:name@example.com", "75"],
+		["an equals sign in its local part, bare", "user=2@example.com", "user=2@example.com", undefined],
+	])(
+		"stores an email with %s that startup reads back",
+		async (_label, email, written, cap) => {
+			const store = await SqliteAuthCredentialStore.open(getAgentDbPath());
+			let rowId: number;
+			try {
+				store.upsertAuthCredentialForProvider("anthropic", oauth(email, `acct-${ids.length}`));
+				rowId = store.listAuthCredentials("anthropic").find(entry => !ids.includes(entry.id))!.id;
+			} finally {
+				store.close();
+			}
+			const argument = cap === undefined ? email : `id:${rowId}=${cap}`;
+
+			const result = await preferJson([argument]);
+
+			const entry = cap === undefined ? written : { [written]: Number(cap) };
+			expect(result.preferences).toEqual([entry]);
+			expect(await writtenPreferences()).toEqual({ anthropic: [entry] });
+			const [preference] = (await resolveStartupAuthConfig(agentDir)).credentialPreferences.anthropic ?? [];
+			expect(preference?.selector).toEqual({ kind: "email", value: email });
+		},
+		CLI_TIMEOUT_MS,
+	);
+
 	it(
 		"stores a 100 percent cap as an uncapped account",
 		async () => {

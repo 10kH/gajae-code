@@ -235,7 +235,7 @@ function recordValueSchema(
 			additionalProperties: { type: "number", exclusiveMinimum: 0, maximum: 100 },
 		};
 		return {
-			anyOf: [account, { type: "array", minItems: 1, items: { anyOf: [account, cappedAccount] } }],
+			anyOf: [account, { type: "array", minItems: 1, uniqueItems: true, items: { anyOf: [account, cappedAccount] } }],
 		};
 	}
 	if (valueSchema?.type !== "model-selector-value") return true;

@@ -56,13 +56,14 @@ function setUsage(email: string, shortUsed: number, longUsed: number, provider: 
 	});
 }
 
-function oauth(email: string): OAuthCredential {
+function oauth(email: string, accountId?: string): OAuthCredential {
 	return {
 		type: "oauth",
 		access: `token-${email}`,
 		refresh: `refresh-${email}`,
 		expires: Date.now() + HOUR_MS,
 		email,
+		...(accountId ? { accountId } : {}),
 	};
 }
 
@@ -95,7 +96,10 @@ async function createStorage(
 			options.reportsUsage !== false && resolved === provider ? usageProvider : undefined,
 		...(preferences ? { credentialPreferences: { [provider]: preferences } } : {}),
 	});
-	await storage.set(provider, (options.emails ?? [PERSONAL, CHEAP, SHARED]).map(oauth));
+	await storage.set(
+		provider,
+		(options.emails ?? [PERSONAL, CHEAP, SHARED]).map(email => oauth(email)),
+	);
 	return storage;
 }
 
@@ -224,13 +228,70 @@ describe("ordered credential preferences", () => {
 		expect(await storage.getApiKey("anthropic", "missing")).toBe(token(CHEAP));
 	});
 
-	test("an account listed twice keeps its first position and cap", async () => {
-		setUsage(PERSONAL, 0.1, 0.1);
-		setUsage(CHEAP, 0.6, 0.1);
-		setUsage(SHARED, 0.3, 0.3);
-		const storage = await createStorage([prefer(CHEAP, 50), prefer(SHARED), prefer(CHEAP)]);
+	describe("a list that names one stored account twice", () => {
+		const CHEAP_ACCOUNT = "acct-cheap";
+		const aliasedPreferences: ConfiguredCredentialPreference[] = [
+			{ selector: { kind: "email", value: CHEAP }, maxUsedFraction: 0.5 },
+			prefer(SHARED),
+			{ selector: { kind: "account", value: CHEAP_ACCOUNT } },
+		];
 
-		expect(await storage.getApiKey("anthropic", "duplicate")).toBe(token(SHARED));
+		async function createAliasedStorage(
+			preferences: readonly ConfiguredCredentialPreference[],
+			credentials: readonly OAuthCredential[],
+		): Promise<AuthStorage> {
+			const store = await SqliteAuthCredentialStore.open(":memory:");
+			openStores.push(store);
+			const storage = new AuthStorage(store, {
+				usageProviderResolver: () => ({
+					id: "anthropic",
+					async fetchUsage(params) {
+						const email = params.credential.email;
+						return email ? (usageByEmail.get(email) ?? null) : null;
+					},
+				}),
+				credentialPreferences: { anthropic: preferences },
+			});
+			await storage.set("anthropic", [...credentials]);
+			return storage;
+		}
+
+		test("through email and account selectors is reported with the shared row", async () => {
+			const storage = await createAliasedStorage(aliasedPreferences, [
+				oauth(PERSONAL),
+				oauth(CHEAP, CHEAP_ACCOUNT),
+				oauth(SHARED),
+			]);
+			const cheapRow = storage.listCredentialInventory("anthropic").find(row => row.email === CHEAP);
+
+			expect(storage.findDuplicateCredentialPreferences()).toEqual([
+				{ provider: "anthropic", credentialId: cheapRow!.id },
+			]);
+		});
+
+		test("is ignored as a whole instead of honoring only the first entry's cap", async () => {
+			setUsage(PERSONAL, 0.1, 0.1);
+			setUsage(CHEAP, 0.6, 0.1);
+			setUsage(SHARED, 0.3, 0.3);
+			const storage = await createAliasedStorage(aliasedPreferences, [
+				oauth(PERSONAL),
+				oauth(CHEAP, CHEAP_ACCOUNT),
+				oauth(SHARED),
+			]);
+
+			// Applied, the list would pick SHARED (CHEAP is over its 50% cap); ignored, balanced ranking picks PERSONAL.
+			expect(await storage.getApiKey("anthropic", "aliased")).toBe(token(PERSONAL));
+		});
+
+		test("is not reported when the aliases designate different rows", async () => {
+			const storage = await createAliasedStorage(aliasedPreferences, [
+				oauth(PERSONAL, CHEAP_ACCOUNT),
+				oauth(CHEAP),
+				oauth(SHARED),
+			]);
+
+			expect(storage.findDuplicateCredentialPreferences()).toEqual([]);
+		});
 	});
 
 	test.each([

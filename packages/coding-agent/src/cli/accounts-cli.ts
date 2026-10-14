@@ -29,6 +29,7 @@ import { CREDENTIAL_STORE_UNREADABLE_MESSAGE } from "../session/credential-store
 import {
 	type CredentialPreferenceEntryValue,
 	isValidCredentialPreferenceCap,
+	parsePreferenceAccount,
 	resolveStartupAuthConfig,
 	type StartupAuthConfigSnapshot,
 } from "../session/startup-auth-config";
@@ -294,12 +295,13 @@ async function runPin(
 }
 
 /**
- * Split `<account>=<percent>` into the account and its usage cap. A suffix that does not start with a digit is part of
- * the account (account ids may end in `=`); a digit-led suffix must be a valid cap.
+ * Split `<account>=<percent>` into the account and its usage cap. The cap follows the whole account, so an `=` before
+ * the last `@` belongs to an email local part (`user=2@example.com`), and a suffix that does not start with a digit is
+ * part of the account (account ids may end in `=`); a digit-led suffix must be a valid cap.
  */
 function parsePreferArgument(raw: string): { account: string; cap: number | undefined } {
 	const separator = raw.lastIndexOf("=");
-	const rawCap = separator < 0 ? "" : raw.slice(separator + 1).trim();
+	const rawCap = separator < 0 || separator < raw.lastIndexOf("@") ? "" : raw.slice(separator + 1).trim();
 	if (!/^\d/.test(rawCap)) return { account: raw.trim(), cap: undefined };
 	const cap = /^\d+(\.\d+)?$/.test(rawCap) ? Number(rawCap) : Number.NaN;
 	if (!isValidCredentialPreferenceCap(cap)) {
@@ -313,6 +315,8 @@ function parsePreferArgument(raw: string): { account: string; cap: number | unde
 /**
  * Portable config text for a resolved OAuth row: its email, else its account id, whichever no other OAuth row of the
  * provider shares. Numeric row ids are never persisted as preferences; a row with neither unique value is refused.
+ * The email is written bare when the startup grammar reads it back that way, else as `email:<address>`; every form
+ * written is one {@link parsePreferenceAccount} accepts, so a successful write never fails the next startup.
  */
 function portablePreferenceAccount(
 	row: CredentialInventoryRecord,
@@ -321,11 +325,14 @@ function portablePreferenceAccount(
 	const oauthRows = providerRows.filter(other => other.credentialKind === "oauth");
 	const email = row.email?.trim().toLowerCase();
 	if (email && oauthRows.filter(other => other.email?.trim().toLowerCase() === email).length === 1) {
-		return row.email!.trim();
+		const address = row.email!.trim();
+		const written = [address, `email:${address}`].find(text => parsePreferenceAccount(text));
+		if (written) return written;
 	}
 	const accountId = row.accountId?.trim();
 	if (accountId && oauthRows.filter(other => other.accountId?.trim() === accountId).length === 1) {
-		return `account:${accountId}`;
+		const written = `account:${accountId}`;
+		if (parsePreferenceAccount(written)) return written;
 	}
 	return undefined;
 }
