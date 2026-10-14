@@ -18,6 +18,7 @@ import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import * as activeStateModule from "@gajae-code/coding-agent/skill-state/active-state";
 import { TempDir } from "@gajae-code/utils";
+import { attachExactMcpControls } from "../src/runtime-mcp/redaction";
 
 describe("AgentSession handoff", () => {
 	let tempDir: TempDir;
@@ -210,6 +211,37 @@ describe("AgentSession handoff", () => {
 		expect(session.sessionId).not.toBe(previousSessionId);
 		expect(observedSessionIds).toEqual([session.sessionId]);
 		unsubscribe();
+	});
+
+	it("notifies after a committed session switch even when transition cleanup rejects", async () => {
+		const previousSessionFile = sessionManager.getSessionFile();
+		if (!previousSessionFile) throw new Error("Expected the current session file to exist");
+		const nextSessionFile = path.join(tempDir.path(), "resume-target.jsonl");
+		await fs.copyFile(previousSessionFile, nextSessionFile);
+		attachExactMcpControls(session, {
+			grantSource: "root-interactive-exact-config",
+			configPath: path.join(tempDir.path(), "mcp.json"),
+		});
+		const observed: Array<{ sessionFile: string | undefined; hasExactMcpControls: boolean }> = [];
+		const unsubscribe = session.subscribeSessionIdentityChanges(() => {
+			observed.push({
+				sessionFile: session.sessionFile,
+				hasExactMcpControls: session.hasExactMcpControls,
+			});
+		});
+		const unregisterCleanup = session.registerToolSessionTransitionCleanup(() => {
+			throw new Error("switch cleanup boom");
+		});
+
+		try {
+			await expect(session.switchSession(nextSessionFile)).rejects.toThrow("Tool session transition cleanup failed");
+			expect(session.sessionFile).toBe(nextSessionFile);
+			expect(session.hasExactMcpControls).toBe(false);
+			expect(observed).toEqual([{ sessionFile: nextSessionFile, hasExactMcpControls: false }]);
+		} finally {
+			unregisterCleanup();
+			unsubscribe();
+		}
 	});
 
 	it("refreshes identity projections after command setup changes cwd, including setup failure", async () => {

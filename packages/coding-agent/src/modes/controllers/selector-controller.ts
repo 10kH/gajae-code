@@ -3515,7 +3515,6 @@ export class SelectorController {
 		if (!detached) {
 			return false;
 		}
-		await this.ctx.refreshSlashCommandState();
 		this.ctx.resetIrcSidebarSession();
 
 		this.#refreshSessionTerminalTitle();
@@ -3641,7 +3640,6 @@ export class SelectorController {
 			);
 			await this.ctx.reloadTodos();
 			if (this.ctx.isStopped?.()) return;
-			await this.ctx.refreshSlashCommandState();
 			this.ctx.showStatus("Resumed session");
 			this.#maybePromptResumeModelChoice();
 		} finally {

@@ -14922,7 +14922,6 @@ export class AgentSession {
 			},
 			switchSession: async sessionPath => {
 				const success = await this.switchSession(sessionPath);
-				if (success) await this.notifySessionIdentityChanged();
 				return { cancelled: !success };
 			},
 			reload: async () => {
@@ -27639,6 +27638,7 @@ export class AgentSession {
 		let ownerShutdownTransitionCommitted = false;
 		let ownerShutdownCanDrainResumes = false;
 		let ownerShutdownFinalizationDeferred = false;
+		let sessionIdentityCommitted = false;
 		this.#beginSessionTransition("switch-session");
 		try {
 			const previousSessionFile = this.sessionManager.getSessionFile();
@@ -28010,6 +28010,7 @@ export class AgentSession {
 						throw new Error("Exact MCP control retirement changed before session switch commit");
 					await exactRetirement?.commit();
 					transitionCleanupCommitted = true;
+					sessionIdentityCommitted = true;
 					let ownerShutdownSettled = true;
 					if (ownerShutdownManager && ownerShutdownLease && ownerId) {
 						try {
@@ -28247,6 +28248,7 @@ export class AgentSession {
 				}
 			}
 			this.#endSessionTransition();
+			if (sessionIdentityCommitted) await this.notifySessionIdentityChanged();
 		}
 	}
 
