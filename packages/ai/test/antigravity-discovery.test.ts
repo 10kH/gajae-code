@@ -2,10 +2,11 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { logger } from "@gajae-code/utils";
+
 import { writeModelCache } from "../src/model-cache";
 import { resolveProviderModels } from "../src/model-manager";
 import { getBundledModel, getBundledModels } from "../src/models";
+import { getAntigravityUserAgent, getGeminiCliUserAgent } from "../src/providers/google-gemini-headers";
 import type { Api, Model } from "../src/types";
 import { fetchAntigravityDiscoveryModels } from "../src/utils/discovery/antigravity";
 
@@ -215,17 +216,20 @@ describe("Antigravity model discovery", () => {
 		expect(capturedRequestBody).toEqual({ project: "test-project-123" });
 	});
 
-	it("omits project from request body when project is not provided", async () => {
+	it("uses the Gemini CLI user agent to discover Argon without a project", async () => {
 		let capturedRequestBody: unknown;
+		const capturedUserAgents: string[] = [];
 		const fetcher = (async (_url: string, init?: RequestInit) => {
 			if (init?.body) {
 				capturedRequestBody = JSON.parse(init.body as string);
 			}
+			const userAgent = new Headers(init?.headers).get("user-agent");
+			if (userAgent) capturedUserAgents.push(userAgent);
 			return new Response(
 				JSON.stringify({
 					models: {
-						"gemini-3.1-pro-low": {
-							displayName: "Gemini 3.1 Pro (Low)",
+						"gemini-4-argon": {
+							displayName: "Gemini 4 Argon",
 							supportsImages: true,
 						},
 					},
@@ -240,15 +244,19 @@ describe("Antigravity model discovery", () => {
 			fetcher,
 		});
 
-		expect(models?.map(model => model.id)).toEqual(["gemini-3.1-pro-low"]);
+		expect(models?.map(model => model.id)).toEqual(["gemini-4-argon"]);
 		expect(capturedRequestBody).toEqual({});
+		const expectedUserAgent = process.env.PI_AI_ANTIGRAVITY_USER_AGENT
+			? getAntigravityUserAgent()
+			: getGeminiCliUserAgent();
+		expect(capturedUserAgents).toEqual([expectedUserAgent]);
 	});
 
-	it("logs drop reasons for filtered models when logger is provided", async () => {
-		const debugLogs: Array<[string, Record<string, unknown> | undefined]> = [];
-		const testLogger: Pick<typeof logger, "debug"> = {
-			debug: (message, meta) => {
-				debugLogs.push([message, meta]);
+	it("preserves the custom logger receiver while logging drop reasons", async () => {
+		const testLogger = {
+			entries: [] as Array<[string, Record<string, unknown> | undefined]>,
+			debug(message: string, meta?: Record<string, unknown>) {
+				this.entries.push([message, meta]);
 			},
 		};
 
@@ -286,15 +294,15 @@ describe("Antigravity model discovery", () => {
 
 		expect(models?.map(model => model.id)).toEqual(["gemini-3.1-pro-low"]);
 
-		const dropReasonLog = debugLogs.find(log => log[0] === "Antigravity discovery dropped models");
+		const dropReasonLog = testLogger.entries.find(log => log[0] === "Antigravity discovery dropped models");
 		expect(dropReasonLog?.[1]?.dropReasons).toEqual({
 			chat_20706: "denylist",
 			"gemini-3.1-pro-high": "retired",
 			"internal-hidden": "isInternal-not-surfaced",
 		});
-		const keptModelsLog = debugLogs.find(log => log[0] === "Antigravity discovery kept models");
+		const keptModelsLog = testLogger.entries.find(log => log[0] === "Antigravity discovery kept models");
 		expect(keptModelsLog?.[1]?.keptModelIds).toEqual(["gemini-3.1-pro-low"]);
-		expect(debugLogs.map(([, meta]) => meta?.endpoint)).toEqual([
+		expect(testLogger.entries.map(([, meta]) => meta?.endpoint)).toEqual([
 			"https://antigravity.example.test",
 			"https://antigravity.example.test",
 			"https://antigravity.example.test",

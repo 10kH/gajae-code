@@ -3714,6 +3714,49 @@ describe("ModelRegistry", () => {
 			}
 		});
 
+		test("sends project IDs from structured Google keys during discovery refresh", async () => {
+			const requests: Array<{ accessToken: string | undefined; body: unknown }> = [];
+			using _hook = hookFetch((input, init) => {
+				if (!String(input).endsWith("/v1internal:fetchAvailableModels")) {
+					throw new Error(`Unexpected URL: ${String(input)}`);
+				}
+				requests.push({
+					accessToken: new Headers(init?.headers).get("authorization")?.replace(/^Bearer /i, ""),
+					body: JSON.parse(String(init?.body ?? "{}")) as unknown,
+				});
+				return new Response(
+					JSON.stringify({ models: { "gemini-project-probe": { displayName: "Project Probe" } } }),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			});
+
+			for (const provider of ["google-antigravity", "google-gemini-cli"] as const) {
+				for (const source of ["models-config", "runtime-override"] as const) {
+					const accessToken = `${provider}-${source}-access`;
+					const projectId = `${provider}-${source}-project`;
+					const structuredKey = JSON.stringify({ token: accessToken, projectId });
+					if (source === "models-config") {
+						writeRawModelsJson({ [provider]: { apiKey: structuredKey } });
+					} else {
+						writeRawModelsJson({});
+						authStorage.setRuntimeApiKey(provider, structuredKey);
+					}
+
+					const registry = new ModelRegistry(authStorage, modelsJsonPath);
+					try {
+						await registry.refreshProvider(provider, "online");
+						expect(requests.at(-1)).toMatchObject({
+							accessToken,
+							body: { project: projectId },
+						});
+					} finally {
+						await registry.dispose();
+						if (source === "runtime-override") authStorage.removeRuntimeApiKey(provider);
+					}
+				}
+			}
+		});
+
 		test("dynamically discovered Antigravity model survives token rotation followed by a models config change", async () => {
 			// Antigravity models outside the bundled catalog exist only through discovery. When a long-running session
 			// rebuilds its catalog after the same account's token refreshed, the discovered model must stay available.

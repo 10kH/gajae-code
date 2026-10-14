@@ -1115,7 +1115,7 @@ function filterMaterializedRegistryProfiles(
 type SpecialProviderDescriptor = {
 	providerId: string;
 	resolveKey: (value: string | undefined) => string | undefined;
-	createOptions: (key: string) => ModelManagerOptions<Api>;
+	createOptions: (key: string, rawValue: string | undefined) => ModelManagerOptions<Api>;
 };
 
 const PROVIDER_BASE_URL_ENV_ALIASES: Record<string, readonly string[]> = {
@@ -1444,31 +1444,44 @@ function getOAuthCredentialsForProvider(authStorage: AuthStorage, provider: stri
 	return entries.filter((entry): entry is OAuthCredential => entry.type === "oauth");
 }
 
+function extractGoogleOAuthProjectId(value: string | undefined, accessToken: string): string | undefined {
+	if (!value) return undefined;
+	try {
+		const parsed = JSON.parse(value) as { token?: unknown; projectId?: unknown };
+		if (typeof parsed.token !== "string" || parsed.token.trim() !== accessToken) return undefined;
+		return typeof parsed.projectId === "string" ? parsed.projectId.trim() || undefined : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 function resolveGoogleOAuthProjectId(
 	authStorage: AuthStorage,
 	provider: string,
 	accessToken: string,
+	rawValue?: string,
 	sessionId?: string,
 	owner?: object,
 ): string | undefined {
+	const configuredProjectId = extractGoogleOAuthProjectId(rawValue, accessToken);
 	if (authStorage.getEffectiveCredentialType(provider, sessionId, owner ? { owner } : undefined) !== "oauth") {
-		return undefined;
+		return configuredProjectId;
 	}
 	const selector = authStorage.resolveEffectiveCredentialSelector(provider, sessionId);
 	if (selector) {
 		const selectedCredential = authStorage.getOAuthCredential(provider, sessionId, owner ? { owner } : undefined);
-		if (selectedCredential?.access !== accessToken) return undefined;
-		return selectedCredential.projectId?.trim() || undefined;
+		if (selectedCredential?.access !== accessToken) return configuredProjectId;
+		return selectedCredential.projectId?.trim() || configuredProjectId;
 	}
 	const matchingCredentials = getOAuthCredentialsForProvider(authStorage, provider).filter(
 		credential => credential.access === accessToken,
 	);
-	if (matchingCredentials.length === 0) return undefined;
+	if (matchingCredentials.length === 0) return configuredProjectId;
 	const projectId = matchingCredentials[0]?.projectId?.trim();
 	if (matchingCredentials.some(credential => (credential.projectId?.trim() ?? "") !== (projectId ?? ""))) {
-		return undefined;
+		return configuredProjectId;
 	}
-	return projectId || undefined;
+	return projectId || configuredProjectId;
 }
 
 function resolveOAuthAccountIdForAccessToken(
@@ -4993,7 +5006,7 @@ export class ModelRegistry {
 			{
 				providerId: "google-antigravity",
 				resolveKey: extractGoogleOAuthToken,
-				createOptions: oauthToken =>
+				createOptions: (oauthToken, rawValue) =>
 					googleAntigravityModelManagerOptions({
 						oauthToken,
 						endpoint: this.getProviderBaseUrl("google-antigravity"),
@@ -5001,6 +5014,7 @@ export class ModelRegistry {
 							this.authStorage,
 							"google-antigravity",
 							oauthToken,
+							rawValue,
 							credentialSessionId,
 							this.#authStorageConfigOwner,
 						),
@@ -5009,7 +5023,7 @@ export class ModelRegistry {
 			{
 				providerId: "google-gemini-cli",
 				resolveKey: extractGoogleOAuthToken,
-				createOptions: oauthToken =>
+				createOptions: (oauthToken, rawValue) =>
 					googleGeminiCliModelManagerOptions({
 						oauthToken,
 						endpoint: this.getProviderBaseUrl("google-gemini-cli"),
@@ -5017,6 +5031,7 @@ export class ModelRegistry {
 							this.authStorage,
 							"google-gemini-cli",
 							oauthToken,
+							rawValue,
 							credentialSessionId,
 							this.#authStorageConfigOwner,
 						),
@@ -5128,7 +5143,7 @@ export class ModelRegistry {
 				authGeneration === this.#getProviderEvidenceGeneration(descriptor.providerId, apiKeyValue) &&
 				isAuthenticated(key)
 			) {
-				const managerOptions = descriptor.createOptions(key);
+				const managerOptions = descriptor.createOptions(key, apiKeyValue);
 				const baseUrl = this.#getProviderBaseUrlForDiscovery(descriptor.providerId) ?? "";
 				options.push({
 					options: managerOptions,

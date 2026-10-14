@@ -1,7 +1,7 @@
 import { logger } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { isRetiredModelKey } from "../../model-retirements";
-import { getAntigravityUserAgent } from "../../providers/google-gemini-headers";
+import { getAntigravityUserAgent, getGeminiCliUserAgent } from "../../providers/google-gemini-headers";
 import type { Model } from "../../types";
 
 const DEFAULT_ANTIGRAVITY_DISCOVERY_ENDPOINTS = [
@@ -188,7 +188,7 @@ export async function fetchAntigravityDiscoveryModels(
 	const endpoints = options.endpoint
 		? [trimTrailingSlashes(options.endpoint)]
 		: DEFAULT_ANTIGRAVITY_DISCOVERY_ENDPOINTS.map(trimTrailingSlashes);
-	const debugLog = options.logger?.debug ?? logger.debug;
+	const debugLogger = options.logger ?? logger;
 
 	for (const endpoint of endpoints) {
 		const redactedEndpoint = redactAntigravityEndpoint(endpoint);
@@ -203,7 +203,7 @@ export async function fetchAntigravityDiscoveryModels(
 				headers: {
 					Authorization: `Bearer ${options.token}`,
 					"Content-Type": "application/json",
-					"User-Agent": options.userAgent ?? getAntigravityUserAgent(),
+					"User-Agent": options.userAgent ?? getAntigravityDiscoveryUserAgent(),
 				},
 				body: JSON.stringify(requestBody),
 				signal,
@@ -212,7 +212,7 @@ export async function fetchAntigravityDiscoveryModels(
 			continue;
 		}
 
-		debugLog?.("Antigravity discovery endpoint response", {
+		debugLogger.debug("Antigravity discovery endpoint response", {
 			endpoint: redactedEndpoint,
 			status: response.status,
 			statusText: response.statusText,
@@ -283,13 +283,13 @@ export async function fetchAntigravityDiscoveryModels(
 		}
 
 		if (Object.keys(modelDropReasons).length > 0) {
-			debugLog?.("Antigravity discovery dropped models", {
+			debugLogger.debug("Antigravity discovery dropped models", {
 				endpoint: redactedEndpoint,
 				dropReasons: modelDropReasons,
 			});
 		}
 
-		debugLog?.("Antigravity discovery kept models", {
+		debugLogger.debug("Antigravity discovery kept models", {
 			endpoint: redactedEndpoint,
 			keptModelIds: models.map(m => m.id),
 		});
@@ -318,6 +318,10 @@ function toPositiveNumber(value: unknown, fallback: number): number {
 
 function trimTrailingSlashes(value: string): string {
 	return value.replace(/\/+$/, "");
+}
+
+function getAntigravityDiscoveryUserAgent(): string {
+	return process.env.PI_AI_ANTIGRAVITY_USER_AGENT ? getAntigravityUserAgent() : getGeminiCliUserAgent();
 }
 
 function redactAntigravityEndpoint(value: string): string {
