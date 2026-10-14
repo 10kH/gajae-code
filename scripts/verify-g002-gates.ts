@@ -984,7 +984,9 @@ export function findMcpTuiMetadataFindings(slashCommandsSource: string, interact
 				statement.expression.type === "AssignmentExpression" &&
 				thisPrivate(statement.expression.left, "sessionBuiltinMcpVisible") &&
 				statement.expression.right.type === "MemberExpression" &&
+				!statement.expression.right.computed &&
 				statement.expression.right.object.type === "MemberExpression" &&
+				!statement.expression.right.object.computed &&
 				statement.expression.right.object.object.type === "ThisExpression" &&
 				statement.expression.right.object.property.type === "Identifier" &&
 				statement.expression.right.object.property.name === "session" &&

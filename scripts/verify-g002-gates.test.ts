@@ -374,6 +374,20 @@ describe("MCP command quarantine", () => {
 		);
 	});
 
+	test("rejects computed capability lookups during TUI metadata initialization", async () => {
+		const root = path.join(import.meta.dir, "..");
+		const slashCommands = await Bun.file(path.join(root, "packages/coding-agent/src/extensibility/slash-commands.ts")).text();
+		const interactiveMode = await Bun.file(path.join(root, "packages/coding-agent/src/modes/interactive-mode.ts")).text();
+		const computedCapability = interactiveMode.replace(
+			"this.#sessionBuiltinMcpVisible = this.session.hasExactMcpControls;",
+			'const capabilityName = "autoCompactionEnabled" as const;\n\t\tthis.#sessionBuiltinMcpVisible = this.session[capabilityName];',
+		);
+		expect(computedCapability).not.toBe(interactiveMode);
+		expect(findMcpTuiMetadataFindings(slashCommands, computedCapability)).toContain(
+			"ordinary TUI /mcp metadata is not filtered by the exact MCP capability",
+		);
+	});
+
 	test("rejects a direct early return before refresh visibility updates", async () => {
 		const root = path.join(import.meta.dir, "..");
 		const slashCommands = await Bun.file(path.join(root, "packages/coding-agent/src/extensibility/slash-commands.ts")).text();
