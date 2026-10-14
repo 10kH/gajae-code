@@ -3580,6 +3580,50 @@ describe("ModelRegistry", () => {
 			expect(afterOfflineIds).toEqual(discoveredIds);
 		});
 
+		test("sends the stored Google OAuth project during discovery refresh", async () => {
+			const requests: Array<{ body: unknown }> = [];
+			using _hook = hookFetch((input, init) => {
+				if (!String(input).endsWith("/v1internal:fetchAvailableModels")) {
+					throw new Error(`Unexpected URL: ${String(input)}`);
+				}
+				requests.push({ body: JSON.parse(String(init?.body ?? "{}")) as unknown });
+				return new Response(
+					JSON.stringify({ models: { "gemini-project-probe": { displayName: "Project Probe" } } }),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			try {
+				for (const [provider, projectId] of [
+					["google-antigravity", "antigravity-project"],
+					["google-gemini-cli", "gemini-cli-project"],
+				] as const) {
+					await authStorage.set(provider, [
+						{
+							type: "oauth",
+							access: `${provider}-other-access`,
+							refresh: `${provider}-other-refresh`,
+							expires: Date.now() + 60 * 60 * 1000,
+							projectId: `${projectId}-other`,
+						},
+						{
+							type: "oauth",
+							access: `${provider}-selected-access`,
+							refresh: `${provider}-selected-refresh`,
+							expires: Date.now() + 60 * 60 * 1000,
+							projectId,
+						},
+					]);
+					const sessionId = `${provider}-project-selection`;
+					authStorage.setSessionCredentialSelector(sessionId, provider, { kind: "project", value: projectId });
+					await registry.refreshProvider(provider, "online", sessionId);
+					expect(requests.at(-1)?.body).toEqual({ project: projectId });
+				}
+			} finally {
+				await registry.dispose();
+			}
+		});
+
 		test("dynamically discovered Antigravity model survives token rotation followed by a models config change", async () => {
 			// Antigravity models outside the bundled catalog exist only through discovery. When a long-running session
 			// rebuilds its catalog after the same account's token refreshed, the discovered model must stay available.
