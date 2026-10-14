@@ -26,7 +26,7 @@ describe("/handoff command", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("shows a cancellable loader while handoff generation is running", async () => {
+	it("shows a cancellable loader and preserves handoff UI behavior without refreshing metadata", async () => {
 		const handoffStarted = Promise.withResolvers<void>();
 		const handoffDone = Promise.withResolvers<{ document: string }>();
 		const originalOnEscape = vi.fn();
@@ -78,11 +78,12 @@ describe("/handoff command", () => {
 		expect(statusContainer.children).toHaveLength(0);
 		expect(ctx.editor.onEscape).toBe(originalOnEscape);
 		expect(ctx.session.handoff).toHaveBeenCalledWith("focus on tests");
-		expect(refreshSlashCommandState).toHaveBeenCalledTimes(1);
+		expect(refreshSlashCommandState).not.toHaveBeenCalled();
 		expect(ctx.resetIrcSidebarSession).toHaveBeenCalledTimes(1);
+		expect(ctx.rebuildChatFromMessages).toHaveBeenCalledWith("replace-identity");
 	});
 
-	it("refreshes slash-command metadata after a committed degraded handoff", async () => {
+	it("reports a committed degraded handoff without refreshing metadata", async () => {
 		const refreshSlashCommandState = vi.fn(async () => {});
 		const showError = vi.fn();
 		const ctx = {
@@ -109,7 +110,7 @@ describe("/handoff command", () => {
 
 		await controller.handleHandoffCommand();
 
-		expect(refreshSlashCommandState).toHaveBeenCalledTimes(1);
+		expect(refreshSlashCommandState).not.toHaveBeenCalled();
 		expect(showError).toHaveBeenCalledWith(
 			expect.stringContaining("Handoff committed but successor initialization was degraded"),
 		);

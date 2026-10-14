@@ -57,7 +57,6 @@ function createFixture(): AutoCompactionFixture {
 		loadingAnimation: { stop: loadingStop },
 		editor: { onEscape: () => order.push("temporaryEscape") },
 		session: {
-			hasExactMcpControls: false,
 			abortCompaction: vi.fn(),
 			retryNow: vi.fn(),
 			abortRetry: vi.fn(),
@@ -124,7 +123,7 @@ async function runEndEvent(event: AutoCompactionEndEvent): Promise<AutoCompactio
 }
 
 describe("EventController auto-compaction overflow status", () => {
-	it("refreshes slash-command metadata before presenting an automatic handoff successor", async () => {
+	it("presents an automatic handoff successor without refreshing metadata", async () => {
 		const fixture = await runEndEvent({
 			type: "auto_compaction_end",
 			action: "handoff",
@@ -133,10 +132,17 @@ describe("EventController auto-compaction overflow status", () => {
 			willRetry: false,
 		});
 
-		expect(fixture.refreshSlashCommandState).toHaveBeenCalledTimes(1);
-		expect(fixture.order.indexOf("refreshSlashCommandState")).toBeLessThan(
+		expect(fixture.refreshSlashCommandState).not.toHaveBeenCalled();
+		expect(fixture.ctx.resetIrcSidebarSession).toHaveBeenCalledTimes(1);
+		expect(fixture.rebuildChatFromMessages).toHaveBeenCalledWith("replace-identity");
+		expect(fixture.order.indexOf("resetIrcSidebarSession")).toBeLessThan(
 			fixture.order.indexOf("rebuildChatFromMessages:replace-identity"),
 		);
+		expect(fixture.order.indexOf("rebuildChatFromMessages:replace-identity")).toBeLessThan(
+			fixture.order.indexOf("reloadTodos"),
+		);
+		expect(fixture.showStatus).toHaveBeenCalledWith("Auto-handoff completed");
+		expect(fixture.flushCompactionQueue).toHaveBeenCalledWith({ willRetry: false });
 	});
 
 	it("stops an active compaction loader during final disposal", () => {

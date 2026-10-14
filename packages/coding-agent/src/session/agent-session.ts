@@ -7060,7 +7060,7 @@ export class AgentSession {
 		}
 	}
 
-	/** Notify UI projections after a committed extension-driven session identity transition. */
+	/** Notify UI projections after a committed session-identity transition. */
 	async notifySessionIdentityChanged(): Promise<void> {
 		for (const listener of [...this.#sessionIdentityChangeListeners]) {
 			try {
@@ -14888,9 +14888,12 @@ export class AgentSession {
 				if (!success) {
 					return { cancelled: true };
 				}
-				await this.notifySessionIdentityChanged();
 				if (options?.setup) {
-					await options.setup(this.sessionManager);
+					try {
+						await options.setup(this.sessionManager);
+					} finally {
+						await this.notifySessionIdentityChanged();
+					}
 				}
 				return { cancelled: false };
 			},
@@ -17843,10 +17846,13 @@ export class AgentSession {
 	 */
 	newSession(options?: NewSessionOptions): Promise<boolean> {
 		if (this.#newSessionTransition) return this.#newSessionTransition;
-		// Acquire the shared transition lease only when starting a fresh transition
+		// Acquire the shared session-transition lease only when starting a fresh transition
 		// (the dedup above returns the in-flight promise without re-acquiring).
 		this.#beginSessionTransition("new-session");
-		const transition = this.#runNewSessionTransition(options);
+		const previousSessionId = this.sessionId;
+		const transition = this.#runNewSessionTransition(options).finally(async () => {
+			if (this.sessionId !== previousSessionId) await this.notifySessionIdentityChanged();
+		});
 		this.#newSessionTransition = transition;
 		void transition
 			.finally(() => {
@@ -21560,6 +21566,7 @@ export class AgentSession {
 				{ code: "busy" },
 			);
 		}
+		const previousSessionId = this.sessionId;
 		// Acquire the shared session-transition lease so handoff is mutually exclusive
 		// with compact/new/switch/branch/clear/fork/navigateTree in BOTH directions —
 		// a transition that started first and yielded still owns the lease here, and a
@@ -21832,6 +21839,7 @@ export class AgentSession {
 			// enqueue or the next agent yield.
 			this.yieldQueue.rearmIdle();
 			this.#endSessionTransition();
+			if (this.sessionId !== previousSessionId) await this.notifySessionIdentityChanged();
 		}
 	}
 
