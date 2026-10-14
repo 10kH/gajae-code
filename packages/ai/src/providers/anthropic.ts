@@ -2096,6 +2096,9 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 		let activeAbortTracker = createAbortSourceTracker(options?.signal);
 
 		try {
+			const idleTimeoutMs =
+				options?.streamIdleTimeoutMs ??
+				getStreamIdleTimeoutMs(model.streamIdleTimeoutMs ?? getProviderStreamIdleTimeoutFallbackMs(model.provider));
 			let client: Anthropic;
 			let isOAuthToken: boolean;
 
@@ -2128,7 +2131,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					requestMaxRetries: options?.requestMaxRetries,
 					maxRetryDelayMs: options?.maxRetryDelayMs,
 					streamFirstEventTimeoutMs: options?.streamFirstEventTimeoutMs,
-					streamIdleTimeoutMs: options?.streamIdleTimeoutMs,
+					streamIdleTimeoutMs: idleTimeoutMs,
 					providerSessionId: options?.providerSessionId,
 				});
 				client = created.client;
@@ -2316,9 +2319,6 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				firstTokenTime = undefined;
 				truncatedToolCalls.clear();
 			};
-			const idleTimeoutMs =
-				options?.streamIdleTimeoutMs ??
-				getStreamIdleTimeoutMs(getProviderStreamIdleTimeoutFallbackMs(model.provider));
 			const firstEventFallbackMs = getProviderFirstEventTimeoutFallbackMs(model.provider);
 			const firstEventTimeoutMs =
 				options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs, firstEventFallbackMs);

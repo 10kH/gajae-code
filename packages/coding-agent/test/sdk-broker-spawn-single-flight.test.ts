@@ -28,6 +28,7 @@ import {
 	setEnsureBrokerTimingForTest,
 	withBrokerStartupLock,
 } from "../src/sdk/broker/ensure";
+import { brokerLockHostIdentity } from "../src/sdk/broker/lock-host-identity";
 import { BrokerStartupError } from "../src/sdk/broker/startup-failure";
 
 const cli = path.resolve(import.meta.dir, "../src/cli.ts");
@@ -1380,10 +1381,17 @@ it("shared agent roots recover dead locks across config profiles despite a retai
 
 		const sdk = path.join(dir, "sdk");
 		const brokerLock = path.join(sdk, "broker.lock");
+		const { ownerHostId } = await brokerLockHostIdentity(dir);
 		await fs.mkdir(brokerLock, { recursive: true, mode: 0o700 });
 		await fs.writeFile(
 			path.join(brokerLock, "owner.json"),
-			JSON.stringify({ version: 1, ownerId: "dead-broker", pid: deadPid, acquiredAt: Date.now() - 60_000 }),
+			JSON.stringify({
+				version: 1,
+				ownerId: "dead-broker",
+				pid: deadPid,
+				ownerHostId,
+				acquiredAt: Date.now() - 60_000,
+			}),
 			{ mode: 0o600 },
 		);
 		const lockStat = await fs.lstat(brokerLock, { bigint: true });
