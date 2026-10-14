@@ -3581,12 +3581,15 @@ describe("ModelRegistry", () => {
 		});
 
 		test("sends the stored Google OAuth project during discovery refresh", async () => {
-			const requests: Array<{ body: unknown }> = [];
+			const requests: Array<{ accessToken: string | undefined; body: unknown }> = [];
 			using _hook = hookFetch((input, init) => {
 				if (!String(input).endsWith("/v1internal:fetchAvailableModels")) {
 					throw new Error(`Unexpected URL: ${String(input)}`);
 				}
-				requests.push({ body: JSON.parse(String(init?.body ?? "{}")) as unknown });
+				requests.push({
+					accessToken: new Headers(init?.headers).get("authorization")?.replace(/^Bearer /i, ""),
+					body: JSON.parse(String(init?.body ?? "{}")) as unknown,
+				});
 				return new Response(
 					JSON.stringify({ models: { "gemini-project-probe": { displayName: "Project Probe" } } }),
 					{ status: 200, headers: { "Content-Type": "application/json" } },
@@ -3598,26 +3601,40 @@ describe("ModelRegistry", () => {
 					["google-antigravity", "antigravity-project"],
 					["google-gemini-cli", "gemini-cli-project"],
 				] as const) {
+					const otherAccessToken = `${provider}-other-access`;
+					const selectedAccessToken = `${provider}-selected-access`;
+					const otherProjectId = `${projectId}-other`;
 					await authStorage.set(provider, [
 						{
 							type: "oauth",
-							access: `${provider}-other-access`,
+							access: otherAccessToken,
 							refresh: `${provider}-other-refresh`,
 							expires: Date.now() + 60 * 60 * 1000,
-							projectId: `${projectId}-other`,
+							projectId: otherProjectId,
 						},
 						{
 							type: "oauth",
-							access: `${provider}-selected-access`,
+							access: selectedAccessToken,
 							refresh: `${provider}-selected-refresh`,
 							expires: Date.now() + 60 * 60 * 1000,
 							projectId,
 						},
 					]);
+					await registry.refreshProvider(provider, "online");
+					const automaticRequest = requests.at(-1);
+					const automaticProject = new Map([
+						[otherAccessToken, otherProjectId],
+						[selectedAccessToken, projectId],
+					]).get(automaticRequest?.accessToken ?? "");
+					expect(automaticRequest?.body).toEqual({ project: automaticProject });
+
 					const sessionId = `${provider}-project-selection`;
 					authStorage.setSessionCredentialSelector(sessionId, provider, { kind: "project", value: projectId });
 					await registry.refreshProvider(provider, "online", sessionId);
-					expect(requests.at(-1)?.body).toEqual({ project: projectId });
+					expect(requests.at(-1)).toMatchObject({
+						accessToken: selectedAccessToken,
+						body: { project: projectId },
+					});
 				}
 			} finally {
 				await registry.dispose();
