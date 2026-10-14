@@ -170,7 +170,9 @@ function isCanonicalOpenAIAffinityOrigin(baseUrl: string | undefined): boolean {
 	}
 }
 /**
- * True for http(s) origins that resolve to the caller's own machine. A loopback
+ * True when the base URL is http(s) and its hostname is a loopback literal
+ * (`127.0.0.0/8`, `localhost`, `::1`). Hostnames are matched as written and
+ * never resolved, so a DNS alias pointed at loopback stays opt-in. A loopback
  * relay runs in the same trust scope as the process that dials it, so the
  * ChatGPT codex backend contract applies: without a stable session identity the
  * backend cannot reuse the warmed prompt prefix, and every turn replays the
