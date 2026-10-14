@@ -253,6 +253,76 @@ describe("createAgentSession cwd after /move", () => {
 		}
 	});
 
+	it("keeps moved tool cwd and Task discovery through reset and reopen", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-move-reopen-"));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "launch");
+		const cwdB = path.join(cwdA, "project");
+		fs.mkdirSync(cwdB, { recursive: true });
+		const settings = Settings.isolated({
+			"async.enabled": false,
+			"bash.autoBackground.enabled": false,
+			"bashInterceptor.enabled": false,
+		});
+		const options = {
+			agentDir: tempDir,
+			settings,
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			toolNames: ["bash", "task"],
+		};
+		const manager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const { session } = await createAgentSession({ ...options, cwd: cwdA, sessionManager: manager });
+		const params = {
+			agent: "missing-reopen-agent",
+			tasks: [{ id: "reopen", description: "Probe moved discovery", assignment: "Probe moved discovery" }],
+		};
+		let sessionFile: string;
+		let sessionId: string;
+		try {
+			await manager.moveTo(cwdB);
+			const task = session.getToolForExecution("task");
+			if (!task) throw new Error("Expected moved Task");
+			expect(textContent(await task.execute("warm-before-reset", params))).toContain("Unknown agent");
+			const originalId = manager.getSessionId();
+			expect(await session.newSession()).toBe(true);
+			expect(manager.getSessionId()).not.toBe(originalId);
+			expect(manager.getCwd()).toBe(cwdB);
+			const afterReset = session.getToolForExecution("task");
+			const bash = session.getToolForExecution("bash");
+			if (!afterReset || !bash) throw new Error("Expected tools after reset");
+			expect(textContent(await afterReset.execute("after-reset", params))).toContain("Unknown agent");
+			expect(textContent(await bash.execute("pwd-after-reset", { command: "pwd" }))).toContain(cwdB);
+			manager.appendMessage({ role: "user", content: "moved and reset", timestamp: Date.now() });
+			await manager.ensureOnDisk();
+			const file = manager.getSessionFile();
+			if (!file) throw new Error("Expected persisted moved session");
+			sessionFile = file;
+			sessionId = manager.getSessionId();
+		} finally {
+			await session.dispose();
+		}
+		const reopened = await SessionManager.open(sessionFile, SessionManager.managedDestination(cwdB, tempDir));
+		const restored = await createAgentSession({ ...options, cwd: cwdB, sessionManager: reopened });
+		try {
+			expect(reopened.getSessionId()).toBe(sessionId);
+			expect(reopened.getCwd()).toBe(cwdB);
+			const task = restored.session.getToolForExecution("task");
+			const bash = restored.session.getToolForExecution("bash");
+			if (!task || !bash) throw new Error("Expected reopened tools");
+			expect(textContent(await task.execute("after-reopen", params))).toContain("Unknown agent");
+			expect(textContent(await bash.execute("pwd-after-reopen", { command: "pwd" }))).toContain(cwdB);
+		} finally {
+			await restored.session.dispose();
+		}
+	});
+
 	it("runs tools from the moved session directory", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-sdk-move-cwd-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
