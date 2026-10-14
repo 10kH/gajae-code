@@ -1023,10 +1023,11 @@
 				"flex",
 				"scale",
 				"priority",
+				"ultrafast",
 				"openai-only",
 				"claude-only"
 			],
-			"description": "Processing priority hint (none = omit). OpenAI accepts the tier values directly; Anthropic realizes `priority` as `speed: \"fast\"` on supported Opus models. Scoped values target one family.",
+			"description": "Processing priority hint (none = omit). OpenAI accepts the tier values directly; ultrafast is a 6x premium tier. Anthropic realizes `priority` as `speed: \"fast\"` on supported Opus models. Scoped values target one family.",
 			"default": "none"
 		},
 		"task": {
@@ -1042,6 +1043,7 @@
 						"flex",
 						"scale",
 						"priority",
+						"ultrafast",
 						"openai-only",
 						"claude-only"
 					],
