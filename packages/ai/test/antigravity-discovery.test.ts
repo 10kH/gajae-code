@@ -279,7 +279,7 @@ describe("Antigravity model discovery", () => {
 
 		const models = await fetchAntigravityDiscoveryModels({
 			token: "test-token",
-			endpoint: "https://antigravity.example.test",
+			endpoint: "https://user:secret@antigravity.example.test/private/path",
 			fetcher,
 			logger: testLogger,
 		});
@@ -294,6 +294,11 @@ describe("Antigravity model discovery", () => {
 		});
 		const keptModelsLog = debugLogs.find(log => log[0] === "Antigravity discovery kept models");
 		expect(keptModelsLog?.[1]?.keptModelIds).toEqual(["gemini-3.1-pro-low"]);
+		expect(debugLogs.map(([, meta]) => meta?.endpoint)).toEqual([
+			"https://antigravity.example.test",
+			"https://antigravity.example.test",
+			"https://antigravity.example.test",
+		]);
 	});
 
 	it("filters retired selectors from fresh authoritative model caches", async () => {

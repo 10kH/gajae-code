@@ -191,6 +191,7 @@ export async function fetchAntigravityDiscoveryModels(
 	const debugLog = options.logger?.debug ?? logger.debug;
 
 	for (const endpoint of endpoints) {
+		const redactedEndpoint = redactAntigravityEndpoint(endpoint);
 		let response: Response;
 		try {
 			const requestBody: Record<string, unknown> = {};
@@ -212,7 +213,7 @@ export async function fetchAntigravityDiscoveryModels(
 		}
 
 		debugLog?.("Antigravity discovery endpoint response", {
-			endpoint,
+			endpoint: redactedEndpoint,
 			status: response.status,
 			statusText: response.statusText,
 		});
@@ -283,13 +284,13 @@ export async function fetchAntigravityDiscoveryModels(
 
 		if (Object.keys(modelDropReasons).length > 0) {
 			debugLog?.("Antigravity discovery dropped models", {
-				endpoint,
+				endpoint: redactedEndpoint,
 				dropReasons: modelDropReasons,
 			});
 		}
 
 		debugLog?.("Antigravity discovery kept models", {
-			endpoint,
+			endpoint: redactedEndpoint,
 			keptModelIds: models.map(m => m.id),
 		});
 
@@ -317,4 +318,12 @@ function toPositiveNumber(value: unknown, fallback: number): number {
 
 function trimTrailingSlashes(value: string): string {
 	return value.replace(/\/+$/, "");
+}
+
+function redactAntigravityEndpoint(value: string): string {
+	try {
+		return new URL(value).origin;
+	} catch {
+		return "invalid endpoint";
+	}
 }
