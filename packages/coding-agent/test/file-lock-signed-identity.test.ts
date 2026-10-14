@@ -4,7 +4,7 @@ import { renameSync, rmSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { type NativeDirectoryTreeSnapshot, snapshotDirectoryTree } from "@gajae-code/natives";
+import { exactRemoveDirectoryTree, type NativeDirectoryTreeSnapshot, snapshotDirectoryTree } from "@gajae-code/natives";
 import {
 	FileLockTestHooks,
 	readFileLockObservationForGc,
@@ -157,6 +157,8 @@ async function signedIdentityFixture(component: "root" | "info" | "both", detach
 			return { ok: true };
 		},
 	);
+	const isFixtureLockTree = (target: string): boolean =>
+		[lock, parked, cleanupLock, cleanupParked].some(candidate => sameFixturePath(target, candidate));
 	FileLockTestHooks.nativeExactRemovalProbe = () => !detach;
 	FileLockTestHooks.nativeQuarantineBindings = () => ({
 		snapshotDirectoryTree: target => {
@@ -166,14 +168,16 @@ async function signedIdentityFixture(component: "root" | "info" | "both", detach
 			// Only the fixture lock tree carries the signed IDs that the lstat spy
 			// reports. Staging trees (e.g. Windows acquisition) keep their real IDs so
 			// their snapshot stays consistent with their unmodified lstat identity.
-			const isFixtureLockTree = [lock, parked, cleanupLock, cleanupParked].some(candidate =>
-				sameFixturePath(target, candidate),
-			);
-			if (!isFixtureLockTree) return captured;
+			if (!isFixtureLockTree(target)) return captured;
 			originals.set(target, captured.snapshot);
 			return { ok: true, snapshot: nativeSnapshot(captured.snapshot) };
 		},
-		exactRemoveDirectoryTree: remove,
+		// Staging trees keep real IDs, so the real native removal owns them; only
+		// fixture lock-tree removals go through the asserting spy.
+		exactRemoveDirectoryTree: (target, snapshot, parentIdentity, detachOnly) =>
+			isFixtureLockTree(target)
+				? remove(target, snapshot, parentIdentity ?? undefined, detachOnly ?? undefined)
+				: exactRemoveDirectoryTree(target, snapshot, parentIdentity, detachOnly),
 	});
 	return {
 		file,
