@@ -287,7 +287,7 @@ describe("Antigravity model discovery", () => {
 
 		const models = await fetchAntigravityDiscoveryModels({
 			token: "test-token",
-			endpoint: "https://user:secret@antigravity.example.test/private/path",
+			endpoint: "https://user:secret@antigravity.example.test/private/path?access_token=query-secret",
 			fetcher,
 			logger: testLogger,
 		});
