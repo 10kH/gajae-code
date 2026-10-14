@@ -3,6 +3,8 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
+import { DEFAULT_FUZZY_THRESHOLD, executePatchSingle } from "@gajae-code/coding-agent/edit";
+import { writethroughNoop } from "@gajae-code/coding-agent/lsp";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { assertEditableFile, assertEditableFileContent } from "@gajae-code/coding-agent/tools/auto-generated-guard";
 import { ToolError } from "@gajae-code/coding-agent/tools/tool-errors";
@@ -218,5 +220,67 @@ describe("WriteTool auto-generated guard", () => {
 		);
 		expect(await Bun.file(notesPath).text()).toContain("value = 2");
 		expect(await Bun.file(similarPath).text()).toContain("value = 2");
+	});
+
+	it("still allows WriteTool to create a missing *.generated.ts file", async () => {
+		const filePath = path.join(tempDir, "brand-new.generated.ts");
+		const tool = new WriteTool(writeSession(tempDir));
+		const result = await tool.execute("write-new-generated", {
+			path: filePath,
+			content: "export const value = 1;\n",
+		});
+		expect(result.content.map(part => (part.type === "text" ? part.text : "")).join("\n")).toContain(
+			"Successfully wrote",
+		);
+		expect(await Bun.file(filePath).text()).toContain("value = 1");
+	});
+});
+
+const noopBeginDeferred = (_targetPath: string) => ({
+	onDeferredDiagnostics: () => {},
+	signal: new AbortController().signal,
+	finalize: () => {},
+});
+
+function patchSession(cwd: string): ToolSession {
+	return {
+		cwd,
+		hasUI: false,
+		getSessionFile: () => null,
+		getSessionSpawns: () => "*",
+		enableLsp: false,
+		settings: Settings.isolated(),
+		getArtifactsDir: () => null,
+		getPlanModeState: () => undefined,
+	} as unknown as ToolSession;
+}
+
+describe("patch create and generated names", () => {
+	it("refuses to create a missing *.generated.ts file through patch", async () => {
+		await expect(
+			executePatchSingle({
+				session: patchSession(tempDir),
+				path: "fresh.generated.ts",
+				params: { op: "create", diff: "export const value = 1;\n" },
+				allowFuzzy: true,
+				fuzzyThreshold: DEFAULT_FUZZY_THRESHOLD,
+				writethrough: writethroughNoop,
+				beginDeferredDiagnosticsForPath: noopBeginDeferred,
+			}),
+		).rejects.toBeInstanceOf(ToolError);
+		expect(await Bun.file(path.join(tempDir, "fresh.generated.ts")).exists()).toBe(false);
+	});
+
+	it("still allows patch create of a handwritten name", async () => {
+		await executePatchSingle({
+			session: patchSession(tempDir),
+			path: "fresh-notes.ts",
+			params: { op: "create", diff: "export const value = 1;\n" },
+			allowFuzzy: true,
+			fuzzyThreshold: DEFAULT_FUZZY_THRESHOLD,
+			writethrough: writethroughNoop,
+			beginDeferredDiagnosticsForPath: noopBeginDeferred,
+		});
+		expect(await Bun.file(path.join(tempDir, "fresh-notes.ts")).text()).toContain("value = 1");
 	});
 });
