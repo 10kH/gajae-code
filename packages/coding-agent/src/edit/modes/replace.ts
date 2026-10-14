@@ -9,6 +9,7 @@ import { markDesignedError } from "@gajae-code/utils/error-classification";
 import * as z from "zod/v4";
 import type { WritethroughCallback, WritethroughDeferredHandle } from "../../lsp";
 import type { ToolSession } from "../../tools";
+import { assertEditableFile, assertEditableFileContent } from "../../tools/auto-generated-guard";
 import { invalidateFsScanAfterWrite } from "../../tools/fs-cache-invalidation";
 import { outputMeta } from "../../tools/output-meta";
 import { enforcePlanModeWrite, resolvePlanPath } from "../../tools/plan-mode-guard";
@@ -636,6 +637,7 @@ export async function executeReplaceSingle(
 	}
 
 	const absolutePath = resolvePlanPath(session, path);
+	await assertEditableFile(absolutePath, path, session.settings);
 	return withEditPathMutation([absolutePath], () =>
 		executeReplaceSingleUnderLock({
 			session,
@@ -664,6 +666,7 @@ async function executeReplaceSingleUnderLock(
 	},
 ): Promise<AgentToolResult<EditToolDetails, typeof replaceEditEntrySchema>> {
 	const {
+		session,
 		path,
 		signal,
 		batchRequest,
@@ -678,6 +681,8 @@ async function executeReplaceSingleUnderLock(
 	} = options;
 
 	const rawContent = await readEditFileText(absolutePath, path);
+	assertEditableFileContent(rawContent, path, session.settings);
+	await assertEditableFile(absolutePath, path, session.settings);
 	const { bom, text: content } = stripBom(rawContent);
 	const originalEnding = detectLineEnding(content);
 	const normalizedContent = normalizeToLF(content);
