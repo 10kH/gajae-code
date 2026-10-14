@@ -118,11 +118,17 @@ interface DuplicateDisposition {
 	predecessorIds: string[];
 }
 
+interface TaskArtifactPersistence {
+	effectiveArtifactsDir: string | undefined;
+	parentArtifactManager: ArtifactManager | undefined;
+}
+
 interface TaskResumeDescriptor {
 	toolCallId: string;
 	params: TaskParams;
 	task: TaskItem & { id: string };
 	sessionFile: string | null;
+	artifactPersistence: TaskArtifactPersistence;
 	durableOutputAllowed?: boolean;
 	forkContextSeed?: ForkContextSeed;
 	agentSource: AgentDefinition["source"];
@@ -912,6 +918,26 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		};
 	}
 
+	#resolveAdmittedArtifactPersistence(admitted: TaskArtifactPersistence): TaskArtifactPersistence {
+		if (!admitted.parentArtifactManager?.getManagedStore()) return admitted;
+		const admittedOwnerId = this.session.getSessionId?.();
+		const currentOwnerId = this.#ownerSession.getSessionId?.();
+		const admittedFile = this.session.getSessionFile();
+		const currentFile = this.#ownerSession.getSessionFile();
+		if (
+			!admittedOwnerId ||
+			admittedOwnerId !== currentOwnerId ||
+			!admittedFile ||
+			!currentFile ||
+			path.basename(admittedFile) !== path.basename(currentFile)
+		)
+			return admitted;
+		const current = this.#sharedArtifactStore();
+		if (!current?.manager.getManagedStore()) return admitted;
+		current.manager.assertManagedBinding();
+		return { effectiveArtifactsDir: current.dir, parentArtifactManager: current.manager };
+	}
+
 	/**
 	 * Create a TaskTool instance.
 	 * Repository authority is captured from session cwd *before* agent discovery so
@@ -1262,7 +1288,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								sessionFiles: new Map([[descriptor.task.id, descriptor.sessionFile]]),
 								suppressRoiReconciliation: true,
 								...(descriptor.durableOutputAllowed === true
-									? {}
+									? { persistence: descriptor.artifactPersistence }
 									: {
 											persistence: {
 												effectiveArtifactsDir: undefined,
@@ -1570,6 +1596,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								params,
 								task: { ...taskItem, id: uniqueId },
 								sessionFile: subtaskSessionFile,
+								artifactPersistence: {
+									effectiveArtifactsDir: batchArtifactsDir,
+									parentArtifactManager: asyncParentArtifactManager,
+								},
 								durableOutputAllowed: Boolean(batchArtifactsDir),
 								forkContextSeed: frozenForkSeed,
 								agentSource: fallbackAgentSource,
@@ -1718,10 +1748,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			resumeMessage?: string;
 			asyncJobManager?: AsyncJobManager;
 			sessionFiles?: ReadonlyMap<string, string | null>;
-			persistence?: {
-				effectiveArtifactsDir: string | undefined;
-				parentArtifactManager: ArtifactManager | undefined;
-			};
+			persistence?: TaskArtifactPersistence;
 			/**
 			 * Set for per-child async runs: the spawnPlan is carried for gate
 			 * consistency, but batch-level ROI reconciliation must not be computed
@@ -2004,8 +2031,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		// File-backed session artifacts, or a session-lifetime durable temp root for
 		// in-memory parents. Never use a per-task temp dir that is deleted on return —
 		// advertised agent:// URIs must remain readable for the parent session lifetime.
-		const { effectiveArtifactsDir, parentArtifactManager } =
-			executionOverrides?.persistence ?? (await this.#resolveEffectiveArtifactsDir());
+		const { effectiveArtifactsDir, parentArtifactManager } = executionOverrides?.persistence
+			? this.#resolveAdmittedArtifactPersistence(executionOverrides.persistence)
+			: await this.#resolveEffectiveArtifactsDir();
 		const hasDurableOutputBacking = Boolean(effectiveArtifactsDir);
 
 		// Share the parent session's local:// root with subagents so they read/write the same scratch space
@@ -2341,8 +2369,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					recommendedMode: advisory.recommendedMode,
 					reasons: advisory.reasons,
 				};
+				let retainedPersistence: TaskArtifactPersistence = { effectiveArtifactsDir, parentArtifactManager };
 				const managedPersistence = parentArtifactManager?.getManagedStore()
-					? createManagedTaskPersistence(parentArtifactManager, task.id)
+					? createManagedTaskPersistence(parentArtifactManager, task.id, () => {
+							retainedPersistence = this.#resolveAdmittedArtifactPersistence(retainedPersistence);
+							if (!retainedPersistence.parentArtifactManager)
+								throw new Error("Managed Task storage authority is unavailable");
+							return retainedPersistence.parentArtifactManager;
+						})
 					: undefined;
 
 				const routingOutcome = routingByIndex.get(index);

@@ -342,28 +342,32 @@ export interface ExecutorOptions {
 export class ManagedTaskPersistence {
 	readonly #artifacts: ArtifactManager;
 	readonly #taskId: string;
+	readonly #getArtifacts: () => ArtifactManager;
 
-	constructor(artifacts: ArtifactManager, taskId: string) {
+	constructor(artifacts: ArtifactManager, taskId: string, getArtifacts: () => ArtifactManager = () => artifacts) {
 		this.#artifacts = artifacts;
 		this.#taskId = validateAllocatedTaskId(taskId);
+		this.#getArtifacts = getArtifacts;
 		if (!artifacts.getManagedSubtreeRootAuthority())
 			throw new Error("Managed task persistence authority is unavailable");
 	}
 
 	async openSession(cwd: string, sessionMemoryMode: SessionMemoryMode = "shadow"): Promise<SessionManager> {
-		const store = this.#artifacts.getManagedStore();
+		const artifacts = this.#getArtifacts();
+		const store = artifacts.getManagedStore();
 		if (!store) throw new Error("Managed task persistence authority is unavailable");
-		this.#artifacts.assertManagedBinding();
-		const sessionFile = path.join(this.#artifacts.dir, `${this.#taskId}.jsonl`);
+		artifacts.assertManagedBinding();
+		const sessionFile = path.join(artifacts.dir, `${this.#taskId}.jsonl`);
 		const session = await SessionManager.openNestedManaged(
 			sessionFile,
-			SessionManager.nestedManagedDestination(store, this.#artifacts.dir),
+			SessionManager.nestedManagedDestination(store, artifacts.dir),
 			store,
 			undefined,
 			cwd,
 			sessionMemoryMode,
 		);
-		this.#artifacts.assertManagedBinding();
+		artifacts.assertManagedBinding();
+		session.registerManagedTranscriptRelocationResolver(this.#getArtifacts);
 		return session;
 	}
 	async openStagedSession(attemptId = this.#taskId): Promise<SessionManager> {
@@ -385,8 +389,10 @@ export class ManagedTaskPersistence {
 	}
 
 	async publishOutput(rawOutput: string, metadata: Uint8Array): Promise<void> {
-		await withArtifactManagerFinalizationTurn(this.#artifacts, () =>
-			this.#artifacts.publishManagedOutputGeneration(
+		const artifacts = this.#getArtifacts();
+		artifacts.assertManagedBinding();
+		await withArtifactManagerFinalizationTurn(artifacts, () =>
+			artifacts.publishManagedOutputGeneration(
 				`${this.#taskId}.md.selector.json`,
 				`${this.#taskId}.md`,
 				Buffer.from(rawOutput, "utf8"),
@@ -396,8 +402,12 @@ export class ManagedTaskPersistence {
 	}
 }
 
-export function createManagedTaskPersistence(artifacts: ArtifactManager, taskId: string): ManagedTaskPersistence {
-	return new ManagedTaskPersistence(artifacts, taskId);
+export function createManagedTaskPersistence(
+	artifacts: ArtifactManager,
+	taskId: string,
+	getArtifacts?: () => ArtifactManager,
+): ManagedTaskPersistence {
+	return new ManagedTaskPersistence(artifacts, taskId, getArtifacts);
 }
 
 const MAX_REVIEW_FINDINGS_ARTIFACT_BYTES = 16 * 1024 * 1024;
