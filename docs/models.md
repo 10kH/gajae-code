@@ -193,7 +193,7 @@ providers:
 | `deepinfra` | `service_tier: "priority"` | Sent only for the first-class `deepinfra` provider ID and only with the `priority` tier. |
 | `opencodex` | `service_tier: "priority"` | First-class OpenCodex discovery opts in automatically; OpenCodex Fast Mode must remain `Auto` for client passthrough. When OpenCodex uses ChatGPT authentication, a final `service_tier: "default"` is not downgrade evidence. |
 
-Custom OpenAI-compatible providers remain fail-closed unless their provider or model configuration explicitly sets `compat.supportsServiceTier: true`. Use that opt-in only when the proxy preserves or intentionally realizes OpenAI's `service_tier` contract:
+Custom OpenAI-compatible providers remain fail-closed for `priority`, `flex`, and `scale` unless their provider or model configuration explicitly sets `compat.supportsServiceTier: true`. Ultrafast is separate: only models that explicitly set `compat.supportsUltrafastTier: true` send that tier, and this flag does not enable the other service tiers.
 
 ```yaml
 providers:
@@ -1018,6 +1018,8 @@ Request shaping:
 - `supportsMultipleSystemMessages` — send system-prompt content as multiple separate blocks instead of merging it into one. Default: `true` for canonical Anthropic endpoints and `false` for unknown or strict-template hosts. Setting it to `true` preserves separate blocks, which is preferred for KV-cache reuse when the trailing prompt changes between calls.
 - `sendSessionHeaders` — forward the agent session id as `session_id` and `x-session-id` request headers so OpenAI-compatible relays/proxies can do session-affinity routing and reuse a server-side prompt cache. Default: `false`. Caller-set `headers`/`requestTransform` values are never overwritten.
 - `supportsResponsesSessionAffinity` — for `openai-responses`, opt in to forwarding `session_id` and `x-client-request-id` affinity headers to a custom OpenAI-compatible relay. Canonical OpenAI routing remains automatic; known non-OpenAI provider IDs are rejected. Default: `false`.
+- `supportsServiceTier` — opt a custom OpenAI-compatible endpoint into `priority`, `flex`, and `scale` request fields. This does not imply ultrafast support.
+- `supportsUltrafastTier` — opt a specific model into `service_tier: "ultrafast"` when the endpoint documents that capability. This is independent of `supportsServiceTier`; models without this flag fail closed.
 - `supportsUsageInStreaming` — send `stream_options: { include_usage: true }` to receive token usage on streaming responses. Default: `true`.
 - `maxTokensField` — `"max_completion_tokens"` or `"max_tokens"`. Default: auto.
 - `supportsToolChoice` — emit the `tool_choice` parameter when the caller forces a specific tool. Default: `true`. Set `false` for endpoints that 400 on `tool_choice` (e.g. DeepSeek when reasoning is on).
