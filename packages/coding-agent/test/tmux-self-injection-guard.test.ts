@@ -12,7 +12,7 @@ const env = {
 };
 
 function resolver(target: string): string | undefined {
-	if (target === "demo" || target === "demo:19.0" || target === ".") return "%47";
+	if (target === "demo" || target === "demo:19.0" || target === "self" || target === ".") return "%47";
 	return "%99";
 }
 
@@ -79,13 +79,14 @@ describe("tmux self-injection guard", () => {
 
 	it("uses env's effective socket environment when resolving named targets", async () => {
 		for (const [command, expectedTmpdir] of [
-			["env -u TMUX_TMPDIR tmux -L default send-keys -t demo x", undefined],
+			["env -u TMUX_TMPDIR tmux -L default send-keys -t self x", undefined],
 			["env -i tmux -L default send-keys -t demo x", undefined],
 			["env TMUX_TMPDIR=/tmp tmux -L default send-keys -t demo x", "/tmp"],
 		] as const) {
 			let resolvedTmpdir: string | undefined;
 			const localOptions = {
 				...options,
+				env: { ...env, TMUX_TMPDIR: "/tmp/foreign" },
 				resolvePaneId: async ({ target, env: resolverEnv }: { target: string; env: Record<string, string> }) => {
 					resolvedTmpdir = resolverEnv.TMUX_TMPDIR;
 					return resolver(target);
@@ -656,6 +657,21 @@ describe("tmux self-injection guard", () => {
 			).resolves.toMatchObject({
 				block: true,
 			});
+		});
+
+		it("does not discover commands after invalid shell builtin options", async () => {
+			for (const command of [
+				"builtin -x tmux send-keys -t %47 x",
+				"builtin --not-a-builtin-option tmux send-keys -t %47 x",
+				"command --help tmux send-keys -t %47 x",
+				"exec -x tmux send-keys -t %47 x",
+				"eval -x tmux send-keys -t %47 x",
+			]) {
+				await expect(checkTmuxSelfInjection(command, options)).resolves.toEqual({ block: false });
+			}
+			await expect(
+				checkTmuxSelfInjection("command --help tmux send-keys -t %47 x; tmux send-keys -t %47 x", options),
+			).resolves.toMatchObject({ block: true });
 		});
 
 		it("should allow bash script with -ce after operand", async () => {
@@ -1334,6 +1350,7 @@ describe("tmux self-injection guard", () => {
 			const script = "tmux send-keys -t %47 x";
 			for (const command of [
 				`bash <<'EOF'\n${script}\nEOF`,
+				`( bash ) <<'EOF'\n${script}\nEOF`,
 				`bash <<'EOF' 0<&0\n${script}\nEOF`,
 				`bash <<'EOF' 0<&00\n${script}\nEOF`,
 				`bash /dev/stdin <<'EOF'\n${script}\nEOF`,
@@ -1342,6 +1359,7 @@ describe("tmux self-injection guard", () => {
 				`bash -- - <<'EOF'\n${script}\nEOF`,
 				`bash -c bash <<'EOF'\n${script}\nEOF`,
 				`cat <<'EOF' | bash\n${script}\nEOF`,
+				`cat <<'EOF' | (bash)\n${script}\nEOF`,
 				`cat <<'EOF' |\nbash\n${script}\nEOF`,
 				`cat <<'EOF' |\\\nbash\n${script}\nEOF`,
 				`bash -c 'bash 3<<INNER\n:\nINNER\n' <<'OUTER'\n${script}\nOUTER`,
@@ -1354,6 +1372,21 @@ describe("tmux self-injection guard", () => {
 			]) {
 				await expect(checkTmuxSelfInjection(command, options)).resolves.toMatchObject({ block: true });
 			}
+		});
+
+		it("carries wrapper working directories into here-document shell payloads", async () => {
+			const targetCwd = "/tmp/target";
+			const localOptions = {
+				...options,
+				cwd: "/tmp/original",
+				env: { ...env, TMUX: `${targetCwd}/tmux.sock,12345,0` },
+			};
+			await expect(
+				checkTmuxSelfInjection(
+					`env -C ${targetCwd} bash <<'EOF'\ntmux -S tmux.sock send-keys -t %47 x\nEOF`,
+					localOptions,
+				),
+			).resolves.toMatchObject({ block: true });
 		});
 
 		it("inspects here-documents used as non-stdin shell script files", async () => {
@@ -1478,6 +1511,7 @@ describe("tmux self-injection guard", () => {
 				`cat <<'EOF'\n$(${document})\nEOF`,
 				`cat <<EOF\n\\$(${document})\nEOF`,
 				`cat <<'EOF' | cat\n${document}\nEOF`,
+				`( echo safe ) <<'EOF' | bash\n${document}\nEOF`,
 				`bash -c cat <<'EOF'\n${document}\nEOF`,
 				`bash -c 'bash <<INNER\n:\nINNER\n' <<'OUTER'\n${document}\nOUTER`,
 				`bash -s -c ':' <<'EOF'\n${document}\nEOF`,
@@ -1790,17 +1824,25 @@ describe("tmux self-injection guard", () => {
 			}
 		});
 
-		it("inspects commands following env null-output options", async () => {
+		it("does not discover commands after env null-output modes", async () => {
 			for (const command of [
 				"env -0 tmux send-keys -t %47 x",
 				"env -i0 tmux send-keys -t %47 x",
 				"env --null tmux send-keys -t %47 x",
 				"env --nu tmux send-keys -t %47 x",
 				"env -S '-0 tmux send-keys -t %47 x'",
-				"env -S '-0' tmux send-keys -t %47 x",
 				"env -S '--null tmux send-keys -t %47 x'",
+				"env -S '-i0 tmux send-keys -t %47 x'",
+				"env -S '-i -0 tmux send-keys -t %47 x'",
+				"env -S '-0' tmux send-keys -t %47 x",
 				"env -S '--null' tmux send-keys -t %47 x",
 			]) {
+				await expect(checkTmuxSelfInjection(command, options)).resolves.toEqual({ block: false });
+			}
+		});
+
+		it("still discovers commands when env -0 is an option operand", async () => {
+			for (const command of ["env -u -0 tmux send-keys -t %47 x", "env -S '-u -0 tmux send-keys -t %47 x'"]) {
 				await expect(checkTmuxSelfInjection(command, options)).resolves.toMatchObject({ block: true });
 			}
 		});

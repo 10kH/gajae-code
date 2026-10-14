@@ -48,7 +48,7 @@ const NON_EXECUTING_SUDO_OPTIONS = new Set([
 	"--version",
 	"--help",
 ]);
-const NON_EXECUTING_ENV_OPTIONS = new Set(["--help", "--version"]);
+const NON_EXECUTING_ENV_OPTIONS = new Set(["--help", "--null", "--version"]);
 const ENV_SIGNAL_OPTIONS = new Set(["--block-signal", "--default-signal", "--ignore-signal", "--list-signal-handling"]);
 const ASSIGNMENT_AWARE_WRAPPERS = new Set(["env", "sudo"]);
 const CONTROL_WORDS = new Set(["then", "do", "else", "fi", "done", "esac"]);
@@ -256,6 +256,7 @@ interface HereDocument {
 	stripTabs: boolean;
 	segment: number;
 	pipeline: number;
+	subshellDepth: number;
 	activeDescriptors: Set<number>;
 	stdin: boolean;
 	redirectOrder: number;
@@ -336,6 +337,20 @@ function matchingWrapperLongOption(wrapperName: string, option: string): string 
 	return matches.length === 1 ? matches[0] : undefined;
 }
 
+function isNonExecutingEnvOption(option: string): boolean {
+	if (option.startsWith("--")) {
+		const optionName = matchingWrapperLongOption("env", option.split("=")[0]);
+		return optionName !== undefined && NON_EXECUTING_ENV_OPTIONS.has(optionName);
+	}
+	if (!option.startsWith("-") || option === "-") return false;
+	for (let index = 1; index < option.length; index++) {
+		const shortOption = `-${option[index]}`;
+		if (shortOption === "-0") return true;
+		if (COMMAND_WRAPPERS_WITH_ARGS.env.optionsWithArg.has(shortOption)) break;
+	}
+	return false;
+}
+
 function wrapperOptionTakesNextArgument(wrapper: { name: string; spec: WrapperSpec }, option: string): boolean {
 	if (isLongOption(option)) {
 		const baseOption = option.split("=")[0];
@@ -373,12 +388,110 @@ function envSplitStringOption(option: string): { payload: string } | { payloadPe
 	return undefined;
 }
 
-function envSplitStringIsNonExecuting(splitString: string): boolean {
-	const firstWord = splitString.trimStart().split(/\s/, 1)[0];
-	if (firstWord === undefined) return false;
-	if (firstWord.startsWith("--")) {
-		const optionName = matchingWrapperLongOption("env", firstWord);
-		return optionName === "--help" || optionName === "--version";
+function splitEnvSplitString(splitString: string): string[] {
+	const parts: string[] = [];
+	let current = "";
+	let argumentStarted = false;
+	let quoted = false;
+	let quoteChar: "'" | '"' = "'";
+
+	for (let index = 0; index < splitString.length; index++) {
+		const character = splitString[index];
+		if (character === "\\" && splitString[index + 1] !== undefined) {
+			const next = splitString[index + 1];
+			if (next === "_") {
+				index++;
+				if (quoted) {
+					current += " ";
+					argumentStarted = true;
+				} else {
+					if (argumentStarted) parts.push(current);
+					current = "";
+					argumentStarted = false;
+				}
+			} else if (next === quoteChar || next === "'" || next === '"' || next === "\\") {
+				current += next;
+				argumentStarted = true;
+				index++;
+			} else {
+				current += character;
+				argumentStarted = true;
+			}
+		} else if (!quoted && (character === "'" || character === '"')) {
+			quoted = true;
+			quoteChar = character;
+			argumentStarted = true;
+		} else if (quoted && character === quoteChar) {
+			quoted = false;
+		} else if (!quoted && /\s/.test(character)) {
+			if (argumentStarted) parts.push(current);
+			current = "";
+			argumentStarted = false;
+		} else {
+			current += character;
+			argumentStarted = true;
+		}
+	}
+	if (argumentStarted) parts.push(current);
+	return parts;
+}
+
+function envSplitStringIsNonExecuting(splitString: string, depth = 0): boolean {
+	if (depth > MAX_INDIRECTION_DEPTH) return false;
+	const parts = splitEnvSplitString(splitString);
+	let skipNext = false;
+	let optionsTerminated = false;
+
+	for (let index = 0; index < parts.length; index++) {
+		const part = parts[index];
+		if (part === undefined) continue;
+		if (skipNext) {
+			skipNext = false;
+			continue;
+		}
+		if (optionsTerminated) return false;
+		if (part === "--") {
+			optionsTerminated = true;
+			continue;
+		}
+		if (isNonExecutingEnvOption(part)) return true;
+
+		if (part === "-S" || part === "--split-string") {
+			const nested = parts[index + 1];
+			if (nested !== undefined && envSplitStringIsNonExecuting(nested, depth + 1)) return true;
+			index++;
+			continue;
+		}
+		if (part.startsWith("-S") && part.length > 2) {
+			if (envSplitStringIsNonExecuting(part.slice(2), depth + 1)) return true;
+			continue;
+		}
+		if (part.startsWith("--split-string=")) {
+			if (envSplitStringIsNonExecuting(part.slice("--split-string=".length), depth + 1)) return true;
+			continue;
+		}
+		if (part.startsWith("--")) {
+			if (wrapperOptionTakesNextArgument({ name: "env", spec: COMMAND_WRAPPERS_WITH_ARGS.env }, part))
+				skipNext = true;
+			continue;
+		}
+		if (part.startsWith("-") && part !== "-") {
+			for (let optionIndex = 1; optionIndex < part.length; optionIndex++) {
+				const shortOption = `-${part[optionIndex]}`;
+				if (shortOption === "-S") {
+					const nested = part.slice(optionIndex + 1) || parts[index + 1];
+					if (nested !== undefined && envSplitStringIsNonExecuting(nested, depth + 1)) return true;
+					if (part.length === optionIndex + 1) index++;
+					break;
+				}
+				if (COMMAND_WRAPPERS_WITH_ARGS.env.optionsWithArg.has(shortOption)) {
+					if (optionIndex === part.length - 1) skipNext = true;
+					break;
+				}
+			}
+			continue;
+		}
+		if (!isAssignment(part)) break;
 	}
 	return false;
 }
@@ -391,6 +504,19 @@ function wrapperMayInvokeShellBuiltins(name: string, assignmentAware: boolean): 
 		name === "exec" ||
 		(name === "time" && assignmentAware)
 	);
+}
+
+function builtinWrapperRejectsOption(name: string, option: string): boolean {
+	if (option === "--") return false;
+	if (name === "builtin" || name === "eval") return true;
+	if (name === "command") return !/^-[pVv]+$/.test(option);
+	if (name === "exec") {
+		for (const flag of option.slice(1)) {
+			if (flag === "a") return false;
+			if (flag !== "c" && flag !== "l") return true;
+		}
+	}
+	return false;
 }
 
 function decodeAnsiCQuotedString(command: string, start: number): { value: string; end: number } | undefined {
@@ -615,6 +741,7 @@ function tokenize(command: string): TokenizeResult {
 					stripTabs: redirectionTargetStripTabs,
 					segment,
 					pipeline,
+					subshellDepth,
 					activeDescriptors: new Set([descriptor]),
 					stdin: redirectionTargetFd === undefined || redirectionTargetFd === 0,
 					redirectOrder: redirectOrder ?? 0,
@@ -803,26 +930,22 @@ function tokenize(command: string): TokenizeResult {
 			) {
 				// This is an option (but not a negative number like -5)
 				// Don't touch skipNextArg yet; it will be consumed by the next argument
-				const envLongOption = text.startsWith("--")
-					? matchingWrapperLongOption("env", text.split("=")[0])
-					: undefined;
 				const wrapperLongOption =
 					text.startsWith("--") && wrapperCommand !== undefined
 						? matchingWrapperLongOption(wrapperCommand.name, text.split("=")[0])
 						: undefined;
 				const nonExecutingSudoMode = wrapperCommand?.name === "sudo" && NON_EXECUTING_SUDO_OPTIONS.has(text);
-				const nonExecutingEnvMode =
-					wrapperCommand?.name === "env" &&
-					(NON_EXECUTING_ENV_OPTIONS.has(text) ||
-						(envLongOption !== undefined && NON_EXECUTING_ENV_OPTIONS.has(envLongOption)));
+				const nonExecutingEnvMode = wrapperCommand?.name === "env" && isNonExecutingEnvOption(text);
+				const invalidBuiltinOption =
+					wrapperCommand !== undefined && builtinWrapperRejectsOption(wrapperCommand.name, text);
 				const nonExecutingCoreutilsMode =
 					wrapperCommand !== undefined &&
 					NON_EXECUTING_COREUTILS_WRAPPERS.has(wrapperCommand.name) &&
 					(NON_EXECUTING_COREUTILS_OPTIONS.has(text) ||
 						(wrapperLongOption !== undefined && NON_EXECUTING_COREUTILS_OPTIONS.has(wrapperLongOption)) ||
 						NON_EXECUTING_WRAPPER_OPTIONS[wrapperCommand.name]?.has(text) === true);
-				if (nonExecutingSudoMode || nonExecutingEnvMode || nonExecutingCoreutilsMode) {
-					// These utility modes never execute the supplied command.
+				if (nonExecutingSudoMode || nonExecutingEnvMode || invalidBuiltinOption || nonExecutingCoreutilsMode) {
+					// These modes never execute the supplied command.
 					executionSuppressed = true;
 					wrapperCommand = undefined;
 					skipNextArg = false;
@@ -1108,7 +1231,7 @@ function tokenize(command: string): TokenizeResult {
 			if (ch === "(") subshellDepth++;
 			else if (ch === ")") subshellDepth = Math.max(0, subshellDepth - 1);
 			if (
-				(ch !== "|" && !(ch === "&" && command[index - 1] === "|")) ||
+				(ch !== "(" && ch !== ")" && ch !== "|" && !(ch === "&" && command[index - 1] === "|")) ||
 				(ch === "|" && command[index - 1] === "|")
 			) {
 				pipeline++;
@@ -1226,50 +1349,7 @@ function targetFromArgs(args: string[]): string | undefined {
 function reconstructCommandFromEnvSplit(splitString: string, depth = 0): string[] | undefined {
 	if (depth > MAX_INDIRECTION_DEPTH) return undefined;
 
-	const parts: string[] = [];
-	let current = "";
-	let argumentStarted = false;
-	let quoted = false;
-	let quoteChar: "'" | '"' = "'";
-
-	for (let i = 0; i < splitString.length; i++) {
-		const ch = splitString[i];
-		if (ch === "\\" && splitString[i + 1] !== undefined) {
-			const next = splitString[i + 1];
-			if (next === "_") {
-				i++;
-				if (quoted) {
-					current += " ";
-					argumentStarted = true;
-				} else {
-					if (argumentStarted) parts.push(current);
-					current = "";
-					argumentStarted = false;
-				}
-			} else if (next === quoteChar || next === "'" || next === '"' || next === "\\") {
-				current += next;
-				argumentStarted = true;
-				i++;
-			} else {
-				current += ch;
-				argumentStarted = true;
-			}
-		} else if (!quoted && (ch === "'" || ch === '"')) {
-			quoted = true;
-			quoteChar = ch;
-			argumentStarted = true;
-		} else if (quoted && ch === quoteChar) {
-			quoted = false;
-		} else if (!quoted && /\s/.test(ch)) {
-			if (argumentStarted) parts.push(current);
-			current = "";
-			argumentStarted = false;
-		} else {
-			current += ch;
-			argumentStarted = true;
-		}
-	}
-	if (argumentStarted) parts.push(current);
+	const parts = splitEnvSplitString(splitString);
 
 	const assignments: string[] = [];
 	const envShortOptionsWithArg = new Set(["-u", "-C", "-a", "-P"]);
@@ -1293,9 +1373,8 @@ function reconstructCommandFromEnvSplit(splitString: string, depth = 0): string[
 			optionsTerminated = true;
 			continue;
 		}
-		if (part === "--help" || part === "--version") return undefined;
+		if (isNonExecutingEnvOption(part)) return undefined;
 		const longOptionName = part.split("=")[0];
-		if (matchingWrapperLongOption("env", longOptionName) === "--null") continue;
 		if (ENV_SIGNAL_OPTIONS.has(longOptionName)) continue;
 
 		let splitString: string | undefined;
@@ -2054,11 +2133,13 @@ function sourceBuiltinReadsStdin(tokens: Token[], commandIndex: number, segment:
 	return false;
 }
 
-function hasShellStdinConsumer(tokens: Token[], segment: number, depth = 0, hereDocumentOrder?: number): boolean {
+function shellStdinConsumerIndex(tokens: Token[], segment: number, hereDocumentOrder?: number): number | undefined {
 	const segmentTokens = tokens.filter(token => token.segment === segment);
 	for (let index = 0; index < segmentTokens.length; index++) {
 		const token = segmentTokens[index];
-		if (!token.commandStart || token.executionSuppressed || isCommandLookup(segmentTokens, index)) continue;
+		if (!token.commandStart || token.executionSuppressed || isCommandLookup(segmentTokens, index)) {
+			continue;
+		}
 		const shellIndex = shellRunnerIndex(segmentTokens, index, segment);
 		const readsStdin =
 			shellIndex !== undefined &&
@@ -2069,9 +2150,15 @@ function hasShellStdinConsumer(tokens: Token[], segment: number, depth = 0, here
 			(token.stdinRedirectSource !== "here-document" && token.stdinRedirectSource !== "here-string") ||
 			(token.stdinRedirectOrder === hereDocumentOrder && hereDocumentOrder !== undefined);
 		if ((readsStdin || sourcesStdin) && readsRedirectedScript && !xargsConsumesStdin(segmentTokens, index, segment)) {
-			return true;
+			return tokens.indexOf(token);
 		}
 	}
+	return undefined;
+}
+
+function hasShellStdinConsumer(tokens: Token[], segment: number, depth = 0, hereDocumentOrder?: number): boolean {
+	if (shellStdinConsumerIndex(tokens, segment, hereDocumentOrder) !== undefined) return true;
+	const segmentTokens = tokens.filter(token => token.segment === segment);
 	if (depth >= MAX_INDIRECTION_DEPTH) return false;
 	for (let index = 0; index < segmentTokens.length; index++) {
 		const token = segmentTokens[index];
@@ -2379,19 +2466,40 @@ function collectHereDocumentCommandSubstitutions(body: string): string[] {
 	return [...substitutions];
 }
 
+function hereDocumentPipelineSegments(tokens: Token[], hereDocument: HereDocument): Set<number> {
+	const groupedRedirect = !tokens.some(token => token.segment === hereDocument.segment && token.commandStart);
+	return new Set(
+		tokens
+			.filter(
+				token =>
+					token.pipeline === hereDocument.pipeline &&
+					(!groupedRedirect || token.subshellDepth > hereDocument.subshellDepth),
+			)
+			.map(token => token.segment),
+	);
+}
+
 function collectShellStdinPayloads(
 	tokens: Token[],
 	hereDocuments: HereDocument[],
 	scripts: ShellScript[],
 	cwd: string,
 	depth = 0,
-): string[] {
-	const payloads = hereDocuments.flatMap(hereDocument =>
-		(hereDocument.kind === "here-document" && hereDocument.delimiterQuoted) ||
-		(hereDocument.kind === "here-string" && !hereDocument.expandsCommandSubstitutions)
-			? []
-			: collectHereDocumentCommandSubstitutions(joinUnquotedHereDocumentLines(hereDocument.body)),
-	);
+	cwdUnknown = false,
+	env: Record<string, string | undefined> = process.env,
+): ShellPayload[] {
+	const payloads: ShellPayload[] = [];
+	for (const hereDocument of hereDocuments) {
+		if (
+			(hereDocument.kind === "here-document" && hereDocument.delimiterQuoted) ||
+			(hereDocument.kind === "here-string" && !hereDocument.expandsCommandSubstitutions)
+		) {
+			continue;
+		}
+		for (const content of collectHereDocumentCommandSubstitutions(joinUnquotedHereDocumentLines(hereDocument.body))) {
+			payloads.push({ content, segment: hereDocument.segment, cwd, cwdUnknown });
+		}
+	}
 	const executableHereDocuments = new Set<HereDocument>();
 	for (let index = 0; index < hereDocuments.length; index++) {
 		const hereDocument = hereDocuments[index];
@@ -2421,13 +2529,9 @@ function collectShellStdinPayloads(
 			if (consumedAsShellInput) executableHereDocuments.add(hereDocument);
 			continue;
 		}
-		const commandRedirectOrder = tokens.find(
-			token => token.segment === hereDocument.segment && token.commandStart,
-		)?.stdinRedirectOrder;
-		if (commandRedirectOrder !== hereDocument.redirectOrder) continue;
-		const pipelineSegments = new Set(
-			tokens.filter(token => token.pipeline === hereDocument.pipeline).map(token => token.segment),
-		);
+		const commandToken = tokens.find(token => token.segment === hereDocument.segment && token.commandStart);
+		if (commandToken && commandToken.stdinRedirectOrder !== hereDocument.redirectOrder) continue;
+		const pipelineSegments = hereDocumentPipelineSegments(tokens, hereDocument);
 		let consumed = false;
 		for (const segment of pipelineSegments) {
 			const sourceOrder = segment === hereDocument.segment ? hereDocument.redirectOrder : undefined;
@@ -2455,7 +2559,40 @@ function collectShellStdinPayloads(
 			}
 		}
 	}
-	for (const hereDocument of executableHereDocuments) payloads.push(hereDocument.body);
+	for (const hereDocument of executableHereDocuments) {
+		const script = scripts.find(
+			candidate =>
+				candidate.segment === hereDocument.segment &&
+				candidate.fileDescriptor !== undefined &&
+				hereDocument.activeDescriptors.has(candidate.fileDescriptor),
+		);
+		let payloadCwd = script?.cwd ?? cwd;
+		let payloadCwdUnknown = script?.cwdUnknown ?? cwdUnknown;
+		const candidateSegments = hereDocument.stdin
+			? hereDocumentPipelineSegments(tokens, hereDocument)
+			: new Set([hereDocument.segment]);
+		for (const segment of candidateSegments) {
+			const redirectOrders = hereDocument.stdin
+				? [segment === hereDocument.segment ? hereDocument.redirectOrder : undefined]
+				: [...hereDocument.stdinRedirectOrders];
+			let consumerIndex: number | undefined;
+			for (const order of redirectOrders) {
+				consumerIndex = shellStdinConsumerIndex(tokens, segment, order);
+				if (consumerIndex !== undefined) break;
+			}
+			if (consumerIndex === undefined) continue;
+			const commandCwd = commandWorkingDirectory(tokens, consumerIndex, cwd, env);
+			payloadCwd = commandCwd ?? cwd;
+			payloadCwdUnknown = cwdUnknown || commandCwd === undefined;
+			break;
+		}
+		payloads.push({
+			content: hereDocument.body,
+			segment: hereDocument.segment,
+			cwd: payloadCwd,
+			cwdUnknown: payloadCwdUnknown,
+		});
+	}
 	return payloads;
 }
 
@@ -2826,7 +2963,9 @@ function shellPayloadUsesScriptDescriptor(
 					(hereDocument.kind === "here-string" && !hereDocument.expandsCommandSubstitutions)
 						? []
 						: collectHereDocumentCommandSubstitutions(joinUnquotedHereDocumentLines(hereDocument.body));
-				if (stdinPayloads.includes(hereDocument.body)) hereDocumentPayloads.push(hereDocument.body);
+				if (stdinPayloads.some(payload => payload.content === hereDocument.body)) {
+					hereDocumentPayloads.push(hereDocument.body);
+				}
 				if (hereDocumentPayloads.length === 0) continue;
 				const closed = shellDescriptorsClosedBefore(nestedTokens, hereDocument.segment);
 				const available = new Set([...activeDescriptors].filter(descriptor => !closed.has(descriptor)));
@@ -3339,8 +3478,14 @@ async function checkTmuxSelfInjectionAtCwd(
 			}
 		}
 		const shellScripts = collectShellScripts(tokens, cwd, cwdUnknown, options.executionEnv ?? env);
-		for (const payload of collectShellStdinPayloads(tokens, hereDocuments, shellScripts, cwd)) {
-			const result = await checkTmuxSelfInjectionAtCwd(payload, options, depth + 1, cwd, cwdUnknown);
+		for (const payload of collectShellStdinPayloads(tokens, hereDocuments, shellScripts, cwd, 0, cwdUnknown, env)) {
+			const result = await checkTmuxSelfInjectionAtCwd(
+				payload.content,
+				options,
+				depth + 1,
+				payload.cwd ?? cwd,
+				payload.cwdUnknown ?? cwdUnknown,
+			);
 			if (result.block) return result;
 		}
 		for (const payload of collectShellPayloadsWithContext(tokens, cwd, cwdUnknown, env)) {
