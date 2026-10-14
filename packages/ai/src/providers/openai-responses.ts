@@ -49,6 +49,7 @@ import {
 	resolveOpenAISdkRequestTimeoutMs,
 } from "../utils/idle-iterator";
 import { parseGitHubCopilotApiKey } from "../utils/oauth/github-copilot";
+import { isLoopbackHostname } from "../utils/parse-bind";
 import { notifyProviderResponse } from "../utils/provider-response";
 import { callWithCopilotModelRetry } from "../utils/retry";
 import { resolveRetryBudget } from "../utils/retry-budget";
@@ -169,27 +170,47 @@ function isCanonicalOpenAIAffinityOrigin(baseUrl: string | undefined): boolean {
 	}
 }
 /**
- * Official OpenAI keeps its existing session-routing behavior even when prompt
- * caching is disabled. Relay affinity is opt-in, cache-enabled, and limited to
- * explicitly supported openai or unknown provider ids so known non-target
- * transports cannot inherit the headers.
+ * True for http(s) origins that resolve to the caller's own machine. A loopback
+ * relay runs in the same trust scope as the process that dials it, so the
+ * ChatGPT codex backend contract applies: without a stable session identity the
+ * backend cannot reuse the warmed prompt prefix, and every turn replays the
+ * whole context. Remote custom relays stay opt-in.
  */
+function isLoopbackRelayOrigin(baseUrl: string | undefined): boolean {
+	if (!baseUrl) return false;
+	try {
+		const url = new URL(baseUrl);
+		if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+		return isLoopbackHostname(url.hostname);
+	} catch {
+		return false;
+	}
+}
 
+/**
+ * Official OpenAI keeps its existing session-routing behavior even when prompt
+ * caching is disabled. Relay affinity is cache-enabled and limited to explicitly
+ * supported openai or unknown provider ids so known non-target transports cannot
+ * inherit the headers. Custom relays default on for loopback origins, where the
+ * caller owns the endpoint, and an explicit `false` opts out everywhere.
+ */
 function shouldSendOpenAIResponsesSessionHeaders(
 	model: Model<"openai-responses">,
 	baseUrl: string | undefined,
 	cacheRetention: CacheRetention,
 ): boolean {
+	const affinityCompat = model.compat?.supportsResponsesSessionAffinity;
 	if (model.provider === "openai") {
 		if (isCanonicalOpenAIAffinityOrigin(baseUrl)) return true;
-		return cacheRetention !== "none" && model.compat?.supportsResponsesSessionAffinity === true;
+		if (cacheRetention === "none" || affinityCompat === false) return false;
+		return affinityCompat === true || isLoopbackRelayOrigin(baseUrl);
 	}
-	if (cacheRetention === "none" || isKnownProvider(model.provider)) {
+	if (cacheRetention === "none" || isKnownProvider(model.provider) || affinityCompat === false) {
 		return false;
 	}
 	return (
 		Boolean(baseUrl?.trim()) &&
-		model.compat?.supportsResponsesSessionAffinity === true &&
+		(affinityCompat === true || isLoopbackRelayOrigin(baseUrl)) &&
 		!isCanonicalOpenAIAffinityOrigin(baseUrl)
 	);
 }
