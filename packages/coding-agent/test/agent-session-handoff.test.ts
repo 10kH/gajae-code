@@ -732,7 +732,7 @@ describe("AgentSession handoff", () => {
 
 		session.agent.emitExternalEvent({ type: "message_end", message: assistantMessage });
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMessage] });
-		await Bun.sleep(20);
+		await waitFor(() => handoffSpy.mock.calls.length === 1);
 
 		expect(handoffSpy).toHaveBeenCalledTimes(1);
 		expect(handoffSpy).toHaveBeenCalledWith(expect.stringContaining("Threshold-triggered maintenance"), {
