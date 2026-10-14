@@ -86,7 +86,7 @@ function makeBridge(outcome: ClientBridgePermissionOutcome): ClientBridge {
 async function createSession(
 	tools: AgentTool[],
 	bridge?: ClientBridge,
-	permissionMode: "allow" | "prompt" = "prompt",
+	permissionMode: "allow" | "prompt" | "deny" = "prompt",
 	extensionRunner?: ExtensionRunner,
 ): Promise<AgentSession> {
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -1087,4 +1087,112 @@ it("read tool: requestPermission is never called for non-gated tools", async () 
 
 	expect(permissionSpy).toHaveBeenCalledTimes(0);
 	expect(readTool.executeCalls).toBe(1);
+});
+
+it("computer tool takes the ACP permission path before executing", async () => {
+	const computerTool = makeFakeTool("computer");
+	const requests: ClientBridgePermissionToolCall[] = [];
+	const bridge: ClientBridge = {
+		capabilities: { requestPermission: true },
+		async requestPermission(toolCall) {
+			requests.push(toolCall);
+			return { outcome: "selected", optionId: "allow_once", kind: "allow_once" };
+		},
+	};
+	const permissionSpy = spyOn(bridge, "requestPermission");
+	session = await createSession([computerTool], bridge);
+
+	await session.setActiveToolsByName(["computer"]);
+	const wrapped = session.agent.state.tools.find(t => t.name === "computer");
+	expect(wrapped).toBeDefined();
+
+	await wrapped!.execute("call-computer", { action: "screenshot" }, undefined, undefined as never, undefined as never);
+
+	expect(permissionSpy).toHaveBeenCalledTimes(1);
+	expect(requests.map(({ toolName, title }) => ({ toolName, title }))).toEqual([
+		{ toolName: "computer", title: "Computer screenshot" },
+	]);
+	expect(computerTool.executeCalls).toBe(1);
+});
+
+it("computer tool permission rejection prevents execution", async () => {
+	const computerTool = makeFakeTool("computer");
+	const bridge = makeBridge({ outcome: "selected", optionId: "reject_once", kind: "reject_once" });
+	session = await createSession([computerTool], bridge);
+
+	await session.setActiveToolsByName(["computer"]);
+	const wrapped = session.agent.state.tools.find(t => t.name === "computer");
+	expect(wrapped).toBeDefined();
+
+	await expect(
+		wrapped!.execute(
+			"call-computer-reject",
+			{ action: "click", x: 1, y: 2 },
+			undefined,
+			undefined as never,
+			undefined as never,
+		),
+	).rejects.toThrow(/rejected by user \(computer\)/);
+	expect(computerTool.executeCalls).toBe(0);
+});
+
+it("computer tool is rejected when the session permission mode is deny", async () => {
+	const computerTool = makeFakeTool("computer");
+	const bridge = makeBridge({ outcome: "selected", optionId: "allow_once", kind: "allow_once" });
+	const permissionSpy = spyOn(bridge, "requestPermission");
+	session = await createSession([computerTool], bridge, "deny");
+
+	await session.setActiveToolsByName(["computer"]);
+	const wrapped = session.agent.state.tools.find(t => t.name === "computer");
+	expect(wrapped).toBeDefined();
+
+	await expect(
+		wrapped!.execute(
+			"call-computer-deny",
+			{ action: "type", text: "hello" },
+			undefined,
+			undefined as never,
+			undefined as never,
+		),
+	).rejects.toThrow(/rejected by session permission policy \(computer\)/);
+	expect(permissionSpy).not.toHaveBeenCalled();
+	expect(computerTool.executeCalls).toBe(0);
+});
+
+it("still allows a tool outside the permission set to run without an ACP prompt", async () => {
+	const outsideTool = makeFakeTool("browser");
+	const bridge = makeBridge({ outcome: "cancelled" });
+	const permissionSpy = spyOn(bridge, "requestPermission");
+	session = await createSession([outsideTool], bridge);
+
+	await session.setActiveToolsByName(["browser"]);
+	const wrapped = session.agent.state.tools.find(t => t.name === "browser");
+	expect(wrapped).toBeDefined();
+
+	await wrapped!.execute("call-browser", { action: "screenshot" }, undefined, undefined as never, undefined as never);
+
+	expect(permissionSpy).not.toHaveBeenCalled();
+	expect(outsideTool.executeCalls).toBe(1);
+});
+
+it("still allows the computer tool when the session permission mode is allow", async () => {
+	const computerTool = makeFakeTool("computer");
+	const bridge = makeBridge({ outcome: "selected", optionId: "reject_once", kind: "reject_once" });
+	const permissionSpy = spyOn(bridge, "requestPermission");
+	session = await createSession([computerTool], bridge, "allow");
+
+	await session.setActiveToolsByName(["computer"]);
+	const wrapped = session.agent.state.tools.find(t => t.name === "computer");
+	expect(wrapped).toBeDefined();
+
+	await wrapped!.execute(
+		"call-computer-allow",
+		{ action: "screenshot" },
+		undefined,
+		undefined as never,
+		undefined as never,
+	);
+
+	expect(permissionSpy).not.toHaveBeenCalled();
+	expect(computerTool.executeCalls).toBe(1);
 });

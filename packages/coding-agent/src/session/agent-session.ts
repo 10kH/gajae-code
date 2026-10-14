@@ -2001,7 +2001,7 @@ async function discardPreparedNewSessionAfterFailure(
 // ============================================================================
 
 /** Tools that require user permission before execution when an ACP client is connected. */
-const PERMISSION_REQUIRED_TOOLS = new Set(["bash", "monitor", "eval", "edit", "delete", "move", "github"]);
+const PERMISSION_REQUIRED_TOOLS = new Set(["bash", "monitor", "eval", "edit", "delete", "move", "github", "computer"]);
 
 function isShellExecutionPermissionTool(toolName: string): boolean {
 	return toolName === "bash" || toolName === "monitor";
@@ -2126,6 +2126,10 @@ function getPermissionIntent(
 		};
 	}
 	if (toolName === "github") return githubPermissionIntent(args);
+	if (toolName === "computer") {
+		const action = getStringProperty(a, "action");
+		return { toolName, title: action ? `Computer ${action}` : toolName, cacheKey: toolName };
+	}
 	return undefined;
 }
 
