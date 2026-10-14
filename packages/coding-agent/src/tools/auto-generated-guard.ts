@@ -36,6 +36,8 @@ const AUTO_GENERATED_HEADER_MARKERS: readonly RegExp[] = [
 	/\bcode\s+generated\s+by\s+[a-z0-9_.-]+/i,
 	/\bthis\s+file\s+was\s+automatically\s+generated\b/i,
 	new RegExp(`\\bgenerated\\s+by\\s+${KNOWN_GENERATOR_PATTERN}\\b`, "i"),
+	/\bgenerated\s+by\s+scripts\/[a-z0-9_./-]+/i,
+	/\bauto-generated\s+by\s+[a-z0-9_./-]+/i,
 ];
 
 type CommentStyle = "slash" | "hash" | "sql" | "html";
@@ -100,6 +102,7 @@ const AUTO_GENERATED_FILENAME_PATTERNS = [
 	/_pb2\.py$/,
 	/_pb2_grpc\.py$/,
 	/\.gen\.(go|ts|js|py)$/,
+	/\.generated\.ts$/,
 	/^generated\.(go|ts|js|py)$/,
 	/\.swagger\.json$/,
 	/\.openapi\.json$/,
