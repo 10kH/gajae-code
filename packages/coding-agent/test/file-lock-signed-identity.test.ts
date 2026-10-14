@@ -163,6 +163,13 @@ async function signedIdentityFixture(component: "root" | "info" | "both", detach
 			pathObservations.push(`snapshot ${target}`);
 			const captured = snapshotDirectoryTree(target);
 			if (!captured.ok || !captured.snapshot) return captured;
+			// Only the fixture lock tree carries the signed IDs that the lstat spy
+			// reports. Staging trees (e.g. Windows acquisition) keep their real IDs so
+			// their snapshot stays consistent with their unmodified lstat identity.
+			const isFixtureLockTree = [lock, parked, cleanupLock, cleanupParked].some(candidate =>
+				sameFixturePath(target, candidate),
+			);
+			if (!isFixtureLockTree) return captured;
 			originals.set(target, captured.snapshot);
 			return { ok: true, snapshot: nativeSnapshot(captured.snapshot) };
 		},
