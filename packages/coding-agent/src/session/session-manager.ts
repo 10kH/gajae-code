@@ -3636,7 +3636,12 @@ function isLinkedWorktreePeer(a: string, b: string): boolean {
  */
 async function readTerminalBreadcrumb(
 	cwd: string,
-	options: { sessionsRoot?: string; allowExplicitOutsideRoot?: boolean } = {},
+	options: {
+		sessionsRoot?: string;
+		allowExplicitOutsideRoot?: boolean;
+		/** Managed continuation inventory, including project-local transcripts. */
+		continuationInventory?: readonly SessionInfo[];
+	} = {},
 ): Promise<string | null> {
 	const terminalId = getTerminalId();
 	if (!terminalId) return null;
@@ -3695,11 +3700,21 @@ async function readTerminalBreadcrumb(
 			candidate => !isStagedSessionPath(candidate.path) && candidate.sessionId === header.id,
 		);
 		if (byIdentity) return byIdentity.path;
-		// Not an owned candidate. A file inside the sessions root stays rejected.
-		// Managed resume also rejects a file outside that root. An explicit
-		// destination still receives the outside path; the caller applies containment.
+		// Not an owned managed candidate. A file inside the sessions root stays
+		// rejected. A file outside that root is resumed only when this continuation
+		// inventory already contains it. An explicit destination still receives an
+		// unmatched outside path; the caller applies containment.
 		const resolvedFile = path.resolve(sessionFile);
-		if (!options.allowExplicitOutsideRoot || pathIsWithin(sessionsRoot, resolvedFile)) return null;
+		const insideSessionsRoot = pathIsWithin(sessionsRoot, resolvedFile);
+		if (
+			!insideSessionsRoot &&
+			options.continuationInventory?.some(
+				session => session.id === header.id && path.resolve(session.path) === resolvedFile,
+			)
+		) {
+			return resolvedFile;
+		}
+		if (!options.allowExplicitOutsideRoot || insideSessionsRoot) return null;
 		return resolvedFile;
 	} catch (err) {
 		if (!isEnoent(err)) logger.debug("Terminal breadcrumb read failed", { err });
@@ -23053,7 +23068,12 @@ export class SessionManager {
 					);
 
 		const terminalSession = await readTerminalBreadcrumb(cwd, {
-			...(destination.kind === "managed" ? { sessionsRoot: destination.securityContext.sessionsRoot } : {}),
+			...(destination.kind === "managed"
+				? {
+						sessionsRoot: destination.securityContext.sessionsRoot,
+						continuationInventory: managedCandidates,
+					}
+				: {}),
 			allowExplicitOutsideRoot: destination.kind === "explicit",
 		});
 		const terminalSessionIsInExplicitRoot = (() => {

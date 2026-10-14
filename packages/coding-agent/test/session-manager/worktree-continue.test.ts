@@ -217,6 +217,39 @@ describe("continueRecent with --worktree sessions", () => {
 		}
 	});
 
+	it("resumes an older project-local breadcrumb ahead of a newer sibling", async () => {
+		const projectDir = path.join(repo, ".gjc", "sessions");
+		fs.mkdirSync(projectDir, { recursive: true });
+		const older = path.join(projectDir, "older-project.jsonl");
+		const newer = path.join(projectDir, "newer-project.jsonl");
+		const writeProject = (file: string, id: string): void => {
+			fs.writeFileSync(
+				file,
+				`${JSON.stringify({ type: "session", id, timestamp: "2025-01-01T00:00:00Z", cwd: repo, version: 3 })}\n${JSON.stringify({ type: "message", id: "1", parentId: null, timestamp: "2025-01-01T00:00:01Z", message: { role: "user", content: id, timestamp: 1 } })}\n`,
+			);
+		};
+		writeProject(older, "older-project-session");
+		writeProject(newer, "newer-project-session");
+		const olderTime = new Date("2020-01-01T00:00:00Z");
+		const newerTime = new Date("2024-06-01T00:00:00Z");
+		fs.utimesSync(older, olderTime, olderTime);
+		fs.utimesSync(newer, newerTime, newerTime);
+		expect(fs.statSync(newer).mtimeMs).toBeGreaterThan(fs.statSync(older).mtimeMs);
+		const listed = await SessionManager.listManagedForResumePickerReadOnly(repo);
+		expect(listed.map(session => session.id)).toEqual(["newer-project-session", "older-project-session"]);
+		const newerBefore = fs.readFileSync(newer, "utf8");
+		writeBreadcrumb(repo, older);
+
+		const resumed = await SessionManager.continueRecent(repo);
+		try {
+			expect(resumed.getSessionId()).toBe("older-project-session");
+			expect(path.resolve(resumed.getSessionFile() ?? "")).toBe(path.resolve(older));
+			expect(fs.readFileSync(newer, "utf8")).toBe(newerBefore);
+		} finally {
+			await resumed.close();
+		}
+	});
+
 	it("does not resume a breadcrumb outside an explicit session directory", async () => {
 		const explicitDir = path.join(root, "explicit-sessions-contained");
 		const inside = path.join(explicitDir, "inside.jsonl");
