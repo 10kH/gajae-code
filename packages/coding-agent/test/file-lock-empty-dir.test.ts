@@ -488,7 +488,7 @@ test.each([
 			},
 			{ retries: 1, retryDelayMs: 1, staleMs: 0 },
 		),
-	).rejects.toMatchObject({ code: "acquire_timeout" });
+	).rejects.toMatchObject({ code: "orphan_transition" });
 	expect(firstCallbackEntered).toBe(false);
 	expect(transitionRemovalAttempts).toBe(transientRefusal === "thrown_replay" ? 1 : 2);
 	await fs.lstat(transitionPath);
@@ -531,7 +531,7 @@ test("rolls back a Windows publication when retirement appears before owner regi
 
 	await expect(
 		withFileLock(filePath, async () => undefined, { retries: 1, retryDelayMs: 1, staleMs: 0 }),
-	).rejects.toMatchObject({ code: "acquire_timeout" });
+	).rejects.toMatchObject({ code: "orphan_transition" });
 
 	expect(transitionPublished).toBe(true);
 	await expect(fs.lstat(lockDir)).rejects.toMatchObject({ code: "ENOENT" });

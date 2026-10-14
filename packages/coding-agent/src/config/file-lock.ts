@@ -1700,12 +1700,14 @@ export interface GenericFileLockDirIdentity {
 }
 
 function sameStableFileLockIdentity(left: GenericFileLockDirIdentity, right: GenericFileLockDirIdentity): boolean {
+	const birthtimeMatches =
+		left.infoBirthtimeNs === "0" || right.infoBirthtimeNs === "0" || left.infoBirthtimeNs === right.infoBirthtimeNs;
 	return (
 		left.rootDev === right.rootDev &&
 		left.rootIno === right.rootIno &&
 		left.infoDev === right.infoDev &&
 		left.infoIno === right.infoIno &&
-		left.infoBirthtimeNs === right.infoBirthtimeNs
+		birthtimeMatches
 	);
 }
 
@@ -1721,6 +1723,25 @@ function sameFileLockContentEvidence(left: GenericFileLockDirIdentity, right: Ge
 
 function sameGenericFileLockDirIdentity(left: GenericFileLockDirIdentity, right: GenericFileLockDirIdentity): boolean {
 	return sameStableFileLockIdentity(left, right) && sameFileLockContentEvidence(left, right);
+}
+
+function fileLockDirIdentityFromNativeSnapshot(snapshot: NativeDirectoryTreeSnapshot): GenericFileLockDirIdentity {
+	const info = snapshot.entries.find(entry => entry.relativePath === "info");
+	if (info?.kind !== "file" || !info.sha256) throw new Error("file_lock_snapshot_missing_owner_identity");
+	return {
+		rootDev: snapshot.rootDev,
+		rootIno: snapshot.rootIno,
+		infoDev: info.dev,
+		infoIno: info.ino,
+		infoNlink: info.nlink,
+		infoSize: info.size,
+		infoMtimeNs: info.mtimeNs,
+		infoCtimeNs: info.ctimeNs,
+		// Native snapshots do not expose birthtime; the remaining inode and content
+		// evidence still binds this exact staged generation across publication.
+		infoBirthtimeNs: "0",
+		infoSha256: info.sha256,
+	};
 }
 
 let nativeExactRemovalUsable: boolean | undefined;
@@ -2333,6 +2354,9 @@ async function tryAcquireLock(
 	previousOwnerHostIds: readonly string[],
 	ownerToken = crypto.randomUUID(),
 	onAcquired?: () => void,
+	onPublished?: (owner: LockInfo) => void,
+	onPublicationRolledBack?: (owner: LockInfo) => void,
+	onPublicationFailed?: (owner: LockInfo, identity: GenericFileLockDirIdentity) => void,
 ): Promise<FileLockAcquisitionResult> {
 	await ensureLockParent(path.dirname(lockPath));
 	const afterParentMkdir = FileLockTestHooks.afterParentMkdir;
@@ -2421,6 +2445,7 @@ async function tryAcquireLock(
 			throw failure;
 		}
 		stagedSnapshot = staged.snapshot;
+		const stagedIdentity = fileLockDirIdentityFromNativeSnapshot(staged.snapshot);
 		const publication = FileLockTestHooks.nativePublicationBindings?.() ?? {
 			renameNoReplacePathAsync,
 			renameDirectoryNoReplacePathAsync,
@@ -2482,47 +2507,56 @@ async function tryAcquireLock(
 			throw failure;
 		}
 		removePending = false;
-		// The transition can appear after the pre-publication check only when the
-		// predecessor atomically detaches its lock before this no-replace publish.
-		// Roll this exact staged tree back to its UUID path before reporting
-		// contention; never delete or rename the predecessor's `.removing` tree.
-		if (stagedSnapshot) {
-			const transitionState = await classifyFileLockRemovalTransition(
-				destinationPath,
-				orphanTransitionAgeMs,
-				ownerHostId,
-				previousOwnerHostIds,
-			);
-			if (transitionState !== null) {
-				const publishedSnapshot = snapshotDirectoryTree(destinationPath);
-				if (
-					!publishedSnapshot.ok ||
-					!publishedSnapshot.snapshot ||
-					!sameFileLockTreeAfterPublication(stagedSnapshot, publishedSnapshot.snapshot)
-				) {
-					const failure = new Error(
-						`Failed to verify published file lock before transition rollback: ${publishedSnapshot.code ?? "identity_mismatch"}.`,
-					) as NodeJS.ErrnoException;
-					if (publishedSnapshot.code) failure.code = publishedSnapshot.code;
-					throw failure;
-				}
-				await rollbackPublishedFileLock(
-					canonicalParent,
+		try {
+			// Preserve exact-generation release authority before post-publication checks
+			// can throw; otherwise a live canonical owner can be left untracked locally.
+			onPublished?.(owner);
+			// The transition can appear after the pre-publication check only when the
+			// predecessor atomically detaches its lock before this no-replace publish.
+			// Roll this exact staged tree back to its UUID path before reporting
+			// contention; never delete or rename the predecessor's `.removing` tree.
+			if (stagedSnapshot) {
+				const transitionState = await classifyFileLockRemovalTransition(
 					destinationPath,
-					canonicalPendingPath,
-					publishedSnapshot.snapshot,
-					parentIdentity,
+					orphanTransitionAgeMs,
+					ownerHostId,
+					previousOwnerHostIds,
 				);
-				removePending = true;
-				return transitionState === "orphan_transition"
-					? { kind: "orphan_transition", path: fileLockRemovalTransitionPath(destinationPath) }
-					: null;
+				if (transitionState !== null) {
+					const publishedSnapshot = snapshotDirectoryTree(destinationPath);
+					if (
+						!publishedSnapshot.ok ||
+						!publishedSnapshot.snapshot ||
+						!sameFileLockTreeAfterPublication(stagedSnapshot, publishedSnapshot.snapshot)
+					) {
+						const failure = new Error(
+							`Failed to verify published file lock before transition rollback: ${publishedSnapshot.code ?? "identity_mismatch"}.`,
+						) as NodeJS.ErrnoException;
+						if (publishedSnapshot.code) failure.code = publishedSnapshot.code;
+						throw failure;
+					}
+					await rollbackPublishedFileLock(
+						canonicalParent,
+						destinationPath,
+						canonicalPendingPath,
+						publishedSnapshot.snapshot,
+						parentIdentity,
+					);
+					removePending = true;
+					onPublicationRolledBack?.(owner);
+					return transitionState === "orphan_transition"
+						? { kind: "orphan_transition", path: fileLockRemovalTransitionPath(destinationPath) }
+						: null;
+				}
 			}
+			// Published and transition-free above, so an onAcquired failure must
+			// propagate instead of retrying an acquisition that already owns the lock.
+			onAcquired?.();
+			return owner;
+		} catch (error) {
+			onPublicationFailed?.(owner, stagedIdentity);
+			throw error;
 		}
-		// Published and transition-free above, so an onAcquired failure must
-		// propagate instead of retrying an acquisition that already owns the lock.
-		onAcquired?.();
-		return owner;
 	} finally {
 		if (removePending) await fs.rm(pendingPath, { recursive: true, force: true }).catch(() => undefined);
 	}
@@ -2918,6 +2952,7 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 	for (; attempt < attemptBudget; attempt++) {
 		if (opts.signal?.aborted) throw opts.signal.reason ?? new Error("File lock acquisition aborted");
 		const localKey = await localLockKey(lockPath);
+		let publishedState: LocalLockState | undefined;
 		const priorRelease = localLockStates.get(localKey);
 		if (priorRelease && priorRelease.status !== "held" && pendingDetachedLockCleanups.has(priorRelease.owner)) {
 			await retryPendingLocalRelease(lockPath, localKey);
@@ -2931,6 +2966,25 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 			opts.previousOwnerHostIds ?? [],
 			ownerToken,
 			opts.onAcquired,
+			owner => {
+				const state: LocalLockState = { owner, status: "held" };
+				publishedState = state;
+				localLockStates.set(localKey, state);
+			},
+			owner => {
+				const state = publishedState;
+				if (!state || state.owner.owner_token !== owner.owner_token) return;
+				if (localLockStates.get(localKey) === state) localLockStates.delete(localKey);
+				if (publishedState === state) publishedState = undefined;
+			},
+			(owner, identity) => {
+				const state = publishedState;
+				if (!state || state.owner.owner_token !== owner.owner_token || localLockStates.get(localKey) !== state)
+					return;
+				fileLockDirIdentities.set(owner, identity);
+				state.status = "release_pending";
+				scheduleReleasePendingRetry(lockPath, localKey, state);
+			},
 		);
 		if (isFileLockOrphanTransition(result)) {
 			// Adoption is identity-bound and can be refused by a transient cleanup race.
@@ -2946,7 +3000,9 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 					result.path,
 				);
 		} else if (result) {
-			localLockStates.set(localKey, { owner: result, status: "held" });
+			const state = publishedState ?? { owner: result, status: "held" as const };
+			state.status = "held";
+			localLockStates.set(localKey, state);
 			return () => releaseLock(lockPath, result, localKey);
 		}
 		if (!contentionObserved) {

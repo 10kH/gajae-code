@@ -45,6 +45,7 @@ interface RemovalCall {
 
 afterEach(async () => {
 	vi.restoreAllMocks();
+	FileLockTestHooks.afterRemovalTransitionMissing = undefined;
 	FileLockTestHooks.nativePublicationBindings = undefined;
 	FileLockTestHooks.stagingIdentityEvidence = undefined;
 	FileLockTestHooks.nativeQuarantineBindings = undefined;
@@ -879,7 +880,43 @@ describe.skipIf(process.platform !== "linux")("file lock committed publication r
 		expect(await fs.readdir(root)).toEqual([]);
 	});
 
-	test("propagates onAcquired failure without retrying or entering protected work", async () => {
+	test("retains release authority when post-publication transition validation throws", async () => {
+		const { root, file, lock } = await makeFixture();
+		const failure = new Error("post-publication transition check failed");
+		let transitionChecks = 0;
+		let acquired = 0;
+		FileLockTestHooks.afterRemovalTransitionMissing = () => {
+			transitionChecks++;
+			if (transitionChecks === 2) throw failure;
+		};
+
+		await expect(
+			withFileLock(file, async () => "unexpected", {
+				...quickAcquire,
+				onAcquired: () => acquired++,
+			}),
+		).rejects.toBe(failure);
+		expect(transitionChecks).toBe(2);
+		expect(acquired).toBe(0);
+		expect(await fs.readdir(lock)).toEqual(["info"]);
+
+		FileLockTestHooks.afterRemovalTransitionMissing = undefined;
+		let entered = 0;
+		await expect(
+			withFileLock(
+				file,
+				async () => {
+					entered++;
+					return "recovered";
+				},
+				quickAcquire,
+			),
+		).resolves.toBe("recovered");
+		expect(entered).toBe(1);
+		expect(await fs.readdir(root)).toEqual([]);
+	});
+
+	test("retains release authority when onAcquired throws", async () => {
 		const { file, lock } = await makeFixture();
 		const publication = installPublicationFailure();
 		const failure = Object.assign(new Error("acquisition callback failed"), { code: "EACCES" });
@@ -900,6 +937,12 @@ describe.skipIf(process.platform !== "linux")("file lock committed publication r
 		expect(publication.fallback).toBe(1);
 		expect(await fs.readdir(lock)).toEqual(["info"]);
 		expect(await Bun.file(path.join(lock, "info")).text()).toBe(publication.originalInfo);
+		FileLockTestHooks.nativePublicationBindings = undefined;
+		await expect(withFileLock(file, async () => "recovered", quickAcquire)).resolves.toBe("recovered");
+		expect(entered).toBe(0);
+		expect(publication.primary).toBe(1);
+		expect(publication.fallback).toBe(1);
+		expect(await fs.readdir(path.dirname(lock))).toEqual([]);
 	});
 
 	test("preserves a preexisting removal transition without invoking publication", async () => {
