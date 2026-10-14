@@ -184,6 +184,65 @@ describe("Antigravity model discovery", () => {
 		expect(getBundledModel("google-antigravity", "gemini-3.1-pro-low")?.id).toBe("gemini-3.1-pro-low");
 	});
 
+	it("sends project in request body when project is provided", async () => {
+		let capturedRequestBody: unknown;
+		const fetcher = (async (_url: string, init?: RequestInit) => {
+			if (init?.body) {
+				capturedRequestBody = JSON.parse(init.body as string);
+			}
+			return new Response(
+				JSON.stringify({
+					models: {
+						"gemini-4-argon": {
+							displayName: "Gemini 4 Argon",
+							supportsImages: true,
+						},
+					},
+				}),
+				{ headers: { "content-type": "application/json" } },
+			);
+		}) as unknown as typeof fetch;
+
+		const models = await fetchAntigravityDiscoveryModels({
+			token: "test-token",
+			endpoint: "https://antigravity.example.test",
+			project: "test-project-123",
+			fetcher,
+		});
+
+		expect(models?.map(model => model.id)).toEqual(["gemini-4-argon"]);
+		expect(capturedRequestBody).toEqual({ project: "test-project-123" });
+	});
+
+	it("omits project from request body when project is not provided", async () => {
+		let capturedRequestBody: unknown;
+		const fetcher = (async (_url: string, init?: RequestInit) => {
+			if (init?.body) {
+				capturedRequestBody = JSON.parse(init.body as string);
+			}
+			return new Response(
+				JSON.stringify({
+					models: {
+						"gemini-3.1-pro-low": {
+							displayName: "Gemini 3.1 Pro (Low)",
+							supportsImages: true,
+						},
+					},
+				}),
+				{ headers: { "content-type": "application/json" } },
+			);
+		}) as unknown as typeof fetch;
+
+		const models = await fetchAntigravityDiscoveryModels({
+			token: "test-token",
+			endpoint: "https://antigravity.example.test",
+			fetcher,
+		});
+
+		expect(models?.map(model => model.id)).toEqual(["gemini-3.1-pro-low"]);
+		expect(capturedRequestBody).toEqual({});
+	});
+
 	it("filters retired selectors from fresh authoritative model caches", async () => {
 		const cacheDir = mkdtempSync(join(tmpdir(), "pi-ai-antigravity-model-cache-"));
 		cacheDirs.push(cacheDir);

@@ -154,7 +154,7 @@ export interface FetchAntigravityDiscoveryModelsOptions {
 	token: string;
 	/** Optional endpoint override. Defaults to Antigravity fallback endpoints. */
 	endpoint?: string;
-	/** Deprecated and ignored for antigravity discovery parity. */
+	/** Optional Google Cloud project ID for tier-gated model discovery. */
 	project?: string;
 	/** Optional user agent override. */
 	userAgent?: string;
@@ -189,6 +189,10 @@ export async function fetchAntigravityDiscoveryModels(
 	for (const endpoint of endpoints) {
 		let response: Response;
 		try {
+			const requestBody: Record<string, unknown> = {};
+			if (options.project) {
+				requestBody.project = options.project;
+			}
 			response = await fetcher(`${endpoint}${FETCH_AVAILABLE_MODELS_PATH}`, {
 				method: "POST",
 				headers: {
@@ -196,7 +200,7 @@ export async function fetchAntigravityDiscoveryModels(
 					"Content-Type": "application/json",
 					"User-Agent": options.userAgent ?? getAntigravityUserAgent(),
 				},
-				body: JSON.stringify({}),
+				body: JSON.stringify(requestBody),
 				signal,
 			});
 		} catch {

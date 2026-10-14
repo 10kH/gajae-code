@@ -1230,6 +1230,33 @@ function extractGoogleOAuthToken(value: string | undefined): string | undefined 
 	return value;
 }
 
+interface GoogleOAuthTokenAndProject {
+	token: string;
+	project?: string;
+}
+
+function extractGoogleOAuthTokenAndProject(value: string | undefined): GoogleOAuthTokenAndProject | undefined {
+	if (!isAuthenticated(value)) return undefined;
+	try {
+		const parsed = JSON.parse(value) as { token?: unknown; projectId?: unknown };
+		if (Object.hasOwn(parsed, "token")) {
+			if (typeof parsed.token !== "string") {
+				return undefined;
+			}
+			const token = parsed.token.trim();
+			if (token.length === 0) return undefined;
+			return {
+				token,
+				project: typeof parsed.projectId === "string" && parsed.projectId.length > 0 ? parsed.projectId : undefined,
+			};
+		}
+	} catch {
+		// OAuth values for Google providers are expected to be JSON, but custom setups may already provide raw token.
+	}
+	// If no token field, just use the value as-is
+	return { token: value };
+}
+
 function getOAuthCredentialsForProvider(authStorage: AuthStorage, provider: string): OAuthCredential[] {
 	const providerEntry = authStorage.getAll()[resolveOAuthStorageProvider(provider)];
 	if (!providerEntry) return [];
@@ -4707,20 +4734,26 @@ export class ModelRegistry {
 			{
 				providerId: "google-antigravity",
 				resolveKey: extractGoogleOAuthToken,
-				createOptions: oauthToken =>
-					googleAntigravityModelManagerOptions({
+				createOptions: oauthToken => {
+					const tokenAndProject = extractGoogleOAuthTokenAndProject(oauthToken);
+					return googleAntigravityModelManagerOptions({
 						oauthToken,
 						endpoint: this.getProviderBaseUrl("google-antigravity"),
-					}),
+						project: tokenAndProject?.project,
+					});
+				},
 			},
 			{
 				providerId: "google-gemini-cli",
 				resolveKey: extractGoogleOAuthToken,
-				createOptions: oauthToken =>
-					googleGeminiCliModelManagerOptions({
+				createOptions: oauthToken => {
+					const tokenAndProject = extractGoogleOAuthTokenAndProject(oauthToken);
+					return googleGeminiCliModelManagerOptions({
 						oauthToken,
 						endpoint: this.getProviderBaseUrl("google-gemini-cli"),
-					}),
+						project: tokenAndProject?.project,
+					});
+				},
 			},
 			{
 				providerId: "openai-codex",
