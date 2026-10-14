@@ -7,6 +7,7 @@ import { getAgentDbPath, resetAgentDirFromEnvironment, setAgentDir } from "@gaja
 import { YAML } from "bun";
 import { runAccountsCommand } from "../src/cli/accounts-cli";
 import { resetSettingsForTest } from "../src/config/settings";
+import { discoverAuthStorage } from "../src/sdk/session";
 import { resolveStartupAuthConfig } from "../src/session/startup-auth-config";
 
 // Each command run opens the credential store and refreshes the offline model registry, which exceeds the default
@@ -112,9 +113,11 @@ describe("gjc accounts prefer", () => {
 
 	it.each([
 		["a colon in its local part, in the email: form", "odd:name@example.com", "email:odd:name@example.com", "75"],
+		["an account: prefix, in the email: form", "account:team@example.com", "email:account:team@example.com", "75"],
+		["an email: prefix, in the email: form", "email:team@example.com", "email:email:team@example.com", "75"],
 		["an equals sign in its local part, bare", "user=2@example.com", "user=2@example.com", undefined],
 	])(
-		"stores an email with %s that startup reads back",
+		"stores an email with %s that startup reads back as the same row",
 		async (_label, email, written, cap) => {
 			const store = await SqliteAuthCredentialStore.open(getAgentDbPath());
 			let rowId: number;
@@ -133,6 +136,12 @@ describe("gjc accounts prefer", () => {
 			expect(await writtenPreferences()).toEqual({ anthropic: [entry] });
 			const [preference] = (await resolveStartupAuthConfig(agentDir)).credentialPreferences.anthropic ?? [];
 			expect(preference?.selector).toEqual({ kind: "email", value: email });
+			const storage = await discoverAuthStorage(agentDir);
+			try {
+				expect(storage.resolveOAuthPinTarget("anthropic", preference!.selector).credentialId).toBe(rowId);
+			} finally {
+				storage.close();
+			}
 		},
 		CLI_TIMEOUT_MS,
 	);

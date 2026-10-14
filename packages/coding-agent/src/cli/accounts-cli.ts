@@ -315,8 +315,10 @@ function parsePreferArgument(raw: string): { account: string; cap: number | unde
 /**
  * Portable config text for a resolved OAuth row: its email, else its account id, whichever no other OAuth row of the
  * provider shares. Numeric row ids are never persisted as preferences; a row with neither unique value is refused.
- * The email is written bare when the startup grammar reads it back that way, else as `email:<address>`; every form
- * written is one {@link parsePreferenceAccount} accepts, so a successful write never fails the next startup.
+ * Each candidate text is written only when {@link parsePreferenceAccount} reads it back as the same selector, so a
+ * successful write neither fails the next startup nor retargets the row: the email is written bare when that
+ * round-trips, else as `email:<address>` (an address such as `account:team@example.com` would otherwise parse as an
+ * account id, and `email:team@example.com` would lose its prefix).
  */
 function portablePreferenceAccount(
 	row: CredentialInventoryRecord,
@@ -325,16 +327,22 @@ function portablePreferenceAccount(
 	const oauthRows = providerRows.filter(other => other.credentialKind === "oauth");
 	const email = row.email?.trim().toLowerCase();
 	if (email && oauthRows.filter(other => other.email?.trim().toLowerCase() === email).length === 1) {
-		const address = row.email!.trim();
-		const written = [address, `email:${address}`].find(text => parsePreferenceAccount(text));
+		const selector: AuthCredentialSelector = { kind: "email", value: row.email!.trim() };
+		const written = [selector.value, `email:${selector.value}`].find(text => readsBackAs(text, selector));
 		if (written) return written;
 	}
 	const accountId = row.accountId?.trim();
 	if (accountId && oauthRows.filter(other => other.accountId?.trim() === accountId).length === 1) {
 		const written = `account:${accountId}`;
-		if (parsePreferenceAccount(written)) return written;
+		if (readsBackAs(written, { kind: "account", value: accountId })) return written;
 	}
 	return undefined;
+}
+
+/** Whether startup parses `text` as exactly `selector`, kind and value. */
+function readsBackAs(text: string, selector: AuthCredentialSelector): boolean {
+	const parsed = parsePreferenceAccount(text);
+	return parsed?.kind === selector.kind && parsed.value === selector.value;
 }
 
 async function writePersistentPreferences(
