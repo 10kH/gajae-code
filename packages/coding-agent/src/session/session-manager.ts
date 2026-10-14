@@ -3693,7 +3693,9 @@ async function readTerminalBreadcrumb(cwd: string): Promise<string | null> {
 			candidate => !isStagedSessionPath(candidate.path) && candidate.sessionId === header.id,
 		);
 		if (byIdentity) return byIdentity.path;
-		return pathIsWithin(sessionsRoot, path.resolve(sessionFile)) ? null : path.resolve(sessionFile);
+		// The listing does not own this file. Do not adopt it, including when it
+		// sits outside the managed sessions root.
+		return null;
 	} catch (err) {
 		if (!isEnoent(err)) logger.debug("Terminal breadcrumb read failed", { err });
 		// Breadcrumb doesn't exist or is corrupt — fall through

@@ -101,7 +101,39 @@ describe("continueRecent with --worktree sessions", () => {
 		}
 	});
 
-	it("keeps a verified explicit-directory breadcrumb terminal-specific", async () => {
+	it("resumes an owned breadcrumb and ignores a session file outside the sessions root", async () => {
+		const ownedFile = writeSession(repo, "owned-session");
+		writeBreadcrumb(repo, ownedFile);
+		const owned = await SessionManager.continueRecent(repo);
+		try {
+			expect(owned.getSessionFile()).toBe(ownedFile);
+			expect(owned.getSessionId()).toBe("owned-session");
+		} finally {
+			await owned.close();
+		}
+
+		const outsideDir = path.join(root, "outside-sessions");
+		const outsideFile = path.join(outsideDir, "outside.jsonl");
+		fs.mkdirSync(outsideDir, { recursive: true });
+		fs.writeFileSync(
+			outsideFile,
+			`${JSON.stringify({ type: "session", id: "outside-session", timestamp: "2025-01-01T00:00:00Z", cwd: repo, version: 3 })}\n${JSON.stringify({ type: "message", id: "1", parentId: null, timestamp: "2025-01-01T00:00:01Z", message: { role: "user", content: "outside", timestamp: 1 } })}\n`,
+		);
+		const before = fs.readFileSync(outsideFile, "utf8");
+		writeBreadcrumb(repo, outsideFile);
+
+		const resumed = await SessionManager.continueRecent(repo);
+		try {
+			expect(resumed.getSessionId()).toBe("owned-session");
+			expect(resumed.getSessionFile()).toBe(ownedFile);
+			expect(resumed.getSessionFile()).not.toBe(outsideFile);
+			expect(fs.readFileSync(outsideFile, "utf8")).toBe(before);
+		} finally {
+			await resumed.close();
+		}
+	});
+
+	it("does not adopt a linked-worktree breadcrumb whose session file is outside the sessions root", async () => {
 		const unmanagedDir = path.join(root, "unmanaged-sessions");
 		const unmanagedFile = path.join(unmanagedDir, "unmanaged.jsonl");
 		fs.mkdirSync(unmanagedDir, { recursive: true });
@@ -112,14 +144,12 @@ describe("continueRecent with --worktree sessions", () => {
 		writeBreadcrumb(worktree, unmanagedFile);
 		const before = fs.readFileSync(unmanagedFile, "utf8");
 
-		writeSession(worktree, "managed-worktree-session");
 		const resumed = await SessionManager.continueRecent(repo);
 		try {
-			// Terminal-specific explicit breadcrumb paths must stay at the verified path.
-			// Managed resume must not adopt/copy them into agent/sessions/v2-* storage.
-			expect(resumed.getSessionFile()).toBe(unmanagedFile);
+			expect(resumed.getSessionFile()).not.toBe(unmanagedFile);
+			expect(resumed.getSessionId()).not.toBe("unmanaged");
 			expect(fs.readFileSync(unmanagedFile, "utf8")).toBe(before);
-			expect(resumed.getSessionFile()?.includes(`${path.sep}agent${path.sep}sessions${path.sep}`)).toBe(false);
+			expect(fs.existsSync(path.join(SessionManager.getDefaultSessionDir(worktree), "unmanaged.jsonl"))).toBe(false);
 		} finally {
 			await resumed.close();
 		}
