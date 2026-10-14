@@ -23376,21 +23376,53 @@ export class AgentSession {
 		| { apiKey: undefined; authError: Error }
 	> {
 		const authStorage = this.#modelRegistry.authStorage;
-		let resolved = await this.#modelRegistry.getApiKeyWithCredentialRowId(candidate, this.credentialSessionId);
+		const resolveCurrentSelection = () =>
+			this.#modelRegistry.getApiKeyWithCredentialRowId(candidate, this.credentialSessionId);
+		let resolved = await resolveCurrentSelection();
+		if (this.#hasManagedFallbackCredentialPin(candidate.provider)) {
+			// A selector can be installed while the initial resolver is awaiting token
+			// refresh. Resolve again without an explicit peer selector so the new pin
+			// owns the credential used for this compaction.
+			resolved = await resolveCurrentSelection();
+		}
 		if (
 			resolved.credentialRowId !== undefined &&
 			!authStorage.isCredentialAvailable(candidate.provider, resolved.credentialRowId)
 		) {
 			if (!this.#hasManagedFallbackCredentialPin(candidate.provider)) {
 				for (const credential of authStorage.listCredentialInventory(candidate.provider)) {
+					if (this.#hasManagedFallbackCredentialPin(candidate.provider)) {
+						resolved = await resolveCurrentSelection();
+						break;
+					}
 					if (credential.disabled || !authStorage.isCredentialAvailable(candidate.provider, credential.id)) continue;
-					const alternative = await this.#modelRegistry.getApiKeyWithCredentialRowId(
-						candidate,
-						this.credentialSessionId,
-						{
-							credentialSelector: { kind: "id", value: String(credential.id) },
-						},
-					);
+					let alternative: { apiKey: string | undefined; credentialRowId: number | undefined };
+					try {
+						alternative = await this.#modelRegistry.getApiKeyWithCredentialRowId(
+							candidate,
+							this.credentialSessionId,
+							{
+								credentialSelector: { kind: "id", value: String(credential.id) },
+							},
+						);
+					} catch (error) {
+						if (this.#hasManagedFallbackCredentialPin(candidate.provider)) {
+							resolved = await resolveCurrentSelection();
+							break;
+						}
+						logger.warn("Failed to resolve stored credential while selecting auto-compaction candidate", {
+							provider: candidate.provider,
+							credentialId: credential.id,
+							errorType: error instanceof Error ? error.name : typeof error,
+						});
+						continue;
+					}
+					if (this.#hasManagedFallbackCredentialPin(candidate.provider)) {
+						// The explicit selector above would override a session pin installed
+						// during resolution. Discard that result and honor the current pin.
+						resolved = await resolveCurrentSelection();
+						break;
+					}
 					if (
 						!alternative.apiKey ||
 						alternative.credentialRowId !== credential.id ||
@@ -25677,7 +25709,14 @@ export class AgentSession {
 		const authStorage = this.#modelRegistry.authStorage;
 		const provider = model.provider;
 		// (1) Pin guard, before any mutation and for every branch.
-		if (this.#hasManagedFallbackCredentialPin(provider)) {
+		if (
+			this.#hasManagedFallbackCredentialPin(provider) ||
+			authStorage.hasConfigApiKey(provider, this.#modelRegistry.getAuthStorageOwner())
+		) {
+			// Ordinary turn failures do not carry request-scoped row identity. Treat
+			// every config override, including apiKeyEnv, as a pin here so an env key
+			// cannot back off an unrelated sticky stored credential. Auto-compaction
+			// has its own row-aware usage-limit rotation path.
 			return "unchanged";
 		}
 

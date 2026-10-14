@@ -260,6 +260,177 @@ describe("auto-compaction usage limit rotates the session credential", () => {
 		expect(ends[0]?.result).toBeDefined();
 	});
 
+	it("continues preflight selection after a peer resolver rejects", async () => {
+		authStorage.close();
+		let rejectedPeerKey: string | undefined;
+		let rejectPeerResolution = false;
+		let rejectedResolverCalls = 0;
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"), {
+			configValueResolver: async config => {
+				if (rejectPeerResolution && config === rejectedPeerKey) {
+					rejectedResolverCalls++;
+					throw new Error("preflight peer resolver failure");
+				}
+				return config;
+			},
+		});
+		await authStorage.set("openai-codex", [
+			{ type: "api_key", key: "codex-key-1" },
+			{ type: "api_key", key: "codex-key-2" },
+			{ type: "api_key", key: "codex-key-3" },
+		]);
+		const credentialSessionId = "compaction-preflight-resolver-rejection";
+		session = createSession(credentialSessionId);
+		let failedRowId: number | undefined;
+		let rejectedPeerRowId: number | undefined;
+		let healthyPeerKey: string | undefined;
+		let appliedBackoff = false;
+		const markUsageLimitReached = vi.spyOn(authStorage, "markUsageLimitReached");
+		const markFailedRow = authStorage.markUsageLimitReached.bind(authStorage);
+		const resolveApiKey = session.modelRegistry.getApiKeyWithCredentialRowId.bind(session.modelRegistry);
+		vi.spyOn(session.modelRegistry, "getApiKeyWithCredentialRowId").mockImplementation(
+			async (candidate, sessionId, options) => {
+				const resolved = await resolveApiKey(candidate, sessionId, options);
+				if (
+					!appliedBackoff &&
+					options?.credentialSelector === undefined &&
+					resolved.credentialRowId !== undefined
+				) {
+					appliedBackoff = true;
+					failedRowId = resolved.credentialRowId;
+					const peers = authStorage
+						.exportSnapshot()
+						.credentials.filter(entry => entry.provider === "openai-codex" && entry.id !== failedRowId);
+					const rejectedPeer = peers[0];
+					const healthyPeer = peers[1];
+					if (rejectedPeer?.credential.type !== "api_key" || healthyPeer?.credential.type !== "api_key") {
+						throw new Error("test setup did not find two API-key peers");
+					}
+					rejectedPeerKey = rejectedPeer.credential.key;
+					rejectedPeerRowId = rejectedPeer.id;
+					healthyPeerKey = healthyPeer.credential.key;
+					await markFailedRow(candidate.provider, credentialSessionId, {
+						rowId: resolved.credentialRowId,
+						retryAfterMs: 60_000,
+					});
+					rejectPeerResolution = true;
+				}
+				return resolved;
+			},
+		);
+		const warning = vi.spyOn(logger, "warn");
+		const compactSpy = stubCompact(() => false);
+
+		await session.runIdleCompaction();
+
+		expect(appliedBackoff).toBe(true);
+		expect(failedRowId).toBeDefined();
+		expect(rejectedPeerRowId).toBeDefined();
+		expect(healthyPeerKey).toBeDefined();
+		expect(rejectedResolverCalls).toBe(1);
+		if (healthyPeerKey === undefined) throw new Error("test setup did not select a healthy peer");
+		expect(compactSpy.mock.calls).toHaveLength(1);
+		expect(compactSpy.mock.calls[0]?.[2]).toBe(healthyPeerKey);
+		expect(markUsageLimitReached).toHaveBeenCalledTimes(1);
+		expect(markUsageLimitReached.mock.calls[0]?.[2]?.rowId).toBe(failedRowId);
+		expect(warning).toHaveBeenCalledWith(
+			"Failed to resolve stored credential while selecting auto-compaction candidate",
+			{
+				provider: "openai-codex",
+				credentialId: rejectedPeerRowId,
+				errorType: "Error",
+			},
+		);
+	});
+
+	it("honors a session credential selector installed during preflight peer resolution", async () => {
+		authStorage.close();
+		let blockPeerResolution = false;
+		let peerKeyToBlock: string | undefined;
+		const peerResolutionStarted = Promise.withResolvers<void>();
+		const releasePeerResolution = Promise.withResolvers<void>();
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"), {
+			configValueResolver: async config => {
+				if (blockPeerResolution && config === peerKeyToBlock) {
+					peerResolutionStarted.resolve();
+					await releasePeerResolution.promise;
+				}
+				return config;
+			},
+		});
+		await authStorage.set("openai-codex", [
+			{ type: "api_key", key: "codex-key-1" },
+			{ type: "api_key", key: "codex-key-2" },
+			{ type: "api_key", key: "codex-key-3" },
+		]);
+		const credentialSessionId = "compaction-preflight-pin-race";
+		session = createSession(credentialSessionId);
+		const credentials = authStorage
+			.exportSnapshot()
+			.credentials.filter(entry => entry.provider === "openai-codex" && entry.credential.type === "api_key");
+		const markUsageLimitReached = vi.spyOn(authStorage, "markUsageLimitReached");
+		const markFailedRow = authStorage.markUsageLimitReached.bind(authStorage);
+		let failedRowId: number | undefined;
+		let pinnedRowId: number | undefined;
+		let pinnedPeerKey: string | undefined;
+		let appliedBackoff = false;
+		const resolveApiKey = session.modelRegistry.getApiKeyWithCredentialRowId.bind(session.modelRegistry);
+		vi.spyOn(session.modelRegistry, "getApiKeyWithCredentialRowId").mockImplementation(
+			async (candidate, sessionId, options) => {
+				const resolved = await resolveApiKey(candidate, sessionId, options);
+				if (
+					!appliedBackoff &&
+					options?.credentialSelector === undefined &&
+					resolved.credentialRowId !== undefined
+				) {
+					appliedBackoff = true;
+					failedRowId = resolved.credentialRowId;
+					const peers = credentials.filter(entry => entry.id !== failedRowId);
+					const firstPeer = peers[0];
+					const pinnedPeer = peers[1];
+					if (firstPeer?.credential.type !== "api_key" || pinnedPeer?.credential.type !== "api_key") {
+						throw new Error("test setup did not find two API-key peers");
+					}
+					peerKeyToBlock = firstPeer.credential.key;
+					pinnedRowId = pinnedPeer.id;
+					pinnedPeerKey = pinnedPeer.credential.key;
+					await markFailedRow(candidate.provider, credentialSessionId, {
+						rowId: resolved.credentialRowId,
+						retryAfterMs: 60_000,
+					});
+					blockPeerResolution = true;
+				}
+				return resolved;
+			},
+		);
+		const compactSpy = stubCompact(() => false);
+
+		const compaction = session.runIdleCompaction();
+		await peerResolutionStarted.promise;
+		try {
+			if (pinnedRowId === undefined) throw new Error("test setup did not select a pin target");
+			authStorage.setSessionCredentialSelector(
+				credentialSessionId,
+				"openai-codex",
+				{ kind: "id", value: String(pinnedRowId) },
+				session.modelRegistry.getAuthStorageOwner(),
+			);
+		} finally {
+			releasePeerResolution.resolve();
+		}
+		await compaction;
+
+		expect(appliedBackoff).toBe(true);
+		expect(failedRowId).toBeDefined();
+		expect(pinnedRowId).toBeDefined();
+		expect(pinnedRowId).not.toBe(failedRowId);
+		expect(pinnedPeerKey).toBeDefined();
+		if (pinnedPeerKey === undefined) throw new Error("test setup did not select a pin target");
+		expect(compactSpy.mock.calls.map(call => call[2])).toEqual([pinnedPeerKey]);
+		expect(markUsageLimitReached).toHaveBeenCalledTimes(1);
+		expect(markUsageLimitReached.mock.calls[0]?.[2]?.rowId).toBe(failedRowId);
+	});
+
 	it("rotates stored credentials even when automatic retries are disabled", async () => {
 		session = createSession();
 		session.settings.set("retry.enabled", false);
