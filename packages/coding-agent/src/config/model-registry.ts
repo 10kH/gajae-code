@@ -918,7 +918,8 @@ function filterMaterializedRegistryProfiles(
 type SpecialProviderDescriptor = {
 	providerId: string;
 	resolveKey: (value: string | undefined) => string | undefined;
-	createOptions: (key: string) => ModelManagerOptions<Api>;
+	/** `rawValue` is the stored credential before `resolveKey`, for providers that need more than the key. */
+	createOptions: (key: string, rawValue: string | undefined) => ModelManagerOptions<Api>;
 };
 
 const PROVIDER_BASE_URL_ENV_ALIASES: Record<string, readonly string[]> = {
@@ -1230,31 +1231,17 @@ function extractGoogleOAuthToken(value: string | undefined): string | undefined 
 	return value;
 }
 
-interface GoogleOAuthTokenAndProject {
-	token: string;
-	project?: string;
-}
-
-function extractGoogleOAuthTokenAndProject(value: string | undefined): GoogleOAuthTokenAndProject | undefined {
+/** Reads the Cloud Code project id stored alongside a Google OAuth token. */
+function extractGoogleOAuthProjectId(value: string | undefined): string | undefined {
 	if (!isAuthenticated(value)) return undefined;
 	try {
-		const parsed = JSON.parse(value) as { token?: unknown; projectId?: unknown };
-		if (Object.hasOwn(parsed, "token")) {
-			if (typeof parsed.token !== "string") {
-				return undefined;
-			}
-			const token = parsed.token.trim();
-			if (token.length === 0) return undefined;
-			return {
-				token,
-				project: typeof parsed.projectId === "string" && parsed.projectId.length > 0 ? parsed.projectId : undefined,
-			};
-		}
+		const parsed = JSON.parse(value) as { projectId?: unknown };
+		return typeof parsed.projectId === "string" && parsed.projectId.trim().length > 0
+			? parsed.projectId.trim()
+			: undefined;
 	} catch {
-		// OAuth values for Google providers are expected to be JSON, but custom setups may already provide raw token.
+		return undefined;
 	}
-	// If no token field, just use the value as-is
-	return { token: value };
 }
 
 function getOAuthCredentialsForProvider(authStorage: AuthStorage, provider: string): OAuthCredential[] {
@@ -4734,26 +4721,22 @@ export class ModelRegistry {
 			{
 				providerId: "google-antigravity",
 				resolveKey: extractGoogleOAuthToken,
-				createOptions: oauthToken => {
-					const tokenAndProject = extractGoogleOAuthTokenAndProject(oauthToken);
-					return googleAntigravityModelManagerOptions({
+				createOptions: (oauthToken, rawValue) =>
+					googleAntigravityModelManagerOptions({
 						oauthToken,
 						endpoint: this.getProviderBaseUrl("google-antigravity"),
-						project: tokenAndProject?.project,
-					});
-				},
+						project: extractGoogleOAuthProjectId(rawValue),
+					}),
 			},
 			{
 				providerId: "google-gemini-cli",
 				resolveKey: extractGoogleOAuthToken,
-				createOptions: oauthToken => {
-					const tokenAndProject = extractGoogleOAuthTokenAndProject(oauthToken);
-					return googleGeminiCliModelManagerOptions({
+				createOptions: (oauthToken, rawValue) =>
+					googleGeminiCliModelManagerOptions({
 						oauthToken,
 						endpoint: this.getProviderBaseUrl("google-gemini-cli"),
-						project: tokenAndProject?.project,
-					});
-				},
+						project: extractGoogleOAuthProjectId(rawValue),
+					}),
 			},
 			{
 				providerId: "openai-codex",
@@ -4861,7 +4844,7 @@ export class ModelRegistry {
 				authGeneration === this.#getProviderEvidenceGeneration(descriptor.providerId, apiKeyValue) &&
 				isAuthenticated(key)
 			) {
-				const managerOptions = descriptor.createOptions(key);
+				const managerOptions = descriptor.createOptions(key, apiKeyValue);
 				const baseUrl = this.#getProviderBaseUrlForDiscovery(descriptor.providerId) ?? "";
 				options.push({
 					options: managerOptions,
