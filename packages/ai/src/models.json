@@ -16590,7 +16590,8 @@
         "maxLevel": "max",
         "minLevel": "low",
         "mode": "effort"
-      }
+      },
+      "compat": {}
     },
     "gpt-5.6-terra": {
       "api": "openai-responses",
@@ -16626,7 +16627,8 @@
       "compat": {
         "supportsDeveloperRole": false,
         "supportsReasoningEffort": false,
-        "supportsStore": false
+        "supportsStore": false,
+        "supportsUltrafastTier": true
       },
       "contextWindow": 1050000,
       "cost": {
@@ -16710,7 +16712,8 @@
       "compat": {
         "supportsDeveloperRole": false,
         "supportsReasoningEffort": false,
-        "supportsStore": false
+        "supportsStore": false,
+        "supportsUltrafastTier": true
       },
       "contextWindow": 1050000,
       "cost": {
@@ -20594,7 +20597,8 @@
         "maxLevel": "max",
         "minLevel": "low",
         "mode": "effort"
-      }
+      },
+      "compat": {}
     },
     "gpt-5.6-terra": {
       "api": "openai-completions",
@@ -33377,7 +33381,8 @@
         "maxLevel": "max",
         "minLevel": "low",
         "mode": "effort"
-      }
+      },
+      "compat": {}
     },
     "gpt-5.6-terra": {
       "api": "kiro-codewhisperer-stream",
@@ -68205,7 +68210,8 @@
         "maxLevel": "max",
         "minLevel": "low",
         "mode": "effort"
-      }
+      },
+      "compat": {}
     },
     "gpt-5.6-terra": {
       "api": "openai-responses",
@@ -68275,6 +68281,9 @@
         "maxLevel": "max",
         "minLevel": "low",
         "mode": "effort"
+      },
+      "compat": {
+        "supportsUltrafastTier": true
       }
     },
     "gpt-6-luna": {
@@ -68377,6 +68386,9 @@
         "maxLevel": "max",
         "minLevel": "low",
         "mode": "effort"
+      },
+      "compat": {
+        "supportsUltrafastTier": true
       }
     },
     "gpt-daybreak-blue-latest": {
@@ -69243,7 +69255,8 @@
         "maxLevel": "max",
         "minLevel": "low",
         "mode": "effort"
-      }
+      },
+      "compat": {}
     },
     "gpt-5.6-terra": {
       "api": "openai-codex-responses",
@@ -69317,6 +69330,9 @@
         "maxLevel": "max",
         "minLevel": "low",
         "mode": "effort"
+      },
+      "compat": {
+        "supportsUltrafastTier": true
       }
     },
     "gpt-6-luna": {
@@ -69422,6 +69438,9 @@
         "maxLevel": "max",
         "minLevel": "low",
         "mode": "effort"
+      },
+      "compat": {
+        "supportsUltrafastTier": true
       }
     },
     "gpt-daybreak-blue-latest": {
@@ -72092,7 +72111,8 @@
         "maxLevel": "max",
         "minLevel": "low",
         "mode": "effort"
-      }
+      },
+      "compat": {}
     },
     "gpt-5.6-terra": {
       "api": "openai-responses",
@@ -72142,6 +72162,9 @@
         "maxLevel": "max",
         "minLevel": "low",
         "mode": "effort"
+      },
+      "compat": {
+        "supportsUltrafastTier": true
       }
     },
     "gpt-6-luna": {
@@ -72217,6 +72240,9 @@
         "maxLevel": "max",
         "minLevel": "low",
         "mode": "effort"
+      },
+      "compat": {
+        "supportsUltrafastTier": true
       }
     },
     "grok-4.5": {

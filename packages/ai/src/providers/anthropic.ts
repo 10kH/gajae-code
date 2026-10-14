@@ -1640,6 +1640,7 @@ function getAnthropicCompat(
 		supportsLongCacheRetention: model.compat?.supportsLongCacheRetention ?? true,
 		supportsToolChoice: model.compat?.supportsToolChoice ?? true,
 		supportsForcedToolChoice: model.compat?.supportsForcedToolChoice ?? true,
+		supportsUltrafastTier: model.compat?.supportsUltrafastTier ?? false,
 		promptCacheMode: model.compat?.promptCacheMode ?? "none",
 		toolChoiceSupport: model.compat?.toolChoiceSupport,
 	};

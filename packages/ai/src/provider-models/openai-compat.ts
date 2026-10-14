@@ -2125,6 +2125,7 @@ export function githubCopilotModelManagerOptions(config?: GithubCopilotModelMana
 								...(api === "openai-completions"
 									? {
 											compat: {
+												...(reference.compat ?? {}),
 												supportsStore: false,
 												supportsDeveloperRole: false,
 												supportsReasoningEffort: false,
