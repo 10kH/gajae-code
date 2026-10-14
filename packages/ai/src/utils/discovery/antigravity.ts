@@ -1,3 +1,4 @@
+import { logger } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { isRetiredModelKey } from "../../model-retirements";
 import { getAntigravityUserAgent } from "../../providers/google-gemini-headers";
@@ -168,6 +169,8 @@ export interface FetchAntigravityDiscoveryModelsOptions {
 	 * Default: `google-antigravity`.
 	 */
 	targetProvider?: "google-antigravity" | "google-gemini-cli";
+	/** Optional logger for debug diagnostics. */
+	logger?: typeof logger;
 }
 
 /**
@@ -185,6 +188,7 @@ export async function fetchAntigravityDiscoveryModels(
 	const endpoints = options.endpoint
 		? [trimTrailingSlashes(options.endpoint)]
 		: DEFAULT_ANTIGRAVITY_DISCOVERY_ENDPOINTS.map(trimTrailingSlashes);
+	const debugLog = options.logger?.debug ?? logger?.debug;
 
 	for (const endpoint of endpoints) {
 		let response: Response;
@@ -206,6 +210,12 @@ export async function fetchAntigravityDiscoveryModels(
 		} catch {
 			continue;
 		}
+
+		debugLog?.("Antigravity discovery endpoint response", {
+			endpoint,
+			status: response.status,
+			statusText: response.statusText,
+		});
 
 		if (!response.ok) {
 			continue;
@@ -233,12 +243,21 @@ export async function fetchAntigravityDiscoveryModels(
 		}
 
 		const models: Model<"google-gemini-cli">[] = [];
+		const modelDropReasons: Record<string, string> = {};
 
 		for (const [modelId, model] of Object.entries(parsed.models ?? {})) {
-			if (ANTIGRAVITY_DISCOVERY_DENYLIST.has(modelId) || isRetiredModelKey(targetProvider, modelId)) {
-				continue;
+			let dropReason: string | undefined;
+
+			if (ANTIGRAVITY_DISCOVERY_DENYLIST.has(modelId)) {
+				dropReason = "denylist";
+			} else if (isRetiredModelKey(targetProvider, modelId)) {
+				dropReason = "retired";
+			} else if (model.isInternal === true && !surfacedModelIds.has(modelId)) {
+				dropReason = "isInternal-not-surfaced";
 			}
-			if (model.isInternal === true && !surfacedModelIds.has(modelId)) {
+
+			if (dropReason) {
+				modelDropReasons[modelId] = dropReason;
 				continue;
 			}
 
@@ -261,6 +280,18 @@ export async function fetchAntigravityDiscoveryModels(
 				maxTokens: toPositiveNumber(model.maxOutputTokens, DEFAULT_MAX_TOKENS),
 			});
 		}
+
+		if (Object.keys(modelDropReasons).length > 0) {
+			debugLog?.("Antigravity discovery dropped models", {
+				endpoint,
+				dropReasons: modelDropReasons,
+			});
+		}
+
+		debugLog?.("Antigravity discovery kept models", {
+			endpoint,
+			keptModelIds: models.map(m => m.id),
+		});
 
 		models.sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
 		return models;

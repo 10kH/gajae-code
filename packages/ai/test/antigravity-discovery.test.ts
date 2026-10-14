@@ -243,6 +243,69 @@ describe("Antigravity model discovery", () => {
 		expect(capturedRequestBody).toEqual({});
 	});
 
+	it("logs drop reasons for filtered models when logger is provided", async () => {
+		const debugLogs: Array<[string, unknown]> = [];
+		const testLogger = {
+			debug: (message: string, meta?: unknown) => {
+				debugLogs.push([message, meta]);
+			},
+		} as any;
+
+		const fetcher = (async () =>
+			new Response(
+				JSON.stringify({
+					models: {
+						"gemini-3.1-pro-low": {
+							displayName: "Gemini 3.1 Pro (Low)",
+							supportsImages: true,
+						},
+						chat_20706: {
+							displayName: "Denylisted",
+							isInternal: true,
+						},
+						"gemini-3.1-pro-high": {
+							displayName: "Retired",
+							isInternal: true,
+						},
+						"internal-hidden": {
+							displayName: "Internal Hidden",
+							isInternal: true,
+						},
+					},
+				}),
+				{ headers: { "content-type": "application/json" } },
+			)) as unknown as typeof fetch;
+
+		const models = await fetchAntigravityDiscoveryModels({
+			token: "test-token",
+			endpoint: "https://antigravity.example.test",
+			fetcher,
+			logger: testLogger,
+		});
+
+		expect(models?.map(model => model.id)).toEqual(["gemini-3.1-pro-low"]);
+
+		// Check that drop reasons were logged
+		const dropReasonLog = debugLogs.find(log => log[0] === "Antigravity discovery dropped models");
+		expect(dropReasonLog).toBeDefined();
+		if (dropReasonLog) {
+			const [, meta] = dropReasonLog;
+			const reasons = (meta as any)?.dropReasons ?? {};
+			expect(reasons["chat_20706"]).toBe("denylist");
+			expect(reasons["gemini-3.1-pro-high"]).toBe("retired");
+			expect(reasons["internal-hidden"]).toBe("isInternal-not-surfaced");
+		}
+
+		// Check that kept models were logged
+		const keptModelsLog = debugLogs.find(log => log[0] === "Antigravity discovery kept models");
+		expect(keptModelsLog).toBeDefined();
+		if (keptModelsLog) {
+			const [, meta] = keptModelsLog;
+			const keptIds = (meta as any)?.keptModelIds ?? [];
+			expect(keptIds).toEqual(["gemini-3.1-pro-low"]);
+		}
+	});
+
 	it("filters retired selectors from fresh authoritative model caches", async () => {
 		const cacheDir = mkdtempSync(join(tmpdir(), "pi-ai-antigravity-model-cache-"));
 		cacheDirs.push(cacheDir);
