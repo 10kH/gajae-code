@@ -2104,7 +2104,7 @@ export type NativeCanonicalDirectoryIdentity =
 			ok: false;
 			platform?: never;
 			canonicalPath?: never;
-			code: "not_found" | "not_directory" | "not_utf8" | "network_unsupported" | "identity_unavailable" | "io_error";
+			code: "access_denied" | "not_found" | "not_directory" | "not_utf8" | "network_unsupported" | "identity_unavailable" | "io_error";
 	  }
 
 /** Bytes copied out of one read-only broker publication observation. */
