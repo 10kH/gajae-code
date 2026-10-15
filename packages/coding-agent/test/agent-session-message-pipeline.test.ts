@@ -1434,6 +1434,80 @@ describe("AgentSession message pipeline", () => {
 		expect(sdkAgentEnds).toHaveLength(1);
 	});
 
+	it("does not delay an SDK terminal for a later admitted event handler", async () => {
+		const laterEventStarted = Promise.withResolvers<void>();
+		const releaseLaterEvent = Promise.withResolvers<void>();
+		const terminalPublished = Promise.withResolvers<void>();
+		const laterMessage = createAssistantMessage("unrelated external event");
+		let laterEventSettled = false;
+		const model: Model = {
+			id: "later-event-terminal-model",
+			name: "later-event-terminal-model",
+			provider: "mock",
+			api: "mock",
+			baseUrl: "mock://",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200_000,
+			maxTokens: 32_768,
+		};
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["system prompt"], messages: [], tools: [] },
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: createAssistantMessage("") });
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("done") });
+				});
+				return stream;
+			},
+		});
+		const session = new AgentSession({
+			agent,
+			sessionManager: createIsolatedSessionManager(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: testModelRegistry as never,
+			extensionRunner: {
+				emitBeforeAgentStart: async () => undefined,
+				hasHandlers: (eventType: string) => eventType === "message_end",
+				emit: async (event: { type: string; message?: unknown }) => {
+					if (event.type !== "message_end" || event.message !== laterMessage) return;
+					laterEventStarted.resolve();
+					await releaseLaterEvent.promise;
+					laterEventSettled = true;
+				},
+			} as never,
+		});
+		sessions.push(session);
+		vi.spyOn(session.goalRuntime, "onAgentEnd").mockImplementation(async () => {
+			agent.emitExternalEvent({ type: "message_end", message: laterMessage } as never);
+			await laterEventStarted.promise;
+		});
+		session.subscribe(event => {
+			if (event.type === "agent_end") terminalPublished.resolve();
+		});
+
+		const prompt = session.sendUserMessage("sdk terminal before unrelated work", {
+			sdkRunCapability: createSdkRunCapability("terminal-admission-boundary"),
+		} as never);
+		try {
+			await laterEventStarted.promise;
+			const publishedBeforeLaterEvent = await Promise.race([
+				terminalPublished.promise.then(() => true),
+				Bun.sleep(1_000).then(() => false),
+			]);
+			expect(publishedBeforeLaterEvent).toBe(true);
+			expect(laterEventSettled).toBe(false);
+			releaseLaterEvent.resolve();
+			await prompt;
+			await session.waitForIdle();
+		} finally {
+			releaseLaterEvent.resolve();
+		}
+	});
+
 	it("serializes a batched SDK terminal publication through the earlier extension delivery", async () => {
 		const firstExtensionStarted = Promise.withResolvers<void>();
 		const releaseFirstExtension = Promise.withResolvers<void>();
