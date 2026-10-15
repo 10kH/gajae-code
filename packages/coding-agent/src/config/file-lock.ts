@@ -2980,7 +2980,14 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 		const localKey = await localLockKey(lockPath);
 		let publishedState: LocalLockState | undefined;
 		const priorRelease = localLockStates.get(localKey);
-		if (priorRelease && priorRelease.status !== "held" && pendingDetachedLockCleanups.has(priorRelease.owner)) {
+		if (
+			priorRelease &&
+			priorRelease.status !== "held" &&
+			(pendingDetachedLockCleanups.has(priorRelease.owner) ||
+				(priorRelease.status === "release_pending" &&
+					priorRelease.releasePath !== undefined &&
+					!priorRelease.releasePromise))
+		) {
 			await retryPendingLocalRelease(lockPath, localKey);
 			extendAttemptBudgetAfterCleanup();
 			continue;

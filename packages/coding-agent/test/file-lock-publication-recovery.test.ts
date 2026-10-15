@@ -47,6 +47,7 @@ interface RemovalCall {
 afterEach(async () => {
 	vi.restoreAllMocks();
 	FileLockTestHooks.afterRemovalTransitionMissing = undefined;
+	FileLockTestHooks.afterRemovalOwnerPublish = undefined;
 	FileLockTestHooks.beforeRemovalRecordUnlink = undefined;
 	FileLockTestHooks.nativePublicationBindings = undefined;
 	FileLockTestHooks.stagingIdentityEvidence = undefined;
@@ -268,6 +269,44 @@ describe.skipIf(process.platform !== "linux")("file lock receipt producer valida
 			"invalid primary success receipt",
 		);
 		await expect(fs.lstat(lock)).resolves.toBeTruthy();
+	});
+
+	test("drains a failed rollback release before same-process reacquisition replaces its state", async () => {
+		vi.useFakeTimers();
+		try {
+			const { file, lock } = await makeFixture();
+			const transition = `${lock}.removing`;
+			const publication = installPublicationFailure(async (_source, destination) => {
+				await fs.mkdir(`${destination}.removing`);
+				await Bun.write(path.join(`${destination}.removing`, "info"), "foreign predecessor");
+			});
+			const closeAuthority = RecoveryFsRoot.prototype.close;
+			const closeSpy = vi.spyOn(RecoveryFsRoot.prototype, "close").mockImplementation(function (
+				this: RecoveryFsRoot,
+			) {
+				closeAuthority.call(this);
+				throw new Error("injected close failure after committed rollback");
+			});
+
+			await expect(withFileLock(file, async () => undefined, quickAcquire)).rejects.toThrow(
+				"File lock rollback authority failed",
+			);
+			expect(closeSpy).toHaveBeenCalledTimes(1);
+			expect(publication.source).not.toBe("");
+
+			closeSpy.mockRestore();
+			FileLockTestHooks.nativePublicationBindings = undefined;
+			await fs.rm(transition, { recursive: true, force: true });
+
+			const release = await acquireFileLock(file, quickAcquire);
+			try {
+				await expect(fs.lstat(publication.source)).rejects.toMatchObject({ code: "ENOENT" });
+			} finally {
+				await release();
+			}
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 });
 
