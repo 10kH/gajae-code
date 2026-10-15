@@ -3823,6 +3823,17 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"task.compactSubagentPanel": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tasks",
+			label: "Compact Subagent Panel",
+			description:
+				"Collapse awaited subagents into one summary line (expand tool output to see each one) and refresh only when the summary changes",
+		},
+	},
+
 	"task.enableLsp": {
 		type: "boolean",
 		default: false,
