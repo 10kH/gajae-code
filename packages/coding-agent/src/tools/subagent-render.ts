@@ -195,10 +195,13 @@ function renderBoundSubagentBody(
 	theme: Theme,
 	staticTime: boolean,
 ): string[] {
-	return [
-		...boundSubagentBodyLines(renderSubagentSnapshotBody(snapshot, expanded, theme, staticTime), width),
-		...renderSubagentGuidanceLines(snapshot, width, theme),
-	];
+	return boundSubagentBodyLines(
+		[
+			...renderSubagentSnapshotBody(snapshot, expanded, theme, staticTime),
+			...renderSubagentGuidanceLines(snapshot, width, theme),
+		],
+		width,
+	);
 }
 
 function renderCachedSubagentBody(

@@ -490,6 +490,21 @@ describe("interrupted await receipts", () => {
 		}
 	});
 
+	it("never exceeds the terminal width with guidance on very narrow terminals", () => {
+		for (const width of [0, 1, 2, 3]) {
+			const component = subagentToolRenderer.renderResult(
+				{
+					content: [{ type: "text", text: "" }],
+					details: { subagents: [snapshot({ id: "0-Narrow", status: "running", guidance: "A" })] },
+				},
+				{ expanded: false, isPartial: false, spinnerFrame: 0 },
+				theme,
+			);
+			for (const line of component.render(width))
+				expect(Bun.stringWidth(Bun.stripANSI(line))).toBeLessThanOrEqual(width);
+		}
+	});
+
 	it("keeps pathological guidance bounded", () => {
 		const component = subagentToolRenderer.renderResult(
 			{
