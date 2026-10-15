@@ -162,7 +162,7 @@ import {
 	resolveMCPToolCache,
 } from "../runtime-mcp";
 import { createMCPFormInputHandler } from "../runtime-mcp/elicitation";
-import type { MCPLoadResult } from "../runtime-mcp/manager";
+import { type MCPLoadResult, omitUnapprovedProjectStdio } from "../runtime-mcp/manager";
 import { omitPluginMcpNameShadows, retainPluginMcpMandatoryNames } from "../runtime-mcp/plugin-mcp-name-filter";
 import { MCP_STARTUP_WAIT_GRACE_MS } from "../runtime-mcp/startup-policy";
 import type { MCPServerConfig } from "../runtime-mcp/types";
@@ -781,6 +781,7 @@ export async function discoverAuthStorage(
 	const resolvedStartupAuth = startupAuth ?? (await resolveStartupAuthConfig(agentDir));
 	const brokerConfig = resolvedStartupAuth.broker;
 	const credentialRankingMode = resolvedStartupAuth.credentialRankingMode;
+	const credentialPreferences = resolvedStartupAuth.credentialPreferences;
 	if (brokerConfig) {
 		const client = new AuthBrokerClient({ url: brokerConfig.url, token: brokerConfig.token });
 		const initialResult = await client.fetchSnapshot();
@@ -792,6 +793,7 @@ export async function discoverAuthStorage(
 			configValueResolver: resolveConfigValue,
 			sourceLabel: `broker ${brokerConfig.url}`,
 			credentialRankingMode,
+			credentialPreferences,
 		});
 		return await reloadDiscoveredAuthStorage(storage);
 	}
@@ -800,6 +802,7 @@ export async function discoverAuthStorage(
 		configValueResolver: resolveConfigValue,
 		sourceLabel: `local ${dbPath}`,
 		credentialRankingMode,
+		credentialPreferences,
 	});
 	return await reloadDiscoveredAuthStorage(storage);
 }
@@ -1553,6 +1556,19 @@ function validateAutomationTools(options: CreateAgentSessionOptions): Automation
 		throw new Error(`SDK automation tools cannot collide with custom tools: ${collisions.join(", ")}`);
 	}
 	return automationTools;
+}
+
+/** User/global `mcp.enableProjectConfig` only. A project file cannot set it.
+ *  Unset keeps non-stdio project MCP and does not approve a project stdio spawn.
+ */
+function nativeProjectMcpAutoload(settings: Settings): {
+	enableProjectConfig: boolean;
+	allowProjectStdio: boolean;
+} {
+	const configured = settings.getGlobal("mcp.enableProjectConfig");
+	if (configured === true) return { enableProjectConfig: true, allowProjectStdio: true };
+	if (configured === false) return { enableProjectConfig: false, allowProjectStdio: false };
+	return { enableProjectConfig: true, allowProjectStdio: false };
 }
 
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
@@ -2725,16 +2741,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				ownedMcpManagerTools = [];
 				publishOwnedMcpTools = false;
 				let nextManager: MCPManager | undefined;
+				const projectMcp = nativeProjectMcpAutoload(settings);
 				try {
 					const loaded = await loadAllMCPConfigs(to, {
 						agentDir,
-						enableProjectConfig: settings.has("mcp.enableProjectConfig")
-							? settings.get("mcp.enableProjectConfig")
-							: true,
+						enableProjectConfig: projectMcp.enableProjectConfig,
 						autoloadOnly: true,
 						nativeOnly: true,
 						settings,
 					});
+					omitUnapprovedProjectStdio(loaded.configs, loaded.sources, projectMcp.allowProjectStdio);
 					const { configs: pluginConfigs } = await buildPluginMcpConfigs({ cwd: to });
 					const pluginNames = new Set(Object.keys(pluginConfigs));
 					const mergedConfigs = { ...loaded.configs, ...pluginConfigs };
@@ -2759,6 +2775,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							{
 								sharedPoolIdleMs: settings.get("mcp.sharedPoolIdleMs"),
 								toolCacheServerNames: conventionalCacheServerNames,
+								allowUntrustedProjectStdio: projectMcp.allowProjectStdio,
 							},
 						);
 						nextManager.setAuthStorage(authStorage);
@@ -3745,6 +3762,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// `--mcp-config` exact-file sessions never reach here. The owned manager's
 			// tools are surfaced as always-on custom tools (like plugin MCPs), so an
 			// ordinary session exposes them without needing MCP discovery mode.
+			const projectMcp = nativeProjectMcpAutoload(settings);
 			let conventionalConfigs: Record<string, MCPServerConfig> = {};
 			let conventionalSources: Record<string, SourceMeta> = {};
 			if (options.enableMcpAutoload !== false) {
@@ -3754,13 +3772,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						// `gjc mcp add` (user scope) writes; an SDK embedder that runs on
 						// its own agent directory autoloads its own registrations.
 						agentDir,
-						// Project-scope native config loads by default; only an
-						// explicitly configured `mcp.enableProjectConfig: false`
-						// disables it (the legacy schema default stays false for
-						// foreign-format discovery consumers of the capability system).
-						enableProjectConfig: settings.has("mcp.enableProjectConfig")
-							? settings.get("mcp.enableProjectConfig")
-							: true,
+						// Non-stdio project MCP stays on unless the user/global layer
+						// sets `mcp.enableProjectConfig` to false. Project files cannot
+						// set that flag. Project stdio also needs it explicitly true.
+						enableProjectConfig: projectMcp.enableProjectConfig,
 						autoloadOnly: true,
 						// Runtime authority is GJC's native `.gjc` config in both scopes;
 						// Claude Code/Codex MCP files are explicit import sources into
@@ -3768,6 +3783,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						nativeOnly: true,
 						settings,
 					});
+					omitUnapprovedProjectStdio(loaded.configs, loaded.sources, projectMcp.allowProjectStdio);
 					conventionalConfigs = loaded.configs;
 					conventionalSources = loaded.sources;
 					for (const warning of loaded.warnings) {
@@ -3832,6 +3848,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						{
 							sharedPoolIdleMs: settings.get("mcp.sharedPoolIdleMs"),
 							toolCacheServerNames: conventionalCacheServerNames,
+							allowUntrustedProjectStdio: projectMcp.allowProjectStdio,
 							...(maxPluginMcpStartupWaitMs === undefined
 								? {}
 								: { maxStartupTimeoutMs: maxPluginMcpStartupWaitMs }),

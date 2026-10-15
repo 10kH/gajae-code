@@ -24,7 +24,7 @@ A server is loaded at startup when all of the following hold:
 - the server is not marked `enabled: false`;
 - the server name is not in the `disabledServers` list of either native config scope (`<agent dir>/mcp.json` or `./.gjc/mcp.json`);
 - the server is not marked `autoload: false` (autoload defaults to true; `autoload: false` keeps a server stored but unloaded at startup — flip the flag and start a new session to load it);
-- project-scope servers load by default; setting `mcp.enableProjectConfig` explicitly to `false` in settings disables every project-scope source for that environment.
+- project-scope HTTP and SSE servers load by default. A project stdio server is spawned only when the user config sets `mcp.enableProjectConfig` to true. A project settings file cannot set that flag. Setting it to false in the user config disables every project-scope source.
 
 Conventional discovery logs a structured `Skipping MCP autoload registration`
 diagnostic with the server name and reason when an eligible-looking entry is

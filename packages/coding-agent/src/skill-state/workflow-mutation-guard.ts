@@ -6,7 +6,11 @@ import { logger } from "@gajae-code/utils";
 import { canonicalEnvKey, type ProjectEnvSnapshot, projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import { isAutoresearchAuthorizedResearchPath } from "../autoresearch/git";
 import { expandApplyPatchToEntries } from "../edit/modes/apply-patch";
-import { GJC_SESSION_PREFIX, modeStatePath as sessionModeStatePath } from "../gjc-runtime/session-layout";
+import {
+	GJC_SESSION_PREFIX,
+	sessionDirName,
+	modeStatePath as sessionModeStatePath,
+} from "../gjc-runtime/session-layout";
 import { resolveGjcSessionForRead } from "../gjc-runtime/session-resolution";
 import { ModeStateSchema } from "../gjc-runtime/state-schema";
 import { workflowEnvelopeChecksumStatus } from "../gjc-runtime/state-writer";
@@ -1767,11 +1771,23 @@ function firstBlockedWorkflowStateSkill(cwd: string, targets: ExtractedTargets):
 	return null;
 }
 
-function isAllowlistedPath(cwd: string, rawPath: string): boolean {
+function planningSessionDirName(sessionId: string | null | undefined): string | undefined {
+	const trimmed = sessionId?.trim();
+	if (!trimmed) return undefined;
+	return sessionDirName(trimmed);
+}
+
+/** Specs and plans are planning-writable. A `_session-` directory must be this session's encoded name. */
+function isAllowlistedPath(cwd: string, rawPath: string, sessionId?: string | null): boolean {
 	const segments = relativeGjcSegments(cwd, rawPath);
 	if (segments?.[0] !== ".gjc") return false;
-	const generatedRoot = segments[1]?.startsWith(GJC_SESSION_PREFIX) ? segments[2] : segments[1];
-	return generatedRoot === "specs" || generatedRoot === "plans";
+	const head = segments[1];
+	if (head?.startsWith(GJC_SESSION_PREFIX)) {
+		const bound = planningSessionDirName(sessionId);
+		if (!bound || head !== bound) return false;
+		return segments[2] === "specs" || segments[2] === "plans";
+	}
+	return head === "specs" || head === "plans";
 }
 function isBlockedGjcPath(cwd: string, rawPath: string): boolean {
 	const segments = relativeGjcSegments(cwd, rawPath);
@@ -1782,9 +1798,11 @@ function hasBlockedGjcTarget(cwd: string, targets: ExtractedTargets): boolean {
 	return targets.paths.some(rawPath => isBlockedGjcPath(cwd, rawPath));
 }
 
-function allTargetsAllowlisted(cwd: string, targets: ExtractedTargets): boolean {
+function allTargetsAllowlisted(cwd: string, targets: ExtractedTargets, sessionId?: string | null): boolean {
 	return (
-		!targets.unknown && targets.paths.length > 0 && targets.paths.every(rawPath => isAllowlistedPath(cwd, rawPath))
+		!targets.unknown &&
+		targets.paths.length > 0 &&
+		targets.paths.every(rawPath => isAllowlistedPath(cwd, rawPath, sessionId))
 	);
 }
 
@@ -1959,10 +1977,14 @@ async function isNeutralTempPath(cwd: string, rawPath: string): Promise<boolean>
 }
 
 /** Targets that remain disallowed during a planning phase (excludes neutral temp scratch). */
-async function planningBlockedTargets(cwd: string, targets: ExtractedTargets): Promise<string[]> {
+async function planningBlockedTargets(
+	cwd: string,
+	targets: ExtractedTargets,
+	sessionId?: string | null,
+): Promise<string[]> {
 	const blocked: string[] = [];
 	for (const rawPath of targets.paths) {
-		if (isAllowlistedPath(cwd, rawPath)) continue;
+		if (isAllowlistedPath(cwd, rawPath, sessionId)) continue;
 		if (!(await isNeutralTempPath(cwd, rawPath))) blocked.push(rawPath);
 	}
 	return blocked;
@@ -1984,12 +2006,15 @@ export async function assertWorkflowMutationRawPathsAllowed(input: {
 		throw new ToolError(`${WORKFLOW_STATE_MUTATION_BLOCK_MESSAGE}\nUse: ${command}`);
 	}
 	if (input.forceOverride) return;
-	const planning = await getActivePlanningSkill(input.cwd, input.sessionId, input.threadId, input.guardContext);
+	const guardContext =
+		input.guardContext ??
+		(await readWorkflowGuardContext(input.cwd, { sessionId: input.sessionId, threadId: input.threadId }));
+	const planning = await getActivePlanningSkill(input.cwd, input.sessionId, input.threadId, guardContext);
 
 	if (!planning) return;
 	const message = planningPhaseBlockMessage(planning.skill);
 	if (input.rawPaths.length === 0) throw new ToolError(message);
-	const blocked = await planningBlockedTargets(input.cwd, targets);
+	const blocked = await planningBlockedTargets(input.cwd, targets, guardContext.sessionId);
 	if (blocked.length > 0) throw new ToolError(message);
 }
 
@@ -2009,7 +2034,10 @@ export async function getWorkflowMutationDecision(
 			command,
 		};
 	}
-	const planning = await getActivePlanningSkill(input.cwd, input.sessionId, input.threadId, input.guardContext);
+	const guardContext =
+		input.guardContext ??
+		(await readWorkflowGuardContext(input.cwd, { sessionId: input.sessionId, threadId: input.threadId }));
+	const planning = await getActivePlanningSkill(input.cwd, input.sessionId, input.threadId, guardContext);
 	if (!planning) {
 		return { blocked: false, targets: [] };
 	}
@@ -2048,7 +2076,7 @@ export async function getWorkflowMutationDecision(
 	// Neutral temp scratch (outside the project tree) stays writable so agents can
 	// stage artifacts and feed their path to the sanctioned `gjc ... --write` CLIs.
 	// Read-only / `gjc` bash extract no targets and fall through to allowed here.
-	const blockedTargets = await planningBlockedTargets(input.cwd, targets);
+	const blockedTargets = await planningBlockedTargets(input.cwd, targets, guardContext.sessionId);
 	if (blockedTargets.length === 0) {
 		return { blocked: false, targets: targets.paths };
 	}
@@ -2056,7 +2084,9 @@ export async function getWorkflowMutationDecision(
 		blocked: true,
 		message,
 		targets: targets.paths,
-		reason: allTargetsAllowlisted(input.cwd, targets) ? "handoff-artifact-tool-target" : "phase-boundary",
+		reason: allTargetsAllowlisted(input.cwd, targets, guardContext.sessionId)
+			? "handoff-artifact-tool-target"
+			: "phase-boundary",
 	};
 }
 
