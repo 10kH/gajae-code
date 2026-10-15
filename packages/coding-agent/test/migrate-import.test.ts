@@ -16,6 +16,7 @@ import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { convertToLlm } from "../src/session/messages";
 import { SessionManager } from "../src/session/session-manager";
+import { type BuiltinSlashCommandRuntime, executeBuiltinSlashCommand } from "../src/slash-commands/builtin-registry";
 
 let home: string;
 let cwd: string;
@@ -209,15 +210,23 @@ describe("end-to-end import", () => {
 		expect(expandSlashCommand("/claude-code:help project", commands)).toContain("Help project.");
 	});
 
-	test("migrated commands in the skill namespace dispatch as file commands", async () => {
+	test("migrated commands under skill and builtin prefixes dispatch as file commands", async () => {
 		const skillContent = "---\ndescription: Skill-only content.\n---\nSKILL-ONLY: this is the skill body.";
 		const commandContent = "COMMAND PAYLOAD: $ARGUMENTS.";
+		const providerCommandContent = "PROVIDER PAYLOAD: $ARGUMENTS.";
 		await write(".claude/skills/foo/SKILL.md", skillContent);
 		await fs.mkdir(path.join(cwd, ".claude", "commands", "skill"), { recursive: true });
 		await fs.writeFile(path.join(cwd, ".claude", "commands", "skill", "foo.md"), commandContent, "utf-8");
+		await fs.mkdir(path.join(cwd, ".claude", "commands", "provider"), { recursive: true });
+		await fs.writeFile(
+			path.join(cwd, ".claude", "commands", "provider", "login.md"),
+			providerCommandContent,
+			"utf-8",
+		);
 
 		const report = await runMigrate(opts({ from: ["claude-code"] }));
 		const commandPath = path.join(cwd, ".gjc", "commands", "claude-code", "skill", "foo.md");
+		const providerCommandPath = path.join(cwd, ".gjc", "commands", "claude-code", "provider", "login.md");
 		expect(report.actions).toContainEqual(
 			expect.objectContaining({
 				type: "command",
@@ -226,12 +235,21 @@ describe("end-to-end import", () => {
 				destination: commandPath,
 			}),
 		);
+		expect(report.actions).toContainEqual(
+			expect.objectContaining({
+				type: "command",
+				name: "claude-code:provider:login",
+				status: "imported",
+				destination: providerCommandPath,
+			}),
+		);
 		expect(report.summary.byType.skill.imported).toBe(1);
 
 		const loadedSkills = await loadSkillsFromDir({ dir: path.join(cwd, ".gjc", "skills"), source: "native:project" });
 		const slashCommands = await loadSlashCommands({ cwd });
 		expect(loadedSkills.skills).toContainEqual(expect.objectContaining({ name: "foo" }));
 		expect(slashCommands).toContainEqual(expect.objectContaining({ name: "claude-code:skill:foo" }));
+		expect(slashCommands).toContainEqual(expect.objectContaining({ name: "claude-code:provider:login" }));
 
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
@@ -239,7 +257,7 @@ describe("end-to-end import", () => {
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 		const modelRegistry = new ModelRegistry(authStorage);
 		const contexts: Context[] = [];
-		const mockModel = createMockModel({ responses: [{ content: ["Done"] }] });
+		const mockModel = createMockModel({ responses: [{ content: ["Done"] }, { content: ["Done"] }] });
 		const agent = new Agent({
 			getApiKey: () => "test-key",
 			convertToLlm,
@@ -259,7 +277,16 @@ describe("end-to-end import", () => {
 		});
 
 		try {
+			const builtinRuntime = {
+				ctx: {} as BuiltinSlashCommandRuntime["ctx"],
+				handleBackgroundCommand: () => {},
+			};
+			expect(await executeBuiltinSlashCommand("/claude-code:skill:foo src/private.ts", builtinRuntime)).toBe(false);
 			await session.prompt("/claude-code:skill:foo src/private.ts");
+			expect(await executeBuiltinSlashCommand("/claude-code:provider:login src/private.ts", builtinRuntime)).toBe(
+				false,
+			);
+			await session.prompt("/claude-code:provider:login src/private.ts");
 
 			const userTexts = contexts.flatMap(context =>
 				context.messages.flatMap(message => {
@@ -269,6 +296,7 @@ describe("end-to-end import", () => {
 				}),
 			);
 			expect(userTexts.join("\n")).toContain("COMMAND PAYLOAD: src/private.ts.");
+			expect(userTexts.join("\n")).toContain("PROVIDER PAYLOAD: src/private.ts.");
 			expect(userTexts.join("\n")).not.toContain("SKILL-ONLY:");
 		} finally {
 			await session.dispose();

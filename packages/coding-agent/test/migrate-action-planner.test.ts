@@ -369,6 +369,28 @@ describe("planMigration — slash commands", () => {
 		});
 	});
 
+	test("only argument-taking built-in prefixes are namespaced", async () => {
+		const candidate = result({
+			slashCommandCandidates: [slashCommand("provider:login"), slashCommand("help:topic")],
+		});
+		const { actions } = await planMigration({ results: [candidate], destinations: dest, force: false });
+
+		expect(actions).toMatchObject([
+			{
+				name: "claude-code:provider:login",
+				destination: path.join(dest.commandsDir, "claude-code", "provider", "login.md"),
+				operation: "create",
+				status: "imported",
+			},
+			{
+				name: "help:topic",
+				destination: path.join(dest.commandsDir, "help", "topic.md"),
+				operation: "create",
+				status: "imported",
+			},
+		]);
+	});
+
 	test("existing commands are skipped by default and updated only with force", async () => {
 		await fs.mkdir(dest.commandsDir, { recursive: true });
 		const destination = path.join(dest.commandsDir, "review.md");

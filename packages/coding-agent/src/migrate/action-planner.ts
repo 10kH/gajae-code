@@ -108,11 +108,12 @@ interface ExistingCommandDestination {
 type ExistingCommandNameIndex = Map<string, ExistingCommandDestination[]>;
 
 function avoidReservedSlashCommandName(source: string, name: string): string {
-	let safeName = name;
-	while (lookupBuiltinSlashCommand(safeName) || safeName.toLowerCase().startsWith("skill:")) {
-		safeName = `${source}:${safeName}`;
-	}
-	return safeName;
+	const separator = name.indexOf(":");
+	const commandName = separator === -1 ? name : name.slice(0, separator);
+	const builtin = lookupBuiltinSlashCommand(commandName);
+	const consumedByBuiltin = builtin !== undefined && (separator === -1 || builtin.allowArgs === true);
+	if (consumedByBuiltin || name.toLowerCase().startsWith("skill:")) return `${source}:${name}`;
+	return name;
 }
 
 async function indexExistingCommandNames(commandsDir: string): Promise<ExistingCommandNameIndex> {
