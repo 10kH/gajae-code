@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import { spawnSync } from "node:child_process";
+import * as syncFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -275,6 +276,40 @@ describe("private marketplace artifact restore", () => {
 		const retriedAgain = await manager.applyPluginRestore(token);
 		expect(retriedAgain.status).toBe("not_needed");
 		expect(retriedAgain.sideEffectStarted).toBe(false);
+	});
+
+	test("reports a failed post-detach restoration as an uncertain mutation", async () => {
+		const { manager, pluginId, installedRoot } = await setupPrivateMarketplace();
+		const plan = await manager.previewPluginRestore(pluginId, "user");
+		const token = await manager.authorizePluginRestore(plan, ["plugin-change", "install-replace", "network"]);
+		const detachedPath = `${installedRoot}.removing`;
+		const exactRemove = native.exactRemoveDirectoryTree;
+		const removeTree = vi
+			.spyOn(native, "exactRemoveDirectoryTree")
+			.mockImplementation((target, snapshot, parent, detachOnly) => {
+				if (target !== installedRoot || detachOnly !== true)
+					return exactRemove(target, snapshot, parent, detachOnly);
+				syncFs.renameSync(target, detachedPath);
+				return { ok: false, code: "restore_failed", detachedPath };
+			});
+
+		try {
+			await manager.applyPluginRestore(token);
+			throw new Error("expected post-detach restoration to be reported as uncertain");
+		} catch (error) {
+			expect(error).toBeInstanceOf(MarketplaceRestoreError);
+			const restoreError = error as MarketplaceRestoreError;
+			expect(restoreError.reasonCode).toBe("backup_detach_unverified");
+			expect(restoreError.sideEffectStarted).toBe(true);
+			expect(restoreError.outcome).toBe("uncertain");
+			expect(restoreError.retainedBackupPath).toBe(detachedPath);
+		}
+
+		expect(
+			removeTree.mock.calls.some(([target, , , detachOnly]) => target === installedRoot && detachOnly === true),
+		).toBe(true);
+		await expect(fs.lstat(installedRoot)).rejects.toMatchObject({ code: "ENOENT" });
+		expect(await fs.readdir(detachedPath)).toContain("corrupt");
 	});
 
 	test("preview never mutates the registry or cache", async () => {

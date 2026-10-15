@@ -889,6 +889,18 @@ export class MarketplaceManager {
 				);
 				const detachedPath = detachedTree(detached);
 				if (!detachedPath) {
+					if (detached.code === "restore_failed" && detached.detachedPath) {
+						const retainedSnapshot = await snapshotIfPresent(detached.detachedPath).catch(() => undefined);
+						const retainedBackupPath =
+							retainedSnapshot && sameDirectoryTreeIdentity(finalSnapshotBefore, retainedSnapshot)
+								? detached.detachedPath
+								: undefined;
+						throw new MarketplaceRestoreError("backup_detach_unverified", {
+							sideEffectStarted: true,
+							outcome: "uncertain",
+							...(retainedBackupPath ? { retainedBackupPath } : {}),
+						});
+					}
 					// identity_mismatch means finalPath already changed before we ever
 					// touched it — exactRemoveDirectoryTree refused the mutation entirely,
 					// so this is a pure precheck refusal: nothing moved, sideEffectStarted
