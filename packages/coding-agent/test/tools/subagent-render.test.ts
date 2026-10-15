@@ -3,7 +3,12 @@ import { resetSettingsForTest, Settings, settings } from "../../src/config/setti
 import type { Theme } from "../../src/modes/theme/theme";
 import { getThemeByName, setThemeInstance } from "../../src/modes/theme/theme";
 import type { AgentProgress } from "../../src/task/types";
-import type { SubagentLiveProgress, SubagentSnapshot, SubagentToolDetails } from "../../src/tools/subagent";
+import {
+	type SubagentLiveProgress,
+	type SubagentSnapshot,
+	type SubagentToolDetails,
+	subagentCompactRenderedStateSignature,
+} from "../../src/tools/subagent";
 import {
 	subagentAwaitRenderedStateSignature,
 	subagentBodyCacheTestHooks,
@@ -885,6 +890,54 @@ describe("compact subagent panel (#6774)", () => {
 		const lines = render({ subagents }, false).split("\n");
 		expect(lines).toHaveLength(4);
 		expect(lines[2]).toBe("  provider degraded: 2 subagents retrying on anthropic (+6 more providers)");
+		// Same height as a single degraded provider.
+		const single = liveGroup(15, 0).map((item, index) =>
+			index < 2
+				? {
+						...item,
+						progress: progress({
+							id: item.id,
+							retryState: {
+								attempt: 1,
+								maxAttempts: 3,
+								kind: "provider_error" as const,
+								provider: "anthropic",
+								delayMs: 10_000,
+								errorMessage: "overloaded",
+								startedAtMs: Date.now(),
+							},
+						}),
+					}
+				: item,
+		);
+		expect(render({ subagents: single }, false).split("\n")).toHaveLength(4);
+		// The expanded view keeps one row per degraded provider.
+		expect(render({ subagents }, true).match(/provider degraded:/g)).toHaveLength(7);
+	});
+
+	it("signs only the visible degradation row, not per-provider churn", () => {
+		const withProviders = (providers: string[]) =>
+			liveGroup(providers.length, 0).map((item, index) => ({
+				...item,
+				progress: progress({
+					id: item.id,
+					retryState: {
+						attempt: 1,
+						maxAttempts: 3,
+						kind: "provider_error" as const,
+						provider: providers[index],
+						delayMs: 10_000,
+						errorMessage: "overloaded",
+						startedAtMs: 0,
+					},
+				}),
+			}));
+		const now = Date.now();
+		const base = subagentCompactRenderedStateSignature(withProviders(["a", "a", "a", "b", "c"]), now);
+		// A lone retrying subagent moving between providers changes nothing on screen.
+		expect(subagentCompactRenderedStateSignature(withProviders(["a", "a", "a", "b", "d"]), now)).toBe(base);
+		// A second degraded provider does change the visible row.
+		expect(subagentCompactRenderedStateSignature(withProviders(["a", "a", "a", "b", "b"]), now)).not.toBe(base);
 	});
 
 	it("lists every subagent when tool output is expanded", () => {

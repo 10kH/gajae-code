@@ -1206,8 +1206,24 @@ export function summarizeSubagentGroup(subagents: readonly SubagentSnapshot[], n
 }
 
 /**
+ * The compact degradation row shows only the most-degraded provider, its count, and
+ * how many other providers degrade (providers with a single retrying subagent are
+ * not a degradation). Signing exactly that keeps invisible per-provider churn from
+ * re-emitting.
+ */
+function compactDegradationSignature(
+	retryingByProvider: Record<string, number>,
+): { provider: string; count: number; moreProviders: number } | null {
+	const groups = Object.entries(retryingByProvider)
+		.filter(([, count]) => count > 1)
+		.sort(([a, countA], [b, countB]) => countB - countA || a.localeCompare(b));
+	const [worst] = groups;
+	return worst ? { provider: worst[0], count: worst[1], moreProviders: groups.length - 1 } : null;
+}
+
+/**
  * Rendered-state signature for the compact await panel. It covers only what the
- * compact view shows (group counts and per-provider retry counts), so per-subagent activity that does not move
+ * compact view shows (group counts and the single degradation row), so per-subagent activity that does not move
  * a count no longer re-emits: the update rate is bounded by count transitions and
  * the liveness interval instead of growing with the number of live subagents.
  */
@@ -1221,7 +1237,7 @@ export function subagentCompactRenderedStateSignature(
 		interrupted: receipt?.interrupted === true,
 		summary: (({ retryingByProvider, ...counts }) => ({
 			...counts,
-			retryingByProvider: Object.entries(retryingByProvider).sort(([a], [b]) => a.localeCompare(b)),
+			degradation: compactDegradationSignature(retryingByProvider),
 		}))(summarizeSubagentGroup(subagents, nowMs)),
 	});
 }
