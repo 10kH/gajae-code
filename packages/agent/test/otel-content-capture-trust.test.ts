@@ -84,6 +84,15 @@ describe("GenAI content capture project dotenv trust", () => {
 		expect(captured.requestMessages).toBeNull();
 	});
 
+	it("ignores escaped project dotenv values that Bun decodes before loading", async () => {
+		const cwd = await tempDir();
+		const captured = await captureIn(cwd, `${ENV_NAME}="full\\n"\n`);
+		expect(captured.spanFound).toBe(true);
+		expect(captured.envValue).toBe("full\n");
+		expect(captured.inputMessages).toBeNull();
+		expect(captured.requestMessages).toBeNull();
+	});
+
 	it("still captures full message content when the operator sets the env and the project does not", async () => {
 		const cwd = await tempDir();
 		const captured = await captureIn(cwd, "OTHER=1\n", { [ENV_NAME]: "full" });
