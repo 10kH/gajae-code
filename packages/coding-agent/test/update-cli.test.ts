@@ -2230,6 +2230,80 @@ describe("update-cli binary replacement", () => {
 		expect(await Bun.file(backupPath).exists()).toBe(false);
 	});
 
+	it("repoints a changed activation candidate and reuses the retry stage", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc.exe");
+		const recordedStage = path.join(dir, "gjc.new.recorded.exe");
+		const retryStage = path.join(dir, "gjc.new.retry.exe");
+		const nextStage = path.join(dir, "gjc.new.next.exe");
+		const backupPath = path.join(dir, "gjc.exe.bak");
+		await writeFixtureFile(targetPath, "old binary");
+		await writeFixtureFile(recordedStage, "new binary");
+		await writeFixtureFile(retryStage, "new binary");
+		const target = (await snapshotRegularFile(targetPath))!;
+		const stage = (await snapshotRegularFile(recordedStage))!;
+		const parent = (await snapshotDirectory(dir))!;
+		await createActivationRecordFile({
+			...buildActivationRecord({
+				targetPath,
+				targetIdentity: target.identity,
+				parentIdentity: parent,
+				baselineDigest: target.identity.sha256,
+				stagingPath: recordedStage,
+				stagingIdentity: stage.identity,
+				candidate: { digest: stage.identity.sha256, version: "15.1.8" },
+			}),
+			phase: "pending_activation",
+		});
+
+		const reconcile = installActivation.reconcileActivationRecord;
+		const reconcileSpy = vi
+			.spyOn(installActivation, "reconcileActivationRecord")
+			.mockImplementation(async (filePath, options) => {
+				if (filePath === targetPath) {
+					await fs.unlink(recordedStage);
+					await writeFixtureFile(recordedStage, "changed binary");
+				}
+				return reconcile(filePath, options);
+			});
+		try {
+			await expect(
+				replaceBinaryFixture({
+					targetPath,
+					tempPath: retryStage,
+					backupPath,
+					expectedVersion: "15.1.8",
+					verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+				}),
+			).rejects.toThrow("installation_pending_activation");
+		} finally {
+			reconcileSpy.mockRestore();
+		}
+
+		const pending = await readActivationRecord(targetPath);
+		expect(pending.status).toBe("valid");
+		if (pending.status === "valid") {
+			expect(pending.record.phase).toBe("pending_activation");
+			expect(pending.record.stagingPath).toBe(retryStage);
+		}
+		expect(await Bun.file(recordedStage).text()).toBe("changed binary");
+		expect(await Bun.file(retryStage).text()).toBe("new binary");
+
+		await writeFixtureFile(nextStage, "new binary");
+		const result = await replaceBinaryFixture({
+			targetPath,
+			tempPath: nextStage,
+			backupPath,
+			expectedVersion: "15.1.8",
+			verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+		});
+		expect(result.ok).toBe(true);
+		expect(await Bun.file(targetPath).text()).toBe("new binary");
+		expect(await Bun.file(retryStage).exists()).toBe(false);
+		expect(await Bun.file(nextStage).exists()).toBe(false);
+		expect(await Bun.file(backupPath).exists()).toBe(false);
+	});
+
 	it("reports and preserves the retry candidate when candidate-missing reconciliation cannot repoint", async () => {
 		const dir = await makeTempDir();
 		const targetPath = path.join(dir, "gjc.exe");

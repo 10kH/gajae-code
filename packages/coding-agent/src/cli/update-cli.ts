@@ -1018,6 +1018,19 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 		allowPromotion: true,
 		expectedRecordIdentity: recordIdentity,
 	});
+	if (promoted.reason === "candidate_changed" && redundantStage) {
+		await repointActivationRecordToRetryCandidate(
+			{
+				...record,
+				phase: "pending_activation",
+				stagingPath: redundantStage.path,
+				stagingIdentity: redundantStage.identity,
+			},
+			recordIdentity,
+			redundantStage.path,
+		);
+		throw new Error("installation_pending_activation");
+	}
 	if (promoted.status === "pending_activation") {
 		if (promoted.reason === "candidate_missing" && redundantStage) {
 			await repointActivationRecordToRetryCandidate(
