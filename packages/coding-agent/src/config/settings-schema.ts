@@ -2847,6 +2847,12 @@ export const SETTINGS_SCHEMA = {
 		type: "string",
 		default: undefined,
 	},
+	// xxHash64 hex pin for settingsPath. Only the user/global value is a pin;
+	// a project file cannot authorize the TOML path it names.
+	"shellMinimizer.settingsHash": {
+		type: "string",
+		default: undefined,
+	},
 	"shellMinimizer.only": { type: "array", default: EMPTY_STRING_ARRAY },
 	"shellMinimizer.except": { type: "array", default: EMPTY_STRING_ARRAY },
 	"shellMinimizer.maxCaptureBytes": {
@@ -3817,6 +3823,17 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"task.compactSubagentPanel": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tasks",
+			label: "Compact Subagent Panel",
+			description:
+				"Collapse awaited subagents into one summary line (expand tool output to see each one) and refresh only when the summary changes",
+		},
+	},
+
 	"task.enableLsp": {
 		type: "boolean",
 		default: false,
@@ -4740,6 +4757,7 @@ export interface BashInterceptorRule {
 export interface ShellMinimizerSettings {
 	enabled: boolean;
 	settingsPath: string | undefined;
+	settingsHash: string | undefined;
 	only: string[];
 	except: string[];
 	maxCaptureBytes: number;

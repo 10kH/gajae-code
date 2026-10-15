@@ -3288,6 +3288,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getWorkflowGateEmitter: () => session?.getWorkflowGateEmitter(),
 			getAskAnswerSource: () => session?.getAskAnswerSource(),
 			getGoalRuntime: () => session?.goalRuntime,
+			getSdkPermissionMode: () => session?.sdkPermissionMode ?? "allow",
 			getClientBridge: () => session?.clientBridge,
 			getCompactContext: () => session.formatCompactContext(),
 			getTodoPhases: () => session.getTodoPhases(),
@@ -4206,18 +4207,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			});
 		}
 
-		// Extension modules are discovered at session startup from the canonical
-		// native locations (`<agentDir>/extensions`, `<cwd>/.gjc/extensions`),
-		// installed plugin bundles, the `extensions` setting, and explicitly
-		// supplied `additionalExtensionPaths`. `disableExtensionDiscovery` keeps its
-		// documented opt-out semantics: explicit paths still load, matching
+		// Extension modules are discovered at session startup from the user agent
+		// directory, installed plugin bundles, the user/global `extensions` setting,
+		// and explicitly supplied `additionalExtensionPaths`. A repository
+		// `.gjc/extensions` tree is not imported. `disableExtensionDiscovery` keeps
+		// its documented opt-out semantics: explicit paths still load, matching
 		// `cli/list-models.ts`. A caller-supplied `preloadedExtensions` result
 		// suppresses discovery entirely.
 		const explicitExtensionPaths = options.additionalExtensionPaths ?? [];
-		// The `extensions` setting is schema-typed as an array of paths, but a
-		// hand-edited config can hold an invalid shape; discovery must degrade to
-		// no extra paths instead of aborting startup for every session.
-		const extensionsSettingPaths = Array.isArray(settings.get("extensions")) ? settings.get("extensions") : [];
+		// The merged `extensions` value includes the project layer, which can name
+		// any module. Only the user/global list is imported. A hand-edited value
+		// with an invalid shape contributes no extra paths.
+		const globalExtensionPaths = settings.getGlobal("extensions");
+		const extensionsSettingPaths = Array.isArray(globalExtensionPaths) ? globalExtensionPaths : [];
 		// Discovery must never block session creation: a filesystem or plugin-registry
 		// failure degrades to the explicit paths and then to no extensions at all, and
 		// the failure stays observable in `extensionsResult.errors`.
