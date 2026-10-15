@@ -376,6 +376,21 @@ describe("MCP command quarantine", () => {
 		);
 	});
 
+	test("rejects mutation through a builtin lookup result", async () => {
+		const root = path.join(import.meta.dir, "..");
+		const registry = await Bun.file(path.join(root, "packages/coding-agent/src/slash-commands/builtin-registry.ts")).text();
+		const lookupDeclaration = "const BUILTIN_SLASH_COMMAND_LOOKUP = new Map<string, SlashCommandSpec>();";
+		const mutation = [
+			lookupDeclaration,
+			'BUILTIN_SLASH_COMMAND_LOOKUP.get("mcp")!.handle = async () => false;',
+		].join("\n");
+		const unverifiedMutation = registry.replace(lookupDeclaration, mutation);
+		expect(unverifiedMutation).not.toBe(registry);
+		expect(findMcpBuiltinQuarantineFindings(unverifiedMutation)).toContain(
+			"root slash-command registry has an unverified additional use or mutation",
+		);
+	});
+
 	test("rejects duplicate root /mcp registrations", () => {
 		expect(findMcpBuiltinQuarantineFindings(registryWithEntries([exactMcpTuiEntry, exactMcpTuiEntry]))).toContain(
 			"multiple root /mcp builtins are registered",
@@ -454,6 +469,20 @@ describe("MCP command quarantine", () => {
 		);
 		expect(computedCapability).not.toBe(interactiveMode);
 		expect(findMcpTuiMetadataFindings(slashCommands, computedCapability)).toContain(
+			"ordinary TUI /mcp metadata is not filtered by the exact MCP capability",
+		);
+	});
+
+	test("rejects overwriting the constructor MCP capability before builtin metadata is built", async () => {
+		const root = path.join(import.meta.dir, "..");
+		const slashCommands = await Bun.file(path.join(root, "packages/coding-agent/src/extensibility/slash-commands.ts")).text();
+		const interactiveMode = await Bun.file(path.join(root, "packages/coding-agent/src/modes/interactive-mode.ts")).text();
+		const overwrittenCapability = interactiveMode.replace(
+			"this.#sessionBuiltinMcpVisible = this.session.hasExactMcpControls;",
+			"this.#sessionBuiltinMcpVisible = this.session.hasExactMcpControls;\n\t\tthis.#sessionBuiltinMcpVisible = this.session.autoCompactionEnabled;",
+		);
+		expect(overwrittenCapability).not.toBe(interactiveMode);
+		expect(findMcpTuiMetadataFindings(slashCommands, overwrittenCapability)).toContain(
 			"ordinary TUI /mcp metadata is not filtered by the exact MCP capability",
 		);
 	});

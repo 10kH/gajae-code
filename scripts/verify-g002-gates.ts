@@ -707,11 +707,38 @@ function isExpectedMcpLookupGet(identifierPath: NodePath<Babel.Identifier>): boo
 		return false;
 	}
 	const callPath = memberPath.parentPath;
-	return (
-		callPath?.isCallExpression() === true &&
-		callPath.node.callee === memberPath.node &&
-		!callPath.node.optional
-	);
+	if (!callPath?.isCallExpression() || callPath.node.callee !== memberPath.node || callPath.node.optional) return false;
+	const resultPath = callPath.parentPath;
+	if (
+		resultPath?.isOptionalMemberExpression() &&
+		resultPath.node.object === callPath.node &&
+		!resultPath.node.computed &&
+		resultPath.node.property.type === "Identifier" &&
+		resultPath.node.property.name === "handle"
+	) {
+		const dispatchPath = resultPath.parentPath;
+		return dispatchPath?.isOptionalCallExpression() === true && dispatchPath.node.callee === resultPath.node;
+	}
+	if (
+		resultPath?.isVariableDeclarator() &&
+		resultPath.node.init === callPath.node &&
+		resultPath.node.id.type === "Identifier" &&
+		resultPath.node.id.name === "command" &&
+		resultPath.parentPath?.isVariableDeclaration() &&
+		resultPath.parentPath.node.kind === "const"
+	) {
+		const functionPath = resultPath.getFunctionParent();
+		return (
+			functionPath?.node.type === "FunctionDeclaration" &&
+			(functionPath.node.id?.name === "executeBuiltinSlashCommand" ||
+				functionPath.node.id?.name === "executeLocalHeadlessBuiltinSlashCommand")
+		);
+	}
+	if (resultPath?.isReturnStatement() && resultPath.node.argument === callPath.node) {
+		const functionPath = resultPath.getFunctionParent();
+		return functionPath?.node.type === "FunctionDeclaration" && functionPath.node.id?.name === "lookupBuiltinSlashCommand";
+	}
+	return false;
 }
 
 function isExpectedMcpLookupSet(identifierPath: NodePath<Babel.Identifier>): boolean {
@@ -1288,21 +1315,19 @@ export function findMcpTuiMetadataFindings(slashCommandsSource: string, interact
 		const constructor = method("constructor");
 		const refreshCommands = method("refreshSlashCommandState");
 		const constructorBody = constructor?.body.body ?? [];
-		const initialization = constructorBody.some(
-			statement =>
-				statement.type === "ExpressionStatement" &&
-				statement.expression.type === "AssignmentExpression" &&
-				thisPrivate(statement.expression.left, "sessionBuiltinMcpVisible") &&
-				statement.expression.right.type === "MemberExpression" &&
-				!statement.expression.right.computed &&
-				statement.expression.right.object.type === "MemberExpression" &&
-				!statement.expression.right.object.computed &&
-				statement.expression.right.object.object.type === "ThisExpression" &&
-				statement.expression.right.object.property.type === "Identifier" &&
-				statement.expression.right.object.property.name === "session" &&
-				statement.expression.right.property.type === "Identifier" &&
-				statement.expression.right.property.name === "hasExactMcpControls",
-		);
+		const constructorCapabilityAssignments: Babel.AssignmentExpression[] = [];
+		if (constructor) {
+			traverse(interactiveMode, {
+				AssignmentExpression(assignmentPath) {
+					if (
+						assignmentPath.findParent(parentPath => parentPath.node === constructor) &&
+						thisPrivate(assignmentPath.node.left, "sessionBuiltinMcpVisible")
+					) {
+						constructorCapabilityAssignments.push(assignmentPath.node);
+					}
+				},
+			});
+		}
 		const initSlashCommandsIndex = constructorBody.findIndex(
 			statement =>
 				statement.type === "VariableDeclaration" &&
@@ -1318,6 +1343,27 @@ export function findMcpTuiMetadataFindings(slashCommandsSource: string, interact
 						thisPrivate(declaration.init.arguments[0], "sessionBuiltinMcpVisible"),
 				),
 		);
+		const initializationAssignmentIndex = constructorBody.findIndex(
+			statement =>
+				statement.type === "ExpressionStatement" &&
+				statement.expression.type === "AssignmentExpression" &&
+				constructorCapabilityAssignments.includes(statement.expression) &&
+				statement.expression.operator === "=" &&
+				thisPrivate(statement.expression.left, "sessionBuiltinMcpVisible") &&
+				statement.expression.right.type === "MemberExpression" &&
+				!statement.expression.right.computed &&
+				statement.expression.right.object.type === "MemberExpression" &&
+				!statement.expression.right.object.computed &&
+				statement.expression.right.object.object.type === "ThisExpression" &&
+				statement.expression.right.object.property.type === "Identifier" &&
+				statement.expression.right.object.property.name === "session" &&
+				statement.expression.right.property.type === "Identifier" &&
+				statement.expression.right.property.name === "hasExactMcpControls",
+		);
+		const initialization =
+			constructorCapabilityAssignments.length === 1 &&
+			initializationAssignmentIndex >= 0 &&
+			initializationAssignmentIndex < initSlashCommandsIndex;
 		const baseSlashCommandsAssignments = constructorBody.filter(
 			statement =>
 				statement.type === "ExpressionStatement" &&
