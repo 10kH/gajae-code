@@ -637,8 +637,8 @@ export function needsDarwinArm64TabWorkerSmoke(paths: readonly string[]): boolea
 
 // Paths whose Windows drive-letter vs Volume-GUID canonicalization, Bun
 // `node:fs` resident-cache write semantics, session-index snapshot fsync
-// semantics, fail-closed empty-lock handling, native path identity, or
-// native-loader Windows capability probing the fix governs. On Ubuntu the
+// semantics, fail-closed lock retirement, marketplace backup detachment,
+// native path identity, or native-loader Windows capability probing the fix governs. On Ubuntu the
 // Windows-only regression suites cannot verify those fixes; dev-ci consumes
 // this emitted flag to run and require the windows-latest job whenever any of
 // these change.
@@ -662,6 +662,8 @@ export function isWindowsSessionPathRegressionPath(changedPath: string): boolean
 		changedPath === "packages/coding-agent/src/sdk/broker/process-incarnation.ts" ||
 		changedPath === "packages/coding-agent/src/config/file-lock.ts" ||
 		changedPath === "packages/coding-agent/test/file-lock-empty-dir.test.ts" ||
+		changedPath === "packages/coding-agent/src/extensibility/plugins/marketplace/manager.ts" ||
+		changedPath === "packages/coding-agent/test/doctor-plugin-restore.test.ts" ||
 		changedPath === "crates/pi-natives/src/path_identity.rs" ||
 		// The session-state lock and empty-delete receipt GC consume the native
 		// identity-bound direct unlink, whose Windows semantics (handle-bound delete,

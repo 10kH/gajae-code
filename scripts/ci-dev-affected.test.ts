@@ -264,6 +264,7 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/sdk-session-index-fsync.windows.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/sdk-session-index-lock-contention.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/file-lock-empty-dir.test.ts");
+		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/doctor-plugin-restore.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/file-lock-signed-identity.test.ts");
 		expect(windowsJob).toContain(
 			"cargo test -p pi-natives generic_removal_does_not_reserve_the_lock_retirement_name",
@@ -1402,9 +1403,11 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(needsWindowsSessionPathRegression(["packages/coding-agent/src/edit/foo.ts"])).toBe(false);
 	});
 
-	test("routes empty lock-directory and native path identity changes to Windows", () => {
+	test("routes Windows lock retirement and marketplace restore changes to Windows", () => {
 		for (const changedPath of [
 			"packages/coding-agent/test/file-lock-empty-dir.test.ts",
+			"packages/coding-agent/src/extensibility/plugins/marketplace/manager.ts",
+			"packages/coding-agent/test/doctor-plugin-restore.test.ts",
 			"crates/pi-natives/src/path_identity.rs",
 		]) {
 			expect(isWindowsSessionPathRegressionPath(changedPath)).toBe(true);
