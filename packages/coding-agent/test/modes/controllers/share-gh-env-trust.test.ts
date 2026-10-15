@@ -24,6 +24,7 @@ const TRUST_KEYS = [
 	"BASH_ENV",
 	"ENV",
 	"ZDOTDIR",
+	"NODE_OPTIONS",
 	"PATH",
 	"HTTP_PROXY",
 	"HTTPS_PROXY",
@@ -56,6 +57,7 @@ interface GhSpawn {
 	BASH_ENV: string | null;
 	ENV: string | null;
 	ZDOTDIR: string | null;
+	NODE_OPTIONS: string | null;
 	GH_HOST: string | null;
 	GH_CONFIG_DIR: string | null;
 	GH_TOKEN: string | null;
@@ -121,6 +123,7 @@ await fsPromises.appendFile(
 		BASH_ENV: process.env.BASH_ENV ?? null,
 		ENV: process.env.ENV ?? null,
 		ZDOTDIR: process.env.ZDOTDIR ?? null,
+		NODE_OPTIONS: process.env.NODE_OPTIONS ?? null,
 		GH_HOST: process.env.GH_HOST ?? null,
 		GH_CONFIG_DIR: process.env.GH_CONFIG_DIR ?? null,
 		GH_TOKEN: process.env.GH_TOKEN ?? null,
@@ -292,6 +295,7 @@ function expectDestination(
 			| "BASH_ENV"
 			| "ENV"
 			| "ZDOTDIR"
+			| "NODE_OPTIONS"
 			| "HTTP_PROXY"
 			| "HTTPS_PROXY"
 			| "ALL_PROXY"
@@ -339,6 +343,7 @@ function expectDestination(
 		expect(spawn.BASH_ENV).toBe(expected.BASH_ENV ?? null);
 		expect(spawn.ENV).toBe(expected.ENV ?? null);
 		expect(spawn.ZDOTDIR).toBe(expected.ZDOTDIR ?? null);
+		expect(spawn.NODE_OPTIONS).toBe(expected.NODE_OPTIONS ?? null);
 		expect(spawn.HTTP_PROXY).toBe(expected.HTTP_PROXY ?? null);
 		expect(spawn.HTTPS_PROXY).toBe(expected.HTTPS_PROXY ?? null);
 		expect(spawn.ALL_PROXY).toBe(expected.ALL_PROXY ?? null);
@@ -409,9 +414,10 @@ APPDATA=project-appdata
 			dotenv: `BASH_ENV=/project/bash-startup
 ENV=/project/shell-startup
 ZDOTDIR=/project/zsh
+NODE_OPTIONS=--no-warnings
 `,
 		});
-		expectDestination(spawns, { BASH_ENV: null, ENV: null, ZDOTDIR: null });
+		expectDestination(spawns, { BASH_ENV: null, ENV: null, ZDOTDIR: null, NODE_OPTIONS: null });
 	});
 
 	it("omits project dotenv proxy and CA overrides from both gh spawns", async () => {
