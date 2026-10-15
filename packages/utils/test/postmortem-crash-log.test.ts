@@ -258,6 +258,12 @@ describe("recordFatalCrash", () => {
 		expect(redactedSingleQuote.endsWith(" note=keep")).toBe(true);
 		expect(redactedSingleQuote).not.toContain("a]x");
 		expect(redactedSingleQuote).not.toContain("second-secret");
+
+		for (const value of [serialized, serializedQuote]) {
+			const multiplySerialized = redactCrashSecrets(JSON.stringify(value));
+			expect(multiplySerialized).not.toContain("beta-secret");
+			expect(multiplySerialized).toContain("note=keep");
+		}
 	});
 
 	it("redacts backtick-quoted containers across embedded closing delimiters", () => {
@@ -405,6 +411,19 @@ describe("recordFatalCrash", () => {
 		expect(redacted.startsWith(String.raw`{\"authorization\":`)).toBe(true);
 		expect(redacted).toContain("«redacted»");
 		expect(redacted.endsWith(String.raw`,\"note\":\"keep\"}`)).toBe(true);
+	});
+
+	it("preserves diagnostics after escaped quoted values followed by punctuation", () => {
+		for (const input of [
+			String.raw`call(password=\"secret\") note=keep`,
+			String.raw`password=\"secret\": note=keep`,
+			String.raw`password=\"secret\". note=keep`,
+		]) {
+			const redacted = redactCrashSecrets(input);
+			expect(redacted).not.toContain("secret");
+			expect(redacted).toContain("«redacted»");
+			expect(redacted).toContain("note=keep");
+		}
 	});
 
 	it("preserves diagnostics after escaped newlines in authorization headers", () => {

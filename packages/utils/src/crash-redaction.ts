@@ -36,6 +36,7 @@ const CREDENTIAL_CONTAINER_CANDIDATE_PATTERN = new RegExp(
 const CREDENTIAL_CAMEL_ASSIGNMENT_PREFIX = String.raw`(?<![A-Za-z0-9_-])((?:\\*["']?-*)(?:${CREDENTIAL_CAMEL_KEY_PATTERN})(?:\\*["']?\s*[=:]\s*))`;
 const AUTHORIZATION_HEADER_PREFIX = String.raw`(?<![A-Za-z0-9_-])((?:\\*["']?-*)(?:[A-Za-z0-9][A-Za-z0-9_-]*[_-])?(?:auth|authorization)(?:\\*["']?\s*:\s*))`;
 const CREDENTIAL_UNQUOTED_VALUE_PATTERN_BODY = String.raw`(?:(?!\\+n|\\+r\\+n)(?:\\[^\r\n]|[^\s"',;}\]]))+`;
+const CREDENTIAL_VALUE_QUOTED_BOUNDARY = String.raw`(?=$|[\s,;}):.\]])`;
 const CREDENTIAL_AUTH_VALUE_PATTERN = new RegExp(
 	String.raw`${CREDENTIAL_ASSIGNMENT_PREFIX}(?:Bearer|Basic|Token)\s+${CREDENTIAL_UNQUOTED_VALUE_PATTERN_BODY}`,
 	"gi",
@@ -44,7 +45,7 @@ const CREDENTIAL_AUTHORIZATION_VALUE_PATTERN = new RegExp(
 	String.raw`${AUTHORIZATION_HEADER_PREFIX}(?!\s*(?:["'«]|\\+["']))(?:(?!\\+n|\\+r\\+n)[^\r\n])+`,
 	"gi",
 );
-const CREDENTIAL_VALUE_PATTERN_BODY = String.raw`(?:(\\+")((?:\\[\s\S]|[^"\\])*?)(\\+")(?=$|[\s,;}\]])|(")((?:\\[\s\S]|[^"\\])*)(")|(\\+')((?:\\[\s\S]|[^'\\])*?)(\\+')(?=$|[\s,;}\]])|(')((?:\\[\s\S]|[^'\\])*)(')|(\x60)((?:\\[\s\S]|[^\x60\\])*)(\x60)(?=$|[\s,;}\]])|(\\+")([^\r\n]*)(?=\r?\n|$)|(")([^\r\n]*)(?=\r?\n|$)|(\\+')([^\r\n]*)(?=\r?\n|$)|(')([^\r\n]*)(?=\r?\n|$)|(\x60)([^\r\n]*)(?=\r?\n|$)|(${CREDENTIAL_UNQUOTED_VALUE_PATTERN_BODY}))`;
+const CREDENTIAL_VALUE_PATTERN_BODY = String.raw`(?:(\\+")((?:\\[\s\S]|[^"\\])*?)(\\+")${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(")((?:\\[\s\S]|[^"\\])*)(")|(\\+')((?:\\[\s\S]|[^'\\])*?)(\\+')${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(')((?:\\[\s\S]|[^'\\])*)(')|(\x60)((?:\\[\s\S]|[^\x60\\])*)(\x60)${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(\\+")([^\r\n]*)(?=\r?\n|$)|(")([^\r\n]*)(?=\r?\n|$)|(\\+')([^\r\n]*)(?=\r?\n|$)|(')([^\r\n]*)(?=\r?\n|$)|(\x60)([^\r\n]*)(?=\r?\n|$)|(${CREDENTIAL_UNQUOTED_VALUE_PATTERN_BODY}))`;
 const CREDENTIAL_VALUE_PATTERN = new RegExp(`${CREDENTIAL_ASSIGNMENT_PREFIX}${CREDENTIAL_VALUE_PATTERN_BODY}`, "gi");
 const CREDENTIAL_CAMEL_VALUE_PATTERN = new RegExp(
 	`${CREDENTIAL_CAMEL_ASSIGNMENT_PREFIX}${CREDENTIAL_VALUE_PATTERN_BODY}`,
@@ -287,6 +288,8 @@ function redactCredentialContainersWithPattern(text: string, assignment: RegExp)
 	return copiedUntil === 0 ? text : output + text.slice(copiedUntil);
 }
 
+type EscapedQuoteDelimiter = { delimiter: "'" | '"'; backslashCount: number };
+
 function findCredentialContainerEnd(text: string, start: number): number {
 	const closing = [text[start] === "[" ? "]" : "}"];
 	const escapedQuoteDelimiter = findEscapedQuoteDelimiter(text, start);
@@ -298,10 +301,14 @@ function findCredentialContainerEnd(text: string, start: number): number {
 			while (text[backslashEnd + 1] === "\\") backslashEnd++;
 			const backslashCount = backslashEnd - index + 1;
 			const nextCharacter = text[backslashEnd + 1];
-			// In a serialized container, one backslash marks a structural quote; longer odd runs escape quote data.
-			if (escapedQuoteDelimiter !== undefined && nextCharacter === escapedQuoteDelimiter && backslashCount === 1) {
-				if (quote === undefined) quote = escapedQuoteDelimiter;
-				else if (quote === escapedQuoteDelimiter) quote = undefined;
+			// The opening escape run identifies this serialization layer; matching runs delimit strings.
+			if (
+				escapedQuoteDelimiter !== undefined &&
+				nextCharacter === escapedQuoteDelimiter.delimiter &&
+				backslashCount === escapedQuoteDelimiter.backslashCount
+			) {
+				if (quote === undefined) quote = escapedQuoteDelimiter.delimiter;
+				else if (quote === escapedQuoteDelimiter.delimiter) quote = undefined;
 				index = backslashEnd + 1;
 				continue;
 			}
@@ -326,7 +333,7 @@ function findCredentialContainerEnd(text: string, start: number): number {
 	return text.length;
 }
 
-function findEscapedQuoteDelimiter(text: string, start: number): "'" | '"' | undefined {
+function findEscapedQuoteDelimiter(text: string, start: number): EscapedQuoteDelimiter | undefined {
 	const closing = [text[start] === "[" ? "]" : "}"];
 	for (let index = start + 1; index < text.length; index++) {
 		const character = text[index] ?? "";
@@ -335,7 +342,9 @@ function findEscapedQuoteDelimiter(text: string, start: number): "'" | '"' | und
 			while (text[backslashEnd + 1] === "\\") backslashEnd++;
 			const backslashCount = backslashEnd - index + 1;
 			const nextCharacter = text[backslashEnd + 1];
-			if ((nextCharacter === '"' || nextCharacter === "'") && backslashCount % 2 === 1) return nextCharacter;
+			if ((nextCharacter === '"' || nextCharacter === "'") && backslashCount % 2 === 1) {
+				return { delimiter: nextCharacter, backslashCount };
+			}
 			index = nextCharacter !== undefined && backslashCount % 2 === 1 ? backslashEnd + 1 : backslashEnd;
 			continue;
 		}
