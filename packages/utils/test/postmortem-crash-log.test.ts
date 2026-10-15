@@ -353,6 +353,21 @@ describe("recordFatalCrash", () => {
 		);
 	});
 
+	it("redacts shell-escaped delimiters inside unquoted credential values", () => {
+		const input = String.raw`password=correct\;horse api_key=correct\,comma authToken=correct\"quote dbPassword=correct\}brace githubToken=correct\]bracket diagnostic=keep`;
+		expect(redactCrashSecrets(input)).toBe(
+			"password=«redacted» api_key=«redacted» authToken=«redacted» dbPassword=«redacted» githubToken=«redacted» diagnostic=keep",
+		);
+
+		const authorization = redactCrashSecrets(String.raw`authorization: Bearer correct\;horse diagnostic=keep`);
+		expect(authorization).toBe("authorization: «redacted» diagnostic=keep");
+
+		const escapedNewline = redactCrashSecrets(String.raw`password=opaque-secret\nnext=keep`);
+		expect(escapedNewline.startsWith("password=«redacted»")).toBe(true);
+		expect(escapedNewline.endsWith(String.raw`\nnext=keep`)).toBe(true);
+		expect(escapedNewline).not.toContain("opaque-secret");
+	});
+
 	it("bounds matching work for long non-credential compound keys", () => {
 		const longKey = `${"a-".repeat(10_000)}tokenx`;
 		const longAcronymKey = `a${"A".repeat(20_000)}x`;
