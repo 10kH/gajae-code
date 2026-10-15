@@ -506,6 +506,10 @@ export interface ReconcileResult {
 	readonly reason?: string;
 	/** Present only for a pre-mutation Windows exact-replacement failure. */
 	readonly windowsErrorCode?: string;
+	readonly detachedPath?: string;
+	readonly retainedSuccessorPath?: string;
+	readonly retainedPlaceholderPath?: string;
+	readonly retainedUnknownPath?: string;
 }
 
 /**
@@ -673,6 +677,14 @@ export async function reconcileActivationRecord(
 				record,
 				reason: result.code ?? "activation_promotion_failed",
 				...(result.windowsErrorCode ? { windowsErrorCode: result.windowsErrorCode } : {}),
+				...(result.detachedPath !== undefined ? { detachedPath: result.detachedPath } : {}),
+				...(result.retainedSuccessorPath !== undefined
+					? { retainedSuccessorPath: result.retainedSuccessorPath }
+					: {}),
+				...(result.retainedPlaceholderPath !== undefined
+					? { retainedPlaceholderPath: result.retainedPlaceholderPath }
+					: {}),
+				...(result.retainedUnknownPath !== undefined ? { retainedUnknownPath: result.retainedUnknownPath } : {}),
 			};
 		}
 		const promoted = await snapshotRegularFile(targetPath);

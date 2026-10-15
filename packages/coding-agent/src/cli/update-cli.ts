@@ -38,6 +38,7 @@ import {
 	createActivationRecordFile,
 	type DirectoryIdentity,
 	type FileIdentity,
+	type ReconcileResult,
 	readActivationRecord,
 	reconcileActivationRecord,
 	sameDirectoryIdentity,
@@ -108,6 +109,24 @@ export interface BinaryReplacementOptions {
 	verifyInstalledVersion: (expectedVersion: string) => Promise<InstalledVersionVerification>;
 }
 
+function formatRetainedActivationPaths(
+	paths:
+		| Pick<
+				ReconcileResult,
+				"detachedPath" | "retainedSuccessorPath" | "retainedPlaceholderPath" | "retainedUnknownPath"
+		  >
+		| undefined,
+): string {
+	if (!paths) return "";
+	const entries = [
+		paths.detachedPath !== undefined ? `detached=${paths.detachedPath}` : undefined,
+		paths.retainedSuccessorPath !== undefined ? `successor=${paths.retainedSuccessorPath}` : undefined,
+		paths.retainedPlaceholderPath !== undefined ? `placeholder=${paths.retainedPlaceholderPath}` : undefined,
+		paths.retainedUnknownPath !== undefined ? `unknown=${paths.retainedUnknownPath}` : undefined,
+	].filter((entry): entry is string => entry !== undefined);
+	return entries.length > 0 ? `; retained paths: ${entries.join("|")}` : "";
+}
+
 export class InstallationAccessDeniedError extends Error {
 	readonly code = "access_denied";
 
@@ -115,9 +134,13 @@ export class InstallationAccessDeniedError extends Error {
 		readonly targetPath: string,
 		readonly windowsErrorCode?: string,
 		readonly stagingCleanupWarning?: string,
+		readonly retainedPaths?: Pick<
+			ReconcileResult,
+			"detachedPath" | "retainedSuccessorPath" | "retainedPlaceholderPath" | "retainedUnknownPath"
+		>,
 	) {
 		super(
-			`access_denied during exact replacement of ${targetPath}${windowsErrorCode ? ` (${windowsErrorCode})` : ""}${stagingCleanupWarning ? `; ${stagingCleanupWarning}` : ""}`,
+			`access_denied during exact replacement of ${targetPath}${windowsErrorCode ? ` (${windowsErrorCode})` : ""}${stagingCleanupWarning ? `; ${stagingCleanupWarning}` : ""}${formatRetainedActivationPaths(retainedPaths)}`,
 		);
 		this.name = "InstallationAccessDeniedError";
 	}
@@ -995,7 +1018,12 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 			? await tryRemoveExactStagingFile(redundantStage.path, redundantStage.identity)
 			: undefined;
 		if (promoted.reason === "access_denied")
-			throw new InstallationAccessDeniedError(targetPath, promoted.windowsErrorCode, stagingCleanupWarning);
+			throw new InstallationAccessDeniedError(targetPath, promoted.windowsErrorCode, stagingCleanupWarning, {
+				detachedPath: promoted.detachedPath,
+				retainedSuccessorPath: promoted.retainedSuccessorPath,
+				retainedPlaceholderPath: promoted.retainedPlaceholderPath,
+				retainedUnknownPath: promoted.retainedUnknownPath,
+			});
 		if (stagingCleanupWarning)
 			logger.warn("Update staging cleanup failed after activation reconciliation failed", {
 				reason: promoted.reason ?? promoted.status,
@@ -1005,6 +1033,7 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 	}
 	record = promoted.record;
 	recordIdentity = promoted.recordIdentity;
+	const cleanupWarnings: string[] = [];
 	try {
 		let verification = await options.verifyInstalledVersion(options.expectedVersion);
 		if (!verification.ok) throw new Error(formatVerificationFailure(verification, options.expectedVersion));
@@ -1013,17 +1042,21 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 			throw new Error("installation_postcheck_identity_changed");
 		if (redundantStage) {
 			const cleanupWarning = await tryRemoveExactStagingFile(redundantStage.path, redundantStage.identity);
-			if (cleanupWarning) verification = { ...verification, cleanupWarning };
+			if (cleanupWarning) {
+				cleanupWarnings.push(cleanupWarning);
+				verification = { ...verification, cleanupWarning };
+			}
 		}
 		await updateActivationRecordFile({ ...record, phase: "verified" }, recordIdentity);
 		return verification;
 	} catch (primary) {
-		const stagingCleanupWarning = redundantStage
+		const rollbackCleanupWarning = redundantStage
 			? await tryRemoveExactStagingFile(redundantStage.path, redundantStage.identity)
 			: undefined;
-		if (stagingCleanupWarning)
+		if (rollbackCleanupWarning) cleanupWarnings.push(rollbackCleanupWarning);
+		if (cleanupWarnings.length > 0)
 			logger.warn("Update staging cleanup failed before activation rollback", {
-				warning: stagingCleanupWarning,
+				warning: cleanupWarnings.join("\n"),
 			});
 		try {
 			const after = await snapshotRegularFile(targetPath);
