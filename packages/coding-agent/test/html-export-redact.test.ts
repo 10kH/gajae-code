@@ -422,7 +422,7 @@ describe("session HTML export embed", () => {
 		try {
 			session = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
 			const note =
-				'safe=keep credentials=["alpha","beta"] secrets={primary:alpha,secondary:{nested:[beta]}} metadata=["public"]\nCookie: theme=dark; sid=opaque-cookie-session\nafter=keep\nCookie: theme=light\\nserialized-after=keep';
+				'safe=keep credentials=["alpha","beta"] secrets={primary:alpha,secondary:{nested:[beta]}} metadata=["public"] credentials={primary:\\`a}x\\`,secondary:\\`second-secret\\`} escaped-note=keep\nCookie: theme=dark; sid=opaque-cookie-session\nafter=keep\nCookie: theme=light\\nserialized-after=keep';
 			session.appendMessage({
 				role: "assistant",
 				content: [
@@ -447,6 +447,8 @@ describe("session HTML export embed", () => {
 			expect(embedded).not.toContain("beta");
 			expect(exportedNote).toContain("credentials=«redacted»");
 			expect(exportedNote).toContain("secrets=«redacted»");
+			expect(exportedNote).not.toContain("second-secret");
+			expect(exportedNote).toContain("escaped-note=keep");
 			expect(exportedNote).toContain('metadata=["public"]');
 			expect(exportedNote).not.toContain("theme=dark");
 			expect(exportedNote).not.toContain("opaque-cookie-session");

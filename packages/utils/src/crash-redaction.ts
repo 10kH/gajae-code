@@ -43,7 +43,7 @@ const CREDENTIAL_AUTH_VALUE_PATTERN = new RegExp(
 	"gi",
 );
 const CREDENTIAL_AUTHORIZATION_VALUE_PATTERN = new RegExp(
-	String.raw`${AUTHORIZATION_HEADER_PREFIX}(?!\s*(?:["'«\x60]|\\+["']))(?:(?!\\+n|\\+r\\+n)[^\r\n])+`,
+	String.raw`${AUTHORIZATION_HEADER_PREFIX}(?!\s*(?:["'«\x60]|\\+["'\x60]))(?:(?!\\+n|\\+r\\+n)[^\r\n])+`,
 	"gi",
 );
 const CREDENTIAL_VALUE_PATTERN_BODY = String.raw`(?:(\\+")((?:\\[\s\S]|[^"\\])*?)(\\+")${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(")((?:\\[\s\S]|[^"\\])*)(")|(\\+')((?:\\[\s\S]|[^'\\])*?)(\\+')${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(')((?:\\[\s\S]|[^'\\])*)(')|(\x60)((?:\\[\s\S]|[^\x60\\])*)(\x60)${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(\\+")([^\r\n]*)(?=\r?\n|$)|(")([^\r\n]*)(?=\r?\n|$)|(\\+')([^\r\n]*)(?=\r?\n|$)|(')([^\r\n]*)(?=\r?\n|$)|(\x60)([^\r\n]*)(?=\r?\n|$)|(${CREDENTIAL_UNQUOTED_VALUE_PATTERN_BODY}))`;
@@ -326,7 +326,7 @@ function redactCredentialContainersWithPattern(text: string, assignment: RegExp)
 	return copiedUntil === 0 ? text : output + text.slice(copiedUntil);
 }
 
-type EscapedQuoteDelimiter = { delimiter: "'" | '"'; backslashCount: number };
+type EscapedQuoteDelimiter = { delimiter: "'" | '"' | "`"; backslashCount: number };
 
 function findCredentialContainerEnd(text: string, start: number): number {
 	const closing = [text[start] === "[" ? "]" : "}"];
@@ -380,13 +380,13 @@ function findEscapedQuoteDelimiter(text: string, start: number): EscapedQuoteDel
 			while (text[backslashEnd + 1] === "\\") backslashEnd++;
 			const backslashCount = backslashEnd - index + 1;
 			const nextCharacter = text[backslashEnd + 1];
-			if ((nextCharacter === '"' || nextCharacter === "'") && backslashCount % 2 === 1) {
+			if ((nextCharacter === '"' || nextCharacter === "'" || nextCharacter === "`") && backslashCount % 2 === 1) {
 				return { delimiter: nextCharacter, backslashCount };
 			}
 			index = nextCharacter !== undefined && backslashCount % 2 === 1 ? backslashEnd + 1 : backslashEnd;
 			continue;
 		}
-		if (character === '"' || character === "'") return undefined;
+		if (character === '"' || character === "'" || character === "`") return undefined;
 		if (character === "[") closing.push("]");
 		else if (character === "{") closing.push("}");
 		else if (character === closing[closing.length - 1]) {

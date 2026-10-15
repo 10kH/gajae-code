@@ -273,6 +273,9 @@ describe("recordFatalCrash", () => {
 		expect(redacted).toBe("credentials=«redacted» note=keep");
 		expect(redacted).not.toContain("alpha}suffix");
 		expect(redacted).not.toContain("beta-secret");
+
+		const escaped = "credentials={primary:\\`a}x\\`,secondary:\\`second-secret\\`} note=keep";
+		expect(redactCrashSecrets(escaped)).toBe("credentials=«redacted» note=keep");
 	});
 
 	it("redacts complete Cookie headers and assignments without consuming diagnostics", async () => {
@@ -326,6 +329,9 @@ describe("recordFatalCrash", () => {
 		);
 		expect(redactCrashSecrets("authorization: `Bearer abc`, note=keep")).toBe(
 			"authorization: `«redacted»`, note=keep",
+		);
+		expect(redactCrashSecrets("authorization: \\`Bearer abc def\\`, note=keep")).toBe(
+			"authorization: \\`«redacted»\\`, note=keep",
 		);
 	});
 
