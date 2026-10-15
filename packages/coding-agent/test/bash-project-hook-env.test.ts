@@ -18,9 +18,12 @@ const HOOK_KEYS = [
 	"BASH_ENV",
 	"NODE_OPTIONS",
 	"PYTHONPATH",
+	"PYTHONUSERBASE",
+	"PYTHONSTARTUP",
 	"PERL5OPT",
 	"PERL5LIB",
 	"JAVA_TOOL_OPTIONS",
+	"JDK_JAVA_OPTIONS",
 	"LD_PRELOAD",
 	"LD_AUDIT",
 	"LD_LIBRARY_PATH",
@@ -194,6 +197,29 @@ describe.skipIf(process.platform === "win32")("bash tool ignores project .env ho
 			},
 		},
 		{
+			name: "PYTHONUSERBASE",
+			binary: "python3",
+			command: "python3 -c 0",
+			plant: ({ cwd, marker }) => {
+				const userBase = path.join(cwd, "userbase");
+				const python = Bun.which("python3");
+				if (!python) throw new Error("python3 is required to find the user site path");
+				const site = Bun.spawnSync([python, "-c", "import site; print(site.USER_SITE)"], {
+					cwd,
+					env: { ...process.env, PYTHONUSERBASE: userBase, PYTHONPATH: undefined, PYTHONSTARTUP: undefined },
+				});
+				if (site.exitCode !== 0) throw new Error(`python3 failed: ${site.stderr.toString()}`);
+				const userSite = site.stdout.toString().trim();
+				if (!userSite || userSite === "None") throw new Error("python3 did not report a user site path");
+				fs.mkdirSync(userSite, { recursive: true });
+				fs.writeFileSync(
+					path.join(userSite, "usercustomize.py"),
+					`open(${JSON.stringify(marker)}, "w").write("ran")\n`,
+				);
+				return `PYTHONUSERBASE=${userBase}\n`;
+			},
+		},
+		{
 			name: "PERL5OPT",
 			binary: "perl",
 			command: "perl -e 0",
@@ -217,31 +243,33 @@ describe.skipIf(process.platform === "win32")("bash tool ignores project .env ho
 		);
 	}
 
-	// The JVM loads a `-javaagent` from JAVA_TOOL_OPTIONS before `main`.
-	it.skipIf(!Bun.which("javac") || !Bun.which("jar") || !Bun.which("java"))(
-		"does not let a project JAVA_TOOL_OPTIONS agent load into java",
-		async () => {
-			const target = project(({ cwd, marker }) => {
-				const source = path.join(cwd, "Planted.java");
-				fs.writeFileSync(
-					source,
-					`public class Planted { public static void premain(String a) throws Exception { java.nio.file.Files.write(java.nio.file.Paths.get(${JSON.stringify(marker)}), new byte[0]); } }\n`,
-				);
-				fs.writeFileSync(path.join(cwd, "manifest.txt"), "Premain-Class: Planted\n");
-				for (const argv of [
-					["javac", source],
-					["jar", "cfm", "planted.jar", "manifest.txt", "Planted.class"],
-				]) {
-					const step = Bun.spawnSync(argv, { cwd });
-					if (step.exitCode !== 0) throw new Error(`${argv[0]} failed: ${step.stderr.toString()}`);
-				}
-				return `JAVA_TOOL_OPTIONS=-javaagent:${path.join(cwd, "planted.jar")}\n`;
-			});
-			const command = "java -version >/dev/null 2>&1; echo probe-done";
-			expect(await runProbe(target, "worker", { GJC_TEST_PROBE_COMMAND: command })).toBe(false);
-		},
-		60_000,
-	);
+	// The JVM loads a `-javaagent` from JAVA_TOOL_OPTIONS and JDK_JAVA_OPTIONS before `main`.
+	for (const key of ["JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS"]) {
+		it.skipIf(!Bun.which("javac") || !Bun.which("jar") || !Bun.which("java"))(
+			`does not let a project ${key} agent load into java`,
+			async () => {
+				const target = project(({ cwd, marker }) => {
+					const source = path.join(cwd, "Planted.java");
+					fs.writeFileSync(
+						source,
+						`public class Planted { public static void premain(String a) throws Exception { java.nio.file.Files.write(java.nio.file.Paths.get(${JSON.stringify(marker)}), new byte[0]); } }\n`,
+					);
+					fs.writeFileSync(path.join(cwd, "manifest.txt"), "Premain-Class: Planted\n");
+					for (const argv of [
+						["javac", source],
+						["jar", "cfm", "planted.jar", "manifest.txt", "Planted.class"],
+					]) {
+						const step = Bun.spawnSync(argv, { cwd });
+						if (step.exitCode !== 0) throw new Error(`${argv[0]} failed: ${step.stderr.toString()}`);
+					}
+					return `${key}=-javaagent:${path.join(cwd, "planted.jar")}\n`;
+				});
+				const command = "java -version >/dev/null 2>&1; echo probe-done";
+				expect(await runProbe(target, "worker", { GJC_TEST_PROBE_COMMAND: command })).toBe(false);
+			},
+			60_000,
+		);
+	}
 
 	// The dynamic loader runs a preloaded library in every dynamically linked
 	// command, including a plain `ls`.
@@ -341,6 +369,19 @@ describe.skipIf(process.platform === "win32")("bash tool ignores project .env ho
 		const command = "python3 -c 0 >/dev/null 2>&1; echo probe-done";
 		expect(await runProbe(target, "worker", { PYTHONPATH: trusted, GJC_TEST_PROBE_COMMAND: command })).toBe(true);
 	});
+
+	it.skipIf(process.platform !== "linux" || !Bun.which("python3") || !Bun.which("script"))(
+		"does not run a project PYTHONSTARTUP file in the interactive PTY",
+		async () => {
+			const target = project(({ cwd, marker }) => {
+				const startup = path.join(cwd, "startup.py");
+				fs.writeFileSync(startup, `open(${JSON.stringify(marker)}, "w").write("ran")\n`);
+				return `PYTHONSTARTUP=${startup}\n`;
+			});
+			const command = "printf 'exit()\\n' | script -qec 'python3' /dev/null; echo probe-done";
+			expect(await runProbe(target, "pty", { ...forwarded(target), GJC_TEST_PROBE_COMMAND: command })).toBe(false);
+		},
+	);
 
 	// The PTY runs a real `bash -lc` that inherits the host environment. A
 	// top-level host never holds dotenv values there, but a child GJC launched
