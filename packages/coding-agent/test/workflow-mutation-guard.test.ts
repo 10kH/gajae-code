@@ -2091,6 +2091,7 @@ describe("bash scanner quoting model", () => {
 			`awk 'BEGIN{printf "PWNED" > "src/product.ts"}'`,
 			`awk -v x=1 'BEGIN { print "PWNED" > "src/product.ts" }' input`,
 			`awk 'BEGIN { print 1; print "PWNED" > "src/product.ts" }' input`,
+			`if awk 'BEGIN { print "PWNED" > "src/product.ts" }' input; then :; fi`,
 			"ln -sf stage/pwn.txt src/product.ts",
 			`python3 -c "import os; os.symlink('stage/pwn.txt','src/pwn-link.ts')"`,
 		];
@@ -2132,7 +2133,9 @@ describe("bash scanner quoting model", () => {
 			"sed -n 's/a/b/p' src/product.ts",
 			"awk '$1 > 5 {print $1}' src/product.ts",
 			`awk '$1 > "m" { print }' input`,
+			`awk 'BEGIN { print 1 # > "src/product.ts"\n}' input`,
 			`awk -v x=1 'BEGIN { print x }' input`,
+			`if awk '$1 > "m" { print }' input; then :; fi`,
 			`python3 -c "import os; os.system('ls')"`,
 			`python3 -c "print(1)"`,
 			`node -e "console.log(1)"`,

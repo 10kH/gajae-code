@@ -1579,7 +1579,7 @@ const BASH_SED_COMMAND_RE = new RegExp(
 	"gi",
 );
 const BASH_AWK_COMMAND_RE = new RegExp(
-	`(?:^|[;&|(\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|()]*\\/)?awk\\b((?:'[^']*'|"(?:\\\\.|[^"\\\\])*"|\\\\.|[^'";&|()\\n\\\\])*)`,
+	`(?:^|[;&|(\\n])\\s*(?:(?:if|then|else|elif|do|in)\\s+)*(?:!\\s+)?(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|()]*\\/)?awk\\b((?:'[^']*'|"(?:\\\\.|[^"\\\\])*"|\\\\.|[^'";&|()\\n\\\\])*)`,
 	"gi",
 );
 
@@ -1933,12 +1933,10 @@ interface AwkToken {
 function tokenizeAwkProgram(program: string): { tokens: AwkToken[]; balanced: boolean } {
 	const tokens: AwkToken[] = [];
 	let balanced = true;
-	let lineHasOnlyWhitespace = true;
 	for (let index = 0; index < program.length; ) {
 		const character = program[index] ?? "";
 		if (character === "\n") {
 			tokens.push({ kind: "separator", value: character });
-			lineHasOnlyWhitespace = true;
 			index++;
 			continue;
 		}
@@ -1946,7 +1944,7 @@ function tokenizeAwkProgram(program: string): { tokens: AwkToken[]; balanced: bo
 			index++;
 			continue;
 		}
-		if (character === "#" && lineHasOnlyWhitespace) {
+		if (character === "#") {
 			while (index < program.length && program[index] !== "\n") index++;
 			continue;
 		}
@@ -1974,7 +1972,6 @@ function tokenizeAwkProgram(program: string): { tokens: AwkToken[]; balanced: bo
 			}
 			if (!closed) balanced = false;
 			tokens.push({ kind: "string", value, escaped });
-			lineHasOnlyWhitespace = false;
 			continue;
 		}
 		if (character === "/" && awkRegexCanStart(tokens)) {
@@ -1983,7 +1980,6 @@ function tokenizeAwkProgram(program: string): { tokens: AwkToken[]; balanced: bo
 			else {
 				tokens.push({ kind: "symbol", value: "regex" });
 				index = end;
-				lineHasOnlyWhitespace = false;
 				continue;
 			}
 		}
@@ -1991,19 +1987,16 @@ function tokenizeAwkProgram(program: string): { tokens: AwkToken[]; balanced: bo
 			const start = index++;
 			while (/[A-Za-z0-9_]/.test(program[index] ?? "")) index++;
 			tokens.push({ kind: "word", value: program.slice(start, index) });
-			lineHasOnlyWhitespace = false;
 			continue;
 		}
 		if (character === ";") {
 			tokens.push({ kind: "separator", value: character });
-			lineHasOnlyWhitespace = false;
 			index++;
 			continue;
 		}
 		const pair = program.slice(index, index + 2);
 		const operator = [">>", ">=", "==", "!=", "<=", "&&", "||", "!~", "++", "--"].includes(pair) ? pair : character;
 		tokens.push({ kind: "symbol", value: operator });
-		lineHasOnlyWhitespace = false;
 		index += operator.length;
 	}
 	return { tokens, balanced };
