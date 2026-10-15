@@ -764,6 +764,92 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 			await fs.rm(agentDir, { recursive: true, force: true });
 		}
 	});
+
+	it("stops a concurrent root waiter when attachment retirement closes an in-flight post", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-root-retirement-"));
+		const releasePost = Promise.withResolvers<void>();
+		const key = "T1:C1:intent:session";
+		let endpointCurrent = true;
+		let retiring = false;
+		let retirementNowCalls = 0;
+		let first: SlackNotificationDaemon | undefined;
+		let publisherResult: Promise<{ status: "fulfilled" } | { status: "rejected"; error: unknown }> | undefined;
+		let waiterResult: Promise<{ status: "fulfilled" } | { status: "rejected"; error: unknown }> | undefined;
+		try {
+			const fake = new FakeSlack();
+			fake.postGate = releasePost.promise;
+			const base = {
+				agentDir,
+				repo: agentDir,
+				teamId: "T1",
+				channelId: "C1",
+				provider: new SlackProvider(fake),
+				resolveAttachment: async (sessionId: string) => (endpointCurrent ? endpoint(sessionId) : null),
+				publicationLeaseMs: 60_000,
+				now: () => (retiring ? (retirementNowCalls++ === 0 ? 1 : 5_002) : 1),
+			};
+			first = new SlackNotificationDaemon({
+				...base,
+				randomId: () => "stable-root-id",
+				publicationOwnerId: "first",
+			});
+			const second = new SlackNotificationDaemon({
+				...base,
+				randomId: () => "stable-root-id",
+				publicationOwnerId: "second",
+			});
+			publisherResult = first.postRoot("session", "root").then(
+				() => ({ status: "fulfilled" as const }),
+				error => ({ status: "rejected" as const, error }),
+			);
+			await fake.waitForPostStartCount(1);
+			waiterResult = second.postRoot("session", "root").then(
+				() => ({ status: "fulfilled" as const }),
+				error => ({ status: "rejected" as const, error }),
+			);
+			const waiterPending = await Promise.race([waiterResult.then(() => false), Bun.sleep(25).then(() => true)]);
+			expect(waiterPending).toBe(true);
+
+			const pending = await first.store.read(key);
+			expect(pending?.state).toBe("posting_root");
+			endpointCurrent = false;
+			retiring = true;
+			await first.retireAttachment("session", 1);
+			const retired = await first.store.read(key);
+			expect(retired?.state).toBe("closed_marker");
+			expect(retired?.rootPublicationOwner).toBeUndefined();
+			expect(retired?.rootPublicationLeaseExpiresAt).toBeUndefined();
+			expect(retired?.rootPublicationFence).toBeGreaterThan(pending?.rootPublicationFence ?? 0);
+			const waiterOutcome = await Promise.race([waiterResult, Bun.sleep(250).then(() => undefined)]);
+			expect(waiterOutcome?.status).toBe("rejected");
+			if (waiterOutcome?.status !== "rejected") throw new Error("Retired Slack root waiter did not reject");
+			expect(waiterOutcome.error).toBeInstanceOf(SlackEndpointBindingError);
+
+			releasePost.resolve();
+			const publisherOutcome = await publisherResult;
+			expect(publisherOutcome.status).toBe("rejected");
+			expect((await first.store.read(key))?.state).toBe("closed_marker");
+		} finally {
+			endpointCurrent = false;
+			releasePost.resolve();
+			if (first) {
+				await first.store.transact(key, current =>
+					current
+						? {
+								...current,
+								generation: current.generation + 1,
+								state: "error",
+								rootPublicationOwner: undefined,
+								rootPublicationLeaseExpiresAt: undefined,
+							}
+						: current,
+				);
+			}
+			if (publisherResult) await publisherResult;
+			if (waiterResult) await waiterResult;
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
 	it("renews a live action lease across an external-call overrun", async () => {
 		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-action-renewal-"));
 		try {
