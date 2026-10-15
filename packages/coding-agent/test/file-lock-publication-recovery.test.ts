@@ -845,6 +845,32 @@ test("rejects a zero retry budget before replaying retained staging cleanup", as
 	await expect(fs.readdir(root)).resolves.toEqual([]);
 });
 
+test("allows an infinite retry budget while honoring cancellation", async () => {
+	const { root, file, lock } = await makeFixture();
+	const controller = new AbortController();
+	const reason = new Error("cancelled infinite lock retry");
+	let publicationAttempts = 0;
+	FileLockTestHooks.nativePublicationBindings = () => ({
+		renameNoReplacePathAsync: async () => {
+			publicationAttempts++;
+			controller.abort(reason);
+			return destinationExistsPublication();
+		},
+		renameDirectoryNoReplacePathAsync,
+	});
+
+	await expect(
+		acquireFileLock(file, {
+			retries: Number.POSITIVE_INFINITY,
+			retryDelayMs: 1,
+			signal: controller.signal,
+		}),
+	).rejects.toBe(reason);
+	expect(publicationAttempts).toBe(1);
+	await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
+	expect(await fs.readdir(root)).toEqual([]);
+});
+
 test("drains destination-exists cleanup before creating another staging directory", async () => {
 	const { root, file, lock } = await makeFixture();
 	let publicationAttempts = 0;

@@ -3045,7 +3045,7 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 	if (options.previousOwnerHostIds?.some(hostId => !hostId))
 		throw new Error("previousOwnerHostIds must contain only non-empty identities");
 	const opts = { ...DEFAULT_OPTIONS, ...options };
-	if (!Number.isSafeInteger(opts.retries) || opts.retries < 1)
+	if (opts.retries !== Number.POSITIVE_INFINITY && (!Number.isSafeInteger(opts.retries) || opts.retries < 1))
 		throw new RangeError("retries must be a positive safe integer");
 	const orphanTransitionAgeMs = options.orphanTransitionAgeMs ?? options.staleMs ?? DEFAULT_OPTIONS.staleMs;
 	if (!Number.isFinite(orphanTransitionAgeMs) || orphanTransitionAgeMs < 0)
