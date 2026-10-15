@@ -72,20 +72,31 @@ user source does not write into the project unless the destination was selected
 as project. The source is read only during preview/apply and is never mutated.
 
 For non-interactive migration, `gjc migrate --from claude-code|codex` imports
-MCP servers, skills, and the selected scope's instructions into `AGENTS.md`.
-User scope is the default: Claude Code reads `~/.claude/CLAUDE.md` and Codex
-reads `~/.codex/AGENTS.md`, writing instructions to `~/.gjc/agent/AGENTS.md`.
-With `--project`, Claude Code reads the project-root `CLAUDE.md` and writes it
-to `<project>/.gjc/AGENTS.md`. A project-root Codex `AGENTS.md` is already a
-native GJC instruction source, so it is left in place rather than copied.
+MCP servers, skills, Markdown slash commands, and the selected scope's
+instructions into `AGENTS.md`. User scope is the default: Claude Code reads
+`~/.claude/CLAUDE.md` and `~/.claude/commands/`, while Codex reads
+`~/.codex/AGENTS.md` and `~/.codex/prompts/`. User instructions go to
+`~/.gjc/agent/AGENTS.md`, and commands go to `~/.gjc/agent/commands/`.
+
+With `--project`, Claude Code reads the project-root `CLAUDE.md` and
+`.claude/commands/`, writing to `<project>/.gjc/AGENTS.md` and
+`<project>/.gjc/commands/`. A project-root Codex `AGENTS.md` is already a
+native GJC instruction source, so it is left in place rather than copied;
+Codex's user prompts remain the command source for either destination scope.
+Nested Claude command paths become colon-separated names, so
+`.claude/commands/review/security.md` is imported as `/review:security`.
+Command Markdown and frontmatter are preserved; GJC uses the `description`
+field and its own argument placeholders, but does not translate Claude-specific
+metadata such as tool restrictions or model selection.
+
 `--dry-run` reports the planned imports and skips without writing; `--force`
-explicitly updates existing destination files. Instruction writes refuse to
-follow symlinked destination directories. Codex prompts are imported as skills.
-Claude Code commands, subagents, extensions, Claude Code/Codex hooks and
-settings (model, permissions, and environment), and optional session history are
-not imported by this command and still need manual migration. This is not a
-replacement for the all-surface `/extensions` preview. Direct native MCP
-registration uses `gjc mcp add`; see the linked MCP reference.
+explicitly updates existing destination files. Instruction and command writes
+refuse to follow symlinked destination directories. Codex prompts are imported
+as slash commands, not skills. Claude Code subagents, extensions,
+Claude Code/Codex hooks and settings (model, permissions, and environment), and
+optional session history are not imported by this command and still need manual
+migration. This is not a replacement for the all-surface `/extensions` preview.
+Direct native MCP registration uses `gjc mcp add`; see the linked MCP reference.
 
 ### Effective runtime precedence
 

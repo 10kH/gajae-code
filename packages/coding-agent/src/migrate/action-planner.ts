@@ -371,5 +371,134 @@ export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 		}
 	}
 
+	// 5. Slash commands — command names map to the scoped commands directory.
+	const plannedCommands = new Set<string>();
+	const validCommandNameSegment = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+	for (const result of input.results) {
+		for (const candidate of result.slashCommandCandidates) {
+			const nameParts = candidate.name.split(":");
+			if (!nameParts.every(part => validCommandNameSegment.test(part))) {
+				actions.push({
+					source: candidate.source,
+					type: "command",
+					name: candidate.name,
+					operation: "fail",
+					status: "failed_invalid_source",
+					reason:
+						"slash command name must use letters, numbers, dots, underscores, or hyphens separated by colons",
+				});
+				continue;
+			}
+
+			const destination = path.join(
+				input.destinations.commandsDir,
+				...nameParts.slice(0, -1),
+				`${nameParts[nameParts.length - 1]}.md`,
+			);
+			const base = { source: candidate.source, type: "command" as const, name: candidate.name, destination };
+			if (plannedCommands.has(destination)) {
+				if (input.force) {
+					actions.push({
+						...base,
+						operation: "update",
+						status: "updated",
+						reason: "duplicate within this run (overwritten under --force)",
+						command: { content: candidate.content },
+					});
+				} else {
+					actions.push({
+						...base,
+						operation: "skip",
+						status: "skipped_exists",
+						reason: "duplicate within this run",
+					});
+				}
+				continue;
+			}
+
+			const destinationDirectories = [path.dirname(input.destinations.commandsDir), input.destinations.commandsDir];
+			let commandDirectory = input.destinations.commandsDir;
+			for (const segment of nameParts.slice(0, -1)) {
+				commandDirectory = path.join(commandDirectory, segment);
+				destinationDirectories.push(commandDirectory);
+			}
+			let unsafeDirectory: string | undefined;
+			let directoryReadError: unknown;
+			for (const directory of destinationDirectories) {
+				try {
+					const stat = await fs.lstat(directory);
+					if (!stat.isDirectory() || stat.isSymbolicLink()) {
+						unsafeDirectory = directory;
+						break;
+					}
+				} catch (error) {
+					if (!isEnoent(error)) {
+						directoryReadError = error;
+						break;
+					}
+				}
+			}
+			if (directoryReadError) {
+				actions.push({
+					...base,
+					operation: "fail",
+					status: "failed_io",
+					reason: `failed to inspect command destination directory: ${(directoryReadError as Error).message}`,
+				});
+				plannedCommands.add(destination);
+				continue;
+			}
+			if (unsafeDirectory) {
+				actions.push({
+					...base,
+					operation: input.force ? "fail" : "skip",
+					status: input.force ? "failed_invalid_destination" : "skipped_exists",
+					reason: `command destination ancestor is not a real directory: ${unsafeDirectory}`,
+				});
+				plannedCommands.add(destination);
+				continue;
+			}
+
+			let exists = false;
+			try {
+				const stat = await fs.lstat(destination);
+				exists = true;
+				if (!stat.isFile() || stat.isSymbolicLink()) {
+					actions.push({
+						...base,
+						operation: input.force ? "fail" : "skip",
+						status: input.force ? "failed_invalid_destination" : "skipped_exists",
+						reason: "destination is not a regular file; refusing to replace it",
+					});
+					plannedCommands.add(destination);
+					continue;
+				}
+			} catch (error) {
+				if (!isEnoent(error)) {
+					actions.push({
+						...base,
+						operation: "fail",
+						status: "failed_io",
+						reason: `failed to inspect command destination: ${(error as Error).message}`,
+					});
+					plannedCommands.add(destination);
+					continue;
+				}
+			}
+
+			if (exists && !input.force) {
+				actions.push({ ...base, operation: "skip", status: "skipped_exists" });
+			} else {
+				actions.push({
+					...base,
+					operation: exists ? "update" : "create",
+					status: exists ? "updated" : "imported",
+					command: { content: candidate.content },
+				});
+			}
+			plannedCommands.add(destination);
+		}
+	}
+
 	return { actions, warnings };
 }

@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { resetAgentDirFromEnvironment, setAgentDir } from "@gajae-code/utils";
 import { runMigrate } from "../src/cli/migrate-cli";
+import { expandSlashCommand, loadSlashCommands } from "../src/extensibility/slash-commands";
 import { readMCPConfigFile } from "../src/runtime-mcp/config-writer";
 
 let home: string;
@@ -120,16 +121,61 @@ describe("end-to-end import", () => {
 		expect(report.ok).toBe(true);
 	});
 
-	test("codex imports TOML MCP + converted prompt", async () => {
+	test("Claude Code commands import as native slash commands, including nested names", async () => {
+		const source = "---\ndescription: Review security.\n---\nReview $ARGUMENTS.";
+		await fs.mkdir(path.join(cwd, ".claude", "commands", "review"), { recursive: true });
+		await fs.writeFile(path.join(cwd, ".claude", "commands", "review", "security.md"), source, "utf-8");
+
+		const destination = path.join(cwd, ".gjc", "commands", "review", "security.md");
+		const dryRun = await runMigrate(opts({ from: ["claude-code"], dryRun: true }));
+		expect(dryRun.actions).toContainEqual(
+			expect.objectContaining({
+				type: "command",
+				name: "review:security",
+				status: "imported",
+				destination,
+			}),
+		);
+		expect(dryRun.summary.byType.command.imported).toBe(1);
+		expect(
+			await fs.access(destination).then(
+				() => true,
+				() => false,
+			),
+		).toBe(false);
+
+		const imported = await runMigrate(opts({ from: ["claude-code"] }));
+		expect(imported.actions).toContainEqual(
+			expect.objectContaining({ type: "command", name: "review:security", status: "imported", destination }),
+		);
+		expect(await fs.readFile(destination, "utf-8")).toBe(source);
+
+		const commands = await loadSlashCommands({ cwd });
+		expect(commands).toContainEqual(
+			expect.objectContaining({ name: "review:security", description: "Review security." }),
+		);
+		expect(expandSlashCommand("/review:security src/auth.ts", commands)).toContain("Review src/auth.ts.");
+	});
+
+	test("Codex prompts import as native slash commands, not skills", async () => {
 		await write(".codex/config.toml", '[mcp_servers.codexSrv]\ncommand = "cdx"\n');
-		await write(".codex/prompts/review.md", "Review carefully.");
+		const prompt = "---\ndescription: Review carefully.\n---\nReview $ARGUMENTS.";
+		await write(".codex/prompts/review.md", prompt);
 		await fs.writeFile(path.join(cwd, "AGENTS.md"), "Follow the Codex project instructions.", "utf-8");
-		await runMigrate(opts({ from: ["codex"] }));
+		const report = await runMigrate(opts({ from: ["codex"] }));
 		const config = await readMCPConfigFile(path.join(cwd, ".gjc", "mcp.json"));
 		expect(config.mcpServers?.codexSrv).toMatchObject({ type: "stdio", command: "cdx" });
-		expect(await fs.readFile(path.join(cwd, ".gjc", "skills", "review", "SKILL.md"), "utf-8")).toContain(
-			"description:",
+		expect(await fs.readFile(path.join(cwd, ".gjc", "commands", "review.md"), "utf-8")).toBe(prompt);
+		expect(report.actions).toContainEqual(
+			expect.objectContaining({ type: "command", source: "codex", name: "review", status: "imported" }),
 		);
+		expect(report.summary.byType.skill.imported).toBe(0);
+		expect(
+			await fs.access(path.join(cwd, ".gjc", "skills", "review", "SKILL.md")).then(
+				() => true,
+				() => false,
+			),
+		).toBe(false);
 		expect(await fs.readFile(path.join(cwd, "AGENTS.md"), "utf-8")).toBe("Follow the Codex project instructions.");
 		expect(
 			await fs.access(path.join(cwd, ".gjc", "AGENTS.md")).then(
@@ -137,6 +183,26 @@ describe("end-to-end import", () => {
 				() => false,
 			),
 		).toBe(false);
+	});
+
+	test("command collisions skip by default and require force to replace", async () => {
+		await fs.mkdir(path.join(cwd, ".claude", "commands"), { recursive: true });
+		await fs.writeFile(path.join(cwd, ".claude", "commands", "review.md"), "Imported command.", "utf-8");
+		const destination = path.join(cwd, ".gjc", "commands", "review.md");
+		await fs.mkdir(path.dirname(destination), { recursive: true });
+		await fs.writeFile(destination, "Keep the current command.", "utf-8");
+
+		const skipped = await runMigrate(opts({ from: ["claude-code"] }));
+		expect(skipped.actions).toContainEqual(
+			expect.objectContaining({ type: "command", name: "review", operation: "skip", status: "skipped_exists" }),
+		);
+		expect(await fs.readFile(destination, "utf-8")).toBe("Keep the current command.");
+
+		const forced = await runMigrate(opts({ from: ["claude-code"], force: true }));
+		expect(forced.actions).toContainEqual(
+			expect.objectContaining({ type: "command", name: "review", operation: "update", status: "updated" }),
+		);
+		expect(await fs.readFile(destination, "utf-8")).toBe("Imported command.");
 	});
 
 	test("opencode imports MCP + skill + command", async () => {

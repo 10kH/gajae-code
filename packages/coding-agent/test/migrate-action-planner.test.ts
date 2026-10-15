@@ -4,7 +4,13 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { planMigration } from "../src/migrate/action-planner";
 import { executeActions } from "../src/migrate/executor";
-import type { AdapterResult, McpCandidate, MigrateDestinations, SkillCandidate } from "../src/migrate/types";
+import type {
+	AdapterResult,
+	McpCandidate,
+	MigrateDestinations,
+	SkillCandidate,
+	SlashCommandCandidate,
+} from "../src/migrate/types";
 
 let tmp: string;
 let dest: MigrateDestinations;
@@ -14,6 +20,7 @@ beforeEach(async () => {
 	dest = {
 		mcpConfigPath: path.join(tmp, "mcp.json"),
 		skillsDir: path.join(tmp, "skills"),
+		commandsDir: path.join(tmp, ".gjc", "commands"),
 		instructionsPath: path.join(tmp, "AGENTS.md"),
 	};
 });
@@ -28,11 +35,21 @@ function mcp(name: string, raw: unknown): McpCandidate {
 function skill(slug: string, content = `---\ndescription: d\n---\nbody`): SkillCandidate {
 	return { source: "claude-code", slug, content, warnings: [] };
 }
+function slashCommand(name: string, content = "Review $ARGUMENTS."): SlashCommandCandidate {
+	return { source: "claude-code", name, content };
+}
 function instruction(content: string, source: "claude-code" | "codex" = "claude-code") {
 	return { source, name: source === "codex" ? "AGENTS.md" : "CLAUDE.md", content };
 }
 function result(partial: Partial<AdapterResult>): AdapterResult {
-	return { mcpCandidates: [], skillCandidates: [], instructionCandidates: [], diagnostics: [], ...partial };
+	return {
+		mcpCandidates: [],
+		skillCandidates: [],
+		slashCommandCandidates: [],
+		instructionCandidates: [],
+		diagnostics: [],
+		...partial,
+	};
 }
 
 async function writeMcpConfig(servers: Record<string, unknown>): Promise<void> {
@@ -305,6 +322,61 @@ describe("planMigration — instructions", () => {
 	});
 });
 
+describe("planMigration — slash commands", () => {
+	test("fresh and nested commands map to scoped Markdown files", async () => {
+		const { actions } = await planMigration({
+			results: [result({ slashCommandCandidates: [slashCommand("review:security")] })],
+			destinations: dest,
+			force: false,
+		});
+		expect(actions[0]).toMatchObject({
+			type: "command",
+			name: "review:security",
+			destination: path.join(dest.commandsDir, "review", "security.md"),
+			operation: "create",
+			status: "imported",
+			command: { content: "Review $ARGUMENTS." },
+		});
+	});
+
+	test("existing commands are skipped by default and updated only with force", async () => {
+		await fs.mkdir(dest.commandsDir, { recursive: true });
+		const destination = path.join(dest.commandsDir, "review.md");
+		await fs.writeFile(destination, "Keep this command.", "utf-8");
+		const candidate = result({ slashCommandCandidates: [slashCommand("review", "Replace this command.")] });
+		const skipped = await planMigration({ results: [candidate], destinations: dest, force: false });
+		expect(skipped.actions[0]).toMatchObject({ operation: "skip", status: "skipped_exists" });
+		const forced = await planMigration({ results: [candidate], destinations: dest, force: true });
+		expect(forced.actions[0]).toMatchObject({ operation: "update", status: "updated" });
+	});
+
+	test("unsafe names and symlinked command destinations are not writable", async () => {
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "migrate-command-outside-"));
+		try {
+			await fs.mkdir(dest.commandsDir, { recursive: true });
+			await fs.symlink(path.join(outside, "review.md"), path.join(dest.commandsDir, "review.md"), "file");
+			const results = [result({ slashCommandCandidates: [slashCommand("../escape")] })];
+			const invalid = await planMigration({ results, destinations: dest, force: false });
+			expect(invalid.actions[0]).toMatchObject({ type: "command", status: "failed_invalid_source" });
+
+			const unsafe = await planMigration({
+				results: [result({ slashCommandCandidates: [slashCommand("review")] })],
+				destinations: dest,
+				force: true,
+			});
+			expect(unsafe.actions[0]).toMatchObject({ status: "failed_invalid_destination", operation: "fail" });
+			expect(
+				await fs.access(path.join(outside, "review.md")).then(
+					() => true,
+					() => false,
+				),
+			).toBe(false);
+		} finally {
+			await fs.rm(outside, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("planMigration — diagnostics", () => {
 	test("source diagnostics become source actions", async () => {
 		const { actions } = await planMigration({
@@ -343,6 +415,39 @@ describe("executeActions — instruction destination safety", () => {
 			expect(action).toMatchObject({ operation: "fail", status: "failed_io" });
 			expect(
 				await fs.access(path.join(outside, "AGENTS.md")).then(
+					() => true,
+					() => false,
+				),
+			).toBe(false);
+		} finally {
+			await fs.rm(outside, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("executeActions — slash command destination safety", () => {
+	test("does not follow a symlinked project .gjc directory", async () => {
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "migrate-command-executor-outside-"));
+		try {
+			const agentRoot = path.join(tmp, ".gjc");
+			await fs.symlink(outside, agentRoot, "dir");
+			const [action] = await executeActions(
+				[
+					{
+						source: "claude-code",
+						type: "command",
+						name: "review:security",
+						destination: path.join(agentRoot, "commands", "review", "security.md"),
+						operation: "create",
+						status: "imported",
+						command: { content: "Review safely." },
+					},
+				],
+				{ project: true },
+			);
+			expect(action).toMatchObject({ operation: "fail", status: "failed_io" });
+			expect(
+				await fs.access(path.join(outside, "commands", "review", "security.md")).then(
 					() => true,
 					() => false,
 				),
