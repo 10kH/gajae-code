@@ -51,6 +51,7 @@ import { buildSkillPromptMessage, type Skill } from "../extensibility/skills";
 import { sessionRoot } from "../gjc-runtime/session-layout";
 import type { HindsightSessionState } from "../hindsight/state";
 import type { LocalProtocolOptions } from "../internal-urls";
+import type { PlanModeState } from "../plan-mode/state";
 import subagentSystemPromptTemplate from "../prompts/system/subagent-system-prompt.md" with { type: "text" };
 import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.md" with { type: "text" };
 import submitReminderTemplate from "../prompts/system/subagent-yield-reminder.md" with { type: "text" };
@@ -306,6 +307,11 @@ export interface ExecutorOptions {
 	 * default (`allow`) before the first prompt. `allow` is that default.
 	 */
 	sdkPermissionMode?: "prompt" | "allow" | "deny";
+	/**
+	 * Parent plan-mode state. Copied onto the child before the first prompt so
+	 * `enforcePlanModeWrite` still refuses product-file writes.
+	 */
+	planModeState?: PlanModeState;
 	/**
 	 * Parent client bridge. Only `requestPermission` is copied onto the child.
 	 * Terminal, filesystem, and deferAgentInitiatedTurns stay on the parent.
@@ -2137,6 +2143,16 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 			);
 
 			activeSession = session;
+			// Plan mode is session state, not a tool-list filter. Copy it before the
+			// first prompt so product writes hit the same read-only guard as the parent.
+			if (options.planModeState?.enabled) {
+				session.setPlanModeState({
+					enabled: true,
+					planFilePath: options.planModeState.planFilePath,
+					...(options.planModeState.workflow ? { workflow: options.planModeState.workflow } : {}),
+					...(options.planModeState.reentry !== undefined ? { reentry: options.planModeState.reentry } : {}),
+				});
+			}
 			// `allow` is the child default. deny/prompt must be copied before the first prompt.
 			if (options.sdkPermissionMode === "deny" || options.sdkPermissionMode === "prompt") {
 				session.setSdkPermissionMode(options.sdkPermissionMode);
