@@ -16,6 +16,7 @@ import {
 	type NativeDirectoryTreeSnapshot,
 	type NativeExactUnlinkResult,
 	type NativeNoReplaceResult,
+	RecoveryFsRoot,
 	renameDirectoryNoReplacePathAsync,
 	renameNoReplacePathAsync,
 	snapshotDirectoryTree,
@@ -46,6 +47,7 @@ interface RemovalCall {
 afterEach(async () => {
 	vi.restoreAllMocks();
 	FileLockTestHooks.afterRemovalTransitionMissing = undefined;
+	FileLockTestHooks.beforeRemovalRecordUnlink = undefined;
 	FileLockTestHooks.nativePublicationBindings = undefined;
 	FileLockTestHooks.stagingIdentityEvidence = undefined;
 	FileLockTestHooks.nativeQuarantineBindings = undefined;
@@ -78,6 +80,15 @@ async function deadPid(): Promise<number> {
 	const child = Bun.spawn(["sh", "-c", "exit 0"], { stdout: "ignore", stderr: "ignore" });
 	await child.exited;
 	return child.pid;
+}
+
+async function waitForAbsence(target: string, timeoutMs = 5_000): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (!(await fs.exists(target))) return true;
+		await Bun.sleep(10);
+	}
+	return !(await fs.exists(target));
 }
 
 function removalInfo(pid: number, ownerHostId?: string): string {
@@ -984,6 +995,51 @@ describe.skipIf(process.platform !== "linux")("file lock committed publication r
 		expect(treeSnapshot(`${lock}.removing`)).toEqual(recordedSnapshot(retained));
 		expect(await Bun.file(path.join(`${lock}.removing`, "info")).text()).toBe("foreign predecessor");
 		expect(await fs.readdir(root)).toEqual([path.basename(`${lock}.removing`)]);
+	});
+
+	test("releases a staged generation when rollback commits before authority close fails", async () => {
+		const { file, lock } = await makeFixture();
+		const transition = `${lock}.removing`;
+		const publication = installPublicationFailure(async (_source, destination) => {
+			await fs.mkdir(`${destination}.removing`);
+			await Bun.write(path.join(`${destination}.removing`, "info"), "foreign predecessor");
+		});
+		const closeAuthority = RecoveryFsRoot.prototype.close;
+		let stagingExistsAtClose = false;
+		const closeSpy = vi.spyOn(RecoveryFsRoot.prototype, "close").mockImplementation(function (this: RecoveryFsRoot) {
+			closeAuthority.call(this);
+			stagingExistsAtClose = syncFs.existsSync(publication.source);
+			throw new Error("injected close failure after committed rollback");
+		});
+		const removalRecordUnlinks: string[] = [];
+		FileLockTestHooks.beforeRemovalRecordUnlink = recordPath => {
+			removalRecordUnlinks.push(recordPath);
+			return true;
+		};
+		const publishedRemovalRecords: string[] = [];
+		FileLockTestHooks.afterRemovalOwnerPublish = transitionPath => {
+			publishedRemovalRecords.push(transitionPath);
+		};
+		let entered = 0;
+		let acquired = 0;
+
+		await expect(
+			withFileLock(file, async () => entered++, { ...quickAcquire, onAcquired: () => acquired++ }),
+		).rejects.toThrow("File lock rollback authority failed");
+
+		expect(entered).toBe(0);
+		expect(acquired).toBe(0);
+		expect(closeSpy).toHaveBeenCalledTimes(1);
+		expect(stagingExistsAtClose).toBe(true);
+		expect(publication.source).not.toBe("");
+		expect(await waitForAbsence(publication.source)).toBe(true);
+		expect(publishedRemovalRecords).toContain(`${publication.source}.removing`);
+		expect(await waitForAbsence(`${publication.source}.removing`)).toBe(true);
+		expect(await waitForAbsence(`${publication.source}.removing.owner`)).toBe(true);
+		expect(removalRecordUnlinks).toContain(`${publication.source}.removing.owner`);
+		await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
+		expect(await Bun.file(path.join(transition, "info")).text()).toBe("foreign predecessor");
+		expect(await fs.readdir(path.dirname(lock))).toEqual([path.basename(transition)]);
 	});
 });
 

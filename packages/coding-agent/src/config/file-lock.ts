@@ -131,6 +131,7 @@ const PROCESS_START_TIME_FORMAT = "utc-v1";
 type LocalLockState = {
 	owner: FileLockOwnerToken;
 	status: "held" | "release_pending" | "releasing";
+	releasePath?: string;
 	releasePromise?: Promise<void>;
 };
 
@@ -780,6 +781,11 @@ async function classifyFileLockRemovalTransition(
 					? null
 					: "active";
 			}
+			// Another same-host process may have completed native removal but been
+			// unable to unlink its receipt. Prove the captured generation is absent
+			// before treating its still-live publisher PID as an active retirement.
+			if (await removalTransitionIsComplete(lockPath, transitionPath, recordedOwner))
+				return (await removeRemovalRecord(recordPath, JSON.stringify(recordedOwner))) ? null : "active";
 			if (ownerIsAlive(recordedOwner.owner) || ownerLiveness(recordedOwner.owner.pid) === "unknown") return "active";
 			return (await removeRemovalRecord(recordPath, JSON.stringify(recordedOwner))) ? null : "active";
 		}
@@ -2356,7 +2362,7 @@ async function tryAcquireLock(
 	onAcquired?: () => void,
 	onPublished?: (owner: LockInfo) => void,
 	onPublicationRolledBack?: (owner: LockInfo) => void,
-	onPublicationFailed?: (owner: LockInfo, identity: GenericFileLockDirIdentity) => void,
+	onPublicationFailed?: (owner: LockInfo, identity: GenericFileLockDirIdentity, releasePath: string) => void,
 ): Promise<FileLockAcquisitionResult> {
 	await ensureLockParent(path.dirname(lockPath));
 	const afterParentMkdir = FileLockTestHooks.afterParentMkdir;
@@ -2370,6 +2376,7 @@ async function tryAcquireLock(
 	);
 	const owner = lockInfo(ownerHostId, ownerToken);
 	let removePending = false;
+	let failedPublicationPath = lockPath;
 	try {
 		await fs.mkdir(pendingPath, { mode: 0o700 });
 		removePending = true;
@@ -2383,6 +2390,7 @@ async function tryAcquireLock(
 		// retain the same lock identity as the ordinary path.
 		const canonicalParent = await fs.realpath(path.dirname(lockPath));
 		const destinationPath = path.join(canonicalParent, path.basename(lockPath));
+		failedPublicationPath = destinationPath;
 		const parent = await fs.lstat(canonicalParent, { bigint: true });
 		const parentIdentity = {
 			dev: canonicalLockDeviceId(parent.dev),
@@ -2535,13 +2543,31 @@ async function tryAcquireLock(
 						if (publishedSnapshot.code) failure.code = publishedSnapshot.code;
 						throw failure;
 					}
-					await rollbackPublishedFileLock(
-						canonicalParent,
-						destinationPath,
-						canonicalPendingPath,
-						publishedSnapshot.snapshot,
-						parentIdentity,
-					);
+					try {
+						await rollbackPublishedFileLock(
+							canonicalParent,
+							destinationPath,
+							canonicalPendingPath,
+							publishedSnapshot.snapshot,
+							parentIdentity,
+						);
+					} catch (error) {
+						// Rollback can commit before a later verification or authority-close
+						// failure. Release the staged generation at the path that actually
+						// retains it, rather than retrying against the now-vacant canonical name.
+						try {
+							const stagedAgain = snapshotDirectoryTree(canonicalPendingPath);
+							if (
+								stagedAgain.ok &&
+								stagedAgain.snapshot &&
+								sameFileLockTreeAfterPublication(publishedSnapshot.snapshot, stagedAgain.snapshot)
+							)
+								failedPublicationPath = canonicalPendingPath;
+						} catch {
+							// Keep the canonical target when the staging identity cannot be proven.
+						}
+						throw error;
+					}
 					removePending = true;
 					onPublicationRolledBack?.(owner);
 					return transitionState === "orphan_transition"
@@ -2554,7 +2580,7 @@ async function tryAcquireLock(
 			onAcquired?.();
 			return owner;
 		} catch (error) {
-			onPublicationFailed?.(owner, stagedIdentity);
+			onPublicationFailed?.(owner, stagedIdentity, failedPublicationPath);
 			throw error;
 		}
 	} finally {
@@ -2741,7 +2767,7 @@ async function retryPendingLocalRelease(lockPath: string, knownKey?: string): Pr
 		return;
 	}
 	state.status = "releasing";
-	const releasePromise = releaseOwnedLock(lockPath, state.owner);
+	const releasePromise = releaseOwnedLock(state.releasePath ?? lockPath, state.owner);
 	state.releasePromise = releasePromise;
 	try {
 		await releasePromise;
@@ -2977,11 +3003,12 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 				if (localLockStates.get(localKey) === state) localLockStates.delete(localKey);
 				if (publishedState === state) publishedState = undefined;
 			},
-			(owner, identity) => {
+			(owner, identity, releasePath) => {
 				const state = publishedState;
 				if (!state || state.owner.owner_token !== owner.owner_token || localLockStates.get(localKey) !== state)
 					return;
 				fileLockDirIdentities.set(owner, identity);
+				state.releasePath = releasePath;
 				state.status = "release_pending";
 				scheduleReleasePendingRetry(lockPath, localKey, state);
 			},
@@ -2990,7 +3017,7 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 			// Adoption is identity-bound and can be refused by a transient cleanup race.
 			// Keep using the caller's bounded contention budget; the same generation is
 			// revalidated before every later adoption attempt.
-			if (attempt + 1 === opts.retries)
+			if (attempt + 1 === attemptBudget)
 				throw new FileLockAcquireError(
 					filePath,
 					lockPath,

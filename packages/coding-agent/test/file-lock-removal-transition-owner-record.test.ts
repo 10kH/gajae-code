@@ -548,6 +548,147 @@ test("does not clear a foreign receipt when its root is detached between namespa
 	expect(await fs.exists(lock)).toBe(false);
 });
 
+test("clears a completed same-host receipt before honoring its live publisher PID", async () => {
+	const { file, transition } = await fixture();
+	await fs.mkdir(transition);
+	const transitionStat = await fs.lstat(transition, { bigint: true });
+	const completedReceipt = JSON.stringify({
+		owner: {
+			pid: process.pid,
+			timestamp: Date.now(),
+			owner_token: "completed-same-host-remover",
+			owner_host_id: "same-host",
+		},
+		rootDev: transitionStat.dev.toString(),
+		rootIno: transitionStat.ino.toString(),
+	});
+	await Bun.write(`${transition}.owner`, completedReceipt);
+	await fs.rm(transition, { recursive: true });
+
+	let callbackEntered = false;
+	await withFileLock(
+		file,
+		async () => {
+			callbackEntered = true;
+		},
+		{ ownerHostId: "same-host", retries: 2, retryDelayMs: 1 },
+	);
+
+	expect(callbackEntered).toBe(true);
+	await expect(fs.lstat(`${transition}.owner`)).rejects.toMatchObject({ code: "ENOENT" });
+});
+
+test("keeps a live same-host receipt while its captured root remains canonical", async () => {
+	const { file, lock, transition } = await fixture();
+	await fs.mkdir(lock);
+	const canonicalOwner: FileLockOwnerToken = {
+		pid: process.pid,
+		timestamp: Date.now(),
+		owner_token: "canonical-lock-owner",
+		owner_host_id: "same-host",
+	};
+	const canonicalInfo = JSON.stringify(canonicalOwner);
+	await Bun.write(path.join(lock, "info"), canonicalInfo);
+	const canonicalStat = await fs.lstat(lock, { bigint: true });
+	const remover = {
+		pid: process.pid,
+		timestamp: Date.now(),
+		owner_token: "live-remover",
+		owner_host_id: "same-host",
+	};
+	const receipt = JSON.stringify({
+		owner: remover,
+		rootDev: canonicalStat.dev.toString(),
+		rootIno: canonicalStat.ino.toString(),
+	});
+	await Bun.write(`${transition}.owner`, receipt);
+
+	const callback = vi.fn(async () => undefined);
+	await expect(
+		withFileLock(file, callback, { ownerHostId: "same-host", retries: 2, retryDelayMs: 1 }),
+	).rejects.toMatchObject({ code: "acquire_timeout" });
+
+	expect(callback).not.toHaveBeenCalled();
+	expect(await Bun.file(path.join(lock, "info")).text()).toBe(canonicalInfo);
+	expect(await Bun.file(`${transition}.owner`).text()).toBe(receipt);
+	await expect(fs.lstat(transition)).rejects.toMatchObject({ code: "ENOENT" });
+});
+
+test("keeps a completed same-host receipt active when exact unlink is refused", async () => {
+	const { file, transition } = await fixture();
+	await fs.mkdir(transition);
+	const transitionStat = await fs.lstat(transition, { bigint: true });
+	const completedReceipt = JSON.stringify({
+		owner: {
+			pid: process.pid,
+			timestamp: Date.now(),
+			owner_token: "completed-same-host-remover",
+			owner_host_id: "same-host",
+		},
+		rootDev: transitionStat.dev.toString(),
+		rootIno: transitionStat.ino.toString(),
+	});
+	await Bun.write(`${transition}.owner`, completedReceipt);
+	await fs.rm(transition, { recursive: true });
+
+	let refuseUnlink = true;
+	FileLockTestHooks.beforeRemovalRecordUnlink = recordPath => !(recordPath === `${transition}.owner` && refuseUnlink);
+	await expect(acquireFileLock(file, { ownerHostId: "same-host", retries: 2, retryDelayMs: 1 })).rejects.toMatchObject(
+		{ code: "acquire_timeout" },
+	);
+	expect(await Bun.file(`${transition}.owner`).text()).toBe(completedReceipt);
+
+	refuseUnlink = false;
+	const release = await acquireFileLock(file, { ownerHostId: "same-host", retries: 2, retryDelayMs: 1 });
+	await release();
+	await expect(fs.lstat(`${transition}.owner`)).rejects.toMatchObject({ code: "ENOENT" });
+});
+
+test("uses the extended acquisition budget after a competing orphan cleanup", async () => {
+	const { file, lock, transition } = await fixture();
+	await fs.mkdir(lock);
+	await Bun.write(
+		path.join(lock, "info"),
+		JSON.stringify({ ...deadOwner, timestamp: Date.now(), owner_token: "stale-lock" }),
+	);
+
+	let transitionSeeded = false;
+	let adoptionRefused = true;
+	FileLockTestHooks.beforeRemovalRecordUnlink = async recordPath => {
+		if (recordPath === `${transition}.owner` && !transitionSeeded) {
+			transitionSeeded = true;
+			await fs.mkdir(transition);
+			const old = new Date(Date.now() - 120_000);
+			await fs.utimes(transition, old, old);
+		}
+		return true;
+	};
+	FileLockTestHooks.nativeQuarantineBindings = () => ({
+		snapshotDirectoryTree,
+		exactRemoveDirectoryTree(target, snapshot, parent, detachOnly) {
+			if (target === transition && adoptionRefused) {
+				adoptionRefused = false;
+				syncFs.rmSync(transition, { recursive: true, force: true });
+				return { ok: false, code: "identity_mismatch" };
+			}
+			return exactRemoveDirectoryTree(target, snapshot, parent, detachOnly);
+		},
+	});
+
+	const release = await acquireFileLock(file, {
+		retries: 2,
+		retryDelayMs: 1,
+		staleMs: 0,
+		orphanTransitionAgeMs: 0,
+	});
+	await release();
+	expect(transitionSeeded).toBe(true);
+	expect(adoptionRefused).toBe(false);
+	await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
+	await expect(fs.lstat(transition)).rejects.toMatchObject({ code: "ENOENT" });
+	await expect(fs.lstat(`${transition}.owner`)).rejects.toMatchObject({ code: "ENOENT" });
+});
+
 test("preserves a local receipt when release detaches after acquisition observes no transition", async () => {
 	const { file, lock, transition } = await fixture();
 	const release = await acquireFileLock(file, { retries: 2, retryDelayMs: 1 });
