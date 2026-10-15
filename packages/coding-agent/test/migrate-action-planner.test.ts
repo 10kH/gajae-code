@@ -400,6 +400,31 @@ describe("planMigration — slash commands", () => {
 		});
 	});
 
+	test("file-versus-directory command collisions are reported before execution", async () => {
+		const candidate = result({
+			slashCommandCandidates: [
+				slashCommand("foo.md:bar", "Nested command."),
+				{ source: "codex", name: "foo", content: "Flat prompt." },
+			],
+		});
+		const skipped = await planMigration({ results: [candidate], destinations: dest, force: false });
+		expect(skipped.actions[0]).toMatchObject({ name: "foo.md:bar", status: "imported" });
+		expect(skipped.actions[1]).toMatchObject({
+			name: "foo",
+			operation: "skip",
+			status: "skipped_exists",
+			reason: 'structural destination collision with "foo.md:bar"; a command file cannot also be a directory',
+		});
+
+		const forced = await planMigration({ results: [candidate], destinations: dest, force: true });
+		expect(forced.actions[1]).toMatchObject({
+			name: "foo",
+			operation: "fail",
+			status: "failed_invalid_destination",
+			reason: 'structural destination collision with "foo.md:bar"; a command file cannot also be a directory',
+		});
+	});
+
 	test("unsafe names and symlinked command destinations are not writable", async () => {
 		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "migrate-command-outside-"));
 		try {

@@ -93,6 +93,8 @@ metadata such as tool restrictions or model selection.
 explicitly updates existing destination files. Command destination collisions
 are compared case-insensitively for portability; without `--force`, the later
 selected command is skipped, and with `--force` it updates the first destination.
+File-versus-directory conflicts between planned command paths are reported before
+writing; `--force` does not delete an existing command subtree to resolve them.
 Instruction and command writes refuse to follow symlinked destination directories.
 Codex prompts are imported as slash commands, not skills. Claude Code subagents,
 extensions, Claude Code/Codex hooks and settings (model, permissions, and

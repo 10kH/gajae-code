@@ -83,6 +83,16 @@ interface CommandDestinationInspection {
 	unsafeReason?: string;
 }
 
+interface PlannedCommandDestination {
+	name: string;
+	destination: string;
+	segments: string[];
+}
+
+function isStrictPathPrefix(prefix: string[], candidate: string[]): boolean {
+	return prefix.length < candidate.length && prefix.every((segment, index) => segment === candidate[index]);
+}
+
 /** Resolve case-equivalent existing paths so command collisions stay portable. */
 async function inspectCommandDestination(
 	commandsDir: string,
@@ -433,7 +443,7 @@ export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 	}
 
 	// 5. Slash commands — command names map to the scoped commands directory.
-	const plannedCommands = new Map<string, { name: string; destination: string }>();
+	const plannedCommands = new Map<string, PlannedCommandDestination>();
 	const validCommandNameSegment = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 	for (const result of input.results) {
 		for (const candidate of result.slashCommandCandidates) {
@@ -457,6 +467,9 @@ export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 				`${nameParts[nameParts.length - 1]}.md`,
 			);
 			const collisionKey = path.resolve(requestedDestination).toLowerCase();
+			const destinationSegments = [...nameParts.slice(0, -1), `${nameParts[nameParts.length - 1]}.md`].map(segment =>
+				segment.toLowerCase(),
+			);
 			const plannedCommand = plannedCommands.get(collisionKey);
 			let destination = plannedCommand?.destination ?? requestedDestination;
 			let base = { source: candidate.source, type: "command" as const, name: candidate.name, destination };
@@ -481,6 +494,22 @@ export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 						reason: collisionReason,
 					});
 				}
+				continue;
+			}
+
+			const structuralCollision = [...plannedCommands.values()].find(
+				planned =>
+					isStrictPathPrefix(planned.segments, destinationSegments) ||
+					isStrictPathPrefix(destinationSegments, planned.segments),
+			);
+			if (structuralCollision) {
+				actions.push({
+					...base,
+					operation: input.force ? "fail" : "skip",
+					status: input.force ? "failed_invalid_destination" : "skipped_exists",
+					reason: `structural destination collision with "${structuralCollision.name}"; a command file cannot also be a directory`,
+				});
+				plannedCommands.set(collisionKey, { name: candidate.name, destination, segments: destinationSegments });
 				continue;
 			}
 
@@ -513,7 +542,7 @@ export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 					status: "failed_io",
 					reason: `failed to inspect command destination directory: ${(directoryReadError as Error).message}`,
 				});
-				plannedCommands.set(collisionKey, { name: candidate.name, destination });
+				plannedCommands.set(collisionKey, { name: candidate.name, destination, segments: destinationSegments });
 				continue;
 			}
 			if (unsafeDirectory) {
@@ -523,7 +552,7 @@ export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 					status: input.force ? "failed_invalid_destination" : "skipped_exists",
 					reason: `command destination ancestor is not a real directory: ${unsafeDirectory}`,
 				});
-				plannedCommands.set(collisionKey, { name: candidate.name, destination });
+				plannedCommands.set(collisionKey, { name: candidate.name, destination, segments: destinationSegments });
 				continue;
 			}
 
@@ -537,7 +566,7 @@ export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 					status: "failed_io",
 					reason: `failed to inspect command destination: ${(error as Error).message}`,
 				});
-				plannedCommands.set(collisionKey, { name: candidate.name, destination });
+				plannedCommands.set(collisionKey, { name: candidate.name, destination, segments: destinationSegments });
 				continue;
 			}
 			destination = inspection.destination;
@@ -549,7 +578,7 @@ export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 					status: input.force ? "failed_invalid_destination" : "skipped_exists",
 					reason: inspection.unsafeReason,
 				});
-				plannedCommands.set(collisionKey, { name: candidate.name, destination });
+				plannedCommands.set(collisionKey, { name: candidate.name, destination, segments: destinationSegments });
 				continue;
 			}
 
@@ -563,7 +592,7 @@ export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 					command: { content: candidate.content },
 				});
 			}
-			plannedCommands.set(collisionKey, { name: candidate.name, destination });
+			plannedCommands.set(collisionKey, { name: candidate.name, destination, segments: destinationSegments });
 		}
 	}
 
