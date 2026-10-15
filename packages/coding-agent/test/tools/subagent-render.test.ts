@@ -915,6 +915,21 @@ describe("compact subagent panel (#6774)", () => {
 		expect(render({ subagents }, true).match(/provider degraded:/g)).toHaveLength(7);
 	});
 
+	it("counts a running subagent with no activity yet as idle once its job outlives the threshold", () => {
+		settings.set("task.compactSubagentPanel", true);
+		const subagents = [
+			snapshot({ id: "0-Stalled", durationMs: 45_000 }),
+			snapshot({ id: "0-Fresh", durationMs: 5_000 }),
+			snapshot({
+				id: "0-NoStamp",
+				durationMs: 45_000,
+				liveProgressAvailable: true,
+				progress: progress({ id: "0-NoStamp", lastActivityMs: undefined }),
+			}),
+		];
+		expect(render({ subagents }, false).split("\n")[1]).toBe("  3 subagents running · 2 idle >30s");
+	});
+
 	it("signs only the visible degradation row, not per-provider churn", () => {
 		const withProviders = (providers: string[]) =>
 			liveGroup(providers.length, 0).map((item, index) => ({

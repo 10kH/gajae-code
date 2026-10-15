@@ -2096,6 +2096,49 @@ describe("compact subagent panel await gating (#6774)", () => {
 		expect(compact.idle).toBe(1);
 	});
 
+	it("emits when a silent subagent crosses the idle threshold with no new progress", async () => {
+		const manager = createManager();
+		const session = createSession();
+		session.settings = Settings.isolated({ "task.compactSubagentPanel": true });
+		const tool = new SubagentTool(session);
+		const gate = Promise.withResolvers<string>();
+		const id = "0-Quiet";
+		manager.register("task", "quiet", async () => gate.promise, {
+			id: "job-quiet",
+			ownerId: "0-Main",
+			metadata: { subagent: { id, agent: "executor", agentSource: "bundled", description: "worker" } },
+		});
+		manager.registerSubagentRecord({
+			subagentId: id,
+			ownerId: "0-Main",
+			currentJobId: "job-quiet",
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: null,
+			resumable: false,
+		});
+		// 200ms short of idle; nothing records progress afterwards.
+		manager.recordSubagentProgress(id, liveProgress(id, 1, Date.now() - 29_800));
+		const restore = tool.withLivenessClock(() => 0);
+		const updates: Array<{ details?: SubagentToolDetails }> = [];
+		const awaiting = tool.execute(
+			"await-quiet",
+			{ action: "await", ids: [id], heartbeat_ms: 100, timeout_ms: 2_000 },
+			undefined,
+			update => updates.push(update as { details?: SubagentToolDetails }),
+		);
+		await Bun.sleep(60);
+		const initial = updates.length;
+		await Bun.sleep(500);
+		const crossed = updates.length - initial;
+		gate.resolve("done");
+		await awaiting;
+		restore();
+		await manager.dispose({ timeoutMs: 100 });
+		expect(initial).toBeGreaterThanOrEqual(1);
+		expect(crossed).toBe(1);
+	});
+
 	it("keeps per-subagent re-emits when the compact panel is off", async () => {
 		const full = await churnUpdates(false);
 		expect(full.churn).toBeGreaterThanOrEqual(3);

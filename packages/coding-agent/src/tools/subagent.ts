@@ -1178,9 +1178,10 @@ export function summarizeSubagentGroup(subagents: readonly SubagentSnapshot[], n
 					const provider = live.retryState.provider ?? "provider";
 					summary.retryingByProvider[provider] = (summary.retryingByProvider[provider] ?? 0) + 1;
 				}
-				if (live?.lastActivityMs !== undefined && nowMs - live.lastActivityMs > SUBAGENT_COMPACT_IDLE_MS) {
-					summary.idle += 1;
-				}
+				// Before its first activity a subagent has no timestamp; its elapsed job time
+				// is then the age, so one stalled from the start still turns idle.
+				const quietMs = live?.lastActivityMs !== undefined ? nowMs - live.lastActivityMs : snapshot.durationMs;
+				if (quietMs > SUBAGENT_COMPACT_IDLE_MS) summary.idle += 1;
 				break;
 			}
 			case "queued":
