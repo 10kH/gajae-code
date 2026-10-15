@@ -1298,7 +1298,10 @@ function fingerprintConfiguredDiscoveryRequestShape(
 	return crypto.createHash("sha256").update("gajae:model-discovery-provenance\0").update(context).digest("hex");
 }
 
+const ANTIGRAVITY_DISCOVERY_CACHE_IDENTITY = "gemini-cli-user-agent-v1";
+
 function fingerprintDescriptorDiscoveryProvenance(
+	providerId: string,
 	authEvidence: string,
 	endpoint: string,
 	projectId?: string,
@@ -1309,10 +1312,18 @@ function fingerprintDescriptorDiscoveryProvenance(
 	} catch {
 		return undefined;
 	}
+	const discoveryIdentity = providerId === "google-antigravity" ? ANTIGRAVITY_DISCOVERY_CACHE_IDENTITY : undefined;
 	return crypto
 		.createHash("sha256")
 		.update("gajae:model-discovery-provenance\0")
-		.update(JSON.stringify({ authEvidence, endpoint, ...(projectId !== undefined ? { projectId } : {}) }))
+		.update(
+			JSON.stringify({
+				authEvidence,
+				endpoint,
+				...(projectId !== undefined ? { projectId } : {}),
+				...(discoveryIdentity !== undefined ? { discoveryIdentity } : {}),
+			}),
+		)
 		.digest("hex");
 }
 
@@ -3747,6 +3758,7 @@ export class ModelRegistry {
 			}
 			const cache = readModelCache<Api>(descriptor.providerId, 24 * 60 * 60 * 1000, Date.now, this.#cacheDbPath);
 			const expectedProvenance = fingerprintDescriptorDiscoveryProvenance(
+				descriptor.providerId,
 				authEvidence ?? this.#getProviderEvidenceGeneration(descriptor.providerId),
 				this.#normalizeDiscoveryEvidenceEndpoint(this.#getProviderBaseUrlForDiscovery(descriptor.providerId) ?? ""),
 			);
@@ -4669,6 +4681,16 @@ export class ModelRegistry {
 		});
 	}
 
+	#removeDescriptorDiscoveredModels(provider: string, modelIds: ReadonlySet<string>): boolean {
+		const staticModelIds = this.#providerActivity.get(provider)?.staticModelIds;
+		const previousLength = this.#models.length;
+		this.#models = this.#models.filter(model => {
+			if (model.provider !== provider || !modelIds.has(model.id)) return true;
+			return staticModelIds?.has(model.id) === true;
+		});
+		return this.#models.length !== previousLength;
+	}
+
 	#mergeDiscoveredModels(discovered: readonly Model<Api>[]): void {
 		const discoveredModels = this.#applyHardcodedModelPolicies(
 			discovered.map(model =>
@@ -5192,6 +5214,14 @@ export class ModelRegistry {
 	): Promise<Model<Api>[]> {
 		const generation = (this.#descriptorDiscoveryGenerations.get(options.providerId) ?? 0) + 1;
 		this.#descriptorDiscoveryGenerations.set(options.providerId, generation);
+		const previousEvidence = this.#descriptorDiscoveryEvidence.get(options.providerId);
+		const discoveryContextChanged =
+			previousEvidence !== undefined &&
+			(previousEvidence.authGeneration !== authGeneration ||
+				previousEvidence.endpoint !== endpoint ||
+				previousEvidence.projectId !== projectId);
+		const isGoogleProjectScopedProvider =
+			options.providerId === "google-antigravity" || options.providerId === "google-gemini-cli";
 		const canUseCredentialDerivedXiaomiEndpoint =
 			options.providerId === "xiaomi" &&
 			apiKey?.startsWith("tp-") === true &&
@@ -5201,8 +5231,7 @@ export class ModelRegistry {
 		let credentialDerivedEndpoint: string | undefined;
 		const reusableCacheProvenance = endpointContainsUserinfo
 			? undefined
-			: fingerprintDescriptorDiscoveryProvenance(authGeneration, endpoint, projectId);
-		if (reusableCacheProvenance === undefined && strategy === "offline") return [];
+			: fingerprintDescriptorDiscoveryProvenance(options.providerId, authGeneration, endpoint, projectId);
 		// Signed/userinfo endpoints may still publish a sanitized best-effort row,
 		// but each refresh gets a new opaque nonce. The nonce contains no endpoint
 		// secret and can never match a previous invocation, so constructor loads,
@@ -5233,6 +5262,40 @@ export class ModelRegistry {
 					? strategy !== "online-if-uncached" || isCurrentDiscovery()
 					: isCurrentProviderRefresh()));
 		try {
+			if (!isCurrentDiscovery()) return [];
+			if (discoveryContextChanged && previousEvidence) {
+				const removedPreviousModels = this.#removeDescriptorDiscoveredModels(
+					options.providerId,
+					previousEvidence.modelIds,
+				);
+				if (removedPreviousModels) {
+					this.#rebuildProviderActivity();
+					this.#rebuildCanonicalIndex();
+				}
+			}
+			if (strategy === "offline") {
+				const cache =
+					reusableCacheProvenance !== undefined && isGoogleProjectScopedProvider
+						? readModelCache<Api>(options.providerId, 24 * 60 * 60 * 1000, Date.now, this.#cacheDbPath)
+						: null;
+				const hasCurrentProjectCache =
+					cache?.dynamicModelIds !== undefined && cache.dynamicModelProvenance === reusableCacheProvenance;
+				if (reusableCacheProvenance === undefined || (isGoogleProjectScopedProvider && !hasCurrentProjectCache)) {
+					if (discoveryContextChanged) {
+						this.#providerEvidenceApiKeys.set(options.providerId, apiKey);
+						this.#descriptorDiscoveryEvidence.set(options.providerId, {
+							fresh: false,
+							modelIds: new Set(),
+							authGeneration,
+							endpoint,
+							projectId,
+						});
+						this.#rebuildProviderActivity();
+						this.#rebuildCanonicalIndex();
+					}
+					return [];
+				}
+			}
 			const manager = createModelManager({
 				...options,
 				cacheDbPath: this.#cacheDbPath,
@@ -5281,7 +5344,7 @@ export class ModelRegistry {
 			const preservesExistingDescriptorEvidence =
 				(result.dynamicModelIds === undefined && !result.fetched && !result.stale) ||
 				(result.stale && result.cacheFresh && result.cacheAuthoritative && evidence?.fresh === true) ||
-				(strategy === "offline" && result.dynamicModelIds === undefined);
+				(strategy === "offline" && result.dynamicModelIds === undefined && !discoveryContextChanged);
 			if (
 				isCurrentDiscovery() &&
 				!preservesExistingDescriptorEvidence &&

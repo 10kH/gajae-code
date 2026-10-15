@@ -8,6 +8,7 @@ import {
 	type Context,
 	Effort,
 	getBundledModels,
+	getGeminiCliUserAgent,
 	getSupportedEfforts,
 	type Model,
 	type OpenAICompat,
@@ -3773,9 +3774,95 @@ describe("ModelRegistry", () => {
 						{ accessToken, project: projectB },
 					]);
 					expect(registry.find(provider, `${projectB}-model`)).toBeDefined();
+					const availableIds = new Set(
+						registry
+							.getAvailable()
+							.filter(model => model.provider === provider)
+							.map(model => model.id),
+					);
+					expect(availableIds.has(`${projectA}-model`)).toBe(false);
+					expect(availableIds.has(`${projectB}-model`)).toBe(true);
+
+					await registry.refreshProvider(provider, "offline", sessionA);
+					const offlineAvailableIds = new Set(
+						registry
+							.getAvailable()
+							.filter(model => model.provider === provider)
+							.map(model => model.id),
+					);
+					expect(offlineAvailableIds.has(`${projectA}-model`)).toBe(false);
+					expect(offlineAvailableIds.has(`${projectB}-model`)).toBe(false);
 				}
 			} finally {
 				await registry.dispose();
+			}
+		});
+
+		test("does not reuse Antigravity cache created with the old discovery identity", async () => {
+			const provider = "google-antigravity";
+			const accessToken = "projectless-antigravity-access";
+			const restoreUserAgent = unsetEnvForTest("PI_AI_ANTIGRAVITY_USER_AGENT");
+			let registry: ModelRegistry | undefined;
+			try {
+				await authStorage.set(provider, [
+					{
+						type: "oauth",
+						access: accessToken,
+						refresh: "projectless-antigravity-refresh",
+						expires: Date.now() + 60 * 60 * 1000,
+						email: "projectless@example.test",
+					},
+				]);
+				registry = new ModelRegistry(authStorage, modelsJsonPath);
+				const endpoint = registry.getProviderBaseUrl(provider);
+				if (!endpoint) throw new Error("Expected a bundled Antigravity endpoint");
+				const authEvidence = authStorage.getProviderEvidenceGeneration(provider, accessToken);
+				const legacyProvenance = crypto
+					.createHash("sha256")
+					.update("gajae:model-discovery-provenance\0")
+					.update(JSON.stringify({ authEvidence, endpoint }))
+					.digest("hex");
+				writeModelCache(
+					provider,
+					Date.now(),
+					getBundledModels(provider),
+					true,
+					"",
+					cacheDbPath,
+					[],
+					legacyProvenance,
+				);
+
+				const requests: Array<{ userAgent: string | null; body: unknown }> = [];
+				using _hook = hookFetch((input, init) => {
+					if (!String(input).endsWith("/v1internal:fetchAvailableModels")) {
+						throw new Error(`Unexpected URL: ${String(input)}`);
+					}
+					requests.push({
+						userAgent: new Headers(init?.headers).get("user-agent"),
+						body: JSON.parse(String(init?.body ?? "{}")) as unknown,
+					});
+					return new Response(
+						JSON.stringify({
+							models: {
+								"gemini-4-argon": {
+									displayName: "Gemini 4 Argon",
+									supportsImages: true,
+									supportsThinking: true,
+								},
+							},
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				});
+
+				await registry.refreshProvider(provider, "online-if-uncached");
+
+				expect(requests).toEqual([{ userAgent: getGeminiCliUserAgent(), body: {} }]);
+				expect(registry.find(provider, "gemini-4-argon")).toBeDefined();
+			} finally {
+				await registry?.dispose();
+				restoreUserAgent();
 			}
 		});
 
