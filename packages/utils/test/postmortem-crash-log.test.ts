@@ -277,6 +277,7 @@ describe("recordFatalCrash", () => {
 			"after=keep",
 			"Cookie: theme=light\\nserialized-after=keep",
 			"cookie=session=topsecret; csrf=alsosecret",
+			'cookie=session="part auth=inside"; csrf=alsosecret auth=opaque-auth bearer=opaque-bearer note=keep',
 			"set_cookie=refresh=opaque-refresh-cookie; xsrf=opaque-xsrf-token\\nserialized-cookie-after=keep",
 		].join("\n");
 
@@ -287,10 +288,14 @@ describe("recordFatalCrash", () => {
 		expect(contents).not.toContain("opaque-cookie-session");
 		expect(contents).not.toContain("topsecret");
 		expect(contents).not.toContain("alsosecret");
+		expect(contents).not.toContain("auth=inside");
+		expect(contents).not.toContain("opaque-auth");
+		expect(contents).not.toContain("opaque-bearer");
 		expect(contents).not.toContain("opaque-refresh-cookie");
 		expect(contents).not.toContain("opaque-xsrf-token");
 		expect(contents).toContain("Cookie: «redacted»");
 		expect(contents).toContain("cookie=«redacted»");
+		expect(contents).toContain("cookie=«redacted» auth=«redacted» bearer=«redacted» note=keep");
 		expect(contents).toContain("set_cookie=«redacted»\\nserialized-cookie-after=keep");
 		expect(contents).toContain("before=keep");
 		expect(contents).toContain("after=keep");
@@ -432,7 +437,8 @@ describe("recordFatalCrash", () => {
 	it("bounds matching work for long non-credential compound keys", () => {
 		const longKey = `${"a-".repeat(10_000)}tokenx`;
 		const longAcronymKey = `a${"A".repeat(20_000)}x`;
-		const input = `${longKey}=public ${longAcronymKey}=public`;
+		const longDiagnosticValue = `stderr=${"E".repeat(20_000)}`;
+		const input = `${longKey}=public ${longAcronymKey}=public ${longDiagnosticValue}`;
 		const startedAt = performance.now();
 
 		expect(isCredentialKey(longKey)).toBe(false);

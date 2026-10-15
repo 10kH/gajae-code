@@ -21,7 +21,18 @@ const CREDENTIAL_CAMEL_MULTI_PREFIX_SEGMENT = "(?:[A-Z][a-z0-9]+|[A-Z]{2,}(?=[A-
 const CREDENTIAL_CAMEL_MULTI_PREFIX = `(?:[a-z0-9]{2,}|[A-Z][a-z0-9]+|[A-Z]{2,})(?:${CREDENTIAL_CAMEL_MULTI_PREFIX_SEGMENT})+(?:[A-Z]{2,})?`;
 const CREDENTIAL_CAMEL_KEY_PATTERN = `(?:(?:${CREDENTIAL_CAMEL_COMPOUND_PREFIX}|${CREDENTIAL_CAMEL_MULTI_PREFIX})(?:${CREDENTIAL_CAMEL_COMPOUND_SUFFIXES})|(?:${CREDENTIAL_CAMEL_PREFIX}|${CREDENTIAL_CAMEL_MULTI_PREFIX})(?:${CREDENTIAL_CAMEL_SIMPLE_SUFFIXES}))`;
 const CREDENTIAL_CAMEL_KEY_SUFFIX = new RegExp(`^${CREDENTIAL_CAMEL_KEY_PATTERN}$`);
+const CREDENTIAL_CAMEL_ASSIGNMENT_CANDIDATE_PATTERN = new RegExp(
+	String.raw`(?:${CREDENTIAL_CAMEL_COMPOUND_SUFFIXES}|${CREDENTIAL_CAMEL_SIMPLE_SUFFIXES})(?:\\*["']?\s*[=:]\s*)`,
+);
 const CREDENTIAL_ASSIGNMENT_PREFIX = String.raw`(?<![A-Za-z0-9_-])((?:\\*["']?-*)(?:${CREDENTIAL_KEY_PATTERN})(?:\\*["']?\s*[=:]\s*))`;
+const CREDENTIAL_ASSIGNMENT_CANDIDATE_PATTERN = new RegExp(
+	String.raw`(?:${CREDENTIAL_KEY_LABELS})(?:\\*["']?\s*[=:]\s*)`,
+	"i",
+);
+const CREDENTIAL_CONTAINER_CANDIDATE_PATTERN = new RegExp(
+	String.raw`(?:${CREDENTIAL_KEY_LABELS})(?:\\*["']?\s*[=:]\s*[\[{])`,
+	"i",
+);
 const CREDENTIAL_CAMEL_ASSIGNMENT_PREFIX = String.raw`(?<![A-Za-z0-9_-])((?:\\*["']?-*)(?:${CREDENTIAL_CAMEL_KEY_PATTERN})(?:\\*["']?\s*[=:]\s*))`;
 const AUTHORIZATION_HEADER_PREFIX = String.raw`(?<![A-Za-z0-9_-])((?:\\*["']?-*)(?:[A-Za-z0-9][A-Za-z0-9_-]*[_-])?(?:auth|authorization)(?:\\*["']?\s*:\s*))`;
 const CREDENTIAL_UNQUOTED_VALUE_PATTERN_BODY = String.raw`(?:(?!\\+n|\\+r\\+n)(?:\\[^\r\n]|[^\s"',;}\]]))+`;
@@ -40,7 +51,61 @@ const CREDENTIAL_CAMEL_VALUE_PATTERN = new RegExp(
 	"g",
 );
 const COOKIE_VALUE_PATTERN =
-	/(?:(?<![A-Za-z0-9_-])|(?<=\\n))((?:[A-Za-z0-9][A-Za-z0-9_-]*[_-])?cookie\s*[:=]\s*)(?:(?!\\+n|\\+r\\+n)[^\r\n])*/gi;
+	/(?:(?<![A-Za-z0-9_-])|(?<=\\n))((?:[A-Za-z0-9][A-Za-z0-9_-]*[_-])?cookie\s*[:=]\s*)((?:(?!\\+n|\\+r\\+n)[^\r\n])*)/gi;
+
+function isCookieFieldWhitespace(character: string | undefined): boolean {
+	return character === " " || character === "\t";
+}
+
+function isCookieFieldNameStart(character: string | undefined): boolean {
+	if (character === undefined) return false;
+	const code = character.charCodeAt(0);
+	return (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+}
+
+function isCookieFieldNameCharacter(character: string | undefined): boolean {
+	if (character === undefined) return false;
+	const code = character.charCodeAt(0);
+	return (
+		character === "_" ||
+		character === "-" ||
+		(code >= 48 && code <= 57) ||
+		(code >= 65 && code <= 90) ||
+		(code >= 97 && code <= 122)
+	);
+}
+
+function cookieDiagnosticSuffix(value: string): string {
+	let quote: string | undefined;
+	for (let index = 0; index < value.length; index++) {
+		const character = value[index];
+		if (character === "\\") {
+			index++;
+			continue;
+		}
+		if (quote !== undefined) {
+			if (character === quote) quote = undefined;
+			continue;
+		}
+		if (character === "'" || character === '"' || character === "`") {
+			quote = character;
+			continue;
+		}
+		if (!isCookieFieldWhitespace(character)) continue;
+
+		const boundary = index;
+		while (isCookieFieldWhitespace(value[index])) index++;
+		if (!isCookieFieldNameStart(value[index])) continue;
+		while (isCookieFieldNameCharacter(value[index])) index++;
+		while (isCookieFieldWhitespace(value[index])) index++;
+		if (value[index] !== "=" && value[index] !== ":") continue;
+
+		let previous = boundary - 1;
+		while (previous >= 0 && isCookieFieldWhitespace(value[previous])) previous--;
+		if (value[previous] !== ";") return value.slice(boundary);
+	}
+	return "";
+}
 
 /** Whether a field name ends in a credential label recognized by the redactor. */
 export function isCredentialKey(key: string): boolean {
@@ -110,9 +175,13 @@ export function redactCrashSecrets(text: string): string {
 	// does not match `SecretAccessKey` (the canonical field has `Access` in the
 	// middle), and `access_token` does not match `SessionToken`.
 	redacted = redacted.replace(/\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b/g, "«redacted-aws-key»");
-	// Cookie headers and assignments contain multiple semicolon-separated values;
-	// redact through the physical/escaped line end to cover every credential.
-	redacted = redacted.replace(COOKIE_VALUE_PATTERN, "$1«redacted»");
+	// Cookie values may contain semicolon-separated pairs. Preserve a later,
+	// whitespace-separated diagnostic assignment so the narrower rules can scrub
+	// it independently without losing useful context after the cookie.
+	redacted = redacted.replace(
+		COOKIE_VALUE_PATTERN,
+		(_match, prefix: string, value: string) => `${prefix}«redacted»${cookieDiagnosticSuffix(value)}`,
+	);
 	redacted = redacted.replace(CREDENTIAL_AUTH_VALUE_PATTERN, (_match, prefix: string) => `${prefix}«redacted»`);
 	redacted = redacted.replace(
 		CREDENTIAL_AUTHORIZATION_VALUE_PATTERN,
@@ -123,8 +192,12 @@ export function redactCrashSecrets(text: string): string {
 	// unterminated value is redacted through the end of its line. Capture each
 	// complete key once and inspect its suffix; repeated compound-prefix groups
 	// backtrack quadratically on long attacker-controlled identifiers.
-	redacted = redacted.replace(CREDENTIAL_VALUE_PATTERN, redactCredentialValue);
-	redacted = redacted.replace(CREDENTIAL_CAMEL_VALUE_PATTERN, redactCredentialValue);
+	if (CREDENTIAL_ASSIGNMENT_CANDIDATE_PATTERN.test(redacted)) {
+		redacted = redacted.replace(CREDENTIAL_VALUE_PATTERN, redactCredentialValue);
+	}
+	if (CREDENTIAL_CAMEL_ASSIGNMENT_CANDIDATE_PATTERN.test(redacted)) {
+		redacted = redacted.replace(CREDENTIAL_CAMEL_VALUE_PATTERN, redactCredentialValue);
+	}
 	return redacted;
 }
 
@@ -191,6 +264,7 @@ function redactCredentialValue(
 }
 
 function redactCredentialContainers(text: string): string {
+	if (!CREDENTIAL_CONTAINER_CANDIDATE_PATTERN.test(text)) return text;
 	const assignment = new RegExp(String.raw`${CREDENTIAL_ASSIGNMENT_PREFIX}(?=[\[{])`, "gi");
 	const camelAssignment = new RegExp(String.raw`${CREDENTIAL_CAMEL_ASSIGNMENT_PREFIX}(?=[\[{])`, "g");
 	return redactCredentialContainersWithPattern(
