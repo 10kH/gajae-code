@@ -22,6 +22,8 @@ const TRUST_KEYS = [
 	"USERPROFILE",
 	"APPDATA",
 	"BASH_ENV",
+	"ENV",
+	"ZDOTDIR",
 	"PATH",
 	"HTTP_PROXY",
 	"HTTPS_PROXY",
@@ -52,6 +54,8 @@ interface GhSpawn {
 	cwd: string;
 	PATH: string;
 	BASH_ENV: string | null;
+	ENV: string | null;
+	ZDOTDIR: string | null;
 	GH_HOST: string | null;
 	GH_CONFIG_DIR: string | null;
 	GH_TOKEN: string | null;
@@ -115,6 +119,8 @@ await fsPromises.appendFile(
 		cwd: process.cwd(),
 		PATH: process.env.PATH ?? "",
 		BASH_ENV: process.env.BASH_ENV ?? null,
+		ENV: process.env.ENV ?? null,
+		ZDOTDIR: process.env.ZDOTDIR ?? null,
 		GH_HOST: process.env.GH_HOST ?? null,
 		GH_CONFIG_DIR: process.env.GH_CONFIG_DIR ?? null,
 		GH_TOKEN: process.env.GH_TOKEN ?? null,
@@ -284,6 +290,8 @@ function expectDestination(
 			| "USERPROFILE"
 			| "APPDATA"
 			| "BASH_ENV"
+			| "ENV"
+			| "ZDOTDIR"
 			| "HTTP_PROXY"
 			| "HTTPS_PROXY"
 			| "ALL_PROXY"
@@ -329,6 +337,8 @@ function expectDestination(
 		expect(spawn.USERPROFILE).toBe(expected.USERPROFILE ?? null);
 		expect(spawn.APPDATA).toBe(expected.APPDATA ?? null);
 		expect(spawn.BASH_ENV).toBe(expected.BASH_ENV ?? null);
+		expect(spawn.ENV).toBe(expected.ENV ?? null);
+		expect(spawn.ZDOTDIR).toBe(expected.ZDOTDIR ?? null);
 		expect(spawn.HTTP_PROXY).toBe(expected.HTTP_PROXY ?? null);
 		expect(spawn.HTTPS_PROXY).toBe(expected.HTTPS_PROXY ?? null);
 		expect(spawn.ALL_PROXY).toBe(expected.ALL_PROXY ?? null);
@@ -393,12 +403,15 @@ APPDATA=project-appdata
 		expectDestination(spawns, {});
 	});
 
-	it("omits a project dotenv Bash startup hook from both gh spawns", async () => {
+	it("omits project dotenv shell startup hooks from both gh spawns", async () => {
 		const spawns = await share({
 			autoload: true,
-			dotenv: "BASH_ENV=/project/bash-startup\n",
+			dotenv: `BASH_ENV=/project/bash-startup
+ENV=/project/shell-startup
+ZDOTDIR=/project/zsh
+`,
 		});
-		expectDestination(spawns, { BASH_ENV: null });
+		expectDestination(spawns, { BASH_ENV: null, ENV: null, ZDOTDIR: null });
 	});
 
 	it("omits project dotenv proxy and CA overrides from both gh spawns", async () => {
