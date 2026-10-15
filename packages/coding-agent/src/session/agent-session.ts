@@ -23339,10 +23339,10 @@ export class AgentSession {
 			matchingRowIds.unshift(credentialRowId);
 		}
 		if (matchingRowIds.length === 0) return undefined;
-		const inventory = authStorage.listCredentialInventory(candidate.provider);
+		const initialInventory = authStorage.listCredentialInventory(candidate.provider);
 		const failedCredential =
-			inventory.find(credential => credential.id === credentialRowId) ??
-			inventory.find(credential => matchingRowIds.includes(credential.id));
+			initialInventory.find(credential => credential.id === credentialRowId) ??
+			initialInventory.find(credential => matchingRowIds.includes(credential.id));
 		const credentialKind =
 			failedCredential?.credentialKind ??
 			authStorage.getSessionCredentialType(candidate.provider, this.credentialSessionId);
@@ -23358,6 +23358,7 @@ export class AgentSession {
 				rowId: failedRowId,
 			});
 		}
+		const inventory = authStorage.listCredentialInventory(candidate.provider);
 		// A row's backoff can expire while compaction is in flight and move the
 		// sticky pointer back to a row this rotation already tried. Scan the live
 		// inventory and exclude every failed row instead of trusting that pointer.
@@ -25726,11 +25727,8 @@ export class AgentSession {
 		retryAfterMs?: number;
 		authDisposition?: AuthDisposition;
 		trackSameTurnRows?: boolean;
-		continueOnPeerResolutionFailure?: boolean;
-		model?: Model;
-		credentialRowId?: number;
 	}): Promise<"rotated" | "alternate" | "exhausted" | "unchanged"> {
-		const model = trigger.model ?? this.model;
+		const model = this.model;
 		if (
 			!model ||
 			(trigger.class !== "auth" &&
@@ -25771,9 +25769,7 @@ export class AgentSession {
 			// Retain this snapshot through mark/result policy; the mark can mutate
 			// assignments before fallback decides whether the typed pool is exhausted.
 			const before =
-				trigger.credentialRowId ??
-				dispatchedCredential?.rowId ??
-				authStorage.getSessionCredentialRowId(provider, credentialSessionId);
+				dispatchedCredential?.rowId ?? authStorage.getSessionCredentialRowId(provider, credentialSessionId);
 			const beforeKind = trigger.trackSameTurnRows
 				? (dispatchedCredential?.credentialKind ??
 					authStorage.getSessionCredentialType(provider, credentialSessionId))
@@ -25809,13 +25805,7 @@ export class AgentSession {
 					});
 				} catch (error) {
 					if (!authStorage.isCredentialAvailable(provider, peerId)) continue;
-					if (!trigger.continueOnPeerResolutionFailure) throw error;
-					logger.warn("Failed to resolve stored credential while selecting an alternate", {
-						provider,
-						credentialId: peerId,
-						errorType: error instanceof Error ? error.name : typeof error,
-					});
-					continue;
+					throw error;
 				}
 				if (!isAuthenticated(peerApiKey)) continue;
 				const selectedRowId = authStorage.getSessionCredentialRowId(provider, credentialSessionId);

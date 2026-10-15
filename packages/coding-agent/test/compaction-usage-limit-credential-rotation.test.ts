@@ -119,6 +119,55 @@ describe("auto-compaction usage limit rotates the session credential", () => {
 		expect(ends[0]?.result).toBeDefined();
 	});
 
+	it("rotates to a credential inserted while the failed row is being marked", async () => {
+		await authStorage.set("openai-codex", [{ type: "api_key", key: "codex-key-1" }]);
+		const failedRow = authStorage
+			.exportSnapshot()
+			.credentials.find(
+				entry =>
+					entry.provider === "openai-codex" &&
+					entry.credential.type === "api_key" &&
+					entry.credential.key === "codex-key-1",
+			);
+		if (!failedRow) throw new Error("test setup did not create the failed credential row");
+		session = createSession();
+		session.settings.set("retry.enabled", false);
+		session.settings.set("retry.maxRetries", 0);
+		const markFailedRow = authStorage.markUsageLimitReached.bind(authStorage);
+		const markUsageLimitReached = vi.spyOn(authStorage, "markUsageLimitReached");
+		markUsageLimitReached.mockImplementation(async (provider, sessionId, options) => {
+			const result = await markFailedRow(provider, sessionId, options);
+			if (options?.rowId === failedRow.id) {
+				await authStorage.set("openai-codex", [
+					{ type: "api_key", key: "codex-key-1" },
+					{ type: "api_key", key: "codex-key-2" },
+				]);
+			}
+			return result;
+		});
+		const ends = collectCompactionEnds(session);
+		const compactSpy = stubCompact(apiKey => apiKey === "codex-key-1");
+
+		await session.runIdleCompaction();
+
+		expect(markUsageLimitReached.mock.calls.map(call => call[2]?.rowId)).toEqual([failedRow.id]);
+		const insertedRow = authStorage
+			.exportSnapshot()
+			.credentials.find(
+				entry =>
+					entry.provider === "openai-codex" &&
+					entry.credential.type === "api_key" &&
+					entry.credential.key === "codex-key-2",
+			);
+		expect(insertedRow).toBeDefined();
+		if (!insertedRow) throw new Error("test setup did not retain the inserted credential row");
+		expect(authStorage.isCredentialAvailable("openai-codex", insertedRow.id)).toBe(true);
+		expect(compactSpy.mock.calls.map(call => call[2])).toEqual(["codex-key-1", "codex-key-2"]);
+		expect(ends).toHaveLength(1);
+		expect(ends[0]?.errorMessage).toBeUndefined();
+		expect(ends[0]?.result).toBeDefined();
+	});
+
 	it("rotates a stored row when an env-sourced config key is also configured", async () => {
 		let credentialSessionId: string | undefined;
 		for (let index = 0; index < 100; index++) {
