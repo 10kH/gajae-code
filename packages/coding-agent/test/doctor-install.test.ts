@@ -1,8 +1,9 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as native from "@gajae-code/natives";
 import {
 	describeInstallRestore,
 	type InstallDispatchAuthority,
@@ -14,6 +15,7 @@ import {
 	activationRecordPath,
 	buildActivationRecord,
 	createActivationRecordFile,
+	readActivationRecord,
 	snapshotDirectory,
 	snapshotRegularFile,
 } from "../src/cli/install-activation";
@@ -233,6 +235,32 @@ describe("doctor standalone install repair: refusals", () => {
 		expect(result.state).toBe("conflict");
 		expect(result.reason).toBe("target_or_parent_changed");
 		expect(await fs.readFile(f.target)).toEqual(Buffer.concat([ELF_HEADER, Buffer.from("raced-runtime")]));
+	});
+
+	it("preserves access_denied when a Windows publication failure reaches doctor", async () => {
+		const f = await fixture();
+		const descriptor = await describeInstallRestore(f.target, f.authority, "stable", "v1.2.3");
+		const replaceSpy = vi.spyOn(native, "exactReplaceRetained").mockReturnValue({
+			ok: false,
+			code: "access_denied",
+			windowsErrorCode: "0xC0000022",
+		});
+		try {
+			const result = await repairStandaloneBinary(
+				f.target,
+				descriptor,
+				candidateFor(f),
+				["install-replace", "network", "external-execution"],
+				fakeDeps(f),
+			);
+			expect(result).toMatchObject({ state: "failed", reason: "access_denied", sideEffectStarted: true });
+			expect(await fs.readFile(f.target)).toEqual(Buffer.concat([ELF_HEADER, Buffer.from("old-runtime")]));
+			const pending = await readActivationRecord(f.target);
+			expect(pending.status).toBe("valid");
+			if (pending.status === "valid") expect(pending.record.phase).toBe("pending_activation");
+		} finally {
+			replaceSpy.mockRestore();
+		}
 	});
 });
 

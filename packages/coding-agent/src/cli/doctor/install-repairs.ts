@@ -29,6 +29,7 @@ import {
 import {
 	acquireBinaryUpdateLock,
 	fetchAndVerifyOfficialPinnedCandidate,
+	InstallationAccessDeniedError,
 	isProtectedSourcePathForInstall,
 	replaceBinaryForUpdate,
 	smokeTestPinnedCandidate,
@@ -317,11 +318,14 @@ export async function repairStandaloneBinary(
 		};
 	} catch (error) {
 		const pendingActivation = error instanceof Error && error.message === "installation_pending_activation";
+		const accessDenied = error instanceof InstallationAccessDeniedError;
 		const reason = pendingActivation
 			? "sharing_violation"
-			: error instanceof Error && /^[a-z][a-z0-9_]{0,63}$/.test(error.message)
-				? error.message
-				: "installation_execution_unverified";
+			: accessDenied
+				? error.code
+				: error instanceof Error && /^[a-z][a-z0-9_]{0,63}$/.test(error.message)
+					? error.message
+					: "installation_execution_unverified";
 		return {
 			state: pendingActivation ? "pending_activation" : started ? "failed" : "blocked",
 			reason,

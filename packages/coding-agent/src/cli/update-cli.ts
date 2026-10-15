@@ -108,6 +108,20 @@ export interface BinaryReplacementOptions {
 	verifyInstalledVersion: (expectedVersion: string) => Promise<InstalledVersionVerification>;
 }
 
+export class InstallationAccessDeniedError extends Error {
+	readonly code = "access_denied";
+
+	constructor(
+		readonly targetPath: string,
+		readonly windowsErrorCode?: string,
+	) {
+		super(
+			`access_denied during exact replacement of ${targetPath}${windowsErrorCode ? ` (${windowsErrorCode})` : ""}`,
+		);
+		this.name = "InstallationAccessDeniedError";
+	}
+}
+
 /**
  * Parse update subcommand arguments.
  * Returns undefined if not an update command.
@@ -921,9 +935,7 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 		!promoted.recordIdentity
 	) {
 		if (promoted.reason === "access_denied")
-			throw new Error(
-				`access_denied during exact replacement of ${targetPath}${promoted.windowsErrorCode ? ` (${promoted.windowsErrorCode})` : ""}`,
-			);
+			throw new InstallationAccessDeniedError(targetPath, promoted.windowsErrorCode);
 		throw new Error(promoted.reason ?? "installation_publication_unverified");
 	}
 	record = promoted.record;
