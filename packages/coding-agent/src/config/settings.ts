@@ -391,6 +391,8 @@ const GLOBAL_ONLY_SETTINGS = new Set<SettingPath>([
 	"paseo.autoImport",
 	"ui.language",
 	"telemetry.enabled",
+	// Destination of the operator Hindsight server. A project file must not redirect it.
+	"hindsight.apiUrl",
 ]);
 const LEGACY_THEME_NAME_REPLACEMENTS = {
 	dark: "red-claw",
