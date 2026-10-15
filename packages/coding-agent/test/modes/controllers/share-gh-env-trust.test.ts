@@ -25,6 +25,11 @@ const TRUST_KEYS = [
 	"ENV",
 	"ZDOTDIR",
 	"NODE_OPTIONS",
+	"NODE_PATH",
+	"PYTHONHOME",
+	"PYTHONPATH",
+	"PYTHONUSERBASE",
+	"PYTHONSTARTUP",
 	"PATH",
 	"HTTP_PROXY",
 	"HTTPS_PROXY",
@@ -58,6 +63,11 @@ interface GhSpawn {
 	ENV: string | null;
 	ZDOTDIR: string | null;
 	NODE_OPTIONS: string | null;
+	NODE_PATH: string | null;
+	PYTHONHOME: string | null;
+	PYTHONPATH: string | null;
+	PYTHONUSERBASE: string | null;
+	PYTHONSTARTUP: string | null;
 	GH_HOST: string | null;
 	GH_CONFIG_DIR: string | null;
 	GH_TOKEN: string | null;
@@ -124,6 +134,11 @@ await fsPromises.appendFile(
 		ENV: process.env.ENV ?? null,
 		ZDOTDIR: process.env.ZDOTDIR ?? null,
 		NODE_OPTIONS: process.env.NODE_OPTIONS ?? null,
+		NODE_PATH: process.env.NODE_PATH ?? null,
+		PYTHONHOME: process.env.PYTHONHOME ?? null,
+		PYTHONPATH: process.env.PYTHONPATH ?? null,
+		PYTHONUSERBASE: process.env.PYTHONUSERBASE ?? null,
+		PYTHONSTARTUP: process.env.PYTHONSTARTUP ?? null,
 		GH_HOST: process.env.GH_HOST ?? null,
 		GH_CONFIG_DIR: process.env.GH_CONFIG_DIR ?? null,
 		GH_TOKEN: process.env.GH_TOKEN ?? null,
@@ -296,6 +311,11 @@ function expectDestination(
 			| "ENV"
 			| "ZDOTDIR"
 			| "NODE_OPTIONS"
+			| "NODE_PATH"
+			| "PYTHONHOME"
+			| "PYTHONPATH"
+			| "PYTHONUSERBASE"
+			| "PYTHONSTARTUP"
 			| "HTTP_PROXY"
 			| "HTTPS_PROXY"
 			| "ALL_PROXY"
@@ -344,6 +364,11 @@ function expectDestination(
 		expect(spawn.ENV).toBe(expected.ENV ?? null);
 		expect(spawn.ZDOTDIR).toBe(expected.ZDOTDIR ?? null);
 		expect(spawn.NODE_OPTIONS).toBe(expected.NODE_OPTIONS ?? null);
+		expect(spawn.NODE_PATH).toBe(expected.NODE_PATH ?? null);
+		expect(spawn.PYTHONHOME).toBe(expected.PYTHONHOME ?? null);
+		expect(spawn.PYTHONPATH).toBe(expected.PYTHONPATH ?? null);
+		expect(spawn.PYTHONUSERBASE).toBe(expected.PYTHONUSERBASE ?? null);
+		expect(spawn.PYTHONSTARTUP).toBe(expected.PYTHONSTARTUP ?? null);
 		expect(spawn.HTTP_PROXY).toBe(expected.HTTP_PROXY ?? null);
 		expect(spawn.HTTPS_PROXY).toBe(expected.HTTPS_PROXY ?? null);
 		expect(spawn.ALL_PROXY).toBe(expected.ALL_PROXY ?? null);
@@ -408,16 +433,52 @@ APPDATA=project-appdata
 		expectDestination(spawns, {});
 	});
 
-	it("omits project dotenv shell startup hooks from both gh spawns", async () => {
+	it("omits project dotenv shell and interpreter startup hooks from both gh spawns", async () => {
 		const spawns = await share({
 			autoload: true,
 			dotenv: `BASH_ENV=/project/bash-startup
 ENV=/project/shell-startup
 ZDOTDIR=/project/zsh
 NODE_OPTIONS=--no-warnings
+NODE_PATH=/project/node-modules
+PYTHONHOME=/project/python-home
+PYTHONPATH=/project/python-path
+PYTHONUSERBASE=/project/python-user-base
+PYTHONSTARTUP=/project/python-startup.py
 `,
 		});
-		expectDestination(spawns, { BASH_ENV: null, ENV: null, ZDOTDIR: null, NODE_OPTIONS: null });
+		expectDestination(spawns, {
+			BASH_ENV: null,
+			ENV: null,
+			ZDOTDIR: null,
+			NODE_OPTIONS: null,
+			NODE_PATH: null,
+			PYTHONHOME: null,
+			PYTHONPATH: null,
+			PYTHONUSERBASE: null,
+			PYTHONSTARTUP: null,
+		});
+	});
+
+	it("preserves operator-declared Node and Python runtime settings", async () => {
+		const spawns = await share({
+			env: {
+				NODE_OPTIONS: "--no-warnings",
+				NODE_PATH: "/operator/node-modules",
+				PYTHONHOME: "/operator/python-home",
+				PYTHONPATH: "/operator/python-path",
+				PYTHONUSERBASE: "/operator/python-user-base",
+				PYTHONSTARTUP: "/operator/python-startup.py",
+			},
+		});
+		expectDestination(spawns, {
+			NODE_OPTIONS: "--no-warnings",
+			NODE_PATH: "/operator/node-modules",
+			PYTHONHOME: "/operator/python-home",
+			PYTHONPATH: "/operator/python-path",
+			PYTHONUSERBASE: "/operator/python-user-base",
+			PYTHONSTARTUP: "/operator/python-startup.py",
+		});
 	});
 
 	it("omits project dotenv proxy and CA overrides from both gh spawns", async () => {
