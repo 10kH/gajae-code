@@ -339,6 +339,24 @@ describe("planMigration — slash commands", () => {
 		});
 	});
 
+	test("built-in command names and aliases are namespaced by source", async () => {
+		const candidate = result({ slashCommandCandidates: [slashCommand("help"), slashCommand("quit")] });
+		const { actions } = await planMigration({ results: [candidate], destinations: dest, force: false });
+
+		expect(actions).toMatchObject([
+			{
+				name: "claude-code:help",
+				destination: path.join(dest.commandsDir, "claude-code", "help.md"),
+				status: "imported",
+			},
+			{
+				name: "claude-code:quit",
+				destination: path.join(dest.commandsDir, "claude-code", "quit.md"),
+				status: "imported",
+			},
+		]);
+	});
+
 	test("existing commands are skipped by default and updated only with force", async () => {
 		await fs.mkdir(dest.commandsDir, { recursive: true });
 		const destination = path.join(dest.commandsDir, "review.md");
@@ -413,6 +431,56 @@ describe("planMigration — slash commands", () => {
 			status: "failed_invalid_destination",
 			reason: "destination filename must end in lowercase .md for native slash-command discovery",
 		});
+	});
+
+	test.skipIf(process.platform === "win32")("flat colon filenames collide with nested command names", async () => {
+		await fs.mkdir(dest.commandsDir, { recursive: true });
+		const existingDestination = path.join(dest.commandsDir, "review:security.md");
+		await fs.writeFile(existingDestination, "Existing flat command.", "utf-8");
+		const candidate = result({
+			slashCommandCandidates: [slashCommand("review:security", "Imported nested command.")],
+		});
+
+		const skipped = await planMigration({ results: [candidate], destinations: dest, force: false });
+		expect(skipped.actions[0]).toMatchObject({
+			name: "review:security",
+			destination: existingDestination,
+			operation: "skip",
+			status: "skipped_exists",
+		});
+		const forced = await planMigration({ results: [candidate], destinations: dest, force: true });
+		expect(forced.actions[0]).toMatchObject({
+			name: "review:security",
+			destination: existingDestination,
+			operation: "update",
+			status: "updated",
+		});
+		const executed = await executeActions(forced.actions, { project: true });
+		expect(executed[0]).toMatchObject({ name: "review:security", status: "updated" });
+		expect(await fs.readFile(existingDestination, "utf-8")).toBe("Imported nested command.");
+		expect(
+			await fs.access(path.join(dest.commandsDir, "review", "security.md")).then(
+				() => true,
+				() => false,
+			),
+		).toBe(false);
+	});
+
+	test.skipIf(process.platform === "win32")("multiple existing files with one loaded name fail closed", async () => {
+		await fs.mkdir(path.join(dest.commandsDir, "review"), { recursive: true });
+		const flatDestination = path.join(dest.commandsDir, "review:security.md");
+		const nestedDestination = path.join(dest.commandsDir, "review", "security.md");
+		await fs.writeFile(flatDestination, "Flat command.", "utf-8");
+		await fs.writeFile(nestedDestination, "Nested command.", "utf-8");
+		const candidate = result({ slashCommandCandidates: [slashCommand("review:security", "Imported command.")] });
+
+		const skipped = await planMigration({ results: [candidate], destinations: dest, force: false });
+		expect(skipped.actions[0]).toMatchObject({ operation: "skip", status: "skipped_exists" });
+		expect(skipped.actions[0]?.reason).toContain("multiple existing files resolve to /review:security");
+		const forced = await planMigration({ results: [candidate], destinations: dest, force: true });
+		expect(forced.actions[0]).toMatchObject({ operation: "fail", status: "failed_invalid_destination" });
+		expect(await fs.readFile(flatDestination, "utf-8")).toBe("Flat command.");
+		expect(await fs.readFile(nestedDestination, "utf-8")).toBe("Nested command.");
 	});
 
 	test("file-versus-directory command collisions are reported before execution", async () => {

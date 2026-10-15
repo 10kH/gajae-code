@@ -89,6 +89,9 @@ Codex's user prompts remain the command source for either destination scope.
 They are written beneath the selected scope's `commands/prompts/` directory.
 Nested Claude command paths become colon-separated names, so
 `.claude/commands/review/security.md` is imported as `/review:security`.
+Names that collide with a GJC built-in command or alias are namespaced under
+their source; for example, `.claude/commands/help.md` becomes
+`/claude-code:help` instead of shadowing the built-in `/help`.
 Command Markdown and frontmatter are preserved; GJC uses the `description`
 field and its own argument placeholders, but does not translate Claude-specific
 metadata such as tool restrictions or model selection.
@@ -98,8 +101,11 @@ explicitly updates existing destination files. Command destination collisions
 are compared case-insensitively for portability; without `--force`, the later
 selected command is skipped, and with `--force` it updates the first destination
 and reports the command name using that destination's existing spelling.
-File-versus-directory conflicts between planned command paths are reported before
-writing; `--force` does not delete an existing command subtree to resolve them.
+Collisions also account for distinct paths that load as the same slash command,
+such as `review:security.md` and `review/security.md`; `--force` updates the
+existing command path. File-versus-directory conflicts between planned command
+paths are reported before writing; `--force` does not delete an existing command
+subtree to resolve them.
 Instruction and command writes refuse to follow symlinked destination directories.
 Codex prompts are imported as slash commands, not skills. Claude Code subagents,
 extensions, Claude Code/Codex hooks and settings (model, permissions, and

@@ -6,10 +6,13 @@
  * that decides add/update/skip/fail, destinations, and warnings, guaranteeing
  * dry-run/live parity.
  */
+
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { FileType, glob } from "@gajae-code/natives";
 import { isEnoent, parseFrontmatter } from "@gajae-code/utils";
 import { readMCPConfigFile, validateServerName } from "../runtime-mcp/config-writer";
+import { lookupBuiltinSlashCommand } from "../slash-commands/builtin-registry";
 import { mapMcpEntry } from "./mcp-mapper";
 import { slugify } from "./skill-normalizer";
 import type { AdapterResult, MigrateAction, MigrateDestinations, MigrateWarning } from "./types";
@@ -94,11 +97,63 @@ function isStrictPathPrefix(prefix: string[], candidate: string[]): boolean {
 }
 
 function commandNameFromDestination(commandsDir: string, destination: string): string {
-	const segments = path.relative(commandsDir, destination).split(path.sep);
-	const filename = segments.pop();
-	if (!filename?.endsWith(".md")) throw new Error(`command destination does not end in .md: ${destination}`);
-	segments.push(filename.slice(0, -3));
-	return segments.join(":");
+	return path.relative(commandsDir, destination).replace(/\.md$/, "").split(path.sep).join(":");
+}
+
+interface ExistingCommandDestination {
+	name: string;
+	destination: string;
+}
+
+type ExistingCommandNameIndex = Map<string, ExistingCommandDestination[]>;
+
+function avoidBuiltinSlashCommandName(source: string, name: string): string {
+	let safeName = name;
+	while (lookupBuiltinSlashCommand(safeName)) safeName = `${source}:${safeName}`;
+	return safeName;
+}
+
+async function indexExistingCommandNames(commandsDir: string): Promise<ExistingCommandNameIndex> {
+	const index: ExistingCommandNameIndex = new Map();
+	const root = path.resolve(commandsDir);
+	try {
+		const rootStat = await fs.lstat(root);
+		if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) return index;
+	} catch (error) {
+		if (isEnoent(error)) return index;
+		throw error;
+	}
+
+	const result = await glob({
+		pattern: "**/*.md",
+		path: root,
+		fileType: FileType.File,
+		hidden: false,
+		gitignore: true,
+	});
+	for (const match of result.matches) {
+		const matchSegments = match.path.split("/");
+		const destination = path.join(root, ...matchSegments);
+		const relative = path.relative(root, destination);
+		if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) continue;
+
+		let isRegularFile = false;
+		try {
+			const stat = await fs.lstat(destination);
+			isRegularFile = stat.isFile() && !stat.isSymbolicLink();
+		} catch (error) {
+			if (isEnoent(error)) continue;
+			throw error;
+		}
+		if (!isRegularFile) continue;
+
+		const name = commandNameFromDestination(root, destination);
+		const key = name.toLowerCase();
+		const destinations = index.get(key) ?? [];
+		destinations.push({ name, destination });
+		index.set(key, destinations);
+	}
+	return index;
 }
 
 /** Resolve case-equivalent existing paths so command collisions stay portable. */
@@ -458,16 +513,26 @@ export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 	}
 
 	// 5. Slash commands — command names map to the scoped commands directory.
+	let existingCommandNames: ExistingCommandNameIndex = new Map();
+	let existingCommandNameIndexError: unknown;
+	if (input.results.some(result => result.slashCommandCandidates.length > 0)) {
+		try {
+			existingCommandNames = await indexExistingCommandNames(input.destinations.commandsDir);
+		} catch (error) {
+			existingCommandNameIndexError = error;
+		}
+	}
 	const plannedCommands = new Map<string, PlannedCommandDestination>();
 	const validCommandNameSegment = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 	for (const result of input.results) {
 		for (const candidate of result.slashCommandCandidates) {
-			const nameParts = candidate.name.split(":");
+			const name = avoidBuiltinSlashCommandName(candidate.source, candidate.name);
+			const nameParts = name.split(":");
 			if (!nameParts.every(part => validCommandNameSegment.test(part))) {
 				actions.push({
 					source: candidate.source,
 					type: "command",
-					name: candidate.name,
+					name,
 					operation: "fail",
 					status: "failed_invalid_source",
 					reason:
@@ -487,9 +552,18 @@ export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 			);
 			const plannedCommand = plannedCommands.get(collisionKey);
 			let destination = plannedCommand?.destination ?? requestedDestination;
-			let base = { source: candidate.source, type: "command" as const, name: candidate.name, destination };
+			let base = { source: candidate.source, type: "command" as const, name, destination };
+			if (existingCommandNameIndexError) {
+				actions.push({
+					...base,
+					operation: "fail",
+					status: "failed_io",
+					reason: `failed to index existing slash commands: ${(existingCommandNameIndexError as Error).message}`,
+				});
+				continue;
+			}
 			if (plannedCommand) {
-				const sameName = plannedCommand.name === candidate.name;
+				const sameName = plannedCommand.name === name;
 				const collisionReason = sameName
 					? "duplicate within this run"
 					: `case-insensitive destination collision with "${plannedCommand.name}"`;
@@ -510,6 +584,47 @@ export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 						reason: collisionReason,
 					});
 				}
+				continue;
+			}
+
+			const matchingExistingNames = existingCommandNames.get(name.toLowerCase()) ?? [];
+			if (matchingExistingNames.length > 1) {
+				const paths = matchingExistingNames.map(existing => existing.destination).join(", ");
+				actions.push({
+					...base,
+					operation: input.force ? "fail" : "skip",
+					status: input.force ? "failed_invalid_destination" : "skipped_exists",
+					reason: `multiple existing files resolve to /${name}: ${paths}`,
+				});
+				continue;
+			}
+			const matchingExistingName = matchingExistingNames[0];
+			if (matchingExistingName) {
+				const effectiveBase = {
+					...base,
+					name: matchingExistingName.name,
+					destination: matchingExistingName.destination,
+				};
+				if (input.force) {
+					actions.push({
+						...effectiveBase,
+						operation: "update",
+						status: "updated",
+						command: { content: candidate.content },
+					});
+				} else {
+					actions.push({
+						...effectiveBase,
+						operation: "skip",
+						status: "skipped_exists",
+						reason: `command name already resolves from ${matchingExistingName.destination}`,
+					});
+				}
+				plannedCommands.set(collisionKey, {
+					name: matchingExistingName.name,
+					destination: matchingExistingName.destination,
+					segments: destinationSegments,
+				});
 				continue;
 			}
 

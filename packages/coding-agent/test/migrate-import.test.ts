@@ -185,6 +185,20 @@ describe("end-to-end import", () => {
 		expect(expandSlashCommand("/review:security src/auth.ts", commands)).toContain("Review src/auth.ts.");
 	});
 
+	test("Claude commands colliding with built-ins are namespaced", async () => {
+		await fs.mkdir(path.join(cwd, ".claude", "commands"), { recursive: true });
+		await fs.writeFile(path.join(cwd, ".claude", "commands", "help.md"), "Help $ARGUMENTS.", "utf-8");
+		const destination = path.join(cwd, ".gjc", "commands", "claude-code", "help.md");
+
+		const report = await runMigrate(opts({ from: ["claude-code"] }));
+		expect(report.actions).toContainEqual(
+			expect.objectContaining({ type: "command", name: "claude-code:help", destination, status: "imported" }),
+		);
+		const commands = await loadSlashCommands({ cwd });
+		expect(commands).toContainEqual(expect.objectContaining({ name: "claude-code:help" }));
+		expect(expandSlashCommand("/claude-code:help project", commands)).toContain("Help project.");
+	});
+
 	test("Codex prompts import as native slash commands, not skills", async () => {
 		await write(".codex/config.toml", '[mcp_servers.codexSrv]\ncommand = "cdx"\n');
 		const prompt = "---\ndescription: Codex help prompt.\n---\nHelp $ARGUMENTS.";
@@ -217,6 +231,29 @@ describe("end-to-end import", () => {
 				() => false,
 			),
 		).toBe(false);
+	});
+
+	test.skipIf(process.platform === "win32")("flat colon command files collide with nested imports", async () => {
+		await fs.mkdir(path.join(cwd, ".claude", "commands", "review"), { recursive: true });
+		await fs.writeFile(
+			path.join(cwd, ".claude", "commands", "review", "security.md"),
+			"Imported $ARGUMENTS.",
+			"utf-8",
+		);
+		const destination = path.join(cwd, ".gjc", "commands", "review:security.md");
+		await fs.mkdir(path.dirname(destination), { recursive: true });
+		await fs.writeFile(destination, "Existing flat command.", "utf-8");
+
+		const skipped = await runMigrate(opts({ from: ["claude-code"] }));
+		expect(skipped.actions).toContainEqual(
+			expect.objectContaining({ type: "command", name: "review:security", destination, status: "skipped_exists" }),
+		);
+		const forced = await runMigrate(opts({ from: ["claude-code"], force: true }));
+		expect(forced.actions).toContainEqual(
+			expect.objectContaining({ type: "command", name: "review:security", destination, status: "updated" }),
+		);
+		const commands = await loadSlashCommands({ cwd });
+		expect(expandSlashCommand("/review:security this", commands)).toContain("Imported this.");
 	});
 
 	test("command collisions skip by default and require force to replace", async () => {
