@@ -963,13 +963,15 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 		expectedRecordIdentity: recordIdentity,
 	});
 	if (promoted.status === "pending_activation") {
-		const stagingCleanupWarning = redundantStage
-			? await tryRemoveExactStagingFile(redundantStage.path, redundantStage.identity)
-			: undefined;
-		if (stagingCleanupWarning)
-			logger.warn("Update staging cleanup failed while activation is pending", {
-				warning: stagingCleanupWarning,
-			});
+		if (promoted.reason !== "candidate_missing") {
+			const stagingCleanupWarning = redundantStage
+				? await tryRemoveExactStagingFile(redundantStage.path, redundantStage.identity)
+				: undefined;
+			if (stagingCleanupWarning)
+				logger.warn("Update staging cleanup failed while activation is pending", {
+					warning: stagingCleanupWarning,
+				});
+		}
 		throw new Error("installation_pending_activation");
 	}
 	if (
@@ -984,6 +986,11 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 			: undefined;
 		if (promoted.reason === "access_denied")
 			throw new InstallationAccessDeniedError(targetPath, promoted.windowsErrorCode, stagingCleanupWarning);
+		if (stagingCleanupWarning)
+			logger.warn("Update staging cleanup failed after activation reconciliation failed", {
+				reason: promoted.reason ?? promoted.status,
+				warning: stagingCleanupWarning,
+			});
 		throw new Error(promoted.reason ?? "installation_publication_unverified");
 	}
 	record = promoted.record;

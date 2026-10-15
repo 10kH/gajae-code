@@ -2000,7 +2000,7 @@ describe("update-cli binary replacement", () => {
 		const target = (await snapshotRegularFile(targetPath))!;
 		const stage = (await snapshotRegularFile(recordedStage))!;
 		const parent = (await snapshotDirectory(dir))!;
-		await createActivationRecordFile({
+		const activationRecord = {
 			...buildActivationRecord({
 				targetPath,
 				targetIdentity: target.identity,
@@ -2010,8 +2010,9 @@ describe("update-cli binary replacement", () => {
 				stagingIdentity: stage.identity,
 				candidate: { digest: stage.identity.sha256, version: "15.1.8" },
 			}),
-			phase: "pending_activation",
-		});
+			phase: "pending_activation" as const,
+		};
+		const recordIdentity = await createActivationRecordFile(activationRecord);
 
 		const exactUnlink = native.exactUnlink;
 		const unlinkSpy = vi.spyOn(native, "exactUnlink").mockImplementation((filePath, identity) => {
@@ -2021,9 +2022,15 @@ describe("update-cli binary replacement", () => {
 		const reconcile = installActivation.reconcileActivationRecord;
 		const reconcileSpy = vi
 			.spyOn(installActivation, "reconcileActivationRecord")
-			.mockImplementation(async (filePath, options) => {
-				if (filePath === targetPath) await fs.unlink(recordedStage);
-				return reconcile(filePath, options);
+			.mockImplementation(async filePath => {
+				if (filePath === targetPath)
+					return {
+						status: "pending_activation",
+						record: activationRecord,
+						recordIdentity,
+						reason: "sharing_violation",
+					};
+				return reconcile(filePath, { allowPromotion: true });
 			});
 		const warnSpy = vi.spyOn(logger, "warn");
 		try {
@@ -2040,6 +2047,133 @@ describe("update-cli binary replacement", () => {
 			expect(warnSpy).toHaveBeenCalledWith("Update staging cleanup failed while activation is pending", {
 				warning: expect.stringContaining("activation_retry_staging_cleanup_failed"),
 			});
+			expect(await Bun.file(targetPath).text()).toBe("old binary");
+			expect(await Bun.file(retryStage).text()).toBe("new binary");
+		} finally {
+			warnSpy.mockRestore();
+			reconcileSpy.mockRestore();
+			unlinkSpy.mockRestore();
+		}
+	});
+
+	it("retains the retry candidate when the recorded stage disappears during reconciliation", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc.exe");
+		const recordedStage = path.join(dir, "gjc.new.recorded.exe");
+		const retryStage = path.join(dir, "gjc.new.retry.exe");
+		const backupPath = path.join(dir, "gjc.exe.bak");
+		await writeFixtureFile(targetPath, "old binary");
+		await writeFixtureFile(recordedStage, "new binary");
+		await writeFixtureFile(retryStage, "new binary");
+		const target = (await snapshotRegularFile(targetPath))!;
+		const stage = (await snapshotRegularFile(recordedStage))!;
+		const parent = (await snapshotDirectory(dir))!;
+		await createActivationRecordFile({
+			...buildActivationRecord({
+				targetPath,
+				targetIdentity: target.identity,
+				parentIdentity: parent,
+				baselineDigest: target.identity.sha256,
+				stagingPath: recordedStage,
+				stagingIdentity: stage.identity,
+				candidate: { digest: stage.identity.sha256, version: "15.1.8" },
+			}),
+			phase: "pending_activation",
+		});
+
+		const reconcile = installActivation.reconcileActivationRecord;
+		const reconcileSpy = vi
+			.spyOn(installActivation, "reconcileActivationRecord")
+			.mockImplementation(async (filePath, options) => {
+				if (filePath === targetPath) await fs.unlink(recordedStage);
+				return reconcile(filePath, options);
+			});
+		try {
+			await expect(
+				replaceBinaryFixture({
+					targetPath,
+					tempPath: retryStage,
+					backupPath,
+					expectedVersion: "15.1.8",
+					verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+				}),
+			).rejects.toThrow("installation_pending_activation");
+			expect(await Bun.file(retryStage).text()).toBe("new binary");
+		} finally {
+			reconcileSpy.mockRestore();
+		}
+
+		const result = await replaceBinaryFixture({
+			targetPath,
+			tempPath: retryStage,
+			backupPath,
+			expectedVersion: "15.1.8",
+			verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+		});
+		expect(result.ok).toBe(true);
+		expect(await Bun.file(targetPath).text()).toBe("new binary");
+		expect(await Bun.file(retryStage).exists()).toBe(false);
+		expect(await Bun.file(backupPath).exists()).toBe(false);
+	});
+
+	it("logs redundant-stage cleanup paths after a reconciliation conflict", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc.exe");
+		const recordedStage = path.join(dir, "gjc.new.recorded.exe");
+		const retryStage = path.join(dir, "gjc.new.retry.exe");
+		const detachedPath = path.join(dir, "gjc.new.retry.exe.cleanup");
+		const placeholderPath = path.join(dir, "gjc.new.retry.exe.placeholder");
+		const backupPath = path.join(dir, "gjc.exe.bak");
+		await writeFixtureFile(targetPath, "old binary");
+		await writeFixtureFile(recordedStage, "new binary");
+		await writeFixtureFile(retryStage, "new binary");
+		const target = (await snapshotRegularFile(targetPath))!;
+		const stage = (await snapshotRegularFile(recordedStage))!;
+		const parent = (await snapshotDirectory(dir))!;
+		await createActivationRecordFile({
+			...buildActivationRecord({
+				targetPath,
+				targetIdentity: target.identity,
+				parentIdentity: parent,
+				baselineDigest: target.identity.sha256,
+				stagingPath: recordedStage,
+				stagingIdentity: stage.identity,
+				candidate: { digest: stage.identity.sha256, version: "15.1.8" },
+			}),
+			phase: "pending_activation",
+		});
+
+		const exactUnlink = native.exactUnlink;
+		const unlinkSpy = vi.spyOn(native, "exactUnlink").mockImplementation((filePath, identity) => {
+			if (path.resolve(filePath) === retryStage)
+				return {
+					ok: false,
+					code: "cleanup_pending",
+					detachedPath,
+					retainedPlaceholderPath: placeholderPath,
+				};
+			return exactUnlink(filePath, identity);
+		});
+		const reconcileSpy = vi
+			.spyOn(installActivation, "reconcileActivationRecord")
+			.mockImplementation(async () => ({ status: "conflict", reason: "backup_collision" }));
+		const warnSpy = vi.spyOn(logger, "warn");
+		try {
+			await expect(
+				replaceBinaryFixture({
+					targetPath,
+					tempPath: retryStage,
+					backupPath,
+					expectedVersion: "15.1.8",
+					verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+				}),
+			).rejects.toThrow("backup_collision");
+			expect(warnSpy).toHaveBeenCalledWith("Update staging cleanup failed after activation reconciliation failed", {
+				reason: "backup_collision",
+				warning: expect.stringContaining(`detached=${detachedPath}|placeholder=${placeholderPath}`),
+			});
+			expect(await Bun.file(targetPath).text()).toBe("old binary");
+			expect(await Bun.file(retryStage).text()).toBe("new binary");
 		} finally {
 			warnSpy.mockRestore();
 			reconcileSpy.mockRestore();
