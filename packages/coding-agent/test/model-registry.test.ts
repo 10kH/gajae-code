@@ -3867,28 +3867,30 @@ describe("ModelRegistry", () => {
 				);
 			});
 
-			for (const provider of ["google-antigravity", "google-gemini-cli"] as const) {
-				for (const source of ["models-config", "runtime-override"] as const) {
-					const accessToken = `${provider}-${source}-access`;
-					const projectId = `${provider}-${source}-project`;
-					const structuredKey = JSON.stringify({ token: accessToken, projectId });
-					if (source === "models-config") {
-						writeRawModelsJson({ [provider]: { apiKey: structuredKey } });
-					} else {
-						writeRawModelsJson({});
-						authStorage.setRuntimeApiKey(provider, structuredKey);
-					}
+			for (const projectField of ["projectId", "project_id"] as const) {
+				for (const provider of ["google-antigravity", "google-gemini-cli"] as const) {
+					for (const source of ["models-config", "runtime-override"] as const) {
+						const accessToken = `${provider}-${source}-${projectField}-access`;
+						const projectId = `${provider}-${source}-${projectField}-project`;
+						const structuredKey = JSON.stringify({ token: accessToken, [projectField]: projectId });
+						if (source === "models-config") {
+							writeRawModelsJson({ [provider]: { apiKey: structuredKey } });
+						} else {
+							writeRawModelsJson({});
+							authStorage.setRuntimeApiKey(provider, structuredKey);
+						}
 
-					const registry = new ModelRegistry(authStorage, modelsJsonPath);
-					try {
-						await registry.refreshProvider(provider, "online");
-						expect(requests.at(-1)).toMatchObject({
-							accessToken,
-							body: { project: projectId },
-						});
-					} finally {
-						await registry.dispose();
-						if (source === "runtime-override") authStorage.removeRuntimeApiKey(provider);
+						const registry = new ModelRegistry(authStorage, modelsJsonPath);
+						try {
+							await registry.refreshProvider(provider, "online");
+							expect(requests.at(-1)).toMatchObject({
+								accessToken,
+								body: { project: projectId },
+							});
+						} finally {
+							await registry.dispose();
+							if (source === "runtime-override") authStorage.removeRuntimeApiKey(provider);
+						}
 					}
 				}
 			}

@@ -1452,9 +1452,10 @@ function getOAuthCredentialsForProvider(authStorage: AuthStorage, provider: stri
 function extractGoogleOAuthProjectId(value: string | undefined, accessToken: string): string | undefined {
 	if (!value) return undefined;
 	try {
-		const parsed = JSON.parse(value) as { token?: unknown; projectId?: unknown };
+		const parsed = JSON.parse(value) as { token?: unknown; projectId?: unknown; project_id?: unknown };
 		if (typeof parsed.token !== "string" || parsed.token.trim() !== accessToken) return undefined;
-		return typeof parsed.projectId === "string" ? parsed.projectId.trim() || undefined : undefined;
+		const projectId = typeof parsed.projectId === "string" ? parsed.projectId : parsed.project_id;
+		return typeof projectId === "string" ? projectId.trim() || undefined : undefined;
 	} catch {
 		return undefined;
 	}
