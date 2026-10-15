@@ -15,8 +15,8 @@ const CREDENTIAL_KEY_SUFFIX = new RegExp(`^${CREDENTIAL_KEY_PATTERN}$`, "i");
 const CREDENTIAL_CAMEL_COMPOUND_SUFFIXES = "AccessToken|RefreshToken|IdToken|SessionToken|ClientSecret";
 const CREDENTIAL_CAMEL_SIMPLE_SUFFIXES =
 	"SecretAccessKey|Authorization|Credentials|Credential|ApiKey|SecretKey|PrivateKey|SessionKey|Password|Passwd|Secrets|Secret|Bearer|Cookie|Token|Auth";
-const CREDENTIAL_CAMEL_PREFIX = "(?:[a-z0-9]+|[A-Z][a-z0-9]*)(?:[A-Z]{2,})?";
-const CREDENTIAL_CAMEL_COMPOUND_PREFIX = "(?:[a-z0-9]{2,}|[A-Z][a-z0-9]+|[A-Z]{2,})(?:[A-Z]{2,})?";
+const CREDENTIAL_CAMEL_PREFIX = "(?:[a-z0-9]+(?:[A-Z]{2,})?|[A-Z][a-z0-9]+(?:[A-Z]{2,})?|[A-Z]{2,})";
+const CREDENTIAL_CAMEL_COMPOUND_PREFIX = "(?:[a-z0-9]{2,}(?:[A-Z]{2,})?|[A-Z][a-z0-9]+(?:[A-Z]{2,})?|[A-Z]{2,})";
 const CREDENTIAL_CAMEL_KEY_PATTERN = `(?:${CREDENTIAL_CAMEL_COMPOUND_PREFIX}(?:${CREDENTIAL_CAMEL_COMPOUND_SUFFIXES})|${CREDENTIAL_CAMEL_PREFIX}(?:${CREDENTIAL_CAMEL_SIMPLE_SUFFIXES}))`;
 const CREDENTIAL_CAMEL_KEY_SUFFIX = new RegExp(`^${CREDENTIAL_CAMEL_KEY_PATTERN}$`);
 const CREDENTIAL_ASSIGNMENT_PREFIX = String.raw`(?<![A-Za-z0-9_-])((?:\\*["']?-*)(?:${CREDENTIAL_KEY_PATTERN})(?:\\*["']?\s*[=:]\s*))`;
@@ -201,16 +201,23 @@ function redactCredentialContainersWithPattern(text: string, assignment: RegExp)
 
 function findCredentialContainerEnd(text: string, start: number): number {
 	const closing = [text[start] === "[" ? "]" : "}"];
+	const escapedQuoteDelimiters = usesEscapedDoubleQuoteDelimiters(text, start);
 	let quote: "'" | '"' | undefined;
-	let escaped = false;
 	for (let index = start + 1; index < text.length; index++) {
 		const character = text[index] ?? "";
-		if (escaped) {
-			escaped = false;
-			continue;
-		}
 		if (character === "\\") {
-			escaped = true;
+			let backslashEnd = index;
+			while (text[backslashEnd + 1] === "\\") backslashEnd++;
+			const backslashCount = backslashEnd - index + 1;
+			const nextCharacter = text[backslashEnd + 1];
+			// In a serialized container, one backslash marks a structural quote; longer odd runs escape quote data.
+			if (nextCharacter === '"' && escapedQuoteDelimiters && backslashCount === 1) {
+				if (quote === undefined) quote = '"';
+				else if (quote === '"') quote = undefined;
+				index = backslashEnd + 1;
+				continue;
+			}
+			index = nextCharacter !== undefined && backslashCount % 2 === 1 ? backslashEnd + 1 : backslashEnd;
 			continue;
 		}
 		if (quote) {
@@ -229,6 +236,30 @@ function findCredentialContainerEnd(text: string, start: number): number {
 		}
 	}
 	return text.length;
+}
+
+function usesEscapedDoubleQuoteDelimiters(text: string, start: number): boolean {
+	const closing = [text[start] === "[" ? "]" : "}"];
+	for (let index = start + 1; index < text.length; index++) {
+		const character = text[index] ?? "";
+		if (character === "\\") {
+			let backslashEnd = index;
+			while (text[backslashEnd + 1] === "\\") backslashEnd++;
+			const backslashCount = backslashEnd - index + 1;
+			const nextCharacter = text[backslashEnd + 1];
+			if (nextCharacter === '"' && backslashCount % 2 === 1) return true;
+			index = nextCharacter !== undefined && backslashCount % 2 === 1 ? backslashEnd + 1 : backslashEnd;
+			continue;
+		}
+		if (character === '"' || character === "'") return false;
+		if (character === "[") closing.push("]");
+		else if (character === "{") closing.push("}");
+		else if (character === closing[closing.length - 1]) {
+			closing.pop();
+			if (closing.length === 0) return false;
+		}
+	}
+	return false;
 }
 
 /** Every placeholder `redactCrashSecrets` can emit. Used by downstream normalizers. */

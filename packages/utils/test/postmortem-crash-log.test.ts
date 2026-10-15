@@ -237,6 +237,22 @@ describe("recordFatalCrash", () => {
 		expect(contents).toContain('metadata=["public"]');
 	});
 
+	it("redacts escaped-quoted containers across embedded closing delimiters", () => {
+		const serialized = String.raw`credentials={\"primary\":\"alpha}suffix\",\"secondary\":\"beta-secret\"} note=keep`;
+		const redacted = redactCrashSecrets(serialized);
+
+		expect(redacted.startsWith("credentials=«redacted»")).toBe(true);
+		expect(redacted.endsWith(" note=keep")).toBe(true);
+		expect(redacted).not.toContain("alpha}suffix");
+		expect(redacted).not.toContain("beta-secret");
+
+		const serializedQuote = String.raw`credentials={\"primary\":\"alpha\\\"}suffix\",\"secondary\":\"beta-secret\"} note=keep`;
+		const redactedQuote = redactCrashSecrets(serializedQuote);
+		expect(redactedQuote.startsWith("credentials=«redacted»")).toBe(true);
+		expect(redactedQuote.endsWith(" note=keep")).toBe(true);
+		expect(redactedQuote).not.toContain("beta-secret");
+	});
+
 	it("redacts complete Cookie header values without consuming following diagnostics", async () => {
 		const target = tempCrashLog();
 		const message =
@@ -268,6 +284,7 @@ describe("recordFatalCrash", () => {
 			"authToken",
 			"githubToken",
 			"dbPassword",
+			"DBPassword",
 			"openaiApiKey",
 			"openAIApiKey",
 			"OpenAIApiKey",
@@ -279,10 +296,10 @@ describe("recordFatalCrash", () => {
 		}
 		expect(
 			redactCrashSecrets(
-				'authToken=opaque-auth-token githubToken="opaque-github-token" dbPassword=opaque-db-password openaiApiKey=opaque-api-key openAIApiKey=opaque-mixed-api-key OpenAIApiKey=opaque-title-api-key stripeSecretKey=opaque-stripe-secret awsSecretAccessKey=opaque-aws-secret mySecretAccessKey=opaque-my-secret',
+				'authToken=opaque-auth-token githubToken="opaque-github-token" dbPassword=opaque-db-password DBPassword=opaque-uppercase-db-password openaiApiKey=opaque-api-key openAIApiKey=opaque-mixed-api-key OpenAIApiKey=opaque-title-api-key stripeSecretKey=opaque-stripe-secret awsSecretAccessKey=opaque-aws-secret mySecretAccessKey=opaque-my-secret',
 			),
 		).toBe(
-			'authToken=«redacted» githubToken="«redacted»" dbPassword=«redacted» openaiApiKey=«redacted» openAIApiKey=«redacted» OpenAIApiKey=«redacted» stripeSecretKey=«redacted» awsSecretAccessKey=«redacted» mySecretAccessKey=«redacted»',
+			'authToken=«redacted» githubToken="«redacted»" dbPassword=«redacted» DBPassword=«redacted» openaiApiKey=«redacted» openAIApiKey=«redacted» OpenAIApiKey=«redacted» stripeSecretKey=«redacted» awsSecretAccessKey=«redacted» mySecretAccessKey=«redacted»',
 		);
 		expect(redactCrashSecrets('{"authToken":"opaque-auth-token"}')).toBe('{"authToken":"«redacted»"}');
 		expect(redactCrashSecrets("authToken={nested:opaque-secret}")).toBe("authToken=«redacted»");
