@@ -8730,7 +8730,9 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				toolName: "bash",
 				args: {},
 			});
-			const boundaryDeadline = Date.now() + 2_000;
+			// This checks ordering, not prompt latency; allow the scheduler to reach
+			// the boundary when many CI shards are contending for the event loop.
+			const boundaryDeadline = Date.now() + 10_000;
 			while (!boundaryWaitStarted && Date.now() < boundaryDeadline) await Bun.sleep(10);
 			expect(boundaryWaitStarted).toBe(true);
 			expect(abortCalls).toHaveLength(0);
@@ -8744,7 +8746,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			});
 			await Bun.sleep(30);
 			expect(abortCalls).toHaveLength(0);
-			const abortDeadline = Date.now() + 2_000;
+			const abortDeadline = Date.now() + 10_000;
 			while (abortCalls.length === 0 && Date.now() < abortDeadline) await Bun.sleep(10);
 			expect(abortCalls).toEqual([{ handle: "deadline-tool-run", scope: "owned", expectedEpoch: epoch }]);
 			expect(await settledStatus(harness, "turn.prompt_status", correlation)).toMatchObject({
