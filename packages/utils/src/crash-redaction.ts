@@ -33,7 +33,7 @@ const CREDENTIAL_AUTHORIZATION_VALUE_PATTERN = new RegExp(
 	String.raw`${AUTHORIZATION_HEADER_PREFIX}(?!\s*(?:["'«]|\\+["']))(?:(?!\\+n|\\+r\\+n)[^\r\n])+`,
 	"gi",
 );
-const CREDENTIAL_VALUE_PATTERN_BODY = String.raw`(?:(\\+")((?:\\[\s\S]|[^"\\])*?)(\\+")(?=$|[\s,;}\]])|(")((?:\\[\s\S]|[^"\\])*)(")|(\\+')((?:\\[\s\S]|[^'\\])*?)(\\+')(?=$|[\s,;}\]])|(')((?:\\[\s\S]|[^'\\])*)(')|(\\+")([^\r\n]*)(?=\r?\n|$)|(")([^\r\n]*)(?=\r?\n|$)|(\\+')([^\r\n]*)(?=\r?\n|$)|(')([^\r\n]*)(?=\r?\n|$)|(${CREDENTIAL_UNQUOTED_VALUE_PATTERN_BODY}))`;
+const CREDENTIAL_VALUE_PATTERN_BODY = String.raw`(?:(\\+")((?:\\[\s\S]|[^"\\])*?)(\\+")(?=$|[\s,;}\]])|(")((?:\\[\s\S]|[^"\\])*)(")|(\\+')((?:\\[\s\S]|[^'\\])*?)(\\+')(?=$|[\s,;}\]])|(')((?:\\[\s\S]|[^'\\])*)(')|(\x60)((?:\\[\s\S]|[^\x60\\])*)(\x60)(?=$|[\s,;}\]])|(\\+")([^\r\n]*)(?=\r?\n|$)|(")([^\r\n]*)(?=\r?\n|$)|(\\+')([^\r\n]*)(?=\r?\n|$)|(')([^\r\n]*)(?=\r?\n|$)|(\x60)([^\r\n]*)(?=\r?\n|$)|(${CREDENTIAL_UNQUOTED_VALUE_PATTERN_BODY}))`;
 const CREDENTIAL_VALUE_PATTERN = new RegExp(`${CREDENTIAL_ASSIGNMENT_PREFIX}${CREDENTIAL_VALUE_PATTERN_BODY}`, "gi");
 const CREDENTIAL_CAMEL_VALUE_PATTERN = new RegExp(
 	`${CREDENTIAL_CAMEL_ASSIGNMENT_PREFIX}${CREDENTIAL_VALUE_PATTERN_BODY}`,
@@ -143,6 +143,9 @@ function redactCredentialValue(
 	singleOpen: string | undefined,
 	singleQuoted: string | undefined,
 	singleClose: string | undefined,
+	backtickOpen: string | undefined,
+	backtickQuoted: string | undefined,
+	backtickClose: string | undefined,
 	unclosedEscapedDoubleOpen: string | undefined,
 	unclosedEscapedDoubleQuoted: string | undefined,
 	unclosedDoubleOpen: string | undefined,
@@ -151,6 +154,8 @@ function redactCredentialValue(
 	unclosedEscapedSingleQuoted: string | undefined,
 	unclosedSingleOpen: string | undefined,
 	unclosedSingleQuoted: string | undefined,
+	unclosedBacktickOpen: string | undefined,
+	unclosedBacktickQuoted: string | undefined,
 ): string {
 	if (escapedDoubleQuoted !== undefined && escapedDoubleOpen !== undefined && escapedDoubleClose !== undefined) {
 		return `${prefix}${escapedDoubleOpen}«redacted»${escapedDoubleClose}`;
@@ -164,6 +169,9 @@ function redactCredentialValue(
 	if (singleQuoted !== undefined && singleOpen !== undefined && singleClose !== undefined) {
 		return `${prefix}${singleOpen}«redacted»${singleClose}`;
 	}
+	if (backtickQuoted !== undefined && backtickOpen !== undefined && backtickClose !== undefined) {
+		return `${prefix}${backtickOpen}«redacted»${backtickClose}`;
+	}
 	if (unclosedEscapedDoubleQuoted !== undefined && unclosedEscapedDoubleOpen !== undefined) {
 		return `${prefix}${unclosedEscapedDoubleOpen}«redacted»`;
 	}
@@ -175,6 +183,9 @@ function redactCredentialValue(
 	}
 	if (unclosedSingleQuoted !== undefined && unclosedSingleOpen !== undefined) {
 		return `${prefix}${unclosedSingleOpen}«redacted»`;
+	}
+	if (unclosedBacktickQuoted !== undefined && unclosedBacktickOpen !== undefined) {
+		return `${prefix}${unclosedBacktickOpen}«redacted»`;
 	}
 	return `${prefix}«redacted»`;
 }

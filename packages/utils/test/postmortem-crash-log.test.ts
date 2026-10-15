@@ -456,6 +456,21 @@ describe("recordFatalCrash", () => {
 		expect(contents).toContain("note=keep-this");
 	});
 
+	it("redacts backtick-quoted credential values that contain spaces", async () => {
+		const target = tempCrashLog();
+		const message =
+			"diagnostic safe=keep-this password=`correct horse battery` dbPassword=`secondary secret` note=keep-this";
+
+		recordFatalCrash("Uncaught Exception", new Error(message), { path: target });
+
+		const contents = await Bun.file(target).text();
+		expect(contents).not.toContain("correct horse battery");
+		expect(contents).not.toContain("secondary secret");
+		expect(contents).toContain("password=`«redacted»`");
+		expect(contents).toContain("dbPassword=`«redacted»`");
+		expect(contents).toContain("note=keep-this");
+	});
+
 	it("redacts escaped quoted credentials in serialized crash text", async () => {
 		const target = tempCrashLog();
 		const message = String.raw`diagnostic safe=keep-this password=\"correct horse battery\" payload={\"password\":\"correct horse battery\"} note=keep-this`;
@@ -470,7 +485,11 @@ describe("recordFatalCrash", () => {
 	});
 
 	it("redacts unterminated quoted credentials without consuming the next line", async () => {
-		for (const credential of ['password="hunter2secret', String.raw`password=\"hunter2secret`]) {
+		for (const credential of [
+			'password="hunter2secret',
+			String.raw`password=\"hunter2secret`,
+			"password=`hunter2secret",
+		]) {
 			const target = tempCrashLog();
 			const message = `${credential}\nsafe-after-newline=keep-this`;
 
