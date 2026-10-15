@@ -260,6 +260,14 @@ describe("recordFatalCrash", () => {
 		);
 	});
 
+	it("redacts backslash-escaped whitespace in unquoted credential values", () => {
+		const input = String.raw`password=correct\ horse\ battery diagnostic=keep`;
+		expect(redactCrashSecrets(input)).toBe("password=«redacted» diagnostic=keep");
+		expect(redactCrashSecrets(String.raw`authorization: Bearer correct\ horse\ battery diagnostic=keep`)).toBe(
+			"authorization: «redacted» diagnostic=keep",
+		);
+	});
+
 	it("bounds matching work for long non-credential compound keys", () => {
 		const longKey = `${"a-".repeat(10_000)}tokenx`;
 		const input = `${longKey}=public`;
