@@ -55,6 +55,7 @@ const TRUST_KEYS = [
 	"PYTHONPATH",
 	"PYTHONUSERBASE",
 	"PYTHONSTARTUP",
+	"TCL_LIBRARY",
 	"LUA_INIT",
 	...LUA_INIT_VERSIONED_ENV_KEYS,
 	"R_ENVIRON",
@@ -119,6 +120,7 @@ interface GhSpawn {
 	PYTHONPATH: string | null;
 	PYTHONUSERBASE: string | null;
 	PYTHONSTARTUP: string | null;
+	TCL_LIBRARY: string | null;
 	LUA_INIT: string | null;
 	luaInitVersionedEnvironment: Record<LuaInitVersionedEnvironmentKey, string | null>;
 	R_ENVIRON: string | null;
@@ -219,6 +221,7 @@ await fsPromises.appendFile(
 		PYTHONPATH: process.env.PYTHONPATH ?? null,
 		PYTHONUSERBASE: process.env.PYTHONUSERBASE ?? null,
 		PYTHONSTARTUP: process.env.PYTHONSTARTUP ?? null,
+		TCL_LIBRARY: process.env.TCL_LIBRARY ?? null,
 		LUA_INIT: process.env.LUA_INIT ?? null,
 		luaInitVersionedEnvironment: Object.fromEntries(
 			${JSON.stringify(LUA_INIT_VERSIONED_ENV_KEYS)}.map(name => [name, process.env[name] ?? null]),
@@ -429,6 +432,7 @@ function expectDestination(
 			| "PYTHONPATH"
 			| "PYTHONUSERBASE"
 			| "PYTHONSTARTUP"
+			| "TCL_LIBRARY"
 			| "LUA_INIT"
 			| "R_ENVIRON"
 			| "R_ENVIRON_USER"
@@ -514,6 +518,7 @@ function expectDestination(
 		expect(spawn.PYTHONPATH).toBe(expected.PYTHONPATH ?? null);
 		expect(spawn.PYTHONUSERBASE).toBe(expected.PYTHONUSERBASE ?? null);
 		expect(spawn.PYTHONSTARTUP).toBe(expected.PYTHONSTARTUP ?? null);
+		expect(spawn.TCL_LIBRARY).toBe(expected.TCL_LIBRARY ?? null);
 		expect(spawn.LUA_INIT).toBe(expected.LUA_INIT ?? null);
 		for (const name of LUA_INIT_VERSIONED_ENV_KEYS)
 			expect(spawn.luaInitVersionedEnvironment[name]).toBe(expected.luaInitVersionedEnvironment?.[name] ?? null);
@@ -616,6 +621,7 @@ PYTHONHOME=/project/python-home
 PYTHONPATH=/project/python-path
 PYTHONUSERBASE=/project/python-user-base
 PYTHONSTARTUP=/project/python-startup.py
+TCL_LIBRARY=/project/tcl-library
 LUA_INIT=@/project/lua-init.lua
 LUA_INIT_5_1=@/project/lua-init-5.1.lua
 LUA_INIT_5_2=@/project/lua-init-5.2.lua
@@ -669,6 +675,7 @@ OPENSSL_CONF=/project/openssl.cnf
 			PYTHONPATH: null,
 			PYTHONUSERBASE: null,
 			PYTHONSTARTUP: null,
+			TCL_LIBRARY: null,
 			LUA_INIT: null,
 			R_ENVIRON: null,
 			R_ENVIRON_USER: null,
@@ -707,6 +714,7 @@ OPENSSL_CONF=/project/openssl.cnf
 				PYTHONPATH: "/operator/python-path",
 				PYTHONUSERBASE: "/operator/python-user-base",
 				PYTHONSTARTUP: "/operator/python-startup.py",
+				TCL_LIBRARY: "/operator/tcl-library",
 				LUA_INIT: "@/operator/lua-init.lua",
 				...luaInitVersionedEnvironment,
 				R_ENVIRON: "/operator/site.Renviron",
@@ -740,6 +748,7 @@ OPENSSL_CONF=/project/openssl.cnf
 			PYTHONPATH: "/operator/python-path",
 			PYTHONUSERBASE: "/operator/python-user-base",
 			PYTHONSTARTUP: "/operator/python-startup.py",
+			TCL_LIBRARY: "/operator/tcl-library",
 			LUA_INIT: "@/operator/lua-init.lua",
 			luaInitVersionedEnvironment,
 			R_ENVIRON: "/operator/site.Renviron",
