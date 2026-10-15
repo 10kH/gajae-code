@@ -1763,11 +1763,10 @@ function readArg(code: string, index: number): { raw: string; end: number } | nu
 	return raw.length > 0 ? { raw, end: cursor } : null;
 }
 
+/** Omitted mode is Python's default `"r"`. A non-literal mode cannot be proved read-only. */
 function modeWrites(raw: string | undefined): boolean | null {
 	if (raw === undefined) return false;
-	const trimmed = raw.trim();
-	if (/^(?:encoding|errors|newline|buffering|closefd|opener)\b/.test(trimmed)) return false;
-	const literal = simpleLiteral(trimmed);
+	const literal = simpleLiteral(raw);
 	return literal === null ? null : /[wax+]/.test(literal);
 }
 
@@ -1850,6 +1849,41 @@ function literalWrite(targets: ExtractedTargets, raw: string | undefined, write:
 	addPath(targets, literal);
 }
 
+/** Arguments of one Path() call, through its own closing parenthesis. */
+function readPathConstructor(code: string, argAt: number): { parts: string[]; after: number } | null {
+	let cursor = argAt;
+	const parts: string[] = [];
+	while (cursor < code.length) {
+		while (/\s/.test(code[cursor] ?? "")) cursor += 1;
+		if (code[cursor] === ")") return { parts, after: cursor + 1 };
+		const argument = readArg(code, cursor);
+		if (!argument) return null;
+		parts.push(argument.raw);
+		cursor = argument.end;
+		while (/\s/.test(code[cursor] ?? "")) cursor += 1;
+		if (code[cursor] === ",") {
+			cursor += 1;
+			continue;
+		}
+		if (code[cursor] === ")") return { parts, after: cursor + 1 };
+		return null;
+	}
+	return null;
+}
+
+/** pathlib keeps the last absolute segment. A non-literal segment is an unresolved receiver. */
+function literalPathReceiver(parts: string[]): string | null {
+	if (parts.length === 0) return ".";
+	const literals: string[] = [];
+	for (const part of parts) {
+		const literal = simpleLiteral(part);
+		if (literal === null) return null;
+		literals.push(literal);
+	}
+	const joined = path.posix.join(...literals);
+	return joined.length === 0 ? "." : joined;
+}
+
 /** Calls inside strings or comments are skipped. A non-literal write path fails closed. */
 function scanInterpreterWrites(code: string, language: "py" | "js", targets: ExtractedTargets): void {
 	let index = 0;
@@ -1898,11 +1932,21 @@ function scanInterpreterWrites(code: string, language: "py" | "js", targets: Ext
 		const argAt = cursor + paren[0].length;
 		const first = readArg(code, argAt);
 		if (pathCtor) {
-			const closed = first ? /^\s*\)/.exec(code.slice(first.end)) : null;
-			const after = first && closed ? first.end + closed[0].length : argAt;
-			const method = /^\s*\.\s*(write_text|write_bytes)\b/.exec(code.slice(after));
-			if (method) literalWrite(targets, first?.raw, true);
-			index = Math.max(after + (method?.[0].length ?? 0), index + 1);
+			const ctor = readPathConstructor(code, argAt);
+			if (!ctor) {
+				index += 1;
+				continue;
+			}
+			const method = /^\s*\.\s*(write_text|write_bytes)\b/.exec(code.slice(ctor.after));
+			if (method) {
+				targets.explicitMutation = true;
+				const receiver = literalPathReceiver(ctor.parts);
+				if (receiver === null || receiver.length === 0) targets.unknown = true;
+				else addPath(targets, receiver);
+			}
+			// Extra segments stay in the argument walk so a nested mutator is still recorded.
+			index =
+				ctor.parts.length > 1 ? index + name.length : Math.max(ctor.after + (method?.[0].length ?? 0), index + 1);
 			continue;
 		}
 		if (!first) {

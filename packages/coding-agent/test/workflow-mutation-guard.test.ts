@@ -2021,4 +2021,63 @@ describe("bash scanner quoting model", () => {
 		});
 		expect(decision.blocked).toBe(false);
 	});
+
+	it("fails closed when an open mode is a non-literal variable", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		for (const code of [
+			'encoding = "w"; open("src/product.ts", encoding).write("x")\n',
+			'open("src/product.ts", mode=encoding).write("x")\n',
+		]) {
+			const input = { cwd, sessionId: "session-a", tool: tool("python"), args: { code } };
+			await expect(assertWorkflowMutationAllowed(input)).rejects.toBeInstanceOf(ToolError);
+			const decision = await getWorkflowMutationDecision(input);
+			expect(decision.blocked, code).toBe(true);
+			expect(decision.reason, code).toBe("unknown-target");
+		}
+	});
+
+	it("blocks a multi-argument Path write and an unresolved Path receiver", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		for (const code of [
+			'Path("src", "product.ts").write_text("x")\n',
+			'Path("src", "product.ts").write_bytes(b"x")\n',
+		]) {
+			const input = { cwd, sessionId: "session-a", tool: tool("python"), args: { code } };
+			await expect(assertWorkflowMutationAllowed(input)).rejects.toBeInstanceOf(ToolError);
+			const decision = await getWorkflowMutationDecision(input);
+			expect(decision.blocked, code).toBe(true);
+			expect(decision.targets, code).toContain("src/product.ts");
+			expect(decision.reason, code).toBe("phase-boundary");
+		}
+		const dynamic = await getWorkflowMutationDecision({
+			cwd,
+			sessionId: "session-a",
+			tool: tool("python"),
+			args: { code: 'Path(root, "product.ts").write_text("x")\n' },
+		});
+		expect(dynamic.blocked).toBe(true);
+		expect(dynamic.reason).toBe("unknown-target");
+	});
+
+	it("allows a multi-part temp Path write and a non-writing Path read", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		for (const code of [
+			'Path("/tmp", "ralplan-note.md").write_text("x")\n',
+			'Path("src", "product.ts").read_text()\n',
+			'open("src/product.ts", "r").read()\n',
+			'open("src/product.ts", mode="r").read()\n',
+			'open("src/product.ts", buffering=-1).read()\n',
+		]) {
+			const decision = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("python"),
+				args: { code },
+			});
+			expect(decision.blocked, code).toBe(false);
+		}
+	});
 });
