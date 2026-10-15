@@ -312,6 +312,17 @@ describe("recordFatalCrash", () => {
 		expect(redactCrashSecrets("authToken={nested:opaque-secret}")).toBe("authToken=«redacted»");
 	});
 
+	it("redacts passphrase credential-key variants", () => {
+		for (const key of ["passphrase", "sshPassphrase", "key_passphrase", "SSH_PASSPHRASE"]) {
+			expect(isCredentialKey(key)).toBe(true);
+		}
+		expect(
+			redactCrashSecrets(
+				"passphrase=opaque-passphrase sshPassphrase=opaque-ssh-passphrase key_passphrase=opaque-key-passphrase SSH_PASSPHRASE=opaque-uppercase-passphrase",
+			),
+		).toBe("passphrase=«redacted» sshPassphrase=«redacted» key_passphrase=«redacted» SSH_PASSPHRASE=«redacted»");
+	});
+
 	it("redacts compound camelCase token and client-secret suffixes", () => {
 		for (const key of [
 			"githubAccessToken",

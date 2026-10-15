@@ -1,3 +1,4 @@
 ### Fixed
 
+- Crash redaction now recognizes passphrase labels such as `passphrase`, `sshPassphrase`, and `key_passphrase`.
 - Durable crash records redact full quoted values, complete bracketed arrays/objects under sensitive labels, and complete Cookie/Set-Cookie header values, including whitespace-bearing, escaped, and unterminated credentials; escaped Cookie newlines preserve following diagnostics. URL userinfo is scrubbed when it contains only a username token or an empty password. Arbitrary unquoted Authorization schemes are redacted through line end, while short Bearer/Basic/Token credentials preserve following diagnostic fields. CamelCase credential fields such as `authToken`, `githubToken`, and `dbPassword` are recognized without matching ordinary lookalike identifiers; long non-credential keys avoid quadratic matching.
