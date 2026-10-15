@@ -296,7 +296,7 @@ describe("BashTool restricted role-agent allowlist", () => {
 		}
 	});
 
-	it.skipIf(process.platform === "win32")("rejects rg --hostname-bin and still runs a plain rg search", async () => {
+	async function withReadOnlyRg(run: (tool: BashTool, ranPath: string) => Promise<void>): Promise<void> {
 		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-read-only-rg-"));
 		const ranPath = path.join(root, "hostname-ran");
 		const originalWhich = Bun.which;
@@ -306,17 +306,38 @@ describe("BashTool restricted role-agent allowlist", () => {
 			const quote = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`;
 			await fs.writeFile(
 				stub,
-				`#!/bin/sh\nprintf '%s\\n' "$*" > ${quote(path.join(root, "argv"))}\nif [ "$1" = "--hostname-bin" ] || [ "\${1#--hostname-bin=}" != "$1" ]; then\n  : > ${quote(ranPath)}\nfi\nprintf 'rg-ok\\n'\n`,
+				[
+					"#!/bin/sh",
+					`printf '%s\\n' "$*" > ${quote(path.join(root, "argv"))}`,
+					'case "$1" in',
+					"  --hostname-bin|--hostname-bin=*)",
+					`    : > ${quote(ranPath)}`,
+					"    ;;",
+					"esac",
+					"printf 'rg-ok\\n'",
+					"",
+				].join("\n"),
 			);
 			await fs.chmod(stub, 0o755);
 			// Bun.which reads the process PATH from startup, so point rg at this fixture.
 			Bun.which = ((command: string) => (command === "rg" ? stub : originalWhich(command))) as typeof Bun.which;
-			const tool = createRestrictedBashTool(root, ["rg"], "read-only");
+			await run(createRestrictedBashTool(root, ["rg"], "read-only"), ranPath);
+		} finally {
+			Bun.which = originalWhich;
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	}
 
+	it.skipIf(process.platform === "win32")("still runs a plain rg search under read-only bash", async () => {
+		await withReadOnlyRg(async (tool, ranPath) => {
 			const result = await tool.execute("tool-call", { command: "rg hello sample.txt" });
 			expect(result.content.find(part => part.type === "text")?.text).toContain("rg-ok");
 			await expect(fs.access(ranPath)).rejects.toThrow();
+		});
+	});
 
+	it.skipIf(process.platform === "win32")("rejects rg --hostname-bin before the program runs", async () => {
+		await withReadOnlyRg(async (tool, ranPath) => {
 			for (const command of [
 				"rg --hostname-bin ./pwned hello sample.txt",
 				"rg --hostname-bin=./pwned hello sample.txt",
@@ -327,10 +348,7 @@ describe("BashTool restricted role-agent allowlist", () => {
 				);
 			}
 			await expect(fs.access(ranPath)).rejects.toThrow();
-		} finally {
-			Bun.which = originalWhich;
-			await fs.rm(root, { recursive: true, force: true });
-		}
+		});
 	});
 
 	it("runs read-only bash without PTY, configured prefixes, shell snapshots, or retained sessions", async () => {
