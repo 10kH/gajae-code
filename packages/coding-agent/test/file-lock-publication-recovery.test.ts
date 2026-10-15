@@ -481,7 +481,7 @@ test("does not retry access-denied receipts without Windows rename provenance", 
 	expect(await fs.readdir(root)).toEqual([]);
 });
 
-test("stops after bounded access-denied publication retries without reporting contention", async () => {
+test("uses the acquisition budget after bounded access-denied publication retries without reporting contention", async () => {
 	const { root, file, lock } = await makeFixture();
 	let attempts = 0;
 	let contentionNotifications = 0;
@@ -507,8 +507,35 @@ test("stops after bounded access-denied publication retries without reporting co
 	expect(isFileLockAcquireTimeout(failure)).toBe(false);
 	expect(failure.holderIsLive).toBe(false);
 	expect(failure.message).not.toContain("SDK broker");
-	expect(failure.attempts).toBe(1);
-	expect(attempts).toBe(expectedBoundedPublicationCalls);
+	expect(failure.attempts).toBe(2);
+	expect(attempts).toBe(expectedBoundedPublicationCalls * 2);
+	expect(contentionNotifications).toBe(0);
+	await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
+	expect(await fs.readdir(root)).toEqual([]);
+});
+
+test("recovers when access-denied publication clears within the outer acquisition budget", async () => {
+	const { root, file, lock } = await makeFixture();
+	let attempts = 0;
+	let contentionNotifications = 0;
+	FileLockTestHooks.nativePublicationBindings = () => ({
+		renameNoReplacePathAsync: async (source, destination) => {
+			attempts++;
+			if (attempts <= expectedBoundedPublicationCalls) return accessDeniedPublication();
+			await fs.rename(source, destination);
+			return successfulPublication(primaryPrimitive ?? "windows_rename_noreplace");
+		},
+		renameDirectoryNoReplacePathAsync,
+	});
+
+	await expect(
+		withFileLock(file, async () => "entered", {
+			retries: 2,
+			retryDelayMs: 1,
+			onContended: () => contentionNotifications++,
+		}),
+	).resolves.toBe("entered");
+	expect(attempts).toBe(expectedBoundedPublicationCalls + 1);
 	expect(contentionNotifications).toBe(0);
 	await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
 	expect(await fs.readdir(root)).toEqual([]);
@@ -702,8 +729,8 @@ test("retries native access-denied staging cleanup within the shared acquisition
 		Object.defineProperty(process, "platform", originalPlatform);
 	}
 
-	expect(publicationAttempts).toBe(expectedBoundedPublicationCalls);
-	expect(cleanupAttempts).toBe(2);
+	expect(publicationAttempts).toBe(expectedBoundedPublicationCalls * 2);
+	expect(cleanupAttempts).toBe(3);
 	await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
 	expect(await fs.readdir(root)).toEqual([]);
 });

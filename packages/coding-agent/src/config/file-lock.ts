@@ -3154,25 +3154,6 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 			opts.onAcquired,
 			retryBudget,
 		);
-		if (isFileLockPublicationRetry(result) && result.code === "access_denied") {
-			const holder = await lockHolderDescription(
-				lockPath,
-				orphanTransitionAgeMs,
-				opts.ownerHostId,
-				opts.previousOwnerHostIds ?? [],
-			);
-			throw new FileLockAcquireError(
-				filePath,
-				lockPath,
-				attempt + 1,
-				holder.description,
-				"acquire_timeout",
-				undefined,
-				undefined,
-				result.code,
-				holder.isLive,
-			);
-		}
 		if (isFileLockOrphanTransition(result)) {
 			// Adoption is identity-bound and can be refused by a transient cleanup race.
 			// Keep using the caller's bounded contention budget; the same generation is
