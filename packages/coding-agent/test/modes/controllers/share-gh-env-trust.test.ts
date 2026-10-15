@@ -27,6 +27,14 @@ const CLR_PROFILER_ENV_KEYS = [
 	"DOTNET_PROFILER_PATH_ARM64",
 ] as const;
 type ClrProfilerEnvironmentKey = (typeof CLR_PROFILER_ENV_KEYS)[number];
+const LUA_INIT_VERSIONED_ENV_KEYS = [
+	"LUA_INIT_5_1",
+	"LUA_INIT_5_2",
+	"LUA_INIT_5_3",
+	"LUA_INIT_5_4",
+	"LUA_INIT_5_5",
+] as const;
+type LuaInitVersionedEnvironmentKey = (typeof LUA_INIT_VERSIONED_ENV_KEYS)[number];
 const TRUST_KEYS = [
 	"GH_HOST",
 	"GH_CONFIG_DIR",
@@ -48,7 +56,7 @@ const TRUST_KEYS = [
 	"PYTHONUSERBASE",
 	"PYTHONSTARTUP",
 	"LUA_INIT",
-	"LUA_INIT_5_4",
+	...LUA_INIT_VERSIONED_ENV_KEYS,
 	"R_ENVIRON",
 	"R_ENVIRON_USER",
 	"R_PROFILE",
@@ -110,7 +118,7 @@ interface GhSpawn {
 	PYTHONUSERBASE: string | null;
 	PYTHONSTARTUP: string | null;
 	LUA_INIT: string | null;
-	LUA_INIT_5_4: string | null;
+	luaInitVersionedEnvironment: Record<LuaInitVersionedEnvironmentKey, string | null>;
 	R_ENVIRON: string | null;
 	R_ENVIRON_USER: string | null;
 	R_PROFILE: string | null;
@@ -208,7 +216,9 @@ await fsPromises.appendFile(
 		PYTHONUSERBASE: process.env.PYTHONUSERBASE ?? null,
 		PYTHONSTARTUP: process.env.PYTHONSTARTUP ?? null,
 		LUA_INIT: process.env.LUA_INIT ?? null,
-		LUA_INIT_5_4: process.env.LUA_INIT_5_4 ?? null,
+		luaInitVersionedEnvironment: Object.fromEntries(
+			${JSON.stringify(LUA_INIT_VERSIONED_ENV_KEYS)}.map(name => [name, process.env[name] ?? null]),
+		),
 		R_ENVIRON: process.env.R_ENVIRON ?? null,
 		R_ENVIRON_USER: process.env.R_ENVIRON_USER ?? null,
 		R_PROFILE: process.env.R_PROFILE ?? null,
@@ -414,7 +424,6 @@ function expectDestination(
 			| "PYTHONUSERBASE"
 			| "PYTHONSTARTUP"
 			| "LUA_INIT"
-			| "LUA_INIT_5_4"
 			| "R_ENVIRON"
 			| "R_ENVIRON_USER"
 			| "R_PROFILE"
@@ -455,6 +464,7 @@ function expectDestination(
 			| "DYLD_ROOT_PATH"
 		>
 	> & {
+		luaInitVersionedEnvironment?: Partial<GhSpawn["luaInitVersionedEnvironment"]>;
 		profilerEnvironment?: Partial<GhSpawn["profilerEnvironment"]>;
 	},
 	allowPathsInsideLaunchDirectory = false,
@@ -497,7 +507,8 @@ function expectDestination(
 		expect(spawn.PYTHONUSERBASE).toBe(expected.PYTHONUSERBASE ?? null);
 		expect(spawn.PYTHONSTARTUP).toBe(expected.PYTHONSTARTUP ?? null);
 		expect(spawn.LUA_INIT).toBe(expected.LUA_INIT ?? null);
-		expect(spawn.LUA_INIT_5_4).toBe(expected.LUA_INIT_5_4 ?? null);
+		for (const name of LUA_INIT_VERSIONED_ENV_KEYS)
+			expect(spawn.luaInitVersionedEnvironment[name]).toBe(expected.luaInitVersionedEnvironment?.[name] ?? null);
 		expect(spawn.R_ENVIRON).toBe(expected.R_ENVIRON ?? null);
 		expect(spawn.R_ENVIRON_USER).toBe(expected.R_ENVIRON_USER ?? null);
 		expect(spawn.R_PROFILE).toBe(expected.R_PROFILE ?? null);
@@ -596,7 +607,11 @@ PYTHONPATH=/project/python-path
 PYTHONUSERBASE=/project/python-user-base
 PYTHONSTARTUP=/project/python-startup.py
 LUA_INIT=@/project/lua-init.lua
+LUA_INIT_5_1=@/project/lua-init-5.1.lua
+LUA_INIT_5_2=@/project/lua-init-5.2.lua
+LUA_INIT_5_3=@/project/lua-init-5.3.lua
 LUA_INIT_5_4=@/project/lua-init-5.4.lua
+LUA_INIT_5_5=@/project/lua-init-5.5.lua
 R_ENVIRON=/project/site.Renviron
 R_ENVIRON_USER=/project/user.Renviron
 R_PROFILE=/project/site.Rprofile
@@ -643,7 +658,6 @@ DOTNET_PROFILER_PATH_ARM64=/project/dotnet-profiler-arm64.so
 			PYTHONUSERBASE: null,
 			PYTHONSTARTUP: null,
 			LUA_INIT: null,
-			LUA_INIT_5_4: null,
 			R_ENVIRON: null,
 			R_ENVIRON_USER: null,
 			R_PROFILE: null,
@@ -667,6 +681,7 @@ DOTNET_PROFILER_PATH_ARM64=/project/dotnet-profiler-arm64.so
 	});
 
 	it("preserves operator-declared interpreter runtime settings", async () => {
+		const luaInitVersionedEnvironment = { LUA_INIT_5_4: "@/operator/lua-init-5.4.lua" };
 		const profilerEnvironment = Object.fromEntries(
 			CLR_PROFILER_ENV_KEYS.map(name => [name, `operator-${name.toLowerCase()}`]),
 		) as Record<ClrProfilerEnvironmentKey, string>;
@@ -679,7 +694,7 @@ DOTNET_PROFILER_PATH_ARM64=/project/dotnet-profiler-arm64.so
 				PYTHONUSERBASE: "/operator/python-user-base",
 				PYTHONSTARTUP: "/operator/python-startup.py",
 				LUA_INIT: "@/operator/lua-init.lua",
-				LUA_INIT_5_4: "@/operator/lua-init-5.4.lua",
+				...luaInitVersionedEnvironment,
 				R_ENVIRON: "/operator/site.Renviron",
 				R_ENVIRON_USER: "/operator/user.Renviron",
 				R_PROFILE: "/operator/site.Rprofile",
@@ -710,7 +725,7 @@ DOTNET_PROFILER_PATH_ARM64=/project/dotnet-profiler-arm64.so
 			PYTHONUSERBASE: "/operator/python-user-base",
 			PYTHONSTARTUP: "/operator/python-startup.py",
 			LUA_INIT: "@/operator/lua-init.lua",
-			LUA_INIT_5_4: "@/operator/lua-init-5.4.lua",
+			luaInitVersionedEnvironment,
 			R_ENVIRON: "/operator/site.Renviron",
 			R_ENVIRON_USER: "/operator/user.Renviron",
 			R_PROFILE: "/operator/site.Rprofile",
