@@ -3714,6 +3714,143 @@ describe("ModelRegistry", () => {
 			}
 		});
 
+		test("scopes Google discovery cache reuse to the session-selected project", async () => {
+			const requests: Array<{ accessToken: string | undefined; project: string | undefined }> = [];
+			using _hook = hookFetch((input, init) => {
+				if (!String(input).endsWith("/v1internal:fetchAvailableModels")) {
+					throw new Error(`Unexpected URL: ${String(input)}`);
+				}
+				const body = JSON.parse(String(init?.body ?? "{}")) as { project?: string };
+				requests.push({
+					accessToken: new Headers(init?.headers).get("authorization")?.replace(/^Bearer /i, ""),
+					project: body.project,
+				});
+				const modelId = `${body.project}-model`;
+				return new Response(JSON.stringify({ models: { [modelId]: { displayName: modelId } } }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			try {
+				for (const provider of ["google-antigravity", "google-gemini-cli"] as const) {
+					const accessToken = `${provider}-shared-access`;
+					const projectA = `${provider}-project-a`;
+					const projectB = `${provider}-project-b`;
+					await authStorage.set(provider, [
+						{
+							type: "oauth",
+							access: accessToken,
+							refresh: `${provider}-project-a-refresh`,
+							expires: Date.now() + 60 * 60 * 1000,
+							projectId: projectA,
+						},
+						{
+							type: "oauth",
+							access: accessToken,
+							refresh: `${provider}-project-b-refresh`,
+							expires: Date.now() + 60 * 60 * 1000,
+							projectId: projectB,
+						},
+					]);
+					const sessionA = `${provider}-project-a-session`;
+					const sessionB = `${provider}-project-b-session`;
+					authStorage.setSessionCredentialSelector(sessionA, provider, {
+						kind: "project",
+						value: projectA,
+					});
+					authStorage.setSessionCredentialSelector(sessionB, provider, {
+						kind: "project",
+						value: projectB,
+					});
+
+					const requestStart = requests.length;
+					await registry.refreshProvider(provider, "online", sessionA);
+					await registry.refreshProvider(provider, "online-if-uncached", sessionB);
+
+					expect(requests.slice(requestStart)).toEqual([
+						{ accessToken, project: projectA },
+						{ accessToken, project: projectB },
+					]);
+					expect(registry.find(provider, `${projectB}-model`)).toBeDefined();
+				}
+			} finally {
+				await registry.dispose();
+			}
+		});
+
+		test("does not publish Google discovery after its selected project changes in flight", async () => {
+			const firstResponse = Promise.withResolvers<Response>();
+			const firstRequest = Promise.withResolvers<void>();
+			const requests: Array<{ accessToken: string | undefined; project: string | undefined }> = [];
+			using _hook = hookFetch((input, init) => {
+				if (!String(input).endsWith("/v1internal:fetchAvailableModels")) {
+					throw new Error(`Unexpected URL: ${String(input)}`);
+				}
+				const body = JSON.parse(String(init?.body ?? "{}")) as { project?: string };
+				requests.push({
+					accessToken: new Headers(init?.headers).get("authorization")?.replace(/^Bearer /i, ""),
+					project: body.project,
+				});
+				if (requests.length === 1) {
+					firstRequest.resolve();
+					return firstResponse.promise;
+				}
+				const modelId = `${body.project}-model`;
+				return new Response(JSON.stringify({ models: { [modelId]: { displayName: modelId } } }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const provider = "google-antigravity";
+			const accessToken = "antigravity-shared-access";
+			const projectA = "antigravity-project-a";
+			const projectB = "antigravity-project-b";
+			const sessionId = "antigravity-project-change-session";
+			try {
+				await authStorage.set(provider, [
+					{
+						type: "oauth",
+						access: accessToken,
+						refresh: "antigravity-project-a-refresh",
+						expires: Date.now() + 60 * 60 * 1000,
+						projectId: projectA,
+					},
+					{
+						type: "oauth",
+						access: accessToken,
+						refresh: "antigravity-project-b-refresh",
+						expires: Date.now() + 60 * 60 * 1000,
+						projectId: projectB,
+					},
+				]);
+				authStorage.setSessionCredentialSelector(sessionId, provider, { kind: "project", value: projectA });
+
+				const firstRefresh = registry.refreshProvider(provider, "online", sessionId);
+				await firstRequest.promise;
+				authStorage.setSessionCredentialSelector(sessionId, provider, { kind: "project", value: projectB });
+				const modelA = `${projectA}-model`;
+				firstResponse.resolve(
+					new Response(JSON.stringify({ models: { [modelA]: { displayName: modelA } } }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					}),
+				);
+				await firstRefresh;
+				expect(readModelCache(provider, 24 * 60 * 60 * 1000, Date.now, cacheDbPath)).toBeNull();
+
+				await registry.refreshProvider(provider, "online-if-uncached", sessionId);
+				expect(requests).toEqual([
+					{ accessToken, project: projectA },
+					{ accessToken, project: projectB },
+				]);
+				expect(registry.find(provider, `${projectB}-model`)).toBeDefined();
+			} finally {
+				await registry.dispose();
+			}
+		});
+
 		test("sends project IDs from structured Google keys during discovery refresh", async () => {
 			const requests: Array<{ accessToken: string | undefined; body: unknown }> = [];
 			using _hook = hookFetch((input, init) => {

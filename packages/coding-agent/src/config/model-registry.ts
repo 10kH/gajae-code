@@ -1115,7 +1115,8 @@ function filterMaterializedRegistryProfiles(
 type SpecialProviderDescriptor = {
 	providerId: string;
 	resolveKey: (value: string | undefined) => string | undefined;
-	createOptions: (key: string, rawValue: string | undefined) => ModelManagerOptions<Api>;
+	resolveProjectId?: (key: string, rawValue: string | undefined) => string | undefined;
+	createOptions: (key: string, projectId?: string) => ModelManagerOptions<Api>;
 };
 
 const PROVIDER_BASE_URL_ENV_ALIASES: Record<string, readonly string[]> = {
@@ -1297,7 +1298,11 @@ function fingerprintConfiguredDiscoveryRequestShape(
 	return crypto.createHash("sha256").update("gajae:model-discovery-provenance\0").update(context).digest("hex");
 }
 
-function fingerprintDescriptorDiscoveryProvenance(authEvidence: string, endpoint: string): string | undefined {
+function fingerprintDescriptorDiscoveryProvenance(
+	authEvidence: string,
+	endpoint: string,
+	projectId?: string,
+): string | undefined {
 	try {
 		const parsed = new URL(endpoint);
 		if (parsed.username || parsed.password || parsed.search) return undefined;
@@ -1307,7 +1312,7 @@ function fingerprintDescriptorDiscoveryProvenance(authEvidence: string, endpoint
 	return crypto
 		.createHash("sha256")
 		.update("gajae:model-discovery-provenance\0")
-		.update(JSON.stringify({ authEvidence, endpoint }))
+		.update(JSON.stringify({ authEvidence, endpoint, ...(projectId !== undefined ? { projectId } : {}) }))
 		.digest("hex");
 }
 
@@ -2050,6 +2055,8 @@ interface ModelManagerDiscoveryOptions {
 	apiKey: string | undefined;
 	endpoint: string;
 	endpointContainsUserinfo: boolean;
+	projectId?: string;
+	isCurrentContext?: () => boolean;
 }
 
 interface ConfiguredDiscoveryResult {
@@ -2294,6 +2301,7 @@ export class ModelRegistry {
 			modelIds: ReadonlySet<string>;
 			authGeneration: string;
 			endpoint: string;
+			projectId?: string;
 		}
 	>();
 	#descriptorDiscoveryGenerations = new Map<string, number>();
@@ -4646,6 +4654,7 @@ export class ModelRegistry {
 					evidence.fresh,
 					evidence.authGeneration,
 					evidence.endpoint,
+					evidence.projectId,
 					[...evidence.modelIds].sort(),
 				]),
 			configured: [...this.#configuredDiscoveryEvidence.entries()]
@@ -5006,35 +5015,39 @@ export class ModelRegistry {
 			{
 				providerId: "google-antigravity",
 				resolveKey: extractGoogleOAuthToken,
-				createOptions: (oauthToken, rawValue) =>
+				resolveProjectId: (oauthToken, rawValue) =>
+					resolveGoogleOAuthProjectId(
+						this.authStorage,
+						"google-antigravity",
+						oauthToken,
+						rawValue,
+						credentialSessionId,
+						this.#authStorageConfigOwner,
+					),
+				createOptions: (oauthToken, projectId) =>
 					googleAntigravityModelManagerOptions({
 						oauthToken,
 						endpoint: this.getProviderBaseUrl("google-antigravity"),
-						project: resolveGoogleOAuthProjectId(
-							this.authStorage,
-							"google-antigravity",
-							oauthToken,
-							rawValue,
-							credentialSessionId,
-							this.#authStorageConfigOwner,
-						),
+						project: projectId,
 					}),
 			},
 			{
 				providerId: "google-gemini-cli",
 				resolveKey: extractGoogleOAuthToken,
-				createOptions: (oauthToken, rawValue) =>
+				resolveProjectId: (oauthToken, rawValue) =>
+					resolveGoogleOAuthProjectId(
+						this.authStorage,
+						"google-gemini-cli",
+						oauthToken,
+						rawValue,
+						credentialSessionId,
+						this.#authStorageConfigOwner,
+					),
+				createOptions: (oauthToken, projectId) =>
 					googleGeminiCliModelManagerOptions({
 						oauthToken,
 						endpoint: this.getProviderBaseUrl("google-gemini-cli"),
-						project: resolveGoogleOAuthProjectId(
-							this.authStorage,
-							"google-gemini-cli",
-							oauthToken,
-							rawValue,
-							credentialSessionId,
-							this.#authStorageConfigOwner,
-						),
+						project: projectId,
 					}),
 			},
 			{
@@ -5143,7 +5156,11 @@ export class ModelRegistry {
 				authGeneration === this.#getProviderEvidenceGeneration(descriptor.providerId, apiKeyValue) &&
 				isAuthenticated(key)
 			) {
-				const managerOptions = descriptor.createOptions(key, apiKeyValue);
+				const projectId = descriptor.resolveProjectId?.(key, apiKeyValue);
+				const isCurrentContext = descriptor.resolveProjectId
+					? () => descriptor.resolveProjectId?.(key, apiKeyValue) === projectId
+					: undefined;
+				const managerOptions = descriptor.createOptions(key, projectId);
 				const baseUrl = this.#getProviderBaseUrlForDiscovery(descriptor.providerId) ?? "";
 				options.push({
 					options: managerOptions,
@@ -5151,6 +5168,8 @@ export class ModelRegistry {
 					apiKey: apiKeyValue,
 					endpoint: this.#normalizeDiscoveryEvidenceEndpoint(baseUrl),
 					endpointContainsUserinfo: this.#urlContainsUserinfo(baseUrl),
+					projectId,
+					...(isCurrentContext ? { isCurrentContext } : {}),
 				});
 			}
 		}
@@ -5158,7 +5177,15 @@ export class ModelRegistry {
 	}
 
 	async #discoverWithModelManager(
-		{ options, authGeneration, apiKey, endpoint, endpointContainsUserinfo }: ModelManagerDiscoveryOptions,
+		{
+			options,
+			authGeneration,
+			apiKey,
+			endpoint,
+			endpointContainsUserinfo,
+			projectId,
+			isCurrentContext,
+		}: ModelManagerDiscoveryOptions,
 		strategy: ModelRefreshStrategy,
 		providerRefresh?: ProviderRefreshFence,
 	): Promise<Model<Api>[]> {
@@ -5173,7 +5200,7 @@ export class ModelRegistry {
 		let credentialDerivedEndpoint: string | undefined;
 		const reusableCacheProvenance = endpointContainsUserinfo
 			? undefined
-			: fingerprintDescriptorDiscoveryProvenance(authGeneration, endpoint);
+			: fingerprintDescriptorDiscoveryProvenance(authGeneration, endpoint, projectId);
 		if (reusableCacheProvenance === undefined && strategy === "offline") return [];
 		// Signed/userinfo endpoints may still publish a sanitized best-effort row,
 		// but each refresh gets a new opaque nonce. The nonce contains no endpoint
@@ -5184,6 +5211,7 @@ export class ModelRegistry {
 		const isCurrentDiscoveryContext = () =>
 			(this.#descriptorDiscoveryGenerations.get(options.providerId) ?? 0) === generation &&
 			this.#getProviderEvidenceGeneration(options.providerId, apiKey) === authGeneration &&
+			(isCurrentContext?.() ?? true) &&
 			(endpoint ===
 				this.#normalizeDiscoveryEvidenceEndpoint(this.#getProviderBaseUrlForDiscovery(options.providerId) ?? "") ||
 				(canUseCredentialDerivedXiaomiEndpoint && credentialDerivedEndpoint !== undefined));
@@ -5235,7 +5263,9 @@ export class ModelRegistry {
 			const evidence = this.#descriptorDiscoveryEvidence.get(options.providerId);
 			const refreshStrategy =
 				strategy === "online-if-uncached" &&
-				(evidence?.authGeneration !== authGeneration || evidence.endpoint !== endpoint)
+				(evidence?.authGeneration !== authGeneration ||
+					evidence.endpoint !== endpoint ||
+					evidence.projectId !== projectId)
 					? "online"
 					: strategy;
 			const result = await manager.refresh(refreshStrategy);
@@ -5258,13 +5288,15 @@ export class ModelRegistry {
 					result.dynamicModelIds !== undefined ||
 					result.stale ||
 					this.#descriptorDiscoveryEvidence.get(options.providerId)?.authGeneration !== authGeneration ||
-					this.#descriptorDiscoveryEvidence.get(options.providerId)?.endpoint !== endpoint)
+					this.#descriptorDiscoveryEvidence.get(options.providerId)?.endpoint !== endpoint ||
+					this.#descriptorDiscoveryEvidence.get(options.providerId)?.projectId !== projectId)
 			) {
 				this.#descriptorDiscoveryEvidence.set(options.providerId, {
 					fresh: result.fetched,
 					modelIds: new Set(models.map(model => model.id)),
 					authGeneration,
 					endpoint: this.#normalizeDiscoveryEvidenceEndpoint(models[0]?.baseUrl ?? endpoint),
+					projectId,
 				});
 			}
 			if (!isCurrentDiscovery()) {
@@ -5290,6 +5322,7 @@ export class ModelRegistry {
 					modelIds: new Set(),
 					authGeneration,
 					endpoint,
+					projectId,
 				});
 			}
 			logger.warn("model discovery failed for provider", {
