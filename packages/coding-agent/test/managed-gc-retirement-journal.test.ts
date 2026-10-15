@@ -471,6 +471,75 @@ function protocolFilesystemSnapshot(root: string): unknown[] {
 	return entries;
 }
 
+describe("retired tombstone listing visibility", () => {
+	it("hides a candidate only when a retired tombstone matches its exact identity", async () => {
+		const fixture = makeFixture();
+		const listed = listManagedCandidates(fixture.scope);
+		if (listed.kind !== "complete") throw new Error(listed.message);
+		const candidate = listed.owned.find(value => value.path === fixture.transcriptPath);
+		if (!candidate) throw new Error("owner_candidate_missing");
+		const isListed = () => {
+			const current = listManagedCandidates(fixture.scope);
+			if (current.kind !== "complete") throw new Error(current.message);
+			return current.owned.some(value => value.path === fixture.transcriptPath);
+		};
+
+		const nearMisses: unknown[] = [
+			{ ...candidate, path: `${candidate.path}.other` },
+			{ ...candidate, sessionId: `${candidate.sessionId}-other` },
+			{ ...candidate, identity: { ...candidate.identity, sha256: "0".repeat(64) } },
+			// Same values with a different type never match: size is a number and
+			// dev/ino/mtimeNs are decimal strings in a persisted target.
+			{ ...candidate, identity: { ...candidate.identity, size: String(candidate.identity.size) } },
+			{ ...candidate, identity: { ...candidate.identity, dev: Number(candidate.identity.dev) } },
+			{ ...candidate, identity: undefined },
+		];
+		for (const [index, target] of nearMisses.entries())
+			publishRetiredTombstone(fixture.scope, `${index.toString(16).padStart(64, "c")}.json`, [target]);
+		expect(isListed()).toBe(true);
+
+		publishRetiredTombstone(fixture.scope, `${"e".repeat(64)}.json`, [candidate]);
+		expect(isListed()).toBe(false);
+	});
+
+	it("reads each retired tombstone once per listing regardless of candidate count", async () => {
+		const fixture = makeFixture();
+		const transcriptStore = openScopeStore(fixture.scope);
+		try {
+			for (let index = 0; index < 12; index++)
+				transcriptStore.publishNoReplaceSync(
+					`extra-${index}.jsonl`,
+					Buffer.from(
+						`${JSON.stringify({ type: "session", id: `extra-${index}`, cwd: fixture.cwd, version: 3 })}\n`,
+						"utf8",
+					),
+				);
+		} finally {
+			transcriptStore.close();
+		}
+		const tombstoneCount = 8;
+		for (let index = 0; index < tombstoneCount; index++)
+			publishRetiredTombstone(fixture.scope, `${index.toString(16).padStart(64, "b")}.json`, [
+				{ path: path.join(fixture.scope.directoryPath, `retired-${index}.jsonl`) },
+			]);
+		const tombstoneDirectory = path.join(fixture.scope.directoryPath, ".gjc-managed-session-internal", "tombstones");
+		const realOpenSync = fs.openSync;
+		let tombstoneOpens = 0;
+		const openSpy = spyOn(fs, "openSync").mockImplementation(((...args: Parameters<typeof fs.openSync>) => {
+			if (path.dirname(String(args[0])) === tombstoneDirectory) tombstoneOpens++;
+			return realOpenSync(...args);
+		}) as typeof fs.openSync);
+		try {
+			const listed = listManagedCandidates(fixture.scope);
+			if (listed.kind !== "complete") throw new Error(listed.message);
+			expect(listed.owned.length).toBeGreaterThanOrEqual(13);
+		} finally {
+			openSpy.mockRestore();
+		}
+		expect(tombstoneOpens).toBe(tombstoneCount);
+	});
+});
+
 describe("independent async owner sibling inventories", () => {
 	it("requires a trusted inspector when managed protocol roles are present", async () => {
 		const fixture = makeFixture();
@@ -1014,6 +1083,28 @@ const LARGE_OWNER_TREE_FILLER_FILE_COUNT = 49_996;
 
 function largeOwnerTreeFileName(index: number): string {
 	return `${String(index).padStart(5, "0")}${"a".repeat(250)}`;
+}
+
+function publishRetiredTombstone(scope: ManagedScope, name: string, targets: unknown[]): void {
+	const store = openScopeStore(scope);
+	try {
+		store.publishNoReplaceSync(
+			`.gjc-managed-session-internal/tombstones/${name}`,
+			Buffer.from(
+				JSON.stringify(
+					{
+						schemaVersion: 2,
+						state: "retired",
+						scope: computeManagedScopeDigest(scope.platform, scope.canonicalCwd),
+						targets,
+					},
+					(_key, value: unknown) => (typeof value === "bigint" ? value.toString() : value),
+				),
+			),
+		);
+	} finally {
+		store.close();
+	}
 }
 
 function makeFixture(
