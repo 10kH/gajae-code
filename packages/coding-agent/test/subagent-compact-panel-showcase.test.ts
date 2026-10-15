@@ -11,23 +11,39 @@ describe("subagent compact panel showcase (#6774)", () => {
 			entry => `${entry.stateId}/${entry.columns}x${entry.rows}/${entry.renderMode}`,
 		);
 		expect(new Set(keys).size).toBe(keys.length);
-		expect(keys).toHaveLength(23);
+		expect(keys).toHaveLength(26);
 		for (const stateId of SUBAGENT_COMPACT_PANEL_STATE_IDS) {
 			expect(keys.some(key => key.startsWith(`${stateId}/`))).toBe(true);
 		}
 	});
 
-	it("renders every collapsed compact state in at most three rows without viewport overflow", async () => {
+	it("renders collapsed compact states in at most four rows and covers every overflowing tail", async () => {
 		for (const entry of SUBAGENT_COMPACT_PANEL_SHOWCASE_ENTRIES) {
 			const rendered = await renderSubagentCompactPanelShowcase(entry);
-			expect(rendered.terminalText.split("\n")).toHaveLength(entry.rows + 1);
+			for (const viewport of rendered.viewports) {
+				expect(viewport.terminalText.split("\n")).toHaveLength(entry.rows + 1);
+				if (entry.renderMode === "ascii-no-color") expect(viewport.terminalAnsiText).toBe(viewport.terminalText);
+			}
 			if (entry.stateId.startsWith("compact-collapsed-")) {
-				expect(rendered.panelLines).toBeLessThanOrEqual(3);
+				expect(rendered.panelLines).toBeLessThanOrEqual(4);
 				expect(rendered.viewportOverflowRows).toBe(0);
 			}
-			if (entry.renderMode === "ascii-no-color") {
-				expect(rendered.terminalAnsiText).toBe(rendered.terminalText);
+			if (rendered.viewportOverflowRows > 0) {
+				expect(rendered.viewports.map(viewport => viewport.scroll)).toEqual(["top", "middle", "bottom"]);
+				expect(rendered.viewports.at(-1)!.firstRow + entry.rows).toBe(rendered.panelLines);
 			}
 		}
+	});
+
+	it("shows the full timeout receipt instead of the compact summary for a final result", async () => {
+		const rendered = await renderSubagentCompactPanelShowcase({
+			stateId: "compact-final-timeout",
+			columns: 120,
+			rows: 36,
+			renderMode: "ascii-no-color",
+		});
+		const all = rendered.viewports.map(viewport => viewport.terminalText).join("");
+		expect(all).toContain("still running after the await timeout");
+		expect(all).not.toContain("to list each");
 	});
 });

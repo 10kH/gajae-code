@@ -16,6 +16,7 @@ export type SubagentCompactPanelStateId =
 	| "compact-collapsed-mixed"
 	| "compact-collapsed-retrying"
 	| "compact-collapsed-terminal"
+	| "compact-final-timeout"
 	| "default-collapsed-3-live"
 	| "narrow-cjk";
 
@@ -28,11 +29,20 @@ export interface SubagentCompactPanelShowcaseEntry {
 	renderMode: SubagentCompactPanelRenderMode;
 }
 
-export interface SubagentCompactPanelShowcaseRender {
+export type SubagentCompactPanelScrollPosition = "top" | "middle" | "bottom";
+
+export interface SubagentCompactPanelViewport {
+	scroll: SubagentCompactPanelScrollPosition;
+	firstRow: number;
 	terminalText: string;
 	terminalAnsiText: string;
+}
+
+export interface SubagentCompactPanelShowcaseRender {
 	panelLines: number;
 	viewportOverflowRows: number;
+	/** Top only when the panel fits; top, middle, and bottom when it overflows. */
+	viewports: SubagentCompactPanelViewport[];
 }
 
 export const SUBAGENT_COMPACT_PANEL_FIXED_NOW_MS = Date.UTC(2026, 9, 15, 6, 0, 0);
@@ -43,6 +53,7 @@ export const SUBAGENT_COMPACT_PANEL_STATE_IDS: readonly SubagentCompactPanelStat
 	"compact-collapsed-mixed",
 	"compact-collapsed-retrying",
 	"compact-collapsed-terminal",
+	"compact-final-timeout",
 	"default-collapsed-3-live",
 	"narrow-cjk",
 ];
@@ -134,6 +145,15 @@ function fixtureDetails(stateId: SubagentCompactPanelStateId, nowMs: number): Su
 					};
 				}),
 			};
+		case "compact-final-timeout":
+			return {
+				awaitOutcome: "timed_out",
+				subagents: Array.from({ length: 12 }, (_, index) => ({
+					...liveSnapshot(index, nowMs),
+					guidance:
+						"Subagent is still running after the await timeout; timeout only bounded this wait and is not a failure.",
+				})),
+			};
 		case "compact-collapsed-terminal":
 			return {
 				subagents: Array.from({ length: 10 }, (_, index) => ({
@@ -168,11 +188,21 @@ function settingsFor(stateId: SubagentCompactPanelStateId): { compact: boolean; 
 	};
 }
 
-/** Clip to the viewport and pad to exactly `rows` lines (whole terminal surface). */
-function fitViewport(lines: readonly string[], rows: number): string[] {
-	const visible = lines.slice(0, rows);
+/** Clip to the viewport starting at `firstRow` and pad to exactly `rows` lines. */
+function fitViewport(lines: readonly string[], firstRow: number, rows: number): string[] {
+	const visible = lines.slice(firstRow, firstRow + rows);
 	while (visible.length < rows) visible.push("");
 	return visible;
+}
+
+function scrollOffsets(panelLines: number, rows: number): Array<[SubagentCompactPanelScrollPosition, number]> {
+	const maxFirstRow = panelLines - rows;
+	if (maxFirstRow <= 0) return [["top", 0]];
+	return [
+		["top", 0],
+		["middle", Math.floor(maxFirstRow / 2)],
+		["bottom", maxFirstRow],
+	];
 }
 
 export async function renderSubagentCompactPanelShowcase(
@@ -193,18 +223,24 @@ export async function renderSubagentCompactPanelShowcase(
 				content: [{ type: "text", text: "" }],
 				details: fixtureDetails(entry.stateId, SUBAGENT_COMPACT_PANEL_FIXED_NOW_MS),
 			},
-			{ expanded, isPartial: true, spinnerFrame: 0 },
+			{ expanded, isPartial: entry.stateId !== "compact-final-timeout", spinnerFrame: 0 },
 			theme,
 		);
 		const panel = component.render(entry.columns);
-		const viewport = fitViewport(panel, entry.rows);
-		const ansi = `${viewport.join("\n")}\n`;
-		const plain = Bun.stripANSI(ansi);
+		const viewports = scrollOffsets(panel.length, entry.rows).map(([scroll, firstRow]) => {
+			const ansi = `${fitViewport(panel, firstRow, entry.rows).join("\n")}\n`;
+			const plain = Bun.stripANSI(ansi);
+			return {
+				scroll,
+				firstRow,
+				terminalText: plain,
+				terminalAnsiText: entry.renderMode === "ascii-no-color" ? plain : ansi,
+			};
+		});
 		return {
-			terminalText: plain,
-			terminalAnsiText: entry.renderMode === "ascii-no-color" ? plain : ansi,
 			panelLines: panel.length,
 			viewportOverflowRows: Math.max(0, panel.length - entry.rows),
+			viewports,
 		};
 	} finally {
 		Date.now = realNow;

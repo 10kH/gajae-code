@@ -1152,6 +1152,8 @@ export interface SubagentGroupSummary {
 	completed: number;
 	failed: number;
 	cancelled: number;
+	/** Running subagents in provider retry, per provider; drives the degradation warning. */
+	retryingByProvider: Record<string, number>;
 }
 
 export function summarizeSubagentGroup(subagents: readonly SubagentSnapshot[], nowMs: number): SubagentGroupSummary {
@@ -1164,13 +1166,18 @@ export function summarizeSubagentGroup(subagents: readonly SubagentSnapshot[], n
 		completed: 0,
 		failed: 0,
 		cancelled: 0,
+		retryingByProvider: {},
 	};
 	for (const snapshot of subagents) {
 		switch (snapshot.status) {
 			case "running": {
 				summary.running += 1;
 				const live = snapshot.liveProgressAvailable !== false ? snapshot.progress : undefined;
-				if (live?.status === "running" && live.retryState) summary.retrying += 1;
+				if (live?.status === "running" && live.retryState) {
+					summary.retrying += 1;
+					const provider = live.retryState.provider ?? "provider";
+					summary.retryingByProvider[provider] = (summary.retryingByProvider[provider] ?? 0) + 1;
+				}
 				if (live?.lastActivityMs !== undefined && nowMs - live.lastActivityMs > SUBAGENT_COMPACT_IDLE_MS) {
 					summary.idle += 1;
 				}
@@ -1200,7 +1207,7 @@ export function summarizeSubagentGroup(subagents: readonly SubagentSnapshot[], n
 
 /**
  * Rendered-state signature for the compact await panel. It covers only what the
- * compact view shows (group counts), so per-subagent activity that does not move
+ * compact view shows (group counts and per-provider retry counts), so per-subagent activity that does not move
  * a count no longer re-emits: the update rate is bounded by count transitions and
  * the liveness interval instead of growing with the number of live subagents.
  */
@@ -1212,7 +1219,10 @@ export function subagentCompactRenderedStateSignature(
 	return JSON.stringify({
 		awaitOutcome: receipt?.awaitOutcome ?? null,
 		interrupted: receipt?.interrupted === true,
-		summary: summarizeSubagentGroup(subagents, nowMs),
+		summary: (({ retryingByProvider, ...counts }) => ({
+			...counts,
+			retryingByProvider: Object.entries(retryingByProvider).sort(([a], [b]) => a.localeCompare(b)),
+		}))(summarizeSubagentGroup(subagents, nowMs)),
 	});
 }
 

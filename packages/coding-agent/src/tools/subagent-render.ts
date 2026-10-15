@@ -454,13 +454,28 @@ export const subagentToolRenderer = {
 					theme,
 				);
 				const out: string[] = [truncateToWidth(replaceTabs(header), width, Ellipsis.Omit)];
-				if (!expanded && compactSubagentPanelEnabled()) {
-					for (const line of [
-						renderCompactSubagentSummary(subagents, theme),
-						renderCompactSubagentHint(runningCount > 0, theme),
-					]) {
-						out.push(truncateToWidth(replaceTabs(line), width, Ellipsis.Unicode));
-					}
+				const liveProgress = subagents.flatMap(snapshot =>
+					snapshot.progress && snapshot.liveProgressAvailable !== false ? [snapshot.progress] : [],
+				);
+				const degradationLines = collectProviderDegradationGroups(liveProgress).map(
+					group =>
+						`  ${theme.fg("warning", `provider degraded: ${group.count} subagents retrying on ${group.provider}`)}`,
+				);
+				// Compact applies only to live await progress. Final results (timeout
+				// guidance, failure and completion receipts, status/steer replies) keep
+				// the full per-subagent rendering.
+				if (!expanded && options.isPartial && compactSubagentPanelEnabled()) {
+					out.push(
+						truncateToWidth(replaceTabs(renderCompactSubagentSummary(subagents, theme)), width, Ellipsis.Unicode),
+					);
+					for (const line of degradationLines) out.push(truncateToWidth(replaceTabs(line), width, Ellipsis.Omit));
+					out.push(
+						truncateToWidth(
+							replaceTabs(renderCompactSubagentHint(runningCount > 0, theme)),
+							width,
+							Ellipsis.Unicode,
+						),
+					);
 					return out;
 				}
 				// Discoverability: the inline panel is a bounded preview; the session
@@ -474,20 +489,7 @@ export const subagentToolRenderer = {
 						),
 					);
 				}
-				const liveProgress = subagents.flatMap(snapshot =>
-					snapshot.progress && snapshot.liveProgressAvailable !== false ? [snapshot.progress] : [],
-				);
-				for (const group of collectProviderDegradationGroups(liveProgress)) {
-					out.push(
-						truncateToWidth(
-							replaceTabs(
-								`  ${theme.fg("warning", `provider degraded: ${group.count} subagents retrying on ${group.provider}`)}`,
-							),
-							width,
-							Ellipsis.Omit,
-						),
-					);
-				}
+				for (const line of degradationLines) out.push(truncateToWidth(replaceTabs(line), width, Ellipsis.Omit));
 
 				snapshotSignatures ??= subagents.map(
 					snapshot =>

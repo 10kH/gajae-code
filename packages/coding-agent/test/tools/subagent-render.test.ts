@@ -827,6 +827,45 @@ describe("compact subagent panel (#6774)", () => {
 		expect(summary).toEndWith("…");
 	});
 
+	it("keeps the full receipt, including timeout guidance, once the await result is final", () => {
+		settings.set("task.compactSubagentPanel", true);
+		const guidance =
+			"Subagent is still running after the await timeout; never cancel just because an await timed out.";
+		const subagents = liveGroup(15, 0).map(item => ({ ...item, guidance }));
+		const component = subagentToolRenderer.renderResult(
+			{ content: [{ type: "text", text: "" }], details: { subagents, awaitOutcome: "timed_out" } },
+			{ expanded: false, isPartial: false, spinnerFrame: 0 },
+			theme,
+		);
+		const out = Bun.stripANSI(component.render(160).join("\n"));
+		expect(out).toContain("0-Worker14");
+		expect(out).toContain("still running after the await timeout");
+		expect(out).not.toContain("to list each");
+	});
+
+	it("keeps the provider degradation warning in the compact summary", () => {
+		settings.set("task.compactSubagentPanel", true);
+		const retryState = {
+			attempt: 2,
+			maxAttempts: 5,
+			kind: "provider_error" as const,
+			provider: "anthropic",
+			delayMs: 10_000,
+			errorMessage: "overloaded",
+			startedAtMs: Date.now(),
+		};
+		const subagents = liveGroup(12, 0).map((item, index) =>
+			index < 4 ? { ...item, progress: progress({ id: item.id, retryState }) } : item,
+		);
+		const lines = render({ subagents }, false).split("\n");
+		expect(lines).toEqual([
+			expect.stringContaining("awaiting 12 of 12"),
+			"  12 subagents running · 4 retrying",
+			"  provider degraded: 4 subagents retrying on anthropic",
+			expect.stringContaining("to list each"),
+		]);
+	});
+
 	it("lists every subagent when tool output is expanded", () => {
 		settings.set("task.compactSubagentPanel", true);
 		const out = render({ subagents: liveGroup(15, 3) }, true);

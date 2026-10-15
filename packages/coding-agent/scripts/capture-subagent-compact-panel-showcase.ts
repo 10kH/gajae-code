@@ -50,45 +50,51 @@ async function main(): Promise<void> {
 	const root = outputPath(process.argv.slice(2));
 	await fs.mkdir(root, { recursive: true });
 	const entries = [];
+	const capturedAt = new Date().toISOString();
 	for (const entry of SUBAGENT_COMPACT_PANEL_SHOWCASE_ENTRIES) {
 		const key = entryKey(entry);
 		const rendered = await renderSubagentCompactPanelShowcase(entry);
-		const metadata = json({
-			entryKey: key,
-			commandOrReplaySource: CANONICAL_COMMAND,
-			fixtureSource: "packages/coding-agent/test/fixtures/tui/subagent-compact-panel-showcase.ts",
-			toolVersion: CAPTURE_TOOL_VERSION,
-			captureMode: "fixture",
-			terminal: { columns: entry.columns, rows: entry.rows },
-			renderMode: entry.renderMode,
-			fontRenderingAssumptions: "red-claw truecolor theme; HTML uses a monospace terminal fallback stack.",
-			wrappingPolicy:
-				"Real subagentToolRenderer output at the recorded terminal-cell width; lines are truncated by the renderer, never wrapped.",
-			fixedClockTimestamp: new Date(SUBAGENT_COMPACT_PANEL_FIXED_NOW_MS).toISOString(),
-			panelLines: rendered.panelLines,
-			viewportOverflowRows: rendered.viewportOverflowRows,
-		});
-		const dir = key;
-		const files = [
-			await writeArtifact(root, `${dir}/terminal.txt`, rendered.terminalText),
-			await writeArtifact(root, `${dir}/terminal-ansi.txt`, rendered.terminalAnsiText),
-			await writeArtifact(root, `${dir}/terminal.html`, ansiToHtml(rendered.terminalAnsiText)),
-			await writeArtifact(root, `${dir}/metadata.json`, metadata),
-		];
-		entries.push({
-			key,
-			stateId: entry.stateId,
-			viewport: { columns: entry.columns, rows: entry.rows },
-			renderMode: entry.renderMode,
-			panelLines: rendered.panelLines,
-			viewportOverflowRows: rendered.viewportOverflowRows,
-			files,
-		});
+		for (const viewport of rendered.viewports) {
+			const viewportKey = `${key}/${viewport.scroll}`;
+			const metadata = json({
+				entryKey: viewportKey,
+				commandOrReplaySource: CANONICAL_COMMAND,
+				fixtureSource: "packages/coding-agent/test/fixtures/tui/subagent-compact-panel-showcase.ts",
+				toolVersion: CAPTURE_TOOL_VERSION,
+				captureMode: "fixture",
+				capturedAt,
+				terminal: { columns: entry.columns, rows: entry.rows },
+				renderMode: entry.renderMode,
+				fontRenderingAssumptions: "red-claw truecolor theme; HTML uses a monospace terminal fallback stack.",
+				wrappingPolicy:
+					"Real subagentToolRenderer output at the recorded terminal-cell width; lines are truncated by the renderer, never wrapped.",
+				fixtureClockTimestamp: new Date(SUBAGENT_COMPACT_PANEL_FIXED_NOW_MS).toISOString(),
+				panelLines: rendered.panelLines,
+				viewportOverflowRows: rendered.viewportOverflowRows,
+				scroll: { position: viewport.scroll, firstRow: viewport.firstRow },
+			});
+			const files = [
+				await writeArtifact(root, `${viewportKey}/terminal.txt`, viewport.terminalText),
+				await writeArtifact(root, `${viewportKey}/terminal-ansi.txt`, viewport.terminalAnsiText),
+				await writeArtifact(root, `${viewportKey}/terminal.html`, ansiToHtml(viewport.terminalAnsiText)),
+				await writeArtifact(root, `${viewportKey}/metadata.json`, metadata),
+			];
+			entries.push({
+				key: viewportKey,
+				stateId: entry.stateId,
+				viewport: { columns: entry.columns, rows: entry.rows },
+				renderMode: entry.renderMode,
+				scroll: viewport.scroll,
+				panelLines: rendered.panelLines,
+				viewportOverflowRows: rendered.viewportOverflowRows,
+				files,
+			});
+		}
 	}
 	await writeArtifact(
 		root,
 		"manifest.json",
-		json({ tool: CAPTURE_TOOL_VERSION, command: CANONICAL_COMMAND, entryCount: entries.length, entries }),
+		json({ tool: CAPTURE_TOOL_VERSION, command: CANONICAL_COMMAND, capturedAt, entryCount: entries.length, entries }),
 	);
 	process.stdout.write(`Captured ${entries.length} subagent compact panel showcase entries at ${root}\n`);
 }
