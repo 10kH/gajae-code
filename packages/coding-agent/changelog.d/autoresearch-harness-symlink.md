@@ -1,2 +1,2 @@
 ### Fixed
-- Refuse agent writes through a symlinked `autoresearch.sh` during an active research mission, preserving product files while allowing new and regular mission harnesses.
+- Require single-target file tools to write the root `autoresearch.sh` during active research missions, rejecting symlinks and preventing compound Bash commands from retargeting the harness; new and regular harnesses remain writable.

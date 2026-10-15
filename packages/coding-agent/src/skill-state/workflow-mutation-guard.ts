@@ -2360,8 +2360,13 @@ export async function getWorkflowMutationDecision(
 	// for an empty list, so an opaque mutation that resolves to NO target (e.g.
 	// `python3 -c "open('src/product.ts','w').write('x')"`) would otherwise skip
 	// the fail-closed check below and be waved through on a research mission.
+	// Bash is a compound command list, not a write boundary: an earlier `ln` or
+	// `mv` can retarget the harness before a later redirection. Harness changes
+	// must use a single-target file tool so the final path is checked for symlinks
+	// immediately before that write operation.
 	if (
 		planning.skill === "autoresearch" &&
+		input.tool.name !== "bash" &&
 		targets.paths.length > 0 &&
 		!targets.unknown &&
 		targets.paths.every(p => isAutoresearchAuthorizedResearchPath(input.cwd, p))

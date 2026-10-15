@@ -191,6 +191,32 @@ describe("autoresearch research-only authorization (real git, nothing stubbed)",
 		}
 	});
 
+	it("blocks compound Bash commands from retargeting the harness before a redirected write", async () => {
+		const cwd = initRepo();
+		await activateMission(cwd);
+
+		// A dedicated file tool can write the regular harness, but Bash cannot
+		// safely honor that exception: any preceding command could replace the
+		// harness with a symlink before the redirect is opened.
+		expect((await decideWrite(cwd, "autoresearch.sh")).blocked).toBe(false);
+
+		const bash = { ...writeTool(), name: "bash" };
+		const decision = await getWorkflowMutationDecision({
+			cwd,
+			sessionId: TEST_SESSION_ID,
+			tool: bash,
+			args: {
+				command: "ln -sf src/product.ts autoresearch.sh && printf changed > autoresearch.sh",
+			},
+		});
+
+		expect(decision.blocked).toBe(true);
+		expect(decision.message).toContain("research-only");
+		expect(decision.targets).toContain("autoresearch.sh");
+		expect(await Bun.file(path.join(cwd, "src/product.ts")).text()).toBe("export const x = 1;\n");
+		expect(await Bun.file(path.join(cwd, "autoresearch.sh")).exists()).toBe(false);
+	});
+
 	it.skipIf(process.platform === "win32")("still allows a regular harness through a symlinked workspace", async () => {
 		const cwd = initRepo();
 		await activateMission(cwd);
