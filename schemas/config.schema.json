@@ -1126,6 +1126,11 @@
 					"description": "Safer concurrent limit for subagents; higher fan-out still requires an explicit plan above 4 tasks.",
 					"default": 8
 				},
+				"compactSubagentPanel": {
+					"type": "boolean",
+					"description": "Collapse awaited subagents into one summary line (expand tool output to see each one) and refresh only when the summary changes",
+					"default": false
+				},
 				"enableLsp": {
 					"type": "boolean",
 					"description": "Allow subagents spawned via the task tool to use the lsp tool. Off by default to keep subagents cheap; enable when LSP-aware delegation is worth the extra tokens.",
