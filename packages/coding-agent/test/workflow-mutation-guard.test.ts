@@ -2085,9 +2085,12 @@ describe("bash scanner quoting model", () => {
 			"sed -n 's/a/b/w src/product.ts' stage/pwn.txt",
 			`python3 -c "import shutil; shutil.copy('stage/pwn.txt','src/product.ts')"`,
 			`python3 -c "import os; os.system('printf PWNED > src/product.ts')"`,
+			`python3 -c "import os; os.system(command)"`,
 			`node -e "require('fs').appendFileSync('src/product.ts','x')"`,
 			`perl -e 'open(F,">","src/product.ts"); print F "PWNED";'`,
 			`awk 'BEGIN{printf "PWNED" > "src/product.ts"}'`,
+			`awk -v x=1 'BEGIN { print "PWNED" > "src/product.ts" }' input`,
+			`awk 'BEGIN { print 1; print "PWNED" > "src/product.ts" }' input`,
 			"ln -sf stage/pwn.txt src/product.ts",
 			`python3 -c "import os; os.symlink('stage/pwn.txt','src/pwn-link.ts')"`,
 		];
@@ -2100,6 +2103,20 @@ describe("bash scanner quoting model", () => {
 			});
 			expect(decision.blocked, command).toBe(true);
 		}
+		const systemWrite = await getWorkflowMutationDecision({
+			cwd,
+			sessionId: "session-a",
+			tool: tool("bash"),
+			args: { command: `python3 -c "import os; os.system('printf PWNED > src/product.ts')"` },
+		});
+		expect(systemWrite.targets).toContain("src/product.ts");
+		const dynamicSystem = await getWorkflowMutationDecision({
+			cwd,
+			sessionId: "session-a",
+			tool: tool("bash"),
+			args: { command: `python3 -c "import os; os.system(command)"` },
+		});
+		expect(dynamicSystem.reason).toBe("unknown-target");
 		await expect(
 			assertWorkflowMutationAllowed({
 				cwd,
@@ -2114,6 +2131,9 @@ describe("bash scanner quoting model", () => {
 			"sed -n '1,80p' packages/coding-agent/src/skill-state/workflow-mutation-guard.ts",
 			"sed -n 's/a/b/p' src/product.ts",
 			"awk '$1 > 5 {print $1}' src/product.ts",
+			`awk '$1 > "m" { print }' input`,
+			`awk -v x=1 'BEGIN { print x }' input`,
+			`python3 -c "import os; os.system('ls')"`,
 			`python3 -c "print(1)"`,
 			`node -e "console.log(1)"`,
 			`perl -e 'print 1'`,

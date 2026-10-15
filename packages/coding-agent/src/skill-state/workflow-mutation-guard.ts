@@ -107,7 +107,7 @@ const BASH_IN_PLACE_MUTATION_COMMAND_RE = new RegExp(
  * because `perl -e 'open(...)'` is that same call.
  */
 const BASH_INTERPRETER_WRITE_API =
-	"(?:open\\s*\\(|writeFile(?:Sync)?\\s*\\(|appendFile(?:Sync)?\\s*\\(|\\.write\\s*\\(|shutil\\s*\\.\\s*(?:copy2?|copyfileobj|copyfile)\\s*\\(|os\\s*\\.\\s*(?:system|symlink)\\s*\\()";
+	"(?:open\\s*\\(|writeFile(?:Sync)?\\s*\\(|appendFile(?:Sync)?\\s*\\(|\\.write\\s*\\(|shutil\\s*\\.\\s*(?:copy2?|copyfileobj|copyfile)\\s*\\(|os\\s*\\.\\s*symlink\\s*\\()";
 const BASH_OPAQUE_INTERPRETER_WRITE_RE = new RegExp(
 	`(?:^|[;&|\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?(?:python3?|node|ruby|perl)\\b[^;&|\\n]*(?:-c|-e)\\b[^;&|\\n]*${BASH_INTERPRETER_WRITE_API}`,
 	"i",
@@ -1579,7 +1579,7 @@ const BASH_SED_COMMAND_RE = new RegExp(
 	"gi",
 );
 const BASH_AWK_COMMAND_RE = new RegExp(
-	`(?:^|[;&|(\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|()]*\\/)?awk\\b([^;&|()\\n]*)`,
+	`(?:^|[;&|(\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|()]*\\/)?awk\\b((?:'[^']*'|"(?:\\\\.|[^"\\\\])*"|\\\\.|[^'";&|()\\n\\\\])*)`,
 	"gi",
 );
 
@@ -1703,20 +1703,140 @@ function interpreterStatementEnd(command: string, start: number): number {
 	return index;
 }
 
-function collectInterpreterOneLinerWrites(command: string, targets: ExtractedTargets): void {
+function pythonSystemCallArguments(script: string): { starts: number[]; unclassifiable: boolean } {
+	const starts: number[] = [];
+	let quote: "'" | '"' | null = null;
+	let tripleQuote = false;
+	let inComment = false;
+	let unclassifiable = false;
+	for (let index = 0; index < script.length; index++) {
+		const character = script[index] ?? "";
+		if (inComment) {
+			if (character === "\n") inComment = false;
+			continue;
+		}
+		if (quote) {
+			if (character === "\\") {
+				index++;
+				continue;
+			}
+			if (tripleQuote && script.startsWith(quote.repeat(3), index)) {
+				quote = null;
+				tripleQuote = false;
+				index += 2;
+				continue;
+			}
+			if (!tripleQuote && character === quote) quote = null;
+			continue;
+		}
+		if (character === "#") {
+			inComment = true;
+			continue;
+		}
+		if (character === "'" || character === '"') {
+			const isFString = /(?:^|[^\w])(?:[rR]?[fF]|[fF][rR])$/.test(script.slice(0, index));
+			tripleQuote = script.startsWith(character.repeat(3), index);
+			quote = character;
+			if (tripleQuote) {
+				const close = script.indexOf(character.repeat(3), index + 3);
+				const body = close < 0 ? script.slice(index + 3) : script.slice(index + 3, close);
+				if (isFString && /\bos\s*\.\s*system\s*\(/.test(body)) unclassifiable = true;
+				index += 2;
+			} else if (isFString) {
+				let close = index + 1;
+				while (close < script.length) {
+					if (script[close] === "\\") {
+						close += 2;
+						continue;
+					}
+					if (script[close] === character) break;
+					close++;
+				}
+				if (/\bos\s*\.\s*system\s*\(/.test(script.slice(index + 1, close))) unclassifiable = true;
+			}
+			continue;
+		}
+		const call = script.slice(index).match(/^\bos\s*\.\s*system\s*\(/);
+		if (call) {
+			starts.push(index + call[0].length);
+			index += call[0].length - 1;
+		}
+	}
+	return { starts, unclassifiable };
+}
+
+function pythonSystemCommand(script: string, start: number): string | undefined {
+	let index = start;
+	while (/\s/.test(script[index] ?? "")) index++;
+	const quote = script[index];
+	if (quote !== "'" && quote !== '"') return undefined;
+	const tripleQuote = script.startsWith(quote.repeat(3), index);
+	index += tripleQuote ? 3 : 1;
+	let value = "";
+	let hasEscape = false;
+	while (index < script.length) {
+		if (script[index] === "\\") {
+			hasEscape = true;
+			index += 2;
+			continue;
+		}
+		if (tripleQuote && script.startsWith(quote.repeat(3), index)) {
+			index += 3;
+			while (/\s/.test(script[index] ?? "")) index++;
+			return !hasEscape && script[index] === ")" ? value : undefined;
+		}
+		if (!tripleQuote && script[index] === quote) {
+			index++;
+			while (/\s/.test(script[index] ?? "")) index++;
+			return !hasEscape && script[index] === ")" ? value : undefined;
+		}
+		value += script[index];
+		index++;
+	}
+	return undefined;
+}
+
+function collectPythonSystemWrites(script: string, targets: ExtractedTargets, depth: number): void {
+	const calls = pythonSystemCallArguments(script);
+	if (calls.unclassifiable) {
+		targets.explicitMutation = true;
+		targets.unknown = true;
+	}
+	for (const start of calls.starts) {
+		const payload = pythonSystemCommand(script, start);
+		if (payload === undefined || depth >= 2) {
+			targets.explicitMutation = true;
+			targets.unknown = true;
+			continue;
+		}
+		const nested = extractBashTargets({ command: payload }, depth + 1);
+		for (const nestedPath of nested.paths) addPath(targets, nestedPath);
+		if (nested.unknown) {
+			targets.explicitMutation = true;
+			targets.unknown = true;
+		}
+		if (nested.explicitMutation) targets.explicitMutation = true;
+	}
+}
+
+function collectInterpreterOneLinerWrites(command: string, targets: ExtractedTargets, depth: number): void {
 	const api = new RegExp(BASH_INTERPRETER_WRITE_API, "i");
 	const names = /(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:python3?|node|ruby|perl)\b/gi;
 	for (const match of command.matchAll(names)) {
 		const start = (match.index ?? 0) + match[0].length;
 		const tail = command.slice(start, interpreterStatementEnd(command, start));
 		const parts = shellWords(tail).map(cleanShellWord);
+		const isPython = /\bpython3?\b/i.test(match[0] ?? "");
 		for (let index = 0; index < parts.length; index++) {
 			const part = parts[index] ?? "";
 			if (part !== "-c" && part !== "-e") continue;
-			if (!api.test(parts[index + 1] ?? "")) continue;
-			targets.explicitMutation = true;
-			targets.unknown = true;
-			return;
+			const script = parts[index + 1] ?? "";
+			if (api.test(script)) {
+				targets.explicitMutation = true;
+				targets.unknown = true;
+				return;
+			}
+			if (isPython) collectPythonSystemWrites(script, targets, depth);
 		}
 	}
 }
@@ -1734,30 +1854,443 @@ function collectSedScriptWrites(command: string, targets: ExtractedTargets): voi
 	}
 }
 
-function firstAwkProgram(parts: string[]): string | undefined {
-	for (let index = 0; index < parts.length; index++) {
-		const part = parts[index] ?? "";
-		if (part === "-e" || part === "--source") return parts[index + 1];
-		if (part === "-f" || part === "--file") {
+function shellSyntaxPosition(command: string, targetIndex: number, allowComment = false): boolean {
+	let quote: "'" | '"' | null = null;
+	let inComment = false;
+	let previous = "";
+	for (let index = 0; index < targetIndex; index++) {
+		const character = command[index] ?? "";
+		if (inComment) {
+			if (character === "\n") {
+				inComment = false;
+				previous = character;
+			}
+			continue;
+		}
+		if (quote === "'") {
+			if (character === "'") quote = null;
+			continue;
+		}
+		if (quote === '"') {
+			if (character === "\\") {
+				index++;
+				continue;
+			}
+			if (character === '"') quote = null;
+			continue;
+		}
+		if (character === "\\") {
 			index++;
 			continue;
 		}
-		if (!part || part.startsWith("-")) continue;
-		return part;
+		if (character === "'" || character === '"') {
+			quote = character;
+			continue;
+		}
+		if (character === "#" && (previous === "" || /\s/.test(previous) || ";|&()".includes(previous))) {
+			inComment = true;
+			continue;
+		}
+		previous = character;
+	}
+	if (command[targetIndex] === "\n" && inComment) return quote === null;
+	return quote === null && (allowComment || !inComment);
+}
+
+function awkRegexCanStart(tokens: AwkToken[]): boolean {
+	const previous = tokens.at(-1);
+	if (!previous) return true;
+	if (previous.kind === "separator") return true;
+	return (
+		(previous.kind === "symbol" &&
+			["{", "(", "[", ",", "?", ":", "=", "==", "!=", "!", "&&", "||", "~", "!~"].includes(previous.value)) ||
+		(previous.kind === "word" && ["print", "printf", "return"].includes(previous.value))
+	);
+}
+
+function awkRegexEnd(program: string, start: number): number | undefined {
+	let inCharacterClass = false;
+	for (let index = start + 1; index < program.length; index++) {
+		const character = program[index] ?? "";
+		if (character === "\\") {
+			index++;
+			continue;
+		}
+		if (character === "[" && !inCharacterClass) inCharacterClass = true;
+		else if (character === "]" && inCharacterClass) inCharacterClass = false;
+		else if (character === "/" && !inCharacterClass) return index + 1;
+		else if (character === "\n") return undefined;
 	}
 	return undefined;
 }
 
-/** Quoted awk redirections (`print > "file"`). Comparisons (`$1 > 5`) are not writes. */
+interface AwkToken {
+	kind: "word" | "string" | "symbol" | "separator";
+	value: string;
+	escaped?: boolean;
+}
+
+function tokenizeAwkProgram(program: string): { tokens: AwkToken[]; balanced: boolean } {
+	const tokens: AwkToken[] = [];
+	let balanced = true;
+	let lineHasOnlyWhitespace = true;
+	for (let index = 0; index < program.length; ) {
+		const character = program[index] ?? "";
+		if (character === "\n") {
+			tokens.push({ kind: "separator", value: character });
+			lineHasOnlyWhitespace = true;
+			index++;
+			continue;
+		}
+		if (/\s/.test(character)) {
+			index++;
+			continue;
+		}
+		if (character === "#" && lineHasOnlyWhitespace) {
+			while (index < program.length && program[index] !== "\n") index++;
+			continue;
+		}
+		if (character === '"') {
+			let value = "";
+			let escaped = false;
+			let closed = false;
+			index++;
+			while (index < program.length) {
+				const next = program[index] ?? "";
+				if (next === "\\") {
+					escaped = true;
+					index += 2;
+					if (index < program.length) value += program[index];
+					index++;
+					continue;
+				}
+				if (next === '"') {
+					closed = true;
+					index++;
+					break;
+				}
+				value += next;
+				index++;
+			}
+			if (!closed) balanced = false;
+			tokens.push({ kind: "string", value, escaped });
+			lineHasOnlyWhitespace = false;
+			continue;
+		}
+		if (character === "/" && awkRegexCanStart(tokens)) {
+			const end = awkRegexEnd(program, index);
+			if (end === undefined) balanced = false;
+			else {
+				tokens.push({ kind: "symbol", value: "regex" });
+				index = end;
+				lineHasOnlyWhitespace = false;
+				continue;
+			}
+		}
+		if (/[A-Za-z_]/.test(character)) {
+			const start = index++;
+			while (/[A-Za-z0-9_]/.test(program[index] ?? "")) index++;
+			tokens.push({ kind: "word", value: program.slice(start, index) });
+			lineHasOnlyWhitespace = false;
+			continue;
+		}
+		if (character === ";") {
+			tokens.push({ kind: "separator", value: character });
+			lineHasOnlyWhitespace = false;
+			index++;
+			continue;
+		}
+		const pair = program.slice(index, index + 2);
+		const operator = [">>", ">=", "==", "!=", "<=", "&&", "||", "!~", "++", "--"].includes(pair) ? pair : character;
+		tokens.push({ kind: "symbol", value: operator });
+		lineHasOnlyWhitespace = false;
+		index += operator.length;
+	}
+	return { tokens, balanced };
+}
+
+interface AwkProgramSource {
+	source: string;
+	expanded: boolean;
+}
+
+function shellWordHasExpansion(word: string): boolean {
+	let quote: "'" | '"' | null = null;
+	for (let index = 0; index < word.length; index++) {
+		const character = word[index] ?? "";
+		if (quote === "'") {
+			if (character === "'") quote = null;
+			continue;
+		}
+		if (quote === '"') {
+			if (character === "\\") {
+				index++;
+				continue;
+			}
+			if (character === '"') quote = null;
+			else if (character === "$" || character === "`") return true;
+			continue;
+		}
+		if (character === "\\") {
+			index++;
+			continue;
+		}
+		if (character === "'" || character === '"') quote = character;
+		else if (character === "$" || character === "`") return true;
+	}
+	return quote !== null;
+}
+
+function awkPrograms(words: string[]): { programs: AwkProgramSource[]; unknown: boolean } {
+	const programs: AwkProgramSource[] = [];
+	const noOperandOptions = new Set([
+		"-b",
+		"-c",
+		"-C",
+		"-g",
+		"-h",
+		"-M",
+		"-n",
+		"-N",
+		"-O",
+		"-P",
+		"-r",
+		"-s",
+		"-S",
+		"-t",
+		"-V",
+		"--characters-as-bytes",
+		"--csv",
+		"--help",
+		"--lint",
+		"--lint-no-ext",
+		"--lint-old",
+		"--posix",
+		"--sandbox",
+		"--traditional",
+		"--version",
+	]);
+	let unknown = false;
+	let hasFileProgram = false;
+	let hasSourceOption = false;
+	const programSource = (raw: string): AwkProgramSource => ({
+		source: cleanShellWord(raw),
+		expanded: shellWordHasExpansion(raw),
+	});
+	const operand = (index: number): string | undefined => {
+		const next = words[index + 1];
+		if (!next) {
+			unknown = true;
+			return undefined;
+		}
+		return next;
+	};
+	for (let index = 0; index < words.length; index++) {
+		const word = words[index];
+		if (!word) continue;
+		if (/^(?:\d+)?(?:>>?|<<<?|&>)/.test(word)) {
+			if (/^(?:\d+)?(?:>>?|<<<?)$/.test(word)) index++;
+			continue;
+		}
+		const part = cleanShellWord(word);
+		if (part === "--") {
+			if (hasFileProgram || hasSourceOption) break;
+			const program = words[index + 1];
+			if (!program) unknown = true;
+			else programs.push(programSource(program));
+			break;
+		}
+		if (part === "-e" || part === "--source") {
+			const program = operand(index);
+			if (program) programs.push(programSource(program));
+			hasSourceOption = true;
+			index++;
+			continue;
+		}
+		if (part.startsWith("--source=")) {
+			programs.push(programSource(part.slice("--source=".length)));
+			hasSourceOption = true;
+			continue;
+		}
+		if (part === "-v" || part === "--assign" || part === "-F" || part === "--field-separator") {
+			if (!operand(index)) continue;
+			index++;
+			continue;
+		}
+		if (part.startsWith("--assign=") || part.startsWith("--field-separator=")) continue;
+		if (part === "-f" || part === "--file" || part === "-E") {
+			if (!operand(index)) continue;
+			hasFileProgram = true;
+			index++;
+			continue;
+		}
+		if (part.startsWith("--file=") || (part.startsWith("-f") && part.length > 2)) {
+			hasFileProgram = true;
+			continue;
+		}
+		if (part.startsWith("-e") && part.length > 2) {
+			programs.push(programSource(part.slice(2)));
+			hasSourceOption = true;
+			continue;
+		}
+		if (part.startsWith("-v") && part.length > 2) continue;
+		if (part.startsWith("-F") && part.length > 2) continue;
+		if (part.startsWith("-") && noOperandOptions.has(part)) continue;
+		if (part.startsWith("-") && /^-[bcCghMnNPrStV]+$/.test(part)) continue;
+		if (part.startsWith("-")) {
+			unknown = true;
+			break;
+		}
+		if (hasFileProgram || hasSourceOption) break;
+		programs.push(programSource(word));
+		break;
+	}
+	return { programs, unknown };
+}
+
+function analyzeAwkProgram(program: string): { paths: string[]; unknown: boolean } {
+	const { tokens, balanced } = tokenizeAwkProgram(program);
+	const paths: string[] = [];
+	let unknown = !balanced;
+	let braceDepth = 0;
+	let parenDepth = 0;
+	let bracketDepth = 0;
+	let statementStart = true;
+	let pendingControlParen = false;
+	const controlParens: boolean[] = [];
+	let printStatement: { braceDepth: number; parenDepth: number; bracketDepth: number } | undefined;
+	for (let index = 0; index < tokens.length; index++) {
+		const token = tokens[index];
+		if (!token) continue;
+		if (token.kind === "separator") {
+			if (parenDepth === 0 && bracketDepth === 0) {
+				printStatement = undefined;
+				statementStart = true;
+				pendingControlParen = false;
+			}
+			continue;
+		}
+		if (token.kind === "string" || token.kind === "word") {
+			if (token.kind === "word" && statementStart && (token.value === "print" || token.value === "printf")) {
+				printStatement = { braceDepth, parenDepth, bracketDepth };
+				statementStart = false;
+				pendingControlParen = false;
+				continue;
+			}
+			if (token.kind === "word" && statementStart && ["for", "if", "while"].includes(token.value)) {
+				pendingControlParen = true;
+				statementStart = false;
+				continue;
+			}
+			if (token.kind === "word" && statementStart && ["do", "else"].includes(token.value)) {
+				statementStart = true;
+				pendingControlParen = false;
+				continue;
+			}
+			statementStart = false;
+			pendingControlParen = false;
+			continue;
+		}
+		if (token.value === "{") {
+			braceDepth++;
+			printStatement = undefined;
+			statementStart = true;
+			pendingControlParen = false;
+			continue;
+		}
+		if (token.value === "}") {
+			braceDepth--;
+			if (braceDepth < 0) unknown = true;
+			printStatement = undefined;
+			statementStart = true;
+			pendingControlParen = false;
+			continue;
+		}
+		if (token.value === "(") {
+			controlParens.push(pendingControlParen);
+			pendingControlParen = false;
+			parenDepth++;
+			statementStart = false;
+			continue;
+		}
+		if (token.value === ")") {
+			parenDepth--;
+			if (parenDepth < 0) unknown = true;
+			statementStart = controlParens.pop() ?? false;
+			continue;
+		}
+		if (token.value === "[") {
+			bracketDepth++;
+			statementStart = false;
+			continue;
+		}
+		if (token.value === "]") {
+			bracketDepth--;
+			if (bracketDepth < 0) unknown = true;
+			statementStart = false;
+			continue;
+		}
+		if (token.value === ">" || token.value === ">>") {
+			if (
+				printStatement &&
+				braceDepth === printStatement.braceDepth &&
+				parenDepth === printStatement.parenDepth &&
+				bracketDepth === printStatement.bracketDepth
+			) {
+				const destination = tokens[index + 1];
+				const trailing = tokens[index + 2];
+				if (
+					destination?.kind !== "string" ||
+					destination.escaped ||
+					(destination.value !== "" && trailing && trailing.kind !== "separator" && trailing.value !== "}")
+				) {
+					unknown = true;
+				} else if (destination.value) {
+					paths.push(destination.value);
+				} else {
+					unknown = true;
+				}
+			}
+			statementStart = false;
+			continue;
+		}
+		if (token.value === ";" && parenDepth === 0 && bracketDepth === 0) {
+			printStatement = undefined;
+			statementStart = true;
+			pendingControlParen = false;
+			continue;
+		}
+		statementStart = false;
+		pendingControlParen = false;
+	}
+	if (braceDepth !== 0 || parenDepth !== 0 || bracketDepth !== 0 || controlParens.length > 0) unknown = true;
+	return { paths, unknown };
+}
+
 function collectAwkProgramWrites(command: string, targets: ExtractedTargets): void {
 	for (const match of command.matchAll(BASH_AWK_COMMAND_RE)) {
-		const program = firstAwkProgram(shellWords(match[1] ?? "").map(cleanShellWord));
-		if (!program) continue;
-		for (const redirect of program.matchAll(/>>?\s*(["'])([^"']+)\1/g)) {
+		const matchIndex = match.index ?? 0;
+		if (!shellSyntaxPosition(command, matchIndex)) continue;
+		const matchEnd = matchIndex + match[0].length;
+		const { programs, unknown } = awkPrograms(shellWords(match[1] ?? ""));
+		if (!shellSyntaxPosition(command, matchEnd, true) || unknown) {
 			targets.explicitMutation = true;
-			const destination = redirect[2] ?? "";
-			if (!destination) targets.unknown = true;
-			else if (!isDeviceSinkPath(destination)) addPath(targets, destination);
+			targets.unknown = true;
+		}
+		for (const program of programs) {
+			if (program.expanded) {
+				targets.explicitMutation = true;
+				targets.unknown = true;
+			}
+			const analyzed = analyzeAwkProgram(program.source);
+			if (analyzed.unknown) {
+				targets.explicitMutation = true;
+				targets.unknown = true;
+			}
+			for (const destination of analyzed.paths) {
+				targets.explicitMutation = true;
+				if (!isDeviceSinkPath(destination)) addPath(targets, destination);
+			}
 		}
 	}
 }
@@ -1901,7 +2434,7 @@ function extractBashTargets(args: unknown, depth = 0): ExtractedTargets {
 	}
 	// `sed w file` and `s///w file` write without `-i`. `awk 'print > "file"'`
 	// writes inside the program, which is not a shell redirection.
-	collectInterpreterOneLinerWrites(heredoc.masked, targets);
+	collectInterpreterOneLinerWrites(heredoc.masked, targets, depth);
 	collectSedScriptWrites(heredoc.masked, targets);
 	collectAwkProgramWrites(heredoc.masked, targets);
 	return targets;
