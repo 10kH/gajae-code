@@ -357,6 +357,18 @@ describe("planMigration — slash commands", () => {
 		]);
 	});
 
+	test("skill invocation command names are namespaced by source", async () => {
+		const candidate = result({ slashCommandCandidates: [slashCommand("skill:foo")] });
+		const { actions } = await planMigration({ results: [candidate], destinations: dest, force: false });
+
+		expect(actions[0]).toMatchObject({
+			name: "claude-code:skill:foo",
+			destination: path.join(dest.commandsDir, "claude-code", "skill", "foo.md"),
+			operation: "create",
+			status: "imported",
+		});
+	});
+
 	test("existing commands are skipped by default and updated only with force", async () => {
 		await fs.mkdir(dest.commandsDir, { recursive: true });
 		const destination = path.join(dest.commandsDir, "review.md");

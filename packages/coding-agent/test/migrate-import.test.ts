@@ -2,10 +2,20 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Agent } from "@gajae-code/agent-core";
+import { type Context, getBundledModel } from "@gajae-code/ai";
+import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { resetAgentDirFromEnvironment, setAgentDir } from "@gajae-code/utils";
 import { runMigrate } from "../src/cli/migrate-cli";
+import { ModelRegistry } from "../src/config/model-registry";
+import { Settings } from "../src/config/settings";
+import { loadSkillsFromDir } from "../src/extensibility/skills";
 import { expandSlashCommand, loadSlashCommands } from "../src/extensibility/slash-commands";
 import { readMCPConfigFile } from "../src/runtime-mcp/config-writer";
+import { AgentSession } from "../src/session/agent-session";
+import { AuthStorage } from "../src/session/auth-storage";
+import { convertToLlm } from "../src/session/messages";
+import { SessionManager } from "../src/session/session-manager";
 
 let home: string;
 let cwd: string;
@@ -197,6 +207,73 @@ describe("end-to-end import", () => {
 		const commands = await loadSlashCommands({ cwd });
 		expect(commands).toContainEqual(expect.objectContaining({ name: "claude-code:help" }));
 		expect(expandSlashCommand("/claude-code:help project", commands)).toContain("Help project.");
+	});
+
+	test("migrated commands in the skill namespace dispatch as file commands", async () => {
+		const skillContent = "---\ndescription: Skill-only content.\n---\nSKILL-ONLY: this is the skill body.";
+		const commandContent = "COMMAND PAYLOAD: $ARGUMENTS.";
+		await write(".claude/skills/foo/SKILL.md", skillContent);
+		await fs.mkdir(path.join(cwd, ".claude", "commands", "skill"), { recursive: true });
+		await fs.writeFile(path.join(cwd, ".claude", "commands", "skill", "foo.md"), commandContent, "utf-8");
+
+		const report = await runMigrate(opts({ from: ["claude-code"] }));
+		const commandPath = path.join(cwd, ".gjc", "commands", "claude-code", "skill", "foo.md");
+		expect(report.actions).toContainEqual(
+			expect.objectContaining({
+				type: "command",
+				name: "claude-code:skill:foo",
+				status: "imported",
+				destination: commandPath,
+			}),
+		);
+		expect(report.summary.byType.skill.imported).toBe(1);
+
+		const loadedSkills = await loadSkillsFromDir({ dir: path.join(cwd, ".gjc", "skills"), source: "native:project" });
+		const slashCommands = await loadSlashCommands({ cwd });
+		expect(loadedSkills.skills).toContainEqual(expect.objectContaining({ name: "foo" }));
+		expect(slashCommands).toContainEqual(expect.objectContaining({ name: "claude-code:skill:foo" }));
+
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
+		const authStorage = await AuthStorage.create(path.join(home, "testauth.db"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const modelRegistry = new ModelRegistry(authStorage);
+		const contexts: Context[] = [];
+		const mockModel = createMockModel({ responses: [{ content: ["Done"] }] });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			convertToLlm,
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (streamModel, context, streamOptions) => {
+				contexts.push(structuredClone(context));
+				return mockModel.stream(streamModel, context, streamOptions);
+			},
+		});
+		const session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(cwd),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry,
+			skills: loadedSkills.skills,
+			slashCommands,
+		});
+
+		try {
+			await session.prompt("/claude-code:skill:foo src/private.ts");
+
+			const userTexts = contexts.flatMap(context =>
+				context.messages.flatMap(message => {
+					if (message.role !== "user") return [];
+					if (typeof message.content === "string") return [message.content];
+					return message.content.filter(block => block.type === "text").map(block => block.text);
+				}),
+			);
+			expect(userTexts.join("\n")).toContain("COMMAND PAYLOAD: src/private.ts.");
+			expect(userTexts.join("\n")).not.toContain("SKILL-ONLY:");
+		} finally {
+			await session.dispose();
+			authStorage.close();
+		}
 	});
 
 	test("Codex prompts import as native slash commands, not skills", async () => {

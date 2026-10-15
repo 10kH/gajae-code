@@ -92,6 +92,8 @@ Nested Claude command paths become colon-separated names, so
 Names that collide with a GJC built-in command or alias are namespaced under
 their source; for example, `.claude/commands/help.md` becomes
 `/claude-code:help` instead of shadowing the built-in `/help`.
+Commands in the reserved `/skill:<name>` invocation prefix are also namespaced;
+for example, `.claude/commands/skill/foo.md` becomes `/claude-code:skill:foo`.
 Command Markdown and frontmatter are preserved; GJC uses the `description`
 field and its own argument placeholders, but does not translate Claude-specific
 metadata such as tool restrictions or model selection.

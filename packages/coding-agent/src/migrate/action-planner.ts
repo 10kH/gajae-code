@@ -107,9 +107,11 @@ interface ExistingCommandDestination {
 
 type ExistingCommandNameIndex = Map<string, ExistingCommandDestination[]>;
 
-function avoidBuiltinSlashCommandName(source: string, name: string): string {
+function avoidReservedSlashCommandName(source: string, name: string): string {
 	let safeName = name;
-	while (lookupBuiltinSlashCommand(safeName)) safeName = `${source}:${safeName}`;
+	while (lookupBuiltinSlashCommand(safeName) || safeName.toLowerCase().startsWith("skill:")) {
+		safeName = `${source}:${safeName}`;
+	}
 	return safeName;
 }
 
@@ -526,7 +528,7 @@ export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 	const validCommandNameSegment = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 	for (const result of input.results) {
 		for (const candidate of result.slashCommandCandidates) {
-			const name = avoidBuiltinSlashCommandName(candidate.source, candidate.name);
+			const name = avoidReservedSlashCommandName(candidate.source, candidate.name);
 			const nameParts = name.split(":");
 			if (!nameParts.every(part => validCommandNameSegment.test(part))) {
 				actions.push({
