@@ -179,13 +179,13 @@ export function redactCrashSecrets(text: string): string {
 	);
 	// Basic-auth credentials embedded in a URL. Scheme and host stay readable
 	// because they are the diagnostic value; only the userinfo is dropped. The
-	// scheme repetition is bounded: an unbounded `[a-z0-9+.-]*` in front of the
-	// literal `://` re-tries every prefix of a long alphabetic run, which is
-	// quadratic in input length and costs ~10s on a 200 KB crash body. The greedy
-	// authority scan consumes raw `@` characters in userinfo through its delimiter.
+	// boundary is consumed so the unbounded scheme scan starts only at the start
+	// of a scheme-character run, avoiding quadratic retries while accepting long
+	// standards-compliant schemes. The greedy authority scan consumes raw `@`
+	// characters in userinfo through its delimiter.
 	redacted = redacted.replace(
-		/(?<![A-Za-z0-9+.-])([a-z][a-z0-9+.-]{0,15}:\/\/)[^/\s?#]*@/gi,
-		"$1«redacted-url-credential»@",
+		/(^|[^A-Za-z0-9+.-])([a-z][a-z0-9+.-]*:\/\/)[^/\s?#]*@/gi,
+		"$1$2«redacted-url-credential»@",
 	);
 	// AKIA is the long-term access key id; ASIA is the temporary/STS one, which is
 	// the shape that actually shows up in a crashed request. ABIA (bearer) and

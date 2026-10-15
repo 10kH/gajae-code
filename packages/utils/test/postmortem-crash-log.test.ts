@@ -673,6 +673,7 @@ describe("recordFatalCrash", () => {
 		const urlSecret = "s3cr3tvalue";
 		const wrappedUrlSecret = "wrapped-s3cr3t";
 		const rawAtUrlPassword = "correct@horse";
+		const longSchemeUrlPassword = "opaque-database-password";
 		const err = new Error(
 			[
 				`fetch failed: ${googleApiKey} ${trailingHyphenGoogleApiKey}`,
@@ -680,6 +681,7 @@ describe("recordFatalCrash", () => {
 				`clone: https://deploy:${urlSecret}@git.example.com/x.git`,
 				`wrapped: _https://deploy:${wrappedUrlSecret}@git.example.com/x.git_`,
 				`raw-at: https://alice:${rawAtUrlPassword}@example.com/repo.git?keep=1`,
+				`database: postgresql+asyncpg://alice:${longSchemeUrlPassword}@example.com/db`,
 				`-----BEGIN RSA PRIVATE KEY-----\n${pemBody}\n-----END RSA PRIVATE KEY-----`,
 			].join(" "),
 		);
@@ -695,6 +697,7 @@ describe("recordFatalCrash", () => {
 		expect(contents).not.toContain(urlSecret);
 		expect(contents).not.toContain(wrappedUrlSecret);
 		expect(contents).not.toContain(rawAtUrlPassword);
+		expect(contents).not.toContain(longSchemeUrlPassword);
 		expect(contents).not.toContain(pemBody);
 		expect(contents).toContain("«redacted-google-api-key»");
 		expect(contents).toContain("«redacted-private-key»");
@@ -702,12 +705,13 @@ describe("recordFatalCrash", () => {
 		expect(contents).toContain("https://«redacted-url-credential»@git.example.com");
 		expect(contents).toContain("_https://«redacted-url-credential»@git.example.com/x.git_");
 		expect(contents).toContain("raw-at: https://«redacted-url-credential»@example.com/repo.git?keep=1");
+		expect(contents).toContain("postgresql+asyncpg://«redacted-url-credential»@example.com/db");
 	});
 
 	it("scans a large credential-free crash body in linear time", () => {
-		// The url-credential rule bounds its scheme repetition. Unbounded, it
-		// re-tries every prefix of a long alphabetic run before failing on `://`,
-		// which is quadratic in body length and cost ~10s on 200 KB.
+		// The URL rule consumes its left boundary, so a long alphabetic run is
+		// attempted once rather than at every suffix. Keep this no-URL body within
+		// budget to guard against quadratic rescanning.
 		const target = tempCrashLog();
 		const startedAt = performance.now();
 		recordFatalCrash("Uncaught Exception", new Error("x".repeat(200_000)), { path: target });

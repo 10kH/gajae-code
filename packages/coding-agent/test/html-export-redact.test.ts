@@ -85,6 +85,7 @@ describe("session HTML export embed", () => {
 				role: "user",
 				content: [
 					"clone: https://alice:correct@horse@example.com/repo.git?keep=1",
+					"database: postgresql+asyncpg://alice:opaque-database-password@example.com/db",
 					"credentials={primary:`alpha}suffix`,secondary:`beta-secret`}",
 					"cookie=session=topsecret; csrf=alsosecret",
 					"set_cookie=refresh=opaque-refresh-cookie; xsrf=opaque-xsrf-token",
@@ -96,6 +97,7 @@ describe("session HTML export embed", () => {
 			const embedded = embeddedSessionText(await Bun.file(outputPath).text());
 			for (const secret of [
 				"correct@horse",
+				"opaque-database-password",
 				"alpha}suffix",
 				"beta-secret",
 				"topsecret",
@@ -106,6 +108,7 @@ describe("session HTML export embed", () => {
 				expect(embedded).not.toContain(secret);
 			}
 			expect(embedded).toContain("https://«redacted-url-credential»@example.com/repo.git?keep=1");
+			expect(embedded).toContain("postgresql+asyncpg://«redacted-url-credential»@example.com/db");
 			expect(embedded).toContain("credentials=«redacted»");
 			expect(embedded).toContain("cookie=«redacted»");
 			expect(embedded).toContain("set_cookie=«redacted»");
