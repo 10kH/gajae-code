@@ -765,6 +765,76 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 		}
 	});
 
+	it("stops a root waiter promptly when the daemon shuts down during a renewed peer lease", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-root-shutdown-waiter-"));
+		const releasePost = Promise.withResolvers<void>();
+		let first: SlackNotificationDaemon | undefined;
+		let second: SlackNotificationDaemon | undefined;
+		let publisher: Promise<SlackConversation> | undefined;
+		let waiter: Promise<{ status: "fulfilled" } | { status: "rejected"; error: unknown }> | undefined;
+		try {
+			const fake = new FakeSlack();
+			fake.postGate = releasePost.promise;
+			const base = {
+				agentDir,
+				repo: agentDir,
+				teamId: "T1",
+				channelId: "C1",
+				provider: new SlackProvider(fake),
+				resolveAttachment: async (sessionId: string) => endpoint(sessionId),
+				publicationLeaseMs: 100,
+			};
+			first = new SlackNotificationDaemon({
+				...base,
+				randomId: () => "stable-root-id",
+				publicationOwnerId: "first",
+			});
+			second = new SlackNotificationDaemon({
+				...base,
+				randomId: () => "stable-root-id",
+				publicationOwnerId: "second",
+			});
+			const publisherResult = first.postRoot("session", "root");
+			publisher = publisherResult;
+			await fake.waitForPostStartCount(1);
+			const waiterResult = second.notify("session", "question", "action").then(
+				() => ({ status: "fulfilled" as const }),
+				error => ({ status: "rejected" as const, error }),
+			);
+			waiter = waiterResult;
+			await Bun.sleep(50);
+			const pending = await second.store.read("T1:C1:intent:session");
+			expect(pending).toMatchObject({ state: "posting_root", rootPublicationOwner: "first" });
+			expect(pending?.rootPublicationLeaseExpiresAt).toBeGreaterThan(Date.now());
+			const waiterStillWaiting = await Promise.race([
+				waiterResult.then(() => false),
+				Bun.sleep(25).then(() => true),
+			]);
+			expect(waiterStillWaiting).toBe(true);
+
+			const stopping = second.stop();
+			const outcome = await Promise.race([waiterResult, Bun.sleep(250).then(() => undefined)]);
+			expect(outcome?.status).toBe("rejected");
+			if (outcome?.status !== "rejected") throw new Error("Slack root waiter did not stop with its daemon");
+			if (!(outcome.error instanceof Error)) throw new Error("Slack root waiter shutdown was not an Error");
+			expect(outcome.error.message).toContain("daemon stopped while waiting");
+			const stoppedPromptly = await Promise.race([stopping.then(() => true), Bun.sleep(250).then(() => false)]);
+			expect(stoppedPromptly).toBe(true);
+			await stopping;
+			expect(fake.postStarts).toBe(1);
+
+			releasePost.resolve();
+			await expect(publisherResult).resolves.toMatchObject({ state: "active", rootTs: "1.1" });
+		} finally {
+			releasePost.resolve();
+			await second?.stop();
+			if (waiter) await waiter;
+			if (publisher) await publisher;
+			await first?.stop();
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
 	it("stops a concurrent root waiter when attachment retirement closes an in-flight post", async () => {
 		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-root-retirement-"));
 		const releasePost = Promise.withResolvers<void>();

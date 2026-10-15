@@ -801,6 +801,7 @@ export class SlackNotificationDaemon {
 		endpointGeneration?: number,
 		requestedClientMsgId?: string,
 	): Promise<SlackRootPublication> {
+		const lifecycleGeneration = this.#lifecycleGeneration;
 		const endpoint = await this.#resolveAttachment(sessionId);
 		if (!endpoint || (endpointGeneration !== undefined && endpoint.generation !== endpointGeneration))
 			throw new SlackEndpointBindingError("Slack root publication requires the current session endpoint.");
@@ -861,7 +862,14 @@ export class SlackNotificationDaemon {
 		if (!pending?.clientMsgId) throw new Error("Unable to persist Slack root post intent");
 		if (!claimed)
 			return {
-				conversation: await this.#waitForRoot(pendingKey, sessionId, body, generation, endpoint.authorityId),
+				conversation: await this.#waitForRoot(
+					pendingKey,
+					sessionId,
+					body,
+					generation,
+					lifecycleGeneration,
+					endpoint.authorityId,
+				),
 				created: false,
 			};
 		if (pending.endpointGeneration !== generation) throw new SlackEndpointBindingError();
@@ -931,7 +939,14 @@ export class SlackNotificationDaemon {
 		if (!active) throw new Error("Slack root mapping disappeared");
 		if (active.state !== "active")
 			return {
-				conversation: await this.#waitForRoot(pendingKey, sessionId, body, generation, endpoint.authorityId),
+				conversation: await this.#waitForRoot(
+					pendingKey,
+					sessionId,
+					body,
+					generation,
+					lifecycleGeneration,
+					endpoint.authorityId,
+				),
 				created: false,
 			};
 		return { conversation: active, created: createdRootEffect };
@@ -3280,16 +3295,25 @@ export class SlackNotificationDaemon {
 		sessionId: string,
 		body: string,
 		endpointGeneration: number,
+		lifecycleGeneration: number,
 		attachmentAuthorityId?: string,
 	): Promise<SlackConversation> {
 		// Another owner may renew this lease while provider work is active, so wait for the durable transition.
 		while (true) {
+			if (lifecycleGeneration !== this.#lifecycleGeneration)
+				throw new Error("Slack daemon stopped while waiting for root publication");
 			await Bun.sleep(ROOT_PUBLICATION_POLL_MS);
+			if (lifecycleGeneration !== this.#lifecycleGeneration)
+				throw new Error("Slack daemon stopped while waiting for root publication");
 			const current = await this.store.read(key);
+			if (lifecycleGeneration !== this.#lifecycleGeneration)
+				throw new Error("Slack daemon stopped while waiting for root publication");
 			if (current?.state === "active") {
 				const currentGeneration = this.#requireEndpointGeneration(current);
 				if (currentGeneration === endpointGeneration) {
 					const endpoint = await this.#resolveAttachment(sessionId);
+					if (lifecycleGeneration !== this.#lifecycleGeneration)
+						throw new Error("Slack daemon stopped while waiting for root publication");
 					if (
 						!endpoint?.isCurrent() ||
 						endpoint.sessionId !== sessionId ||
@@ -3309,6 +3333,8 @@ export class SlackNotificationDaemon {
 				if (currentGeneration > endpointGeneration)
 					throw new SlackEndpointBindingError("Slack root belongs to a newer endpoint generation.");
 				const endpoint = await this.#resolveAttachment(sessionId);
+				if (lifecycleGeneration !== this.#lifecycleGeneration)
+					throw new Error("Slack daemon stopped while waiting for root publication");
 				if (
 					!endpoint?.isCurrent() ||
 					endpoint.sessionId !== sessionId ||
