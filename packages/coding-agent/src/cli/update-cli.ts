@@ -11,7 +11,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { exactReplaceRetained, exactUnlink } from "@gajae-code/natives";
-import { $which, APP_NAME, isCompiledBinary, isEnoent, redactCrashSecrets, VERSION } from "@gajae-code/utils";
+import { $which, APP_NAME, isCompiledBinary, isEnoent, logger, redactCrashSecrets, VERSION } from "@gajae-code/utils";
 import { $ } from "bun";
 import chalk from "chalk";
 import { acquireFileLock } from "../config/file-lock";
@@ -1364,7 +1364,8 @@ async function updateViaBinaryAt(
 		beforeReplace: () => console.log(chalk.dim("Installing update...")),
 	});
 
-	if (verification.cleanupWarning) console.warn(chalk.yellow(verification.cleanupWarning));
+	if (verification.cleanupWarning)
+		logger.warn("Update staging cleanup failed", { warning: verification.cleanupWarning });
 	return verification;
 }
 
