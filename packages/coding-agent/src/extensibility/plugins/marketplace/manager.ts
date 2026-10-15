@@ -858,9 +858,10 @@ export class MarketplaceManager {
 			});
 			if (finalStat?.isSymbolicLink()) throw new MarketplaceRestoreError("final_path_is_symlink");
 			const hadFinal = finalStat !== undefined;
-			// Single-component name; never renamed elsewhere on collision since the
-			// native no-replace primitive is what actually refuses an occupied slot.
-			const backup = `${finalPath}.restore-backup-${process.pid}-${randomBytes(6).toString("hex")}`;
+			// Keep the private backup component bounded independently of the canonical
+			// cache basename, which can itself be near NAME_MAX through a long version.
+			const backupName = `.gjc-restore-backup-${createHash("sha256").update(finalPath).digest("hex")}-${randomBytes(12).toString("hex")}`;
+			const backup = path.join(pluginsCacheDir, backupName);
 
 			const parentRecheck = await fs.lstat(pluginsCacheDir, { bigint: true }).catch(() => undefined);
 			if (!parentRecheck || parentRecheck.dev !== parentBefore.dev || parentRecheck.ino !== parentBefore.ino)
