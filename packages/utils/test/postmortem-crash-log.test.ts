@@ -288,6 +288,25 @@ describe("recordFatalCrash", () => {
 		expect(redactCrashSecrets("authToken={nested:opaque-secret}")).toBe("authToken=«redacted»");
 	});
 
+	it("redacts compound camelCase token and client-secret suffixes", () => {
+		for (const key of [
+			"githubAccessToken",
+			"googleRefreshToken",
+			"awsSessionToken",
+			"oidcIdToken",
+			"oauthClientSecret",
+		]) {
+			expect(isCredentialKey(key)).toBe(true);
+		}
+		expect(
+			redactCrashSecrets(
+				"githubAccessToken=opaque-access-token googleRefreshToken=opaque-refresh-token awsSessionToken=opaque-session-token oidcIdToken=opaque-id-token oauthClientSecret=opaque-client-secret",
+			),
+		).toBe(
+			"githubAccessToken=«redacted» googleRefreshToken=«redacted» awsSessionToken=«redacted» oidcIdToken=«redacted» oauthClientSecret=«redacted»",
+		);
+	});
+
 	it("redacts complete values for nonstandard authorization schemes", () => {
 		expect(redactCrashSecrets("Authorization: ApiKey opaque-secret\nnext=keep")).toBe(
 			"Authorization: «redacted»\nnext=keep",
