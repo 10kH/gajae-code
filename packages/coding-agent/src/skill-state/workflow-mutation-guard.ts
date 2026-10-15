@@ -1794,6 +1794,28 @@ function nextCallArg(code: string, end: number): { raw: string; end: number } | 
 	return readArg(code, cursor + 1);
 }
 
+/** Whitespace or a backslash-newline may sit before an attribute (`shutil .copy`). */
+function skipCallGap(code: string, index: number): number {
+	let cursor = index;
+	while (cursor < code.length) {
+		const character = code[cursor] ?? "";
+		if (/\s/.test(character)) {
+			cursor += 1;
+			continue;
+		}
+		if (character === "\\" && code[cursor + 1] === "\n") {
+			cursor += 2;
+			continue;
+		}
+		if (character === "\\" && code[cursor + 1] === "\r" && code[cursor + 2] === "\n") {
+			cursor += 3;
+			continue;
+		}
+		break;
+	}
+	return cursor;
+}
+
 function literalWrite(targets: ExtractedTargets, raw: string | undefined, write: boolean | null): void {
 	if (write === false) return;
 	targets.explicitMutation = true;
@@ -1829,12 +1851,13 @@ function scanInterpreterWrites(code: string, language: "py" | "js", targets: Ext
 			index += name.length;
 			continue;
 		}
-		let cursor = index + name.length;
+		let cursor = skipCallGap(code, index + name.length);
 		let dotted = "";
 		if (code[cursor] === ".") {
-			const dot = /^\w+/.exec(code.slice(cursor + 1));
+			const methodAt = skipCallGap(code, cursor + 1);
+			const dot = /^\w+/.exec(code.slice(methodAt));
 			dotted = dot?.[0] ?? "";
-			cursor += 1 + dotted.length;
+			cursor = methodAt + dotted.length;
 		}
 		const paren = /^\s*\(/.exec(code.slice(cursor));
 		const helper = (name === "write" || name === "append") && dotted === "";

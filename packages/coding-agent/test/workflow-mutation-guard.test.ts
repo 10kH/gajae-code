@@ -1938,4 +1938,53 @@ describe("bash scanner quoting model", () => {
 		expect(decision.reason).toBe("workflow-state-target");
 		expect(decision.message).toContain("runtime-owned");
 	});
+
+	it("blocks a qualified copy or rename destination when a gap precedes the attribute", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		const cases: Array<[string, unknown]> = [
+			["python", { code: 'shutil .copy("/tmp/a.md", "src/product.ts")\n' }],
+			["python", { code: 'os .rename("/tmp/a.md", "src/product.ts")\n' }],
+			["python", { code: 'shutil\\\n.copy("/tmp/a.md", "src/product.ts")\n' }],
+			["eval", { cells: [{ language: "js", code: 'fs .renameSync("/tmp/a.md", "src/product.ts")\n' }] }],
+		];
+		for (const [name, args] of cases) {
+			const input = { cwd, sessionId: "session-a", tool: tool(name), args };
+			await expect(assertWorkflowMutationAllowed(input)).rejects.toBeInstanceOf(ToolError);
+			const decision = await getWorkflowMutationDecision(input);
+			expect(decision.blocked, `${name} ${JSON.stringify(args)}`).toBe(true);
+			expect(decision.targets, `${name} ${JSON.stringify(args)}`).toContain("src/product.ts");
+			expect(decision.reason).toBe("phase-boundary");
+		}
+		const scratch = await getWorkflowMutationDecision({
+			cwd,
+			sessionId: "session-a",
+			tool: tool("python"),
+			args: { code: 'shutil .copy("/tmp/a.md", "/tmp/b.md")\n' },
+		});
+		expect(scratch.blocked).toBe(false);
+		expect(scratch.targets).toContain("/tmp/b.md");
+
+		await writeActiveSkill(cwd, "autoresearch", "research");
+		const research = await getWorkflowMutationDecision({
+			cwd,
+			sessionId: "session-a",
+			tool: tool("python"),
+			args: { code: 'os .rename("/tmp/a.md", "src/product.ts")\n' },
+		});
+		expect(research.blocked).toBe(true);
+		expect(research.targets).toContain("src/product.ts");
+		expect(research.message).toContain("research-only");
+	});
+
+	it("still allows a gapped qualified copy when planning is inactive", async () => {
+		const cwd = await makeTempRoot();
+		const decision = await getWorkflowMutationDecision({
+			cwd,
+			sessionId: "session-a",
+			tool: tool("python"),
+			args: { code: 'shutil .copy("/tmp/a.md", "src/product.ts")\n' },
+		});
+		expect(decision.blocked).toBe(false);
+	});
 });
