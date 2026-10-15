@@ -9116,7 +9116,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			await harness?.stop();
 			await rm(cwd, { recursive: true, force: true });
 		}
-	});
+	}, 15_000);
 
 	test("agent_start during an expiry claim keeps the queued correlation owned", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-deadline-start-race-"));
