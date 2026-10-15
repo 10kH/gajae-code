@@ -314,4 +314,20 @@ describe("end-to-end import", () => {
 		);
 		expect(await fs.readFile(destination, "utf-8")).toBe("Imported instructions.");
 	});
+
+	test("forced case-equivalent command updates report the loaded command name", async () => {
+		await fs.mkdir(path.join(cwd, ".claude", "commands"), { recursive: true });
+		await fs.writeFile(path.join(cwd, ".claude", "commands", "review.md"), "Imported $ARGUMENTS.", "utf-8");
+		const destination = path.join(cwd, ".gjc", "commands", "Review.md");
+		await fs.mkdir(path.dirname(destination), { recursive: true });
+		await fs.writeFile(destination, "Existing command.", "utf-8");
+
+		const report = await runMigrate(opts({ from: ["claude-code"], force: true }));
+		expect(report.actions).toContainEqual(
+			expect.objectContaining({ type: "command", name: "Review", destination, status: "updated" }),
+		);
+		const commands = await loadSlashCommands({ cwd });
+		expect(commands).toContainEqual(expect.objectContaining({ name: "Review" }));
+		expect(expandSlashCommand("/Review this", commands)).toContain("Imported this.");
+	});
 });

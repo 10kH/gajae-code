@@ -370,7 +370,7 @@ describe("planMigration — slash commands", () => {
 
 		const forced = await planMigration({ results, destinations: dest, force: true });
 		expect(forced.actions[1]).toMatchObject({
-			name: "review",
+			name: "Review",
 			destination: path.join(dest.commandsDir, "Review.md"),
 			operation: "update",
 			status: "updated",
@@ -394,9 +394,24 @@ describe("planMigration — slash commands", () => {
 		});
 		const forced = await planMigration({ results: [candidate], destinations: dest, force: true });
 		expect(forced.actions[0]).toMatchObject({
+			name: "Review",
 			destination: existingDestination,
 			operation: "update",
 			status: "updated",
+		});
+	});
+
+	test("case-equivalent extension aliases are not treated as discoverable commands", async () => {
+		await fs.mkdir(dest.commandsDir, { recursive: true });
+		const existingDestination = path.join(dest.commandsDir, "Review.MD");
+		await fs.writeFile(existingDestination, "Existing command.", "utf-8");
+		const candidate = result({ slashCommandCandidates: [slashCommand("review", "Imported prompt.")] });
+
+		const forced = await planMigration({ results: [candidate], destinations: dest, force: true });
+		expect(forced.actions[0]).toMatchObject({
+			operation: "fail",
+			status: "failed_invalid_destination",
+			reason: "destination filename must end in lowercase .md for native slash-command discovery",
 		});
 	});
 

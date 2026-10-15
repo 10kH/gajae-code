@@ -93,6 +93,14 @@ function isStrictPathPrefix(prefix: string[], candidate: string[]): boolean {
 	return prefix.length < candidate.length && prefix.every((segment, index) => segment === candidate[index]);
 }
 
+function commandNameFromDestination(commandsDir: string, destination: string): string {
+	const segments = path.relative(commandsDir, destination).split(path.sep);
+	const filename = segments.pop();
+	if (!filename?.endsWith(".md")) throw new Error(`command destination does not end in .md: ${destination}`);
+	segments.push(filename.slice(0, -3));
+	return segments.join(":");
+}
+
 /** Resolve case-equivalent existing paths so command collisions stay portable. */
 async function inspectCommandDestination(
 	commandsDir: string,
@@ -140,6 +148,13 @@ async function inspectCommandDestination(
 				destination: entryPath,
 				exists: false,
 				unsafeReason: "destination is not a regular file; refusing to replace it",
+			};
+		}
+		if (!entry.name.endsWith(".md")) {
+			return {
+				destination: entryPath,
+				exists: false,
+				unsafeReason: "destination filename must end in lowercase .md for native slash-command discovery",
 			};
 		}
 		return { destination: entryPath, exists: true };
@@ -481,6 +496,7 @@ export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 				if (input.force) {
 					actions.push({
 						...base,
+						name: plannedCommand.name,
 						operation: "update",
 						status: "updated",
 						reason: `${collisionReason} (overwritten under --force)`,
@@ -581,6 +597,8 @@ export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 				plannedCommands.set(collisionKey, { name: candidate.name, destination, segments: destinationSegments });
 				continue;
 			}
+			const effectiveName = commandNameFromDestination(input.destinations.commandsDir, destination);
+			base = { ...base, name: effectiveName };
 
 			if (inspection.exists && !input.force) {
 				actions.push({ ...base, operation: "skip", status: "skipped_exists" });
@@ -592,7 +610,7 @@ export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 					command: { content: candidate.content },
 				});
 			}
-			plannedCommands.set(collisionKey, { name: candidate.name, destination, segments: destinationSegments });
+			plannedCommands.set(collisionKey, { name: effectiveName, destination, segments: destinationSegments });
 		}
 	}
 
