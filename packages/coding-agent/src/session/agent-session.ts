@@ -2011,6 +2011,7 @@ const PERMISSION_REQUIRED_TOOLS = new Set([
 	"github",
 	"computer",
 	"python",
+	"recipe",
 ]);
 
 function isShellExecutionPermissionTool(toolName: string): boolean {
@@ -2018,7 +2019,12 @@ function isShellExecutionPermissionTool(toolName: string): boolean {
 }
 
 function isExecutionPermissionTool(toolName: string): boolean {
-	return isShellExecutionPermissionTool(toolName) || toolName === "eval" || toolName === "python";
+	return (
+		isShellExecutionPermissionTool(toolName) ||
+		toolName === "eval" ||
+		toolName === "python" ||
+		toolName === "recipe"
+	);
 }
 
 /** Permission options presented to the client on each gated tool call. */
@@ -2105,6 +2111,10 @@ function getPermissionIntent(
 		if (action === "clear") return { toolName, title: "python clear", cacheKey: toolName };
 		const code = getStringProperty(a, "code")?.slice(0, 80);
 		return { toolName, title: code && code.length > 0 ? code : "python", cacheKey: toolName };
+	}
+	if (toolName === "recipe") {
+		const op = getStringProperty(a, "op")?.slice(0, 80);
+		return { toolName, title: op && op.length > 0 ? op : "recipe", cacheKey: toolName };
 	}
 	if (toolName === "delete") {
 		const p = getStringProperty(a, "path");
