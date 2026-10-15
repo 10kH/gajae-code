@@ -392,6 +392,17 @@ describe("recordFatalCrash", () => {
 		);
 	});
 
+	it("redacts separated and camelCase secret key base fields", () => {
+		const keys = ["secret_key_base", "SECRET_KEY_BASE", "secretKeyBase"];
+		for (const key of keys) expect(isCredentialKey(key)).toBe(true);
+		expect(
+			redactCrashSecrets(
+				"secret_key_base=opaque-snake-base SECRET_KEY_BASE=opaque-uppercase-base secretKeyBase=opaque-camel-base",
+			),
+		).toBe("secret_key_base=«redacted» SECRET_KEY_BASE=«redacted» secretKeyBase=«redacted»");
+		expect(redactCrashSecrets('{"secretKeyBase":"opaque-json-base"}')).toBe('{"secretKeyBase":"«redacted»"}');
+	});
+
 	it("redacts passphrase credential-key variants", () => {
 		for (const key of ["passphrase", "sshPassphrase", "key_passphrase", "SSH_PASSPHRASE"]) {
 			expect(isCredentialKey(key)).toBe(true);

@@ -8,7 +8,7 @@
  */
 
 const CREDENTIAL_KEY_LABELS =
-	"api[._-]?key|apikey|access[._-]?token|refresh[._-]?token|id[._-]?token|session[._-]?key|session[._-]?token|client[._-]?secret|aws[._-]?secret[._-]?access[._-]?key|secret[._-]?key|secret[._-]?access[._-]?key|encryption[._-]?key|signing[._-]?key|password|passwd|pwd|passphrase|auth|authorization|bearer|private[._-]?token|token|secrets?|credentials?|private[._-]?key|cookie";
+	"api[._-]?key|apikey|access[._-]?token|refresh[._-]?token|id[._-]?token|session[._-]?key|session[._-]?token|client[._-]?secret|aws[._-]?secret[._-]?access[._-]?key|secret[._-]?key[._-]?base|secret[._-]?key|secret[._-]?access[._-]?key|encryption[._-]?key|signing[._-]?key|password|passwd|pwd|passphrase|auth|authorization|bearer|private[._-]?token|token|secrets?|credentials?|private[._-]?key|cookie";
 const CREDENTIAL_KEY_PREFIX = `(?:[A-Za-z0-9][A-Za-z0-9_.-]*[_.-])?`;
 const CREDENTIAL_KEY_PATTERN = `${CREDENTIAL_KEY_PREFIX}(?:${CREDENTIAL_KEY_LABELS})`;
 const CREDENTIAL_KEY_SUFFIX = new RegExp(`^${CREDENTIAL_KEY_PATTERN}$`, "i");
