@@ -87,6 +87,7 @@ const TRUST_KEYS = [
 	"https_proxy",
 	"all_proxy",
 	"no_proxy",
+	"OPENSSL_CONF",
 	"SSL_CERT_FILE",
 	"SSL_CERT_DIR",
 	"LD_PRELOAD",
@@ -140,6 +141,7 @@ interface GhSpawn {
 	PHPRC: string | null;
 	PHP_INI_SCAN_DIR: string | null;
 	DOTNET_STARTUP_HOOKS: string | null;
+	OPENSSL_CONF: string | null;
 	profilerEnvironment: Record<ClrProfilerEnvironmentKey, string | null>;
 	GH_HOST: string | null;
 	GH_CONFIG_DIR: string | null;
@@ -241,6 +243,7 @@ await fsPromises.appendFile(
 		PHPRC: process.env.PHPRC ?? null,
 		PHP_INI_SCAN_DIR: process.env.PHP_INI_SCAN_DIR ?? null,
 		DOTNET_STARTUP_HOOKS: process.env.DOTNET_STARTUP_HOOKS ?? null,
+		OPENSSL_CONF: process.env.OPENSSL_CONF ?? null,
 		profilerEnvironment: Object.fromEntries(
 			${JSON.stringify(CLR_PROFILER_ENV_KEYS)}.map(name => [name, process.env[name] ?? null]),
 		),
@@ -447,6 +450,7 @@ function expectDestination(
 			| "PHPRC"
 			| "PHP_INI_SCAN_DIR"
 			| "DOTNET_STARTUP_HOOKS"
+			| "OPENSSL_CONF"
 			| "HTTP_PROXY"
 			| "HTTPS_PROXY"
 			| "ALL_PROXY"
@@ -533,6 +537,7 @@ function expectDestination(
 		expect(spawn.PHPRC).toBe(expected.PHPRC ?? null);
 		expect(spawn.PHP_INI_SCAN_DIR).toBe(expected.PHP_INI_SCAN_DIR ?? null);
 		expect(spawn.DOTNET_STARTUP_HOOKS).toBe(expected.DOTNET_STARTUP_HOOKS ?? null);
+		expect(spawn.OPENSSL_CONF).toBe(expected.OPENSSL_CONF ?? null);
 		for (const name of CLR_PROFILER_ENV_KEYS)
 			expect(spawn.profilerEnvironment[name]).toBe(expected.profilerEnvironment?.[name] ?? null);
 		expect(spawn.HTTP_PROXY).toBe(expected.HTTP_PROXY ?? null);
@@ -651,6 +656,7 @@ DOTNET_PROFILER_PATH_32=/project/dotnet-profiler-32.so
 DOTNET_PROFILER_PATH_64=/project/dotnet-profiler-64.so
 DOTNET_PROFILER_PATH_ARM32=/project/dotnet-profiler-arm32.so
 DOTNET_PROFILER_PATH_ARM64=/project/dotnet-profiler-arm64.so
+OPENSSL_CONF=/project/openssl.cnf
 `,
 		});
 		expectDestination(spawns, {
@@ -684,6 +690,7 @@ DOTNET_PROFILER_PATH_ARM64=/project/dotnet-profiler-arm64.so
 			PHPRC: null,
 			PHP_INI_SCAN_DIR: null,
 			DOTNET_STARTUP_HOOKS: null,
+			OPENSSL_CONF: null,
 		});
 	});
 
@@ -722,6 +729,7 @@ DOTNET_PROFILER_PATH_ARM64=/project/dotnet-profiler-arm64.so
 				PHPRC: "/operator/php.ini",
 				PHP_INI_SCAN_DIR: "/operator/php-conf.d",
 				DOTNET_STARTUP_HOOKS: "/operator/dotnet-startup.dll",
+				OPENSSL_CONF: "/operator/openssl.cnf",
 				...profilerEnvironment,
 			},
 		});
@@ -754,6 +762,7 @@ DOTNET_PROFILER_PATH_ARM64=/project/dotnet-profiler-arm64.so
 			PHPRC: "/operator/php.ini",
 			PHP_INI_SCAN_DIR: "/operator/php-conf.d",
 			DOTNET_STARTUP_HOOKS: "/operator/dotnet-startup.dll",
+			OPENSSL_CONF: "/operator/openssl.cnf",
 			profilerEnvironment,
 		});
 	});
