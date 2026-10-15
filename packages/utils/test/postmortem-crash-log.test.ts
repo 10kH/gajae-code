@@ -269,6 +269,8 @@ describe("recordFatalCrash", () => {
 			"githubToken",
 			"dbPassword",
 			"openaiApiKey",
+			"openAIApiKey",
+			"OpenAIApiKey",
 			"stripeSecretKey",
 			"awsSecretAccessKey",
 			"mySecretAccessKey",
@@ -277,10 +279,10 @@ describe("recordFatalCrash", () => {
 		}
 		expect(
 			redactCrashSecrets(
-				'authToken=opaque-auth-token githubToken="opaque-github-token" dbPassword=opaque-db-password openaiApiKey=opaque-api-key stripeSecretKey=opaque-stripe-secret awsSecretAccessKey=opaque-aws-secret mySecretAccessKey=opaque-my-secret',
+				'authToken=opaque-auth-token githubToken="opaque-github-token" dbPassword=opaque-db-password openaiApiKey=opaque-api-key openAIApiKey=opaque-mixed-api-key OpenAIApiKey=opaque-title-api-key stripeSecretKey=opaque-stripe-secret awsSecretAccessKey=opaque-aws-secret mySecretAccessKey=opaque-my-secret',
 			),
 		).toBe(
-			'authToken=«redacted» githubToken="«redacted»" dbPassword=«redacted» openaiApiKey=«redacted» stripeSecretKey=«redacted» awsSecretAccessKey=«redacted» mySecretAccessKey=«redacted»',
+			'authToken=«redacted» githubToken="«redacted»" dbPassword=«redacted» openaiApiKey=«redacted» openAIApiKey=«redacted» OpenAIApiKey=«redacted» stripeSecretKey=«redacted» awsSecretAccessKey=«redacted» mySecretAccessKey=«redacted»',
 		);
 		expect(redactCrashSecrets('{"authToken":"opaque-auth-token"}')).toBe('{"authToken":"«redacted»"}');
 		expect(redactCrashSecrets("authToken={nested:opaque-secret}")).toBe("authToken=«redacted»");
@@ -293,6 +295,18 @@ describe("recordFatalCrash", () => {
 		expect(
 			redactCrashSecrets('Authorization: Digest username="Mufasa", realm="test", nonce="opaque"\nnext=keep'),
 		).toBe("Authorization: «redacted»\nnext=keep");
+	});
+
+	it("preserves diagnostics after escaped newlines in authorization headers", () => {
+		const escapedLf = redactCrashSecrets(String.raw`Authorization: ApiKey opaque-secret\nnext=keep`);
+		expect(escapedLf.startsWith("Authorization: «redacted»")).toBe(true);
+		expect(escapedLf.endsWith(String.raw`\nnext=keep`)).toBe(true);
+		expect(escapedLf).not.toContain("opaque-secret");
+
+		const escapedCrlf = redactCrashSecrets(String.raw`Authorization: ApiKey opaque-secret\r\nnext=keep`);
+		expect(escapedCrlf.startsWith("Authorization: «redacted»")).toBe(true);
+		expect(escapedCrlf.endsWith(String.raw`\r\nnext=keep`)).toBe(true);
+		expect(escapedCrlf).not.toContain("opaque-secret");
 	});
 
 	it("redacts backslash-escaped whitespace in unquoted credential values", () => {
