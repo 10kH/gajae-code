@@ -7,6 +7,25 @@
  * text goes through `sanitizeExternalCrashV1` instead.
  */
 
+const CREDENTIAL_KEY_LABELS =
+	"api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?key|session[_-]?token|client[_-]?secret|aws[_-]?secret[_-]?access[_-]?key|secret[_-]?key|secret[_-]?access[_-]?key|password|passwd|auth|authorization|bearer|private[_-]?token|token|secrets?|credentials?|private[_-]?key|cookie";
+const CREDENTIAL_KEY_PATTERN = `(?:[A-Za-z0-9][A-Za-z0-9_-]*[_-])?(?:${CREDENTIAL_KEY_LABELS})`;
+const CREDENTIAL_KEY_SUFFIX = new RegExp(`^${CREDENTIAL_KEY_PATTERN}$`, "i");
+const CREDENTIAL_ASSIGNMENT_PREFIX = String.raw`(?<![A-Za-z0-9_-])((?:\\*["']?-*)(?:${CREDENTIAL_KEY_PATTERN})(?:\\*["']?\s*[=:]\s*))`;
+const CREDENTIAL_AUTH_VALUE_PATTERN = new RegExp(
+	String.raw`${CREDENTIAL_ASSIGNMENT_PREFIX}(?:Bearer|Basic|Token)\s+[^\s"',;}\]]+`,
+	"gi",
+);
+const CREDENTIAL_VALUE_PATTERN = new RegExp(
+	String.raw`${CREDENTIAL_ASSIGNMENT_PREFIX}(?:(\\+")((?:\\[\s\S]|[^"\\])*?)(\\+")(?=$|[\s,;}\]])|(")((?:\\[\s\S]|[^"\\])*)(")|(\\+')((?:\\[\s\S]|[^'\\])*?)(\\+')(?=$|[\s,;}\]])|(')((?:\\[\s\S]|[^'\\])*)(')|(\\+")([^\r\n]*)(?=\r?\n|$)|(")([^\r\n]*)(?=\r?\n|$)|(\\+')([^\r\n]*)(?=\r?\n|$)|(')([^\r\n]*)(?=\r?\n|$)|([^\s"',;}\]]+))`,
+	"gi",
+);
+
+/** Whether a field name ends in a credential label recognized by the redactor. */
+export function isCredentialKey(key: string): boolean {
+	return CREDENTIAL_KEY_SUFFIX.test(key);
+}
+
 /**
  * Scrub credential material from crash text before it is persisted.
  * Covers bearer/basic-style headers, key=value or JSON key forms of common
@@ -72,13 +91,16 @@ export function redactCrashSecrets(text: string): string {
 		/(?:(?<![A-Za-z0-9_-])|(?<=\\n))((?:set-)?cookie\s*:\s*)(?:(?!\\+n|\\+r\\+n)[^\r\n])*/gi,
 		"$1«redacted»",
 	);
+	redacted = redacted.replace(CREDENTIAL_AUTH_VALUE_PATTERN, (_match, prefix: string) => `${prefix}«redacted»`);
 	// Escaped delimiters support JSON nested in diagnostic strings. Their quoted
 	// branch stops at a closing delimiter followed by a field boundary, while an
-	// unterminated value is redacted through the end of its line.
+	// unterminated value is redacted through the end of its line. Capture each
+	// complete key once and inspect its suffix; repeated compound-prefix groups
+	// backtrack quadratically on long attacker-controlled identifiers.
 	redacted = redacted.replace(
-		/(?<![A-Za-z0-9_])((?:\\*["']?)(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?key|session[_-]?token|client[_-]?secret|aws[_-]?secret[_-]?access[_-]?key|secret[_-]?key|secret[_-]?access[_-]?key|password|passwd|auth|authorization|bearer|private[_-]?token|token|secret|secrets|credential|credentials|private[_-]?key|cookie)(?:\\*["']?\s*[=:]\s*))(?:(\\+")((?:\\[\s\S]|[^"\\])*?)(\\+")(?=$|[\s,;}\]])|(")((?:\\[\s\S]|[^"\\])*)(")|(\\+')((?:\\[\s\S]|[^'\\])*?)(\\+')(?=$|[\s,;}\]])|(')((?:\\[\s\S]|[^'\\])*)(')|(\\+")([^\r\n]*)(?=\r?\n|$)|(")([^\r\n]*)(?=\r?\n|$)|(\\+')([^\r\n]*)(?=\r?\n|$)|(')([^\r\n]*)(?=\r?\n|$)|([^\s"',;}\]]+))/gi,
+		CREDENTIAL_VALUE_PATTERN,
 		(
-			_match,
+			_match: string,
 			prefix: string,
 			escapedDoubleOpen: string | undefined,
 			escapedDoubleQuoted: string | undefined,
@@ -132,8 +154,7 @@ export function redactCrashSecrets(text: string): string {
 }
 
 function redactCredentialContainers(text: string): string {
-	const assignment =
-		/(?<![A-Za-z0-9_])((?:\\*["']?)(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?key|session[_-]?token|client[_-]?secret|aws[_-]?secret[_-]?access[_-]?key|secret[_-]?key|secret[_-]?access[_-]?key|password|passwd|auth|authorization|bearer|private[_-]?token|token|secrets?|credentials?|private[_-]?key|cookie)(?:\\*["']?\s*[=:]\s*))(?=\[|\{)/gi;
+	const assignment = new RegExp(String.raw`${CREDENTIAL_ASSIGNMENT_PREFIX}(?=[\[{])`, "gi");
 	let output = "";
 	let copiedUntil = 0;
 	for (let match = assignment.exec(text); match !== null; match = assignment.exec(text)) {

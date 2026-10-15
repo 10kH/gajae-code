@@ -2,7 +2,7 @@ import * as syncFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentState } from "@gajae-code/agent-core";
-import { APP_NAME, isEnoent, redactCrashSecrets } from "@gajae-code/utils";
+import { APP_NAME, isCredentialKey, isEnoent, redactCrashSecrets } from "@gajae-code/utils";
 import { getResolvedThemeColors, getThemeExportColors } from "../../modes/theme/theme";
 import { SessionManager } from "../../session/session-manager";
 // Pre-generated template (created by scripts/generate-template.ts at publish time)
@@ -279,13 +279,10 @@ function uniqueJsonObjectKey(target: Record<string, unknown>, key: string): stri
 	return candidate;
 }
 
-const CREDENTIAL_JSON_KEY =
-	/^(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?key|session[_-]?token|client[_-]?secret|aws[_-]?secret[_-]?access[_-]?key|secret[_-]?key|secret[_-]?access[_-]?key|password|passwd|auth|authorization|bearer|private[_-]?token|token|secrets|secret|credentials|credential|private[_-]?key|cookie)$/i;
-
 function redactKeyedValue(key: string, value: unknown): unknown {
 	// A recognized key is authoritative for every JSON type, including a short
 	// string, a number, an array, or a nested object.
-	if (CREDENTIAL_JSON_KEY.test(key)) return "«redacted»";
+	if (isCredentialKey(key)) return "«redacted»";
 	if (typeof value !== "string") return redactJsonValue(value);
 	const encoded = JSON.stringify({ [key]: value });
 	try {

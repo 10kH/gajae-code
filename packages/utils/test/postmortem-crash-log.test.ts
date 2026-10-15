@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { isCredentialKey, redactCrashSecrets } from "../src/crash-redaction";
 import { CRASH_LOG_MAX_BYTES, CRASH_RECORD_MAX_BYTES, recordFatalCrash } from "../src/postmortem";
 
 function tempCrashLog(): string {
@@ -248,6 +249,25 @@ describe("recordFatalCrash", () => {
 		expect(contents).toContain("Cookie: «redacted»");
 		expect(contents).toContain("before=keep");
 		expect(contents).toContain("after=keep");
+	});
+
+	it("redacts short credentials following an authorization scheme as one value", () => {
+		expect(redactCrashSecrets("authorization: Bearer abc diagnostic=keep")).toBe(
+			"authorization: «redacted» diagnostic=keep",
+		);
+		expect(redactCrashSecrets("authorization: Basic x diagnostic=keep")).toBe(
+			"authorization: «redacted» diagnostic=keep",
+		);
+	});
+
+	it("bounds matching work for long non-credential compound keys", () => {
+		const longKey = `${"a-".repeat(10_000)}tokenx`;
+		const input = `${longKey}=public`;
+		const startedAt = performance.now();
+
+		expect(isCredentialKey(longKey)).toBe(false);
+		expect(redactCrashSecrets(input)).toBe(input);
+		expect(performance.now() - startedAt).toBeLessThan(500);
 	});
 
 	it("redacts full quoted credential values that contain spaces", async () => {
