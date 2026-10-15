@@ -31,6 +31,7 @@ import { AUTOROUTING_SELECTOR_MAX_LENGTH, type AutoroutingReasonCode } from "../
 import { resolveProfileBindings } from "../config/model-profiles";
 import { resolveAgentModelPatterns } from "../config/model-resolver";
 import type { Theme } from "../modes/theme/theme";
+import type { PlanModeState } from "../plan-mode/state";
 import planModeSubagentPrompt from "../prompts/system/plan-mode-subagent.md" with { type: "text" };
 import taskSummaryTemplate from "../prompts/tools/task-summary.md" with { type: "text" };
 import type { ForkContextSeed } from "../session/agent-session";
@@ -215,6 +216,20 @@ function inheritedSubagentApproval(session: ToolSession) {
 	return {
 		sdkPermissionMode: mode === "deny" || mode === "prompt" ? mode : ("allow" as const),
 		clientBridge: session.getClientBridge?.(),
+	};
+}
+
+/** Enabled plan mode only. A missing or disabled state leaves the child writable. */
+function inheritedPlanMode(session: ToolSession): { planModeState?: PlanModeState } {
+	const state = session.getPlanModeState?.();
+	if (!state?.enabled || !state.planFilePath) return {};
+	return {
+		planModeState: {
+			enabled: true,
+			planFilePath: state.planFilePath,
+			...(state.workflow ? { workflow: state.workflow } : {}),
+			...(state.reentry !== undefined ? { reentry: state.reentry } : {}),
+		},
 	};
 }
 
@@ -2508,6 +2523,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						profileAuthority: session.profileAuthority,
 						inheritedServiceTier: session.serviceTier,
 						...inheritedSubagentApproval(session),
+						...inheritedPlanMode(session),
 						contextFiles,
 						skills: availableSkills,
 						autoloadSkills: resolvedAutoloadSkills,
@@ -2598,6 +2614,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						profileAuthority: session.profileAuthority,
 						inheritedServiceTier: session.serviceTier,
 						...inheritedSubagentApproval(session),
+						...inheritedPlanMode(session),
 						contextFiles,
 						skills: availableSkills,
 						autoloadSkills: resolvedAutoloadSkills,
