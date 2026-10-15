@@ -7089,9 +7089,10 @@ export class AuthStorage {
 	/**
 	 * Resolve a stored api_key credential that outranks an env-sourced config
 	 * override (`apiKeyEnv`). Mirrors the api_key branches of {@link getApiKey}:
-	 * the selector-pinned credential first, then the round-robin/session pool.
-	 * Returns undefined when no stored api_key credential resolves, leaving the
-	 * env-sourced override in effect.
+	 * a selected credential must resolve or fail closed; unpinned resolution then
+	 * tries the round-robin/session pool. Returns undefined when no unpinned
+	 * stored api_key credential resolves, leaving the env-sourced override in
+	 * effect.
 	 */
 	async #resolveStoredApiKeyOverEnvConfig(
 		provider: string,
@@ -7106,6 +7107,7 @@ export class AuthStorage {
 				onCredentialRowResolved?.(selectedCredential.id);
 				return resolved;
 			}
+			throw new Error(`Selected credential for ${provider} (id:${selectedCredential.id}) is unavailable`);
 		}
 		const attemptedApiKeyIndices = new Set<number>();
 		for (;;) {

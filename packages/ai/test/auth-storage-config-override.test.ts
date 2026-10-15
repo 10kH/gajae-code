@@ -194,6 +194,32 @@ describe("AuthStorage config-override apiKey", () => {
 			).rejects.toThrow("config API key override is active");
 		});
 	});
+	test("env-sourced override fails closed when an explicitly selected stored API key cannot resolve", async () => {
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			if (!store) throw new Error("test setup failed");
+			const resolvedKeys: string[] = [];
+			authStorage = new AuthStorage(store, {
+				configValueResolver: async key => {
+					resolvedKeys.push(key);
+					return key === "!unavailable-command" ? undefined : key;
+				},
+			});
+			await authStorage.set("anthropic", [
+				{ type: "api_key", key: "!unavailable-command" },
+				{ type: "api_key", key: "peer-key" },
+			]);
+			authStorage.setConfigApiKey("anthropic", "env-configured-key", { envSourced: true });
+			const selectedRow = authStorage.listCredentialInventory("anthropic")[0];
+			if (!selectedRow) throw new Error("test setup did not create the selected credential");
+
+			await expect(
+				authStorage.getApiKey("anthropic", undefined, {
+					credentialSelector: { kind: "id", value: String(selectedRow.id) },
+				}),
+			).rejects.toThrow(`Selected credential for anthropic (id:${selectedRow.id}) is unavailable`);
+			expect(resolvedKeys).toEqual(["!unavailable-command"]);
+		});
+	});
 
 	test("env-sourced override applies when no stored credential exists", async () => {
 		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {

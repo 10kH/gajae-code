@@ -23312,6 +23312,7 @@ export class AgentSession {
 		credentialRowId: number | undefined,
 		retryAfterMs: number | undefined,
 		failedRowIds: Set<number>,
+		signal: AbortSignal,
 	): Promise<{ apiKey: string; credentialRowId: number } | undefined> {
 		if (candidate.provider !== this.model?.provider) return undefined;
 		if (this.#hasManagedFallbackCredentialPin(candidate.provider)) return undefined;
@@ -23336,6 +23337,7 @@ export class AgentSession {
 			failedRowIds.add(failedRowId);
 			await authStorage.markUsageLimitReached(candidate.provider, this.credentialSessionId, {
 				retryAfterMs,
+				signal,
 				owner: this.#modelRegistry.getAuthStorageOwner(),
 				rowId: failedRowId,
 			});
@@ -23367,11 +23369,18 @@ export class AgentSession {
 				continue;
 			}
 			if (this.#hasManagedFallbackCredentialPin(candidate.provider)) return undefined;
-			if (
-				resolved.credentialRowId === peer.id &&
-				isAuthenticated(resolved.apiKey) &&
-				authStorage.isCredentialAvailable(candidate.provider, peer.id)
-			) {
+			if (resolved.credentialRowId !== peer.id || !isAuthenticated(resolved.apiKey)) continue;
+			if (resolved.apiKey === apiKey) {
+				failedRowIds.add(peer.id);
+				await authStorage.markUsageLimitReached(candidate.provider, this.credentialSessionId, {
+					retryAfterMs,
+					signal,
+					owner: this.#modelRegistry.getAuthStorageOwner(),
+					rowId: peer.id,
+				});
+				continue;
+			}
+			if (authStorage.isCredentialAvailable(candidate.provider, peer.id)) {
 				return { apiKey: resolved.apiKey, credentialRowId: peer.id };
 			}
 		}
@@ -24122,6 +24131,7 @@ export class AgentSession {
 									credentialRowId,
 									retryAfterMs,
 									usageLimitedRowIds,
+									autoCompactionSignal,
 								);
 								if (rotatedCredential !== undefined && !usageLimitedApiKeys.has(rotatedCredential.apiKey)) {
 									apiKey = rotatedCredential.apiKey;

@@ -112,6 +112,8 @@ describe("auto-compaction usage limit rotates the session credential", () => {
 		expect(keys).toHaveLength(2);
 		expect(keys[1]).not.toBe(keys[0]);
 		expect(markUsageLimitReached).toHaveBeenCalledTimes(1);
+		expect(markUsageLimitReached.mock.calls[0]?.[2]?.signal).toBeInstanceOf(AbortSignal);
+		expect(markUsageLimitReached.mock.calls[0]?.[2]?.signal).toBe(compactSpy.mock.calls[0]?.[4]);
 		expect(ends).toHaveLength(1);
 		expect(ends[0]?.errorMessage).toBeUndefined();
 		expect(ends[0]?.result).toBeDefined();
@@ -691,6 +693,71 @@ describe("auto-compaction usage limit rotates the session credential", () => {
 			else process.env.GJC_TEST_COMPACTION_DUP_KEY_A = previousA;
 			if (previousB === undefined) delete process.env.GJC_TEST_COMPACTION_DUP_KEY_B;
 			else process.env.GJC_TEST_COMPACTION_DUP_KEY_B = previousB;
+		}
+	});
+
+	it("continues past a command alias that resolves to the failed key after matching", async () => {
+		const aliasEnv = "GJC_TEST_COMPACTION_TRANSIENT_DUPLICATE_ALIAS";
+		const previousAlias = process.env[aliasEnv];
+		delete process.env[aliasEnv];
+		try {
+			await authStorage.set("openai-codex", [
+				{ type: "api_key", key: "codex-dup-secret" },
+				{ type: "api_key", key: aliasEnv },
+				{ type: "api_key", key: "codex-key-3" },
+			]);
+			const failedRow = authStorage
+				.exportSnapshot()
+				.credentials.find(
+					entry =>
+						entry.provider === "openai-codex" &&
+						entry.credential.type === "api_key" &&
+						entry.credential.key === "codex-dup-secret",
+				);
+			const aliasRow = authStorage
+				.exportSnapshot()
+				.credentials.find(
+					entry =>
+						entry.provider === "openai-codex" &&
+						entry.credential.type === "api_key" &&
+						entry.credential.key === aliasEnv,
+				);
+			if (!failedRow || !aliasRow) throw new Error("test setup did not create both duplicate credential rows");
+			let credentialSessionId: string | undefined;
+			for (let index = 0; index < 100; index++) {
+				const candidate = `transient-duplicate-alias-${index}`;
+				const initial = await authStorage.getApiKeyWithCredentialRowId("openai-codex", candidate);
+				if (initial.credentialRowId === failedRow.id) {
+					credentialSessionId = candidate;
+					break;
+				}
+			}
+			if (credentialSessionId === undefined) throw new Error("expected a session seed selecting the failed key");
+			session = createSession(credentialSessionId);
+			session.settings.set("retry.enabled", false);
+			session.settings.set("retry.maxRetries", 0);
+			const resolveMatchingRows = authStorage.getCredentialRowIdsMatchingApiKey.bind(authStorage);
+			vi.spyOn(authStorage, "getCredentialRowIdsMatchingApiKey").mockImplementation(async (provider, apiKey) => {
+				const rowIds = await resolveMatchingRows(provider, apiKey);
+				if (apiKey === "codex-dup-secret") process.env[aliasEnv] = "codex-dup-secret";
+				return rowIds;
+			});
+			const markUsageLimitReached = vi.spyOn(authStorage, "markUsageLimitReached");
+			const ends = collectCompactionEnds(session);
+			const compactSpy = stubCompact(apiKey => apiKey === "codex-dup-secret");
+
+			await session.runIdleCompaction();
+
+			expect(compactSpy.mock.calls.map(call => call[2])).toEqual(["codex-dup-secret", "codex-key-3"]);
+			expect(markUsageLimitReached.mock.calls.map(call => call[2]?.rowId)).toContain(failedRow.id);
+			expect(markUsageLimitReached.mock.calls.map(call => call[2]?.rowId)).toContain(aliasRow.id);
+			expect(authStorage.isCredentialAvailable("openai-codex", aliasRow.id)).toBe(false);
+			expect(ends).toHaveLength(1);
+			expect(ends[0]?.errorMessage).toBeUndefined();
+			expect(ends[0]?.result).toBeDefined();
+		} finally {
+			if (previousAlias === undefined) delete process.env[aliasEnv];
+			else process.env[aliasEnv] = previousAlias;
 		}
 	});
 
