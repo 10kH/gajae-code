@@ -139,6 +139,19 @@ function renderCompactSubagentSummary(subagents: readonly SubagentSnapshot[], th
 	return `  ${theme.fg("dim", parts.join(" · "))}`;
 }
 
+// At most one warning row in compact mode, however many providers degrade, so the
+// collapsed height stays independent of the subagent count. The expanded view keeps
+// one row per provider.
+function renderCompactDegradationLine(
+	groups: ReadonlyArray<{ provider: string; count: number }>,
+	theme: Theme,
+): string | undefined {
+	const [worst] = groups;
+	if (!worst) return undefined;
+	const more = groups.length > 1 ? ` (+${groups.length - 1} more ${pluralize("provider", groups.length - 1)})` : "";
+	return `  ${theme.fg("warning", `provider degraded: ${worst.count} subagents retrying on ${worst.provider}${more}`)}`;
+}
+
 // The expand hint gets its own line so a long summary never truncates it away.
 function renderCompactSubagentHint(running: boolean, theme: Theme): string {
 	const expandKey = getKeybindings().getKeys("app.tools.expand")[0];
@@ -457,10 +470,7 @@ export const subagentToolRenderer = {
 				const liveProgress = subagents.flatMap(snapshot =>
 					snapshot.progress && snapshot.liveProgressAvailable !== false ? [snapshot.progress] : [],
 				);
-				const degradationLines = collectProviderDegradationGroups(liveProgress).map(
-					group =>
-						`  ${theme.fg("warning", `provider degraded: ${group.count} subagents retrying on ${group.provider}`)}`,
-				);
+				const degradationGroups = collectProviderDegradationGroups(liveProgress);
 				// Compact applies only to live await progress. Final results (timeout
 				// guidance, failure and completion receipts, status/steer replies) keep
 				// the full per-subagent rendering.
@@ -468,7 +478,9 @@ export const subagentToolRenderer = {
 					out.push(
 						truncateToWidth(replaceTabs(renderCompactSubagentSummary(subagents, theme)), width, Ellipsis.Unicode),
 					);
-					for (const line of degradationLines) out.push(truncateToWidth(replaceTabs(line), width, Ellipsis.Omit));
+					const compactDegradation = renderCompactDegradationLine(degradationGroups, theme);
+					if (compactDegradation)
+						out.push(truncateToWidth(replaceTabs(compactDegradation), width, Ellipsis.Unicode));
 					out.push(
 						truncateToWidth(
 							replaceTabs(renderCompactSubagentHint(runningCount > 0, theme)),
@@ -489,7 +501,17 @@ export const subagentToolRenderer = {
 						),
 					);
 				}
-				for (const line of degradationLines) out.push(truncateToWidth(replaceTabs(line), width, Ellipsis.Omit));
+				for (const group of degradationGroups) {
+					out.push(
+						truncateToWidth(
+							replaceTabs(
+								`  ${theme.fg("warning", `provider degraded: ${group.count} subagents retrying on ${group.provider}`)}`,
+							),
+							width,
+							Ellipsis.Omit,
+						),
+					);
+				}
 
 				snapshotSignatures ??= subagents.map(
 					snapshot =>

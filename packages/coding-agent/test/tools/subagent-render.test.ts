@@ -866,6 +866,27 @@ describe("compact subagent panel (#6774)", () => {
 		]);
 	});
 
+	it("caps provider degradation at one row however many providers degrade", () => {
+		settings.set("task.compactSubagentPanel", true);
+		const providers = ["anthropic", "openai", "google", "xai", "mistral", "groq", "deepseek"];
+		const subagents = liveGroup(15, 0).map((item, index) => {
+			if (index >= 14) return item;
+			const retryState = {
+				attempt: 1,
+				maxAttempts: 3,
+				kind: "provider_error" as const,
+				provider: providers[index % providers.length],
+				delayMs: 10_000,
+				errorMessage: "overloaded",
+				startedAtMs: Date.now(),
+			};
+			return { ...item, progress: progress({ id: item.id, retryState }) };
+		});
+		const lines = render({ subagents }, false).split("\n");
+		expect(lines).toHaveLength(4);
+		expect(lines[2]).toBe("  provider degraded: 2 subagents retrying on anthropic (+6 more providers)");
+	});
+
 	it("lists every subagent when tool output is expanded", () => {
 		settings.set("task.compactSubagentPanel", true);
 		const out = render({ subagents: liveGroup(15, 3) }, true);

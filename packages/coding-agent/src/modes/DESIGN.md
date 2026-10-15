@@ -481,8 +481,8 @@ existing tool-panel grammar; it adds no tokens.
   full per-subagent rendering, so nothing the user must act on is summarized.
 - **Anatomy (collapsed, setting on):** a height independent of the number of
   subagents — the existing status header, one `dim` summary row of group counts
-  joined by ` · `, the existing `warning` row per degraded provider (bounded by
-  distinct providers, not subagents), and one `dim` hint row in parentheses
+  joined by ` · `, at most one `warning` row naming the most-degraded provider and
+  how many more providers degrade (the expanded view keeps one row per provider), and one `dim` hint row in parentheses
   naming the effective `app.tools.expand` key and, while anything runs, the
   existing `ctrl+s to observe sessions` hint.
 - **Count order:** `N subagents running`, then `failed`, `retrying`,
