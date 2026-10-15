@@ -30,6 +30,8 @@ const TRUST_KEYS = [
 	"PYTHONPATH",
 	"PYTHONUSERBASE",
 	"PYTHONSTARTUP",
+	"RUBYOPT",
+	"RUBYLIB",
 	"PATH",
 	"HTTP_PROXY",
 	"HTTPS_PROXY",
@@ -68,6 +70,8 @@ interface GhSpawn {
 	PYTHONPATH: string | null;
 	PYTHONUSERBASE: string | null;
 	PYTHONSTARTUP: string | null;
+	RUBYOPT: string | null;
+	RUBYLIB: string | null;
 	GH_HOST: string | null;
 	GH_CONFIG_DIR: string | null;
 	GH_TOKEN: string | null;
@@ -139,6 +143,8 @@ await fsPromises.appendFile(
 		PYTHONPATH: process.env.PYTHONPATH ?? null,
 		PYTHONUSERBASE: process.env.PYTHONUSERBASE ?? null,
 		PYTHONSTARTUP: process.env.PYTHONSTARTUP ?? null,
+		RUBYOPT: process.env.RUBYOPT ?? null,
+		RUBYLIB: process.env.RUBYLIB ?? null,
 		GH_HOST: process.env.GH_HOST ?? null,
 		GH_CONFIG_DIR: process.env.GH_CONFIG_DIR ?? null,
 		GH_TOKEN: process.env.GH_TOKEN ?? null,
@@ -316,6 +322,8 @@ function expectDestination(
 			| "PYTHONPATH"
 			| "PYTHONUSERBASE"
 			| "PYTHONSTARTUP"
+			| "RUBYOPT"
+			| "RUBYLIB"
 			| "HTTP_PROXY"
 			| "HTTPS_PROXY"
 			| "ALL_PROXY"
@@ -369,6 +377,8 @@ function expectDestination(
 		expect(spawn.PYTHONPATH).toBe(expected.PYTHONPATH ?? null);
 		expect(spawn.PYTHONUSERBASE).toBe(expected.PYTHONUSERBASE ?? null);
 		expect(spawn.PYTHONSTARTUP).toBe(expected.PYTHONSTARTUP ?? null);
+		expect(spawn.RUBYOPT).toBe(expected.RUBYOPT ?? null);
+		expect(spawn.RUBYLIB).toBe(expected.RUBYLIB ?? null);
 		expect(spawn.HTTP_PROXY).toBe(expected.HTTP_PROXY ?? null);
 		expect(spawn.HTTPS_PROXY).toBe(expected.HTTPS_PROXY ?? null);
 		expect(spawn.ALL_PROXY).toBe(expected.ALL_PROXY ?? null);
@@ -445,6 +455,8 @@ PYTHONHOME=/project/python-home
 PYTHONPATH=/project/python-path
 PYTHONUSERBASE=/project/python-user-base
 PYTHONSTARTUP=/project/python-startup.py
+RUBYOPT=-r/project/ruby-startup.rb
+RUBYLIB=/project/ruby-libraries
 `,
 		});
 		expectDestination(spawns, {
@@ -457,10 +469,12 @@ PYTHONSTARTUP=/project/python-startup.py
 			PYTHONPATH: null,
 			PYTHONUSERBASE: null,
 			PYTHONSTARTUP: null,
+			RUBYOPT: null,
+			RUBYLIB: null,
 		});
 	});
 
-	it("preserves operator-declared Node and Python runtime settings", async () => {
+	it("preserves operator-declared Node, Python, and Ruby runtime settings", async () => {
 		const spawns = await share({
 			env: {
 				NODE_OPTIONS: "--no-warnings",
@@ -469,6 +483,8 @@ PYTHONSTARTUP=/project/python-startup.py
 				PYTHONPATH: "/operator/python-path",
 				PYTHONUSERBASE: "/operator/python-user-base",
 				PYTHONSTARTUP: "/operator/python-startup.py",
+				RUBYOPT: "-r/operator/ruby-startup.rb",
+				RUBYLIB: "/operator/ruby-libraries",
 			},
 		});
 		expectDestination(spawns, {
@@ -478,6 +494,8 @@ PYTHONSTARTUP=/project/python-startup.py
 			PYTHONPATH: "/operator/python-path",
 			PYTHONUSERBASE: "/operator/python-user-base",
 			PYTHONSTARTUP: "/operator/python-startup.py",
+			RUBYOPT: "-r/operator/ruby-startup.rb",
+			RUBYLIB: "/operator/ruby-libraries",
 		});
 	});
 
