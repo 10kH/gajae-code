@@ -4,8 +4,9 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
-import { VERSION } from "@gajae-code/utils";
+import { logger, VERSION } from "@gajae-code/utils";
 import { runCli } from "../src/cli";
+import * as installActivation from "../src/cli/install-activation";
 import {
 	buildActivationRecord,
 	createActivationRecordFile,
@@ -1969,6 +1970,65 @@ describe("update-cli binary replacement", () => {
 			expect(await Bun.file(targetPath).text()).toBe("new binary");
 			expect(await Bun.file(retryStage).exists()).toBe(true);
 		} finally {
+			unlinkSpy.mockRestore();
+		}
+	});
+
+	it("logs redundant-stage cleanup failure when activation remains pending", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc.exe");
+		const recordedStage = path.join(dir, "gjc.new.recorded.exe");
+		const retryStage = path.join(dir, "gjc.new.retry.exe");
+		const backupPath = path.join(dir, "gjc.exe.bak");
+		await writeFixtureFile(targetPath, "old binary");
+		await writeFixtureFile(recordedStage, "new binary");
+		await writeFixtureFile(retryStage, "new binary");
+		const target = (await snapshotRegularFile(targetPath))!;
+		const stage = (await snapshotRegularFile(recordedStage))!;
+		const parent = (await snapshotDirectory(dir))!;
+		await createActivationRecordFile({
+			...buildActivationRecord({
+				targetPath,
+				targetIdentity: target.identity,
+				parentIdentity: parent,
+				baselineDigest: target.identity.sha256,
+				stagingPath: recordedStage,
+				stagingIdentity: stage.identity,
+				candidate: { digest: stage.identity.sha256, version: "15.1.8" },
+			}),
+			phase: "pending_activation",
+		});
+
+		const exactUnlink = native.exactUnlink;
+		const unlinkSpy = vi.spyOn(native, "exactUnlink").mockImplementation((filePath, identity) => {
+			if (path.resolve(filePath) === retryStage) return { ok: false, code: "sharing_violation" };
+			return exactUnlink(filePath, identity);
+		});
+		const reconcile = installActivation.reconcileActivationRecord;
+		const reconcileSpy = vi
+			.spyOn(installActivation, "reconcileActivationRecord")
+			.mockImplementation(async (filePath, options) => {
+				if (filePath === targetPath) await fs.unlink(recordedStage);
+				return reconcile(filePath, options);
+			});
+		const warnSpy = vi.spyOn(logger, "warn");
+		try {
+			await expect(
+				replaceBinaryFixture({
+					targetPath,
+					tempPath: retryStage,
+					backupPath,
+					expectedVersion: "15.1.8",
+					verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+				}),
+			).rejects.toThrow("installation_pending_activation");
+
+			expect(warnSpy).toHaveBeenCalledWith("Update staging cleanup failed while activation is pending", {
+				warning: expect.stringContaining("activation_retry_staging_cleanup_failed"),
+			});
+		} finally {
+			warnSpy.mockRestore();
+			reconcileSpy.mockRestore();
 			unlinkSpy.mockRestore();
 		}
 	});

@@ -938,7 +938,13 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 		expectedRecordIdentity: recordIdentity,
 	});
 	if (promoted.status === "pending_activation") {
-		if (redundantStage) await tryRemoveExactStagingFile(redundantStage.path, redundantStage.identity);
+		const stagingCleanupWarning = redundantStage
+			? await tryRemoveExactStagingFile(redundantStage.path, redundantStage.identity)
+			: undefined;
+		if (stagingCleanupWarning)
+			logger.warn("Update staging cleanup failed while activation is pending", {
+				warning: stagingCleanupWarning,
+			});
 		throw new Error("installation_pending_activation");
 	}
 	if (
