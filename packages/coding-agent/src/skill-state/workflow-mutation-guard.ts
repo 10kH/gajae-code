@@ -1746,13 +1746,6 @@ function readArg(code: string, index: number): { raw: string; end: number } | nu
 	while (/\s/.test(code[cursor] ?? "")) cursor += 1;
 	if (cursor >= code.length || code[cursor] === ")") return null;
 	const start = cursor;
-	if (code[cursor] === "'" || code[cursor] === '"') {
-		const quote = code[cursor];
-		cursor += 1;
-		while (cursor < code.length && code[cursor] !== quote) cursor += code[cursor] === "\\" ? 2 : 1;
-		const end = Math.min(code.length, cursor + 1);
-		return { raw: code.slice(start, end), end };
-	}
 	let depth = 0;
 	while (cursor < code.length) {
 		const character = code[cursor];
@@ -1792,6 +1785,36 @@ function nextCallArg(code: string, end: number): { raw: string; end: number } | 
 	while (/\s/.test(code[cursor] ?? "")) cursor += 1;
 	if (code[cursor] !== ",") return null;
 	return readArg(code, cursor + 1);
+}
+
+function openModeWrites(code: string, first: { raw: string; end: number }): boolean | null {
+	let cursor = first.end;
+	let positionalIndex = 1;
+	let mode: string | undefined;
+	let unknownMode = false;
+	while (cursor < code.length) {
+		while (/\s/.test(code[cursor] ?? "")) cursor += 1;
+		if (code[cursor] !== ",") break;
+		const argument = readArg(code, cursor + 1);
+		if (!argument) break;
+		const raw = argument.raw.trim();
+		if (raw.startsWith("*") || raw.startsWith("**")) {
+			unknownMode = true;
+		} else {
+			const keyword = /^([A-Za-z_]\w*)\s*=\s*([\s\S]*)$/.exec(raw);
+			if (keyword?.[1] === "mode") {
+				if (mode !== undefined) unknownMode = true;
+				else mode = keyword[2];
+			} else if (!keyword && positionalIndex === 1) {
+				if (mode !== undefined) unknownMode = true;
+				else mode = raw;
+			}
+		}
+		positionalIndex += 1;
+		cursor = argument.end;
+	}
+	if (unknownMode) return null;
+	return modeWrites(mode);
 }
 
 /** Whitespace or a backslash-newline may sit before an attribute (`shutil .copy`). */
@@ -1888,11 +1911,7 @@ function scanInterpreterWrites(code: string, language: "py" | "js", targets: Ext
 			continue;
 		}
 		if (open && dotted === "") {
-			const comma = first.end;
-			let modeAt = comma;
-			while (/\s/.test(code[modeAt] ?? "")) modeAt += 1;
-			const mode = code[modeAt] === "," ? readArg(code, modeAt + 1) : null;
-			literalWrite(targets, first.raw, modeWrites(mode?.raw));
+			literalWrite(targets, first.raw, openModeWrites(code, first));
 			index = Math.max(first.end, index + 1);
 			continue;
 		}

@@ -1926,6 +1926,40 @@ describe("bash scanner quoting model", () => {
 		}
 	});
 
+	it("fails closed when a literal path prefix is followed by an expression", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		const decision = await getWorkflowMutationDecision({
+			cwd,
+			sessionId: "session-a",
+			tool: tool("python"),
+			args: { code: 'write("/tmp/" + target, "x")\n' },
+		});
+		expect(decision.blocked).toBe(true);
+		expect(decision.reason).toBe("unknown-target");
+	});
+
+	it("finds Python open write mode after other keyword arguments", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		const input = {
+			cwd,
+			sessionId: "session-a",
+			tool: tool("python"),
+			args: { code: 'open("src/product.ts", encoding="utf-8", mode="w").write("x")\n' },
+		};
+		const decision = await getWorkflowMutationDecision(input);
+		expect(decision.blocked).toBe(true);
+		expect(decision.reason).toBe("phase-boundary");
+		expect(decision.targets).toContain("src/product.ts");
+
+		const readOnly = await getWorkflowMutationDecision({
+			...input,
+			args: { code: 'open("src/product.ts", encoding="utf-8", mode="r").read()\n' },
+		});
+		expect(readOnly.blocked).toBe(false);
+	});
+
 	it("blocks python writes into runtime-owned .gjc state", async () => {
 		const cwd = await makeTempRoot();
 		const decision = await getWorkflowMutationDecision({
