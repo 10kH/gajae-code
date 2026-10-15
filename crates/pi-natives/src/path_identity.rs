@@ -10952,10 +10952,19 @@ mod platform {
 		static EXACT_REPLACE_DESTINATION_OPEN_SHARING_VIOLATION_INJECT: std::cell::Cell<u32> =
 			const { std::cell::Cell::new(0) };
 	}
+	#[cfg(test)]
+	thread_local! {
+		static EXACT_REPLACE_RETAINED_PUBLISH_STATUS_INJECT: std::cell::Cell<Option<i32>> =
+			const { std::cell::Cell::new(None) };
+	}
 
 	#[cfg(test)]
 	pub(super) fn inject_exact_replace_destination_open_sharing_violations(count: u32) {
 		EXACT_REPLACE_DESTINATION_OPEN_SHARING_VIOLATION_INJECT.with(|target| target.set(count));
+	}
+	#[cfg(test)]
+	pub(super) fn inject_exact_replace_retained_publish_status(status: Option<i32>) {
+		EXACT_REPLACE_RETAINED_PUBLISH_STATUS_INJECT.with(|target| target.set(status));
 	}
 
 	#[cfg(test)]
@@ -10968,6 +10977,10 @@ mod platform {
 			target.set(current - 1);
 			true
 		})
+	}
+	#[cfg(test)]
+	fn take_injected_exact_replace_retained_publish_status() -> Option<i32> {
+		EXACT_REPLACE_RETAINED_PUBLISH_STATUS_INJECT.with(|target| target.replace(None))
 	}
 
 	#[cfg(not(test))]
@@ -11674,15 +11687,30 @@ mod platform {
 		rename_handle_status(handle, parent_handle, name, replace_if_exists).map_err(ntstatus_code)
 	}
 
-	fn rename_handle_with_transient_retry(
+	fn rename_pre_retirement_with_transient_retry(
 		handle: HANDLE,
 		parent_handle: HANDLE,
 		name: &[u16],
 		replace_if_exists: bool,
 	) -> Result<(), i32> {
+		// This bounded wait is safe only while the live destination still exists.
+		// Never use it for publication after retiring the predecessor: restore the
+		// predecessor before any retry delay in that state.
 		rename_with_transient_retry(|| {
 			rename_handle_status(handle, parent_handle, name, replace_if_exists)
 		})
+	}
+
+	fn publish_retained_source_once(
+		handle: HANDLE,
+		parent_handle: HANDLE,
+		name: &[u16],
+	) -> Result<(), i32> {
+		#[cfg(test)]
+		if let Some(status) = take_injected_exact_replace_retained_publish_status() {
+			return Err(status);
+		}
+		rename_handle_status(handle, parent_handle, name, false)
 	}
 
 	fn retained_replace_rename_failure(status: i32) -> NativeExactUnlinkResult {
@@ -12159,10 +12187,12 @@ mod platform {
 	/// (an external successor claimed it), the predecessor remains durably
 	/// recoverable at exactly its caller-recorded `backup_name`.
 	/// `STATUS_SHARING_VIOLATION` on the destination open and transient
-	/// `STATUS_ACCESS_DENIED`/`STATUS_SHARING_VIOLATION` rename failures are
-	/// retried only at their safe syscall boundaries. Pre-mutation results
-	/// retain the native status; failures after retirement preserve the
-	/// recovery paths.
+	/// `STATUS_ACCESS_DENIED`/`STATUS_SHARING_VIOLATION` failures retiring the
+	/// predecessor are retried only while the live destination still exists. The
+	/// source publication is attempted once after retirement; a failure restores
+	/// the predecessor immediately before returning, so the public path is never
+	/// vacant during a retry delay. Pre-mutation results retain the native
+	/// status; failures after retirement preserve the recovery paths.
 	pub(super) fn exact_replace_retained(
 		source_path: &Path,
 		destination_path: &Path,
@@ -12334,7 +12364,7 @@ mod platform {
 		// crash after it commits leaves the predecessor durably at the exact
 		// caller-recorded `backup_name` with `destination_name` vacant -- both
 		// states are fully described by evidence the caller already holds.
-		if let Err(status) = rename_handle_with_transient_retry(
+		if let Err(status) = rename_pre_retirement_with_transient_retry(
 			destination.target,
 			parent_handle,
 			&backup_name_wide,
@@ -12379,19 +12409,14 @@ mod platform {
 				NativeExactUnlinkResult::detached_failure(code, backup_path_string)
 			};
 		}
-		match rename_handle_with_transient_retry(
-			source.target,
-			parent_handle,
-			&destination_name_wide,
-			false,
-		) {
+		match publish_retained_source_once(source.target, parent_handle, &destination_name_wide) {
 			Ok(()) => NativeExactUnlinkResult::detached(backup_path_string),
 			Err(status) => {
 				let code = retained_replace_error_code(status);
-				// The publish itself failed: restore the predecessor to its original
-				// name (exact no-replace rename, never overwriting a name that is no
-				// longer vacant) whenever that name is still vacant, exactly as
-				// exact_replace_path does on this failure path.
+				// The source publish is attempted once after retirement: waiting here
+				// would leave the public name vacant. Restore the predecessor
+				// immediately with an exact no-replace rename, never overwriting a
+				// name that is no longer vacant.
 				let restored_destination =
 					rename_handle(destination.target, parent_handle, &destination_name_wide, false)
 						.is_ok();
@@ -12413,6 +12438,129 @@ mod platform {
 					}
 				}
 			},
+		}
+	}
+
+	#[cfg(test)]
+	mod exact_replace_retained_retry_tests {
+		use std::{
+			fs,
+			os::windows::io::AsRawHandle,
+			path::{Path, PathBuf},
+			sync::atomic::{AtomicU64, Ordering},
+		};
+
+		use super::{
+			super::{ExactFileIdentity, STATUS_ACCESS_DENIED, apply_owner_only_path_security, sha256},
+			BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle, HANDLE, exact_replace_retained,
+			inject_exact_replace_retained_publish_status, open_directory_exact,
+		};
+
+		static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+		struct TempDir(PathBuf);
+
+		impl TempDir {
+			fn new() -> Self {
+				let path = std::env::temp_dir().join(format!(
+					"gjc-exact-replace-retained-{}-{}",
+					std::process::id(),
+					NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+				));
+				fs::create_dir(&path).expect("create retained replace temp directory");
+				Self(path)
+			}
+		}
+
+		impl Drop for TempDir {
+			fn drop(&mut self) {
+				let _ = fs::remove_dir_all(&self.0);
+			}
+		}
+
+		fn file_information(handle: HANDLE) -> BY_HANDLE_FILE_INFORMATION {
+			let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+			assert_ne!(
+				unsafe { GetFileInformationByHandle(handle, &mut information) },
+				0,
+				"read file identity",
+			);
+			information
+		}
+
+		fn identity(path: &Path, parent: &Path, bytes: &[u8]) -> ExactFileIdentity {
+			let file = fs::File::open(path).expect("open retained replace file");
+			let information = file_information(file.as_raw_handle() as HANDLE);
+			let parent = open_directory_exact(parent).expect("open retained replace parent");
+			let parent_information = file_information(parent.target);
+			let filetime = (u64::from(information.ftLastWriteTime.dwHighDateTime) << 32)
+				| u64::from(information.ftLastWriteTime.dwLowDateTime);
+			let mtime_ns = i128::from(filetime) * 100 - 11_644_473_600_000_000_000i128;
+			ExactFileIdentity {
+				dev:               u64::from(information.dwVolumeSerialNumber),
+				ino:               (u64::from(information.nFileIndexHigh) << 32)
+					| u64::from(information.nFileIndexLow),
+				nlink:             Some(u64::from(information.nNumberOfLinks)),
+				parent_dev:        Some(u64::from(parent_information.dwVolumeSerialNumber)),
+				parent_ino:        Some(
+					(u64::from(parent_information.nFileIndexHigh) << 32)
+						| u64::from(parent_information.nFileIndexLow),
+				),
+				size:              (u64::from(information.nFileSizeHigh) << 32)
+					| u64::from(information.nFileSizeLow),
+				mtime_ns:          i64::try_from(mtime_ns).expect("mtime fits i64"),
+				directory:         false,
+				detach_only:       false,
+				quarantine_name:   None,
+				sha256:            Some(sha256(bytes)),
+				allow_hard_link:   false,
+				require_hard_link: false,
+			}
+		}
+
+		struct ResetPublishFailureInjection;
+
+		impl Drop for ResetPublishFailureInjection {
+			fn drop(&mut self) {
+				inject_exact_replace_retained_publish_status(None);
+			}
+		}
+
+		#[test]
+		fn denied_source_publish_restores_live_predecessor_without_retrying_vacancy() {
+			let temporary = TempDir::new();
+			let source = temporary.0.join("staging.exe");
+			let destination = temporary.0.join("gjc.exe");
+			let backup_name = "gjc.exe.backup";
+			let backup = temporary.0.join(backup_name);
+			fs::write(&source, b"new binary").expect("write staged executable");
+			fs::write(&destination, b"old binary").expect("write installed executable");
+			for path in [&source, &destination] {
+				let secured = apply_owner_only_path_security(
+					path.to_string_lossy().into_owned(),
+					"file".to_owned(),
+				);
+				assert!(secured.ok, "owner-only security failed: {:?}", secured.code);
+			}
+			let source_identity = identity(&source, &temporary.0, b"new binary");
+			let destination_identity = identity(&destination, &temporary.0, b"old binary");
+			let _reset_injection = ResetPublishFailureInjection;
+			inject_exact_replace_retained_publish_status(Some(STATUS_ACCESS_DENIED));
+
+			let result = exact_replace_retained(
+				&source,
+				&destination,
+				backup_name,
+				&source_identity,
+				&destination_identity,
+			);
+
+			assert!(!result.ok);
+			assert_eq!(result.code.as_deref(), Some("access_denied"));
+			assert_eq!(result.detached_path, None);
+			assert_eq!(fs::read(&destination).expect("read restored executable"), b"old binary");
+			assert_eq!(fs::read(&source).expect("read retained staged executable"), b"new binary");
+			assert!(!backup.exists(), "the predecessor must be restored before returning");
 		}
 	}
 

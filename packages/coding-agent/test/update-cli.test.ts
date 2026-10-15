@@ -2101,6 +2101,69 @@ describe("update-cli binary replacement", () => {
 		expect(await Bun.file(tempPath).exists()).toBe(false);
 		expect(await Bun.file(backupPath).exists()).toBe(false);
 	});
+	it("logs redundant-stage cleanup paths when verification failure triggers rollback", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc.exe");
+		const recordedStage = path.join(dir, "gjc.new.recorded.exe");
+		const retryStage = path.join(dir, "gjc.new.retry.exe");
+		const detachedPath = path.join(dir, "gjc.new.retry.exe.cleanup");
+		const placeholderPath = path.join(dir, "gjc.new.retry.exe.placeholder");
+		const backupPath = path.join(dir, "gjc.exe.bak");
+		await writeFixtureFile(targetPath, "old binary");
+		await writeFixtureFile(recordedStage, "new binary");
+		await writeFixtureFile(retryStage, "new binary");
+		const target = (await snapshotRegularFile(targetPath))!;
+		const stage = (await snapshotRegularFile(recordedStage))!;
+		const parent = (await snapshotDirectory(dir))!;
+		await createActivationRecordFile({
+			...buildActivationRecord({
+				targetPath,
+				targetIdentity: target.identity,
+				parentIdentity: parent,
+				baselineDigest: target.identity.sha256,
+				stagingPath: recordedStage,
+				stagingIdentity: stage.identity,
+				candidate: { digest: stage.identity.sha256, version: "15.1.8" },
+			}),
+			phase: "pending_activation",
+		});
+
+		const exactUnlink = native.exactUnlink;
+		const unlinkSpy = vi.spyOn(native, "exactUnlink").mockImplementation((filePath, identity) => {
+			if (path.resolve(filePath) === retryStage) {
+				return {
+					ok: false,
+					code: "cleanup_pending",
+					detachedPath,
+					retainedPlaceholderPath: placeholderPath,
+				};
+			}
+			return exactUnlink(filePath, identity);
+		});
+		const warnSpy = vi.spyOn(logger, "warn");
+		try {
+			await expect(
+				replaceBinaryFixture({
+					targetPath,
+					tempPath: retryStage,
+					backupPath,
+					expectedVersion: "15.1.8",
+					verifyInstalledVersion: async () => ({ ok: false, path: targetPath }),
+				}),
+			).rejects.toThrow("could not verify updated version");
+
+			expect(warnSpy).toHaveBeenCalledWith("Update staging cleanup failed before activation rollback", {
+				warning: expect.stringContaining(`detached=${detachedPath}|placeholder=${placeholderPath}`),
+			});
+			expect(await Bun.file(targetPath).text()).toBe("old binary");
+			expect(await Bun.file(retryStage).text()).toBe("new binary");
+			expect(await Bun.file(recordedStage).exists()).toBe(false);
+			expect(await Bun.file(backupPath).exists()).toBe(false);
+		} finally {
+			warnSpy.mockRestore();
+			unlinkSpy.mockRestore();
+		}
+	});
 	it("installs a fresh binary when the migration target does not exist yet", async () => {
 		const dir = await makeTempDir();
 		const targetPath = path.join(dir, "gjc");

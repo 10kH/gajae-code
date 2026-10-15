@@ -1001,7 +1001,13 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 		await updateActivationRecordFile({ ...record, phase: "verified" }, recordIdentity);
 		return verification;
 	} catch (primary) {
-		if (redundantStage) await tryRemoveExactStagingFile(redundantStage.path, redundantStage.identity);
+		const stagingCleanupWarning = redundantStage
+			? await tryRemoveExactStagingFile(redundantStage.path, redundantStage.identity)
+			: undefined;
+		if (stagingCleanupWarning)
+			logger.warn("Update staging cleanup failed before activation rollback", {
+				warning: stagingCleanupWarning,
+			});
 		try {
 			const after = await snapshotRegularFile(targetPath);
 			if (!after || !record.targetIdentity || !sameFileIdentity(record.targetIdentity, after.identity))
