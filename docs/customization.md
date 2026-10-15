@@ -90,12 +90,15 @@ field and its own argument placeholders, but does not translate Claude-specific
 metadata such as tool restrictions or model selection.
 
 `--dry-run` reports the planned imports and skips without writing; `--force`
-explicitly updates existing destination files. Instruction and command writes
-refuse to follow symlinked destination directories. Codex prompts are imported
-as slash commands, not skills. Claude Code subagents, extensions,
-Claude Code/Codex hooks and settings (model, permissions, and environment), and
-optional session history are not imported by this command and still need manual
-migration. This is not a replacement for the all-surface `/extensions` preview.
+explicitly updates existing destination files. Command destination collisions
+are compared case-insensitively for portability; without `--force`, the later
+selected command is skipped, and with `--force` it updates the first destination.
+Instruction and command writes refuse to follow symlinked destination directories.
+Codex prompts are imported as slash commands, not skills. Claude Code subagents,
+extensions, Claude Code/Codex hooks and settings (model, permissions, and
+environment), and optional session history are not imported by this command and
+still need manual migration. This is not a replacement for the all-surface
+`/extensions` preview.
 Direct native MCP registration uses `gjc mcp add`; see the linked MCP reference.
 
 ### Effective runtime precedence

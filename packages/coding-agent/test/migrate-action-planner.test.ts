@@ -350,6 +350,56 @@ describe("planMigration — slash commands", () => {
 		expect(forced.actions[0]).toMatchObject({ operation: "update", status: "updated" });
 	});
 
+	test("case-equivalent names collide before execution and force updates the planned path", async () => {
+		const results = [
+			result({
+				slashCommandCandidates: [
+					slashCommand("Review", "Claude command."),
+					{ source: "codex", name: "review", content: "Codex prompt." },
+				],
+			}),
+		];
+		const skipped = await planMigration({ results, destinations: dest, force: false });
+		expect(skipped.actions[0]).toMatchObject({ name: "Review", status: "imported" });
+		expect(skipped.actions[1]).toMatchObject({
+			name: "review",
+			operation: "skip",
+			status: "skipped_exists",
+			reason: 'case-insensitive destination collision with "Review"',
+		});
+
+		const forced = await planMigration({ results, destinations: dest, force: true });
+		expect(forced.actions[1]).toMatchObject({
+			name: "review",
+			destination: path.join(dest.commandsDir, "Review.md"),
+			operation: "update",
+			status: "updated",
+			command: { content: "Codex prompt." },
+		});
+		const executed = await executeActions(forced.actions, { project: true });
+		expect(executed.map(action => action.status)).toEqual(["imported", "updated"]);
+		expect(await fs.readFile(path.join(dest.commandsDir, "Review.md"), "utf-8")).toBe("Codex prompt.");
+	});
+
+	test("case-equivalent existing files are treated as the same command destination", async () => {
+		await fs.mkdir(dest.commandsDir, { recursive: true });
+		const existingDestination = path.join(dest.commandsDir, "Review.md");
+		await fs.writeFile(existingDestination, "Existing command.", "utf-8");
+		const candidate = result({ slashCommandCandidates: [slashCommand("review", "Imported prompt.")] });
+		const skipped = await planMigration({ results: [candidate], destinations: dest, force: false });
+		expect(skipped.actions[0]).toMatchObject({
+			destination: existingDestination,
+			operation: "skip",
+			status: "skipped_exists",
+		});
+		const forced = await planMigration({ results: [candidate], destinations: dest, force: true });
+		expect(forced.actions[0]).toMatchObject({
+			destination: existingDestination,
+			operation: "update",
+			status: "updated",
+		});
+	});
+
 	test("unsafe names and symlinked command destinations are not writable", async () => {
 		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "migrate-command-outside-"));
 		try {

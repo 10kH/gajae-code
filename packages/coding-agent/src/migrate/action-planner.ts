@@ -77,6 +77,67 @@ async function indexDestinationSkills(skillsDir: string): Promise<DestSkillIndex
 	return index;
 }
 
+interface CommandDestinationInspection {
+	destination: string;
+	exists: boolean;
+	unsafeReason?: string;
+}
+
+/** Resolve case-equivalent existing paths so command collisions stay portable. */
+async function inspectCommandDestination(
+	commandsDir: string,
+	nameParts: string[],
+): Promise<CommandDestinationInspection> {
+	const segments = [...nameParts.slice(0, -1), `${nameParts[nameParts.length - 1]}.md`];
+	let directory = commandsDir;
+
+	for (let index = 0; index < segments.length; index++) {
+		const segment = segments[index]!;
+		const entries = await fs.readdir(directory, { withFileTypes: true }).catch((error: unknown) => {
+			if (!isEnoent(error)) throw error;
+			return null;
+		});
+		if (!entries) {
+			return { destination: path.join(directory, ...segments.slice(index)), exists: false };
+		}
+
+		const matches = entries.filter(entry => entry.name.toLowerCase() === segment.toLowerCase());
+		if (matches.length > 1) {
+			return {
+				destination: path.join(directory, segment),
+				exists: false,
+				unsafeReason: `multiple case-equivalent destination entries exist for ${segment} in ${directory}`,
+			};
+		}
+		const entry = matches[0];
+		if (!entry) return { destination: path.join(directory, ...segments.slice(index)), exists: false };
+
+		const entryPath = path.join(directory, entry.name);
+		if (index < segments.length - 1) {
+			if (!entry.isDirectory() || entry.isSymbolicLink()) {
+				return {
+					destination: entryPath,
+					exists: false,
+					unsafeReason: `command destination ancestor is not a real directory: ${entryPath}`,
+				};
+			}
+			directory = entryPath;
+			continue;
+		}
+
+		if (!entry.isFile() || entry.isSymbolicLink()) {
+			return {
+				destination: entryPath,
+				exists: false,
+				unsafeReason: "destination is not a regular file; refusing to replace it",
+			};
+		}
+		return { destination: entryPath, exists: true };
+	}
+
+	throw new Error("slash command name has no destination segment");
+}
+
 export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 	const actions: MigrateAction[] = [];
 	const warnings: MigrateWarning[] = [];
@@ -372,7 +433,7 @@ export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 	}
 
 	// 5. Slash commands — command names map to the scoped commands directory.
-	const plannedCommands = new Set<string>();
+	const plannedCommands = new Map<string, { name: string; destination: string }>();
 	const validCommandNameSegment = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 	for (const result of input.results) {
 		for (const candidate of result.slashCommandCandidates) {
@@ -390,19 +451,26 @@ export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 				continue;
 			}
 
-			const destination = path.join(
+			const requestedDestination = path.join(
 				input.destinations.commandsDir,
 				...nameParts.slice(0, -1),
 				`${nameParts[nameParts.length - 1]}.md`,
 			);
-			const base = { source: candidate.source, type: "command" as const, name: candidate.name, destination };
-			if (plannedCommands.has(destination)) {
+			const collisionKey = path.resolve(requestedDestination).toLowerCase();
+			const plannedCommand = plannedCommands.get(collisionKey);
+			let destination = plannedCommand?.destination ?? requestedDestination;
+			let base = { source: candidate.source, type: "command" as const, name: candidate.name, destination };
+			if (plannedCommand) {
+				const sameName = plannedCommand.name === candidate.name;
+				const collisionReason = sameName
+					? "duplicate within this run"
+					: `case-insensitive destination collision with "${plannedCommand.name}"`;
 				if (input.force) {
 					actions.push({
 						...base,
 						operation: "update",
 						status: "updated",
-						reason: "duplicate within this run (overwritten under --force)",
+						reason: `${collisionReason} (overwritten under --force)`,
 						command: { content: candidate.content },
 					});
 				} else {
@@ -410,7 +478,7 @@ export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 						...base,
 						operation: "skip",
 						status: "skipped_exists",
-						reason: "duplicate within this run",
+						reason: collisionReason,
 					});
 				}
 				continue;
@@ -445,7 +513,7 @@ export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 					status: "failed_io",
 					reason: `failed to inspect command destination directory: ${(directoryReadError as Error).message}`,
 				});
-				plannedCommands.add(destination);
+				plannedCommands.set(collisionKey, { name: candidate.name, destination });
 				continue;
 			}
 			if (unsafeDirectory) {
@@ -455,48 +523,47 @@ export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 					status: input.force ? "failed_invalid_destination" : "skipped_exists",
 					reason: `command destination ancestor is not a real directory: ${unsafeDirectory}`,
 				});
-				plannedCommands.add(destination);
+				plannedCommands.set(collisionKey, { name: candidate.name, destination });
 				continue;
 			}
 
-			let exists = false;
+			let inspection: CommandDestinationInspection;
 			try {
-				const stat = await fs.lstat(destination);
-				exists = true;
-				if (!stat.isFile() || stat.isSymbolicLink()) {
-					actions.push({
-						...base,
-						operation: input.force ? "fail" : "skip",
-						status: input.force ? "failed_invalid_destination" : "skipped_exists",
-						reason: "destination is not a regular file; refusing to replace it",
-					});
-					plannedCommands.add(destination);
-					continue;
-				}
+				inspection = await inspectCommandDestination(input.destinations.commandsDir, nameParts);
 			} catch (error) {
-				if (!isEnoent(error)) {
-					actions.push({
-						...base,
-						operation: "fail",
-						status: "failed_io",
-						reason: `failed to inspect command destination: ${(error as Error).message}`,
-					});
-					plannedCommands.add(destination);
-					continue;
-				}
+				actions.push({
+					...base,
+					operation: "fail",
+					status: "failed_io",
+					reason: `failed to inspect command destination: ${(error as Error).message}`,
+				});
+				plannedCommands.set(collisionKey, { name: candidate.name, destination });
+				continue;
+			}
+			destination = inspection.destination;
+			base = { ...base, destination };
+			if (inspection.unsafeReason) {
+				actions.push({
+					...base,
+					operation: input.force ? "fail" : "skip",
+					status: input.force ? "failed_invalid_destination" : "skipped_exists",
+					reason: inspection.unsafeReason,
+				});
+				plannedCommands.set(collisionKey, { name: candidate.name, destination });
+				continue;
 			}
 
-			if (exists && !input.force) {
+			if (inspection.exists && !input.force) {
 				actions.push({ ...base, operation: "skip", status: "skipped_exists" });
 			} else {
 				actions.push({
 					...base,
-					operation: exists ? "update" : "create",
-					status: exists ? "updated" : "imported",
+					operation: inspection.exists ? "update" : "create",
+					status: inspection.exists ? "updated" : "imported",
 					command: { content: candidate.content },
 				});
 			}
-			plannedCommands.add(destination);
+			plannedCommands.set(collisionKey, { name: candidate.name, destination });
 		}
 	}
 
