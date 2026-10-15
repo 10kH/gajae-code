@@ -58,7 +58,7 @@ function slackPublicationClientMsgId(publicationId: string): string {
 
 // Durable filesystem publication leases must outlast one event-loop and persistence turn.
 const MIN_PUBLICATION_LEASE_MS = 100;
-const ROOT_PUBLICATION_WAIT_MS = 5_000;
+const ROOT_PUBLICATION_POLL_MS = 50;
 const INBOUND_REACTION_DEADLINE_MS = 5_000;
 const RETIREMENT_DRAIN_MS = 5_000;
 const INBOUND_REACTION = "eyes";
@@ -3271,9 +3271,9 @@ export class SlackNotificationDaemon {
 		body: string,
 		endpointGeneration: number,
 	): Promise<SlackConversation> {
-		const deadline = performance.now() + ROOT_PUBLICATION_WAIT_MS;
-		while (performance.now() < deadline) {
-			await Bun.sleep(10);
+		// Another owner may renew this lease while provider work is active, so wait for the durable transition.
+		while (true) {
+			await Bun.sleep(ROOT_PUBLICATION_POLL_MS);
 			const current = await this.store.read(key);
 			if (current?.state === "active") {
 				const currentGeneration = this.#requireEndpointGeneration(current);
@@ -3283,6 +3283,7 @@ export class SlackNotificationDaemon {
 				return await this.resume(sessionId, body, endpointGeneration);
 			}
 			if (
+				current === undefined ||
 				current?.state === "error" ||
 				(current?.state === "posting_root" &&
 					this.#leaseExpired(current.rootPublicationLeaseExpiresAt, this.#now())) ||
@@ -3293,7 +3294,6 @@ export class SlackNotificationDaemon {
 				return await this.postRoot(sessionId, body, endpointGeneration);
 			}
 		}
-		throw new Error("Slack root post is still pending");
 	}
 
 	async #waitForAction(key: string, sessionId: string, body: string, actionId: string): Promise<SlackConversation> {

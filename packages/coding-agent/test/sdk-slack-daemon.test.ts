@@ -611,7 +611,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 		});
 	});
 
-	it("allows only the durable posting-root owner to publish a concurrent root", async () => {
+	it("waits for the active root publisher beyond the former five-second limit", async () => {
 		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-concurrent-"));
 		try {
 			const fake = new FakeSlack();
@@ -635,7 +635,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 			);
 			try {
 				await fake.waitForPostStartCount(1);
-				await Bun.sleep(1_100);
+				await Bun.sleep(5_250);
 			} finally {
 				postGate.resolve();
 			}
@@ -647,7 +647,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 		} finally {
 			await fs.rm(agentDir, { recursive: true, force: true });
 		}
-	});
+	}, 15_000);
 
 	it("takes over an expired crashed root publisher while retaining its client message identity", async () => {
 		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-root-lease-"));

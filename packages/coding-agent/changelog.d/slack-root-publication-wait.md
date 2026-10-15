@@ -1,3 +1,3 @@
 ### Fixed
 
-- Concurrent Slack root requests now wait up to five seconds for the active durable publisher before failing, avoiding false timeouts during slow filesystem turns.
+- Concurrent Slack root requests now wait through the active durable publication lease and retry only after its state changes or expires, avoiding false timeouts while a valid publisher is still working.
