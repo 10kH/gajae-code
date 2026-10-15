@@ -33,7 +33,7 @@ describe("session HTML export embed", () => {
 			session = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
 			session.appendMessage({
 				role: "user",
-				content: `${ORDINARY_SENTENCE} ${API_KEY} ${GITHUB_TOKEN} private_token=abc123 AWS_SECRET_ACCESS_KEY=x password="correct horse battery" authorization="Bearer abc" ${ESCAPED_CREDENTIAL}`,
+				content: `${ORDINARY_SENTENCE} ${API_KEY} ${GITHUB_TOKEN} private_token=abc123 AWS_SECRET_ACCESS_KEY=x password="correct horse battery" authorization="Bearer abc" Authorization: ApiKey opaque-secret\n${ESCAPED_CREDENTIAL}`,
 				timestamp: 1,
 			});
 			const outputPath = path.join(tempDir, "export.html");
@@ -52,6 +52,7 @@ describe("session HTML export embed", () => {
 			expect(embedded).not.toContain("AWS_SECRET_ACCESS_KEY=x");
 			expect(embedded).not.toContain("correct horse battery");
 			expect(embedded).not.toContain("Bearer abc");
+			expect(embedded).not.toContain("opaque-secret");
 			expect(embedded).toContain("«redacted»");
 			expect(embedded).toContain("payload=");
 			expect(embedded).toContain("«redacted-api-key»");
@@ -256,6 +257,51 @@ describe("session HTML export embed", () => {
 				"«redacted-api-key»#2": true,
 				"«redacted-api-key»#3": false,
 			});
+		} finally {
+			await session?.close();
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("assigns suffixes efficiently for large credential-key collisions", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-html-export-many-credential-keys-"));
+		let session: SessionManager | undefined;
+		try {
+			session = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+			const credentialKeyMap: Record<string, unknown> = { "«redacted-api-key»": "existing-value" };
+			for (let index = 0; index < 10_000; index++) {
+				credentialKeyMap[`sk-${index.toString(36).padStart(12, "0")}`] = index;
+			}
+			session.appendMessage({
+				role: "assistant",
+				content: [
+					{
+						type: "toolCall",
+						id: "call-many-credential-keys",
+						name: "echo",
+						arguments: { credentialKeyMap },
+					},
+				],
+				timestamp: 1,
+			} as unknown as Parameters<SessionManager["appendMessage"]>[0]);
+
+			const outputPath = path.join(tempDir, "export.html");
+			const startedAt = performance.now();
+			await exportSessionToHtml(session, undefined, { outputPath });
+			expect(performance.now() - startedAt).toBeLessThan(5_000);
+
+			const embedded = embeddedSessionText(await Bun.file(outputPath).text());
+			const parsed = JSON.parse(embedded) as {
+				entries: Array<{
+					message?: {
+						content?: Array<{ arguments?: { credentialKeyMap?: Record<string, unknown> } }>;
+					};
+				}>;
+			};
+			const exportedKeys = parsed.entries[0]?.message?.content?.[0]?.arguments?.credentialKeyMap;
+			expect(Object.keys(exportedKeys ?? {})).toHaveLength(10_001);
+			expect(exportedKeys?.["«redacted-api-key»"]).toBe("existing-value");
+			expect(exportedKeys?.["«redacted-api-key»#10001"]).toBe(9_999);
 		} finally {
 			await session?.close();
 			await fs.rm(tempDir, { recursive: true, force: true });

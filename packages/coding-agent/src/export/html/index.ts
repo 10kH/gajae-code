@@ -265,17 +265,28 @@ function redactJsonValue(value: unknown): unknown {
 	if (value === null || typeof value !== "object") return value;
 	const source = value as Record<string, unknown>;
 	const redacted = Object.create(null) as Record<string, unknown>;
+	const nextSuffixByKey = new Map<string, number>();
 	for (const key of Object.keys(source)) {
-		const redactedKey = uniqueJsonObjectKey(redacted, redactCrashSecrets(key));
+		const redactedKey = uniqueJsonObjectKey(redacted, redactCrashSecrets(key), nextSuffixByKey);
 		redacted[redactedKey] = redactKeyedValue(key, source[key]);
 	}
 	return redacted;
 }
 
-function uniqueJsonObjectKey(target: Record<string, unknown>, key: string): string {
-	let candidate = key;
-	let suffix = 2;
-	while (Object.hasOwn(target, candidate)) candidate = `${key}#${suffix++}`;
+// Resume after the last collision for this base key rather than rescanning prior suffixes.
+function uniqueJsonObjectKey(
+	target: Record<string, unknown>,
+	key: string,
+	nextSuffixByKey: Map<string, number>,
+): string {
+	if (!Object.hasOwn(target, key)) return key;
+	let suffix = nextSuffixByKey.get(key) ?? 2;
+	let candidate = `${key}#${suffix}`;
+	while (Object.hasOwn(target, candidate)) {
+		suffix += 1;
+		candidate = `${key}#${suffix}`;
+	}
+	nextSuffixByKey.set(key, suffix + 1);
 	return candidate;
 }
 
