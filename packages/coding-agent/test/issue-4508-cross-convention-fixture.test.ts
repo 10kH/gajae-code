@@ -250,7 +250,7 @@ async function consumeCanonicalBundle(marker: string): Promise<{
 	const created = await createAgentSession({
 		cwd: projectDir,
 		agentDir,
-		settings: Settings.isolated(),
+		settings: Settings.isolated({ "mcp.enableProjectConfig": true }),
 		sessionManager: SessionManager.inMemory(projectDir),
 		skills: loadedSkills.skills,
 		rules: [],
