@@ -10,6 +10,23 @@ import * as path from "node:path";
  */
 
 const PROBE = path.join(import.meta.dir, "../../fixtures/share-gh-env-probe.ts");
+const CLR_PROFILER_ENV_KEYS = [
+	"CORECLR_ENABLE_PROFILING",
+	"DOTNET_ENABLE_PROFILING",
+	"CORECLR_PROFILER",
+	"DOTNET_PROFILER",
+	"CORECLR_PROFILER_PATH",
+	"CORECLR_PROFILER_PATH_32",
+	"CORECLR_PROFILER_PATH_64",
+	"CORECLR_PROFILER_PATH_ARM32",
+	"CORECLR_PROFILER_PATH_ARM64",
+	"DOTNET_PROFILER_PATH",
+	"DOTNET_PROFILER_PATH_32",
+	"DOTNET_PROFILER_PATH_64",
+	"DOTNET_PROFILER_PATH_ARM32",
+	"DOTNET_PROFILER_PATH_ARM64",
+] as const;
+type ClrProfilerEnvironmentKey = (typeof CLR_PROFILER_ENV_KEYS)[number];
 const TRUST_KEYS = [
 	"GH_HOST",
 	"GH_CONFIG_DIR",
@@ -51,6 +68,7 @@ const TRUST_KEYS = [
 	"PHPRC",
 	"PHP_INI_SCAN_DIR",
 	"DOTNET_STARTUP_HOOKS",
+	...CLR_PROFILER_ENV_KEYS,
 	"PATH",
 	"HTTP_PROXY",
 	"HTTPS_PROXY",
@@ -112,6 +130,7 @@ interface GhSpawn {
 	PHPRC: string | null;
 	PHP_INI_SCAN_DIR: string | null;
 	DOTNET_STARTUP_HOOKS: string | null;
+	profilerEnvironment: Record<ClrProfilerEnvironmentKey, string | null>;
 	GH_HOST: string | null;
 	GH_CONFIG_DIR: string | null;
 	GH_TOKEN: string | null;
@@ -209,6 +228,9 @@ await fsPromises.appendFile(
 		PHPRC: process.env.PHPRC ?? null,
 		PHP_INI_SCAN_DIR: process.env.PHP_INI_SCAN_DIR ?? null,
 		DOTNET_STARTUP_HOOKS: process.env.DOTNET_STARTUP_HOOKS ?? null,
+		profilerEnvironment: Object.fromEntries(
+			${JSON.stringify(CLR_PROFILER_ENV_KEYS)}.map(name => [name, process.env[name] ?? null]),
+		),
 		GH_HOST: process.env.GH_HOST ?? null,
 		GH_CONFIG_DIR: process.env.GH_CONFIG_DIR ?? null,
 		GH_TOKEN: process.env.GH_TOKEN ?? null,
@@ -432,7 +454,9 @@ function expectDestination(
 			| "DYLD_FALLBACK_FRAMEWORK_PATH"
 			| "DYLD_ROOT_PATH"
 		>
-	>,
+	> & {
+		profilerEnvironment?: Partial<GhSpawn["profilerEnvironment"]>;
+	},
 	allowPathsInsideLaunchDirectory = false,
 ): void {
 	expect(spawns[0]?.args).toEqual(["auth", "status"]);
@@ -493,6 +517,8 @@ function expectDestination(
 		expect(spawn.PHPRC).toBe(expected.PHPRC ?? null);
 		expect(spawn.PHP_INI_SCAN_DIR).toBe(expected.PHP_INI_SCAN_DIR ?? null);
 		expect(spawn.DOTNET_STARTUP_HOOKS).toBe(expected.DOTNET_STARTUP_HOOKS ?? null);
+		for (const name of CLR_PROFILER_ENV_KEYS)
+			expect(spawn.profilerEnvironment[name]).toBe(expected.profilerEnvironment?.[name] ?? null);
 		expect(spawn.HTTP_PROXY).toBe(expected.HTTP_PROXY ?? null);
 		expect(spawn.HTTPS_PROXY).toBe(expected.HTTPS_PROXY ?? null);
 		expect(spawn.ALL_PROXY).toBe(expected.ALL_PROXY ?? null);
@@ -590,6 +616,20 @@ CLASSPATH=/project/classes
 PHPRC=/project/php.ini
 PHP_INI_SCAN_DIR=/project/php-conf.d
 DOTNET_STARTUP_HOOKS=/project/dotnet-startup.dll
+CORECLR_ENABLE_PROFILING=1
+DOTNET_ENABLE_PROFILING=1
+CORECLR_PROFILER={12345678-1234-1234-1234-123456789012}
+DOTNET_PROFILER={12345678-1234-1234-1234-123456789012}
+CORECLR_PROFILER_PATH=/project/coreclr-profiler.so
+CORECLR_PROFILER_PATH_32=/project/coreclr-profiler-32.so
+CORECLR_PROFILER_PATH_64=/project/coreclr-profiler-64.so
+CORECLR_PROFILER_PATH_ARM32=/project/coreclr-profiler-arm32.so
+CORECLR_PROFILER_PATH_ARM64=/project/coreclr-profiler-arm64.so
+DOTNET_PROFILER_PATH=/project/dotnet-profiler.so
+DOTNET_PROFILER_PATH_32=/project/dotnet-profiler-32.so
+DOTNET_PROFILER_PATH_64=/project/dotnet-profiler-64.so
+DOTNET_PROFILER_PATH_ARM32=/project/dotnet-profiler-arm32.so
+DOTNET_PROFILER_PATH_ARM64=/project/dotnet-profiler-arm64.so
 `,
 		});
 		expectDestination(spawns, {
@@ -627,6 +667,9 @@ DOTNET_STARTUP_HOOKS=/project/dotnet-startup.dll
 	});
 
 	it("preserves operator-declared interpreter runtime settings", async () => {
+		const profilerEnvironment = Object.fromEntries(
+			CLR_PROFILER_ENV_KEYS.map(name => [name, `operator-${name.toLowerCase()}`]),
+		) as Record<ClrProfilerEnvironmentKey, string>;
 		const spawns = await share({
 			env: {
 				NODE_OPTIONS: "--no-warnings",
@@ -656,6 +699,7 @@ DOTNET_STARTUP_HOOKS=/project/dotnet-startup.dll
 				PHPRC: "/operator/php.ini",
 				PHP_INI_SCAN_DIR: "/operator/php-conf.d",
 				DOTNET_STARTUP_HOOKS: "/operator/dotnet-startup.dll",
+				...profilerEnvironment,
 			},
 		});
 		expectDestination(spawns, {
@@ -686,6 +730,7 @@ DOTNET_STARTUP_HOOKS=/project/dotnet-startup.dll
 			PHPRC: "/operator/php.ini",
 			PHP_INI_SCAN_DIR: "/operator/php-conf.d",
 			DOTNET_STARTUP_HOOKS: "/operator/dotnet-startup.dll",
+			profilerEnvironment,
 		});
 	});
 
