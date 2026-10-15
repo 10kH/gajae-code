@@ -338,6 +338,14 @@ describe("recordFatalCrash", () => {
 		expect(redactCrashSecrets("authToken={nested:opaque-secret}")).toBe("authToken=«redacted»");
 	});
 
+	it("redacts abbreviated password credential fields", () => {
+		for (const key of ["pwd", "dbPwd", "user_pwd"]) expect(isCredentialKey(key)).toBe(true);
+		expect(redactCrashSecrets("pwd=opaque-pwd dbPwd=opaque-db-pwd user_pwd=opaque-user-pwd")).toBe(
+			"pwd=«redacted» dbPwd=«redacted» user_pwd=«redacted»",
+		);
+		expect(redactCrashSecrets('{"dbPwd":"opaque-db-pwd"}')).toBe('{"dbPwd":"«redacted»"}');
+	});
+
 	it("redacts passphrase credential-key variants", () => {
 		for (const key of ["passphrase", "sshPassphrase", "key_passphrase", "SSH_PASSPHRASE"]) {
 			expect(isCredentialKey(key)).toBe(true);
