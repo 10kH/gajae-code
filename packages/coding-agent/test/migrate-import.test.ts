@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { resetAgentDirFromEnvironment, setAgentDir } from "@gajae-code/utils";
 import { runMigrate } from "../src/cli/migrate-cli";
 import { readMCPConfigFile } from "../src/runtime-mcp/config-writer";
 
@@ -41,6 +42,61 @@ describe("end-to-end import", () => {
 		const report = await runMigrate(opts({ from: ["claude-code"] }));
 		expect(await fs.readFile(path.join(cwd, ".gjc", "AGENTS.md"), "utf-8")).toBe("Instructions only.");
 		expect(report.actions).toContainEqual(expect.objectContaining({ type: "instruction", status: "imported" }));
+	});
+
+	test("user instructions import one selected source and report the later collision", async () => {
+		await write(".claude/CLAUDE.md", "Claude user instructions.");
+		await write(".codex/AGENTS.md", "Codex user instructions.");
+		const agentDir = path.join(home, "agent");
+		const previous = process.env.GJC_CODING_AGENT_DIR;
+		setAgentDir(agentDir);
+		try {
+			const report = await runMigrate(opts({ project: false, from: ["all"] }));
+			const claude = report.actions.find(action => action.type === "instruction" && action.source === "claude-code");
+			const codex = report.actions.find(action => action.type === "instruction" && action.source === "codex");
+			expect(claude).toMatchObject({ status: "imported", destination: path.join(agentDir, "AGENTS.md") });
+			expect(codex).toMatchObject({
+				status: "skipped_exists",
+				reason: "another selected source already targets this file; import one source at a time",
+			});
+			expect(await fs.readFile(path.join(agentDir, "AGENTS.md"), "utf-8")).toBe("Claude user instructions.");
+
+			const codexOnly = await runMigrate(opts({ project: false, from: ["codex"], force: true }));
+			expect(codexOnly.actions).toContainEqual(
+				expect.objectContaining({ source: "codex", type: "instruction", status: "updated" }),
+			);
+			expect(await fs.readFile(path.join(agentDir, "AGENTS.md"), "utf-8")).toBe("Codex user instructions.");
+		} finally {
+			if (previous === undefined) delete process.env.GJC_CODING_AGENT_DIR;
+			else process.env.GJC_CODING_AGENT_DIR = previous;
+			resetAgentDirFromEnvironment();
+		}
+	});
+
+	test("user instruction import refuses a symlinked configuration root", async () => {
+		await write(".claude/CLAUDE.md", "Do not write through this link.");
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "migrate-import-user-outside-"));
+		const configRoot = path.join(home, ".gjc");
+		await fs.symlink(outside, configRoot, "dir");
+		const agentDir = path.join(configRoot, "agent");
+		const previous = process.env.GJC_CODING_AGENT_DIR;
+		setAgentDir(agentDir);
+		try {
+			const report = await runMigrate(opts({ project: false, from: ["claude-code"] }));
+			const instruction = report.actions.find(action => action.type === "instruction");
+			expect(instruction).toMatchObject({ status: "failed_io", operation: "fail" });
+			expect(
+				await fs.access(path.join(outside, "agent", "AGENTS.md")).then(
+					() => true,
+					() => false,
+				),
+			).toBe(false);
+		} finally {
+			if (previous === undefined) delete process.env.GJC_CODING_AGENT_DIR;
+			else process.env.GJC_CODING_AGENT_DIR = previous;
+			resetAgentDirFromEnvironment();
+			await fs.rm(outside, { recursive: true, force: true });
+		}
 	});
 
 	test("claude-code imports MCP + skill", async () => {

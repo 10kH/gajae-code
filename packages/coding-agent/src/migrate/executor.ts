@@ -9,6 +9,7 @@
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { getTrustedHomeDir } from "@gajae-code/utils";
 import { upsertMCPServer } from "../runtime-mcp/config-writer";
 import type { MigrateAction } from "./types";
 
@@ -24,6 +25,7 @@ async function ensureRealDirectoryPathNoFollow(
 	trustedBase: string,
 	label = "skill destination",
 	createMissing = true,
+	mode?: number,
 ): Promise<void> {
 	const resolvedBase = path.resolve(trustedBase);
 	const resolvedDirectory = path.resolve(directory);
@@ -50,7 +52,7 @@ async function ensureRealDirectoryPathNoFollow(
 			// A missing project `.gjc` is created by the MCP writer (mode 0o700).
 			// Do not mkdir here, or that mode is lost. An existing symlink still fails above.
 			if (!createMissing) return;
-			await fs.mkdir(current);
+			await fs.mkdir(current, mode === undefined ? undefined : { mode });
 			const stat = await fs.lstat(current);
 			if (!stat.isDirectory() || stat.isSymbolicLink()) {
 				throw new Error(`${label} ancestor is not a real directory: ${current}`);
@@ -75,26 +77,35 @@ async function writeSkillFileNoFollow(destination: string, content: string): Pro
 }
 
 async function ensureInstructionDirectory(directory: string, project: boolean): Promise<void> {
+	let trustedBase = path.dirname(directory);
 	if (!project) {
-		await fs.mkdir(directory, { recursive: true, mode: 0o700 });
-		return;
-	}
-
-	let stat: Awaited<ReturnType<typeof fs.lstat>>;
-	try {
-		stat = await fs.lstat(directory);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-		try {
-			await fs.mkdir(directory, { mode: 0o700 });
-		} catch (mkdirError) {
-			if ((mkdirError as NodeJS.ErrnoException).code !== "EEXIST") throw mkdirError;
+		const home = path.resolve(getTrustedHomeDir());
+		const resolvedDirectory = path.resolve(directory);
+		const relative = path.relative(home, resolvedDirectory);
+		const isWithinHome =
+			relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+		if (isWithinHome) {
+			trustedBase = home;
+		} else {
+			let current = path.dirname(resolvedDirectory);
+			while (true) {
+				try {
+					const stat = await fs.lstat(current);
+					if (!stat.isDirectory() || stat.isSymbolicLink()) {
+						throw new Error(`user instruction destination ancestor is not a real directory: ${current}`);
+					}
+					trustedBase = current;
+					break;
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+					const parent = path.dirname(current);
+					if (parent === current) throw error;
+					current = parent;
+				}
+			}
 		}
-		stat = await fs.lstat(directory);
 	}
-	if (!stat.isDirectory() || stat.isSymbolicLink()) {
-		throw new Error(`instruction destination directory is not a real directory: ${directory}`);
-	}
+	await ensureRealDirectoryPathNoFollow(directory, trustedBase, "instruction destination", true, 0o700);
 }
 
 async function writeInstructionFileNoFollow(destination: string, content: string, project: boolean): Promise<void> {

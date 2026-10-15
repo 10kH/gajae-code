@@ -79,8 +79,9 @@ With `--project`, Claude Code reads the project-root `CLAUDE.md` and writes it
 to `<project>/.gjc/AGENTS.md`. A project-root Codex `AGENTS.md` is already a
 native GJC instruction source, so it is left in place rather than copied.
 `--dry-run` reports the planned imports and skips without writing; `--force`
-explicitly updates existing destination files. Codex prompts are imported as
-skills. Claude Code commands, subagents, extensions, Claude Code/Codex hooks and
+explicitly updates existing destination files. Instruction writes refuse to
+follow symlinked destination directories. Codex prompts are imported as skills.
+Claude Code commands, subagents, extensions, Claude Code/Codex hooks and
 settings (model, permissions, and environment), and optional session history are
 not imported by this command and still need manual migration. This is not a
 replacement for the all-surface `/extensions` preview. Direct native MCP
