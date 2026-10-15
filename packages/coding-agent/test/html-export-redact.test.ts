@@ -135,6 +135,9 @@ describe("session HTML export embed", () => {
 							sensitive_values: {
 								bearer: "opaque-bearer-value",
 								token: "opaque-token-value",
+								authToken: "opaque-auth-token-value",
+								githubToken: "opaque-github-token-value",
+								dbPassword: "opaque-db-password-value",
 								secret: "opaque-secret-value",
 								session_key: "opaque-session-key-value",
 								credential: "opaque-credential-value",
@@ -172,6 +175,9 @@ describe("session HTML export embed", () => {
 			for (const secret of [
 				"opaque-token-value",
 				"opaque-bearer-value",
+				"opaque-auth-token-value",
+				"opaque-github-token-value",
+				"opaque-db-password-value",
 				"opaque-secret-value",
 				"opaque-session-key-value",
 				"opaque-credential-value",
@@ -191,6 +197,9 @@ describe("session HTML export embed", () => {
 			expect(sensitiveValues).toEqual({
 				bearer: "«redacted»",
 				token: "«redacted»",
+				authToken: "«redacted»",
+				githubToken: "«redacted»",
+				dbPassword: "«redacted»",
 				secret: "«redacted»",
 				session_key: "«redacted»",
 				credential: "«redacted»",
@@ -314,7 +323,7 @@ describe("session HTML export embed", () => {
 		try {
 			session = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
 			const note =
-				'safe=keep credentials=["alpha","beta"] secrets={primary:alpha,secondary:{nested:[beta]}} metadata=["public"]\nCookie: theme=dark; sid=opaque-cookie-session\nafter=keep';
+				'safe=keep credentials=["alpha","beta"] secrets={primary:alpha,secondary:{nested:[beta]}} metadata=["public"]\nCookie: theme=dark; sid=opaque-cookie-session\nafter=keep\nCookie: theme=light\\nserialized-after=keep';
 			session.appendMessage({
 				role: "assistant",
 				content: [
@@ -342,8 +351,11 @@ describe("session HTML export embed", () => {
 			expect(exportedNote).toContain('metadata=["public"]');
 			expect(exportedNote).not.toContain("theme=dark");
 			expect(exportedNote).not.toContain("opaque-cookie-session");
+			expect(exportedNote).not.toContain("theme=light");
 			expect(exportedNote).toContain("Cookie: «redacted»");
 			expect(exportedNote).toContain("after=keep");
+			expect(exportedNote).toContain("Cookie: «redacted»\\nserialized-after=keep");
+			expect(exportedNote).toContain("serialized-after=keep");
 		} finally {
 			await session?.close();
 			await fs.rm(tempDir, { recursive: true, force: true });

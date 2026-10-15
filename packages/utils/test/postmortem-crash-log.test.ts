@@ -239,7 +239,8 @@ describe("recordFatalCrash", () => {
 
 	it("redacts complete Cookie header values without consuming following diagnostics", async () => {
 		const target = tempCrashLog();
-		const message = "before=keep\nCookie: theme=dark; sid=opaque-cookie-session\nafter=keep";
+		const message =
+			"before=keep\nCookie: theme=dark; sid=opaque-cookie-session\nafter=keep\nCookie: theme=light\\nserialized-after=keep";
 
 		recordFatalCrash("Uncaught Exception", new Error(message), { path: target });
 
@@ -249,6 +250,8 @@ describe("recordFatalCrash", () => {
 		expect(contents).toContain("Cookie: «redacted»");
 		expect(contents).toContain("before=keep");
 		expect(contents).toContain("after=keep");
+		expect(contents).toContain("Cookie: «redacted»\\nserialized-after=keep");
+		expect(contents).toContain("serialized-after=keep");
 	});
 
 	it("redacts short credentials following an authorization scheme as one value", () => {
@@ -258,6 +261,19 @@ describe("recordFatalCrash", () => {
 		expect(redactCrashSecrets("authorization: Basic x diagnostic=keep")).toBe(
 			"authorization: «redacted» diagnostic=keep",
 		);
+	});
+
+	it("redacts camelCase credential suffixes in labels and values", () => {
+		for (const key of ["authToken", "githubToken", "dbPassword"]) {
+			expect(isCredentialKey(key)).toBe(true);
+		}
+		expect(
+			redactCrashSecrets(
+				'authToken=opaque-auth-token githubToken="opaque-github-token" dbPassword=opaque-db-password',
+			),
+		).toBe('authToken=«redacted» githubToken="«redacted»" dbPassword=«redacted»');
+		expect(redactCrashSecrets('{"authToken":"opaque-auth-token"}')).toBe('{"authToken":"«redacted»"}');
+		expect(redactCrashSecrets("authToken={nested:opaque-secret}")).toBe("authToken=«redacted»");
 	});
 
 	it("redacts complete values for nonstandard authorization schemes", () => {

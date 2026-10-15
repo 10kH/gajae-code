@@ -9,9 +9,14 @@
 
 const CREDENTIAL_KEY_LABELS =
 	"api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?key|session[_-]?token|client[_-]?secret|aws[_-]?secret[_-]?access[_-]?key|secret[_-]?key|secret[_-]?access[_-]?key|password|passwd|auth|authorization|bearer|private[_-]?token|token|secrets?|credentials?|private[_-]?key|cookie";
-const CREDENTIAL_KEY_PATTERN = `(?:[A-Za-z0-9][A-Za-z0-9_-]*[_-])?(?:${CREDENTIAL_KEY_LABELS})`;
+const CREDENTIAL_KEY_PREFIX = `(?:[A-Za-z0-9][A-Za-z0-9_-]*[_-])?`;
+const CREDENTIAL_KEY_PATTERN = `${CREDENTIAL_KEY_PREFIX}(?:${CREDENTIAL_KEY_LABELS})`;
 const CREDENTIAL_KEY_SUFFIX = new RegExp(`^${CREDENTIAL_KEY_PATTERN}$`, "i");
+const CREDENTIAL_CAMEL_KEY_PATTERN =
+	"[a-z0-9]+(?:Token|Password|Passwd|Auth|Authorization|Bearer|Cookie|Secret|Secrets|Credential|Credentials)";
+const CREDENTIAL_CAMEL_KEY_SUFFIX = new RegExp(`^${CREDENTIAL_CAMEL_KEY_PATTERN}$`);
 const CREDENTIAL_ASSIGNMENT_PREFIX = String.raw`(?<![A-Za-z0-9_-])((?:\\*["']?-*)(?:${CREDENTIAL_KEY_PATTERN})(?:\\*["']?\s*[=:]\s*))`;
+const CREDENTIAL_CAMEL_ASSIGNMENT_PREFIX = String.raw`(?<![A-Za-z0-9_-])((?:\\*["']?-*)(?:${CREDENTIAL_CAMEL_KEY_PATTERN})(?:\\*["']?\s*[=:]\s*))`;
 const AUTHORIZATION_ASSIGNMENT_PREFIX = String.raw`(?<![A-Za-z0-9_-])((?:\\*["']?-*)(?:[A-Za-z0-9][A-Za-z0-9_-]*[_-])?(?:auth|authorization)(?:\\*["']?\s*[=:]\s*))`;
 const CREDENTIAL_AUTH_VALUE_PATTERN = new RegExp(
 	String.raw`${CREDENTIAL_ASSIGNMENT_PREFIX}(?:Bearer|Basic|Token)\s+(?:\\[ \t]|[^\s"',;}\]])+`,
@@ -21,14 +26,16 @@ const CREDENTIAL_AUTHORIZATION_VALUE_PATTERN = new RegExp(
 	String.raw`${AUTHORIZATION_ASSIGNMENT_PREFIX}(?!\s*["'«])[^\r\n]+`,
 	"gi",
 );
-const CREDENTIAL_VALUE_PATTERN = new RegExp(
-	String.raw`${CREDENTIAL_ASSIGNMENT_PREFIX}(?:(\\+")((?:\\[\s\S]|[^"\\])*?)(\\+")(?=$|[\s,;}\]])|(")((?:\\[\s\S]|[^"\\])*)(")|(\\+')((?:\\[\s\S]|[^'\\])*?)(\\+')(?=$|[\s,;}\]])|(')((?:\\[\s\S]|[^'\\])*)(')|(\\+")([^\r\n]*)(?=\r?\n|$)|(")([^\r\n]*)(?=\r?\n|$)|(\\+')([^\r\n]*)(?=\r?\n|$)|(')([^\r\n]*)(?=\r?\n|$)|((?:\\[ \t]|[^\s"',;}\]])+))`,
-	"gi",
+const CREDENTIAL_VALUE_PATTERN_BODY = String.raw`(?:(\\+")((?:\\[\s\S]|[^"\\])*?)(\\+")(?=$|[\s,;}\]])|(")((?:\\[\s\S]|[^"\\])*)(")|(\\+')((?:\\[\s\S]|[^'\\])*?)(\\+')(?=$|[\s,;}\]])|(')((?:\\[\s\S]|[^'\\])*)(')|(\\+")([^\r\n]*)(?=\r?\n|$)|(")([^\r\n]*)(?=\r?\n|$)|(\\+')([^\r\n]*)(?=\r?\n|$)|(')([^\r\n]*)(?=\r?\n|$)|((?:\\[ \t]|(?!\\+n|\\+r\\+n)[^\s"',;}\]])+))`;
+const CREDENTIAL_VALUE_PATTERN = new RegExp(`${CREDENTIAL_ASSIGNMENT_PREFIX}${CREDENTIAL_VALUE_PATTERN_BODY}`, "gi");
+const CREDENTIAL_CAMEL_VALUE_PATTERN = new RegExp(
+	`${CREDENTIAL_CAMEL_ASSIGNMENT_PREFIX}${CREDENTIAL_VALUE_PATTERN_BODY}`,
+	"g",
 );
 
 /** Whether a field name ends in a credential label recognized by the redactor. */
 export function isCredentialKey(key: string): boolean {
-	return CREDENTIAL_KEY_SUFFIX.test(key);
+	return CREDENTIAL_KEY_SUFFIX.test(key) || CREDENTIAL_CAMEL_KEY_SUFFIX.test(key);
 }
 
 /**
@@ -40,7 +47,10 @@ export function isCredentialKey(key: string): boolean {
  */
 export function redactCrashSecrets(text: string): string {
 	let redacted = redactCredentialContainers(text);
-	redacted = redacted.replace(/\b(?:Bearer|Basic|Token)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "«redacted-auth»");
+	redacted = redacted.replace(
+		/(?<![A-Za-z0-9_-])(?:Bearer|Basic|Token)\s+[A-Za-z0-9._~+/=-]{8,}/gi,
+		"«redacted-auth»",
+	);
 	redacted = redacted.replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, "«redacted-jwt»");
 	redacted = redacted.replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, "«redacted-api-key»");
 	// `gh[opsur]_` covers the classic PAT/OAuth/server/user/refresh prefixes;
@@ -106,64 +116,72 @@ export function redactCrashSecrets(text: string): string {
 	// unterminated value is redacted through the end of its line. Capture each
 	// complete key once and inspect its suffix; repeated compound-prefix groups
 	// backtrack quadratically on long attacker-controlled identifiers.
-	redacted = redacted.replace(
-		CREDENTIAL_VALUE_PATTERN,
-		(
-			_match: string,
-			prefix: string,
-			escapedDoubleOpen: string | undefined,
-			escapedDoubleQuoted: string | undefined,
-			escapedDoubleClose: string | undefined,
-			doubleOpen: string | undefined,
-			doubleQuoted: string | undefined,
-			doubleClose: string | undefined,
-			escapedSingleOpen: string | undefined,
-			escapedSingleQuoted: string | undefined,
-			escapedSingleClose: string | undefined,
-			singleOpen: string | undefined,
-			singleQuoted: string | undefined,
-			singleClose: string | undefined,
-			unclosedEscapedDoubleOpen: string | undefined,
-			unclosedEscapedDoubleQuoted: string | undefined,
-			unclosedDoubleOpen: string | undefined,
-			unclosedDoubleQuoted: string | undefined,
-			unclosedEscapedSingleOpen: string | undefined,
-			unclosedEscapedSingleQuoted: string | undefined,
-			unclosedSingleOpen: string | undefined,
-			unclosedSingleQuoted: string | undefined,
-		) => {
-			if (escapedDoubleQuoted !== undefined && escapedDoubleOpen !== undefined && escapedDoubleClose !== undefined) {
-				return `${prefix}${escapedDoubleOpen}«redacted»${escapedDoubleClose}`;
-			}
-			if (doubleQuoted !== undefined && doubleOpen !== undefined && doubleClose !== undefined) {
-				return `${prefix}${doubleOpen}«redacted»${doubleClose}`;
-			}
-			if (escapedSingleQuoted !== undefined && escapedSingleOpen !== undefined && escapedSingleClose !== undefined) {
-				return `${prefix}${escapedSingleOpen}«redacted»${escapedSingleClose}`;
-			}
-			if (singleQuoted !== undefined && singleOpen !== undefined && singleClose !== undefined) {
-				return `${prefix}${singleOpen}«redacted»${singleClose}`;
-			}
-			if (unclosedEscapedDoubleQuoted !== undefined && unclosedEscapedDoubleOpen !== undefined) {
-				return `${prefix}${unclosedEscapedDoubleOpen}«redacted»`;
-			}
-			if (unclosedDoubleQuoted !== undefined && unclosedDoubleOpen !== undefined) {
-				return `${prefix}${unclosedDoubleOpen}«redacted»`;
-			}
-			if (unclosedEscapedSingleQuoted !== undefined && unclosedEscapedSingleOpen !== undefined) {
-				return `${prefix}${unclosedEscapedSingleOpen}«redacted»`;
-			}
-			if (unclosedSingleQuoted !== undefined && unclosedSingleOpen !== undefined) {
-				return `${prefix}${unclosedSingleOpen}«redacted»`;
-			}
-			return `${prefix}«redacted»`;
-		},
-	);
+	redacted = redacted.replace(CREDENTIAL_VALUE_PATTERN, redactCredentialValue);
+	redacted = redacted.replace(CREDENTIAL_CAMEL_VALUE_PATTERN, redactCredentialValue);
 	return redacted;
+}
+
+function redactCredentialValue(
+	_match: string,
+	prefix: string,
+	escapedDoubleOpen: string | undefined,
+	escapedDoubleQuoted: string | undefined,
+	escapedDoubleClose: string | undefined,
+	doubleOpen: string | undefined,
+	doubleQuoted: string | undefined,
+	doubleClose: string | undefined,
+	escapedSingleOpen: string | undefined,
+	escapedSingleQuoted: string | undefined,
+	escapedSingleClose: string | undefined,
+	singleOpen: string | undefined,
+	singleQuoted: string | undefined,
+	singleClose: string | undefined,
+	unclosedEscapedDoubleOpen: string | undefined,
+	unclosedEscapedDoubleQuoted: string | undefined,
+	unclosedDoubleOpen: string | undefined,
+	unclosedDoubleQuoted: string | undefined,
+	unclosedEscapedSingleOpen: string | undefined,
+	unclosedEscapedSingleQuoted: string | undefined,
+	unclosedSingleOpen: string | undefined,
+	unclosedSingleQuoted: string | undefined,
+): string {
+	if (escapedDoubleQuoted !== undefined && escapedDoubleOpen !== undefined && escapedDoubleClose !== undefined) {
+		return `${prefix}${escapedDoubleOpen}«redacted»${escapedDoubleClose}`;
+	}
+	if (doubleQuoted !== undefined && doubleOpen !== undefined && doubleClose !== undefined) {
+		return `${prefix}${doubleOpen}«redacted»${doubleClose}`;
+	}
+	if (escapedSingleQuoted !== undefined && escapedSingleOpen !== undefined && escapedSingleClose !== undefined) {
+		return `${prefix}${escapedSingleOpen}«redacted»${escapedSingleClose}`;
+	}
+	if (singleQuoted !== undefined && singleOpen !== undefined && singleClose !== undefined) {
+		return `${prefix}${singleOpen}«redacted»${singleClose}`;
+	}
+	if (unclosedEscapedDoubleQuoted !== undefined && unclosedEscapedDoubleOpen !== undefined) {
+		return `${prefix}${unclosedEscapedDoubleOpen}«redacted»`;
+	}
+	if (unclosedDoubleQuoted !== undefined && unclosedDoubleOpen !== undefined) {
+		return `${prefix}${unclosedDoubleOpen}«redacted»`;
+	}
+	if (unclosedEscapedSingleQuoted !== undefined && unclosedEscapedSingleOpen !== undefined) {
+		return `${prefix}${unclosedEscapedSingleOpen}«redacted»`;
+	}
+	if (unclosedSingleQuoted !== undefined && unclosedSingleOpen !== undefined) {
+		return `${prefix}${unclosedSingleOpen}«redacted»`;
+	}
+	return `${prefix}«redacted»`;
 }
 
 function redactCredentialContainers(text: string): string {
 	const assignment = new RegExp(String.raw`${CREDENTIAL_ASSIGNMENT_PREFIX}(?=[\[{])`, "gi");
+	const camelAssignment = new RegExp(String.raw`${CREDENTIAL_CAMEL_ASSIGNMENT_PREFIX}(?=[\[{])`, "g");
+	return redactCredentialContainersWithPattern(
+		redactCredentialContainersWithPattern(text, assignment),
+		camelAssignment,
+	);
+}
+
+function redactCredentialContainersWithPattern(text: string, assignment: RegExp): string {
 	let output = "";
 	let copiedUntil = 0;
 	for (let match = assignment.exec(text); match !== null; match = assignment.exec(text)) {
