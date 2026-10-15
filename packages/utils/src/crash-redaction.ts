@@ -104,7 +104,7 @@ function cookieDiagnosticSuffix(value: string): string {
 
 		let previous = boundary - 1;
 		while (previous >= 0 && isCookieFieldWhitespace(value[previous])) previous--;
-		if (value[previous] !== ";") return value.slice(boundary);
+		if (value[previous] !== ";" && value[previous] !== ",") return value.slice(boundary);
 	}
 	return "";
 }
@@ -177,7 +177,7 @@ export function redactCrashSecrets(text: string): string {
 	// does not match `SecretAccessKey` (the canonical field has `Access` in the
 	// middle), and `access_token` does not match `SessionToken`.
 	redacted = redacted.replace(/\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b/g, "«redacted-aws-key»");
-	// Cookie values may contain semicolon-separated pairs. Preserve a later,
+	// Cookie values may contain semicolon- or comma-separated pairs. Preserve a later,
 	// whitespace-separated diagnostic assignment so the narrower rules can scrub
 	// it independently without losing useful context after the cookie.
 	redacted = redacted.replace(

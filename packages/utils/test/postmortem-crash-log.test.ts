@@ -283,6 +283,8 @@ describe("recordFatalCrash", () => {
 			"after=keep",
 			"Cookie: theme=light\\nserialized-after=keep",
 			"cookie=session=topsecret; csrf=alsosecret",
+			"cookie=session=comma-topsecret, csrf=comma-alsosecret",
+			"cookie=session=comma-diagnostic-topsecret, csrf=comma-diagnostic-csrf auth=comma-auth-secret note=keep",
 			'cookie=session="part auth=inside"; csrf=alsosecret auth=opaque-auth bearer=opaque-bearer note=keep',
 			"set_cookie=refresh=opaque-refresh-cookie; xsrf=opaque-xsrf-token\\nserialized-cookie-after=keep",
 		].join("\n");
@@ -294,6 +296,11 @@ describe("recordFatalCrash", () => {
 		expect(contents).not.toContain("opaque-cookie-session");
 		expect(contents).not.toContain("topsecret");
 		expect(contents).not.toContain("alsosecret");
+		expect(contents).not.toContain("comma-topsecret");
+		expect(contents).not.toContain("comma-alsosecret");
+		expect(contents).not.toContain("comma-diagnostic-topsecret");
+		expect(contents).not.toContain("comma-diagnostic-csrf");
+		expect(contents).not.toContain("comma-auth-secret");
 		expect(contents).not.toContain("auth=inside");
 		expect(contents).not.toContain("opaque-auth");
 		expect(contents).not.toContain("opaque-bearer");
@@ -301,6 +308,7 @@ describe("recordFatalCrash", () => {
 		expect(contents).not.toContain("opaque-xsrf-token");
 		expect(contents).toContain("Cookie: «redacted»");
 		expect(contents).toContain("cookie=«redacted»");
+		expect(contents).toContain("cookie=«redacted» auth=«redacted» note=keep");
 		expect(contents).toContain("cookie=«redacted» auth=«redacted» bearer=«redacted» note=keep");
 		expect(contents).toContain("set_cookie=«redacted»\\nserialized-cookie-after=keep");
 		expect(contents).toContain("before=keep");
