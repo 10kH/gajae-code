@@ -344,6 +344,15 @@ describe("recordFatalCrash", () => {
 		expect(redactCrashSecrets("authToken={nested:opaque-secret}")).toBe("authToken=«redacted»");
 	});
 
+	it("redacts encryption and signing key fields", () => {
+		const keys = ["encryptionKey", "signingKey", "myEncryptionKey", "mySigningKey", "encryption_key", "signing-key"];
+		for (const key of keys) expect(isCredentialKey(key)).toBe(true);
+
+		const labeled = keys.map((key, index) => `${key}=opaque-key-${index}`).join(" ");
+		expect(redactCrashSecrets(labeled)).toBe(keys.map(key => `${key}=«redacted»`).join(" "));
+		expect(redactCrashSecrets('{"encryptionKey":"opaque-json-key"}')).toBe('{"encryptionKey":"«redacted»"}');
+	});
+
 	it("redacts abbreviated password credential fields", () => {
 		for (const key of ["pwd", "dbPwd", "user_pwd"]) expect(isCredentialKey(key)).toBe(true);
 		expect(redactCrashSecrets("pwd=opaque-pwd dbPwd=opaque-db-pwd user_pwd=opaque-user-pwd")).toBe(
