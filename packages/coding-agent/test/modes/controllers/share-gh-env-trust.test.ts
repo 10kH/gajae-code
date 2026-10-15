@@ -30,6 +30,8 @@ const TRUST_KEYS = [
 	"PYTHONPATH",
 	"PYTHONUSERBASE",
 	"PYTHONSTARTUP",
+	"LUA_INIT",
+	"LUA_INIT_5_4",
 	"RUBYOPT",
 	"RUBYLIB",
 	"PERL5OPT",
@@ -82,6 +84,8 @@ interface GhSpawn {
 	PYTHONPATH: string | null;
 	PYTHONUSERBASE: string | null;
 	PYTHONSTARTUP: string | null;
+	LUA_INIT: string | null;
+	LUA_INIT_5_4: string | null;
 	RUBYOPT: string | null;
 	RUBYLIB: string | null;
 	PERL5OPT: string | null;
@@ -170,6 +174,8 @@ await fsPromises.appendFile(
 		PYTHONPATH: process.env.PYTHONPATH ?? null,
 		PYTHONUSERBASE: process.env.PYTHONUSERBASE ?? null,
 		PYTHONSTARTUP: process.env.PYTHONSTARTUP ?? null,
+		LUA_INIT: process.env.LUA_INIT ?? null,
+		LUA_INIT_5_4: process.env.LUA_INIT_5_4 ?? null,
 		RUBYOPT: process.env.RUBYOPT ?? null,
 		RUBYLIB: process.env.RUBYLIB ?? null,
 		PERL5OPT: process.env.PERL5OPT ?? null,
@@ -364,6 +370,8 @@ function expectDestination(
 			| "PYTHONPATH"
 			| "PYTHONUSERBASE"
 			| "PYTHONSTARTUP"
+			| "LUA_INIT"
+			| "LUA_INIT_5_4"
 			| "RUBYOPT"
 			| "RUBYLIB"
 			| "PERL5OPT"
@@ -436,6 +444,8 @@ function expectDestination(
 		expect(spawn.PYTHONPATH).toBe(expected.PYTHONPATH ?? null);
 		expect(spawn.PYTHONUSERBASE).toBe(expected.PYTHONUSERBASE ?? null);
 		expect(spawn.PYTHONSTARTUP).toBe(expected.PYTHONSTARTUP ?? null);
+		expect(spawn.LUA_INIT).toBe(expected.LUA_INIT ?? null);
+		expect(spawn.LUA_INIT_5_4).toBe(expected.LUA_INIT_5_4 ?? null);
 		expect(spawn.RUBYOPT).toBe(expected.RUBYOPT ?? null);
 		expect(spawn.RUBYLIB).toBe(expected.RUBYLIB ?? null);
 		expect(spawn.PERL5OPT).toBe(expected.PERL5OPT ?? null);
@@ -524,6 +534,8 @@ PYTHONHOME=/project/python-home
 PYTHONPATH=/project/python-path
 PYTHONUSERBASE=/project/python-user-base
 PYTHONSTARTUP=/project/python-startup.py
+LUA_INIT=@/project/lua-init.lua
+LUA_INIT_5_4=@/project/lua-init-5.4.lua
 RUBYOPT=-r/project/ruby-startup.rb
 RUBYLIB=/project/ruby-libraries
 PERL5OPT=-MProject::Startup
@@ -548,6 +560,8 @@ DOTNET_STARTUP_HOOKS=/project/dotnet-startup.dll
 			PYTHONPATH: null,
 			PYTHONUSERBASE: null,
 			PYTHONSTARTUP: null,
+			LUA_INIT: null,
+			LUA_INIT_5_4: null,
 			RUBYOPT: null,
 			RUBYLIB: null,
 			PERL5OPT: null,
@@ -572,6 +586,8 @@ DOTNET_STARTUP_HOOKS=/project/dotnet-startup.dll
 				PYTHONPATH: "/operator/python-path",
 				PYTHONUSERBASE: "/operator/python-user-base",
 				PYTHONSTARTUP: "/operator/python-startup.py",
+				LUA_INIT: "@/operator/lua-init.lua",
+				LUA_INIT_5_4: "@/operator/lua-init-5.4.lua",
 				RUBYOPT: "-r/operator/ruby-startup.rb",
 				RUBYLIB: "/operator/ruby-libraries",
 				PERL5OPT: "-MOperator::Startup",
@@ -593,6 +609,8 @@ DOTNET_STARTUP_HOOKS=/project/dotnet-startup.dll
 			PYTHONPATH: "/operator/python-path",
 			PYTHONUSERBASE: "/operator/python-user-base",
 			PYTHONSTARTUP: "/operator/python-startup.py",
+			LUA_INIT: "@/operator/lua-init.lua",
+			LUA_INIT_5_4: "@/operator/lua-init-5.4.lua",
 			RUBYOPT: "-r/operator/ruby-startup.rb",
 			RUBYLIB: "/operator/ruby-libraries",
 			PERL5OPT: "-MOperator::Startup",
