@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
+import { logger } from "@gajae-code/utils";
 import {
 	describeInstallRestore,
 	type InstallDispatchAuthority,
@@ -237,14 +238,18 @@ describe("doctor standalone install repair: refusals", () => {
 		expect(await fs.readFile(f.target)).toEqual(Buffer.concat([ELF_HEADER, Buffer.from("raced-runtime")]));
 	});
 
-	it("preserves access_denied when a Windows publication failure reaches doctor", async () => {
+	it("preserves access_denied recovery paths when a Windows publication failure reaches doctor", async () => {
 		const f = await fixture();
 		const descriptor = await describeInstallRestore(f.target, f.authority, "stable", "v1.2.3");
+		const detachedPath = path.join(f.root, "gjc.detached");
 		const replaceSpy = vi.spyOn(native, "exactReplaceRetained").mockReturnValue({
 			ok: false,
 			code: "access_denied",
 			windowsErrorCode: "0xC0000022",
+			detachedPath,
+			retainedUnknownPath: f.target,
 		});
+		const warnSpy = vi.spyOn(logger, "warn");
 		try {
 			const result = await repairStandaloneBinary(
 				f.target,
@@ -253,12 +258,25 @@ describe("doctor standalone install repair: refusals", () => {
 				["install-replace", "network", "external-execution"],
 				fakeDeps(f),
 			);
-			expect(result).toMatchObject({ state: "failed", reason: "access_denied", sideEffectStarted: true });
+			expect(result).toMatchObject({
+				state: "failed",
+				reason: "access_denied",
+				sideEffectStarted: true,
+				windowsErrorCode: "0xC0000022",
+				retainedPaths: { detachedPath, retainedUnknownPath: f.target },
+			});
+			expect(warnSpy).toHaveBeenCalledWith("Doctor standalone binary restore failed with access denied", {
+				targetPath: f.target,
+				code: "access_denied",
+				windowsErrorCode: "0xC0000022",
+				retainedPaths: { detachedPath, retainedUnknownPath: f.target },
+			});
 			expect(await fs.readFile(f.target)).toEqual(Buffer.concat([ELF_HEADER, Buffer.from("old-runtime")]));
 			const pending = await readActivationRecord(f.target);
 			expect(pending.status).toBe("valid");
-			if (pending.status === "valid") expect(pending.record.phase).toBe("pending_activation");
+			if (pending.status === "valid") expect(pending.record.phase).toBe("staged");
 		} finally {
+			warnSpy.mockRestore();
 			replaceSpy.mockRestore();
 		}
 	});

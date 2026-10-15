@@ -146,6 +146,23 @@ export class InstallationAccessDeniedError extends Error {
 	}
 }
 
+export class ActivationRetryCandidateRepointError extends Error {
+	readonly reasonCode: string;
+
+	constructor(
+		readonly candidatePath: string,
+		cause: unknown,
+	) {
+		const reasonCode =
+			cause instanceof Error && /^[a-z][a-z0-9_]{0,63}$/.test(cause.message)
+				? cause.message
+				: "activation_record_repoint_failed";
+		super(`${reasonCode}; retained retry candidate: ${candidatePath}`, { cause });
+		this.name = "ActivationRetryCandidateRepointError";
+		this.reasonCode = reasonCode;
+	}
+}
+
 /**
  * Parse update subcommand arguments.
  * Returns undefined if not an update command.
@@ -862,6 +879,18 @@ async function tryRemoveExactStagingFile(filePath: string, identity: FileIdentit
 	}
 }
 
+async function repointActivationRecordToRetryCandidate(
+	record: ActivationRecordV1,
+	recordIdentity: FileIdentity,
+	candidatePath: string,
+): Promise<FileIdentity> {
+	try {
+		return await updateActivationRecordFile(record, recordIdentity);
+	} catch (error) {
+		throw new ActivationRetryCandidateRepointError(candidatePath, error);
+	}
+}
+
 /**
  * Atomically replace the installed binary and roll back if version verification fails.
  */
@@ -943,7 +972,11 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 					stagingPath: currentStagingPath,
 					stagingIdentity: retryCandidate.identity,
 				};
-				recordIdentity = await updateActivationRecordFile(record, existing.identity);
+				recordIdentity = await repointActivationRecordToRetryCandidate(
+					record,
+					existing.identity,
+					currentStagingPath,
+				);
 			} else {
 				if (retryCandidate) redundantStage = { path: currentStagingPath, identity: retryCandidate.identity };
 				record = existing.record;
@@ -987,7 +1020,7 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 	});
 	if (promoted.status === "pending_activation") {
 		if (promoted.reason === "candidate_missing" && redundantStage) {
-			await updateActivationRecordFile(
+			await repointActivationRecordToRetryCandidate(
 				{
 					...record,
 					phase: "pending_activation",
@@ -995,6 +1028,7 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 					stagingIdentity: redundantStage.identity,
 				},
 				recordIdentity,
+				redundantStage.path,
 			);
 		} else {
 			const stagingCleanupWarning = redundantStage
