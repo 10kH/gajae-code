@@ -39,6 +39,8 @@ const CREDENTIAL_CAMEL_VALUE_PATTERN = new RegExp(
 	`${CREDENTIAL_CAMEL_ASSIGNMENT_PREFIX}${CREDENTIAL_VALUE_PATTERN_BODY}`,
 	"g",
 );
+const COOKIE_VALUE_PATTERN =
+	/(?:(?<![A-Za-z0-9_-])|(?<=\\n))((?:[A-Za-z0-9][A-Za-z0-9_-]*[_-])?cookie\s*[:=]\s*)(?:(?!\\+n|\\+r\\+n)[^\r\n])*/gi;
 
 /** Whether a field name ends in a credential label recognized by the redactor. */
 export function isCredentialKey(key: string): boolean {
@@ -93,9 +95,10 @@ export function redactCrashSecrets(text: string): string {
 	// because they are the diagnostic value; only the userinfo is dropped. The
 	// scheme repetition is bounded: an unbounded `[a-z0-9+.-]*` in front of the
 	// literal `://` re-tries every prefix of a long alphabetic run, which is
-	// quadratic in input length and costs ~10s on a 200 KB crash body.
+	// quadratic in input length and costs ~10s on a 200 KB crash body. The greedy
+	// authority scan consumes raw `@` characters in userinfo through its delimiter.
 	redacted = redacted.replace(
-		/(?<![A-Za-z0-9+.-])([a-z][a-z0-9+.-]{0,15}:\/\/)[^/\s:@]{1,256}(?::[^/\s@]*)?@/gi,
+		/(?<![A-Za-z0-9+.-])([a-z][a-z0-9+.-]{0,15}:\/\/)[^/\s?#]*@/gi,
 		"$1«redacted-url-credential»@",
 	);
 	// AKIA is the long-term access key id; ASIA is the temporary/STS one, which is
@@ -107,12 +110,9 @@ export function redactCrashSecrets(text: string): string {
 	// does not match `SecretAccessKey` (the canonical field has `Access` in the
 	// middle), and `access_token` does not match `SessionToken`.
 	redacted = redacted.replace(/\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b/g, "«redacted-aws-key»");
-	// Cookie headers contain multiple semicolon-separated values; redacting only
-	// the first pair would leave later session cookies visible in exported text.
-	redacted = redacted.replace(
-		/(?:(?<![A-Za-z0-9_-])|(?<=\\n))((?:set-)?cookie\s*:\s*)(?:(?!\\+n|\\+r\\+n)[^\r\n])*/gi,
-		"$1«redacted»",
-	);
+	// Cookie headers and assignments contain multiple semicolon-separated values;
+	// redact through the physical/escaped line end to cover every credential.
+	redacted = redacted.replace(COOKIE_VALUE_PATTERN, "$1«redacted»");
 	redacted = redacted.replace(CREDENTIAL_AUTH_VALUE_PATTERN, (_match, prefix: string) => `${prefix}«redacted»`);
 	redacted = redacted.replace(
 		CREDENTIAL_AUTHORIZATION_VALUE_PATTERN,
@@ -205,7 +205,7 @@ function redactCredentialContainersWithPattern(text: string, assignment: RegExp)
 function findCredentialContainerEnd(text: string, start: number): number {
 	const closing = [text[start] === "[" ? "]" : "}"];
 	const escapedQuoteDelimiter = findEscapedQuoteDelimiter(text, start);
-	let quote: "'" | '"' | undefined;
+	let quote: "'" | '"' | "`" | undefined;
 	for (let index = start + 1; index < text.length; index++) {
 		const character = text[index] ?? "";
 		if (character === "\\") {
@@ -227,7 +227,7 @@ function findCredentialContainerEnd(text: string, start: number): number {
 			if (character === quote) quote = undefined;
 			continue;
 		}
-		if (character === '"' || character === "'") {
+		if (character === '"' || character === "'" || character === "`") {
 			quote = character;
 			continue;
 		}

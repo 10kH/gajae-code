@@ -260,17 +260,38 @@ describe("recordFatalCrash", () => {
 		expect(redactedSingleQuote).not.toContain("second-secret");
 	});
 
-	it("redacts complete Cookie header values without consuming following diagnostics", async () => {
+	it("redacts backtick-quoted containers across embedded closing delimiters", () => {
+		const serialized = "credentials={primary:`alpha}suffix`,secondary:`beta-secret`} note=keep";
+		const redacted = redactCrashSecrets(serialized);
+
+		expect(redacted).toBe("credentials=«redacted» note=keep");
+		expect(redacted).not.toContain("alpha}suffix");
+		expect(redacted).not.toContain("beta-secret");
+	});
+
+	it("redacts complete Cookie headers and assignments without consuming diagnostics", async () => {
 		const target = tempCrashLog();
-		const message =
-			"before=keep\nCookie: theme=dark; sid=opaque-cookie-session\nafter=keep\nCookie: theme=light\\nserialized-after=keep";
+		const message = [
+			"before=keep",
+			"Cookie: theme=dark; sid=opaque-cookie-session",
+			"after=keep",
+			"Cookie: theme=light\\nserialized-after=keep",
+			"cookie=session=topsecret; csrf=alsosecret",
+			"set_cookie=refresh=opaque-refresh-cookie; xsrf=opaque-xsrf-token\\nserialized-cookie-after=keep",
+		].join("\n");
 
 		recordFatalCrash("Uncaught Exception", new Error(message), { path: target });
 
 		const contents = await Bun.file(target).text();
 		expect(contents).not.toContain("theme=dark");
 		expect(contents).not.toContain("opaque-cookie-session");
+		expect(contents).not.toContain("topsecret");
+		expect(contents).not.toContain("alsosecret");
+		expect(contents).not.toContain("opaque-refresh-cookie");
+		expect(contents).not.toContain("opaque-xsrf-token");
 		expect(contents).toContain("Cookie: «redacted»");
+		expect(contents).toContain("cookie=«redacted»");
+		expect(contents).toContain("set_cookie=«redacted»\\nserialized-cookie-after=keep");
 		expect(contents).toContain("before=keep");
 		expect(contents).toContain("after=keep");
 		expect(contents).toContain("Cookie: «redacted»\\nserialized-after=keep");
@@ -522,12 +543,14 @@ describe("recordFatalCrash", () => {
 		const contextAws = "ACCAIOSFODNN7EXAMPLE";
 		const urlSecret = "s3cr3tvalue";
 		const wrappedUrlSecret = "wrapped-s3cr3t";
+		const rawAtUrlPassword = "correct@horse";
 		const err = new Error(
 			[
 				`fetch failed: ${googleApiKey} ${trailingHyphenGoogleApiKey}`,
 				`${bearerAws} ${contextAws}`,
 				`clone: https://deploy:${urlSecret}@git.example.com/x.git`,
 				`wrapped: _https://deploy:${wrappedUrlSecret}@git.example.com/x.git_`,
+				`raw-at: https://alice:${rawAtUrlPassword}@example.com/repo.git?keep=1`,
 				`-----BEGIN RSA PRIVATE KEY-----\n${pemBody}\n-----END RSA PRIVATE KEY-----`,
 			].join(" "),
 		);
@@ -542,12 +565,14 @@ describe("recordFatalCrash", () => {
 		expect(contents).not.toContain(contextAws);
 		expect(contents).not.toContain(urlSecret);
 		expect(contents).not.toContain(wrappedUrlSecret);
+		expect(contents).not.toContain(rawAtUrlPassword);
 		expect(contents).not.toContain(pemBody);
 		expect(contents).toContain("«redacted-google-api-key»");
 		expect(contents).toContain("«redacted-private-key»");
 		// Scheme and host stay readable so the record still says which remote failed.
 		expect(contents).toContain("https://«redacted-url-credential»@git.example.com");
 		expect(contents).toContain("_https://«redacted-url-credential»@git.example.com/x.git_");
+		expect(contents).toContain("raw-at: https://«redacted-url-credential»@example.com/repo.git?keep=1");
 	});
 
 	it("scans a large credential-free crash body in linear time", () => {

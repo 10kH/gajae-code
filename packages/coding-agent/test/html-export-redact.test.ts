@@ -66,6 +66,45 @@ describe("session HTML export embed", () => {
 		}
 	});
 
+	it("scrubs raw-at URL, backtick-container, and compound cookie diagnostics", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-html-export-compound-diagnostics-"));
+		let session: SessionManager | undefined;
+		try {
+			session = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+			session.appendMessage({
+				role: "user",
+				content: [
+					"clone: https://alice:correct@horse@example.com/repo.git?keep=1",
+					"credentials={primary:`alpha}suffix`,secondary:`beta-secret`}",
+					"cookie=session=topsecret; csrf=alsosecret",
+					"set_cookie=refresh=opaque-refresh-cookie; xsrf=opaque-xsrf-token",
+				].join("\n"),
+				timestamp: 1,
+			});
+			const outputPath = path.join(tempDir, "export.html");
+			await exportSessionToHtml(session, undefined, { outputPath });
+			const embedded = embeddedSessionText(await Bun.file(outputPath).text());
+			for (const secret of [
+				"correct@horse",
+				"alpha}suffix",
+				"beta-secret",
+				"topsecret",
+				"alsosecret",
+				"opaque-refresh-cookie",
+				"opaque-xsrf-token",
+			]) {
+				expect(embedded).not.toContain(secret);
+			}
+			expect(embedded).toContain("https://«redacted-url-credential»@example.com/repo.git?keep=1");
+			expect(embedded).toContain("credentials=«redacted»");
+			expect(embedded).toContain("cookie=«redacted»");
+			expect(embedded).toContain("set_cookie=«redacted»");
+		} finally {
+			await session?.close();
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("scrubs a labeled secret that contains a quotation mark", async () => {
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-html-export-quote-"));
 		let session: SessionManager | undefined;
