@@ -430,6 +430,8 @@ describe("recordFatalCrash", () => {
 			String.raw`call(password=\"secret\") note=keep`,
 			String.raw`password=\"secret\": note=keep`,
 			String.raw`password=\"secret\". note=keep`,
+			String.raw`call(password=\"secret\">) note=keep`,
+			String.raw`call(password=\"secret\"/>) note=keep`,
 		]) {
 			const redacted = redactCrashSecrets(input);
 			expect(redacted).not.toContain("secret");
