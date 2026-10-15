@@ -963,7 +963,17 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 		expectedRecordIdentity: recordIdentity,
 	});
 	if (promoted.status === "pending_activation") {
-		if (promoted.reason !== "candidate_missing") {
+		if (promoted.reason === "candidate_missing" && redundantStage) {
+			await updateActivationRecordFile(
+				{
+					...record,
+					phase: "pending_activation",
+					stagingPath: redundantStage.path,
+					stagingIdentity: redundantStage.identity,
+				},
+				recordIdentity,
+			);
+		} else {
 			const stagingCleanupWarning = redundantStage
 				? await tryRemoveExactStagingFile(redundantStage.path, redundantStage.identity)
 				: undefined;

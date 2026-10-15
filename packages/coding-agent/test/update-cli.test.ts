@@ -2103,6 +2103,13 @@ describe("update-cli binary replacement", () => {
 			reconcileSpy.mockRestore();
 		}
 
+		const pending = await readActivationRecord(targetPath);
+		expect(pending.status).toBe("valid");
+		if (pending.status === "valid") {
+			expect(pending.record.phase).toBe("pending_activation");
+			expect(pending.record.stagingPath).toBe(retryStage);
+		}
+
 		const result = await replaceBinaryFixture({
 			targetPath,
 			tempPath: retryStage,
