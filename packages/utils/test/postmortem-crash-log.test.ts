@@ -372,6 +372,20 @@ describe("recordFatalCrash", () => {
 		expect(redactCrashSecrets('{"dbPwd":"opaque-db-pwd"}')).toBe('{"dbPwd":"«redacted»"}');
 	});
 
+	it("recognizes dotted credential-key segments", () => {
+		const keys = ["api.key", "client.secret", "db.password", "service.api.key", "aws.secret.access.key"];
+		for (const key of keys) expect(isCredentialKey(key)).toBe(true);
+		expect(isCredentialKey("client.name")).toBe(false);
+		expect(
+			redactCrashSecrets(
+				'api.key=opaque-api-key client.secret="opaque-client-secret" db.password=opaque-db-password aws.secret.access.key=opaque-aws-secret',
+			),
+		).toBe('api.key=«redacted» client.secret="«redacted»" db.password=«redacted» aws.secret.access.key=«redacted»');
+		expect(redactCrashSecrets('{"client.secret":"opaque-json-secret","note.version":"keep"}')).toBe(
+			'{"client.secret":"«redacted»","note.version":"keep"}',
+		);
+	});
+
 	it("redacts passphrase credential-key variants", () => {
 		for (const key of ["passphrase", "sshPassphrase", "key_passphrase", "SSH_PASSPHRASE"]) {
 			expect(isCredentialKey(key)).toBe(true);

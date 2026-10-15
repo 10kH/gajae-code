@@ -177,6 +177,10 @@ describe("session HTML export embed", () => {
 						arguments: {
 							sensitive_values: {
 								bearer: "opaque-bearer-value",
+								"client.secret": "opaque-dotted-client-secret-value",
+								"db.password": "opaque-dotted-db-password-value",
+								"api.key": "opaque-dotted-api-key-value",
+								"aws.secret.access.key": "opaque-dotted-aws-secret-value",
 								token: "opaque-token-value",
 								authToken: "opaque-auth-token-value",
 								githubToken: "opaque-github-token-value",
@@ -232,6 +236,10 @@ describe("session HTML export embed", () => {
 			for (const secret of [
 				"opaque-token-value",
 				"opaque-bearer-value",
+				"opaque-dotted-client-secret-value",
+				"opaque-dotted-db-password-value",
+				"opaque-dotted-api-key-value",
+				"opaque-dotted-aws-secret-value",
 				"opaque-auth-token-value",
 				"opaque-github-token-value",
 				"opaque-db-password-value",
@@ -267,6 +275,10 @@ describe("session HTML export embed", () => {
 			}
 			expect(sensitiveValues).toEqual({
 				bearer: "«redacted»",
+				"client.secret": "«redacted»",
+				"db.password": "«redacted»",
+				"api.key": "«redacted»",
+				"aws.secret.access.key": "«redacted»",
 				token: "«redacted»",
 				authToken: "«redacted»",
 				githubToken: "«redacted»",

@@ -8,8 +8,8 @@
  */
 
 const CREDENTIAL_KEY_LABELS =
-	"api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?key|session[_-]?token|client[_-]?secret|aws[_-]?secret[_-]?access[_-]?key|secret[_-]?key|secret[_-]?access[_-]?key|encryption[_-]?key|signing[_-]?key|password|passwd|pwd|passphrase|auth|authorization|bearer|private[_-]?token|token|secrets?|credentials?|private[_-]?key|cookie";
-const CREDENTIAL_KEY_PREFIX = `(?:[A-Za-z0-9][A-Za-z0-9_-]*[_-])?`;
+	"api[._-]?key|apikey|access[._-]?token|refresh[._-]?token|id[._-]?token|session[._-]?key|session[._-]?token|client[._-]?secret|aws[._-]?secret[._-]?access[._-]?key|secret[._-]?key|secret[._-]?access[._-]?key|encryption[._-]?key|signing[._-]?key|password|passwd|pwd|passphrase|auth|authorization|bearer|private[._-]?token|token|secrets?|credentials?|private[._-]?key|cookie";
+const CREDENTIAL_KEY_PREFIX = `(?:[A-Za-z0-9][A-Za-z0-9_.-]*[_.-])?`;
 const CREDENTIAL_KEY_PATTERN = `${CREDENTIAL_KEY_PREFIX}(?:${CREDENTIAL_KEY_LABELS})`;
 const CREDENTIAL_KEY_SUFFIX = new RegExp(`^${CREDENTIAL_KEY_PATTERN}$`, "i");
 const CREDENTIAL_CAMEL_COMPOUND_SUFFIXES =
@@ -25,7 +25,7 @@ const CREDENTIAL_CAMEL_KEY_SUFFIX = new RegExp(`^${CREDENTIAL_CAMEL_KEY_PATTERN}
 const CREDENTIAL_CAMEL_ASSIGNMENT_CANDIDATE_PATTERN = new RegExp(
 	String.raw`(?:${CREDENTIAL_CAMEL_COMPOUND_SUFFIXES}|${CREDENTIAL_CAMEL_SIMPLE_SUFFIXES})(?:\\*["']?\s*[=:]\s*)`,
 );
-const CREDENTIAL_ASSIGNMENT_PREFIX = String.raw`(?<![A-Za-z0-9_-])((?:\\*["']?-*)(?:${CREDENTIAL_KEY_PATTERN})(?:\\*["']?\s*[=:]\s*))`;
+const CREDENTIAL_ASSIGNMENT_PREFIX = String.raw`(?<![A-Za-z0-9_.-])((?:\\*["']?-*)(?:${CREDENTIAL_KEY_PATTERN})(?:\\*["']?\s*[=:]\s*))`;
 const CREDENTIAL_ASSIGNMENT_CANDIDATE_PATTERN = new RegExp(
 	String.raw`(?:${CREDENTIAL_KEY_LABELS})(?:\\*["']?\s*[=:]\s*)`,
 	"i",
