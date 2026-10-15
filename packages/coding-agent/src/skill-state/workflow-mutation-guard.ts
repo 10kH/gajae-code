@@ -88,22 +88,34 @@ const BASH_COMMAND_WRAPPER_SOURCE =
  */
 const BASH_COMMAND_POSITION_KEYWORD_RE = /(?:^|[;&|(\n{}])\s*(?:then|else|elif|do|in|\{|!)(?=\s)/gi;
 const BASH_MUTATION_COMMAND_RE = new RegExp(
-	`(?:^|[;&|(\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|()]*\\/)?(?:tee|touch|rm|mkdir|cp|mv|install|truncate)\\b([^;&|()\\n]*)|(?:^|[^<>])(?:>>?|\\d>>?)\\s*([^\\s;&|]+)`,
+	`(?:^|[;&|(\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|()]*\\/)?(?:tee|touch|rm|mkdir|cp|mv|install|truncate|ln)\\b([^;&|()\\n]*)|(?:^|[^<>])(?:>>?|\\d>>?)\\s*([^\\s;&|]+)`,
 	"gi",
 );
 /** Command-word extractor; must accept the same prefixes as `BASH_MUTATION_COMMAND_RE`. */
 const BASH_MUTATION_COMMAND_NAME_RE = new RegExp(
-	`(?:^|[;&|(\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|()]*\\/)?(tee|touch|rm|mkdir|cp|mv|install|truncate)\\b`,
+	`(?:^|[;&|(\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|()]*\\/)?(tee|touch|rm|mkdir|cp|mv|install|truncate|ln)\\b`,
 	"i",
 );
 const BASH_IN_PLACE_MUTATION_COMMAND_RE = new RegExp(
 	`(?:^|[;&|(\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|()]*\\/)?(?:sed|perl)\\b([^;&|()\\n]*)`,
 	"gi",
 );
-const BASH_OPAQUE_INTERPRETER_WRITE_RE =
-	/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:python3?|node|ruby)\b[^;&|\n]*(?:-c|-e)\b[^;&|\n]*(?:open\s*\(|writeFile(?:Sync)?\s*\(|\.write\s*\()/i;
-const BASH_HEREDOC_OPAQUE_INTERPRETER_WRITE_RE =
-	/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:python3?|node|ruby)\b[^;&|\n]*(?:<<[-]?\s*['"]?\w+['"]?)[\s\S]*(?:open\s*\(|writeFile(?:Sync)?\s*\(|\.write\s*\()/i;
+/**
+ * Write APIs a planning one-liner cannot be allowed to call. The destination is
+ * not a static path the temp allowlist can trust, so a match fails closed the
+ * same way `open(` / `writeFile(` / `.write(` already do. `perl` is included
+ * because `perl -e 'open(...)'` is that same call.
+ */
+const BASH_INTERPRETER_WRITE_API =
+	"(?:open\\s*\\(|writeFile(?:Sync)?\\s*\\(|appendFile(?:Sync)?\\s*\\(|\\.write\\s*\\(|shutil\\s*\\.\\s*(?:copy2?|copyfileobj|copyfile)\\s*\\(|os\\s*\\.\\s*(?:system|symlink)\\s*\\()";
+const BASH_OPAQUE_INTERPRETER_WRITE_RE = new RegExp(
+	`(?:^|[;&|\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?(?:python3?|node|ruby|perl)\\b[^;&|\\n]*(?:-c|-e)\\b[^;&|\\n]*${BASH_INTERPRETER_WRITE_API}`,
+	"i",
+);
+const BASH_HEREDOC_OPAQUE_INTERPRETER_WRITE_RE = new RegExp(
+	`(?:^|[;&|\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?(?:python3?|node|ruby|perl)\\b[^;&|\\n]*(?:<<[-]?\\s*['"]?\\w+['"]?)[\\s\\S]*${BASH_INTERPRETER_WRITE_API}`,
+	"i",
+);
 const BASH_DD_OUTPUT_RE = new RegExp(
 	`(?:^|[;&|\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|]*\\/)?dd\\b([^;&|\\n]*)`,
 	"gi",
@@ -1562,6 +1574,194 @@ function extractSubstitutionBodies(command: string): SubstitutionBody[] {
 	return bodies;
 }
 
+const BASH_SED_COMMAND_RE = new RegExp(
+	`(?:^|[;&|(\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|()]*\\/)?sed\\b([^;&|()\\n]*)`,
+	"gi",
+);
+const BASH_AWK_COMMAND_RE = new RegExp(
+	`(?:^|[;&|(\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|()]*\\/)?awk\\b([^;&|()\\n]*)`,
+	"gi",
+);
+
+/** `true` when index sits at a sed command letter, not inside a pattern. */
+function sedCommandPosition(script: string, index: number): boolean {
+	if (index === 0) return true;
+	return /[\s;{}\n\d$,]/.test(script[index - 1] ?? "");
+}
+
+function sedWriteName(script: string, index: number): { path: string | null; next: number } {
+	let cursor = index;
+	while (cursor < script.length && (script[cursor] === " " || script[cursor] === "\t")) cursor++;
+	const start = cursor;
+	while (
+		cursor < script.length &&
+		script[cursor] !== " " &&
+		script[cursor] !== "\t" &&
+		script[cursor] !== ";" &&
+		script[cursor] !== "\n" &&
+		script[cursor] !== "}"
+	) {
+		cursor++;
+	}
+	return { path: cursor > start ? script.slice(start, cursor) : null, next: cursor };
+}
+
+/**
+ * Filename a sed script writes with the `w`/`W` command or an `s///w file` flag.
+ * `undefined` means this text does not write. `null` means it writes without a
+ * literal filename.
+ */
+function sedScriptWritePath(script: string): string | null | undefined {
+	let index = 0;
+	while (index < script.length) {
+		const character = script[index] ?? "";
+		if (" \t\n;{}".includes(character)) {
+			index++;
+			continue;
+		}
+		if ((character === "w" || character === "W") && sedCommandPosition(script, index)) {
+			const next = script[index + 1];
+			if (next === undefined || " \t;\n}".includes(next)) {
+				const taken = sedWriteName(script, index + 1);
+				if (taken.path) return taken.path;
+				index = Math.max(taken.next, index + 1);
+				continue;
+			}
+		}
+		if (character === "s" && index + 1 < script.length) {
+			const delimiter = script[index + 1] ?? "";
+			if (delimiter && !/[\s\\]/.test(delimiter)) {
+				index += 2;
+				let fields = 1;
+				while (index < script.length && fields < 3) {
+					if (script[index] === "\\") {
+						index += 2;
+						continue;
+					}
+					if (script[index] === delimiter) fields++;
+					index++;
+				}
+				while (index < script.length && script[index] !== ";" && script[index] !== "\n" && script[index] !== "}") {
+					if (
+						(script[index] === "w" || script[index] === "W") &&
+						(script[index + 1] === " " || script[index + 1] === "\t")
+					) {
+						return sedWriteName(script, index + 1).path;
+					}
+					index++;
+				}
+				continue;
+			}
+		}
+		index++;
+	}
+	return undefined;
+}
+
+/**
+ * `-c`/`-e` bodies are one shell word, so a `;` inside the quotes is not a
+ * statement break. The line-oriented interpreter regex stops at that `;` and
+ * misses `import shutil; shutil.copy(...)`.
+ */
+function interpreterStatementEnd(command: string, start: number): number {
+	let index = start;
+	let inSingle = false;
+	let inDouble = false;
+	while (index < command.length) {
+		const character = command[index] ?? "";
+		if (inSingle) {
+			if (character === "'") inSingle = false;
+			index++;
+			continue;
+		}
+		if (inDouble) {
+			if (character === "\\") {
+				index += 2;
+				continue;
+			}
+			if (character === '"') inDouble = false;
+			index++;
+			continue;
+		}
+		if (character === "'") {
+			inSingle = true;
+			index++;
+			continue;
+		}
+		if (character === '"') {
+			inDouble = true;
+			index++;
+			continue;
+		}
+		if (character === "\\") {
+			index += 2;
+			continue;
+		}
+		if (character === ";" || character === "&" || character === "|" || character === "\n") break;
+		index++;
+	}
+	return index;
+}
+
+function collectInterpreterOneLinerWrites(command: string, targets: ExtractedTargets): void {
+	const api = new RegExp(BASH_INTERPRETER_WRITE_API, "i");
+	const names = /(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:python3?|node|ruby|perl)\b/gi;
+	for (const match of command.matchAll(names)) {
+		const start = (match.index ?? 0) + match[0].length;
+		const tail = command.slice(start, interpreterStatementEnd(command, start));
+		const parts = shellWords(tail).map(cleanShellWord);
+		for (let index = 0; index < parts.length; index++) {
+			const part = parts[index] ?? "";
+			if (part !== "-c" && part !== "-e") continue;
+			if (!api.test(parts[index + 1] ?? "")) continue;
+			targets.explicitMutation = true;
+			targets.unknown = true;
+			return;
+		}
+	}
+}
+
+function collectSedScriptWrites(command: string, targets: ExtractedTargets): void {
+	for (const match of command.matchAll(BASH_SED_COMMAND_RE)) {
+		for (const part of shellWords(match[1] ?? "").map(cleanShellWord)) {
+			if (!part || part.startsWith("-")) continue;
+			const writePath = sedScriptWritePath(part);
+			if (writePath === undefined) continue;
+			targets.explicitMutation = true;
+			if (writePath && !isDeviceSinkPath(writePath)) addPath(targets, writePath);
+			else if (!writePath) targets.unknown = true;
+		}
+	}
+}
+
+function firstAwkProgram(parts: string[]): string | undefined {
+	for (let index = 0; index < parts.length; index++) {
+		const part = parts[index] ?? "";
+		if (part === "-e" || part === "--source") return parts[index + 1];
+		if (part === "-f" || part === "--file") {
+			index++;
+			continue;
+		}
+		if (!part || part.startsWith("-")) continue;
+		return part;
+	}
+	return undefined;
+}
+
+/** Quoted awk redirections (`print > "file"`). Comparisons (`$1 > 5`) are not writes. */
+function collectAwkProgramWrites(command: string, targets: ExtractedTargets): void {
+	for (const match of command.matchAll(BASH_AWK_COMMAND_RE)) {
+		const program = firstAwkProgram(shellWords(match[1] ?? "").map(cleanShellWord));
+		if (!program) continue;
+		for (const redirect of program.matchAll(/>>?\s*(["'])([^"']+)\1/g)) {
+			targets.explicitMutation = true;
+			const destination = redirect[2] ?? "";
+			if (!destination) targets.unknown = true;
+			else if (!isDeviceSinkPath(destination)) addPath(targets, destination);
+		}
+	}
+}
+
 function extractBashTargets(args: unknown, depth = 0): ExtractedTargets {
 	const record = getRecord(args);
 	const command = safeString(record?.command);
@@ -1677,7 +1877,11 @@ function extractBashTargets(args: unknown, depth = 0): ExtractedTargets {
 		const parts = shellWords(match[1] ?? "");
 		const commandName = match[0]?.match(BASH_MUTATION_COMMAND_NAME_RE)?.[1]?.toLowerCase();
 		const targetParts =
-			commandName === "cp" || commandName === "mv" || commandName === "install" || commandName === "truncate"
+			commandName === "cp" ||
+			commandName === "mv" ||
+			commandName === "install" ||
+			commandName === "truncate" ||
+			commandName === "ln"
 				? parts.slice(-1)
 				: parts;
 		let extractedTarget = false;
@@ -1695,6 +1899,11 @@ function extractBashTargets(args: unknown, depth = 0): ExtractedTargets {
 		// fail closed rather than allowing a targetless mutation through planning.
 		if (!extractedTarget) targets.unknown = true;
 	}
+	// `sed w file` and `s///w file` write without `-i`. `awk 'print > "file"'`
+	// writes inside the program, which is not a shell redirection.
+	collectInterpreterOneLinerWrites(heredoc.masked, targets);
+	collectSedScriptWrites(heredoc.masked, targets);
+	collectAwkProgramWrites(heredoc.masked, targets);
 	return targets;
 }
 /**

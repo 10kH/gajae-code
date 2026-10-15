@@ -2076,6 +2076,78 @@ describe("bash scanner quoting model", () => {
 		expect(decision.targets).toContain(productPath);
 	});
 
+	it("blocks planning bash writes outside the old denylist and still allows read-only commands", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		const scratch = path.join(os.tmpdir(), `gjc-plan-bash-${process.pid}.txt`);
+		const blocked = [
+			"sed -n 'w src/product.ts' stage/pwn.txt",
+			"sed -n 's/a/b/w src/product.ts' stage/pwn.txt",
+			`python3 -c "import shutil; shutil.copy('stage/pwn.txt','src/product.ts')"`,
+			`python3 -c "import os; os.system('printf PWNED > src/product.ts')"`,
+			`node -e "require('fs').appendFileSync('src/product.ts','x')"`,
+			`perl -e 'open(F,">","src/product.ts"); print F "PWNED";'`,
+			`awk 'BEGIN{printf "PWNED" > "src/product.ts"}'`,
+			"ln -sf stage/pwn.txt src/product.ts",
+			`python3 -c "import os; os.symlink('stage/pwn.txt','src/pwn-link.ts')"`,
+		];
+		for (const command of blocked) {
+			const decision = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("bash"),
+				args: { command },
+			});
+			expect(decision.blocked, command).toBe(true);
+		}
+		await expect(
+			assertWorkflowMutationAllowed({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("bash"),
+				args: { command: "sed -n 'w src/product.ts' stage/pwn.txt" },
+			}),
+		).rejects.toBeInstanceOf(ToolError);
+
+		for (const command of [
+			"sed -n '1p' src/product.ts",
+			"sed -n '1,80p' packages/coding-agent/src/skill-state/workflow-mutation-guard.ts",
+			"sed -n 's/a/b/p' src/product.ts",
+			"awk '$1 > 5 {print $1}' src/product.ts",
+			`python3 -c "print(1)"`,
+			`node -e "console.log(1)"`,
+			`perl -e 'print 1'`,
+			"ls src/product.ts",
+			"readlink src/product.ts",
+			`ln -sf stage/pwn.txt ${scratch}`,
+			`sed -n 'w ${scratch}' src/product.ts`,
+			`awk 'BEGIN{printf "x" > "${scratch}"}'`,
+		]) {
+			const decision = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("bash"),
+				args: { command },
+			});
+			expect(decision.blocked, command).toBe(false);
+		}
+		await assertWorkflowMutationAllowed({
+			cwd,
+			sessionId: "session-a",
+			tool: tool("bash"),
+			args: { command: "sed -n '1p' src/product.ts" },
+		});
+
+		const idle = await makeTempRoot();
+		const outsidePlanning = await getWorkflowMutationDecision({
+			cwd: idle,
+			sessionId: "session-a",
+			tool: tool("bash"),
+			args: { command: "ln -sf stage/pwn.txt src/product.ts" },
+		});
+		expect(outsidePlanning.blocked).toBe(false);
+	});
+
 	it("allows a multi-part temp Path write and a non-writing Path read", async () => {
 		const cwd = await makeTempRoot();
 		await writeActiveSkill(cwd, "ralplan", "planner");
