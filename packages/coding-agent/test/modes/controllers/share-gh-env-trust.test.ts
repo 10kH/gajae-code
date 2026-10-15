@@ -32,6 +32,10 @@ const TRUST_KEYS = [
 	"PYTHONSTARTUP",
 	"LUA_INIT",
 	"LUA_INIT_5_4",
+	"R_ENVIRON",
+	"R_ENVIRON_USER",
+	"R_PROFILE",
+	"R_PROFILE_USER",
 	"RUBYOPT",
 	"RUBYLIB",
 	"PERL5OPT",
@@ -86,6 +90,10 @@ interface GhSpawn {
 	PYTHONSTARTUP: string | null;
 	LUA_INIT: string | null;
 	LUA_INIT_5_4: string | null;
+	R_ENVIRON: string | null;
+	R_ENVIRON_USER: string | null;
+	R_PROFILE: string | null;
+	R_PROFILE_USER: string | null;
 	RUBYOPT: string | null;
 	RUBYLIB: string | null;
 	PERL5OPT: string | null;
@@ -176,6 +184,10 @@ await fsPromises.appendFile(
 		PYTHONSTARTUP: process.env.PYTHONSTARTUP ?? null,
 		LUA_INIT: process.env.LUA_INIT ?? null,
 		LUA_INIT_5_4: process.env.LUA_INIT_5_4 ?? null,
+		R_ENVIRON: process.env.R_ENVIRON ?? null,
+		R_ENVIRON_USER: process.env.R_ENVIRON_USER ?? null,
+		R_PROFILE: process.env.R_PROFILE ?? null,
+		R_PROFILE_USER: process.env.R_PROFILE_USER ?? null,
 		RUBYOPT: process.env.RUBYOPT ?? null,
 		RUBYLIB: process.env.RUBYLIB ?? null,
 		PERL5OPT: process.env.PERL5OPT ?? null,
@@ -372,6 +384,10 @@ function expectDestination(
 			| "PYTHONSTARTUP"
 			| "LUA_INIT"
 			| "LUA_INIT_5_4"
+			| "R_ENVIRON"
+			| "R_ENVIRON_USER"
+			| "R_PROFILE"
+			| "R_PROFILE_USER"
 			| "RUBYOPT"
 			| "RUBYLIB"
 			| "PERL5OPT"
@@ -446,6 +462,10 @@ function expectDestination(
 		expect(spawn.PYTHONSTARTUP).toBe(expected.PYTHONSTARTUP ?? null);
 		expect(spawn.LUA_INIT).toBe(expected.LUA_INIT ?? null);
 		expect(spawn.LUA_INIT_5_4).toBe(expected.LUA_INIT_5_4 ?? null);
+		expect(spawn.R_ENVIRON).toBe(expected.R_ENVIRON ?? null);
+		expect(spawn.R_ENVIRON_USER).toBe(expected.R_ENVIRON_USER ?? null);
+		expect(spawn.R_PROFILE).toBe(expected.R_PROFILE ?? null);
+		expect(spawn.R_PROFILE_USER).toBe(expected.R_PROFILE_USER ?? null);
 		expect(spawn.RUBYOPT).toBe(expected.RUBYOPT ?? null);
 		expect(spawn.RUBYLIB).toBe(expected.RUBYLIB ?? null);
 		expect(spawn.PERL5OPT).toBe(expected.PERL5OPT ?? null);
@@ -536,6 +556,10 @@ PYTHONUSERBASE=/project/python-user-base
 PYTHONSTARTUP=/project/python-startup.py
 LUA_INIT=@/project/lua-init.lua
 LUA_INIT_5_4=@/project/lua-init-5.4.lua
+R_ENVIRON=/project/site.Renviron
+R_ENVIRON_USER=/project/user.Renviron
+R_PROFILE=/project/site.Rprofile
+R_PROFILE_USER=/project/user.Rprofile
 RUBYOPT=-r/project/ruby-startup.rb
 RUBYLIB=/project/ruby-libraries
 PERL5OPT=-MProject::Startup
@@ -562,6 +586,10 @@ DOTNET_STARTUP_HOOKS=/project/dotnet-startup.dll
 			PYTHONSTARTUP: null,
 			LUA_INIT: null,
 			LUA_INIT_5_4: null,
+			R_ENVIRON: null,
+			R_ENVIRON_USER: null,
+			R_PROFILE: null,
+			R_PROFILE_USER: null,
 			RUBYOPT: null,
 			RUBYLIB: null,
 			PERL5OPT: null,
@@ -588,6 +616,10 @@ DOTNET_STARTUP_HOOKS=/project/dotnet-startup.dll
 				PYTHONSTARTUP: "/operator/python-startup.py",
 				LUA_INIT: "@/operator/lua-init.lua",
 				LUA_INIT_5_4: "@/operator/lua-init-5.4.lua",
+				R_ENVIRON: "/operator/site.Renviron",
+				R_ENVIRON_USER: "/operator/user.Renviron",
+				R_PROFILE: "/operator/site.Rprofile",
+				R_PROFILE_USER: "/operator/user.Rprofile",
 				RUBYOPT: "-r/operator/ruby-startup.rb",
 				RUBYLIB: "/operator/ruby-libraries",
 				PERL5OPT: "-MOperator::Startup",
@@ -611,6 +643,10 @@ DOTNET_STARTUP_HOOKS=/project/dotnet-startup.dll
 			PYTHONSTARTUP: "/operator/python-startup.py",
 			LUA_INIT: "@/operator/lua-init.lua",
 			LUA_INIT_5_4: "@/operator/lua-init-5.4.lua",
+			R_ENVIRON: "/operator/site.Renviron",
+			R_ENVIRON_USER: "/operator/user.Renviron",
+			R_PROFILE: "/operator/site.Rprofile",
+			R_PROFILE_USER: "/operator/user.Rprofile",
 			RUBYOPT: "-r/operator/ruby-startup.rb",
 			RUBYLIB: "/operator/ruby-libraries",
 			PERL5OPT: "-MOperator::Startup",
