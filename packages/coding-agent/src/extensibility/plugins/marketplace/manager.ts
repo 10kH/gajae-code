@@ -15,6 +15,7 @@ import {
 	type NativeDirectoryTreeSnapshot,
 	type NativeExactUnlinkResult,
 	renameDirectoryNoReplacePathAsync,
+	renameNoReplacePathAsync,
 	snapshotDirectoryTree,
 } from "@gajae-code/natives";
 import { isEnoent, logger, pathIsWithin } from "@gajae-code/utils";
@@ -173,6 +174,13 @@ async function snapshotIfPresent(targetPath: string): Promise<NativeDirectoryTre
 	if (!stat || stat.isSymbolicLink() || !stat.isDirectory()) return undefined;
 	const snapshot = snapshotDirectoryTree(targetPath);
 	return snapshot.ok ? snapshot.snapshot : undefined;
+}
+
+/** Windows supports directory no-replace through the handle-based path API, not the POSIX directory fallback. */
+function renameDirectoryNoReplace(sourcePath: string, destinationPath: string) {
+	return process.platform === "win32"
+		? renameNoReplacePathAsync(sourcePath, destinationPath)
+		: renameDirectoryNoReplacePathAsync(sourcePath, destinationPath);
 }
 
 /**
@@ -923,7 +931,7 @@ export class MarketplaceManager {
 				// later detach of the same canonical path inside this same transaction (the
 				// rollback path) collides with our own leftover and is misread as a foreign
 				// claim. The rename below is what vacates it; failure is reported, never assumed.
-				const backupPublish = await renameDirectoryNoReplacePathAsync(detachedPath, backup);
+				const backupPublish = await renameDirectoryNoReplace(detachedPath, backup);
 				if (!backupPublish.ok) {
 					// mutationState "not_committed" proves the rename never moved the
 					// object; it is still at the detached path, so that path is real
@@ -979,7 +987,7 @@ export class MarketplaceManager {
 				// devices on cross_device, the dev/ino-stability assumption behind
 				// `stagedSnapshot` breaks silently and every identity-bound check in this
 				// method becomes unsound.
-				const publish = await renameDirectoryNoReplacePathAsync(token.stagedArtifactPath, finalPath);
+				const publish = await renameDirectoryNoReplace(token.stagedArtifactPath, finalPath);
 				// Test seam only (no-op in production): lets a test deterministically
 				// simulate a concurrent second writer republishing finalPath here,
 				// exercising the foreign-owner branch below without weakening it.
@@ -1250,7 +1258,7 @@ export class MarketplaceManager {
 						);
 					}
 				}
-				const restorePublish = await renameDirectoryNoReplacePathAsync(backup, finalPath);
+				const restorePublish = await renameDirectoryNoReplace(backup, finalPath);
 				if (!restorePublish.ok) {
 					// Restore failed: confirm what actually remains at `backup` right now
 					// (the no-replace rename may have left it there proven-untouched, or
