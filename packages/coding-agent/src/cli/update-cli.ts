@@ -114,9 +114,10 @@ export class InstallationAccessDeniedError extends Error {
 	constructor(
 		readonly targetPath: string,
 		readonly windowsErrorCode?: string,
+		readonly stagingCleanupWarning?: string,
 	) {
 		super(
-			`access_denied during exact replacement of ${targetPath}${windowsErrorCode ? ` (${windowsErrorCode})` : ""}`,
+			`access_denied during exact replacement of ${targetPath}${windowsErrorCode ? ` (${windowsErrorCode})` : ""}${stagingCleanupWarning ? `; ${stagingCleanupWarning}` : ""}`,
 		);
 		this.name = "InstallationAccessDeniedError";
 	}
@@ -804,6 +805,15 @@ async function removeExactStagingFile(filePath: string, identity: FileIdentity):
 		throw new Error(`activation_retry_staging_cleanup_failed:${removed.code ?? "unverified"}:${filePath}`);
 }
 
+async function tryRemoveExactStagingFile(filePath: string, identity: FileIdentity): Promise<string | undefined> {
+	try {
+		await removeExactStagingFile(filePath, identity);
+		return undefined;
+	} catch (error) {
+		return error instanceof Error ? error.message : String(error);
+	}
+}
+
 /**
  * Atomically replace the installed binary and roll back if version verification fails.
  */
@@ -852,6 +862,7 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 	}
 	let record: ActivationRecordV1;
 	let recordIdentity: FileIdentity;
+	let redundantStage: { readonly path: string; readonly identity: FileIdentity } | undefined;
 	if (existing.status === "valid" && existing.record.phase !== "verified" && existing.record.phase !== "rolled_back") {
 		if (
 			existing.record.candidate.digest !== (options.candidate?.sha256.toLowerCase() ?? staged?.identity.sha256) ||
@@ -886,7 +897,7 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 				};
 				recordIdentity = await updateActivationRecordFile(record, existing.identity);
 			} else {
-				if (retryCandidate) await removeExactStagingFile(currentStagingPath, retryCandidate.identity);
+				if (retryCandidate) redundantStage = { path: currentStagingPath, identity: retryCandidate.identity };
 				record = existing.record;
 				recordIdentity = existing.identity;
 			}
@@ -926,7 +937,10 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 		allowPromotion: true,
 		expectedRecordIdentity: recordIdentity,
 	});
-	if (promoted.status === "pending_activation") throw new Error("installation_pending_activation");
+	if (promoted.status === "pending_activation") {
+		if (redundantStage) await tryRemoveExactStagingFile(redundantStage.path, redundantStage.identity);
+		throw new Error("installation_pending_activation");
+	}
 	if (
 		(promoted.status !== "reconciled" &&
 			promoted.status !== "applied_unverified" &&
@@ -934,21 +948,29 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 		!promoted.record ||
 		!promoted.recordIdentity
 	) {
+		const stagingCleanupWarning = redundantStage
+			? await tryRemoveExactStagingFile(redundantStage.path, redundantStage.identity)
+			: undefined;
 		if (promoted.reason === "access_denied")
-			throw new InstallationAccessDeniedError(targetPath, promoted.windowsErrorCode);
+			throw new InstallationAccessDeniedError(targetPath, promoted.windowsErrorCode, stagingCleanupWarning);
 		throw new Error(promoted.reason ?? "installation_publication_unverified");
 	}
 	record = promoted.record;
 	recordIdentity = promoted.recordIdentity;
 	try {
-		const verification = await options.verifyInstalledVersion(options.expectedVersion);
+		let verification = await options.verifyInstalledVersion(options.expectedVersion);
 		if (!verification.ok) throw new Error(formatVerificationFailure(verification, options.expectedVersion));
 		const after = await snapshotRegularFile(targetPath);
 		if (!after || !record.targetIdentity || !sameFileIdentity(record.targetIdentity, after.identity))
 			throw new Error("installation_postcheck_identity_changed");
+		if (redundantStage) {
+			const cleanupWarning = await tryRemoveExactStagingFile(redundantStage.path, redundantStage.identity);
+			if (cleanupWarning) verification = { ...verification, cleanupWarning };
+		}
 		await updateActivationRecordFile({ ...record, phase: "verified" }, recordIdentity);
 		return verification;
 	} catch (primary) {
+		if (redundantStage) await tryRemoveExactStagingFile(redundantStage.path, redundantStage.identity);
 		try {
 			const after = await snapshotRegularFile(targetPath);
 			if (!after || !record.targetIdentity || !sameFileIdentity(record.targetIdentity, after.identity))

@@ -1925,6 +1925,54 @@ describe("update-cli binary replacement", () => {
 		}
 	});
 
+	it("does not block activation when redundant-stage cleanup is denied", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc.exe");
+		const recordedStage = path.join(dir, "gjc.new.recorded.exe");
+		const retryStage = path.join(dir, "gjc.new.retry.exe");
+		const backupPath = path.join(dir, "gjc.exe.bak");
+		await writeFixtureFile(targetPath, "old binary");
+		await writeFixtureFile(recordedStage, "new binary");
+		await writeFixtureFile(retryStage, "new binary");
+		const target = (await snapshotRegularFile(targetPath))!;
+		const stage = (await snapshotRegularFile(recordedStage))!;
+		const parent = (await snapshotDirectory(dir))!;
+		await createActivationRecordFile({
+			...buildActivationRecord({
+				targetPath,
+				targetIdentity: target.identity,
+				parentIdentity: parent,
+				baselineDigest: target.identity.sha256,
+				stagingPath: recordedStage,
+				stagingIdentity: stage.identity,
+				candidate: { digest: stage.identity.sha256, version: "15.1.8" },
+			}),
+			phase: "pending_activation",
+		});
+
+		const exactUnlink = native.exactUnlink;
+		const unlinkSpy = vi.spyOn(native, "exactUnlink").mockImplementation((filePath, identity) => {
+			if (path.resolve(filePath) === retryStage) return { ok: false, code: "sharing_violation" };
+			return exactUnlink(filePath, identity);
+		});
+		try {
+			const result = await replaceBinaryFixture({
+				targetPath,
+				tempPath: retryStage,
+				backupPath,
+				expectedVersion: "15.1.8",
+				verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+			});
+
+			expect(result.ok).toBe(true);
+			expect(result.cleanupWarning).toContain("activation_retry_staging_cleanup_failed");
+			expect(await Bun.file(targetPath).text()).toBe("new binary");
+			expect(await Bun.file(retryStage).exists()).toBe(true);
+		} finally {
+			unlinkSpy.mockRestore();
+		}
+	});
+
 	it("consumes the shared verified activation record rather than creating a competing journal", async () => {
 		const dir = await makeTempDir();
 		const targetPath = path.join(dir, "gjc");
