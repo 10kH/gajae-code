@@ -3,11 +3,13 @@ import * as fsNode from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as native from "@gajae-code/natives";
 import { VERSION } from "@gajae-code/utils";
 import { runCli } from "../src/cli";
 import {
 	buildActivationRecord,
 	createActivationRecordFile,
+	readActivationRecord,
 	snapshotDirectory,
 	snapshotRegularFile,
 } from "../src/cli/install-activation";
@@ -1866,6 +1868,63 @@ async function replaceBinaryFixture(options: Omit<BinaryReplacementOptions, "ori
 }
 
 describe("update-cli binary replacement", () => {
+	it("reports a denied promotion and reuses its pending stage without leaving a duplicate", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc.exe");
+		const firstStage = path.join(dir, "gjc.new.first.exe");
+		const retryStage = path.join(dir, "gjc.new.retry.exe");
+		const backupPath = path.join(dir, "gjc.exe.bak");
+		await writeFixtureFile(targetPath, "old binary");
+		await writeFixtureFile(firstStage, "new binary");
+
+		const replaceNative = native.exactReplaceRetained;
+		let attempts = 0;
+		const replaceSpy = vi.spyOn(native, "exactReplaceRetained").mockImplementation((...args) => {
+			if (attempts++ === 0) return { ok: false, code: "access_denied", windowsErrorCode: "0xC0000022" };
+			return replaceNative(...args);
+		});
+		try {
+			await expect(
+				replaceBinaryFixture({
+					targetPath,
+					tempPath: firstStage,
+					backupPath,
+					expectedVersion: "15.1.8",
+					verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+				}),
+			).rejects.toThrow(`access_denied during exact replacement of ${targetPath} (0xC0000022)`);
+
+			expect(await Bun.file(targetPath).text()).toBe("old binary");
+			expect(await Bun.file(firstStage).text()).toBe("new binary");
+			const pending = await readActivationRecord(targetPath);
+			expect(pending.status).toBe("valid");
+			if (pending.status === "valid") {
+				expect(pending.record.phase).toBe("pending_activation");
+				expect(pending.record.stagingPath).toBe(firstStage);
+			}
+
+			await writeFixtureFile(retryStage, "new binary");
+			const retried = await replaceBinaryFixture({
+				targetPath,
+				tempPath: retryStage,
+				backupPath,
+				expectedVersion: "15.1.8",
+				verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+			});
+
+			expect(retried.ok).toBe(true);
+			expect(await Bun.file(targetPath).text()).toBe("new binary");
+			expect(await Bun.file(firstStage).exists()).toBe(false);
+			expect(await Bun.file(retryStage).exists()).toBe(false);
+			const verified = await readActivationRecord(targetPath);
+			expect(verified.status).toBe("valid");
+			if (verified.status === "valid") expect(verified.record.phase).toBe("verified");
+			expect(replaceSpy).toHaveBeenCalledTimes(2);
+		} finally {
+			replaceSpy.mockRestore();
+		}
+	});
+
 	it("consumes the shared verified activation record rather than creating a competing journal", async () => {
 		const dir = await makeTempDir();
 		const targetPath = path.join(dir, "gjc");

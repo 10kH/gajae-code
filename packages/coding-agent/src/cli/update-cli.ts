@@ -782,6 +782,14 @@ export async function recoverWindowsUpdateJournal(journalPath: string): Promise<
 	throw new Error("legacy_update_journal_requires_manual_review");
 }
 
+async function removeExactStagingFile(filePath: string, identity: FileIdentity): Promise<void> {
+	const quarantineName = `.${path.basename(filePath)}.cleanup.${randomUUID()}`;
+	const removed = exactUnlink(filePath, toNativeIdentity(identity, quarantineName));
+	const remaining = await snapshotRegularFile(filePath);
+	if ((!removed.ok && removed.code !== "not_found") || remaining)
+		throw new Error(`activation_retry_staging_cleanup_failed:${removed.code ?? "unverified"}:${filePath}`);
+}
+
 /**
  * Atomically replace the installed binary and roll back if version verification fails.
  */
@@ -839,8 +847,39 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 					existing.record.candidate.channel !== options.candidate.channel))
 		)
 			throw new Error("activation_transaction_requires_reconciliation");
-		record = existing.record;
-		recordIdentity = existing.identity;
+		const currentStagingPath = path.resolve(options.tempPath);
+		const recordedStagingPath = path.resolve(existing.record.stagingPath);
+		if (currentStagingPath !== recordedStagingPath) {
+			const retryCandidate = staged ?? (await snapshotRegularFile(currentStagingPath));
+			if (retryCandidate && retryCandidate.identity.sha256 !== existing.record.candidate.digest)
+				throw new Error("activation_retry_candidate_digest_mismatch");
+			const activationNeedsStagedCandidate =
+				existing.record.phase === "staged" || existing.record.phase === "pending_activation";
+			const recordedStage = activationNeedsStagedCandidate
+				? await snapshotRegularFile(recordedStagingPath)
+				: undefined;
+			const recordedStageIsValid =
+				recordedStage &&
+				existing.record.stagingIdentity &&
+				sameFileIdentity(existing.record.stagingIdentity, recordedStage.identity) &&
+				recordedStage.identity.sha256 === existing.record.candidate.digest;
+			if (activationNeedsStagedCandidate && !recordedStageIsValid) {
+				if (!retryCandidate) throw new Error("activation_retry_candidate_missing");
+				record = {
+					...existing.record,
+					stagingPath: currentStagingPath,
+					stagingIdentity: retryCandidate.identity,
+				};
+				recordIdentity = await updateActivationRecordFile(record, existing.identity);
+			} else {
+				if (retryCandidate) await removeExactStagingFile(currentStagingPath, retryCandidate.identity);
+				record = existing.record;
+				recordIdentity = existing.identity;
+			}
+		} else {
+			record = existing.record;
+			recordIdentity = existing.identity;
+		}
 	} else {
 		if (!staged) throw new Error("installation_staging_unavailable");
 		record = {
@@ -880,8 +919,13 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 			promoted.status !== "verified") ||
 		!promoted.record ||
 		!promoted.recordIdentity
-	)
+	) {
+		if (promoted.reason === "access_denied")
+			throw new Error(
+				`access_denied during exact replacement of ${targetPath}${promoted.windowsErrorCode ? ` (${promoted.windowsErrorCode})` : ""}`,
+			);
 		throw new Error(promoted.reason ?? "installation_publication_unverified");
+	}
 	record = promoted.record;
 	recordIdentity = promoted.recordIdentity;
 	try {

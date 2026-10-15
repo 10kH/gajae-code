@@ -960,7 +960,8 @@ const STATUS_SHARING_VIOLATION: i32 = 0xc000_0043u32 as i32;
 
 #[cfg(any(windows, test))]
 /// `STATUS_ACCESS_DENIED`, kept distinct from owner-identity failures because
-/// Windows directory rename can fail before mutation while a child is open.
+/// Windows replacement opens and renames can fail before mutation while a
+/// handle denies the requested sharing or delete access.
 const STATUS_ACCESS_DENIED: i32 = 0xc000_0022u32 as i32;
 
 #[cfg(any(windows, test))]
@@ -980,10 +981,15 @@ fn ntstatus_code(status: i32) -> &'static str {
 fn publication_rename_error_code(code: &'static str) -> &'static str {
 	match code {
 		// Preserve the existing owner-only security contract everywhere else. A
-		// failed Windows no-replace rename has a distinct access-denied meaning.
+		// denied Windows publication syscall is not an owner-identity failure.
 		"owner_mismatch" => "access_denied",
 		other => other,
 	}
+}
+
+#[cfg(any(windows, test))]
+fn retained_replace_error_code(status: i32) -> &'static str {
+	publication_rename_error_code(ntstatus_code(status))
 }
 
 #[cfg(any(windows, test))]
@@ -997,40 +1003,61 @@ const fn is_retryable_exact_replace_status(status: i32) -> bool {
 
 #[cfg(windows)]
 /// STATUS_INVALID_PARAMETER: the synthetic NTSTATUS used for early,
-/// pre-syscall name validation rejections in the status-returning open path
-/// (e.g. an embedded NUL or an oversized name), which never reach
-/// `NtCreateFile` and so have no real NTSTATUS to report. Distinct from
-/// `STATUS_SHARING_VIOLATION` and never retried.
+/// pre-syscall name validation rejections in the status-returning open/rename
+/// paths (e.g. an embedded NUL or an oversized name), which never reach the
+/// underlying syscall and so have no real NTSTATUS to report. Distinct from
+/// transient publication statuses and never retried.
 const STATUS_INVALID_PARAMETER: i32 = 0xc000_000du32 as i32;
 
-/// Bound on transient retries for the exact-replace destination open on
-/// Windows, matching the reporter's controlled 30 x 100 ms reproduction window
-/// (~1.2 s of contention) with margin. The delay keeps the retry hot loop from
-/// busy-spinning the persistence fence; the bound keeps a persistent holder
-/// from freezing a session for more than ~3 s.
+/// Bound on transient retries for pre-mutation exact-replace operations on
+/// Windows. Thirty attempts with 100 ms between them bounds a persistent
+/// denial to about three seconds without busy-spinning.
 #[cfg(any(windows, test))]
-const EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT: u32 = 30;
+const EXACT_REPLACE_RETRY_LIMIT: u32 = 30;
 #[cfg(any(windows, test))]
-const EXACT_REPLACE_DESTINATION_OPEN_RETRY_DELAY_MS: u64 = 100;
+const EXACT_REPLACE_RETRY_DELAY_MS: u64 = 100;
 
 #[cfg(any(windows, test))]
-/// Open a Windows handle with bounded transient retry on sharing violations.
+/// Open a Windows handle with bounded retry on sharing violations.
 /// `open` returns the raw NTSTATUS on failure; only
 /// [`is_retryable_exact_replace_status`] failures are retried, and only up to
-/// [`EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT`] attempts with a bounded delay
+/// [`EXACT_REPLACE_RETRY_LIMIT`] attempts with a bounded delay
 /// between them. This is the narrow pre-mutation syscall boundary: the caller
 /// must ensure nothing has been renamed or unlinked before the open.
 fn open_with_transient_retry<T>(mut open: impl FnMut() -> Result<T, i32>) -> Result<T, i32> {
-	for attempt in 0..EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT {
+	for attempt in 0..EXACT_REPLACE_RETRY_LIMIT {
 		match open() {
 			Ok(handle) => return Ok(handle),
 			Err(status)
 				if is_retryable_exact_replace_status(status)
-					&& attempt + 1 < EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT =>
+					&& attempt + 1 < EXACT_REPLACE_RETRY_LIMIT =>
 			{
-				std::thread::sleep(std::time::Duration::from_millis(
-					EXACT_REPLACE_DESTINATION_OPEN_RETRY_DELAY_MS,
-				));
+				std::thread::sleep(std::time::Duration::from_millis(EXACT_REPLACE_RETRY_DELAY_MS));
+			},
+			Err(status) => return Err(status),
+		}
+	}
+	unreachable!("the retry bound guarantees at least one attempt")
+}
+
+#[cfg(any(windows, test))]
+const fn is_retryable_exact_replace_rename_status(status: i32) -> bool {
+	status == STATUS_ACCESS_DENIED || status == STATUS_SHARING_VIOLATION
+}
+
+#[cfg(any(windows, test))]
+/// Retry exact-replace rename failures only for bounded transient statuses.
+/// Both statuses are returned before the requested rename takes effect, so
+/// the caller can safely retry this one operation without publishing twice.
+fn rename_with_transient_retry<T>(mut rename: impl FnMut() -> Result<T, i32>) -> Result<T, i32> {
+	for attempt in 0..EXACT_REPLACE_RETRY_LIMIT {
+		match rename() {
+			Ok(result) => return Ok(result),
+			Err(status)
+				if is_retryable_exact_replace_rename_status(status)
+					&& attempt + 1 < EXACT_REPLACE_RETRY_LIMIT =>
+			{
+				std::thread::sleep(std::time::Duration::from_millis(EXACT_REPLACE_RETRY_DELAY_MS));
 			},
 			Err(status) => return Err(status),
 		}
@@ -1048,10 +1075,11 @@ fn native_windows_error_code(status: i32) -> String {
 #[cfg(test)]
 mod exact_replace_windows_retry_policy_tests {
 	use super::{
-		EXACT_REPLACE_DESTINATION_OPEN_RETRY_DELAY_MS, EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT,
-		STATUS_ACCESS_DENIED, STATUS_SHARING_VIOLATION, is_retryable_exact_replace_status,
-		native_windows_error_code, ntstatus_code, open_with_transient_retry,
-		publication_rename_error_code,
+		EXACT_REPLACE_RETRY_DELAY_MS, EXACT_REPLACE_RETRY_LIMIT, STATUS_ACCESS_DENIED,
+		STATUS_SHARING_VIOLATION, is_retryable_exact_replace_rename_status,
+		is_retryable_exact_replace_status, native_windows_error_code, ntstatus_code,
+		open_with_transient_retry, publication_rename_error_code, rename_with_transient_retry,
+		retained_replace_error_code,
 	};
 
 	#[test]
@@ -1073,8 +1101,20 @@ mod exact_replace_windows_retry_policy_tests {
 
 	#[test]
 	fn retry_budget_and_delay_are_bounded() {
-		assert_eq!(EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT, 30);
-		assert_eq!(EXACT_REPLACE_DESTINATION_OPEN_RETRY_DELAY_MS, 100);
+		assert_eq!(EXACT_REPLACE_RETRY_LIMIT, 30);
+		assert_eq!(EXACT_REPLACE_RETRY_DELAY_MS, 100);
+	}
+
+	#[test]
+	fn exact_replace_rename_retries_access_denied_and_sharing_violations_only() {
+		assert!(is_retryable_exact_replace_rename_status(STATUS_ACCESS_DENIED));
+		assert!(is_retryable_exact_replace_rename_status(STATUS_SHARING_VIOLATION));
+		for status in [0xc000_0034u32 as i32, 0xc000_007fu32 as i32, 0xc000_000du32 as i32] {
+			assert!(
+				!is_retryable_exact_replace_rename_status(status),
+				"0x{status:08X} must not retry",
+			);
+		}
 	}
 
 	#[test]
@@ -1087,6 +1127,39 @@ mod exact_replace_windows_retry_policy_tests {
 			"access_denied"
 		);
 		assert_eq!(ntstatus_code(STATUS_SHARING_VIOLATION), "sharing_violation");
+	}
+
+	#[test]
+	fn retained_replace_access_denied_is_not_an_owner_mismatch() {
+		assert_eq!(retained_replace_error_code(STATUS_ACCESS_DENIED), "access_denied");
+	}
+
+	#[test]
+	fn rename_retry_succeeds_after_transient_access_denied() {
+		let mut failures = 2;
+		let attempts = std::cell::Cell::new(0);
+		let renamed = rename_with_transient_retry(|| {
+			attempts.set(attempts.get() + 1);
+			if failures > 0 {
+				failures -= 1;
+				Err(STATUS_ACCESS_DENIED)
+			} else {
+				Ok(())
+			}
+		});
+		assert_eq!(renamed, Ok(()));
+		assert_eq!(attempts.get(), 3, "2 transient failures then success");
+	}
+
+	#[test]
+	fn rename_retry_exhausts_the_budget_and_preserves_access_denied() {
+		let attempts = std::cell::Cell::new(0);
+		let renamed: Result<(), i32> = rename_with_transient_retry(|| {
+			attempts.set(attempts.get() + 1);
+			Err(STATUS_ACCESS_DENIED)
+		});
+		assert_eq!(renamed, Err(STATUS_ACCESS_DENIED));
+		assert_eq!(attempts.get(), EXACT_REPLACE_RETRY_LIMIT);
 	}
 
 	#[test]
@@ -1114,7 +1187,7 @@ mod exact_replace_windows_retry_policy_tests {
 			Err(STATUS_SHARING_VIOLATION)
 		});
 		assert_eq!(opened, Err(STATUS_SHARING_VIOLATION));
-		assert_eq!(attempts.get(), EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT);
+		assert_eq!(attempts.get(), EXACT_REPLACE_RETRY_LIMIT);
 	}
 
 	#[test]
@@ -1747,9 +1820,10 @@ pub fn exact_replace_path(
 /// single-link ownership; hard-linked or symlinked source/destination are
 /// rejected) before anything is mutated. On Windows a pre-mutation
 /// `STATUS_SHARING_VIOLATION` on the destination open is reported as a
-/// distinct `sharing_violation` code with `windows_error_code` set -- exactly
-/// as [`exact_replace_path`] already reports it -- and is always surfaced
-/// before any rename, so it is never mistaken for a post-effect failure.
+/// distinct `sharing_violation` code, while `STATUS_ACCESS_DENIED` on a
+/// retained open or rename is reported as `access_denied`. Pre-mutation
+/// failures include the original `windows_error_code`; only known-safe rename
+/// operations retry transient access-denied or sharing-violation statuses.
 #[napi]
 pub fn exact_replace_retained(
 	source_path: String,
@@ -10845,13 +10919,13 @@ mod platform {
 	};
 
 	use super::{
-		EXACT_REPLACE_DESTINATION_OPEN_RETRY_DELAY_MS, EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT,
-		ExactFileIdentity, NativeCanonicalDirectoryIdentity, NativeDirectoryTreeEntry,
-		NativeDirectoryTreeResult, NativeDirectoryTreeSnapshot, NativeExactUnlinkResult,
-		NativeOwnerOnlySecurityResult, NativePermissionRepairResult, STATUS_INVALID_PARAMETER,
-		STATUS_SHARING_VIOLATION, is_retryable_exact_replace_status, native_windows_error_code,
-		ntstatus_code, open_with_transient_retry, publication_rename_error_code, sha256,
-		volume_case_sensitivity_from_flags,
+		EXACT_REPLACE_RETRY_DELAY_MS, EXACT_REPLACE_RETRY_LIMIT, ExactFileIdentity,
+		NativeCanonicalDirectoryIdentity, NativeDirectoryTreeEntry, NativeDirectoryTreeResult,
+		NativeDirectoryTreeSnapshot, NativeExactUnlinkResult, NativeOwnerOnlySecurityResult,
+		NativePermissionRepairResult, STATUS_INVALID_PARAMETER, STATUS_SHARING_VIOLATION,
+		is_retryable_exact_replace_status, native_windows_error_code, ntstatus_code,
+		open_with_transient_retry, publication_rename_error_code, rename_with_transient_retry,
+		retained_replace_error_code, sha256, volume_case_sensitivity_from_flags,
 	};
 
 	type UvGetOsfhandle = unsafe extern "C" fn(fd: i32) -> isize;
@@ -11527,25 +11601,29 @@ mod platform {
 		handles_same_object_checked(left, right).unwrap_or(false)
 	}
 
-	fn rename_handle(
+	fn rename_handle_status(
 		handle: HANDLE,
 		parent_handle: HANDLE,
 		name: &[u16],
 		replace_if_exists: bool,
-	) -> Result<(), &'static str> {
-		let name_bytes = name.len().checked_mul(size_of::<u16>()).ok_or("io_error")?;
+	) -> Result<(), i32> {
+		let name_bytes = name
+			.len()
+			.checked_mul(size_of::<u16>())
+			.ok_or(STATUS_INVALID_PARAMETER)?;
 		let file_name_offset = std::mem::offset_of!(HandleRenameInformation, file_name);
 		let allocation_size = file_name_offset
 			.checked_add(name_bytes)
-			.ok_or("io_error")?
+			.ok_or(STATUS_INVALID_PARAMETER)?
 			.max(size_of::<HandleRenameInformation>());
-		let allocation_size_u32 = u32::try_from(allocation_size).map_err(|_| "io_error")?;
+		let allocation_size_u32 =
+			u32::try_from(allocation_size).map_err(|_| STATUS_INVALID_PARAMETER)?;
 		if file_name_offset % align_of::<u16>() != 0 {
-			return Err("io_error");
+			return Err(STATUS_INVALID_PARAMETER);
 		}
 		let words = allocation_size
 			.checked_add(size_of::<usize>() - 1)
-			.ok_or("io_error")?
+			.ok_or(STATUS_INVALID_PARAMETER)?
 			/ size_of::<usize>();
 		let mut storage = vec![0usize; words];
 		let rename = storage.as_mut_ptr().cast::<HandleRenameInformation>();
@@ -11556,7 +11634,8 @@ mod platform {
 		unsafe {
 			(*rename).replace_if_exists = u8::from(replace_if_exists);
 			(*rename).root_directory = parent_handle;
-			(*rename).file_name_length = u32::try_from(name_bytes).map_err(|_| "io_error")?;
+			(*rename).file_name_length =
+				u32::try_from(name_bytes).map_err(|_| STATUS_INVALID_PARAMETER)?;
 			let file_name = storage
 				.as_mut_ptr()
 				.cast::<u8>()
@@ -11582,8 +11661,33 @@ mod platform {
 		if rename_status >= 0 {
 			Ok(())
 		} else {
-			Err(ntstatus_code(rename_status))
+			Err(rename_status)
 		}
+	}
+
+	fn rename_handle(
+		handle: HANDLE,
+		parent_handle: HANDLE,
+		name: &[u16],
+		replace_if_exists: bool,
+	) -> Result<(), &'static str> {
+		rename_handle_status(handle, parent_handle, name, replace_if_exists).map_err(ntstatus_code)
+	}
+
+	fn rename_handle_with_transient_retry(
+		handle: HANDLE,
+		parent_handle: HANDLE,
+		name: &[u16],
+		replace_if_exists: bool,
+	) -> Result<(), i32> {
+		rename_with_transient_retry(|| {
+			rename_handle_status(handle, parent_handle, name, replace_if_exists)
+		})
+	}
+
+	fn retained_replace_rename_failure(status: i32) -> NativeExactUnlinkResult {
+		NativeExactUnlinkResult::failure(retained_replace_error_code(status))
+			.with_windows_error_code(native_windows_error_code(status))
 	}
 
 	fn detach_directory(
@@ -12054,9 +12158,11 @@ mod platform {
 	/// exact no-replace rename whenever that name is still vacant; if it is not
 	/// (an external successor claimed it), the predecessor remains durably
 	/// recoverable at exactly its caller-recorded `backup_name`.
-	/// `STATUS_SHARING_VIOLATION` on the destination open is detected and
-	/// reported before any rename, exactly as in `exact_replace_path`, so it is
-	/// never confused with a post-effect failure.
+	/// `STATUS_SHARING_VIOLATION` on the destination open and transient
+	/// `STATUS_ACCESS_DENIED`/`STATUS_SHARING_VIOLATION` rename failures are
+	/// retried only at their safe syscall boundaries. Pre-mutation results
+	/// retain the native status; failures after retirement preserve the
+	/// recovery paths.
 	pub(super) fn exact_replace_retained(
 		source_path: &Path,
 		destination_path: &Path,
@@ -12150,8 +12256,8 @@ mod platform {
 			return NativeExactUnlinkResult::failure("io_error");
 		};
 		// Pre-mutation, retryable-sharing-violation destination open -- identical
-		// boundary to exact_replace_path. A sharing violation here always fires
-		// before any rename, so it is never mistaken for a post-effect failure.
+		// boundary to exact_replace_path. Any access-denied status is still
+		// classified as a publication failure, not an ownership mismatch.
 		let destination_handle = match open_with_transient_retry(|| {
 			if take_injected_exact_replace_destination_open_sharing_violation() {
 				return Err(STATUS_SHARING_VIOLATION);
@@ -12174,7 +12280,7 @@ mod platform {
 					if is_retryable_exact_replace_status(status) {
 						"sharing_violation"
 					} else {
-						ntstatus_code(status)
+						retained_replace_error_code(status)
 					},
 				)
 				.with_windows_error_code(native_windows_error_code(status));
@@ -12228,9 +12334,13 @@ mod platform {
 		// crash after it commits leaves the predecessor durably at the exact
 		// caller-recorded `backup_name` with `destination_name` vacant -- both
 		// states are fully described by evidence the caller already holds.
-		if let Err(code) = rename_handle(destination.target, parent_handle, &backup_name_wide, false)
-		{
-			return NativeExactUnlinkResult::failure(code);
+		if let Err(status) = rename_handle_with_transient_retry(
+			destination.target,
+			parent_handle,
+			&backup_name_wide,
+			false,
+		) {
+			return retained_replace_rename_failure(status);
 		}
 		let mut retired_destination: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
 		if unsafe { GetFileInformationByHandle(destination.target, &mut retired_destination) } == 0
@@ -12269,9 +12379,15 @@ mod platform {
 				NativeExactUnlinkResult::detached_failure(code, backup_path_string)
 			};
 		}
-		match rename_handle(source.target, parent_handle, &destination_name_wide, false) {
+		match rename_handle_with_transient_retry(
+			source.target,
+			parent_handle,
+			&destination_name_wide,
+			false,
+		) {
 			Ok(()) => NativeExactUnlinkResult::detached(backup_path_string),
-			Err(code) => {
+			Err(status) => {
+				let code = retained_replace_error_code(status);
 				// The publish itself failed: restore the predecessor to its original
 				// name (exact no-replace rename, never overwriting a name that is no
 				// longer vacant) whenever that name is still vacant, exactly as
