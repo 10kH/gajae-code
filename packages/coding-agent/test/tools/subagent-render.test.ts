@@ -1,4 +1,5 @@
-import { beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
+import { resetSettingsForTest, Settings, settings } from "../../src/config/settings";
 import type { Theme } from "../../src/modes/theme/theme";
 import { getThemeByName, setThemeInstance } from "../../src/modes/theme/theme";
 import type { AgentProgress } from "../../src/task/types";
@@ -734,5 +735,109 @@ describe("subagent await renderer body cache (PR2)", () => {
 		expect(theme.icon.fast).toBeTruthy();
 		expect(fast.join("\n")).toContain(theme.icon.fast);
 		expect(slow.join("\n")).not.toContain(theme.icon.fast);
+	});
+});
+
+describe("compact subagent panel (#6774)", () => {
+	beforeEach(async () => {
+		resetSettingsForTest();
+		await Settings.init({ inMemory: true });
+		subagentBodyCacheTestHooks.reset();
+	});
+	afterEach(() => {
+		resetSettingsForTest();
+	});
+
+	function liveGroup(count: number, idle: number): SubagentSnapshot[] {
+		const now = Date.now();
+		return Array.from({ length: count }, (_, index) => {
+			const id = `0-Worker${index}`;
+			return snapshot({
+				id,
+				description: `worker ${index}`,
+				liveProgressAvailable: true,
+				progress: progress({
+					id,
+					currentTool: "bash",
+					toolCount: index + 1,
+					lastActivityMs: index < idle ? now - 45_000 : now - 1_000,
+				}),
+			});
+		});
+	}
+
+	it("renders 15 live subagents as a constant-height summary when collapsed", () => {
+		settings.set("task.compactSubagentPanel", true);
+		const out = render({ subagents: liveGroup(15, 3) }, false);
+		const lines = out.split("\n");
+		expect(lines).toEqual([
+			expect.stringContaining("awaiting 15 of 15"),
+			"  15 subagents running · 3 idle >30s",
+			expect.stringMatching(/^ {2}\(.* to list each · ctrl\+s to observe sessions\)$/),
+		]);
+		expect(out).not.toContain("0-Worker");
+		// The heavy per-subagent bodies are never built in compact mode.
+		expect(subagentBodyCacheTestHooks.bodyRenders).toBe(0);
+	});
+
+	it("keeps the line count independent of the number of subagents", () => {
+		settings.set("task.compactSubagentPanel", true);
+		const few = render({ subagents: liveGroup(2, 0) }, false).split("\n");
+		const many = render({ subagents: liveGroup(40, 0) }, false).split("\n");
+		expect(many.length).toBe(few.length);
+	});
+
+	it("summarizes mixed terminal states", () => {
+		settings.set("task.compactSubagentPanel", true);
+		const out = render(
+			{
+				subagents: [
+					...liveGroup(1, 0),
+					snapshot({ id: "0-Queued", status: "queued" }),
+					snapshot({ id: "0-Done", status: "completed" }),
+					snapshot({ id: "0-Failed", status: "failed" }),
+					snapshot({ id: "0-Cancelled", status: "cancelled" }),
+				],
+			},
+			false,
+		);
+		expect(out).toContain("1 subagent running · 1 failed · 1 queued · 1 done · 1 cancelled");
+	});
+
+	it("keeps failures visible and marks truncation on a narrow terminal", () => {
+		settings.set("task.compactSubagentPanel", true);
+		const component = subagentToolRenderer.renderResult(
+			{
+				content: [{ type: "text", text: "" }],
+				details: {
+					subagents: [
+						...liveGroup(9, 1),
+						snapshot({ id: "0-Queued", status: "queued" }),
+						snapshot({ id: "0-Paused", status: "paused" }),
+						snapshot({ id: "0-Done", status: "completed" }),
+						snapshot({ id: "0-Failed", status: "failed" }),
+					],
+				},
+			},
+			{ expanded: false, isPartial: true, spinnerFrame: 0 },
+			theme,
+		);
+		const summary = Bun.stripANSI(component.render(40)[1]!);
+		expect(summary).toStartWith("  9 subagents running · 1 failed");
+		expect(summary).toEndWith("…");
+	});
+
+	it("lists every subagent when tool output is expanded", () => {
+		settings.set("task.compactSubagentPanel", true);
+		const out = render({ subagents: liveGroup(15, 3) }, true);
+		for (let index = 0; index < 15; index++) expect(out).toContain(`0-Worker${index}`);
+		expect(out).not.toContain("idle >30s");
+	});
+
+	it("keeps the per-subagent list when the setting is off", () => {
+		const out = render({ subagents: liveGroup(3, 0) }, false);
+		expect(out).toContain("0-Worker0");
+		expect(out).toContain("0-Worker2");
+		expect(out).not.toContain("subagents running");
 	});
 });

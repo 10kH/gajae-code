@@ -540,8 +540,11 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			if (!onUpdate || streamingDisabled) return;
 			try {
 				const result = this.#progressResult(manager, records, true);
-				const signature = subagentAwaitRenderedStateSignature(result.details?.subagents ?? []);
 				const t = nowMs();
+				const snapshots = result.details?.subagents ?? [];
+				const signature = this.session.settings.get("task.compactSubagentPanel")
+					? subagentCompactRenderedStateSignature(snapshots, Date.now())
+					: subagentAwaitRenderedStateSignature(snapshots);
 				const livenessDue = force || t - lastEmitMs >= livenessIntervalMs;
 				if (!livenessDue && signature === lastEmittedSignature) return;
 				lastEmittedSignature = signature;
@@ -1133,6 +1136,83 @@ export function subagentAwaitRenderedStateSignature(
 		awaitOutcome: receipt?.awaitOutcome ?? null,
 		interrupted: receipt?.interrupted === true,
 		subagents: subagents.map(canonicalizeSnapshotForSignature),
+	});
+}
+
+/** A running subagent with no activity for longer than this counts as idle in the compact panel. */
+export const SUBAGENT_COMPACT_IDLE_MS = 30_000;
+
+/** Group counts behind the compact await panel's single summary line. */
+export interface SubagentGroupSummary {
+	running: number;
+	idle: number;
+	retrying: number;
+	queued: number;
+	paused: number;
+	completed: number;
+	failed: number;
+	cancelled: number;
+}
+
+export function summarizeSubagentGroup(subagents: readonly SubagentSnapshot[], nowMs: number): SubagentGroupSummary {
+	const summary: SubagentGroupSummary = {
+		running: 0,
+		idle: 0,
+		retrying: 0,
+		queued: 0,
+		paused: 0,
+		completed: 0,
+		failed: 0,
+		cancelled: 0,
+	};
+	for (const snapshot of subagents) {
+		switch (snapshot.status) {
+			case "running": {
+				summary.running += 1;
+				const live = snapshot.liveProgressAvailable !== false ? snapshot.progress : undefined;
+				if (live?.status === "running" && live.retryState) summary.retrying += 1;
+				if (live?.lastActivityMs !== undefined && nowMs - live.lastActivityMs > SUBAGENT_COMPACT_IDLE_MS) {
+					summary.idle += 1;
+				}
+				break;
+			}
+			case "queued":
+				summary.queued += 1;
+				break;
+			case "paused":
+				summary.paused += 1;
+				break;
+			case "completed":
+			case "already_completed":
+				summary.completed += 1;
+				break;
+			case "failed":
+			case "not_found":
+				summary.failed += 1;
+				break;
+			case "cancelled":
+				summary.cancelled += 1;
+				break;
+		}
+	}
+	return summary;
+}
+
+/**
+ * Rendered-state signature for the compact await panel. It covers only what the
+ * compact view shows (group counts), so per-subagent activity that does not move
+ * a count no longer re-emits: the update rate is bounded by count transitions and
+ * the liveness interval instead of growing with the number of live subagents.
+ */
+export function subagentCompactRenderedStateSignature(
+	subagents: readonly SubagentSnapshot[],
+	nowMs: number,
+	receipt?: Pick<SubagentToolDetails, "awaitOutcome" | "interrupted">,
+): string {
+	return JSON.stringify({
+		awaitOutcome: receipt?.awaitOutcome ?? null,
+		interrupted: receipt?.interrupted === true,
+		summary: summarizeSubagentGroup(subagents, nowMs),
 	});
 }
 

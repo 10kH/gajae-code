@@ -469,3 +469,41 @@ differently named bundles, and a stored `uri#ref` differs from a bare `uri`, so
 locator-based refusal would refuse installs that should proceed. Refusing on a
 guess is worse than reporting the real failure, so identity must be readable for
 refusal to apply.
+
+## Subagent compact await panel
+
+Source: `tools/subagent-render.ts` (the `subagent` await panel), behind the
+`task.compactSubagentPanel` setting (default off). This section extends the
+existing tool-panel grammar; it adds no tokens.
+
+- **Anatomy (collapsed, setting on):** exactly three rows regardless of the
+  number of subagents — the existing status header, one `dim` summary row of
+  group counts joined by ` · `, and one `dim` hint row in
+  parentheses naming the effective `app.tools.expand` key and, while anything
+  runs, the existing `ctrl+s to observe sessions` hint.
+- **Count order:** `N subagents running`, then `failed`, `retrying`,
+  `idle >30s`, `queued`, `paused`, `done`, `cancelled`. Zero counts are omitted.
+  Attention states come first because a narrow terminal truncates the row end;
+  truncation shows `…` so a dropped count is visible.
+- **States:** collapsed → summary; expanded (the existing tool-output toggle)
+  → the unchanged per-subagent list. With the setting off the panel is the
+  unchanged per-subagent list in both states. Status is carried by words and
+  counts, never by color or the spinner alone; ASCII/no-color keeps the same
+  text.
+- **Motion:** no new animation. With the setting on, await progress re-emits
+  only when the summary counts change (plus the existing liveness interval).
+- **International text:** the summary and hint are fixed English labels and
+  numbers; subagent descriptions (which may be CJK) appear only in the expanded
+  list, whose layout is unchanged.
+
+Capture command (fixture-backed, real renderer, fixed clock):
+
+```sh
+bun packages/coding-agent/scripts/capture-subagent-compact-panel-showcase.ts --out .gjc/qa/subagent-compact-panel-<run>
+```
+
+The matrix is every state at `80x24`, `120x36`, and `160x48` in
+`unicode-color`, plus `compact-collapsed-15-live` and `compact-collapsed-mixed`
+at `80x24/ascii-no-color`, `compact-collapsed-mixed/48x36/unicode-color`, and
+`narrow-cjk/48x36` in both render modes: 23 entries, each with `terminal.txt`,
+`terminal-ansi.txt`, `terminal.html`, and `metadata.json`.
