@@ -1147,14 +1147,145 @@ export function findMcpTuiMetadataFindings(slashCommandsSource: string, interact
 					? member.key.type === "PrivateName" && member.key.id.name === name.slice(1)
 					: member.key.type === "Identifier" && member.key.name === name;
 			});
+		const refreshHelper = method("#refreshSessionBuiltinSlashCommandVisibility");
 		const thisPrivate = (node: Babel.Node, property: string): boolean =>
 			node.type === "MemberExpression" &&
 			!node.computed &&
 			node.object.type === "ThisExpression" &&
 			node.property.type === "PrivateName" &&
 			node.property.id.name === property;
+		const refreshBody = refreshHelper?.body.body ?? [];
+		const commandNameMember = (node: Babel.Node, parameter: string): boolean =>
+			node.type === "MemberExpression" &&
+			!node.computed &&
+			!node.optional &&
+			node.object.type === "Identifier" &&
+			node.object.name === parameter &&
+			node.property.type === "Identifier" &&
+			node.property.name === "name";
+		const isExpectedBuiltinCommandNamesDeclaration = (statement: Babel.Statement): boolean => {
+			if (
+				statement.type !== "VariableDeclaration" ||
+				statement.kind !== "const" ||
+				statement.declarations.length !== 1
+			) {
+				return false;
+			}
+			const declaration = statement.declarations[0];
+			const initializer = declaration?.init;
+			if (
+				declaration?.id.type !== "Identifier" ||
+				declaration.id.name !== "builtinCommandNames" ||
+				initializer?.type !== "NewExpression" ||
+				initializer.callee.type !== "Identifier" ||
+				initializer.callee.name !== "Set" ||
+				initializer.arguments.length !== 1
+			) {
+				return false;
+			}
+			const names = initializer.arguments[0];
+			if (
+				names?.type !== "CallExpression" ||
+				names.optional ||
+				names.arguments.length !== 1 ||
+				names.callee.type !== "MemberExpression" ||
+				names.callee.computed ||
+				names.callee.optional ||
+				names.callee.object.type !== "Identifier" ||
+				names.callee.object.name !== "BUILTIN_SLASH_COMMANDS" ||
+				names.callee.property.type !== "Identifier" ||
+				names.callee.property.name !== "map"
+			) {
+				return false;
+			}
+			const mapper = names.arguments[0];
+			return (
+				mapper?.type === "ArrowFunctionExpression" &&
+				!mapper.async &&
+				!mapper.generator &&
+				mapper.params.length === 1 &&
+				mapper.params[0]?.type === "Identifier" &&
+				mapper.params[0].name === "command" &&
+				commandNameMember(mapper.body, "command")
+			);
+		};
+		const builtinCommandNamesDeclarationIndices = refreshBody.flatMap((statement, index) =>
+			isExpectedBuiltinCommandNamesDeclaration(statement) ? [index] : [],
+		);
+		const isExpectedBuiltinCommandNamesTail = (element: Babel.Node | null | undefined): boolean => {
+			if (element?.type !== "SpreadElement") return false;
+			const filter = element.argument;
+			if (
+				filter.type !== "CallExpression" ||
+				filter.optional ||
+				filter.arguments.length !== 1 ||
+				filter.callee.type !== "MemberExpression" ||
+				filter.callee.computed ||
+				filter.callee.optional ||
+				!thisPrivate(filter.callee.object, "baseSlashCommands") ||
+				filter.callee.property.type !== "Identifier" ||
+				filter.callee.property.name !== "filter"
+			) {
+				return false;
+			}
+			const predicate = filter.arguments[0];
+			if (
+				predicate?.type !== "ArrowFunctionExpression" ||
+				predicate.async ||
+				predicate.generator ||
+				predicate.params.length !== 1 ||
+				predicate.params[0]?.type !== "Identifier" ||
+				predicate.params[0].name !== "command" ||
+				predicate.body.type !== "UnaryExpression" ||
+				predicate.body.operator !== "!" ||
+				predicate.body.argument.type !== "CallExpression" ||
+				predicate.body.argument.optional ||
+				predicate.body.argument.arguments.length !== 1 ||
+				!isMcpFilterMember(predicate.body.argument.callee, "builtinCommandNames", "has")
+			) {
+				return false;
+			}
+			return commandNameMember(predicate.body.argument.arguments[0]!, "command");
+		};
+		const isExpectedPreviousSlashCommandTail = (statement: Babel.Statement): boolean => {
+			if (
+				statement.type !== "VariableDeclaration" ||
+				statement.kind !== "const" ||
+				statement.declarations.length !== 1
+			) {
+				return false;
+			}
+			const declaration = statement.declarations[0];
+			const initializer = declaration?.init;
+			if (
+				declaration?.id.type !== "Identifier" ||
+				declaration.id.name !== "previousSlashCommandTail" ||
+				initializer?.type !== "CallExpression" ||
+				initializer.optional ||
+				initializer.arguments.length !== 1 ||
+				initializer.callee.type !== "MemberExpression" ||
+				initializer.callee.computed ||
+				initializer.callee.optional ||
+				!thisPrivate(initializer.callee.object, "resolvedSlashCommands") ||
+				initializer.callee.property.type !== "Identifier" ||
+				initializer.callee.property.name !== "slice"
+			) {
+				return false;
+			}
+			const offset = initializer.arguments[0];
+			return (
+				offset?.type === "MemberExpression" &&
+				!offset.computed &&
+				!offset.optional &&
+				thisPrivate(offset.object, "baseSlashCommands") &&
+				offset.property.type === "Identifier" &&
+				offset.property.name === "length"
+			);
+		};
+		const previousSlashCommandTailIndices = refreshBody.flatMap((statement, index) =>
+			isExpectedPreviousSlashCommandTail(statement) ? [index] : [],
+		);
 		const constructor = method("constructor");
-		const refreshHelper = method("#refreshSessionBuiltinSlashCommandVisibility");
 		const refreshCommands = method("refreshSlashCommandState");
 		const constructorBody = constructor?.body.body ?? [];
 		const initialization = constructorBody.some(
@@ -1219,7 +1350,6 @@ export function findMcpTuiMetadataFindings(slashCommandsSource: string, interact
 			);
 		});
 		const initSlashCommands = initSlashCommandsIndex >= 0 && initSlashCommandsIndex < baseSlashCommandsIndex;
-		const refreshBody = refreshHelper?.body.body ?? [];
 		const capabilitySnapshot = refreshBody[0];
 		const capabilitySnapshotIsExact =
 			capabilitySnapshot?.type === "VariableDeclaration" &&
@@ -1259,29 +1389,60 @@ export function findMcpTuiMetadataFindings(slashCommandsSource: string, interact
 				statement.expression.right.name === "hasExactMcpControls",
 		);
 		const rebuildSlashCommandsIndex = refreshBody.findIndex(
-			statement =>
-				statement.type === "ExpressionStatement" &&
-				statement.expression.type === "AssignmentExpression" &&
-				statement.expression.operator === "=" &&
-				thisPrivate(statement.expression.left, "baseSlashCommands") &&
-				statement.expression.right.type === "ArrayExpression" &&
-				statement.expression.right.elements[0]?.type === "SpreadElement" &&
-				statement.expression.right.elements[0].argument.type === "CallExpression" &&
-				statement.expression.right.elements[0].argument.callee.type === "Identifier" &&
-				statement.expression.right.elements[0].argument.callee.name === "getBuiltinSlashCommandsForSession" &&
-				statement.expression.right.elements[0].argument.arguments.length === 1 &&
-				statement.expression.right.elements[0].argument.arguments[0]?.type === "Identifier" &&
-				statement.expression.right.elements[0].argument.arguments[0].name === "hasExactMcpControls",
+			statement => {
+				if (
+					statement.type !== "ExpressionStatement" ||
+					statement.expression.type !== "AssignmentExpression" ||
+					statement.expression.operator !== "=" ||
+					!thisPrivate(statement.expression.left, "baseSlashCommands") ||
+					statement.expression.right.type !== "ArrayExpression"
+				) {
+					return false;
+				}
+				const elements = statement.expression.right.elements;
+				const sessionBuiltins = elements[0];
+				return (
+					elements.length === 2 &&
+					builtinCommandNamesDeclarationIndices.length === 1 &&
+					builtinCommandNamesDeclarationIndices[0]! < refreshBody.indexOf(statement) &&
+					previousSlashCommandTailIndices.length === 1 &&
+					previousSlashCommandTailIndices[0]! < refreshBody.indexOf(statement) &&
+					sessionBuiltins?.type === "SpreadElement" &&
+					sessionBuiltins.argument.type === "CallExpression" &&
+					sessionBuiltins.argument.callee.type === "Identifier" &&
+					sessionBuiltins.argument.callee.name === "getBuiltinSlashCommandsForSession" &&
+					sessionBuiltins.argument.arguments.length === 1 &&
+					sessionBuiltins.argument.arguments[0]?.type === "Identifier" &&
+					sessionBuiltins.argument.arguments[0].name === "hasExactMcpControls" &&
+					isExpectedBuiltinCommandNamesTail(elements[1])
+				);
+			},
 		);
 		const rebuildResolvedSlashCommandsIndex = refreshBody.findIndex(
-			statement =>
-				statement.type === "ExpressionStatement" &&
-				statement.expression.type === "AssignmentExpression" &&
-				statement.expression.operator === "=" &&
-				thisPrivate(statement.expression.left, "resolvedSlashCommands") &&
-				statement.expression.right.type === "ArrayExpression" &&
-				statement.expression.right.elements[0]?.type === "SpreadElement" &&
-				thisPrivate(statement.expression.right.elements[0].argument, "baseSlashCommands"),
+			statement => {
+				if (
+					statement.type !== "ExpressionStatement" ||
+					statement.expression.type !== "AssignmentExpression" ||
+					statement.expression.operator !== "=" ||
+					!thisPrivate(statement.expression.left, "resolvedSlashCommands") ||
+					statement.expression.right.type !== "ArrayExpression"
+				) {
+					return false;
+				}
+				const elements = statement.expression.right.elements;
+				const baseCommands = elements[0];
+				const preservedTail = elements[1];
+				return (
+					elements.length === 2 &&
+					previousSlashCommandTailIndices.length === 1 &&
+					previousSlashCommandTailIndices[0]! < refreshBody.indexOf(statement) &&
+					baseCommands?.type === "SpreadElement" &&
+					thisPrivate(baseCommands.argument, "baseSlashCommands") &&
+					preservedTail?.type === "SpreadElement" &&
+					preservedTail.argument.type === "Identifier" &&
+					preservedTail.argument.name === "previousSlashCommandTail"
+				);
+			},
 		);
 		const updateAutocompleteIndex = refreshBody.findIndex(
 			statement =>
@@ -1315,13 +1476,18 @@ export function findMcpTuiMetadataFindings(slashCommandsSource: string, interact
 			});
 		}
 		const refreshActionsAreReachable =
+			refreshBody.length === 8 &&
 			capabilitySnapshotIsExact &&
 			capabilityNoopReturn !== undefined &&
 			!hasUnexpectedRefreshExit &&
-			rebuildSlashCommandsIndex > 1 &&
-			refreshCapabilityFlagIndex > rebuildSlashCommandsIndex &&
-			rebuildResolvedSlashCommandsIndex > refreshCapabilityFlagIndex &&
-			updateAutocompleteIndex > rebuildResolvedSlashCommandsIndex;
+			previousSlashCommandTailIndices.length === 1 &&
+			previousSlashCommandTailIndices[0] === 2 &&
+			builtinCommandNamesDeclarationIndices.length === 1 &&
+			builtinCommandNamesDeclarationIndices[0] === 3 &&
+			rebuildSlashCommandsIndex === 4 &&
+			refreshCapabilityFlagIndex === 5 &&
+			rebuildResolvedSlashCommandsIndex === 6 &&
+			updateAutocompleteIndex === 7;
 		const refreshBodyStatements = refreshCommands?.body.body ?? [];
 		const loadIndex = refreshBodyStatements.findIndex(
 			statement =>

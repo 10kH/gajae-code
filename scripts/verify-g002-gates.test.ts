@@ -430,6 +430,20 @@ describe("MCP command quarantine", () => {
 		);
 	});
 
+	test("rejects re-adding the unfiltered builtin list during capability refresh", async () => {
+		const root = path.join(import.meta.dir, "..");
+		const slashCommands = await Bun.file(path.join(root, "packages/coding-agent/src/extensibility/slash-commands.ts")).text();
+		const interactiveMode = await Bun.file(path.join(root, "packages/coding-agent/src/modes/interactive-mode.ts")).text();
+		const reintroducedBuiltins = interactiveMode.replace(
+			"\t\t\t...this.#baseSlashCommands.filter(command => !builtinCommandNames.has(command.name)),",
+			"\t\t\t...this.#baseSlashCommands.filter(command => !builtinCommandNames.has(command.name)),\n\t\t\t...BUILTIN_SLASH_COMMANDS,",
+		);
+		expect(reintroducedBuiltins).not.toBe(interactiveMode);
+		expect(findMcpTuiMetadataFindings(slashCommands, reintroducedBuiltins)).toContain(
+			"ordinary TUI /mcp metadata is not filtered by the exact MCP capability",
+		);
+	});
+
 	test("rejects computed capability lookups during TUI metadata initialization", async () => {
 		const root = path.join(import.meta.dir, "..");
 		const slashCommands = await Bun.file(path.join(root, "packages/coding-agent/src/extensibility/slash-commands.ts")).text();
