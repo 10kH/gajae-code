@@ -255,9 +255,8 @@ async function writeSessionHtml(
 
 /**
  * Own `__proto__` stays a data property; a normal object would turn that assignment into the prototype.
- * Each field is redacted together with its key. A detached leaf such as `abcdefgh1234` under `password`
- * would otherwise miss the key-aware rule. If that serialized field does not parse, the value is
- * redacted on its own so a quotation mark inside a labeled secret cannot break the export.
+ * Credential keys mask every JSON value, and string values are scrubbed directly so JSON escaping
+ * cannot turn ordinary quote characters into credential-value delimiters.
  */
 function redactJsonValue(value: unknown): unknown {
 	if (typeof value === "string") return redactCrashSecrets(value);
@@ -294,17 +293,7 @@ function redactKeyedValue(key: string, value: unknown): unknown {
 	// A recognized key is authoritative for every JSON type, including a short
 	// string, a number, an array, or a nested object.
 	if (isCredentialKey(key)) return "«redacted»";
-	if (typeof value !== "string") return redactJsonValue(value);
-	const encoded = JSON.stringify({ [key]: value });
-	try {
-		const parsed = JSON.parse(redactCrashSecrets(encoded)) as Record<string, unknown>;
-		if (parsed !== null && typeof parsed === "object" && Object.hasOwn(parsed, key)) return parsed[key];
-	} catch {
-		// Credential keys are masked above. Redaction of an embedded credential can
-		// otherwise make the serialized field invalid, so scrub its detached value.
-		return redactCrashSecrets(value);
-	}
-	return redactCrashSecrets(value);
+	return typeof value === "string" ? redactCrashSecrets(value) : redactJsonValue(value);
 }
 
 function sessionEmbedJson(value: unknown): string {
