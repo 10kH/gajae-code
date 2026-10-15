@@ -2056,11 +2056,12 @@ describe("update-cli binary replacement", () => {
 		}
 	});
 
-	it("retains the retry candidate when the recorded stage disappears during reconciliation", async () => {
+	it("repoints a missing activation candidate and reuses it with a new staging path", async () => {
 		const dir = await makeTempDir();
 		const targetPath = path.join(dir, "gjc.exe");
 		const recordedStage = path.join(dir, "gjc.new.recorded.exe");
 		const retryStage = path.join(dir, "gjc.new.retry.exe");
+		const nextStage = path.join(dir, "gjc.new.next.exe");
 		const backupPath = path.join(dir, "gjc.exe.bak");
 		await writeFixtureFile(targetPath, "old binary");
 		await writeFixtureFile(recordedStage, "new binary");
@@ -2110,9 +2111,10 @@ describe("update-cli binary replacement", () => {
 			expect(pending.record.stagingPath).toBe(retryStage);
 		}
 
+		await writeFixtureFile(nextStage, "new binary");
 		const result = await replaceBinaryFixture({
 			targetPath,
-			tempPath: retryStage,
+			tempPath: nextStage,
 			backupPath,
 			expectedVersion: "15.1.8",
 			verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
@@ -2120,6 +2122,7 @@ describe("update-cli binary replacement", () => {
 		expect(result.ok).toBe(true);
 		expect(await Bun.file(targetPath).text()).toBe("new binary");
 		expect(await Bun.file(retryStage).exists()).toBe(false);
+		expect(await Bun.file(nextStage).exists()).toBe(false);
 		expect(await Bun.file(backupPath).exists()).toBe(false);
 	});
 
