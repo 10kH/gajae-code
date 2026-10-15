@@ -94,18 +94,19 @@ describe("codex adapter", () => {
 	test("reads TOML mcp_servers and converts Markdown prompts to slash commands", async () => {
 		await writeFile(".codex/config.toml", '[mcp_servers.srv]\ncommand = "bin"\nargs = ["--x"]\n');
 		await writeFile(".codex/prompts/review.md", "---\ndescription: Review code.\n---\nReview $ARGUMENTS.");
+		await writeFile(".codex/prompts/help.md", "---\ndescription: Codex help prompt.\n---\nHelp $ARGUMENTS.");
 		await writeFile(".codex/AGENTS.md", "User-level Codex instructions.");
 		const result = await getAdapter("codex").collect(adapterOptions());
 		expect(result.mcpCandidates).toHaveLength(1);
 		expect(result.mcpCandidates[0]).toMatchObject({ source: "codex", name: "srv" });
 		expect(result.skillCandidates).toHaveLength(0);
-		expect(result.slashCommandCandidates).toEqual([
-			{
-				source: "codex",
-				name: "review",
-				content: "---\ndescription: Review code.\n---\nReview $ARGUMENTS.",
-			},
+		expect(result.slashCommandCandidates.map(candidate => candidate.name).sort()).toEqual([
+			"prompts:help",
+			"prompts:review",
 		]);
+		expect(result.slashCommandCandidates.find(candidate => candidate.name === "prompts:review")?.content).toBe(
+			"---\ndescription: Review code.\n---\nReview $ARGUMENTS.",
+		);
 		expect(result.instructionCandidates).toEqual([
 			{ source: "codex", name: "AGENTS.md", content: "User-level Codex instructions." },
 		]);

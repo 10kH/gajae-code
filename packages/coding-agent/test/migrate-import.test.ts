@@ -187,23 +187,29 @@ describe("end-to-end import", () => {
 
 	test("Codex prompts import as native slash commands, not skills", async () => {
 		await write(".codex/config.toml", '[mcp_servers.codexSrv]\ncommand = "cdx"\n');
-		const prompt = "---\ndescription: Review carefully.\n---\nReview $ARGUMENTS.";
-		await write(".codex/prompts/review.md", prompt);
+		const prompt = "---\ndescription: Codex help prompt.\n---\nHelp $ARGUMENTS.";
+		await write(".codex/prompts/help.md", prompt);
 		await fs.writeFile(path.join(cwd, "AGENTS.md"), "Follow the Codex project instructions.", "utf-8");
 		const report = await runMigrate(opts({ from: ["codex"] }));
 		const config = await readMCPConfigFile(path.join(cwd, ".gjc", "mcp.json"));
 		expect(config.mcpServers?.codexSrv).toMatchObject({ type: "stdio", command: "cdx" });
-		expect(await fs.readFile(path.join(cwd, ".gjc", "commands", "review.md"), "utf-8")).toBe(prompt);
+		const commandPath = path.join(cwd, ".gjc", "commands", "prompts", "help.md");
+		expect(await fs.readFile(commandPath, "utf-8")).toBe(prompt);
 		expect(report.actions).toContainEqual(
-			expect.objectContaining({ type: "command", source: "codex", name: "review", status: "imported" }),
+			expect.objectContaining({ type: "command", source: "codex", name: "prompts:help", status: "imported" }),
 		);
 		expect(report.summary.byType.skill.imported).toBe(0);
 		expect(
-			await fs.access(path.join(cwd, ".gjc", "skills", "review", "SKILL.md")).then(
+			await fs.access(path.join(cwd, ".gjc", "skills", "help", "SKILL.md")).then(
 				() => true,
 				() => false,
 			),
 		).toBe(false);
+		const commands = await loadSlashCommands({ cwd });
+		expect(commands).toContainEqual(
+			expect.objectContaining({ name: "prompts:help", description: "Codex help prompt." }),
+		);
+		expect(expandSlashCommand("/prompts:help the project", commands)).toContain("Help the project.");
 		expect(await fs.readFile(path.join(cwd, "AGENTS.md"), "utf-8")).toBe("Follow the Codex project instructions.");
 		expect(
 			await fs.access(path.join(cwd, ".gjc", "AGENTS.md")).then(

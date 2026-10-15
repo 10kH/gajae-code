@@ -77,12 +77,16 @@ instructions into `AGENTS.md`. User scope is the default: Claude Code reads
 `~/.claude/CLAUDE.md` and `~/.claude/commands/`, while Codex reads
 `~/.codex/AGENTS.md` and `~/.codex/prompts/`. User instructions go to
 `~/.gjc/agent/AGENTS.md`, and commands go to `~/.gjc/agent/commands/`.
+Codex prompts are namespaced under `/prompts:<name>` (for example,
+`~/.codex/prompts/help.md` becomes `/prompts:help`) so they cannot be shadowed
+by GJC's built-in slash commands.
 
 With `--project`, Claude Code reads the project-root `CLAUDE.md` and
 `.claude/commands/`, writing to `<project>/.gjc/AGENTS.md` and
 `<project>/.gjc/commands/`. A project-root Codex `AGENTS.md` is already a
 native GJC instruction source, so it is left in place rather than copied;
 Codex's user prompts remain the command source for either destination scope.
+They are written beneath the selected scope's `commands/prompts/` directory.
 Nested Claude command paths become colon-separated names, so
 `.claude/commands/review/security.md` is imported as `/review:security`.
 Command Markdown and frontmatter are preserved; GJC uses the `description`

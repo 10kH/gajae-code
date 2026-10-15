@@ -75,7 +75,9 @@ export const codexAdapter: Adapter = {
 		}
 
 		const prompts = await collectMarkdownCommands(path.join(homeDir, ".codex", "prompts"), SOURCE);
-		result.slashCommandCandidates.push(...prompts.candidates);
+		result.slashCommandCandidates.push(
+			...prompts.candidates.map(candidate => ({ ...candidate, name: `prompts:${candidate.name}` })),
+		);
 		result.diagnostics.push(...prompts.diagnostics);
 
 		if (scope === "user") {
