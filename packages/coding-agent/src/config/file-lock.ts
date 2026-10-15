@@ -157,6 +157,8 @@ const pendingStagingCleanups = new Map<string, PendingFileLockStagingCleanup>();
  */
 const PUBLICATION_TRANSIENT_RETRY_ATTEMPTS = 3;
 const PUBLICATION_TRANSIENT_RETRY_DELAY_MS = 10;
+/** Allow one caller backoff for transient Windows denial without multiplying a persistent ACL failure by the full lock wait. */
+const MAX_ACCESS_DENIED_PUBLICATION_ACQUISITION_ATTEMPTS = 2;
 
 /** Grace period after which an unpublished removal transition becomes reclaimable as orphan. */
 const REMOVAL_TRANSITION_GRACE_MS = 10_000;
@@ -3136,7 +3138,10 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 	let contentionObserved = false;
 	let staleRemovalFailure: RecordedStaleRemovalFailure | undefined;
 	let publicationFailureCode: FileLockPublicationFailureCode | undefined;
+	let accessDeniedPublicationAttempts = 0;
+	let attemptsMade = 0;
 	for (let attempt = 0; attempt < opts.retries; attempt++) {
+		attemptsMade = attempt + 1;
 		throwIfFileLockAcquisitionAborted(opts.signal);
 		await retryPendingStagingCleanups(lockPath, retryBudget);
 		const localKey = await localLockKey(lockPath);
@@ -3159,6 +3164,7 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 			// Keep using the caller's bounded contention budget; the same generation is
 			// revalidated before every later adoption attempt.
 			publicationFailureCode = undefined;
+			accessDeniedPublicationAttempts = 0;
 			if (attempt + 1 === opts.retries)
 				throw new FileLockAcquireError(
 					filePath,
@@ -3170,14 +3176,17 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 				);
 		} else if (isFileLockPublicationRetry(result)) {
 			publicationFailureCode = result.code;
+			accessDeniedPublicationAttempts = result.code === "access_denied" ? accessDeniedPublicationAttempts + 1 : 0;
 		} else {
 			publicationFailureCode = undefined;
+			accessDeniedPublicationAttempts = 0;
 			if (result) {
 				localLockStates.set(localKey, { owner: result, status: "held" });
 				return () => releaseLock(lockPath, result, localKey);
 			}
 		}
 		throwIfFileLockAcquisitionAborted(opts.signal);
+		if (accessDeniedPublicationAttempts >= MAX_ACCESS_DENIED_PUBLICATION_ACQUISITION_ATTEMPTS) break;
 		const publicationIsProvenContention = isFileLockPublicationRetry(result) && result.code === "sharing_violation";
 		if (!contentionObserved && (!isFileLockPublicationRetry(result) || publicationIsProvenContention)) {
 			contentionObserved = true;
@@ -3232,7 +3241,7 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 	throw new FileLockAcquireError(
 		filePath,
 		lockPath,
-		opts.retries,
+		attemptsMade,
 		holder.description,
 		transitionState === "orphan_transition" ? "orphan_transition" : "acquire_timeout",
 		transitionPath,

@@ -23,10 +23,15 @@ import {
 	snapshotDirectoryTree,
 } from "@gajae-code/natives";
 import { registerOwnedDeletionRoot } from "../../../scripts/safe-cleanup";
+import { sessionIndexStartupLockOptions } from "../src/sdk/broker/session-index";
 
 const tempDirs: { directory: string; forgetGrant: () => void }[] = [];
 const quickAcquire = { retries: 3, retryDelayMs: 1 };
 const expectedBoundedPublicationCalls = 3;
+
+function sessionIndexRetryBudget() {
+	return sessionIndexStartupLockOptions(performance.now() + 60_000, undefined, "authorized-successor");
+}
 
 interface Fixture {
 	root: string;
@@ -481,10 +486,13 @@ test("does not retry access-denied receipts without Windows rename provenance", 
 	expect(await fs.readdir(root)).toEqual([]);
 });
 
-test("uses the acquisition budget after bounded access-denied publication retries without reporting contention", async () => {
+test("bounds persistent access-denied retries independently of the session-index acquisition budget", async () => {
 	const { root, file, lock } = await makeFixture();
 	let attempts = 0;
 	let contentionNotifications = 0;
+	const retryBudget = sessionIndexRetryBudget();
+	expect(retryBudget.retries).toBe(600);
+	expect(retryBudget.retryDelayMs).toBe(100);
 	FileLockTestHooks.nativePublicationBindings = () => ({
 		renameNoReplacePathAsync: async () => {
 			attempts++;
@@ -494,8 +502,7 @@ test("uses the acquisition budget after bounded access-denied publication retrie
 	});
 
 	const failure = await acquireFileLock(file, {
-		retries: 2,
-		retryDelayMs: 1,
+		...retryBudget,
 		onContended: () => contentionNotifications++,
 	}).then(
 		() => undefined,
@@ -518,6 +525,7 @@ test("recovers when access-denied publication clears within the outer acquisitio
 	const { root, file, lock } = await makeFixture();
 	let attempts = 0;
 	let contentionNotifications = 0;
+	const retryBudget = sessionIndexRetryBudget();
 	FileLockTestHooks.nativePublicationBindings = () => ({
 		renameNoReplacePathAsync: async (source, destination) => {
 			attempts++;
@@ -530,8 +538,7 @@ test("recovers when access-denied publication clears within the outer acquisitio
 
 	await expect(
 		withFileLock(file, async () => "entered", {
-			retries: 2,
-			retryDelayMs: 1,
+			...retryBudget,
 			onContended: () => contentionNotifications++,
 		}),
 	).resolves.toBe("entered");
