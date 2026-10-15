@@ -101,6 +101,7 @@ async function makeSession(
 		"bash.autoBackground.enabled": false,
 		"bashInterceptor.enabled": false,
 		"lsp.enabled": true,
+		"mcp.enableProjectConfig": true,
 	});
 	const sessionManager = SessionManager.inMemory(cwd);
 	const { session } = await createAgentSession({

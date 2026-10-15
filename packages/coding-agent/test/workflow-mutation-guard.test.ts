@@ -537,6 +537,73 @@ describe("workflow mutation guard", () => {
 		}
 	});
 
+	it("blocks bash writes to another session's specs and plans during planning", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveDeepInterview(cwd, "session-a");
+
+		for (const command of [
+			"echo x > .gjc/_session-session-b/specs/deep-interview-x.md",
+			"echo x > .gjc/_session-session-b/plans/plan.md",
+			"mkdir -p .gjc/_session-session-a-extra/specs",
+			"echo x > .gjc/_session-session-a/specs/a.md; echo y > .gjc/_session-session-b/plans/b.md",
+		]) {
+			await expect(
+				assertWorkflowMutationAllowed({
+					cwd,
+					sessionId: "session-a",
+					tool: tool("bash"),
+					args: { command },
+				}),
+			).rejects.toThrow(DEEP_INTERVIEW_MUTATION_BLOCK_MESSAGE);
+		}
+
+		await writeActiveDeepInterview(cwd, "a.b");
+		await expect(
+			assertWorkflowMutationAllowed({
+				cwd,
+				sessionId: "a.b",
+				tool: tool("bash"),
+				args: { command: "echo x > .gjc/_session-a.b/specs/x.md" },
+			}),
+		).rejects.toThrow(DEEP_INTERVIEW_MUTATION_BLOCK_MESSAGE);
+	});
+
+	it("allows the current session's specs and plans and unscoped planning artifacts", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveDeepInterview(cwd, "session-a");
+
+		for (const command of [
+			"echo x > .gjc/_session-session-a/specs/deep-interview-x.md",
+			"echo x > .gjc/_session-session-a/plans/plan.md",
+			"cat source.md > .gjc/specs/deep-interview-x.md",
+			"mkdir -p .gjc/plans",
+		]) {
+			await assertWorkflowMutationAllowed({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("bash"),
+				args: { command },
+			});
+		}
+
+		const directWrite = await getWorkflowMutationDecision({
+			cwd,
+			sessionId: "session-a",
+			tool: tool("write"),
+			args: { path: ".gjc/_session-session-a/specs/deep-interview-x.md", content: "x" },
+		});
+		expect(directWrite.blocked).toBe(true);
+		expect(directWrite.reason).toBe("gjc-target");
+
+		await writeActiveDeepInterview(cwd, "a.b");
+		await assertWorkflowMutationAllowed({
+			cwd,
+			sessionId: "a.b",
+			tool: tool("bash"),
+			args: { command: "echo x > .gjc/_session-a%2Eb/specs/x.md" },
+		});
+	});
+
 	it("allows the /dev/null sink during active deep-interview", async () => {
 		const cwd = await makeTempRoot();
 		await writeActiveDeepInterview(cwd);
