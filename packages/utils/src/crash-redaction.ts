@@ -202,7 +202,7 @@ function redactCredentialContainersWithPattern(text: string, assignment: RegExp)
 
 function findCredentialContainerEnd(text: string, start: number): number {
 	const closing = [text[start] === "[" ? "]" : "}"];
-	const escapedQuoteDelimiters = usesEscapedDoubleQuoteDelimiters(text, start);
+	const escapedQuoteDelimiter = findEscapedQuoteDelimiter(text, start);
 	let quote: "'" | '"' | undefined;
 	for (let index = start + 1; index < text.length; index++) {
 		const character = text[index] ?? "";
@@ -212,9 +212,9 @@ function findCredentialContainerEnd(text: string, start: number): number {
 			const backslashCount = backslashEnd - index + 1;
 			const nextCharacter = text[backslashEnd + 1];
 			// In a serialized container, one backslash marks a structural quote; longer odd runs escape quote data.
-			if (nextCharacter === '"' && escapedQuoteDelimiters && backslashCount === 1) {
-				if (quote === undefined) quote = '"';
-				else if (quote === '"') quote = undefined;
+			if (escapedQuoteDelimiter !== undefined && nextCharacter === escapedQuoteDelimiter && backslashCount === 1) {
+				if (quote === undefined) quote = escapedQuoteDelimiter;
+				else if (quote === escapedQuoteDelimiter) quote = undefined;
 				index = backslashEnd + 1;
 				continue;
 			}
@@ -239,7 +239,7 @@ function findCredentialContainerEnd(text: string, start: number): number {
 	return text.length;
 }
 
-function usesEscapedDoubleQuoteDelimiters(text: string, start: number): boolean {
+function findEscapedQuoteDelimiter(text: string, start: number): "'" | '"' | undefined {
 	const closing = [text[start] === "[" ? "]" : "}"];
 	for (let index = start + 1; index < text.length; index++) {
 		const character = text[index] ?? "";
@@ -248,19 +248,19 @@ function usesEscapedDoubleQuoteDelimiters(text: string, start: number): boolean 
 			while (text[backslashEnd + 1] === "\\") backslashEnd++;
 			const backslashCount = backslashEnd - index + 1;
 			const nextCharacter = text[backslashEnd + 1];
-			if (nextCharacter === '"' && backslashCount % 2 === 1) return true;
+			if ((nextCharacter === '"' || nextCharacter === "'") && backslashCount % 2 === 1) return nextCharacter;
 			index = nextCharacter !== undefined && backslashCount % 2 === 1 ? backslashEnd + 1 : backslashEnd;
 			continue;
 		}
-		if (character === '"' || character === "'") return false;
+		if (character === '"' || character === "'") return undefined;
 		if (character === "[") closing.push("]");
 		else if (character === "{") closing.push("}");
 		else if (character === closing[closing.length - 1]) {
 			closing.pop();
-			if (closing.length === 0) return false;
+			if (closing.length === 0) return undefined;
 		}
 	}
-	return false;
+	return undefined;
 }
 
 /** Every placeholder `redactCrashSecrets` can emit. Used by downstream normalizers. */

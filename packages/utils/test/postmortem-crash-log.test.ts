@@ -251,6 +251,13 @@ describe("recordFatalCrash", () => {
 		expect(redactedQuote.startsWith("credentials=«redacted»")).toBe(true);
 		expect(redactedQuote.endsWith(" note=keep")).toBe(true);
 		expect(redactedQuote).not.toContain("beta-secret");
+
+		const serializedSingleQuote = String.raw`credentials=[\'a]x\',\'second-secret\'] note=keep`;
+		const redactedSingleQuote = redactCrashSecrets(serializedSingleQuote);
+		expect(redactedSingleQuote.startsWith("credentials=«redacted»")).toBe(true);
+		expect(redactedSingleQuote.endsWith(" note=keep")).toBe(true);
+		expect(redactedSingleQuote).not.toContain("a]x");
+		expect(redactedSingleQuote).not.toContain("second-secret");
 	});
 
 	it("redacts complete Cookie header values without consuming following diagnostics", async () => {
