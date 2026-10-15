@@ -119,6 +119,7 @@ const GH_SHARE_TRUST_KEYS = [
 	"HOME",
 	"USERPROFILE",
 	"APPDATA",
+	"BASH_ENV",
 	"PATH",
 	"HTTP_PROXY",
 	"HTTPS_PROXY",
@@ -221,7 +222,7 @@ async function resolveGhShareExecutable(): Promise<{ executable: string; searchP
 
 /**
  * Environment for the default `/share` `gh` children. GitHub CLI routing,
- * config, authentication, proxy, certificate, executable-search, and dynamic
+ * config, authentication, proxy, certificate, shell startup, executable-search, and dynamic
  * loader overrides that match the project dotenv are omitted so a repository
  * cannot redirect the upload, substitute the `gh` binary, authenticate with a
  * project-provided token, or intercept its HTTPS request. The executable itself

@@ -21,6 +21,7 @@ const TRUST_KEYS = [
 	"HOME",
 	"USERPROFILE",
 	"APPDATA",
+	"BASH_ENV",
 	"PATH",
 	"HTTP_PROXY",
 	"HTTPS_PROXY",
@@ -50,6 +51,7 @@ interface GhSpawn {
 	source: string;
 	cwd: string;
 	PATH: string;
+	BASH_ENV: string | null;
 	GH_HOST: string | null;
 	GH_CONFIG_DIR: string | null;
 	GH_TOKEN: string | null;
@@ -112,6 +114,7 @@ await fsPromises.appendFile(
 		source: ${JSON.stringify(source)},
 		cwd: process.cwd(),
 		PATH: process.env.PATH ?? "",
+		BASH_ENV: process.env.BASH_ENV ?? null,
 		GH_HOST: process.env.GH_HOST ?? null,
 		GH_CONFIG_DIR: process.env.GH_CONFIG_DIR ?? null,
 		GH_TOKEN: process.env.GH_TOKEN ?? null,
@@ -280,6 +283,7 @@ function expectDestination(
 			| "HOME"
 			| "USERPROFILE"
 			| "APPDATA"
+			| "BASH_ENV"
 			| "HTTP_PROXY"
 			| "HTTPS_PROXY"
 			| "ALL_PROXY"
@@ -324,6 +328,7 @@ function expectDestination(
 		expect(spawn.HOME).toBe(expected.HOME ?? null);
 		expect(spawn.USERPROFILE).toBe(expected.USERPROFILE ?? null);
 		expect(spawn.APPDATA).toBe(expected.APPDATA ?? null);
+		expect(spawn.BASH_ENV).toBe(expected.BASH_ENV ?? null);
 		expect(spawn.HTTP_PROXY).toBe(expected.HTTP_PROXY ?? null);
 		expect(spawn.HTTPS_PROXY).toBe(expected.HTTPS_PROXY ?? null);
 		expect(spawn.ALL_PROXY).toBe(expected.ALL_PROXY ?? null);
@@ -386,6 +391,14 @@ APPDATA=project-appdata
 `,
 		});
 		expectDestination(spawns, {});
+	});
+
+	it("omits a project dotenv Bash startup hook from both gh spawns", async () => {
+		const spawns = await share({
+			autoload: true,
+			dotenv: "BASH_ENV=/project/bash-startup\n",
+		});
+		expectDestination(spawns, { BASH_ENV: null });
 	});
 
 	it("omits project dotenv proxy and CA overrides from both gh spawns", async () => {
