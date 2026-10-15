@@ -320,6 +320,62 @@ describe("MCP command quarantine", () => {
 		);
 	});
 
+	test("rejects an active registry that is not derived from the audited root registry", async () => {
+		const root = path.join(import.meta.dir, "..");
+		const registry = await Bun.file(path.join(root, "packages/coding-agent/src/slash-commands/builtin-registry.ts")).text();
+		const activeRegistryStart = registry.indexOf("const ACTIVE_BUILTIN_SLASH_COMMAND_REGISTRY:");
+		const lookupDeclarationStart = registry.indexOf("\nconst BUILTIN_SLASH_COMMAND_LOOKUP", activeRegistryStart);
+		expect(activeRegistryStart).toBeGreaterThanOrEqual(0);
+		expect(lookupDeclarationStart).toBeGreaterThan(activeRegistryStart);
+		const independentRegistry = [
+			registry.slice(0, activeRegistryStart),
+			'const ACTIVE_BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [{ name: "mcp", handle: async () => false }];',
+			registry.slice(lookupDeclarationStart),
+		].join("\n");
+		expect(independentRegistry).not.toBe(registry);
+		expect(findMcpBuiltinQuarantineFindings(independentRegistry)).toContain(
+			"root slash-command registry has an unverified additional use or mutation",
+		);
+	});
+
+	test("rejects a no-op active-registry filter that re-enables quarantined commands", async () => {
+		const root = path.join(import.meta.dir, "..");
+		const registry = await Bun.file(path.join(root, "packages/coding-agent/src/slash-commands/builtin-registry.ts")).text();
+		const noOpFilter = registry.replace(
+			'!QUARANTINED_UTILITY_SLASH_COMMANDS.has(command.name) &&\n\t\t(command.name !== "import-session" || IMPORT_SESSION_RETAINED_DESCRIPTOR_AUTHORITY_AVAILABLE)',
+			"true",
+		);
+		expect(noOpFilter).not.toBe(registry);
+		expect(findMcpBuiltinQuarantineFindings(noOpFilter)).toContain(
+			"root slash-command registry has an unverified additional use or mutation",
+		);
+	});
+
+	test("rejects changes to the utility command quarantine set", async () => {
+		const root = path.join(import.meta.dir, "..");
+		const registry = await Bun.file(path.join(root, "packages/coding-agent/src/slash-commands/builtin-registry.ts")).text();
+		const unquarantinedSet = registry.replace('new Set(["agents"])', "new Set([])");
+		expect(unquarantinedSet).not.toBe(registry);
+		expect(findMcpBuiltinQuarantineFindings(unquarantinedSet)).toContain(
+			"root slash-command registry has an unverified additional use or mutation",
+		);
+	});
+
+	test("rejects unverified writes to the builtin dispatch lookup", async () => {
+		const root = path.join(import.meta.dir, "..");
+		const registry = await Bun.file(path.join(root, "packages/coding-agent/src/slash-commands/builtin-registry.ts")).text();
+		const lookupDeclaration = "const BUILTIN_SLASH_COMMAND_LOOKUP = new Map<string, SlashCommandSpec>();";
+		const mutation = [
+			lookupDeclaration,
+			'BUILTIN_SLASH_COMMAND_LOOKUP.set("mcp", { name: "mcp", handle: async () => false });',
+		].join("\n");
+		const unverifiedWriter = registry.replace(lookupDeclaration, mutation);
+		expect(unverifiedWriter).not.toBe(registry);
+		expect(findMcpBuiltinQuarantineFindings(unverifiedWriter)).toContain(
+			"root slash-command registry has an unverified additional use or mutation",
+		);
+	});
+
 	test("rejects duplicate root /mcp registrations", () => {
 		expect(findMcpBuiltinQuarantineFindings(registryWithEntries([exactMcpTuiEntry, exactMcpTuiEntry]))).toContain(
 			"multiple root /mcp builtins are registered",

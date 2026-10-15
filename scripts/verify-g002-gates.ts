@@ -525,47 +525,36 @@ function isMcpFilterMember(expression: Babel.Node, object: string, property: str
 	);
 }
 
-function isStaticMcpFilterExpression(expression: Babel.Node, parameterName: string): boolean {
-	switch (expression.type) {
-		case "LogicalExpression":
-			return (
-				(expression.operator === "&&" || expression.operator === "||") &&
-				isStaticMcpFilterExpression(expression.left, parameterName) &&
-				isStaticMcpFilterExpression(expression.right, parameterName)
-			);
-		case "UnaryExpression":
-			return expression.operator === "!" && isStaticMcpFilterExpression(expression.argument, parameterName);
-		case "BinaryExpression":
-			return (
-				(expression.operator === "===" || expression.operator === "!==") &&
-				isStaticMcpFilterExpression(expression.left, parameterName) &&
-				isStaticMcpFilterExpression(expression.right, parameterName)
-			);
-		case "CallExpression": {
-			const argument = expression.arguments[0];
-			return (
-				!expression.optional &&
-				expression.arguments.length === 1 &&
-				isMcpFilterMember(expression.callee, "QUARANTINED_UTILITY_SLASH_COMMANDS", "has") &&
-				argument !== undefined &&
-				argument.type !== "SpreadElement" &&
-				argument.type !== "ArgumentPlaceholder" &&
-				isStaticMcpFilterExpression(argument, parameterName)
-			);
-		}
-		case "MemberExpression":
-			return isMcpFilterMember(expression, parameterName, "name");
-		case "Identifier":
-			return (
-				expression.name === parameterName ||
-				expression.name === "IMPORT_SESSION_RETAINED_DESCRIPTOR_AUTHORITY_AVAILABLE"
-			);
-		case "BooleanLiteral":
-		case "StringLiteral":
-			return true;
-		default:
-			return false;
+function isApprovedMcpRegistryFilter(expression: Babel.Node, parameterName: string): boolean {
+	if (expression.type !== "LogicalExpression" || expression.operator !== "&&") return false;
+	const utilityQuarantine = expression.left;
+	if (
+		utilityQuarantine.type !== "UnaryExpression" ||
+		utilityQuarantine.operator !== "!" ||
+		utilityQuarantine.argument.type !== "CallExpression" ||
+		utilityQuarantine.argument.optional ||
+		utilityQuarantine.argument.arguments.length !== 1 ||
+		!isMcpFilterMember(utilityQuarantine.argument.callee, "QUARANTINED_UTILITY_SLASH_COMMANDS", "has")
+	) {
+		return false;
 	}
+	const quarantinedCommandName = utilityQuarantine.argument.arguments[0];
+	if (!quarantinedCommandName || !isMcpFilterMember(quarantinedCommandName, parameterName, "name")) return false;
+
+	const retainedDescriptorFilter = expression.right;
+	if (retainedDescriptorFilter.type !== "LogicalExpression" || retainedDescriptorFilter.operator !== "||") {
+		return false;
+	}
+	const importSessionExclusion = retainedDescriptorFilter.left;
+	return (
+		importSessionExclusion.type === "BinaryExpression" &&
+		importSessionExclusion.operator === "!==" &&
+		isMcpFilterMember(importSessionExclusion.left, parameterName, "name") &&
+		importSessionExclusion.right.type === "StringLiteral" &&
+		importSessionExclusion.right.value === "import-session" &&
+		retainedDescriptorFilter.right.type === "Identifier" &&
+		retainedDescriptorFilter.right.name === "IMPORT_SESSION_RETAINED_DESCRIPTOR_AUTHORITY_AVAILABLE"
+	);
 }
 
 function isActiveMcpRegistryFilterReference(identifierPath: NodePath<Babel.Identifier>): boolean {
@@ -597,6 +586,14 @@ function isActiveMcpRegistryFilterReference(identifierPath: NodePath<Babel.Ident
 	) {
 		return false;
 	}
+	const variableDeclarationPath = declarationPath.parentPath;
+	if (
+		!variableDeclarationPath?.isVariableDeclaration() ||
+		variableDeclarationPath.node.kind !== "const" ||
+		variableDeclarationPath.node.declarations.length !== 1
+	) {
+		return false;
+	}
 	const callback = callPath.node.arguments[0];
 	if (
 		callback?.type !== "ArrowFunctionExpression" ||
@@ -608,7 +605,7 @@ function isActiveMcpRegistryFilterReference(identifierPath: NodePath<Babel.Ident
 	) {
 		return false;
 	}
-	return isStaticMcpFilterExpression(callback.body, callback.params[0].name);
+	return isApprovedMcpRegistryFilter(callback.body, callback.params[0].name);
 }
 
 function isSafeMcpLookupSet(
@@ -681,6 +678,158 @@ function isSafeMcpLookupLoop(statement: Babel.ForOfStatement): boolean {
 	);
 }
 
+function isExpectedMcpLookupDeclaration(identifierPath: NodePath<Babel.Identifier>): boolean {
+	const declaratorPath = identifierPath.parentPath;
+	if (!declaratorPath?.isVariableDeclarator() || declaratorPath.node.id !== identifierPath.node) return false;
+	const declarationPath = declaratorPath.parentPath;
+	const initializer = declaratorPath.node.init;
+	return (
+		declarationPath?.isVariableDeclaration() === true &&
+		declarationPath.node.kind === "const" &&
+		declarationPath.node.declarations.length === 1 &&
+		initializer?.type === "NewExpression" &&
+		initializer.callee.type === "Identifier" &&
+		initializer.callee.name === "Map" &&
+		initializer.arguments.length === 0
+	);
+}
+
+function isExpectedMcpLookupGet(identifierPath: NodePath<Babel.Identifier>): boolean {
+	const memberPath = identifierPath.parentPath;
+	if (
+		!memberPath?.isMemberExpression() ||
+		memberPath.node.object !== identifierPath.node ||
+		memberPath.node.computed ||
+		memberPath.node.optional ||
+		memberPath.node.property.type !== "Identifier" ||
+		memberPath.node.property.name !== "get"
+	) {
+		return false;
+	}
+	const callPath = memberPath.parentPath;
+	return (
+		callPath?.isCallExpression() === true &&
+		callPath.node.callee === memberPath.node &&
+		!callPath.node.optional
+	);
+}
+
+function isExpectedMcpLookupSet(identifierPath: NodePath<Babel.Identifier>): boolean {
+	const memberPath = identifierPath.parentPath;
+	if (
+		!memberPath?.isMemberExpression() ||
+		memberPath.node.object !== identifierPath.node ||
+		memberPath.node.computed ||
+		memberPath.node.optional ||
+		memberPath.node.property.type !== "Identifier" ||
+		memberPath.node.property.name !== "set"
+	) {
+		return false;
+	}
+	const callPath = memberPath.parentPath;
+	if (!callPath?.isCallExpression() || callPath.node.callee !== memberPath.node || callPath.node.optional) return false;
+	const statementPath = callPath.parentPath;
+	if (!statementPath?.isExpressionStatement()) return false;
+	let ancestor: NodePath<Babel.Node> | null = statementPath.parentPath;
+	while (ancestor) {
+		if (ancestor.isForOfStatement() && isSafeMcpLookupLoop(ancestor.node)) return true;
+		ancestor = ancestor.parentPath;
+	}
+	return false;
+}
+
+function hasOnlyExpectedMcpLookupUse(program: Babel.File, required: boolean): boolean {
+	let declarationCount = 0;
+	let populationWrites = 0;
+	let reads = 0;
+	let hasUnverifiedReference = false;
+	traverse(program, {
+		Identifier(identifierPath) {
+			if (identifierPath.node.name !== "BUILTIN_SLASH_COMMAND_LOOKUP") return;
+			if (identifierPath.parentPath?.isVariableDeclarator() && identifierPath.parentPath.node.id === identifierPath.node) {
+				declarationCount++;
+				if (!isExpectedMcpLookupDeclaration(identifierPath)) hasUnverifiedReference = true;
+				return;
+			}
+			if (isExpectedMcpLookupGet(identifierPath)) {
+				reads++;
+				return;
+			}
+			if (isExpectedMcpLookupSet(identifierPath)) {
+				populationWrites++;
+				return;
+			}
+			hasUnverifiedReference = true;
+		},
+	});
+	if (!required) return declarationCount === 0 && populationWrites === 0 && reads === 0 && !hasUnverifiedReference;
+	return declarationCount === 1 && populationWrites === 2 && reads > 0 && !hasUnverifiedReference;
+}
+
+function isExpectedQuarantinedUtilitySetDeclaration(identifierPath: NodePath<Babel.Identifier>): boolean {
+	const declaratorPath = identifierPath.parentPath;
+	if (!declaratorPath?.isVariableDeclarator() || declaratorPath.node.id !== identifierPath.node) return false;
+	const declarationPath = declaratorPath.parentPath;
+	const initializer = declaratorPath.node.init;
+	const entries =
+		initializer?.type === "NewExpression" && initializer.arguments.length === 1 ? initializer.arguments[0] : undefined;
+	const entry = entries?.type === "ArrayExpression" ? entries.elements[0] : undefined;
+	return (
+		declarationPath?.isVariableDeclaration() === true &&
+		declarationPath.node.kind === "const" &&
+		declarationPath.node.declarations.length === 1 &&
+		initializer?.type === "NewExpression" &&
+		initializer.callee.type === "Identifier" &&
+		initializer.callee.name === "Set" &&
+		initializer.arguments.length === 1 &&
+		entries?.type === "ArrayExpression" &&
+		entries.elements.length === 1 &&
+		entry?.type === "StringLiteral" &&
+		entry.value === "agents"
+	);
+}
+
+function isExpectedQuarantinedUtilitySetHas(identifierPath: NodePath<Babel.Identifier>): boolean {
+	const memberPath = identifierPath.parentPath;
+	if (
+		!memberPath?.isMemberExpression() ||
+		memberPath.node.object !== identifierPath.node ||
+		memberPath.node.computed ||
+		memberPath.node.optional ||
+		memberPath.node.property.type !== "Identifier" ||
+		memberPath.node.property.name !== "has"
+	) {
+		return false;
+	}
+	const callPath = memberPath.parentPath;
+	return (
+		callPath?.isCallExpression() === true &&
+		callPath.node.callee === memberPath.node &&
+		!callPath.node.optional &&
+		callPath.node.arguments.length === 1
+	);
+}
+
+function hasOnlyExpectedQuarantinedUtilitySetUse(program: Babel.File, required: boolean): boolean {
+	let declarationCount = 0;
+	let references = 0;
+	let hasUnverifiedReference = false;
+	traverse(program, {
+		Identifier(identifierPath) {
+			if (identifierPath.node.name !== "QUARANTINED_UTILITY_SLASH_COMMANDS") return;
+			if (identifierPath.parentPath?.isVariableDeclarator() && identifierPath.parentPath.node.id === identifierPath.node) {
+				declarationCount++;
+				if (!isExpectedQuarantinedUtilitySetDeclaration(identifierPath)) hasUnverifiedReference = true;
+				return;
+			}
+			references++;
+			if (!isExpectedQuarantinedUtilitySetHas(identifierPath)) hasUnverifiedReference = true;
+		},
+	});
+	if (!required) return declarationCount === 0 && references === 0 && !hasUnverifiedReference;
+	return declarationCount === 1 && references === 1 && !hasUnverifiedReference;
+}
+
 function isSafeMcpMetadataMapReference(identifierPath: NodePath<Babel.Identifier>): boolean {
 	const memberPath = identifierPath.parentPath;
 	if (
@@ -735,21 +884,30 @@ function isSafeMcpMetadataMapReference(identifierPath: NodePath<Babel.Identifier
 }
 
 function hasOnlyExpectedActiveMcpRegistryUse(program: Babel.File): boolean {
-	let hasActiveRegistryDeclaration = false;
+	let activeRegistryDeclarations = 0;
 	let referenceCount = 0;
 	let lookupReferences = 0;
 	let metadataReferences = 0;
 	let exportReferences = 0;
 	let hasUnverifiedReference = false;
+	let hasUnverifiedDeclaration = false;
 	traverse(program, {
 		Identifier(identifierPath) {
 			if (identifierPath.node.name !== "ACTIVE_BUILTIN_SLASH_COMMAND_REGISTRY") return;
 			const parentPath = identifierPath.parentPath;
 			if (parentPath?.isVariableDeclarator() && parentPath.node.id === identifierPath.node) {
-				hasActiveRegistryDeclaration = true;
+				activeRegistryDeclarations++;
+				const declarationPath = parentPath.parentPath;
+				if (
+					!declarationPath?.isVariableDeclaration() ||
+					declarationPath.node.kind !== "const" ||
+					declarationPath.node.declarations.length !== 1
+				) {
+					hasUnverifiedDeclaration = true;
+				}
 				return;
 			}
-		referenceCount++;
+			referenceCount++;
 			if (parentPath?.isForOfStatement() && parentPath.node.right === identifierPath.node) {
 				if (isSafeMcpLookupLoop(parentPath.node)) lookupReferences++;
 				else hasUnverifiedReference = true;
@@ -769,8 +927,10 @@ function hasOnlyExpectedActiveMcpRegistryUse(program: Babel.File): boolean {
 			else hasUnverifiedReference = true;
 		},
 	});
-	if (!hasActiveRegistryDeclaration) return referenceCount === 0;
+	if (activeRegistryDeclarations === 0) return referenceCount === 0;
 	return (
+		activeRegistryDeclarations === 1 &&
+		!hasUnverifiedDeclaration &&
 		!hasUnverifiedReference &&
 		lookupReferences === 1 &&
 		metadataReferences === 1 &&
@@ -783,9 +943,17 @@ function hasOnlyExpectedMcpRegistryUse(
 	registryDeclaration: Babel.VariableDeclarator,
 ): boolean {
 	let referenceCount = 0;
+	let hasActiveRegistryDeclaration = false;
 	let hasExpectedFilterReference = false;
 	traverse(program, {
 		Identifier(identifierPath) {
+			if (
+				identifierPath.node.name === "ACTIVE_BUILTIN_SLASH_COMMAND_REGISTRY" &&
+				identifierPath.parentPath?.isVariableDeclarator() &&
+				identifierPath.parentPath.node.id === identifierPath.node
+			) {
+				hasActiveRegistryDeclaration = true;
+			}
 			if (
 				identifierPath.node.name !== "BUILTIN_SLASH_COMMAND_REGISTRY" ||
 				identifierPath.node === registryDeclaration.id
@@ -796,9 +964,20 @@ function hasOnlyExpectedMcpRegistryUse(
 			if (isActiveMcpRegistryFilterReference(identifierPath)) hasExpectedFilterReference = true;
 		},
 	});
+	if (!hasActiveRegistryDeclaration) {
+		return (
+			referenceCount === 0 &&
+			hasOnlyExpectedActiveMcpRegistryUse(program) &&
+			hasOnlyExpectedMcpLookupUse(program, false) &&
+			hasOnlyExpectedQuarantinedUtilitySetUse(program, false)
+		);
+	}
 	return (
-		(referenceCount === 0 || (referenceCount === 1 && hasExpectedFilterReference)) &&
-		hasOnlyExpectedActiveMcpRegistryUse(program)
+		referenceCount === 1 &&
+		hasExpectedFilterReference &&
+		hasOnlyExpectedActiveMcpRegistryUse(program) &&
+		hasOnlyExpectedMcpLookupUse(program, true) &&
+		hasOnlyExpectedQuarantinedUtilitySetUse(program, true)
 	);
 }
 
