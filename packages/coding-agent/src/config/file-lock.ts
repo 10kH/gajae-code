@@ -331,14 +331,47 @@ async function removePendingStaging(stagingPath: string, identity: FileLockStagi
 		// A pathname check followed by fs.rm can erase a replacement installed in
 		// between; Windows cleanup must revalidate the captured tree atomically.
 		const removal = nativeFileLockBindings().exactRemoveDirectoryTree(stagingPath, identity.treeSnapshot);
-		if (!removal.ok && removal.code !== "not_found")
+		if (!removal.ok && removal.code !== "not_found") {
+			const detachedPath = validateDetachedStagingCleanupPath(stagingPath, removal.detachedPath);
 			throw Object.assign(new Error(`Failed to remove staged file-lock tree: ${removal.code ?? "unknown"}.`), {
 				code: removal.code ?? "cleanup_failed",
+				...(detachedPath === undefined ? {} : { detachedPath }),
 			});
+		}
 		return;
 	}
 	if (await hasPendingStagingRootIdentity(stagingPath, identity))
 		await fs.rm(stagingPath, { recursive: true, force: true });
+}
+
+function sameFileLockPath(left: string, right: string): boolean {
+	const resolvedLeft = path.resolve(left);
+	const resolvedRight = path.resolve(right);
+	return process.platform === "win32"
+		? resolvedLeft.toLowerCase() === resolvedRight.toLowerCase()
+		: resolvedLeft === resolvedRight;
+}
+
+function validateDetachedStagingCleanupPath(stagingPath: string, detachedPath: string | undefined): string | undefined {
+	if (detachedPath === undefined) return undefined;
+	if (!sameFileLockPath(detachedPath, stagingPath) && !sameFileLockPath(detachedPath, `${stagingPath}.removing`))
+		throw Object.assign(new Error("Native staging cleanup returned an unexpected detached path."), {
+			code: "identity_mismatch",
+		});
+	return detachedPath;
+}
+
+function detachedStagingCleanupPath(stagingPath: string, error: unknown): string {
+	if (typeof error !== "object" || error === null || !("detachedPath" in error)) return stagingPath;
+	const detachedPath = (error as { detachedPath?: unknown }).detachedPath;
+	try {
+		return (
+			validateDetachedStagingCleanupPath(stagingPath, typeof detachedPath === "string" ? detachedPath : undefined) ??
+			stagingPath
+		);
+	} catch {
+		return stagingPath;
+	}
 }
 
 function retainPendingStagingCleanup(
@@ -357,14 +390,17 @@ async function abortStagingCleanup(
 	identity: FileLockStagingRootIdentity,
 	signal: AbortSignal,
 ): Promise<never> {
+	let cleanupPath = stagingPath;
 	try {
-		await removePendingStaging(stagingPath, identity);
-		pendingStagingCleanups.delete(stagingPath);
+		await removePendingStaging(cleanupPath, identity);
+		pendingStagingCleanups.delete(cleanupPath);
 	} catch (error) {
+		cleanupPath = detachedStagingCleanupPath(cleanupPath, error);
+		if (cleanupPath !== stagingPath) pendingStagingCleanups.delete(stagingPath);
 		// The stage is still owned by this acquisition. Preserve an in-process retry
 		// until another acquisition can clean it; after process exit the orphan reaper
 		// can safely reclaim it once this publisher is no longer live.
-		retainPendingStagingCleanup(lockPath, stagingPath, identity, error);
+		retainPendingStagingCleanup(lockPath, cleanupPath, identity, error);
 	}
 	throw signal.reason ?? new Error("File lock acquisition aborted");
 }
@@ -377,6 +413,16 @@ async function retryPendingStagingCleanups(
 	for (const [stagingPath, pending] of pendingStagingCleanups) {
 		if ((await localLockKey(pending.lockPath)) !== lockKey) continue;
 		if (!pending.identity) {
+			try {
+				await fs.lstat(stagingPath);
+			} catch (error) {
+				if (isEnoent(error)) {
+					pendingStagingCleanups.delete(stagingPath);
+					continue;
+				}
+				if (retryBudget.signal?.aborted) throw retryBudget.signal.reason ?? error;
+				throw new FileLockStagingCleanupError(lockPath, stagingPath, error);
+			}
 			const error = Object.assign(new Error("Retained staging cleanup has no captured identity."), {
 				code: "identity_unavailable",
 			});
@@ -388,12 +434,17 @@ async function retryPendingStagingCleanups(
 					pendingStagingCleanups.delete(stagingPath);
 					continue;
 				}
-				const snapshot = await captureFileLockStagingTreeSnapshot(stagingPath, retryBudget);
-				pending.identity = bindFileLockStagingTreeSnapshot(stagingPath, pending.identity, snapshot);
 			} catch (error) {
 				if (retryBudget.signal?.aborted) throw retryBudget.signal.reason ?? error;
 				throw new FileLockStagingCleanupError(lockPath, stagingPath, error);
 			}
+			const error = Object.assign(
+				new Error(
+					"The original staging-tree snapshot was not captured; refusing to establish cleanup authority later.",
+				),
+				{ code: "identity_unavailable" },
+			);
+			throw new FileLockStagingCleanupError(lockPath, stagingPath, error);
 		}
 		await cleanupPendingStagingOrThrow(lockPath, stagingPath, pending.identity, retryBudget);
 	}
@@ -405,27 +456,34 @@ async function cleanupPendingStagingOrThrow(
 	identity: FileLockStagingRootIdentity,
 	retryBudget: FileLockAcquisitionRetryBudget,
 ): Promise<void> {
+	let cleanupPath = stagingPath;
 	for (;;) {
-		if (retryBudget.signal?.aborted) await abortStagingCleanup(lockPath, stagingPath, identity, retryBudget.signal);
+		if (retryBudget.signal?.aborted) await abortStagingCleanup(lockPath, cleanupPath, identity, retryBudget.signal);
 		try {
-			await removePendingStaging(stagingPath, identity);
-			pendingStagingCleanups.delete(stagingPath);
+			await removePendingStaging(cleanupPath, identity);
+			pendingStagingCleanups.delete(cleanupPath);
 			return;
 		} catch (error) {
 			if (retryBudget.signal?.aborted)
-				await abortStagingCleanup(lockPath, stagingPath, identity, retryBudget.signal);
-			if (!isTransientReleaseError(error) || retryBudget.remainingDelays === 0) {
-				retainPendingStagingCleanup(lockPath, stagingPath, identity, error);
-				throw new FileLockStagingCleanupError(lockPath, stagingPath, error);
+				await abortStagingCleanup(lockPath, cleanupPath, identity, retryBudget.signal);
+			const detachedPath = detachedStagingCleanupPath(cleanupPath, error);
+			if (detachedPath !== cleanupPath) {
+				pendingStagingCleanups.delete(cleanupPath);
+				cleanupPath = detachedPath;
+			}
+			if (!isTransientReleaseError(error) || retryBudget.remainingDelays <= 0) {
+				retainPendingStagingCleanup(lockPath, cleanupPath, identity, error);
+				throw new FileLockStagingCleanupError(lockPath, cleanupPath, error);
 			}
 			// An open child can deny both publication and removal on Windows. Keep the
 			// same staging identity and share the outer acquisition delay budget.
+			retainPendingStagingCleanup(lockPath, cleanupPath, identity, error);
 			retryBudget.remainingDelays--;
 			try {
 				await sleepFileLockRetry(retryBudget.retryDelayMs, retryBudget.signal);
 			} catch (abortError) {
 				if (!retryBudget.signal?.aborted) throw abortError;
-				await abortStagingCleanup(lockPath, stagingPath, identity, retryBudget.signal);
+				await abortStagingCleanup(lockPath, cleanupPath, identity, retryBudget.signal);
 			}
 		}
 	}
@@ -2600,7 +2658,9 @@ async function tryAcquireLock(
 				await removePendingStaging(pendingPath, pendingStagingIdentity);
 				pendingStagingCleanups.delete(pendingPath);
 			} catch (cleanupError) {
-				retainPendingStagingCleanup(lockPath, pendingPath, pendingStagingIdentity, cleanupError);
+				const cleanupPath = detachedStagingCleanupPath(pendingPath, cleanupError);
+				if (cleanupPath !== pendingPath) pendingStagingCleanups.delete(pendingPath);
+				retainPendingStagingCleanup(lockPath, cleanupPath, pendingStagingIdentity, cleanupError);
 			}
 		}
 	}
@@ -2609,7 +2669,12 @@ async function tryAcquireLock(
 function isTransientReleaseError(error: unknown): boolean {
 	const code = (error as NodeJS.ErrnoException).code;
 	return (
-		code === "EBUSY" || code === "EPERM" || code === "EACCES" || code === "ENOTEMPTY" || code === "sharing_violation"
+		code === "EBUSY" ||
+		code === "EPERM" ||
+		code === "EACCES" ||
+		code === "ENOTEMPTY" ||
+		code === "access_denied" ||
+		code === "sharing_violation"
 	);
 }
 
@@ -2980,6 +3045,8 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 	if (options.previousOwnerHostIds?.some(hostId => !hostId))
 		throw new Error("previousOwnerHostIds must contain only non-empty identities");
 	const opts = { ...DEFAULT_OPTIONS, ...options };
+	if (!Number.isSafeInteger(opts.retries) || opts.retries < 1)
+		throw new RangeError("retries must be a positive safe integer");
 	const orphanTransitionAgeMs = options.orphanTransitionAgeMs ?? options.staleMs ?? DEFAULT_OPTIONS.staleMs;
 	if (!Number.isFinite(orphanTransitionAgeMs) || orphanTransitionAgeMs < 0)
 		throw new RangeError("orphanTransitionAgeMs must be a finite, non-negative number");
@@ -3023,6 +3090,25 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 			opts.onAcquired,
 			retryBudget,
 		);
+		if (isFileLockPublicationRetry(result) && result.code === "access_denied") {
+			const holder = await lockHolderDescription(
+				lockPath,
+				orphanTransitionAgeMs,
+				opts.ownerHostId,
+				opts.previousOwnerHostIds ?? [],
+			);
+			throw new FileLockAcquireError(
+				filePath,
+				lockPath,
+				attempt + 1,
+				holder.description,
+				"acquire_timeout",
+				undefined,
+				undefined,
+				result.code,
+				holder.isLive,
+			);
+		}
 		if (isFileLockOrphanTransition(result)) {
 			// Adoption is identity-bound and can be refused by a transient cleanup race.
 			// Keep using the caller's bounded contention budget; the same generation is
@@ -3145,10 +3231,14 @@ const FILE_LOCK_STAGING_UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-
 const FILE_LOCK_STAGING_NAME_WITH_IDENTITY =
 	/^.+\.lock\.pending\.([1-9]\d*)\.([is][A-Za-z0-9_-]{16})\.([A-Za-z0-9_-]{16})$/;
 const LEGACY_FILE_LOCK_STAGING_NAME = new RegExp(`^.+\\.lock\\.pending\\.([1-9]\\d*)\\.${FILE_LOCK_STAGING_UUID}$`);
+const FILE_LOCK_STAGING_REMOVING_SUFFIX = ".removing";
 
 function fileLockStagingOwner(name: string): FileLockStagingOwner | null {
-	const current = FILE_LOCK_STAGING_NAME_WITH_IDENTITY.exec(name);
-	const legacy = current ? null : LEGACY_FILE_LOCK_STAGING_NAME.exec(name);
+	const stagingName = name.endsWith(FILE_LOCK_STAGING_REMOVING_SUFFIX)
+		? name.slice(0, -FILE_LOCK_STAGING_REMOVING_SUFFIX.length)
+		: name;
+	const current = FILE_LOCK_STAGING_NAME_WITH_IDENTITY.exec(stagingName);
+	const legacy = current ? null : LEGACY_FILE_LOCK_STAGING_NAME.exec(stagingName);
 	const match = current ?? legacy;
 	if (!match) return null;
 	const pid = Number(match[1]);
@@ -3292,6 +3382,28 @@ export async function inspectFileLockStagingDir(
 		reason: `file_lock_staging_owner_${status}`,
 	};
 	if (status !== "dead" || !remove) return result;
+	if (path.basename(canonical).endsWith(FILE_LOCK_STAGING_REMOVING_SUFFIX)) {
+		const removal = await exactRemoveLockTree(canonical, captured.snapshot);
+		if (removal.ok || removal.code === "not_found") return { ...result, removed: true, reason: "removed" };
+		const detachedTreeWasDurablyScrubbed =
+			removal.code === "cleanup_pending" &&
+			removal.payloadDurable === true &&
+			removal.detachedPath !== undefined &&
+			sameFileLockPath(removal.detachedPath, canonical) &&
+			removal.retainedSuccessorPath === undefined &&
+			removal.retainedPlaceholderPath === undefined &&
+			removal.retainedUnknownPath === undefined &&
+			Object.keys(removal).every(key => ["ok", "code", "payloadDurable", "detachedPath"].includes(key));
+		if (detachedTreeWasDurablyScrubbed) {
+			const removed = await removeDetachedLockQuarantineOnDisk(
+				canonical,
+				captured.snapshot.rootDev,
+				captured.snapshot.rootIno,
+			);
+			return { ...result, removed, reason: removed ? "removed" : "cleanup_pending" };
+		}
+		return { ...result, reason: removal.code ?? "cleanup_failed" };
+	}
 	if (observation) {
 		const removal = await removeFileLockDirForGc(canonical, observation.info, observation.identity);
 		return { ...result, removed: removal === "removed", reason: removal };

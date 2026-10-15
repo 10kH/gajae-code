@@ -964,6 +964,25 @@ const STATUS_SHARING_VIOLATION: i32 = 0xc000_0043u32 as i32;
 const STATUS_ACCESS_DENIED: i32 = 0xc000_0022u32 as i32;
 
 #[cfg(any(windows, test))]
+const WIN32_ERROR_FILE_NOT_FOUND: u32 = 2;
+#[cfg(any(windows, test))]
+const WIN32_ERROR_PATH_NOT_FOUND: u32 = 3;
+#[cfg(any(windows, test))]
+const WIN32_ERROR_ACCESS_DENIED: u32 = 5;
+#[cfg(any(windows, test))]
+const WIN32_ERROR_SHARING_VIOLATION: u32 = 32;
+
+#[cfg(any(windows, test))]
+fn windows_error_code(error: u32) -> &'static str {
+	match error {
+		WIN32_ERROR_FILE_NOT_FOUND | WIN32_ERROR_PATH_NOT_FOUND => "not_found",
+		WIN32_ERROR_ACCESS_DENIED => "access_denied",
+		WIN32_ERROR_SHARING_VIOLATION => "sharing_violation",
+		_ => "io_error",
+	}
+}
+
+#[cfg(any(windows, test))]
 fn ntstatus_code(status: i32) -> &'static str {
 	match status as u32 {
 		0xc000_0034 | 0xc000_003a => "not_found",
@@ -1049,9 +1068,9 @@ fn native_windows_error_code(status: i32) -> String {
 mod exact_replace_windows_retry_policy_tests {
 	use super::{
 		EXACT_REPLACE_DESTINATION_OPEN_RETRY_DELAY_MS, EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT,
-		NativeExactUnlinkResult, NativeNoReplaceResult, STATUS_ACCESS_DENIED,
-		STATUS_SHARING_VIOLATION, is_retryable_exact_replace_status, native_windows_error_code,
-		ntstatus_code, open_with_transient_retry, publication_rename_error_code,
+		STATUS_ACCESS_DENIED, STATUS_SHARING_VIOLATION, is_retryable_exact_replace_status,
+		native_windows_error_code, ntstatus_code, open_with_transient_retry,
+		publication_rename_error_code, windows_error_code,
 	};
 
 	#[test]
@@ -1081,6 +1100,14 @@ mod exact_replace_windows_retry_policy_tests {
 	fn windows_error_code_is_hex_and_path_free() {
 		assert_eq!(native_windows_error_code(STATUS_SHARING_VIOLATION), "0xC0000043");
 		assert_eq!(native_windows_error_code(STATUS_ACCESS_DENIED as i32), "0xC0000022");
+	}
+
+	#[test]
+	fn win32_access_denied_stays_distinct_for_exact_cleanup() {
+		assert_eq!(windows_error_code(5), "access_denied");
+		assert_eq!(windows_error_code(32), "sharing_violation");
+		assert_eq!(windows_error_code(2), "not_found");
+		assert_eq!(windows_error_code(5_000), "io_error");
 	}
 
 	#[test]
@@ -10825,8 +10852,7 @@ mod platform {
 	use windows_sys::Win32::{
 		Foundation::{
 			CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_FILE_NOT_FOUND,
-			ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION, GENERIC_ALL, GetLastError, HANDLE,
-			INVALID_HANDLE_VALUE, LocalFree,
+			ERROR_PATH_NOT_FOUND, GENERIC_ALL, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
 		},
 		Security::{
 			ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION, ACL_SIZE_INFORMATION,
@@ -10945,11 +10971,7 @@ mod platform {
 	}
 
 	fn last_error_code() -> &'static str {
-		match unsafe { GetLastError() } {
-			ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => "not_found",
-			ERROR_SHARING_VIOLATION => "sharing_violation",
-			_ => "io_error",
-		}
+		super::windows_error_code(unsafe { GetLastError() })
 	}
 
 	fn open_path(path: &Path, reparse: bool, desired_access: u32) -> Result<HANDLE, &'static str> {
