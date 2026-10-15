@@ -402,11 +402,7 @@ async function loadSlashCommands(ctx: LoadContext): Promise<LoadResult<SlashComm
 			recursive: true,
 			scope: readScopeForLevel(level),
 			transform: (_name, content, filePath, source) => ({
-				name: path
-					.relative(commandsDir, filePath)
-					.split(path.sep)
-					.map(segment => segment.replace(/\.md$/, ""))
-					.join(":"),
+				name: path.relative(commandsDir, filePath).replace(/\.md$/, "").split(path.sep).join(":"),
 				path: filePath,
 				content,
 				level,

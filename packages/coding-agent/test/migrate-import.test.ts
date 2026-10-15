@@ -123,10 +123,18 @@ describe("end-to-end import", () => {
 
 	test("Claude Code commands import as native slash commands, including nested names", async () => {
 		const source = "---\ndescription: Review security.\n---\nReview $ARGUMENTS.";
+		const markdownDirectorySource = "---\ndescription: Check release.\n---\nCheck $ARGUMENTS.";
 		await fs.mkdir(path.join(cwd, ".claude", "commands", "review"), { recursive: true });
 		await fs.writeFile(path.join(cwd, ".claude", "commands", "review", "security.md"), source, "utf-8");
+		await fs.mkdir(path.join(cwd, ".claude", "commands", "release.md"), { recursive: true });
+		await fs.writeFile(
+			path.join(cwd, ".claude", "commands", "release.md", "check.md"),
+			markdownDirectorySource,
+			"utf-8",
+		);
 
 		const destination = path.join(cwd, ".gjc", "commands", "review", "security.md");
+		const markdownDirectoryDestination = path.join(cwd, ".gjc", "commands", "release.md", "check.md");
 		const dryRun = await runMigrate(opts({ from: ["claude-code"], dryRun: true }));
 		expect(dryRun.actions).toContainEqual(
 			expect.objectContaining({
@@ -136,7 +144,15 @@ describe("end-to-end import", () => {
 				destination,
 			}),
 		);
-		expect(dryRun.summary.byType.command.imported).toBe(1);
+		expect(dryRun.actions).toContainEqual(
+			expect.objectContaining({
+				type: "command",
+				name: "release.md:check",
+				status: "imported",
+				destination: markdownDirectoryDestination,
+			}),
+		);
+		expect(dryRun.summary.byType.command.imported).toBe(2);
 		expect(
 			await fs.access(destination).then(
 				() => true,
@@ -148,11 +164,23 @@ describe("end-to-end import", () => {
 		expect(imported.actions).toContainEqual(
 			expect.objectContaining({ type: "command", name: "review:security", status: "imported", destination }),
 		);
+		expect(imported.actions).toContainEqual(
+			expect.objectContaining({
+				type: "command",
+				name: "release.md:check",
+				status: "imported",
+				destination: markdownDirectoryDestination,
+			}),
+		);
 		expect(await fs.readFile(destination, "utf-8")).toBe(source);
+		expect(await fs.readFile(markdownDirectoryDestination, "utf-8")).toBe(markdownDirectorySource);
 
 		const commands = await loadSlashCommands({ cwd });
 		expect(commands).toContainEqual(
 			expect.objectContaining({ name: "review:security", description: "Review security." }),
+		);
+		expect(commands).toContainEqual(
+			expect.objectContaining({ name: "release.md:check", description: "Check release." }),
 		);
 		expect(expandSlashCommand("/review:security src/auth.ts", commands)).toContain("Review src/auth.ts.");
 	});
