@@ -393,6 +393,32 @@ describe("tmux self-injection guard", () => {
 			}
 		});
 
+		it("expands env chdir paths from the effective execution environment", async () => {
+			const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-tmux-env-execution-cwd-"));
+			const originalCwd = path.join(tempDir, "original");
+			const foreignCwd = path.join(tempDir, "foreign");
+			const currentCwd = path.join(tempDir, "current");
+			await Promise.all([fs.mkdir(originalCwd), fs.mkdir(foreignCwd), fs.mkdir(currentCwd)]);
+			const localOptions = {
+				...options,
+				cwd: originalCwd,
+				env: { ...env, TMUX: `${path.join(currentCwd, "tmux.sock")},12345,0`, TARGET: foreignCwd },
+				executionEnv: {
+					...env,
+					TMUX: `${path.join(foreignCwd, "tmux.sock")},12345,0`,
+					TMUX_PANE: "%99",
+					TARGET: currentCwd,
+				},
+			};
+			try {
+				await expect(
+					checkTmuxSelfInjection("env -C $TARGET tmux -S tmux.sock send-keys -t %47 x", localOptions),
+				).resolves.toMatchObject({ block: true });
+			} finally {
+				await fs.rm(tempDir, { recursive: true, force: true });
+			}
+		});
+
 		it("propagates env working directories into nested shell payloads", async () => {
 			const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-tmux-nested-env-cwd-"));
 			const originalCwd = path.join(tempDir, "original");
@@ -1186,6 +1212,12 @@ describe("tmux self-injection guard", () => {
 			}
 		});
 
+		it("recognizes GNU env split-string abbreviations recursively", async () => {
+			await expect(
+				checkTmuxSelfInjection(`env -S '--spl "tmux send-keys -t %47 x"'`, options),
+			).resolves.toMatchObject({ block: true });
+		});
+
 		it("preserves env split-string argv for nested shell payloads", async () => {
 			await expect(
 				checkTmuxSelfInjection(`env -S 'bash -c "tmux send-keys -t %47 x"'`, options),
@@ -1387,6 +1419,22 @@ describe("tmux self-injection guard", () => {
 					localOptions,
 				),
 			).resolves.toMatchObject({ block: true });
+		});
+
+		it("resolves nested scripts from env chdir in executable stdin", async () => {
+			const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-tmux-env-stdin-script-cwd-"));
+			const originalCwd = path.join(tempDir, "original");
+			const targetCwd = path.join(tempDir, "target");
+			await Promise.all([fs.mkdir(originalCwd), fs.mkdir(targetCwd)]);
+			await Bun.write(path.join(targetCwd, "nested.sh"), "tmux send-keys -t %47 x\n");
+			const localOptions = { ...options, cwd: originalCwd, env: { ...env, PWD: originalCwd } };
+			try {
+				await expect(
+					checkTmuxSelfInjection(`env -C ${targetCwd} bash -s <<'EOF'\nsh ./nested.sh\nEOF`, localOptions),
+				).resolves.toMatchObject({ block: true });
+			} finally {
+				await fs.rm(tempDir, { recursive: true, force: true });
+			}
 		});
 
 		it("inspects here-documents used as non-stdin shell script files", async () => {
@@ -1710,6 +1758,12 @@ describe("tmux self-injection guard", () => {
 					"TMUX_TMPDIR=/tmp/outer env -u TMUX_TMPDIR tmux -L default send-keys -t %47 x",
 					envOptions,
 				),
+			).resolves.toMatchObject({ block: true });
+		});
+
+		it("uses the default TMUX_TMPDIR when an inline assignment is empty", async () => {
+			await expect(
+				checkTmuxSelfInjection("TMUX_TMPDIR= tmux -L default send-keys -t %47 x", options),
 			).resolves.toMatchObject({ block: true });
 		});
 

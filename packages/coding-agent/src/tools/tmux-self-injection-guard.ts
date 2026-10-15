@@ -1374,19 +1374,18 @@ function reconstructCommandFromEnvSplit(splitString: string, depth = 0): string[
 			continue;
 		}
 		if (isNonExecutingEnvOption(part)) return undefined;
-		const longOptionName = part.split("=")[0];
+		const equalsIndex = part.indexOf("=");
+		const optionName = matchingWrapperLongOption("env", equalsIndex < 0 ? part : part.slice(0, equalsIndex));
+		const longOptionName = equalsIndex < 0 ? part : part.slice(0, equalsIndex);
 		if (ENV_SIGNAL_OPTIONS.has(longOptionName)) continue;
 
 		let splitString: string | undefined;
 		let splitOptionLength = 0;
-		if (part === "-S" || part === "--split-string") {
-			splitString = parts[i + 1];
-			splitOptionLength = 2;
+		if (part === "-S" || optionName === "--split-string") {
+			splitString = equalsIndex < 0 ? parts[i + 1] : part.slice(equalsIndex + 1);
+			splitOptionLength = equalsIndex < 0 ? 2 : 1;
 		} else if (part.startsWith("-S") && part.length > 2) {
 			splitString = part.slice(2);
-			splitOptionLength = 1;
-		} else if (part.startsWith("--split-string=")) {
-			splitString = part.slice("--split-string=".length);
 			splitOptionLength = 1;
 		}
 		let shortBundleHandled = false;
@@ -2995,7 +2994,7 @@ function socketPathFor(
 	uid: number,
 ): string {
 	if (socket.flag === "-S") return path.isAbsolute(socket.value) ? socket.value : path.resolve(cwd, socket.value);
-	return path.join(env.TMUX_TMPDIR ?? "/tmp", `tmux-${uid}`, socket.value);
+	return path.join(env.TMUX_TMPDIR || "/tmp", `tmux-${uid}`, socket.value);
 }
 
 function sameSocket(left: string, right: string): boolean {
@@ -3376,7 +3375,8 @@ export async function checkTmuxSelfInjection(
 	depth = 0,
 ): Promise<TmuxSelfInjectionResult> {
 	const env = options.env ?? process.env;
-	return checkTmuxSelfInjectionAtCwd(command, options, depth, options.cwd ?? env.PWD ?? ".", false);
+	const executionEnv = options.executionEnv ?? env;
+	return checkTmuxSelfInjectionAtCwd(command, options, depth, options.cwd ?? executionEnv.PWD ?? ".", false);
 }
 
 async function checkTmuxSelfInjectionAtCwd(
@@ -3387,6 +3387,7 @@ async function checkTmuxSelfInjectionAtCwd(
 	cwdUnknown: boolean,
 ): Promise<TmuxSelfInjectionResult> {
 	const env = options.env ?? process.env;
+	const executionEnv = options.executionEnv ?? env;
 	const identity = currentIdentity(env);
 	if (!identity) return { block: false };
 	const uid = typeof process.getuid === "function" ? process.getuid() : 0;
@@ -3404,7 +3405,7 @@ async function checkTmuxSelfInjectionAtCwd(
 		if (isCommandLookup(tokens, index)) continue;
 		const invocation = parseInvocation(tokens.slice(index + 1));
 		if (!invocation || invocation.nonExecuting) continue;
-		const commandCwd = commandWorkingDirectory(tokens, index, cwd, env);
+		const commandCwd = commandWorkingDirectory(tokens, index, cwd, executionEnv);
 		const commandCwdUnknown = cwdUnknown || commandCwd === undefined;
 		if (depth < MAX_INDIRECTION_DEPTH) {
 			for (const shellCommand of invocation.shellCommands) {
@@ -3419,7 +3420,7 @@ async function checkTmuxSelfInjectionAtCwd(
 			}
 		}
 		if (!invocation.verb || !INPUT_VERBS.has(invocation.verb)) continue;
-		const commandEnv = { ...env };
+		const commandEnv = { ...executionEnv };
 		const assignedTmux = assignedTmuxEnvironmentValue(tokens, index, "TMUX");
 		const assignedTmpdir = assignedTmuxEnvironmentValue(tokens, index, "TMUX_TMPDIR");
 		if (assignedTmpdir !== undefined) commandEnv.TMUX_TMPDIR = assignedTmpdir;
@@ -3478,7 +3479,15 @@ async function checkTmuxSelfInjectionAtCwd(
 			}
 		}
 		const shellScripts = collectShellScripts(tokens, cwd, cwdUnknown, options.executionEnv ?? env);
-		for (const payload of collectShellStdinPayloads(tokens, hereDocuments, shellScripts, cwd, 0, cwdUnknown, env)) {
+		for (const payload of collectShellStdinPayloads(
+			tokens,
+			hereDocuments,
+			shellScripts,
+			cwd,
+			0,
+			cwdUnknown,
+			executionEnv,
+		)) {
 			const result = await checkTmuxSelfInjectionAtCwd(
 				payload.content,
 				options,
@@ -3488,7 +3497,7 @@ async function checkTmuxSelfInjectionAtCwd(
 			);
 			if (result.block) return result;
 		}
-		for (const payload of collectShellPayloadsWithContext(tokens, cwd, cwdUnknown, env)) {
+		for (const payload of collectShellPayloadsWithContext(tokens, cwd, cwdUnknown, executionEnv)) {
 			const result = await checkTmuxSelfInjectionAtCwd(
 				payload.content,
 				options,
