@@ -43,7 +43,7 @@ const CREDENTIAL_AUTH_VALUE_PATTERN = new RegExp(
 	"gi",
 );
 const CREDENTIAL_AUTHORIZATION_VALUE_PATTERN = new RegExp(
-	String.raw`${AUTHORIZATION_HEADER_PREFIX}(?!\s*(?:["'«]|\\+["']))(?:(?!\\+n|\\+r\\+n)[^\r\n])+`,
+	String.raw`${AUTHORIZATION_HEADER_PREFIX}(?!\s*(?:["'«\x60]|\\+["']))(?:(?!\\+n|\\+r\\+n)[^\r\n])+`,
 	"gi",
 );
 const CREDENTIAL_VALUE_PATTERN_BODY = String.raw`(?:(\\+")((?:\\[\s\S]|[^"\\])*?)(\\+")${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(")((?:\\[\s\S]|[^"\\])*)(")|(\\+')((?:\\[\s\S]|[^'\\])*?)(\\+')${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(')((?:\\[\s\S]|[^'\\])*)(')|(\x60)((?:\\[\s\S]|[^\x60\\])*)(\x60)${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(\\+")([^\r\n]*)(?=\r?\n|$)|(")([^\r\n]*)(?=\r?\n|$)|(\\+')([^\r\n]*)(?=\r?\n|$)|(')([^\r\n]*)(?=\r?\n|$)|(\x60)([^\r\n]*)(?=\r?\n|$)|(${CREDENTIAL_UNQUOTED_VALUE_PATTERN_BODY}))`;

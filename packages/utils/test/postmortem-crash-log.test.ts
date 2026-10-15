@@ -316,6 +316,9 @@ describe("recordFatalCrash", () => {
 		expect(redactCrashSecrets("authorization: Basic x diagnostic=keep")).toBe(
 			"authorization: «redacted» diagnostic=keep",
 		);
+		expect(redactCrashSecrets("authorization: `Bearer abc`, note=keep")).toBe(
+			"authorization: `«redacted»`, note=keep",
+		);
 	});
 
 	it("redacts camelCase credential suffixes in labels and values", () => {
