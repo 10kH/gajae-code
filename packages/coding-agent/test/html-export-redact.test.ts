@@ -10,6 +10,8 @@ const API_KEY = "sk-htmlExportFakeKey1234";
 const GITHUB_TOKEN = "ghp_htmlExportFakeToken123456";
 const ESCAPED_CREDENTIAL = String.raw`password=\"correct horse battery\" payload={\"password\":\"correct horse battery\"}`;
 const ESCAPED_BACKTICK_CREDENTIAL = "password=\\`shell-escaped horse battery staple\\`";
+const BACKTICK_QUOTED_KEY_CREDENTIAL = "`password`=`backtick-key horse battery staple`";
+const ESCAPED_BACKTICK_QUOTED_KEY_CREDENTIAL = "\\`password\\`=\\`escaped-backtick-key horse battery staple\\`";
 const ORDINARY_SENTENCE = "The harbor ferry leaves at noon.";
 const QUOTED_SENTENCE = 'he said "hello" and walked on';
 
@@ -36,7 +38,7 @@ describe("session HTML export embed", () => {
 				role: "user",
 				content:
 					`${ORDINARY_SENTENCE} ${API_KEY} ${GITHUB_TOKEN} private_token=abc123 AWS_SECRET_ACCESS_KEY=x password="correct horse battery" ` +
-					"password=`correct horse battery staple` " +
+					`password=\`correct horse battery staple\` ${BACKTICK_QUOTED_KEY_CREDENTIAL} ${ESCAPED_BACKTICK_QUOTED_KEY_CREDENTIAL} ` +
 					`authorization="Bearer abc" Authorization: ApiKey opaque-secret\n${ESCAPED_CREDENTIAL} ${ESCAPED_BACKTICK_CREDENTIAL}`,
 				timestamp: 1,
 			});
@@ -56,6 +58,8 @@ describe("session HTML export embed", () => {
 			expect(embedded).not.toContain("AWS_SECRET_ACCESS_KEY=x");
 			expect(embedded).not.toContain("correct horse battery");
 			expect(embedded).not.toContain("shell-escaped horse battery staple");
+			expect(embedded).not.toContain("backtick-key horse battery staple");
+			expect(embedded).not.toContain("escaped-backtick-key horse battery staple");
 			expect(embedded).toContain("password=`«redacted»`");
 			expect(embedded).not.toContain("Bearer abc");
 			expect(embedded).not.toContain("opaque-secret");

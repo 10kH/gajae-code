@@ -278,6 +278,21 @@ describe("recordFatalCrash", () => {
 		expect(redactCrashSecrets(escaped)).toBe("credentials=«redacted» note=keep");
 	});
 
+	it("redacts credential assignments with raw and escaped backtick-quoted keys", () => {
+		expect(redactCrashSecrets("`password`=`raw-key secret`")).toBe("`password`=`«redacted»`");
+		expect(redactCrashSecrets("\\`password\\`=\\`escaped-key secret\\`")).toBe("\\`password\\`=\\`«redacted»\\`");
+		expect(redactCrashSecrets("`dbPassword`=`raw camel key secret`")).toBe("`dbPassword`=`«redacted»`");
+		expect(redactCrashSecrets("\\`dbPassword\\`=\\`escaped camel key secret\\`")).toBe(
+			"\\`dbPassword\\`=\\`«redacted»\\`",
+		);
+		expect(redactCrashSecrets("`credentials`={primary:`container-secret`} note=keep")).toBe(
+			"`credentials`=«redacted» note=keep",
+		);
+		expect(redactCrashSecrets("\\`credentials\\`={primary:\\`escaped-container-secret\\`} note=keep")).toBe(
+			"\\`credentials\\`=«redacted» note=keep",
+		);
+	});
+
 	it("redacts complete Cookie headers and assignments without consuming diagnostics", async () => {
 		const target = tempCrashLog();
 		const message = [

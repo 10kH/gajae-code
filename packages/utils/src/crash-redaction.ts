@@ -23,19 +23,19 @@ const CREDENTIAL_CAMEL_MULTI_PREFIX = `(?:[a-z0-9]{2,}|[A-Z][a-z0-9]+|[A-Z]{2,})
 const CREDENTIAL_CAMEL_KEY_PATTERN = `(?:(?:${CREDENTIAL_CAMEL_COMPOUND_PREFIX}|${CREDENTIAL_CAMEL_MULTI_PREFIX})(?:${CREDENTIAL_CAMEL_COMPOUND_SUFFIXES})|(?:${CREDENTIAL_CAMEL_PREFIX}|${CREDENTIAL_CAMEL_MULTI_PREFIX})(?:${CREDENTIAL_CAMEL_SIMPLE_SUFFIXES}))`;
 const CREDENTIAL_CAMEL_KEY_SUFFIX = new RegExp(`^${CREDENTIAL_CAMEL_KEY_PATTERN}$`);
 const CREDENTIAL_CAMEL_ASSIGNMENT_CANDIDATE_PATTERN = new RegExp(
-	String.raw`(?:${CREDENTIAL_CAMEL_COMPOUND_SUFFIXES}|${CREDENTIAL_CAMEL_SIMPLE_SUFFIXES})(?:\\*["']?\s*[=:]\s*)`,
+	String.raw`(?:${CREDENTIAL_CAMEL_COMPOUND_SUFFIXES}|${CREDENTIAL_CAMEL_SIMPLE_SUFFIXES})(?:\\*["'\x60]?\s*[=:]\s*)`,
 );
-const CREDENTIAL_ASSIGNMENT_PREFIX = String.raw`(?<![A-Za-z0-9_.-])((?:\\*["']?-*)(?:${CREDENTIAL_KEY_PATTERN})(?:\\*["']?\s*[=:]\s*))`;
+const CREDENTIAL_ASSIGNMENT_PREFIX = String.raw`(?<![A-Za-z0-9_.-])((?:\\*["'\x60]?-*)(?:${CREDENTIAL_KEY_PATTERN})(?:\\*["'\x60]?\s*[=:]\s*))`;
 const CREDENTIAL_ASSIGNMENT_CANDIDATE_PATTERN = new RegExp(
-	String.raw`(?:${CREDENTIAL_KEY_LABELS})(?:\\*["']?\s*[=:]\s*)`,
+	String.raw`(?:${CREDENTIAL_KEY_LABELS})(?:\\*["'\x60]?\s*[=:]\s*)`,
 	"i",
 );
 const CREDENTIAL_CONTAINER_CANDIDATE_PATTERN = new RegExp(
-	String.raw`(?:${CREDENTIAL_KEY_LABELS})(?:\\*["']?\s*[=:]\s*[\[{])`,
+	String.raw`(?:${CREDENTIAL_KEY_LABELS})(?:\\*["'\x60]?\s*[=:]\s*[\[{])`,
 	"i",
 );
-const CREDENTIAL_CAMEL_ASSIGNMENT_PREFIX = String.raw`(?<![A-Za-z0-9_-])((?:\\*["']?-*)(?:${CREDENTIAL_CAMEL_KEY_PATTERN})(?:\\*["']?\s*[=:]\s*))`;
-const AUTHORIZATION_HEADER_PREFIX = String.raw`(?<![A-Za-z0-9_-])((?:\\*["']?-*)(?:[A-Za-z0-9][A-Za-z0-9_-]*[_-])?(?:auth|authorization)(?:\\*["']?\s*:\s*))`;
+const CREDENTIAL_CAMEL_ASSIGNMENT_PREFIX = String.raw`(?<![A-Za-z0-9_-])((?:\\*["'\x60]?-*)(?:${CREDENTIAL_CAMEL_KEY_PATTERN})(?:\\*["'\x60]?\s*[=:]\s*))`;
+const AUTHORIZATION_HEADER_PREFIX = String.raw`(?<![A-Za-z0-9_-])((?:\\*["'\x60]?-*)(?:[A-Za-z0-9][A-Za-z0-9_-]*[_-])?(?:auth|authorization)(?:\\*["'\x60]?\s*:\s*))`;
 const CREDENTIAL_UNQUOTED_VALUE_PATTERN_BODY = String.raw`(?:(?!\\+n|\\+r\\+n)(?:\\[^\r\n]|[^\s"',;}\]]))+`;
 const CREDENTIAL_VALUE_QUOTED_BOUNDARY = String.raw`(?=$|[\s,;}):.\]]|/?>)`;
 const CREDENTIAL_AUTH_VALUE_PATTERN = new RegExp(
