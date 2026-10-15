@@ -1,8 +1,9 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as native from "@gajae-code/natives";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import {
 	applyGjcBundleRestore,
@@ -32,6 +33,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+	vi.restoreAllMocks();
 	setAgentDir(originalAgentDir);
 	await fs.rm(agentDir, { recursive: true, force: true });
 	await fs.rm(cwd, { recursive: true, force: true });
@@ -189,7 +191,11 @@ describe("private marketplace artifact restore", () => {
 		expect(token.originalInstallPath).toBe(installedRoot);
 		expect(token.stagedArtifactPath).not.toBe(installedRoot);
 
+		const removeTree = vi.spyOn(native, "exactRemoveDirectoryTree");
 		const restored = await manager.applyPluginRestore(token);
+		expect(
+			removeTree.mock.calls.some(([target, , , detachOnly]) => target === installedRoot && detachOnly === true),
+		).toBe(true);
 		expect(restored.status).toBe("verified");
 		expect(restored.sideEffectStarted).toBe(true);
 		expect(restored.entry.enabled).toBe(false);

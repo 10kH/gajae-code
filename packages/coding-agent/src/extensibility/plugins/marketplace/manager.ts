@@ -878,10 +878,15 @@ export class MarketplaceManager {
 				// merely a decision about whether it is safe to proceed. sideEffectStarted
 				// stays false — effects are physical, not procedural.
 				if (!finalSnapshotBefore) throw new MarketplaceRestoreError("final_path_snapshot_unavailable");
-				const detached = exactRemoveDirectoryTree(finalPath, finalSnapshotBefore, {
-					dev: parentBefore.dev,
-					ino: parentBefore.ino,
-				});
+				const detached = exactRemoveDirectoryTree(
+					finalPath,
+					finalSnapshotBefore,
+					{
+						dev: parentBefore.dev,
+						ino: parentBefore.ino,
+					},
+					true,
+				);
 				const detachedPath = detachedTree(detached);
 				if (!detachedPath) {
 					// identity_mismatch means finalPath already changed before we ever
