@@ -418,9 +418,12 @@ export class CommandController {
 			return;
 		}
 		const ghShareExecutable = ghShare.executable;
+		// Bun wrappers load project bunfig.toml preloads from their working directory.
+		const ghShareCwd = path.parse(ghShareLaunchRoot).root;
 		const ghEnv = ghShareChildEnv(ghShare.searchPath);
 		try {
 			const authProcess = Bun.spawn([ghShareExecutable, "auth", "status"], {
+				cwd: ghShareCwd,
 				env: ghEnv,
 				stdin: "ignore",
 				stdout: "ignore",
@@ -455,6 +458,7 @@ export class CommandController {
 		let cancellationRequested = false;
 		try {
 			const gistProcess = Bun.spawn([ghShareExecutable, "gist", "create", "--public=false", tmpFile], {
+				cwd: ghShareCwd,
 				env: ghEnv,
 				stdin: "ignore",
 				stdout: "pipe",

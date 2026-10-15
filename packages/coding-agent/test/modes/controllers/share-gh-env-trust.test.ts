@@ -70,6 +70,8 @@ interface GhSpawn {
 	args: string[];
 	source: string;
 	cwd: string;
+	projectRoot: string;
+	bunfigPreloadExecuted: boolean;
 	PATH: string;
 	BASH_ENV: string | null;
 	ENV: string | null;
@@ -147,12 +149,17 @@ if (!record) {
 	process.stderr.write("missing share record\\n");
 	process.exit(2);
 }
+const bunfigPreloadMarker = process.env.GJC_SHARE_BUNFIG_MARKER;
 await fsPromises.appendFile(
 	record,
 	JSON.stringify({
 		args: process.argv.slice(2),
 		source: ${JSON.stringify(source)},
 		cwd: process.cwd(),
+		projectRoot: process.env.GJC_SHARE_PROJECT_ROOT ?? "",
+		bunfigPreloadExecuted: bunfigPreloadMarker
+			? await fsPromises.stat(bunfigPreloadMarker).then(() => true, () => false)
+			: false,
 		PATH: process.env.PATH ?? "",
 		BASH_ENV: process.env.BASH_ENV ?? null,
 		ENV: process.env.ENV ?? null,
@@ -222,6 +229,7 @@ async function share(options: {
 	moveAway?: boolean;
 	launchFromFilesystemRoot?: boolean;
 	nonCheckoutLaunch?: boolean;
+	bunfigPreload?: boolean;
 	autoload?: boolean;
 	noSpawnError?: string;
 	ghPathMode?:
@@ -268,7 +276,11 @@ async function share(options: {
 	delete env.GJC_SHARE_EXPECT_HOST;
 	delete env.GJC_SHARE_EXPECT_CONFIG;
 	delete env.GJC_SHARE_MOVE_TO;
+	delete env.GJC_SHARE_PROJECT_ROOT;
+	delete env.GJC_SHARE_BUNFIG_MARKER;
 	env.GJC_SHARE_GH_RECORD = record;
+	env.GJC_SHARE_PROJECT_ROOT = cwd;
+	if (options.bunfigPreload) env.GJC_SHARE_BUNFIG_MARKER = path.join(cwd, "bunfig-preload-ran");
 	switch (ghPathMode) {
 		case "checkout-relative":
 			env.PATH = "bin";
@@ -391,8 +403,15 @@ function expectDestination(
 	expect(spawns[1]?.args.slice(0, 3)).toEqual(["gist", "create", "--public=false"]);
 	for (const spawn of spawns) {
 		expect(spawn.source).toBe("operator");
+		expect(spawn.cwd).toBe(path.parse(spawn.projectRoot).root);
+		const cwdRelative = path.relative(spawn.projectRoot, spawn.cwd);
+		const cwdIsInsideProject =
+			cwdRelative === "" ||
+			(cwdRelative !== ".." && !cwdRelative.startsWith(`..${path.sep}`) && !path.isAbsolute(cwdRelative));
+		expect(cwdIsInsideProject).toBe(false);
+		expect(spawn.bunfigPreloadExecuted).toBe(false);
 		for (const directory of spawn.PATH.split(path.delimiter)) {
-			const relative = path.relative(spawn.cwd, directory);
+			const relative = path.relative(spawn.projectRoot, directory);
 			const pathIsInsideLaunchDirectory =
 				relative === "" ||
 				(relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
@@ -589,6 +608,12 @@ DOTNET_STARTUP_HOOKS=/project/dotnet-startup.dll
 		});
 	});
 
+	it("runs Bun-based gh wrappers outside project bunfig preloads", async () => {
+		const spawns = await share({ bunfigPreload: true });
+		expectDestination(spawns, {});
+		expect(spawns.map(spawn => spawn.bunfigPreloadExecuted)).toEqual([false, false]);
+	});
+
 	it("omits project dotenv proxy and CA overrides from both gh spawns", async () => {
 		const spawns = await share({
 			autoload: true,
@@ -674,7 +699,7 @@ DYLD_ROOT_PATH=/project/root
 		});
 		expectDestination(spawns, {}, true);
 		for (const spawn of spawns) {
-			expect(spawn.PATH.split(path.delimiter)).toEqual([path.join(spawn.cwd, "bin")]);
+			expect(spawn.PATH.split(path.delimiter)).toEqual([path.join(spawn.projectRoot, "bin")]);
 		}
 	});
 
