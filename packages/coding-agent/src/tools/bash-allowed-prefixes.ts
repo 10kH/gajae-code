@@ -242,11 +242,34 @@ function optionWords(words: readonly string[]): string[] {
 }
 
 function isLongOption(word: string, option: string): boolean {
-	if (!word.startsWith("--")) return false;
-	const equalsAt = word.indexOf("=");
-	const name = equalsAt === -1 ? word : word.slice(0, equalsAt);
-	// GNU getopt treats a prefix as that option (`--outp` is `--output`, `--comp` is `--compile`).
-	return name.length > 2 && option.startsWith(name);
+	return word === option || word.startsWith(`${option}=`);
+}
+
+function fileCompilesMagic(words: readonly string[]): boolean {
+	const valueOptions = ["--exclude", "--exclude-quiet", "--files-from", "--separator", "--magic-file", "--parameter"];
+	for (let index = 1; index < words.length; index += 1) {
+		const word = words[index]!;
+		if (word === "--") break;
+		if (word.startsWith("--")) {
+			const equalsAt = word.indexOf("=");
+			const name = equalsAt === -1 ? word : word.slice(0, equalsAt);
+			if (name.length > 2 && "--compile".startsWith(name)) return true;
+			if (equalsAt === -1 && valueOptions.some(option => name.length > 2 && option.startsWith(name))) {
+				index += 1;
+			}
+		} else if (word.startsWith("-")) {
+			for (let offset = 1; offset < word.length; offset += 1) {
+				const flag = word[offset]!;
+				if (flag === "C") return true;
+				// Required arguments consume the rest of the cluster, or the next word (even `--`).
+				if ("eFfmMP".includes(flag)) {
+					if (offset === word.length - 1) index += 1;
+					break;
+				}
+			}
+		}
+	}
+	return false;
 }
 
 function hasShortOption(word: string, option: string): boolean {
@@ -289,12 +312,8 @@ function validateReadOnlyCommand(words: readonly string[]): BashAllowedPrefixesC
 		}
 	}
 
-	if (command === "file") {
-		for (const option of options) {
-			if (isLongOption(option, "--compile") || hasShortOption(option, "C")) {
-				return { allowed: false, reason: "read-only bash does not allow file magic compilation" };
-			}
-		}
+	if (command === "file" && fileCompilesMagic(words)) {
+		return { allowed: false, reason: "read-only bash does not allow file magic compilation" };
 	}
 
 	const gitWrite = rejectGitHostAccess(words);

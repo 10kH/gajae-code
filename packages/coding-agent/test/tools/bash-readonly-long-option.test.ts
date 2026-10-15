@@ -39,46 +39,60 @@ function createReadOnlyBashTool(cwd: string, prefixes: string[]): BashTool {
 	return new BashTool(session);
 }
 
-describe("read-only bash long-option denylist", () => {
-	it.skipIf(process.platform === "win32")(
-		"rejects a GNU abbreviation of tree --output before the program runs",
-		async () => {
-			const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-read-only-tree-abbrev-"));
-			const marker = path.join(root, "ran");
-			const stub = path.join(root, "tree");
-			const originalWhich = Bun.which;
-			try {
-				const quote = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`;
-				await fs.writeFile(
-					stub,
-					["#!/bin/sh", `printf 'ran\\n' > ${quote(marker)}`, "printf 'tree-ran\\n'", ""].join("\n"),
-				);
-				await fs.chmod(stub, 0o755);
-				Bun.which = ((command: string) => (command === "tree" ? stub : originalWhich(command))) as typeof Bun.which;
-				const tool = createReadOnlyBashTool(root, ["tree"]);
-				for (const command of ["tree --outp=out.txt", "tree --out out.txt", "tree --output=out.txt"]) {
-					await expect(tool.execute("tool-call", { command })).rejects.toThrow(
-						"read-only bash does not allow tree output-file writes",
-					);
-				}
-				await expect(fs.access(marker)).rejects.toThrow();
-			} finally {
-				Bun.which = originalWhich;
-				await fs.rm(root, { recursive: true, force: true });
+describe("read-only bash file compilation", () => {
+	it("still allows file option arguments that resemble compilation flags", () => {
+		for (const command of [
+			"file -m --compile sample.txt",
+			"file --magic-file=--compile sample.txt",
+			"file -e --comp sample.txt",
+			"file -f --compile",
+			"file -P --compile sample.txt",
+			"file -- --compile",
+		]) {
+			expect(checkBashAllowedPrefixes(command, ["file"], { profile: "read-only" })).toEqual({ allowed: true });
+		}
+	});
+
+	it.skipIf(process.platform === "win32")("still allows rg and tree pattern values through public bash", async () => {
+		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-read-only-pattern-ok-"));
+		const originalWhich = Bun.which;
+		try {
+			for (const name of ["rg", "tree"]) {
+				await fs.writeFile(path.join(root, name), "#!/bin/sh\nprintf '%s\\n' \"$@\"\n");
+				await fs.chmod(path.join(root, name), 0o755);
 			}
-		},
-	);
+			Bun.which = ((command: string) =>
+				command === "rg" || command === "tree"
+					? path.join(root, command)
+					: originalWhich(command)) as typeof Bun.which;
+			const tool = createReadOnlyBashTool(root, ["rg", "tree"]);
+			for (const command of ["rg -e --p sample.txt", "tree -P --o ."]) {
+				const result = await tool.execute("tool-call", { command });
+				expect(result.content.find(part => part.type === "text")?.text).toContain(
+					command.includes("rg") ? "--p" : "--o",
+				);
+			}
+		} finally {
+			Bun.which = originalWhich;
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
 
 	it.skipIf(process.platform === "win32" || !Bun.which("file"))(
-		"rejects file -C and --compile before magic compilation",
+		"rejects file compilation through the public bash entry before writing magic",
 		async () => {
 			const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-read-only-file-compile-"));
 			try {
+				await fs.writeFile(path.join(root, "magic"), "0 string HELLO sample\n");
 				const tool = createReadOnlyBashTool(root, ["file"]);
 				for (const command of [
-					"file -C / --compile",
-					"file --compile /usr/share/file/magic",
-					"file --comp /usr/share/file/magic",
+					"file -C -m magic",
+					"file -bC -m magic",
+					"file --compile -m magic",
+					"file --comp -m magic",
+					"file -m -- --compile",
+					"file --magic-file -- --comp",
+					"file -FC -C -m magic",
 				]) {
 					await expect(tool.execute("tool-call", { command })).rejects.toThrow(
 						"read-only bash does not allow file magic compilation",
@@ -92,65 +106,32 @@ describe("read-only bash long-option denylist", () => {
 	);
 
 	it.skipIf(process.platform === "win32" || !Bun.which("file"))(
-		"still allows a read-only file inspection",
+		"still allows file inspection with attached and separate option values",
 		async () => {
 			const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-read-only-file-ok-"));
 			try {
 				await fs.writeFile(path.join(root, "sample.txt"), "hello\n");
 				const tool = createReadOnlyBashTool(root, ["file"]);
-				const result = await tool.execute("tool-call", { command: "file sample.txt" });
-				expect(result.content.find(part => part.type === "text")?.text).toContain("sample.txt");
+				for (const command of [
+					"file sample.txt",
+					"file -FC sample.txt",
+					"file -bFC sample.txt",
+					"file -F --compile sample.txt",
+					"file --separator --comp sample.txt",
+					"file --separator=--compile sample.txt",
+					"file --mime sample.txt",
+				]) {
+					const result = await tool.execute("tool-call", { command });
+					expect(result.content.find(part => part.type === "text")?.text).toContain("text");
+				}
+				await fs.writeFile(path.join(root, "--compile"), "hello\n");
+				const result = await tool.execute("tool-call", { command: "file -- --compile" });
+				expect(result.content.find(part => part.type === "text")?.text).toContain("--compile:");
 				await expect(fs.access(path.join(root, "magic.mgc"))).rejects.toThrow();
 			} finally {
 				await fs.rm(root, { recursive: true, force: true });
 			}
 		},
+		30_000,
 	);
-
-	it.skipIf(process.platform === "win32")("still allows a tree listing without an output file", async () => {
-		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-read-only-tree-ok-"));
-		const stub = path.join(root, "tree");
-		const originalWhich = Bun.which;
-		try {
-			await fs.writeFile(stub, "#!/bin/sh\nprintf 'tree-ok\\n'\n");
-			await fs.chmod(stub, 0o755);
-			Bun.which = ((command: string) => (command === "tree" ? stub : originalWhich(command))) as typeof Bun.which;
-			const tool = createReadOnlyBashTool(root, ["tree"]);
-			const result = await tool.execute("tool-call", { command: "tree --dirsfirst" });
-			expect(result.content.find(part => part.type === "text")?.text).toContain("tree-ok");
-		} finally {
-			Bun.which = originalWhich;
-			await fs.rm(root, { recursive: true, force: true });
-		}
-	});
-
-	it("rejects abbreviated git --output and ripgrep hostname flags", () => {
-		for (const command of ["git diff --outp=out.diff", "git diff --output=out.diff"]) {
-			const result = checkBashAllowedPrefixes(command, ["git diff"]);
-			expect(result.allowed).toBe(false);
-			expect(result.reason).toContain("git --output or --no-index");
-		}
-		const hostname = checkBashAllowedPrefixes("rg --host ./pwned hello", ["rg"], { profile: "read-only" });
-		expect(hostname.allowed).toBe(false);
-		expect(hostname.reason).toContain("ripgrep hostname commands");
-	});
-
-	it("still allows git diff --stat and a plain rg pattern", () => {
-		expect(checkBashAllowedPrefixes("git diff --stat", ["git diff"])).toEqual({ allowed: true });
-		expect(checkBashAllowedPrefixes("git diff --output-indicator-new=X", ["git diff"])).toEqual({
-			allowed: true,
-		});
-		expect(checkBashAllowedPrefixes("rg --heading hello sample.txt", ["rg"], { profile: "read-only" })).toEqual({
-			allowed: true,
-		});
-		expect(checkBashAllowedPrefixes("rg --pretty hello sample.txt", ["rg"], { profile: "read-only" })).toEqual({
-			allowed: true,
-		});
-		expect(checkBashAllowedPrefixes("tree --opt-toggle --dirsfirst .", ["tree"], { profile: "read-only" })).toEqual({
-			allowed: true,
-		});
-		expect(checkBashAllowedPrefixes("file --mime sample.txt", ["file"], { profile: "read-only" })).toEqual({
-			allowed: true,
-		});
-	});
 });

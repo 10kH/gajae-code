@@ -1,3 +1,3 @@
 ### Fixed
 
-- Read-only bash rejects GNU abbreviations of denied long options, including `tree --outp` and `file -C` / `--compile`.
+- Read-only bash blocks `file -C` / `--compile` and its long-option abbreviations while preserving inspection option arguments.
