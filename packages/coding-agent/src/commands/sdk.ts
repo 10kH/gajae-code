@@ -12,12 +12,14 @@ import {
 } from "@gajae-code/natives";
 import { getAgentDir, logger, postmortem } from "@gajae-code/utils";
 import { CliParseError, Command } from "@gajae-code/utils/cli";
+import { projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import type { Args as ParsedArgs } from "../cli/args";
 import { isSafeSdkInternalAgentDir, scanPublicCommand } from "../cli/public-command-entry";
 import { PublicCommandFailure } from "../cli/public-command-errors";
 import { FileLockAcquireError } from "../config/file-lock";
 import { parseModelString } from "../config/model-resolver";
 import { Settings } from "../config/settings";
+import { trustedCoordinatorEnv } from "../gjc-runtime/sidecar-bootstrap-env";
 import { usePostmortemSignalExitAuthority } from "../lsp/client";
 import { applyStartupModelProfiles, createSessionManager } from "../main";
 import { initializeExtensions } from "../modes/runtime-init";
@@ -94,11 +96,17 @@ export async function lifecycleArgs(
 	if (targetScope.kind !== "resolved") throw new Error(`Lifecycle session scope is invalid: ${targetScope.message}`);
 	const forkSessionDir =
 		request.operation === "session.fork" ? SessionManager.getDefaultSessionDir(cwd, agentDir) : undefined;
+	// Bun has already copied the project dotenv into process.env. A matching or
+	// dynamic declaration must not select an in-memory session. The exact "1"
+	// check stays; an operator value the project does not declare is still honored.
+	const inMemorySession =
+		process.env.GJC_SDK_TEST_IN_MEMORY_SESSION === "1" &&
+		trustedCoordinatorEnv("GJC_SDK_TEST_IN_MEMORY_SESSION", process.env, projectEnvSnapshot(cwd)) === "1";
 	return {
 		messages: [],
 		fileArgs: [],
 		unknownFlags: new Map(),
-		...(process.env.GJC_SDK_TEST_IN_MEMORY_SESSION === "1" ? { noSession: true } : {}),
+		...(inMemorySession ? { noSession: true } : {}),
 		...(request.operation === "session.resume" ? { resume: request.sessionPath } : {}),
 		...(request.modelPreset ? { mpreset: request.modelPreset } : {}),
 		// Explicit model pin (#4707): coordinator-resolved `provider/model`
