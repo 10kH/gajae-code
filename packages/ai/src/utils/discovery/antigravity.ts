@@ -320,7 +320,7 @@ function trimTrailingSlashes(value: string): string {
 	return value.replace(/\/+$/, "");
 }
 
-function getAntigravityDiscoveryUserAgent(): string {
+export function getAntigravityDiscoveryUserAgent(): string {
 	return process.env.PI_AI_ANTIGRAVITY_USER_AGENT ? getAntigravityUserAgent() : getGeminiCliUserAgent();
 }
 

@@ -3798,47 +3798,19 @@ describe("ModelRegistry", () => {
 			}
 		});
 
-		test("does not reuse Antigravity cache created with the old discovery identity", async () => {
-			const provider = "google-antigravity";
-			const accessToken = "projectless-antigravity-access";
+		test("invalidates Google discovery caches when the effective user agent changes", async () => {
 			const restoreUserAgent = unsetEnvForTest("PI_AI_ANTIGRAVITY_USER_AGENT");
 			let registry: ModelRegistry | undefined;
 			try {
-				await authStorage.set(provider, [
-					{
-						type: "oauth",
-						access: accessToken,
-						refresh: "projectless-antigravity-refresh",
-						expires: Date.now() + 60 * 60 * 1000,
-						email: "projectless@example.test",
-					},
-				]);
 				registry = new ModelRegistry(authStorage, modelsJsonPath);
-				const endpoint = registry.getProviderBaseUrl(provider);
-				if (!endpoint) throw new Error("Expected a bundled Antigravity endpoint");
-				const authEvidence = authStorage.getProviderEvidenceGeneration(provider, accessToken);
-				const legacyProvenance = crypto
-					.createHash("sha256")
-					.update("gajae:model-discovery-provenance\0")
-					.update(JSON.stringify({ authEvidence, endpoint }))
-					.digest("hex");
-				writeModelCache(
-					provider,
-					Date.now(),
-					getBundledModels(provider),
-					true,
-					"",
-					cacheDbPath,
-					[],
-					legacyProvenance,
-				);
-
-				const requests: Array<{ userAgent: string | null; body: unknown }> = [];
+				let currentProvider = "";
+				const requests: Array<{ provider: string; userAgent: string | null; body: unknown }> = [];
 				using _hook = hookFetch((input, init) => {
 					if (!String(input).endsWith("/v1internal:fetchAvailableModels")) {
 						throw new Error(`Unexpected URL: ${String(input)}`);
 					}
 					requests.push({
+						provider: currentProvider,
 						userAgent: new Headers(init?.headers).get("user-agent"),
 						body: JSON.parse(String(init?.body ?? "{}")) as unknown,
 					});
@@ -3856,10 +3828,76 @@ describe("ModelRegistry", () => {
 					);
 				});
 
-				await registry.refreshProvider(provider, "online-if-uncached");
+				for (const provider of ["google-antigravity", "google-gemini-cli"] as const) {
+					const accessToken = `${provider}-projectless-access`;
+					await authStorage.set(provider, [
+						{
+							type: "oauth",
+							access: accessToken,
+							refresh: `${provider}-projectless-refresh`,
+							expires: Date.now() + 60 * 60 * 1000,
+							email: `${provider}@example.test`,
+						},
+					]);
+					const endpoint = registry.getProviderBaseUrl(provider);
+					if (!endpoint) throw new Error(`Expected a bundled endpoint for ${provider}`);
+					const authEvidence = authStorage.getProviderEvidenceGeneration(provider, accessToken);
+					const legacyProvenance = crypto
+						.createHash("sha256")
+						.update("gajae:model-discovery-provenance\0")
+						.update(JSON.stringify({ authEvidence, endpoint }))
+						.digest("hex");
+					writeModelCache(
+						provider,
+						Date.now(),
+						getBundledModels(provider),
+						true,
+						"",
+						cacheDbPath,
+						[],
+						legacyProvenance,
+					);
+					currentProvider = provider;
+					const requestStart = requests.length;
+					await registry.refreshProvider(provider, "online-if-uncached");
 
-				expect(requests).toEqual([{ userAgent: getGeminiCliUserAgent(), body: {} }]);
-				expect(registry.find(provider, "gemini-4-argon")).toBeDefined();
+					expect(requests.slice(requestStart)).toEqual([
+						{ provider, userAgent: getGeminiCliUserAgent(), body: {} },
+					]);
+					expect(registry.find(provider, "gemini-4-argon")).toBeDefined();
+				}
+
+				const provider = "google-antigravity";
+				const accessToken = `${provider}-projectless-access`;
+				const endpoint = registry.getProviderBaseUrl(provider);
+				if (!endpoint) throw new Error("Expected a bundled Antigravity endpoint");
+				const authEvidence = authStorage.getProviderEvidenceGeneration(provider, accessToken);
+				const defaultIdentityProvenance = crypto
+					.createHash("sha256")
+					.update("gajae:model-discovery-provenance\0")
+					.update(JSON.stringify({ authEvidence, endpoint, discoveryIdentity: getGeminiCliUserAgent() }))
+					.digest("hex");
+				writeModelCache(
+					provider,
+					Date.now(),
+					getBundledModels(provider),
+					true,
+					"",
+					cacheDbPath,
+					[],
+					defaultIdentityProvenance,
+				);
+
+				const overrideUserAgent = "antigravity-test-cache-identity";
+				const restoreOverride = setEnvForTest("PI_AI_ANTIGRAVITY_USER_AGENT", overrideUserAgent);
+				try {
+					currentProvider = provider;
+					const requestStart = requests.length;
+					await registry.refreshProvider(provider, "online-if-uncached");
+					expect(requests.slice(requestStart)).toEqual([{ provider, userAgent: overrideUserAgent, body: {} }]);
+				} finally {
+					restoreOverride();
+				}
 			} finally {
 				await registry?.dispose();
 				restoreUserAgent();

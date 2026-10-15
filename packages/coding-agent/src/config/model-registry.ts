@@ -45,6 +45,7 @@ import {
 } from "@gajae-code/ai/core";
 import { fetchModelsDevPayload } from "@gajae-code/ai/provider-models/openai-compat";
 import { isDirectXaiReasoningEffortModel } from "@gajae-code/ai/providers/openai-completions-compat";
+import { getAntigravityDiscoveryUserAgent } from "@gajae-code/ai/utils/discovery/antigravity";
 import {
 	detectDiscoveredApiFamily,
 	isSafeCatalogModelId,
@@ -1298,8 +1299,6 @@ function fingerprintConfiguredDiscoveryRequestShape(
 	return crypto.createHash("sha256").update("gajae:model-discovery-provenance\0").update(context).digest("hex");
 }
 
-const ANTIGRAVITY_DISCOVERY_CACHE_IDENTITY = "gemini-cli-user-agent-v1";
-
 function fingerprintDescriptorDiscoveryProvenance(
 	providerId: string,
 	authEvidence: string,
@@ -1312,7 +1311,10 @@ function fingerprintDescriptorDiscoveryProvenance(
 	} catch {
 		return undefined;
 	}
-	const discoveryIdentity = providerId === "google-antigravity" ? ANTIGRAVITY_DISCOVERY_CACHE_IDENTITY : undefined;
+	const discoveryIdentity =
+		providerId === "google-antigravity" || providerId === "google-gemini-cli"
+			? getAntigravityDiscoveryUserAgent()
+			: undefined;
 	return crypto
 		.createHash("sha256")
 		.update("gajae:model-discovery-provenance\0")
