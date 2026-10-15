@@ -333,6 +333,16 @@ describe("recordFatalCrash", () => {
 		).toBe("Authorization: «redacted»\nnext=keep");
 	});
 
+	it("preserves fields after escaped authorization values in serialized JSON", () => {
+		const serialized = String.raw`{\"authorization\":\"Bearer abc\",\"note\":\"keep\"}`;
+		const redacted = redactCrashSecrets(serialized);
+
+		expect(redacted).not.toContain("Bearer abc");
+		expect(redacted.startsWith(String.raw`{\"authorization\":`)).toBe(true);
+		expect(redacted).toContain("«redacted»");
+		expect(redacted.endsWith(String.raw`,\"note\":\"keep\"}`)).toBe(true);
+	});
+
 	it("preserves diagnostics after escaped newlines in authorization headers", () => {
 		const escapedLf = redactCrashSecrets(String.raw`Authorization: ApiKey opaque-secret\nnext=keep`);
 		expect(escapedLf.startsWith("Authorization: «redacted»")).toBe(true);
