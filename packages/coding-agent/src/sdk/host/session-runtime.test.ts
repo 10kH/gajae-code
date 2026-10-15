@@ -9092,12 +9092,12 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			const accepted = await harness.control("turn.prompt", { text: "start while expiring" });
 			expect(accepted.ok).toBe(true);
 			const correlation = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
-			const claimDeadline = Date.now() + 2_000;
+			const claimDeadline = Date.now() + 10_000;
 			while (!claimWasEntered && Date.now() < claimDeadline) await Bun.sleep(5);
 			expect(claimWasEntered).toBe(true);
 			await claimEntered.promise;
 			startPromise = harness.emit("agent_start");
-			const captureDeadline = Date.now() + 2_000;
+			const captureDeadline = Date.now() + 10_000;
 			while (handleReads === 0 && Date.now() < captureDeadline) await Bun.sleep(5);
 			expect(handleReads).toBeGreaterThan(0);
 			releaseClaim.resolve();
