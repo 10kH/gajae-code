@@ -74,6 +74,43 @@ async function writeSkillFileNoFollow(destination: string, content: string): Pro
 	}
 }
 
+async function ensureInstructionDirectory(directory: string, project: boolean): Promise<void> {
+	if (!project) {
+		await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+		return;
+	}
+
+	let stat: Awaited<ReturnType<typeof fs.lstat>>;
+	try {
+		stat = await fs.lstat(directory);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		try {
+			await fs.mkdir(directory, { mode: 0o700 });
+		} catch (mkdirError) {
+			if ((mkdirError as NodeJS.ErrnoException).code !== "EEXIST") throw mkdirError;
+		}
+		stat = await fs.lstat(directory);
+	}
+	if (!stat.isDirectory() || stat.isSymbolicLink()) {
+		throw new Error(`instruction destination directory is not a real directory: ${directory}`);
+	}
+}
+
+async function writeInstructionFileNoFollow(destination: string, content: string, project: boolean): Promise<void> {
+	await ensureInstructionDirectory(path.dirname(destination), project);
+	const handle = await fs.open(
+		destination,
+		fsSync.constants.O_WRONLY | fsSync.constants.O_CREAT | fsSync.constants.O_TRUNC | fsSync.constants.O_NOFOLLOW,
+		0o666,
+	);
+	try {
+		await handle.writeFile(content, "utf-8");
+	} finally {
+		await handle.close();
+	}
+}
+
 export async function executeActions(
 	actions: MigrateAction[],
 	options?: { project?: boolean },
@@ -103,6 +140,13 @@ export async function executeActions(
 				out.push(action);
 			} else if (action.type === "skill" && action.skill && action.destination) {
 				await writeSkillFileNoFollow(action.destination, action.skill.content);
+				out.push(action);
+			} else if (action.type === "instruction" && action.instruction && action.destination) {
+				await writeInstructionFileNoFollow(
+					action.destination,
+					action.instruction.content,
+					options?.project ?? false,
+				);
 				out.push(action);
 			} else {
 				out.push(action);
