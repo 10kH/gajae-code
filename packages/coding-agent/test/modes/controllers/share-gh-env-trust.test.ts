@@ -32,6 +32,9 @@ const TRUST_KEYS = [
 	"PYTHONSTARTUP",
 	"RUBYOPT",
 	"RUBYLIB",
+	"PERL5OPT",
+	"PERL5LIB",
+	"PERLLIB",
 	"PATH",
 	"HTTP_PROXY",
 	"HTTPS_PROXY",
@@ -72,6 +75,9 @@ interface GhSpawn {
 	PYTHONSTARTUP: string | null;
 	RUBYOPT: string | null;
 	RUBYLIB: string | null;
+	PERL5OPT: string | null;
+	PERL5LIB: string | null;
+	PERLLIB: string | null;
 	GH_HOST: string | null;
 	GH_CONFIG_DIR: string | null;
 	GH_TOKEN: string | null;
@@ -145,6 +151,9 @@ await fsPromises.appendFile(
 		PYTHONSTARTUP: process.env.PYTHONSTARTUP ?? null,
 		RUBYOPT: process.env.RUBYOPT ?? null,
 		RUBYLIB: process.env.RUBYLIB ?? null,
+		PERL5OPT: process.env.PERL5OPT ?? null,
+		PERL5LIB: process.env.PERL5LIB ?? null,
+		PERLLIB: process.env.PERLLIB ?? null,
 		GH_HOST: process.env.GH_HOST ?? null,
 		GH_CONFIG_DIR: process.env.GH_CONFIG_DIR ?? null,
 		GH_TOKEN: process.env.GH_TOKEN ?? null,
@@ -324,6 +333,9 @@ function expectDestination(
 			| "PYTHONSTARTUP"
 			| "RUBYOPT"
 			| "RUBYLIB"
+			| "PERL5OPT"
+			| "PERL5LIB"
+			| "PERLLIB"
 			| "HTTP_PROXY"
 			| "HTTPS_PROXY"
 			| "ALL_PROXY"
@@ -379,6 +391,9 @@ function expectDestination(
 		expect(spawn.PYTHONSTARTUP).toBe(expected.PYTHONSTARTUP ?? null);
 		expect(spawn.RUBYOPT).toBe(expected.RUBYOPT ?? null);
 		expect(spawn.RUBYLIB).toBe(expected.RUBYLIB ?? null);
+		expect(spawn.PERL5OPT).toBe(expected.PERL5OPT ?? null);
+		expect(spawn.PERL5LIB).toBe(expected.PERL5LIB ?? null);
+		expect(spawn.PERLLIB).toBe(expected.PERLLIB ?? null);
 		expect(spawn.HTTP_PROXY).toBe(expected.HTTP_PROXY ?? null);
 		expect(spawn.HTTPS_PROXY).toBe(expected.HTTPS_PROXY ?? null);
 		expect(spawn.ALL_PROXY).toBe(expected.ALL_PROXY ?? null);
@@ -457,6 +472,9 @@ PYTHONUSERBASE=/project/python-user-base
 PYTHONSTARTUP=/project/python-startup.py
 RUBYOPT=-r/project/ruby-startup.rb
 RUBYLIB=/project/ruby-libraries
+PERL5OPT=-MProject::Startup
+PERL5LIB=/project/perl5-libraries
+PERLLIB=/project/perl-libraries
 `,
 		});
 		expectDestination(spawns, {
@@ -471,10 +489,13 @@ RUBYLIB=/project/ruby-libraries
 			PYTHONSTARTUP: null,
 			RUBYOPT: null,
 			RUBYLIB: null,
+			PERL5OPT: null,
+			PERL5LIB: null,
+			PERLLIB: null,
 		});
 	});
 
-	it("preserves operator-declared Node, Python, and Ruby runtime settings", async () => {
+	it("preserves operator-declared interpreter runtime settings", async () => {
 		const spawns = await share({
 			env: {
 				NODE_OPTIONS: "--no-warnings",
@@ -485,6 +506,9 @@ RUBYLIB=/project/ruby-libraries
 				PYTHONSTARTUP: "/operator/python-startup.py",
 				RUBYOPT: "-r/operator/ruby-startup.rb",
 				RUBYLIB: "/operator/ruby-libraries",
+				PERL5OPT: "-MOperator::Startup",
+				PERL5LIB: "/operator/perl5-libraries",
+				PERLLIB: "/operator/perl-libraries",
 			},
 		});
 		expectDestination(spawns, {
@@ -496,6 +520,9 @@ RUBYLIB=/project/ruby-libraries
 			PYTHONSTARTUP: "/operator/python-startup.py",
 			RUBYOPT: "-r/operator/ruby-startup.rb",
 			RUBYLIB: "/operator/ruby-libraries",
+			PERL5OPT: "-MOperator::Startup",
+			PERL5LIB: "/operator/perl5-libraries",
+			PERLLIB: "/operator/perl-libraries",
 		});
 	});
 
