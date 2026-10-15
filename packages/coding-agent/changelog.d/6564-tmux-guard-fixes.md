@@ -13,6 +13,7 @@
 - Propagate `env -C` working directories into nested shell and here-document payloads; preserve pipeline identity across subshell grouping.
 - Inspect only the final repeated `tmux -c` command and stop command discovery after invalid shell-builtin wrapper options or GNU `env --null`/`-0` modes.
 - Pass the effective environment, including `env -u` changes, to named-target resolution.
+- Resolve wrapper working directories from the effective Bash environment and apply tmux's `/tmp` fallback when `TMUX_TMPDIR` is empty.
 - Inspect assignment-prefixed `eval` strings and shell scripts in their effective working directory, while respecting non-executing wrapper and Bash modes.
 - Respect unambiguous GNU wrapper-option abbreviations and bundled options inside `env -S` payloads.
 - Treat `sudo -e`/`--edit` as file editing rather than command execution when checking wrapper arguments.
