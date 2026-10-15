@@ -89,6 +89,8 @@ const TRUST_KEYS = [
 	"all_proxy",
 	"no_proxy",
 	"OPENSSL_CONF",
+	"OPENSSL_CONF_INCLUDE",
+	"OPENSSL_MODULES",
 	"SSL_CERT_FILE",
 	"SSL_CERT_DIR",
 	"LD_PRELOAD",
@@ -144,6 +146,8 @@ interface GhSpawn {
 	PHP_INI_SCAN_DIR: string | null;
 	DOTNET_STARTUP_HOOKS: string | null;
 	OPENSSL_CONF: string | null;
+	OPENSSL_CONF_INCLUDE: string | null;
+	OPENSSL_MODULES: string | null;
 	profilerEnvironment: Record<ClrProfilerEnvironmentKey, string | null>;
 	GH_HOST: string | null;
 	GH_CONFIG_DIR: string | null;
@@ -247,6 +251,8 @@ await fsPromises.appendFile(
 		PHP_INI_SCAN_DIR: process.env.PHP_INI_SCAN_DIR ?? null,
 		DOTNET_STARTUP_HOOKS: process.env.DOTNET_STARTUP_HOOKS ?? null,
 		OPENSSL_CONF: process.env.OPENSSL_CONF ?? null,
+		OPENSSL_CONF_INCLUDE: process.env.OPENSSL_CONF_INCLUDE ?? null,
+		OPENSSL_MODULES: process.env.OPENSSL_MODULES ?? null,
 		profilerEnvironment: Object.fromEntries(
 			${JSON.stringify(CLR_PROFILER_ENV_KEYS)}.map(name => [name, process.env[name] ?? null]),
 		),
@@ -455,6 +461,8 @@ function expectDestination(
 			| "PHP_INI_SCAN_DIR"
 			| "DOTNET_STARTUP_HOOKS"
 			| "OPENSSL_CONF"
+			| "OPENSSL_CONF_INCLUDE"
+			| "OPENSSL_MODULES"
 			| "HTTP_PROXY"
 			| "HTTPS_PROXY"
 			| "ALL_PROXY"
@@ -543,6 +551,8 @@ function expectDestination(
 		expect(spawn.PHP_INI_SCAN_DIR).toBe(expected.PHP_INI_SCAN_DIR ?? null);
 		expect(spawn.DOTNET_STARTUP_HOOKS).toBe(expected.DOTNET_STARTUP_HOOKS ?? null);
 		expect(spawn.OPENSSL_CONF).toBe(expected.OPENSSL_CONF ?? null);
+		expect(spawn.OPENSSL_CONF_INCLUDE).toBe(expected.OPENSSL_CONF_INCLUDE ?? null);
+		expect(spawn.OPENSSL_MODULES).toBe(expected.OPENSSL_MODULES ?? null);
 		for (const name of CLR_PROFILER_ENV_KEYS)
 			expect(spawn.profilerEnvironment[name]).toBe(expected.profilerEnvironment?.[name] ?? null);
 		expect(spawn.HTTP_PROXY).toBe(expected.HTTP_PROXY ?? null);
@@ -663,6 +673,8 @@ DOTNET_PROFILER_PATH_64=/project/dotnet-profiler-64.so
 DOTNET_PROFILER_PATH_ARM32=/project/dotnet-profiler-arm32.so
 DOTNET_PROFILER_PATH_ARM64=/project/dotnet-profiler-arm64.so
 OPENSSL_CONF=/project/openssl.cnf
+OPENSSL_CONF_INCLUDE=/project/openssl-conf-include
+OPENSSL_MODULES=/project/openssl-modules
 `,
 		});
 		expectDestination(spawns, {
@@ -698,10 +710,12 @@ OPENSSL_CONF=/project/openssl.cnf
 			PHP_INI_SCAN_DIR: null,
 			DOTNET_STARTUP_HOOKS: null,
 			OPENSSL_CONF: null,
+			OPENSSL_CONF_INCLUDE: null,
+			OPENSSL_MODULES: null,
 		});
 	});
 
-	it("preserves operator-declared interpreter runtime settings", async () => {
+	it("preserves operator-declared runtime settings", async () => {
 		const luaInitVersionedEnvironment = { LUA_INIT_5_4: "@/operator/lua-init-5.4.lua" };
 		const profilerEnvironment = Object.fromEntries(
 			CLR_PROFILER_ENV_KEYS.map(name => [name, `operator-${name.toLowerCase()}`]),
@@ -738,6 +752,8 @@ OPENSSL_CONF=/project/openssl.cnf
 				PHP_INI_SCAN_DIR: "/operator/php-conf.d",
 				DOTNET_STARTUP_HOOKS: "/operator/dotnet-startup.dll",
 				OPENSSL_CONF: "/operator/openssl.cnf",
+				OPENSSL_CONF_INCLUDE: "/operator/openssl-conf-include",
+				OPENSSL_MODULES: "/operator/openssl-modules",
 				...profilerEnvironment,
 			},
 		});
@@ -772,6 +788,8 @@ OPENSSL_CONF=/project/openssl.cnf
 			PHP_INI_SCAN_DIR: "/operator/php-conf.d",
 			DOTNET_STARTUP_HOOKS: "/operator/dotnet-startup.dll",
 			OPENSSL_CONF: "/operator/openssl.cnf",
+			OPENSSL_CONF_INCLUDE: "/operator/openssl-conf-include",
+			OPENSSL_MODULES: "/operator/openssl-modules",
 			profilerEnvironment,
 		});
 	});
