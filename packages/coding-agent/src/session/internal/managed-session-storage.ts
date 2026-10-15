@@ -170,7 +170,11 @@ function exactUnlinkCompleted(result: NativeExactUnlinkResult): boolean {
 }
 
 function isRetryableReplacementReceiptCleanupError(error: unknown): boolean {
-	return error instanceof Error && error.message === "managed_replace_receipt_cleanup_pending:io_error";
+	return (
+		error instanceof Error &&
+		(error.message === "managed_replace_receipt_cleanup_pending:io_error" ||
+			error.message === "managed_replace_receipt_cleanup_pending:access_denied")
+	);
 }
 
 /**
