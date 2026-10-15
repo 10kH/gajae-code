@@ -64,6 +64,7 @@ const TRUST_KEYS = [
 	"ERL_AFLAGS",
 	"ERL_FLAGS",
 	"ERL_ZFLAGS",
+	"BUNDLER_SETUP",
 	"RUBYOPT",
 	"RUBYLIB",
 	"PERL5OPT",
@@ -126,6 +127,7 @@ interface GhSpawn {
 	ERL_AFLAGS: string | null;
 	ERL_FLAGS: string | null;
 	ERL_ZFLAGS: string | null;
+	BUNDLER_SETUP: string | null;
 	RUBYOPT: string | null;
 	RUBYLIB: string | null;
 	PERL5OPT: string | null;
@@ -226,6 +228,7 @@ await fsPromises.appendFile(
 		ERL_AFLAGS: process.env.ERL_AFLAGS ?? null,
 		ERL_FLAGS: process.env.ERL_FLAGS ?? null,
 		ERL_ZFLAGS: process.env.ERL_ZFLAGS ?? null,
+		BUNDLER_SETUP: process.env.BUNDLER_SETUP ?? null,
 		RUBYOPT: process.env.RUBYOPT ?? null,
 		RUBYLIB: process.env.RUBYLIB ?? null,
 		PERL5OPT: process.env.PERL5OPT ?? null,
@@ -431,6 +434,7 @@ function expectDestination(
 			| "ERL_AFLAGS"
 			| "ERL_FLAGS"
 			| "ERL_ZFLAGS"
+			| "BUNDLER_SETUP"
 			| "RUBYOPT"
 			| "RUBYLIB"
 			| "PERL5OPT"
@@ -516,6 +520,7 @@ function expectDestination(
 		expect(spawn.ERL_AFLAGS).toBe(expected.ERL_AFLAGS ?? null);
 		expect(spawn.ERL_FLAGS).toBe(expected.ERL_FLAGS ?? null);
 		expect(spawn.ERL_ZFLAGS).toBe(expected.ERL_ZFLAGS ?? null);
+		expect(spawn.BUNDLER_SETUP).toBe(expected.BUNDLER_SETUP ?? null);
 		expect(spawn.RUBYOPT).toBe(expected.RUBYOPT ?? null);
 		expect(spawn.RUBYLIB).toBe(expected.RUBYLIB ?? null);
 		expect(spawn.PERL5OPT).toBe(expected.PERL5OPT ?? null);
@@ -619,6 +624,7 @@ R_PROFILE_USER=/project/user.Rprofile
 ERL_AFLAGS=-eval project-startup-a
 ERL_FLAGS=-eval project-startup-b
 ERL_ZFLAGS=-eval project-startup-c
+BUNDLER_SETUP=/project/bundler-setup.rb
 RUBYOPT=-r/project/ruby-startup.rb
 RUBYLIB=/project/ruby-libraries
 PERL5OPT=-MProject::Startup
@@ -665,6 +671,7 @@ DOTNET_PROFILER_PATH_ARM64=/project/dotnet-profiler-arm64.so
 			ERL_AFLAGS: null,
 			ERL_FLAGS: null,
 			ERL_ZFLAGS: null,
+			BUNDLER_SETUP: null,
 			RUBYOPT: null,
 			RUBYLIB: null,
 			PERL5OPT: null,
@@ -702,6 +709,7 @@ DOTNET_PROFILER_PATH_ARM64=/project/dotnet-profiler-arm64.so
 				ERL_AFLAGS: "-eval operator-startup-a",
 				ERL_FLAGS: "-eval operator-startup-b",
 				ERL_ZFLAGS: "-eval operator-startup-c",
+				BUNDLER_SETUP: "/operator/bundler-setup.rb",
 				RUBYOPT: "-r/operator/ruby-startup.rb",
 				RUBYLIB: "/operator/ruby-libraries",
 				PERL5OPT: "-MOperator::Startup",
@@ -733,6 +741,7 @@ DOTNET_PROFILER_PATH_ARM64=/project/dotnet-profiler-arm64.so
 			ERL_AFLAGS: "-eval operator-startup-a",
 			ERL_FLAGS: "-eval operator-startup-b",
 			ERL_ZFLAGS: "-eval operator-startup-c",
+			BUNDLER_SETUP: "/operator/bundler-setup.rb",
 			RUBYOPT: "-r/operator/ruby-startup.rb",
 			RUBYLIB: "/operator/ruby-libraries",
 			PERL5OPT: "-MOperator::Startup",
