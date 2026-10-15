@@ -1094,7 +1094,6 @@ fn native_windows_error_code(status: i32) -> String {
 #[cfg(test)]
 mod exact_replace_windows_retry_policy_tests {
 	use super::{
-		EXACT_REPLACE_DESTINATION_OPEN_RETRY_DELAY_MS, EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT,
 		EXACT_REPLACE_RETRY_DELAY_MS, EXACT_REPLACE_RETRY_LIMIT, STATUS_ACCESS_DENIED,
 		STATUS_SHARING_VIOLATION, is_retryable_exact_replace_rename_status,
 		is_retryable_exact_replace_status, native_windows_error_code, ntstatus_code,
