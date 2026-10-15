@@ -153,8 +153,10 @@ execution that its directory adapter does not support.
 
 A native MCP server is startup-eligible only when it is not `enabled: false`,
 not listed in either scope's `disabledServers`, and not `autoload: false`.
-Project MCP loading is on by default and is disabled for an environment only by
-an explicit `mcp.enableProjectConfig: false`. `--no-mcp` opts one standalone
+Project HTTP and SSE MCP loading is on by default. A project stdio server
+starts only when the user config sets `mcp.enableProjectConfig` to true; a
+project settings file cannot set that flag, and `false` disables every
+project-scope source. `--no-mcp` opts one standalone
 session out of conventional native autoload; an exact-file `--mcp-config` is a
 separate top-level opt-in that replaces conventional autoload.
 
