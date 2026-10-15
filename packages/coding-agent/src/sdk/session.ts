@@ -3288,6 +3288,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getWorkflowGateEmitter: () => session?.getWorkflowGateEmitter(),
 			getAskAnswerSource: () => session?.getAskAnswerSource(),
 			getGoalRuntime: () => session?.goalRuntime,
+			getSdkPermissionMode: () => session?.sdkPermissionMode ?? "allow",
 			getClientBridge: () => session?.clientBridge,
 			getCompactContext: () => session.formatCompactContext(),
 			getTodoPhases: () => session.getTodoPhases(),
