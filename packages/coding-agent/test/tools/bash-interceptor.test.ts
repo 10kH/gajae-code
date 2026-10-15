@@ -296,6 +296,43 @@ describe("BashTool restricted role-agent allowlist", () => {
 		}
 	});
 
+	it.skipIf(process.platform === "win32")("rejects rg --hostname-bin and still runs a plain rg search", async () => {
+		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-read-only-rg-"));
+		const ranPath = path.join(root, "hostname-ran");
+		const originalWhich = Bun.which;
+		try {
+			await fs.writeFile(path.join(root, "sample.txt"), "hello\n");
+			const stub = path.join(root, "rg");
+			const quote = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`;
+			await fs.writeFile(
+				stub,
+				`#!/bin/sh\nprintf '%s\\n' "$*" > ${quote(path.join(root, "argv"))}\nif [ "$1" = "--hostname-bin" ] || [ "\${1#--hostname-bin=}" != "$1" ]; then\n  : > ${quote(ranPath)}\nfi\nprintf 'rg-ok\\n'\n`,
+			);
+			await fs.chmod(stub, 0o755);
+			// Bun.which reads the process PATH from startup, so point rg at this fixture.
+			Bun.which = ((command: string) => (command === "rg" ? stub : originalWhich(command))) as typeof Bun.which;
+			const tool = createRestrictedBashTool(root, ["rg"], "read-only");
+
+			const result = await tool.execute("tool-call", { command: "rg hello sample.txt" });
+			expect(result.content.find(part => part.type === "text")?.text).toContain("rg-ok");
+			await expect(fs.access(ranPath)).rejects.toThrow();
+
+			for (const command of [
+				"rg --hostname-bin ./pwned hello sample.txt",
+				"rg --hostname-bin=./pwned hello sample.txt",
+				'rg "--hostname-bin" ./pwned hello sample.txt',
+			]) {
+				await expect(tool.execute("tool-call", { command })).rejects.toThrow(
+					"read-only bash does not allow ripgrep hostname commands",
+				);
+			}
+			await expect(fs.access(ranPath)).rejects.toThrow();
+		} finally {
+			Bun.which = originalWhich;
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
 	it("runs read-only bash without PTY, configured prefixes, shell snapshots, or retained sessions", async () => {
 		if (process.platform === "win32") return;
 		const bashPath = Bun.env.SHELL?.includes("bash") ? Bun.env.SHELL : "/bin/bash";
