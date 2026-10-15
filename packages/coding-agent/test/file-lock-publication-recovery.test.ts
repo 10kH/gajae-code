@@ -54,6 +54,7 @@ afterEach(async () => {
 	FileLockTestHooks.processIncarnation = undefined;
 	FileLockTestHooks.nativeQuarantineBindings = undefined;
 	FileLockTestHooks.cleanupPendingStaging = undefined;
+	FileLockTestHooks.afterStagingInfoWrite = undefined;
 	for (const { directory, forgetGrant } of tempDirs.splice(0)) {
 		try {
 			await fs.rm(directory, { recursive: true, force: true });
@@ -77,6 +78,17 @@ async function makeFixture(parent = os.tmpdir()): Promise<Fixture> {
 	tempDirs.push({ directory: root, forgetGrant });
 	const file = path.join(root, "state.json");
 	return { root, file, lock: `${file}.lock` };
+}
+
+function exactRemoveStagingSnapshotForTest(
+	target: string,
+	expected: NativeDirectoryTreeSnapshot,
+): NativeExactUnlinkResult {
+	const current = snapshotDirectoryTree(target);
+	if (!current.ok || !current.snapshot || JSON.stringify(current.snapshot) !== JSON.stringify(expected))
+		return { ok: false, code: "identity_mismatch" };
+	syncFs.rmSync(target, { recursive: true, force: true });
+	return { ok: true };
 }
 
 async function deadPid(): Promise<number> {
@@ -948,7 +960,7 @@ test("blocks future acquisition when staging root identity cannot be captured", 
 	await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
 });
 
-test("does not recapture Windows staging cleanup authority after a snapshot failure", async () => {
+test("revalidates expected Windows staging contents after a snapshot failure", async () => {
 	const { root, file, lock } = await makeFixture();
 	const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
 	if (!originalPlatform?.configurable) throw new Error("process_platform_not_configurable");
@@ -957,10 +969,10 @@ test("does not recapture Windows staging cleanup authority after a snapshot fail
 	FileLockTestHooks.nativeQuarantineBindings = () => ({
 		snapshotDirectoryTree: stagingPath => {
 			snapshotAttempts++;
-			if (snapshotAttempts === 1) return { ok: false, code: "io_error" };
+			if (snapshotAttempts <= 2) return { ok: false, code: "io_error" };
 			return snapshotDirectoryTree(stagingPath);
 		},
-		exactRemoveDirectoryTree,
+		exactRemoveDirectoryTree: exactRemoveStagingSnapshotForTest,
 	});
 	FileLockTestHooks.nativePublicationBindings = () => ({
 		renameNoReplacePathAsync: async (source, destination) => {
@@ -987,13 +999,13 @@ test("does not recapture Windows staging cleanup authority after a snapshot fail
 			lockPath: lock,
 			code: "identity_unavailable",
 		});
-		expect(snapshotAttempts).toBe(1);
+		expect(snapshotAttempts).toBe(3);
 		expect(publicationAttempts).toBe(0);
 		expect(await Bun.file(path.join(pendingPath, "foreign")).text()).toBe("preserve unproven staged content");
 
-		await fs.rm(pendingPath, { recursive: true, force: true });
+		await fs.rm(path.join(pendingPath, "foreign"));
 		release = await acquireFileLock(file, { retries: 2, retryDelayMs: 1 });
-		expect(snapshotAttempts).toBe(2);
+		expect(snapshotAttempts).toBe(5);
 		expect(publicationAttempts).toBe(1);
 		expect((await fs.readdir(root)).filter(name => name.includes(".pending."))).toHaveLength(0);
 	} finally {
@@ -1002,6 +1014,50 @@ test("does not recapture Windows staging cleanup authority after a snapshot fail
 	}
 	if (!release) throw new Error("Expected acquisition to succeed after the unproven stage was removed");
 	await release();
+	expect(await fs.readdir(root)).toEqual([]);
+});
+
+test("cleans a Windows staging setup failure using the created info identity", async () => {
+	const { root, file, lock } = await makeFixture();
+	const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+	if (!originalPlatform?.configurable) throw new Error("process_platform_not_configurable");
+	let setupAttempts = 0;
+	let snapshotAttempts = 0;
+	FileLockTestHooks.nativeQuarantineBindings = () => ({
+		snapshotDirectoryTree: stagingPath => {
+			snapshotAttempts++;
+			return snapshotDirectoryTree(stagingPath);
+		},
+		exactRemoveDirectoryTree: exactRemoveStagingSnapshotForTest,
+	});
+	FileLockTestHooks.nativePublicationBindings = () => ({
+		renameNoReplacePathAsync: async (source, destination) => {
+			await fs.rename(source, destination);
+			return successfulPublication("windows_rename_noreplace");
+		},
+		renameDirectoryNoReplacePathAsync,
+	});
+	FileLockTestHooks.afterStagingInfoWrite = async () => {
+		setupAttempts++;
+		if (setupAttempts === 1) throw Object.assign(new Error("transient staging setup denial"), { code: "EACCES" });
+	};
+
+	try {
+		Object.defineProperty(process, "platform", { ...originalPlatform, value: "win32" });
+		await expect(acquireFileLock(file, { retries: 1, retryDelayMs: 1 })).rejects.toMatchObject({
+			message: "transient staging setup denial",
+			code: "EACCES",
+		});
+		expect((await fs.readdir(root)).filter(name => name.includes(".pending."))).toHaveLength(0);
+		const release = await acquireFileLock(file, { retries: 1, retryDelayMs: 1 });
+		expect(setupAttempts).toBe(2);
+		expect(snapshotAttempts).toBe(2);
+		await release();
+		await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
+	} finally {
+		Object.defineProperty(process, "platform", originalPlatform);
+		FileLockTestHooks.nativeQuarantineBindings = undefined;
+	}
 	expect(await fs.readdir(root)).toEqual([]);
 });
 

@@ -136,10 +136,12 @@ const DEFAULT_OPTIONS: Required<
 	retryDelayMs: 100,
 };
 
+type FileLockStagingFileIdentity = { dev: string; ino: string };
 type FileLockStagingRootIdentity = {
 	rootDev: string;
 	rootIno: string;
 	treeSnapshot?: NativeDirectoryTreeSnapshot;
+	infoFileIdentity?: FileLockStagingFileIdentity;
 };
 type PendingFileLockStagingCleanup = {
 	lockPath: string;
@@ -189,6 +191,7 @@ type LockInfo = FileLockOwnerToken;
 
 export const FileLockTestHooks: {
 	afterParentMkdir?: (lockPath: string) => void | Promise<void>;
+	afterStagingInfoWrite?: (stagingPath: string) => void | Promise<void>;
 	beforeRemovalOwnerPublish?: (transitionPath: string) => void | Promise<void>;
 	cleanupPendingStaging?: (stagingPath: string) => Promise<void>;
 	stagingRootIdentity?: (stagingPath: string) => FileLockStagingRootIdentity | Promise<FileLockStagingRootIdentity>;
@@ -290,6 +293,45 @@ function bindFileLockStagingTreeSnapshot(
 			code: "identity_mismatch",
 		});
 	return { ...identity, treeSnapshot: snapshot };
+}
+
+function matchesExpectedFileLockStagingTree(
+	snapshot: NativeDirectoryTreeSnapshot,
+	identity: FileLockStagingRootIdentity,
+): boolean {
+	const root = snapshot.entries.find(entry => entry.relativePath === "");
+	if (
+		snapshot.rootDev !== identity.rootDev ||
+		snapshot.rootIno !== identity.rootIno ||
+		root?.kind !== "directory" ||
+		root.dev !== identity.rootDev ||
+		root.ino !== identity.rootIno
+	)
+		return false;
+	if (snapshot.entries.length === 1) return true;
+	if (snapshot.entries.length !== 2 || !identity.infoFileIdentity) return false;
+	const info = snapshot.entries.find(entry => entry.relativePath === "info");
+	return (
+		info?.kind === "file" &&
+		info.dev === identity.infoFileIdentity.dev &&
+		info.ino === identity.infoFileIdentity.ino &&
+		info.nlink === "1"
+	);
+}
+
+async function captureFileLockStagingCleanupIdentity(
+	stagingPath: string,
+	identity: FileLockStagingRootIdentity,
+	retryBudget: FileLockAcquisitionRetryBudget,
+): Promise<FileLockStagingRootIdentity> {
+	const snapshot = await captureFileLockStagingTreeSnapshot(stagingPath, retryBudget);
+	// A replay can authorize only the empty root or that root plus this attempt's exact info inode.
+	if (!matchesExpectedFileLockStagingTree(snapshot, identity))
+		throw Object.assign(
+			new Error("Staged file-lock contents changed before cleanup authority was captured; refusing removal."),
+			{ code: "identity_unavailable" },
+		);
+	return bindFileLockStagingTreeSnapshot(stagingPath, identity, snapshot);
 }
 
 async function hasPendingStagingRootIdentity(
@@ -428,25 +470,21 @@ async function retryPendingStagingCleanups(
 			});
 			throw new FileLockStagingCleanupError(lockPath, stagingPath, error);
 		}
-		if (process.platform === "win32" && !pending.identity.treeSnapshot) {
+		let identity = pending.identity;
+		if (process.platform === "win32" && !identity.treeSnapshot) {
 			try {
-				if (!(await hasPendingStagingRootIdentity(stagingPath, pending.identity))) {
+				if (!(await hasPendingStagingRootIdentity(stagingPath, identity))) {
 					pendingStagingCleanups.delete(stagingPath);
 					continue;
 				}
+				identity = await captureFileLockStagingCleanupIdentity(stagingPath, identity, retryBudget);
+				pendingStagingCleanups.set(stagingPath, { ...pending, identity });
 			} catch (error) {
 				if (retryBudget.signal?.aborted) throw retryBudget.signal.reason ?? error;
 				throw new FileLockStagingCleanupError(lockPath, stagingPath, error);
 			}
-			const error = Object.assign(
-				new Error(
-					"The original staging-tree snapshot was not captured; refusing to establish cleanup authority later.",
-				),
-				{ code: "identity_unavailable" },
-			);
-			throw new FileLockStagingCleanupError(lockPath, stagingPath, error);
 		}
-		await cleanupPendingStagingOrThrow(lockPath, stagingPath, pending.identity, retryBudget);
+		await cleanupPendingStagingOrThrow(lockPath, stagingPath, identity, retryBudget);
 	}
 }
 
@@ -603,13 +641,29 @@ function lockInfo(ownerHostId: string | undefined, ownerToken: string): LockInfo
 	};
 }
 
-function writeLockInfo(lockPath: string, info: LockInfo): Promise<LockInfo> {
+async function writeLockInfo(
+	lockPath: string,
+	info: LockInfo,
+	onFileCreated: (identity: FileLockStagingFileIdentity) => void,
+): Promise<LockInfo> {
 	// Owner metadata must stay readable by its own process under a restrictive
 	// umask: release re-reads this record to authorize removal, and an info file
 	// born mode 000 under umask 0777 would wedge the lock at first release.
-	return Bun.write(`${lockPath}/info`, JSON.stringify(info), { mode: 0o600 })
-		.then(() => fs.chmod(`${lockPath}/info`, 0o600))
-		.then(() => info);
+	// Keep the created file's identity through setup so an early cleanup can reject
+	// a same-name replacement instead of treating a later tree snapshot as authority.
+	const handle = await fs.open(`${lockPath}/info`, "wx", 0o600);
+	try {
+		const stats = await handle.stat({ bigint: true });
+		onFileCreated({
+			dev: canonicalLockDeviceId(stats.dev).toString(),
+			ino: canonicalLockFileId(stats.ino).toString(),
+		});
+		await handle.writeFile(JSON.stringify(info));
+		await handle.chmod(0o600);
+		return info;
+	} finally {
+		await handle.close();
+	}
 }
 
 type LockInfoFileState = {
@@ -2438,7 +2492,11 @@ async function tryAcquireLock(
 			throw new FileLockStagingCleanupError(lockPath, pendingPath, error);
 		}
 		await fs.chmod(pendingPath, 0o700);
-		await writeLockInfo(pendingPath, owner);
+		await writeLockInfo(pendingPath, owner, infoFileIdentity => {
+			if (!pendingStagingIdentity) throw new Error("Staged file-lock root identity is unavailable.");
+			pendingStagingIdentity = { ...pendingStagingIdentity, infoFileIdentity };
+		});
+		await FileLockTestHooks.afterStagingInfoWrite?.(pendingPath);
 		// A plain POSIX rename replaces an existing empty directory. The legacy
 		// directory lock is a real holder, so publication must use the native
 		// no-replace primitive rather than treating an empty destination as free.
@@ -2655,6 +2713,12 @@ async function tryAcquireLock(
 	} finally {
 		if (removePending && pendingStagingIdentity) {
 			try {
+				if (process.platform === "win32" && !pendingStagingIdentity.treeSnapshot)
+					pendingStagingIdentity = await captureFileLockStagingCleanupIdentity(
+						pendingPath,
+						pendingStagingIdentity,
+						retryBudget,
+					);
 				await removePendingStaging(pendingPath, pendingStagingIdentity);
 				pendingStagingCleanups.delete(pendingPath);
 			} catch (cleanupError) {
