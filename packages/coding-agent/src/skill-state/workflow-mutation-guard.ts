@@ -1874,13 +1874,13 @@ function readPathConstructor(code: string, argAt: number): { parts: string[]; af
 /** pathlib keeps the last absolute segment. A non-literal segment is an unresolved receiver. */
 function literalPathReceiver(parts: string[]): string | null {
 	if (parts.length === 0) return ".";
-	const literals: string[] = [];
+	let joined = "";
 	for (const part of parts) {
 		const literal = simpleLiteral(part);
 		if (literal === null) return null;
-		literals.push(literal);
+		if (path.isAbsolute(literal)) joined = literal;
+		else joined = joined ? path.join(joined, literal) : literal;
 	}
-	const joined = path.posix.join(...literals);
 	return joined.length === 0 ? "." : joined;
 }
 

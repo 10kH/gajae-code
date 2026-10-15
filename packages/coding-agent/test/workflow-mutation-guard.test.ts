@@ -2061,6 +2061,21 @@ describe("bash scanner quoting model", () => {
 		expect(dynamic.reason).toBe("unknown-target");
 	});
 
+	it("resets a Path receiver at a later absolute component before the scratch check", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		const productPath = path.join(cwd, "src", "product.ts");
+		const decision = await getWorkflowMutationDecision({
+			cwd,
+			sessionId: "session-a",
+			tool: tool("python"),
+			args: { code: `Path("/tmp", ${JSON.stringify(productPath)}).write_text("x")\n` },
+		});
+		expect(decision.blocked).toBe(true);
+		expect(decision.reason).toBe("phase-boundary");
+		expect(decision.targets).toContain(productPath);
+	});
+
 	it("allows a multi-part temp Path write and a non-writing Path read", async () => {
 		const cwd = await makeTempRoot();
 		await writeActiveSkill(cwd, "ralplan", "planner");
