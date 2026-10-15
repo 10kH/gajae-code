@@ -323,6 +323,18 @@ describe("recordFatalCrash", () => {
 		).toBe("passphrase=«redacted» sshPassphrase=«redacted» key_passphrase=«redacted» SSH_PASSPHRASE=«redacted»");
 	});
 
+	it("redacts credential keys with multiple camelCase prefix segments", () => {
+		const keys = ["gitHubAccessToken", "azureDevOpsToken", "myDatabasePassword", "GoogleCloudSecretKey"];
+		for (const key of keys) expect(isCredentialKey(key)).toBe(true);
+		expect(
+			redactCrashSecrets(
+				"gitHubAccessToken=opaque-github-value azureDevOpsToken=opaque-azure-value myDatabasePassword=opaque-database-value GoogleCloudSecretKey=opaque-cloud-value",
+			),
+		).toBe(
+			"gitHubAccessToken=«redacted» azureDevOpsToken=«redacted» myDatabasePassword=«redacted» GoogleCloudSecretKey=«redacted»",
+		);
+	});
+
 	it("redacts compound camelCase token and client-secret suffixes", () => {
 		for (const key of [
 			"githubAccessToken",
