@@ -615,6 +615,8 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-concurrent-"));
 		try {
 			const fake = new FakeSlack();
+			const postGate = Promise.withResolvers<void>();
+			fake.postGate = postGate.promise;
 			const options = {
 				agentDir,
 				repo: agentDir,
@@ -624,10 +626,22 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				randomId: () => "root-client-id",
 				resolveAttachment: async (sessionId: string) => endpoint(sessionId),
 			};
-			const [first, second] = await Promise.all([
+			const pending = Promise.all([
 				new SlackNotificationDaemon(options).postRoot("session", "root"),
 				new SlackNotificationDaemon(options).postRoot("session", "root"),
-			]);
+			]).then(
+				roots => ({ fulfilled: true as const, roots }),
+				error => ({ fulfilled: false as const, error }),
+			);
+			try {
+				await fake.waitForPostStartCount(1);
+				await Bun.sleep(1_100);
+			} finally {
+				postGate.resolve();
+			}
+			const outcome = await pending;
+			if (!outcome.fulfilled) throw outcome.error;
+			const [first, second] = outcome.roots;
 			expect(first.rootTs).toBe(second.rootTs);
 			expect(fake.posts).toEqual([expect.objectContaining({ clientMsgId: "root-client-id", text: "root" })]);
 		} finally {

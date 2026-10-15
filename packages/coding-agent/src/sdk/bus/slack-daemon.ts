@@ -58,6 +58,7 @@ function slackPublicationClientMsgId(publicationId: string): string {
 
 // Durable filesystem publication leases must outlast one event-loop and persistence turn.
 const MIN_PUBLICATION_LEASE_MS = 100;
+const ROOT_PUBLICATION_WAIT_MS = 5_000;
 const INBOUND_REACTION_DEADLINE_MS = 5_000;
 const RETIREMENT_DRAIN_MS = 5_000;
 const INBOUND_REACTION = "eyes";
@@ -3270,7 +3271,8 @@ export class SlackNotificationDaemon {
 		body: string,
 		endpointGeneration: number,
 	): Promise<SlackConversation> {
-		for (let attempt = 0; attempt < 100; attempt++) {
+		const deadline = performance.now() + ROOT_PUBLICATION_WAIT_MS;
+		while (performance.now() < deadline) {
 			await Bun.sleep(10);
 			const current = await this.store.read(key);
 			if (current?.state === "active") {
