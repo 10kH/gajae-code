@@ -242,7 +242,11 @@ function optionWords(words: readonly string[]): string[] {
 }
 
 function isLongOption(word: string, option: string): boolean {
-	return word === option || word.startsWith(`${option}=`);
+	if (!word.startsWith("--")) return false;
+	const equalsAt = word.indexOf("=");
+	const name = equalsAt === -1 ? word : word.slice(0, equalsAt);
+	// GNU getopt treats a prefix as that option (`--outp` is `--output`, `--comp` is `--compile`).
+	return name.length > 2 && option.startsWith(name);
 }
 
 function hasShortOption(word: string, option: string): boolean {
@@ -281,6 +285,14 @@ function validateReadOnlyCommand(words: readonly string[]): BashAllowedPrefixesC
 		for (const option of options) {
 			if (isLongOption(option, "--output") || hasShortOption(option, "o")) {
 				return { allowed: false, reason: "read-only bash does not allow tree output-file writes" };
+			}
+		}
+	}
+
+	if (command === "file") {
+		for (const option of options) {
+			if (isLongOption(option, "--compile") || hasShortOption(option, "C")) {
+				return { allowed: false, reason: "read-only bash does not allow file magic compilation" };
 			}
 		}
 	}
