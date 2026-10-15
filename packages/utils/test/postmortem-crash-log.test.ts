@@ -540,6 +540,15 @@ describe("recordFatalCrash", () => {
 		expect(contents).toContain("note=keep-this");
 	});
 
+	it("redacts backslash-escaped backtick credential values", () => {
+		const input = "password=\\`correct horse battery staple\\` note=keep";
+		expect(redactCrashSecrets(input)).toBe("password=\\`«redacted»\\` note=keep");
+		expect(redactCrashSecrets("dbPassword=\\`secondary secret\\` note=keep")).toBe(
+			"dbPassword=\\`«redacted»\\` note=keep",
+		);
+		expect(redactCrashSecrets("password=\\`hunter2secret")).toBe("password=\\`«redacted»");
+	});
+
 	it("redacts escaped quoted credentials in serialized crash text", async () => {
 		const target = tempCrashLog();
 		const message = String.raw`diagnostic safe=keep-this password=\"correct horse battery\" payload={\"password\":\"correct horse battery\"} note=keep-this`;

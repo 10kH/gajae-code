@@ -47,9 +47,28 @@ const CREDENTIAL_AUTHORIZATION_VALUE_PATTERN = new RegExp(
 	"gi",
 );
 const CREDENTIAL_VALUE_PATTERN_BODY = String.raw`(?:(\\+")((?:\\[\s\S]|[^"\\])*?)(\\+")${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(")((?:\\[\s\S]|[^"\\])*)(")|(\\+')((?:\\[\s\S]|[^'\\])*?)(\\+')${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(')((?:\\[\s\S]|[^'\\])*)(')|(\x60)((?:\\[\s\S]|[^\x60\\])*)(\x60)${CREDENTIAL_VALUE_QUOTED_BOUNDARY}|(\\+")([^\r\n]*)(?=\r?\n|$)|(")([^\r\n]*)(?=\r?\n|$)|(\\+')([^\r\n]*)(?=\r?\n|$)|(')([^\r\n]*)(?=\r?\n|$)|(\x60)([^\r\n]*)(?=\r?\n|$)|(${CREDENTIAL_UNQUOTED_VALUE_PATTERN_BODY}))`;
-const CREDENTIAL_VALUE_PATTERN = new RegExp(`${CREDENTIAL_ASSIGNMENT_PREFIX}${CREDENTIAL_VALUE_PATTERN_BODY}`, "gi");
+const CREDENTIAL_VALUE_PATTERN = new RegExp(
+	String.raw`${CREDENTIAL_ASSIGNMENT_PREFIX}(?!\\+\x60)${CREDENTIAL_VALUE_PATTERN_BODY}`,
+	"gi",
+);
 const CREDENTIAL_CAMEL_VALUE_PATTERN = new RegExp(
-	`${CREDENTIAL_CAMEL_ASSIGNMENT_PREFIX}${CREDENTIAL_VALUE_PATTERN_BODY}`,
+	String.raw`${CREDENTIAL_CAMEL_ASSIGNMENT_PREFIX}(?!\\+\x60)${CREDENTIAL_VALUE_PATTERN_BODY}`,
+	"g",
+);
+const CREDENTIAL_ESCAPED_BACKTICK_VALUE_PATTERN = new RegExp(
+	String.raw`${CREDENTIAL_ASSIGNMENT_PREFIX}(\\+\x60)((?:\\[\s\S]|[^\x60\\])*?)(\\+\x60)${CREDENTIAL_VALUE_QUOTED_BOUNDARY}`,
+	"gi",
+);
+const CREDENTIAL_CAMEL_ESCAPED_BACKTICK_VALUE_PATTERN = new RegExp(
+	String.raw`${CREDENTIAL_CAMEL_ASSIGNMENT_PREFIX}(\\+\x60)((?:\\[\s\S]|[^\x60\\])*?)(\\+\x60)${CREDENTIAL_VALUE_QUOTED_BOUNDARY}`,
+	"g",
+);
+const CREDENTIAL_ESCAPED_BACKTICK_UNCLOSED_PATTERN = new RegExp(
+	String.raw`${CREDENTIAL_ASSIGNMENT_PREFIX}(\\+\x60)((?:(?!\\+\x60)[^\r\n])*)(?=\r?\n|$)`,
+	"gi",
+);
+const CREDENTIAL_CAMEL_ESCAPED_BACKTICK_UNCLOSED_PATTERN = new RegExp(
+	String.raw`${CREDENTIAL_CAMEL_ASSIGNMENT_PREFIX}(\\+\x60)((?:(?!\\+\x60)[^\r\n])*)(?=\r?\n|$)`,
 	"g",
 );
 const COOKIE_VALUE_PATTERN =
@@ -195,9 +214,27 @@ export function redactCrashSecrets(text: string): string {
 	// complete key once and inspect its suffix; repeated compound-prefix groups
 	// backtrack quadratically on long attacker-controlled identifiers.
 	if (CREDENTIAL_ASSIGNMENT_CANDIDATE_PATTERN.test(redacted)) {
+		redacted = redacted.replace(
+			CREDENTIAL_ESCAPED_BACKTICK_VALUE_PATTERN,
+			(_match: string, prefix: string, open: string, _value: string, close: string) =>
+				`${prefix}${open}«redacted»${close}`,
+		);
+		redacted = redacted.replace(
+			CREDENTIAL_ESCAPED_BACKTICK_UNCLOSED_PATTERN,
+			(_match: string, prefix: string, open: string) => `${prefix}${open}«redacted»`,
+		);
 		redacted = redacted.replace(CREDENTIAL_VALUE_PATTERN, redactCredentialValue);
 	}
 	if (CREDENTIAL_CAMEL_ASSIGNMENT_CANDIDATE_PATTERN.test(redacted)) {
+		redacted = redacted.replace(
+			CREDENTIAL_CAMEL_ESCAPED_BACKTICK_VALUE_PATTERN,
+			(_match: string, prefix: string, open: string, _value: string, close: string) =>
+				`${prefix}${open}«redacted»${close}`,
+		);
+		redacted = redacted.replace(
+			CREDENTIAL_CAMEL_ESCAPED_BACKTICK_UNCLOSED_PATTERN,
+			(_match: string, prefix: string, open: string) => `${prefix}${open}«redacted»`,
+		);
 		redacted = redacted.replace(CREDENTIAL_CAMEL_VALUE_PATTERN, redactCredentialValue);
 	}
 	return redacted;
