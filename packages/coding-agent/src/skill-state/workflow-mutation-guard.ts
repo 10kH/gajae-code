@@ -1680,16 +1680,18 @@ function extractBashTargets(args: unknown, depth = 0): ExtractedTargets {
 		const commandName = match[0]?.match(BASH_MUTATION_COMMAND_NAME_RE)?.[1]?.toLowerCase();
 		const chmodModeIndex =
 			commandName === "chmod" ? parts.findIndex(part => BASH_CHMOD_MODE_RE.test(cleanShellWord(part))) : -1;
-		const targetParts =
+		let targetParts = parts;
+		if (
 			commandName === "cp" ||
 			commandName === "mv" ||
 			commandName === "install" ||
 			commandName === "truncate" ||
 			commandName === "ln"
-				? parts.slice(-1)
-				: commandName === "chmod" && chmodModeIndex >= 0
-					? parts.filter((_part, index) => index !== chmodModeIndex)
-					: parts;
+		) {
+			targetParts = parts.slice(-1);
+		} else if (commandName === "chmod" && chmodModeIndex >= 0) {
+			targetParts = parts.filter((_part, index) => index !== chmodModeIndex);
+		}
 		let extractedTarget = false;
 		for (const part of targetParts) {
 			const cleaned = cleanShellWord(part);
