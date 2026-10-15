@@ -800,9 +800,34 @@ export async function recoverWindowsUpdateJournal(journalPath: string): Promise<
 async function removeExactStagingFile(filePath: string, identity: FileIdentity): Promise<void> {
 	const quarantineName = `.${path.basename(filePath)}.cleanup.${randomUUID()}`;
 	const removed = exactUnlink(filePath, toNativeIdentity(identity, quarantineName));
-	const remaining = await snapshotRegularFile(filePath);
-	if ((!removed.ok && removed.code !== "not_found") || remaining)
-		throw new Error(`activation_retry_staging_cleanup_failed:${removed.code ?? "unverified"}:${filePath}`);
+	let pathStillExists = false;
+	let snapshotFailure: string | undefined;
+	try {
+		pathStillExists = (await snapshotRegularFile(filePath)) !== undefined;
+	} catch (error) {
+		snapshotFailure = error instanceof Error ? error.message : String(error);
+	}
+	const recoveryPaths = [
+		removed.detachedPath ? `detached=${removed.detachedPath}` : undefined,
+		removed.retainedPlaceholderPath ? `placeholder=${removed.retainedPlaceholderPath}` : undefined,
+		removed.retainedUnknownPath ? `unknown=${removed.retainedUnknownPath}` : undefined,
+		removed.retainedSuccessorPath ? `successor=${removed.retainedSuccessorPath}` : undefined,
+	].filter((value): value is string => value !== undefined);
+	if (
+		(!removed.ok && removed.code !== "not_found") ||
+		pathStillExists ||
+		snapshotFailure !== undefined ||
+		recoveryPaths.length > 0
+	) {
+		const reason =
+			removed.code ?? (pathStillExists ? "path_still_exists" : snapshotFailure ? "snapshot_failed" : "unverified");
+		const details = [
+			`path=${filePath}`,
+			...recoveryPaths,
+			...(snapshotFailure !== undefined ? [`snapshot=${snapshotFailure}`] : []),
+		].join("|");
+		throw new Error(`activation_retry_staging_cleanup_failed:${reason}:${details}`);
+	}
 }
 
 async function tryRemoveExactStagingFile(filePath: string, identity: FileIdentity): Promise<string | undefined> {

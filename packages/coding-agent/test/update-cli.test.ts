@@ -1926,11 +1926,12 @@ describe("update-cli binary replacement", () => {
 		}
 	});
 
-	it("does not block activation when redundant-stage cleanup is denied", async () => {
+	it("preserves retained paths without blocking activation when redundant-stage cleanup fails", async () => {
 		const dir = await makeTempDir();
 		const targetPath = path.join(dir, "gjc.exe");
 		const recordedStage = path.join(dir, "gjc.new.recorded.exe");
 		const retryStage = path.join(dir, "gjc.new.retry.exe");
+		const detachedPath = path.join(dir, "gjc.new.retry.exe.cleanup");
 		const backupPath = path.join(dir, "gjc.exe.bak");
 		await writeFixtureFile(targetPath, "old binary");
 		await writeFixtureFile(recordedStage, "new binary");
@@ -1953,7 +1954,16 @@ describe("update-cli binary replacement", () => {
 
 		const exactUnlink = native.exactUnlink;
 		const unlinkSpy = vi.spyOn(native, "exactUnlink").mockImplementation((filePath, identity) => {
-			if (path.resolve(filePath) === retryStage) return { ok: false, code: "sharing_violation" };
+			if (path.resolve(filePath) === retryStage) {
+				fsNode.renameSync(retryStage, detachedPath);
+				fsNode.mkdirSync(retryStage);
+				return {
+					ok: false,
+					code: "cleanup_pending",
+					detachedPath,
+					retainedPlaceholderPath: retryStage,
+				};
+			}
 			return exactUnlink(filePath, identity);
 		});
 		try {
@@ -1967,8 +1977,12 @@ describe("update-cli binary replacement", () => {
 
 			expect(result.ok).toBe(true);
 			expect(result.cleanupWarning).toContain("activation_retry_staging_cleanup_failed");
+			expect(result.cleanupWarning).toContain(`detached=${detachedPath}`);
+			expect(result.cleanupWarning).toContain(`placeholder=${retryStage}`);
+			expect(result.cleanupWarning).toContain("snapshot=target_not_regular");
 			expect(await Bun.file(targetPath).text()).toBe("new binary");
-			expect(await Bun.file(retryStage).exists()).toBe(true);
+			expect(await Bun.file(detachedPath).text()).toBe("new binary");
+			expect(fsNode.statSync(retryStage).isDirectory()).toBe(true);
 		} finally {
 			unlinkSpy.mockRestore();
 		}
