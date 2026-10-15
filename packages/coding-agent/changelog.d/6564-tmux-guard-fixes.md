@@ -21,4 +21,4 @@
 - Resolve statically known environment references in `env -C`, suppress command discovery for non-executing GNU `env` help/version/null modes and sudo modes.
 - Inspect command substitutions in ordinary shell arguments and here-documents, skip literal here-document bodies when matching substitution boundaries, and decode ANSI-C-quoted Bash `-c` payloads.
 - Stop timeout option parsing after its required duration, and recognize terminal help/version modes and unambiguous long-option abbreviations for common wrappers.
-- Document that the guard is best-effort and does not cover arbitrary interpreter one-liners, shell variable indirection, or commands launched by the Python/eval tools.
+- Document the guard's BashTool preflight scope, its direct `AgentSession.executeBash()`/SDK bypass, and its limitations around interpreter one-liners, shell variable indirection, and Python/eval tools.
