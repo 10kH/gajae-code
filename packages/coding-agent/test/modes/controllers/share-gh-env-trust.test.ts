@@ -35,6 +35,10 @@ const TRUST_KEYS = [
 	"PERL5OPT",
 	"PERL5LIB",
 	"PERLLIB",
+	"JAVA_TOOL_OPTIONS",
+	"JDK_JAVA_OPTIONS",
+	"_JAVA_OPTIONS",
+	"CLASSPATH",
 	"PATH",
 	"HTTP_PROXY",
 	"HTTPS_PROXY",
@@ -78,6 +82,10 @@ interface GhSpawn {
 	PERL5OPT: string | null;
 	PERL5LIB: string | null;
 	PERLLIB: string | null;
+	JAVA_TOOL_OPTIONS: string | null;
+	JDK_JAVA_OPTIONS: string | null;
+	_JAVA_OPTIONS: string | null;
+	CLASSPATH: string | null;
 	GH_HOST: string | null;
 	GH_CONFIG_DIR: string | null;
 	GH_TOKEN: string | null;
@@ -154,6 +162,10 @@ await fsPromises.appendFile(
 		PERL5OPT: process.env.PERL5OPT ?? null,
 		PERL5LIB: process.env.PERL5LIB ?? null,
 		PERLLIB: process.env.PERLLIB ?? null,
+		JAVA_TOOL_OPTIONS: process.env.JAVA_TOOL_OPTIONS ?? null,
+		JDK_JAVA_OPTIONS: process.env.JDK_JAVA_OPTIONS ?? null,
+		_JAVA_OPTIONS: process.env._JAVA_OPTIONS ?? null,
+		CLASSPATH: process.env.CLASSPATH ?? null,
 		GH_HOST: process.env.GH_HOST ?? null,
 		GH_CONFIG_DIR: process.env.GH_CONFIG_DIR ?? null,
 		GH_TOKEN: process.env.GH_TOKEN ?? null,
@@ -336,6 +348,10 @@ function expectDestination(
 			| "PERL5OPT"
 			| "PERL5LIB"
 			| "PERLLIB"
+			| "JAVA_TOOL_OPTIONS"
+			| "JDK_JAVA_OPTIONS"
+			| "_JAVA_OPTIONS"
+			| "CLASSPATH"
 			| "HTTP_PROXY"
 			| "HTTPS_PROXY"
 			| "ALL_PROXY"
@@ -394,6 +410,10 @@ function expectDestination(
 		expect(spawn.PERL5OPT).toBe(expected.PERL5OPT ?? null);
 		expect(spawn.PERL5LIB).toBe(expected.PERL5LIB ?? null);
 		expect(spawn.PERLLIB).toBe(expected.PERLLIB ?? null);
+		expect(spawn.JAVA_TOOL_OPTIONS).toBe(expected.JAVA_TOOL_OPTIONS ?? null);
+		expect(spawn.JDK_JAVA_OPTIONS).toBe(expected.JDK_JAVA_OPTIONS ?? null);
+		expect(spawn._JAVA_OPTIONS).toBe(expected._JAVA_OPTIONS ?? null);
+		expect(spawn.CLASSPATH).toBe(expected.CLASSPATH ?? null);
 		expect(spawn.HTTP_PROXY).toBe(expected.HTTP_PROXY ?? null);
 		expect(spawn.HTTPS_PROXY).toBe(expected.HTTPS_PROXY ?? null);
 		expect(spawn.ALL_PROXY).toBe(expected.ALL_PROXY ?? null);
@@ -475,6 +495,10 @@ RUBYLIB=/project/ruby-libraries
 PERL5OPT=-MProject::Startup
 PERL5LIB=/project/perl5-libraries
 PERLLIB=/project/perl-libraries
+JAVA_TOOL_OPTIONS=-javaagent:/project/java-agent.jar
+JDK_JAVA_OPTIONS=-javaagent:/project/jdk-agent.jar
+_JAVA_OPTIONS=-javaagent:/project/legacy-java-agent.jar
+CLASSPATH=/project/classes
 `,
 		});
 		expectDestination(spawns, {
@@ -492,6 +516,10 @@ PERLLIB=/project/perl-libraries
 			PERL5OPT: null,
 			PERL5LIB: null,
 			PERLLIB: null,
+			JAVA_TOOL_OPTIONS: null,
+			JDK_JAVA_OPTIONS: null,
+			_JAVA_OPTIONS: null,
+			CLASSPATH: null,
 		});
 	});
 
@@ -509,6 +537,10 @@ PERLLIB=/project/perl-libraries
 				PERL5OPT: "-MOperator::Startup",
 				PERL5LIB: "/operator/perl5-libraries",
 				PERLLIB: "/operator/perl-libraries",
+				JAVA_TOOL_OPTIONS: "-javaagent:/operator/java-agent.jar",
+				JDK_JAVA_OPTIONS: "-javaagent:/operator/jdk-agent.jar",
+				_JAVA_OPTIONS: "-javaagent:/operator/legacy-java-agent.jar",
+				CLASSPATH: "/operator/classes",
 			},
 		});
 		expectDestination(spawns, {
@@ -523,6 +555,10 @@ PERLLIB=/project/perl-libraries
 			PERL5OPT: "-MOperator::Startup",
 			PERL5LIB: "/operator/perl5-libraries",
 			PERLLIB: "/operator/perl-libraries",
+			JAVA_TOOL_OPTIONS: "-javaagent:/operator/java-agent.jar",
+			JDK_JAVA_OPTIONS: "-javaagent:/operator/jdk-agent.jar",
+			_JAVA_OPTIONS: "-javaagent:/operator/legacy-java-agent.jar",
+			CLASSPATH: "/operator/classes",
 		});
 	});
 
