@@ -319,10 +319,12 @@ describe("recordFatalCrash", () => {
 
 	it("bounds matching work for long non-credential compound keys", () => {
 		const longKey = `${"a-".repeat(10_000)}tokenx`;
-		const input = `${longKey}=public`;
+		const longAcronymKey = `a${"A".repeat(20_000)}x`;
+		const input = `${longKey}=public ${longAcronymKey}=public`;
 		const startedAt = performance.now();
 
 		expect(isCredentialKey(longKey)).toBe(false);
+		expect(isCredentialKey(longAcronymKey)).toBe(false);
 		expect(redactCrashSecrets(input)).toBe(input);
 		expect(performance.now() - startedAt).toBeLessThan(500);
 	});
