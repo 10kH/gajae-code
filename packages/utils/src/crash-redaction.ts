@@ -16,7 +16,7 @@ const CREDENTIAL_CAMEL_COMPOUND_SUFFIXES = "AccessToken|RefreshToken|IdToken|Ses
 const CREDENTIAL_CAMEL_SIMPLE_SUFFIXES =
 	"SecretAccessKey|Authorization|Credentials|Credential|ApiKey|SecretKey|PrivateKey|SessionKey|Password|Passwd|Secrets|Secret|Bearer|Cookie|Token|Auth";
 const CREDENTIAL_CAMEL_PREFIX = "(?:[a-z0-9]+|[A-Z][a-z0-9]*)(?:[A-Z]{2,})?";
-const CREDENTIAL_CAMEL_COMPOUND_PREFIX = "(?:[a-z0-9]{2,}|[A-Z][a-z0-9]*)(?:[A-Z]{2,})?";
+const CREDENTIAL_CAMEL_COMPOUND_PREFIX = "(?:[a-z0-9]{2,}|[A-Z][a-z0-9]+|[A-Z]{2,})(?:[A-Z]{2,})?";
 const CREDENTIAL_CAMEL_KEY_PATTERN = `(?:${CREDENTIAL_CAMEL_COMPOUND_PREFIX}(?:${CREDENTIAL_CAMEL_COMPOUND_SUFFIXES})|${CREDENTIAL_CAMEL_PREFIX}(?:${CREDENTIAL_CAMEL_SIMPLE_SUFFIXES}))`;
 const CREDENTIAL_CAMEL_KEY_SUFFIX = new RegExp(`^${CREDENTIAL_CAMEL_KEY_PATTERN}$`);
 const CREDENTIAL_ASSIGNMENT_PREFIX = String.raw`(?<![A-Za-z0-9_-])((?:\\*["']?-*)(?:${CREDENTIAL_KEY_PATTERN})(?:\\*["']?\s*[=:]\s*))`;

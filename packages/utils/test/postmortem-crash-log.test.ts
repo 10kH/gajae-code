@@ -399,6 +399,7 @@ describe("recordFatalCrash", () => {
 			`ASIA${"C".repeat(15)}`,
 			"SecretAccessKeyId=diagnostic-identifier",
 			"SessionTokenCount=12345678",
+			"ASessionToken=diagnosticvalue",
 			"xSessionToken=diagnosticvalue",
 			"_SecretAccessKey=diagnostic-value",
 		];
