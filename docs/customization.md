@@ -71,12 +71,21 @@ A project import writes beneath `<project>/.gjc/`; a user import writes beneath
 user source does not write into the project unless the destination was selected
 as project. The source is read only during preview/apply and is never mutated.
 
-For non-interactive MCP/skill-only migration, `gjc migrate --from
-claude-code|codex` supports the user destination by default, `--project` for a
-project destination, `--dry-run` for a plan, and `--force` for its explicit
-update behavior. It is not a replacement for the all-surface `/extensions`
-preview. Direct native MCP registration uses `gjc mcp add`; see the linked MCP
-reference.
+For non-interactive migration, `gjc migrate --from claude-code|codex` imports
+MCP servers, skills, and the selected scope's instructions into `AGENTS.md`.
+User scope is the default: Claude Code reads `~/.claude/CLAUDE.md` and Codex
+reads `~/.codex/AGENTS.md`, writing instructions to `~/.gjc/agent/AGENTS.md`.
+With `--project`, Claude Code reads the project-root `CLAUDE.md` and writes it
+to `<project>/.gjc/AGENTS.md`. A project-root Codex `AGENTS.md` is already a
+native GJC instruction source, so it is left in place rather than copied.
+`--dry-run` reports the planned imports and skips without writing; `--force`
+explicitly updates existing destination files. Instruction writes refuse to
+follow symlinked destination directories. Codex prompts are imported as skills.
+Claude Code commands, subagents, extensions, Claude Code/Codex hooks and
+settings (model, permissions, and environment), and optional session history are
+not imported by this command and still need manual migration. This is not a
+replacement for the all-surface `/extensions` preview. Direct native MCP
+registration uses `gjc mcp add`; see the linked MCP reference.
 
 ### Effective runtime precedence
 
@@ -153,8 +162,10 @@ execution that its directory adapter does not support.
 
 A native MCP server is startup-eligible only when it is not `enabled: false`,
 not listed in either scope's `disabledServers`, and not `autoload: false`.
-Project MCP loading is on by default and is disabled for an environment only by
-an explicit `mcp.enableProjectConfig: false`. `--no-mcp` opts one standalone
+Project HTTP and SSE MCP loading is on by default. A project stdio server
+starts only when the user config sets `mcp.enableProjectConfig` to true; a
+project settings file cannot set that flag, and `false` disables every
+project-scope source. `--no-mcp` opts one standalone
 session out of conventional native autoload; an exact-file `--mcp-config` is a
 separate top-level opt-in that replaces conventional autoload.
 

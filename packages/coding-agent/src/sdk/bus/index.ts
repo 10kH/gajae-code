@@ -2659,6 +2659,10 @@ function sdkControlSurface(
 		// the session-wide preflight seam must not be invoked while another
 		// connection's active preflight could be cancelled by it (review P1).
 		noOtherConnectionPreflights?: () => boolean,
+		// True only for an operator terminal abort that the broker control route already
+		// authorized (`TerminalAbortInput.operator`, which a public SDK caller cannot grant):
+		// it addresses the session's active turn, not the requesting connection's own prompt.
+		operatorAuthorized?: boolean,
 	) => Promise<
 		| {
 				ok: true;
@@ -3178,6 +3182,9 @@ function sdkControlSurface(
 				// invoking it (review thread P1).
 				() =>
 					![...pendingPreflightCancellations.values()].some(entry => entry.connectionId !== requesterConnectionId),
+				// Broker-authorized operator authority is the one case where the abort
+				// addresses a turn another connection submitted (see the parameter note).
+				input.operator === true,
 			);
 			// Preflight cancellation happens ONLY for a NEWLY ADMITTED abort,
 			// after the durable admission/replay decision inside
@@ -4279,6 +4286,34 @@ export function boundedCorrelatedAgentEndFrame(frame: Record<string, unknown>): 
 		finalText: `${finalText.slice(0, RESPONSE_CEILING_BYTES / 8)}[truncated]`,
 		finalTextTruncated: true,
 	};
+}
+
+/** Connection-scoped identity of a queued prompt submission an abort may address. */
+export interface TerminalAbortSubmissionScope {
+	connectionId?: string;
+	terminal: boolean;
+}
+
+/**
+ * Whether a terminal abort addresses this prompt submission.
+ *
+ * An ordinary abort is scoped to the requesting connection's own prompt: `connectionId`
+ * identifies the connection that submitted it, and a submission that already reached a
+ * terminal state is never addressed. Broker-authorized operator authority
+ * (`TerminalAbortInput.operator`, granted only through the broker control route) is the
+ * documented exception — "operator authority changes only connection ownership, never
+ * those settlement proofs" — so it addresses the session's submission even when another
+ * connection submitted it. Without that override every operator abort issued over a
+ * second connection (the SDK client case, where each request is its own connection)
+ * reported no_active_turn while the turn was still running.
+ */
+export function terminalAbortAddressesSubmission(input: {
+	connectionId: string | undefined;
+	operatorAuthorized: boolean;
+	submission: TerminalAbortSubmissionScope;
+}): boolean {
+	if (input.submission.terminal) return false;
+	return input.operatorAuthorized || input.submission.connectionId === input.connectionId;
 }
 
 export function createNotificationsExtension(
@@ -6727,7 +6762,14 @@ export function createNotificationsExtension(
 				}
 				return { aborted: true, disposition: "cancelled" as const };
 			},
-			async (connectionId, scope, idempotencyKey, preflightCancel, noOtherConnectionPreflights) => {
+			async (
+				connectionId,
+				scope,
+				idempotencyKey,
+				preflightCancel,
+				noOtherConnectionPreflights,
+				operatorAuthorized = false,
+			) => {
 				// Capture the steering snapshot at ADMISSION (before the durable
 				// marker transaction): client steering admitted while the abort
 				// is in flight classifies as post-snapshot and is preserved at
@@ -7089,9 +7131,9 @@ export function createNotificationsExtension(
 						return "failed";
 					}
 				};
-				let active = [...promptSubmissions.entries()].find(
-					([, submission]) => submission.connectionId === connectionId && !submission.terminal,
-				);
+				const addresses = (submission: TerminalAbortSubmissionScope): boolean =>
+					terminalAbortAddressesSubmission({ connectionId, operatorAuthorized, submission });
+				let active = [...promptSubmissions.entries()].find(([, submission]) => addresses(submission));
 				if (!active) {
 					// DURABLY reserve the key even for a no-active-turn abort: the
 					// generic idempotency cache is in-memory only, so after restart
@@ -7121,9 +7163,7 @@ export function createNotificationsExtension(
 					// and the durable no-effect row would block a same-key retry from
 					// stopping it — fall through to the pre-run / active fencing path
 					// when a submission now exists (review thread P1).
-					active = [...promptSubmissions.entries()].find(
-						([, submission]) => submission.connectionId === connectionId && !submission.terminal,
-					);
+					active = [...promptSubmissions.entries()].find(([, submission]) => addresses(submission));
 					if (!active) {
 						// Close the remaining acceptance race: cancel the requester's
 						// preflights HERE, in the same synchronous region as the
