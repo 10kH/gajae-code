@@ -2266,6 +2266,7 @@ describe("update-cli binary replacement", () => {
 				}
 				return reconcile(filePath, options);
 			});
+		const warnSpy = vi.spyOn(logger, "warn");
 		try {
 			await expect(
 				replaceBinaryFixture({
@@ -2276,8 +2277,13 @@ describe("update-cli binary replacement", () => {
 					verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
 				}),
 			).rejects.toThrow("installation_pending_activation");
+			expect(warnSpy).toHaveBeenCalledWith(
+				"Activation staging path changed during reconciliation; leaving it untouched",
+				{ changedStagingPath: recordedStage, retryCandidatePath: retryStage },
+			);
 		} finally {
 			reconcileSpy.mockRestore();
+			warnSpy.mockRestore();
 		}
 
 		const pending = await readActivationRecord(targetPath);

@@ -1019,6 +1019,10 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 		expectedRecordIdentity: recordIdentity,
 	});
 	if (promoted.reason === "candidate_changed" && redundantStage) {
+		logger.warn("Activation staging path changed during reconciliation; leaving it untouched", {
+			changedStagingPath: record.stagingPath,
+			retryCandidatePath: redundantStage.path,
+		});
 		await repointActivationRecordToRetryCandidate(
 			{
 				...record,
