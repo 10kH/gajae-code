@@ -264,14 +264,24 @@ describe("recordFatalCrash", () => {
 	});
 
 	it("redacts camelCase credential suffixes in labels and values", () => {
-		for (const key of ["authToken", "githubToken", "dbPassword"]) {
+		for (const key of [
+			"authToken",
+			"githubToken",
+			"dbPassword",
+			"openaiApiKey",
+			"stripeSecretKey",
+			"awsSecretAccessKey",
+			"mySecretAccessKey",
+		]) {
 			expect(isCredentialKey(key)).toBe(true);
 		}
 		expect(
 			redactCrashSecrets(
-				'authToken=opaque-auth-token githubToken="opaque-github-token" dbPassword=opaque-db-password',
+				'authToken=opaque-auth-token githubToken="opaque-github-token" dbPassword=opaque-db-password openaiApiKey=opaque-api-key stripeSecretKey=opaque-stripe-secret awsSecretAccessKey=opaque-aws-secret mySecretAccessKey=opaque-my-secret',
 			),
-		).toBe('authToken=«redacted» githubToken="«redacted»" dbPassword=«redacted»');
+		).toBe(
+			'authToken=«redacted» githubToken="«redacted»" dbPassword=«redacted» openaiApiKey=«redacted» stripeSecretKey=«redacted» awsSecretAccessKey=«redacted» mySecretAccessKey=«redacted»',
+		);
 		expect(redactCrashSecrets('{"authToken":"opaque-auth-token"}')).toBe('{"authToken":"«redacted»"}');
 		expect(redactCrashSecrets("authToken={nested:opaque-secret}")).toBe("authToken=«redacted»");
 	});
@@ -354,7 +364,6 @@ describe("recordFatalCrash", () => {
 			`ASIA${"C".repeat(15)}`,
 			"SecretAccessKeyId=diagnostic-identifier",
 			"SessionTokenCount=12345678",
-			"mySecretAccessKey=diagnostic-value",
 			"xSessionToken=diagnosticvalue",
 			"_SecretAccessKey=diagnostic-value",
 		];

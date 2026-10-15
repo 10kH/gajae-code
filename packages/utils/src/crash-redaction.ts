@@ -13,17 +13,17 @@ const CREDENTIAL_KEY_PREFIX = `(?:[A-Za-z0-9][A-Za-z0-9_-]*[_-])?`;
 const CREDENTIAL_KEY_PATTERN = `${CREDENTIAL_KEY_PREFIX}(?:${CREDENTIAL_KEY_LABELS})`;
 const CREDENTIAL_KEY_SUFFIX = new RegExp(`^${CREDENTIAL_KEY_PATTERN}$`, "i");
 const CREDENTIAL_CAMEL_KEY_PATTERN =
-	"[a-z0-9]+(?:Token|Password|Passwd|Auth|Authorization|Bearer|Cookie|Secret|Secrets|Credential|Credentials)";
+	"[a-z0-9]+(?:SecretAccessKey|Authorization|Credentials|Credential|ApiKey|SecretKey|PrivateKey|SessionKey|Password|Passwd|Secrets|Secret|Bearer|Cookie|Token|Auth)";
 const CREDENTIAL_CAMEL_KEY_SUFFIX = new RegExp(`^${CREDENTIAL_CAMEL_KEY_PATTERN}$`);
 const CREDENTIAL_ASSIGNMENT_PREFIX = String.raw`(?<![A-Za-z0-9_-])((?:\\*["']?-*)(?:${CREDENTIAL_KEY_PATTERN})(?:\\*["']?\s*[=:]\s*))`;
 const CREDENTIAL_CAMEL_ASSIGNMENT_PREFIX = String.raw`(?<![A-Za-z0-9_-])((?:\\*["']?-*)(?:${CREDENTIAL_CAMEL_KEY_PATTERN})(?:\\*["']?\s*[=:]\s*))`;
-const AUTHORIZATION_ASSIGNMENT_PREFIX = String.raw`(?<![A-Za-z0-9_-])((?:\\*["']?-*)(?:[A-Za-z0-9][A-Za-z0-9_-]*[_-])?(?:auth|authorization)(?:\\*["']?\s*[=:]\s*))`;
+const AUTHORIZATION_HEADER_PREFIX = String.raw`(?<![A-Za-z0-9_-])((?:\\*["']?-*)(?:[A-Za-z0-9][A-Za-z0-9_-]*[_-])?(?:auth|authorization)(?:\\*["']?\s*:\s*))`;
 const CREDENTIAL_AUTH_VALUE_PATTERN = new RegExp(
 	String.raw`${CREDENTIAL_ASSIGNMENT_PREFIX}(?:Bearer|Basic|Token)\s+(?:\\[ \t]|[^\s"',;}\]])+`,
 	"gi",
 );
 const CREDENTIAL_AUTHORIZATION_VALUE_PATTERN = new RegExp(
-	String.raw`${AUTHORIZATION_ASSIGNMENT_PREFIX}(?!\s*["'«])[^\r\n]+`,
+	String.raw`${AUTHORIZATION_HEADER_PREFIX}(?!\s*["'«])[^\r\n]+`,
 	"gi",
 );
 const CREDENTIAL_VALUE_PATTERN_BODY = String.raw`(?:(\\+")((?:\\[\s\S]|[^"\\])*?)(\\+")(?=$|[\s,;}\]])|(")((?:\\[\s\S]|[^"\\])*)(")|(\\+')((?:\\[\s\S]|[^'\\])*?)(\\+')(?=$|[\s,;}\]])|(')((?:\\[\s\S]|[^'\\])*)(')|(\\+")([^\r\n]*)(?=\r?\n|$)|(")([^\r\n]*)(?=\r?\n|$)|(\\+')([^\r\n]*)(?=\r?\n|$)|(')([^\r\n]*)(?=\r?\n|$)|((?:\\[ \t]|(?!\\+n|\\+r\\+n)[^\s"',;}\]])+))`;
