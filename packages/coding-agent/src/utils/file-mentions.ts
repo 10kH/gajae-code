@@ -80,6 +80,7 @@ type MentionCandidate = {
 	path: string;
 	pathLower: string;
 	normalizedPath: string;
+	segments: string[];
 };
 
 function normalizeMentionQuery(query: string): string {
@@ -117,9 +118,35 @@ async function listMentionCandidates(cwd: string): Promise<MentionCandidate[]> {
 		if (normalizedPath.length === 0) {
 			continue;
 		}
-		candidates.push({ path: entry, pathLower, normalizedPath });
+		const segments = pathLower.split(PATH_SEPARATOR_REGEX).filter(segment => segment.length > 0);
+		candidates.push({ path: entry, pathLower, normalizedPath, segments });
 	}
 	return candidates;
+}
+
+/**
+ * True when `query` can be spelled as prefixes of path segments taken in order
+ * (segments may be skipped), e.g. `httpserap` → `http_server_api_tests`.
+ * Plain subsequence matching would also accept letters scattered mid-word across
+ * any long path, so a stray `@handle` or `@word` would resolve to an unrelated file.
+ */
+function matchesSegmentPrefixes(query: string, segments: string[]): boolean {
+	const failed = new Set<number>();
+	const visit = (segmentIndex: number, queryIndex: number): boolean => {
+		if (queryIndex === query.length) return true;
+		if (segmentIndex === segments.length) return false;
+		const key = segmentIndex * (query.length + 1) + queryIndex;
+		if (failed.has(key)) return false;
+		const segment = segments[segmentIndex]!;
+		for (let taken = 1; taken <= segment.length && queryIndex + taken <= query.length; taken++) {
+			if (segment[taken - 1] !== query[queryIndex + taken - 1]) break;
+			if (visit(segmentIndex + 1, queryIndex + taken)) return true;
+		}
+		if (visit(segmentIndex + 1, queryIndex)) return true;
+		failed.add(key);
+		return false;
+	};
+	return visit(0, 0);
 }
 
 async function resolveMentionPath(
@@ -148,6 +175,7 @@ async function resolveMentionPath(
 	}
 
 	const scored = candidates
+		.filter(candidate => matchesSegmentPrefixes(normalizedQuery, candidate.segments))
 		.map(candidate => ({ candidate, match: fuzzyMatch(normalizedQuery, candidate.normalizedPath) }))
 		.filter(entry => entry.match.matches)
 		.sort((a, b) => {
