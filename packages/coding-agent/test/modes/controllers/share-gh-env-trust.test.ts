@@ -41,6 +41,7 @@ const TRUST_KEYS = [
 	"CLASSPATH",
 	"PHPRC",
 	"PHP_INI_SCAN_DIR",
+	"DOTNET_STARTUP_HOOKS",
 	"PATH",
 	"HTTP_PROXY",
 	"HTTPS_PROXY",
@@ -90,6 +91,7 @@ interface GhSpawn {
 	CLASSPATH: string | null;
 	PHPRC: string | null;
 	PHP_INI_SCAN_DIR: string | null;
+	DOTNET_STARTUP_HOOKS: string | null;
 	GH_HOST: string | null;
 	GH_CONFIG_DIR: string | null;
 	GH_TOKEN: string | null;
@@ -172,6 +174,7 @@ await fsPromises.appendFile(
 		CLASSPATH: process.env.CLASSPATH ?? null,
 		PHPRC: process.env.PHPRC ?? null,
 		PHP_INI_SCAN_DIR: process.env.PHP_INI_SCAN_DIR ?? null,
+		DOTNET_STARTUP_HOOKS: process.env.DOTNET_STARTUP_HOOKS ?? null,
 		GH_HOST: process.env.GH_HOST ?? null,
 		GH_CONFIG_DIR: process.env.GH_CONFIG_DIR ?? null,
 		GH_TOKEN: process.env.GH_TOKEN ?? null,
@@ -360,6 +363,7 @@ function expectDestination(
 			| "CLASSPATH"
 			| "PHPRC"
 			| "PHP_INI_SCAN_DIR"
+			| "DOTNET_STARTUP_HOOKS"
 			| "HTTP_PROXY"
 			| "HTTPS_PROXY"
 			| "ALL_PROXY"
@@ -424,6 +428,7 @@ function expectDestination(
 		expect(spawn.CLASSPATH).toBe(expected.CLASSPATH ?? null);
 		expect(spawn.PHPRC).toBe(expected.PHPRC ?? null);
 		expect(spawn.PHP_INI_SCAN_DIR).toBe(expected.PHP_INI_SCAN_DIR ?? null);
+		expect(spawn.DOTNET_STARTUP_HOOKS).toBe(expected.DOTNET_STARTUP_HOOKS ?? null);
 		expect(spawn.HTTP_PROXY).toBe(expected.HTTP_PROXY ?? null);
 		expect(spawn.HTTPS_PROXY).toBe(expected.HTTPS_PROXY ?? null);
 		expect(spawn.ALL_PROXY).toBe(expected.ALL_PROXY ?? null);
@@ -511,6 +516,7 @@ _JAVA_OPTIONS=-javaagent:/project/legacy-java-agent.jar
 CLASSPATH=/project/classes
 PHPRC=/project/php.ini
 PHP_INI_SCAN_DIR=/project/php-conf.d
+DOTNET_STARTUP_HOOKS=/project/dotnet-startup.dll
 `,
 		});
 		expectDestination(spawns, {
@@ -534,6 +540,7 @@ PHP_INI_SCAN_DIR=/project/php-conf.d
 			CLASSPATH: null,
 			PHPRC: null,
 			PHP_INI_SCAN_DIR: null,
+			DOTNET_STARTUP_HOOKS: null,
 		});
 	});
 
@@ -557,6 +564,7 @@ PHP_INI_SCAN_DIR=/project/php-conf.d
 				CLASSPATH: "/operator/classes",
 				PHPRC: "/operator/php.ini",
 				PHP_INI_SCAN_DIR: "/operator/php-conf.d",
+				DOTNET_STARTUP_HOOKS: "/operator/dotnet-startup.dll",
 			},
 		});
 		expectDestination(spawns, {
@@ -577,6 +585,7 @@ PHP_INI_SCAN_DIR=/project/php-conf.d
 			CLASSPATH: "/operator/classes",
 			PHPRC: "/operator/php.ini",
 			PHP_INI_SCAN_DIR: "/operator/php-conf.d",
+			DOTNET_STARTUP_HOOKS: "/operator/dotnet-startup.dll",
 		});
 	});
 
