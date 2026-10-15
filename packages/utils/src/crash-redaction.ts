@@ -12,8 +12,13 @@ const CREDENTIAL_KEY_LABELS =
 const CREDENTIAL_KEY_PATTERN = `(?:[A-Za-z0-9][A-Za-z0-9_-]*[_-])?(?:${CREDENTIAL_KEY_LABELS})`;
 const CREDENTIAL_KEY_SUFFIX = new RegExp(`^${CREDENTIAL_KEY_PATTERN}$`, "i");
 const CREDENTIAL_ASSIGNMENT_PREFIX = String.raw`(?<![A-Za-z0-9_-])((?:\\*["']?-*)(?:${CREDENTIAL_KEY_PATTERN})(?:\\*["']?\s*[=:]\s*))`;
+const AUTHORIZATION_ASSIGNMENT_PREFIX = String.raw`(?<![A-Za-z0-9_-])((?:\\*["']?-*)(?:[A-Za-z0-9][A-Za-z0-9_-]*[_-])?(?:auth|authorization)(?:\\*["']?\s*[=:]\s*))`;
 const CREDENTIAL_AUTH_VALUE_PATTERN = new RegExp(
 	String.raw`${CREDENTIAL_ASSIGNMENT_PREFIX}(?:Bearer|Basic|Token)\s+(?:\\[ \t]|[^\s"',;}\]])+`,
+	"gi",
+);
+const CREDENTIAL_AUTHORIZATION_VALUE_PATTERN = new RegExp(
+	String.raw`${AUTHORIZATION_ASSIGNMENT_PREFIX}(?!\s*["'«])[^\r\n]+`,
 	"gi",
 );
 const CREDENTIAL_VALUE_PATTERN = new RegExp(
@@ -92,6 +97,10 @@ export function redactCrashSecrets(text: string): string {
 		"$1«redacted»",
 	);
 	redacted = redacted.replace(CREDENTIAL_AUTH_VALUE_PATTERN, (_match, prefix: string) => `${prefix}«redacted»`);
+	redacted = redacted.replace(
+		CREDENTIAL_AUTHORIZATION_VALUE_PATTERN,
+		(_match, prefix: string) => `${prefix}«redacted»`,
+	);
 	// Escaped delimiters support JSON nested in diagnostic strings. Their quoted
 	// branch stops at a closing delimiter followed by a field boundary, while an
 	// unterminated value is redacted through the end of its line. Capture each

@@ -260,6 +260,15 @@ describe("recordFatalCrash", () => {
 		);
 	});
 
+	it("redacts complete values for nonstandard authorization schemes", () => {
+		expect(redactCrashSecrets("Authorization: ApiKey opaque-secret\nnext=keep")).toBe(
+			"Authorization: «redacted»\nnext=keep",
+		);
+		expect(
+			redactCrashSecrets('Authorization: Digest username="Mufasa", realm="test", nonce="opaque"\nnext=keep'),
+		).toBe("Authorization: «redacted»\nnext=keep");
+	});
+
 	it("redacts backslash-escaped whitespace in unquoted credential values", () => {
 		const input = String.raw`password=correct\ horse\ battery diagnostic=keep`;
 		expect(redactCrashSecrets(input)).toBe("password=«redacted» diagnostic=keep");
