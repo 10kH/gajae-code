@@ -244,6 +244,30 @@ describe("AgentSession handoff", () => {
 		}
 	});
 
+	it("notifies after a committed branch even when transition cleanup rejects", async () => {
+		const previousSessionId = session.sessionId;
+		const userEntry = sessionManager
+			.getEntries()
+			.find(entry => entry.type === "message" && entry.message.role === "user");
+		if (!userEntry) throw new Error("Expected a user entry to branch from");
+		const observedSessionIds: string[] = [];
+		const unsubscribe = session.subscribeSessionIdentityChanges(() => {
+			observedSessionIds.push(session.sessionId);
+		});
+		const unregisterCleanup = session.registerToolSessionTransitionCleanup(() => {
+			throw new Error("branch cleanup boom");
+		});
+
+		try {
+			await expect(session.branch(userEntry.id)).rejects.toThrow("Tool session transition cleanup failed");
+			expect(session.sessionId).not.toBe(previousSessionId);
+			expect(observedSessionIds).toEqual([session.sessionId]);
+		} finally {
+			unregisterCleanup();
+			unsubscribe();
+		}
+	});
+
 	it("refreshes identity projections after command setup changes cwd, including setup failure", async () => {
 		await session.dispose();
 		sessionManager = SessionManager.create(tempDir.path(), tempDir.path());

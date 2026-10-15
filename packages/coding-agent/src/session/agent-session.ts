@@ -14926,7 +14926,6 @@ export class AgentSession {
 			},
 			branch: async entryId => {
 				const result = await this.branch(entryId);
-				if (!result.cancelled) await this.notifySessionIdentityChanged();
 				return { cancelled: result.cancelled };
 			},
 			navigateTree: async (targetId, options) => {
@@ -28285,6 +28284,7 @@ export class AgentSession {
 		selectedText: string;
 		cancelled: boolean;
 	}> {
+		const previousSessionId = this.sessionId;
 		this.#beginSessionTransition("branch");
 		try {
 			const selectedEntry = this.sessionManager.getEntryForFidelity(entryId);
@@ -28394,6 +28394,7 @@ export class AgentSession {
 		} finally {
 			this.#reconnectToAgent();
 			this.#endSessionTransition();
+			if (this.sessionId !== previousSessionId) await this.notifySessionIdentityChanged();
 		}
 	}
 
