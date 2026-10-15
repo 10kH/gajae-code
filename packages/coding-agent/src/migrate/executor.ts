@@ -131,6 +131,7 @@ async function writeCommandFileNoFollow(
 	content: string,
 	name: string,
 	project: boolean,
+	createOnly: boolean,
 ): Promise<void> {
 	const destinationDirectory = path.dirname(destination);
 	if (project) {
@@ -159,7 +160,11 @@ async function writeCommandFileNoFollow(
 
 	const handle = await fs.open(
 		destination,
-		fsSync.constants.O_WRONLY | fsSync.constants.O_CREAT | fsSync.constants.O_TRUNC | fsSync.constants.O_NOFOLLOW,
+		fsSync.constants.O_WRONLY |
+			fsSync.constants.O_CREAT |
+			fsSync.constants.O_TRUNC |
+			fsSync.constants.O_NOFOLLOW |
+			(createOnly ? fsSync.constants.O_EXCL : 0),
 		0o666,
 	);
 	try {
@@ -212,12 +217,26 @@ export async function executeActions(
 					action.command.content,
 					action.name,
 					options?.project ?? false,
+					action.operation === "create",
 				);
 				out.push(action);
 			} else {
 				out.push(action);
 			}
 		} catch (error) {
+			if (
+				action.type === "command" &&
+				action.operation === "create" &&
+				(error as NodeJS.ErrnoException).code === "EEXIST"
+			) {
+				out.push({
+					...action,
+					operation: "skip",
+					status: "skipped_exists",
+					reason: "destination appeared after planning; refusing to overwrite it",
+				});
+				continue;
+			}
 			out.push({
 				...action,
 				operation: "fail",

@@ -456,6 +456,28 @@ describe("executeActions — slash command destination safety", () => {
 			await fs.rm(outside, { recursive: true, force: true });
 		}
 	});
+
+	test("does not truncate a command destination created after planning", async () => {
+		const planned = await planMigration({
+			results: [result({ slashCommandCandidates: [slashCommand("review", "Imported command.")] })],
+			destinations: dest,
+			force: false,
+		});
+		const action = planned.actions[0];
+		expect(action).toMatchObject({ operation: "create", status: "imported" });
+		if (!action?.destination) throw new Error("expected command destination");
+
+		await fs.mkdir(path.dirname(action.destination), { recursive: true });
+		await fs.writeFile(action.destination, "Created after the plan.", "utf-8");
+		const [executed] = await executeActions(planned.actions, { project: true });
+
+		expect(executed).toMatchObject({
+			operation: "skip",
+			status: "skipped_exists",
+			reason: "destination appeared after planning; refusing to overwrite it",
+		});
+		expect(await fs.readFile(action.destination, "utf-8")).toBe("Created after the plan.");
+	});
 });
 
 describe("executeActions — skill destination safety", () => {
