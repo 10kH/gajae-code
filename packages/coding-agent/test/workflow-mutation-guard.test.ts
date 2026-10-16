@@ -2160,7 +2160,8 @@ describe("bash scanner quoting model", () => {
 				name: "ANSI-C quoted Python write source",
 				command: `python3 -c $'open("src/product.ts","w").write("PWNED")'`,
 				blocked: true,
-				reason: "unknown-target",
+				reason: "phase-boundary",
+				target: "src/product.ts",
 			},
 			{
 				name: "Python exec-wrapped write source",
@@ -2344,8 +2345,59 @@ describe("bash scanner quoting model", () => {
 				reason: "unknown-target",
 			},
 			{
-				name: "Python compile source containing a write",
+				name: "Python compile-only source remains inert",
 				command: `python3 -c 'compile(${JSON.stringify('open("src/product.ts","w").write("x")')}, "<string>", "exec")'`,
+				blocked: false,
+			},
+			{
+				name: "Python pathlib Path.write_text",
+				command: `python3 -c 'from pathlib import Path; Path("src/product.ts").write_text("PWNED")'`,
+				blocked: true,
+				reason: "phase-boundary",
+				target: "src/product.ts",
+			},
+			{
+				name: "Python built-in open for writing",
+				command: `python3 -c 'open("src/product.ts", "w").write("PWNED")'`,
+				blocked: true,
+				reason: "phase-boundary",
+				target: "src/product.ts",
+			},
+			{
+				name: "Python pathlib Path.write_bytes",
+				command: `python3 -c 'from pathlib import Path; Path("src/product.ts").write_bytes(b"PWNED")'`,
+				blocked: true,
+				reason: "phase-boundary",
+				target: "src/product.ts",
+			},
+			{
+				name: "Python pathlib.Path.open for writing",
+				command: `python3 -c 'import pathlib; pathlib.Path("src/product.ts").open("w")'`,
+				blocked: true,
+				reason: "phase-boundary",
+				target: "src/product.ts",
+			},
+			{
+				name: "Node process.stdout.write rebound to a file writer",
+				command: `node -e 'process.stdout.write=process.getBuiltinModule("fs")["writeFileSync"],process.stdout.write("src/product.ts","PWNED")'`,
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
+				name: "Node console method rebound to a file writer",
+				command: `node -e 'console.log=process.getBuiltinModule("fs").writeFileSync;console.log("src/product.ts","PWNED")'`,
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
+				name: "Node computed console method rebound to a file writer",
+				command: `node -e 'const method="log";global.console[method]=process.getBuiltinModule("fs").writeFileSync;global.console[method]("src/product.ts","PWNED")'`,
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
+				name: "Python stdout method rebound to a file writer",
+				command: `python3 -c 'import sys; sys.stdout.write=open("src/product.ts","w").write; sys.stdout.write("PWNED")'`,
 				blocked: true,
 				reason: "unknown-target",
 			},
@@ -2446,6 +2498,8 @@ describe("bash scanner quoting model", () => {
 			`python3 -c 'import importlib; importlib.import_module("project_plugin")'`,
 			`python3 -c 'import runpy; runpy.run_path("src/payload.py")'`,
 			`python3 -c 'spec.loader.exec_module(module)'`,
+			`python3 -c 'import pathlib; pathlib.Path("src/product.ts").open(mode=mode)'`,
+			`python3 -c 'open("src/product.ts", mode=mode).write("PWNED")'`,
 			`node -e"require('fs').appendFileSync('src/product.ts','x')"`,
 			`perl -e'open(F,">","src/product.ts"); print F "PWNED";'`,
 			`ruby -e'File.open("src/product.ts","w").write("PWNED")'`,
@@ -2519,6 +2573,8 @@ describe("bash scanner quoting model", () => {
 			`awk -v x=1 'BEGIN { print x }' input`,
 			`if awk '$1 > "m" { print }' input; then :; fi`,
 			`python3 -c "import os; os.system('ls')"`,
+			`python3 -c "import pathlib; pathlib.Path('src/product.ts').open('r').read()"`,
+			`python3 -c 'from pathlib import Path; Path("/tmp/ralplan-note.md").write_text("x")'`,
 			`python3 -c $'print("open(")'`,
 			`python3 -c "print('writeFileSync(')"`,
 			`python3 -c "print('shutil.copy(')"`,
@@ -2527,6 +2583,8 @@ describe("bash scanner quoting model", () => {
 			`node -e "console.log('appendFileSync(')"`,
 			`node -e "/* appendFileSync('src/product.ts','x') */ console.log(1)"`,
 			`node -e "console.log(1)"`,
+			`node -e 'process.stdout.write("status")'`,
+			`node -e "console.log('process.stdout.write = fs.writeFileSync')"`,
 			`perl -e 'print 1'`,
 			`ruby -e'puts "open("'`,
 			"ls src/product.ts",
@@ -2582,6 +2640,7 @@ describe("bash scanner quoting model", () => {
 		await writeActiveSkill(cwd, "ralplan", "planner");
 		for (const code of [
 			'Path("/tmp", "ralplan-note.md").write_text("x")\n',
+			'Path("src", "product.ts").open("r").read()\n',
 			'Path("src", "product.ts").read_text()\n',
 			'open("src/product.ts", "r").read()\n',
 			'open("src/product.ts", mode="r").read()\n',
@@ -2606,35 +2665,68 @@ describe("bash scanner quoting model", () => {
 		for (let sample = 0; sample < 12; sample++) {
 			const target = `src/generated-${seededToken(random, 8)}.ts`;
 			const content = seededToken(random, 10);
-			const source = `open(${JSON.stringify(target)}, "w").write(${JSON.stringify(content)})`;
-			const firstSplit = 1 + Math.floor(random() * (source.length - 2));
-			const secondSplit = firstSplit + 1 + Math.floor(random() * (source.length - firstSplit - 1));
-			const operands = [
-				quoteBashSingle(source),
-				quoteBashDouble(source),
-				quoteBashAnsiC(source),
-				quoteBashConcatenation(source, firstSplit, secondSplit),
+			const destination = JSON.stringify(target);
+			const data = JSON.stringify(content);
+			const scripts = [
+				{
+					interpreter: "python3 -c",
+					source: `open(${destination}, "w").write(${data})`,
+					target,
+				},
+				{
+					interpreter: "python3 -c",
+					source: `Path(${destination}).write_text(${data})`,
+					target,
+				},
+				{
+					interpreter: "python3 -c",
+					source: `pathlib.Path(${destination}).write_bytes(b${data})`,
+					target,
+				},
+				{
+					interpreter: "node -e",
+					source: `process.stdout.write = process.getBuiltinModule("fs").writeFileSync; process.stdout.write(${destination}, ${data})`,
+					expectedReason: "unknown-target",
+				},
+				{
+					interpreter: "node -e",
+					source: `console.log = process.getBuiltinModule("fs").writeFileSync; console.log(${destination}, ${data})`,
+					expectedReason: "unknown-target",
+				},
 			];
-			let expectedVerdict: { blocked: boolean; reason: string | undefined; targets: string[] } | undefined;
 
-			for (const operand of operands) {
-				const command = `python3 -c ${operand}`;
-				const decision = await getWorkflowMutationDecision({
-					cwd,
-					sessionId: "session-a",
-					guardContext,
-					tool: tool("bash"),
-					args: { command },
-				});
-				const verdict = {
-					blocked: decision.blocked,
-					reason: decision.reason,
-					targets: decision.targets,
-				};
-				expect(decision.blocked, command).toBe(true);
-				expect(decision.reason, command).toBe("unknown-target");
-				if (expectedVerdict) expect(verdict, command).toEqual(expectedVerdict);
-				else expectedVerdict = verdict;
+			for (const { interpreter, source, expectedReason, target: expectedTarget } of scripts) {
+				const firstSplit = 1 + Math.floor(random() * (source.length - 2));
+				const secondSplit = firstSplit + 1 + Math.floor(random() * (source.length - firstSplit - 1));
+				const operands = [
+					quoteBashSingle(source),
+					quoteBashDouble(source),
+					quoteBashAnsiC(source),
+					quoteBashConcatenation(source, firstSplit, secondSplit),
+				];
+				let expectedVerdict: { blocked: boolean } | undefined;
+
+				for (const operand of operands) {
+					const command = `${interpreter} ${operand}`;
+					const decision = await getWorkflowMutationDecision({
+						cwd,
+						sessionId: "session-a",
+						guardContext,
+						tool: tool("bash"),
+						args: { command },
+					});
+					const verdict = { blocked: decision.blocked };
+					expect(decision.blocked, command).toBe(true);
+					if (expectedReason) expect(decision.reason, command).toBe(expectedReason);
+					if (expectedTarget) {
+						if (decision.reason === "phase-boundary") expect(decision.targets, command).toContain(expectedTarget);
+						else expect(decision.reason, command).toBe("unknown-target");
+					} else {
+						expect(decision.reason, command).toBe("unknown-target");
+					}
+					if (expectedVerdict) expect(verdict, command).toEqual(expectedVerdict);
+					else expectedVerdict = verdict;
+				}
 			}
 		}
 	});

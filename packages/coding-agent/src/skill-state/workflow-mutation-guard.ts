@@ -110,22 +110,24 @@ const BASH_IN_PLACE_MUTATION_COMMAND_RE = new RegExp(
  */
 const BASH_INTERPRETER_WRITE_API =
 	"(?:open\\s*\\(|writeFile(?:Sync)?\\s*\\(|appendFile(?:Sync)?\\s*\\(|file_put_contents\\s*\\(|fwrite\\s*\\(|fputs\\s*\\(|unlink\\s*\\(|rename\\s*\\(|mkdir\\s*\\(|rmdir\\s*\\(|copy\\s*\\(|symlink\\s*\\(|link\\s*\\(|move_uploaded_file\\s*\\(|truncate\\s*\\(|touch\\s*\\(|\\.write\\s*\\(|shutil\\s*\\.\\s*(?:copy2?|copyfileobj|copyfile)\\s*\\(|os\\s*\\.\\s*symlink\\s*\\()";
+const INTERPRETER_OUTPUT_METHOD_ASSIGNMENT_RE =
+	/^\b(?:(?:process|Bun|Deno|sys)\s*\.\s*(?:stdout|stderr)|(?:(?:globalThis|global)\s*\.\s*)?console)(?:\s*(?:\.\s*[\w$]+|\[\s*[^\]]+\s*\]))?\s*(?:\|\|=|&&=|\?\?=|[+\-*/%&|^]?=(?!=|>))/;
 /**
  * Inline interpreter source is opaque whenever it exposes code evaluation or
  * reflective loading. This deliberately scans the complete source spelling,
  * including quoted spans, because another language may evaluate those spans.
  */
 const INTERPRETER_DYNAMIC_EXECUTION_RE =
-	/\b(?:eval|exec|execfile|compile|Function|instance_eval|instance_exec|class_eval|class_exec|module_eval|module_exec|send|public_send|__send__|method_missing|__import__|exec_module|import_module|run_path|run_module|loadstring|dofile|loadfile|load|source|include|include_once|require_once|create_function|call_user_func(?:_array)?|setTimeout|setInterval|runInThisContext|runInNewContext|runInContext|getattr|setattr|__getattr__|__getattribute__|ReflectionClass|ReflectionFunction|ReflectionMethod|invokeMethod|invokeArgs)\b/;
+	/\b(?:eval|exec|execfile|Function|instance_eval|instance_exec|class_eval|class_exec|module_eval|module_exec|send|public_send|__send__|method_missing|__import__|exec_module|import_module|run_path|run_module|loadstring|dofile|loadfile|load|source|include|include_once|require_once|create_function|call_user_func(?:_array)?|setTimeout|setInterval|runInThisContext|runInNewContext|runInContext|getattr|setattr|__getattr__|__getattribute__|ReflectionClass|ReflectionFunction|ReflectionMethod|invokeMethod|invokeArgs)\b/;
 const INTERPRETER_FILESYSTEM_REQUIRE_RE =
 	/\b(?:require|import|from)\s*(?:\(\s*)?(['"\x60])(?:node:)?(?:fs(?:\/promises)?|fs-extra|graceful-fs|child_process|fileutils|io|lfs)\1(?:\s*\))?/i;
 const INTERPRETER_NONLITERAL_REQUIRE_RE = /\brequire\s*(?:\(\s*(?!['"\x60])|\s+(?!['"\x60]))/i;
 const SHELL_DOT_SOURCE_RE = /(?:^|[;&|\n])\s*(?:(?:if|then|do)\s+)?\.\s+(?:["'$`]|[A-Za-z0-9_./~])/;
-/** Source evaluation and dynamic imports make Python payloads opaque to this static scanner. */
+/** Executable Python source evaluation and dynamic imports make payloads opaque; compile() alone is inert. */
 const PYTHON_DYNAMIC_EXECUTION_IDENTIFIER_RE =
-	/^(?:exec|eval|execfile|__import__|exec_module|import_module|run_path|run_module)\b/;
+	/^(?:exec|eval|execfile|__import__|exec_module|import_module|run_path|run_module|getattr|setattr|__getattr__|__getattribute__)\b/;
 const PYTHON_DYNAMIC_EXECUTION_TOKEN_RE =
-	/\b(?:exec|eval|execfile|__import__|exec_module|import_module|run_path|run_module)\b/;
+	/\b(?:exec|eval|execfile|__import__|exec_module|import_module|run_path|run_module|getattr|setattr|__getattr__|__getattribute__)\b/;
 /** JavaScript eval and Function construct executable code from runtime strings. */
 const JAVASCRIPT_DYNAMIC_EXECUTION_IDENTIFIER_RE = /^(?:eval|Function)\b/;
 const JAVASCRIPT_DYNAMIC_EXECUTION_TOKEN_RE = /\b(?:eval|Function)\b/;
@@ -2059,12 +2061,16 @@ function collectInterpreterOneLinerWrites(command: string, targets: ExtractedTar
 					: /^(?:ruby|jruby)$/.test(binary)
 						? "ruby"
 						: "perl";
+			if (/^(?:python|pypy)/.test(binary)) {
+				scanInterpreterWrites(script, "py", targets);
+				collectPythonSystemWrites(script, targets, depth);
+				continue;
+			}
 			if (interpreterCodeContainsWriteApi(script, language, api)) {
 				targets.explicitMutation = true;
 				targets.unknown = true;
 				return;
 			}
-			if (/^(?:python|pypy)/.test(binary)) collectPythonSystemWrites(script, targets, depth);
 		}
 	}
 }
@@ -2081,7 +2087,7 @@ function interpreterCodeOptions(binary: string): string[] {
 
 function containsOpaqueInterpreterSource(source: string, binary: string): boolean {
 	return (
-		INTERPRETER_DYNAMIC_EXECUTION_RE.test(source) ||
+		(!/^(?:python|pypy)/.test(binary) && INTERPRETER_DYNAMIC_EXECUTION_RE.test(source)) ||
 		INTERPRETER_FILESYSTEM_REQUIRE_RE.test(source) ||
 		INTERPRETER_NONLITERAL_REQUIRE_RE.test(source) ||
 		(/^php/.test(binary) && /\bassert\b/i.test(source)) ||
@@ -2129,6 +2135,7 @@ function interpreterCodeContainsWriteApi(
 				continue;
 			}
 		}
+		if (INTERPRETER_OUTPUT_METHOD_ASSIGNMENT_RE.test(script.slice(index))) return true;
 		if (language === "py" && PYTHON_DYNAMIC_EXECUTION_IDENTIFIER_RE.test(script.slice(index))) return true;
 		if (language === "js" && JAVASCRIPT_DYNAMIC_EXECUTION_IDENTIFIER_RE.test(script.slice(index))) return true;
 		if (language === "perl" && isReadOnlyPerlOpen(script, index)) {
@@ -2993,9 +3000,15 @@ function modeWrites(raw: string | undefined): boolean | null {
 	return literal === null ? null : /[wax+]/.test(literal);
 }
 
-const PY_OS_MUTATORS = new Set("remove unlink rename replace rmtree move copy copy2 copyfile".split(" "));
+const PY_OS_MUTATORS = new Set(
+	"remove unlink rename replace rmtree move copy copy2 copyfile symlink link mkdir makedirs rmdir truncate open".split(
+		" ",
+	),
+);
 /** Copy and rename write the destination, not only the source. */
-const TWO_ARG_MUTATORS = new Set("rename replace move copy copy2 copyfile renameSync copyFileSync".split(" "));
+const TWO_ARG_MUTATORS = new Set(
+	"rename replace move copy copy2 copyfile symlink link renameSync copyFileSync".split(" "),
+);
 const JS_FS_MUTATORS = new Set(
 	"writeFileSync writeFile appendFileSync appendFile rmSync unlinkSync renameSync copyFileSync mkdirSync openSync".split(
 		" ",
@@ -3107,6 +3120,48 @@ function literalPathReceiver(parts: string[]): string | null {
 	return joined.length === 0 ? "." : joined;
 }
 
+/** `Path.open()` defaults to read mode; a dynamic mode cannot be proven read-only. */
+function pathlibOpenModeWrites(code: string, methodAt: number): boolean | null {
+	const call = /^\s*\.\s*open\s*\(/.exec(code.slice(methodAt));
+	if (!call) return false;
+	let cursor = methodAt + call[0].length;
+	let mode: string | undefined;
+	let modeSeen = false;
+	let unknownMode = false;
+	let positionalIndex = 0;
+	while (cursor < code.length) {
+		while (/\s/.test(code[cursor] ?? "")) cursor += 1;
+		if (code[cursor] === ")") break;
+		const argument = readArg(code, cursor);
+		if (!argument) return null;
+		const raw = argument.raw.trim();
+		if (raw.startsWith("*") || raw.startsWith("**")) {
+			unknownMode = true;
+		} else {
+			const keyword = /^([A-Za-z_]\w*)\s*=\s*([\s\S]*)$/.exec(raw);
+			if (keyword?.[1] === "mode") {
+				if (modeSeen) unknownMode = true;
+				else {
+					mode = keyword[2];
+					modeSeen = true;
+				}
+			} else if (!keyword && positionalIndex === 0) {
+				if (modeSeen) unknownMode = true;
+				else {
+					mode = raw;
+					modeSeen = true;
+				}
+			}
+		}
+		positionalIndex += 1;
+		cursor = argument.end;
+		while (/\s/.test(code[cursor] ?? "")) cursor += 1;
+		if (code[cursor] === ",") cursor += 1;
+		else if (code[cursor] !== ")") return null;
+	}
+	return unknownMode ? null : modeWrites(mode);
+}
+
 /** Calls inside strings or comments are skipped. A non-literal write path fails closed. */
 function scanInterpreterWrites(code: string, language: "py" | "js", targets: ExtractedTargets): void {
 	let index = 0;
@@ -3120,6 +3175,11 @@ function scanInterpreterWrites(code: string, language: "py" | "js", targets: Ext
 			}
 			index = trivia;
 			continue;
+		}
+		if (INTERPRETER_OUTPUT_METHOD_ASSIGNMENT_RE.test(code.slice(index))) {
+			targets.explicitMutation = true;
+			targets.unknown = true;
+			return;
 		}
 		const previous = index === 0 ? "" : (code[index - 1] ?? "");
 		if ((index > 0 && /[\w]/.test(previous)) || !/[A-Za-z_]/.test(code[index] ?? "")) {
@@ -3152,7 +3212,8 @@ function scanInterpreterWrites(code: string, language: "py" | "js", targets: Ext
 		const paren = /^\s*\(/.exec(code.slice(cursor));
 		const helper = (name === "write" || name === "append") && dotted === "";
 		const open = (name === "open" && language === "py") || (name === "openSync" && language === "js");
-		const pathCtor = name === "Path" && dotted === "";
+		const pathCtor =
+			(name === "Path" && dotted === "") || (language === "py" && name === "pathlib" && dotted === "Path");
 		const osCall =
 			language === "py" &&
 			((name === "os" && PY_OS_MUTATORS.has(dotted)) || (name === "shutil" && PY_OS_MUTATORS.has(dotted)));
@@ -3170,12 +3231,15 @@ function scanInterpreterWrites(code: string, language: "py" | "js", targets: Ext
 				index += 1;
 				continue;
 			}
-			const method = /^\s*\.\s*(write_text|write_bytes)\b/.exec(code.slice(ctor.after));
+			const method = /^\s*\.\s*(write_\w+|open)\s*\(/.exec(code.slice(ctor.after));
 			if (method) {
-				targets.explicitMutation = true;
-				const receiver = literalPathReceiver(ctor.parts);
-				if (receiver === null || receiver.length === 0) targets.unknown = true;
-				else addPath(targets, receiver);
+				const writes = method[1] === "open" ? pathlibOpenModeWrites(code, ctor.after) : true;
+				if (writes !== false) {
+					targets.explicitMutation = true;
+					const receiver = literalPathReceiver(ctor.parts);
+					if (writes === null || receiver === null || receiver.length === 0) targets.unknown = true;
+					else addPath(targets, receiver);
+				}
 			}
 			// Extra segments stay in the argument walk so a nested mutator is still recorded.
 			index =
