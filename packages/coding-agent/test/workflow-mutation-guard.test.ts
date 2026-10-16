@@ -2144,6 +2144,18 @@ describe("bash scanner quoting model", () => {
 				reason: "unknown-target",
 			},
 			{
+				name: "Ruby eval-wrapped write source",
+				command: `ruby -e 'eval("File.open(\\"src/product.ts\\",\\"w\\").write(\\"PWNED\\")")'`,
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
+				name: "Ruby reflective send source",
+				command: `ruby -e 'send(:eval, "File.open(\\"src/product.ts\\",\\"w\\").write(\\"PWNED\\")")'`,
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
 				name: "Node eval-wrapped write source",
 				command: `node -e 'eval(${JSON.stringify('require("fs").writeFileSync("src/product.ts","PWNED")')})'`,
 				blocked: true,
@@ -2158,6 +2170,60 @@ describe("bash scanner quoting model", () => {
 			{
 				name: "Node dynamic eval inside an interpolated template",
 				command: "node -e '`" + "$" + "{eval(command)}`'",
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
+				name: "Node filesystem module loaded by string",
+				command: `node -e 'const fs = require("node:fs"); fs.writeFileSync("src/product.ts", "PWNED")'`,
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
+				name: "filesystem module loading is opaque without a visible write call",
+				command: `node -e 'require("node:fs/promises")'`,
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
+				name: "Perl eval source",
+				command: `perl -e 'eval $payload'`,
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
+				name: "PHP eval source",
+				command: `php -r 'eval($payload);'`,
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
+				name: "Lua dynamic load source",
+				command: `lua -e 'loadstring(payload)()'`,
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
+				name: "Lua filesystem module loaded by string",
+				command: `lua -e 'require("io")'`,
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
+				name: "Bash -c eval source",
+				command: `bash -c 'eval "$payload"'`,
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
+				name: "dynamic execution spelling inside an interpreter string span",
+				command: `ruby -e 'puts "eval(\\"File.open(\\"src/product.ts\\",\\"w\\")\\")"'`,
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
+				name: "PHP direct file write API",
+				command: `php -r 'file_put_contents("src/product.ts", "PWNED");'`,
 				blocked: true,
 				reason: "unknown-target",
 			},
@@ -2181,6 +2247,32 @@ describe("bash scanner quoting model", () => {
 				target: "src/product.ts",
 			},
 			{
+				name: "GNU AWK alias direct output write",
+				command: `gawk 'BEGIN { print "PWNED" > "src/product.ts" }' input`,
+				blocked: true,
+				reason: "phase-boundary",
+				target: "src/product.ts",
+			},
+			{
+				name: "MAWK alias direct output write",
+				command: `mawk 'BEGIN { print "PWNED" > "src/product.ts" }' input`,
+				blocked: true,
+				reason: "phase-boundary",
+				target: "src/product.ts",
+			},
+			{
+				name: "AWK command-pipe write",
+				command: `awk 'BEGIN { print "PWNED" | "tee src/product.ts" }'`,
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
+				name: "AWK system command execution",
+				command: `awk 'BEGIN { system("touch src/product.ts") }'`,
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
 				name: "AWK second statement in quoted program",
 				command: `awk 'BEGIN { print 1; print "PWNED" > "src/product.ts" }' input`,
 				blocked: true,
@@ -2190,6 +2282,13 @@ describe("bash scanner quoting model", () => {
 			{
 				name: "sed addressed write after regex address",
 				command: "sed -n '/needle/w src/product.ts' input",
+				blocked: true,
+				reason: "phase-boundary",
+				target: "src/product.ts",
+			},
+			{
+				name: "sed write after a semicolon in the quoted program",
+				command: "sed -n '1p;w src/product.ts' packages/coding-agent/package.json",
 				blocked: true,
 				reason: "phase-boundary",
 				target: "src/product.ts",
@@ -2208,18 +2307,19 @@ describe("bash scanner quoting model", () => {
 				reason: "unknown-target",
 			},
 			{
-				name: "compile-only Python code object containing a write",
+				name: "Python compile source containing a write",
 				command: `python3 -c 'compile(${JSON.stringify('open("src/product.ts","w").write("x")')}, "<string>", "exec")'`,
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
+				name: "Python write API name in inert output text",
+				command: `python3 -c "print('shutil.copy(')"`,
 				blocked: false,
 			},
 			{
-				name: "Python exec/eval/compile API names in inert output text",
-				command: `python3 -c "print('exec eval compile shutil.copy(')"`,
-				blocked: false,
-			},
-			{
-				name: "Node eval and write API names in inert output text",
-				command: `node -e "console.log('exec eval compile writeFileSync(')"`,
+				name: "Node write API name in inert output text",
+				command: `node -e "console.log('writeFileSync(')"`,
 				blocked: false,
 			},
 			{
@@ -2243,6 +2343,11 @@ describe("bash scanner quoting model", () => {
 				blocked: false,
 			},
 			{
+				name: "quoted sed command text is not a command",
+				command: `echo 'prefix; sed -n "w src/product.ts"'`,
+				blocked: false,
+			},
+			{
 				name: "AWK quoted string comparison rather than redirection",
 				command: `awk '$1 > "m" { print }' input`,
 				blocked: false,
@@ -2258,8 +2363,23 @@ describe("bash scanner quoting model", () => {
 				blocked: false,
 			},
 			{
+				name: "GNU AWK POSIX compatibility option and read-only program",
+				command: "awk -W posix '$1 > 5 { print $1 }' input",
+				blocked: false,
+			},
+			{
 				name: "AWK escaped temporary destination",
 				command: `awk 'BEGIN { printf "x" > ${JSON.stringify(escapedScratch)} }'`,
+				blocked: false,
+			},
+			{
+				name: "Lua read-only inline source",
+				command: `lua -e 'print("ok")'`,
+				blocked: false,
+			},
+			{
+				name: "Perl explicit read-mode open",
+				command: `perl -e 'open(F, "<", "src/product.ts"); print 1;'`,
 				blocked: false,
 			},
 		];
@@ -2363,7 +2483,7 @@ describe("bash scanner quoting model", () => {
 			`if awk '$1 > "m" { print }' input; then :; fi`,
 			`python3 -c "import os; os.system('ls')"`,
 			`python3 -c $'print("open(")'`,
-			`python3 -c "print('exec(\\"open(\\")')"`,
+			`python3 -c "print('writeFileSync(')"`,
 			`python3 -c "print('shutil.copy(')"`,
 			`python3 -c "print(1) # shutil.copy('stage/pwn.txt','src/product.ts')"`,
 			`python3 -c "print(1)"`,
