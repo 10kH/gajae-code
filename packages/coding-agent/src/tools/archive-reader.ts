@@ -7,7 +7,7 @@ const MAX_ARCHIVE_TOTAL_BYTES = 64 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRY_COUNT = 8192;
 const MAX_ARCHIVE_PATH_DEPTH = 48;
 const MAX_TAR_CONTAINER_BYTES = MAX_ARCHIVE_TOTAL_BYTES + MAX_ARCHIVE_ENTRY_COUNT * 512 + 1024;
-const MAX_GZIP_LAYERS = 8;
+const MAX_GZIP_LAYERS = 24;
 
 let fflateModulePromise: Promise<typeof import("fflate")> | undefined;
 async function loadFflate(): Promise<typeof import("fflate")> {
@@ -176,10 +176,12 @@ function isGzipBytes(bytes: Uint8Array): boolean {
 function inflateToTar(bytes: Uint8Array, labeledGzip: boolean): Uint8Array {
 	let payload = bytes;
 	let layers = 0;
-	while (layers === 0 ? labeledGzip || isGzipBytes(payload) : isGzipBytes(payload)) {
+	let sawGzip = labeledGzip || isGzipBytes(payload);
+	while (sawGzip) {
 		layers += 1;
 		if (layers > MAX_GZIP_LAYERS) throw archiveLimitError("total");
 		payload = gunzipBounded(payload);
+		sawGzip = isGzipBytes(payload);
 	}
 	return payload;
 }

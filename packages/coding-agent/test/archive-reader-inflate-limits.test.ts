@@ -287,6 +287,45 @@ describe("openArchive inflate caps", () => {
 	);
 
 	test(
+		"still allows a small tar under 24 gzip wrappers",
+		noted("still allows a small tar under 24 gzip wrappers", async () => {
+			const dir = await mkdtemp(path.join(tmpdir(), "archive-gz24-"));
+			try {
+				await writeFile(path.join(dir, "hello.txt"), "hello");
+				const raw = path.join(dir, "ok.tar");
+				await exec("tar", ["-cf", raw, "-C", dir, "hello.txt"]);
+				let wrapped = await Bun.file(raw).bytes();
+				for (let layer = 0; layer < 24; layer++) wrapped = gzipSync(wrapped);
+				const archivePath = path.join(dir, "wrapped.tar.gz");
+				await writeFile(archivePath, wrapped);
+				const archive = await openArchive(archivePath);
+				expect(new TextDecoder().decode((await archive.readFile("hello.txt")).bytes)).toBe("hello");
+			} finally {
+				await rm(dir, { recursive: true, force: true });
+			}
+		}),
+	);
+
+	test(
+		"rejects a 25th gzip wrapper",
+		noted("rejects a 25th gzip wrapper", async () => {
+			const dir = await mkdtemp(path.join(tmpdir(), "archive-gz25-"));
+			try {
+				await writeFile(path.join(dir, "hello.txt"), "hello");
+				const raw = path.join(dir, "ok.tar");
+				await exec("tar", ["-cf", raw, "-C", dir, "hello.txt"]);
+				let wrapped = await Bun.file(raw).bytes();
+				for (let layer = 0; layer < 25; layer++) wrapped = gzipSync(wrapped);
+				const archivePath = path.join(dir, "wrapped.tar.gz");
+				await writeFile(archivePath, wrapped);
+				await expect(openArchive(archivePath)).rejects.toThrow(/total limit/);
+			} finally {
+				await rm(dir, { recursive: true, force: true });
+			}
+		}),
+	);
+
+	test(
 		"rejects a second gzip wrapper past the total cap",
 		noted("rejects a second gzip wrapper past the total cap", async () => {
 			const dir = await mkdtemp(path.join(tmpdir(), "archive-gz2bomb-"));
