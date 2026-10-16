@@ -46,16 +46,40 @@
 				"credentialPreferences": {
 					"type": "object",
 					"additionalProperties": {
-						"type": "string",
-						"pattern": "^(email:[^@\\s]+@[^@\\s]+|account:\\S+)$"
+						"anyOf": [
+							{
+								"type": "string",
+								"pattern": "^(email:[^@\\s]+@[^@\\s]+|account:\\S+|[^@\\s:]+@[^@\\s]+)$"
+							},
+							{
+								"type": "array",
+								"minItems": 1,
+								"uniqueItems": true,
+								"items": {
+									"anyOf": [
+										{
+											"type": "string",
+											"pattern": "^(email:[^@\\s]+@[^@\\s]+|account:\\S+|[^@\\s:]+@[^@\\s]+)$"
+										},
+										{
+											"type": "object",
+											"minProperties": 1,
+											"maxProperties": 1,
+											"propertyNames": {
+												"pattern": "^(email:[^@\\s]+@[^@\\s]+|account:\\S+|[^@\\s:]+@[^@\\s]+)$"
+											},
+											"additionalProperties": {
+												"type": "number",
+												"exclusiveMinimum": 0,
+												"maximum": 100
+											}
+										}
+									]
+								}
+							}
+						]
 					},
 					"default": {}
-				},
-				"credentialPreferenceMaxUsedPercent": {
-					"type": "number",
-					"default": 100,
-					"exclusiveMinimum": 0,
-					"maximum": 100
 				}
 			},
 			"additionalProperties": false
