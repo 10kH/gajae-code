@@ -86,6 +86,7 @@ describe("session HTML export embed", () => {
 				content: [
 					"clone: https://alice:correct@horse@example.com/repo.git?keep=1",
 					"database: postgresql+asyncpg://alice:opaque-database-password@example.com/db",
+					"password_confirmation=opaque-snake-confirmation passwordConfirmation=opaque-camel-confirmation",
 					"password=correct,horse",
 					"password=correct;horse",
 					"password=correct horse battery staple token=second-secret note=keep",
@@ -107,6 +108,8 @@ describe("session HTML export embed", () => {
 				"opaque-database-password",
 				"correct,horse",
 				"correct;horse",
+				"opaque-snake-confirmation",
+				"opaque-camel-confirmation",
 				"correct horse battery staple",
 				"second-secret",
 				"alpha}suffix",
@@ -121,6 +124,7 @@ describe("session HTML export embed", () => {
 			expect(embedded).toContain("https://«redacted-url-credential»@example.com/repo.git?keep=1");
 			expect(embedded).toContain("postgresql+asyncpg://«redacted-url-credential»@example.com/db");
 			expect(exportedContent).toContain("password=«redacted»");
+			expect(exportedContent).toContain("password_confirmation=«redacted» passwordConfirmation=«redacted»");
 			expect(exportedContent).toContain("password=«redacted» token=«redacted» note=keep");
 			expect(exportedContent).toContain('password="«redacted»\nstack "frame"\nafter=keep');
 			expect(exportedContent).toContain("credentials=«redacted»\nstack frame\nafter=keep");
@@ -169,7 +173,12 @@ describe("session HTML export embed", () => {
 						type: "toolCall",
 						id: "call-1",
 						name: "echo",
-						arguments: { password: "abcdefgh1234", note: ORDINARY_SENTENCE },
+						arguments: {
+							password: "abcdefgh1234",
+							password_confirmation: "opaque-nested-snake-confirmation",
+							passwordConfirmation: "opaque-nested-camel-confirmation",
+							note: ORDINARY_SENTENCE,
+						},
 					},
 				],
 				timestamp: 1,
@@ -178,7 +187,11 @@ describe("session HTML export embed", () => {
 			await exportSessionToHtml(session, undefined, { outputPath });
 			const embedded = embeddedSessionText(await Bun.file(outputPath).text());
 			expect(embedded).not.toContain("abcdefgh1234");
+			expect(embedded).not.toContain("opaque-nested-snake-confirmation");
+			expect(embedded).not.toContain("opaque-nested-camel-confirmation");
 			expect(embedded).toContain("«redacted»");
+			expect(embedded).toContain('"password_confirmation":"«redacted»"');
+			expect(embedded).toContain('"passwordConfirmation":"«redacted»"');
 			expect(embedded).toContain(ORDINARY_SENTENCE);
 		} finally {
 			await session?.close();

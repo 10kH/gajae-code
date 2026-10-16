@@ -548,6 +548,29 @@ describe("recordFatalCrash", () => {
 		expect(redactCrashSecrets('{"dbPwd":"opaque-db-pwd"}')).toBe('{"dbPwd":"«redacted»"}');
 	});
 
+	it("redacts password confirmation credential fields", () => {
+		const keys = [
+			"password_confirmation",
+			"password-confirmation",
+			"password.confirmation",
+			"password confirmation",
+			"password_confirm",
+			"passwordConfirmation",
+			"PasswordConfirmation",
+			"passwordConfirm",
+			"PasswordConfirm",
+		];
+		for (const key of keys) expect(isCredentialKey(key)).toBe(true);
+
+		const labeled = keys.map(key => `${key}=opaque-confirmation-secret`).join(" ");
+		expect(redactCrashSecrets(labeled)).toBe(keys.map(key => `${key}=«redacted»`).join(" "));
+		expect(
+			redactCrashSecrets(
+				'{"password_confirmation":"opaque-snake-confirmation","passwordConfirmation":"opaque-camel-confirmation"}',
+			),
+		).toBe('{"password_confirmation":"«redacted»","passwordConfirmation":"«redacted»"}');
+	});
+
 	it("recognizes dotted credential-key segments", () => {
 		const keys = ["api.key", "client.secret", "db.password", "service.api.key", "aws.secret.access.key"];
 		for (const key of keys) expect(isCredentialKey(key)).toBe(true);
