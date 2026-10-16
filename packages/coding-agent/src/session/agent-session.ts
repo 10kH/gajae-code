@@ -284,7 +284,8 @@ import { getDefault, SETTINGS_SCHEMA, type SettingPath } from "../config/setting
 import { resolveEagerTaskDelegation } from "../config/task-delegation";
 import { RawSseDebugBuffer } from "../debug/raw-sse-buffer";
 import { loadCapability } from "../discovery";
-import { expandApplyPatchToEntries, normalizeDiff, normalizeToLF, ParseError, previewPatch, replaceText, stripBom, readEditFileText } from "../edit";
+import { expandApplyPatchToEntries, normalizeDiff, normalizeToLF, ParseError, previewPatch, replaceText, stripBom } from "../edit";
+import { readEditFileText } from "../edit/read-file";
 import { MAX_EDIT_FILE_BYTES } from "../edit/read-file";
 import { disposeVmContextsByOwner } from "../eval/js/context-manager";
 import {
@@ -7718,10 +7719,11 @@ export class AgentSession {
 			}
 		}
 
-		if (event.type === "tool_execution_start") {
-			this.#markRetryReplayUnsafe();
-
-		if (event.type === "tool_execution_update" || event.type === "tool_execution_end") {
+		if (
+			event.type === "tool_execution_start" ||
+			event.type === "tool_execution_update" ||
+			event.type === "tool_execution_end"
+		) {
 			this.#markRetryReplayUnsafe();
 		} else if (event.type === "message_end") {
 			if (
