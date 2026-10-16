@@ -195,6 +195,15 @@ describe("recordFatalCrash", () => {
 		expect(contents).toContain("«redacted»");
 	});
 
+	it("redacts whitespace-separated credential labels", () => {
+		const labels = ["API Key", "Private Key", "Secret Access Key"];
+		const labeled = labels.map((label, index) => `${label}=opaque-secret-${index}`).join(" ");
+
+		for (const label of labels) expect(isCredentialKey(label)).toBe(true);
+		expect(redactCrashSecrets(labeled)).toBe(labels.map(label => `${label}=«redacted»`).join(" "));
+		expect(redactCrashSecrets('{"API Key":"opaque-json-api-secret"}')).toBe('{"API Key":"«redacted»"}');
+	});
+
 	it("redacts short values under sensitive labels", async () => {
 		const target = tempCrashLog();
 		const labeled = [

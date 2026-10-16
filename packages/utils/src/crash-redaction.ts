@@ -7,8 +7,8 @@
  * text goes through `sanitizeExternalCrashV1` instead.
  */
 
-const CREDENTIAL_KEY_LABELS =
-	"api[._-]?key|apikey|account[._-]?key|access[._-]?token|refresh[._-]?token|id[._-]?token|session[._-]?key|session[._-]?token|client[._-]?secret|aws[._-]?secret[._-]?access[._-]?key|secret[._-]?key[._-]?base|secret[._-]?key|secret[._-]?access[._-]?key|encryption[._-]?key|signing[._-]?key|password|passwd|pwd|passphrase|auth|authorization|bearer|private[._-]?token|token|secrets?|credentials?|private[._-]?key|cookies?";
+const CREDENTIAL_KEY_SEPARATOR = "[._\\t -]*";
+const CREDENTIAL_KEY_LABELS = `api${CREDENTIAL_KEY_SEPARATOR}key|apikey|account${CREDENTIAL_KEY_SEPARATOR}key|access${CREDENTIAL_KEY_SEPARATOR}token|refresh${CREDENTIAL_KEY_SEPARATOR}token|id${CREDENTIAL_KEY_SEPARATOR}token|session${CREDENTIAL_KEY_SEPARATOR}key|session${CREDENTIAL_KEY_SEPARATOR}token|client${CREDENTIAL_KEY_SEPARATOR}secret|aws${CREDENTIAL_KEY_SEPARATOR}secret${CREDENTIAL_KEY_SEPARATOR}access${CREDENTIAL_KEY_SEPARATOR}key|secret${CREDENTIAL_KEY_SEPARATOR}key${CREDENTIAL_KEY_SEPARATOR}base|secret${CREDENTIAL_KEY_SEPARATOR}key|secret${CREDENTIAL_KEY_SEPARATOR}access${CREDENTIAL_KEY_SEPARATOR}key|encryption${CREDENTIAL_KEY_SEPARATOR}key|signing${CREDENTIAL_KEY_SEPARATOR}key|password|passwd|pwd|passphrase|auth|authorization|bearer|private${CREDENTIAL_KEY_SEPARATOR}token|token|secrets?|credentials?|private${CREDENTIAL_KEY_SEPARATOR}key|cookies?`;
 const CREDENTIAL_KEY_PREFIX = `(?:[A-Za-z0-9][A-Za-z0-9_.-]*[_.-])?`;
 const CREDENTIAL_KEY_PATTERN = `${CREDENTIAL_KEY_PREFIX}(?:${CREDENTIAL_KEY_LABELS})`;
 const CREDENTIAL_KEY_SUFFIX = new RegExp(`^${CREDENTIAL_KEY_PATTERN}$`, "i");
