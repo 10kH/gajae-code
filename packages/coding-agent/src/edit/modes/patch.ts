@@ -643,11 +643,14 @@ export async function executePatchSingle(
 	const resolvedPath = resolvePlanPath(session, path);
 	const resolvedRename = rename ? resolvePlanPath(session, rename) : undefined;
 
+	signal?.throwIfAborted();
 	await assertEditableFile(resolvedPath, path, session.settings);
 	// The rename destination is the path that is written. The source call above
 	// already uses this helper, including generated names that do not exist yet.
+	signal?.throwIfAborted();
 	if (resolvedRename && rename && resolvedRename !== resolvedPath) {
 		await assertEditableFile(resolvedRename, rename, session.settings);
+		signal?.throwIfAborted();
 	}
 
 	// Capture pre-edit content so we can verify the write actually hit disk.

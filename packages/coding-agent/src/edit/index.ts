@@ -169,20 +169,54 @@ function createEditWritethrough(session: ToolSession): WritethroughCallback {
 	return enableLsp ? createLspWritethrough(session.cwd, { enableFormat, enableDiagnostics }) : writethroughNoop;
 }
 
-/** Refuse a generated source or rename destination before any entry in the request writes. */
-async function assertPatchEntriesEditable(
+type PatchGuardFailure = { path: string; errorText: string };
+
+/**
+ * Refuse a generated source or rename destination before any entry writes.
+ * A single entry still throws. Several entries return the per-entry errors
+ * the patch aggregators already use, and the caller writes nothing.
+ */
+async function collectPatchGuardFailures(
 	session: ToolSession,
 	entries: { path: string; rename?: string }[],
-): Promise<void> {
+	signal?: AbortSignal,
+): Promise<PatchGuardFailure[] | undefined> {
+	const failures: PatchGuardFailure[] = [];
+	const aggregate = entries.length > 1;
 	for (const entry of entries) {
-		const resolvedPath = resolvePlanPath(session, entry.path);
-		await assertEditableFile(resolvedPath, entry.path, session.settings);
-		if (!entry.rename) continue;
-		const resolvedRename = resolvePlanPath(session, entry.rename);
-		if (resolvedRename !== resolvedPath) {
+		signal?.throwIfAborted();
+		try {
+			const resolvedPath = resolvePlanPath(session, entry.path);
+			await assertEditableFile(resolvedPath, entry.path, session.settings);
+			signal?.throwIfAborted();
+			if (!entry.rename) continue;
+			const resolvedRename = resolvePlanPath(session, entry.rename);
+			if (resolvedRename === resolvedPath) continue;
 			await assertEditableFile(resolvedRename, entry.rename, session.settings);
+			signal?.throwIfAborted();
+		} catch (err) {
+			signal?.throwIfAborted();
+			if (!aggregate || (err instanceof Error && err.name === "AbortError")) throw err;
+			failures.push({ path: entry.path, errorText: err instanceof Error ? err.message : String(err) });
 		}
 	}
+	return failures.length > 0 ? failures : undefined;
+}
+
+function refusedPatchEntriesResult(
+	failures: PatchGuardFailure[],
+	details: { path?: string; perFileResults?: EditToolPerFileResult[] },
+): AgentToolResult<EditToolDetails, TInput> {
+	return {
+		content: [
+			{
+				type: "text",
+				text: failures.map(failure => `Error editing ${failure.path}: ${failure.errorText}`).join("\n"),
+			},
+		],
+		details: { diff: "", ...details },
+		isError: true,
+	};
 }
 
 /** Run apply_patch file operations and aggregate their multi-file result. */
@@ -430,10 +464,12 @@ export class EditTool implements AgentTool<TInput> {
 				) => {
 					const { edits, path } = params as PatchParams;
 					const patchEdits = edits as PatchEditEntry[];
-					await assertPatchEntriesEditable(
+					const guardFailures = await collectPatchGuardFailures(
 						tool.session,
 						patchEdits.map(entry => ({ path, rename: entry.rename })),
+						signal,
 					);
+					if (guardFailures) return refusedPatchEntriesResult(guardFailures, { path });
 					const runs = patchEdits.map(
 						entry => (br: LspBatchRequest | undefined) =>
 							executePatchSingle({
@@ -462,10 +498,21 @@ export class EditTool implements AgentTool<TInput> {
 					onUpdate?: (partialResult: AgentToolResult<EditToolDetails, TInput>) => void,
 				) => {
 					const entries = expandApplyPatchToEntries(params as ApplyPatchParams);
-					await assertPatchEntriesEditable(
+					const guardFailures = await collectPatchGuardFailures(
 						tool.session,
 						entries.map(entry => ({ path: entry.path, rename: entry.rename })),
+						signal,
 					);
+					if (guardFailures) {
+						return refusedPatchEntriesResult(guardFailures, {
+							perFileResults: guardFailures.map(failure => ({
+								path: failure.path,
+								diff: "",
+								isError: true,
+								errorText: failure.errorText,
+							})),
+						});
+					}
 					const perFile = entries.map(entry => {
 						const { path, ...patchParams } = entry;
 						return {
