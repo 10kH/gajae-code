@@ -1,7 +1,8 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { NotificationServer } from "@gajae-code/natives";
 import type { ExtensionAPI } from "../src/extensibility/extensions";
 import { createNotificationsExtension } from "../src/sdk/bus";
 import {
@@ -75,12 +76,15 @@ async function boot() {
 	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 	await waitFor(() => Bun.file(endpointFile).size > 0, "endpoint");
 	const endpoint = await Bun.file(endpointFile).json();
-	const connect = async (capabilities: string[]) => {
+	const connect = async (capabilities: string[], helloCapabilities?: string[]) => {
 		const frames: Frame[] = [];
 		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
 		sockets.push(socket);
 		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
 		await waitFor(() => frames.some(frame => frame.type === "hello"), "hello");
+		if (helloCapabilities) {
+			socket.send(JSON.stringify({ type: "hello", protocolVersion: 3, capabilities: helloCapabilities }));
+		}
 		socket.send(JSON.stringify({ type: "event_replay", id: "caps", capabilities }));
 		await waitFor(() => frames.some(frame => frame.type === "event_replay_result"), "negotiation");
 		return {
@@ -164,4 +168,41 @@ test("bus owner keeps correlation and gets no duplicate observer copy", async ()
 	for (const frame of owner.content())
 		expect(frame).toMatchObject({ commandId: correlation.commandId, turnId: correlation.turnId });
 	for (const frame of observer.content()) expect(frame.commandId).toBeUndefined();
+}, 30_000);
+
+test("native replay capabilities admit observers before delayed negotiation callbacks", async () => {
+	const delayedCallbacks: Array<() => void> = [];
+	const registerCapabilities = NotificationServer.prototype.onNegotiatedCapabilities;
+	const capabilitySpy = spyOn(NotificationServer.prototype, "onNegotiatedCapabilities");
+	capabilitySpy.mockImplementation(function (
+		this: NotificationServer,
+		callback: Parameters<NotificationServer["onNegotiatedCapabilities"]>[0],
+	) {
+		registerCapabilities.call(this, (error, connectionId, negotiated) => {
+			delayedCallbacks.push(() => callback(error, connectionId, negotiated));
+		});
+	});
+	try {
+		const host = await boot();
+		const observer = await host.connect(["session_host_observer_v1"], ["turn_stream"]);
+		await host.emit({ type: "agent_start" });
+		for (const event of [start, update("one"), update("one\ntwo"), end]) await host.emit(event);
+		await waitFor(() => observer.content().length === 4, "observer stream before capability callback");
+		expect(observer.content().map(frame => (frame.payload as { event: unknown }).event)).toEqual([
+			start,
+			update("one"),
+			update("one\ntwo"),
+			end,
+		]);
+		await waitFor(() => delayedCallbacks.length >= 2, "hello and replay capability callbacks");
+
+		// Deliver the older hello snapshot after replay has added observer capability.
+		delayedCallbacks[0]!();
+		await host.emit(update("after delayed hello"));
+		await waitFor(() => observer.content().length === 5, "observer stream after delayed hello");
+		expect((observer.content()[4]?.payload as { event: unknown }).event).toEqual(update("after delayed hello"));
+	} finally {
+		for (const deliver of delayedCallbacks.splice(0)) deliver();
+		capabilitySpy.mockRestore();
+	}
 }, 30_000);
