@@ -1,5 +1,6 @@
 import * as net from "node:net";
 import * as tls from "node:tls";
+import { canonicalEnvKey, projectEnvSnapshot } from "@gajae-code/utils/env-file";
 
 export interface ProxyConnectOptions {
 	signal?: AbortSignal;
@@ -44,6 +45,33 @@ function firstEnvValue(...names: string[]): string | undefined {
 	for (const name of names) {
 		const value = process.env[name];
 		if (value?.trim()) return value.trim();
+	}
+	return undefined;
+}
+
+// Bun autoloads cwd dotenv into process.env before this module loads and does
+// not record which entries came from the file. Compare against the startup
+// snapshot: a dynamic declaration is refused, and a runtime value equal to the
+// declared text is ambiguous. A shell value that differs is still a selector.
+const projectProxyEnv = projectEnvSnapshot();
+
+function projectSuppliedProxy(name: string, runtime: string): boolean {
+	const key = canonicalEnvKey(name);
+	const declared = projectProxyEnv.values[key];
+	if (declared === undefined && !projectProxyEnv.dynamic.has(key)) return false;
+	return projectProxyEnv.dynamic.has(key) || declared === runtime || declared === runtime.trim();
+}
+
+function trustedProxyEnvValue(name: string): string | undefined {
+	const runtime = process.env[name];
+	if (!runtime?.trim() || projectSuppliedProxy(name, runtime)) return undefined;
+	return runtime.trim();
+}
+
+function firstTrustedProxyEnv(...names: string[]): string | undefined {
+	for (const name of names) {
+		const value = trustedProxyEnvValue(name);
+		if (value) return value;
 	}
 	return undefined;
 }
@@ -254,18 +282,18 @@ export function getProxyForUrl(provider: string, url: URL): string | undefined {
 	const normalizedProvider = normalizeProvider(provider);
 	const protocolProxy =
 		url.protocol === "https:"
-			? firstEnvValue("HTTPS_PROXY", "https_proxy")
+			? firstTrustedProxyEnv("HTTPS_PROXY", "https_proxy")
 			: url.protocol === "http:"
-				? firstEnvValue("HTTP_PROXY", "http_proxy")
+				? firstTrustedProxyEnv("HTTP_PROXY", "http_proxy")
 				: undefined;
 	const candidates = [
-		normalizedProvider ? process.env[`PI_PROXY_${normalizedProvider}`] : undefined,
-		process.env.PI_PROXY,
+		normalizedProvider ? trustedProxyEnvValue(`PI_PROXY_${normalizedProvider}`) : undefined,
+		trustedProxyEnvValue("PI_PROXY"),
 		protocolProxy,
-		firstEnvValue("ALL_PROXY", "all_proxy"),
+		firstTrustedProxyEnv("ALL_PROXY", "all_proxy"),
 	];
 	for (const candidate of candidates) {
-		if (candidate?.trim()) return candidate.trim();
+		if (candidate) return candidate;
 	}
 	return undefined;
 }
