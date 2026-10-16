@@ -36,7 +36,8 @@ const CREDENTIAL_CONTAINER_CANDIDATE_PATTERN = new RegExp(
 );
 const CREDENTIAL_CAMEL_ASSIGNMENT_PREFIX = String.raw`(?<![A-Za-z0-9_-])((?:\\*["'\x60]?-*)(?:${CREDENTIAL_CAMEL_KEY_PATTERN})(?:\\*["'\x60]?\s*[=:]\s*))`;
 const AUTHORIZATION_HEADER_PREFIX = String.raw`(?<![A-Za-z0-9_-])((?:\\*["'\x60]?-*)(?:[A-Za-z0-9][A-Za-z0-9_-]*[_-])?(?:auth|authorization)(?:\\*["'\x60]?\s*:\s*))`;
-const CREDENTIAL_UNQUOTED_VALUE_PATTERN_BODY = String.raw`(?:(?!\\+n|\\+r\\+n)(?:\\[^\r\n]|[^\s"',;}\]]))+`;
+const CREDENTIAL_FOLLOWING_FIELD_PATTERN = String.raw`[,;][ \t]*[A-Za-z][A-Za-z0-9_. \t-]{0,127}[ \t]*[=:]`;
+const CREDENTIAL_UNQUOTED_VALUE_PATTERN_BODY = String.raw`(?:(?!\\+n|\\+r\\+n|${CREDENTIAL_FOLLOWING_FIELD_PATTERN})(?:\\[^\r\n]|[^\s"'}\]]))+`;
 const CREDENTIAL_VALUE_QUOTED_BOUNDARY = String.raw`(?=$|[\s,;}):.\]]|/?>)`;
 const CREDENTIAL_AUTH_VALUE_PATTERN = new RegExp(
 	String.raw`${CREDENTIAL_ASSIGNMENT_PREFIX}(?:Bearer|Basic|Token)\s+${CREDENTIAL_UNQUOTED_VALUE_PATTERN_BODY}`,
@@ -332,6 +333,16 @@ type EscapedQuoteDelimiter = { delimiter: "'" | '"' | "`"; backslashCount: numbe
 function findCredentialContainerEnd(text: string, start: number): number {
 	const closing = [text[start] === "[" ? "]" : "}"];
 	const escapedQuoteDelimiter = findEscapedQuoteDelimiter(text, start);
+	const lineFeedIndex = text.indexOf("\n", start);
+	const carriageReturnIndex = text.indexOf("\r", start);
+	const unclosedEnd =
+		lineFeedIndex < 0
+			? carriageReturnIndex < 0
+				? text.length
+				: carriageReturnIndex
+			: carriageReturnIndex < 0
+				? lineFeedIndex
+				: Math.min(lineFeedIndex, carriageReturnIndex);
 	let quote: "'" | '"' | "`" | undefined;
 	for (let index = start + 1; index < text.length; index++) {
 		const character = text[index] ?? "";
@@ -369,7 +380,7 @@ function findCredentialContainerEnd(text: string, start: number): number {
 			if (closing.length === 0) return index + 1;
 		}
 	}
-	return text.length;
+	return unclosedEnd;
 }
 
 function findEscapedQuoteDelimiter(text: string, start: number): EscapedQuoteDelimiter | undefined {

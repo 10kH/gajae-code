@@ -204,6 +204,14 @@ describe("recordFatalCrash", () => {
 		expect(redactCrashSecrets('{"API Key":"opaque-json-api-secret"}')).toBe('{"API Key":"«redacted»"}');
 	});
 
+	it("redacts punctuation-bearing unquoted credential values without swallowing following fields", () => {
+		expect(redactCrashSecrets("password=correct,horse")).toBe("password=«redacted»");
+		expect(redactCrashSecrets("password=correct;horse")).toBe("password=«redacted»");
+		expect(redactCrashSecrets("password=correct, token=second-secret note=keep")).toBe(
+			"password=«redacted», token=«redacted» note=keep",
+		);
+	});
+
 	it("redacts short values under sensitive labels", async () => {
 		const target = tempCrashLog();
 		const labeled = [
@@ -244,6 +252,11 @@ describe("recordFatalCrash", () => {
 		expect(contents).toContain("credentials=«redacted»");
 		expect(contents).toContain("secrets=«redacted»");
 		expect(contents).toContain('metadata=["public"]');
+	});
+
+	it("preserves later diagnostics after an unterminated credential container", () => {
+		const input = "safe=keep credentials={secret=abc\nstack frame\nafter=keep";
+		expect(redactCrashSecrets(input)).toBe("safe=keep credentials=«redacted»\nstack frame\nafter=keep");
 	});
 
 	it("redacts plural cookie containers and camelCase cookie fields", () => {

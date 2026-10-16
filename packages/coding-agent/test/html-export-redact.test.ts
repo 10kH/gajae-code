@@ -86,7 +86,10 @@ describe("session HTML export embed", () => {
 				content: [
 					"clone: https://alice:correct@horse@example.com/repo.git?keep=1",
 					"database: postgresql+asyncpg://alice:opaque-database-password@example.com/db",
+					"password=correct,horse",
+					"password=correct;horse",
 					'password="secret\nstack "frame"\nafter=keep',
+					"credentials={secret=abc\nstack frame\nafter=keep",
 					"credentials={primary:`alpha}suffix`,secondary:`beta-secret`}",
 					"cookie=session=topsecret; csrf=alsosecret",
 					"set_cookie=refresh=opaque-refresh-cookie; xsrf=opaque-xsrf-token",
@@ -101,6 +104,8 @@ describe("session HTML export embed", () => {
 			for (const secret of [
 				"correct@horse",
 				"opaque-database-password",
+				"correct,horse",
+				"correct;horse",
 				"alpha}suffix",
 				"beta-secret",
 				"topsecret",
@@ -112,7 +117,9 @@ describe("session HTML export embed", () => {
 			}
 			expect(embedded).toContain("https://«redacted-url-credential»@example.com/repo.git?keep=1");
 			expect(embedded).toContain("postgresql+asyncpg://«redacted-url-credential»@example.com/db");
+			expect(exportedContent).toContain("password=«redacted»");
 			expect(exportedContent).toContain('password="«redacted»\nstack "frame"\nafter=keep');
+			expect(exportedContent).toContain("credentials=«redacted»\nstack frame\nafter=keep");
 			expect(embedded).toContain("credentials=«redacted»");
 			expect(embedded).toContain("cookie=«redacted»");
 			expect(embedded).toContain("set_cookie=«redacted»");
