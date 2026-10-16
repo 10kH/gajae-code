@@ -1212,7 +1212,7 @@ describe("TTSR beforeToolCall integration", () => {
 		// Create a temp file with initial content
 		// Create a temp file with function that will be exported after edit
 		const testFile = path.join(tempDir, "test.ts");
-		fs.writeFileSync(testFile, "function testFn() {}\n");
+		fs.writeFileSync(testFile, "function testFn() {}");
 
 		let callCount = 0;
 		const agent = new Agent({
@@ -1287,15 +1287,15 @@ describe("TTSR beforeToolCall integration", () => {
 			},
 		});
 
-		const sessionManager = SessionManager.inMemory();
+		const sessionManager = SessionManager.inMemory(tempDir);
 		session = new AgentSession({
 			agent,
 			sessionManager,
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			ttsrManager,
 			modelRegistry,
-			toolRegistry: new Map([[editTool.name, editTool as AgentTool]]),
-		});
+		toolRegistry: new Map([[editTool.name, editTool as AgentTool]]),
+	});
 
 		const ttsr_triggered_events: Array<{ type: string; rules: Rule[] }> = [];
 		session.subscribe(event => {
@@ -1303,10 +1303,6 @@ describe("TTSR beforeToolCall integration", () => {
 				ttsr_triggered_events.push(event as any);
 			}
 		});
-
-		// Verify file was created with initial content
-		const initialContent = fs.readFileSync(testFile, "utf8");
-		expect(initialContent).toContain("function testFn() {}");
 
 		await session.prompt("Export the function");
 		await session.waitForIdle();
