@@ -153,6 +153,20 @@ describe("recordFatalCrash", () => {
 		expect(contents).toContain('"refresh_token": "«redacted»');
 	});
 
+	it("redacts unquoted multiword credential values before persisting", () => {
+		const target = tempCrashLog();
+		const secret = "correct horse battery staple";
+
+		recordFatalCrash("Uncaught Exception", new Error(`password=${secret} token=second-secret note=keep`), {
+			path: target,
+		});
+
+		const contents = fs.readFileSync(target, "utf8");
+		expect(contents).not.toContain(secret);
+		expect(contents).not.toContain("second-secret");
+		expect(contents).toContain("password=«redacted» token=«redacted» note=keep");
+	});
+
 	it("redacts current vendor token formats, not just the legacy prefixes", () => {
 		const target = tempCrashLog();
 		// GitHub fine-grained PATs use `github_pat_`, not the classic `gh[opsur]_`.
@@ -209,6 +223,16 @@ describe("recordFatalCrash", () => {
 		expect(redactCrashSecrets("password=correct;horse")).toBe("password=«redacted»");
 		expect(redactCrashSecrets("password=correct, token=second-secret note=keep")).toBe(
 			"password=«redacted», token=«redacted» note=keep",
+		);
+	});
+
+	it("redacts unquoted multiword credentials while preserving following fields", () => {
+		expect(redactCrashSecrets("password=correct horse battery staple")).toBe("password=«redacted»");
+		expect(redactCrashSecrets("password=correct horse battery staple token=second-secret note=keep")).toBe(
+			"password=«redacted» token=«redacted» note=keep",
+		);
+		expect(redactCrashSecrets("password=correct Secret Access Key=second-secret note=keep")).toBe(
+			"password=«redacted» Secret Access Key=«redacted» note=keep",
 		);
 	});
 
