@@ -175,6 +175,49 @@ describe("session HTML export embed", () => {
 		}
 	});
 
+	it("redacts credentials in serialized header tuples", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-html-export-header-tuples-"));
+		let session: SessionManager | undefined;
+		try {
+			session = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+			session.appendMessage({
+				role: "assistant",
+				content: [
+					{
+						type: "toolCall",
+						id: "call-header-tuples",
+						name: "echo",
+						arguments: {
+							headers: [
+								["X-Api-Key", "opaque-secret-123"],
+								["Authorization", "Bearer opaque-auth-secret"],
+								["Content-Type", "application/json"],
+							],
+						},
+					},
+				],
+				timestamp: 1,
+			} as unknown as Parameters<SessionManager["appendMessage"]>[0]);
+			const outputPath = path.join(tempDir, "export.html");
+			await exportSessionToHtml(session, undefined, { outputPath });
+			const embedded = embeddedSessionText(await Bun.file(outputPath).text());
+			const parsed = JSON.parse(embedded) as {
+				entries: Array<{ message?: { content?: Array<{ arguments?: Record<string, unknown> }> } }>;
+			};
+			const headers = parsed.entries[0]?.message?.content?.[0]?.arguments?.headers;
+			expect(embedded).not.toContain("opaque-secret-123");
+			expect(embedded).not.toContain("opaque-auth-secret");
+			expect(headers).toEqual([
+				["X-Api-Key", "«redacted»"],
+				["Authorization", "«redacted»"],
+				["Content-Type", "application/json"],
+			]);
+		} finally {
+			await session?.close();
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("masks opaque credentials under generic field names", async () => {
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-html-export-generic-credentials-"));
 		let session: SessionManager | undefined;

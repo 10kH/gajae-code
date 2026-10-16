@@ -260,7 +260,12 @@ async function writeSessionHtml(
  */
 function redactJsonValue(value: unknown): unknown {
 	if (typeof value === "string") return redactCrashSecrets(value);
-	if (Array.isArray(value)) return value.map(item => redactJsonValue(item));
+	if (Array.isArray(value)) {
+		if (value.length === 2 && typeof value[0] === "string" && isCredentialKey(value[0])) {
+			return [redactJsonValue(value[0]), "«redacted»"];
+		}
+		return value.map(item => redactJsonValue(item));
+	}
 	if (value === null || typeof value !== "object") return value;
 	const source = value as Record<string, unknown>;
 	const redacted = Object.create(null) as Record<string, unknown>;
