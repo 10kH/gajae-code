@@ -6,6 +6,8 @@ const MAX_ARCHIVE_ENTRY_BYTES = 16 * 1024 * 1024;
 const MAX_ARCHIVE_TOTAL_BYTES = 64 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRY_COUNT = 8192;
 const MAX_ARCHIVE_PATH_DEPTH = 48;
+const MAX_TAR_CONTAINER_BYTES = MAX_ARCHIVE_TOTAL_BYTES + MAX_ARCHIVE_ENTRY_COUNT * 512 + 1024;
+const MAX_GZIP_LAYERS = 8;
 
 let fflateModulePromise: Promise<typeof import("fflate")> | undefined;
 async function loadFflate(): Promise<typeof import("fflate")> {
@@ -159,7 +161,7 @@ function getArchiveFormatFromPath(filePath: string): ArchiveFormat | undefined {
 
 function gunzipBounded(bytes: Uint8Array): Uint8Array {
 	try {
-		return gunzipSync(bytes, { maxOutputLength: MAX_ARCHIVE_TOTAL_BYTES });
+		return gunzipSync(bytes, { maxOutputLength: MAX_TAR_CONTAINER_BYTES });
 	} catch (error) {
 		const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "";
 		if (code === "ERR_BUFFER_TOO_LARGE") throw archiveLimitError("total");
@@ -167,47 +169,91 @@ function gunzipBounded(bytes: Uint8Array): Uint8Array {
 	}
 }
 
-async function readTarEntries(bytes: Uint8Array, gzip: boolean): Promise<ArchiveIndexEntry[]> {
-	if (!gzip && bytes.byteLength > MAX_ARCHIVE_TOTAL_BYTES) {
-		throw archiveLimitError("total");
-	}
-	const payload = gzip ? gunzipBounded(bytes) : bytes;
-	let archive: Bun.Archive;
-	try {
-		archive = new Bun.Archive(payload);
-	} catch (error) {
-		throw new ToolError(error instanceof Error ? error.message : String(error));
-	}
+function isGzipBytes(bytes: Uint8Array): boolean {
+	return bytes.byteLength >= 3 && bytes[0] === 0x1f && bytes[1] === 0x8b;
+}
 
-	let files: Map<string, File>;
-	try {
-		files = await archive.files();
-	} catch (error) {
-		throw new ToolError(error instanceof Error ? error.message : String(error));
+function inflateToTar(bytes: Uint8Array, labeledGzip: boolean): Uint8Array {
+	let payload = bytes;
+	let layers = 0;
+	while (layers === 0 ? labeledGzip || isGzipBytes(payload) : isGzipBytes(payload)) {
+		layers += 1;
+		if (layers > MAX_GZIP_LAYERS) throw archiveLimitError("total");
+		payload = gunzipBounded(payload);
 	}
+	return payload;
+}
 
+function tarText(header: Uint8Array, start: number, length: number): string {
+	let end = start;
+	const stop = start + length;
+	while (end < stop && header[end] !== 0) end += 1;
+	return new TextDecoder().decode(header.subarray(start, end));
+}
+
+function tarOctal(header: Uint8Array, start: number, length: number): number {
+	const text = tarText(header, start, length).trim();
+	if (!text) return 0;
+	if (!/^[0-7]+$/.test(text)) return Number.NaN;
+	return Number.parseInt(text, 8);
+}
+
+function tarEntryName(header: Uint8Array): string {
+	const name = tarText(header, 0, 100);
+	const prefix = tarText(header, 257, 5) === "ustar" ? tarText(header, 345, 155) : "";
+	return prefix ? `${prefix}/${name}` : name;
+}
+
+async function readTarEntries(bytes: Uint8Array, labeledGzip: boolean): Promise<ArchiveIndexEntry[]> {
+	const payload = inflateToTar(bytes, labeledGzip);
+	if (payload.byteLength > MAX_TAR_CONTAINER_BYTES) throw archiveLimitError("total");
 	const entries: ArchiveIndexEntry[] = [];
 	let entryCount = 0;
-	let totalUncompressed = 0;
-	for (const [rawPath, file] of files) {
+	let memberBytes = 0;
+	let offset = 0;
+	let longName: string | undefined;
+	while (offset + 512 <= payload.byteLength) {
+		const header = payload.subarray(offset, offset + 512);
+		if (header.every(byte => byte === 0)) break;
+		const size = tarOctal(header, 124, 12);
+		if (!Number.isSafeInteger(size) || size < 0) throw new ToolError("Unsupported tar size encoding");
+		const typeFlag = header[156] ?? 0;
+		const headerName = tarEntryName(header);
+		const rawName = typeFlag === 76 ? headerName : (longName ?? headerName);
 		entryCount += 1;
 		if (entryCount > MAX_ARCHIVE_ENTRY_COUNT) throw archiveLimitError("count");
-		if (archiveEntryDepth(rawPath) > MAX_ARCHIVE_PATH_DEPTH) throw archiveLimitError("depth", rawPath);
-		if (file.size > MAX_ARCHIVE_ENTRY_BYTES) throw archiveLimitError("entry", rawPath);
-		totalUncompressed += file.size;
-		if (totalUncompressed > MAX_ARCHIVE_TOTAL_BYTES) throw archiveLimitError("total");
-		const normalizedPath = normalizeArchiveEntryPath(rawPath);
-		if (!normalizedPath) continue;
-		const mtimeMs = file.lastModified > 0 ? file.lastModified : undefined;
+		if (archiveEntryDepth(rawName) > MAX_ARCHIVE_PATH_DEPTH) throw archiveLimitError("depth", rawName);
+		if (size > MAX_ARCHIVE_TOTAL_BYTES) throw archiveLimitError("total");
+		if (size > MAX_ARCHIVE_ENTRY_BYTES) throw archiveLimitError("entry", rawName);
+		const isRegular = typeFlag === 0 || typeFlag === 48;
+		if (isRegular) {
+			memberBytes += size;
+			if (memberBytes > MAX_ARCHIVE_TOTAL_BYTES) throw archiveLimitError("total");
+		}
+		const dataEnd = offset + 512 + size;
+		if (dataEnd > payload.byteLength) throw new ToolError("Truncated tar entry");
+		const data = payload.subarray(offset + 512, dataEnd);
+		offset += 512 + Math.ceil(size / 512) * 512;
+		if (typeFlag === 76) {
+			longName = new TextDecoder().decode(data).replace(/\0+$/, "");
+			continue;
+		}
+		longName = undefined;
+		const normalizedPath = normalizeArchiveEntryPath(rawName);
+		if (!normalizedPath || !isRegular) continue;
+		const mtime = tarOctal(header, 136, 12);
+		const mtimeMs = Number.isFinite(mtime) && mtime > 0 ? mtime * 1000 : undefined;
 		entries.push({
 			path: normalizedPath,
 			isDirectory: false,
-			size: file.size,
+			size,
 			mtimeMs,
-			storage: { type: "tar", file },
+			storage: {
+				type: "tar",
+				file: new File([data], normalizedPath, { lastModified: mtimeMs ?? 0 }),
+			},
 		});
 	}
-
 	return entries;
 }
 

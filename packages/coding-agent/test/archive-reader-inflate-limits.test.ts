@@ -1,9 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, open, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { gzipSync } from "node:zlib";
 import { Zip, ZipDeflate, zipSync } from "fflate";
 import { openArchive } from "../src/tools/archive-reader";
 
@@ -12,6 +13,47 @@ const ENTRY_LIMIT = 16 * 1024 * 1024;
 const TOTAL_LIMIT = 64 * 1024 * 1024;
 const COUNT_LIMIT = 8192;
 const DEPTH_LIMIT = 48;
+
+function ustarHeader(name: string, size: number, typeFlag = "0"): Uint8Array {
+	const header = new Uint8Array(512);
+	const enc = new TextEncoder();
+	const put = (text: string, at: number) => header.set(enc.encode(text), at);
+	const nameBytes = enc.encode(name);
+	if (nameBytes.byteLength > 100) throw new Error(`ustar name exceeds 100 bytes: ${name}`);
+	header.set(nameBytes, 0);
+	put("0000644\0", 100);
+	put("0000000\0", 108);
+	put("0000000\0", 116);
+	put(`${size.toString(8).padStart(11, "0")}\0`, 124);
+	put("00000000000\0", 136);
+	header.fill(0x20, 148, 156);
+	header[156] = typeFlag.charCodeAt(0);
+	put("ustar\0", 257);
+	put("00", 263);
+	let sum = 0;
+	for (const byte of header) sum += byte;
+	put(`${sum.toString(8).padStart(6, "0")}\0 `, 148);
+	return header;
+}
+
+async function writeUstarBytes(file: string, chunks: Uint8Array[]): Promise<void> {
+	await writeFile(file, concat([...chunks, new Uint8Array(1024)]));
+}
+
+async function writeUstar(
+	file: string,
+	writeBody: (push: (chunk: Uint8Array) => Promise<void>) => Promise<void>,
+): Promise<void> {
+	const handle = await open(file, "w");
+	try {
+		await writeBody(async chunk => {
+			await handle.write(chunk);
+		});
+		await handle.write(new Uint8Array(1024));
+	} finally {
+		await handle.close();
+	}
+}
 
 function concat(parts: Uint8Array[]): Uint8Array {
 	const total = parts.reduce((sum, part) => sum + part.byteLength, 0);
@@ -168,5 +210,262 @@ describe("openArchive inflate caps", () => {
 			}
 		}),
 		20_000,
+	);
+
+	test(
+		"still allows a crafted ustar member",
+		noted("still allows a crafted ustar member", async () => {
+			const dir = await mkdtemp(path.join(tmpdir(), "archive-ustar-"));
+			try {
+				const archivePath = path.join(dir, "ok.tar");
+				const body = new TextEncoder().encode("hello");
+				await writeUstar(archivePath, async push => {
+					await push(ustarHeader("hello.txt", body.byteLength));
+					await push(body);
+					await push(new Uint8Array((512 - (body.byteLength % 512)) % 512));
+				});
+				const archive = await openArchive(archivePath);
+				expect(new TextDecoder().decode((await archive.readFile("hello.txt")).bytes)).toBe("hello");
+			} finally {
+				await rm(dir, { recursive: true, force: true });
+			}
+		}),
+	);
+
+	test(
+		"still allows a small gzip payload with a tar name",
+		noted("still allows a small gzip payload with a tar name", async () => {
+			const dir = await mkdtemp(path.join(tmpdir(), "archive-gzname-"));
+			try {
+				await writeFile(path.join(dir, "hello.txt"), "hello");
+				const gzipPath = path.join(dir, "ok.tar.gz");
+				await exec("tar", ["-czf", gzipPath, "-C", dir, "hello.txt"]);
+				const namedTar = path.join(dir, "ok.tar");
+				await writeFile(namedTar, await Bun.file(gzipPath).bytes());
+				const archive = await openArchive(namedTar);
+				expect(new TextDecoder().decode((await archive.readFile("hello.txt")).bytes)).toBe("hello");
+			} finally {
+				await rm(dir, { recursive: true, force: true });
+			}
+		}),
+	);
+
+	test(
+		"rejects gzip bytes in a tar name past the total cap",
+		noted("rejects gzip bytes in a tar name past the total cap", async () => {
+			const dir = await mkdtemp(path.join(tmpdir(), "archive-gztar-"));
+			try {
+				await writeFile(path.join(dir, "big.bin"), new Uint8Array(TOTAL_LIMIT + 1));
+				const gzipPath = path.join(dir, "bomb.tar.gz");
+				await exec("tar", ["-czf", gzipPath, "-C", dir, "big.bin"]);
+				const namedTar = path.join(dir, "bomb.tar");
+				await writeFile(namedTar, await Bun.file(gzipPath).bytes());
+				await expect(openArchive(namedTar)).rejects.toThrow(/total limit/);
+			} finally {
+				await rm(dir, { recursive: true, force: true });
+			}
+		}),
+		60_000,
+	);
+
+	test(
+		"still allows a small tar under two gzip wrappers",
+		noted("still allows a small tar under two gzip wrappers", async () => {
+			const dir = await mkdtemp(path.join(tmpdir(), "archive-gz2-"));
+			try {
+				await writeFile(path.join(dir, "hello.txt"), "hello");
+				const once = path.join(dir, "once.tar.gz");
+				await exec("tar", ["-czf", once, "-C", dir, "hello.txt"]);
+				const twice = path.join(dir, "twice.tar.gz");
+				await writeFile(twice, gzipSync(await Bun.file(once).bytes()));
+				const archive = await openArchive(twice);
+				expect(new TextDecoder().decode((await archive.readFile("hello.txt")).bytes)).toBe("hello");
+			} finally {
+				await rm(dir, { recursive: true, force: true });
+			}
+		}),
+	);
+
+	test(
+		"rejects a second gzip wrapper past the total cap",
+		noted("rejects a second gzip wrapper past the total cap", async () => {
+			const dir = await mkdtemp(path.join(tmpdir(), "archive-gz2bomb-"));
+			try {
+				await writeFile(path.join(dir, "big.bin"), new Uint8Array(TOTAL_LIMIT + 1));
+				const once = path.join(dir, "once.tar.gz");
+				await exec("tar", ["-czf", once, "-C", dir, "big.bin"]);
+				const twice = path.join(dir, "twice.tar.gz");
+				await writeFile(twice, gzipSync(await Bun.file(once).bytes()));
+				await expect(openArchive(twice)).rejects.toThrow(/total limit/);
+			} finally {
+				await rm(dir, { recursive: true, force: true });
+			}
+		}),
+		60_000,
+	);
+
+	test(
+		"rejects directory-only tar entries past the count cap",
+		noted("rejects directory-only tar entries past the count cap", async () => {
+			const dir = await mkdtemp(path.join(tmpdir(), "archive-dircount-"));
+			try {
+				const archivePath = path.join(dir, "dirs.tar");
+				const headers: Uint8Array[] = [];
+				for (let index = 0; index < COUNT_LIMIT + 1; index++) headers.push(ustarHeader(`d${index}/`, 0, "5"));
+				await writeUstarBytes(archivePath, headers);
+				await expect(openArchive(archivePath)).rejects.toThrow(/too many entries/);
+			} finally {
+				await rm(dir, { recursive: true, force: true });
+			}
+		}),
+		20_000,
+	);
+
+	test(
+		"still allows a directory-only tar at the count cap",
+		noted("still allows a directory-only tar at the count cap", async () => {
+			const dir = await mkdtemp(path.join(tmpdir(), "archive-dirkeep-"));
+			try {
+				const archivePath = path.join(dir, "dirs.tar");
+				const headers: Uint8Array[] = [];
+				for (let index = 0; index < COUNT_LIMIT; index++) headers.push(ustarHeader(`d${index}/`, 0, "5"));
+				await writeUstarBytes(archivePath, headers);
+				await openArchive(archivePath);
+			} finally {
+				await rm(dir, { recursive: true, force: true });
+			}
+		}),
+		20_000,
+	);
+
+	test(
+		"rejects a directory-only tar nested past the depth cap",
+		noted("rejects a directory-only tar nested past the depth cap", async () => {
+			const dir = await mkdtemp(path.join(tmpdir(), "archive-dirdeep-"));
+			try {
+				const archivePath = path.join(dir, "deep.tar");
+				const name = "a/".repeat(DEPTH_LIMIT + 1);
+				await writeUstar(archivePath, async push => {
+					await push(ustarHeader(name, 0, "5"));
+				});
+				await expect(openArchive(archivePath)).rejects.toThrow(/nested too deeply/);
+			} finally {
+				await rm(dir, { recursive: true, force: true });
+			}
+		}),
+	);
+
+	test(
+		"still allows a tar member at the depth cap",
+		noted("still allows a tar member at the depth cap", async () => {
+			const dir = await mkdtemp(path.join(tmpdir(), "archive-tardepth-"));
+			try {
+				const archivePath = path.join(dir, "deep.tar");
+				const name = `${"a/".repeat(DEPTH_LIMIT - 1)}f.txt`;
+				await writeUstar(archivePath, async push => {
+					await push(ustarHeader(name, 1));
+					await push(new Uint8Array([65]));
+					await push(new Uint8Array(511));
+				});
+				const archive = await openArchive(archivePath);
+				expect((await archive.readFile(name)).bytes[0]).toBe(65);
+			} finally {
+				await rm(dir, { recursive: true, force: true });
+			}
+		}),
+	);
+
+	test(
+		"rejects duplicate tar paths past the count cap",
+		noted("rejects duplicate tar paths past the count cap", async () => {
+			const dir = await mkdtemp(path.join(tmpdir(), "archive-dup-"));
+			try {
+				const archivePath = path.join(dir, "dup.tar");
+				const headers: Uint8Array[] = [];
+				for (let index = 0; index < COUNT_LIMIT + 1; index++) headers.push(ustarHeader("a.txt", 0));
+				await writeUstarBytes(archivePath, headers);
+				await expect(openArchive(archivePath)).rejects.toThrow(/too many entries/);
+			} finally {
+				await rm(dir, { recursive: true, force: true });
+			}
+		}),
+		20_000,
+	);
+
+	test(
+		"rejects a tar entry from its declared size before the body",
+		noted("rejects a tar entry from its declared size before the body", async () => {
+			const dir = await mkdtemp(path.join(tmpdir(), "archive-decl-"));
+			try {
+				const archivePath = path.join(dir, "declared.tar");
+				await writeUstar(archivePath, async push => {
+					await push(ustarHeader("big.bin", ENTRY_LIMIT + 1));
+				});
+				await expect(openArchive(archivePath)).rejects.toThrow(/per-entry limit/);
+			} finally {
+				await rm(dir, { recursive: true, force: true });
+			}
+		}),
+	);
+
+	test(
+		"still allows four max-size tar members",
+		noted("still allows four max-size tar members", async () => {
+			const dir = await mkdtemp(path.join(tmpdir(), "archive-four-"));
+			try {
+				const archivePath = path.join(dir, "four.tar");
+				const chunk = new Uint8Array(1024 * 1024);
+				await writeUstar(archivePath, async push => {
+					for (let index = 0; index < 4; index++) {
+						await push(ustarHeader(`p${index}.bin`, ENTRY_LIMIT));
+						let left = ENTRY_LIMIT;
+						while (left > 0) {
+							const n = Math.min(chunk.byteLength, left);
+							await push(chunk.subarray(0, n));
+							left -= n;
+						}
+					}
+				});
+				const archive = await openArchive(archivePath);
+				expect((await archive.readFile("p0.bin")).bytes.byteLength).toBe(ENTRY_LIMIT);
+				expect((await archive.readFile("p3.bin")).bytes.byteLength).toBe(ENTRY_LIMIT);
+			} finally {
+				await rm(dir, { recursive: true, force: true });
+			}
+		}),
+		60_000,
+	);
+
+	test(
+		"still allows four max-size tar.gz members",
+		noted("still allows four max-size tar.gz members", async () => {
+			const dir = await mkdtemp(path.join(tmpdir(), "archive-fourgz-"));
+			try {
+				const rawPath = path.join(dir, "four.tar");
+				const chunk = new Uint8Array(1024 * 1024);
+				await writeUstar(rawPath, async push => {
+					for (let index = 0; index < 4; index++) {
+						await push(ustarHeader(`p${index}.bin`, ENTRY_LIMIT));
+						let left = ENTRY_LIMIT;
+						while (left > 0) {
+							const n = Math.min(chunk.byteLength, left);
+							await push(chunk.subarray(0, n));
+							left -= n;
+						}
+					}
+				});
+				const gzipPath = path.join(dir, "four.tar.gz");
+				await exec("gzip", ["-c", "-n", rawPath], { encoding: "buffer", maxBuffer: 8 * 1024 * 1024 }).then(
+					async result => {
+						await writeFile(gzipPath, result.stdout);
+					},
+				);
+				const archive = await openArchive(gzipPath);
+				expect((await archive.readFile("p0.bin")).bytes.byteLength).toBe(ENTRY_LIMIT);
+			} finally {
+				await rm(dir, { recursive: true, force: true });
+			}
+		}),
+		60_000,
 	);
 });
