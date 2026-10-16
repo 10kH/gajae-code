@@ -21,6 +21,8 @@ import hashlineDescription from "../prompts/tools/hashline.md" with { type: "tex
 import patchDescription from "../prompts/tools/patch.md" with { type: "text" };
 import replaceDescription from "../prompts/tools/replace.md" with { type: "text" };
 import type { ToolSession } from "../tools";
+import { assertEditableFile } from "../tools/auto-generated-guard";
+import { resolvePlanPath } from "../tools/plan-mode-guard";
 import { VimTool, vimSchema } from "../tools/vim";
 import { type EditMode, resolveEditMode, resolveForcedEnvEditMode } from "../utils/edit-mode";
 import type { VimToolDetails } from "../vim/types";
@@ -165,6 +167,22 @@ function createEditWritethrough(session: ToolSession): WritethroughCallback {
 	const enableDiagnostics = enableLsp && session.settings.get("lsp.diagnosticsOnEdit");
 	const enableFormat = enableLsp && session.settings.get("lsp.formatOnWrite");
 	return enableLsp ? createLspWritethrough(session.cwd, { enableFormat, enableDiagnostics }) : writethroughNoop;
+}
+
+/** Refuse a generated source or rename destination before any entry in the request writes. */
+async function assertPatchEntriesEditable(
+	session: ToolSession,
+	entries: { path: string; rename?: string }[],
+): Promise<void> {
+	for (const entry of entries) {
+		const resolvedPath = resolvePlanPath(session, entry.path);
+		await assertEditableFile(resolvedPath, entry.path, session.settings);
+		if (!entry.rename) continue;
+		const resolvedRename = resolvePlanPath(session, entry.rename);
+		if (resolvedRename !== resolvedPath) {
+			await assertEditableFile(resolvedRename, entry.rename, session.settings);
+		}
+	}
 }
 
 /** Run apply_patch file operations and aggregate their multi-file result. */
@@ -403,7 +421,7 @@ export class EditTool implements AgentTool<TInput> {
 			patch: {
 				description: () => prompt.render(patchDescription),
 				parameters: patchEditSchema,
-				execute: (
+				execute: async (
 					tool: EditTool,
 					params: EditParams,
 					signal: AbortSignal | undefined,
@@ -411,7 +429,12 @@ export class EditTool implements AgentTool<TInput> {
 					onUpdate?: (partialResult: AgentToolResult<EditToolDetails, TInput>) => void,
 				) => {
 					const { edits, path } = params as PatchParams;
-					const runs = (edits as PatchEditEntry[]).map(
+					const patchEdits = edits as PatchEditEntry[];
+					await assertPatchEntriesEditable(
+						tool.session,
+						patchEdits.map(entry => ({ path, rename: entry.rename })),
+					);
+					const runs = patchEdits.map(
 						entry => (br: LspBatchRequest | undefined) =>
 							executePatchSingle({
 								session: tool.session,
@@ -431,7 +454,7 @@ export class EditTool implements AgentTool<TInput> {
 			apply_patch: {
 				description: () => prompt.render(applyPatchDescription),
 				parameters: applyPatchSchema,
-				execute: (
+				execute: async (
 					tool: EditTool,
 					params: EditParams,
 					signal: AbortSignal | undefined,
@@ -439,6 +462,10 @@ export class EditTool implements AgentTool<TInput> {
 					onUpdate?: (partialResult: AgentToolResult<EditToolDetails, TInput>) => void,
 				) => {
 					const entries = expandApplyPatchToEntries(params as ApplyPatchParams);
+					await assertPatchEntriesEditable(
+						tool.session,
+						entries.map(entry => ({ path: entry.path, rename: entry.rename })),
+					);
 					const perFile = entries.map(entry => {
 						const { path, ...patchParams } = entry;
 						return {

@@ -104,6 +104,78 @@ it("still allows a patch rename onto a new handwritten path", async () => {
 	expect(await Bun.file(path.join(tempDir, "product.ts")).exists()).toBe(false);
 });
 
+it("refuses a later patch rename onto an auto-generated file before writing the earlier edit", async () => {
+	const source = path.join(tempDir, "product.ts");
+	await Bun.write(source, SOURCE);
+	await Bun.write(path.join(tempDir, "widget.pb.go"), "package widget\n");
+
+	const tool = new EditTool(makeSession(tempDir, true), "patch");
+	await expect(
+		tool.execute("patch-rename-multi", {
+			path: "product.ts",
+			edits: [
+				{ op: "update", diff: DIFF },
+				{ op: "update", rename: "widget.pb.go", diff: "@@\n-moved\n+again" },
+			],
+		}),
+	).rejects.toThrow(/Cannot modify auto-generated file/);
+
+	expect(await Bun.file(source).text()).toBe(SOURCE);
+	expect(await Bun.file(path.join(tempDir, "widget.pb.go")).text()).toBe("package widget\n");
+});
+
+it("refuses an apply_patch rename onto an auto-generated file before writing an earlier file", async () => {
+	await Bun.write(path.join(tempDir, "first.ts"), "old\n");
+	await Bun.write(path.join(tempDir, "product.ts"), SOURCE);
+	await Bun.write(path.join(tempDir, "widget.pb.go"), "package widget\n");
+
+	const tool = new EditTool(makeSession(tempDir, true), "apply_patch");
+	const input = [
+		"*** Begin Patch",
+		"*** Update File: first.ts",
+		"@@",
+		"-old",
+		"+changed",
+		"*** Update File: product.ts",
+		"*** Move to: widget.pb.go",
+		"@@",
+		"-line",
+		"+moved",
+		"*** End Patch",
+	].join("\n");
+	await expect(tool.execute("apply-patch-rename-autogen", { input })).rejects.toThrow(
+		/Cannot modify auto-generated file/,
+	);
+
+	expect(await Bun.file(path.join(tempDir, "first.ts")).text()).toBe("old\n");
+	expect(await Bun.file(path.join(tempDir, "product.ts")).text()).toBe(SOURCE);
+	expect(await Bun.file(path.join(tempDir, "widget.pb.go")).text()).toBe("package widget\n");
+});
+
+it("still allows two handwritten files in one apply_patch", async () => {
+	await Bun.write(path.join(tempDir, "a.ts"), "a\n");
+	await Bun.write(path.join(tempDir, "c.ts"), "c\n");
+
+	const tool = new EditTool(makeSession(tempDir, true), "apply_patch");
+	const input = [
+		"*** Begin Patch",
+		"*** Update File: a.ts",
+		"@@",
+		"-a",
+		"+b",
+		"*** Update File: c.ts",
+		"@@",
+		"-c",
+		"+d",
+		"*** End Patch",
+	].join("\n");
+	const result = await tool.execute("apply-patch-two-handwritten", { input });
+
+	expect(result.isError).toBeUndefined();
+	expect(await Bun.file(path.join(tempDir, "a.ts")).text()).toBe("b\n");
+	expect(await Bun.file(path.join(tempDir, "c.ts")).text()).toBe("d\n");
+});
+
 it("still allows a patch rename onto an auto-generated file when the setting is off", async () => {
 	await writePair("product.ts", "widget.pb.go", "package widget\n");
 
