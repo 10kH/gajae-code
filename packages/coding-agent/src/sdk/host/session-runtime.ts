@@ -560,7 +560,10 @@ export class SessionSdkSessionRuntime {
 						frame.type === "event_replay" &&
 						isStringArray(frame.capabilities)
 					) {
-						this.#connectionCapabilities.set(connectionId, new Set(frame.capabilities));
+						this.#connectionCapabilities.set(
+							connectionId,
+							new Set([...(this.#connectionCapabilities.get(connectionId) ?? []), ...frame.capabilities]),
+						);
 					}
 					handler(connectionId, frame);
 				}),
