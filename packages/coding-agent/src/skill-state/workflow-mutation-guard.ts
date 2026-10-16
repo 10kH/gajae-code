@@ -132,7 +132,7 @@ const BASH_INTERPRETER_WRITE_API_PATTERNS = [
 const BASH_INTERPRETER_WRITE_API = `(?:${BASH_INTERPRETER_WRITE_API_PATTERNS.join("|")})`;
 const BASH_INTERPRETER_WRITE_API_EXCLUDING_OPEN = `(?:${BASH_INTERPRETER_WRITE_API_PATTERNS.slice(1).join("|")})`;
 const INTERPRETER_OUTPUT_METHOD_ASSIGNMENT_RE =
-	/^\b(?:(?:process|Bun|Deno|sys)\s*\.\s*(?:stdout|stderr)|(?:(?:globalThis|global)\s*\.\s*)?console)(?:\s*(?:\.\s*[\w$]+|\[\s*[^\]]+\s*\]))?\s*(?:\|\|=|&&=|\?\?=|[+\-*/%&|^]?=(?!=|>))/;
+	/^\b(?:(?:process|Bun|Deno|sys)(?:\s*\.\s*(?:stdout|stderr)|\s*\[\s*[^\]]+\s*\])|(?:(?:globalThis|global)\s*\.\s*)?console)(?:\s*(?:\.\s*[\w$]+|\[\s*[^\]]+\s*\]))?\s*(?:\|\|=|&&=|\?\?=|[+\-*/%&|^]?=(?!=|>))/;
 /**
  * Inline interpreter source is opaque whenever it exposes code evaluation or
  * reflective loading. This deliberately scans the complete source spelling,
@@ -3192,6 +3192,7 @@ function pathlibOpenModeWrites(code: string, methodAt: number): boolean | null {
 /** Calls inside strings or comments are skipped. A non-literal write path fails closed. */
 function scanInterpreterWrites(code: string, language: "py" | "js", targets: ExtractedTargets): void {
 	let index = 0;
+	const recognizedPathMethodIndexes = new Set<number>();
 	while (index < code.length) {
 		const trivia = skipNoise(code, index, language);
 		if (trivia !== index) {
@@ -3223,6 +3224,24 @@ function scanInterpreterWrites(code: string, language: "py" | "js", targets: Ext
 			targets.explicitMutation = true;
 			targets.unknown = true;
 			return;
+		}
+		let receiverDot = index - 1;
+		while (receiverDot >= 0 && /\s/.test(code[receiverDot] ?? "")) receiverDot -= 1;
+		const unresolvedPathMethod =
+			language === "py" &&
+			code[receiverDot] === "." &&
+			(/^write_\w+$/.test(name) || name === "touch" || name === "open");
+		if (unresolvedPathMethod && !recognizedPathMethodIndexes.has(index)) {
+			const callAt = skipCallGap(code, index + name.length);
+			if (code[callAt] === "(") {
+				const writes = name === "open" ? pathlibOpenModeWrites(code, receiverDot) : true;
+				if (writes !== false) {
+					targets.explicitMutation = true;
+					targets.unknown = true;
+				}
+				index = Math.max(callAt + 1, index + name.length);
+				continue;
+			}
 		}
 		if ((name === "write" || name === "append") && previous === ".") {
 			index += name.length;
@@ -3260,6 +3279,9 @@ function scanInterpreterWrites(code: string, language: "py" | "js", targets: Ext
 			}
 			const method = /^\s*\.\s*(write_\w+|open|touch)\s*\(/.exec(code.slice(ctor.after));
 			if (method) {
+				if (ctor.parts.length > 1) {
+					recognizedPathMethodIndexes.add(ctor.after + method[0].indexOf(method[1]));
+				}
 				const writes = method[1] === "open" ? pathlibOpenModeWrites(code, ctor.after) : true;
 				if (writes !== false) {
 					targets.explicitMutation = true;

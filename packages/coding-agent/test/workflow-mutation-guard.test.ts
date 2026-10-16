@@ -2126,6 +2126,19 @@ describe("bash scanner quoting model", () => {
 		});
 		expect(dynamic.blocked).toBe(true);
 		expect(dynamic.reason).toBe("unknown-target");
+		for (const code of [
+			'from pathlib import Path as P; P("src/product.ts").write_text("x")\n',
+			'from pathlib import Path; Path("src").joinpath("product.ts").write_text("x")\n',
+		]) {
+			const decision = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("python"),
+				args: { code },
+			});
+			expect(decision.blocked, code).toBe(true);
+			expect(decision.reason, code).toBe("unknown-target");
+		}
 	});
 
 	it("resets a Path receiver at a later absolute component before the scratch check", async () => {
@@ -2364,6 +2377,18 @@ describe("bash scanner quoting model", () => {
 				target: "src/product.ts",
 			},
 			{
+				name: "Python pathlib Path imported under an alias fails closed",
+				command: `python3 -c 'from pathlib import Path as P; P("src/product.ts").write_text("PWNED")'`,
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
+				name: "Python chained pathlib write fails closed",
+				command: `python3 -c 'from pathlib import Path; Path("src").joinpath("product.ts").write_text("PWNED")'`,
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
 				name: "Python built-in open for writing",
 				command: `python3 -c 'open("src/product.ts", "w").write("PWNED")'`,
 				blocked: true,
@@ -2404,6 +2429,12 @@ describe("bash scanner quoting model", () => {
 			{
 				name: "Node process.stdout.write rebound to a file writer",
 				command: `node -e 'process.stdout.write=process.getBuiltinModule("fs")["writeFileSync"],process.stdout.write("src/product.ts","PWNED")'`,
+				blocked: true,
+				reason: "unknown-target",
+			},
+			{
+				name: "Node bracketed process.stdout access rebound to a file writer",
+				command: `node -e 'process["stdout"].write=process.getBuiltinModule("fs").writeFileSync;process.stdout.write("src/product.ts","PWNED")'`,
 				blocked: true,
 				reason: "unknown-target",
 			},
@@ -2603,6 +2634,7 @@ describe("bash scanner quoting model", () => {
 			`if awk '$1 > "m" { print }' input; then :; fi`,
 			`python3 -c "import os; os.system('ls')"`,
 			`python3 -c "import pathlib; pathlib.Path('src/product.ts').open('r').read()"`,
+			`python3 -c 'from pathlib import Path as P; P("src").joinpath("product.ts").open("r").read()'`,
 			`python3 -c 'from pathlib import Path; Path("/tmp/ralplan-note.md").write_text("x")'`,
 			`python3 -c $'print("open(")'`,
 			`python3 -c "print('writeFileSync(')"`,
