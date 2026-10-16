@@ -2080,8 +2080,10 @@ describe("bash scanner quoting model", () => {
 		const cwd = await makeTempRoot();
 		await writeActiveSkill(cwd, "ralplan", "planner");
 		const scratch = path.join(os.tmpdir(), `gjc-plan-bash-${process.pid}.txt`);
+		const escapedScratch = path.join(os.tmpdir(), `gjc-plan-escaped\\${process.pid}.txt`);
 		const blocked = [
 			"sed -n 'w src/product.ts' stage/pwn.txt",
+			"sed -e 'w src/product.ts' stage/pwn.txt",
 			"sed -n 's/a/b/w src/product.ts' stage/pwn.txt",
 			`python3 -c "import shutil; shutil.copy('stage/pwn.txt','src/product.ts')"`,
 			`python3 -c "import os; os.system('printf PWNED > src/product.ts')"`,
@@ -2091,6 +2093,7 @@ describe("bash scanner quoting model", () => {
 			`awk 'BEGIN{printf "PWNED" > "src/product.ts"}'`,
 			`awk -v x=1 'BEGIN { print "PWNED" > "src/product.ts" }' input`,
 			`awk 'BEGIN { print 1; print "PWNED" > "src/product.ts" }' input`,
+			"awk -W unsupported-extension",
 			`if awk 'BEGIN { print "PWNED" > "src/product.ts" }' input; then :; fi`,
 			"ln -sf stage/pwn.txt src/product.ts",
 			`python3 -c "import os; os.symlink('stage/pwn.txt','src/pwn-link.ts')"`,
@@ -2129,22 +2132,30 @@ describe("bash scanner quoting model", () => {
 
 		for (const command of [
 			"sed -n '1p' src/product.ts",
+			"sed -n '1p' 'w src/product.ts'",
+			"sed -e '1p' 'w src/product.ts'",
 			"sed -n '1,80p' packages/coding-agent/src/skill-state/workflow-mutation-guard.ts",
 			"sed -n 's/a/b/p' src/product.ts",
 			"awk '$1 > 5 {print $1}' src/product.ts",
 			`awk '$1 > "m" { print }' input`,
+			"awk -W version",
 			`awk 'BEGIN { print 1 # > "src/product.ts"\n}' input`,
 			`awk -v x=1 'BEGIN { print x }' input`,
 			`if awk '$1 > "m" { print }' input; then :; fi`,
 			`python3 -c "import os; os.system('ls')"`,
+			`python3 -c "print('shutil.copy(')"`,
+			`python3 -c "print(1) # shutil.copy('stage/pwn.txt','src/product.ts')"`,
 			`python3 -c "print(1)"`,
+			`node -e "console.log('appendFileSync(')"`,
+			`node -e "/* appendFileSync('src/product.ts','x') */ console.log(1)"`,
 			`node -e "console.log(1)"`,
 			`perl -e 'print 1'`,
 			"ls src/product.ts",
 			"readlink src/product.ts",
 			`ln -sf stage/pwn.txt ${scratch}`,
 			`sed -n 'w ${scratch}' src/product.ts`,
-			`awk 'BEGIN{printf "x" > "${scratch}"}'`,
+			`awk 'BEGIN { printf "x" > ${JSON.stringify(scratch)} }'`,
+			`awk 'BEGIN { printf "x" > ${JSON.stringify(escapedScratch)} }'`,
 		]) {
 			const decision = await getWorkflowMutationDecision({
 				cwd,

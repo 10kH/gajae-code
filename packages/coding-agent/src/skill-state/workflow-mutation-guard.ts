@@ -108,10 +108,6 @@ const BASH_IN_PLACE_MUTATION_COMMAND_RE = new RegExp(
  */
 const BASH_INTERPRETER_WRITE_API =
 	"(?:open\\s*\\(|writeFile(?:Sync)?\\s*\\(|appendFile(?:Sync)?\\s*\\(|\\.write\\s*\\(|shutil\\s*\\.\\s*(?:copy2?|copyfileobj|copyfile)\\s*\\(|os\\s*\\.\\s*symlink\\s*\\()";
-const BASH_OPAQUE_INTERPRETER_WRITE_RE = new RegExp(
-	`(?:^|[;&|\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?(?:python3?|node|ruby|perl)\\b[^;&|\\n]*(?:-c|-e)\\b[^;&|\\n]*${BASH_INTERPRETER_WRITE_API}`,
-	"i",
-);
 const BASH_HEREDOC_OPAQUE_INTERPRETER_WRITE_RE = new RegExp(
 	`(?:^|[;&|\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?(?:python3?|node|ruby|perl)\\b[^;&|\\n]*(?:<<[-]?\\s*['"]?\\w+['"]?)[\\s\\S]*${BASH_INTERPRETER_WRITE_API}`,
 	"i",
@@ -1831,7 +1827,15 @@ function collectInterpreterOneLinerWrites(command: string, targets: ExtractedTar
 			const part = parts[index] ?? "";
 			if (part !== "-c" && part !== "-e") continue;
 			const script = parts[index + 1] ?? "";
-			if (api.test(script)) {
+			const commandName = match[0] ?? "";
+			const language = isPython
+				? "py"
+				: /\bnode\b/i.test(commandName)
+					? "js"
+					: /\bruby\b/i.test(commandName)
+						? "ruby"
+						: "perl";
+			if (interpreterCodeContainsWriteApi(script, language, api)) {
 				targets.explicitMutation = true;
 				targets.unknown = true;
 				return;
@@ -1841,17 +1845,142 @@ function collectInterpreterOneLinerWrites(command: string, targets: ExtractedTar
 	}
 }
 
+function interpreterCodeContainsWriteApi(
+	script: string,
+	language: "py" | "js" | "ruby" | "perl",
+	api: RegExp,
+): boolean {
+	const apiAtStart = new RegExp(`^(?:${BASH_INTERPRETER_WRITE_API})`, "i");
+	let index = 0;
+	while (index < script.length) {
+		if (language === "py" || language === "js") {
+			const next =
+				language === "js" && script[index] === "`"
+					? skipJavaScriptTemplate(script, index)
+					: skipNoise(script, index, language);
+			if (next !== index) {
+				const skipped = script.slice(index, next);
+				const isInterpolated =
+					(language === "js" && script[index] === "`" && skipped.includes("${")) ||
+					(language === "py" &&
+						/(?:^|[^\w])(?:[rR]?[fF]|[fF][rR])$/.test(script.slice(Math.max(0, index - 3), index)) &&
+						skipped.includes("{"));
+				if (isInterpolated && api.test(skipped)) return true;
+				index = next;
+				continue;
+			}
+		} else {
+			const next = skipOtherInterpreterNoise(script, index);
+			if (next !== index) {
+				const skipped = script.slice(index, next);
+				if (language === "ruby" && script[index] !== "'" && skipped.includes("#{") && api.test(skipped))
+					return true;
+				index = next;
+				continue;
+			}
+		}
+		if (apiAtStart.test(script.slice(index))) return true;
+		index += 1;
+	}
+	return false;
+}
+
+function skipJavaScriptTemplate(script: string, index: number): number {
+	let cursor = index + 1;
+	while (cursor < script.length) {
+		if (script[cursor] === "\\") {
+			cursor += 2;
+			continue;
+		}
+		if (script[cursor] === "`") return cursor + 1;
+		cursor += 1;
+	}
+	return script.length;
+}
+
+function skipOtherInterpreterNoise(script: string, index: number): number {
+	const character = script[index] ?? "";
+	if (character === "#") {
+		const end = script.indexOf("\n", index);
+		return end < 0 ? script.length : end;
+	}
+	if (character !== "'" && character !== '"' && character !== "`") return index;
+	let cursor = index + 1;
+	while (cursor < script.length) {
+		if (script[cursor] === "\\") {
+			cursor += 2;
+			continue;
+		}
+		if (script[cursor] === character) return cursor + 1;
+		cursor += 1;
+	}
+	return script.length;
+}
+
 function collectSedScriptWrites(command: string, targets: ExtractedTargets): void {
 	for (const match of command.matchAll(BASH_SED_COMMAND_RE)) {
-		for (const part of shellWords(match[1] ?? "").map(cleanShellWord)) {
-			if (!part || part.startsWith("-")) continue;
-			const writePath = sedScriptWritePath(part);
+		const words = shellWords(match[1] ?? "").map(cleanShellWord);
+		const parsed = sedScriptOperands(words);
+		if (parsed.unknown) {
+			targets.explicitMutation = true;
+			targets.unknown = true;
+		}
+		for (const script of parsed.scripts) {
+			const writePath = sedScriptWritePath(script);
 			if (writePath === undefined) continue;
 			targets.explicitMutation = true;
 			if (writePath && !isDeviceSinkPath(writePath)) addPath(targets, writePath);
 			else if (!writePath) targets.unknown = true;
 		}
 	}
+}
+
+function sedScriptOperands(words: string[]): { scripts: string[]; unknown: boolean } {
+	const scripts: string[] = [];
+	let hasBareScript = false;
+	let unknown = false;
+	for (let index = 0; index < words.length; index++) {
+		const word = words[index] ?? "";
+		if (!word) continue;
+		if (word === "--") {
+			if (!hasBareScript && scripts.length === 0 && words[index + 1]) scripts.push(words[index + 1] ?? "");
+			break;
+		}
+		if (word === "-e" || word === "--expression") {
+			const script = words[index + 1];
+			if (script) scripts.push(script);
+			index += 1;
+			continue;
+		}
+		if (word.startsWith("--expression=")) {
+			scripts.push(word.slice("--expression=".length));
+			continue;
+		}
+		if (word.startsWith("-e") && word.length > 2) {
+			scripts.push(word.slice(2));
+			continue;
+		}
+		if (word === "-f" || word === "--file") {
+			// The script contents are not present in the command, so their write behavior is opaque.
+			unknown = true;
+			index += 1;
+			continue;
+		}
+		if (word.startsWith("--file=") || (word.startsWith("-f") && word.length > 2)) {
+			unknown = true;
+			continue;
+		}
+		if (word === "-l" || word === "--line-length") {
+			index += 1;
+			continue;
+		}
+		if (word.startsWith("-")) continue;
+		if (!hasBareScript && scripts.length === 0) {
+			scripts.push(word);
+			hasBareScript = true;
+		}
+	}
+	return { scripts, unknown };
 }
 
 function shellSyntaxPosition(command: string, targetIndex: number, allowComment = false): boolean {
@@ -1927,7 +2056,7 @@ function awkRegexEnd(program: string, start: number): number | undefined {
 interface AwkToken {
 	kind: "word" | "string" | "symbol" | "separator";
 	value: string;
-	escaped?: boolean;
+	unsafeEscapes?: boolean;
 }
 
 function tokenizeAwkProgram(program: string): { tokens: AwkToken[]; balanced: boolean } {
@@ -1950,16 +2079,68 @@ function tokenizeAwkProgram(program: string): { tokens: AwkToken[]; balanced: bo
 		}
 		if (character === '"') {
 			let value = "";
-			let escaped = false;
+			let unsafeEscapes = false;
 			let closed = false;
 			index++;
 			while (index < program.length) {
 				const next = program[index] ?? "";
 				if (next === "\\") {
-					escaped = true;
-					index += 2;
-					if (index < program.length) value += program[index];
-					index++;
+					const escapedChar = program[index + 1] ?? "";
+					if (escapedChar === "\\" || escapedChar === '"') {
+						value += escapedChar;
+						index += 2;
+						continue;
+					}
+					switch (escapedChar) {
+						case "a":
+							value += "\u0007";
+							index += 2;
+							continue;
+						case "b":
+							value += "\b";
+							index += 2;
+							continue;
+						case "f":
+							value += "\f";
+							index += 2;
+							continue;
+						case "n":
+							value += "\n";
+							index += 2;
+							continue;
+						case "r":
+							value += "\r";
+							index += 2;
+							continue;
+						case "t":
+							value += "\t";
+							index += 2;
+							continue;
+						case "v":
+							value += "\u000b";
+							index += 2;
+							continue;
+					}
+					if (/[0-7]/.test(escapedChar)) {
+						let end = index + 1;
+						while (end < program.length && end < index + 4 && /[0-7]/.test(program[end] ?? "")) end++;
+						value += String.fromCharCode(Number.parseInt(program.slice(index + 1, end), 8));
+						index = end;
+						continue;
+					}
+					if (escapedChar === "x") {
+						let end = index + 2;
+						while (end < program.length && /[\da-f]/i.test(program[end] ?? "")) end++;
+						const hex = program.slice(index + 2, end);
+						const codePoint = hex ? Number.parseInt(hex, 16) : Number.NaN;
+						if (hex && codePoint <= 0xffff) value += String.fromCharCode(codePoint);
+						else unsafeEscapes = true;
+						index = end;
+						continue;
+					}
+					unsafeEscapes = true;
+					if (escapedChar) value += escapedChar;
+					index += escapedChar ? 2 : 1;
 					continue;
 				}
 				if (next === '"') {
@@ -1971,7 +2152,7 @@ function tokenizeAwkProgram(program: string): { tokens: AwkToken[]; balanced: bo
 				index++;
 			}
 			if (!closed) balanced = false;
-			tokens.push({ kind: "string", value, escaped });
+			tokens.push({ kind: "string", value, unsafeEscapes });
 			continue;
 		}
 		if (character === "/" && awkRegexCanStart(tokens)) {
@@ -2110,6 +2291,21 @@ function awkPrograms(words: string[]): { programs: AwkProgramSource[]; unknown: 
 			index++;
 			continue;
 		}
+		if (part === "-W") {
+			if (operand(index) !== "version") {
+				unknown = true;
+				break;
+			}
+			index++;
+			continue;
+		}
+		if (part.startsWith("-W")) {
+			if (part.slice(2) !== "version") {
+				unknown = true;
+				break;
+			}
+			continue;
+		}
 		if (part.startsWith("--assign=") || part.startsWith("--field-separator=")) continue;
 		if (part === "-f" || part === "--file" || part === "-E") {
 			if (!operand(index)) continue;
@@ -2234,7 +2430,7 @@ function analyzeAwkProgram(program: string): { paths: string[]; unknown: boolean
 				const trailing = tokens[index + 2];
 				if (
 					destination?.kind !== "string" ||
-					destination.escaped ||
+					destination.unsafeEscapes ||
 					(destination.value !== "" && trailing && trailing.kind !== "separator" && trailing.value !== "}")
 				) {
 					unknown = true;
@@ -2346,10 +2542,7 @@ function extractBashTargets(args: unknown, depth = 0): ExtractedTargets {
 		targets.explicitMutation = true;
 		targets.unknown = true;
 	}
-	if (
-		BASH_OPAQUE_INTERPRETER_WRITE_RE.test(heredoc.masked) ||
-		BASH_HEREDOC_OPAQUE_INTERPRETER_WRITE_RE.test(heredoc.masked)
-	) {
+	if (BASH_HEREDOC_OPAQUE_INTERPRETER_WRITE_RE.test(heredoc.masked)) {
 		targets.explicitMutation = true;
 		targets.unknown = true;
 	}
