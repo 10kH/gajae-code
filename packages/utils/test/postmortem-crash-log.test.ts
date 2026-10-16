@@ -408,6 +408,17 @@ describe("recordFatalCrash", () => {
 		expect(redactCrashSecrets('{"encryptionKey":"opaque-json-key"}')).toBe('{"encryptionKey":"«redacted»"}');
 	});
 
+	it("redacts Azure Storage account-key field variants", () => {
+		const keys = ["AccountKey", "accountKey", "account_key", "account-key", "account.key", "storageAccountKey"];
+		for (const key of keys) expect(isCredentialKey(key)).toBe(true);
+
+		const labeled = keys.map((key, index) => `${key}=opaque-account-key-${index}`).join(" ");
+		expect(redactCrashSecrets(labeled)).toBe(keys.map(key => `${key}=«redacted»`).join(" "));
+		expect(redactCrashSecrets('{"AccountKey":"opaque-json-account-key","account_key":"opaque-json-snake-key"}')).toBe(
+			'{"AccountKey":"«redacted»","account_key":"«redacted»"}',
+		);
+	});
+
 	it("redacts abbreviated password credential fields", () => {
 		for (const key of ["pwd", "dbPwd", "user_pwd"]) expect(isCredentialKey(key)).toBe(true);
 		expect(redactCrashSecrets("pwd=opaque-pwd dbPwd=opaque-db-pwd user_pwd=opaque-user-pwd")).toBe(
