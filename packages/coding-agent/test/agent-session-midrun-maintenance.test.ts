@@ -493,6 +493,40 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 		expect(getLatestCompactionEntry(session.sessionManager.getBranch())).toBeNull();
 	});
 
+	it("releases the run context when a committed prune is followed by a skipped compaction that fits", async () => {
+		// The prune estimate counts both old outputs, but only one is published,
+		// so the committed prune leaves the estimate above the 300k ceiling. The
+		// keep window covers the whole remaining history, so compaction is skipped
+		// while the context still fits the 1M window: the run must resume on the
+		// rewritten history instead of sending its pre-prune snapshot.
+		session = await buildSession({
+			persisted: true,
+			contextWindow: 1_000_000,
+			shortCircuit: true,
+			settings: { "compaction.thresholdTokens": -1, "compaction.keepRecentTokens": 150_000 },
+		});
+		const output = "evictable-output-".repeat(3_000);
+		const retainedOutput = "retained-output-".repeat(2_500);
+		await seedPrunableToolConversation(session, output, 239_000, retainedOutput);
+		const artifactManager = session.sessionManager.getArtifactManager();
+		expect(artifactManager).not.toBeNull();
+		if (!artifactManager) return;
+		const originalPublishExactText = artifactManager.publishExactText.bind(artifactManager);
+		artifactManager.publishExactText = async (text, options) =>
+			text === retainedOutput
+				? { outcome: "unavailable", diagnostic: "injected unavailable publication" }
+				: await originalPublishExactText(text, options);
+		try {
+			const outcome = await session.runMidRunMaintenanceForTests(contextOf(session));
+			expect(outcome).toBe("pruned");
+		} finally {
+			artifactManager.publishExactText = originalPublishExactText;
+		}
+		expect(session.messages.some(message => JSON.stringify(message).includes(output))).toBe(false);
+		expect(session.messages.some(message => JSON.stringify(message).includes(retainedOutput))).toBe(true);
+		expect(getLatestCompactionEntry(session.sessionManager.getBranch())).toBeNull();
+	}, 30_000);
+
 	it("does not double-compact while a compaction is already in flight", async () => {
 		session = await buildSession({ shortCircuit: true, settings: { "compaction.keepRecentTokens": 10 } });
 		await seedCompactableConversation(session, THRESHOLD * 3);
