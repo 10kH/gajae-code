@@ -79,6 +79,8 @@ const TRUST_KEYS = [
 	"PYTHONUSERBASE",
 	"PYTHONSTARTUP",
 	"JULIA_DEPOT_PATH",
+	"JULIA_LOAD_PATH",
+	"JULIA_PROJECT",
 	"TCL_LIBRARY",
 	"TCLLIBPATH",
 	"LUA_INIT",
@@ -157,6 +159,8 @@ interface GhSpawn {
 	PYTHONUSERBASE: string | null;
 	PYTHONSTARTUP: string | null;
 	JULIA_DEPOT_PATH: string | null;
+	JULIA_LOAD_PATH: string | null;
+	JULIA_PROJECT: string | null;
 	TCL_LIBRARY: string | null;
 	TCLLIBPATH: string | null;
 	LUA_INIT: string | null;
@@ -271,6 +275,8 @@ await fsPromises.appendFile(
 		PYTHONUSERBASE: process.env.PYTHONUSERBASE ?? null,
 		PYTHONSTARTUP: process.env.PYTHONSTARTUP ?? null,
 		JULIA_DEPOT_PATH: process.env.JULIA_DEPOT_PATH ?? null,
+		JULIA_LOAD_PATH: process.env.JULIA_LOAD_PATH ?? null,
+		JULIA_PROJECT: process.env.JULIA_PROJECT ?? null,
 		TCL_LIBRARY: process.env.TCL_LIBRARY ?? null,
 		TCLLIBPATH: process.env.TCLLIBPATH ?? null,
 		LUA_INIT: process.env.LUA_INIT ?? null,
@@ -499,6 +505,8 @@ function expectDestination(
 			| "PYTHONUSERBASE"
 			| "PYTHONSTARTUP"
 			| "JULIA_DEPOT_PATH"
+			| "JULIA_LOAD_PATH"
+			| "JULIA_PROJECT"
 			| "TCL_LIBRARY"
 			| "TCLLIBPATH"
 			| "LUA_INIT"
@@ -598,6 +606,8 @@ function expectDestination(
 		expect(spawn.PYTHONUSERBASE).toBe(expected.PYTHONUSERBASE ?? null);
 		expect(spawn.PYTHONSTARTUP).toBe(expected.PYTHONSTARTUP ?? null);
 		expect(spawn.JULIA_DEPOT_PATH).toBe(expected.JULIA_DEPOT_PATH ?? null);
+		expect(spawn.JULIA_LOAD_PATH).toBe(expected.JULIA_LOAD_PATH ?? null);
+		expect(spawn.JULIA_PROJECT).toBe(expected.JULIA_PROJECT ?? null);
 		expect(spawn.TCL_LIBRARY).toBe(expected.TCL_LIBRARY ?? null);
 		expect(spawn.TCLLIBPATH).toBe(expected.TCLLIBPATH ?? null);
 		expect(spawn.LUA_INIT).toBe(expected.LUA_INIT ?? null);
@@ -716,6 +726,8 @@ PYTHONPATH=/project/python-path
 PYTHONUSERBASE=/project/python-user-base
 PYTHONSTARTUP=/project/python-startup.py
 JULIA_DEPOT_PATH=/project/julia-depot
+JULIA_LOAD_PATH=/project/julia-load-path
+JULIA_PROJECT=/project/julia-project
 TCL_LIBRARY=/project/tcl-library
 TCLLIBPATH=/project/tcl-packages
 LUA_INIT=@/project/lua-init.lua
@@ -835,6 +847,11 @@ OPENSSL_ENGINES=/project/openssl-engines
 	});
 
 	it("preserves operator-declared runtime settings", async () => {
+		const juliaEnvironment = {
+			JULIA_DEPOT_PATH: "/operator/julia-depot",
+			JULIA_LOAD_PATH: "/operator/julia-load-path",
+			JULIA_PROJECT: "/operator/julia-project",
+		};
 		const luaInitVersionedEnvironment = { LUA_INIT_5_4: "@/operator/lua-init-5.4.lua" };
 		const luaModulePathEnvironment = Object.fromEntries(
 			LUA_MODULE_PATH_ENV_KEYS.map(name => [name, `/operator/${name.toLowerCase()}`]),
@@ -853,6 +870,7 @@ OPENSSL_ENGINES=/project/openssl-engines
 				PYTHONPATH: "/operator/python-path",
 				PYTHONUSERBASE: "/operator/python-user-base",
 				PYTHONSTARTUP: "/operator/python-startup.py",
+				...juliaEnvironment,
 				TCL_LIBRARY: "/operator/tcl-library",
 				TCLLIBPATH: "/operator/tcl-packages",
 				LUA_INIT: "@/operator/lua-init.lua",
@@ -899,6 +917,7 @@ OPENSSL_ENGINES=/project/openssl-engines
 			PYTHONPATH: "/operator/python-path",
 			PYTHONUSERBASE: "/operator/python-user-base",
 			PYTHONSTARTUP: "/operator/python-startup.py",
+			...juliaEnvironment,
 			TCL_LIBRARY: "/operator/tcl-library",
 			TCLLIBPATH: "/operator/tcl-packages",
 			LUA_INIT: "@/operator/lua-init.lua",
