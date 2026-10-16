@@ -92,6 +92,7 @@ const TRUST_KEYS = [
 	"OPENSSL_CONF",
 	"OPENSSL_CONF_INCLUDE",
 	"OPENSSL_MODULES",
+	"OPENSSL_ENGINES",
 	"SSL_CERT_FILE",
 	"SSL_CERT_DIR",
 	"LD_PRELOAD",
@@ -150,6 +151,7 @@ interface GhSpawn {
 	OPENSSL_CONF: string | null;
 	OPENSSL_CONF_INCLUDE: string | null;
 	OPENSSL_MODULES: string | null;
+	OPENSSL_ENGINES: string | null;
 	profilerEnvironment: Record<ClrProfilerEnvironmentKey, string | null>;
 	GH_HOST: string | null;
 	GH_CONFIG_DIR: string | null;
@@ -256,6 +258,7 @@ await fsPromises.appendFile(
 		OPENSSL_CONF: process.env.OPENSSL_CONF ?? null,
 		OPENSSL_CONF_INCLUDE: process.env.OPENSSL_CONF_INCLUDE ?? null,
 		OPENSSL_MODULES: process.env.OPENSSL_MODULES ?? null,
+		OPENSSL_ENGINES: process.env.OPENSSL_ENGINES ?? null,
 		profilerEnvironment: Object.fromEntries(
 			${JSON.stringify(CLR_PROFILER_ENV_KEYS)}.map(name => [name, process.env[name] ?? null]),
 		),
@@ -467,6 +470,7 @@ function expectDestination(
 			| "OPENSSL_CONF"
 			| "OPENSSL_CONF_INCLUDE"
 			| "OPENSSL_MODULES"
+			| "OPENSSL_ENGINES"
 			| "HTTP_PROXY"
 			| "HTTPS_PROXY"
 			| "ALL_PROXY"
@@ -558,6 +562,7 @@ function expectDestination(
 		expect(spawn.OPENSSL_CONF).toBe(expected.OPENSSL_CONF ?? null);
 		expect(spawn.OPENSSL_CONF_INCLUDE).toBe(expected.OPENSSL_CONF_INCLUDE ?? null);
 		expect(spawn.OPENSSL_MODULES).toBe(expected.OPENSSL_MODULES ?? null);
+		expect(spawn.OPENSSL_ENGINES).toBe(expected.OPENSSL_ENGINES ?? null);
 		for (const name of CLR_PROFILER_ENV_KEYS)
 			expect(spawn.profilerEnvironment[name]).toBe(expected.profilerEnvironment?.[name] ?? null);
 		expect(spawn.HTTP_PROXY).toBe(expected.HTTP_PROXY ?? null);
@@ -681,6 +686,7 @@ DOTNET_PROFILER_PATH_ARM64=/project/dotnet-profiler-arm64.so
 OPENSSL_CONF=/project/openssl.cnf
 OPENSSL_CONF_INCLUDE=/project/openssl-conf-include
 OPENSSL_MODULES=/project/openssl-modules
+OPENSSL_ENGINES=/project/openssl-engines
 `,
 		});
 		expectDestination(spawns, {
@@ -719,6 +725,7 @@ OPENSSL_MODULES=/project/openssl-modules
 			OPENSSL_CONF: null,
 			OPENSSL_CONF_INCLUDE: null,
 			OPENSSL_MODULES: null,
+			OPENSSL_ENGINES: null,
 		});
 	});
 
@@ -761,6 +768,7 @@ OPENSSL_MODULES=/project/openssl-modules
 				OPENSSL_CONF: "/operator/openssl.cnf",
 				OPENSSL_CONF_INCLUDE: "/operator/openssl-conf-include",
 				OPENSSL_MODULES: "/operator/openssl-modules",
+				OPENSSL_ENGINES: "/operator/openssl-engines",
 				...profilerEnvironment,
 			},
 		});
@@ -797,6 +805,7 @@ OPENSSL_MODULES=/project/openssl-modules
 			OPENSSL_CONF: "/operator/openssl.cnf",
 			OPENSSL_CONF_INCLUDE: "/operator/openssl-conf-include",
 			OPENSSL_MODULES: "/operator/openssl-modules",
+			OPENSSL_ENGINES: "/operator/openssl-engines",
 			profilerEnvironment,
 		});
 	});
@@ -966,6 +975,30 @@ DYLD_ROOT_PATH=/project/root
 
 		expectDestination(spawns, { GH_CONFIG_DIR: path.resolve(launchRoot, "relative/gh") });
 		for (const spawn of spawns) expect(spawn.cwd).toBe(path.parse(launchRoot).root);
+	});
+
+	it("anchors relative operator certificate paths to the launch root", async () => {
+		const absoluteCertDirectory = path.join(path.parse(process.cwd()).root, "operator", "certs");
+		const spawns = await share({
+			autoload: true,
+			dotenv: "OTHER=1\n",
+			moveAway: true,
+			env: {
+				SSL_CERT_FILE: "relative/certs/ca.pem",
+				SSL_CERT_DIR: ["relative/certs/one", absoluteCertDirectory, "relative/certs/two"].join(path.delimiter),
+			},
+		});
+		const launchRoot = spawns[0]?.projectRoot;
+		if (!launchRoot) throw new Error("Share fixture did not record the launch root.");
+
+		expectDestination(spawns, {
+			SSL_CERT_FILE: path.resolve(launchRoot, "relative/certs/ca.pem"),
+			SSL_CERT_DIR: [
+				path.resolve(launchRoot, "relative/certs/one"),
+				absoluteCertDirectory,
+				path.resolve(launchRoot, "relative/certs/two"),
+			].join(path.delimiter),
+		});
 	});
 
 	it("keeps operator proxy and CA values that differ from project declarations", async () => {

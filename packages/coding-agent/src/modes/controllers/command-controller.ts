@@ -178,6 +178,7 @@ const GH_SHARE_TRUST_KEYS = [
 	"OPENSSL_CONF",
 	"OPENSSL_CONF_INCLUDE",
 	"OPENSSL_MODULES",
+	"OPENSSL_ENGINES",
 	"SSL_CERT_FILE",
 	"SSL_CERT_DIR",
 	"LD_PRELOAD",
@@ -308,6 +309,27 @@ function ghShareChildEnv(trustedPath: string, env: NodeJS.ProcessEnv = process.e
 		// `gh` children use the filesystem root as cwd to avoid project Bun
 		// preloads, so retain the launch-directory meaning of relative config paths.
 		child[name] = path.resolve(ghShareLaunchRoot, value);
+	}
+	const certFileKey = canonicalEnvKey("SSL_CERT_FILE");
+	const certDirKey = canonicalEnvKey("SSL_CERT_DIR");
+	for (const name of Object.keys(child)) {
+		const key = canonicalEnvKey(name);
+		const value = child[name];
+		if (typeof value !== "string" || value.length === 0) continue;
+		if (key === certFileKey && !path.isAbsolute(value)) {
+			// Certificate overrides retain their launch-directory meaning even
+			// though `gh` children run from the filesystem root.
+			child[name] = path.resolve(ghShareLaunchRoot, value);
+		} else if (key === certDirKey) {
+			child[name] = value
+				.split(path.delimiter)
+				.map(directory =>
+					directory.length > 0 && !path.isAbsolute(directory)
+						? path.resolve(ghShareLaunchRoot, directory)
+						: directory,
+				)
+				.join(path.delimiter);
+		}
 	}
 	const pathKey = canonicalEnvKey("PATH");
 	for (const name of Object.keys(child)) {
